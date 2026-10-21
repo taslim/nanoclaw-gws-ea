@@ -10,7 +10,7 @@ import {
   fillBoundBrowserSecret,
   validateFillSecret,
 } from './fill.js';
-import type { BrowserExecutionContext } from './queue.js';
+import type { BrowserExecutionContext } from './actions.js';
 import type { PinnedBrowserRef } from './observe.js';
 import { observePage, pageHasSecret } from './observe.js';
 import * as nativeAuthentication from './authentication-submit.js';

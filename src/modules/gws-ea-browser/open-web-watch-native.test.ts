@@ -1,3 +1,4 @@
+import { createBrowserQueue, recoverAndStartBrowserQueue } from './index.js';
 /**
  * Wake-on-change watches against native Chrome (KTD20): an unreviewed booking site whose slot list changes, checked
  * by the real scheduler and replay without the model. The signed-out context is the fixture's own page, since the
@@ -207,7 +208,7 @@ describe.skipIf(!chromePath)('wake-on-change watches in native Chrome', { timeou
     for (const [url, route] of Object.entries(watched.pages)) fixture.serve(url, route);
     page = await fixture.newPage();
     await prepareMerchantPage(page);
-    queue = new BrowserQueue(new BrowserStore(), {
+    queue = createBrowserQueue(new BrowserStore(), {
       pageForJob: async () => page,
       // The signed-out check page is the fixture's own (see the mock above); no host Chrome is reached.
       connection: async () => ({}) as ChromeConnection,
@@ -216,7 +217,7 @@ describe.skipIf(!chromePath)('wake-on-change watches in native Chrome', { timeou
     });
     configureBrowserCancellation(queue);
     registerBrowserPurchaseDelivery(() => queue);
-    await queue.start();
+    await recoverAndStartBrowserQueue(queue);
     await resumeBrowserPurchaseCommits(queue);
     setBrowserAdmissionReady(true);
     // The fixture site's politeness floor and the principal's night would only slow these checks down.
@@ -541,13 +542,13 @@ describe.skipIf(!chromePath)('a reader watch beside region watches in native Chr
       await prepareMerchantPage(checkPage);
       return checkPage;
     };
-    queue = new BrowserQueue(store, {
+    queue = createBrowserQueue(store, {
       pageForJob: async () => resy.page,
       connection: async () => ({}) as ChromeConnection,
       closeJob: async () => undefined,
       onDisconnected: () => () => undefined,
     });
-    await queue.start();
+    await recoverAndStartBrowserQueue(queue);
   });
   afterEach(async () => {
     signedOut.open = undefined;

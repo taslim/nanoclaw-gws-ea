@@ -14,7 +14,9 @@ import { browserSite, type SiteLease } from './leases.js';
 import { merchantSignatureFor } from './merchant-signatures.js';
 import type { ReservationAvailability, ReservationPolicy } from './merchant-contract.js';
 import { readBrowserPolicy } from './policy.js';
-import type { BrowserExecutionContext, BrowserQueue } from './queue.js';
+import type { BrowserQueue } from './queue.js';
+import type { BrowserExecutionContext, BrowserWatchExecutionContext } from './actions.js';
+import { BrowserOperation } from './operation.js';
 import {
   captureRecipeRegion,
   executeRecipe,
@@ -251,16 +253,10 @@ export async function runBrowserWatchCheck(
       const job = await queue.store.getJob(input.jobId);
       const session = job ? await getSession(job.browser_session_id) : undefined;
       if (!job || !session || session.status !== 'active') return { status: 'failed' };
-      const controller = new AbortController();
-      const deadline = Date.now() + 90_000;
-      const abort = (): void => controller.abort();
-      signal.addEventListener('abort', abort, { once: true });
-      if (signal.aborted) abort();
-      const timer = setTimeout(abort, 90_000);
-      timer.unref();
-      let page: Page | undefined;
+      const operation = new BrowserOperation(Date.now() + 90_000, undefined, signal);
       let temporaryLease = false;
       const assertActive = async (): Promise<void> => {
+        operation.assertActive();
         const current = await db.get<{ cancelled: number; cancel_requested: number }>(
           'SELECT cancelled,cancel_requested FROM gws_ea_browser_jobs WHERE id = ?',
           job.id,
@@ -270,8 +266,6 @@ export async function runBrowserWatchCheck(
           input.id,
         );
         if (
-          controller.signal.aborted ||
-          Date.now() >= deadline ||
           !current ||
           current.cancelled ||
           current.cancel_requested ||
@@ -280,6 +274,7 @@ export async function runBrowserWatchCheck(
           !(await readBrowserPolicy()).enabled
         )
           throw new Error('Watch check is no longer active');
+        operation.assertActive();
       };
       const siteAccess = async (url: URL): Promise<'ordinary' | 'site_busy' | 'blocked_address'> => {
         await assertActive();
@@ -299,57 +294,49 @@ export async function runBrowserWatchCheck(
       };
       try {
         await assertActive();
-        return await withSignedOutBrowserPage(await queue.runtime.connection(), async (signedOut) => {
-          page = signedOut;
-          controller.signal.addEventListener(
-            'abort',
-            () => {
-              void signedOut.close().catch(() => undefined);
-            },
-            { once: true },
-          );
-          await assertActive();
-          const context: BrowserExecutionContext = {
-            job,
-            session,
-            request: { id: input.id },
-            store: queue.store,
-            runtime: queue.runtime,
-            signal: controller.signal,
-            deadline,
-            page: async () => {
-              await assertActive();
-              return signedOut;
-            },
-            assertActive,
-            remaining: () => Math.max(0, deadline - Date.now()),
-            wakeWaiters: (ids, eventId) => queue.wakeWaiters(ids, eventId),
-            markCommitStarted: async () => {
-              throw new Error('A signed-out availability check cannot commit');
-            },
-          };
-          const result = await executeRecipe(
-            context,
-            { recipe_id: input.recipeId, parameters: input.parameters },
-            { page: signedOut, record: false, readOnly: true, siteAccess },
-          );
-          if (input.region) return readRegionCheck(signedOut, input.region, result, assertActive);
-          if (result.status !== 'completed') return watchCheckFailure(result);
-          const availability = await merchantSignatureFor(signedOut)?.readAvailability?.(signedOut, {
-            venueId: input.venueId,
-            partySize: input.partySize,
-          });
-          await assertActive();
-          return availability?.status === 'ready'
-            ? { status: 'ready', availability }
-            : { status: availability?.status === 'blocked' ? 'blocked' : 'failed' };
-        });
+        const outcome = await operation.run<BrowserWatchCheckResult>(async () =>
+          withSignedOutBrowserPage(await queue.runtime.connection(), async (signedOut) => {
+            operation.ownPage(signedOut);
+            await assertActive();
+            const context: BrowserWatchExecutionContext = {
+              kind: 'watch_check',
+              job,
+              session,
+              check: { id: input.id },
+              store: queue.store,
+              runtime: queue.runtime,
+              signal: operation.signal,
+              deadline: operation.deadline,
+              page: async () => {
+                await assertActive();
+                return signedOut;
+              },
+              assertActive,
+              remaining: operation.remaining,
+              wakeWaiters: (ids, eventId) => queue.wakeWaiters(ids, eventId),
+            };
+            const result = await executeRecipe(
+              context,
+              { recipe_id: input.recipeId, parameters: input.parameters },
+              { page: signedOut, record: false, readOnly: true, siteAccess },
+            );
+            if (input.region) return readRegionCheck(signedOut, input.region, result, assertActive);
+            if (result.status !== 'completed') return watchCheckFailure(result);
+            const availability = await merchantSignatureFor(signedOut)?.readAvailability?.(signedOut, {
+              venueId: input.venueId,
+              partySize: input.partySize,
+            });
+            await assertActive();
+            return availability?.status === 'ready'
+              ? { status: 'ready', availability }
+              : { status: availability?.status === 'blocked' ? 'blocked' : 'failed' };
+          }),
+        );
+        return 'value' in outcome ? outcome.value : { status: 'failed' };
       } catch {
         return { status: 'failed' };
       } finally {
-        clearTimeout(timer);
-        signal.removeEventListener('abort', abort);
-        await page?.close().catch(() => undefined);
+        await operation.finish();
         if (temporaryLease)
           await queue.wakeWaiters(await queue.leases.release(input.jobId, input.site), `watch-check-${input.id}`);
       }

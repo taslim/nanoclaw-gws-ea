@@ -69,12 +69,8 @@ import { disposeBrowserRefs, pinBrowserRefs, readBrowserRef } from './observe.js
 import { readBrowserPolicy } from './policy.js';
 import { writeBrowserNotice } from './notices.js';
 import { notifyPendingUnconfirmed } from './purchase-outcome.js';
-import {
-  BrowserQueue,
-  registerBrowserActionDelivery,
-  registerBrowserQueuedAction,
-  type BrowserExecutionContext,
-} from './queue.js';
+import { BrowserQueue, registerBrowserActionDelivery } from './queue.js';
+import type { BrowserExecutionContext, BrowserQueuedAction } from './actions.js';
 import { evidenceMatchesAttempt, reconcilePurchaseAttempt } from './reconciliation.js';
 import { deriveReservationGuaranteeAuthority } from './reservation-guarantee.js';
 import { principalClock } from './watch-policy.js';
@@ -1100,7 +1096,10 @@ export async function executeBrowserPurchase(
   }
 }
 
-registerBrowserQueuedAction('purchase', { validate: validatePurchaseRequest, execute: executeBrowserPurchase });
+export const purchaseAction: BrowserQueuedAction = {
+  validate: validatePurchaseRequest,
+  execute: executeBrowserPurchase,
+};
 
 /** Internal approval work has no polling MCP caller; every pre-commit answer resumes its job. */
 async function deliverPurchaseCommitAnswer(request: BrowserRequest, frame: ResponseFrame): Promise<void> {
@@ -1153,7 +1152,7 @@ async function deliverPurchaseCommitAnswer(request: BrowserRequest, frame: Respo
   }
   void requestWake(session, 'browser-purchase-outcome').catch(() => undefined);
 }
-registerBrowserQueuedAction('browser_purchase_commit', {
+export const purchaseCommitAction: BrowserQueuedAction = {
   validate(content) {
     if (typeof content.authority_id !== 'string') throw invalidArgs('authority_id required');
     return { authority_id: content.authority_id };
@@ -1168,7 +1167,7 @@ registerBrowserQueuedAction('browser_purchase_commit', {
     }
   },
   deliverAnswer: deliverPurchaseCommitAnswer,
-});
+};
 export function registerBrowserPurchaseDelivery(queue: () => BrowserQueue): void {
   getPurchaseQueue = queue;
   registerBrowserActionDelivery('purchase', queue);

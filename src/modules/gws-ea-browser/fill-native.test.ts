@@ -19,7 +19,7 @@ import { browserSiteLeasesMigration } from './migration.js';
 import type { BrowserSecretField } from './authentication-signatures.js';
 import type { PinnedBrowserRef } from './observe.js';
 import { browserPaths } from './paths.js';
-import type { BrowserExecutionContext } from './queue.js';
+import type { BrowserExecutionContext } from './actions.js';
 
 const chromePath = process.env.GWS_EA_BROWSER_TEST_CHROME;
 const secret = 'host-only-cross-origin-fixture-value';

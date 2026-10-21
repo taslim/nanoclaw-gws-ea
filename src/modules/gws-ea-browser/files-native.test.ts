@@ -32,7 +32,7 @@ import { ensureBrowserNavigationGuard } from './commit-classifier.js';
 import { executeBrowserBatch } from './executor.js';
 import { observePage, type BrowserRef } from './observe.js';
 import { browserPaths, writePrivateFile } from './paths.js';
-import type { BrowserExecutionContext } from './queue.js';
+import type { BrowserExecutionContext } from './actions.js';
 import { JobWindows } from './windows.js';
 
 const chromePath = process.env.GWS_EA_BROWSER_TEST_CHROME;
@@ -121,6 +121,7 @@ describe.skipIf(!chromePath)('native Chrome file transfers', { timeout: 30_000 }
     page = await windows.pageForJob(job.id);
     await page.goto('http://fixture.example/docs/archive');
     context = {
+      kind: 'request',
       job,
       request,
       session,

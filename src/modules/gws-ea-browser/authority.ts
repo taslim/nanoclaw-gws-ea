@@ -17,7 +17,7 @@ import {
   type PurchaseFacts,
 } from './fingerprint.js';
 import { readBrowserPolicy } from './policy.js';
-import type { BrowserExecutionContext } from './queue.js';
+import type { BrowserExecutionContext } from './actions.js';
 import type { WatchBounds } from './watches.js';
 
 export interface SpendingAuthority {

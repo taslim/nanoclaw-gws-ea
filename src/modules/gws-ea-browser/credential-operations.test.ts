@@ -1,3 +1,4 @@
+import { createBrowserQueue } from './index.js';
 import fs from 'node:fs';
 import { mkdtemp, realpath, rm } from 'node:fs/promises';
 import os from 'node:os';
@@ -55,7 +56,8 @@ import {
   type VaultFixtureFiles,
 } from './onepassword-fixture.js';
 import { writePrivateFile } from './paths.js';
-import { BrowserQueue, type BrowserExecutionContext } from './queue.js';
+import { BrowserQueue } from './queue.js';
+import type { BrowserExecutionContext } from './actions.js';
 import { openSignupVerification } from './sign-in-mail.js';
 
 const ORIGIN = 'https://accounts.shop.example';
@@ -622,7 +624,7 @@ describe("the principal's release of an attempt the host cannot settle", () => {
       messaging_group_id: 'mg-principal-dm',
       resolved_at: at,
     });
-    queue = new BrowserQueue(new BrowserStore(), {
+    queue = createBrowserQueue(new BrowserStore(), {
       pageForJob: async () => {
         throw new Error('A release never opens a page');
       },

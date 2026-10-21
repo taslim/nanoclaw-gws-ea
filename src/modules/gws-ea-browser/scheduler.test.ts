@@ -1,3 +1,4 @@
+import { createBrowserQueue } from './index.js';
 import fs from 'node:fs';
 import { getEventListeners } from 'node:events';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
@@ -47,7 +48,7 @@ beforeEach(async () => {
   const job = await store.jobForSession(session);
   if (!job) throw new Error('Missing job');
   jobId = job.id;
-  queue = new BrowserQueue(store, {
+  queue = createBrowserQueue(store, {
     async pageForJob(): Promise<never> {
       throw new Error('Unexpected signed-in browser');
     },

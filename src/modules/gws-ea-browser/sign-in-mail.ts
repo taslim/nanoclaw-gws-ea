@@ -59,7 +59,8 @@ import {
   type BrowserRef,
   type PinnedBrowserRef,
 } from './observe.js';
-import { registerBrowserQueuedAction, type BrowserExecutionContext, type BrowserQueue } from './queue.js';
+import { type BrowserQueue } from './queue.js';
+import type { BrowserExecutionContext, BrowserQueuedAction } from './actions.js';
 import { signInAddress } from './web-address.js';
 
 interface SignInPayload extends Record<string, unknown> {
@@ -835,9 +836,9 @@ export async function cleanupBrowserSignInMail(jobId?: string): Promise<void> {
   await cleanupSignInClaims();
 }
 
-registerBrowserQueuedAction('sign_in_code', { validate: validateSignInCode, execute: executeSignInCode });
-registerBrowserQueuedAction('browser_relay_sign_in', {
+export const signInCodeAction: BrowserQueuedAction = { validate: validateSignInCode, execute: executeSignInCode };
+export const relaySignInAction: BrowserQueuedAction = {
   validate: validateRelayPayload,
   execute: executeRelayCode,
   deliverAnswer: deliverRelayAnswer,
-});
+};

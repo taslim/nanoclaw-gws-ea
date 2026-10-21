@@ -39,7 +39,7 @@ import {
   type PinnedBrowserRef,
 } from './observe.js';
 import { readBrowserPolicy } from './policy.js';
-import { registerBrowserQueuedAction, type BrowserExecutionContext } from './queue.js';
+import { browserOperationId, type BrowserOperationContext, type BrowserQueuedAction } from './actions.js';
 import { beginBrowserActionTrace, isReadOnlyBrowserAction } from './recipes.js';
 import { givenAddressStop } from './web-address.js';
 
@@ -248,7 +248,7 @@ async function refuseFieldEntry(page: Page, target: PinnedBrowserRef): Promise<v
  * inside one script-request window, as a press does (KTD2). Typing presses nothing: no confirmation check follows.
  */
 async function fieldInput(
-  context: BrowserExecutionContext,
+  context: BrowserOperationContext,
   guard: BrowserNavigationGuard,
   fields: ReadonlyArray<{ readonly target: PinnedBrowserRef; readonly value: string }>,
 ): Promise<void> {
@@ -285,7 +285,7 @@ const CONFIRMATION_LOAD_MS = 5_000;
  * not pressed through its cover. It never waits on a navigation it starts; the action's window does.
  */
 async function nativeAction(
-  context: BrowserExecutionContext,
+  context: BrowserOperationContext,
   act: (options: { timeout: number; noWaitAfter: true }) => Promise<void>,
 ): Promise<void> {
   await context.assertActive();
@@ -327,7 +327,7 @@ function sameConfirmation(left: ConfirmationEvidence, right: ConfirmationEvidenc
  * more than the approved total (KTD8): the same order number for more is something added to that order. A free
  * commit was approved for nothing, so a charge on its record is never its own.
  */
-async function placedByJob(context: BrowserExecutionContext, evidence: ConfirmationEvidence): Promise<boolean> {
+async function placedByJob(context: BrowserOperationContext, evidence: ConfirmationEvidence): Promise<boolean> {
   const { charged } = evidence;
   if (!charged) return false;
   const approved = await context.store.db.all<{ facts_json: string }>(
@@ -350,7 +350,7 @@ async function placedByJob(context: BrowserExecutionContext, evidence: Confirmat
  * receipt or tracking. Nor did the order this job's own approved purchase placed, for up to its approved total.
  */
 async function unapprovedCommit(
-  context: BrowserExecutionContext,
+  context: BrowserOperationContext,
   page: Page,
   site: string | undefined,
   before: readonly ConfirmationEvidence[],
@@ -384,7 +384,7 @@ type GuardReason = ReturnType<BrowserNavigationGuard['reason']>;
 function batchErrorReason(
   error: unknown,
   blocked: GuardReason,
-  context: BrowserExecutionContext,
+  context: BrowserOperationContext,
   page: Page,
 ): BrowserStopReason {
   if (
@@ -400,7 +400,7 @@ function batchErrorReason(
 }
 
 export async function executeBrowserBatch(
-  context: BrowserExecutionContext,
+  context: BrowserOperationContext,
   payload: Record<string, unknown>,
   options: BrowserBatchOptions = {},
 ): Promise<Record<string, unknown>> {
@@ -430,7 +430,7 @@ export async function executeBrowserBatch(
 }
 
 async function executeBatch(
-  context: BrowserExecutionContext,
+  context: BrowserOperationContext,
   actions: readonly BrowserAction[],
   page: Page,
   options: BrowserBatchOptions,
@@ -477,10 +477,10 @@ async function executeBatch(
           const lease = options.siteAccess
             ? { acquired: (await options.siteAccess(new URL(page.url()))) === 'ordinary', waitingJobs: [] }
             : await new SiteLeaseStore(context.store.db).acquire(context.job.id, page.url());
-          await context.wakeWaiters(lease.waitingJobs, `${context.request.id}:action-release`);
+          await context.wakeWaiters(lease.waitingJobs, `${browserOperationId(context)}:action-release`);
           if (!lease.acquired) throw new BrowserBatchStop('site_busy');
         }
-        if (options.record !== false) {
+        if (options.record !== false && context.kind !== 'watch_check') {
           trace = await beginBrowserActionTrace(context, page, action, refs);
           data.trace_index = trace.index;
         }
@@ -501,7 +501,7 @@ async function executeBatch(
             const lease = options.siteAccess
               ? { acquired: (await options.siteAccess(new URL(action.url))) === 'ordinary', waitingJobs: [] }
               : await new SiteLeaseStore(context.store.db).acquire(context.job.id, action.url);
-            await context.wakeWaiters(lease.waitingJobs, `${context.request.id}:navigate-release`);
+            await context.wakeWaiters(lease.waitingJobs, `${browserOperationId(context)}:navigate-release`);
             if (!lease.acquired) throw new BrowserBatchStop('site_busy');
             await page.goto(action.url, { waitUntil: 'domcontentloaded', timeout: context.remaining() });
             break;
@@ -646,6 +646,10 @@ async function executeBatch(
             }
             break;
           case 'download':
+            if (context.kind === 'watch_check') {
+              reason = 'read_only';
+              break;
+            }
             if (target) {
               const policy = await readBrowserPolicy();
               if (!policy.enabled) throw new BrowserBatchStop('browser_unavailable');
@@ -735,4 +739,4 @@ async function executeBatch(
   };
 }
 
-registerBrowserQueuedAction('browser', { validate: validateBrowserBatch, execute: executeBrowserBatch });
+export const browserAction: BrowserQueuedAction = { validate: validateBrowserBatch, execute: executeBrowserBatch };

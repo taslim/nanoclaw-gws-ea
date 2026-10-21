@@ -1,3 +1,4 @@
+import { createBrowserQueue } from './index.js';
 import fs from 'node:fs';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 const root = await vi.hoisted(async () => {
@@ -18,16 +19,18 @@ import { BrowserStore } from './db.js';
 import {
   browserDelegateGuard,
   cancelBrowserJob,
+  cancelBrowserJobInTransaction,
+  finishBrowserJobCancellation,
   finishRequestedCancellation,
   readBrowserJob,
   sweepBrowserJobSessions,
 } from './cancel.js';
-import { BrowserQueue } from './queue.js';
 import { getSession, updateSession } from '../../db/sessions.js';
 import { guard } from '../../guard/index.js';
 import { browserWatchesMigration } from './migration.js';
 import { deliverAction as send, refusal } from './testing/delivery-answer.js';
 import { vaultAccessGuard } from './vault-access.js';
+import { credentialAttempts } from './credential-attempts.js';
 
 let session: Session;
 beforeEach(async () => {
@@ -201,7 +204,7 @@ describe('cancelling a job with credential attempts', () => {
     );
   const closed: string[] = [];
   const queue = () =>
-    new BrowserQueue(new BrowserStore(), {
+    createBrowserQueue(new BrowserStore(), {
       pageForJob: async () => {
         throw new Error('This test must not open a page');
       },
@@ -255,6 +258,25 @@ describe('cancelling a job with credential attempts', () => {
       expect(await cancelBrowserJob(job.thread_id)).toMatchObject({ status: 'already_cancelled' });
     },
   );
+
+  it('interrupts pending work and closes its page even when candidate cleanup fails', async () => {
+    const job = (await readBrowserJob(session.thread_id!))!.job;
+    await insert('unused-cleanup', job.id, 'saved', null);
+    const activeQueue = queue();
+    await activeQueue.store.accept(job, session, 'cancel-cleanup', 'browser', {}, 90_000);
+    const result = await activeQueue.store.db.transaction(() =>
+      cancelBrowserJobInTransaction(job.thread_id, activeQueue.store),
+    );
+    const retire = vi.spyOn(credentialAttempts, 'retireCandidates').mockRejectedValue(new Error('Vault unavailable'));
+    try {
+      await expect(finishBrowserJobCancellation(result, activeQueue)).rejects.toThrow('Vault unavailable');
+      expect(await activeQueue.store.pending(job.id)).toEqual([]);
+      expect(closed).toContain(job.id);
+      expect(await activeQueue.store.undelivered(job.id)).toEqual([]);
+    } finally {
+      retire.mockRestore();
+    }
+  });
 
   it('never closes the session of a job whose credential attempt is unresolved', async () => {
     const old = new Date(Date.now() - 15 * 24 * 60 * 60 * 1000).toISOString();

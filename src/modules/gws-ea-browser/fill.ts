@@ -26,7 +26,7 @@ import {
   type BrowserRef,
   type PinnedBrowserRef,
 } from './observe.js';
-import { registerBrowserQueuedAction, type BrowserExecutionContext } from './queue.js';
+import type { BrowserExecutionContext, BrowserQueuedAction } from './actions.js';
 
 export interface BoundBrowserSecretField {
   readonly page: Page;
@@ -338,7 +338,7 @@ export async function executeFillSecret(
   });
 }
 
-registerBrowserQueuedAction('fill_secret', { validate: validateFillSecret, execute: executeFillSecret });
+export const fillSecretAction: BrowserQueuedAction = { validate: validateFillSecret, execute: executeFillSecret };
 registerBrowserSiteInfoProvider(async (page, origin, assertActive) => {
   try {
     const origins = new Set([

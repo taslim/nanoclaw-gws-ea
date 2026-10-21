@@ -5,7 +5,7 @@ import { merchantSignatures } from './merchant-signatures.js';
 import { SiteLeaseStore } from './leases.js';
 import { documentGate, type PausedDocument } from './document-gate.js';
 import { coverPageTargets, ensurePageTargets, onUncoveredPageTarget, pageTargetsReady } from './page-targets.js';
-import type { BrowserExecutionContext } from './queue.js';
+import { browserOperationId, type BrowserOperationContext } from './actions.js';
 import {
   inspectAuthenticationControl,
   submitAuthenticationForm,
@@ -955,7 +955,7 @@ export interface BrowserJobAccess {
  * top-level document's site (KTD7); a frame's document is classified, but never takes or waits on a lease.
  */
 export async function withBrowserJobNavigation<T>(
-  context: BrowserExecutionContext,
+  context: BrowserOperationContext,
   page: Page,
   operation: () => Promise<T>,
   access: BrowserJobAccess = {},
@@ -968,7 +968,7 @@ export async function withBrowserJobNavigation<T>(
     const lease = siteAccess
       ? { acquired: (await siteAccess(new URL(page.url()))) === 'ordinary', waitingJobs: [] }
       : await leases.acquire(context.job.id, page.url());
-    await context.wakeWaiters(lease.waitingJobs, `${context.request.id}:lease-release`);
+    await context.wakeWaiters(lease.waitingJobs, `${browserOperationId(context)}:lease-release`);
     if (!lease.acquired) {
       // A regular activation exception carries the same closed vocabulary as a tool stop.
       throw new BrowserSiteBusyError();
@@ -984,7 +984,7 @@ export async function withBrowserJobNavigation<T>(
         if (!document.topLevel) return 'ordinary';
         if (siteAccess) return siteAccess(url);
         const lease = await leases.acquire(context.job.id, url.href);
-        await context.wakeWaiters(lease.waitingJobs, `${context.request.id}:redirect-release`);
+        await context.wakeWaiters(lease.waitingJobs, `${browserOperationId(context)}:redirect-release`);
         return lease.acquired ? 'ordinary' : 'site_busy';
       },
     },

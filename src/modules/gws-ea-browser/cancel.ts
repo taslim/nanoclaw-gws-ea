@@ -273,21 +273,34 @@ export async function finishBrowserJobCancellation(
   queue = cancellationQueue,
   running?: string,
 ): Promise<void> {
-  if (result.abandonedAttempts?.length) await credentialAttempts.retireCandidates(result.abandonedAttempts);
-  if (result.withdrawnCards)
-    await finishPurchaseCardWithdrawals(result.withdrawnCards, 'Withdrawn: this browser errand was cancelled.');
-  if (result.withdrawnCards && (await getDb().hasTable('gws_ea_browser_watches')))
-    for (const card of result.withdrawnCards)
-      await getDb().run(
-        'UPDATE gws_ea_browser_watches SET approval_finished_at = ? WHERE approval_id = ?',
-        new Date().toISOString(),
-        card.approval_id,
-      );
-  if (!queue || result.status === 'already_cancelled' || result.status === 'in_progress') return;
-  await queue.interruptJob(result.job.id, running);
-  // The job is already cancelled; a window that fails to close leaves its site's waiters to be woken all the same.
-  await queue.runtime.closeJob(result.job.id).catch(() => undefined);
-  await queue.wakeWaiters(result.waitingJobs, `cancel:${result.job.id}`);
+  const cleanup = await Promise.allSettled([
+    (async () => {
+      if (result.abandonedAttempts?.length) await credentialAttempts.retireCandidates(result.abandonedAttempts);
+    })(),
+    (async () => {
+      if (!result.withdrawnCards) return;
+      await finishPurchaseCardWithdrawals(result.withdrawnCards, 'Withdrawn: this browser errand was cancelled.');
+      if (await getDb().hasTable('gws_ea_browser_watches'))
+        for (const card of result.withdrawnCards)
+          await getDb().run(
+            'UPDATE gws_ea_browser_watches SET approval_finished_at = ? WHERE approval_id = ?',
+            new Date().toISOString(),
+            card.approval_id,
+          );
+    })(),
+    (async () => {
+      if (!queue || result.status === 'already_cancelled' || result.status === 'in_progress') return;
+      try {
+        await queue.interruptJob(result.job.id, running);
+      } finally {
+        // Closing this job must not strand its site's waiters.
+        await queue.runtime.closeJob(result.job.id).catch(() => undefined);
+        await queue.wakeWaiters(result.waitingJobs, `cancel:${result.job.id}`);
+      }
+    })(),
+  ]);
+  const failed = cleanup.find((result) => result.status === 'rejected');
+  if (failed?.status === 'rejected') throw failed.reason;
 }
 
 export async function cancelBrowserJob(

@@ -1,3 +1,4 @@
+import { createBrowserQueue, recoverAndStartBrowserQueue } from './index.js';
 import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import Database from 'better-sqlite3';
@@ -25,8 +26,6 @@ vi.mock('./fill.js', async (original) => ({
 }));
 import { closeDb, createAgentGroup, getDb, initTestDb, runMigrations } from '../../db/index.js';
 import { BrowserStore } from './db.js';
-import { browserQueueMigration, browserSiteLeasesMigration } from './migration.js';
-import { browserSignInMigration } from './sign-in-migration.js';
 import {
   answerRelayCode,
   answerSignInReply,
@@ -47,7 +46,8 @@ import {
   type BoundBrowserSecretField,
 } from './fill.js';
 import { observePage, pageHasSecret, type PinnedBrowserRef } from './observe.js';
-import { BrowserQueue, type BrowserExecutionContext } from './queue.js';
+import { BrowserQueue } from './queue.js';
+import type { BrowserExecutionContext } from './actions.js';
 import { getDeliveryAction } from '../../delivery.js';
 import { ANSWER_LATER } from '../../cli/delivery-action.js';
 import { getSessionsByAgentGroup } from '../../db/sessions.js';
@@ -80,9 +80,6 @@ let list: ReturnType<typeof vi.fn>;
 beforeEach(async () => {
   vi.stubEnv('GWS_EA_BROWSER_POLICY_FILE', `${root}/missing-${randomUUID()}.json`);
   await runMigrations(await initTestDb());
-  await browserSiteLeasesMigration.up(getDb());
-  await browserQueueMigration.up(getDb());
-  await browserSignInMigration.up(getDb());
   await getDb().run(
     'UPDATE gws_ea_profile SET assistant_workspace_email = ? WHERE singleton = 1',
     'assistant@example.com',
@@ -639,7 +636,7 @@ it.each(['fill', 'restart'] as const)(
         .run(sent.requestId, 'system', new Date().toISOString(), JSON.stringify(sent));
       outbound.close();
     }
-    const queue = new BrowserQueue(context.store, {
+    const queue = createBrowserQueue(context.store, {
       pageForJob: async () => f.page,
       connection: async () => {
         throw new Error('No Chrome in this fixture');
@@ -647,7 +644,7 @@ it.each(['fill', 'restart'] as const)(
       closeJob: async () => undefined,
       onDisconnected: () => () => undefined,
     });
-    if (mode === 'fill') await queue.start();
+    if (mode === 'fill') await recoverAndStartBrowserQueue(queue);
     let unlock!: () => void;
     const blocked = new Promise<void>((resolve) => {
       unlock = resolve;
@@ -670,7 +667,7 @@ it.each(['fill', 'restart'] as const)(
     expect(f.values).toEqual([]);
     if (mode === 'restart') {
       await recoverBrowserSignInMail();
-      await queue.start();
+      await recoverAndStartBrowserQueue(queue);
     }
     unlock();
     await lock;

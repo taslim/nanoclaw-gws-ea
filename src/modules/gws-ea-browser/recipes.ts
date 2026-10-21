@@ -30,7 +30,7 @@ import {
   type BrowserRef,
   type PinnedBrowserRef,
 } from './observe.js';
-import { registerBrowserQueuedAction, type BrowserExecutionContext } from './queue.js';
+import type { BrowserExecutionContext, BrowserOperationContext, BrowserQueuedAction } from './actions.js';
 
 type BrowserRole = Parameters<Frame['getByRole']>[0];
 const roles = new Set<BrowserRole>([
@@ -751,7 +751,7 @@ function sameCheckpoint(expected: RecipeCheckpoint, found: RecipeCheckpoint): bo
   return expected.url === found.url && expected.heading === found.heading;
 }
 export async function executeRecipe(
-  context: BrowserExecutionContext,
+  context: BrowserOperationContext,
   payload: Record<string, unknown>,
   options: BrowserBatchOptions = {},
 ): Promise<Record<string, unknown>> {
@@ -903,8 +903,8 @@ export async function executeRecipe(
   return { status: 'completed', observation: await observePage(page, context.assertActive), repeat_safe: repeatSafe };
 }
 
-registerBrowserQueuedAction('save_recipe', { validate: validateSaveRecipe, execute: saveBrowserRecipe });
-registerBrowserQueuedAction('run_recipe', { validate: validateRunRecipe, execute: executeRecipe });
+export const saveRecipeAction: BrowserQueuedAction = { validate: validateSaveRecipe, execute: saveBrowserRecipe };
+export const runRecipeAction: BrowserQueuedAction = { validate: validateRunRecipe, execute: executeRecipe };
 registerBrowserSiteInfoProvider(async (_page, origin) => {
   const rows = await getDb().all<RecipeRow>(
     `SELECT r.* FROM gws_ea_browser_recipes r WHERE r.site = ? AND r.version = (SELECT MAX(latest.version) FROM gws_ea_browser_recipes latest WHERE latest.site = r.site AND latest.name = r.name) ORDER BY r.name`,

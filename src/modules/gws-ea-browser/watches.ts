@@ -47,7 +47,8 @@ import {
   type BrowserRecipe,
   type StructuredBrowserLocator,
 } from './recipes.js';
-import { registerBrowserQueuedAction, type BrowserExecutionContext, type BrowserQueue } from './queue.js';
+import { type BrowserQueue } from './queue.js';
+import type { BrowserExecutionContext, BrowserQueuedAction } from './actions.js';
 import {
   WATCH_HOURLY_WAKES,
   WATCH_REGION_TEXT_LIMIT,
@@ -1581,8 +1582,8 @@ export async function recoverBrowserWatches(queue: BrowserQueue): Promise<void> 
   await deliverWatchNotices(db);
 }
 
-registerBrowserQueuedAction('watch', { validate: validateQueuedWatch, execute: createBrowserWatch });
-registerBrowserQueuedAction('list_watches', {
+export const watchAction: BrowserQueuedAction = { validate: validateQueuedWatch, execute: createBrowserWatch };
+export const listWatchesAction: BrowserQueuedAction = {
   validate: () => ({}),
   async execute(context) {
     const watches = await context.store.db.all<WatchRow>(
@@ -1622,8 +1623,8 @@ registerBrowserQueuedAction('list_watches', {
       });
     return { watches: listed };
   },
-});
-registerBrowserQueuedAction('cancel_watch', {
+};
+export const cancelWatchAction: BrowserQueuedAction = {
   validate(raw) {
     if (typeof raw.watch_id !== 'string') throw invalidArgs('watch_id is required');
     return { watch_id: raw.watch_id };
@@ -1644,8 +1645,8 @@ registerBrowserQueuedAction('cancel_watch', {
       );
     return { status: 'cancelled', watch_id: watch.id };
   },
-});
-registerBrowserQueuedAction('browser_watch_book', {
+};
+export const watchBookAction: BrowserQueuedAction = {
   validate(raw) {
     if (typeof raw.watch_id !== 'string') throw invalidArgs('watch_id is required');
     return { watch_id: raw.watch_id };
@@ -1692,4 +1693,4 @@ registerBrowserQueuedAction('browser_watch_book', {
       );
     }
   },
-});
+};

@@ -74,7 +74,7 @@ import {
 } from './onepassword-fixture.js';
 import { writeOnePasswordHostPolicy } from './onepassword-policy.js';
 import { browserPaths } from './paths.js';
-import type { BrowserExecutionContext } from './queue.js';
+import type { BrowserExecutionContext } from './actions.js';
 import { answerSignInReply, recoverBrowserSignInMail } from './sign-in-mail.js';
 
 registerMigration(gwsEaInboxMigration);

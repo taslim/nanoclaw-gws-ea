@@ -26,33 +26,49 @@ import {
 import { BrowserStore } from './db.js';
 import { notifyPendingIncidents } from './incidents.js';
 import { BrowserQueue, registerBrowserActionDelivery } from './queue.js';
-import './executor.js';
-import './recipes.js';
+import { browserAction } from './executor.js';
+import { saveRecipeAction, runRecipeAction } from './recipes.js';
 import './capability.js';
-import './fill.js';
-import { registerCredentialAuthorityDelivery } from './credential-operations.js';
+import { fillSecretAction } from './fill.js';
+import {
+  credentialFormAction,
+  registerCredentialAuthorityDelivery,
+  settleRefusedSites,
+} from './credential-operations.js';
 import { browserAdmissionReady, setBrowserAdmissionReady } from './group.js';
 import './destination-policy.js';
 import './guidance.js';
 import {
   configureBrowserCancellation,
+  finishRequestedCancellation,
   registerBrowserCancellationDelivery,
   sweepBrowserJobSessions,
 } from './cancel.js';
 import { reconcileBrowserGroup } from './reconcile.js';
 import { browserSignInMigration } from './sign-in-migration.js';
-import { cleanupBrowserSignInMail, recoverBrowserSignInMail, registerSignInMailDelivery } from './sign-in-mail.js';
+import {
+  cleanupBrowserSignInMail,
+  recoverBrowserSignInMail,
+  registerSignInMailDelivery,
+  signInCodeAction,
+  relaySignInAction,
+} from './sign-in-mail.js';
 import {
   registerBrowserPurchaseDelivery,
+  purchaseAction,
+  purchaseCommitAction,
+  recordUnknownBrowserPurchaseRequest,
   resumeBrowserPurchaseCommits,
   sweepBrowserPurchaseState,
 } from './purchase.js';
 import { registerPurchaseOutcomeDelivery } from './purchase-outcome.js';
 import { registerReservationGuaranteeDelivery } from './reservation-guarantee.js';
-import { registerConsentGrantsDelivery } from './consent-approval.js';
+import { registerConsentGrantsDelivery, requestConsentAction } from './consent-approval.js';
 import { registerDisclosureDelivery } from './disclosures.js';
 import { registerVaultAccessDelivery } from './vault-access.js';
-import './watches.js';
+import { watchAction, listWatchesAction, cancelWatchAction, watchBookAction } from './watches.js';
+import type { BrowserActions, BrowserExecutionContext } from './actions.js';
+import { sweepBrowserStartup } from './start-sweep.js';
 import { createBrowserWatchScheduler, type BrowserWatchScheduler } from './scheduler.js';
 
 registerMigration(browserSiteLeasesMigration);
@@ -100,9 +116,7 @@ onHostStart(async ({ signal }) => {
     const ready = await optional(async () => {
       if (!recovered) {
         await recoverBrowserSignInMail();
-        // Queue startup recovers purchase markers before any worker can run.
-        await activeQueue.start();
-        await resumeBrowserPurchaseCommits(activeQueue);
+        await recoverAndStartBrowserQueue(activeQueue);
         recovered = true;
       }
       await reconcileBrowserGroup();
@@ -114,8 +128,16 @@ onHostStart(async ({ signal }) => {
       watchScheduler = undefined;
       if (scheduler) await optional(() => scheduler.stop());
     } else if (!watchScheduler) {
-      watchScheduler = createBrowserWatchScheduler(activeQueue);
-      watchScheduler.start(signal);
+      await optional(async () => {
+        const scheduler = createBrowserWatchScheduler(activeQueue);
+        try {
+          scheduler.start(signal);
+          watchScheduler = scheduler;
+        } catch (error) {
+          await scheduler.stop();
+          throw error;
+        }
+      });
     }
   };
   const maintain = async (): Promise<void> => {
@@ -152,9 +174,43 @@ onHostStart(async ({ signal }) => {
   reconcileTimer.unref();
 });
 
+export const browserActions: BrowserActions = {
+  browser: browserAction,
+  fill_secret: fillSecretAction,
+  credential_form: credentialFormAction,
+  sign_in_code: signInCodeAction,
+  browser_relay_sign_in: relaySignInAction,
+  save_recipe: saveRecipeAction,
+  run_recipe: runRecipeAction,
+  request_consent: requestConsentAction,
+  purchase: purchaseAction,
+  browser_purchase_commit: purchaseCommitAction,
+  watch: watchAction,
+  list_watches: listWatchesAction,
+  cancel_watch: cancelWatchAction,
+  browser_watch_book: watchBookAction,
+};
+
+export const browserQueueFollowUps = {
+  finishRequestedCancellation,
+  settleRefusedSites,
+  recordUnknownBrowserPurchaseRequest,
+};
+
+export function createBrowserQueue(store: BrowserStore, runtime: BrowserExecutionContext['runtime']): BrowserQueue {
+  return new BrowserQueue(store, runtime, browserActions, browserQueueFollowUps);
+}
+
+/** All mandatory durable recovery finishes before any queued worker can run. */
+export async function recoverAndStartBrowserQueue(queue: BrowserQueue): Promise<void> {
+  await sweepBrowserStartup(queue);
+  await resumeBrowserPurchaseCommits(queue);
+  await queue.start();
+}
+
 let queue: BrowserQueue | undefined;
 export function getBrowserQueue(): BrowserQueue {
-  queue ??= new BrowserQueue(new BrowserStore(), runtime);
+  queue ??= createBrowserQueue(new BrowserStore(), runtime);
   return queue;
 }
 registerBrowserActionDelivery('browser', getBrowserQueue);
@@ -164,7 +220,8 @@ registerBrowserActionDelivery('sign_in_code', getBrowserQueue);
 registerBrowserActionDelivery('save_recipe', getBrowserQueue);
 registerBrowserActionDelivery('run_recipe', getBrowserQueue);
 registerBrowserActionDelivery('request_consent', getBrowserQueue);
-for (const name of ['watch', 'list_watches', 'cancel_watch']) registerBrowserActionDelivery(name, getBrowserQueue);
+for (const name of ['watch', 'list_watches', 'cancel_watch'] as const)
+  registerBrowserActionDelivery(name, getBrowserQueue);
 registerBrowserCancellationDelivery(getBrowserQueue);
 registerSignInMailDelivery(getBrowserQueue);
 registerBrowserPurchaseDelivery(getBrowserQueue);
@@ -182,12 +239,8 @@ export {
   type BrowserJob,
   type BrowserRequest,
 } from './db.js';
-export {
-  registerBrowserQueuedAction,
-  registerBrowserActionDelivery,
-  type BrowserExecutionContext,
-  type BrowserQueuedAction,
-} from './queue.js';
+export { registerBrowserActionDelivery } from './queue.js';
+export type { BrowserExecutionContext, BrowserQueuedAction } from './actions.js';
 export {
   activateControl,
   classifyActivation,

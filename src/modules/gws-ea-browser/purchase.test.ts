@@ -1,3 +1,5 @@
+import { createBrowserQueue, recoverAndStartBrowserQueue } from './index.js';
+import { holdBrowserRequest, stopHeldBrowserRequests } from './testing/held-request.js';
 /** Real delivery, approval, central DB, mailbox and native DOM. Only the container wake is mocked. */
 import fs from 'node:fs';
 import { execFileSync } from 'node:child_process';
@@ -517,7 +519,7 @@ describe.skipIf(!chromePath)('reviewed merchant purchases through native host de
     // Classification reads each control in an isolated world, through the handoff a job context registers.
     await prepareAuthenticationIsolation(page.context(), true);
     await page.goto(`${AMAZON_RETAIL.origin}${AMAZON_RETAIL.reviewPath}`);
-    queue = new BrowserQueue(new BrowserStore(), {
+    queue = createBrowserQueue(new BrowserStore(), {
       pageForJob: async () => page,
       connection: async (): Promise<never> => {
         throw new Error('Not used');
@@ -527,11 +529,12 @@ describe.skipIf(!chromePath)('reviewed merchant purchases through native host de
     });
     registerBrowserPurchaseDelivery(() => queue);
     if (!getDeliveryAction('reservation_guarantee')) registerReservationGuaranteeDelivery();
-    await queue.start();
+    await recoverAndStartBrowserQueue(queue);
     await resumeBrowserPurchaseCommits(queue);
     setBrowserAdmissionReady(true);
   });
   afterEach(async () => {
+    await stopHeldBrowserRequests();
     setBrowserAdmissionReady(false);
     await queue?.stop();
     await page?.context().close();
@@ -820,7 +823,7 @@ describe.skipIf(!chromePath)('reviewed merchant purchases through native host de
       );
       await queue.idle();
       await queue.stop();
-      await queue.start();
+      await recoverAndStartBrowserQueue(queue);
       await resumeBrowserPurchaseCommits(queue);
       if (closePage) {
         await page.close();
@@ -948,7 +951,7 @@ describe.skipIf(!chromePath)('reviewed merchant purchases through native host de
     await getDb().run("UPDATE pending_approvals SET status = 'approved' WHERE approval_id = ?", row.approval_id);
     await resumeApprovedApprovals();
     expect(submitted).toBe(0);
-    await queue.start();
+    await recoverAndStartBrowserQueue(queue);
     await resumeBrowserPurchaseCommits(queue);
     await queue.idle();
     expect(submitted).toBe(1);
@@ -1060,8 +1063,8 @@ describe.skipIf(!chromePath)('reviewed merchant purchases through native host de
     const requestRow = (await queue.store.pending(session.thread_id!))[0];
     if (!requestRow) throw new Error('Approved commit was not durably queued');
     const id = requestRow.id;
-    await queue.store.start(id);
-    const context = (await queue.contextForRequest(id))!;
+    const held = await holdBrowserRequest(queue.store, queue.runtime, 'browser_purchase_commit');
+    const context = held.context;
     await store.begin(
       context,
       authority.id,
@@ -1069,8 +1072,13 @@ describe.skipIf(!chromePath)('reviewed merchant purchases through native host de
     );
     expect((await queue.store.request(id))?.commit_started_at).toBeTruthy();
     expect(submitted).toBe(0);
+    const stoppedHost = vi.spyOn(held.queue, 'finish').mockRejectedValue(new Error('Host stopped before answer'));
+    await expect(held.queue.stop()).rejects.toThrow('Host stopped before answer');
+    stoppedHost.mockRestore();
+    expect((await store.get(authority.id))?.state).toBe('committing');
+    expect((await queue.store.request(id))?.answered_at).toBeNull();
     await queue.stop();
-    await queue.start();
+    await recoverAndStartBrowserQueue(queue);
     await resumeBrowserPurchaseCommits(queue);
     await queue.idle();
     expect((await store.get(authority.id))?.state).toBe('unknown');

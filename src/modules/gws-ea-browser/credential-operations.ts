@@ -100,7 +100,8 @@ import {
   type PinnedBrowserRef,
 } from './observe.js';
 import { registrableDomain, type BrowserVaultReason } from './onepassword.js';
-import { registerBrowserQueuedAction, type BrowserExecutionContext, type BrowserQueue } from './queue.js';
+import { type BrowserQueue } from './queue.js';
+import type { BrowserExecutionContext, BrowserQueuedAction } from './actions.js';
 import {
   finishSignupVerification,
   openSignupVerification,
@@ -1756,8 +1757,8 @@ export async function recoverCredentialAttempts(attempts: CredentialAttempts = c
     }
 }
 
-registerBrowserQueuedAction('credential_form', {
+export const credentialFormAction: BrowserQueuedAction = {
   validate: validateCredentialForm,
   execute: (context, payload) => executeCredentialForm(context, payload),
   recover: (request) => recoverCredentialRequest(request),
-});
+};

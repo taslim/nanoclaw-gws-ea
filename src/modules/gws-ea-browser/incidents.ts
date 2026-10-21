@@ -17,7 +17,7 @@ import { showsCharge, type ConfirmationEvidence } from './confirmation.js';
 import { BrowserStore } from './db.js';
 import { formatMoney } from './fingerprint.js';
 import { tellOfPurchaseOnce } from './notices.js';
-import type { BrowserExecutionContext } from './queue.js';
+import type { BrowserOperationContext } from './actions.js';
 
 export type IncidentKind = 'unapproved_commit' | 'late_confirmation';
 
@@ -140,7 +140,7 @@ export interface UnapprovedCommit {
  * never interrupted. Returns what the stopped action reports of the incident.
  */
 export async function stopForUnapprovedCommit(
-  context: BrowserExecutionContext,
+  context: BrowserOperationContext,
   commit: UnapprovedCommit,
 ): Promise<{ readonly site: string; readonly reference: string; readonly charged?: string }> {
   if (!showsCharge(commit.evidence)) throw new Error('A confirmation without a charge is no unapproved commit');
@@ -160,6 +160,6 @@ export async function stopForUnapprovedCommit(
     });
   }
   /* eslint-enable no-catch-all/no-catch-all */
-  await finishBrowserJobCancellation(stop, undefined, context.request.id);
+  await finishBrowserJobCancellation(stop, undefined, context.kind === 'watch_check' ? undefined : context.request.id);
   return { site: incident.site, ...unapprovedCommitFacts(incident) };
 }

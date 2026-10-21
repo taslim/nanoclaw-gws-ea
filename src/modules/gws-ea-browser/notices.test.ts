@@ -1,3 +1,4 @@
+import { createBrowserQueue } from './index.js';
 import fs from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import Database from 'better-sqlite3';
@@ -23,7 +24,6 @@ import { resolveSystemSession, writeSessionMessage } from '../../session-manager
 import '../gws-ea-profile/index.js';
 import './index.js';
 import { BrowserStore } from './db.js';
-import { BrowserQueue } from './queue.js';
 import { notifyPurchaseOutcome } from './authority.js';
 import { notifyPurchaseCard } from './cards.js';
 import { deliverWatchNotices } from './watches.js';
@@ -83,7 +83,7 @@ it('delivers purchase, card, watch and site notices to cold and active browser t
     JSON.stringify({ type: 'browser_watch_outcome', status: 'found', watch_id: 'notice-watch' }),
     at,
   );
-  const queue = new BrowserQueue(store, {
+  const queue = createBrowserQueue(store, {
     async pageForJob(): Promise<never> {
       throw new Error('No browser operation expected');
     },

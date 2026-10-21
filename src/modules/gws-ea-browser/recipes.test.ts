@@ -9,7 +9,7 @@ import { browserRecipesMigration, browserSiteLeasesMigration } from './migration
 import { prepareAuthenticationIsolation } from './authentication-submit.js';
 import { executeBrowserBatch } from './executor.js';
 import { observePage, registerPageSecret, type BrowserRef } from './observe.js';
-import type { BrowserExecutionContext } from './queue.js';
+import type { BrowserExecutionContext } from './actions.js';
 import {
   executeRecipe,
   loadRecipe,

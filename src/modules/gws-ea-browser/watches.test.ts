@@ -1,3 +1,5 @@
+import { recoverAndStartBrowserQueue } from './index.js';
+import { holdBrowserRequest, stopHeldBrowserRequests } from './testing/held-request.js';
 import fs from 'node:fs';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 const root = await vi.hoisted(async () => {
@@ -15,7 +17,6 @@ import { resolveSystemSession } from '../../session-manager.js';
 import '../gws-ea-profile/index.js';
 import './index.js';
 import { BrowserStore } from './db.js';
-import { BrowserQueue } from './queue.js';
 import { PurchaseAuthorityStore } from './authority.js';
 import { ERRAND_ORIGIN_LINE } from './cards.js';
 import { browserWatchesMigration } from './migration.js';
@@ -100,6 +101,7 @@ beforeEach(async () => {
   process.env.GWS_EA_BROWSER_POLICY_FILE = file;
 });
 afterEach(async () => {
+  await stopHeldBrowserRequests();
   vi.restoreAllMocks();
   vi.useRealTimers();
   delete process.env.GWS_EA_BROWSER_POLICY_FILE;
@@ -113,9 +115,7 @@ async function executionContext(name: string) {
   const { getSession } = await import('../../db/sessions.js');
   const session = (await getSession(job.browser_session_id))!;
   await store.accept(job, session, name, 'purchase', {}, 90_000);
-  const request = (await store.pending(jobId)).find((candidate) => candidate.request_id === name)!;
-  await store.start(request.id);
-  const queue = new BrowserQueue(store, {
+  return holdBrowserRequest(store, {
     async pageForJob(): Promise<never> {
       throw new Error('Unexpected browser');
     },
@@ -125,7 +125,6 @@ async function executionContext(name: string) {
     async closeJob() {},
     onDisconnected: () => () => undefined,
   });
-  return { queue, context: (await queue.contextForRequest(request.id))! };
 }
 
 /** An armed watch of the job: a reader watch on `watched`, a site, or a region watch (KTD20) with those bounds. */
@@ -265,8 +264,7 @@ describe('native watch bounds and one booking claim', () => {
     const session = (await getSession(job.browser_session_id))!;
     await store.accept(job, session, 'native-commit', 'purchase', {}, 90_000);
     const request = (await store.pending(jobId))[0];
-    await store.start(request.id);
-    const queue = new BrowserQueue(store, {
+    const { context } = await holdBrowserRequest(store, {
       async pageForJob(): Promise<never> {
         throw new Error('No DOM in authority test');
       },
@@ -276,7 +274,6 @@ describe('native watch bounds and one booking claim', () => {
       async closeJob() {},
       onDisconnected: () => () => undefined,
     });
-    const context = (await queue.contextForRequest(request.id))!;
     const authorityStore = new PurchaseAuthorityStore();
     const authority = await authorityStore.create({
       id: 'free-watch',
@@ -300,19 +297,17 @@ describe('native watch bounds and one booking claim', () => {
       jobId,
       new Date().toISOString(),
     );
-    await queue.withJobLock(jobId, () =>
-      authorityStore.begin(context, authority.id, facts, (db, accepted, current) =>
-        claimWatchBooking(db, {
-          watchId: 'friday',
-          jobId,
-          authorityId: accepted.id,
-          attemptId: accepted.attempt_id,
-          requestId: request.id,
-          facts: current,
-          calendarCheckedReservation: facts.reservation!,
-          at: new Date().toISOString(),
-        }),
-      ),
+    await authorityStore.begin(context, authority.id, facts, (db, accepted, current) =>
+      claimWatchBooking(db, {
+        watchId: 'friday',
+        jobId,
+        authorityId: accepted.id,
+        attemptId: accepted.attempt_id,
+        requestId: request.id,
+        facts: current,
+        calendarCheckedReservation: facts.reservation!,
+        at: new Date().toISOString(),
+      }),
     );
     expect(await store.request(request.id)).toMatchObject({ commit_started_at: expect.any(String) });
     expect(await authorityStore.get(authority.id)).toMatchObject({ state: 'committing' });
@@ -473,7 +468,12 @@ describe('native watch bounds and one booking claim', () => {
         at: new Date().toISOString(),
       }),
     );
-    await queue.start();
+    const stoppedHost = vi.spyOn(queue, 'finish').mockRejectedValue(new Error('Host stopped before answer'));
+    await expect(queue.stop()).rejects.toThrow('Host stopped before answer');
+    stoppedHost.mockRestore();
+    expect(await store.get(authority.id)).toMatchObject({ state: 'committing' });
+    expect((await queue.store.request(context.request.id))?.answered_at).toBeNull();
+    await recoverAndStartBrowserQueue(queue);
     expect(await store.get(authority.id)).toMatchObject({ state: 'unknown' });
     expect(await getDb().get('SELECT status FROM gws_ea_browser_watches WHERE id=?', 'friday')).toEqual({
       status: 'outcome_unknown',
@@ -1103,7 +1103,8 @@ describe('watches on sites with no reader (KTD20)', () => {
     expect(() => validateWatchRequest({ ...regionRequest, watch_id: 'watch-1' })).toThrow('watch_id');
     // The queue keeps the agent's own fields, so the run reads a release rule as the agent sent it.
     const { queue } = await executionContext('queued-release');
-    await queue.start();
+    await queue.stop();
+    await recoverAndStartBrowserQueue(queue);
     try {
       await getDb().run(
         "INSERT INTO gws_ea_browser_recipes(id,site,name,version,source_job_id,first_action,last_action,parameters_json,steps_json,read_only,created_at) VALUES('check-recipe','resy.com','Availability',1,?,0,0,'[]','[]',1,?)",

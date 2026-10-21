@@ -1,3 +1,4 @@
+import { createBrowserQueue } from './index.js';
 /** The open rule against native Chrome: unreviewed sites, cross-site frames, dialogs and hostile page script. */
 import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
@@ -77,7 +78,8 @@ import { browserVault } from './onepassword.js';
 import { observePage, type BrowserObservation } from './observe.js';
 import { registerBrowserPurchaseDelivery, resumeBrowserPurchaseCommits } from './purchase.js';
 import { recordPurchaseOutcome } from './purchase-outcome.js';
-import { BrowserQueue, type BrowserExecutionContext } from './queue.js';
+import { BrowserQueue } from './queue.js';
+import type { BrowserExecutionContext } from './actions.js';
 import { executeRecipe, saveBrowserRecipe } from './recipes.js';
 import { registerReservationGuaranteeDelivery } from './reservation-guarantee.js';
 import { deliverAction } from './testing/delivery-answer.js';
@@ -211,7 +213,7 @@ async function startErrandHost(thread: string): Promise<ErrandHost> {
     sent: [],
     attached: [],
     closed: 0,
-    queue: new BrowserQueue(new BrowserStore(), {
+    queue: createBrowserQueue(new BrowserStore(), {
       pageForJob: async () => page,
       connection: async (): Promise<never> => {
         throw new Error('Not used');
@@ -1306,7 +1308,7 @@ describe.skipIf(!chromePath)('personal data in native Chrome (KTD19, R34)', { ti
           target: refIn(signIn, 'Email'),
           submit: refIn(signIn, 'Continue'),
         }),
-      ).toEqual({ status: 'submitted' });
+      ).toMatchObject({ status: 'submitted' });
       expect(resolve).toHaveBeenCalledWith(
         'vault_osteria',
         'username',

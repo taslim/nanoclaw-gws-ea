@@ -1,5 +1,3 @@
-import type { Page } from 'playwright-core';
-
 import {
   ANSWER_LATER,
   ActionRefusal,
@@ -18,10 +16,10 @@ import { ALLOW, DENY, defineGuardedAction } from '../../guard/index.js';
 import { log } from '../../log.js';
 import { clearOutbox } from '../../session-manager.js';
 import type { Session } from '../../types.js';
-import { BrowserStore, markBrowserRequestCommitStarted, type BrowserJob, type BrowserRequest } from './db.js';
-import type { BrowserRuntime } from './runtime.js';
+import type { BrowserActionName, BrowserActions, BrowserExecutionContext } from './actions.js';
+import { BrowserOperation } from './operation.js';
+import { BrowserStore, markBrowserRequestCommitStarted, type BrowserRequest } from './db.js';
 import { SiteLeaseStore } from './leases.js';
-import { sweepBrowserStartup } from './start-sweep.js';
 import { readBrowserPolicy } from './policy.js';
 import { reconcileBrowserGroup } from './reconcile.js';
 import { writeBrowserNotice } from './notices.js';
@@ -30,44 +28,6 @@ import { BrowserDiagnosticAttempt } from './diagnostics.js';
 
 export const BROWSER_REQUEST_BUDGET_MS = 90_000;
 export const BROWSER_REQUEST_MAX_BUDGET_MS = 100_000;
-
-export interface BrowserExecutionContext {
-  readonly job: BrowserJob;
-  readonly request: Pick<BrowserRequest, 'id'>;
-  readonly session: Session;
-  readonly signal: AbortSignal;
-  readonly deadline: number;
-  readonly store: BrowserStore;
-  readonly runtime: Pick<BrowserRuntime, 'pageForJob' | 'connection' | 'closeJob' | 'onDisconnected'>;
-  page(): Promise<Page>;
-  /** Queued executors already own the exclusive job lock. Check again after any external wait. */
-  assertActive(): Promise<void>;
-  wakeWaiters(jobIds: readonly string[], eventId: string): Promise<void>;
-  markCommitStarted(): Promise<void>;
-  remaining(): number;
-}
-
-export interface BrowserQueuedAction {
-  validate(content: Record<string, unknown>): Record<string, unknown>;
-  execute(context: BrowserExecutionContext, payload: Record<string, unknown>): Promise<Record<string, unknown>>;
-  /** Host-only deferred callers receive every durable terminal outcome, including recovery and timeout. */
-  deliverAnswer?(request: BrowserRequest, frame: ResponseFrame): Promise<void>;
-  /**
-   * The durable outcome of a request its worker cannot answer from its own
-   * result (a crash, interruption, timeout or failure), recorded before the
-   * answer. Undefined leaves the generic stop. Never a reason to run again.
-   */
-  recover?(request: BrowserRequest): Promise<Record<string, unknown> | undefined>;
-  budgetMs?: number;
-}
-
-const actions = new Map<string, BrowserQueuedAction>();
-
-/** Each module registers its native action; absent capabilities have no executable action. */
-export function registerBrowserQueuedAction(name: string, action: BrowserQueuedAction): void {
-  if (actions.has(name)) throw new Error(`Browser action already registered: ${name}`);
-  actions.set(name, action);
-}
 
 export const browserRequestGuard = defineGuardedAction({
   action: 'gws_ea_browser.request',
@@ -89,7 +49,7 @@ export const browserRequestGuard = defineGuardedAction({
   },
 });
 
-export function registerBrowserActionDelivery(name: string, queue: () => BrowserQueue): void {
+export function registerBrowserActionDelivery(name: BrowserActionName, queue: () => BrowserQueue): void {
   registerDeliveryAction(
     name,
     answeringAction(name, async (content, session, requestId) => {
@@ -101,13 +61,19 @@ export function registerBrowserActionDelivery(name: string, queue: () => Browser
   );
 }
 
+export interface BrowserQueueFollowUps {
+  finishRequestedCancellation(jobId: string, queue: BrowserQueue): Promise<void>;
+  settleRefusedSites(queue: BrowserQueue, jobId: string): Promise<void>;
+  recordUnknownBrowserPurchaseRequest(requestId: string): Promise<void>;
+}
+
 /** Durable acceptance is synchronous with delivery; every browser wait is outside it. */
 export class BrowserQueue {
   private ready = false;
   private stopping = false;
   private readonly drains = new Map<string, Promise<void>>();
   private readonly locks = new Map<string, Promise<unknown>>();
-  private readonly running = new Map<string, AbortController>();
+  private readonly running = new Map<string, BrowserOperation>();
   private readonly diagnosticAttempts = new Map<string, BrowserDiagnosticAttempt>();
   private disconnect: (() => void) | undefined;
   readonly leases: SiteLeaseStore;
@@ -115,8 +81,14 @@ export class BrowserQueue {
   constructor(
     readonly store: BrowserStore,
     readonly runtime: BrowserExecutionContext['runtime'],
+    private readonly actions: BrowserActions,
+    private readonly followUps: BrowserQueueFollowUps,
   ) {
     this.leases = new SiteLeaseStore(store.db);
+  }
+
+  private action(name: string) {
+    return Object.hasOwn(this.actions, name) ? this.actions[name as BrowserActionName] : undefined;
   }
 
   async accept(name: string, content: Record<string, unknown>, session: Session, requestId: string): Promise<void> {
@@ -131,7 +103,7 @@ export class BrowserQueue {
       this.wake(job.id);
       return;
     }
-    const action = actions.get(name);
+    const action = this.action(name);
     if (!action) throw invalidArgs('Unknown browser action.');
     const payload = action.validate(content);
     const budget = content.budget_ms ?? action.budgetMs ?? BROWSER_REQUEST_BUDGET_MS;
@@ -168,9 +140,10 @@ export class BrowserQueue {
   async start(): Promise<void> {
     if (this.ready) return;
     this.stopping = false;
-    await sweepBrowserStartup(this);
     this.disconnect = this.runtime.onDisconnected(() => {
-      void this.interruptRunning();
+      void this.interruptRunning().catch(() =>
+        log.warn('Browser requests could not be interrupted', { reason: 'interruption_failed' }),
+      );
     });
     this.ready = true;
     for (const request of await this.store.pending()) this.wake(request.job_id);
@@ -181,12 +154,19 @@ export class BrowserQueue {
     this.ready = false;
     this.disconnect?.();
     this.disconnect = undefined;
-    await this.interruptRunning();
-    await this.idle();
+    try {
+      await this.interruptRunning();
+    } finally {
+      await this.idle();
+    }
   }
 
   async idle(): Promise<void> {
-    while (this.drains.size) await Promise.all([...this.drains.values()]);
+    while (this.drains.size) {
+      const settled = await Promise.allSettled([...this.drains.values()]);
+      const failed = settled.find((result) => result.status === 'rejected');
+      if (failed?.status === 'rejected') throw failed.reason;
+    }
   }
 
   wake(jobId: string): void {
@@ -237,34 +217,36 @@ export class BrowserQueue {
     return result.then((value) => ({ acquired: true, value }));
   }
 
-  async contextForRequest(
+  private async contextForRequest(
     id: string,
-    signal: AbortSignal = new AbortController().signal,
+    operation: BrowserOperation,
   ): Promise<BrowserExecutionContext | undefined> {
     const request = await this.store.request(id);
     if (!request) return undefined;
     const job = await this.store.getJob(request.job_id);
     const session = await getSession(request.session_id);
     if (!job || !session) return undefined;
-    const deadline = new Date(request.accepted_at).getTime() + request.budget_ms;
     const assertActive = async (): Promise<void> => {
-      if (signal.aborted || Date.now() >= deadline) throw new Error('Browser request is no longer active');
+      operation.assertActive();
       const current = await this.store.request(id);
       const liveJob = await this.store.getJob(job.id);
-      if (!current || current.answered_at || liveJob?.cancelled || signal.aborted || Date.now() >= deadline)
+      operation.assertActive();
+      if (!current || current.answered_at || !liveJob || liveJob.cancelled)
         throw new Error('Browser request is no longer active');
     };
     return {
+      kind: 'request',
       job,
       request,
       session,
-      signal,
-      deadline,
+      signal: operation.signal,
+      deadline: operation.deadline,
       store: this.store,
       runtime: this.runtime,
       page: async () => {
         await assertActive();
         const page = await this.runtime.pageForJob(job.id);
+        operation.ownPage(page);
         await assertActive();
         this.diagnosticAttempts.get(id)?.observe(page);
         return page;
@@ -275,7 +257,7 @@ export class BrowserQueue {
         await assertActive();
         await markBrowserRequestCommitStarted(this.store.db, request.id);
       },
-      remaining: () => Math.max(0, deadline - Date.now()),
+      remaining: operation.remaining,
     };
   }
 
@@ -300,66 +282,50 @@ export class BrowserQueue {
       await this.releaseJobLeases(current.job_id, current.id);
       return;
     }
-    const controller = new AbortController();
-    const context = await this.contextForRequest(request.id, controller.signal);
+    const operation = new BrowserOperation(Date.parse(request.accepted_at) + request.budget_ms, () =>
+      this.runtime.closeJob(request.job_id),
+    );
+    const context = await this.contextForRequest(request.id, operation);
     if (!context) {
+      await operation.finish();
       await this.finish(request, stopped('interrupted', true));
       return;
     }
     if (context.job.cancelled) {
+      await operation.finish();
       await this.finish(started, stopped('interrupted', true));
       return;
     }
     if (!context.remaining()) {
+      await operation.finish();
       await this.finish(started, stopped('timeout', true));
       return;
     }
-    this.running.set(request.id, controller);
+    this.running.set(request.id, operation);
     const diagnostics = new BrowserDiagnosticAttempt({
       jobId: request.job_id,
       requestId: request.id,
       action: request.action,
     });
     this.diagnosticAttempts.set(request.id, diagnostics);
-    let timer: NodeJS.Timeout | undefined;
-    let execution: Promise<Record<string, unknown>> | undefined;
     try {
-      const timeout = new Promise<Record<string, unknown>>((resolve) => {
-        timer = setTimeout(() => {
-          controller.abort('timeout');
-          resolve(stopped('timeout', false));
-        }, context.remaining());
-        timer.unref();
-      });
-      const action = actions.get(request.action);
+      const action = this.action(request.action);
       if (!action) {
         await this.finish(started, stopped('interrupted', true));
         return;
       }
-      execution = action.execute(context, JSON.parse(request.payload_json) as Record<string, unknown>);
-      const aborted = new Promise<Record<string, unknown>>((resolve) =>
-        controller.signal.addEventListener(
-          'abort',
-          () => resolve(stopped(controller.signal.reason === 'timeout' ? 'timeout' : 'interrupted', false)),
-          { once: true },
-        ),
+      const outcome = await operation.run(() =>
+        action.execute(context, JSON.parse(request.payload_json) as Record<string, unknown>),
       );
-      // Only the winner's value can answer: an action cut off by its timeout or
-      // abort reports its durable state, whatever it settles to while closing.
-      const { won, result } = await Promise.race([
-        execution.then((value) => ({ won: true, result: value })),
-        timeout.then((value) => ({ won: false, result: value })),
-        aborted.then((value) => ({ won: false, result: value })),
-      ]);
-      if (controller.signal.aborted) await this.runtime.closeJob(request.job_id);
+      await operation.closeAbortedPage();
       const latest = await this.store.request(request.id);
       await this.finish(
         started,
-        controller.signal.aborted && latest?.commit_started_at
+        operation.signal.aborted && latest?.commit_started_at
           ? stopped('unconfirmed', false)
-          : won
-            ? result
-            : ((await actions.get(request.action)?.recover?.(started)) ?? result),
+          : 'value' in outcome
+            ? outcome.value
+            : ((await action.recover?.(started)) ?? stopped(outcome.stopped, false)),
       );
     } catch (error) {
       if (!(error instanceof ActionRefusal))
@@ -377,13 +343,10 @@ export class BrowserQueue {
           ? stopped('unconfirmed', false)
           : error instanceof ActionRefusal
             ? error
-            : ((await actions.get(request.action)?.recover?.(started)) ?? stopped('browser_unavailable', false)),
+            : ((await this.action(request.action)?.recover?.(started)) ?? stopped('browser_unavailable', false)),
       );
     } finally {
-      if (timer) clearTimeout(timer);
-      // An interrupted SDK call may finish late. Keep this job quarantined until it settles;
-      // its assertActive checks prohibit any further interaction in the meantime.
-      if (controller.signal.aborted) await execution?.catch(() => undefined);
+      await operation.finish();
       diagnostics.finish();
       this.diagnosticAttempts.delete(request.id);
       this.running.delete(request.id);
@@ -393,16 +356,21 @@ export class BrowserQueue {
 
   /** After each request: sites it no longer holds go to their waiters, and a cancellation waiting on it completes. */
   private async releaseJobLeases(jobId: string, eventId: string): Promise<void> {
-    await this.wakeWaiters(await this.leases.releaseUnheldPurchases(jobId), `${eventId}:purchase-holds`);
-    const leases = await this.store.db.all<{ site: string }>(
-      "SELECT site FROM gws_ea_browser_site_leases WHERE job_id = ? AND state <> 'purchase'",
-      jobId,
-    );
-    for (const lease of leases)
-      await this.wakeWaiters(await this.leases.release(jobId, lease.site), `${eventId}:${lease.site}`);
-    const { finishRequestedCancellation } = await import('./cancel.js');
-    await finishRequestedCancellation(jobId, this);
-    this.settleRefusedSites(jobId);
+    try {
+      await this.wakeWaiters(await this.leases.releaseUnheldPurchases(jobId), `${eventId}:purchase-holds`);
+      const leases = await this.store.db.all<{ site: string }>(
+        "SELECT site FROM gws_ea_browser_site_leases WHERE job_id = ? AND state <> 'purchase'",
+        jobId,
+      );
+      for (const lease of leases)
+        await this.wakeWaiters(await this.leases.release(jobId, lease.site), `${eventId}:${lease.site}`);
+    } finally {
+      try {
+        await this.followUps.finishRequestedCancellation(jobId, this);
+      } finally {
+        this.settleRefusedSites(jobId);
+      }
+    }
   }
 
   /**
@@ -412,8 +380,8 @@ export class BrowserQueue {
    * provider call holds up this job's queue.
    */
   private settleRefusedSites(jobId: string): void {
-    void import('./credential-operations.js')
-      .then(({ settleRefusedSites }) => settleRefusedSites(this, jobId))
+    void this.followUps
+      .settleRefusedSites(this, jobId)
       .catch(() => log.warn('A held credential site could not be settled', { reason: 'settlement_failed' }));
   }
 
@@ -424,7 +392,7 @@ export class BrowserQueue {
    */
   async interruptedAnswer(request: BrowserRequest, repeatSafe: boolean): Promise<Record<string, unknown>> {
     if (request.commit_started_at) return stopped('unconfirmed', false);
-    return (await actions.get(request.action)?.recover?.(request)) ?? stopped('interrupted', repeatSafe);
+    return (await this.action(request.action)?.recover?.(request)) ?? stopped('interrupted', repeatSafe);
   }
 
   async wakeWaiters(jobIds: readonly string[], eventId: string): Promise<void> {
@@ -459,8 +427,7 @@ export class BrowserQueue {
       !(result instanceof ActionRefusal) &&
       (result.status === 'unconfirmed' || result.reason === 'unconfirmed')
     ) {
-      const { recordUnknownBrowserPurchaseRequest } = await import('./purchase.js');
-      await recordUnknownBrowserPurchaseRequest(request.id);
+      await this.followUps.recordUnknownBrowserPurchaseRequest(request.id);
     }
     const diagnostics = this.diagnosticAttempts.get(request.id)?.finish();
     this.diagnosticAttempts.delete(request.id);
@@ -492,7 +459,7 @@ export class BrowserQueue {
     try {
       const frame = JSON.parse(request.answer_json) as ResponseFrame;
       await writeActionResponse(session, request.request_id, frame);
-      await actions.get(request.action)?.deliverAnswer?.(request, frame);
+      await this.action(request.action)?.deliverAnswer?.(request, frame);
     } catch (_error) {
       return;
     } // Persisted answer remains eligible for the next mailbox retry.
@@ -516,13 +483,17 @@ export class BrowserQueue {
   }
 
   async interruptRunning(): Promise<void> {
-    for (const [id, controller] of this.running) {
-      controller.abort('interrupted');
-      const request = await this.store.request(id);
-      if (!request) continue;
-      await this.runtime.closeJob(request.job_id).catch(() => undefined);
-      await this.finish(request, await this.interruptedAnswer(request, false));
-    }
+    const interrupted = await Promise.allSettled(
+      [...this.running].map(async ([id, operation]) => {
+        operation.abort('interrupted');
+        const request = await this.store.request(id);
+        if (!request) return;
+        await operation.closeAbortedPage();
+        await this.finish(request, await this.interruptedAnswer(request, false));
+      }),
+    );
+    const failed = interrupted.find((result) => result.status === 'rejected');
+    if (failed?.status === 'rejected') throw failed.reason;
   }
 }
 

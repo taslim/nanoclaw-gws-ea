@@ -31,7 +31,7 @@ import {
 import { BrowserStore } from './db.js';
 import { writeBrowserNotice } from './notices.js';
 import { readBrowserPolicy } from './policy.js';
-import { registerBrowserQueuedAction, type BrowserExecutionContext } from './queue.js';
+import type { BrowserExecutionContext, BrowserQueuedAction } from './actions.js';
 import { quoted } from '../approvals/request-text.js';
 
 /** The `pending_approvals.action` a consent card resolves through. */
@@ -254,7 +254,10 @@ registerApprovalResolvedHandler(async ({ approval, outcome }) => {
   if (changed.changes && stop) await notifyConsentOutcome(stop, status);
 });
 
-registerBrowserQueuedAction('request_consent', { validate: validateConsentRequest, execute: executeConsentRequest });
+export const requestConsentAction: BrowserQueuedAction = {
+  validate: validateConsentRequest,
+  execute: executeConsentRequest,
+};
 
 // ---------------------------------------------------------------- the principal's grants, through main
 

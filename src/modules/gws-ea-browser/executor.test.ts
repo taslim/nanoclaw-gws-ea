@@ -6,7 +6,7 @@ import { recordWebAlias } from '../gws-ea-profile/testing/web-alias.js';
 import './index.js';
 import { executeBrowserBatch, isSecretBrowserField, validateBrowserBatch } from './executor.js';
 import type { PinnedBrowserRef } from './observe.js';
-import type { BrowserExecutionContext } from './queue.js';
+import type { BrowserExecutionContext } from './actions.js';
 import { registerPageSecret } from './observe.js';
 
 // A fake page has no isolated worlds, so its scan for secret values would fail closed; native suites cover the

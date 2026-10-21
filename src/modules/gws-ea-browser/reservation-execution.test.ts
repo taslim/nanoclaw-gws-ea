@@ -1,3 +1,4 @@
+import { createBrowserQueue, recoverAndStartBrowserQueue } from './index.js';
 /** Native Chrome + real queue/authority/claims. Only calendar service and container wake are fixture boundaries. */
 import fs from 'node:fs';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -90,7 +91,7 @@ describe.skipIf(!chromePath)('native reservation through the common purchase exe
     fixture = await resyFixture(chromePath, fixtureState);
     await resyReservationSignature.preparePage?.(fixture.page);
     await load();
-    queue = new BrowserQueue(store, {
+    queue = createBrowserQueue(store, {
       pageForJob: async () => fixture.page,
       connection: async () => {
         throw new Error('No file transfer in reservation fixture');
@@ -100,7 +101,7 @@ describe.skipIf(!chromePath)('native reservation through the common purchase exe
       },
       onDisconnected: () => () => undefined,
     });
-    await queue.start();
+    await recoverAndStartBrowserQueue(queue);
     const bounds: WatchBounds = {
       site: 'resy.com',
       venue: { id: '25973', name: "L'Artusi" },
