@@ -1262,11 +1262,13 @@ describe.skipIf(!chromePath)('native authorized signup and password change', { t
         });
         await formFrame.evaluate(`(() => {
           const child = document.createElement('iframe');
-          child.srcdoc = "<body><script>fetch('https://parent.example/callback-signup?data=frame').catch(() => {}).finally(() => { document.body.dataset.finished = 'yes'; });</script></body>";
+          // Start the real callback later so this also covers completion after the first poll.
+          child.srcdoc = "<body><script>setTimeout(() => { fetch('https://parent.example/callback-signup?data=frame').catch(() => {}).finally(() => { document.body.dataset.finished = 'yes'; }); }, 100);</script></body>";
           document.body.append(child);
         })()`);
         const child = await newFrame;
-        await child.waitForFunction("document.body.dataset.finished === 'yes'");
+        // A child clipped outside its parent's viewport may receive no animation frames.
+        await child.waitForFunction("document.body.dataset.finished === 'yes'", undefined, { polling: 50 });
         expect(posts).toEqual([]);
         await grant();
         expect(await fill(authority, await refs(SIGNUP))).toEqual({ status: 'outcome_unknown' });
