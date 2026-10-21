@@ -9,9 +9,9 @@ import { pageHostnameIsPrivate } from './page-privacy.js';
 const manifest: unknown = createRequire(import.meta.url)('playwright-core/package.json');
 const playwrightVersion =
   typeof manifest === 'object' && manifest !== null && 'version' in manifest ? version(manifest.version) : undefined;
-const EVENT_LIMIT = 64;
+export const BROWSER_DIAGNOSTIC_EVENT_LIMIT = 64;
 const METHODS = new Set(['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS', 'CONNECT', 'TRACE']);
-const RESOURCES = new Set([
+export const BROWSER_DIAGNOSTIC_RESOURCES: ReadonlySet<string> = new Set([
   'document',
   'stylesheet',
   'image',
@@ -27,7 +27,7 @@ const RESOURCES = new Set([
   'other',
 ]);
 const ACTIONS = new Set<string>(BROWSER_ACTION_NAMES);
-const RULES = new Set([
+export const BROWSER_DIAGNOSTIC_RULES: ReadonlySet<string> = new Set([
   'blocked_address',
   'purchase_control',
   'account_security',
@@ -95,7 +95,7 @@ function facts(input: { url: string; method: string; resource: string }): Reques
   return {
     ...(site ? { site } : {}),
     method: METHODS.has(input.method) ? input.method : 'OTHER',
-    resource: RESOURCES.has(input.resource) ? input.resource : 'other',
+    resource: BROWSER_DIAGNOSTIC_RESOURCES.has(input.resource) ? input.resource : 'other',
   };
 }
 function transportCategory(raw: string | undefined): TransportCategory {
@@ -207,7 +207,7 @@ function safeFact(event: BrowserDiagnosticFact): BrowserDiagnosticFact {
         source: event.source,
         category: event.category,
         ...request,
-        ...(event.rule && RULES.has(event.rule) ? { rule: event.rule } : {}),
+        ...(event.rule && BROWSER_DIAGNOSTIC_RULES.has(event.rule) ? { rule: event.rule } : {}),
       };
     case 'runtime_error':
       return { source: event.source, category: event.category };
@@ -245,7 +245,7 @@ export class BrowserDiagnosticAttempt {
 
   record(event: BrowserDiagnosticFact, actionIndex?: number, requestIndex?: number, redirectedFrom?: number): void {
     if (this.closed) return;
-    if (this.events.length >= EVENT_LIMIT) {
+    if (this.events.length >= BROWSER_DIAGNOSTIC_EVENT_LIMIT) {
       this.omitted++;
       return;
     }
@@ -260,7 +260,6 @@ export class BrowserDiagnosticAttempt {
 
   finish(): BrowserDiagnostics {
     this.closed = true;
-    // Values may become private after a request began (for example when a credential field was read).
     for (const event of this.events) {
       const site = 'site' in event ? event.site : undefined;
       if (site && [...this.pages].some((page) => pageHostnameIsPrivate(page, site)) && 'site' in event)

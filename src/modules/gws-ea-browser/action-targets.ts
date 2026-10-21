@@ -20,10 +20,6 @@ export function browserKeyboardSubmitTarget(element: ElementHandle): Promise<JSH
   });
 }
 
-/**
- * Whether a target only reads: an ordinary control or field, on no transaction page, outside any form that
- * submits by anything but GET. Its replay loads GET documents only (KTD2), so a script that posts is refused.
- */
 async function readOnlyTarget(page: Page, target: PinnedBrowserRef, kind: ActivationIntent['kind']): Promise<boolean> {
   const facts = await readPageControlFacts(page, target.element);
   if (

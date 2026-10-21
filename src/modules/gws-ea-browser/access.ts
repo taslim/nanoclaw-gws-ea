@@ -88,7 +88,6 @@ export async function readHostBrowserPolicy(file?: string): Promise<BrowserPolic
     return policy;
     // eslint-disable-next-line no-catch-all/no-catch-all -- Every failed host authority read denies browser admission.
   } catch {
-    // A failed host authority read is never permission to admit work, even for a disabled v2 policy.
     return { status: 'unavailable', enabled: false, reason: 'invalid-browser-policy' };
   }
 }

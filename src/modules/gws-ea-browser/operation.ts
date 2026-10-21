@@ -67,7 +67,6 @@ export class BrowserOperation {
   async finish(): Promise<void> {
     clearTimeout(this.timer);
     this.parentSignal?.removeEventListener('abort', this.onAbort);
-    // Never release the job lock to a replacement while an old native operation can still finish.
     if (this.signal.aborted) await this.execution?.catch(() => undefined);
     await this.closing;
   }

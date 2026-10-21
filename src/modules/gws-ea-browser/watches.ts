@@ -1,6 +1,5 @@
 import { observePage } from './observe.js';
 import { formatLocalTimeWithZone } from '../../timezone.js';
-import { createHash } from 'node:crypto';
 import { markWatchRegion, readBrowserWatchSetup } from './watch-runtime.js';
 import { executeBrowserPurchase } from './purchase.js';
 import {
@@ -15,6 +14,7 @@ import {
   regionWakesThisHour,
   excerpt,
   detachBrowserWatchCards,
+  watchDigest,
 } from './watch-state.js';
 import { invalidArgs } from '../../cli/delivery-action.js';
 import { getDb } from '../../db/connection.js';
@@ -408,7 +408,7 @@ export async function createBrowserWatch(
   const input = validateWatchRequest(payload),
     db = context.store.db;
   if (input.watch_id) return markBrowserWatchAgain(context, input);
-  const id = `watch-${digest(context.request.id)}`;
+  const id = `watch-${watchDigest(context.request.id)}`;
   const existing = await getBrowserWatch(id, db);
   if (existing)
     return {
@@ -728,7 +728,7 @@ export const watchBookAction: BrowserQueuedAction = {
         await emitWatchNotice(
           watch,
           'available',
-          `recipe:${watch.booking_recipe_id}:${digest(JSON.stringify(result.expected))}`,
+          `recipe:${watch.booking_recipe_id}:${watchDigest(JSON.stringify(result.expected))}`,
           { reason: 'booking_recipe_changed' },
         );
         return result;
@@ -743,5 +743,3 @@ export const watchBookAction: BrowserQueuedAction = {
     }
   },
 };
-
-const digest = (text: string): string => createHash('sha256').update(text).digest('hex');

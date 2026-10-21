@@ -149,7 +149,6 @@ export async function collectSecretFields(page: Page): Promise<boolean> {
   if (!page.frames().length) return false;
   const values = await readPageSecretValues(page);
   for (const value of values) {
-    // An observed value taints its documents; only a host fill owns active atomic exposure.
     registerPageRedaction(page, value);
     stateFor(page).unboundSecretDocuments.add(value);
     await bindPageSecretDocuments(page, value);
@@ -157,7 +156,6 @@ export async function collectSecretFields(page: Page): Promise<boolean> {
   return values.length > 0;
 }
 
-/** Active host exposure, an unbound secret, or a current document the host observed or filled a secret on. */
 async function hostSecretOnPage(page: Page): Promise<boolean> {
   const state = stateFor(page);
   if (state.activeSecrets.size || state.unboundSecretDocuments.size) return true;

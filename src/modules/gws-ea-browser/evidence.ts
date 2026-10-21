@@ -1,6 +1,12 @@
 import { getDomain } from 'tldts';
 import { BROWSER_ACTION_NAMES } from './actions.js';
-import type { BrowserDiagnostics, BrowserDiagnosticEvent } from './diagnostics.js';
+import {
+  BROWSER_DIAGNOSTIC_EVENT_LIMIT,
+  BROWSER_DIAGNOSTIC_RESOURCES,
+  BROWSER_DIAGNOSTIC_RULES,
+  type BrowserDiagnostics,
+  type BrowserDiagnosticEvent,
+} from './diagnostics.js';
 import { getDb } from '../../db/connection.js';
 import type { MailboxSession } from '../../mailbox/types.js';
 import { withExistingMailboxSession } from '../../session-manager.js';
@@ -117,7 +123,6 @@ function runtimeVersion(value: unknown): string | undefined {
     : undefined;
 }
 function diagnosticSite(value: unknown): string | undefined {
-  // Stored metadata is untrusted input here. Reject URLs, redaction markers and arbitrary strings.
   return typeof value === 'string' &&
     value.length <= 253 &&
     /^[a-z0-9]+(?:[a-z0-9.-]*[a-z0-9])?$/u.test(value) &&
@@ -148,21 +153,8 @@ function diagnosticEvent(raw: unknown): BrowserDiagnosticEvent | undefined {
     'TRACE',
     'OTHER',
   ]);
-  const resource = member(event.resource, [
-    'document',
-    'stylesheet',
-    'image',
-    'media',
-    'font',
-    'script',
-    'texttrack',
-    'xhr',
-    'fetch',
-    'eventsource',
-    'websocket',
-    'manifest',
-    'other',
-  ]);
+  const resource =
+    typeof event.resource === 'string' && BROWSER_DIAGNOSTIC_RESOURCES.has(event.resource) ? event.resource : undefined;
   const request = { ...(site ? { site } : {}), ...(method ? { method } : {}), ...(resource ? { resource } : {}) };
   switch (event.source) {
     case 'http_response':
@@ -177,20 +169,7 @@ function diagnosticEvent(raw: unknown): BrowserDiagnosticEvent | undefined {
     }
     case 'host_refusal': {
       const category = member(event.category, ['address', 'document', 'action', 'target', 'download']);
-      const rule = member(event.rule, [
-        'blocked_address',
-        'purchase_control',
-        'account_security',
-        'speaks_as_principal',
-        'consent_control',
-        'consent_required',
-        'read_only',
-        'site_busy',
-        'secret_field',
-        'card_field',
-        'stale_ref',
-        'personal_data',
-      ]);
+      const rule = typeof event.rule === 'string' && BROWSER_DIAGNOSTIC_RULES.has(event.rule) ? event.rule : undefined;
       return category
         ? { ...common, ...request, source: event.source, category, ...(rule ? { rule } : {}) }
         : undefined;
@@ -228,11 +207,11 @@ function diagnosticMetadata(raw: unknown, request: EvidenceRequest, job: Evidenc
     action: request.action,
     ...(count(metadata.action_index) ? { action_index: metadata.action_index } : {}),
     runtime: { node, ...(playwright ? { playwright } : {}), ...(chrome ? { chrome } : {}) },
-    events: metadata.events.slice(0, 64).flatMap((event) => {
+    events: metadata.events.slice(0, BROWSER_DIAGNOSTIC_EVENT_LIMIT).flatMap((event) => {
       const safe = diagnosticEvent(event);
       return safe ? [safe] : [];
     }),
-    omitted_events: metadata.omitted_events + Math.max(0, metadata.events.length - 64),
+    omitted_events: metadata.omitted_events + Math.max(0, metadata.events.length - BROWSER_DIAGNOSTIC_EVENT_LIMIT),
   };
 }
 function resultMetadata(

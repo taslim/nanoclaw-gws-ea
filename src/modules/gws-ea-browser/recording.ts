@@ -25,7 +25,6 @@ export function checkpoint(
   snapshot: Pick<BrowserStructure, 'tree' | 'replayUrl'>,
   nodes?: ReturnType<typeof flatten>,
 ): RecipeCheckpoint {
-  // Display strings never become executable checkpoint state.
   if (!snapshot.replayUrl) throw new Error('Checkpoint unavailable');
   const heading = (nodes ?? flatten(ariaNodes(snapshot.tree))).find((node) => node.role === 'heading')?.name;
   return { url: checkpointUrl(snapshot.replayUrl), ...(heading ? { heading } : {}) };

@@ -2,7 +2,7 @@ import { linkWatchBookingRecipe } from './watch-recipes.js';
 import { type BrowserRecipeParameter, type BrowserRecipe, loadRecipe } from './recipe-store.js';
 import { checkpoint as recordedCheckpoint, type BrowserRecipeStep, type RecipeCheckpoint } from './recording.js';
 import { browserKeyboardSubmitTarget } from './action-targets.js';
-import { browserActionRefs, type BrowserAction, type BrowserBatchOptions } from './actions.js';
+import { type BrowserAction, type BrowserBatchOptions } from './actions.js';
 import {
   ariaNodes,
   flatten,
@@ -24,7 +24,6 @@ import {
   browserRefForElement,
   observePage,
   snapshotBrowserStructure,
-  type BrowserObservation,
   type BrowserRef,
   type PinnedBrowserRef,
 } from './observe.js';
@@ -242,20 +241,16 @@ export async function saveBrowserRecipe(
     repeat_safe: false,
   };
 }
-function bindAction(step: BrowserRecipeStep, refs: BrowserRef[], value?: string): BrowserAction {
+function parameterizedAction(step: BrowserRecipeStep, value?: string): BrowserAction {
   const action = structuredClone(step.action);
-  if ('ref' in action) {
-    Object.assign(action, refs[0]);
-    if (value !== undefined) {
-      if (action.kind === 'type') action.text = value;
-      else if (action.kind === 'select') action.value = value;
-    }
-  } else if (action.kind === 'form_input') {
-    action.fields = action.fields.map((field, index) => ({ ...refs[index], value: value ?? field.value }));
-    if (action.submit) action.submit = refs[action.fields.length];
+  if (value !== undefined) {
+    if (action.kind === 'type') action.text = value;
+    else if (action.kind === 'select') action.value = value;
+    else if (action.kind === 'form_input') action.fields = action.fields.map((field) => ({ ...field, value }));
   }
   return action;
 }
+
 interface ActiveUrlInput {
   parameter: BrowserRecipeParameter;
   value: string;
@@ -357,27 +352,21 @@ export async function executeRecipe(
         await element.dispose();
       }
     }
-    const action = bindAction(
+    const action = parameterizedAction(
       step,
-      browserActionRefs(step.action),
       parameter?.kind === 'value' ? input.parameters[parameter.name] : undefined,
     );
     const result = await executeBrowserBatch(context, { actions: [action] }, { ...options, page, targets });
-    if (isRecord(result.recording)) {
+    if (result.recording) {
       if (result.recording.status !== 'complete') recording.status = 'unavailable';
-      if (Array.isArray(result.recording.trace_indices))
-        recording.trace_indices.push(
-          ...result.recording.trace_indices.filter(
-            (value): value is number => typeof value === 'number' && Number.isInteger(value),
-          ),
-        );
+      recording.trace_indices.push(...result.recording.trace_indices);
     } else recording.status = 'unavailable';
     // A step that bought something nobody approved has stopped the job: the replay ends with it (KTD10).
     if (result.reason === 'unapproved_commit') return { ...result, ...coverage(), step: index, repeat_safe: false };
     if (result.repeat_safe === false) repeatSafe = false;
-    const observation = isRecord(result.observation)
-      ? (result.observation as unknown as BrowserObservation)
-      : await observePage(page, context.assertActive, { remaining: context.remaining, signal: context.signal });
+    const observation =
+      result.observation ??
+      (await observePage(page, context.assertActive, { remaining: context.remaining, signal: context.signal }));
     if (result.reason === 'purchase_control') {
       const commit = targets[action.kind === 'form_input' ? targets.length - 1 : 0];
       if (!commit) return failed(index, { commit: 'recorded control' }, { commit: 'unavailable' });

@@ -226,7 +226,6 @@ export async function observePage(
       ]);
       Object.assign(site, recipes, vault);
       site = redactPageData(page, site) as BrowserObservation['site'];
-      // Unavailable discovery can be retried by the next observation on this same origin set.
       if (!recipes.recipes_status && !vault.vault_status) state.siteOriginsKey = originsKey;
     }
   } catch (_error) {

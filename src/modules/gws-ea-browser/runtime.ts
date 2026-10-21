@@ -131,8 +131,6 @@ export class BrowserRuntime {
         this.windows = undefined;
         this.retiring = stopChrome(attached.child);
         for (const listener of this.disconnectListeners) listener();
-        // A crash never replays a request; the queue owns interrupted answers.
-        // Only the runtime is replaced, under the same current policy.
         this.restart = setTimeout(() => {
           this.restart = undefined;
           if (generation !== this.generation) return;

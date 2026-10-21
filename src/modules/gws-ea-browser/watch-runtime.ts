@@ -102,7 +102,6 @@ export async function readWatchRegion(
   region: StructuredBrowserLocator,
   checkMainUrl = true,
 ): Promise<string | undefined> {
-  // A failed privacy read is an operationally failed check, never a missing region.
   await collectSecretFields(page);
   try {
     const target = await locateStructured(page, region, checkMainUrl);

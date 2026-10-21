@@ -1,4 +1,3 @@
-import { createHash } from 'node:crypto';
 import {
   type WatchRow,
   type WatchPurchaseRefusal,
@@ -10,6 +9,7 @@ import {
   compareWatchBounds,
   claimWatchBooking,
   emitWatchNotice,
+  watchDigest,
 } from './watch-state.js';
 import { findPrincipalCalendarConflicts } from '../gws-ea-meetings/calendar-facts.js';
 import { PurchaseAuthorityStore, type SpendingAuthority } from './authority.js';
@@ -29,7 +29,7 @@ async function checkWatchCalendar(watch: WatchRow, facts: PurchaseFacts): Promis
     status = 'calendar_unavailable';
   }
   if (status) {
-    await emitWatchNotice(watch, status, `${status}:${digest(JSON.stringify(slot))}`);
+    await emitWatchNotice(watch, status, `${status}:${watchDigest(JSON.stringify(slot))}`);
     return { status, watchId: watch.id };
   }
   return undefined;
@@ -58,13 +58,11 @@ export async function prepareWatchPurchase(
     const pending = watches.find((candidate) => candidate.status === 'awaiting_principal');
     if (!active.length && pending) return { status: 'awaiting_principal', watchId: pending.id };
     if (!active.length) return undefined;
-    // A region watch approved only what its bounds cover: any other booking is the principal's on its own card.
     if (active.every((candidate) => boundsOf(candidate).kind === 'region')) return undefined;
     for (const candidate of active)
-      await emitWatchNotice(candidate, 'outside_bounds', `outside:${digest(JSON.stringify(facts.reservation))}`);
+      await emitWatchNotice(candidate, 'outside_bounds', `outside:${watchDigest(JSON.stringify(facts.reservation))}`);
     return { status: 'outside_bounds', watchId: watches[0].id };
   }
-  // An agreement the principal has not approved goes on the purchase's card, which approves it with the booking.
   if (
     boundsOf(watch).kind === 'region' &&
     facts.agreements?.length &&
@@ -86,14 +84,13 @@ export async function prepareWatchPurchase(
         )
       )
         return { status: 'ready', watchId: watch.id, authorityId: existing.id };
-      // The parent watch still covers these facts. Retire its unspent child before deriving another.
       await db.run(
         "UPDATE gws_ea_browser_authorities SET state = 'revoked' WHERE id = ? AND state = 'live'",
         existing.id,
       );
     }
   }
-  const id = `watch-authority-${digest(`${watch.id}\0${context.request.id}`)}`;
+  const id = `watch-authority-${watchDigest(`${watch.id}\0${context.request.id}`)}`;
   const bounds = boundsOf(watch);
   const arrival = Date.parse(bookedSlot(facts)?.at ?? '');
   const window = bounds.windows.find((entry) => arrival >= Date.parse(entry.start) && arrival <= Date.parse(entry.end));
@@ -107,14 +104,13 @@ export async function prepareWatchPurchase(
     facts,
     bounds: {
       reservation: {
-        // A generic booking names its venue only as the page shows it.
         venueId: bounds.kind === 'region' ? bounds.venue.name : bounds.venue.id,
         partySize: bounds.partySize,
         windowStart: window.start,
         windowEnd: window.end,
       },
     },
-    attemptId: `watch-attempt-${digest(id)}`,
+    attemptId: `watch-attempt-${watchDigest(id)}`,
     expiresAt: bounds.until,
   });
   await db.run('UPDATE gws_ea_browser_watches SET authority_id = ? WHERE id = ?', authority.id, watch.id);
@@ -145,5 +141,3 @@ export async function prepareWatchCommit(
       at: new Date().toISOString(),
     });
 }
-
-const digest = (text: string): string => createHash('sha256').update(text).digest('hex');

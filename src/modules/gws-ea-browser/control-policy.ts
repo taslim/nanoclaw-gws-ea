@@ -34,21 +34,16 @@ export function reviewedMerchantFlow(url: URL): ReviewedMerchantFlow | undefined
 // Vocabulary is data: widen or narrow it here, never by bypassing the classification order.
 const purchase =
   /\b(?:buy(?:\s+now)?|pay(?:\s+now)?|place\s+(?:your\s+)?order|order\s+now|purchase(?!\s+(?:history|details|summary|records?|protection|options?))|confirm\s+(?:purchase|order|reservation|booking)|complete\s+(?:purchase|order|booking|reservation)|reserve\s+now|book\s+now|subscribe|start\s+(?:free\s+)?trial|donate|accept\s+(?:fee|charge)|upgrade|renew|place\s+(?:a\s+|your\s+)?bid|bid\s+now)\b/iu;
-/** Registration is a purchase only when it is paid. */
 const registration = /\bregister\b/iu;
-/** Cancelling or changing a booking or an order, a purchase on a page that shows a fee (R14). */
 const cancellation =
   /\b(?:cancel|change|modify|reschedule|amend)\s+(?:(?:my|this|your|the)\s+)?(?:reservation|booking|order|appointment|table|stay|trip|tickets?|subscription|membership|plan|visit|class)s?\b|^yes,?\s+cancel\b/iu;
-/** A bare Cancel cancels the booking on its page; in a dialog it closes the dialog. */
 const bareCancel = /^cancel$/iu;
 const security =
   /\b(?:change|reset|delete|remove|update|manage)\s+(?:password|security|account|payment\s+method|credit\s+card)|\b(?:sign\s*out|log\s*out|delete\s+account)\b/iu;
 const speaking =
   /\b(?:send\s+(?:message|email)|publish|post\s+(?:review|comment)|submit\s+(?:review|comment)|agree\s+on\s+behalf)\b/iu;
-/** Speaking a control's label names: reviews, comments, ratings, tips and messages to people (R4). */
 const speakingName =
   /\b(?:write|leave|add|post|submit)\s+(?:a\s+|your\s+)?(?:review|comment|rating|reply|answer|question|tip)\b|\b(?:send|post|submit)\s+(?:a\s+|your\s+)?(?:message|reply|note|inquiry|enquiry|feedback)\b|\b(?:give|send)\s+(?:a\s+)?tip\b|\brate\s+(?:this|us|it|your)\b|\bmessage\s+(?:the\s+|a\s+)?(?:restaurant|seller|host|owner|store|shop|business|venue|organi[sz]er|support)\b/iu;
-/** A press named only for speaking. On a field the same word names its content, not an action. */
 const speakingPress = /^(?:post|reply|comment|publish|tweet)$/iu;
 const unrelatedSecurity =
   /\b(?:change|update|add|remove|manage)\s+(?:sign.in email|email address|phone|two.factor|2fa|payment methods?)\b/iu;
@@ -56,15 +51,8 @@ const securityRoute =
   /\b(?:security|secure|auth|account)\s+(?:lock|report|reset|revoke)\b|\b(?:reset|revoke|lock)\s+(?:password|account|access|sessions?|tokens?)\b/iu;
 const purchaseRoute =
   /\b(?:oneclick|one click|charge|checkout submit|confirmbooking|placeorder|purchase|subscribe|starttrial)\b/iu;
-/**
- * Named preparation on a checkout, and the view controls of an order or booking's own page beside its charge and
- * card (a calendar entry, a receipt, tracking, managing the booking): never a commit, even where the page is a
- * transaction page (R2). Each of a control's names must be one. Changing or cancelling a booking is none of these:
- * R14 decides it.
- */
 const preparation =
   /^(?:add\s+to\s+(?:(?:my|your)\s+)?calendar|(?:view|see|show|print|download)\s+(?:(?:my|your|the)\s+)?(?:receipt|invoice|order|booking|reservation|tickets?)(?:\s+details)?|track\s+(?:(?:my|your|the)\s+)?(?:order|package|parcel|delivery|shipment)|manage\s+(?:(?:my|your|the)\s+)?(?:booking|reservation|order|tickets?)|[+−–-]|plus|minus|(?:(?:increase|decrease|reduce|raise|lower|update|change|edit|set|select|choose)\s+(?:the\s+)?)?(?:quantity|qty)\b.*|remove\b.*|delete(?:\s+(?:item|this\s+item|from\s+.+))?|apply(?:\s+(?:code|coupon|promo(?:\s+code)?|discount(?:\s+code)?|gift\s+card|voucher|credit))?|(?:add|enter|use|have\s+an?)\s+(?:a\s+)?(?:coupon|promo(?:\s+code)?|discount(?:\s+code)?|gift\s+card|voucher)\b.*|(?:coupon|promo(?:\s+code)?|discount(?:\s+code)?|gift\s+card|voucher)\b.*|edit\b.*|change(?:\s+(?:address|delivery|shipping|date|time|quantity|size|colou?r|items?))?|(?:use|add|edit|change|select|choose|save|enter)\s+(?:(?:a|this|new|another|the)\s+)?(?:(?:shipping|delivery|billing)\s+)?address(?:es)?\b.*|(?:select|choose|change)\s+(?:a\s+|the\s+)?(?:delivery|shipping)\s+(?:option|method|speed|date|time)|(?:standard|express|next.day|same.day|economy|priority|free)\s+(?:delivery|shipping)\b.*|back|go\s+back|previous|return\s+to\s+(?:cart|bag|basket|shop|store|shipping|information|details)|continue\s+(?:shopping|browsing)|keep\s+shopping|(?:show|hide|view|see|open|close)\s+(?:the\s+)?(?:order\s+)?(?:summary|details)|order\s+summary|add\s+to\s+(?:cart|bag|basket)|(?:view|go\s+to|open)\s+(?:cart|bag|basket)|(?:proceed|continue|go)\s+to\s+(?:checkout|shipping|delivery|payment|billing|information|details)|check\s*out|close|dismiss|cancel|not\s+now|no,?\s+thanks)$/iu;
-/** Roles and tags that choose or hold a value: activating one never presses anything. */
 const choiceRole =
   /^(?:checkbox|radio|switch|option|menuitemcheckbox|menuitemradio|tab|slider|spinbutton|combobox|listbox|textbox|searchbox)$/iu;
 
@@ -97,9 +85,7 @@ export function classifyControlFacts(facts: ControlFacts, kind: ActivationKind =
   const pressed = pressesControl(facts, kind);
   const region = facts.region;
   const routes = [facts.href, facts.formAction].flatMap((raw) => (raw ? [classifyNavigationUrl(raw)] : []));
-  // 1. A blocked address.
   if (routes.includes('blocked_address')) return 'blocked_address';
-  // 2. Account security: by label, by route, or a press of an account form on a signed-in account page.
   if (
     security.test(evidence) ||
     unrelatedSecurity.test(evidence) ||
@@ -107,8 +93,6 @@ export function classifyControlFacts(facts: ControlFacts, kind: ActivationKind =
     (pressed && facts.accountPage === true && region?.accountFields === true)
   )
     return 'account_security';
-  // 3. Speaking: by label, by route, in a chat widget, or a press that sends free text outside a booking or order,
-  // where the text would be that transaction's note.
   if (
     speaking.test(evidence) ||
     speakingName.test(evidence) ||
@@ -117,10 +101,7 @@ export function classifyControlFacts(facts: ControlFacts, kind: ActivationKind =
     (pressed && (facts.chatFrame === true || (region?.freeText === true && !region.commits)))
   )
     return 'speaks_as_principal';
-  // 4. A choice the consent engine owns (KTD11), by the choice the action would toggle: the agent never makes it.
   if (facts.toggles && consentClassChoice(facts.toggles)) return 'consent_control';
-  // 5. Purchase vocabulary: a label or route naming one, paid registration, or cancelling or changing a booking
-  // whose page shows a fee.
   if (
     purchase.test(evidence) ||
     routes.includes('purchase_control') ||
@@ -129,8 +110,6 @@ export function classifyControlFacts(facts: ControlFacts, kind: ActivationKind =
       names.some((name) => cancellation.test(name) || (bareCancel.test(name) && region?.dialog !== true)))
   )
     return 'purchase_control';
-  // 6. A commit on a transaction page: a press in a form or dialog that shows a total or a charge with a payment
-  // method, or in a modal speaking of the order on such a page, unless the host names it as preparation.
   if (
     pressed &&
     (region?.transaction === true || (region?.modalOrder === true && facts.transaction)) &&
@@ -141,10 +120,8 @@ export function classifyControlFacts(facts: ControlFacts, kind: ActivationKind =
 }
 
 const ACTION_PARAMETER = /^(?:action|operation|intent|command|do)$/iu;
-/** A path segment of this many words or more is prose, such as an article's slug, never a route that acts. */
 const PROSE_WORDS = 4;
 
-/** A navigation's path and action parameters as words, for the host's own route signatures. */
 function navigationEvidence(url: URL): string | undefined {
   try {
     const actionParameters = [...url.searchParams]
@@ -156,7 +133,6 @@ function navigationEvidence(url: URL): string | undefined {
   }
 }
 
-/** The words of a navigation's route that can act: its path segments and action parameters, without prose. */
 function routeWords(url: URL): string | undefined {
   try {
     return [
@@ -195,15 +171,9 @@ export function classifyNavigationUrl(raw: string): ActionClass {
   return reviewed && reviewed !== 'ordinary' ? reviewed : 'ordinary';
 }
 
-/**
- * The words an authorized password change may use (KTD7, R18). Only within a
- * change's own scope are they set aside before the security checks; every
- * other account-security change stays refused there too.
- */
 const passwordChange = /\b(?:change|update|set|save)\s+(?:(?:your|my)\s+)?(?:new\s+)?password\b/giu;
 const credentialSecurity =
   /\b(?:change|update|add|remove|manage|edit|replace|reset|delete)\s+(?:(?:your|my|sign.?in|login)\s+)?(?:e-?mail(?:\s+address)?|phone(?:\s+number)?|mobile|two.?factor|2fa|mfa|totp|authenticator|passkeys?|security\s+(?:keys?|questions?)|payment(?:\s+methods?)?|billing|cards?)\b/iu;
-/** Inside the widened scope, any money route is refused, not merely the generic commit signatures. */
 const credentialFinancial =
   /\b(?:checkout|cart|basket|billing|payments?|orders?|subscriptions?|subscribe|trials?|donate|donations?|purchase|upgrade|plans?|pricing)\b/iu;
 const signupActivation =
@@ -213,13 +183,7 @@ const credentialActivation: Record<CredentialKind, RegExp> = {
   rotation:
     /^(?:(?:change|update|set|save)\s+(?:(?:your|my)\s+)?(?:new\s+)?password|save(?:\s+changes)?|submit|continue|next|done|confirm|update)$/iu,
 };
-/**
- * A signup form's own submit control that accepts the site's terms as it
- * creates the account ("Agree and create account", "Agree & Join"). Only the
- * bound form's control may carry it, with no money terms on the page.
- */
 const agreeingSignup = new RegExp(`^(?:i\\s+)?(?:agree|accept)\\s*(?:and|&)\\s*(?:${signupActivation})$`, 'iu');
-/** The control that submits a signup's emailed verification code. */
 const verificationActivation =
   /^(?:verify(?:\s+(?:my\s+)?(?:e-?mail|account|code))?|confirm(?:\s+(?:my\s+)?(?:e-?mail|account|code))?|submit(?:\s+code)?|activate(?:\s+(?:my\s+)?account)?|continue|next|done)$/iu;
 /** Where a credential operation's control sits: the bound form's own control, or the step it submits. */

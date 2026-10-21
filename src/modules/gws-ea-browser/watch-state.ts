@@ -100,12 +100,8 @@ export type WatchClaimCallback = (
 ) => Promise<void>;
 export const APPROVAL_ACTION = 'browser_watch_setup';
 export const liveStates = ['armed', 'checking', 'preparing'] as const;
-const digest = (text: string): string => createHash('sha256').update(text).digest('hex');
+export const watchDigest = (text: string): string => createHash('sha256').update(text).digest('hex');
 export const boundsOf = (watch: WatchRow): WatchBounds => JSON.parse(watch.bounds_json) as WatchBounds;
-/**
- * An unreviewed page states when a booking starts, not when it ends: its calendar check and slot claim cover the two
- * hours a table is usually held.
- */
 const GENERIC_BOOKING_SPAN_MS = 2 * 60 * 60_000;
 /** The most a booking's terms can charge: each for every guest it is per, an unread amount without bound. */
 export function financialExposure(
@@ -114,7 +110,6 @@ export function financialExposure(
 ): number {
   return commitments.reduce((sum, term) => sum + (term.amountMinor ?? Infinity) * (term.perPerson ? partySize : 1), 0);
 }
-/** Whether a checkout's total or its terms' most passes the watch's maximum, or its amount due now the most due now. */
 function exceedsFinancialLimit(facts: PurchaseFacts, partySize: number, financial: WatchFinancialBounds): boolean {
   return (
     Math.max(facts.totalMinor, financialExposure(facts.commitments, partySize)) > financial.maxTotalMinor ||
@@ -137,7 +132,7 @@ export function bookedSlot(facts: PurchaseFacts): ReservationFacts | undefined {
   };
 }
 export function watchSlotKey(slot: ReservationFacts): string {
-  return digest(
+  return watchDigest(
     JSON.stringify([
       slot.venueId,
       slot.partySize,
@@ -161,10 +156,6 @@ export function watchReleases(watch: WatchRow): number[] {
   );
 }
 
-/**
- * Where a booking, as a page states it, falls outside a region watch's venue, party or windows (KTD20). A fact the
- * page does not state never places it outside.
- */
 function regionBookingOutside(
   bounds: WatchBounds,
   booking: Pick<GenericBookingFacts, 'venue' | 'partySize' | 'at'>,
@@ -181,11 +172,6 @@ function regionBookingOutside(
     : 'time';
 }
 
-/**
- * A region watch's approval covers a booking (KTD20) when the site's own checkout, as the host reads it, is the
- * watched merchant's, for the venue and party, arriving within a window, with its total, amount due now and every fee
- * within the approved maximum. A recurring charge has no total a one-time maximum bounds.
- */
 function compareRegionWatchBounds(bounds: WatchBounds, facts: PurchaseFacts, now: string): WatchBoundResult {
   const refuse = (reason: string): WatchBoundResult => ({ status: 'outside_bounds', reason });
   if (!(Date.parse(now) < Date.parse(bounds.until))) return refuse('deadline');
@@ -388,7 +374,6 @@ export async function finishWatchPurchase(
   );
 }
 
-/** Records one notice for a watch's job, once per event key; `deliverWatchNotices` writes it and wakes the job. */
 async function insertWatchNotice(
   db: DbDriver,
   watch: WatchRow,
@@ -415,7 +400,6 @@ export async function emitWatchNotice(
   await deliverWatchNotices(db);
 }
 
-/** A region watch's wakes (KTD20), each a notice: every change it reported and every request to mark it again. */
 const REGION_WAKE = /^(?:change|region_missing):/u;
 /** When a region watch woke the agent in the hour before `now`. */
 export async function regionWakesThisHour(db: DbDriver, watchId: string, now: number): Promise<number[]> {
@@ -426,7 +410,6 @@ export async function regionWakesThisHour(db: DbDriver, watchId: string, now: nu
   );
   return notices.filter((notice) => REGION_WAKE.test(notice.event_key)).map((notice) => Date.parse(notice.created_at));
 }
-/** The job's latest step toward a booking: a free commit's attempt, a purchase card, or a spending authority. */
 async function latestBookingStep(db: DbDriver, jobId: string): Promise<number> {
   const step = await db.get<{ at: string | null }>(
     `SELECT MAX(at) AS at FROM (
@@ -510,7 +493,7 @@ export async function recordRegionCheck(
             db,
             current,
             'region_missing',
-            `region_missing:${digest(`${current.region_marked_at ?? ''}\0${current.region_missing_since}`)}`,
+            `region_missing:${watchDigest(`${current.region_marked_at ?? ''}\0${current.region_missing_since}`)}`,
             { reason: read.reason },
           );
         return;
@@ -616,7 +599,7 @@ export async function deliverWatchNotices(db: DbDriver = getDb()): Promise<void>
     try {
       await writeBrowserNotice(
         session,
-        `browser-watch-${digest(`${notice.watch_id}\0${notice.event_key}`)}`,
+        `browser-watch-${watchDigest(`${notice.watch_id}\0${notice.event_key}`)}`,
         notice.outcome_json,
       );
       // eslint-disable-next-line no-catch-all/no-catch-all -- Retain a durable notice when its mailbox cannot be written.

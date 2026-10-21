@@ -170,7 +170,6 @@ export async function captureLocator(
   }
   throw new BrowserLocatorError('No structured accessible locator for this target');
 }
-/** The roles a host-found control can carry: what a press can be aimed at. */
 const PRESS_ROLES: readonly BrowserRole[] = ['button', 'link', 'menuitem', 'tab', 'option'];
 /** Computed native role membership, without taking a snapshot that would replace the current public ref map. */
 export async function captureElementRole(element: ElementHandle): Promise<BrowserRole> {

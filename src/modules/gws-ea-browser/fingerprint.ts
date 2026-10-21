@@ -425,7 +425,6 @@ export function guaranteeCoversReservation(
     )
   )
     return false;
-  // Distinct conditional fees can both apply; the ceiling covers total exposure, never one person's amount.
   const exposure = facts.commitments.reduce(
     (sum, term) => sum + (term.amountMinor ?? Infinity) * (term.perPerson ? reservation.partySize : 1),
     0,

@@ -452,8 +452,6 @@ async function executeBatch(
       let pressed = false;
       try {
         await context.assertActive();
-        // A signed-out check may share another job's held checkout; that ownership can change while it waits.
-        // The job's own active-site lease is already owned by the enclosing navigation scope.
         if (action.kind !== 'navigate' && options.siteAccess && /^https?:/u.test(page.url())) {
           if ((await options.siteAccess(new URL(page.url()))) !== 'ordinary') throw new BrowserBatchStop('site_busy');
         }
@@ -464,7 +462,6 @@ async function executeBatch(
           trace = await withinBrowserRecordingBudget(context.remaining(), () =>
             reserveBrowserActionTrace(db, jobId, requestId),
           );
-          // Preparation cannot decide whether the action runs; it reads no new snapshot or refs.
           let facts: BrowserRecipeStep | undefined;
           if (trace && index === 0) {
             try {
@@ -780,7 +777,6 @@ async function executeBatch(
   if (options.record !== false && context.kind !== 'watch_check') {
     let complete = true;
     for (const [ordinal, entry] of recordings.entries()) {
-      // Only the final action owns this observation. Never fill a missing intermediate checkpoint with it.
       const after = ordinal === recordings.length - 1 ? browserStructureFacts(page) : undefined;
       const trace = entry.trace;
       const facts = entry.facts;
