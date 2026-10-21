@@ -180,7 +180,20 @@ interface FactsView {
   readonly addresses: PrincipalRecognizer;
   readonly calendars: readonly string[];
   /** Each calendar's name as main speaks of it to the principal (`calendarNames`). */
-  readonly names: ReadonlyMap<string, string>;
+  readonly names: ReadonlyMap<string, CalendarName>;
+}
+
+interface CalendarName {
+  readonly text: string;
+  readonly external: boolean;
+}
+
+function calendarName(name: CalendarName): string {
+  return name.external ? untrustedLine(name.text, MAX_NAME_CHARS, CALENDAR_SOURCE) : name.text;
+}
+
+function namedCalendar(id: string, view: FactsView): CalendarName {
+  return view.names.get(id) ?? { text: id, external: true };
 }
 
 function timeKey(time: EventTime | undefined): string {
@@ -206,7 +219,7 @@ function mailbox(email: string): string {
  * that would read alike keep their addresses, the only thing that tells
  * them apart.
  */
-function calendarNames(entries: readonly CalendarEntry[], addresses: PrincipalRecognizer): Map<string, string> {
+function calendarNames(entries: readonly CalendarEntry[], addresses: PrincipalRecognizer): Map<string, CalendarName> {
   const heard = (name: string): string => {
     if (entries.length === 1) return "the principal's calendar";
     if (!addresses.has(name)) return "one of the principal's calendars";
@@ -216,11 +229,20 @@ function calendarNames(entries: readonly CalendarEntry[], addresses: PrincipalRe
   };
   const named = entries.map((entry) => {
     const name = entry.summary?.replace(/\s+/gu, ' ').trim() || entry.id;
-    return { id: entry.id, name, spoken: EMAIL_PATTERN.test(name) ? heard(name) : name };
+    const address = EMAIL_PATTERN.test(name);
+    return {
+      id: entry.id,
+      name,
+      spoken: { text: address ? heard(name) : name, external: !address },
+    };
   });
   const uses = new Map<string, number>();
-  for (const { spoken } of named) uses.set(spoken, (uses.get(spoken) ?? 0) + 1);
-  return new Map(named.map(({ id, name, spoken }) => [id, uses.get(spoken) === 1 ? spoken : name] as const));
+  for (const { spoken } of named) uses.set(spoken.text, (uses.get(spoken.text) ?? 0) + 1);
+  return new Map(
+    named.map(
+      ({ id, name, spoken }) => [id, uses.get(spoken.text) === 1 ? spoken : { text: name, external: true }] as const,
+    ),
+  );
 }
 
 function isRoom(attendee: DetailedAttendee): boolean {
@@ -261,9 +283,9 @@ function listMessage(head: string, entries: readonly string[], total: number): s
 function conflictLine(conflict: Conflict, view: FactsView): string {
   const overlapping = conflict.overlap_minutes === 0 ? 'under a minute' : count(conflict.overlap_minutes, 'minute');
   const when = conflict.all_day ? conflict.when : `${conflict.when} (overlapping ${overlapping})`;
-  const calendars = conflict.calendars.map((id) => view.names.get(id) ?? id);
+  const calendars = conflict.calendars.map((id) => namedCalendar(id, view));
   if (conflict.title === null) {
-    const named = calendars.filter((name) => !EMAIL_PATTERN.test(name));
+    const named = calendars.filter((name) => !EMAIL_PATTERN.test(name.text)).map(calendarName);
     return [
       `- ${when}`,
       ...(named.length === 0 ? [] : [`on ${LIST.format(named)}`]),
@@ -277,7 +299,7 @@ function conflictLine(conflict: Conflict, view: FactsView): string {
       : `organized by ${view.addresses.has(conflict.organizer) ? 'the principal' : conflict.organizer}`;
   return [
     `- ${when}`,
-    `on ${LIST.format(calendars)}`,
+    `on ${LIST.format(calendars.map(calendarName))}`,
     ...(organizer === undefined ? [] : [organizer]),
     ...(answer === undefined ? [] : [`the principal's answer: ${answer}`]),
     `title:\n${conflict.title}`,
@@ -289,7 +311,7 @@ function personLine(person: PersonStats, view: FactsView): string {
   const address = person.identity.replace(/^email:/u, '');
   if (person.meetings === 0) return `- ${address}: no meetings`;
   const byCalendar = Object.entries(person.meetings_by_calendar).map(
-    ([id, meetings]) => [view.names.get(id) ?? id, meetings] as const,
+    ([id, meetings]) => [calendarName(namedCalendar(id, view)), meetings] as const,
   );
   const meetings =
     byCalendar.length === 1

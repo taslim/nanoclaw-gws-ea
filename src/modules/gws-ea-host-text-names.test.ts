@@ -228,8 +228,10 @@ function toolMention(name: string, key: string): Mention {
   return { name, held: (holdings) => holdings.keys.has(key) };
 }
 
-function gogMention(service: string, words: readonly string[]): Mention | undefined {
-  if (!GOG_SERVICES.has(service)) return undefined;
+function gogMention(service: string, words: readonly string[]): Mention {
+  if (!GOG_SERVICES.has(service)) {
+    return { name: `gog ${[service, ...words.slice(0, 1)].join(' ')}`, unknown: 'not a command gog is given' };
+  }
   const hasGog = (holdings: Holdings, keys: readonly string[]): boolean =>
     holdings.keys.has(SHELL_CAPABILITY) && keys.some((key) => holdings.keys.has(key));
   for (let length = words.length; length > 0; length -= 1) {
@@ -279,8 +281,7 @@ function mentionsIn(text: string): Mention[] {
   for (const [, tool, first, rest] of text.matchAll(COMMAND)) {
     if (first === undefined) continue;
     const words = (rest ?? '').split(' ').filter((word) => word.length > 0);
-    const mention = tool === 'gog' ? gogMention(first, words) : nclMention(first, words);
-    if (mention !== undefined) mentions.push(mention);
+    mentions.push(tool === 'gog' ? gogMention(first, words) : nclMention(first, words));
   }
   return mentions;
 }
@@ -406,6 +407,12 @@ describe('the host-text names check', () => {
     expect(problems('gws-ea-fixture/main-notes.ts', `const NOTE = 'Read it with gog calendar event first.';`)).toEqual(
       [],
     );
+  });
+
+  it.each(['calender events', 'contacts list'])('fails on a gog service that is not given: %s', (command) => {
+    expect(problems('gws-ea-fixture/main-notes.ts', `const NOTE = 'Read it with gog ${command}.';`)).toEqual([
+      `gws-ea-fixture/main-notes.ts:1 gog ${command}: not a command gog is given`,
+    ]);
   });
 
   it('fails on any ncl named to an agent without it, and on an ncl command that is not registered', () => {
