@@ -3,6 +3,7 @@ import { repairBrowserWatchChecks } from './scheduler.js';
 import {
   type WatchBounds,
   type WatchRow,
+  deliverWatchNotices,
   getBrowserWatch,
   compareWatchBounds,
   claimWatchBooking,
@@ -25,7 +26,9 @@ vi.mock('../../config.js', async (original) => ({
 vi.mock('../../request-wake.js', () => ({ requestWake: vi.fn(async () => true) }));
 import { closeDb, createAgentGroup, createMessagingGroup, getDb, initTestDb, runMigrations } from '../../db/index.js';
 import { setDeliveryAdapter } from '../../delivery.js';
-import { resolveSystemSession } from '../../session-manager.js';
+import { resolveSystemSession, withExistingMailboxSession } from '../../session-manager.js';
+import { getPendingApproval, getSession } from '../../db/sessions.js';
+import type { PendingApproval, Session } from '../../types.js';
 import '../gws-ea-profile/index.js';
 import './index.js';
 import { BrowserStore } from './db.js';
@@ -35,12 +38,15 @@ import { browserWatchesMigration } from './migration.js';
 import { GENERIC_FLOW_ID, type GenericBookingFacts, type PurchaseFacts } from './fingerprint.js';
 import { createBrowserWatch, renderWatchCard, validateWatchRequest } from './watches.js';
 import { prepareWatchPurchase } from './watch-purchase.js';
+
 import * as calendarFacts from '../gws-ea-meetings/calendar-facts.js';
 import * as watchRuntime from './watch-runtime.js';
 import { bindVerifiedPrincipalUser } from '../gws-ea-profile/db.js';
 import { upsertUser } from '../permissions/db/users.js';
 import { upsertUserDm } from '../permissions/db/user-dms.js';
 import { handleApprovalsResponse, resumeApprovedApprovals } from '../approvals/response-handler.js';
+import { finalizeReject, resumeRejectedApprovals } from '../approvals/finalize.js';
+import { requestApproval } from '../approvals/index.js';
 import { saveBrowserRecipe } from './recipes.js';
 
 import { cancelBrowserJob } from './cancel.js';
@@ -536,7 +542,7 @@ describe('native watch bounds and one booking claim', () => {
       venue: bounds.venue,
       party_size: 4,
       windows: bounds.windows,
-      financial: { currency: 'USD', max_total: '50.00', terms },
+      financial: { currency: 'USD', max_total: '50.00' },
       until: bounds.until,
     });
     expect(result).toMatchObject({ status: 'refused', reason: 'read_only_recipe_required' });
@@ -552,7 +558,7 @@ describe('native watch bounds and one booking claim', () => {
       venue: bounds.venue,
       party_size: 4,
       windows: bounds.windows,
-      financial: { currency: 'USD', max_total: '50.00', terms },
+      financial: { currency: 'USD', max_total: '50.00' },
       until: bounds.until,
     });
     expect(pending).toMatchObject({ status: 'awaiting_principal' });
@@ -560,6 +566,8 @@ describe('native watch bounds and one booking claim', () => {
     expect(cards[0]).toContain('Bistro');
     expect(cards[0]).toContain('$50.00');
     expect(cards[0]).toContain(terms);
+    // The venue reads by its name: the site's own id for it means nothing to the principal.
+    expect(cards[0]).not.toContain('merchant identity');
     const approval = (
       await getDb().all<import('../../types.js').PendingApproval>(
         "SELECT * FROM pending_approvals WHERE action='browser_watch_setup'",
@@ -592,7 +600,7 @@ describe('native watch bounds and one booking claim', () => {
       venue: bounds.venue,
       party_size: 4,
       windows: bounds.windows,
-      financial: { currency: 'USD', max_total: '50.00', terms },
+      financial: { currency: 'USD', max_total: '50.00' },
       until: bounds.until,
     });
     expect(cards).toHaveLength(1);
@@ -786,9 +794,102 @@ const free = {
   venue: bounds.venue,
   party_size: 4,
   windows: bounds.windows,
-  financial: { currency: 'USD', max_total: '0', terms: 'Nothing due' },
+  financial: { currency: 'USD', max_total: '0' },
   until: bounds.until,
 };
+
+describe('a paid reader watch reads the venue’s terms itself (KTD12)', () => {
+  const NO_SHOW = 'No-show fee: $25 per guest, charged if you miss your reservation.';
+  /** A watch on Resy's Bistro for four, whose policy the host reads as `policy`, under the browser's own `financial`. */
+  async function watchBistro(
+    policy: Awaited<ReturnType<typeof watchRuntime.readBrowserWatchSetup>> extends infer Setup
+      ? Setup extends { policy?: infer Policy }
+        ? Policy
+        : never
+      : never,
+    financial: Record<string, unknown>,
+  ): Promise<{ result: Record<string, unknown>; cards: string[] }> {
+    const cards = await bindPrincipal();
+    const { context } = await executionContext('paid-watch');
+    vi.spyOn(watchRuntime, 'readBrowserWatchSetup').mockResolvedValue({
+      availability: {
+        status: 'ready',
+        site: 'resy.com',
+        venue: bounds.venue,
+        partySize: 4,
+        currency: 'USD',
+        timeZone: 'UTC',
+        slots: [],
+      },
+      policy,
+    });
+    await getDb().run(
+      "INSERT INTO gws_ea_browser_recipes(id,site,name,version,source_job_id,first_action,last_action,parameters_json,steps_json,read_only,created_at) VALUES('check-recipe','resy.com','Availability',1,?,0,0,'[]','[]',1,?)",
+      jobId,
+      new Date().toISOString(),
+    );
+    const result = await createBrowserWatch(context, {
+      site: 'https://resy.com/search',
+      recipe_id: 'check-recipe',
+      parameters: {},
+      venue: bounds.venue,
+      party_size: 4,
+      windows: bounds.windows,
+      financial,
+      until: bounds.until,
+    });
+    return { result, cards };
+  }
+  const noShow = (amountMinor: number | undefined) => ({
+    currency: 'USD',
+    dueNowMinor: 0,
+    commitments: [
+      {
+        kind: 'conditional_fee' as const,
+        terms: NO_SHOW,
+        ...(amountMinor === undefined ? {} : { amountMinor }),
+        perPerson: true,
+        trigger: 'No-show',
+        conditionalTrigger: 'no_show' as const,
+        cancellationTerms: 'Cancel at least 24 hours before arrival',
+        cancellationBeforeMs: 86_400_000,
+      },
+    ],
+  });
+
+  it('arms through its card, with the terms the host read, whatever the browser called them', async () => {
+    const { result, cards } = await watchBistro(noShow(2500), {
+      currency: 'USD',
+      max_total: '100.00',
+      terms: 'a no-show fee of about $25 a head',
+    });
+    expect(result).toMatchObject({ status: 'awaiting_principal' });
+    expect(cards).toHaveLength(1);
+    expect(cards[0]).toContain(NO_SHOW);
+    expect(cards[0]).not.toContain('about $25 a head');
+  });
+
+  it('arms with no terms from the browser at all', async () => {
+    const { result } = await watchBistro(noShow(2500), { currency: 'USD', max_total: '100.00' });
+    expect(result).toMatchObject({ status: 'awaiting_principal' });
+  });
+
+  it('refuses a fee above the maximum as such, stating the fee it read and the exposure', async () => {
+    const { result, cards } = await watchBistro(noShow(2500), { currency: 'USD', max_total: '80.00' });
+    expect(result).toMatchObject({ status: 'refused', reason: 'terms_over_bounds', exposure: '$100.00' });
+    expect(result.message).toContain('$100.00');
+    expect(result.message).toContain('$80.00');
+    expect(result.message).toContain(NO_SHOW);
+    expect(result.message).toMatch(/EXTERNAL_UNTRUSTED_CONTENT/);
+    expect(cards).toEqual([]);
+  });
+
+  it('still answers terms_unavailable for a policy it could not read', async () => {
+    const { result, cards } = await watchBistro(noShow(undefined), { currency: 'USD', max_total: '100.00' });
+    expect(result).toEqual({ status: 'refused', reason: 'terms_unavailable' });
+    expect(cards).toEqual([]);
+  });
+});
 
 describe('venue release schedules and card times', () => {
   it('reads a release rule apart from the bounds and refuses one it could not schedule', () => {
@@ -868,7 +969,7 @@ describe('venue release schedules and card times', () => {
     const request = {
       ...free,
       windows: [{ start: '2026-11-24T19:00:00+09:00', end: '2026-11-24T21:00:00+09:00' }],
-      financial: { currency: 'JPY', max_total: '20000', terms },
+      financial: { currency: 'JPY', max_total: '20000' },
       until: '2026-11-24T00:00:00Z',
     };
     const created = await createBrowserWatch(context, {
@@ -1004,7 +1105,7 @@ describe('watches on sites with no reader (KTD20)', () => {
     venue: { id: 'the-larder', name: 'The Larder' },
     party_size: 2,
     windows: regionBounds.windows,
-    financial: { currency: 'USD', max_total: '0', terms: 'Nothing due' },
+    financial: { currency: 'USD', max_total: '0' },
     until: regionBounds.until,
   };
 
@@ -1215,5 +1316,105 @@ describe('watches on sites with no reader (KTD20)', () => {
     expect(card).toContain('Arrival window: Oct 16, 2026, 7:00 PM through 9:00 PM Los Angeles time');
     expect(card).toContain('Any other booking, a recurring charge included, comes to you on its own card.');
     expect(card).not.toContain('merchant identity');
+  });
+});
+
+describe('a watch the principal declines', () => {
+  /** A financial watch of the job awaiting its card, posted to the principal as the job asks for one. */
+  async function awaitingCard(id: string): Promise<{ approval: PendingApproval; session: Session; cards: string[] }> {
+    const cards = await bindPrincipal();
+    await seedWatch(id);
+    await getDb().run("UPDATE gws_ea_browser_watches SET status = 'awaiting_principal' WHERE id = ?", id);
+    const job = (await new BrowserStore().getJob(jobId))!;
+    const session = (await getSession(job.browser_session_id))!;
+    const approvalId = await requestApproval({
+      session,
+      agentName: 'browser',
+      action: 'browser_watch_setup',
+      payload: { watchId: id, jobId, bounds },
+      title: 'Approve this reservation watch?',
+      question: 'Watch Bistro for a table for 4.',
+      approverUserId: 'gchat:users/watch-principal',
+      originLine: ERRAND_ORIGIN_LINE,
+    });
+    const approval = (await getPendingApproval(approvalId!))!;
+    await getDb().run(
+      'UPDATE gws_ea_browser_watches SET approval_id = ?,approval_json = ? WHERE id = ?',
+      approval.approval_id,
+      JSON.stringify(approval),
+      id,
+    );
+    return { approval, session, cards };
+  }
+  /** What the job's session heard about a decision on its watch. */
+  async function told(session: Session): Promise<string[]> {
+    const rows = await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) =>
+      mailbox.getInboundHistory(100),
+    );
+    return (rows ?? [])
+      .map((row) => (JSON.parse(row.content) as { text?: string }).text ?? '')
+      .filter((text) => /declined|rejected/u.test(text));
+  }
+
+  it('tells the job once, as the principal’s decision, and leaves the card as the principal answered it', async () => {
+    const { approval, session, cards } = await awaitingCard('declined');
+    await handleApprovalsResponse({
+      questionId: approval.approval_id,
+      value: 'reject',
+      userId: 'gchat:users/watch-principal',
+      channelType: 'gchat',
+      platformId: 'spaces/watch-principal',
+      threadId: null,
+    });
+    await deliverWatchNotices();
+    const notes = await told(session);
+    expect(notes).toHaveLength(1);
+    expect(JSON.parse(notes[0])).toMatchObject({
+      type: 'browser_watch_outcome',
+      watch_id: 'declined',
+      status: 'rejected',
+      message: expect.stringContaining('The principal declined this watch'),
+    });
+    expect(notes[0]).not.toMatch(/admin|browser_watch_setup|appr-/u);
+    expect(await getDb().get('SELECT status FROM gws_ea_browser_watches WHERE id = ?', 'declined')).toEqual({
+      status: 'cancelled',
+    });
+    expect(cards.some((card) => card.includes('Withdrawn'))).toBe(false);
+  });
+
+  it('commits a declined watch and its recoverable notice together, then retries after a failed insert', async () => {
+    const { approval, session } = await awaitingCard('declined-interrupted');
+    const db = getDb();
+    const run = db.run.bind(db);
+    let interrupt = true;
+    const write = vi.spyOn(db, 'run').mockImplementation(async (sql, ...params) => {
+      if (interrupt && sql.includes('INSERT INTO gws_ea_browser_watch_notices')) {
+        interrupt = false;
+        throw new Error('notice insert interrupted');
+      }
+      return run(sql, ...params);
+    });
+    try {
+      await finalizeReject(approval, 'gchat:users/watch-principal', 'too late');
+      expect((await getBrowserWatch('declined-interrupted'))?.status).toBe('awaiting_principal');
+      expect(await told(session)).toEqual([]);
+    } finally {
+      write.mockRestore();
+    }
+    await resumeRejectedApprovals();
+    await deliverWatchNotices();
+    await resumeRejectedApprovals();
+    expect((await getBrowserWatch('declined-interrupted'))?.status).toBe('cancelled');
+    const notes = await told(session);
+    expect(notes).toHaveLength(1);
+    expect((JSON.parse(notes[0]) as { message: string }).message).toContain('"too late"');
+  });
+
+  it('carries the reason the principal gave', async () => {
+    const { approval, session } = await awaitingCard('declined-why');
+    await finalizeReject(approval, 'gchat:users/watch-principal', 'too late on a weeknight');
+    const notes = await told(session);
+    expect(notes).toHaveLength(1);
+    expect((JSON.parse(notes[0]) as { message: string }).message).toContain('"too late on a weeknight"');
   });
 });

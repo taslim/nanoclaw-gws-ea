@@ -13,7 +13,7 @@ afterEach(async () => {
   await fs.rm(root, { force: true, recursive: true });
 });
 
-function transcript(texts = [' Schedule Friday', ' if Sarah confirms.']): unknown {
+function transcript(texts = [' Schedule Friday', ' if Remy confirms.']): unknown {
   return {
     params: { language: 'auto', translate: false, model: '/model' },
     result: { language: 'es' },
@@ -25,7 +25,7 @@ describe('validated complete structured recognition', () => {
   it('preserves source wording, all segments, and detected language without translation', () => {
     expect(parseWhisperOutput(transcript(), '/model', 1000)).toEqual({
       status: 'recognized',
-      text: 'Schedule Friday if Sarah confirms.',
+      text: 'Schedule Friday if Remy confirms.',
       language: 'es',
     });
     expect(parseWhisperOutput(transcript([]), '/model', 1000)).toEqual({ status: 'no-speech' });

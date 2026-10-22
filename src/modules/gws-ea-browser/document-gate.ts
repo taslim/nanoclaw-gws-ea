@@ -24,6 +24,8 @@ export interface PausedDocument {
 export type DocumentDecision = { allow: true; headers?: Array<{ name: string; value: string }> } | { allow: false };
 /** A page's policy as it stood when one request paused. */
 export interface CapturedPolicy {
+  /** A credential fill holds submissions across every target from before its input callbacks run. */
+  readonly submissionsHeld?: boolean;
   decide(document: PausedDocument): Promise<DocumentDecision>;
   /** The gate refused this request because it could not tell whether the document was the page's. */
   refuse(): void;
@@ -202,15 +204,34 @@ async function openDocumentGate(browser: Browser): Promise<DocumentGate> {
     ).catch(() => undefined);
   };
   session.on('Fetch.requestPaused', (event) => {
-    // A service worker's script is the only other request paused here. Refusing it keeps every site's
-    // worker unregistered, so no navigation is ever answered by a worker instead of the network.
     if (event.resourceType !== 'Document') {
-      answer(event.requestId, { allow: !serviceWorkerScript(event.request.headers) });
-      return;
+      if (serviceWorkerScript(event.request.headers)) {
+        answer(event.requestId, { allow: false });
+        return;
+      }
     }
     // Every guard's policy is taken as it stood at the pause, before placement can await.
     const captured = new Map<GuardedPage, CapturedPolicy>();
     for (const page of guarded()) captured.set(page, page.capture());
+    if (event.resourceType !== 'Document') {
+      // Workers cannot own secret-bearing traffic, and a new frame or popup must not outrun a page-target
+      // session. Decide HTTP requests here, on the browser session, using the hold captured at request time.
+      if (![...captured.values()].some((policy) => policy.submissionsHeld)) {
+        answer(event.requestId, { allow: true });
+        return;
+      }
+      const decideSubmission = async (): Promise<DocumentDecision> => {
+        const owner = await ownerOf(event.frameId);
+        if (owner === 'unguarded') return { allow: true };
+        if ('refuse' in owner) return { allow: false };
+        return { allow: !captured.get(owner.page)?.submissionsHeld };
+      };
+      void withinTime(decideSubmission(), DECISION_TIMEOUT_MS).then(
+        (decision) => answer(event.requestId, decision),
+        () => answer(event.requestId, { allow: false }),
+      );
+      return;
+    }
     // A page's target id is its main frame's id: only a document there is the page's own top-level document.
     const topOf = pages.get(event.frameId);
     const decide = async (): Promise<DocumentDecision> => {
@@ -236,10 +257,7 @@ async function openDocumentGate(browser: Browser): Promise<DocumentGate> {
     );
   });
   await session.send('Fetch.enable', {
-    patterns: [
-      { requestStage: 'Request', resourceType: 'Document' },
-      { requestStage: 'Request', resourceType: 'Other' },
-    ],
+    patterns: [{ requestStage: 'Request' }],
   });
   return {
     register(targetId, page) {

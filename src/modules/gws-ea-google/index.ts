@@ -17,7 +17,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 
 import { registerCapability } from '../../capabilities.js';
 import { registerContainerEnv } from '../../container-env.js';
-import { getGatewayProvider } from '../../gateway-providers/index.js';
+import { getGatewayProvider, withholdGatewayAgentSkills } from '../../gateway-providers/index.js';
 import { onHostStart } from '../../host-lifecycle.js';
 import { log } from '../../log.js';
 import { knownMainAgentGroupId } from '../gws-ea-profile/db.js';
@@ -29,7 +29,7 @@ import {
 } from './grant.js';
 import { googleGrantFilePath, readGoogleGrantFile } from './grant-file.js';
 import { createGoogleTokenRefresher, GATEWAY_TOKEN_PLACEHOLDER } from './refresher.js';
-import { createHostTokenSource, type HostTokenSource } from './tokens.js';
+import { createHostTokenSource, GoogleNotSignedInError, type HostTokenSource } from './tokens.js';
 import { WORKSPACE_GOG_COMMANDS } from './workspace-commands.js';
 
 /** How often the host checks whether a token needs renewing. */
@@ -57,7 +57,7 @@ const CAPABILITY_DESCRIPTIONS: Readonly<Record<GoogleCapability, string>> = {
  * `respond_to_event` and `calendar.respond` is off. Workspace's are gog's
  * whole surface for its five products, generated (`./workspace-commands.ts`).
  */
-const GOG_COMMANDS: Readonly<Record<GoogleCapability, readonly string[]>> = {
+export const GOG_COMMANDS: Readonly<Record<GoogleCapability, readonly string[]>> = {
   'google-calendar': [
     'calendar.calendars',
     'calendar.subscribe',
@@ -92,6 +92,16 @@ for (const [capability, skill] of GOOGLE_KEYS) {
     skills: [skill],
   });
 }
+
+/**
+ * No agent here is handed the gateway's own agent skill. The Google skills
+ * teach the way to Google, through gog with the host's tokens, and what to do
+ * when that connection fails: only the operator reconnects it, and no agent
+ * sends anyone a link to sign in. The gateway's skill would teach a second
+ * way beside it, connect links included, to every group with a shell,
+ * groups main creates among them. The gateway still carries their traffic.
+ */
+withholdGatewayAgentSkills();
 
 /**
  * gog's settings for a group, from the Google keys it holds (KTD1, KTD2). The
@@ -164,7 +174,9 @@ onHostStart(async ({ signal }) => {
  * `GoogleScopeNotGrantedError` without asking Google.
  */
 export function hostGoogleAccessToken(service: HostGoogleServiceId): Promise<string> {
-  if (!hostTokens) return Promise.reject(new Error('Google access is off on this host: it has no Google sign-in'));
+  if (!hostTokens) {
+    return Promise.reject(new GoogleNotSignedInError('Google access is off on this host: it has no Google sign-in'));
+  }
   return hostTokens.accessToken(service);
 }
 

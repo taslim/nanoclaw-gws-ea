@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 
 import { initTestSessionDb, closeSessionDb, getInboundDb, getOutboundDb } from './mailbox/sqlite/connection.js';
 import { getUndeliveredMessages, writeMessageOut } from './db/messages-out.js';
-import { emailSend, freeTime } from './mcp-tools/gws-ea-email.js';
+import { emailSend, freeTime, tellMain } from './mcp-tools/gws-ea-email.js';
 import type { McpToolDefinition } from './mcp-tools/types.js';
 import { buildInformedWrapNudge, processQuery } from './poll-loop.js';
 import type { AgentQuery, ProviderEvent, ProviderExchange } from './providers/types.js';
@@ -921,6 +921,60 @@ describe('DB-visible sends gate the nudge', () => {
     ['an email_send the host refused', emailSend, { text: 'Hi Remy.' }, false],
   ])('a stray line after only %s is still nudged', async (_label, tool, args, ok) => {
     expect(await strayLineAfter(tool, args, ok)).toHaveLength(1);
+  });
+
+  /** A turn that makes one request and ends on a closing line, then answers the nudge with only `<internal>done</internal>`. */
+  async function closingLineThenDone(tool: McpToolDefinition, args: Record<string, unknown>): Promise<string[]> {
+    seedDest();
+    async function* events(): AsyncGenerator<ProviderEvent> {
+      yield { type: 'init', continuation: 's1' };
+      await requestAnswered(tool, args, true);
+      yield { type: 'result', text: 'Done — that is handled.' };
+      yield { type: 'result', text: '<internal>done</internal>' };
+    }
+    const { query, pushes } = makeStubQuery(events());
+    await processQuery(query, CHAT_ROUTING, ['m1'], 'claude', undefined, 'prompt', undefined, true);
+    return pushes;
+  }
+
+  it('a sent email then a closing note gets a nudge that names no send_message and lets the note end done, sending nothing more', async () => {
+    const pushes = await closingLineThenDone(emailSend, { text: 'Hi Remy, does Tuesday at 12:30 suit you?' });
+
+    expect(nudges(pushes)).toHaveLength(1);
+    expect(pushes[0]).not.toContain('send_message');
+    expect(pushes[0]).toContain(
+      'or that text was only a note to yourself, respond with only <internal>done</internal>',
+    );
+    expect(deliveredTexts()).toEqual([]);
+    // The email's request is the only row the turn wrote.
+    expect(getUndeliveredMessages()).toHaveLength(1);
+  });
+
+  it('an account left for main then a closing note gets a nudge that asks for no re-send, and done sends nothing', async () => {
+    const pushes = await closingLineThenDone(tellMain, { account: 'Juno Hale confirmed Tuesday at 12:30.' });
+
+    expect(nudges(pushes)).toHaveLength(1);
+    expect(pushes[0]).not.toContain('re-send');
+    expect(pushes[0]).not.toContain('send_message');
+    expect(pushes[0]).toContain(
+      'If the turn had nothing to send, respond with only <internal>done</internal> and nothing will be sent.',
+    );
+    expect(deliveredTexts()).toEqual([]);
+    expect(getUndeliveredMessages()).toHaveLength(1);
+  });
+
+  it('a turn that ends in only <internal> is not nudged', async () => {
+    seedDest();
+    async function* events(): AsyncGenerator<ProviderEvent> {
+      yield { type: 'init', continuation: 's1' };
+      await requestAnswered(tellMain, { account: 'Juno Hale confirmed Tuesday at 12:30.' }, true);
+      yield { type: 'result', text: '<internal>Account left for main.</internal>' };
+    }
+    const { query, pushes } = makeStubQuery(events());
+
+    await processQuery(query, CHAT_ROUTING, ['m1'], 'claude', undefined, 'prompt', undefined, true);
+
+    expect(pushes).toEqual([]);
   });
 });
 

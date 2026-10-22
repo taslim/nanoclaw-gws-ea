@@ -169,6 +169,21 @@ it('hands the delegate tools to main under version 1, enabled or not, and to no 
   ).toMatchObject({ capabilities: expect.arrayContaining(['browser-delegate']) });
 });
 
+it('hands record_purchase_outcome to main and every delegator, main off the access list included', async () => {
+  for (const id of ['main', 'research', 'desk']) {
+    await createAgentGroup({ id, name: id, folder: id, agent_provider: null, created_at: new Date().toISOString() });
+    await ensureContainerConfig(id);
+  }
+  await getDb().run('UPDATE gws_ea_profile SET main_agent_group_id = ? WHERE singleton = 1', 'main');
+  writeBrowserAccess(`${ROOT}/browser/policy.json`, { agentGroupIds: ['research'] });
+  // Main records the purchases of a group that lost access, so it holds the tool the unconfirmed note names.
+  expect((await getGroupCapabilities('main')).has('browser-delegate')).toBe(false);
+  expect((await getGroupCapabilities('main')).has('browser-purchase-outcome')).toBe(true);
+  expect((await getGroupCapabilities('research')).has('browser-purchase-outcome')).toBe(true);
+  expect((await getGroupCapabilities('desk')).has('browser-purchase-outcome')).toBe(false);
+  expect((await materializeContainerJson('main')).capabilities).toContain('browser-purchase-outcome');
+});
+
 it('admits the errands of every listed group, and no longer main once the list leaves it out', async () => {
   for (const id of ['main', 'research'])
     await createAgentGroup({ id, name: id, folder: id, agent_provider: null, created_at: new Date().toISOString() });

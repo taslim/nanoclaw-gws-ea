@@ -193,16 +193,13 @@ export function renderPurchaseCard(
     ...earlierLines(earlier, principalTimeZone),
     `Site: ${quoted(facts.origin, SELLER_TEXT_LIMIT)}`,
     `Account: ${isAssistantAddress(facts.account, identity) ? "your assistant's account" : quoted(facts.account, SELLER_TEXT_LIMIT)}`,
-    `Commit control: ${quoted(facts.control.label, SELLER_TEXT_LIMIT)}`,
-    ...facts.items.map(
-      (item) =>
-        `Item: ${quoted(item.title, SELLER_TEXT_LIMIT)}; quantity ${item.quantity}; merchant id ${quoted(item.id, SELLER_TEXT_LIMIT)}`,
-    ),
+    `Button I'll press: ${quoted(facts.control.label, SELLER_TEXT_LIMIT)}`,
+    ...facts.items.map((item) => `Item: ${quoted(item.title, SELLER_TEXT_LIMIT)}; quantity ${item.quantity}`),
     `Total: ${money(facts.totalMinor)} (${facts.currency})`,
     `Due now: ${money(facts.dueNowMinor)}`,
     ...(facts.reservation
       ? [
-          `Venue: ${quoted(facts.reservation.venueName, SELLER_TEXT_LIMIT)}; merchant id ${quoted(facts.reservation.venueId, SELLER_TEXT_LIMIT)}`,
+          `Venue: ${quoted(facts.reservation.venueName, SELLER_TEXT_LIMIT)}`,
           `Party size: ${facts.reservation.partySize}`,
           `Reservation time: ${cardEventSpan(facts.reservation.at, facts.reservation.endAt, facts.reservation.timeZone, principalTimeZone)}`,
         ]
@@ -263,7 +260,7 @@ export async function detachPurchaseCards(jobId: string, reason: PurchaseCard['s
 export async function finishPurchaseCardWithdrawals(cards: readonly PendingApproval[], message: string): Promise<void> {
   for (const card of cards) await finishApprovalWithdrawal(card, message);
 }
-export async function notifyPurchaseCard(cardId: string, outcome: string): Promise<void> {
+export async function notifyPurchaseCard(cardId: string, outcome: string, reason?: string): Promise<void> {
   const db = getDb();
   const card = await db.get<PurchaseCard>('SELECT * FROM gws_ea_browser_purchase_cards WHERE id = ?', cardId);
   if (!card || card.notified_at) return;
@@ -283,7 +280,9 @@ export async function notifyPurchaseCard(cardId: string, outcome: string): Promi
         card_id: card.id,
         status: outcome,
         ...(outcome === 'rejected'
-          ? { message: 'The principal declined. Remove the cart items you added; do not try another purchase path.' }
+          ? {
+              message: `The principal declined${reason ? `: "${reason}"` : ''}. Remove the cart items you added; do not try another purchase path.`,
+            }
           : {}),
       }),
     );

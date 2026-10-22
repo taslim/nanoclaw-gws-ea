@@ -278,7 +278,9 @@ describe('forgetting again after a snapshot restore', () => {
     expect(await getPerson(remy)).toEqual(before);
     expect(warn).toHaveBeenCalledWith(expect.stringMatching(/could not be forgotten again/i), {
       personId: remy,
-      err: expect.objectContaining({ message: expect.stringMatching(/email:remy@example.test.*access/i) }),
+      err: expect.objectContaining({
+        message: expect.stringMatching(/remy@example.test.*operator must remove that access/i),
+      }),
     });
     expect(await getPerson(lena)).toBeUndefined();
     await expect(addPerson(learned('email:remy@example.test'))).rejects.toThrow(/forgotten/i);

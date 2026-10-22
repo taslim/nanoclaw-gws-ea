@@ -24,6 +24,7 @@ import { getDomain, getDomainWithoutSuffix } from 'tldts';
 
 import { getDb } from '../../db/connection.js';
 import type { DbDriver } from '../../db/driver.js';
+import { untrusted } from '../gws-ea-inbox/untrusted.js';
 import { isolationSelector } from './authentication-submit.js';
 import {
   CHOICE_SOURCE,
@@ -1021,7 +1022,12 @@ export type ConsentPassResult =
       /** Inside a purchase: the paid extras the submission carries, for the card. */
       readonly addOns: readonly string[];
     }
-  | { readonly status: 'consent_required'; readonly stops: readonly ConsentStopView[] }
+  | {
+      readonly status: 'consent_required';
+      readonly stops: readonly ConsentStopView[];
+      /** Whether the host had set a choice in the form before it stopped: false for a stop on its first read. */
+      readonly hostChanged: boolean;
+    }
   | { readonly status: 'add_on'; readonly addOns: readonly string[] };
 
 /** The job a stop belongs to, and the database its stops and the principal's grants live in. */
@@ -1062,7 +1068,8 @@ function fingerprint(read: ConsentRead): string {
  * The one consent check before every submission (KTD11): reads the control's form, makes every choice the
  * engine owns with real clicks, waits for the page to settle and reads again, so what it answers is what the
  * page holds just before the press. `ready` lets the press go; outside a purchase, `consent_required` names
- * the recorded stops and `add_on` an extra the press would buy. Nothing is pressed here.
+ * the recorded stops, and whether the host had set a choice first, and `add_on` an extra the press would buy.
+ * Nothing is pressed here.
  */
 export async function runConsentPass(
   page: Page,
@@ -1079,7 +1086,11 @@ export async function runConsentPass(
       site,
       ...(kept ? { kept } : {}),
     });
-  const answer = async (round: ConsentRound, decision: ConsentDecision): Promise<ConsentPassResult> => {
+  const answer = async (
+    round: ConsentRound,
+    decision: ConsentDecision,
+    hostChanged: boolean,
+  ): Promise<ConsentPassResult> => {
     switch (decision.status) {
       case 'ready':
         return {
@@ -1098,13 +1109,14 @@ export async function runConsentPass(
             fingerprint: fingerprint(round.read),
             items: decision.items,
           }),
+          hostChanged,
         };
     }
   };
   const first = await readRound(page, control);
   try {
     const decision = await decide(first);
-    if (decision.status !== 'ready' || !decision.set.length) return await answer(first, decision);
+    if (decision.status !== 'ready' || !decision.set.length) return await answer(first, decision, false);
     for (const setting of decision.set) {
       await options.assertActive?.();
       await setChoice(first, setting);
@@ -1117,12 +1129,25 @@ export async function runConsentPass(
   const second = await readRound(page, control);
   try {
     const decision = await decide(second);
-    if (decision.status !== 'ready' || !decision.set.length) return await answer(second, decision);
+    if (decision.status !== 'ready' || !decision.set.length) return await answer(second, decision, true);
     // What the host set and the page undid is the page's own choice now: only the principal can keep it.
-    return await answer(second, await decide(second, new Set(decision.set.map((setting) => setting.id))));
+    return await answer(second, await decide(second, new Set(decision.set.map((setting) => setting.id))), true);
   } finally {
     await second.close();
   }
+}
+
+/**
+ * A site's consent wording as an agent reads it, in an answer, a notice or a grant list: the site wrote it, so it
+ * arrives inside untrusted markers that name the site. The principal's card quotes it plainly.
+ */
+export function siteWording(wording: string, site: string): string {
+  return untrusted(wording, 2000, site);
+}
+
+/** The stops an answer gives the browser, each wording as `siteWording` frames it. */
+export function consentStopsForAgent(stops: readonly ConsentStopView[]): ConsentStopView[] {
+  return stops.map((stop) => ({ ...stop, wording: siteWording(stop.wording, stop.site) }));
 }
 
 /** A submission stopped for wording only the principal can agree to (`consent_required`). */
@@ -1151,6 +1176,7 @@ export interface ConsentStop {
   created_at: string;
   requested_at: string | null;
   decided_at: string | null;
+  outcome_notified_at: string | null;
 }
 export interface ConsentGrant {
   id: string;

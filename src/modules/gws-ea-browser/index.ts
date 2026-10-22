@@ -11,7 +11,10 @@ import { BrowserRuntime } from './runtime.js';
 import { readBrowserEvidence } from './evidence.js';
 import {
   browserConsentMigration,
+  browserConsentOutcomesMigration,
   browserCredentialAttemptsMigration,
+  browserCredentialConsentHoldMigration,
+  browserCredentialUncertaintyMigration,
   browserDisclosuresMigration,
   browserGenericCheckoutMigration,
   browserIncidentsMigration,
@@ -67,7 +70,7 @@ import {
 } from './purchase.js';
 import { registerPurchaseOutcomeDelivery } from './purchase-outcome.js';
 import { registerReservationGuaranteeDelivery } from './reservation-guarantee.js';
-import { registerConsentGrantsDelivery, requestConsentAction } from './consent-approval.js';
+import { recoverConsentOutcomes, registerConsentGrantsDelivery, requestConsentAction } from './consent-approval.js';
 import { registerDisclosureDelivery } from './disclosures.js';
 import { registerVaultAccessDelivery } from './vault-access.js';
 import { watchAction, listWatchesAction, cancelWatchAction, watchBookAction } from './watches.js';
@@ -93,6 +96,9 @@ registerMigration(browserDisclosuresMigration);
 registerMigration(browserGenericCheckoutMigration);
 registerMigration(browserWatchRegionMigration);
 registerMigration(browserPurchaseOutcomesMigration);
+registerMigration(browserCredentialConsentHoldMigration);
+registerMigration(browserConsentOutcomesMigration);
+registerMigration(browserCredentialUncertaintyMigration);
 
 const runtime = new BrowserRuntime(undefined, browserAdmissionReady);
 export function getBrowserRuntime(): BrowserRuntime {
@@ -156,6 +162,7 @@ onHostStart(async ({ signal }) => {
       () => activeQueue.retryAnswers(),
       () => sweepBrowserJobSessions(),
       () => cleanupBrowserSignInMail(),
+      () => recoverConsentOutcomes(),
       () => sweepBrowserPurchaseState(activeQueue),
       () => notifyPendingIncidents(),
     ])

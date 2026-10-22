@@ -22,6 +22,7 @@
 import { registerResponseHandler } from '../../response-registry.js';
 import { onHostStart } from '../../host-lifecycle.js';
 import { sweepExpiredApprovals } from './lifecycle.js';
+import { resumeRejectedApprovals } from './finalize.js';
 import { handleApprovalsResponse, resumeApprovedApprovals } from './response-handler.js';
 
 // Public API re-exports so consumers import from the module root.
@@ -30,6 +31,8 @@ export type {
   ApprovalHandler,
   ApprovalHandlerContext,
   ApprovalHandlerOptions,
+  ApprovalRejectedEvent,
+  ApprovalRejectionFinalizer,
   RequestApprovalOptions,
   RequestPicture,
 } from './primitive.js';
@@ -45,4 +48,5 @@ export { resumeApprovedApprovals } from './response-handler.js';
 onHostStart(async () => {
   await sweepExpiredApprovals();
   await resumeApprovedApprovals();
+  await resumeRejectedApprovals();
 });

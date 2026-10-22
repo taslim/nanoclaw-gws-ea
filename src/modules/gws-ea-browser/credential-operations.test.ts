@@ -29,6 +29,7 @@ import { setDeliveryAdapter } from '../../delivery.js';
 import { inboundDbPath } from '../../mailbox/sqlite/paths.js';
 import { resolveSystemSession } from '../../session-manager.js';
 import type { PendingApproval, Session } from '../../types.js';
+import { requestApproval, sweepExpiredApprovals } from '../approvals/index.js';
 import { handleApprovalsResponse } from '../approvals/response-handler.js';
 import { addPrincipalAddress, bindVerifiedPrincipalUser } from '../gws-ea-profile/db.js';
 import '../gws-ea-profile/index.js';
@@ -36,6 +37,8 @@ import { recordWebAlias } from '../gws-ea-profile/testing/web-alias.js';
 import { upsertUserDm } from '../permissions/db/user-dms.js';
 import { upsertUser } from '../permissions/db/users.js';
 import './index.js';
+import { CONSENT_APPROVAL } from './consent-approval.js';
+import { recordConsentStops } from './consent.js';
 import { CredentialAttempts, type CredentialAttempt } from './credential-attempts.js';
 import {
   credentialAuthorityRequest,
@@ -739,9 +742,136 @@ describe("the principal's release of an attempt the host cannot settle", () => {
     expect(card.question).toContain("I can't tell whether the password changed");
     expect(card.question).toContain('Both the original and the new password are kept in my 1Password vault');
     await click('reject');
+    const declined = notes().at(-1) ?? '';
+    expect(declined).toContain(`The principal chose to keep waiting on the password change for "${USERNAME}"`);
+    expect(declined).not.toMatch(/admin|browser_credential_release|appr-/u);
     expect(await attempts.get(id)).toMatchObject({ phase: 'unknown' });
     expect(await lease()).toEqual({ job_id: job.thread_id });
     expect(await ask({ operation: 'change_password', site: ORIGIN, username: USERNAME })).toEqual({ status: 'busy' });
+  });
+
+  const WAIVER = 'I have read and accept the liability waiver';
+  /** A stop of this job's consent pass for one wording, recorded under the page's site, its card out to the principal. */
+  async function consentCard(
+    site: string,
+    wording: string,
+    fingerprint: string,
+  ): Promise<{ stopId: string; approvalId: string }> {
+    const [stop] = await recordConsentStops(
+      { jobId: job.thread_id!, db: getDb() },
+      { site, origin: ORIGIN, fingerprint, items: [{ id: 0, wording, kind: 'agreement' }] },
+    );
+    await getDb().run("UPDATE gws_ea_browser_consent_stops SET status = 'requested' WHERE id = ?", stop.stop_id);
+    const approvalId = await requestApproval({
+      session: job,
+      agentName: 'browser',
+      action: CONSENT_APPROVAL,
+      payload: { stopId: stop.stop_id, jobId: job.thread_id },
+      title: `Agree to this on ${site}?`,
+      question: `${site} asks me to agree to this: "${wording}"`,
+      approverUserId: PRINCIPAL,
+      expiresAt: new Date(Date.now() + 60_000).toISOString(),
+    });
+    if (!approvalId || !stop.stop_id) throw new Error('No consent card');
+    return { stopId: stop.stop_id, approvalId };
+  }
+  /** A disclosed signup stays uncertain while the principal decides a wording on the page's site. */
+  async function uncertainAfterConsent(site = 'shop.example'): Promise<{ id: string; approvalId: string }> {
+    const id = await disclosedSignup();
+    await holdSite();
+    const { stopId, approvalId } = await consentCard(site, WAIVER, 'join-form');
+    expect(await attempts.markUnknown(id, { signal: 'consent', stops: stopId, held: true })).toMatchObject({
+      phase: 'unknown',
+    });
+    return { id, approvalId };
+  }
+  const decline = (approvalId: string) =>
+    handleApprovalsResponse({
+      questionId: approvalId,
+      value: 'reject',
+      userId: PRINCIPAL,
+      channelType: DM.channelType,
+      platformId: DM.platformId,
+      threadId: null,
+    });
+
+  it.each([
+    ['declines', decline],
+    [
+      'lets lapse',
+      async () => {
+        await getDb().run("UPDATE pending_approvals SET expires_at = '2026-01-01T00:00:00.000Z'");
+        await sweepExpiredApprovals();
+      },
+    ],
+  ] as const)(
+    'keeps a signup uncertain when the principal %s its consent card, with a truthful release warning',
+    async (_case, decide) => {
+      const { id, approvalId } = await uncertainAfterConsent();
+      await decide(approvalId);
+      expect(await attempts.get(id)).toMatchObject({ phase: 'unknown' });
+      expect(await lease()).toEqual({ job_id: job.thread_id });
+      expect(await release(id)).toEqual({ status: 'awaiting_principal' });
+      // Even an old held marker cannot prove that an input callback never submitted.
+      const question = (JSON.parse(cards.at(-1) ?? '{}') as { question?: string }).question ?? '';
+      expect(question).toContain(
+        `I tried to create the account "${USERNAME}" on shop.example, but I can't tell whether the account was created.`,
+      );
+      expect(question).toContain('Trying again could create a second account.');
+      expect(question).not.toContain('never submitted');
+      await click('approve');
+      expect(await attempts.get(id)).toMatchObject({ phase: 'rejected' });
+      expect(await lease()).toBeUndefined();
+    },
+  );
+
+  it('keeps a framed signup uncertain when the card on its parent site is declined', async () => {
+    // A signup form another site embeds: the stop names the page's site, the attempt its own form's.
+    const { id, approvalId } = await uncertainAfterConsent('parent.example');
+    await decline(approvalId);
+    expect(await attempts.get(id)).toMatchObject({ phase: 'unknown' });
+    expect(await release(id)).toEqual({ status: 'awaiting_principal' });
+  });
+
+  it('keeps an exposed signup uncertain across decisions on its own and other consent stops', async () => {
+    const id = await disclosedSignup();
+    await holdSite();
+    const [own] = await recordConsentStops(
+      { jobId: job.thread_id!, db: getDb() },
+      {
+        site: 'shop.example',
+        origin: ORIGIN,
+        fingerprint: 'join-form',
+        items: [{ id: 0, wording: WAIVER, kind: 'agreement' }],
+      },
+    );
+    await getDb().run("UPDATE gws_ea_browser_consent_stops SET status = 'approved' WHERE id = ?", own.stop_id);
+    await attempts.markUnknown(id, { signal: 'consent', stops: own.stop_id! });
+    const other = await consentCard('shop.example', 'I agree to share my details with travel partners', 'offers-form');
+    await decline(other.approvalId);
+    expect(await attempts.get(id)).toMatchObject({ phase: 'unknown' });
+    expect(await release(id)).toEqual({ status: 'awaiting_principal' });
+  });
+
+  it('does not redisclose a candidate after a consent grant, and warns that a new attempt may duplicate it', async () => {
+    const { id } = await uncertainAfterConsent();
+    const candidate = (await attempts.get(id))?.candidate_item_id;
+    expect(await attempts.disclose(id, { jobId: job.thread_id!, origin: ORIGIN })).toEqual({
+      status: 'refused',
+      reason: 'not_saved',
+    });
+    expect((await attempts.get(id))?.candidate_item_id).toBe(candidate);
+    expect(await release(id)).toEqual({ status: 'awaiting_principal' });
+    const question = (JSON.parse(cards.at(-1) ?? '{}') as { question?: string }).question ?? '';
+    expect(question).toContain('Trying again could create a second account.');
+  });
+
+  it('keeps an uncertain signup and its site when its job is cancelled, until an informed release', async () => {
+    const { id } = await uncertainAfterConsent();
+    const { cancelBrowserJob } = await import('./cancel.js');
+    expect(await cancelBrowserJob(job.thread_id!)).toMatchObject({ status: 'in_progress' });
+    expect(await attempts.get(id)).toMatchObject({ phase: 'unknown' });
+    expect(await lease()).toEqual({ job_id: job.thread_id });
   });
 
   it('on approval ends the attempt as the principal released it, lifts its site, completes the cancellation and frees the account, leaving 1Password untouched', async () => {
@@ -774,6 +904,10 @@ describe("the principal's release of an attempt the host cannot settle", () => {
     expect(vaultState()).toBe(before);
     expect(fake.items.get(released!.candidate_item_id!)?.tags).toContain(`gws-ea-pending/${id}`);
     expect(notes().at(-1)).toContain('released');
+    // The candidate is the login named for the site, so main can tell the principal where the password is.
+    expect(notes().at(-1)).toContain(
+      'Its password stays in the assistant\'s 1Password vault, in the login "shop.example", which the host has not finished saving.',
+    );
     // The account is no longer busy: a new errand may sign up for it.
     const next = (await resolveSystemSession('browser', 'system:a2a:main:next-errand')).session;
     expect(
@@ -802,7 +936,9 @@ describe("the principal's release of an attempt the host cannot settle", () => {
     expect(await attempts.get(id)).toMatchObject({ phase: 'rejected', owned_item_id: null });
     expect(fake.value(itemId, 'password')).toBe('principal-chosen-password-1');
     expect(fake.value(candidateId, 'password')).toBe(next);
-    expect(notes().at(-1)).toContain('"New password for shop.example"');
+    expect(notes().at(-1)).toContain(
+      'as its own item, "New password for shop.example"; the login was changed or removed in 1Password meanwhile, and the host left it as it is.',
+    );
     expect(await ask({ operation: 'change_password', site: ORIGIN, username: USERNAME })).toMatchObject({
       status: 'recorded',
     });
@@ -868,7 +1004,10 @@ describe("the principal's release of an attempt the host cannot settle", () => {
     expect(await attempts.get(id)).toMatchObject({ phase: 'finalized', owned_item_id: itemId });
     expect(await lease()).toBeUndefined();
     expect(notes().at(-1)).toContain('was not released: 1Password could be reached again');
-    expect(notes().at(-1)).toContain('password_changed, vault updated');
+    expect(notes().at(-1)).toContain(
+      "the host finished it: the site took the new password, and the login in the assistant's 1Password vault now holds it.",
+    );
+    expect(notes().at(-1)).not.toMatch(/password_changed|vault updated|\(/u);
   });
 
   it('describes a promoted change it cannot finish by what is left: the login has it, the separate item may too', async () => {
@@ -961,7 +1100,7 @@ describe("the principal's release of an attempt the host cannot settle", () => {
     await click('approve');
     expect(await attempts.get(id)).toMatchObject({ phase: 'rejected', owned_item_id: null });
     expect(notes().at(-1)).toContain(
-      'Its login was changed in 1Password before the host finished saving it, and stays as it was changed.',
+      'Its login was changed or removed in 1Password before the host finished saving it, and the host left it as it is.',
     );
     expect(fake.value(candidateId, 'username')).toBe(PRINCIPAL_USERNAME);
   });

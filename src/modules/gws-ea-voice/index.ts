@@ -9,11 +9,12 @@ import { VOICE_RECIPE_ID } from '../../gws-ea/voice-assets.js';
 import { isRecord } from '../../gws-ea/validation.js';
 import { onHostShutdown, onHostStart } from '../../host-lifecycle.js';
 import { registerInboundPreparer, type InboundPreparationRequest } from '../../inbound-preparation.js';
+import { EMAIL_CHANNEL_TYPE, PRINCIPAL_PLATFORM_ID } from '../gws-ea-inbox/runtime.js';
+import { isVerifiedPrincipalUser } from '../gws-ea-profile/db.js';
 import { readVoiceReadiness } from './config.js';
 import { VoiceProcessError } from './process.js';
 import { readOriginalAudio, VoiceMediaError } from './staging.js';
 import { transcribeAudio, VoiceRecognitionError } from './transcribe.js';
-import './guidance.js';
 
 const MAX_PENDING_NOTES = 8;
 const stop = new AbortController();
@@ -33,6 +34,21 @@ function failureReason(error: unknown): string {
   return 'recognition-failed';
 }
 
+/**
+ * Whether a recording came in the principal's own private conversation: mail
+ * on their own email conversation, or a verified principal user in a direct
+ * message. An external-email thread is the inbox's, even for the principal's
+ * own mail, and a shared space is never private.
+ */
+async function inPrincipalPrivateConversation(request: InboundPreparationRequest): Promise<boolean> {
+  const conversation = request.messagingGroup;
+  if (conversation.channel_type === EMAIL_CHANNEL_TYPE && conversation.platform_id === PRINCIPAL_PLATFORM_ID)
+    return true;
+  const handle = request.authenticatedSender?.userId;
+  if (conversation.is_group !== 0 || !handle) return false;
+  return isVerifiedPrincipalUser(handle.includes(':') ? handle : `${conversation.channel_type}:${handle}`);
+}
+
 function observed(speech: SpeechResult): void {
   const at = new Date().toISOString();
   lastOutcome = { status: speech.status, at };
@@ -41,11 +57,13 @@ function observed(speech: SpeechResult): void {
 }
 
 async function prepareRecord(
+  request: InboundPreparationRequest,
   content: Record<string, unknown>,
   attachments: Record<string, unknown>[],
   blocked?: 'voice-busy' | 'aborted',
 ): Promise<string> {
   const readiness = await readVoiceReadiness();
+  const principals = await inPrincipalPrivateConversation(request);
   const otherNames = new Set(
     Array.isArray(content.attachments)
       ? content.attachments
@@ -67,7 +85,7 @@ async function prepareRecord(
         typeof sourceSpeech.reason === 'string' && /^[a-z0-9-]{1,80}$/.test(sourceSpeech.reason)
           ? sourceSpeech.reason
           : 'media-download-failed';
-      const failure: SpeechResult = { status: 'failed', reason };
+      const failure: SpeechResult = { status: 'failed', reason, inPrincipalPrivateConversation: principals };
       attachment.speech = failure;
       delete attachment.localPath;
       observed(failure);
@@ -115,7 +133,7 @@ async function prepareRecord(
     /* eslint-enable no-catch-all/no-catch-all */
     delete attachment.path;
     delete attachment.localPath;
-    attachment.speech = speech;
+    attachment.speech = { ...speech, inPrincipalPrivateConversation: principals } satisfies SpeechResult;
     observed(speech);
   }
   return JSON.stringify(content);
@@ -145,7 +163,7 @@ export async function prepareVoiceContent(request: InboundPreparationRequest): P
   if (queued >= MAX_PENDING_NOTES || stop.signal.aborted) {
     inflight++;
     try {
-      return await prepareRecord(content, audio, stop.signal.aborted ? 'aborted' : 'voice-busy');
+      return await prepareRecord(request, content, audio, stop.signal.aborted ? 'aborted' : 'voice-busy');
     } finally {
       inflight--;
     }
@@ -155,7 +173,7 @@ export async function prepareVoiceContent(request: InboundPreparationRequest): P
     queued--;
     inflight++;
     try {
-      return await prepareRecord(content, audio);
+      return await prepareRecord(request, content, audio);
     } finally {
       inflight--;
     }

@@ -291,6 +291,30 @@ describe('GWS-EA preferences project-doc section', () => {
     );
   });
 
+  it('gives the browser no preference value: each errand brief carries the bounds it needs', async () => {
+    const browser = group('ag-browser', 'browser');
+    await createAgentGroup(browser);
+    await ensureContainerConfig(browser.id);
+    await getDb().run('UPDATE gws_ea_profile SET browser_agent_group_id = ? WHERE singleton = 1', browser.id);
+    await setSchedulingPreference({
+      kind: 'working-hours',
+      weekday: 'mon',
+      hours: { start: '09:00', end: '17:00' },
+      source: 'principal',
+      basis: 'Works nine to five.',
+    });
+
+    expect((await getRequiredProjectDocSections(browser)).map((section) => section.name)).not.toContain(
+      'Scheduling Preferences',
+    );
+    const groupDir = path.join(TEST_ROOT, browser.folder);
+    await composeGroupProjectDoc(browser, groupDir, { fileName: 'CLAUDE.md' });
+    expect(fs.readFileSync(path.join(groupDir, 'CLAUDE.md'), 'utf8')).not.toContain('09:00');
+    expect((await getRequiredProjectDocSections(other)).map((section) => section.name)).toContain(
+      'Scheduling Preferences',
+    );
+  });
+
   it('adds no section to another group until a preference is stored', async () => {
     expect((await getRequiredProjectDocSections(other)).map((section) => section.name)).not.toContain(
       'Scheduling Preferences',

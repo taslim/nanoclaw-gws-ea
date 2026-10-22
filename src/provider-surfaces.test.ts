@@ -35,7 +35,8 @@ vi.mock('./modules/mount-security/index.js', () => ({
 import { resolveCapabilities } from './capabilities.js';
 import { buildMounts, resolveProviderContribution } from './container-runner.js';
 import { closeDb, createAgentGroup, initTestDb, runMigrations } from './db/index.js';
-import { ensureContainerConfig } from './db/container-configs.js';
+import { ensureContainerConfig, updateContainerConfigJson } from './db/container-configs.js';
+import { getGatewayProvider, resetGatewayProvider } from './gateway-providers/index.js';
 import { initGroupFilesystem } from './group-init.js';
 import { PERSONA_PREPEND_FILE } from './group-persona.js';
 import { log } from './log.js';
@@ -546,6 +547,53 @@ describe('buildMounts agent surfaces', () => {
       '/home/node/.agents',
       '/workspace/agent/AGENTS.md',
     ]);
+  });
+});
+
+describe("a spawn's skill selection", () => {
+  /** Spawn a Claude session for a group storing `skills`, the way the host does, and read what it was handed. */
+  async function spawnWith(
+    folder: string,
+    skills: string[] | 'all',
+  ): Promise<{ mounted: string[]; inlined: string[] }> {
+    const ag = group(`ag-${folder}`, folder);
+    await createAgentGroup(ag);
+    await ensureContainerConfig(ag.id);
+    await updateContainerConfigJson(ag.id, 'skills', skills);
+    await initGroupFilesystem(ag, { provider: 'claude' });
+    const config = { ...containerConfig(), skills };
+    const sess = session(`${folder}-session`, ag.id);
+
+    const resolved = await resolveProviderContribution(sess, ag, config);
+    await buildMounts(ag, sess, config, resolved.provider, resolved.contribution, resolved.surfaces);
+
+    const linked = path.join(DATA_DIR, 'v2-sessions', ag.id, '.claude-shared', 'skills');
+    const document = fs.readFileSync(path.join(GROUPS_DIR, folder, 'CLAUDE.md'), 'utf-8');
+    return {
+      mounted: fs.readdirSync(linked).sort(),
+      inlined: [...document.matchAll(/^# NanoClaw Skill: (.+)$/gmu)].map((match) => match[1]).sort(),
+    };
+  }
+
+  /** The mounted skills that ship resident instructions, which the document must inline. */
+  function withInstructions(skills: readonly string[]): string[] {
+    return skills.filter((skill) => fs.existsSync(path.join('container', 'skills', skill, 'instructions.md')));
+  }
+
+  it("inlines the instructions of the gateway's skill when the spawn mounts it beside the stored list", async () => {
+    resetGatewayProvider({ ...getGatewayProvider(), agentSkills: ['onecli-gateway'] });
+
+    const { mounted, inlined } = await spawnWith('gateway-taught', ['welcome']);
+
+    expect(mounted).toEqual(['onecli-gateway', 'welcome']);
+    expect(inlined).toEqual(['onecli-gateway']);
+  });
+
+  it("inlines no other gateway's skill for a group stored as `all`, and every mounted skill's instructions", async () => {
+    const { mounted, inlined } = await spawnWith('stored-all', 'all');
+
+    expect(mounted).not.toContain('onecli-gateway');
+    expect(inlined).toEqual(withInstructions(mounted));
   });
 });
 

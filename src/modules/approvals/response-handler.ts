@@ -90,7 +90,7 @@ async function handleRegisteredApproval(
   // the reason an answer in words gave after its no.
   if (selectedOption !== 'approve') {
     const reason = answer.reason ? clampReason(answer.reason) || undefined : undefined;
-    if (await finalizeReject(approval, session, userId, reason)) await showOutcome(approval, answer, reason);
+    if (await finalizeReject(approval, userId, reason)) await showOutcome(approval, answer, reason);
     return;
   }
 

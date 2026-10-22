@@ -3,6 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+import { getResource } from '../../cli/crud.js';
 import { dispatch } from '../../cli/dispatch.js';
 import type { CallerContext } from '../../cli/frame.js';
 import { lookup } from '../../cli/registry.js';
@@ -19,6 +20,10 @@ import { FINGERPRINT_KEY_FILE_NAME } from './fingerprint.js';
 import { MAIN_PEOPLE_POINTER } from './index.js';
 
 const VERBS = ['find', 'get', 'list', 'add', 'update', 'set-level', 'forget'] as const;
+
+/** What main reads while the store is stopped: its own next step, with the key's path and remedy left to the operator. */
+const STORE_UNAVAILABLE =
+  "The people store can't be used right now, and restoring it is the operator's job. Tell the principal in a line that you can't look people up or change them for now, and carry on with the rest.";
 
 function group(id: string, name: string): AgentGroup {
   return { id, name, folder: id, agent_provider: null, created_at: '2026-10-02T00:00:00.000Z' };
@@ -77,6 +82,22 @@ describe('GWS-EA people ncl resource', () => {
     for (const verb of VERBS) expect(lookup(`people-${verb}`), verb).toBeDefined();
     for (const gone of ['create', 'delete', 'instruct', 'unsay'])
       expect(lookup(`people-${gone}`), gone).toBeUndefined();
+  });
+
+  it("names in add's help only the sources a learned identity may come from", () => {
+    const help = lookup('people-add')?.description ?? '';
+    expect(help).toContain('--source learned for someone you came to know from the calendar or the directory');
+    expect(help).not.toMatch(/\bmail\b/u);
+  });
+
+  it('describes a learned level as the store takes it: any level, with no cap in the help', () => {
+    const add = lookup('people-add')?.description ?? '';
+    const setLevel = getResource('people')?.customOperations?.['set-level'];
+    const level = setLevel?.args?.find((arg) => arg.name === 'level')?.description ?? '';
+    expect(add).not.toMatch(/learned level is active or known/u);
+    expect(level).toBe(
+      'inner-circle and close are usually the principal’s word. A level you judged yourself is learned: --source learned, or on add, --level-source learned.',
+    );
   });
 
   it('lets main keep a person through ncl, from add to forget', async () => {
@@ -203,7 +224,7 @@ describe('GWS-EA people ncl resource', () => {
     expect(await run('people-list', {}, HOST)).toMatchObject({ ok: true, data: [{ name: 'Sam Lee' }] });
   });
 
-  it('refuses every verb while the store is stopped for want of its key', async () => {
+  it('refuses every verb while the store is stopped for want of its key: main gets one plain line, the operator the remedy', async () => {
     const pat = await addPerson({
       name: 'Pat Doe',
       level: 'close',
@@ -225,7 +246,11 @@ describe('GWS-EA people ncl resource', () => {
     ] as const) {
       expect(await run(`people-${verb}`, args), verb).toMatchObject({
         ok: false,
-        error: { message: expect.stringMatching(/stopped/i) },
+        error: { message: STORE_UNAVAILABLE },
+      });
+      expect(await run(`people-${verb}`, args, HOST), verb).toMatchObject({
+        ok: false,
+        error: { message: expect.stringMatching(/stopped.*Restore the key/is) },
       });
     }
     expect(fs.existsSync(path.join(root, FINGERPRINT_KEY_FILE_NAME))).toBe(false);

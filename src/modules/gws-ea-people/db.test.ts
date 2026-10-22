@@ -659,10 +659,33 @@ describe('forgetting a person', () => {
       NOW,
     );
 
-    await expect(forgetPerson({ id })).rejects.toThrow(/email:pat@example.test.*access/i);
+    await expect(forgetPerson({ id })).rejects.toThrow(
+      "Pat Doe has access to the assistant as pat@example.test, which only the principal's operator can remove: " +
+        'tell the principal their operator must remove that access before you can forget them.',
+    );
     expect(await getPersonLevel('email:pat@example.test')).toBe('close');
     expect(hookCalls).toEqual([]);
     expect(reviewCalls).toEqual([]);
+  });
+
+  it('refuses to forget someone who gave another person a NanoClaw role, naming the operator, changing nothing', async () => {
+    const { id } = await addPerson(pat());
+    await createUser('email:pat@example.test');
+    await createUser('email:remy@example.test');
+    await getDb().run(
+      `INSERT INTO user_roles (user_id, role, agent_group_id, granted_by, granted_at) VALUES (?, 'admin', ?, ?, ?)`,
+      'email:remy@example.test',
+      MAIN.id,
+      'email:pat@example.test',
+      NOW,
+    );
+
+    await expect(forgetPerson({ id })).rejects.toThrow(
+      "Pat Doe gave someone access to the assistant as pat@example.test, which only the principal's operator can remove: " +
+        'tell the principal their operator must remove that access before you can forget them.',
+    );
+    expect(await getPersonLevel('email:pat@example.test')).toBe('close');
+    expect(hookCalls).toEqual([]);
   });
 
   it('refuses a learned add of a forgotten identity in any spelling; the principal adding it back clears the fingerprint', async () => {

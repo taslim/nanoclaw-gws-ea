@@ -10,8 +10,6 @@ import type { ForgottenFingerprint } from './forget-handoff.js';
 export const PERSON_LEVELS = ['inner-circle', 'close', 'active', 'known'] as const;
 export type PersonLevel = (typeof PERSON_LEVELS)[number];
 
-/** The levels learning may set: a learned level stops at active (R15). */
-
 /** Who makes a change: the principal, or the assistant on what it learned. */
 export const CHANGE_SOURCES = ['principal', 'learned'] as const;
 export type ChangeSource = (typeof CHANGE_SOURCES)[number];
@@ -279,10 +277,13 @@ function noPerson(id: string): Error {
 // The fingerprint key: the store runs without one only while it holds no fingerprints.
 // ---------------------------------------------------------------------------
 
-function stoppedError(file: string | undefined): Error {
+/** The store's refusal while it cannot honor a forget. Its words, and the key's path, are for the operator. */
+export class PeopleStoreStoppedError extends Error {}
+
+function stoppedError(file: string | undefined): PeopleStoreStoppedError {
   const where =
     file === undefined ? 'has no place on this host (no instance secrets directory)' : `is missing at ${file}`;
-  return new Error(
+  return new PeopleStoreStoppedError(
     `The people store is stopped: it holds forgotten identities, but its fingerprint key ${where}. ` +
       "Restore the key from the instance's backup; a new key would let forgotten people be learned again.",
   );
@@ -682,22 +683,27 @@ export async function setPersonLevel(input: SetPersonLevelInput): Promise<Person
  * An `email:` user that NanoClaw grants access to is the operator's to
  * revoke; forgetting never removes a role or a membership on its own.
  */
-async function assertNoGrantedAccess(userIds: readonly string[]): Promise<void> {
+async function assertNoGrantedAccess(name: string, userIds: readonly string[]): Promise<void> {
   const db = getDb();
   for (const userId of userIds) {
-    const role = await db.get(
-      'SELECT 1 AS present FROM user_roles WHERE user_id = ? OR granted_by = ? LIMIT 1',
+    const holds = await db.get(
+      `SELECT 1 AS present FROM user_roles WHERE user_id = ?
+       UNION ALL SELECT 1 FROM agent_group_members WHERE user_id = ? LIMIT 1`,
       userId,
       userId,
     );
-    const member = await db.get(
-      'SELECT 1 AS present FROM agent_group_members WHERE user_id = ? OR added_by = ? LIMIT 1',
+    const granted = await db.get(
+      `SELECT 1 AS present FROM user_roles WHERE granted_by = ?
+       UNION ALL SELECT 1 FROM agent_group_members WHERE added_by = ? LIMIT 1`,
       userId,
       userId,
     );
-    if (role || member) {
+    if (holds || granted) {
+      // main relays this to the principal, whose operator alone changes who may use the assistant.
+      const address = userId.slice('email:'.length);
       throw new Error(
-        `${userId} holds access in NanoClaw (a role or an agent-group membership); remove that access before forgetting this person`,
+        `${name} ${holds ? 'has' : 'gave someone'} access to the assistant as ${address}, which only the principal's operator can remove: ` +
+          'tell the principal their operator must remove that access before you can forget them.',
       );
     }
   }
@@ -718,7 +724,10 @@ export async function forgetPerson(input: ForgetPersonInput): Promise<ForgetAnsw
   await loadFingerprintKey();
   const person = await requirePerson(id);
   const handles = person.identities.map((identity) => identity.handle);
-  await assertNoGrantedAccess(handles.filter((handle) => handle.startsWith('email:')));
+  await assertNoGrantedAccess(
+    person.name,
+    handles.filter((handle) => handle.startsWith('email:')),
+  );
   const key = await forgetKey();
 
   const rewrite = new Set<string>();

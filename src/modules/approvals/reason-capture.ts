@@ -31,7 +31,7 @@ import {
 import { log } from '../../log.js';
 import { registerMessageInterceptor } from '../../router.js';
 import type { PendingApproval, Session } from '../../types.js';
-import { finalizeReject } from './finalize.js';
+import { finalizeReject, resumeRejectedApprovals } from './finalize.js';
 import { approvalCardThread } from './primitive.js';
 
 /** How long an awaiting-reason hold waits for the admin's reply before the sweep finalizes a plain reject. */
@@ -99,7 +99,7 @@ export async function armReasonCapture(approval: PendingApproval, session: Sessi
       hasDeliveryAddress: Boolean(channelType && platformId),
       hasAdapter: Boolean(adapter),
     });
-    await finalizeReject(approval, session, userId, undefined, 'awaiting_reason');
+    await finalizeReject(approval, userId, undefined, 'awaiting_reason');
     return;
   }
 
@@ -120,7 +120,7 @@ export async function armReasonCapture(approval: PendingApproval, session: Sessi
       approvalId: approval.approval_id,
       err,
     });
-    await finalizeReject(approval, session, userId, undefined, 'awaiting_reason');
+    await finalizeReject(approval, userId, undefined, 'awaiting_reason');
     return;
   }
 
@@ -161,7 +161,7 @@ export async function captureReasonReply(event: InboundEvent): Promise<boolean> 
   }
 
   const reason = clampReason(extractText(event));
-  await finalizeReject(approval, session, arming.userId, reason || undefined);
+  await finalizeReject(approval, arming.userId, reason || undefined);
   log.info('reject-with-reason: reason captured and relayed', {
     approvalId: approval.approval_id,
     hasReason: reason.length > 0,
@@ -178,6 +178,7 @@ registerMessageInterceptor(captureReasonReply);
  * requesting agent always gets its decision. Called once per sweep tick.
  */
 export async function sweepAwaitingReasonRejects(): Promise<void> {
+  await resumeRejectedApprovals();
   const rows = await getExpiredAwaitingReasonApprovals(new Date().toISOString());
   for (const approval of rows) {
     const session = approval.session_id ? await getSession(approval.session_id) : null;
@@ -186,7 +187,7 @@ export async function sweepAwaitingReasonRejects(): Promise<void> {
       continue;
     }
     // Plain reject, unknown resolver — the admin opted in but never typed.
-    await finalizeReject(approval, session, '');
+    await finalizeReject(approval, '');
     log.info('reject-with-reason: window elapsed, finalized as plain reject', { approvalId: approval.approval_id });
   }
 }

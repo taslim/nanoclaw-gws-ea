@@ -11,6 +11,7 @@ import { register } from '../../cli/registry.js';
 import type { AgentGroup } from '../../types.js';
 import { registerApprovalHandler } from '../approvals/index.js';
 import { NAME_LIMIT, quoted } from '../approvals/request-text.js';
+import { hasBrowserAccess } from '../gws-ea-browser/access.js';
 // The inbox's store alone: its module entry points load external-email, whose
 // registrations must follow this module's.
 import { getInboxState, principalCalendarAccess } from '../gws-ea-inbox/db.js';
@@ -86,11 +87,11 @@ function assistantAddressSentence(assistant: string, email: string | null): stri
 }
 
 /**
- * The assistant on the web, for main (KTD14): its alias, or that none is set
- * up yet, and that accounts in the principal's name come only from their
- * logins in 1Password (R25).
+ * The assistant on the web, for each group that delegates to the browser
+ * (KTD14): its alias, or that none is set up yet, and that accounts in the
+ * principal's name come only from their logins in 1Password (R25).
  */
-function mainWebSentences(assistant: string, principal: string, alias: string | null): string {
+function delegatorWebSentences(assistant: string, principal: string, alias: string | null): string {
   const address =
     alias === null
       ? ` ${assistant} has no web address yet: until the operator sets it up, a browser errand that needs ${assistant}'s email stops with \`alias_unavailable\`.`
@@ -123,6 +124,7 @@ function browserWebSentence(assistant: string, principal: string, alias: string 
  * poll keeps each one's calendar access, so it reads both live: a copy
  * composed when its container started would go stale the moment either
  * changed (R9).
+ * to: main
  */
 export const MAIN_PRINCIPAL_ADDRESSES_POINTER =
   " The principal's email addresses decide which calendars are theirs. Read them with `ncl principal-addresses list`, whose `calendar_access` says what you can do with each address's calendar, before you decide whose a calendar is or what you can do with one: the list is the only current copy, and an address or its access may have changed since you last read it. Once the assistant has its own inbox, mail from these addresses carries the principal's authority, so a new one waits for the principal to confirm it in the conversation; the command says when it does, and you are told the result.";
@@ -135,7 +137,9 @@ export const MAIN_PRINCIPAL_ADDRESSES_POINTER =
  * the address it converses from, and knows the principal's addresses only
  * to recognize them (R34). Any other group gets the addresses as of
  * its container's start: the default `group` CLI scope leaves the live list
- * out of its reach.
+ * out of its reach. Main or another group gets the assistant's web address
+ * only while the browser access setting lets it delegate errands, which is
+ * all that address is for.
  */
 async function identitySection(group: AgentGroup): Promise<{ name: string; body: string } | undefined> {
   if (!(await getDb().hasTable('gws_ea_profile'))) return undefined;
@@ -146,13 +150,19 @@ async function identitySection(group: AgentGroup): Promise<{ name: string; body:
   const names = `${assistant} is the assistant. ${principal} is the principal. They are separate people: act and communicate as ${assistant}, support ${principal}, and never present the assistant as the principal.`;
   const audience = await projectDocAudience(group.id);
   if (audience === 'external-email') return { name: 'Assistant Identity', body: names };
+  if (audience === 'browser') {
+    const body = `${browserWebSentence(assistant, principal, profile.assistant_alias)}${browserPrincipalAddressesSentence(principal, profile.principal_emails)}`;
+    return { name: 'Assistant Identity', body: `${names}${body}` };
+  }
   const own = assistantAddressSentence(assistant, profile.assistant_workspace_email);
-  const body =
+  const web = (await hasBrowserAccess(group.id))
+    ? delegatorWebSentences(assistant, principal, profile.assistant_alias)
+    : '';
+  const addresses =
     audience === 'main'
-      ? `${own}${mainWebSentences(assistant, principal, profile.assistant_alias)}${MAIN_PRINCIPAL_ADDRESSES_POINTER}`
-      : audience === 'browser'
-        ? `${browserWebSentence(assistant, principal, profile.assistant_alias)}${browserPrincipalAddressesSentence(principal, profile.principal_emails)}`
-        : `${own}${principalAddressesSentence(principal, profile.principal_emails)}`;
+      ? MAIN_PRINCIPAL_ADDRESSES_POINTER
+      : principalAddressesSentence(principal, profile.principal_emails);
+  const body = `${own}${web}${addresses}`;
   return { name: 'Assistant Identity', body: `${names}${body}` };
 }
 
@@ -336,30 +346,40 @@ async function requestAddAddressCard(ctx: CallerContext, email: string, approver
   } as const;
 }
 
-registerApprovalHandler(ADD_ADDRESS_APPROVAL, async ({ session, payload, approval, userId, notify }) => {
-  const email = typeof payload.email === 'string' ? payload.email : '';
-  // The card names its approver; this re-check holds even if the principal
-  // identity changed after the card went out.
-  if (!(await isVerifiedPrincipalUser(userId))) {
-    await notify(`${email} was not added: only the principal can confirm one of their addresses.`);
-    return;
-  }
-  const decision = await guard(addPrincipalAddressAction, {
-    actor: { kind: 'agent', agentGroupId: session.agent_group_id, sessionId: session.id },
-    payload: addAddressPayload(email),
-    grant: approval,
-  });
-  if (decision.effect !== 'allow') {
-    await notify(`${email} was not added: ${decision.reason}`);
-    return;
-  }
-  const { added } = await addPrincipalAddress(email);
-  await notify(
-    added
-      ? `The principal confirmed. ${email} is now one of their addresses.`
-      : `The principal confirmed. ${email} was already one of their addresses.`,
-  );
-});
+registerApprovalHandler(
+  ADD_ADDRESS_APPROVAL,
+  async ({ session, payload, approval, userId, notify }) => {
+    const email = typeof payload.email === 'string' ? payload.email : '';
+    // The card names its approver; this re-check holds even if the principal
+    // identity changed after the card went out.
+    if (!(await isVerifiedPrincipalUser(userId))) {
+      await notify(`${email} was not added: only the principal can confirm one of their addresses.`);
+      return;
+    }
+    const decision = await guard(addPrincipalAddressAction, {
+      actor: { kind: 'agent', agentGroupId: session.agent_group_id, sessionId: session.id },
+      payload: addAddressPayload(email),
+      grant: approval,
+    });
+    if (decision.effect !== 'allow') {
+      await notify(`${email} was not added: ${decision.reason}`);
+      return;
+    }
+    const { added } = await addPrincipalAddress(email);
+    await notify(
+      added
+        ? `The principal confirmed. ${email} is now one of their addresses.`
+        : `The principal confirmed. ${email} was already one of their addresses.`,
+    );
+  },
+  {
+    rejectionNote: (approval, reason) => {
+      const { email } = JSON.parse(approval.payload) as { email?: unknown };
+      const address = typeof email === 'string' ? email : 'that address';
+      return `The principal declined to add ${address} as one of their addresses${reason ? `: "${reason}"` : ''}. Mail from it carries no authority of theirs.`;
+    },
+  },
+);
 
 /**
  * Add an address: directly for the operator, and for main until the inbox
@@ -410,6 +430,7 @@ const EMAIL_ARGUMENT = {
   description: "One of the principal's email addresses; stored lowercased.",
 } as const;
 
+/** to: main */
 registerResource({
   name: 'principal address',
   plural: 'principal-addresses',
@@ -482,9 +503,12 @@ function receiptText(changes: readonly ProfileChange[]): string {
   return `I updated your profile: ${LIST.format(described)}. If you didn't ask for this, tell me and I'll change it back.`;
 }
 
-/** What follows the change, and when: the host's readers now, main's own copies on its next start. */
+/**
+ * What follows the change, and when: the host's readers now, main's own copies on its next start.
+ * to: main
+ */
 const TAKES_EFFECT =
-  "The host's email signatures and free_time use the new values now; your own clock and the identity text in your instructions follow on your next start.";
+  "The host's email signatures and external-email's offered times use the new values now. Your own clock and the identity in your instructions follow at your next start, with nothing for you to do.";
 
 async function setPrincipalProfile(args: Record<string, unknown>, ctx: CallerContext) {
   await assertMainCaller(ctx, NAME_AND_TIMEZONE);
@@ -517,6 +541,7 @@ const TIMEZONE_ARGUMENT = {
   description: 'Their home time zone, as an IANA id such as Europe/London.',
 } as const;
 
+/** to: main */
 registerResource({
   name: 'principal profile',
   plural: 'principal-profile',

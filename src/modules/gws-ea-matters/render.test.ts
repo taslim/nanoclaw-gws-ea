@@ -26,6 +26,7 @@ import { createSession, getSession } from '../../db/sessions.js';
 import { createScheduledTask, prepareScheduledTask } from '../scheduling/create.js';
 import { initSessionFolder } from '../../session-manager.js';
 import { GOOGLE_GRANT_FILE_ENV } from '../gws-ea-google/grant.js';
+import { GoogleGrantRevokedError } from '../gws-ea-google/tokens.js';
 import { GoogleApiError } from '../gws-ea-inbox/gmail-api.js';
 import '../gws-ea-inbox/index.js';
 import { FakeGmailThreads } from '../gws-ea-inbox/testing/fake-gmail-threads.js';
@@ -379,6 +380,18 @@ describe('a matter as main reads it', () => {
     const rendered = await late;
     expect(rendered).toContain(`- thread ${THREAD_JUNO}: couldn't read just now`);
     expect(rendered).toContain(`- event ${KICKOFF}: Oct 14, 2026, 3:00 PM to 4:00 PM; confirmed`);
+  });
+
+  it("renders a read the assistant's Google sign-in can't make as the operator's to reconnect, in no host terms", async () => {
+    const { gmail, sources } = world();
+    const acme = await open('Acme renewal', 'Renew.', [{ kind: 'thread', reference: THREAD_JUNO }]);
+
+    gmail.failNext(new GoogleGrantRevokedError("Google no longer accepts the assistant's sign-in; sign in again"));
+    const rendered = await view(acme, sources);
+    expect(rendered).toContain(
+      `- thread ${THREAD_JUNO}: couldn't read: your Google connection isn't working right now, and reconnecting it is the operator's job`,
+    );
+    expect(rendered).not.toContain('sign in again');
   });
 
   it('names no one the principal had forgotten, by name or address', async () => {

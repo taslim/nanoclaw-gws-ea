@@ -76,6 +76,21 @@ describe('gateway provider registry', () => {
     expect(gateway.selectGatewayAgentSkills(['welcome', 'inactive-skill', 'active-skill'], false)).toEqual(['welcome']);
   });
 
+  it("withholds the gateway's agent skills from every agent once a module asks, even one that names them", async () => {
+    process.env.NANOCLAW_GATEWAY_PROVIDER = 'active';
+    const registry = await import('./gateway-provider-registry.js');
+    registry.registerGatewayProvider(fixture('inactive', ['inactive-skill'], []));
+    registry.registerGatewayProvider(fixture('active', ['active-skill'], []));
+    const gateway = await import('./index.js');
+
+    gateway.withholdGatewayAgentSkills();
+
+    expect(gateway.selectGatewayAgentSkills(['welcome', 'inactive-skill', 'active-skill'], true)).toEqual(['welcome']);
+    expect(gateway.selectGatewayAgentSkills(['welcome'], false)).toEqual(['welcome']);
+    // The gateway itself stays selected: it still carries the agents' traffic.
+    expect(gateway.getGatewayProvider().kind).toBe('active');
+  });
+
   it('fails closed when the selected registration is missing', async () => {
     process.env.NANOCLAW_GATEWAY_PROVIDER = 'missing';
     const gateway = await import('./index.js');

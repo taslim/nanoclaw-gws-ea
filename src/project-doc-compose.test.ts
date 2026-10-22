@@ -29,7 +29,6 @@ import {
   type ProjectDocSpec,
 } from './project-doc-compose.js';
 import type { AgentGroup } from './types.js';
-import './modules/gws-ea-voice/index.js';
 
 const CLAUDE_SPEC: ProjectDocSpec = {
   fileName: 'CLAUDE.md',
@@ -71,9 +70,6 @@ beforeEach(async () => {
   for (const entry of ['CLAUDE.md', 'agent-runner']) {
     fs.symlinkSync(path.join(REPO_ROOT, 'container', entry), path.join(sourceRoot, 'container', entry));
   }
-  const moduleDir = path.join(sourceRoot, 'src', 'modules');
-  fs.mkdirSync(moduleDir, { recursive: true });
-  fs.symlinkSync(path.join(REPO_ROOT, 'src', 'modules', 'gws-ea-voice'), path.join(moduleDir, 'gws-ea-voice'));
   process.chdir(sourceRoot);
   await runMigrations(await initTestDb(), [...getRegisteredMigrations(), capabilitiesMigration]);
 });
@@ -437,22 +433,6 @@ describe('composeGroupProjectDoc size cap', () => {
     expect(doc).toContain('# Required Runtime Identity');
     expect(doc).toContain('REQUIRED_IDENTITY_MARKER');
     expect(doc).toContain('# Omitted for size');
-  });
-
-  it("retains voice interpretation guidance under the cap without importing another group's private context", async () => {
-    const ag = await seed('ag-restricted-voice', 'restricted-voice');
-    await updateContainerConfigJson(ag.id, 'mcp_servers', bigMcp(4));
-    fs.mkdirSync(path.join(groupDirOf(ag.folder), 'memory'), { recursive: true });
-    fs.writeFileSync(path.join(groupDirOf(ag.folder), 'memory', 'private-person.md'), 'PRIVATE_PERSON_CONTEXT');
-
-    const doc = await compose(ag, { ...CLAUDE_SPEC, maxBytes: 24 * 1024 });
-
-    expect(doc).toContain('# Voice notes');
-    expect(doc).toContain("Use only this receiving conversation's permitted context, tools, and memory");
-    expect(doc).toContain('# Omitted for size');
-    expect(doc).not.toContain('PRIVATE_PERSON_CONTEXT');
-    expect(doc).not.toContain('# Executive Assistant');
-    expect(doc).not.toContain('ncl people');
   });
 
   // Claude Code "loads a CLAUDE.md file of up to 4 MiB in full and skips a

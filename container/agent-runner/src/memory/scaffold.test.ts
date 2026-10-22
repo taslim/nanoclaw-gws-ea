@@ -3,6 +3,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 
+import { RELEASE_MEMORY_DEFINITION } from './context.js';
 import { ensureMemoryScaffold } from './scaffold.js';
 
 function parseFrontmatter(filePath: string): unknown {
@@ -13,21 +14,26 @@ function parseFrontmatter(filePath: string): unknown {
 }
 
 describe('ensureMemoryScaffold', () => {
-  it('deterministically creates the memory tree', () => {
+  it('creates only the index, seeding no definition: the release supplies it', () => {
     const base = fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-mem-'));
     try {
       ensureMemoryScaffold(base);
 
-      expect(fs.existsSync(path.join(base, 'memory', 'index.md'))).toBe(true);
-      expect(fs.existsSync(path.join(base, 'memory', 'system', 'index.md'))).toBe(true);
-      expect(fs.existsSync(path.join(base, 'memory', 'system', 'definition.md'))).toBe(true);
-      expect(fs.existsSync(path.join(base, 'memory', 'memories'))).toBe(false);
-      expect(fs.existsSync(path.join(base, 'memory', 'data'))).toBe(false);
+      expect(fs.readdirSync(path.join(base, 'memory'))).toEqual(['index.md']);
       expect(parseFrontmatter(path.join(base, 'memory', 'index.md'))).toMatchObject({ okf_version: '0.1' });
-      expect(parseFrontmatter(path.join(base, 'memory', 'system', 'definition.md'))).toMatchObject({ type: 'system' });
-      expect(fs.readFileSync(path.join(base, 'memory', 'system', 'index.md'), 'utf-8')).toContain(
-        '[Definition](definition.md)',
-      );
+    } finally {
+      fs.rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  it('maps the release definition by its path in the container, where the memory hook reads it', () => {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-mem-'));
+    try {
+      ensureMemoryScaffold(base);
+      const index = fs.readFileSync(path.join(base, 'memory', 'index.md'), 'utf-8');
+
+      expect(index).toContain(`](${RELEASE_MEMORY_DEFINITION.path})`);
+      expect(index.indexOf('## Core Memory')).toBeLessThan(index.indexOf('## Map'));
     } finally {
       fs.rmSync(base, { recursive: true, force: true });
     }

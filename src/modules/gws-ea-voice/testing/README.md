@@ -35,7 +35,7 @@ installation directories in the receipts. A private manifest has this shape:
     {
       "id": "date-correction",
       "audioFile": "/private/voice-acceptance/human-note.m4a",
-      "expectedIntent": "Friday replaces Thursday. Wait for Sarah's confirmation; do not book before it. No question about which day."
+      "expectedIntent": "Friday replaces Thursday. Wait for Remy's confirmation; do not book before it. No question about which day."
     }
   ]
 }
@@ -83,7 +83,7 @@ each candidate against the human expectations established before the run.
 | ---------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | AE1: brief instruction             | Resolve a plausible person-name misrecognition using permitted context, perform the intended job, and reply normally. No extra recipient or action.                                                                                                                                                                                     |
 | AE2: long rambling note            | Complete a multi-minute note containing three jobs, a corrected date, and a digression. Verify all three durable outcomes; abandoned date and digression cause no side effect. Include mixed language, numbers, and negation.                                                                                                           |
-| AE3: conditional correction        | Friday definitively replaces Thursday. Track Sarah's confirmation as the execution dependency. Deliver that confirmation through ordinary input and verify the Friday move exactly once.                                                                                                                                                |
+| AE3: conditional correction        | Friday definitively replaces Thursday. Track Remy's confirmation as the execution dependency. Deliver that confirmation through ordinary input and verify the Friday move exactly once.                                                                                                                                                 |
 | AE4: cancellation/order            | Delay actual media hydration and recognition, then send cancellation in the same conversation. Observe note-before-cancellation, cancel still-unperformed work, and verify unrelated conversations continue. Distinguish work already completed and verified.                                                                           |
 | AE5: forwarded/quoted source       | Forward an imperative recording with a summary request. Summarize without executing the recording. Check source status remains informational in history, echo, and backfill. Ordinary reply quotes do not relabel new direct audio.                                                                                                     |
 | AE6: context isolation/corrections | Send a similar reference to main and a restricted conversation. Verify only permitted context is used. Correct a recognized name naturally and verify an existing durable memory correction is reused without a new global vocabulary store.                                                                                            |

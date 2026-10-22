@@ -34,7 +34,6 @@ describe('sealed sessions', () => {
     try {
       expect(prepareSessionMemory(false, base)).toBe(MEMORY_SESSION_HOOK);
       expect(fs.existsSync(path.join(base, 'memory', 'index.md'))).toBe(true);
-      expect(fs.existsSync(path.join(base, 'memory', 'system', 'definition.md'))).toBe(true);
     } finally {
       fs.rmSync(base, { recursive: true, force: true });
     }

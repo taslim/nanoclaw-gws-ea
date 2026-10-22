@@ -28,6 +28,7 @@ vi.mock('../../container-runner.js', async (importOriginal) => ({
 
 vi.mock('../../request-wake.js', () => ({ requestWake: vi.fn().mockResolvedValue(true) }));
 
+import { getResource } from '../../cli/crud.js';
 import { dispatch } from '../../cli/dispatch.js';
 import type { CallerContext } from '../../cli/frame.js';
 import { lookup } from '../../cli/registry.js';
@@ -43,6 +44,7 @@ import {
 import { inboundDbPath, outboundDbPath } from '../../mailbox/sqlite/paths.js';
 import { resolveSession } from '../../session-manager.js';
 import type { PendingApproval, Session } from '../../types.js';
+import { finalizeReject } from '../approvals/finalize.js';
 import { handleApprovalsResponse } from '../approvals/response-handler.js';
 import { addPrincipalAddress, bindVerifiedPrincipalUser } from '../gws-ea-profile/db.js';
 import { upsertUserDm } from '../permissions/db/user-dms.js';
@@ -227,6 +229,19 @@ describe('private values in ncl', () => {
     }
   });
 
+  it('names the one way a value reaches someone else, a disclosure main records, and the id that serves it', () => {
+    const resource = getResource('private-values');
+    expect(resource?.description).toContain(
+      "except to a site the principal's own request names, recorded for one browser errand with record_disclosure",
+    );
+    expect(resource?.columns.find((column) => column.name === 'id')?.description).toBe(
+      "The value's id, from `list`: what remove and record_disclosure take.",
+    );
+    expect(resource?.customOperations?.add?.description).toContain(
+      'recorded for one browser errand with record_disclosure',
+    );
+  });
+
   it('lets main add and list values, and treats another spelling of one as held', async () => {
     const id = await addHome();
     const again = await run(
@@ -357,7 +372,23 @@ describe('removing a private value', () => {
       threadId: null,
     });
     expect(await listPrivateValues()).toHaveLength(1);
-    expect(notes(main).at(-1)).toMatch(/rejected/i);
+    const note = notes(main).at(-1) ?? '';
+    expect(note).toBe(
+      `The principal declined to stop protecting their private address "${HOME_LABEL}". It stays protected.`,
+    );
+    expect(note).not.toMatch(/admin|private_value_remove|appr-/u);
+  });
+
+  it('tells main the reason the principal gave for keeping the value protected', async () => {
+    const id = await addHome();
+    await run('private-values-remove', { id }, agent(main));
+    const [approval] = await pendingApprovals();
+
+    await finalizeReject(approval, PRINCIPAL, 'I still need it kept private');
+    expect(await listPrivateValues()).toHaveLength(1);
+    expect(notes(main).at(-1)).toBe(
+      `The principal declined to stop protecting their private address "${HOME_LABEL}": "I still need it kept private". It stays protected.`,
+    );
   });
 
   it('keeps the value when the clicker is no longer the verified principal, though another one is', async () => {

@@ -59,9 +59,24 @@ describe('Claude memory SessionStart registration', () => {
       { matcher: 'resume', hooks: [{ type: 'command', command: 'custom-resume' }] },
       { matcher: '.*', hooks: [{ type: 'command', command: 'custom-start' }] },
       {
-        matcher: 'startup|clear|compact',
+        matcher: 'startup|resume|clear|compact',
         hooks: [{ type: 'command', command: 'bun /app/src/memory/hook.ts', timeout: 10 }],
       },
+    ]);
+  });
+
+  it("replaces an earlier release's memory hook with one that also runs on resume", () => {
+    const settingsFile = path.join(configDir, 'settings.json');
+    const memoryHook = [{ type: 'command', command: 'bun /app/src/memory/hook.ts', timeout: 10 }];
+    fs.writeFileSync(
+      settingsFile,
+      JSON.stringify({ hooks: { SessionStart: [{ matcher: 'startup|clear|compact', hooks: memoryHook }] } }),
+    );
+
+    registerProviderMemorySessionHook('claude', createProvider('claude'), MEMORY_SESSION_HOOK);
+
+    expect(JSON.parse(fs.readFileSync(settingsFile, 'utf-8')).hooks.SessionStart).toEqual([
+      { matcher: 'startup|resume|clear|compact', hooks: memoryHook },
     ]);
   });
 

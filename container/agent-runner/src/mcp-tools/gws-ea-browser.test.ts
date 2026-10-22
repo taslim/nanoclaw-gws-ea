@@ -91,11 +91,7 @@ const cases: ReadonlyArray<readonly [McpToolDefinition, Record<string, unknown>]
       venue: { id: 'bistro-123', name: 'Bistro' },
       party_size: 4,
       windows: [{ start: '2026-10-16T19:00:00-07:00', end: '2026-10-16T21:00:00-07:00' }],
-      financial: {
-        currency: 'USD',
-        max_total: '50.00',
-        terms: 'Conditional no-show fee only; nothing due at booking.',
-      },
+      financial: { currency: 'USD', max_total: '50.00' },
       until: '2026-10-16T18:00:00-07:00',
       release: {
         wording: 'Tables are released 30 days ahead at 10:00',
@@ -177,7 +173,6 @@ const AGENT_FACING_FILES = [
   './gws-ea-browser.ts',
   './gws-ea-browser.instructions.md',
   './gws-ea-browser-delegate.ts',
-  './gws-ea-browser-delegate.instructions.md',
   '../../../../templates/gws-ea/browser/instructions.md',
   '../../../../templates/gws-ea/browser/README.md',
   '../../../../src/modules/gws-ea-browser/main-guidance.md',
@@ -319,6 +314,28 @@ describe('the browser tools', () => {
     expect(signInCode.tool.inputSchema.properties).not.toHaveProperty('code');
   });
 
+  it('distinguishes a pre-disclosure consent refusal from an uncertain attempt that must never be submitted again', () => {
+    const description = credentialForm.tool.description;
+    expect(description).toContain('refused with consent_required before disclosure');
+    expect(description).toContain('outcome_unknown with reason consent_required after disclosure');
+    expect(description).toContain('A grant never permits refilling an exposed attempt.');
+    expect(description).not.toContain('consent_required, which submitted nothing');
+    expect(requestConsent.tool.description).toContain(
+      'If credentials already reached the page, reconcile that attempt before trying again',
+    );
+  });
+
+  it('takes a watch’s maximum as its only financial bound, and names a fee above it', () => {
+    const accepts = new Ajv({ formats: { uri: true, 'date-time': true } }).compile(watch.tool.inputSchema);
+    const [, fields] = cases.find(([tool]) => tool === watch)!;
+    expect(accepts(fields)).toBe(true);
+    // The host reads a paid venue's terms itself, so the browser's own wording of them is no bound.
+    expect(accepts({ ...fields, financial: { currency: 'USD', max_total: '50.00', terms: 'No-show fee only' } })).toBe(
+      false,
+    );
+    expect(watch.tool.description).toContain('terms_over_bounds');
+  });
+
   it('refuses a credential_form step the host would refuse, before sending anything', async () => {
     const authority = '6f1d2c3b-4a5e-4f60-8a7b-9c0d1e2f3a4b';
     const ref = (n: number) => ({ ref: `e${n}`, generation: 1 });
@@ -394,6 +411,16 @@ describe('the browser tools', () => {
     for (const needed_by of ['2026-10-23T17:00:00', 'October 23', '23/10/2026'])
       expect(validate({ target, needed_by })).toBe(false);
     expect(purchase.tool.inputSchema.properties?.needed_by).not.toHaveProperty('format');
+  });
+
+  it('reads main as whichever agent sent the errand, in its guidance, its tools and the host’s answers and notices', () => {
+    const guidance = fs.readFileSync(
+      new URL('../../../../templates/gws-ea/browser/instructions.md', import.meta.url),
+      'utf8',
+    );
+    expect(guidance.split('\n')[0]).toContain(
+      "When another of the assistant's agents delegated this errand, read main as that agent wherever it appears: in this guidance, in your tools' descriptions, and in the host's answers and notices.",
+    );
   });
 
   it('names only real tools in its mechanics instructions', async () => {

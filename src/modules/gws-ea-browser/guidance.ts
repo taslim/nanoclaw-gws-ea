@@ -5,7 +5,7 @@ import { registerA2aInboundFraming } from '../agent-to-agent/agent-route.js';
 import { untrusted } from '../gws-ea-inbox/untrusted.js';
 import { getBrowserAgentGroupId } from '../gws-ea-profile/db.js';
 import { registerGuidance } from '../gws-ea-profile/guidance.js';
-import { hasBrowserAccess } from './access.js';
+import { hasBrowserAccess, isMainAgentGroup } from './access.js';
 
 /** Whether a group may delegate to the browser, whether or not the operator has it enabled now (KTD15). */
 async function delegates(agentGroupId: string): Promise<boolean> {
@@ -22,6 +22,19 @@ registerCapability(BROWSER_DELEGATE_CAPABILITY, {
   description: 'Delegate browser errands, cancel jobs and relay principal sign-in codes through the host',
   default: 'off',
   grantedTo: delegates,
+});
+
+/**
+ * Main records the purchases of a group whose browser access was removed (purchase-outcome.ts), so the tool
+ * reaches main and every delegator, whatever the setting lists (KTD16); the host checks each recording's errand.
+ */
+export const PURCHASE_OUTCOME_CAPABILITY = 'browser-purchase-outcome';
+registerCapability(PURCHASE_OUTCOME_CAPABILITY, {
+  description: 'record_purchase_outcome: settle a browser purchase the page left unconfirmed',
+  default: 'off',
+  grantedTo: async (agentGroupId) =>
+    (await getDb().hasTable('gws_ea_profile')) &&
+    ((await isMainAgentGroup(agentGroupId)) || (await hasBrowserAccess(agentGroupId))),
 });
 
 registerGuidance('gws-ea-browser:main-guidance', {

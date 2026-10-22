@@ -24,7 +24,7 @@ import type { InboundEvent, InboundMessage } from '../channels/adapter.js';
 import type { ContainerConfig } from '../container-config.js';
 import type { GatewayApprovalRequest, GatewaySessionInput } from '../gateway-providers/gateway-provider-registry.js';
 import type { ProviderStateVolume } from '../provider-contracts/registry.js';
-import type { AgentGroup, Session } from '../types.js';
+import type { AgentGroup, PendingApproval, Session } from '../types.js';
 import { CONTROL_PLANE_ROOT } from './paths.js';
 import type { NanoclawCommandRunner, NanoclawServiceEnvironment, NanoclawServiceHelpers } from './service-control.js';
 
@@ -1497,5 +1497,265 @@ describe('recorded divergence: upstream sync 2026-10-19 re-applied these on upst
 
     expect(await ignored('templates/gws-ea/main/new-file.md')).toBe(false);
     expect(await ignored('templates/sales/sdr/plugin.json')).toBe(true);
+  });
+});
+
+describe('recorded divergence: the agent runner words delivery for the tools the agent holds', () => {
+  it('teaches send_message and pacing only with reply, gives every chat agent the quiet ending, and leaves signing to its guidance', async () => {
+    const runner = path.join(originalCwd, 'container/agent-runner/src');
+    const destinations = await readFile(path.join(runner, 'destinations.ts'), 'utf8');
+    const compaction = await readFile(path.join(runner, 'compact-instructions.ts'), 'utf8');
+    const pollLoop = await readFile(path.join(runner, 'poll-loop.ts'), 'utf8');
+    const index = await readFile(path.join(runner, 'index.ts'), 'utf8');
+
+    expect(destinations).toContain(
+      'sections.push(buildDestinationsSection(mode, capabilities.has(REPLY_CAPABILITY)));',
+    );
+    expect(destinations).toContain('Sign only where your guidance asks for it.');
+    expect(destinations).not.toContain('when signing any message');
+    expect(destinations).toContain('When a turn has nothing to send, end it with only `<internal>…</internal>`');
+    expect(index).toContain("taskId ? { kind: 'task', taskId } : { kind: 'chat' },\n    config.capabilities,\n  );");
+    expect(compaction).toContain('const canReply = capabilities.has(REPLY_CAPABILITY);');
+    expect(compaction).toContain("'A turn with nothing to send ends with only <internal>...</internal>.'");
+    expect(compaction).toContain('console.log(buildCompactInstructions(names, taskId, loadConfig().capabilities));');
+    expect(compaction).toContain('taskId: getTaskSeriesId(),');
+    expect(pollLoop).not.toContain('Please re-send your reply');
+    expect(pollLoop).toContain(
+      'If the turn had nothing to send, respond with only <internal>done</internal> and nothing will be sent.',
+    );
+    expect(pollLoop).toContain('or that text was only a note to yourself, respond with only <internal>done</internal>');
+  });
+});
+
+describe('recorded divergence: compaction keeps the relationship and the work in flight', () => {
+  it('asks the summary for corrections from whoever may direct the agent, promises, pending cards and open ids, and to restate no standing rule', async () => {
+    const compaction = await readFile(
+      path.join(originalCwd, 'container/agent-runner/src/compact-instructions.ts'),
+      'utf8',
+    );
+
+    for (const line of [
+      'corrections and preferences they gave in this session, in their own words, and who gave each;',
+      'promises made and not yet kept;',
+      'decisions and approval cards still waiting on an answer;',
+      'open threads and errands, each with its host id exactly as written.',
+      'The people you serve are whoever your own instructions say may direct you.',
+      '4. Leave out standing instructions and memory: both are loaded again after the summary',
+      'never a rule to follow from now on.',
+      'Leave out how to use tools and commands too: the skills and tool',
+      'descriptions carry that, and a command remembered from a summary is not the skill that teaches it.',
+    ]) {
+      expect(compaction).toContain(line);
+    }
+  });
+});
+
+describe('recorded divergence: recognized speech carries its reading note and an unheard recording a status line for its reader', () => {
+  it("says how to read speech once, and names the operator only in the principal's own private conversation", async () => {
+    const formatter = await readFile(path.join(originalCwd, 'container/agent-runner/src/formatter.ts'), 'utf8');
+
+    expect(formatter).toContain('const SPEECH_READING_NOTE =');
+    expect(formatter).toContain(
+      'A self-correction replaces what it corrects. Keep every point, number, negation and condition',
+    );
+    expect(formatter).toContain('`\\n<speech_note>${SPEECH_READING_NOTE}</speech_note>`');
+    expect(formatter).toContain('const principals = speech.inPrincipalPrivateConversation === true;');
+    expect(formatter).toContain('const NOT_LISTENED_ELSEWHERE =');
+    expect(formatter).toContain(
+      `"You can't listen to this recording here. Its sender expects you heard it, so if it bears on the thread, say you couldn't listen to it and ask them to put it in writing, without saying why; handle the rest of the message as usual."`,
+    );
+    expect(formatter).toContain(
+      'They expect you heard it, so tell them so in a line of your reply, ask them to ${ask}, and handle the rest of their message as usual.',
+    );
+    expect(formatter).toContain(
+      'Its sender expects you heard it, so if it bears on the thread, tell them so and ask them to ${ask}; handle the rest of the message as usual.',
+    );
+    expect(formatter).toContain('`\\n<speech status="${status}"${sourceAttrs}>${speechStatusLine(speech)}</speech>`');
+  });
+});
+
+describe('recorded divergence: memory rules come from the release, within one budget, on every session start', () => {
+  const runner = (file: string) => path.join(originalCwd, 'container/agent-runner/src/memory', file);
+  async function memoryTree(index: string): Promise<string> {
+    const base = await mkdtemp(path.join(os.tmpdir(), 'divergence-memory-'));
+    cleanups.push(() => rm(base, { recursive: true, force: true }));
+    await mkdir(path.join(base, 'memory'), { recursive: true });
+    await writeFile(path.join(base, 'memory', 'index.md'), index);
+    return base;
+  }
+
+  it("renders the release's definition, never a copy in the agent's tree, in 10,000 characters with only the index cut", async () => {
+    const memory = (await import(runner('context.ts'))) as RunnerMemoryContextModule;
+    const core = '- 2026-10-19: Morgan keeps mornings free.';
+    const base = await memoryTree(
+      `# Memory Index\n\n## Core Memory\n\n${core}\n\n## Map\n\n${'- [Matter](matters/matter.md) - a matter to recall\n'.repeat(500)}`,
+    );
+    await mkdir(path.join(base, 'memory', 'system'));
+    await writeFile(path.join(base, 'memory', 'system', 'definition.md'), 'agent-edited doctrine\n');
+
+    const section = memory.renderMemorySection(base);
+
+    expect(section.length).toBeLessThanOrEqual(10_000);
+    expect(section).toContain((await readFile(memory.RELEASE_MEMORY_DEFINITION.file, 'utf8')).trim());
+    expect(section).not.toContain('agent-edited doctrine');
+    expect(section).toContain(core);
+    expect(section).toContain(memory.MEMORY_TRUNCATION_NOTICE);
+  });
+
+  it('injects on resume only when the section changed since it was last delivered to that session', async () => {
+    const hook = (await import(runner('session-hook.ts'))) as RunnerMemorySessionHookModule;
+    const base = await memoryTree('# Memory Index\n');
+    const session = { id: 'session-a', stateDir: path.join(base, 'state') };
+    const deliver = (source: 'startup' | 'resume' | 'clear' | 'compact') => {
+      const context = hook.memoryContextForSessionStart(source, base, session);
+      if (context) hook.recordMemoryDelivered(session, context);
+      return context;
+    };
+
+    expect(hook.MEMORY_SESSION_HOOK.sources).toEqual(['startup', 'resume', 'clear', 'compact']);
+    expect(deliver('resume')).toContain('## Memory');
+    expect(deliver('resume')).toBeUndefined();
+    expect(deliver('compact')).toContain('## Memory');
+    await writeFile(path.join(base, 'memory', 'index.md'), '# Memory Index\n\n- 2026-10-19: a new correction\n');
+    expect(deliver('resume')).toContain('a new correction');
+  });
+
+  it('records a section only after the hook prints it, so one that never arrives is offered again', async () => {
+    const hook = (await import(runner('session-hook.ts'))) as RunnerMemorySessionHookModule;
+    const script = await readFile(runner('hook.ts'), 'utf8');
+    const base = await memoryTree('# Memory Index\n');
+    const session = { id: 'session-a', stateDir: path.join(base, 'state') };
+
+    expect(hook.memoryContextForSessionStart('resume', base, session)).toContain('## Memory');
+    expect(hook.memoryContextForSessionStart('resume', base, session)).toContain('## Memory');
+    const printed = script.indexOf('writeStdout(');
+    expect(printed).toBeGreaterThan(-1);
+    expect(printed).toBeLessThan(script.indexOf('recordMemoryDelivered(session, context)'));
+  });
+
+  it("seeds only the index, whose Map names the release's definition, and leaves upstream's template unseeded", async () => {
+    const scaffold = (await import(runner('scaffold.ts'))) as RunnerMemoryScaffoldModule;
+    const base = await mkdtemp(path.join(os.tmpdir(), 'divergence-memory-'));
+    cleanups.push(() => rm(base, { recursive: true, force: true }));
+
+    scaffold.ensureMemoryScaffold(base);
+
+    expect(await readdir(path.join(base, 'memory'))).toEqual(['index.md']);
+    expect(await readFile(path.join(base, 'memory', 'index.md'), 'utf8')).toContain(
+      '](/app/src/memory/gws-ea-definition.md)',
+    );
+    expect(existsSync(runner('templates/system/definition.md'))).toBe(true);
+  });
+
+  it("tells every memory-keeping agent that what it is taught belongs in memory, and that the persona file is the operator's", async () => {
+    const instructions = await readFile(
+      path.join(originalCwd, 'container/agent-runner/src/mcp-tools/memory.instructions.md'),
+      'utf8',
+    );
+
+    expect(instructions).toContain("the release's memory definition");
+    expect(instructions).toContain("is your operator's persona file");
+    expect(instructions).not.toContain('take effect after the group container restarts');
+  });
+});
+
+/** The slices of the runner's memory modules (`container/agent-runner/src/memory/`) the memory guards drive. */
+interface RunnerMemoryContextModule {
+  renderMemorySection(baseDir?: string): string;
+  readonly RELEASE_MEMORY_DEFINITION: { readonly file: string; readonly path: string };
+  readonly MEMORY_TRUNCATION_NOTICE: string;
+}
+interface RunnerMemorySessionHookModule {
+  readonly MEMORY_SESSION_HOOK: { readonly sources: readonly string[] };
+  memoryContextForSessionStart(
+    source: 'startup' | 'resume' | 'clear' | 'compact',
+    baseDir?: string,
+    session?: { id: string; stateDir?: string },
+  ): string | undefined;
+  recordMemoryDelivered(session: { id: string; stateDir?: string }, section: string): void;
+}
+interface RunnerMemoryScaffoldModule {
+  ensureMemoryScaffold(baseDir?: string): void;
+}
+
+describe('recorded divergence: an approval module can word its own rejection', () => {
+  it("relays the action's registered note in place of the generic one, none for a null note, before the wake", async () => {
+    const primitive = await import('../modules/approvals/primitive.js');
+    const finalize = await readFile(path.join(originalCwd, 'src/modules/approvals/finalize.ts'), 'utf8');
+    primitive.registerApprovalHandler('divergence:worded-reject', async () => undefined, {
+      rejectionNote: (approval, reason) => `The principal declined ${approval.title}: "${reason ?? ''}"`,
+    });
+
+    const note = primitive.getApprovalRejectionNote('divergence:worded-reject');
+    expect(await note?.({ title: 'the trip' } as PendingApproval, 'not now')).toBe(
+      'The principal declined the trip: "not now"',
+    );
+    expect(primitive.getApprovalRejectionNote('divergence:unregistered')).toBeUndefined();
+    // Rejections keep their durable claim until required settlement, notes, and wake all succeed.
+    expect(finalize).toContain("SET status = 'rejected', rejection_user_id = ?, rejection_reason = ?, rejected_at = ?");
+    expect(finalize).toContain('if (text !== null)');
+    expect(finalize.indexOf('await getApprovalRejectionFinalizer(approval.action)?.(event)')).toBeLessThan(
+      finalize.indexOf('const rejectionNote = getApprovalRejectionNote(approval.action)'),
+    );
+    expect(finalize.indexOf('await notifyApprovalResolved(event)')).toBeLessThan(
+      finalize.indexOf("await requestWake(session, 'approval-response')"),
+    );
+    expect(finalize.indexOf("await requestWake(session, 'approval-response')")).toBeLessThan(
+      finalize.lastIndexOf('await deletePendingApproval(approvalId)'),
+    );
+  });
+});
+
+/** The slice of the runner's Claude config module (`container/agent-runner/src/providers/claude-config.ts`) the skills guard drives. */
+interface ClaudeConfigModule {
+  resolveClaudeExecutionPolicy(): { disallowedTools: string[]; settings: Record<string, unknown> };
+}
+
+describe('recorded divergence: an agent sees only the skills NanoClaw mounts for it', () => {
+  const read = (file: string) => readFile(path.join(originalCwd, file), 'utf8');
+
+  it('switches off the skills Claude Code ships, and its reminder and push tools, for every Claude agent', async () => {
+    const config = (await import(
+      path.join(originalCwd, 'container/agent-runner/src/providers/claude-config.ts')
+    )) as ClaudeConfigModule;
+    const policy = config.resolveClaudeExecutionPolicy();
+
+    expect(policy.settings).toMatchObject({
+      disableBundledSkills: true,
+      enabledPlugins: { 'plugin-authoring@builtin': false },
+      skillOverrides: { design: 'off', doctor: 'off' },
+    });
+    expect(policy.disallowedTools).toEqual(expect.arrayContaining(['RemoteTrigger', 'PushNotification']));
+  });
+
+  it('composes the document from the selection the skills are mounted from', async () => {
+    const runner = await read('src/container-runner.ts');
+
+    expect(runner).toContain('composeGroupProjectDoc(agentGroup, context.groupDir, spec, context.selectedSkills)');
+  });
+
+  it("lets a module withhold the gateway's agent skills, and GWS-EA withholds them from every agent", async () => {
+    vi.resetModules();
+    const gateway = await import('../gateway-providers/index.js');
+    gateway.resetGatewayProvider({ ...gateway.getGatewayProvider(), agentSkills: ['gateway-skill'] });
+    expect(gateway.selectGatewayAgentSkills(['welcome'], true)).toEqual(['welcome', 'gateway-skill']);
+
+    await import('../modules/gws-ea-google/index.js');
+
+    expect(gateway.selectGatewayAgentSkills(['welcome'], true)).toEqual(['welcome']);
+  });
+});
+
+describe('recorded divergence: the PreCompact hook composes the mailbox it reads', () => {
+  it('imports the mailbox composition slot and starts the mailbox from the session context before reading', async () => {
+    const compaction = await readFile(
+      path.join(originalCwd, 'container/agent-runner/src/compact-instructions.ts'),
+      'utf8',
+    );
+
+    expect(compaction).toContain("import './mailbox/compose.js';");
+    expect(compaction).toContain('await mailbox.start(await readMailboxContext());');
+    expect(compaction).toContain('await mailbox.run(() => ({');
+    expect(compaction).toContain('await mailbox.stop();');
   });
 });

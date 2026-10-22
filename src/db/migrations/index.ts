@@ -28,6 +28,7 @@ import { migration024 } from './024-host-coordination.js';
 import { migration025 } from './025-container-config-speed.js';
 import { migration026 } from './026-unregistered-sender-provenance.js';
 import { migration027 } from './027-pending-question-deadline.js';
+import { migration028 } from './028-approval-rejection.js';
 
 interface MigrationBase {
   version: number;
@@ -97,6 +98,7 @@ export const migrations: Migration[] = [
   migration025,
   migration026,
   migration027,
+  migration028,
 ];
 
 /**

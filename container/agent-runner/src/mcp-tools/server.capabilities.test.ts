@@ -36,6 +36,7 @@ const ALL = [
   'request-status',
   'gws-ea-email',
   'browser-delegate',
+  'browser-purchase-outcome',
   'google-calendar',
   'google-mail-read',
   'google-directory',
@@ -150,13 +151,13 @@ describe('NanoClaw tool server capabilities', () => {
         'consent_grants',
         'credential_authority',
         'record_disclosure',
-        'record_purchase_outcome',
         'relay_code',
         'reservation_bounds',
         'reservation_guarantee',
         'vault_access',
       ],
     ],
+    ['browser-purchase-outcome', ['browser-purchase-outcome'], ['record_purchase_outcome']],
     // main works in Drive, Docs, Sheets, Slides and Forms with gog alone.
     ['google-workspace', ['google-workspace'], []],
     ["external-email's keys", EXTERNAL_EMAIL, [...EXTERNAL_EMAIL_TOOLS, 'request_status', ...TIME_TOOLS].sort()],
@@ -181,6 +182,18 @@ describe('NanoClaw tool server capabilities', () => {
       const told = tools.flatMap((tool) => descriptions(tool).map((text) => `${tool.name}: ${text}`));
       expect(told.length).toBeGreaterThan(tools.length);
       expect(told.filter((text) => text.match(controlWords) !== null)).toEqual([]);
+    } finally {
+      await close();
+    }
+  });
+
+  it('keeps every tool description within the length Claude Code keeps', async () => {
+    // Claude Code 2.1.296 cuts a deferred tool's description at 16,384 characters.
+    const { client, close } = await connect([...ALL, 'browser', ...EXTERNAL_EMAIL]);
+    try {
+      const { tools } = await client.listTools();
+      expect(tools.length).toBeGreaterThan(DEFAULT_ON_TOOLS.length);
+      expect(tools.filter((tool) => (tool.description ?? '').length > 16_384).map((tool) => tool.name)).toEqual([]);
     } finally {
       await close();
     }

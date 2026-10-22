@@ -23,8 +23,8 @@ export const GUIDANCE_PATH = path.join('src', 'modules', 'gws-ea-main', 'guidanc
  * The shared skills (`container/skills/`) `main` loads: web research and the
  * skill of every Google capability (`gws-ea-google`). Main's capabilities
  * bound the list, so it is handed a Google skill only while it holds that
- * service's key. NanoClaw adds the gateway's own skill, and the template
- * supplies `welcome`.
+ * service's key. The template supplies `welcome`; no agent here is handed the
+ * gateway's own skill (`gws-ea-google` withholds it).
  */
 export const MAIN_SHARED_SKILLS: readonly string[] = ['agent-browser', ...EXPOSED_GOOGLE_SKILLS];
 

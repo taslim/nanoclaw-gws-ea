@@ -34,6 +34,8 @@ import type { PendingApproval, Session } from '../../types.js';
 import type { OutboundFile } from '../../channels/adapter.js';
 import { handleApprovalsResponse, resumeApprovedApprovals } from '../approvals/response-handler.js';
 import { sweepExpiredApprovals } from '../approvals/index.js';
+import { finalizeReject, resumeRejectedApprovals } from '../approvals/finalize.js';
+import * as browserNotices from './notices.js';
 import { bindVerifiedPrincipalUser, reconcileGwsEaProfile } from '../gws-ea-profile/db.js';
 import { upsertUser } from '../permissions/db/users.js';
 import { upsertUserDm } from '../permissions/db/user-dms.js';
@@ -604,7 +606,7 @@ describe.skipIf(!chromePath)('reviewed merchant purchases through native host de
     await buy();
     expect(await request('buy')).toMatchObject({
       status: 'facts_incomplete',
-      missing: ["the site's reviewed checkout"],
+      missing: ['the checkout page in the form the site normally shows it'],
     });
     expect(await approvals()).toHaveLength(0);
     expect(sent).toHaveLength(0);
@@ -984,6 +986,89 @@ describe.skipIf(!chromePath)('reviewed merchant purchases through native host de
       (await getDb().get<{ revoked_at: string }>('SELECT revoked_at FROM gws_ea_browser_reservation_guarantees'))
         ?.revoked_at,
     ).toBeTruthy();
+  });
+  it('tells the job of a declined card once, as the principal’s decision', async () => {
+    await buy();
+    await click((await approvals())[0], 'reject');
+    const told = await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) =>
+      mailbox
+        .getInboundHistory(100)
+        .map((message) => (JSON.parse(message.content) as { text?: string }).text ?? '')
+        .filter((text) => /declined|rejected/u.test(text)),
+    );
+    expect(told).toHaveLength(1);
+    expect(told?.[0]).toContain('The principal declined.');
+    expect(told?.[0]).not.toMatch(/admin|browser_purchase\b(?!_outcome)/u);
+    expect(submitted).toBe(0);
+  });
+  it('retains a purchase decline after a failed notice write and delivers it once on replay', async () => {
+    await buy();
+    const [approval] = await approvals();
+    const write = vi
+      .spyOn(browserNotices, 'writeBrowserNotice')
+      .mockRejectedValueOnce(new Error('mailbox unavailable'));
+    try {
+      await finalizeReject(approval, PRINCIPAL, 'too late on a weeknight');
+      expect(await approvals()).toEqual([
+        expect.objectContaining({
+          approval_id: approval.approval_id,
+          status: 'rejected',
+          rejection_user_id: PRINCIPAL,
+          rejection_reason: 'too late on a weeknight',
+        }),
+      ]);
+      expect(await getDb().get('SELECT status,notified_at FROM gws_ea_browser_purchase_cards')).toEqual({
+        status: 'rejected',
+        notified_at: null,
+      });
+      expect(await queue.leases.owned(session.thread_id!, 'amazon.com')).toBe(true);
+    } finally {
+      write.mockRestore();
+    }
+    await resumeRejectedApprovals();
+    await resumeRejectedApprovals();
+    const told = await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) =>
+      mailbox
+        .getInboundHistory(100)
+        .map((message) => (JSON.parse(message.content) as { text?: string }).text ?? '')
+        .filter((text) => text.startsWith('{"type":"browser_purchase_outcome"'))
+        .map((text) => JSON.parse(text) as { status: string; message: string }),
+    );
+    expect(told).toEqual([
+      expect.objectContaining({
+        status: 'rejected',
+        message:
+          'The principal declined: "too late on a weeknight". Remove the cart items you added; do not try another purchase path.',
+      }),
+    ]);
+    expect(await approvals()).toHaveLength(0);
+    expect(
+      (await getDb().get<{ notified_at: string | null }>('SELECT notified_at FROM gws_ea_browser_purchase_cards'))
+        ?.notified_at,
+    ).toBeTruthy();
+    expect(await queue.leases.owned(session.thread_id!, 'amazon.com')).toBe(false);
+    expect(submitted).toBe(0);
+  });
+  it('carries the principal’s purchase rejection reason in the browser outcome', async () => {
+    await buy();
+    const [approval] = await approvals();
+    await finalizeReject(approval, PRINCIPAL, 'choose a smaller kettle');
+    await resumeRejectedApprovals();
+    const told = await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) =>
+      mailbox
+        .getInboundHistory(100)
+        .map((message) => (JSON.parse(message.content) as { text?: string }).text ?? '')
+        .filter((text) => text.startsWith('{"type":"browser_purchase_outcome"'))
+        .map((text) => JSON.parse(text) as { status: string; message: string }),
+    );
+    expect(told).toEqual([
+      expect.objectContaining({
+        status: 'rejected',
+        message:
+          'The principal declined: "choose a smaller kettle". Remove the cart items you added; do not try another purchase path.',
+      }),
+    ]);
+    expect(submitted).toBe(0);
   });
   it('expires a waiting card through native approvals and reports the rejection/expiry once', async () => {
     await buy();

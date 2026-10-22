@@ -56,9 +56,15 @@ async function drive(options: ProviderOptions): Promise<void> {
   }
 }
 
-const POLICY_SETTINGS = { syncClaudeAiSkills: false, syncClaudeAiPlugins: false };
+const POLICY_SETTINGS = {
+  syncClaudeAiSkills: false,
+  syncClaudeAiPlugins: false,
+  disableBundledSkills: true,
+  skillOverrides: { design: 'off', doctor: 'off' },
+  enabledPlugins: { 'plugin-authoring@builtin': false },
+};
 
-describe('flag-level settings: claude.ai sync opt-out always, fastMode when enabled', () => {
+describe('flag-level settings: claude.ai sync and bundled skills off always, fastMode when enabled', () => {
   it('sends settings.fastMode alongside the policy settings when enabled', async () => {
     await drive({ speed: 'fast' });
     expect(lastOptions?.settings).toEqual({ ...POLICY_SETTINGS, fastMode: true });

@@ -386,6 +386,7 @@ async function askPrincipal(email: string, session: Session): Promise<Record<str
   return { status: 'awaiting_principal', email };
 }
 
+/** to: main, delegator */
 async function vaultAccessRequest(
   content: Record<string, unknown>,
   session: Session,
@@ -404,18 +405,25 @@ async function vaultAccessRequest(
   return { ...(await oneAtATime(() => shareVault(to.email, dependencies))) };
 }
 
-/** What main is told once the principal confirmed another email and the host acted on it. */
+/**
+ * What main is told once the principal confirmed another email and the host acted on it. The host keeps no
+ * record of that email, so sharing with it later asks the principal again (KTD17).
+ */
 function confirmedNote(email: string, outcome: ShareOutcome): string {
   const confirmed = `The principal confirmed ${email} as the email their 1Password account uses.`;
+  const again = 'Sharing with this email later asks the principal to confirm it again.';
+  const plainly = `Tell the principal plainly the vault can't be shared right now. ${again}`;
   switch (outcome.status) {
     case 'shared':
       return `${confirmed} The assistant's vault is now shared with it, and 1Password shows their access. Give the principal ${outcome.link} to open their 1Password account, where the vault "${outcome.vault_name}" is listed.`;
     case 'operator_needed':
-      return `${confirmed} The vault could not be shared with it. Give the principal this message to forward to their operator, exactly as written:\n\n${outcome.operator_message}`;
+      return outcome.reason === 'not_a_member'
+        ? `${confirmed} The vault could not be shared with it: 1Password has no member with that email; first ask whether their 1Password account uses another one. ${again} If it uses no other, give the principal this message to forward to their operator, exactly as written:\n\n${outcome.operator_message}`
+        : `${confirmed} The vault could not be shared with it. ${again} Give the principal this message to forward to their operator, exactly as written:\n\n${outcome.operator_message}`;
     case 'rate_limited':
-      return `${confirmed} 1Password's request limit is spent for now, so nothing was shared and nothing was retried. Ask again later with vault_access.`;
+      return `${confirmed} 1Password's request limit is spent for now, so nothing was shared and nothing was retried. ${plainly}`;
     case 'vault_unavailable':
-      return `${confirmed} The assistant's vault cannot be used right now, so nothing was shared.`;
+      return `${confirmed} The assistant's vault cannot be used right now, so nothing was shared. ${plainly}`;
   }
 }
 
@@ -446,7 +454,14 @@ export function registerVaultAccessDelivery(dependencies: VaultAccessDependencie
       }
       await notify(confirmedNote(email, await oneAtATime(() => shareVault(email, dependencies))));
     },
-    // Sharing reads access before any grant, so resuming an approved row after a restart is safe.
-    { restartSafe: true },
+    {
+      // Sharing reads access before any grant, so resuming an approved row after a restart is safe.
+      restartSafe: true,
+      rejectionNote: (approval, reason) => {
+        const { email } = JSON.parse(approval.payload) as { email?: unknown };
+        const recipient = typeof email === 'string' ? email : 'that email';
+        return `The principal declined to share the vault with ${recipient}${reason ? `: "${reason}"` : ''}. Nothing was shared.`;
+      },
+    },
   );
 }

@@ -17,18 +17,19 @@ import { fileURLToPath } from 'url';
  * Idempotent — only writes what's missing, so the agent's own edits and
  * accumulated memory are never clobbered on a later wake. Every provider uses
  * the same tree.
+ *
+ * Only the index is seeded. The memory definition comes from the release
+ * (context.ts), so `templates/system/` is no longer copied, and a copy an
+ * earlier release seeded stays on disk unread.
  */
 const TEMPLATES_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), 'templates');
 
 export function ensureMemoryScaffold(baseDir = '/workspace/agent'): void {
   const memoryDir = path.join(baseDir, 'memory');
-  const systemDir = path.join(memoryDir, 'system');
 
-  fs.mkdirSync(systemDir, { recursive: true });
+  fs.mkdirSync(memoryDir, { recursive: true });
 
   copyTemplateIfMissing('index.md', path.join(memoryDir, 'index.md'));
-  copyTemplateIfMissing(path.join('system', 'index.md'), path.join(systemDir, 'index.md'));
-  copyTemplateIfMissing(path.join('system', 'definition.md'), path.join(systemDir, 'definition.md'));
 }
 
 function copyTemplateIfMissing(template: string, dest: string): void {

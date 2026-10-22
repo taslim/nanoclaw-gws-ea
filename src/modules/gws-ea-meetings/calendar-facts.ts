@@ -32,18 +32,22 @@
  *
  * Every time comes with a label ready to write on the principal's clock.
  * Titles and names other people wrote come back capped and wrapped as
- * untrusted text. A group holding Google Calendar calls them (`guard.ts`);
- * nothing here ever reaches external-email.
+ * untrusted text. The message is what main reads: each entry on its own line,
+ * in plain words, calendars by their names, as many as fit its size, and how
+ * many more there are; the fields stay for the host's own callers. A group
+ * holding Google Calendar calls them (`guard.ts`); nothing here ever reaches
+ * external-email.
  */
 import { TIMEZONE } from '../../config.js';
 import { forbidden, invalidArgs, type ActionAnswer } from '../../cli/delivery-action.js';
-import { identityMatchKey } from '../../gws-ea/validation.js';
+import { EMAIL_PATTERN, identityMatchKey } from '../../gws-ea/validation.js';
 import { isPrincipalCalendar } from '../gws-ea-inbox/calendar-notifications.js';
 import { assistantAddresses } from '../gws-ea-inbox/runtime.js';
 import { untrustedLine } from '../gws-ea-inbox/untrusted.js';
 import { getGwsEaProfile, principalRecognizer, type PrincipalRecognizer } from '../gws-ea-profile/db.js';
 import {
   createMeetingsCalendarApi,
+  type CalendarEntry,
   type DetailedAttendee,
   type DetailedEvent,
   type EventTime,
@@ -76,8 +80,20 @@ const MAX_PEOPLE_ASKED = 100;
 const MAX_NAME_CHARS = 64;
 const MAX_TITLE_CHARS = 100;
 const MAX_ICAL_UID = 1_024;
+/** The most one answer's message carries, so a long list never crowds main's context. */
+const MAX_MESSAGE_CHARS = 12_000;
+/** Room kept for the line saying how many more were not listed. */
+const NOT_LISTED_ROOM = 40;
 const DAY = 86_400_000;
 const MINUTE = 60_000;
+const LIST = new Intl.ListFormat('en', { style: 'long', type: 'conjunction' });
+/** The principal's answers in words; any other, or none, says nothing. */
+const ANSWER_WORDS: Readonly<Record<string, string>> = {
+  accepted: 'accepted',
+  tentative: 'maybe',
+  needsAction: 'not answered yet',
+  declined: 'declined',
+};
 /** Where the text other people wrote came from, as its untrusted wrapping names it. */
 const CALENDAR_SOURCE = 'google_calendar';
 
@@ -113,7 +129,7 @@ export interface PersonStats {
   /** Meetings with the principal and this person alone; the assistant does not count. */
   readonly one_on_ones: number;
   readonly recurring_series: number;
-  /** Ready to write, on the principal's clock: "Tuesday 1 Sept". */
+  /** Ready to write, on the principal's clock: "Tuesday, Sep 1". */
   readonly first_meeting: string | null;
   readonly last_meeting: string | null;
 }
@@ -163,6 +179,21 @@ interface FactsView {
   readonly timezone: string;
   readonly addresses: PrincipalRecognizer;
   readonly calendars: readonly string[];
+  /** Each calendar's name as main speaks of it to the principal (`calendarNames`). */
+  readonly names: ReadonlyMap<string, CalendarName>;
+}
+
+interface CalendarName {
+  readonly text: string;
+  readonly external: boolean;
+}
+
+function calendarName(name: CalendarName): string {
+  return name.external ? untrustedLine(name.text, MAX_NAME_CHARS, CALENDAR_SOURCE) : name.text;
+}
+
+function namedCalendar(id: string, view: FactsView): CalendarName {
+  return view.names.get(id) ?? { text: id, external: true };
 }
 
 function timeKey(time: EventTime | undefined): string {
@@ -178,8 +209,122 @@ function mailbox(email: string): string {
   return identityMatchKey(`email:${email}`);
 }
 
+/**
+ * Each of the principal's calendars by the name main speaks of it by: its
+ * name as Google lists it, or its ID when it has none. Google names an
+ * account's main calendar by its address, and an address is no name the
+ * principal calls their calendar by, so one called by an address is named
+ * as they would hear it: their calendar when it is their only one, else by
+ * its account, their Gmail calendar or their calendar at its domain. Two
+ * that would read alike keep their addresses, the only thing that tells
+ * them apart.
+ */
+function calendarNames(entries: readonly CalendarEntry[], addresses: PrincipalRecognizer): Map<string, CalendarName> {
+  const heard = (name: string): string => {
+    if (entries.length === 1) return "the principal's calendar";
+    if (!addresses.has(name)) return "one of the principal's calendars";
+    const key = mailbox(name);
+    const domain = key.slice(key.lastIndexOf('@') + 1);
+    return domain === 'gmail.com' ? "the principal's Gmail calendar" : `the principal's calendar at ${domain}`;
+  };
+  const named = entries.map((entry) => {
+    const name = entry.summary?.replace(/\s+/gu, ' ').trim() || entry.id;
+    const address = EMAIL_PATTERN.test(name);
+    return {
+      id: entry.id,
+      name,
+      spoken: { text: address ? heard(name) : name, external: !address },
+    };
+  });
+  const uses = new Map<string, number>();
+  for (const { spoken } of named) uses.set(spoken.text, (uses.get(spoken.text) ?? 0) + 1);
+  return new Map(
+    named.map(
+      ({ id, name, spoken }) => [id, uses.get(spoken.text) === 1 ? spoken : { text: name, external: true }] as const,
+    ),
+  );
+}
+
 function isRoom(attendee: DetailedAttendee): boolean {
   return attendee.resource === true || (attendee.email?.endsWith('@resource.calendar.google.com') ?? false);
+}
+
+/** "1 meeting", "3 meetings", "no one-on-ones". */
+function count(n: number, one: string, many = `${one}s`): string {
+  return n === 0 ? `no ${many}` : `${n} ${n === 1 ? one : many}`;
+}
+
+/**
+ * `head`, then as many entries as fit within the message's size, then how
+ * many of `total` were not listed, so the count stays honest however many
+ * the size or a cap left out.
+ */
+function listMessage(head: string, entries: readonly string[], total: number): string {
+  const lines = [head];
+  let size = head.length;
+  for (const entry of entries) {
+    if (size + 1 + entry.length + NOT_LISTED_ROOM > MAX_MESSAGE_CHARS) break;
+    lines.push(entry);
+    size += 1 + entry.length;
+  }
+  const notListed = total - (lines.length - 1);
+  if (notListed > 0) lines.push(`${notListed} more not listed.`);
+  return lines.join('\n');
+}
+
+/**
+ * One conflict as main reads it. A block with no title, free/busy-only or
+ * hidden, says in words that it takes all of its own time: a bare "busy" line
+ * next to a titled meeting at the same start reads as that meeting's shadow,
+ * and main once answered from the meeting's end alone. It names its calendar,
+ * so it reads as a block of its own, but never by an address: two calendars
+ * told apart only by their addresses need no telling apart for a busy block.
+ */
+function conflictLine(conflict: Conflict, view: FactsView): string {
+  const overlapping = conflict.overlap_minutes === 0 ? 'under a minute' : count(conflict.overlap_minutes, 'minute');
+  const when = conflict.all_day ? conflict.when : `${conflict.when} (overlapping ${overlapping})`;
+  const calendars = conflict.calendars.map((id) => namedCalendar(id, view));
+  if (conflict.title === null) {
+    const named = calendars.filter((name) => !EMAIL_PATTERN.test(name.text)).map(calendarName);
+    return [
+      `- ${when}`,
+      ...(named.length === 0 ? [] : [`on ${LIST.format(named)}`]),
+      'busy, with no details shown: the principal is taken for all of it',
+    ].join('; ');
+  }
+  const answer = conflict.principal_response === null ? undefined : ANSWER_WORDS[conflict.principal_response];
+  const organizer =
+    conflict.organizer === null
+      ? undefined
+      : `organized by ${view.addresses.has(conflict.organizer) ? 'the principal' : conflict.organizer}`;
+  return [
+    `- ${when}`,
+    `on ${LIST.format(calendars.map(calendarName))}`,
+    ...(organizer === undefined ? [] : [organizer]),
+    ...(answer === undefined ? [] : [`the principal's answer: ${answer}`]),
+    `title:\n${conflict.title}`,
+  ].join('; ');
+}
+
+/** One person as main reads it, their name last, inside its markers. */
+function personLine(person: PersonStats, view: FactsView): string {
+  const address = person.identity.replace(/^email:/u, '');
+  if (person.meetings === 0) return `- ${address}: no meetings`;
+  const byCalendar = Object.entries(person.meetings_by_calendar).map(
+    ([id, meetings]) => [calendarName(namedCalendar(id, view)), meetings] as const,
+  );
+  const meetings =
+    byCalendar.length === 1
+      ? `${count(person.meetings, 'meeting')}, all on ${byCalendar[0][0]}`
+      : `${count(person.meetings, 'meeting')}: ${LIST.format(byCalendar.map(([name, n]) => `${n} on ${name}`))}`;
+  return [
+    `- ${address}: ${meetings}`,
+    count(person.one_on_ones, 'one-on-one'),
+    count(person.recurring_series, 'recurring series', 'recurring series'),
+    `first met ${person.first_meeting}`,
+    `last met ${person.last_meeting}`,
+    ...(person.display_name === null ? [] : [`their name on invitations:\n${person.display_name}`]),
+  ].join('; ');
 }
 
 export function createCalendarFactTools(deps: CalendarFactsDeps) {
@@ -188,13 +333,19 @@ export function createCalendarFactTools(deps: CalendarFactsDeps) {
   async function viewOf(): Promise<FactsView> {
     const [profile, listed] = await Promise.all([getGwsEaProfile(), calendar().listCalendars()]);
     const addresses = principalRecognizer(profile.principal_emails);
-    const calendars = listed.filter((entry) => isPrincipalCalendar(entry, addresses)).map((entry) => entry.id);
+    const principal = listed.filter((entry) => isPrincipalCalendar(entry, addresses));
+    const calendars = principal.map((entry) => entry.id);
     if (calendars.length === 0) {
       throw forbidden(
         "None of the calendars you can see is the principal's yet, so there is nothing to count: the host adds each of their addresses' calendars to yours once they share it with you.",
       );
     }
-    return { timezone: profile.principal_timezone ?? TIMEZONE, addresses, calendars };
+    return {
+      timezone: profile.principal_timezone ?? TIMEZONE,
+      addresses,
+      calendars,
+      names: calendarNames(principal, addresses),
+    };
   }
 
   /**
@@ -281,9 +432,13 @@ export function createCalendarFactTools(deps: CalendarFactsDeps) {
       conflicts: listed,
       conflicts_not_listed: conflicts.length - listed.length,
       message:
-        listed.length === 0
+        conflicts.length === 0
           ? `${checked} is free on the principal's calendars.`
-          : [`${checked} overlaps:`, ...listed.map((conflict) => `- ${conflict.when}`)].join('\n'),
+          : listMessage(
+              `${checked} is not free. Each block below takes the principal's time, including any their calendar shows with no details:`,
+              listed.map((conflict) => conflictLine(conflict, view)),
+              conflicts.length,
+            ),
     };
   };
 
@@ -422,7 +577,11 @@ export function createCalendarFactTools(deps: CalendarFactsDeps) {
       people: listed,
       people_not_listed: people.length - listed.length,
       events: counts,
-      message: `Counted ${counts.counted} meetings the principal organized or accepted since ${since}, with ${tallies.size} people.`,
+      message: listMessage(
+        `Counted ${counts.counted} meetings the principal organized or accepted since ${since}, with ${tallies.size} people.`,
+        listed.map((person) => personLine(person, view)),
+        people.length,
+      ),
     };
   };
 

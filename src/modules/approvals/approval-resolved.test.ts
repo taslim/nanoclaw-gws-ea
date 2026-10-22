@@ -21,11 +21,14 @@ import {
 } from '../../db/sessions.js';
 import { upsertUser } from '../permissions/db/users.js';
 import { grantRole } from '../permissions/db/user-roles.js';
-import { initSessionFolder } from '../../session-manager.js';
+import { initSessionFolder, withMailboxSession } from '../../session-manager.js';
+import { wakeContainer } from '../../container-runner.js';
 import { handleApprovalsResponse, resumeApprovedApprovals } from './response-handler.js';
 import { registerApprovalHandler, registerApprovalResolvedHandler, type ApprovalResolvedEvent } from './primitive.js';
 import { detachApproval, finishApprovalWithdrawal, sweepExpiredApprovals, withdrawApproval } from './lifecycle.js';
 import { setDeliveryAdapter } from '../../delivery.js';
+import { sweepAwaitingReasonRejects } from './reason-capture.js';
+import { resumeRejectedApprovals } from './finalize.js';
 
 vi.mock('../../container-runner.js', () => ({
   wakeContainer: vi.fn().mockResolvedValue(undefined),
@@ -166,6 +169,93 @@ describe('approval-resolved callbacks', () => {
 });
 
 describe('approval lifecycle', () => {
+  it('retains a rejected decision until its required finalizer persists the outcome, and replays the same reason', async () => {
+    await getDb().exec(`CREATE TABLE rejection_effects (
+      approval_id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      reason TEXT
+    )`);
+    registerApprovalHandler('durable_rejection', async () => undefined, {
+      rejectionNote: () => null,
+      finalizeRejection: async () => {
+        throw new Error('interrupted before settlement');
+      },
+    });
+    await seedApproval('appr-durable', 'durable_rejection');
+    await handleApprovalsResponse({
+      questionId: 'appr-durable',
+      value: 'reject',
+      reason: 'Please choose a different day.',
+      userId: 'slack:admin-1',
+      channelType: 'slack',
+      platformId: 'slack:C1',
+      threadId: null,
+    });
+
+    expect((await getPendingApproval('appr-durable'))?.status).toBe('rejected');
+    expect(await getDb().all('SELECT * FROM rejection_effects')).toEqual([]);
+
+    // A repeated answer cannot replace the already durable decision or its reason.
+    await handleApprovalsResponse({
+      questionId: 'appr-durable',
+      value: 'reject',
+      reason: 'A later, different answer.',
+      userId: 'slack:admin-1',
+      channelType: 'slack',
+      platformId: 'slack:C1',
+      threadId: null,
+    });
+
+    // Reinstall the module handler as on restart: it has no captured click or reason.
+    registerApprovalHandler('durable_rejection', async () => undefined, {
+      rejectionNote: () => null,
+      finalizeRejection: async ({ approval, userId, reason }: ApprovalResolvedEvent) => {
+        await getDb().run(
+          'INSERT INTO rejection_effects (approval_id, user_id, reason) VALUES (?, ?, ?) ON CONFLICT (approval_id) DO NOTHING',
+          approval.approval_id,
+          userId,
+          reason ?? null,
+        );
+      },
+    });
+    await resumeRejectedApprovals();
+    await resumeRejectedApprovals();
+    expect(await getPendingApproval('appr-durable')).toBeUndefined();
+    expect(await getDb().all('SELECT * FROM rejection_effects')).toEqual([
+      { approval_id: 'appr-durable', user_id: 'slack:admin-1', reason: 'Please choose a different day.' },
+    ]);
+  });
+
+  it('replays a rejection interrupted after its mailbox note without duplicating that note', async () => {
+    registerApprovalHandler('durable_generic_rejection', async () => undefined);
+    await seedApproval('appr-note-replay', 'durable_generic_rejection');
+    await getDb().run(
+      'UPDATE pending_approvals SET created_at = ? WHERE approval_id = ?',
+      '2000-01-01T00:00:00.000Z',
+      'appr-note-replay',
+    );
+    vi.mocked(wakeContainer).mockRejectedValueOnce(new Error('interrupted before wake'));
+    const rejectedAt = now();
+    await handleApprovalsResponse({
+      questionId: 'appr-note-replay',
+      value: 'reject',
+      userId: 'slack:admin-1',
+      channelType: 'slack',
+      platformId: 'slack:C1',
+      threadId: null,
+    });
+    expect((await getPendingApproval('appr-note-replay'))?.status).toBe('rejected');
+
+    await sweepAwaitingReasonRejects();
+    expect(await getPendingApproval('appr-note-replay')).toBeUndefined();
+    const notes = await withMailboxSession('ag-1', 'sess-1', (mailbox) => mailbox.getInboundHistory(10));
+    expect(notes).toHaveLength(1);
+    expect(JSON.parse(notes[0].content)).toMatchObject({
+      text: 'Your durable_generic_rejection request was rejected by admin.',
+    });
+    expect(notes[0].timestamp >= rejectedAt).toBe(true);
+  });
+
   it('withdraws a bound card once and makes a later click inert', async () => {
     const delivered: string[] = [];
     setDeliveryAdapter({

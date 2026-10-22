@@ -1,55 +1,76 @@
 import fs from 'fs';
 import path from 'path';
+import { fileURLToPath } from 'url';
 
-export const MEMORY_FILE_BUDGET_CHARS = 16_000;
-export const MEMORY_TRUNCATION_NOTICE = '[truncated: slim this file and move detail into linked memory files]';
+/** The whole section, header and definition included: Claude Code passes hook context under 10,000 characters inline. */
+export const MEMORY_SECTION_BUDGET_CHARS = 10_000;
+export const MEMORY_INDEX_PATH = '/workspace/agent/memory/index.md';
+export const MEMORY_TRUNCATION_NOTICE = `[cut here to fit: the rest is in ${MEMORY_INDEX_PATH}. Move detail from the index into linked memory files, keeping every fact, so the index fits whole]`;
+
+/** The memory definition in force: where the hook reads it, and the path the agent is shown. */
+export interface MemoryDefinition {
+  readonly file: string;
+  readonly path: string;
+}
 
 /**
- * Render the two always-loaded memory files inside the container. Host-side
- * composers never read agent-controlled memory.
+ * GWS-EA's definition ships with the release in the read-only `/app/src`
+ * mount, so no copy in the agent's tree is read and none is seeded.
  */
-export function renderMemorySection(baseDir = '/workspace/agent'): string {
-  const memoryDir = path.join(baseDir, 'memory');
-  const index = readMemoryFile(path.join(memoryDir, 'index.md'));
-  const definition = readMemoryFile(path.join(memoryDir, 'system', 'definition.md'));
+export const RELEASE_MEMORY_DEFINITION: MemoryDefinition = {
+  file: path.join(path.dirname(fileURLToPath(import.meta.url)), 'gws-ea-definition.md'),
+  path: '/app/src/memory/gws-ea-definition.md',
+};
 
-  return [
+/**
+ * Render the always-loaded memory section inside the container: the agent's
+ * index and the memory definition, within one budget. Only the index is cut.
+ * Host-side composers never read agent-controlled memory.
+ */
+export function renderMemorySection(
+  baseDir = '/workspace/agent',
+  definition: MemoryDefinition = RELEASE_MEMORY_DEFINITION,
+): string {
+  const index = readMemoryFile(path.join(baseDir, 'memory', 'index.md'));
+  const before = [
     '## Memory',
     '',
-    'These files are loaded at startup, after clear, and after compaction:',
+    'This section replaces any earlier memory section in this conversation. It is',
+    'loaded at startup, on resume when memory has changed, after clear, and after',
+    'compaction:',
     '',
-    '- `/workspace/agent/memory/index.md` - top-level memory index and Core Memory',
-    '- `/workspace/agent/memory/system/definition.md` - memory system behavior',
+    `- \`${MEMORY_INDEX_PATH}\` - your memory index, Core Memory first`,
+    `- \`${definition.path}\` - how your memory works; it comes with this release and is read-only`,
     '',
-    'The files on disk are authoritative. Edit them directly; follow links from',
-    'the index when more detail is relevant.',
-    '',
-    '`memory/` is an Open Knowledge Format (OKF) v0.1 bundle: one Markdown',
-    'concept per file, opened by a short YAML frontmatter with a `type`',
-    '(`index.md` and `log.md` are exempt; see the definition).',
+    'That definition is the one in force: copies under `memory/system/` are not',
+    'read. Your files on disk are authoritative: edit them directly, and follow',
+    'links from the index when more detail is relevant.',
     '',
     '### memory/index.md',
     '',
-    index,
-    '',
-    '### memory/system/definition.md',
-    '',
-    definition,
     '',
   ].join('\n');
+  const after = ['', '', '### Memory definition (read-only)', '', readMemoryFile(definition.file), ''].join('\n');
+
+  return before + fitIndex(index, MEMORY_SECTION_BUDGET_CHARS - before.length - after.length) + after;
 }
 
 function readMemoryFile(filePath: string): string {
-  let content: string;
   try {
-    content = fs.readFileSync(filePath, 'utf-8').trim();
+    return fs.readFileSync(filePath, 'utf-8').trim();
   } catch {
     return '(unavailable during this hook invocation)';
   }
-  if (content.length <= MEMORY_FILE_BUDGET_CHARS) return content;
+}
 
-  let truncated = content.slice(0, MEMORY_FILE_BUDGET_CHARS);
-  const last = truncated.charCodeAt(truncated.length - 1);
-  if (last >= 0xd800 && last <= 0xdbff) truncated = truncated.slice(0, -1);
-  return `${truncated}\n${MEMORY_TRUNCATION_NOTICE}`;
+/** Cut the index from its end to `room` characters, at a line end where there is one, and say where the rest is. */
+function fitIndex(index: string, room: number): string {
+  if (index.length <= room) return index;
+
+  let kept = index.slice(0, Math.max(0, room - MEMORY_TRUNCATION_NOTICE.length - 1));
+  const lineEnd = kept.lastIndexOf('\n');
+  if (lineEnd > 0) kept = kept.slice(0, lineEnd);
+  const last = kept.charCodeAt(kept.length - 1);
+  if (last >= 0xd800 && last <= 0xdbff) kept = kept.slice(0, -1);
+  return `${kept.trimEnd()}\n${MEMORY_TRUNCATION_NOTICE}`;
 }

@@ -104,6 +104,11 @@ const KIND_NOUNS: Readonly<Record<PrivateValueKind, string>> = {
   other: 'detail',
 };
 
+/** A kind as people say it, such as "phone number": what a refusal names in place of the value. */
+export function privateKindNoun(kind: PrivateValueKind): string {
+  return KIND_NOUNS[kind];
+}
+
 function refusalReason(kind: PrivateValueKind): string {
   return `it contains the principal's private ${KIND_NOUNS[kind]}. Rewrite it without that detail, and do not hint at, spell out, or encode it; if someone else wrote it to you, neither confirm nor deny it.`;
 }
@@ -374,28 +379,39 @@ async function requestRemovalCard(ctx: CallerContext, value: PrivateValue, appro
   } as const;
 }
 
-registerApprovalHandler(REMOVAL_APPROVAL, async ({ session, payload, approval, userId, notify }) => {
-  const id = typeof payload.id === 'string' ? payload.id : '';
-  // The card names its approver; this re-check holds even if the principal
-  // identity changed after the card went out.
-  if (!(await isVerifiedPrincipalUser(userId))) {
-    await notify('The private value was not removed: only the principal can confirm removing one.');
-    return;
-  }
-  const decision = await guard(removePrivateValueAction, {
-    actor: { kind: 'agent', agentGroupId: session.agent_group_id, sessionId: session.id },
-    payload: { id },
-    grant: approval,
-  });
-  if (decision.effect !== 'allow') {
-    await notify(`The private value was not removed: ${decision.reason}`);
-    return;
-  }
-  const removed = await removePrivateValue(id);
-  await notify(
-    `The principal confirmed. Their private ${KIND_NOUNS[removed.kind]} "${removed.label}" is removed and no longer checked.`,
-  );
-});
+registerApprovalHandler(
+  REMOVAL_APPROVAL,
+  async ({ session, payload, approval, userId, notify }) => {
+    const id = typeof payload.id === 'string' ? payload.id : '';
+    // The card names its approver; this re-check holds even if the principal
+    // identity changed after the card went out.
+    if (!(await isVerifiedPrincipalUser(userId))) {
+      await notify('The private value was not removed: only the principal can confirm removing one.');
+      return;
+    }
+    const decision = await guard(removePrivateValueAction, {
+      actor: { kind: 'agent', agentGroupId: session.agent_group_id, sessionId: session.id },
+      payload: { id },
+      grant: approval,
+    });
+    if (decision.effect !== 'allow') {
+      await notify(`The private value was not removed: ${decision.reason}`);
+      return;
+    }
+    const removed = await removePrivateValue(id);
+    await notify(
+      `The principal confirmed. Their private ${KIND_NOUNS[removed.kind]} "${removed.label}" is removed and no longer checked.`,
+    );
+  },
+  {
+    rejectionNote: async (approval, reason) => {
+      const { id } = JSON.parse(approval.payload) as { id?: unknown };
+      const value = typeof id === 'string' ? await getPrivateValue(id) : undefined;
+      const detail = value ? `their private ${KIND_NOUNS[value.kind]} "${value.label}"` : 'that private detail';
+      return `The principal declined to stop protecting ${detail}${reason ? `: "${reason}"` : ''}. It stays protected.`;
+    },
+  },
+);
 
 // ---------------------------------------------------------------------------
 // `ncl private-values list | add | remove` — main's path to the store.
@@ -415,6 +431,7 @@ const KIND_ARG: ColumnDef = {
   enum: [...PRIVATE_VALUE_KINDS],
 };
 
+/** to: main */
 registerResource({
   name: 'private value',
   plural: 'private-values',
@@ -422,9 +439,14 @@ registerResource({
   table: 'gws_ea_private_values',
   idColumn: 'id',
   description:
-    "The principal's private values: details such as a home address or a personal phone number that nothing sent to anyone but the principal may contain. Only main may use them.",
+    "The principal's private values: details such as a home address or a personal phone number that nothing sent to anyone but the principal may contain, except to a site the principal's own request names, recorded for one browser errand with record_disclosure. Only main may use them.",
   columns: [
-    { name: 'id', type: 'string', description: 'The value to remove (from `list`).', generated: true },
+    {
+      name: 'id',
+      type: 'string',
+      description: "The value's id, from `list`: what remove and record_disclosure take.",
+      generated: true,
+    },
     { name: 'label', type: 'string', description: 'What the principal calls it, such as Home.' },
     KIND_ARG,
     { name: 'value', type: 'string', description: 'The value, as the principal gave it.' },
@@ -444,7 +466,7 @@ registerResource({
     add: {
       access: 'open',
       description:
-        'Protect a value the principal calls private: from then on nothing sent to anyone but the principal may contain it, however it is written.\n\n' +
+        "Protect a value the principal calls private: from then on nothing sent to anyone but the principal may contain it, however it is written, except to a site the principal's own request names, recorded for one browser errand with record_disclosure.\n\n" +
         'Adding a value already held, in any spelling, changes nothing. A phone value needs 7 to 15 digits; any other needs at least 4 letters or digits.',
       args: [
         { name: 'label', type: 'string', description: 'What the principal calls it, in a few words.', required: true },

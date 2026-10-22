@@ -1,3 +1,5 @@
+import fs from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import { afterEach, beforeEach, expect, it } from 'bun:test';
 import { getUndeliveredMessages } from '../db/messages-out.js';
 import { closeSessionDb, getInboundDb, initTestSessionDb } from '../mailbox/sqlite/connection.js';
@@ -13,10 +15,23 @@ import {
   reservationBounds,
   vaultAccess,
 } from './gws-ea-browser-delegate.js';
+import * as browserTools from './gws-ea-browser.js';
 import type { McpToolDefinition } from './types.js';
 
 beforeEach(initTestSessionDb);
 afterEach(closeSessionDb);
+
+const DELEGATE_TOOLS = [
+  cancelJob,
+  relayCode,
+  reservationGuarantee,
+  reservationBounds,
+  vaultAccess,
+  credentialAuthority,
+  consentGrants,
+  recordDisclosure,
+  recordPurchaseOutcome,
+];
 
 /**
  * Call `tool`, answer its host request with `data`, and check that it sent
@@ -294,4 +309,54 @@ it("records an unconfirmed purchase's outcome by the job's attempt id, with its 
   expect(request).toEqual({ action: 'record_purchase_outcome', requestId: id, ...fields });
   for (const word of ['recorded', 'already_recorded', 'possible_duplicate', 'in_progress', 'email', 'principal'])
     expect(recordPurchaseOutcome.tool.description).toContain(word);
+});
+
+it('carries at each tool the rules a delegating agent meets there', () => {
+  expect(reservationGuarantee.tool.description).toContain(
+    'A per-person fee counts across the whole party: the maximum covers it times the party size.',
+  );
+  expect(reservationGuarantee.tool.description).toContain(
+    'A booking made under it carries the fee and cancellation-deadline terms the host accepted: follow them through its matter and the calendar',
+  );
+  expect(vaultAccess.tool.description).toContain(
+    "An address a page, message or browser report suggests is never the principal's on that word alone.",
+  );
+  expect(credentialAuthority.tool.description).toContain(
+    'no password passes through you, so never put one in a message or file',
+  );
+  // A delegator other than main reads no job state: the id it records by is the one its notice carried.
+  expect(recordPurchaseOutcome.tool.description).toContain("the attempt id the host's unconfirmed notice gave");
+  expect(recordPurchaseOutcome.tool.description).not.toContain("job's state");
+});
+
+it('names in the delegation guidance only real tools, and otherwise only codes and fields the browser tools name', async () => {
+  const guidance = fs.readFileSync(
+    new URL('../../../../src/modules/gws-ea-browser/main-guidance.md', import.meta.url),
+    'utf8',
+  );
+  const tools = [
+    ...DELEGATE_TOOLS,
+    ...Object.values(browserTools).filter(
+      (value): value is McpToolDefinition => typeof value === 'object' && value !== null && 'tool' in value,
+    ),
+  ];
+  const named = new Set<string>();
+  const collect = (value: unknown): void => {
+    if (typeof value === 'string') for (const word of value.match(/\b[a-z]+(?:_[a-z]+)*\b/gu) ?? []) named.add(word);
+    else if (Array.isArray(value)) for (const item of value) collect(item);
+    else if (value && typeof value === 'object')
+      for (const [key, item] of Object.entries(value)) {
+        named.add(key);
+        collect(item);
+      }
+  };
+  for (const tool of tools) collect([tool.tool.description, tool.tool.inputSchema]);
+  const cwd = process.cwd();
+  try {
+    process.chdir(fileURLToPath(new URL('../../../../', import.meta.url)));
+    const { unknownToolNames } = await import('../../../../src/test-utils/runner-tools.js');
+    expect(unknownToolNames(guidance, [...named])).toEqual([]);
+  } finally {
+    process.chdir(cwd);
+  }
 });

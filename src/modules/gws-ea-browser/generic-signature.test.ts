@@ -237,7 +237,7 @@ describe('the generic fact floor', () => {
       value: 'Leave it at the door',
     });
     expect(changed(shop.lines, [...(shop.fields ?? []), note])).toBe('The note changed.');
-    expect(changed(shop.lines, shop.fields, 'https://pay.example/c/pottery-42')).toBe('The checkout origin changed.');
+    expect(changed(shop.lines, shop.fields, 'https://pay.example/c/pottery-42')).toBe('The checkout page changed.');
     // A next step's own commit label is no change.
     expect(
       materialPurchaseChange(approved, { ...approved, control: { ...approved.control, label: 'Continue' } }, {}),

@@ -66,7 +66,7 @@ it('routes B then the retry of A in provider FIFO order, with matching exchange 
         yield { type: 'result', text: 'answer A without wrapping' };
         expect(pushed).toHaveLength(2);
         expect(pushed[0]).toContain('question B');
-        expect(pushed[1]).toContain('Please re-send');
+        expect(pushed[1]).toContain('If that text was meant for someone, send it now');
         for (const prompt of pushed.slice()) {
           const id = prompt.includes('question B') ? 'B' : 'A';
           stamps.push(getCurrentReplyRoute());

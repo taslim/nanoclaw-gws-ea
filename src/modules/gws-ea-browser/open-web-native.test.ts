@@ -89,6 +89,7 @@ import { executeRecipe, saveBrowserRecipe } from './recipes.js';
 
 import { registerReservationGuaranteeDelivery } from './reservation-guarantee.js';
 import { deliverAction } from './testing/delivery-answer.js';
+import { siteWordingPattern } from './testing/site-wording.js';
 
 const chromePath = process.env.GWS_EA_BROWSER_TEST_CHROME;
 
@@ -566,6 +567,8 @@ describe.skipIf(!chromePath)('the consent engine in native Chrome', { timeout: 3
     expect(result).toEqual({
       status: 'consent_required',
       stops: [{ stop_id: stop.id, site: 'join.example', wording: 'Send me offers' }],
+      // The host unticked the box before the site ticked it again.
+      hostChanged: true,
     });
     expect(stop).toMatchObject({ origin: 'https://join.example', kind: 'marketing', status: 'open' });
     expect(await checked('#offers')).toBe(true);
@@ -578,7 +581,14 @@ describe.skipIf(!chromePath)('the consent engine in native Chrome', { timeout: 3
     expect(stopped).toMatchObject({
       status: 'stopped',
       reason: 'consent_required',
-      consent: [{ stop_id: stop.id, site: 'join.example', wording: 'I agree to receive marketing' }],
+      // The browser reads the site's wording as text the site wrote.
+      consent: [
+        {
+          stop_id: stop.id,
+          site: 'join.example',
+          wording: expect.stringMatching(siteWordingPattern('I agree to receive marketing', 'join.example')),
+        },
+      ],
       actions: [{ status: 'stopped', reason: 'consent_required' }],
     });
     expect(submitted('/required-marketing/joined')).toBeUndefined();
@@ -620,9 +630,11 @@ describe.skipIf(!chromePath)('the consent engine in native Chrome', { timeout: 3
       [CONSENT.namedTerms, "I agree to Klarna's Terms of Service"],
     ] as const) {
       await visit(url);
+      // Stopped on its first read, before the host set any choice.
       expect(await pass(page.locator('#join-button'))).toMatchObject({
         status: 'consent_required',
         stops: [{ wording }],
+        hostChanged: false,
       });
       expect(
         await page
@@ -2179,7 +2191,7 @@ document.getElementById('updated').addEventListener('click', () => location.assi
     });
     expect(await read('#commit')).toMatchObject({
       status: 'facts_incomplete',
-      missing: ['a commit control the host can find again'],
+      missing: ["the checkout's place-order button"],
     });
     expect(posts()).toEqual([]);
   });
@@ -2280,7 +2292,15 @@ document.getElementById('updated').addEventListener('click', () => location.assi
     const notices = await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) =>
       mailbox.getInboundHistory(100).map((message) => message.content),
     );
-    expect(notices?.some((content) => content.includes('checkout_changing'))).toBe(true);
+    const changing = notices
+      ?.map((content) => JSON.parse(content) as { text?: string })
+      .filter((content) => content.text?.includes('"browser_purchase_outcome"'))
+      .map((content) => JSON.parse(content.text ?? '') as Record<string, unknown>)
+      .find((notice) => notice.status === 'checkout_changing');
+    // The browser reads what changed in the sentence it reports from.
+    expect(changing?.message).toContain(
+      'The checkout changed again after three changed cards (The total rose to $46.00, from $45.00.), so the host stopped this errand',
+    );
     expect(await attempts()).toMatchObject(Array(4).fill({ resolution: 'not_committed' }));
     expect(await getDb().get('SELECT cancelled FROM gws_ea_browser_jobs WHERE id = ?', session.thread_id)).toEqual({
       cancelled: 1,

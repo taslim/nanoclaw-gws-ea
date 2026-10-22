@@ -26,7 +26,7 @@ function manifest() {
     repetitions: 2,
     installations: Object.fromEntries(models.map((model) => [model, path.join(root, model)])),
     notes: [
-      { id: 'correction', audioFile: path.join(root, 'human.m4a'), expectedIntent: 'Friday, after Sarah confirms.' },
+      { id: 'correction', audioFile: path.join(root, 'human.m4a'), expectedIntent: 'Friday, after Remy confirms.' },
     ],
   };
 }
@@ -92,7 +92,7 @@ describe('private comparison evidence, never model qualification', () => {
     expect(report.qualification).toBe('pending');
     expect(report.measurement).toBe('decode-and-recognition-wall-time');
     expect(report.notes[0]).toMatchObject({
-      expectedIntent: 'Friday, after Sarah confirms.',
+      expectedIntent: 'Friday, after Remy confirms.',
       sha256: createHash('sha256').update('same original bytes').digest('hex'),
       runs: expect.arrayContaining([
         expect.objectContaining({

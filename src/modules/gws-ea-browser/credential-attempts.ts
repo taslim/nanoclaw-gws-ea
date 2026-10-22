@@ -662,7 +662,7 @@ export class CredentialAttempts {
   ): Promise<CredentialDisclosure> {
     const attempt = await this.require(id);
     if (attempt.job_id !== binding.jobId) return refused('wrong_job');
-    if (attempt.phase !== 'saved' && attempt.phase !== 'exposed') return refused('not_saved');
+    if (attempt.phase !== 'saved') return refused('not_saved');
     if (registrableDomain(binding.origin) !== attempt.site) return refused('origin_mismatch');
     const candidate = await this.candidate(attempt, assertActive);
     if (!('secret' in candidate)) return candidate.status === 'mismatch' ? refused('candidate_mismatch') : candidate;
@@ -680,7 +680,7 @@ export class CredentialAttempts {
     const at = now();
     const changed = await this.db.run(
       `UPDATE ${TABLE} SET phase = 'exposed', exposed_at = COALESCE(exposed_at, ?), updated_at = ?
-       WHERE id = ? AND job_id = ? AND phase IN ('saved','exposed')`,
+       WHERE id = ? AND job_id = ? AND phase = 'saved'`,
       at,
       at,
       id,

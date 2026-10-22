@@ -12,4 +12,4 @@ preferences. Replace this note with your first core fact.
 
 ## Map
 
-- [Memory system definition](system/definition.md) - how this memory works, and yours to improve
+- [Memory system definition](/app/src/memory/gws-ea-definition.md) - how this memory works; it comes with the release and is read-only

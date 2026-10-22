@@ -26,8 +26,9 @@ import { createPendingApproval } from '../../db/sessions.js';
 import { setDeliveryAdapter } from '../../delivery.js';
 import { resolveSession, resolveSystemSession, withExistingMailboxSession } from '../../session-manager.js';
 import type { PendingApproval, Session } from '../../types.js';
-import { sweepExpiredApprovals } from '../approvals/index.js';
+import { sweepExpiredApprovals, withdrawApproval } from '../approvals/index.js';
 import { handleApprovalsResponse, resumeApprovedApprovals } from '../approvals/response-handler.js';
+import { resumeRejectedApprovals } from '../approvals/finalize.js';
 import { bindVerifiedPrincipalUser, reconcileGwsEaProfile } from '../gws-ea-profile/db.js';
 import { upsertUser } from '../permissions/db/users.js';
 import { upsertUserDm } from '../permissions/db/user-dms.js';
@@ -39,7 +40,10 @@ import { setBrowserAdmissionReady } from './group.js';
 import { CONSENT, openWebFixture, type OpenWebFixture } from './open-web-native-fixture.js';
 import { BrowserQueue } from './queue.js';
 import { ERRAND_ORIGIN_LINE } from './cards.js';
+import { siteWordingPattern } from './testing/site-wording.js';
 import { deliverAction } from './testing/delivery-answer.js';
+import * as browserNotices from './notices.js';
+import { recoverConsentOutcomes } from './consent-approval.js';
 
 const PRINCIPAL = 'gchat:users/principal';
 const OPERATOR = 'gchat:users/operator';
@@ -195,6 +199,40 @@ async function notices(): Promise<Array<Record<string, unknown>>> {
   });
 }
 
+/** A password reached this form; its outcome remains uncertain independently of the consent decision. */
+async function uncertainCredential(stopId: string): Promise<string> {
+  const id = `credential-${stopId}`;
+  const at = new Date().toISOString();
+  await getDb().run(
+    `INSERT INTO gws_ea_browser_credential_attempts
+      (id,kind,job_id,instance_id,account_id,vault_id,origin,site,username,phase,evidence_json,created_at,updated_at)
+      VALUES(?,'signup',?,'instance','account','vault','https://join.example','join.example','aya@example.test','unknown',?,?,?)`,
+    id,
+    job.id,
+    JSON.stringify({ signal: 'consent', stops: stopId }),
+    at,
+    at,
+  );
+  return id;
+}
+const credentialPhase = async (id: string) =>
+  (await getDb().get<{ phase: string }>('SELECT phase FROM gws_ea_browser_credential_attempts WHERE id = ?', id))
+    ?.phase;
+
+/** Interrupt only a terminal consent write, after a real card claim and core decision can be recorded. */
+function failConsentSettlementOnce() {
+  const db = getDb();
+  const run = db.run.bind(db);
+  let failed = false;
+  return vi.spyOn(db, 'run').mockImplementation(async (sql, ...parameters) => {
+    if (!failed && /UPDATE gws_ea_browser_consent_stops SET status = (?:\?|'withdrawn')/u.test(sql)) {
+      failed = true;
+      throw new Error('write interrupted');
+    }
+    return run(sql, ...parameters);
+  });
+}
+
 describe('asking the principal for consent', () => {
   it('posts one card naming the site and the exact wording; approval stands as the principal’s grant and tells the job', async () => {
     const id = await stop();
@@ -222,8 +260,14 @@ describe('asking the principal for consent', () => {
       }),
     ]);
     expect(await stopStatus(id)).toBe('approved');
+    // The job reads the site's wording as text the site wrote; the card above keeps it in plain quotes.
     expect(await notices()).toEqual([
-      expect.objectContaining({ type: 'browser_consent_outcome', stop_id: id, status: 'approved', wording: WORDING }),
+      expect.objectContaining({
+        type: 'browser_consent_outcome',
+        stop_id: id,
+        status: 'approved',
+        wording: expect.stringMatching(siteWordingPattern(WORDING, 'join.example')),
+      }),
     ]);
     // A replayed approval after a restart records nothing twice.
     await createPendingApproval({ ...approval, status: 'approved' });
@@ -254,8 +298,195 @@ describe('asking the principal for consent', () => {
       expect(await notices()).toEqual([
         expect.objectContaining({ status, stop_id: id, message: expect.stringContaining(message) }),
       ]);
+      // The errand may come from a group other than main: the browser reports to whichever sent it.
+      const [notice] = await notices();
+      expect(notice?.message).toMatch(/report this to the agent that sent the errand\.$/u);
+      expect(notice?.message).not.toContain('main');
     },
   );
+
+  it('tells the job of a declined card once, as the principal’s decision', async () => {
+    const id = await stop();
+    await ask(id, 'consent-1');
+    await click((await approvals())[0], 'reject');
+    const rows = await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) =>
+      mailbox.getInboundHistory(100),
+    );
+    const told = (rows ?? [])
+      .map((row) => (JSON.parse(row.content) as { text?: string }).text ?? '')
+      .filter((text) => /declined|rejected/u.test(text));
+    expect(told).toHaveLength(1);
+    expect(told[0]).toContain('The principal declined.');
+    expect(told[0]).not.toMatch(/admin|browser_consent\b(?!_outcome)/u);
+  });
+
+  it('retains a rejected decision when the consent write fails, without reopening an uncertain credential', async () => {
+    const id = await stop();
+    const attempt = await uncertainCredential(id);
+    await ask(id, 'consent-atomic');
+    const settlement = failConsentSettlementOnce();
+    try {
+      await click((await approvals())[0], 'reject');
+      expect(await stopStatus(id)).toBe('requested');
+      expect(await credentialPhase(attempt)).toBe('unknown');
+      expect(await notices()).toEqual([]);
+    } finally {
+      settlement.mockRestore();
+    }
+    await resumeRejectedApprovals();
+    expect(await stopStatus(id)).toBe('rejected');
+    expect(await credentialPhase(attempt)).toBe('unknown');
+    expect(await notices()).toHaveLength(1);
+  });
+
+  it('replays a rejected consent notice after its mailbox was unavailable', async () => {
+    const id = await stop();
+    const attempt = await uncertainCredential(id);
+    await ask(id, 'consent-notice');
+    const write = vi
+      .spyOn(browserNotices, 'writeBrowserNotice')
+      .mockRejectedValueOnce(new Error('mailbox unavailable'));
+    try {
+      await click((await approvals())[0], 'reject');
+      expect(await stopStatus(id)).toBe('rejected');
+      expect(await credentialPhase(attempt)).toBe('unknown');
+      expect(await notices()).toEqual([]);
+    } finally {
+      write.mockRestore();
+    }
+    await resumeRejectedApprovals();
+    await resumeRejectedApprovals();
+    expect(await notices()).toHaveLength(1);
+  });
+
+  it('delivers an interrupted terminal stop once when the browser restarts without changing its uncertain credential', async () => {
+    const id = await stop();
+    const attempt = await uncertainCredential(id);
+    await ask(id, 'consent-interrupted');
+    await getDb().run(
+      "UPDATE gws_ea_browser_consent_stops SET status = 'rejected',decided_at = ? WHERE id = ?",
+      new Date().toISOString(),
+      id,
+    );
+    await queue.stop();
+    await recoverAndStartBrowserQueue(queue);
+    expect(await credentialPhase(attempt)).toBe('unknown');
+    expect(await notices()).toHaveLength(1);
+    await queue.stop();
+    await recoverAndStartBrowserQueue(queue);
+    expect(await notices()).toHaveLength(1);
+  });
+
+  it('recovers a failed no-card settlement after card delivery and the terminal write both fail', async () => {
+    const id = await stop();
+    const attempt = await uncertainCredential(id);
+    setDeliveryAdapter({
+      async deliver(): Promise<never> {
+        throw new Error('channel unavailable');
+      },
+    });
+    const settlement = failConsentSettlementOnce();
+    try {
+      await ask(id, 'consent-no-card');
+      expect(await approvals()).toEqual([]);
+      expect(await stopStatus(id)).toBe('requested');
+      expect(await credentialPhase(attempt)).toBe('unknown');
+    } finally {
+      settlement.mockRestore();
+    }
+    await recoverConsentOutcomes();
+    await recoverConsentOutcomes();
+    expect(await stopStatus(id)).toBe('withdrawn');
+    expect(await credentialPhase(attempt)).toBe('unknown');
+    expect(await notices()).toEqual([
+      expect.objectContaining({ stop_id: id, status: 'withdrawn', message: expect.stringContaining('no longer open') }),
+    ]);
+  });
+
+  it.each(['expired', 'withdrawn'] as const)(
+    'recovers a %s card after its terminal write fails and the approval row is gone',
+    async (outcome) => {
+      const id = await stop();
+      const attempt = await uncertainCredential(id);
+      await ask(id, `consent-${outcome}-interrupted`);
+      const [approval] = await approvals();
+      const settlement = failConsentSettlementOnce();
+      try {
+        if (outcome === 'expired') {
+          await getDb().run(
+            "UPDATE pending_approvals SET expires_at = '2026-01-01T00:00:00.000Z' WHERE approval_id = ?",
+            approval.approval_id,
+          );
+          await sweepExpiredApprovals();
+        } else {
+          await withdrawApproval(approval.approval_id, 'Withdrawn: the errand ended.');
+        }
+        expect(await approvals()).toEqual([]);
+        expect(await stopStatus(id)).toBe('requested');
+        expect(await credentialPhase(attempt)).toBe('unknown');
+      } finally {
+        settlement.mockRestore();
+      }
+      await recoverConsentOutcomes();
+      await recoverConsentOutcomes();
+      expect(await stopStatus(id)).toBe('withdrawn');
+      expect(await credentialPhase(attempt)).toBe('unknown');
+      expect(await notices()).toEqual([
+        expect.objectContaining({ stop_id: id, message: expect.stringContaining('no longer open') }),
+      ]);
+    },
+  );
+
+  it('reconnects a pending card by its exact stop and job after an interrupted approval-id write', async () => {
+    const id = await stop();
+    await ask(id, 'consent-id-gap');
+    const [approval] = await approvals();
+    await getDb().run('UPDATE gws_ea_browser_consent_stops SET approval_id = NULL WHERE id = ?', id);
+    await recoverConsentOutcomes();
+    expect(await getDb().get('SELECT status,approval_id FROM gws_ea_browser_consent_stops WHERE id = ?', id)).toEqual({
+      status: 'requested',
+      approval_id: approval.approval_id,
+    });
+    expect(await notices()).toEqual([]);
+    await click(approval);
+    expect(await stopStatus(id)).toBe('approved');
+  });
+
+  it('keeps an in-flight card request open when a sweep runs before its approval row exists', async () => {
+    const id = await stop();
+    const db = getDb();
+    const run = db.run.bind(db);
+    let claimed!: () => void;
+    const claimReached = new Promise<void>((resolve) => {
+      claimed = resolve;
+    });
+    let resume!: () => void;
+    const resumeClaim = new Promise<void>((resolve) => {
+      resume = resolve;
+    });
+    const write = vi.spyOn(db, 'run').mockImplementation(async (sql, ...params) => {
+      const result = await run(sql, ...params);
+      if (sql.includes("SET status = 'requested',requested_at")) {
+        claimed();
+        await resumeClaim;
+      }
+      return result;
+    });
+    const asking = ask(id, 'consent-in-flight');
+    try {
+      await claimReached;
+      expect(await approvals()).toEqual([]);
+      await recoverConsentOutcomes();
+      expect(await stopStatus(id)).toBe('requested');
+      expect(await notices()).toEqual([]);
+    } finally {
+      resume();
+      await asking;
+      write.mockRestore();
+    }
+    expect(await approvals()).toHaveLength(1);
+    expect(await stopStatus(id)).toBe('requested');
+  });
 
   it('refuses an unknown stop, another job’s stop and a stop already used, with no card', async () => {
     const id = await stop();
@@ -311,7 +542,7 @@ describe('asking the principal for consent', () => {
             grant_id: grant.id,
             site: 'join.example',
             origin: 'https://join.example',
-            wording: WORDING,
+            wording: expect.stringMatching(siteWordingPattern(WORDING, 'join.example')),
             approved_at: expect.any(String),
           },
         ],

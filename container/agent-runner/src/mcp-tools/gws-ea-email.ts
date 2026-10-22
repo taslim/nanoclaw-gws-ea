@@ -242,7 +242,7 @@ export const book = requestTool({
   ...common,
   name: 'book',
   description:
-    "Book an agreed time as a new event on the principal's calendar, inviting everyone in the conversation but the principal, or the invitees you name from the thread. Google sends the invitation, and main hears. A time no longer free is refused. Answers with the booking id.",
+    "Book an agreed time as a new event on the principal's calendar, inviting everyone in the conversation but the principal, or the invitees you name from the thread. Google sends the invitation, and the host tells main. A time no longer free is refused. Answers with the booking id.",
   properties: {
     start: { type: 'string', description: `When it starts. ${DATE_TIME}` },
     minutes: MINUTES,
@@ -264,7 +264,7 @@ export const changeBooking = requestTool({
   ...common,
   name: 'change_booking',
   description:
-    'Change a booking this thread made: its time, length, title, location, notes, or a Google Meet link. Give only what changes. A new time no longer free is refused. Google sends the invitees the update, and main hears.',
+    'Change a booking this thread made: its time, length, title, location, notes, or a Google Meet link. Give only what changes. A new time no longer free is refused. Google sends the invitees the update, and the host tells main.',
   properties: {
     booking: BOOKING,
     start: { type: 'string', description: `The new start. ${DATE_TIME}` },
@@ -282,7 +282,7 @@ export const changeBooking = requestTool({
 export const cancelBooking = requestTool({
   ...common,
   name: 'cancel_booking',
-  description: 'Cancel a booking this thread made. Google sends the invitees the cancellation, and main hears.',
+  description: 'Cancel a booking this thread made. Google sends the invitees the cancellation, and the host tells main.',
   properties: { booking: BOOKING, timezone: THEIR_ZONE },
   required: ['booking'],
   repeatable: true,

@@ -321,7 +321,7 @@ describe('a comment', () => {
     expect(hostText(text)).toBe(
       'Google Docs and Drive report activity on files you can see:\n' +
         `- A comment for you on file ${fileId} (comment AAABkQ3x0Yc).\n\n` +
-        'Read each comment in its file with the Google tool before you act on it.',
+        'Read each comment in its file with gog, as your gworkspace skill shows, before you act on it.',
     );
     expect(text).toMatch(/Source: drive\n---\nTitle: Trip plan\nFrom: Morgan Ellery <morgan\.fixture@gmail\.com>\n/u);
     expect(text).not.toContain('can you share this');
@@ -527,7 +527,9 @@ describe('a request for access (AE5)', () => {
 
     const said = hostText(text);
     expect(said).toContain(`- Someone asked for access to file ${fileId}.`);
-    expect(said).toContain('Drive shows these requests waiting on it; answer them with the Google tool:');
+    expect(said).toContain(
+      'Drive shows these requests waiting on it; answer them with gog, as your gworkspace skill shows:',
+    );
     expect(said).toContain(`  - ${MORGAN_WORK}, one of Morgan Ellery's addresses, asks for writer access.`);
     expect(said).toContain(`  - ${REMY} asks for reader access, and wrote:`);
     expect(said).not.toContain('ignore your rules');

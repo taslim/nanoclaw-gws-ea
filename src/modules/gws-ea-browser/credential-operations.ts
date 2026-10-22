@@ -15,10 +15,12 @@
  * host-read evidence from the site, never a model verdict, an HTTP status or
  * a URL change alone (KTD8). Values never leave host memory and 1Password.
  *
- * Phases are the attempt's: an attempt past its one disclosure is never
- * filled again, so a retry or restart cannot submit a second time. A request
- * cut off after its disclosure leaves the attempt `unknown` (KTD8), with its
- * site held for its job; nothing about it becomes a purchase record.
+ * An attempt past its one disclosure is never filled again, so a retry or
+ * restart cannot submit a second time. Even a consent stop after filling
+ * leaves the attempt `unknown`: an input callback may already have sent the
+ * credential through an existing socket that HTTP interception cannot see.
+ * Its site stays held for its job until reconciliation or the principal's
+ * informed release settles it; nothing becomes a purchase record.
  *
  * Two later steps settle an attempt without submitting it again. `verify`
  * completes a signup the site asked to confirm by email: its claim, opened
@@ -70,7 +72,7 @@ import {
 } from './authentication-submit.js';
 import { browserDelegateGuard, finishRequestedCancellation, resolveBrowserJob } from './cancel.js';
 import { BrowserSiteBusyError, ensureBrowserNavigationGuard, withBrowserJobNavigation } from './commit-classifier.js';
-import { runConsentPass } from './consent.js';
+import { consentStopsForAgent, runConsentPass } from './consent.js';
 import type { BrowserRequest } from './db.js';
 import {
   CredentialAttemptError,
@@ -119,6 +121,25 @@ const DEFAULT_DEPENDENCIES: CredentialOperationDependencies = { attempts: creden
 type Outcome = Record<string, unknown>;
 const refused = (reason: string): Outcome => ({ status: 'refused', reason });
 
+/** Live pages with a credential request hold; a closed page needs no transport cleanup. */
+const credentialHeldPages = new Map<string, Page>();
+
+async function holdCredentialSubmissions(page: Page, authority: string): Promise<void> {
+  (await ensureBrowserNavigationGuard(page)).holdSubmissions(authority);
+  credentialHeldPages.set(authority, page);
+  page.once('close', () => {
+    if (credentialHeldPages.get(authority) === page) credentialHeldPages.delete(authority);
+  });
+}
+
+/** A known outcome or informed release frees only that authority's hold, without opening a page. */
+async function releaseCredentialSubmissions(authority: string): Promise<void> {
+  const page = credentialHeldPages.get(authority);
+  if (!page) return;
+  if (!page.isClosed()) (await ensureBrowserNavigationGuard(page)).allowSubmissions(authority);
+  credentialHeldPages.delete(authority);
+}
+
 // ---------------------------------------------------------------- main's authority
 
 const AUTHORITY_FIELDS: ReadonlySet<string> = new Set([
@@ -156,6 +177,7 @@ function vaultOutcome(reason: BrowserVaultReason): Outcome {
  * Login, an edited one, or an account with no saved Login is refused here,
  * before the browser can act. Sign-in email, phone, two-factor and
  * payment-method changes have no operation.
+ * to: main, delegator
  */
 export async function credentialAuthorityRequest(
   content: Record<string, unknown>,
@@ -265,6 +287,10 @@ export const credentialReleaseGuard = defineGuardedAction({
   },
 });
 
+/** What the host did with a login someone changed or removed in 1Password while it was saving it. */
+const LEFT = 'the host left it as it is.';
+const CHANGED_MEANWHILE = `the login was changed or removed in 1Password meanwhile, and ${LEFT}`;
+
 /**
  * What 1Password holds for an attempt the host could not finish, in the
  * principal's words on the card (`mine`) and in main's note (`theirs`). A
@@ -282,7 +308,7 @@ function vaultLeft(
       case 'conflict':
         return {
           mine: undefined,
-          theirs: 'Its login was changed in 1Password before the host finished saving it, and stays as it was changed.',
+          theirs: `Its login was changed or removed in 1Password before the host finished saving it, and ${LEFT}`,
         };
       case 'confirmed':
         return {
@@ -292,13 +318,13 @@ function vaultLeft(
       default:
         return {
           mine: 'The password I generated for it is kept in my 1Password vault.',
-          theirs: "The password generated for it stays in the assistant's 1Password vault, not saved as its login.",
+          theirs: `Its password stays in the assistant's 1Password vault, in the login "${attempt.site}", which the host has not finished saving.`,
         };
     }
   if (phase === 'conflict')
     return {
       mine: `The new password is in my 1Password vault as its own item, ${item}.`,
-      theirs: `The new password stays in the assistant's 1Password vault as its own item, ${item}; the login stays as it was changed.`,
+      theirs: `The new password stays in the assistant's 1Password vault as its own item, ${item}; ${CHANGED_MEANWHILE}`,
     };
   if (phase !== 'confirmed')
     return {
@@ -315,7 +341,7 @@ function vaultLeft(
     case 'kept':
       return {
         mine: `The new password is in my 1Password vault as its own item, ${item}, which may still hold the old password too.`,
-        theirs: `The new password stays in the assistant's 1Password vault as its own item, ${item}, which may still hold the old password too; the login stays as it was changed.`,
+        theirs: `The new password stays in the assistant's 1Password vault as its own item, ${item}, which may still hold the old password too; ${CHANGED_MEANWHILE}`,
       };
     case null:
       return {
@@ -323,6 +349,11 @@ function vaultLeft(
         theirs: `The new password stays in the assistant's 1Password vault as its own item, ${item}; the login may still have the old one.`,
       };
   }
+}
+
+/** An attempt's recorded evidence, parsed; undefined when it has none. */
+function parsedEvidence(attempt: Pick<CredentialAttempt, 'evidence_json'>): unknown {
+  return attempt.evidence_json === null ? undefined : JSON.parse(attempt.evidence_json);
 }
 
 /** What happened, as the principal reads it first on the card. */
@@ -336,7 +367,7 @@ function situation(attempt: CredentialAttempt, account: string): string {
       case 'awaiting_verification':
         return `I tried to create the account ${account}. The site asked to confirm it by email, which never completed, so I can't tell whether the account was created.`;
       default: {
-        const evidence: unknown = attempt.evidence_json === null ? undefined : JSON.parse(attempt.evidence_json);
+        const evidence: unknown = parsedEvidence(attempt);
         const via = isRecord(evidence) ? evidence.via : undefined;
         return via === 'link' || via === 'code'
           ? `The site asked to confirm the account ${account} by email, and I used the ${via} it sent, but I can't tell whether the site accepted it.`
@@ -350,6 +381,17 @@ function situation(attempt: CredentialAttempt, account: string): string {
       ? `The site took a new password for ${account}, and the login in my 1Password vault has it, but I can't reach 1Password to delete the separate item that held it.`
       : `The site took a new password for ${account}, but I can't reach 1Password to put it into the login.`;
   return `I tried to change the password of ${account}, but I can't tell whether the password changed.`;
+}
+
+/** What a release the host could finish after all leaves, in words: the job's outcome with its vault state. */
+function finishedWords(attempt: Pick<CredentialAttempt, 'kind' | 'site'>, vault: 'finalized' | 'conflict'): string {
+  if (attempt.kind === 'signup')
+    return vault === 'finalized'
+      ? "the site created the account, and its login in the assistant's 1Password vault holds its password."
+      : `the site created the account, but its login was changed or removed in 1Password before the host finished saving it, and ${LEFT}`;
+  return vault === 'finalized'
+    ? "the site took the new password, and the login in the assistant's 1Password vault now holds it."
+    : `the site took the new password, which is in the assistant's 1Password vault as its own item, "New password for ${attempt.site}"; ${CHANGED_MEANWHILE}`;
 }
 
 /** What the principal reads on the card: what happened, what 1Password keeps, and what releasing means. */
@@ -433,7 +475,7 @@ async function credentialReleaseRequest(
 
 /** The release evidence: this approval's, and the phase it released, as a resumed approval finds it. */
 function releasedFrom(attempt: CredentialAttempt, approvalId: string): CredentialAttemptPhase | undefined {
-  const evidence: unknown = attempt.evidence_json === null ? undefined : JSON.parse(attempt.evidence_json);
+  const evidence: unknown = parsedEvidence(attempt);
   if (attempt.phase !== 'rejected' || !isRecord(evidence) || evidence.approval !== approvalId) return undefined;
   const from = evidence.released_from;
   return RELEASABLE_PHASES.find((phase) => phase === from) ?? 'unknown';
@@ -446,9 +488,10 @@ function releasedFrom(attempt: CredentialAttempt, approvalId: string): Credentia
  */
 async function freeSite(
   queue: BrowserQueue,
-  attempt: Pick<CredentialAttempt, 'job_id' | 'site'>,
+  attempt: Pick<CredentialAttempt, 'id' | 'job_id' | 'site'>,
   eventId: string,
 ): Promise<void> {
+  await releaseCredentialSubmissions(attempt.id);
   const running = await queue.store.db.get<{ present: number }>(
     'SELECT 1 AS present FROM gws_ea_browser_requests WHERE job_id = ? AND started_at IS NOT NULL AND answered_at IS NULL LIMIT 1',
     attempt.job_id,
@@ -490,9 +533,8 @@ async function applyCredentialRelease(
     }
     if (result.status === 'settled') {
       await freeSite(queue, result.result.attempt, `credential-settled-${current.id}`);
-      const outcome = websiteOutcome(current.kind, result.result.status);
       await notify(
-        `The ${current.kind === 'signup' ? 'signup' : 'password change'} for ${current.username} on ${current.site} was not released: 1Password could be reached again, and the host finished it (${String(outcome.status)}, vault ${String(outcome.vault)}).`,
+        `The ${current.kind === 'signup' ? 'signup' : 'password change'} for ${current.username} on ${current.site} was not released: 1Password could be reached again, and the host finished it: ${finishedWords(current, result.result.status)}`,
       );
       return;
     }
@@ -570,7 +612,17 @@ export function registerCredentialAuthorityDelivery(
   registerApprovalHandler(
     CREDENTIAL_RELEASE_APPROVAL,
     (context) => applyCredentialRelease(context, queue(), dependencies.attempts),
-    { restartSafe: true },
+    {
+      restartSafe: true,
+      rejectionNote: async (approval, reason) => {
+        const { attemptId } = JSON.parse(approval.payload) as { attemptId?: unknown };
+        const attempt = typeof attemptId === 'string' ? await dependencies.attempts.get(attemptId) : undefined;
+        const errand = attempt
+          ? `the ${attempt.kind === 'signup' ? 'account signup' : 'password change'} for "${attempt.username}" on ${attempt.site}`
+          : 'that signup or password change';
+        return `The principal chose to keep waiting on ${errand}${reason ? `: "${reason}"` : ''}. It stays as it is.`;
+      },
+    },
   );
 }
 
@@ -666,12 +718,13 @@ async function finalizedOutcome(
   attempts: CredentialAttempts,
   assertActive: () => Promise<void>,
 ): Promise<Outcome> {
+  await releaseCredentialSubmissions(attempt.id);
   return websiteOutcome(attempt.kind, vaultState((await attempts.finalize(attempt.id, assertActive)).status));
 }
 
 /**
  * A confirmed website change: the login holds the new password (`saved`,
- * `updated`); it was changed in 1Password meanwhile and stays as it was made
+ * `updated`); it was changed or removed in 1Password meanwhile and stays as it is
  * (`left_as_edited`); or 1Password is not updated yet (`pending`), which the
  * next reconcile finishes.
  */
@@ -944,15 +997,19 @@ async function bindGroup(
   };
 }
 
+interface ConsentStopped {
+  readonly outcome: Outcome;
+}
+
 /**
  * The consent engine's check before a credential submission (KTD11): it accepts the site's own terms, opts
- * out of marketing and stops for any other agreement. An outcome only when the submission must not go ahead.
+ * out of marketing and stops for any other agreement. A stop only when the submission must not go ahead.
  */
 async function consentStop(
   context: BrowserExecutionContext,
   page: Page,
   group: CredentialGroup,
-): Promise<Outcome | undefined> {
+): Promise<ConsentStopped | undefined> {
   const consent = await runConsentPass(page, group.element, {
     scope: { jobId: context.job.id, db: context.store.db },
     assertActive: context.assertActive,
@@ -961,9 +1018,11 @@ async function consentStop(
     case 'ready':
       return undefined;
     case 'consent_required':
-      return { ...refused('consent_required'), consent: consent.stops };
+      return {
+        outcome: { ...refused('consent_required'), consent: consentStopsForAgent(consent.stops) },
+      };
     case 'add_on':
-      return refused('purchase_control');
+      return { outcome: refused('purchase_control') };
   }
 }
 
@@ -1152,7 +1211,7 @@ async function runStep(
     await leaseSite(context, group);
     // The form's choices are made, or stopped for, before anything is saved or disclosed.
     const stopped = await consentStop(context, page, group);
-    if (stopped) return stopped;
+    if (stopped) return stopped.outcome;
     // Only a new password is a disclosure; a username-only step of a multi-step signup reveals nothing.
     return payload.new_password
       ? await disclosingStep(context, page, attempt, bind, group, attempts)
@@ -1215,7 +1274,7 @@ async function usernameStep(
   if (filled === 'not_inserted') return refused('form_changed');
   // The check again just before the press: a controlled form may have reset a choice as it took the values.
   const stopped = await consentStop(context, page, group);
-  if (stopped) return stopped;
+  if (stopped) return stopped.outcome;
   return activateWithin(context, page, group, values, [], async (activation) => {
     if (activation === 'uncertain') return { status: 'outcome_unknown' };
     if (activation !== 'activated') return refused('form_changed');
@@ -1384,6 +1443,7 @@ async function disclosingStep(
     watchResponse(saved.id, context, page, group, { step: 'credentials', before });
     return { status: 'outcome_unknown' };
   };
+  let uninserted = false;
   page.on('framenavigated', navigation);
   try {
     for (const secret of secrets) {
@@ -1397,19 +1457,25 @@ async function disclosingStep(
       await rejectExposed(attempts, saved.id, evidence('none', 'not_inserted', 'none'));
       return { status: 'vault_unavailable' };
     }
+    // A page's input/change handlers can submit without navigating. Install this before any value reaches
+    // them, and retain it through a consent hold (and secret cleanup), not just this call's stack.
+    await holdCredentialSubmissions(page, saved.id);
     const filled = await fillNativeCredentialGroup(group.frame, group.native, values, context.assertActive);
     if (filled === 'not_inserted') {
+      uninserted = true;
       // Proven: nothing reached the page, so no website could have acted on it.
       await rejectExposed(attempts, saved.id, evidence('none', filled, 'none'));
       return refused('form_changed');
     }
-    // The check again just before the press. The values are in the page by now, so a stop here leaves the
-    // attempt unknown, as any activation that did not run does.
+    // HTTP holds limit callbacks, but an existing socket may already have submitted. A consent stop
+    // after disclosure is uncertain too: keep the candidate and watch the response without refilling.
     const stopped = await consentStop(context, page, group);
     if (stopped) {
       await settle(() => attempts.markUnknown(saved.id, evidence('consent', filled, 'none')));
-      return { ...stopped, status: 'outcome_unknown' };
+      watchResponse(saved.id, context, page, group, { step: 'credentials', before });
+      return { ...stopped.outcome, status: 'outcome_unknown' };
     }
+    await releaseCredentialSubmissions(saved.id);
     return await activateWithin(context, page, group, values, secrets, async (activation) => {
       if (activation === 'activated') await attempts.markAwaitingVerification(saved.id);
       const result = await awaitWebsite(context, page, group, before, activation === 'activated' ? 15_000 : 2_000);
@@ -1445,6 +1511,7 @@ async function disclosingStep(
   } finally {
     page.off('framenavigated', navigation);
     await settleFilledSecrets(context, page, secrets);
+    if (uninserted) await releaseCredentialSubmissions(saved.id);
     // The wait stays open while the site may still send its verification email: asked for, or unknown.
     if (verifying) {
       const phase = (await attempts.get(saved.id))?.phase;
@@ -1492,10 +1559,12 @@ function watchResponse(
 
 /** Browser actions that cannot change what a site shows: anything else since the activation makes its response unattributable. */
 const READ_ONLY_ACTIONS: ReadonlySet<unknown> = new Set(['observe', 'screenshot', 'wait_for']);
-function readOnlyRequest(request: Pick<BrowserRequest, 'action' | 'payload_json'>): boolean {
+function readOnlyRequest(request: Pick<BrowserRequest, 'action' | 'payload_json'>, authority: string): boolean {
   const payload: unknown = JSON.parse(request.payload_json);
   if (!isRecord(payload)) return false;
-  if (request.action === 'credential_form') return payload.operation === 'reconcile';
+  if (request.action === 'request_consent') return true;
+  if (request.action === 'credential_form')
+    return payload.operation === 'reconcile' || (payload.authority === authority && payload.operation === undefined);
   return (
     request.action === 'browser' &&
     Array.isArray(payload.actions) &&
@@ -1504,7 +1573,11 @@ function readOnlyRequest(request: Pick<BrowserRequest, 'action' | 'payload_json'
 }
 
 /** The site's response is the activation's only if nothing since could have navigated or interacted. */
-async function attributable(context: BrowserExecutionContext, watched: WatchedResponse): Promise<boolean> {
+async function attributable(
+  context: BrowserExecutionContext,
+  watched: WatchedResponse,
+  authority: string,
+): Promise<boolean> {
   const { db } = context.store;
   if (watched.page.isClosed() || !(await db.hasTable('gws_ea_browser_requests'))) return !watched.page.isClosed();
   const later = await db.all<Pick<BrowserRequest, 'action' | 'payload_json'>>(
@@ -1514,7 +1587,7 @@ async function attributable(context: BrowserExecutionContext, watched: WatchedRe
     context.request.id,
     watched.at,
   );
-  return later.every(readOnlyRequest);
+  return later.every((request) => readOnlyRequest(request, authority));
 }
 
 /**
@@ -1538,7 +1611,7 @@ async function reconcile(
       return await finalizedOutcome(attempt, attempts, context.assertActive);
     case 'unknown': {
       const watched = watchedResponses.get(attempt.id);
-      if (!watched || !(await attributable(context, watched))) return { status: 'inconclusive' };
+      if (!watched || !(await attributable(context, watched, attempt.id))) return { status: 'inconclusive' };
       return onSitePage(context, (page) => reconcileResponse(context, page, attempt, watched, attempts));
     }
     default:
@@ -1569,9 +1642,11 @@ async function reconcileResponse(
     case 'current_password_rejected':
     case 'password_rejected':
       await attempts.markRejected(attempt.id, proof);
+      await releaseCredentialSubmissions(attempt.id);
       return { status: result };
     case 'verification_requested':
       await attempts.markVerificationRequested(attempt.id, proof);
+      await releaseCredentialSubmissions(attempt.id);
       return { status: 'verification_requested' };
     case 'confirmed':
       await attempts.markConfirmed(attempt.id, proof);
@@ -1649,7 +1724,8 @@ async function verify(
       await leaseSite(context, group);
       // The answer stays for the next verify when the form's choices stop the code's submission.
       return (
-        (await consentStop(context, page, group)) ?? enterCode(context, page, attempt, group, reply.value, attempts)
+        (await consentStop(context, page, group))?.outcome ??
+        enterCode(context, page, attempt, group, reply.value, attempts)
       );
     }),
   );

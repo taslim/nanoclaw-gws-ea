@@ -269,7 +269,10 @@ registerResource({
             return { nowhere: await placeNowhere(links) };
           }
           const id = optionalString(args.id);
-          if (id === undefined) throw new Error('--id is required: the matter to place them in, or --nowhere');
+          if (id === undefined)
+            throw new Error(
+              '--id is required: the matter to place them in, or --nowhere. For a new matter, use ncl matters open with the same links.',
+            );
           return placeInMatter(id, links);
         }),
     },
@@ -364,11 +367,11 @@ registerResource({
     today: {
       access: 'open',
       description:
-        "Today as matters hold it: today's looks, the matters handed back without one, and the threads waiting to be placed. It is the script of a morning rundown the principal asks for: an --in-conversation task, theirs to move or drop.",
+        "Your own list for today: today's looks, the matters handed back without one, and the threads waiting to be placed. Run it as the script of a morning rundown the principal asks for, an --in-conversation task theirs to move or drop. Build the rundown from their calendar and tell them what on this list needs them, in their words: the list itself is yours alone.",
       args: [],
       examples: [
         'ncl matters today',
-        'ncl tasks create --in-conversation --name "morning rundown" --recurrence "30 7 * * 1-5" --script "ncl matters today" --prompt "Their morning rundown"',
+        'ncl tasks create --in-conversation --name "morning rundown" --recurrence "30 7 * * 1-5" --script "ncl matters today" --prompt "Their morning rundown: their day from the calendar, and what on your list needs them"',
       ],
       formatHuman: (verdict) => JSON.stringify(verdict),
       handler: async (_args, ctx) => asMain(ctx, todayVerdict),

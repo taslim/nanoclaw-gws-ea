@@ -13,8 +13,7 @@ export function browserSite(url: string): string {
 
 /**
  * Credential phases whose site stays held by their job (KTD8): the website
- * may have taken a credential, and only that job's verification or
- * reconciliation may settle it. Another errand can neither submit there
+ * may have taken a credential, and only that job may settle it. Another errand can neither submit there
  * again nor take the site meanwhile; every other site stays free.
  */
 export const HELD_CREDENTIAL_PHASES = ['exposed', 'awaiting_verification', 'unknown', 'confirmed'] as const;

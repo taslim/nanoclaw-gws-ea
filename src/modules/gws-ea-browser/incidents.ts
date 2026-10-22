@@ -1,7 +1,8 @@
 /**
  * Incidents (KTD10): spending that may have slipped past the host. Each is a row of its own, inserted in the
  * same transaction as its job's stop, and a job records one per kind and evidence. The job's delegating group
- * hears of each at once, and tells the principal; once that group's browser access was removed, main hears.
+ * hears of each at once, and tells the principal; once that group's browser access was removed, main hears. An
+ * incident its recorder learns of from its own answer is recorded told (KTD15), so no notice repeats the alarm.
  *
  * `unapproved_commit` is a confirmation page that showed a charge after an ordinary press. `late_confirmation`
  * is main reporting placed a purchase it had recorded not placed: the merchant's late order email, and possibly
@@ -41,22 +42,26 @@ export interface NewIncident {
   /** What makes this incident this one: the same evidence for the same job and kind is recorded once. */
   readonly evidenceKey: string;
   readonly evidence: unknown;
+  /** The agent that raised it hears of it in its own answer, so no notice goes out. */
+  readonly told?: boolean;
 }
 
 /**
  * Records `incident` and stops its job (cancels it) in one transaction. Recording the same evidence again stops
- * nothing new. The caller finishes the cancellation and tells of the incident after this commits.
+ * nothing new, and `created` says which this was. The caller finishes the cancellation and tells of the incident
+ * after this commits.
  */
 export async function recordIncidentWithStop(
   store: BrowserStore,
   thread: string,
   incident: NewIncident,
-): Promise<{ readonly incident: BrowserIncident; readonly stop: BrowserJobCancellation }> {
+): Promise<{ readonly incident: BrowserIncident; readonly stop: BrowserJobCancellation; readonly created: boolean }> {
   return store.db.transaction(async () => {
     const stop = await cancelBrowserJobInTransaction(thread, store);
-    await store.db.run(
-      `INSERT INTO gws_ea_browser_incidents(id,kind,site,job_id,attempt_id,evidence_key,evidence_json,created_at)
-       VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(job_id,kind,evidence_key) DO NOTHING`,
+    const at = new Date().toISOString();
+    const inserted = await store.db.run(
+      `INSERT INTO gws_ea_browser_incidents(id,kind,site,job_id,attempt_id,evidence_key,evidence_json,created_at,notified_at)
+       VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(job_id,kind,evidence_key) DO NOTHING`,
       `incident-${randomUUID()}`,
       incident.kind,
       incident.site,
@@ -64,7 +69,8 @@ export async function recordIncidentWithStop(
       incident.attemptId ?? null,
       incident.evidenceKey,
       JSON.stringify(incident.evidence),
-      new Date().toISOString(),
+      at,
+      incident.told ? at : null,
     );
     const recorded = await store.db.get<BrowserIncident>(
       'SELECT * FROM gws_ea_browser_incidents WHERE job_id = ? AND kind = ? AND evidence_key = ?',
@@ -73,7 +79,7 @@ export async function recordIncidentWithStop(
       incident.evidenceKey,
     );
     if (!recorded) throw new Error('Incident was not recorded');
-    return { incident: recorded, stop };
+    return { incident: recorded, stop, created: inserted.changes > 0 };
   });
 }
 

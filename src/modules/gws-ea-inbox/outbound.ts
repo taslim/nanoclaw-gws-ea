@@ -282,7 +282,10 @@ async function carriedOver(
   return (await checkOutbound([quotedBy(quote), quote.text], audience)).allowed ? quote : undefined;
 }
 
-/** The channel adapter's `deliver` for `email:inbox`: send one email in its thread, exactly once. */
+/**
+ * The channel adapter's `deliver` for `email:inbox`: send one email in its thread, exactly once.
+ * to: external-email
+ */
 export async function sendToOutside(
   runtime: InboxRuntime,
   platformId: string,

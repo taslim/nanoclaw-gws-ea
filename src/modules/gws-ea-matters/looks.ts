@@ -174,7 +174,7 @@ export function lookSeries(key: string): LookSeries | undefined {
 }
 
 function lookPrompt(matterId: string): string {
-  return `Look at matter ${matterId}: the script output is the matter as it stands now. Set its next look, or close it.`;
+  return `Look at matter ${matterId}: the script output is the matter as it stands now. Act on it, then set its next look or close it.`;
 }
 
 async function createLook(

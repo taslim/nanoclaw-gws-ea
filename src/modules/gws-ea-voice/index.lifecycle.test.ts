@@ -43,9 +43,11 @@ function deferred<T>() {
 
 const recognized: SpeechResult = {
   status: 'recognized',
-  text: 'Move it to Thursday—actually Friday, if Sarah confirms.',
+  text: 'Move it to Thursday—actually Friday, if Remy confirms.',
   language: 'en',
 };
+/** The stored result: a recording in an unverified sender's conversation carries a false mark. */
+const stored = (speech: SpeechResult): SpeechResult => ({ ...speech, inPrincipalPrivateConversation: false });
 let root: string;
 let installation: VerifiedVoiceInstallation;
 let voice: typeof import('./index.js');
@@ -54,6 +56,10 @@ let lifecycle: typeof import('../../host-lifecycle.js');
 beforeEach(async () => {
   // Queue, stop signal, and lifecycle registrations belong to a fresh host.
   vi.resetModules();
+  const db = await import('../../db/index.js');
+  const { getRegisteredMigrations } = await import('../../db/migrations/index.js');
+  const { gwsEaProfileMigration } = await import('../gws-ea-profile/migration.js');
+  await db.runMigrations(await db.initTestDb(), [...getRegisteredMigrations(), gwsEaProfileMigration]);
   boundary.readiness.mockReset();
   boundary.transcribe.mockReset();
   root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'voice-lifecycle-test-')));
@@ -97,6 +103,7 @@ beforeEach(async () => {
 });
 afterEach(async () => {
   await lifecycle.stopHostModules();
+  await (await import('../../db/index.js')).closeDb();
   await fs.rm(root, { recursive: true, force: true });
 });
 
@@ -236,7 +243,7 @@ describe('enabled voice preparation through the host entrypoint', () => {
     expect(order).toEqual(Array.from({ length: 9 }, (_, index) => `note-${index}`));
     expect(peak).toBe(1);
     expect((await Promise.all([first, ...pending])).map((prepared) => content(prepared).attachments[0].speech)).toEqual(
-      Array.from({ length: 9 }, () => recognized),
+      Array.from({ length: 9 }, () => stored(recognized)),
     );
     expect(await voice.voiceHealth()).toMatchObject({ queued: 0, inflight: 0, lastFailure: null });
   });
@@ -260,10 +267,9 @@ describe('enabled voice preparation through the host entrypoint', () => {
     } finally {
       readiness.resolve({ status: 'ready', enabled: true, installation });
     }
-    expect(content(await operation).attachments[0].speech).toEqual({
-      status: 'unavailable',
-      reason: 'operator-enablement-required',
-    });
+    expect(content(await operation).attachments[0].speech).toEqual(
+      stored({ status: 'unavailable', reason: 'operator-enablement-required' }),
+    );
     expect(boundary.transcribe).not.toHaveBeenCalled();
     expect(await voice.voiceHealth()).toMatchObject({ enabled: false, queued: 0, inflight: 0 });
   });
@@ -291,7 +297,7 @@ describe('enabled voice preparation through the host entrypoint', () => {
       });
     finish.resolve(recognized);
     const prepared = content(await operation);
-    expect(prepared.attachments[0].speech).toEqual(recognized);
+    expect(prepared.attachments[0].speech).toEqual(stored(recognized));
     expect(prepared.attachments[1]).toMatchObject({
       data: Buffer.from('second').toString('base64'),
       speech: {
@@ -327,11 +333,11 @@ describe('enabled voice preparation through the host entrypoint', () => {
       await shutdown;
     }
     for (const prepared of await Promise.all([first, queued]))
-      expect(content(prepared).attachments[0].speech).toEqual({ status: 'failed', reason: 'aborted' });
+      expect(content(prepared).attachments[0].speech).toEqual(stored({ status: 'failed', reason: 'aborted' }));
     expect(stopped).toBe(true);
     expect(await voice.voiceHealth()).toMatchObject({ queued: 0, inflight: 0, lastFailure: { reason: 'aborted' } });
     const later = content(await voice.prepareVoiceContent(request(['later'])));
-    expect(later.attachments[0].speech).toEqual({ status: 'failed', reason: 'aborted' });
+    expect(later.attachments[0].speech).toEqual(stored({ status: 'failed', reason: 'aborted' }));
     expect(boundary.transcribe).toHaveBeenCalledTimes(1);
     expect(await voice.voiceHealth()).toMatchObject({ queued: 0, inflight: 0 });
   });

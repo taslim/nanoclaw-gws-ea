@@ -47,14 +47,27 @@ export function getGatewayProvider(): GatewayProviderDefinition {
   return selected;
 }
 
+let agentSkillsWithheld = false;
+
+/**
+ * Withhold the gateway's agent skills from every agent. A module calls this
+ * as it loads when its agents are taught their own way to the services the
+ * gateway signs in to: the gateway's skill would teach a second one beside
+ * it, connect links included. The gateway still carries the agents' traffic.
+ */
+export function withholdGatewayAgentSkills(): void {
+  agentSkillsWithheld = true;
+}
+
 /**
  * Expose only the active gateway's agent skills; drop any other gateway's.
  * An agent whose capabilities give it no way to use the gateway
- * (`teachesGateway` in src/capabilities.ts) gets no gateway skill at all.
+ * (`teachesGateway` in src/capabilities.ts) gets no gateway skill at all, and
+ * neither does any agent once a module withholds them.
  */
 export function selectGatewayAgentSkills(skills: readonly string[], teachesGateway: boolean): string[] {
   const gatewaySkills = new Set(listGatewayProviderRegistrations().flatMap((entry) => entry.agentSkills));
-  const required = teachesGateway ? getGatewayProvider().agentSkills : [];
+  const required = teachesGateway && !agentSkillsWithheld ? getGatewayProvider().agentSkills : [];
   return [...new Set([...skills.filter((skill) => !gatewaySkills.has(skill)), ...required])];
 }
 

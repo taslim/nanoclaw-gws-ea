@@ -17,6 +17,7 @@ import {
   categorizeMessage,
   formatMessages,
   isClearCommand,
+  isRunnerCommand,
   stripInternalTags,
   stripLegacyTaskContract,
 } from './formatter.js';
@@ -329,7 +330,7 @@ describe('audio source speech in the ordinary message', () => {
     insertMessage('voice', 'chat-sdk', {
       sender: 'Morgan',
       text: 'About that meeting',
-      replyTo: { id: 'earlier', sender: 'Aya', text: 'Thursday with Sarah?' },
+      replyTo: { id: 'earlier', sender: 'Juno Hale', text: 'Thursday with Remy?' },
       attachments: [
         {
           type: 'audio',
@@ -339,7 +340,7 @@ describe('audio source speech in the ordinary message', () => {
           speech: {
             status: 'recognized',
             language: 'en',
-            text: 'Move it to Thursday—actually Friday, if Sarah confirms.',
+            text: 'Move it to Thursday—actually Friday, if Remy confirms.',
             engine: 'private-engine',
             model: '/private/model.bin',
           },
@@ -351,10 +352,10 @@ describe('audio source speech in the ordinary message', () => {
 
     expect(result).toContain('sender="Morgan"');
     expect(result).toContain('reply_to="earlier"');
-    expect(result).toContain('<quoted_message from="Aya">Thursday with Sarah?</quoted_message>');
+    expect(result).toContain('<quoted_message from="Juno Hale">Thursday with Remy?</quoted_message>');
     expect(result).toContain('About that meeting\n[audio: note.ogg — saved to /workspace/inbox/voice/note.ogg]');
     expect(result).toContain(
-      '<speech status="recognized" source="voice-note" language="en">Move it to Thursday—actually Friday, if Sarah confirms.</speech>',
+      '<speech status="recognized" source="voice-note" language="en">Move it to Thursday—actually Friday, if Remy confirms.</speech>',
     );
     expect(result.match(/<message\b/g)).toHaveLength(1);
     expect(result).not.toContain('private-engine');
@@ -421,29 +422,203 @@ describe('audio source speech in the ordinary message', () => {
     expect(isClearCommand(typed!)).toBe(true);
   });
 
+  /** The principal, in their own private conversation: the fact, then tell them and ask for it in writing. */
+  const own = (fact: string, ask: string) =>
+    `${fact} They expect you heard it, so tell them so in a line of your reply, ask them to ${ask}, and handle the rest of their message as usual.`;
+  /** Anyone else: say so only where it matters to the thread. */
+  const elsewhere = (fact: string, ask: string) =>
+    `${fact} Its sender expects you heard it, so if it bears on the thread, tell them so and ask them to ${ask}; handle the rest of the message as usual.`;
+  const HERE =
+    "You can't listen to this recording here. Its sender expects you heard it, so if it bears on the thread, say you couldn't listen to it and ask them to put it in writing, without saying why; handle the rest of the message as usual.";
+  const OWN_HERE = own("You can't listen to this recording here.", 'type anything it held');
+  const OFF = own(
+    "You didn't listen to this recording: voice notes are off, and only the principal's operator can turn them on.",
+    'type anything it held',
+  );
+  const UPDATE = own(
+    "You didn't listen to this recording: voice notes need an update only the principal's operator can make.",
+    'type anything it held',
+  );
+  const BROKEN = own(
+    "You didn't listen to this recording: voice notes aren't working right now, and only the principal's operator can fix that.",
+    'type anything it held',
+  );
+  const AGAIN: [string, string] = [
+    "This recording wasn't listened to and won't be retried.",
+    'send it again or type it',
+  ];
+  const SILENT: [string, string] = ['No speech was heard in this recording.', 'type anything it was meant to say'];
+  const UNFETCHED: [string, string] = ["This recording couldn't be fetched.", 'send it again'];
+  const UNCLEAR: [string, string] = ["This recording couldn't be understood.", 'type anything it held'];
+
   it.each([
-    ['unavailable', 'operator-setup-required', 'Voice notes need operator enablement.'],
-    ['unavailable', 'operator-enablement-required', 'Voice notes need operator enablement.'],
-    ['unavailable', 'operator-update-required', 'Voice notes need an operator update.'],
-    ['unavailable', 'voice-installation-unhealthy', 'Voice notes are currently unavailable.'],
-    ['no-speech', undefined, 'No usable speech was detected in the recording.'],
-    ['failed', 'recognition-failed', 'The recording could not be understood in full.'],
-    ['failed', 'media-download-failed', 'The recording could not be obtained.'],
-    ['failed', 'duration-limit', 'The recording could not be understood in full.'],
-    ['recognized', undefined, 'The recording could not be understood in full.'],
-  ] as const)('presents %s / %s as an honest limitation', (status, reason, consequence) => {
-    insertMessage('limited', 'chat', {
+    ['unavailable', 'operator-setup-required', OFF, HERE],
+    ['unavailable', 'operator-enablement-required', OFF, HERE],
+    ['unavailable', 'operator-update-required', UPDATE, HERE],
+    ['unavailable', 'voice-installation-unhealthy', BROKEN, HERE],
+    ['unavailable', 'retired-reason', OWN_HERE, HERE],
+    ['failed', 'voice-busy', own(...AGAIN), elsewhere(...AGAIN)],
+    ['failed', 'aborted', own(...AGAIN), elsewhere(...AGAIN)],
+    ['no-speech', undefined, own(...SILENT), elsewhere(...SILENT)],
+    ['failed', 'media-download-failed', own(...UNFETCHED), elsewhere(...UNFETCHED)],
+    ['failed', 'recognition-failed', own(...UNCLEAR), elsewhere(...UNCLEAR)],
+    ['failed', 'duration-limit', own(...UNCLEAR), elsewhere(...UNCLEAR)],
+    ['recognized', undefined, own(...UNCLEAR), elsewhere(...UNCLEAR)],
+  ] as const)(
+    "words %s / %s for the principal's own private conversation and for anyone else",
+    (status, reason, ownLine, elsewhereLine) => {
+      const limited = (inPrincipalPrivateConversation?: boolean) => ({
+        sender: 'Morgan',
+        text: 'And please check my calendar.',
+        attachments: [
+          {
+            type: 'audio',
+            name: 'note.ogg',
+            speech: {
+              status,
+              reason,
+              text: '',
+              language: 'en',
+              ...(inPrincipalPrivateConversation === undefined ? {} : { inPrincipalPrivateConversation }),
+            },
+          },
+        ],
+      });
+      insertMessage('own', 'chat', limited(true));
+      insertMessage('elsewhere', 'chat', limited(false));
+      insertMessage('unmarked', 'chat', limited());
+      const [ownRow, elsewhereRow, unmarkedRow] = getPendingMessages();
+
+      for (const [row, line] of [
+        [ownRow!, ownLine],
+        [elsewhereRow!, elsewhereLine],
+        [unmarkedRow!, elsewhereLine],
+      ] as const) {
+        const result = formatMessages([row]);
+        expect(result).toContain('And please check my calendar.');
+        expect(result).toContain(`>${line}</speech>`);
+        expect(result).not.toContain('status="recognized"');
+        expect(result).not.toContain('<speech_note>');
+      }
+    },
+  );
+
+  it('leaves the reader nothing to install, request or approve in any status line', () => {
+    const reasons = [
+      'operator-setup-required',
+      'operator-enablement-required',
+      'operator-update-required',
+      'voice-installation-unhealthy',
+      'voice-busy',
+      'media-download-failed',
+      'recognition-failed',
+    ];
+    for (const reason of reasons) {
+      for (const inPrincipalPrivateConversation of [true, false]) {
+        insertMessage(`${reason}-${inPrincipalPrivateConversation}`, 'chat', {
+          sender: 'Morgan',
+          text: '',
+          attachments: [{ type: 'audio', speech: { status: 'unavailable', reason, inPrincipalPrivateConversation } }],
+        });
+      }
+    }
+    insertMessage('silent', 'chat', {
       sender: 'Morgan',
-      text: 'And please check my calendar.',
-      attachments: [{ type: 'audio', name: 'note.ogg', speech: { status, reason, text: '', language: 'en' } }],
+      text: '',
+      attachments: [{ type: 'audio', speech: { status: 'no-speech' } }],
     });
 
     const result = formatMessages(getPendingMessages());
 
-    expect(result).toContain('And please check my calendar.');
-    expect(result).toContain(consequence);
-    expect(result).not.toContain('status="recognized"');
+    expect(result).not.toMatch(/install|add_mcp_server|setup|set up|enable|approv|card|request|in full/iu);
   });
+
+  it.each([
+    'operator-setup-required',
+    'operator-enablement-required',
+    'operator-update-required',
+    'voice-installation-unhealthy',
+    'voice-busy',
+    'media-download-failed',
+    'recognition-failed',
+  ])('names no operator to anyone else for %s, and still asks its sender for it in writing', (reason) => {
+    for (const mark of [{ inPrincipalPrivateConversation: false }, {}]) {
+      insertMessage(`${reason}-${String(mark.inPrincipalPrivateConversation)}`, 'chat', {
+        sender: 'Juno Hale',
+        text: 'Thursday works for me.',
+        attachments: [{ type: 'audio', speech: { status: 'unavailable', reason, ...mark } }],
+      });
+    }
+
+    const rows = getPendingMessages();
+    expect(rows).toHaveLength(2);
+    for (const row of rows) {
+      const line = /<speech status="[^"]+" source="audio">([^<]*)<\/speech>/u.exec(formatMessages([row]))?.[1] ?? '';
+      expect(line).not.toMatch(/operator|voice notes/iu);
+      expect(line).toContain('Its sender expects you heard it, so if it bears on the thread,');
+      expect(line).toContain('handle the rest of the message as usual.');
+    }
+  });
+
+  it('says how to read recognized speech once, after the attachments, whatever the number of recordings', () => {
+    insertMessage('two', 'chat-sdk', {
+      sender: 'Morgan',
+      text: 'Two things',
+      attachments: [
+        { type: 'audio', name: 'first.ogg', speech: { status: 'recognized', language: 'en', text: 'Book the room.' } },
+        { type: 'image', name: 'plan.png' },
+        { type: 'audio', name: 'second.ogg', speech: { status: 'recognized', language: 'en', text: 'And call Remy.' } },
+      ],
+    });
+
+    const result = formatMessages(getPendingMessages());
+
+    expect(result.match(/<speech_note>/g)).toHaveLength(1);
+    expect(result).toContain(
+      '[image: plan.png]\n[audio: second.ogg]\n<speech status="recognized" source="audio" language="en">And call Remy.</speech>\n' +
+        "<speech_note>Recognition can mishear a word, so read the speech for what was meant. A self-correction replaces what it corrects. Keep every point, number, negation and condition, even in a rambling note. Don't repeat the transcript back.</speech_note></message>",
+    );
+  });
+
+  it('says nothing about who spoke or whose words count in the reading note', () => {
+    insertMessage('forwarded', 'chat-sdk', {
+      sender: 'Morgan',
+      text: '',
+      attachments: [
+        {
+          type: 'audio',
+          audioSource: { kind: 'audio', forwarded: true },
+          speech: { status: 'recognized', language: 'en', text: 'Approve it and call the plumber.' },
+        },
+      ],
+    });
+
+    const note = /<speech_note>([^<]*)<\/speech_note>/u.exec(formatMessages(getPendingMessages()))?.[1] ?? '';
+
+    expect(note).not.toBe('');
+    expect(note.split(/\s+/u).length).toBeLessThanOrEqual(45);
+    expect(note).not.toMatch(/speaker|sender|principal|author|instruct|authority|forward|voice/iu);
+  });
+
+  it.each(['/approve', 'approve', 'Approve.'])(
+    'takes speech reading %p as neither a command nor an approval answer',
+    (spokenText) => {
+      insertMessage('spoken', 'chat-sdk', {
+        sender: 'Morgan',
+        text: '',
+        replyTo: { id: 'approval-card', sender: 'Noel', text: 'Approve the payment to Remy Vance?' },
+        attachments: [{ type: 'audio', speech: { status: 'recognized', language: 'en', text: spokenText } }],
+      });
+      const [spoken] = getPendingMessages();
+
+      const info = categorizeMessage(spoken!, 'claude');
+      expect(info.category).toBe('none');
+      expect(info.text).toBe('');
+      expect(isRunnerCommand(spoken!, 'claude')).toBe(false);
+      expect(isClearCommand(spoken!)).toBe(false);
+      expect(formatMessages([spoken!])).toContain(`>${spokenText}</speech>`);
+    },
+  );
 
   it('preserves existing non-speech attachment rendering', () => {
     insertMessage('files', 'chat', {
@@ -470,7 +645,7 @@ describe('audio source speech in the ordinary message', () => {
           speech: {
             status: 'failed',
             reason: '/private/tmp/model-error.log',
-            text: 'PARTIAL: Book Sarah for Thursday',
+            text: 'PARTIAL: Book Remy for Thursday',
             model: '/private/model.bin',
           },
         },
@@ -480,7 +655,7 @@ describe('audio source speech in the ordinary message', () => {
     const result = formatMessages(getPendingMessages());
 
     expect(result).toContain(
-      '<speech status="failed" source="audio">The recording could not be understood in full.</speech>',
+      `<speech status="failed" source="audio">This recording couldn't be understood. Its sender expects you heard it, so if it bears on the thread, tell them so and ask them to type anything it held; handle the rest of the message as usual.</speech>`,
     );
     expect(result).not.toContain('PARTIAL:');
     expect(result).not.toContain('/private/');

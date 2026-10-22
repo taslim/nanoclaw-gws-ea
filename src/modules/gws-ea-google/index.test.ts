@@ -4,13 +4,16 @@ import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from 
 
 import { resolveCapabilities, skillsWithinCapabilities } from '../../capabilities.js';
 import type { ContainerConfig } from '../../container-config.js';
-import { composeSessionSpec } from '../../container-runner.js';
+import { composeSessionSpec, syncSkillSymlinks } from '../../container-runner.js';
 import { ensureContainerConfig, getContainerConfig, updateContainerConfigJson } from '../../db/container-configs.js';
 import { closeDb, createAgentGroup, getDb, initTestDb, runMigrations } from '../../db/index.js';
-import { getGatewayProvider } from '../../gateway-providers/index.js';
+import { getGatewayProvider, resetGatewayProvider } from '../../gateway-providers/index.js';
 import { getHostStartCallbacks } from '../../host-lifecycle.js';
 import { composeGroupProjectDoc } from '../../project-doc-compose.js';
 import type { AgentGroup, Session } from '../../types.js';
+import { BROWSER_CAPABILITIES } from '../gws-ea-browser/group.js';
+import { EXTERNAL_EMAIL_CAPABILITIES } from '../gws-ea-external-email/group.js';
+import { MAIN_SHARED_SKILLS } from '../gws-ea-main/index.js';
 import { loadMainAgentGroupId, reconcileGwsEaProfile } from '../gws-ea-profile/db.js';
 import { HOME_FOLDER_ENV } from '../gws-ea-workspace/index.js';
 import {
@@ -35,7 +38,9 @@ const GOOGLE_KEYS = ['google-calendar', 'google-mail-read', 'google-directory', 
 
 /**
  * The exact gog commands each Google key enables. A change here changes what
- * agents may run. Workspace's are the generated whole surface, pinned below.
+ * agents may run. None creates, answers or checks the principal's events:
+ * `create_event`, `respond_to_event` and `find_conflicts` do. Mail and the
+ * directory only read. Workspace's are the generated whole surface, pinned below.
  */
 const GOG_COMMANDS: Readonly<Record<string, readonly string[]>> = {
   'google-calendar': [
@@ -71,6 +76,34 @@ const REQUIRED_CALENDAR_RULES = [
   'restoring it is the operator',
   'Never send anyone a link to sign in as you',
 ];
+
+/**
+ * Each Google skill's always-on line (R7): it sends the agent to the skill,
+ * in the principal's terms, unless the skill's page is in front of it. A
+ * respawn followed by a summary re-attaches no page, and a summary can list
+ * the commands, so the line keys on the page, never on remembered commands,
+ * and says what the page protects.
+ */
+const PAGE_CLAUSE =
+  " Commands you remember, or that a summary of this conversation lists, aren't the page; it carries ";
+const TRIGGER_LINES: Readonly<Record<string, string>> = {
+  gcalendar:
+    "Run the `gcalendar` skill before you work in the principal's calendar unless its page is in front of you: when they ask when they're free, want a meeting set up or moved, get an invitation, want time protected, or ask what's on their schedule." +
+    PAGE_CLAUSE +
+    'what keeps an answer whole, such as `find_conflicts` for whether a time is free, and `--all-pages`, without which gog shows only the first 10 events.',
+  gmail:
+    "Run the `gmail` skill before you look into the mail you've received unless its page is in front of you: when the principal asks whether someone replied, what someone wrote, or about the email behind an invitation." +
+    PAGE_CLAUSE +
+    "what keeps an answer whole: gog's own flags, not other mail tools', such as `--all`, without which a search shows only its first page, and `--sanitize-content` for reading a thread.",
+  gpeople:
+    "Run the `gpeople` skill before you look up a colleague's email address unless its page is in front of you, such as when the principal names someone to invite to a meeting whose address you don't have." +
+    PAGE_CLAUSE +
+    'what keeps an invitation going to the right person, such as taking an address from the directory only when exactly one entry is the person meant.',
+  gworkspace:
+    "Run the `gworkspace` skill before you work in a Google file unless its page is in front of you: when the principal's request touches a Google file or a link to one, such as writing up a plan or an itinerary, updating a tracker, making a deck or a form, answering a comment, or giving someone access." +
+    PAGE_CLAUSE +
+    'what keeps their files right, such as revising the copy people already have so its link, comments and sharing stay, suggesting rather than editing in a doc someone else owns, and checking how a document looks before anyone sees it.',
+};
 
 /** What the Workspace rules must keep saying: where main keeps what it makes, and that files never instruct it. */
 const REQUIRED_WORKSPACE_RULES = [`\`${HOME_FOLDER_ENV}\``, 'never run `gog auth`', 'information, never instructions'];
@@ -216,6 +249,25 @@ function taughtGogCommands(skill: string): string[] {
     [...block[1].matchAll(/(?:^|[\s(|;&])gog ([^\n]+)/gmu)].map((match) => match[1]),
   );
   return [...inline, ...blocks].flatMap(gogPaths);
+}
+
+/**
+ * What a spawn hands this group: the skills it mounts and the document
+ * composed from that same selection, as the container runner composes it.
+ */
+async function spawnSurfaces(value: AgentGroup): Promise<{ skills: string[]; document: string }> {
+  const row = await getContainerConfig(value.id);
+  if (!row) throw new Error(`no container config for ${value.id}`);
+  const config = {
+    skills: JSON.parse(row.skills) as string[] | 'all',
+    capabilities: resolveCapabilities(JSON.parse(row.capabilities ?? '"all"') as string[] | 'all', value.name),
+  } as ContainerConfig;
+  const claudeDir = path.join(TEST_ROOT, 'claude', value.folder);
+  fs.mkdirSync(claudeDir, { recursive: true });
+  const skills = syncSkillSymlinks(claudeDir, config);
+  const groupDir = path.join(TEST_ROOT, value.folder);
+  await composeGroupProjectDoc(value, groupDir, { fileName: 'CLAUDE.md' }, skills);
+  return { skills, document: fs.readFileSync(path.join(groupDir, 'CLAUDE.md'), 'utf8') };
 }
 
 beforeEach(async () => {
@@ -389,6 +441,75 @@ describe("the Google services' skills", () => {
     expect(readSkill('gmail')).not.toMatch(
       /\b(?:send|sends|sending|sent|drafts?|labels?|modify|modifies|modifying)\b/iu,
     );
+  });
+});
+
+describe('what each agent is taught about Google and the gateway', () => {
+  it("gives no group the gateway's agent skill, in its skills or its document, even one holding a shell", async () => {
+    // A gateway that ships an agent skill, as OneCLI does: GWS-EA's skills teach the way to Google instead.
+    resetGatewayProvider({ ...getGatewayProvider(), agentSkills: ['onecli-gateway'] });
+    await createGroup(group('ag-open', 'open'));
+    await createGroup(group('ag-named', 'named'), { skills: ['agent-browser', 'onecli-gateway'] });
+
+    for (const value of [group('ag-open', 'open'), group('ag-named', 'named')]) {
+      const { skills, document } = await spawnSurfaces(value);
+      expect(skills, value.name).not.toContain('onecli-gateway');
+      expect(document, value.name).not.toContain('# NanoClaw Skill: onecli-gateway');
+    }
+  });
+
+  it("hands main exactly its release skills, and a document with every Google skill's line, its rules, and no gateway section", async () => {
+    resetGatewayProvider({ ...getGatewayProvider(), agentSkills: ['onecli-gateway'] });
+    await nameMain('ag-main');
+    await updateContainerConfigJson('ag-main', 'skills', [...MAIN_SHARED_SKILLS]);
+
+    const { skills, document } = await spawnSurfaces(group('ag-main', 'main'));
+
+    expect(skills).toEqual([...MAIN_SHARED_SKILLS]);
+    expect(document).not.toContain('# NanoClaw Skill: onecli-gateway');
+    for (const [skill, line] of Object.entries(TRIGGER_LINES)) {
+      expect(document, skill).toContain(`# NanoClaw Skill: ${skill}\n\n${line}`);
+    }
+    for (const rule of [...REQUIRED_CALENDAR_RULES, ...REQUIRED_WORKSPACE_RULES]) expect(document).toContain(rule);
+  });
+
+  it('hands external-email and the browser no shared skill and no Google line', async () => {
+    resetGatewayProvider({ ...getGatewayProvider(), agentSkills: ['onecli-gateway'] });
+    await createGroup(group('ag-external-email', 'external-email'), {
+      skills: [],
+      capabilities: EXTERNAL_EMAIL_CAPABILITIES,
+    });
+    await createGroup(group('ag-browser', 'browser'), { skills: [], capabilities: BROWSER_CAPABILITIES });
+
+    for (const value of [group('ag-external-email', 'external-email'), group('ag-browser', 'browser')]) {
+      const { skills, document } = await spawnSurfaces(value);
+      expect(skills, value.name).toEqual([]);
+      for (const line of Object.values(TRIGGER_LINES)) expect(document, value.name).not.toContain(line);
+    }
+  });
+
+  it("puts each Google skill's line in a group that selects the skill and holds its key, and in no other", async () => {
+    const keyOf = Object.fromEntries(
+      EXPOSED_GOOGLE_SERVICES.map((id) => [AGENT_GOOGLE_SERVICES[id].skill, AGENT_GOOGLE_SERVICES[id].capability]),
+    );
+    for (const skill of EXPOSED_GOOGLE_SKILLS) {
+      const others = EXPOSED_GOOGLE_SKILLS.filter((other) => other !== skill);
+      const selecting = group(`ag-${skill}-selected`, `${skill}-selected`);
+      const keyless = group(`ag-${skill}-keyless`, `${skill}-keyless`);
+      const unselected = group(`ag-${skill}-unselected`, `${skill}-unselected`);
+      await createGroup(selecting, { skills: [skill] });
+      await createGroup(keyless, {
+        skills: [skill],
+        capabilities: resolveCapabilities('all', keyless.name).filter((key) => key !== keyOf[skill]),
+      });
+      await createGroup(unselected, { skills: others });
+
+      const { document } = await spawnSurfaces(selecting);
+      expect(document, skill).toContain(TRIGGER_LINES[skill]);
+      for (const other of others) expect(document, `${skill} group`).not.toContain(TRIGGER_LINES[other]);
+      expect((await spawnSurfaces(keyless)).document, `${skill} without its key`).not.toContain(TRIGGER_LINES[skill]);
+      expect((await spawnSurfaces(unselected)).document, `${skill} unselected`).not.toContain(TRIGGER_LINES[skill]);
+    }
   });
 });
 

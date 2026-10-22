@@ -70,8 +70,9 @@ async function main(): Promise<void> {
   trustGatewayCaForChromium({ log });
 
   // Runtime-generated system-prompt addendum: agent identity (name) plus
-  // the live destinations map. Everything else (capabilities, per-module
-  // instructions, per-channel formatting) is loaded by Claude Code from
+  // the live destinations map, worded for the delivery tools the group's
+  // capabilities hold. Everything else (per-module instructions,
+  // per-channel formatting) is loaded by Claude Code from
   // /workspace/agent/CLAUDE.md — one flat file the host composes per spawn
   // with every instruction source inlined, no imports. Memory is supplied
   // separately by each provider's native lifecycle hook.
@@ -79,6 +80,7 @@ async function main(): Promise<void> {
   const instructions = buildSystemPromptAddendum(
     config.assistantName || undefined,
     taskId ? { kind: 'task', taskId } : { kind: 'chat' },
+    config.capabilities,
   );
 
   // Discover additional directories mounted at /workspace/extra/*

@@ -87,12 +87,38 @@ export interface ApprovalHandlerContext {
 
 export type ApprovalHandler = (ctx: ApprovalHandlerContext) => Promise<void>;
 
+/**
+ * What the requesting agent reads when its request is rejected, given the
+ * rejected row and the approver's reason, if any (already clamped). `null`
+ * writes no note: the module's required rejection finalizer durably records
+ * its own notification before the rejection wakes the agent.
+ */
+export type ApprovalRejectionNote = (
+  approval: PendingApproval,
+  reason: string | undefined,
+) => string | null | Promise<string | null>;
+
 export interface ApprovalHandlerOptions {
   /** The handler is idempotent and may resume an approved row after a host restart. */
   restartSafe?: boolean;
+  /** Words the rejection for this action; without it the agent reads the generic note (finalize.ts). */
+  rejectionNote?: ApprovalRejectionNote;
+  /**
+   * Required, idempotent rejection settlement. Persist module state and its
+   * notification before returning; failures retain the decision for replay at
+   * startup and on the host sweep. Best-effort observers run afterwards.
+   */
+  finalizeRejection?: ApprovalRejectionFinalizer;
 }
 
-const approvalHandlers = new Map<string, { handler: ApprovalHandler; restartSafe: boolean }>();
+interface ApprovalHandlerRegistration {
+  handler: ApprovalHandler;
+  restartSafe: boolean;
+  rejectionNote?: ApprovalRejectionNote;
+  finalizeRejection?: ApprovalRejectionFinalizer;
+}
+
+const approvalHandlers = new Map<string, ApprovalHandlerRegistration>();
 
 export function registerApprovalHandler(
   action: string,
@@ -102,11 +128,24 @@ export function registerApprovalHandler(
   if (approvalHandlers.has(action)) {
     log.warn('Approval handler re-registered (overwriting)', { action });
   }
-  approvalHandlers.set(action, { handler, restartSafe: options.restartSafe === true });
+  approvalHandlers.set(action, {
+    handler,
+    restartSafe: options.restartSafe === true,
+    rejectionNote: options.rejectionNote,
+    finalizeRejection: options.finalizeRejection,
+  });
 }
 
 export function getApprovalHandler(action: string): ApprovalHandler | undefined {
   return approvalHandlers.get(action)?.handler;
+}
+
+export function getApprovalRejectionNote(action: string): ApprovalRejectionNote | undefined {
+  return approvalHandlers.get(action)?.rejectionNote;
+}
+
+export function getApprovalRejectionFinalizer(action: string): ApprovalRejectionFinalizer | undefined {
+  return approvalHandlers.get(action)?.finalizeRejection;
 }
 
 export function getRegisteredApprovalActions(): readonly string[] {
@@ -137,6 +176,9 @@ export interface ApprovalResolvedEvent {
   /** The reason given with a rejection. */
   reason?: string;
 }
+
+export type ApprovalRejectedEvent = ApprovalResolvedEvent & { outcome: 'reject' };
+export type ApprovalRejectionFinalizer = (event: ApprovalRejectedEvent) => Promise<void>;
 
 export type ApprovalResolvedHandler = (event: ApprovalResolvedEvent) => Promise<void> | void;
 

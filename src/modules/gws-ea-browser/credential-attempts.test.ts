@@ -904,6 +904,30 @@ describe('password changes', () => {
 });
 
 describe('phases', () => {
+  it('never discloses an uncertain candidate again, retaining its password and evidence for reconciliation', async () => {
+    const subject = service();
+    const attempt = expectPrepared(await subject.prepareSignup({ jobId: JOB, origin: ORIGIN, username: USERNAME }));
+    await subject.save(attempt.id);
+    await subject.disclose(attempt.id, { jobId: JOB, origin: ORIGIN });
+    const before = await subject.get(attempt.id);
+    expect(await subject.disclose(attempt.id, { jobId: JOB, origin: ORIGIN })).toEqual({
+      status: 'refused',
+      reason: 'not_saved',
+    });
+    await subject.markUnknown(attempt.id, { signal: 'consent', activation: 'none' });
+    expect(await subject.disclose(attempt.id, { jobId: JOB, origin: ORIGIN })).toEqual({
+      status: 'refused',
+      reason: 'not_saved',
+    });
+    expect(await subject.get(attempt.id)).toMatchObject({
+      phase: 'unknown',
+      candidate_item_id: before?.candidate_item_id,
+    });
+    expect(fake.items.has(before!.candidate_item_id!)).toBe(true);
+    expect(await subject.abandonForJob(JOB)).toEqual([]);
+    expect(await phase(attempt.id)).toBe('unknown');
+  });
+
   it('moves only along the diagram and records flat evidence that never carries a value', async () => {
     const subject = service();
     const attempt = expectPrepared(await subject.prepareSignup({ jobId: JOB, origin: ORIGIN, username: USERNAME }));
