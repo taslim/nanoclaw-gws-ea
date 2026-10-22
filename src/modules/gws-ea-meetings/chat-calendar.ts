@@ -58,7 +58,7 @@ const TAG_CHAT_REQUEST = 'gwsEaChatRequest';
 interface BookingRequest {
   readonly session_id: string;
   readonly request_id: string;
-  readonly action: 'change' | 'cancel';
+  readonly action: 'book' | 'change' | 'cancel';
   readonly fingerprint: string;
   readonly request_json: string;
   readonly messaging_group_id: string;
@@ -200,21 +200,20 @@ export function createChatSchedulingTools(deps: SchedulingToolsDeps) {
     }
     /* eslint-enable no-catch-all/no-catch-all */
   }
-  async function withdrawFailedBooking(calendarId: string, eventId: string, chatId: string): Promise<void> {
+  async function withdrawFailedBooking(calendarId: string, eventId: string, chatId: string): Promise<boolean> {
     /* eslint-disable no-catch-all/no-catch-all -- the booking already failed; withdrawing its partial write is best effort and logged */
     try {
       const event = await calendar().getEvent(calendarId, eventId);
-      if (
-        event &&
-        event.status !== 'cancelled' &&
-        event.tags?.[TAG_CHAT] === chatId &&
-        event.tags[TAG_ROLE] === 'booking'
-      ) {
+      if (!event || event.status === 'cancelled') return true;
+      if (event.tags?.[TAG_CHAT] === chatId && event.tags[TAG_ROLE] === 'booking') {
         await calendar().deleteEvent(calendarId, eventId, 'all');
         recordOwnCalendarChange(calendarId, eventId);
+        return true;
       }
+      return false;
     } catch (error) {
       log.error('A failed chat booking could not be withdrawn', { calendarId, eventId, chatId, error });
+      return false;
     }
     /* eslint-enable no-catch-all/no-catch-all */
   }
@@ -250,9 +249,16 @@ export function createChatSchedulingTools(deps: SchedulingToolsDeps) {
         : 'No free time in this range; ask for another range.',
     };
   };
-  const book: ActionAnswer = async (content, session, requestId) => {
+  const book: DeferredActionAnswer = async (content, session, requestId) => {
     const view = await viewOf(session);
+    let saved = await savedRequest(session, requestId, 'book', content);
+    const cached = savedResult(saved);
+    if (cached) return cached;
+    const applied = savedResult(saved, false);
+    if (saved?.applied === 1 && applied) return completeRequest(saved, view, applied);
     const entry = await bookingCalendar(view);
+    if (saved && saved.calendar_id !== entry.id)
+      throw forbidden('The chat booking calendar changed before this request was confirmed. Ask main with tell_main.');
     const start = instantOf(content.start, 'start');
     const span = { start, end: start + minutesOf(content.minutes) * MINUTE };
     const title = lineOf(content.title, 'title', 120);
@@ -279,6 +285,13 @@ export function createChatSchedulingTools(deps: SchedulingToolsDeps) {
       );
       if (video && !allowsMeet(entry))
         throw forbidden('This calendar does not allow Google Meet links. Give a location instead.');
+      booking = {
+        messaging_group_id: view.chatId,
+        calendar_id: entry.id,
+        event_id: eventId,
+        booked_at: new Date().toISOString(),
+      };
+      saved ??= await recordRequest(session, requestId, 'book', content, booking, span);
       try {
         await ensureEvent(
           calendar(),
@@ -299,12 +312,6 @@ export function createChatSchedulingTools(deps: SchedulingToolsDeps) {
           'all',
           { key: TAG_CHAT, value: view.chatId },
         );
-        booking = {
-          messaging_group_id: view.chatId,
-          calendar_id: entry.id,
-          event_id: eventId,
-          booked_at: new Date().toISOString(),
-        };
         await getDb().run(
           'INSERT INTO gws_ea_chat_bookings(messaging_group_id,calendar_id,event_id,booked_at) VALUES(?,?,?,?) ON CONFLICT DO NOTHING',
           view.chatId,
@@ -313,18 +320,23 @@ export function createChatSchedulingTools(deps: SchedulingToolsDeps) {
           booking.booked_at,
         );
       } catch (error) {
-        await withdrawFailedBooking(entry.id, eventId, view.chatId);
+        if (await withdrawFailedBooking(entry.id, eventId, view.chatId))
+          await getDb().run(
+            'DELETE FROM gws_ea_chat_booking_requests WHERE session_id=? AND request_id=?',
+            session.id,
+            requestId,
+          );
         throw error;
       }
     }
+    saved ??= await recordRequest(session, requestId, 'book', content, booking, span);
     const conference = video ? await readConference(calendar(), booking.calendar_id, eventId) : undefined;
-    await tellMain(view, booking, 'booked', span, requestId, title);
-    return {
+    return completeRequest(saved, view, {
       booking: eventId,
       start: iso(span.start),
       end: iso(span.end),
       message: `Booked: ${bothZones(span, view.timezone, theirs)}${conferenceWords(conference)}. Google sends the invitation; main hears. To change or cancel it, give booking ${eventId}.`,
-    };
+    });
   };
   async function ownBooking(content: Record<string, unknown>, view: View) {
     const eventId = bookingIdOf(content.booking);
@@ -353,7 +365,7 @@ export function createChatSchedulingTools(deps: SchedulingToolsDeps) {
     );
     return { booking, event, span, invitees };
   }
-  async function savedMutation(
+  async function savedRequest(
     session: Session,
     requestId: string,
     action: BookingRequest['action'],
@@ -374,7 +386,7 @@ export function createChatSchedulingTools(deps: SchedulingToolsDeps) {
     if (!isRecord(result)) throw new Error('The saved booking result is unreadable.');
     return result;
   }
-  async function recordMutation(
+  async function recordRequest(
     session: Session,
     requestId: string,
     action: BookingRequest['action'],
@@ -396,11 +408,11 @@ export function createChatSchedulingTools(deps: SchedulingToolsDeps) {
       iso(span.end),
       new Date().toISOString(),
     );
-    const row = await savedMutation(session, requestId, action, content);
+    const row = await savedRequest(session, requestId, action, content);
     if (!row) throw new Error('The booking request was not recorded.');
     return row;
   }
-  async function refuseRejectedMutation(row: BookingRequest, error: unknown): Promise<void> {
+  async function refuseRejectedRequest(row: BookingRequest, error: unknown): Promise<void> {
     if (error instanceof GoogleApiError && !error.retryable) {
       await getDb().run(
         'DELETE FROM gws_ea_chat_booking_requests WHERE session_id=? AND request_id=?',
@@ -410,25 +422,27 @@ export function createChatSchedulingTools(deps: SchedulingToolsDeps) {
       throw forbidden(`Google refused this booking request: ${error.message}`);
     }
   }
-  async function completeMutation(
+  async function completeRequest(
     row: BookingRequest,
     view: View,
     result: Record<string, unknown>,
-    title?: string,
   ): Promise<Record<string, unknown> | typeof ANSWER_LATER> {
+    const content: unknown = JSON.parse(row.request_json);
+    if (!isRecord(content)) throw new Error('The saved booking request is unreadable.');
+    const title = row.action === 'cancel' ? undefined : lineOf(content.title, 'title', 120);
+    const kind = { book: 'booked', change: 'changed', cancel: 'cancelled' } as const;
     const span = { start: Date.parse(row.start_at), end: Date.parse(row.end_at) };
     const booking = { calendar_id: row.calendar_id, event_id: row.event_id };
-    recordOwnCalendarChange(row.calendar_id, row.event_id);
-    await getDb().run(
-      'UPDATE gws_ea_chat_booking_requests SET applied=1,result_json=? WHERE session_id=? AND request_id=?',
-      JSON.stringify(result),
-      row.session_id,
-      row.request_id,
-    );
-    if (
-      !(await tellMain(view, booking, row.action === 'change' ? 'changed' : 'cancelled', span, row.request_id, title))
-    )
-      return ANSWER_LATER;
+    if (row.applied !== 1) {
+      recordOwnCalendarChange(row.calendar_id, row.event_id);
+      await getDb().run(
+        'UPDATE gws_ea_chat_booking_requests SET applied=1,result_json=? WHERE session_id=? AND request_id=?',
+        JSON.stringify(result),
+        row.session_id,
+        row.request_id,
+      );
+    }
+    if (!(await tellMain(view, booking, kind[row.action], span, row.request_id, title))) return ANSWER_LATER;
     await getDb().transaction(async () => {
       await getDb().run(
         'UPDATE gws_ea_chat_booking_requests SET reported=1 WHERE session_id=? AND request_id=?',
@@ -460,12 +474,11 @@ export function createChatSchedulingTools(deps: SchedulingToolsDeps) {
   }
   const changeBooking: DeferredActionAnswer = async (content, session, requestId) => {
     const view = await viewOf(session);
-    let saved = await savedMutation(session, requestId, 'change', content);
+    let saved = await savedRequest(session, requestId, 'change', content);
     const cached = savedResult(saved);
     if (cached) return cached;
     const applied = savedResult(saved, false);
-    if (saved?.applied === 1 && applied)
-      return completeMutation(saved, view, applied, lineOf(content.title, 'title', 120));
+    if (saved?.applied === 1 && applied) return completeRequest(saved, view, applied);
     let current;
     try {
       current = await ownBooking(content, view);
@@ -477,11 +490,10 @@ export function createChatSchedulingTools(deps: SchedulingToolsDeps) {
     const mark = eventIdFor('chat-booking-change', session.id, requestId);
     if (saved && event.tags?.[TAG_CHAT_REQUEST] === mark) {
       const appliedSpan = { start: Date.parse(saved.start_at), end: Date.parse(saved.end_at) };
-      return completeMutation(
+      return completeRequest(
         saved,
         view,
         changedAnswer(booking.event_id, appliedSpan, view, timezoneOf(content.timezone), event.conference),
-        lineOf(content.title, 'title', 120),
       );
     }
     await inviteesOf(invitees, view);
@@ -528,7 +540,7 @@ export function createChatSchedulingTools(deps: SchedulingToolsDeps) {
         end: iso(span.end),
         message: `The booking already stands at ${bothZones(span, view.timezone, theirs)}: nothing changed.`,
       };
-    saved ??= await recordMutation(session, requestId, 'change', content, booking, span);
+    saved ??= await recordRequest(session, requestId, 'change', content, booking, span);
     if (saved.applied !== 1 && event.tags?.[TAG_CHAT_REQUEST] !== mark) {
       try {
         await calendar().patchEvent(
@@ -539,7 +551,7 @@ export function createChatSchedulingTools(deps: SchedulingToolsDeps) {
         );
         /* eslint-disable no-catch-all/no-catch-all -- a failed write is uncertain until its own Google mark is read */
       } catch (error) {
-        await refuseRejectedMutation(saved, error);
+        await refuseRejectedRequest(saved, error);
         // The request may already stand in Google. Only its private request mark confirms it.
         try {
           const observed = await calendar().getEvent(booking.calendar_id, booking.event_id);
@@ -554,19 +566,19 @@ export function createChatSchedulingTools(deps: SchedulingToolsDeps) {
     const conference = linking
       ? await readConference(calendar(), booking.calendar_id, booking.event_id)
       : event.conference;
-    return completeMutation(saved, view, changedAnswer(booking.event_id, span, view, theirs, conference), title);
+    return completeRequest(saved, view, changedAnswer(booking.event_id, span, view, theirs, conference));
   };
   const cancelBooking: DeferredActionAnswer = async (content, session, requestId) => {
     const theirs = timezoneOf(content.timezone);
     const view = await viewOf(session);
-    let saved = await savedMutation(session, requestId, 'cancel', content);
+    let saved = await savedRequest(session, requestId, 'cancel', content);
     const cached = savedResult(saved);
     if (cached) return cached;
     const applied = savedResult(saved, false);
-    if (saved?.applied === 1 && applied) return completeMutation(saved, view, applied);
+    if (saved?.applied === 1 && applied) return completeRequest(saved, view, applied);
     if (!saved) {
       const { booking, span } = await ownBooking(content, view);
-      saved = await recordMutation(session, requestId, 'cancel', content, booking, span);
+      saved = await recordRequest(session, requestId, 'cancel', content, booking, span);
     }
     if (!(await bookingFor(view.chatId, saved.event_id))) throw forbidden('This chat has no such booking.');
     /* eslint-disable no-catch-all/no-catch-all -- Google failures leave the durable cancellation unanswered for a later read-back */
@@ -581,7 +593,7 @@ export function createChatSchedulingTools(deps: SchedulingToolsDeps) {
         try {
           await calendar().deleteEvent(saved.calendar_id, saved.event_id, 'all');
         } catch (error) {
-          await refuseRejectedMutation(saved, error);
+          await refuseRejectedRequest(saved, error);
           try {
             const observed = await calendar().getEvent(saved.calendar_id, saved.event_id);
             if (observed && observed.status !== 'cancelled') return ANSWER_LATER;
@@ -602,7 +614,7 @@ export function createChatSchedulingTools(deps: SchedulingToolsDeps) {
     }
     /* eslint-enable no-catch-all/no-catch-all */
     const span = { start: Date.parse(saved.start_at), end: Date.parse(saved.end_at) };
-    return completeMutation(saved, view, {
+    return completeRequest(saved, view, {
       booking: saved.event_id,
       message: `Cancelled: ${bothZones(span, view.timezone, theirs)}. Google sends the cancellation; main hears.`,
     });
@@ -617,7 +629,7 @@ export function createChatSchedulingTools(deps: SchedulingToolsDeps) {
     });
     return result === 'written' || result === 'already-written';
   }
-  function mutationAnswer(answer: DeferredActionAnswer): DeferredActionAnswer {
+  function requestAnswer(answer: DeferredActionAnswer): DeferredActionAnswer {
     return async (content, session, requestId) => {
       try {
         return await answer(content, session, requestId);
@@ -639,13 +651,19 @@ export function createChatSchedulingTools(deps: SchedulingToolsDeps) {
       }
     };
   }
+  const initial = bound(
+    requestAnswer(book),
+    ['start', 'minutes', 'title', 'notes', 'location', 'video_call', 'invitees', 'timezone'],
+    true,
+    true,
+  );
   const change = bound(
-    mutationAnswer(changeBooking),
+    requestAnswer(changeBooking),
     ['booking', 'start', 'minutes', 'title', 'notes', 'location', 'video_call', 'timezone'],
     true,
     true,
   );
-  const cancel = bound(mutationAnswer(cancelBooking), ['booking', 'timezone'], true);
+  const cancel = bound(requestAnswer(cancelBooking), ['booking', 'timezone'], true);
   return {
     async resumePending(): Promise<void> {
       if (!(await getDb().hasTable('gws_ea_chat_booking_requests'))) return;
@@ -662,7 +680,7 @@ export function createChatSchedulingTools(deps: SchedulingToolsDeps) {
             const applied = savedResult(row, false);
             const settled =
               row.applied === 1 && applied
-                ? await completeMutation(row, await viewForChat(row.messaging_group_id), applied)
+                ? await completeRequest(row, await viewForChat(row.messaging_group_id), applied)
                 : await reportUnconfirmed(row);
             if (settled === ANSWER_LATER || settled === false) continue;
           }
@@ -686,7 +704,7 @@ export function createChatSchedulingTools(deps: SchedulingToolsDeps) {
           const applied = savedResult(row, false);
           const result =
             row.applied === 1 && applied
-              ? await completeMutation(row, await viewForChat(row.messaging_group_id), applied)
+              ? await completeRequest(row, await viewForChat(row.messaging_group_id), applied)
               : await reportUnconfirmed(row);
           if (result !== ANSWER_LATER && result !== false)
             await getDb().run(
@@ -699,7 +717,11 @@ export function createChatSchedulingTools(deps: SchedulingToolsDeps) {
         const content: unknown = JSON.parse(row.request_json);
         if (!isRecord(content)) throw new Error('The saved booking request is unreadable.');
         try {
-          const result = await (row.action === 'change' ? change : cancel)(content, session, row.request_id);
+          const result = await ({ book: initial, change, cancel } as const)[row.action](
+            content,
+            session,
+            row.request_id,
+          );
           if (result !== ANSWER_LATER) {
             await writeActionResponse(session, row.request_id, { id: row.request_id, ok: true, data: result });
             await getDb().run(
@@ -716,12 +738,7 @@ export function createChatSchedulingTools(deps: SchedulingToolsDeps) {
       }
     },
     freeTime: bound(freeTime, ['from', 'to', 'minutes', 'timezone']),
-    book: bound(
-      book,
-      ['start', 'minutes', 'title', 'notes', 'location', 'video_call', 'invitees', 'timezone'],
-      true,
-      true,
-    ),
+    book: initial,
     changeBooking: change,
     cancelBooking: cancel,
   };

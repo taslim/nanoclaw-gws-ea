@@ -216,7 +216,7 @@ describe('the inbox migrations', () => {
       getRegisteredMigrations()
         .map((migration) => migration.name)
         .filter((name) => name.startsWith('module:gws-ea-meetings:')),
-    ).toEqual(['module:gws-ea-meetings:chat-booking-requests']);
+    ).toEqual(['module:gws-ea-meetings:chat-booking-requests', 'module:gws-ea-meetings:chat-booking-reports']);
   });
 
   it('are portable: async, and free of every banned construct', () => {

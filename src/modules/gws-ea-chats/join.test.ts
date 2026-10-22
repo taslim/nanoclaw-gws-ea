@@ -948,3 +948,28 @@ it('refreshes host context on a real engaged turn, including new verified levels
   expect(current).not.toContain('Private person name');
   expect(current).not.toContain('Private basis');
 });
+
+it('expires independent asking chats when one mailbox settlement fails, then finishes that cleanup on retry', async () => {
+  principal = false;
+  await routeInbound(inbound('first-held'));
+  await routeInbound(inbound('second-held', 'hello', {}, 'second@g.us'));
+  const expiry = Date.now() + 8 * 24 * 60 * 60_000;
+  const interrupted = vi
+    .spyOn(sessionManager, 'withExistingMailboxSession')
+    .mockRejectedValueOnce(new Error('First expired mailbox unavailable'));
+  try {
+    await expect(expireAskingChats(expiry)).resolves.toBeUndefined();
+    const closed = await getDb().all<{ state: string; settled_at: string | null }>(
+      'SELECT state,settled_at FROM gws_ea_chats',
+    );
+    expect(closed).toHaveLength(2);
+    expect(closed.every((chat) => chat.state === 'declined')).toBe(true);
+    expect(closed.filter((chat) => chat.settled_at === null)).toHaveLength(1);
+  } finally {
+    interrupted.mockRestore();
+  }
+  await sweepChatLifecycle();
+  const settled = await getDb().all<{ settled_at: string | null }>('SELECT settled_at FROM gws_ea_chats');
+  expect(settled.every((chat) => chat.settled_at !== null)).toBe(true);
+  expect(await rows()).toEqual([expect.objectContaining({ status: 'completed' })]);
+});

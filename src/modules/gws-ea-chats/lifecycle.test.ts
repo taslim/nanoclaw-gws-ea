@@ -37,7 +37,8 @@ vi.mock('./hold.js', () => ({
   settleChatMessages: fixture.settle,
 }));
 vi.mock('./join.js', () => ({ notifyAskingChat: fixture.notify }));
-import { registerChatLifecycleTask, sweepChatLifecycle } from './lifecycle.js';
+import { registerChatLifecycleTask } from './lifecycle-tasks.js';
+import { sweepChatLifecycle } from './lifecycle.js';
 const failedTask = vi.fn(async () => undefined);
 const laterTask = vi.fn(async () => undefined);
 registerChatLifecycleTask('test:first', failedTask);

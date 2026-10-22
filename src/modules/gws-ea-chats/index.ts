@@ -27,7 +27,7 @@ import './directory.js';
 import { CHAT_BRIDGE_ACTIONS, flushChatHandoffs, inChatConversation } from './bridge.js';
 import { writeChatContext } from './context.js';
 import { chatHandoffMigration } from './handoff-migration.js';
-import { registerChatLifecycleTask } from './lifecycle.js';
+import { registerChatLifecycleTask } from './lifecycle-tasks.js';
 import { chatToolsMigration } from './tools-migration.js';
 import { EXPECT_REPLY_ACTION, consumeExpectedChatReply, expireExpectedChatReplies } from './expect.js';
 import { REMIND_ACTION } from './remind.js';
@@ -44,7 +44,8 @@ export * from './roster.js';
 export { decideJoin, refreshChatMembership } from './join.js';
 export { renderChat } from './framing.js';
 export { registerExpectedChatReplyReader } from './engage.js';
-export { registerChatLifecycleTask, sweepChatLifecycle } from './lifecycle.js';
+export { registerChatLifecycleTask } from './lifecycle-tasks.js';
+export { sweepChatLifecycle } from './lifecycle.js';
 
 registerMigration(chatsMigration);
 registerMigration(chatHandoffMigration);

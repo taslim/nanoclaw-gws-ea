@@ -18,6 +18,7 @@ import { bindWhatsAppPrincipal, removeWhatsAppPrincipalBinding } from '../gws-ea
 import { getGwsEaProfile, getMainAgentGroupId, listVerifiedPrincipalUsers } from '../gws-ea-profile/db.js';
 import { requirePrincipalDirectMessage } from '../gws-ea-profile/marks.js';
 import { writeNoteForMain } from '../gws-ea-profile/main-note.js';
+import { registerChatLifecycleTask } from '../gws-ea-chats/lifecycle-tasks.js';
 import type { WhatsAppAdapter } from './adapter.js';
 import { WhatsAppIndex } from './index-store.js';
 import { WhatsAppAuthStore } from './auth-store.js';
@@ -83,12 +84,16 @@ export class WhatsAppLinking {
   private timer: ReturnType<typeof setTimeout> | undefined;
   private pairingDeadline: number | undefined;
   private tail: Promise<unknown> = Promise.resolve();
+  private adapterStateTail: Promise<unknown> = Promise.resolve();
   constructor(readonly options: WhatsAppLinkingOptions) {
     if (options.directory !== path.join(options.paths.instanceRoot(options.instanceId), 'secrets', 'whatsapp'))
       throw new Error('WhatsApp account state is not this assistant’s secrets directory');
     this.unregister = registerWhatsAppObserver({
-      onMessage: (received) => this.receive(received),
-      onConnectionUpdate: ({ update }) => this.connection(update.connection),
+      onMessage: (received) => this.serializeAdapterState(() => this.receive(received)),
+      onConnectionUpdate: ({ update }) =>
+        update.connection === 'open'
+          ? this.serializeAdapterState(() => this.connection(update.connection))
+          : this.connection(update.connection),
     });
   }
   close(): void {
@@ -99,6 +104,11 @@ export class WhatsAppLinking {
   private serialize<T>(work: () => Promise<T>): Promise<T> {
     const run = this.tail.then(work);
     this.tail = run.catch(() => undefined);
+    return run;
+  }
+  private serializeAdapterState<T>(work: () => Promise<T>): Promise<T> {
+    const run = this.adapterStateTail.then(work);
+    this.adapterStateTail = run.catch(() => undefined);
     return run;
   }
   async status(): Promise<WhatsAppLinkStatus> {
@@ -184,10 +194,11 @@ export class WhatsAppLinking {
         previous && !principalInput ? undefined : principalNumber,
       );
       if (previous?.state === 'connected') {
-        if (!previous.principal && (!previous.binding || previous.binding.expiresAt <= Date.now())) {
-          await this.setOwnProfile();
-          await this.issueBinding(previous);
+        if (!previous.principal && previous.binding && previous.binding.expiresAt <= Date.now()) {
+          const { binding: _binding, ...unbound } = previous;
+          await writeWhatsAppLink(this.options.directory, { ...unbound, profilePending: true });
         }
+        await this.serializeAdapterState(() => this.finishConnectedSetup());
         return status(await readWhatsAppLink(this.options.directory));
       }
       if (previous?.pairing && previous.pairing.expiresAt > Date.now())
@@ -226,16 +237,38 @@ export class WhatsAppLinking {
       }
     });
   }
+  resumeConnectedSetup(): Promise<void> {
+    return this.serializeAdapterState(() => this.finishConnectedSetup());
+  }
+  private async finishConnectedSetup(): Promise<void> {
+    let record = await readWhatsAppLink(this.options.directory);
+    if (record?.state !== 'connected' || !transport()?.isConnected()) return;
+    const profilePending = record.profilePending || (!record.principal && !record.binding);
+    if (profilePending) {
+      await this.setOwnProfile();
+      record = await readWhatsAppLink(this.options.directory);
+      if (record?.state !== 'connected' || !transport()?.isConnected()) return;
+      const { profilePending: _pending, ...ready } = record;
+      await writeWhatsAppLink(this.options.directory, ready);
+      record = ready;
+      if (record.principal) await transport()?.releaseHeldPrincipal(record.principal.lid);
+    }
+    if (!record.principal && (!record.binding?.notified || (profilePending && record.binding.expiresAt <= Date.now())))
+      await this.issueBinding(record);
+  }
   private async issueBinding(record: WhatsAppLink): Promise<void> {
     const binding = (record.binding && record.binding.expiresAt > Date.now() ? record.binding : undefined) ?? {
       code: `EA-${randomBytes(4).toString('hex').toUpperCase()}`,
       expiresAt: Date.now() + BINDING_WINDOW_MS,
     };
-    await writeWhatsAppLink(this.options.directory, { ...record, binding });
+    if (binding !== record.binding) await writeWhatsAppLink(this.options.directory, { ...record, binding });
     await this.note(
       `bind:${binding.code}`,
       `WhatsApp is connected as ${record.number}. Give the principal this binding code: ${binding.code}. Ask them to send it to ${record.number} from their own WhatsApp number, ${record.principalNumber}, within 30 minutes. No message has been sent to that number.`,
     );
+    const current = await readWhatsAppLink(this.options.directory);
+    if (current?.binding?.code === binding.code)
+      await writeWhatsAppLink(this.options.directory, { ...current, binding: { ...binding, notified: true } });
   }
   private async setOwnProfile(): Promise<void> {
     const profile = await getGwsEaProfile();
@@ -253,11 +286,9 @@ export class WhatsAppLinking {
       this.timer = undefined;
       if (record.number && record.account?.phoneJid !== `${record.number.slice(1)}@s.whatsapp.net`)
         throw new Error('The connected WhatsApp account does not match its admitted number.');
-      await this.setOwnProfile();
       const { pairing: _pairing, outage: _outage, ...connected } = record;
-      await writeWhatsAppLink(this.options.directory, { ...connected, state: 'connected' });
-      if (!record.principal) await this.issueBinding({ ...connected, state: 'connected' });
-      else await transport()?.releaseHeldPrincipal(record.principal.lid);
+      await writeWhatsAppLink(this.options.directory, { ...connected, state: 'connected', profilePending: true });
+      await this.finishConnectedSetup();
     } else if (connection === 'close' && record.pairing) {
       // Do not teardown inside the transport's own awaited event: teardown waits for this event.
       this.arm(Date.now());
@@ -343,6 +374,7 @@ export class WhatsAppLinking {
     this.timer = undefined;
     const hadAdapter = transport() !== undefined;
     await stopChannelAdapter('whatsapp');
+    await this.adapterStateTail;
     this.pairingDeadline = undefined;
     const authFile = path.join(this.options.directory, 'auth.sqlite');
     const exists = await fs.access(authFile).then(
@@ -393,6 +425,7 @@ export class WhatsAppLinking {
       if (adapter) await adapter.logout();
       else await logoutWhatsAppAccount({ directory: this.options.directory });
       await stopChannelAdapter('whatsapp');
+      await this.adapterStateTail;
       const record = await readWhatsAppLink(this.options.directory);
       this.pairingDeadline = undefined;
       if (record) this.discardPending(record);
@@ -407,6 +440,9 @@ export class WhatsAppLinking {
 }
 
 let runtime: WhatsAppLinking | undefined;
+registerChatLifecycleTask('gws-ea-whatsapp:link', async () => {
+  await runtime?.resumeConnectedSetup();
+});
 onHostShutdown(() => {
   runtime?.close();
   runtime = undefined;

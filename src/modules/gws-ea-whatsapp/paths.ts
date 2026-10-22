@@ -20,7 +20,8 @@ export interface WhatsAppLink {
   readonly number?: string;
   readonly principalNumber?: string;
   readonly pairing?: { readonly expiresAt: number; readonly previousState: 'needs-relink' | null };
-  readonly binding?: { readonly code: string; readonly expiresAt: number };
+  readonly binding?: { readonly code: string; readonly expiresAt: number; readonly notified?: boolean };
+  readonly profilePending?: boolean;
   readonly outage?: { readonly id: string; readonly notified?: boolean };
   readonly account?: WhatsAppPerson;
   readonly principal?: WhatsAppPerson;
@@ -120,7 +121,9 @@ export async function readWhatsAppLink(directory: string): Promise<WhatsAppLink 
         typeof value.binding.code !== 'string' ||
         !/^[A-Z0-9-]{8,32}$/u.test(value.binding.code) ||
         typeof value.binding.expiresAt !== 'number' ||
-        !Number.isFinite(value.binding.expiresAt))) ||
+        !Number.isFinite(value.binding.expiresAt) ||
+        (value.binding.notified !== undefined && typeof value.binding.notified !== 'boolean'))) ||
+    (value.profilePending !== undefined && typeof value.profilePending !== 'boolean') ||
     (value.outage !== undefined &&
       (!isRecord(value.outage) ||
         typeof value.outage.id !== 'string' ||

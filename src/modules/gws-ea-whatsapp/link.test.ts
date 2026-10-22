@@ -60,6 +60,9 @@ import { dispatch } from '../../cli/dispatch.js';
 import { registerWhatsAppObserver, type WhatsAppLinkNotice } from './observers.js';
 import * as channelRegistry from '../../channels/channel-registry.js';
 import * as instanceRegistry from '../../gws-ea/registry.js';
+import * as mainNotes from '../gws-ea-profile/main-note.js';
+import { sweepChatLifecycle } from '../gws-ea-chats/lifecycle.js';
+import { chatsMigration } from '../gws-ea-chats/migration.js';
 
 const instanceId = '12345678-1234-4234-8234-123456789abc';
 let root: string;
@@ -275,6 +278,123 @@ async function connect() {
   return { socket, code };
 }
 
+async function enableLinkRecoveryLifecycle(): Promise<void> {
+  await runMigrations(getDb(), [chatsMigration]);
+  const options = linking.options;
+  linking.close();
+  vi.stubEnv('GWS_EA_WHATSAPP_DIR', options.directory);
+  vi.stubEnv('GWS_EA_CONFIG_ROOT', options.paths.configRoot);
+  vi.stubEnv('GWS_EA_STATE_ROOT', options.paths.stateRoot);
+  vi.stubEnv('GWS_EA_INSTANCE_ID', instanceId);
+  linking = whatsAppLinking();
+}
+
+it.each(['new link', 'bound re-link'] as const)(
+  'finishes a %s after a transient profile failure through the lifecycle without another connection event',
+  async (attempt) => {
+    await enableLinkRecoveryLifecycle();
+    if (attempt === 'bound re-link') {
+      const { socket, code } = await connect();
+      await socket.emit('messages.upsert', { type: 'notify', messages: [principalMessage('original-proof', code)] });
+      await socket.emit('connection.update', {
+        connection: 'close',
+        lastDisconnect: {
+          error: Object.assign(new Error('logged out'), { output: { statusCode: 401 } }),
+          date: new Date(),
+        },
+      });
+      await marked('relink', 'Please re-link WhatsApp.');
+      await linking.link(undefined, undefined, { ...caller, principalMessages: ['relink'] });
+    } else {
+      await marked('numbers', 'Your number +15550000000, mine +447700900123.');
+      await linking.link('+15550000000', '+447700900123', caller);
+    }
+    const socket = sockets.at(-1)!;
+    const profile = vi.spyOn(socket, 'updateProfileStatus').mockRejectedValueOnce(new Error('Profile unavailable'));
+    try {
+      await socket.emit('connection.update', { connection: 'open' });
+      expect(socket.profileAbout).toBeUndefined();
+      await sweepChatLifecycle();
+      await sweepChatLifecycle();
+      expect(socket.profileName).toBe('Aya');
+      expect(socket.profileAbout).toBe('Personal assistant');
+      expect(await linking.status()).toMatchObject({ state: 'connected' });
+      expect((await readWhatsAppLink(linking.options.directory))?.pairing).toBeUndefined();
+      const notes = (await mailboxRows()).filter(({ id }) => id.startsWith('whatsapp-link:bind:'));
+      expect(notes).toHaveLength(1);
+      if (attempt === 'new link') {
+        expect(await isVerifiedPrincipalUser('whatsapp:12000')).toBe(false);
+        const code = /binding code: ([A-Z0-9-]+)/u.exec(notes[0].content)?.[1];
+        if (!code) throw new Error('Recovered binding code did not reach main');
+        await socket.emit('messages.upsert', { type: 'notify', messages: [principalMessage('recovered-proof', code)] });
+      }
+      expect(await isVerifiedPrincipalUser('whatsapp:12000')).toBe(true);
+      expect(socket.sends).toHaveLength(0);
+      expect(sockets).toHaveLength(attempt === 'new link' ? 1 : 2);
+    } finally {
+      profile.mockRestore();
+    }
+  },
+);
+
+it('drains an in-flight principal proof during unlink without deadlocking or restoring removed authority', async () => {
+  const { socket, code } = await connect();
+  let releaseLookup!: () => void;
+  socket.lookupGate = new Promise<void>((resolve) => {
+    releaseLookup = resolve;
+  });
+  socket.usync.set('447700900123@s.whatsapp.net', '12000@lid');
+  const proof = socket.emit('messages.upsert', {
+    type: 'notify',
+    messages: [
+      incoming('proof-during-unlink', code, {
+        key: { id: 'proof-during-unlink', remoteJid: '447700900123@s.whatsapp.net' },
+      }),
+    ],
+  });
+  await vi.waitFor(() => expect(socket.lookups).toContain('447700900123@s.whatsapp.net'));
+  const unlinked = linking.unlink();
+  await vi.waitFor(() => expect(socket.ended).toBe(true));
+  releaseLookup();
+  const outcome = await Promise.race([
+    Promise.all([proof, unlinked]).then(() => 'completed'),
+    new Promise<string>((resolve) => {
+      setTimeout(() => resolve('deadlocked'), 1500).unref();
+    }),
+  ]);
+  expect(outcome).toBe('completed');
+  expect(await linking.status()).toEqual({ state: 'unlinked' });
+  expect(fs.existsSync(path.join(linking.options.directory, 'link.json'))).toBe(false);
+  expect(await isVerifiedPrincipalUser('whatsapp:12000')).toBe(false);
+  expect(socket.sends).toHaveLength(0);
+});
+
+it('retries a failed binding note in the lifecycle using the saved unexpired code and one main note', async () => {
+  await enableLinkRecoveryLifecycle();
+  await marked('numbers', 'Your number +15550000000, mine +447700900123.');
+  await linking.link('+15550000000', '+447700900123', caller);
+  const socket = sockets.at(-1)!;
+  const note = vi.spyOn(mainNotes, 'writeNoteForMain').mockRejectedValueOnce(new Error('Main mailbox unavailable'));
+  try {
+    await socket.emit('connection.update', { connection: 'open' });
+    const pending = (await readWhatsAppLink(linking.options.directory))?.binding;
+    expect(pending).toBeDefined();
+    expect((await mailboxRows()).some(({ id }) => id.startsWith('whatsapp-link:bind:'))).toBe(false);
+    await sweepChatLifecycle();
+    await sweepChatLifecycle();
+    expect((await readWhatsAppLink(linking.options.directory))?.binding).toMatchObject(pending!);
+    const notes = (await mailboxRows()).filter(({ id }) => id.startsWith('whatsapp-link:bind:'));
+    expect(notes).toHaveLength(1);
+    expect(notes[0].id).toBe(`whatsapp-link:bind:${pending!.code}`);
+    expect(notes[0].content).toContain(pending!.code);
+    expect(await isVerifiedPrincipalUser('whatsapp:12000')).toBe(false);
+    expect(sockets).toHaveLength(1);
+    expect(socket.sends).toHaveLength(0);
+  } finally {
+    note.mockRestore();
+  }
+});
+
 it.each([
   ['number absent', 'My number is +447700900123.', '+15550000000', '+447700900123', false, /did not give/],
   ['equal numbers', 'Use +15550000000 for both.', '+15550000000', '+15550000000', false, /own number/],
@@ -330,6 +450,7 @@ it('refuses a connected account with a different authenticated number', async ()
 });
 
 it('binds neither another number, a wrong code, a forwarded code nor an expired code, and renews proof without pairing again', async () => {
+  await enableLinkRecoveryLifecycle();
   const { socket, code } = await connect();
   await socket.emit('messages.upsert', {
     type: 'notify',
@@ -358,6 +479,9 @@ it('binds neither another number, a wrong code, a forwarded code nor an expired 
   });
   await socket.emit('messages.upsert', { type: 'notify', messages: [principalMessage('expired', code)] });
   expect((await linking.status()).principal).toBeUndefined();
+  await sweepChatLifecycle();
+  expect((await readWhatsAppLink(linking.options.directory))?.binding?.code).toBe(code);
+  expect((await mailboxRows()).filter(({ id }) => id.startsWith('whatsapp-link:bind:'))).toHaveLength(1);
   await linking.link('+15550000000', '+447700900123', caller);
   const renewed = await readWhatsAppLink(linking.options.directory);
   expect(renewed?.binding?.code).not.toBe(code);

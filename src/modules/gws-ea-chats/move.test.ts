@@ -1017,7 +1017,7 @@ it('marks the job retiring in the detach transaction and resumes cleanup after a
   await host.move.moveChat(chatId);
   const previous = await jobSession();
   retirementFails = true;
-  await expect(host.hold.detachChat(chatId)).rejects.toThrow('OneCLI did not answer');
+  await expect(host.hold.detachChat(chatId)).resolves.toBeUndefined();
   retirementFails = false;
   expect((await host.jobs.getJobAgentForChat(chatId))?.state).toBe('retiring');
   await host.join.decideJoin({

@@ -18,10 +18,6 @@ vi.mock('../../channels/channel-registry.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../../channels/channel-registry.js')>();
   return { ...actual, registerChannelAdapter: vi.fn(actual.registerChannelAdapter) };
 });
-vi.mock('../../delivery.js', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('../../delivery.js')>();
-  return { ...actual, registerPostDeliveryHook: vi.fn(actual.registerPostDeliveryHook) };
-});
 const originalCwd = process.cwd();
 let root: string;
 beforeEach(async () => {

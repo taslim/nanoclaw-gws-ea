@@ -270,6 +270,30 @@ it('withdraws its own partially applied booking when the calendar reports failur
   expect(refusalU11(await sendU11(session, 'chat_book', fields))).toContain('calendar connection lost');
   expect(calendar.live()).toEqual([]);
   expect(await getDb().all('SELECT * FROM gws_ea_chat_bookings')).toEqual([]);
+  expect(await getDb().all('SELECT * FROM gws_ea_chat_booking_requests')).toEqual([]);
+});
+it('reports a failed booking whose partial Google write could not be withdrawn without creating it again', async () => {
+  calendar.failNext({ op: 'insert', error: new Error('calendar connection lost'), afterApplying: true });
+  calendar.failNext({ op: 'delete', error: new Error('withdrawal unavailable') });
+  expect(refusalU11(await sendU11(session, 'chat_book', fields, 'unwithdrawn-booking'))).toContain(
+    'calendar connection lost',
+  );
+  expect(calendar.live()).toHaveLength(1);
+  const resumed = createChatSchedulingTools({ calendar: () => calendar });
+  await resumed.resumePending();
+  await resumed.resumePending();
+  expect(calendar.writes.filter((write) => write.op === 'insert')).toHaveLength(1);
+  expect(calendarNotes(main, 'booked')).toEqual([]);
+  const inbox = new Database(inboundDbPath(main.agent_group_id, main.id), { readonly: true });
+  try {
+    const notes = inbox.prepare("SELECT content FROM messages_in WHERE id LIKE 'chat-booking-unconfirmed-%'").all() as {
+      content: string;
+    }[];
+    expect(notes).toHaveLength(1);
+    expect(notes[0].content).toContain(calendar.live()[0].id);
+  } finally {
+    inbox.close();
+  }
 });
 it('serializes real email and chat bookings so only one can take the same free slot', async () => {
   vi.useRealTimers();
@@ -422,12 +446,13 @@ it.each(['patch', 'delete'] as const)(
   },
 );
 
-it.each(['patch', 'delete'] as const)(
+it.each(['insert', 'patch', 'delete'] as const)(
   'replays a confirmed %s after its action-response write was interrupted',
   async (op) => {
-    const booked = dataU11(await sendU11(session, 'chat_book', fields));
-    const action = op === 'patch' ? 'chat_change_booking' : 'chat_cancel_booking';
-    const request = { booking: booked.booking, ...(op === 'patch' ? { start: LATER } : {}) };
+    const booked = op === 'insert' ? undefined : dataU11(await sendU11(session, 'chat_book', fields));
+    const action = { insert: 'chat_book', patch: 'chat_change_booking', delete: 'chat_cancel_booking' }[op];
+    const request =
+      op === 'insert' ? fields : { booking: booked?.booking, ...(op === 'patch' ? { start: LATER } : {}) };
     const id = `answer-write-${op}`;
     const host = await import('../../session-manager.js');
     const write = host.writeSessionMessage;
@@ -442,7 +467,52 @@ it.each(['patch', 'delete'] as const)(
     await createChatSchedulingTools({ calendar: () => calendar }).resumePending();
     expect((await sendU11(session, action, request, id)).ok).toBe(true);
     expect(calendar.writes.filter((record) => record.op === op)).toHaveLength(1);
-    expect(calendarNotes(main, op === 'patch' ? 'changed' : 'cancelled')).toHaveLength(1);
+    expect(calendarNotes(main, { insert: 'booked', patch: 'changed', delete: 'cancelled' }[op])).toHaveLength(1);
+  },
+);
+it.each(['main mailbox', 'matter placement'] as const)(
+  'keeps a new booking pending after %s fails and resumes its report without booking twice',
+  async (failure) => {
+    const id = 'initial-book-report';
+    const host = await import('../../session-manager.js');
+    const matters = await import('../gws-ea-matters/db.js');
+    const write = host.writeSessionMessage;
+    const interrupted =
+      failure === 'main mailbox'
+        ? vi.spyOn(host, 'writeSessionMessage').mockImplementation(async (...args) => {
+            if (args[2].id.includes('-booked-')) throw new Error('main mailbox temporarily unavailable');
+            return write(...args);
+          })
+        : vi.spyOn(matters, 'placeInMatter').mockRejectedValue(new Error('matter placement temporarily unavailable'));
+    const handler = getDeliveryAction('chat_book');
+    if (!handler) throw new Error('No calendar action');
+    await handler({ ...fields, action: 'chat_book', requestId: id }, session);
+    const inbox = new Database(inboundDbPath(session.agent_group_id, session.id), { readonly: true });
+    try {
+      expect(inbox.prepare('SELECT id FROM messages_in WHERE id=?').get(`action-resp-${id}`)).toBeUndefined();
+      expect(calendarNotes(main, 'booked')).toEqual([]);
+      expect(calendar.live()).toHaveLength(1);
+      expect(
+        await getDb().get('SELECT action,applied,reported FROM gws_ea_chat_booking_requests WHERE request_id=?', id),
+      ).toEqual({ action: 'book', applied: 1, reported: 0 });
+      interrupted.mockRestore();
+      const resumed = createChatSchedulingTools({ calendar: () => calendar });
+      await resumed.resumePending();
+      await resumed.resumePending();
+      const response = await sendU11(session, 'chat_book', fields, id);
+      const booked = dataU11(response);
+      expect(booked.message).toContain('main hears');
+      expect(await sendU11(session, 'chat_book', fields, id)).toEqual(response);
+      expect(calendar.writes.filter((record) => record.op === 'insert')).toHaveLength(1);
+      expect(calendarNotes(main, 'booked')).toHaveLength(1);
+      expect(calendarNotes(main, 'booked')[0].content).toContain(String(booked.booking));
+      expect(calendarNotes(main, 'booked')[0].content).toContain('Venue visit');
+      expect(
+        await getDb().get('SELECT reported,answered FROM gws_ea_chat_booking_requests WHERE request_id=?', id),
+      ).toEqual({ reported: 1, answered: 1 });
+    } finally {
+      inbox.close();
+    }
   },
 );
 it('keeps a confirmed mutation pending until main receives its one durable note', async () => {
@@ -499,7 +569,9 @@ it.each(['patch', 'delete'] as const)(
         ),
       ),
     ).toContain('permission refused');
-    expect(await getDb().all('SELECT request_id FROM gws_ea_chat_booking_requests')).toEqual([]);
+    expect(
+      await getDb().all('SELECT request_id FROM gws_ea_chat_booking_requests WHERE request_id=?', `refused-${op}`),
+    ).toEqual([]);
     expect(calendarNotes(main, op === 'patch' ? 'changed' : 'cancelled')).toEqual([]);
   },
 );
@@ -544,4 +616,38 @@ it('does not later resume an unapplied mutation after its tool received a termin
   await createChatSchedulingTools({ calendar: () => calendar }).resumePending();
   expect(calendar.writes.filter((write) => write.op === 'patch')).toEqual([]);
   expect(calendarNotes(main, 'changed')).toEqual([]);
+});
+
+it('reports a confirmed initial booking after its serving session closes without another event or chat response', async () => {
+  const id = 'closed-initial-book';
+  const host = await import('../../session-manager.js');
+  const write = host.writeSessionMessage;
+  const interrupted = vi.spyOn(host, 'writeSessionMessage').mockImplementation(async (...args) => {
+    if (args[2].id.includes('-booked-')) throw new Error('Main mailbox unavailable');
+    return write(...args);
+  });
+  const handler = getDeliveryAction('chat_book');
+  if (!handler) throw new Error('No calendar action');
+  try {
+    await handler({ ...fields, action: 'chat_book', requestId: id }, session);
+    expect(calendar.live()).toHaveLength(1);
+    expect(calendarNotes(main, 'booked')).toEqual([]);
+  } finally {
+    interrupted.mockRestore();
+  }
+  await getDb().run("UPDATE sessions SET status='closed' WHERE id=?", session.id);
+  const recovered = createChatSchedulingTools({ calendar: () => calendar });
+  await recovered.resumePending();
+  await recovered.resumePending();
+  expect(calendar.writes.filter((record) => record.op === 'insert')).toHaveLength(1);
+  expect(calendarNotes(main, 'booked')).toHaveLength(1);
+  expect(
+    await getDb().get('SELECT applied,reported,answered FROM gws_ea_chat_booking_requests WHERE request_id=?', id),
+  ).toEqual({ applied: 1, reported: 1, answered: 1 });
+  const chat = new Database(inboundDbPath(session.agent_group_id, session.id), { readonly: true });
+  try {
+    expect(chat.prepare('SELECT id FROM messages_in WHERE id=?').get(`action-resp-${id}`)).toBeUndefined();
+  } finally {
+    chat.close();
+  }
 });

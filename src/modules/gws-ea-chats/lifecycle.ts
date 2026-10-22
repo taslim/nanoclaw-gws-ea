@@ -7,12 +7,8 @@ import { getChat, listChats } from './db.js';
 import { expireAskingChats, releaseChatMessages, settleChatMessages } from './hold.js';
 import { notifyAskingChat } from './join.js';
 
-const lifecycleTasks = new Map<string, () => Promise<void>>();
-export function registerChatLifecycleTask(id: string, task: () => Promise<void>): void {
-  if (lifecycleTasks.has(id)) throw new Error(`Chat lifecycle task already registered: ${id}`);
-  lifecycleTasks.set(id, task);
-}
-/** A durable item remains pending when its external work fails; unrelated items still progress. */
+import { lifecycleTasks } from './lifecycle-tasks.js';
+
 async function recover(id: string, work: () => Promise<void>): Promise<void> {
   try {
     await work();
