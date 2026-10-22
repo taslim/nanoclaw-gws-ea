@@ -33,7 +33,7 @@ async function ownsDebugger(owned: OwnedChrome, signal: AbortSignal): Promise<bo
   const output = await new Promise<string>((resolve, reject) => {
     execFile(
       'lsof',
-      ['-w', '-nP', '-a', `-iTCP:${debuggerPort}`, '-sTCP:LISTEN', '-Fpn'],
+      ['-w', '-nP', '-a', `-iTCP:${debuggerPort}`, '-sTCP:LISTEN', '-Fpfn'],
       { signal, timeout: 2_000, maxBuffer: 64 * 1024, encoding: 'utf8' },
       (error, stdout, stderr) => {
         // lsof uses status 1 for an empty selection. Any diagnostics or other failure is unobservable.

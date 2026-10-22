@@ -58,11 +58,12 @@ function listen(output = `p${pid}\nf12\nn127.0.0.1:${port}\n`, error: ExecFileEx
   lsof.mockImplementation(
     (
       _command: string,
-      _args: string[],
+      args: string[],
       _options: unknown,
       callback: (error: ExecFileException | null, stdout: string, stderr: string) => void,
     ) => {
-      callback(error, output, stderr);
+      const fields = args.find((arg) => arg.startsWith('-F'))?.slice(2);
+      callback(error, fields?.includes('f') ? output : output.replace(/^f[^\n]*\n/gm, ''), stderr);
     },
   );
 }
@@ -104,7 +105,7 @@ describe('owned loopback Chrome attachment', () => {
     expect(lsof).toHaveBeenCalledTimes(2);
     expect(lsof.mock.calls[0]?.slice(0, 2)).toEqual([
       'lsof',
-      ['-w', '-nP', '-a', `-iTCP:${port}`, '-sTCP:LISTEN', '-Fpn'],
+      ['-w', '-nP', '-a', `-iTCP:${port}`, '-sTCP:LISTEN', '-Fpfn'],
     ]);
     expect(attach).toHaveBeenCalledExactlyOnceWith(endpoint, { isLocal: true, artifactsDir: paths.artifactsDir });
     expect(connection.debuggerPort).toBe(port);
