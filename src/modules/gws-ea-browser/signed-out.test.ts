@@ -22,7 +22,12 @@ describe.skipIf(!chromePath)('native signed-out watch pages', { timeout: 30_000 
     await prepareChromeProfile(paths);
     connection = await connectChrome(await spawnChrome({ chromePath, paths, proxyUrl: 'http://127.0.0.1:9' }), paths);
     await connection.context.addCookies([
-      { name: 'assistant-session', value: 'persistent-only', url: 'https://fixture.example' },
+      {
+        name: 'assistant-session',
+        value: 'persistent-only',
+        url: 'https://fixture.example',
+        expires: Math.floor(Date.now() / 1000) + 3_600,
+      },
     ]);
   });
 
