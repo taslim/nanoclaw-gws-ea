@@ -1223,7 +1223,7 @@ describe.skipIf(!chromePath)('native authorized signup and password change', { t
       expect(await page.locator('h1').textContent()).toBe('Join');
     }, 30_000);
 
-    it('keeps a post-fill consent stop uncertain and refuses a refill after the grant', async () => {
+    it('keeps a post-fill consent stop uncertain and refuses refills before and after the grant', async () => {
       await page.goto(`${SITE}/waiver-on-fill`);
       const authority = await signupAuthority();
       const held = await fill(authority, await refs(SIGNUP));
@@ -1246,13 +1246,17 @@ describe.skipIf(!chromePath)('native authorized signup and password change', { t
       });
       const password = await candidatePassword(authority.id);
       expect(await pageText()).not.toContain(password);
+      const pending = await fill(authority, await refs(SIGNUP));
+      expect(pending).toEqual({ status: 'outcome_unknown' });
+      expect(posts).toEqual([]);
+      expect(await attempts.get(authority.id)).toMatchObject({ phase: 'unknown' });
       await grant();
       const done = await fill(authority, await refs(SIGNUP));
       expect(done).toEqual({ status: 'outcome_unknown' });
       expect(posts).toEqual([]);
       // One candidate, one disclosure's value, and no answer that carries it.
       expect(fake.calls.filter((call) => call === 'create')).toHaveLength(1);
-      expect(JSON.stringify([held, done])).not.toContain(password);
+      expect(JSON.stringify([held, pending, done])).not.toContain(password);
     }, 30_000);
 
     for (const address of [
@@ -1338,15 +1342,6 @@ describe.skipIf(!chromePath)('native authorized signup and password change', { t
           { attempts: restarted },
         ),
       ).toEqual({ status: 'inconclusive' });
-    }, 30_000);
-
-    it('refuses a refill while the principal has not answered', async () => {
-      await page.goto(`${SITE}/waiver-on-fill`);
-      const authority = await signupAuthority();
-      await fill(authority, await refs(SIGNUP));
-      expect(await fill(authority, await refs(SIGNUP))).toEqual({ status: 'outcome_unknown' });
-      expect(posts).toEqual([]);
-      expect(await attempts.get(authority.id)).toMatchObject({ phase: 'unknown' });
     }, 30_000);
 
     for (const [path, outcome, why] of [

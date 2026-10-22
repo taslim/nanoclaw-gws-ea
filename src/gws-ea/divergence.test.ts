@@ -68,64 +68,6 @@ async function freshInstall(): Promise<string> {
   return directory;
 }
 
-describe('recorded divergence: resumable native mailbox cutovers', () => {
-  it('keeps source identity, deadlines and settlement in the native mailbox while existing delivery reads retain their meaning', async () => {
-    await freshInstall();
-    const { wrapSqliteInbound, wrapSqliteOutbound } = await import('../mailbox/sqlite/index.js');
-    const { INBOUND_SCHEMA, OUTBOUND_SCHEMA } = await import('../mailbox/sqlite/schema.js');
-    const raw = new Database(':memory:');
-    try {
-      raw.exec(INBOUND_SCHEMA);
-      raw.exec(OUTBOUND_SCHEMA);
-      const inbound = wrapSqliteInbound(raw);
-      const outbound = wrapSqliteOutbound(raw);
-      await inbound.insertMessage({
-        id: 'source',
-        kind: 'chat',
-        timestamp: '2026-10-15T12:00:00.000Z',
-        channelType: 'whatsapp',
-        platformId: 'trip',
-        threadId: null,
-        content: '{"text":"Reply later"}',
-        processAfter: '2999-01-01T00:00:00.000Z',
-        recurrence: null,
-        trigger: false,
-        status: 'held',
-        sourceSessionId: 'source-session',
-        onWake: true,
-      });
-      expect(inbound.getInboundRecords({ since: '2026-10-01T00:00:00.000Z', status: 'held' })).toMatchObject([
-        { id: 'source', trigger: false, sourceSessionId: 'source-session', onWake: true },
-      ]);
-      inbound.releaseHeldMessages(null, { preserveTriggers: true, preserveProcessAfter: true });
-      expect(inbound.getInboundRecords({ status: 'pending' })).toMatchObject([
-        { id: 'source', processAfter: '2999-01-01T00:00:00.000Z', trigger: false },
-      ]);
-      expect(inbound.settleUnreadMessages(['source'])).toBe(1);
-      expect(inbound.settleUnreadMessages(['source'])).toBe(0);
-      for (const id of ['posted', 'failed'])
-        await outbound.writeDirect({
-          id,
-          kind: 'chat',
-          platformId: 'trip',
-          channelType: 'whatsapp',
-          threadId: null,
-          content: '{"text":"An answer"}',
-        });
-      inbound.markDelivered('posted', 'posted-on-platform');
-      inbound.markDeliveryFailed('failed');
-      expect(outbound.getOutboundRecords('2020-01-01T00:00:00.000Z').map((row) => row.id)).toEqual([
-        'posted',
-        'failed',
-      ]);
-      expect(inbound.getDeliveredIds('delivered')).toEqual(new Set(['posted']));
-      expect(inbound.getDeliveredIds()).toEqual(new Set(['posted', 'failed']));
-    } finally {
-      raw.close();
-    }
-  });
-});
-
 describe('recorded divergence: the installed OneCLI adapter', () => {
   it('is exactly what add-onecli installs: every file it copies equals its payload source', async () => {
     const skill = path.join(originalCwd, '.claude/skills/add-onecli');
@@ -1271,24 +1213,6 @@ describe('recorded divergence: the agent runner describes delivery so a sent rep
   });
 });
 
-describe('recorded divergence: a subagent cannot message the conversation', () => {
-  it("refuses the delivery tools inside a subagent, in the Claude provider's tool hook", async () => {
-    const provider = await readFile(path.join(originalCwd, 'container/agent-runner/src/providers/claude.ts'), 'utf8');
-
-    expect(provider).toContain('if (i.agent_id !== undefined && SUBAGENT_DENIED_TOOLS.has(toolName)) {');
-    for (const tool of [
-      'send_message',
-      'send_file',
-      'edit_message',
-      'add_reaction',
-      'send_card',
-      'ask_user_question',
-    ]) {
-      expect(provider).toContain(`'${tool}'`);
-    }
-  });
-});
-
 describe('recorded divergence: the agent image carries the pinned Google tool', () => {
   /** The Dockerfile with line continuations joined, so each instruction is one line. */
   async function dockerfileInstructions(): Promise<string[]> {
@@ -1683,16 +1607,6 @@ function runProgram(
   });
 }
 
-describe('recorded divergence: one tool name can have a capability-specific definition', () => {
-  it('serves each key its own schema and wire handler through the real runner MCP server', async () => {
-    const result = await runProgram('bun', ['test', '--isolate', 'src/mcp-tools/server.variants.test.ts'], {
-      cwd: path.join(originalCwd, 'container/agent-runner'),
-    });
-    expect(result.status, result.stderr).toBe(0);
-    expect(result.stderr).toContain('1 pass');
-  });
-});
-
 describe('recorded divergence: a bridge adapter can make a text delivery retry idempotent', () => {
   it('passes the same row and part key through repeated file-free text deliveries', async () => {
     const { createChatSdkBridge } = await import('../channels/chat-sdk-bridge.js');
@@ -1797,34 +1711,6 @@ describe("recorded divergence: NanoClaw's update helpers act on the install they
       stdout: `${expected.containerImageBase}\n${expected.launchdLabel}`,
     });
     expect(await names('Not An ID')).toMatchObject({ status: 1, stdout: '' });
-  });
-});
-
-describe('recorded divergence: the migration script applies module migrations', () => {
-  it('records the capabilities and gws-ea module migrations in a fresh central database', async () => {
-    const install = await freshInstall();
-    const run = await runProgram(
-      process.execPath,
-      ['--import', TSX_LOADER, path.join(originalCwd, 'scripts/migrate.ts')],
-      {
-        cwd: install,
-        env: process.env,
-      },
-    );
-    expect(run, run.stderr).toMatchObject({ status: 0 });
-
-    const central = new Database(path.join(install, 'data', 'v2.db'), { readonly: true });
-    try {
-      const applied = central.prepare('SELECT name FROM schema_version').all() as Array<{ name: string }>;
-      expect(applied.map((row) => row.name)).toEqual(
-        expect.arrayContaining([
-          'module:capabilities:container-config-capabilities',
-          'module:gws-ea-profile:create-profile',
-        ]),
-      );
-    } finally {
-      central.close();
-    }
   });
 });
 

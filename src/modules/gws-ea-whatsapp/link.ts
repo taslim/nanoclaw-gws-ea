@@ -20,9 +20,6 @@ import { requirePrincipalDirectMessage } from '../gws-ea-profile/marks.js';
 import { writeNoteForMain } from '../gws-ea-profile/main-note.js';
 import { registerChatLifecycleTask } from '../gws-ea-chats/lifecycle-tasks.js';
 import type { WhatsAppAdapter } from './adapter.js';
-import { WhatsAppIndex } from './index-store.js';
-import { WhatsAppAuthStore } from './auth-store.js';
-import { logoutWhatsAppAccount } from './logout.js';
 import {
   observeWhatsAppLinkNotice,
   registerWhatsAppObserver,
@@ -357,9 +354,10 @@ export class WhatsAppLinking {
       await writeWhatsAppLink(this.options.directory, bound);
     }
   }
-  private discardPending(record: WhatsAppLink): void {
+  private async discardPending(record: WhatsAppLink): Promise<void> {
     const number = record.number;
     if (!number) throw new Error('The WhatsApp account number is missing');
+    const { WhatsAppIndex } = await import('./index-store.js');
     const index = new WhatsAppIndex(this.options.directory, () => `${number.slice(1)}@s.whatsapp.net`);
     try {
       index.discardUnrouted();
@@ -387,6 +385,7 @@ export class WhatsAppLinking {
     let authenticated = false;
     let logoutProven = false;
     if (exists) {
+      const { WhatsAppAuthStore } = await import('./auth-store.js');
       const auth = new WhatsAppAuthStore(this.options.directory);
       try {
         authenticated = auth.authenticated;
@@ -403,7 +402,7 @@ export class WhatsAppLinking {
       if (hadAdapter) await startChannelAdapter('whatsapp');
       return;
     }
-    this.discardPending(record);
+    await this.discardPending(record);
     if (!logoutProven) await fs.rm(authFile, { force: true });
     if (record.pairing.previousState) {
       const { pairing: _pairing, binding: _binding, ...previous } = record;
@@ -423,12 +422,15 @@ export class WhatsAppLinking {
       this.timer = undefined;
       const adapter = transport();
       if (adapter) await adapter.logout();
-      else await logoutWhatsAppAccount({ directory: this.options.directory });
+      else {
+        const { logoutWhatsAppAccount } = await import('./logout.js');
+        await logoutWhatsAppAccount({ directory: this.options.directory });
+      }
       await stopChannelAdapter('whatsapp');
       await this.adapterStateTail;
       const record = await readWhatsAppLink(this.options.directory);
       this.pairingDeadline = undefined;
-      if (record) this.discardPending(record);
+      if (record) await this.discardPending(record);
       if (record?.principal) await removeWhatsAppPrincipalBinding(record.principal.lid);
       // Keep the native proof until both the durable link and its exclusive claim are gone.
       await fs.rm(path.join(this.options.directory, 'link.json'), { force: true });

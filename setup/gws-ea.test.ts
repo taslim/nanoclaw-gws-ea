@@ -1,8 +1,9 @@
+import { spawnSync } from 'node:child_process';
 import { realpathSync } from 'node:fs';
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
@@ -706,4 +707,39 @@ describe("GWS-EA service control through NanoClaw's helpers", () => {
     ]);
     expect(loaded.get(`gui/${UID}/${b!.serviceIdentity}`)).toBe(true);
   });
+});
+
+describe('cold operator CLI startup', () => {
+  it('shows help without loading the WhatsApp transport', async () => {
+    const cwd = await mkdtemp(path.join(os.tmpdir(), 'gws-ea-cold-start-'));
+    try {
+      const loader = path.join(cwd, 'reject-whatsapp.mjs');
+      await writeFile(
+        loader,
+        `export function resolve(specifier, context, nextResolve) {
+          if (specifier.startsWith('@whiskeysockets/baileys'))
+            throw new Error('CLI help loaded the WhatsApp transport');
+          return nextResolve(specifier, context);
+        }`,
+      );
+      const preload = `import { register } from 'node:module'; register(${JSON.stringify(pathToFileURL(loader).href)});`;
+      const result = spawnSync(
+        process.execPath,
+        [
+          '--import',
+          fileURLToPath(new URL('../node_modules/tsx/dist/loader.mjs', import.meta.url)),
+          '--import',
+          `data:text/javascript,${encodeURIComponent(preload)}`,
+          fileURLToPath(new URL('./gws-ea.ts', import.meta.url)),
+          '--help',
+        ],
+        { cwd, encoding: 'utf8', timeout: 30_000, killSignal: 'SIGKILL' },
+      );
+      expect(result.error, result.stderr).toBeUndefined();
+      expect(result.status, result.stderr).toBe(0);
+      expect(result.stdout).toContain('gws-ea');
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  }, 35_000);
 });

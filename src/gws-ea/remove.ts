@@ -36,7 +36,7 @@ import { getInstallScopedNames } from '../install-slug.js';
 import { createWorkspaceEventsApi, type WorkspaceEventsApi } from '../modules/gws-ea-chat/subscription.js';
 import { GOOGLE_GRANT_FILE_NAME, type GoogleGrant } from '../modules/gws-ea-google/grant.js';
 import { readGoogleGrantFile } from '../modules/gws-ea-google/grant-file.js';
-import { logoutWhatsAppAccount, type WhatsAppLogoutOptions } from '../modules/gws-ea-whatsapp/logout.js';
+import type { WhatsAppLogoutOptions } from '../modules/gws-ea-whatsapp/logout.js';
 import {
   GoogleGrantRevokedError,
   GoogleScopeNotGrantedError,
@@ -994,6 +994,7 @@ async function removeLocked(
         }));
       }
       await reconcileUnlinkedReservation();
+      const { logoutWhatsAppAccount } = await import('../modules/gws-ea-whatsapp/logout.js');
       await logoutWhatsAppAccount({
         directory: whatsappDirectory,
         number: releaseReservation.exclusive_resource_claims.whatsapp_number,
