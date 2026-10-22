@@ -325,7 +325,6 @@ function validListenerPort(value: unknown): value is number {
   return typeof value === 'number' && Number.isInteger(value) && value > 0 && value <= 65_535;
 }
 
-/** Only listener identity crosses this comparison; health contains no private endpoint. */
 function observedListeners(health: unknown) {
   if (
     !isRecord(health) ||

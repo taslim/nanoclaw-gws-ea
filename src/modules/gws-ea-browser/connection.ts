@@ -25,7 +25,6 @@ export interface ChromeConnection {
   close(): Promise<void>;
 }
 
-/** Every listener must be the exact loopback endpoint of our live child. Empty is startup only. */
 async function ownsDebugger(owned: OwnedChrome, signal: AbortSignal): Promise<boolean> {
   signal.throwIfAborted();
   const { child, debuggerPort } = owned;
@@ -133,8 +132,6 @@ export async function connectChrome(
   child.once('error', onExit);
   const signal = AbortSignal.any([startupSignal, ended.signal]);
   let browser: Browser | undefined;
-  let retiring: Promise<void> | undefined;
-  const retire = (): Promise<void> => (retiring ??= stopChrome(child));
   const check = (): void => {
     signal.throwIfAborted();
     if (child.exitCode !== null || child.signalCode !== null) throw new Error('Chrome process unavailable');
@@ -154,7 +151,7 @@ export async function connectChrome(
       check();
       browser = await chromium.connectOverCDP(endpoint, { isLocal: true, artifactsDir: paths.artifactsDir });
       if (signal.aborted) {
-        await retire();
+        await stopChrome(child);
         void browser.close().catch(() => undefined);
         check();
       }
@@ -195,7 +192,7 @@ export async function connectChrome(
             } finally {
               if (timer) clearTimeout(timer);
             }
-            await retire();
+            await stopChrome(child);
             // Process retirement must remain reachable even if the client never finishes disposal.
             void attached.close().catch(() => undefined);
           })();
@@ -207,7 +204,7 @@ export async function connectChrome(
     check();
     return connection;
   } catch {
-    await retire();
+    await stopChrome(child);
     void browser?.close().catch(() => undefined);
     // eslint-disable-next-line preserve-caught-error -- Native causes can expose private debugger endpoints or browser identifiers.
     throw new Error('Chrome connection unavailable');

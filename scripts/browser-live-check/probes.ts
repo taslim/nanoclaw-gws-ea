@@ -266,15 +266,12 @@ export async function localProbes(
         screenshotTimedOut = true;
       }
       const { bounds } = await probeBrowser.session.send('Browser.getWindowBounds', { windowId });
+      let status: ProbeResult['status'];
+      if (!clicked || bounds.windowState !== 'minimized') status = 'failed';
+      else if (screenshotTimedOut) status = 'not-run';
+      else status = screenshotBytes > 0 ? 'passed' : 'failed';
       return {
-        status:
-          !clicked || bounds.windowState !== 'minimized'
-            ? 'failed'
-            : screenshotTimedOut
-              ? 'not-run'
-              : screenshotBytes > 0
-                ? 'passed'
-                : 'failed',
+        status,
         detail: {
           clicked,
           screenshotBytes,
