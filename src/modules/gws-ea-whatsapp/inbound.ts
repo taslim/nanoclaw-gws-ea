@@ -1,3 +1,4 @@
+import { chatAcceptsInbound } from '../gws-ea-chats/db.js';
 import { normalizeMessageContent, type WAMessage } from '@whiskeysockets/baileys';
 
 import type { ChannelSetup, InboundMessage } from '../../channels/adapter.js';
@@ -6,7 +7,7 @@ import { log } from '../../log.js';
 import type { WhatsAppSocket } from './adapter.js';
 import { normalizedJid, resolvePerson } from './identity.js';
 import type { WhatsAppIndex } from './index-store.js';
-import { chatMediaEligible, inboundMedia, isForwarded, messageContext, type WhatsAppAttachment } from './media.js';
+import { inboundMedia, isForwarded, messageContext, type WhatsAppAttachment } from './media.js';
 import { observeWhatsAppMessage } from './observers.js';
 import type { WhatsAppPerson } from './paths.js';
 
@@ -113,7 +114,12 @@ export function createWhatsAppInbound(options: WhatsAppInboundOptions) {
     const quoted = quotedId ? options.index.message(platformId, quotedId) : undefined;
     const reaction = message.reactionMessage;
     const target = reaction?.key?.id ? options.index.message(platformId, reaction.key.id) : undefined;
-    const attachments = await inboundMedia(raw, message, await chatMediaEligible(platformId), options.download);
+    const attachments = await inboundMedia(
+      raw,
+      message,
+      await chatAcceptsInbound('whatsapp', platformId),
+      options.download,
+    );
     const content: WhatsAppContent = {
       text: reaction ? '' : text,
       sender: senderName,

@@ -2,7 +2,6 @@ import type { proto, WAMessage } from '@whiskeysockets/baileys';
 
 import { extForMime } from '../../attachment-naming.js';
 import type { AudioSource, SpeechResult } from '../../channels/inbound-content.js';
-import { getDb } from '../../db/index.js';
 import { log } from '../../log.js';
 
 import { MAX_WHATSAPP_MEDIA_BYTES, WhatsAppMediaTooLargeError } from './media-limits.js';
@@ -17,17 +16,6 @@ export interface WhatsAppAttachment {
   readonly audioSource?: AudioSource;
   readonly speech?: SpeechResult;
   readonly downloadError?: 'too-large' | 'size-unknown' | 'chat-declined' | 'media-download-failed';
-}
-
-/** An unknown chat is eligible: its first voice note must reach voice preparation. */
-export async function chatMediaEligible(platformId: string): Promise<boolean> {
-  const db = getDb();
-  if (!(await db.hasTable('gws_ea_chats'))) return true;
-  const chat = await db.get<{ state: string }>(
-    `SELECT c.state FROM gws_ea_chats c JOIN messaging_groups m ON m.id=c.messaging_group_id WHERE m.channel_type='whatsapp' AND m.platform_id=?`,
-    platformId,
-  );
-  return chat?.state !== 'declined' && chat?.state !== 'detached';
 }
 
 export function messageContext(message: proto.IMessage): proto.IContextInfo | undefined {
