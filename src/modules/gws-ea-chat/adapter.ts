@@ -708,7 +708,7 @@ function gchatAudioSource(raw: Record<string, unknown>): AudioSource {
  */
 export const GCHAT_DEFAULTS: ChannelDefaults = {
   dm: { engageMode: 'pattern', engagePattern: '.', threads: false, unknownSenderPolicy: 'request_approval' },
-  group: { engageMode: 'module', threads: false, unknownSenderPolicy: 'public' },
+  group: { engageMode: 'mention', threads: true, unknownSenderPolicy: 'request_approval' },
   mentions: 'platform',
 };
 
