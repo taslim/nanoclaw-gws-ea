@@ -57,7 +57,10 @@ export async function chatAgentDrift(
   const problems: string[] = [];
   const stored = parseStoredCapabilities(config.capabilities, group.name);
   if (stored === 'all' || !sameKeys(stored, baseline)) problems.push('its stored capabilities differ from the release');
-  const expected = [...baseline, ...(kind === 'job' && (await hasBrowserAccess(groupId)) ? ['browser-delegate'] : [])];
+  const expected = [
+    ...baseline,
+    ...(kind === 'job' && (await hasBrowserAccess(groupId)) ? ['browser-delegate', 'browser-purchase-outcome'] : []),
+  ];
   if (!sameKeys([...(await getGroupCapabilities(groupId))], expected))
     problems.push('its effective capabilities differ from its authorized grants');
   if (config.cli_scope !== 'disabled') problems.push('its CLI is not disabled');

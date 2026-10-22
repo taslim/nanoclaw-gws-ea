@@ -407,7 +407,7 @@ it.each(['patch', 'delete'] as const)(
     const kind = op === 'patch' ? 'changed' : 'cancelled';
     expect(calendarNotes(main, kind)).toHaveLength(1);
     expect(calendarNotes(main, kind)[0].content).toContain(String(booked.booking));
-    expect(calendarNotes(main, kind)[0].content).toContain(op === 'patch' ? 'Wednesday 21 Oct' : 'Tuesday 20 Oct');
+    expect(calendarNotes(main, kind)[0].content).toContain(op === 'patch' ? 'Wednesday, Oct 21' : 'Tuesday, Oct 20');
     expect(await getDb().all('SELECT event_id FROM gws_ea_chat_bookings')).toHaveLength(op === 'patch' ? 1 : 0);
     expect(calendar.event(PRINCIPAL, String(booked.booking))).toMatchObject(
       op === 'patch' ? { start: { dateTime: '2026-10-21T12:00:00.000Z' } } : { status: 'cancelled' },

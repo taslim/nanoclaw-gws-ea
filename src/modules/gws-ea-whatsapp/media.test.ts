@@ -160,6 +160,7 @@ describe('WhatsApp media at the native voice boundary', () => {
       status: 'recognized',
       text: 'Find a table for six on Friday.',
       language: 'en',
+      inPrincipalPrivateConversation: false,
     });
     expect(boundary.transcribe.mock.calls[0][0]).toEqual(Buffer.from('real media boundary bytes'));
   });

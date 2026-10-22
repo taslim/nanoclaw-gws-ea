@@ -1,7 +1,11 @@
 import { getDb } from '../../db/connection.js';
 import { updateContainerConfigJson, updateContainerConfigScalars } from '../../db/container-configs.js';
 import { createAgentFromTemplate } from '../../templates/create-agent.js';
-import { getExternalChatAgentGroupId, recordExternalChatAgentGroupId } from '../gws-ea-profile/db.js';
+import {
+  getExternalChatAgentGroupId,
+  nameAssistantAgent,
+  recordExternalChatAgentGroupId,
+} from '../gws-ea-profile/db.js';
 import { reconcileChatGateway } from './gateway.js';
 import {
   CHAT_SHARED_SKILLS,
@@ -11,6 +15,7 @@ import {
 } from './shape.js';
 
 export async function reconcileChatShape(group: string, kind: 'external-chat' | 'job'): Promise<void> {
+  await nameAssistantAgent(group);
   await updateContainerConfigScalars(group, { cli_scope: 'disabled' });
   await updateContainerConfigJson(group, 'capabilities', [
     ...(kind === 'external-chat' ? EXTERNAL_CHAT_CAPABILITIES : JOB_CHAT_CAPABILITIES),

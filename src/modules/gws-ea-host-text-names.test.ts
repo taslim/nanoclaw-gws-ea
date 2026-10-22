@@ -44,6 +44,7 @@ import { BROWSER_CAPABILITIES } from './gws-ea-browser/group.js';
 import { BROWSER_DELEGATE_CAPABILITY, PURCHASE_OUTCOME_CAPABILITY } from './gws-ea-browser/guidance.js';
 import { OPERATIONAL_CODES } from './gws-ea-browser/operational-codes.js';
 import { EXTERNAL_EMAIL_CAPABILITIES } from './gws-ea-external-email/group.js';
+import { EXTERNAL_CHAT_CAPABILITIES, JOB_CHAT_CAPABILITIES } from './gws-ea-chat-agents/shape.js';
 import { GOG_COMMANDS } from './gws-ea-google/index.js';
 // They register the `ncl` commands host texts name.
 import '../cli/resources/index.js';
@@ -55,7 +56,7 @@ import './gws-ea-matters/index.js';
 
 const MODULES = path.resolve(import.meta.dirname);
 
-const READERS = ['main', 'external-email', 'browser', 'delegator', 'principal'] as const;
+const READERS = ['main', 'external-email', 'external-chat', 'job', 'browser', 'delegator', 'principal'] as const;
 type Reader = (typeof READERS)[number];
 
 function isReader(name: string): name is Reader {
@@ -75,6 +76,8 @@ const HOLDINGS: Readonly<Record<Reader, Holdings>> = {
   // policy version 1 lists main alone, and main records every unconfirmed purchase.
   main: { keys: new Set([...resolveCapabilities('all', 'main'), ...DELEGATE_KEYS]), ncl: 'global' },
   'external-email': { keys: new Set(EXTERNAL_EMAIL_CAPABILITIES), ncl: 'none' },
+  'external-chat': { keys: new Set(EXTERNAL_CHAT_CAPABILITIES), ncl: 'none' },
+  job: { keys: new Set(JOB_CHAT_CAPABILITIES), ncl: 'none' },
   browser: { keys: new Set(BROWSER_CAPABILITIES), ncl: 'none' },
   // Another group the browser setting lists: what the setting grants, and `cli_scope: group`.
   delegator: { keys: new Set(DELEGATE_KEYS), ncl: 'group' },
@@ -100,11 +103,20 @@ const POLICY: Policy = {
     'gws-ea-matters/tool-matter.ts': 'main',
     // The answers of main's calendar tools.
     'gws-ea-meetings/principal-events.ts': 'main',
+    'gws-ea-meetings/chat-calendar.ts': 'external-chat',
+    'gws-ea-chats/context.ts': 'external-chat',
+    'gws-ea-chat-agents/docs.ts': 'job',
     // `ncl people` and `ncl preferences` help, answers and guidance.
     'gws-ea-people/index.ts': 'main',
     'gws-ea-preferences/index.ts': 'main',
   },
   words: {
+    'gws-ea-chats/handoffs.ts': {
+      delivered_session_id: 'a column in the optional SQL delivery filter, read only by the host',
+    },
+    'gws-ea-workspace/docs-api.ts': {
+      nc_job_doc: 'the Drive app-property key used to find a document after an uncertain create',
+    },
     'gws-ea-browser/authentication-submit.ts': {
       not_inserted: 'a status in the script the host runs in the page, which only the host reads',
     },
@@ -224,8 +236,8 @@ const SNAKE = /(?<![\w.$/-])[a-z][a-z0-9]*(?:_[a-z0-9]+)+(?![\w(-])/gu;
 const BACKTICKED = /`([a-z]+)`/gu;
 const COMMAND = /\b(gog|ncl) ([a-z][a-z-]*)((?: [a-z][a-z-]*){0,2})/gu;
 
-function toolMention(name: string, key: string): Mention {
-  return { name, held: (holdings) => holdings.keys.has(key) };
+function toolMention(name: string, keys: ReadonlySet<string>): Mention {
+  return { name, held: (holdings) => [...keys].some((key) => holdings.keys.has(key)) };
 }
 
 function gogMention(service: string, words: readonly string[]): Mention {
@@ -397,6 +409,15 @@ describe('the host-text names check', () => {
   it('fails on a text that names a tool its reader does not hold', () => {
     expect(problems('gws-ea-fixture/main-notes.ts', `const NOTE = 'Offer the times free_time gives.';`)).toEqual([
       'gws-ea-fixture/main-notes.ts:1 free_time: main does not hold it',
+    ]);
+  });
+
+  it('checks chat variants against the chat reader and keeps main out of them', () => {
+    const source = "const NOTE = 'Use free_time, book and tell_main for this chat.';";
+    expect(problems('gws-ea-fixture/mixed.ts', '/** to: external-chat */\n' + source)).toEqual([]);
+    expect(problems('gws-ea-fixture/main-notes.ts', source)).toEqual([
+      'gws-ea-fixture/main-notes.ts:1 free_time: main does not hold it',
+      'gws-ea-fixture/main-notes.ts:1 tell_main: main does not hold it',
     ]);
   });
 

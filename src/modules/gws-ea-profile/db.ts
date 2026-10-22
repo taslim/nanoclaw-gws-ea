@@ -462,24 +462,37 @@ async function keepMainInPrincipalTimezone(mainAgentGroupId: string, timezone: s
 }
 
 /**
- * The assistant's own agents, main and whichever of `external-email` and the
- * browser exist, are named by its display name (KTD1): each one's container
- * config copy is derived here, from the groups the profile records, whenever
+ * The assistant's own agents, including its shared chat agent and live chat
+ * jobs, are named by its display name (KTD1): each one's container config
+ * copy is derived from the profile and job registry whenever
  * the profile is reconciled, so a rename reaches each on its next spawn.
  * Written only when it differs. Any other group keeps its own name.
  */
 async function keepAssistantAgentsNamed(name: string): Promise<void> {
   const row = await getDb().get<
-    Pick<GwsEaProfile, 'main_agent_group_id' | 'external_email_agent_group_id' | 'browser_agent_group_id'>
+    Pick<
+      GwsEaProfile,
+      | 'main_agent_group_id'
+      | 'external_email_agent_group_id'
+      | 'external_chat_agent_group_id'
+      | 'browser_agent_group_id'
+    >
   >(
-    'SELECT main_agent_group_id, external_email_agent_group_id, browser_agent_group_id FROM gws_ea_profile WHERE singleton = 1',
+    'SELECT main_agent_group_id, external_email_agent_group_id, external_chat_agent_group_id, browser_agent_group_id FROM gws_ea_profile WHERE singleton = 1',
   );
   for (const agentGroupId of [
     row?.main_agent_group_id,
     row?.external_email_agent_group_id,
+    row?.external_chat_agent_group_id,
     row?.browser_agent_group_id,
   ]) {
     if (agentGroupId) await keepAssistantNamed(agentGroupId, name);
+  }
+  if (await getDb().hasTable('gws_ea_job_agents')) {
+    const jobs = await getDb().all<{ agent_group_id: string }>(
+      "SELECT agent_group_id FROM gws_ea_job_agents WHERE state IN ('creating', 'active')",
+    );
+    for (const job of jobs) await keepAssistantNamed(job.agent_group_id, name);
   }
 }
 

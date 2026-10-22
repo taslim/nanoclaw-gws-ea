@@ -68,7 +68,10 @@ export const principalEventAction = defineGuardedAction({
   },
 });
 
-/** Chat calendar tools act only for the canonical current serving chat with main's calendar. */
+/**
+ * Chat calendar tools act only for the canonical current serving chat with main's calendar.
+ * to: external-chat, job
+ */
 export const chatCalendarAction = defineGuardedAction({
   action: 'gws_ea_meetings.chat_calendar',
   decide: async ({ actor }) => {

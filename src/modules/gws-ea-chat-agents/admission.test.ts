@@ -24,8 +24,13 @@ import { getGroupCapabilities, registerCapability } from '../../capabilities.js'
 import { processLock } from '../../community-portal/process-lock.js';
 import { readEnvFile } from '../../env.js';
 import { assertSessionAdmitted, buildMounts, syncSkillSymlinks } from '../../container-runner.js';
-import { configFromDb } from '../../container-config.js';
-import { ensureContainerConfig, getContainerConfig, updateContainerConfigJson } from '../../db/container-configs.js';
+import { configFromDb, materializeContainerJson } from '../../container-config.js';
+import {
+  ensureContainerConfig,
+  getContainerConfig,
+  updateContainerConfigJson,
+  updateContainerConfigScalars,
+} from '../../db/container-configs.js';
 import {
   closeDb,
   createAgentGroup,
@@ -46,7 +51,8 @@ import { resolveSystemSession } from '../../session-manager.js';
 import { hasBrowserAccess } from '../gws-ea-browser/access.js';
 import '../gws-ea-browser/guidance.js';
 import { readBrowserPolicy } from '../gws-ea-browser/policy.js';
-import { getExternalChatAgentGroupId, projectDocAudience } from '../gws-ea-profile/db.js';
+import { getExternalChatAgentGroupId, projectDocAudience, reconcileGwsEaProfile } from '../gws-ea-profile/db.js';
+import { recordWebAlias } from '../gws-ea-profile/testing/web-alias.js';
 import { ensureExternalChatGroup, reconcileChatAgents, resumeRetiringJobAgents, chatAgentHealth } from './index.js';
 import { createJobAgent, activateJobAgent, getJobAgentForChat, listJobAgents } from './jobs.js';
 import { EXTERNAL_CHAT_CAPABILITIES } from './shape.js';
@@ -194,11 +200,43 @@ it.each(['external-chat', 'job'] as const)(
   },
 );
 
+it('names casual and job sessions at creation, profile rename and startup reconciliation', async () => {
+  const external = await ensureExternalChatGroup();
+  const job = await createJobAgent('trip');
+  const groups = [external, job.agent_group_id];
+  for (const id of groups) expect((await materializeContainerJson(id)).assistantName).toBe('Robin');
+  await createAgentGroup({
+    id: 'main',
+    name: 'main',
+    folder: 'main',
+    agent_provider: null,
+    created_at: new Date().toISOString(),
+  });
+  await ensureContainerConfig('main');
+
+  await reconcileGwsEaProfile({
+    assistantDisplayName: 'Finch',
+    assistantWorkspaceEmail: 'assistant@example.test',
+    principalDisplayName: 'Juno Hale',
+    principalTimezone: 'America/Los_Angeles',
+    mainAgentGroupId: 'main',
+  });
+
+  for (const id of groups) {
+    expect((await materializeContainerJson(id)).assistantName).toBe('Finch');
+    await updateContainerConfigScalars(id, { assistant_name: 'old name' });
+  }
+  await reconcileChatAgents();
+  for (const id of groups) expect((await materializeContainerJson(id)).assistantName).toBe('Finch');
+});
+
 it('composes browser guidance only for an explicitly granted active job and removes it on revocation', async () => {
+  await recordWebAlias('nibor@example.test');
   const external = await ensureExternalChatGroup();
   const job = await createJobAgent('trip');
   expect(await documentFor(external)).not.toContain('# Browser delegation');
   expect(await documentFor(job.agent_group_id)).not.toContain('# Browser delegation');
+  expect(await documentFor(job.agent_group_id)).not.toContain('nibor@example.test');
   policy([job.agent_group_id]);
   expect(await documentFor(job.agent_group_id)).not.toContain('# Browser delegation');
   await activateJobAgent(job.agent_group_id);
@@ -207,6 +245,7 @@ it('composes browser guidance only for an explicitly granted active job and remo
   const granted = await documentFor(job.agent_group_id);
 
   expect(granted).toContain('# Browser delegation');
+  expect(granted).toContain("Robin's web address is `nibor@example.test`");
   expect(granted).toContain('shared signed-in profile and vault');
   expect(granted).toContain('`record_disclosure`');
   expect(granted).toContain('principal approvals');
@@ -215,6 +254,7 @@ it('composes browser guidance only for an explicitly granted active job and remo
   expect(await documentFor(external)).not.toContain('# Browser delegation');
   policy([]);
   expect(await documentFor(job.agent_group_id)).not.toContain('# Browser delegation');
+  expect(await documentFor(job.agent_group_id)).not.toContain('nibor@example.test');
 });
 
 it('creates one sealed shared agent and a job agent with separate exact stored shapes and model-only gateway identities', async () => {
