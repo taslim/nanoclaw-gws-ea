@@ -5,7 +5,7 @@ import { resyReservationSignature } from './resy-signature.js';
 import { ensureBrowserNavigationGuard } from './commit-classifier.js';
 
 const TOKEN = 'opaque-native-slot-token';
-function availability(): Record<string, unknown> {
+function availability(timeZone = 'EST5EDT'): Record<string, unknown> {
   return {
     query: { day: '2026-10-17', party_size: 2 },
     results: {
@@ -15,7 +15,7 @@ function availability(): Record<string, unknown> {
             id: { resy: 25973 },
             name: "L'Artusi",
             currency: { code: 'USD' },
-            location: { time_zone: 'EST5EDT' },
+            location: { time_zone: timeZone },
           },
           slots: [
             {
@@ -79,34 +79,60 @@ function fixturePage(origin = 'https://resy.com'): {
 
 afterEach(() => vi.useRealTimers());
 describe('reviewed Resy native inventory', () => {
-  it('reads explicit native slot interval and identity without exposing inventory tokens', async () => {
-    const { page, emit } = fixturePage();
-    await resyReservationSignature.preparePage?.(page);
-    emit('/4/find', availability());
-    const answer = await resyReservationSignature.readAvailability?.(page, { venueId: '25973', partySize: 2 });
-    expect(answer).toMatchObject({
-      status: 'ready',
-      site: 'resy.com',
-      venue: { id: '25973', name: "L'Artusi" },
-      partySize: 2,
-      currency: 'USD',
-      timeZone: 'America/New_York',
-      slots: [
-        {
-          reservation: {
-            venueId: '25973',
-            venueName: "L'Artusi",
-            partySize: 2,
-            at: '2026-10-17T15:00:00.000Z',
-            endAt: '2026-10-17T16:00:00.000Z',
-            timeZone: 'America/New_York',
+  it.each(['America/New_York', 'EST5EDT'])(
+    'reads explicit native slot interval and identity for %s without exposing inventory tokens',
+    async (timeZone) => {
+      const { page, emit } = fixturePage();
+      await resyReservationSignature.preparePage?.(page);
+      emit('/4/find', availability(timeZone));
+      const answer = await resyReservationSignature.readAvailability?.(page, { venueId: '25973', partySize: 2 });
+      expect(answer).toMatchObject({
+        status: 'ready',
+        site: 'resy.com',
+        venue: { id: '25973', name: "L'Artusi" },
+        partySize: 2,
+        currency: 'USD',
+        timeZone: expect.any(String),
+        slots: [
+          {
+            reservation: {
+              venueId: '25973',
+              venueName: "L'Artusi",
+              partySize: 2,
+              at: '2026-10-17T15:00:00.000Z',
+              endAt: '2026-10-17T16:00:00.000Z',
+              timeZone: expect.any(String),
+            },
           },
-        },
-      ],
-    });
-    expect(JSON.stringify(answer)).not.toContain(TOKEN);
-    if (answer?.status === 'ready') expect(answer.slots[0].id).toMatch(/^[a-f0-9]{64}$/u);
-  });
+        ],
+      });
+      expect(JSON.stringify(answer)).not.toContain(TOKEN);
+      if (answer?.status === 'ready') {
+        const { reservation } = answer.slots[0];
+        expect(answer.slots[0].id).toMatch(/^[a-f0-9]{64}$/u);
+        expect(reservation.timeZone).toBe(answer.timeZone);
+        // ICU versions may retain the native alias; either spelling must describe the venue's clock.
+        const clock = new Intl.DateTimeFormat('en-US', {
+          timeZone: answer.timeZone,
+          hour: '2-digit',
+          minute: '2-digit',
+          hourCycle: 'h23',
+        });
+        expect(clock.formatToParts(new Date(reservation.at))).toEqual(
+          expect.arrayContaining([
+            { type: 'hour', value: '11' },
+            { type: 'minute', value: '00' },
+          ]),
+        );
+        expect(clock.formatToParts(new Date(reservation.endAt))).toEqual(
+          expect.arrayContaining([
+            { type: 'hour', value: '12' },
+            { type: 'minute', value: '00' },
+          ]),
+        );
+      }
+    },
+  );
   it('does not substitute an assumed interval when the native end is missing', async () => {
     const { page, emit } = fixturePage();
     const raw = availability();
