@@ -157,6 +157,8 @@ it.each(['external-chat', 'job'] as const)(
     const config = await getContainerConfig(group);
     expect(config).toMatchObject({ cli_scope: 'disabled', skills: JSON.stringify(['whatsapp-formatting']) });
     expect(await getGroupCapabilities(group)).not.toContain('shell');
+    expect(await getGroupCapabilities(group)).toContain('files-send');
+    if (kind === 'external-chat') expect(await getGroupCapabilities(group)).not.toContain('files-write');
     const agent = await getAgentGroup(group);
     if (!config || !agent) throw new Error('No configured chat group');
     const skillHome = path.join(ROOT, 'skill-links', group);
@@ -224,13 +226,22 @@ it('creates one sealed shared agent and a job agent with separate exact stored s
   expect(job.state).toBe('creating');
   expect(await getContainerConfig(external)).toMatchObject({
     cli_scope: 'disabled',
-    capabilities: JSON.stringify(['reply', 'files-read', 'web', 'time', 'request-status', 'gws-ea-chat-external']),
+    capabilities: JSON.stringify([
+      'reply',
+      'files-read',
+      'files-send',
+      'web',
+      'time',
+      'request-status',
+      'gws-ea-chat-external',
+    ]),
   });
   expect(await getContainerConfig(job.agent_group_id)).toMatchObject({
     cli_scope: 'disabled',
     capabilities: JSON.stringify([
       'reply',
       'files-read',
+      'files-send',
       'web',
       'time',
       'request-status',

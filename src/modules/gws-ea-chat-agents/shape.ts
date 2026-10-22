@@ -22,6 +22,7 @@ registerCapability(JOB_DOCUMENTS_CAPABILITY, {
 export const EXTERNAL_CHAT_CAPABILITIES: readonly string[] = [
   'reply',
   'files-read',
+  'files-send',
   'web',
   'time',
   'request-status',
