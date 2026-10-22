@@ -1,34 +1,33 @@
-import { execFile, spawn, type ChildProcess } from 'node:child_process';
 import { once } from 'node:events';
-import { chmod, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, rm } from 'node:fs/promises';
 import { createServer, type Server } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { Readable, Writable } from 'node:stream';
-import { setTimeout as delay } from 'node:timers/promises';
-import { promisify } from 'node:util';
+
+import { errors, type Page } from 'playwright-core';
 
 import {
-  chromium,
-  errors,
-  type Browser,
-  type CDPSession,
-  type ConnectOverCDPTransport,
-  type Page,
-} from 'playwright-core';
-
+  prepareChromeProfile,
+  spawnChrome,
+  stopChrome,
+  type OwnedChrome,
+} from '../../src/modules/gws-ea-browser/chrome.js';
+import { ensureBrowserNavigationGuard, registrableSite } from '../../src/modules/gws-ea-browser/commit-classifier.js';
+import {
+  connectChrome,
+  createBackgroundPage,
+  verifyChromePolicy,
+  type ChromeConnection,
+} from '../../src/modules/gws-ea-browser/connection.js';
+import { BrowserDiagnosticAttempt } from '../../src/modules/gws-ea-browser/diagnostics.js';
+import { browserPaths } from '../../src/modules/gws-ea-browser/paths.js';
 import { runProbe, type JsonValue, type ProbeResult } from './evidence.js';
 
-const execFileAsync = promisify(execFile);
 export const SYSTEM_CHROME = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
 
-export interface ProbeBrowser {
-  browser: Browser;
-  session: CDPSession;
-  child: ChildProcess;
+export interface ProbeBrowser extends Pick<ChromeConnection, 'browser' | 'session' | 'child' | 'debuggerPort'> {
   profile: string;
   artifacts: string;
-  flags: string[];
   newPage: () => Promise<Page>;
   close: () => Promise<void>;
 }
@@ -52,139 +51,83 @@ async function denyAllProxy(): Promise<{ server: Server; url: string }> {
 export async function launchProbeBrowser(
   options: {
     chromePath?: string;
-    automationControlled?: boolean;
     /** Only the host's public-only filtering proxy may be supplied here. */
     publicProxyUrl?: string;
   } = {},
 ): Promise<ProbeBrowser> {
-  const profile = await mkdtemp(join(tmpdir(), 'nanoclaw-browser-probe-'));
-  await chmod(profile, 0o700);
-  const artifacts = join(profile, 'artifacts');
-  await mkdir(artifacts, { mode: 0o700 });
-  await mkdir(join(profile, 'Default'), { mode: 0o700 });
-  await writeFile(
-    join(profile, 'Default', 'Preferences'),
-    JSON.stringify({
-      profile: { exit_type: 'Normal', exited_cleanly: true, password_manager_enabled: false },
-      credentials_enable_service: false,
-      autofill: { credit_card_enabled: false, profile_enabled: false },
-      browser: { check_default_browser: false },
-      session: { restore_on_startup: 5 },
-      // Chrome's renderer reads this profile pref. The command-line switch
-      // alone produced non-proxied UDP host candidates on branded Chrome 155.
-      // chromium/src chrome/common/pref_names.h: kWebRTCIPHandlingPolicy.
-      webrtc: { ip_handling_policy: 'disable_non_proxied_udp' },
-    }),
-    { mode: 0o600 },
-  );
-  const refusingProxy = options.publicProxyUrl === undefined ? await denyAllProxy() : undefined;
-  const flags = [
-    `--user-data-dir=${profile}`,
-    '--remote-debugging-pipe',
-    '--no-startup-window',
-    '--no-first-run',
-    '--no-default-browser-check',
-    '--disable-search-engine-choice-screen',
-    '--disable-backgrounding-occluded-windows',
-    '--disable-renderer-backgrounding',
-    '--disable-background-timer-throttling',
-    '--enable-features=CDPScreenshotNewSurface',
-    `--proxy-server=${options.publicProxyUrl ?? refusingProxy?.url}`,
-    '--proxy-bypass-list=<-loopback>',
-    '--disable-quic',
-    '--force-webrtc-ip-handling-policy=disable_non_proxied_udp',
-    ...(options.automationControlled === false ? [] : ['--disable-blink-features=AutomationControlled']),
-  ];
-  const child = spawn(options.chromePath ?? SYSTEM_CHROME, flags, {
-    stdio: ['ignore', 'ignore', 'ignore', 'pipe', 'pipe'],
-  });
-  let browser: Browser | undefined;
-  let closed = false;
-  const close = async (): Promise<void> => {
-    if (closed) return;
-    closed = true;
-    await browser?.close().catch(() => undefined);
-    if (child.exitCode === null && child.signalCode === null) {
-      const exited = once(child, 'exit').then(() => undefined);
-      child.kill('SIGTERM');
-      await Promise.race([exited, delay(3_000)]);
-      if (child.exitCode === null && child.signalCode === null) {
-        child.kill('SIGKILL');
-        await exited;
+  const root = await mkdtemp(join(tmpdir(), 'nanoclaw-browser-probe-'));
+  const paths = browserPaths(join(root, 'policy.json'));
+  let refusingProxy: Awaited<ReturnType<typeof denyAllProxy>> | undefined;
+  let owned: OwnedChrome | undefined;
+  let connection: ChromeConnection | undefined;
+  let closing: Promise<void> | undefined;
+  const close = (): Promise<void> => {
+    closing ??= (async () => {
+      try {
+        if (connection) await connection.close();
+        else if (owned) await stopChrome(owned.child);
+      } finally {
+        try {
+          if (refusingProxy) {
+            const server = refusingProxy.server;
+            server.closeAllConnections();
+            await new Promise<void>((resolve, reject) => {
+              server.close((error) => (error === undefined ? resolve() : reject(error)));
+            });
+          }
+        } finally {
+          await rm(root, { recursive: true, force: true });
+        }
       }
-    }
-    if (refusingProxy !== undefined) {
-      refusingProxy.server.closeAllConnections();
-      await new Promise<void>((resolve, reject) => {
-        refusingProxy.server.close((error) => (error === undefined ? resolve() : reject(error)));
-      });
-    }
-    await rm(profile, { recursive: true, force: true });
+    })().catch(() => {
+      throw new Error('Probe Chrome cleanup unavailable');
+    });
+    return closing;
   };
   try {
-    const outbound = child.stdio[3];
-    const inbound = child.stdio[4];
-    if (!(outbound instanceof Writable) || !(inbound instanceof Readable)) {
-      throw new Error('Chrome debugging pipe descriptors are unavailable');
+    await prepareChromeProfile(paths);
+    refusingProxy = options.publicProxyUrl === undefined ? await denyAllProxy() : undefined;
+    const proxyUrl = options.publicProxyUrl ?? refusingProxy?.url;
+    if (!proxyUrl) throw new Error('Probe proxy unavailable');
+    const signal = AbortSignal.timeout(30_000);
+    owned = await spawnChrome({ chromePath: options.chromePath ?? SYSTEM_CHROME, paths, proxyUrl }, signal);
+    connection = await connectChrome(owned, paths, signal);
+    const attached = connection;
+    const probe = await createBackgroundPage(attached);
+    try {
+      await verifyChromePolicy(probe);
+      signal.throwIfAborted();
+    } finally {
+      await probe.close();
     }
-    const transport: ConnectOverCDPTransport = {
-      send(message) {
-        outbound.write(`${JSON.stringify(message)}\0`);
-      },
-      close() {
-        child.kill('SIGTERM');
-      },
-    };
-    let buffered = Buffer.alloc(0);
-    inbound.on('data', (chunk: Buffer) => {
-      buffered = Buffer.concat([buffered, chunk]);
-      let end: number;
-      while ((end = buffered.indexOf(0)) !== -1) {
-        const frame = buffered.subarray(0, end).toString('utf8');
-        buffered = buffered.subarray(end + 1);
-        if (frame.length === 0) continue;
-        const message: unknown = JSON.parse(frame);
-        if (typeof message !== 'object' || message === null) {
-          transport.onclose?.('Chrome sent an invalid protocol frame');
-          child.kill('SIGTERM');
-          return;
-        }
-        setImmediate(() => transport.onmessage?.(message));
-      }
-    });
-    child.on('error', (error) => transport.onclose?.(error.message));
-    child.on('exit', () => transport.onclose?.('Chrome exited'));
-    browser = await chromium.connectOverCDP(transport, { isLocal: true, artifactsDir: artifacts, timeout: 15_000 });
-    const attachedBrowser = browser;
-    const session = await browser.newBrowserCDPSession();
-    for (const name of ['clipboard-read', 'clipboard-write', 'local-network-access']) {
-      await session.send('Browser.setPermission', { permission: { name }, setting: 'denied' });
-    }
-    await session.send('Browser.setDownloadBehavior', { behavior: 'deny' });
     return {
-      browser,
-      session,
-      child,
-      profile,
-      artifacts,
-      flags,
+      browser: attached.browser,
+      session: attached.session,
+      child: attached.child,
+      debuggerPort: attached.debuggerPort,
+      profile: paths.profileDir,
+      artifacts: paths.artifactsDir,
       async newPage() {
-        const context = attachedBrowser.contexts()[0];
-        if (context === undefined) throw new Error('Chrome has no default context');
-        const appeared = context.waitForEvent('page', { timeout: 10_000 });
-        await session.send('Target.createTarget', { url: 'about:blank', newWindow: true, background: true });
-        const page = await appeared;
-        page.setDefaultTimeout(5_000);
-        page.on('dialog', (dialog) => void dialog.dismiss().catch(() => undefined));
-        const pageSession = await context.newCDPSession(page);
-        await pageSession.send('Page.setInterceptFileChooserDialog', { enabled: true });
-        return page;
+        try {
+          return await createBackgroundPage(attached);
+        } catch {
+          throw new Error('Background probe page unavailable');
+        }
       },
       close,
     };
-  } catch (error: unknown) {
+  } catch {
     await close();
-    throw error;
+    throw new Error('Probe Chrome unavailable');
+  }
+}
+
+/** Native error messages can include private debugger endpoints or page data. */
+async function sanitizedProbe(execute: () => Promise<Omit<ProbeResult, 'name'>>): Promise<Omit<ProbeResult, 'name'>> {
+  try {
+    return await execute();
+  } catch {
+    return { status: 'failed', detail: { error: 'Browser probe could not complete' } };
   }
 }
 
@@ -194,13 +137,16 @@ export async function localProbes(
 ): Promise<ProbeResult[]> {
   const results: ProbeResult[] = [];
   const add = async (name: string, execute: () => Promise<Omit<ProbeResult, 'name'>>): Promise<void> => {
-    results.push(await observedProbe(name, execute));
+    results.push(await observedProbe(name, () => sanitizedProbe(execute)));
   };
   const page = await probeBrowser.newPage();
-  await add('debugging_pipe', async () => ({
+  await add('owned_loopback_cdp', async () => ({
     status: 'passed',
     detail: {
-      transport: 'private child-process pipe',
+      transport: 'owned Chrome child on explicit loopback CDP port',
+      debuggerPort: probeBrowser.debuggerPort,
+      scope:
+        'host ownership and literal 127.0.0.1 binding verified at attachment; no assistant-network isolation proof',
       chromeVersion: probeBrowser.browser.version(),
       viewport: page.viewportSize(),
     },
@@ -217,44 +163,32 @@ export async function localProbes(
     const clicked = (await page.locator('h1').textContent()) === 'After';
     // JSON snapshots generate a new ref generation; consume the old ref first.
     const json = await page.locator('body').ariaSnapshotJSON();
+    const screenshotBytes = (await page.screenshot({ timeout: 5_000 })).length;
     return {
-      status: clicked && json !== undefined ? 'passed' : 'failed',
+      status: clicked && json !== undefined && screenshotBytes > 0 ? 'passed' : 'failed',
       detail: {
         aiSnapshot: true,
         jsonSnapshot: json !== undefined,
         getByRefClicked: clicked,
+        screenshotBytes,
         normalized: normalized.toString(),
       },
     };
   });
-  await add('no_debugging_tcp_listener', async () => {
-    if (probeBrowser.child.pid === undefined) throw new Error('Chrome pid unavailable');
-    let stdout: string;
-    try {
-      ({ stdout } = await execFileAsync(
-        '/usr/sbin/lsof',
-        ['-a', '-p', String(probeBrowser.child.pid), '-iTCP', '-sTCP:LISTEN', '-Fn'],
-        { encoding: 'utf8', timeout: 5_000 },
-      ));
-    } catch (error: unknown) {
-      // lsof returns 1 when its successful query found no matching descriptor.
-      if (
-        typeof error !== 'object' ||
-        error === null ||
-        !('code' in error) ||
-        error.code !== 1 ||
-        !('stdout' in error) ||
-        typeof error.stdout !== 'string'
-      )
-        throw error;
-      stdout = error.stdout;
-    }
-    return { status: stdout.trim() === '' ? 'passed' : 'failed', detail: { listeningSocketRecords: stdout.trim() } };
-  });
-  await add('detection_signals_with_flag', async () => ({
+  await add('detection_signals', async () => ({
     status: 'passed',
     detail: await detectionSignals(page),
   }));
+  await add('notifications_denied', async () => {
+    const notification = await page.evaluate(() => ({
+      api: typeof Notification,
+      permission: Notification.permission,
+    }));
+    return {
+      status: notification.api === 'function' && notification.permission === 'denied' ? 'passed' : 'failed',
+      detail: { ...notification, permissionPromptRequested: false },
+    };
+  });
   await add('clipboard_permissions', async () => {
     // Permission denial is checked before attempting either API. No readText
     // call runs, so clipboard contents cannot be read even if Chrome regresses.
@@ -304,7 +238,7 @@ export async function localProbes(
     return {
       status: candidates.length === 0 ? 'passed' : 'failed',
       detail: {
-        candidates,
+        candidateCount: candidates.length,
         scope: 'no non-proxied host candidates with empty ICE server list; external STUN/QUIC not exercised',
       },
     };
@@ -323,13 +257,28 @@ export async function localProbes(
       await probeBrowser.session.send('Browser.setWindowBounds', { windowId, bounds: { windowState: 'minimized' } });
       await minimized.getByRole('button', { name: 'Run', exact: true }).click();
       const clicked = (await minimized.locator('h1').textContent()) === 'After';
-      const screenshot = await minimized.screenshot({ timeout: 5_000 });
+      let screenshotBytes = 0;
+      let screenshotTimedOut = false;
+      try {
+        screenshotBytes = (await minimized.screenshot({ timeout: 5_000 })).length;
+      } catch (error) {
+        if (!(error instanceof errors.TimeoutError)) throw error;
+        screenshotTimedOut = true;
+      }
       const { bounds } = await probeBrowser.session.send('Browser.getWindowBounds', { windowId });
       return {
-        status: clicked && screenshot.length > 0 && bounds.windowState === 'minimized' ? 'passed' : 'failed',
+        status:
+          !clicked || bounds.windowState !== 'minimized'
+            ? 'failed'
+            : screenshotTimedOut
+              ? 'not-run'
+              : screenshotBytes > 0
+                ? 'passed'
+                : 'failed',
         detail: {
           clicked,
-          screenshotBytes: screenshot.length,
+          screenshotBytes,
+          screenshotTimedOut,
           windowState: bounds.windowState ?? 'unknown',
           scope: 'this desktop state only; no restore or activation was requested',
         },
@@ -338,7 +287,9 @@ export async function localProbes(
       await minimized.close();
     }
   });
-  await page.close();
+  await page.close().catch(() => {
+    throw new Error('Probe page cleanup unavailable');
+  });
   return results;
 }
 
@@ -369,52 +320,97 @@ export async function publicSiteProbes(
   const results: ProbeResult[] = [];
   for (const site of sites) {
     results.push(
-      await observedProbe(`signed_out_flow_${site.name}`, async () => {
-        const page = await probeBrowser.newPage();
-        try {
-          await page.goto(site.url, { waitUntil: 'domcontentloaded', timeout: 30_000 });
-          let ready = true;
+      await observedProbe(`signed_out_flow_${site.name}`, () =>
+        sanitizedProbe(async () => {
+          const page = await probeBrowser.newPage();
+          const diagnostics = new BrowserDiagnosticAttempt({
+            jobId: 'anonymous-probe',
+            requestId: site.name,
+            action: 'navigate',
+          });
+          diagnostics.observe(page);
           try {
-            // These sites hydrate after DOMContentLoaded. An empty app shell
-            // is not evidence that a public search was blocked or succeeded.
-            await page.waitForFunction(
-              () =>
-                /restaurant|reservation|availability|search results|no (?:results|availability)|find a table|verify (?:you are|you're) human|unusual activity|access denied|captcha|attention required|checking your browser|security check|blocked/i.test(
-                  document.body?.innerText ?? '',
-                ),
-              undefined,
-              { timeout: 15_000 },
+            const leasedSite = registrableSite(site.url);
+            if (!leasedSite) throw new Error('Public probe site unavailable');
+            const guard = await ensureBrowserNavigationGuard(page);
+            return await guard.runWithPolicy(
+              {
+                readOnly: true,
+                leasedSite,
+                async beforeNavigate(url, document) {
+                  return !document.topLevel || registrableSite(url.href) === leasedSite
+                    ? 'ordinary'
+                    : 'blocked_address';
+                },
+              },
+              async () => {
+                const response = await page.goto(site.url, { waitUntil: 'domcontentloaded', timeout: 30_000 });
+                let ready = true;
+                try {
+                  // These sites hydrate after DOMContentLoaded; an empty shell establishes no merchant outcome.
+                  await page.waitForFunction(
+                    () =>
+                      /restaurant|reservation|availability|search results|no (?:results|availability)|find a table|verify (?:you are|you're) human|unusual activity|access denied|captcha|attention required|checking your browser|security check|blocked/i.test(
+                        document.body?.innerText ?? '',
+                      ),
+                    undefined,
+                    { timeout: 15_000 },
+                  );
+                } catch (error) {
+                  if (!(error instanceof errors.TimeoutError)) throw error;
+                  ready = false;
+                }
+                const text = await page.locator('body').innerText();
+                const challenge =
+                  /verify (?:you are|you're) human|unusual activity|access denied|captcha|attention required|checking your browser|security check|blocked/i.test(
+                    text,
+                  );
+                const searchResults =
+                  /restaurant|reservation|availability|search results|no (?:results|availability)|find a table/i.test(
+                    text,
+                  );
+                const status = response?.status() ?? 0;
+                const refusal = guard.reason();
+                const evidence = diagnostics.finish();
+                return {
+                  status:
+                    challenge || !searchResults || status < 200 || status >= 400 || refusal !== undefined
+                      ? 'failed'
+                      : 'passed',
+                  detail: {
+                    requestedUrl: site.url,
+                    finalSite: registrableSite(page.url()) ?? 'unknown',
+                    responseStatus: status,
+                    hostRefusal: refusal ?? null,
+                    challenge,
+                    ready,
+                    searchResults,
+                    runtime: { ...evidence.runtime },
+                    requests: evidence.events.map((event) => ({ ...event })),
+                    omittedEvents: evidence.omitted_events,
+                    scope:
+                      'fresh diagnostic profile; read-only anonymous search page on the leased site; no login, reservation, payment, or operator-profile comparison',
+                  },
+                };
+              },
             );
-          } catch (error) {
-            if (!(error instanceof errors.TimeoutError)) throw error;
-            ready = false;
+          } catch {
+            const evidence = diagnostics.finish();
+            return {
+              status: 'failed',
+              detail: {
+                requestedUrl: site.url,
+                error: 'Anonymous navigation could not complete',
+                runtime: { ...evidence.runtime },
+                requests: evidence.events.map((event) => ({ ...event })),
+                omittedEvents: evidence.omitted_events,
+              },
+            };
+          } finally {
+            await page.close();
           }
-          // A search URL is the first model-free flow step. Record what arrived,
-          // rather than treating an HTTP 200 bot challenge as a successful flow.
-          const snapshot = await page.locator('body').ariaSnapshot({ mode: 'ai' });
-          const text = await page.locator('body').innerText();
-          const challenge =
-            /verify (?:you are|you're) human|unusual activity|access denied|captcha|attention required|checking your browser|security check|blocked/i.test(
-              text,
-            );
-          const searchResults =
-            /restaurant|reservation|availability|search results|no (?:results|availability)|find a table/i.test(text);
-          return {
-            status: challenge || !searchResults ? 'failed' : 'passed',
-            detail: {
-              url: page.url(),
-              title: await page.title(),
-              challenge,
-              ready,
-              searchResults,
-              snapshot: snapshot.slice(0, 24_000),
-              scope: 'signed-out search page; no login, booking, payment, or operator-profile comparison',
-            },
-          };
-        } finally {
-          await page.close();
-        }
-      }),
+        }),
+      ),
     );
   }
   return results;

@@ -1,9 +1,8 @@
 /**
  * pnpm exec tsx scripts/browser-live-check/index.ts
  *
- * Local, account-free U1 probes. A fresh throwaway profile and a deny-all proxy
- * are always used. U14 may supply the real public-only proxy to
- * launchProbeBrowser/publicSiteProbes without duplicating its security policy.
+ * Account-free checks through the production Chrome launch/connection path.
+ * A fresh throwaway profile and a deny-all proxy are always used here.
  */
 import { execFile } from 'node:child_process';
 import { resolve } from 'node:path';
@@ -11,7 +10,7 @@ import { promisify } from 'node:util';
 
 import { writeEvidence, type LiveCheckReport, type ProbeResult } from './evidence.js';
 import { assessQuietOperation, FocusSampler } from './focus-sampler.js';
-import { detectionSignals, launchProbeBrowser, localProbes } from './probes.js';
+import { launchProbeBrowser, localProbes } from './probes.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -36,23 +35,11 @@ async function main(): Promise<void> {
             detail: {
               profile: 'owner-only temporary profile, removed after run',
               network: 'deny-all proxy',
-              privateDebuggingPipe: true,
+              transport: 'owned Chrome child on explicit loopback CDP port',
+              debuggerPort: probeBrowser.debuggerPort,
+              isolation: 'not measured; use the deployed capability check for its assistant-network route',
             },
           };
-        } finally {
-          await probeBrowser.close();
-        }
-      }),
-    );
-    probes.push(
-      await sampler.runProbe('detection_signals_without_flag', async () => {
-        const probeBrowser = await launchProbeBrowser({ automationControlled: false });
-        try {
-          const page = await probeBrowser.newPage();
-          await page.goto('data:text/html,<h1>Detection signals</h1>');
-          const detail = await detectionSignals(page);
-          await page.close();
-          return { status: 'passed', detail };
         } finally {
           await probeBrowser.close();
         }
@@ -80,7 +67,7 @@ async function main(): Promise<void> {
     download_and_file_chooser:
       'Requires runtime interception and durable handoff; local transport alone does not prove these contracts',
     public_site_flows:
-      'Requires the implemented host public-only proxy; publicSiteProbes is ready for U3/U14 to invoke',
+      'Not run by this deny-all check; publicSiteProbes requires the production public-only proxy and establishes anonymous page loading only',
     operator_chrome_comparison: 'Operator is unavailable; the harness never adopts a personal profile',
     secret_confinement: 'Requires the implemented runtime secret boundary',
     concurrency: 'Requires native job/session leases and the implemented runtime',
@@ -99,16 +86,16 @@ async function main(): Promise<void> {
     observations: sampler.observations,
     decisions: {
       transport:
-        probes.find((probe) => probe.name === 'debugging_pipe')?.status === 'passed'
-          ? 'private debugging pipe available'
-          : 'private debugging pipe not proven',
+        probes.find((probe) => probe.name === 'owned_loopback_cdp')?.status === 'passed'
+          ? 'production owned loopback CDP attachment verified'
+          : 'production loopback CDP attachment not proven',
       chromeBuild: chromeVersion,
       minimized: probes.find((probe) => probe.name === 'minimized_rendering_and_input')?.status ?? 'not-run',
       detection:
-        'Both flag variants measured locally; bot-protected-site compatibility still requires public flow probes',
+        'Selected production configuration only; merchant compatibility requires independent anonymous navigation checks',
       apiSurface: probes.find((probe) => probe.name === 'playwright_api_surface')?.status ?? 'not-run',
       acceptance:
-        'Partial U1 evidence; not-run entries and locked-desktop samples cannot establish R30 or U14 acceptance',
+        'Local native evidence only; not-run entries and locked-desktop samples cannot establish active-desktop, assistant-network or real errand acceptance',
     },
   };
   const destination = await writeEvidence({ outputRoot: resolve('docs/rebuild/evidence'), runId, report });

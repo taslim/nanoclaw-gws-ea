@@ -1,6 +1,11 @@
 # Host browser live checks
 
-`index.ts` preserves the account-free U1 probes with a throwaway Chrome profile.
+`index.ts` runs account-free local probes with a throwaway Chrome profile and a
+deny-all proxy. It uses production `prepareChromeProfile`, `spawnChrome`,
+`connectChrome`, `createBackgroundPage` and `verifyChromePolicy`; it owns only its
+disposable profile and refusing proxy. No flag variants or alternative launcher
+are used.
+
 `acceptance.ts` records the end-to-end U14 checks against a **merged, deployed
 dogfood assistant on the Mac, with its owner present**. Run the acceptance commands
 only after that deployment. Never start the operator checkout's service to run
@@ -11,6 +16,45 @@ permissions, approves no cards, restarts no services and runs no `gws-ea`
 command. The owner uses their normal channel. The harness reads the deployed host's existing, owner-only
 `ncl.sock` and independently checks the supplied verification artifacts. Any real
 booking or purchase still needs its normal explicit principal authority.
+
+## Local transport and isolation checks
+
+```sh
+GWS_EA_BROWSER_TEST_CHROME="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
+  pnpm exec vitest run scripts/browser-live-check/probes.test.ts
+pnpm exec tsx scripts/browser-live-check/index.ts
+```
+
+The native harness smoke verifies an actual nonzero listener owned by its Chrome
+child and bound to literal `127.0.0.1`, native input, the present-but-denied
+Notifications API, and process/listener/profile cleanup. The local Mac command
+records policy admission, API behavior, background rendering/input and passive
+desktop samples in a new owner-only evidence run. A locked desktop cannot prove
+active operator focus or clipboard continuity. Minimized screenshot timeout is
+reported as `not-run`, even when minimized input works; minimized operation stays
+optional. Neither command uses a personal profile or reads clipboard contents.
+
+The transport is native Playwright attachment to the ownership-verified loopback
+CDP listener of the Chrome child production launched. Only its integer debugger
+port may appear in host evidence; endpoint URLs, WebSocket paths and browser IDs
+stay private. This is accessible to trusted host processes and, through host
+forwarding, ordinary Docker bridge containers. It provides no pipe exclusivity.
+
+`gws-ea capabilities check browser --id <full-id>` separately checks the proxy
+and active debugger through the managed assistant network's existing host-gateway
+route, without launching Chrome. Stopped Chrome reports debugger `not_run`;
+starting, missing, invalid, changed or unobservable active targets prevent a ready
+result. This named-route observation does not repeat the recorded multi-route
+and gateway audit. Stop adoption if the managed network can reach the debugger.
+
+`publicSiteProbes` requires the production public-only filtering proxy supplied
+to `launchProbeBrowser`. It runs only anonymous GET document navigation under the
+production navigation guard, leased to each tested registrable site in this
+single-owner disposable harness; it uses no job DB or account state. Its bounded
+request facts omit raw native errors, page text, snapshots and redirect URLs.
+A 403 or challenge fails page-load acceptance. The search probes do not establish sign-in, reservation or payment
+success; record the exact previously failing OpenTable route twice on fresh
+profiles separately, with Resy/Tock as controls.
 
 ## Refactor verification boundaries
 

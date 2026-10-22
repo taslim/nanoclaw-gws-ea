@@ -25,13 +25,13 @@ describe('browser live-check evidence', () => {
         macosVersion: '27.0.1',
         probes: [
           {
-            name: 'debugging_pipe',
+            name: 'owned_loopback_cdp',
             status: 'passed' as const,
-            detail: { transport: 'pipe', listeningSockets: [] },
+            detail: { transport: 'owned loopback CDP', debuggerPort: 49_152 },
           },
         ],
         observations: [],
-        decisions: { transport: 'private debugging pipe' },
+        decisions: { transport: 'owned loopback CDP' },
       },
     };
     const destination = await writeEvidence(input);
