@@ -10,7 +10,7 @@ afterEach(() => closeSessionDb());
 it.each<[McpToolDefinition, Record<string, unknown>, string]>([
   [docCreate, { title: 'Trip itinerary', text: 'Day one' }, 'doc_create'],
   [docRead, { file: 'document-1' }, 'doc_read'],
-  [docEdit, { file: 'document-1', find: 'Day one', replace: 'Day two' }, 'doc_edit'],
+  [docEdit, { file: 'document-1', revision: 'r1', find: 'Day one', replace: 'Day two' }, 'doc_edit'],
   [docShare, { file: 'document-1', role: 'reader' }, 'doc_share'],
 ])(
   'sends %s to its host action without credentials or caller-chosen sharing recipients',
@@ -38,10 +38,16 @@ it.each<[McpToolDefinition, Record<string, unknown>, string]>([
     expect(await waiting).toMatchObject({ content: [{ type: 'text', text: 'Done.' }] });
   },
 );
+it('requires the revision observed by doc_read for an edit', () => {
+  const edit = new Ajv().compile(docEdit.tool.inputSchema);
+  expect(edit({ file: 'document-1', find: 'Day one', replace: 'Day two' })).toBe(false);
+  expect(edit({ file: 'document-1', revision: '', find: 'Day one', replace: 'Day two' })).toBe(false);
+  expect(edit({ file: 'document-1', revision: 'r1', find: 'Day one', replace: 'Day two' })).toBe(true);
+});
 it('requires an exact text edit and permits deletion without offering a link-sharing schema', () => {
   const edit = new Ajv().compile(docEdit.tool.inputSchema);
-  expect(edit({ file: 'document-1', find: 'remove this', replace: '' })).toBe(true);
-  expect(edit({ file: 'document-1', requests: [] })).toBe(false);
+  expect(edit({ file: 'document-1', revision: 'r1', find: 'remove this', replace: '' })).toBe(true);
+  expect(edit({ file: 'document-1', revision: 'r1', find: 'remove this', replace: '', requests: [] })).toBe(false);
   const share = new Ajv().compile(docShare.tool.inputSchema);
   expect(share({ file: 'document-1' })).toBe(true);
   expect(share({ file: 'document-1', role: 'owner' })).toBe(false);

@@ -69,6 +69,7 @@ let hideFolders = false;
 let loseFolderResponse = false;
 let loseCreateResponse = false;
 let loseEditResponse = false;
+let omitRevision = false;
 registerChannelAdapter('whatsapp', {
   factory: () => ({
     name: 'whatsapp',
@@ -121,6 +122,11 @@ function refused(frame: ResponseFrame): string {
 async function made(): Promise<string> {
   return String(accepted(await request(job, 'doc_create', { title: 'Trip plan', text: 'Friday at the lake.' })).file);
 }
+async function observedRevision(file: string): Promise<string> {
+  const revision = accepted(await request(job, 'doc_read', { file })).revision;
+  if (typeof revision !== 'string' || revision.length === 0) throw new Error('doc_read did not return a revision');
+  return revision;
+}
 async function outsideFile(): Promise<string> {
   const file = await drive.createFile({ name: 'Outside document', mimeType: 'application/vnd.google-apps.document' });
   documents.set(file.id, { title: 'Outside document', text: 'Everyone may read this.', revision: 1 });
@@ -139,6 +145,7 @@ beforeEach(async () => {
   loseFolderResponse = false;
   loseCreateResponse = false;
   loseEditResponse = false;
+  omitRevision = false;
   nativeGroups = undefined;
   members = [
     { key: 'whatsapp:22', isPrincipal: false },
@@ -219,7 +226,7 @@ beforeEach(async () => {
           return Response.json({
             documentId: id,
             title: doc.title,
-            revisionId: `r${doc.revision}`,
+            ...(omitRevision ? {} : { revisionId: `r${doc.revision}` }),
             tabs: [
               {
                 documentTab: { body: { content: [{ paragraph: { elements: [{ textRun: { content: doc.text } }] } }] } },
@@ -327,8 +334,9 @@ it('creates in the job folder, records ownership, reads and edits through the ho
     file,
   );
   expect(drive.file(file)?.parents).toEqual([folderIds.get(ownership?.folder_id ?? '') ?? ownership?.folder_id]);
-  expect(accepted(await request(job, 'doc_read', { file })).text).toContain('Friday at the lake.');
-  accepted(await request(job, 'doc_edit', { file, find: 'Friday', replace: 'Saturday' }));
+  const observed = accepted(await request(job, 'doc_read', { file }));
+  expect(observed).toMatchObject({ text: 'Friday at the lake.', revision: 'r1' });
+  accepted(await request(job, 'doc_edit', { file, revision: observed.revision, find: 'Friday', replace: 'Saturday' }));
   expect(documents.get(file)?.text).toBe('Saturday at the lake.');
   accepted(await request(job, 'doc_share', { file }));
   expect((await drive.listPermissions(file)).map((permission) => permission.emailAddress)).toContain(
@@ -338,6 +346,50 @@ it('creates in the job folder, records ownership, reads and edits through the ho
     { type: 'user', emailAddress: 'mira@example.com', role: 'reader' },
   ]);
   expect(vi.mocked(hostGoogleAccessToken).mock.calls.every(([service]) => service === 'drive-host')).toBe(true);
+});
+it('refuses a first edit after a collaborator changes the observed document, then edits only after a new read', async () => {
+  const file = await made();
+  const observed = accepted(await request(job, 'doc_read', { file }));
+  expect(observed).toMatchObject({ text: 'Friday at the lake.', revision: 'r1' });
+  const collaboratorText = 'Friday at the lake. Bring a lake map.';
+  documents.set(file, { title: 'Trip plan', text: collaboratorText, revision: 2 });
+  const stale = await request(job, 'doc_edit', {
+    file,
+    revision: observed.revision,
+    find: 'lake',
+    replace: 'beach',
+  });
+  expect(refused(stale)).toContain('changed');
+  expect(documents.get(file)).toEqual({ title: 'Trip plan', text: collaboratorText, revision: 2 });
+  const current = accepted(await request(job, 'doc_read', { file }));
+  expect(current).toMatchObject({ text: collaboratorText, revision: 'r2' });
+  accepted(await request(job, 'doc_edit', { file, revision: current.revision, find: 'lake', replace: 'beach' }));
+  expect(documents.get(file)).toEqual({
+    title: 'Trip plan',
+    text: 'Friday at the beach. Bring a beach map.',
+    revision: 3,
+  });
+});
+it.each([undefined, ''])('refuses an edit without a nonempty observed revision (%s)', async (revision) => {
+  const file = await made();
+  const reads = bodyReads.length;
+  const result = await request(job, 'doc_edit', { file, revision, find: 'Friday', replace: 'Saturday' });
+  expect(result).toMatchObject({
+    ok: false,
+    error: { code: 'invalid-args', message: expect.stringContaining('revision') },
+  });
+  expect(bodyReads).toHaveLength(reads);
+  expect(documents.get(file)).toEqual({ title: 'Trip plan', text: 'Friday at the lake.', revision: 1 });
+});
+it('returns readable content without an editable revision when Google omits its revision', async () => {
+  const file = await made();
+  omitRevision = true;
+  const observed = accepted(await request(job, 'doc_read', { file }));
+  expect(observed.text).toBe('Friday at the lake.');
+  expect(observed).not.toHaveProperty('revision');
+  const result = await request(job, 'doc_edit', { file, revision: 'r1', find: 'Friday', replace: 'Saturday' });
+  expect(refused(result)).toContain('Google did not supply the revision');
+  expect(documents.get(file)).toEqual({ title: 'Trip plan', text: 'Friday at the lake.', revision: 1 });
 });
 it('returns the actual created file ID and URL through the runner tool mailbox', async () => {
   const frame = await request(job, 'doc_create', { title: 'Trip plan', text: 'Friday at the lake.' });
@@ -440,7 +492,12 @@ it('refuses edit/share on an accessible outside file and every document action f
   for (const action of ['doc_edit', 'doc_share'])
     expect(
       refused(
-        await request(job, action, { file, ...(action === 'doc_edit' ? { find: 'Everyone', replace: 'Nobody' } : {}) }),
+        await request(job, action, {
+          file,
+          ...(action === 'doc_edit'
+            ? { revision: await observedRevision(file), find: 'Everyone', replace: 'Nobody' }
+            : {}),
+        }),
       ),
     ).toContain('made for this job');
   for (const action of ['doc_create', 'doc_read', 'doc_edit', 'doc_share'])
@@ -454,9 +511,16 @@ it('keeps private values behind the existing matcher on writes and new shares, h
   );
   expect(documents.size).toBe(0);
   const file = await made();
-  expect(refused(await request(job, 'doc_edit', { file, find: 'the lake', replace: '123 Secret Lane' }))).toContain(
-    'private address',
-  );
+  expect(
+    refused(
+      await request(job, 'doc_edit', {
+        file,
+        revision: await observedRevision(file),
+        find: 'the lake',
+        replace: '123 Secret Lane',
+      }),
+    ),
+  ).toContain('private address');
   expect(documents.get(file)?.text).toBe('Friday at the lake.');
   documents.set(file, { title: 'Trip plan', text: '123 Secret Lane', revision: 3 });
   expect(refused(await request(job, 'doc_share', { file }))).toContain('private address');
@@ -490,9 +554,16 @@ it.each(['anyone', 'group', 'domain', 'user'])(
       new Date().toISOString(),
     );
     drive.share(file, { id: 'outside', type, role: 'reader', emailAddress: 'outside@example.com' });
-    expect(refused(await request(job, 'doc_edit', { file, find: 'the lake', replace: '123 Secret Lane' }))).toContain(
-      'private address',
-    );
+    expect(
+      refused(
+        await request(job, 'doc_edit', {
+          file,
+          revision: await observedRevision(file),
+          find: 'the lake',
+          replace: '123 Secret Lane',
+        }),
+      ),
+    ).toContain('private address');
     expect(documents.get(file)?.text).toBe('Friday at the lake.');
     documents.set(file, { title: 'Trip plan', text: '123 Secret Lane', revision: 3 });
     expect(refused(await request(job, 'doc_share', { file }))).toContain('private address');
@@ -501,7 +572,9 @@ it.each(['anyone', 'group', 'domain', 'user'])(
 it('does not make ordinary edits depend on a document having a narrow access list', async () => {
   const file = await made();
   drive.share(file, { id: 'public', type: 'anyone', role: 'reader' });
-  accepted(await request(job, 'doc_edit', { file, find: 'Friday', replace: 'Sunday' }));
+  accepted(
+    await request(job, 'doc_edit', { file, revision: await observedRevision(file), find: 'Friday', replace: 'Sunday' }),
+  );
   expect(documents.get(file)?.text).toBe('Sunday at the lake.');
   accepted(await request(job, 'doc_share', { file }));
 });
@@ -527,7 +600,11 @@ it('refuses a hidden Google link that members cannot open before an edit or a ne
   const privateFile = await outsideFile();
   const file = await made();
   const link = `https://docs.google.com/document/d/${privateFile}/edit`;
-  expect(refused(await request(job, 'doc_edit', { file, find: 'the lake', replace: link }))).toContain('main');
+  expect(
+    refused(
+      await request(job, 'doc_edit', { file, revision: await observedRevision(file), find: 'the lake', replace: link }),
+    ),
+  ).toContain('main');
   expect(documents.get(file)?.text).toBe('Friday at the lake.');
   documents.set(file, { title: 'Trip plan', text: link, revision: 3 });
   expect(refused(await request(job, 'doc_share', { file }))).toContain('main');
@@ -544,10 +621,21 @@ it('replays a completed create without creating twice after its mailbox answer i
 });
 it('does not apply an overlapping replacement twice if only the mailbox answer is lost', async () => {
   const file = await made();
-  const fields = { file, find: 'lake', replace: 'lake lake' };
+  const fields = { file, revision: await observedRevision(file), find: 'lake', replace: 'lake lake' };
   accepted(await request(job, 'doc_edit', fields, 'edit-replayed'));
   loseAnswer(job, 'edit-replayed');
   accepted(await request(job, 'doc_edit', fields, 'edit-replayed'));
+  expect(documents.get(file)?.text).toBe('Friday at the lake lake.');
+});
+it('refuses a replay that swaps the original edit revision for a newer read', async () => {
+  const file = await made();
+  const fields = { file, revision: await observedRevision(file), find: 'lake', replace: 'lake lake' };
+  accepted(await request(job, 'doc_edit', fields, 'changed-edit-revision'));
+  loseAnswer(job, 'changed-edit-revision');
+  const newerRevision = await observedRevision(file);
+  expect(newerRevision).not.toBe(fields.revision);
+  const changed = await request(job, 'doc_edit', { ...fields, revision: newerRevision }, 'changed-edit-revision');
+  expect(refused(changed)).toContain('different work');
   expect(documents.get(file)?.text).toBe('Friday at the lake lake.');
 });
 it('recovers an ambiguous create by its scoped native marker without issuing a second create', async () => {
@@ -572,7 +660,7 @@ it('keeps a started create unconfirmed when Google cannot find its marker, witho
 it('reports an ambiguous edit honestly when its recorded revision has changed instead of applying it twice', async () => {
   const file = await made();
   loseEditResponse = true;
-  const fields = { file, find: 'lake', replace: 'lake lake' };
+  const fields = { file, revision: await observedRevision(file), find: 'lake', replace: 'lake lake' };
   expect(refused(await request(job, 'doc_edit', fields, 'ambiguous-edit'))).toContain('unconfirmed');
   loseAnswer(job, 'ambiguous-edit');
   expect(refused(await request(job, 'doc_edit', fields, 'ambiguous-edit'))).toContain('unconfirmed');
@@ -606,7 +694,12 @@ it('lets a cleared private write reach verified principal and assistant accounts
     'principal-mark',
     new Date().toISOString(),
   );
-  const result = await request(job, 'doc_edit', { file, find: 'the lake', replace: '123 Secret Lane' });
+  const result = await request(job, 'doc_edit', {
+    file,
+    revision: await observedRevision(file),
+    find: 'the lake',
+    replace: '123 Secret Lane',
+  });
   expect(accepted(result)).toEqual({ file, message: 'The document was edited.' });
   expect(JSON.stringify(result)).not.toContain('juno@example.com');
   expect(JSON.stringify(result)).not.toContain('assistant@example.com');
