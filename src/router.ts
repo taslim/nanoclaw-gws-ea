@@ -790,7 +790,6 @@ async function deliverToAgent(
     threadId: effectiveThreadId,
   };
 
-  // Classify original transport content before preparation; visible denials obey engagement and admission.
   let deniedCommand: string | undefined;
   if (event.message.kind === 'chat' || event.message.kind === 'chat-sdk') {
     const gate = await gateCommand(event.message.content, userId, agent.agent_group_id);

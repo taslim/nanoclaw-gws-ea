@@ -51,6 +51,7 @@ function clear(platform: string, group: boolean, addressed = false, person = '22
   return {
     channelType: 'whatsapp',
     platformId: platform,
+    threadId: null,
     message: {
       id: `clear-${platform}`,
       kind: 'chat',
@@ -136,5 +137,5 @@ it('native manual Google Chat wiring keeps mention engagement and wakes on a men
   const messages = await withExistingMailboxSession('peer', session!.id, (mailbox) =>
     mailbox.getInboundRecords({ status: 'pending' }),
   );
-  expect(messages.find((row) => row.id === 'mentioned:peer')).toMatchObject({ threadId: 'thread' });
+  expect(messages?.find((row) => row.id === 'mentioned:peer')).toMatchObject({ threadId: 'thread' });
 });
