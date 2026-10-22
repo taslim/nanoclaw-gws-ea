@@ -11,7 +11,7 @@ vi.mock('../../config.js', async (original) => ({
 }));
 vi.mock('../../request-wake.js', () => ({ requestWake: vi.fn(async () => true) }));
 import { closeDb, createAgentGroup, createMessagingGroup, getDb, initTestDb, runMigrations } from '../../db/index.js';
-import { setDeliveryAdapter } from '../../delivery.js';
+import { getDeliveryAction, setDeliveryAdapter } from '../../delivery.js';
 import { inboundDbPath } from '../../mailbox/sqlite/paths.js';
 import { resolveSession } from '../../session-manager.js';
 import type { PendingApproval, Session } from '../../types.js';
@@ -123,8 +123,9 @@ describe('standing reservation guarantee coverage', () => {
   });
 });
 
-describe('a standing guarantee the principal declines', () => {
+describe('standing reservation guarantees through native host delivery', () => {
   const PRINCIPAL = 'gchat:users/morgan';
+  const OPERATOR = 'gchat:users/operator';
   let main: Session;
 
   beforeEach(async () => {
@@ -153,6 +154,7 @@ describe('a standing guarantee the principal declines', () => {
       created_at: at,
     });
     await upsertUser({ id: PRINCIPAL, kind: 'gchat', display_name: 'Morgan', created_at: at });
+    await upsertUser({ id: OPERATOR, kind: 'gchat', display_name: 'Operator', created_at: at });
     await upsertUserDm({ user_id: PRINCIPAL, channel_type: 'gchat', messaging_group_id: 'rg-dm', resolved_at: at });
     await bindVerifiedPrincipalUser(PRINCIPAL, at);
     setDeliveryAdapter({ deliver: async () => 'guarantee-card' });
@@ -175,11 +177,11 @@ describe('a standing guarantee the principal declines', () => {
     const [approval] = await getDb().all<PendingApproval>('SELECT * FROM pending_approvals');
     return approval;
   }
-  async function answer(approval: PendingApproval, value: 'approve' | 'reject'): Promise<void> {
+  async function answer(approval: PendingApproval, value: 'approve' | 'reject', userId = PRINCIPAL): Promise<void> {
     await handleApprovalsResponse({
       questionId: approval.approval_id,
       value,
-      userId: PRINCIPAL,
+      userId,
       channelType: 'gchat',
       platformId: 'spaces/morgan',
       threadId: null,
@@ -197,6 +199,67 @@ describe('a standing guarantee the principal declines', () => {
       db.close();
     }
   }
+
+  it('requires explicit main proposals and principal approval for any standing guarantee', async () => {
+    const handler = getDeliveryAction('reservation_guarantee')!;
+    await handler({ action: 'reservation_guarantee', requestId: 'grant-read', operation: 'read' }, main);
+    expect(await getDb().all('SELECT * FROM gws_ea_browser_reservation_guarantees')).toEqual([]);
+    await handler(
+      {
+        action: 'reservation_guarantee',
+        requestId: 'grant-propose',
+        operation: 'propose',
+        currency: 'USD',
+        max_total: '100.00',
+      },
+      main,
+    );
+    const [row] = await getDb().all<PendingApproval>('SELECT * FROM pending_approvals');
+    expect(row.approver_user_id).toBe(PRINCIPAL);
+    await answer(row, 'approve', OPERATOR);
+    expect(await getDb().all('SELECT * FROM gws_ea_browser_reservation_guarantees')).toEqual([]);
+    await answer(row, 'approve');
+    expect(await getDb().all('SELECT * FROM gws_ea_browser_reservation_guarantees')).toMatchObject([
+      { currency: 'USD', max_total_minor: 10000, revoked_at: null },
+    ]);
+    await handler({ action: 'reservation_guarantee', requestId: 'grant-revoke', operation: 'revoke' }, main);
+    expect(
+      (await getDb().get<{ revoked_at: string }>('SELECT revoked_at FROM gws_ea_browser_reservation_guarantees'))
+        ?.revoked_at,
+    ).toBeTruthy();
+  });
+
+  it.each([
+    ['JPY', '100', 100],
+    ['KWD', '1.234', 1234],
+  ] as const)(
+    'preserves a principal-confirmed %s guarantee in its currency units',
+    async (currency, maximum, minor) => {
+      const handler = getDeliveryAction('reservation_guarantee')!;
+      await handler(
+        {
+          action: 'reservation_guarantee',
+          requestId: 'currency-proposal',
+          operation: 'propose',
+          currency,
+          max_total: maximum,
+        },
+        main,
+      );
+      const [row] = await getDb().all<PendingApproval>('SELECT * FROM pending_approvals');
+      expect(row).toBeDefined();
+      await answer(row, 'approve');
+      expect(await getDb().get('SELECT currency,max_total_minor FROM gws_ea_browser_reservation_guarantees')).toEqual({
+        currency,
+        max_total_minor: minor,
+      });
+      expect(await reservationGuaranteeRequest({ operation: 'read' }, main, 'currency-read')).toMatchObject({
+        status: 'active',
+        currency,
+        max_total: maximum,
+      });
+    },
+  );
 
   it('tells main the principal declined, and that a reservation with a fee still comes to them on its own card', async () => {
     await answer(await propose('first', '100.00'), 'reject');

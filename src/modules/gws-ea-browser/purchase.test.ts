@@ -61,7 +61,6 @@ import { ensureBrowserNavigationGuard } from './commit-classifier.js';
 import { secureJobPage } from './connection.js';
 import { prepareAuthenticationIsolation } from './authentication-submit.js';
 import { coverPageTargets } from './page-targets.js';
-import { registerReservationGuaranteeDelivery, reservationGuaranteeRequest } from './reservation-guarantee.js';
 import { setBrowserAdmissionReady } from './group.js';
 
 const PRINCIPAL = 'gchat:users/principal';
@@ -531,7 +530,6 @@ describe.skipIf(!chromePath)('reviewed merchant purchases through native host de
       onDisconnected: () => () => undefined,
     });
     registerBrowserPurchaseDelivery(() => queue);
-    if (!getDeliveryAction('reservation_guarantee')) registerReservationGuaranteeDelivery();
     await recoverAndStartBrowserQueue(queue);
     await resumeBrowserPurchaseCommits(queue);
     setBrowserAdmissionReady(true);
@@ -959,34 +957,6 @@ describe.skipIf(!chromePath)('reviewed merchant purchases through native host de
     await queue.idle();
     expect(submitted).toBe(1);
   });
-  it('requires explicit main proposals and principal approval for any standing guarantee', async () => {
-    const handler = getDeliveryAction('reservation_guarantee')!;
-    await handler({ action: 'reservation_guarantee', requestId: 'grant-read', operation: 'read' }, main);
-    expect(await getDb().all('SELECT * FROM gws_ea_browser_reservation_guarantees')).toEqual([]);
-    await handler(
-      {
-        action: 'reservation_guarantee',
-        requestId: 'grant-propose',
-        operation: 'propose',
-        currency: 'USD',
-        max_total: '100.00',
-      },
-      main,
-    );
-    const [row] = await approvals();
-    expect(row.approver_user_id).toBe(PRINCIPAL);
-    await click(row, 'approve', OPERATOR);
-    expect(await getDb().all('SELECT * FROM gws_ea_browser_reservation_guarantees')).toEqual([]);
-    await click(row);
-    expect(await getDb().all('SELECT * FROM gws_ea_browser_reservation_guarantees')).toMatchObject([
-      { currency: 'USD', max_total_minor: 10000, revoked_at: null },
-    ]);
-    await handler({ action: 'reservation_guarantee', requestId: 'grant-revoke', operation: 'revoke' }, main);
-    expect(
-      (await getDb().get<{ revoked_at: string }>('SELECT revoked_at FROM gws_ea_browser_reservation_guarantees'))
-        ?.revoked_at,
-    ).toBeTruthy();
-  });
   it('tells the job of a declined card once, as the principal’s decision', async () => {
     await buy();
     await click((await approvals())[0], 'reject');
@@ -1084,37 +1054,6 @@ describe.skipIf(!chromePath)('reviewed merchant purchases through native host de
     expect(await readBrowserJob(session.thread_id!)).toMatchObject({ state: 'idle' });
     expect(await getDb().get('SELECT status FROM gws_ea_browser_purchase_cards')).toEqual({ status: 'expired' });
   });
-  it.each([
-    ['JPY', '100', 100],
-    ['KWD', '1.234', 1234],
-  ] as const)(
-    'preserves a principal-confirmed %s guarantee in its currency units',
-    async (currency, maximum, minor) => {
-      const handler = getDeliveryAction('reservation_guarantee')!;
-      await handler(
-        {
-          action: 'reservation_guarantee',
-          requestId: 'currency-proposal',
-          operation: 'propose',
-          currency,
-          max_total: maximum,
-        },
-        main,
-      );
-      const [row] = await approvals();
-      expect(row).toBeDefined();
-      await click(row);
-      expect(await getDb().get('SELECT currency,max_total_minor FROM gws_ea_browser_reservation_guarantees')).toEqual({
-        currency,
-        max_total_minor: minor,
-      });
-      expect(await reservationGuaranteeRequest({ operation: 'read' }, main, 'currency-read')).toMatchObject({
-        status: 'active',
-        currency,
-        max_total: maximum,
-      });
-    },
-  );
   it('returns in_progress for cancellation during the native press and completes cancellation after its verified outcome', async () => {
     let release!: () => void;
     holdPost = new Promise<void>((resolve) => {
@@ -1593,6 +1532,11 @@ describe.skipIf(!chromePath)('reviewed merchant purchases through native host de
         `nested-now-${trial}`,
       );
       await queue.idle();
+      expect(await request(`nested-now-${trial}`)).toMatchObject({ status: 'stopped', reason: 'purchase_control' });
+      // The nested child's script reports before attempting its purchase navigation.
+      await expect
+        .poll(() => page.locator('#redirected').textContent(), { timeout: 5_000 })
+        .toBe(`Redirected ${trial}`);
     }
     expect(widgetRequests.filter((path) => path === '/checkout/placeorder')).toHaveLength(0);
   }, 120_000);
