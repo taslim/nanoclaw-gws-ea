@@ -335,8 +335,9 @@ describe('optional host browser lifecycle', () => {
     }
   });
   it.skipIf(!process.env.GWS_EA_BROWSER_TEST_CHROME)(
-    'keeps the other native job page usable when one job closes',
+    'starts under the service PATH and keeps the other native job page usable when one job closes',
     async () => {
+      vi.stubEnv('PATH', '/usr/local/bin:/usr/bin:/bin');
       await ensureBrowserPaths(browserPaths(file));
       await writePrivateFile(
         file,

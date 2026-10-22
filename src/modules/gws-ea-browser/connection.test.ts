@@ -104,7 +104,7 @@ describe('owned loopback Chrome attachment', () => {
     expect(requests).toMatchObject([{ hostname: '127.0.0.1', port, path: '/json/version' }]);
     expect(lsof).toHaveBeenCalledTimes(2);
     expect(lsof.mock.calls[0]?.slice(0, 2)).toEqual([
-      'lsof',
+      process.platform === 'darwin' ? '/usr/sbin/lsof' : 'lsof',
       ['-w', '-nP', '-a', `-iTCP:${port}`, '-sTCP:LISTEN', '-Fpfn'],
     ]);
     expect(attach).toHaveBeenCalledExactlyOnceWith(endpoint, { isLocal: true, artifactsDir: paths.artifactsDir });
