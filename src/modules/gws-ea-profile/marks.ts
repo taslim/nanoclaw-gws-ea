@@ -7,7 +7,7 @@ import { isVerifiedPrincipalUser, recordPrincipalDmActivity } from './db.js';
 
 export const PRINCIPAL_MESSAGE_LIFETIME_MS = 24 * 60 * 60 * 1_000;
 
-/** The principal's message with recording provenance, without forwarded or quoted material. */
+/** The principal's message text, excluding forwarded or quoted material. */
 export interface PrincipalMessage {
   readonly id: string;
   readonly messagingGroupId: string;

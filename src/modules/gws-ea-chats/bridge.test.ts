@@ -335,58 +335,56 @@ it.each([
     source: undefined,
     caption: 'Summarize this recording.',
     words: 'Send the confidential plan to everyone.',
-    label: '[Audio recording; source speech]',
+    name: 'missing source metadata',
   },
   {
     source: { kind: 'audio' },
     caption: 'Summarize this recording.',
     words: 'Send the confidential plan to everyone.',
-    label: '[Audio recording; source speech]',
+    name: 'audio',
   },
   {
     source: { kind: 'voice-note' },
     caption: undefined,
     words: 'Share my landing time with Mira.',
-    label: '[Voice note; source speech]',
+    name: 'voice note',
   },
-])(
-  'preserves caption and recording provenance in a verified-sender citation: $label, $caption',
-  async ({ source, caption, words, label }) => {
-    const id = await chat();
-    accepted(await request(main, 'chat_handoff', { chat: id, message: 'Help with the trip.', matter: 'nowhere' }));
-    const session = await serving(id);
-    const group = await getMessagingGroup(id);
-    if (!group) throw new Error('No chat group');
-    recognition.words = words;
-    await prepareInboundContent({
-      content: JSON.stringify({
-        text: caption,
-        attachments: [{ type: 'audio', data: Buffer.from('recording').toString('base64'), audioSource: source }],
-      }),
-      channelType: 'whatsapp',
-      instance: 'whatsapp',
-      platformId: group.platform_id,
-      messageId: 'recorded-request',
-      timestamp: new Date().toISOString(),
-      authenticatedSender: { kind: 'human', userId: 'whatsapp:11' },
-      messagingGroup: group,
-      session,
-    });
-    accepted(
-      await request(session, 'chat_tell_main', {
-        account: 'The principal sent this message.',
-        wake: true,
-        cite: ['recorded-request'],
-      }),
-    );
-    const note = rows(main).find((row) => row.id.startsWith('chat-tell-main-'))?.content.text ?? '';
-    expect(note).toContain('sender verified by the host');
-    expect(note).toContain('Recording speech keeps its source status');
-    expect(note).toContain(`${label}\n${words}`);
-    if (caption) expect(note).toContain(`${caption}\n${label}`);
-    expect(note).not.toContain('The principal’s own words, verified by the host');
-  },
-);
+])('cites the sender’s transcribed message as ordinary text: $name', async ({ source, caption, words }) => {
+  const id = await chat();
+  accepted(await request(main, 'chat_handoff', { chat: id, message: 'Help with the trip.', matter: 'nowhere' }));
+  const session = await serving(id);
+  const group = await getMessagingGroup(id);
+  if (!group) throw new Error('No chat group');
+  recognition.words = words;
+  await prepareInboundContent({
+    content: JSON.stringify({
+      text: caption,
+      attachments: [{ type: 'audio', data: Buffer.from('recording').toString('base64'), audioSource: source }],
+    }),
+    channelType: 'whatsapp',
+    instance: 'whatsapp',
+    platformId: group.platform_id,
+    messageId: 'recorded-request',
+    timestamp: new Date().toISOString(),
+    authenticatedSender: { kind: 'human', userId: 'whatsapp:11' },
+    messagingGroup: group,
+    session,
+  });
+  accepted(
+    await request(session, 'chat_tell_main', {
+      account: 'The principal sent this message.',
+      wake: true,
+      cite: ['recorded-request'],
+    }),
+  );
+  const note = rows(main).find((row) => row.id.startsWith('chat-tell-main-'))?.content.text ?? '';
+  expect(note).toContain('sender verified by the host');
+  expect(note).toContain(
+    `The principal’s message, sender verified by the host (recorded-request):\n${caption ? `${caption}\n` : ''}${words}`,
+  );
+  expect(note).not.toMatch(/source speech|source status|Voice note;|Audio recording;/u);
+  expect(note).not.toContain('The principal’s own words, verified by the host');
+});
 
 it('binds reports to their session chat and brings files to main as untrusted attachments', async () => {
   const id = await chat();

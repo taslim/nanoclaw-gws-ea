@@ -2074,15 +2074,10 @@ describe('recorded divergence: compaction keeps the relationship and the work in
   });
 });
 
-describe('recorded divergence: recognized speech carries its reading note and an unheard recording a status line for its reader', () => {
-  it("says how to read speech once, and names the operator only in the principal's own private conversation", async () => {
+describe('recorded divergence: an unheard recording carries a status line for its reader', () => {
+  it("names the operator only in the principal's own private conversation", async () => {
     const formatter = await readFile(path.join(originalCwd, 'container/agent-runner/src/formatter.ts'), 'utf8');
 
-    expect(formatter).toContain('const SPEECH_READING_NOTE =');
-    expect(formatter).toContain(
-      'A self-correction replaces what it corrects. Keep every point, number, negation and condition',
-    );
-    expect(formatter).toContain('`\\n<speech_note>${SPEECH_READING_NOTE}</speech_note>`');
     expect(formatter).toContain('const principals = speech.inPrincipalPrivateConversation === true;');
     expect(formatter).toContain('const NOT_LISTENED_ELSEWHERE =');
     expect(formatter).toContain(

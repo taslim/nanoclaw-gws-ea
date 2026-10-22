@@ -27,16 +27,9 @@ function record(value: unknown): Record<string, unknown> | undefined {
     : undefined;
 }
 
-function recordingLabel(source: Record<string, unknown> | undefined): string {
-  if (source?.forwarded === true) return '[Forwarded recording; source information]';
-  if (source?.quoted === true) return '[Quoted recording; source information]';
-  return source?.kind === 'voice-note' ? '[Voice note; source speech]' : '[Audio recording; source speech]';
-}
-
 /**
- * Conversation context keeps the caption and faithful speech together, with
- * source status before any transcript excerpt. This must never be used for
- * command classification, platform mentions, or regex engagement.
+ * Conversation context includes transcriptions as message text. This must never
+ * be used for command classification, platform mentions, or regex engagement.
  */
 export function parseInboundContent(raw: string): {
   text: string;
@@ -66,7 +59,10 @@ export function extractInboundContent(value: unknown): {
       const attachment = record(value);
       const speech = record(attachment?.speech);
       if (speech?.status !== 'recognized' || typeof speech.text !== 'string' || !speech.text) continue;
-      parts.push(`${recordingLabel(record(attachment?.audioSource))}\n${speech.text}`);
+      const source = record(attachment?.audioSource);
+      if (source?.forwarded === true) parts.push('[Forwarded]');
+      if (source?.quoted === true) parts.push('[Quoted]');
+      parts.push(speech.text);
     }
   }
   return {

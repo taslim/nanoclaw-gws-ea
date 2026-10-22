@@ -532,14 +532,6 @@ function attachmentText(value: unknown): string {
 }
 
 /**
- * How to read recognized speech, said once after a message's attachments. It
- * covers reading a transcript only: whose words a recording holds is decided
- * as for any attachment.
- */
-const SPEECH_READING_NOTE =
-  "Recognition can mishear a word, so read the speech for what was meant. A self-correction replaces what it corrects. Keep every point, number, negation and condition, even in a rambling note. Don't repeat the transcript back.";
-
-/**
  * Why voice notes could not hear a recording, as the principal may hear it:
  * each names their operator, the only one who can change it.
  */
@@ -595,7 +587,6 @@ function isRecognizedSpeech(speech: Record<string, unknown> | undefined): boolea
   return speech?.status === 'recognized' && attachmentText(speech.text).trim() !== '';
 }
 
-/** Speech remains nested source material; engine/model diagnostics stay in storage. */
 function formatSpeech(attachment: Record<string, unknown>): string {
   const speech = attachmentRecord(attachment.speech);
   if (!speech) return '';
@@ -605,9 +596,14 @@ function formatSpeech(attachment: Record<string, unknown>): string {
     (source?.forwarded === true ? ' forwarded="true"' : '') +
     (source?.quoted === true ? ' quoted="true"' : '');
   if (isRecognizedSpeech(speech)) {
-    const language = attachmentText(speech.language);
-    const languageAttr = language ? ` language="${escapeXml(language)}"` : '';
-    return `\n<speech status="recognized"${sourceAttrs}${languageAttr}>${escapeXml(attachmentText(speech.text))}</speech>`;
+    return (
+      '\n' +
+      [
+        ...(source?.forwarded === true ? ['[Forwarded]'] : []),
+        ...(source?.quoted === true ? ['[Quoted]'] : []),
+        escapeXml(attachmentText(speech.text)),
+      ].join('\n')
+    );
   }
   const status = speech.status === 'unavailable' || speech.status === 'no-speech' ? speech.status : 'failed';
   return `\n<speech status="${status}"${sourceAttrs}>${speechStatusLine(speech)}</speech>`;
@@ -615,10 +611,8 @@ function formatSpeech(attachment: Record<string, unknown>): string {
 
 function formatAttachments(attachments: unknown): string {
   if (!Array.isArray(attachments) || attachments.length === 0) return '';
-  let heard = false;
   const parts = attachments.map((value: unknown) => {
     const a = attachmentRecord(value) ?? {};
-    heard ||= isRecognizedSpeech(attachmentRecord(a.speech));
     const name = attachmentText(a.name) || attachmentText(a.filename) || 'attachment';
     const type = attachmentText(a.type) || 'file';
     const local = attachmentText(a.localPath);
@@ -633,7 +627,7 @@ function formatAttachments(attachments: unknown): string {
       : `[${escapeXml(type)}: ${escapeXml(name)}]`;
     return description + speech;
   });
-  return '\n' + parts.join('\n') + (heard ? `\n<speech_note>${SPEECH_READING_NOTE}</speech_note>` : '');
+  return '\n' + parts.join('\n');
 }
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
