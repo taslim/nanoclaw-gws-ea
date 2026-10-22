@@ -36,6 +36,7 @@ import { getInstallScopedNames } from '../install-slug.js';
 import { createWorkspaceEventsApi, type WorkspaceEventsApi } from '../modules/gws-ea-chat/subscription.js';
 import { GOOGLE_GRANT_FILE_NAME, type GoogleGrant } from '../modules/gws-ea-google/grant.js';
 import { readGoogleGrantFile } from '../modules/gws-ea-google/grant-file.js';
+import { logoutWhatsAppAccount, type WhatsAppLogoutOptions } from '../modules/gws-ea-whatsapp/logout.js';
 import {
   GoogleGrantRevokedError,
   GoogleScopeNotGrantedError,
@@ -55,6 +56,7 @@ import {
   type GcpProjectCoordinates,
 } from './gcloud.js';
 import { readProvisionJournal } from './journal.js';
+import { runInstanceNclJson } from './ncl.js';
 import type { OnePasswordCliSeams } from './onepassword.js';
 import {
   captureOnePasswordCleanup,
@@ -97,7 +99,7 @@ import {
 } from './registry.js';
 import { activeStep } from './run-log.js';
 import { readOwnerOnlyJson, removePrivateFile } from './secrets.js';
-import { serviceManagerEnvironment } from './service.js';
+import { loadInstanceRuntimeConfig, serviceManagerEnvironment } from './service.js';
 import { createServiceControl, type NanoclawServiceHelpers, type ServiceControlTarget } from './service-control.js';
 import {
   createInstanceServiceCoordinates,
@@ -110,6 +112,7 @@ import { canonicalTimestamp, isRecord, requireDockerEndpoint, requirePath } from
 
 /** Resources in teardown order; the registry entry is released after all of them. */
 export const REMOVAL_RESOURCES = [
+  'whatsapp',
   'nanoclaw',
   'chat-subscription',
   'onepassword',
@@ -148,6 +151,7 @@ const INVALID_RECORD = 'invalid_runtime_config';
 const UNREADABLE_CLEANUP = 'removal_receipt_unreadable';
 
 const RESOURCE_STEPS: Readonly<Record<RemovalResource, StepIdentity>> = {
+  whatsapp: { id: 'remove_whatsapp', label: 'Signing out the assistant’s WhatsApp device…' },
   nanoclaw: { id: 'remove_nanoclaw', label: 'Stopping NanoClaw…' },
   'chat-subscription': { id: 'remove_chat_subscription', label: 'Deleting the Google Chat subscription…' },
   onepassword: { id: 'remove_onepassword', label: "Cleaning up the assistant's 1Password vault and token…" },
@@ -204,6 +208,8 @@ export interface RemovalOptions {
 
 /** Boundary seams; each defaults to the real one. */
 export interface RemovalDependencies extends RemovalOptions {
+  readonly ncl?: typeof runInstanceNclJson;
+  readonly whatsapp?: Omit<WhatsAppLogoutOptions, 'directory' | 'number'>;
   readonly platform?: InstanceServicePlatform;
   /** Reaches Google as the assistant: its Chat token and its Workspace Events subscription. */
   readonly fetch?: typeof globalThis.fetch;
@@ -812,6 +818,14 @@ async function removeLocked(
   const reservation =
     registry.instances[instanceId] ?? existing?.reservation ?? (await getInstanceReservation(paths, instanceId));
   const claims = reservation.exclusive_resource_claims;
+  let releaseReservation = reservation;
+  const { whatsapp_number: _whatsappNumber, ...withoutWhatsApp } = claims;
+  const unlinkedReservation = { ...reservation, exclusive_resource_claims: withoutWhatsApp };
+  const reconcileUnlinkedReservation = async (): Promise<void> => {
+    // Native unlink releases exactly this claim before removing auth or answering ncl. No other change is adopted.
+    const current = (await readRegistry(paths)).instances[instanceId];
+    if (JSON.stringify(current) === JSON.stringify(unlinkedReservation)) releaseReservation = unlinkedReservation;
+  };
   let receipt: RemovalReceipt = existing ?? {
     schema_version: RECEIPT_SCHEMA_VERSION,
     instance_id: instanceId,
@@ -831,7 +845,18 @@ async function removeLocked(
   // Released last, so a released reservation left only local files and the receipt behind.
   const released = registry.instances[instanceId] === undefined;
   const started = (step: ProvisionStepId): boolean => !released && provisioning.started(step);
+  const whatsappDirectory = path.join(paths.instanceRoot(instanceId), 'secrets', 'whatsapp');
+  const hasWhatsApp =
+    claims.whatsapp_number !== undefined ||
+    (await access(whatsappDirectory).then(
+      () => true,
+      (error: unknown) => {
+        if (isErrno(error, 'ENOENT')) return false;
+        throw error;
+      },
+    ));
   const owned: Readonly<Record<RemovalResource, boolean>> = {
+    whatsapp: hasWhatsApp,
     nanoclaw: started('start_nanoclaw'),
     // The host keeps the subscription from its start, with the assistant's sign-in.
     'chat-subscription': started('start_nanoclaw'),
@@ -910,8 +935,8 @@ async function removeLocked(
   const onePasswordSeams = dependencies.onePassword;
 
   await runStep(reporter, { id: 'prerequisites' }, async () => {
-    if (pending.has('nanoclaw')) requireUninstall();
-    if (pending.has('nanoclaw') || pending.has('onecli')) await docker();
+    if (pending.has('nanoclaw') || pending.has('whatsapp')) requireUninstall();
+    if (pending.has('nanoclaw') || pending.has('onecli') || pending.has('whatsapp')) await docker();
     if (pending.has('gcp-project')) {
       await withSignIn(async () => {
         await assertGcloudInstalled(runGcloud);
@@ -946,6 +971,36 @@ async function removeLocked(
   await record((current) => current);
 
   const removals: Readonly<Record<RemovalResource, () => Promise<Evidence | undefined>>> = {
+    whatsapp: async () => {
+      if (!receipt.completed.nanoclaw) {
+        try {
+          const runtime = await loadInstanceRuntimeConfig(paths.runtimeFile(instanceId));
+          const result = await (dependencies.ncl ?? runInstanceNclJson)(runtime, ['gws-ea-whatsapp', 'unlink']);
+          if (!isRecord(result) || result.state !== 'unlinked')
+            throw new Error('The host did not confirm WhatsApp unlink.');
+          await reconcileUnlinkedReservation();
+          return undefined;
+          // eslint-disable-next-line no-catch-all/no-catch-all -- Any failed live-host unlink falls back only after verified native teardown.
+        } catch (error) {
+          activeStep()?.write(
+            `Host unlink could not finish: ${error instanceof Error ? redact(error.message) : 'host unavailable'}; stopping this instance before native sign-out.\n`,
+          );
+        }
+        // This exact native teardown verifies the host has exited and drains its containers before a second socket opens.
+        await requireUninstall()(reservation, await localRuntime());
+        await record((current) => ({
+          ...current,
+          completed: { ...current.completed, nanoclaw: new Date().toISOString() },
+        }));
+      }
+      await reconcileUnlinkedReservation();
+      await logoutWhatsAppAccount({
+        directory: whatsappDirectory,
+        number: releaseReservation.exclusive_resource_claims.whatsapp_number,
+        ...dependencies.whatsapp,
+      });
+      return undefined;
+    },
     nanoclaw: async () => {
       await requireUninstall()(reservation, await localRuntime());
       return undefined;
@@ -1032,7 +1087,7 @@ async function removeLocked(
   };
 
   for (const resource of REMOVAL_RESOURCES) {
-    if (!pending.has(resource)) continue;
+    if (!pending.has(resource) || receipt.completed[resource]) continue;
     const abandoned = await runStep(reporter, RESOURCE_STEPS[resource], removals[resource]);
     await record((current) =>
       abandoned && isAbandonable(resource)
@@ -1040,7 +1095,7 @@ async function removeLocked(
         : { ...current, completed: { ...current.completed, [resource]: new Date().toISOString() } },
     );
   }
-  await releaseInstanceReservation(paths, reservation);
+  await releaseInstanceReservation(paths, releaseReservation);
   // Local removal is complete. A service account left to revoke, or a creation never proven, keeps the receipt until the operator closes it.
   const cleanup = receipt.onepassword;
   const owed = cleanup !== undefined && onePasswordCleanupOwed(cleanup);

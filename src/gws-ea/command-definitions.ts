@@ -32,6 +32,7 @@ export type CommandHandler =
   | { readonly kind: 'attempt'; readonly command: AttemptCommand }
   | { readonly kind: 'observation'; readonly command: 'list' | 'status' | 'logs' }
   | { readonly kind: 'native'; readonly command: 'ncl' }
+  | { readonly kind: 'whatsapp'; readonly command: 'link' | 'unlink' | 'status' }
   | {
       readonly kind: 'capability';
       readonly command: 'list' | 'show' | 'check' | 'install' | 'enable' | 'disable' | 'uninstall';
@@ -140,6 +141,64 @@ export const COMMON_OPTIONS: readonly OptionDefinition[] = [
 ];
 
 export const COMMAND_DEFINITIONS: readonly CommandDefinition[] = [
+  ...(['link', 'unlink', 'status'] as const).map(
+    (command): CommandDefinition => ({
+      path: ['whatsapp', command],
+      group: 'Service',
+      handler: { kind: 'whatsapp', command },
+      scope: 'assistant',
+      summary:
+        command === 'link'
+          ? 'Link the assistant’s own WhatsApp number with a pairing code.'
+          : command === 'unlink'
+            ? 'Unlink WhatsApp and remove the principal’s WhatsApp binding.'
+            : 'Show the assistant’s WhatsApp link state.',
+      options: [
+        id,
+        ...(command === 'link'
+          ? [
+              value('number', 'e164', 'The assistant’s own WhatsApp number, with country code.'),
+              value(
+                'principal-number',
+                'e164',
+                'The principal’s WhatsApp number, with country code. Omit both numbers for a re-link.',
+              ),
+            ]
+          : []),
+      ],
+      effects:
+        command === 'status'
+          ? ['Reads the running host’s link state.']
+          : command === 'link'
+            ? [
+                'Claims the assistant’s number and opens one pairing connection. The principal then proves their number with a binding code.',
+              ]
+            : ['Logs out and deletes the auth store and binding, retaining account-scoped contact refusals and locks.'],
+      prerequisites: [...assistantPrerequisites, 'A running assistant host.'],
+      recovery: ['Re-link needs no numbers restated; changed numbers require unlink and a fresh binding proof.'],
+      examples: [
+        `gws-ea whatsapp ${command} --id <instance_id>${command === 'link' ? ' --number +15550000000 --principal-number +447700900123' : ''}`,
+      ],
+      outputModes: ['human', 'json'],
+      resultSchema: managedResultSchema({
+        type: 'object',
+        properties: {
+          state: { enum: ['unlinked', 'linking', 'connected', 'needs-relink'] },
+          number: { type: 'string' },
+          principal: {
+            type: 'object',
+            properties: { lid: { type: 'string' }, phoneJid: { type: 'string' } },
+            required: ['lid'],
+            additionalProperties: false,
+          },
+          bindingPending: { type: 'boolean' },
+          pairingCode: { type: 'string' },
+        },
+        required: ['state'],
+        additionalProperties: false,
+      }),
+    }),
+  ),
   {
     path: ['create'],
     group: 'Assistants',

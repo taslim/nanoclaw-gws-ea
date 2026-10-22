@@ -25,6 +25,7 @@ import { bookingThread } from '../gws-ea-meetings/thread-calendar.js';
 import { getPerson } from '../gws-ea-people/db.js';
 import { loadPrincipalRecognizer } from '../gws-ea-profile/db.js';
 import { getMatter, listOpenMatterLinks, type Matter, type OpenMatterLink, type PieceKind } from './db.js';
+import { chatMemberPeople } from './chat-links.js';
 
 /** Why an open matter is suggested, strongest first. */
 export const CANDIDATE_REASONS = ['reply chain', 'booking', 'same person', 'same organization'] as const;
@@ -133,6 +134,17 @@ async function addressesOf(personId: string): Promise<string[]> {
   });
 }
 
+function personReason(
+  addresses: readonly string[],
+  senderKey: string,
+  organization: string | undefined,
+): CandidateReason | undefined {
+  if (addresses.some((address) => identityMatchKey(`email:${address}`) === senderKey)) return 'same person';
+  if (organization !== undefined && addresses.some((address) => domainOf(address) === organization))
+    return 'same organization';
+  return undefined;
+}
+
 async function candidate(matter: Matter, reasons: ReadonlySet<CandidateReason>): Promise<Candidate> {
   const project = matter.parent_id === null ? undefined : await getMatter(matter.parent_id);
   return {
@@ -160,20 +172,21 @@ export async function candidatesFor(piece: NewPiece, reads?: CandidateReads): Pr
   const organization = await organizationOf(sender, own);
   const senderKey = identityMatchKey(`email:${sender}`);
   const people = new Map<string, CandidateReason | undefined>();
-  for (const link of links.filter((held) => held.kind === 'person')) {
-    if (!people.has(link.reference)) {
-      const addresses = await addressesOf(link.reference);
-      people.set(
-        link.reference,
-        addresses.some((address) => identityMatchKey(`email:${address}`) === senderKey)
-          ? 'same person'
-          : organization !== undefined && addresses.some((address) => domainOf(address) === organization)
-            ? 'same organization'
-            : undefined,
-      );
+  const rosters = new Map<string, readonly string[]>();
+  for (const link of links.filter((held) => held.kind === 'person' || held.kind === 'chat')) {
+    let personIds: readonly string[] = [link.reference];
+    if (link.kind === 'chat') {
+      const cached = rosters.get(link.reference);
+      personIds = cached ?? (await chatMemberPeople(link.reference));
+      if (cached === undefined) rosters.set(link.reference, personIds);
     }
-    const reason = people.get(link.reference);
-    if (reason !== undefined) suggest(link.matter_id, reason);
+    for (const personId of personIds) {
+      if (!people.has(personId)) {
+        people.set(personId, personReason(await addressesOf(personId), senderKey, organization));
+      }
+      const reason = people.get(personId);
+      if (reason !== undefined) suggest(link.matter_id, reason);
+    }
   }
 
   const answered = new Set(await threadsWithMessageIds(piece.answers ?? []));

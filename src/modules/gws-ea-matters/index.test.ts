@@ -31,7 +31,7 @@ import { dispatch } from '../../cli/dispatch.js';
 import type { CallerContext, ResponseFrame } from '../../cli/frame.js';
 import { commandGuard, lookup } from '../../cli/registry.js';
 import { ensureContainerConfig, updateContainerConfigScalars } from '../../db/container-configs.js';
-import { closeDb, createAgentGroup, initTestDb, runMigrations } from '../../db/index.js';
+import { closeDb, createAgentGroup, createMessagingGroup, getDb, initTestDb, runMigrations } from '../../db/index.js';
 import type { AgentGroup } from '../../types.js';
 import '../gws-ea-profile/index.js';
 import '../gws-ea-people/index.js';
@@ -107,6 +107,46 @@ afterEach(async () => {
 });
 
 describe('GWS-EA matters ncl resource', () => {
+  it('links the same chat to two matters through native place, and unlinks only the named matter', async () => {
+    await createMessagingGroup({
+      id: 'mg-trip',
+      channel_type: 'whatsapp',
+      platform_id: 'trip@g.us',
+      name: 'Lake trip',
+      is_group: 1,
+      unknown_sender_policy: 'public',
+      created_at: NOW,
+    });
+    await getDb().exec(`CREATE TABLE gws_ea_chats (
+      messaging_group_id TEXT PRIMARY KEY, state TEXT NOT NULL, serving_agent_group_id TEXT NOT NULL
+    );
+    CREATE TABLE gws_ea_chat_members (messaging_group_id TEXT NOT NULL, person_id TEXT);`);
+    await getDb().run("INSERT INTO gws_ea_chats VALUES ('mg-trip', 'connected', 'ag-other')");
+    const first = await data<Placed>(
+      run('matters-open', {
+        title: 'Dinner Thursday',
+        'open-loop': 'Book dinner.',
+        look: '2026-10-14T09:00',
+      }),
+    );
+    const second = await data<Placed>(
+      run('matters-open', {
+        title: 'Lake trip',
+        'open-loop': 'Plan the trip.',
+        look: '2026-10-14T09:00',
+      }),
+    );
+    for (const matter of [first.matter, second.matter]) {
+      expect(await data(run('matters-place', { id: matter.id, chat: 'mg-trip' }))).toMatchObject({
+        matter: { links: [{ kind: 'chat', reference: 'mg-trip' }] },
+        moved: [],
+      });
+    }
+    await data(run('matters-update', { id: first.matter.id, unlink: 'chat:mg-trip' }));
+    expect((await getMatter(first.matter.id))?.links).toEqual([]);
+    expect((await getMatter(second.matter.id))?.links).toMatchObject([{ kind: 'chat', reference: 'mg-trip' }]);
+  });
+
   it('registers its own verbs as open, guarded matters commands, and no generic create or delete', () => {
     for (const verb of VERBS) {
       const command = lookup(`matters-${verb}`);

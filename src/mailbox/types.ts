@@ -3,6 +3,9 @@ import type {
   DestinationRecord,
   DirectOutboundWrite,
   InboundWrite,
+  InboundRecord,
+  InboundStatus,
+  OutboundRecord,
   OutboundDelivery,
   ProcessingAckRecord,
   SessionRoutingRecord,
@@ -33,6 +36,11 @@ export type {
 export interface MailboxSessionKey {
   agentGroupId: string;
   sessionId: string;
+}
+
+export interface HeldReleaseOptions {
+  readonly preserveTriggers?: boolean;
+  readonly preserveProcessAfter?: boolean;
 }
 
 export type ProcessingAck = ProcessingAckRecord;
@@ -129,14 +137,18 @@ export interface InboundMailbox {
   countUnreadContext(exceptChannelType: string): number;
   /**
    * Release every held message: each becomes a pending trigger, due at
-   * `processAfter` (null: due now). Returns how many it released.
+   * `processAfter` (null: due now). With preserveTriggers, retain each row's
+   * original engagement instead. With preserveProcessAfter, retain each row's
+   * stored deadline. Returns how many it released.
    */
-  releaseHeldMessages(processAfter: string | null): number;
+  releaseHeldMessages(processAfter: string | null, options?: HeldReleaseOptions): number;
   /**
    * Settle every held message: each is completed unread, so no turn ever
    * reads it and no later release brings it back. Returns how many it settled.
    */
   settleHeldMessages(): number;
+  /** Complete unread transferred pending/held rows only, after their durable destination insert. */
+  settleUnreadMessages(messageIds: readonly string[]): number;
   markMessageFailed(messageId: string): void;
   retryWithBackoff(messageId: string, backoffSec: number): void;
   getMessageForRetry(messageId: string, status: 'pending' | 'processing'): MessageRetry | undefined;
@@ -146,8 +158,10 @@ export interface InboundMailbox {
   hasMessage(messageId: string): boolean;
   /** The messages with these ids, whatever their status, in the order they arrived; an id it lacks is left out. */
   getInboundMessages(messageIds: readonly string[]): InboundOrigin[];
+  /** Stable source identities and lifecycle facts, in arrival order, for resumable host cutovers. */
+  getInboundRecords(options?: { readonly since?: string; readonly status?: InboundStatus }): InboundRecord[];
   applyProcessingAcks(acks: ProcessingAck[]): void;
-  getDeliveredIds(): Set<string>;
+  getDeliveredIds(status?: 'delivered'): Set<string>;
   markDelivered(messageOutId: string, platformMessageId: string | null): void;
   markDeliveryFailed(messageOutId: string): void;
   getInboundSourceSessionId(messageId: string): string | null;
@@ -182,6 +196,8 @@ export interface InboundMailbox {
 
 /** Host-visible outbound mailbox behavior. Storage layout and lifecycle are implementation-private. */
 export interface OutboundMailbox {
+  /** Stable outbound source rows since an inclusive timestamp, in arrival order. */
+  getOutboundRecords(since: string): OutboundRecord[];
   /** Read one immutable container request by its exact outbound id. Host only. */
   getOutboundMessage(id: string): OutboundMessage | undefined;
   getTerminalProcessingAcks(): ProcessingAck[];

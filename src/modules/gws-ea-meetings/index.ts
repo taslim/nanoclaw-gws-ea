@@ -20,17 +20,21 @@
  * a group holding Google Calendar. Each request gets one `action_response`,
  * refusals included. The runner's tool for each carries the same name.
  *
- * What a thread booked lives in the inbox's thread map (`thread-calendar.ts`);
- * this module has no tables of its own.
+ * What a thread booked lives in the inbox's thread map (`thread-calendar.ts`).
  */
 import { answeredGuard, answeringAction, forbidden, type ActionAnswer } from '../../cli/delivery-action.js';
 import { registerDeliveryAction } from '../../delivery.js';
 import { log } from '../../log.js';
 import { GOOGLE_CONNECTION_DOWN, isGoogleConnectionDown } from '../gws-ea-google/agent-boundary.js';
+import { registerMigration } from '../../db/migrations/index.js';
+import { registerChatLifecycleTask } from '../gws-ea-chats/lifecycle-tasks.js';
+import { chatBookingRequestsMigration } from './chat-booking-migration.js';
+import { chatBookingReportsMigration } from './chat-booking-report-migration.js';
 import { hostGoogleAccessToken } from '../gws-ea-google/index.js';
 import { createMeetingsCalendarApi, type MeetingsCalendarApi } from './calendar-api.js';
 import { createCalendarFactTools } from './calendar-facts.js';
-import { principalEventAction, threadCalendarAction } from './guard.js';
+import { chatCalendarAction, principalEventAction, threadCalendarAction } from './guard.js';
+import { createChatSchedulingTools } from './chat-calendar.js';
 import { createPrincipalEventTools } from './principal-events.js';
 import { createSchedulingTools } from './tools.js';
 
@@ -80,6 +84,19 @@ for (const [action, answer] of SCHEDULING_REQUESTS) {
     answeringAction(action, withConnectionStep(action, answer, EXTERNAL_EMAIL_STEP)),
     answeredGuard(threadCalendarAction),
   );
+}
+
+registerMigration(chatBookingRequestsMigration);
+registerMigration(chatBookingReportsMigration);
+const chatScheduling = createChatSchedulingTools({ calendar: calendarApi });
+registerChatLifecycleTask('gws-ea-meetings:chat-bookings', chatScheduling.resumePending);
+for (const [action, answer] of [
+  ['chat_free_time', chatScheduling.freeTime],
+  ['chat_book', chatScheduling.book],
+  ['chat_change_booking', chatScheduling.changeBooking],
+  ['chat_cancel_booking', chatScheduling.cancelBooking],
+] as const) {
+  registerDeliveryAction(action, answeringAction(action, answer), answeredGuard(chatCalendarAction));
 }
 
 const principalEvents = createPrincipalEventTools({ calendar: calendarApi });

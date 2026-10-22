@@ -34,6 +34,7 @@ import { requestApproval } from '../approvals/primitive.js';
 import { RENEW_BEFORE_EXPIRY_MS } from '../gws-ea-google/tokens.js';
 import { upsertUserDm } from '../permissions/db/user-dms.js';
 import { upsertUser } from '../permissions/db/users.js';
+import { chatsMigration } from '../gws-ea-chats/migration.js';
 import { startTypingRefresh, stopTypingRefresh } from '../typing/index.js';
 import {
   AssistantChatAdapter,
@@ -187,6 +188,19 @@ async function start(startDelivery?: ConstructorParameters<typeof AssistantChatA
   await build(startDelivery).setup(hostSetup());
 }
 
+it('uses one stable Google create request ID for a repeated durable text row', async () => {
+  await start();
+  const message = { kind: 'chat', content: { text: 'A durable notice' } };
+  await channel!.deliver(`gchat:${DM}`, null, message, 'notice-row');
+  await channel!.deliver(`gchat:${DM}`, null, message, 'notice-row');
+  await channel!.deliver(`gchat:${DM}`, null, message, 'another-row');
+  const ids = api.calls(`${DM}/messages`).map(({ url }) => url.searchParams.get('requestId'));
+  expect(ids).toHaveLength(3);
+  expect(ids[0]).toMatch(/^[0-9a-f]{64}$/u);
+  expect(ids[1]).toBe(ids[0]);
+  expect(ids[2]).not.toBe(ids[0]);
+});
+
 function messageEvent(name: string): WorkspaceEvent {
   return {
     messageId: `pubsub-${name}`,
@@ -197,6 +211,47 @@ function messageEvent(name: string): WorkspaceEvent {
     data: { message: { name } },
   };
 }
+
+it.each(['declined', 'detached'])('downloads no media for a %s chat', async (state) => {
+  await runMigrations(getDb(), [chatsMigration]);
+  await createAgentGroup({
+    id: 'closed-chat-agent',
+    name: 'external-chat',
+    folder: 'closed-chat-agent',
+    agent_provider: null,
+    created_at: new Date().toISOString(),
+  });
+  await createMessagingGroup({
+    id: 'closed-room',
+    channel_type: 'gchat',
+    instance: 'gchat',
+    platform_id: `gchat:${ROOM}`,
+    name: 'Closed room',
+    is_group: 1,
+    unknown_sender_policy: 'public',
+    created_at: new Date().toISOString(),
+  });
+  await getDb().run(
+    'INSERT INTO gws_ea_chats (messaging_group_id,state,serving_agent_group_id,principal_present,created_at,updated_at) VALUES (?, ?, ?, 0, ?, ?)',
+    'closed-room',
+    state,
+    'closed-chat-agent',
+    new Date().toISOString(),
+    new Date().toISOString(),
+  );
+  await start();
+  api.media.set('closed-voice', Buffer.from('recording'));
+  api.addMessage(
+    chatMessage(ROOM, 'closed.1', {
+      attachment: [
+        { contentName: 'recording.ogg', contentType: 'audio/ogg', attachmentDataRef: { resourceName: 'closed-voice' } },
+      ],
+    }),
+  );
+  await deliver!(messageEvent(`${ROOM}/messages/closed.1`));
+  expect(api.calls('media/closed-voice')).toEqual([]);
+  expect(routed).toEqual([]);
+});
 
 /** A reaction placed four minutes after the message it is on, as Google records the event's time. */
 function reactionEvent(name: string): WorkspaceEvent {
@@ -1536,8 +1591,12 @@ describe('the reply context', () => {
           quotedMessageSnapshot: { sender: 'Remy Vance', text: 'Offsite moved to May.' },
         }),
       ),
-    ).toEqual({ sender: 'Remy Vance', text: 'Offsite moved to May.' });
-    expect(extractGchatReplyContext(quoting({ name: `${ROOM}/messages/remy.9`, quoteType: 'FORWARD' }))).toBeNull();
+    ).toEqual({ sender: 'Remy Vance', text: 'Offsite moved to May.', forwarded: true });
+    expect(extractGchatReplyContext(quoting({ name: `${ROOM}/messages/remy.9`, quoteType: 'FORWARD' }))).toEqual({
+      sender: 'unknown',
+      text: '',
+      forwarded: true,
+    });
   });
 });
 

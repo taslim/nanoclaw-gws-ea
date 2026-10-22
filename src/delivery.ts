@@ -38,7 +38,7 @@ import { normalizeOptions } from './channels/ask-question.js';
 import { requestWake } from './request-wake.js';
 import { clearOutbox, readOutboxFiles, withExistingMailboxSession, writeSessionMessage } from './session-manager.js';
 import { endTypingInConversation, pauseTypingRefreshAfterDelivery, setTypingAdapter } from './modules/typing/index.js';
-import type { OutboundFile } from './channels/adapter.js';
+import { ChannelNotConnectedError, type OutboundFile } from './channels/adapter.js';
 import type { PendingApproval, Session } from './types.js';
 import type { OutboundMessage } from './mailbox/index.js';
 
@@ -123,9 +123,35 @@ async function clearAttemptRow(messageId: string): Promise<void> {
  * second caller skips will be picked up on the next poll tick (~1s).
  */
 const inflightDeliveries = new Map<string, Promise<void>>();
+const inflightChannelDeliveries = new Map<string, { readonly done: Promise<void>; readonly finish: () => void }>();
 
 /** How long a stop waits for delivery passes under way, so one is not cut between a send and its record. */
 const STOP_WAIT_MS = 10_000;
+
+/** Wait only for a channel send already entered, through its mailbox receipt; queued guards and host actions do not block closure. */
+export async function waitForSessionChannelDelivery(sessionId: string): Promise<void> {
+  const inflight = inflightChannelDeliveries.get(sessionId);
+  if (!inflight) return;
+  let timeout: NodeJS.Timeout | undefined;
+  try {
+    await Promise.race([
+      inflight.done,
+      new Promise<never>((_resolve, reject) => {
+        timeout = setTimeout(
+          () => reject(new Error('A channel send has not settled; conversation cleanup will resume.')),
+          STOP_WAIT_MS,
+        );
+      }),
+    ]);
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+function finishChannelDelivery(sessionId: string): void {
+  const inflight = inflightChannelDeliveries.get(sessionId);
+  inflightChannelDeliveries.delete(sessionId);
+  inflight?.finish();
+}
 
 export interface ChannelDeliveryAdapter {
   deliver(
@@ -138,6 +164,12 @@ export interface ChannelDeliveryAdapter {
     /** Delivering adapter instance (defaults to channelType downstream).
      *  Host-internal only — containers never see instance. */
     instance?: string,
+    /** Durable outbound row ID, when the send belongs to a mailbox row. */
+    messageId?: string,
+    /** Original outbound row time, independent of when the adapter first sees it. */
+    timestamp?: string,
+    /** Host-owned source session; its closure revokes a mailbox send even after guards awaited. */
+    sourceSessionId?: string,
   ): Promise<string | undefined>;
   setTyping?(
     channelType: string,
@@ -234,18 +266,53 @@ async function assertOutboundAllowed(send: OutboundSend): Promise<void> {
 }
 
 function guardAdapter(adapter: ChannelDeliveryAdapter): ChannelDeliveryAdapter {
+  const disconnected = new Map<string, { readonly until: number; readonly error: ChannelNotConnectedError }>();
   return {
-    async deliver(channelType, platformId, threadId, kind, content, files, instance) {
+    async deliver(
+      channelType,
+      platformId,
+      threadId,
+      kind,
+      content,
+      files,
+      instance,
+      messageId,
+      timestamp,
+      sourceSessionId,
+    ) {
       await assertOutboundAllowed({ channelType, platformId, threadId, instance, kind, content, files });
-      const platformMessageId = await adapter.deliver(
-        channelType,
-        platformId,
-        threadId,
-        kind,
-        content,
-        files,
-        instance,
-      );
+      // Claim before the async status read so closure cannot finish between that read and adapter entry.
+      if (sourceSessionId !== undefined && inflightDeliveries.has(sourceSessionId)) {
+        let finish!: () => void;
+        const done = new Promise<void>((resolve) => {
+          finish = resolve;
+        });
+        inflightChannelDeliveries.set(sourceSessionId, { done, finish });
+      }
+      if (sourceSessionId !== undefined && (await getSession(sourceSessionId))?.status !== 'active')
+        throw new OutboundRefusedError('core:session-closed', 'The conversation that produced this message ended.');
+      const key = instance ?? channelType;
+      const unavailable = disconnected.get(key);
+      if (unavailable !== undefined && unavailable.until > Date.now()) throw unavailable.error;
+      disconnected.delete(key);
+      let platformMessageId: string | undefined;
+      try {
+        platformMessageId = await adapter.deliver(
+          channelType,
+          platformId,
+          threadId,
+          kind,
+          content,
+          files,
+          instance,
+          messageId,
+          timestamp,
+        );
+      } catch (error) {
+        if (error instanceof ChannelNotConnectedError)
+          disconnected.set(key, { until: Date.now() + ACTIVE_POLL_MS, error });
+        throw error;
+      }
       // Whatever reached the conversation (a reply, a reaction, a host's
       // approval request) ends the work each turn anchored there was showing.
       endTypingInConversation(channelType, platformId, threadId, instance);
@@ -438,6 +505,7 @@ async function drainSession(session: Session): Promise<void> {
   const exhausted = pending.length > 0 ? await exhaustedAttempts(session.id) : new Set<string>();
   const givenUp: OutboundMessage[] = [];
   for (const msg of pending) {
+    if ((await getSession(session.id))?.status !== 'active') break;
     if (exhausted.has(msg.id)) {
       givenUp.push(msg);
       continue;
@@ -450,6 +518,7 @@ async function drainSession(session: Session): Promise<void> {
       const firstDelivery = delivered.size === 0;
       delivered.add(msg.id);
       await clearAttemptRow(msg.id);
+      finishChannelDelivery(session.id);
       if (msg.kind !== 'system' && msg.channelType !== 'agent') {
         pauseTypingRefreshAfterDelivery(session.id);
         if (msg.kind !== 'task_log') {
@@ -477,6 +546,7 @@ async function drainSession(session: Session): Promise<void> {
         }
       }
     } catch (err) {
+      if (err instanceof ChannelNotConnectedError) continue;
       if (err instanceof OutboundRefusedError) {
         await closeRefused(msg, session, agentGroup.id, err);
         continue;
@@ -500,6 +570,8 @@ async function drainSession(session: Session): Promise<void> {
           err,
         });
       }
+    } finally {
+      finishChannelDelivery(session.id);
     }
   }
 
@@ -574,7 +646,7 @@ async function closeRefused(
       }),
     });
     const fresh = await getSession(session.id);
-    if (fresh) await requestWake(fresh, 'inbound-message');
+    if (fresh?.status === 'active') await requestWake(fresh, 'inbound-message');
   } catch (err) {
     log.error('Could not tell the agent its message was refused', { messageId: msg.id, sessionId: session.id, err });
   }
@@ -590,6 +662,7 @@ async function deliverMessage(
     threadId: string | null;
     content: string;
     inReplyTo: string | null;
+    timestamp: string;
   },
   session: Session,
 ): Promise<string | undefined> {
@@ -795,6 +868,9 @@ async function deliverMessage(
     deliveredContent,
     files,
     deliverInstance,
+    msg.id,
+    msg.timestamp,
+    session.id,
   );
   log.info('Message delivered', {
     id: msg.id,

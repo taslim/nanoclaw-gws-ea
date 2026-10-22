@@ -250,7 +250,7 @@ describe('fanInboundMessage', () => {
     });
     expect(written).toBe(1);
     const echo = JSON.parse(readEchoRows('s-dm-t2')[0].content as string) as { text: string };
-    expect(echo.text).toMatch(/^\[Forwarded recording; source information\]\nSend the contract to Morgan\./u);
+    expect(echo.text).toMatch(/^\[Forwarded\]\nSend the contract to Morgan\./u);
     expect(echo.text).toHaveLength(ECHO_TEXT_MAX_CHARS + 1);
   });
 

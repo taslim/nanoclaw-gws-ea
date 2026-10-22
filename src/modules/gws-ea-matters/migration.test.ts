@@ -65,10 +65,11 @@ function schemaOf(db: DbDriver): SchemaEntry[] {
 }
 
 describe('the matters migrations', () => {
-  it('create matters and extend their native links with browser jobs', () => {
+  it('create matters and extend their native links with browser jobs and chats', () => {
     expect(mattersMigrations().map((migration) => migration.name)).toEqual([
       CREATE_MATTERS,
       'module:gws-ea-matters:browser-jobs',
+      'module:gws-ea-matters:chat-links',
     ]);
   });
 
@@ -97,5 +98,57 @@ describe('the matters migrations', () => {
   it('give an install from the release before the schema of a fresh install', async () => {
     const fresh = schemaOf(await freshInstall());
     expect(schemaOf(await updatedInstall())).toEqual(fresh);
+  });
+
+  it('preserves every existing link and the unique piece index when chat links are added', async () => {
+    const db = await initSqliteTestDb();
+    const old = getRegisteredMigrations().filter((migration) => migration.name !== 'module:gws-ea-matters:chat-links');
+    await runMigrations(db, old);
+    const at = '2026-10-18T12:00:00.000Z';
+    for (const id of ['m-first', 'm-second']) {
+      await db.run(
+        "INSERT INTO gws_ea_matters (id, title, open_loop, created_at, updated_at) VALUES (?, 'Title', 'Loop', ?, ?)",
+        id,
+        at,
+        at,
+      );
+    }
+    for (const kind of ['thread', 'event', 'file', 'person', 'memory', 'job']) {
+      await db.run(
+        'INSERT INTO gws_ea_matter_links (matter_id, kind, reference, handler, matter_open, linked_at) VALUES (?, ?, ?, ?, 1, ?)',
+        'm-first',
+        kind,
+        `${kind}-reference`,
+        'existing-handler',
+        at,
+      );
+    }
+    const before = await db.all('SELECT * FROM gws_ea_matter_links ORDER BY kind');
+    await runMigrations(db);
+    expect(
+      await db.all(
+        'SELECT matter_id, kind, reference, handler, matter_open, linked_at FROM gws_ea_matter_links ORDER BY kind',
+      ),
+    ).toEqual(before);
+    expect(await db.all('SELECT account, account_at FROM gws_ea_matter_links')).toEqual(
+      Array.from({ length: 6 }, () => ({ account: null, account_at: null })),
+    );
+    await expect(
+      db.run(
+        "INSERT INTO gws_ea_matter_links (matter_id, kind, reference, matter_open, linked_at) VALUES ('m-second', 'job', 'job-reference', 1, ?)",
+        at,
+      ),
+    ).rejects.toThrow(/UNIQUE/);
+    for (const id of ['m-first', 'm-second']) {
+      await db.run(
+        "INSERT INTO gws_ea_matter_links (matter_id, kind, reference, matter_open, linked_at) VALUES (?, 'chat', 'mg-trip', 1, ?)",
+        id,
+        at,
+      );
+    }
+    expect(await db.all("SELECT matter_id FROM gws_ea_matter_links WHERE kind = 'chat' ORDER BY matter_id")).toEqual([
+      { matter_id: 'm-first' },
+      { matter_id: 'm-second' },
+    ]);
   });
 });

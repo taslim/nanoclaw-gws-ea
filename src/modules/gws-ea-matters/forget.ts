@@ -27,6 +27,7 @@ import { mayNamePerson, type ForgottenPerson, type PersonToForget } from '../gws
 import { linkKey, type LinkRef } from './db.js';
 import { isEventOrFile, linksOn } from './live.js';
 import { cancelTaskSeries, oneAtATime } from './looks.js';
+import { chatsWithPerson } from './chat-links.js';
 
 /** A matter kept only for the person, with what deleting it takes along. */
 interface KeptOnlyFor {
@@ -78,6 +79,7 @@ export async function mattersToRewrite(person: PersonToForget): Promise<string[]
   const going = new Set((await keptOnlyFor(person.id)).map((matter) => matter.id));
   const isTheirs = addressOf(person.handles);
   const theirThreads = new Set((await threadsWithAddresses(isTheirs)).threadKeys);
+  const theirChats = await chatsWithPerson(person.id);
   const links = await db.all<LinkRef & { readonly matter_id: string }>(
     'SELECT matter_id, kind, reference FROM gws_ea_matter_links',
   );
@@ -92,7 +94,8 @@ export async function mattersToRewrite(person: PersonToForget): Promise<string[]
   for (const link of links) {
     const theirs =
       (link.kind === 'person' && link.reference === person.id) ||
-      (link.kind === 'thread' && theirThreads.has(link.reference));
+      (link.kind === 'thread' && theirThreads.has(link.reference)) ||
+      (link.kind === 'chat' && theirChats.has(link.reference));
     if (theirs) named.add(link.matter_id);
   }
   for (const matter of matters) {
@@ -134,6 +137,12 @@ export function forgetFromMatters(person: ForgottenPerson): Promise<void> {
         person.id,
       );
       await clearThreadAccounts(threads.map((thread) => thread.reference));
+      for (const chat of await chatsWithPerson(person.id)) {
+        await db.run(
+          "UPDATE gws_ea_matter_links SET account = NULL, account_at = NULL WHERE kind = 'chat' AND reference = ?",
+          chat,
+        );
+      }
       await db.run("DELETE FROM gws_ea_matter_links WHERE kind = 'person' AND reference = ?", person.id);
       const now = new Date().toISOString();
       for (const { matter_id } of linking) {

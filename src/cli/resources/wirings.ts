@@ -26,7 +26,7 @@ import { assertWiringAdmitted } from '../../db/wiring-admission.js';
  * reject e.g. `--engage-mode bogus`).
  */
 const CREATE_ENUMS: Record<string, string[]> = {
-  engage_mode: ['pattern', 'mention', 'mention-sticky'],
+  engage_mode: ['pattern', 'mention', 'mention-sticky', 'module'],
   sender_scope: ['all', 'known'],
   ignored_message_policy: ['drop', 'accumulate'],
   session_mode: ['shared', 'per-thread', 'agent-shared'],
@@ -72,8 +72,8 @@ registerResource({
       name: 'engage_mode',
       type: 'string',
       description:
-        'When the agent engages. "mention" — only when @mentioned or in DMs. "mention-sticky" — once mentioned in a thread, the agent subscribes and responds to all subsequent messages in that thread without needing further mentions. "pattern" — matches every message against engage_pattern regex. Default: declared by the channel adapter for the target chat (DM vs group); "mention" when the channel has no declaration.',
-      enum: ['pattern', 'mention', 'mention-sticky'],
+        'When the agent engages. "mention" — only when @mentioned or in DMs. "mention-sticky" — once mentioned in a thread, the agent subscribes and responds to all subsequent messages in that thread without needing further mentions. "pattern" — matches every message against engage_pattern regex. "module" — the channel module decides after preparing content; without a decider, messages accumulate silently. Default: declared by the channel adapter for the target chat (DM vs group); "mention" when the channel has no declaration.',
+      enum: ['pattern', 'mention', 'mention-sticky', 'module'],
       default: 'mention',
       updatable: true,
     },

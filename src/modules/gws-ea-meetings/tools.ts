@@ -76,6 +76,7 @@ import { writeNoteForMain } from '../gws-ea-profile/main-note.js';
 import { allowsMeet, type CalendarEntry, type EventWrite, type MeetingsCalendarApi } from './calendar-api.js';
 import {
   assertInvitationShareable,
+  bothZones,
   conferenceWords,
   ensureEvent,
   eventIdFor,
@@ -187,11 +188,6 @@ function spanAt(start: number, minutes: number): Span {
   return { start, end: start + minutes * MINUTE };
 }
 
-/** A time ready to write: in the principal's zone and, when known, the other side's. */
-function bothZones(span: Span, timezone: string, theirs: string | undefined): string {
-  return `${slotLabel(span, timezone)}${theirs === undefined ? '' : `; for them, ${slotLabel(span, theirs)}`}`;
-}
-
 // ---------------------------------------------------------------------------
 // The principal, and the thread's calendar
 // ---------------------------------------------------------------------------
@@ -250,6 +246,16 @@ async function matterThreads(booking: ThreadBooking, joining: boolean): Promise<
 export interface SchedulingToolsDeps {
   /** The host's own Calendar client. */
   readonly calendar: () => MeetingsCalendarApi;
+}
+
+let schedulingTurn: Promise<unknown> = Promise.resolve();
+export function inSchedulingTurn<T>(work: () => Promise<T>): Promise<T> {
+  const done = schedulingTurn.then(work);
+  schedulingTurn = done.then(
+    () => undefined,
+    () => undefined,
+  );
+  return done;
 }
 
 export function createSchedulingTools(deps: SchedulingToolsDeps) {
@@ -337,17 +343,8 @@ export function createSchedulingTools(deps: SchedulingToolsDeps) {
    * is free and writes before the next looks, so two threads never take one
    * time, and the second is told it has gone.
    */
-  let turn: Promise<unknown> = Promise.resolve();
-  function takeTurn<T>(work: () => Promise<T>): Promise<T> {
-    const done = turn.then(work);
-    turn = done.then(
-      () => undefined,
-      () => undefined,
-    );
-    return done;
-  }
   function inTurn(answer: ActionAnswer): ActionAnswer {
-    return (content, session, requestId) => takeTurn(() => answer(content, session, requestId));
+    return (content, session, requestId) => inSchedulingTurn(() => answer(content, session, requestId));
   }
 
   // -------------------------------------------------------------------------

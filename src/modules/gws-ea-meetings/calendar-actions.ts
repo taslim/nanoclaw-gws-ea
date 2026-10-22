@@ -96,6 +96,8 @@ export interface Invitation {
   readonly recipients: readonly string[];
   /** Who writes it, so a refused link is explained in words fitted to them. */
   readonly writer: LinkWriter;
+  /** Canonical chat, supplied only by the host's serving-session check. */
+  readonly chatId?: string;
 }
 
 /**
@@ -118,6 +120,7 @@ export async function assertInvitationShareable(
   const check = await checkOutbound(
     [...invitation.texts, ...invitation.shown].map((text) => text ?? ''),
     await audienceForAddresses(invitation.recipients),
+    invitation.chatId,
   );
   if (!check.allowed) {
     throw forbidden(
@@ -238,6 +241,11 @@ export function conferenceWords(conference: EventConference | undefined): string
       throw new Error(`Unknown conference status ${String(unreachable)}`);
     }
   }
+}
+
+/** A time ready to write: in the principal's zone and, when known, the other side's. */
+export function bothZones(span: Span, timezone: string, theirs: string | undefined): string {
+  return `${slotLabel(span, timezone)}${theirs === undefined ? '' : `; for them, ${slotLabel(span, theirs)}`}`;
 }
 
 /**

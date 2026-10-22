@@ -59,20 +59,25 @@ function definedName(node: ts.Node): string | undefined {
 }
 
 /**
- * The capability key that grants each runner tool, read from the
- * `registerTools([...], key)` calls in the tool sources. A call without a key
- * takes its module's `loadToolModule` key; a list that is not written out
+ * The capability keys that grant each runner tool, read from the
+ * `registerTools([...], key)` and `registerToolVariant(tool, key)` calls.
+ * A variant registered in a loop takes its definitions from that loop.
+ * A call without a key takes its module's `loadToolModule` key; a list that is not written out
  * (`registerTools(createTimeTools(...))`) registers every tool its file
  * defines. A tool no key grants is served to no group, so it is left out.
  */
-export function runnerToolCapabilities(): ReadonlyMap<string, string> {
+export function runnerToolCapabilities(): ReadonlyMap<string, ReadonlySet<string>> {
   const keys = loadKeys();
-  const granted = new Map<string, string>();
+  const granted = new Map<string, Set<string>>();
   for (const [file, text, source] of parsedToolSources()) {
     const constants = new Map<string, ts.Expression>();
     const collect = (node: ts.Node): void => {
       if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && node.initializer) {
         constants.set(node.name.text, node.initializer);
+      }
+      if (ts.isForOfStatement(node) && ts.isVariableDeclarationList(node.initializer)) {
+        for (const declaration of node.initializer.declarations)
+          if (ts.isIdentifier(declaration.name)) constants.set(declaration.name.text, node.expression);
       }
       ts.forEachChild(node, collect);
     };
@@ -84,18 +89,29 @@ export function runnerToolCapabilities(): ReadonlyMap<string, string> {
       return value && ts.isStringLiteral(value) ? value.text : undefined;
     };
     const visit = (node: ts.Node): void => {
-      if (ts.isCallExpression(node) && node.expression.getText() === 'registerTools') {
+      if (ts.isCallExpression(node) && ['registerTools', 'registerToolVariant'].includes(node.expression.getText())) {
         const [list, keyArgument] = node.arguments;
         const key = keyOf(keyArgument);
+        const definitions = list && ts.isIdentifier(list) ? constants.get(list.text) : list;
+        const variantName = definitions && definedName(definitions);
         const names =
-          list && ts.isArrayLiteralExpression(list)
-            ? list.elements.flatMap((element) => {
+          definitions && ts.isArrayLiteralExpression(definitions)
+            ? definitions.elements.flatMap((element) => {
                 const definition = ts.isIdentifier(element) ? constants.get(element.text) : element;
                 const name = definition && definedName(definition);
                 return name ? [name] : [];
               })
-            : toolNamesIn(text);
-        if (key !== undefined) for (const name of names) granted.set(name, key);
+            : node.expression.getText() === 'registerToolVariant'
+              ? variantName
+                ? [variantName]
+                : []
+              : toolNamesIn(text);
+        if (key !== undefined)
+          for (const name of names) {
+            const held = granted.get(name) ?? new Set<string>();
+            held.add(key);
+            granted.set(name, held);
+          }
       }
       ts.forEachChild(node, visit);
     };

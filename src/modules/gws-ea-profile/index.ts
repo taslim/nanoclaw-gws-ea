@@ -4,6 +4,7 @@ import { getMessagingGroup } from '../../db/messaging-groups.js';
 import { registerMigration } from '../../db/migrations/index.js';
 import { ALLOW, DENY, defineGuardedAction, guard, HOLD } from '../../guard/index.js';
 import { onHostStart } from '../../host-lifecycle.js';
+import { registerInboundPreparer } from '../../inbound-preparation.js';
 import { registerRequiredProjectDocSection } from '../../project-doc-sections.js';
 import { registerResource } from '../../cli/crud.js';
 import type { CallerContext } from '../../cli/frame.js';
@@ -16,11 +17,10 @@ import { hasBrowserAccess } from '../gws-ea-browser/access.js';
 // registrations must follow this module's.
 import { getInboxState, principalCalendarAccess } from '../gws-ea-inbox/db.js';
 import { sendPrincipalNotice } from '../gws-ea-notices/index.js';
-import { rememberAuthenticatedUserDm } from '../permissions/user-dm.js';
+import { bindPrincipalIdentity } from './bind.js';
 import {
   addPrincipalAddress,
   assertMainCaller,
-  bindVerifiedPrincipalUser,
   ensureMainAgentGroupIdLoaded,
   getGwsEaProfile,
   getMainAgentGroupId,
@@ -40,11 +40,15 @@ import {
 import { escapeMarkdownInline } from './markdown.js';
 import {
   gwsEaExternalEmailPointerMigration,
+  gwsEaExternalChatPointerMigration,
   gwsEaBrowserPointerMigration,
   gwsEaPrincipalAddressesMigration,
   gwsEaProfileMigration,
   gwsEaWebAliasMigration,
+  gwsEaPrincipalMessagesMigration,
+  gwsEaPrincipalDmRoutingMigration,
 } from './migration.js';
+import { preparePrincipalMessageContent } from './marks.js';
 import { guardActor, requestPrincipalConfirmation } from './principal-confirmation.js';
 import './wiring-policy.js';
 
@@ -53,6 +57,10 @@ registerMigration(gwsEaPrincipalAddressesMigration);
 registerMigration(gwsEaExternalEmailPointerMigration);
 registerMigration(gwsEaBrowserPointerMigration);
 registerMigration(gwsEaWebAliasMigration);
+registerMigration(gwsEaExternalChatPointerMigration);
+registerMigration(gwsEaPrincipalMessagesMigration);
+registerMigration(gwsEaPrincipalDmRoutingMigration);
+registerInboundPreparer(preparePrincipalMessageContent);
 
 // What a spawn reads synchronously: main's group, as the profile names it.
 // Start callbacks run in module import order, so it is read before any later module's start.
@@ -131,9 +139,9 @@ export const MAIN_PRINCIPAL_ADDRESSES_POINTER =
 
 /**
  * Who the assistant and the principal are, for each audience (KTD14). Main
- * reads the principal's addresses live. `external-email` writes to people
- * other than the principal, so it gets the two names and no address of
- * either. The browser gives the assistant's web alias to websites, never
+ * reads the principal's addresses live. Outside email and casual chats get
+ * names only; a chat job additionally gets the assistant's web address while
+ * explicitly allowed to delegate. The browser gives that alias to websites, never
  * the address it converses from, and knows the principal's addresses only
  * to recognize them (R34). Any other group gets the addresses as of
  * its container's start: the default `group` CLI scope leaves the live list
@@ -149,15 +157,16 @@ async function identitySection(group: AgentGroup): Promise<{ name: string; body:
   const principal = escapeMarkdownInline(profile.principal_display_name);
   const names = `${assistant} is the assistant. ${principal} is the principal. They are separate people: act and communicate as ${assistant}, support ${principal}, and never present the assistant as the principal.`;
   const audience = await projectDocAudience(group.id);
-  if (audience === 'external-email') return { name: 'Assistant Identity', body: names };
+  if (audience === 'external-email' || audience === 'external-chat') return { name: 'Assistant Identity', body: names };
   if (audience === 'browser') {
     const body = `${browserWebSentence(assistant, principal, profile.assistant_alias)}${browserPrincipalAddressesSentence(principal, profile.principal_emails)}`;
     return { name: 'Assistant Identity', body: `${names}${body}` };
   }
-  const own = assistantAddressSentence(assistant, profile.assistant_workspace_email);
   const web = (await hasBrowserAccess(group.id))
     ? delegatorWebSentences(assistant, principal, profile.assistant_alias)
     : '';
+  if (audience === 'job') return { name: 'Assistant Identity', body: `${names}${web}` };
+  const own = assistantAddressSentence(assistant, profile.assistant_workspace_email);
   const addresses =
     audience === 'main'
       ? MAIN_PRINCIPAL_ADDRESSES_POINTER
@@ -262,10 +271,7 @@ register({
   handler: async ({ userId, verifiedAt, messagingGroupId }) => {
     const dm = await getMessagingGroup(messagingGroupId);
     if (!dm) throw new Error(`Principal direct message not found: ${messagingGroupId}`);
-    await getDb().transaction(async () => {
-      await bindVerifiedPrincipalUser(userId, verifiedAt);
-      await rememberAuthenticatedUserDm(userId, dm, verifiedAt);
-    });
+    await bindPrincipalIdentity({ userId, verifiedAt, messagingGroupId });
     return { user_id: userId, verified_at: verifiedAt, messaging_group_id: dm.id };
   },
 });
@@ -573,10 +579,15 @@ registerResource({
 });
 
 export {
-  bindVerifiedPrincipalUser,
   getGwsEaProfile,
   isVerifiedPrincipalUser,
   listPrincipalAddresses,
   listVerifiedPrincipalUsers,
   reconcileGwsEaProfile,
 } from './db.js';
+export {
+  requirePrincipalMessage,
+  requirePrincipalDirectMessage,
+  PRINCIPAL_MESSAGE_LIFETIME_MS,
+  type PrincipalMessage,
+} from './marks.js';

@@ -18,7 +18,7 @@ import type { RollbackOutcome, RollbackPreview } from './rollback.js';
 import type { AssistantListing, AssistantStatus } from './status.js';
 import type { UpdatePreview } from './update.js';
 import type { AssistantUpdate, UpdateAllPlan, UpdateTargetResult } from './update-all.js';
-import { PROVISION_STEPS } from './types.js';
+import { PROVISION_STEPS, type WhatsAppCommandData } from './types.js';
 import { isRecord } from './validation.js';
 
 export type Changed = boolean | null;
@@ -62,6 +62,7 @@ export interface VoiceOperationData {
   readonly installation_dir?: string;
 }
 export type CommandData =
+  | WhatsAppCommandData
   | OperationData
   | VoiceOperationData
   | CapabilityList

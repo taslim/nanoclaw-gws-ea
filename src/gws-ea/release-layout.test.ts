@@ -15,6 +15,11 @@ import path from 'node:path';
 import Database from 'better-sqlite3';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
+import { WhatsAppAuthStore } from '../modules/gws-ea-whatsapp/auth-store.js';
+import { WhatsAppContacts } from '../modules/gws-ea-whatsapp/contacts.js';
+import { WhatsAppIndex } from '../modules/gws-ea-whatsapp/index-store.js';
+import { WhatsAppNoticeStore } from '../modules/gws-ea-notices/whatsapp-store.js';
+import { writeWhatsAppLink } from '../modules/gws-ea-whatsapp/paths.js';
 import { CONTROL_PLANE_ROOT } from './paths.js';
 import {
   createState,
@@ -401,6 +406,60 @@ describe('pruning', STAGING, () => {
 });
 
 describe('snapshots', STAGING, () => {
+  async function accountFiles(root: string, phase: string): Promise<readonly Buffer[]> {
+    const directory = path.join(root, 'secrets/whatsapp');
+    const account = () => '15550000000@s.whatsapp.net';
+    const link = {
+      schema_version: 1 as const,
+      state: 'connected' as const,
+      number: '+15550000000',
+      principal: { lid: '12000', phoneJid: '447700900123@s.whatsapp.net' },
+      principalVerifiedAt: '2026-01-01T00:00:00.000Z',
+    };
+    await writeWhatsAppLink(directory, link);
+    const auth = new WhatsAppAuthStore(directory);
+    auth.saveCreds({ registered: true, me: { id: '15550000000:1@s.whatsapp.net', name: phase } });
+    auth.close();
+    const messages = new WhatsAppIndex(directory, account);
+    messages.prepare(phase, 'trip@g.us', `wire-${phase}`, 123);
+    messages.accepted(phase);
+    messages.complete(phase);
+    messages.close();
+    const contacts = new WhatsAppContacts(directory, account, () => 123);
+    contacts.admitDM('12000@lid', { requestId: phase, principalMessageId: `principal-${phase}` });
+    contacts.connection({
+      reachoutTimeLock: { isActive: true, timeEnforcementEnds: new Date('2030-01-01T00:00:00.000Z') },
+    });
+    contacts.close();
+    const notices = new WhatsAppNoticeStore(directory);
+    notices.accept(phase, { id: phase, kind: 'needs-relink', link, text: 'Tell main once' });
+    notices.delivered(phase);
+    notices.close();
+    return Promise.all(
+      ['auth.sqlite', 'messages.sqlite', 'contacts.sqlite', 'notices.sqlite', 'link.json'].map((file) =>
+        readFile(path.join(directory, file)),
+      ),
+    );
+  }
+  it('keeps every native WhatsApp account store outside snapshots, restores, and returned quarantines, with peer bytes untouched', async () => {
+    const { layout, a } = await fencedForUpdate();
+    const peer = instanceRoot();
+    await accountFiles(layout.root, 'before-snapshot');
+    const peerBytes = await accountFiles(peer, 'peer');
+    const snapshot = await takeSnapshot(layout, UPDATE, a);
+    const current = await accountFiles(layout.root, 'after-snapshot');
+    await restoreSnapshot(layout, UPDATE, ROLLBACK);
+    const files = ['auth.sqlite', 'messages.sqlite', 'contacts.sqlite', 'notices.sqlite', 'link.json'];
+    const bytes = (root: string) =>
+      Promise.all(files.map((file) => readFile(path.join(root, 'secrets/whatsapp', file))));
+    expect(await bytes(layout.root)).toEqual(current);
+    expect(await bytes(peer)).toEqual(peerBytes);
+    await expect(lstat(path.join(snapshot, 'secrets'))).rejects.toMatchObject({ code: 'ENOENT' });
+    await expect(lstat(path.join(layout.quarantine(ROLLBACK), 'secrets'))).rejects.toMatchObject({ code: 'ENOENT' });
+    await returnQuarantinedState(layout, ROLLBACK);
+    expect(await bytes(layout.root)).toEqual(current);
+    expect(await bytes(peer)).toEqual(peerBytes);
+  });
   async function stateWith(layout: InstanceLayout): Promise<void> {
     await mkdir(path.join(layout.state, 'data', 'v2-sessions', 'ag-main', 'sess-1'), { recursive: true });
     await writeFile(path.join(layout.state, 'data', 'v2.db'), 'central v1');
@@ -420,6 +479,12 @@ describe('snapshots', STAGING, () => {
 
   it('takes a copy that later writes never reach', async () => {
     const { layout, a } = await fencedForUpdate();
+    const whatsapp = path.join(layout.root, 'secrets', 'whatsapp');
+    await writeWhatsAppLink(whatsapp, { schema_version: 1, state: 'connected', account: { lid: '12025550123' } });
+    const auth = new WhatsAppAuthStore(whatsapp);
+    auth.saveCreds();
+    auth.close();
+    const authBefore = await readFile(path.join(whatsapp, 'auth.sqlite'));
     await mkdir(path.join(layout.root, 'browser', 'profile'), { recursive: true, mode: 0o700 });
     await mkdir(path.join(layout.root, 'browser', 'staging'), { recursive: true, mode: 0o700 });
     await writeFile(path.join(layout.root, 'browser', 'profile', 'Cookies'), 'private browser cookies', {
@@ -437,6 +502,8 @@ describe('snapshots', STAGING, () => {
       statSync(path.join(layout.state, '.env')).mode & 0o777,
     );
     expect(statSync(snapshot).mode & 0o777).toBe(0o700);
+    await expect(lstat(path.join(snapshot, 'secrets'))).rejects.toMatchObject({ code: 'ENOENT' });
+    expect(await readFile(path.join(whatsapp, 'auth.sqlite'))).toEqual(authBefore);
     await expect(lstat(path.join(snapshot, 'browser'))).rejects.toMatchObject({ code: 'ENOENT' });
     expect(await readFile(path.join(layout.root, 'browser', 'profile', 'Cookies'), 'utf8')).toBe(
       'private browser cookies',

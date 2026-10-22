@@ -141,5 +141,14 @@ export {
   CHAT_EVENT_TYPES,
   CHAT_MESSAGE_CREATED,
   CHAT_REACTION_CREATED,
+  CHAT_MEMBERSHIP_CREATED,
+  CHAT_MEMBERSHIP_UPDATED,
+  CHAT_MEMBERSHIP_DELETED,
   CHAT_SUBSCRIPTION_TARGET,
 } from './subscription.js';
+export {
+  registerChatMembershipObserver,
+  type AssistantChatChannel,
+  type ChatMembership,
+  type ChatMembershipEvent,
+} from './membership.js';

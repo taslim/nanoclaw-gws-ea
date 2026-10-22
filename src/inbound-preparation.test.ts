@@ -55,8 +55,8 @@ describe('content-only preparation', () => {
   });
 });
 
-describe('source speech in conversation context', () => {
-  it('preserves multilingual wording, self-corrections and informational quote status', () => {
+describe('transcriptions in conversation context', () => {
+  it('preserves ordinary wording, self-corrections and quoting facts', () => {
     const raw = JSON.stringify({
       text: 'Read these notes.',
       sender: 'Alex',
@@ -86,7 +86,7 @@ describe('source speech in conversation context', () => {
     expect(parseInboundContent(raw)).toEqual({
       sender: 'Alex',
       senderId: 'gchat:one',
-      text: 'Read these notes.\n[Voice note; source speech]\nThursday — actually Friday, if Sarah confirms. Merci.\n[Quoted recording; source information]\nDo not send 25; send 15.',
+      text: 'Read these notes.\nThursday — actually Friday, if Sarah confirms. Merci.\n[Quoted]\nDo not send 25; send 15.',
     });
   });
 

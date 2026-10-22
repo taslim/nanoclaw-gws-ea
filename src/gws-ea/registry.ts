@@ -137,7 +137,14 @@ function validateClaims(value: unknown, instanceId: string): ExclusiveResourceCl
     workspace_email: workspaceEmail,
     ...(aliasEmail === undefined ? {} : { alias_email: aliasEmail }),
     onecli_project: onecliProject,
+    ...(value.whatsapp_number === undefined ? {} : { whatsapp_number: validateWhatsAppNumber(value.whatsapp_number) }),
   };
+}
+
+function validateWhatsAppNumber(value: unknown): string {
+  if (typeof value !== 'string' || !/^\+[1-9]\d{6,14}$/u.test(value))
+    throw new GwsEaError('invalid_claim', 'WhatsApp account number must be E.164');
+  return value;
 }
 
 function validateAliasEmail(value: unknown): string {
@@ -240,6 +247,7 @@ function claimKeys(instance: InstanceReservation): string[] {
     `mailbox:${claims.workspace_email}`,
     ...(claims.alias_email === undefined ? [] : [`mailbox:${claims.alias_email}`]),
     `onecli-project:${claims.onecli_project}`,
+    ...(claims.whatsapp_number === undefined ? [] : [`whatsapp-number:${claims.whatsapp_number}`]),
   ];
   return keys;
 }
@@ -402,6 +410,40 @@ export async function claimInstanceAlias(
       ),
     );
     return claimed;
+  });
+}
+
+/** Add or release the optional account claim under the machine lock, without changing any other claim. */
+export async function claimInstanceWhatsApp(
+  paths: ControlPlanePaths,
+  instanceId: string,
+  number: string | undefined,
+): Promise<InstanceReservation> {
+  assertInstanceId(instanceId);
+  if (number !== undefined) validateWhatsAppNumber(number);
+  return withMachineLock(paths, async () => {
+    const registry = await readRegistryFile(paths);
+    const stored = registry.instances[instanceId];
+    if (!stored) throw new GwsEaError('unknown_instance', 'Unknown instance ID');
+    if (
+      number !== undefined &&
+      Object.values(registry.instances).some(
+        (instance) =>
+          instance.instance_id !== instanceId && instance.exclusive_resource_claims.whatsapp_number === number,
+      )
+    )
+      throw new GwsEaError('claim_conflict', `WhatsApp number ${number} is already held by another assistant`);
+    if (stored.exclusive_resource_claims.whatsapp_number === number) return stored;
+    const { whatsapp_number: _previous, ...claims } = stored.exclusive_resource_claims;
+    const next = validateReservation({
+      ...stored,
+      exclusive_resource_claims: { ...claims, ...(number === undefined ? {} : { whatsapp_number: number }) },
+    });
+    await writePrivate(
+      paths.registryFile,
+      validateRegistry({ ...registry, instances: { ...registry.instances, [instanceId]: next } }, paths.registryFile),
+    );
+    return next;
   });
 }
 

@@ -15,6 +15,8 @@ import path from 'node:path';
 
 import Database from 'better-sqlite3';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { WhatsAppAuthStore } from '../modules/gws-ea-whatsapp/auth-store.js';
+import { writeWhatsAppLink } from '../modules/gws-ea-whatsapp/paths.js';
 
 import { peopleForgetHandoffFile, readPeopleForgetHandoff } from '../modules/gws-ea-people/forget-handoff.js';
 import {
@@ -768,6 +770,21 @@ describe('rollback isolation', GIT_HEAVY, () => {
     const host = await machine();
     const a = await assistant(host);
     const b = await assistant(host, { port: 38_001 });
+    for (const runtime of [a, b]) {
+      const directory = path.join(host.paths.instanceRoot(runtime.instance_id), 'secrets/whatsapp');
+      await writeWhatsAppLink(directory, {
+        schema_version: 1,
+        state: 'connected',
+        number: runtime === a ? '+15550000000' : '+15550000001',
+      });
+      const auth = new WhatsAppAuthStore(directory);
+      auth.saveCreds({ registered: true });
+      auth.close();
+    }
+    const privateFiles = [a, b].map((runtime) =>
+      path.join(host.paths.instanceRoot(runtime.instance_id), 'secrets/whatsapp/auth.sqlite'),
+    );
+    const privateBefore = await Promise.all(privateFiles.map((file) => readFile(file)));
     const next = await nextRelease(host, NEW_IMAGE);
     const state = world(a);
     state.tags.set(releaseTag(b, host.first), state.tags.get(releaseTag(a, host.first))!);
@@ -785,6 +802,7 @@ describe('rollback isolation', GIT_HEAVY, () => {
     expect(await readlink(a.checkout_root)).toBe(releaseName(host.first));
     expect(await readlink(b.checkout_root)).toBe(releaseName(next.commit));
     expect(await readdir(bRoot, { recursive: true })).toEqual(before);
+    expect(await Promise.all(privateFiles.map((file) => readFile(file)))).toEqual(privateBefore);
     expect(releaseOf(await getInstanceReservation(host.paths, b.instance_id))).toEqual(release(host, next.commit));
     // A's prune removed only its own tag: the image stays while B's tag names it.
     expect(state.tags.has(releaseTag(a, next.commit))).toBe(false);
@@ -804,6 +822,9 @@ describe('what a snapshot restore discards', () => {
       mkdirSync(path.join(state, 'groups', 'main'), { recursive: true });
       const central = new Database(path.join(state, 'data', 'v2.db'));
       central.exec('CREATE TABLE agent_groups (id TEXT PRIMARY KEY, name TEXT NOT NULL)');
+      central.exec(
+        'CREATE TABLE gws_ea_job_agents (agent_group_id TEXT PRIMARY KEY, messaging_group_id TEXT, state TEXT)',
+      );
       central.prepare('INSERT INTO agent_groups VALUES (?, ?)').run('ag-main', 'main');
       central.close();
       const inbound = new Database(path.join(session(state), 'inbound.db'));
@@ -828,6 +849,7 @@ describe('what a snapshot restore discards', () => {
     }
     const central = new Database(path.join(currentRoot, 'data', 'v2.db'));
     central.prepare('INSERT INTO agent_groups VALUES (?, ?)').run('ag-new', 'new');
+    central.prepare('INSERT INTO gws_ea_job_agents VALUES (?, ?, ?)').run('ag-new', 'trip-chat', 'active');
     central.close();
 
     const summary = await summarizeDiscard(currentRoot, snapshotRoot);
@@ -837,9 +859,13 @@ describe('what a snapshot restore discards', () => {
       rerun: { count: 2, ids: ['m1', 'task-1'] },
       taskFirings: { count: 1, ids: ['task-1'] },
       redelivered: { count: 1, ids: ['out-1'] },
-      centralRows: [{ table: 'agent_groups', count: 1 }],
+      centralRows: [
+        { table: 'agent_groups', count: 1 },
+        { table: 'gws_ea_job_agents', count: 1 },
+      ],
       files: { count: 1, paths: [path.join('main', 'CLAUDE.local.md')] },
       orphanedAgents: ['ag-new'],
+      jobAgents: [{ agent_group_id: 'ag-new', messaging_group_id: 'trip-chat', state: 'active' }],
     });
     expect(await summarizeDiscard(snapshotRoot, snapshotRoot)).toEqual({
       inbound: { count: 0, ids: [] },
@@ -849,6 +875,7 @@ describe('what a snapshot restore discards', () => {
       centralRows: [],
       files: { count: 0, paths: [] },
       orphanedAgents: [],
+      jobAgents: [],
     });
   });
 

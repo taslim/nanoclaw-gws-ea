@@ -34,7 +34,7 @@ describe('the mcp-tools instruction files', () => {
 });
 
 describe("the runner's tools, read from their sources", () => {
-  it('grant each tool through one capability key, as its registerTools call or module load names it', () => {
+  it('keeps every capability for native tools and chat variants, including variants registered in a loop', () => {
     const keys = runnerToolCapabilities();
     expect([...runnerToolNames()].filter((tool) => !keys.has(tool))).toEqual([]);
     expect({
@@ -44,21 +44,23 @@ describe("the runner's tools, read from their sources", () => {
       time_now: keys.get('time_now'),
       email_handoff: keys.get('email_handoff'),
       free_time: keys.get('free_time'),
+      tell_main: keys.get('tell_main'),
       find_conflicts: keys.get('find_conflicts'),
       purchase: keys.get('purchase'),
       relay_code: keys.get('relay_code'),
       record_purchase_outcome: keys.get('record_purchase_outcome'),
     }).toEqual({
-      send_message: 'reply',
-      add_reaction: 'files-send',
-      send_card: 'interactive',
-      time_now: 'time',
-      email_handoff: 'gws-ea-email',
-      free_time: 'gws-ea-email-external',
-      find_conflicts: 'google-calendar',
-      purchase: 'browser',
-      relay_code: 'browser-delegate',
-      record_purchase_outcome: 'browser-purchase-outcome',
+      send_message: new Set(['reply']),
+      add_reaction: new Set(['files-send']),
+      send_card: new Set(['interactive']),
+      time_now: new Set(['time']),
+      email_handoff: new Set(['gws-ea-email']),
+      free_time: new Set(['gws-ea-chat-external', 'gws-ea-email-external']),
+      tell_main: new Set(['gws-ea-chat-external', 'gws-ea-email-external']),
+      find_conflicts: new Set(['google-calendar']),
+      purchase: new Set(['browser']),
+      relay_code: new Set(['browser-delegate']),
+      record_purchase_outcome: new Set(['browser-purchase-outcome']),
     });
   });
 

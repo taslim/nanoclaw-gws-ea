@@ -106,12 +106,19 @@ export function createChannelDeliveryAdapter(): ChannelDeliveryAdapter {
       content: string,
       files?: OutboundFile[],
       instance?: string,
+      messageId?: string,
+      timestamp?: string,
     ): Promise<string | undefined> {
       const adapter = getChannelAdapterExact(instance ?? channelType);
       if (!adapter) {
         throw new MissingChannelAdapterError(channelType, instance);
       }
-      return adapter.deliver(platformId, threadId, { kind, content: JSON.parse(content), files });
+      return adapter.deliver(
+        platformId,
+        threadId,
+        { kind, content: JSON.parse(content), files, ...(timestamp === undefined ? {} : { timestamp }) },
+        messageId,
+      );
     },
     async setTyping(
       channelType: string,
@@ -338,6 +345,16 @@ export async function teardownChannelAdapters(): Promise<void> {
     }
   }
   activeAdapters.clear();
+}
+
+/** Withdraw one exact instance before closing it; a teardown failure propagates to the caller. */
+export async function stopChannelAdapter(key: string): Promise<'stopped' | 'not-active'> {
+  const adapter = activeAdapters.get(key);
+  if (!adapter) return 'not-active';
+  activeAdapters.delete(key);
+  await adapter.teardown();
+  log.info('Channel adapter stopped', { channel: key });
+  return 'stopped';
 }
 
 /**

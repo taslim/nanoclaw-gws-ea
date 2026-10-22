@@ -240,7 +240,12 @@ async function maintainSessionMailbox(
 
   if (isTaskThread(session.thread_id)) {
     const liveTasks = mailbox.countLiveTasks();
-    if (shouldCloseTaskSession(session.thread_id, isContainerRunning(session.id), liveTasks)) {
+    // A reply still waiting for its channel keeps the session open: delivery
+    // skips closed sessions, so closing now would strand the reply unreported.
+    if (
+      shouldCloseTaskSession(session.thread_id, isContainerRunning(session.id), liveTasks) &&
+      mailbox.getDueMessages(mailbox.getDeliveredIds()).length === 0
+    ) {
       await updateSession(session.id, { status: 'closed' });
       log.info('Closed spent task session', { sessionId: session.id, threadId: session.thread_id });
     }

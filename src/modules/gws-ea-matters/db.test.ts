@@ -99,6 +99,8 @@ describe('the matters schema', () => {
       'handler',
       'matter_open',
       'linked_at',
+      'account',
+      'account_at',
     ]);
   });
 

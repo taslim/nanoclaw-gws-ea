@@ -51,6 +51,11 @@ export interface DriveComment {
   readonly id: string;
   /** Its words: someone else's text. */
   readonly content?: string;
+  readonly htmlContent?: string;
+  /** The original text quoted by the comment, which can differ from the current document. */
+  readonly quotedFileContent?: { readonly mimeType?: string; readonly value?: string };
+  /** Non-deleted replies, whose contents become readable with a new file share too. */
+  readonly replies?: readonly { readonly content?: string; readonly htmlContent?: string }[];
   /** Resolved by one of its replies. */
   readonly resolved?: boolean;
   /** When it or any of its replies last changed. */
@@ -106,6 +111,8 @@ export interface DriveApi {
   /** Undefined when the file no longer exists, or the assistant cannot see it. A trashed file still exists. */
   getFile(fileId: string): Promise<DriveFile | undefined>;
   createFile(input: {
+    /** A pre-generated native Drive ID. Supported for folders, not Google Docs documents. */
+    readonly id?: string;
     readonly name: string;
     readonly mimeType: string;
     readonly parents?: readonly string[];
@@ -267,6 +274,24 @@ function toComment(value: unknown): DriveComment[] {
     {
       id: value.id,
       ...textField(value, 'content'),
+      ...textField(value, 'htmlContent'),
+      ...(isRecord(value.quotedFileContent)
+        ? {
+            quotedFileContent: {
+              ...textField(value.quotedFileContent, 'mimeType'),
+              ...textField(value.quotedFileContent, 'value'),
+            },
+          }
+        : {}),
+      ...(Array.isArray(value.replies)
+        ? {
+            replies: value.replies.flatMap((reply) =>
+              isRecord(reply) && reply.deleted !== true
+                ? [{ ...textField(reply, 'content'), ...textField(reply, 'htmlContent') }]
+                : [],
+            ),
+          }
+        : {}),
       ...booleanField(value, 'resolved'),
       ...textField(value, 'modifiedTime'),
       ...textField(value, 'assigneeEmailAddress'),
@@ -283,7 +308,8 @@ const DRIVE = 'https://www.googleapis.com/drive/v3';
 const DRIVE_V2 = 'https://www.googleapis.com/drive/v2';
 const FILE_FIELDS =
   'id,name,mimeType,trashed,parents,owners(emailAddress,permissionId),sharingUser(emailAddress,permissionId),sharedWithMeTime,capabilities(canShare),modifiedTime,lastModifyingUser(emailAddress,permissionId)';
-const COMMENT_FIELDS = 'id,content,resolved,modifiedTime,assigneeEmailAddress,mentionedEmailAddresses';
+const COMMENT_FIELDS =
+  'id,content,htmlContent,quotedFileContent(mimeType,value),replies(content,htmlContent,deleted),resolved,modifiedTime,assigneeEmailAddress,mentionedEmailAddresses';
 const PERMISSION_FIELDS =
   'id,type,role,emailAddress,domain,deleted,expirationTime,view,permissionDetails(permissionType,role,inherited,inheritedFrom)';
 /** Pages read before a list is refused as too long: an access list and its requests are short. */
@@ -315,6 +341,19 @@ async function listPages<T>(
   throw new GoogleApiError(502, `Google Drive returned a ${what} too long to read`);
 }
 
+/** Allocate a native ID that can be persisted before a folder's creation. */
+export async function generateDriveFileId(options: GoogleClientOptions): Promise<string> {
+  const payload = await googleJson(options, `${DRIVE}/files/generateIds?count=1&space=drive`);
+  if (
+    !isRecord(payload) ||
+    !Array.isArray(payload.ids) ||
+    payload.ids.length !== 1 ||
+    typeof payload.ids[0] !== 'string'
+  )
+    throw unreadable('generated file ID');
+  return payload.ids[0];
+}
+
 /** The real client, over Drive's REST API. */
 export function createDriveApi(options: GoogleClientOptions): DriveApi {
   return {
@@ -328,6 +367,7 @@ export function createDriveApi(options: GoogleClientOptions): DriveApi {
       const payload = await googleJson(options, `${DRIVE}/files?${search.toString()}`, {
         method: 'POST',
         body: {
+          ...(input.id === undefined ? {} : { id: input.id }),
           name: input.name,
           mimeType: input.mimeType,
           ...(input.parents === undefined ? {} : { parents: [...input.parents] }),

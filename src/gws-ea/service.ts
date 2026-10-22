@@ -391,10 +391,10 @@ export function hostPolicyLocators(configRoot: string): Readonly<Record<string, 
 }
 
 /**
- * Bind the shared policy locators in native host configuration, rewriting
- * only one that differs; whether one did. A locator conveys no per-assistant
- * consent: each policy decides for itself, and stays out of runtime.json,
- * container env and release snapshots.
+ * Bind shared policy locators and the exact per-assistant coordination lock in
+ * native host configuration, rewriting only values that differ. A locator
+ * conveys no per-assistant consent: each policy decides for itself. These
+ * paths stay out of runtime.json, container env and release snapshots.
  */
 export async function bindInstanceHostPolicies(
   config: InstanceRuntimeConfig,
@@ -402,7 +402,14 @@ export async function bindInstanceHostPolicies(
   upsertEnvVars: UpsertEnvVars,
 ): Promise<boolean> {
   if (!path.isAbsolute(configRoot)) throw new GwsEaError('invalid_arguments', 'Host policy locators must be absolute');
-  const locators = hostPolicyLocators(configRoot);
+  const locators = {
+    ...hostPolicyLocators(configRoot),
+    GWS_EA_INSTANCE_LOCK_FILE: path.join(configRoot, 'locks', `${config.instance_id}.lock`),
+    GWS_EA_CONFIG_ROOT: configRoot,
+    GWS_EA_STATE_ROOT: path.dirname(config.instance_root),
+    GWS_EA_INSTANCE_ID: config.instance_id,
+    GWS_EA_WHATSAPP_DIR: path.join(config.instance_root, 'secrets', 'whatsapp'),
+  };
   const present = readEnvFile(Object.keys(locators), config.state_root);
   const changed = Object.entries(locators).filter(([key, file]) => present[key] !== file);
   if (changed.length) upsertEnvVars(Object.fromEntries(changed), config.state_root);

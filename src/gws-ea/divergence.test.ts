@@ -68,6 +68,64 @@ async function freshInstall(): Promise<string> {
   return directory;
 }
 
+describe('recorded divergence: resumable native mailbox cutovers', () => {
+  it('keeps source identity, deadlines and settlement in the native mailbox while existing delivery reads retain their meaning', async () => {
+    await freshInstall();
+    const { wrapSqliteInbound, wrapSqliteOutbound } = await import('../mailbox/sqlite/index.js');
+    const { INBOUND_SCHEMA, OUTBOUND_SCHEMA } = await import('../mailbox/sqlite/schema.js');
+    const raw = new Database(':memory:');
+    try {
+      raw.exec(INBOUND_SCHEMA);
+      raw.exec(OUTBOUND_SCHEMA);
+      const inbound = wrapSqliteInbound(raw);
+      const outbound = wrapSqliteOutbound(raw);
+      await inbound.insertMessage({
+        id: 'source',
+        kind: 'chat',
+        timestamp: '2026-10-15T12:00:00.000Z',
+        channelType: 'whatsapp',
+        platformId: 'trip',
+        threadId: null,
+        content: '{"text":"Reply later"}',
+        processAfter: '2999-01-01T00:00:00.000Z',
+        recurrence: null,
+        trigger: false,
+        status: 'held',
+        sourceSessionId: 'source-session',
+        onWake: true,
+      });
+      expect(inbound.getInboundRecords({ since: '2026-10-01T00:00:00.000Z', status: 'held' })).toMatchObject([
+        { id: 'source', trigger: false, sourceSessionId: 'source-session', onWake: true },
+      ]);
+      inbound.releaseHeldMessages(null, { preserveTriggers: true, preserveProcessAfter: true });
+      expect(inbound.getInboundRecords({ status: 'pending' })).toMatchObject([
+        { id: 'source', processAfter: '2999-01-01T00:00:00.000Z', trigger: false },
+      ]);
+      expect(inbound.settleUnreadMessages(['source'])).toBe(1);
+      expect(inbound.settleUnreadMessages(['source'])).toBe(0);
+      for (const id of ['posted', 'failed'])
+        await outbound.writeDirect({
+          id,
+          kind: 'chat',
+          platformId: 'trip',
+          channelType: 'whatsapp',
+          threadId: null,
+          content: '{"text":"An answer"}',
+        });
+      inbound.markDelivered('posted', 'posted-on-platform');
+      inbound.markDeliveryFailed('failed');
+      expect(outbound.getOutboundRecords('2020-01-01T00:00:00.000Z').map((row) => row.id)).toEqual([
+        'posted',
+        'failed',
+      ]);
+      expect(inbound.getDeliveredIds('delivered')).toEqual(new Set(['posted']));
+      expect(inbound.getDeliveredIds()).toEqual(new Set(['posted', 'failed']));
+    } finally {
+      raw.close();
+    }
+  });
+});
+
 describe('recorded divergence: the installed OneCLI adapter', () => {
   it('is exactly what add-onecli installs: every file it copies equals its payload source', async () => {
     const skill = path.join(originalCwd, '.claude/skills/add-onecli');
@@ -407,6 +465,55 @@ describe('recorded divergence: a Google Chat message keeps its attachments', () 
 });
 
 describe('recorded divergence: delivery consults outbound guards, and the runner reports a failed turn', () => {
+  it('rechecks a mailbox source session after guards await, while direct host sends remain available', async () => {
+    await freshInstall();
+    const db = await import('../db/index.js');
+    await db.runMigrations(await db.initTestDb());
+    cleanups.push(() => db.closeDb());
+    await db.createAgentGroup({
+      id: 'source',
+      name: 'Source',
+      folder: 'source',
+      agent_provider: null,
+      created_at: new Date().toISOString(),
+    });
+    const { createSession, updateSession } = await import('../db/sessions.js');
+    await createSession({
+      id: 'old-conversation',
+      agent_group_id: 'source',
+      messaging_group_id: null,
+      thread_id: 'system:proof',
+      agent_provider: null,
+      status: 'active',
+      container_status: 'stopped',
+      last_active: null,
+      created_at: new Date().toISOString(),
+    });
+    const delivery = await import('../delivery.js');
+    delivery.registerOutboundGuard('divergence:close-source', async () => {
+      await updateSession('old-conversation', { status: 'closed' });
+      return { effect: 'allow' };
+    });
+    const sent = vi.fn(async () => 'posted');
+    const guarded = delivery.setDeliveryAdapter({ deliver: sent });
+    await expect(
+      guarded.deliver(
+        'gchat',
+        'spaces/chat',
+        null,
+        'chat',
+        '{"text":"old"}',
+        undefined,
+        undefined,
+        'old-row',
+        new Date().toISOString(),
+        'old-conversation',
+      ),
+    ).rejects.toBeInstanceOf(delivery.OutboundRefusedError);
+    expect(sent).not.toHaveBeenCalled();
+    await guarded.deliver('gchat', 'spaces/chat', null, 'chat', '{"text":"host notice"}');
+    expect(sent).toHaveBeenCalledTimes(1);
+  });
   it('refuses a send that a registered outbound guard refuses, before the channel adapter sees it', async () => {
     await freshInstall();
     const delivery = await import('../delivery.js');
@@ -554,7 +661,324 @@ describe('recorded divergence: a module can hold an inbound message until a time
   });
 });
 
+describe('recorded divergence: disconnected adapters keep durable sends pending', () => {
+  it('spends no attempt while disconnected and passes the same row id into the native adapter after recovery', async () => {
+    await freshInstall();
+    await import('../mailbox/compose.js');
+    const db = await import('../db/index.js');
+    await db.runMigrations(await db.initTestDb());
+    cleanups.push(() => db.closeDb());
+    const created_at = new Date().toISOString();
+    await db.createAgentGroup({ id: 'ag-1', name: 'Robin', folder: 'main', agent_provider: null, created_at });
+    await db.createMessagingGroup({
+      id: 'mg-1',
+      channel_type: 'whatsapp',
+      platform_id: 'principal-dm',
+      name: 'Principal',
+      is_group: 0,
+      unknown_sender_policy: 'public',
+      created_at,
+    });
+    const manager = await import('../session-manager.js');
+    const { session } = await manager.resolveSession('ag-1', 'mg-1', null, 'shared');
+    await manager.writeOutboundDirect('ag-1', session.id, {
+      id: 'durable-send',
+      kind: 'chat',
+      platformId: 'principal-dm',
+      channelType: 'whatsapp',
+      threadId: null,
+      content: JSON.stringify({ text: 'Thursday works.' }),
+    });
+    const delivery = await import('../delivery.js');
+    const { ChannelNotConnectedError } = await import('../channels/adapter.js');
+    delivery.setDeliveryAdapter({
+      async deliver() {
+        throw new ChannelNotConnectedError();
+      },
+    });
+    await delivery.deliverSessionMessages(session);
+    expect(
+      await db.getDb().get('SELECT 1 FROM delivery_attempts WHERE message_id = ?', 'durable-send'),
+    ).toBeUndefined();
+    expect(await manager.withMailboxSession('ag-1', session.id, (mailbox) => mailbox.getDeliveredIds())).toEqual(
+      new Set(),
+    );
+
+    const registry = await import('../channels/channel-registry.js');
+    const sent: Array<{ id?: string; timestamp?: string }> = [];
+    registry.registerChannelAdapter('whatsapp', {
+      factory: () => ({
+        name: 'whatsapp',
+        channelType: 'whatsapp',
+        supportsThreads: false,
+        async setup() {},
+        async teardown() {},
+        isConnected: () => true,
+        async deliver(_platform, _thread, message, messageId) {
+          sent.push({ id: messageId, timestamp: message.timestamp });
+          return 'platform-send';
+        },
+      }),
+    });
+    await registry.initChannelAdapters(() => ({ onInbound() {}, onInboundEvent() {}, onMetadata() {}, onAction() {} }));
+    cleanups.push(() => registry.teardownChannelAdapters());
+    delivery.setDeliveryAdapter(registry.createChannelDeliveryAdapter());
+    await delivery.deliverSessionMessages(session);
+    await delivery.deliverSessionMessages(session);
+    expect(sent).toEqual([{ id: 'durable-send', timestamp: expect.stringMatching(/^\d{4}-\d{2}-\d{2}T/u) }]);
+  });
+  it('keeps a spent task session open while its reply waits for the channel', async () => {
+    await freshInstall();
+    await import('../mailbox/compose.js');
+    const db = await import('../db/index.js');
+    await db.runMigrations(await db.initTestDb());
+    cleanups.push(() => db.closeDb());
+    const created_at = new Date().toISOString();
+    await db.createAgentGroup({ id: 'ag-1', name: 'Robin', folder: 'main', agent_provider: null, created_at });
+    await db.createMessagingGroup({
+      id: 'mg-1',
+      channel_type: 'whatsapp',
+      platform_id: 'principal-dm',
+      name: 'Principal',
+      is_group: 0,
+      unknown_sender_policy: 'public',
+      created_at,
+    });
+    const manager = await import('../session-manager.js');
+    const { session } = await manager.resolveSession('ag-1', 'mg-1', 'system:tasks:reminder', 'per-thread');
+    await manager.writeOutboundDirect('ag-1', session.id, {
+      id: 'task-reply',
+      kind: 'chat',
+      platformId: 'principal-dm',
+      channelType: 'whatsapp',
+      threadId: null,
+      content: JSON.stringify({ text: 'Your cabin choice is due today.' }),
+    });
+    const delivery = await import('../delivery.js');
+    const { ChannelNotConnectedError } = await import('../channels/adapter.js');
+    delivery.setDeliveryAdapter({
+      async deliver() {
+        throw new ChannelNotConnectedError();
+      },
+    });
+    await delivery.deliverSessionMessages(session);
+    const { reconcileSession } = await import('../reconcile-session.js');
+    const { getSession } = await import('../db/sessions.js');
+    await reconcileSession(session.id);
+    expect((await getSession(session.id))?.status).toBe('active');
+  });
+});
+
+describe('recorded divergence: request-addressed conversation reminders', () => {
+  it('keeps one native task when an interrupted request is replayed and retains random identities for other callers', async () => {
+    await freshInstall();
+    await import('../mailbox/compose.js');
+    const db = await import('../db/index.js');
+    await db.runMigrations(await db.initTestDb());
+    cleanups.push(() => db.closeDb());
+    const created_at = new Date().toISOString();
+    await db.createAgentGroup({
+      id: 'reminder-agent',
+      name: 'Robin',
+      folder: 'reminder-agent',
+      agent_provider: null,
+      created_at,
+    });
+    await db.createMessagingGroup({
+      id: 'reminder-chat',
+      channel_type: 'whatsapp',
+      platform_id: 'trip@g.us',
+      name: 'Trip',
+      is_group: 1,
+      unknown_sender_policy: 'public',
+      created_at,
+    });
+    const manager = await import('../session-manager.js');
+    const { session } = await manager.resolveSession('reminder-agent', 'reminder-chat', null, 'shared');
+    const { createScheduledTask } = await import('../modules/scheduling/create.js');
+    const task = {
+      prompt: 'Remind the group to choose a cabin.',
+      recurrence: null,
+      script: null,
+      processAfter: new Date(Date.now() + 60_000).toISOString(),
+    };
+    const first = await createScheduledTask('reminder-agent', task, { session, id: 'chat-reminder-request-1' });
+    const replay = await createScheduledTask('reminder-agent', task, { session, id: 'chat-reminder-request-1' });
+    expect(first.row.id).toBe('chat-reminder-request-1');
+    expect(replay.row.id).toBe(first.row.id);
+    await manager.withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) => {
+      expect(mailbox.listLiveTasks()).toHaveLength(1);
+      expect(mailbox.listLiveTasks()[0]?.content).toContain('"inConversation":true');
+    });
+    const ordinary = await createScheduledTask('reminder-agent', task, { session });
+    const another = await createScheduledTask('reminder-agent', task, { session });
+    expect(ordinary.row.id).not.toBe(another.row.id);
+    await manager.withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) => {
+      expect(mailbox.listLiveTasks()).toHaveLength(3);
+    });
+  });
+});
+
+describe('recorded divergence: prepared module engagement and destination-free chat wirings', () => {
+  it('keeps silent context, wakes only on the module decision, and orders host work in the conversation tail', async () => {
+    await freshInstall();
+    await import('../mailbox/compose.js');
+    const db = await import('../db/index.js');
+    await db.runMigrations(await db.initTestDb());
+    cleanups.push(() => db.closeDb());
+    const created_at = new Date().toISOString();
+    await db.createAgentGroup({ id: 'ag-1', name: 'Robin', folder: 'main', agent_provider: null, created_at });
+    await db.createMessagingGroup({
+      id: 'mg-1',
+      channel_type: 'whatsapp',
+      platform_id: 'trip',
+      name: 'Lake trip',
+      is_group: 1,
+      unknown_sender_policy: 'public',
+      created_at,
+    });
+    await db.createMessagingGroupAgent(
+      {
+        id: 'wiring',
+        messaging_group_id: 'mg-1',
+        agent_group_id: 'ag-1',
+        engage_mode: 'module',
+        engage_pattern: null,
+        sender_scope: 'all',
+        ignored_message_policy: 'accumulate',
+        session_mode: 'shared',
+        priority: 0,
+        created_at,
+      },
+      { companionDestination: false },
+    );
+    expect(await db.getDb().all('SELECT * FROM agent_destinations')).toEqual([]);
+    const router = await import('../router.js');
+    const preparation = await import('../inbound-preparation.js');
+    preparation.registerInboundPreparer(({ content }) => Promise.resolve(content.replace('voice', 'Robin')));
+    const order: string[] = [];
+    router.registerEngagementDecider('whatsapp', ({ event }) => {
+      order.push(event.message.id);
+      return event.message.content.includes('Robin');
+    });
+    const event = (id: string, text: string): InboundEvent => ({
+      channelType: 'whatsapp',
+      platformId: 'trip',
+      threadId: null,
+      message: {
+        id,
+        kind: 'chat',
+        content: JSON.stringify({ text }),
+        timestamp: created_at,
+        isGroup: true,
+        deduplicate: true,
+      },
+    });
+    external.requestWake.mockClear();
+    await Promise.all([
+      router.routeInbound(event('banter', 'Funny video.')),
+      router.runInConversationTail({ channelType: 'whatsapp', platformId: 'trip' }, async () => {
+        order.push('cutover');
+      }),
+      router.routeInbound(event('addressed', 'voice, check Thursday.')),
+    ]);
+    expect(order).toEqual(['banter', 'cutover', 'addressed']);
+    expect(external.requestWake).toHaveBeenCalledTimes(1);
+    await router.routeInbound(event('addressed', 'voice, check Thursday.'));
+    expect(order).toEqual(['banter', 'cutover', 'addressed']);
+    expect(external.requestWake).toHaveBeenCalledTimes(1);
+    const session = await db.getDb().get<{ id: string }>('SELECT id FROM sessions WHERE agent_group_id = ?', 'ag-1');
+    const { inboundDbPath } = await import('../mailbox/sqlite/paths.js');
+    const inbound = new Database(inboundDbPath('ag-1', session!.id), { readonly: true });
+    try {
+      expect(inbound.prepare('SELECT id, trigger FROM messages_in ORDER BY seq').all()).toEqual([
+        { id: 'banter:ag-1', trigger: 0 },
+        { id: 'addressed:ag-1', trigger: 1 },
+      ]);
+    } finally {
+      inbound.close();
+    }
+  });
+});
+
 describe('recorded divergence: a module can hold an inbound message until it releases or settles it', () => {
+  it('can release held chat context without making ambient messages wake the assistant', async () => {
+    await freshInstall();
+    const db = await import('../db/index.js');
+    await db.runMigrations(await db.initTestDb());
+    cleanups.push(() => db.closeDb());
+    const createdAt = new Date().toISOString();
+    await db.createAgentGroup({
+      id: 'chat-agent',
+      name: 'Chat',
+      folder: 'chat-agent',
+      agent_provider: null,
+      created_at: createdAt,
+    });
+    await db.createMessagingGroup({
+      id: 'trip',
+      channel_type: 'whatsapp',
+      platform_id: 'trip@g.us',
+      is_group: 1,
+      name: 'Trip',
+      unknown_sender_policy: 'public',
+      created_at: createdAt,
+    });
+    await db.createMessagingGroupAgent(
+      {
+        id: 'chat-wiring',
+        messaging_group_id: 'trip',
+        agent_group_id: 'chat-agent',
+        engage_mode: 'module',
+        engage_pattern: null,
+        sender_scope: 'all',
+        ignored_message_policy: 'accumulate',
+        session_mode: 'shared',
+        priority: 0,
+        created_at: createdAt,
+      },
+      { companionDestination: false },
+    );
+    await import('../mailbox/compose.js');
+    const router = await import('../router.js');
+    const { findSessionForAgent } = await import('../db/sessions.js');
+    const { withExistingMailboxSession } = await import('../session-manager.js');
+    router.registerEngagementDecider('whatsapp', ({ event }) => event.message.isMention === true);
+    router.registerInboundDelay(() => router.HOLD_UNTIL_RELEASED);
+    external.requestWake.mockClear();
+    const receive = (id: string, isMention: boolean) =>
+      router.routeInbound({
+        channelType: 'whatsapp',
+        platformId: 'trip@g.us',
+        threadId: null,
+        message: {
+          id,
+          kind: 'chat',
+          content: JSON.stringify({ text: id }),
+          timestamp: createdAt,
+          isGroup: true,
+          isMention,
+        },
+      });
+
+    await receive('ambient', false);
+    const sessionId = (await findSessionForAgent('chat-agent', 'trip', null))?.id ?? '';
+    expect(
+      await withExistingMailboxSession('chat-agent', sessionId, (mailbox) => {
+        expect(mailbox.releaseHeldMessages(null, { preserveTriggers: true })).toBe(1);
+        return mailbox.countDueMessages();
+      }),
+    ).toBe(0);
+    await receive('addressed', true);
+    expect(external.requestWake).not.toHaveBeenCalled();
+    expect(
+      await withExistingMailboxSession('chat-agent', sessionId, (mailbox) => {
+        expect(mailbox.releaseHeldMessages(null, { preserveTriggers: true })).toBe(1);
+        return mailbox.countDueMessages();
+      }),
+    ).toBe(1);
+  });
+
   it('writes a held row that nothing counts or wakes for, whatever time another delay names, and releases it due at the time named, or settles it unread', async () => {
     await freshInstall();
     const db = await import('../db/index.js');
@@ -1118,6 +1542,16 @@ describe('recorded divergence: a module can refuse a destination on every write 
 });
 
 describe('recorded divergence: instructions follow the capabilities that use them', () => {
+  it('lets a reply-only group select WhatsApp formatting without granting shell or other skills', async () => {
+    await freshInstall();
+    const { skillsWithinCapabilities } = await import('../capabilities.js');
+
+    expect(
+      skillsWithinCapabilities(['whatsapp-formatting', 'agent-browser', 'unclassified-command'], new Set(['reply'])),
+    ).toEqual(['whatsapp-formatting']);
+    expect(skillsWithinCapabilities(['whatsapp-formatting'], new Set())).toEqual([]);
+  });
+
   it("keeps memory, conversation history, account connection, and ncl out of the base instructions, and the file tools out of reply's", async () => {
     const read = (file: string) => readFile(path.join(originalCwd, file), 'utf8');
     const base = await read('container/CLAUDE.md');
@@ -1248,6 +1682,37 @@ function runProgram(
     child.on('close', (status) => resolve({ status, stdout, stderr }));
   });
 }
+
+describe('recorded divergence: one tool name can have a capability-specific definition', () => {
+  it('serves each key its own schema and wire handler through the real runner MCP server', async () => {
+    const result = await runProgram('bun', ['test', '--isolate', 'src/mcp-tools/server.variants.test.ts'], {
+      cwd: path.join(originalCwd, 'container/agent-runner'),
+    });
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stderr).toContain('1 pass');
+  });
+});
+
+describe('recorded divergence: a bridge adapter can make a text delivery retry idempotent', () => {
+  it('passes the same row and part key through repeated file-free text deliveries', async () => {
+    const { createChatSdkBridge } = await import('../channels/chat-sdk-bridge.js');
+    const keys: string[] = [];
+    const bridge = createChatSdkBridge({
+      adapter: {
+        name: 'durable-text',
+        postTextOnce: async (threadId: string, _text: string, key: string) => {
+          keys.push(key);
+          return { id: key, threadId, raw: {} };
+        },
+      } as unknown as Adapter,
+      supportsThreads: false,
+    });
+    const message = { kind: 'chat', content: { text: 'One outage notice' } };
+    expect(await bridge.deliver('principal', null, message, 'one-notice')).toBe('one-notice:0');
+    expect(await bridge.deliver('principal', null, message, 'one-notice')).toBe('one-notice:0');
+    expect(keys).toEqual(['one-notice:0', 'one-notice:0']);
+  });
+});
 
 describe("recorded divergence: NanoClaw's update helpers act on the install they are given", () => {
   type UpdateHelpers = Pick<NanoclawServiceHelpers, 'createCommandRunner' | 'detectService' | 'drainContainers'>;
@@ -1382,6 +1847,65 @@ describe("recorded divergence: the host's own sends pass the outbound guards, an
     expect(channelMessage).toContain('deduplicate: message.deduplicate,');
     expect(adminEvent).toContain('authenticatedSender: undefined,');
     expect(adminEvent).toContain("deduplicate: adapter.channelType === 'cli' ? event.message.deduplicate : undefined,");
+  });
+});
+
+describe('recorded divergence: WhatsApp is an instance-owned module channel', () => {
+  it('can replace its linked transport without stopping another channel', async () => {
+    await freshInstall();
+    const registry = await import('../channels/channel-registry.js');
+    const setups: string[] = [];
+    const stops: string[] = [];
+    let generation = 0;
+    const adapter = (channelType: string, identity: string) => ({
+      name: channelType,
+      channelType,
+      supportsThreads: false,
+      setup: async () => {
+        setups.push(identity);
+      },
+      teardown: async () => {
+        stops.push(identity);
+      },
+      isConnected: () => !stops.includes(identity),
+      deliver: async () => identity,
+    });
+    registry.registerChannelAdapter('whatsapp', { factory: () => adapter('whatsapp', `wa-${++generation}`) });
+    registry.registerChannelAdapter('gchat', { factory: () => adapter('gchat', 'gchat') });
+    registry.registerChannelAdapter('unlinked', { factory: async () => null });
+    await registry.initChannelAdapters(() => ({
+      onInbound() {},
+      onInboundEvent() {},
+      onMetadata() {},
+      onAction() {},
+    }));
+    cleanups.push(() => registry.teardownChannelAdapters());
+
+    await expect(registry.stopChannelAdapter('whatsapp')).resolves.toBe('stopped');
+    expect(stops).toEqual(['wa-1']);
+    expect(registry.getChannelAdapterExact('whatsapp')).toBeUndefined();
+    expect(registry.getChannelAdapterExact('gchat')?.isConnected()).toBe(true);
+    await expect(registry.startChannelAdapter('whatsapp')).resolves.toBe('started');
+    expect(setups).toEqual(['wa-1', 'gchat', 'wa-2']);
+    expect(registry.getChannelAdapterExact('whatsapp')?.isConnected()).toBe(true);
+    await expect(registry.startChannelAdapter('unlinked')).resolves.toBe('no-credentials');
+    expect(registry.getChannelAdapterExact('unlinked')).toBeUndefined();
+    expect(registry.getChannelAdapterExact('gchat')?.isConnected()).toBe(true);
+  });
+
+  it('registers once from the module barrel and stays inert without a link record', async () => {
+    await freshInstall();
+    const registry = await import('../channels/channel-registry.js');
+    vi.mocked(registry.registerChannelAdapter).mockClear();
+
+    await import('../channels/index.js');
+    const whatsapp = () =>
+      vi.mocked(registry.registerChannelAdapter).mock.calls.filter(([name]) => name === 'whatsapp');
+    expect(whatsapp()).toHaveLength(0);
+
+    await import('../modules/index.js');
+    expect(whatsapp()).toHaveLength(1);
+    expect(await whatsapp()[0]![1].factory()).toBeNull();
   });
 });
 
@@ -1550,15 +2074,10 @@ describe('recorded divergence: compaction keeps the relationship and the work in
   });
 });
 
-describe('recorded divergence: recognized speech carries its reading note and an unheard recording a status line for its reader', () => {
-  it("says how to read speech once, and names the operator only in the principal's own private conversation", async () => {
+describe('recorded divergence: an unheard recording carries a status line for its reader', () => {
+  it("names the operator only in the principal's own private conversation", async () => {
     const formatter = await readFile(path.join(originalCwd, 'container/agent-runner/src/formatter.ts'), 'utf8');
 
-    expect(formatter).toContain('const SPEECH_READING_NOTE =');
-    expect(formatter).toContain(
-      'A self-correction replaces what it corrects. Keep every point, number, negation and condition',
-    );
-    expect(formatter).toContain('`\\n<speech_note>${SPEECH_READING_NOTE}</speech_note>`');
     expect(formatter).toContain('const principals = speech.inPrincipalPrivateConversation === true;');
     expect(formatter).toContain('const NOT_LISTENED_ELSEWHERE =');
     expect(formatter).toContain(

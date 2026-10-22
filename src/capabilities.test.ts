@@ -11,6 +11,7 @@ import {
   parseStoredCapabilities,
   registerCapability,
   resolveCapabilities,
+  skillsWithinCapabilities,
 } from './capabilities.js';
 import { log } from './log.js';
 
@@ -93,5 +94,13 @@ describe('what a list grants on the host', () => {
 
   it('leaves out instructions no key names', () => {
     expect(grantsInstructions('unclaimed-module', all)).toBe(false);
+  });
+
+  it('lets reply select WhatsApp formatting without shell, while commands still need shell', () => {
+    const selected = ['welcome', 'whatsapp-formatting', 'agent-browser', 'unclassified-command'];
+
+    expect(skillsWithinCapabilities(selected, new Set(['reply']))).toEqual(['welcome', 'whatsapp-formatting']);
+    expect(skillsWithinCapabilities(selected, new Set(['shell']))).toEqual(['agent-browser', 'unclassified-command']);
+    expect(skillsWithinCapabilities(selected, new Set())).toEqual([]);
   });
 });

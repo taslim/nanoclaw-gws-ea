@@ -5,6 +5,8 @@
  * Two patterns: native adapters (implement directly) or Chat SDK bridge (wrap a Chat SDK adapter).
  */
 
+import type { EngageMode } from '../types.js';
+
 /** Passed to the adapter at setup time. */
 export interface ChannelSetup {
   /** Called when an inbound message arrives from the platform. */
@@ -181,6 +183,8 @@ export interface OutboundMessage {
   kind: string;
   content: unknown; // parsed JSON from messages_out
   files?: OutboundFile[]; // file attachments from the session outbox, or a host request's pictures
+  /** Original outbound row time, stamped by the host; absent for direct host sends. */
+  timestamp?: string;
 }
 
 /** Discovered conversation info (from syncConversations). */
@@ -203,7 +207,7 @@ export interface ResolvedConversation {
 /** Wiring/mg defaults for one conversation context (DM vs group/channel). */
 export interface ChannelContextDefaults {
   /** Default engage_mode for wirings created in this context. */
-  engageMode: 'pattern' | 'mention' | 'mention-sticky';
+  engageMode: EngageMode;
   /**
    * Default engage_pattern when engageMode === 'pattern'. May contain the
    * literal token `{name}`: creation helpers replace it with the regex-escaped
@@ -273,6 +277,14 @@ export interface ChannelDefaults {
   mentions: 'platform' | 'dm-only' | 'never';
 }
 
+/** A linked adapter is temporarily disconnected; queued sends wait without spending a delivery attempt. */
+export class ChannelNotConnectedError extends Error {
+  constructor() {
+    super('Channel is not connected');
+    this.name = 'ChannelNotConnectedError';
+  }
+}
+
 /** The v2 channel adapter contract. */
 export interface ChannelAdapter {
   name: string;
@@ -304,8 +316,17 @@ export interface ChannelAdapter {
   teardown(): Promise<void>;
   isConnected(): boolean;
 
-  // Outbound delivery — returns the platform message ID if available
-  deliver(platformId: string, threadId: string | null, message: OutboundMessage): Promise<string | undefined>;
+  /**
+   * Return the platform message ID after sending. `messageId` is the durable
+   * outbound row ID when delivery owns one, for platform idempotency. A linked
+   * but disconnected adapter throws ChannelNotConnectedError without sending.
+   */
+  deliver(
+    platformId: string,
+    threadId: string | null,
+    message: OutboundMessage,
+    messageId?: string,
+  ): Promise<string | undefined>;
 
   // Optional
   /**
@@ -392,7 +413,7 @@ export interface ChannelAdapter {
 }
 
 /** Factory function that creates a channel adapter (returns null if credentials missing). */
-export type ChannelAdapterFactory = () => ChannelAdapter | Promise<ChannelAdapter> | null;
+export type ChannelAdapterFactory = () => ChannelAdapter | null | Promise<ChannelAdapter | null>;
 
 /** Registration entry for a channel adapter. */
 export interface ChannelRegistration {

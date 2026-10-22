@@ -79,6 +79,23 @@ const probes = object({
   principal: probe(),
   main_identity: probe({ agent_group_id: nullable(text) }),
   external_email: probe({ agent_group_id: nullable(text) }),
+  whatsapp: probe({
+    state: nullable(choices('unlinked', 'linking', 'connected', 'needs-relink')),
+    number: nullable(text),
+  }),
+  external_chat: probe({ agent_group_id: nullable(text) }),
+  job_agents: probe({
+    count: nullable(count),
+    jobs: nullable(
+      array(
+        probe({
+          agent_group_id: nullable(text),
+          messaging_group_id: nullable(text),
+          state: nullable(text),
+        }),
+      ),
+    ),
+  }),
   workspace: probe({ account: nullable(text) }),
   chat: probe({
     consumer_connected: effect,
@@ -416,7 +433,7 @@ const removalPreview = object({
 });
 const removal = object(
   {
-    removed: array(choices('nanoclaw', 'chat-subscription', 'gcp-project', 'onecli', 'instance-files')),
+    removed: array(choices('whatsapp', 'nanoclaw', 'chat-subscription', 'gcp-project', 'onecli', 'instance-files')),
     abandoned: array(object({ resource: choices('gcp-project', 'chat-subscription', 'onepassword'), evidence: text })),
     keyPolicyUnrestored: text,
     memberPolicyUnrestored: text,
@@ -484,6 +501,7 @@ const rollbackPreview = object({
     centralRows: array(object({ table: text, count })),
     files: object({ count, paths: array(text) }),
     orphanedAgents: array(text),
+    jobAgents: array(object({ agent_group_id: text, messaging_group_id: text, state: text })),
   }),
 });
 const rollbackFacts = {

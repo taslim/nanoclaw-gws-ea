@@ -2,10 +2,16 @@ import { randomUUID } from 'node:crypto';
 import { access, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import privateFiles from 'node:fs/promises';
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { writePrivate } from '../community-portal/private-file.js';
+import { WhatsAppAuthStore } from '../modules/gws-ea-whatsapp/auth-store.js';
+import { writeWhatsAppLink } from '../modules/gws-ea-whatsapp/paths.js';
+import { FakeSocket } from '../modules/gws-ea-whatsapp/testing/fake-socket.js';
+import { WhatsAppLinking } from '../modules/gws-ea-whatsapp/link.js';
+import { logoutWhatsAppAccount } from '../modules/gws-ea-whatsapp/logout.js';
 import { getInstallScopedNames } from '../install-slug.js';
 import { ASSISTANT_TOKEN, FakeGoogleEvents } from '../modules/gws-ea-chat/testing/fake-google-events.js';
 import { GOOGLE_GRANT_FILE_NAME, GOOGLE_SIGN_IN_SCOPES } from '../modules/gws-ea-google/grant.js';
@@ -40,7 +46,15 @@ import {
 } from './operation.js';
 import { resolveControlPlanePaths, type ControlPlanePaths } from './paths.js';
 import type { SanitizedCommand, SanitizedCommandOutcome, SanitizedCommandOutcomeRunner } from './process.js';
-import { readRegistry, swapInstanceRelease, writeInstanceMarker } from './registry.js';
+import {
+  claimInstanceAlias,
+  claimInstanceWhatsApp,
+  readRegistry,
+  swapInstanceRelease,
+  writeInstanceMarker,
+} from './registry.js';
+import { createInstanceRuntimeConfig, persistInstanceRuntime } from './service.js';
+import { createOnecliRuntimeLayout } from './onecli-compose.js';
 import { fence, linkReleaseState, pointCurrent, releaseName, type InstanceLayout } from './release-layout.js';
 import {
   describeRemoval,
@@ -2462,5 +2476,237 @@ describe('removal command', () => {
       '--abandon: "registry" cannot be abandoned; choose from gcp-project, chat-subscription, onepassword',
     );
     expect(remove).not.toHaveBeenCalled();
+  });
+});
+
+async function linkedWhatsApp(paths: ControlPlanePaths, input: InstanceReservationInput) {
+  const directory = path.join(paths.instanceRoot(input.instance_id), 'secrets/whatsapp');
+  await claimInstanceWhatsApp(paths, input.instance_id, '+15550000000');
+  await writeWhatsAppLink(directory, {
+    schema_version: 1,
+    state: 'connected',
+    number: '+15550000000',
+    account: { lid: '999000', phoneJid: '15550000000@s.whatsapp.net' },
+  });
+  const auth = new WhatsAppAuthStore(directory);
+  auth.saveCreds({ registered: true, me: { id: '15550000000:1@s.whatsapp.net', name: 'Aya' } });
+  auth.close();
+  const reserved = (await readRegistry(paths)).instances[input.instance_id]!;
+  const onecli = createOnecliRuntimeLayout({
+    instanceId: input.instance_id,
+    instanceRoot: paths.instanceRoot(input.instance_id),
+    project: input.exclusive_resource_claims.onecli_project,
+    appPort: input.allocated_ports.onecli_app,
+    gatewayPort: input.allocated_ports.onecli_gateway,
+    dockerEndpoint: DOCKER,
+  });
+  await persistInstanceRuntime(
+    createInstanceRuntimeConfig(paths, reserved, onecli, {
+      nodePath: process.execPath,
+      homeDirectory: paths.stateRoot,
+      selectedProvider: 'claude',
+      dockerEndpoint: DOCKER,
+    }),
+    () => undefined,
+  );
+  return directory;
+}
+describe('WhatsApp removal', () => {
+  it('keeps the full reservation check when unlink is accompanied by an unrelated registry mutation', async () => {
+    const paths = await testPaths();
+    const input = await reserve(paths, reservationInput(), { started: ['start_nanoclaw'] });
+    await linkedWhatsApp(paths, input);
+    const removal = world(input);
+    await expect(
+      removeAssistant(paths, input.instance_id, {
+        ...removal.dependencies,
+        ncl: async () => {
+          await claimInstanceWhatsApp(paths, input.instance_id, undefined);
+          await claimInstanceAlias(paths, input.instance_id, 'other-alias@example.test');
+          return { state: 'unlinked' };
+        },
+      }),
+    ).rejects.toMatchObject({ code: 'reservation_mismatch' });
+    expect((await readRegistry(paths)).instances[input.instance_id]?.exclusive_resource_claims.alias_email).toBe(
+      'other-alias@example.test',
+    );
+  });
+  it('does not skip missing credentials while the known WhatsApp number claim is still owned', async () => {
+    const paths = await testPaths();
+    const input = await reserve(paths, reservationInput(), { started: ['start_nanoclaw'] });
+    const directory = await linkedWhatsApp(paths, input);
+    await rm(path.join(directory, 'auth.sqlite'));
+    const removal = world(input);
+    await expect(
+      removeAssistant(paths, input.instance_id, {
+        ...removal.dependencies,
+        ncl: async () => {
+          throw new Error('Host unavailable');
+        },
+      }),
+    ).rejects.toThrow('WhatsApp credentials are missing');
+    expect(await exists(path.join(directory, 'link.json'))).toBe(true);
+    expect((await readRegistry(paths)).instances[input.instance_id]?.exclusive_resource_claims.whatsapp_number).toBe(
+      '+15550000000',
+    );
+  });
+  it.each(['after-claim', 'lost-response'] as const)(
+    'recovers actual native unlink interrupted %s without adopting other reservation changes',
+    async (boundary) => {
+      const paths = await testPaths();
+      const input = await reserve(paths, reservationInput(), { started: ['start_nanoclaw'] });
+      const directory = await linkedWhatsApp(paths, input);
+      const removal = world(input);
+      const owner = new WhatsAppLinking({ directory, paths, instanceId: input.instance_id });
+      const socket = new FakeSocket();
+      const unexpectedSocket = vi.fn(() => {
+        throw new Error('A completed native logout must not reconnect');
+      });
+      const ncl = vi.fn(async () => {
+        await logoutWhatsAppAccount({
+          directory,
+          resolveVersion: async () => [2, 3000, 123456],
+          makeSocket: () => {
+            queueMicrotask(() => {
+              void socket.emit('connection.update', { connection: 'open' });
+            });
+            return socket;
+          },
+        });
+        const nativeRm = privateFiles.rm;
+        const injected = vi.spyOn(privateFiles, 'rm').mockImplementation(async (...args) => {
+          if (boundary === 'after-claim' && String(args[0]) === path.join(directory, 'auth.sqlite'))
+            throw new Error('Auth cleanup interrupted after claim release');
+          await nativeRm(...args);
+        });
+        try {
+          await owner.unlink();
+        } finally {
+          injected.mockRestore();
+        }
+        throw new Error('Native unlink finished but ncl response was lost');
+      });
+      try {
+        await removeAssistant(paths, input.instance_id, {
+          ...removal.dependencies,
+          ncl,
+          whatsapp: { makeSocket: unexpectedSocket },
+        });
+        expect(ncl).toHaveBeenCalledTimes(1);
+        expect(unexpectedSocket).not.toHaveBeenCalled();
+        expect(socket.loggedOut).toBe(true);
+        expect(socket.ended).toBe(true);
+        expect(removal.order).toEqual(['nanoclaw']);
+        await expectGone(paths, input);
+      } finally {
+        owner.close();
+      }
+    },
+  );
+  it('unlinks through the running host before stopping it, deletes private state, and releases the number for another assistant', async () => {
+    const paths = await testPaths();
+    const input = await reserve(paths, reservationInput(), { started: ['start_nanoclaw'] });
+    const directory = await linkedWhatsApp(paths, input);
+    const removal = world(input);
+    const outcome = await removeAssistant(paths, input.instance_id, {
+      ...removal.dependencies,
+      ncl: async (_runtime, args) => {
+        expect(args).toEqual(['gws-ea-whatsapp', 'unlink']);
+        removal.order.push('whatsapp-unlink');
+        await claimInstanceWhatsApp(paths, input.instance_id, undefined);
+        return { state: 'unlinked' };
+      },
+    });
+    expect(removal.order).toEqual(['whatsapp-unlink', 'nanoclaw']);
+    expect(outcome.removed).toContain('whatsapp');
+    expect(await exists(directory)).toBe(false);
+    const peer = await reserve(paths, reservationInput({ label: 'peer', port: 39000 }));
+    await expect(claimInstanceWhatsApp(paths, peer.instance_id, '+15550000000')).resolves.toMatchObject({
+      exclusive_resource_claims: { whatsapp_number: '+15550000000' },
+    });
+  });
+  it('signs out after verified offline teardown, and resumes a later failure from its durable receipt without a new socket', async () => {
+    const paths = await testPaths();
+    const input = await reserve(paths, reservationInput(), { started: ['start_nanoclaw', 'start_onecli'] });
+    const directory = await linkedWhatsApp(paths, input);
+    const removal = world(input);
+    let socket: FakeSocket | undefined;
+    const ncl = vi.fn(async () => {
+      throw new Error('Host socket is unavailable');
+    });
+    const makeSocket = vi.fn(() => {
+      socket = new FakeSocket();
+      return socket;
+    });
+    const removeOnecli = vi.fn(async () => {
+      if (removeOnecli.mock.calls.length === 1) throw new Error('OneCLI teardown interrupted');
+    });
+    const dependencies = {
+      ...removal.dependencies,
+      ncl,
+      removeOnecli,
+      whatsapp: { makeSocket, resolveVersion: async (): Promise<[number, number, number]> => [2, 3000, 123456] },
+    };
+    const pending = removeAssistant(paths, input.instance_id, dependencies);
+    const refusal = expect(pending).rejects.toThrow('OneCLI teardown interrupted');
+    await vi.waitFor(() => expect(socket).toBeDefined());
+    expect(removal.order).toEqual(['nanoclaw']);
+    expect((await readRegistry(paths)).instances[input.instance_id]?.exclusive_resource_claims.whatsapp_number).toBe(
+      '+15550000000',
+    );
+    await socket!.emit('connection.update', { connection: 'open' });
+    await refusal;
+    expect(socket!.loggedOut).toBe(true);
+    expect(socket!.ended).toBe(true);
+    const receipt = JSON.parse(await readFile(paths.removalFile(input.instance_id), 'utf8')) as {
+      completed: Record<string, string>;
+    };
+    expect(Object.keys(receipt.completed)).toEqual(['nanoclaw', 'whatsapp', 'chat-subscription']);
+    expect(await exists(directory)).toBe(true);
+    await removeAssistant(paths, input.instance_id, dependencies);
+    expect(ncl).toHaveBeenCalledTimes(1);
+    expect(makeSocket).toHaveBeenCalledTimes(1);
+    expect(removal.order).toEqual(['nanoclaw']);
+    await expectGone(paths, input);
+  });
+  it('keeps registered state and the number claim after a failed native logout, with a peer assistant untouched', async () => {
+    const paths = await testPaths();
+    const input = await reserve(paths, reservationInput(), { started: ['start_nanoclaw'] });
+    const directory = await linkedWhatsApp(paths, input);
+    const removal = world(input);
+    const peer = await reserve(paths, reservationInput({ label: 'peer', port: 39000 }));
+    const peerFile = path.join(paths.instanceRoot(peer.instance_id), 'private-peer');
+    await writeFile(peerFile, 'Peer must remain unchanged');
+    const peerBefore = await readFile(peerFile);
+    const peerRegistry = (await readRegistry(paths)).instances[peer.instance_id];
+    let socket: FakeSocket | undefined;
+    const pending = removeAssistant(paths, input.instance_id, {
+      ...removal.dependencies,
+      ncl: async () => {
+        throw new Error('Host unavailable');
+      },
+      whatsapp: {
+        resolveVersion: async (): Promise<[number, number, number]> => [2, 3000, 123456],
+        makeSocket: () => {
+          socket = new FakeSocket();
+          vi.spyOn(socket, 'logout').mockRejectedValueOnce(new Error('Native logout refused'));
+          return socket;
+        },
+      },
+    });
+    const refusal = expect(pending).rejects.toThrow('Native logout refused');
+    await vi.waitFor(() => expect(socket).toBeDefined());
+    await socket!.emit('connection.update', { connection: 'open' });
+    await refusal;
+    const retained = new WhatsAppAuthStore(directory);
+    expect(retained.state.creds.registered).toBe(true);
+    retained.close();
+    expect(socket!.ended).toBe(true);
+    expect(await exists(path.join(directory, 'link.json'))).toBe(true);
+    expect((await readRegistry(paths)).instances[input.instance_id]?.exclusive_resource_claims.whatsapp_number).toBe(
+      '+15550000000',
+    );
+    expect(await readFile(peerFile)).toEqual(peerBefore);
+    expect((await readRegistry(paths)).instances[peer.instance_id]).toEqual(peerRegistry);
   });
 });

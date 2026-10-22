@@ -8,6 +8,7 @@
  */
 import path from 'node:path';
 
+import { registerCapability } from '../../capabilities.js';
 import { register } from '../../cli/registry.js';
 import { parseSkillSelection } from '../../container-config.js';
 import { getDb } from '../../db/connection.js';
@@ -19,14 +20,21 @@ import { registerGuidance } from '../gws-ea-profile/guidance.js';
 /** The guidance, relative to the checkout the host runs from, as NanoClaw reads its other instruction files. */
 export const GUIDANCE_PATH = path.join('src', 'modules', 'gws-ea-main', 'guidance.md');
 
+export const MAIN_CHAT_CAPABILITY = 'gws-ea-chat';
+registerCapability(MAIN_CHAT_CAPABILITY, {
+  description: 'whatsapp_link and chat-addressed host actions for canonical main',
+  default: 'on',
+  instructions: [MAIN_CHAT_CAPABILITY, 'gws-ea-chat-outreach'],
+});
+
 /**
- * The shared skills (`container/skills/`) `main` loads: web research and the
- * skill of every Google capability (`gws-ea-google`). Main's capabilities
- * bound the list, so it is handed a Google skill only while it holds that
- * service's key. The template supplies `welcome`; no agent here is handed the
- * gateway's own skill (`gws-ea-google` withholds it).
+ * The shared skills (`container/skills/`) `main` loads: web research, every
+ * Google capability's skill (`gws-ea-google`), and WhatsApp formatting. Main's
+ * capabilities bound the list, so it receives a Google skill only while it
+ * holds that service's key. The template supplies `welcome`; no agent here
+ * receives the gateway's own skill (`gws-ea-google` withholds it).
  */
-export const MAIN_SHARED_SKILLS: readonly string[] = ['agent-browser', ...EXPOSED_GOOGLE_SKILLS];
+export const MAIN_SHARED_SKILLS: readonly string[] = ['agent-browser', ...EXPOSED_GOOGLE_SKILLS, 'whatsapp-formatting'];
 
 async function mainAgentGroupId(): Promise<string | null> {
   if (!(await getDb().hasTable('gws_ea_profile'))) return null;

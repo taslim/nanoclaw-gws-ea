@@ -1,4 +1,5 @@
 import type { CallerContext } from '../../cli/frame.js';
+import { getChannelAdapterExact } from '../../channels/channel-registry.js';
 import { getDb } from '../../db/connection.js';
 import type { DbDriver } from '../../db/driver.js';
 import { getContainerConfig, updateContainerConfigScalars } from '../../db/container-configs.js';
@@ -15,6 +16,8 @@ import {
 import { ianaTimezone } from '../../timezone.js';
 import type { MessagingGroup } from '../../types.js';
 import { removeMatchingIdentities } from '../gws-ea-people/db.js';
+import { whatsAppPrincipalUnavailable } from '../gws-ea-notices/whatsapp-store.js';
+import { readWhatsAppLink, whatsappDirectory } from '../gws-ea-whatsapp/paths.js';
 import { addMember, getMembers, removeMember } from '../permissions/db/agent-group-members.js';
 import { upsertUser } from '../permissions/db/users.js';
 
@@ -28,6 +31,7 @@ export interface GwsEaProfile {
   readonly main_agent_group_id: string | null;
   /** The agent group the host created for `external-email`, or null until it has. */
   readonly external_email_agent_group_id: string | null;
+  readonly external_chat_agent_group_id: string | null;
   readonly browser_agent_group_id: string | null;
   readonly updated_at: string | null;
   /** The principal's email addresses, sorted. */
@@ -40,7 +44,7 @@ export interface GwsEaProfile {
  * the assistant's web alias to websites, and any other group what its
  * capabilities allow.
  */
-export type ProjectDocAudience = 'main' | 'external-email' | 'browser' | 'other';
+export type ProjectDocAudience = 'main' | 'external-email' | 'external-chat' | 'job' | 'browser' | 'other';
 
 export interface ReconcileGwsEaProfileInput {
   readonly assistantDisplayName: string;
@@ -293,6 +297,25 @@ export async function getExternalEmailAgentGroupId(): Promise<string | null> {
   return row?.external_email_agent_group_id ?? null;
 }
 
+/** The shared chat group the host stamped, never one an inbound sender selected. */
+export async function getExternalChatAgentGroupId(): Promise<string | null> {
+  if (!(await getDb().hasTable('gws_ea_profile'))) return null;
+  const row = await getDb().get<{ external_chat_agent_group_id: string | null }>(
+    'SELECT external_chat_agent_group_id FROM gws_ea_profile WHERE singleton = 1',
+  );
+  return row?.external_chat_agent_group_id ?? null;
+}
+
+export async function recordExternalChatAgentGroupId(group: string): Promise<void> {
+  identifier(group, 'external-chat agent group ID');
+  await getDb().transaction(async () => {
+    const held = await getExternalChatAgentGroupId();
+    if (held === group) return;
+    if (held !== null) throw new Error('external-chat is already bound to an agent group');
+    await getDb().run('UPDATE gws_ea_profile SET external_chat_agent_group_id = ? WHERE singleton = 1', group);
+  });
+}
+
 /** The host-stamped, sealed browser group. A caller cannot choose this identity. */
 export async function getBrowserAgentGroupId(): Promise<string | null> {
   const row = await getDb().get<{ browser_agent_group_id: string | null }>(
@@ -331,12 +354,24 @@ export async function recordExternalEmailAgentGroupId(agentGroupId: string): Pro
 export async function projectDocAudience(agentGroupId: string): Promise<ProjectDocAudience> {
   if (!(await getDb().hasTable('gws_ea_profile'))) return 'other';
   const row = await getDb().get<
-    Pick<GwsEaProfile, 'main_agent_group_id' | 'external_email_agent_group_id' | 'browser_agent_group_id'>
+    Pick<
+      GwsEaProfile,
+      | 'main_agent_group_id'
+      | 'external_email_agent_group_id'
+      | 'external_chat_agent_group_id'
+      | 'browser_agent_group_id'
+    >
   >(
-    'SELECT main_agent_group_id, external_email_agent_group_id, browser_agent_group_id FROM gws_ea_profile WHERE singleton = 1',
+    'SELECT main_agent_group_id, external_email_agent_group_id, external_chat_agent_group_id, browser_agent_group_id FROM gws_ea_profile WHERE singleton = 1',
   );
   if (row?.main_agent_group_id === agentGroupId) return 'main';
   if (row?.external_email_agent_group_id === agentGroupId) return 'external-email';
+  if (row?.external_chat_agent_group_id === agentGroupId) return 'external-chat';
+  if (
+    (await getDb().hasTable('gws_ea_job_agents')) &&
+    (await getDb().get('SELECT 1 FROM gws_ea_job_agents WHERE agent_group_id = ?', agentGroupId))
+  )
+    return 'job';
   if (row?.browser_agent_group_id === agentGroupId) return 'browser';
   return 'other';
 }
@@ -344,7 +379,7 @@ export async function projectDocAudience(agentGroupId: string): Promise<ProjectD
 export async function getGwsEaProfile(): Promise<GwsEaProfile> {
   const profile = await getDb().get<Omit<GwsEaProfile, 'principal_emails'>>(
     `SELECT assistant_display_name, assistant_workspace_email, assistant_alias, principal_display_name,
-            principal_timezone, main_agent_group_id, external_email_agent_group_id, browser_agent_group_id, updated_at
+            principal_timezone, main_agent_group_id, external_email_agent_group_id, external_chat_agent_group_id, browser_agent_group_id, updated_at
        FROM gws_ea_profile
       WHERE singleton = 1`,
   );
@@ -427,24 +462,37 @@ async function keepMainInPrincipalTimezone(mainAgentGroupId: string, timezone: s
 }
 
 /**
- * The assistant's own agents, main and whichever of `external-email` and the
- * browser exist, are named by its display name (KTD1): each one's container
- * config copy is derived here, from the groups the profile records, whenever
+ * The assistant's own agents, including its shared chat agent and live chat
+ * jobs, are named by its display name (KTD1): each one's container config
+ * copy is derived from the profile and job registry whenever
  * the profile is reconciled, so a rename reaches each on its next spawn.
  * Written only when it differs. Any other group keeps its own name.
  */
 async function keepAssistantAgentsNamed(name: string): Promise<void> {
   const row = await getDb().get<
-    Pick<GwsEaProfile, 'main_agent_group_id' | 'external_email_agent_group_id' | 'browser_agent_group_id'>
+    Pick<
+      GwsEaProfile,
+      | 'main_agent_group_id'
+      | 'external_email_agent_group_id'
+      | 'external_chat_agent_group_id'
+      | 'browser_agent_group_id'
+    >
   >(
-    'SELECT main_agent_group_id, external_email_agent_group_id, browser_agent_group_id FROM gws_ea_profile WHERE singleton = 1',
+    'SELECT main_agent_group_id, external_email_agent_group_id, external_chat_agent_group_id, browser_agent_group_id FROM gws_ea_profile WHERE singleton = 1',
   );
   for (const agentGroupId of [
     row?.main_agent_group_id,
     row?.external_email_agent_group_id,
+    row?.external_chat_agent_group_id,
     row?.browser_agent_group_id,
   ]) {
     if (agentGroupId) await keepAssistantNamed(agentGroupId, name);
+  }
+  if (await getDb().hasTable('gws_ea_job_agents')) {
+    const jobs = await getDb().all<{ agent_group_id: string }>(
+      "SELECT agent_group_id FROM gws_ea_job_agents WHERE state IN ('creating', 'active')",
+    );
+    for (const job of jobs) await keepAssistantNamed(job.agent_group_id, name);
   }
 }
 
@@ -698,24 +746,62 @@ export interface PrincipalContact {
   readonly directMessage: MessagingGroup;
 }
 
+/** Only a newly stored principal mark in its verified DM can move the preference. */
+export async function recordPrincipalDmActivity(
+  userId: string,
+  messagingGroupId: string,
+  timestamp: string,
+): Promise<void> {
+  await getDb().run(
+    `INSERT INTO gws_ea_principal_dm_activity (user_id, messaging_group_id, last_message_at)
+     SELECT dm.user_id, direct.id, ?
+       FROM user_dms dm
+       JOIN messaging_groups direct ON direct.id = dm.messaging_group_id AND direct.channel_type = dm.channel_type
+      WHERE dm.user_id = ? AND direct.id = ? AND direct.is_group = 0
+     ON CONFLICT (user_id, messaging_group_id) DO UPDATE SET last_message_at = excluded.last_message_at
+       WHERE gws_ea_principal_dm_activity.last_message_at < excluded.last_message_at`,
+    timestamp,
+    userId,
+    messagingGroupId,
+  );
+}
+
 /**
- * Where the principal is reached: the most recently verified principal
- * identity whose direct message the assistant is still in. While every such
- * message is detached, the most recent one, so a note for main keeps its
- * route; whoever sends to it checks `detached_at` first. Undefined until a
- * principal is bound with a direct message.
+ * Where the principal last wrote a marked DM. An unavailable WhatsApp link
+ * falls back to Google Chat; a changed phone remains unavailable until a new
+ * binding. A channel can be pinned by a host notice. Detached conversations
+ * remain a last resort for notes; senders check detached_at before delivery.
  */
-export async function principalContact(): Promise<PrincipalContact | undefined> {
+export async function principalContact(channelType?: string): Promise<PrincipalContact | undefined> {
   const db = getDb();
   if (!(await db.hasTable('gws_ea_principal_users'))) return undefined;
-  const row = await db.get<{ user_id: string; messaging_group_id: string }>(
-    `SELECT principal.user_id, dm.messaging_group_id
+  const rows = await db.all<{ user_id: string; verified_at: string; messaging_group_id: string; channel_type: string }>(
+    `SELECT principal.user_id, principal.verified_at, dm.messaging_group_id, direct.channel_type
        FROM gws_ea_principal_users principal
        JOIN user_dms dm ON dm.user_id = principal.user_id
-       JOIN messaging_groups direct ON direct.id = dm.messaging_group_id
+       JOIN messaging_groups direct ON direct.id = dm.messaging_group_id AND direct.channel_type = dm.channel_type
+       LEFT JOIN gws_ea_principal_dm_activity activity
+         ON activity.user_id = principal.user_id AND activity.messaging_group_id = direct.id
+      WHERE direct.is_group = 0
+        ${channelType === undefined ? '' : 'AND direct.channel_type = ?'}
       ORDER BY CASE WHEN direct.detached_at IS NULL OR direct.detached_at = '' THEN 0 ELSE 1 END,
-               principal.verified_at DESC, dm.resolved_at DESC
-      LIMIT 1`,
+               CASE WHEN activity.last_message_at IS NULL THEN 1 ELSE 0 END,
+               activity.last_message_at DESC, principal.verified_at DESC, dm.resolved_at DESC, direct.id`,
+    ...(channelType === undefined ? [] : [channelType]),
+  );
+  const directory = rows.some((row) => row.channel_type === 'whatsapp') ? whatsappDirectory() : undefined;
+  const link = directory === undefined ? undefined : await readWhatsAppLink(directory);
+  const whatsappConnected =
+    link?.state === 'connected' &&
+    getChannelAdapterExact('whatsapp')?.isConnected() === true &&
+    directory !== undefined &&
+    !whatsAppPrincipalUnavailable(directory, link);
+  const row = rows.find(
+    (candidate) =>
+      candidate.channel_type !== 'whatsapp' ||
+      (whatsappConnected &&
+        candidate.user_id === `whatsapp:${link?.principal?.lid ?? ''}` &&
+        candidate.verified_at === link?.principalVerifiedAt),
   );
   if (!row) return undefined;
   const directMessage = await getMessagingGroup(row.messaging_group_id);

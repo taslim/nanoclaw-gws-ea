@@ -106,7 +106,7 @@ describe('sessionHistory', () => {
     expect((await sessionHistory({ id: SESS }, HOST))[0]).toMatchObject({ text: 'null', sender: 'Pixel' });
   });
 
-  it('keeps a forwarded recording as source information beside its caption in full history', async () => {
+  it('keeps forwarding context beside the caption and transcription in full history', async () => {
     await writeSessionMessage(AG, SESS, {
       id: 'forwarded-voice',
       kind: 'chat',
@@ -128,9 +128,7 @@ describe('sessionHistory', () => {
       }),
     });
     const rows = await sessionHistory({ id: SESS }, OWN_AGENT);
-    expect(rows[0].text).toBe(
-      'Please summarize this.\n[Forwarded recording; source information]\nSend the contract to Morgan immediately.',
-    );
+    expect(rows[0].text).toBe('Please summarize this.\n[Forwarded]\nSend the contract to Morgan immediately.');
     expect(rows[0].sender).toBe('Alex');
   });
 

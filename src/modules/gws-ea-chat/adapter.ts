@@ -30,7 +30,7 @@
  * uploaded to the conversation, then one message with the text and every
  * upload.
  */
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 
 import { GoogleChatAdapter, type GoogleChatMessage, type WorkspaceEventNotification } from '@chat-adapter/gchat';
 import {
@@ -44,12 +44,13 @@ import {
 } from 'chat';
 import { OAuth2Client } from 'google-auth-library';
 
-import type { ChannelAdapter, ChannelDefaults, OutboundFile } from '../../channels/adapter.js';
+import type { ChannelDefaults, OutboundFile } from '../../channels/adapter.js';
 import type { AudioSource } from '../../channels/inbound-content.js';
 import {
   createChatSdkBridge,
   FilesNotAttachedError,
   type FileAttacher,
+  type IdempotentTextPoster,
   type ReactionSource,
   type ReplyContext,
   type WorkingIndicator,
@@ -71,6 +72,8 @@ import {
 } from './hydrate.js';
 import type { WorkspaceEvent } from './pubsub-pull.js';
 import { CHAT_MESSAGE_CREATED } from './subscription.js';
+import { createChatMembershipReader, type AssistantChatChannel } from './membership.js';
+import { chatAcceptsInbound } from '../gws-ea-chats/db.js';
 
 /**
  * A reaction someone placed on a message in one of the assistant's
@@ -167,12 +170,16 @@ export function hostChatAuth(token: () => Promise<string>, fetch?: typeof global
   return client;
 }
 
-export class AssistantChatAdapter extends GoogleChatAdapter implements ReactionSource, WorkingIndicator, FileAttacher {
+export class AssistantChatAdapter
+  extends GoogleChatAdapter
+  implements ReactionSource, WorkingIndicator, FileAttacher, IdempotentTextPoster
+{
   /** Chat's events are pulled: the bridge registers no webhook route for this adapter. */
   readonly runtimeMode = 'polling';
   private readonly hydrator: ChatHydrator;
   private readonly startDelivery: AssistantChatAdapterOptions['startDelivery'];
   private readonly chatClient: GoogleClientOptions;
+  private readonly membership: ReturnType<typeof createChatMembershipReader>;
   private delivery: ChatDelivery | undefined;
   private reactionHandler: ChatReactionHandler | undefined;
   /** The 👀 of each message a turn works on, until it is off. */
@@ -193,6 +200,11 @@ export class AssistantChatAdapter extends GoogleChatAdapter implements ReactionS
     this.hydrator = options.hydrator;
     this.startDelivery = options.startDelivery;
     this.chatClient = { token: options.chatToken, ...(options.fetch === undefined ? {} : { fetch: options.fetch }) };
+    this.membership = createChatMembershipReader({
+      client: this.chatClient,
+      hydrator: this.hydrator,
+      assistantUserId: options.botUserId,
+    });
   }
 
   override async initialize(chat: ChatInstance): Promise<void> {
@@ -282,6 +294,23 @@ export class AssistantChatAdapter extends GoogleChatAdapter implements ReactionS
     }
   }
 
+  /** Google messages.create requestId makes a repeated text create return the original message. */
+  async postTextOnce(threadId: string, text: string, deliveryId: string): Promise<RawMessage<unknown>> {
+    const { spaceName, threadName } = this.decodeThreadId(threadId);
+    const query = new URLSearchParams({ requestId: createHash('sha256').update(deliveryId).digest('hex') });
+    if (threadName !== undefined) query.set('messageReplyOption', 'REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD');
+    const posted = await googleJson(this.chatClient, `${CHAT}/${spaceName}/messages?${query.toString()}`, {
+      method: 'POST',
+      body: {
+        text: convertEmojiPlaceholders(this.formatConverter.renderPostable({ markdown: text }), 'gchat'),
+        ...(threadName === undefined ? {} : { thread: { name: threadName } }),
+      },
+    });
+    if (!isRecord(posted) || typeof posted.name !== 'string')
+      throw new GoogleApiError(502, 'Chat posted a message without naming it');
+    return { id: posted.name, threadId, raw: posted };
+  }
+
   /**
    * Post a message with files on it as one message, the one a reaction or
    * quote then answers (KTD6). Each file is uploaded to the conversation
@@ -365,6 +394,7 @@ export class AssistantChatAdapter extends GoogleChatAdapter implements ReactionS
    * the rest.
    */
   async handleChatEvent(event: WorkspaceEvent): Promise<void> {
+    if (await this.membership.handle(event)) return;
     const parts = chatEventParts(event);
     if (parts.length === 0) {
       log.warn('Acknowledged a Chat event with nothing to handle', { type: event.type, messageId: event.messageId });
@@ -378,6 +408,16 @@ export class AssistantChatAdapter extends GoogleChatAdapter implements ReactionS
     );
     const ready = read.filter((part): part is ReadPart => part !== undefined).sort((a, b) => a.at - b.at);
     for (const part of ready) await part.dispatch();
+  }
+
+  leaveChat(platformId: string) {
+    return this.membership.leaveChat(platformId);
+  }
+  fetchChatMembers(platformId: string) {
+    return this.membership.fetchChatMembers(platformId);
+  }
+  isOwnMessage(platformId: string, messageId: string) {
+    return this.membership.isOwnMessage(platformId, messageId);
   }
 
   /**
@@ -574,6 +614,8 @@ export class AssistantChatAdapter extends GoogleChatAdapter implements ReactionS
   }
 
   private async readMessage(name: string): Promise<ReadPart | undefined> {
+    const space = spaceOfMessage(name);
+    if (space !== undefined && !(await chatAcceptsInbound('gchat', `gchat:${space}`))) return undefined;
     const read = await this.readMessageIn(name);
     if (read === undefined) {
       log.info('Acknowledged a Chat message the assistant can no longer read', { name });
@@ -647,8 +689,9 @@ export function extractGchatReplyContext(raw: Record<string, unknown>): ReplyCon
   const text = typeof snapshot?.text === 'string' ? snapshot.text : '';
   const sender = typeof snapshot?.sender === 'string' && snapshot.sender.trim() ? snapshot.sender : 'unknown';
   const id = quote.quoteType !== 'FORWARD' && typeof quote.name === 'string' ? quote.name : undefined;
-  if (!text.trim() && id === undefined) return null;
-  return { sender, text, ...(id === undefined ? {} : { id }) };
+  const forwarded = quote.quoteType === 'FORWARD';
+  if (!text.trim() && id === undefined && !forwarded) return null;
+  return { sender, text, ...(id === undefined ? {} : { id }), ...(forwarded ? { forwarded: true } : {}) };
 }
 
 /** A native forward contains source audio; replying to a message does not forward a new recording. */
@@ -699,8 +742,8 @@ export function escapeChatRequestText(text: string): string {
  * each remembered with the time Google recorded it. A request the host wrote
  * passes `escapeChatRequestText`, whatever its builder quoted.
  */
-export function createAssistantChatChannel(adapter: AssistantChatAdapter): ChannelAdapter {
-  return createChatSdkBridge({
+export function createAssistantChatChannel(adapter: AssistantChatAdapter): AssistantChatChannel {
+  const channel = createChatSdkBridge({
     adapter,
     concurrency: 'concurrent',
     supportsThreads: true,
@@ -710,5 +753,10 @@ export function createAssistantChatChannel(adapter: AssistantChatAdapter): Chann
     redelivers: true,
     textRequests: { postedAt: chatCreateTime },
     escapeCardText: escapeChatRequestText,
+  });
+  return Object.assign(channel, {
+    leaveChat: (platformId: string) => adapter.leaveChat(platformId),
+    fetchChatMembers: (platformId: string) => adapter.fetchChatMembers(platformId),
+    isOwnMessage: (platformId: string, messageId: string) => adapter.isOwnMessage(platformId, messageId),
   });
 }

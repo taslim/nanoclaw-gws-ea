@@ -1,0 +1,7 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "gws-ea-external-chat",
+  "version": "1.0.0",
+  "description": "The shared GWS-EA agent for isolated casual chat conversations.",
+  "extensions": { "ai.nanoco.nanoclaw": { "agentName": "external-chat" } }
+}

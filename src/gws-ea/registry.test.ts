@@ -18,6 +18,7 @@ import {
   assertRegistryMarkerAgreement,
   assertStateConsistent,
   claimInstanceAlias,
+  claimInstanceWhatsApp,
   getInstanceReservation,
   readRegistry,
   swapInstanceRelease,
@@ -1080,5 +1081,36 @@ describe('create recovery contract', () => {
     await expect(readFile(paths.bootstrapFile(instanceId), 'utf8')).resolves.toContain('"schema_version": 1');
     expect(stderr.join('\n')).toContain(`gws-ea resume --id ${instanceId}`);
     expect(stderr.join('\n')).not.toContain('gws-ea create --track');
+  });
+});
+
+describe('WhatsApp account claims added after create', () => {
+  it('serializes competing numbers under the machine lock, names the collision, and releases only that claim', async () => {
+    const paths = await testPaths();
+    const first = reservation();
+    const second = distinctReservation();
+    await reserveInstance(paths, first);
+    await reserveInstance(paths, second);
+    const outcomes = await Promise.allSettled([
+      claimInstanceWhatsApp(paths, first.instance_id, '+447700900123'),
+      claimInstanceWhatsApp(paths, second.instance_id, '+447700900123'),
+    ]);
+    expect(outcomes.filter(({ status }) => status === 'fulfilled')).toHaveLength(1);
+    const rejected = outcomes.find((outcome) => outcome.status === 'rejected');
+    expect(rejected).toMatchObject({
+      reason: { code: 'claim_conflict', message: expect.stringContaining('+447700900123') },
+    });
+    const stored = await readRegistry(paths);
+    const owner = Object.values(stored.instances).find(
+      ({ exclusive_resource_claims: claims }) => claims.whatsapp_number === '+447700900123',
+    )!;
+    const released = await claimInstanceWhatsApp(paths, owner.instance_id, undefined);
+    expect(released.exclusive_resource_claims.whatsapp_number).toBeUndefined();
+    const { whatsapp_number: _number, ...claims } = owner.exclusive_resource_claims;
+    expect(released.exclusive_resource_claims).toEqual(claims);
+    const other = owner.instance_id === first.instance_id ? second.instance_id : first.instance_id;
+    expect((await claimInstanceWhatsApp(paths, other, '+447700900123')).exclusive_resource_claims.whatsapp_number).toBe(
+      '+447700900123',
+    );
   });
 });

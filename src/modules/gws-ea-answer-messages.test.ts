@@ -28,6 +28,76 @@ type Review =
  * `src/modules`, its other fields sorted, a spread written `...name`.
  */
 const REVIEWED: Readonly<Record<string, Review>> = {
+  'gws-ea-chat-agents/docs.ts answer: file, url': {
+    kind: 'rendered',
+    reason: 'the message gives the created document id and its URL',
+  },
+  'gws-ea-chat-agents/docs.ts answer: file': {
+    kind: 'host-only',
+    reason: "the document id is the agent's own input; the message confirms the edit",
+  },
+  'gws-ea-chat-agents/docs.ts share: file, shared': {
+    kind: 'host-only',
+    reason:
+      "the file is the agent's input; the host retains its checked recipient receipt and the message confirms access for the current members",
+  },
+  'gws-ea-chats/bridge.ts handoff: chat': {
+    kind: 'host-only',
+    reason: "the chat id is main's own input; the message confirms the handoff",
+  },
+  'gws-ea-chats/bridge.ts handoff: created_at, id, matter_id, messaging_group_id': {
+    kind: 'host-only',
+    reason: 'the durable handoff record written to the central store, not a tool answer',
+  },
+  'gws-ea-chats/bridge.ts admission: chat': {
+    kind: 'host-only',
+    reason: "the chat id is main's input; the message confirms admission",
+  },
+  'gws-ea-chats/bridge.ts decline: chat': {
+    kind: 'host-only',
+    reason: "the chat id is main's input; the message confirms the decline",
+  },
+  'gws-ea-chats/bridge.ts leave: chat': {
+    kind: 'host-only',
+    reason: "the chat id is main's input; the message confirms departure",
+  },
+  'gws-ea-chats/expect.ts expectReply: until': {
+    kind: 'host-only',
+    reason: 'the host maintains the expectation deadline; the message confirms the next answer will reach this chat',
+  },
+  'gws-ea-chats/outreach.ts reachOut: created_at, id, matter_id, messaging_group_id': {
+    kind: 'host-only',
+    reason: 'the stored first-contact handoff record, not a tool answer',
+  },
+  'gws-ea-chats/remind.ts remind: at, reminder': {
+    kind: 'host-only',
+    reason:
+      "the time is the agent's input and the task id serves the host's move recovery; the message confirms the reminder",
+  },
+  'gws-ea-meetings/chat-calendar.ts book: booking, end, start': {
+    kind: 'rendered',
+    reason: 'the message gives the booked time, conference and booking id',
+  },
+  'gws-ea-meetings/chat-calendar.ts changedAnswer: booking, end, start': {
+    kind: 'rendered',
+    reason: "the message gives the resulting time and conference; the booking id is the agent's input",
+  },
+  'gws-ea-meetings/chat-calendar.ts changeBooking: booking, end, start': {
+    kind: 'rendered',
+    reason: "the no-change message gives the actual time; the booking id is the agent's input",
+  },
+  'gws-ea-meetings/chat-calendar.ts cancelBooking: booking': {
+    kind: 'host-only',
+    reason: "the booking id is the agent's input and the message confirms the cancellation",
+  },
+  'gws-ea-whatsapp/adapter.ts report: at': {
+    kind: 'host-only',
+    reason: 'a persisted transport error for the operator, not an agent answer',
+  },
+  'gws-ea-whatsapp/adapter.ts connect: at': {
+    kind: 'host-only',
+    reason: 'a persisted logout error for the operator, not an agent answer',
+  },
   'gws-ea-browser/authority.ts notifyPurchaseWaiters: job, site, type': {
     kind: 'read-whole',
     reason: 'a browser notice: its JSON is the chat text the browser reads',

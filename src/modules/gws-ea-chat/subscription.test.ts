@@ -6,6 +6,7 @@ import { createChatHealth, type ChatHealthRecorder } from './health.js';
 import type { WorkspaceEvent } from './pubsub-pull.js';
 import {
   CHAT_MESSAGE_CREATED,
+  CHAT_EVENT_TYPES,
   CHAT_REACTION_CREATED,
   CHAT_SUBSCRIPTION_TARGET,
   SUBSCRIPTION_EXPIRATION_REMINDER,
@@ -108,7 +109,7 @@ describe('adoption', () => {
     expect(workspaceCalls('DELETE', `/v1/${existing.name}`)).toBe(0);
     const list = fake.requests.find((request) => request.url.pathname === '/v1/subscriptions');
     expect(list?.url.searchParams.get('filter')).toBe(
-      `(event_types:"${CHAT_MESSAGE_CREATED}" OR event_types:"${CHAT_REACTION_CREATED}") AND target_resource="${CHAT_SUBSCRIPTION_TARGET}"`,
+      `(${CHAT_EVENT_TYPES.map((type) => `event_types:"${type}"`).join(' OR ')}) AND target_resource="${CHAT_SUBSCRIPTION_TARGET}"`,
     );
   });
 
@@ -129,14 +130,14 @@ describe('adoption', () => {
     const [created, ...others] = [...fake.subscriptions.values()];
     expect(others).toEqual([]);
     expect(created).toMatchObject({
-      eventTypes: [CHAT_MESSAGE_CREATED, CHAT_REACTION_CREATED],
+      eventTypes: [...CHAT_EVENT_TYPES],
       notificationEndpoint: { pubsubTopic: TOPIC },
     });
     expect(created!.name).not.toBe(stale.name);
     expect(health.read().subscription.name).toBe(created!.name);
   });
 
-  it("creates one with the two event types, name-only, for a 7-day life, with the assistant's own token", async () => {
+  it("creates one with message, reaction and membership events, name-only, for a 7-day life, with the assistant's own token", async () => {
     fake.slowOperations = 1;
     start();
 
@@ -147,7 +148,13 @@ describe('adoption', () => {
     expect(create?.authorization).toBe(`Bearer ${ASSISTANT_TOKEN}`);
     expect(create?.body).toEqual({
       targetResource: CHAT_SUBSCRIPTION_TARGET,
-      eventTypes: [CHAT_MESSAGE_CREATED, CHAT_REACTION_CREATED],
+      eventTypes: [
+        CHAT_MESSAGE_CREATED,
+        CHAT_REACTION_CREATED,
+        'google.workspace.chat.membership.v1.created',
+        'google.workspace.chat.membership.v1.updated',
+        'google.workspace.chat.membership.v1.deleted',
+      ],
       notificationEndpoint: { pubsubTopic: TOPIC },
       payloadOptions: { includeResource: false },
       ttl: '604800s',

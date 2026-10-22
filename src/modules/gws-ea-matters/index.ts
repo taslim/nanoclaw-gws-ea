@@ -33,13 +33,14 @@ import {
 import { forgetFromMatters, mattersToRewrite } from './forget.js';
 import { closeMatterAndLook, lookVerdict, openMatterWithLook, updateMatterAndLook } from './looks.js';
 import { runMattersLoop } from './loop.js';
-import { gwsEaMattersMigration, gwsEaMatterJobsMigration } from './migration.js';
+import { gwsEaMattersMigration, gwsEaMatterJobsMigration, gwsEaMatterChatsMigration } from './migration.js';
 import { parseNextLook, type NextLook } from './next-look.js';
 import { principalTimezone, renderMatter } from './render.js';
 import { syncVerdict, todayVerdict } from './sync.js';
 
 registerMigration(gwsEaMattersMigration);
 registerMigration(gwsEaMatterJobsMigration);
+registerMigration(gwsEaMatterChatsMigration);
 
 onHostStart(async ({ signal }) => {
   await cancelClosedMatterJobs();
@@ -156,6 +157,12 @@ const LOOK_ARGS: ColumnDef[] = [
   },
 ];
 const LINK_ARGS: ColumnDef[] = [
+  {
+    name: 'chat',
+    type: 'string',
+    description:
+      'Chats by messaging-group id, comma-separated. A chat can be linked to any number of matters, each with its own handler account.',
+  },
   {
     name: 'job',
     type: 'string',

@@ -120,8 +120,8 @@ export function googleCredentialFor(service: AgentGoogleServiceId): AgentGoogleC
  * attachments, and is the scope the Workspace Events subscription to message
  * and reaction events
  * rests on; `chat.spaces.readonly` reads a space and finds a DM;
- * `chat.spaces.create` opens one; and `chat.memberships.readonly` reads who
- * is in a space.
+ * `chat.spaces.create` opens one; membership scopes read the roster and let
+ * the assistant leave a space as its own user.
  */
 export const HOST_GOOGLE_SERVICES = {
   gmail: { scopes: ['https://www.googleapis.com/auth/gmail.modify'] },
@@ -133,6 +133,7 @@ export const HOST_GOOGLE_SERVICES = {
       'https://www.googleapis.com/auth/chat.spaces.readonly',
       'https://www.googleapis.com/auth/chat.spaces.create',
       'https://www.googleapis.com/auth/chat.memberships.readonly',
+      'https://www.googleapis.com/auth/chat.memberships',
     ],
   },
   'directory-host': { scopes: AGENT_GOOGLE_SERVICES.directory.scopes },

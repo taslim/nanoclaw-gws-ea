@@ -13,11 +13,13 @@ import Database from 'better-sqlite3';
 import type { ResponseFrame } from '../../../cli/frame.js';
 import { ensureContainerConfig, updateContainerConfigScalars } from '../../../db/container-configs.js';
 import { createAgentGroup, createMessagingGroup, getDb } from '../../../db/index.js';
+import { runMigrations } from '../../../db/migrations/index.js';
 import { inboundDbPath, outboundDbPath } from '../../../mailbox/sqlite/paths.js';
 import { reconcileSession } from '../../../reconcile-session.js';
 import { resolveSession, withExistingMailboxSession } from '../../../session-manager.js';
 import type { Session } from '../../../types.js';
 import { bindVerifiedPrincipalUser } from '../../gws-ea-profile/db.js';
+import { gwsEaPrincipalDmRoutingMigration } from '../../gws-ea-profile/migration.js';
 import { upsertUserDm } from '../../permissions/db/user-dms.js';
 import { upsertUser } from '../../permissions/db/users.js';
 
@@ -27,6 +29,7 @@ const DIRECT_MESSAGE = 'mg-dm';
 
 /** Main in `timezone`, named by the profile, and the principal's direct message: what a look comes back to. */
 export async function seedMain(timezone: string): Promise<void> {
+  await runMigrations(getDb(), [gwsEaPrincipalDmRoutingMigration]);
   const now = new Date().toISOString();
   await createAgentGroup({ id: MAIN, name: 'main', folder: MAIN, agent_provider: null, created_at: now });
   await ensureContainerConfig(MAIN);

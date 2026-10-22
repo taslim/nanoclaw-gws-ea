@@ -2,6 +2,28 @@
 
 Implementation-level details for the architecture. See [architecture.md](architecture.md) for the high-level design.
 
+## Capability-specific MCP tool definitions
+
+The runner's `registerToolVariant(tool, capability)` registers another definition
+for an existing tool name. The capability selects its schema and handler together;
+an ungranted variant is neither listed nor callable. The base definition keeps
+priority if both keys are granted. Ordinary `registerTools` duplicate handling
+and `extendTool` behavior remain unchanged.
+
+The Chat SDK bridge also accepts an adapter's optional
+`postTextOnce(threadId, text, deliveryId)` method for ordinary file-free text.
+When a durable delivery row is present, each text part gets a stable row/part
+key. Attachments, cards and direct sends without a row ID retain their existing
+posting path.
+
+## Request-addressed conversation tasks
+
+`createScheduledTask(agentGroupId, task, { session, id })` accepts an optional
+caller-selected native task ID. A repeated ID returns the existing task in that
+session, including after its due time, so replaying an interrupted host action
+does not create another reminder. IDs use lowercase letters, digits and hyphens.
+Omitting `id` retains the existing generated-ID behavior.
+
 ## Channel Adapter Interface
 
 ### NanoClaw Channel Interface
@@ -36,7 +58,7 @@ interface ChannelAdapter {
   isConnected(): boolean;
 
   // Outbound delivery
-  deliver(platformId: string, threadId: string | null, message: OutboundMessage): Promise<string | undefined>;
+  deliver(platformId: string, threadId: string | null, message: OutboundMessage, messageId?: string): Promise<string | undefined>;
 
   // Optional
   setTyping?(platformId: string, threadId: string | null): Promise<void>;
@@ -66,7 +88,7 @@ Each adapter can declare static wiring-time defaults. There are exactly two leve
 ```typescript
 // src/channels/adapter.ts
 interface ChannelContextDefaults {
-  engageMode: 'pattern' | 'mention' | 'mention-sticky';
+  engageMode: 'pattern' | 'mention' | 'mention-sticky' | 'module';
   engagePattern?: string;   // required iff engageMode='pattern'; may contain the
                             // literal token {name} — creation helpers substitute the
                             // regex-escaped agent_group name
@@ -104,6 +126,55 @@ Never returns undefined. `hasDeclaredChannelDefaults()` reports whether tiers 1�
 **Creation helpers** (`src/channels/channel-defaults.ts`): every wiring-creation path calls `resolveWiringDefaults(channelKey, isGroup, agentGroupName)` — it picks `decl.group` vs `decl.dm` by `isGroup = event.message.isGroup ?? (mg.is_group === 1)` (never `threadId !== null`), substitutes `{name}`, and downgrades `mention-sticky` → `mention` when the context's resolved threads value is false. `resolveUnknownSenderPolicy` does the same for auto-created messaging_groups rows.
 
 **Runtime thread policy**: engage mode and sender policy are creation-time snapshots; threading is the one setting consulted live. `messaging_group_agents.threads` (migration 019) is the per-wiring override: `NULL` = inherit the adapter declaration for the wiring's context, `1`/`0` = explicit. `resolveThreadPolicy(wiring.threads, decl, isGroup, supportsThreads)` hard-ANDs the result with the adapter's raw capability — a wiring can opt out of threads on a threaded platform, never opt in on a non-threaded one. When the policy is off, event-derived thread ids are nulled at router fanout (sessions collapse, replies land top-level); `event.replyTo` is operator intent from the CLI transport and is never nulled.
+
+### Module engagement and channel outages
+
+A wiring with `engage_mode: 'module'` uses the channel's
+`registerEngagementDecider(channelType, decide)` after sender admission and
+inbound preparation. The decider receives the prepared event, session, messaging
+group and wiring, so recognized speech can engage it. A false result or missing
+decider stores silent context without typing or waking an agent.
+
+Retry-safe inbound already stored in its canonical session mailbox is skipped
+before the module decider runs. A replay cannot consume a later expected reply.
+Other engagement modes retain their existing delivery behavior.
+
+`createMessagingGroupAgent(wiring, { companionDestination: false })` writes the
+wiring without a group-wide channel destination. Its sessions can still reply
+to their originating chat. `runInConversationTail(address, work)` orders a
+host cutover between inbound messages for that adapter instance and chat.
+
+A linked adapter that is temporarily disconnected throws
+`ChannelNotConnectedError`. The delivery poll keeps its rows pending without
+spending attempts and backs off that exact adapter for one active-poll interval;
+other channels and system actions continue. Ordinary send failures retain the
+existing attempt limit. The durable outbound row ID reaches the adapter as the
+optional fourth `deliver` argument, unchanged through outbound guards and the
+registry bridge, so a platform can derive its idempotency key from that ID.
+`OutboundMessage.timestamp` carries the original row time through the mailbox
+projection and guards, so an adapter can expire an old queued send even when
+it first sees the row after a host outage. Direct host sends may omit it.
+
+`stopChannelAdapter(key)` withdraws one exact active instance before awaiting
+teardown, returning `stopped` or `not-active`. Teardown errors propagate. After
+it settles, `startChannelAdapter(key)` can construct a fresh instance with the
+captured host setup; other active channels are unaffected.
+
+Held chat context can use
+`mailbox.releaseHeldMessages(processAfter, { preserveTriggers: true })` to keep
+each row's original engagement. Callers wake only when `countDueMessages()` finds
+a trigger. Without the option, release retains its existing behavior of making
+every held row a pending trigger.
+
+Host cutovers may also set `preserveProcessAfter: true` to retain each held
+row's deadline. `getInboundRecords({ since?, status? })` returns the canonical
+inbound identities, timestamps, engagement and source flags in arrival order;
+`getOutboundRecords(since)` supplies stable outbound identities and deadlines.
+`getDeliveredIds('delivered')` selects successful deliveries for conversation
+history, while the existing no-argument read includes failed settlements for
+send deduplication. After a destination insert is durable,
+`settleUnreadMessages(ids)` completes only those pending/held source rows.
+These are native mailbox operations; no module reads session SQLite directly.
 
 ### Chat SDK Bridge
 

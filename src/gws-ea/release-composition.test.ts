@@ -31,9 +31,11 @@ describe('release composition', () => {
     expect(imports(barrel, 'capabilities/index')).toBe(true);
   });
 
-  it('composes the Google Chat channel from its module, and the OneCLI gateway', async () => {
+  it('composes the principal chat channels from their modules, and the OneCLI gateway', async () => {
     expect(imports(await read('src/modules/index.ts'), 'gws-ea-chat/index')).toBe(true);
+    expect(imports(await read('src/modules/index.ts'), 'gws-ea-whatsapp/index')).toBe(true);
     expect(imports(await read('src/channels/index.ts'), 'gchat')).toBe(false);
+    expect(imports(await read('src/channels/index.ts'), 'whatsapp')).toBe(false);
     expect(imports(await read('src/gateway-providers/index.ts'), 'installed')).toBe(true);
     expect(imports(await read('src/gateway-providers/installed.ts'), 'onecli')).toBe(true);
   });

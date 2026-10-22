@@ -89,6 +89,14 @@ it('declares its agent-group scope field', () => {
 });
 
 describe('wirings-create — declaration-derived defaults', () => {
+  it('creates and updates module engagement through the native command boundary', async () => {
+    const row = await create({ messaging_group_id: 'mg-never', agent_group_id: 'ag-1', engage_mode: 'module' });
+    expect((await getMessagingGroupAgent(String(row.id)))?.engage_mode).toBe('module');
+    await update({ id: row.id, engage_mode: 'pattern', engage_pattern: '.' });
+    await update({ id: row.id, engage_mode: 'module' });
+    expect((await getMessagingGroupAgent(String(row.id)))?.engage_mode).toBe('module');
+  });
+
   it('fills DM defaults from the declaration with {name} substituted', async () => {
     const row = await create({ messaging_group_id: 'mg-dm', agent_group_id: 'ag-1' });
     expect(row.engage_mode).toBe('pattern');
