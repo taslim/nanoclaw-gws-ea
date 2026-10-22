@@ -1,3 +1,4 @@
+import { extractInboundContent } from '../../channels/inbound-content.js';
 import { getDb } from '../../db/connection.js';
 import type { DbDriver } from '../../db/driver.js';
 import { isRecord } from '../../gws-ea/validation.js';
@@ -6,7 +7,7 @@ import { isVerifiedPrincipalUser, recordPrincipalDmActivity } from './db.js';
 
 export const PRINCIPAL_MESSAGE_LIFETIME_MS = 24 * 60 * 60 * 1_000;
 
-/** The principal's words as the host received them, without quoted material. */
+/** The principal's message with recording provenance, without forwarded or quoted material. */
 export interface PrincipalMessage {
   readonly id: string;
   readonly messagingGroupId: string;
@@ -15,8 +16,9 @@ export interface PrincipalMessage {
   readonly text: string;
 }
 
-function principalWords(content: Record<string, unknown>): string {
-  const parts = typeof content.text === 'string' && content.text.trim() ? [content.text] : [];
+function principalMessageText(content: Record<string, unknown>): string {
+  const text = typeof content.text === 'string' && content.text.trim() ? content.text : '';
+  const recordings: Record<string, unknown>[] = [];
   if (Array.isArray(content.attachments)) {
     for (const attachment of content.attachments) {
       if (!isRecord(attachment)) continue;
@@ -24,11 +26,11 @@ function principalWords(content: Record<string, unknown>): string {
       const speech = isRecord(attachment.speech) ? attachment.speech : undefined;
       if (source?.forwarded === true || source?.quoted === true) continue;
       if (speech?.status === 'recognized' && typeof speech.text === 'string' && speech.text.trim()) {
-        parts.push(speech.text);
+        recordings.push(attachment);
       }
     }
   }
-  return parts.join('\n');
+  return extractInboundContent({ text, attachments: recordings }).text;
 }
 
 /** Registered after voice preparation: only the authenticated transport sender can earn this mark. */
@@ -67,7 +69,7 @@ export async function preparePrincipalMessageContent(request: InboundPreparation
     !(await isVerifiedPrincipalUser(userId))
   )
     return clean();
-  const text = principalWords(parsed);
+  const text = principalMessageText(parsed);
   const received = Date.parse(request.timestamp);
   if (!text || !Number.isFinite(received) || received > now || now - received > PRINCIPAL_MESSAGE_LIFETIME_MS) {
     return clean();

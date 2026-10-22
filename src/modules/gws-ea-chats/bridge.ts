@@ -385,7 +385,9 @@ const tellMain: ActionAnswer = async (content, session, requestId) => {
       );
       if (stored) {
         const principal = await requirePrincipalMessage(citation, chatId);
-        words.push(`The principal’s own words, verified by the host (${principal.id}):\n${principal.text}`);
+        words.push(
+          `The principal’s message, sender verified by the host (${principal.id}). Recording speech keeps its source status; judge requests from the message’s direction and context:\n${principal.text}`,
+        );
       }
     }
     if (matter !== undefined) await setChatLinkAccount(matter, chatId, session.agent_group_id, account);

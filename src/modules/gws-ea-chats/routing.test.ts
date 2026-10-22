@@ -1,5 +1,18 @@
 import fs from 'node:fs';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
+const recognition = vi.hoisted(() => ({ words: '' }));
+vi.mock('../gws-ea-voice/config.js', () => ({
+  readVoiceReadiness: async () => ({
+    status: 'ready',
+    enabled: true,
+    installation: { installationDir: 'verified-test-installation' },
+  }),
+}));
+vi.mock('../gws-ea-voice/transcribe.js', async (original) => ({
+  ...(await original<typeof import('../gws-ea-voice/transcribe.js')>()),
+  transcribeAudio: async () => ({ status: 'recognized', text: recognition.words, language: 'en' }),
+}));
+
 const { ROOT, send } = vi.hoisted(() => ({
   ROOT: `/tmp/wa-routing-fixes-${process.pid}`,
   send: vi.fn(async () => 'sent'),
@@ -8,10 +21,15 @@ vi.mock('../../config.js', async (original) => ({
   ...(await original<typeof import('../../config.js')>()),
   DATA_DIR: ROOT,
 }));
+vi.mock('../typing/index.js', async (original) => ({
+  ...(await original<typeof import('../typing/index.js')>()),
+  startTypingRefresh: vi.fn(),
+}));
 vi.mock('../../request-wake.js', () => ({ requestWake: vi.fn(async () => true) }));
 vi.mock('../../log.js', () => ({
   log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn(), fatal: vi.fn() },
 }));
+import '../gws-ea-voice/index.js';
 import { seedU11, cleanU11 } from './testing/u11-fixture.js';
 import { registerChannelAdapter } from '../../channels/channel-registry.js';
 import { GCHAT_DEFAULTS } from '../gws-ea-chat/adapter.js';
@@ -24,6 +42,7 @@ import { routeInbound } from '../../router.js';
 import { withExistingMailboxSession } from '../../session-manager.js';
 import { requestWake } from '../../request-wake.js';
 import { getChat } from './db.js';
+import { startTypingRefresh } from '../typing/index.js';
 import type { InboundEvent } from '../../channels/adapter.js';
 registerChannelAdapter('gchat', {
   defaults: GCHAT_DEFAULTS,
@@ -43,6 +62,7 @@ beforeEach(async () => {
   fs.rmSync(ROOT, { recursive: true, force: true });
   chatId = (await seedU11()).chat.messaging_group_id;
   send.mockClear();
+  vi.mocked(startTypingRefresh).mockClear();
   vi.mocked(requestWake).mockClear();
   setDeliveryAdapter({ deliver: send });
 });
@@ -139,3 +159,55 @@ it('native manual Google Chat wiring keeps mention engagement and wakes on a men
   );
   expect(messages?.find((row) => row.id === 'mentioned:peer')).toMatchObject({ threadId: 'thread' });
 });
+
+it.each([
+  { label: 'direct speech', source: { kind: 'voice-note' }, text: '', forwarded: false, engaged: true },
+  {
+    label: 'forwarded recording',
+    source: { kind: 'voice-note', forwarded: true },
+    text: '',
+    forwarded: false,
+    engaged: false,
+  },
+  { label: 'quoted recording', source: { kind: 'audio', quoted: true }, text: '', forwarded: false, engaged: false },
+  {
+    label: 'direct caption with forwarded recording',
+    source: { kind: 'audio', forwarded: true },
+    text: 'Robin, summarize this.',
+    forwarded: false,
+    engaged: true,
+  },
+  { label: 'forwarded message', source: undefined, text: 'Robin, check Thursday.', forwarded: true, engaged: false },
+])(
+  'engages only for direct content while retaining $label as chat context',
+  async ({ source, text, forwarded, engaged }) => {
+    recognition.words = 'Robin, check Thursday.';
+    await routeInbound({
+      ...clear('context@g.us', true),
+      message: {
+        ...clear('context@g.us', true).message,
+        id: 'source-content',
+        content: JSON.stringify({
+          text,
+          forwarded,
+          attachments: source
+            ? [{ type: 'audio', data: Buffer.from('recording').toString('base64'), audioSource: source }]
+            : [],
+        }),
+      },
+    });
+    expect(vi.mocked(requestWake).mock.calls).toHaveLength(engaged ? 1 : 0);
+    expect(vi.mocked(startTypingRefresh).mock.calls).toHaveLength(engaged ? 1 : 0);
+    const session = await getDb().get<{ id: string; agent_group_id: string }>(
+      'SELECT id,agent_group_id FROM sessions WHERE messaging_group_id=?',
+      chatId,
+    );
+    if (!session) throw new Error('No chat session');
+    const records = await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) =>
+      mailbox.getInboundRecords(),
+    );
+    const stored = records?.find((record) => record.id.startsWith('source-content:'));
+    expect(stored).toMatchObject({ trigger: engaged });
+    expect(stored?.content).toContain('Robin, check Thursday.');
+  },
+);

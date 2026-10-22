@@ -143,7 +143,9 @@ describe('principal message marks through host preparation', () => {
       }),
     );
     expect(prepared).toMatchObject({ principalMessage: { id: request.messageId } });
-    expect((await requirePrincipalMessage(request.messageId, 'chat-a')).text).toBe(recognition.words);
+    expect((await requirePrincipalMessage(request.messageId, 'chat-a')).text).toBe(
+      `[Voice note; source speech]\n${recognition.words}`,
+    );
   });
 
   it('keeps the principal’s outer words, never what they quote', async () => {

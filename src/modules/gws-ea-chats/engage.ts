@@ -1,5 +1,4 @@
 import { getChannelAdapterExact } from '../../channels/channel-registry.js';
-import { parseInboundContent } from '../../channels/inbound-content.js';
 import { isRecord } from '../../gws-ea/validation.js';
 import type { EngagementDecisionRequest } from '../../router.js';
 import type { AssistantChatChannel } from '../gws-ea-chat/membership.js';
@@ -24,6 +23,21 @@ function contentRecord(content: string): Record<string, unknown> | undefined {
     if (!(error instanceof SyntaxError)) throw error;
     return undefined;
   }
+}
+function directText(content: Record<string, unknown> | undefined): string {
+  const quote = isRecord(content?.replyTo) ? content.replyTo : undefined;
+  if (!content || content.forwarded === true || content.quoted === true || quote?.forwarded === true) return '';
+  const parts = typeof content.text === 'string' ? [content.text] : [];
+  if (Array.isArray(content.attachments)) {
+    for (const attachment of content.attachments) {
+      if (!isRecord(attachment)) continue;
+      const source = isRecord(attachment.audioSource) ? attachment.audioSource : undefined;
+      const speech = isRecord(attachment.speech) ? attachment.speech : undefined;
+      if (source?.forwarded === true || source?.quoted === true) continue;
+      if (speech?.status === 'recognized' && typeof speech.text === 'string') parts.push(speech.text);
+    }
+  }
+  return parts.join('\n');
 }
 export async function decideChatEngagement({ event, messagingGroup }: EngagementDecisionRequest): Promise<boolean> {
   let chat = await getChat(messagingGroup.id);
@@ -64,11 +78,7 @@ export async function decideChatEngagement({ event, messagingGroup }: Engagement
   const name = (await getGwsEaProfile()).assistant_display_name;
   if (name) {
     const escaped = name.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&');
-    if (
-      new RegExp(`(?:^|[^\\p{L}\\p{N}_])@?${escaped}(?=$|[^\\p{L}\\p{N}_])`, 'iu').test(
-        parseInboundContent(event.message.content).text,
-      )
-    )
+    if (new RegExp(`(?:^|[^\\p{L}\\p{N}_])@?${escaped}(?=$|[^\\p{L}\\p{N}_])`, 'iu').test(directText(parsed)))
       return true;
   }
   const quote = isRecord(parsed?.replyTo) ? parsed.replyTo : undefined;
