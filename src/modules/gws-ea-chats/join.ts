@@ -27,7 +27,7 @@ import {
   type ChatMember,
 } from './roster.js';
 import { ensureChatWiring } from './wiring-policy.js';
-import { settleChatMessages } from './hold.js';
+import { reopenClosedChat } from './closed-admission.js';
 
 export interface ChatJoinFacts {
   readonly channelType: 'whatsapp' | 'gchat';
@@ -78,33 +78,13 @@ export async function decideJoin(facts: ChatJoinFacts): Promise<Chat | undefined
   let chat = await getChat(group.id);
   if (chat?.state === 'declined' || (chat?.state === 'detached' && !facts.joined)) return chat;
   if (chat?.state === 'detached') {
-    await settleChatMessages(group.id);
-    const rejoinedAt = new Date(Math.max(Date.now(), Date.parse(chat.created_at) + 1)).toISOString();
-    const state = facts.members.some((member) => member.isPrincipal) ? 'connected' : 'asking';
-    await getDb().transaction(async () => {
-      await getDb().run(
-        `UPDATE gws_ea_chats SET state = ?, serving_agent_group_id = ?,
-        asking_notified_at = NULL, connected_at = ?, created_at = ?, updated_at = ?,
-        move_source_session_id = NULL, move_request_id = NULL, move_pending_reminder_ids_json = '[]', move_failed = 0 WHERE messaging_group_id = ?`,
-        state,
-        external,
-        state === 'connected' ? rejoinedAt : null,
-        rejoinedAt,
-        now,
-        group.id,
-      );
-      await getDb().run(
-        "UPDATE messaging_groups SET denied_at = NULL, detached_at = NULL, unknown_sender_policy = 'public', name = COALESCE(?, name) WHERE id = ?",
-        facts.name,
-        group.id,
-      );
-      await refreshChatRoster(group.id, facts.members);
-      const rejoined = await getChat(group.id);
-      if (!rejoined) throw new Error('The rejoined chat disappeared.');
-      await ensureChatWiring(rejoined);
-    });
-    chat = await getChat(group.id);
-    if (chat) await notifyAskingChat(chat);
+    chat = await reopenClosedChat(
+      chat,
+      facts,
+      external,
+      facts.members.some((member) => member.isPrincipal) ? 'connected' : 'asking',
+    );
+    await notifyAskingChat(chat);
     return chat;
   }
   if (!chat) {

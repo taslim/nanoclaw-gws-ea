@@ -1,3 +1,4 @@
+import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import Database from 'better-sqlite3';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
@@ -8,6 +9,9 @@ vi.mock('../../config.js', async (original) => ({
   DATA_DIR: ROOT,
 }));
 vi.mock('../../request-wake.js', () => ({ requestWake: vi.fn(async () => true) }));
+vi.mock('../gws-ea-chat-agents/gateway.js', () => ({
+  retireChatGateway: vi.fn(async () => undefined),
+}));
 vi.mock('../../log.js', () => ({
   log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn(), fatal: vi.fn() },
 }));
@@ -31,8 +35,9 @@ import { createMessagingGroup, getMessagingGroup, getMessagingGroupAgents } from
 import { findSessionForAgent } from '../../db/sessions.js';
 import { deliverSessionMessages, getDeliveryAction, setDeliveryAdapter } from '../../delivery.js';
 import { inboundDbPath } from '../../mailbox/sqlite/paths.js';
-import { resolveSession, writeOutboundDirect } from '../../session-manager.js';
+import { resolveSession, writeOutboundDirect, writeSessionMessage } from '../../session-manager.js';
 import type { Session } from '../../types.js';
+import { retireChatGateway } from '../gws-ea-chat-agents/gateway.js';
 import { addPerson, getPerson, getPersonLevel } from '../gws-ea-people/db.js';
 import { addPrivateValue } from '../gws-ea-privacy/db.js';
 import type { WhatsAppAdapter } from '../gws-ea-whatsapp/adapter.js';
@@ -236,7 +241,7 @@ it('refuses a sixth new person before any send or chat handoff and tells main th
   expect(inbox(main).some((row) => row.content.text?.includes('contact-cap'))).toBe(true);
 });
 
-it('creates a group with the principal and sends only Morgan’s per-person invitation when their settings refuse the add', async () => {
+it('reports every mixed group outcome through the tool and request_status, and sends only the offered per-person invitation', async () => {
   await mark('principal-outreach', 'Make a coffee group with Morgan and me.');
   h.socket().addResults.set('12000@lid', {
     jid: '12000@lid',
@@ -252,7 +257,24 @@ it('creates a group with the principal and sends only Morgan’s per-person invi
       ],
     },
   });
-  const result = accepted(await request({ ...fields, group: 'Coffee next week' }));
+  h.socket().usync.set('15551113333@s.whatsapp.net', '13000@lid');
+  h.socket().usync.set('15551114444@s.whatsapp.net', '14000@lid');
+  h.socket().addResults.set('13000@lid', {
+    jid: '13000@lid',
+    status: '404',
+    content: { tag: 'participant', attrs: {} },
+  });
+  const update = h.socket().groupParticipantsUpdate.bind(h.socket());
+  vi.spyOn(h.socket(), 'groupParticipantsUpdate').mockImplementation(async (platform, members, action) => {
+    if (members.includes('14000@lid')) throw new Error('Participant add transport interrupted');
+    return update(platform, members, action);
+  });
+  const frame = await request({
+    ...fields,
+    group: 'Coffee next week',
+    people: [...people, { name: 'Casey', number: '+15551113333' }, { name: 'Taylor', number: '+15551114444' }],
+  });
+  const result = accepted(frame);
   expect(h.socket().createdGroups).toEqual([{ subject: 'Coffee next week', participants: ['11000@lid'] }]);
   expect(h.socket().sends).toEqual([
     expect.objectContaining({
@@ -264,6 +286,47 @@ it('creates a group with the principal and sends only Morgan’s per-person invi
     expect.arrayContaining([expect.objectContaining({ person: 'whatsapp:12000', outcome: 'invited' })]),
   );
   expect(await getChat(String(result.chat))).toMatchObject({ state: 'connected', serving_agent_group_id: 'external' });
+  expect(result.participants).toEqual([
+    { person: 'whatsapp:11000', outcome: 'added' },
+    { person: 'whatsapp:12000', outcome: 'invited' },
+    {
+      person: 'whatsapp:13000',
+      outcome: 'refused',
+      reason: expect.stringContaining('gws-ea-whatsapp:add-refused'),
+    },
+    { person: 'whatsapp:14000', outcome: 'unconfirmed', reason: 'Participant add transport interrupted' },
+  ]);
+  const runner = new URL('../../../container/agent-runner/src/', import.meta.url).href;
+  const script = `
+    await import(${JSON.stringify(`${runner}modules/index.ts`)});
+    const { initTestSessionDb, getInboundDb, closeSessionDb } = await import(${JSON.stringify(`${runner}mailbox/sqlite/connection.ts`)});
+    const { getUndeliveredMessages } = await import(${JSON.stringify(`${runner}db/messages-out.ts`)});
+    const { chatReachOut } = await import(${JSON.stringify(`${runner}mcp-tools/gws-ea-chat-outreach.ts`)});
+    const { requestStatus } = await import(${JSON.stringify(`${runner}mcp-tools/request-status.ts`)});
+    const frame = await Bun.stdin.json();
+    initTestSessionDb();
+    try {
+      const waiting = chatReachOut.handler({ people: [], message: 'Handoff', principal_message: 'principal-outreach' });
+      while (getUndeliveredMessages().length === 0) await Bun.sleep(1);
+      const request = getUndeliveredMessages()[0];
+      getInboundDb().prepare('INSERT INTO messages_in(id,kind,timestamp,content,trigger) VALUES(?,?,?,?,0)').run(
+        'action-resp-' + request.id, 'system', new Date().toISOString(),
+        JSON.stringify({ type: 'action_response', requestId: request.id, frame })
+      );
+      const tool = await waiting;
+      const status = await requestStatus.handler({ request_id: request.id });
+      console.log(JSON.stringify({ tool, status }));
+    } finally { closeSessionDb(); }
+  `;
+  const rendered = JSON.parse(
+    execFileSync('bun', ['--eval', script], {
+      input: JSON.stringify(frame),
+      encoding: 'utf8',
+      timeout: 5000,
+    }),
+  ) as { tool: { content: { text: string }[] }; status: unknown };
+  expect(JSON.parse(rendered.tool.content[0].text)).toEqual(result);
+  expect(rendered.status).toEqual(rendered.tool);
 });
 
 it('binds the native resolved identity to Morgan’s existing record without lowering their level or handing private people context to the chat', async () => {
@@ -329,4 +392,118 @@ it('brings an actual first-message 463 to main once and leaves the refused outbo
   expect(inbox(main).find((row) => row.content.text?.includes('WhatsApp error 463'))?.content.text).toContain(
     'Use email or tell the principal',
   );
+});
+
+it.each([false, true])(
+  'starts a fresh private-chat lifetime after the promoted job leaves, including interrupted cleanup (%s)',
+  async (interrupted) => {
+    await mark('principal-outreach');
+    const first = accepted(await request(fields));
+    const chatId = String(first.chat);
+    const previous = await getChat(chatId);
+    const oldSession = await findSessionForAgent('external', chatId, null);
+    if (!previous || !oldSession) throw new Error('Missing original chat');
+    const now = new Date().toISOString();
+    await getDb().run(
+      "INSERT INTO gws_ea_job_agents(agent_group_id,messaging_group_id,state,created_at,updated_at) VALUES('peer',?,'active',?,?)",
+      chatId,
+      now,
+      now,
+    );
+    const job = (await resolveSession('peer', chatId, null, 'shared')).session;
+    await writeSessionMessage('peer', job.id, {
+      id: 'old-job-held',
+      kind: 'chat',
+      timestamp: now,
+      platformId: '12000@lid',
+      channelType: 'whatsapp',
+      threadId: null,
+      content: JSON.stringify({ text: 'Old private-chat work' }),
+      trigger: true,
+      status: 'held',
+    });
+    await getDb().run(
+      "UPDATE gws_ea_chats SET state='job',serving_agent_group_id='peer',asking_notified_at=?,move_source_session_id=?,move_request_id='old-move',move_pending_reminder_ids_json='[\"old-reminder\"]',move_failed=1 WHERE messaging_group_id=?",
+      now,
+      oldSession.id,
+      chatId,
+    );
+    const secret = await addPrivateValue({ kind: 'other', label: 'Fixture', value: 'Old cleared fixture value' });
+    await getDb().run(
+      'INSERT INTO gws_ea_chat_clearances(messaging_group_id,private_value_id,principal_message_id,cleared_at) VALUES(?,?,?,?)',
+      chatId,
+      secret.id,
+      'principal-outreach',
+      now,
+    );
+    const leave = getDeliveryAction('chat_leave');
+    if (!leave) throw new Error('Missing chat_leave action');
+    if (interrupted) vi.mocked(retireChatGateway).mockRejectedValueOnce(new Error('Retirement gateway interrupted'));
+    await leave({ action: 'chat_leave', requestId: 'leave-job-chat', chat: chatId }, main);
+    expect(inbox(main).find((row) => row.id === 'action-resp-leave-job-chat')?.content.frame).toMatchObject({
+      ok: true,
+    });
+    expect(await getDb().get('SELECT state FROM gws_ea_job_agents WHERE agent_group_id=?', 'peer')).toEqual({
+      state: interrupted ? 'retiring' : 'retired',
+    });
+    await mark('principal-followup', 'Contact Morgan again to arrange coffee.');
+    if (interrupted) {
+      vi.mocked(retireChatGateway).mockRejectedValueOnce(new Error('Retirement still unavailable'));
+      expect(await request({ ...fields, principal_message: 'principal-followup' })).toMatchObject({ ok: false });
+      expect(await getChat(chatId)).toMatchObject({ state: 'detached', serving_agent_group_id: 'peer' });
+    }
+    const reopened = accepted(await request({ ...fields, principal_message: 'principal-followup' }));
+    expect(reopened.chat).toBe(chatId);
+    expect(await getChat(chatId)).toMatchObject({
+      state: 'connected',
+      serving_agent_group_id: 'external',
+      asking_notified_at: null,
+    });
+    expect(Date.parse((await getChat(chatId))!.created_at)).toBeGreaterThan(Date.parse(previous.created_at));
+    expect(
+      await getDb().get(
+        'SELECT move_source_session_id,move_request_id,move_pending_reminder_ids_json,move_failed,settled_at,calendar_id,placed_nowhere FROM gws_ea_chats WHERE messaging_group_id=?',
+        chatId,
+      ),
+    ).toEqual({
+      move_source_session_id: null,
+      move_request_id: null,
+      move_pending_reminder_ids_json: '[]',
+      move_failed: 0,
+      settled_at: null,
+      calendar_id: null,
+      placed_nowhere: 1,
+    });
+    expect(await getDb().all('SELECT * FROM gws_ea_chat_clearances WHERE messaging_group_id=?', chatId)).toEqual([]);
+    expect(await getMessagingGroup(chatId)).toMatchObject({ detached_at: null, denied_at: null });
+    expect(await getDb().get('SELECT status FROM sessions WHERE id=?', job.id)).toEqual({ status: 'closed' });
+    const oldMailbox = new Database(inboundDbPath('peer', job.id), { readonly: true });
+    try {
+      expect(oldMailbox.prepare('SELECT status FROM messages_in WHERE id=?').get('old-job-held')).toEqual({
+        status: 'completed',
+      });
+    } finally {
+      oldMailbox.close();
+    }
+    const current = await findSessionForAgent('external', chatId, null);
+    expect(current?.id).not.toBe(oldSession.id);
+    expect(current && inbox(current).filter((row) => row.id.startsWith('chat-outreach-'))).toHaveLength(1);
+  },
+);
+
+it.each(['job', 'moving'] as const)('does not take outreach ownership from an active %s chat', async (state) => {
+  await mark('principal-outreach');
+  const first = accepted(await request(fields));
+  await getDb().run(
+    'UPDATE gws_ea_chats SET state=?,serving_agent_group_id=? WHERE messaging_group_id=?',
+    state,
+    'peer',
+    String(first.chat),
+  );
+  await mark('principal-followup');
+  expect(await request({ ...fields, principal_message: 'principal-followup' })).toMatchObject({
+    ok: false,
+    error: { message: expect.stringContaining('another assistant session') },
+  });
+  expect(await getChat(String(first.chat))).toMatchObject({ state, serving_agent_group_id: 'peer' });
 });

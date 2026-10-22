@@ -26,6 +26,7 @@ import type { WhatsAppAdapter } from '../gws-ea-whatsapp/adapter.js';
 import type { WhatsAppOutreachRequest } from '../gws-ea-whatsapp/contacts.js';
 import type { WhatsAppPerson } from '../gws-ea-whatsapp/paths.js';
 import { flushChatHandoffs } from './bridge.js';
+import { reopenClosedChat } from './closed-admission.js';
 import { getChat } from './db.js';
 import { recordChatHandoff } from './handoffs.js';
 import type { ChatJoinFacts } from './join.js';
@@ -92,7 +93,9 @@ async function assertOutreachConversation(platformId: string, external: string):
   const chat = await getChat(group.id);
   if (
     chat
-      ? chat.serving_agent_group_id !== external || chat.state === 'job' || chat.state === 'moving'
+      ? chat.state !== 'detached' &&
+        chat.state !== 'declined' &&
+        (chat.serving_agent_group_id !== external || chat.state === 'job' || chat.state === 'moving')
       : (await getMessagingGroupAgents(group.id)).length > 0
   )
     throw forbidden('This conversation already belongs to another assistant session.');
@@ -180,32 +183,40 @@ const reachOut: ActionAnswer = async (content, session, requestId) => {
     });
     const group = await getMessagingGroupByPlatform('whatsapp', facts.platformId, 'whatsapp');
     if (!group) throw new Error('The outreach conversation was not stored.');
+    const previous = await getChat(group.id);
+    const reopening = previous?.state === 'detached' || previous?.state === 'declined';
+    if (reopening) await reopenClosedChat(previous, facts, external, 'connected');
     await getDb().transaction(async () => {
-      await getDb().run(
-        `INSERT INTO gws_ea_chats(messaging_group_id,state,serving_agent_group_id,principal_present,connected_at,placed_nowhere,created_at,updated_at)
+      if (reopening) {
+        await getDb().run('UPDATE gws_ea_chats SET placed_nowhere=1 WHERE messaging_group_id=?', group.id);
+      } else {
+        await getDb().run(
+          `INSERT INTO gws_ea_chats(messaging_group_id,state,serving_agent_group_id,principal_present,connected_at,placed_nowhere,created_at,updated_at)
         VALUES(?,'connected',?,?,?,1,?,?) ON CONFLICT(messaging_group_id) DO UPDATE SET state='connected',connected_at=COALESCE(gws_ea_chats.connected_at,excluded.connected_at),placed_nowhere=1,updated_at=excluded.updated_at`,
-        group.id,
-        external,
-        Number(facts.members.some((member) => member.isPrincipal)),
-        now,
-        now,
-        now,
-      );
-      await getDb().run(
-        "UPDATE messaging_groups SET denied_at=NULL,detached_at=NULL,unknown_sender_policy='public',name=COALESCE(?,name) WHERE id=?",
-        facts.name,
-        group.id,
-      );
-      await refreshChatRoster(group.id, facts.members);
-      const chat = await getChat(group.id);
-      if (!chat) throw new Error('The outreach chat was not stored.');
-      await ensureChatWiring(chat);
+          group.id,
+          external,
+          Number(facts.members.some((member) => member.isPrincipal)),
+          now,
+          now,
+          now,
+        );
+        await getDb().run(
+          "UPDATE messaging_groups SET denied_at=NULL,detached_at=NULL,unknown_sender_policy='public',name=COALESCE(?,name) WHERE id=?",
+          facts.name,
+          group.id,
+        );
+        await refreshChatRoster(group.id, facts.members);
+        const chat = await getChat(group.id);
+        if (!chat) throw new Error('The outreach chat was not stored.');
+        await ensureChatWiring(chat);
+      }
       await recordChatHandoff({ id, messaging_group_id: group.id, message, matter_id: null, created_at: now }, []);
     });
     await flushChatHandoffs(group.id);
     return {
       chat: group.id,
-      message: 'The conversation is connected and your request has been handed over.',
+      status: 'connected',
+      handoff: 'handed_over',
       ...(participants === undefined ? {} : { participants }),
     };
   });
