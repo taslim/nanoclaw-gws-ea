@@ -102,7 +102,10 @@ describe('owned loopback Chrome attachment', () => {
     const connection = await connectChrome(owned, paths);
     expect(requests).toMatchObject([{ hostname: '127.0.0.1', port, path: '/json/version' }]);
     expect(lsof).toHaveBeenCalledTimes(2);
-    expect(lsof.mock.calls[0]?.slice(0, 2)).toEqual(['lsof', ['-nP', '-a', `-iTCP:${port}`, '-sTCP:LISTEN', '-Fpn']]);
+    expect(lsof.mock.calls[0]?.slice(0, 2)).toEqual([
+      'lsof',
+      ['-w', '-nP', '-a', `-iTCP:${port}`, '-sTCP:LISTEN', '-Fpn'],
+    ]);
     expect(attach).toHaveBeenCalledExactlyOnceWith(endpoint, { isLocal: true, artifactsDir: paths.artifactsDir });
     expect(connection.debuggerPort).toBe(port);
     expect(send).toHaveBeenCalledWith('Browser.setPermission', {
@@ -165,8 +168,17 @@ describe('owned loopback Chrome attachment', () => {
     },
   );
 
-  it('refuses an ownership-tool failure without exposing its diagnostics', async () => {
-    listen('', Object.assign(new Error('tool failed: sensitive endpoint'), { code: 'ENOENT' }));
+  it.each([
+    ['missing tool', '', Object.assign(new Error('tool failed: sensitive endpoint'), { code: 'ENOENT' }), ''],
+    [
+      'failed selection',
+      `p${pid}\nf12\nn127.0.0.1:${port}\n`,
+      Object.assign(new Error('tool failed'), { code: 2 }),
+      '',
+    ],
+    ['unexpected diagnostic', `p${pid}\nf12\nn127.0.0.1:${port}\n`, null, 'sensitive endpoint'],
+  ])('refuses %s without exposing ownership-tool diagnostics', async (_name, output, error, stderr) => {
+    listen(output, error, stderr);
     const { owned } = childFixture();
     const failure = await connectChrome(owned, paths).catch((error: unknown) => error);
     expect(failure).toEqual(new Error('Chrome connection unavailable'));
