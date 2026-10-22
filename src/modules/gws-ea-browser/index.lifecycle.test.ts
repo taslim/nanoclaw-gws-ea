@@ -2,9 +2,11 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import net from 'node:net';
+import { EventEmitter } from 'node:events';
 import type { ChildProcess } from 'node:child_process';
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import type { Browser, Page } from 'playwright-core';
 
 import { lookup } from '../../cli/registry.js';
 import { browserActions, getBrowserRuntime } from './index.js';
@@ -23,6 +25,7 @@ import * as cancellation from './cancel.js';
 import * as startup from './start-sweep.js';
 import * as chrome from './chrome.js';
 import * as connection from './connection.js';
+import { JobWindows } from './windows.js';
 import { browserPaths, ensureBrowserPaths, writePrivateFile } from './paths.js';
 
 let root: string;
@@ -347,6 +350,10 @@ describe('optional host browser lifecycle', () => {
       expect(first).not.toBe(second);
       expect(first.viewportSize()).toBeNull();
       expect(second.viewportSize()).toBeNull();
+      const state = runtime.state();
+      expect(state.chrome).toMatchObject({ state: 'running', debuggerPort: expect.any(Number) });
+      if (state.chrome.state !== 'running') throw new Error('Expected an admitted Chrome');
+      expect(state.chrome.debuggerPort).toBeGreaterThan(0);
       await runtime.closeJob('first');
       expect(first.isClosed()).toBe(true);
       expect(await second.evaluate('21 * 2')).toBe(42);
@@ -366,9 +373,9 @@ describe('optional host browser lifecycle', () => {
           chromePath: process.env.GWS_EA_BROWSER_TEST_CHROME,
         }),
       );
-      const connect = connection.connectChromePipe;
+      const connect = connection.connectChrome;
       const spawn = vi.spyOn(chrome, 'spawnChrome');
-      vi.spyOn(connection, 'connectChromePipe').mockImplementationOnce(async (child, paths) => {
+      vi.spyOn(connection, 'connectChrome').mockImplementationOnce(async (child, paths) => {
         const attached = await connect(child, paths);
         vi.spyOn(attached.context, 'newCDPSession').mockRejectedValueOnce(new Error('Target lost during setup'));
         return attached;
@@ -377,7 +384,7 @@ describe('optional host browser lifecycle', () => {
         await expect(runtime.connection()).rejects.toMatchObject({ code: 'browser_unavailable' });
         const spawned = spawn.mock.results[0];
         if (spawned?.type !== 'return') throw new Error('Expected an owned Chrome process');
-        const child = spawned.value;
+        const { child } = await spawned.value;
         expect(child.exitCode !== null || child.signalCode !== null).toBe(true);
         expect(runtime.state().chrome).toEqual({ state: 'unavailable' });
         const state = runtime.state();
@@ -389,41 +396,134 @@ describe('optional host browser lifecycle', () => {
     },
     30_000,
   );
-  it('bounds a stalled Chrome attachment and reports unavailable without retaining startup admission', async () => {
+  it('bounds a stalled attach and disposes a late success without publishing it', async () => {
     await ensureBrowserPaths(browserPaths(file));
     await writePrivateFile(file, JSON.stringify({ schemaVersion: 1, enabled: true }));
     await runtime.reconcile();
+    const child = Object.assign(new EventEmitter(), { pid: 12345, exitCode: null as number | null, signalCode: null });
+    vi.spyOn(chrome, 'spawnChrome').mockResolvedValue({ child: child as ChildProcess, debuggerPort: 45679 });
+    vi.spyOn(chrome, 'stopChrome').mockImplementation(async () => {
+      child.exitCode = 0;
+      child.emit('exit', 0, null);
+    });
     let entered!: () => void;
     const connecting = new Promise<void>((resolve) => {
       entered = resolve;
     });
-    let rejectConnection!: (error: Error) => void;
-    vi.spyOn(chrome, 'spawnChrome').mockReturnValue({} as ChildProcess);
-    vi.spyOn(chrome, 'stopChrome').mockResolvedValue();
-    vi.spyOn(connection, 'connectChromePipe').mockImplementation(() => {
+    let resolveConnection!: (attached: connection.ChromeConnection) => void;
+    vi.spyOn(connection, 'connectChrome').mockImplementation(() => {
       entered();
-      return new Promise((_resolve, reject) => {
-        rejectConnection = reject;
+      return new Promise((resolve) => {
+        resolveConnection = resolve;
       });
     });
+    const policy = vi.spyOn(connection, 'verifyChromePolicy').mockResolvedValue();
+    const close = vi.fn(async () => undefined);
+    const attached = { child, close } as unknown as connection.ChromeConnection;
     vi.useFakeTimers();
-    let outcome = 'pending';
-    const pending = runtime.pageForJob('stalled').then(
-      () => {
-        outcome = 'opened';
-      },
-      () => {
-        outcome = 'browser_unavailable';
-      },
-    );
+    const pending = runtime.connection();
+    const rejected = expect(pending).rejects.toMatchObject({ code: 'browser_unavailable' });
     try {
       await connecting;
       await vi.advanceTimersByTimeAsync(30_001);
-      expect(outcome).toBe('browser_unavailable');
+      await rejected;
+      expect(child.exitCode).toBe(0);
+      expect(runtime.state().chrome).toEqual({ state: 'unavailable' });
+      resolveConnection(attached);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(close).toHaveBeenCalledOnce();
+      expect(policy).not.toHaveBeenCalled();
       expect(runtime.state().chrome).toEqual({ state: 'unavailable' });
     } finally {
-      rejectConnection(new Error('Owned test connection cleanup'));
-      await pending;
+      vi.useRealTimers();
+      vi.restoreAllMocks();
+    }
+  });
+
+  it.each(['shutdown', 'disable'] as const)('cancels pending setup on %s and closes a later attach', async (action) => {
+    await ensureBrowserPaths(browserPaths(file));
+    await writePrivateFile(file, JSON.stringify({ schemaVersion: 1, enabled: true }));
+    await runtime.reconcile();
+    const child = Object.assign(new EventEmitter(), { pid: 12345, exitCode: null as number | null, signalCode: null });
+    vi.spyOn(chrome, 'spawnChrome').mockResolvedValue({ child: child as ChildProcess, debuggerPort: 45679 });
+    vi.spyOn(chrome, 'stopChrome').mockImplementation(async () => {
+      child.exitCode = 0;
+      child.emit('exit', 0, null);
+    });
+    let entered!: () => void;
+    const connecting = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    let resolveConnection!: (attached: connection.ChromeConnection) => void;
+    vi.spyOn(connection, 'connectChrome').mockImplementation(() => {
+      entered();
+      return new Promise((resolve) => {
+        resolveConnection = resolve;
+      });
+    });
+    const close = vi.fn(async () => undefined);
+    const pending = runtime.connection();
+    const rejected = expect(pending).rejects.toMatchObject({ code: 'browser_unavailable' });
+    try {
+      await connecting;
+      if (action === 'disable') await writePrivateFile(file, JSON.stringify({ schemaVersion: 1, enabled: false }));
+      await (action === 'shutdown' ? runtime.shutdown() : runtime.reconcile());
+      await rejected;
+      expect(child.exitCode).toBe(0);
+      expect(runtime.state()).toMatchObject({ ready: false, proxy: { state: 'stopped' }, windows: 0 });
+      resolveConnection({ child, close } as unknown as connection.ChromeConnection);
+      await vi.waitFor(() => expect(close).toHaveBeenCalledOnce());
+      expect(runtime.state().chrome.state).not.toBe('running');
+    } finally {
+      vi.restoreAllMocks();
+    }
+  });
+
+  it('keeps the single startup deadline through background policy admission and retires before client disposal', async () => {
+    await ensureBrowserPaths(browserPaths(file));
+    await writePrivateFile(file, JSON.stringify({ schemaVersion: 1, enabled: true }));
+    await runtime.reconcile();
+    const child = Object.assign(new EventEmitter(), { pid: 12345, exitCode: null as number | null, signalCode: null });
+    vi.spyOn(chrome, 'spawnChrome').mockResolvedValue({ child: child as ChildProcess, debuggerPort: 45679 });
+    vi.spyOn(chrome, 'stopChrome').mockImplementation(async () => {
+      child.exitCode = 0;
+      child.emit('exit', 0, null);
+    });
+    const close = vi.fn(() => new Promise<never>(() => undefined));
+    const browser = { isConnected: () => true } as Browser;
+    vi.spyOn(connection, 'connectChrome').mockResolvedValue({
+      child,
+      browser,
+      close,
+    } as unknown as connection.ChromeConnection);
+    vi.spyOn(JobWindows.prototype, 'pageForJob').mockResolvedValue({} as Page);
+    const windowsClosed = vi.spyOn(JobWindows.prototype, 'close').mockResolvedValue();
+    let entered!: () => void;
+    const probing = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    let finishProbe!: () => void;
+    vi.spyOn(connection, 'verifyChromePolicy').mockImplementation(() => {
+      entered();
+      return new Promise<void>((resolve) => {
+        finishProbe = resolve;
+      });
+    });
+    vi.useFakeTimers();
+    const pending = runtime.connection();
+    const rejected = expect(pending).rejects.toMatchObject({ code: 'browser_unavailable' });
+    try {
+      await probing;
+      await vi.advanceTimersByTimeAsync(30_001);
+      await rejected;
+      expect(child.exitCode).toBe(0);
+      expect(close).toHaveBeenCalledOnce();
+      expect(runtime.state().chrome).toEqual({ state: 'unavailable' });
+      finishProbe();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(windowsClosed).toHaveBeenCalledOnce();
+      expect(runtime.state().chrome).toEqual({ state: 'unavailable' });
+    } finally {
       vi.useRealTimers();
       vi.restoreAllMocks();
     }

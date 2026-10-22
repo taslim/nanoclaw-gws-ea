@@ -1,5 +1,5 @@
 /**
- * Real Chrome pipe, background windows and TLS origins for authorized signup
+ * Real owned Chrome, background windows and TLS origins for authorized signup
  * and password changes; all traffic terminates in this fixture, and 1Password
  * is the SDK fake. Generated passwords are read back only from that fake.
  */
@@ -54,7 +54,7 @@ import { gwsEaInboxMigration } from '../gws-ea-inbox/migration.js';
 import { setActiveInbox, type InboxRuntime } from '../gws-ea-inbox/runtime.js';
 import { prepareAuthenticationIsolation } from './authentication-submit.js';
 import { prepareChromeProfile, spawnChrome } from './chrome.js';
-import { connectChromePipe, type ChromeConnection } from './connection.js';
+import { connectChrome, type ChromeConnection } from './connection.js';
 import { CredentialAttempts, type CredentialAttempt } from './credential-attempts.js';
 import { executeCredentialForm } from './credential-operations.js';
 import { executeBrowserBatch } from './executor.js';
@@ -318,8 +318,8 @@ describe.skipIf(!chromePath)('native authorized signup and password change', { t
     if (!proxyAddress || typeof proxyAddress === 'string') throw new Error('Proxy fixture did not bind');
     const paths = browserPaths(join(root, 'browser', 'policy.json'));
     await prepareChromeProfile(paths);
-    connection = await connectChromePipe(
-      spawnChrome({ chromePath, paths, proxyUrl: `http://127.0.0.1:${proxyAddress.port}` }),
+    connection = await connectChrome(
+      await spawnChrome({ chromePath, paths, proxyUrl: `http://127.0.0.1:${proxyAddress.port}` }),
       paths,
     );
     await prepareAuthenticationIsolation(connection.context);

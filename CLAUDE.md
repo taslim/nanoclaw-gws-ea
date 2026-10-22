@@ -74,7 +74,7 @@ For ad-hoc central queries from skills or scripts, use the in-tree wrapper rathe
 | `src/modules/approvals/primitive.ts` | `pickApprover`, `pickApprovalDelivery`, `requestApproval` (returns approval id), approval-handler registry with opt-in restart-safe handlers |
 | `src/modules/approvals/lifecycle.ts` | Approval withdrawal and expiry: DB-only detach, then card edit/notification after commit |
 | `src/modules/agent-to-agent/` | Native destination ACLs and routing, including per-thread tool-agent sessions and untrusted inbound framing |
-| `src/modules/gws-ea-browser/` | Optional host Playwright runtime, private Chrome pipe, public-only proxy, job queue, sign-in, the open-rule classifier, consent engine, reviewed and generic purchase readers, purchase authority, recipes and wake-on-change watches |
+| `src/modules/gws-ea-browser/` | Optional host Playwright runtime, owned loopback Chrome CDP connection, public-only proxy, job queue, sign-in, the open-rule classifier, consent engine, reviewed and generic purchase readers, purchase authority, recipes and wake-on-change watches |
 | `src/gws-ea/onepassword*.ts` + `src/modules/gws-ea-browser/{onepassword*,credential-*,vault-access}.ts` | 1Password: operator provisioning, disable and removal cleanup; the sanitized `op` CLI boundary and host vault client; durable credential attempts for signups and owned password changes; main's vault sharing with the principal |
 | `src/command-gate.ts` | Router-side admin command gate — queries `user_roles` directly (no env var, no container-side check) |
 | `src/modules/permissions/user-dm.ts` | Cold-DM resolution + `user_dms` cache |
@@ -258,7 +258,13 @@ retries. Tokens are owner-only host files (the management token under the
 control plane's config root, each runtime token in instance secrets), outside
 snapshots and container mounts. Profile and staging data live under
 `<instance root>/browser/`, outside routine snapshot roots. There is no
-Keychain credential store, debugging TCP endpoint or takeover portal.
+Keychain credential store or takeover portal. Host Playwright attaches to the
+Chrome child it launched on an explicit nonzero `127.0.0.1` debugging port, after
+verifying the listener belongs to that live child. The endpoint and browser ID
+stay host-private; host health exposes only its integer port. Trusted host
+processes and ordinary Docker bridge containers can reach loopback forwarding;
+the managed assistant-network boundary is checked separately for both the proxy
+and active debugger, without claiming pipe exclusivity.
 
 ### Host browser errands
 

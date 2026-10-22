@@ -8,7 +8,7 @@ import type { ElementHandle, Frame, Page } from 'playwright-core';
 import { inspectAuthenticationControl, submitAuthenticationForm } from './authentication-signatures.js';
 import { prepareAuthenticationIsolation } from './authentication-submit.js';
 import { prepareChromeProfile, spawnChrome } from './chrome.js';
-import { connectChromePipe, type ChromeConnection } from './connection.js';
+import { connectChrome, type ChromeConnection } from './connection.js';
 import { browserPaths } from './paths.js';
 
 type Location = 'top' | 'same-origin-frame' | 'cross-origin-frame' | 'shadow' | 'ambiguous-frame';
@@ -32,7 +32,7 @@ describe.skipIf(!chromePath)('native authentication submission', { timeout: 30_0
     root = await mkdtemp(join(tmpdir(), 'nanoclaw-auth-native-'));
     const paths = browserPaths(join(root, 'browser', 'policy.json'));
     await prepareChromeProfile(paths);
-    connection = await connectChromePipe(spawnChrome({ chromePath, paths, proxyUrl: 'http://127.0.0.1:9' }), paths);
+    connection = await connectChrome(await spawnChrome({ chromePath, paths, proxyUrl: 'http://127.0.0.1:9' }), paths);
     await prepareAuthenticationIsolation(connection.context);
   });
 

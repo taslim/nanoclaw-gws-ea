@@ -1,14 +1,21 @@
-import { execFile } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
+import { EventEmitter } from 'node:events';
+import net from 'node:net';
 import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, readlink, rm, symlink, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
 
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { buildChromeLaunch, prepareChromeProfile } from './chrome.js';
+import { buildChromeLaunch, prepareChromeProfile, spawnChrome } from './chrome.js';
 import { browserPaths, ensureBrowserPaths, writePrivateFile } from './paths.js';
 import { readBrowserPolicy } from './policy.js';
+
+vi.mock('node:child_process', async (load) => {
+  const original = await load<typeof import('node:child_process')>();
+  return { ...original, spawn: vi.fn(original.spawn) };
+});
 
 const execute = promisify(execFile);
 let root: string;
@@ -20,12 +27,13 @@ afterEach(async () => {
 });
 
 describe('dedicated Chrome profile and launch', () => {
-  it('uses a private pipe, dedicated profile, public proxy and background flags only', () => {
+  it('uses an explicit loopback debugger port, dedicated profile, public proxy and background flags only', () => {
     const paths = browserPaths(path.join(root, 'browser', 'policy.json'));
     const launch = buildChromeLaunch({
       chromePath: '/Applications/Chrome with spaces.app/Chrome',
       paths,
       proxyUrl: 'http://127.0.0.1:45678',
+      debuggerPort: 45679,
     });
     expect(launch.command).toBe('/bin/sh');
     expect(launch.args.slice(0, 4)).toEqual([
@@ -36,7 +44,8 @@ describe('dedicated Chrome profile and launch', () => {
     ]);
     expect(launch.args).toEqual(
       expect.arrayContaining([
-        '--remote-debugging-pipe',
+        '--remote-debugging-address=127.0.0.1',
+        '--remote-debugging-port=45679',
         `--user-data-dir=${paths.profileDir}`,
         '--proxy-server=http://127.0.0.1:45678',
         '--proxy-bypass-list=<-loopback>',
@@ -49,16 +58,68 @@ describe('dedicated Chrome profile and launch', () => {
     );
     expect(
       launch.args.some((arg) =>
-        /--(?:remote-debugging-port|enable-automation|remote-allow-origins|headless)|AutomationControlled|CDPScreenshotNewSurface/.test(
+        /--(?:remote-debugging-pipe|disable-notifications|enable-automation|remote-allow-origins|headless)|AutomationControlled|CDPScreenshotNewSurface/.test(
           arg,
         ),
       ),
     ).toBe(false);
   });
 
+  it.each([0, -1, 65_536, 1.5, Number.NaN])('refuses invalid Chrome debugger port %s', (debuggerPort) => {
+    expect(() =>
+      buildChromeLaunch({
+        chromePath: '/fixture/chrome',
+        paths: browserPaths(path.join(root, 'browser', 'policy.json')),
+        proxyUrl: 'http://127.0.0.1:45678',
+        debuggerPort,
+      }),
+    ).toThrow('Chrome needs an explicit debugger port');
+  });
+
+  it('never spawns a late Chrome after cancellation during port selection', async () => {
+    let listening!: () => void;
+    const selector = Object.assign(new EventEmitter(), {
+      listen: vi.fn((_port: number, _host: string, callback: () => void) => {
+        listening = callback;
+      }),
+      address: () => ({ address: '127.0.0.1', family: 'IPv4', port: 45679 }),
+      close: vi.fn((callback?: (error?: Error) => void) => {
+        callback?.();
+      }),
+    });
+    const reserve = vi.spyOn(net, 'createServer').mockReturnValue(selector as unknown as net.Server);
+    const spawnProcess = vi.mocked(spawn);
+    spawnProcess.mockClear();
+    const controller = new AbortController();
+    try {
+      const pending = spawnChrome(
+        {
+          chromePath: '/fixture/chrome',
+          paths: browserPaths(path.join(root, 'browser', 'policy.json')),
+          proxyUrl: 'http://127.0.0.1:45678',
+        },
+        controller.signal,
+      );
+      controller.abort();
+      await expect(pending).rejects.toThrow('Chrome startup cancelled');
+      listening();
+      await Promise.resolve();
+      expect(spawnProcess).not.toHaveBeenCalled();
+      expect(selector.close).toHaveBeenCalled();
+    } finally {
+      reserve.mockRestore();
+      spawnProcess.mockClear();
+    }
+  });
+
   it('sets a child-only umask and preserves argv verbatim', async () => {
     const paths = browserPaths(path.join(root, 'browser', 'policy.json'));
-    const launch = buildChromeLaunch({ chromePath: process.execPath, paths, proxyUrl: 'http://127.0.0.1:45678' });
+    const launch = buildChromeLaunch({
+      chromePath: process.execPath,
+      paths,
+      proxyUrl: 'http://127.0.0.1:45678',
+      debuggerPort: 45679,
+    });
     const output = path.join(root, 'private data with spaces');
     const argv = ['literal $(no-command)', 'quoted "value"'];
     await execute(launch.command, [

@@ -105,12 +105,12 @@ describe('quiet job windows', () => {
     expect(pages[0].isClosed()).toBe(true);
     expect(windows.size).toBe(0);
   });
-  it('has no OS focus, foreground-target, port or trace path in runtime source', async () => {
+  it('has no OS focus, foreground-target or trace path in runtime source', async () => {
     const names = await readdir(new URL('.', import.meta.url));
     for (const name of names.filter((name) => name.endsWith('.ts') && !name.endsWith('.test.ts'))) {
       const source = await readFile(new URL(name, import.meta.url), 'utf8');
       expect(source, name).not.toMatch(
-        /\bbringToFront\s*\(|['"]Target\.activateTarget['"]|--remote-debugging-port|--enable-automation|--remote-allow-origins|\btracing\s*\./,
+        /\bbringToFront\s*\(|['"]Target\.activateTarget['"]|--enable-automation|--remote-allow-origins|\btracing\s*\./,
       );
       expect(source, name).not.toMatch(/\bpage\.route\s*\(|\bcontext\.newPage\s*\(/);
     }

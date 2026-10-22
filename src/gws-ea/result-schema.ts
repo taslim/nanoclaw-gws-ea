@@ -247,6 +247,7 @@ const browserMetadata = {
 const browserAccess = {
   oneOf: [object({ version: { const: 1 } }), object({ version: { const: 2 }, agent_group_ids: array(text) })],
 };
+const browserIsolationCheck = { status: choices('not_run', 'passed', 'failed', 'unknown'), reason: nullable(text) };
 export const BROWSER_CAPABILITY_SCHEMA = object({
   ...browserMetadata,
   instance_id: text,
@@ -259,7 +260,11 @@ export const BROWSER_CAPABILITY_SCHEMA = object({
     version: nullable(text),
     reason: nullable(text),
   }),
-  isolation: object({ status: choices('not_run', 'passed', 'failed', 'unknown'), reason: nullable(text) }),
+  isolation: object({
+    ...browserIsolationCheck,
+    proxy: object(browserIsolationCheck),
+    debugger: object(browserIsolationCheck),
+  }),
   ready: bool,
   access: nullable(browserAccess),
 });

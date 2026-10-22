@@ -10,6 +10,7 @@ import { browserPaths } from '../modules/gws-ea-browser/paths.js';
 import { BROWSER_POLICY_VERSIONS, readBrowserPolicy } from '../modules/gws-ea-browser/policy.js';
 import {
   assertBrowserPolicyReadable,
+  browserCapabilityLines,
   disableBrowserCapability,
   enableBrowserCapability,
   inspectBrowserCapability,
@@ -89,7 +90,7 @@ describe('assistant browser capability', () => {
     expect(await disableBrowserCapability(f.paths, f.instanceId)).toMatchObject({ changed: false });
   });
 
-  it('reports Chrome missing and host-down isolation as not_run without writing anything', async () => {
+  it('reports Chrome missing and unobservable host isolation without writing anything', async () => {
     const f = await fixture();
     await enableBrowserCapability(f.paths, f.instanceId);
     const before = await readFile(f.browser.policyFile, 'utf8');
@@ -99,32 +100,47 @@ describe('assistant browser capability', () => {
         throw Object.assign(new Error('missing'), { code: 'ENOENT' });
       },
       ncl: async () => {
-        throw new Error('host down');
+        throw new Error('host down: ws://127.0.0.1:41444/devtools/browser/private-fixture-id');
       },
     });
     expect(result.chrome.status).toBe('unavailable');
-    expect(result.isolation.status).toBe('not_run');
+    expect(result.isolation.status).toBe('unknown');
     expect(result.ready).toBe(false);
+    expect(JSON.stringify(result)).not.toContain('private-fixture-id');
     expect(await readFile(f.browser.policyFile, 'utf8')).toBe(before);
   });
 
-  it.each([false, true])('probes the actual host gateway on the assistant network; reachable=%s', async (reachable) => {
+  it.each([
+    { proxyReachable: false, debuggerReachable: false },
+    { proxyReachable: true, debuggerReachable: false },
+    { proxyReachable: false, debuggerReachable: true },
+  ])('probes both host listeners on the assistant network: %j', async ({ proxyReachable, debuggerReachable }) => {
     const f = await fixture();
     await enableBrowserCapability(f.paths, f.instanceId);
     const commands: SanitizedCommand[] = [];
-    const server = createServer((socket) => socket.end());
-    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
-    const address = server.address();
-    if (address === null || typeof address === 'string') throw new Error('No TCP listener');
-    const port = address.port;
-    if (!reachable)
-      await new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
+    const listeners = await Promise.all(
+      [proxyReachable, debuggerReachable].map(async (reachable) => {
+        const server = createServer((socket) => socket.end());
+        await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+        const address = server.address();
+        if (address === null || typeof address === 'string') throw new Error('No TCP listener');
+        if (!reachable)
+          await new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
+        return { server, port: address.port };
+      }),
+    );
+    const [proxy, debuggerListener] = listeners;
     try {
       const result = await inspectBrowserCapability(f.paths, f.instanceId, {
         check: true,
         ncl: async (_runtime, args) => {
           expect(args).toEqual(['gws-ea-browser-health']);
-          return { schemaVersion: 1, enabled: true, proxy: { state: 'listening', port } };
+          return {
+            schemaVersion: 1,
+            enabled: true,
+            proxy: { state: 'listening', port: proxy!.port },
+            chrome: { state: 'running', pid: 12345, debuggerPort: debuggerListener!.port },
+          };
         },
         runCommand: async (command) => {
           commands.push(command);
@@ -142,8 +158,18 @@ describe('assistant browser capability', () => {
           });
         },
       });
-      expect(result.isolation.status).toBe(reachable ? 'failed' : 'passed');
-      expect(result.ready).toBe(!reachable);
+      expect(result.isolation).toMatchObject({
+        status: proxyReachable || debuggerReachable ? 'failed' : 'passed',
+        proxy: { status: proxyReachable ? 'failed' : 'passed' },
+        debugger: { status: debuggerReachable ? 'failed' : 'passed' },
+      });
+      expect(result.ready).toBe(!proxyReachable && !debuggerReachable);
+      expect(browserCapabilityLines(result)).toEqual(
+        expect.arrayContaining([
+          `  Proxy isolation: ${proxyReachable ? 'failed' : 'passed'}`,
+          `  Debugger isolation: ${debuggerReachable ? 'failed' : 'passed'}`,
+        ]),
+      );
       const probe = commands.find((command) => command.command === 'docker');
       expect(probe?.args).toEqual(
         expect.arrayContaining([
@@ -154,13 +180,96 @@ describe('assistant browser capability', () => {
         ]),
       );
       expect(probe?.env?.DOCKER_HOST).toBe(f.runtime.docker_endpoint);
-      expect(probe?.args.join(' ')).toContain(String(port));
+      for (const listener of listeners) expect(probe?.args.join(' ')).toContain(String(listener.port));
       expect(probe?.args.join(' ')).not.toContain('host.docker.internal');
     } finally {
-      if (server.listening)
-        await new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
+      for (const { server } of listeners)
+        if (server.listening)
+          await new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
     }
   });
+
+  it('keeps idle Chrome stopped and reports debugger proof as not_run', async () => {
+    const f = await fixture();
+    await enableBrowserCapability(f.paths, f.instanceId);
+    const calls: string[][] = [];
+    const result = await inspectBrowserCapability(f.paths, f.instanceId, {
+      check: true,
+      ncl: async (_runtime, args) => {
+        calls.push([...args]);
+        return {
+          schemaVersion: 1,
+          enabled: true,
+          proxy: { state: 'listening', port: 41444 },
+          chrome: { state: 'stopped' },
+        };
+      },
+      runCommand: async (command) =>
+        command.command === 'docker' ? { stdout: '{"proxy":false}', stderr: '', exitCode: 0 } : chrome(command),
+    });
+    expect(result).toMatchObject({
+      ready: true,
+      isolation: { status: 'passed', proxy: { status: 'passed' }, debugger: { status: 'not_run' } },
+    });
+    expect(calls).toEqual([['gws-ea-browser-health'], ['gws-ea-browser-health']]);
+  });
+
+  it.each([
+    undefined,
+    { state: 'starting' },
+    { state: 'running', pid: 12345 },
+    { state: 'running', pid: 12345, debuggerPort: 0 },
+  ])('does not infer debugger isolation from incomplete running state: %j', async (hostChrome) => {
+    const f = await fixture();
+    await enableBrowserCapability(f.paths, f.instanceId);
+    const result = await inspectBrowserCapability(f.paths, f.instanceId, {
+      check: true,
+      ncl: async () => ({
+        schemaVersion: 1,
+        enabled: true,
+        proxy: { state: 'listening', port: 41444 },
+        chrome: hostChrome,
+      }),
+      runCommand: async (command) =>
+        command.command === 'docker' ? { stdout: '{"proxy":false}', stderr: '', exitCode: 0 } : chrome(command),
+    });
+    expect(result).toMatchObject({ ready: false, isolation: { status: 'unknown', debugger: { status: 'unknown' } } });
+  });
+
+  it.each([
+    { beforeChrome: { state: 'stopped' }, proxy: { state: 'listening', port: 41445 }, chrome: { state: 'stopped' } },
+    {
+      beforeChrome: { state: 'stopped' },
+      proxy: { state: 'listening', port: 41444 },
+      chrome: { state: 'running', pid: 12345, debuggerPort: 41445 },
+    },
+    {
+      beforeChrome: { state: 'running', pid: 12345, debuggerPort: 41445 },
+      proxy: { state: 'listening', port: 41444 },
+      chrome: { state: 'running', pid: 12346, debuggerPort: 41445 },
+    },
+  ])(
+    'invalidates a probe if its target set changes before the second health read: %j',
+    async ({ beforeChrome, ...after }) => {
+      const f = await fixture();
+      await enableBrowserCapability(f.paths, f.instanceId);
+      let reads = 0;
+      const result = await inspectBrowserCapability(f.paths, f.instanceId, {
+        check: true,
+        ncl: async () => ({
+          schemaVersion: 1,
+          enabled: true,
+          ...(reads++ === 0 ? { proxy: { state: 'listening', port: 41444 }, chrome: beforeChrome } : after),
+        }),
+        runCommand: async (command) =>
+          command.command === 'docker'
+            ? { stdout: '{"proxy":false,"debugger":false}', stderr: '', exitCode: 0 }
+            : chrome(command),
+      });
+      expect(reads).toBe(2);
+      expect(result).toMatchObject({ ready: false, isolation: { status: 'unknown' } });
+    },
+  );
 
   it.each(['disabled', 'unavailable'] as const)(
     'does not report a host with %s browser runtime as ready',
@@ -176,7 +285,7 @@ describe('assistant browser capability', () => {
           chrome: { state: state === 'unavailable' ? 'unavailable' : 'stopped' },
         }),
         runCommand: async (command) =>
-          command.command === 'docker' ? { stdout: '{"reachable":false}', stderr: '', exitCode: 0 } : chrome(command),
+          command.command === 'docker' ? { stdout: '{"proxy":false}', stderr: '', exitCode: 0 } : chrome(command),
       });
       expect(result.ready).toBe(false);
       if (state === 'disabled') expect(result.isolation.status).toBe('not_run');
@@ -190,7 +299,12 @@ describe('assistant browser capability', () => {
     await enableBrowserCapability(f.paths, f.instanceId);
     const result = await inspectBrowserCapability(f.paths, f.instanceId, {
       check: true,
-      ncl: async () => ({ schemaVersion: 1, enabled: true, proxy: { state: 'listening', port: 41444 } }),
+      ncl: async () => ({
+        schemaVersion: 1,
+        enabled: true,
+        proxy: { state: 'listening', port: 41444 },
+        chrome: { state: 'stopped' },
+      }),
       runCommand: async (command) =>
         command.command === 'docker' ? { stdout: '', stderr: 'image missing', exitCode: 125 } : chrome(command),
     });

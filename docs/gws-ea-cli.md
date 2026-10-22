@@ -236,7 +236,19 @@ are refused to a release that cannot read it; `--main-only` lifts that.
 ### Browser diagnosis and release acceptance
 
 `gws-ea capabilities check browser --id <full-id>` checks the selected managed
-assistant. Browser request evidence distinguishes an observed website response,
+assistant without starting Chrome. It reports proxy and debugger isolation
+separately on that assistant network's existing host-gateway route. A stopped
+Chrome reports debugger `not_run` and can remain ready when proxy isolation
+passes. Starting Chrome, missing or malformed running-listener metadata, changed
+targets during the check, or an unobservable probe makes isolation `unknown` and
+ready false; a reachable listener fails isolation. This named route check does
+not repeat the multi-route/gateway audit or establish isolation from trusted host
+processes or ordinary Docker bridge containers.
+
+Host Playwright uses the live Chrome child it launched, with ownership-verified
+CDP on an explicit nonzero `127.0.0.1` port. Host health may report that integer
+port; debugger endpoint URLs and browser IDs stay private. Browser request
+evidence distinguishes an observed website response,
 a local rule refusal, a transport failure and a runtime failure; a completed
 navigation onto an Access Denied page is still a challenge. A website denial is
 not proof of its cause or a completed booking. Main reports the practical

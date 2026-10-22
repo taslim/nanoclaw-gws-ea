@@ -6,7 +6,7 @@ import { selectors, type BrowserContext, type Page } from 'playwright-core';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 
 import { prepareChromeProfile, spawnChrome } from './chrome.js';
-import { connectChromePipe, type ChromeConnection } from './connection.js';
+import { connectChrome, createBackgroundPage, type ChromeConnection } from './connection.js';
 import { browserPaths } from './paths.js';
 import { withSignedOutBrowserPage } from './signed-out.js';
 
@@ -20,15 +20,44 @@ describe.skipIf(!chromePath)('native signed-out watch pages', { timeout: 30_000 
     root = await mkdtemp(join(tmpdir(), 'nanoclaw-signed-out-native-'));
     const paths = browserPaths(join(root, 'browser', 'policy.json'));
     await prepareChromeProfile(paths);
-    connection = await connectChromePipe(spawnChrome({ chromePath, paths, proxyUrl: 'http://127.0.0.1:9' }), paths);
+    connection = await connectChrome(await spawnChrome({ chromePath, paths, proxyUrl: 'http://127.0.0.1:9' }), paths);
     await connection.context.addCookies([
-      { name: 'assistant-session', value: 'persistent-only', url: 'https://fixture.example' },
+      {
+        name: 'assistant-session',
+        value: 'persistent-only',
+        url: 'https://fixture.example',
+        expires: Math.floor(Date.now() / 1000) + 3_600,
+      },
     ]);
   });
 
   afterAll(async () => {
     await connection?.close();
     if (root) await rm(root, { recursive: true, force: true });
+  });
+
+  it('retains the Notifications API with denied permission in persistent and signed-out contexts', async () => {
+    const check = async (page: Page): Promise<void> => {
+      await page.route('https://notifications.fixture.example/**', (route) =>
+        route.fulfill({ contentType: 'text/html', body: '<title>Notification policy fixture</title>' }),
+      );
+      await page.goto('https://notifications.fixture.example/');
+      expect(
+        await page.evaluate(`(async () => ({
+        available: typeof Notification,
+        permission: Notification.permission,
+        requested: await Notification.requestPermission(),
+        queried: (await navigator.permissions.query({ name: 'notifications' })).state,
+      }))()`),
+      ).toEqual({ available: 'function', permission: 'denied', requested: 'denied', queried: 'denied' });
+    };
+    const persistent = await createBackgroundPage(connection);
+    try {
+      await check(persistent);
+    } finally {
+      await persistent.close();
+    }
+    await withSignedOutBrowserPage(connection, check);
   });
 
   it('uses an isolated native context and closes it after returning without touching the persistent account', async () => {

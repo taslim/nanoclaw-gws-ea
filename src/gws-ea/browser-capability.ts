@@ -32,6 +32,11 @@ export const BROWSER_CAPABILITY = {
   summary: 'Run quiet host Chrome errands for one assistant.',
 } as const;
 
+interface BrowserIsolationCheck {
+  readonly status: 'not_run' | 'passed' | 'failed' | 'unknown';
+  readonly reason: string | null;
+}
+
 export interface BrowserCapabilityObservation {
   readonly name: 'browser';
   readonly scope: 'assistant';
@@ -47,7 +52,10 @@ export interface BrowserCapabilityObservation {
     readonly version: string | null;
     readonly reason: string | null;
   };
-  readonly isolation: { readonly status: 'not_run' | 'passed' | 'failed' | 'unknown'; readonly reason: string | null };
+  readonly isolation: BrowserIsolationCheck & {
+    readonly proxy: BrowserIsolationCheck;
+    readonly debugger: BrowserIsolationCheck;
+  };
   readonly ready: boolean;
   /** Who the policy grants the browser; null while it cannot be read. */
   readonly access: BrowserAccessView | null;
@@ -313,6 +321,42 @@ export async function disableBrowserCapability(
   });
 }
 
+function validListenerPort(value: unknown): value is number {
+  return typeof value === 'number' && Number.isInteger(value) && value > 0 && value <= 65_535;
+}
+
+function observedListeners(health: unknown) {
+  if (
+    !isRecord(health) ||
+    health.schemaVersion !== 1 ||
+    typeof health.enabled !== 'boolean' ||
+    !isRecord(health.proxy) ||
+    (health.proxy.state !== 'listening' && health.proxy.state !== 'stopped')
+  )
+    throw new Error('Invalid browser health');
+  const chrome = isRecord(health.chrome) ? health.chrome : undefined;
+  return {
+    enabled: health.enabled,
+    proxyState: health.proxy.state,
+    proxyPort: validListenerPort(health.proxy.port) ? health.proxy.port : undefined,
+    chromeState: typeof chrome?.state === 'string' ? chrome.state : 'unknown',
+    chromePid:
+      typeof chrome?.pid === 'number' && Number.isSafeInteger(chrome.pid) && chrome.pid > 0 ? chrome.pid : undefined,
+    debuggerPort: validListenerPort(chrome?.debuggerPort) ? chrome.debuggerPort : undefined,
+  };
+}
+
+function aggregateIsolation(
+  checks: Record<'proxy' | 'debugger', BrowserIsolationCheck>,
+): BrowserCapabilityObservation['isolation'] {
+  const unresolved =
+    [checks.proxy, checks.debugger].find((check) => check.status === 'failed') ??
+    [checks.proxy, checks.debugger].find((check) => check.status === 'unknown');
+  const overall: BrowserIsolationCheck =
+    unresolved ?? (checks.proxy.status === 'passed' ? { status: 'passed', reason: null } : checks.proxy);
+  return { ...overall, ...checks };
+}
+
 /** Bounded read-only observation: no locks, policy writes, host reconciliation, downloads or repairs. */
 /* eslint-disable no-catch-all/no-catch-all -- Optional observations preserve unavailable/unknown results; raw failures must never reveal credentials. */
 export async function inspectBrowserCapability(
@@ -334,12 +378,11 @@ export async function inspectBrowserCapability(
     version: null,
     reason: null,
   };
-  let isolation: BrowserCapabilityObservation['isolation'] = {
+  const notRun: BrowserIsolationCheck = {
     status: 'not_run',
-    reason: options.check
-      ? 'The browser proxy is not running.'
-      : 'Run capabilities check browser to observe the live proxy.',
+    reason: 'Run capabilities check browser to observe active host listeners.',
   };
+  const checks: Record<'proxy' | 'debugger', BrowserIsolationCheck> = { proxy: notRun, debugger: notRun };
   const run = options.runCommand ?? runSanitizedCommandOutcome;
   if (options.check) {
     try {
@@ -361,86 +404,109 @@ export async function inspectBrowserCapability(
         reason: 'Google Chrome is missing or cannot report its version at the configured absolute path.',
       };
     }
-    let port: number | undefined;
+    const ncl = options.ncl ?? runInstanceNclJson;
     try {
-      const health = await (options.ncl ?? runInstanceNclJson)(runtime, ['gws-ea-browser-health']);
-      if (
-        !isRecord(health) ||
-        health.schemaVersion !== 1 ||
-        typeof health.enabled !== 'boolean' ||
-        !isRecord(health.proxy) ||
-        !['listening', 'stopped'].includes(String(health.proxy.state))
-      )
-        throw new Error('Invalid browser health');
-      if (!health.enabled) {
-        isolation = {
-          status: 'not_run',
-          reason:
-            'The running host has not enabled this browser capability. Wait for policy reconciliation and check again.',
-        };
-      } else if (health.proxy.state === 'listening') {
-        if (
-          !Number.isSafeInteger(health.proxy.port) ||
-          Number(health.proxy.port) < 1 ||
-          Number(health.proxy.port) > 65535
-        )
-          throw new Error('Invalid proxy port');
-        port = Number(health.proxy.port);
-      }
-      if (isRecord(health.chrome) && health.chrome.state === 'unavailable') {
+      const snapshot = observedListeners(await ncl(runtime, ['gws-ea-browser-health']));
+      if (snapshot.chromeState === 'unavailable')
         chrome = {
           ...chrome,
           status: 'unavailable',
           reason:
             'The running host could not launch its owned Chrome. Check its browser diagnostics before trying another errand.',
         };
+      if (!snapshot.enabled) {
+        checks.proxy = checks.debugger = {
+          status: 'not_run',
+          reason:
+            'The running host has not enabled this browser capability. Wait for policy reconciliation and check again.',
+        };
+      } else {
+        const ports: Partial<Record<'proxy' | 'debugger', number>> = {};
+        checks.proxy = { status: 'not_run', reason: 'The browser proxy is not running.' };
+        if (snapshot.proxyState === 'listening') {
+          checks.proxy = { status: 'unknown', reason: 'The active browser proxy has not been verified.' };
+          if (snapshot.proxyPort !== undefined) ports.proxy = snapshot.proxyPort;
+        }
+        checks.debugger =
+          snapshot.chromeState === 'stopped'
+            ? { status: 'not_run', reason: 'Chrome is stopped; debugger isolation has not been tested.' }
+            : { status: 'unknown', reason: 'The host could not identify an admitted running Chrome debugger.' };
+        if (
+          snapshot.chromeState === 'running' &&
+          snapshot.chromePid !== undefined &&
+          snapshot.debuggerPort !== undefined
+        )
+          ports.debugger = snapshot.debuggerPort;
+        if (Object.keys(ports).length) {
+          try {
+            const script = `const net=require('node:net');const ports=${JSON.stringify(ports)};
+Promise.all(Object.entries(ports).map(([name,port])=>new Promise((resolve,reject)=>{
+  const socket=net.connect({host:'gws-ea-browser-host',port});let done=false;
+  function finish(reachable){if(done)return;done=true;socket.destroy();resolve([name,reachable]);}
+  socket.setTimeout(4000);socket.once('connect',()=>finish(true));socket.once('timeout',()=>finish(false));
+  socket.once('error',error=>{if(['ECONNREFUSED','EHOSTUNREACH','ENETUNREACH','ETIMEDOUT'].includes(error.code))finish(false);else{socket.destroy();reject(new Error('Probe could not be evaluated'));}});
+}))).then(results=>console.log(JSON.stringify(Object.fromEntries(results)))).catch(()=>{console.error('Isolation probe failed');process.exitCode=1;});`;
+            const result = await run({
+              command: 'docker',
+              args: [
+                'run',
+                '--rm',
+                '--pull=never',
+                '--network',
+                runtime.agent_egress_network,
+                '--add-host=gws-ea-browser-host:host-gateway',
+                '--entrypoint',
+                'node',
+                `${getInstallScopedNames(runtime.install_id).containerImageBase}:r-${reservation.deployed_commit.slice(0, 8)}`,
+                '--eval',
+                script,
+              ],
+              cwd: runtime.instance_root,
+              env: buildToolEnvironment(process.env, {
+                DOCKER_HOST: runtime.docker_endpoint,
+                HOME: runtime.home_directory,
+              }),
+              timeoutMs: 20_000,
+              outputLimitBytes: 4096,
+            });
+            const probe: unknown = result.exitCode === 0 ? JSON.parse(result.stdout) : undefined;
+            if (!isRecord(probe)) throw new Error('Isolation probe failed');
+            for (const name of ['proxy', 'debugger'] as const) {
+              if (ports[name] === undefined) continue;
+              const reachable = probe[name];
+              if (typeof reachable !== 'boolean') throw new Error('Isolation probe incomplete');
+              checks[name] = reachable
+                ? {
+                    status: 'failed',
+                    reason: `An assistant-network container can reach the host ${name === 'proxy' ? 'browser proxy' : 'Chrome debugger'} through the host gateway.`,
+                  }
+                : { status: 'passed', reason: null };
+            }
+          } catch {
+            for (const name of ['proxy', 'debugger'] as const)
+              if (ports[name] !== undefined)
+                checks[name] = {
+                  status: 'unknown',
+                  reason:
+                    'The assistant-network host-gateway TCP probe could not run. Check Docker, the existing release image, and the assistant network.',
+                };
+          }
+          const after = observedListeners(await ncl(runtime, ['gws-ea-browser-health']));
+          if (JSON.stringify(after) !== JSON.stringify(snapshot))
+            checks.proxy = checks.debugger = {
+              status: 'unknown',
+              reason: 'The host browser listeners changed during the check. Run the check again.',
+            };
+        }
       }
-    } catch (_error) {
-      isolation = {
-        status: 'not_run',
+    } catch {
+      checks.proxy = checks.debugger = {
+        status: 'unknown',
         reason: 'The running host browser health could not be observed. Start the assistant and check again.',
       };
     }
-    if (port !== undefined) {
-      try {
-        const script = `const net=require('node:net');const socket=net.connect({host:'gws-ea-browser-host',port:${port}});let done=false;function finish(reachable){if(done)return;done=true;socket.destroy();console.log(JSON.stringify({reachable}));}socket.setTimeout(4000);socket.on('connect',()=>finish(true));socket.on('timeout',()=>finish(false));socket.on('error',e=>{if(['ECONNREFUSED','EHOSTUNREACH','ENETUNREACH','ETIMEDOUT'].includes(e.code))finish(false);else{console.error('Probe connection could not be evaluated');process.exitCode=1;socket.destroy();}});`;
-        const result = await run({
-          command: 'docker',
-          args: [
-            'run',
-            '--rm',
-            '--pull=never',
-            '--network',
-            runtime.agent_egress_network,
-            '--add-host=gws-ea-browser-host:host-gateway',
-            '--entrypoint',
-            'node',
-            `${getInstallScopedNames(runtime.install_id).containerImageBase}:r-${reservation.deployed_commit.slice(0, 8)}`,
-            '--eval',
-            script,
-          ],
-          cwd: runtime.instance_root,
-          env: buildToolEnvironment(process.env, {
-            DOCKER_HOST: runtime.docker_endpoint,
-            HOME: runtime.home_directory,
-          }),
-          timeoutMs: 20_000,
-          outputLimitBytes: 4096,
-        });
-        const probe: unknown = result.exitCode === 0 ? JSON.parse(result.stdout) : undefined;
-        if (!isRecord(probe) || typeof probe.reachable !== 'boolean') throw new Error('Isolation probe failed');
-        isolation = probe.reachable
-          ? { status: 'failed', reason: 'An agent-network container can reach the host browser proxy.' }
-          : { status: 'passed', reason: null };
-      } catch (_error) {
-        isolation = {
-          status: 'unknown',
-          reason:
-            'The agent-network isolation probe could not run. Check Docker, the existing release image, and the assistant network.',
-        };
-      }
-    }
   }
+  const isolation = aggregateIsolation(checks);
   return {
     ...BROWSER_CAPABILITY,
     instance_id: instanceId,
@@ -525,7 +591,16 @@ export function browserCapabilityLines(capability: BrowserCapabilityObservation)
     ...(capability.access === null ? [] : [`  Access: ${browserAccessLine(capability.access)}`]),
     `  Chrome: ${capability.chrome.status}; path: ${capability.chrome.path}; version: ${capability.chrome.version ?? 'not checked'}`,
     `  Isolation: ${capability.isolation.status}`,
-    ...[capability.chrome.reason, capability.isolation.reason]
+    `  Proxy isolation: ${capability.isolation.proxy.status}`,
+    `  Debugger isolation: ${capability.isolation.debugger.status}`,
+    ...[
+      ...new Set([
+        capability.chrome.reason,
+        capability.isolation.reason,
+        capability.isolation.proxy.reason,
+        capability.isolation.debugger.reason,
+      ]),
+    ]
       .filter((reason): reason is string => reason !== null)
       .map((reason) => `  ${reason}`),
     `Observed: ${formatLocalTime(capability.observed_at, Intl.DateTimeFormat().resolvedOptions().timeZone)}`,

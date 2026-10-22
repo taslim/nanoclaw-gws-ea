@@ -281,7 +281,7 @@ onHostShutdown(async () => {
 
 register({
   name: 'gws-ea-browser-health',
-  description: 'Report host browser policy, proxy port and owned Chrome state.',
+  description: 'Report host browser policy, active listener ports and owned Chrome state.',
   access: 'hidden',
   hostOnly: true,
   parseArgs(raw) {

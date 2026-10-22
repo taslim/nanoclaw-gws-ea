@@ -1,4 +1,4 @@
-/** Real Chrome pipe, background windows and TLS origins; all traffic terminates in this fixture. */
+/** Real owned Chrome, background windows and TLS origins; all traffic terminates in this fixture. */
 import { execFileSync } from 'node:child_process';
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { createServer as createHttpServer, type Server as HttpServer } from 'node:http';
@@ -11,7 +11,7 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } 
 import { closeDb, getDb, initSqliteTestDb } from '../../db/connection.js';
 import { prepareAuthenticationIsolation } from './authentication-submit.js';
 import { prepareChromeProfile, spawnChrome } from './chrome.js';
-import { connectChromePipe, type ChromeConnection } from './connection.js';
+import { connectChrome, type ChromeConnection } from './connection.js';
 import { executeBrowserBatch } from './executor.js';
 
 import { bindBrowserSecretField, fillBoundBrowserSecret } from './fill.js';
@@ -141,8 +141,8 @@ describe.skipIf(!chromePath)('native host secret fill', { timeout: 30_000 }, () 
     if (!proxyAddress || typeof proxyAddress === 'string') throw new Error('Proxy fixture did not bind');
     const paths = browserPaths(join(root, 'browser', 'policy.json'));
     await prepareChromeProfile(paths);
-    connection = await connectChromePipe(
-      spawnChrome({ chromePath, paths, proxyUrl: `http://127.0.0.1:${proxyAddress.port}` }),
+    connection = await connectChrome(
+      await spawnChrome({ chromePath, paths, proxyUrl: `http://127.0.0.1:${proxyAddress.port}` }),
       paths,
     );
     await prepareAuthenticationIsolation(connection.context);
