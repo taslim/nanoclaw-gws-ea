@@ -2191,7 +2191,7 @@ document.getElementById('updated').addEventListener('click', () => location.assi
     });
     expect(await read('#commit')).toMatchObject({
       status: 'facts_incomplete',
-      missing: ['a commit control the host can find again'],
+      missing: ["the checkout's place-order button"],
     });
     expect(posts()).toEqual([]);
   });

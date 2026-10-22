@@ -263,10 +263,8 @@ describe('a purchase with no page proof', () => {
     );
     // A delegator other than main reads no matter state, so the id it is pointed to is the one its notice carried.
     await expect(
-      recordPurchaseOutcome(
-        { thread: job.thread_id, attempt_id: id, outcome: 'unknown', source: 'email' },
-        main,
-        () => new BrowserQueue(new BrowserStore(), runtime),
+      recordPurchaseOutcome({ thread: job.thread_id, attempt_id: id, outcome: 'unknown', source: 'email' }, main, () =>
+        createBrowserQueue(new BrowserStore(), runtime),
       ),
     ).rejects.toThrow(
       "record_purchase_outcome needs the job thread, the attempt id the host's unconfirmed notice gave, placed or not_placed, and the source: email or principal.",
@@ -405,7 +403,7 @@ describe('main recording an unconfirmed purchase', () => {
     await recordPurchaseOutcome(
       { ...fields, action: 'record_purchase_outcome', requestId: 'outcome-replayed' },
       main,
-      () => new BrowserQueue(new BrowserStore(), runtime),
+      () => createBrowserQueue(new BrowserStore(), runtime),
     );
     expect(await getDb().get('SELECT notified_at FROM gws_ea_browser_incidents WHERE job_id = ?', job.id)).toEqual({
       notified_at: expect.any(String),

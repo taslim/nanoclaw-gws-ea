@@ -45,7 +45,7 @@ const REVIEWED: Readonly<Record<string, Review>> = {
     reason:
       "the possible duplicate's alarm says what was recorded first and what to do (KTD15); the thread is the recorder's own input",
   },
-  'gws-ea-browser/purchase-outcome.ts notifyUnconfirmedPurchase: kind': {
+  'gws-ea-browser/notices.ts notifyUnconfirmedPurchase: kind': {
     kind: 'host-only',
     reason: 'the log line written while nobody can be told yet',
   },
@@ -61,10 +61,12 @@ const REVIEWED: Readonly<Record<string, Review>> = {
     kind: 'read-whole',
     reason: 'a browser notice: its JSON is the chat text the browser reads',
   },
-  'gws-ea-browser/queue.ts frame: code': {
-    kind: 'host-only',
-    reason: "a refusal frame: the code is for the runner and host; the agent reads the refusal's message",
-  },
+  'gws-ea-browser/queue.ts frame: ...(diagnostics && diagnostics.events.length ? { metadata: { diagnostics } } : {}), code':
+    {
+      kind: 'rendered',
+      reason:
+        'the runner appends the code and safe diagnostics as JSON to the refusal text when metadata exists; otherwise the code serves the host',
+    },
   'gws-ea-browser/watches.ts termsOverBounds: exposure, max_total, reason, status': {
     kind: 'rendered',
     reason: 'the exposure, the maximum and the terms as the host read them are written into the sentence (U11)',

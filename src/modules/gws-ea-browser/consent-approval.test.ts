@@ -369,11 +369,11 @@ describe('asking the principal for consent', () => {
       id,
     );
     await queue.stop();
-    await queue.start();
+    await recoverAndStartBrowserQueue(queue);
     expect(await credentialPhase(attempt)).toBe('unknown');
     expect(await notices()).toHaveLength(1);
     await queue.stop();
-    await queue.start();
+    await recoverAndStartBrowserQueue(queue);
     expect(await notices()).toHaveLength(1);
   });
 

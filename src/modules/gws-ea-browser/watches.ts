@@ -33,6 +33,7 @@ import { cardEventSpan, ERRAND_ORIGIN_LINE, SELLER_TEXT_LIMIT } from './cards.js
 import { browserSite } from './leases.js';
 import { amountMinor, formatMoney } from './fingerprint.js';
 import { merchantSignatures } from './merchant-signatures.js';
+import type { ReservationPolicy } from './merchant-contract.js';
 import { readBrowserRef, type BrowserRef } from './observe.js';
 import { readHostBrowserPolicy } from './access.js';
 import { executeRecipe } from './recipes.js';

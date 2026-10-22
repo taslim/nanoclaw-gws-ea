@@ -1227,7 +1227,7 @@ describe('the notice after an approved purchase that went no further', () => {
     await store.answer(id, { id: 'notice-commit', ok: true, data }, new Date().toISOString());
     const request = await store.request(id);
     if (!request) throw new Error('Expected the commit request');
-    await new BrowserQueue(store, runtime).deliver(request);
+    await new BrowserQueue(store, runtime, actions, browserQueueFollowUps).deliver(request);
     const inbound = new Database(inboundDbPath(session.agent_group_id, session.id), { readonly: true });
     try {
       const rows = inbound.prepare("SELECT content FROM messages_in WHERE id LIKE 'browser-commit-%'").all() as Array<{

@@ -1,3 +1,4 @@
+import { formatLocalTimeWithZone } from '../../timezone.js';
 import { claimRegionWatchCommit } from './watch-state.js';
 import { createHash } from 'node:crypto';
 import type { ElementHandle, Page } from 'playwright-core';
@@ -21,7 +22,6 @@ import {
   type SpendingAuthority,
 } from './authority.js';
 import {
-  cardTime,
   detachPurchaseCards,
   ERRAND_ORIGIN_LINE,
   finishPurchaseCardWithdrawals,
@@ -1183,7 +1183,7 @@ async function purchaseCommitNotice(
   if (authority.expires_at <= new Date().toISOString())
     return told(`${none}: the principal's approval expired before the checkout could go through. Report it to main.`);
   const holds = async (): Promise<string> =>
-    `The principal's approval holds until it expires, ${cardTime(authority.expires_at, await principalClock())}.`;
+    `The principal's approval holds until it expires, ${formatLocalTimeWithZone(authority.expires_at, await principalClock())}.`;
   if (
     unspent &&
     (data.status === 'checkout_lapsed' ||
