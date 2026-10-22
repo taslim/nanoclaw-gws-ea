@@ -260,7 +260,7 @@ export async function detachPurchaseCards(jobId: string, reason: PurchaseCard['s
 export async function finishPurchaseCardWithdrawals(cards: readonly PendingApproval[], message: string): Promise<void> {
   for (const card of cards) await finishApprovalWithdrawal(card, message);
 }
-export async function notifyPurchaseCard(cardId: string, outcome: string): Promise<void> {
+export async function notifyPurchaseCard(cardId: string, outcome: string, reason?: string): Promise<void> {
   const db = getDb();
   const card = await db.get<PurchaseCard>('SELECT * FROM gws_ea_browser_purchase_cards WHERE id = ?', cardId);
   if (!card || card.notified_at) return;
@@ -280,7 +280,9 @@ export async function notifyPurchaseCard(cardId: string, outcome: string): Promi
         card_id: card.id,
         status: outcome,
         ...(outcome === 'rejected'
-          ? { message: 'The principal declined. Remove the cart items you added; do not try another purchase path.' }
+          ? {
+              message: `The principal declined${reason ? `: "${reason}"` : ''}. Remove the cart items you added; do not try another purchase path.`,
+            }
           : {}),
       }),
     );

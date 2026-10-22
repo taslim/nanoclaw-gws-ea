@@ -12,7 +12,7 @@ import { isRecord } from '../../gws-ea/validation.js';
 import type { ResponseFrame } from '../../cli/frame.js';
 import { requestWake } from '../../request-wake.js';
 import { registerApprovalHandler, requestApproval } from '../approvals/index.js';
-import { registerApprovalResolvedHandler } from '../approvals/primitive.js';
+import { registerApprovalResolvedHandler, type ApprovalResolvedEvent } from '../approvals/primitive.js';
 import { isVerifiedPrincipalUser, principalApproverUserId } from '../gws-ea-profile/db.js';
 import {
   PurchaseAuthorityError,
@@ -482,11 +482,11 @@ registerApprovalHandler(
     // Acceptance is quick and never awaits a browser operation. Early host replay persists only.
     if (authorityId && commitsReady && getPurchaseQueue) await enqueuePurchaseCommit(getPurchaseQueue(), authorityId);
   },
-  // A no reaches the job once, as the card's outcome from the resolved callback below.
-  { restartSafe: true, rejectionNote: () => null },
+  // A decline settles its outcome durably before the approval can be removed.
+  { restartSafe: true, rejectionNote: () => null, finalizeRejection: settlePurchaseCardOutcome },
 );
 
-registerApprovalResolvedHandler(async ({ approval, outcome }) => {
+async function settlePurchaseCardOutcome({ approval, outcome, reason }: ApprovalResolvedEvent): Promise<void> {
   if (approval.action !== PURCHASE_APPROVAL || outcome === 'approve') return;
   const payload = JSON.parse(approval.payload) as { cardId?: string };
   if (!payload.cardId) return;
@@ -496,7 +496,7 @@ registerApprovalResolvedHandler(async ({ approval, outcome }) => {
     status,
     payload.cardId,
   );
-  await notifyPurchaseCard(payload.cardId, status);
+  await notifyPurchaseCard(payload.cardId, status, reason);
   const card = await getDb().get<PurchaseCard>(
     'SELECT * FROM gws_ea_browser_purchase_cards WHERE id = ?',
     payload.cardId,
@@ -505,6 +505,10 @@ registerApprovalResolvedHandler(async ({ approval, outcome }) => {
     const queue = getPurchaseQueue();
     await queue.wakeWaiters(await queue.leases.releaseUnheldPurchases(card.job_id), `card-${card.id}-${status}`);
   }
+}
+
+registerApprovalResolvedHandler(async (event) => {
+  if (event.outcome !== 'reject') await settlePurchaseCardOutcome(event);
 });
 
 /**
