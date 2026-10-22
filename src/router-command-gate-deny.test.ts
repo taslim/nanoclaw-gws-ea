@@ -167,6 +167,8 @@ describe('command-gate denial', () => {
         JSON.stringify({ text: 'Permission denied: /clear requires admin access.' }),
         undefined,
         'testchat',
+        undefined,
+        undefined,
       ],
     ]);
     const counts = outboundRowCounts();

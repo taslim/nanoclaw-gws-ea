@@ -273,6 +273,8 @@ it('withdraws its own partially applied booking when the calendar reports failur
 });
 it('serializes real email and chat bookings so only one can take the same free slot', async () => {
   vi.useRealTimers();
+  vi.useFakeTimers({ toFake: ['Date'] });
+  vi.setSystemTime(new Date('2026-10-18T12:00:00Z'));
   const insert = calendar.insertEvent.bind(calendar);
   vi.spyOn(calendar, 'insertEvent').mockImplementation(async (...args) => {
     // Google has not applied the first write yet while another source checks availability.
