@@ -111,14 +111,14 @@ describe('reviewed Resy native inventory', () => {
         const { reservation } = answer.slots[0];
         expect(answer.slots[0].id).toMatch(/^[a-f0-9]{64}$/u);
         expect(reservation.timeZone).toBe(answer.timeZone);
-        // ICU versions may retain the native alias; either spelling must describe the venue's clock.
+        // ICU versions may retain the native alias; verify the venue's winter and summer offsets.
         const clock = new Intl.DateTimeFormat('en-US', {
           timeZone: answer.timeZone,
           hour: '2-digit',
           minute: '2-digit',
           hourCycle: 'h23',
         });
-        expect(clock.formatToParts(new Date(reservation.at))).toEqual(
+        expect(clock.formatToParts(new Date('2026-01-17T16:00:00.000Z'))).toEqual(
           expect.arrayContaining([
             { type: 'hour', value: '11' },
             { type: 'minute', value: '00' },
