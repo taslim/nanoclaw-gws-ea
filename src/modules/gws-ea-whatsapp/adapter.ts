@@ -13,7 +13,6 @@ import { pino } from 'pino';
 import {
   ChannelNotConnectedError,
   type ChannelAdapter,
-  type ChannelDefaults,
   type ChannelSetup,
   type OutboundMessage,
 } from '../../channels/adapter.js';
@@ -24,6 +23,7 @@ import { OutboundRefusedError } from '../../delivery.js';
 import { checkOutbound } from '../gws-ea-privacy/outbound.js';
 import { SqliteStateAdapter } from '../../state-sqlite.js';
 import { WhatsAppAuthStore } from './auth-store.js';
+import { WHATSAPP_DEFAULTS } from './defaults.js';
 import { WhatsAppContacts, type WhatsAppOutreachRequest } from './contacts.js';
 import { createWhatsAppOutreach, type WhatsAppGroupOutreach } from './outreach.js';
 import { createWhatsAppGroupEvents, type WhatsAppGroup } from './events.js';
@@ -102,11 +102,6 @@ export interface WhatsAppAdapter extends ChannelAdapter {
     request: WhatsAppOutreachRequest,
   ): Promise<'added' | 'invited'>;
 }
-export const WHATSAPP_DEFAULTS: ChannelDefaults = {
-  dm: { engageMode: 'pattern', engagePattern: '.', threads: false, unknownSenderPolicy: 'strict' },
-  group: { engageMode: 'mention', threads: false, unknownSenderPolicy: 'strict' },
-  mentions: 'platform',
-};
 const logger = pino({ level: 'silent' });
 
 export function createWhatsAppAdapter(options: WhatsAppAdapterOptions): WhatsAppAdapter {

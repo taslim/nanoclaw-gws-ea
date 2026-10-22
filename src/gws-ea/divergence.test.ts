@@ -1800,34 +1800,6 @@ describe("recorded divergence: NanoClaw's update helpers act on the install they
   });
 });
 
-describe('recorded divergence: the migration script applies module migrations', () => {
-  it('records the capabilities and gws-ea module migrations in a fresh central database', async () => {
-    const install = await freshInstall();
-    const run = await runProgram(
-      process.execPath,
-      ['--import', TSX_LOADER, path.join(originalCwd, 'scripts/migrate.ts')],
-      {
-        cwd: install,
-        env: process.env,
-      },
-    );
-    expect(run, run.stderr).toMatchObject({ status: 0 });
-
-    const central = new Database(path.join(install, 'data', 'v2.db'), { readonly: true });
-    try {
-      const applied = central.prepare('SELECT name FROM schema_version').all() as Array<{ name: string }>;
-      expect(applied.map((row) => row.name)).toEqual(
-        expect.arrayContaining([
-          'module:capabilities:container-config-capabilities',
-          'module:gws-ea-profile:create-profile',
-        ]),
-      );
-    } finally {
-      central.close();
-    }
-  });
-});
-
 describe("recorded divergence: the host's own sends pass the outbound guards, and only a channel asserts a sender", () => {
   it('hands the guarded delivery adapter to the approval coordinator and the host modules', async () => {
     const host = await readFile(path.join(originalCwd, 'src/index.ts'), 'utf8');

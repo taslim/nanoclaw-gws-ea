@@ -3,7 +3,8 @@ import fs from 'node:fs';
 
 import { getChannelAdapterExact, registerChannelAdapter } from '../../channels/channel-registry.js';
 import { registerPostDeliveryHook } from '../../delivery.js';
-import { createWhatsAppAdapter, WHATSAPP_DEFAULTS, type WhatsAppAdapter } from './adapter.js';
+import type { WhatsAppAdapter } from './adapter.js';
+import { WHATSAPP_DEFAULTS } from './defaults.js';
 import { readWhatsAppLink, whatsappDirectory } from './paths.js';
 import { whatsAppLinking } from './link.js';
 
@@ -18,6 +19,7 @@ registerChannelAdapter('whatsapp', {
     if (!directory || !fs.existsSync(directory)) return null;
     await whatsAppLinking().reconcile();
     if (!(await readWhatsAppLink(directory))) return null;
+    const { createWhatsAppAdapter } = await import('./adapter.js');
     return createWhatsAppAdapter({ directory });
   },
 });
@@ -25,14 +27,8 @@ registerPostDeliveryHook((message) => {
   if (message.channelType === 'whatsapp') activeWhatsAppAdapter()?.completeDelivery(message.id);
 });
 
-export {
-  createWhatsAppAdapter,
-  WHATSAPP_DEFAULTS,
-  resolveWaWebVersion,
-  type WhatsAppAdapter,
-  type WhatsAppAdapterOptions,
-  type WhatsAppSocket,
-} from './adapter.js';
+export { WHATSAPP_DEFAULTS } from './defaults.js';
+export type { WhatsAppAdapter, WhatsAppAdapterOptions, WhatsAppSocket } from './adapter.js';
 export {
   readWhatsAppLink,
   writeWhatsAppLink,
