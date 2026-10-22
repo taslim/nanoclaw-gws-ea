@@ -1,3 +1,4 @@
+import { log } from '../../log.js';
 import { getDb } from '../../db/connection.js';
 import { isContainerRunning, killContainer } from '../../container-runner.js';
 import { getMessagingGroup } from '../../db/messaging-groups.js';
@@ -178,11 +179,17 @@ export async function expireAskingChats(now = Date.now()): Promise<void> {
     "SELECT messaging_group_id FROM gws_ea_chats WHERE state = 'asking' AND created_at <= ?",
     new Date(now - ASKING_LIFETIME_MS).toISOString(),
   );
-  for (const chat of due)
-    await inChatTail(chat.messaging_group_id, async () => {
-      if ((await getChat(chat.messaging_group_id))?.state === 'asking')
-        await closeChat(chat.messaging_group_id, 'declined');
-    });
+  for (const chat of due) {
+    try {
+      await inChatTail(chat.messaging_group_id, async () => {
+        if ((await getChat(chat.messaging_group_id))?.state === 'asking')
+          await closeChat(chat.messaging_group_id, 'declined');
+      });
+      // eslint-disable-next-line no-catch-all/no-catch-all -- each expired chat is durable and must not starve other expirations.
+    } catch (error) {
+      log.error('Chat expiry will resume', { chat: chat.messaging_group_id, error });
+    }
+  }
 }
 
 /** A checked main handoff places a new private conversation. Caller owns the tail and transaction. */

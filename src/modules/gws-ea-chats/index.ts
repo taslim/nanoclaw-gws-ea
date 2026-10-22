@@ -1,3 +1,4 @@
+import { log } from '../../log.js';
 import { setMembershipHandler } from '../../channels/chat-sdk-bridge.js';
 import { getDb } from '../../db/connection.js';
 import { registerMigration } from '../../db/migrations/index.js';
@@ -81,8 +82,14 @@ registerSessionAdmissionPolicy('gws-ea-chats:context', async ({ key }) => {
   }
 });
 registerChatLifecycleTask('gws-ea-chats:handoffs', async () => {
-  for (const chat of await listChats())
-    await inChatConversation(chat.messaging_group_id, () => flushChatHandoffs(chat.messaging_group_id));
+  for (const chat of await listChats()) {
+    try {
+      await inChatConversation(chat.messaging_group_id, () => flushChatHandoffs(chat.messaging_group_id));
+      // eslint-disable-next-line no-catch-all/no-catch-all -- pending handoffs are durable; one unavailable mailbox must not starve other chats.
+    } catch (error) {
+      log.error('Chat handoffs will resume', { chat: chat.messaging_group_id, error });
+    }
+  }
 });
 registerMessageInterceptor(interceptChatMessage);
 registerInboundDelay((_event, session) => chatInboundDelay(session));

@@ -20,7 +20,7 @@ import { updateContainerConfigJson } from '../../db/container-configs.js';
 import { closeDb, createMessagingGroup, getDb, initTestDb, runMigrations } from '../../db/index.js';
 import '../gws-ea-browser/guidance.js';
 import { hasBrowserAccess } from '../gws-ea-browser/access.js';
-import { ensureExternalChatGroup, reconcileChatAgents } from './index.js';
+import { ensureExternalChatGroup, reconcileChatAgents, resumeRetiringJobAgents } from './index.js';
 import { activateJobAgent, createJobAgent } from './jobs.js';
 import { retireJobAgent } from './retire.js';
 
@@ -189,4 +189,23 @@ it('reports a retired job healthy only while its gateway has no usable credentia
   });
   agents.delete(retired);
   expect(await health()).toMatchObject({ jobs: [{ state: 'retired', health: { status: 'ok', reason: null } }] });
+});
+
+it('continues retiring independent jobs when one gateway cleanup is unavailable', async () => {
+  const broken = await job('broken-retirement');
+  const healthy = await job('healthy-retirement');
+  await getDb().run("UPDATE gws_ea_job_agents SET state='retiring'");
+  unavailable = broken;
+  await expect(resumeRetiringJobAgents()).resolves.toBeUndefined();
+  expect(await getDb().get('SELECT state FROM gws_ea_job_agents WHERE agent_group_id=?', broken)).toEqual({
+    state: 'retiring',
+  });
+  expect(await getDb().get('SELECT state FROM gws_ea_job_agents WHERE agent_group_id=?', healthy)).toEqual({
+    state: 'retired',
+  });
+  unavailable = undefined;
+  await resumeRetiringJobAgents();
+  expect(await getDb().get('SELECT state FROM gws_ea_job_agents WHERE agent_group_id=?', broken)).toEqual({
+    state: 'retired',
+  });
 });

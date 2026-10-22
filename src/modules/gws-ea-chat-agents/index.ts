@@ -81,9 +81,11 @@ export async function resumeRetiringJobAgents(): Promise<void> {
     if (job.state !== 'retiring' && !unserved) continue;
     try {
       await retireJobAgent(job.agent_group_id);
+      // eslint-disable-next-line no-catch-all/no-catch-all -- retiring jobs retain their pending state; one failed cleanup must not starve its peers.
     } catch (error) {
-      if (!(error instanceof GwsEaError) || error.code !== 'instance_busy') throw error;
-      log.info('Job retirement waits for the current instance operation', { agentGroupId: job.agent_group_id });
+      if (error instanceof GwsEaError && error.code === 'instance_busy')
+        log.info('Job retirement waits for the current instance operation', { agentGroupId: job.agent_group_id });
+      else log.error('Job retirement will resume', { agentGroupId: job.agent_group_id, error });
     }
   }
 }
