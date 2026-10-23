@@ -7,10 +7,10 @@ Each area of a sync gets one read-only analysis agent, launched together. Fill e
 ```
 Repo: <operator checkout path> — GWS-EA, an opinionated Google Workspace
 executive-assistant product built as a downstream fork of NanoClaw. Branch
-`rebuild-v2` (<sha>) is our integration line. `upstream/<ref>` (<sha>,
+`<dogfood branch>` (<sha>) is our integration line. `upstream/<ref>` (<sha>,
 nanocoai/nanoclaw, <version>) is <N> commits ahead. Merge base: <sha> (the
 upstream commit our last sync merged). We are about to merge upstream into
-rebuild-v2.
+the dogfood branch.
 
 Wherever our fork's change and upstream's new work meet, don't adapt our change
 onto upstream: re-fitting an old hunk onto new code keeps divergence we may no
@@ -31,7 +31,7 @@ operator checkout, so read these there):
 - docs/rebuild/01-development-model.md, 02-divergence-inventory.md,
   05-multi-assistant-deployment-architecture.md, 07-experience-principles.md,
   docs/rebuild/reviews/ (pending decisions), docs/rebuild/solutions/.
-- Our commits: `git log <merge-base>..origin/rebuild-v2 -- <path>`, `git show <sha>`.
+- Our commits: `git log <merge-base>..origin/<dogfood branch> -- <path>`, `git show <sha>`.
 Upstream's intent: `git show <sha>` and CHANGELOG.md on upstream/<ref>.
 
 Rules: read-only, because the merge happens later in one place and an edit here

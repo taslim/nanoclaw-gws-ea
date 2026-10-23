@@ -12,6 +12,7 @@ import { ONECLI_GATEWAY_VERSION, ONECLI_SDK_VERSION } from '../pins.js';
 import { runSanitizedCommand, type SanitizedCommand } from '../process.js';
 import type { SetupCommand } from '../release-preflight.js';
 import type { ReleaseStageSeams } from '../release-stage.js';
+import releaseTracks from '../release-tracks.json' with { type: 'json' };
 
 function git(cwd: string, ...args: string[]): string {
   return execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
@@ -57,7 +58,7 @@ export async function releaseRepository(root: string): Promise<ReleaseRepository
     await mkdir(path.dirname(path.join(source, file)), { recursive: true });
     await writeFile(path.join(source, file), contents, mode === undefined ? {} : { mode });
   }
-  git(source, 'init', '--quiet', '-b', 'rebuild-v2');
+  git(source, 'init', '--quiet', '-b', releaseTracks.dogfood);
   git(source, 'add', '.');
   git(source, '-c', 'user.name=Morgan Ellery', '-c', 'user.email=morgan@example.com', 'commit', '--quiet', '-m', 'r');
   git(root, 'clone', '--quiet', '--bare', source, remote);

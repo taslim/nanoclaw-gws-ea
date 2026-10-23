@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { runCli, type CliRuntime } from './cli.js';
+import releaseTracks from './release-tracks.json' with { type: 'json' };
 import { runStep } from './events.js';
 import {
   acquireInstanceOperation,
@@ -783,7 +784,7 @@ describe('create recovery contract', () => {
     const instanceIds = Object.keys((await readRegistry(paths)).instances);
     expect(instanceIds).toHaveLength(1);
     const instanceId = instanceIds[0]!;
-    expect(resolveCalls).toEqual([['https://example.test/nanoclaw.git', 'refs/heads/rebuild-v2']]);
+    expect(resolveCalls).toEqual([['https://example.test/nanoclaw.git', `refs/heads/${releaseTracks.dogfood}`]]);
     expect(portsReleased).toBe(true);
     expect(progress).toEqual([
       'Resolving the release…',

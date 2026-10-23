@@ -29,6 +29,7 @@ import { writePrivate } from '../community-portal/private-file.js';
 import { getInstallScopedNames } from '../install-slug.js';
 import { formatLocalTime } from '../timezone.js';
 import { parseInvocation } from './command-parser.js';
+import releaseTracks from './release-tracks.json' with { type: 'json' };
 import { deriveGcpClaims } from './gcp-identity.js';
 import { enableBrowserCapability } from './browser-capability.js';
 import { acquireInstanceOperation, reserveInstance } from './journal.js';
@@ -1457,7 +1458,7 @@ describe('status', () => {
     const commit = await nextRelease(host);
     const remote = path.join(host.root, track === 'dogfood' ? 'mirror source' : 'mirror');
     git(host.root, 'clone', '--quiet', host.tool, remote);
-    git(remote, 'branch', track === 'dogfood' ? 'rebuild-v2' : track);
+    git(remote, 'branch', track === 'dogfood' ? releaseTracks.dogfood : track);
     const target: ReleaseCoordinates = { source_remote: remote, release_track: track, deployed_commit: commit };
     await updateUnfinishedAt(host.paths, reservation, target);
     const state = world(reservation);

@@ -71,7 +71,7 @@ async function assistant(root: string, remote = 'https://example.test/nanoclaw.g
   });
   const reservation = await reserveInstance(paths, {
     instance_id: '22222222-2222-4222-8222-222222222222',
-    release_track: 'rebuild-v2',
+    release_track: 'dogfood',
     source_remote: remote,
     deployed_commit: commit,
     allocated_ports: { onecli_app: 34_002, onecli_gateway: 34_003 },

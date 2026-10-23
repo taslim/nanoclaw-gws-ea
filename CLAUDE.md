@@ -325,11 +325,18 @@ correlation and runtime versions, without raw URLs or secret-bearing payloads.
 
 ## Rebuild Workflow (Temporary)
 
-`rebuild-v2` is the integration branch for the in-progress GWS-EA rebuild. Public
+The `dogfood` track identifies the integration branch for the in-progress GWS-EA rebuild. Public
 `main` remains untouched until the user explicitly authorizes a promotion. The
 accepted product, architecture, slice, and acceptance decisions live in the
 local, gitignored `docs/rebuild/` tree; Compound Engineering uses that same tree
 as its artifact root.
+
+`src/gws-ea/release-tracks.json` is the authoritative track-to-branch mapping.
+Resolve its current integration branch with
+`pnpm --silent run release-tracks:branch dogfood`; use that result for Git and PR
+operations. After changing the mapping, run `pnpm run release-tracks:generate`
+to update CI and CodeRabbit's marked branch filters. CI rejects drift with
+`pnpm run release-tracks:check`. Do not infer a branch from a track's name.
 
 `docs/rebuild/solutions/` is the local store of documented solutions to past
 problems (bugs, best practices, and workflow patterns), organized by category
@@ -349,23 +356,24 @@ included, on its next `create`, `update`, or `cleanup`.
   slice into an implementation-ready plan, and `$ce-work` to implement and verify
   that plan. `$lfg` may orchestrate those stages when the user asks for autonomous
   end-to-end delivery.
-- Before implementation, create a short-lived descriptive branch from the latest
-  `origin/rebuild-v2`. Do not implement directly on `rebuild-v2` or `main`.
+- Before implementation, resolve the dogfood branch and create a short-lived
+  descriptive branch from its latest `origin/<resolved branch>`. Do not implement
+  directly on the integration branch or `main`.
 - Deliver the checkpoints in `docs/rebuild/06-slice-1-talkable-assistant.md` as
   focused end-to-end changes with their stated acceptance evidence. A later
   checkpoint must not silently widen an earlier checkpoint's accepted scope.
 - During the rebuild, the project-defined shipping process replaces Compound
   Engineering's default PR handoff: finish the CE simplify, review, and validation
   gates; commit only work-owned files; push the current feature branch; create the
-  PR with explicit base `rebuild-v2`; then hand the resulting URL to
+  PR with the dogfood track's resolved branch as its explicit base; then hand the resulting URL to
   `$ce-babysit-pr`. Never rely on GitHub's default PR base and never use a full
   `$ce-commit-push-pr` invocation that would target `main`.
 - An explicit `$lfg` invocation or explicit request to open a rebuild PR authorizes
-  that PR to target `rebuild-v2`; otherwise show the rebuild PR-hygiene evidence
+  that PR to target the dogfood branch; otherwise show the rebuild PR-hygiene evidence
   below and wait for approval before publishing.
-- Merge into `rebuild-v2` only with explicit user approval. Opening, retargeting,
+- Merge into the dogfood branch only with explicit user approval. Opening, retargeting,
   or merging a PR to `main` requires a separate explicit promotion request.
-- Bringing official NanoClaw into `rebuild-v2` is the maintainer's job: use
+- Bringing official NanoClaw into the dogfood track is the maintainer's job: use
   `/sync-nanoclaw`. Nobody runs `/update-nanoclaw` in a GWS-EA checkout: it
   updates a plain NanoClaw install in place. An operator updates GWS-EA with
   `git pull` in the tool checkout, `bash gws-ea.sh`, then `gws-ea update --all`,
@@ -402,9 +410,10 @@ Before creating a rebuild PR, update and compare against its actual integration
 base:
 
 ```bash
-git fetch origin rebuild-v2
-git diff origin/rebuild-v2...HEAD --stat
-git log origin/rebuild-v2..HEAD --oneline
+DOGFOOD_BRANCH="$(pnpm --silent run release-tracks:branch dogfood)" || exit
+git fetch origin "$DOGFOOD_BRANCH"
+git diff "origin/$DOGFOOD_BRANCH"...HEAD --stat
+git log "origin/$DOGFOOD_BRANCH"..HEAD --oneline
 ```
 
 For any other PR, run the upstream comparison:

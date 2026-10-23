@@ -15,6 +15,7 @@ import { ONECLI_GATEWAY_VERSION, ONECLI_SDK_VERSION } from './pins.js';
 import { runSanitizedCommand, type SanitizedCommandRunner } from './process.js';
 
 import { resolveReleaseTarget, type ToolProviderSetup } from './release-target.js';
+import releaseTracks from './release-tracks.json' with { type: 'json' };
 import type { ReleaseSource } from './release-tracks.js';
 import { createInstanceRuntimeConfig, persistInstanceRuntime } from './service.js';
 import type { InstanceReservation, ReleaseCoordinates } from './types.js';
@@ -26,7 +27,7 @@ afterEach(async () => {
   for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true });
 });
 
-const TRACK_BRANCH = 'rebuild-v2';
+const TRACK_BRANCH = releaseTracks.dogfood;
 const CREDENTIAL: ProviderCredentialMetadata = {
   name: 'Anthropic',
   type: 'anthropic',
