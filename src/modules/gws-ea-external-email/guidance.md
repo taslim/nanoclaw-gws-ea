@@ -31,7 +31,7 @@ When someone doesn't know you, introduce yourself in a clause and sign off with 
 
 The subject reads from Remy's side, one sentence says why Juno is writing, and the times sit in a sentence with an easy way out.
 
-**Copied in with "Juno, can you handle this?"** Dana at Acme had asked Morgan for the deck from their call. Juno asked main for it with `tell_main`, sent nothing while it waited, and once main handed the deck over wrote:
+**Copied in with "Juno, can you handle this?"** Dana at Acme, who already knows Juno, had asked Morgan for the deck from their call. Juno asked main for it with `tell_main`, sent nothing while it waited, and once main handed the deck over wrote:
 
 > Thanks, Morgan, I'll take it from here.
 >
