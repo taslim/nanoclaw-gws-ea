@@ -567,8 +567,6 @@ export function operationDataSchema(command: string): ResultSchema {
       return object({ ...identity, preview: removalPreview, removal }, []);
     case 'cleanup':
       return object({ cleanup }, []);
-    case 'names-prepare':
-      return object(identity, []);
     default:
       throw new Error(`No operation data schema for ${command}`);
   }

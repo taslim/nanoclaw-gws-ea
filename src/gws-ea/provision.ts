@@ -1,11 +1,9 @@
 import Database from 'better-sqlite3';
 import { existsSync } from 'node:fs';
 import { mkdir, rmdir } from 'node:fs/promises';
-import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 
 import {
-  assertInstanceCreated,
   readProvisionJournal,
   recordChatConfigurationConfirmed,
   recordPrincipalChatAddress,
@@ -60,7 +58,6 @@ import { instanceServicePlatform } from './service-coordinates.js';
 import { runInstanceNclJson } from './ncl.js';
 import { reconcileMainIdentity, type MainIdentityDependencies, type MainIdentityInput } from './identity.js';
 import { displayPersonName, normalizePersonName, type PersonName, type NameOwner } from './person-name.js';
-import { resolveExecutable } from './process.js';
 import type { OnecliAgent } from './onecli-admin.js';
 import {
   bindPrincipal,
@@ -84,7 +81,7 @@ import { readOwnerOnlyFile, readOwnerOnlyJson, removePrivateFile, writePrivateTe
 import { assertInstanceId, getInstanceReservation, writeInstanceMarker } from './registry.js';
 import { isErrno } from '../community-portal/errors.js';
 import { preparePrivateDirectory, type ControlPlanePaths } from './paths.js';
-import { createState, isReleaseComplete, pointCurrent, readCurrent, releaseName } from './release-layout.js';
+import { createState, pointCurrent, readCurrent, releaseName } from './release-layout.js';
 import { pollUntil } from './poll.js';
 import { GwsEaError, type InstanceReservation, type ProvisionStepId } from './types.js';
 import {
@@ -1161,13 +1158,6 @@ function readPersistedProfile(runtime: InstanceRuntimeConfig): PersistedProfileI
       .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'gws_ea_profile'")
       .get();
     if (!profileTable) return undefined;
-    const columns = database.prepare('PRAGMA table_info(gws_ea_profile)').all() as Array<{ name: string }>;
-    if (!columns.some((column) => column.name === 'assistant_first_name')) {
-      throw new GwsEaError(
-        'profile_names_required',
-        `Prepare explicit names with gws-ea names prepare --id ${runtime.instance_id}, then update this assistant before resuming.`,
-      );
-    }
     return database
       .prepare(
         `SELECT assistant_first_name, assistant_last_name, assistant_workspace_email,
@@ -1268,108 +1258,15 @@ interface InstanceState {
   readonly runtime?: InstanceRuntimeConfig;
 }
 
-function profileCreationState(
-  paths: ControlPlanePaths,
-  reservation: InstanceReservation,
-): { readonly published: boolean; readonly legacy: boolean } {
-  const file = centralDatabaseFile(paths.instanceLayout(reservation.instance_id).state);
-  if (!existsSync(file)) return { published: false, legacy: false };
-  const database = openWithoutSideFiles(file);
-  try {
-    const columns = database.prepare('PRAGMA table_info(gws_ea_profile)').all() as Array<{ name: string }>;
-    return {
-      published:
-        columns.length > 0 &&
-        database
-          .prepare('SELECT 1 FROM gws_ea_profile WHERE singleton = 1 AND main_agent_group_id IS NOT NULL')
-          .get() !== undefined,
-      legacy: columns.some(({ name }) => name === 'assistant_display_name'),
-    };
-  } finally {
-    database.close();
-  }
-}
-
-async function refuseIncompleteLegacyCreate(
-  paths: ControlPlanePaths,
-  reservation: InstanceReservation,
-  manifest: unknown,
-): Promise<void> {
-  const profile = profileCreationState(paths, reservation);
-  let incomplete = isRecord(manifest) && manifest.schema_version === 1 && !profile.published;
-  if (profile.legacy) {
-    try {
-      await assertInstanceCreated(paths, reservation.instance_id);
-    } catch (error) {
-      if (!(error instanceof GwsEaError) || error.code !== 'instance_not_created') throw error;
-      incomplete = true;
-    }
-  }
-  if (!incomplete) return;
-  const layout = paths.instanceLayout(reservation.instance_id);
-  const release = releaseName(reservation.deployed_commit);
-  const launcher = path.join(layout.release(release), 'bin', 'gws-ea');
-  const quote = (value: string): string => `'${value.replaceAll("'", "'\\''")}'`;
-  let staged = false;
-  if (await isReleaseComplete(layout, release)) {
-    try {
-      await resolveExecutable(launcher);
-      staged = true;
-    } catch (error) {
-      if (!(error instanceof GwsEaError) || error.code !== 'executable_not_found') throw error;
-    }
-  }
-  const setup = staged
-    ? ''
-    : [
-        'GWS_EA_LEGACY_RECOVERY_ROOT="$(mktemp -d)"',
-        `git clone --no-checkout -- ${quote(reservation.source_remote)} "$GWS_EA_LEGACY_RECOVERY_ROOT"`,
-        `git -C "$GWS_EA_LEGACY_RECOVERY_ROOT" checkout --detach ${quote(reservation.deployed_commit)}`,
-        'pnpm --dir "$GWS_EA_LEGACY_RECOVERY_ROOT" install --frozen-lockfile --prod=false',
-        '',
-      ].join(' && ');
-  const executable = staged ? quote(launcher) : '"$GWS_EA_LEGACY_RECOVERY_ROOT/bin/gws-ea"';
-  const command = `${setup}GWS_EA_CONFIG_ROOT=${quote(paths.configRoot)} GWS_EA_STATE_ROOT=${quote(paths.stateRoot)} ${executable} resume --id ${reservation.instance_id}`;
-  throw new GwsEaError(
-    'incomplete_legacy_create',
-    `Finish this incomplete create using its pinned release before preparing names or updating: ${command}`,
-  );
-}
-
-async function recordedBootstrap(paths: ControlPlanePaths, reservation: InstanceReservation): Promise<unknown> {
-  try {
-    return await readOwnerOnlyJson(
-      paths.bootstrapFile(reservation.instance_id),
-      'Bootstrap manifest',
-      INVALID_BOOTSTRAP,
-    );
-  } catch (error) {
+async function readInstanceState(paths: ControlPlanePaths, reservation: InstanceReservation): Promise<InstanceState> {
+  const absent = (error: unknown): undefined => {
     if (isErrno(error, 'ENOENT')) return undefined;
     throw error;
-  }
-}
-
-/** Legacy create manifests belong to their pinned launcher and are never rewritten by a new release. */
-export async function assertLegacyCreateComplete(
-  paths: ControlPlanePaths,
-  reservation: InstanceReservation,
-): Promise<void> {
-  await refuseIncompleteLegacyCreate(paths, reservation, await recordedBootstrap(paths, reservation));
-}
-
-async function readInstanceState(paths: ControlPlanePaths, reservation: InstanceReservation): Promise<InstanceState> {
-  const [rawManifest, runtime] = await Promise.all([
-    recordedBootstrap(paths, reservation),
-    loadInstanceRuntimeConfig(paths.runtimeFile(reservation.instance_id)).catch((error: unknown) => {
-      if (isErrno(error, 'ENOENT')) return undefined;
-      throw error;
-    }),
+  };
+  const [manifest, runtime] = await Promise.all([
+    loadProductionBootstrapManifest(paths.bootstrapFile(reservation.instance_id)).catch(absent),
+    loadInstanceRuntimeConfig(paths.runtimeFile(reservation.instance_id)).catch(absent),
   ]);
-  await refuseIncompleteLegacyCreate(paths, reservation, rawManifest);
-  const manifest =
-    rawManifest === undefined || (isRecord(rawManifest) && rawManifest.schema_version === 1)
-      ? undefined
-      : validateProductionBootstrapManifest(rawManifest);
   return { ...(manifest ? { manifest } : {}), ...(runtime ? { runtime } : {}) };
 }
 

@@ -26,7 +26,6 @@ import type { AliasStepOptions } from './alias.js';
 import { instanceBrowserPolicyFile } from './browser-capability.js';
 import { getInstanceReservation } from './registry.js';
 import {
-  assertLegacyCreateComplete,
   createProductionProvisionSteps,
   fixPrincipalChatAddress,
   installProductionBootstrapManifest,
@@ -840,54 +839,6 @@ describe('production bootstrap trust boundary', () => {
     });
   });
 
-  it('routes an unfinished legacy create through its pinned release before and after main publication', async () => {
-    const paths = await testPaths();
-    const reserved = await reserveInstance(paths, reservation());
-    const file = paths.bootstrapFile(reserved.instance_id);
-    const legacy = JSON.stringify({
-      ...bootstrapManifest(paths),
-      schema_version: 1,
-      identity: { assistant_display_name: 'Aya', principal_display_name: 'Principal' },
-    });
-    await writeFile(file, legacy, { mode: 0o600 });
-
-    await expect(recordedHost(paths, reserved)).rejects.toMatchObject({
-      code: 'incomplete_legacy_create',
-      message: expect.stringContaining('git clone --no-checkout'),
-    });
-    await expect(readFile(file, 'utf8')).resolves.toBe(legacy);
-    const layout = paths.instanceLayout(reserved.instance_id);
-    await mkdir(path.join(layout.state, 'data'), { recursive: true });
-    const db = new Database(path.join(layout.state, 'data', 'v2.db'));
-    db.exec(`CREATE TABLE gws_ea_profile (
-      singleton INTEGER PRIMARY KEY, main_agent_group_id TEXT, assistant_display_name TEXT);
-      INSERT INTO gws_ea_profile VALUES (1, 'main', 'Aya');`);
-    db.close();
-    await expect(recordedHost(paths, reserved)).rejects.toMatchObject({ code: 'incomplete_legacy_create' });
-    await rm(file);
-    await expect(recordedHost(paths, reserved)).rejects.toMatchObject({
-      code: 'incomplete_legacy_create',
-      message: expect.stringContaining(reserved.deployed_commit),
-    });
-    await expect(assertLegacyCreateComplete(paths, reserved)).rejects.toMatchObject({
-      code: 'incomplete_legacy_create',
-    });
-    await expect(readFile(file, 'utf8')).rejects.toMatchObject({ code: 'ENOENT' });
-    const launcher = path.join(layout.release('aaaaaaaa'), 'bin', 'gws-ea');
-    await mkdir(path.dirname(launcher), { recursive: true });
-    await writeFile(launcher, await readFile(new URL('../../bin/gws-ea', import.meta.url)), { mode: 0o700 });
-    await expect(recordedHost(paths, reserved)).rejects.toMatchObject({
-      message: expect.stringContaining('git clone --no-checkout'),
-    });
-    await linkReleaseState(layout, 'aaaaaaaa');
-    await mkdir(layout.kept('aaaaaaaa'), { recursive: true });
-    await writeFile(layout.receipt('aaaaaaaa'), '{}');
-    await expect(recordedHost(paths, reserved)).rejects.toMatchObject({
-      code: 'incomplete_legacy_create',
-      message: expect.stringContaining(`'${launcher}' resume --id ${reserved.instance_id}`),
-    });
-  });
-
   it('stages and removes only the validated bootstrap file before reservation publication', async () => {
     const paths = await testPaths();
     const input = reservation();
@@ -1034,11 +985,10 @@ describe('production bootstrap trust boundary', () => {
       profile: { principal_first_name: 'Juno', principal_last_name: null },
     });
 
-    const staleLegacy = JSON.stringify({ schema_version: 1, identity: { principal_display_name: 'Old Principal' } });
-    await writeFile(paths.bootstrapFile(reserved.instance_id), staleLegacy, { mode: 0o600 });
-    await expect(assertLegacyCreateComplete(paths, reserved)).resolves.toBeUndefined();
+    const leftoverManifest = JSON.stringify(manifest);
+    await writeFile(paths.bootstrapFile(reserved.instance_id), leftoverManifest, { mode: 0o600 });
     await expect(recordedHost(paths, reserved)).resolves.toEqual({ dockerEndpoint: runtime.docker_endpoint });
-    await expect(readFile(paths.bootstrapFile(reserved.instance_id), 'utf8')).resolves.toBe(staleLegacy);
+    await expect(readFile(paths.bootstrapFile(reserved.instance_id), 'utf8')).resolves.toBe(leftoverManifest);
     await rm(paths.bootstrapFile(reserved.instance_id));
     await expect(recordedHost(paths, reserved)).resolves.toEqual({ dockerEndpoint: runtime.docker_endpoint });
   });
