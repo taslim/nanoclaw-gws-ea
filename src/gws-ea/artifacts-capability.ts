@@ -810,6 +810,19 @@ export async function enableArtifactsCapability(
           'artifacts_not_ready',
           'Artifact prerequisites have not all been verified. Check this capability after resolving the reported prerequisite.',
         );
+      // Runner tool schemas and composed instructions are fixed at spawn. Refresh only current
+      // eligible authors through the existing guarded restart command; their next turn respawns.
+      const authors = await ncl(runtime, ['gws-ea-artifacts-author-groups']);
+      if (
+        !isRecord(authors) ||
+        !Array.isArray(authors.group_ids) ||
+        !authors.group_ids.every((id): id is string => typeof id === 'string' && id.length > 0)
+      )
+        throw new GwsEaError(
+          'artifacts_authors_unavailable',
+          'The host could not read current artifact author groups.',
+        );
+      for (const groupId of new Set(authors.group_ids)) await ncl(runtime, ['groups', 'restart', '--id', groupId]);
       return operation(instanceId, claim, true, true);
     } catch (cause) {
       if (enabledPolicy) await writePolicy(policyFile, { ...enabledPolicy, enabled: false });

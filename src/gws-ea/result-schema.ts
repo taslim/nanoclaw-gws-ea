@@ -470,8 +470,12 @@ const removalPreview = object({
 });
 const removal = object(
   {
-    removed: array(choices('whatsapp', 'nanoclaw', 'chat-subscription', 'gcp-project', 'onecli', 'instance-files')),
-    abandoned: array(object({ resource: choices('gcp-project', 'chat-subscription', 'onepassword'), evidence: text })),
+    removed: array(
+      choices('whatsapp', 'nanoclaw', 'artifacts', 'chat-subscription', 'gcp-project', 'onecli', 'instance-files'),
+    ),
+    abandoned: array(
+      object({ resource: choices('gcp-project', 'chat-subscription', 'onepassword', 'artifacts'), evidence: text }),
+    ),
     keyPolicyUnrestored: text,
     memberPolicyUnrestored: text,
     onepassword: object({

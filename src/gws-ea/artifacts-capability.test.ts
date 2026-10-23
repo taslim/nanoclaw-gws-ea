@@ -211,6 +211,7 @@ async function provisionFixture() {
   const api = cloudflareFixture();
   let emails = ['principal@example.test', 'second@example.test'];
   const commands: string[][] = [];
+  const restarts: string[][] = [];
   const dependencies = {
     fetch: api.transport,
     sleep: async () => {},
@@ -218,6 +219,11 @@ async function provisionFixture() {
       if (args[0] === 'gws-ea-profile-get')
         return { assistant_first_name: 'Robin', principal_emails: ['principal@example.test', 'second@example.test'] };
       if (args[0] === 'gws-ea-artifacts-admission-emails') return { emails };
+      if (args[0] === 'gws-ea-artifacts-author-groups') return { group_ids: ['canonical', 'selected-author'] };
+      if (args[0] === 'groups' && args[1] === 'restart') {
+        restarts.push([...args]);
+        return { restarted: 0 };
+      }
       if (args[0] === 'gws-ea-artifacts-health') {
         const policy = await readArtifactsPolicy(instanceArtifactsPolicyFile(runtime));
         return {
@@ -248,6 +254,7 @@ async function provisionFixture() {
     files,
     dependencies,
     commands,
+    restarts,
     emails: (next: string[]) => {
       emails = next;
     },
@@ -349,6 +356,15 @@ describe('artifacts operator capability', () => {
     expect((await readArtifactsOperatorConfig(f.files.configFile))?.dns['robin.other.test'].zoneId).toBe(
       'dedicated-zone',
     );
+  });
+
+  it('refreshes each current eligible author through native restart without a wake message, including zero-running results', async () => {
+    const f = await provisionFixture();
+    await enableArtifactsCapability(f.paths, f.a.instanceId, {}, f.dependencies);
+    expect(f.restarts).toEqual([
+      ['groups', 'restart', '--id', 'canonical'],
+      ['groups', 'restart', '--id', 'selected-author'],
+    ]);
   });
 
   it('waits for delayed local listener readiness before exposing ingress', async () => {

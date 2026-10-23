@@ -2318,6 +2318,8 @@ function removalSummary(preview: RemovalPreview, outcome: RemovalOutcome | undef
       'sign-in; with the project deleted it delivers nowhere, and Google deletes it within 7 days.',
     onepassword:
       "No longer tracked: the assistant's 1Password resources named below; settle any that remain yourself on 1Password.com.",
+    artifacts:
+      'Left behind: the exact artifact resources named below. Their ownership record, credentials and removal receipt remain for manual cleanup.',
   };
   return [
     ...(outcome?.removed.includes('gcp-project')
@@ -2325,7 +2327,7 @@ function removalSummary(preview: RemovalPreview, outcome: RemovalOutcome | undef
       : []),
     ...(outcome?.onepassword ? onePasswordOutcomeLines(preview.instanceId, outcome.onepassword) : []),
     ...(outcome?.abandoned.flatMap(({ resource, evidence }) =>
-      resource === 'onepassword'
+      resource === 'onepassword' || resource === 'artifacts'
         ? [leftBehind[resource], ...evidence.split('\n').map((line) => `  ${line}`)]
         : [leftBehind[resource]],
     ) ?? []),
