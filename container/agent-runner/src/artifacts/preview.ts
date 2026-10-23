@@ -94,7 +94,6 @@ export async function previewArtifact(input: ArtifactPreviewInput): Promise<Arti
       const request = route.request();
       const url = request.url();
       if (request.method() !== 'GET' || (url !== `${origin}${viewPath}` && url !== childUrl)) {
-        // URLs may contain private information; report the resource kind and scheme only.
         append(blockedRequests, `${request.resourceType()}:${new URL(url).protocol}`);
         await route.abort('blockedbyclient');
         return;
@@ -109,7 +108,6 @@ export async function previewArtifact(input: ArtifactPreviewInput): Promise<Arti
               title: input.title ?? 'Artifact preview',
               childUrl,
             });
-      // Removing only the enforcement header deliberately exercises the same conservative static fallback.
       const headers = { ...response.headers };
       if (staticCapture) delete headers['connection-allowlist'];
       await route.fulfill({ status: 200, headers, body: response.body });
@@ -126,7 +124,6 @@ export async function previewArtifact(input: ArtifactPreviewInput): Promise<Arti
           page.on('console', (message) => {
             const text = message.text();
             // CSP may refuse an attempted resource before Playwright emits a network request.
-            // Keep only a directive name, never the console text or its target URL.
             if (text.includes('Content Security Policy') && /blocked|violates/iu.test(text)) {
               const directive = /directive: "([a-z-]+)/u.exec(text)?.[1];
               append(blockedRequests, directive ? `csp:${directive}` : 'csp');

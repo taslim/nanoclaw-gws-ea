@@ -50,6 +50,7 @@ const URL_ATTRIBUTES = new Set([
   'longdesc',
   'manifest',
 ]);
+const SOURCE_LINK_ATTRIBUTES = new Set(['href', 'target', 'data-artifact-source', 'role', 'tabindex']);
 const DATA_IMAGE = /^data:image\/(?:png|jpeg|gif|webp|avif);base64,[a-z0-9+/=\s]+$/iu;
 const DATA_CSS = /^data:(?:image\/(?:png|jpeg|gif|webp|avif)|font\/(?:woff2?|ttf|otf));base64,[a-z0-9+/=\s]+$/iu;
 function isElement(node: Node): node is Element {
@@ -59,7 +60,6 @@ function textContent(node: Node): string {
   return 'value' in node ? node.value : 'childNodes' in node ? node.childNodes.map(textContent).join('') : '';
 }
 function assertCss(css: string): void {
-  // Escaped identifiers and unterminated comments are unsupported, rather than maintaining a second CSS parser.
   if (css.includes('\\') || /\/\*(?![\s\S]*?\*\/)/u.test(css))
     throw new Error('CSS escapes and incomplete comments are unsupported.');
   const plain = css.replace(/\/\*[\s\S]*?\*\//gu, '');
@@ -82,7 +82,7 @@ function removeAttribute(element: Element, name: string): void {
 }
 /** Bounded, standards-parsed, self-contained source. This validation is not the runtime network boundary. */
 export function parseArtifactDocument(html: string): ArtifactDocument {
-  if (new TextEncoder().encode(html).byteLength > ARTIFACT_DOCUMENT_MAX_BYTES)
+  if (Buffer.byteLength(html, 'utf8') > ARTIFACT_DOCUMENT_MAX_BYTES)
     throw new Error('Artifact source exceeds the 4 MiB limit.');
   const document = parse(html, {
     onParseError(error) {
@@ -120,20 +120,16 @@ export function parseArtifactDocument(html: string): ArtifactDocument {
           throw new Error('Source links must be canonical HTTPS URLs without credentials.');
         const id = `source-${sources.length + 1}`;
         sources.push({ id, label: textContent(element).trim().slice(0, 180) || url.hostname, url: url.href });
-        removeAttribute(element, 'href');
-        removeAttribute(element, 'target');
-        removeAttribute(element, 'data-artifact-source');
-        removeAttribute(element, 'role');
-        removeAttribute(element, 'tabindex');
+        element.attrs = element.attrs.filter(({ name: attributeName }) => !SOURCE_LINK_ATTRIBUTES.has(attributeName));
         element.attrs.push(
           { name: 'data-artifact-source', value: id },
           { name: 'role', value: 'button' },
           { name: 'tabindex', value: '0' },
         );
       } else if (name === 'href' && attribute.value.startsWith('#')) {
-        // Inline SVG references.
+        continue;
       } else if (name === 'src' && element.tagName === 'img' && DATA_IMAGE.test(attribute.value)) {
-        // Raster data images have no active document or remote dependencies.
+        continue;
       } else throw new Error(`Artifact ${name} must not reference a remote resource.`);
     }
   });

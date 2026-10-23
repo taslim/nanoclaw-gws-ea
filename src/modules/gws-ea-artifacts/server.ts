@@ -114,7 +114,6 @@ export function createArtifactViewHandler(
       response.writeHead(200, rendered.headers);
       response.end(request.method === 'HEAD' ? undefined : rendered.body);
     };
-    // Optional view failures must never escape the HTTP callback or expose content/authorization diagnostics.
     void serve().catch((_error: unknown) => {
       if (!response.headersSent) finish(503);
       else response.destroy();

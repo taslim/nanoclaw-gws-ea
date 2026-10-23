@@ -30,7 +30,6 @@ function headers(csp: string): Readonly<Record<string, string>> {
       'camera=(), microphone=(), geolocation=(), payment=(), usb=(), serial=(), bluetooth=(), browsing-topics=()',
   };
 }
-/** The only cross-frame message selects an already parsed source. Opening it still needs a parent click. */
 const LINK_HELPER = `function bindSources(){
 function choose(event){const anchor=event.target.closest?.('[data-artifact-source]');if(!anchor)return;if(event.type==='keydown'&&!['Enter',' '].includes(event.key))return;event.preventDefault();event.stopImmediatePropagation();parent.postMessage({type:'artifact-source',id:anchor.dataset.artifactSource},'*');}
 document.addEventListener('click',choose,true);document.addEventListener('keydown',choose,true);}

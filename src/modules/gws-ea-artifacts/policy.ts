@@ -45,7 +45,6 @@ const HOST = /^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,6
 const ID = /^[a-zA-Z0-9_-]{1,256}$/u;
 const RESERVED = new Set(['public', 'private', 'guest', 'assets', 'api', 'cdn-cgi', 'health', 'login', 'logout']);
 
-/** One canonical encoded first-name segment; Unicode and punctuation follow the existing profile name contract. */
 function validPrefix(value: string): boolean {
   if (value === '') return true;
   if (!value.startsWith('/')) return false;

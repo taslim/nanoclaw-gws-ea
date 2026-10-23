@@ -274,8 +274,7 @@ export async function saveArtifact(
         assertOwned(actor, earlier);
         if (earlier.initial_fingerprint !== initial)
           throw forbidden('This create key was already used for different artifact content.');
-        // The original saved revision remains the result of a create retry, even after private edits.
-        const original = await getArtifactRevision(earlier.artifact_id, 1);
+        const original = await getArtifactRevisionMetadata(earlier.artifact_id, 1);
         if (!original) throw new Error('Artifact initial revision is missing.');
         const result: ArtifactSaveResult = {
           artifact_id: earlier.artifact_id,
@@ -363,7 +362,6 @@ export async function deleteArtifact(
       'SELECT artifact_id,author_group_id,initial_fingerprint,head_revision,generation,expires_at,deleted_at FROM gws_ea_artifacts WHERE artifact_id=?',
       artifactId,
     );
-    // Expiry ends access, but the owner can still explicitly remove retained content.
     if (!held || (!actor.isMain && held.author_group_id !== actor.agentGroupId))
       throw forbidden('Only your own artifacts may be deleted.');
     if (held.deleted_at !== null) throw forbidden('This artifact was deleted.');
