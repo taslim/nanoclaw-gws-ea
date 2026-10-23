@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { createServer, request as httpRequest } from 'node:http';
 import { generateKeyPair, exportJWK, SignJWT } from 'jose';
+import Database from 'better-sqlite3';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 const { ROOT } = vi.hoisted(() => ({ ROOT: `/private/tmp/artifact-runtime-${process.pid}` }));
 vi.mock('../../config.js', async (original) => ({
@@ -22,9 +23,11 @@ import {
   takeSnapshot,
 } from '../../gws-ea/release-layout.js';
 import { resolveSystemSession } from '../../session-manager.js';
+import { inboundDbPath } from '../../mailbox/sqlite/paths.js';
 import {
   artifactsAccessApplication,
   artifactsEmailPolicy,
+  readArtifactsOperatorConfig,
   reconcileArtifactsAccessEmails,
   writeArtifactsOperatorConfig,
 } from '../../gws-ea/artifacts-cloudflare.js';
@@ -119,6 +122,7 @@ beforeEach(async () => {
       '00000000-0000-4000-8000-000000000001': {
         claim,
         enabled: true,
+        publicationReady: true,
         applicationId: 'app',
         policyId: 'policy',
         aud: 'aud',
@@ -193,6 +197,93 @@ afterEach(async () => {
   vi.useRealTimers();
   fs.rmSync(ROOT, { recursive: true, force: true });
 });
+it('replays a historical success as currently unusable when operator state cannot be read', async () => {
+  await runtime.reconcile();
+  const input = parseArtifactShare({
+    ...publication,
+    operation: 'public_publish',
+    principal_message: { id: 'mark', messaging_group_id: 'chat' },
+  });
+  await runtime.sharing.submit(main, 'receipt', input);
+  const stored = await getDb().get<{ result_json: string }>(
+    "SELECT result_json FROM gws_ea_artifact_requests WHERE request_id='receipt'",
+  );
+  if (!stored) throw new Error('No historical publication');
+  expect(JSON.parse(stored.result_json)).toMatchObject({ ok: true, data: { state: 'active' } });
+  const consumed = new Database(inboundDbPath(main.agent_group_id, main.id));
+  try {
+    consumed.prepare('DELETE FROM messages_in WHERE id=?').run('action-resp-receipt');
+  } finally {
+    consumed.close();
+  }
+  fs.writeFileSync(policy.cloudflare.operatorConfigFile, '{');
+  await expect(runtime.sharing.submit(main, 'receipt', input)).resolves.toBeUndefined();
+  const inbox = new Database(inboundDbPath(main.agent_group_id, main.id), { readonly: true });
+  try {
+    const row = inbox.prepare('SELECT content FROM messages_in WHERE id=?').get('action-resp-receipt') as
+      | { content: string }
+      | undefined;
+    if (!row) throw new Error('No replay answer');
+    expect(JSON.parse(row.content)).toMatchObject({
+      frame: { ok: true, data: { state: 'active', current_access: { usable: false } } },
+    });
+  } finally {
+    inbox.close();
+  }
+  expect(await getDb().get("SELECT result_json FROM gws_ea_artifact_requests WHERE request_id='receipt'")).toEqual(
+    stored,
+  );
+});
+it.each(['failed', 'verified'] as const)(
+  'keeps publication pending while external provisioning is %s',
+  async (outcome) => {
+    const file = policy.cloudflare.operatorConfigFile;
+    const config = await readArtifactsOperatorConfig(file);
+    if (!config) throw new Error('Missing owned operator configuration');
+    const instanceId = '00000000-0000-4000-8000-000000000001';
+    await writeArtifactsOperatorConfig(file, {
+      ...config,
+      assistants: {
+        ...config.assistants,
+        [instanceId]: { ...config.assistants[instanceId], publicationReady: false },
+      },
+    });
+    await runtime.reconcile();
+    expect(await runtime.health()).toMatchObject({ listener: { state: 'listening' } });
+    await runtime.sharing.submit(
+      main,
+      'during-enable',
+      parseArtifactShare({
+        ...publication,
+        operation: 'public_publish',
+        principal_message: { id: 'mark', messaging_group_id: 'chat' },
+      }),
+    );
+    await runtime.reconcile();
+    expect(await getDb().get("SELECT state FROM gws_ea_artifact_requests WHERE request_id='during-enable'")).toEqual({
+      state: 'pending',
+    });
+    expect(await getDb().get('SELECT state FROM gws_ea_artifact_shares')).toEqual({ state: 'pending' });
+    if (outcome === 'failed') writePolicy(false);
+    else
+      await writeArtifactsOperatorConfig(file, {
+        ...config,
+        assistants: {
+          ...config.assistants,
+          [instanceId]: { ...config.assistants[instanceId], publicationReady: true },
+        },
+      });
+    await runtime.reconcile();
+    const row = await getDb().get<{ result_json: string }>(
+      "SELECT result_json FROM gws_ea_artifact_requests WHERE request_id='during-enable'",
+    );
+    if (!row) throw new Error('No publication receipt');
+    expect(JSON.parse(row.result_json)).toMatchObject({ ok: outcome === 'verified' });
+    expect(await getDb().get('SELECT state FROM gws_ea_artifact_shares')).toEqual({
+      state: outcome === 'verified' ? 'active' : 'revoked',
+    });
+  },
+);
 it('verifies Access before a real loopback origin becomes healthy, and keeps save/view/unchanged ticks free of management calls', async () => {
   const key = await generateKeyPair('RS256');
   const jwk = { ...(await exportJWK(key.publicKey)), kid: 'current', alg: 'RS256' };

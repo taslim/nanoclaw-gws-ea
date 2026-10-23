@@ -24,7 +24,10 @@ const expires = {
 } as const;
 const principal = {
   type: 'object',
-  properties: { id: identifier, messaging_group_id: identifier },
+  properties: {
+    id: { type: 'string', minLength: 1, maxLength: 1024, pattern: '^(?!\\s*$)[^\\u0000-\\u001f\\u007f-\\u009f]+$' },
+    messaging_group_id: identifier,
+  },
   required: ['id', 'messaging_group_id'],
   additionalProperties: false,
 } as const;

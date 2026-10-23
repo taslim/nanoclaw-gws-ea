@@ -35,11 +35,22 @@ export class ArtifactsRuntime {
   constructor(private readonly dependencies: ArtifactsRuntimeDependencies = {}) {
     this.sharing = new ArtifactSharing({
       verifyAdmission: (config) => this.verifyAdmission(config),
-      publicationReady: (config) =>
-        this.ready && this.server?.listening === true && artifactDigest(config) === artifactDigest(this.config),
+      publicationReady: async (config) => {
+        try {
+          return (
+            (await this.coordinatesMatch(config, true)) &&
+            this.ready &&
+            this.server?.listening === true &&
+            artifactDigest(config) === artifactDigest(this.config)
+          );
+          // eslint-disable-next-line no-catch-all/no-catch-all -- Optional owner-state failure closes access while preserving historical receipts.
+        } catch {
+          return false;
+        }
+      },
     });
   }
-  private async coordinatesMatch(config: ArtifactsPolicyFile): Promise<boolean> {
+  private async coordinatesMatch(config: ArtifactsPolicyFile, publication = false): Promise<boolean> {
     const operator = await readArtifactsOperatorConfig(config.cloudflare.operatorConfigFile);
     const assistant = operator
       ? Object.values(operator.assistants).find(
@@ -50,6 +61,7 @@ export class ArtifactsRuntime {
       operator?.accountId === config.cloudflare.accountId &&
       `https://${operator.teamName}.cloudflareaccess.com` === config.accessIssuer &&
       assistant?.enabled === true &&
+      (!publication || assistant.publicationReady === true) &&
       assistant.aud === config.accessAud &&
       assistant.claim.hostname === config.hostname &&
       assistant.claim.path_prefix === config.pathPrefix &&

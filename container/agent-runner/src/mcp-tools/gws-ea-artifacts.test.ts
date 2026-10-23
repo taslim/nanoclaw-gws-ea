@@ -60,3 +60,10 @@ it('rejects mixed create/revise and mixed audience operations', () => {
     }),
   ).toBe(false);
 });
+it('accepts opaque native principal message IDs while refusing empty, oversized and control-bearing marks', () => {
+  const validate = new Ajv({ strict: false }).compile(artifactShare.tool.inputSchema);
+  const request = { operation: 'public_publish', artifact_id: 'trip', revision: 1, expected_hash: hash };
+  expect(validate({ ...request, principal_message: { ...mark, id: 'spaces/AAAAjuno/messages/remy.1' } })).toBe(true);
+  for (const id of ['', 'a'.repeat(1025), 'spaces/room\n/messages/message', 'message\u007f'])
+    expect(validate({ ...request, principal_message: { ...mark, id } })).toBe(false);
+});

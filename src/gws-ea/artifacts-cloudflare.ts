@@ -165,6 +165,7 @@ export interface ArtifactsRemoteAssistant {
   readonly policyId?: string;
   readonly aud?: string;
   readonly enabled: boolean;
+  readonly publicationReady?: boolean;
   readonly revokePending?: boolean;
 }
 type ArtifactsCreateKind = 'pin' | 'tunnel' | 'application' | 'policy' | 'dns';
@@ -300,9 +301,11 @@ export function parseArtifactsOperatorConfig(value: unknown): ArtifactsOperatorC
       return invalid();
     if (applicationId) applications.add(applicationId);
     if (assistant.revokePending !== undefined && typeof assistant.revokePending !== 'boolean') return invalid();
+    if (assistant.publicationReady !== undefined && typeof assistant.publicationReady !== 'boolean') return invalid();
     assistants[instanceId] = {
       claim: { hostname: claim.hostname, path_prefix: claim.path_prefix, listen_port: claim.listen_port },
       enabled: assistant.enabled,
+      ...(typeof assistant.publicationReady === 'boolean' ? { publicationReady: assistant.publicationReady } : {}),
       ...(applicationId === undefined ? {} : { applicationId }),
       ...(policyId === undefined ? {} : { policyId }),
       ...(aud === undefined ? {} : { aud }),

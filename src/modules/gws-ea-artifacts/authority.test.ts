@@ -123,6 +123,10 @@ it('accepts main’s explicit scoped instruction, canonicalizes exact emails and
   }
 });
 it('refuses spoofed fields, stale or foreign marks, wrong source hashes, and non-main sessions', async () => {
+  for (const id of ['', ' ', 'x'.repeat(1025), 'message\nforged', 'message\u009b'])
+    expect(() => parseArtifactShare({ ...input, principal_message: { id, messaging_group_id: 'chat' } })).toThrow(
+      'principal message ID',
+    );
   expect(() => parseArtifactShare({ ...input, author_group_id: 'canonical' })).toThrow('Unexpected');
   await expect(
     authorizeArtifactShare(main, parseArtifactShare({ ...input, expected_hash: 'f'.repeat(64) })),

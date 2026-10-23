@@ -167,7 +167,7 @@ function storedFrame(value: Record<string, unknown>, requestId: string): Respons
 export interface ArtifactSharingDependencies {
   /** Concrete Access admission owner. Invoked outside central transactions. */
   readonly verifyAdmission: (config: ArtifactsPolicyFile) => Promise<void>;
-  readonly publicationReady: (config: ArtifactsPolicyFile) => boolean;
+  readonly publicationReady: (config: ArtifactsPolicyFile) => boolean | Promise<boolean>;
 }
 export class ArtifactSharing {
   private readonly running = new Set<string>();
@@ -263,7 +263,7 @@ export class ArtifactSharing {
         frame.data.share_id,
       );
       const policy = await readArtifactsPolicy();
-      const ready = policy.status === 'enabled' && this.dependencies.publicationReady(policy.config);
+      const ready = policy.status === 'enabled' && (await this.dependencies.publicationReady(policy.config));
       frame = {
         ...frame,
         data: {
@@ -525,7 +525,7 @@ export class ArtifactSharing {
     const policy = await readArtifactsPolicy();
     if (policy.status !== 'enabled' || artifactDigest(policy.config) !== held.policy_hash)
       throw forbidden('Artifact capability coordinates changed.');
-    if (!this.dependencies.publicationReady(policy.config)) {
+    if (!(await this.dependencies.publicationReady(policy.config))) {
       if (grant)
         throw forbidden('The artifact origin is unavailable. Nothing was published; ask again when it is ready.');
       return;
@@ -539,7 +539,7 @@ export class ArtifactSharing {
         fresh.status !== 'enabled' ||
         artifactDigest(fresh.config) !== held.policy_hash ||
         current.scopeHash !== held.scope_hash ||
-        !this.dependencies.publicationReady(fresh.config)
+        !(await this.dependencies.publicationReady(fresh.config))
       )
         throw forbidden('Artifact sharing authority changed.');
       if (grant && (!(await isVerifiedPrincipalUser(grant.approver_user_id ?? '')) || grant.session_id !== session.id))

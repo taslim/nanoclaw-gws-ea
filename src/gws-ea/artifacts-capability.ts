@@ -385,6 +385,14 @@ async function provision(
     const loaded = await readArtifactsOperatorConfig(file);
     if (!loaded) throw new GwsEaError('artifacts_operator_required', 'Artifacts operator configuration is missing.');
     let config: ArtifactsOperatorConfig = loaded;
+    const previous = config.assistants[instanceId];
+    if (previous?.publicationReady) {
+      config = {
+        ...config,
+        assistants: { ...config.assistants, [instanceId]: { ...previous, publicationReady: false } },
+      };
+      await writeArtifactsOperatorConfig(file, config);
+    }
     if (config.pending)
       throw new GwsEaError(
         'artifacts_create_unproven',
@@ -812,7 +820,7 @@ export async function enableArtifactsCapability(
       });
       await startConnector(paths, runtime, dependencies);
       const observed = await inspectArtifactsCapability(paths, instanceId, { ...dependencies, check: true });
-      if (!observed.ready)
+      if (observed.remote !== 'verified' || observed.listener !== 'listening')
         throw new GwsEaError(
           'artifacts_not_ready',
           'Artifact prerequisites have not all been verified. Check this capability after resolving the reported prerequisite.',
@@ -828,6 +836,27 @@ export async function enableArtifactsCapability(
           'The host could not read current artifact author groups.',
         );
       for (const groupId of new Set(authors.group_ids)) await ncl(runtime, ['groups', 'restart', '--id', groupId]);
+      const activationPolicy = enabledPolicy;
+      await withMachineLock(paths, async () => {
+        const file = artifactsOperatorFiles(paths).configFile;
+        const live = await readArtifactsOperatorConfig(file);
+        const current = live?.assistants[instanceId];
+        const policy = await readArtifactsPolicy(policyFile);
+        if (
+          !live ||
+          !current?.enabled ||
+          current.applicationId !== activationPolicy.cloudflare.applicationId ||
+          current.aud !== activationPolicy.accessAud ||
+          JSON.stringify(current.claim) !== JSON.stringify(claim) ||
+          policy.status !== 'enabled' ||
+          JSON.stringify(policy.config) !== JSON.stringify(activationPolicy)
+        )
+          throw new GwsEaError('artifacts_disabled', 'Artifact coordinates changed before activation completed.');
+        await writeArtifactsOperatorConfig(file, {
+          ...live,
+          assistants: { ...live.assistants, [instanceId]: { ...current, publicationReady: true } },
+        });
+      });
       return operation(instanceId, claim, true, true);
     } catch (cause) {
       if (enabledPolicy) await writePolicy(policyFile, { ...enabledPolicy, enabled: false });
@@ -840,7 +869,10 @@ export async function enableArtifactsCapability(
           if (live && assistant) {
             await writeArtifactsOperatorConfig(file, {
               ...live,
-              assistants: { ...live.assistants, [instanceId]: { ...live.assistants[instanceId], enabled: false } },
+              assistants: {
+                ...live.assistants,
+                [instanceId]: { ...live.assistants[instanceId], enabled: false, publicationReady: false },
+              },
             });
             if (live.tunnelId)
               await setArtifactsIngress(await artifactsApi(live, dependencies), live, assistant.claim, false);
@@ -880,11 +912,11 @@ export async function disableArtifactsCapability(
       const config = await readArtifactsOperatorConfig(file);
       const assistant = config?.assistants[instanceId];
       if (!config || !assistant) return;
-      if (assistant.enabled) {
+      if (assistant.enabled || assistant.publicationReady) {
         await dependencies.recordEffect?.(null);
         await writeArtifactsOperatorConfig(file, {
           ...config,
-          assistants: { ...config.assistants, [instanceId]: { ...assistant, enabled: false } },
+          assistants: { ...config.assistants, [instanceId]: { ...assistant, enabled: false, publicationReady: false } },
         });
         changed = true;
         await dependencies.recordEffect?.(true);
@@ -1038,6 +1070,8 @@ export async function inspectArtifactsCapability(
       listener = policy.enabled && availableHealth(health, assistant.claim.listen_port) ? 'listening' : 'unavailable';
       if (policy.enabled && listener !== 'listening')
         reason = 'The running host listener is not available at its claimed port.';
+      else if (policy.enabled && assistant.publicationReady !== true)
+        reason = 'Artifact activation has not completed. Re-run enable to verify and finish activation.';
       // eslint-disable-next-line no-catch-all/no-catch-all -- Optional status never exposes raw API, process or credential failures.
     } catch (cause) {
       remote = 'unavailable';
@@ -1058,7 +1092,11 @@ export async function inspectArtifactsCapability(
     policy_file: policyFile,
     remote,
     listener,
-    ready: policy.enabled && remote === 'verified' && listener === 'listening',
+    ready:
+      policy.enabled &&
+      remote === 'verified' &&
+      listener === 'listening' &&
+      config?.assistants[instanceId]?.publicationReady === true,
     reason,
     operator,
   };

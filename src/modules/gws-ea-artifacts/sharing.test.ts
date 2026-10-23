@@ -12,7 +12,15 @@ vi.mock('../../config.js', async (original) => ({
 vi.mock('../../request-wake.js', () => ({ requestWake: async () => false }));
 vi.mock('../../log.js', () => ({ log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() } }));
 import '../index.js';
-import { closeDb, createAgentGroup, createMessagingGroup, getDb, initTestDb, runMigrations } from '../../db/index.js';
+import {
+  closeDb,
+  createAgentGroup,
+  createMessagingGroup,
+  getMessagingGroup,
+  getDb,
+  initTestDb,
+  runMigrations,
+} from '../../db/index.js';
 import { createPendingApproval, getPendingApprovalsByAction } from '../../db/sessions.js';
 import { setDeliveryAdapter } from '../../delivery.js';
 import { expireApproval } from '../approvals/lifecycle.js';
@@ -23,6 +31,7 @@ import { resolveSystemSession } from '../../session-manager.js';
 import type { ResponseFrame } from '../../cli/frame.js';
 import type { Session } from '../../types.js';
 import { bindVerifiedPrincipalUser } from '../gws-ea-profile/db.js';
+import { preparePrincipalMessageContent } from '../gws-ea-profile/marks.js';
 import { upsertUserDm } from '../permissions/db/user-dms.js';
 import { upsertUser } from '../permissions/db/users.js';
 import { getApprovalHandler, getApprovalRejectionFinalizer } from '../approvals/primitive.js';
@@ -148,6 +157,38 @@ afterEach(async () => {
   vi.unstubAllEnvs();
   await closeDb();
   fs.rmSync(ROOT, { recursive: true, force: true });
+});
+it('publishes and revokes using the exact native Google Chat principal message ID', async () => {
+  const messageId = 'spaces/AAAAjuno/messages/remy.1';
+  const messagingGroup = await getMessagingGroup('chat');
+  if (!messagingGroup) throw new Error('No principal chat');
+  const prepared = await preparePrincipalMessageContent({
+    content: JSON.stringify({ text: 'Publish this exact report, then withdraw it.' }),
+    channelType: 'gchat',
+    instance: 'gchat',
+    platformId: 'spaces/AAAAjuno',
+    messageId,
+    timestamp: new Date().toISOString(),
+    authenticatedSender: { userId: 'gchat:principal', kind: 'human' },
+    session: main,
+    messagingGroup,
+  });
+  expect(JSON.parse(prepared)).toMatchObject({ principalMessage: { id: messageId, messagingGroupId: 'chat' } });
+  const { recipients: _recipients, ...publication } = input;
+  const principal_message = { id: messageId, messaging_group_id: 'chat' };
+  await send('native-publish', { ...publication, operation: 'public_publish', principal_message });
+  const applied = data('native-publish');
+  expect(applied).toMatchObject({ state: 'active', revision: 1 });
+  expect(await view(String(applied.share_id), 'public')).toMatchObject({ html: '<p>Shared report</p>' });
+  await send('native-revoke', {
+    operation: 'revoke',
+    artifact_id: input.artifact_id,
+    share_id: applied.share_id,
+    expected_generation: applied.generation,
+    principal_message,
+  });
+  expect(data('native-revoke')).toMatchObject({ state: 'revoked' });
+  expect(await view(String(applied.share_id), 'public')).toBeUndefined();
 });
 it('applies exact named snapshots through native guard/mailbox; a guest cannot open the private head or another grant', async () => {
   await send('named');

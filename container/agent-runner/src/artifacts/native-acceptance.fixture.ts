@@ -51,7 +51,7 @@ if (phase === 'author') {
     artifact_id: (examples[0].saved as Record<string, unknown>).artifact_id,
     revision: 1,
     expected_hash: (examples[0].saved as Record<string, unknown>).source_hash,
-    principal_message: { id: 'mark', messaging_group_id: 'chat' },
+    principal_message: { id: 'spaces/AAAAjuno/messages/remy.1', messaging_group_id: 'chat' },
   });
   assert(denied.isError, 'A worker must not publish');
 } else {
@@ -59,7 +59,7 @@ if (phase === 'author') {
     ...(JSON.parse(fs.readFileSync('/workspace/agent/references.json', 'utf8')) as Record<string, unknown>[]),
   );
   const saved = examples[0].saved as Record<string, unknown>;
-  const principal_message = { id: 'mark', messaging_group_id: 'chat' };
+  const principal_message = { id: 'spaces/AAAAjuno/messages/remy.1', messaging_group_id: 'chat' };
   const publication = {
     artifact_id: saved.artifact_id,
     revision: 1,

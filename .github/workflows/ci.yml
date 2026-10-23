@@ -45,6 +45,9 @@ jobs:
       - name: Format check
         run: pnpm run format:check
 
+      - name: Artifact preview renderer matches host
+        run: pnpm run artifact-viewer:check
+
       - name: Typecheck host
         run: pnpm exec tsc --noEmit
 

@@ -379,6 +379,9 @@ describe('artifacts operator capability', () => {
       ncl: async (runtime: typeof f.a.runtime, args: readonly string[]) => {
         const policy = await readArtifactsPolicy(instanceArtifactsPolicyFile(runtime));
         if (args[0] === 'gws-ea-artifacts-health' && policy.enabled) {
+          expect(
+            (await readArtifactsOperatorConfig(f.files.configFile))?.assistants[f.a.instanceId]?.publicationReady,
+          ).not.toBe(true);
           observations++;
           if (observations <= 4)
             expect(f.api.ingress().some((route) => route.hostname === 'views.example.test')).toBe(false);
@@ -391,6 +394,35 @@ describe('artifacts operator capability', () => {
     expect(await enableArtifactsCapability(f.paths, f.a.instanceId, {}, dependencies)).toMatchObject({ enabled: true });
     expect(observations).toBeGreaterThanOrEqual(4);
     expect(waits).toEqual([500, 500, 500]);
+    expect((await readArtifactsOperatorConfig(f.files.configFile))?.assistants[f.a.instanceId]?.publicationReady).toBe(
+      true,
+    );
+  });
+
+  it('never admits publication when ingress opens but final connector verification fails', async () => {
+    const f = await provisionFixture();
+    const dependencies = {
+      ...f.dependencies,
+      fetch: (async (input, init) => {
+        if (String(input).endsWith('/connections')) {
+          expect(f.api.ingress().some((route) => route.hostname === 'views.example.test')).toBe(true);
+          expect(
+            (await readArtifactsOperatorConfig(f.files.configFile))?.assistants[f.a.instanceId]?.publicationReady,
+          ).not.toBe(true);
+          throw new Error('Fixture connector verification failed');
+        }
+        return f.api.transport(input, init);
+      }) satisfies typeof fetch,
+    };
+    await expect(enableArtifactsCapability(f.paths, f.a.instanceId, {}, dependencies)).rejects.toMatchObject({
+      code: 'artifacts_not_ready',
+    });
+    expect((await readArtifactsPolicy(instanceArtifactsPolicyFile(f.a.runtime))).enabled).toBe(false);
+    expect((await readArtifactsOperatorConfig(f.files.configFile))?.assistants[f.a.instanceId]).toMatchObject({
+      enabled: false,
+      publicationReady: false,
+    });
+    expect(f.api.ingress().some((route) => route.hostname === 'views.example.test')).toBe(false);
   });
 
   it('keeps ingress closed when the running host cannot verify its listener', async () => {
@@ -427,6 +459,7 @@ describe('artifacts operator capability', () => {
     expect((await readArtifactsPolicy(instanceArtifactsPolicyFile(f.a.runtime))).enabled).toBe(false);
     expect((await readArtifactsOperatorConfig(f.files.configFile))?.assistants[f.a.instanceId]).toMatchObject({
       enabled: false,
+      publicationReady: false,
       applicationId: f.api.apps[0].id,
     });
     f.api.reject(undefined);

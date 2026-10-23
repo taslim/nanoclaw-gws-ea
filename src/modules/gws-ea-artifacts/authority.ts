@@ -70,7 +70,9 @@ function integer(value: unknown): number {
 function mark(value: unknown): ArtifactPrincipalMark {
   if (!isRecord(value)) throw invalidArgs('Cite the principal_message.');
   closed(value, ['id', 'messaging_group_id']);
-  return { id: id(value.id), messaging_group_id: id(value.messaging_group_id) };
+  if (typeof value.id !== 'string' || !value.id.trim() || value.id.length > 1024 || hasControlCharacters(value.id))
+    throw invalidArgs('Cite a valid principal message ID.');
+  return { id: value.id, messaging_group_id: id(value.messaging_group_id) };
 }
 export function parseArtifactShare(content: Record<string, unknown>): ArtifactShareInput {
   const operation = content.operation;

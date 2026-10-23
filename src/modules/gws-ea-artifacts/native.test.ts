@@ -84,7 +84,7 @@ it.skipIf(!process.env.GWS_EA_ARTIFACT_NATIVE_IMAGE)(
       created_at: now,
     });
     await getDb().run(
-      "INSERT INTO gws_ea_principal_messages(message_id,messaging_group_id,user_id,timestamp,text) VALUES('mark','chat','gchat:principal',?,'Share the selected revision with Alex and Sam, publish, republish and revoke it.')",
+      "INSERT INTO gws_ea_principal_messages(message_id,messaging_group_id,user_id,timestamp,text) VALUES('spaces/AAAAjuno/messages/remy.1','chat','gchat:principal',?,'Share the selected revision with Alex and Sam, publish, republish and revoke it.')",
       now,
     );
     const main = (await resolveSystemSession('canonical', 'system:artifacts-native')).session;
