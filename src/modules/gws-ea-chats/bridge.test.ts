@@ -672,3 +672,51 @@ it('checks a member-supplied email for Google access beside a public artifact li
   accepted(await request(main, 'chat_handoff', fields));
   expect(await listChatHandoffs(id)).toHaveLength(1);
 });
+it('requires native principal membership for private artifact handoffs while retaining named email grants', async () => {
+  const id = await chat();
+  const policy = path.join(ROOT, 'artifact-policy.json');
+  fs.writeFileSync(
+    policy,
+    JSON.stringify({
+      schemaVersion: 1,
+      enabled: true,
+      hostname: 'views.example.com',
+      pathPrefix: '/aya',
+      listenPort: 9123,
+      accessIssuer: 'https://team.cloudflareaccess.com',
+      accessAud: 'aud',
+      cloudflare: { accountId: 'a', applicationId: 'b', operatorConfigFile: '/private/tmp/cf.json' },
+    }),
+    { mode: 0o600 },
+  );
+  vi.stubEnv('GWS_EA_ARTIFACTS_POLICY_FILE', policy);
+  const source = prepareArtifactSource(Buffer.from('<p>Principal report</p>'));
+  const saved = await saveArtifact(
+    { agentGroupId: 'main', sessionId: main.id, isMain: true },
+    { requestId: 'principal-report', action: 'save', fingerprint: 'principal-report' },
+    { title: 'Principal report', create_key: 'principal-report' },
+    source,
+  );
+  const share = '11111111-1111-4111-8111-111111111111';
+  const now = new Date().toISOString();
+  await getDb().run(
+    "INSERT INTO gws_ea_artifact_shares(share_id,artifact_id,kind,revision,source_hash,generation,state,scope_hash,created_at,updated_at) VALUES(?,?,'named',1,?,1,'active','scope',?,?)",
+    share,
+    saved.artifact_id,
+    source.source_hash,
+    now,
+    now,
+  );
+  const fields = {
+    chat: id,
+    message: `https://views.example.com/aya/${saved.artifact_id}`,
+    matter: 'nowhere',
+    people: [{ member: 'whatsapp:22', email: 'juno@example.com' }],
+  };
+  expect(refused(await request(main, 'chat_handoff', fields))).toContain('artifact access');
+  expect(await listChatHandoffs(id)).toEqual([]);
+  accepted(await request(main, 'chat_handoff', { ...fields, message: `https://views.example.com/aya/share/${share}` }));
+  members = members.filter((member) => member.isPrincipal);
+  accepted(await request(main, 'chat_handoff', { chat: id, message: fields.message, matter: 'nowhere' }));
+  expect(await listChatHandoffs(id)).toHaveLength(2);
+});

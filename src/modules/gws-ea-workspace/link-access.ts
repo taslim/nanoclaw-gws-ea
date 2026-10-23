@@ -81,6 +81,8 @@ export interface LinkCheckRequest {
   readonly artifactRecipients?: readonly string[];
   /** A current chat member whose email identity is unknown; artifact named/private links cannot pass them. */
   readonly unknownRecipients?: boolean;
+  /** Native chat membership, independent of supplied emails; private artifact links require the principal alone. */
+  readonly nonPrincipalChatMembers?: boolean;
   readonly writer: LinkWriter;
 }
 
@@ -552,6 +554,7 @@ export async function checkLinksOpenable(request: LinkCheckRequest): Promise<Lin
     texts: request.texts,
     recipients: request.artifactRecipients ?? request.recipients,
     unknownRecipients: request.unknownRecipients,
+    nonPrincipalChatMembers: request.nonPrincipalChatMembers,
   });
   if (!artifacts.allowed) return artifacts;
   shared ??= createLinkAccess({

@@ -214,7 +214,11 @@ async function checkHandoffLinks(
       texts,
       recipients: addresses.filter((address): address is string => address !== null),
       ...(artifactAudience
-        ? { artifactRecipients: artifactAudience.recipients, unknownRecipients: artifactAudience.unknownRecipients }
+        ? {
+            artifactRecipients: artifactAudience.recipients,
+            unknownRecipients: artifactAudience.unknownRecipients,
+            nonPrincipalChatMembers: artifactAudience.nonPrincipalChatMembers,
+          }
         : {}),
       writer: 'main',
     });

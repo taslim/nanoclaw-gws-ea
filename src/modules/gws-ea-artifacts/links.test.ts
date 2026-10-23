@@ -197,6 +197,40 @@ it('refuses a final channel delivery after revocation and never drops a member w
     'second',
   );
   expect(deliver).toHaveBeenCalledTimes(2);
+  await getDb().run("UPDATE gws_ea_chat_members SET email='principal@example.com' WHERE member_key='known'");
+  await expect(
+    channel.deliver(
+      'gchat',
+      'room',
+      null,
+      'chat',
+      JSON.stringify({ text: `${base}/${artifactId}` }),
+      undefined,
+      'second',
+    ),
+  ).rejects.toBeInstanceOf(OutboundRefusedError);
+  expect(deliver).toHaveBeenCalledTimes(2);
+  await channel.deliver(
+    'gchat',
+    'room',
+    null,
+    'chat',
+    JSON.stringify({ text: `${base}/share/${shareId}` }),
+    undefined,
+    'second',
+  );
+  expect(deliver).toHaveBeenCalledTimes(3);
+  await getDb().run("UPDATE gws_ea_chat_members SET is_principal=1 WHERE member_key='known'");
+  await channel.deliver(
+    'gchat',
+    'room',
+    null,
+    'chat',
+    JSON.stringify({ text: `${base}/${artifactId}` }),
+    undefined,
+    'second',
+  );
+  expect(deliver).toHaveBeenCalledTimes(4);
   await getDb().run("UPDATE gws_ea_artifact_shares SET state='revoked' WHERE share_id=?", shareId);
   await expect(
     channel.deliver(
@@ -209,5 +243,5 @@ it('refuses a final channel delivery after revocation and never drops a member w
       'second',
     ),
   ).rejects.toBeInstanceOf(OutboundRefusedError);
-  expect(deliver).toHaveBeenCalledTimes(2);
+  expect(deliver).toHaveBeenCalledTimes(4);
 });

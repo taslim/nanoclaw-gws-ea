@@ -13,6 +13,7 @@ interface ArtifactLinkCheckRequest {
   readonly texts: readonly string[];
   readonly recipients: readonly string[];
   readonly unknownRecipients?: boolean;
+  readonly nonPrincipalChatMembers?: boolean;
 }
 type ArtifactLinkCheck = { readonly allowed: true } | { readonly allowed: false; readonly reason: string };
 const URLS = /https?:\/\/[^\s<>"'`\\]+/giu;
@@ -43,7 +44,11 @@ export async function hasArtifactLinks(texts: readonly string[]): Promise<boolea
 /** Current host-confirmed chat identities. An unknown member is retained even beside known recipients. */
 export async function artifactAudienceForMembers(
   members: readonly Pick<ChatMember, 'is_principal' | 'email' | 'email_source'>[],
-): Promise<{ readonly recipients: readonly string[]; readonly unknownRecipients: boolean }> {
+): Promise<{
+  readonly recipients: readonly string[];
+  readonly unknownRecipients: boolean;
+  readonly nonPrincipalChatMembers: boolean;
+}> {
   const principals = (await listPrincipalAddresses()).map(({ email }) => email);
   const recipients: string[] = [];
   let unknownRecipients = members.length === 0;
@@ -54,7 +59,11 @@ export async function artifactAudienceForMembers(
     } else if (member.email && member.email_source === 'main') recipients.push(member.email);
     else unknownRecipients = true;
   }
-  return { recipients: [...new Set(recipients)], unknownRecipients };
+  return {
+    recipients: [...new Set(recipients)],
+    unknownRecipients,
+    nonPrincipalChatMembers: members.some((member) => member.is_principal !== 1),
+  };
 }
 /** Concrete local artifact URLs only: no network, Access token, source read or generic link registry. */
 export async function checkArtifactLinksOpenable(request: ArtifactLinkCheckRequest): Promise<ArtifactLinkCheck> {
@@ -92,6 +101,7 @@ export async function checkArtifactLinksOpenable(request: ArtifactLinkCheckReque
       );
       if (
         !live ||
+        request.nonPrincipalChatMembers === true ||
         request.unknownRecipients === true ||
         recipients.length === 0 ||
         recipients.some((email) => email === undefined || !principals.has(email))
@@ -139,10 +149,14 @@ export async function judgeArtifactSend(send: OutboundSend): Promise<OutboundGua
     if (isUtf8(file.data)) texts.push(file.data.toString('utf8'));
   }
   if (artifactUrls(texts, policy.config).length === 0) return { effect: 'allow' };
-  let audience: { readonly recipients: readonly string[]; readonly unknownRecipients: boolean };
+  let audience: {
+    readonly recipients: readonly string[];
+    readonly unknownRecipients: boolean;
+    readonly nonPrincipalChatMembers: boolean;
+  };
   if ((await resolveAudience(send)) === 'principal') {
     const recipients = (await listPrincipalAddresses()).map(({ email }) => email);
-    audience = { recipients, unknownRecipients: recipients.length === 0 };
+    audience = { recipients, unknownRecipients: recipients.length === 0, nonPrincipalChatMembers: false };
   } else {
     const target = await getDb().get<{ id: string }>(
       'SELECT id FROM messaging_groups WHERE channel_type=? AND platform_id=? AND instance=?',
