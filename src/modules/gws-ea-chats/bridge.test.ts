@@ -58,6 +58,7 @@ import '../gws-ea-people/index.js';
 import '../gws-ea-privacy/index.js';
 import '../gws-ea-matters/index.js';
 import '../gws-ea-chat-agents/index.js';
+import '../gws-ea-artifacts/index.js';
 import './index.js';
 import {
   initChannelAdapters,
@@ -88,6 +89,8 @@ import { getChatCalendar, chatFiles, listChatHandoffs } from './handoffs.js';
 import { flushChatHandoffs, inChatConversation } from './bridge.js';
 import { judgeSend } from '../gws-ea-privacy/outbound.js';
 import { WHATSAPP_DIRECTORY_ENV, writeWhatsAppLink } from '../gws-ea-whatsapp/paths.js';
+import { prepareArtifactSource, saveArtifact } from '../gws-ea-artifacts/db.js';
+import { setChatMemberEmail } from './roster.js';
 
 let main: Session;
 let sequence = 0;
@@ -618,4 +621,54 @@ it('checks an artifact-only handoff before exposing it to chat members', async (
     ),
   ).toContain('artifact access');
   expect(await listChatHandoffs(id)).toEqual([]);
+});
+it('checks a member-supplied email for Google access beside a public artifact link', async () => {
+  const id = await chat();
+  await setChatMemberEmail(id, 'whatsapp:22', 'mira@example.com', 'member');
+  const policy = path.join(ROOT, 'artifact-policy.json');
+  fs.writeFileSync(
+    policy,
+    JSON.stringify({
+      schemaVersion: 1,
+      enabled: true,
+      hostname: 'views.example.com',
+      pathPrefix: '/aya',
+      listenPort: 9123,
+      accessIssuer: 'https://team.cloudflareaccess.com',
+      accessAud: 'aud',
+      cloudflare: { accountId: 'a', applicationId: 'b', operatorConfigFile: '/private/tmp/cf.json' },
+    }),
+    { mode: 0o600 },
+  );
+  vi.stubEnv('GWS_EA_ARTIFACTS_POLICY_FILE', policy);
+  const source = prepareArtifactSource(Buffer.from('<p>Public report</p>'));
+  const saved = await saveArtifact(
+    { agentGroupId: 'main', sessionId: main.id, isMain: true },
+    { requestId: 'public-report', action: 'save', fingerprint: 'public-report' },
+    { title: 'Public report', create_key: 'public-report' },
+    source,
+  );
+  const share = '22222222-2222-4222-8222-222222222222';
+  const now = new Date().toISOString();
+  await getDb().run(
+    "INSERT INTO gws_ea_artifact_shares(share_id,artifact_id,kind,revision,source_hash,generation,state,scope_hash,created_at,updated_at) VALUES(?,?,'public',1,?,1,'active','scope',?,?)",
+    share,
+    saved.artifact_id,
+    source.source_hash,
+    now,
+    now,
+  );
+  const drive = workspace.drive as FakeDrive;
+  const memberPermissionId = drive.addAccount('mira@example.com');
+  const file = await drive.createFile({ name: 'Private itinerary', mimeType: 'application/vnd.google-apps.document' });
+  const fields = {
+    chat: id,
+    message: `https://docs.google.com/document/d/${file.id}/edit https://views.example.com/aya/public/${share}`,
+    matter: 'nowhere',
+  };
+  expect(refused(await request(main, 'chat_handoff', fields))).toContain('mira@example.com');
+  expect(await listChatHandoffs(id)).toEqual([]);
+  drive.share(file.id, { id: memberPermissionId, type: 'user', role: 'reader', emailAddress: 'mira@example.com' });
+  accepted(await request(main, 'chat_handoff', fields));
+  expect(await listChatHandoffs(id)).toHaveLength(1);
 });

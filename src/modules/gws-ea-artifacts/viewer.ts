@@ -1,3 +1,4 @@
+import { defaultTreeAdapter, html as htmlNamespace, parse, serialize } from 'parse5';
 import { artifactExecutableHtml, type ArtifactDocument } from './document.js';
 
 export const ARTIFACT_CONNECTION_POLICY = '(); report-to=gws-ea-artifact-isolation';
@@ -50,9 +51,15 @@ function finish(verified){if(settled)return;settled=true;clearTimeout(timer);obs
 document.open();document.write(authored);document.close();bindSources();document.documentElement.dataset.artifactMode='interactive';}
 try{observer=new ReportingObserver(reports=>{for(const report of reports){const body=report.body?.toJSON?.();if(report.type==='connection-allowlist'&&body?.disposition==='enforce'&&body?.connection==='webrtc'&&Array.isArray(body?.allowlist)&&body.allowlist.length===0){finish(true);break;}}},{types:['connection-allowlist'],buffered:false});observer.observe();timer=setTimeout(()=>finish(false),900);const connection=new RTCPeerConnection({iceServers:[]});connection.close();}catch{finish(false);}
 })();`;
-  const body = document.staticHtml.replace('</body>', `<script nonce="${nonce}">${bootstrap}</script></body>`);
+  const parsed = parse(document.staticHtml);
+  const html = parsed.childNodes.filter(defaultTreeAdapter.isElementNode).find((node) => node.tagName === 'html');
+  const body = html?.childNodes.filter(defaultTreeAdapter.isElementNode).find((node) => node.tagName === 'body');
+  if (!body) throw new Error('Artifact static document has no body.');
+  const script = defaultTreeAdapter.createElement('script', htmlNamespace.NS.HTML, [{ name: 'nonce', value: nonce }]);
+  defaultTreeAdapter.insertText(script, bootstrap);
+  defaultTreeAdapter.appendChild(body, script);
   return {
-    body,
+    body: serialize(parsed),
     headers: {
       ...headers(
         `default-src 'none'; script-src 'nonce-${nonce}'${document.handlerHashes.length ? ` 'unsafe-hashes' ${document.handlerHashes.join(' ')}` : ''}; style-src 'unsafe-inline'; img-src data:; font-src data:; connect-src 'none'; worker-src 'none'; frame-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'self'; sandbox allow-scripts`,

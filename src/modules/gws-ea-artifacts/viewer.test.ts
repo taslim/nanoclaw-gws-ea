@@ -2,7 +2,9 @@ import { existsSync } from 'node:fs';
 import { createServer, type Server } from 'node:http';
 import { createSocket } from 'node:dgram';
 import { createServer as createTcpServer } from 'node:net';
+import { Script } from 'node:vm';
 import { chromium, type Browser, type BrowserContext } from 'playwright-core';
+import { defaultTreeAdapter, parse } from 'parse5';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { parseArtifactDocument } from './document.js';
 import { renderArtifactChild, renderArtifactViewer } from './viewer.js';
@@ -18,6 +20,29 @@ const executablePath =
 if (configuredChrome && !existsSync(configuredChrome))
   throw new Error(`Configured artifact test Chromium is missing: ${configuredChrome}`);
 const nonce = '0123456789abcdef0123456789abcdef';
+it.each([
+  '<p>Budget</p>',
+  '<p title="</body>">Budget</p>',
+  '<style>body::after{content:"</body>"}</style><p>Budget</p>',
+  '<template><p title="</body>">Template</p></template><p>Budget</p>',
+])('places an intact executable bootstrap in the actual body despite literal closing tags: %s', (content) => {
+  const document = parseArtifactDocument(
+    `<!doctype html><html><body>${content}<p>$& $\` $'</p><script>document.title="Interactive"</script></body></html><!-- </body> -->`,
+  );
+  const rendered = parse(renderArtifactChild({ document, nonce }).body);
+  const html = rendered.childNodes.filter(defaultTreeAdapter.isElementNode).find((node) => node.tagName === 'html');
+  const body = html?.childNodes.filter(defaultTreeAdapter.isElementNode).find((node) => node.tagName === 'body');
+  if (!body) throw new Error('Missing rendered body.');
+  const scripts = body.childNodes.filter(defaultTreeAdapter.isElementNode).filter((node) => node.tagName === 'script');
+  expect(scripts).toHaveLength(1);
+  expect(scripts[0].attrs).toContainEqual({ name: 'nonce', value: nonce });
+  const bootstrap = scripts[0].childNodes
+    .filter(defaultTreeAdapter.isTextNode)
+    .map((node) => node.value)
+    .join('');
+  expect(bootstrap).toContain("$&amp; $` $'");
+  expect(() => new Script(bootstrap)).not.toThrow();
+});
 const fixtureHtml = `<!doctype html><html><head><style>body{font:18px system-ui;margin:20px}button,input{font:inherit}svg{max-width:100%}</style></head><body><h1>Budget scenario</h1><p>Base budget: $42</p><label>Multiplier <input id="factor" type="number" value="2"></label><button id="calculate">Calculate</button><output id="result">84</output><p><a href="https://example.com/source">Evidence</a></p><script>document.querySelector('#calculate').addEventListener('click',()=>document.querySelector('#result').textContent=42*Number(document.querySelector('#factor').value));</script></body></html>`;
 let browser: Browser;
 let server: Server;
@@ -142,6 +167,7 @@ describe.skipIf(!executablePath)('actual Chromium artifact boundary', () => {
       await page.evaluate("postMessage({type:'artifact-source',id:'source-1'},'*')");
       expect(await page.locator('details').getAttribute('open')).toBeNull();
       await page.frames()[1].waitForFunction("document.documentElement.dataset.artifactMode === 'interactive'");
+      await page.frames()[1].waitForFunction("document.readyState === 'complete'");
       await page.frames()[1].locator('[data-artifact-source]').click();
       await page.locator('details[open]').waitFor({ timeout: 1500 });
       expect(await page.locator('a#source-1').getAttribute('href')).toBe('https://example.com/source');

@@ -213,7 +213,9 @@ async function checkHandoffLinks(
     const checked = await checkLinksOpenable({
       texts,
       recipients: addresses.filter((address): address is string => address !== null),
-      ...(artifactAudience ?? {}),
+      ...(artifactAudience
+        ? { artifactRecipients: artifactAudience.recipients, unknownRecipients: artifactAudience.unknownRecipients }
+        : {}),
       writer: 'main',
     });
     if (!checked.allowed) throw forbidden(`Nothing was handed over: ${checked.reason}`);

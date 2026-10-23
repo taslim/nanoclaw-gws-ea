@@ -77,6 +77,8 @@ export interface LinkCheckRequest {
   readonly texts: readonly string[];
   /** Everyone the message reaches. The principal's addresses are never checked. */
   readonly recipients: readonly string[];
+  /** Host-confirmed artifact identities when a chat has stricter identity requirements than Google. */
+  readonly artifactRecipients?: readonly string[];
   /** A current chat member whose email identity is unknown; artifact named/private links cannot pass them. */
   readonly unknownRecipients?: boolean;
   readonly writer: LinkWriter;
@@ -546,7 +548,11 @@ let shared: LinkAccess | undefined;
  * decide.
  */
 export async function checkLinksOpenable(request: LinkCheckRequest): Promise<LinkCheck> {
-  const artifacts = await checkArtifactLinksOpenable(request);
+  const artifacts = await checkArtifactLinksOpenable({
+    texts: request.texts,
+    recipients: request.artifactRecipients ?? request.recipients,
+    unknownRecipients: request.unknownRecipients,
+  });
   if (!artifacts.allowed) return artifacts;
   shared ??= createLinkAccess({
     drive: createDriveApi({ token: driveToken, fetch: shortFetch }),
