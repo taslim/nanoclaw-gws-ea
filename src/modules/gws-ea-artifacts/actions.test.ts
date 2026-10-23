@@ -171,11 +171,10 @@ it('gives own metadata and exact requested source only to the calling session in
   const checkout = accepted(
     await request(another, 'artifact_read', { artifact_id: artifactId, checkout: true }, 'checkout'),
   );
-  expect(checkout.file).toBe(`inbox/checkout/${String(artifactId)}-r1.html`);
-  expect(fs.readFileSync(path.join(sessionDir('author', another.id), String(checkout.file)), 'utf8')).toContain(
-    '<h1>Trip</h1>',
-  );
-  expect(fs.existsSync(path.join(sessionDir('author', author.id), String(checkout.file)))).toBe(false);
+  expect(checkout.file).toBe(`/workspace/inbox/checkout/${String(artifactId)}-r1.html`);
+  const inboxPath = String(checkout.file).slice('/workspace/'.length);
+  expect(fs.readFileSync(path.join(sessionDir('author', another.id), inboxPath), 'utf8')).toContain('<h1>Trip</h1>');
+  expect(fs.existsSync(path.join(sessionDir('author', author.id), inboxPath))).toBe(false);
   await updateContainerConfigJson('peer', 'capabilities', ['artifacts']);
   expect(refusal(await request(peer, 'artifact_read', { artifact_id: artifactId, checkout: true }))).toContain(
     'unavailable to you',
@@ -264,4 +263,22 @@ it('returns old revision metadata without exposing a later private title or load
   expect(old.title).toBe('Trip');
   expect(old).not.toHaveProperty('html');
   expect(queries.mock.calls.some(([sql]) => /SELECT[^]*\bhtml\b/u.test(sql))).toBe(false);
+});
+
+it('refuses unsupported artifact documents at save, before any content is persisted', async () => {
+  const id = 'remote-source';
+  stage(author, id, '<html><body><img src="https://example.com/tracker.png"></body></html>');
+  expect(
+    refusal(await request(author, 'artifact_save', { create_key: id, title: 'Unsafe', file: 'view.html' }, id)),
+  ).toContain('remote resource');
+  expect(await getDb().all('SELECT artifact_id FROM gws_ea_artifacts')).toEqual([]);
+});
+
+it('authorizes local preview through the mailbox and refuses stale tools after capability disable', async () => {
+  expect(accepted(await request(author, 'artifact_preview_authorize', {}))).toEqual({
+    authorized: true,
+    session_id: author.id,
+  });
+  writePolicy(false);
+  expect(refusal(await request(author, 'artifact_preview_authorize', {}))).toContain('current capability');
 });

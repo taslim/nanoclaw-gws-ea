@@ -73,6 +73,7 @@ export {
   linkTargets,
   messageStrings,
   privateValuesGivenAway,
+  privateValuesGivenAwayInHtml,
   privateKindNoun,
   type OutboundCheck,
   type PrivateValueReference,

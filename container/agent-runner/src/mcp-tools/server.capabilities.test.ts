@@ -160,6 +160,11 @@ describe('NanoClaw tool server capabilities', () => {
     ['google-calendar', ['google-calendar'], CALENDAR_TOOLS],
     ['browser', ['browser'], BROWSER_TOOLS],
     [
+      'artifacts',
+      ['artifacts'],
+      ['artifact_delete', 'artifact_list', 'artifact_preview', 'artifact_read', 'artifact_save', 'artifact_share'],
+    ],
+    [
       'browser-delegate',
       ['browser-delegate'],
       [

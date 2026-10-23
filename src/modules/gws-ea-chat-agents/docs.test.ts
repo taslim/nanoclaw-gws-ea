@@ -324,6 +324,7 @@ afterEach(async () => {
   await teardownChannelAdapters();
   await closeDb();
   vi.unstubAllGlobals();
+  vi.unstubAllEnvs();
   fs.rmSync(ROOT, { recursive: true, force: true });
 });
 
@@ -747,4 +748,32 @@ it('keeps an ambiguous folder under the same reserved ID when Drive cannot confi
   expect(folderCreates).toHaveLength(1);
   expect(generatedFolderIds).toBe(1);
   expect(documents.size).toBe(0);
+});
+it('checks artifact-only links before an edit or a document share exposes them', async () => {
+  const file = await made();
+  const policy = `${ROOT}/artifact-policy.json`;
+  fs.writeFileSync(
+    policy,
+    JSON.stringify({
+      schemaVersion: 1,
+      enabled: true,
+      hostname: 'views.example.com',
+      pathPrefix: '/aya',
+      listenPort: 9123,
+      accessIssuer: 'https://team.cloudflareaccess.com',
+      accessAud: 'aud',
+      cloudflare: { accountId: 'a', applicationId: 'b', operatorConfigFile: '/private/tmp/cf.json' },
+    }),
+    { mode: 0o600 },
+  );
+  vi.stubEnv('GWS_EA_ARTIFACTS_POLICY_FILE', policy);
+  const link = 'https://views.example.com/aya/share/11111111-1111-4111-8111-111111111111';
+  expect(
+    refused(
+      await request(job, 'doc_edit', { file, revision: await observedRevision(file), find: 'the lake', replace: link }),
+    ),
+  ).toContain('artifact access');
+  expect(documents.get(file)?.text).toBe('Friday at the lake.');
+  documents.set(file, { title: 'Trip plan', text: link, revision: 3 });
+  expect(refused(await request(job, 'doc_share', { file }))).toContain('artifact access');
 });

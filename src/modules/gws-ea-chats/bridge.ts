@@ -21,6 +21,7 @@ import { runInConversationTail } from '../../router.js';
 import { readOutboxFiles, resolveSession, writeSessionMessage } from '../../session-manager.js';
 import type { Session } from '../../types.js';
 import type { AssistantChatChannel } from '../gws-ea-chat/membership.js';
+import { artifactAudienceForMembers, hasArtifactLinks } from '../gws-ea-artifacts/links.js';
 import { getJobAgent } from '../gws-ea-chat-agents/jobs.js';
 import { hostGoogleAccessToken } from '../gws-ea-google/index.js';
 import { isBookableCalendar } from '../gws-ea-inbox/calendar-notifications.js';
@@ -181,7 +182,8 @@ async function checkHandoffLinks(
   people: readonly PersonEmail[],
 ): Promise<void> {
   const links = googleLinksIn(texts);
-  if (links.length === 0) return;
+  const artifacts = await hasArtifactLinks(texts);
+  if (links.length === 0 && !artifacts) return;
   const outside = members.filter((member) => member.is_principal !== 1);
   const addresses = outside.map(
     (member) => people.find((person) => person.member === member.member_key)?.email ?? member.email,
@@ -200,9 +202,18 @@ async function checkHandoffLinks(
             'Nothing was handed over: a chat member has no email address, so their access to the link cannot be checked. Supply that member’s email in people, or use a public link.',
           );
     }
+    const artifactAudience = artifacts
+      ? await artifactAudienceForMembers(
+          members.map((member) => {
+            const supplied = people.find((person) => person.member === member.member_key)?.email;
+            return supplied ? { ...member, email: supplied, email_source: 'main' as const } : member;
+          }),
+        )
+      : undefined;
     const checked = await checkLinksOpenable({
       texts,
       recipients: addresses.filter((address): address is string => address !== null),
+      ...(artifactAudience ?? {}),
       writer: 'main',
     });
     if (!checked.allowed) throw forbidden(`Nothing was handed over: ${checked.reason}`);

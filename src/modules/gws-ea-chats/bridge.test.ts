@@ -588,3 +588,34 @@ it('does not detach a chat when its native platform refuses the leave', async ()
   expect(refused(await request(main, 'chat_leave', { chat: id }))).toMatch(/Platform refused/);
   expect((await getChat(id))?.state).toBe('connected');
 });
+it('checks an artifact-only handoff before exposing it to chat members', async () => {
+  const id = await chat();
+  const policy = path.join(ROOT, 'artifact-policy.json');
+  fs.writeFileSync(
+    policy,
+    JSON.stringify({
+      schemaVersion: 1,
+      enabled: true,
+      hostname: 'views.example.com',
+      pathPrefix: '/aya',
+      listenPort: 9123,
+      accessIssuer: 'https://team.cloudflareaccess.com',
+      accessAud: 'aud',
+      cloudflare: { accountId: 'a', applicationId: 'b', operatorConfigFile: '/private/tmp/cf.json' },
+    }),
+    { mode: 0o600 },
+  );
+  vi.stubEnv('GWS_EA_ARTIFACTS_POLICY_FILE', policy);
+  const message = 'https://views.example.com/aya/share/11111111-1111-4111-8111-111111111111';
+  expect(
+    refused(
+      await request(main, 'chat_handoff', {
+        chat: id,
+        message,
+        matter: 'nowhere',
+        people: [{ member: 'whatsapp:22', email: 'mira@example.com' }],
+      }),
+    ),
+  ).toContain('artifact access');
+  expect(await listChatHandoffs(id)).toEqual([]);
+});

@@ -13,6 +13,7 @@ import type { DeliveryGuardSpec, GuardedDeliveryHandler } from '../../delivery-g
 import { hasControlCharacters, isRecord } from '../../gws-ea/validation.js';
 import { ALLOW, DENY, defineGuardedAction } from '../../guard/index.js';
 import type { Session } from '../../types.js';
+import { artifactAudienceForMembers, hasArtifactLinks } from '../gws-ea-artifacts/links.js';
 import { inChatConversation, requireServingChat } from '../gws-ea-chats/bridge.js';
 import type { Chat } from '../gws-ea-chats/db.js';
 import { refreshChatMembership } from '../gws-ea-chats/join.js';
@@ -121,12 +122,22 @@ async function safe(texts: readonly string[], chat: string, file: string): Promi
     throw forbidden(
       `The document was not written or shared: ${check.reason} Tell main if the principal wants to share it.`,
     );
-  if (googleLinksIn(texts).length === 0) return;
-  await checkLinks(texts, memberEmails(await listChatMembers(chat)));
+  const google = googleLinksIn(texts).length > 0;
+  if (!google && !(await hasArtifactLinks(texts))) return;
+  const members = await listChatMembers(chat);
+  if (google) await checkLinks(texts, memberEmails(members));
+  else {
+    const audience = await artifactAudienceForMembers(members);
+    await checkLinks(texts, audience.recipients, audience.unknownRecipients);
+  }
 }
-async function checkLinks(texts: readonly string[], recipients: readonly string[]): Promise<void> {
+async function checkLinks(
+  texts: readonly string[],
+  recipients: readonly string[],
+  unknownRecipients = false,
+): Promise<void> {
   try {
-    const check = await checkLinksOpenable({ texts, recipients, writer: 'job' });
+    const check = await checkLinksOpenable({ texts, recipients, unknownRecipients, writer: 'job' });
     if (!check.allowed) throw forbidden(check.reason);
   } catch (error) {
     if (error instanceof LinkCheckUnavailableError) throw forbidden(LINKS_UNCHECKED);
@@ -134,7 +145,11 @@ async function checkLinks(texts: readonly string[], recipients: readonly string[
   }
 }
 async function refreshForWrite(texts: readonly string[], chat: string): Promise<void> {
-  if (googleLinksIn(texts).length > 0 || !(await checkOutbound(texts, 'others')).allowed)
+  if (
+    googleLinksIn(texts).length > 0 ||
+    (await hasArtifactLinks(texts)) ||
+    !(await checkOutbound(texts, 'others')).allowed
+  )
     await refreshChatMembership(chat);
 }
 function memberEmails(members: readonly ChatMember[], includePrincipal = false): string[] {
