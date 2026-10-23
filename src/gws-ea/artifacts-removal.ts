@@ -167,8 +167,7 @@ async function stopConnector(
     if (uid === undefined)
       throw new GwsEaError('artifacts_connector_unavailable', 'Cannot identify the connector service user.');
     const service = `gui/${uid}/${connector.label}`;
-    const absent = (result: { readonly exitCode: number; readonly stderr: string }) =>
-      result.exitCode !== 0 && /could not find service/iu.test(result.stderr);
+    const absent = (result: { readonly exitCode: number }) => result.exitCode === 113;
     const observed = await invoke('launchctl', ['print', service]);
     if (!absent(observed)) {
       if (

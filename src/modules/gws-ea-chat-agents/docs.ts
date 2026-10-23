@@ -123,21 +123,30 @@ async function safe(texts: readonly string[], chat: string, file: string): Promi
       `The document was not written or shared: ${check.reason} Tell main if the principal wants to share it.`,
     );
   const google = googleLinksIn(texts).length > 0;
-  if (!google && !(await hasArtifactLinks(texts))) return;
+  const artifacts = await hasArtifactLinks(texts);
+  if (!google && !artifacts) return;
   const members = await listChatMembers(chat);
-  if (google) await checkLinks(texts, memberEmails(members));
-  else {
-    const audience = await artifactAudienceForMembers(members);
-    await checkLinks(texts, audience.recipients, audience.unknownRecipients);
-  }
+  const audience = artifacts ? await artifactAudienceForMembers(members) : undefined;
+  await checkLinks(texts, google ? memberEmails(members) : [], audience);
 }
 async function checkLinks(
   texts: readonly string[],
   recipients: readonly string[],
-  unknownRecipients = false,
+  artifactAudience?: Awaited<ReturnType<typeof artifactAudienceForMembers>>,
 ): Promise<void> {
   try {
-    const check = await checkLinksOpenable({ texts, recipients, unknownRecipients, writer: 'job' });
+    const check = await checkLinksOpenable({
+      texts,
+      recipients,
+      ...(artifactAudience
+        ? {
+            artifactRecipients: artifactAudience.recipients,
+            unknownRecipients: artifactAudience.unknownRecipients,
+            nonPrincipalChatMembers: artifactAudience.nonPrincipalChatMembers,
+          }
+        : {}),
+      writer: 'job',
+    });
     if (!check.allowed) throw forbidden(check.reason);
   } catch (error) {
     if (error instanceof LinkCheckUnavailableError) throw forbidden(LINKS_UNCHECKED);

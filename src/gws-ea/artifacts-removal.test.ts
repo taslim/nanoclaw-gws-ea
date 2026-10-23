@@ -418,7 +418,7 @@ it('removes an assistant with no artifact intent despite an unreadable optional 
   expect(f.effects).toEqual([]);
 });
 
-it('boots out and verifies the exact owned launchd connector before removing its definition and credentials', async () => {
+async function launchdFixture() {
   const f = await fixture();
   const label = 'com.gws-ea.artifacts.0123456789abcdef';
   const definitionFile = path.join(f.root, 'Library/LaunchAgents', `${label}.plist`);
@@ -443,29 +443,41 @@ it('boots out and verifies the exact owned launchd connector before removing its
       standardErrorPath: path.join(f.files.root, 'connector.error.log'),
     }),
   );
-  let running = true;
-  const commands: string[][] = [];
-  await removeAssistant(f.paths, f.own.instance_id, {
-    ...f.dependencies,
-    runCommand: async (command) => {
-      commands.push([...command.args]);
-      if (command.args[0] === 'bootout') running = false;
-      return {
-        stdout: '',
-        stderr: running ? '' : 'Could not find service',
-        exitCode: command.args[0] === 'print' && !running ? 113 : 0,
-      };
-    },
-  });
-  const exact = `gui/${process.getuid?.()}/${label}`;
-  expect(commands).toEqual([
-    ['print', exact],
-    ['bootout', exact],
-    ['print', exact],
-  ]);
-  expect(await exists(definitionFile)).toBe(false);
-  expect(await exists(f.config.credentialFile)).toBe(false);
-});
+  return { f, label, definitionFile };
+}
+
+it.each([true, false])(
+  'removes the exact owned launchd connector and credentials (initially running: %s)',
+  async (initiallyRunning) => {
+    const { f, label, definitionFile } = await launchdFixture();
+    let running = initiallyRunning;
+    const commands: string[][] = [];
+    await removeAssistant(f.paths, f.own.instance_id, {
+      ...f.dependencies,
+      runCommand: async (command) => {
+        commands.push([...command.args]);
+        if (command.args[0] === 'bootout') running = false;
+        return {
+          stdout: '',
+          stderr: '',
+          exitCode: command.args[0] === 'print' && !running ? 113 : 0,
+        };
+      },
+    });
+    const exact = `gui/${process.getuid?.()}/${label}`;
+    expect(commands).toEqual(
+      initiallyRunning
+        ? [
+            ['print', exact],
+            ['bootout', exact],
+            ['print', exact],
+          ]
+        : [['print', exact]],
+    );
+    expect(await exists(definitionFile)).toBe(false);
+    expect(await exists(f.config.credentialFile)).toBe(false);
+  },
+);
 
 it('preserves an unknown receipt schema containing exact artifact IDs instead of overwriting its evidence', async () => {
   const f = await fixture();
@@ -507,3 +519,19 @@ it('publishes artifact abandonment and its exact durable receipt through the nat
   ]);
   expect(await exists(f.paths.removalFile(f.own.instance_id))).toBe(true);
 });
+
+it.each([112, 5])(
+  'keeps connector files when launchd print fails with exit %s despite absent-job wording',
+  async (exitCode) => {
+    const { f, definitionFile } = await launchdFixture();
+    await expect(
+      removeAssistant(f.paths, f.own.instance_id, {
+        ...f.dependencies,
+        runCommand: async () => ({ stdout: '', stderr: 'Could not find service', exitCode }),
+      }),
+    ).rejects.toMatchObject({ resource: 'artifacts' });
+    expect(await exists(definitionFile)).toBe(true);
+    expect(await exists(f.config.credentialFile)).toBe(true);
+    expect(await exists(f.files.tokenFile)).toBe(true);
+  },
+);
