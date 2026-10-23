@@ -1,4 +1,3 @@
-/** Exact owned artifact teardown, journaled in the native removal receipt. */
 import path from 'node:path';
 
 import { isErrno } from '../community-portal/errors.js';
@@ -10,12 +9,11 @@ import {
   writeArtifactsOperatorConfig,
   type ArtifactsOperatorConfig,
 } from './artifacts-cloudflare.js';
-import { setArtifactsIngress } from './artifacts-capability.js';
+import { renderArtifactsConnectorService, setArtifactsIngress } from './artifacts-capability.js';
 import type { ControlPlanePaths } from './paths.js';
 import { runSanitizedCommandOutcome, buildToolEnvironment, type SanitizedCommandOutcomeRunner } from './process.js';
 import { readRegistry, withMachineLock } from './registry.js';
 import { readOwnerOnlyFile, removePrivateFile } from './secrets.js';
-import { renderLaunchdService, renderSystemdService } from './service-definition.js';
 import { GwsEaError, type InstanceReservation } from './types.js';
 import { isRecord } from './validation.js';
 
@@ -135,20 +133,7 @@ async function stopConnector(
   const connector = config.connector;
   if (!connector) return;
   const files = artifactsOperatorFiles(paths);
-  const input = {
-    programArguments: [config.cloudflaredPath, 'tunnel', '--no-autoupdate', 'run', '--token-file', files.tokenFile],
-    workingDirectory: files.root,
-    environment: { HOME: connector.homeDirectory, PATH: '/usr/local/bin:/usr/bin:/bin' },
-    standardOutputPath: path.join(files.root, 'connector.log'),
-    standardErrorPath: path.join(files.root, 'connector.error.log'),
-  };
-  const expected =
-    connector.manager === 'launchd'
-      ? renderLaunchdService({ ...input, label: connector.label })
-      : renderSystemdService({
-          ...input,
-          wantedBy: connector.manager === 'systemd-system' ? 'multi-user.target' : 'default.target',
-        });
+  const expected = renderArtifactsConnectorService(files, config.cloudflaredPath, connector);
   const stored = await readOwnerOnlyFile(connector.definitionFile).catch((cause: unknown) => {
     if (isErrno(cause, 'ENOENT')) return undefined;
     throw cause;
@@ -399,7 +384,6 @@ export async function settleArtifactsCleanup(
         }
         await step('remote', async () => undefined);
       }
-      // Keep shared config current, and leave all exact receipt evidence until the final local cleanup settles.
       if (shared) {
         if (!live) throw new GwsEaError('artifacts_owner_missing', 'Shared ownership record is missing.');
         const assistants = { ...live.assistants };
@@ -417,7 +401,6 @@ export async function settleArtifactsCleanup(
     });
     return undefined;
   } catch (cause) {
-    // Optional cleanup failures retain exact evidence and cannot erase the instance or its claim implicitly.
     if (!(cause instanceof Error)) throw cause;
     return refusal(
       paths,

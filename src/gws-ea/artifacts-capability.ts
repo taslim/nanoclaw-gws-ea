@@ -573,6 +573,26 @@ async function verifyConnectorExecutable(
     );
 }
 
+export function renderArtifactsConnectorService(
+  files: ReturnType<typeof artifactsOperatorFiles>,
+  cloudflaredPath: string,
+  connector: NonNullable<ArtifactsOperatorConfig['connector']>,
+): string {
+  const input = {
+    programArguments: [cloudflaredPath, 'tunnel', '--no-autoupdate', 'run', '--token-file', files.tokenFile],
+    workingDirectory: files.root,
+    environment: { HOME: connector.homeDirectory, PATH: '/usr/local/bin:/usr/bin:/bin' },
+    standardOutputPath: path.join(files.root, 'connector.log'),
+    standardErrorPath: path.join(files.root, 'connector.error.log'),
+  };
+  return connector.manager === 'launchd'
+    ? renderLaunchdService({ ...input, label: connector.label })
+    : renderSystemdService({
+        ...input,
+        wantedBy: connector.manager === 'systemd-system' ? 'multi-user.target' : 'default.target',
+      });
+}
+
 async function startConnector(
   paths: ControlPlanePaths,
   runtime: InstanceRuntimeConfig,
@@ -603,20 +623,7 @@ async function startConnector(
         config.connector.homeDirectory !== connector.homeDirectory)
     )
       throw new GwsEaError('artifacts_connector_conflict', 'The shared connector service coordinates changed.');
-    const input = {
-      programArguments: [config.cloudflaredPath, 'tunnel', '--no-autoupdate', 'run', '--token-file', files.tokenFile],
-      workingDirectory: files.root,
-      environment: { HOME: runtime.home_directory, PATH: '/usr/local/bin:/usr/bin:/bin' },
-      standardOutputPath: path.join(files.root, 'connector.log'),
-      standardErrorPath: path.join(files.root, 'connector.error.log'),
-    };
-    const definition =
-      manager === 'launchd'
-        ? renderLaunchdService({ ...input, label })
-        : renderSystemdService({
-            ...input,
-            wantedBy: manager === 'systemd-system' ? 'multi-user.target' : 'default.target',
-          });
+    const definition = renderArtifactsConnectorService(files, config.cloudflaredPath, connector);
     const stored = await readOwnerOnlyFile(definitionFile).catch((cause: unknown) => {
       if (isErrno(cause, 'ENOENT')) return undefined;
       throw cause;
@@ -810,8 +817,6 @@ export async function enableArtifactsCapability(
           'artifacts_not_ready',
           'Artifact prerequisites have not all been verified. Check this capability after resolving the reported prerequisite.',
         );
-      // Runner tool schemas and composed instructions are fixed at spawn. Refresh only current
-      // eligible authors through the existing guarded restart command; their next turn respawns.
       const authors = await ncl(runtime, ['gws-ea-artifacts-author-groups']);
       if (
         !isRecord(authors) ||

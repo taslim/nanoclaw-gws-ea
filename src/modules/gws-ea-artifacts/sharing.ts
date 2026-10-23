@@ -65,7 +65,6 @@ export async function artifactShares(
   config: ArtifactsPolicyFile,
   after = '',
 ): Promise<{ readonly shares: ArtifactShareMetadata[]; readonly shares_next_cursor: string | null }> {
-  // One complete grant keeps exact recipients available without multiplying the bounded audience payload.
   const rows = await getDb().all<ShareRow>(
     `SELECT ${SHARE_METADATA} FROM ${SHARE_JOIN} WHERE s.artifact_id=? AND s.share_id>? ORDER BY s.share_id LIMIT 2`,
     artifactId,
