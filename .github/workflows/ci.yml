@@ -45,9 +45,6 @@ jobs:
       - name: Format check
         run: pnpm run format:check
 
-      - name: Artifact preview renderer matches host
-        run: pnpm run artifact-viewer:check
-
       - name: Typecheck host
         run: pnpm exec tsc --noEmit
 
@@ -69,8 +66,6 @@ jobs:
 
       - name: Container tests
         working-directory: container/agent-runner
-        env:
-          GWS_EA_BROWSER_TEST_CHROME: /usr/bin/google-chrome
         run: bun run test
 
   iron-front:

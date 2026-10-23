@@ -162,7 +162,7 @@ describe('NanoClaw tool server capabilities', () => {
     [
       'artifacts',
       ['artifacts'],
-      ['artifact_delete', 'artifact_list', 'artifact_preview', 'artifact_read', 'artifact_save', 'artifact_share'],
+      ['artifact_delete', 'artifact_list', 'artifact_read', 'artifact_save', 'artifact_share'],
     ],
     [
       'browser-delegate',

@@ -3,13 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import { requestAction } from '../action-request.js';
 import '../mailbox/compose.js';
-import {
-  artifactList,
-  artifactPreview,
-  artifactRead,
-  artifactSave,
-  artifactShare,
-} from '../mcp-tools/gws-ea-artifacts.js';
+import { artifactList, artifactRead, artifactSave, artifactShare } from '../mcp-tools/gws-ea-artifacts.js';
 import { requestStatus } from '../mcp-tools/request-status.js';
 import type { McpToolDefinition } from '../mcp-tools/types.js';
 
@@ -29,22 +23,12 @@ if (phase === 'author') {
   for (const name of ['executive-brief', 'evidence-comparison', 'capacity-calculator']) {
     const file = `${name}.html`;
     fs.copyFileSync(`/examples/${file}`, `/workspace/agent/${file}`);
-    const preview = await artifactPreview.handler({ file, title: name });
-    assert(!preview.isError, JSON.stringify(preview));
-    const first = preview.content[0];
-    assert(first?.type === 'text');
-    const metadata = JSON.parse(first.text) as Record<string, unknown>;
-    for (const [index, image] of preview.content.slice(1).entries()) {
-      assert(image.type === 'image');
-      fs.writeFileSync(`/workspace/agent/${name}-${index}.png`, Buffer.from(image.data, 'base64'));
-    }
     const saved = await call(artifactSave, {
       create_key: name,
       file,
       title: name,
-      expected_hash: metadata.source_hash,
     });
-    examples.push({ name, saved, preview: metadata });
+    examples.push({ name, saved });
   }
   const denied = await artifactShare.handler({
     operation: 'public_publish',
@@ -94,17 +78,11 @@ if (phase === 'author') {
   const original = fs.readFileSync(checkoutFile, 'utf8');
   assert(original.includes('</main>'));
   fs.writeFileSync(checkoutFile, original.replace('</main>', '<p>Deliberate private revision</p></main>'));
-  const preview = await artifactPreview.handler({ file: checkoutFile, title: 'Private revision' });
-  assert(!preview.isError, JSON.stringify(preview));
-  const metadata = preview.content[0];
-  assert(metadata.type === 'text');
-  const hash = (JSON.parse(metadata.text) as Record<string, unknown>).source_hash;
   const revised = await call(artifactSave, {
     artifact_id: saved.artifact_id,
     expected_revision: 1,
     title: 'Private revision',
     file: checkoutFile,
-    expected_hash: hash,
   });
   await checkpoint('private-revised', { revised });
   const replaced = await call(artifactShare, {

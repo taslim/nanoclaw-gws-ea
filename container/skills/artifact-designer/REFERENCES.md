@@ -12,4 +12,4 @@ Keep the principles when adapting: answer first, evidence close to claims, consi
 
 The comparison and calculator keep script-dependent controls initially hidden, attach event listeners and initialize before revealing them. Their data already lives in HTML. Neither submits, navigates with scripts, fetches data or stores state. Source anchors contain actual HTTPS reference targets; the trusted viewer offers deliberate opening. Its sources explain methods, not the invented sample observations.
 
-Inspect real preview images after adapting. Check desktop, phone and static views, then exercise the relevant controls, keyboard focus, invalid/empty state and reset. Capturing images alone is not visual review. Use the saved source hash to ensure the inspected file is the file saved.
+After adapting an example, review its information and source. Where rendered inspection is available, check desktop, phone and static views and exercise relevant controls, keyboard focus, invalid/empty states and reset. State any verification limits accurately.

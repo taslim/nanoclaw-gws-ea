@@ -141,7 +141,7 @@ it('rolls back source, head and request settlement together when a durable write
   expect(await getDb().all('SELECT revision FROM gws_ea_artifact_revisions')).toEqual([]);
   expect(await getDb().all('SELECT request_id FROM gws_ea_artifact_requests')).toEqual([]);
 });
-it('refuses invalid UTF-8, excessive bytes and mismatched preview hashes before saving', () => {
+it('refuses invalid UTF-8, excessive bytes and mismatched expected hashes before saving', () => {
   expect(() => prepareArtifactSource(Buffer.from([0xc3, 0x28]))).toThrow(/UTF-8/);
   expect(() => prepareArtifactSource(Buffer.alloc(4 * 1024 * 1024 + 1))).toThrow(/4 MiB/);
   expect(() => prepareArtifactSource(Buffer.from('html'), '0'.repeat(64))).toThrow(/hash/);

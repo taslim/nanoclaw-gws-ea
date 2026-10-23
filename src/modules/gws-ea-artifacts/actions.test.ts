@@ -279,13 +279,10 @@ it('refuses unsupported artifact documents at save, before any content is persis
   expect(await getDb().all('SELECT artifact_id FROM gws_ea_artifacts')).toEqual([]);
 });
 
-it('authorizes local preview through the mailbox and refuses stale tools after capability disable', async () => {
-  expect(accepted(await request(author, 'artifact_preview_authorize', {}))).toEqual({
-    authorized: true,
-    session_id: author.id,
-  });
+it('refuses stale artifact tools immediately after capability disable', async () => {
+  expect(accepted(await request(author, 'artifact_list', {})).artifacts).toEqual([]);
   writePolicy(false);
-  expect(refusal(await request(author, 'artifact_preview_authorize', {}))).toContain('current capability');
+  expect(refusal(await request(author, 'artifact_list', {}))).toContain('current capability');
 });
 
 it('gives main current share generations and pinned metadata without disclosing source or exposing sharing controls to the author', async () => {

@@ -1,9 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { answerResult, requestAction, requestOutbox, requestTool } from '../action-request.js';
-import { previewArtifact } from '../artifacts/preview.js';
+import { requestOutbox, requestTool } from '../action-request.js';
 import { registerTools } from './server.js';
-import type { McpToolDefinition } from './types.js';
 
 const LIMIT = 4 * 1024 * 1024;
 const common = { timeoutMs: 120_000, repeatable: false, additionalProperties: false } as const;
@@ -42,9 +40,6 @@ const recipients = {
     additionalProperties: false,
   },
 } as const;
-function failure(message: string) {
-  return { isError: true, content: [{ type: 'text' as const, text: message }] };
-}
 function descriptorAlias(fd: number): string {
   if (process.platform === 'linux') return `/proc/self/fd/${fd}`;
   if (process.platform === 'darwin') {
@@ -105,7 +100,7 @@ export const artifactSave = requestTool({
   ...common,
   name: 'artifact_save',
   description:
-    'Save one self-contained HTML file as a private artifact. Create with a stable create_key; revise with artifact_id and the current expected_revision. Pass the preview’s expected_hash to refuse changed source. This never shares content. After timeout use request_status.',
+    'Save one self-contained HTML file as a private artifact. Create with a stable create_key; revise with artifact_id and the current expected_revision. Optionally supply expected_hash to require exact source bytes. This never shares content. After timeout use request_status.',
   properties: {
     create_key: identifier,
     artifact_id: identifier,
@@ -208,94 +203,4 @@ export const artifactShare = requestTool({
     },
   ],
 });
-export const artifactPreview: McpToolDefinition = {
-  tool: {
-    name: 'artifact_preview',
-    description:
-      'Render a draft HTML file locally after the host checks live author access. Returns exact source hash, four PNG captures (desktop/mobile interactive/static) and bounded diagnostics. Inspect images and repair defects before saving. Does not save or publish.',
-    inputSchema: {
-      type: 'object',
-      properties: { file, title, expected_hash: hash },
-      required: ['file'],
-      additionalProperties: false,
-    },
-  },
-  async handler(args, context) {
-    const deadline = Date.now() + 15_000;
-    const deadlineSignal = AbortSignal.timeout(15_000);
-    const signal = context?.signal ? AbortSignal.any([context.signal, deadlineSignal]) : deadlineSignal;
-    const interrupted = () =>
-      failure(
-        deadlineSignal.aborted || Date.now() >= deadline
-          ? 'Artifact preview exceeded its 15-second deadline.'
-          : 'Artifact preview was cancelled.',
-      );
-    if (
-      Object.keys(args).some((key) => !['file', 'title', 'expected_hash'].includes(key)) ||
-      typeof args.file !== 'string' ||
-      (args.title !== undefined && (typeof args.title !== 'string' || args.title.length > 256)) ||
-      (args.expected_hash !== undefined &&
-        (typeof args.expected_hash !== 'string' || !new RegExp(hash.pattern, 'u').test(args.expected_hash)))
-    )
-      return failure('Invalid artifact preview fields.');
-    if (signal.aborted || Date.now() >= deadline) return interrupted();
-    const authorization = await requestAction(
-      'artifact_preview_authorize',
-      {},
-      { timeoutMs: Math.max(1, deadline - Date.now()), signal },
-    );
-    if (signal.aborted || Date.now() >= deadline) return interrupted();
-    if (authorization.status !== 'answered')
-      return failure(
-        authorization.status === 'timeout'
-          ? `Artifact preview exceeded its 15-second deadline. Check request_status with ${authorization.requestId}.`
-          : 'Preview authorization was cancelled or unavailable.',
-      );
-    if (!authorization.frame.ok) return answerResult(authorization.frame);
-    const data: unknown = authorization.frame.data;
-    if (
-      !data ||
-      typeof data !== 'object' ||
-      !('authorized' in data) ||
-      data.authorized !== true ||
-      !('session_id' in data) ||
-      typeof data.session_id !== 'string'
-    )
-      return failure('The host did not authorize this preview session.');
-    try {
-      const bytes = sourceBytes(args.file);
-      const html = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes);
-      const result = await previewArtifact({
-        sessionId: data.session_id,
-        html,
-        ...(typeof args.title === 'string' ? { title: args.title } : {}),
-        ...(typeof args.expected_hash === 'string' ? { expectedHash: args.expected_hash } : {}),
-        signal,
-      });
-      if (signal.aborted || Date.now() >= deadline) return interrupted();
-      if (result.status !== 'previewed')
-        return { content: [{ type: 'text', text: JSON.stringify(result) }], isError: true };
-      return {
-        content: [
-          {
-            type: 'text',
-            text: JSON.stringify({
-              status: result.status,
-              source_hash: result.sourceHash,
-              captures: result.images.map(({ viewport, mode }, image_index) => ({ viewport, mode, image_index })),
-              diagnostics: result.diagnostics,
-            }),
-          },
-          ...result.images.map(({ mimeType, data: imageData }) => ({
-            type: 'image' as const,
-            mimeType,
-            data: imageData,
-          })),
-        ],
-      };
-    } catch (error) {
-      return failure(error instanceof Error ? error.message : 'Artifact preview could not read the source.');
-    }
-  },
-};
-registerTools([artifactSave, artifactRead, artifactList, artifactPreview, artifactShare, artifactDelete], 'artifacts');
+registerTools([artifactSave, artifactRead, artifactList, artifactShare, artifactDelete], 'artifacts');

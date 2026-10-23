@@ -93,7 +93,7 @@ export function prepareArtifactSource(bytes: Uint8Array, expectedHash?: string):
   }
   const source_hash = createHash('sha256').update(bytes).digest('hex');
   if (expectedHash !== undefined && source_hash !== expectedHash)
-    throw forbidden('Artifact source hash changed since preview. Preview the current file again.');
+    throw forbidden('Artifact source does not match expected_hash. Read the current file before retrying.');
   return { html, source_hash, byte_count: bytes.byteLength, [preparedSource]: true };
 }
 const META = `a.artifact_id,a.author_group_id,a.title,a.head_revision,a.generation,a.expires_at,a.created_at,a.updated_at,r.source_hash,r.byte_count`;

@@ -2,8 +2,8 @@
 
 An artifact is one saved HTML information view: a brief, comparison, explanation,
 plan or local calculator. The principal requests it in conversation and receives
-a private link. The assistant previews its desktop and phone layouts before
-delivery. There is no generated application build or separate designer agent.
+a private link. The assistant authors a self-contained document using its normal file tools
+and design guidance, then saves it through the native artifact tools.
 
 All essential information is present in the initial document. Local scripts may
 filter, sort or calculate embedded information. They cannot submit data, send
@@ -70,14 +70,13 @@ For a group with a custom skill selection, include `artifact-designer` in that
 existing selection as well; selecting `artifacts` does not override a custom
 skill list. Main's release reconciliation includes the design skill automatically.
 
-| Tool               | Native contract                                                                                                                                                                                                                                        |
-| ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `artifact_preview` | Render a local draft in a fresh runner Chromium context; return exact source hash, desktop/mobile interactive/static PNGs and bounded errors, refused requests and overflow diagnostics; one active preview per session and a 15-second total deadline |
-| `artifact_save`    | Create with stable `create_key`, `title`, `file`; revise with `artifact_id` and `expected_revision`; use the inspected preview's `expected_hash`; return IDs, hash, bytes, generation and private URL                                                  |
-| `artifact_read`    | Return scoped metadata; `checkout: true` writes the selected revision to this session's inbox; `revision` selects an older source without exposing a later private title                                                                               |
-| `artifact_list`    | Scoped metadata only; `limit` is 1–100, default 20; pass `next_cursor` as `after`; main receives named share counts by stored state and the public slot as `share_summary`, without recipient/history expansion                                        |
-| `artifact_share`   | Main-only closed union: `named_publish`, `public_publish`, `named_replace`, `public_replace`, `revoke`; select an exact revision/hash and audience; replacements/revocation require `share_id` and `expected_generation`                               |
-| `artifact_delete`  | Delete owned content and access with the current artifact `expected_generation`; main may act across authors                                                                                                                                           |
+| Tool              | Native contract                                                                                                                                                                                                          |
+| ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `artifact_save`   | Create with stable `create_key`, `title`, `file`; revise with `artifact_id` and `expected_revision`; optionally require exact source bytes with `expected_hash`; return IDs, hash, bytes, generation and private URL     |
+| `artifact_read`   | Return scoped metadata; `checkout: true` writes the selected revision to this session's inbox; `revision` selects an older source without exposing a later private title                                                 |
+| `artifact_list`   | Scoped metadata only; `limit` is 1–100, default 20; pass `next_cursor` as `after`; main receives named share counts by stored state and the public slot as `share_summary`, without recipient/history expansion          |
+| `artifact_share`  | Main-only closed union: `named_publish`, `public_publish`, `named_replace`, `public_replace`, `revoke`; select an exact revision/hash and audience; replacements/revocation require `share_id` and `expected_generation` |
+| `artifact_delete` | Delete owned content and access with the current artifact `expected_generation`; main may act across authors                                                                                                             |
 
 Main's `artifact_read` returns one complete sharing grant in `shares`, including
 its exact recipients, revision/hash, state, generation, expiry and URL. Pass its
@@ -91,8 +90,9 @@ delivery actions. A timeout does not cancel a mutation: use `request_status`
 with the returned request ID before retrying. Exact request results are journaled
 with authenticated session identity and fingerprints. Creation keys prevent
 duplicate objects across new request IDs; revisions use head compare-and-swap.
-No save/view requires a model, Chromium or Cloudflare management call; preview
-alone starts runner Chromium.
+Saving, publishing and serving artifacts launch no browser. Saving and viewing
+require no model or Cloudflare management call. The host validates saved HTML;
+real-browser tests verify the viewer’s rendering and isolation boundary.
 
 ## Privacy and viewer boundary
 

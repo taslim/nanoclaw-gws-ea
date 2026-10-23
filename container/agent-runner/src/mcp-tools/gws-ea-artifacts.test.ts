@@ -1,13 +1,6 @@
 import { expect, it } from 'bun:test';
 import Ajv from 'ajv';
-import {
-  artifactDelete,
-  artifactList,
-  artifactPreview,
-  artifactRead,
-  artifactSave,
-  artifactShare,
-} from './gws-ea-artifacts.js';
+import { artifactDelete, artifactList, artifactRead, artifactSave, artifactShare } from './gws-ea-artifacts.js';
 const hash = 'a'.repeat(64);
 const mark = { id: 'principal-message', messaging_group_id: 'chat' };
 it.each([
@@ -16,7 +9,6 @@ it.each([
   [artifactRead, { artifact_id: 'trip', checkout: true }],
   [artifactRead, { artifact_id: 'trip', shares_after: 'share-cursor' }],
   [artifactList, {}],
-  [artifactPreview, { file: 'trip.html', expected_hash: hash }],
   [artifactDelete, { artifact_id: 'trip', expected_generation: 1 }],
   [
     artifactShare,
