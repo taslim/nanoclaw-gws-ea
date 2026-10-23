@@ -800,7 +800,8 @@ class Cli {
     if (isStateRefusal(error))
       return state.instanceId ? [{ kind: 'command', argv: ['gws-ea', 'status', '--id', state.instanceId] }] : [];
     const command = plan.command === 'create' ? 'resume' : plan.command;
-    const base = ['gws-ea', command, ...(state.instanceId ? ['--id', state.instanceId] : [])];
+    const commandPath = command === 'names-prepare' ? ['names', 'prepare'] : [command];
+    const base = ['gws-ea', ...commandPath, ...(state.instanceId ? ['--id', state.instanceId] : [])];
     const retained =
       command === 'resume' || command === 'connect-google'
         ? ['secrets-file']
@@ -808,7 +809,9 @@ class Cli {
           ? ['track', 'source-remote']
           : command === 'remove'
             ? ['abandon']
-            : [];
+            : command === 'names-prepare'
+              ? ['assistant-first-name', 'assistant-last-name', 'principal-first-name', 'principal-last-name']
+              : [];
     for (const flag of retained) if (plan.options[flag]) base.push(`--${flag}`, plan.options[flag]);
     if (command === 'rollback' && plan.options.snapshot === 'true') base.push('--snapshot');
     if (command === 'remove' && plan.options['delete-vault'] === 'true') base.push('--delete-vault');
@@ -860,7 +863,8 @@ class Cli {
   /** Retrying a reserved create resumes it; every other attempt reruns as given. */
   #retry(plan: AttemptPlan, state: AttemptState): () => Promise<Attempt> {
     if (plan.command !== 'create' || !state.reserved || !state.instanceId) {
-      return () => this.prepare(plan.command, parseInvocation([plan.command, ...plan.args]))();
+      const commandPath = plan.command === 'names-prepare' ? ['names', 'prepare'] : [plan.command];
+      return () => this.prepare(plan.command, parseInvocation([...commandPath, ...plan.args]))();
     }
     const resumeArgs = [
       '--id',

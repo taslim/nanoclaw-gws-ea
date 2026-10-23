@@ -27,7 +27,8 @@ export function normalizePersonName(input: PersonNameInput, owner: NameOwner): P
   let problem: string | undefined;
   if (!firstName) problem = 'the first name is empty';
   else if (display.length > maximum) problem = `it is longer than ${maximum} characters`;
-  else if (hasControlCharacters(display)) problem = 'it holds a control character';
+  else if (hasControlCharacters(display) || /[\p{Zl}\p{Zp}]/u.test(display))
+    problem = 'it holds a control or line separator character';
   else if (/@|:\/\/|www\.|\//iu.test(display)) problem = 'it holds an address or a link';
   else if (/[<>`]/u.test(display)) problem = 'it holds markup';
   else if (/\.\p{L}{2}/u.test(display)) problem = 'it holds a domain name, which mail turns into a link';

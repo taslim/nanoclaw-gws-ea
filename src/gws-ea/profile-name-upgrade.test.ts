@@ -73,16 +73,10 @@ describe('explicit name upgrade input', () => {
     );
   });
 
-  it('prepares explicit per-instance components through the native operator command without changing live data', async () => {
+  it('retains explicit components across native command retries without changing live data', async () => {
     const host = await machine();
     const runtime = await assistant(host);
     const file = path.join(runtime.state_root, 'data', 'v2.db');
-    const db = new Database(file);
-    db.exec(`ALTER TABLE gws_ea_profile ADD COLUMN assistant_display_name TEXT;
-      ALTER TABLE gws_ea_profile ADD COLUMN principal_display_name TEXT;
-      UPDATE gws_ea_profile SET assistant_display_name='Robin Wu',principal_display_name='Mary Ann Lee';`);
-    const before = db.prepare('SELECT * FROM gws_ea_profile').get();
-    db.close();
     const next = await nextRelease(host);
     const driver = cli(host, world(runtime), next, runtime);
     const args = [
@@ -100,7 +94,30 @@ describe('explicit name upgrade input', () => {
       'Lee',
       '--json',
     ];
-    expect(await driver.run(args), driver.err.join('\n')).toBe(0);
+    expect(await driver.run(args), driver.err.join('\n')).toBe(1);
+    expect(JSON.parse(driver.out.at(-1) ?? '{}')).toMatchObject({
+      error: { code: 'profile_names_current' },
+      next_actions: [{ kind: 'command', argv: ['gws-ea', ...args.slice(0, -1)] }],
+    });
+    let failures = 0;
+    let before: unknown;
+    const interactive = cli(host, world(runtime), next, runtime, {
+      onFailure: async () => {
+        failures += 1;
+        const db = new Database(file);
+        try {
+          db.exec(`ALTER TABLE gws_ea_profile ADD COLUMN assistant_display_name TEXT;
+            ALTER TABLE gws_ea_profile ADD COLUMN principal_display_name TEXT;
+            UPDATE gws_ea_profile SET assistant_display_name='Robin Wu',principal_display_name='Mary Ann Lee';`);
+          before = db.prepare('SELECT * FROM gws_ea_profile').get();
+        } finally {
+          db.close();
+        }
+        return 'retry';
+      },
+    });
+    expect(await interactive.run(args.slice(0, -1)), interactive.err.join('\n')).toBe(0);
+    expect(failures).toBe(1);
     expect(await readProfileNameInput(host.paths, runtime.instance_id)).toEqual({
       ...input,
       instance_id: runtime.instance_id,
