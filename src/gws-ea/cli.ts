@@ -5,7 +5,16 @@ import {
   voiceCapabilityRecovery,
   voiceCapabilityNextActions,
   browserCapabilityCatalog,
+  artifactsCapabilityCatalog,
 } from './capabilities.js';
+import {
+  disableArtifactsCapability,
+  enableArtifactsCapability,
+  inspectArtifactsCapability,
+  type ArtifactsCapabilityDependencies,
+  type ArtifactsCapabilityObservation,
+  type ArtifactsOperationData,
+} from './artifacts-capability.js';
 import { aliasDecision, type AliasDecision } from './alias.js';
 import {
   browserAccessLine,
@@ -265,6 +274,7 @@ export interface CliRuntime {
   whatsappNcl?: typeof runInstanceNclJson;
   /** How the browser commands reach Chrome and the assistant's host, its web alias step included; tests substitute it. */
   browserInspection?: BrowserCapabilityInspection;
+  artifacts?: ArtifactsCapabilityDependencies;
   /** How the 1Password CLI is found and run; tests substitute the runner. */
   onePassword?: OnePasswordCliSeams;
   /** A terminal's choice among the operator's 1Password accounts; absent, enable requires --account. */
@@ -2514,6 +2524,87 @@ export async function runCli(args: readonly string[], runtime: CliRuntime = {}):
     }
     case 'capability': {
       const command = handler.command;
+      if (handler.name === 'artifacts') {
+        let changed: Changed = false;
+        let data: ArtifactsCapabilityObservation | ArtifactsOperationData | null = null;
+        const stop = observeInterruption(() => ({ changed, data }));
+        try {
+          const paths = runtime.paths ?? resolveControlPlanePaths();
+          const instanceId = targetInstance(options);
+          const dependencies = {
+            ...runtime.artifacts,
+            recordEffect: (effect: true | null) => {
+              changed = combineEffects(changed, effect);
+            },
+          };
+          if (command === 'show' || command === 'check') {
+            data = await inspectArtifactsCapability(paths, instanceId, { ...dependencies, check: command === 'check' });
+            const failed = command === 'check' && !data.ready;
+            if (!json)
+              output(
+                `Artifacts: ${data.activation}. Remote: ${data.remote}. Listener: ${data.listener}.${data.reason ? ` ${data.reason}` : ''}`,
+              );
+            emitResult(
+              managedResult(invocation.definition.path.join(' '), {
+                outcome: failed ? 'failed' : 'succeeded',
+                changed,
+                data,
+                ...(failed
+                  ? {
+                      error: new GwsEaError(
+                        'artifacts_check_failed',
+                        'Artifact readiness was not established. Inspect the reported prerequisites.',
+                      ),
+                    }
+                  : {}),
+              }),
+            );
+            return failed ? EXIT_CODES.failed : EXIT_CODES.ready;
+          }
+          if (command === 'enable')
+            data = await enableArtifactsCapability(
+              paths,
+              instanceId,
+              {
+                accountId: options.account,
+                teamName: options.team,
+                zoneId: options.zone,
+                hostname: options.hostname,
+                credentialFile: options['credential-file'],
+                assistantHostname: options['assistant-hostname'],
+                cloudflaredPath: options.cloudflared,
+                discardUnproven: options['discard-unproven'],
+              },
+              dependencies,
+            );
+          else if (command === 'disable') data = await disableArtifactsCapability(paths, instanceId, dependencies);
+          else throw new GwsEaError('invalid_arguments', `Artifacts do not support ${command}.`);
+          if (!json) output(`Artifacts ${data.enabled ? 'enabled' : 'disabled'} for assistant ${instanceId}.`);
+          emitResult(managedResult(invocation.definition.path.join(' '), { outcome: 'succeeded', changed, data }));
+          return EXIT_CODES.ready;
+          // eslint-disable-next-line no-catch-all/no-catch-all -- The managed CLI boundary retains effects and emits only redacted domain failures.
+        } catch (cause) {
+          const error =
+            cause instanceof GwsEaError
+              ? cause
+              : new GwsEaError(
+                  'artifacts_operation_failed',
+                  'Artifacts operation failed. Inspect the owner-only configuration and running host.',
+                  { cause },
+                );
+          emitResult(
+            managedResult(invocation.definition.path.join(' '), {
+              outcome: isBusy(error) ? 'busy' : 'failed',
+              changed,
+              data,
+              error,
+            }),
+          );
+          return reportStop(presenter, error);
+        } finally {
+          stop();
+        }
+      }
       if (handler.name === 'browser') {
         let changed: Changed = false;
         let data: BrowserCapabilityObservation | BrowserOperationData | null = null;
@@ -2804,10 +2895,11 @@ export async function runCli(args: readonly string[], runtime: CliRuntime = {}):
             const capability = await inspectVoiceCapability(paths, { checkConsumers: command === 'check' });
             actions = voiceCapabilityNextActions(capability, command === 'check');
             const browser = command === 'list' ? await browserCapabilityCatalog(paths) : undefined;
+            const artifacts = command === 'list' ? await artifactsCapabilityCatalog(paths) : undefined;
             const onePassword = command === 'list' ? await onePasswordCapabilityCatalog(paths) : undefined;
             data =
               command === 'list' && browser && onePassword
-                ? { capabilities: [capability, browser, onePassword] }
+                ? { capabilities: [capability, browser, onePassword, ...(artifacts ? [artifacts] : [])] }
                 : capability;
             if (!json)
               for (const line of [...capabilityLines(capability, command !== 'list'), ...nextActionLines(actions)])
@@ -2820,6 +2912,8 @@ export async function runCli(args: readonly string[], runtime: CliRuntime = {}):
               output(
                 `onepassword (host): ${onePassword.summary} Actions: ${onePassword.actions.join(', ')}. Activation: ${onePassword.activation}.`,
               );
+            if (!json && artifacts)
+              output(`artifacts (assistant): ${artifacts.summary} Actions: ${artifacts.actions.join(', ')}.`);
             break;
           }
           case 'install': {

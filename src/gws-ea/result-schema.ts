@@ -3,6 +3,7 @@ import type { ResultSchema } from './command-definitions.js';
 import { VOICE_CAPABILITY } from './capabilities.js';
 import { OPERATION_PHASES } from './operation.js';
 import { BROWSER_CAPABILITY } from './browser-capability.js';
+import { ARTIFACTS_CAPABILITY } from './artifacts-capability.js';
 import { ONEPASSWORD_CAPABILITY, ONEPASSWORD_PENDING_REASONS, ONEPASSWORD_SKIP_REASONS } from './onepassword.js';
 
 const text = { type: 'string' } as const;
@@ -295,6 +296,41 @@ const onePasswordMetadata = {
   actions: array(choices(...ONEPASSWORD_CAPABILITY.actions)),
   summary: text,
 };
+const artifactsMetadata = {
+  name: { const: 'artifacts' },
+  scope: { const: 'assistant' },
+  actions: array(choices(...ARTIFACTS_CAPABILITY.actions)),
+  summary: text,
+};
+export const ARTIFACTS_CAPABILITY_SCHEMA = object({
+  ...artifactsMetadata,
+  instance_id: text,
+  observed_at: time,
+  activation: choices('enabled', 'disabled', 'unavailable'),
+  hostname: nullable(text),
+  path_prefix: nullable(text),
+  policy_file: text,
+  remote: choices('not_checked', 'verified', 'unavailable'),
+  listener: choices('not_checked', 'listening', 'unavailable'),
+  ready: bool,
+  reason: nullable(text),
+  operator: object({
+    status: choices('configured', 'missing', 'unavailable'),
+    account_id: nullable(text),
+    team_name: nullable(text),
+    zone_id: nullable(text),
+    hostname: nullable(text),
+    pending: nullable(object({ kind: text, attempt: text, started_at: time })),
+  }),
+});
+export const ARTIFACTS_OPERATION_SCHEMA = object({
+  ...artifactsMetadata,
+  instance_id: text,
+  enabled: bool,
+  changed: bool,
+  hostname: nullable(text),
+  path_prefix: nullable(text),
+});
 const onePasswordCheck = choices('not_checked', 'verified', 'failed');
 const onePasswordToken = choices('present', 'absent', 'invalid');
 export const ONEPASSWORD_CAPABILITY_SCHEMA = object({
@@ -389,6 +425,7 @@ export const CAPABILITY_LIST_SCHEMA = object({
     oneOf: [
       VOICE_CAPABILITY_SCHEMA,
       object({ ...browserMetadata, assistant_ids: array(text) }),
+      object({ ...artifactsMetadata, assistant_ids: array(text) }),
       object({ ...onePasswordMetadata, activation: choices('enabled', 'disabled', 'unknown') }),
     ],
   }),

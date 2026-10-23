@@ -1,5 +1,6 @@
 import { VOICE_CAPABILITY } from './capabilities.js';
 import { BROWSER_CAPABILITY } from './browser-capability.js';
+import { ARTIFACTS_CAPABILITY } from './artifacts-capability.js';
 import { MANAGEMENT_TARGET, ONEPASSWORD_CAPABILITY } from './onepassword.js';
 import {
   managedResultSchema,
@@ -11,6 +12,8 @@ import {
   VOICE_OPERATION_SCHEMA,
   BROWSER_CAPABILITY_SCHEMA,
   BROWSER_OPERATION_SCHEMA,
+  ARTIFACTS_CAPABILITY_SCHEMA,
+  ARTIFACTS_OPERATION_SCHEMA,
   ONEPASSWORD_CAPABILITY_SCHEMA,
   ONEPASSWORD_DISABLE_SCHEMA,
   ONEPASSWORD_OPERATION_SCHEMA,
@@ -36,7 +39,7 @@ export type CommandHandler =
   | {
       readonly kind: 'capability';
       readonly command: 'list' | 'show' | 'check' | 'install' | 'enable' | 'disable' | 'uninstall';
-      readonly name?: 'browser' | 'onepassword';
+      readonly name?: 'browser' | 'onepassword' | 'artifacts';
     }
   | { readonly kind: 'discovery'; readonly command: 'help' | 'schema' | 'completion' | 'version' };
 
@@ -642,6 +645,87 @@ export const COMMAND_DEFINITIONS: readonly CommandDefinition[] = [
       outputModes: managedModes,
       resultSchema: managedResultSchema(
         command === 'show' || command === 'check' ? BROWSER_CAPABILITY_SCHEMA : BROWSER_OPERATION_SCHEMA,
+      ),
+    }),
+  ),
+  ...ARTIFACTS_CAPABILITY.actions.map(
+    (command): CommandDefinition => ({
+      path: ['capabilities', command, 'artifacts'],
+      group: 'Capabilities',
+      handler: { kind: 'capability', command, name: 'artifacts' },
+      scope: 'assistant',
+      summary:
+        command === 'enable'
+          ? 'Provision private HTML artifacts through an owned Cloudflare tunnel and email PIN.'
+          : command === 'disable'
+            ? 'Close artifact serving immediately and remove this assistant’s ingress.'
+            : `Read-only ${command === 'check' ? 'verification' : 'observation'} of artifact policy and prerequisites.`,
+      options:
+        command === 'enable'
+          ? [
+              id,
+              value('account', 'account_id', 'Cloudflare account for this operator host; required on first enable.'),
+              value('team', 'team_name', 'Exact Cloudflare Access team subdomain; required on first enable.'),
+              value(
+                'zone',
+                'zone_id',
+                'Active Cloudflare zone in this account for the shared hostname; required on first enable.',
+              ),
+              value('hostname', 'hostname', 'Shared operator hostname; required on first enable.'),
+              {
+                ...value(
+                  'credential-file',
+                  'file',
+                  'Owner-only file inside the operator config root containing the Cloudflare management API token.',
+                ),
+                valueKind: 'file',
+              },
+              value(
+                'assistant-hostname',
+                'hostname',
+                'Dedicated hostname for this assistant in an active zone of the same account; claims its root.',
+              ),
+              {
+                ...value(
+                  'cloudflared',
+                  'file',
+                  'Trusted absolute cloudflared executable; otherwise resolves cloudflared from PATH.',
+                ),
+                valueKind: 'file',
+              },
+              value(
+                'discard-unproven',
+                'attempt',
+                'Confirm you inspected and removed the resource an interrupted create may have left, then clear only that exact recorded attempt.',
+              ),
+            ]
+          : [id],
+      effects:
+        command === 'show' || command === 'check'
+          ? [
+              'Read-only observation; check makes bounded management and native host requests. No repair or service change.',
+            ]
+          : command === 'enable'
+            ? [
+                'Claims a stable first-name namespace and loopback port before remote effects.',
+                'Creates only journaled Access, PIN, DNS and named-tunnel resources; runs a host-only connector with a separate token file.',
+                'An ambiguous create blocks retries until the operator resolves and explicitly acknowledges its exact attempt.',
+              ]
+            : [
+                'Publishes disabled origin policy before remote cleanup, retaining content and stable namespace claims.',
+              ],
+      prerequisites: [
+        'An explicitly named managed assistant with a compatible running host.',
+        'Cloudflare account, Access team, active DNS zone and API permissions; cloudflared 2025.4.0 or later.',
+      ],
+      recovery: [
+        'Run capabilities check artifacts --id <instance_id>; resolve the reported ownership, policy, account, capacity or host prerequisite.',
+        'For an interrupted create, inspect the exact journal attempt, remove any resource it created, then enable with --discard-unproven <attempt>. Never identify ownership by friendly name alone.',
+      ],
+      examples: [`gws-ea capabilities ${command} artifacts --id <instance_id>`],
+      outputModes: managedModes,
+      resultSchema: managedResultSchema(
+        command === 'show' || command === 'check' ? ARTIFACTS_CAPABILITY_SCHEMA : ARTIFACTS_OPERATION_SCHEMA,
       ),
     }),
   ),

@@ -31,6 +31,13 @@ export interface AllocatedPorts {
   onecli_gateway: number;
 }
 
+/** A retained public namespace and host-only listener claim. Identity stays internal. */
+export interface ArtifactsNamespaceClaim {
+  readonly hostname: string;
+  readonly path_prefix: string;
+  readonly listen_port: number;
+}
+
 /**
  * What only this assistant may hold. Everything Google Cloud names is the
  * instance's own: the project is derived from its instance ID, and the
@@ -52,6 +59,7 @@ export interface ExclusiveResourceClaims {
   alias_email?: string;
   /** This assistant alone may link this E.164 WhatsApp account. */
   whatsapp_number?: string;
+  artifacts?: ArtifactsNamespaceClaim;
   onecli_project: string;
 }
 
