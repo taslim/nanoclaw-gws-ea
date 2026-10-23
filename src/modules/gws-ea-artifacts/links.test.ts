@@ -245,3 +245,27 @@ it('refuses a final channel delivery after revocation and never drops a member w
   ).rejects.toBeInstanceOf(OutboundRefusedError);
   expect(deliver).toHaveBeenCalledTimes(4);
 });
+
+it.each(['private', 'named', 'public'] as const)(
+  'checks a %s artifact URL in an attachment containing invalid UTF-8 at the final delivery boundary',
+  async (kind) => {
+    const { setDeliveryAdapter, OutboundRefusedError } = await import('../../delivery.js');
+    const url =
+      kind === 'private'
+        ? `${base}/${artifactId}`
+        : kind === 'named'
+          ? `${base}/share/${shareId}`
+          : `${base}/public/${publicId}`;
+    const files = [{ filename: 'report.bin', data: Buffer.concat([Buffer.from([0xff]), Buffer.from(`\n${url}\n`)]) }];
+    const deliver = vi.fn(async () => undefined);
+    const channel = setDeliveryAdapter({ deliver });
+    const sent = channel.deliver('gchat', 'unknown-room', null, 'chat', '{"text":"Report attached"}', files);
+    if (kind === 'public') {
+      await expect(sent).resolves.toBeUndefined();
+      expect(deliver).toHaveBeenCalledTimes(1);
+    } else {
+      await expect(sent).rejects.toBeInstanceOf(OutboundRefusedError);
+      expect(deliver).not.toHaveBeenCalled();
+    }
+  },
+);

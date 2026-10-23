@@ -1,4 +1,3 @@
-import { isUtf8 } from 'node:buffer';
 import { getDb } from '../../db/connection.js';
 import type { OutboundGuardDecision, OutboundSend } from '../../delivery.js';
 import { normalizePrincipalEmail } from '../../gws-ea/validation.js';
@@ -146,7 +145,7 @@ export async function judgeArtifactSend(send: OutboundSend): Promise<OutboundGua
   const texts = messageStrings(send.content);
   for (const file of send.files ?? []) {
     texts.push(file.filename);
-    if (isUtf8(file.data)) texts.push(file.data.toString('utf8'));
+    texts.push(file.data.toString('utf8'));
   }
   if (artifactUrls(texts, policy.config).length === 0) return { effect: 'allow' };
   let audience: {
