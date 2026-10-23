@@ -1,15 +1,15 @@
 ---
 name: sync-nanoclaw
-description: "Maintainer only: merge the latest official NanoClaw (nanocoai/nanoclaw, the upstream remote) into GWS-EA's integration line rebuild-v2, re-deriving every place the fork and upstream meet so GWS-EA's divergence shrinks wherever upstream now does the job. Use it whenever the GWS-EA maintainer wants upstream NanoClaw's newer work, even without naming the skill: 'pull in latest from nanocoai/nanoclaw', 'sync with upstream', 'upstream is 70 commits ahead, bring it in', 'merge NanoClaw v2026.10.0 into rebuild-v2', 'update our fork to the latest NanoClaw'. Not for updating a GWS-EA install or its assistants, and in GWS-EA nobody runs /update-nanoclaw: operators run git pull, bash gws-ea.sh, then gws-ea update --all."
+description: "Maintainer only: merge the latest official NanoClaw (nanocoai/nanoclaw, the upstream remote) into GWS-EA's integration line selected by the dogfood track, re-deriving every place the fork and upstream meet so GWS-EA's divergence shrinks wherever upstream now does the job. Use it whenever the GWS-EA maintainer wants upstream NanoClaw's newer work, even without naming the skill: 'pull in latest from nanocoai/nanoclaw', 'sync with upstream', 'upstream is 70 commits ahead, bring it in', 'merge NanoClaw v2026.10.0 into dogfood', 'update our fork to the latest NanoClaw'. Not for updating a GWS-EA install or its assistants, and in GWS-EA nobody runs /update-nanoclaw: operators run git pull, bash gws-ea.sh, then gws-ea update --all."
 ---
 
 # Sync NanoClaw into GWS-EA
 
-Merges official NanoClaw (remote `upstream`, `nanocoai/nanoclaw`) into `rebuild-v2`, the GWS-EA integration line that assistants deploy from. Every place GWS-EA and upstream's new work meet is re-derived from GWS-EA's original intent: where upstream now provides the mechanism, GWS-EA's copy goes; where it does not, GWS-EA's change is re-applied on upstream's code. The sync lands as a real merge commit, fast-forwarded onto `rebuild-v2`.
+Merges official NanoClaw (remote `upstream`, `nanocoai/nanoclaw`) into the dogfood track's resolved branch, the GWS-EA integration line that assistants deploy from. Every place GWS-EA and upstream's new work meet is re-derived from GWS-EA's original intent: where upstream now provides the mechanism, GWS-EA's copy goes; where it does not, GWS-EA's change is re-applied on upstream's code. The sync lands as a real merge commit, fast-forwarded onto the dogfood track's resolved branch.
 
 ## When to use
 
-- The GWS-EA maintainer wants upstream NanoClaw's newest work in `rebuild-v2`.
+- The GWS-EA maintainer wants upstream NanoClaw's newest work in the dogfood track's resolved branch.
 - Not for an operator updating their tool checkout or assistants: they run `git pull`, `bash gws-ea.sh`, then `gws-ea update --all`.
 - Not `/update-nanoclaw`: that updates a plain NanoClaw install in place. A GWS-EA tool checkout is not an install, and assistants are deployed at exact commits by `gws-ea update`.
 
@@ -33,23 +33,28 @@ git remote get-url upstream   # nanocoai/nanoclaw
 gh repo view taslim/nanoclaw-gws-ea --json viewerPermission --jq .viewerPermission
 ```
 
-Continue only when `origin` points at `taslim/nanoclaw-gws-ea`, `upstream` at `nanocoai/nanoclaw` (each as `https://github.com/<owner>/<repo>` or `git@github.com:<owner>/<repo>`, with or without `.git`), and the permission is `ADMIN`, `MAINTAIN` or `WRITE`. An `upstream` that points anywhere else would merge someone else's code into `rebuild-v2` as NanoClaw: stop and show the maintainer the URL. Otherwise stop: *"This skill is for GWS-EA's maintainer. To update GWS-EA, run `git pull`, `bash gws-ea.sh`, then `gws-ea update --all`."* When the `upstream` remote is missing, the maintainer adds it with `git remote add upstream https://github.com/nanocoai/nanoclaw.git`.
+Continue only when `origin` points at `taslim/nanoclaw-gws-ea`, `upstream` at `nanocoai/nanoclaw` (each as `https://github.com/<owner>/<repo>` or `git@github.com:<owner>/<repo>`, with or without `.git`), and the permission is `ADMIN`, `MAINTAIN` or `WRITE`. An `upstream` that points anywhere else would merge someone else's code into the dogfood track's resolved branch as NanoClaw: stop and show the maintainer the URL. Otherwise stop: *"This skill is for GWS-EA's maintainer. To update GWS-EA, run `git pull`, `bash gws-ea.sh`, then `gws-ea update --all`."* When the `upstream` remote is missing, the maintainer adds it with `git remote add upstream https://github.com/nanocoai/nanoclaw.git`.
 
 "Latest" means `upstream/main`. When the maintainer names a release tag (`vYYYY.MM.N` or `-rc.N`), use that ref everywhere this skill says `upstream/main`.
 
 ```bash
-git fetch upstream --tags && git fetch origin +refs/heads/rebuild-v2:refs/remotes/origin/rebuild-v2
-git rev-list --count origin/rebuild-v2..upstream/main                      # 0 means already current: stop
-git log --oneline -1 "$(git merge-base origin/rebuild-v2 upstream/main)"   # the upstream commit the last sync merged
+DOGFOOD_BRANCH="$(pnpm --silent run release-tracks:branch dogfood)" || exit
+DOGFOOD_REF="origin/$DOGFOOD_BRANCH"
+git fetch upstream --tags && git fetch origin "+refs/heads/$DOGFOOD_BRANCH:refs/remotes/$DOGFOOD_REF"
+git rev-list --count "$DOGFOOD_REF"..upstream/main                      # 0 means already current: stop
+git log --oneline -1 "$(git merge-base "$DOGFOOD_REF" upstream/main)"   # the upstream commit the last sync merged
 git show upstream/main:package.json | grep '"version"'                     # the version this sync brings in
 ```
 
-Each command call starts a fresh shell, so variables do not carry over. Start every later command block with these lines, with today's date and the operator checkout's path written literally:
+Each command call starts a fresh shell, so variables do not carry over. Start every later command block with these lines, with today's date and the operator checkout's path written literally. Resolve the
+dogfood branch in each fresh shell; fail the command if resolution fails:
 
 ```bash
 D='<YYYY-MM-DD>'; OPERATOR='<operator checkout path>'
 SCRATCH="${TMPDIR:-/tmp}/sync-nanoclaw-$D"; mkdir -p "$SCRATCH/analysis"   # lists, reports and diffs, outside the repo
-MB=$(git merge-base origin/rebuild-v2 upstream/main)
+DOGFOOD_BRANCH="$(pnpm --silent run release-tracks:branch dogfood)" || exit
+DOGFOOD_REF="origin/$DOGFOOD_BRANCH"
+MB=$(git merge-base "$DOGFOOD_REF" upstream/main)
 ```
 
 When the harness names a session scratch directory, use it in place of `${TMPDIR:-/tmp}`.
@@ -59,7 +64,7 @@ When the harness names a session scratch directory, use it in place of `${TMPDIR
 From the operator checkout (`$OPERATOR`):
 
 ```bash
-git worktree add ".claude/worktrees/sync-nanoclaw-$D" -b "chore/sync-nanoclaw-$D" origin/rebuild-v2
+git worktree add ".claude/worktrees/sync-nanoclaw-$D" -b "chore/sync-nanoclaw-$D" "$DOGFOOD_REF"
 ```
 
 Run every later command inside that worktree. Never switch, merge or reset in the operator checkout.
@@ -67,14 +72,14 @@ Run every later command inside that worktree. Never switch, merge or reset in th
 ### 3. Map where the two sides meet
 
 ```bash
-git diff --name-only "$MB" origin/rebuild-v2 | sort > "$SCRATCH/ours.txt"
+git diff --name-only "$MB" "$DOGFOOD_REF" | sort > "$SCRATCH/ours.txt"
 git diff --name-only "$MB" upstream/main | sort > "$SCRATCH/theirs.txt"
 comm -12 "$SCRATCH/ours.txt" "$SCRATCH/theirs.txt"                 # changed on both sides
-git merge-tree --write-tree --name-only origin/rebuild-v2 upstream/main   # first line: a tree id; then the predicted conflicts; touches nothing
+git merge-tree --write-tree --name-only "$DOGFOOD_REF" upstream/main   # first line: a tree id; then the predicted conflicts; touches nothing
 git log --no-merges --format='@@ %h %s' --name-only "$MB"..upstream/main  # each upstream commit and what it touches
 ```
 
-Files changed on both sides are only part of it. Also read the divergence record (`$OPERATOR/docs/rebuild/upstream-divergence-2026-09-24.md`) for upstream capabilities that overlap a GWS-EA divergence in files only GWS-EA touched. Examples: a new upstream update channel next to GWS-EA's release tracks, or a new approval hook next to its gateway seams. Read upstream's `CHANGELOG.md` entries since the merge base too: each `[BREAKING]` entry is an item for the maintainer even when it touches no file the fork changed. Group everything into areas (see `references/area-analysis.md`), then tell the maintainer the sync's size before analyzing: commits ahead, files changed on both sides, predicted conflicts, and the areas.
+Files changed on both sides are only part of it. Also read the divergence record (`$OPERATOR/docs/rebuild/upstream-divergence-2026-09-24.md`) for upstream capabilities that overlap a GWS-EA divergence in files only GWS-EA touched. Examples: a new upstream update channel next to GWS-EA's release tracks, or a new approval hook next to its gateway seams. Read upstream's `CHANGELOG.md` entries since the merge base too: each `[BREAKING]` entry is an item for the maintainer even when it touches no file the fork changed. Group everything into areas (see `references/area-analysis.md`), then tell the maintainer the sync's size before analyzing: the resolved branch, commits ahead, files changed on both sides, predicted conflicts, and the areas.
 
 ### 4. Analyze each area in parallel
 
@@ -101,7 +106,7 @@ Ask only the genuine decisions, with a recommendation first. Decide product ques
 ### 6. Merge and resolve
 
 ```bash
-git config rerere.enabled true   # repo-wide; records each resolution so step 10 can replay it if rebuild-v2 moves
+git config rerere.enabled true   # repo-wide; records each resolution so step 10 can replay it if the dogfood branch moves
 git merge --no-ff --no-commit upstream/main
 git diff --name-only --diff-filter=U | tee "$SCRATCH/conflicts.txt"   # step 9 reviews every one of these
 ```
@@ -126,7 +131,7 @@ Then the follow-ups the merge forces:
   - Adding a `minimumReleaseAgeExclude` or `onlyBuiltDependencies` entry is the maintainer's call; ask first.
 
   ```bash
-  git show origin/rebuild-v2:pnpm-lock.yaml upstream/main:pnpm-lock.yaml | grep -o 'integrity: sha512-[A-Za-z0-9+/=]*' | sort -u > "$SCRATCH/known"
+  git show "$DOGFOOD_REF:pnpm-lock.yaml" upstream/main:pnpm-lock.yaml | grep -o 'integrity: sha512-[A-Za-z0-9+/=]*' | sort -u > "$SCRATCH/known"
   grep -o 'integrity: sha512-[A-Za-z0-9+/=]*' pnpm-lock.yaml | sort -u | comm -23 - "$SCRATCH/known"   # must print nothing
   ```
 - **Central migrations:** the fork adds its own numbered migrations under `src/db/migrations/`. When upstream adds one, keep both in `src/db/migrations/index.ts`. A migration's `name` is its applied identity, so never rename either one; a shared number is harmless. Check that a fresh install still runs the whole list in order.
@@ -149,7 +154,7 @@ Save the merge commit only once the tree is green (step 7). Anything not needed 
 
 A full local `vitest run` times out in a few heavy suites under load (often upstream's `scripts/update/transaction.e2e.test.ts`). Re-run each failing file alone. A timeout that passes when its file runs alone is load; an assertion failure, or any failure CI reproduces, is a regression to fix. Report it either way, and let CI decide. After every behavior change, re-run the whole suite, not just the files you touched.
 
-Commit the merge: `Merge upstream NanoClaw <version> into rebuild-v2`, with the version from step 1 (or the tag named), with one bullet per area saying what was re-derived and where GWS-EA's code shrank.
+Commit the merge: `Merge upstream NanoClaw <version> into dogfood`, with the version from step 1 (or the tag named), with one bullet per area saying what was re-derived and where GWS-EA's code shrank.
 
 ### 8. Guards and the divergence record
 
@@ -175,22 +180,22 @@ Invoke the Compound Engineering review skill (`compound-engineering:ce-code-revi
 ### 10. Land
 
 ```bash
-git fetch origin +refs/heads/rebuild-v2:refs/remotes/origin/rebuild-v2
-git merge-base --is-ancestor origin/rebuild-v2 HEAD && echo fast-forward
-git log origin/rebuild-v2..HEAD --first-parent --oneline
-git diff --stat origin/rebuild-v2...HEAD | tail -1
+git fetch origin "+refs/heads/$DOGFOOD_BRANCH:refs/remotes/$DOGFOOD_REF"
+git merge-base --is-ancestor "$DOGFOOD_REF" HEAD && echo fast-forward
+git log "$DOGFOOD_REF"..HEAD --first-parent --oneline
+git diff --stat "$DOGFOOD_REF"...HEAD | tail -1
 ```
 
-Show the maintainer the commit list, the checks, and the review result, then wait for an explicit go. If `rebuild-v2` moved meanwhile, replay the branch onto it with `git rebase --rebase-merges origin/rebuild-v2`; `rerere` reapplies the recorded resolutions, so resolve only conflicts that are new, then re-run step 7. Then:
+Show the maintainer the commit list, the checks, and the review result, then wait for an explicit go. If the dogfood track's resolved branch moved meanwhile, replay the branch onto it with `git rebase --rebase-merges "$DOGFOOD_REF"`; `rerere` reapplies the recorded resolutions, so resolve only conflicts that are new, then re-run step 7. Then:
 
 ```bash
-git push origin HEAD:rebuild-v2    # fast-forward only; never --force, never a PR
+git push origin "HEAD:refs/heads/$DOGFOOD_BRANCH"    # fast-forward only; never --force, never a PR
 ```
 
 ### 11. Afterwards
 
-- Watch CI on the push, since a sync never had a PR to run it: `gh run list --repo taslim/nanoclaw-gws-ea --branch rebuild-v2 --limit 3`. A red run is fixed forward in an ordinary PR.
-- Bring the operator checkout (`$OPERATOR`) to the new `rebuild-v2`, since `gws-ea` runs from its source. When `git branch --show-current` there prints `rebuild-v2`, run `git pull --ff-only`, then `pnpm install --frozen-lockfile`, and confirm `gws-ea --help` loads. On any other branch, leave it: that is the maintainer's work in progress; tell them `rebuild-v2` moved.
+- Watch CI on the push, since a sync never had a PR to run it: `gh run list --repo taslim/nanoclaw-gws-ea --branch "$DOGFOOD_BRANCH" --limit 3`. A red run is fixed forward in an ordinary PR.
+- Bring the operator checkout (`$OPERATOR`) to the updated dogfood branch, since `gws-ea` runs from its source. When `git branch --show-current` there prints `$DOGFOOD_BRANCH`, run `git pull --ff-only`, then `pnpm install --frozen-lockfile`, and confirm `gws-ea --help` loads. On any other branch, leave it: that is the maintainer's work in progress; tell them the dogfood branch moved.
 - `git worktree remove .claude/worktrees/sync-nanoclaw-$D` and `git branch -d chore/sync-nanoclaw-$D`.
 - Tell the maintainer that assistants get the sync through `gws-ea update`, their call. Say when the update rebuilds the agent image (a `container/` change).
 
@@ -200,7 +205,7 @@ git push origin HEAD:rebuild-v2    # fast-forward only; never --force, never a P
 |---|---|---|
 | A file list passed as one path; a diff comes out empty | zsh does not split an unquoted `$VAR` into words | `$(cat "$file")` or `${=VAR}` |
 | `git merge --abort` fails: "Entry … not uptodate" | A cleanly merged file was edited after the merge | Copy the resolved files to scratch, `git reset --hard HEAD`, redo the merge, copy them back |
-| `CLAUDE.md`'s STOP banner says to halt on merge conflicts | It guards v1 installs pulling v2, not this sync | `rebuild-v2` already contains a v2 upstream merge; continue |
+| `CLAUDE.md`'s STOP banner says to halt on merge conflicts | It guards v1 installs pulling v2, not this sync | the dogfood track's resolved branch already contains a v2 upstream merge; continue |
 | `scripts/update/controller-archive.test.ts` fails with `ERR_MODULE_NOT_FOUND` | Upstream's update controller runs from `git archive … scripts src/install-slug.ts`, so `scripts/update/*` may import nothing else from `src/` | Keep upstream's file; put what GWS-EA needs in its own file with a guard |
 | `gh` acts on nanocoai/nanoclaw | The repo has no default `gh` repo | Pass `--repo taslim/nanoclaw-gws-ea` |
 | A commit prints pages of prettier output | Husky's pre-commit runs `format:fix` on `src/` | Check `git log -1` and `git status`; the commit landed |

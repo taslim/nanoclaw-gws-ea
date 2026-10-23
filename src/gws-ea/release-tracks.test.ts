@@ -1,14 +1,16 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import { resolveReleaseSource } from './release-tracks.js';
 
 const MIRROR = 'https://github.com/example/nanoclaw-gws-ea-mirror.git';
 
+vi.mock('./release-tracks.json', () => ({ default: { prod: null, dogfood: 'integration-test' } }));
+
 describe('release sources', () => {
   it('follows the dogfood line on the public repository without asking for a remote', () => {
     expect(resolveReleaseSource('dogfood')).toEqual({
       remote: 'https://github.com/taslim/nanoclaw-gws-ea.git',
-      ref: 'refs/heads/rebuild-v2',
+      ref: 'refs/heads/integration-test',
     });
   });
 
@@ -25,7 +27,10 @@ describe('release sources', () => {
   });
 
   it("installs a product track's branch from another repository with --source-remote", () => {
-    expect(resolveReleaseSource('dogfood', ` ${MIRROR} `)).toEqual({ remote: MIRROR, ref: 'refs/heads/rebuild-v2' });
+    expect(resolveReleaseSource('dogfood', ` ${MIRROR} `)).toEqual({
+      remote: MIRROR,
+      ref: 'refs/heads/integration-test',
+    });
   });
 
   it('installs any other track from the branch of its name in the repository --source-remote names', () => {

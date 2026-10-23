@@ -1,9 +1,11 @@
 # yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
 
-# The rebuild uses `rebuild-v2` as an integration branch while public `main`
-# remains frozen. CodeRabbit skips non-default PR bases unless they are listed.
+# Generated branch filters follow the product tracks and public main.
+# Update with pnpm run release-tracks:generate.
 reviews:
   auto_review:
+    # release-tracks:start
     base_branches:
-      - "main"
-      - "rebuild-v2"
+      - '^main$'
+      - '^rebuild-v2$'
+    # release-tracks:end

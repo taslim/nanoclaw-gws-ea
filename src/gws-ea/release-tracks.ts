@@ -1,3 +1,5 @@
+import productTracks from './release-tracks.json' with { type: 'json' };
+
 import { GwsEaError } from './types.js';
 
 const GWS_EA_RELEASE_REMOTE = 'https://github.com/taslim/nanoclaw-gws-ea.git';
@@ -5,17 +7,7 @@ const GWS_EA_RELEASE_REMOTE = 'https://github.com/taslim/nanoclaw-gws-ea.git';
 /** What an assistant's record accepts as a track: also the branch a non-product track installs. */
 export const RELEASE_TRACK_PATTERN = /^[a-z0-9][a-z0-9._-]{0,63}$/;
 
-/**
- * The branch each product release track follows in the public repository, or
- * `null` while the track has no release. A track names a release line; which
- * branch carries it is configuration, so moving a line is a one-line change.
- */
-const PRODUCT_TRACKS: Readonly<Record<string, string | null>> = {
-  // Public `main` once the rebuild is promoted there; the pre-rebuild `main` is not a release.
-  prod: null,
-  // The integration line its operator runs first.
-  dogfood: 'rebuild-v2',
-};
+const PRODUCT_TRACKS: Readonly<Record<string, string | null>> = productTracks;
 
 export interface ReleaseSource {
   readonly remote: string;

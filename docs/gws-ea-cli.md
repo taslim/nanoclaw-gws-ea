@@ -81,6 +81,29 @@ recovery never print credential values. Do not place secrets in shell examples.
 
 ## Update, roll back, and remove
 
+### Maintainer release tracks
+
+`src/gws-ea/release-tracks.json` declares each product track's backing branch.
+A `null` branch means that track has no release. Runtime create/update commands,
+release-test fixtures and repository branch filters use this declaration.
+Changing it does not rename a branch or change an assistant's deployed commit.
+
+```sh
+# Read-only lookup; prints just the backing branch for use in shell commands.
+DOGFOOD_BRANCH="$(pnpm --silent run release-tracks:branch dogfood)" || exit
+git fetch origin "$DOGFOOD_BRANCH"
+
+# After editing the declaration, update generated CI/CodeRabbit filters.
+pnpm run release-tracks:generate
+pnpm run release-tracks:check
+```
+
+Use the resolved branch as the explicit base for dogfood PRs. The generator
+changes only marked filter sections; public `main` retains CI/review coverage
+while `prod` has no release. CI checks for drift without rewriting files.
+
+### Assistant lifecycle commands
+
 ```sh
 gws-ea update --id 01234567-89ab-4def-8123-456789abcdef
 gws-ea update --all

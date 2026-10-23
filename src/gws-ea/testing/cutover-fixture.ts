@@ -38,6 +38,7 @@ import { runSanitizedCommand, type SanitizedCommand, type SanitizedCommandRunner
 import { getInstanceReservation, writeInstanceMarker } from '../registry.js';
 import { createState, pointCurrent, releaseName } from '../release-layout.js';
 import type { SetupCommand } from '../release-preflight.js';
+import releaseTracks from '../release-tracks.json' with { type: 'json' };
 import { applyReleaseEnvironment, stageRelease } from '../release-stage.js';
 import type { ToolProviderSetup } from '../release-target.js';
 import {
@@ -81,7 +82,7 @@ export const { upsertEnvVars } = (await import(path.join(CONTROL_PLANE_ROOT, 'se
   readonly upsertEnvVars: UpsertEnvVars;
 };
 
-export const TRACK_BRANCH = 'rebuild-v2';
+export const TRACK_BRANCH = releaseTracks.dogfood;
 export const DOCKER = 'unix:///var/run/docker.sock';
 export const CREDENTIAL = {
   name: 'Anthropic',
