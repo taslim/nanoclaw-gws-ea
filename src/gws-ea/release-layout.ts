@@ -247,21 +247,6 @@ export async function discardIncompleteRelease(layout: InstanceLayout, name: str
   await rm(layout.release(name), { recursive: true, force: true });
 }
 
-/** Restage one cached proof without touching a serving release or a rollback target. Caller holds the instance lock. */
-export async function discardUnreferencedRelease(
-  layout: InstanceLayout,
-  name: string,
-  rollbackRelease: string | undefined,
-): Promise<void> {
-  requireReleaseName(name);
-  const live = await readCurrent(layout);
-  if (live === undefined || live === name || rollbackRelease === name) {
-    throw unsafe(`Release ${name} is still referenced, so it cannot be restaged.`);
-  }
-  await rm(layout.kept(name), { recursive: true, force: true });
-  await rm(layout.release(name), { recursive: true, force: true });
-}
-
 /**
  * The release the live link names, or undefined while a switch has fenced
  * it. A link that names anything but a release directory beside it is

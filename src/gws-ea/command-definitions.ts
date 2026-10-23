@@ -20,7 +20,6 @@ export type AttemptCommand =
   | 'create'
   | 'resume'
   | 'connect-google'
-  | 'names-prepare'
   | 'start'
   | 'stop'
   | 'restart'
@@ -238,30 +237,6 @@ export const COMMAND_DEFINITIONS: readonly CommandDefinition[] = [
     examples: ['gws-ea create --track dogfood', 'gws-ea create --track=prod --principal-email=principal@example.com'],
     outputModes: managedModes,
     resultSchema: managedResultSchema(operationDataSchema('create')),
-  },
-  {
-    path: ['names', 'prepare'],
-    group: 'Assistants',
-    handler: { kind: 'attempt', command: 'names-prepare' },
-    summary: 'Prepare explicit first and last names before upgrading a legacy assistant.',
-    scope: 'assistant',
-    options: [
-      id,
-      value('assistant-first-name', 'name', 'Assistant first name.', true),
-      value('assistant-last-name', 'name', 'Assistant last name; omit when absent.'),
-      value('principal-first-name', 'name', 'Principal first name.', true),
-      value('principal-last-name', 'name', 'Principal last name; omit when absent.'),
-    ],
-    effects: ['Records per-assistant name components outside live state; the next update validates and converts them.'],
-    prerequisites: assistantPrerequisites,
-    recovery: [
-      'Rerun with explicit corrected components, then update the assistant. Finish incomplete creation with its pinned launcher first.',
-    ],
-    examples: [
-      'gws-ea names prepare --id <instance_id> --assistant-first-name Robin --assistant-last-name Wu --principal-first-name "Mary Ann" --principal-last-name Lee',
-    ],
-    outputModes: managedModes,
-    resultSchema: managedResultSchema(operationDataSchema('names-prepare')),
   },
   {
     path: ['list'],

@@ -120,8 +120,6 @@ export interface OperationRecord {
   readonly follow_ups: readonly OperationFollowUp[];
   /** An update with no release to return to: once its target started, a failure closes it (KTD9). */
   readonly no_rollback_target?: true;
-  /** Exact explicit-name input proved on the staged database copy. */
-  readonly profile_names_fingerprint?: string;
   /** A rollback that failed, going back to the release it left (KTD5): continuing it finishes that return. */
   readonly returning?: true;
   /** Closed for fix-forward: only an update to another release goes on from here (KTD9). */
@@ -132,7 +130,7 @@ export interface OperationRecord {
 export type OperationFacts = Partial<Pick<OperationRecord, 'stop' | 'manifest' | 'mode' | 'follow_ups'>>;
 
 export type OperationStart = Pick<OperationRecord, 'kind' | 'from' | 'to'> &
-  Partial<Pick<OperationRecord, 'manifest' | 'no_rollback_target' | 'profile_names_fingerprint'>>;
+  Partial<Pick<OperationRecord, 'manifest' | 'no_rollback_target'>>;
 
 /**
  * A command that takes the instance lock, and for `update` the release it
@@ -141,16 +139,7 @@ export type OperationStart = Pick<OperationRecord, 'kind' | 'from' | 'to'> &
  */
 export type OperationIntent =
   | {
-      readonly command:
-        | 'create'
-        | 'resume'
-        | 'start'
-        | 'stop'
-        | 'restart'
-        | 'ncl'
-        | 'rollback'
-        | 'connect-google'
-        | 'names-prepare';
+      readonly command: 'create' | 'resume' | 'start' | 'stop' | 'restart' | 'ncl' | 'rollback' | 'connect-google';
     }
   | { readonly command: 'update'; readonly target: ReleaseCoordinates };
 
@@ -318,10 +307,6 @@ function parseOperationRecord(value: unknown, instanceId: string): OperationReco
   const mode = value.mode === undefined ? undefined : oneOf(ROLLBACK_MODES, value.mode, 'rollback mode');
   const noRollbackTarget = flag(value.no_rollback_target, 'rollback target');
   const returning = flag(value.returning, 'return');
-  const profileNamesFingerprint =
-    value.profile_names_fingerprint === undefined
-      ? undefined
-      : matching(value.profile_names_fingerprint, /^[a-f0-9]{64}$/u, 'prepared-name fingerprint');
   if (value.closed !== undefined && value.closed !== 'failed') throw invalid('Operation record closing is invalid');
   if (kind === 'update' && (mode || returning || commitPoint === 'record')) {
     throw invalid('An update records no rollback mode, return, or commit by record');
@@ -347,7 +332,6 @@ function parseOperationRecord(value: unknown, instanceId: string): OperationReco
     follow_ups: list(value.follow_ups, 'follow-ups', parseFollowUp),
     ...(noRollbackTarget ? { no_rollback_target: true as const } : {}),
     ...(returning ? { returning: true as const } : {}),
-    ...(profileNamesFingerprint === undefined ? {} : { profile_names_fingerprint: profileNamesFingerprint }),
     ...(value.closed === 'failed' ? { closed: 'failed' as const } : {}),
   };
 }
@@ -760,9 +744,6 @@ export async function beginOperation(operation: InstanceOperation, start: Operat
       ...(start.manifest ? { manifest: start.manifest } : {}),
       follow_ups: followUps,
       ...(noRollbackTarget ? { no_rollback_target: true as const } : {}),
-      ...(start.profile_names_fingerprint === undefined
-        ? {}
-        : { profile_names_fingerprint: start.profile_names_fingerprint }),
     },
     operation.recordEffect,
   );

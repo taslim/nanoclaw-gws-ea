@@ -66,7 +66,6 @@ import {
   operationNextSteps,
   planFollowUps,
   readOperationRecord,
-  readRollbackPoint,
   recordOperationFacts,
   reservationAt,
   revertClause,
@@ -83,7 +82,6 @@ import { safeErrorMessage } from './redact.js';
 import { getInstanceReservation } from './registry.js';
 import {
   exists,
-  discardUnreferencedRelease,
   fenceEnded,
   isReleaseComplete,
   operationName,
@@ -94,14 +92,6 @@ import {
 } from './release-layout.js';
 import type { ReleasePreflightRuntime } from './release-preflight.js';
 import { stageRelease } from './release-stage.js';
-import {
-  assertProfileNameInputCurrent,
-  clearProfileNameInput,
-  installProfileNameInput,
-  profileNameInputFingerprint,
-  readProfileNameInput,
-} from './profile-name-upgrade.js';
-import type { ProfileNameMigrationInput } from './profile-name-migration.js';
 import { resolveReleaseTarget, type ToolProviderSetup, type UpdateReleaseTarget } from './release-target.js';
 import { resolveReleaseSource, type ReleaseSource } from './release-tracks.js';
 import { describeRollback, localTimezone, revertUpdate } from './rollback.js';
@@ -123,7 +113,6 @@ import {
 import { isRecord } from './validation.js';
 import {
   backupCentralDatabase,
-  centralDatabaseFile,
   printableName,
   readCentralMigrations,
   readDerivedImageGroups,
@@ -212,7 +201,6 @@ export interface StagedUpdate {
   /** The live schema as staging read it; the dry run left its migrations as they were. */
   readonly manifest: SnapshotManifest;
   readonly preview: UpdatePreview;
-  readonly profileNamesFingerprint?: string;
 }
 
 interface CheckedUpdate {
@@ -471,7 +459,6 @@ export interface MigrationDryRun {
   readonly liveMigrations: readonly string[];
   /** The staged release's folder, before its links to the assistant's state are made. */
   readonly stagedRelease: string;
-  readonly profileNames?: ProfileNameMigrationInput;
 }
 
 function sameList(left: readonly string[], right: readonly string[]): boolean {
@@ -532,7 +519,6 @@ export async function dryRunReleaseMigrations(
   let live: readonly string[] = [];
   try {
     try {
-      installProfileNameInput(database, request.profileNames);
       await run({
         command: 'pnpm',
         args: ['run', 'migrate'],
@@ -570,7 +556,6 @@ export async function dryRunReleaseMigrations(
 interface KeptDryRun {
   readonly live: readonly string[];
   readonly added: readonly string[];
-  readonly profileNamesFingerprint?: string;
 }
 
 function dryRunFile(paths: ControlPlanePaths, instanceId: string, release: string): string {
@@ -637,20 +622,6 @@ async function stageUpdate(
   const onecli = instanceOnecliLayout(paths, reservation, runtime.docker_endpoint);
   const manifest = readSchemaManifest(layout.state);
   const live = manifest.central_migrations;
-  const profileNames = await readProfileNameInput(paths, instanceId);
-  assertProfileNameInputCurrent(layout.state, profileNames);
-  const profileNamesFingerprint = profileNameInputFingerprint(profileNames) ?? undefined;
-  if (await isReleaseComplete(layout, name)) {
-    const kept = await readOwnerOnlyJson(
-      dryRunFile(paths, instanceId, name),
-      'Kept migration dry run',
-      'invalid_kept_release',
-    );
-    if (!isRecord(kept) || kept.profileNamesFingerprint !== profileNamesFingerprint) {
-      const rollback = await readRollbackPoint(paths, instanceId);
-      await discardUnreferencedRelease(layout, name, rollback && releaseName(rollback.release.deployed_commit));
-    }
-  }
 
   const migrations = await runStep(
     reporter,
@@ -671,14 +642,13 @@ async function stageUpdate(
           provider: target.preflight,
           beforeLink: async (stagedRelease) => {
             const added = await dryRunReleaseMigrations(
-              { liveState: layout.state, liveMigrations: live, stagedRelease, profileNames },
+              { liveState: layout.state, liveMigrations: live, stagedRelease },
               run,
               (await prepareReleaseCommandEnvironments(layout.root)).common,
             );
             await writePrivate(dryRunFile(paths, instanceId, name), {
               live,
               added,
-              ...(profileNamesFingerprint === undefined ? {} : { profileNamesFingerprint }),
             } satisfies KeptDryRun);
             tried = added;
           },
@@ -716,7 +686,6 @@ async function stageUpdate(
     from,
     to: release,
     manifest,
-    ...(profileNamesFingerprint === undefined ? {} : { profileNamesFingerprint }),
     preview: {
       instanceId,
       from,
@@ -762,9 +731,6 @@ export async function confirmStagedUpdate(
     from: staged.from,
     to: staged.to,
     manifest: staged.manifest,
-    ...(staged.profileNamesFingerprint === undefined
-      ? {}
-      : { profile_names_fingerprint: staged.profileNamesFingerprint }),
   });
 }
 
@@ -944,13 +910,6 @@ async function refence(host: CutoverHost, record: OperationRecord): Promise<Oper
 async function runUpdate(host: CutoverHost, start: OperationRecord): Promise<string | null> {
   const { operation, layout, reporter } = host;
   const name = releaseName(start.to.deployed_commit);
-  const profileNames = await readProfileNameInput(operation.paths, operation.instanceId);
-  if ((profileNameInputFingerprint(profileNames) ?? undefined) !== start.profile_names_fingerprint) {
-    throw new GwsEaError(
-      'profile_names_changed',
-      'The prepared names changed after this update was confirmed; revert this update and prepare it again.',
-    );
-  }
   let record = RESUMED_FENCED.has(start.phase) ? await refence(host, start) : start;
   let definitionChanged = false;
   let signInNeeded: string | null = null;
@@ -966,7 +925,6 @@ async function runUpdate(host: CutoverHost, start: OperationRecord): Promise<str
         const stop = await fenceInstance(host, STOP_LABEL, () => {
           manifest = readSchemaManifest(layout.state);
           assertMigrationsUnchanged(staged, manifest);
-          assertProfileNameInputCurrent(layout.state, profileNames);
         });
         record = await advanceOperation(operation, 'fenced', { stop, ...(manifest ? { manifest } : {}) });
         break;
@@ -978,12 +936,10 @@ async function runUpdate(host: CutoverHost, start: OperationRecord): Promise<str
         record = await advanceOperation(operation, 'snapshotted');
         break;
       case 'snapshotted':
-        installProfileNameInput(centralDatabaseFile(layout.state), profileNames);
         definitionChanged = await switchTo(host, record.to, record.from, 'Switching to the new release…');
         record = await advanceOperation(operation, 'switched');
         break;
       case 'switched':
-        installProfileNameInput(centralDatabaseFile(layout.state), profileNames);
         if ((await readCurrent(layout)) !== name) {
           definitionChanged = await switchTo(host, record.to, record.from, 'Switching to the new release…');
         }
@@ -1061,6 +1017,5 @@ export async function continueUpdate(
     }
   }
   await finishFollowUps(operation, dependencies);
-  if (record.profile_names_fingerprint !== undefined) await clearProfileNameInput(paths, instanceId);
   return { from: record.from, to: record.to, rollbackTarget: record.no_rollback_target !== true, signInNeeded };
 }
