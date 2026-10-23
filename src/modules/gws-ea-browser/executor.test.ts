@@ -99,7 +99,7 @@ describe("the assistant's own address in a site field (KTD14, R23)", () => {
   beforeEach(async () => {
     await runMigrations(await initTestDb());
     await getDb().run(
-      'UPDATE gws_ea_profile SET assistant_display_name = ?, assistant_workspace_email = ? WHERE singleton = 1',
+      `UPDATE gws_ea_profile SET assistant_first_name = ?, assistant_workspace_email = ? WHERE singleton = 1`,
       'Juno',
       'juno@corp.example',
     );

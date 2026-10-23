@@ -228,11 +228,11 @@ beforeEach(async () => {
   await host.ncl([
     'gws-ea-profile',
     'reconcile',
-    '--assistant-display-name',
+    '--assistant-first-name',
     'Aya',
     '--assistant-workspace-email',
     'aya@example.com',
-    '--principal-display-name',
+    '--principal-first-name',
     'Principal',
     '--principal-timezone',
     'UTC',

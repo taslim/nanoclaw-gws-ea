@@ -167,9 +167,9 @@ beforeEach(async () => {
     created_at: now(),
   });
   await reconcileGwsEaProfile({
-    assistantDisplayName: 'Aya',
+    assistantName: { firstName: 'Aya', lastName: null },
     assistantWorkspaceEmail: 'aya@example.test',
-    principalDisplayName: 'Morgan',
+    principalName: { firstName: 'Morgan', lastName: null },
     principalTimezone: 'Africa/Lagos',
     mainAgentGroupId: 'ag-main',
     principalEmails: ['morgan@example.test', 'morgan@work.example.test'],
@@ -288,7 +288,7 @@ describe('a new principal address once the inbox exists', () => {
       NEW_ADDRESS,
       () =>
         reconcileGwsEaProfile({
-          assistantDisplayName: 'Aya',
+          assistantName: { firstName: 'Aya', lastName: null },
           assistantWorkspaceEmail: 'morgan+aya@new.example.test',
           mainAgentGroupId: 'ag-main',
         }),

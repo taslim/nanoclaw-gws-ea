@@ -88,7 +88,7 @@ beforeEach(async () => {
   for (const id of ['main', 'browser'])
     await createAgentGroup({ id, name: id, folder: id, agent_provider: null, created_at: new Date().toISOString() });
   await getDb().run(
-    'UPDATE gws_ea_profile SET main_agent_group_id = ?, browser_agent_group_id = ? WHERE singleton = 1',
+    `UPDATE gws_ea_profile SET assistant_first_name=COALESCE(assistant_first_name,'Juno'),principal_first_name=COALESCE(principal_first_name,'Morgan'),main_agent_group_id = ?, browser_agent_group_id = ? WHERE singleton = 1`,
     'main',
     'browser',
   );
@@ -1111,7 +1111,7 @@ describe("a signup's account email (KTD14; R20, R23, R25)", () => {
 
   beforeEach(async () => {
     await getDb().run(
-      'UPDATE gws_ea_profile SET assistant_display_name = ?, assistant_workspace_email = ? WHERE singleton = 1',
+      `UPDATE gws_ea_profile SET assistant_first_name = ?, assistant_workspace_email = ? WHERE singleton = 1`,
       'Juno',
       'juno@corp.example',
     );

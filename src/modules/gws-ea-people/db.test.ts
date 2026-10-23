@@ -77,9 +77,9 @@ async function createUser(id: string): Promise<void> {
 async function setUpInstance(): Promise<void> {
   await createAgentGroup(MAIN);
   await reconcileGwsEaProfile({
-    assistantDisplayName: 'Juno',
+    assistantName: { firstName: 'Juno', lastName: null },
     assistantWorkspaceEmail: 'juno@example.test',
-    principalDisplayName: 'Morgan',
+    principalName: { firstName: 'Morgan', lastName: null },
     principalTimezone: 'Africa/Lagos',
     mainAgentGroupId: MAIN.id,
     principalEmails: ['morgan@example.test', 'morgan.fixture@gmail.com'],

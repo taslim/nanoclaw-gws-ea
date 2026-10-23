@@ -46,7 +46,10 @@ beforeEach(async () => {
     agent_provider: null,
     created_at: new Date().toISOString(),
   });
-  await getDb().run('UPDATE gws_ea_profile SET main_agent_group_id = ? WHERE singleton = 1', 'main');
+  await getDb().run(
+    `UPDATE gws_ea_profile SET assistant_first_name=COALESCE(assistant_first_name,'Juno'),principal_first_name=COALESCE(principal_first_name,'Morgan'),main_agent_group_id = ? WHERE singleton = 1`,
+    'main',
+  );
 });
 afterEach(async () => {
   setBrowserAdmissionReady(false);

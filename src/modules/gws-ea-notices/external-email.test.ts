@@ -266,7 +266,7 @@ beforeEach(async () => {
     resolved_at: now(),
   });
   await getDb().run(
-    "UPDATE gws_ea_profile SET main_agent_group_id = 'ag-main', assistant_workspace_email = ? WHERE singleton = 1",
+    "UPDATE gws_ea_profile SET assistant_first_name=COALESCE(assistant_first_name,'Juno'),principal_first_name=COALESCE(principal_first_name,'Morgan'),main_agent_group_id = 'ag-main', assistant_workspace_email = ? WHERE singleton = 1",
     JUNO,
   );
   await recordExternalEmailAgentGroupId('ag-external');

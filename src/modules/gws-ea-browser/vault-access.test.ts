@@ -312,9 +312,9 @@ beforeEach(async () => {
     created_at: at,
   });
   await reconcileGwsEaProfile({
-    assistantDisplayName: 'Juno',
+    assistantName: { firstName: 'Juno', lastName: null },
     assistantWorkspaceEmail: 'juno@assistant.example.test',
-    principalDisplayName: 'Morgan Ellery',
+    principalName: { firstName: 'Morgan', lastName: 'Ellery' },
     principalTimezone: 'Europe/London',
     mainAgentGroupId: 'va-main',
     principalEmails: [PRINCIPAL_EMAIL],

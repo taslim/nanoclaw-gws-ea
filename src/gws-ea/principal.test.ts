@@ -448,11 +448,11 @@ describe('binding the principal on a real instance', () => {
         runNcl(config, [
           'gws-ea-profile',
           'reconcile',
-          '--assistant-display-name',
+          '--assistant-first-name',
           'Aya',
           '--assistant-workspace-email',
           'aya@example.com',
-          '--principal-display-name',
+          '--principal-first-name',
           'Juno Hale',
           '--principal-timezone',
           'UTC',

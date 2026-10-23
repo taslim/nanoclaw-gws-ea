@@ -567,7 +567,7 @@ function setupAnswers() {
   return {
     assistantWorkspaceEmail: 'assistant@example.test',
     bootstrapManifest: {
-      schema_version: 1,
+      schema_version: 2,
       node_path: process.execPath,
       home_directory: '/Users/operator',
       platform: process.platform === 'darwin' ? 'macos' : 'linux',
@@ -585,8 +585,10 @@ function setupAnswers() {
         param_format: null,
       },
       identity: {
-        assistant_display_name: 'Aya',
-        principal_display_name: 'Principal',
+        assistant_first_name: 'Aya',
+        assistant_last_name: null,
+        principal_first_name: 'Principal',
+        principal_last_name: null,
         principal_timezone: 'America/Los_Angeles',
         principal_emails: ['principal@example.test'],
         principal_chat_email: 'principal@example.test',

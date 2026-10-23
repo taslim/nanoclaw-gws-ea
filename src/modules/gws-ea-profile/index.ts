@@ -47,6 +47,7 @@ import {
   gwsEaWebAliasMigration,
   gwsEaPrincipalMessagesMigration,
   gwsEaPrincipalDmRoutingMigration,
+  gwsEaStructuredNamesMigration,
 } from './migration.js';
 import { preparePrincipalMessageContent } from './marks.js';
 import { guardActor, requestPrincipalConfirmation } from './principal-confirmation.js';
@@ -60,6 +61,7 @@ registerMigration(gwsEaWebAliasMigration);
 registerMigration(gwsEaExternalChatPointerMigration);
 registerMigration(gwsEaPrincipalMessagesMigration);
 registerMigration(gwsEaPrincipalDmRoutingMigration);
+registerMigration(gwsEaStructuredNamesMigration);
 registerInboundPreparer(preparePrincipalMessageContent);
 
 // What a spawn reads synchronously: main's group, as the profile names it.
@@ -187,9 +189,11 @@ registerRequiredProjectDocSection('gws-ea-profile:identity', identitySection);
 const flag = (key: string): string => `--${key.replace(/_/g, '-')}`;
 
 const reconcileKeys = new Set([
-  'assistant_display_name',
+  'assistant_first_name',
+  'assistant_last_name',
   'assistant_workspace_email',
-  'principal_display_name',
+  'principal_first_name',
+  'principal_last_name',
   'principal_timezone',
   'main_agent_group_id',
   'principal_emails',
@@ -224,11 +228,21 @@ register({
     };
     // The principal's name and timezone seed the profile: create declares them, and nothing after it.
     const seed = (key: string): string | undefined => (raw[key] === undefined ? undefined : required(key));
+    if (raw.principal_last_name !== undefined && raw.principal_first_name === undefined) {
+      throw new Error('--principal-last-name requires --principal-first-name');
+    }
     const principalEmails = raw.principal_emails;
     return validateGwsEaProfileInput({
-      assistantDisplayName: required('assistant_display_name'),
+      assistantName: { firstName: required('assistant_first_name'), lastName: seed('assistant_last_name') ?? null },
       assistantWorkspaceEmail: required('assistant_workspace_email'),
-      principalDisplayName: seed('principal_display_name'),
+      ...(raw.principal_first_name === undefined
+        ? {}
+        : {
+            principalName: {
+              firstName: required('principal_first_name'),
+              lastName: seed('principal_last_name') ?? null,
+            },
+          }),
       principalTimezone: seed('principal_timezone'),
       mainAgentGroupId: required('main_agent_group_id'),
       ...(principalEmails === undefined ? {} : { principalEmails: parsePrincipalEmails(principalEmails) }),
@@ -493,13 +507,13 @@ const NAME_AND_TIMEZONE = 'name and timezone';
 
 /** One field a `set` changed, from and to what the profile held. */
 interface ProfileChange {
-  readonly field: keyof PublishedNameAndTimezone;
-  readonly from: string;
-  readonly to: string;
+  readonly field: 'first_name' | 'last_name' | 'timezone';
+  readonly from: string | null;
+  readonly to: string | null;
 }
 
 function profileChanges(before: PublishedNameAndTimezone, after: PublishedNameAndTimezone): ProfileChange[] {
-  return (['name', 'timezone'] as const)
+  return (['first_name', 'last_name', 'timezone'] as const)
     .filter((field) => after[field] !== before[field])
     .map((field) => ({ field, from: before[field], to: after[field] }));
 }
@@ -509,9 +523,10 @@ function profileChanges(before: PublishedNameAndTimezone, after: PublishedNameAn
  * not ask for cannot pass unseen (KTD9).
  */
 function receiptText(changes: readonly ProfileChange[]): string {
-  const described = changes.map(({ field, from, to }) =>
-    field === 'name' ? `your name is now ${to} (it was ${from})` : `your home time zone is now ${to} (it was ${from})`,
-  );
+  const described = changes.map(({ field, from, to }) => {
+    const label = field === 'first_name' ? 'first name' : field === 'last_name' ? 'last name' : 'home time zone';
+    return `your ${label} is now ${to ?? 'not set'} (it was ${from ?? 'not set'})`;
+  });
   return `I updated your profile: ${LIST.format(described)}. If you didn't ask for this, tell me and I'll change it back.`;
 }
 
@@ -524,12 +539,21 @@ const TAKES_EFFECT =
 
 async function setPrincipalProfile(args: Record<string, unknown>, ctx: CallerContext) {
   await assertMainCaller(ctx, NAME_AND_TIMEZONE);
-  const name = typeof args.name === 'string' ? args.name : undefined;
+  const firstName = typeof args.first_name === 'string' ? args.first_name : undefined;
+  const lastName = typeof args.last_name === 'string' ? args.last_name : undefined;
+  const clearLastName = args.clear_last_name === true;
   const timezone = typeof args.timezone === 'string' ? args.timezone : undefined;
-  if (name === undefined && timezone === undefined) throw new Error('Give --name, --timezone, or both');
-  const { before, after } = await setPrincipalNameAndTimezone({ name, timezone });
+  if (lastName !== undefined && clearLastName) throw new Error('Use --last-name or --clear-last-name, never both');
+  if (firstName === undefined && lastName === undefined && !clearLastName && timezone === undefined) {
+    throw new Error('Give --first-name, --last-name, --clear-last-name, or --timezone');
+  }
+  const { before, after } = await setPrincipalNameAndTimezone({
+    firstName,
+    lastName: clearLastName ? null : lastName,
+    timezone,
+  });
   const changes = profileChanges(before, after);
-  const answer = { name: after.name, timezone: after.timezone, changed: changes.map(({ field }) => field) };
+  const answer = { ...after, changed: changes.map(({ field }) => field) };
   if (changes.length === 0) return { ...answer, message: 'Nothing changed: the profile already holds these.' };
   const delivered = await sendPrincipalNotice(receiptText(changes), 'principal-profile-changed');
   return {
@@ -540,11 +564,24 @@ async function setPrincipalProfile(args: Record<string, unknown>, ctx: CallerCon
   };
 }
 
-const NAME_ARGUMENT = {
-  name: 'name',
+const FIRST_NAME_ARGUMENT = {
+  name: 'first_name',
   type: 'string',
   description:
-    "The principal's name as they want it used, such as in the signature on the assistant's email. A person's name only: no address, link, domain or markup, and at most 80 characters.",
+    "The principal's first name, preserving compound given names. A person's name only; combined first and last name at most 80 characters.",
+} as const;
+
+const LAST_NAME_ARGUMENT = {
+  name: 'last_name',
+  type: 'string',
+  description:
+    "The principal's last name, preserving compound surnames. Omit to keep it; use --clear-last-name to remove it.",
+} as const;
+
+const CLEAR_LAST_NAME_ARGUMENT = {
+  name: 'clear_last_name',
+  type: 'boolean',
+  description: "Remove the principal's last name.",
 } as const;
 
 const TIMEZONE_ARGUMENT = {
@@ -561,7 +598,7 @@ registerResource({
   table: 'gws_ea_profile',
   idColumn: 'singleton',
   description: "The principal's name and home time zone, as the assistant uses them. Only main may use them.",
-  columns: [NAME_ARGUMENT, TIMEZONE_ARGUMENT],
+  columns: [FIRST_NAME_ARGUMENT, LAST_NAME_ARGUMENT, TIMEZONE_ARGUMENT],
   operations: {},
   customOperations: {
     get: {
@@ -577,8 +614,11 @@ registerResource({
       access: 'open',
       description:
         "Change the principal's name, home time zone, or both, when the principal tells you to. No confirmation is needed; the principal is sent a receipt giving the old and new values. The host uses the new values at once; your own clock and the identity text in your instructions follow on your next start.",
-      args: [NAME_ARGUMENT, TIMEZONE_ARGUMENT],
-      examples: ['ncl principal-profile set --name "Juno Hale"', 'ncl principal-profile set --timezone Europe/London'],
+      args: [FIRST_NAME_ARGUMENT, LAST_NAME_ARGUMENT, CLEAR_LAST_NAME_ARGUMENT, TIMEZONE_ARGUMENT],
+      examples: [
+        'ncl principal-profile set --first-name Juno --last-name Hale',
+        'ncl principal-profile set --timezone Europe/London',
+      ],
       handler: setPrincipalProfile,
     },
   },

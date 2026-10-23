@@ -43,7 +43,7 @@ export async function seedU11() {
   deliveredU11.mockClear();
   const seeded = await seedContext();
   await getDb().run(
-    "UPDATE gws_ea_profile SET assistant_display_name='Robin', principal_timezone='UTC' WHERE singleton=1",
+    "UPDATE gws_ea_profile SET assistant_first_name = 'Robin', assistant_last_name = NULL, principal_timezone='UTC' WHERE singleton=1",
   );
   await initChannelAdapters(() => ({
     onInbound: () => {},

@@ -46,7 +46,7 @@ function provider(value: string, label: string): SetupProviderEntry {
 }
 
 describe('GWS-EA interactive create input', () => {
-  it('derives display names, defaults timezone from the system, and auto-selects the sole provider', async () => {
+  it('retains name components, defaults timezone from the system, and auto-selects the sole provider', async () => {
     const claude = provider('claude', 'Claude');
     const text = vi
       .fn()
@@ -113,7 +113,7 @@ describe('GWS-EA interactive create input', () => {
     expect(result).toEqual({
       assistantWorkspaceEmail: 'ada@example.test',
       bootstrapManifest: {
-        schema_version: 1,
+        schema_version: 2,
         node_path: '/opt/homebrew/bin/node',
         home_directory: '/Users/principal',
         platform: 'macos',
@@ -131,8 +131,10 @@ describe('GWS-EA interactive create input', () => {
           param_format: null,
         },
         identity: {
-          assistant_display_name: 'Ada Lovelace',
-          principal_display_name: 'Morgan',
+          assistant_first_name: 'Ada',
+          assistant_last_name: 'Lovelace',
+          principal_first_name: 'Morgan',
+          principal_last_name: null,
           principal_timezone: 'America/Los_Angeles',
           principal_emails: ['morgan@example.test', 't@other.test'],
           principal_chat_email: 't@other.test',
@@ -227,7 +229,10 @@ describe('GWS-EA interactive create input', () => {
       ],
     });
     expect(result.bootstrapManifest.provider.id).toBe('codex');
-    expect(result.bootstrapManifest.identity.principal_display_name).toBe('Morgan Ellery');
+    expect(result.bootstrapManifest.identity).toMatchObject({
+      principal_first_name: 'Morgan',
+      principal_last_name: 'Ellery',
+    });
   });
 
   it('attaches focused validation to prompted timezone and email fields', async () => {
@@ -352,8 +357,10 @@ describe('GWS-EA unattended create input', () => {
 
     expect(result.assistantWorkspaceEmail).toBe('aya@example.test');
     expect(result.bootstrapManifest.identity).toEqual({
-      assistant_display_name: 'Aya',
-      principal_display_name: 'Morgan Ellery',
+      assistant_first_name: 'Aya',
+      assistant_last_name: null,
+      principal_first_name: 'Morgan',
+      principal_last_name: 'Ellery',
       principal_timezone: 'America/Los_Angeles',
       principal_emails: ['morgan@example.test'],
       // Their only address is the one the assistant opens its DM with.
@@ -361,6 +368,16 @@ describe('GWS-EA unattended create input', () => {
     });
     expect(unattendedPrompts.text).not.toHaveBeenCalled();
   });
+
+  it.each(['assistant-first-name', 'principal-first-name'] as const)(
+    'applies shared name validation to --%s before returning a manifest',
+    async (flag) => {
+      await expect(unattended({ ...FLAGS, [flag]: 'person@example.test' })).rejects.toMatchObject({
+        code: 'invalid_arguments',
+        message: expect.stringContaining(`--${flag}`),
+      });
+    },
+  );
 
   it("takes the principal's Google Chat address from its flag, as one of their addresses", async () => {
     const emails = ['morgan@example.test', 'morgan@home.example.test'];

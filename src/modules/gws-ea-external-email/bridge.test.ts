@@ -332,8 +332,8 @@ beforeEach(async () => {
   });
   await getDb().run(
     `UPDATE gws_ea_profile
-        SET main_agent_group_id = 'ag-main', assistant_display_name = 'Juno', assistant_workspace_email = ?,
-            principal_display_name = 'Pat Doe', principal_timezone = 'America/New_York'
+        SET assistant_first_name=COALESCE(assistant_first_name,'Juno'),principal_first_name=COALESCE(principal_first_name,'Morgan'),main_agent_group_id = 'ag-main', assistant_first_name = 'Juno', assistant_last_name = NULL, assistant_workspace_email = ?,
+            principal_first_name = 'Pat', principal_last_name = 'Doe', principal_timezone = 'America/New_York'
       WHERE singleton = 1`,
     JUNO,
   );

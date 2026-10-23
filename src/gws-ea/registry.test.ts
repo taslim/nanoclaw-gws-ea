@@ -88,7 +88,7 @@ function createSetupInput() {
     sourceRemote: 'https://example.test/nanoclaw.git',
     assistantWorkspaceEmail: 'assistant@example.test',
     bootstrapManifest: {
-      schema_version: 1,
+      schema_version: 2,
       node_path: process.execPath,
       home_directory: '/Users/operator',
       platform: process.platform === 'darwin' ? 'macos' : 'linux',
@@ -106,8 +106,10 @@ function createSetupInput() {
         param_format: null,
       },
       identity: {
-        assistant_display_name: 'Aya',
-        principal_display_name: 'Principal',
+        assistant_first_name: 'Aya',
+        assistant_last_name: null,
+        principal_first_name: 'Principal',
+        principal_last_name: null,
         principal_timezone: 'America/Los_Angeles',
         principal_emails: ['principal@example.test'],
         principal_chat_email: 'principal@example.test',
@@ -934,7 +936,7 @@ describe('create recovery contract', () => {
       stderr: (line) => stderr.push(line),
       collectCreateInputs: async () => ({
         ...createSetupInput(),
-        bootstrapManifest: { ...createSetupInput().bootstrapManifest, schema_version: 99 as 1 },
+        bootstrapManifest: { ...createSetupInput().bootstrapManifest, schema_version: 99 as 2 },
       }),
       checkPrerequisites: async () => PREREQUISITES,
       resolveReleaseTarget: async ({ track, source }) => ({
@@ -966,7 +968,7 @@ describe('create recovery contract', () => {
         reserveInstance: async (_paths, input) => {
           candidateId = input.instance_id;
           stagedBeforeReservation = (await readFile(paths.bootstrapFile(input.instance_id), 'utf8')).includes(
-            '"schema_version": 1',
+            '"schema_version": 2',
           );
           throw new GwsEaError('claim_conflict', 'An exclusive operational resource is already claimed');
         },
@@ -1027,7 +1029,7 @@ describe('create recovery contract', () => {
     expect(instanceIds).toHaveLength(1);
     const instanceId = instanceIds[0]!;
     expect(stderr).toContain(`instance_id: ${instanceId}`);
-    await expect(readFile(paths.bootstrapFile(instanceId), 'utf8')).resolves.toContain('"schema_version": 1');
+    await expect(readFile(paths.bootstrapFile(instanceId), 'utf8')).resolves.toContain('"schema_version": 2');
     expect(stderr.join('\n')).toContain(`gws-ea resume --id ${instanceId}`);
     expect(`${stdout.join('\n')}\n${stderr.join('\n')}`).not.toContain(secretCanary);
     expect((await readProvisionJournal(paths, instanceId)).steps).toEqual({});
@@ -1078,7 +1080,7 @@ describe('create recovery contract', () => {
     const instanceIds = Object.keys((await readRegistry(paths)).instances);
     expect(instanceIds).toHaveLength(1);
     const instanceId = instanceIds[0]!;
-    await expect(readFile(paths.bootstrapFile(instanceId), 'utf8')).resolves.toContain('"schema_version": 1');
+    await expect(readFile(paths.bootstrapFile(instanceId), 'utf8')).resolves.toContain('"schema_version": 2');
     expect(stderr.join('\n')).toContain(`gws-ea resume --id ${instanceId}`);
     expect(stderr.join('\n')).not.toContain('gws-ea create --track');
   });

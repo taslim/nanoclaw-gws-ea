@@ -38,11 +38,11 @@ async function createGroup(value: AgentGroup): Promise<void> {
   await ensureContainerConfig(value.id);
 }
 
-async function reconcile(assistantDisplayName: string): Promise<void> {
+async function reconcile(firstName: string, lastName: string): Promise<void> {
   await reconcileGwsEaProfile({
-    assistantDisplayName,
+    assistantName: { firstName, lastName },
     assistantWorkspaceEmail: 'remy@example.test',
-    principalDisplayName: 'Morgan Ellery',
+    principalName: { firstName: 'Morgan', lastName: 'Ellery' },
     principalTimezone: 'America/New_York',
     mainAgentGroupId: 'ag-main',
     principalEmails: ['morgan@example.test'],
@@ -70,7 +70,7 @@ describe("the assistant's own agents carry its display name", () => {
     const externalEmail = await ensureExternalEmailGroup();
     const browser = await ensureBrowserGroup();
 
-    await reconcile('Remy Vance');
+    await reconcile('Remy', 'Vance');
 
     for (const id of ['ag-main', externalEmail, browser]) {
       expect(await assistantName(id)).toBe('Remy Vance');
@@ -80,10 +80,10 @@ describe("the assistant's own agents carry its display name", () => {
 
   it('writes nothing when a second reconcile holds the same name', async () => {
     const externalEmail = await ensureExternalEmailGroup();
-    await reconcile('Remy Vance');
+    await reconcile('Remy', 'Vance');
     const before = [await getContainerConfig('ag-main'), await getContainerConfig(externalEmail)];
 
-    await reconcile('Remy Vance');
+    await reconcile('Remy', 'Vance');
 
     expect([await getContainerConfig('ag-main'), await getContainerConfig(externalEmail)]).toEqual(before);
   });
@@ -91,9 +91,9 @@ describe("the assistant's own agents carry its display name", () => {
   it('renames all three when a reconcile renames the assistant', async () => {
     const externalEmail = await ensureExternalEmailGroup();
     const browser = await ensureBrowserGroup();
-    await reconcile('Remy Vance');
+    await reconcile('Remy', 'Vance');
 
-    await reconcile('Juno Hale');
+    await reconcile('Juno', 'Hale');
 
     for (const id of ['ag-main', externalEmail, browser]) expect(await assistantName(id)).toBe('Juno Hale');
   });
@@ -101,14 +101,14 @@ describe("the assistant's own agents carry its display name", () => {
   it('leaves a group main made with create_agent to its own name', async () => {
     await createGroup(group('ag-research', 'research'));
 
-    await reconcile('Remy Vance');
+    await reconcile('Remy', 'Vance');
 
     expect(await assistantName('ag-research')).toBeNull();
     expect((await materializeContainerJson('ag-research')).assistantName).toBe('research');
   });
 
   it('names external-email and the browser at creation once the profile holds the name', async () => {
-    await reconcile('Remy Vance');
+    await reconcile('Remy', 'Vance');
 
     const externalEmail = await ensureExternalEmailGroup();
     const browser = await ensureBrowserGroup();
@@ -121,7 +121,7 @@ describe("the assistant's own agents carry its display name", () => {
     const externalEmail = await ensureExternalEmailGroup();
     expect(await assistantName(externalEmail)).toBeNull();
 
-    await reconcile('Remy Vance');
+    await reconcile('Remy', 'Vance');
 
     expect(await assistantName(externalEmail)).toBe('Remy Vance');
   });

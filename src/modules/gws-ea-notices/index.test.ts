@@ -488,7 +488,9 @@ describe('a reply that fails permanently', () => {
   it('sends nothing for any session but main’s', async () => {
     await fromMorgan('in-ask');
     await createAgentGroup({ id: 'ag-other', name: 'other', folder: 'other', agent_provider: null, created_at: now() });
-    await getDb().run("UPDATE gws_ea_profile SET main_agent_group_id = 'ag-other' WHERE singleton = 1");
+    await getDb().run(
+      "UPDATE gws_ea_profile SET assistant_first_name=COALESCE(assistant_first_name,'Juno'),principal_first_name=COALESCE(principal_first_name,'Morgan'),main_agent_group_id = 'ag-other' WHERE singleton = 1",
+    );
     reply('out-a', ['in-ask']);
     channel((send) => !isNotice(send));
 

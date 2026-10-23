@@ -26,12 +26,14 @@ import type { AliasStepOptions } from './alias.js';
 import { instanceBrowserPolicyFile } from './browser-capability.js';
 import { getInstanceReservation } from './registry.js';
 import {
+  assertLegacyCreateComplete,
   createProductionProvisionSteps,
   fixPrincipalChatAddress,
   installProductionBootstrapManifest,
   loadProductionBootstrapManifest,
   provisionAssistantResources,
   removeProductionBootstrapManifest,
+  recordedHost,
   resolveProvisionSource,
   runProductionProvision,
   type ProductionBootstrapManifest,
@@ -141,7 +143,7 @@ async function writeSubscriberKey(
 
 function bootstrapManifest(paths: ControlPlanePaths): ProductionBootstrapManifest {
   return {
-    schema_version: 1,
+    schema_version: 2,
     node_path: process.execPath,
     home_directory: path.dirname(paths.stateRoot),
     platform: process.platform === 'darwin' ? 'macos' : 'linux',
@@ -159,8 +161,10 @@ function bootstrapManifest(paths: ControlPlanePaths): ProductionBootstrapManifes
       param_format: null,
     },
     identity: {
-      assistant_display_name: 'Aya',
-      principal_display_name: 'Principal',
+      assistant_first_name: 'Aya',
+      assistant_last_name: null,
+      principal_first_name: 'Principal',
+      principal_last_name: null,
       principal_timezone: 'America/Los_Angeles',
       principal_emails: ['principal@example.test'],
       principal_chat_email: 'principal@example.test',
@@ -704,6 +708,45 @@ describe('production bootstrap trust boundary', () => {
     await expect(loadProductionBootstrapManifest(file)).resolves.toEqual(bootstrapManifest(paths));
   });
 
+  it('round-trips native name components without losing compound boundaries', async () => {
+    const paths = await testPaths();
+    const manifest = bootstrapManifest(paths);
+    const input = {
+      ...manifest,
+      identity: {
+        ...manifest.identity,
+        assistant_first_name: '  María del Mar  ',
+        assistant_last_name: '  de la Cruz  ',
+        principal_first_name: '  李 小龍  ',
+        principal_last_name: null,
+      },
+    };
+    await installProductionBootstrapManifest(paths, INSTANCE_ID, input);
+    const stored = await loadProductionBootstrapManifest(paths.bootstrapFile(INSTANCE_ID));
+    expect(stored.identity).toMatchObject({
+      assistant_first_name: 'María del Mar',
+      assistant_last_name: 'de la Cruz',
+      principal_first_name: '李 小龍',
+      principal_last_name: null,
+    });
+    expect(stored.identity).not.toHaveProperty('assistant_display_name');
+    expect(stored.identity).not.toHaveProperty('principal_display_name');
+  });
+
+  it.each([
+    { principal_first_name: 'x'.repeat(81) },
+    { assistant_last_name: '<script>' },
+    { principal_last_name: undefined },
+  ])('rejects invalid or missing native name components: %o', async (names) => {
+    const paths = await testPaths();
+    const file = path.join(path.dirname(paths.configRoot), 'setup.json');
+    const manifest = bootstrapManifest(paths);
+    await writeFile(file, JSON.stringify({ ...manifest, identity: { ...manifest.identity, ...names } }), {
+      mode: 0o600,
+    });
+    await expect(loadProductionBootstrapManifest(file)).rejects.toMatchObject({ code: 'invalid_bootstrap_manifest' });
+  });
+
   it('refuses a bootstrap manifest without a local Docker endpoint', async () => {
     const paths = await testPaths();
     const file = path.join(path.dirname(paths.configRoot), 'setup.json');
@@ -797,13 +840,61 @@ describe('production bootstrap trust boundary', () => {
     });
   });
 
+  it('routes an unfinished legacy create through its pinned release before and after main publication', async () => {
+    const paths = await testPaths();
+    const reserved = await reserveInstance(paths, reservation());
+    const file = paths.bootstrapFile(reserved.instance_id);
+    const legacy = JSON.stringify({
+      ...bootstrapManifest(paths),
+      schema_version: 1,
+      identity: { assistant_display_name: 'Aya', principal_display_name: 'Principal' },
+    });
+    await writeFile(file, legacy, { mode: 0o600 });
+
+    await expect(recordedHost(paths, reserved)).rejects.toMatchObject({
+      code: 'incomplete_legacy_create',
+      message: expect.stringContaining('git clone --no-checkout'),
+    });
+    await expect(readFile(file, 'utf8')).resolves.toBe(legacy);
+    const layout = paths.instanceLayout(reserved.instance_id);
+    await mkdir(path.join(layout.state, 'data'), { recursive: true });
+    const db = new Database(path.join(layout.state, 'data', 'v2.db'));
+    db.exec(`CREATE TABLE gws_ea_profile (
+      singleton INTEGER PRIMARY KEY, main_agent_group_id TEXT, assistant_display_name TEXT);
+      INSERT INTO gws_ea_profile VALUES (1, 'main', 'Aya');`);
+    db.close();
+    await expect(recordedHost(paths, reserved)).rejects.toMatchObject({ code: 'incomplete_legacy_create' });
+    await rm(file);
+    await expect(recordedHost(paths, reserved)).rejects.toMatchObject({
+      code: 'incomplete_legacy_create',
+      message: expect.stringContaining(reserved.deployed_commit),
+    });
+    await expect(assertLegacyCreateComplete(paths, reserved)).rejects.toMatchObject({
+      code: 'incomplete_legacy_create',
+    });
+    await expect(readFile(file, 'utf8')).rejects.toMatchObject({ code: 'ENOENT' });
+    const launcher = path.join(layout.release('aaaaaaaa'), 'bin', 'gws-ea');
+    await mkdir(path.dirname(launcher), { recursive: true });
+    await writeFile(launcher, await readFile(new URL('../../bin/gws-ea', import.meta.url)), { mode: 0o700 });
+    await expect(recordedHost(paths, reserved)).rejects.toMatchObject({
+      message: expect.stringContaining('git clone --no-checkout'),
+    });
+    await linkReleaseState(layout, 'aaaaaaaa');
+    await mkdir(layout.kept('aaaaaaaa'), { recursive: true });
+    await writeFile(layout.receipt('aaaaaaaa'), '{}');
+    await expect(recordedHost(paths, reserved)).rejects.toMatchObject({
+      code: 'incomplete_legacy_create',
+      message: expect.stringContaining(`'${launcher}' resume --id ${reserved.instance_id}`),
+    });
+  });
+
   it('stages and removes only the validated bootstrap file before reservation publication', async () => {
     const paths = await testPaths();
     const input = reservation();
     const manifest = bootstrapManifest(paths);
 
     await installProductionBootstrapManifest(paths, input.instance_id, manifest);
-    await expect(readFile(paths.bootstrapFile(input.instance_id), 'utf8')).resolves.toContain('"schema_version": 1');
+    await expect(readFile(paths.bootstrapFile(input.instance_id), 'utf8')).resolves.toContain('"schema_version": 2');
     await removeProductionBootstrapManifest(paths, input.instance_id);
     await expect(readFile(paths.bootstrapFile(input.instance_id), 'utf8')).rejects.toMatchObject({ code: 'ENOENT' });
     await expect(readFile(paths.instanceRoot(input.instance_id), 'utf8')).rejects.toMatchObject({ code: 'ENOENT' });
@@ -901,7 +992,11 @@ describe('production bootstrap trust boundary', () => {
     // Until main is published, create's setup file seeds the profile with the principal.
     await expect(resolve(manifest)).resolves.toMatchObject({
       identity: {
-        principal: { displayName: 'Principal', timezone: 'America/Los_Angeles', emails: ['principal@example.test'] },
+        principal: {
+          name: { firstName: 'Principal', lastName: null },
+          timezone: 'America/Los_Angeles',
+          emails: ['principal@example.test'],
+        },
       },
       principalDisplayName: 'Principal',
     });
@@ -911,11 +1006,11 @@ describe('production bootstrap trust boundary', () => {
     try {
       central.exec(`
         CREATE TABLE gws_ea_profile (
-          singleton INTEGER PRIMARY KEY, assistant_display_name TEXT, assistant_workspace_email TEXT,
-          principal_display_name TEXT, principal_timezone TEXT, main_agent_group_id TEXT, updated_at TEXT
+          singleton INTEGER PRIMARY KEY, assistant_first_name TEXT, assistant_last_name TEXT, assistant_workspace_email TEXT,
+          principal_first_name TEXT, principal_last_name TEXT, principal_timezone TEXT, main_agent_group_id TEXT, updated_at TEXT
         );
         INSERT INTO gws_ea_profile VALUES
-          (1, 'Aya', 'assistant@example.com', 'Juno Hale', 'Europe/London', 'ag-main', '2026-10-10T09:00:00.000Z');
+          (1, 'Aya', NULL, 'assistant@example.com', 'Juno', 'Hale', 'Europe/London', 'ag-main', '2026-10-10T09:00:00.000Z');
       `);
     } finally {
       central.close();
@@ -924,11 +1019,28 @@ describe('production bootstrap trust boundary', () => {
     for (const leftover of [manifest, undefined]) {
       const source = await resolve(leftover);
       expect(source?.identity, leftover ? 'with the setup file' : 'without it').toEqual({
-        assistantDisplayName: 'Aya',
+        assistantName: { firstName: 'Aya', lastName: null },
         assistantWorkspaceEmail: 'assistant@example.com',
       });
       expect(source?.principalDisplayName).toBe('Juno Hale');
     }
+
+    const changed = new Database(path.join(runtime.state_root, 'data', 'v2.db'));
+    changed.prepare('UPDATE gws_ea_profile SET principal_last_name = NULL WHERE singleton = 1').run();
+    changed.close();
+    // A cleared surname remains absent even while create's old principal seed survives.
+    await expect(resolve(manifest)).resolves.toMatchObject({
+      principalDisplayName: 'Juno',
+      profile: { principal_first_name: 'Juno', principal_last_name: null },
+    });
+
+    const staleLegacy = JSON.stringify({ schema_version: 1, identity: { principal_display_name: 'Old Principal' } });
+    await writeFile(paths.bootstrapFile(reserved.instance_id), staleLegacy, { mode: 0o600 });
+    await expect(assertLegacyCreateComplete(paths, reserved)).resolves.toBeUndefined();
+    await expect(recordedHost(paths, reserved)).resolves.toEqual({ dockerEndpoint: runtime.docker_endpoint });
+    await expect(readFile(paths.bootstrapFile(reserved.instance_id), 'utf8')).resolves.toBe(staleLegacy);
+    await rm(paths.bootstrapFile(reserved.instance_id));
+    await expect(recordedHost(paths, reserved)).resolves.toEqual({ dockerEndpoint: runtime.docker_endpoint });
   });
 
   it('resumes past a release receipt whose OneCLI cohort differs from this launcher’s pins', async () => {
@@ -1005,9 +1117,13 @@ function productionContext(operation: InstanceOperation, reserved: InstanceReser
         headerName: 'x-api-key',
       }),
       identity: {
-        assistantDisplayName: 'Aya',
+        assistantName: { firstName: 'Aya', lastName: null },
         assistantWorkspaceEmail: reserved.exclusive_resource_claims.workspace_email,
-        principal: { displayName: 'Principal', timezone: 'America/Los_Angeles', emails: ['principal@example.test'] },
+        principal: {
+          name: { firstName: 'Principal', lastName: null },
+          timezone: 'America/Los_Angeles',
+          emails: ['principal@example.test'],
+        },
       },
       principalDisplayName: 'Principal',
       principalChatEmail: 'principal@example.test',
@@ -1099,7 +1215,8 @@ function probeIdentityDependencies(
       const principal = state.principal ?? { name: 'Principal', timezone: 'America/Los_Angeles' };
       if (args[0] === 'gws-ea-profile' && args[1] === 'get') {
         return {
-          assistant_display_name: context.input.identity.assistantDisplayName,
+          assistant_first_name: context.input.identity.assistantName.firstName,
+          assistant_last_name: context.input.identity.assistantName.lastName,
           assistant_workspace_email: context.input.identity.assistantWorkspaceEmail,
           principal_display_name: principal.name,
           principal_timezone: principal.timezone,

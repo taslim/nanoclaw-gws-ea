@@ -611,7 +611,7 @@ it.each(['fill', 'restart'] as const)(
     for (const id of ['main', 'browser', 'research'])
       await createAgentGroup({ id, name: id, folder: id, agent_provider: null, created_at: new Date().toISOString() });
     await getDb().run(
-      'UPDATE gws_ea_profile SET main_agent_group_id = ?, browser_agent_group_id = ? WHERE singleton = 1',
+      `UPDATE gws_ea_profile SET assistant_first_name=COALESCE(assistant_first_name,'Juno'),principal_first_name=COALESCE(principal_first_name,'Morgan'),main_agent_group_id = ?, browser_agent_group_id = ? WHERE singleton = 1`,
       'main',
       'browser',
     );
@@ -708,7 +708,10 @@ it('refuses a relay after cancellation cleanup instead of reusing its pinned fie
     agent_provider: null,
     created_at: new Date().toISOString(),
   });
-  await getDb().run('UPDATE gws_ea_profile SET main_agent_group_id = ? WHERE singleton = 1', 'main');
+  await getDb().run(
+    `UPDATE gws_ea_profile SET assistant_first_name=COALESCE(assistant_first_name,'Juno'),principal_first_name=COALESCE(principal_first_name,'Morgan'),main_agent_group_id = ? WHERE singleton = 1`,
+    'main',
+  );
   await executeSignInCode(f.context, { ...payload, from: 'principal' });
   await cleanupBrowserSignInMail('job');
   expect(

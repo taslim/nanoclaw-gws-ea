@@ -37,6 +37,40 @@ revision. An assistant's deployed revision is a separate fact in `status`.
 
 ## Create and continue
 
+Setup retains the assistant's and principal's first names and optional last
+names separately. Display names are derived from those components. An omitted
+last name is stored as absent, and compound first or last names keep their
+boundaries.
+
+For an existing assistant that stores only combined names, prepare explicit
+components once before updating. Omit a last-name flag when that person has no
+last name; the tool never guesses a split:
+
+```sh
+gws-ea names prepare --id 01234567-89ab-4def-8123-456789abcdef \
+  --assistant-first-name Robin --assistant-last-name Wu \
+  --principal-first-name "Mary Ann" --principal-last-name Lee
+gws-ea update --id 01234567-89ab-4def-8123-456789abcdef
+```
+
+Preparation writes an owner-only per-assistant record outside live state. The
+updater proves the conversion on a database copy, then applies it after its
+normal fence and snapshot. If a name changes meanwhile, prepare the current
+components again. Prepared records are independent, so prepare each legacy
+assistant before `gws-ea update --all`. Prepare names again before updating a
+restored legacy snapshot.
+
+An incomplete create from before this change must finish with its pinned
+release launcher first. The new tool prints that exact recovery command and
+keeps any old setup file intact. If no complete pinned release is available,
+the command creates a separate checkout at the saved revision. Once creation
+finishes, prepare names and update normally.
+
+Main and the operator can read the principal's current components with
+`ncl principal-profile get` and edit them with `set --first-name`, `--last-name`
+or `--clear-last-name`. Omitted components stay unchanged. A change sends the
+principal a receipt, including a boundary change whose display text is the same.
+
 ```sh
 gws-ea create --track dogfood
 # After a reserved creation pauses:

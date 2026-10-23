@@ -14,6 +14,7 @@ import {
   principalAddressConflict,
   principalAddressesConflict,
 } from '../src/gws-ea/validation.js';
+import { normalizePersonName, type PersonName, type NameOwner } from '../src/gws-ea/person-name.js';
 import { isConsumerGoogleAccount } from '../src/gws-ea/gcloud.js';
 import { GwsEaError } from '../src/gws-ea/types.js';
 import { EMAIL_PATTERN } from '../src/gws-ea/validation.js';
@@ -213,8 +214,26 @@ function systemTimezone(): string {
   return resolveTimezone(Intl.DateTimeFormat().resolvedOptions().timeZone);
 }
 
-function displayName(first: string, last: string): string {
-  return last ? `${first} ${last}` : first;
+async function personNameInput(source: InputSource, owner: NameOwner): Promise<PersonName> {
+  const label = owner === 'assistant' ? 'Assistant' : 'Principal';
+  const problem = (firstName: string, lastName: string | null): string | undefined => {
+    try {
+      normalizePersonName({ firstName, lastName }, owner);
+      return undefined;
+    } catch (error) {
+      if (error instanceof Error) return error.message;
+      throw error;
+    }
+  };
+  const firstName = await textInput(source, `${owner}-first-name`, `${label} first name`, {
+    validate: (value) => problem(value, null),
+  });
+  const lastName = await textInput(source, `${owner}-last-name`, `${label} last name`, {
+    optional: true,
+    placeholder: 'Optional',
+    validate: (value) => problem(firstName, value),
+  });
+  return normalizePersonName({ firstName, lastName }, owner);
 }
 
 async function chooseProvider(
@@ -272,22 +291,14 @@ export async function collectGwsEaCreateInput(
     ].join('\n'),
     'New assistant',
   );
-  const assistantFirst = await textInput(source, 'assistant-first-name', 'Assistant first name');
-  const assistantLast = await textInput(source, 'assistant-last-name', 'Assistant last name', {
-    optional: true,
-    placeholder: 'Optional',
-  });
+  const assistantName = await personNameInput(source, 'assistant');
   const assistantWorkspaceEmail = await textInput(
     source,
     'assistant-workspace-email',
     'Assistant Google Workspace email',
     { validate: workspaceEmailProblem },
   );
-  const principalFirst = await textInput(source, 'principal-first-name', 'Principal first name');
-  const principalLast = await textInput(source, 'principal-last-name', 'Principal last name', {
-    optional: true,
-    placeholder: 'Optional',
-  });
+  const principalName = await personNameInput(source, 'principal');
   const principalEmails = await principalEmailsInput(source, assistantWorkspaceEmail);
   const principalChatEmail = await principalChatEmailInput(source, principalEmails);
   const givenTimezone = await textInput(source, 'principal-timezone', 'Principal timezone', {
@@ -303,7 +314,7 @@ export async function collectGwsEaCreateInput(
   return {
     assistantWorkspaceEmail,
     bootstrapManifest: {
-      schema_version: 1,
+      schema_version: 2,
       node_path: host.nodePath,
       home_directory: host.homeDirectory,
       platform: host.platform,
@@ -321,8 +332,10 @@ export async function collectGwsEaCreateInput(
         param_format: metadata.paramFormat ?? null,
       },
       identity: {
-        assistant_display_name: displayName(assistantFirst, assistantLast),
-        principal_display_name: displayName(principalFirst, principalLast),
+        assistant_first_name: assistantName.firstName,
+        assistant_last_name: assistantName.lastName,
+        principal_first_name: principalName.firstName,
+        principal_last_name: principalName.lastName,
         principal_timezone: principalTimezone,
         principal_emails: principalEmails,
         principal_chat_email: principalChatEmail,

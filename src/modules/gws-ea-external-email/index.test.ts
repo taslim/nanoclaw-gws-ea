@@ -65,9 +65,9 @@ async function createGroup(value: AgentGroup): Promise<void> {
 
 async function publishMain(main: AgentGroup): Promise<void> {
   await reconcileGwsEaProfile({
-    assistantDisplayName: 'Aya',
+    assistantName: { firstName: 'Aya', lastName: null },
     assistantWorkspaceEmail: 'aya@example.test',
-    principalDisplayName: 'Morgan',
+    principalName: { firstName: 'Morgan', lastName: null },
     principalTimezone: 'America/Los_Angeles',
     mainAgentGroupId: main.id,
     principalEmails: ['morgan@example.test'],
@@ -258,9 +258,9 @@ describe("external-email's project document", () => {
     const main = group('ag-main');
     await createGroup(main);
     await reconcileGwsEaProfile({
-      assistantDisplayName: 'Aya',
+      assistantName: { firstName: 'Aya', lastName: null },
       assistantWorkspaceEmail: 'aya@example.test',
-      principalDisplayName: 'Juno *Hale* [Jr] #1_',
+      principalName: { firstName: 'Juno', lastName: '*Hale* [Jr] #1_' },
       principalTimezone: 'Europe/London',
       mainAgentGroupId: main.id,
       principalEmails: ['juno@example.test'],

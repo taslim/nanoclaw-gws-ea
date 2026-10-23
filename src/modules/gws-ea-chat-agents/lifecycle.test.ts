@@ -77,7 +77,9 @@ beforeEach(async () => {
     }),
   );
   await runMigrations(await initTestDb());
-  await getDb().run("UPDATE gws_ea_profile SET assistant_display_name = 'Robin' WHERE singleton = 1");
+  await getDb().run(
+    "UPDATE gws_ea_profile SET assistant_first_name = 'Robin', assistant_last_name = NULL WHERE singleton = 1",
+  );
 });
 afterEach(async () => {
   await closeDb();

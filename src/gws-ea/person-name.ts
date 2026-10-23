@@ -1,4 +1,5 @@
 import { hasControlCharacters } from './validation.js';
+import { GwsEaError } from './types.js';
 
 export interface PersonName {
   readonly firstName: string;
@@ -17,7 +18,6 @@ export function displayPersonName(name: PersonName): string {
   return name.lastName === null ? name.firstName : `${name.firstName} ${name.lastName}`;
 }
 
-/** The same identity rules apply at setup, conversion and later profile edits. */
 export function normalizePersonName(input: PersonNameInput, owner: NameOwner): PersonName {
   const firstName = input.firstName.trim();
   const lastName = input.lastName?.trim() || null;
@@ -31,6 +31,7 @@ export function normalizePersonName(input: PersonNameInput, owner: NameOwner): P
   else if (/@|:\/\/|www\.|\//iu.test(display)) problem = 'it holds an address or a link';
   else if (/[<>`]/u.test(display)) problem = 'it holds markup';
   else if (/\.\p{L}{2}/u.test(display)) problem = 'it holds a domain name, which mail turns into a link';
-  if (problem !== undefined) throw new Error(`${owner} name cannot be a person's name: ${problem}`);
+  if (problem !== undefined)
+    throw new GwsEaError('invalid_name', `${owner} name cannot be a person's name: ${problem}`);
   return name;
 }

@@ -140,7 +140,7 @@ describe('standing reservation guarantees through native host delivery', () => {
     for (const id of ['rg-main', 'rg-browser'])
       await createAgentGroup({ id, name: id, folder: id, agent_provider: null, created_at: at });
     await getDb().run(
-      'UPDATE gws_ea_profile SET main_agent_group_id = ?, browser_agent_group_id = ? WHERE singleton = 1',
+      `UPDATE gws_ea_profile SET assistant_first_name=COALESCE(assistant_first_name,'Juno'),principal_first_name=COALESCE(principal_first_name,'Morgan'),main_agent_group_id = ?, browser_agent_group_id = ? WHERE singleton = 1`,
       'rg-main',
       'rg-browser',
     );

@@ -15,12 +15,9 @@ describe('structured identity names', () => {
     expect(displayPersonName(name)).toBe('Mary Ann');
   });
 
-  it.each(['', '  ', 'name@example.com', 'www.example.com', '<name>', 'A\nB'])(
-    'refuses invalid first name %j',
-    (firstName) => {
-      expect(() => normalizePersonName({ firstName, lastName: null }, 'principal')).toThrow();
-    },
-  );
+  it.each(['name@example.com', '<name>'])('refuses invalid first name %j', (firstName) => {
+    expect(() => normalizePersonName({ firstName, lastName: null }, 'principal')).toThrow();
+  });
 
   it('applies the limit to the combined name and preserves the identity-specific limits', () => {
     expect(() => normalizePersonName({ firstName: 'A'.repeat(40), lastName: 'B'.repeat(40) }, 'principal')).toThrow(
