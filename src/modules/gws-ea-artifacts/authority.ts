@@ -1,7 +1,12 @@
 import { forbidden, invalidArgs } from '../../cli/delivery-action.js';
 import { getDb } from '../../db/connection.js';
 import { getSession } from '../../db/sessions.js';
-import { hasControlCharacters, isRecord, normalizePrincipalEmail } from '../../gws-ea/validation.js';
+import {
+  canonicalTimestamp,
+  hasControlCharacters,
+  isRecord,
+  normalizePrincipalEmail,
+} from '../../gws-ea/validation.js';
 import { ALLOW, DENY, HOLD, defineGuardedAction } from '../../guard/index.js';
 import type { Session } from '../../types.js';
 import { listPrincipalAddresses, principalApproverUserId } from '../gws-ea-profile/db.js';
@@ -96,9 +101,7 @@ export function parseArtifactShare(content: Record<string, unknown>): ArtifactSh
   if (
     content.expires_at !== undefined &&
     content.expires_at !== null &&
-    (typeof content.expires_at !== 'string' ||
-      !Number.isFinite(Date.parse(content.expires_at)) ||
-      new Date(content.expires_at).toISOString() !== content.expires_at)
+    canonicalTimestamp(content.expires_at) === undefined
   )
     throw invalidArgs('expires_at must be an ISO timestamp or null.');
   let privateIds: readonly string[] | undefined;

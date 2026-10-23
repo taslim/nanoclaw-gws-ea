@@ -35,7 +35,6 @@ function artifactUrls(texts: readonly string[], config: ArtifactsPolicyFile): re
     );
   });
 }
-/** Lets existing Google-only callers preserve their ordinary no-link fast path. */
 export async function hasArtifactLinks(texts: readonly string[]): Promise<boolean> {
   const policy = await readArtifactsPolicy();
   return 'config' in policy && policy.config !== undefined && artifactUrls(texts, policy.config).length > 0;

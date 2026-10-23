@@ -408,7 +408,6 @@ async function provision(
       body: unknown,
       recorded: (id: string) => ArtifactsOperatorConfig,
     ): Promise<void> => {
-      if (!config) throw new Error('Missing operator configuration');
       await save({
         ...config,
         pending: {
@@ -448,7 +447,7 @@ async function provision(
           randomUUID(),
           `${account}/access/identity_providers`,
           { name: 'Artifact email PIN', type: 'onetimepin', config: {} },
-          (id) => ({ ...config!, pin: { id, owned: true } }),
+          (id) => ({ ...config, pin: { id, owned: true } }),
         );
     }
     let assistant: ArtifactsRemoteAssistant = config.assistants[instanceId] ?? { claim, enabled: false };
@@ -471,8 +470,8 @@ async function provision(
         `${account}/access/apps`,
         artifactsAccessApplication(claim, config.pin!.id),
         (id) => ({
-          ...config!,
-          assistants: { ...config!.assistants, [instanceId]: { ...assistant, applicationId: id } },
+          ...config,
+          assistants: { ...config.assistants, [instanceId]: { ...assistant, applicationId: id } },
         }),
       );
       assistant = config.assistants[instanceId];
@@ -494,8 +493,8 @@ async function provision(
           'The owned application has an unrecorded policy. It was left unchanged.',
         );
       await create('policy', instanceId, `${appPath}/policies`, artifactsEmailPolicy(emails), (id) => ({
-        ...config!,
-        assistants: { ...config!.assistants, [instanceId]: { ...assistant, policyId: id } },
+        ...config,
+        assistants: { ...config.assistants, [instanceId]: { ...assistant, policyId: id } },
       }));
       assistant = config.assistants[instanceId];
     } else if (policies.length !== 1 || policies[0].id !== assistant.policyId)
@@ -506,7 +505,7 @@ async function provision(
         randomUUID(),
         `${account}/cfd_tunnel`,
         { name: `gws-ea-artifacts-${randomUUID()}`, config_src: 'cloudflare' },
-        (id) => ({ ...config!, tunnelId: id }),
+        (id) => ({ ...config, tunnelId: id }),
       );
     const tunnel = await api.request('GET', `${account}/cfd_tunnel/${config.tunnelId}`);
     if (!isRecord(tunnel) || tunnel.id !== config.tunnelId || tunnel.config_src !== 'cloudflare' || tunnel.deleted_at)
@@ -524,7 +523,7 @@ async function provision(
         claim.hostname,
         `/zones/${zoneId}/dns_records`,
         { type: 'CNAME', name: claim.hostname, content: `${config.tunnelId}.cfargotunnel.com`, proxied: true, ttl: 1 },
-        (id) => ({ ...config!, dns: { ...config!.dns, [claim.hostname]: { id, zoneId } } }),
+        (id) => ({ ...config, dns: { ...config.dns, [claim.hostname]: { id, zoneId } } }),
       );
     }
     const ownedDns = config.dns[claim.hostname];

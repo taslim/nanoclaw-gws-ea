@@ -9,7 +9,7 @@ import {
 } from '../../cli/delivery-action.js';
 import type { ResponseFrame } from '../../cli/frame.js';
 import { getDb } from '../../db/connection.js';
-import { getPendingApproval, getPendingApprovalsByAction, getSession } from '../../db/sessions.js';
+import { getPendingApproval, getSession } from '../../db/sessions.js';
 import type { DeliveryGuardSpec } from '../../delivery-guard.js';
 import { guard } from '../../guard/index.js';
 import { isRecord } from '../../gws-ea/validation.js';
@@ -64,18 +64,22 @@ export async function artifactShares(
     `SELECT s.share_id,s.kind,s.state,s.revision,s.source_hash,r.title,s.generation,s.expires_at FROM gws_ea_artifact_shares s LEFT JOIN gws_ea_artifact_revisions r ON r.artifact_id=s.artifact_id AND r.revision=s.revision WHERE s.artifact_id=? ORDER BY s.created_at,s.share_id`,
     artifactId,
   );
-  return Promise.all(
-    shares.map(async (share) => ({
-      ...share,
-      recipients: (
-        await getDb().all<{ email: string }>(
-          'SELECT email FROM gws_ea_artifact_share_recipients WHERE share_id=? ORDER BY email',
-          share.share_id,
-        )
-      ).map(({ email }) => email),
-      url: shareUrl(config, share.kind, share.share_id),
-    })),
+  if (!shares.length) return [];
+  const recipients = new Map<string, string[]>();
+  const rows = await getDb().all<{ share_id: string; email: string }>(
+    'SELECT g.share_id,g.email FROM gws_ea_artifact_share_recipients g JOIN gws_ea_artifact_shares s ON s.share_id=g.share_id WHERE s.artifact_id=? ORDER BY g.share_id,g.email',
+    artifactId,
   );
+  for (const row of rows) {
+    const emails = recipients.get(row.share_id) ?? [];
+    emails.push(row.email);
+    recipients.set(row.share_id, emails);
+  }
+  return shares.map((share) => ({
+    ...share,
+    recipients: recipients.get(share.share_id) ?? [],
+    url: shareUrl(config, share.kind, share.share_id),
+  }));
 }
 /** Also callable while disabled: capability intent survives a temporary shutdown. */
 export async function artifactAdmissionEmails(): Promise<string[]> {
@@ -147,7 +151,6 @@ export interface ArtifactSharingDependencies {
   readonly verifyAdmission: (config: ArtifactsPolicyFile) => Promise<void>;
   readonly publicationReady: (config: ArtifactsPolicyFile) => boolean;
 }
-/** Native request journal + native approvals; no separate worker queue or approval registry. */
 export class ArtifactSharing {
   private readonly running = new Set<string>();
   private pendingCursor: readonly [string, string] = ['', ''];
@@ -450,12 +453,17 @@ export class ArtifactSharing {
     });
     if (completed) await this.answer(session, completed);
   }
-  private async approvals(session: Session, requestId: string): Promise<PendingApproval | undefined> {
-    return (await getPendingApprovalsByAction(ARTIFACT_SHARE_APPROVAL)).find((approval) => {
-      if (approval.session_id !== session.id) return false;
-      const payload: unknown = JSON.parse(approval.payload);
-      return isRecord(payload) && payload.reservation_request_id === requestId;
-    });
+  private async approvals(
+    session: Session,
+    requestId: string,
+    held: Reservation,
+  ): Promise<PendingApproval | undefined> {
+    return getDb().get<PendingApproval>(
+      'SELECT * FROM pending_approvals WHERE action=? AND session_id=? AND payload=?',
+      ARTIFACT_SHARE_APPROVAL,
+      session.id,
+      JSON.stringify({ input: held.input, scope_hash: held.scope_hash, reservation_request_id: requestId }),
+    );
   }
   private async process(session: Session, requestId: string, grant: PendingApproval | null = null): Promise<void> {
     const row = await getDb().get<{ payload_json: string }>(
@@ -476,7 +484,7 @@ export class ArtifactSharing {
     const decision = await consult();
     if (decision.effect === 'deny') throw forbidden(decision.reason);
     if (decision.effect === 'hold') {
-      if (!(await this.approvals(session, requestId))) {
+      if (!(await this.approvals(session, requestId, held))) {
         const id = await requestApproval({
           session,
           action: ARTIFACT_SHARE_APPROVAL,
@@ -568,14 +576,13 @@ export class ArtifactSharing {
     }
     /* eslint-enable no-catch-all/no-catch-all */
   }
-  /** Bounded advancing scans recover both pending work and missing mailbox answers. */
   async recover(): Promise<void> {
     await this.reconcile();
   }
   private async recoverAnswers(): Promise<void> {
     const [sessionId, requestId] = this.answerCursor;
-    const rows = await getDb().all<{ session_id: string; request_id: string; result_json: string }>(
-      "SELECT session_id,request_id,result_json FROM gws_ea_artifact_requests WHERE action='share' AND state='settled' AND (session_id>? OR (session_id=? AND request_id>?)) ORDER BY session_id,request_id LIMIT 32",
+    const rows = await getDb().all<{ session_id: string; request_id: string }>(
+      "SELECT session_id,request_id FROM gws_ea_artifact_requests WHERE action='share' AND state='settled' AND (session_id>? OR (session_id=? AND request_id>?)) ORDER BY session_id,request_id LIMIT 32",
       sessionId,
       sessionId,
       requestId,
@@ -588,7 +595,13 @@ export class ArtifactSharing {
         mailbox.hasMessage(`action-resp-${row.request_id}`),
       );
       if (exists) continue;
-      const result: unknown = JSON.parse(row.result_json);
+      const missing = await getDb().get<{ result_json: string }>(
+        "SELECT result_json FROM gws_ea_artifact_requests WHERE session_id=? AND request_id=? AND action='share' AND state='settled'",
+        row.session_id,
+        row.request_id,
+      );
+      if (!missing) continue;
+      const result: unknown = JSON.parse(missing.result_json);
       if (isRecord(result)) await this.replay(session, storedFrame(result, row.request_id));
     }
     if (rows.length < 32) this.answerCursor = ['', ''];
@@ -606,9 +619,10 @@ export class ArtifactSharing {
       this.pendingCursor = [row.session_id, row.request_id];
       const session = await getSession(row.session_id);
       if (!session || this.running.has(`${session.id}:${row.request_id}`)) continue;
-      const approval = await this.approvals(session, row.request_id);
+      const held = reservation(row.payload_json);
+      const approval = await this.approvals(session, row.request_id, held);
       if (approval?.status === 'approved') continue; // Native restart-safe approval replay owns its still-live grant.
-      await this.submit(session, row.request_id, reservation(row.payload_json).input);
+      await this.submit(session, row.request_id, held.input);
     }
     if (pending.length < 32) this.pendingCursor = ['', ''];
   }
