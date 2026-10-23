@@ -9,9 +9,18 @@ describe('artifact document policy', () => {
     expect(document.staticHtml).toContain('Base case: $42');
     expect(document.staticHtml).toContain('<text>42</text>');
     expect(document.staticHtml).toContain('disabled=""');
+    expect(document.staticHtml).toContain('Interactive controls are unavailable');
     expect(document.staticHtml).not.toContain('<script');
     expect(document.staticHtml).not.toContain('onclick');
     expect(document.html).toContain('onclick');
+  });
+  it('keeps an entirely static document readable without claiming interactions are unavailable', () => {
+    const document = parseArtifactDocument(
+      '<!doctype html><h1>Decision brief</h1><p>Choose the local option.</p><details><summary>Evidence</summary><p>Nearby facts</p></details>',
+    );
+    expect(document.staticHtml).toContain('<details>');
+    expect(document.staticHtml).toContain('Nearby facts');
+    expect(document.staticHtml).not.toContain('Interactive controls are unavailable');
   });
   it('extracts exact HTTPS sources, leaves fragments local, and never puts external hrefs in the child', () => {
     const document = parseArtifactDocument(

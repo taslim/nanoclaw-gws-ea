@@ -111,6 +111,13 @@ const POLICY: Policy = {
     'gws-ea-preferences/index.ts': 'main',
   },
   words: {
+    'gws-ea-artifacts/db.ts': {
+      head_revision: 'a column in the host-only SQL compare-and-swap condition, not prose sent to an agent',
+    },
+    'gws-ea-artifacts/sharing.ts': {
+      gws_ea_artifact_shares: 'a host-only SQL table named in the shared JOIN fragment',
+      gws_ea_artifact_revisions: 'a host-only SQL table named in the shared JOIN fragment',
+    },
     'gws-ea-chats/handoffs.ts': {
       delivered_session_id: 'a column in the optional SQL delivery filter, read only by the host',
     },

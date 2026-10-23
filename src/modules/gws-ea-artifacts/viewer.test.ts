@@ -6,8 +6,17 @@ import { chromium, type Browser, type BrowserContext } from 'playwright-core';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { parseArtifactDocument } from './document.js';
 import { renderArtifactChild, renderArtifactViewer } from './viewer.js';
+const configuredChrome = process.env.ARTIFACT_TEST_CHROMIUM || process.env.GWS_EA_BROWSER_TEST_CHROME;
 const executablePath =
-  process.env.ARTIFACT_TEST_CHROMIUM || '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
+  configuredChrome ??
+  [
+    '/usr/bin/google-chrome',
+    '/usr/bin/chromium',
+    '/usr/bin/chromium-browser',
+    '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+  ].find(existsSync);
+if (configuredChrome && !existsSync(configuredChrome))
+  throw new Error(`Configured artifact test Chromium is missing: ${configuredChrome}`);
 const nonce = '0123456789abcdef0123456789abcdef';
 const fixtureHtml = `<!doctype html><html><head><style>body{font:18px system-ui;margin:20px}button,input{font:inherit}svg{max-width:100%}</style></head><body><h1>Budget scenario</h1><p>Base budget: $42</p><label>Multiplier <input id="factor" type="number" value="2"></label><button id="calculate">Calculate</button><output id="result">84</output><p><a href="https://example.com/source">Evidence</a></p><script>document.querySelector('#calculate').addEventListener('click',()=>document.querySelector('#result').textContent=42*Number(document.querySelector('#factor').value));</script></body></html>`;
 let browser: Browser;
@@ -34,7 +43,7 @@ async function pageFixture(
   await page.goto(origin);
   return { context, page };
 }
-describe.skipIf(!existsSync(executablePath))('actual Chromium artifact boundary', () => {
+describe.skipIf(!executablePath)('actual Chromium artifact boundary', () => {
   beforeAll(async () => {
     await new Promise<void>((resolve) => udp.bind(0, '127.0.0.1', resolve));
     udpPort = udp.address().port;

@@ -14,6 +14,7 @@ it.each([
   [artifactSave, { create_key: 'trip', title: 'Trip', file: 'trip.html' }],
   [artifactSave, { artifact_id: 'trip', expected_revision: 1, title: 'Trip', file: 'trip.html' }],
   [artifactRead, { artifact_id: 'trip', checkout: true }],
+  [artifactRead, { artifact_id: 'trip', shares_after: 'share-cursor' }],
   [artifactList, {}],
   [artifactPreview, { file: 'trip.html', expected_hash: hash }],
   [artifactDelete, { artifact_id: 'trip', expected_generation: 1 }],

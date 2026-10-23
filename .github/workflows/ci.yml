@@ -66,6 +66,8 @@ jobs:
 
       - name: Container tests
         working-directory: container/agent-runner
+        env:
+          GWS_EA_BROWSER_TEST_CHROME: /usr/bin/google-chrome
         run: bun run test
 
   iron-front:

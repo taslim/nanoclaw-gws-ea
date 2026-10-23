@@ -28,6 +28,16 @@ type Review =
  * `src/modules`, its other fields sorted, a spread written `...name`.
  */
 const REVIEWED: Readonly<Record<string, Review>> = {
+  'gws-ea-artifacts/sharing.ts failure: code': {
+    kind: 'host-only',
+    reason:
+      'the native ResponseFrame error message fully explains the refusal; code classifies it for host/transport handling',
+  },
+  'gws-ea-artifacts/sharing.ts storedFrame: code': {
+    kind: 'host-only',
+    reason:
+      'the replayed native ResponseFrame retains the complete error message and its host/transport classification',
+  },
   'gws-ea-chat-agents/docs.ts answer: file, url': {
     kind: 'rendered',
     reason: 'the message gives the created document id and its URL',

@@ -2,8 +2,17 @@ import { createHash } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { describe, expect, it } from 'bun:test';
 import { previewArtifact } from './preview.js';
+const configuredChrome = process.env.ARTIFACT_TEST_CHROMIUM || process.env.GWS_EA_BROWSER_TEST_CHROME;
 const executablePath =
-  process.env.ARTIFACT_TEST_CHROMIUM || '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
+  configuredChrome ??
+  [
+    '/usr/bin/google-chrome',
+    '/usr/bin/chromium',
+    '/usr/bin/chromium-browser',
+    '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+  ].find(existsSync);
+if (configuredChrome && !existsSync(configuredChrome))
+  throw new Error(`Configured artifact test Chromium is missing: ${configuredChrome}`);
 const html =
   '<!doctype html><html><head><style>body{font:20px system-ui;margin:20px}svg{max-width:100%}</style></head><body><h1>Quarterly budget</h1><p>Base amount: $42</p><button id="up">Increase</button><output>42</output><script>document.querySelector("#up").onclick=()=>document.querySelector("output").textContent="84";</script></body></html>';
 describe('artifact preview', () => {
@@ -15,7 +24,7 @@ describe('artifact preview', () => {
     expect(result.status).toBe('failed');
     if (result.status === 'failed') expect(result.reason).toContain('cancelled');
   });
-  it.skipIf(!existsSync(executablePath))(
+  it.skipIf(!executablePath)(
     'captures actual desktop/mobile interaction and fallback within its deadline, rejects concurrency, and releases the session',
     async () => {
       const start = performance.now();
@@ -43,7 +52,7 @@ describe('artifact preview', () => {
     },
     20_000,
   );
-  it.skipIf(!existsSync(executablePath))(
+  it.skipIf(!executablePath)(
     'closes cancelled running work and allows the next request',
     async () => {
       const abort = new AbortController();
@@ -63,7 +72,7 @@ describe('artifact preview', () => {
     },
     5_000,
   );
-  it.skipIf(!existsSync(executablePath))(
+  it.skipIf(!executablePath)(
     'enforces its deadline on unresponsive authored JavaScript and cleans up',
     async () => {
       const started = performance.now();
@@ -81,7 +90,7 @@ describe('artifact preview', () => {
     },
     20_000,
   );
-  it.skipIf(!existsSync(executablePath))(
+  it.skipIf(!executablePath)(
     'reports authored JavaScript errors, blocked requests and overflow without exposing target URLs',
     async () => {
       const result = await previewArtifact({

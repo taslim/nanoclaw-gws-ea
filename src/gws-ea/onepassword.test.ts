@@ -1130,7 +1130,14 @@ describe('the native 1Password capability commands', () => {
     const listed = await run(['capabilities', 'list', '--json']);
     expectResultContract('capabilities list', JSON.parse(listed.stdout));
     expect(JSON.parse(listed.stdout)).toMatchObject({
-      data: { capabilities: [{ name: 'voice' }, { name: 'browser' }, { name: 'onepassword', activation: 'enabled' }] },
+      data: {
+        capabilities: [
+          { name: 'voice' },
+          { name: 'browser' },
+          { name: 'onepassword', activation: 'enabled' },
+          { name: 'artifacts' },
+        ],
+      },
     });
     const human = await run(['capabilities', 'check', 'onepassword']);
     expect(human.stdout).toContain('Account type: families');
@@ -1193,7 +1200,14 @@ describe('the native 1Password capability commands', () => {
     });
     const listed = await run(['capabilities', 'list', '--json']);
     expect(JSON.parse(listed.stdout)).toMatchObject({
-      data: { capabilities: [{ name: 'voice' }, { name: 'browser' }, { name: 'onepassword', activation: 'enabled' }] },
+      data: {
+        capabilities: [
+          { name: 'voice' },
+          { name: 'browser' },
+          { name: 'onepassword', activation: 'enabled' },
+          { name: 'artifacts' },
+        ],
+      },
     });
 
     const everything = [disabled, human, reenabled].map((output) => output.stdout + output.stderr).join('\n');

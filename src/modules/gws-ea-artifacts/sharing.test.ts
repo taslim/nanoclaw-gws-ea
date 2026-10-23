@@ -177,7 +177,11 @@ it('applies exact named snapshots through native guard/mailbox; a guest cannot o
   expect(await view(String(input.artifact_id), 'private', 'principal@example.com')).toMatchObject({
     title: 'Private new title',
   });
-  expect(await artifactShares(String(input.artifact_id), policy)).toEqual(
+  const first = await artifactShares(String(input.artifact_id), policy);
+  const second = first.shares_next_cursor
+    ? await artifactShares(String(input.artifact_id), policy, first.shares_next_cursor)
+    : { shares: [] };
+  expect([...first.shares, ...second.shares]).toEqual(
     expect.arrayContaining([
       expect.objectContaining({
         share_id: applied.share_id,
@@ -345,6 +349,18 @@ it('rejects changed request input and oversized exact payload before any audienc
   expect(response('large')).toMatchObject({ ok: false, error: { message: expect.stringContaining('16 KiB') } });
   expect(await getDb().all('SELECT share_id FROM gws_ea_artifact_shares')).toHaveLength(1);
 });
+it('returns every recipient in a complete bounded page for a large legal audience', async () => {
+  const recipients = Array.from({ length: 100 }, (_, index) => ({
+    email: `guest${String(index).padStart(3, '0')}@${'a'.repeat(55)}.${'b'.repeat(55)}.example.com`,
+  }));
+  await send('large-legal', { ...input, recipients });
+  expect(data('large-legal').state).toBe('active');
+  const page = await artifactShares(String(input.artifact_id), policy);
+  expect(page.shares).toHaveLength(1);
+  expect(page.shares[0].recipients).toEqual(recipients.map(({ email }) => email));
+  expect(page.shares_next_cursor).toBeNull();
+  expect(Buffer.byteLength(JSON.stringify(page))).toBeLessThan(16 * 1024);
+});
 it('pins expiry at publication; later private extensions cannot extend the grant and reductions deny immediately', async () => {
   const expires = new Date(Date.now() + 60000).toISOString();
   await getDb().run('UPDATE gws_ea_artifacts SET expires_at=?', expires);
@@ -352,7 +368,7 @@ it('pins expiry at publication; later private extensions cannot extend the grant
   const applied = data('expiry');
   expect(applied.expires_at).toBe(expires);
   await getDb().run('UPDATE gws_ea_artifacts SET expires_at=?', new Date(Date.now() + 3600000).toISOString());
-  expect((await artifactShares(String(input.artifact_id), policy))[0].expires_at).toBe(expires);
+  expect((await artifactShares(String(input.artifact_id), policy)).shares[0].expires_at).toBe(expires);
   await getDb().run('UPDATE gws_ea_artifact_shares SET expires_at=?', new Date(Date.now() - 1).toISOString());
   expect(await view(String(applied.share_id), 'share', 'juno@example.com')).toBeUndefined();
   expect(await artifactAdmissionEmails()).toEqual(['principal@example.com']);

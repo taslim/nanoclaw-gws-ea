@@ -56,30 +56,49 @@ export interface ArtifactShareMetadata {
   readonly recipients: readonly string[];
   readonly url: string;
 }
+type ShareRow = Omit<ArtifactShareMetadata, 'recipients' | 'url'>;
+const SHARE_METADATA = 's.share_id,s.kind,s.state,s.revision,s.source_hash,r.title,s.generation,s.expires_at';
+const SHARE_JOIN =
+  'gws_ea_artifact_shares s LEFT JOIN gws_ea_artifact_revisions r ON r.artifact_id=s.artifact_id AND r.revision=s.revision';
 export async function artifactShares(
   artifactId: string,
   config: ArtifactsPolicyFile,
-): Promise<ArtifactShareMetadata[]> {
-  const shares = await getDb().all<Omit<ArtifactShareMetadata, 'recipients' | 'url'>>(
-    `SELECT s.share_id,s.kind,s.state,s.revision,s.source_hash,r.title,s.generation,s.expires_at FROM gws_ea_artifact_shares s LEFT JOIN gws_ea_artifact_revisions r ON r.artifact_id=s.artifact_id AND r.revision=s.revision WHERE s.artifact_id=? ORDER BY s.created_at,s.share_id`,
+  after = '',
+): Promise<{ readonly shares: ArtifactShareMetadata[]; readonly shares_next_cursor: string | null }> {
+  // One complete grant keeps exact recipients available without multiplying the bounded audience payload.
+  const rows = await getDb().all<ShareRow>(
+    `SELECT ${SHARE_METADATA} FROM ${SHARE_JOIN} WHERE s.artifact_id=? AND s.share_id>? ORDER BY s.share_id LIMIT 2`,
+    artifactId,
+    after,
+  );
+  const share = rows[0];
+  if (!share) return { shares: [], shares_next_cursor: null };
+  const recipients = await getDb().all<{ email: string }>(
+    'SELECT email FROM gws_ea_artifact_share_recipients WHERE share_id=? ORDER BY email',
+    share.share_id,
+  );
+  return {
+    shares: [
+      { ...share, recipients: recipients.map(({ email }) => email), url: shareUrl(config, share.kind, share.share_id) },
+    ],
+    shares_next_cursor: rows.length > 1 ? share.share_id : null,
+  };
+}
+export async function artifactShareSummary(artifactId: string, config: ArtifactsPolicyFile) {
+  const named = { active: 0, pending: 0, revoked: 0 };
+  const counts = await getDb().all<{ state: ArtifactShareMetadata['state']; count: number }>(
+    "SELECT state,COUNT(*) AS count FROM gws_ea_artifact_shares WHERE artifact_id=? AND kind='named' GROUP BY state",
     artifactId,
   );
-  if (!shares.length) return [];
-  const recipients = new Map<string, string[]>();
-  const rows = await getDb().all<{ share_id: string; email: string }>(
-    'SELECT g.share_id,g.email FROM gws_ea_artifact_share_recipients g JOIN gws_ea_artifact_shares s ON s.share_id=g.share_id WHERE s.artifact_id=? ORDER BY g.share_id,g.email',
+  for (const { state, count } of counts) named[state] = count;
+  const publication = await getDb().get<ShareRow>(
+    `SELECT ${SHARE_METADATA} FROM ${SHARE_JOIN} WHERE s.artifact_id=? AND s.kind='public'`,
     artifactId,
   );
-  for (const row of rows) {
-    const emails = recipients.get(row.share_id) ?? [];
-    emails.push(row.email);
-    recipients.set(row.share_id, emails);
-  }
-  return shares.map((share) => ({
-    ...share,
-    recipients: recipients.get(share.share_id) ?? [],
-    url: shareUrl(config, share.kind, share.share_id),
-  }));
+  return {
+    named,
+    public: publication ? { ...publication, url: shareUrl(config, 'public', publication.share_id) } : null,
+  };
 }
 /** Also callable while disabled: capability intent survives a temporary shutdown. */
 export async function artifactAdmissionEmails(): Promise<string[]> {

@@ -312,8 +312,54 @@ it('gives main current share generations and pinned metadata without disclosing 
   ]);
   expect(JSON.stringify(read)).not.toContain('<h1>');
   const listed = accepted(await request(main, 'artifact_list', {}));
-  expect(listed.artifacts).toEqual([expect.objectContaining({ shares: read.shares })]);
+  expect(listed.artifacts).toEqual([
+    expect.objectContaining({ share_summary: { named: { active: 1, pending: 0, revoked: 0 }, public: null } }),
+  ]);
+  expect(JSON.stringify(listed)).not.toContain('juno@example.com');
   expect(accepted(await request(author, 'artifact_read', { artifact_id: saved.artifact_id }))).not.toHaveProperty(
     'shares',
   );
+});
+
+it('pages sharing metadata without limiting stored shares and keeps artifact lists small', async () => {
+  const saved = await made();
+  const now = new Date().toISOString();
+  for (let index = 0; index < 45; index++) {
+    const id = `named-${String(index).padStart(3, '0')}`;
+    await getDb().run(
+      "INSERT INTO gws_ea_artifact_shares(share_id,artifact_id,kind,revision,source_hash,generation,state,scope_hash,created_at,updated_at) VALUES(?,?,'named',1,?,7,'active','scope',?,?)",
+      id,
+      saved.artifact_id as string,
+      saved.source_hash as string,
+      now,
+      now,
+    );
+    await getDb().run(
+      'INSERT INTO gws_ea_artifact_share_recipients(share_id,email) VALUES(?,?)',
+      id,
+      `guest-${index}@example.com`,
+    );
+  }
+  const seen: string[] = [];
+  let after: unknown;
+  do {
+    const page = accepted(
+      await request(main, 'artifact_read', {
+        artifact_id: saved.artifact_id,
+        ...(after ? { shares_after: after } : {}),
+      }),
+    );
+    const shares = page.shares as Array<{ share_id: string; generation: number; recipients: string[] }>;
+    expect(shares.length).toBeLessThanOrEqual(1);
+    expect(shares.every((share) => share.generation === 7 && share.recipients.length === 1)).toBe(true);
+    seen.push(...shares.map((share) => share.share_id));
+    after = page.shares_next_cursor;
+  } while (after);
+  expect(seen).toEqual(Array.from({ length: 45 }, (_, index) => `named-${String(index).padStart(3, '0')}`));
+  const listed = accepted(await request(main, 'artifact_list', {}));
+  expect(listed.artifacts).toEqual([
+    expect.objectContaining({ share_summary: { named: { active: 45, pending: 0, revoked: 0 }, public: null } }),
+  ]);
+  expect(JSON.stringify(listed)).not.toContain('guest-');
+  expect(JSON.stringify(listed)).not.toContain('named-044');
 });

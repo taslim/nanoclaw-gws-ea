@@ -91,7 +91,10 @@ export function parseArtifactDocument(html: string): ArtifactDocument {
   });
   const sources: ArtifactSourceLink[] = [];
   const handlerHashes = new Set<string>();
+  let hasUnavailableInteractions = false;
   walk(document, (element) => {
+    if (['script', 'input', 'button', 'select', 'textarea'].includes(element.tagName))
+      hasUnavailableInteractions = true;
     if (BLOCKED.has(element.tagName)) throw new Error(`Unsupported artifact element: ${element.tagName}.`);
     if (element.tagName === 'meta' && element.attrs.some((attribute) => attribute.name === 'http-equiv'))
       throw new Error('HTTP meta directives are unsupported.');
@@ -102,6 +105,7 @@ export function parseArtifactDocument(html: string): ArtifactDocument {
       const name = attribute.name.toLowerCase();
       if (name.startsWith('on'))
         handlerHashes.add(`'sha256-${createHash('sha256').update(attribute.value).digest('base64')}'`);
+      if (name.startsWith('on') || name === 'contenteditable') hasUnavailableInteractions = true;
       if (name === 'style') assertCss(attribute.value);
       if (['srcset', 'imagesrcset', 'ping', 'download', 'form', 'autofocus', 'is'].includes(name))
         throw new Error(`Unsupported artifact attribute: ${name}.`);
@@ -160,7 +164,7 @@ export function parseArtifactDocument(html: string): ArtifactDocument {
   }
   makeStatic(fallback);
   walk(fallback, (element) => {
-    if (element.tagName !== 'body') return;
+    if (element.tagName !== 'body' || !hasUnavailableInteractions) return;
     const notice = defaultTreeAdapter.createElement('aside', htmlNamespace.NS.HTML, [
       { name: 'role', value: 'note' },
       {

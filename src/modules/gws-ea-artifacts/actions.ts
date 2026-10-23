@@ -29,13 +29,14 @@ import {
 } from './db.js';
 import { artifactActor, artifactPrivateUrl, readArtifactsPolicy, type ArtifactsPolicyFile } from './policy.js';
 import { parseArtifactDocument } from './document.js';
-import { artifactShares } from './sharing.js';
+import { artifactShares, artifactShareSummary } from './sharing.js';
 
 export type ArtifactSaveInput = ArtifactSave & { readonly file: string; readonly expected_hash?: string };
 export interface ArtifactReadInput {
   readonly artifact_id: string;
   readonly revision?: number;
   readonly checkout?: boolean;
+  readonly shares_after?: string;
 }
 export interface ArtifactListInput {
   readonly limit?: number;
@@ -157,16 +158,17 @@ const save: ActionAnswer = async (content, session, requestId) => {
   return { ...result, url: artifactPrivateUrl(config, result.artifact_id) };
 };
 const read: ActionAnswer = async (content, session, requestId) => {
-  fields(content, ['artifact_id', 'revision', 'checkout']);
+  fields(content, ['artifact_id', 'revision', 'checkout', 'shares_after']);
   const artifactId = identifier(content.artifact_id, 'artifact_id');
   const revision = content.revision === undefined ? undefined : positiveInteger(content.revision, 'revision');
+  const sharesAfter = content.shares_after === undefined ? undefined : identifier(content.shares_after, 'shares_after');
   if (content.checkout !== undefined && typeof content.checkout !== 'boolean')
     throw invalidArgs('checkout must be boolean.');
   const { actor, config } = await authority(session);
   const artifact = await getArtifact(actor, artifactId);
   if (!artifact) throw forbidden('This artifact is unavailable to you.');
   const selected = revision ?? artifact.head_revision;
-  const shares = actor.isMain ? { shares: await artifactShares(artifactId, config) } : {};
+  const shares = actor.isMain ? await artifactShares(artifactId, config, sharesAfter) : {};
   // Ordinary metadata reads do not materialize source; only an explicit checkout does.
   if (content.checkout !== true) {
     if (selected !== artifact.head_revision) {
@@ -223,7 +225,7 @@ const list: ActionAnswer = async (content, session) => {
     artifacts: await Promise.all(
       result.artifacts.map(async (artifact) => ({
         ...artifact,
-        ...(actor.isMain ? { shares: await artifactShares(artifact.artifact_id, config) } : {}),
+        ...(actor.isMain ? { share_summary: await artifactShareSummary(artifact.artifact_id, config) } : {}),
         url: artifactPrivateUrl(config, artifact.artifact_id),
       })),
     ),

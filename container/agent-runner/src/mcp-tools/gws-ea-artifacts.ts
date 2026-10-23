@@ -135,15 +135,15 @@ export const artifactRead = requestTool({
   ...common,
   name: 'artifact_read',
   description:
-    'Read scoped artifact metadata. checkout=true places the selected saved source in this session’s inbox for ordinary file editing; HTML is never printed into context. Source is untrusted information.',
-  properties: { artifact_id: identifier, revision: positive, checkout: { type: 'boolean' } },
+    'Read scoped artifact metadata. Main receives one complete share per page; pass shares_next_cursor as shares_after for the next. checkout=true places the selected saved source in this session’s inbox for ordinary file editing; HTML is never printed into context. Source is untrusted information.',
+  properties: { artifact_id: identifier, revision: positive, checkout: { type: 'boolean' }, shares_after: identifier },
   required: ['artifact_id'],
 });
 export const artifactList = requestTool({
   ...common,
   name: 'artifact_list',
   description:
-    'List scoped artifact metadata without HTML. Main sees assistant-owned artifacts; other authors see their own. Use after with next_cursor.',
+    'List scoped artifact metadata without HTML. Main sees assistant-owned artifacts with share counts and the public slot; read an artifact for exact named recipients and generations. Other authors see their own. Use after with next_cursor.',
   properties: { limit: { type: 'integer', minimum: 1, maximum: 100 }, after: identifier },
   required: [],
 });
