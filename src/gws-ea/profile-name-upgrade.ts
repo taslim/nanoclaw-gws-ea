@@ -51,16 +51,26 @@ export async function clearProfileNameInput(paths: ControlPlanePaths, instanceId
   await removePrivateFile(inputFile(paths, instanceId));
 }
 
-function legacyNames(db: Database.Database): LegacyProfileNames | undefined {
+interface LegacyProfileState extends LegacyProfileNames {
+  readonly main_agent_group_id: string | null;
+}
+
+function legacyNames(db: Database.Database): LegacyProfileState | undefined {
   const columns = db.prepare('PRAGMA table_info(gws_ea_profile)').all() as Array<{ name: string }>;
   if (!columns.some(({ name }) => name === 'assistant_display_name')) return undefined;
   return db
-    .prepare('SELECT assistant_display_name, principal_display_name FROM gws_ea_profile WHERE singleton = 1')
-    .get() as LegacyProfileNames | undefined;
+    .prepare(
+      'SELECT assistant_display_name, principal_display_name, main_agent_group_id FROM gws_ea_profile WHERE singleton = 1',
+    )
+    .get() as LegacyProfileState | undefined;
 }
 
-function populated(names: LegacyProfileNames): boolean {
-  return names.assistant_display_name !== null || names.principal_display_name !== null;
+function populated(profile: LegacyProfileState): boolean {
+  return (
+    profile.assistant_display_name !== null ||
+    profile.principal_display_name !== null ||
+    profile.main_agent_group_id !== null
+  );
 }
 
 /** Validate while serving as well as after fencing: schema fingerprints do not detect a rename. */
@@ -107,7 +117,10 @@ export async function prepareProfileNames(
   const input: ProfileNameMigrationInput = {
     schema_version: 1,
     instance_id: instanceId,
-    previous,
+    previous: {
+      assistant_display_name: previous.assistant_display_name,
+      principal_display_name: previous.principal_display_name,
+    },
     assistant,
     principal,
   };

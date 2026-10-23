@@ -28,8 +28,9 @@ async function legacy() {
   roots.push(root);
   const file = path.join(root, 'v2.db');
   const db = new Database(file);
-  db.exec(`CREATE TABLE gws_ea_profile (singleton INTEGER PRIMARY KEY, assistant_display_name TEXT, principal_display_name TEXT);
-    INSERT INTO gws_ea_profile VALUES (1, 'Robin Wu', 'Mary Ann Lee');`);
+  db.exec(`CREATE TABLE gws_ea_profile (
+      singleton INTEGER PRIMARY KEY, assistant_display_name TEXT, principal_display_name TEXT, main_agent_group_id TEXT);
+    INSERT INTO gws_ea_profile VALUES (1, 'Robin Wu', 'Mary Ann Lee', 'ag-main');`);
   db.close();
   return file;
 }
@@ -41,7 +42,11 @@ describe('explicit name upgrade input', () => {
     installProfileNameInput(file, input);
     const db = new Database(file);
     try {
-      expect(db.prepare('SELECT * FROM gws_ea_profile').get()).toEqual({ singleton: 1, ...input.previous });
+      expect(db.prepare('SELECT * FROM gws_ea_profile').get()).toEqual({
+        singleton: 1,
+        ...input.previous,
+        main_agent_group_id: 'ag-main',
+      });
       const row = db.prepare('SELECT payload FROM gws_ea_profile_name_input WHERE singleton = 1').get() as {
         payload: string;
       };
