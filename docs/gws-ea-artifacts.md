@@ -129,6 +129,10 @@ conversation available. The origin stays unavailable until Access prerequisites
 and its local listener are verified. New named admission can remain pending;
 native request status reports the eventual outcome. Revoke/delete/disable during
 an in-flight update cannot be undone by its late response.
+Publication also waits for completed operator activation, including verified
+ingress and an active connector. A local listener alone cannot settle it as
+usable. If activation is interrupted, `check` reports it and `enable` resumes
+verification before publication can proceed.
 
 Central-data snapshots contain immutable HTML and pointers. Update/restore
 reconciles remote intent before serving; unknown policy compatibility fails
@@ -160,3 +164,10 @@ This fixture uses synthetic JWT signing keys/JWKS and substitutes remote guest
 admission. It proves local authorization and native execution, not Cloudflare
 PIN sign-in, live path overrides, tunnel delivery, identity seats or remote
 resource cleanup. Those require a separately owned disposable Cloudflare setup.
+
+Before deployment, complete that live check with two disposable assistants:
+sign in with every principal address, verify exact named-guest access and
+cross-assistant denial, open public snapshots without signing in, then withdraw
+access while retaining an old session. Verify `no-store`, namespace collisions,
+Tunnel delivery and last/non-last assistant cleanup. The PR's local acceptance
+does not replace this deployment gate.

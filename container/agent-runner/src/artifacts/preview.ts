@@ -135,11 +135,12 @@ export async function previewArtifact(input: ArtifactPreviewInput): Promise<Arti
           await page.goto(`${origin}${viewPath}`, { waitUntil: 'load', timeout: DEADLINE_MS });
           const frame = page.frames().find((candidate) => candidate !== page.mainFrame());
           if (!frame) throw new Error('Artifact frame did not load.');
-          await frame
-            .waitForFunction(() => document.documentElement.dataset.artifactMode === 'interactive', undefined, {
-              timeout: 1_200,
-            })
-            .catch((_error: unknown) => undefined);
+          if (mode === 'interactive' && chromiumMajor >= ARTIFACT_MIN_CHROMIUM)
+            await frame
+              .waitForFunction(() => document.documentElement.dataset.artifactMode === 'interactive', undefined, {
+                timeout: 1_200,
+              })
+              .catch((_error: unknown) => undefined);
           const interactive = (await frame.locator('html').getAttribute('data-artifact-mode')) === 'interactive';
           if (mode === 'interactive') interactionAvailable &&= interactive;
           const overflow = await frame.evaluate(() => document.documentElement.scrollWidth > innerWidth + 1);

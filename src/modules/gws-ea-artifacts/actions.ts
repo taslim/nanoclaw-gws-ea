@@ -8,7 +8,7 @@ import {
 } from '../../cli/delivery-action.js';
 import { getSession } from '../../db/sessions.js';
 import type { DeliveryGuardSpec, GuardedDeliveryHandler } from '../../delivery-guard.js';
-import { hasControlCharacters } from '../../gws-ea/validation.js';
+import { canonicalTimestamp, hasControlCharacters } from '../../gws-ea/validation.js';
 import { ALLOW, DENY, defineGuardedAction } from '../../guard/index.js';
 import { readOutboxFileBounded, stageInboxFile } from '../../session-manager.js';
 import type { Session } from '../../types.js';
@@ -64,13 +64,9 @@ function positiveInteger(value: unknown, field: string): number {
 function expiry(content: Record<string, unknown>): { expires_at?: string | null } {
   if (content.expires_at === undefined) return {};
   if (content.expires_at === null) return { expires_at: null };
-  if (
-    typeof content.expires_at !== 'string' ||
-    !Number.isFinite(Date.parse(content.expires_at)) ||
-    new Date(content.expires_at).toISOString() !== content.expires_at
-  )
-    throw invalidArgs('expires_at must be a future ISO timestamp or null.');
-  return { expires_at: content.expires_at };
+  const expiresAt = canonicalTimestamp(content.expires_at);
+  if (expiresAt === undefined) throw invalidArgs('expires_at must be a future ISO timestamp or null.');
+  return { expires_at: expiresAt };
 }
 export function parseArtifactSave(content: Record<string, unknown>): ArtifactSaveInput {
   fields(content, ['create_key', 'artifact_id', 'expected_revision', 'title', 'file', 'expected_hash', 'expires_at']);
@@ -169,7 +165,6 @@ const read: ActionAnswer = async (content, session, requestId) => {
   if (!artifact) throw forbidden('This artifact is unavailable to you.');
   const selected = revision ?? artifact.head_revision;
   const shares = actor.isMain ? await artifactShares(artifactId, config, sharesAfter) : {};
-  // Ordinary metadata reads do not materialize source; only an explicit checkout does.
   if (content.checkout !== true) {
     if (selected !== artifact.head_revision) {
       const exists = await getArtifactRevisionMetadata(artifactId, selected);

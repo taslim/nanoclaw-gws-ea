@@ -270,8 +270,6 @@ export async function settleArtifactsCleanup(
             'artifacts_create_unproven',
             'The receipt still names an unproven creation without an explicit recorded resolution.',
           );
-        // Other assistants may have provisioned since capture. Journal every exact shared ID
-        // before effects, and honor the existing explicit resolution of an interrupted create.
         const { pending: _pending, resolvedAttempts: _resolved, ...owned } = recorded;
         recorded = {
           ...owned,
@@ -304,8 +302,6 @@ export async function settleArtifactsCleanup(
       const shared = peers.length > 0;
       cleanup = {
         ...cleanup,
-        // A retry may now be the last owner after another assistant finished removal.
-        // Re-prove shared remote cleanup before deleting its credentials.
         completed:
           cleanup.sharedRetained && !shared ? cleanup.completed.filter((key) => key !== 'remote') : cleanup.completed,
         sharedRetained: shared,
