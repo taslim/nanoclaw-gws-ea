@@ -1,7 +1,12 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
-const { ROOT } = vi.hoisted(() => ({ ROOT: `/private/tmp/artifact-links-${process.pid}` }));
+const ROOT = await vi.hoisted(async () => {
+  const { realpathSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  return join(realpathSync(tmpdir()), `artifact-links-${process.pid}`);
+});
 vi.mock('../../config.js', async (original) => ({
   ...(await original<typeof import('../../config.js')>()),
   DATA_DIR: ROOT,

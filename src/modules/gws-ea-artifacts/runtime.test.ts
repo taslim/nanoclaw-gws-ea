@@ -4,7 +4,12 @@ import { createServer, request as httpRequest } from 'node:http';
 import { generateKeyPair, exportJWK, SignJWT } from 'jose';
 import Database from 'better-sqlite3';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
-const { ROOT } = vi.hoisted(() => ({ ROOT: `/private/tmp/artifact-runtime-${process.pid}` }));
+const ROOT = await vi.hoisted(async () => {
+  const { realpathSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  return join(realpathSync(tmpdir()), `artifact-runtime-${process.pid}`);
+});
 vi.mock('../../config.js', async (original) => ({
   ...(await original<typeof import('../../config.js')>()),
   DATA_DIR: ROOT,

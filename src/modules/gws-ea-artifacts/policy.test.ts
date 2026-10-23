@@ -1,10 +1,11 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import { tmpdir } from 'node:os';
 import { execFileSync } from 'node:child_process';
 import { afterEach, beforeEach, expect, it } from 'vitest';
 import { parseArtifactsPolicyFile, readArtifactsPolicy, type ArtifactsPolicyFile } from './policy.js';
 
-const ROOT = `/private/tmp/gws-ea-artifact-policy-${process.pid}`;
+const ROOT = path.join(fs.realpathSync(tmpdir()), `gws-ea-artifact-policy-${process.pid}`);
 const config: ArtifactsPolicyFile = {
   schemaVersion: 1,
   enabled: true,
