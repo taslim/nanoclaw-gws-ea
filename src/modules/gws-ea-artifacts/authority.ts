@@ -232,7 +232,12 @@ export async function authorizeArtifactShare(
       shareId,
     );
     const generation = reserved?.generation ?? ('expected_generation' in input ? input.expected_generation : undefined);
-    if (!held || held.state === 'revoked' || held.generation !== generation || (reserved && held.state !== 'pending'))
+    if (
+      !held ||
+      (held.state === 'revoked' && (reserved || input.operation !== 'public_replace')) ||
+      held.generation !== generation ||
+      (reserved && held.state !== 'pending')
+    )
       throw forbidden('This share changed or was revoked. Read its current generation before acting.');
     if (
       input.operation !== 'revoke' &&

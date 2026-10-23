@@ -282,3 +282,38 @@ it('authorizes local preview through the mailbox and refuses stale tools after c
   writePolicy(false);
   expect(refusal(await request(author, 'artifact_preview_authorize', {}))).toContain('current capability');
 });
+
+it('gives main current share generations and pinned metadata without disclosing source or exposing sharing controls to the author', async () => {
+  const saved = await made();
+  const shareId = '00000000-0000-4000-8000-000000000001';
+  const now = new Date().toISOString();
+  await getDb().run(
+    "INSERT INTO gws_ea_artifact_shares(share_id,artifact_id,kind,revision,source_hash,generation,state,scope_hash,created_at,updated_at) VALUES(?,?,'named',1,?,3,'active','scope',?,?)",
+    shareId,
+    saved.artifact_id as string,
+    saved.source_hash as string,
+    now,
+    now,
+  );
+  await getDb().run(
+    'INSERT INTO gws_ea_artifact_share_recipients(share_id,email) VALUES(?,?)',
+    shareId,
+    'juno@example.com',
+  );
+  const read = accepted(await request(main, 'artifact_read', { artifact_id: saved.artifact_id }));
+  expect(read.shares).toEqual([
+    expect.objectContaining({
+      share_id: shareId,
+      generation: 3,
+      state: 'active',
+      title: 'Trip',
+      recipients: ['juno@example.com'],
+    }),
+  ]);
+  expect(JSON.stringify(read)).not.toContain('<h1>');
+  const listed = accepted(await request(main, 'artifact_list', {}));
+  expect(listed.artifacts).toEqual([expect.objectContaining({ shares: read.shares })]);
+  expect(accepted(await request(author, 'artifact_read', { artifact_id: saved.artifact_id }))).not.toHaveProperty(
+    'shares',
+  );
+});

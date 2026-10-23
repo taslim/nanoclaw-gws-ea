@@ -303,3 +303,23 @@ it('reads the selected revision title and exempts only exact current principal r
       .needsConfirmation,
   ).toBe(true);
 });
+
+it('permits a fresh explicit public replacement of the stable revoked slot while refusing reserved resurrection', async () => {
+  const now = new Date().toISOString();
+  await getDb().run(
+    "INSERT INTO gws_ea_artifact_shares(share_id,artifact_id,kind,revision,source_hash,generation,state,scope_hash,created_at,updated_at) VALUES('stable-public',?,'public',1,?,2,'revoked','old',?,?)",
+    String(input.artifact_id),
+    String(input.expected_hash),
+    now,
+    now,
+  );
+  const { recipients: _recipients, ...base } = input;
+  const replacement = parseArtifactShare({
+    ...base,
+    operation: 'public_replace',
+    share_id: 'stable-public',
+    expected_generation: 2,
+  });
+  expect((await authorizeArtifactShare(main, replacement)).revision?.revision).toBe(1);
+  await expect(authorizeArtifactShare(main, replacement, { requestId: 'missing' })).rejects.toThrow('not pending');
+});

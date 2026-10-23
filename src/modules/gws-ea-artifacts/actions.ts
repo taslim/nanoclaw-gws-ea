@@ -29,6 +29,7 @@ import {
 } from './db.js';
 import { artifactActor, artifactPrivateUrl, readArtifactsPolicy, type ArtifactsPolicyFile } from './policy.js';
 import { parseArtifactDocument } from './document.js';
+import { artifactShares } from './sharing.js';
 
 export type ArtifactSaveInput = ArtifactSave & { readonly file: string; readonly expected_hash?: string };
 export interface ArtifactReadInput {
@@ -165,6 +166,7 @@ const read: ActionAnswer = async (content, session, requestId) => {
   const artifact = await getArtifact(actor, artifactId);
   if (!artifact) throw forbidden('This artifact is unavailable to you.');
   const selected = revision ?? artifact.head_revision;
+  const shares = actor.isMain ? { shares: await artifactShares(artifactId, config) } : {};
   // Ordinary metadata reads do not materialize source; only an explicit checkout does.
   if (content.checkout !== true) {
     if (selected !== artifact.head_revision) {
@@ -172,6 +174,7 @@ const read: ActionAnswer = async (content, session, requestId) => {
       if (!exists) throw invalidArgs('This artifact revision does not exist.');
       return {
         ...artifact,
+        ...shares,
         revision: selected,
         title: exists.title,
         source_hash: exists.source_hash,
@@ -180,7 +183,7 @@ const read: ActionAnswer = async (content, session, requestId) => {
         url: artifactPrivateUrl(config, artifactId),
       };
     }
-    return { ...artifact, revision: selected, url: artifactPrivateUrl(config, artifactId) };
+    return { ...artifact, ...shares, revision: selected, url: artifactPrivateUrl(config, artifactId) };
   }
   const source = await getArtifactRevision(artifactId, selected);
   if (!source) throw invalidArgs('This artifact revision does not exist.');
@@ -198,6 +201,7 @@ const read: ActionAnswer = async (content, session, requestId) => {
   }
   return {
     ...artifact,
+    ...shares,
     revision: selected,
     title: source.title,
     revision_created_at: source.created_at,
@@ -216,10 +220,13 @@ const list: ActionAnswer = async (content, session) => {
   const result = await listArtifacts(actor, { limit, after });
   return {
     ...result,
-    artifacts: result.artifacts.map((artifact) => ({
-      ...artifact,
-      url: artifactPrivateUrl(config, artifact.artifact_id),
-    })),
+    artifacts: await Promise.all(
+      result.artifacts.map(async (artifact) => ({
+        ...artifact,
+        ...(actor.isMain ? { shares: await artifactShares(artifact.artifact_id, config) } : {}),
+        url: artifactPrivateUrl(config, artifact.artifact_id),
+      })),
+    ),
   };
 };
 const remove: ActionAnswer = async (content, session, requestId) => {
