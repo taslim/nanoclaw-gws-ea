@@ -13,7 +13,7 @@ vi.mock('./config.js', async () => {
   return { ...actual, DATA_DIR: '/tmp/nanoclaw-test-outbox-root' };
 });
 
-import { clearOutbox, readOutboxFiles, sessionDir } from './session-manager.js';
+import { clearOutbox, readOutboxFileBounded, readOutboxFiles, sessionDir, stageInboxFile } from './session-manager.js';
 
 const TEST_DIR = '/tmp/nanoclaw-test-outbox-root';
 const AG = 'ag-outbox';
@@ -52,10 +52,38 @@ describe('outbox root replaced by a symlink', () => {
     expect(readOutboxFiles(AG, SESS, 'msg-1', ['secret.txt'])).toBeUndefined();
   });
 
+  it('bounded artifact intake refuses it without reading host bytes', () => {
+    expect(() => readOutboxFileBounded(AG, SESS, 'msg-1', 'secret.txt', 1024)).toThrow(/not a real directory/u);
+  });
+
   it('clearOutbox deletes nothing through it', () => {
     clearOutbox(AG, SESS, 'msg-1');
 
     expect(fs.readFileSync(path.join(TEST_DIR, 'host-outside', 'msg-1', 'secret.txt'), 'utf-8')).toBe('host-secret');
+  });
+});
+
+describe('explicit source checkout', () => {
+  it('stages once in the calling session and reuses only identical host-staged bytes', () => {
+    const bytes = Buffer.from('<p>Source</p>');
+    expect(stageInboxFile(AG, SESS, 'checkout', 'view.html', bytes)).toBe('inbox/checkout/view.html');
+    expect(stageInboxFile(AG, SESS, 'checkout', 'view.html', bytes)).toBe('inbox/checkout/view.html');
+    expect(() => stageInboxFile(AG, SESS, 'checkout', 'view.html', Buffer.from('different'))).toThrow(
+      /different file/u,
+    );
+    expect(fs.readFileSync(path.join(sessionDir(AG, SESS), 'inbox', 'checkout', 'view.html'), 'utf8')).toBe(
+      '<p>Source</p>',
+    );
+  });
+
+  it('refuses a symlinked inbox and never writes through it', () => {
+    const outside = path.join(TEST_DIR, 'host-inbox');
+    fs.mkdirSync(outside);
+    fs.symlinkSync(outside, path.join(sessionDir(AG, SESS), 'inbox'));
+    expect(() => stageInboxFile(AG, SESS, 'checkout', 'view.html', Buffer.from('source'))).toThrow(
+      /not a real directory/u,
+    );
+    expect(fs.readdirSync(outside)).toEqual([]);
   });
 });
 

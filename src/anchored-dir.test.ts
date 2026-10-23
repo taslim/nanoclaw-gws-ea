@@ -208,3 +208,29 @@ describe('operations stay on the opened directory', () => {
     expect(fs.readlinkSync(path.join(root, 'x'))).toBe('/app/skills/x');
   });
 });
+
+describe('bounded reads', () => {
+  it('checks the size before allocating and refuses a file that grows during the read', () => {
+    fs.writeFileSync(path.join(root, 'big'), Buffer.alloc(1025));
+    fs.writeFileSync(path.join(root, 'growing'), 'abcd');
+    const dir = openOrThrow([]);
+    const allocate = vi.spyOn(Buffer, 'alloc');
+    try {
+      expect(() => dir.readFileBounded('big', 1024)).toThrow(/limit/);
+      expect(allocate).not.toHaveBeenCalled();
+      const original = fs.readSync;
+      let appended = false;
+      vi.spyOn(fs, 'readSync').mockImplementation(((...args: Parameters<typeof fs.readSync>) => {
+        if (!appended) {
+          appended = true;
+          fs.appendFileSync(path.join(root, 'growing'), 'e');
+        }
+        return original(...args);
+      }) as typeof fs.readSync);
+      expect(() => dir.readFileBounded('growing', 4)).toThrow(/changed|grew/);
+    } finally {
+      vi.restoreAllMocks();
+      dir.close();
+    }
+  });
+});
