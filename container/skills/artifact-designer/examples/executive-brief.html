@@ -1,0 +1,316 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Keep one workshop, protect the practice time</title>
+    <style>
+      :root {
+        color-scheme: light;
+        --paper: #f8f5ed;
+        --ink: #20312d;
+        --muted: #52625a;
+        --line: #c8cec2;
+        --accent: #8b3c20;
+      }
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        margin: 0;
+        color: var(--ink);
+        background: var(--paper);
+        font:
+          1rem/1.6 system-ui,
+          sans-serif;
+      }
+      main,
+      header,
+      footer {
+        width: min(100% - 3rem, 68rem);
+        margin-inline: auto;
+      }
+      header {
+        display: flex;
+        flex-wrap: wrap;
+        justify-content: space-between;
+        gap: 0.5rem 2rem;
+        padding-block: 1.5rem;
+        border-bottom: 1px solid var(--line);
+        font-size: 0.82rem;
+      }
+      header p,
+      footer p {
+        margin: 0;
+      }
+      .label {
+        font-weight: 750;
+        letter-spacing: 0.1em;
+        text-transform: uppercase;
+        color: var(--accent);
+        font-size: 0.75rem;
+      }
+      .lead {
+        display: grid;
+        grid-template-columns: 1.8fr 1fr;
+        align-items: end;
+        gap: 3rem;
+        padding-block: 3rem;
+      }
+      h1 {
+        margin: 0.6rem 0 1.2rem;
+        font:
+          500 clamp(2.5rem, 5vw, 4.6rem)/1.08 Georgia,
+          serif;
+        letter-spacing: -0.035em;
+        max-width: 17ch;
+      }
+      h2 {
+        margin: 0 0 1rem;
+        font-size: 1.4rem;
+        line-height: 1.25;
+      }
+      h3 {
+        font-size: 1rem;
+        margin: 0;
+      }
+      p {
+        margin: 0 0 1rem;
+      }
+      .dek {
+        font-size: 1.16rem;
+        max-width: 52ch;
+      }
+      .decision {
+        border-top: 3px solid var(--accent);
+        padding-top: 1rem;
+      }
+      .decision strong {
+        font-size: 1.15rem;
+      }
+      .body {
+        display: grid;
+        grid-template-columns: 1.8fr 1fr;
+        gap: 3rem;
+        padding-bottom: 3rem;
+      }
+      section {
+        padding-block: 1.7rem;
+        border-top: 1px solid var(--line);
+      }
+      .observations {
+        padding: 0;
+        list-style: none;
+        margin: 0;
+      }
+      .observations li {
+        display: grid;
+        grid-template-columns: 4rem 1fr;
+        gap: 1rem;
+        padding-block: 0.8rem;
+      }
+      .number {
+        font:
+          500 2.2rem/1.1 Georgia,
+          serif;
+        color: var(--accent);
+      }
+      .note {
+        color: var(--muted);
+        font-size: 0.88rem;
+      }
+      .observations p {
+        margin: 0.2rem 0 0;
+      }
+      aside {
+        min-width: 0;
+      }
+      .schedule {
+        list-style: none;
+        margin: 0;
+        padding: 0;
+      }
+      .schedule li {
+        display: flex;
+        gap: 1rem;
+        justify-content: space-between;
+        padding: 0.6rem 0;
+        border-bottom: 1px solid var(--line);
+      }
+      .schedule strong {
+        white-space: nowrap;
+        font-variant-numeric: tabular-nums;
+      }
+      details {
+        border-block: 1px solid var(--line);
+        padding-block: 1rem;
+      }
+      summary {
+        cursor: pointer;
+        font-weight: 700;
+        padding: 0.2rem 0;
+      }
+      details p {
+        margin: 1rem 0 0;
+      }
+      a {
+        color: var(--accent);
+        text-underline-offset: 0.2em;
+      }
+      :focus-visible {
+        outline: 3px solid #005fcc;
+        outline-offset: 4px;
+      }
+      footer {
+        border-top: 1px solid var(--line);
+        padding-block: 1.5rem 2rem;
+        color: var(--muted);
+        font-size: 0.8rem;
+      }
+      @media (max-width: 700px) {
+        .lead,
+        .body {
+          grid-template-columns: 1fr;
+          gap: 1.5rem;
+        }
+        .lead {
+          padding-block: 2rem;
+        }
+        main,
+        header,
+        footer {
+          width: min(100% - 2rem, 68rem);
+        }
+        h1 {
+          font-size: 2.7rem;
+        }
+        .body {
+          gap: 0;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <p class="label">Workshop planning / illustrative brief</p>
+      <p>Sample snapshot · 20 October 2026</p>
+    </header>
+    <main>
+      <div class="lead">
+        <div>
+          <p class="label">Recommendation</p>
+          <h1>Keep one workshop. Protect the practice time.</h1>
+          <p class="dek">
+            For this sample group of 24, one 90-minute session leaves 45 minutes for hands-on practice. Two shorter
+            repeats would leave only 15 minutes each.
+          </p>
+        </div>
+        <aside class="decision" aria-label="Decision needed">
+          <p class="label">The decision</p>
+          <p><strong>Use one 90-minute session.</strong></p>
+          <p>
+            Keep the group together and divide into six tables of four. Confirm a room with step-free access before
+            committing.
+          </p>
+          <p class="note">
+            This is an invented planning exercise, not a completed booking or a real attendance report.
+          </p>
+        </aside>
+      </div>
+      <div class="body">
+        <article>
+          <section aria-labelledby="evidence">
+            <h2 id="evidence">What the sample tells us</h2>
+            <ol class="observations">
+              <li>
+                <span class="number">24</span>
+                <div>
+                  <h3>People fit six small groups</h3>
+                  <p>Six tables of four keep discussion manageable without requiring a second facilitator.</p>
+                  <p class="note">
+                    Sample input A: invented registration count, 20 October. Table arrangement is a proposed choice.
+                  </p>
+                </div>
+              </li>
+              <li>
+                <span class="number">45</span>
+                <div>
+                  <h3>Minutes remain for practice</h3>
+                  <p>
+                    A 90-minute block, less 15 minutes of orientation, 10 of demonstration and 20 of discussion, leaves
+                    45 minutes.
+                  </p>
+                  <p class="note">
+                    Sample input B: assumed agenda durations. Calculation: 90 − 15 − 10 − 20 = 45 minutes.
+                  </p>
+                </div>
+              </li>
+              <li>
+                <span class="number">?</span>
+                <div>
+                  <h3>Room access remains unconfirmed</h3>
+                  <p>
+                    The sample contains no access assessment. Confirm the route, seating and participants’ access needs
+                    before choosing a venue.
+                  </p>
+                  <p class="note">
+                    Planning reference:
+                    <a href="https://www.w3.org/WAI/teach-advocate/accessible-presentations/"
+                      >W3C guidance for accessible presentations and events</a
+                    >. It does not verify any sample room.
+                  </p>
+                </div>
+              </li>
+            </ol>
+          </section>
+          <section aria-labelledby="alternative">
+            <h2 id="alternative">When two repeats would make sense</h2>
+            <p>
+              Two 60-minute repeats could accommodate conflicting schedules. With the same 45-minute fixed agenda in
+              each repeat, practice falls to 15 minutes per attendee. That tradeoff is reasonable only if attendance
+              would otherwise be lost.
+            </p>
+            <p class="note">
+              Unknown: participants’ availability. The sample supplies no evidence of a scheduling conflict.
+            </p>
+          </section>
+          <details>
+            <summary>Assumptions and arithmetic</summary>
+            <p>
+              All counts and durations here are invented to demonstrate a brief. One facilitator is assumed available
+              for either 90 minutes or two 60-minute repeats. Fixed agenda time is 15 + 10 + 20 = 45 minutes per
+              session. The calculation excludes breaks, setup and transitions; add those before using it for a real
+              event.
+            </p>
+          </details>
+        </article>
+        <aside>
+          <section aria-labelledby="agenda">
+            <h2 id="agenda">The proposed 90 minutes</h2>
+            <ol class="schedule">
+              <li><span>Orientation</span><strong>15 min</strong></li>
+              <li><span>Demonstration</span><strong>10 min</strong></li>
+              <li><span>Table practice</span><strong>45 min</strong></li>
+              <li><span>Discussion</span><strong>20 min</strong></li>
+            </ol>
+            <p class="note">Illustrative agenda · 90 minutes total</p>
+          </section>
+          <section aria-labelledby="next">
+            <h2 id="next">Next step</h2>
+            <p>
+              If this were your event, confirm the single-session format in the conversation. Then resolve the room’s
+              access and the group’s availability.
+            </p>
+            <p class="note">No reservation or message is sent from this page.</p>
+          </section>
+        </aside>
+      </div>
+    </main>
+    <footer>
+      <p>
+        Design example · All event observations and figures are invented · The external reference supports the checklist
+        only.
+      </p>
+    </footer>
+  </body>
+</html>
