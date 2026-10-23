@@ -137,9 +137,9 @@ async function startHost(): Promise<void> {
 async function nameMain(agentGroupId: string): Promise<void> {
   await createGroup(group(agentGroupId, 'main'));
   await reconcileGwsEaProfile({
-    assistantDisplayName: 'Juno',
+    assistantName: { firstName: 'Juno', lastName: null },
     assistantWorkspaceEmail: 'juno@northwind.example',
-    principalDisplayName: 'Morgan Ellery',
+    principalName: { firstName: 'Morgan', lastName: 'Ellery' },
     principalTimezone: 'Europe/London',
     mainAgentGroupId: agentGroupId,
   });

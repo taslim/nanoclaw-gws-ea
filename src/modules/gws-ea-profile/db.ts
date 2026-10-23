@@ -13,6 +13,7 @@ import {
   principalAddressesConflict,
   resolvePrincipalAddress,
 } from '../../gws-ea/validation.js';
+import { displayPersonName, normalizePersonName, type PersonName } from '../../gws-ea/person-name.js';
 import { ianaTimezone } from '../../timezone.js';
 import type { MessagingGroup } from '../../types.js';
 import { removeMatchingIdentities } from '../gws-ea-people/db.js';
@@ -22,6 +23,10 @@ import { addMember, getMembers, removeMember } from '../permissions/db/agent-gro
 import { upsertUser } from '../permissions/db/users.js';
 
 export interface GwsEaProfile {
+  readonly assistant_first_name: string | null;
+  readonly assistant_last_name: string | null;
+  readonly principal_first_name: string | null;
+  readonly principal_last_name: string | null;
   readonly assistant_display_name: string | null;
   readonly assistant_workspace_email: string | null;
   /** The assistant's verified web alias, one of its own addresses (KTD14), or null until one is recorded. */
@@ -47,7 +52,7 @@ export interface GwsEaProfile {
 export type ProjectDocAudience = 'main' | 'external-email' | 'external-chat' | 'job' | 'browser' | 'other';
 
 export interface ReconcileGwsEaProfileInput {
-  readonly assistantDisplayName: string;
+  readonly assistantName: PersonName;
   readonly assistantWorkspaceEmail: string;
   /**
    * The principal's name and timezone as create declared them, which seed
@@ -55,7 +60,7 @@ export interface ReconcileGwsEaProfileInput {
    * them through main (`setPrincipalNameAndTimezone`), and a reconcile keeps
    * what the profile holds.
    */
-  readonly principalDisplayName?: string;
+  readonly principalName?: PersonName;
   readonly principalTimezone?: string;
   readonly mainAgentGroupId: string;
   /**
@@ -78,12 +83,16 @@ export interface PrincipalAddress {
 
 /** The principal's name and home timezone, as the profile holds them; null until create seeds them. */
 export interface PrincipalNameAndTimezone {
+  readonly first_name: string | null;
+  readonly last_name: string | null;
   readonly name: string | null;
   readonly timezone: string | null;
 }
 
 /** The principal's name and home timezone once main is published, when the profile holds both. */
 export interface PublishedNameAndTimezone {
+  readonly first_name: string;
+  readonly last_name: string | null;
   readonly name: string;
   readonly timezone: string;
 }
@@ -101,45 +110,6 @@ export interface PrincipalRecognizer {
   has(address: string | undefined): boolean;
   /** The listed addresses, sorted, as the profile holds them. */
   readonly listed: readonly string[];
-}
-
-function displayName(value: string, label: string): string {
-  const normalized = value.trim();
-  if (!normalized || normalized.length > 120 || hasControlCharacters(normalized)) {
-    throw new Error(`${label} is invalid`);
-  }
-  return normalized;
-}
-
-/**
- * The longest name `main` may set for the principal. A name with titles and
- * a suffix fits well within it, and it keeps a sentence of instructions out
- * of the signature the name reaches.
- */
-const PRINCIPAL_NAME_MAX_LENGTH = 80;
-
-/**
- * Why `name` could not be a person's name, or undefined when it could
- * (KTD9). The name reaches external-email's instructions and, through the
- * signature they give it, its email, so it carries no address, link or
- * markup: a dot directly before two letters is a domain, which mail clients
- * turn into a link.
- */
-function personalNameProblem(name: string): string | undefined {
-  if (!name) return 'it is empty';
-  if (name.length > PRINCIPAL_NAME_MAX_LENGTH) return `it is longer than ${PRINCIPAL_NAME_MAX_LENGTH} characters`;
-  if (hasControlCharacters(name)) return 'it holds a control character';
-  if (/@|:\/\/|www\.|\//iu.test(name)) return 'it holds an address or a link';
-  if (/[<>`]/u.test(name)) return 'it holds markup';
-  if (/\.\p{L}{2}/u.test(name)) return 'it holds a domain name, which mail turns into a link';
-  return undefined;
-}
-
-function personalName(value: string): string {
-  const name = value.trim();
-  const problem = personalNameProblem(name);
-  if (problem !== undefined) throw new Error(`${JSON.stringify(value)} cannot be a person's name: ${problem}`);
-  return name;
 }
 
 /**
@@ -197,11 +167,11 @@ export function validateGwsEaProfileInput(input: ReconcileGwsEaProfileInput): Re
     throw new Error('Principal timezone is invalid');
   }
   return {
-    assistantDisplayName: displayName(input.assistantDisplayName, 'Assistant display name'),
+    assistantName: normalizePersonName(input.assistantName, 'assistant'),
     assistantWorkspaceEmail,
-    ...(input.principalDisplayName === undefined
+    ...(input.principalName === undefined
       ? {}
-      : { principalDisplayName: displayName(input.principalDisplayName, 'Principal display name') }),
+      : { principalName: normalizePersonName(input.principalName, 'principal') }),
     ...(seedTimezone === undefined ? {} : { principalTimezone: seedTimezone }),
     mainAgentGroupId: identifier(input.mainAgentGroupId, 'Main agent group ID'),
     ...(input.principalEmails === undefined
@@ -378,14 +348,27 @@ export async function projectDocAudience(agentGroupId: string): Promise<ProjectD
 }
 
 export async function getGwsEaProfile(): Promise<GwsEaProfile> {
-  const profile = await getDb().get<Omit<GwsEaProfile, 'principal_emails'>>(
-    `SELECT assistant_display_name, assistant_workspace_email, assistant_alias, principal_display_name,
+  const profile = await getDb().get<
+    Omit<GwsEaProfile, 'principal_emails' | 'assistant_display_name' | 'principal_display_name'>
+  >(
+    `SELECT assistant_first_name, assistant_last_name, assistant_workspace_email, assistant_alias, principal_first_name, principal_last_name,
             principal_timezone, main_agent_group_id, external_email_agent_group_id, external_chat_agent_group_id, browser_agent_group_id, updated_at
        FROM gws_ea_profile
       WHERE singleton = 1`,
   );
   if (!profile) throw new Error('GWS-EA profile singleton is missing');
-  return { ...profile, principal_emails: await heldAddresses() };
+  return {
+    ...profile,
+    assistant_display_name:
+      profile.assistant_first_name === null
+        ? null
+        : displayPersonName({ firstName: profile.assistant_first_name, lastName: profile.assistant_last_name }),
+    principal_display_name:
+      profile.principal_first_name === null
+        ? null
+        : displayPersonName({ firstName: profile.principal_first_name, lastName: profile.principal_last_name }),
+    principal_emails: await heldAddresses(),
+  };
 }
 
 /**
@@ -510,19 +493,25 @@ async function keepAssistantNamed(agentGroupId: string, name: string): Promise<v
  * that is named by the reconcile that sets it.
  */
 export async function nameAssistantAgent(agentGroupId: string): Promise<void> {
-  const row = await getDb().get<{ assistant_display_name: string | null }>(
-    'SELECT assistant_display_name FROM gws_ea_profile WHERE singleton = 1',
-  );
-  if (row?.assistant_display_name) await keepAssistantNamed(agentGroupId, row.assistant_display_name);
+  const profile = await getGwsEaProfile();
+  if (profile.assistant_display_name) await keepAssistantNamed(agentGroupId, profile.assistant_display_name);
 }
 
-/** The principal's name and home timezone, as the profile holds them. */
+/** The principal's structured name, display name and home timezone. */
 export async function principalNameAndTimezone(): Promise<PrincipalNameAndTimezone> {
-  const row = await getDb().get<{ principal_display_name: string | null; principal_timezone: string | null }>(
-    'SELECT principal_display_name, principal_timezone FROM gws_ea_profile WHERE singleton = 1',
-  );
-  if (!row) throw new Error('GWS-EA profile singleton is missing');
-  return { name: row.principal_display_name, timezone: row.principal_timezone };
+  const profile = await getDb().get<
+    Pick<GwsEaProfile, 'principal_first_name' | 'principal_last_name' | 'principal_timezone'>
+  >('SELECT principal_first_name, principal_last_name, principal_timezone FROM gws_ea_profile WHERE singleton = 1');
+  if (!profile) throw new Error('GWS-EA profile singleton is missing');
+  return {
+    name:
+      profile.principal_first_name === null
+        ? null
+        : displayPersonName({ firstName: profile.principal_first_name, lastName: profile.principal_last_name }),
+    first_name: profile.principal_first_name,
+    last_name: profile.principal_last_name,
+    timezone: profile.principal_timezone,
+  };
 }
 
 /** Make the profile hold exactly `emails`, keeping when each one it already held was added. */
@@ -539,38 +528,46 @@ export async function reconcileGwsEaProfile(input: ReconcileGwsEaProfileInput): 
   const validated = validateGwsEaProfileInput(input);
   const db = getDb();
   await db.transaction(async () => {
-    const profile = await db.get<{ main_agent_group_id: string | null }>(
-      'SELECT main_agent_group_id FROM gws_ea_profile WHERE singleton = 1',
-    );
+    const profile = await getGwsEaProfile();
     const group = await db.get<{ id: string }>('SELECT id FROM agent_groups WHERE id = ?', validated.mainAgentGroupId);
-    if (!profile) throw new Error('GWS-EA profile singleton is missing');
     if (!group) throw new Error(`Canonical main agent group does not exist: ${validated.mainAgentGroupId}`);
     if (profile.main_agent_group_id !== null && profile.main_agent_group_id !== validated.mainAgentGroupId) {
       throw new Error(`Canonical main is already bound to ${profile.main_agent_group_id}`);
     }
+    const seed = profile.main_agent_group_id === null;
+    const principalName =
+      seed && validated.principalName !== undefined
+        ? validated.principalName
+        : profile.principal_first_name === null
+          ? undefined
+          : { firstName: profile.principal_first_name, lastName: profile.principal_last_name };
+    const timezone = seed ? (validated.principalTimezone ?? profile.principal_timezone) : profile.principal_timezone;
+    if (principalName === undefined || timezone === null) {
+      throw new Error("A profile that names main needs the principal's name and timezone");
+    }
     const now = new Date().toISOString();
     await db.run(
       `UPDATE gws_ea_profile
-          SET assistant_display_name = ?,
+          SET assistant_first_name = ?,
+              assistant_last_name = ?,
               assistant_workspace_email = ?,
-              principal_display_name = COALESCE(?, principal_display_name),
-              principal_timezone = COALESCE(?, principal_timezone),
+              principal_first_name = ?,
+              principal_last_name = ?,
+              principal_timezone = ?,
               main_agent_group_id = ?,
               updated_at = ?
         WHERE singleton = 1`,
-      validated.assistantDisplayName,
+      validated.assistantName.firstName,
+      validated.assistantName.lastName,
       validated.assistantWorkspaceEmail,
-      validated.principalDisplayName ?? null,
-      validated.principalTimezone ?? null,
+      principalName.firstName,
+      principalName.lastName,
+      timezone,
       validated.mainAgentGroupId,
       now,
     );
-    const principal = await principalNameAndTimezone();
-    if (principal.name === null || principal.timezone === null) {
-      throw new Error("A profile that names main needs the principal's name and timezone");
-    }
-    await keepMainInPrincipalTimezone(validated.mainAgentGroupId, principal.timezone);
-    await keepAssistantAgentsNamed(validated.assistantDisplayName);
+    await keepMainInPrincipalTimezone(validated.mainAgentGroupId, timezone);
+    await keepAssistantAgentsNamed(displayPersonName(validated.assistantName));
     if (validated.principalEmails) await replacePrincipalAddresses(validated.principalEmails, now);
     await syncPrincipalMembers();
   });
@@ -581,34 +578,53 @@ export async function reconcileGwsEaProfile(input: ReconcileGwsEaProfileInput): 
 /**
  * Change the principal's name, home timezone, or both, on the principal's
  * word (R16). The profile is their one source: main's container timezone is
- * derived from it in the same transaction. A name must be one a person could
- * have (`personalNameProblem`). What the profile already holds is not
- * written again. Returns the values before and after.
+ * derived from it in the same transaction. Shared name validation applies.
+ * What the profile already holds is not written again. Returns the values before and after.
  */
 export async function setPrincipalNameAndTimezone(change: {
-  readonly name?: string;
+  readonly firstName?: string;
+  readonly lastName?: string | null;
   readonly timezone?: string;
 }): Promise<{ readonly before: PublishedNameAndTimezone; readonly after: PublishedNameAndTimezone }> {
-  const name = change.name === undefined ? undefined : personalName(change.name);
+  if (typeof change.lastName === 'string' && !change.lastName.trim()) {
+    throw new Error('Use --clear-last-name to remove the last name');
+  }
   const timezone = change.timezone === undefined ? undefined : principalTimezone(change.timezone);
   const db = getDb();
   return db.transaction(async () => {
     const mainAgentGroupId = await getMainAgentGroupId();
     const held = await principalNameAndTimezone();
-    // A profile that names main holds both (`reconcileGwsEaProfile`).
-    if (mainAgentGroupId === null || held.name === null || held.timezone === null) {
+    if (mainAgentGroupId === null || held.first_name === null || held.name === null || held.timezone === null) {
       throw new Error("Main is not published yet, so the principal's name and timezone are not set");
     }
-    const before = { name: held.name, timezone: held.timezone };
-    const after = { name: name ?? before.name, timezone: timezone ?? before.timezone };
-    if (after.name !== before.name || after.timezone !== before.timezone) {
+    const name = normalizePersonName(
+      {
+        firstName: change.firstName ?? held.first_name,
+        lastName: change.lastName === undefined ? held.last_name : change.lastName,
+      },
+      'principal',
+    );
+    const before: PublishedNameAndTimezone = {
+      name: held.name,
+      first_name: held.first_name,
+      last_name: held.last_name,
+      timezone: held.timezone,
+    };
+    const after: PublishedNameAndTimezone = {
+      name: displayPersonName(name),
+      first_name: name.firstName,
+      last_name: name.lastName,
+      timezone: timezone ?? before.timezone,
+    };
+    if (
+      after.first_name !== before.first_name ||
+      after.last_name !== before.last_name ||
+      after.timezone !== before.timezone
+    ) {
       await db.run(
-        `UPDATE gws_ea_profile
-            SET principal_display_name = ?,
-                principal_timezone = ?,
-                updated_at = ?
-          WHERE singleton = 1`,
-        after.name,
+        `UPDATE gws_ea_profile SET principal_first_name = ?, principal_last_name = ?, principal_timezone = ?, updated_at = ? WHERE singleton = 1`,
+        after.first_name,
+        after.last_name,
         after.timezone,
         new Date().toISOString(),
       );

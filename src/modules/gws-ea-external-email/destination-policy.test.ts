@@ -125,9 +125,9 @@ beforeEach(async () => {
     await ensureContainerConfig(value.id);
   }
   await reconcileGwsEaProfile({
-    assistantDisplayName: 'Aya',
+    assistantName: { firstName: 'Aya', lastName: null },
     assistantWorkspaceEmail: 'aya@example.test',
-    principalDisplayName: 'Morgan',
+    principalName: { firstName: 'Morgan', lastName: null },
     principalTimezone: 'America/Los_Angeles',
     mainAgentGroupId: main.id,
   });

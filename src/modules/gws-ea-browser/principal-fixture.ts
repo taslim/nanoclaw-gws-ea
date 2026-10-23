@@ -65,14 +65,14 @@ export async function seedAssistant(): Promise<Session> {
     await createAgentGroup({ id, name: id, folder: id, agent_provider: null, created_at: new Date().toISOString() });
   await seedPrincipal();
   await reconcileGwsEaProfile({
-    assistantDisplayName: 'Aya',
+    assistantName: { firstName: 'Aya', lastName: null },
     assistantWorkspaceEmail: 'aya@example.test',
-    principalDisplayName: 'Morgan',
+    principalName: { firstName: 'Morgan', lastName: null },
     principalTimezone: 'America/Los_Angeles',
     mainAgentGroupId: 'main-p',
     principalEmails: ['morgan@example.test'],
   });
-  await getDb().run('UPDATE gws_ea_profile SET browser_agent_group_id = ? WHERE singleton = 1', 'browser-p');
+  await getDb().run(`UPDATE gws_ea_profile SET browser_agent_group_id = ? WHERE singleton = 1`, 'browser-p');
   return (await resolveSession('main-p', 'mg-principal', null, 'agent-shared')).session;
 }
 

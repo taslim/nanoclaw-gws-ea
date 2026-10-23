@@ -155,9 +155,9 @@ export async function publishAliasTestProfile(): Promise<void> {
   });
   await ensureContainerConfig('ag-main');
   await reconcileGwsEaProfile({
-    assistantDisplayName: ASSISTANT_NAME,
+    assistantName: { firstName: ASSISTANT_NAME, lastName: null },
     assistantWorkspaceEmail: ASSISTANT_EMAIL,
-    principalDisplayName: 'Morgan Ellery',
+    principalName: { firstName: 'Morgan', lastName: 'Ellery' },
     principalTimezone: 'America/New_York',
     mainAgentGroupId: 'ag-main',
     principalEmails: [PRINCIPAL_EMAIL],

@@ -39,7 +39,7 @@ beforeEach(async () => {
   for (const id of ['scheduler-main', 'scheduler-browser'])
     await createAgentGroup({ id, name: id, folder: id, agent_provider: null, created_at: new Date().toISOString() });
   await getDb().run(
-    'UPDATE gws_ea_profile SET main_agent_group_id = ?,browser_agent_group_id = ? WHERE singleton = 1',
+    `UPDATE gws_ea_profile SET assistant_first_name=COALESCE(assistant_first_name,'Juno'),principal_first_name=COALESCE(principal_first_name,'Morgan'),main_agent_group_id = ?,browser_agent_group_id = ? WHERE singleton = 1`,
     'scheduler-main',
     'scheduler-browser',
   );
@@ -514,7 +514,7 @@ async function nextCheck(id: string): Promise<string | undefined> {
 }
 async function seedPrincipal(timezone: string): Promise<void> {
   await getDb().run(
-    "UPDATE gws_ea_profile SET principal_display_name = 'Morgan Ellery',principal_timezone = ? WHERE singleton = 1",
+    "UPDATE gws_ea_profile SET principal_first_name = 'Morgan', principal_last_name = 'Ellery',principal_timezone = ? WHERE singleton = 1",
     timezone,
   );
 }

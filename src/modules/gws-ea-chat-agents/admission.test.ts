@@ -107,7 +107,7 @@ beforeEach(async () => {
   );
   await runMigrations(await initTestDb());
   await getDb().run(
-    "UPDATE gws_ea_profile SET assistant_display_name = 'Robin', principal_display_name = 'Juno Hale', assistant_workspace_email = 'assistant@example.test' WHERE singleton = 1",
+    "UPDATE gws_ea_profile SET assistant_first_name = 'Robin', assistant_last_name = NULL, principal_first_name = 'Juno', principal_last_name = 'Hale', assistant_workspace_email = 'assistant@example.test' WHERE singleton = 1",
   );
   await createMessagingGroup({
     id: 'trip',
@@ -154,7 +154,9 @@ it.each(['external-chat', 'job'] as const)(
       created_at: new Date().toISOString(),
     });
     await ensureContainerConfig('main');
-    await getDb().run("UPDATE gws_ea_profile SET main_agent_group_id = 'main' WHERE singleton = 1");
+    await getDb().run(
+      "UPDATE gws_ea_profile SET assistant_first_name=COALESCE(assistant_first_name,'Juno'),principal_first_name=COALESCE(principal_first_name,'Morgan'),main_agent_group_id = 'main' WHERE singleton = 1",
+    );
     const mainDoc = await documentFor('main');
     expect(mainDoc).toContain('# Executive Assistant');
     expect(mainDoc).toContain('assistant@example.test');
@@ -215,9 +217,9 @@ it('names casual and job sessions at creation, profile rename and startup reconc
   await ensureContainerConfig('main');
 
   await reconcileGwsEaProfile({
-    assistantDisplayName: 'Finch',
+    assistantName: { firstName: 'Finch', lastName: null },
     assistantWorkspaceEmail: 'assistant@example.test',
-    principalDisplayName: 'Juno Hale',
+    principalName: { firstName: 'Juno', lastName: 'Hale' },
     principalTimezone: 'America/Los_Angeles',
     mainAgentGroupId: 'main',
   });

@@ -37,9 +37,10 @@ const FOLDER = 'folder-recorded';
 const DRIVE_SCOPE = 'https://www.googleapis.com/auth/drive';
 
 const PROFILE = {
-  'assistant-display-name': 'Juno',
+  'assistant-first-name': 'Juno',
   'assistant-workspace-email': 'juno@northwind.example',
-  'principal-display-name': 'Morgan Ellery',
+  'principal-first-name': 'Morgan',
+  'principal-last-name': 'Ellery',
   'principal-timezone': 'Europe/London',
   'main-agent-group-id': 'ag-main',
   'principal-emails': JSON.stringify(['morgan.fixture@gmail.com']),
@@ -129,7 +130,7 @@ describe("the home folder's environment", () => {
     // The profile an earlier host process wrote: nothing in this one named main.
     await getDb().run(
       `UPDATE gws_ea_profile
-          SET assistant_display_name = 'Juno', principal_display_name = 'Morgan Ellery',
+          SET assistant_first_name = 'Juno', assistant_last_name = NULL, principal_first_name = 'Morgan', principal_last_name = 'Ellery',
               main_agent_group_id = 'ag-main-restarted'
         WHERE singleton = 1`,
     );
@@ -155,7 +156,11 @@ describe("the home folder's environment", () => {
     onTestFinished(() => db.closeDb());
     await db.createAgentGroup(group('ag-main'));
     // The profile and the folder an earlier host process wrote.
-    await db.getDb().run("UPDATE gws_ea_profile SET main_agent_group_id = 'ag-main' WHERE singleton = 1");
+    await db
+      .getDb()
+      .run(
+        "UPDATE gws_ea_profile SET assistant_first_name=COALESCE(assistant_first_name,'Juno'),principal_first_name=COALESCE(principal_first_name,'Morgan'),main_agent_group_id = 'ag-main' WHERE singleton = 1",
+      );
     await recordFolder(FOLDER, AT);
     // main as the profile's start reads it, which runs before this module's;
     // a spawn reading it first is the profile's own test.
@@ -195,9 +200,9 @@ describe("the home folder's environment", () => {
   it('is nothing before the host has made a folder', async () => {
     await createGroups();
     await reconcileGwsEaProfile({
-      assistantDisplayName: 'Juno',
+      assistantName: { firstName: 'Juno', lastName: null },
       assistantWorkspaceEmail: 'juno@northwind.example',
-      principalDisplayName: 'Morgan Ellery',
+      principalName: { firstName: 'Morgan', lastName: 'Ellery' },
       principalTimezone: 'Europe/London',
       mainAgentGroupId: 'ag-main',
     });

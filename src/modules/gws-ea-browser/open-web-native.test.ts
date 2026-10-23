@@ -190,9 +190,9 @@ async function startErrandHost(thread: string): Promise<ErrandHost> {
     created_at: now,
   });
   await reconcileGwsEaProfile({
-    assistantDisplayName: 'Aya',
+    assistantName: { firstName: 'Aya', lastName: null },
     assistantWorkspaceEmail: 'aya@example.test',
-    principalDisplayName: 'Morgan',
+    principalName: { firstName: 'Morgan', lastName: null },
     principalTimezone: 'America/Los_Angeles',
     mainAgentGroupId: 'main-p',
     principalEmails: ['morgan@example.test'],

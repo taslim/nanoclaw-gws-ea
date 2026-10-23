@@ -165,9 +165,9 @@ beforeEach(async () => {
   await runMigrations(await initTestDb());
   await createAgentGroup({ id: 'ag-main', name: 'main', folder: 'main', agent_provider: null, created_at: NOW });
   await reconcileGwsEaProfile({
-    assistantDisplayName: 'Juno',
+    assistantName: { firstName: 'Juno', lastName: null },
     assistantWorkspaceEmail: 'juno@example.test',
-    principalDisplayName: 'Morgan',
+    principalName: { firstName: 'Morgan', lastName: null },
     principalTimezone: 'Africa/Lagos',
     mainAgentGroupId: 'ag-main',
     principalEmails: ['morgan@example.test'],

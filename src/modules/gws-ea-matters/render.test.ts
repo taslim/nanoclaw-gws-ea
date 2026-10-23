@@ -124,7 +124,7 @@ beforeEach(async () => {
   await ensureContainerConfig(MAIN);
   await updateContainerConfigScalars(MAIN, { timezone: ZONE });
   await getDb().run(
-    `UPDATE gws_ea_profile SET main_agent_group_id = ?, principal_display_name = 'Morgan Ellery',
+    `UPDATE gws_ea_profile SET assistant_first_name=COALESCE(assistant_first_name,'Juno'),principal_first_name=COALESCE(principal_first_name,'Morgan'),main_agent_group_id = ?, principal_first_name = 'Morgan', principal_last_name = 'Ellery',
        assistant_workspace_email = ? WHERE singleton = 1`,
     MAIN,
     ASSISTANT,

@@ -92,7 +92,7 @@ beforeEach(async () => {
   for (const id of ['bounds-main', 'bounds-browser'])
     await createAgentGroup({ id, name: id, folder: id, agent_provider: null, created_at: new Date().toISOString() });
   await getDb().run(
-    'UPDATE gws_ea_profile SET main_agent_group_id=?,browser_agent_group_id=? WHERE singleton=1',
+    `UPDATE gws_ea_profile SET assistant_first_name=COALESCE(assistant_first_name,'Juno'),principal_first_name=COALESCE(principal_first_name,'Morgan'),main_agent_group_id=?,browser_agent_group_id=? WHERE singleton=1`,
     'bounds-main',
     'bounds-browser',
   );

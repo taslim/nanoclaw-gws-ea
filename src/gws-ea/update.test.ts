@@ -14,6 +14,10 @@ import path from 'node:path';
 
 import Database from 'better-sqlite3';
 import { SqliteDriver } from '../db/drivers/sqlite.js';
+import { runMigrations } from '../db/migrations/index.js';
+import { gwsEaStructuredNamesMigration } from '../modules/gws-ea-profile/migration.js';
+import { PROFILE_NAME_MIGRATION, type ProfileNameMigrationInput } from './profile-name-migration.js';
+import { assertProfileNameInputCurrent, prepareProfileNames } from './profile-name-upgrade.js';
 import type { Session } from '../types.js';
 import { BrowserStore, browserRequestId } from '../modules/gws-ea-browser/db.js';
 import { browserQueueMigration, browserRecipesMigration } from '../modules/gws-ea-browser/migration.js';
@@ -271,6 +275,45 @@ describe('staging an update while the assistant serves', GIT_HEAVY, () => {
     expect(preview).toContain('research (ag-research)');
     expect(preview).toMatch(/failure after it starts may restore the pre-update snapshot/u);
   });
+
+  it(
+    'restages only the unused target when explicit name boundaries change, without writing live state',
+    GIT_HEAVY,
+    async () => {
+      const host = await machine();
+      const runtime = await assistant(host);
+      const next = await nextRelease(host);
+      const state = world(runtime, applying(ADDED_MIGRATION));
+      const layout = layoutOf(host, runtime);
+      const db = new Database(path.join(layout.state, 'data', 'v2.db'));
+      db.exec(`ALTER TABLE gws_ea_profile ADD COLUMN assistant_display_name TEXT;
+      ALTER TABLE gws_ea_profile ADD COLUMN principal_display_name TEXT;
+      UPDATE gws_ea_profile SET assistant_display_name='Robin Wu',principal_display_name='Mary Ann Lee';`);
+      db.close();
+      const prepare = async (firstName: string, lastName: string) => {
+        const op = await acquireInstanceOperation(host.paths, runtime.instance_id, { command: 'names-prepare' });
+        if (!op) throw new Error('test instance busy');
+        try {
+          await prepareProfileNames(op, {
+            assistant: { firstName: 'Robin', lastName: 'Wu' },
+            principal: { firstName, lastName },
+          });
+        } finally {
+          op.release();
+        }
+      };
+      await prepare('Mary Ann', 'Lee');
+      const before = await snapshot(layout.state);
+      const first = await stage(host, runtime, dependencies(state, next, runtime));
+      await prepare('Mary', 'Ann Lee');
+      const second = await stage(host, runtime, dependencies(state, next, runtime));
+      expect(second.profileNamesFingerprint).not.toBe(first.profileNamesFingerprint);
+      expect(state.events.filter((event) => event === 'setup install')).toHaveLength(2);
+      expect(state.running).toBe(true);
+      expect(await readlink(layout.current)).toBe(releaseName(host.first));
+      expect(await snapshot(layout.state)).toEqual(before);
+    },
+  );
 
   it.each([
     [
@@ -1443,6 +1486,58 @@ describe("the dry run of a release's migrations", () => {
     expect(seen).toEqual([{ cwd: staged, migrations: [...LIVE_MIGRATIONS] }]);
     expect(readCentralMigrations(state)).toEqual([...LIVE_MIGRATIONS]);
     // Nothing is left where the release's links go, and nothing else changed.
+    expect(await snapshot(root)).toEqual(before);
+  });
+
+  it('requires and converts explicit names for a published main with null legacy names, leaving live state unchanged', async () => {
+    const { root, state, staged } = await instance();
+    const db = new Database(path.join(state, 'data', 'v2.db'));
+    db.exec(`CREATE TABLE agent_groups (id TEXT PRIMARY KEY);
+      INSERT INTO agent_groups VALUES ('ag-main');
+      CREATE TABLE container_configs (agent_group_id TEXT PRIMARY KEY, assistant_name TEXT, updated_at TEXT);
+      CREATE TABLE gws_ea_profile (
+        singleton INTEGER PRIMARY KEY, assistant_display_name TEXT, principal_display_name TEXT,
+        assistant_workspace_email TEXT, principal_timezone TEXT, main_agent_group_id TEXT, updated_at TEXT,
+        external_email_agent_group_id TEXT, browser_agent_group_id TEXT, assistant_alias TEXT,
+        alias_candidate TEXT, alias_probe_message_id TEXT, external_chat_agent_group_id TEXT);
+      INSERT INTO gws_ea_profile (singleton,main_agent_group_id) VALUES (1,'ag-main');`);
+    db.close();
+    const profileNames: ProfileNameMigrationInput = {
+      schema_version: 1,
+      instance_id: '12345678-1234-4234-8234-123456789012',
+      previous: { assistant_display_name: null, principal_display_name: null },
+      assistant: { firstName: 'Robin', lastName: 'Wu' },
+      principal: { firstName: 'Mary Ann', lastName: 'Lee' },
+    };
+    const before = await snapshot(root);
+    expect(() => assertProfileNameInputCurrent(state, undefined)).toThrow(/names prepare/u);
+    expect(() => assertProfileNameInputCurrent(state, profileNames)).not.toThrow();
+    let converted: unknown;
+    const run: SanitizedCommandRunner = async (spec) => {
+      const driver = new SqliteDriver(new Database(path.join(spec.cwd, 'data', 'v2.db')));
+      try {
+        await runMigrations(driver, [gwsEaStructuredNamesMigration]);
+        converted = await driver.get(
+          'SELECT assistant_first_name,assistant_last_name,principal_first_name,principal_last_name FROM gws_ea_profile',
+        );
+      } finally {
+        await driver.close();
+      }
+      return { stdout: '', stderr: '' };
+    };
+    expect(
+      await dryRunReleaseMigrations(
+        { liveState: state, liveMigrations: LIVE_MIGRATIONS, stagedRelease: staged, profileNames },
+        run,
+        {},
+      ),
+    ).toEqual([PROFILE_NAME_MIGRATION]);
+    expect(converted).toEqual({
+      assistant_first_name: 'Robin',
+      assistant_last_name: 'Wu',
+      principal_first_name: 'Mary Ann',
+      principal_last_name: 'Lee',
+    });
     expect(await snapshot(root)).toEqual(before);
   });
 

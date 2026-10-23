@@ -34,7 +34,10 @@ export async function seedMain(timezone: string): Promise<void> {
   await createAgentGroup({ id: MAIN, name: 'main', folder: MAIN, agent_provider: null, created_at: now });
   await ensureContainerConfig(MAIN);
   await updateContainerConfigScalars(MAIN, { cli_scope: 'global', timezone });
-  await getDb().run('UPDATE gws_ea_profile SET main_agent_group_id = ? WHERE singleton = 1', MAIN);
+  await getDb().run(
+    `UPDATE gws_ea_profile SET assistant_first_name=COALESCE(assistant_first_name,'Juno'),principal_first_name=COALESCE(principal_first_name,'Morgan'),main_agent_group_id = ? WHERE singleton = 1`,
+    MAIN,
+  );
   await createMessagingGroup({
     id: DIRECT_MESSAGE,
     channel_type: 'gchat',

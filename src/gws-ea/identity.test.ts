@@ -132,7 +132,7 @@ function harness(
     if (args[0] === 'gws-ea-profile' && args[1] === 'reconcile') {
       state.profileWrites += 1;
       state.profileWriteArgs.push(args);
-      state.principalDisplayName = flagValue(args, '--principal-display-name') ?? state.principalDisplayName;
+      state.principalDisplayName = flagValue(args, '--principal-first-name') ?? state.principalDisplayName;
       state.principalTimezone = flagValue(args, '--principal-timezone') ?? state.principalTimezone;
       const declared = flagValue(args, '--principal-emails');
       if (declared !== undefined) state.principalEmails = JSON.parse(declared) as string[];
@@ -188,12 +188,16 @@ function harness(
 
 /** Main once it is published: the profile holds the principal, and a reconcile names none. */
 const input = {
-  assistantDisplayName: 'Aya',
+  assistantName: { firstName: 'Aya', lastName: null },
   assistantWorkspaceEmail: 'aya@example.test',
 };
 
 /** Who the principal is, as create declared them. */
-const seed = { displayName: 'Morgan', timezone: 'America/Los_Angeles', emails: ['morgan@example.test'] };
+const seed = {
+  name: { firstName: 'Morgan', lastName: null },
+  timezone: 'America/Los_Angeles',
+  emails: ['morgan@example.test'],
+};
 
 /** Main's first publication, which seeds the profile with the principal. */
 const create = { ...input, principal: seed };
@@ -217,7 +221,11 @@ describe('main identity reconciliation', () => {
     const { state, dependencies } = harness();
 
     const result = await reconcileMainIdentity(runtimeConfig(), create, dependencies);
-    await reconcileMainIdentity(runtimeConfig(), { ...input, assistantDisplayName: 'Aya Renamed' }, dependencies);
+    await reconcileMainIdentity(
+      runtimeConfig(),
+      { ...input, assistantName: { firstName: 'Aya', lastName: 'Renamed' } },
+      dependencies,
+    );
 
     expect(result).toEqual({ agentGroupId: GROUP_ID, onecliAgentId: 'oc-main' });
     expect(state.groupCreated).toBe(1);
@@ -235,7 +243,7 @@ describe('main identity reconciliation', () => {
     // A resume that finds the profile different repairs the identity.
     const repaired = await reconcileMainIdentity(
       runtimeConfig(),
-      { ...input, assistantDisplayName: 'Aya Renamed' },
+      { ...input, assistantName: { firstName: 'Aya', lastName: 'Renamed' } },
       dependencies,
     );
 
@@ -332,14 +340,36 @@ describe('main identity reconciliation', () => {
 
     await reconcileMainIdentity(
       runtimeConfig(),
-      { ...input, principal: { ...seed, timezone: 'Africa/Lagos' } },
+      {
+        ...input,
+        assistantName: { firstName: 'Aya Ren', lastName: 'Wu' },
+        principal: { ...seed, name: { firstName: 'Morgan Ann', lastName: 'Ellery' }, timezone: 'Africa/Lagos' },
+      },
       dependencies,
     );
 
     const [published] = state.profileWriteArgs;
-    expect(flagValue(published!, '--principal-display-name')).toBe('Morgan');
+    expect(flagValue(published!, '--principal-first-name')).toBe('Morgan Ann');
+    expect(flagValue(published!, '--principal-last-name')).toBe('Ellery');
+    expect(flagValue(published!, '--assistant-first-name')).toBe('Aya Ren');
+    expect(flagValue(published!, '--assistant-last-name')).toBe('Wu');
     expect(flagValue(published!, '--principal-timezone')).toBe('Africa/Lagos');
     expect(flagValue(published!, '--principal-emails')).toBe(JSON.stringify(['morgan@example.test']));
+  });
+
+  it('rejects unsafe components before mutating NanoClaw or OneCLI', async () => {
+    const { state, dependencies } = harness();
+    await expect(
+      reconcileMainIdentity(
+        runtimeConfig(),
+        {
+          ...create,
+          principal: { ...seed, name: { firstName: 'Morgan', lastName: '<script>' } },
+        },
+        dependencies,
+      ),
+    ).rejects.toMatchObject({ code: 'invalid_identity' });
+    expect(state).toMatchObject({ groupCreated: 0, provider: null, profileWrites: 0, agents: [] });
   });
 
   it("seeds the principal's timezone in the zone's own spelling, since main's container runs in it", async () => {
@@ -374,7 +404,12 @@ describe('main identity reconciliation', () => {
     await reconcileMainIdentity(runtimeConfig(), input, dependencies);
 
     const updated = state.profileWriteArgs.at(-1)!;
-    for (const flag of ['--principal-display-name', '--principal-timezone', '--principal-emails']) {
+    for (const flag of [
+      '--principal-first-name',
+      '--principal-last-name',
+      '--principal-timezone',
+      '--principal-emails',
+    ]) {
       expect(updated, flag).not.toContain(flag);
     }
     expect(state).toMatchObject({

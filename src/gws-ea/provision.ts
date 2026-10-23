@@ -1,9 +1,11 @@
 import Database from 'better-sqlite3';
 import { existsSync } from 'node:fs';
 import { mkdir, rmdir } from 'node:fs/promises';
+import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 
 import {
+  assertInstanceCreated,
   readProvisionJournal,
   recordChatConfigurationConfirmed,
   recordPrincipalChatAddress,
@@ -57,6 +59,8 @@ import { createServiceControl, runtimeServiceTarget, type NanoclawServiceHelpers
 import { instanceServicePlatform } from './service-coordinates.js';
 import { runInstanceNclJson } from './ncl.js';
 import { reconcileMainIdentity, type MainIdentityDependencies, type MainIdentityInput } from './identity.js';
+import { displayPersonName, normalizePersonName, type PersonName, type NameOwner } from './person-name.js';
+import { resolveExecutable } from './process.js';
 import type { OnecliAgent } from './onecli-admin.js';
 import {
   bindPrincipal,
@@ -80,7 +84,7 @@ import { readOwnerOnlyFile, readOwnerOnlyJson, removePrivateFile, writePrivateTe
 import { assertInstanceId, getInstanceReservation, writeInstanceMarker } from './registry.js';
 import { isErrno } from '../community-portal/errors.js';
 import { preparePrivateDirectory, type ControlPlanePaths } from './paths.js';
-import { createState, pointCurrent, readCurrent, releaseName } from './release-layout.js';
+import { createState, isReleaseComplete, pointCurrent, readCurrent, releaseName } from './release-layout.js';
 import { pollUntil } from './poll.js';
 import { GwsEaError, type InstanceReservation, type ProvisionStepId } from './types.js';
 import {
@@ -433,7 +437,8 @@ async function defaultObserveMainIdentity(context: ProductionProvisionContext): 
     const mainAgentGroupId = optionalString(profileValue.main_agent_group_id);
     if (
       !mainAgentGroupId ||
-      profileValue.assistant_display_name !== context.input.identity.assistantDisplayName ||
+      profileValue.assistant_first_name !== context.input.identity.assistantName.firstName ||
+      profileValue.assistant_last_name !== context.input.identity.assistantName.lastName ||
       profileValue.assistant_workspace_email !== context.input.identity.assistantWorkspaceEmail.toLowerCase()
     ) {
       return ABSENT;
@@ -625,7 +630,7 @@ async function principalResult(
 async function chatConfigurationPause(input: ProductionProvisionInput): Promise<ProvisionHumanPause> {
   const chat = [
     googleChatConfigurationUrl(input.gcp.projectId),
-    `App name: ${input.identity.assistantDisplayName}`,
+    `App name: ${displayPersonName(input.identity.assistantName)}`,
     'Avatar URL: a public HTTPS image of the assistant',
     `Description: a short line, such as "Executive assistant to ${input.principalDisplayName}"`,
     'Interactive features: off, since the assistant talks in Chat as its own account, not as a Chat app',
@@ -653,7 +658,7 @@ async function chatConfigurationPause(input: ProductionProvisionInput): Promise<
       '1. Configure the Google Chat API:',
       ...indented(chat),
       "2. Create the assistant's Google sign-in client:",
-      ...indented(googleClientSteps(input.gcp, input.identity.assistantDisplayName)),
+      ...indented(googleClientSteps(input.gcp, displayPersonName(input.identity.assistantName))),
     ],
     resumeFlag: `--chat-configured ${GOOGLE_CLIENT_FILE_FLAG} <file>`,
   };
@@ -951,7 +956,7 @@ export function createProductionProvisionSteps(
   };
 }
 
-const BOOTSTRAP_SCHEMA_VERSION = 1 as const;
+const BOOTSTRAP_SCHEMA_VERSION = 2 as const;
 
 export interface ProductionBootstrapManifest {
   readonly schema_version: typeof BOOTSTRAP_SCHEMA_VERSION;
@@ -973,8 +978,10 @@ export interface ProductionBootstrapManifest {
     readonly param_format: string | null;
   };
   readonly identity: {
-    readonly assistant_display_name: string;
-    readonly principal_display_name: string;
+    readonly assistant_first_name: string;
+    readonly assistant_last_name: string | null;
+    readonly principal_first_name: string;
+    readonly principal_last_name: string | null;
     readonly principal_timezone: string;
     /** The principal's addresses create collected: one or more, lowercased, each once. */
     readonly principal_emails: readonly string[];
@@ -987,6 +994,20 @@ const INVALID_BOOTSTRAP = 'invalid_bootstrap_manifest';
 
 function bootstrapString(value: unknown, label: string, maximum?: number): string {
   return requireString(value, label, INVALID_BOOTSTRAP, maximum);
+}
+
+function bootstrapName(identity: Record<string, unknown>, owner: NameOwner): PersonName {
+  const firstName = bootstrapString(identity[`${owner}_first_name`], `${owner} first name`);
+  const last = identity[`${owner}_last_name`];
+  if (last !== null && typeof last !== 'string') {
+    throw new GwsEaError(INVALID_BOOTSTRAP, `Bootstrap ${owner} last name must be a string or null`);
+  }
+  try {
+    return normalizePersonName({ firstName, lastName: last }, owner);
+  } catch (error) {
+    if (error instanceof Error) throw new GwsEaError(INVALID_BOOTSTRAP, error.message);
+    throw error;
+  }
 }
 
 function bootstrapPrincipalEmails(value: unknown): readonly string[] {
@@ -1030,6 +1051,8 @@ export function validateProductionBootstrapManifest(value: unknown): ProductionB
     return candidate === null || candidate === undefined ? null : bootstrapString(candidate, `provider ${key}`, 512);
   };
   const principalEmails = bootstrapPrincipalEmails(identity.principal_emails);
+  const assistantName = bootstrapName(identity, 'assistant');
+  const principalName = bootstrapName(identity, 'principal');
   return {
     schema_version: BOOTSTRAP_SCHEMA_VERSION,
     node_path: requirePath(manifest.node_path, 'node_path', INVALID_BOOTSTRAP),
@@ -1049,8 +1072,10 @@ export function validateProductionBootstrapManifest(value: unknown): ProductionB
       param_format: optionalProviderString('param_format'),
     },
     identity: {
-      assistant_display_name: bootstrapString(identity.assistant_display_name, 'assistant display name', 120),
-      principal_display_name: bootstrapString(identity.principal_display_name, 'principal display name', 120),
+      assistant_first_name: assistantName.firstName,
+      assistant_last_name: assistantName.lastName,
+      principal_first_name: principalName.firstName,
+      principal_last_name: principalName.lastName,
       principal_timezone: bootstrapString(identity.principal_timezone, 'principal timezone', 128),
       principal_emails: principalEmails,
       principal_chat_email: bootstrapPrincipalChatEmail(identity.principal_chat_email, principalEmails),
@@ -1113,9 +1138,11 @@ export async function removeProductionBootstrapManifest(paths: ControlPlanePaths
 }
 
 interface PersistedProfileIdentity {
-  readonly assistant_display_name: string;
+  readonly assistant_first_name: string;
+  readonly assistant_last_name: string | null;
   readonly assistant_workspace_email: string;
-  readonly principal_display_name: string;
+  readonly principal_first_name: string;
+  readonly principal_last_name: string | null;
   readonly main_agent_group_id: string;
   readonly updated_at: string;
 }
@@ -1134,10 +1161,17 @@ function readPersistedProfile(runtime: InstanceRuntimeConfig): PersistedProfileI
       .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'gws_ea_profile'")
       .get();
     if (!profileTable) return undefined;
+    const columns = database.prepare('PRAGMA table_info(gws_ea_profile)').all() as Array<{ name: string }>;
+    if (!columns.some((column) => column.name === 'assistant_first_name')) {
+      throw new GwsEaError(
+        'profile_names_required',
+        `Prepare explicit names with gws-ea names prepare --id ${runtime.instance_id}, then update this assistant before resuming.`,
+      );
+    }
     return database
       .prepare(
-        `SELECT assistant_display_name, assistant_workspace_email,
-                principal_display_name, main_agent_group_id, updated_at
+        `SELECT assistant_first_name, assistant_last_name, assistant_workspace_email,
+                principal_first_name, principal_last_name, main_agent_group_id, updated_at
            FROM gws_ea_profile
           WHERE singleton = 1 AND main_agent_group_id IS NOT NULL`,
       )
@@ -1186,19 +1220,21 @@ export async function resolveProvisionSource(
       providerCredentialMetadata: bootstrapProviderCredential(manifest),
       profile,
       identity: {
-        assistantDisplayName: identity.assistant_display_name,
+        assistantName: { firstName: identity.assistant_first_name, lastName: identity.assistant_last_name },
         assistantWorkspaceEmail: reservation.exclusive_resource_claims.workspace_email,
         ...(profile
           ? {}
           : {
               principal: {
-                displayName: identity.principal_display_name,
+                name: { firstName: identity.principal_first_name, lastName: identity.principal_last_name },
                 timezone: identity.principal_timezone,
                 emails: identity.principal_emails,
               },
             }),
       },
-      principalDisplayName: profile?.principal_display_name ?? identity.principal_display_name,
+      principalDisplayName: profile
+        ? displayPersonName({ firstName: profile.principal_first_name, lastName: profile.principal_last_name })
+        : displayPersonName({ firstName: identity.principal_first_name, lastName: identity.principal_last_name }),
     };
   }
   const receipt = operation.paths.releasePreflightFile(operation.instanceId, reservation.deployed_commit);
@@ -1215,10 +1251,13 @@ export async function resolveProvisionSource(
     providerCredentialMetadata: preflight.providerCredential,
     profile,
     identity: {
-      assistantDisplayName: profile.assistant_display_name,
+      assistantName: { firstName: profile.assistant_first_name, lastName: profile.assistant_last_name },
       assistantWorkspaceEmail: profile.assistant_workspace_email,
     },
-    principalDisplayName: profile.principal_display_name,
+    principalDisplayName: displayPersonName({
+      firstName: profile.principal_first_name,
+      lastName: profile.principal_last_name,
+    }),
   };
 }
 
@@ -1229,15 +1268,108 @@ interface InstanceState {
   readonly runtime?: InstanceRuntimeConfig;
 }
 
-async function readInstanceState(paths: ControlPlanePaths, reservation: InstanceReservation): Promise<InstanceState> {
-  const absent = (error: unknown): undefined => {
+function profileCreationState(
+  paths: ControlPlanePaths,
+  reservation: InstanceReservation,
+): { readonly published: boolean; readonly legacy: boolean } {
+  const file = centralDatabaseFile(paths.instanceLayout(reservation.instance_id).state);
+  if (!existsSync(file)) return { published: false, legacy: false };
+  const database = openWithoutSideFiles(file);
+  try {
+    const columns = database.prepare('PRAGMA table_info(gws_ea_profile)').all() as Array<{ name: string }>;
+    return {
+      published:
+        columns.length > 0 &&
+        database
+          .prepare('SELECT 1 FROM gws_ea_profile WHERE singleton = 1 AND main_agent_group_id IS NOT NULL')
+          .get() !== undefined,
+      legacy: columns.some(({ name }) => name === 'assistant_display_name'),
+    };
+  } finally {
+    database.close();
+  }
+}
+
+async function refuseIncompleteLegacyCreate(
+  paths: ControlPlanePaths,
+  reservation: InstanceReservation,
+  manifest: unknown,
+): Promise<void> {
+  const profile = profileCreationState(paths, reservation);
+  let incomplete = isRecord(manifest) && manifest.schema_version === 1 && !profile.published;
+  if (profile.legacy) {
+    try {
+      await assertInstanceCreated(paths, reservation.instance_id);
+    } catch (error) {
+      if (!(error instanceof GwsEaError) || error.code !== 'instance_not_created') throw error;
+      incomplete = true;
+    }
+  }
+  if (!incomplete) return;
+  const layout = paths.instanceLayout(reservation.instance_id);
+  const release = releaseName(reservation.deployed_commit);
+  const launcher = path.join(layout.release(release), 'bin', 'gws-ea');
+  const quote = (value: string): string => `'${value.replaceAll("'", "'\\''")}'`;
+  let staged = false;
+  if (await isReleaseComplete(layout, release)) {
+    try {
+      await resolveExecutable(launcher);
+      staged = true;
+    } catch (error) {
+      if (!(error instanceof GwsEaError) || error.code !== 'executable_not_found') throw error;
+    }
+  }
+  const setup = staged
+    ? ''
+    : [
+        'GWS_EA_LEGACY_RECOVERY_ROOT="$(mktemp -d)"',
+        `git clone --no-checkout -- ${quote(reservation.source_remote)} "$GWS_EA_LEGACY_RECOVERY_ROOT"`,
+        `git -C "$GWS_EA_LEGACY_RECOVERY_ROOT" checkout --detach ${quote(reservation.deployed_commit)}`,
+        'pnpm --dir "$GWS_EA_LEGACY_RECOVERY_ROOT" install --frozen-lockfile --prod=false',
+        '',
+      ].join(' && ');
+  const executable = staged ? quote(launcher) : '"$GWS_EA_LEGACY_RECOVERY_ROOT/bin/gws-ea"';
+  const command = `${setup}GWS_EA_CONFIG_ROOT=${quote(paths.configRoot)} GWS_EA_STATE_ROOT=${quote(paths.stateRoot)} ${executable} resume --id ${reservation.instance_id}`;
+  throw new GwsEaError(
+    'incomplete_legacy_create',
+    `Finish this incomplete create using its pinned release before preparing names or updating: ${command}`,
+  );
+}
+
+async function recordedBootstrap(paths: ControlPlanePaths, reservation: InstanceReservation): Promise<unknown> {
+  try {
+    return await readOwnerOnlyJson(
+      paths.bootstrapFile(reservation.instance_id),
+      'Bootstrap manifest',
+      INVALID_BOOTSTRAP,
+    );
+  } catch (error) {
     if (isErrno(error, 'ENOENT')) return undefined;
     throw error;
-  };
-  const [manifest, runtime] = await Promise.all([
-    loadProductionBootstrapManifest(paths.bootstrapFile(reservation.instance_id)).catch(absent),
-    loadInstanceRuntimeConfig(paths.runtimeFile(reservation.instance_id)).catch(absent),
+  }
+}
+
+/** Legacy create manifests belong to their pinned launcher and are never rewritten by a new release. */
+export async function assertLegacyCreateComplete(
+  paths: ControlPlanePaths,
+  reservation: InstanceReservation,
+): Promise<void> {
+  await refuseIncompleteLegacyCreate(paths, reservation, await recordedBootstrap(paths, reservation));
+}
+
+async function readInstanceState(paths: ControlPlanePaths, reservation: InstanceReservation): Promise<InstanceState> {
+  const [rawManifest, runtime] = await Promise.all([
+    recordedBootstrap(paths, reservation),
+    loadInstanceRuntimeConfig(paths.runtimeFile(reservation.instance_id)).catch((error: unknown) => {
+      if (isErrno(error, 'ENOENT')) return undefined;
+      throw error;
+    }),
   ]);
+  await refuseIncompleteLegacyCreate(paths, reservation, rawManifest);
+  const manifest =
+    rawManifest === undefined || (isRecord(rawManifest) && rawManifest.schema_version === 1)
+      ? undefined
+      : validateProductionBootstrapManifest(rawManifest);
   return { ...(manifest ? { manifest } : {}), ...(runtime ? { runtime } : {}) };
 }
 
@@ -1411,7 +1543,7 @@ export async function runProductionProvision(
       google: {
         runtime,
         assistantWorkspaceEmail: source.identity.assistantWorkspaceEmail,
-        assistantName: source.identity.assistantDisplayName,
+        assistantName: displayPersonName(source.identity.assistantName),
         ...(interaction?.decisions.googleClientFile ? { clientFile: interaction.decisions.googleClientFile } : {}),
         signIn: (request) => {
           if (interaction) return interaction.signInAssistantToGoogle(request);

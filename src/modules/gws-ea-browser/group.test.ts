@@ -79,7 +79,10 @@ it('keeps active main guidance conditional so enablement changes need no contain
   const main = { id: 'main', name: 'main', folder: 'main', agent_provider: null, created_at: new Date().toISOString() };
   await createAgentGroup(main);
   const { getDb } = await import('../../db/connection.js');
-  await getDb().run('UPDATE gws_ea_profile SET main_agent_group_id = ? WHERE singleton = 1', main.id);
+  await getDb().run(
+    `UPDATE gws_ea_profile SET assistant_first_name=COALESCE(assistant_first_name,'Juno'),principal_first_name=COALESCE(principal_first_name,'Morgan'),main_agent_group_id = ? WHERE singleton = 1`,
+    main.id,
+  );
   const file = `${ROOT}/browser/policy.json`;
   fs.mkdirSync(`${ROOT}/browser`, { recursive: true, mode: 0o700 });
   process.env.GWS_EA_BROWSER_POLICY_FILE = file;
@@ -120,7 +123,10 @@ it('admits only canonical main errand sessions to the sealed browser group', asy
     agent_provider: null,
     created_at: new Date().toISOString(),
   });
-  await getDb().run('UPDATE gws_ea_profile SET main_agent_group_id = ? WHERE singleton = 1', 'main');
+  await getDb().run(
+    `UPDATE gws_ea_profile SET assistant_first_name=COALESCE(assistant_first_name,'Juno'),principal_first_name=COALESCE(principal_first_name,'Morgan'),main_agent_group_id = ? WHERE singleton = 1`,
+    'main',
+  );
   fs.mkdirSync(`${ROOT}/browser`, { recursive: true, mode: 0o700 });
   const policy = `${ROOT}/browser/policy.json`;
   fs.writeFileSync(policy, JSON.stringify({ schemaVersion: 1, enabled: true }), {
@@ -157,7 +163,10 @@ it('hands the delegate tools to main under version 1, enabled or not, and to no 
     await createAgentGroup({ id, name: id, folder: id, agent_provider: null, created_at: new Date().toISOString() });
     await ensureContainerConfig(id);
   }
-  await getDb().run('UPDATE gws_ea_profile SET main_agent_group_id = ? WHERE singleton = 1', 'main');
+  await getDb().run(
+    `UPDATE gws_ea_profile SET assistant_first_name=COALESCE(assistant_first_name,'Juno'),principal_first_name=COALESCE(principal_first_name,'Morgan'),main_agent_group_id = ? WHERE singleton = 1`,
+    'main',
+  );
   expect((await getGroupCapabilities('main')).has('browser-delegate')).toBe(true);
   expect((await getGroupCapabilities('research')).has('browser-delegate')).toBe(false);
   // Stored explicitly, the key is still the setting's to grant.
@@ -174,7 +183,10 @@ it('hands record_purchase_outcome to main and every delegator, main off the acce
     await createAgentGroup({ id, name: id, folder: id, agent_provider: null, created_at: new Date().toISOString() });
     await ensureContainerConfig(id);
   }
-  await getDb().run('UPDATE gws_ea_profile SET main_agent_group_id = ? WHERE singleton = 1', 'main');
+  await getDb().run(
+    `UPDATE gws_ea_profile SET assistant_first_name=COALESCE(assistant_first_name,'Juno'),principal_first_name=COALESCE(principal_first_name,'Morgan'),main_agent_group_id = ? WHERE singleton = 1`,
+    'main',
+  );
   writeBrowserAccess(`${ROOT}/browser/policy.json`, { agentGroupIds: ['research'] });
   // Main records the purchases of a group that lost access, so it holds the tool the unconfirmed note names.
   expect((await getGroupCapabilities('main')).has('browser-delegate')).toBe(false);
@@ -187,7 +199,10 @@ it('hands record_purchase_outcome to main and every delegator, main off the acce
 it('admits the errands of every listed group, and no longer main once the list leaves it out', async () => {
   for (const id of ['main', 'research'])
     await createAgentGroup({ id, name: id, folder: id, agent_provider: null, created_at: new Date().toISOString() });
-  await getDb().run('UPDATE gws_ea_profile SET main_agent_group_id = ? WHERE singleton = 1', 'main');
+  await getDb().run(
+    `UPDATE gws_ea_profile SET assistant_first_name=COALESCE(assistant_first_name,'Juno'),principal_first_name=COALESCE(principal_first_name,'Morgan'),main_agent_group_id = ? WHERE singleton = 1`,
+    'main',
+  );
   writeBrowserAccess(`${ROOT}/browser/policy.json`, { agentGroupIds: ['research'] });
   const id = await ensureBrowserGroup();
   const admit = async (thread: string) =>

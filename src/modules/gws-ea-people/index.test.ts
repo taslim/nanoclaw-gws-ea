@@ -62,9 +62,9 @@ beforeEach(async () => {
     await updateContainerConfigScalars(candidate.id, { cli_scope: 'global' });
   }
   await reconcileGwsEaProfile({
-    assistantDisplayName: 'Juno',
+    assistantName: { firstName: 'Juno', lastName: null },
     assistantWorkspaceEmail: 'juno@example.test',
-    principalDisplayName: 'Morgan',
+    principalName: { firstName: 'Morgan', lastName: null },
     principalTimezone: 'Africa/Lagos',
     mainAgentGroupId: main.id,
     principalEmails: ['morgan@example.test'],

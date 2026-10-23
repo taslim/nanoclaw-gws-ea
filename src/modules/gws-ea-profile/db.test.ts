@@ -51,7 +51,9 @@ beforeEach(async () => {
   const at = new Date(Date.now() - 30_000).toISOString();
   bindingAt = at;
   await createAgentGroup({ id: 'main', name: 'main', folder: 'main', agent_provider: null, created_at: at });
-  await getDb().run("UPDATE gws_ea_profile SET main_agent_group_id = 'main' WHERE singleton = 1");
+  await getDb().run(
+    "UPDATE gws_ea_profile SET assistant_first_name = 'Aya', principal_first_name = 'Morgan', main_agent_group_id = 'main' WHERE singleton = 1",
+  );
   google = {
     id: 'google-dm',
     channel_type: 'gchat',

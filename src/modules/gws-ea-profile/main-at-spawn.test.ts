@@ -52,7 +52,9 @@ afterEach(async () => {
 it("gives main its Workspace commands when a held message spawns it before the host's start", async () => {
   for (const id of ['ag-main', 'ag-research']) await createAgentGroup(group(id));
   // The profile an earlier host process wrote: nothing in this one has read it.
-  await getDb().run("UPDATE gws_ea_profile SET main_agent_group_id = 'ag-main' WHERE singleton = 1");
+  await getDb().run(
+    "UPDATE gws_ea_profile SET assistant_first_name = 'Aya', principal_first_name = 'Morgan', main_agent_group_id = 'ag-main' WHERE singleton = 1",
+  );
 
   await admit('adopt');
   expect(gogCommandsAtSpawn('ag-main')).toBeUndefined();

@@ -76,9 +76,9 @@ beforeEach(async () => {
   await createAgentGroup({ id: 'ag-main', name: 'main', folder: 'main', agent_provider: null, created_at: now() });
   await createAgentGroup({ id: 'ag-other', name: 'other', folder: 'other', agent_provider: null, created_at: now() });
   await reconcileGwsEaProfile({
-    assistantDisplayName: 'Aya',
+    assistantName: { firstName: 'Aya', lastName: null },
     assistantWorkspaceEmail: 'aya@example.test',
-    principalDisplayName: 'Principal',
+    principalName: { firstName: 'Principal', lastName: null },
     principalTimezone: 'UTC',
     mainAgentGroupId: 'ag-main',
   });

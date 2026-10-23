@@ -170,7 +170,7 @@ beforeEach(async () => {
   await runMigrations(await initTestDb());
   await seedMain(ZONE);
   await getDb().run(
-    `UPDATE gws_ea_profile SET principal_display_name = 'Morgan Ellery', assistant_workspace_email = ? WHERE singleton = 1`,
+    `UPDATE gws_ea_profile SET principal_first_name = 'Morgan', principal_last_name = 'Ellery', assistant_workspace_email = ? WHERE singleton = 1`,
     ASSISTANT,
   );
   await addPrincipalAddress(MORGAN);

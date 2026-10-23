@@ -1252,9 +1252,9 @@ describe('recorded divergence: the agent image carries the pinned Google tool', 
     const { reconcileGwsEaProfile } = await import('../modules/gws-ea-profile/db.js');
     for (const id of ['ag-main', 'ag-research']) await db.createAgentGroup(agentGroup(id));
     await reconcileGwsEaProfile({
-      assistantDisplayName: 'Juno',
+      assistantName: { firstName: 'Juno', lastName: null },
       assistantWorkspaceEmail: 'juno@northwind.example',
-      principalDisplayName: 'Morgan Ellery',
+      principalName: { firstName: 'Morgan', lastName: 'Ellery' },
       principalTimezone: 'Europe/London',
       mainAgentGroupId: 'ag-main',
     });

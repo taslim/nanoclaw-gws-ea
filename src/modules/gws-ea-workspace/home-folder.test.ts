@@ -105,9 +105,9 @@ function setUp(): World {
 async function setUpProfile(emails: readonly string[] = [GMAIL, WORK]): Promise<void> {
   await createAgentGroup({ id: 'ag-main', name: 'main', folder: 'main', agent_provider: null, created_at: AT });
   await reconcileGwsEaProfile({
-    assistantDisplayName: 'Juno',
+    assistantName: { firstName: 'Juno', lastName: null },
     assistantWorkspaceEmail: ASSISTANT,
-    principalDisplayName: 'Morgan Ellery',
+    principalName: { firstName: 'Morgan', lastName: 'Ellery' },
     principalTimezone: 'Europe/London',
     mainAgentGroupId: 'ag-main',
     principalEmails: emails,
@@ -515,7 +515,9 @@ describe('the home folder', () => {
     await getDb().run('UPDATE gws_ea_workspace_folder SET folder_id = ? WHERE singleton = 1', earlier.id);
     await world.home.load();
     await world.home.tick();
-    await getDb().run("UPDATE gws_ea_profile SET principal_display_name = 'Juno Hale' WHERE singleton = 1");
+    await getDb().run(
+      "UPDATE gws_ea_profile SET principal_first_name = 'Juno', principal_last_name = 'Hale' WHERE singleton = 1",
+    );
     const mark = world.drive.calls.length;
     await world.home.tick();
 
@@ -562,7 +564,9 @@ describe('the home folder tick', () => {
     await setUpProfile();
     await world.home.tick();
     world.grant = GRANT;
-    await getDb().run('UPDATE gws_ea_profile SET assistant_display_name = NULL WHERE singleton = 1');
+    await getDb().run(
+      `UPDATE gws_ea_profile SET assistant_first_name = NULL, main_agent_group_id = NULL WHERE singleton = 1`,
+    );
     await world.home.tick();
 
     expect(world.drive.calls).toEqual([]);

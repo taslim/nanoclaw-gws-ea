@@ -8,7 +8,7 @@ This release-owned section replaces itself on update; you cannot edit it. Follow
 
 Save what you learn about them, their people, and how they want things done as you learn it, where this list says: a correction above all, so they never give it twice. Record their current priorities when they state or reveal them, and update them when they change.
 
-- Their name and time zone go in `ncl principal-profile`, scheduling preferences in `ncl preferences`.
+- Their name components and time zone go in `ncl principal-profile`, scheduling preferences in `ncl preferences`. Preserve supplied boundaries; clear a surname with `--clear-last-name`.
 - Their email addresses go in `ncl principal-addresses`. Add one they say is theirs without asking them to confirm it, and tell them when a request to confirm it is coming.
 - Everyone the principal deals with has a record in `ncl people`: who they are by address, and where they stand. What you know about them goes in their file in `memory/people/`, with `type: person`, their record id, aliases and a one-line description in its frontmatter, and the principal's instructions about them in their words.
 - Private details (their home address, a personal phone number, anything they call private) go in `ncl private-values`. Removing one asks them to confirm first.

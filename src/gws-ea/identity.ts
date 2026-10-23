@@ -10,6 +10,7 @@ import {
   requireString,
   unwrapData,
 } from './validation.js';
+import { normalizePersonName, type PersonName, type NameOwner } from './person-name.js';
 import { ianaTimezone } from '../timezone.js';
 
 /** The template create stamps main from, the group it names, and the plugin it stamps into main's folder. */
@@ -19,7 +20,7 @@ export const MAIN_PLUGIN_NAME = 'gws-ea-main';
 
 /** The principal as create declared them, which seeds the profile when it first publishes main. */
 export interface PrincipalSeed {
-  readonly displayName: string;
+  readonly name: PersonName;
   /** Their home timezone; main's container runs in it, as the host derives it from the profile (KTD7). */
   readonly timezone: string;
   /** One or more addresses; the profile then holds exactly these. */
@@ -27,7 +28,7 @@ export interface PrincipalSeed {
 }
 
 export interface MainIdentityInput {
-  readonly assistantDisplayName: string;
+  readonly assistantName: PersonName;
   readonly assistantWorkspaceEmail: string;
   /**
    * The principal, until main is published. Absent after: the profile is the
@@ -91,6 +92,15 @@ function exactAgent(agents: readonly OnecliAgent[], agentGroupId: string): Onecl
   return match;
 }
 
+function identityName(input: PersonName, owner: NameOwner): PersonName {
+  try {
+    return normalizePersonName(input, owner);
+  } catch (error) {
+    if (error instanceof Error) throw new GwsEaError('invalid_identity', error.message);
+    throw error;
+  }
+}
+
 function validateInput(input: MainIdentityInput): MainIdentityInput {
   const assistantWorkspaceEmail = safeString(
     input.assistantWorkspaceEmail.trim().toLowerCase(),
@@ -101,7 +111,7 @@ function validateInput(input: MainIdentityInput): MainIdentityInput {
     throw new GwsEaError('invalid_identity', 'Assistant Workspace email is invalid');
   }
   return {
-    assistantDisplayName: safeString(input.assistantDisplayName.trim(), 'Assistant display name', 120),
+    assistantName: identityName(input.assistantName, 'assistant'),
     assistantWorkspaceEmail,
     ...(input.principal === undefined
       ? {}
@@ -119,7 +129,7 @@ function validatePrincipalSeed(seed: PrincipalSeed, assistantWorkspaceEmail: str
   const timezone = ianaTimezone(safeString(seed.timezone, 'Principal timezone', 120));
   if (timezone === undefined) throw new GwsEaError('invalid_identity', 'Principal timezone is invalid');
   return {
-    displayName: safeString(seed.displayName.trim(), 'Principal display name', 120),
+    name: identityName(seed.name, 'principal'),
     timezone,
     emails: validatePrincipalEmails(seed.emails, assistantWorkspaceEmail),
   };
@@ -229,8 +239,9 @@ export async function reconcileMainIdentity(
     await runNcl(config, [
       'gws-ea-profile',
       'reconcile',
-      '--assistant-display-name',
-      input.assistantDisplayName,
+      '--assistant-first-name',
+      input.assistantName.firstName,
+      ...(input.assistantName.lastName === null ? [] : ['--assistant-last-name', input.assistantName.lastName]),
       '--assistant-workspace-email',
       input.assistantWorkspaceEmail,
       '--main-agent-group-id',
@@ -238,8 +249,9 @@ export async function reconcileMainIdentity(
       ...(principal === undefined
         ? []
         : [
-            '--principal-display-name',
-            principal.displayName,
+            '--principal-first-name',
+            principal.name.firstName,
+            ...(principal.name.lastName === null ? [] : ['--principal-last-name', principal.name.lastName]),
             '--principal-timezone',
             principal.timezone,
             '--principal-emails',

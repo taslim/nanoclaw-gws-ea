@@ -202,7 +202,10 @@ beforeEach(async () => {
   ] as const) {
     await createAgentGroup({ id, name, folder: name, agent_provider: null, created_at: now() });
   }
-  await getDb().run('UPDATE gws_ea_profile SET main_agent_group_id = ? WHERE singleton = 1', 'ag-main');
+  await getDb().run(
+    `UPDATE gws_ea_profile SET assistant_first_name=COALESCE(assistant_first_name,'Juno'),principal_first_name=COALESCE(principal_first_name,'Morgan'),main_agent_group_id = ? WHERE singleton = 1`,
+    'ag-main',
+  );
   await ensureInbox('ag-external');
   await ensurePrincipalConversation('ag-main');
   // A thread main placed and handed over: its mail is worked at the thread's pace.

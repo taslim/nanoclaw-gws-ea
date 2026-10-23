@@ -174,9 +174,9 @@ describe.skipIf(!chromePath)('wake-on-change watches in native Chrome', { timeou
       created_at: new Date().toISOString(),
     });
     await reconcileGwsEaProfile({
-      assistantDisplayName: 'Aya',
+      assistantName: { firstName: 'Aya', lastName: null },
       assistantWorkspaceEmail: 'aya@example.test',
-      principalDisplayName: 'Morgan Ellery',
+      principalName: { firstName: 'Morgan', lastName: 'Ellery' },
       principalTimezone: 'America/Los_Angeles',
       mainAgentGroupId: 'main-w',
       principalEmails: ['morgan@example.test'],
@@ -590,7 +590,7 @@ describe.skipIf(!chromePath)('a reader watch beside region watches in native Chr
     for (const id of ['reader-main', 'reader-browser'])
       await createAgentGroup({ id, name: id, folder: id, agent_provider: null, created_at: new Date().toISOString() });
     await getDb().run(
-      'UPDATE gws_ea_profile SET main_agent_group_id=?,browser_agent_group_id=? WHERE singleton=1',
+      `UPDATE gws_ea_profile SET assistant_first_name=COALESCE(assistant_first_name,'Juno'),principal_first_name=COALESCE(principal_first_name,'Morgan'),main_agent_group_id=?,browser_agent_group_id=? WHERE singleton=1`,
       'reader-main',
       'reader-browser',
     );

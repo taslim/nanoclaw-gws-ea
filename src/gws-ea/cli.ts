@@ -89,6 +89,8 @@ import {
 import { isRecord } from './validation.js';
 import type { WhatsAppCommandData } from './types.js';
 import { runInstanceNclJson } from './ncl.js';
+import { prepareProfileNames } from './profile-name-upgrade.js';
+import { normalizePersonName } from './person-name.js';
 import { deriveGcpClaims, GCP_BILLING_ACCOUNT_PATTERN } from './gcp-identity.js';
 import {
   acquireInstanceOperation,
@@ -619,6 +621,50 @@ class Cli {
             work: (session) => this.#serviceWork(session, command, instanceId),
           });
       }
+      case 'names-prepare': {
+        const instanceId = targetInstance(options);
+        const assistant = normalizePersonName(
+          {
+            firstName: requireOption(options, 'assistant-first-name'),
+            lastName: options['assistant-last-name'] ?? null,
+          },
+          'assistant',
+        );
+        const principal = normalizePersonName(
+          {
+            firstName: requireOption(options, 'principal-first-name'),
+            lastName: options['principal-last-name'] ?? null,
+          },
+          'principal',
+        );
+        return () =>
+          this.#attempt({
+            command,
+            args,
+            options,
+            instanceId,
+            work: async ({ reporter }) => {
+              const operation = await this.#acquire(reporter, instanceId, { command: 'names-prepare' });
+              if (!operation) throw busy();
+              try {
+                const changed = await prepareProfileNames(operation, { assistant, principal });
+                if (changed) reporter.emit?.({ type: 'domain-effect', step: 'names-prepare', changed: true });
+                return {
+                  status: 'ready',
+                  message: 'Name components prepared. Run gws-ea update for this assistant.',
+                  details: [
+                    `Assistant first name: ${assistant.firstName}`,
+                    `Assistant last name: ${assistant.lastName ?? '(none)'}`,
+                    `Principal first name: ${principal.firstName}`,
+                    `Principal last name: ${principal.lastName ?? '(none)'}`,
+                  ],
+                };
+              } finally {
+                operation.release();
+              }
+            },
+          });
+      }
       case 'update': {
         if (options.all === 'true') {
           assertUpdatesEveryAssistant(options);
@@ -694,6 +740,13 @@ class Cli {
       case 'stop':
       case 'restart':
         return `gws-ea ${plan.command} --id ${state.instanceId}`;
+      case 'names-prepare':
+        return join(
+          `gws-ea names prepare --id ${state.instanceId}`,
+          ...['assistant-first-name', 'assistant-last-name', 'principal-first-name', 'principal-last-name'].map(
+            (key) => (plan.options[key] === undefined ? undefined : `--${key} ${shellQuote(plan.options[key])}`),
+          ),
+        );
       case 'update': {
         const { track, yes } = plan.options;
         const remote = plan.options['source-remote'];
@@ -747,7 +800,8 @@ class Cli {
     if (isStateRefusal(error))
       return state.instanceId ? [{ kind: 'command', argv: ['gws-ea', 'status', '--id', state.instanceId] }] : [];
     const command = plan.command === 'create' ? 'resume' : plan.command;
-    const base = ['gws-ea', command, ...(state.instanceId ? ['--id', state.instanceId] : [])];
+    const commandPath = command === 'names-prepare' ? ['names', 'prepare'] : [command];
+    const base = ['gws-ea', ...commandPath, ...(state.instanceId ? ['--id', state.instanceId] : [])];
     const retained =
       command === 'resume' || command === 'connect-google'
         ? ['secrets-file']
@@ -755,7 +809,9 @@ class Cli {
           ? ['track', 'source-remote']
           : command === 'remove'
             ? ['abandon']
-            : [];
+            : command === 'names-prepare'
+              ? ['assistant-first-name', 'assistant-last-name', 'principal-first-name', 'principal-last-name']
+              : [];
     for (const flag of retained) if (plan.options[flag]) base.push(`--${flag}`, plan.options[flag]);
     if (command === 'rollback' && plan.options.snapshot === 'true') base.push('--snapshot');
     if (command === 'remove' && plan.options['delete-vault'] === 'true') base.push('--delete-vault');
@@ -807,7 +863,8 @@ class Cli {
   /** Retrying a reserved create resumes it; every other attempt reruns as given. */
   #retry(plan: AttemptPlan, state: AttemptState): () => Promise<Attempt> {
     if (plan.command !== 'create' || !state.reserved || !state.instanceId) {
-      return () => this.prepare(plan.command, parseInvocation([plan.command, ...plan.args]))();
+      const commandPath = plan.command === 'names-prepare' ? ['names', 'prepare'] : [plan.command];
+      return () => this.prepare(plan.command, parseInvocation([...commandPath, ...plan.args]))();
     }
     const resumeArgs = [
       '--id',

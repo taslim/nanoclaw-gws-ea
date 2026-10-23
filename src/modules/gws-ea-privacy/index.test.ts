@@ -206,7 +206,7 @@ beforeEach(async () => {
   await upsertUserDm({ user_id: PRINCIPAL, channel_type: 'gchat', messaging_group_id: 'mg-dm', resolved_at: now() });
   await getDb().run(
     `UPDATE gws_ea_profile
-        SET main_agent_group_id = ?, principal_display_name = 'Pat Doe', assistant_workspace_email = ?
+        SET assistant_first_name=COALESCE(assistant_first_name,'Juno'),principal_first_name=COALESCE(principal_first_name,'Morgan'),main_agent_group_id = ?, principal_first_name = 'Pat', principal_last_name = 'Doe', assistant_workspace_email = ?
       WHERE singleton = 1`,
     'ag-main',
     JUNO,

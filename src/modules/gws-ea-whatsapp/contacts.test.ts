@@ -13,7 +13,7 @@ vi.mock('../../request-wake.js', () => ({ requestWake: vi.fn(async () => true) }
 import { getDb, runMigrations } from '../../db/index.js';
 import { inboundDbPath } from '../../mailbox/sqlite/paths.js';
 import { mainSession, seedMain } from '../gws-ea-matters/testing/main-conversation.js';
-import { gwsEaProfileMigration } from '../gws-ea-profile/migration.js';
+import * as profileMigrations from '../gws-ea-profile/migration.js';
 
 import { incoming } from './testing/fake-socket.js';
 import { registerWhatsAppObserver } from './observers.js';
@@ -24,7 +24,10 @@ let h: TransportHarness;
 beforeEach(async () => {
   fs.rmSync('/tmp/nanoclaw-wa-u2-contacts', { recursive: true, force: true });
   h = await transportHarness();
-  await runMigrations(getDb(), [gwsEaProfileMigration]);
+  await runMigrations(
+    getDb(),
+    Object.values(profileMigrations).sort((left, right) => left.version - right.version),
+  );
 });
 afterEach(async () => {
   await h.close();
