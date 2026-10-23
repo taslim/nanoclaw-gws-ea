@@ -77,7 +77,7 @@ import { readOutboxFiles } from '../../session-manager.js';
 import type { Session } from '../../types.js';
 import { getExternalEmailAgentGroupId } from '../gws-ea-external-email/index.js';
 import { audienceForAddresses, checkOutbound, PRIVACY_GUARD_ID } from '../gws-ea-privacy/index.js';
-import { getGwsEaProfile, getMainAgentGroupId } from '../gws-ea-profile/db.js';
+import { getMainAgentGroupId } from '../gws-ea-profile/db.js';
 import {
   checkLinksOpenable,
   LINK_ACCESS_REFUSER,
@@ -86,7 +86,7 @@ import {
 } from '../gws-ea-workspace/link-access.js';
 import { buildMime, encodeRaw, normalizeAddress, parseGmailMessage, type ParsedMail } from './mime.js';
 import { replyAll, threadRecipients, type Recipients } from './recipients.js';
-import { emailSignature, quotedBy, renderEmail, type QuotedMessage } from './render.js';
+import { quotedBy, renderEmail, type QuotedMessage } from './render.js';
 import {
   assistantAddresses,
   EMAIL_CHANNEL_TYPE,
@@ -324,7 +324,6 @@ export async function sendToOutside(
     if (!links.allowed) throw new OutboundRefusedError(LINK_ACCESS_REFUSER, links.reason);
     const body = renderEmail({
       markdown: email.text,
-      signature: emailSignature(await getGwsEaProfile()),
       ...(quote === undefined ? {} : { quote }),
     });
     const from = await assistantMailbox(runtime);

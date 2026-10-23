@@ -49,7 +49,8 @@ describe('the web alias probe (KTD13)', () => {
     const body = gmail.sent[0].replace(/=\r\n/gu, '');
     expect(body).toContain(`checks that ${ALIAS} delivers to Juno's mailbox`);
     expect(body).toContain('you can delete it');
-    expect(body).toContain(`Check reference: ${nonce}`);
+    expect(body).toContain(`Check reference: ${nonce}\r\nJuno\r\n`);
+    expect(body).toContain(`Check reference: ${nonce}<br />\r\nJuno</p>`);
     expect(body).not.toContain('Morgan');
     await expect(getAliasSetup()).resolves.toEqual({ alias: null, candidate: ALIAS, probe_message_id: messageId });
   });

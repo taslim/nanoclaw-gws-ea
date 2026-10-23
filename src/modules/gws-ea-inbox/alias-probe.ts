@@ -21,6 +21,7 @@
 import { randomBytes } from 'node:crypto';
 
 import { getAliasSetup, recordAliasProbe, recordVerifiedAlias } from '../gws-ea-profile/db.js';
+import { escapeMarkdownInline } from '../gws-ea-profile/markdown.js';
 import type { GmailApi, GmailMessage } from './gmail-api.js';
 import { buildMime, domainOf, encodeRaw, headerValue, parseAddressList } from './mime.js';
 import { renderEmail } from './render.js';
@@ -50,7 +51,7 @@ function probeMarkdown(address: string, assistantName: string, nonce: string): s
   return [
     `This automatic message checks that ${address} delivers to ${assistantName}'s mailbox. It was sent while that address was being set up.`,
     'If it reached you instead, the address is not set up yet, and you can delete it. No reply is needed.',
-    `Check reference: ${nonce}`,
+    `Check reference: ${nonce}\n${escapeMarkdownInline(assistantName)}`,
   ].join('\n\n');
 }
 
@@ -61,7 +62,7 @@ async function sendProbe(runtime: InboxRuntime, candidate: string): Promise<bool
   const messageId = `<alias-check.${nonce}@${domainOf(from.address)}>`;
   if (!(await recordAliasProbe(candidate, messageId))) return false;
   const name = from.displayName ?? from.address;
-  const body = renderEmail({ markdown: probeMarkdown(candidate, name, nonce), signature: name });
+  const body = renderEmail({ markdown: probeMarkdown(candidate, name, nonce) });
   const raw = encodeRaw(
     buildMime({
       from,

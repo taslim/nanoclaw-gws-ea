@@ -15,7 +15,6 @@ import type { AgentGroup, User } from '../../types.js';
 import { registerMigration } from '../../db/migrations/index.js';
 import { recordCalendarAccess } from '../gws-ea-inbox/db.js';
 import { gwsEaInboxCalendarAccessMigration } from '../gws-ea-inbox/migration.js';
-import { emailSignature } from '../gws-ea-inbox/render.js';
 import { writeBrowserAccess } from '../gws-ea-browser/testing/browser-access.js';
 import { addPerson, getPerson, updatePerson } from '../gws-ea-people/db.js';
 import { gwsEaPeopleMigration, gwsEaPeopleThinRecordMigration } from '../gws-ea-people/migration.js';
@@ -28,6 +27,7 @@ import {
   projectDocAudience,
   reconcileGwsEaProfile,
   recordExternalEmailAgentGroupId,
+  recordExternalChatAgentGroupId,
   setBrowserAgentGroupId,
 } from './db.js';
 import { MAIN_PRINCIPAL_ADDRESSES_POINTER } from './index.js';
@@ -741,15 +741,26 @@ describe("external-email's pointer and audience", () => {
     await expect(recordExternalEmailAgentGroupId(research.id)).rejects.toThrow(/already bound/);
   });
 
-  it('writes each document for its audience: external-email gets the two names and no address', async () => {
+  it('keeps identities audience-specific: email gets its signature, casual chat gets names alone', async () => {
+    const chat = group('ag-external-chat', 'external-chat');
+    await createGroup(chat);
+    await recordExternalChatAgentGroupId(chat.id);
     await recordExternalEmailAgentGroupId(ee.id);
 
     expect(await projectDocAudience(main.id)).toBe('main');
     expect(await projectDocAudience(ee.id)).toBe('external-email');
+    expect(await projectDocAudience(chat.id)).toBe('external-chat');
     expect(await projectDocAudience(research.id)).toBe('other');
 
     const [section] = await getRequiredProjectDocSections(ee);
     expect(section).toEqual({
+      name: 'Assistant Identity',
+      body:
+        'Aya is the assistant. Morgan is the principal. They are separate people: act and communicate as Aya, support Morgan, and never present the assistant as the principal.' +
+        '\n\nYour email signature:\n\nAya | EA to Morgan',
+    });
+    const [chatSection] = await getRequiredProjectDocSections(chat);
+    expect(chatSection).toEqual({
       name: 'Assistant Identity',
       body: 'Aya is the assistant. Morgan is the principal. They are separate people: act and communicate as Aya, support Morgan, and never present the assistant as the principal.',
     });
@@ -957,6 +968,10 @@ describe("the principal's name and timezone (R16, KTD9)", () => {
   });
 
   it("changes the name on main's word: live readers use it at once, and the principal gets one receipt", async () => {
+    const ee = group('ag-external-email', 'external-email');
+    await createGroup(ee);
+    await recordExternalEmailAgentGroupId(ee.id);
+
     const response = await run('principal-profile-set', { name: 'Juno Hale' }, agent(main.id));
 
     expect(response).toMatchObject({
@@ -972,16 +987,16 @@ describe("the principal's name and timezone (R16, KTD9)", () => {
     expect(response).toMatchObject({
       data: {
         message: expect.stringContaining(
-          "The host's email signatures and external-email's offered times use the new values now. Your own clock and the identity in your instructions follow at your next start, with nothing for you to do.",
+          "The times external-email offers use the new values now. Your own clock and the identity in your instructions follow at your next start; external-email's identity and email signature follow at its next start, with nothing for you to do.",
         ),
       },
     });
     expect(await nameAndTimezone()).toEqual({ name: 'Juno Hale', timezone: 'America/Los_Angeles' });
-    // The signature reads the profile at each send.
-    expect(emailSignature(await getGwsEaProfile())).toBe('Aya | EA to Juno Hale');
     // main's identity text is composed at its next start, from the profile.
     const [section] = await getRequiredProjectDocSections(main);
     expect(section?.body).toContain('Juno Hale is the principal.');
+    const [emailIdentity] = await getRequiredProjectDocSections(ee);
+    expect(emailIdentity?.body).toContain('Your email signature:\n\nAya | EA to Juno Hale');
     expect(sent).toHaveLength(1);
     expect(sent[0]).toContain('Morgan Ellery');
     expect(sent[0]).toContain('Juno Hale');
