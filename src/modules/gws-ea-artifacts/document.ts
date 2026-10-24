@@ -14,6 +14,9 @@ export interface ArtifactDocument {
   readonly staticHtml: string;
   readonly sources: readonly ArtifactSourceLink[];
   readonly handlerHashes: readonly string[];
+  /** Authored script or inline handlers exist. A scripted page never gets direct link navigation. */
+  readonly scripted: boolean;
+  readonly lang: string;
 }
 const BLOCKED = new Set([
   'base',
@@ -50,7 +53,12 @@ const URL_ATTRIBUTES = new Set([
   'longdesc',
   'manifest',
 ]);
-const SOURCE_LINK_ATTRIBUTES = new Set(['href', 'target', 'data-artifact-source', 'role', 'tabindex']);
+const SOURCE_LINK_ATTRIBUTES = new Set(['href', 'target', 'rel', 'data-artifact-source', 'role', 'tabindex']);
+const TEL_LINK = /^tel:\+?[0-9][0-9 ().-]{2,30}$/u;
+// One address and nothing else: no headers or body that could carry page content into a message.
+const MAILTO_LINK = /^mailto:[^\s?#&,;:<>"'@]+@[^\s?#&,;:<>"'@]+\.[a-z]{2,}$/iu;
+const LANG = /^[a-z]{2,3}(?:-[a-z0-9]{2,8})*$/iu;
+export const ARTIFACT_STATIC_NOTICE = 'The controls on this page work in Chrome on a computer or an Android phone.';
 const DATA_IMAGE = /^data:image\/(?:png|jpeg|gif|webp|avif);base64,[a-z0-9+/=\s]+$/iu;
 const DATA_CSS = /^data:(?:image\/(?:png|jpeg|gif|webp|avif)|font\/(?:woff2?|ttf|otf));base64,[a-z0-9+/=\s]+$/iu;
 function isElement(node: Node): node is Element {
@@ -90,11 +98,12 @@ export function parseArtifactDocument(html: string): ArtifactDocument {
     },
   });
   const sources: ArtifactSourceLink[] = [];
+  const sourceAnchors: Array<{ readonly element: Element; readonly url: string }> = [];
+  let contactLinks = 0;
   const handlerHashes = new Set<string>();
-  let hasUnavailableInteractions = false;
+  let scripted = false;
   walk(document, (element) => {
-    if (['script', 'input', 'button', 'select', 'textarea'].includes(element.tagName))
-      hasUnavailableInteractions = true;
+    if (element.tagName === 'script') scripted = true;
     if (BLOCKED.has(element.tagName)) throw new Error(`Unsupported artifact element: ${element.tagName}.`);
     if (element.tagName === 'meta' && element.attrs.some((attribute) => attribute.name === 'http-equiv'))
       throw new Error('HTTP meta directives are unsupported.');
@@ -103,18 +112,30 @@ export function parseArtifactDocument(html: string): ArtifactDocument {
     if (element.tagName === 'style') assertCss(textContent(element));
     for (const attribute of [...element.attrs]) {
       const name = attribute.name.toLowerCase();
-      if (name.startsWith('on'))
+      if (name.startsWith('on')) {
+        scripted = true;
         handlerHashes.add(`'sha256-${createHash('sha256').update(attribute.value).digest('base64')}'`);
-      if (name.startsWith('on') || name === 'contenteditable') hasUnavailableInteractions = true;
+      }
       if (name === 'style') assertCss(attribute.value);
       if (['srcset', 'imagesrcset', 'ping', 'download', 'form', 'autofocus', 'is'].includes(name))
         throw new Error(`Unsupported artifact attribute: ${name}.`);
       if (!URL_ATTRIBUTES.has(name)) continue;
       if ((element.tagName === 'a' || element.tagName === 'area') && name === 'href') {
-        if (attribute.value.startsWith('#')) continue;
+        const value = attribute.value.trim();
+        if (value.startsWith('#')) continue;
+        if (/^(?:tel|mailto):/iu.test(value)) {
+          if (!TEL_LINK.test(value) && !MAILTO_LINK.test(value))
+            throw new Error('Phone links take only a number, and email links only one address.');
+          contactLinks += 1;
+          // In its own frame the viewer's frame policy would replace the page with an error; a new context
+          // hands the number or address to the device and leaves the page in place.
+          element.attrs = element.attrs.filter(({ name }) => name === 'href' || !SOURCE_LINK_ATTRIBUTES.has(name));
+          element.attrs.push({ name: 'target', value: '_blank' }, { name: 'rel', value: 'noopener noreferrer' });
+          continue;
+        }
         let url: URL;
         try {
-          url = new URL(attribute.value);
+          url = new URL(value);
         } catch (error) {
           if (error instanceof TypeError)
             throw new Error('Source links must be absolute HTTPS URLs.', { cause: error });
@@ -124,12 +145,7 @@ export function parseArtifactDocument(html: string): ArtifactDocument {
           throw new Error('Source links must be canonical HTTPS URLs without credentials.');
         const id = `source-${sources.length + 1}`;
         sources.push({ id, label: textContent(element).trim().slice(0, 180) || url.hostname, url: url.href });
-        element.attrs = element.attrs.filter(({ name: attributeName }) => !SOURCE_LINK_ATTRIBUTES.has(attributeName));
-        element.attrs.push(
-          { name: 'data-artifact-source', value: id },
-          { name: 'role', value: 'button' },
-          { name: 'tabindex', value: '0' },
-        );
+        sourceAnchors.push({ element, url: url.href });
       } else if (name === 'href' && attribute.value.startsWith('#')) {
         continue;
       } else if (name === 'src' && element.tagName === 'img' && DATA_IMAGE.test(attribute.value)) {
@@ -139,6 +155,27 @@ export function parseArtifactDocument(html: string): ArtifactDocument {
   });
   if (handlerHashes.size > 128)
     throw new Error('Use script event listeners instead of more than 128 distinct inline event handlers.');
+  if (scripted && contactLinks > 0) throw new Error('Phone and email links need a page without scripts.');
+  // A page without authored script keeps ordinary links: nothing on it can follow one without the reader.
+  // A scripted page hands each exact parsed source to the trusted viewer for a deliberate second step.
+  sourceAnchors.forEach(({ element, url }, index) => {
+    element.attrs = element.attrs.filter(({ name }) => !SOURCE_LINK_ATTRIBUTES.has(name));
+    element.attrs.push(
+      ...(scripted
+        ? [
+            { name: 'data-artifact-source', value: sources[index].id },
+            { name: 'role', value: 'button' },
+            { name: 'tabindex', value: '0' },
+          ]
+        : [
+            { name: 'href', value: url },
+            { name: 'target', value: '_blank' },
+            { name: 'rel', value: 'noopener noreferrer' },
+          ]),
+    );
+  });
+  const root = document.childNodes.filter(isElement).find((node) => node.tagName === 'html');
+  const declaredLang = root?.attrs.find((attribute) => attribute.name === 'lang')?.value.trim() ?? '';
   const normalized = serialize(document);
   const fallback = parse(normalized);
   function makeStatic(node: Node): void {
@@ -151,7 +188,8 @@ export function parseArtifactDocument(html: string): ArtifactDocument {
         (attribute) =>
           !attribute.name.toLowerCase().startsWith('on') && !['nonce', 'contenteditable'].includes(attribute.name),
       );
-      if (['input', 'button', 'select', 'textarea'].includes(node.tagName)) {
+      // Controls on an unscripted page can only drive CSS, which works everywhere; scripted controls cannot.
+      if (scripted && ['input', 'button', 'select', 'textarea'].includes(node.tagName)) {
         removeAttribute(node, 'disabled');
         node.attrs.push({ name: 'disabled', value: '' });
         const style = node.attrs.find((attribute) => attribute.name === 'style');
@@ -164,21 +202,29 @@ export function parseArtifactDocument(html: string): ArtifactDocument {
   }
   makeStatic(fallback);
   walk(fallback, (element) => {
-    if (element.tagName !== 'body' || !hasUnavailableInteractions) return;
+    if (element.tagName !== 'body' || !scripted) return;
     const notice = defaultTreeAdapter.createElement('aside', htmlNamespace.NS.HTML, [
       { name: 'role', value: 'note' },
+      { name: 'data-artifact-notice', value: '' },
       {
         name: 'style',
         value:
-          'display:block!important;font:14px/1.5 system-ui,sans-serif!important;color:#36475b!important;background:#f0f4f8!important;padding:10px 16px!important;margin:0 0 16px!important;border:0!important',
+          'display:block!important;font:14px/1.5 system-ui,sans-serif!important;color:inherit!important;background:rgba(127,127,127,.14)!important;padding:10px 16px!important;margin:0 0 16px!important;border:0!important',
       },
     ]);
-    defaultTreeAdapter.insertText(notice, 'Interactive controls are unavailable in this browser.');
+    defaultTreeAdapter.insertText(notice, ARTIFACT_STATIC_NOTICE);
     const first = element.childNodes[0];
     if (first) defaultTreeAdapter.insertBefore(element, notice, first);
     else defaultTreeAdapter.appendChild(element, notice);
   });
-  return { html: normalized, staticHtml: serialize(fallback), sources, handlerHashes: [...handlerHashes] };
+  return {
+    html: normalized,
+    staticHtml: serialize(fallback),
+    sources,
+    handlerHashes: [...handlerHashes],
+    scripted,
+    lang: LANG.test(declaredLang) ? declaredLang : 'en',
+  };
 }
 /** Add the trusted response nonce through the parser, including scripts nested in templates. */
 export function artifactExecutableHtml(document: ArtifactDocument, nonce: string): string {

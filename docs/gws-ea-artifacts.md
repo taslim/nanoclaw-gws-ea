@@ -8,8 +8,11 @@ and design guidance, then saves it through the native artifact tools.
 All essential information is present in the initial document. Local scripts may
 filter, sort or calculate embedded information. They cannot submit data, send
 messages, command an agent or perform account actions. A browser without verified
-network isolation receives the complete static view; controls that need scripts
-are unavailable. A document that is entirely static needs no warning.
+network isolation receives the complete static view, with a note that the
+controls work in Chrome on a computer or an Android phone. A document without
+authored script is served with no script at all: its links open in a new tab in
+one tap, and it may carry `tel:` (a number only) and `mailto:` (one address,
+nothing else) links.
 
 ## Operation and access
 
@@ -110,11 +113,18 @@ Encoded/constructed values and rasterized text remain matcher limitations.
 
 The host parses with `parse5` and rejects remote assets, forms, frames and other
 unsupported surfaces. A trusted wrapper hosts an opaque sandboxed child and
-restrictive CSP. The child receives enforced empty `Connection-Allowlist`.
-Authored scripts start only after supported-engine/version checks and a
-non-egressing enforcement probe verify the browser's control. CSP or request
-interception alone is not that proof. HTTPS source anchors become exact targets
-in a trusted parent control for deliberate reader navigation.
+restrictive CSP. A document without authored script or inline handlers gets
+`script-src 'none'` and a sandbox that only lets its own links open new tabs
+(`allow-popups allow-popups-to-escape-sandbox`): with no script on the page,
+nothing can follow a link without the reader, so its HTTPS, `tel:` and `mailto:`
+anchors stay ordinary links opening in a new context. A scripted child gets
+`sandbox allow-scripts` and an enforced empty `Connection-Allowlist`. Its authored
+scripts start only after supported-engine/version checks and a non-egressing
+enforcement probe verify the browser's control, during which the static notice
+stays hidden. CSP or request interception alone is not that proof. Its HTTPS
+source anchors become exact targets in a trusted parent control for deliberate
+reader navigation, and it may not carry `tel:` or `mailto:` links. The wrapper
+follows the reader's light or dark preference and the document's `lang`.
 
 The loopback origin validates configured host, canonical path and current local
 object state on every GET/HEAD, including each hash-pinned child response. Private

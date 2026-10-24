@@ -1,6 +1,6 @@
 import fs from 'node:fs';
 import { describe, expect, it } from 'vitest';
-import { parseArtifactDocument } from './document.js';
+import { ARTIFACT_STATIC_NOTICE, parseArtifactDocument } from './document.js';
 
 describe('artifact document policy', () => {
   it('keeps information while removing every static executable surface and suppressing controls', () => {
@@ -9,8 +9,9 @@ describe('artifact document policy', () => {
     );
     expect(document.staticHtml).toContain('Base case: $42');
     expect(document.staticHtml).toContain('<text>42</text>');
+    expect(document.scripted).toBe(true);
     expect(document.staticHtml).toContain('disabled=""');
-    expect(document.staticHtml).toContain('Interactive controls are unavailable');
+    expect(document.staticHtml).toContain(ARTIFACT_STATIC_NOTICE);
     expect(document.staticHtml).not.toContain('<script');
     expect(document.staticHtml).not.toContain('onclick');
     expect(document.html).toContain('onclick');
@@ -19,17 +20,63 @@ describe('artifact document policy', () => {
     const document = parseArtifactDocument(
       '<!doctype html><h1>Decision brief</h1><p>Choose the local option.</p><details><summary>Evidence</summary><p>Nearby facts</p></details>',
     );
+    expect(document.scripted).toBe(false);
     expect(document.staticHtml).toContain('<details>');
     expect(document.staticHtml).toContain('Nearby facts');
-    expect(document.staticHtml).not.toContain('Interactive controls are unavailable');
+    expect(document.staticHtml).not.toContain(ARTIFACT_STATIC_NOTICE);
   });
-  it('extracts exact HTTPS sources, leaves fragments local, and never puts external hrefs in the child', () => {
+  it('leaves controls on an unscripted page usable for CSS, without claiming they need another browser', () => {
     const document = parseArtifactDocument(
-      '<!doctype html><a href="https://example.com/p?a=1&amp;b=2">Evidence</a><a href="#detail">Detail</a><h2 id="detail">Details</h2>',
+      '<!doctype html><label><input type="checkbox" id="nonstop"> Nonstop only</label><p>Flights</p>',
+    );
+    expect(document.scripted).toBe(false);
+    expect(document.staticHtml).not.toContain('disabled');
+    expect(document.staticHtml).not.toContain(ARTIFACT_STATIC_NOTICE);
+  });
+  it('reads a well-formed page language and otherwise falls back to English', () => {
+    expect(parseArtifactDocument('<!doctype html><html lang="pt-BR"><p>Olá</p></html>').lang).toBe('pt-BR');
+    expect(parseArtifactDocument('<!doctype html><html lang="en&quot;><x"><p>Hi</p></html>').lang).toBe('en');
+    expect(parseArtifactDocument('<!doctype html><p>Hi</p>').lang).toBe('en');
+  });
+  it('keeps ordinary new-tab links on an unscripted page and lists their exact sources', () => {
+    const document = parseArtifactDocument(
+      '<!doctype html><a href="https://example.com/p?a=1&amp;b=2" target="_self" rel="opener">Evidence</a><a href="#detail">Detail</a><h2 id="detail">Details</h2>',
     );
     expect(document.sources).toEqual([{ id: 'source-1', label: 'Evidence', url: 'https://example.com/p?a=1&b=2' }]);
-    expect(document.html).not.toContain('href="https:');
+    expect(document.html).toContain(
+      '<a href="https://example.com/p?a=1&amp;b=2" target="_blank" rel="noopener noreferrer">Evidence</a>',
+    );
     expect(document.html).toContain('href="#detail"');
+  });
+  it('never puts an external href in a scripted page, handing each exact source to the viewer instead', () => {
+    const document = parseArtifactDocument(
+      '<!doctype html><a href="https://example.com/p">Evidence</a><script>document.title="x"</script>',
+    );
+    expect(document.sources).toEqual([{ id: 'source-1', label: 'Evidence', url: 'https://example.com/p' }]);
+    expect(document.html).not.toContain('href="https:');
+    expect(document.html).toContain('data-artifact-source="source-1"');
+  });
+  it('allows a bare phone number or one email address on an unscripted page only', () => {
+    const document = parseArtifactDocument(
+      '<!doctype html><a href="tel:+1 415-555-0148">+1 415-555-0148</a><a href="mailto:host@example.com">host@example.com</a>',
+    );
+    expect(document.sources).toEqual([]);
+    expect(document.html).toContain(
+      '<a href="tel:+1 415-555-0148" target="_blank" rel="noopener noreferrer">+1 415-555-0148</a>',
+    );
+    expect(document.html).toContain(
+      '<a href="mailto:host@example.com" target="_blank" rel="noopener noreferrer">host@example.com</a>',
+    );
+    expect(() =>
+      parseArtifactDocument('<!doctype html><a href="tel:+14155550148">Call</a><script>void 0</script>'),
+    ).toThrow('without scripts');
+    for (const href of [
+      'mailto:host@example.com?body=private',
+      'mailto:a@example.com,b@example.com',
+      'tel:call-me',
+      'tel:+1;ext=2',
+    ])
+      expect(() => parseArtifactDocument(`<!doctype html><a href="${href}">Contact</a>`), href).toThrow();
   });
   it('rejects oversized source and ambiguous duplicate HTML attributes before rendering', () => {
     expect(() => parseArtifactDocument('x'.repeat(4 * 1024 * 1024 + 1))).toThrow('4 MiB');

@@ -26,7 +26,7 @@ Use for what the reader acts on: when, where, who, cost, confirmation, deadline.
 </dl>
 ```
 
-Use `code` for confirmation numbers and identifiers; one tap selects the whole code. Put phone numbers in `<span class="nowrap">` so they never break across lines. A `dd` may hold a second line in `<small>`. Keep `dt`/`dd` pairs as direct children, without wrapper `div`s.
+Use `code` for confirmation numbers and identifiers; one tap selects the whole code. Make a phone number or an email address tappable, and keep it on one line, with `<a class="nowrap" href="tel:…">` or `<a class="nowrap" href="mailto:…">`. A `dd` may hold a second line in `<small>`. Keep `dt`/`dd` pairs as direct children, without wrapper `div`s.
 
 ## Options side by side
 
@@ -198,4 +198,4 @@ A script earns its place only when a desktop reader will try their own numbers, 
 </script>
 ```
 
-Phones and Safari never run it, and the viewer then notes that controls are unavailable. Put the hidden container after the content it enhances, so revealing it does not push the reading position.
+Phones and Safari never run it, and the viewer notes where the controls work. A script also sends every link through the viewer's list and rules out phone and email links. Put the hidden container after the content it enhances, so revealing it does not push the reading position.

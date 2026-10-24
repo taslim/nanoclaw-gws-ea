@@ -43,6 +43,33 @@ it.each([
   expect(bootstrap).toContain("$&amp; $` $'");
   expect(() => new Script(bootstrap)).not.toThrow();
 });
+it('runs no script on an unscripted page and lets only its own links leave, while scripted pages stay isolated', () => {
+  const plain = parseArtifactDocument('<!doctype html><html lang="pt"><a href="https://example.com/a">A</a></html>');
+  const plainChild = renderArtifactChild({ document: plain, nonce });
+  expect(plainChild.body).not.toContain('<script');
+  expect(plainChild.headers['content-security-policy']).toContain("script-src 'none'");
+  expect(plainChild.headers['content-security-policy']).toContain(
+    'sandbox allow-popups allow-popups-to-escape-sandbox',
+  );
+  expect(plainChild.headers['connection-allowlist']).toBeUndefined();
+  const plainViewer = renderArtifactViewer({
+    document: plain,
+    nonce,
+    title: 'Plan',
+    childUrl: 'https://views.example.com/a/frame/x',
+  }).body;
+  expect(plainViewer).toContain('<html lang="pt">');
+  expect(plainViewer).toContain('sandbox="allow-popups allow-popups-to-escape-sandbox"');
+  expect(plainViewer).not.toContain('<script');
+  const scripted = parseArtifactDocument('<!doctype html><a href="https://example.com/a">A</a><script>void 0</script>');
+  const scriptedChild = renderArtifactChild({ document: scripted, nonce });
+  expect(scriptedChild.headers['content-security-policy']).toMatch(/sandbox allow-scripts$/u);
+  expect(scriptedChild.headers['connection-allowlist']).toBeDefined();
+  expect(
+    renderArtifactViewer({ document: scripted, nonce, title: 'Plan', childUrl: 'https://views.example.com/a/frame/x' })
+      .body,
+  ).toContain('sandbox="allow-scripts"');
+});
 const fixtureHtml = `<!doctype html><html><head><style>body{font:18px system-ui;margin:20px}button,input{font:inherit}svg{max-width:100%}</style></head><body><h1>Budget scenario</h1><p>Base budget: $42</p><label>Multiplier <input id="factor" type="number" value="2"></label><button id="calculate">Calculate</button><output id="result">84</output><p><a href="https://example.com/source">Evidence</a></p><script>document.querySelector('#calculate').addEventListener('click',()=>document.querySelector('#result').textContent=42*Number(document.querySelector('#factor').value));</script></body></html>`;
 let browser: Browser;
 let server: Server;
@@ -130,6 +157,7 @@ describe.skipIf(!executablePath)('actual Chromium artifact boundary', () => {
     try {
       const frame = page.frames()[1];
       await frame.waitForFunction("document.documentElement.dataset.artifactMode === 'interactive'");
+      expect(await frame.locator('[data-artifact-notice]').count()).toBe(0);
       await frame.locator('#factor').fill('3');
       await frame.locator('#calculate').focus();
       await page.keyboard.press('Enter');
@@ -149,11 +177,17 @@ describe.skipIf(!executablePath)('actual Chromium artifact boundary', () => {
         '<!doctype html><h1>Readable complete information</h1><button onclick="document.body.textContent=\'LEAK\'">Action</button><script>document.body.textContent="LEAK"</script>';
       const { context, page } = await pageFixture(fixtureMode === 'unsupported' ? 'Firefox/150' : undefined);
       try {
-        await page.waitForTimeout(1_050);
+        // A capable Chromium hides the notice while it verifies isolation, so it never flashes there.
+        await page.waitForTimeout(250);
+        expect(await page.frames()[1].locator('[data-artifact-notice]').isVisible()).toBe(
+          fixtureMode === 'unsupported',
+        );
+        await page.waitForTimeout(800);
         const frame = page.frames()[1];
         expect(await frame.locator('body').textContent()).toContain('Readable complete information');
         expect(await frame.locator('button').isDisabled()).toBe(true);
         expect(await frame.locator('html').getAttribute('data-artifact-mode')).toBeNull();
+        expect(await frame.locator('[data-artifact-notice]').isVisible()).toBe(true);
       } finally {
         await context.close();
       }
@@ -168,17 +202,48 @@ describe.skipIf(!executablePath)('actual Chromium artifact boundary', () => {
       expect(await page.locator('details').getAttribute('open')).toBeNull();
       await page.frames()[1].waitForFunction("document.documentElement.dataset.artifactMode === 'interactive'");
       await page.frames()[1].waitForFunction("document.readyState === 'complete'");
-      await page.frames()[1].locator('[data-artifact-source]').click();
+      // Local headless Chrome intermittently drops synthetic mouse input that opens a tab; keyboard activation
+      // is a real user gesture and exercises the same link policy.
+      await page.frames()[1].locator('[data-artifact-source]').focus();
+      await page.keyboard.press('Enter');
       await page.locator('details[open]').waitFor({ timeout: 1500 });
       expect(await page.locator('a#source-1').getAttribute('href')).toBe('https://example.com/source');
+      expect(await page.evaluate('document.activeElement?.id')).toBe('source-1');
       const popupRequest = page.waitForEvent('popup', { timeout: 1500 });
       await context.route('https://example.com/source', (route) =>
         route.fulfill({ status: 200, body: 'Deliberate source' }),
       );
-      await page.locator('a#source-1').click();
+      await page.keyboard.press('Enter');
       const popup = await popupRequest;
       await popup.waitForLoadState();
       expect(await popup.content()).toContain('Deliberate source');
+    } finally {
+      await context.close();
+    }
+  });
+  it("opens an unscripted page's own link in one tap while the page runs no script at all", async () => {
+    mode = 'enforced';
+    source =
+      '<!doctype html><html lang="pt"><h1>Plain page</h1><p><a href="https://example.com/direct">Direct source</a></p><p><a href="#end">Jump</a></p><p id="end">End</p></html>';
+    const { context, page } = await pageFixture();
+    try {
+      expect(await page.locator('html').getAttribute('lang')).toBe('pt');
+      const frame = page.frames()[1];
+      await frame.locator('a[href="https://example.com/direct"]').waitFor();
+      expect(await frame.evaluate('document.scripts.length')).toBe(0);
+      await context.route('https://example.com/direct', (route) =>
+        route.fulfill({ status: 200, body: 'Direct source opened' }),
+      );
+      const popupRequest = page.waitForEvent('popup', { timeout: 3000 });
+      await frame.locator('a[href="https://example.com/direct"]').focus();
+      await page.keyboard.press('Enter');
+      const popup = await popupRequest;
+      await popup.waitForLoadState();
+      expect(await popup.content()).toContain('Direct source opened');
+      expect(await page.locator('details').getAttribute('open')).toBeNull();
+      await frame.locator('a[href="#end"]').focus();
+      await page.keyboard.press('Enter');
+      expect(frame.url()).toBe(`${origin}/frame#end`);
     } finally {
       await context.close();
     }

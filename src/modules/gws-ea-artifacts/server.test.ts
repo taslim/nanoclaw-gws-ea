@@ -70,7 +70,9 @@ describe('view-only artifact origin', () => {
       expect(await wrapper.text()).toContain(`${route}/frame/${sourceHash}`);
       const child = await request(`${route}/frame/${sourceHash}`);
       expect(child.status).toBe(200);
-      expect(child.headers.get('connection-allowlist')).toBe('(); report-to=gws-ea-artifact-isolation');
+      // A script-free revision runs no script at all, so no connection allowlist is needed (or sent).
+      expect(child.headers.get('content-security-policy')).toContain("script-src 'none'");
+      expect(child.headers.get('connection-allowlist')).toBeNull();
       const head = await request(route, 'HEAD');
       expect(head.status).toBe(200);
       expect(await head.text()).toBe('');

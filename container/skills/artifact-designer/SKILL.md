@@ -89,16 +89,22 @@ An eyebrow label, a badge, a card, an icon, a large number or a gradient belongs
 
 The static page carries every fact. Native `details` and `#` links work everywhere.
 
-Add a script only when a desktop reader gains something the page cannot otherwise give, such as trying their own numbers or narrowing dozens of rows. On phones the script never runs, and the viewer adds a note that controls are unavailable. The pattern is in elements.md.
+Add a script only when a desktop reader gains something the page cannot otherwise give, such as trying their own numbers or narrowing dozens of rows. That gain costs something:
+
+- on phones the script never runs, and the viewer notes that the controls work in Chrome on a computer or Android;
+- every link then takes a second tap through the viewer's list;
+- phone and email links are refused.
+
+The pattern is in elements.md.
 
 ## What the viewer allows
 
 - **One self-contained file.** Inline styles, inline `<svg>` and inline scripts only. No remote files, fonts, frames or forms.
 - **Images only when the picture informs,** and only as `data:` PNG, JPEG, GIF, WebP or AVIF.
 - **Links:**
-  - HTTPS links open through the viewer's source list, which takes a second tap. Link the few that matter, with text that says what they are.
+  - On a page without scripts, HTTPS links open in a new tab with one tap. Link the few that matter, with text that says what they are.
+  - On a page without scripts, phone numbers and email addresses can be tapped: `tel:` takes the number only, and `mailto:` one address with nothing after it.
   - `#` links jump within the page.
-  - `tel:` and `mailto:` are refused, so write phone numbers and email addresses as text.
 - **CSS:**
   - It cannot contain a backslash; type the character itself.
   - `url()` takes only `data:` or `#id`.
