@@ -31,7 +31,6 @@ import './gws-ea-google/index.js';
 import './gws-ea-chat/index.js';
 import './gws-ea-whatsapp/index.js';
 import './gws-ea-voice/index.js';
-// Character and identity precede role guidance in every composed document.
 import './gws-ea-profile/index.js';
 import './gws-ea-main/index.js';
 import './gws-ea-preferences/index.js';

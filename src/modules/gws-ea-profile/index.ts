@@ -95,7 +95,6 @@ function assistantAddressSentence(assistant: string, email: string | null): stri
   return ` ${assistant}'s own Google Workspace address is ${quotedAddress(email)}.`;
 }
 
-/** The browser recognizes the principal's addresses without disclosing them to a site. */
 function browserPrincipalAddressesSentence(principal: string, emails: readonly string[]): string {
   if (emails.length === 0) return '';
   const quoted = LIST.format(emails.map((email) => `\`${email}\``));
@@ -114,11 +113,6 @@ function browserPrincipalAddressesSentence(principal: string, emails: readonly s
 export const MAIN_PRINCIPAL_ADDRESSES_POINTER =
   " Read `ncl principal-addresses list` before identifying the principal's calendars or using their access. Its addresses and `calendar_access` are the only current copy; either may have changed since your last read.";
 
-/**
- * Names, roles and the addresses each audience needs. Main reads the principal's
- * addresses live; outside email gets its signature, and outside chats names only.
- * The browser recognizes principal addresses but receives no conversation address.
- */
 async function identitySection(group: AgentGroup): Promise<{ name: string; body: string } | undefined> {
   if (!(await getDb().hasTable('gws_ea_profile'))) return undefined;
   const profile = await getGwsEaProfile();

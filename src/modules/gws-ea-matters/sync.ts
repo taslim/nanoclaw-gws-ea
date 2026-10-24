@@ -213,7 +213,6 @@ async function unreadNotes(): Promise<number> {
   return count;
 }
 
-/** Morning rundown tasks use today's list as their script, whatever the principal named them. */
 async function morningRundowns(timezone: string): Promise<string[]> {
   const today = localDay(new Date().toISOString(), timezone);
   const times: string[] = [];
@@ -240,7 +239,6 @@ async function morningRundowns(timezone: string): Promise<string[]> {
   return times.sort().map((at) => `Morning rundown: ${formatLocalTime(at, timezone)}.`);
 }
 
-/** Always wake main to look ahead, with host facts that help it avoid duplicate morning messages. */
 export async function syncVerdict(): Promise<ScriptVerdict> {
   const timezone = await principalTimezone();
   const [notes, unplaced, sync, looks, rundowns] = await Promise.all([
