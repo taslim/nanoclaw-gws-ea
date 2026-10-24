@@ -177,6 +177,8 @@ describe('the daily sync', () => {
     const [after] = await syncs();
     expect(await syncs()).toHaveLength(1);
     expect(after).toMatchObject({ recurrence: '30 5 * * *' });
+    // Today's run keeps its time; the new hours take over from tomorrow.
+    expect(after.process_after).toBe(before.process_after);
     expect(after.series_id).not.toBe(before.series_id);
     expect(taskRows(await mainSession()).find((row) => row.id === before.id)?.status).toBe('cancelled');
   });

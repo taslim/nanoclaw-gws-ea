@@ -1133,10 +1133,10 @@ async function deliverPurchaseCommitAnswer(request: BrowserRequest, frame: Respo
           job.id,
         )
       : undefined;
-  const notice = purchaseCommitNotice(stopped, authority, data, {
+  const notice = await purchaseCommitNotice(stopped, authority, data, {
     incident,
     now: new Date().toISOString(),
-    principalTimeZone: await principalClock(),
+    principalClock,
   });
   try {
     await writeBrowserNotice(

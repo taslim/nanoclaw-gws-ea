@@ -85,16 +85,17 @@ interface PurchaseCommitNotice {
   readonly safe_to_rebuild: boolean;
   readonly repeat_safe: boolean;
 }
-export function purchaseCommitNotice(
+export async function purchaseCommitNotice(
   stopped: boolean,
   authority: SpendingAuthority,
   data: Record<string, unknown>,
   facts: {
     readonly incident: { kind: IncidentKind; site: string } | undefined;
     readonly now: string;
-    readonly principalTimeZone: string;
+    /** Read only for the two answers that state the approval's expiry, so the others never depend on it. */
+    readonly principalClock: () => Promise<string>;
   },
-): PurchaseCommitNotice {
+): Promise<PurchaseCommitNotice> {
   const none = 'No purchase was attempted';
   const told = (message: string, rebuild = false, repeatSafe = false): PurchaseCommitNotice => ({
     message,
@@ -116,8 +117,8 @@ export function purchaseCommitNotice(
     return told(
       `${none}: the principal's approval expired before the checkout could go through. Report it to the agent that sent this errand.`,
     );
-  const holds = (): string =>
-    `The principal's approval holds until it expires, ${formatLocalTimeWithZone(authority.expires_at, facts.principalTimeZone)}.`;
+  const holds = async (): Promise<string> =>
+    `The principal's approval holds until it expires, ${formatLocalTimeWithZone(authority.expires_at, await facts.principalClock())}.`;
   if (
     unspent &&
     (data.status === 'checkout_lapsed' ||
@@ -129,11 +130,11 @@ export function purchaseCommitNotice(
     );
   if (data.status === 'waiting_on_earlier')
     return told(
-      `${none}: an earlier purchase on this site is waiting for its outcome to be recorded. Browse on; when the host wakes you, rebuild the checkout from a fresh observation and call purchase. ${holds()}`,
+      `${none}: an earlier purchase on this site is waiting for its outcome to be recorded. Browse on; when the host wakes you, rebuild the checkout from a fresh observation and call purchase. ${await holds()}`,
     );
   if (data.status === 'site_purchase_blocked' || (data.status === 'stopped' && data.reason === 'site_busy'))
     return told(
-      `${none}: another errand holds this site. The host wakes you when it is free; then call purchase again. ${holds()}`,
+      `${none}: another errand holds this site. The host wakes you when it is free; then call purchase again. ${await holds()}`,
       false,
       data.repeat_safe === true,
     );

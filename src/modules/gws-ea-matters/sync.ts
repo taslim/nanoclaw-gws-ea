@@ -140,7 +140,7 @@ async function occurrenceTaken({ session, task }: HeldTask): Promise<boolean> {
  * next pass replaces that successor. A due occurrence the runner has claimed
  * or finished runs its course, and is replaced the same way once re-armed.
  * Any other pending occurrence that is overdue or due today keeps its time
- * when the release changes. The caller holds `oneAtATime`.
+ * when the release or the principal's working hours change. The caller holds `oneAtATime`.
  */
 export async function keepSync(conversation: Session): Promise<string> {
   const timezone = await resolveGroupTimezone(conversation.agent_group_id);
@@ -159,10 +159,9 @@ export async function keepSync(conversation: Session): Promise<string> {
     if (sameContent && sameSchedule) return task.processAfter;
     if (due && (await occurrenceTaken(held))) return task.processAfter;
   }
+  // A changed prompt, script or schedule takes over from the next run; today's run keeps its time.
   const keepTime =
     task.status === 'pending' &&
-    !sameContent &&
-    sameSchedule &&
     task.processAfter !== null &&
     (due || localDay(task.processAfter, timezone) === localDay(new Date().toISOString(), timezone));
   await cancelTaskSeries(seriesKey(task));

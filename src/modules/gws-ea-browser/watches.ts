@@ -23,6 +23,7 @@ import { getDb } from '../../db/connection.js';
 import type { DbDriver } from '../../db/driver.js';
 import { getPendingApproval } from '../../db/sessions.js';
 import { DENY, HOLD, defineGuardedAction, guard } from '../../guard/index.js';
+import { log } from '../../log.js';
 import { isRecord } from '../../gws-ea/validation.js';
 import { ianaTimezone } from '../../timezone.js';
 import { finishApprovalWithdrawal, registerApprovalHandler, requestApproval } from '../approvals/index.js';
@@ -578,8 +579,15 @@ async function settleWatchOutcome({ approval, outcome, reason }: ApprovalResolve
   if (typeof payload.watchId !== 'string') return;
   const watchId = payload.watchId;
   const db = getDb();
-  // Read the delegators' names before the transaction: the policy file is no part of it.
-  const delegators = outcome === 'reject' ? await browserDelegators() : [];
+  // Read the delegators' names before the transaction: the policy file is no part of it. A name is
+  // only wording, so a failed read leaves the notice addressed to the agent that sent the errand.
+  const delegators =
+    outcome === 'reject'
+      ? await browserDelegators().catch((error: unknown) => {
+          log.warn('A declined watch names no delegator: the browser policy could not be read', { error });
+          return [];
+        })
+      : [];
   await db.transaction(async () => {
     const watch = await getBrowserWatch(watchId, db);
     const status = outcome === 'expired' ? 'expired' : 'cancelled';
