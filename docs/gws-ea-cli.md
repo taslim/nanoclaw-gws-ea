@@ -75,6 +75,16 @@ Degraded and unknown observations still exit 0: read the facts, not only the exi
 Unknown or unreachable services and consumers do not establish health or drainage.
 Human times use the install timezone; machine observations are ISO UTC.
 
+“Last observed agent outcome (main)” shows the last terminal provider turn in main's
+selected conversation, with its provider, observation time, and safe failure cause.
+It is historical evidence, separate from conversation readiness and task or delivery
+success. JSON carries it in `data.main_turn`, outside `data.probes`. A later
+successful provider result replaces a failure, including a turn with no response
+text. Missing or malformed state and a different configured provider leave `last`
+null with a reason. Restarting or replacing credentials does not update the record.
+A recorded credential failure includes sign-in guidance. This observation does not
+cover every agent or establish that all external effects of a turn succeeded.
+
 `gws-ea --version` identifies this tool's package version and exact checkout
 revision. An assistant's deployed revision is a separate fact in `status`.
 

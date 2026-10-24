@@ -7,6 +7,168 @@ import { formatMessages, extractRouting, isClearCommand, isRunnerCommand } from 
 import { dispatchResultText, processQuery, runPollLoop } from './poll-loop.js';
 import { MockProvider } from './providers/mock.js';
 import type { AgentQuery, ProviderEvent, ProviderExchange } from './providers/types.js';
+import { recordProviderTurn } from './db/session-state.js';
+import { getAgentMailbox } from './mailbox/index.js';
+import type { ProviderTurnOutcome } from './mailbox/model.generated.js';
+
+function latestTurn(): ProviderTurnOutcome | null {
+  const row = getOutboundDb().prepare('SELECT value FROM session_state WHERE key = ?').get('latest_provider_turn') as {
+    value: string;
+  } | null;
+  return row ? (JSON.parse(row.value) as ProviderTurnOutcome) : null;
+}
+
+describe('latest provider turn observation', () => {
+  it('records a bounded failed result and replaces it with silent provider success', async () => {
+    const events = async function* (): AsyncGenerator<ProviderEvent> {
+      yield { type: 'result', text: null, isError: true, error: 'private diagnostic', failure: 'credentials' };
+      expect(latestTurn()).toMatchObject({ version: 1, provider: 'mock', status: 'failed', cause: 'credentials' });
+      expect(JSON.stringify(latestTurn())).not.toContain('private diagnostic');
+      yield { type: 'result', text: null };
+    };
+    await processQuery(
+      { events: events(), push: () => {}, end: () => {}, abort: () => {} },
+      { platformId: null, channelType: null, threadId: null, inReplyTo: 'm1' },
+      ['m1'],
+      'mock',
+      undefined,
+      'work',
+      undefined,
+    );
+    expect(latestTurn()).toEqual({
+      version: 1,
+      provider: 'mock',
+      observedAt: expect.stringMatching(/^\d{4}-\d{2}-\d{2}T.*Z$/u),
+      status: 'completed',
+      cause: null,
+    });
+  });
+
+  it.each(['billing', undefined] as const)('records failed results with safe cause %s', async (failure) => {
+    await processQuery(
+      {
+        events: (async function* (): AsyncGenerator<ProviderEvent> {
+          yield { type: 'result', text: null, isError: true, failure, error: 'private prompt and error' };
+        })(),
+        push: () => {},
+        end: () => {},
+        abort: () => {},
+      },
+      { platformId: null, channelType: null, threadId: null, inReplyTo: 'm1' },
+      ['m1'],
+      'mock',
+      undefined,
+      'work',
+      undefined,
+    );
+    expect(latestTurn()).toMatchObject({ status: 'failed', cause: failure ?? 'unknown' });
+    expect(JSON.stringify(latestTurn())).not.toContain('private');
+  });
+
+  it.each(['eof', 'throw'] as const)('records an unfinished provider %s without raw diagnostics', async (ending) => {
+    const work = processQuery(
+      {
+        events: (async function* (): AsyncGenerator<ProviderEvent> {
+          if (ending === 'throw') throw new Error('private diagnostic');
+        })(),
+        push: () => {},
+        end: () => {},
+        abort: () => {},
+      },
+      { platformId: null, channelType: null, threadId: null, inReplyTo: 'm1', taskRun: true },
+      ['m1'],
+      'mock',
+      undefined,
+      'work',
+      undefined,
+    );
+    if (ending === 'throw') await expect(work).rejects.toThrow('private diagnostic');
+    else await work;
+    expect(latestTurn()).toMatchObject({ status: 'failed', cause: 'unknown' });
+    expect(JSON.stringify(latestTurn())).not.toContain('private');
+  });
+
+  it.each(['eof', 'throw', 'result'] as const)(
+    'preserves the preceding observation on explicit cancellation ending in %s',
+    async (ending) => {
+      recordProviderTurn('mock', true, 'billing');
+      const previous = latestTurn();
+      const controller = new AbortController();
+      const work = processQuery(
+        {
+          events: (async function* (): AsyncGenerator<ProviderEvent> {
+            controller.abort();
+            if (ending === 'throw') throw new Error('cancelled');
+            if (ending === 'result') yield { type: 'result', text: null, isError: true };
+          })(),
+          push: () => {},
+          end: () => {},
+          abort: () => {},
+        },
+        { platformId: null, channelType: null, threadId: null, inReplyTo: 'm1' },
+        ['m1'],
+        'mock',
+        undefined,
+        'work',
+        undefined,
+        false,
+        controller.signal,
+      );
+      if (ending === 'throw') await expect(work).rejects.toThrow('cancelled');
+      else await work;
+      expect(latestTurn()).toEqual(previous);
+    },
+  );
+
+  it('preserves the completed provider result when task-log delivery throws', async () => {
+    recordProviderTurn('mock', true, 'credentials');
+    const write = spyOn(getAgentMailbox().operations, 'writeMessageOut').mockRejectedValueOnce(
+      new Error('delivery failed'),
+    );
+    try {
+      await expect(
+        processQuery(
+          {
+            events: (async function* (): AsyncGenerator<ProviderEvent> {
+              yield { type: 'result', text: 'task summary' };
+            })(),
+            push: () => {},
+            end: () => {},
+            abort: () => {},
+          },
+          { platformId: null, channelType: null, threadId: null, inReplyTo: 'm1', taskRun: true },
+          ['m1'],
+          'mock',
+          undefined,
+          'work',
+          undefined,
+        ),
+      ).rejects.toThrow('delivery failed');
+      expect(latestTurn()).toMatchObject({ status: 'completed', cause: null });
+    } finally {
+      write.mockRestore();
+    }
+  });
+
+  it('records synchronous query creation failure without settling the input', async () => {
+    insertMessage('creation', 'chat', { text: 'work' });
+    const provider = new MockProvider();
+    const query = spyOn(provider, 'query').mockImplementation(() => {
+      throw new Error('creation failed');
+    });
+    try {
+      await expect(runPollLoop({ provider, providerName: 'mock', cwd: '/workspace' })).rejects.toThrow(
+        'creation failed',
+      );
+      expect(latestTurn()).toMatchObject({ status: 'failed', cause: 'unknown' });
+      expect(
+        getOutboundDb().prepare('SELECT status FROM processing_ack WHERE message_id = ?').get('creation'),
+      ).toMatchObject({ status: 'processing' });
+    } finally {
+      query.mockRestore();
+    }
+  });
+});
 
 beforeEach(() => {
   initTestSessionDb();
@@ -731,6 +893,10 @@ describe('task-run turn wiring (real processQuery)', () => {
     );
 
     expect(taskLogRows()).toEqual([{ text: '[undelivered → main] Completed before failure. Backend failed.' }]);
+    expect(latestTurn()).toMatchObject({ status: 'failed', cause: 'unknown' });
+    expect(getOutboundDb().prepare('SELECT status FROM processing_ack WHERE message_id = ?').get('t1')).toEqual({
+      status: 'completed',
+    });
     expect(getUndeliveredMessages().filter((row) => row.kind === 'chat')).toHaveLength(0);
     expect(exchanges).toEqual([{ prompt: 'prompt', result: text, continuation: 'sess-1', status: 'error' }]);
     expect(pushes).toHaveLength(0);

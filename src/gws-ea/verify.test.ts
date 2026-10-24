@@ -17,6 +17,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { principalWelcomeEventId, type PrincipalBinding } from './principal.js';
 import {
   readLatestDelivery,
+  readLatestProviderTurn,
   readSchemaManifest,
   verifyPrincipalBinding,
   verifyTalkableConversation,
@@ -428,6 +429,86 @@ describe('talkable conversation verification', () => {
 });
 
 describe('read-only observation', () => {
+  function seedProviderTurn(value: string, provider: string | null = null): void {
+    const central = new Database(path.join(checkout, 'data', 'v2.db'));
+    try {
+      central
+        .prepare(
+          'INSERT INTO container_configs (agent_group_id, provider, updated_at) VALUES (?, ?, ?) ON CONFLICT(agent_group_id) DO UPDATE SET provider = excluded.provider',
+        )
+        .run(MAIN, provider, BOUND_AT);
+    } finally {
+      central.close();
+    }
+    const outbound = new Database(host.outboundDbPath(MAIN, sessionId));
+    try {
+      outbound
+        .prepare('INSERT OR REPLACE INTO session_state (key, value, updated_at) VALUES (?, ?, ?)')
+        .run('latest_provider_turn', value, BOUND_AT);
+    } finally {
+      outbound.close();
+    }
+  }
+
+  const failedTurn = { version: 1, provider: 'claude', observedAt: BOUND_AT, status: 'failed', cause: 'credentials' };
+
+  it('reads only the bounded latest terminal result and current effective provider', () => {
+    seedProviderTurn(JSON.stringify(failedTurn));
+    expect(readLatestProviderTurn(checkout)).toEqual({
+      mainAgentGroupId: MAIN,
+      sessionId,
+      provider: 'claude',
+      last: failedTurn,
+    });
+    seedProviderTurn(JSON.stringify({ ...failedTurn, status: 'completed', cause: null }), 'codex');
+    expect(readLatestProviderTurn(checkout)).toMatchObject({
+      provider: 'codex',
+      last: { provider: 'claude', status: 'completed' },
+    });
+  });
+
+  it('uses the runner’s Claude fallback for an empty configured provider', () => {
+    seedProviderTurn(JSON.stringify(failedTurn), '');
+    expect(readLatestProviderTurn(checkout)).toMatchObject({ provider: 'claude', last: failedTurn });
+  });
+
+  it.each([
+    'not json',
+    '{}',
+    JSON.stringify({ ...failedTurn, version: 0 }),
+    JSON.stringify({ ...failedTurn, cause: 'raw diagnostic' }),
+    JSON.stringify({ ...failedTurn, observedAt: '2026-09-18' }),
+    JSON.stringify({ ...failedTurn, error: 'private diagnostic' }),
+    JSON.stringify({ ...failedTurn, provider: 'private\nvalue' }),
+    JSON.stringify({ ...failedTurn, status: 'completed' }),
+  ])('treats malformed or legacy terminal state as unobserved: %s', (value) => {
+    seedProviderTurn(value);
+    expect(readLatestProviderTurn(checkout)?.last).toBeUndefined();
+  });
+
+  it('does not inherit a removed main or a newly selected conversation’s old observation', () => {
+    seedProviderTurn(JSON.stringify(failedTurn));
+    const central = new Database(path.join(checkout, 'data', 'v2.db'));
+    try {
+      central.prepare('UPDATE sessions SET status = ? WHERE id = ?').run('closed', sessionId);
+    } finally {
+      central.close();
+    }
+    expect(readLatestProviderTurn(checkout)).toMatchObject({ sessionId: undefined, last: undefined });
+    const reopened = new Database(path.join(checkout, 'data', 'v2.db'));
+    try {
+      reopened.exec('UPDATE gws_ea_profile SET main_agent_group_id = NULL');
+    } finally {
+      reopened.close();
+    }
+    expect(readLatestProviderTurn(checkout)).toBeUndefined();
+  });
+
+  it('has no terminal evidence before the new runtime records a result', () => {
+    expect(readLatestProviderTurn(checkout)?.last).toBeUndefined();
+    expect(readLatestProviderTurn(path.join(checkout, 'missing'))).toBeUndefined();
+  });
+
   it("reads the latest delivery result of main's conversation, and the replies the host is still retrying", async () => {
     expect(readLatestDelivery(checkout)).toEqual({
       mainAgentGroupId: MAIN,

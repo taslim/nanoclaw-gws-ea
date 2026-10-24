@@ -4,7 +4,7 @@ import { getPendingMessages } from './db/messages-in.js';
 import { getUndeliveredMessages } from './db/messages-out.js';
 import { getCurrentReplyRoute, getContinuation, setContinuation } from './db/session-state.js';
 import { getAgentMailbox } from './mailbox/index.js';
-import { closeSessionDb, getInboundDb, initTestSessionDb } from './mailbox/sqlite/connection.js';
+import { closeSessionDb, getInboundDb, getOutboundDb, initTestSessionDb } from './mailbox/sqlite/connection.js';
 import { runPollLoop } from './poll-loop.js';
 import type { AgentProvider, ProviderEvent, ProviderExchange } from './providers/types.js';
 
@@ -130,6 +130,9 @@ describe('provider throws with active or queued turns', () => {
       ['Answered A', 'thread-a', 'request-a'],
     ]);
     expect(failedTurnThreads()).toEqual(['thread-b']);
+    expect(
+      getOutboundDb().prepare("SELECT value FROM session_state WHERE key = 'latest_provider_turn'").get(),
+    ).toMatchObject({ value: expect.stringContaining('"status":"failed"') });
   });
 
   it('preserves a partial answer and reports every abandoned route once, including still-queued turns', async () => {
@@ -195,6 +198,9 @@ describe('provider throws with active or queued turns', () => {
     });
     expect(visibleRows().map((row) => JSON.parse(row.content).text)).toEqual(['Answered A', 'Answered B']);
     expect(failedTurnThreads()).toEqual([]);
+    expect(
+      getOutboundDb().prepare("SELECT value FROM session_state WHERE key = 'latest_provider_turn'").get(),
+    ).toMatchObject({ value: expect.stringContaining('"status":"completed"') });
   });
 
   it('masks an initial provider throw before any result', async () => {

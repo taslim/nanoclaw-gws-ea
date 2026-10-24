@@ -171,6 +171,17 @@ export const STATUS_DATA_SCHEMA = object({
     latest_migration: nullable(text),
     reason: nullable(text),
   }),
+  main_turn: object({
+    provider: nullable(text),
+    last: nullable(
+      object({
+        status: choices('completed', 'failed'),
+        at: time,
+        cause: nullable(choices('credentials', 'billing', 'unknown')),
+      }),
+    ),
+    reason: nullable(text),
+  }),
   probes,
 });
 const artifactReceipt = object({ file: text, size: count, sha256: text });
