@@ -254,18 +254,24 @@ describe('held messages', () => {
 });
 
 describe('unread context', () => {
-  it('counts the due rows that wake nothing, leaving out triggers, rows read or not yet due, and the channel named', () => {
+  it('counts readable due context, excluding tool replies, triggers, read or future rows, and the named channel', () => {
     if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
     fs.mkdirSync(TEST_DIR, { recursive: true });
     ensureSchema(DB_PATH, 'inbound');
     const db = new Database(DB_PATH);
     const write = (
       id: string,
-      options: { trigger: boolean; channelType?: string; processAfter?: string; status?: 'held' },
+      options: {
+        trigger: boolean;
+        kind?: 'chat' | 'system';
+        channelType?: string;
+        processAfter?: string;
+        status?: 'held';
+      },
     ): void =>
       insertMessage(db, {
         id,
-        kind: 'chat',
+        kind: options.kind ?? 'chat',
         timestamp: new Date().toISOString(),
         platformId: 'chat:dm-morgan',
         channelType: options.channelType ?? 'chat',
@@ -284,9 +290,15 @@ describe('unread context', () => {
     write('echo', { trigger: false, channelType: 'session-echo' });
     write('message', { trigger: true });
     write('held', { trigger: false, status: 'held' });
+    write('tool-reply', { trigger: false, kind: 'system' });
     db.prepare("UPDATE messages_in SET status = 'completed' WHERE id = 'note-read'").run();
 
     expect(countUnreadContext(db, 'session-echo')).toBe(2);
+    expect(db.prepare('SELECT kind, status, trigger FROM messages_in WHERE id = ?').get('tool-reply')).toEqual({
+      kind: 'system',
+      status: 'pending',
+      trigger: 0,
+    });
     db.close();
   });
 });

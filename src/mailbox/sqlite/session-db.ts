@@ -126,8 +126,8 @@ export function countDueMessages(db: Database.Database): number {
 
 /**
  * How many due messages wait, waking nothing, as context for the session's
- * next turn: pending rows that are not triggers, other than those on
- * `exceptChannelType`.
+ * next turn: pending non-trigger rows, excluding system tool replies and
+ * those on `exceptChannelType`.
  */
 export function countUnreadContext(db: Database.Database, exceptChannelType: string): number {
   return (
@@ -136,6 +136,7 @@ export function countUnreadContext(db: Database.Database, exceptChannelType: str
         `SELECT COUNT(*) as count FROM messages_in
        WHERE status = 'pending'
          AND trigger = 0
+         AND kind <> 'system'
          AND (channel_type IS NULL OR channel_type <> ?)
          AND (process_after IS NULL OR datetime(process_after) <= datetime('now'))`,
       )
