@@ -123,6 +123,16 @@ const probes = object({
     last: nullable(object({ status: text, message_out_id: text, at: time })),
     retrying: nullable(count),
   }),
+  main_turn: probe({
+    provider: nullable(text),
+    last: nullable(
+      object({
+        status: choices('completed', 'failed'),
+        at: time,
+        cause: nullable(choices('credentials', 'billing', 'unknown')),
+      }),
+    ),
+  }),
   web_alias: probe({
     state: nullable(choices('not_needed', 'pending', 'verified')),
     address: nullable(text),

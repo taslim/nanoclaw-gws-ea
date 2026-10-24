@@ -154,6 +154,47 @@ export interface StateRecord {
   updatedAt: IsoTimestamp;
 }
 
+/** The latest terminal provider turn, independent of delivery and task settlement. */
+export const LATEST_PROVIDER_TURN_KEY = 'latest_provider_turn';
+export type ProviderTurnCause = 'credentials' | 'billing' | 'unknown';
+export interface ProviderTurnOutcome {
+  readonly version: 1;
+  readonly provider: string;
+  readonly observedAt: IsoTimestamp;
+  readonly status: 'completed' | 'failed';
+  readonly cause: ProviderTurnCause | null;
+}
+
+/** Reject legacy or malformed state rather than treating it as evidence of recovery. */
+export function parseProviderTurnOutcome(value: unknown): ProviderTurnOutcome | undefined {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return undefined;
+  const row = value as Record<string, unknown>;
+  if (
+    Object.keys(row).sort().join(',') !== 'cause,observedAt,provider,status,version' ||
+    row.version !== 1 ||
+    typeof row.provider !== 'string' ||
+    !/^[a-z][a-z0-9_-]{0,63}$/u.test(row.provider) ||
+    (row.status !== 'completed' && row.status !== 'failed') ||
+    (row.status === 'completed'
+      ? row.cause !== null
+      : row.cause !== 'credentials' && row.cause !== 'billing' && row.cause !== 'unknown')
+  )
+    return undefined;
+  try {
+    const observedAt = parseIsoTimestamp(row.observedAt);
+    return {
+      version: 1,
+      provider: row.provider,
+      observedAt,
+      status: row.status,
+      cause: row.cause as ProviderTurnCause | null,
+    };
+    // eslint-disable-next-line no-catch-all/no-catch-all -- Invalid optional state is unknown evidence, never recovery.
+  } catch {
+    return undefined;
+  }
+}
+
 export interface ContainerRecord {
   currentTool: string | null;
   toolDeclaredTimeoutMs: number | null;

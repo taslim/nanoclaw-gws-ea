@@ -242,6 +242,8 @@ const SDK_NOTICES = new Map<string, { hint: string; failure?: ProviderFailure }>
  * notice: `<status> billing_error: <message>`, the API's own error type.
  */
 const BILLING_ERROR_ENTRY = /^\d{3} billing_error:/u;
+const REVOKED_OAUTH_NOTICE =
+  'Failed to authenticate: OAuth token revoked. Please log in again or contact your administrator.';
 
 /** The real clock for archive names and rotation stamps; tests hand the history functions a fixed one. */
 const REAL_CLOCK = { now: () => Date.now() };
@@ -407,6 +409,7 @@ export class ClaudeProvider implements AgentProvider {
     async function* translateEvents(): AsyncGenerator<ProviderEvent> {
       let messageCount = 0;
       let lastStreamActivityAt = 0;
+      let turnFailure: ProviderFailure | undefined;
       for await (const message of sdkResult) {
         if (aborted) return;
 
@@ -449,6 +452,13 @@ export class ClaudeProvider implements AgentProvider {
               .filter((block) => block.type === 'text' && block.text)
               .map((block) => block.text)
               .join('');
+            if (
+              'is_api_error_message' in message &&
+              message.is_api_error_message === true &&
+              message.error === 'authentication_failed' &&
+              text === REVOKED_OAUTH_NOTICE
+            )
+              turnFailure = 'credentials';
             if (text) yield { type: 'text', text };
           }
         } else if (message.type === 'result') {
@@ -456,8 +466,14 @@ export class ClaudeProvider implements AgentProvider {
           // (e.g. a non-retryable 403 billing_error) carry their message in
           // `errors[]` instead. Keep that actionable notice separate from
           // model output so the poll-loop can deliver it without scratchpad.
-          const m = message as { result?: string; is_error?: boolean; errors?: string[] };
-          const isError = m.is_error === true;
+          const m = message as {
+            result?: string;
+            is_error?: boolean;
+            errors?: string[];
+            api_error_status?: number | null;
+          };
+          const confirmedFailure = m.api_error_status === 401 ? turnFailure : undefined;
+          const isError = m.is_error === true || confirmedFailure !== undefined;
           // Some failures (e.g. an invalid API key) leave errors[] empty and put
           // the SDK's own notice in `result`. Other result text can echo upstream
           // bodies, so only exact fixed notices are reused; the rest stay generic.
@@ -466,8 +482,10 @@ export class ClaudeProvider implements AgentProvider {
           const notice = SDK_NOTICES.get(candidate);
           const resultAsError = notice ? `${candidate}\n${notice.hint}` : '';
           const failure: ProviderFailure | undefined =
+            confirmedFailure ??
             notice?.failure ??
             (isError && m.errors?.some((entry) => BILLING_ERROR_ENTRY.test(entry.trim())) ? 'billing' : undefined);
+          turnFailure = undefined;
           yield {
             type: 'result',
             text: resultAsError ? null : (m.result ?? null),

@@ -198,6 +198,45 @@ it('leaves a successful result untouched', async () => {
   ]);
 });
 
+it.each([true, false, undefined])(
+  'classifies revoked OAuth wire evidence with is_error=%s for its turn only',
+  async (isError) => {
+    const revoked = 'Failed to authenticate: OAuth token revoked. Please log in again or contact your administrator.';
+    sdkMessages.push({
+      type: 'assistant',
+      is_api_error_message: true,
+      error: 'authentication_failed',
+      message: {
+        content: [{ type: 'text', text: revoked }],
+      },
+    });
+    sdkMessages.push({ type: 'result', subtype: 'success', is_error: isError, api_error_status: 401, result: revoked });
+    sdkMessages.push({ type: 'result', is_error: false, result: '' });
+    expect(await resultEvents()).toEqual([
+      { type: 'result', text: revoked, isError: true, error: undefined, failure: 'credentials' },
+      { type: 'result', text: '', isError: false, error: undefined },
+    ]);
+  },
+);
+
+it.each([
+  { envelope: {}, status: 401 },
+  { envelope: { is_api_error_message: true, error: 'authentication_failed' }, status: 403 },
+  { envelope: { is_api_error_message: true, error: 'unknown' }, status: 401 },
+  { envelope: { is_api_error_message: true, error: 'authentication_failed' }, status: null },
+])('does not classify revoked-token wording without the evidenced API envelope %p', async ({ envelope, status }) => {
+  const revoked = 'Failed to authenticate: OAuth token revoked. Please log in again or contact your administrator.';
+  sdkMessages.push({
+    type: 'assistant',
+    ...envelope,
+    message: {
+      content: [{ type: 'text', text: revoked }],
+    },
+  });
+  sdkMessages.push({ type: 'result', subtype: 'success', is_error: true, api_error_status: status, result: revoked });
+  expect(await resultEvents()).toEqual([{ type: 'result', text: revoked, isError: true, error: undefined }]);
+});
+
 it("keeps the SDK's own auth notice out of the channel: the host hears the failed turn, its cause, and the notice for its log", async () => {
   sdkMessages.push({ type: 'result', subtype: 'success', is_error: true, result: AUTH_ERROR, errors: [] });
   const provider = createProvider('claude');

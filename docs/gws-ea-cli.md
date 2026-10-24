@@ -32,6 +32,15 @@ Degraded and unknown observations still exit 0: read the facts, not only the exi
 Unknown or unreachable services and consumers do not establish health or drainage.
 Human times use the install timezone; machine observations are ISO UTC.
 
+The `main_turn` probe shows the last observed terminal provider turn in main's
+selected conversation, with its provider, observation time, and safe failure cause.
+A failed turn degrades the conversation summary even when a scheduled occurrence
+or message delivery succeeded. A later successful provider result clears it,
+including a turn with no response text. Missing or malformed state and a different
+configured provider are unknown. Restarting, replacing credentials, or a healthy
+host does not prove provider recovery. This observation does not cover every agent
+or establish that all external effects of a turn succeeded.
+
 `gws-ea --version` identifies this tool's package version and exact checkout
 revision. An assistant's deployed revision is a separate fact in `status`.
 

@@ -27,6 +27,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { writePrivate } from '../community-portal/private-file.js';
 import { getInstallScopedNames } from '../install-slug.js';
+import { parseIsoTimestamp } from '../mailbox/model.js';
 import { formatLocalTime } from '../timezone.js';
 import { parseInvocation } from './command-parser.js';
 import releaseTracks from './release-tracks.json' with { type: 'json' };
@@ -525,6 +526,18 @@ function healthyObservers(state: World): StatusObservers {
     }),
     schema: () => MANIFEST,
     delivery: () => DELIVERED,
+    mainTurn: () => ({
+      mainAgentGroupId: MAIN,
+      sessionId: SESSION,
+      provider: 'claude',
+      last: {
+        version: 1,
+        provider: 'claude',
+        observedAt: parseIsoTimestamp(DELIVERED_AT),
+        status: 'completed',
+        cause: null,
+      },
+    }),
     google: async (_runtime, declaredEmail) => ({ status: 'connected', account: declaredEmail }),
   };
 }
@@ -578,6 +591,77 @@ interface StatusShape {
 }
 
 describe('status', () => {
+  it('keeps failed main turns visible beside healthy scheduling, host, and delivery observations', async () => {
+    const host = await machine();
+    const reservation = await assistant(host, { label: 'alpha', port: 36_001 });
+    const state = world(reservation);
+    const observers: StatusObservers = {
+      ...healthyObservers(state),
+      mainTurn: () => ({
+        mainAgentGroupId: MAIN,
+        sessionId: SESSION,
+        provider: 'claude',
+        last: {
+          version: 1,
+          provider: 'claude',
+          observedAt: parseIsoTimestamp(DELIVERED_AT),
+          status: 'failed',
+          cause: 'credentials',
+        },
+      }),
+    };
+    const { status, nextActions } = await statusJson(host, state, reservation.instance_id, observers);
+    expect(status.probes.main_turn).toMatchObject({
+      status: 'degraded',
+      provider: 'claude',
+      last: { status: 'failed', at: DELIVERED_AT, cause: 'credentials' },
+    });
+    expect(status.probes.delivery.status).toBe('ok');
+    expect(status.probes.host.status).toBe('ok');
+    expect(nextActions).toContainEqual(
+      expect.objectContaining({ kind: 'external', instruction: expect.stringContaining('provider sign-in') }),
+    );
+    const { runtime, output } = command(host, state, observers);
+    await runStatusCommand(runtime, { instanceId: reservation.instance_id, json: false });
+    expect(output.stdout.join('\n')).toContain('Conversation: degraded (main_turn)');
+    expect(output.stdout.join('\n')).toContain(
+      `claude: last observed turn failed ${formatLocalTime(DELIVERED_AT, 'America/New_York')} (credentials)`,
+    );
+  });
+
+  it.each(['missing', 'provider mismatch', 'read failure'] as const)(
+    'reports main turn unknown for %s',
+    async (scenario) => {
+      const host = await machine();
+      const reservation = await assistant(host, { label: 'alpha', port: 36_001 });
+      const state = world(reservation);
+      const observers: StatusObservers = {
+        ...healthyObservers(state),
+        mainTurn: () => {
+          if (scenario === 'read failure') throw new Error('private provider diagnostic');
+          if (scenario === 'missing') return undefined;
+          return {
+            mainAgentGroupId: MAIN,
+            sessionId: SESSION,
+            provider: 'codex',
+            last: {
+              version: 1,
+              provider: 'claude',
+              observedAt: parseIsoTimestamp(DELIVERED_AT),
+              status: 'completed',
+              cause: null,
+            },
+          };
+        },
+      };
+      const { status, output } = await statusJson(host, state, reservation.instance_id, observers);
+      expect(status.probes.main_turn).toMatchObject({ status: 'unknown', last: null });
+      expect(output.stdout.join('\n')).not.toContain('private provider diagnostic');
+      const text = command(host, state, observers);
+      await runStatusCommand(text.runtime, { instanceId: reservation.instance_id, json: false });
+      expect(text.output.stdout.join('\n')).toContain('Conversation: unknown (main_turn)');
+    },
+  );
   it('reports every probe as ok for a healthy assistant, with its release, rollback, and schema facts', async () => {
     const host = await machine();
     const reservation = await assistant(host, { label: 'alpha', port: 36_001 });
@@ -1729,6 +1813,7 @@ function hostDatabases(checkout: string, migrations: readonly string[]): void {
       CREATE TABLE sessions (
         id TEXT PRIMARY KEY, agent_group_id TEXT, messaging_group_id TEXT, thread_id TEXT, status TEXT, created_at TEXT
       );
+      CREATE TABLE container_configs (agent_group_id TEXT PRIMARY KEY, provider TEXT);
       CREATE TABLE delivery_attempts (
         message_id TEXT PRIMARY KEY, session_id TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,
         last_attempt_at TEXT, next_attempt_at TEXT, last_error TEXT
@@ -1738,6 +1823,7 @@ function hostDatabases(checkout: string, migrations: readonly string[]): void {
       central.prepare('INSERT INTO schema_version VALUES (?, ?, ?)').run(index + 1, name, NOW.toISOString()),
     );
     central.prepare('INSERT INTO gws_ea_profile VALUES (1, ?)').run(MAIN);
+    central.prepare('INSERT INTO container_configs VALUES (?, NULL)').run(MAIN);
     central
       .prepare("INSERT INTO sessions VALUES (?, ?, 'mg-principal', NULL, 'active', ?)")
       .run(SESSION, MAIN, NOW.toISOString());
@@ -1757,6 +1843,20 @@ async function sessionMailbox(checkout: string): Promise<void> {
     inbound.prepare("INSERT INTO delivered VALUES ('out-welcome', NULL, 'delivered', ?)").run(DELIVERED_AT);
   } finally {
     inbound.close();
+  }
+  const outbound = new Database(path.join(directory, 'outbound.db'));
+  try {
+    outbound.pragma('journal_mode = WAL');
+    outbound.exec('CREATE TABLE session_state (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL)');
+    outbound
+      .prepare('INSERT INTO session_state VALUES (?, ?, ?)')
+      .run(
+        'latest_provider_turn',
+        JSON.stringify({ version: 1, provider: 'claude', observedAt: DELIVERED_AT, status: 'completed', cause: null }),
+        DELIVERED_AT,
+      );
+  } finally {
+    outbound.close();
   }
 }
 
