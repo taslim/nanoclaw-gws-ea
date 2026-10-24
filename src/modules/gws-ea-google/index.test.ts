@@ -68,7 +68,7 @@ const SERVICE_COMMANDS = [
 
 /** Calendar procedures remain available on demand to every group holding the skill. */
 const REQUIRED_CALENDAR_RULES = [
-  'Use the `gog` command, through Bash, for everything you do in Google Calendar but three: create an event with the `create_event` tool, change who an event invites with `change_guests`, and answer for the principal with `respond_to_event`.',
+  'Use the `create_event`, `change_guests`, `respond_to_event` and `find_conflicts` tools for creating events, changing guests, answering for the principal and checking availability; use `gog` through Bash for every other Google Calendar operation.',
   'never run `gog auth`',
   "A calendar is the principal's when its ID (their primary calendar) or its `dataOwner` is one of the principal's addresses.",
   // The one rule the host recognizes them by (R1): never the exact spelling alone.

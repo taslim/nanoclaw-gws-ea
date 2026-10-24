@@ -30,8 +30,9 @@ Two files are always loaded:
   and the corrections that govern every conversation, as short dated facts)
   and a map of everything else. A correction gets its own dated line even when
   an existing Core Memory line points to a preferences or corrections file: the
-  pointer stays, and the correction goes beside it. Core Memory comes first, so
-  a cut never reaches it. Headlines and pointers only; detail belongs in linked
+  pointer stays, and the correction goes beside it. Core Memory comes first, ahead of
+  the Map if the index is cut, but must still fit within the available index
+  budget described below. Headlines and pointers only; detail belongs in linked
   files.
 - **The release's definition** tells the agent how its memory works: what to
   store, where to put it, and how to keep it true. It is read-only, and each
