@@ -5,7 +5,9 @@ import path from 'node:path';
 import { stripVTControlCharacters } from 'node:util';
 
 import { isErrno } from '../community-portal/errors.js';
+import { LATEST_PROVIDER_TURN_KEY, parseProviderTurnOutcome, type ProviderTurnOutcome } from '../mailbox/model.js';
 import type { ForgottenFingerprint } from '../modules/gws-ea-people/forget-handoff.js';
+import { resolveProviderName } from '../providers/provider-name.js';
 import type { SnapshotManifest } from './operation.js';
 import { principalWelcomeEventId, type PrincipalBinding } from './principal.js';
 import { redact } from './redact.js';
@@ -651,6 +653,65 @@ export function readLatestDelivery(stateRoot: string): LatestDelivery | undefine
     retrying,
     lastError,
   };
+}
+
+export interface LatestProviderTurn {
+  readonly mainAgentGroupId: string;
+  readonly sessionId: string | undefined;
+  /** Main's effective provider from its current container configuration. */
+  readonly provider: string | undefined;
+  readonly last: ProviderTurnOutcome | undefined;
+}
+
+/** Main's selected conversation only. Read physical state even while stopped or fenced. */
+export function readLatestProviderTurn(stateRoot: string): LatestProviderTurn | undefined {
+  const root = path.resolve(stateRoot);
+  const centralFile = centralDatabaseFile(root);
+  if (!existsSync(centralFile)) return undefined;
+  const central = openReadonly(centralFile);
+  let mainAgentGroupId: string;
+  let sessionId: string | undefined;
+  let provider: string | undefined;
+  try {
+    if (!hasTable(central, 'gws_ea_profile')) return undefined;
+    const profile = central.prepare('SELECT main_agent_group_id FROM gws_ea_profile WHERE singleton = 1').get() as
+      | { main_agent_group_id: string | null }
+      | undefined;
+    if (!profile?.main_agent_group_id) return undefined;
+    mainAgentGroupId = profile.main_agent_group_id;
+    sessionId = hasTable(central, 'sessions') ? mainSessionId(central, mainAgentGroupId) : undefined;
+    if (hasTable(central, 'container_configs')) {
+      const config = central
+        .prepare('SELECT provider FROM container_configs WHERE agent_group_id = ?')
+        .get(mainAgentGroupId) as { provider: string | null } | undefined;
+      if (config) {
+        const name = resolveProviderName(undefined, config.provider);
+        if (/^[a-z][a-z0-9_-]{0,63}$/u.test(name)) provider = name;
+      }
+    }
+  } finally {
+    central.close();
+  }
+  const result = { mainAgentGroupId, sessionId, provider, last: undefined };
+  if (!sessionId) return result;
+  const outboundFile = path.join(root, 'data', 'v2-sessions', mainAgentGroupId, sessionId, 'outbound.db');
+  if (!existsSync(outboundFile)) return result;
+  const outbound = openReadonly(outboundFile);
+  try {
+    if (!hasTable(outbound, 'session_state')) return result;
+    const row = outbound.prepare('SELECT value FROM session_state WHERE key = ?').get(LATEST_PROVIDER_TURN_KEY) as
+      | { value: string }
+      | undefined;
+    if (!row) return result;
+    try {
+      return { ...result, last: parseProviderTurnOutcome(JSON.parse(row.value) as unknown) };
+    } catch (error) {
+      if (error instanceof SyntaxError) return result;
+      throw error;
+    }
+  } finally {
+    outbound.close();
+  }
 }
 
 export interface InstanceErrorLog {

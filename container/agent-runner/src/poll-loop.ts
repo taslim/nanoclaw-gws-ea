@@ -19,6 +19,7 @@ import {
   migrateLegacyContinuation,
   setContinuation,
   setCurrentReplyRoute,
+  recordProviderTurn,
 } from './db/session-state.js';
 import {
   batchOf,
@@ -246,12 +247,18 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
 
     log(`Processing ${keep.length} message(s), kinds: ${[...new Set(keep.map((m) => m.kind))].join(',')}`);
 
-    const query = config.provider.query({
-      prompt,
-      continuation,
-      cwd: config.cwd,
-      systemContext: config.systemContext,
-    });
+    let query: AgentQuery;
+    try {
+      query = config.provider.query({
+        prompt,
+        continuation,
+        cwd: config.cwd,
+        systemContext: config.systemContext,
+      });
+    } catch (error) {
+      if (!config.signal?.aborted) recordProviderTurn(config.providerName, true);
+      throw error;
+    }
     // Process the query while concurrently polling for new messages
     const skippedSet = new Set(skipped.map((s) => s.id));
     const processingIds = ids.filter((id) => !commandIds.includes(id) && !skippedSet.has(id));
@@ -434,6 +441,8 @@ export async function processQuery(
   // push order (including retries) and advance at every result, mirroring
   // archivePrompts. An empty initial prompt (a pre-warmed query) starts idle.
   let answering = initialPrompt !== '';
+  // Iterator failures belong to the provider; dispatch/write failures do not.
+  let handlingEvent = false;
   type QueuedTurn = {
     routing: RoutingContext;
     unwrappedNudged: boolean;
@@ -607,6 +616,9 @@ export async function processQuery(
 
   try {
     for await (const event of query.events) {
+      handlingEvent = true;
+      if (event.type === 'result' && !endedForCommand && !signal?.aborted)
+        recordProviderTurn(providerName, event.isError === true, event.failure);
       handleEvent(event, routing);
       touchHeartbeat();
 
@@ -761,12 +773,16 @@ export async function processQuery(
         if (next) adoptTurn(next);
         else answering = false;
       }
+      handlingEvent = false;
     }
+    if (!endedForCommand && !signal?.aborted && (answering || queuedTurns.length > 0))
+      recordProviderTurn(providerName, true);
   } catch (err) {
     // Freeze the queue before awaiting notices. Follow-ups have already been
     // acknowledged, so an abandoned queued turn cannot rely on redelivery.
     done = true;
     const cancelled = endedForCommand || signal?.aborted;
+    if (!cancelled && !handlingEvent && (answering || queuedTurns.length > 0)) recordProviderTurn(providerName, true);
     const errMsg = err instanceof Error ? err.message : String(err);
     notifyExchangeComplete(onExchangeComplete, {
       prompt: archivePrompts[0] ?? initialPrompt,
@@ -1247,9 +1263,7 @@ function wasWrittenInSeqWindow(dest: DestinationEntry, body: string, afterSeq: n
   // door's row carries the batch beside its text (isDoorText).
   return chatRowsInWindow(afterSeq, uptoSeq).some(
     (message) =>
-      message.platform_id === platformId &&
-      message.channel_type === channelType &&
-      isDoorText(message.content, body),
+      message.platform_id === platformId && message.channel_type === channelType && isDoorText(message.content, body),
   );
 }
 

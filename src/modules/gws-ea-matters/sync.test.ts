@@ -37,6 +37,7 @@ vi.mock('../gws-ea-inbox/gmail-api.js', async (importOriginal) => ({
 import { dispatch } from '../../cli/dispatch.js';
 import type { CallerContext, ResponseFrame } from '../../cli/frame.js';
 import { closeDb, initTestDb, runMigrations } from '../../db/index.js';
+import { withExistingMailboxSession, writeSessionMessage } from '../../session-manager.js';
 import '../gws-ea-inbox/index.js';
 import { FakeGmailThreads } from '../gws-ea-inbox/testing/fake-gmail-threads.js';
 import { createThread, recordThreadAddresses, recordThreadMessage } from '../gws-ea-inbox/thread-map.js';
@@ -174,6 +175,37 @@ describe('the daily sync', () => {
     const quiet = await run('matters-sync', {});
     expect(quiet).toMatchObject({ ok: true, data: { wakeAgent: false } });
     expect(await runnerReads(printed(quiet), scratch)).toEqual({ wakeAgent: false });
+  });
+
+  it('stays quiet with a pending tool reply, but wakes for a readable note alongside it', async () => {
+    const main = await mainSession();
+    const reply = JSON.stringify({ action: 'cli_response', requestId: 'old-request', ok: true, data: [] });
+    await writeSessionMessage(main.agent_group_id, main.id, {
+      id: 'stale-tool-reply',
+      kind: 'system',
+      timestamp: MONDAY_6AM,
+      platformId: null,
+      channelType: null,
+      threadId: null,
+      content: reply,
+      processAfter: null,
+      recurrence: null,
+      trigger: false,
+    });
+
+    expect(await data(run('matters-sync', {}))).toEqual({ wakeAgent: false });
+    await note('readable-note', 'Calendar access needs attention.');
+    expect(await data(run('matters-sync', {}))).toEqual({
+      wakeAgent: true,
+      data: ['A note you have not read comes with this.'],
+    });
+    await answerOccurrence(main, 'readable-note', 'completed');
+    expect(await data(run('matters-sync', {}))).toEqual({ wakeAgent: false });
+    expect(
+      await withExistingMailboxSession(main.agent_group_id, main.id, (mailbox) =>
+        mailbox.getInboundRecords({ status: 'pending' }),
+      ),
+    ).toMatchObject([{ id: 'stale-tool-reply', kind: 'system', content: reply }]);
   });
 
   it('wakes main for the notes it has not read, and not once it has read them', async () => {

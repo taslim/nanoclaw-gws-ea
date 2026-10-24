@@ -21,6 +21,7 @@ import { createHash } from 'node:crypto';
 
 import { errorCode, isErrno } from '../community-portal/errors.js';
 import { getInstallScopedNames } from '../install-slug.js';
+import type { ProviderTurnCause } from '../mailbox/model.js';
 import { readBrowserPolicy } from '../modules/gws-ea-browser/policy.js';
 import type { ChatSubscriptionState } from '../modules/gws-ea-chat/health.js';
 import { formatLocalTime } from '../timezone.js';
@@ -77,9 +78,11 @@ import { GwsEaError, shortCommit, type InstanceReservation, type ReleaseCoordina
 import { isRecord, optionalString, unwrapData } from './validation.js';
 import {
   readLatestDelivery,
+  readLatestProviderTurn,
   readSchemaManifest,
   verifyPrincipalBinding,
   type LatestDelivery,
+  type LatestProviderTurn,
   type PrincipalBindingVerificationInput,
   type PrincipalBindingVerificationResult,
 } from './verify.js';
@@ -116,6 +119,17 @@ export interface DeliveryView {
   readonly status: string;
   readonly message_out_id: string;
   readonly at: string;
+}
+
+/** Historical provider evidence; it does not establish current conversation readiness. */
+export interface MainTurnView {
+  readonly provider: string | null;
+  readonly last: {
+    readonly status: 'completed' | 'failed';
+    readonly at: string;
+    readonly cause: ProviderTurnCause | null;
+  } | null;
+  readonly reason: string | null;
 }
 
 /** The facts a probe reports beside its status; each is null when it could not observe them. */
@@ -363,6 +377,7 @@ export interface AssistantStatus {
   readonly release: ReleaseView;
   readonly rollback: RollbackView;
   readonly schema: SchemaView;
+  readonly main_turn: MainTurnView;
   readonly probes: AssistantProbes;
 }
 
@@ -381,6 +396,7 @@ export interface StatusObservers {
   /** The schema the databases under a `data`-holding root record: the physical `state/`, or a kept release. */
   readonly schema: (stateRoot: string) => SnapshotManifest;
   readonly delivery: (stateRoot: string) => LatestDelivery | undefined;
+  readonly mainTurn: (stateRoot: string) => LatestProviderTurn | undefined;
   /** The assistant's Google connection, observed without changing it. */
   readonly google: (runtime: InstanceRuntimeConfig, declaredEmail: string) => Promise<GoogleConnectionReport>;
 }
@@ -462,6 +478,7 @@ function resolveObservers(overrides: Partial<StatusObservers> = {}): StatusObser
         observeGoogleConnection(runtime, declaredEmail, overrides.fetch ? { fetch: overrides.fetch } : {})),
     schema: overrides.schema ?? readSchemaManifest,
     delivery: overrides.delivery ?? readLatestDelivery,
+    mainTurn: overrides.mainTurn ?? readLatestProviderTurn,
   };
 }
 
@@ -1085,6 +1102,28 @@ async function deliveryProbe({ context, reservation, observers }: Subject): Prom
   return { ...OK, ...facts };
 }
 
+function observeMainTurn({ context, reservation, observers }: Subject): MainTurnView {
+  let seen: LatestProviderTurn | undefined;
+  try {
+    seen = observers.mainTurn(context.paths.instanceLayout(reservation.instance_id).state);
+    // eslint-disable-next-line no-catch-all/no-catch-all -- Observation failure is unknown; raw diagnostics must not enter operator output.
+  } catch {
+    return { reason: "Main's last provider turn could not be read.", provider: null, last: null };
+  }
+  const provider = seen?.provider ?? null;
+  if (!seen?.last || !provider || seen.last.provider !== provider)
+    return {
+      reason: 'No valid terminal turn is recorded for main’s current provider.',
+      provider,
+      last: null,
+    };
+  return {
+    provider,
+    last: { status: seen.last.status, at: seen.last.observedAt, cause: seen.last.cause },
+    reason: null,
+  };
+}
+
 /**
  * Whether the tool's own release is ahead of the assistant's, from the tool's
  * history alone: local and read-only, so `list` asks it of every assistant.
@@ -1313,6 +1352,7 @@ export async function observeAssistantStatus(
     ...record,
     rollback,
     schema: schemaView(live),
+    main_turn: observeMainTurn(subject),
     probes: {
       checkout,
       image,
@@ -1615,6 +1655,13 @@ function jobAgentLine(job: ChatAgentView): string {
   return `    ${job.agent_group_id ?? '(unknown)'}: ${job.state ?? 'unknown'}; chat ${job.messaging_group_id ?? '(unknown)'}; ${job.status}${job.reason ? `; ${job.reason}` : ''}`;
 }
 
+function mainTurnLine({ provider, last, reason }: MainTurnView, timezone: string): string {
+  const detail = last
+    ? `${provider}: ${last.status} ${formatLocalTime(last.at, timezone)}${last.cause ? ` (${last.cause})` : ''}`
+    : reason;
+  return `  Last observed agent outcome (main): ${detail}`;
+}
+
 function renderStatusDetails(status: AssistantStatus, timezone: string): string[] {
   const { registry, schema } = status;
   const operation = operationDetail(status.instance_id, status.operation, status.removal_in_progress);
@@ -1632,6 +1679,7 @@ function renderStatusDetails(status: AssistantStatus, timezone: string): string[
     `  Operation: ${operation.length === 0 ? 'none' : operation[0]!}`,
     ...operation.slice(1).map((line) => `             ${line}`),
     `  Schema:    ${schemaLine}`,
+    mainTurnLine(status.main_turn, timezone),
     'Probes:',
   ];
   for (const name of PROBE_NAMES) {
@@ -1683,6 +1731,7 @@ function renderStatus(status: AssistantStatus, timezone: string, details: boolea
     `  Account: ${status.registry.account}`,
     `  Service: ${status.probes.service.state}${status.probes.service.reason ? `; ${status.probes.service.reason}` : ''}`,
     `  Conversation: ${conversationSummary(status)}`,
+    mainTurnLine(status.main_turn, timezone),
     `  WhatsApp: ${probeDetail('whatsapp', status.probes, timezone)}${status.probes.whatsapp.reason ? `; ${status.probes.whatsapp.reason}` : ''}`,
     `  External chat: ${status.probes.external_chat.agent_group_id ?? 'unknown'}; ${status.probes.external_chat.status}${status.probes.external_chat.reason ? `; ${status.probes.external_chat.reason}` : ''}`,
     `  Job agents: ${probeDetail('job_agents', status.probes, timezone)}; ${status.probes.job_agents.status}`,
@@ -1725,6 +1774,12 @@ function statusActions(status: AssistantStatus): NextAction[] {
     actions.push(command('connect-google'));
   if (status.probes.web_alias.state === 'pending')
     actions.push({ kind: 'command', argv: webAliasArgv(status.instance_id, status.probes.web_alias) });
+  if (status.main_turn.last?.cause === 'credentials')
+    actions.push({
+      kind: 'external',
+      instruction:
+        "For the recorded credential failure, check this assistant's provider sign-in in its operator credential console. A later successful turn confirms recovery. Keep credentials out of chat.",
+    });
   // Voice is optional, and a web alias still pending is setup to finish: neither sends the operator to the logs.
   if (PROBE_NAMES.some((name) => name !== 'voice' && name !== 'web_alias' && status.probes[name].status !== 'ok'))
     actions.push({ kind: 'command', argv: ['gws-ea', 'logs', '--id', status.instance_id, '--errors'] });

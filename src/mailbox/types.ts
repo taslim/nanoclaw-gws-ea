@@ -132,7 +132,8 @@ export interface InboundMailbox {
   countDueMessages(): number;
   /**
    * How many due messages wait, waking nothing, as context for the next
-   * turn: pending non-trigger rows, other than those on `exceptChannelType`.
+   * turn: pending non-trigger rows, excluding system tool replies and those
+   * on `exceptChannelType`.
    */
   countUnreadContext(exceptChannelType: string): number;
   /**

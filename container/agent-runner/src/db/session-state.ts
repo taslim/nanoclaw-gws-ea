@@ -9,6 +9,12 @@
  * on file and resumes cleanly if the user flips back.
  */
 import { getAgentMailbox } from '../mailbox/index.js';
+import {
+  LATEST_PROVIDER_TURN_KEY,
+  parseIsoTimestamp,
+  type ProviderTurnCause,
+  type ProviderTurnOutcome,
+} from '../mailbox/model.generated.js';
 
 const LEGACY_KEY = 'sdk_session_id';
 
@@ -26,6 +32,20 @@ function setValue(key: string, value: string): void {
 
 function deleteValue(key: string): void {
   getAgentMailbox().operations.deleteState(key);
+}
+
+/** Only bounded provider facts enter operator state; diagnostics stay in existing logs. */
+export function recordProviderTurn(provider: string, failed: boolean, cause?: ProviderTurnCause): void {
+  setValue(
+    LATEST_PROVIDER_TURN_KEY,
+    JSON.stringify({
+      version: 1,
+      provider: provider.toLowerCase(),
+      observedAt: parseIsoTimestamp(new Date().toISOString()),
+      status: failed ? 'failed' : 'completed',
+      cause: failed ? (cause ?? 'unknown') : null,
+    } satisfies ProviderTurnOutcome),
+  );
 }
 
 /**
