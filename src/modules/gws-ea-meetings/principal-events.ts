@@ -525,7 +525,6 @@ export function createPrincipalEventTools(deps: PrincipalEventToolsDeps) {
         const name = calendarNames(listed, principal).get(entry.id);
         if (name !== undefined && !EMAIL_PATTERN.test(name.text)) spokenCalendar = calendarName(name);
       } catch (error) {
-        // The write succeeded; optional calendar naming cannot turn its confirmation into a failed action.
         log.warn('Calendar event was added, but its calendar name could not be read', { error });
       }
     }

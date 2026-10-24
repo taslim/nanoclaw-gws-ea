@@ -256,7 +256,6 @@ export function withholdModuleInstructions(
   instructionWithholdings.push({ modules, appliesTo });
 }
 
-/** The module documents a product withholds from this group now. */
 export async function getWithheldModuleInstructions(agentGroupId: string): Promise<ReadonlySet<string>> {
   const modules = new Set<string>();
   for (const withholding of instructionWithholdings) {
