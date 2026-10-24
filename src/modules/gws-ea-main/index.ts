@@ -52,13 +52,11 @@ async function mainAgentGroupId(): Promise<string | null> {
   return getMainAgentGroupId();
 }
 
-// Main's role teaches the ncl and task use it needs; shell remains available.
 withholdModuleInstructions(
   ['cli', 'scheduling', 'connect'],
   async (agentGroupId) => agentGroupId === (await mainAgentGroupId()),
 );
 
-/** Main receives new release defaults on its next create/update reconciliation. */
 export function mainCapabilitySelection(): string[] {
   return resolveCapabilities('all', 'main').filter((key) => key !== 'agents' && key !== 'self-mod');
 }
@@ -76,7 +74,6 @@ interface MainConfiguration {
   readonly capabilities: CapabilitySelection;
 }
 
-/** Set main's shared skills and release defaults, writing only when they differ. */
 async function reconcileMainConfiguration(agentGroupId: string): Promise<MainConfiguration> {
   const row = await getContainerConfig(agentGroupId);
   if (!row) throw new Error(`No container config for group: ${agentGroupId}`);
@@ -102,8 +99,6 @@ async function reconcileMainConfiguration(agentGroupId: string): Promise<MainCon
   };
 }
 
-// The lifecycle commands (create, update) set these lists through this command;
-// the host never rewrites it at start.
 register({
   name: 'gws-ea-main-reconcile',
   description: "Set canonical main's NanoClaw shared skills and capabilities to the release's selection.",

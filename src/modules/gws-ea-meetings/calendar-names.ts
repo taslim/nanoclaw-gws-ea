@@ -1,4 +1,3 @@
-/** Calendar names shared by the host's conflict and event answers. */
 import { EMAIL_PATTERN, identityMatchKey } from '../../gws-ea/validation.js';
 import { untrustedLine } from '../gws-ea-inbox/untrusted.js';
 import type { PrincipalRecognizer } from '../gws-ea-profile/db.js';
@@ -13,7 +12,6 @@ export function calendarName(name: CalendarName): string {
   return name.external ? untrustedLine(name.text, 64, 'google_calendar') : name.text;
 }
 
-/** Address-named calendars use spoken account names, keeping ambiguous names distinct. */
 export function calendarNames(
   entries: readonly CalendarEntry[],
   addresses: PrincipalRecognizer,
