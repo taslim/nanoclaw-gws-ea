@@ -11,83 +11,69 @@ importers:
       '@1password/sdk':
         specifier: 0.5.0
         version: 0.5.0
-
       '@chat-adapter/gchat':
         specifier: 4.41.1
         version: 4.41.1
-
       '@clack/core':
         specifier: ^1.2.0
         version: 1.2.0
-
       '@clack/prompts':
         specifier: ^1.2.0
         version: 1.2.0
-
       '@onecli-sh/sdk':
         specifier: 2.2.1
         version: 2.2.1
-
       '@whiskeysockets/baileys':
         specifier: 7.0.0-rc14
         version: 7.0.0-rc14(sharp@0.35.5(@types/node@22.19.17))
-
       better-sqlite3:
         specifier: 13.0.3
         version: 13.0.3
-
       chat:
         specifier: 4.41.1
         version: 4.41.1
-
       cron-parser:
         specifier: 5.5.0
         version: 5.5.0
-
       google-auth-library:
         specifier: 10.5.0
         version: 10.5.0
-
       ipaddr.js:
         specifier: 2.5.0
         version: 2.5.0
-
+      jose:
+        specifier: 6.2.13
+        version: 6.2.13
       kleur:
         specifier: ^4.1.5
         version: 4.1.5
-
       mdast-util-from-markdown:
         specifier: 2.0.3
         version: 2.0.3
-
       mdast-util-gfm:
         specifier: 3.1.0
         version: 3.1.0
-
       micromark:
         specifier: 4.0.2
         version: 4.0.2
-
       micromark-extension-gfm:
         specifier: 3.0.0
         version: 3.0.0
-
       micromark-util-sanitize-uri:
         specifier: 2.0.1
         version: 2.0.1
-
+      parse5:
+        specifier: 8.0.1
+        version: 8.0.1
       pino:
         specifier: 9.6.0
         version: 9.6.0
-
       playwright-core:
         specifier: 1.64.0
         version: 1.64.0
-
       tldts:
         specifier: 7.4.18
         version: 7.4.18
-
       undici:
         specifier: 7.30.1
         version: 7.30.1
@@ -1070,6 +1056,10 @@ packages:
   emoji-regex@9.2.2:
     resolution: {integrity: sha512-L18DaJsXSUk2+42pv8mLs5jJT2hqFkFE4j21wOmgbUqsZ2hL72NsUU785g9RXgo3s0ZNgVl42TiHp3ZtOv/Vyg==}
 
+  entities@8.1.0:
+    resolution: {integrity: sha512-kxL7msIffSuh9aaFAMD7rxAIuTRMAHMeBtgHW2yUdWw732ZNh4MehkF2gdjvtdmikkaIP9bFDDJOPlsvm7avrA==}
+    engines: {node: '>=20.19.0'}
+
   es-define-property@1.0.1:
     resolution: {integrity: sha512-e3nRfgfUZ4rNGL232gUgX06QNyyez04KdjFrF+LTRoOXmrOgFKDg4BCdsjW8EnT69eqdYGmRpJwiPVYNrCaW3g==}
     engines: {node: '>= 0.4'}
@@ -1361,6 +1351,9 @@ packages:
 
   jackspeak@3.4.3:
     resolution: {integrity: sha512-OGlZQpz2yfahA/Rd1Y8Cd9SIEsqvXkLVoSw/cgwhnhFMDbsQFeZYoJJ7bIZBS9BcamUW96asq/npPWugM+RQBw==}
+
+  jose@6.2.13:
+    resolution: {integrity: sha512-7TIg10ZE1x82YediN+lcrPNvGMKge9yFHQD+Qho/b8y2adfugU3AsvvHfxV0fzyFllT6l9xCjf4RWY9g/Z9PJQ==}
 
   js-yaml@4.3.2:
     resolution: {integrity: sha512-SFNOvSJ+Dgf/9An904Yx+CgSlIPCkIpao4qo51lpee25TIRejdH3rhR4EZMGoNx3/TP3O+wzWuiTFl4sqbltzA==}
@@ -1711,6 +1704,9 @@ packages:
   parent-module@1.0.1:
     resolution: {integrity: sha512-GQ2EWRpQV8/o+Aw8YqtfZZPfNRWZYkbidE9k5rpl/hC3vtHHBfGm2Ifi6qWV+coDGkrUKZAxE3Lot5kcsRlh+g==}
     engines: {node: '>=6'}
+
+  parse5@8.0.1:
+    resolution: {integrity: sha512-z1e/HMG90obSGeidlli3hj7cbocou0/wa5HacvI3ASx34PecNjNQeaHNo5WIZpWofN9kgkqV1q5YvXe3F0FoPw==}
 
   path-exists@4.0.0:
     resolution: {integrity: sha512-ak9Qy5Q7jYb2Wwcey5Fpvg2KoAc/ZIhLSLOSBmRmygPsGwkVVt0fZa0qrtMz+m6tJTAHfZQ8FnmB4MG4LWy7/w==}
@@ -2945,6 +2941,8 @@ snapshots:
 
   emoji-regex@9.2.2: {}
 
+  entities@8.1.0: {}
+
   es-define-property@1.0.1: {}
 
   es-errors@1.3.0: {}
@@ -3279,6 +3277,8 @@ snapshots:
       '@isaacs/cliui': 8.0.2
     optionalDependencies:
       '@pkgjs/parseargs': 0.11.0
+
+  jose@6.2.13: {}
 
   js-yaml@4.3.2:
     dependencies:
@@ -3773,6 +3773,10 @@ snapshots:
   parent-module@1.0.1:
     dependencies:
       callsites: 3.1.0
+
+  parse5@8.0.1:
+    dependencies:
+      entities: 8.1.0
 
   path-exists@4.0.0: {}
 

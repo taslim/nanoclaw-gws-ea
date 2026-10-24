@@ -1,8 +1,11 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { defaultEmojiResolver } from 'chat';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+import { getGroupCapabilities } from '../../capabilities.js';
+import { parseSkillSelection } from '../../container-config.js';
+import { syncSkillSymlinks } from '../../container-runner.js';
 import { dispatch } from '../../cli/dispatch.js';
 import { listCommands, lookup } from '../../cli/registry.js';
 import { ensureContainerConfig, getContainerConfig, updateContainerConfigJson } from '../../db/container-configs.js';
@@ -13,6 +16,8 @@ import { getRequiredProjectDocSections } from '../../project-doc-sections.js';
 import { unknownToolNames } from '../../test-utils/runner-tools.js';
 import type { AgentGroup } from '../../types.js';
 import { reconcileGwsEaProfile } from '../gws-ea-profile/db.js';
+import { ARTIFACTS_POLICY_FILE_ENV, type ArtifactsPolicyFile } from '../gws-ea-artifacts/policy.js';
+import '../gws-ea-artifacts/capability.js';
 import { GUIDANCE_PATH, MAIN_SHARED_SKILLS } from './index.js';
 import '../gws-ea-profile/index.js';
 // It registers the email channel's keys, whose instructions main is taught.
@@ -88,6 +93,7 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
+  vi.unstubAllEnvs();
   hostStopped.abort();
   hostStopped = new AbortController();
   await closeDb();
@@ -349,9 +355,67 @@ describe("main's skills", () => {
       { caller: 'host' },
     );
 
-    const skills = ['agent-browser', 'gcalendar', 'gmail', 'gpeople', 'gworkspace', 'whatsapp-formatting'];
+    const skills = [
+      'agent-browser',
+      'gcalendar',
+      'gmail',
+      'gpeople',
+      'gworkspace',
+      'whatsapp-formatting',
+      'artifact-designer',
+    ];
     expect(response).toMatchObject({ ok: true, data: { agent_group_id: main.id, skills } });
     expect(await skillsOf(main.id)).toEqual(skills);
+  });
+
+  it('selects artifact design for canonical main and an explicitly granted shell-less author only while enabled', async () => {
+    const main = group('ag-canonical', 'Assistant');
+    const author = group('ag-author', 'research');
+    const peer = group('ag-peer', 'main');
+    for (const value of [main, author, peer]) await createGroup(value);
+    await publishMain(main);
+    const policy: ArtifactsPolicyFile = {
+      schemaVersion: 1,
+      enabled: true,
+      hostname: 'views.example.com',
+      pathPrefix: '/aya',
+      listenPort: 9123,
+      accessIssuer: 'https://team.cloudflareaccess.com',
+      accessAud: 'assistant-aud',
+      cloudflare: { accountId: 'account', applicationId: 'app', operatorConfigFile: '/private/tmp/operator.json' },
+    };
+    const policyFile = path.join(TEST_ROOT, 'artifacts-policy.json');
+    fs.writeFileSync(policyFile, JSON.stringify(policy), { mode: 0o600 });
+    vi.stubEnv(ARTIFACTS_POLICY_FILE_ENV, policyFile);
+    await dispatch(
+      { id: 'main-skills', command: 'gws-ea-main-reconcile', args: { 'agent-group-id': main.id } },
+      { caller: 'host' },
+    );
+    await updateContainerConfigJson(author.id, 'capabilities', ['reply', 'files-read', 'files-write', 'artifacts']);
+    await updateContainerConfigJson(author.id, 'skills', ['artifact-designer']);
+
+    async function selected(id: string): Promise<string[]> {
+      const selection = parseSkillSelection((await getContainerConfig(id))?.skills, id);
+      return syncSkillSymlinks(path.join(TEST_ROOT, id, 'runtime-skills'), {
+        mcpServers: {},
+        packages: { apt: [], npm: [] },
+        additionalMounts: [],
+        skills: selection,
+        capabilities: [...(await getGroupCapabilities(id))],
+      });
+    }
+
+    expect(await selected(main.id)).toContain('artifact-designer');
+    expect((await getGroupCapabilities(author.id)).has('shell')).toBe(false);
+    expect(await selected(author.id)).toEqual(['artifact-designer']);
+    expect(fs.readlinkSync(path.join(TEST_ROOT, author.id, 'runtime-skills', 'skills', 'artifact-designer'))).toBe(
+      '/app/skills/artifact-designer',
+    );
+    expect(await selected(peer.id)).not.toContain('artifact-designer');
+    await updateContainerConfigJson(author.id, 'capabilities', ['reply', 'files-read', 'files-write']);
+    expect(await selected(author.id)).toEqual([]);
+    fs.writeFileSync(policyFile, JSON.stringify({ ...policy, enabled: false }));
+    expect(await selected(main.id)).not.toContain('artifact-designer');
   });
 
   it("puts the Calendar and Workspace rules in main's document once its skills are the release's", async () => {

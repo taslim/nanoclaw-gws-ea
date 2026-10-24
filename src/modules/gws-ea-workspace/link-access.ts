@@ -54,6 +54,7 @@
 import { setTimeout as delay } from 'node:timers/promises';
 
 import { normalizePrincipalEmail } from '../../gws-ea/validation.js';
+import { checkArtifactLinksOpenable } from '../gws-ea-artifacts/links.js';
 import { hostGoogleAccessToken } from '../gws-ea-google/index.js';
 import { GoogleGrantRevokedError, GoogleScopeNotGrantedError, GoogleTokenError } from '../gws-ea-google/tokens.js';
 import { GoogleApiError } from '../gws-ea-inbox/gmail-api.js';
@@ -76,6 +77,12 @@ export interface LinkCheckRequest {
   readonly texts: readonly string[];
   /** Everyone the message reaches. The principal's addresses are never checked. */
   readonly recipients: readonly string[];
+  /** Host-confirmed artifact identities when a chat has stricter identity requirements than Google. */
+  readonly artifactRecipients?: readonly string[];
+  /** A current chat member whose email identity is unknown; artifact named/private links cannot pass them. */
+  readonly unknownRecipients?: boolean;
+  /** Native chat membership, independent of supplied emails; private artifact links require the principal alone. */
+  readonly nonPrincipalChatMembers?: boolean;
   readonly writer: LinkWriter;
 }
 
@@ -542,7 +549,14 @@ let shared: LinkAccess | undefined;
  * `LinkCheckUnavailableError` when Google was too briefly unavailable to
  * decide.
  */
-export function checkLinksOpenable(request: LinkCheckRequest): Promise<LinkCheck> {
+export async function checkLinksOpenable(request: LinkCheckRequest): Promise<LinkCheck> {
+  const artifacts = await checkArtifactLinksOpenable({
+    texts: request.texts,
+    recipients: request.artifactRecipients ?? request.recipients,
+    unknownRecipients: request.unknownRecipients,
+    nonPrincipalChatMembers: request.nonPrincipalChatMembers,
+  });
+  if (!artifacts.allowed) return artifacts;
   shared ??= createLinkAccess({
     drive: createDriveApi({ token: driveToken, fetch: shortFetch }),
     probe: (target) => probeLink(target),

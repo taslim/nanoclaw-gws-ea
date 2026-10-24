@@ -124,6 +124,16 @@ export class AnchoredDir {
     }
   }
 
+  /** Read one regular file within a hard byte bound, refusing concurrent size changes. */
+  readFileBounded(name: string, maxBytes: number): Buffer {
+    const fd = this.openReadFd(name);
+    try {
+      return readRegularFileBounded(fd, maxBytes);
+    } finally {
+      fs.closeSync(fd);
+    }
+  }
+
   /** Create `name` and write `data`. EEXIST if anything, a symlink included, holds the name. */
   writeNewFile(name: string, data: Uint8Array): void {
     const fd = this.openNewFd(name);
@@ -261,4 +271,25 @@ function descriptorAlias(fd: number): string {
     return alias;
   }
   throw new Error(`anchored directory I/O is not supported on ${process.platform}`);
+}
+
+/** Read an already-open descriptor with a pre-allocation bound and a growth probe. The caller owns the descriptor. */
+export function readRegularFileBounded(fd: number, maxBytes: number): Buffer {
+  if (!Number.isSafeInteger(maxBytes) || maxBytes < 0) throw new Error('Invalid file byte limit');
+  const before = fs.fstatSync(fd, { bigint: true });
+  if (!before.isFile()) throw new Error('Not a regular file');
+  if (before.size > BigInt(maxBytes)) throw new Error('File exceeds its byte limit');
+  const size = Number(before.size);
+  const bytes = Buffer.alloc(size);
+  let offset = 0;
+  while (offset < size) {
+    const count = fs.readSync(fd, bytes, offset, size - offset, offset);
+    if (count === 0) throw new Error('File changed while reading');
+    offset += count;
+  }
+  if (fs.readSync(fd, Buffer.alloc(1), 0, 1, size) !== 0) throw new Error('File grew while reading');
+  const after = fs.fstatSync(fd, { bigint: true });
+  if (after.size !== before.size || after.mtimeNs !== before.mtimeNs || after.ctimeNs !== before.ctimeNs)
+    throw new Error('File changed while reading');
+  return bytes;
 }

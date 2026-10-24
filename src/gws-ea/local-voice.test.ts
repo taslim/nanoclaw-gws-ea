@@ -600,6 +600,12 @@ describe('native public capability journeys', () => {
               actions: ['show', 'check', 'enable', 'disable'],
               activation: 'disabled',
             },
+            {
+              name: 'artifacts',
+              scope: 'assistant',
+              actions: ['show', 'check', 'enable', 'disable'],
+              assistant_ids: [],
+            },
           ],
         },
       },

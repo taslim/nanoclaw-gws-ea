@@ -603,6 +603,52 @@ export function readOutboxFiles(
   return files.length > 0 ? files : undefined;
 }
 
+/** Exactly one declared staged file, with a size bound before allocation. Missing staging is distinguishable for durable replays. */
+export function readOutboxFileBounded(
+  agentGroupId: string,
+  sessionId: string,
+  messageId: string,
+  filename: string,
+  maxBytes: number,
+): Buffer | undefined {
+  if (!isSafeAttachmentName(messageId) || !isSafeAttachmentName(filename)) throw new Error('Unsafe staging name');
+  const outbox = AnchoredDir.open(sessionDir(agentGroupId, sessionId), ['outbox', messageId]);
+  if (!outbox) return undefined;
+  try {
+    return outbox.readFileBounded(filename, maxBytes);
+  } catch (error) {
+    if (error instanceof Error && 'code' in error && error.code === 'ENOENT') return undefined;
+    throw error;
+  } finally {
+    outbox.close();
+  }
+}
+
+/** Check out host-held bytes into only the requesting session's inbox, never an authored host path. */
+export function stageInboxFile(
+  agentGroupId: string,
+  sessionId: string,
+  messageId: string,
+  filename: string,
+  bytes: Buffer,
+): string {
+  if (!isSafeAttachmentName(messageId) || !isSafeAttachmentName(filename)) throw new Error('Unsafe staging name');
+  const inbox = AnchoredDir.open(sessionDir(agentGroupId, sessionId), ['inbox', messageId], true);
+  if (!inbox) throw new Error('Inbox staging is unavailable');
+  try {
+    try {
+      inbox.writeNewFile(filename, bytes);
+    } catch (error) {
+      if (!(error instanceof Error && 'code' in error && error.code === 'EEXIST')) throw error;
+      if (!holdsStagedOriginal(inbox, filename, bytes))
+        throw new Error('Inbox staging already holds a different file', { cause: error });
+    }
+    return `inbox/${messageId}/${filename}`;
+  } finally {
+    inbox.close();
+  }
+}
+
 /**
  * Remove a message's outbox directory after successful delivery. Best-effort:
  * failures log and swallow. A cleanup failure must NOT propagate to the

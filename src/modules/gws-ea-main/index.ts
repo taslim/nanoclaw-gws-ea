@@ -29,12 +29,17 @@ registerCapability(MAIN_CHAT_CAPABILITY, {
 
 /**
  * The shared skills (`container/skills/`) `main` loads: web research, every
- * Google capability's skill (`gws-ea-google`), and WhatsApp formatting. Main's
- * capabilities bound the list, so it receives a Google skill only while it
- * holds that service's key. The template supplies `welcome`; no agent here
+ * Google capability's skill (`gws-ea-google`), WhatsApp formatting, and HTML
+ * artifact design. Main's capabilities bound the list, so it receives each
+ * skill only while it holds that capability. The template supplies `welcome`; no agent here
  * receives the gateway's own skill (`gws-ea-google` withholds it).
  */
-export const MAIN_SHARED_SKILLS: readonly string[] = ['agent-browser', ...EXPOSED_GOOGLE_SKILLS, 'whatsapp-formatting'];
+export const MAIN_SHARED_SKILLS: readonly string[] = [
+  'agent-browser',
+  ...EXPOSED_GOOGLE_SKILLS,
+  'whatsapp-formatting',
+  'artifact-designer',
+];
 
 async function mainAgentGroupId(): Promise<string | null> {
   if (!(await getDb().hasTable('gws_ea_profile'))) return null;

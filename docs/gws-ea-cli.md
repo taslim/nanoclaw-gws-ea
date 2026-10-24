@@ -12,7 +12,50 @@ See [the voice guide](gws-ea-voice.md) for optional voice installation,
 activation, and health checks, [1Password vaults](#1password-vaults) for
 assistants' saved logins, [web alias](#web-alias) for the address an
 assistant's browser uses, and [browser access](#browser-access) for which of
-its agents may use the browser.
+its agents may use the browser. [HTML artifacts](gws-ea-artifacts.md) covers
+private information views and explicit sharing through Cloudflare Access.
+
+## HTML artifacts
+
+Artifacts are optional per assistant. The operator needs an active Cloudflare
+DNS zone, an Access team, an account-scoped management token with the required
+Tunnel, DNS, Access application/policy and identity-provider permissions, and
+`cloudflared` 2025.4.0 or later. Keep the token in an owner-only file inside the
+operator config root; the default root is `~/.config/gws-ea`, respecting
+`XDG_CONFIG_HOME` and `GWS_EA_CONFIG_ROOT`.
+
+```sh
+gws-ea capabilities enable artifacts --id <instance_id> \
+  --account <cloudflare_account_id> --team <access_team_subdomain> \
+  --zone <active_zone_id> --hostname views.example.com \
+  --credential-file <absolute_owner_only_token_file>
+gws-ea capabilities show artifacts --id <instance_id>
+gws-ea capabilities check artifacts --id <instance_id>
+gws-ea capabilities disable artifacts --id <instance_id>
+```
+
+The first enable records this host's shared hostname and account. Later enables
+reuse them. An assistant named Aya claims `/aya`; another Aya cannot claim that
+prefix on the same hostname. Use `--assistant-hostname aya.other.example.com`
+with an active zone in the same account for a separate hostname. No identity ID
+or generated suffix is added to public links. Existing namespace claims remain
+stable through disable and re-enable.
+
+The principal asks for a view in conversation and opens its private link with an
+email PIN. Every currently confirmed principal address can open private views.
+Named guests use their exact invited email; public snapshots need no sign-in.
+Check the operator's current Cloudflare Access seat allowance for the intended
+principal and guest identities. Viewing requires the operator host and connector
+to be running. Ordinary authoring and reading make no Cloudflare management calls.
+
+`show` and `check` observe without repair. Enable verifies the owned resources,
+listener and connector before reporting readiness. Disable immediately closes
+origin access and removes this assistant's ingress while retaining content,
+publication intent and name claims. Re-enable verifies prerequisites and restores
+only unchanged, unexpired intent. For interrupted provisioning, inspect the exact
+reported attempt and remove any resource it created before acknowledging that
+attempt with `--discard-unproven <attempt>`. See the [artifact guide](gws-ea-artifacts.md)
+for retention, recovery, removal and native tool details.
 
 ## Find and inspect an assistant
 

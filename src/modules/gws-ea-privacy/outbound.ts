@@ -9,6 +9,7 @@ import { EMAIL_CHANNEL_TYPE, INBOX_PLATFORM_ID } from '../gws-ea-inbox/runtime.j
 import { resolveAudience, type Audience } from './audience.js';
 import { clearedPrivateValueIds } from './clearance.js';
 import { listPrivateValues } from './db.js';
+import { htmlReadings } from './html.js';
 import {
   compilePrivateValue,
   findPrivateValue,
@@ -203,6 +204,19 @@ export async function privateValuesGivenAway(
 ): Promise<readonly PrivateValueReference[]> {
   if (!(await getDb().hasTable('gws_ea_private_values'))) return [];
   const readings = readingsOf(typeof content === 'string' ? [content] : content);
+  return privateValuesInReadings(readings);
+}
+
+/** Complete immutable HTML and its revision title; no chat or browser clearance is transferable. */
+export async function privateValuesGivenAwayInHtml(
+  html: string,
+  title: string,
+): Promise<readonly PrivateValueReference[]> {
+  if (!(await getDb().hasTable('gws_ea_private_values'))) return [];
+  return privateValuesInReadings([...htmlReadings(html), ...readingsOf([title])]);
+}
+
+async function privateValuesInReadings(readings: readonly TextStream[]): Promise<readonly PrivateValueReference[]> {
   return (await listPrivateValues())
     .filter((value) => {
       const compiled = compilePrivateValue(value.kind, value.value);

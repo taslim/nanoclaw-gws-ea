@@ -21,6 +21,7 @@ import {
   REGISTRY_SCHEMA_VERSION,
   sameRelease,
   type AllocatedPorts,
+  type ArtifactsNamespaceClaim,
   type ExclusiveResourceClaims,
   type InstanceMarker,
   type InstanceRegistry,
@@ -137,7 +138,42 @@ function validateClaims(value: unknown, instanceId: string): ExclusiveResourceCl
     workspace_email: workspaceEmail,
     ...(aliasEmail === undefined ? {} : { alias_email: aliasEmail }),
     onecli_project: onecliProject,
+    ...(value.artifacts === undefined ? {} : { artifacts: validateArtifactsClaim(value.artifacts) }),
     ...(value.whatsapp_number === undefined ? {} : { whatsapp_number: validateWhatsAppNumber(value.whatsapp_number) }),
+  };
+}
+
+function validateArtifactsClaim(value: unknown): ArtifactsNamespaceClaim {
+  if (
+    !isRecord(value) ||
+    typeof value.hostname !== 'string' ||
+    !/^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/u.test(value.hostname) ||
+    typeof value.path_prefix !== 'string'
+  )
+    throw new GwsEaError('invalid_claim', 'Artifact namespace is invalid');
+  const prefix = value.path_prefix;
+  if (prefix !== '') {
+    let decoded: string;
+    try {
+      decoded = decodeURIComponent(prefix.slice(1));
+    } catch (cause) {
+      throw new GwsEaError('invalid_claim', 'Artifact namespace encoding is invalid', { cause });
+    }
+    if (
+      !decoded ||
+      decoded === '.' ||
+      decoded === '..' ||
+      /[\\/%\p{Cc}]/u.test(decoded) ||
+      decoded !== decoded.normalize('NFKC').toLowerCase().replace(/\s+/gu, '-') ||
+      prefix !== `/${encodeURIComponent(decoded)}` ||
+      ['public', 'private', 'guest', 'assets', 'api', 'cdn-cgi', 'health', 'login', 'logout'].includes(decoded)
+    )
+      throw new GwsEaError('invalid_claim', 'Artifact namespace is invalid');
+  }
+  return {
+    hostname: value.hostname,
+    path_prefix: prefix,
+    listen_port: validatePort(value.listen_port, 'artifact listener'),
   };
 }
 
@@ -172,13 +208,17 @@ export function validateReservation(value: unknown): InstanceReservation {
   const instanceId = requireString(value.instance_id, 'instance_id', 36);
   assertInstanceId(instanceId);
   const release = validateReleaseCoordinates(value);
+  const allocatedPorts = validatePorts(value.allocated_ports);
+  const claims = validateClaims(value.exclusive_resource_claims, instanceId);
+  if (claims.artifacts && Object.values(allocatedPorts).includes(claims.artifacts.listen_port))
+    throw new GwsEaError('invalid_claim', 'The artifact listener must have its own distinct port');
   return {
     instance_id: instanceId,
     release_track: release.release_track,
     source_remote: release.source_remote,
     deployed_commit: release.deployed_commit,
-    allocated_ports: validatePorts(value.allocated_ports),
-    exclusive_resource_claims: validateClaims(value.exclusive_resource_claims, instanceId),
+    allocated_ports: allocatedPorts,
+    exclusive_resource_claims: claims,
   };
 }
 
@@ -248,6 +288,7 @@ function claimKeys(instance: InstanceReservation): string[] {
     ...(claims.alias_email === undefined ? [] : [`mailbox:${claims.alias_email}`]),
     `onecli-project:${claims.onecli_project}`,
     ...(claims.whatsapp_number === undefined ? [] : [`whatsapp-number:${claims.whatsapp_number}`]),
+    ...(claims.artifacts === undefined ? [] : [`port:${claims.artifacts.listen_port}`]),
   ];
   return keys;
 }
@@ -267,6 +308,22 @@ export function otherAssistantsMailboxes(registry: InstanceRegistry, instanceId:
 function assertNoClaimCollisions(instances: readonly InstanceReservation[]): void {
   const seen = new Map<string, string>();
   for (const instance of instances) {
+    const namespace = instance.exclusive_resource_claims.artifacts;
+    if (
+      namespace &&
+      instances.some((other) => {
+        const claim = other.exclusive_resource_claims.artifacts;
+        return (
+          other.instance_id !== instance.instance_id &&
+          claim?.hostname === namespace.hostname &&
+          (claim.path_prefix === '' || namespace.path_prefix === '' || claim.path_prefix === namespace.path_prefix)
+        );
+      })
+    )
+      throw new GwsEaError(
+        'claim_conflict',
+        'Artifact namespace is already claimed. Configure a different assistant hostname.',
+      );
     for (const claim of claimKeys(instance)) {
       const owner = seen.get(claim);
       if (owner && owner !== instance.instance_id) {
@@ -275,6 +332,36 @@ function assertNoClaimCollisions(instances: readonly InstanceReservation[]): voi
       seen.set(claim, instance.instance_id);
     }
   }
+}
+
+/** Stable claims are retained on disable and cannot be silently renamed on re-enable. */
+export async function claimInstanceArtifacts(
+  paths: ControlPlanePaths,
+  instanceId: string,
+  claim: ArtifactsNamespaceClaim,
+): Promise<InstanceReservation> {
+  return withMachineLock(paths, async () => {
+    const registry = await readRegistryFile(paths);
+    const stored = registry.instances[instanceId];
+    if (!stored) throw new GwsEaError('unknown_instance', 'Unknown instance ID');
+    const previous = stored.exclusive_resource_claims.artifacts;
+    if (previous) {
+      if (JSON.stringify(previous) !== JSON.stringify(validateArtifactsClaim(claim)))
+        throw new GwsEaError(
+          'claim_conflict',
+          'Existing artifact links retain their claimed hostname, prefix and port.',
+        );
+      return stored;
+    }
+    const next = validateReservation({
+      ...stored,
+      exclusive_resource_claims: { ...stored.exclusive_resource_claims, artifacts: claim },
+    });
+    const instances = { ...registry.instances, [instanceId]: next };
+    assertNoClaimCollisions(Object.values(instances));
+    await writePrivate(paths.registryFile, { ...registry, instances });
+    return next;
+  });
 }
 
 async function acquireMachineLock(paths: ControlPlanePaths): Promise<() => void> {

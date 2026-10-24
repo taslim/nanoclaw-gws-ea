@@ -40,7 +40,7 @@ export async function audienceForAddresses(addresses: readonly string[]): Promis
   return addresses.every((address) => principal.has(address)) ? 'principal' : 'others';
 }
 
-async function isPrincipalDirectMessage(channelType: string, platformId: string): Promise<boolean> {
+async function isPrincipalDirectMessage(channelType: string, platformId: string, instance: string): Promise<boolean> {
   const db = getDb();
   if (!(await db.hasTable('gws_ea_principal_users'))) return false;
   const row = await db.get<{ present: number }>(
@@ -48,10 +48,11 @@ async function isPrincipalDirectMessage(channelType: string, platformId: string)
        FROM messaging_groups mg
        JOIN user_dms dm ON dm.messaging_group_id = mg.id
        JOIN gws_ea_principal_users principal ON principal.user_id = dm.user_id
-      WHERE mg.channel_type = ? AND mg.platform_id = ? AND mg.is_group = 0
+      WHERE mg.channel_type = ? AND mg.platform_id = ? AND mg.instance = ? AND mg.is_group = 0
       LIMIT 1`,
     channelType,
     platformId,
+    instance,
   );
   return row !== undefined;
 }
@@ -59,5 +60,7 @@ async function isPrincipalDirectMessage(channelType: string, platformId: string)
 export async function resolveAudience(send: OutboundSend): Promise<Audience> {
   const resolver = recipientResolvers.get(send.channelType);
   if (resolver) return audienceForAddresses(await resolver(send));
-  return (await isPrincipalDirectMessage(send.channelType, send.platformId)) ? 'principal' : 'others';
+  return (await isPrincipalDirectMessage(send.channelType, send.platformId, send.instance ?? send.channelType))
+    ? 'principal'
+    : 'others';
 }

@@ -45,6 +45,12 @@ import {
 } from '../modules/gws-ea-google/tokens.js';
 import { GoogleApiError } from '../modules/gws-ea-inbox/gmail-api.js';
 import { reclaimImage } from './agent-image-release.js';
+import {
+  captureArtifactsCleanup,
+  parseArtifactsCleanup,
+  settleArtifactsCleanup,
+  type ArtifactsCleanup,
+} from './artifacts-removal.js';
 import { PauseRequired, runStep, withGoogleSignIn, type StepIdentity, type StepReporter } from './events.js';
 import {
   assertGcloudInstalled,
@@ -114,6 +120,7 @@ import { canonicalTimestamp, isRecord, requireDockerEndpoint, requirePath } from
 export const REMOVAL_RESOURCES = [
   'whatsapp',
   'nanoclaw',
+  'artifacts',
   'chat-subscription',
   'onepassword',
   'gcp-project',
@@ -128,7 +135,7 @@ export type RemovalResource = (typeof REMOVAL_RESOURCES)[number];
  * Google refuses its sign-in, or its 1Password resources: a vault removal
  * cannot settle, and the service accounts only the operator can revoke.
  */
-export const ABANDONABLE_RESOURCES = ['gcp-project', 'chat-subscription', 'onepassword'] as const;
+export const ABANDONABLE_RESOURCES = ['gcp-project', 'chat-subscription', 'onepassword', 'artifacts'] as const;
 export type AbandonableResource = (typeof ABANDONABLE_RESOURCES)[number];
 
 /** What leaving each resource behind means, as a pause tells the operator. */
@@ -139,6 +146,8 @@ const LEAVING_BEHIND: Readonly<Record<AbandonableResource, string>> = {
     'Leaving it behind is safe: once the project is deleted it delivers nowhere, and Google deletes it within 7 days; removal records this evidence.',
   onepassword:
     'Leaving it behind keeps the vault and its items in 1Password and stops tracking its service accounts and any creation never proven; removal records their IDs and names as evidence, so you can delete or revoke them yourself on 1Password.com.',
+  artifacts:
+    'Leaving artifacts behind retains the exact Cloudflare IDs, unresolved creation attempts and connector coordinates in the removal receipt. Its shared ownership record and credentials remain for manual cleanup; no resource is adopted or deleted by name.',
 };
 
 function isAbandonable(resource: RemovalResource): resource is RemovalResource & AbandonableResource {
@@ -153,6 +162,7 @@ const UNREADABLE_CLEANUP = 'removal_receipt_unreadable';
 const RESOURCE_STEPS: Readonly<Record<RemovalResource, StepIdentity>> = {
   whatsapp: { id: 'remove_whatsapp', label: 'Signing out the assistant’s WhatsApp device…' },
   nanoclaw: { id: 'remove_nanoclaw', label: 'Stopping NanoClaw…' },
+  artifacts: { id: 'remove_artifacts', label: 'Removing the assistant’s owned artifact access…' },
   'chat-subscription': { id: 'remove_chat_subscription', label: 'Deleting the Google Chat subscription…' },
   onepassword: { id: 'remove_onepassword', label: "Cleaning up the assistant's 1Password vault and token…" },
   'gcp-project': { id: 'remove_gcp_project', label: 'Deleting the Google Cloud project…' },
@@ -179,6 +189,7 @@ interface RemovalReceipt {
   readonly member_policy_unrestored?: Evidence;
   /** The assistant's 1Password IDs and what became of them; kept here, outside the instance, until the operator closes it. */
   readonly onepassword?: OnePasswordCleanup;
+  readonly artifacts?: ArtifactsCleanup;
 }
 
 /** What local teardown uses, as the instance recorded it. */
@@ -290,8 +301,10 @@ function entries<K extends string, V>(keys: readonly K[], value: unknown, parse:
  * aside: everything it could say is re-observed.
  */
 async function readReceipt(paths: ControlPlanePaths, instanceId: string): Promise<RemovalReceipt | undefined> {
+  let artifactEvidence = false;
   try {
     const raw = await readOwnerOnlyJson(paths.removalFile(instanceId), 'Removal receipt', 'invalid_removal');
+    artifactEvidence = isRecord(raw) && raw.artifacts !== undefined;
     if (!isRecord(raw) || raw.instance_id !== instanceId) {
       throw new GwsEaError('invalid_removal', 'Removal receipt does not match this instance');
     }
@@ -308,6 +321,12 @@ async function readReceipt(paths: ControlPlanePaths, instanceId: string): Promis
     const keyPolicyUnrestored = evidenceOf(raw.key_policy_unrestored);
     const memberPolicyUnrestored = evidenceOf(raw.member_policy_unrestored);
     const onepassword = raw.onepassword === undefined ? undefined : parseOnePasswordCleanup(raw.onepassword);
+    const artifacts = raw.artifacts === undefined ? undefined : parseArtifactsCleanup(raw.artifacts);
+    if (raw.artifacts !== undefined && !artifacts)
+      throw new GwsEaError(
+        UNREADABLE_CLEANUP,
+        `The removal receipt ${paths.removalFile(instanceId)} names artifact resources it cannot read safely; removal stops so their IDs are not lost.`,
+      );
     if (raw.onepassword !== undefined && !onepassword)
       throw new GwsEaError(
         UNREADABLE_CLEANUP,
@@ -323,9 +342,15 @@ async function readReceipt(paths: ControlPlanePaths, instanceId: string): Promis
       ...(keyPolicyUnrestored ? { key_policy_unrestored: keyPolicyUnrestored } : {}),
       ...(memberPolicyUnrestored ? { member_policy_unrestored: memberPolicyUnrestored } : {}),
       ...(onepassword ? { onepassword } : {}),
+      ...(artifacts ? { artifacts } : {}),
     };
   } catch (error) {
     if (isErrno(error, 'ENOENT')) return undefined;
+    if (artifactEvidence && error instanceof GwsEaError && error.code !== UNREADABLE_CLEANUP)
+      throw new GwsEaError(
+        UNREADABLE_CLEANUP,
+        `The artifact removal receipt ${paths.removalFile(instanceId)} cannot be interpreted safely. Preserve its exact ownership evidence before retrying.`,
+      );
     if (!(error instanceof GwsEaError) || error.code === UNREADABLE_CLEANUP) throw error;
     activeStep()?.write(`${error.message}; its resources are observed again\n`);
     return undefined;
@@ -842,6 +867,10 @@ async function removeLocked(
   const recorded = await readRecordedRuntime(paths, reservation);
   const onePassword = await onePasswordCapture(paths, reservation, existing, dependencies.deleteVault);
   if (onePassword.status === 'captured') receipt = { ...receipt, onepassword: onePassword.cleanup };
+  const artifacts = existing?.artifacts
+    ? { status: 'captured' as const, cleanup: existing.artifacts }
+    : await captureArtifactsCleanup(paths, reservation);
+  if (artifacts.status === 'captured') receipt = { ...receipt, artifacts: artifacts.cleanup };
   // Released last, so a released reservation left only local files and the receipt behind.
   const released = registry.instances[instanceId] === undefined;
   const started = (step: ProvisionStepId): boolean => !released && provisioning.started(step);
@@ -858,6 +887,7 @@ async function removeLocked(
   const owned: Readonly<Record<RemovalResource, boolean>> = {
     whatsapp: hasWhatsApp,
     nanoclaw: started('start_nanoclaw'),
+    artifacts: artifacts.status !== 'none',
     // The host keeps the subscription from its start, with the assistant's sign-in.
     'chat-subscription': started('start_nanoclaw'),
     'gcp-project': started('provision_gcp'),
@@ -1006,6 +1036,19 @@ async function removeLocked(
       await requireUninstall()(reservation, await localRuntime());
       return undefined;
     },
+    artifacts: async () => {
+      if (artifacts.status === 'unreadable') return leaveBehind('artifacts', artifacts);
+      const cleanup = receipt.artifacts;
+      if (!cleanup) return undefined;
+      const blocked = await settleArtifactsCleanup(paths, instanceId, cleanup, {
+        fetch: dependencies.fetch,
+        runCommand: run,
+        record: (next) => record((current) => ({ ...current, artifacts: next })),
+      });
+      return blocked
+        ? leaveBehind('artifacts', { ...blocked, evidence: `${blocked.evidence}\nRemoval receipt: ${file}` })
+        : undefined;
+    },
     'chat-subscription': async () => {
       const access = await chatSubscription();
       switch (access.state) {
@@ -1114,7 +1157,7 @@ async function removeLocked(
         },
       },
     }));
-  const retained = owed && !receipt.abandoned.onepassword;
+  const retained = (owed && !receipt.abandoned.onepassword) || receipt.abandoned.artifacts !== undefined;
   if (!retained) await removePrivateFile(file);
 
   return {

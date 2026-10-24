@@ -2473,7 +2473,7 @@ describe('removal command', () => {
       }),
     ).toBe(2);
     expect(errors[0]).toBe(
-      '--abandon: "registry" cannot be abandoned; choose from gcp-project, chat-subscription, onepassword',
+      '--abandon: "registry" cannot be abandoned; choose from gcp-project, chat-subscription, onepassword, artifacts',
     );
     expect(remove).not.toHaveBeenCalled();
   });

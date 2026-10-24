@@ -23,6 +23,7 @@ import '../gws-ea-people/index.js';
 import '../gws-ea-privacy/index.js';
 import '../gws-ea-matters/index.js';
 import '../gws-ea-chats/index.js';
+import '../gws-ea-artifacts/index.js';
 import './index.js';
 import { createAgentGroup } from '../../db/agent-groups.js';
 import { closeDb, getDb, initTestDb } from '../../db/connection.js';
@@ -43,6 +44,7 @@ import { addPrivateValue } from '../gws-ea-privacy/db.js';
 import { addPrincipalAddress } from '../gws-ea-profile/db.js';
 import { hostGoogleAccessToken } from '../gws-ea-google/index.js';
 import { FakeDrive } from '../gws-ea-workspace/testing/fake-drive.js';
+import { prepareArtifactSource, saveArtifact } from '../gws-ea-artifacts/db.js';
 import { generateDriveFileId } from '../gws-ea-workspace/drive-api.js';
 import { JOB_DOCUMENT_ACTIONS } from './docs.js';
 import { createWhatsAppGroupEvents } from '../gws-ea-whatsapp/events.js';
@@ -126,6 +128,35 @@ async function observedRevision(file: string): Promise<string> {
   const revision = accepted(await request(job, 'doc_read', { file })).revision;
   if (typeof revision !== 'string' || revision.length === 0) throw new Error('doc_read did not return a revision');
   return revision;
+}
+function enableArtifacts(): void {
+  const policy = `${ROOT}/artifact-policy.json`;
+  fs.writeFileSync(
+    policy,
+    JSON.stringify({
+      schemaVersion: 1,
+      enabled: true,
+      hostname: 'views.example.com',
+      pathPrefix: '/aya',
+      listenPort: 9123,
+      accessIssuer: 'https://team.cloudflareaccess.com',
+      accessAud: 'aud',
+      cloudflare: { accountId: 'a', applicationId: 'b', operatorConfigFile: '/private/tmp/cf.json' },
+    }),
+    { mode: 0o600 },
+  );
+  vi.stubEnv('GWS_EA_ARTIFACTS_POLICY_FILE', policy);
+}
+async function privateArtifactLink(): Promise<string> {
+  enableArtifacts();
+  await addPrincipalAddress('principal@example.com');
+  const saved = await saveArtifact(
+    { agentGroupId: job.agent_group_id, sessionId: job.id, isMain: false },
+    { requestId: 'fixture-artifact', action: 'save', fingerprint: 'fixture-artifact' },
+    { create_key: 'report', title: 'Report' },
+    prepareArtifactSource(Buffer.from('<p>Report</p>')),
+  );
+  return `https://views.example.com/aya/${saved.artifact_id}`;
 }
 async function outsideFile(): Promise<string> {
   const file = await drive.createFile({ name: 'Outside document', mimeType: 'application/vnd.google-apps.document' });
@@ -324,6 +355,7 @@ afterEach(async () => {
   await teardownChannelAdapters();
   await closeDb();
   vi.unstubAllGlobals();
+  vi.unstubAllEnvs();
   fs.rmSync(ROOT, { recursive: true, force: true });
 });
 
@@ -748,3 +780,56 @@ it('keeps an ambiguous folder under the same reserved ID when Drive cannot confi
   expect(generatedFolderIds).toBe(1);
   expect(documents.size).toBe(0);
 });
+it('checks artifact-only links before an edit or a document share exposes them', async () => {
+  const file = await made();
+  enableArtifacts();
+  const link = 'https://views.example.com/aya/share/11111111-1111-4111-8111-111111111111';
+  expect(
+    refused(
+      await request(job, 'doc_edit', { file, revision: await observedRevision(file), find: 'the lake', replace: link }),
+    ),
+  ).toContain('artifact access');
+  expect(documents.get(file)?.text).toBe('Friday at the lake.');
+  documents.set(file, { title: 'Trip plan', text: link, revision: 3 });
+  expect(refused(await request(job, 'doc_share', { file }))).toContain('artifact access');
+});
+
+it('allows private artifact links beside Google links for a native principal-only document audience', async () => {
+  const file = await made();
+  const artifact = await privateArtifactLink();
+  const google = `https://docs.google.com/document/d/${await outsideFile()}/edit`;
+  members = [{ key: 'whatsapp:11', isPrincipal: true }];
+  accepted(
+    await request(job, 'doc_edit', {
+      file,
+      revision: await observedRevision(file),
+      find: 'the lake',
+      replace: `${artifact} ${google}`,
+    }),
+  );
+  expect(documents.get(file)?.text).toBe(`Friday at ${artifact} ${google}.`);
+  accepted(await request(job, 'doc_share', { file }));
+});
+it.each([false, true])(
+  'refuses private artifact links for a non-principal assigned a principal email (Google link: %s)',
+  async (mixed) => {
+    const file = await made();
+    const artifact = await privateArtifactLink();
+    await setChatMemberEmail('trip', 'whatsapp:22', 'principal@example.com', 'main');
+    const replacement = mixed ? `${artifact} https://docs.google.com/document/d/${await outsideFile()}/edit` : artifact;
+    expect(
+      refused(
+        await request(job, 'doc_edit', {
+          file,
+          revision: await observedRevision(file),
+          find: 'the lake',
+          replace: replacement,
+        }),
+      ),
+    ).toContain('artifact access');
+    expect(documents.get(file)?.text).toBe('Friday at the lake.');
+    documents.set(file, { title: 'Trip plan', text: replacement, revision: 3 });
+    expect(refused(await request(job, 'doc_share', { file }))).toContain('artifact access');
+    expect(drive.writes.filter((call) => call.op === 'createPermission')).toEqual([]);
+  },
+);

@@ -17,8 +17,13 @@ const UPSTREAM_ACTIONS: ReadonlySet<string> = new Set([
   'a2a_message_gate',
   'cli_command',
 ]);
-/** The actions whose resolved callbacks already tell the browser job of a no. */
-const TOLD_BY_THEIR_MODULE = ['browser_consent', 'browser_purchase', 'browser_watch_setup'];
+/** Actions whose module-owned settlement already tells the requesting job once. */
+const TOLD_BY_THEIR_MODULE = [
+  'browser_consent',
+  'browser_purchase',
+  'browser_watch_setup',
+  'artifact_share_private_values',
+];
 const WORDED = [
   'browser_credential_release',
   'browser_reservation_guarantee',
