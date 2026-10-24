@@ -20,9 +20,12 @@ const examples: Record<string, unknown>[] = [];
 const phase = process.argv[2];
 assert(phase === 'author' || phase === 'main');
 if (phase === 'author') {
-  for (const name of ['executive-brief', 'evidence-comparison', 'capacity-calculator']) {
+  for (const name of ['decision', 'itinerary', 'brief']) {
     const file = `${name}.html`;
-    fs.copyFileSync(`/examples/${file}`, `/workspace/agent/${file}`);
+    fs.writeFileSync(
+      `/workspace/agent/${file}`,
+      `<!doctype html><html lang="en"><head><meta charset="utf-8"><title>${name}</title></head><body><main><h1>${name}</h1><p>Acceptance document.</p></main></body></html>`,
+    );
     const saved = await call(artifactSave, {
       create_key: name,
       file,

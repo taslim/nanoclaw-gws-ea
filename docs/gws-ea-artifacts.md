@@ -53,11 +53,15 @@ tombstones so late requests cannot recreate it.
 
 ## Authoring and native tools
 
-The `artifact-designer` skill is lazy design guidance. Authors use their existing
-file read/write/edit tools, with no shell requirement, to create a regular UTF-8
-HTML file under `/workspace/agent/` or edit a checked-out inbox file. Include
-styles, scripts, SVG and data assets inline. Aim for ordinary markup around
-32 KiB; the hard single-document limit is 4 MiB including real data and images.
+The `artifact-designer` skill is lazy design guidance. It holds principles for
+the reader and the information, a house `starter.html` page whose stylesheet
+every page carries (authors with a shell copy it and fill its body; others
+write it out whole), and element patterns read on demand. It deliberately has no
+full-page examples, because models copy an example's surface. Authors use their
+existing file read/write/edit tools, with no shell requirement, to create a
+regular UTF-8 HTML file under `/workspace/agent/` or edit a checked-out inbox
+file. Include styles, scripts, SVG and data assets inline. A typical page is
+8–20 KB; the hard single-document limit is 4 MiB including real data and images.
 Preserve the information within that limit instead of truncating it.
 
 Canonical main gains the capability when the assistant enables it. Other eligible

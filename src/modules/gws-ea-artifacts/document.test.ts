@@ -1,3 +1,4 @@
+import fs from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import { parseArtifactDocument } from './document.js';
 
@@ -36,7 +37,15 @@ describe('artifact document policy', () => {
       'duplicate-attribute',
     );
   });
+  it('accepts the design skill starter page and modern scroll properties', () => {
+    const starter = fs
+      .readFileSync('container/skills/artifact-designer/starter.html', 'utf8')
+      .replace('<title></title>', '<title>Plan</title><style>html{scroll-behavior:smooth}</style>')
+      .replace('<main></main>', '<main><h1>Plan</h1></main>');
+    expect(parseArtifactDocument(starter).staticHtml).toContain('<h1>Plan</h1>');
+  });
   it.each([
+    '<style>body{behavior:none}</style>',
     '<form><input></form>',
     '<iframe src="about:blank"></iframe>',
     '<base href="https://example.com">',

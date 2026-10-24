@@ -63,7 +63,7 @@ function assertCss(css: string): void {
   if (css.includes('\\') || /\/\*(?![\s\S]*?\*\/)/u.test(css))
     throw new Error('CSS escapes and incomplete comments are unsupported.');
   const plain = css.replace(/\/\*[\s\S]*?\*\//gu, '');
-  if (/@import|expression\s*\(|-moz-binding|behavior\s*:/iu.test(plain))
+  if (/@import|expression\s*\(|-moz-binding|(?<![\w-])behavior\s*:/iu.test(plain))
     throw new Error('External CSS is unsupported.');
   for (const match of plain.matchAll(/url\s*\(\s*([\s\S]*?)\s*\)/giu)) {
     const url = match[1].replace(/^(['"])([\s\S]*)\1$/u, '$2').trim();

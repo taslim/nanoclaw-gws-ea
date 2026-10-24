@@ -216,7 +216,6 @@ it.skipIf(!process.env.GWS_EA_ARTIFACT_NATIVE_IMAGE)(
       const mounts = [
         `${path.join(repo, 'container/agent-runner/src')}:/app/src:ro`,
         `${path.join(repo, 'container/agent-runner/node_modules')}:/app/node_modules:ro`,
-        `${path.join(repo, 'container/skills/artifact-designer/examples')}:/examples:ro`,
         `${workspace}:/workspace`,
       ];
       const cidfile = path.join(ROOT, `${phase}.cid`);
