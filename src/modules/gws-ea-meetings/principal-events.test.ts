@@ -235,6 +235,34 @@ afterEach(async () => {
 });
 
 describe('create_event', () => {
+  it('uses the same spoken calendar names as conflict answers, without an address', async () => {
+    calendar.calendars.set(READ_ONLY, { id: READ_ONLY, accessRole: 'reader', summary: 'Family calendar' });
+    const listed = vi.spyOn(calendar, 'listCalendars');
+    const created = data(await send(main, 'create_event', FOCUS));
+
+    expect(created.message).toContain("to the principal's calendar at northwind.example:");
+    expect(created.message).not.toContain(PRINCIPAL);
+    expect(listed).toHaveBeenCalledTimes(1);
+  });
+
+  it('marks a calendar name supplied by Google as untrusted', async () => {
+    calendar.calendars.set(PRINCIPAL, { id: PRINCIPAL, accessRole: 'writer', summary: 'Work calendar' });
+    const created = data(await send(main, 'create_event', FOCUS));
+
+    expect(created.message).toMatch(
+      /to <<<EXTERNAL_UNTRUSTED_CONTENT id="([0-9a-f]{16})">>>\nSource: google_calendar\n---\nWork calendar\n<<<END_EXTERNAL_UNTRUSTED_CONTENT id="\1">>>:/u,
+    );
+  });
+
+  it('still confirms the event without exposing an address when calendar listing fails', async () => {
+    vi.spyOn(calendar, 'listCalendars').mockRejectedValueOnce(new Error('Calendar list unavailable'));
+    const created = data(await send(main, 'create_event', FOCUS));
+
+    expect(created.message).toContain('Added "Focus: board deck"');
+    expect(created.message).not.toContain(PRINCIPAL);
+    expect(calendar.event(PRINCIPAL, String(created.event))).toMatchObject({ summary: FOCUS.title });
+  });
+
   it('puts an event on the principal’s calendar with the principal its one guest, accepted, emailing no one', async () => {
     const created = data(
       await send(main, 'create_event', {
@@ -1216,7 +1244,7 @@ describe('the assistant’s own calendar (R19)', () => {
     ]);
     expect(created).toMatchObject({ calendar: ASSISTANT, start: FOCUS.start, end: FOCUS.end });
     expect(created.message).toBe(
-      `Added "Focus: board deck" to ${ASSISTANT}: Thursday, Oct 8, 9:00–11:00 AM PDT. ${OWN_CALENDAR_VISIBILITY} Change who it invites with change_guests, event ${String(created.event)}; anything else with gog calendar update.`,
+      `Added "Focus: board deck" to your own calendar: Thursday, Oct 8, 9:00–11:00 AM PDT. ${OWN_CALENDAR_VISIBILITY} Change who it invites with change_guests, event ${String(created.event)}; anything else with gog calendar update.`,
     );
   });
 
