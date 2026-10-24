@@ -135,6 +135,7 @@ export function countUnreadContext(db: Database.Database, exceptChannelType: str
       .prepare(
         `SELECT COUNT(*) as count FROM messages_in
        WHERE status = 'pending'
+         AND kind <> 'system'
          AND trigger = 0
          AND (channel_type IS NULL OR channel_type <> ?)
          AND (process_after IS NULL OR datetime(process_after) <= datetime('now'))`,

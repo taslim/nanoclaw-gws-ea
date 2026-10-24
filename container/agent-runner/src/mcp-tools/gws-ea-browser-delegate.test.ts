@@ -277,7 +277,7 @@ it("records a disclosure of one stored value to one site for a job, by the value
     { status: 'recorded', site: 'osteria.example', value_id: fields.value_id, kind: 'phone' },
   );
   expect(request).toEqual({ action: 'record_disclosure', requestId: id, ...fields });
-  for (const word of ['recorded', 'personal_data', 'private-values', 'value_id'])
+  for (const word of ['recorded', 'personal_data', 'value_id'])
     expect(recordDisclosure.tool.description).toContain(word);
 });
 
@@ -359,4 +359,85 @@ it('names in the delegation guidance only real tools, and otherwise only codes a
   } finally {
     process.chdir(cwd);
   }
+});
+
+it('keeps shared browser judgment brief and moves outcome meanings to the tools and job', () => {
+  const guidance = fs.readFileSync(
+    new URL('../../../../src/modules/gws-ea-browser/main-guidance.md', import.meta.url),
+    'utf8',
+  );
+  expect(guidance.trim().split(/\s+/u).length).toBeGreaterThanOrEqual(280);
+  expect(guidance.trim().split(/\s+/u).length).toBeLessThanOrEqual(340);
+  for (const mechanic of [
+    'card_needed',
+    'facts_incomplete',
+    'checkout_changing',
+    'alias_unavailable',
+    'possible_duplicate',
+    'personal_data',
+    'account_exists',
+    '--job',
+    'ncl private-values list',
+    'reservation_bounds',
+    'relay_code',
+    'Assistant Identity',
+  ])
+    expect(guidance).not.toContain(mechanic);
+  for (const judgment of [
+    'signed-in',
+    'brief',
+    'For example',
+    'shared signed-in profile and vault',
+    '`record_disclosure`',
+    'principal approvals',
+    'never mind',
+    'password',
+    'currency',
+    'maximum total',
+  ])
+    expect(guidance).toContain(judgment);
+  expect(recordDisclosure.tool.description).toContain('embedded');
+  expect(recordDisclosure.tool.description).toContain('booking platform');
+  expect(recordDisclosure.tool.description).not.toContain('ncl private-values list');
+  const instructions = fs.readFileSync(
+    new URL('../../../../templates/gws-ea/browser/instructions.md', import.meta.url),
+    'utf8',
+  );
+  expect(instructions).toContain('plain words');
+  expect(instructions).not.toContain('Assistant Identity');
+  for (const code of [
+    'card_needed',
+    'facts_incomplete',
+    'checkout_changing',
+    'alias_unavailable',
+    'possible_duplicate',
+    'personal_data',
+    'account_exists',
+  ])
+    expect(instructions).toContain(code);
+});
+
+it('explains credential outcomes where the job calls the tool', () => {
+  const description = browserTools.credentialForm.tool.description ?? '';
+  for (const [code, meaning] of [
+    ['account_exists', 'already has an account'],
+    ['password_rejected', 'rejected the new password'],
+    ['current_password_rejected', 'rejected the saved current password'],
+    ['outcome_unknown', 'may or may not have happened'],
+    ['inconclusive', 'could not establish'],
+    ['ambiguous', 'could not identify'],
+    ['not_owned', 'changed or removed'],
+    ['vault_unavailable', 'cannot be used right now'],
+    ['rate_limited', 'daily request limit'],
+  ]) {
+    expect(description).toContain(code);
+    expect(description).toContain(meaning);
+  }
+  for (const tool of [
+    ...DELEGATE_TOOLS,
+    ...Object.values(browserTools).filter(
+      (value): value is McpToolDefinition => typeof value === 'object' && value !== null && 'tool' in value,
+    ),
+  ])
+    expect((tool.tool.description ?? '').length).toBeLessThanOrEqual(4096);
 });

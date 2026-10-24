@@ -19,6 +19,7 @@
  * authority. The principal's explicit retry after adding a login lists the
  * vault again at once.
  */
+import { noVerifiedPrincipalMessage } from '../gws-ea-profile/approval-wording.js';
 import { answeredGuard, answeringAction, forbidden, invalidArgs } from '../../cli/delivery-action.js';
 import { getDb } from '../../db/connection.js';
 import { registerDeliveryAction } from '../../delivery.js';
@@ -164,7 +165,7 @@ const vaultEmailGuard = defineGuardedAction({
     const principal = await principalApproverUserId();
     return principal
       ? HOLD('Only the principal confirms an email that is not one of their addresses.', principal)
-      : DENY('No verified principal can confirm that email.');
+      : DENY(noVerifiedPrincipalMessage());
   },
 });
 
@@ -374,7 +375,7 @@ async function askPrincipal(email: string, session: Session): Promise<Record<str
   if (open) return { status: 'awaiting_principal', email };
   const approvalId = await requestApproval({
     session,
-    agentName: 'main',
+    agentName: session.agent_group_id,
     action: EMAIL_APPROVAL,
     payload,
     title: 'Share my 1Password vault with this email?',

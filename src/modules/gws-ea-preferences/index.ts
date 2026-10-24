@@ -84,15 +84,7 @@ function summarizeSchedulingPreferences(values: SchedulingPreferenceValues): str
 }
 
 /**
- * main reads the store, which it also changes: a copy in its document is
- * written when the container starts, so it would go stale the moment main
- * set or forgot a value, and a fresh conversation would act on the old one.
- */
-export const MAIN_PREFERENCES_POINTER =
-  "The principal's scheduling preferences (working hours, protected times, default meeting lengths, buffers, and preferred times) live in their typed store. Read them with `ncl preferences get` before you schedule anything or describe them: the store is the only current copy, and a value from earlier in the conversation may have changed since.";
-
-/**
- * The preferences each audience is given (KTD14). `external-email` gets
+ * Main's role directs it to the live store it changes. `external-email` gets
  * none: it learns the principal's time only as free slots from the host.
  * The browser gets none either: it sees only its errand, and the brief that
  * sends one carries whatever bounds the errand needs. Other groups cannot
@@ -102,8 +94,7 @@ export const MAIN_PREFERENCES_POINTER =
 async function preferencesSection(group: AgentGroup): Promise<RequiredProjectDocSection | undefined> {
   if (!(await getDb().hasTable('gws_ea_pref_working_hours'))) return undefined;
   const audience = await projectDocAudience(group.id);
-  if (audience === 'main') return { name: 'Scheduling Preferences', body: MAIN_PREFERENCES_POINTER };
-  if (audience === 'external-email' || audience === 'browser') return undefined;
+  if (audience === 'main' || audience === 'external-email' || audience === 'browser') return undefined;
   const body = summarizeSchedulingPreferences(await getSchedulingPreferenceValues());
   return body === undefined ? undefined : { name: 'Scheduling Preferences', body };
 }

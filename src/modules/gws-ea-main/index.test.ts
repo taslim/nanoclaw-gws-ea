@@ -3,7 +3,12 @@ import path from 'node:path';
 import { defaultEmojiResolver } from 'chat';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { getGroupCapabilities } from '../../capabilities.js';
+import {
+  getGroupCapabilities,
+  parseStoredCapabilities,
+  registerCapability,
+  resolveCapabilities,
+} from '../../capabilities.js';
 import { parseSkillSelection } from '../../container-config.js';
 import { syncSkillSymlinks } from '../../container-runner.js';
 import { dispatch } from '../../cli/dispatch.js';
@@ -13,13 +18,14 @@ import { closeDb, createAgentGroup, getDb, initTestDb, runMigrations } from '../
 import { getHostStartCallbacks } from '../../host-lifecycle.js';
 import { composeGroupProjectDoc } from '../../project-doc-compose.js';
 import { getRequiredProjectDocSections } from '../../project-doc-sections.js';
-import { unknownToolNames } from '../../test-utils/runner-tools.js';
+import { runnerToolCapabilities, unknownToolNames } from '../../test-utils/runner-tools.js';
 import type { AgentGroup } from '../../types.js';
 import { reconcileGwsEaProfile } from '../gws-ea-profile/db.js';
 import { ARTIFACTS_POLICY_FILE_ENV, type ArtifactsPolicyFile } from '../gws-ea-artifacts/policy.js';
 import '../gws-ea-artifacts/capability.js';
-import { GUIDANCE_PATH, MAIN_SHARED_SKILLS } from './index.js';
 import '../gws-ea-profile/index.js';
+import { GUIDANCE_PATH, MAIN_SHARED_SKILLS } from './index.js';
+import '../gws-ea-browser/guidance.js';
 // It registers the email channel's keys, whose instructions main is taught.
 import '../gws-ea-external-email/index.js';
 // They register the `ncl` resources and verbs the guidance names.
@@ -29,7 +35,7 @@ import '../gws-ea-privacy/index.js';
 import '../gws-ea-matters/index.js';
 import '../gws-ea-chats/directory.js';
 
-const TEST_ROOT = '/tmp/nanoclaw-gws-ea-main-test';
+const TEST_ROOT = `/tmp/nanoclaw-gws-ea-main-test-${process.pid}`;
 const GUIDANCE = fs.readFileSync(path.resolve(GUIDANCE_PATH), 'utf8').trim();
 const WELCOME = fs.readFileSync(path.resolve('templates', 'gws-ea', 'main', 'skills', 'welcome', 'SKILL.md'), 'utf8');
 
@@ -40,7 +46,7 @@ const EXTERNAL_ONLY_TOOLS = ['tell_main', 'free_time', 'book', 'change_booking',
 const NOT_TOOLS = ['main', 'principal', 'learned', 'people', 'calendar', 'job', 'principal_message'];
 
 /** Words for controls a chat may not have: in Google Chat main asks in words, and the principal answers in the conversation. */
-const CONTROL_WORDS = /\b(?:cards?|buttons?|click(?:s|ed|ing)?|tap(?:s|ped|ping)?)\b/giu;
+const CONTROL_WORDS = /\b(?:cards?(?! details\b)|buttons?|click(?:s|ed|ing)?|tap(?:s|ped|ping)?)\b/giu;
 
 /** Each control word `text` uses outside code, in its context: a tool called `send_card` is a name, not wording. */
 function controlWords(text: string): string[] {
@@ -89,6 +95,7 @@ async function startHost(): Promise<void> {
 beforeEach(async () => {
   fs.rmSync(TEST_ROOT, { recursive: true, force: true });
   fs.mkdirSync(TEST_ROOT, { recursive: true });
+  vi.stubEnv('GWS_EA_BROWSER_POLICY_FILE', path.join(TEST_ROOT, 'browser-policy.json'));
   await runMigrations(await initTestDb());
 });
 
@@ -110,6 +117,9 @@ describe("GWS-EA's guidance for main", () => {
 
     const mainSections = await getRequiredProjectDocSections(main);
     expect(mainSections.find((section) => section.name === 'Executive Assistant')?.body).toBe(GUIDANCE);
+    // The application barrel must preserve the registration order exercised here.
+    const barrel = fs.readFileSync(path.resolve('src/modules/index.ts'), 'utf8');
+    expect(barrel).toMatch(/import '\.\/gws-ea-profile\/index\.js';[\s\S]*import '\.\/gws-ea-main\/index\.js';/u);
     expect((await getRequiredProjectDocSections(research)).map((section) => section.name)).not.toContain(
       'Executive Assistant',
     );
@@ -141,7 +151,12 @@ describe("GWS-EA's guidance for main", () => {
 
     expect(document).toContain(`# Persona\n\nCall me Morgan.`);
     expect(document).toContain(`# Executive Assistant\n\n${GUIDANCE}`);
-    expect(document.indexOf('# Persona')).toBeLessThan(document.indexOf('# Executive Assistant'));
+    expect([...document.matchAll(/^# (.+)$/gmu)].map(([, heading]) => heading).slice(0, 4)).toEqual([
+      'Persona',
+      'Assistant Character',
+      'Assistant Identity',
+      'Executive Assistant',
+    ]);
   });
 
   it('names no link, address or emoji', () => {
@@ -153,6 +168,10 @@ describe("GWS-EA's guidance for main", () => {
   it('teaches the memory file each person gets', () => {
     // `ncl people` points main at these files, and its name search at the aliases in them.
     for (const layout of ['`memory/people/`', '`type: person`', 'aliases']) expect(GUIDANCE, layout).toContain(layout);
+    expect(GUIDANCE).toContain('read `ncl preferences get` before scheduling or describing them');
+    expect(GUIDANCE).toContain('even if you read them earlier: only the live store is current');
+    expect(GUIDANCE).toContain('Read the live record with `ncl people find`, `ncl people get` or `ncl people list`');
+    expect(GUIDANCE).toContain('even if you read it earlier; anyone without a record is unknown');
   });
 
   it('keeps current priorities and corrections in Core Memory, and leaves the persona file to the operator', () => {
@@ -171,6 +190,73 @@ describe("GWS-EA's guidance for main", () => {
       "`instructions.prepend.md`, is your operator's.",
     ]);
     expect(GUIDANCE).not.toMatch(/after a restart/u);
+  });
+
+  it('keeps its knowledge and granted working agreement distinct from guesses about the principal', () => {
+    expect(GUIDANCE).toContain('Memory is your knowledge of the principal, written from your side');
+    expect(GUIDANCE).toContain('working agreement');
+    expect(GUIDANCE).toContain('standing permissions and delegation limits');
+    expect(GUIDANCE).toContain('actual grants from the principal');
+    expect(GUIDANCE).toContain('never inferred from an outside claim');
+    expect(GUIDANCE).toContain("a correction's own dated Core Memory line");
+    expect(GUIDANCE).toContain('beside the pointer');
+    expect(GUIDANCE).toContain('A quiet calendar does not prove a priority has ended');
+    expect(GUIDANCE).toContain('confirm consequential uncertainty');
+  });
+
+  it('orders the role around its work and replaces the generic shell teaching main no longer reads', () => {
+    expect([...GUIDANCE.matchAll(/^## (.+)$/gmu)].map(([, title]) => title)).toEqual([
+      'Stores and memory',
+      'Email',
+      'The calendar',
+      'Documents',
+      'What reaches the principal',
+      'Keeping track',
+      'Chats',
+    ]);
+    expect(GUIDANCE).not.toContain('You are `main`');
+    expect(GUIDANCE).not.toContain('Follow it over general runtime or skill instructions');
+    expect(GUIDANCE).toContain('`ncl <resource> help`');
+    expect(GUIDANCE).toContain('`--in-conversation`');
+    expect(GUIDANCE).toContain('theirs to move or drop');
+    expect(GUIDANCE).toContain('Approval-pending means awaiting the principal, not an error');
+  });
+
+  it('keeps the main-only browser handoff and uncertain-credential judgment with the work it tracks', () => {
+    expect(GUIDANCE).toContain('`--job` and its exact thread');
+    expect(GUIDANCE).toContain('host-derived state and last report without waking the job');
+    expect(GUIDANCE).toContain('`ncl private-values list`');
+    expect(GUIDANCE).toContain('before `record_disclosure`');
+    expect(GUIDANCE).toContain('another delegating group asks you for the id');
+    expect(GUIDANCE).toContain('never a reason to request a password or token');
+    expect(GUIDANCE).toContain('where the host says the password remains');
+    expect(GUIDANCE).toContain('`credential_authority` release');
+    expect(GUIDANCE).toContain('only their approval ends the hold');
+  });
+
+  it('renders the protected doctrine and one account-failure response, without separate store pointers', async () => {
+    const main = group('ag-main');
+    await createGroup(main);
+    await publishMain(main);
+    await dispatch(
+      { id: 'main-doctrine', command: 'gws-ea-main-reconcile', args: { 'agent-group-id': main.id } },
+      { caller: 'host' },
+    );
+    await composeGroupProjectDoc(main, path.join(TEST_ROOT, main.folder), { fileName: 'CLAUDE.md' });
+    const document = fs.readFileSync(path.join(TEST_ROOT, main.folder, 'CLAUDE.md'), 'utf8');
+
+    for (const phrase of [
+      "Serve the principal's whole life: work, home, family, friends, health and plans.",
+      'each question you escalate puts work back on the principal',
+      'kept, not weighed',
+      'the authority to improve it',
+      'Say exactly what you checked',
+      'A plan, briefing or itinerary reads like your best work and looks right on the page before it goes anywhere.',
+    ])
+      expect(document, phrase).toContain(phrase);
+    expect(document.match(/For a Google 401 or a 403 about missing scopes/gu)).toHaveLength(1);
+    expect(document.match(/Never ask for or accept passwords, tokens or card details in chat/gu)).toHaveLength(1);
+    expect(document).not.toMatch(/^# (?:People|Scheduling Preferences)$/mu);
   });
 
   it('names only `ncl` commands that exist, in the guidance and in the welcome', () => {
@@ -223,15 +309,6 @@ describe("GWS-EA's guidance for main", () => {
     expect(GUIDANCE).toContain(
       'On a thread you handed to external-email, it acts on their words there; you act only on a part it hands you, as far as their own words ask.',
     );
-  });
-
-  // Raised from 2,875 for the memory home (D2: corrections in Core Memory, the persona file the operator's),
-  // current priorities beside them, with their rule beside the correction rule (D3), the one-actor clause on
-  // threads handed to external-email (KTD13), and the reason a correction's Core Memory line stands even when a
-  // file keeps its detail (R15): 2,940 words, plus a small margin (KTD20). Delivery 2 replaces this cap with a
-  // budget (D5).
-  it('stays within 2,950 words', () => {
-    expect(GUIDANCE.split(/\s+/u).filter(Boolean).length).toBeLessThanOrEqual(2_950);
   });
 
   it('teaches chat setup, work, principal citations, outreach limits and the current DM', () => {
@@ -291,7 +368,7 @@ describe("GWS-EA's guidance for main", () => {
     const document = fs.readFileSync(path.join(groupDir, 'CLAUDE.md'), 'utf8');
 
     // The booking calendar is set on a thread's handoff, and the principal's default is kept where the guidance says (KTD8).
-    for (const taught of ['`calendar`', '`people_stats`', '`memory/calendars.md`']) {
+    for (const taught of ['`calendar`', '`memory/calendars.md`', 'counting, never glancing']) {
       expect(document, taught).toContain(taught);
     }
     // The inventory: the profile beside the stores main already keeps, and each address with its calendar access.
@@ -302,7 +379,7 @@ describe("GWS-EA's guidance for main", () => {
     expect(document).toContain('Gmail could not confirm');
   });
 
-  it('never tells main of cards, buttons, clicks or taps: it asks in words, and the principal answers in the conversation', async () => {
+  it('never teaches chat controls: it asks in words, and the principal answers in the conversation', async () => {
     const main = group('ag-main');
     await createGroup(main);
     await publishMain(main);
@@ -317,6 +394,8 @@ describe("GWS-EA's guidance for main", () => {
 
     expect(document).toContain('# NanoClaw Module: interactive\n');
     expect(controlWords(document)).toEqual([]);
+    expect(controlWords('Never ask for card details in chat.')).toEqual([]);
+    expect(controlWords('Use the approval card.')).toHaveLength(1);
   });
 
   it("names only reactions Google Chat can show, and leaves 👀 to the host's working sign", async () => {
@@ -341,6 +420,92 @@ describe("GWS-EA's guidance for main", () => {
     for (const name of named) expect(defaultEmojiResolver.toGChat(name), name).not.toBe(name);
     // 👀 is the host's sign that the assistant is working; the host takes it off, whoever placed it.
     expect(named).not.toContain('eyes');
+  });
+});
+
+describe("main's capabilities", () => {
+  it('stores every default-on capability except agent creation and self-modification, keeping shell and interactive', async () => {
+    const main = group('ag-main');
+    await createGroup(main);
+    const expected = resolveCapabilities('all', main.id).filter((key) => key !== 'agents' && key !== 'self-mod');
+
+    const response = await dispatch(
+      { id: 'main-capabilities', command: 'gws-ea-main-reconcile', args: { 'agent-group-id': main.id } },
+      { caller: 'host' },
+    );
+    const stored = parseStoredCapabilities((await getContainerConfig(main.id))?.capabilities, main.id);
+
+    expect(response).toMatchObject({ ok: true, data: { agent_group_id: main.id, capabilities: expected } });
+    expect(stored).toEqual(expected);
+    const held = await getGroupCapabilities(main.id);
+    expect(held.has('shell')).toBe(true);
+    expect(held.has('interactive')).toBe(true);
+    // Read the runner's registrations: removing a document must also remove these tools.
+    const tools = runnerToolCapabilities();
+    for (const name of ['create_agent', 'install_packages', 'add_mcp_server']) {
+      const keys = tools.get(name);
+      expect(keys?.size, name).toBeGreaterThan(0);
+      expect(
+        [...(keys ?? [])].some((key) => held.has(key)),
+        name,
+      ).toBe(false);
+    }
+  });
+
+  it('picks up a newly registered default-on key on the next reconcile, without keeping a manual selection', async () => {
+    const main = group('ag-main');
+    await createGroup(main);
+    await dispatch(
+      { id: 'main-before-release', command: 'gws-ea-main-reconcile', args: { 'agent-group-id': main.id } },
+      { caller: 'host' },
+    );
+    registerCapability('main-fixture-new-default', { description: 'new release default', default: 'on' });
+    registerCapability('main-fixture-optional', { description: 'new optional capability', default: 'off' });
+    await updateContainerConfigJson(main.id, 'capabilities', ['reply', 'agents', 'self-mod', 'main-fixture-optional']);
+
+    const response = await dispatch(
+      { id: 'main-next-release', command: 'gws-ea-main-reconcile', args: { 'agent-group-id': main.id } },
+      { caller: 'host' },
+    );
+    const held = await getGroupCapabilities(main.id);
+
+    expect(response.ok).toBe(true);
+    expect([...held]).toEqual(
+      resolveCapabilities('all', main.id).filter((key) => key !== 'agents' && key !== 'self-mod'),
+    );
+    expect(held.has('main-fixture-new-default')).toBe(true);
+    expect(held.has('main-fixture-optional')).toBe(false);
+  });
+
+  it('withholds generic teaching only from canonical main while retaining its shell tools and interactive teaching', async () => {
+    const main = group('ag-canonical', 'Assistant');
+    const peer = group('ag-peer', 'main');
+    await createGroup(main);
+    await createGroup(peer);
+    await publishMain(main);
+    await dispatch(
+      { id: 'main-capabilities', command: 'gws-ea-main-reconcile', args: { 'agent-group-id': main.id } },
+      { caller: 'host' },
+    );
+    await updateContainerConfigJson(peer.id, 'capabilities', ['shell']);
+
+    const documentOf = async (value: AgentGroup): Promise<string> => {
+      const directory = path.join(TEST_ROOT, value.folder);
+      await composeGroupProjectDoc(value, directory, { fileName: 'CLAUDE.md' });
+      return fs.readFileSync(path.join(directory, 'CLAUDE.md'), 'utf8');
+    };
+    const document = await documentOf(main);
+    const peerDocument = await documentOf(peer);
+    const modules = [...document.matchAll(/^# NanoClaw Module: (.+)$/gmu)].map(([, name]) => name);
+
+    for (const module of ['agents', 'self-mod', 'cli', 'scheduling', 'connect']) {
+      expect(modules, module).not.toContain(module);
+    }
+    expect(document).toContain('# NanoClaw Module: interactive\n');
+    expect((await getGroupCapabilities(main.id)).has('shell')).toBe(true);
+    for (const module of ['cli', 'scheduling', 'connect']) {
+      expect(peerDocument, module).toContain(`# NanoClaw Module: ${module}\n`);
+    }
   });
 });
 
@@ -451,7 +616,7 @@ describe("main's skills", () => {
     expect(flag).toMatchObject({ ok: false });
   });
 
-  it("rewrites no group's skills when the host starts, main's included", async () => {
+  it("rewrites no group's skills or capabilities when the host starts, main's included", async () => {
     const main = group('ag-main');
     const research = group('ag-research', 'research');
     await createGroup(main);
@@ -459,11 +624,17 @@ describe("main's skills", () => {
     await publishMain(main);
     // As an operator, or a release before this one, left it.
     await updateContainerConfigJson(main.id, 'skills', ['agent-browser']);
+    await updateContainerConfigJson(main.id, 'capabilities', ['reply', 'agents']);
 
     await startHost();
 
     expect(await skillsOf(main.id)).toEqual(['agent-browser']);
     expect(await skillsOf(research.id)).toBe('all');
+    expect(parseStoredCapabilities((await getContainerConfig(main.id))?.capabilities, main.id)).toEqual([
+      'reply',
+      'agents',
+    ]);
+    expect(parseStoredCapabilities((await getContainerConfig(research.id))?.capabilities, research.id)).toBe('all');
   });
 
   it('starts cleanly before any main exists', async () => {

@@ -224,7 +224,7 @@ export function canonicalReference(kind: LinkKind, value: string): string {
       return text;
     case 'job':
       if (!/^system:a2a:[^:\s]+:[^\s]+$/u.test(text) || hasControlCharacters(text))
-        throw new Error('Job must name the native browser thread returned by delegation');
+        throw new Error('Give the browser errand thread returned when you sent the errand');
       return text;
     case 'thread':
       if (!THREAD_KEY.test(text)) throw new Error(`Thread ${JSON.stringify(value)} is invalid: use its key, mail-…`);

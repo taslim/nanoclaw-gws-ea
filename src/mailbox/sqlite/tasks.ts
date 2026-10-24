@@ -137,9 +137,7 @@ export function updateTask(db: Database.Database, taskId: string, update: TaskUp
   return rows.length;
 }
 
-// Only tasks carry a recurrence (non-task writeSessionMessage never sets one),
-// so getCompletedRecurring only ever returns task rows — the fields below are
-// all that handleRecurrence needs to clone the next occurrence.
+// Fields handleRecurrence needs to clone a task’s next occurrence.
 export interface RecurringMessage {
   id: string;
   content: string;
@@ -152,7 +150,9 @@ export interface RecurringMessage {
 // it; dropping the row would silently kill the series on first script error.
 export function getCompletedRecurring(db: Database.Database): RecurringMessage[] {
   return db
-    .prepare("SELECT * FROM messages_in WHERE status IN ('completed', 'failed') AND recurrence IS NOT NULL")
+    .prepare(
+      "SELECT * FROM messages_in WHERE kind = 'task' AND status IN ('completed', 'failed') AND recurrence IS NOT NULL",
+    )
     .all() as RecurringMessage[];
 }
 

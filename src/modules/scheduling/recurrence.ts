@@ -70,7 +70,7 @@ export async function handleRecurrence(inDb: InboundMailbox, session: Session): 
       if (scriptFails >= SCRIPT_FAIL_PAUSE_CAP) {
         // Re-arm PAUSED at the cron time so `ncl tasks resume` revives the
         // series in place; leave the why in the run log.
-        await inDb.armNextTask(msg.id, {
+        const armed = await inDb.armNextTask(msg.id, {
           id: newId,
           seriesId: msg.seriesId,
           processAfter: cronNext.toISOString(),
@@ -78,6 +78,7 @@ export async function handleRecurrence(inDb: InboundMailbox, session: Session): 
           content: msg.content,
           status: 'paused',
         });
+        if (!armed) continue;
         await appendHostTaskNote(
           session.agent_group_id,
           msg.seriesId,
@@ -94,13 +95,14 @@ export async function handleRecurrence(inDb: InboundMailbox, session: Session): 
       const backoffAt = scriptFails > 0 ? Date.now() + scriptBackoffMinutes(scriptFails) * 60_000 : 0;
       const nextRun = new Date(Math.max(cronNext.getTime(), backoffAt)).toISOString();
 
-      await inDb.armNextTask(msg.id, {
+      const armed = await inDb.armNextTask(msg.id, {
         id: newId,
         seriesId: msg.seriesId,
         processAfter: nextRun,
         recurrence: msg.recurrence,
         content: msg.content,
       });
+      if (!armed) continue;
 
       log.info('Inserted next recurrence', {
         originalId: msg.id,

@@ -1,3 +1,4 @@
+import { noVerifiedPrincipalMessage } from './approval-wording.js';
 import { registerSessionAdmissionPolicy } from '../../container-runner.js';
 import { getDb } from '../../db/connection.js';
 import { getMessagingGroup } from '../../db/messaging-groups.js';
@@ -10,9 +11,9 @@ import { registerResource } from '../../cli/crud.js';
 import type { CallerContext } from '../../cli/frame.js';
 import { register } from '../../cli/registry.js';
 import type { AgentGroup } from '../../types.js';
+import { hasBrowserAccess } from '../gws-ea-browser/access.js';
 import { registerApprovalHandler } from '../approvals/index.js';
 import { NAME_LIMIT, quoted } from '../approvals/request-text.js';
-import { hasBrowserAccess } from '../gws-ea-browser/access.js';
 // The inbox's store alone: its module entry points load external-email, whose
 // registrations must follow this module's.
 import { getInboxState, principalCalendarAccess } from '../gws-ea-inbox/db.js';
@@ -37,6 +38,7 @@ import {
   validateGwsEaProfileInput,
   type PublishedNameAndTimezone,
 } from './db.js';
+import { registerGuidance } from './guidance.js';
 import { escapeMarkdownInline } from './markdown.js';
 import {
   gwsEaExternalEmailPointerMigration,
@@ -94,37 +96,18 @@ function assistantAddressSentence(assistant: string, email: string | null): stri
   return ` ${assistant}'s own Google Workspace address is ${quotedAddress(email)}.`;
 }
 
-/**
- * The assistant on the web, for each group that delegates to the browser
- * (KTD14): its alias, or that none is set up yet, and that accounts in the
- * principal's name come only from their logins in 1Password (R25).
- */
-function delegatorWebSentences(assistant: string, principal: string, alias: string | null): string {
-  const address =
-    alias === null
-      ? ` ${assistant} has no web address yet: until the operator sets it up, a browser errand that needs ${assistant}'s email stops with \`alias_unavailable\`.`
-      : ` ${assistant}'s web address is ${quotedAddress(alias)}: ${assistant}'s email on every website, for ${assistant}'s own accounts and for bookings and checkouts made for ${principal}.`;
-  return `${address} ${assistant} never creates an account in ${principal}'s name: ${principal}'s own accounts come only from their logins in 1Password, so when an errand needs one that the vault has no login for, ask ${principal} to add it to 1Password.`;
+function websiteEmailSentence(assistant: string, email: string | null): string {
+  return email === null
+    ? ` ${assistant} has no verified website email.`
+    : ` ${assistant}'s verified website email is ${quotedAddress(email)}.`;
 }
 
-/**
- * The principal's addresses for the browser (R34): to recognize on a page, never to give a site. Only the
- * host puts one on a site, when it signs the principal in to their own account from their login in 1Password.
- */
 function browserPrincipalAddressesSentence(principal: string, emails: readonly string[]): string {
   if (emails.length === 0) return '';
   const quoted = LIST.format(emails.map((email) => `\`${email}\``));
-  const signIn = `signing ${principal} in to their own account with their login in 1Password.`;
   return emails.length === 1
-    ? ` ${principal}'s email address is ${quoted}, so you recognize it on a page; never type it into a site. Only the host puts it on a site, ${signIn}`
-    : ` ${principal}'s email addresses are ${quoted}, so you recognize them on a page; never type one into a site. Only the host puts one on a site, ${signIn}`;
-}
-
-/** The browser's email on every website (KTD14): the alias, never the address the assistant converses from. */
-function browserWebSentence(assistant: string, principal: string, alias: string | null): string {
-  return alias === null
-    ? ` ${assistant} has no email address for websites yet: a site form that needs one cannot be completed until the operator sets it up, so report that to main.`
-    : ` ${assistant}'s email on every website is ${quotedAddress(alias)}: give it wherever a site asks for ${assistant}'s email, including on a booking or checkout made for ${principal} in ${principal}'s name, and open ${assistant}'s accounts with it, in ${assistant}'s own name.`;
+    ? ` ${principal}'s email address is ${quoted}, so you recognize it on a page; never type it into a site.`
+    : ` ${principal}'s email addresses are ${quoted}, so you recognize them on a page; never type one into a site.`;
 }
 
 /**
@@ -135,20 +118,8 @@ function browserWebSentence(assistant: string, principal: string, alias: string 
  * to: main
  */
 export const MAIN_PRINCIPAL_ADDRESSES_POINTER =
-  " The principal's email addresses decide which calendars are theirs. Read them with `ncl principal-addresses list`, whose `calendar_access` says what you can do with each address's calendar, before you decide whose a calendar is or what you can do with one: the list is the only current copy, and an address or its access may have changed since you last read it. Once the assistant has its own inbox, mail from these addresses carries the principal's authority, so a new one waits for the principal to confirm it in the conversation; the command says when it does, and you are told the result.";
+  " Read `ncl principal-addresses list` before identifying the principal's calendars or using their access. Its addresses and `calendar_access` are the only current copy; either may have changed since your last read.";
 
-/**
- * Who the assistant and the principal are, for each audience (KTD14). Main
- * reads the principal's addresses live. Outside email gets names and its
- * email signature, casual chats names only; a chat job additionally gets
- * the assistant's web address while explicitly allowed to delegate. The browser gives that alias to websites, never
- * the address it converses from, and knows the principal's addresses only
- * to recognize them (R34). Any other group gets the addresses as of
- * its container's start: the default `group` CLI scope leaves the live list
- * out of its reach. Main or another group gets the assistant's web address
- * only while the browser access setting lets it delegate errands, which is
- * all that address is for.
- */
 async function identitySection(group: AgentGroup): Promise<{ name: string; body: string } | undefined> {
   if (!(await getDb().hasTable('gws_ea_profile'))) return undefined;
   const profile = await getGwsEaProfile();
@@ -165,22 +136,29 @@ async function identitySection(group: AgentGroup): Promise<{ name: string; body:
   }
   if (audience === 'external-chat') return { name: 'Assistant Identity', body: names };
   if (audience === 'browser') {
-    const body = `${browserWebSentence(assistant, principal, profile.assistant_alias)}${browserPrincipalAddressesSentence(principal, profile.principal_emails)}`;
+    const body = `${websiteEmailSentence(assistant, profile.assistant_alias)}${browserPrincipalAddressesSentence(principal, profile.principal_emails)}`;
     return { name: 'Assistant Identity', body: `${names}${body}` };
   }
-  const web = (await hasBrowserAccess(group.id))
-    ? delegatorWebSentences(assistant, principal, profile.assistant_alias)
-    : '';
-  if (audience === 'job') return { name: 'Assistant Identity', body: `${names}${web}` };
+  const website = (await hasBrowserAccess(group.id)) ? websiteEmailSentence(assistant, profile.assistant_alias) : '';
+  if (audience === 'job') return { name: 'Assistant Identity', body: `${names}${website}` };
   const own = assistantAddressSentence(assistant, profile.assistant_workspace_email);
   const addresses =
     audience === 'main'
       ? MAIN_PRINCIPAL_ADDRESSES_POINTER
       : principalAddressesSentence(principal, profile.principal_emails);
-  const body = `${own}${web}${addresses}`;
+  const body = `${own}${website}${addresses}`;
   return { name: 'Assistant Identity', body: `${names}${body}` };
 }
 
+registerGuidance('gws-ea-profile:character', {
+  agent: 'the assistant',
+  heading: 'Assistant Character',
+  file: 'src/modules/gws-ea-profile/character.md',
+  receives: async (agentGroupId) => {
+    const audience = await projectDocAudience(agentGroupId);
+    return audience === 'main' || audience === 'external-email' || audience === 'external-chat' || audience === 'job';
+  },
+});
 registerRequiredProjectDocSection('gws-ea-profile:identity', identitySection);
 
 /** A canonical key as the flag the control plane passes (src/cli/args.ts canonicalizes `-` to `_`). */
@@ -349,7 +327,7 @@ const addPrincipalAddressAction = defineGuardedAction({
     }
     if (!(await inboxExists())) return ALLOW('no inbox yet: an address decides only whose calendars are theirs');
     const approver = await principalApproverUserId();
-    if (approver === undefined) return DENY('No verified principal can confirm a new address yet.');
+    if (approver === undefined) return DENY(noVerifiedPrincipalMessage());
     return HOLD("mail from the principal's addresses carries their authority, so the principal confirms it", approver);
   },
 });

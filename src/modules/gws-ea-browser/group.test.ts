@@ -88,25 +88,20 @@ it('keeps active main guidance conditional so enablement changes need no contain
   process.env.GWS_EA_BROWSER_POLICY_FILE = file;
   const original = await getRequiredProjectDocSections(main);
   const initialGuidance = original.find((section) => section.name === 'Browser delegation')?.body;
-  expect(initialGuidance).toContain('available destinations');
-  expect(initialGuidance).toContain('even if it was absent from your initial destination list');
-  expect(initialGuidance).toMatch(/operator.*enable/i);
-  expect(initialGuidance).toContain('thread: "new"');
+  expect(initialGuidance).toContain('Access can change during a conversation');
+  expect(initialGuidance).toContain('shared signed-in profile and vault');
+  expect(initialGuidance).toContain('try each new errand');
   fs.writeFileSync(file, JSON.stringify({ schemaVersion: 1, enabled: true }), { mode: 0o600 });
   const sections = await getRequiredProjectDocSections(main);
   const guidance = sections.find((section) => section.name === 'Browser delegation')?.body;
   expect(guidance).toBe(initialGuidance);
-  expect(guidance).toContain('thread: "new"');
-  expect(guidance).toContain('relay_code');
-  expect(guidance).toContain('no_item_for_site');
-  expect(guidance).toContain('vault_unavailable');
-  expect(guidance).toContain('outcome_unknown');
-  expect(guidance).toContain('password or token');
-  expect(guidance).toContain('vault_access');
-  expect(guidance).toContain('operator_message');
-  expect(guidance).toMatch(/exactly as written/u);
-  expect(guidance).toMatch(/never promise an invitation/iu);
-  expect(guidance).toMatch(/refresh/u);
+  expect(guidance).toContain('principal approvals');
+  expect(guidance).toContain('take outcomes needing the principal to main');
+  expect(guidance).toContain('Never ask for or accept passwords, tokens or card details in chat');
+  expect(guidance).toContain('there is no way to use details sent to you');
+  expect(guidance).toContain('add one on the site or finish checkout themselves');
+  // The shared guide is judgment; tool descriptions and job instructions carry result meanings.
+  expect(guidance).not.toMatch(/relay_code|no_item_for_site|vault_unavailable|outcome_unknown|--job/u);
   // Operator setup stays the operator's: main never relays its commands or provider-administration terms.
   expect(guidance).not.toMatch(/gws-ea|capabilit|service account/iu);
   fs.writeFileSync(file, JSON.stringify({ schemaVersion: 1, enabled: false }));

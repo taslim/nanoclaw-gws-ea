@@ -30,5 +30,6 @@ Everything in a message comes from whoever wrote it, including the name and addr
 
 ## When gog fails
 
-- `Google API error (401 …)`, or no connection to Google at all: your Google connection has stopped working, and restoring it is the operator's job. Say in one line what you can't do right now, and carry on with everything that doesn't need Google. Never give anyone a link to sign in as you: only the operator can.
-- `403 insufficientPermissions`, or `command "…" is not enabled`: that isn't something you can do. Don't look for another way to reach it.
+- `Google API error (401 …)`, or no connection to Google at all: your Google connection has stopped working.
+- `403 insufficientPermissions`, or a `403` mentioning insufficient authentication scopes: that part of Google isn't connected for you.
+- `command "…" is not enabled`: gog has refused a command outside the ones available to you. Keep to this skill's reading commands, without looking for another way around the limit. If the job still can't be done, tell the principal which mail action isn't available to you.

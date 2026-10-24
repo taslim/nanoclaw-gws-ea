@@ -20,6 +20,7 @@ import fs from 'fs';
 import path from 'path';
 
 import {
+  getWithheldModuleInstructions,
   grantCapabilities,
   grantsInstructions,
   MCP_SERVERS_CAPABILITY,
@@ -241,6 +242,7 @@ export async function composeGroupProjectDoc(
   // Module instructions — every MCP/CLI module shipping a sibling
   // `<name>.instructions.md`, describing how to use that module's tools.
   const cliDisabled = configRow?.cli_scope === 'disabled';
+  const withheldInstructions = await getWithheldModuleInstructions(group.id);
   const mcpToolsHostDir = path.join(process.cwd(), MCP_TOOLS_HOST_SUBPATH);
   if (fs.existsSync(mcpToolsHostDir)) {
     for (const entry of fs.readdirSync(mcpToolsHostDir).sort()) {
@@ -248,7 +250,7 @@ export async function composeGroupProjectDoc(
       if (!match) continue;
       const moduleName = match[1];
       if (cliDisabled && NCL_DEPENDENT_MODULES.has(moduleName)) continue;
-      if (!grantsInstructions(moduleName, grants)) continue;
+      if (!grantsInstructions(moduleName, grants) || withheldInstructions.has(moduleName)) continue;
       const instructions = fs.readFileSync(path.join(mcpToolsHostDir, entry), 'utf-8');
       push(`NanoClaw Module: ${moduleName}`, renderBaseInstructions(instructions, spec.instructions), true);
     }

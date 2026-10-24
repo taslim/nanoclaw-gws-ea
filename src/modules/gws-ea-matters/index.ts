@@ -8,8 +8,9 @@
  * (R6). `get` reads each link live from its source (KTD5, `render.ts`).
  *
  * A matter's next look is one scheduled task in main's conversation
- * (KTD4, `looks.ts`), the daily sync brings main back to whatever waited for
- * it (KTD6, `sync.ts`), and the host keeps both on time without the model
+ * (KTD4, `looks.ts`), the daily sync wakes main every day to look ahead and
+ * read what waited for it (KTD6, `sync.ts`), and the host keeps both on time
+ * without the model
  * (KTD7, `loop.ts`). Forgetting a person takes them off every matter
  * (R26, `forget.ts`).
  */
@@ -167,7 +168,7 @@ const LINK_ARGS: ColumnDef[] = [
     name: 'job',
     type: 'string',
     description:
-      'Native browser job threads, comma-separated. A job sits in one open matter; placing it moves it. Closing its matter cancels it.',
+      'Browser errand threads, comma-separated; use the thread returned when you send the errand. A job sits in one open matter; placing it moves it. Closing its matter cancels it.',
   },
   {
     name: 'thread',
@@ -206,7 +207,7 @@ registerResource({
   table: 'gws_ea_matters',
   idColumn: 'id',
   description:
-    "What you must come back to after this turn, however small: one matter each, with a title in the principal's words, the open loop (what they want and what happens next), links to where the facts live, the next look, and whether it is open. A thread, event or file sits in one open matter at a time. Only main may use them, and no one else ever sees one.",
+    "What you must come back to after this turn, however small: one matter each, with a title in the principal's words, the open loop (what they want and what happens next), links to where the facts live, the next look, and whether it is open. A thread, event, file or browser errand sits in one open matter at a time. Only main may use them, and no one else ever sees one.",
   columns: [
     { name: 'id', type: 'string', description: 'The matter.', generated: true },
     { name: 'title', type: 'string', description: "The principal's words for it." },
@@ -222,7 +223,7 @@ registerResource({
       access: 'open',
       description:
         'Open a matter for something you must come back to, with its next look and the links you have.\n\n' +
-        'A thread, event or file in another open matter moves here; the answer names where it came from. Give --parent to open it as a strand of a project, when part of the project needs its own next look; links the whole project shares stay with the project.',
+        'A thread, event, file or browser errand in another open matter moves here; the answer names where it came from. Give --parent to open it as a strand of a project, when part of the project needs its own next look; links the whole project shares stay with the project.',
       args: [
         { ...TITLE_ARG, required: true },
         { ...OPEN_LOOP_ARG, required: true },
@@ -299,7 +300,7 @@ registerResource({
           name: 'unlink',
           type: 'string',
           description:
-            'Links to take off, each as kind:reference as `get` shows it (person:p-1a2b3c4d5e6f), comma-separated.',
+            'Links to take off, comma-separated: join each kind and reference from `get` with a colon, such as person:p-1a2b3c4d5e6f.',
         },
       ],
       examples: [
@@ -364,7 +365,7 @@ registerResource({
     sync: {
       access: 'open',
       description:
-        "The daily sync's pre-task script, which runs on its own once a day before the principal's day starts: it wakes you only when something has waited for you, a note you have not read or a thread to place. The host keeps the sync and its time; you never set it.",
+        "The daily sync's pre-task script, which runs on its own once a day before the principal's day starts: it wakes you every day to look ahead, carrying unread notes, threads to place, later looks and any morning rundown's time. It marks a Monday occurrence for the month ahead. The host keeps the sync and its time; you never set it.",
       args: [],
       examples: ['ncl matters sync'],
       // The runner reads the last line of a script's output as its verdict: one line of JSON.
@@ -374,7 +375,7 @@ registerResource({
     today: {
       access: 'open',
       description:
-        "Your own list for today: today's looks, the matters handed back without one, and the threads waiting to be placed. Run it as the script of a morning rundown the principal asks for, an --in-conversation task theirs to move or drop. Build the rundown from their calendar and tell them what on this list needs them, in their words: the list itself is yours alone.",
+        "Your own list for today: today's looks, the matters handed back without one, and the threads waiting to be placed. Read it alongside their calendar when they ask for a morning rundown. Fold in anything the daily sync prepared and send one morning message. Tell them what needs their attention, in their words; keep this list to yourself.",
       args: [],
       examples: [
         'ncl matters today',

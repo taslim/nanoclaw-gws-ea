@@ -12,9 +12,9 @@ import { getRequiredProjectDocSections } from '../../project-doc-sections.js';
 import type { AgentGroup } from '../../types.js';
 import '../gws-ea-profile/index.js';
 import { getSchedulingPreferences, setSchedulingPreference } from './db.js';
-import { MAIN_PREFERENCES_POINTER } from './index.js';
+import './index.js';
 
-const TEST_ROOT = '/tmp/nanoclaw-gws-ea-preferences-test';
+const TEST_ROOT = `/tmp/nanoclaw-gws-ea-preferences-test-${process.pid}`;
 
 function group(id: string, name: string): AgentGroup {
   return { id, name, folder: id, agent_provider: null, created_at: '2026-09-30T00:00:00.000Z' };
@@ -324,10 +324,10 @@ describe('GWS-EA preferences project-doc section', () => {
     );
   });
 
-  it('points main at the live store, whatever it holds, and never copies a value it could change', async () => {
-    const pointer = { name: 'Scheduling Preferences', body: MAIN_PREFERENCES_POINTER };
-    expect(await getRequiredProjectDocSections(main)).toContainEqual(pointer);
-    expect(MAIN_PREFERENCES_POINTER).toContain('`ncl preferences get`');
+  it('adds no separate pointer or stored values for main: its role directs it to the live store', async () => {
+    expect((await getRequiredProjectDocSections(main)).map((section) => section.name)).not.toContain(
+      'Scheduling Preferences',
+    );
 
     await setSchedulingPreference({
       kind: 'protected-window',
@@ -336,10 +336,14 @@ describe('GWS-EA preferences project-doc section', () => {
       source: 'principal',
       basis: 'Said no meetings before 10.',
     });
-    expect(await getRequiredProjectDocSections(main)).toContainEqual(pointer);
+    expect((await getRequiredProjectDocSections(main)).map((section) => section.name)).not.toContain(
+      'Scheduling Preferences',
+    );
     const groupDir = path.join(TEST_ROOT, main.folder);
     await composeGroupProjectDoc(main, groupDir, { fileName: 'CLAUDE.md' });
-    expect(fs.readFileSync(path.join(groupDir, 'CLAUDE.md'), 'utf8')).not.toContain('00:00-10:00');
+    const document = fs.readFileSync(path.join(groupDir, 'CLAUDE.md'), 'utf8');
+    expect(document).not.toContain('# Scheduling Preferences');
+    expect(document).not.toContain('00:00-10:00');
   });
 
   it('summarizes the stored values with their source for the next session and omits reasons and bases', async () => {

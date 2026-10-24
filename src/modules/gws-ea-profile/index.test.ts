@@ -33,7 +33,8 @@ import {
 import { MAIN_PRINCIPAL_ADDRESSES_POINTER } from './index.js';
 import { recordWebAlias } from './testing/web-alias.js';
 
-const TEST_ROOT = '/tmp/nanoclaw-gws-ea-profile-test';
+const TEST_ROOT = `/tmp/nanoclaw-gws-ea-profile-test-${process.pid}`;
+const CHARACTER = fs.readFileSync(path.resolve('src/modules/gws-ea-profile/character.md'), 'utf8').trim();
 
 // The people store's tables alone, so an address made the principal's can be
 // seen leaving a person's record; its document section stays out of these tests.
@@ -143,19 +144,23 @@ describe('GWS-EA profile module', () => {
 
     for (const candidate of [main, laterGroup]) {
       const sections = await getRequiredProjectDocSections(candidate);
-      expect(sections).toHaveLength(1);
-      expect(sections[0]?.body).toContain('Aya');
-      expect(sections[0]?.body).toContain('Morgan');
-      expect(sections[0]?.body).toContain('separate people');
-      expect(sections[0]?.body).not.toMatch(
-        /google chat|slack|credential|oauth|provider|book|chapter|source material/i,
+      expect(sections.map((section) => section.name)).toEqual(
+        candidate === main ? ['Assistant Character', 'Assistant Identity'] : ['Assistant Identity'],
       );
+      const identity = sections.find((section) => section.name === 'Assistant Identity');
+      expect(identity?.body).toContain('Aya');
+      expect(identity?.body).toContain('Morgan');
+      expect(identity?.body).toContain('separate people');
+      expect(identity?.body).not.toMatch(/google chat|slack|credential|oauth|provider|book|chapter|source material/i);
     }
 
     const groupDir = path.join(TEST_ROOT, main.folder);
     await composeGroupProjectDoc(main, groupDir, { fileName: 'CLAUDE.md' });
     const document = fs.readFileSync(path.join(groupDir, 'CLAUDE.md'), 'utf8');
-    expect(document).toContain('# Assistant Identity');
+    expect([...document.matchAll(/^# (.+)$/gmu)].map(([, heading]) => heading).slice(0, 2)).toEqual([
+      'Assistant Character',
+      'Assistant Identity',
+    ]);
     expect(document.indexOf('# Assistant Identity')).toBeLessThan(document.indexOf('# NanoClaw Runtime Contract'));
   });
 
@@ -680,7 +685,9 @@ describe("the principal's email addresses", () => {
   });
 
   it('points main at the live address list, which it changes mid-conversation, and copies none', async () => {
-    const [section] = await getRequiredProjectDocSections(main);
+    const section = (await getRequiredProjectDocSections(main)).find(
+      (section) => section.name === 'Assistant Identity',
+    );
 
     expect(section?.body).toContain(MAIN_PRINCIPAL_ADDRESSES_POINTER);
     expect(section?.body).not.toMatch(/morgan@(work\.)?example\.test/u);
@@ -711,7 +718,9 @@ describe("the principal's email addresses", () => {
   });
 
   it("names the assistant's own Google address, so the principal knows where to share calendars", async () => {
-    const [section] = await getRequiredProjectDocSections(main);
+    const section = (await getRequiredProjectDocSections(main)).find(
+      (section) => section.name === 'Assistant Identity',
+    );
     expect(section?.body).toContain("Aya's own Google Workspace address is `aya@example.test`.");
   });
 });
@@ -758,14 +767,16 @@ describe("external-email's pointer and audience", () => {
     expect(await projectDocAudience(chat.id)).toBe('external-chat');
     expect(await projectDocAudience(research.id)).toBe('other');
 
-    const [section] = await getRequiredProjectDocSections(ee);
+    const section = (await getRequiredProjectDocSections(ee)).find((section) => section.name === 'Assistant Identity');
     expect(section).toEqual({
       name: 'Assistant Identity',
       body:
         'Aya is the assistant. Morgan is the principal. They are separate people: act and communicate as Aya, support Morgan, and never present the assistant as the principal.' +
         '\n\nYour email signature:\n\nAya | EA to Morgan',
     });
-    const [chatSection] = await getRequiredProjectDocSections(chat);
+    const chatSection = (await getRequiredProjectDocSections(chat)).find(
+      (section) => section.name === 'Assistant Identity',
+    );
     expect(chatSection).toEqual({
       name: 'Assistant Identity',
       body: 'Aya is the assistant. Morgan is the principal. They are separate people: act and communicate as Aya, support Morgan, and never present the assistant as the principal.',
@@ -776,14 +787,10 @@ describe("external-email's pointer and audience", () => {
   });
 });
 
-describe("the assistant's web address in each identity section (KTD14)", () => {
+describe('character and audience-specific identity', () => {
   const main = group('ag-main');
   const browser = group('ag-browser', 'browser');
   const research = group('ag-research', 'research');
-  const NAMES =
-    'Juno is the assistant. Morgan is the principal. They are separate people: act and communicate as Juno, support Morgan, and never present the assistant as the principal.';
-  const ACCOUNTS =
-    " Juno never creates an account in Morgan's name: Morgan's own accounts come only from their logins in 1Password, so when an errand needs one that the vault has no login for, ask Morgan to add it to 1Password.";
 
   beforeEach(async () => {
     for (const candidate of [main, browser, research]) await createGroup(candidate);
@@ -802,19 +809,42 @@ describe("the assistant's web address in each identity section (KTD14)", () => {
     return (await getRequiredProjectDocSections(of)).find((section) => section.name === 'Assistant Identity')?.body;
   }
 
-  it("gives the browser the alias as its email on every site and the assistant's own name for its accounts, never the address it converses from", async () => {
-    await recordWebAlias('onuj@example.test');
-
-    expect(await projectDocAudience(browser.id)).toBe('browser');
-    expect(await identity(browser)).toBe(
-      `${NAMES} Juno's email on every website is \`onuj@example.test\`: give it wherever a site asks for Juno's email, ` +
-        "including on a booking or checkout made for Morgan in Morgan's name, and open Juno's accounts with it, in Juno's own name. " +
-        "Morgan's email address is `morgan@example.test`, so you recognize it on a page; never type it into a site. " +
-        'Only the host puts it on a site, signing Morgan in to their own account with their login in 1Password.',
+  it('keeps protected character doctrine intact, in its own voice without machinery or a memory assignment', () => {
+    const protectedProse = [
+      "Serve the principal's whole life: work, home, family, friends, health and plans.",
+      'each question you escalate puts work back on the principal. Missing information, a choice of taste, other people seeing the result, or several reasonable options are not reasons to ask.',
+      'Their time for family, friends, health, and rest is kept, not weighed',
+      'Calendar ownership is not obedience to the existing calendar; it is the authority to improve it.',
+      'How they live is theirs: point out what a choice collides with, such as a family date, and otherwise arrange it without comment',
+      'remind them of theirs in time, such as a birthday wish, with a line they could send',
+      "When something big happens, such as an illness, a death, a family emergency, or a new baby, answer briefly and as a person would, then take things off them unasked: clear and move what you can, let others hear only that they're away, and hold what can wait. Send one short message with what's handled, and ask nothing that can wait.",
+      'Say exactly what you checked, such as "clear on your calendar" when theirs is all you saw, and call something done only when it worked.',
+      'When something needs nothing from them, such as a change they made to their own calendar, send nothing',
+    ];
+    for (const prose of protectedProse) expect(CHARACTER).toContain(prose);
+    expect(CHARACTER).toContain('Your “I” always means you, never the principal');
+    expect(CHARACTER).toContain('What you know of them is held in trust for them');
+    expect(CHARACTER).not.toMatch(
+      /\b(?:ncl|tools?|agent groups?|matters record|Core Memory|runtime|provider|host)\b|memory\//iu,
     );
+    expect(CHARACTER.split(/\s+/u).filter(Boolean).length).toBeGreaterThanOrEqual(500);
+    expect(CHARACTER.split(/\s+/u).filter(Boolean).length).toBeLessThanOrEqual(700);
   });
 
-  it("gives the browser the principal's addresses to recognize, never to offer a form (R34)", async () => {
+  it('leaves the browser without character while retaining the addresses it may recognize', async () => {
+    const groupDir = path.join(TEST_ROOT, browser.folder);
+    await composeGroupProjectDoc(browser, groupDir, { fileName: 'CLAUDE.md' });
+    const document = fs.readFileSync(path.join(groupDir, 'CLAUDE.md'), 'utf8');
+
+    expect(document).not.toContain('# Assistant Character');
+    expect(document).not.toContain(CHARACTER);
+    expect(document).toContain(
+      "Morgan's email address is `morgan@example.test`, so you recognize it on a page; never type it into a site.",
+    );
+    expect(document).not.toContain('juno@example.test');
+  });
+
+  it('preserves every principal address for browser recognition without a vault procedure', async () => {
     await reconcileGwsEaProfile({
       assistantName: { firstName: 'Juno', lastName: null },
       assistantWorkspaceEmail: 'juno@example.test',
@@ -825,59 +855,42 @@ describe("the assistant's web address in each identity section (KTD14)", () => {
     });
 
     expect(await identity(browser)).toContain(
-      " Morgan's email addresses are `morgan.ellery@home.example` and `morgan@example.test`, so you recognize them on a page; " +
-        'never type one into a site. Only the host puts one on a site, signing Morgan in to their own account with their login in 1Password.',
+      " Morgan's email addresses are `morgan.ellery@home.example` and `morgan@example.test`, so you recognize them on a page; never type one into a site.",
     );
   });
 
-  it("names the alias as main's web address beside its own, and keeps the principal's accounts to their logins in 1Password", async () => {
-    await recordWebAlias('onuj@example.test');
-
-    expect(await identity(main)).toBe(
-      `${NAMES} Juno's own Google Workspace address is \`juno@example.test\`.` +
-        " Juno's web address is `onuj@example.test`: Juno's email on every website, for Juno's own accounts and for bookings and checkouts made for Morgan." +
-        `${ACCOUNTS}${MAIN_PRINCIPAL_ADDRESSES_POINTER}`,
-    );
-    // A group the browser access setting doesn't list sends no errand, so it gets no web address.
-    expect(await identity(research)).not.toContain('onuj@example.test');
-  });
-
-  it('gives the web address to another group the browser access setting lists, as main gets it', async () => {
+  it('keeps the verified website email available as an identity fact without web or vault procedures', async () => {
     await recordWebAlias('onuj@example.test');
     writeBrowserAccess(path.join(TEST_ROOT, 'browser', 'policy.json'), { agentGroupIds: [main.id, research.id] });
     try {
-      expect(await identity(research)).toBe(
-        `${NAMES} Juno's own Google Workspace address is \`juno@example.test\`.` +
-          " Juno's web address is `onuj@example.test`: Juno's email on every website, for Juno's own accounts and for bookings and checkouts made for Morgan." +
-          `${ACCOUNTS} Morgan's email address is \`morgan@example.test\`.`,
-      );
+      const mainIdentity = await identity(main);
+      expect(mainIdentity).toContain("Juno's own Google Workspace address is `juno@example.test`.");
+      expect(mainIdentity).toContain('`ncl principal-addresses list`');
+      expect(mainIdentity).toContain('`calendar_access`');
+      expect(mainIdentity?.split(/\s+/u).filter(Boolean).length).toBeLessThanOrEqual(90);
+      for (const candidate of [main, browser, research]) {
+        expect(await identity(candidate)).toContain("Juno's verified website email is `onuj@example.test`.");
+        expect(await identity(candidate)).not.toMatch(/1Password|alias_unavailable|vault|sign ?up|checkouts/u);
+      }
     } finally {
       vi.unstubAllEnvs();
     }
   });
 
-  it("leaves the web address and the browser's stops out of main's section when the access setting omits main", async () => {
-    await recordWebAlias('onuj@example.test');
-    writeBrowserAccess(path.join(TEST_ROOT, 'browser', 'policy.json'), { agentGroupIds: [research.id] });
+  it('makes a missing website email explicit and withholds its fact when browser access is removed', async () => {
+    writeBrowserAccess(path.join(TEST_ROOT, 'browser', 'policy.json'), { agentGroupIds: [main.id] });
     try {
-      expect(await identity(main)).toBe(
-        `${NAMES} Juno's own Google Workspace address is \`juno@example.test\`.${MAIN_PRINCIPAL_ADDRESSES_POINTER}`,
-      );
+      expect(await identity(browser)).toContain('Juno has no verified website email.');
+      expect(await identity(main)).toContain('Juno has no verified website email.');
+      expect(await identity(research)).not.toContain('website email');
+      await recordWebAlias('onuj@example.test');
+      expect(await identity(main)).toContain('`onuj@example.test`');
+      writeBrowserAccess(path.join(TEST_ROOT, 'browser', 'policy.json'), { agentGroupIds: [research.id] });
+      expect(await identity(main)).not.toContain('website email');
+      expect(await identity(research)).toContain('`onuj@example.test`');
     } finally {
       vi.unstubAllEnvs();
     }
-  });
-
-  it('tells main and the browser that no web address is set up while none is recorded (R23)', async () => {
-    expect(await identity(main)).toContain(
-      " Juno has no web address yet: until the operator sets it up, a browser errand that needs Juno's email stops with `alias_unavailable`." +
-        ACCOUNTS,
-    );
-    const body = await identity(browser);
-    expect(body).toContain(
-      ' Juno has no email address for websites yet: a site form that needs one cannot be completed until the operator sets it up, so report that to main.',
-    );
-    expect(body).not.toContain('juno@example.test');
   });
 });
 
@@ -999,9 +1012,13 @@ describe("the principal's name and timezone (R16, KTD9)", () => {
     });
     expect(await nameAndTimezone()).toEqual({ name: 'Juno Hale', timezone: 'America/Los_Angeles' });
     // main's identity text is composed at its next start, from the profile.
-    const [section] = await getRequiredProjectDocSections(main);
+    const section = (await getRequiredProjectDocSections(main)).find(
+      (section) => section.name === 'Assistant Identity',
+    );
     expect(section?.body).toContain('Juno Hale is the principal.');
-    const [emailIdentity] = await getRequiredProjectDocSections(ee);
+    const emailIdentity = (await getRequiredProjectDocSections(ee)).find(
+      (section) => section.name === 'Assistant Identity',
+    );
     expect(emailIdentity?.body).toContain('Your email signature:\n\nAya | EA to Juno Hale');
     expect(sent).toHaveLength(1);
     expect(sent[0]).toContain('first name is now Juno (it was Morgan)');
