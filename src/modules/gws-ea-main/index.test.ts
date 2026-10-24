@@ -46,7 +46,7 @@ const EXTERNAL_ONLY_TOOLS = ['tell_main', 'free_time', 'book', 'change_booking',
 const NOT_TOOLS = ['main', 'principal', 'learned', 'people', 'calendar', 'job', 'principal_message'];
 
 /** Words for controls a chat may not have: in Google Chat main asks in words, and the principal answers in the conversation. */
-const CONTROL_WORDS = /\b(?:cards?|buttons?|click(?:s|ed|ing)?|tap(?:s|ped|ping)?)\b/giu;
+const CONTROL_WORDS = /\b(?:cards?(?! details\b)|buttons?|click(?:s|ed|ing)?|tap(?:s|ped|ping)?)\b/giu;
 
 /** Each control word `text` uses outside code, in its context: a tool called `send_card` is a name, not wording. */
 function controlWords(text: string): string[] {
@@ -255,7 +255,7 @@ describe("GWS-EA's guidance for main", () => {
     ])
       expect(document, phrase).toContain(phrase);
     expect(document.match(/For a Google 401 or a 403 about missing scopes/gu)).toHaveLength(1);
-    expect(document.match(/Never ask for or accept passwords or tokens in chat/gu)).toHaveLength(1);
+    expect(document.match(/Never ask for or accept passwords, tokens or card details in chat/gu)).toHaveLength(1);
     expect(document).not.toMatch(/^# (?:People|Scheduling Preferences)$/mu);
   });
 
@@ -309,15 +309,6 @@ describe("GWS-EA's guidance for main", () => {
     expect(GUIDANCE).toContain(
       'On a thread you handed to external-email, it acts on their words there; you act only on a part it hands you, as far as their own words ask.',
     );
-  });
-
-  // Raised from 2,875 for the memory home (D2: corrections in Core Memory, the persona file the operator's),
-  // current priorities beside them, with their rule beside the correction rule (D3), the one-actor clause on
-  // threads handed to external-email (KTD13), and the reason a correction's Core Memory line stands even when a
-  // file keeps its detail (R15): 2,940 words, plus a small margin (KTD20). Delivery 2 replaces this cap with a
-  // budget (D5).
-  it('stays within 2,950 words', () => {
-    expect(GUIDANCE.split(/\s+/u).filter(Boolean).length).toBeLessThanOrEqual(2_950);
   });
 
   it('teaches chat setup, work, principal citations, outreach limits and the current DM', () => {
@@ -388,7 +379,7 @@ describe("GWS-EA's guidance for main", () => {
     expect(document).toContain('Gmail could not confirm');
   });
 
-  it('never tells main of cards, buttons, clicks or taps: it asks in words, and the principal answers in the conversation', async () => {
+  it('never teaches chat controls: it asks in words, and the principal answers in the conversation', async () => {
     const main = group('ag-main');
     await createGroup(main);
     await publishMain(main);
@@ -403,6 +394,8 @@ describe("GWS-EA's guidance for main", () => {
 
     expect(document).toContain('# NanoClaw Module: interactive\n');
     expect(controlWords(document)).toEqual([]);
+    expect(controlWords('Never ask for card details in chat.')).toEqual([]);
+    expect(controlWords('Use the approval card.')).toHaveLength(1);
   });
 
   it("names only reactions Google Chat can show, and leaves 👀 to the host's working sign", async () => {

@@ -97,7 +97,9 @@ it('keeps active main guidance conditional so enablement changes need no contain
   expect(guidance).toBe(initialGuidance);
   expect(guidance).toContain('principal approvals');
   expect(guidance).toContain('take outcomes needing the principal to main');
-  expect(guidance).toContain('Never ask for or accept passwords or tokens in chat');
+  expect(guidance).toContain('Never ask for or accept passwords, tokens or card details in chat');
+  expect(guidance).toContain('there is no way to use details sent to you');
+  expect(guidance).toContain('add one on the site or finish checkout themselves');
   // The shared guide is judgment; tool descriptions and job instructions carry result meanings.
   expect(guidance).not.toMatch(/relay_code|no_item_for_site|vault_unavailable|outcome_unknown|--job/u);
   // Operator setup stays the operator's: main never relays its commands or provider-administration terms.
