@@ -3,6 +3,7 @@ import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from 'vitest';
 
 import { resolveCapabilities, skillsWithinCapabilities } from '../../capabilities.js';
+import { dispatch } from '../../cli/dispatch.js';
 import type { ContainerConfig } from '../../container-config.js';
 import { composeSessionSpec, syncSkillSymlinks } from '../../container-runner.js';
 import { ensureContainerConfig, getContainerConfig, updateContainerConfigJson } from '../../db/container-configs.js';
@@ -459,12 +460,20 @@ describe('what each agent is taught about Google and the gateway', () => {
   it("hands main exactly its release skills, and a document with every Google skill's line, its rules, and no gateway section", async () => {
     resetGatewayProvider({ ...getGatewayProvider(), agentSkills: ['onecli-gateway'] });
     await nameMain('ag-main');
-    await updateContainerConfigJson('ag-main', 'skills', [...MAIN_SHARED_SKILLS]);
+    const reconciled = await dispatch(
+      { id: 'main-reconcile', command: 'gws-ea-main-reconcile', args: { 'agent-group-id': 'ag-main' } },
+      { caller: 'host' },
+    );
+    expect(reconciled.ok).toBe(true);
 
     const { skills, document } = await spawnSurfaces(group('ag-main', 'main'));
 
     expect(skills).toEqual([...MAIN_SHARED_SKILLS]);
     expect(document).not.toContain('# NanoClaw Skill: onecli-gateway');
+    for (const module of ['agents', 'self-mod', 'cli', 'scheduling', 'connect']) {
+      expect(document).not.toContain(`# NanoClaw Module: ${module}\n`);
+    }
+    expect(document).toContain('# NanoClaw Module: interactive\n');
     for (const [skill, line] of Object.entries(TRIGGER_LINES)) {
       expect(document, skill).toContain(`# NanoClaw Skill: ${skill}\n\n${line}`);
     }
