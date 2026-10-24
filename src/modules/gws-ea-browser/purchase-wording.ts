@@ -63,7 +63,6 @@ function hostStop(
   }
 }
 
-/** Why a checkout reached no card or press, in the words the browser reports to its delegator. */
 function unpurchasable(data: Record<string, unknown>): string | undefined {
   switch (data.status) {
     case 'card_needed':
@@ -81,7 +80,6 @@ function unpurchasable(data: Record<string, unknown>): string | undefined {
   }
 }
 
-/** What the browser hears of an approved purchase that went no further (KTD10): its job's state first, then status. */
 interface PurchaseCommitNotice {
   readonly message: string;
   readonly safe_to_rebuild: boolean;
@@ -109,7 +107,6 @@ export function purchaseCommitNotice(
       ? told(`${none}. ${stop} Report it to the agent that sent this errand.`)
       : told(`${none}: this errand was cancelled, so stop here.`);
   }
-  // A changed or expired checkout already went back to the principal as a new card.
   if (data.status === 'awaiting_principal')
     return told(
       `${none}: the principal has a new card with the checkout's current facts. Stay on the checkout and wait for its outcome.`,
@@ -146,7 +143,6 @@ export function purchaseCommitNotice(
   return told(`${none} (${status}). Handle it as the purchase tool describes.`);
 }
 
-/** Host-only invariant failure, never a page's text. */
 export function purchaseInvariantMessage(kind: 'checkout' | 'free', unknown: never): string {
   return kind === 'checkout'
     ? `Unknown checkout read ${JSON.stringify(unknown)}`

@@ -41,20 +41,7 @@ export function watchMessage(kind: keyof typeof watchMessages): string {
 export function renderWatchCard(watch: WatchRow, venueTimeZone: string, principalTimeZone: string): string {
   const bounds = boundsOf(watch),
     financial = bounds.financial;
-  if (bounds.kind === 'region')
-    return [
-      'Approve one reservation across this errand’s watches, within these bounds:',
-      `Site: ${quoted(watch.site, SELLER_TEXT_LIMIT)}`,
-      `Venue: ${quoted(bounds.venue.name, SELLER_TEXT_LIMIT)}`,
-      `Party size: ${bounds.partySize}`,
-      ...bounds.windows.map(
-        (window) => `Arrival window: ${cardEventSpan(window.start, window.end, venueTimeZone, principalTimeZone)}`,
-      ),
-      `Maximum total exposure, all guests and fees: ${formatMoney(financial.maxTotalMinor, financial.currency)} (${financial.currency})`,
-      'A booking goes ahead without asking you again only when the site’s own checkout shows this venue, party and arrival window, with its total, amount due now and every fee within that maximum. Any other booking, a recurring charge included, comes to you on its own card.',
-      `Watch deadline: ${formatLocalTimeWithZone(bounds.until, principalTimeZone)}`,
-    ].join('\n');
-  return [
+  const lines = [
     'Approve one reservation across this errand’s watches, within these bounds:',
     `Site: ${quoted(watch.site, SELLER_TEXT_LIMIT)}`,
     `Venue: ${quoted(bounds.venue.name, SELLER_TEXT_LIMIT)}`,
@@ -63,13 +50,21 @@ export function renderWatchCard(watch: WatchRow, venueTimeZone: string, principa
       (window) => `Arrival window: ${cardEventSpan(window.start, window.end, venueTimeZone, principalTimeZone)}`,
     ),
     `Maximum total exposure, all guests and fees: ${formatMoney(financial.maxTotalMinor, financial.currency)} (${financial.currency})`,
-    `Maximum due now: ${formatMoney(financial.maxDueNowMinor, financial.currency)}`,
-    ...financial.policy!.commitments.map(
-      (term) =>
-        `Merchant financial terms: ${quoted(term.terms, 1200)}; ${term.kind}; amount ${term.amountMinor === undefined ? 'unreadable' : formatMoney(term.amountMinor, financial.currency)}${term.perPerson ? ` per guest × ${bounds.partySize}` : ' total'}; trigger ${quoted(term.trigger ?? '', SELLER_TEXT_LIMIT)}; cancellation ${quoted(term.cancellationTerms ?? '', SELLER_TEXT_LIMIT)}${term.cancellationBeforeMs === undefined ? '' : `; cutoff ${term.cancellationBeforeMs / 60_000} minutes before arrival`}${term.frequency ? `; frequency ${quoted(term.frequency, SELLER_TEXT_LIMIT)}` : ''}${term.conversionAt ? `; converts ${formatLocalTimeWithZone(term.conversionAt, principalTimeZone)}` : ''}`,
-    ),
-    `Watch deadline: ${formatLocalTimeWithZone(bounds.until, principalTimeZone)}`,
-  ].join('\n');
+  ];
+  if (bounds.kind === 'region')
+    lines.push(
+      'A booking goes ahead without asking you again only when the site’s own checkout shows this venue, party and arrival window, with its total, amount due now and every fee within that maximum. Any other booking, a recurring charge included, comes to you on its own card.',
+    );
+  else
+    lines.push(
+      `Maximum due now: ${formatMoney(financial.maxDueNowMinor, financial.currency)}`,
+      ...financial.policy!.commitments.map(
+        (term) =>
+          `Merchant financial terms: ${quoted(term.terms, 1200)}; ${term.kind}; amount ${term.amountMinor === undefined ? 'unreadable' : formatMoney(term.amountMinor, financial.currency)}${term.perPerson ? ` per guest × ${bounds.partySize}` : ' total'}; trigger ${quoted(term.trigger ?? '', SELLER_TEXT_LIMIT)}; cancellation ${quoted(term.cancellationTerms ?? '', SELLER_TEXT_LIMIT)}${term.cancellationBeforeMs === undefined ? '' : `; cutoff ${term.cancellationBeforeMs / 60_000} minutes before arrival`}${term.frequency ? `; frequency ${quoted(term.frequency, SELLER_TEXT_LIMIT)}` : ''}${term.conversionAt ? `; converts ${formatLocalTimeWithZone(term.conversionAt, principalTimeZone)}` : ''}`,
+      ),
+    );
+  lines.push(`Watch deadline: ${formatLocalTimeWithZone(bounds.until, principalTimeZone)}`);
+  return lines.join('\n');
 }
 
 /** to: browser */
