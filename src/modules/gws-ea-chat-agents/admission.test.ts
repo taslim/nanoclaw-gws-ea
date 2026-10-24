@@ -48,6 +48,7 @@ import { getRequiredProjectDocSections } from '../../project-doc-sections.js';
 import { composeGroupProjectDoc } from '../../project-doc-compose.js';
 import { initGroupFilesystem } from '../../group-init.js';
 import { resolveSystemSession } from '../../session-manager.js';
+import '../gws-ea-profile/index.js';
 import { hasBrowserAccess } from '../gws-ea-browser/access.js';
 import '../gws-ea-browser/guidance.js';
 import { readBrowserPolicy } from '../gws-ea-browser/policy.js';
@@ -175,6 +176,13 @@ it.each(['external-chat', 'job'] as const)(
 
     const doc = await documentFor(group);
 
+    expect([...doc.matchAll(/^# (.+)$/gmu)].map(([, heading]) => heading).slice(0, 4)).toEqual([
+      'Assistant Character',
+      'Assistant Identity',
+      'Principal',
+      kind === 'job' ? 'Job Chat' : 'External Chat',
+    ]);
+    expect(doc).toContain(fs.readFileSync(path.resolve('src/modules/gws-ea-profile/character.md'), 'utf8').trim());
     const file = path.resolve('src/modules/gws-ea-chat-agents', `${kind === 'job' ? 'job' : kind}.guidance.md`);
     expect(doc).toContain(fs.readFileSync(file, 'utf8').trim());
     expect(doc).toContain('# NanoClaw Skill: whatsapp-formatting');
@@ -247,7 +255,12 @@ it('composes browser guidance only for an explicitly granted active job and remo
   const granted = await documentFor(job.agent_group_id);
 
   expect(granted).toContain('# Browser delegation');
-  expect(granted).toContain("Robin's web address is `nibor@example.test`");
+  const group = await getAgentGroup(job.agent_group_id);
+  if (!group) throw new Error('No job group');
+  const identity = (await getRequiredProjectDocSections(group)).find(
+    (section) => section.name === 'Assistant Identity',
+  );
+  expect(identity?.body).not.toContain('nibor@example.test');
   expect(granted).toContain('shared signed-in profile and vault');
   expect(granted).toContain('`record_disclosure`');
   expect(granted).toContain('principal approvals');
