@@ -17,7 +17,7 @@ import { reconcileGwsEaProfile } from '../gws-ea-profile/db.js';
 import '../gws-ea-profile/index.js';
 import { addPerson, getPerson, getPersonLevel, listPeople, type Person } from './db.js';
 import { FINGERPRINT_KEY_FILE_NAME } from './fingerprint.js';
-import { MAIN_PEOPLE_POINTER } from './index.js';
+import './index.js';
 
 const VERBS = ['find', 'get', 'list', 'add', 'update', 'set-level', 'forget'] as const;
 
@@ -257,8 +257,8 @@ describe('GWS-EA people ncl resource', () => {
   });
 });
 
-describe('GWS-EA people project-doc section', () => {
-  it('points main at the live store and copies no record into any document', async () => {
+describe('GWS-EA people project documents', () => {
+  it('adds no separate pointer and copies no record into any document: main reads the live store from its role', async () => {
     await addPerson({
       name: 'Pat Doe',
       level: 'close',
@@ -267,20 +267,15 @@ describe('GWS-EA people project-doc section', () => {
       identity: 'email:pat@example.test',
     });
 
-    const pointer = { name: 'People', body: MAIN_PEOPLE_POINTER };
-    expect(await getRequiredProjectDocSections(main)).toContainEqual(pointer);
-    expect(MAIN_PEOPLE_POINTER).toContain('`ncl people find`');
-    expect(MAIN_PEOPLE_POINTER).toContain('`memory/people/`');
-    expect((await getRequiredProjectDocSections(other)).map((section) => section.name)).not.toContain('People');
-
     for (const candidate of [main, other]) {
+      expect((await getRequiredProjectDocSections(candidate)).map((section) => section.name)).not.toContain('People');
       const groupDir = path.join(root, candidate.folder);
       await composeGroupProjectDoc(candidate, groupDir, { fileName: 'CLAUDE.md' });
       const document = fs.readFileSync(path.join(groupDir, 'CLAUDE.md'), 'utf8');
       for (const secret of ['Pat Doe', 'pat@example.test', 'close friend']) {
         expect(document, `${candidate.name}: ${secret}`).not.toContain(secret);
       }
-      expect(document.includes('# People'), candidate.name).toBe(candidate === main);
+      expect(document, candidate.name).not.toContain('# People');
     }
   });
 });

@@ -2,24 +2,21 @@
  * GWS-EA's people store (KTD8, KTD10): one thin typed record per person,
  * holding only what the host enforces: who they are by identity, and their
  * one level. `main` reads and writes it through main-only `ncl people` verbs
- * and reads it live through a pointer section; what it knows of a person
- * lives in its own memory. The only people fact the host passes on is a
- * level for an identity (`getPersonLevel`). Other modules purge their own
+ * as its role directs; what it knows of a person lives in its own memory.
+ * The only people fact the host passes on is a level for an identity
+ * (`getPersonLevel`). Other modules purge their own
  * data for a forgotten person through `registerPersonForgetHook`, and put to
  * main what only it can rewrite through `registerPersonForgetReview`.
  */
 import { registerResource, type ColumnDef } from '../../cli/crud.js';
 import type { CallerContext } from '../../cli/frame.js';
 import { DATA_DIR } from '../../config.js';
-import { getDb } from '../../db/connection.js';
 import { registerMigration } from '../../db/migrations/index.js';
 import { optionalString } from '../../gws-ea/validation.js';
 import { onHostStart } from '../../host-lifecycle.js';
 import { log } from '../../log.js';
-import { registerRequiredProjectDocSection, type RequiredProjectDocSection } from '../../project-doc-sections.js';
 import { registerMessageInterceptor } from '../../router.js';
-import type { AgentGroup } from '../../types.js';
-import { assertMainCaller, getMainAgentGroupId } from '../gws-ea-profile/db.js';
+import { assertMainCaller } from '../gws-ea-profile/db.js';
 import {
   addPerson,
   assertPeopleStoreRunning,
@@ -40,27 +37,6 @@ import { gwsEaPeopleMigration, gwsEaPeopleThinRecordMigration } from './migratio
 
 registerMigration(gwsEaPeopleMigration);
 registerMigration(gwsEaPeopleThinRecordMigration);
-
-// ---------------------------------------------------------------------------
-// Project-document pointer: main only, and never a record.
-// ---------------------------------------------------------------------------
-
-/**
- * main changes the store mid-conversation, so a copy composed when its
- * container started would go stale; it reads the store live instead. Other
- * groups get nothing: no person's record leaves main.
- */
-export const MAIN_PEOPLE_POINTER =
-  'Everyone the principal deals with has a record in their people store: their name, their identities (channel-qualified, such as `email:name@example.com`), and the one level that says where they stand, with where it came from. Read it with `ncl people find`, `ncl people get`, or `ncl people list` before you schedule with someone or say where they stand: the store is the only current copy, and a record from earlier in the conversation may have changed since. Anyone without a record is unknown. What you know about a person is in your memory, in their file under `memory/people/`.';
-
-async function peopleSection(group: AgentGroup): Promise<RequiredProjectDocSection | undefined> {
-  const db = getDb();
-  if (!(await db.hasTable('gws_ea_people')) || !(await db.hasTable('gws_ea_profile'))) return undefined;
-  if (group.id !== (await getMainAgentGroupId())) return undefined;
-  return { name: 'People', body: MAIN_PEOPLE_POINTER };
-}
-
-registerRequiredProjectDocSection('gws-ea-people:pointer', peopleSection);
 
 // ---------------------------------------------------------------------------
 // `ncl people …` — main's read and write path.
