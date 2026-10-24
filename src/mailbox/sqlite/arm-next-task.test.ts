@@ -14,7 +14,7 @@ import { ensureSchema, openInboundDb } from './session-db.js';
 import { insertTaskRow, getCompletedRecurring } from './tasks.js';
 import { wrapSqliteInbound } from './index.js';
 
-const TEST_DIR = '/tmp/nanoclaw-arm-next-task-test';
+const TEST_DIR = `/tmp/nanoclaw-arm-next-task-test-${process.pid}-${Math.random().toString(36).slice(2)}`;
 const DB_PATH = path.join(TEST_DIR, 'inbound.db');
 
 function freshDb() {
@@ -93,5 +93,32 @@ describe('armNextTask', () => {
     });
     expect(getCompletedRecurring(db)).toHaveLength(0);
     expect(mailbox.getTask('task-next-retry')?.id).toBe('task-next-retry');
+  });
+
+  it('lets only one caller consume a completed occurrence across separate mailbox handles', async () => {
+    const db = freshDb();
+    const competingDb = openInboundDb(DB_PATH);
+    try {
+      completedRecurringOriginal(db, 'task-original');
+      const first = wrapSqliteInbound(db);
+      const second = wrapSqliteInbound(competingDb);
+      const next = {
+        id: 'task-next',
+        seriesId: 'task-original',
+        processAfter: new Date(Date.now() + 3_600_000).toISOString(),
+        recurrence: '0 9 * * *',
+        content: JSON.stringify({ prompt: 'noop' }),
+      };
+
+      const claimed = await first.armNextTask('task-original', next);
+      const lost = await second.armNextTask('task-original', { ...next, id: 'task-duplicate' });
+      expect(second.getTask('task-duplicate')).toBeUndefined();
+      expect(second.listLiveTasks().map((task) => task.id)).toEqual(['task-next']);
+      expect(claimed).toBe(true);
+      expect(lost).toBe(false);
+    } finally {
+      competingDb.close();
+      db.close();
+    }
   });
 });
