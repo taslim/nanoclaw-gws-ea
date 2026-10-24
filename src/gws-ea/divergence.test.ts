@@ -1528,6 +1528,24 @@ describe('recorded divergence: instructions follow the capabilities that use the
   });
 });
 
+describe("recorded divergence: a module can withhold a capability's teaching from one group", () => {
+  it('withholds the documents the capability names, for that group alone, and compose consults it', async () => {
+    await freshInstall();
+    const capabilities = await import('../capabilities.js');
+    capabilities.withholdCapabilityInstructions(capabilities.SHELL_CAPABILITY, async (id) => id === 'ag-main');
+
+    expect([...(await capabilities.getWithheldModuleInstructions('ag-main'))].sort()).toEqual([
+      'cli',
+      'connect',
+      'scheduling',
+    ]);
+    expect(await capabilities.getWithheldModuleInstructions('ag-other')).toEqual(new Set());
+    const compose = await readFile(path.join(originalCwd, 'src/project-doc-compose.ts'), 'utf8');
+    expect(compose).toContain('const withheldInstructions = await getWithheldModuleInstructions(group.id);');
+    expect(compose).toContain('withheldInstructions.has(moduleName)');
+  });
+});
+
 describe("recorded divergence: a protected agent group is the host's alone", () => {
   it('denies its self-modification requests rather than carding them for approval', async () => {
     await freshInstall();

@@ -41,8 +41,9 @@ import path from 'node:path';
 import ts from 'typescript';
 import { describe, expect, it } from 'vitest';
 
-import { SHELL_CAPABILITY } from '../capabilities.js';
-import { MAIN_SHARED_SKILLS, mainCapabilitySelection } from './gws-ea-main/index.js';
+import { resolveCapabilities, SHELL_CAPABILITY } from '../capabilities.js';
+import { MAIN_CHAT_CAPABILITY, MAIN_SHARED_SKILLS, mainCapabilitySelection } from './gws-ea-main/index.js';
+import { registeredGuidanceFiles } from './gws-ea-profile/guidance.js';
 import { noVerifiedPrincipalMessage } from './gws-ea-profile/approval-wording.js';
 import { GROUP_SCOPE_RESOURCES, listCommands, lookup } from '../cli/registry.js';
 import { runnerToolCapabilities, runnerToolVocabulary } from '../test-utils/runner-tools.js';
@@ -60,6 +61,8 @@ import './gws-ea-preferences/index.js';
 import './gws-ea-privacy/index.js';
 import './gws-ea-matters/index.js';
 import './gws-ea-chats/directory.js';
+// Every module, so each registered guidance file is known.
+import './index.js';
 
 const MODULES = path.resolve(import.meta.dirname);
 const ROOT = path.resolve(MODULES, '../..');
@@ -82,13 +85,14 @@ const DELEGATE_KEYS = [BROWSER_DELEGATE_CAPABILITY, PURCHASE_OUTCOME_CAPABILITY]
 const HOLDINGS: Readonly<Record<Reader, Holdings>> = {
   // Create/update reconciliation stores main's current release defaults; browser access grants both delegate keys:
   // policy version 1 lists main alone, and main records every unconfirmed purchase.
-  main: { keys: new Set([...mainCapabilitySelection(), ...DELEGATE_KEYS]), ncl: 'global' },
+  main: { keys: new Set([...mainCapabilitySelection(), MAIN_CHAT_CAPABILITY, ...DELEGATE_KEYS]), ncl: 'global' },
   'external-email': { keys: new Set(EXTERNAL_EMAIL_CAPABILITIES), ncl: 'none' },
   'external-chat': { keys: new Set(EXTERNAL_CHAT_CAPABILITIES), ncl: 'none' },
   job: { keys: new Set(JOB_CHAT_CAPABILITIES), ncl: 'none' },
   browser: { keys: new Set(BROWSER_CAPABILITIES), ncl: 'none' },
-  // Another group the browser setting lists: what the setting grants, and `cli_scope: group`.
-  delegator: { keys: new Set(DELEGATE_KEYS), ncl: 'group' },
+  // Another group the browser setting lists, as the operator creates one: every default key, what the
+  // setting grants, and `cli_scope: group`.
+  delegator: { keys: new Set([...resolveCapabilities('all', 'delegator'), ...DELEGATE_KEYS]), ncl: 'group' },
   principal: { keys: new Set(), ncl: 'none' },
 };
 
@@ -467,7 +471,8 @@ const GUIDANCE_READERS: Readonly<Record<string, readonly Reader[]>> = {
   'container/agent-runner/src/mcp-tools/gws-ea-chat-outreach.instructions.md': ['main'],
   'container/agent-runner/src/mcp-tools/gws-ea-chat.instructions.md': ['main'],
   'container/agent-runner/src/mcp-tools/gws-ea-email-external.instructions.md': ['external-email'],
-  'container/agent-runner/src/mcp-tools/gws-ea-email.instructions.md': ['main'],
+  // Default-on: a group that stores `all` holds it too.
+  'container/agent-runner/src/mcp-tools/gws-ea-email.instructions.md': ['main', 'delegator'],
   // Google skill instructions are generic: a non-main recipient may have group-scoped or disabled CLI.
   'container/skills/gcalendar/instructions.md': ['main', 'delegator', 'job'],
   'container/skills/gmail/instructions.md': ['main', 'delegator', 'job'],
@@ -499,7 +504,9 @@ function guidanceFiles(): string[] {
   const skillFiles = [...new Set([...MAIN_SHARED_SKILLS, ...CHAT_SHARED_SKILLS])]
     .map((skill) => `container/skills/${skill}/instructions.md`)
     .filter((file) => fs.existsSync(path.join(ROOT, file)));
-  return [...new Set([...moduleFiles, ...runnerFiles, ...templateFiles, ...skillFiles])].sort();
+  return [
+    ...new Set([...registeredGuidanceFiles(), ...moduleFiles, ...runnerFiles, ...templateFiles, ...skillFiles]),
+  ].sort();
 }
 
 function guidanceNclProblems(file: string, text: string): string[] {

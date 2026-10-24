@@ -12,7 +12,8 @@ import {
   parseStoredCapabilities,
   registerCapability,
   resolveCapabilities,
-  withholdModuleInstructions,
+  SHELL_CAPABILITY,
+  withholdCapabilityInstructions,
   type CapabilitySelection,
 } from '../../capabilities.js';
 import { register } from '../../cli/registry.js';
@@ -29,8 +30,10 @@ export const GUIDANCE_PATH = path.join('src', 'modules', 'gws-ea-main', 'guidanc
 export const MAIN_CHAT_CAPABILITY = 'gws-ea-chat';
 registerCapability(MAIN_CHAT_CAPABILITY, {
   description: 'whatsapp_link and chat-addressed host actions for canonical main',
-  default: 'on',
+  default: 'off',
   instructions: [MAIN_CHAT_CAPABILITY, 'gws-ea-chat-outreach'],
+  // Canonical main's alone: a group that stores `all` must not learn main's chat commands.
+  grantedTo: async (agentGroupId) => agentGroupId === (await mainAgentGroupId()),
 });
 
 /**
@@ -52,10 +55,8 @@ async function mainAgentGroupId(): Promise<string | null> {
   return getMainAgentGroupId();
 }
 
-withholdModuleInstructions(
-  ['cli', 'scheduling', 'connect'],
-  async (agentGroupId) => agentGroupId === (await mainAgentGroupId()),
-);
+// Main keeps the shell's tools; its own guidance teaches the commands it uses.
+withholdCapabilityInstructions(SHELL_CAPABILITY, async (agentGroupId) => agentGroupId === (await mainAgentGroupId()));
 
 export function mainCapabilitySelection(): string[] {
   return resolveCapabilities('all', 'main').filter((key) => key !== 'agents' && key !== 'self-mod');

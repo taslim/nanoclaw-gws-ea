@@ -14,7 +14,7 @@ import { allowsBuiltinTool, resolveClaudeCapabilityPolicy } from '../providers/c
 // The barrel loads every tool module under its key; a tool module imported
 // ahead of it would register its tools without one.
 import './index.js';
-import { createMcpServer, loadToolModule, registerTools } from './server.js';
+import { createMcpServer, loadToolModule, registeredToolCapabilities, registerTools } from './server.js';
 
 const TIME_TOOLS = ['time_convert', 'time_diff', 'time_now', 'time_resolve'];
 
@@ -209,9 +209,7 @@ describe('NanoClaw tool server capabilities', () => {
   });
 
   it.each<[string, readonly string[] | undefined]>([
-    ...[
-      ...new Set([...ALL, ...EXTERNAL_EMAIL, 'browser', 'gws-ea-chat-external', 'gws-ea-chat-documents', 'artifacts']),
-    ].map<[string, readonly string[]]>((key) => [key, [key]]),
+    ...registeredToolCapabilities().map<[string, readonly string[]]>((key) => [key, [key]]),
     ['all registered base tools', undefined],
   ])('keeps every description served for %s within 4,096 characters', async (_holding, grants) => {
     // KTD15 / R23: Claude Code 2.1.296 keeps only 4,096 upfront characters.

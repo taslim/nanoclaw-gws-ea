@@ -5,19 +5,23 @@ import { describe, expect, it } from 'vitest';
 
 import { CHAT_SHARED_SKILLS } from '../modules/gws-ea-chat-agents/shape.js';
 import { MAIN_SHARED_SKILLS } from '../modules/gws-ea-main/index.js';
+import { registeredGuidanceFiles } from '../modules/gws-ea-profile/guidance.js';
+// Every module, so each registered guidance file is known.
+import '../modules/index.js';
 
 const ROOT = path.resolve(import.meta.dirname, '../..');
 
 /** New sizes plus small editing margins; these are file caps, never an aggregate budget. */
 const CAPS: Readonly<Record<string, { readonly words: number; readonly reason: string }>> = {
   'src/modules/gws-ea-profile/character.md': {
-    words: 680,
-    reason: '646 words of shared identity and trust, plus 34 for local edits; role-specific memory stays in main.',
+    words: 720,
+    reason:
+      "689 words of shared identity and trust: review restored 'repeat', the mistake rule's limits, 'confident without hedging' and the one password rule; plus 31. Role-specific memory stays in main.",
   },
   'src/modules/gws-ea-main/guidance.md': {
-    words: 2_320,
+    words: 2_420,
     reason:
-      '2,232 words, 232 above the 2,000-word target to retain authority, memory and browser guardrails, plus 88 for local edits.',
+      '2,339 words: the rewrite kept authority, memory and browser guardrails, and review restored thirteen judgment clauses it had dropped and the rundown gate; plus 81 for local edits.',
   },
   'src/modules/gws-ea-external-email/guidance.md': {
     words: 930,
@@ -32,9 +36,9 @@ const CAPS: Readonly<Record<string, { readonly words: number; readonly reason: s
     reason: '286 words of job-scoped work, memory and authority, plus 14 for local edits.',
   },
   'src/modules/gws-ea-browser/main-guidance.md': {
-    words: 360,
+    words: 400,
     reason:
-      '340 words, including the saved-payment-only boundary a replay found missing, plus 20; main-only mechanics stay in its role.',
+      '378 words: the saved-payment-only boundary a replay found missing, the strict disclosure rule and the unknown-destination next step; plus 22. Main-only mechanics stay in its role.',
   },
   'templates/gws-ea/browser/instructions.md': {
     words: 1_040,
@@ -117,7 +121,9 @@ function guidanceFiles(): string[] {
   const skillFiles = [...new Set([...MAIN_SHARED_SKILLS, ...CHAT_SHARED_SKILLS])]
     .map((skill) => `container/skills/${skill}/instructions.md`)
     .filter((file) => fs.existsSync(path.join(ROOT, file)));
-  return [...new Set([...moduleFiles, ...runnerFiles, ...templateFiles, ...skillFiles])].sort();
+  return [
+    ...new Set([...registeredGuidanceFiles(), ...moduleFiles, ...runnerFiles, ...templateFiles, ...skillFiles]),
+  ].sort();
 }
 
 function uncappedFiles(files: readonly string[]): string[] {
