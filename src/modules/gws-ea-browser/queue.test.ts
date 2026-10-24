@@ -1290,28 +1290,28 @@ describe('the notice after an approved purchase that went no further', () => {
       { status: 'card_needed', repeat_safe: false },
       false,
       false,
-      /no payment method saved.*Report it to main/s,
+      /no payment method saved.*Report it to the agent that sent this errand/s,
     ],
     [
       'a checkout missing facts',
       { status: 'facts_incomplete', missing: ['the total'], repeat_safe: false },
       false,
       false,
-      /could not read the total.*Report it to main/s,
+      /could not read the total.*Report it to the agent that sent this errand/s,
     ],
     [
       'a checkout whose terms the host could not read',
       { status: 'terms_unavailable', repeat_safe: false },
       false,
       false,
-      /could not read the site’s terms.*Report it to main/s,
+      /could not read the site’s terms.*Report it to the agent that sent this errand/s,
     ],
     [
       'a checkout whose terms can charge more than the maximum',
       { status: 'terms_over_bounds', repeat_safe: false },
       false,
       false,
-      /terms can charge more than the principal’s maximum.*Report it to main/s,
+      /terms can charge more than the principal’s maximum.*Report it to the agent that sent this errand/s,
     ],
     [
       'an unknown status',
@@ -1348,7 +1348,7 @@ describe('the notice after an approved purchase that went no further', () => {
     );
     expect(notice).toMatchObject({ safe_to_rebuild: false, reason: 'The total rose to $45.00, from $42.00.' });
     expect(notice.message).toMatch(
-      /\(The total rose to \$45\.00, from \$42\.00\.\), so the host stopped this errand.*Report it to main/s,
+      /\(The total rose to \$45\.00, from \$42\.00\.\), so the host stopped this errand.*Report it to the agent that sent this errand/s,
     );
     expect(notice.message).not.toMatch(/cancelled/);
   });
@@ -1357,12 +1357,12 @@ describe('the notice after an approved purchase that went no further', () => {
     [
       'a late confirmation',
       'late_confirmation',
-      /placed after all, so the host stopped this errand.*Report it to main/s,
+      /placed after all, so the host stopped this errand.*Report it to the agent that sent this errand/s,
     ],
     [
       'an unapproved commit',
       'unapproved_commit',
-      /confirmation showing a charge nobody approved, so the host stopped this errand.*Report it to main/s,
+      /confirmation showing a charge nobody approved, so this errand was stopped.*Report it to the agent that sent this errand/s,
     ],
   ] as const)('tells the browser the host stopped an errand %s ended', async (_name, kind, words) => {
     const notice = await deliverCommit({ status: 'checkout_lapsed', repeat_safe: true }, async (job) => {
@@ -1386,6 +1386,6 @@ describe('the notice after an approved purchase that went no further', () => {
       new Date(Date.now() - 60_000).toISOString(),
     );
     expect(notice).toMatchObject({ safe_to_rebuild: false });
-    expect(notice.message).toMatch(/approval expired.*Report it to main/s);
+    expect(notice.message).toMatch(/approval expired.*Report it to the agent that sent this errand/s);
   });
 });

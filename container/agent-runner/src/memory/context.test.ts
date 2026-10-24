@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from 'bun:test';
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 
 import {
@@ -10,12 +11,12 @@ import {
   renderMemorySection,
 } from './context.js';
 
-const BASE = '/tmp/nanoclaw-memory-context-test';
+let baseDir: string;
 const RELEASE_DEFINITION = fs.readFileSync(RELEASE_MEMORY_DEFINITION.file, 'utf-8').trim();
 
 function writeIndex(index: string): void {
-  fs.mkdirSync(path.join(BASE, 'memory'), { recursive: true });
-  fs.writeFileSync(path.join(BASE, 'memory', 'index.md'), index);
+  fs.mkdirSync(path.join(baseDir, 'memory'), { recursive: true });
+  fs.writeFileSync(path.join(baseDir, 'memory', 'index.md'), index);
 }
 
 /** An index whose Core Memory leads it, then a Map of `entries` linked files. */
@@ -30,11 +31,10 @@ function renderedIndex(section: string): string {
 }
 
 beforeEach(() => {
-  fs.rmSync(BASE, { recursive: true, force: true });
-  fs.mkdirSync(BASE, { recursive: true });
+  baseDir = fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-memory-context-'));
 });
 
-afterEach(() => fs.rmSync(BASE, { recursive: true, force: true }));
+afterEach(() => fs.rmSync(baseDir, { recursive: true, force: true }));
 
 describe('renderMemorySection', () => {
   it('fits the whole section, header included, in 10,000 characters, cutting an oversized index from its end', () => {
@@ -43,7 +43,7 @@ describe('renderMemorySection', () => {
     expect(index.length).toBeGreaterThan(20_000);
     writeIndex(index);
 
-    const section = renderMemorySection(BASE);
+    const section = renderMemorySection(baseDir);
 
     expect(section.length).toBeLessThanOrEqual(MEMORY_SECTION_BUDGET_CHARS);
     expect(renderedIndex(section).trimEnd().endsWith(MEMORY_TRUNCATION_NOTICE)).toBe(true);
@@ -60,7 +60,7 @@ describe('renderMemorySection', () => {
     const index = indexWithMap('- 2026-10-19: Morgan keeps mornings free.', 3);
     writeIndex(index);
 
-    const section = renderMemorySection(BASE);
+    const section = renderMemorySection(baseDir);
 
     expect(section).toContain(index.trim());
     expect(section).not.toContain(MEMORY_TRUNCATION_NOTICE);
@@ -72,7 +72,7 @@ describe('renderMemorySection', () => {
     );
     writeIndex(indexWithMap(core, 600));
 
-    const section = renderMemorySection(BASE);
+    const section = renderMemorySection(baseDir);
 
     expect(section).toContain(core);
     expect(section).toContain(MEMORY_TRUNCATION_NOTICE);
@@ -81,7 +81,7 @@ describe('renderMemorySection', () => {
   it('cuts at a line end, so no fact is shown half-written', () => {
     writeIndex(indexWithMap('- 2026-10-19: Morgan keeps mornings free.', 400));
 
-    const kept = renderedIndex(renderMemorySection(BASE)).replace(MEMORY_TRUNCATION_NOTICE, '').trimEnd();
+    const kept = renderedIndex(renderMemorySection(baseDir)).replace(MEMORY_TRUNCATION_NOTICE, '').trimEnd();
 
     expect(kept).toMatch(/- a matter to recall$/u);
   });
@@ -92,7 +92,7 @@ describe('renderMemorySection', () => {
     const tail = 'y'.repeat(MEMORY_TRUNCATION_NOTICE.length + 50);
     writeIndex(`${'x'.repeat(room - MEMORY_TRUNCATION_NOTICE.length - 2)}😀${tail}`);
 
-    const section = renderMemorySection(BASE);
+    const section = renderMemorySection(baseDir);
 
     expect(section.length).toBeLessThanOrEqual(MEMORY_SECTION_BUDGET_CHARS);
     expect(section).toContain(MEMORY_TRUNCATION_NOTICE);
@@ -103,24 +103,45 @@ describe('renderMemorySection', () => {
     expect(MEMORY_SECTION_BUDGET_CHARS - renderMemorySectionWithIndex('').length).toBeGreaterThanOrEqual(3_500);
   });
 
-  it('gives a correction that governs every conversation its own Core Memory line, even when a file also keeps it', () => {
-    // An existing preferences file is the faithful reading of "update that entity's existing file"; only
-    // Core Memory is in front of the agent every time, so the rule itself must live there too (R15).
+  it('gives a correction its own dated Core Memory line beside an existing pointer to a corrections file', () => {
     const definition = RELEASE_DEFINITION.replace(/\s+/gu, ' ');
 
     expect(definition).toContain(
-      'A correction that governs every conversation gets its own short dated line in Core Memory, even when a file for preferences or corrections also keeps it:',
+      'A correction that governs every conversation gets its own short dated line in Core Memory.',
     );
-    expect(definition).toContain('a linked file is read only when you think to open it.');
+    expect(definition).toContain(
+      "An existing Core Memory line pointing to a preferences or corrections file never replaces that correction's own line; add it beside the pointer.",
+    );
     expect(definition).toContain('Beyond Core Memory, write to the smallest useful file');
+  });
+
+  it('remembers the principal and the people served for them, within the portable file contract', () => {
+    const definition = RELEASE_DEFINITION.replace(/\s+/gu, ' ');
+
+    expect(definition).toContain('the principal and the people you work with for them');
+    expect(definition).not.toMatch(/\buser(?:'s)?\b/iu);
+    expect(definition).toContain('Open Knowledge Format (OKF)');
+    expect(definition).toContain('One Markdown concept per file');
+    expect(definition).toContain('`type`');
+    expect(definition).toContain('`index.md` and `log.md`');
+    expect(definition).toContain('`okf_version: "0.1"`');
+    expect(definition).toContain('never drop frontmatter fields you do not recognize');
+    expect(definition).toContain('Missing or malformed frontmatter never makes a memory unusable.');
+  });
+
+  it('seeds new indexes in terms of the principal', () => {
+    const template = fs.readFileSync(path.join(import.meta.dir, 'templates', 'index.md'), 'utf-8');
+
+    expect(template).toContain('who the principal is');
+    expect(template).not.toContain('who the user is');
   });
 
   it("reads the definition from the release, never from a copy in the agent's tree", () => {
     writeIndex('# Memory Index\n');
-    fs.mkdirSync(path.join(BASE, 'memory', 'system'), { recursive: true });
-    fs.writeFileSync(path.join(BASE, 'memory', 'system', 'definition.md'), 'agent-edited doctrine\n');
+    fs.mkdirSync(path.join(baseDir, 'memory', 'system'), { recursive: true });
+    fs.writeFileSync(path.join(baseDir, 'memory', 'system', 'definition.md'), 'agent-edited doctrine\n');
 
-    const section = renderMemorySection(BASE);
+    const section = renderMemorySection(baseDir);
 
     expect(section).toContain(RELEASE_DEFINITION);
     expect(section).not.toContain('agent-edited doctrine');
@@ -129,7 +150,7 @@ describe('renderMemorySection', () => {
   it('says the release definition is in force and read-only, that copies are not read, and that it replaces earlier sections', () => {
     writeIndex('# Memory Index\n');
 
-    const section = renderMemorySection(BASE);
+    const section = renderMemorySection(baseDir);
     const header = section.slice(0, section.indexOf('### memory/index.md')).replace(/\s+/gu, ' ');
 
     expect(header).toContain(`\`${RELEASE_MEMORY_DEFINITION.path}\``);
@@ -147,7 +168,7 @@ describe('renderMemorySection', () => {
   it('inlines existing untyped memory without blocking it', () => {
     writeIndex('# Memory Index\n- [Casa](projects/casa.md)\n');
 
-    const section = renderMemorySection(BASE);
+    const section = renderMemorySection(baseDir);
 
     expect(section).toContain('## Memory');
     expect(section).toContain('files on disk are authoritative');
@@ -156,11 +177,11 @@ describe('renderMemorySection', () => {
   });
 
   it('degrades without throwing when the index is missing', () => {
-    expect(renderMemorySection(BASE)).toContain('unavailable during this hook invocation');
+    expect(renderMemorySection(baseDir)).toContain('unavailable during this hook invocation');
   });
 });
 
 function renderMemorySectionWithIndex(index: string): string {
   writeIndex(index);
-  return renderMemorySection(BASE);
+  return renderMemorySection(baseDir);
 }

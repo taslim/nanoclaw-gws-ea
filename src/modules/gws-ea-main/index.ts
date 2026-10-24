@@ -8,7 +8,14 @@
  */
 import path from 'node:path';
 
-import { registerCapability } from '../../capabilities.js';
+import {
+  parseStoredCapabilities,
+  registerCapability,
+  resolveCapabilities,
+  SHELL_CAPABILITY,
+  withholdCapabilityInstructions,
+  type CapabilitySelection,
+} from '../../capabilities.js';
 import { register } from '../../cli/registry.js';
 import { parseSkillSelection } from '../../container-config.js';
 import { getDb } from '../../db/connection.js';
@@ -23,8 +30,10 @@ export const GUIDANCE_PATH = path.join('src', 'modules', 'gws-ea-main', 'guidanc
 export const MAIN_CHAT_CAPABILITY = 'gws-ea-chat';
 registerCapability(MAIN_CHAT_CAPABILITY, {
   description: 'whatsapp_link and chat-addressed host actions for canonical main',
-  default: 'on',
+  default: 'off',
   instructions: [MAIN_CHAT_CAPABILITY, 'gws-ea-chat-outreach'],
+  // Canonical main's alone: a group that stores `all` must not learn main's chat commands.
+  grantedTo: async (agentGroupId) => agentGroupId === (await mainAgentGroupId()),
 });
 
 /**
@@ -46,6 +55,13 @@ async function mainAgentGroupId(): Promise<string | null> {
   return getMainAgentGroupId();
 }
 
+// Main keeps the shell's tools; its own guidance teaches the commands it uses.
+withholdCapabilityInstructions(SHELL_CAPABILITY, async (agentGroupId) => agentGroupId === (await mainAgentGroupId()));
+
+export function mainCapabilitySelection(): string[] {
+  return resolveCapabilities('all', 'main').filter((key) => key !== 'agents' && key !== 'self-mod');
+}
+
 registerGuidance('gws-ea-main:guidance', {
   agent: 'main',
   heading: 'Executive Assistant',
@@ -53,13 +69,13 @@ registerGuidance('gws-ea-main:guidance', {
   agentGroupId: mainAgentGroupId,
 });
 
-interface MainSkills {
+interface MainConfiguration {
   readonly agent_group_id: string;
   readonly skills: string[] | 'all';
+  readonly capabilities: CapabilitySelection;
 }
 
-/** Set a group's shared skills to `main`'s, writing only when they differ. */
-async function reconcileMainSkills(agentGroupId: string): Promise<MainSkills> {
+async function reconcileMainConfiguration(agentGroupId: string): Promise<MainConfiguration> {
   const row = await getContainerConfig(agentGroupId);
   if (!row) throw new Error(`No container config for group: ${agentGroupId}`);
   const current = parseSkillSelection(row.skills, agentGroupId);
@@ -67,15 +83,26 @@ async function reconcileMainSkills(agentGroupId: string): Promise<MainSkills> {
   if (current === 'all' || current.length !== wanted.length || current.some((skill, i) => skill !== wanted[i])) {
     await updateContainerConfigJson(agentGroupId, 'skills', wanted);
   }
+  const currentCapabilities = parseStoredCapabilities(row.capabilities, agentGroupId);
+  const capabilities = mainCapabilitySelection();
+  if (
+    currentCapabilities === 'all' ||
+    currentCapabilities.length !== capabilities.length ||
+    currentCapabilities.some((key, i) => key !== capabilities[i])
+  ) {
+    await updateContainerConfigJson(agentGroupId, 'capabilities', capabilities);
+  }
   const updated = await getContainerConfig(agentGroupId);
-  return { agent_group_id: agentGroupId, skills: parseSkillSelection(updated?.skills, agentGroupId) };
+  return {
+    agent_group_id: agentGroupId,
+    skills: parseSkillSelection(updated?.skills, agentGroupId),
+    capabilities: parseStoredCapabilities(updated?.capabilities, agentGroupId),
+  };
 }
 
-// The lifecycle commands (create, update) set the list through this command;
-// the host never rewrites it at start.
 register({
   name: 'gws-ea-main-reconcile',
-  description: "Set canonical main's NanoClaw shared skills to the release's list.",
+  description: "Set canonical main's NanoClaw shared skills and capabilities to the release's selection.",
   access: 'hidden',
   hostOnly: true,
   // Dispatch hands over canonical keys (src/cli/args.ts): `--agent-group-id` arrives as `agent_group_id`.
@@ -86,5 +113,5 @@ register({
     if (typeof agentGroupId !== 'string' || agentGroupId.length === 0) throw new Error('--agent-group-id is required');
     return agentGroupId;
   },
-  handler: async (agentGroupId) => reconcileMainSkills(agentGroupId),
+  handler: async (agentGroupId) => reconcileMainConfiguration(agentGroupId),
 });

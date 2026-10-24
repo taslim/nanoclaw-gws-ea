@@ -4,6 +4,7 @@
  * that holds its guidance, two names and the principal's time zone, and
  * nothing else of GWS-EA's.
  */
+import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -222,6 +223,7 @@ describe("external-email's project document", () => {
     const composed = sections(doc);
 
     expect([...composed.keys()]).toEqual([
+      '# Assistant Character',
       '# Assistant Identity',
       '# Principal',
       '# External Email',
@@ -229,6 +231,9 @@ describe("external-email's project document", () => {
       '# NanoClaw Module: gws-ea-email-external',
       '# NanoClaw Module: time',
     ]);
+    expect(composed.get('# Assistant Character')).toBe(
+      fs.readFileSync(path.resolve('src/modules/gws-ea-profile/character.md'), 'utf8').trim(),
+    );
     expect(composed.get('# Assistant Identity')).toBe(
       'Aya is the assistant. Morgan is the principal. They are separate people: act and communicate as Aya, support Morgan, and never present the assistant as the principal.' +
         '\n\nYour email signature:\n\nAya | EA to Morgan',
@@ -236,6 +241,8 @@ describe("external-email's project document", () => {
     // Said once here, so no email it reads repeats it.
     expect(composed.get('# Principal')).toBe('You work for Morgan, whose time zone is America/Los_Angeles.');
     expect(composed.get('# External Email')).toBe(fs.readFileSync(path.resolve(GUIDANCE_PATH), 'utf8').trim());
+    expect([...doc.matchAll(/^## Host sign-in task$/gmu)]).toHaveLength(1);
+    expect([...doc.matchAll(/`sign_in_reply`/gu)]).toHaveLength(1);
     expect(doc).not.toContain('morgan@example.test');
     expect(doc).not.toContain('aya@example.test');
     expect(doc).not.toContain('Working hours');
@@ -277,6 +284,17 @@ describe("external-email's project document", () => {
     expect(composed.get('# Assistant Identity')).toContain(`${escaped} is the principal.`);
   });
 
+  it('preserves How you write and the three example emails verbatim', () => {
+    const writing = GUIDANCE_TEXT.slice(
+      GUIDANCE_TEXT.indexOf('## How you write\n'),
+      GUIDANCE_TEXT.indexOf('## Working with main\n'),
+    );
+    // Frozen before the character-core rewrite: wording and examples are the contract.
+    expect(createHash('sha256').update(writing).digest('hex')).toBe(
+      '742e99de37cb6417bbf2b2786d7b8211bdd0ec29c4075afd250d6cfb2376ff3d',
+    );
+  });
+
   it('names no link, address or emoji', () => {
     expect(GUIDANCE_TEXT).not.toMatch(/https?:\/\//i);
     expect(GUIDANCE_TEXT).not.toMatch(/\b[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}\b/);
@@ -285,10 +303,6 @@ describe("external-email's project document", () => {
 
   it('holds no rule about being an AI', () => {
     expect(GUIDANCE_TEXT).not.toMatch(/\b(?:AI|artificial intelligence|language model|chatbot|bot)\b/iu);
-  });
-
-  it('stays within 950 words', () => {
-    expect(GUIDANCE_TEXT.split(/\s+/u).filter(Boolean).length).toBeLessThanOrEqual(950);
   });
 
   it('names only tools external-email holds', () => {

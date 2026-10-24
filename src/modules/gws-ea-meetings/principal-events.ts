@@ -60,7 +60,8 @@
  */
 import { TIMEZONE } from '../../config.js';
 import { forbidden, invalidArgs, type ActionAnswer } from '../../cli/delivery-action.js';
-import { hasControlCharacters } from '../../gws-ea/validation.js';
+import { EMAIL_PATTERN, hasControlCharacters } from '../../gws-ea/validation.js';
+import { log } from '../../log.js';
 import {
   canChangeEvents,
   EVENT_ID,
@@ -91,6 +92,7 @@ import {
   spanLabel,
 } from './calendar-actions.js';
 import { addressesOf, flagOf, instantOf, lineOf, notesOf, timezoneOf } from './fields.js';
+import { calendarName, calendarNames } from './calendar-names.js';
 
 const TITLE_MAX = 200;
 const NOTES_MAX = 8_000;
@@ -516,13 +518,23 @@ export function createPrincipalEventTools(deps: PrincipalEventToolsDeps) {
       matterId === undefined
         ? []
         : [await joinRequestedMatter(matterId, { kind: 'event', reference: `${entry.id}/${eventId}` })];
+    let spokenCalendar = owner === 'assistant' ? 'your own calendar' : "the principal's calendar";
+    if (owner === 'principal') {
+      try {
+        const listed = (await calendar().listCalendars()).filter((item) => isPrincipalCalendar(item, principal));
+        const name = calendarNames(listed, principal).get(entry.id);
+        if (name !== undefined && !EMAIL_PATTERN.test(name.text)) spokenCalendar = calendarName(name);
+      } catch (error) {
+        log.warn('Calendar event was added, but its calendar name could not be read', { error });
+      }
+    }
     return {
       calendar: entry.id,
       event: eventId,
       start: String(content.start),
       end: String(content.end),
       message: [
-        `Added "${title}" to ${entry.summary ?? entry.id}: ${when}${conferenceWords(conference)}.`,
+        `Added "${title}" to ${spokenCalendar}: ${when}${conferenceWords(conference)}.`,
         OWNER_WORDS[owner].added,
         ...(invited.length === 0
           ? []

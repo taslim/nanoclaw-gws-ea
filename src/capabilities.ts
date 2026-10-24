@@ -240,6 +240,33 @@ export function grantsInstructions(moduleName: string, grants: ReadonlySet<strin
   return false;
 }
 
+const instructionWithholdings: {
+  key: string;
+  appliesTo: (agentGroupId: string) => Promise<boolean>;
+}[] = [];
+
+/**
+ * Withhold a capability's teaching where a product supplies its own
+ * instructions: the documents its registry entry names, read when composing,
+ * so a renamed document stays withheld. Only the project document changes;
+ * the capability's tools stay held.
+ */
+export function withholdCapabilityInstructions(
+  key: string,
+  appliesTo: (agentGroupId: string) => Promise<boolean>,
+): void {
+  instructionWithholdings.push({ key, appliesTo });
+}
+
+export async function getWithheldModuleInstructions(agentGroupId: string): Promise<ReadonlySet<string>> {
+  const modules = new Set<string>();
+  for (const withholding of instructionWithholdings) {
+    if (!(await withholding.appliesTo(agentGroupId))) continue;
+    for (const module of registry.get(withholding.key)?.instructions ?? []) modules.add(module);
+  }
+  return modules;
+}
+
 /**
  * Bound a skill selection by capabilities. A skill is kept when the group
  * holds every key that names it; a skill no key names needs `shell`, because a

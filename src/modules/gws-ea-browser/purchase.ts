@@ -1,4 +1,14 @@
-import { formatLocalTimeWithZone } from '../../timezone.js';
+import { noVerifiedPrincipalMessage } from '../gws-ea-profile/approval-wording.js';
+import {
+  checkoutChanging,
+  purchaseCommitNotice,
+  purchaseMessage,
+  purchaseInvariantMessage,
+  purchaseAddOnMissing,
+  purchaseCardTitle,
+  purchaseCardWithdrawal,
+  purchaseApprovalExpired,
+} from './purchase-wording.js';
 import { claimRegionWatchCommit } from './watch-state.js';
 import { createHash } from 'node:crypto';
 import type { ElementHandle, Page } from 'playwright-core';
@@ -87,7 +97,7 @@ export const browserPurchaseGuard = defineGuardedAction({
   grantActionName: PURCHASE_APPROVAL,
   grantCoversRequest: (grant, input) => grant.payload === JSON.stringify(input.payload),
   async decide({ actor, payload }) {
-    if (actor.kind !== 'agent' || !actor.sessionId) return DENY('Only a live browser job can request a purchase.');
+    if (actor.kind !== 'agent' || !actor.sessionId) return DENY(purchaseMessage('live'));
     const session = await getSession(actor.sessionId);
     const db = getDb();
     const job =
@@ -106,12 +116,10 @@ export const browserPurchaseGuard = defineGuardedAction({
       job.cancel_requested ||
       session.status !== 'active'
     )
-      return DENY('The browser job is no longer live.');
-    if (!(await readHostBrowserPolicy()).enabled) return DENY('Browser is disabled.');
+      return DENY(purchaseMessage('noLiveJob'));
+    if (!(await readHostBrowserPolicy()).enabled) return DENY(purchaseMessage('disabled'));
     const principal = await principalApproverUserId();
-    return principal
-      ? HOLD('A purchase requires the principal to confirm the complete merchant facts.', principal)
-      : DENY('No verified principal can confirm this purchase.');
+    return principal ? HOLD(purchaseMessage('principal'), principal) : DENY(noVerifiedPrincipalMessage());
   },
 });
 function cardPayload(card: PurchaseCard): Record<string, unknown> {
@@ -142,7 +150,7 @@ async function checkoutConsent(
     scope: { jobId: context.job.id, db: context.store.db },
     assertActive: context.assertActive,
   });
-  if (consent.status !== 'ready') throw new Error('A purchase consent pass answers only with its facts');
+  if (consent.status !== 'ready') throw new Error(purchaseMessage('consentFacts'));
   return consent;
 }
 
@@ -158,7 +166,7 @@ function withConsent(facts: PurchaseFacts, consent: CheckoutConsent): PurchaseFa
 /** A real calendar date, or a date and time with an explicit UTC offset normalized to UTC. */
 function iso(value: unknown): string {
   const parsed = readIsoTime(value, 'optional');
-  if (!parsed) throw invalidArgs('Use a real ISO date, or a date and time with a UTC offset.');
+  if (!parsed) throw invalidArgs(purchaseMessage('iso'));
   return parsed;
 }
 /** Merchants quote delivery as calendar dates, so a window bound is the date it names in its own offset. */
@@ -182,10 +190,10 @@ export function validatePurchaseRequest(content: Record<string, unknown>): Recor
         ].includes(key),
     )
   )
-    throw invalidArgs('Unknown purchase field.');
+    throw invalidArgs(purchaseMessage('unknownField'));
   const operation = content.operation ?? 'commit';
-  if (operation !== 'commit' && operation !== 'reconcile') throw invalidArgs('Unknown purchase operation.');
-  const ref = readBrowserRef(content.target, 'target needs a current ref and generation.');
+  if (operation !== 'commit' && operation !== 'reconcile') throw invalidArgs(purchaseMessage('operation'));
+  const ref = readBrowserRef(content.target, purchaseMessage('target'));
   if (operation === 'reconcile') {
     if (
       typeof content.attempt_id !== 'string' ||
@@ -193,22 +201,22 @@ export function validatePurchaseRequest(content: Record<string, unknown>): Recor
       content.delivery_window !== undefined ||
       content.needed_by !== undefined
     )
-      throw invalidArgs('Reconciliation needs only attempt_id and target; no model verdict is accepted.');
+      throw invalidArgs(purchaseMessage('reconcile'));
     return { operation, target: ref, attempt_id: content.attempt_id };
   }
-  if (content.attempt_id !== undefined) throw invalidArgs('attempt_id is for reconciliation.');
+  if (content.attempt_id !== undefined) throw invalidArgs(purchaseMessage('attempt'));
   let deliveryWindow: PurchaseBounds['deliveryWindow'];
   if (content.delivery_window !== undefined) {
     if (
       !isRecord(content.delivery_window) ||
       Object.keys(content.delivery_window).some((key) => !['start', 'end'].includes(key))
     )
-      throw invalidArgs('delivery_window needs start and end.');
+      throw invalidArgs(purchaseMessage('window'));
     deliveryWindow = {
       start: calendarDate(content.delivery_window.start),
       end: calendarDate(content.delivery_window.end),
     };
-    if (deliveryWindow.start > deliveryWindow.end) throw invalidArgs('The delivery window must be ordered.');
+    if (deliveryWindow.start > deliveryWindow.end) throw invalidArgs(purchaseMessage('windowOrder'));
   }
   const neededBy = content.needed_by === undefined ? undefined : iso(content.needed_by);
   return {
@@ -244,16 +252,6 @@ async function changedCards(db: DbDriver, jobId: string, site: string): Promise<
     jobId,
   );
   return cards.filter((card) => (JSON.parse(card.facts_json) as PurchaseFacts).site === site).length;
-}
-
-/** The answer of a checkout that changed after its third changed card: no fourth card; its job stops (R9). */
-function checkoutChanging(change: string): Record<string, unknown> {
-  return {
-    status: 'checkout_changing',
-    reason: change,
-    message: `The checkout changed again after three changed cards (${change}), so the host stopped this errand; nothing more went to the principal.`,
-    repeat_safe: false,
-  };
 }
 
 /**
@@ -317,7 +315,7 @@ async function requestPurchaseCard(
     payload,
   });
   if (decision.effect === 'deny') throw forbidden(decision.reason);
-  if (decision.effect !== 'hold') throw forbidden('Purchase confirmation was not held for the principal.');
+  if (decision.effect !== 'hold') throw forbidden(purchaseMessage('notHeld'));
   // The card's picture (KTD6), taken before anything durable changes; null leaves the card saying it is unavailable.
   const picture = await checkoutPicture(context, facts);
   const expires = new Date(Date.now() + PURCHASE_CARD_LIFE_MS).toISOString();
@@ -326,7 +324,7 @@ async function requestPurchaseCard(
       'SELECT cancelled,cancel_requested FROM gws_ea_browser_jobs WHERE id = ?',
       context.job.id,
     );
-    if (!job || job.cancelled || job.cancel_requested) throw forbidden('The browser job was cancelled.');
+    if (!job || job.cancelled || job.cancel_requested) throw forbidden(purchaseMessage('cancelled'));
     const old = await detachPurchaseCards(context.job.id, 'superseded');
     const recorded = await authorities.recordedNotPlaced(facts.site);
     await db.run(
@@ -355,10 +353,7 @@ async function requestPurchaseCard(
     };
   });
   await context.wakeWaiters(detached.waitingJobs, `superseded-${id}`);
-  await finishPurchaseCardWithdrawals(
-    detached.cards,
-    'Withdrawn: the checkout changed. A fresh card contains the current facts.',
-  );
+  await finishPurchaseCardWithdrawals(detached.cards, purchaseCardWithdrawal());
   const earlier = { unresolved: exceptions.length, recordedNotPlaced: detached.recorded };
   const question = renderPurchaseCard(facts, bounds, earlier, await principalClock(), change, {
     alias: await assistantWebAddress(),
@@ -368,7 +363,7 @@ async function requestPurchaseCard(
     agentName: 'browser',
     action: PURCHASE_APPROVAL,
     payload,
-    title: 'Approve this purchase?',
+    title: purchaseCardTitle(),
     question,
     approverUserId: decision.approverUserId,
     expiresAt: expires,
@@ -596,7 +591,7 @@ function unreadyCommit(read: Exclude<MerchantCheckoutRead, { status: 'ready' }>)
       return { status: read.status, repeat_safe: false };
     default: {
       const unknown: never = read;
-      throw new Error(`Unknown checkout read ${JSON.stringify(unknown)}`);
+      throw new Error(purchaseInvariantMessage('checkout', unknown));
     }
   }
 }
@@ -666,13 +661,12 @@ export async function executeAuthorizedPurchase(
       if (authority.kind === 'watch' && (change || expired))
         return { status: 'outside_bounds', watchId: authority.watch_id, repeat_safe: false };
       if (change) return requestPurchaseCard(context, facts, bounds, change);
-      if (expired) return requestPurchaseCard(context, facts, bounds, 'The previous approval expired.', false);
+      if (expired) return requestPurchaseCard(context, facts, bounds, purchaseApprovalExpired(), false);
       // Re-read once more inside the classifier's authority callback, immediately before its only native press.
       await press(read.signature, element, async () => {
         await context.assertActive();
         const latest = await readMerchantPurchase(page, element);
-        if (latest.status !== 'ready')
-          throw new PurchaseAuthorityError('changed', 'The checkout is no longer readable.');
+        if (latest.status !== 'ready') throw new PurchaseAuthorityError('changed', purchaseMessage('unreadable'));
         let commitClaim = claim;
         if (authority.kind === 'watch') {
           const { prepareWatchCommit } = await import('./watch-purchase.js');
@@ -821,7 +815,7 @@ async function stillFree(page: Page, free: FreeCommit, latest: MerchantPurchaseR
       );
     default: {
       const unknown: never = free;
-      throw new Error(`Unknown free commit ${JSON.stringify(unknown)}`);
+      throw new Error(purchaseInvariantMessage('free', unknown));
     }
   }
 }
@@ -859,7 +853,7 @@ async function commitFree(
     return {
       answer: {
         status: 'facts_incomplete',
-        missing: consent.addOns.map((addOn) => `the charge for ${addOn}`),
+        missing: consent.addOns.map((addOn) => purchaseAddOnMissing(addOn)),
         repeat_safe: true,
       },
     };
@@ -885,7 +879,7 @@ async function commitFree(
           const again = await runConsentPass(page, free.element, { scope, assertActive: context.assertActive });
           const latest = await readMerchantPurchase(page, free.element);
           if (again.status !== 'ready' || !(await stillFree(page, free, latest)))
-            throw new PurchaseAuthorityError('changed', 'The booking changed before the host pressed it.');
+            throw new PurchaseAuthorityError('changed', purchaseMessage('bookingChanged'));
           await db.transaction(async () => {
             const job = await db.get<{ cancelled: number; cancel_requested: number }>(
               'SELECT cancelled,cancel_requested FROM gws_ea_browser_jobs WHERE id = ?',
@@ -1009,9 +1003,7 @@ export async function executeBrowserPurchase(
   const found: { unapproved?: UnapprovedCommit } = {};
   try {
     const answer = await withBrowserJobNavigation(context, page, async () => {
-      const refs = await pinBrowserRefs(page, [
-        readBrowserRef(payload.target, 'target needs a current ref and generation.'),
-      ]);
+      const refs = await pinBrowserRefs(page, [readBrowserRef(payload.target, purchaseMessage('target'))]);
       try {
         if (payload.operation === 'reconcile')
           return reconcilePurchaseAttempt(
@@ -1046,7 +1038,7 @@ export async function executeBrowserPurchase(
             return { status: read.status, repeat_safe: true };
           default: {
             const unknown: never = read;
-            throw new Error(`Unknown checkout read ${JSON.stringify(unknown)}`);
+            throw new Error(purchaseInvariantMessage('checkout', unknown));
           }
         }
         // The merchant keeps its lease through a payment platform's own page (KTD7).
@@ -1112,107 +1104,6 @@ export const purchaseAction: BrowserQueuedAction = {
   execute: executeBrowserPurchase,
 };
 
-/** Why the host itself stopped a job: its checkout kept changing, or an incident's stop (KTD10). */
-async function hostStop(jobId: string, data: Record<string, unknown>): Promise<string | undefined> {
-  if (data.status === 'checkout_changing' && typeof data.message === 'string') return data.message;
-  const incident = await getDb().get<{ kind: IncidentKind; site: string }>(
-    'SELECT kind,site FROM gws_ea_browser_incidents WHERE job_id = ? ORDER BY created_at LIMIT 1',
-    jobId,
-  );
-  if (!incident) return undefined;
-  switch (incident.kind) {
-    case 'unapproved_commit':
-      return `An ordinary press on ${incident.site} landed on a confirmation showing a charge nobody approved, so the host stopped this errand.`;
-    case 'late_confirmation':
-      return `A purchase on ${incident.site} recorded as not placed was reported placed after all, so the host stopped this errand.`;
-    default: {
-      const unknown: never = incident.kind;
-      throw new Error(`Unknown incident kind ${String(unknown)}`);
-    }
-  }
-}
-
-/** Why a checkout reached no card or press, in the words the browser reports to main. */
-function unpurchasable(data: Record<string, unknown>): string | undefined {
-  switch (data.status) {
-    case 'card_needed':
-      return 'the site has no payment method saved for this checkout, and card details are never entered';
-    case 'facts_incomplete':
-      return Array.isArray(data.missing) && data.missing.length
-        ? `the host could not read ${data.missing.join(', ')} on the checkout`
-        : 'the host could not read every fact the checkout needs';
-    case 'terms_unavailable':
-      return 'the host could not read the site’s terms';
-    case 'terms_over_bounds':
-      return 'the site’s terms can charge more than the principal’s maximum';
-    default:
-      return undefined;
-  }
-}
-
-/** What the browser hears of an approved purchase that went no further (KTD10): its job's state first, then status. */
-interface PurchaseCommitNotice {
-  readonly message: string;
-  readonly safe_to_rebuild: boolean;
-  readonly repeat_safe: boolean;
-}
-async function purchaseCommitNotice(
-  job: { readonly id: string; readonly cancelled: number },
-  authority: SpendingAuthority,
-  data: Record<string, unknown>,
-): Promise<PurchaseCommitNotice> {
-  const none = 'No purchase was attempted';
-  const told = (message: string, rebuild = false, repeatSafe = false): PurchaseCommitNotice => ({
-    message,
-    safe_to_rebuild: rebuild,
-    repeat_safe: repeatSafe,
-  });
-  const cancellation = await getDb().get<{ cancel_requested: number }>(
-    'SELECT cancel_requested FROM gws_ea_browser_jobs WHERE id = ?',
-    job.id,
-  );
-  const stopped = job.cancelled === 1 || cancellation?.cancel_requested === 1;
-  if (stopped) {
-    const stop = await hostStop(job.id, data);
-    return stop
-      ? told(`${none}. ${stop} Report it to main.`)
-      : told(`${none}: this errand was cancelled, so stop here.`);
-  }
-  // A changed or expired checkout already went back to the principal as a new card.
-  if (data.status === 'awaiting_principal')
-    return told(
-      `${none}: the principal has a new card with the checkout's current facts. Stay on the checkout and wait for its outcome.`,
-    );
-  const unspent = authority.state === 'live' && !authority.commit_started_at;
-  if (authority.expires_at <= new Date().toISOString())
-    return told(`${none}: the principal's approval expired before the checkout could go through. Report it to main.`);
-  const holds = async (): Promise<string> =>
-    `The principal's approval holds until it expires, ${formatLocalTimeWithZone(authority.expires_at, await principalClock())}.`;
-  if (
-    unspent &&
-    (data.status === 'checkout_lapsed' ||
-      (data.status === 'stopped' && (data.reason === 'interrupted' || data.reason === 'browser_unavailable')))
-  )
-    return told(
-      `${none}. Rebuild the checkout from a fresh observation and call purchase; the host revalidates the approved facts, bounds and expiry.`,
-      true,
-    );
-  if (data.status === 'waiting_on_earlier')
-    return told(
-      `${none}: an earlier purchase on this site is waiting for its outcome to be recorded. Browse on; when the host wakes you, rebuild the checkout from a fresh observation and call purchase. ${await holds()}`,
-    );
-  if (data.status === 'site_purchase_blocked' || (data.status === 'stopped' && data.reason === 'site_busy'))
-    return told(
-      `${none}: another errand holds this site. The host wakes you when it is free; then call purchase again. ${await holds()}`,
-      false,
-      data.repeat_safe === true,
-    );
-  const reason = unpurchasable(data);
-  if (reason) return told(`${none}: ${reason}. Report it to main.`);
-  const status = typeof data.reason === 'string' ? `${String(data.status)}, ${data.reason}` : String(data.status);
-  return told(`${none} (${status}). Handle it as the purchase tool describes.`);
-}
-
 /** Internal approval work has no polling MCP caller; every pre-commit answer resumes its job. */
 async function deliverPurchaseCommitAnswer(request: BrowserRequest, frame: ResponseFrame): Promise<void> {
   if (request.commit_started_at) return; // Marked outcomes already use the durable authority notification.
@@ -1230,7 +1121,23 @@ async function deliverPurchaseCommitAnswer(request: BrowserRequest, frame: Respo
           status: 'stopped',
           reason: frame.ok ? 'browser_unavailable' : frame.error.code,
         };
-  const notice = await purchaseCommitNotice(job, authority, data);
+  const cancellation = await getDb().get<{ cancel_requested: number }>(
+    'SELECT cancel_requested FROM gws_ea_browser_jobs WHERE id = ?',
+    job.id,
+  );
+  const stopped = job.cancelled === 1 || cancellation?.cancel_requested === 1;
+  const incident =
+    stopped && !(data.status === 'checkout_changing' && typeof data.message === 'string')
+      ? await getDb().get<{ kind: IncidentKind; site: string }>(
+          'SELECT kind,site FROM gws_ea_browser_incidents WHERE job_id = ? ORDER BY created_at LIMIT 1',
+          job.id,
+        )
+      : undefined;
+  const notice = await purchaseCommitNotice(stopped, authority, data, {
+    incident,
+    now: new Date().toISOString(),
+    principalClock,
+  });
   try {
     await writeBrowserNotice(
       session,
@@ -1251,7 +1158,7 @@ async function deliverPurchaseCommitAnswer(request: BrowserRequest, frame: Respo
 }
 export const purchaseCommitAction: BrowserQueuedAction = {
   validate(content) {
-    if (typeof content.authority_id !== 'string') throw invalidArgs('authority_id required');
+    if (typeof content.authority_id !== 'string') throw invalidArgs(purchaseMessage('authority'));
     return { authority_id: content.authority_id };
   },
   async execute(context, payload) {

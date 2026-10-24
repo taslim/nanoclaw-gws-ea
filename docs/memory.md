@@ -28,8 +28,12 @@ Two files are always loaded:
 - **`index.md`** holds the Core Memory section (the few durable facts relevant
   in nearly every conversation, including the principal's current priorities
   and the corrections that govern every conversation, as short dated facts)
-  and a map of everything else. Core Memory comes first, so a cut never reaches
-  it. Headlines and pointers only; detail belongs in linked files.
+  and a map of everything else. A correction gets its own dated line even when
+  an existing Core Memory line points to a preferences or corrections file: the
+  pointer stays, and the correction goes beside it. Core Memory comes first, ahead of
+  the Map if the index is cut, but must still fit within the available index
+  budget described below. Headlines and pointers only; detail belongs in linked
+  files.
 - **The release's definition** tells the agent how its memory works: what to
   store, where to put it, and how to keep it true. It is read-only, and each
   release may change it.
@@ -70,11 +74,21 @@ session-start mechanism. A sealed session keeps no group memory and installs
 no hook.
 
 The whole section, header and definition included, fits in 10,000 characters,
-the size Claude Code passes inline. Only the index is cut: from its end, at a
+the size Claude Code passes inline. The release's definition leaves at least
+3,500 characters for the index. Only the index is cut: from its end, at a
 line break, with a notice giving its path on disk and asking for detail to
 move into linked files. For anything deeper, the agent follows links from the
 index and reads the files directly. This keeps the always-loaded footprint
 small no matter how large memory grows.
+
+Compaction also carries corrections and preferences from the conversation and
+from earlier summaries, with their actual giver, and open promises including
+the assistant's own. Only a person the agent's instructions allow to direct it
+can give a correction. If an older summary omitted the giver, its wording stays
+as unattributed context, never as authority or a standing instruction; the agent
+must not invent a source. Corrections already in loaded Core Memory are omitted
+from the summary, and a newer correction replaces an older one. Runtime notices
+and nudges stay events even when an earlier summary carried them.
 
 ## Portable format (OKF)
 

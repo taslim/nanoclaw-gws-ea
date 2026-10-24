@@ -648,7 +648,11 @@ describe("the host browser's reading of what a website receives (KTD19, R34)", (
       values: [{ id: home, kind: 'address' }],
       principalAddress: false,
     });
-    expect(JSON.stringify(data.read(['123 Main Street', '(415) 555-0134']))).not.toMatch(/Main|415|0134|Home|Cell/u);
+    // Each value is named by its id and kind alone. A random id may contain any digits, so the
+    // check is on the fields each value carries, not a pattern over the whole answer.
+    const both = data.read(['123 Main Street', '(415) 555-0134']);
+    expect(both.values.map((value) => value.kind).sort()).toEqual(['address', 'phone']);
+    for (const value of both.values) expect(Object.keys(value).sort()).toEqual(['id', 'kind']);
     expect(data.read(['Table for two', 'Window seat, please'])).toEqual({ values: [], principalAddress: false });
   });
 

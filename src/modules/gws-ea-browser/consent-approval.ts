@@ -6,6 +6,7 @@
  * again, or the principal withdraws it through main. A rejection leaves the box unticked, and the job is told; a
  * credential form held for that stop is left unknown, never filled again.
  */
+import { noVerifiedPrincipalMessage } from '../gws-ea-profile/approval-wording.js';
 import { getDomain } from 'tldts';
 
 import { answeredGuard, answeringAction, forbidden, invalidArgs } from '../../cli/delivery-action.js';
@@ -70,7 +71,7 @@ export const browserConsentGuard = defineGuardedAction({
     const principal = await principalApproverUserId();
     return principal
       ? HOLD('Agreeing to anything beyond a site’s own terms is the principal’s decision.', principal)
-      : DENY('No verified principal can agree to this.');
+      : DENY(noVerifiedPrincipalMessage());
   },
 });
 

@@ -18,5 +18,7 @@ gog reaches Google through the gateway, signed in as you, so it needs no account
 
 When gog fails:
 
-- `Google API error (401 …)`, `people API is not enabled`, or no connection to Google at all: restoring access is the operator's job. Say in one line what you can't do right now, and carry on with everything that doesn't need the directory. Never give anyone a link to sign in as you, or the link gog prints: only the operator can use them.
-- `403 insufficientPermissions`, or `command "…" is not enabled`: that isn't something you can do. Don't look for another way to reach it.
+- `Google API error (401 …)`, or no connection to Google at all: your Google connection has stopped working.
+- `403 insufficientPermissions`, or a `403` mentioning insufficient authentication scopes: that part of Google isn't connected for you.
+- `people API is not enabled`: the organization's directory isn't available through your connection yet. Tell them the directory isn't available right now, and ask the principal for the address when the job needs it. Only the operator can use the setup link gog prints.
+- `command "…" is not enabled`: gog has refused a command outside the ones available to you. Use this skill's directory search, without looking for another way around the limit. If it can't do the job, tell the principal which lookup isn't available to you.

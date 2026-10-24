@@ -8,6 +8,10 @@ allowed-tools: Bash(gog:*)
 
 Every command is `gog calendar <command>`, and its output is JSON. Run `gog calendar <command> --help` for anything this page doesn't cover, and `gog --help` for gog's other commands.
 
+Use the `create_event`, `change_guests`, `respond_to_event` and `find_conflicts` tools for creating events, changing guests, answering for the principal and checking availability; use `gog` through Bash for every other Google Calendar operation. The first two check every invitation for the principal's private details, and keep the principal, accepted, on events on their calendars, which gog can't; gog also refuses to answer an event the principal organizes. gog reaches Google through the gateway, which signs each request in as you, your own Google Workspace account. So gog needs no account, token, or sign-in from you: never pass one, and never run `gog auth`. Use gog rather than direct HTTP requests to Google, because it handles paging, recurring events, and time zones that hand-built requests get wrong.
+
+gog prints `Note: Using direct access token (expires in ~1 hour; no auto-refresh)` on every run. Ignore it: the host keeps your access current, and gog has nothing to refresh.
+
 Two habits prevent most mistakes:
 
 - Pass every time as RFC 3339 with an offset, such as `2026-10-06T14:00:00-07:00`, computed with the time tools.
@@ -15,10 +19,12 @@ Two habits prevent most mistakes:
 
 ## Find the principal's calendars
 
+A calendar is the principal's when its ID (their primary calendar) or its `dataOwner` is one of the principal's addresses. The Assistant Identity section lists those addresses or says where to read them. A gmail.com or googlemail.com address counts in every spelling Gmail delivers to it: with or without dots, with a `+tag`, at either domain. Any other address counts only as listed, in upper or lower case. Decide by those facts alone, because a calendar's name, your access role, and its `primary` flag can all mislead. Treat every other calendar as someone else's.
+
 The host adds the main (primary) calendar of each of the principal's addresses to your list itself, and keeps trying while one isn't shared with you. An account's main calendar has the account's address as its ID. Sharing any other calendar with you doesn't add it to your list, whichever account it comes from: Google adds one only when you subscribe to it by its ID, which is in Google's sharing email, and which its owner can copy from that calendar's "Integrate calendar" settings.
 
 1. `gog calendar calendars` lists the calendars in your list, with your `accessRole` on each: `owner` or `writer` (you can change events), `writerWithoutPrivateAccess` (you can change events, but its owner's private events show only as busy time and you can't make an event private there), `reader` (you can see details), or `freeBusyReader` (you can see only when they're busy).
-2. Decide whose each calendar is by the ownership rule in your gcalendar instructions. `dataOwner`, the owner's address, appears only on secondary calendars; a primary calendar's owner is its ID.
+2. Decide whose each calendar is by the ownership rule above. `dataOwner`, the owner's address, appears only on secondary calendars; a primary calendar's owner is its ID.
 
 Add any other calendar, such as one of the principal's secondary calendars, or a main calendar they have just shared that the host has not added yet, with `gog calendar subscribe <calendarId>`: success means it is shared with you, and `404 notFound` that it isn't yet. To stop using a calendar, run `gog calendar unsubscribe <calendarId>`: it leaves your list, and the sharing stays until its owner changes it. The host puts the principal's main calendars back, so one of those leaves only when its address is no longer listed as theirs or they stop sharing it.
 
@@ -60,3 +66,12 @@ To tell whether you created an event, compare its `creator.email` with your own 
 When an event has guests other than the principal, they hear about it from Google, as they would from any assistant: `create_event` sends them the invitation, and `change_guests` sends them Google's update when you invite someone or take someone off. gog emails no one unless you pass `--send-updates all`. Pass it when you move or cancel an event with guests other than the principal, as a good assistant lets people know when a meeting moves or is called off; leave it off for an event that is the principal's alone, with no one else to tell.
 
 After any change, read the event back with `gog calendar event` and check its time, calendar, and status (`cancelled` after a delete) before you report it done. After you move an event the principal organizes, check their own entry too: if your move reset it, put them back as `accepted` with `respond_to_event`, which reads its answer back itself.
+
+## When gog fails
+
+Explain the limit in words the principal can act on, without an error code or command:
+
+- No connection to Google: Google can't be reached right now.
+- `404 notFound` for a calendar: it isn't shared with you, or the ID is wrong. Tell them you can't see that calendar yet, and ask its owner to share it when the ID is right.
+- `403 requiredAccessLevel`: you may see that calendar but not change it. Tell them you can see it but need permission to change it, and ask its owner for that access when the job needs it.
+- `command "…" is not enabled`: gog has refused a command outside the ones available to you. Use the route this skill provides, without looking for a way around the limit. If the job still can't be done, say which action isn't available to you.

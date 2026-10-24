@@ -47,7 +47,6 @@ import { untrustedLine } from '../gws-ea-inbox/untrusted.js';
 import { getGwsEaProfile, principalRecognizer, type PrincipalRecognizer } from '../gws-ea-profile/db.js';
 import {
   createMeetingsCalendarApi,
-  type CalendarEntry,
   type DetailedAttendee,
   type DetailedEvent,
   type EventTime,
@@ -56,6 +55,7 @@ import {
 import { hostGoogleAccessToken } from '../gws-ea-google/index.js';
 import { dayLabel, spanLabel } from './calendar-actions.js';
 import { addressesOf, instantOf, lineOf } from './fields.js';
+import { calendarName, calendarNames, type CalendarName } from './calendar-names.js';
 import {
   blocksTime,
   eventSpan,
@@ -183,15 +183,6 @@ interface FactsView {
   readonly names: ReadonlyMap<string, CalendarName>;
 }
 
-interface CalendarName {
-  readonly text: string;
-  readonly external: boolean;
-}
-
-function calendarName(name: CalendarName): string {
-  return name.external ? untrustedLine(name.text, MAX_NAME_CHARS, CALENDAR_SOURCE) : name.text;
-}
-
 function namedCalendar(id: string, view: FactsView): CalendarName {
   return view.names.get(id) ?? { text: id, external: true };
 }
@@ -207,42 +198,6 @@ function overlap(a: Span, b: Span): number {
 /** An address's key across the spellings that reach one mailbox: who is the assistant, never who is the principal. */
 function mailbox(email: string): string {
   return identityMatchKey(`email:${email}`);
-}
-
-/**
- * Each of the principal's calendars by the name main speaks of it by: its
- * name as Google lists it, or its ID when it has none. Google names an
- * account's main calendar by its address, and an address is no name the
- * principal calls their calendar by, so one called by an address is named
- * as they would hear it: their calendar when it is their only one, else by
- * its account, their Gmail calendar or their calendar at its domain. Two
- * that would read alike keep their addresses, the only thing that tells
- * them apart.
- */
-function calendarNames(entries: readonly CalendarEntry[], addresses: PrincipalRecognizer): Map<string, CalendarName> {
-  const heard = (name: string): string => {
-    if (entries.length === 1) return "the principal's calendar";
-    if (!addresses.has(name)) return "one of the principal's calendars";
-    const key = mailbox(name);
-    const domain = key.slice(key.lastIndexOf('@') + 1);
-    return domain === 'gmail.com' ? "the principal's Gmail calendar" : `the principal's calendar at ${domain}`;
-  };
-  const named = entries.map((entry) => {
-    const name = entry.summary?.replace(/\s+/gu, ' ').trim() || entry.id;
-    const address = EMAIL_PATTERN.test(name);
-    return {
-      id: entry.id,
-      name,
-      spoken: { text: address ? heard(name) : name, external: !address },
-    };
-  });
-  const uses = new Map<string, number>();
-  for (const { spoken } of named) uses.set(spoken.text, (uses.get(spoken.text) ?? 0) + 1);
-  return new Map(
-    named.map(
-      ({ id, name, spoken }) => [id, uses.get(spoken.text) === 1 ? spoken : { text: name, external: true }] as const,
-    ),
-  );
 }
 
 function isRoom(attendee: DetailedAttendee): boolean {

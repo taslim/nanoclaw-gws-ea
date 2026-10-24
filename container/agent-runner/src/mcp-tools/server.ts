@@ -66,6 +66,13 @@ export function registerToolVariant(tool: McpToolDefinition, capability: string)
   toolVariants.set(name, variants);
 }
 
+/** Every capability key a base tool or a variant is served under, for checks that must cover each one. */
+export function registeredToolCapabilities(): string[] {
+  const keys = new Set(toolCapabilities.values());
+  for (const variants of toolVariants.values()) for (const key of variants.keys()) keys.add(key);
+  return [...keys].sort();
+}
+
 /**
  * Import a tool module whose tools one capability key grants. Every tool the
  * module registers while it loads is attributed to `capability`, so a module

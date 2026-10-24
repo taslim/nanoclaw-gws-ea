@@ -30,6 +30,7 @@
  * only in the same document the host was watching with no interaction since;
  * from `confirmed` it re-runs the vault's finalize.
  */
+import { noVerifiedPrincipalMessage } from '../gws-ea-profile/approval-wording.js';
 import {
   classifyCredentialControlFacts,
   classifyCredentialNavigation,
@@ -109,7 +110,17 @@ import {
   takeSignupVerification,
 } from './sign-in-mail.js';
 import { signupAccountStop } from './web-address.js';
-import { quoted } from '../approvals/request-text.js';
+import {
+  credentialAuthorityMessage,
+  credentialFormMessage,
+  credentialReleaseTitle,
+  credentialReleaseRefused,
+  credentialReleaseSettled,
+  credentialReleased,
+  credentialReleaseRejected,
+  releaseQuestion,
+  parsedEvidence,
+} from './credential-wording.js';
 
 export interface CredentialOperationDependencies {
   readonly attempts: CredentialAttempts;
@@ -184,10 +195,9 @@ export async function credentialAuthorityRequest(
   session: Session,
   dependencies: CredentialOperationDependencies = DEFAULT_DEPENDENCIES,
 ): Promise<Outcome> {
-  if (!(await hasBrowserAccess(session.agent_group_id)))
-    throw forbidden('Only an agent with browser access may delegate an account signup or password change.');
+  if (!(await hasBrowserAccess(session.agent_group_id))) throw forbidden(credentialAuthorityMessage('accessRequired'));
   if (Object.keys(content).some((key) => !AUTHORITY_FIELDS.has(key)))
-    throw invalidArgs('Unknown credential_authority field.');
+    throw invalidArgs(credentialAuthorityMessage('unknownField'));
   if (content.operation === 'release') return credentialReleaseRequest(content, session, dependencies);
   const { thread, operation, site, username } = content;
   if (
@@ -197,12 +207,10 @@ export async function credentialAuthorityRequest(
     typeof site !== 'string' ||
     !line(username, MAX_USERNAME)
   )
-    throw invalidArgs(
-      'credential_authority needs the job thread, signup or change_password, the HTTPS site and the exact account username.',
-    );
+    throw invalidArgs(credentialAuthorityMessage('authorityRequired'));
   const origin = httpsOrigin(site)?.origin;
   const domain = origin && registrableDomain(origin);
-  if (!origin || !domain) throw invalidArgs('The site must be a public HTTPS address.');
+  if (!origin || !domain) throw invalidArgs(credentialAuthorityMessage('publicSite'));
   const job = await resolveBrowserJob(thread, undefined, session.agent_group_id);
   const cancelling =
     job &&
@@ -210,8 +218,7 @@ export async function credentialAuthorityRequest(
       'SELECT cancel_requested FROM gws_ea_browser_jobs WHERE id = ?',
       job.id,
     ));
-  if (!job || job.cancelled || cancelling?.cancel_requested)
-    throw forbidden('No live browser job of yours exists for that thread.');
+  if (!job || job.cancelled || cancelling?.cancel_requested) throw forbidden(credentialAuthorityMessage('liveJob'));
   const kind: CredentialKind = operation === 'signup' ? 'signup' : 'rotation';
   const { attempts } = dependencies;
   const unresolved = await attempts.unresolved();
@@ -276,136 +283,16 @@ export const credentialReleaseGuard = defineGuardedAction({
   grantCoversRequest: (grant, input) => grant.payload === JSON.stringify(input.payload),
   async decide({ actor, payload }) {
     if (actor.kind !== 'agent' || !(await hasBrowserAccess(actor.agentGroupId)))
-      return DENY('Only an agent with browser access may ask the principal to release a credential attempt.');
+      return DENY(credentialAuthorityMessage('releaseAccess'));
     const attempt = typeof payload.attemptId === 'string' ? await credentialAttempts.get(payload.attemptId) : undefined;
     if (!attempt || attempt.job_id !== payload.jobId || !RELEASABLE_PHASES.includes(attempt.phase))
-      return DENY('That credential attempt is settled, or its own step settles it.');
+      return DENY(credentialAuthorityMessage('settled'));
     const principal = await principalApproverUserId();
     return principal
-      ? HOLD('Only the principal may end an attempt whose outcome the host cannot establish.', principal)
-      : DENY('No verified principal can decide this.');
+      ? HOLD(credentialAuthorityMessage('principalDecision'), principal)
+      : DENY(noVerifiedPrincipalMessage());
   },
 });
-
-/** What the host did with a login someone changed or removed in 1Password while it was saving it. */
-const LEFT = 'the host left it as it is.';
-const CHANGED_MEANWHILE = `the login was changed or removed in 1Password meanwhile, and ${LEFT}`;
-
-/**
- * What 1Password holds for an attempt the host could not finish, in the
- * principal's words on the card (`mine`) and in main's note (`theirs`). A
- * confirmed one says which item holds the password the site took, and
- * whether the original login may still hold the old one, from its recorded
- * settlement.
- */
-function vaultLeft(
-  attempt: Pick<CredentialAttempt, 'kind' | 'site' | 'settlement'>,
-  phase: CredentialAttemptPhase,
-): { readonly mine: string | undefined; readonly theirs: string } {
-  const item = `"New password for ${attempt.site}"`;
-  if (attempt.kind === 'signup')
-    switch (phase) {
-      case 'conflict':
-        return {
-          mine: undefined,
-          theirs: `Its login was changed or removed in 1Password before the host finished saving it, and ${LEFT}`,
-        };
-      case 'confirmed':
-        return {
-          mine: `Its password is in my 1Password vault, in the login "${attempt.site}" that I couldn't finish saving.`,
-          theirs: `Its password stays in the assistant's 1Password vault, in the login "${attempt.site}" the host could not finish saving.`,
-        };
-      default:
-        return {
-          mine: 'The password I generated for it is kept in my 1Password vault.',
-          theirs: `Its password stays in the assistant's 1Password vault, in the login "${attempt.site}", which the host has not finished saving.`,
-        };
-    }
-  if (phase === 'conflict')
-    return {
-      mine: `The new password is in my 1Password vault as its own item, ${item}.`,
-      theirs: `The new password stays in the assistant's 1Password vault as its own item, ${item}; ${CHANGED_MEANWHILE}`,
-    };
-  if (phase !== 'confirmed')
-    return {
-      mine: 'Both the original and the new password are kept in my 1Password vault.',
-      theirs:
-        "Both the original and the new password stay in the assistant's 1Password vault; the login was not updated.",
-    };
-  switch (attempt.settlement) {
-    case 'promoted':
-      return {
-        mine: `The item ${item} may still hold a copy of it and of the old password.`,
-        theirs: `The login holds the new password; the item ${item} may still hold a copy of it and of the old password.`,
-      };
-    case 'kept':
-      return {
-        mine: `The new password is in my 1Password vault as its own item, ${item}, which may still hold the old password too.`,
-        theirs: `The new password stays in the assistant's 1Password vault as its own item, ${item}, which may still hold the old password too; ${CHANGED_MEANWHILE}`,
-      };
-    case null:
-      return {
-        mine: `The new password is in my 1Password vault as its own item, ${item}, and the login may still have the old one.`,
-        theirs: `The new password stays in the assistant's 1Password vault as its own item, ${item}; the login may still have the old one.`,
-      };
-  }
-}
-
-/** An attempt's recorded evidence, parsed; undefined when it has none. */
-function parsedEvidence(attempt: Pick<CredentialAttempt, 'evidence_json'>): unknown {
-  return attempt.evidence_json === null ? undefined : JSON.parse(attempt.evidence_json);
-}
-
-/** What happened, as the principal reads it first on the card. */
-function situation(attempt: CredentialAttempt, account: string): string {
-  if (attempt.kind === 'signup')
-    switch (attempt.phase) {
-      case 'conflict':
-        return `The site created the account ${account}, but its login in my 1Password vault was changed or removed before I finished saving it, so I left it as it is.`;
-      case 'confirmed':
-        return `The site created the account ${account}, but I can't reach 1Password to finish saving its login.`;
-      case 'awaiting_verification':
-        return `I tried to create the account ${account}. The site asked to confirm it by email, which never completed, so I can't tell whether the account was created.`;
-      default: {
-        const evidence: unknown = parsedEvidence(attempt);
-        const via = isRecord(evidence) ? evidence.via : undefined;
-        return via === 'link' || via === 'code'
-          ? `The site asked to confirm the account ${account} by email, and I used the ${via} it sent, but I can't tell whether the site accepted it.`
-          : `I tried to create the account ${account}, but I can't tell whether the account was created.`;
-      }
-    }
-  if (attempt.phase === 'conflict' || (attempt.phase === 'confirmed' && attempt.settlement === 'kept'))
-    return `The site took a new password for ${account}, but its login in my 1Password vault was changed or removed while I was changing it, so I left the login as it is.`;
-  if (attempt.phase === 'confirmed')
-    return attempt.settlement === 'promoted'
-      ? `The site took a new password for ${account}, and the login in my 1Password vault has it, but I can't reach 1Password to delete the separate item that held it.`
-      : `The site took a new password for ${account}, but I can't reach 1Password to put it into the login.`;
-  return `I tried to change the password of ${account}, but I can't tell whether the password changed.`;
-}
-
-/** What a release the host could finish after all leaves, in words: the job's outcome with its vault state. */
-function finishedWords(attempt: Pick<CredentialAttempt, 'kind' | 'site'>, vault: 'finalized' | 'conflict'): string {
-  if (attempt.kind === 'signup')
-    return vault === 'finalized'
-      ? "the site created the account, and its login in the assistant's 1Password vault holds its password."
-      : `the site created the account, but its login was changed or removed in 1Password before the host finished saving it, and ${LEFT}`;
-  return vault === 'finalized'
-    ? "the site took the new password, and the login in the assistant's 1Password vault now holds it."
-    : `the site took the new password, which is in the assistant's 1Password vault as its own item, "New password for ${attempt.site}"; ${CHANGED_MEANWHILE}`;
-}
-
-/** What the principal reads on the card: what happened, what 1Password keeps, and what releasing means. */
-function releaseQuestion(attempt: CredentialAttempt): string {
-  const account = `${quoted(attempt.username, 256)} on ${attempt.site}`;
-  const uncertain = attempt.phase === 'unknown' || attempt.phase === 'awaiting_verification';
-  const consequence =
-    attempt.kind === 'signup'
-      ? `If you release it, I stop waiting on it and free the site, and I change nothing more in 1Password.${uncertain ? ' Trying again could create a second account.' : ''}`
-      : `If you release it, I stop waiting on it and free the site and the login, and I change nothing more in 1Password.${uncertain ? ' Trying again could change the password a second time.' : ''}`;
-  return [situation(attempt, account), vaultLeft(attempt, attempt.phase).mine, consequence]
-    .filter((sentence) => sentence !== undefined)
-    .join('\n');
-}
 
 /** A confirmed attempt is settled when 1Password can still finish it: a release is only for one it cannot. */
 async function settledFirst(attempts: CredentialAttempts, attempt: CredentialAttempt): Promise<Outcome | undefined> {
@@ -437,9 +324,9 @@ async function credentialReleaseRequest(
     content.site !== undefined ||
     content.username !== undefined
   )
-    throw invalidArgs('release needs only the job thread and the credential authority it recorded.');
+    throw invalidArgs(credentialAuthorityMessage('releaseFields'));
   const job = await resolveBrowserJob(thread, undefined, session.agent_group_id);
-  if (!job) throw forbidden('No browser job of yours exists for that thread.');
+  if (!job) throw forbidden(credentialAuthorityMessage('jobRequired'));
   const found = await attempts.get(authority);
   if (!found || found.job_id !== job.id || !RELEASABLE_PHASES.includes(found.phase))
     return { status: 'not_releasable' };
@@ -461,15 +348,15 @@ async function credentialReleaseRequest(
   if (open) return { status: 'awaiting_principal' };
   const approvalId = await requestApproval({
     session,
-    agentName: 'main',
+    agentName: session.agent_group_id,
     action: CREDENTIAL_RELEASE_APPROVAL,
     payload,
-    title: attempt.kind === 'signup' ? 'Stop waiting on this account signup?' : 'Stop waiting on this password change?',
+    title: credentialReleaseTitle(attempt.kind),
     question: releaseQuestion(attempt),
     approverUserId: decision.approverUserId,
     details: { facts: { site: attempt.site, account: attempt.username } },
   });
-  if (approvalId === null) throw forbidden('The principal could not be asked right now.');
+  if (approvalId === null) throw forbidden(credentialAuthorityMessage('cannotAsk'));
   return { status: 'awaiting_principal' };
 }
 
@@ -512,7 +399,7 @@ async function applyCredentialRelease(
   attempts: CredentialAttempts,
 ): Promise<void> {
   if (!(await isVerifiedPrincipalUser(userId)) || approval.approver_user_id !== userId) {
-    await notify('The credential attempt was not released: only the principal can decide that.');
+    await notify(credentialAuthorityMessage('principalOnly'));
     return;
   }
   let current = typeof payload.attemptId === 'string' ? await attempts.get(payload.attemptId) : undefined;
@@ -520,7 +407,7 @@ async function applyCredentialRelease(
   if (!current || !from) {
     const decision = await guard(credentialReleaseGuard, { actor: agentActor(session), payload, grant: approval });
     if (decision.effect !== 'allow' || !current) {
-      await notify(`The credential attempt was not released: ${decision.reason}`);
+      await notify(credentialReleaseRefused(decision.reason));
       return;
     }
     let result: CredentialReleaseResult;
@@ -528,14 +415,12 @@ async function applyCredentialRelease(
       result = await attempts.release(current.id, approval.approval_id);
     } catch (error) {
       if (!(error instanceof CredentialAttemptError)) throw error;
-      await notify('The credential attempt was not released: another step settled it first.');
+      await notify(credentialAuthorityMessage('settledFirst'));
       return;
     }
     if (result.status === 'settled') {
       await freeSite(queue, result.result.attempt, `credential-settled-${current.id}`);
-      await notify(
-        `The ${current.kind === 'signup' ? 'signup' : 'password change'} for ${current.username} on ${current.site} was not released: 1Password could be reached again, and the host finished it: ${finishedWords(current, result.result.status)}`,
-      );
+      await notify(credentialReleaseSettled(current, result.result.status));
       return;
     }
     current = result.attempt;
@@ -544,9 +429,7 @@ async function applyCredentialRelease(
   watchedResponses.delete(current.id);
   await finishSignupVerification(current.id);
   await freeSite(queue, current, `credential-release-${current.id}`);
-  await notify(
-    `The principal released the ${current.kind === 'signup' ? 'signup' : 'password change'} for ${current.username} on ${current.site}. ${vaultLeft(current, from).theirs} The site is free again, and nothing in 1Password changed.`,
-  );
+  await notify(credentialReleased(current, from));
 }
 
 /**
@@ -617,10 +500,7 @@ export function registerCredentialAuthorityDelivery(
       rejectionNote: async (approval, reason) => {
         const { attemptId } = JSON.parse(approval.payload) as { attemptId?: unknown };
         const attempt = typeof attemptId === 'string' ? await dependencies.attempts.get(attemptId) : undefined;
-        const errand = attempt
-          ? `the ${attempt.kind === 'signup' ? 'account signup' : 'password change'} for "${attempt.username}" on ${attempt.site}`
-          : 'that signup or password change';
-        return `The principal chose to keep waiting on ${errand}${reason ? `: "${reason}"` : ''}. It stays as it is.`;
+        return credentialReleaseRejected(attempt, reason);
       },
     },
   );
@@ -659,7 +539,7 @@ export interface CredentialReconcilePayload extends Record<string, unknown> {
 }
 export type CredentialFormPayload = CredentialSubmitPayload | CredentialVerifyPayload | CredentialReconcilePayload;
 
-const REF_MESSAGE = 'Choose credential fields and the activation control from a fresh observation.';
+const REF_MESSAGE = credentialFormMessage('freshFields');
 
 /** Only an authority and fresh refs: no value, selector or verdict is accepted. */
 export function validateCredentialForm(content: Record<string, unknown>): CredentialFormPayload {
@@ -678,18 +558,15 @@ export function validateCredentialForm(content: Record<string, unknown>): Creden
     typeof authority !== 'string' ||
     !AUTHORITY_ID.test(authority)
   )
-    throw invalidArgs(
-      'Choose the credential authority main recorded, submit, verify or reconcile, and fields from a fresh observation.',
-    );
+    throw invalidArgs(credentialFormMessage('authorityAndFields'));
   if (operation === 'reconcile') return { authority, operation };
   if (operation === 'verify') {
     if ((content.code_field === undefined) !== (content.activate === undefined))
-      throw invalidArgs('Name the verification code field together with the control that submits it, or neither.');
+      throw invalidArgs(credentialFormMessage('verificationPair'));
     if (content.code_field === undefined) return { authority, operation };
     const codeField = readBrowserRef(content.code_field, REF_MESSAGE);
     const activate = readBrowserRef(content.activate, REF_MESSAGE);
-    if (codeField.ref === activate.ref)
-      throw invalidArgs('Name the verification code field together with the control that submits it, or neither.');
+    if (codeField.ref === activate.ref) throw invalidArgs(credentialFormMessage('verificationPair'));
     return { authority, operation, code_field: codeField, activate };
   }
   const payload: CredentialSubmitPayload = { authority, activate: readBrowserRef(content.activate, REF_MESSAGE) };
@@ -701,9 +578,7 @@ export function validateCredentialForm(content: Record<string, unknown>): Creden
     new Set(refs).size !== refs.length ||
     ((payload.confirmation || payload.current_password) && !payload.new_password)
   )
-    throw invalidArgs(
-      'Name each field once, with the new password beside any confirmation or current password, and the control that submits them.',
-    );
+    throw invalidArgs(credentialFormMessage('fieldGroup'));
   return payload;
 }
 
@@ -776,13 +651,13 @@ export async function executeCredentialForm(
   if (!attempt || attempt.job_id !== context.job.id) return refused('no_authority');
   if (payload.operation === 'reconcile') return reconcile(context, attempt, attempts);
   if (payload.operation === 'verify') {
-    if (attempt.kind !== 'signup') throw invalidArgs('Only a new account verifies its email.');
+    if (attempt.kind !== 'signup') throw invalidArgs(credentialFormMessage('newAccountOnly'));
     return verify(context, attempt, payload, attempts);
   }
   if (attempt.kind === 'signup' && payload.current_password)
-    throw invalidArgs('A signup has no current password to fill.');
+    throw invalidArgs(credentialFormMessage('noCurrentPassword'));
   if (attempt.kind === 'rotation' && (!payload.new_password || payload.username))
-    throw invalidArgs('A password change fills the current and new password fields, never a username.');
+    throw invalidArgs(credentialFormMessage('passwordFields'));
   const settled = await settledOutcome(attempt, attempts, context.assertActive);
   if (settled) return settled;
   return onSitePage(context, (page) => runStep(context, page, attempt, payload, attempts));
@@ -1180,7 +1055,7 @@ async function boundStep(
     if (error instanceof BrowserRefError) return refused(error.reason);
     if (error instanceof BrowserSiteBusyError || error instanceof ActionRefusal) throw error;
     // Playwright and protocol errors may carry page prose; only constant host prose crosses this boundary.
-    throw forbidden('The host could not safely bind this form. Take a fresh observation.');
+    throw forbidden(credentialFormMessage('cannotBind'));
   } finally {
     await disposeBrowserRefs(refs);
   }
@@ -1705,7 +1580,7 @@ async function verify(
         // Off the site, the link waits for a step on it.
         if (opened.status === 'origin_mismatch') return refused('origin_mismatch');
         await finishSignupVerification(attempt.id);
-        throw forbidden('The host refused an insecure or off-site verification link.');
+        throw forbidden(credentialFormMessage('verificationLink'));
       }
       await finishSignupVerification(attempt.id);
       // The link is spent: a landing without the site's confirmation leaves the signup unknown, the bearer page cleared.

@@ -1,3 +1,4 @@
+import { noVerifiedPrincipalMessage } from '../gws-ea-profile/approval-wording.js';
 import { createHash } from 'node:crypto';
 import { answeredGuard, answeringAction, forbidden, invalidArgs } from '../../cli/delivery-action.js';
 import { getDb } from '../../db/connection.js';
@@ -172,7 +173,7 @@ const guaranteeGuard = defineGuardedAction({
     const principal = await principalApproverUserId();
     return principal
       ? HOLD('Only the principal can authorize a standing reservation guarantee.', principal)
-      : DENY('No verified principal can confirm a standing guarantee.');
+      : DENY(noVerifiedPrincipalMessage());
   },
 });
 
@@ -369,7 +370,7 @@ export async function reservationGuaranteeRequest(
     await finishApprovalWithdrawal(row, 'Withdrawn: a newer standing-guarantee proposal replaced this card.');
   const approvalId = await requestApproval({
     session,
-    agentName: 'main',
+    agentName: session.agent_group_id,
     action: GUARANTEE_APPROVAL,
     payload,
     title: 'Allow conditional reservation guarantees?',

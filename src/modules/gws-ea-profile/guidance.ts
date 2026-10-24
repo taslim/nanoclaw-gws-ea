@@ -33,7 +33,15 @@ export type Guidance = {
     }
 );
 
+const guidanceFiles = new Set<string>();
+
+/** Every registered guidance file, relative to the checkout: what the release's caps and command checks cover. */
+export function registeredGuidanceFiles(): string[] {
+  return [...guidanceFiles].sort();
+}
+
 export function registerGuidance(id: string, guidance: Guidance): void {
+  guidanceFiles.add(guidance.file.split(path.sep).join('/'));
   registerRequiredProjectDocSection(id, async (group) => {
     const receives =
       'receives' in guidance ? await guidance.receives(group.id) : group.id === (await guidance.agentGroupId());
