@@ -123,16 +123,6 @@ const probes = object({
     last: nullable(object({ status: text, message_out_id: text, at: time })),
     retrying: nullable(count),
   }),
-  main_turn: probe({
-    provider: nullable(text),
-    last: nullable(
-      object({
-        status: choices('completed', 'failed'),
-        at: time,
-        cause: nullable(choices('credentials', 'billing', 'unknown')),
-      }),
-    ),
-  }),
   web_alias: probe({
     state: nullable(choices('not_needed', 'pending', 'verified')),
     address: nullable(text),
@@ -178,6 +168,17 @@ export const STATUS_DATA_SCHEMA = object({
     central_fingerprint: nullable(text),
     session_fingerprint: nullable(text),
     latest_migration: nullable(text),
+    reason: nullable(text),
+  }),
+  main_turn: object({
+    provider: nullable(text),
+    last: nullable(
+      object({
+        status: choices('completed', 'failed'),
+        at: time,
+        cause: nullable(choices('credentials', 'billing', 'unknown')),
+      }),
+    ),
     reason: nullable(text),
   }),
   probes,

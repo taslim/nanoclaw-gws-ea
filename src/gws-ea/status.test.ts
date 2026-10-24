@@ -113,6 +113,7 @@ const STATUS_FIELDS = [
   'release',
   'rollback',
   'schema',
+  'main_turn',
   'probes',
 ] as const;
 
@@ -583,6 +584,11 @@ async function statusJson(host: Machine, state: World, instanceId: string, obser
 
 type ProbeShape = { status: string; reason: string | null } & Record<string, unknown>;
 interface StatusShape {
+  main_turn: {
+    provider: string | null;
+    last: { status: string; at: string; cause: string | null } | null;
+    reason: string | null;
+  };
   probes: Record<string, ProbeShape>;
   release: Record<string, unknown>;
   rollback: Record<string, unknown>;
@@ -591,46 +597,59 @@ interface StatusShape {
 }
 
 describe('status', () => {
-  it('keeps failed main turns visible beside healthy scheduling, host, and delivery observations', async () => {
-    const host = await machine();
-    const reservation = await assistant(host, { label: 'alpha', port: 36_001 });
-    const state = world(reservation);
-    const observers: StatusObservers = {
-      ...healthyObservers(state),
-      mainTurn: () => ({
-        mainAgentGroupId: MAIN,
-        sessionId: SESSION,
-        provider: 'claude',
-        last: {
-          version: 1,
+  it.each(['credentials', 'billing', 'unknown'] as const)(
+    'keeps a failed main turn (%s) informational beside healthy conversation probes',
+    async (cause) => {
+      const host = await machine();
+      const reservation = await assistant(host, { label: 'alpha', port: 36_001 });
+      const state = world(reservation);
+      const observers: StatusObservers = {
+        ...healthyObservers(state),
+        mainTurn: () => ({
+          mainAgentGroupId: MAIN,
+          sessionId: SESSION,
           provider: 'claude',
-          observedAt: parseIsoTimestamp(DELIVERED_AT),
-          status: 'failed',
-          cause: 'credentials',
-        },
-      }),
-    };
-    const { status, nextActions } = await statusJson(host, state, reservation.instance_id, observers);
-    expect(status.probes.main_turn).toMatchObject({
-      status: 'degraded',
-      provider: 'claude',
-      last: { status: 'failed', at: DELIVERED_AT, cause: 'credentials' },
-    });
-    expect(status.probes.delivery.status).toBe('ok');
-    expect(status.probes.host.status).toBe('ok');
-    expect(nextActions).toContainEqual(
-      expect.objectContaining({ kind: 'external', instruction: expect.stringContaining('provider sign-in') }),
-    );
-    const { runtime, output } = command(host, state, observers);
-    await runStatusCommand(runtime, { instanceId: reservation.instance_id, json: false });
-    expect(output.stdout.join('\n')).toContain('Conversation: degraded (main_turn)');
-    expect(output.stdout.join('\n')).toContain(
-      `claude: last observed turn failed ${formatLocalTime(DELIVERED_AT, 'America/New_York')} (credentials)`,
-    );
-  });
+          last: {
+            version: 1,
+            provider: 'claude',
+            observedAt: parseIsoTimestamp(DELIVERED_AT),
+            status: 'failed',
+            cause,
+          },
+        }),
+      };
+      const { status, nextActions } = await statusJson(host, state, reservation.instance_id, observers);
+      expect(status.main_turn).toEqual({
+        provider: 'claude',
+        last: { status: 'failed', at: DELIVERED_AT, cause },
+        reason: null,
+      });
+      expect(status.probes).not.toHaveProperty('main_turn');
+      expect(status.probes.delivery.status).toBe('ok');
+      expect(status.probes.host.status).toBe('ok');
+      expect(nextActions).toEqual(
+        cause === 'credentials'
+          ? [expect.objectContaining({ kind: 'external', instruction: expect.stringContaining('provider sign-in') })]
+          : [],
+      );
+      const { runtime, output } = command(host, state, observers);
+      await runStatusCommand(runtime, { instanceId: reservation.instance_id, json: false });
+      expect(output.stdout.join('\n')).toContain(
+        'Conversation: ready (observed host, Chat, identities, authorization, and delivery)',
+      );
+      expect(output.stdout.join('\n')).toContain(
+        `Last observed agent outcome (main): claude: failed ${formatLocalTime(DELIVERED_AT, 'America/New_York')} (${cause})`,
+      );
+      const detailed = command(host, state, observers);
+      await runStatusCommand(detailed.runtime, { instanceId: reservation.instance_id, json: false, details: true });
+      expect(detailed.output.stdout.join('\n')).toContain(
+        `Last observed agent outcome (main): claude: failed ${formatLocalTime(DELIVERED_AT, 'America/New_York')} (${cause})`,
+      );
+    },
+  );
 
   it.each(['missing', 'provider mismatch', 'read failure'] as const)(
-    'reports main turn unknown for %s',
+    'keeps missing main outcome (%s) independent of conversation readiness',
     async (scenario) => {
       const host = await machine();
       const reservation = await assistant(host, { label: 'alpha', port: 36_001 });
@@ -654,12 +673,18 @@ describe('status', () => {
           };
         },
       };
-      const { status, output } = await statusJson(host, state, reservation.instance_id, observers);
-      expect(status.probes.main_turn).toMatchObject({ status: 'unknown', last: null });
+      const { status, output, nextActions } = await statusJson(host, state, reservation.instance_id, observers);
+      expect(status.main_turn).toMatchObject({ last: null, reason: expect.any(String) });
+      expect(status.probes).not.toHaveProperty('main_turn');
+      expect(nextActions).toEqual([]);
       expect(output.stdout.join('\n')).not.toContain('private provider diagnostic');
       const text = command(host, state, observers);
       await runStatusCommand(text.runtime, { instanceId: reservation.instance_id, json: false });
-      expect(text.output.stdout.join('\n')).toContain('Conversation: unknown (main_turn)');
+      expect(text.output.stdout.join('\n')).toContain(
+        'Conversation: ready (observed host, Chat, identities, authorization, and delivery)',
+      );
+      expect(text.output.stdout.join('\n')).toContain('Last observed agent outcome (main):');
+      expect(text.output.stdout.join('\n')).not.toContain('private provider diagnostic');
     },
   );
   it('reports every probe as ok for a healthy assistant, with its release, rollback, and schema facts', async () => {
@@ -673,6 +698,11 @@ describe('status', () => {
 
     expect(exitCode).toBe(0);
     expect(Object.keys(status.probes)).toEqual([...PROBE_NAMES]);
+    expect(status.main_turn).toEqual({
+      provider: 'claude',
+      last: { status: 'completed', at: DELIVERED_AT, cause: null },
+      reason: null,
+    });
     for (const name of PROBE_NAMES.filter((name) => name !== 'voice'))
       expect(status.probes[name], name).toMatchObject({ status: 'ok', reason: null });
     expect(status.probes).toHaveProperty(

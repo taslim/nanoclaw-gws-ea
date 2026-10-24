@@ -121,13 +121,15 @@ export interface DeliveryView {
   readonly at: string;
 }
 
-export interface MainTurnFacts {
+/** Historical provider evidence; it does not establish current conversation readiness. */
+export interface MainTurnView {
   readonly provider: string | null;
   readonly last: {
     readonly status: 'completed' | 'failed';
     readonly at: string;
     readonly cause: ProviderTurnCause | null;
   } | null;
+  readonly reason: string | null;
 }
 
 /** The facts a probe reports beside its status; each is null when it could not observe them. */
@@ -252,8 +254,6 @@ export interface AssistantProbes {
   readonly principal: ProbeResult;
   /** Main's latest delivery result, and the replies the host is still retrying. */
   readonly delivery: ProbeResult & DeliveryFacts;
-  /** Latest observed provider turn in main's selected conversation, independent of task and delivery success. */
-  readonly main_turn: ProbeResult & MainTurnFacts;
   /** While the browser is enabled, its verified web alias; setup is incomplete until there is one (R23). */
   readonly web_alias: ProbeResult & WebAliasFacts;
 }
@@ -274,7 +274,6 @@ export const PROBE_NAMES = [
   'workspace',
   'principal',
   'delivery',
-  'main_turn',
   'web_alias',
   'voice',
 ] as const satisfies readonly (keyof AssistantProbes)[];
@@ -378,6 +377,7 @@ export interface AssistantStatus {
   readonly release: ReleaseView;
   readonly rollback: RollbackView;
   readonly schema: SchemaView;
+  readonly main_turn: MainTurnView;
   readonly probes: AssistantProbes;
 }
 
@@ -1102,26 +1102,26 @@ async function deliveryProbe({ context, reservation, observers }: Subject): Prom
   return { ...OK, ...facts };
 }
 
-async function mainTurnProbe({ context, reservation, observers }: Subject): Promise<ProbeResult & MainTurnFacts> {
+function observeMainTurn({ context, reservation, observers }: Subject): MainTurnView {
   let seen: LatestProviderTurn | undefined;
   try {
     seen = observers.mainTurn(context.paths.instanceLayout(reservation.instance_id).state);
     // eslint-disable-next-line no-catch-all/no-catch-all -- Observation failure is unknown; raw diagnostics must not enter operator output.
   } catch {
-    return { status: 'unknown', reason: "Main's last provider turn could not be read.", provider: null, last: null };
+    return { reason: "Main's last provider turn could not be read.", provider: null, last: null };
   }
   const provider = seen?.provider ?? null;
   if (!seen?.last || !provider || seen.last.provider !== provider)
     return {
-      status: 'unknown',
       reason: 'No valid terminal turn is recorded for main’s current provider.',
       provider,
       last: null,
     };
-  const last = { status: seen.last.status, at: seen.last.observedAt, cause: seen.last.cause };
-  return last.status === 'completed'
-    ? { ...OK, provider, last }
-    : { status: 'degraded', reason: `Main's last observed provider turn failed (${last.cause}).`, provider, last };
+  return {
+    provider,
+    last: { status: seen.last.status, at: seen.last.observedAt, cause: seen.last.cause },
+    reason: null,
+  };
 }
 
 /**
@@ -1301,7 +1301,6 @@ export async function observeAssistantStatus(
     workspace,
     principal,
     delivery,
-    mainTurn,
     webAlias,
     voice,
     rollback,
@@ -1333,7 +1332,6 @@ export async function observeAssistantStatus(
     probe<WorkspaceFacts>(() => workspaceProbe(subject), { account: null }),
     probe(() => principalProbe(subject), {}),
     probe<DeliveryFacts>(() => deliveryProbe(subject), { last: null, retrying: null }),
-    probe<MainTurnFacts>(() => mainTurnProbe(subject), { provider: null, last: null }),
     probe<WebAliasFacts>(() => webAliasProbe(subject), { state: null, address: null, probe_sent: null }),
     probe<Omit<VoiceObservation, 'status' | 'reason'>>(
       () => observeLocalVoice(context.paths, requireRuntime(runtime), observers.ncl),
@@ -1354,6 +1352,7 @@ export async function observeAssistantStatus(
     ...record,
     rollback,
     schema: schemaView(live),
+    main_turn: observeMainTurn(subject),
     probes: {
       checkout,
       image,
@@ -1370,7 +1369,6 @@ export async function observeAssistantStatus(
       workspace,
       principal,
       delivery,
-      main_turn: mainTurn,
       web_alias: webAlias,
       voice,
     },
@@ -1585,12 +1583,6 @@ function probeDetail(name: (typeof PROBE_NAMES)[number], probes: AssistantProbes
       const last = probes.delivery.last;
       return last ? `${last.status} ${formatLocalTime(last.at, timezone)} (${last.message_out_id})` : '';
     }
-    case 'main_turn': {
-      const { provider, last } = probes.main_turn;
-      return last
-        ? `${provider}: last observed turn ${last.status} ${formatLocalTime(last.at, timezone)}${last.cause ? ` (${last.cause})` : ''}`
-        : '';
-    }
     case 'web_alias':
       return webAliasSummary(probes.web_alias);
     case 'voice': {
@@ -1663,6 +1655,13 @@ function jobAgentLine(job: ChatAgentView): string {
   return `    ${job.agent_group_id ?? '(unknown)'}: ${job.state ?? 'unknown'}; chat ${job.messaging_group_id ?? '(unknown)'}; ${job.status}${job.reason ? `; ${job.reason}` : ''}`;
 }
 
+function mainTurnLine({ provider, last, reason }: MainTurnView, timezone: string): string {
+  const detail = last
+    ? `${provider}: ${last.status} ${formatLocalTime(last.at, timezone)}${last.cause ? ` (${last.cause})` : ''}`
+    : reason;
+  return `  Last observed agent outcome (main): ${detail}`;
+}
+
 function renderStatusDetails(status: AssistantStatus, timezone: string): string[] {
   const { registry, schema } = status;
   const operation = operationDetail(status.instance_id, status.operation, status.removal_in_progress);
@@ -1680,12 +1679,13 @@ function renderStatusDetails(status: AssistantStatus, timezone: string): string[
     `  Operation: ${operation.length === 0 ? 'none' : operation[0]!}`,
     ...operation.slice(1).map((line) => `             ${line}`),
     `  Schema:    ${schemaLine}`,
+    mainTurnLine(status.main_turn, timezone),
     'Probes:',
   ];
   for (const name of PROBE_NAMES) {
     const result = status.probes[name];
     const detail =
-      name === 'voice' || name === 'main_turn'
+      name === 'voice'
         ? [probeDetail(name, status.probes, timezone), ...(result.reason ? [result.reason] : [])].join('; ')
         : (result.reason ?? probeDetail(name, status.probes, timezone));
     lines.push(probeLine(result.status, name, detail));
@@ -1708,12 +1708,11 @@ function conversationSummary(status: AssistantStatus): string {
     'workspace',
     'principal',
     'delivery',
-    'main_turn',
   ] as const;
   const degraded = names.filter((name) => status.probes[name].status === 'degraded');
   const unknown = names.filter((name) => status.probes[name].status === 'unknown');
   if (degraded.length === 0 && unknown.length === 0)
-    return 'ready (observed host, Chat, identities, authorization, delivery, and main’s last provider turn)';
+    return 'ready (observed host, Chat, identities, authorization, and delivery)';
   return [
     ...(degraded.length ? [`degraded (${degraded.join(', ')})`] : []),
     ...(unknown.length ? [`unknown (${unknown.join(', ')})`] : []),
@@ -1732,7 +1731,7 @@ function renderStatus(status: AssistantStatus, timezone: string, details: boolea
     `  Account: ${status.registry.account}`,
     `  Service: ${status.probes.service.state}${status.probes.service.reason ? `; ${status.probes.service.reason}` : ''}`,
     `  Conversation: ${conversationSummary(status)}`,
-    `  Main turn: ${probeDetail('main_turn', status.probes, timezone) || status.probes.main_turn.reason}`,
+    mainTurnLine(status.main_turn, timezone),
     `  WhatsApp: ${probeDetail('whatsapp', status.probes, timezone)}${status.probes.whatsapp.reason ? `; ${status.probes.whatsapp.reason}` : ''}`,
     `  External chat: ${status.probes.external_chat.agent_group_id ?? 'unknown'}; ${status.probes.external_chat.status}${status.probes.external_chat.reason ? `; ${status.probes.external_chat.reason}` : ''}`,
     `  Job agents: ${probeDetail('job_agents', status.probes, timezone)}; ${status.probes.job_agents.status}`,
@@ -1775,11 +1774,11 @@ function statusActions(status: AssistantStatus): NextAction[] {
     actions.push(command('connect-google'));
   if (status.probes.web_alias.state === 'pending')
     actions.push({ kind: 'command', argv: webAliasArgv(status.instance_id, status.probes.web_alias) });
-  if (status.probes.main_turn.last?.cause === 'credentials')
+  if (status.main_turn.last?.cause === 'credentials')
     actions.push({
       kind: 'external',
       instruction:
-        "Repair this assistant's provider sign-in in its operator credential console, then observe a successful provider turn. Keep credentials out of chat.",
+        "For the recorded credential failure, check this assistant's provider sign-in in its operator credential console. A later successful turn confirms recovery. Keep credentials out of chat.",
     });
   // Voice is optional, and a web alias still pending is setup to finish: neither sends the operator to the logs.
   if (PROBE_NAMES.some((name) => name !== 'voice' && name !== 'web_alias' && status.probes[name].status !== 'ok'))
