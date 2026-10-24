@@ -36,7 +36,8 @@ import { PurchaseAuthorityStore } from './authority.js';
 import { ERRAND_ORIGIN_LINE } from './cards.js';
 import { browserWatchesMigration } from './migration.js';
 import { GENERIC_FLOW_ID, type GenericBookingFacts, type PurchaseFacts } from './fingerprint.js';
-import { createBrowserWatch, renderWatchCard, validateWatchRequest } from './watches.js';
+import { createBrowserWatch, validateWatchRequest } from './watches.js';
+import { renderWatchCard } from './watch-wording.js';
 import { prepareWatchPurchase } from './watch-purchase.js';
 
 import * as calendarFacts from '../gws-ea-meetings/calendar-facts.js';
@@ -1380,6 +1381,36 @@ describe('a watch the principal declines', () => {
       status: 'cancelled',
     });
     expect(cards.some((card) => card.includes('Withdrawn'))).toBe(false);
+  });
+
+  it('sends a non-main errand back to its actual delegator when its watch is declined', async () => {
+    await createAgentGroup({
+      id: 'watch-planner',
+      name: 'Planner',
+      folder: 'watch-planner',
+      agent_provider: null,
+      created_at: new Date().toISOString(),
+    });
+    fs.writeFileSync(
+      process.env.GWS_EA_BROWSER_POLICY_FILE!,
+      JSON.stringify({
+        schemaVersion: 2,
+        enabled: true,
+        agentGroupIds: ['watch-planner'],
+      }),
+      { mode: 0o600 },
+    );
+    const delegated = (await resolveSystemSession('watch-browser', 'system:a2a:watch-planner:table')).session;
+    const job = await new BrowserStore().jobForSession(delegated);
+    expect(job).toBeDefined();
+    jobId = job!.id;
+    const { approval, session } = await awaitingCard('planner-declined');
+    await finalizeReject(approval, 'gchat:users/watch-principal', 'another evening');
+    const notes = await told(session);
+    expect(notes).toHaveLength(1);
+    const notice = JSON.parse(notes[0]) as { message: string };
+    expect(notice.message).toContain('planner');
+    expect(notice.message).not.toMatch(/report this to main/u);
   });
 
   it('commits a declined watch and its recoverable notice together, then retries after a failed insert', async () => {

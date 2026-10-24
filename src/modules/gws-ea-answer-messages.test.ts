@@ -129,11 +129,11 @@ const REVIEWED: Readonly<Record<string, Review>> = {
     kind: 'host-only',
     reason: 'the log line written while nobody can be told yet',
   },
-  'gws-ea-browser/purchase.ts checkoutChanging: reason, repeat_safe, status': {
+  'gws-ea-browser/purchase-wording.ts checkoutChanging: reason, repeat_safe, status': {
     kind: 'rendered',
     reason: 'the change the host read is written into the sentence (U11)',
   },
-  'gws-ea-browser/purchase.ts told: repeat_safe, safe_to_rebuild': {
+  'gws-ea-browser/purchase-wording.ts told: repeat_safe, safe_to_rebuild': {
     kind: 'read-whole',
     reason: 'spread into the purchase-outcome notice, whose JSON is the chat text the browser reads',
   },
@@ -147,7 +147,7 @@ const REVIEWED: Readonly<Record<string, Review>> = {
       reason:
         'the runner appends the code and safe diagnostics as JSON to the refusal text when metadata exists; otherwise the code serves the host',
     },
-  'gws-ea-browser/watches.ts termsOverBounds: exposure, max_total, reason, status': {
+  'gws-ea-browser/watch-wording.ts termsOverBounds: exposure, max_total, reason, status': {
     kind: 'rendered',
     reason: 'the exposure, the maximum and the terms as the host read them are written into the sentence (U11)',
   },

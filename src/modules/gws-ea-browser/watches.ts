@@ -1,5 +1,5 @@
+import { noVerifiedPrincipalMessage } from '../gws-ea-profile/approval-wording.js';
 import { observePage } from './observe.js';
-import { formatLocalTimeWithZone } from '../../timezone.js';
 import { markWatchRegion, readBrowserWatchSetup } from './watch-runtime.js';
 import { executeBrowserPurchase } from './purchase.js';
 import {
@@ -29,20 +29,25 @@ import { finishApprovalWithdrawal, registerApprovalHandler, requestApproval } fr
 import { registerApprovalResolvedHandler, type ApprovalResolvedEvent } from '../approvals/primitive.js';
 import { isVerifiedPrincipalUser, principalApproverUserId } from '../gws-ea-profile/db.js';
 import { readIsoTime } from './iso-time.js';
-import { cardEventSpan, ERRAND_ORIGIN_LINE, SELLER_TEXT_LIMIT } from './cards.js';
+import { ERRAND_ORIGIN_LINE } from './cards.js';
 import { browserSite } from './leases.js';
-import { amountMinor, formatMoney } from './fingerprint.js';
+import { amountMinor } from './fingerprint.js';
 import { merchantSignatures } from './merchant-signatures.js';
-import type { ReservationPolicy } from './merchant-contract.js';
 import { readBrowserRef, type BrowserRef } from './observe.js';
-import { readHostBrowserPolicy } from './access.js';
+import { browserDelegators, readHostBrowserPolicy } from './access.js';
 import { executeRecipe } from './recipes.js';
 import { loadRecipe, recipeCheckKey, type BrowserRecipe } from './recipe-store.js';
 import { type StructuredBrowserLocator } from './locators.js';
 import type { BrowserExecutionContext, BrowserQueuedAction } from './actions.js';
 import { principalClock, watchSitePolicy, watchStartAt, type WatchReleaseRule } from './watch-policy.js';
-import { quoted } from '../approvals/request-text.js';
-import { untrusted } from '../gws-ea-inbox/untrusted.js';
+import {
+  renderWatchCard,
+  termsOverBounds,
+  watchMessage,
+  rejectedWatchMessage,
+  watchCardTitle,
+  watchCardWithdrawal,
+} from './watch-wording.js';
 
 interface WatchReleaseInput {
   schedule: WatchReleaseRule['schedule'];
@@ -68,12 +73,11 @@ interface WatchInput extends Record<string, unknown> {
 }
 function offsetInstant(value: unknown): string {
   const parsed = readIsoTime(value, 'required');
-  if (!parsed) throw invalidArgs('Watch times need real ISO dates and times with explicit UTC offsets.');
+  if (!parsed) throw invalidArgs(watchMessage('times'));
   return parsed;
 }
 const RELEASE_FIELDS = ['wording', 'time', 'time_zone', 'days_ahead', 'day_of_month', 'months_ahead'];
-const RELEASE_RULE =
-  'A release rule needs the venue’s own wording, a time as HH:MM on its clock, and days_ahead, or day_of_month with months_ahead.';
+const RELEASE_RULE = watchMessage('release');
 const wholeBetween = (value: unknown, min: number, max: number): value is number =>
   Number.isSafeInteger(value) && Number(value) >= min && Number(value) <= max;
 function validateRelease(raw: unknown): WatchReleaseInput {
@@ -98,8 +102,7 @@ function validateRelease(raw: unknown): WatchReleaseInput {
     schedule = { kind: 'monthly', day: raw.day_of_month, monthsAhead: raw.months_ahead };
   else throw invalidArgs(RELEASE_RULE);
   const timeZone = typeof raw.time_zone === 'string' ? ianaTimezone(raw.time_zone) : undefined;
-  if (raw.time_zone !== undefined && !timeZone)
-    throw invalidArgs('A release time_zone must be an IANA zone, such as Asia/Tokyo.');
+  if (raw.time_zone !== undefined && !timeZone) throw invalidArgs(watchMessage('releaseZone'));
   return { schedule, time: raw.time, wording: raw.wording.trim(), ...(timeZone ? { timeZone } : {}) };
 }
 /** The rule as stored: on the venue's zone as the host read it from the site, or else as the agent gave it. */
@@ -129,7 +132,7 @@ export function validateWatchRequest(raw: Record<string, unknown>): WatchInput {
         ].includes(key),
     )
   )
-    throw invalidArgs('Unknown watch field.');
+    throw invalidArgs(watchMessage('unknownField'));
   if (
     typeof raw.site !== 'string' ||
     typeof raw.recipe_id !== 'string' ||
@@ -147,7 +150,7 @@ export function validateWatchRequest(raw: Record<string, unknown>): WatchInput {
     !raw.windows.length ||
     !isRecord(raw.financial)
   )
-    throw invalidArgs('A watch needs its recipe, exact venue, party, windows and financial bounds.');
+    throw invalidArgs(watchMessage('required'));
   const financial = raw.financial;
   if (
     typeof financial.currency !== 'string' ||
@@ -155,29 +158,26 @@ export function validateWatchRequest(raw: Record<string, unknown>): WatchInput {
     typeof financial.max_total !== 'string' ||
     amountMinor(financial.max_total, financial.currency) === undefined
   )
-    throw invalidArgs('Financial bounds need a currency and an exact nonnegative maximum.');
+    throw invalidArgs(watchMessage('financial'));
   try {
-    if (new URL(raw.site).protocol !== 'https:') throw new Error('HTTPS required');
+    if (new URL(raw.site).protocol !== 'https:') throw new Error(watchMessage('https'));
     browserSite(raw.site);
   } catch (_error) {
-    throw invalidArgs('Watch site must be a public HTTPS URL.');
+    throw invalidArgs(watchMessage('site'));
   }
   const windows = raw.windows.map((entry) => {
-    if (!isRecord(entry)) throw invalidArgs('Each watch window needs start and end.');
+    if (!isRecord(entry)) throw invalidArgs(watchMessage('window'));
     const start = offsetInstant(entry.start),
       end = offsetInstant(entry.end);
-    if (start > end) throw invalidArgs('Watch window end must not precede its start.');
+    if (start > end) throw invalidArgs(watchMessage('windowOrder'));
     return { start, end };
   });
   const until = offsetInstant(raw.until);
-  if (until <= new Date().toISOString()) throw invalidArgs('Watch deadline has already passed.');
+  if (until <= new Date().toISOString()) throw invalidArgs(watchMessage('deadline'));
   const release = raw.release === undefined ? undefined : validateRelease(raw.release);
-  const region =
-    raw.region === undefined
-      ? undefined
-      : readBrowserRef(raw.region, 'region needs a ref and generation from the latest observation.');
+  const region = raw.region === undefined ? undefined : readBrowserRef(raw.region, watchMessage('region'));
   if (raw.watch_id !== undefined && (typeof raw.watch_id !== 'string' || !raw.watch_id || !region))
-    throw invalidArgs('Marking a watch again needs its watch_id and a region.');
+    throw invalidArgs(watchMessage('mark'));
   return {
     site: raw.site,
     recipe_id: raw.recipe_id,
@@ -236,7 +236,7 @@ const watchSetupGuard = defineGuardedAction({
       !(await readHostBrowserPolicy()).enabled ||
       typeof payload.watchId !== 'string'
     )
-      return DENY('Only a live browser watch can request its setup approval.');
+      return DENY(watchMessage('live'));
     const watch = await getBrowserWatch(payload.watchId);
     const job = watch
       ? await getDb().get<{ browser_session_id: string; cancelled: number; cancel_requested: number }>(
@@ -253,47 +253,11 @@ const watchSetupGuard = defineGuardedAction({
       !['awaiting_principal', 'armed'].includes(watch.status) ||
       Date.parse(boundsOf(watch).until) <= Date.now()
     )
-      return DENY('This watch is no longer available.');
+      return DENY(watchMessage('unavailable'));
     const principal = await principalApproverUserId();
-    return principal
-      ? HOLD('The principal must authorize these exact reservation bounds.', principal)
-      : DENY('No verified principal can approve the watch.');
+    return principal ? HOLD(watchMessage('principalBounds'), principal) : DENY(noVerifiedPrincipalMessage());
   },
 });
-/** Arrival windows read on the venue's clock; conversions and the deadline on the principal's. */
-export function renderWatchCard(watch: WatchRow, venueTimeZone: string, principalTimeZone: string): string {
-  const bounds = boundsOf(watch),
-    financial = bounds.financial;
-  if (bounds.kind === 'region')
-    return [
-      'Approve one reservation across this errand’s watches, within these bounds:',
-      `Site: ${quoted(watch.site, SELLER_TEXT_LIMIT)}`,
-      `Venue: ${quoted(bounds.venue.name, SELLER_TEXT_LIMIT)}`,
-      `Party size: ${bounds.partySize}`,
-      ...bounds.windows.map(
-        (window) => `Arrival window: ${cardEventSpan(window.start, window.end, venueTimeZone, principalTimeZone)}`,
-      ),
-      `Maximum total exposure, all guests and fees: ${formatMoney(financial.maxTotalMinor, financial.currency)} (${financial.currency})`,
-      'A booking goes ahead without asking you again only when the site’s own checkout shows this venue, party and arrival window, with its total, amount due now and every fee within that maximum. Any other booking, a recurring charge included, comes to you on its own card.',
-      `Watch deadline: ${formatLocalTimeWithZone(bounds.until, principalTimeZone)}`,
-    ].join('\n');
-  return [
-    'Approve one reservation across this errand’s watches, within these bounds:',
-    `Site: ${quoted(watch.site, SELLER_TEXT_LIMIT)}`,
-    `Venue: ${quoted(bounds.venue.name, SELLER_TEXT_LIMIT)}`,
-    `Party size: ${bounds.partySize}`,
-    ...bounds.windows.map(
-      (window) => `Arrival window: ${cardEventSpan(window.start, window.end, venueTimeZone, principalTimeZone)}`,
-    ),
-    `Maximum total exposure, all guests and fees: ${formatMoney(financial.maxTotalMinor, financial.currency)} (${financial.currency})`,
-    `Maximum due now: ${formatMoney(financial.maxDueNowMinor, financial.currency)}`,
-    ...financial.policy!.commitments.map(
-      (term) =>
-        `Merchant financial terms: ${quoted(term.terms, 1200)}; ${term.kind}; amount ${term.amountMinor === undefined ? 'unreadable' : formatMoney(term.amountMinor, financial.currency)}${term.perPerson ? ` per guest × ${bounds.partySize}` : ' total'}; trigger ${quoted(term.trigger ?? '', SELLER_TEXT_LIMIT)}; cancellation ${quoted(term.cancellationTerms ?? '', SELLER_TEXT_LIMIT)}${term.cancellationBeforeMs === undefined ? '' : `; cutoff ${term.cancellationBeforeMs / 60_000} minutes before arrival`}${term.frequency ? `; frequency ${quoted(term.frequency, SELLER_TEXT_LIMIT)}` : ''}${term.conversionAt ? `; converts ${formatLocalTimeWithZone(term.conversionAt, principalTimeZone)}` : ''}`,
-    ),
-    `Watch deadline: ${formatLocalTimeWithZone(bounds.until, principalTimeZone)}`,
-  ].join('\n');
-}
 type PreparedWatch =
   | {
       status: 'ready';
@@ -304,30 +268,6 @@ type PreparedWatch =
       region?: { locator: StructuredBrowserLocator; text: string };
     }
   | { status: 'refused'; reason: string; exposure?: string; max_total?: string; message?: string };
-/**
- * A paid venue whose terms can charge more than the principal's maximum: the terms the host read and what they come
- * to for the party, so main can ask the principal for a higher maximum.
- */
-function termsOverBounds(
-  site: string,
-  policy: ReservationPolicy,
-  exposureMinor: number,
-  maxTotalMinor: number,
-  partySize: number,
-): PreparedWatch {
-  const exposure = formatMoney(exposureMinor, policy.currency);
-  const maximum = formatMoney(maxTotalMinor, policy.currency);
-  return {
-    status: 'refused',
-    reason: 'terms_over_bounds',
-    exposure,
-    max_total: maximum,
-    message:
-      `No watch was set: the venue's terms can charge up to ${exposure} for a party of ${partySize}, above the ` +
-      `maximum of ${maximum}. Report it to main with the terms as the host read them, so main can ask the ` +
-      `principal for a higher maximum:\n${untrusted(policy.commitments.map((term) => term.terms).join('\n'), 1200, site)}`,
-  };
-}
 /** A reader watch's bounds and release (Resy): the venue, its zone and its terms as the host reads them. */
 async function prepareReaderWatch(
   context: BrowserExecutionContext,
@@ -456,8 +396,7 @@ export async function createBrowserWatch(
       'SELECT state FROM gws_ea_browser_watch_job_claims WHERE job_id = ?',
       context.job.id,
     );
-    if (!job || job.cancelled || (claim && claim.state !== 'available'))
-      throw invalidArgs('This job cannot arm another booking watch.');
+    if (!job || job.cancelled || (claim && claim.state !== 'available')) throw invalidArgs(watchMessage('cannotArm'));
     await db.run(
       "INSERT INTO gws_ea_browser_watch_job_claims(job_id,state) VALUES(?,'available') ON CONFLICT(job_id) DO NOTHING",
       context.job.id,
@@ -524,7 +463,7 @@ export async function createBrowserWatch(
     agentName: 'browser',
     action: APPROVAL_ACTION,
     payload: approvalPayload,
-    title: 'Approve this reservation watch?',
+    title: watchCardTitle(),
     question,
     approverUserId: decision.approverUserId,
     expiresAt: bounds.until,
@@ -556,7 +495,7 @@ async function markBrowserWatchAgain(
 ): Promise<Record<string, unknown>> {
   const db = context.store.db;
   const watch = await getBrowserWatch(input.watch_id!, db);
-  if (!watch || watch.job_id !== context.job.id) throw invalidArgs('This watch does not belong to the job.');
+  if (!watch || watch.job_id !== context.job.id) throw invalidArgs(watchMessage('belongs'));
   if (!watch.region_json) return { status: 'refused', reason: 'site_has_reader', watch_id: watch.id };
   const markable = ['awaiting_principal', 'armed', 'checking'];
   if (!markable.includes(watch.status)) return { status: watch.status, watch_id: watch.id };
@@ -658,10 +597,16 @@ async function settleWatchOutcome({ approval, outcome, reason }: ApprovalResolve
       at,
       watch.id,
     );
-    if (outcome === 'reject')
+    if (outcome === 'reject') {
+      const job = await db.get<{ source_agent_group_id: string }>(
+        'SELECT source_agent_group_id FROM gws_ea_browser_jobs WHERE id = ?',
+        watch.job_id,
+      );
+      const delegator = (await browserDelegators()).find((entry) => entry.agentGroupId === job?.source_agent_group_id);
       await insertWatchNotice(db, watch, 'rejected', 'rejected', {
-        message: `The principal declined this watch${reason ? `: "${reason}"` : ''}. It is cancelled and books nothing; report this to main.`,
+        message: rejectedWatchMessage(delegator?.name ?? job?.source_agent_group_id, reason),
       });
+    }
   });
   if (outcome === 'reject') await deliverWatchNotices(db);
 }
@@ -730,17 +675,17 @@ export const listWatchesAction: BrowserQueuedAction = {
 };
 export const cancelWatchAction: BrowserQueuedAction = {
   validate(raw) {
-    if (typeof raw.watch_id !== 'string') throw invalidArgs('watch_id is required');
+    if (typeof raw.watch_id !== 'string') throw invalidArgs(watchMessage('watchId'));
     return { watch_id: raw.watch_id };
   },
   async execute(context, payload) {
     const watch = await getBrowserWatch(String(payload.watch_id), context.store.db);
-    if (!watch || watch.job_id !== context.job.id) throw invalidArgs('This watch does not belong to the job.');
+    if (!watch || watch.job_id !== context.job.id) throw invalidArgs(watchMessage('belongs'));
     if (watch.status === 'booking') return { status: 'in_progress', watch_id: watch.id };
     const withdrawn = await context.store.db.transaction(() =>
       detachBrowserWatchCards(watch.job_id, 'cancelled', watch.id),
     );
-    for (const approval of withdrawn) await finishApprovalWithdrawal(approval, 'Withdrawn: this watch was cancelled.');
+    for (const approval of withdrawn) await finishApprovalWithdrawal(approval, watchCardWithdrawal());
     for (const approval of withdrawn)
       await context.store.db.run(
         'UPDATE gws_ea_browser_watches SET approval_finished_at = ? WHERE approval_id = ?',
@@ -752,7 +697,7 @@ export const cancelWatchAction: BrowserQueuedAction = {
 };
 export const watchBookAction: BrowserQueuedAction = {
   validate(raw) {
-    if (typeof raw.watch_id !== 'string') throw invalidArgs('watch_id is required');
+    if (typeof raw.watch_id !== 'string') throw invalidArgs(watchMessage('watchId'));
     return { watch_id: raw.watch_id };
   },
   async execute(context, payload) {

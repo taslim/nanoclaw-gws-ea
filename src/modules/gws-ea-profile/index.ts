@@ -1,3 +1,4 @@
+import { noVerifiedPrincipalMessage } from './approval-wording.js';
 import { registerSessionAdmissionPolicy } from '../../container-runner.js';
 import { getDb } from '../../db/connection.js';
 import { getMessagingGroup } from '../../db/messaging-groups.js';
@@ -324,7 +325,7 @@ const addPrincipalAddressAction = defineGuardedAction({
     }
     if (!(await inboxExists())) return ALLOW('no inbox yet: an address decides only whose calendars are theirs');
     const approver = await principalApproverUserId();
-    if (approver === undefined) return DENY('No verified principal can confirm a new address yet.');
+    if (approver === undefined) return DENY(noVerifiedPrincipalMessage());
     return HOLD("mail from the principal's addresses carries their authority, so the principal confirms it", approver);
   },
 });

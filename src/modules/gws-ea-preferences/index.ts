@@ -89,7 +89,7 @@ function summarizeSchedulingPreferences(values: SchedulingPreferenceValues): str
  * set or forgot a value, and a fresh conversation would act on the old one.
  */
 export const MAIN_PREFERENCES_POINTER =
-  "The principal's scheduling preferences (working hours, protected times, default meeting lengths, buffers, and preferred times) live in their typed store. Read them with `ncl preferences get` before you schedule anything or describe them: the store is the only current copy, and a value from earlier in the conversation may have changed since.";
+  "The principal's scheduling preferences (working hours, protected times, default meeting lengths, buffers, and preferred times) are kept with their source. Read them with `ncl preferences get` before you schedule anything or describe them: the store is the only current copy, and a value from earlier in the conversation may have changed since.";
 
 /**
  * The preferences each audience is given (KTD14). `external-email` gets
