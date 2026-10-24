@@ -97,7 +97,7 @@ function noticeText(incident: BrowserIncident, thread: string): string {
     case 'unapproved_commit': {
       const { reference, charged } = unapprovedCommitFacts(incident);
       return (
-        `Browser job ${thread} was stopped: an ordinary press on ${incident.site} landed on a confirmation showing ` +
+        `Browser job ${thread} was stopped: an action on ${incident.site} led to a confirmation showing ` +
         `${charged ?? 'a charge'}, reference ${reference}. Nobody approved this purchase. Tell the principal now.`
       );
     }

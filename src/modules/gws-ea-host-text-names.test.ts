@@ -37,7 +37,9 @@ import path from 'node:path';
 import ts from 'typescript';
 import { describe, expect, it } from 'vitest';
 
-import { resolveCapabilities, SHELL_CAPABILITY } from '../capabilities.js';
+import { SHELL_CAPABILITY } from '../capabilities.js';
+import { mainCapabilitySelection } from './gws-ea-main/index.js';
+import { noVerifiedPrincipalMessage } from './gws-ea-profile/approval-wording.js';
 import { GROUP_SCOPE_RESOURCES, listCommands, lookup } from '../cli/registry.js';
 import { runnerToolCapabilities, runnerToolVocabulary } from '../test-utils/runner-tools.js';
 import { BROWSER_CAPABILITIES } from './gws-ea-browser/group.js';
@@ -72,9 +74,9 @@ interface Holdings {
 const DELEGATE_KEYS = [BROWSER_DELEGATE_CAPABILITY, PURCHASE_OUTCOME_CAPABILITY];
 
 const HOLDINGS: Readonly<Record<Reader, Holdings>> = {
-  // Main stores `all`, and the browser setting grants it both delegate keys:
+  // Create/update reconciliation stores main's current release defaults; browser access grants both delegate keys:
   // policy version 1 lists main alone, and main records every unconfirmed purchase.
-  main: { keys: new Set([...resolveCapabilities('all', 'main'), ...DELEGATE_KEYS]), ncl: 'global' },
+  main: { keys: new Set([...mainCapabilitySelection(), ...DELEGATE_KEYS]), ncl: 'global' },
   'external-email': { keys: new Set(EXTERNAL_EMAIL_CAPABILITIES), ncl: 'none' },
   'external-chat': { keys: new Set(EXTERNAL_CHAT_CAPABILITIES), ncl: 'none' },
   job: { keys: new Set(JOB_CHAT_CAPABILITIES), ncl: 'none' },
@@ -127,7 +129,7 @@ const POLICY: Policy = {
     'gws-ea-browser/authentication-submit.ts': {
       not_inserted: 'a status in the script the host runs in the page, which only the host reads',
     },
-    'gws-ea-browser/purchase.ts': {
+    'gws-ea-browser/purchase-wording.ts': {
       authority_id: "a field of the commit the host queues itself; its refusal reaches the host's queue",
     },
     'gws-ea-chat/subscription.ts': {
@@ -398,6 +400,36 @@ describe('the names in GWS-EA host text', () => {
       for (const [file, names] of Object.entries(listed)) {
         for (const [name, reason] of Object.entries(names)) expect(reason.trim(), `${file} ${name}`).not.toBe('');
       }
+    }
+  });
+
+  it('keeps browser execution sentences in the reader-tagged wording files', () => {
+    for (const name of ['credential-operations', 'purchase', 'watches']) {
+      const file = `gws-ea-browser/${name}.ts`;
+      const prose = hostTexts(file, sources.get(file) ?? '').filter(({ text }) =>
+        /\b[a-z]{2,}\s+[a-z]{2,}\s+[a-z]{2,}\b/iu.test(text),
+      );
+      expect(
+        prose.map(({ text }) => text),
+        file,
+      ).toEqual([]);
+    }
+  });
+
+  it('gives every approval without a verified principal the same actionable next step', () => {
+    expect(noVerifiedPrincipalMessage()).toContain('Pause here');
+    expect(noVerifiedPrincipalMessage()).toContain('connected and verified before you can try again');
+    for (const file of [
+      'gws-ea-privacy/index.ts',
+      'gws-ea-profile/index.ts',
+      'gws-ea-browser/watches.ts',
+      'gws-ea-browser/vault-access.ts',
+      'gws-ea-browser/consent-approval.ts',
+      'gws-ea-browser/purchase.ts',
+      'gws-ea-browser/credential-operations.ts',
+      'gws-ea-browser/reservation-guarantee.ts',
+    ]) {
+      expect(sources.get(file), file).toContain('DENY(noVerifiedPrincipalMessage())');
     }
   });
 });

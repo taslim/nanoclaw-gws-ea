@@ -53,7 +53,9 @@ export class BrowserOriginMismatchError extends Error {
 
 export function assertBrowserSecretDiagnosticsSafe(): void {
   if (browserDiagnosticsUnsafe())
-    throw forbidden('Disable Playwright debug logging before signing in with the host browser.');
+    throw forbidden(
+      'Signing in is unavailable while browser diagnostics could expose credentials. Stop here and tell the agent that sent this errand that sign-in is unavailable.',
+    );
 }
 
 async function fieldKind(element: ElementHandle): Promise<BrowserSecretField | undefined> {

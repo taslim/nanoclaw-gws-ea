@@ -1,3 +1,4 @@
+import { noVerifiedPrincipalMessage } from '../gws-ea-profile/approval-wording.js';
 /**
  * GWS-EA privacy: the principal's private values and the audience check
  * (R24, R37, KTD7).
@@ -182,7 +183,7 @@ const removePrivateValueAction = defineGuardedAction({
       return DENY('Only main may ask to remove a private value.');
     }
     const approver = await principalApproverUserId();
-    if (approver === undefined) return DENY('No verified principal can confirm removing a private value yet.');
+    if (approver === undefined) return DENY(noVerifiedPrincipalMessage());
     return HOLD('removing a private value switches its check off, so the principal confirms it', approver);
   },
 });
