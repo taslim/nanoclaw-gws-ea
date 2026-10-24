@@ -222,6 +222,7 @@ describe("external-email's project document", () => {
     const composed = sections(doc);
 
     expect([...composed.keys()]).toEqual([
+      '# Assistant Character',
       '# Assistant Identity',
       '# Principal',
       '# External Email',
@@ -229,6 +230,9 @@ describe("external-email's project document", () => {
       '# NanoClaw Module: gws-ea-email-external',
       '# NanoClaw Module: time',
     ]);
+    expect(composed.get('# Assistant Character')).toBe(
+      fs.readFileSync(path.resolve('src/modules/gws-ea-profile/character.md'), 'utf8').trim(),
+    );
     expect(composed.get('# Assistant Identity')).toBe(
       'Aya is the assistant. Morgan is the principal. They are separate people: act and communicate as Aya, support Morgan, and never present the assistant as the principal.' +
         '\n\nYour email signature:\n\nAya | EA to Morgan',

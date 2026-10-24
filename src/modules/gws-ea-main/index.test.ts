@@ -18,8 +18,8 @@ import type { AgentGroup } from '../../types.js';
 import { reconcileGwsEaProfile } from '../gws-ea-profile/db.js';
 import { ARTIFACTS_POLICY_FILE_ENV, type ArtifactsPolicyFile } from '../gws-ea-artifacts/policy.js';
 import '../gws-ea-artifacts/capability.js';
-import { GUIDANCE_PATH, MAIN_SHARED_SKILLS } from './index.js';
 import '../gws-ea-profile/index.js';
+import { GUIDANCE_PATH, MAIN_SHARED_SKILLS } from './index.js';
 // It registers the email channel's keys, whose instructions main is taught.
 import '../gws-ea-external-email/index.js';
 // They register the `ncl` resources and verbs the guidance names.
@@ -29,7 +29,7 @@ import '../gws-ea-privacy/index.js';
 import '../gws-ea-matters/index.js';
 import '../gws-ea-chats/directory.js';
 
-const TEST_ROOT = '/tmp/nanoclaw-gws-ea-main-test';
+const TEST_ROOT = `/tmp/nanoclaw-gws-ea-main-test-${process.pid}`;
 const GUIDANCE = fs.readFileSync(path.resolve(GUIDANCE_PATH), 'utf8').trim();
 const WELCOME = fs.readFileSync(path.resolve('templates', 'gws-ea', 'main', 'skills', 'welcome', 'SKILL.md'), 'utf8');
 
@@ -110,6 +110,9 @@ describe("GWS-EA's guidance for main", () => {
 
     const mainSections = await getRequiredProjectDocSections(main);
     expect(mainSections.find((section) => section.name === 'Executive Assistant')?.body).toBe(GUIDANCE);
+    // The application barrel must preserve the registration order exercised here.
+    const barrel = fs.readFileSync(path.resolve('src/modules/index.ts'), 'utf8');
+    expect(barrel).toMatch(/import '\.\/gws-ea-profile\/index\.js';[\s\S]*import '\.\/gws-ea-main\/index\.js';/u);
     expect((await getRequiredProjectDocSections(research)).map((section) => section.name)).not.toContain(
       'Executive Assistant',
     );
@@ -141,7 +144,12 @@ describe("GWS-EA's guidance for main", () => {
 
     expect(document).toContain(`# Persona\n\nCall me Morgan.`);
     expect(document).toContain(`# Executive Assistant\n\n${GUIDANCE}`);
-    expect(document.indexOf('# Persona')).toBeLessThan(document.indexOf('# Executive Assistant'));
+    expect([...document.matchAll(/^# (.+)$/gmu)].map(([, heading]) => heading).slice(0, 4)).toEqual([
+      'Persona',
+      'Assistant Character',
+      'Assistant Identity',
+      'Executive Assistant',
+    ]);
   });
 
   it('names no link, address or emoji', () => {
