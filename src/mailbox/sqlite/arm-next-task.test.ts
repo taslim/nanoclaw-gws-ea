@@ -13,6 +13,7 @@ import { describe, it, expect, afterEach } from 'vitest';
 import { ensureSchema, openInboundDb } from './session-db.js';
 import { insertTaskRow, getCompletedRecurring } from './tasks.js';
 import { wrapSqliteInbound } from './index.js';
+import { parseIsoTimestamp } from '../model.js';
 
 const TEST_DIR = `/tmp/nanoclaw-arm-next-task-test-${process.pid}-${Math.random().toString(36).slice(2)}`;
 const DB_PATH = path.join(TEST_DIR, 'inbound.db');
@@ -40,6 +41,53 @@ function completedRecurringOriginal(db: ReturnType<typeof openInboundDb>, id: st
 }
 
 describe('armNextTask', () => {
+  it('selects only completed or failed task recurrences that can be claimed', async () => {
+    const db = freshDb();
+    try {
+      const mailbox = wrapSqliteInbound(db);
+      for (const kind of ['task', 'chat', 'chat-sdk', 'webhook', 'system'] as const) {
+        for (const status of ['completed', 'failed'] as const) {
+          const id = `${kind}-${status}`;
+          await mailbox.insertMessage({
+            id,
+            kind,
+            timestamp: new Date().toISOString(),
+            platformId: null,
+            channelType: null,
+            threadId: null,
+            content: JSON.stringify({ prompt: 'noop' }),
+            processAfter: null,
+            recurrence: '0 9 * * *',
+          });
+          mailbox.applyProcessingAcks([
+            {
+              messageId: id,
+              status: status === 'failed' ? 'script-skip:error' : status,
+              statusChanged: parseIsoTimestamp(new Date().toISOString()),
+            },
+          ]);
+        }
+      }
+      await mailbox.insertTask({
+        id: 'pending-task',
+        seriesId: 'pending-task',
+        processAfter: new Date().toISOString(),
+        recurrence: '0 9 * * *',
+        content: JSON.stringify({ prompt: 'noop' }),
+      });
+      completedRecurringOriginal(db, 'one-off');
+      mailbox.clearRecurrence('one-off');
+
+      expect(
+        mailbox
+          .getCompletedRecurring()
+          .map((row) => row.id)
+          .sort(),
+      ).toEqual(['task-completed', 'task-failed']);
+    } finally {
+      db.close();
+    }
+  });
   it('inserts the next occurrence and clears the recurrence in one step', async () => {
     const db = freshDb();
     completedRecurringOriginal(db, 'task-original');
