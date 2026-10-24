@@ -24,8 +24,17 @@ vi.mock('@1password/sdk', async (importOriginal) => ({
 
 import Database from 'better-sqlite3';
 
-import { closeDb, createAgentGroup, createMessagingGroup, getDb, initTestDb, runMigrations } from '../../db/index.js';
+import {
+  closeDb,
+  createAgentGroup,
+  createMessagingGroup,
+  getAgentGroup,
+  getDb,
+  initTestDb,
+  runMigrations,
+} from '../../db/index.js';
 import { setDeliveryAdapter } from '../../delivery.js';
+import { getRequiredProjectDocSections } from '../../project-doc-sections.js';
 import { inboundDbPath } from '../../mailbox/sqlite/paths.js';
 import { resolveSystemSession } from '../../session-manager.js';
 import type { PendingApproval, Session } from '../../types.js';
@@ -62,6 +71,7 @@ import { writePrivateFile } from './paths.js';
 import { BrowserQueue } from './queue.js';
 import type { BrowserExecutionContext } from './actions.js';
 import { openSignupVerification } from './sign-in-mail.js';
+import { givenAddressStop } from './web-address.js';
 
 const ORIGIN = 'https://accounts.shop.example';
 const USERNAME = 'morgan.ellery@example.com';
@@ -161,6 +171,33 @@ function context(): { context: BrowserExecutionContext; page: ReturnType<typeof 
 }
 
 describe("main's credential authority", () => {
+  it('obtains the exact website email for a fresh guest form and signup before any vault login exists', async () => {
+    const email = 'onuj@web.example';
+    await recordWebAlias(email);
+    expect(fake.items.size).toBe(0);
+    const websiteEmail = async (id: string): Promise<string> => {
+      const group = await getAgentGroup(id);
+      if (!group) throw new Error('Missing browser identity fixture group');
+      const identity = (await getRequiredProjectDocSections(group)).find(
+        (section) => section.name === 'Assistant Identity',
+      )?.body;
+      const address = /verified website email is `([^`]+)`/u.exec(identity ?? '')?.[1];
+      if (address === undefined) throw new Error('The host did not supply a verified website email');
+      return address;
+    };
+
+    const guestEmail = await websiteEmail('browser');
+    expect(guestEmail).toBe(email);
+    expect(await givenAddressStop([guestEmail])).toBeUndefined();
+    const signupEmail = await websiteEmail('main');
+    expect(await ask({ operation: 'signup', site: ORIGIN, username: signupEmail })).toMatchObject({
+      status: 'recorded',
+      username: email,
+    });
+    expect(fake.items.size).toBe(0);
+    expect(fake.calls).toEqual([]);
+  });
+
   it('records a signup for one job, site and account, repeats safely, and spends no provider request', async () => {
     const recorded = await ask({ operation: 'signup', site: `${ORIGIN}/join?ref=home`, username: USERNAME });
     expect(recorded).toEqual({

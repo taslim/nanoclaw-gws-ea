@@ -859,7 +859,7 @@ describe('character and audience-specific identity', () => {
     );
   });
 
-  it('keeps names, role and current address pointers in identity, with web and vault mechanics elsewhere', async () => {
+  it('keeps the verified website email available as an identity fact without web or vault procedures', async () => {
     await recordWebAlias('onuj@example.test');
     writeBrowserAccess(path.join(TEST_ROOT, 'browser', 'policy.json'), { agentGroupIds: [main.id, research.id] });
     try {
@@ -869,8 +869,25 @@ describe('character and audience-specific identity', () => {
       expect(mainIdentity).toContain('`calendar_access`');
       expect(mainIdentity?.split(/\s+/u).filter(Boolean).length).toBeLessThanOrEqual(90);
       for (const candidate of [main, browser, research]) {
-        expect(await identity(candidate)).not.toMatch(/onuj@example\.test|1Password|alias_unavailable|vault/u);
+        expect(await identity(candidate)).toContain("Juno's verified website email is `onuj@example.test`.");
+        expect(await identity(candidate)).not.toMatch(/1Password|alias_unavailable|vault|sign ?up|checkouts/u);
       }
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it('makes a missing website email explicit and withholds its fact when browser access is removed', async () => {
+    writeBrowserAccess(path.join(TEST_ROOT, 'browser', 'policy.json'), { agentGroupIds: [main.id] });
+    try {
+      expect(await identity(browser)).toContain('Juno has no verified website email.');
+      expect(await identity(main)).toContain('Juno has no verified website email.');
+      expect(await identity(research)).not.toContain('website email');
+      await recordWebAlias('onuj@example.test');
+      expect(await identity(main)).toContain('`onuj@example.test`');
+      writeBrowserAccess(path.join(TEST_ROOT, 'browser', 'policy.json'), { agentGroupIds: [research.id] });
+      expect(await identity(main)).not.toContain('website email');
+      expect(await identity(research)).toContain('`onuj@example.test`');
     } finally {
       vi.unstubAllEnvs();
     }

@@ -11,6 +11,7 @@ import { registerResource } from '../../cli/crud.js';
 import type { CallerContext } from '../../cli/frame.js';
 import { register } from '../../cli/registry.js';
 import type { AgentGroup } from '../../types.js';
+import { hasBrowserAccess } from '../gws-ea-browser/access.js';
 import { registerApprovalHandler } from '../approvals/index.js';
 import { NAME_LIMIT, quoted } from '../approvals/request-text.js';
 // The inbox's store alone: its module entry points load external-email, whose
@@ -95,6 +96,12 @@ function assistantAddressSentence(assistant: string, email: string | null): stri
   return ` ${assistant}'s own Google Workspace address is ${quotedAddress(email)}.`;
 }
 
+function websiteEmailSentence(assistant: string, email: string | null): string {
+  return email === null
+    ? ` ${assistant} has no verified website email.`
+    : ` ${assistant}'s verified website email is ${quotedAddress(email)}.`;
+}
+
 function browserPrincipalAddressesSentence(principal: string, emails: readonly string[]): string {
   if (emails.length === 0) return '';
   const quoted = LIST.format(emails.map((email) => `\`${email}\``));
@@ -129,16 +136,17 @@ async function identitySection(group: AgentGroup): Promise<{ name: string; body:
   }
   if (audience === 'external-chat') return { name: 'Assistant Identity', body: names };
   if (audience === 'browser') {
-    const body = browserPrincipalAddressesSentence(principal, profile.principal_emails);
+    const body = `${websiteEmailSentence(assistant, profile.assistant_alias)}${browserPrincipalAddressesSentence(principal, profile.principal_emails)}`;
     return { name: 'Assistant Identity', body: `${names}${body}` };
   }
-  if (audience === 'job') return { name: 'Assistant Identity', body: names };
+  const website = (await hasBrowserAccess(group.id)) ? websiteEmailSentence(assistant, profile.assistant_alias) : '';
+  if (audience === 'job') return { name: 'Assistant Identity', body: `${names}${website}` };
   const own = assistantAddressSentence(assistant, profile.assistant_workspace_email);
   const addresses =
     audience === 'main'
       ? MAIN_PRINCIPAL_ADDRESSES_POINTER
       : principalAddressesSentence(principal, profile.principal_emails);
-  const body = `${own}${addresses}`;
+  const body = `${own}${website}${addresses}`;
   return { name: 'Assistant Identity', body: `${names}${body}` };
 }
 
