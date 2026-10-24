@@ -211,7 +211,8 @@ const REVIEWED: Readonly<Record<string, Review>> = {
   },
   'gws-ea-meetings/principal-events.ts createEvent: calendar, end, event, start': {
     kind: 'rendered',
-    reason: 'the message names the calendar, the time and the event id main changes it by',
+    reason:
+      "the message names the calendar in words, the time and the event id main changes it by; the calendar id is main's own input",
   },
   'gws-ea-meetings/principal-events.ts answered: calendar, event, guests': {
     kind: 'rendered',

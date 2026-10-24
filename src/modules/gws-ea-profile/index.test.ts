@@ -816,7 +816,8 @@ describe('character and audience-specific identity', () => {
       'Their time for family, friends, health, and rest is kept, not weighed',
       'Calendar ownership is not obedience to the existing calendar; it is the authority to improve it.',
       'How they live is theirs: point out what a choice collides with, such as a family date, and otherwise arrange it without comment',
-      'remind them of theirs in time, such as a birthday wish, with a line they could send',
+      'Leave the personal touch to the principal: when you talk with them, remind them in time of a birthday wish or a thank-you that is theirs to send, with a line they could use.',
+      'do not repeat, confirm or correct it',
       "When something big happens, such as an illness, a death, a family emergency, or a new baby, answer briefly and as a person would, then take things off them unasked: clear and move what you can, let others hear only that they're away, and hold what can wait. Send one short message with what's handled, and ask nothing that can wait.",
       'Say exactly what you checked, such as "clear on your calendar" when theirs is all you saw, and call something done only when it worked.',
       'When something needs nothing from them, such as a change they made to their own calendar, send nothing',
@@ -827,8 +828,7 @@ describe('character and audience-specific identity', () => {
     expect(CHARACTER).not.toMatch(
       /\b(?:ncl|tools?|agent groups?|matters record|Core Memory|runtime|provider|host)\b|memory\//iu,
     );
-    expect(CHARACTER.split(/\s+/u).filter(Boolean).length).toBeGreaterThanOrEqual(500);
-    expect(CHARACTER.split(/\s+/u).filter(Boolean).length).toBeLessThanOrEqual(700);
+    // Its size cap lives with every other guidance file's, in src/gws-ea/guidance-caps.test.ts.
   });
 
   it('leaves the browser without character while retaining the addresses it may recognize', async () => {
@@ -859,7 +859,7 @@ describe('character and audience-specific identity', () => {
     );
   });
 
-  it('keeps the verified website email available as an identity fact without web or vault procedures', async () => {
+  it('keeps the verified web address available as an identity fact without web or vault procedures', async () => {
     await recordWebAlias('onuj@example.test');
     writeBrowserAccess(path.join(TEST_ROOT, 'browser', 'policy.json'), { agentGroupIds: [main.id, research.id] });
     try {
@@ -869,7 +869,7 @@ describe('character and audience-specific identity', () => {
       expect(mainIdentity).toContain('`calendar_access`');
       expect(mainIdentity?.split(/\s+/u).filter(Boolean).length).toBeLessThanOrEqual(90);
       for (const candidate of [main, browser, research]) {
-        expect(await identity(candidate)).toContain("Juno's verified website email is `onuj@example.test`.");
+        expect(await identity(candidate)).toContain("Juno's verified web address is `onuj@example.test`.");
         expect(await identity(candidate)).not.toMatch(/1Password|alias_unavailable|vault|sign ?up|checkouts/u);
       }
     } finally {
@@ -877,16 +877,16 @@ describe('character and audience-specific identity', () => {
     }
   });
 
-  it('makes a missing website email explicit and withholds its fact when browser access is removed', async () => {
+  it('makes a missing web address explicit and withholds its fact when browser access is removed', async () => {
     writeBrowserAccess(path.join(TEST_ROOT, 'browser', 'policy.json'), { agentGroupIds: [main.id] });
     try {
-      expect(await identity(browser)).toContain('Juno has no verified website email.');
-      expect(await identity(main)).toContain('Juno has no verified website email.');
-      expect(await identity(research)).not.toContain('website email');
+      expect(await identity(browser)).toContain('Juno has no verified web address.');
+      expect(await identity(main)).toContain('Juno has no verified web address.');
+      expect(await identity(research)).not.toContain('web address');
       await recordWebAlias('onuj@example.test');
       expect(await identity(main)).toContain('`onuj@example.test`');
       writeBrowserAccess(path.join(TEST_ROOT, 'browser', 'policy.json'), { agentGroupIds: [research.id] });
-      expect(await identity(main)).not.toContain('website email');
+      expect(await identity(main)).not.toContain('web address');
       expect(await identity(research)).toContain('`onuj@example.test`');
     } finally {
       vi.unstubAllEnvs();

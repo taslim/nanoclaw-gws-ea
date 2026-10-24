@@ -96,10 +96,14 @@ it('keeps active main guidance conditional so enablement changes need no contain
   const guidance = sections.find((section) => section.name === 'Browser delegation')?.body;
   expect(guidance).toBe(initialGuidance);
   expect(guidance).toContain('principal approvals');
-  expect(guidance).toContain('take outcomes needing the principal to main');
-  expect(guidance).toContain('Never ask for or accept passwords, tokens or card details in chat');
-  expect(guidance).toContain('there is no way to use details sent to you');
-  expect(guidance).toContain('add one on the site or finish checkout themselves');
+  expect(guidance).toContain('In a group other than main, take outcomes needing the principal to main');
+  expect(guidance).toContain('Never ask for or accept card details in chat');
+  expect(guidance).toContain('there is no way to use card details sent to you');
+  expect(guidance).toContain('adds one on the site or finishes checkout themselves');
+  expect(guidance).toContain('tell the principal their operator needs to enable it');
+  expect(guidance).toContain(
+    "only to a site the principal's request names, or the booking platform embedded in that site",
+  );
   // The shared guide is judgment; tool descriptions and job instructions carry result meanings.
   expect(guidance).not.toMatch(/relay_code|no_item_for_site|vault_unavailable|outcome_unknown|--job/u);
   // Operator setup stays the operator's: main never relays its commands or provider-administration terms.

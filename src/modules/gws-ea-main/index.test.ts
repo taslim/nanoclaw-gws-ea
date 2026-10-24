@@ -200,8 +200,9 @@ describe("GWS-EA's guidance for main", () => {
     expect(GUIDANCE).toContain('never inferred from an outside claim');
     expect(GUIDANCE).toContain("a correction's own dated Core Memory line");
     expect(GUIDANCE).toContain('beside the pointer');
-    expect(GUIDANCE).toContain('A quiet calendar does not prove a priority has ended');
-    expect(GUIDANCE).toContain('confirm consequential uncertainty');
+    expect(GUIDANCE).toContain('a quiet calendar does not prove a priority has ended');
+    expect(GUIDANCE).toContain("When a decision rests on a priority you're no longer sure of, confirm it in one line");
+    expect(GUIDANCE).toContain('A standing morning rundown only if they ask');
   });
 
   it('orders the role around its work and replaces the generic shell teaching main no longer reads', () => {
@@ -255,7 +256,8 @@ describe("GWS-EA's guidance for main", () => {
     ])
       expect(document, phrase).toContain(phrase);
     expect(document.match(/For a Google 401 or a 403 about missing scopes/gu)).toHaveLength(1);
-    expect(document.match(/Never ask for or accept passwords, tokens or card details in chat/gu)).toHaveLength(1);
+    expect(document.match(/Never ask anyone for a password, key or token\./gu)).toHaveLength(1);
+    expect(document.match(/Never ask for or accept card details in chat/gu)).toHaveLength(1);
     expect(document).not.toMatch(/^# (?:People|Scheduling Preferences)$/mu);
   });
 

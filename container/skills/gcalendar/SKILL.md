@@ -72,6 +72,6 @@ After any change, read the event back with `gog calendar event` and check its ti
 Explain the limit in words the principal can act on, without an error code or command:
 
 - No connection to Google: Google can't be reached right now.
-- `404 notFound` for a calendar: it isn't shared with you, or the ID is wrong. Say, “I can't see that calendar yet,” and ask its owner to share it when the ID is right.
-- `403 requiredAccessLevel`: you may see that calendar but not change it. Say, “I can see that calendar, but I need permission to change it,” and ask its owner for that access when the job needs it.
+- `404 notFound` for a calendar: it isn't shared with you, or the ID is wrong. Tell them you can't see that calendar yet, and ask its owner to share it when the ID is right.
+- `403 requiredAccessLevel`: you may see that calendar but not change it. Tell them you can see it but need permission to change it, and ask its owner for that access when the job needs it.
 - `command "…" is not enabled`: gog has refused a command outside the ones available to you. Use the route this skill provides, without looking for a way around the limit. If the job still can't be done, say which action isn't available to you.

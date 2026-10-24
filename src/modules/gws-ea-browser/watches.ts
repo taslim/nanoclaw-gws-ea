@@ -578,6 +578,8 @@ async function settleWatchOutcome({ approval, outcome, reason }: ApprovalResolve
   if (typeof payload.watchId !== 'string') return;
   const watchId = payload.watchId;
   const db = getDb();
+  // Read the delegators' names before the transaction: the policy file is no part of it.
+  const delegators = outcome === 'reject' ? await browserDelegators() : [];
   await db.transaction(async () => {
     const watch = await getBrowserWatch(watchId, db);
     const status = outcome === 'expired' ? 'expired' : 'cancelled';
@@ -602,9 +604,9 @@ async function settleWatchOutcome({ approval, outcome, reason }: ApprovalResolve
         'SELECT source_agent_group_id FROM gws_ea_browser_jobs WHERE id = ?',
         watch.job_id,
       );
-      const delegator = (await browserDelegators()).find((entry) => entry.agentGroupId === job?.source_agent_group_id);
+      const delegator = delegators.find((entry) => entry.agentGroupId === job?.source_agent_group_id);
       await insertWatchNotice(db, watch, 'rejected', 'rejected', {
-        message: rejectedWatchMessage(delegator?.name ?? job?.source_agent_group_id, reason),
+        message: rejectedWatchMessage(delegator?.name, reason),
       });
     }
   });

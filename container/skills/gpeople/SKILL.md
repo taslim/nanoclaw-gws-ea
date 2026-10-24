@@ -20,5 +20,5 @@ When gog fails:
 
 - `Google API error (401 …)`, or no connection to Google at all: your Google connection has stopped working.
 - `403 insufficientPermissions`, or a `403` mentioning insufficient authentication scopes: that part of Google isn't connected for you.
-- `people API is not enabled`: the organization's directory isn't available through your connection yet. Say, “I can't look in the directory right now,” and ask the principal for the address when the job needs it. Only the operator can use the setup link gog prints.
+- `people API is not enabled`: the organization's directory isn't available through your connection yet. Tell them the directory isn't available right now, and ask the principal for the address when the job needs it. Only the operator can use the setup link gog prints.
 - `command "…" is not enabled`: gog has refused a command outside the ones available to you. Use this skill's directory search, without looking for another way around the limit. If it can't do the job, tell the principal which lookup isn't available to you.

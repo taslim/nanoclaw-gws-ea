@@ -171,7 +171,7 @@ function context(): { context: BrowserExecutionContext; page: ReturnType<typeof 
 }
 
 describe("main's credential authority", () => {
-  it('obtains the exact website email for a fresh guest form and signup before any vault login exists', async () => {
+  it('obtains the exact web address for a fresh guest form and signup before any vault login exists', async () => {
     const email = 'onuj@web.example';
     await recordWebAlias(email);
     expect(fake.items.size).toBe(0);
@@ -181,8 +181,8 @@ describe("main's credential authority", () => {
       const identity = (await getRequiredProjectDocSections(group)).find(
         (section) => section.name === 'Assistant Identity',
       )?.body;
-      const address = /verified website email is `([^`]+)`/u.exec(identity ?? '')?.[1];
-      if (address === undefined) throw new Error('The host did not supply a verified website email');
+      const address = /verified web address is `([^`]+)`/u.exec(identity ?? '')?.[1];
+      if (address === undefined) throw new Error('The host did not supply a verified web address');
       return address;
     };
 
