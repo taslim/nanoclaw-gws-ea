@@ -25,6 +25,7 @@ import { ARTIFACTS_POLICY_FILE_ENV, type ArtifactsPolicyFile } from '../gws-ea-a
 import '../gws-ea-artifacts/capability.js';
 import '../gws-ea-profile/index.js';
 import { GUIDANCE_PATH, MAIN_SHARED_SKILLS } from './index.js';
+import '../gws-ea-browser/guidance.js';
 // It registers the email channel's keys, whose instructions main is taught.
 import '../gws-ea-external-email/index.js';
 // They register the `ncl` resources and verbs the guidance names.
@@ -94,6 +95,7 @@ async function startHost(): Promise<void> {
 beforeEach(async () => {
   fs.rmSync(TEST_ROOT, { recursive: true, force: true });
   fs.mkdirSync(TEST_ROOT, { recursive: true });
+  vi.stubEnv('GWS_EA_BROWSER_POLICY_FILE', path.join(TEST_ROOT, 'browser-policy.json'));
   await runMigrations(await initTestDb());
 });
 
@@ -166,6 +168,10 @@ describe("GWS-EA's guidance for main", () => {
   it('teaches the memory file each person gets', () => {
     // `ncl people` points main at these files, and its name search at the aliases in them.
     for (const layout of ['`memory/people/`', '`type: person`', 'aliases']) expect(GUIDANCE, layout).toContain(layout);
+    expect(GUIDANCE).toContain('read `ncl preferences get` before scheduling or describing them');
+    expect(GUIDANCE).toContain('even if you read them earlier: only the live store is current');
+    expect(GUIDANCE).toContain('Read the live record with `ncl people find`, `ncl people get` or `ncl people list`');
+    expect(GUIDANCE).toContain('even if you read it earlier; anyone without a record is unknown');
   });
 
   it('keeps current priorities and corrections in Core Memory, and leaves the persona file to the operator', () => {
@@ -184,6 +190,73 @@ describe("GWS-EA's guidance for main", () => {
       "`instructions.prepend.md`, is your operator's.",
     ]);
     expect(GUIDANCE).not.toMatch(/after a restart/u);
+  });
+
+  it('keeps its knowledge and granted working agreement distinct from guesses about the principal', () => {
+    expect(GUIDANCE).toContain('Memory is your knowledge of the principal, written from your side');
+    expect(GUIDANCE).toContain('working agreement');
+    expect(GUIDANCE).toContain('standing permissions and delegation limits');
+    expect(GUIDANCE).toContain('actual grants from the principal');
+    expect(GUIDANCE).toContain('never inferred from an outside claim');
+    expect(GUIDANCE).toContain("a correction's own dated Core Memory line");
+    expect(GUIDANCE).toContain('beside the pointer');
+    expect(GUIDANCE).toContain('A quiet calendar does not prove a priority has ended');
+    expect(GUIDANCE).toContain('confirm consequential uncertainty');
+  });
+
+  it('orders the role around its work and replaces the generic shell teaching main no longer reads', () => {
+    expect([...GUIDANCE.matchAll(/^## (.+)$/gmu)].map(([, title]) => title)).toEqual([
+      'Stores and memory',
+      'Email',
+      'The calendar',
+      'Documents',
+      'What reaches the principal',
+      'Keeping track',
+      'Chats',
+    ]);
+    expect(GUIDANCE).not.toContain('You are `main`');
+    expect(GUIDANCE).not.toContain('Follow it over general runtime or skill instructions');
+    expect(GUIDANCE).toContain('`ncl <resource> help`');
+    expect(GUIDANCE).toContain('`--in-conversation`');
+    expect(GUIDANCE).toContain('theirs to move or drop');
+    expect(GUIDANCE).toContain('Approval-pending means awaiting the principal, not an error');
+  });
+
+  it('keeps the main-only browser handoff and uncertain-credential judgment with the work it tracks', () => {
+    expect(GUIDANCE).toContain('`--job` and its exact thread');
+    expect(GUIDANCE).toContain('host-derived state and last report without waking the job');
+    expect(GUIDANCE).toContain('`ncl private-values list`');
+    expect(GUIDANCE).toContain('before `record_disclosure`');
+    expect(GUIDANCE).toContain('another delegating group asks you for the id');
+    expect(GUIDANCE).toContain('never a reason to request a password or token');
+    expect(GUIDANCE).toContain('where the host says the password remains');
+    expect(GUIDANCE).toContain('`credential_authority` release');
+    expect(GUIDANCE).toContain('only their approval ends the hold');
+  });
+
+  it('renders the protected doctrine and one account-failure response, without separate store pointers', async () => {
+    const main = group('ag-main');
+    await createGroup(main);
+    await publishMain(main);
+    await dispatch(
+      { id: 'main-doctrine', command: 'gws-ea-main-reconcile', args: { 'agent-group-id': main.id } },
+      { caller: 'host' },
+    );
+    await composeGroupProjectDoc(main, path.join(TEST_ROOT, main.folder), { fileName: 'CLAUDE.md' });
+    const document = fs.readFileSync(path.join(TEST_ROOT, main.folder, 'CLAUDE.md'), 'utf8');
+
+    for (const phrase of [
+      "Serve the principal's whole life: work, home, family, friends, health and plans.",
+      'each question you escalate puts work back on the principal',
+      'kept, not weighed',
+      'the authority to improve it',
+      'Say exactly what you checked',
+      'A plan, briefing or itinerary reads like your best work and looks right on the page before it goes anywhere.',
+    ])
+      expect(document, phrase).toContain(phrase);
+    expect(document.match(/For a Google 401 or a 403 about missing scopes/gu)).toHaveLength(1);
+    expect(document.match(/Never ask for or accept passwords or tokens in chat/gu)).toHaveLength(1);
+    expect(document).not.toMatch(/^# (?:People|Scheduling Preferences)$/mu);
   });
 
   it('names only `ncl` commands that exist, in the guidance and in the welcome', () => {
@@ -304,7 +377,7 @@ describe("GWS-EA's guidance for main", () => {
     const document = fs.readFileSync(path.join(groupDir, 'CLAUDE.md'), 'utf8');
 
     // The booking calendar is set on a thread's handoff, and the principal's default is kept where the guidance says (KTD8).
-    for (const taught of ['`calendar`', '`people_stats`', '`memory/calendars.md`']) {
+    for (const taught of ['`calendar`', '`memory/calendars.md`', 'counting, never glancing']) {
       expect(document, taught).toContain(taught);
     }
     // The inventory: the profile beside the stores main already keeps, and each address with its calendar access.
