@@ -140,7 +140,7 @@ export async function keepSync(conversation: Session): Promise<string> {
     if (sameContent && sameSchedule) return nextRun(recurrence, timezone);
     const at = nextRun(recurrence, timezone);
     const id = makeTaskId(SYNC_TASK_NAME);
-    await withExistingMailboxSession(held.session.agent_group_id, held.session.id, (mailbox) =>
+    const armed = await withExistingMailboxSession(held.session.agent_group_id, held.session.id, (mailbox) =>
       mailbox.armNextTask(task.id, {
         id,
         seriesId: id,
@@ -154,6 +154,9 @@ export async function keepSync(conversation: Session): Promise<string> {
         }),
       }),
     );
+    // The sweep may have re-armed our snapshot first. Reconcile its successor
+    // against this release rather than leave the old prompt on that clock.
+    if (armed === false) return keepSync(conversation);
     return at;
   }
   if (task.status === 'pending' && task.processAfter !== null) {
