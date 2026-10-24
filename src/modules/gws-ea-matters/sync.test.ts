@@ -43,7 +43,7 @@ import { isContainerRunning } from '../../container-runner.js';
 import type { CallerContext, ResponseFrame } from '../../cli/frame.js';
 import { closeDb, initTestDb, runMigrations } from '../../db/index.js';
 import { reconcileSession } from '../../reconcile-session.js';
-import { withExistingMailboxSession } from '../../session-manager.js';
+import { withExistingMailboxSession, writeSessionMessage } from '../../session-manager.js';
 import '../gws-ea-inbox/index.js';
 import { FakeGmailThreads } from '../gws-ea-inbox/testing/fake-gmail-threads.js';
 import { createThread, recordThreadAddresses, recordThreadMessage } from '../gws-ea-inbox/thread-map.js';
@@ -348,23 +348,35 @@ describe('the daily sync', () => {
     expect(await syncs()).toEqual([next]);
   });
 
-  it('does not count a stale system tool reply as an unread note', async () => {
+  it('reads no note from a pending tool reply, but reports a readable note alongside it', async () => {
     const main = await mainSession();
-    await withExistingMailboxSession(MAIN, main.id, (mailbox) =>
-      mailbox.insertMessage({
-        id: 'stale-tool-reply',
-        kind: 'system',
-        timestamp: MONDAY_6AM,
-        platformId: null,
-        channelType: null,
-        threadId: null,
-        content: JSON.stringify({ text: 'A tool reply from an old turn.' }),
-        trigger: false,
-        processAfter: null,
-        recurrence: null,
-      }),
-    );
+    const reply = JSON.stringify({ action: 'cli_response', requestId: 'old-request', ok: true, data: [] });
+    await writeSessionMessage(main.agent_group_id, main.id, {
+      id: 'stale-tool-reply',
+      kind: 'system',
+      timestamp: MONDAY_6AM,
+      platformId: null,
+      channelType: null,
+      threadId: null,
+      content: reply,
+      processAfter: null,
+      recurrence: null,
+      trigger: false,
+    });
+
     expect(await data(run('matters-sync', {}))).toEqual({ wakeAgent: true, data: [] });
+    await note('readable-note', 'Calendar access needs attention.');
+    expect(await data(run('matters-sync', {}))).toEqual({
+      wakeAgent: true,
+      data: ['A note you have not read comes with this.'],
+    });
+    await answerOccurrence(main, 'readable-note', 'completed');
+    expect(await data(run('matters-sync', {}))).toEqual({ wakeAgent: true, data: [] });
+    expect(
+      await withExistingMailboxSession(main.agent_group_id, main.id, (mailbox) =>
+        mailbox.getInboundRecords({ status: 'pending' }),
+      ),
+    ).toMatchObject([{ id: 'stale-tool-reply', kind: 'system', content: reply }]);
   });
 
   it('reports unread notes while they wait, then still wakes main without a note line', async () => {
