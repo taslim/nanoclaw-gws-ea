@@ -114,8 +114,8 @@ const DEFAULT_ON_TOOLS = [
   ...TIME_TOOLS,
 ].sort();
 
-async function connect(grants: readonly string[]): Promise<{ client: Client; close: () => Promise<void> }> {
-  const server = createMcpServer(async (action) => action(), new Set(grants));
+async function connect(grants?: readonly string[]): Promise<{ client: Client; close: () => Promise<void> }> {
+  const server = createMcpServer(async (action) => action(), grants === undefined ? undefined : new Set(grants));
   const [serverTransport, clientTransport] = InMemoryTransport.createLinkedPair();
   const client = new Client({ name: 'capabilities-fixture', version: '1' });
   await server.connect(serverTransport);
@@ -208,13 +208,24 @@ describe('NanoClaw tool server capabilities', () => {
     }
   });
 
-  it('keeps every tool description within the length Claude Code keeps', async () => {
-    // Claude Code 2.1.296 cuts a deferred tool's description at 16,384 characters.
-    const { client, close } = await connect([...ALL, 'browser', ...EXTERNAL_EMAIL]);
+  it.each<[string, readonly string[] | undefined]>([
+    ...[
+      ...new Set([...ALL, ...EXTERNAL_EMAIL, 'browser', 'gws-ea-chat-external', 'gws-ea-chat-documents', 'artifacts']),
+    ].map<[string, readonly string[]]>((key) => [key, [key]]),
+    ['all registered base tools', undefined],
+  ])('keeps every description served for %s within 4,096 characters', async (_holding, grants) => {
+    // KTD15 / R23: Claude Code 2.1.296 keeps only 4,096 upfront characters.
+    // A gateway's non-first-party API address loads tools upfront. Serve each
+    // key alone so a base definition cannot hide another key's variant; the
+    // undefined case also covers every registered base tool without filtering.
+    const { client, close } = await connect(grants);
     try {
       const { tools } = await client.listTools();
-      expect(tools.length).toBeGreaterThan(DEFAULT_ON_TOOLS.length);
-      expect(tools.filter((tool) => (tool.description ?? '').length > 16_384).map((tool) => tool.name)).toEqual([]);
+      expect(
+        tools
+          .filter((tool) => (tool.description ?? '').length > 4_096)
+          .map((tool) => ({ name: tool.name, characters: (tool.description ?? '').length })),
+      ).toEqual([]);
     } finally {
       await close();
     }

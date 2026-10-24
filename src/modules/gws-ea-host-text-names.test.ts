@@ -26,6 +26,10 @@
  * description (`registerCapability`) lists the tools its key grants to whoever
  * configures a group, so its names must exist, but no reader is checked.
  *
+ * Resident guidance and instruction Markdown also names only `ncl` commands
+ * every listed reader can use (R22 / KTD14). Its other names are not scanned:
+ * a backticked `browser` may name the destination rather than the browser tool.
+ *
  * What it cannot see: a tool named in plain words ("the Google tool"); a real
  * command used wrongly (`ncl matters place` where a new matter needs `open`);
  * a text built in one module and sent from another, which is checked
@@ -38,7 +42,7 @@ import ts from 'typescript';
 import { describe, expect, it } from 'vitest';
 
 import { SHELL_CAPABILITY } from '../capabilities.js';
-import { mainCapabilitySelection } from './gws-ea-main/index.js';
+import { MAIN_SHARED_SKILLS, mainCapabilitySelection } from './gws-ea-main/index.js';
 import { noVerifiedPrincipalMessage } from './gws-ea-profile/approval-wording.js';
 import { GROUP_SCOPE_RESOURCES, listCommands, lookup } from '../cli/registry.js';
 import { runnerToolCapabilities, runnerToolVocabulary } from '../test-utils/runner-tools.js';
@@ -46,7 +50,7 @@ import { BROWSER_CAPABILITIES } from './gws-ea-browser/group.js';
 import { BROWSER_DELEGATE_CAPABILITY, PURCHASE_OUTCOME_CAPABILITY } from './gws-ea-browser/guidance.js';
 import { OPERATIONAL_CODES } from './gws-ea-browser/operational-codes.js';
 import { EXTERNAL_EMAIL_CAPABILITIES } from './gws-ea-external-email/group.js';
-import { EXTERNAL_CHAT_CAPABILITIES, JOB_CHAT_CAPABILITIES } from './gws-ea-chat-agents/shape.js';
+import { CHAT_SHARED_SKILLS, EXTERNAL_CHAT_CAPABILITIES, JOB_CHAT_CAPABILITIES } from './gws-ea-chat-agents/shape.js';
 import { GOG_COMMANDS } from './gws-ea-google/index.js';
 // They register the `ncl` commands host texts name.
 import '../cli/resources/index.js';
@@ -55,8 +59,10 @@ import './gws-ea-people/index.js';
 import './gws-ea-preferences/index.js';
 import './gws-ea-privacy/index.js';
 import './gws-ea-matters/index.js';
+import './gws-ea-chats/directory.js';
 
 const MODULES = path.resolve(import.meta.dirname);
+const ROOT = path.resolve(MODULES, '../..');
 
 const READERS = ['main', 'external-email', 'external-chat', 'job', 'browser', 'delegator', 'principal'] as const;
 type Reader = (typeof READERS)[number];
@@ -243,7 +249,7 @@ const GOG_SERVICES = new Set([...GOG_KEYS.keys()].map((command) => command.split
 
 const SNAKE = /(?<![\w.$/-])[a-z][a-z0-9]*(?:_[a-z0-9]+)+(?![\w(-])/gu;
 const BACKTICKED = /`([a-z]+)`/gu;
-const COMMAND = /\b(gog|ncl) ([a-z][a-z-]*)((?: [a-z][a-z-]*){0,2})/gu;
+const COMMAND = /\b(gog|ncl) ([a-z][a-z-]*)((?: [a-z][a-z-]*(?:\|[a-z][a-z-]*)*){0,2})/gu;
 
 function toolMention(name: string, keys: ReadonlySet<string>): Mention {
   return { name, held: (holdings) => [...keys].some((key) => holdings.keys.has(key)) };
@@ -299,10 +305,21 @@ function mentionsIn(text: string): Mention[] {
     const key = TOOL_KEYS.get(word);
     if (key !== undefined) mentions.push(toolMention(word, key));
   }
+  return [...mentions, ...commandMentionsIn(text)];
+}
+
+/** Reuse the registry and scope checks for commands in both TypeScript prose and Markdown. */
+function commandMentionsIn(text: string): Mention[] {
+  const mentions: Mention[] = [];
   for (const [, tool, first, rest] of text.matchAll(COMMAND)) {
     if (first === undefined) continue;
     const words = (rest ?? '').split(' ').filter((word) => word.length > 0);
-    mentions.push(tool === 'gog' ? gogMention(first, words) : nclMention(first, words));
+    // Guidance may name alternatives as `ncl chats list|get`; each must exist.
+    const alternatives = words.reduce<string[][]>(
+      (paths, word) => paths.flatMap((prefix) => word.split('|').map((part) => [...prefix, part])),
+      [[]],
+    );
+    for (const path of alternatives) mentions.push(tool === 'gog' ? gogMention(first, path) : nclMention(first, path));
   }
   return mentions;
 }
@@ -431,6 +448,118 @@ describe('the names in GWS-EA host text', () => {
     ]) {
       expect(sources.get(file), file).toContain('DENY(noVerifiedPrincipalMessage())');
     }
+  });
+});
+
+/** Each resident instruction's possible readers, including optional browser access on a CLI-disabled job. */
+const GUIDANCE_READERS: Readonly<Record<string, readonly Reader[]>> = {
+  'src/modules/gws-ea-profile/character.md': ['main', 'external-email', 'external-chat', 'job'],
+  'src/modules/gws-ea-main/guidance.md': ['main'],
+  'src/modules/gws-ea-external-email/guidance.md': ['external-email'],
+  'src/modules/gws-ea-chat-agents/external-chat.guidance.md': ['external-chat'],
+  'src/modules/gws-ea-chat-agents/job.guidance.md': ['job'],
+  'src/modules/gws-ea-browser/main-guidance.md': ['main', 'delegator', 'job'],
+  'templates/gws-ea/browser/instructions.md': ['browser'],
+  'container/agent-runner/src/mcp-tools/gws-ea-artifacts.instructions.md': ['main', 'delegator', 'job'],
+  'container/agent-runner/src/mcp-tools/gws-ea-browser.instructions.md': ['browser'],
+  'container/agent-runner/src/mcp-tools/gws-ea-chat-documents.instructions.md': ['job'],
+  'container/agent-runner/src/mcp-tools/gws-ea-chat-external.instructions.md': ['external-chat', 'job'],
+  'container/agent-runner/src/mcp-tools/gws-ea-chat-outreach.instructions.md': ['main'],
+  'container/agent-runner/src/mcp-tools/gws-ea-chat.instructions.md': ['main'],
+  'container/agent-runner/src/mcp-tools/gws-ea-email-external.instructions.md': ['external-email'],
+  'container/agent-runner/src/mcp-tools/gws-ea-email.instructions.md': ['main'],
+  // Google skill instructions are generic: a non-main recipient may have group-scoped or disabled CLI.
+  'container/skills/gcalendar/instructions.md': ['main', 'delegator', 'job'],
+  'container/skills/gmail/instructions.md': ['main', 'delegator', 'job'],
+  'container/skills/gpeople/instructions.md': ['main', 'delegator', 'job'],
+  'container/skills/gworkspace/instructions.md': ['main', 'delegator', 'job'],
+  'container/skills/whatsapp-formatting/instructions.md': ['main', 'external-chat', 'job', 'delegator'],
+};
+
+function guidanceFilesUnder(relative: string): string[] {
+  return fs.readdirSync(path.join(ROOT, relative), { withFileTypes: true }).flatMap((entry) => {
+    const file = path.posix.join(relative, entry.name);
+    return entry.isDirectory() ? guidanceFilesUnder(file) : [file];
+  });
+}
+
+/** Discover readers independently of the pinned map so a new file cannot silently escape checking. */
+function guidanceFiles(): string[] {
+  const moduleFiles = fs
+    .readdirSync(MODULES, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory() && entry.name.startsWith('gws-ea-'))
+    .flatMap((entry) => guidanceFilesUnder(`src/modules/${entry.name}`))
+    .filter((file) => file.endsWith('guidance.md') || file === 'src/modules/gws-ea-profile/character.md');
+  const runnerFiles = guidanceFilesUnder('container/agent-runner/src/mcp-tools').filter((file) =>
+    /^gws-ea.*\.instructions\.md$/u.test(path.posix.basename(file)),
+  );
+  const templateFiles = guidanceFilesUnder('templates/gws-ea').filter(
+    (file) => path.posix.basename(file) === 'instructions.md',
+  );
+  const skillFiles = [...new Set([...MAIN_SHARED_SKILLS, ...CHAT_SHARED_SKILLS])]
+    .map((skill) => `container/skills/${skill}/instructions.md`)
+    .filter((file) => fs.existsSync(path.join(ROOT, file)));
+  return [...new Set([...moduleFiles, ...runnerFiles, ...templateFiles, ...skillFiles])].sort();
+}
+
+function guidanceNclProblems(file: string, text: string): string[] {
+  const readers = GUIDANCE_READERS[file];
+  if (readers === undefined) return [`${file}: no guidance readers listed`];
+  return text.split('\n').flatMap((line, index) =>
+    commandMentionsIn(line)
+      .filter(({ name }) => name.startsWith('ncl '))
+      .flatMap((mention) => {
+        const named = `${file}:${index + 1} ${mention.name}`;
+        if (mention.unknown !== undefined) return [`${named}: ${mention.unknown}`];
+        return readers
+          .filter((reader) => mention.held?.(HOLDINGS[reader]) !== true)
+          .map((reader) => `${named}: ${reader} does not hold it`);
+      }),
+  );
+}
+
+describe('the ncl commands in GWS-EA guidance', () => {
+  const files = guidanceFiles();
+
+  it('pins every resident instruction file to its readers, with no stale entries', () => {
+    expect(files).toEqual(Object.keys(GUIDANCE_READERS).sort());
+  });
+
+  it('names only registered commands every reader can use', () => {
+    expect(files.flatMap((file) => guidanceNclProblems(file, fs.readFileSync(path.join(ROOT, file), 'utf8')))).toEqual(
+      [],
+    );
+  });
+
+  it('refuses main-only ncl in shared browser delegation guidance, including its job reader', () => {
+    const file = 'src/modules/gws-ea-browser/main-guidance.md';
+    expect(guidanceNclProblems(file, 'Read `ncl private-values list` before disclosing.')).toEqual([
+      `${file}:1 ncl private-values list: delegator does not hold it`,
+      `${file}:1 ncl private-values list: job does not hold it`,
+    ]);
+    expect(guidanceNclProblems(file, 'Use `browser` for this errand.')).toEqual([]);
+  });
+
+  it.each([
+    ['ncl imaginary list', 'ncl imaginary: no ncl resource'],
+    ['ncl people search', 'ncl people search: not a registered ncl command'],
+    ['ncl chats list|invent', 'ncl chats invent: not a registered ncl command'],
+  ])('refuses the unknown command %s', (command, problem) => {
+    const file = 'src/modules/gws-ea-main/guidance.md';
+    expect(guidanceNclProblems(file, `Use \`${command}\`.`)).toEqual([`${file}:1 ${problem}`]);
+  });
+
+  it('refuses main-only commands in a generic Google skill', () => {
+    const file = 'container/skills/gcalendar/instructions.md';
+    expect(guidanceNclProblems(file, 'Read `ncl principal-addresses list` first.')).toEqual([
+      `${file}:1 ncl principal-addresses list: delegator does not hold it`,
+      `${file}:1 ncl principal-addresses list: job does not hold it`,
+    ]);
+  });
+
+  it('refuses to check a new instruction file until its readers are listed', () => {
+    const file = 'src/modules/gws-ea-new-role/guidance.md';
+    expect(guidanceNclProblems(file, 'Read `ncl people list`.')).toEqual([`${file}: no guidance readers listed`]);
   });
 });
 

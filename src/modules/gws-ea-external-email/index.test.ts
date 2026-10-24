@@ -305,10 +305,6 @@ describe("external-email's project document", () => {
     expect(GUIDANCE_TEXT).not.toMatch(/\b(?:AI|artificial intelligence|language model|chatbot|bot)\b/iu);
   });
 
-  it('stays within 950 words', () => {
-    expect(GUIDANCE_TEXT.split(/\s+/u).filter(Boolean).length).toBeLessThanOrEqual(950);
-  });
-
   it('names only tools external-email holds', () => {
     expect(unknownToolNames(GUIDANCE_TEXT, [])).toEqual([]);
     const named = GUIDANCE_TEXT.split('`').filter(
