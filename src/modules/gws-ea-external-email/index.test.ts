@@ -4,6 +4,7 @@
  * that holds its guidance, two names and the principal's time zone, and
  * nothing else of GWS-EA's.
  */
+import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -240,6 +241,8 @@ describe("external-email's project document", () => {
     // Said once here, so no email it reads repeats it.
     expect(composed.get('# Principal')).toBe('You work for Morgan, whose time zone is America/Los_Angeles.');
     expect(composed.get('# External Email')).toBe(fs.readFileSync(path.resolve(GUIDANCE_PATH), 'utf8').trim());
+    expect([...doc.matchAll(/^## Host sign-in task$/gmu)]).toHaveLength(1);
+    expect([...doc.matchAll(/`sign_in_reply`/gu)]).toHaveLength(1);
     expect(doc).not.toContain('morgan@example.test');
     expect(doc).not.toContain('aya@example.test');
     expect(doc).not.toContain('Working hours');
@@ -279,6 +282,17 @@ describe("external-email's project document", () => {
     const escaped = 'Juno \\*Hale\\* \\[Jr\\] \\#1\\_';
     expect(composed.get('# Principal')).toBe(`You work for ${escaped}, whose time zone is Europe/London.`);
     expect(composed.get('# Assistant Identity')).toContain(`${escaped} is the principal.`);
+  });
+
+  it('preserves How you write and the three example emails verbatim', () => {
+    const writing = GUIDANCE_TEXT.slice(
+      GUIDANCE_TEXT.indexOf('## How you write\n'),
+      GUIDANCE_TEXT.indexOf('## Working with main\n'),
+    );
+    // Frozen before the character-core rewrite: wording and examples are the contract.
+    expect(createHash('sha256').update(writing).digest('hex')).toBe(
+      '742e99de37cb6417bbf2b2786d7b8211bdd0ec29c4075afd250d6cfb2376ff3d',
+    );
   });
 
   it('names no link, address or emoji', () => {

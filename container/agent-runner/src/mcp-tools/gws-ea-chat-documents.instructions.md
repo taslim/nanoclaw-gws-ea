@@ -12,8 +12,7 @@ by link, use `tell_main`, citing the principal’s host-marked message. You cann
 link access. Never put a private detail into a document or share one containing it
 unless main has recorded the principal’s clearance for this exact chat.
 
-After a timeout, check `request_status`. An unconfirmed create must be checked with
-main before creating another document. For an unconfirmed edit, read the document
-before doing more work; repeating a replacement blindly can change it twice. An
+An unconfirmed create must be checked with main before creating another document.
+For an unconfirmed edit, read the document before doing more work; repeating a replacement blindly can change it twice. An
 existing request keeps its original arguments and revision; a new read does not
 authorize changing the revision on a replay.
