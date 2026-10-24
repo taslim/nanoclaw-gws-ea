@@ -8,8 +8,9 @@
  * (R6). `get` reads each link live from its source (KTD5, `render.ts`).
  *
  * A matter's next look is one scheduled task in main's conversation
- * (KTD4, `looks.ts`), the daily sync brings main back to whatever waited for
- * it (KTD6, `sync.ts`), and the host keeps both on time without the model
+ * (KTD4, `looks.ts`), the daily sync wakes main every day to look ahead and
+ * read what waited for it (KTD6, `sync.ts`), and the host keeps both on time
+ * without the model
  * (KTD7, `loop.ts`). Forgetting a person takes them off every matter
  * (R26, `forget.ts`).
  */
@@ -364,7 +365,7 @@ registerResource({
     sync: {
       access: 'open',
       description:
-        "The daily sync's pre-task script, which runs on its own once a day before the principal's day starts: it wakes you only when something has waited for you, a note you have not read or a thread to place. The host keeps the sync and its time; you never set it.",
+        "The daily sync's pre-task script, which runs on its own once a day before the principal's day starts: it wakes you every day to look ahead, carrying unread notes, threads to place, later looks and any morning rundown's time. It marks a Monday occurrence for the month ahead. The host keeps the sync and its time; you never set it.",
       args: [],
       examples: ['ncl matters sync'],
       // The runner reads the last line of a script's output as its verdict: one line of JSON.
@@ -374,7 +375,7 @@ registerResource({
     today: {
       access: 'open',
       description:
-        "Your own list for today: today's looks, the matters handed back without one, and the threads waiting to be placed. Read it alongside their calendar when they ask for a morning rundown. Tell them what needs their attention, in their words; keep this list to yourself.",
+        "Your own list for today: today's looks, the matters handed back without one, and the threads waiting to be placed. Read it alongside their calendar when they ask for a morning rundown. Fold in anything the daily sync prepared and send one morning message. Tell them what needs their attention, in their words; keep this list to yourself.",
       args: [],
       examples: [
         'ncl matters today',

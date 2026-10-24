@@ -1,18 +1,21 @@
 /**
  * The daily sync (KTD6): one recurring task in `main`'s conversation, kept by
- * the host (`loop.ts`), that brings main back once a day to whatever has
- * waited for it. It is the host's bookkeeping, never a message to the
- * principal: whether they hear about their day, and when, is main's
+ * the host (`loop.ts`), that wakes main seven days a week to look ahead
+ * and read whatever has waited for it. It is the host's bookkeeping, never
+ * a message to the principal: whether they hear about their day, and when, is main's
  * judgment, and a standing morning rundown is a task they ask for.
  *
  * - Its time is an hour before the earliest working-hours start in the
  *   principal's preferences, or 07:00 while they have none, in main's time
  *   zone, and it follows their working hours when those change. Nothing else
  *   sets it.
- * - Its pre-task script, `ncl matters sync`, wakes main only when something
- *   waits for it: a note it has not read, which rides along with the sync,
- *   or a thread still waiting to be placed (R27). On a quiet day it wakes
- *   nothing.
+ * - Its pre-task script, `ncl matters sync`, always wakes main (character
+ *   and roles KTD12), carrying unread notes, threads still waiting to be
+ *   placed, later looks and a morning rundown's time. Monday's month view
+ *   follows the occurrence's scheduled day in the principal's zone.
+ * - The prompt asks main to look closely at the next few days, and on
+ *   Mondays at the month through a subagent briefed with current priorities.
+ *   The principal hears only what needs them, in one morning message.
  * - A matter left without a look, and a repeating look whose run failed,
  *   come back at its time (`loop.ts`), each as a look of its own (R14).
  *
@@ -23,13 +26,15 @@
 import { CronExpressionParser } from 'cron-parser';
 
 import { resolveGroupTimezone } from '../../container-config.js';
+import { isContainerRunning } from '../../container-runner.js';
 import { withExistingMailboxSession } from '../../session-manager.js';
 import { formatLocalTime } from '../../timezone.js';
 import type { Session } from '../../types.js';
 import { ECHO_CHANNEL_TYPE } from '../cross-session-context/config.js';
 import { listUnplacedThreads, type UnplacedThread } from '../gws-ea-inbox/thread-map.js';
 import { getSchedulingPreferenceValues } from '../gws-ea-preferences/db.js';
-import { createScheduledTask, prepareScheduledTask, taskNameSlug } from '../scheduling/create.js';
+import { createScheduledTask, makeTaskId, prepareScheduledTask, taskNameSlug } from '../scheduling/create.js';
+import { parseTaskContent } from '../scheduling/task-content.js';
 import {
   cancelTaskSeries,
   listHeldLookSlots,
@@ -45,6 +50,21 @@ const SYNC_TASK_NAME = 'gws-ea daily sync';
 const SYNC_SLUG = taskNameSlug(SYNC_TASK_NAME);
 const DEFAULT_SYNC_MINUTE = 7 * 60;
 const BEFORE_WORK_MINUTES = 60;
+const SYNC_SCRIPT = 'ncl matters sync';
+const SYNC_PROMPT = `Your daily sync. Read what has waited for you, then look closely at the next few days across work and personal life: preparation, timing, transitions and confirmations. Check open matters before raising anything, handle what you can, and set a matter look for anything that can wait.
+
+When the script says this sync starts the week, also look at the month ahead through a subagent. Brief it with Core Memory's current priorities; a subagent does not receive your memory section. Ask for one line per candidate: what, when, and what may be owed. Decide what to act on yourself. Keep current priorities in Core Memory as short dated facts with their evidence. Distinguish calendar observations from inferred priorities. Update or retire a priority when evidence shows it changed; a quiet calendar alone never retires an explicit priority. Confirm consequential uncertainty with the principal, with a recommendation.
+
+Stay silent unless something needs the principal. On days off, raise work only if it would otherwise be missed. Merge anything for them with a morning rundown or later look already due, so they receive one message timed for their morning. If the rundown is still to come, put what it needs in a matter for that time; if the morning's message already went, send another only for something that cannot wait. Keep your look-ahead and memory housekeeping to yourself.`;
+
+function localDay(iso: string, timezone: string): string {
+  return new Intl.DateTimeFormat('en-CA', {
+    timeZone: timezone,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).format(new Date(iso));
+}
 
 function minuteOfDay(time: string): number {
   const [hours, minutes] = time.split(':').map(Number);
@@ -81,39 +101,74 @@ async function findSync(): Promise<HeldTask | undefined> {
   return latest;
 }
 
-async function createSync(conversation: Session, recurrence: string, timezone: string): Promise<string> {
+async function createSync(
+  conversation: Session,
+  recurrence: string,
+  timezone: string,
+  processAfter?: string,
+): Promise<string> {
   const prepared = prepareScheduledTask({
     name: SYNC_TASK_NAME,
-    prompt:
-      'Your daily sync: what has waited for you since your last turn comes with this. Act on it as you would on any note, and give the principal what needs them as one message, timed for their morning.',
-    script: 'ncl matters sync',
+    prompt: SYNC_PROMPT,
+    script: SYNC_SCRIPT,
     recurrence,
     timezone,
+    ...(processAfter === undefined ? {} : { processAfter }),
   });
   await createScheduledTask(conversation.agent_group_id, prepared, { session: conversation });
   return prepared.processAfter;
 }
 
 /**
- * Make sure the sync exists at its time (KTD7, step 1), and say when it next
- * comes, ISO. It is created on the first pass, and again once it was
- * cancelled, paused (by the sweep after eight failed runs, or by hand), ended,
- * or left at a time the principal's working hours no longer give. One that
- * has just run keeps its series, whose next run the sweep arms. The caller
- * holds `oneAtATime`.
+ * Keep the release's sync prompt, script and time on each host pass (KTD12).
+ * A pending occurrence due today keeps its time when the release changes;
+ * one already running finishes once. Completed recurring rows still own a
+ * clock until the sweep re-arms them: replace that clock atomically, rather
+ * than cancel a spent row (which deliberately leaves its recurrence alone).
+ * An identical task is left unchanged. The caller holds `oneAtATime`.
  */
 export async function keepSync(conversation: Session): Promise<string> {
   const timezone = await resolveGroupTimezone(conversation.agent_group_id);
   const recurrence = await syncRecurrence();
-  const task = (await findSync())?.task;
-  if (task !== undefined && task.recurrence !== null) {
-    if (task.status === 'completed' || task.status === 'failed') return nextRun(task.recurrence, timezone);
-    if (task.status === 'pending' && task.processAfter !== null && task.recurrence === recurrence) {
-      return task.processAfter;
-    }
+  const held = await findSync();
+  if (held === undefined) return createSync(conversation, recurrence, timezone);
+  const { task } = held;
+  const content = parseTaskContent(task.content);
+  const sameContent = content.prompt === SYNC_PROMPT && content.script === SYNC_SCRIPT;
+  const sameSchedule = task.recurrence === recurrence;
+  if (task.recurrence !== null && (task.status === 'completed' || task.status === 'failed')) {
+    if (sameContent && sameSchedule) return nextRun(recurrence, timezone);
+    const at = nextRun(recurrence, timezone);
+    const id = makeTaskId(SYNC_TASK_NAME);
+    await withExistingMailboxSession(held.session.agent_group_id, held.session.id, (mailbox) =>
+      mailbox.armNextTask(task.id, {
+        id,
+        seriesId: id,
+        processAfter: at,
+        recurrence,
+        content: JSON.stringify({
+          prompt: SYNC_PROMPT,
+          script: SYNC_SCRIPT,
+          originSessionId: null,
+          inConversation: true,
+        }),
+      }),
+    );
+    return at;
   }
-  if (task !== undefined) await cancelTaskSeries(seriesKey(task));
-  return createSync(conversation, recurrence, timezone);
+  if (task.status === 'pending' && task.processAfter !== null) {
+    if (sameContent && sameSchedule) return task.processAfter;
+    // The runner may have read the due row before posting its processing claim.
+    if (Date.parse(task.processAfter) <= Date.now() && isContainerRunning(held.session.id)) return task.processAfter;
+  }
+  const keepToday =
+    task.status === 'pending' &&
+    !sameContent &&
+    sameSchedule &&
+    task.processAfter !== null &&
+    localDay(task.processAfter, timezone) === localDay(new Date().toISOString(), timezone);
+  await cancelTaskSeries(seriesKey(task));
+  return createSync(conversation, recurrence, timezone, keepToday ? (task.processAfter ?? undefined) : undefined);
 }
 
 /** One part of what a script prints: its heading, and a line for each thing in it. */
@@ -158,14 +213,49 @@ async function unreadNotes(): Promise<number> {
   return count;
 }
 
-/**
- * The sync's verdict: main wakes only for what waits for it, notes it has
- * not read and threads still to place, and on a quiet day not at all.
- */
+/** Morning rundown tasks use today's list as their script, whatever the principal named them. */
+async function morningRundowns(timezone: string): Promise<string[]> {
+  const today = localDay(new Date().toISOString(), timezone);
+  const times: string[] = [];
+  for (const session of await mainConversations()) {
+    const tasks = await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) =>
+      mailbox.listLiveTasks('pending'),
+    );
+    for (const task of tasks ?? []) {
+      const at = task.processAfter;
+      if (
+        at === null ||
+        localDay(at, timezone) !== today ||
+        parseTaskContent(task.content).script?.trim() !== 'ncl matters today'
+      )
+        continue;
+      const hour = Number(
+        new Intl.DateTimeFormat('en-US', { timeZone: timezone, hour: 'numeric', hourCycle: 'h23' }).format(
+          new Date(at),
+        ),
+      );
+      if (hour < 12) times.push(at);
+    }
+  }
+  return times.sort().map((at) => `Morning rundown: ${formatLocalTime(at, timezone)}.`);
+}
+
+/** Always wake main to look ahead, with host facts that help it avoid duplicate morning messages. */
 export async function syncVerdict(): Promise<ScriptVerdict> {
-  const [notes, unplaced] = await Promise.all([unreadNotes(), listUnplacedThreads()]);
-  if (notes === 0 && unplaced.length === 0) return { wakeAgent: false };
   const timezone = await principalTimezone();
+  const [notes, unplaced, sync, looks, rundowns] = await Promise.all([
+    unreadNotes(),
+    listUnplacedThreads(),
+    findSync(),
+    looksBefore(nextRun('0 0 * * *', timezone)),
+    morningRundowns(timezone),
+  ]);
+  const at = sync?.task.processAfter;
+  const startsWeek =
+    at !== undefined &&
+    at !== null &&
+    new Intl.DateTimeFormat('en-US', { timeZone: timezone, weekday: 'long' }).format(new Date(at)) === 'Monday';
+  const later = looks.filter((look) => Date.parse(look.at) > Date.now());
   const unread =
     notes === 0
       ? []
@@ -176,7 +266,18 @@ export async function syncVerdict(): Promise<ScriptVerdict> {
         ];
   return {
     wakeAgent: true,
-    data: [...unread, ...(unplaced.length === 0 ? [] : sectionLines(unplacedSection(unplaced, timezone)))],
+    data: [
+      ...unread,
+      ...(unplaced.length === 0 ? [] : sectionLines(unplacedSection(unplaced, timezone))),
+      ...(startsWeek ? [`This sync starts the week: Monday in ${timezone}.`] : []),
+      ...(later.length === 0
+        ? []
+        : sectionLines({
+            heading: 'Later looks today',
+            lines: later.map((look) => `- ${look.matterId}, ${formatLocalTime(look.at, timezone)}: ${look.title}`),
+          })),
+      ...rundowns,
+    ],
   };
 }
 

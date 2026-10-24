@@ -21,7 +21,7 @@ import {
   syncProcessingAcks,
 } from './session-db.js';
 
-const TEST_DIR = '/tmp/nanoclaw-session-db-test';
+const TEST_DIR = `/tmp/nanoclaw-session-db-test-${process.pid}-${Math.random().toString(36).slice(2)}`;
 const DB_PATH = path.join(TEST_DIR, 'inbound.db');
 
 afterEach(() => {
@@ -254,18 +254,24 @@ describe('held messages', () => {
 });
 
 describe('unread context', () => {
-  it('counts the due rows that wake nothing, leaving out triggers, rows read or not yet due, and the channel named', () => {
+  it('counts the due rows that wake nothing, leaving out system replies, triggers, rows read or not yet due, and the channel named', () => {
     if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
     fs.mkdirSync(TEST_DIR, { recursive: true });
     ensureSchema(DB_PATH, 'inbound');
     const db = new Database(DB_PATH);
     const write = (
       id: string,
-      options: { trigger: boolean; channelType?: string; processAfter?: string; status?: 'held' },
+      options: {
+        trigger: boolean;
+        channelType?: string;
+        processAfter?: string;
+        status?: 'held';
+        kind?: 'chat' | 'system';
+      },
     ): void =>
       insertMessage(db, {
         id,
-        kind: 'chat',
+        kind: options.kind ?? 'chat',
         timestamp: new Date().toISOString(),
         platformId: 'chat:dm-morgan',
         channelType: options.channelType ?? 'chat',
@@ -277,6 +283,7 @@ describe('unread context', () => {
         ...(options.status ? { status: options.status } : {}),
       });
 
+    write('stale-tool-reply', { trigger: false, kind: 'system' });
     write('note-due', { trigger: false });
     write('note-past', { trigger: false, processAfter: new Date(Date.now() - 60_000).toISOString() });
     write('note-ahead', { trigger: false, processAfter: new Date(Date.now() + 3_600_000).toISOString() });
