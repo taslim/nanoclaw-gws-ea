@@ -33,7 +33,7 @@ import type { Session } from '../../types.js';
 import { ECHO_CHANNEL_TYPE } from '../cross-session-context/config.js';
 import { listUnplacedThreads, type UnplacedThread } from '../gws-ea-inbox/thread-map.js';
 import { getSchedulingPreferenceValues } from '../gws-ea-preferences/db.js';
-import { createScheduledTask, makeTaskId, prepareScheduledTask, taskNameSlug } from '../scheduling/create.js';
+import { createScheduledTask, prepareScheduledTask, taskNameSlug } from '../scheduling/create.js';
 import { parseTaskContent } from '../scheduling/task-content.js';
 import {
   cancelTaskSeries,
@@ -53,7 +53,7 @@ const BEFORE_WORK_MINUTES = 60;
 const SYNC_SCRIPT = 'ncl matters sync';
 const SYNC_PROMPT = `Your daily sync. Read what has waited for you, then look closely at the next few days across work and personal life: preparation, timing, transitions and confirmations. Check open matters before raising anything, handle what you can, and set a matter look for anything that can wait.
 
-When the script says this sync starts the week, also look at the month ahead through a subagent. Brief it with Core Memory's current priorities; a subagent does not receive your memory section. Ask for one line per candidate: what, when, and what may be owed. Decide what to act on yourself. Keep current priorities in Core Memory as short dated facts with their evidence. Distinguish calendar observations from inferred priorities. Update or retire a priority when evidence shows it changed; a quiet calendar alone never retires an explicit priority. Confirm consequential uncertainty with the principal, with a recommendation.
+When the script says this sync starts the week, also look at the month ahead through a subagent. Brief it with Core Memory's current priorities; a subagent does not receive your memory section. Ask for one line per candidate: what, when, and what may be owed. Decide what to act on yourself. Keep current priorities in Core Memory as short dated facts, with any evidence in a linked file. Record a priority the month reveals as inferred, apart from those the principal stated, and update or retire one when evidence shows it changed; a quiet calendar alone never retires a priority they stated. When a decision now rests on a priority you're unsure of, confirm it in one line with your recommendation, inside the morning's one message.
 
 Stay silent unless something needs the principal. On days off, raise work only if it would otherwise be missed. Merge anything for them with a morning rundown or later look already due, so they receive one message timed for their morning. If the rundown is still to come, put what it needs in a matter for that time; if the morning's message already went, send another only for something that cannot wait. Keep your look-ahead and memory housekeeping to yourself.`;
 
@@ -119,13 +119,28 @@ async function createSync(
   return prepared.processAfter;
 }
 
+/** Whether the runner has claimed or finished this occurrence before the host applied its ack. */
+async function occurrenceTaken({ session, task }: HeldTask): Promise<boolean> {
+  // The runner may have read the due row before posting its processing claim.
+  if (isContainerRunning(session.id)) return true;
+  const taken = await withExistingMailboxSession(
+    session.agent_group_id,
+    session.id,
+    (mailbox) =>
+      mailbox.getTerminalProcessingAcks().some((ack) => ack.messageId === task.id) ||
+      mailbox.getProcessingClaims().some((claim) => claim.messageId === task.id),
+  );
+  return taken ?? false;
+}
+
 /**
  * Keep the release's sync prompt, script and time on each host pass (KTD12).
- * A pending occurrence due today keeps its time when the release changes;
- * one already running finishes once. Completed recurring rows still own a
- * clock until the sweep re-arms them: replace that clock atomically, rather
- * than cancel a spent row (which deliberately leaves its recurrence alone).
- * An identical task is left unchanged. The caller holds `oneAtATime`.
+ * An identical task is left unchanged. A completed or failed row is the
+ * sweep's to re-arm within a minute, as upstream's restamp leaves it; the
+ * next pass replaces that successor. A due occurrence the runner has claimed
+ * or finished runs its course, and is replaced the same way once re-armed.
+ * Any other pending occurrence that is overdue or due today keeps its time
+ * when the release changes. The caller holds `oneAtATime`.
  */
 export async function keepSync(conversation: Session): Promise<string> {
   const timezone = await resolveGroupTimezone(conversation.agent_group_id);
@@ -133,45 +148,25 @@ export async function keepSync(conversation: Session): Promise<string> {
   const held = await findSync();
   if (held === undefined) return createSync(conversation, recurrence, timezone);
   const { task } = held;
+  if (task.recurrence !== null && (task.status === 'completed' || task.status === 'failed')) {
+    return nextRun(task.recurrence, timezone);
+  }
   const content = parseTaskContent(task.content);
   const sameContent = content.prompt === SYNC_PROMPT && content.script === SYNC_SCRIPT;
   const sameSchedule = task.recurrence === recurrence;
-  if (task.recurrence !== null && (task.status === 'completed' || task.status === 'failed')) {
-    if (sameContent && sameSchedule) return nextRun(recurrence, timezone);
-    const at = nextRun(recurrence, timezone);
-    const id = makeTaskId(SYNC_TASK_NAME);
-    const armed = await withExistingMailboxSession(held.session.agent_group_id, held.session.id, (mailbox) =>
-      mailbox.armNextTask(task.id, {
-        id,
-        seriesId: id,
-        processAfter: at,
-        recurrence,
-        content: JSON.stringify({
-          prompt: SYNC_PROMPT,
-          script: SYNC_SCRIPT,
-          originSessionId: null,
-          inConversation: true,
-        }),
-      }),
-    );
-    // The sweep may have re-armed our snapshot first. Reconcile its successor
-    // against this release rather than leave the old prompt on that clock.
-    if (armed === false) return keepSync(conversation);
-    return at;
-  }
+  const due = task.processAfter !== null && Date.parse(task.processAfter) <= Date.now();
   if (task.status === 'pending' && task.processAfter !== null) {
     if (sameContent && sameSchedule) return task.processAfter;
-    // The runner may have read the due row before posting its processing claim.
-    if (Date.parse(task.processAfter) <= Date.now() && isContainerRunning(held.session.id)) return task.processAfter;
+    if (due && (await occurrenceTaken(held))) return task.processAfter;
   }
-  const keepToday =
+  const keepTime =
     task.status === 'pending' &&
     !sameContent &&
     sameSchedule &&
     task.processAfter !== null &&
-    localDay(task.processAfter, timezone) === localDay(new Date().toISOString(), timezone);
+    (due || localDay(task.processAfter, timezone) === localDay(new Date().toISOString(), timezone));
   await cancelTaskSeries(seriesKey(task));
-  return createSync(conversation, recurrence, timezone, keepToday ? (task.processAfter ?? undefined) : undefined);
+  return createSync(conversation, recurrence, timezone, keepTime ? (task.processAfter ?? undefined) : undefined);
 }
 
 /** One part of what a script prints: its heading, and a line for each thing in it. */
@@ -251,10 +246,13 @@ export async function syncVerdict(): Promise<ScriptVerdict> {
     looksBefore(nextRun('0 0 * * *', timezone)),
     morningRundowns(timezone),
   ]);
+  // The occurrence running now is still pending and due; a call at any other
+  // time reads tomorrow's row, which starts nothing yet.
   const at = sync?.task.processAfter;
   const startsWeek =
     at !== undefined &&
     at !== null &&
+    Date.parse(at) <= Date.now() &&
     new Intl.DateTimeFormat('en-US', { timeZone: timezone, weekday: 'long' }).format(new Date(at)) === 'Monday';
   const later = looks.filter((look) => Date.parse(look.at) > Date.now());
   const unread =

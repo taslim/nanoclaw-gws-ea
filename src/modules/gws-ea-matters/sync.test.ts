@@ -39,16 +39,9 @@ vi.mock('../gws-ea-inbox/gmail-api.js', async (importOriginal) => ({
 }));
 
 import { dispatch } from '../../cli/dispatch.js';
-import * as containerConfig from '../../container-config.js';
 import { isContainerRunning } from '../../container-runner.js';
 import type { CallerContext, ResponseFrame } from '../../cli/frame.js';
 import { closeDb, initTestDb, runMigrations } from '../../db/index.js';
-import {
-  getAgentMailbox,
-  type AgentMailbox,
-  type MailboxSession,
-  type MailboxSessionKey,
-} from '../../mailbox/index.js';
 import { reconcileSession } from '../../reconcile-session.js';
 import { withExistingMailboxSession } from '../../session-manager.js';
 import '../gws-ea-inbox/index.js';
@@ -60,7 +53,6 @@ import '../gws-ea-preferences/index.js';
 import '../gws-ea-profile/index.js';
 import { writeNoteForMain } from '../gws-ea-profile/main-note.js';
 import { createScheduledTask, prepareScheduledTask } from '../scheduling/create.js';
-import { handleRecurrence } from '../scheduling/recurrence.js';
 import type { Matter, Placed } from './db.js';
 import './index.js';
 import { keepMattersOnTime } from './loop.js';
@@ -69,6 +61,7 @@ import {
   liveTaskRows,
   MAIN,
   mainSession,
+  postAnswer,
   printed,
   runnerReads,
   runOccurrence,
@@ -112,14 +105,6 @@ async function syncs(): Promise<TaskRow[]> {
 
 function localClock(iso: string): string {
   return new Date(iso).toLocaleTimeString('en-US', { timeZone: ZONE, hour: 'numeric', minute: '2-digit' });
-}
-
-function deferred<T>(): { readonly promise: Promise<T>; readonly resolve: (value: T) => void } {
-  let resolve!: (value: T) => void;
-  const promise = new Promise<T>((settle) => {
-    resolve = settle;
-  });
-  return { promise, resolve };
 }
 
 /** A note for main that wakes nothing, as the host writes one. */
@@ -208,6 +193,8 @@ describe('the daily sync', () => {
     { scheduledFrom: '2026-10-11T10:00:00.000Z', runAt: '2026-10-12T03:30:00.000Z', startsWeek: false },
     // Monday's occurrence remains Monday's, even when the host runs it after midnight.
     { scheduledFrom: MONDAY_6AM, runAt: '2026-10-13T04:30:00.000Z', startsWeek: true },
+    // Sunday afternoon: Monday's occurrence is pending but not due, so a call now starts nothing.
+    { scheduledFrom: '2026-10-11T18:00:00.000Z', runAt: '2026-10-11T18:00:00.000Z', startsWeek: false },
   ])(
     'uses the occurrence in the principal zone for the week cue: $runAt',
     async ({ scheduledFrom, runAt, startsWeek }) => {
@@ -251,7 +238,9 @@ describe('the daily sync', () => {
     { changed: 'prompt', runAt: MONDAY_6AM },
     { changed: 'prompt', runAt: '2026-10-12T15:00:00.000Z' },
     { changed: 'script', runAt: MONDAY_6AM },
-  ])('replaces a changed $changed on one pass at $runAt without losing today', async ({ changed, runAt }) => {
+    // The host was down across midnight: yesterday's occurrence never ran, and still runs now.
+    { changed: 'prompt', runAt: '2026-10-13T12:30:00.000Z' },
+  ])('replaces a changed $changed on one pass at $runAt without losing its run', async ({ changed, runAt }) => {
     await keepMattersOnTime();
     const [release] = await syncs();
     const content = taskContent(release);
@@ -282,7 +271,7 @@ describe('the daily sync', () => {
   });
 
   it.each(['completed', 'script-skip:error'] as const)(
-    'upgrades an old release after %s before rearming without a second recurring clock',
+    'leaves an old release answered %s to the sweep, then upgrades its next occurrence without running today again',
     async (answer) => {
       const main = await mainSession();
       const old = await createScheduledTask(
@@ -298,16 +287,28 @@ describe('the daily sync', () => {
         { session: main },
       );
       vi.setSystemTime(new Date('2026-10-12T12:00:00.000Z'));
-      await answerOccurrence(main, old.row.id, answer);
+      // The runner answered, but the host has not read the answer yet, as just after a restart.
+      postAnswer(main, old.row.id, answer);
+      await keepMattersOnTime();
+      expect((await syncs()).map((row) => row.id)).toEqual([old.row.id]);
+      // Once read, the row is the sweep's to re-arm; the pass leaves it.
+      await withExistingMailboxSession(MAIN, main.id, (mailbox) =>
+        mailbox.applyProcessingAcks(mailbox.getTerminalProcessingAcks()),
+      );
+      await keepMattersOnTime();
+      expect(await syncs()).toEqual([]);
+      // The sweep re-arms the old release's clock, and the next pass replaces that successor.
+      await reconcileSession(main.id);
+      expect(taskRows(main).find((row) => row.id === old.row.id)).toMatchObject({
+        status: answer === 'completed' ? 'completed' : 'failed',
+        recurrence: null,
+      });
       await keepMattersOnTime();
       const [replacement] = await syncs();
       expect(await syncs()).toHaveLength(1);
       expect(taskContent(replacement).prompt).not.toBe('An older release prompt.');
       expect(replacement.process_after).toBe('2026-10-13T11:00:00.000Z');
-      expect(taskRows(main).find((row) => row.id === old.row.id)).toMatchObject({
-        status: answer === 'completed' ? 'completed' : 'failed',
-        recurrence: null,
-      });
+      expect(taskRows(main).filter((row) => row.recurrence !== null)).toEqual([replacement]);
       await reconcileSession(main.id);
       await keepMattersOnTime();
       expect(await syncs()).toEqual([replacement]);
@@ -333,8 +334,11 @@ describe('the daily sync', () => {
     await keepMattersOnTime();
     expect((await syncs()).map((row) => row.id)).toEqual([old.row.id]);
     expect(taskContent((await syncs())[0]).prompt).toBe('An older release prompt.');
-    await answerOccurrence(main, old.row.id, 'completed');
+    postAnswer(main, old.row.id, 'completed');
     vi.mocked(isContainerRunning).mockReturnValue(false);
+    await keepMattersOnTime();
+    expect((await syncs()).map((row) => row.id)).toEqual([old.row.id]);
+    await reconcileSession(main.id);
     await keepMattersOnTime();
     const [next] = await syncs();
     expect(await syncs()).toHaveLength(1);
@@ -342,84 +346,6 @@ describe('the daily sync', () => {
     expect(taskContent(next).prompt).not.toBe('An older release prompt.');
     await reconcileSession(main.id);
     expect(await syncs()).toEqual([next]);
-  });
-
-  it.each([
-    { winner: 'upgrade', answer: 'completed' },
-    { winner: 'sweep', answer: 'completed' },
-    { winner: 'upgrade', answer: 'script-skip:error' },
-    { winner: 'sweep', answer: 'script-skip:error' },
-  ] as const)('keeps one current sync when $winner claims a $answer occurrence first', async ({ winner, answer }) => {
-    const main = await mainSession();
-    const old = await createScheduledTask(
-      MAIN,
-      prepareScheduledTask({
-        name: 'gws-ea daily sync',
-        prompt: 'An older release prompt.',
-        script: 'ncl matters sync',
-        recurrence: '0 7 * * *',
-        processAfter: '2026-10-12T07:00',
-        timezone: ZONE,
-      }),
-      { session: main },
-    );
-    vi.setSystemTime(new Date('2026-10-12T12:00:00.000Z'));
-    await answerOccurrence(main, old.row.id, answer);
-
-    // The sweep has its completed-row snapshot, but is awaiting the timezone.
-    const snapshotTaken = deferred<void>();
-    const timezone = deferred<string>();
-    vi.spyOn(containerConfig, 'resolveGroupTimezone').mockImplementationOnce(() => {
-      snapshotTaken.resolve();
-      return timezone.promise;
-    });
-    const sweeping = withExistingMailboxSession(MAIN, main.id, (mailbox) => handleRecurrence(mailbox, main));
-    await snapshotTaken.promise;
-
-    if (winner === 'sweep') {
-      // Let keepSync read the same old row, then finish the sweep before that
-      // read returns. This uses separate real mailbox handles, as the host does.
-      const store = getAgentMailbox();
-      const session = store.session.bind(store);
-      const afterRead: AgentMailbox['session'] = <T>(
-        key: MailboxSessionKey,
-        action: (mailbox: MailboxSession) => T | Promise<T>,
-      ): Promise<T> =>
-        session(key, async (mailbox) => {
-          const find = mailbox.findTaskBySeriesSlug;
-          let readOldSync = false;
-          mailbox.findTaskBySeriesSlug = (slug) => {
-            const task = find(slug);
-            readOldSync ||= task?.id === old.row.id;
-            return task;
-          };
-          const result = await action(mailbox);
-          if (readOldSync) {
-            timezone.resolve(ZONE);
-            await sweeping;
-          }
-          return result;
-        });
-      vi.spyOn(store, 'session').mockImplementation(afterRead);
-    }
-
-    await keepMattersOnTime();
-    timezone.resolve(ZONE);
-    await sweeping;
-
-    const armed = taskRows(main).filter((row) => row.recurrence !== null);
-    expect(armed).toHaveLength(1);
-    expect(await syncs()).toEqual(armed);
-    expect(armed[0]).toMatchObject({
-      status: 'pending',
-      recurrence: '0 7 * * *',
-      process_after: '2026-10-13T11:00:00.000Z',
-    });
-    expect(taskContent(armed[0]).prompt).toContain('look closely at the next few days');
-    expect(taskContent(armed[0]).script).toBe('ncl matters sync');
-    await reconcileSession(main.id);
-    await keepMattersOnTime();
-    expect(await syncs()).toEqual(armed);
   });
 
   it('does not count a stale system tool reply as an unread note', async () => {

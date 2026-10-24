@@ -118,6 +118,18 @@ export async function answerOccurrence(
   rowId: string,
   answer: 'completed' | 'script-skip:error',
 ): Promise<void> {
+  postAnswer(session, rowId, answer);
+  await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) =>
+    mailbox.applyProcessingAcks(mailbox.getTerminalProcessingAcks()),
+  );
+}
+
+/**
+ * The container's answer alone: the occurrence's time comes and the runner
+ * posts its terminal ack, which the host has not read yet, as just after a
+ * restart. SQLite's `now` is the real clock, so the time moves to just past.
+ */
+export function postAnswer(session: Session, rowId: string, answer: 'completed' | 'script-skip:error'): void {
   withDb(inboundDbPath(session.agent_group_id, session.id), (db) =>
     db
       .prepare('UPDATE messages_in SET process_after = ? WHERE id = ?')
@@ -127,9 +139,6 @@ export async function answerOccurrence(
     db
       .prepare('INSERT INTO processing_ack (message_id, status, status_changed) VALUES (?, ?, ?)')
       .run(rowId, answer, new Date().toISOString()),
-  );
-  await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) =>
-    mailbox.applyProcessingAcks(mailbox.getTerminalProcessingAcks()),
   );
 }
 

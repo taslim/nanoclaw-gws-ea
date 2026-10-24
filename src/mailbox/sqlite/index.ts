@@ -303,15 +303,10 @@ export function wrapSqliteInbound(db: Database.Database, nextSequence = () => ne
     getMostRecentPeerSourceSessionId: (peerAgentGroupId) => getMostRecentPeerSourceSessionId(db, peerAgentGroupId),
     insertTask: async (task) => insertTaskRow(db, task, nextSequence()),
     armNextTask: async (originalId, task) => {
-      return db.transaction(() => {
-        const claimed = db
-          .prepare(
-            "UPDATE messages_in SET recurrence = NULL WHERE id = ? AND kind = 'task' AND status IN ('completed', 'failed') AND recurrence IS NOT NULL",
-          )
-          .run(originalId).changes;
-        if (claimed === 0) return false;
-        insertTaskRow(db, task, nextSequence());
-        return true;
+      const sequence = nextSequence();
+      db.transaction(() => {
+        insertTaskRow(db, task, sequence);
+        clearRecurrence(db, originalId);
       })();
     },
     cancelTask: (taskId) => (taskId === undefined ? cancelAllTasks(db) : cancelTask(db, taskId)),
