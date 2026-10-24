@@ -3,7 +3,12 @@ import path from 'node:path';
 import { defaultEmojiResolver } from 'chat';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { getGroupCapabilities } from '../../capabilities.js';
+import {
+  getGroupCapabilities,
+  parseStoredCapabilities,
+  registerCapability,
+  resolveCapabilities,
+} from '../../capabilities.js';
 import { parseSkillSelection } from '../../container-config.js';
 import { syncSkillSymlinks } from '../../container-runner.js';
 import { dispatch } from '../../cli/dispatch.js';
@@ -13,7 +18,7 @@ import { closeDb, createAgentGroup, getDb, initTestDb, runMigrations } from '../
 import { getHostStartCallbacks } from '../../host-lifecycle.js';
 import { composeGroupProjectDoc } from '../../project-doc-compose.js';
 import { getRequiredProjectDocSections } from '../../project-doc-sections.js';
-import { unknownToolNames } from '../../test-utils/runner-tools.js';
+import { runnerToolCapabilities, unknownToolNames } from '../../test-utils/runner-tools.js';
 import type { AgentGroup } from '../../types.js';
 import { reconcileGwsEaProfile } from '../gws-ea-profile/db.js';
 import { ARTIFACTS_POLICY_FILE_ENV, type ArtifactsPolicyFile } from '../gws-ea-artifacts/policy.js';
@@ -352,6 +357,92 @@ describe("GWS-EA's guidance for main", () => {
   });
 });
 
+describe("main's capabilities", () => {
+  it('stores every default-on capability except agent creation and self-modification, keeping shell and interactive', async () => {
+    const main = group('ag-main');
+    await createGroup(main);
+    const expected = resolveCapabilities('all', main.id).filter((key) => key !== 'agents' && key !== 'self-mod');
+
+    const response = await dispatch(
+      { id: 'main-capabilities', command: 'gws-ea-main-reconcile', args: { 'agent-group-id': main.id } },
+      { caller: 'host' },
+    );
+    const stored = parseStoredCapabilities((await getContainerConfig(main.id))?.capabilities, main.id);
+
+    expect(response).toMatchObject({ ok: true, data: { agent_group_id: main.id, capabilities: expected } });
+    expect(stored).toEqual(expected);
+    const held = await getGroupCapabilities(main.id);
+    expect(held.has('shell')).toBe(true);
+    expect(held.has('interactive')).toBe(true);
+    // Read the runner's registrations: removing a document must also remove these tools.
+    const tools = runnerToolCapabilities();
+    for (const name of ['create_agent', 'install_packages', 'add_mcp_server']) {
+      const keys = tools.get(name);
+      expect(keys?.size, name).toBeGreaterThan(0);
+      expect(
+        [...(keys ?? [])].some((key) => held.has(key)),
+        name,
+      ).toBe(false);
+    }
+  });
+
+  it('picks up a newly registered default-on key on the next reconcile, without keeping a manual selection', async () => {
+    const main = group('ag-main');
+    await createGroup(main);
+    await dispatch(
+      { id: 'main-before-release', command: 'gws-ea-main-reconcile', args: { 'agent-group-id': main.id } },
+      { caller: 'host' },
+    );
+    registerCapability('main-fixture-new-default', { description: 'new release default', default: 'on' });
+    registerCapability('main-fixture-optional', { description: 'new optional capability', default: 'off' });
+    await updateContainerConfigJson(main.id, 'capabilities', ['reply', 'agents', 'self-mod', 'main-fixture-optional']);
+
+    const response = await dispatch(
+      { id: 'main-next-release', command: 'gws-ea-main-reconcile', args: { 'agent-group-id': main.id } },
+      { caller: 'host' },
+    );
+    const held = await getGroupCapabilities(main.id);
+
+    expect(response.ok).toBe(true);
+    expect([...held]).toEqual(
+      resolveCapabilities('all', main.id).filter((key) => key !== 'agents' && key !== 'self-mod'),
+    );
+    expect(held.has('main-fixture-new-default')).toBe(true);
+    expect(held.has('main-fixture-optional')).toBe(false);
+  });
+
+  it('withholds generic teaching only from canonical main while retaining its shell tools and interactive teaching', async () => {
+    const main = group('ag-canonical', 'Assistant');
+    const peer = group('ag-peer', 'main');
+    await createGroup(main);
+    await createGroup(peer);
+    await publishMain(main);
+    await dispatch(
+      { id: 'main-capabilities', command: 'gws-ea-main-reconcile', args: { 'agent-group-id': main.id } },
+      { caller: 'host' },
+    );
+    await updateContainerConfigJson(peer.id, 'capabilities', ['shell']);
+
+    const documentOf = async (value: AgentGroup): Promise<string> => {
+      const directory = path.join(TEST_ROOT, value.folder);
+      await composeGroupProjectDoc(value, directory, { fileName: 'CLAUDE.md' });
+      return fs.readFileSync(path.join(directory, 'CLAUDE.md'), 'utf8');
+    };
+    const document = await documentOf(main);
+    const peerDocument = await documentOf(peer);
+    const modules = [...document.matchAll(/^# NanoClaw Module: (.+)$/gmu)].map(([, name]) => name);
+
+    for (const module of ['agents', 'self-mod', 'cli', 'scheduling', 'connect']) {
+      expect(modules, module).not.toContain(module);
+    }
+    expect(document).toContain('# NanoClaw Module: interactive\n');
+    expect((await getGroupCapabilities(main.id)).has('shell')).toBe(true);
+    for (const module of ['cli', 'scheduling', 'connect']) {
+      expect(peerDocument, module).toContain(`# NanoClaw Module: ${module}\n`);
+    }
+  });
+});
+
 describe("main's skills", () => {
   it("sets main's skills to the release's list through a hidden host-only command", async () => {
     const main = group('ag-main');
@@ -459,7 +550,7 @@ describe("main's skills", () => {
     expect(flag).toMatchObject({ ok: false });
   });
 
-  it("rewrites no group's skills when the host starts, main's included", async () => {
+  it("rewrites no group's skills or capabilities when the host starts, main's included", async () => {
     const main = group('ag-main');
     const research = group('ag-research', 'research');
     await createGroup(main);
@@ -467,11 +558,17 @@ describe("main's skills", () => {
     await publishMain(main);
     // As an operator, or a release before this one, left it.
     await updateContainerConfigJson(main.id, 'skills', ['agent-browser']);
+    await updateContainerConfigJson(main.id, 'capabilities', ['reply', 'agents']);
 
     await startHost();
 
     expect(await skillsOf(main.id)).toEqual(['agent-browser']);
     expect(await skillsOf(research.id)).toBe('all');
+    expect(parseStoredCapabilities((await getContainerConfig(main.id))?.capabilities, main.id)).toEqual([
+      'reply',
+      'agents',
+    ]);
+    expect(parseStoredCapabilities((await getContainerConfig(research.id))?.capabilities, research.id)).toBe('all');
   });
 
   it('starts cleanly before any main exists', async () => {
