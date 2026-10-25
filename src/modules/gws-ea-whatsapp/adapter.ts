@@ -107,9 +107,9 @@ export interface WhatsAppAdapter extends ChannelAdapter {
 }
 const logger = pino({ level: 'silent' });
 /**
- * How long a new socket may take to announce it is ready to pair; it is usually a
- * second or two. It ends well inside the 30-second link timeouts of main's tool and
- * the operator command, after the version lookup's own bounded wait.
+ * How long a new socket may take to announce it can pair. Added to the version
+ * lookup's own bounded wait, a link still answers inside the 30-second timeouts
+ * of main's tool and the operator command.
  */
 const PAIRING_READY_MS = 15_000;
 
@@ -130,7 +130,7 @@ function pairingAnnounced(current: WhatsAppSocket): Promise<void> {
     };
     current.ev.on('connection.update', settle);
   });
-  // Only a pairing request awaits this; a socket that reconnects an existing account never announces a QR.
+  // Nothing awaits this unless a pairing is requested, so a close must not surface as an unhandled rejection.
   announced.catch(() => undefined);
   return announced;
 }
@@ -156,7 +156,6 @@ export function createWhatsAppAdapter(options: WhatsAppAdapterOptions): WhatsApp
   const index = new WhatsAppIndex(options.directory, indexAccount);
   const state = new SqliteStateAdapter('gws-ea-whatsapp');
   let socket: WhatsAppSocket | undefined;
-  /** The current socket's announcement that it can pair. */
   let pairable: { readonly socket: WhatsAppSocket; readonly announced: Promise<void> } | undefined;
   let connected = false;
   let stopped = false;

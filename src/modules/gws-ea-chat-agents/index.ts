@@ -90,8 +90,9 @@ export async function resumeRetiringJobAgents(): Promise<void> {
   }
 }
 
-// Like external-email, the chat agents need only the profile: a new assistant's
-// host starts before its main is published, and publication names them.
+// As with external-email, creating the chat agents needs no published main: a new
+// assistant's host starts before main exists, and publishing main names them.
+// Chat admission waits for the bound principal separately (`decideJoin`).
 onHostStart(async () => {
   if (!(await getDb().hasTable('gws_ea_profile'))) return;
   await reconcileChatAgents();
