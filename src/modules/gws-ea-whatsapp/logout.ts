@@ -2,7 +2,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import {
-  Browsers,
   DisconnectReason,
   jidNormalizedUser,
   makeWASocket,
@@ -14,7 +13,7 @@ import { pino } from 'pino';
 import { isRecord } from '../../gws-ea/validation.js';
 import { WhatsAppAuthStore } from './auth-store.js';
 import { readWhatsAppLink } from './paths.js';
-import { resolveWaWebVersion } from './socket.js';
+import { resolveWaWebVersion, WHATSAPP_BROWSER } from './socket.js';
 
 const LOGOUT_TIMEOUT_MS = 30_000;
 type LogoutSocket = Pick<WASocket, 'logout' | 'end'> & { readonly ev: BaileysEventEmitter };
@@ -63,7 +62,7 @@ export async function logoutWhatsAppAccount(options: WhatsAppLogoutOptions): Pro
         version,
         auth: auth.state,
         logger: pino({ level: 'silent' }),
-        browser: Browsers.macOS('Desktop'),
+        browser: WHATSAPP_BROWSER,
         markOnlineOnConnect: false,
         syncFullHistory: false,
         shouldSyncHistoryMessage: () => false,

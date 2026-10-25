@@ -1,4 +1,7 @@
-import { fetchLatestWaWebVersion } from '@whiskeysockets/baileys';
+import { Browsers, fetchLatestWaWebVersion } from '@whiskeysockets/baileys';
+
+/** WhatsApp answers a phone-number pairing request from the desktop-app identity with bad-request, so the phone reports it couldn't link. */
+export const WHATSAPP_BROWSER = Browsers.macOS('Chrome');
 
 /** Refuse Baileys' baked-in fallback: it is returned with isLatest=false/error when the lookup fails. */
 export async function resolveWaWebVersion(): Promise<[number, number, number]> {
