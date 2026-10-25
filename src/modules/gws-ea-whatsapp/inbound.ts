@@ -105,9 +105,12 @@ export function createWhatsAppInbound(options: WhatsAppInboundOptions) {
       raw,
     );
     if (!isGroup && person) options.onDirectMessage(person, at);
+    const self = [socket.user?.id, socket.user?.lid]
+      .filter((jid): jid is string => typeof jid === 'string')
+      .map(normalizedJid);
     for (const mention of context?.mentionedJid ?? []) {
       const jid = normalizedJid(mention);
-      const name = options.index.name(jid);
+      const name = self.includes(jid) ? socket.user?.name : options.index.name(jid);
       if (name) text = text.replaceAll(`@${jid.split('@')[0]}`, `@${name}`);
     }
     const quotedId = context?.stanzaId || undefined;
@@ -146,9 +149,6 @@ export function createWhatsAppInbound(options: WhatsAppInboundOptions) {
           }
         : {}),
     };
-    const self = [socket.user?.id, socket.user?.lid]
-      .filter((jid): jid is string => typeof jid === 'string')
-      .map(normalizedJid);
     const mentioned = (context?.mentionedJid ?? []).some((jid) => self.includes(normalizedJid(jid)));
     const inbound: InboundMessage = {
       id,

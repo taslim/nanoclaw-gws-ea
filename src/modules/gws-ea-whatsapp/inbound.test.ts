@@ -172,7 +172,7 @@ describe('durable WhatsApp inbound and trusted context', () => {
     expect(h.content()[0].replyTo).toEqual({ id: 'never-stored' });
     expect(h.messages()[0].isMention).toBe(false);
   });
-  it('renders known mention pills as names and recognizes either assistant address', async () => {
+  it("renders known mention pills as names, the assistant's own as its name, and recognizes either assistant address", async () => {
     await h.start();
     await h.socket().emit('contacts.upsert', [{ id: '14000@lid', name: 'Maya' }]);
     await h.socket().emit('messages.upsert', {
@@ -188,7 +188,7 @@ describe('durable WhatsApp inbound and trusted context', () => {
         }),
       ],
     });
-    expect(h.content()[0].text).toBe('@Maya and @999000 hello');
+    expect(h.content()[0].text).toBe('@Maya and @Assistant hello');
     expect(h.messages()[0].isMention).toBe(true);
   });
   it('emits reactions on own sends with the native target shape and no written text', async () => {
