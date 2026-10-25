@@ -20,6 +20,8 @@ export interface WhatsAppContent {
   readonly isGroup: boolean;
   readonly fromMe: boolean;
   readonly forwarded: boolean;
+  /** Member keys, with `you` for the assistant. */
+  readonly mentions?: readonly string[];
   readonly attachments?: readonly WhatsAppAttachment[];
   readonly replyTo?: { readonly id: string; readonly text?: string; readonly sender?: string };
   readonly reaction?: {
@@ -108,9 +110,15 @@ export function createWhatsAppInbound(options: WhatsAppInboundOptions) {
     const self = [socket.user?.id, socket.user?.lid]
       .filter((jid): jid is string => typeof jid === 'string')
       .map(normalizedJid);
+    // Names make the text readable; the keys say for certain who each mention is.
+    const mentions = new Set<string>();
     for (const mention of context?.mentionedJid ?? []) {
       const jid = normalizedJid(mention);
-      const name = self.includes(jid) ? socket.user?.name : options.index.name(jid);
+      const own = self.includes(jid);
+      const mentioned = own ? undefined : await resolvePerson(socket, options.index, jid);
+      if (own) mentions.add('you');
+      else if (mentioned) mentions.add(`whatsapp:${mentioned.lid}`);
+      const name = own ? socket.user?.name : options.index.name(jid);
       if (name) text = text.replaceAll(`@${jid.split('@')[0]}`, `@${name}`);
     }
     const quotedId = context?.stanzaId || undefined;
@@ -132,6 +140,7 @@ export function createWhatsAppInbound(options: WhatsAppInboundOptions) {
       isGroup,
       fromMe: false,
       forwarded,
+      ...(mentions.size ? { mentions: [...mentions] } : {}),
       ...(attachments.length ? { attachments } : {}),
       ...(quotedId
         ? { replyTo: { id: quotedId, ...(quoted ? { text: quoted.text, sender: quoted.sender } : {}) } }

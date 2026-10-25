@@ -907,6 +907,16 @@ describe('recorded divergence: prepared module engagement and destination-free c
   });
 });
 
+describe('recorded divergence: a chat message names who spoke and whom they mentioned by platform key', () => {
+  it("renders the adapter's sender and mention keys as attributes, outside the member-written text", async () => {
+    const formatter = await readFile(path.join(originalCwd, 'container/agent-runner/src/formatter.ts'), 'utf8');
+    expect(formatter).toContain(
+      "const identityAttrs = msg.channel_type === 'agent' ? '' : formatIdentityAttrs(msg, content);",
+    );
+    expect(formatter).toContain('(senderId ? ` sender_id="${escapeXml(senderId)}"` : \'\')');
+    expect(formatter).toContain(`(mentions.length > 0 ? \` mentions="\${escapeXml(mentions.join(','))}"\` : '')`);
+  });
+});
 describe('recorded divergence: a module can hold an inbound message until it releases or settles it', () => {
   it('can release held chat context without making ambient messages wake the assistant', async () => {
     await freshInstall();

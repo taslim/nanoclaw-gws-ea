@@ -19,6 +19,7 @@ it('gives the chat only verified levels, framed source names, principal presence
   const { chat, session, matter } = await seedContext();
   const text = await renderChatContext(chat.messaging_group_id);
   expect(text).toContain('Member whatsapp:22; verified principal: false; level: close.');
+  expect(text).toContain("A message's sender_id and mentions name these member keys; `you` is you.");
   for (const privateField of ['Private person name', 'Private reason', 'Private matter title', 'whatsapp:22 is'])
     expect(text).not.toContain(privateField);
   expect(text).toContain('Principal present: true.');

@@ -329,9 +329,26 @@ function formatSingleChat(msg: MessageInRow): string {
 
   const fromAttr = originAttr(msg);
   const threadAttr = msg.channel_type === 'agent' && msg.thread_id ? ` thread="${escapeXml(msg.thread_id)}"` : '';
+  const identityAttrs = msg.channel_type === 'agent' ? '' : formatIdentityAttrs(msg, content);
 
   const principalMark = msg.channel_type === 'agent' ? '' : formatPrincipalMark(content.principalMessage);
-  return `${principalMark}<message${idAttr}${fromAttr}${threadAttr} sender="${escapeXml(sender)}" time="${escapeXml(time)}"${replyAttr}>${replyPrefix}${escapeXml(text)}${linksSuffix}${attachmentsSuffix}${appContextSuffix}</message>`;
+  return `${principalMark}<message${idAttr}${fromAttr}${threadAttr} sender="${escapeXml(sender)}"${identityAttrs} time="${escapeXml(time)}"${replyAttr}>${replyPrefix}${escapeXml(text)}${linksSuffix}${attachmentsSuffix}${appContextSuffix}</message>`;
+}
+
+/**
+ * Names in the text are for reading; these platform keys, written by the adapter and never by a member, say
+ * exactly who spoke and whom they mentioned (`you` is the agent).
+ */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function formatIdentityAttrs(msg: MessageInRow, content: any): string {
+  const senderId = extractSenderId(msg, content);
+  const mentions = Array.isArray(content.mentions)
+    ? content.mentions.filter((key: unknown): key is string => typeof key === 'string' && key.length > 0)
+    : [];
+  return (
+    (senderId ? ` sender_id="${escapeXml(senderId)}"` : '') +
+    (mentions.length > 0 ? ` mentions="${escapeXml(mentions.join(','))}"` : '')
+  );
 }
 
 function formatPrincipalMark(value: unknown): string {

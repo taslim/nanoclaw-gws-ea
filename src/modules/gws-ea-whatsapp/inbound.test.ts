@@ -189,6 +189,7 @@ describe('durable WhatsApp inbound and trusted context', () => {
       ],
     });
     expect(h.content()[0].text).toBe('@Maya and @Assistant hello');
+    expect(h.content()[0].mentions).toEqual(['whatsapp:14000', 'you']);
     expect(h.messages()[0].isMention).toBe(true);
   });
   it('emits reactions on own sends with the native target shape and no written text', async () => {
