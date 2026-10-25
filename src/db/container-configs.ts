@@ -116,7 +116,7 @@ export async function updateContainerConfigScalars(
   await getDb().run(`UPDATE container_configs SET ${fields.join(', ')} WHERE agent_group_id = @agent_group_id`, values);
 }
 
-/** Overwrite a JSON column wholesale. Used for skills, mcp_servers, packages_*, additional_mounts, capabilities. */
+/** Overwrite a JSON column wholesale. */
 export async function updateContainerConfigJson(
   agentGroupId: string,
   column: 'skills' | 'mcp_servers' | 'packages_apt' | 'packages_npm' | 'additional_mounts' | 'capabilities',

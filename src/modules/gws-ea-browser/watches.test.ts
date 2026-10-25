@@ -134,7 +134,7 @@ async function executionContext(name: string) {
   });
 }
 
-/** An armed watch of the job: a reader watch on `watched`, a site, or a region watch (KTD20) with those bounds. */
+/** An armed watch of the job: a reader watch on `watched`, a site, or a region watch with those bounds. */
 async function seedWatch(id: string, watched: string | WatchBounds = 'resy.com'): Promise<void> {
   const at = '2026-10-15T12:00:00.000Z';
   const region = typeof watched === 'string' ? undefined : watched;
@@ -574,7 +574,7 @@ describe('native watch bounds and one booking claim', () => {
         "SELECT * FROM pending_approvals WHERE action='browser_watch_setup'",
       )
     )[0];
-    // The card names the errand in the principal's words, never its internal thread (KTD18).
+    // The card names the errand in the principal's words, never its internal thread.
     expect(approval.question.endsWith(`\n\n${ERRAND_ORIGIN_LINE}`)).toBe(true);
     expect(approval.question).not.toContain(jobId);
     await handleApprovalsResponse({
@@ -799,7 +799,7 @@ const free = {
   until: bounds.until,
 };
 
-describe('a paid reader watch reads the venue’s terms itself (KTD12)', () => {
+describe('a paid reader watch reads the venue’s terms itself', () => {
   const NO_SHOW = 'No-show fee: $25 per guest, charged if you miss your reservation.';
   /** A watch on Resy's Bistro for four, whose policy the host reads as `policy`, under the browser's own `financial`. */
   async function watchBistro(
@@ -1054,7 +1054,7 @@ describe('venue release schedules and card times', () => {
   });
 });
 
-describe('watches on sites with no reader (KTD20)', () => {
+describe('watches on sites with no reader', () => {
   const regionBounds: WatchBounds = {
     kind: 'region',
     site: 'larder.example',

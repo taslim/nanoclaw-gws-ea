@@ -1,8 +1,7 @@
 /**
- * gws-ea's version pin: the OneCLI gateway. It lives in
- * `src/gws-ea/versions.json`, outside the upstream-owned root
- * `versions.json`. A release carries its own copy, from which release
- * preflight reads the gateway its receipt records.
+ * gws-ea's pins live in `src/gws-ea/versions.json`, outside the upstream-owned
+ * root `versions.json`. Each release carries its own copy, which release
+ * preflight reads.
  */
 import { createRequire } from 'node:module';
 
@@ -17,7 +16,6 @@ export interface GwsEaPins {
   readonly onecliGateway: string;
 }
 
-/** What each pin is called where an operator reads it. */
 export const PIN_NAMES: Readonly<Record<keyof GwsEaPins, string>> = {
   onecliGateway: 'OneCLI gateway',
 };
@@ -39,7 +37,6 @@ export function parsePins(value: unknown, label = 'gws-ea versions.json'): GwsEa
 export const LAUNCHER_PINS = parsePins(launcherPins);
 export const ONECLI_GATEWAY_VERSION = LAUNCHER_PINS.onecliGateway;
 
-/** The OneCLI SDK is pinned by the checkout's own package.json. */
 const packageManifest: unknown = createRequire(import.meta.url)('../../package.json');
 export const ONECLI_SDK_VERSION = exactVersion(
   requireRecord(

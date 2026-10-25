@@ -1,4 +1,4 @@
-/** Native transport facts used by the link and chat owners, before ordinary routing. */
+/** Host modules' hooks into WhatsApp transport events; message observers run before ordinary routing. */
 import type { BaileysEventMap, WAMessage } from '@whiskeysockets/baileys';
 
 import type { InboundMessage } from '../../channels/adapter.js';
@@ -27,7 +27,7 @@ export interface WhatsAppLinkNotice {
 export interface WhatsAppObserver {
   readonly onLinkNotice?: (notice: WhatsAppLinkNotice) => Promise<boolean>;
   readonly onMembership?: (event: WhatsAppMembershipEvent) => Promise<void>;
-  /** A binding message may be consumed; only a completed effect may return consume. */
+  /** Return `consume` only once the effect is complete: a consumed message is marked routed and never replayed. */
   readonly onMessage?: (received: WhatsAppReceived) => Promise<'consume' | 'hold' | 'route'>;
   readonly onConnectionUpdate?: (event: {
     readonly update: BaileysEventMap['connection.update'];
@@ -64,7 +64,7 @@ export async function observeWhatsAppMembership(event: WhatsAppMembershipEvent):
   for (const observer of observers) await observer.onMembership?.(event);
 }
 
-/** True once at least one registered notice owner accepted the durable event; failures remain pending. */
+/** True when any observer accepted the notice, so the caller may mark it delivered. */
 export async function observeWhatsAppLinkNotice(notice: WhatsAppLinkNotice): Promise<boolean> {
   let accepted = false;
   for (const observer of observers) if (observer.onLinkNotice && (await observer.onLinkNotice(notice))) accepted = true;

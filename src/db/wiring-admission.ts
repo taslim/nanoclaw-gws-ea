@@ -11,7 +11,7 @@ export type WiringAdmissionPolicy = (input: WiringAdmissionInput) => void | Prom
 const policies = new Map<string, WiringAdmissionPolicy>();
 const POLICY_ID = /^[a-z0-9][a-z0-9._-]*:[a-z0-9][a-z0-9._-]*$/u;
 
-/** Register an invariant checked by every supported wiring mutation path. */
+/** An invariant every supported wiring mutation path checks. */
 export function registerWiringAdmissionPolicy(id: string, policy: WiringAdmissionPolicy): void {
   if (!POLICY_ID.test(id)) throw new Error(`Invalid wiring admission policy ID: ${id}`);
   if (policies.has(id)) throw new Error(`Wiring admission policy already registered: ${id}`);
@@ -23,7 +23,7 @@ export async function assertWiringAdmitted(input: WiringAdmissionInput): Promise
 }
 
 export interface DestinationAdmissionInput {
-  /** The `agent_destinations` row about to be written: by `ncl destinations add`, a wiring's companion row, or `create_agent`. */
+  /** The `agent_destinations` row `createDestination` is about to write. */
   readonly proposed: AgentDestination;
 }
 
@@ -46,8 +46,8 @@ export class DestinationRefusedError extends Error {
 const destinationPolicies = new Map<string, DestinationAdmissionPolicy>();
 
 /**
- * Register an invariant checked before every destination row is written.
- * A destination is an ACL grant: the row lets its owner send to its target.
+ * Checked by `createDestination` before it writes a row. A destination is an
+ * ACL grant: the row lets its owner send to its target.
  */
 export function registerDestinationAdmissionPolicy(id: string, policy: DestinationAdmissionPolicy): void {
   if (!POLICY_ID.test(id)) throw new Error(`Invalid destination admission policy ID: ${id}`);
@@ -55,7 +55,6 @@ export function registerDestinationAdmissionPolicy(id: string, policy: Destinati
   destinationPolicies.set(id, policy);
 }
 
-/** Why a registered policy refuses the destination, or undefined when every policy admits it. */
 export async function destinationRefusal(
   input: DestinationAdmissionInput,
 ): Promise<DestinationRefusedError | undefined> {

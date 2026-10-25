@@ -1,4 +1,4 @@
-/** The sealed browser agent's native, mailbox-backed host requests. */
+/** The sealed browser agent's host requests. */
 import { requestTool } from '../action-request.js';
 import { registerTools } from './server.js';
 

@@ -8,10 +8,9 @@
  * no session persistence, and the tool environment minus secret variables;
  * its reply is shown as untrusted text and nothing it suggests is executed.
  *
- * Upstream setup/lib/claude-assist.ts is deliberately not reused: though its
- * Claude is now limited to reading (Read, Grep, Glob), it reads unredacted
- * files wherever the user can, resumes sessions, and hands a suggested command
- * to setup/run-suggested.sh to run.
+ * Upstream setup/lib/claude-assist.ts is deliberately not reused: its read-only
+ * Claude still reads unredacted files wherever the user can, resumes sessions,
+ * and hands a suggested command to setup/run-suggested.sh to run.
  */
 import { mkdir, readFile } from 'node:fs/promises';
 import os from 'node:os';
@@ -33,7 +32,6 @@ import { redact } from '../src/gws-ea/redact.js';
 import { writePrivateTextFile } from '../src/gws-ea/secrets.js';
 import { GwsEaError } from '../src/gws-ea/types.js';
 
-/** `-p` with no tools, an empty strict MCP configuration, and nothing saved to resume. */
 const CLAUDE_DIAGNOSIS_ARGS = [
   '-p',
   '--output-format',
@@ -50,7 +48,7 @@ const CLAUDE_DIAGNOSIS_ARGS = [
 const DIAGNOSIS_TIMEOUT_MS = 3 * 60 * 1000;
 const MAX_REPLY_CHARACTERS = 4000;
 
-/** The fixed gws-ea sources sent for each step; Claude cannot read anything else. */
+/** Sent per step; with no tools, Claude sees nothing beyond these and the run's logs. */
 const STEP_SOURCES: Readonly<Record<string, readonly string[]>> = {
   secrets: ['src/gws-ea/create-input.ts'],
   prerequisites: [
@@ -129,7 +127,6 @@ async function writeBundleFile(directory: string, name: string, contents: string
   await writePrivateTextFile(file, contents);
 }
 
-/** Stage the redacted bundle in a private directory beside the run's logs. */
 async function stageBundle(
   report: FailureReport,
 ): Promise<{ readonly directory: string; readonly files: readonly BundleFile[] }> {
@@ -185,10 +182,8 @@ function prompt(report: FailureReport, files: readonly BundleFile[]): string {
 }
 
 /**
- * Strip terminal escape sequences, control characters, and invisible format
- * characters (bidi overrides and isolates, zero-width characters) from
- * untrusted text, so a shown command reads as its bytes. Format characters go
- * first, so one cannot split an escape sequence and leave its tail behind.
+ * Strips escape sequences, control characters and invisible format characters (bidi, zero-width) so a shown
+ * command reads as its bytes. Format characters go first so one cannot split an escape sequence and leave its tail.
  */
 function sanitize(text: string): string {
   return text
@@ -204,10 +199,7 @@ function diagnosisEnvironment(ambient: NodeJS.ProcessEnv): Record<string, string
   return Object.fromEntries(Object.entries(environment).filter(([key]) => !isSecretEnvironmentKey(key)));
 }
 
-/**
- * Offer diagnosis of a failure; the driver wires this only on a TTY. Omitted
- * without `claude`; sends nothing without consent; never executes a suggestion.
- */
+/** Prompts, so the driver wires it only when a person is at a TTY. */
 export async function offerDiagnosis(
   report: FailureReport,
   dependencies: DiagnosisDependencies = {},

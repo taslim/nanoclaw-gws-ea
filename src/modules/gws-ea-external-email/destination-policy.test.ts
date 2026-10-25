@@ -1,7 +1,7 @@
 /**
- * KTD5's destination admission, pinned to the email groups the host created
- * (KTD1): no raw destination joins main and external-email, external-email
- * addresses nothing but its inbox, only main addresses the principal's email
+ * Destination admission, pinned to the email groups the host created: no raw
+ * destination joins main and external-email, external-email addresses
+ * nothing but its inbox, only main addresses the principal's email
  * conversation, and no other group addresses either, or any other email
  * conversation. Each write path refuses one, and status reports a row that
  * got in behind the check.

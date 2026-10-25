@@ -35,7 +35,7 @@ const LINK_HELPER = `function bindSources(){
 function choose(event){const anchor=event.target.closest?.('[data-artifact-source]');if(!anchor)return;if(event.type==='keydown'&&!['Enter',' '].includes(event.key))return;event.preventDefault();event.stopImmediatePropagation();parent.postMessage({type:'artifact-source',id:anchor.dataset.artifactSource},'*');}
 document.addEventListener('click',choose,true);document.addEventListener('keydown',choose,true);}
 bindSources();`;
-/** Sandbox for the child frame. A page without authored script may open its own ordinary links in a new tab. */
+/** A page without authored script may open its own ordinary links in a new tab. */
 function childSandbox(document: ArtifactDocument): string {
   return document.scripted ? 'allow-scripts' : 'allow-popups allow-popups-to-escape-sandbox';
 }

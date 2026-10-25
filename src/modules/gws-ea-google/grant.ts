@@ -1,31 +1,26 @@
 /**
- * The assistant's one Google sign-in (KTD2), shared by the control plane,
- * which writes it at setup, and the host, which refreshes it. The grant file
- * holds the OAuth client, each consent's refresh token with the scopes Google
- * granted it, and the account with its Google ID; it lives in the instance's
- * owner-only `secrets/` directory and never in a container.
+ * The assistant's one Google sign-in, shared by the control plane, which
+ * writes it at setup, and the host, which mints tokens from it. The grant
+ * file lives in the instance's owner-only `secrets/` directory and never in
+ * a container.
  */
 import { canonicalTimestamp, hasControlCharacters, isRecord } from '../../gws-ea/validation.js';
 
-/** What a Google service's access token is limited to. */
 export interface GoogleServiceScopes {
   readonly scopes: readonly string[];
 }
 
 /**
- * A Google service agents reach (KTD6): its capability decides which agent
- * groups are taught to use it, with its skill and gog's commands for it.
- * Its token reaches agents through the credential of the host it is served
- * on (`AGENT_GOOGLE_CREDENTIALS`).
+ * Its capability decides which agent groups are taught to use it, with its
+ * skill and gog's commands for it. Its token reaches agents through the
+ * credential of the host it is served on (`AGENT_GOOGLE_CREDENTIALS`).
  */
 export interface AgentGoogleService extends GoogleServiceScopes {
-  /** The capability key (src/capabilities.ts) that grants the service. */
   readonly capability: string;
-  /** The container skill (`container/skills/<skill>/`) that teaches agents to use it. */
+  /** Its directory under `container/skills/`. */
   readonly skill: string;
 }
 
-/** Drive, Docs, Sheets, Slides and Forms are one capability, taught by one skill. */
 const WORKSPACE = { capability: 'google-workspace', skill: 'gworkspace' } as const;
 
 export const AGENT_GOOGLE_SERVICES = {
@@ -61,17 +56,14 @@ export const AGENT_GOOGLE_SERVICES = {
 export type AgentGoogleServiceId = keyof typeof AGENT_GOOGLE_SERVICES;
 
 /**
- * One gateway credential the host publishes for agents (KTD1): a token
- * injected on exactly one host, since the gateway matches a credential by
- * exact host (`src/gateway-providers/credential-connection.ts`), carrying the
+ * One per host, since the gateway matches a credential by exact host
+ * (`src/gateway-providers/credential-connection.ts`); its token carries the
  * scopes of every service served there.
  */
 export interface AgentGoogleCredential {
-  /** The one host the gateway injects it on. */
   readonly host: string;
-  /** The gateway credential its access token is published as. */
   readonly secretName: string;
-  /** The services served on the host. The first is the one it keeps when Google refuses the rest. */
+  /** The first is the one it keeps when Google refuses the rest. */
   readonly services: readonly AgentGoogleServiceId[];
 }
 
@@ -91,10 +83,8 @@ export const AGENT_GOOGLE_CREDENTIALS: readonly AgentGoogleCredential[] = [
   { host: 'forms.googleapis.com', secretName: 'google-forms', services: ['forms'] },
 ];
 
-/** Every host where the gateway injects a Google token for agents. */
 export const AGENT_GOOGLE_HOSTS: readonly string[] = AGENT_GOOGLE_CREDENTIALS.map((credential) => credential.host);
 
-/** The credential serving `service`. */
 export function googleCredentialFor(service: AgentGoogleServiceId): AgentGoogleCredential {
   const credential = AGENT_GOOGLE_CREDENTIALS.find((candidate) => candidate.services.includes(service));
   if (!credential) throw new Error(`No Google credential serves ${service}`);
@@ -102,26 +92,20 @@ export function googleCredentialFor(service: AgentGoogleServiceId): AgentGoogleC
 }
 
 /**
- * Google services only the host uses (KTD6): their tokens are minted on
- * demand, held in host memory, and never become a gateway credential. Gmail's
- * modify scope reads and sends the assistant's own inbox. The host's Calendar
- * token, with the same scopes agents' Calendar token has, turns on the
- * principal's calendar notifications and runs the host's calendar actions.
- * The host's Drive token keeps the home folder, checks links, and enriches
- * activity notices; it has the scope agents' `www.googleapis.com` token
- * carries, so it keeps a token out of the gateway but is no privilege
- * boundary. The same holds for the host's directory token, which names the
- * people the assistant meets in Chat.
+ * Google services only the host uses: their tokens are minted on demand,
+ * held in host memory, and never become a gateway credential. Gmail's modify
+ * scope reads and sends the assistant's own inbox. The Calendar, Drive and
+ * directory services carry the same scopes as agents' tokens, so they keep a
+ * token out of the gateway but are no privilege boundary.
  *
- * Chat is the host's alone: it is how the assistant talks, as its own account,
- * so no agent holds a Chat scope. Its token carries the narrowest scopes
- * covering what the host does there: `chat.messages` sends, reads, and edits
- * messages, adds, lists, and removes reactions, uploads and downloads
- * attachments, and is the scope the Workspace Events subscription to message
- * and reaction events
- * rests on; `chat.spaces.readonly` reads a space and finds a DM;
- * `chat.spaces.create` opens one; membership scopes read the roster and let
- * the assistant leave a space as its own user.
+ * Chat is the host's alone: it is how the assistant talks, as its own
+ * account, so no agent holds a Chat scope. Its token carries the narrowest
+ * scopes covering what the host does there: `chat.messages` sends, reads,
+ * and edits messages, adds, lists, and removes reactions, uploads and
+ * downloads attachments, and is the scope the Workspace Events subscription
+ * to message and reaction events rests on; `chat.spaces.readonly` reads a
+ * space and finds a DM; `chat.spaces.create` opens one; membership scopes
+ * read the roster and let the assistant leave a space as its own user.
  */
 export const HOST_GOOGLE_SERVICES = {
   gmail: { scopes: ['https://www.googleapis.com/auth/gmail.modify'] },
@@ -148,11 +132,9 @@ export const GOOGLE_SERVICES: Readonly<Record<GoogleServiceId, GoogleServiceScop
 };
 
 /**
- * The services agents reach. Each credential carries the scopes of its
- * exposed services that the grant holds, so a scope reaches agents only once
- * its service is listed here and the operator has granted it. Each service
- * also brings its capability, its skill, and gog's commands for it to the
- * groups holding the capability.
+ * A scope reaches agents only once its service is listed here and the
+ * operator has granted it. Each listed service also brings its capability,
+ * its skill, and gog's commands for it to the groups holding the capability.
  */
 export const EXPOSED_GOOGLE_SERVICES: readonly AgentGoogleServiceId[] = [
   'calendar',
@@ -165,27 +147,18 @@ export const EXPOSED_GOOGLE_SERVICES: readonly AgentGoogleServiceId[] = [
   'forms',
 ];
 
-/** The capability key of a Google service agents reach. */
 export type GoogleCapability = (typeof AGENT_GOOGLE_SERVICES)[AgentGoogleServiceId]['capability'];
 
-/**
- * The exposed services' skills, each once, since Drive, Docs, Sheets, Slides
- * and Forms share one. Each reaches only a group holding its capability.
- */
 export const EXPOSED_GOOGLE_SKILLS: readonly string[] = [
   ...new Set(EXPOSED_GOOGLE_SERVICES.map((id) => AGENT_GOOGLE_SERVICES[id].skill)),
 ];
 
-/** The scopes of `wanted` that `granted` holds, each once, in `wanted`'s order. */
 export function grantedScopes(wanted: readonly string[], granted: readonly string[]): string[] {
   const held = new Set(granted);
   return [...new Set(wanted)].filter((scope) => held.has(scope));
 }
 
-/**
- * What a credential's token asks for (KTD1): the scopes of its exposed
- * services that `granted` holds. Empty means the host publishes nothing for it.
- */
+/** Empty means the host publishes nothing for the credential. */
 export function credentialScopes(credential: AgentGoogleCredential, granted: readonly string[]): string[] {
   const wanted = credential.services
     .filter((id) => EXPOSED_GOOGLE_SERVICES.includes(id))
@@ -221,7 +194,6 @@ export function credentialScopes(credential: AgentGoogleCredential, granted: rea
  * Drive together.
  */
 const SIGN_IN_CONSENTS: readonly (readonly string[])[] = [
-  // Calendar, Gmail and Drive.
   [
     'https://www.googleapis.com/auth/calendar',
     'https://www.googleapis.com/auth/calendar.readonly',
@@ -259,7 +231,6 @@ const SIGN_IN_CONSENTS: readonly (readonly string[])[] = [
     'https://www.googleapis.com/auth/drive.labels.readonly',
     'https://www.googleapis.com/auth/drive.meet.readonly',
   ],
-  // Docs, Sheets, Slides, Forms, the directory, and Chat.
   [
     'https://www.googleapis.com/auth/documents',
     'https://www.googleapis.com/auth/documents.readonly',
@@ -294,27 +265,22 @@ const SIGN_IN_CONSENTS: readonly (readonly string[])[] = [
   ],
 ];
 
-/**
- * What the sign-in asks for, one consent at a time: the account's identity,
- * so each consent proves who granted it, and its share of the products'
- * scopes, which hold every service's (agent-facing and host-only).
- */
+/** Each consent also asks for the account's identity, so each proves who granted it. */
 export const GOOGLE_SIGN_IN_CONSENTS: readonly (readonly string[])[] = SIGN_IN_CONSENTS.map((scopes) => [
   'openid',
   'email',
   ...scopes,
 ]);
 
-/** Every scope the sign-in asks for, each once. A grant lacking any of them needs a new sign-in. */
+/** A grant lacking any of these needs a new sign-in. */
 export const GOOGLE_SIGN_IN_SCOPES: readonly string[] = [...new Set(GOOGLE_SIGN_IN_CONSENTS.flat())];
 
-/** The scopes a grant must hold: the identity scopes Google reports in full form, and the rest of the sign-in's. */
+/** Each identity scope in every form Google may report it: `email` can come back as `userinfo.email`. */
 const IDENTITY_SCOPE_FORMS: Readonly<Record<string, readonly string[]>> = {
   openid: ['openid'],
   email: ['email', 'https://www.googleapis.com/auth/userinfo.email'],
 };
 
-/** The required scopes a granted set lacks; Google may report `email` in its long form. */
 export function missingGoogleScopes(granted: readonly string[]): string[] {
   const held = new Set(granted);
   return GOOGLE_SIGN_IN_SCOPES.filter((scope) => !(IDENTITY_SCOPE_FORMS[scope] ?? [scope]).some((f) => held.has(f)));
@@ -333,32 +299,26 @@ export function isGoogleAccountId(value: unknown): value is string {
 /** One consent of the sign-in: its refresh token mints only the scopes Google granted with it. */
 export interface GoogleConsent {
   readonly refresh_token: string;
-  /** The scopes Google reported granting. */
   readonly scopes: readonly string[];
 }
 
 export interface GoogleGrant {
   readonly schema_version: typeof GOOGLE_GRANT_SCHEMA_VERSION;
-  /** The signed-in account, lowercased: the assistant's own Workspace address. */
+  /** The assistant's own Workspace address, lowercased. */
   readonly account: string;
-  /** The signed-in account's Google ID, by which Chat knows the assistant as `users/{sub}`. */
   readonly sub: string;
   readonly client_id: string;
   readonly client_secret: string;
-  /** One per consent of the sign-in, in its order. */
   readonly consents: readonly GoogleConsent[];
   readonly granted_at: string;
 }
 
-/** Every scope the grant holds, across its consents, each once. */
 export function scopesOfGrant(grant: GoogleGrant): string[] {
   return [...new Set(grant.consents.flatMap((consent) => consent.scopes))];
 }
 
-/** The grant file's name in the instance's `secrets/` directory. */
 export const GOOGLE_GRANT_FILE_NAME = 'google-grant.json';
 
-/** The host's environment key naming the grant file. */
 export const GOOGLE_GRANT_FILE_ENV = 'GWS_EA_GOOGLE_GRANT_FILE';
 
 /** A sign-in's identity: a new sign-in, even of the same account, is a new identity. */
@@ -383,7 +343,6 @@ function parseConsent(value: unknown, label: string): GoogleConsent {
   };
 }
 
-/** Parse a grant file's content; any other shape is refused rather than used. */
 export function parseGoogleGrant(value: unknown): GoogleGrant {
   if (!isRecord(value)) throw new Error('Google grant is invalid');
   if (value.schema_version !== GOOGLE_GRANT_SCHEMA_VERSION) throw new Error('Google grant schema is unsupported');

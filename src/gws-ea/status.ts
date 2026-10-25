@@ -1,19 +1,17 @@
 import { managedResult, resultJson, type NextAction } from './result.js';
 /**
  * `list` and `status`: the operator's read-only view of the assistants on
- * this machine (R1, R2, KTD10). Both read only local state and what each
- * assistant's own observers report. They load no secrets, start no run log,
- * take no lock, repair nothing, and write no file: observers may read the
- * instance-held OneCLI admin key they already use, but never the operator's
- * secrets file or secret environment variables.
- * The isolation probe stays a create and update gate.
+ * this machine. Both read only local state and what each assistant's own
+ * observers report. They start no run log, take no lock, repair nothing, and
+ * write no file; observers may read the instance-held credentials they
+ * already use, but never the operator's secrets file or secret environment
+ * variables. The isolation probe stays a create and update gate.
  *
  * Every observation is live, and registry values are shown as the record,
- * never as health. Each probe reports ok, degraded, or unknown with its
- * reason; a probe that throws becomes its own result, so one failing
+ * never as health. A probe that throws becomes its own result, so one failing
  * observation never hides another. An unfinished update or rollback never
- * stops either command (R16): both show it, with the command that continues
- * or reverts it. Both work in every phase (R9): while a switch has fenced the
+ * stops either command: both show it, with the command that continues or
+ * reverts it. Both work in every phase: while a switch has fenced the
  * assistant they read its `state/` and `logs/` physically. Both exit 0 once
  * they observed, whatever the health; an unknown assistant ID exits 1.
  */
@@ -87,7 +85,6 @@ import {
   type PrincipalBindingVerificationResult,
 } from './verify.js';
 
-/** `0` once the command observed, whatever the health; `1` when it could not (such as an unknown ID). */
 const OBSERVED = 0;
 const FAILED = 1;
 
@@ -111,7 +108,7 @@ export interface ProbeResult {
   readonly reason: string | null;
 }
 
-/** The host's service as NanoClaw detects it; `unmanaged` is a host running outside its service. */
+/** `unmanaged` is a host running outside its service. */
 export type ServiceState = 'running' | 'stopped' | 'not_installed' | 'unmanaged' | 'unknown';
 
 export interface DeliveryView {
@@ -179,17 +176,15 @@ export interface InboxFacts {
   readonly state: 'healthy' | 'unhealthy' | null;
   /** When it became unhealthy; null while healthy. */
   readonly since: string | null;
-  /** When a poll last succeeded. */
   readonly last_success_at: string | null;
   readonly calendar_notifications: CalendarNotificationsView | null;
-  /** Each principal address's calendar access, the facts main lists: shown, never a fault. */
+  /** Shown beside the inbox's health, never a fault. */
   readonly calendar_access: readonly CalendarAccessView[] | null;
 }
-/** Google Chat as the host reports it (KTD12); each fact is null when the host did not report it. */
+/** Google Chat as the host reports it; each fact is null when the host did not report it. */
 export interface ChatFacts {
   /** The pull consumer is connected to Pub/Sub. */
   readonly consumer_connected: boolean | null;
-  /** When a pull last returned. */
   readonly last_pull_at: string | null;
   /** The Workspace Events subscription's state, as the host last saw it. */
   readonly subscription_state: ChatSubscriptionState | null;
@@ -206,53 +201,42 @@ export interface WorkspaceFacts {
   /** The Google account the assistant is signed in as. */
   readonly account: string | null;
 }
-/** The web alias an enabled browser needs (KTD13), as the running host records it; null when not observed. */
+/** The web alias an enabled browser needs, as the running host records it; null when not observed. */
 export interface WebAliasFacts {
   /** `not_needed` while the browser is not enabled. */
   readonly state: 'not_needed' | 'pending' | 'configured' | null;
-  /** The configured alias, or the address the operator was asked to add. */
+  /** The configured alias, or the address the operator was asked to add; null when there is neither. */
   readonly address: string | null;
 }
 
 export interface AssistantProbes {
-  /** Optional host-wide voice, with release compatibility and actual recognition observations. */
   readonly voice: VoiceObservation;
   /** The live checkout agrees with its record: marker, detached commit, no tracked changes. */
   readonly checkout: ProbeResult & CheckoutFacts;
-  /** The live release's own agent image, which its host runs agents on (KTD6). */
   readonly image: ProbeResult & ImageFacts;
-  /** The host's service, as NanoClaw's own service helpers detect it. */
   readonly service: ProbeResult & ServiceFacts;
   /** The host's own status over its CLI socket, answering for this assistant's checkout. */
   readonly host: ProbeResult;
-  /** Google Chat receiving: the host's pull consumer connected, and its subscription active (KTD12). */
+  /** Google Chat receiving: the host's pull consumer connected, and its subscription active. */
   readonly chat: ProbeResult & ChatFacts;
   /** The OneCLI runtime, as the instance's own Compose file names it. */
   readonly onecli: ProbeResult;
   /** Main as published, on the assistant's provider, with its OneCLI agent granted every secret. */
   readonly main_identity: ProbeResult & MainIdentityFacts;
-  /** external-email as the host stamped it, no destination joining it to main or reaching its inbox. */
+  /** external-email as the host stamped it, with no destination breaking its separation. */
   readonly external_email: ProbeResult & ExternalEmailFacts;
   readonly whatsapp: ProbeResult & WhatsAppFacts;
   readonly external_chat: ProbeResult & MainIdentityFacts;
   readonly job_agents: ProbeResult & JobAgentFacts;
-  /**
-   * The assistant's inbox as the host reports it: polling healthy, and
-   * calendar notifications on for the principal's calendars. Beside it,
-   * what the assistant can do with each principal address's calendar.
-   */
+  /** The assistant's inbox polling healthy, and calendar notifications on for the principal's calendars. */
   readonly inbox: ProbeResult & InboxFacts;
-  /**
-   * The assistant's own Google sign-in, accepted by Google with every scope
-   * this release asks for, and agents' token for each Google host in OneCLI,
-   * Calendar's carrying Drive rather than Calendar alone.
-   */
+  /** The assistant's Google connection whole, as `observeGoogleConnection` judges it. */
   readonly workspace: ProbeResult & WorkspaceFacts;
   /** The principal binding and its queued welcome. */
   readonly principal: ProbeResult;
   /** Main's latest delivery result, and the replies the host is still retrying. */
   readonly delivery: ProbeResult & DeliveryFacts;
-  /** While the browser is enabled, its configured web alias; setup is incomplete until there is one (R23). */
+  /** While the browser is enabled, its configured web alias; setup is incomplete until there is one. */
   readonly web_alias: ProbeResult & WebAliasFacts;
 }
 
@@ -285,7 +269,6 @@ interface OperationRecordFacts {
   readonly updated_at: string;
 }
 
-/** An assistant's update or rollback, as the operation record and the registry show it. */
 export type OperationView =
   | { readonly state: 'none' }
   | ({ readonly state: 'open' } & OperationRecordFacts & {
@@ -304,9 +287,9 @@ export type OperationView =
   | { readonly state: 'unreadable'; readonly code: string; readonly message: string };
 
 /**
- * Where the assistant stands between releases (R9): `live` while the live
- * link names a release; `fenced` while a switch has removed it, so nothing
- * can start the host; `unknown` when that cannot be read.
+ * `live` while the live link names a release; `fenced` while a switch has
+ * removed it, so nothing can start the host; `unknown` when that cannot be
+ * read.
  */
 export type PhaseView =
   | { readonly state: 'live'; readonly release: string }
@@ -320,7 +303,6 @@ export interface ListedAssistant {
   readonly track: string;
   readonly deployed_commit: string;
   readonly phase: PhaseView;
-  /** Whether the tool's release is ahead of it, as `status` reports it. */
   readonly release: ReleaseView;
   readonly service: { readonly state: ServiceState; readonly reason: string | null };
   readonly operation: OperationView;
@@ -350,7 +332,7 @@ export interface ReleaseView {
 }
 
 export interface RollbackView {
-  /** A previous release of this assistant is kept to roll back to. */
+  /** Whether the assistant keeps a rollback point. */
   readonly available: boolean;
   readonly previous_commit: string | null;
   /** Whether either schema fingerprint moved since it: a rollback then restores the pre-update snapshot. */
@@ -379,19 +361,14 @@ export interface AssistantStatus {
   readonly probes: AssistantProbes;
 }
 
-/** The boundaries `status` observes through; each defaults to the real one. */
 export interface StatusObservers {
-  /** Runs Git (the checkout, the tool's release) and Docker (OneCLI, the agent image). */
   readonly runCommand: SanitizedCommandRunner;
-  /** Reaches Google and OneCLI for the Google connection. */
   readonly fetch?: typeof globalThis.fetch;
   /** `ncl <args> --json` through the assistant's own host. */
   readonly ncl: (runtime: InstanceRuntimeConfig, args: readonly string[]) => Promise<unknown>;
-  /** The assistant's OneCLI agents, as its OneCLI lists them to the instance-held admin key. */
   readonly onecliAgents: (runtime: InstanceRuntimeConfig) => Promise<readonly OnecliAgent[]>;
   readonly onecli: (layout: OnecliRuntimeLayout, pins: OnecliPins) => Promise<Observation>;
   readonly principalBinding: (input: PrincipalBindingVerificationInput) => PrincipalBindingVerificationResult;
-  /** The schema the databases under a `data`-holding root record: the physical `state/`, or a kept release. */
   readonly schema: (stateRoot: string) => SnapshotManifest;
   readonly delivery: (stateRoot: string) => LatestDelivery | undefined;
   readonly mainTurn: (stateRoot: string) => LatestProviderTurn | undefined;
@@ -399,7 +376,6 @@ export interface StatusObservers {
   readonly google: (runtime: InstanceRuntimeConfig, declaredEmail: string) => Promise<GoogleConnectionReport>;
 }
 
-/** What `list` and `status` observe with. The driver supplies NanoClaw's helpers; the rest default. */
 export interface ObservationContext {
   readonly paths: ControlPlanePaths;
   /** NanoClaw's service helpers (`scripts/update/service.ts`); without them service state is unknown. */
@@ -425,19 +401,17 @@ export interface ReadOnlyCommandRuntime extends ObservationContext {
   readonly columns?: number;
 }
 
-/** A probe that could not observe: its result is unknown, for this reason. */
+/** Thrown by a probe that could not observe: its result is unknown, with this message as the reason. */
 class Unobservable extends Error {}
 
 const OK: ProbeResult = Object.freeze({ status: 'ok', reason: null });
 
-/** `clause` as a sentence: capitalized, ending in a full stop. */
 function sentence(clause: string): string {
   const text = clause.trim();
   const capitalized = `${text.charAt(0).toUpperCase()}${text.slice(1)}`;
   return /[.!?]$/u.test(capitalized) ? capitalized : `${capitalized}.`;
 }
 
-/** What a probe that threw reports: unknown when it could not observe, degraded when it saw something wrong. */
 function failure(error: unknown): ProbeResult {
   if (error instanceof Unobservable) return { status: 'unknown', reason: error.message };
   if (error instanceof GwsEaError) {
@@ -447,7 +421,6 @@ function failure(error: unknown): ProbeResult {
   return { status: 'unknown', reason: code ? `The observation failed (${code}).` : safeErrorMessage(error) };
 }
 
-/** Run one probe; whatever it throws becomes its result, with `unobserved` as its facts. */
 async function probe<Facts extends object>(
   observe: () => Promise<ProbeResult & Facts>,
   unobserved: Facts,
@@ -480,13 +453,11 @@ function resolveObservers(overrides: Partial<StatusObservers> = {}): StatusObser
   };
 }
 
-/** The runtime create recorded once the host first started, at the live checkout; `why` says why it is missing. */
 type RuntimeRecord =
   | { readonly state: 'recorded'; readonly config: InstanceRuntimeConfig }
   | { readonly state: 'missing'; readonly why: string }
   | { readonly state: 'unreadable'; readonly error: unknown };
 
-/** Why the assistant's `state/` holds no runtime record: its create never got as far as its host. */
 const MISSING_RUNTIME = 'The assistant has no runtime record: its host has never been started.';
 
 async function readRuntimeRecord(paths: ControlPlanePaths, reservation: InstanceReservation): Promise<RuntimeRecord> {
@@ -510,7 +481,6 @@ function requireRuntime(record: RuntimeRecord): InstanceRuntimeConfig {
   }
 }
 
-/** The operation as the lock-free inspection sees it; a record that cannot be inspected is shown as such. */
 async function inspect(paths: ControlPlanePaths, reservation: InstanceReservation): Promise<OperationInspection> {
   try {
     return await inspectOperation(paths, reservation);
@@ -570,7 +540,6 @@ function unknownAssistant(instanceId: string): GwsEaError {
 
 const LAUNCHER_REQUIRED = 'Run gws-ea through its launcher, which supplies NanoClaw';
 
-/** The host's service, as NanoClaw's own service helpers detect it (KTD3). */
 function serviceObservation(handle: NanoclawServiceHandle): ProbeResult & ServiceFacts {
   switch (handle.mode) {
     case 'none':
@@ -609,17 +578,15 @@ function observeService(
   );
 }
 
-/** Whether a removal receipt says this assistant's removal is under way. */
 function removalInProgress(paths: ControlPlanePaths, instanceId: string): Promise<boolean> {
   return isRegularFile(paths.removalFile(instanceId));
 }
 
-/** The release the assistant's live link names, read at most once however many observations of it ask. */
 function liveRelease(paths: ControlPlanePaths, instanceId: string): () => Promise<string | undefined> {
   return once(() => readCurrent(paths.instanceLayout(instanceId)));
 }
 
-/** Where the assistant stands between releases, read physically, never through the live link. */
+/** Read physically, never through the live link. */
 async function observePhase(current: () => Promise<string | undefined>): Promise<PhaseView> {
   try {
     const live = await current();
@@ -630,7 +597,6 @@ async function observePhase(current: () => Promise<string | undefined>): Promise
   }
 }
 
-/** What an operator is told of the assistant's phase, naming what moves it on where a command does. */
 function phaseDetail(phase: PhaseView): string {
   switch (phase.state) {
     case 'live':
@@ -642,7 +608,6 @@ function phaseDetail(phase: PhaseView): string {
   }
 }
 
-/** Everything one status observation shares, read once. */
 interface Subject {
   readonly context: ObservationContext;
   readonly observers: StatusObservers;
@@ -684,7 +649,6 @@ async function checkoutProbe({
   }
 }
 
-/** The live release's own agent image, `<base>:r-<release>`, which its host runs agents on (KTD6). */
 async function imageProbe({ runtime: record, observers, current }: Subject): Promise<ProbeResult & ImageFacts> {
   const runtime = requireRuntime(record);
   const live = await current();
@@ -707,7 +671,6 @@ function hostFailure(error: unknown, instanceRoot: string): string {
   return redact(message.replaceAll('logs/nanoclaw.error.log', hostLogFiles(instanceRoot).errors));
 }
 
-/** The host's own status over its CLI socket, which answers only for this checkout (upstream `queryHost`). */
 async function hostProbe({ context, reservation }: Subject): Promise<ProbeResult> {
   if (!context.hostStatus) throw new Unobservable(`${LAUNCHER_REQUIRED}'s host status helpers.`);
   try {
@@ -722,12 +685,6 @@ async function hostProbe({ context, reservation }: Subject): Promise<ProbeResult
   return OK;
 }
 
-/**
- * Google Chat as the running host reports it (KTD12): receiving once its
- * consumer is connected and its subscription active, beside when the
- * subscription expires and when a pull last returned. A broken sign-in is
- * named as one, with the command that signs the assistant in again.
- */
 async function chatProbe({ reservation, runtime: record, observers }: Subject): Promise<ProbeResult & ChatFacts> {
   const health = parseChatHealth(unwrapData(await observers.ncl(requireRuntime(record), CHAT_HEALTH_ARGS)));
   const facts: ChatFacts = {
@@ -743,10 +700,6 @@ async function chatProbe({ reservation, runtime: record, observers }: Subject): 
     : { status: 'degraded', reason: sentence(receiving.reason), ...facts };
 }
 
-/**
- * OneCLI at the pins the receipt of the release the registry records holds,
- * and the images its own Compose file names (KTD6).
- */
 async function onecliProbe({ context, reservation, runtime: record, observers }: Subject): Promise<ProbeResult> {
   const runtime = requireRuntime(record);
   const setup = await readDeployedSetup(context.paths, reservation);
@@ -761,7 +714,6 @@ async function onecliProbe({ context, reservation, runtime: record, observers }:
   return fromObservation(await observers.onecli(layout, { gateway: setup.onecli.gateway }));
 }
 
-/** Main's agent group ID, as the profile the running host serves names it. */
 async function publishedMain({ runtime: record, observers }: Subject): Promise<string> {
   const profile = unwrapData(await observers.ncl(requireRuntime(record), ['gws-ea-profile', 'get']));
   const main = isRecord(profile) ? optionalString(profile.main_agent_group_id) : undefined;
@@ -770,12 +722,10 @@ async function publishedMain({ runtime: record, observers }: Subject): Promise<s
   return main;
 }
 
-/** The assistant's OneCLI agents, as its own OneCLI lists them. */
 function onecliAgents({ runtime: record, observers }: Subject): Promise<readonly OnecliAgent[]> {
   return observers.onecliAgents(requireRuntime(record));
 }
 
-/** Main as published, on the assistant's provider, with its OneCLI agent granted every secret. */
 async function mainIdentityProbe(
   subject: Subject,
   main: () => Promise<string>,
@@ -811,10 +761,6 @@ async function mainIdentityProbe(
   return { ...OK, agent_group_id: agentGroupId };
 }
 
-/**
- * external-email as the running host reports it: as the host stamped it, with
- * no destination joining it to main or reaching its inbox.
- */
 async function externalEmailProbe(subject: Subject): Promise<ProbeResult & ExternalEmailFacts> {
   const runtime = requireRuntime(subject.runtime);
   const health = unwrapData(await subject.observers.ncl(runtime, ['gws-ea-external-email', 'health']));
@@ -919,7 +865,7 @@ function nullableString(value: unknown): value is string | null {
   return value === null || typeof value === 'string';
 }
 
-/** The inbox's health as the host's `getInboxHealth` reports it, with every field checked. */
+/** As the host's `getInboxHealth` reports it. */
 interface InboxHealthReport {
   readonly state: (typeof INBOX_STATES)[number];
   readonly reason: string | null;
@@ -930,7 +876,7 @@ interface InboxHealthReport {
   readonly calendarAccess: readonly CalendarAccessView[] | null;
 }
 
-/** Each address's calendar access as the host reports it, or undefined when any of it is malformed. */
+/** Undefined when any of it is malformed. */
 function parseCalendarAccess(value: unknown): CalendarAccessView[] | undefined {
   if (!Array.isArray(value)) return undefined;
   const views: CalendarAccessView[] = [];
@@ -976,23 +922,16 @@ function parseInboxHealth(value: unknown): InboxHealthReport {
   };
 }
 
-/** `clause`, followed by the host's reason when it gave one. */
 function because(clause: string, reason: string | null): string {
   return reason ? `${clause}: ${redact(reason)}` : clause;
 }
 
-/** The command that continues the web alias's setup, with `--alias-added` once there is an address to add. */
 function webAliasArgv(instanceId: string, facts: WebAliasFacts): string[] {
   const command = ['gws-ea', 'capabilities', 'enable', 'browser', '--id', instanceId];
   return facts.address !== null ? [...command, '--alias-added'] : command;
 }
 
-/**
- * The web alias an enabled browser needs (KTD13): not needed while the
- * browser is not enabled, which the policy file says without asking the
- * host; otherwise the setup the running host records. Until the alias is
- * configured, setup is incomplete (R23), with what finishes it.
- */
+/** Whether the browser is enabled comes from its policy file, without asking the host. */
 async function webAliasProbe(subject: Subject): Promise<ProbeResult & WebAliasFacts> {
   const runtime = requireRuntime(subject.runtime);
   if (!(await readBrowserPolicy(instanceBrowserPolicyFile(runtime))).enabled) {
@@ -1010,11 +949,8 @@ async function webAliasProbe(subject: Subject): Promise<ProbeResult & WebAliasFa
 }
 
 /**
- * The assistant's inbox as the running host reports it: polling Gmail without
- * failing, and calendar notifications on for the principal's calendars. Each
- * principal address's calendar access is reported beside it and never
- * degrades it: a calendar not shared is a fact, and only a failing sync is a
- * fault.
+ * Calendar access never degrades the inbox: a calendar not shared is a fact,
+ * and only a failing sync is a fault.
  */
 async function inboxProbe(subject: Subject): Promise<ProbeResult & InboxFacts> {
   const runtime = requireRuntime(subject.runtime);
@@ -1040,7 +976,6 @@ async function inboxProbe(subject: Subject): Promise<ProbeResult & InboxFacts> {
   return { ...OK, ...facts };
 }
 
-/** The assistant's own Google sign-in, as `sign_in_google` left it and Google still accepts it. */
 async function workspaceProbe({
   reservation,
   runtime: record,
@@ -1053,7 +988,6 @@ async function workspaceProbe({
     : { status: 'degraded', reason: report.reason, account: report.account };
 }
 
-/** The principal bind_principal bound through the DM the assistant opened, still bound, with its welcome queued. */
 async function principalProbe({ context, reservation, observers }: Subject): Promise<ProbeResult> {
   const journal = await readProvisionJournal(context.paths, reservation.instance_id);
   const result = observers.principalBinding({
@@ -1069,7 +1003,6 @@ async function principalProbe({ context, reservation, observers }: Subject): Pro
     : { status: 'degraded', reason: "The principal's direct message, its binding, or its welcome is missing." };
 }
 
-/** Main's latest delivery result, and the replies the host is still retrying. */
 async function deliveryProbe({ context, reservation, observers }: Subject): Promise<ProbeResult & DeliveryFacts> {
   const seen = observers.delivery(context.paths.instanceLayout(reservation.instance_id).state);
   if (!seen) return { status: 'unknown', reason: 'Main is not published yet.', last: null, retrying: null };
@@ -1120,10 +1053,7 @@ function observeMainTurn({ context, reservation, observers }: Subject): MainTurn
   };
 }
 
-/**
- * Whether the tool's own release is ahead of the assistant's, from the tool's
- * history alone: local and read-only, so `list` asks it of every assistant.
- */
+/** From the tool's history alone: local and read-only, so `list` asks it of every assistant. */
 async function observeRelease({
   context,
   reservation,
@@ -1168,7 +1098,6 @@ function fingerprint(value: unknown): string {
   return `sha256:${createHash('sha256').update(JSON.stringify(value)).digest('hex')}`;
 }
 
-/** The two schema fingerprints (KTD5): the central migrations applied, and every session table's columns. */
 function fingerprints(manifest: SnapshotManifest): { readonly central: string; readonly session: string } {
   return {
     central: fingerprint([...manifest.central_migrations].sort()),
@@ -1198,11 +1127,6 @@ function schemaView(read: SchemaRead): SchemaView {
   };
 }
 
-/**
- * The rollback point, and whether either schema moved since its snapshot
- * (R3), decided as `rollback` decides it, from the schema the rollback point
- * records. It is available exactly when the assistant has one.
- */
 async function observeRollback({ context, reservation }: Subject, live: SchemaRead): Promise<RollbackView> {
   let point;
   try {
@@ -1231,7 +1155,6 @@ async function observeRollback({ context, reservation }: Subject, live: SchemaRe
   };
 }
 
-/** Run `observe` once, however many probes ask for its result. */
 function once<T>(observe: () => Promise<T>): () => Promise<T> {
   let result: Promise<T> | undefined;
   return () => (result ??= observe());
@@ -1244,7 +1167,7 @@ async function findReservation(paths: ControlPlanePaths, instanceId: string): Pr
   return reservation;
 }
 
-/** One assistant's live, read-only observations (R2). Throws only when the assistant cannot be found. */
+/** Throws only when the assistant cannot be found in the registry. */
 export async function observeAssistantStatus(
   context: ObservationContext,
   instanceId: string,
@@ -1371,10 +1294,7 @@ export async function observeAssistantStatus(
   };
 }
 
-/**
- * Every registered assistant, from local state only (R1): the registry, cheap
- * service detection, and where each stands against the tool's own release.
- */
+/** Every registered assistant, from local state only. */
 export async function listAssistants(context: ObservationContext): Promise<AssistantListing> {
   const observedAt = (context.now ?? (() => new Date()))().toISOString();
   const registry = await readRegistry(context.paths);
@@ -1424,11 +1344,7 @@ function operationSummary(operation: OperationView): string {
   }
 }
 
-/**
- * What an operator is told of an update or rollback left unfinished, naming
- * what continues or reverts it, of one closed for fix-forward, or of a record
- * that cannot be read: `status`, `list`, and `update --all` word it alike.
- */
+/** Shared so every command that reports an unfinished operation words it alike. */
 export function unfinishedOperation(
   operation: Extract<OperationView, { readonly state: 'open' | 'failed' | 'unreadable' }>,
 ): string {
@@ -1450,7 +1366,6 @@ export function unfinishedOperation(
   }
 }
 
-/** What an operator does about an assistant's update, rollback, or removal, if anything. */
 function operationDetail(instanceId: string, operation: OperationView, removal: boolean): string[] {
   const lines: string[] = [];
   if (removal) lines.push(`Removal is in progress; finish it with gws-ea remove --id ${instanceId}.`);
@@ -1482,7 +1397,6 @@ function table(rows: readonly (readonly string[])[]): string[] {
   );
 }
 
-/** Whether an assistant is behind the tool's release, as `list` shows it. */
 function behindCell(release: ReleaseView): string {
   if (release.behind_tool_release === null) return 'unknown';
   return release.behind_tool_release ? 'yes' : 'no';
@@ -1607,13 +1521,11 @@ function probeDetail(name: (typeof PROBE_NAMES)[number], probes: AssistantProbes
   }
 }
 
-/** The web alias as one phrase: its state and address. */
 function webAliasSummary(alias: WebAliasFacts): string {
   if (alias.state === null) return 'unknown';
   return alias.address === null ? alias.state.replace('_', ' ') : `${alias.state} ${alias.address}`;
 }
 
-/** Receiving Chat's line: until when its subscription runs, and when a pull last returned. */
 function chatDetail(chat: ChatFacts, timezone: string): string {
   const expires = chat.subscription_expire_time;
   const pulled = chat.last_pull_at;
@@ -1623,7 +1535,6 @@ function chatDetail(chat: ChatFacts, timezone: string): string {
   ].join('; ');
 }
 
-/** One probe's line: its status, its name, and what it saw. */
 function probeLine(status: string, name: string, detail: string): string {
   return `  ${status.padEnd(8)}  ${name.padEnd(14)}  ${detail}`.trimEnd();
 }
@@ -1636,7 +1547,7 @@ const ACCESS_WORDS: Readonly<Record<CalendarAccessView['access'], string>> = {
   none: 'no access',
 };
 
-/** Under the inbox's line, each principal address's calendar access, whatever the probe saw. */
+/** Shown whatever the inbox probe's status. */
 function calendarAccessLines(views: readonly CalendarAccessView[] | null, timezone: string): string[] {
   return (views ?? []).map(({ address, access, checked_at: checkedAt }) =>
     probeLine(
@@ -1782,7 +1693,6 @@ function statusActions(status: AssistantStatus): NextAction[] {
   return actions;
 }
 
-/** `gws-ea list [--json]`: prints the listing, and returns the exit code. */
 export async function runListCommand(
   runtime: ReadOnlyCommandRuntime,
   options: { readonly json: boolean },
@@ -1803,7 +1713,6 @@ export async function runListCommand(
   return OBSERVED;
 }
 
-/** `gws-ea status --id <id> [--json]`: prints the observations, and returns the exit code. */
 export async function runStatusCommand(
   runtime: ReadOnlyCommandRuntime,
   options: { readonly instanceId: string; readonly json: boolean; readonly details?: boolean },

@@ -36,9 +36,8 @@ import { getResponseHandlers, type ResponsePayload } from './response-registry.j
 const hostAbortController = new AbortController();
 
 /**
- * Hand an answer to the first handler that claims it. A handler that throws
- * rejects the dispatch: the answer is not handled, and a channel that
- * redelivers hands it over again.
+ * A handler that throws rejects the dispatch: the answer is not handled, and
+ * a channel that redelivers hands it over again.
  */
 async function dispatchResponse(payload: ResponsePayload): Promise<void> {
   for (const handler of getResponseHandlers()) {

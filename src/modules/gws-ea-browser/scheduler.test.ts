@@ -79,7 +79,7 @@ const bounds: WatchBounds = {
 };
 /**
  * An armed watch of the job. `watch` sets its bounds apart from the shared ones, its venue's release rule, and, for a
- * region watch (KTD20), its marked region's baseline text.
+ * region watch, its marked region's baseline text.
  */
 async function arm(
   id: string,
@@ -713,7 +713,7 @@ it("checks a few seconds after the venue's release, at the floor through its bur
   expect(await checksStarted('opentable.com')).toEqual([]);
 }, 30_000);
 
-/** A region watch (KTD20) on an unreviewed site, its slot list marked with `baseline` as its text. */
+/** A region watch on an unreviewed site, its slot list marked with `baseline` as its text. */
 const armRegion = (id: string, baseline: string): Promise<void> =>
   arm(id, id, 4, 1, 'larder.example', {
     bounds: { kind: 'region', venue: { id: 'larder', name: 'The Larder' } },

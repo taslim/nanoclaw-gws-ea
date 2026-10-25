@@ -32,9 +32,9 @@ export interface WriteMessageOut {
   thread_id?: string | null;
   content: string;
   /**
-   * The inbound messages this row answers. A message to a person names them,
-   * by default the batch of the turn being answered (the reply stamp), so the
-   * host can tell whether a send that fails was the principal's to hear of.
+   * Ids of the inbound messages this row answers, the reply stamp's batch by
+   * default. The host reads them to tell whether a failed send was the
+   * principal's to hear of.
    */
   batch?: readonly string[];
 }
@@ -58,7 +58,6 @@ export function withOutboundPassthrough<T>(entries: Record<string, unknown>, fn:
   return outboundPassthrough.run(entries, fn);
 }
 
-/** `content` with `entries` merged in when it is a JSON object, never overwriting a key it has. */
 function mergeEntries(content: string, entries: Record<string, unknown>): string {
   let parsed: unknown;
   try {
@@ -79,11 +78,7 @@ function mergeEntries(content: string, entries: Record<string, unknown>): string
   return changed ? JSON.stringify(payload) : content;
 }
 
-/**
- * Apply any active passthrough entries to a system-action JSON payload, and
- * name the batch a message to a person answers. A message to another agent
- * reaches it as written, so it names none.
- */
+/** A message to another agent reaches it as written, so it names no batch. */
 function decorateContent(msg: WriteMessageOut): string {
   if (msg.kind === 'system') {
     const entries = outboundPassthrough.getStore();

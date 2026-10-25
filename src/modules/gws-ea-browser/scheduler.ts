@@ -33,7 +33,7 @@ export interface BrowserWatchCheckInput {
   parameters: Record<string, string>;
   venueId: string;
   partySize: number;
-  /** A region watch's marked region (KTD20): the check reads its text instead of a reader's availability. */
+  /** Set for a region watch: the check reads this region's text instead of a reader's availability. */
   region?: StructuredBrowserLocator;
 }
 export type BrowserWatchCheckResult =
@@ -128,7 +128,7 @@ export class BrowserWatchScheduler {
       .catch(() => undefined);
     return running;
   }
-  /** Signals never claim, fetch, or reroute mail. The observer has no routing return value. */
+  /** Only marks the site for an early check: it never claims, fetches or reroutes the mail. */
   async notify(mail: ParsedMail): Promise<void> {
     if (!mail.from) return;
     const db = this.queue.store.db;
@@ -196,8 +196,8 @@ export class BrowserWatchScheduler {
       const policy = this.deps.policy(first.site);
       // A shared check serves every member's venue release.
       const releases = watches.flatMap(watchReleases);
-      // A due check waits out the principal's night on their clock as it is now, so a timezone they
-      // change holds at once, whichever way it moves the night; a release burst does not wait.
+      // A due check waits out the principal's night on their clock as it is now, so a timezone change holds at
+      // once; a release burst does not wait.
       if (watchStartAt(policy, now, releases, await principalClock()) > now) continue;
       const state = await this.reserveCheck(db, watches, policy, Boolean(notify));
       if (!state) continue;

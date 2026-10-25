@@ -1,12 +1,12 @@
 /**
- * GWS-EA's people store (KTD8, KTD10): one thin typed record per person,
- * holding only what the host enforces: who they are by identity, and their
- * one level. `main` reads and writes it through main-only `ncl people` verbs
- * as its role directs; what it knows of a person lives in its own memory.
- * The only people fact the host passes on is a level for an identity
- * (`getPersonLevel`). Other modules purge their own
- * data for a forgotten person through `registerPersonForgetHook`, and put to
- * main what only it can rewrite through `registerPersonForgetReview`.
+ * GWS-EA's people store: one thin typed record per person, holding only what
+ * the host enforces: who they are by identity, and their one level. `main`
+ * reads and writes it through the main-only `ncl people` verbs; what it knows
+ * of a person lives in its own memory. A reader other than main learns at
+ * most a level for an identity (`getPersonLevel`), never a name. Other modules
+ * purge their own data for a forgotten person through
+ * `registerPersonForgetHook`, and put to main what only it can rewrite through
+ * `registerPersonForgetReview`.
  */
 import { registerResource, type ColumnDef } from '../../cli/crud.js';
 import type { CallerContext } from '../../cli/frame.js';
@@ -43,9 +43,8 @@ registerMigration(gwsEaPeopleThinRecordMigration);
 // ---------------------------------------------------------------------------
 
 /**
- * What main hears while the store can't be used: restoring its key is the
- * operator's job, so main gets only what it can do, and the key's path and
- * remedy go to the host log.
+ * Restoring the key is the operator's job, so main hears only what it can do;
+ * the key's path and remedy go to the host log.
  */
 const PEOPLE_STORE_UNAVAILABLE =
   "The people store can't be used right now, and restoring it is the operator's job. Tell the principal in a line that you can't look people up or change them for now, and carry on with the rest.";
@@ -281,7 +280,7 @@ registerResource({
 });
 
 // ---------------------------------------------------------------------------
-// Forgetting again after a snapshot restore (KTD8)
+// Forgetting again after a snapshot restore
 // ---------------------------------------------------------------------------
 
 let handoffSweep: Promise<void> | undefined;

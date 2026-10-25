@@ -1,31 +1,26 @@
 /**
- * The signed-out visit (KTD5): what someone holding only a link sees when
- * they open it. The link check makes it only when Drive cannot answer, such
- * as for a form's responder link, or a file the assistant can only view or
- * cannot see.
+ * The signed-out visit: what someone holding only a link sees when they open
+ * it. The link check makes it only when Drive cannot answer, such as for a
+ * form's responder link, or a file the assistant can only view or cannot
+ * see.
  *
- * It is the one Google call made without the host's token, so it never goes
- * through `googleJson`: no Authorization header, no cookies, and no redirect
- * followed but one, from a `forms.gle` short link to a form's responder page
- * on docs.google.com. It visits only an https URL on docs.google.com,
- * drive.google.com or forms.gle, with no userinfo or port, gives up after a
- * few seconds, and reads a page only for a form, no further than a cap.
+ * Made without the host's token, it never goes through `googleJson`: no
+ * Authorization header, no cookies, and no redirect followed but one, from a
+ * `forms.gle` short link to a form's responder page on docs.google.com. It
+ * visits only an https URL on docs.google.com, drive.google.com or
+ * forms.gle, with no userinfo or port, gives up after a few seconds, and
+ * reads a page only for a form, no further than a cap.
  *
- * - A page that opens passes: anyone with the link can open the file.
- * - A form passes only when its page offers the form to answer; a closed or
- *   unpublished one does not.
- * - Google asking for a sign-in means not public: a file shared with named
- *   people, or a form only certain people may answer.
- * - A rate limit, a server error, Google's "sorry" page, no answer, or no
- *   answer in time are brief, and thrown as `ProbeUnavailableError`.
+ * A rate limit, a server error, Google's "sorry" page, no answer, or no
+ * answer in time are brief, and thrown as `ProbeUnavailableError`.
  */
 
 export type ProbeVerdict =
   /** Anyone with the link opens it: a file, or a form that takes responses. */
   | 'opens'
-  /** Google asks for a sign-in first. */
+  /** Google asks for a sign-in first: a file shared with named people, or a form only certain people may answer. */
   | 'sign-in'
-  /** A form that is closed, or offers nothing to answer. */
+  /** A form that is closed or unpublished, or offers nothing to answer. */
   | 'not-accepting'
   /** Nothing is there for someone signed out. */
   | 'not-found'

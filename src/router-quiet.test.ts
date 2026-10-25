@@ -1,8 +1,8 @@
 /**
- * The router's quiet path (KTD10), driven as the Chat bridge drives it.
+ * The router's quiet path, driven as the Chat bridge drives it.
  *
  * A reaction on the assistant's own message wakes the conversation's agent
- * the way a mention does (R4). Any other reaction, and any event marked
+ * the way a mention does. Any other reaction, and any event marked
  * quiet, is context: stored with trigger=0 in the session the conversation
  * already has, waking nothing and creating no session. Both reach an agent
  * only when the person may (membership, or a public conversation), and a
@@ -251,7 +251,7 @@ async function count(table: string): Promise<number> {
 }
 
 describe("a reaction on the assistant's own message", () => {
-  it("wakes main for the principal's 👍 in the DM, with the reaction as the waking row (AE4)", async () => {
+  it("wakes main for the principal's 👍 in the DM, with the reaction as the waking row", async () => {
     await routeInbound(reaction({ by: JUNO, platformId: DM, threadId: DM_THREAD, on: 'assistant' }));
 
     const [session] = await sessions();
@@ -348,7 +348,7 @@ describe("a reaction on someone else's message (quiet)", () => {
 });
 
 describe('who a reaction reaches', () => {
-  it("drops a non-member's reactions without a trace: no row, drop record, approval request, or DM (AE10)", async () => {
+  it("drops a non-member's reactions without a trace: no row, drop record, approval request, or DM", async () => {
     await routeInbound(written(REMY, ROOM, ROOM_THREAD, `${ROOM}/messages/remy.1`));
     const [session] = await sessions();
     requestWake.mockClear();

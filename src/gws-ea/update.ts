@@ -1,25 +1,17 @@
 /**
- * `update` (R1, R2, R10, R11). Every refusal comes before anything changes.
- * Then, while the assistant serves, the tool's own release is staged in its
- * own folder as every release is (`stageRelease`, KTD3): materialized,
- * installed, built and preflighted, its agent image tagged `<base>:r-<hex8>`
- * (KTD6), its migrations tried on a copy of the live central database in a
- * scratch `data/` the release holds before its links to the assistant's state
- * are made, and the files it runs with kept, its receipt last. Staging writes
- * nothing into `state/`. The gateway image the release names is built when it
- * differs from the one the assistant runs, and the preview says what the
- * switch will change.
+ * `update`. Every refusal comes before anything changes. The tool's own
+ * release is then staged while the assistant serves (`stageRelease`), its
+ * migrations tried on a copy of the live central database in a scratch
+ * `data/` before the release's links to the assistant's state are made.
+ * Staging writes nothing into `state/`.
  *
  * Nothing live changes before the operator confirms. A decline or a staging
  * failure writes no record, and the staged release is left for the next
  * update, which reuses it complete or stages it again. Confirming records the
- * update at `staged`; the serving OneCLI runtime is re-verified (KTD15), and
- * only then is the assistant offline: fenced, snapshotted, switched to the
- * release, and started. Main's shared skills are reconciled (KTD16), the
- * release verified and committed through the registry, and its follow-ups
- * run. Each phase is recorded as it completes, so an update cut short
- * anywhere is continued by the next `update --id`; one that fails before it
- * is committed is handed to recovery.
+ * update at `staged`; the assistant goes offline only after the serving
+ * OneCLI runtime is re-verified. Each phase is recorded as it completes, so
+ * an update cut short anywhere is continued by the next `update --id`; one
+ * that fails before it is committed is handed to recovery.
  */
 import { lstat, mkdir, readdir, readFile, realpath, rm, statfs } from 'node:fs/promises';
 import path from 'node:path';
@@ -124,7 +116,7 @@ import {
 const AGENT_RUNNER_LOCKFILE = 'container/agent-runner/bun.lock';
 /**
  * The sources that shape the session databases. Their columns are added only
- * when a host opens each session, so a dry run cannot exercise them (KTD5).
+ * when a host opens each session, so a dry run cannot exercise them.
  */
 const SESSION_SCHEMA_SOURCES = [
   'src/mailbox/sqlite/schema.ts',
@@ -135,14 +127,13 @@ const SESSION_SCHEMA_SOURCES = [
 const DISK_RESERVE_BYTES = 256 * 1024 * 1024;
 const MIGRATION_TIMEOUT_MS = 5 * 60_000;
 const DOCKER_TIMEOUT_MS = 60_000;
-/** What a staged release keeps of its migration dry run, beside its receipt. */
 const DRY_RUN_FILE = 'migration-dry-run.json';
 
 export interface UpdateRequest {
   readonly instanceId: string;
   /** `--track`: the assistant's own track unless given. */
   readonly track?: string;
-  /** `--source-remote`: the assistant's recorded source remote unless given (KTD4). */
+  /** `--source-remote`: the assistant's recorded source remote unless given. */
   readonly sourceRemote?: string;
   /**
    * `update --all`'s release: the tool's commit when the run began. A tool
@@ -156,14 +147,12 @@ export interface UpdateRequest {
 export interface UpdateSeams extends CutoverSeams {
   /** The tool's checkout, whose commit an update deploys; the one this control plane runs from by default. */
   readonly toolRoot?: string;
-  /** Runs the staged release's frozen install and its build. */
   readonly runSetupCommand?: ReleasePreflightRuntime['runSetupCommand'];
   /** Bytes free to this user on the filesystem holding `directory`. */
   readonly freeBytes?: (directory: string) => Promise<number>;
 }
 
 export interface UpdateDependencies extends CutoverDependencies, UpdateSeams {
-  /** The tool's provider setup, which the driver reads from `setup/providers`. */
   readonly providerSetup: ToolProviderSetup;
 }
 
@@ -178,7 +167,6 @@ export interface UpdateIntent {
   readonly target: ReleaseCoordinates;
 }
 
-/** What the operator confirms. */
 export interface UpdatePreview {
   readonly instanceId: string;
   readonly from: ReleaseCoordinates;
@@ -186,7 +174,7 @@ export interface UpdatePreview {
   /** The central migrations the release adds, in the order they ran on the copy. */
   readonly migrations: readonly string[];
   readonly gateway: GatewayImageChange;
-  /** The groups whose own image is rebuilt on the new release's image once it is committed (KTD6). */
+  /** The groups whose own image is rebuilt on the new release's image once it is committed. */
   readonly groupImages: readonly DerivedImageGroup[];
   /** Those groups then run the previous agent-runner dependencies until their rebuild finishes. */
   readonly agentRunnerLockChanged: boolean;
@@ -214,10 +202,8 @@ function checkoutRuntime(seams: UpdateSeams): CheckoutRuntime {
 }
 
 /**
- * The release `update` would deploy: the tool's own commit, on the track the
- * operator names or the assistant's own, from the source remote the operator
- * names or the assistant's recorded one. A request pinned to a commit the
- * tool's checkout has since moved off is refused.
+ * The release `update` would deploy: the tool's own commit. A request pinned
+ * to a commit the tool's checkout has since moved off is refused.
  */
 export async function resolveUpdateIntent(
   paths: ControlPlanePaths,
@@ -270,7 +256,6 @@ export function serviceRefusal(
   }
 }
 
-/** The assistant's service must run its host; `serviceRefusal` says why it does not. */
 function assertHostRunning(runtime: InstanceRuntimeConfig, dependencies: UpdateDependencies): void {
   const id = runtime.instance_id;
   const handle = createServiceControl(
@@ -320,7 +305,6 @@ function gigabytes(bytes: number): string {
   return `${(bytes / 1024 ** 3).toFixed(1)} GB`;
 }
 
-/** The size Docker reports for the agent image the assistant runs, its release's own tag. */
 async function agentImageBytes(
   runtime: InstanceRuntimeConfig,
   reservation: InstanceReservation,
@@ -350,7 +334,7 @@ async function agentImageBytes(
 /**
  * Whether the agent image the release would build for this assistant is
  * already built and shared under its content key, read before anything is
- * staged: from the tool's checkout, which is the release (R6), and the
+ * staged: from the tool's checkout, which is the release, and the
  * assistant's own `INSTALL_CJK_FONTS`, which its build is given.
  */
 async function releaseAgentImageShared(
@@ -372,7 +356,7 @@ async function releaseAgentImageShared(
 
 /**
  * Room for what the update adds before it can delete anything, mirroring the
- * upstream updater's check (KTD14), measured on the filesystem holding the
+ * upstream updater's check, measured on the filesystem holding the
  * physical `state/`: the snapshot of `state/` the switch takes; the staged
  * release's install and build, for which the live release's folder stands,
  * unless it is staged already; the dry run's copy of the central database;
@@ -411,7 +395,7 @@ async function assertFreeDisk(
 
 /**
  * Whether this update supersedes an operation with no release to return to
- * (KTD9, `supersedable`): one closed for fix-forward, or an update with no
+ * (`supersedable`): one closed for fix-forward, or an update with no
  * rollback target, to another release. Such an assistant may be fenced, so
  * its host is not required to serve, and the release it ran is not checked.
  */
@@ -494,13 +478,12 @@ async function dryRunDatabase(workingDirectory: string, stagedRelease: string): 
 }
 
 /**
- * Try a release's own migrations on a copy of the live central database
- * (KTD15): a single-step online backup into the staged release's scratch
- * `data/`, then the release's migration script, run from the release's real
- * path. The live migrations must be as staging recorded them afterwards.
- * Whatever the run made where the release's links go is then removed, so the
- * release holds none of it (KTD3). Returns the migrations the release adds,
- * in the order they ran.
+ * Try a release's own migrations on a copy of the live central database: a
+ * single-step online backup into the staged release's scratch `data/`, then
+ * the release's migration script, run from the release's real path. The live
+ * migrations must be as staging recorded them afterwards. Whatever the run
+ * made where the release's links go is then removed, so the release holds
+ * none of it. Returns the migrations the release adds, in the order they ran.
  */
 export async function dryRunReleaseMigrations(
   request: MigrationDryRun,
@@ -552,7 +535,6 @@ export async function dryRunReleaseMigrations(
   );
 }
 
-/** What a staged release keeps of its dry run: the live migrations it was tried against, and those it added. */
 interface KeptDryRun {
   readonly live: readonly string[];
   readonly added: readonly string[];
@@ -602,12 +584,7 @@ async function sameFiles(left: string, right: string, files: readonly string[]):
   return true;
 }
 
-/**
- * Stage the checked release while the assistant serves (`stageRelease`),
- * with its migration dry run on the release before its links are made, and
- * the gateway image it names; then preview the switch. A release staged
- * complete by an earlier update is reused with the dry run it kept.
- */
+/** A release staged complete by an earlier update is reused with the dry run it kept. */
 async function stageUpdate(
   operation: InstanceOperation,
   { reservation, runtime, target }: CheckedUpdate,
@@ -715,10 +692,9 @@ export async function prepareUpdate(
 }
 
 /**
- * Ask `confirm` about a staged update, then record it at `staged` (KTD2),
- * from the release the registry names, with the live schema staging read.
- * A decline records nothing; the staged release is left for the next update.
- * Returns the record, or undefined when declined.
+ * Record a confirmed update at `staged`, from the release the registry names,
+ * with the live schema staging read. A decline records nothing and returns
+ * undefined; the staged release is left for the next update.
  */
 export async function confirmStagedUpdate(
   operation: InstanceOperation,
@@ -734,7 +710,6 @@ export async function confirmStagedUpdate(
   });
 }
 
-/** The preview, one fact per line. */
 export function updatePreviewLines(preview: UpdatePreview): string[] {
   const { from, to, gateway, groupImages } = preview;
   const groups = groupImages.map((group) => `${printableName(group.name)} (${group.id})`).join(', ');
@@ -761,7 +736,6 @@ export function updatePreviewLines(preview: UpdatePreview): string[] {
   ];
 }
 
-/** An update that failed before its release was committed, as recovery receives it. */
 interface FailedUpdate {
   /** The update's record as the failure left it: its phase says how far it got. */
   readonly record: OperationRecord;
@@ -779,7 +753,7 @@ const STARTED: ReadonlySet<OperationRecord['phase']> = new Set(['started', 'veri
  * `targetMayHaveStarted`), the update is rolled back by the rollback rules,
  * which its own confirmation covers: code only when neither schema moved,
  * else the snapshot its fence took. One with no rollback target is closed for
- * fix-forward instead once its release started (KTD9). Before that the
+ * fix-forward instead once its release started. Before that the
  * release it left is served again (`serveLeftRelease`) and the record
  * discarded, the staged release kept for the next update: a refusal before
  * the release started. When that return fails too, or the update has no
@@ -874,14 +848,14 @@ async function releasePins(host: CutoverHost, release: ReleaseCoordinates): Prom
 const RESUMED_FENCED: ReadonlySet<OperationRecord['phase']> = new Set(['fenced', 'snapshotted', 'switched']);
 
 /**
- * Re-establish the fence of an update resumed while fenced (KTD1): whatever
+ * Re-establish the fence of an update resumed while fenced: whatever
  * started since (a reboot, a login) is stopped and the instance proven quiet
  * again before anything goes on, and the stop is recorded afresh. Once the
  * update took its snapshot, a fence in force that ended the release the
  * update left means that release was served again since (a return that
  * refused the update and was cut short) and may have recorded more, so the
- * snapshot is taken again under this fence before the update goes on (KTD4);
- * one this fence already took is kept. A fence that ended the update's own
+ * snapshot is taken again under this fence before the update goes on; one
+ * this fence already took is kept. A fence that ended the update's own
  * release leaves the snapshot as the release it left wrote it.
  */
 async function refence(host: CutoverHost, record: OperationRecord): Promise<OperationRecord> {
@@ -897,15 +871,10 @@ async function refence(host: CutoverHost, record: OperationRecord): Promise<Oper
 
 /**
  * Run the update from the phase its record reached until its release is
- * committed. Before the fence the serving OneCLI runtime is re-verified;
- * then the assistant is fenced, its state snapshotted as the release it
- * left last wrote it (`snapshots/<op>/`, keyed to the fence), switched to the
- * release, and started; main's skills are reconciled, the release verified,
- * its follow-ups planned, and the registry compare-and-swap commits it. A
- * resume between the fence and the start fences again first, so a switch is
- * always followed by a start that reads the service definition it installed.
- * Returns why the release's Google Chat waits on a new sign-in when this run
- * verified it serving through one (KTD12), and null otherwise.
+ * committed. A resume between the fence and the start fences again first, so
+ * a switch is always followed by a start that reads the service definition it
+ * installed. Returns why the release's Google Chat waits on a new sign-in when
+ * this run verified it serving through one, and null otherwise.
  */
 async function runUpdate(host: CutoverHost, start: OperationRecord): Promise<string | null> {
   const { operation, layout, reporter } = host;
@@ -977,13 +946,12 @@ async function runUpdate(host: CutoverHost, start: OperationRecord): Promise<str
   }
 }
 
-/** Where an update left the assistant: the release it runs, and the one it left. */
 export interface UpdatedAssistant {
   readonly from: ReleaseCoordinates;
   readonly to: ReleaseCoordinates;
-  /** The release it left is kept to roll back to: false for an update with no rollback target (KTD9). */
+  /** The release it left is kept to roll back to: false for an update with no rollback target. */
   readonly rollbackTarget: boolean;
-  /** Why its Google Chat waits on a new sign-in, which the release was served through (KTD12); null otherwise. */
+  /** Why its Google Chat waits on a new sign-in, which the release was served through; null otherwise. */
   readonly signInNeeded: string | null;
 }
 

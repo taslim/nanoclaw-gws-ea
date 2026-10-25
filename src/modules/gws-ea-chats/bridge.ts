@@ -65,7 +65,7 @@ const mainAction = defineGuardedAction({
       : DENY('Only main may hand work to, admit, decline or leave a chat.'),
 });
 
-/** Native worker identity comes from the profile and active registry, never from an action field. */
+/** The serving agent is checked against the profile and the job registry, never against an action field. */
 export async function requireServingChat(session: Session): Promise<Chat> {
   const current = await getSession(session.id);
   const chat = session.messaging_group_id === null ? undefined : await getChat(session.messaging_group_id);
@@ -232,7 +232,10 @@ async function checkHandoffLinks(
 function handoffId(session: Session, requestId: string): string {
   return `chat-handoff-${createHash('sha256').update(`${session.id}\0${requestId}`).digest('hex')}`;
 }
-/** Caller owns the chat conversation tail. U12 calls this after its actual serving-pointer swap. */
+/**
+ * Caller owns the chat conversation tail. While a move is pending, handoffs wait for the move's own
+ * `wake: false` call, made once the chat's serving agent is final.
+ */
 export async function flushChatHandoffs(chatId: string, options: { readonly wake?: boolean } = {}): Promise<void> {
   const chat = await getChat(chatId);
   if (!chat || !chatIsActive(chat)) return;

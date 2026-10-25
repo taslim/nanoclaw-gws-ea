@@ -3,27 +3,20 @@
  * move to the tool's release, one at a time, in the order `list` shows them.
  *
  * Before anything runs, each assistant is checked as `update --id` checks it,
- * in its order, lock-free and read-only as `list` reads: a removal under way,
- * an unfinished update or rollback, an unfinished create, the release
- * resolution itself (on its own track, forward, keeping its OneCLI, Postgres,
- * and provider setup), and a running service. One that cannot move is
- * skipped and reported, with the command that moves it; each other one then
- * takes its turn through `update --id`'s own path, which checks everything
- * again under its lock. A committed update's follow-ups are finished before
- * anything else, as `update --id` finishes them, even at the tool's release;
- * they run through the assistant's host, so a stopped one is skipped first.
- * The tool's commit is read once, as the run begins, and every check and
- * turn is pinned to it: a turn that finds the tool's checkout moved refuses
- * before it stages anything, so one run never deploys two releases.
+ * lock-free and read-only as `list` reads. One that cannot move is skipped
+ * and reported, with the command that moves it; each other one then takes its
+ * turn through `update --id`'s own path, which checks everything again under
+ * its lock. A committed update's follow-ups are finished before anything
+ * else, as `update --id` finishes them, even at the tool's release. The tool's
+ * commit is read once, as the run begins, and every check and turn is pinned
+ * to it: a turn that finds the tool's checkout moved refuses before it stages
+ * anything, so one run never deploys two releases.
  *
- * The plan is shown before anything is staged: each assistant that moves,
- * from and to, with the database migrations of the release it has not
- * applied, then each one skipped and why. It is confirmed once, or by
- * `--yes`; a no changes nothing. The turns then run without asking. A
- * failure, or another command holding the assistant, stops the run there,
- * leaving the rest unattempted. An interrupt ends the run as it ends any
- * command: the assistant in its turn is left as an interrupted `update --id`
- * leaves it, which `gws-ea update --id` continues, and the rest untouched.
+ * The plan is confirmed once, or by `--yes`, before anything is staged; the
+ * turns then run without asking. A failure, or another command holding the
+ * assistant, stops the run there, leaving the rest unattempted. An interrupt
+ * leaves the assistant in its turn as an interrupted `update --id` leaves it,
+ * and the rest untouched.
  */
 import Database from 'better-sqlite3';
 
@@ -40,7 +33,6 @@ import { GwsEaError, releaseLine, releaseOf, sameRelease, shortCommit, type Rele
 import { resolveUpdateIntent, serviceRefusal, type UpdatedAssistant, type UpdateSeams } from './update.js';
 import { readCentralMigrations } from './verify.js';
 
-/** What `update --all` checks the assistants with. */
 export interface UpdateAllContext {
   readonly paths: ControlPlanePaths;
   readonly serviceHelpers: NanoclawServiceHelpers;
@@ -50,9 +42,8 @@ export interface UpdateAllContext {
   readonly releaseMigrations?: () => Promise<readonly string[]>;
 }
 
-/** What an assistant's turn does, as its plan shows it. */
 export type PlannedTurn =
-  /** It moves `from` → `to`, adding `migrations` to its database; undefined when its database could not be read. */
+  /** `migrations` are those it has not applied; undefined when its database could not be read. */
   | {
       readonly kind: 'update';
       readonly from: ReleaseCoordinates;
@@ -62,25 +53,22 @@ export type PlannedTurn =
   /** It already runs `release`, committed by an update whose follow-ups are left. */
   | { readonly kind: 'follow_ups'; readonly release: ReleaseCoordinates };
 
-/** One registered assistant: it takes `turn`, or it is skipped for `reason`. */
 export type UpdateCandidate =
   | { readonly instanceId: string; readonly eligible: true; readonly turn: PlannedTurn }
   | { readonly instanceId: string; readonly eligible: false; readonly reason: string };
 
 export interface UpdateAllPlan {
-  /** The tool's own commit as the run began: the release every turn deploys, or refuses to move from. */
+  /** The tool's own commit as the run began, which every turn is pinned to. */
   readonly toolCommit: string;
   /** Every registered assistant, in `list` order. */
   readonly candidates: readonly UpdateCandidate[];
 }
 
-/** How one assistant's `update --id` path ended when it did not fail. */
 export type AssistantUpdate =
   | { readonly kind: 'updated'; readonly updated: UpdatedAssistant }
   /** Its recorded update to the release it would deploy only had follow-ups left, and they finished. */
   | { readonly kind: 'completed'; readonly release: ReleaseCoordinates };
 
-/** How one assistant's turn ended: its update's end, a failure, or another command holding it. */
 export type UpdateTurn =
   | AssistantUpdate
   | { readonly kind: 'failed'; readonly exitCode?: number }
@@ -97,7 +85,7 @@ export function initialUpdateTarget(candidate: UpdateCandidate): UpdateTargetRes
     : { instance_id: candidate.instanceId, outcome: 'skipped', reason: candidate.reason };
 }
 
-/** The run's stop summary; its outcome is the exit code's. */
+/** `exitCode`, when set, overrides the exit code `outcome` implies. */
 export interface UpdateAllSummary {
   readonly outcome: 'ready' | 'failed' | 'busy';
   readonly headline: string;
@@ -107,7 +95,6 @@ export interface UpdateAllSummary {
   readonly exitCode?: number;
 }
 
-/** Why the assistant's update or rollback record keeps it from an update, naming what moves it on, as `status` does. */
 function operationRefusal({ operation }: ListedAssistant): string | undefined {
   switch (operation.state) {
     case 'none':
@@ -120,23 +107,21 @@ function operationRefusal({ operation }: ListedAssistant): string | undefined {
   }
 }
 
-/** What `update --id` would do with an assistant, as far as its release decides: its turn, or why it has none. */
 type IntendedTurn =
   | {
       readonly kind: 'update';
       readonly from: ReleaseCoordinates;
       readonly to: ReleaseCoordinates;
-      /** Its `state/`, whose central database names the migrations it has applied. */
+      /** Its `state/` path, whose central database records the migrations it has applied. */
       readonly state: string;
     }
   | { readonly kind: 'follow_ups'; readonly release: ReleaseCoordinates }
   | { readonly kind: 'refused'; readonly reason: string };
 
 /**
- * Whether `update --id` would take this assistant forward, decided as it
- * decides, in its order. Its own refusals are reported with their own
- * message; anything else is not an answer, so it is thrown, naming the
- * assistant, and nothing runs.
+ * Decided as `update --id` decides, in its order. Its own refusals are
+ * reported with their own message; anything else is not an answer, so it is
+ * thrown, naming the assistant, and nothing runs.
  */
 async function intendedTurn(
   context: UpdateAllContext,
@@ -185,11 +170,9 @@ async function intendedTurn(
 }
 
 /**
- * The release's migrations the central database under `state` has not
- * applied, in the order the release applies them; undefined when that
- * database cannot be read. Only read, never changed: the plan names them,
- * and each turn's dry run on a copy of the database is what its update is
- * held to.
+ * In the order the release applies them; undefined when the database cannot
+ * be read. Only read: the plan names them, and each turn's dry run on a copy
+ * of the database is what its update is held to.
  */
 function unappliedMigrations(state: string, release: readonly string[]): readonly string[] | undefined {
   let applied: readonly string[];
@@ -202,7 +185,6 @@ function unappliedMigrations(state: string, release: readonly string[]): readonl
   return release.filter((name) => !applied.includes(name));
 }
 
-/** Whether this assistant takes a turn, and what it does; `releaseMigrations` names the release's, once one moves. */
 async function classify(
   context: UpdateAllContext,
   listed: ListedAssistant,
@@ -240,10 +222,8 @@ export async function registeredReleaseMigrations(): Promise<readonly string[]> 
 }
 
 /**
- * Every registered assistant in `list` order, each eligible, with what its
- * turn does, or skipped with why. The tool's own commit is resolved once
- * first: a tool that cannot deploy stops the run before any assistant is
- * checked.
+ * The tool's own commit is resolved once, first: a tool that cannot deploy
+ * stops the run before any assistant is checked.
  */
 export async function planUpdateAll(context: UpdateAllContext): Promise<UpdateAllPlan> {
   const { paths, seams } = context;
@@ -275,7 +255,6 @@ function skippedLines(candidates: readonly UpdateCandidate[]): string[] {
   );
 }
 
-/** The migrations a planned update adds, as its preview names them. */
 function migrationsLine(migrations: readonly string[] | undefined): string {
   if (migrations === undefined) return 'unknown (its database could not be read)';
   return migrations.length > 0 ? migrations.join(', ') : 'none';
@@ -290,7 +269,6 @@ function turnLine(instanceId: string, turn: PlannedTurn): string {
   }
 }
 
-/** The plan, one line per assistant: each turn, in order, then each one skipped. */
 function planLines(candidates: readonly UpdateCandidate[]): string[] {
   const turns = candidates.flatMap((candidate) =>
     candidate.eligible ? [turnLine(candidate.instanceId, candidate.turn)] : [],
@@ -298,7 +276,6 @@ function planLines(candidates: readonly UpdateCandidate[]): string[] {
   return [...turns, ...skippedLines(candidates)];
 }
 
-/** One line per assistant whose turn ended, by how it ended. */
 function endedLines(ended: ReadonlyMap<string, AssistantUpdate>): Record<AssistantUpdate['kind'], string[]> {
   const lines: Record<AssistantUpdate['kind'], string[]> = { updated: [], completed: [] };
   for (const [id, update] of ended) {
@@ -314,13 +291,11 @@ function endedLines(ended: ReadonlyMap<string, AssistantUpdate>): Record<Assista
   return lines;
 }
 
-/** What the run did and skipped: each assistant's line, updated first, skipped last. */
 function outcomeLines(ended: ReadonlyMap<string, AssistantUpdate>, skipped: readonly string[]): string[] {
   const { updated, completed } = endedLines(ended);
   return [...updated, ...completed, ...skipped];
 }
 
-/** How many assistants ended each way, naming only the ways some did. */
 function counted(ended: ReadonlyMap<string, AssistantUpdate>, skipped: number): string {
   const { updated, completed } = endedLines(ended);
   return (
@@ -335,7 +310,6 @@ function counted(ended: ReadonlyMap<string, AssistantUpdate>, skipped: number): 
     .join(', ');
 }
 
-/** How the run reads when a turn stopped it: its outcome and headline. */
 function stopOf(
   turn: Exclude<UpdateTurn, AssistantUpdate>,
   instanceId: string,
@@ -353,11 +327,8 @@ function stopOf(
 }
 
 /**
- * Show the plan and ask `confirm` about it once, before anything is staged;
- * a no changes nothing. Then give each eligible assistant its turn through
- * `updateOne`, in order, pinned to the plan's tool commit, and summarize the
- * run; a failed or busy turn stops it there. With nothing to update, nothing
- * is asked.
+ * `confirm` is asked once, before any turn, and not at all when nothing can
+ * move; a failed or busy turn stops the run there.
  */
 export async function runUpdateAll(
   plan: UpdateAllPlan,

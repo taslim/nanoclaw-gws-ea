@@ -40,9 +40,8 @@ import { getUser } from './db/users.js';
 import { getUserDm, upsertUserDm } from './db/user-dms.js';
 
 /**
- * Persist an already-authenticated direct conversation as the DM mapping for
- * a known user. Unlike ensureUserDm(), this never calls an adapter or invents
- * a conversation: callers must supply the exact row proven by an inbound DM.
+ * Unlike ensureUserDm(), never calls an adapter or invents a conversation:
+ * callers supply the exact row an authenticated inbound DM proved.
  */
 export async function rememberAuthenticatedUserDm(
   userId: string,

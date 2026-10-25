@@ -32,13 +32,12 @@ export interface BrowserErrand {
   readonly source: string;
 }
 
-/** Whether the delegating agent was told, had been told already, or had nowhere to be told. */
 export type DelegatorNotice = 'written' | 'already-written' | 'no-main' | 'no-principal' | 'no-delegating-session';
 
 /**
  * Tell the agent that delegated a browser errand `text` now, once per `id`, and wake it: main in its shared
- * conversation, naming the job so its open matter comes with it; any other agent with browser access in the
- * session it delegated from (R28). No other agent hears of it.
+ * conversation, naming the job so its open matter comes with it; any other delegator in the session it delegated
+ * from. No other agent hears of it.
  */
 export async function tellDelegator(
   errand: BrowserErrand,
@@ -73,9 +72,8 @@ export async function tellDelegator(
 }
 
 /**
- * Tell the agent that delegated a browser errand of its purchase, as `tellDelegator` does; once its group's
- * browser access was removed, main hears instead, since main is the one left to record the purchase's outcome
- * (KTD9). The note names no job: main never holds another group's errand.
+ * Once the delegating group's browser access was removed, main hears instead, since main is the one left to
+ * record the purchase's outcome. The note names no job: main never holds another group's errand.
  */
 async function tellOfPurchase(
   errand: BrowserErrand,
@@ -86,7 +84,6 @@ async function tellOfPurchase(
   return writeNoteForMain({ ...note, wake: true });
 }
 
-/** A purchase notice its browser job's delegating group hears once (KTD9, KTD10). */
 export interface OncePurchaseNotice {
   /** The table whose `notified_at` marks the record told. */
   readonly table: string;
@@ -97,8 +94,8 @@ export interface OncePurchaseNotice {
 }
 
 /**
- * Tells the delegating group of `record`'s job of it, as `tellOfPurchase` does, then marks it told with a
- * compare-and-set; a notice that cannot go out yet stays owed for the host's sweep.
+ * Marks `record` told, with a compare-and-set, only once its note is written; a notice that cannot go out yet
+ * stays owed for the host's sweep.
  */
 export async function tellOfPurchaseOnce(
   db: DbDriver,
@@ -123,7 +120,6 @@ export async function tellOfPurchaseOnce(
   );
 }
 
-/** What an attempt was, as main reads it: a booking or an order, free or paid with its total, on its merchant. */
 export function attemptSummary(attempt: Pick<PurchaseAttemptRow, 'kind' | 'facts_json' | 'site'>): {
   booking: boolean;
   what: string;
@@ -142,10 +138,7 @@ export function attemptSummary(attempt: Pick<PurchaseAttemptRow, 'kind' | 'facts
   };
 }
 
-/**
- * What the delegating group reads of an unconfirmed attempt: what, when, its attempt id, and what settles it.
- * to: main, delegator
- */
+/** to: main, delegator */
 async function unconfirmedText(job: BrowserJob, attempt: PurchaseAttemptRow): Promise<string> {
   const { what, total } = attemptSummary(attempt);
   return (
@@ -157,7 +150,7 @@ async function unconfirmedText(job: BrowserJob, attempt: PurchaseAttemptRow): Pr
   );
 }
 
-/** Tells an unconfirmed attempt's delegating group of it, once; a notice that cannot go out yet waits for the sweep. */
+/** At most once; a notice that cannot go out yet waits for the host's sweep. */
 export async function notifyUnconfirmedPurchase(attempt: PurchaseAttemptRow, db: DbDriver): Promise<void> {
   if (attempt.resolution || !attempt.unconfirmed_at || attempt.notified_at) return;
   await tellOfPurchaseOnce(db, attempt, {

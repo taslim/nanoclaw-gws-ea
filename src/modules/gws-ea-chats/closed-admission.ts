@@ -7,7 +7,7 @@ import type { ChatJoinFacts } from './join.js';
 import { refreshChatRoster } from './roster.js';
 import { ensureChatWiring } from './wiring-policy.js';
 
-/** A native rejoin or a new principal request starts a new lifetime only after the previous one is closed. Caller owns the conversation tail. */
+/** Rejoining or reaching out to a closed chat starts a new admission lifetime. Caller owns the conversation tail. */
 export async function reopenClosedChat(
   chat: Chat,
   facts: ChatJoinFacts,

@@ -1,4 +1,4 @@
-/** The consent engine's reading of a choice's wording, and what it decides for each choice (KTD11). */
+/** The consent engine's reading of a choice's wording, and what it decides for each choice. */
 import { describe, expect, it } from 'vitest';
 
 import {

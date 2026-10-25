@@ -1,8 +1,8 @@
 /**
- * Covers R20 and R65 for what a session keeps: each external-email session
+ * What a session keeps: each external-email session
  * gets its own Claude home and its own inbox, so one thread's transcript and
  * files never reach another thread's container, and nothing it mounts reaches
- * main's folder, where main keeps what it knows of people (R10, R15).
+ * main's folder, where main keeps what it knows of people.
  */
 import fs from 'node:fs';
 import path from 'node:path';

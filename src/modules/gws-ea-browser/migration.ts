@@ -1,6 +1,6 @@
 import type { ModuleMigrationName, PortableMigration } from '../../db/migrations/index.js';
 
-/** Main's delegated reservation limits are independent of facts supplied by a page or browser job. */
+/** A delegating agent's reservation bounds, independent of facts supplied by a page or browser job. */
 export const browserReservationBoundsMigration: PortableMigration & { name: ModuleMigrationName } = {
   version: 1,
   name: 'module:gws-ea-browser:reservation-bounds',
@@ -83,8 +83,8 @@ export const browserWatchesMigration: PortableMigration & { name: ModuleMigratio
 };
 
 /**
- * A venue's release schedule, written once when its watch is created and outside the
- * bounds the principal approves. Watches set before it have none.
+ * A venue's release schedule, written once when its watch is created and outside the bounds the principal
+ * approves. Watches set before it have none.
  */
 export const browserWatchReleaseMigration: PortableMigration & { name: ModuleMigrationName } = {
   version: 1,
@@ -197,10 +197,9 @@ export const browserSiteLeasesMigration: PortableMigration & { name: ModuleMigra
 };
 
 /**
- * Host-generated credentials (KTD6): each operation's binding, candidate and
- * source references, phase and decided settlement; never a value. A finalized row is the
- * ownership record of the Login it names. Rows outlive jobs, so `job_id` is
- * deliberately not a foreign key.
+ * Host-generated credentials: each operation's binding, candidate and source references, phase and decided
+ * settlement; never a value. A finalized row is the ownership record of the Login it names. Rows outlive jobs, so
+ * `job_id` is deliberately not a foreign key.
  */
 export const browserCredentialAttemptsMigration: PortableMigration & { name: ModuleMigrationName } = {
   version: 1,
@@ -334,9 +333,9 @@ export const browserPurchaseMigration: PortableMigration & { name: ModuleMigrati
 };
 
 /**
- * Consent stops and the principal's standing grants (KTD11). A stop is one wording the engine could not agree
- * to on its own, for one job's form; a grant is the principal's agreement to that exact wording on one site
- * and frame origin, live until main withdraws it. Grants outlive jobs, so they name no job.
+ * Consent stops and the principal's standing grants. A stop is one wording the engine could not agree to on its
+ * own, for one job's form; a grant is the principal's agreement to that exact wording on one site and frame
+ * origin, live until withdrawn. Grants outlive jobs, so they name no job.
  */
 export const browserConsentMigration: PortableMigration & { name: ModuleMigrationName } = {
   version: 1,
@@ -374,9 +373,9 @@ export const browserConsentMigration: PortableMigration & { name: ModuleMigratio
 };
 
 /**
- * Incidents (KTD10): spending that may have slipped past the host, each recorded with its job's stop. A job
- * records one incident per kind and evidence; an incident from a page names no purchase attempt, and a late
- * confirmation names the attempt main had recorded not placed.
+ * Incidents: spending that may have slipped past the host, each recorded with its job's stop. A job records one
+ * incident per kind and evidence; an incident from a page names no purchase attempt, and a late confirmation names
+ * the attempt recorded not placed.
  */
 export const browserIncidentsMigration: PortableMigration & { name: ModuleMigrationName } = {
   version: 1,
@@ -400,9 +399,9 @@ export const browserIncidentsMigration: PortableMigration & { name: ModuleMigrat
 };
 
 /**
- * Personal-data disclosures (KTD19): main's word that one errand may give one site one of the principal's
- * stored private values. A row names the value by its id in the privacy store and never holds it, so no second
- * copy exists; a value removed there leaves its rows naming nothing.
+ * Personal-data disclosures: a delegating agent's word that one of its errands may give one site one of the
+ * principal's stored private values. A row names the value by its id in the privacy store and never holds it, so
+ * no second copy exists; a value removed there leaves its rows naming nothing.
  */
 export const browserDisclosuresMigration: PortableMigration & { name: ModuleMigrationName } = {
   version: 1,
@@ -421,9 +420,9 @@ export const browserDisclosuresMigration: PortableMigration & { name: ModuleMigr
 };
 
 /**
- * Checkouts on any site (KTD3, KTD5, KTD7): a free commit's money-less attempt, each paid attempt's payment
- * platform and contact-email account key, and the change a replacement card names, which the change cap counts.
- * Free attempts outlive jobs, so `job_id` is deliberately not a foreign key.
+ * Checkouts on any site: a free commit's money-less attempt, each paid attempt's payment platform and
+ * contact-email account key, and the change a replacement card names, which the change cap counts. Free attempts
+ * outlive jobs, so `job_id` is deliberately not a foreign key.
  */
 export const browserGenericCheckoutMigration: PortableMigration & { name: ModuleMigrationName } = {
   version: 1,
@@ -453,9 +452,9 @@ export const browserGenericCheckoutMigration: PortableMigration & { name: Module
 };
 
 /**
- * Wake-on-change watches (KTD20): on a site with no reader, the region the agent marked, its normalized text as
- * the agent last saw it, when it was marked, and since when the host has not found it. Reader watches leave them
- * null. Wakes are the watch's own notices, so they need no table of their own.
+ * Wake-on-change watches: on a site with no reader, the region the agent marked, its normalized text as the agent
+ * last saw it, when it was marked, and since when the host has not found it. Reader watches leave them null. Wakes
+ * are the watch's own notices, so they need no table of their own.
  */
 export const browserWatchRegionMigration: PortableMigration & { name: ModuleMigrationName } = {
   version: 1,
@@ -471,10 +470,10 @@ export const browserWatchRegionMigration: PortableMigration & { name: ModuleMigr
 };
 
 /**
- * Purchase outcomes (KTD8, KTD9): where each attempt's outcome came from (its page, a step of its checkout, the
- * merchant's email or the principal), when it became unconfirmed and when its delegating group heard so, and
- * the card that showed main's recorded "not placed". A job a `purchase` answered waiting-on-earlier waits on its
- * site until no attempt there is unresolved; `released_at` marks one whose wake is still to be told.
+ * Purchase outcomes: where each attempt's outcome came from (its page, a step of its checkout, the merchant's
+ * email or the principal), when it became unconfirmed and when that was told, and the card that showed the
+ * principal a recorded "not placed". A job a `purchase` answered waiting-on-earlier waits on its site until no
+ * attempt there is unresolved; `released_at` marks one whose wake is still to be told.
  */
 export const browserPurchaseOutcomesMigration: PortableMigration & { name: ModuleMigrationName } = {
   version: 1,
@@ -501,8 +500,8 @@ export const browserPurchaseOutcomesMigration: PortableMigration & { name: Modul
 };
 
 /**
- * Historical consent-wait phase (KTD11). Its first-read and navigation checks could not observe existing
- * socket submissions. The later credential-uncertainty migration retires it; keep this schema step for upgrades.
+ * Historical consent-wait phase. Its first-read and navigation checks could not observe existing socket
+ * submissions. The later credential-uncertainty migration retires it; keep this schema step for upgrades.
  */
 export const browserCredentialConsentHoldMigration: PortableMigration & { name: ModuleMigrationName } = {
   version: 1,

@@ -1,7 +1,7 @@
 /**
- * Every gog command `main` may run in Google Workspace (KTD2), generated
- * rather than picked, so a hand-made list never keeps the assistant from
- * ordinary work in its files. The token, not this list, is the boundary.
+ * Every gog command `main` may run in Google Workspace, generated rather
+ * than picked, so a hand-made list never keeps the assistant from ordinary
+ * work in its files. The token, not this list, is the boundary.
  *
  * gog v0.43.0 takes exact command paths (`GOG_ENABLE_COMMANDS_EXACT`, where a
  * parent does not enable its children), so the list names each one:

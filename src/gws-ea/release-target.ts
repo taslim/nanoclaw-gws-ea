@@ -1,10 +1,10 @@
 /**
- * The release create and update deploy: the tool's own commit (R6). The
- * tool's checkout must have no tracked changes and its commit must be on the
- * chosen track, so everything the tool writes is correct for the release by
- * construction, and no assistant runs a commit newer than the tool. An update
- * also moves only forward (KTD4) and keeps the assistant's OneCLI, Postgres,
- * and provider setup (R9, KTD20); going back is `rollback`.
+ * The release create and update deploy: the tool's own commit, never the
+ * track's tip. The tool's checkout must have no tracked changes and its commit
+ * must be on the chosen track, so everything the tool writes is correct for
+ * the release by construction, and no assistant runs a commit newer than the
+ * tool. An update also moves only forward and keeps the assistant's OneCLI,
+ * Postgres, and provider setup; going back is `rollback`.
  */
 import { locateOnTrack, resolveToolCommit, type CheckoutRuntime, type TrackPosition } from './checkout.js';
 import { ONECLI_POSTGRES_IMAGE } from './onecli-compose.js';
@@ -16,13 +16,11 @@ import type { ReleaseSource } from './release-tracks.js';
 import { GwsEaError, shortCommit, type InstanceReservation, type ReleaseCoordinates } from './types.js';
 import type { ProviderCredentialMetadata } from '../provider-credential.js';
 
-/** The tool's own provider setup, which the driver reads from `setup/providers`. */
 export interface ToolProviderSetup {
-  /** The credential metadata the tool's setup declares for `provider`, or undefined when it does not compose it. */
+  /** Undefined when the tool's setup does not compose `provider`. */
   readonly credentialMetadata: (provider: string) => ProviderCredentialMetadata | undefined;
 }
 
-/** The assistant an update moves, and the tool's provider setup it is held to. */
 export interface UpdatedAssistant {
   readonly paths: ControlPlanePaths;
   readonly reservation: InstanceReservation;
@@ -40,17 +38,16 @@ export interface UpdateTargetRequest extends CreateTargetRequest {
 }
 
 export interface ReleaseTarget {
-  /** The tool's own commit on the track: what create reserves, and an update's target. */
   readonly release: ReleaseCoordinates;
 }
 
 export interface UpdateReleaseTarget extends ReleaseTarget {
-  /** The staged release preflight's input, less its checkout: the assistant's provider and credential (KTD20). */
+  /** The assistant's own provider and credential, which the update keeps. */
   readonly preflight: Omit<ReleasePreflightInput, 'checkoutRoot'>;
 }
 
 export interface ReleaseTargetRuntime extends CheckoutRuntime {
-  /** The tool's checkout; the one this control plane runs from by default. */
+  /** The tool's checkout; defaults to the one this control plane runs from. */
   readonly toolRoot?: string;
 }
 
@@ -96,11 +93,6 @@ function assertMovesForward(
   );
 }
 
-/**
- * Resolve the release create reserves or an update deploys. Both deploy the
- * tool's own commit, never the track's tip: a tool behind the tip deploys
- * its own commit.
- */
 export function resolveReleaseTarget(
   request: UpdateTargetRequest,
   runtime?: ReleaseTargetRuntime,

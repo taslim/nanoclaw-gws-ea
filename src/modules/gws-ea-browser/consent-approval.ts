@@ -1,10 +1,10 @@
 /**
- * The principal's side of the consent engine (KTD11, R17). A `consent_required` stop records one wording the
- * engine would not agree to on its own; the browser agent asks the principal with `request_consent` and that
- * stop's id, and the principal approves or rejects it on a card showing the site and the exact wording. An
- * approval stands for that wording on that site and frame origin until the wording changes, which stops
- * again, or the principal withdraws it through main. A rejection leaves the box unticked, and the job is told; a
- * credential form held for that stop is left unknown, never filled again.
+ * The principal's side of the consent engine. A `consent_required` stop records one wording the engine would not
+ * agree to on its own; the browser agent asks the principal with `request_consent` and that stop's id, and the
+ * principal approves or rejects it on a card showing the site and the exact wording. An approval stands for that
+ * wording on that site and frame origin until the wording changes, which stops again, or the principal withdraws
+ * it through an agent with browser access. A rejection leaves the box unticked, and the job is told; a credential
+ * form held for that stop is left unknown, never filled again.
  */
 import { noVerifiedPrincipalMessage } from '../gws-ea-profile/approval-wording.js';
 import { getDomain } from 'tldts';
@@ -75,7 +75,7 @@ export const browserConsentGuard = defineGuardedAction({
   },
 });
 
-/** A site as main names it, an address or a domain, as grants key it: its registrable domain. */
+/** An address or a bare domain, keyed as grants are: by its registrable domain. */
 function siteKey(raw: string): string {
   const trimmed = raw.trim().toLowerCase();
   try {
@@ -86,7 +86,6 @@ function siteKey(raw: string): string {
   }
 }
 
-/** What the principal reads: the site, the exact wording, and what approving it means. */
 function consentQuestion(stop: ConsentStop): string {
   return [
     `To continue your errand, ${stop.site} asks me to agree to this:`,
@@ -357,13 +356,13 @@ export const requestConsentAction: BrowserQueuedAction = {
   execute: executeConsentRequest,
 };
 
-// ---------------------------------------------------------------- the principal's grants, through main
+// ---------------------------------------------------------------- the principal's grants, for browser delegators
 
 const GRANT_FIELDS: ReadonlySet<string> = new Set(['action', 'requestId', 'operation', 'grant_id', 'site']);
 
 /**
- * Main reads the principal's standing agreements, or withdraws one the principal asked to withdraw: from then
- * on that wording stops again on its site, and a purchase approved with it asks again before it commits.
+ * Lists the principal's standing agreements, or withdraws one the principal asked to withdraw: from then on that
+ * wording stops again on its site, and a purchase approved with it asks again before it commits.
  * to: main, delegator
  */
 async function consentGrantsRequest(

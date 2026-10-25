@@ -307,7 +307,7 @@ describe("GWS-EA's guidance for main", () => {
     );
   });
 
-  it("leaves the principal's email on a thread it handed over to external-email, but for a part it hands back (KTD13)", () => {
+  it("leaves the principal's email on a thread it handed over to external-email, but for a part it hands back", () => {
     expect(GUIDANCE).toContain(
       'On a thread you handed to external-email, it acts on their words there; you act only on a part it hands you, as far as their own words ask.',
     );
@@ -369,7 +369,7 @@ describe("GWS-EA's guidance for main", () => {
     await composeGroupProjectDoc(main, groupDir, { fileName: 'CLAUDE.md' });
     const document = fs.readFileSync(path.join(groupDir, 'CLAUDE.md'), 'utf8');
 
-    // The booking calendar is set on a thread's handoff, and the principal's default is kept where the guidance says (KTD8).
+    // The booking calendar is set on a thread's handoff, and the principal's default is kept where the guidance says.
     for (const taught of ['`calendar`', '`memory/calendars.md`', 'counting, never glancing']) {
       expect(document, taught).toContain(taught);
     }

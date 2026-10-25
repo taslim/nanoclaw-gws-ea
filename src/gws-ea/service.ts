@@ -51,7 +51,6 @@ const SERVICE_PATH = '/usr/local/bin:/usr/bin:/bin';
 const INVALID_RUNTIME = 'invalid_runtime_config';
 
 export interface InstanceSecretFiles {
-  /** The Chat subscriber account's JSON key, which the host pulls Chat's events with (KTD6). */
   readonly gchat_subscriber_key: string;
   readonly onecli_runtime_api_key: string;
   readonly onecli_admin_api_key: string;
@@ -59,15 +58,15 @@ export interface InstanceSecretFiles {
 
 /**
  * What `runtime.json` stores: the values nothing else determines, plus the
- * local Docker endpoint create resolved. Everything derivable from
- * them is recomputed on every read, so it can never disagree with them.
- * It belongs to the assistant, not to a release: create writes it once into
- * the physical `state/`, and which release runs is the live link (KTD2).
+ * local Docker endpoint create resolved. Everything derivable from them is
+ * recomputed on every read, so it can never disagree with them. It belongs to
+ * the assistant, not to a release: create writes it once into the physical
+ * `state/`, and which release runs is the live link.
  */
 export interface PersistedInstanceRuntime {
   readonly schema_version: typeof INSTANCE_RUNTIME_SCHEMA_VERSION;
   readonly instance_id: string;
-  /** The assistant's canonical physical root, `<state root>/<first 8 hex>`. */
+  /** Canonical and physical: `<state root>/<first 8 hex>`. */
   readonly instance_root: string;
   readonly node_path: string;
   readonly home_directory: string;
@@ -78,9 +77,9 @@ export interface PersistedInstanceRuntime {
 }
 
 export interface InstanceRuntimeConfig extends PersistedInstanceRuntime {
-  /** The live release's link, `<instance root>/nanoclaw`: what the service, `ncl`, and the host's status run from. */
+  /** The live release's link, `<instance root>/nanoclaw`, not a physical folder. */
   readonly checkout_root: string;
-  /** The physical `state/`, which holds NanoClaw's `.env` and `data` whatever release is live, or none. */
+  /** The physical `state/`, holding NanoClaw's state roots whatever release is live, or none. */
   readonly state_root: string;
   readonly install_id: string;
   readonly agent_egress_network: string;
@@ -104,7 +103,6 @@ export interface InstanceRuntimeInput {
  */
 export type UpsertEnvVars = (values: Record<string, string>, projectRoot: string) => unknown;
 
-/** The options upstream `waitForHost` takes that gws-ea uses. */
 export interface WaitForHostOptions {
   readonly channel?: string;
   readonly pid?: number;
@@ -150,17 +148,15 @@ export interface ServiceLayoutOptions {
 export interface InstanceServiceDependencies extends ServiceLayoutOptions {
   readonly runCommand?: SanitizedCommandRunner;
   readonly uid?: number;
-  /** Where the user-bus variables are read; absent ones are derived from the UID. */
+  /** Stands in for `process.env`; user-bus variables absent from it are derived from the UID. */
   readonly ambientEnv?: NodeJS.ProcessEnv;
   /**
-   * (Re)starts the installed service the way `gws-ea start`, update, and
-   * rollback do: NanoClaw's own helpers, stopping a running host and waiting
-   * until its manager has let it go before starting it again.
+   * (Re)starts the installed service as `gws-ea restart` does: a running host
+   * is stopped and its manager waited out before it starts again.
    */
   readonly restartService?: (config: InstanceRuntimeConfig) => Promise<unknown>;
 }
 
-/** A (re)started service, with the pid its manager reports when it has one. */
 export interface InstanceServiceStart {
   readonly layout: InstanceServiceLayout;
   readonly pid: number | undefined;
@@ -168,7 +164,7 @@ export interface InstanceServiceStart {
 
 export interface InstanceRuntimeDependencies extends InstanceServiceDependencies {
   readonly upsertEnvVars: UpsertEnvVars;
-  /** The control plane's config root, whose shared operator policies the host reads; supplied by create. */
+  /** The control plane's config root; when set, the host-policy locators are bound as well. */
   readonly hostPolicyRoot?: string;
 }
 
@@ -188,7 +184,7 @@ function expectedSecretFiles(instanceRoot: string): InstanceSecretFiles {
   };
 }
 
-/** The assistant's Google sign-in, which the host refreshes (KTD2). */
+/** The assistant's Google sign-in, which the host refreshes. */
 export function googleGrantFile(config: Pick<InstanceRuntimeConfig, 'secret_files'>): string {
   return path.join(path.dirname(config.secret_files.gchat_subscriber_key), GOOGLE_GRANT_FILE_NAME);
 }
@@ -266,7 +262,7 @@ export function createInstanceRuntimeConfig(
   } satisfies PersistedInstanceRuntime);
 }
 
-/** Read the persisted values, ignoring any other field, and recompute the derived ones. */
+/** Ignores fields it does not persist, and recomputes the derived ones. */
 export function validateRuntimeConfig(value: unknown): InstanceRuntimeConfig {
   const raw = requireRecord(value, 'Runtime config', INVALID_RUNTIME);
   if (raw.schema_version !== INSTANCE_RUNTIME_SCHEMA_VERSION) {
@@ -299,7 +295,10 @@ export function validateRuntimeConfig(value: unknown): InstanceRuntimeConfig {
   });
 }
 
-/** The `.env` keys gws-ea owns; every other key belongs to another writer. */
+/**
+ * gws-ea's `.env` keys that each release keeps (`kept-release.ts`). The
+ * host-policy locators `bindInstanceHostPolicies` writes are not among them.
+ */
 export const INSTANCE_HOST_ENV_KEYS = [
   'NANOCLAW_INSTALL_ID',
   'DEFAULT_AGENT_PROVIDER',
@@ -314,7 +313,6 @@ export const INSTANCE_HOST_ENV_KEYS = [
 
 type InstanceHostEnvKey = (typeof INSTANCE_HOST_ENV_KEYS)[number];
 
-/** gws-ea's `.env` keys for the assistant `config` describes, as this tool renders them. */
 export function instanceHostConfiguration(config: InstanceRuntimeConfig): Readonly<Record<InstanceHostEnvKey, string>> {
   return {
     NANOCLAW_INSTALL_ID: config.install_id,
@@ -330,9 +328,9 @@ export function instanceHostConfiguration(config: InstanceRuntimeConfig): Readon
 }
 
 /**
- * Write `runtime.json` once. A later run leaves the file as it is when its
- * persisted values agree, so fields another launcher added survive, and
- * refuses when they disagree.
+ * A later run leaves an existing `runtime.json` as it is when its persisted
+ * values agree, so fields another launcher added survive, and refuses when
+ * they disagree.
  */
 async function persistRuntimeFile(config: InstanceRuntimeConfig): Promise<void> {
   const file = instanceRuntimeFile(config.state_root);
@@ -353,11 +351,12 @@ async function persistRuntimeFile(config: InstanceRuntimeConfig): Promise<void> 
 }
 
 /**
- * Write `runtime.json` once, and gws-ea's `.env` keys where the assistant's
- * `.env` does not set them, as NanoClaw reads it. Both are in the physical
- * `state/`, never written through a link. A key it sets is the release's own,
- * written by the create that deployed it, so a later start never rewrites it;
- * every other writer's keys are kept.
+ * Write `runtime.json` once, re-bind the host-policy locators that differ, and
+ * add the release keys (`INSTANCE_HOST_ENV_KEYS`) the assistant's `.env` does
+ * not set. All are in the physical `state/`, never written through a link. A
+ * release key already set is the release's own, written by the create that
+ * deployed it, so a later start never rewrites it; every other writer's keys
+ * are kept.
  */
 export async function persistInstanceRuntime(
   configInput: InstanceRuntimeConfig,
@@ -382,9 +381,8 @@ export async function persistInstanceRuntime(
 }
 
 /**
- * The shared operator policies under the control plane's config root, by the
- * host variable that locates each: voice, and 1Password. Each names a file,
- * never a value, and never the 1Password management token beside its policy.
+ * Each names a policy file, never a value, and never the 1Password management
+ * token beside its policy.
  */
 export function hostPolicyLocators(configRoot: string): Readonly<Record<string, string>> {
   return {
@@ -394,10 +392,11 @@ export function hostPolicyLocators(configRoot: string): Readonly<Record<string, 
 }
 
 /**
- * Bind shared policy locators and the exact per-assistant coordination lock in
- * native host configuration, rewriting only values that differ. A locator
- * conveys no per-assistant consent: each policy decides for itself. These
- * paths stay out of runtime.json, container env and release snapshots.
+ * Bind the host-only gws-ea locators in the assistant's `.env`, rewriting only
+ * values that differ. A policy locator conveys no per-assistant consent: each
+ * policy decides for itself. These keys stay out of runtime.json, container
+ * env and the files kept with a release; an operation's `state/` snapshot
+ * copies them with the `.env`.
  */
 export async function bindInstanceHostPolicies(
   config: InstanceRuntimeConfig,
@@ -419,12 +418,11 @@ export async function bindInstanceHostPolicies(
   return changed.length > 0;
 }
 
-/** gws-ea's `.env` keys as the `.env` in `root` holds them, as NanoClaw reads it; other writers' keys are not read. */
 export function readInstanceHostEnvironment(root: string): Record<string, string> {
   return readEnvFile([...INSTANCE_HOST_ENV_KEYS], root);
 }
 
-/** Load the runtime record at `file`, which must be where the record itself says it lives: its own `state/`. */
+/** `file` must be where the record itself says it lives: its own `state/`. */
 export async function loadInstanceRuntimeConfig(file: string): Promise<InstanceRuntimeConfig> {
   const config = validateRuntimeConfig(await readOwnerOnlyJson(file, 'Runtime config', INVALID_RUNTIME));
   if (file !== instanceRuntimeFile(config.state_root)) {
@@ -439,11 +437,9 @@ export interface HostLogFiles {
 }
 
 /**
- * The log files of the host of the assistant at `instanceRoot`: NanoClaw's
- * `logs/nanoclaw.log` and `logs/nanoclaw.error.log`, read in the physical
- * `logs/` every release links its own to, so they are there while no release
- * is live. The service definition below sends standard output and error
- * here, so `logs` reads what the host writes.
+ * In the physical `logs/` every release links its own to, so they are there
+ * while no release is live. The service definition sends the host's standard
+ * output and error here, so `gws-ea logs` reads what the host writes.
  */
 export function hostLogFiles(instanceRoot: string): HostLogFiles {
   const logs = instanceLayout(instanceRoot).logs;
@@ -478,10 +474,9 @@ function createInstanceServiceLayout(
   };
 }
 
-/** The runtime values a service manager's environment derives from. */
 export type ServiceManagerRuntime = Pick<PersistedInstanceRuntime, 'home_directory' | 'docker_endpoint'>;
 
-/** The environment the service manager's own commands run with, upstream NanoClaw's minimal service PATH; the launcher's PATH is launcherPath's. */
+/** Upstream NanoClaw's minimal service PATH, which the service manager's own commands run with. */
 function serviceEnvironment(config: ServiceManagerRuntime): Readonly<Record<string, string>> {
   return {
     HOME: config.home_directory,
@@ -491,10 +486,8 @@ function serviceEnvironment(config: ServiceManagerRuntime): Readonly<Record<stri
 }
 
 /**
- * The launcher's PATH, as upstream NanoClaw gives its own service
- * (setup/service.ts): the directory of the node it runs first, unless already
- * listed, then Homebrew's under launchd, the system's, and ~/.local/bin. A
- * Docker CLI installed by Homebrew is then found as it is by NanoClaw.
+ * As upstream NanoClaw gives its own service (setup/service.ts), so a Docker
+ * CLI installed by Homebrew is found as it is by NanoClaw.
  */
 function launcherPath(config: InstanceRuntimeConfig, manager: InstanceServiceLayout['manager']): string {
   const directories = [
@@ -527,7 +520,6 @@ function renderInstanceService(config: InstanceRuntimeConfig, layout: InstanceSe
       });
 }
 
-/** Where the service manager reads the assistant's service definition. */
 export function instanceServiceDefinitionFile(
   configInput: InstanceRuntimeConfig,
   options: ServiceLayoutOptions,
@@ -535,7 +527,6 @@ export function instanceServiceDefinitionFile(
   return createInstanceServiceLayout(configInput, options).serviceDefinitionPath;
 }
 
-/** The assistant's service definition as this tool renders it, for the service manager `options` name. */
 export function renderInstanceServiceDefinition(
   configInput: InstanceRuntimeConfig,
   options: ServiceLayoutOptions,
@@ -546,9 +537,9 @@ export function renderInstanceServiceDefinition(
 
 /**
  * Put back the service definition a kept release ran with, while its service
- * is stopped (KTD1): a switch installs the one the release kept rather than
- * rendering one. Only when it differs from the one installed, and systemd is
- * then told to reload it. Returns whether it changed.
+ * is stopped: a switch installs the one the release kept rather than rendering
+ * one. Written, and systemd told to reload, only when it differs from the one
+ * installed; returns whether it did.
  */
 export async function restoreInstanceServiceDefinition(
   configInput: InstanceRuntimeConfig,
@@ -578,7 +569,7 @@ async function installServiceDefinition(
   return true;
 }
 
-/** Tell systemd to read the service definitions again; launchd reads one when its job is bootstrapped. */
+/** launchd needs no reload: it reads a definition when its job is bootstrapped. */
 async function reloadServiceManager(
   config: InstanceRuntimeConfig,
   layout: InstanceServiceLayout,
@@ -628,10 +619,9 @@ function requireUid(dependencies: Pick<InstanceServiceDependencies, 'uid'>): num
 }
 
 /**
- * The environment `launchctl`, `systemctl`, and `loginctl` run with. A user
- * service manager is reached over the user bus, so `systemctl --user` gets
- * `XDG_RUNTIME_DIR` and `DBUS_SESSION_BUS_ADDRESS`, derived from the UID when
- * the caller has none (a non-login shell, sudo, cron).
+ * A user service manager is reached over the user bus, so `systemctl --user`
+ * gets `XDG_RUNTIME_DIR` and `DBUS_SESSION_BUS_ADDRESS`, derived from the UID
+ * when the caller has none (a non-login shell, sudo, cron).
  */
 export function serviceManagerEnvironment(
   config: ServiceManagerRuntime,
@@ -684,11 +674,9 @@ async function ensureLingering(
 /**
  * Install the service when its definition is missing, then (re)start it. An
  * existing definition is the release's own, rendered by the create that
- * deployed it, so a later start never renders it again (KTD1). systemd is
- * told about a new unit, enables it, and keeps a user's services running
- * after logout (lingering). The start itself is the one every other command
- * uses (`restartService`): a running host is stopped and its job waited out,
- * so launchd never sees a `bootstrap` while it still removes the old job.
+ * deployed it, so a later start never renders it again. The start is
+ * `restartService`: a running host is stopped and its job waited out, so
+ * launchd never sees a `bootstrap` while it still removes the old job.
  */
 export async function reconcileInstanceService(
   configInput: InstanceRuntimeConfig,
@@ -786,11 +774,9 @@ export function buildInstanceCliCommand(
 }
 
 /**
- * The host's environment. Chat delivery reaches it as the owner-only path of
- * the subscriber key and the assistant's project, from which the host names
- * its topic and pull subscription (KTD6): the key itself never enters an
- * environment. The project is the one create reserved, named from the
- * instance ID.
+ * Chat delivery reaches the host as the owner-only path of the subscriber key
+ * and the assistant's project, from which the host names its topic and pull
+ * subscription: the key itself never enters an environment.
  */
 async function buildInstanceHostEnvironment(
   configInput: InstanceRuntimeConfig,
@@ -818,14 +804,12 @@ async function buildInstanceHostEnvironment(
   });
 }
 
-/** The instance's OneCLI administrative key, from its owner-only secret file; an empty file is refused. */
 async function readOnecliAdminApiKey(config: InstanceRuntimeConfig): Promise<string> {
   const apiKey = (await readOwnerOnlyFile(config.secret_files.onecli_admin_api_key)).trim();
   if (!apiKey) throw new GwsEaError('invalid_secret', 'The OneCLI administrative credential is empty');
   return apiKey;
 }
 
-/** The instance's OneCLI administration: its own app URL, with the admin key its owner-only file holds. */
 export async function instanceOnecliAdmin(
   configInput: InstanceRuntimeConfig,
   dependencies: OnecliAdminDependencies = {},
@@ -841,7 +825,7 @@ export async function instanceOnecliAdmin(
  * the live link; a launcher anywhere else, or one whose release a switch has
  * since replaced, starts nothing. The host runs from that folder, so NanoClaw
  * reaches the assistant's state through the release's links, and runs agents
- * on the release's own image, `<base>:r-<hex8>` (KTD6).
+ * on the release's own image, `<base>:r-<hex8>`.
  */
 export async function launchInstanceHost(
   configFile: string,
@@ -906,9 +890,7 @@ export async function stampUpgradeState(
 }
 
 /**
- * Persist the runtime, stamp the upgrade tripwire of the release at `commit`
- * with that release's own script, and install and start the service. The
- * release's agent image was provided when the release was staged
+ * The release's agent image was provided when the release was staged
  * (`release-stage.ts`), and its host runs that image's tag.
  */
 export async function reconcileInstanceRuntime(
@@ -919,7 +901,7 @@ export async function reconcileInstanceRuntime(
   const config = validateRuntimeConfig(configInput);
   const release = instanceLayout(config.instance_root).release(releaseName(commit));
   await persistInstanceRuntime(config, dependencies.upsertEnvVars, dependencies.hostPolicyRoot);
-  // The script runs with the operator's tools, as release preflight's commands do; only the service keeps its minimal PATH.
+  // Run with the operator's tools, as release preflight's commands are; only the service keeps its minimal PATH.
   const environment = buildToolEnvironment(dependencies.ambientEnv ?? process.env, {
     HOME: config.home_directory,
     DOCKER_HOST: config.docker_endpoint,

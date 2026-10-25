@@ -75,11 +75,7 @@ export async function findSessionByAgentGroup(agentGroupId: string): Promise<Ses
   );
 }
 
-/**
- * A group's active conversation sessions, newest first: every active session
- * that is not a system one. A task that comes back as a turn of a
- * conversation lives in that conversation's mailbox.
- */
+/** A task that comes back as a turn of a conversation lives in that conversation's mailbox. */
 export async function findConversationSessions(agentGroupId: string): Promise<Session[]> {
   return getDb().all<Session>(
     `SELECT * FROM sessions

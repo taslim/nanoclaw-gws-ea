@@ -71,13 +71,13 @@ const REQUIRED_CALENDAR_RULES = [
   'Use the `create_event`, `change_guests`, `respond_to_event` and `find_conflicts` tools for creating events, changing guests, answering for the principal and checking availability; use `gog` through Bash for every other Google Calendar operation.',
   'never run `gog auth`',
   "A calendar is the principal's when its ID (their primary calendar) or its `dataOwner` is one of the principal's addresses.",
-  // The one rule the host recognizes them by (R1): never the exact spelling alone.
+  // The one rule the host recognizes them by: never the exact spelling alone.
   'A gmail.com or googlemail.com address counts in every spelling Gmail delivers to it: with or without dots, with a `+tag`, at either domain. Any other address counts only as listed, in upper or lower case.',
   'Treat every other calendar as someone else',
 ];
 
 /**
- * Each Google skill's always-on line (R7): it sends the agent to the skill,
+ * Each Google skill's always-on line: it sends the agent to the skill,
  * in the principal's terms, unless the skill's page is in front of it. A
  * respawn followed by a summary re-attaches no page, and a summary can list
  * the commands, so the line keys on the page, never on remembered commands,

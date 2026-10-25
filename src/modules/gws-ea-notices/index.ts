@@ -1,21 +1,20 @@
 /**
- * GWS-EA failure notices (R38, Slice 5 R25): when the assistant cannot finish
- * something, whoever should know hears of it once, and a counterpart never
- * does.
+ * GWS-EA failure notices: when the assistant cannot finish something, whoever
+ * should know hears of it once, and a counterpart never does.
  *
  * Core reports three causes, and this module decides who hears and in what
  * words:
  *
- *   - a message the host gave up delivering (registerDeliveryFailedHook);
- *     only a message a person would have read counts;
+ *   - a message the host gave up delivering (registerDeliveryFailedHook):
+ *     one a person would have read, or a browser's report to the agent that
+ *     delegated its errand;
  *   - an inbound message the host gave up processing (registerInboundFailedHook);
  *   - a turn the agent runner reports as failed (the `turn_failed` delivery action).
  *
  * The runner names the messages a turn answered on its report and beside
- * every message the turn wrote to a person (KTD12), so each failure comes
- * with the inbound messages it concerns. Who hears depends on whose
- * conversation it was (`conversationOf`), and in main's, on whose those
- * messages were:
+ * every message the turn wrote to a person, so each failure comes with the
+ * inbound messages it concerns. Who hears depends on whose conversation it
+ * was (`conversationOf`), and in main's, on whose those messages were:
  *
  *   - one of main's own, where the principal sent one of them, a chat from a
  *     verified principal user or mail on their own email conversation: the
@@ -23,12 +22,12 @@
  *     conversation the failure came from. A failure in that direct message
  *     keeps its thread there; any other goes to the top of it. A failed turn
  *     whose provider recognized an outage only whoever runs the assistant can
- *     fix (a rejected credential, a spent balance) gets a sentence that does
- *     not ask for a resend, since every resend fails the same way. The notice
- *     is one direct send through the delivery adapter, so it passes the
- *     outbound guard; it is never queued or retried, so a failing channel
- *     cannot turn one notice into a stream of them. Why it failed goes to the
- *     host log only.
+ *     fix (a rejected credential, a spent balance) gets a sentence saying the
+ *     fix is not theirs and to send it again later, since a resend now fails
+ *     the same way. The notice is one direct send through the delivery
+ *     adapter, so it passes the outbound guard; it is never queued or retried,
+ *     so a failing channel cannot turn one notice into a stream of them. Why
+ *     it failed goes to the host log only.
  *   - one of main's own, for everything else it concerned (a note from the
  *     host, a look, the daily sync, another agent's message): main, since the
  *     principal sent none of it and has nothing to send again. It gets one
@@ -45,17 +44,19 @@
  *     wrote. The principal asked for nothing there. A turn that answered
  *     another agent rather than the thread is no one's to hear of, so a
  *     failure never answers a failure.
+ *   - a browser errand: the agent that delegated it, woken by a fact naming
+ *     the job (`tellDelegator`).
  *
- * A task session serves no conversation: its failures are no one's to hear of.
+ * Any other session, a task session included, serves no conversation: its
+ * failures are no one's to hear of.
  *
  * Delivery reports a give-up before recording it, so a stop in between never
  * loses the report, and any report may come again: the principal's notices
- * record each of their messages they were told of, and main's facts carry
- * ids derived from what failed, so each is heard once.
+ * record each of their messages they were told of, and every fact carries an
+ * id derived from what failed, so each is heard once.
  *
- * Other GWS-EA modules that own a sentence of their own (the inbox, for mail
- * it set aside or an inbox it cannot reach) send it through
- * `sendPrincipalNotice`, to the same audience by the same path.
+ * A GWS-EA module with a sentence of its own for the principal sends it
+ * through `sendPrincipalNotice`, to the same audience by the same path.
  */
 import { createHash } from 'node:crypto';
 
@@ -87,41 +88,35 @@ import './whatsapp.js';
 
 registerMigration(gwsEaNoticesMigration);
 
-/** The one plain sentence the principal sees whenever the assistant could not finish. */
 const FAILURE_NOTICE_TEXT = "Something went wrong on my side and I couldn't finish that. Please send it again.";
 
-/** What the principal sees when the assistant cannot work until whoever runs it fixes something. */
 const OUTAGE_NOTICE_TEXT =
   "I can't do anything at the moment: something on my side needs fixing first, and it isn't anything you need to do. Please send this again later.";
 
-/** The longest provider error the host log keeps from one report; the container writes the row. */
+/** Characters of a provider error the host log keeps; the container writes the report, so the host bounds it. */
 const REPORTED_ERROR_LIMIT = 2000;
 
 type Cause = 'delivery-failed' | 'inbound-failed' | 'turn-failed';
 
-/** The conversation and thread a failed message or turn belonged to. */
 export interface Route {
   readonly channelType: string | null;
   readonly platformId: string | null;
   readonly threadId: string | null;
 }
 
-/** A conversation with a person, not another agent or none at all. */
 function isPersonRoute(route: Route): boolean {
   return route.channelType !== null && route.platformId !== null && route.channelType !== 'agent';
 }
 
-/** What a notice's log lines name it by. */
 interface NoticeLog {
   readonly label: 'Failure notice' | 'Notice';
   readonly fields: Readonly<Record<string, unknown>>;
 }
 
 /**
- * Send `text` to the principal's direct message as one direct send, in
- * `route`'s thread when the route is that direct message. Best effort: the
- * work it reports is already recorded, so a failure is logged, never retried,
- * and never thrown. Returns whether it was delivered.
+ * In `route`'s thread only when `route` is the principal's direct message
+ * itself. Best effort: a failure is logged, never retried or thrown. Returns
+ * whether it was delivered.
  */
 async function deliverToPrincipal(text: string, route: Route | undefined, notice: NoticeLog): Promise<boolean> {
   const adapter = getDeliveryAdapter();
@@ -172,14 +167,12 @@ async function conversationOf(
   return { thread: session.thread_id };
 }
 
-/** The ids a report or a reply names; anything but a list of ids names none. */
 function idsOf(value: unknown): string[] {
   return Array.isArray(value)
     ? value.filter((id: unknown): id is string => typeof id === 'string' && id.length > 0)
     : [];
 }
 
-/** A row's JSON object content, or undefined for any other. */
 function contentOf(raw: string): Readonly<Record<string, unknown>> | undefined {
   let content: unknown;
   try {
@@ -191,7 +184,7 @@ function contentOf(raw: string): Readonly<Record<string, unknown>> | undefined {
   return isRecord(content) ? content : undefined;
 }
 
-/** The inbound messages a session holds with these ids; none once the session is gone. */
+/** None once the session is gone. */
 async function messagesOf(session: Session, ids: readonly string[]): Promise<InboundOrigin[]> {
   if (ids.length === 0) return [];
   const messages = await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) =>
@@ -224,7 +217,6 @@ async function isPrincipals(message: InboundOrigin): Promise<boolean> {
   return sender !== undefined && (await isVerifiedPrincipalUser(sender));
 }
 
-/** `messages` split into the principal's own and the rest. */
 async function whose(
   messages: readonly InboundOrigin[],
 ): Promise<{ readonly principal: InboundOrigin[]; readonly rest: InboundOrigin[] }> {
@@ -234,7 +226,6 @@ async function whose(
   return { principal, rest };
 }
 
-/** The failed messages among `ids` the principal has not been told of. */
 async function unreported(ids: readonly string[]): Promise<Set<string>> {
   const rows = await getDb().all<{ message_id: string }>(
     `SELECT message_id FROM gws_ea_notices_reported WHERE message_id IN (${ids.map(() => '?').join(', ')})`,
@@ -256,8 +247,8 @@ async function recordReported(ids: readonly string[]): Promise<void> {
 }
 
 /**
- * Tell the principal the assistant could not finish their `own` messages,
- * threaded by `route`: once, so nothing when each was told of before.
+ * Silent when every one of `own` was told of before. They are recorded as told
+ * even when the send fails, since a notice is never retried.
  */
 async function tellPrincipal(
   cause: Cause,
@@ -296,10 +287,7 @@ function whatFailed(cause: Cause, threadKey: string, people: readonly string[]):
   }
 }
 
-/**
- * Tell main of `failed` in an outside thread, with the thread's open matter;
- * the same failures told again write nothing.
- */
+/** Wakes main, and the thread piece brings the thread's open matter with it. */
 async function tellMain(cause: Cause, threadKey: string, failed: readonly string[]): Promise<void> {
   const result = await writeNoteForMain({
     id: factId(`external-email-${cause}`, [threadKey, ...[...failed].sort()]),
@@ -313,11 +301,7 @@ async function tellMain(cause: Cause, threadKey: string, failed: readonly string
   }
 }
 
-/**
- * Tell the agent that delegated a browser errand of `failed` in it, once:
- * main with the job's open matter, any other agent with browser access in
- * the session it delegated from (R28). No other agent hears of it.
- */
+/** Whom it reaches, and where, is `tellDelegator`'s routing. */
 async function tellOfBrowserJob(cause: Cause, errand: BrowserErrand, failed: readonly string[]): Promise<void> {
   const words: Record<Cause, string> = {
     'delivery-failed': 'its report could not be delivered, even after retrying.',
@@ -380,11 +364,6 @@ function carriedBy(messages: readonly InboundOrigin[], looks: boolean): NoteName
   return { pieces: [...pieces.values()], matters: [...matters] };
 }
 
-/**
- * Tell main, in a fact that wakes nothing, of `failed` in its own
- * conversation, with the pieces it concerned and their matters; the same
- * failures told again write nothing.
- */
 async function tellMainOfItsOwn(cause: Cause, failed: readonly string[], carried: NoteNames): Promise<void> {
   const pieces = carried.pieces.map((piece) => `${PIECE_WORDS[piece.kind]} ${piece.reference}`);
   const result = await writeNoteForMain({
@@ -401,10 +380,9 @@ async function tellMainOfItsOwn(cause: Cause, failed: readonly string[], carried
 }
 
 /**
- * One plain sentence to the principal, at the top of their direct message,
- * for a module that owns its own wording (such as the inbox reporting a
- * message it set aside). It passes the outbound guard like any send, and is
- * never queued or retried. Returns whether it was delivered.
+ * For a module with wording of its own: at the top of the principal's direct
+ * message, through the outbound guard, never queued or retried. Returns
+ * whether it was delivered.
  */
 export async function sendPrincipalNotice(text: string, cause: string): Promise<boolean> {
   return deliverToPrincipal(text, undefined, { label: 'Notice', fields: { cause } });
@@ -422,7 +400,6 @@ function answeredBy(post: OutboundMessage): string[] {
   return idsOf(contentOf(post.content)?.batch);
 }
 
-// Delivery may report a give-up again after a stop: whoever hears of a failed message hears of it once.
 registerDeliveryFailedHook(async (failed, session) => {
   const route = await conversationOf(session);
   if (route !== undefined && route !== 'main' && 'job' in route) {
@@ -482,7 +459,7 @@ registerInboundFailedHook(async (failed, session) => {
   const { principal, rest } = await whose(await messagesOf(session, ids));
   const [first] = principal;
   if (first !== undefined) await tellPrincipal('inbound-failed', session, principal, first);
-  // A look given up comes back through the matters loop.
+  // No look mark here: a look given up shows as a failed run, which the matters loop reads.
   if (rest.length > 0) {
     await tellMainOfItsOwn(
       'inbound-failed',

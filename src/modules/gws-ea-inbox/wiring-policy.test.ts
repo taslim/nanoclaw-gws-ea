@@ -1,6 +1,6 @@
 /**
- * The email channel's two wirings are pinned where wirings are written
- * (KTD1): the inbox reaches only external-email, external-email only the
+ * The email channel's two wirings are pinned where wirings are written:
+ * the inbox reaches only external-email, external-email only the
  * inbox, and only per thread; the principal's email conversation reaches only
  * main, in its shared session, from known senders.
  */

@@ -1,8 +1,8 @@
 /**
- * `external-email`'s agent group (KTD3): created once by the host from the
- * release's template, then never written by host-start code again (R35).
- * What the host stamped is the only shape it may start in; anything else is
- * drift, which the session admission refuses and status reports.
+ * `external-email`'s agent group: created once by the host from the
+ * release's template, then never written by host-start code again. What the
+ * host stamped is the only shape it may start in; anything else is drift,
+ * which the session admission refuses and status reports.
  */
 import fs from 'node:fs';
 import path from 'node:path';
@@ -29,11 +29,9 @@ import {
 } from '../gws-ea-profile/db.js';
 
 /**
- * The email channel's tool keys, one for each part (KTD4), registered
- * together so each tool's grant is found in one place. The actions they send
- * belong to the modules that answer them: the bridge (`email_handoff`,
- * `tell_main`), the inbox (`email_send`, by each caller's own rules) and the
- * meetings module (the five scheduling tools). Each key brings its tools'
+ * The email channel's tool keys, one for each part, registered together so
+ * each tool's grant is found in one place. The actions they send belong to
+ * the modules that answer them, not to this one. Each key brings its tools'
  * instructions, in the runner's `<key>.instructions.md`.
  */
 export const MAIN_EMAIL_CAPABILITY = 'gws-ea-email';
@@ -58,14 +56,12 @@ export const EXTERNAL_EMAIL_PLUGIN = 'gws-ea-external-email';
 export const EXTERNAL_EMAIL_NAME = 'external-email';
 
 /**
- * Exactly what the group holds: its thread's tools, `request_status` for a
- * request the host was slow to answer, the `time_*` calculators, which
- * compute over the container's clock and reveal nothing, and `files-read`,
- * for the files that reached its thread (KTD9). No timers: main nudges a
- * thread when its matter comes due (Slice 5 R15). No write tools, shell,
- * web, subagents, MCP servers, messages to destinations, or
- * `conversation-context`: each of its sessions is sealed from every other,
- * and nothing of one thread lands in the folder its sessions share.
+ * Exactly what the group holds; the `time_*` calculators compute over the
+ * container's clock and reveal nothing. No timers: main nudges a thread when
+ * its matter comes due. No write tools, shell, web, subagents, MCP servers,
+ * messages to destinations, or `conversation-context`: each of its sessions
+ * is sealed from every other, and nothing of one thread lands in the folder
+ * its sessions share.
  */
 export const EXTERNAL_EMAIL_CAPABILITIES: readonly string[] = [
   'files-read',
@@ -75,12 +71,10 @@ export const EXTERNAL_EMAIL_CAPABILITIES: readonly string[] = [
 ];
 
 /**
- * Create the group when the profile names none, and return its ID. The
- * group, its configuration, and the pointer are written in one transaction,
- * so a host stopped part-way leaves no group the pointer misses; files the
- * template stamped before such a stop stay in a folder the next attempt does
- * not reuse. Once the profile names the assistant, the group carries that
- * name from creation. Once the pointer is recorded this changes nothing.
+ * The group, its configuration, and the pointer are written in one
+ * transaction, so a host stopped part-way leaves no group the pointer misses;
+ * files the template stamped before such a stop stay in a folder the next
+ * attempt does not reuse.
  */
 export async function ensureExternalEmailGroup(): Promise<string> {
   const existing = await getExternalEmailAgentGroupId();
@@ -97,15 +91,11 @@ export async function ensureExternalEmailGroup(): Promise<string> {
   });
 }
 
-/** What a drift check judges beside the stored group: the session's own provider, when known. */
+/** The session's pinned provider, when known, which spawn prefers to the group's. */
 export interface DriftContext {
   readonly sessionProvider?: string | null;
 }
 
-/**
- * Why `external-email`, as it is stored now, may not start: one clause per
- * difference from what the host stamped. Empty when there is none.
- */
 export async function externalEmailDrift(agentGroupId: string, context: DriftContext = {}): Promise<string[]> {
   const group = await getAgentGroup(agentGroupId);
   if (!group) return [`its agent group ${agentGroupId} no longer exists`];
@@ -148,10 +138,6 @@ function configurationDrift(row: ContainerConfigRow, groupName: string): string[
   return problems;
 }
 
-/**
- * Its folder holds its own template's plugin and no other, and no plugin
- * stamped a skill into the group's template-skill store.
- */
 function stampedPluginDrift(agentGroupId: string, folder: string): string[] {
   const problems: string[] = [];
   const others = directoryEntries(path.join(GROUPS_DIR, folder, 'plugins')).filter(
@@ -163,7 +149,6 @@ function stampedPluginDrift(agentGroupId: string, folder: string): string[] {
   return problems;
 }
 
-/** The directories (and links) directly under `dir`; a missing directory holds none. */
 function directoryEntries(dir: string): string[] {
   if (!fs.existsSync(dir)) return [];
   return fs
@@ -173,7 +158,7 @@ function directoryEntries(dir: string): string[] {
     .sort();
 }
 
-/** A stored JSON column; one that does not parse is its own text, which counts as carrying something. */
+/** Text that does not parse is returned as is, so it counts as carrying something. */
 function storedJson(raw: string): unknown {
   try {
     return JSON.parse(raw) as unknown;

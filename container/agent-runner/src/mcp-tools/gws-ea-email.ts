@@ -1,19 +1,13 @@
 /**
- * GWS-EA's email tools (KTD4, KTD5, KTD7, KTD9): typed requests to the host,
- * each named after the action it sends but `email_principal`, which sends
- * main's `email_send`. The host checks every request
- * against its caller and thread, so these handlers only shape the call and
- * stage the files it carries.
+ * GWS-EA's email tools: typed requests to the host, each named after the
+ * action it sends but `email_principal`, which sends main's `email_send`. The
+ * host checks every request against its caller and thread, so these handlers
+ * only shape the call and stage the files it carries.
  *
- * - `main` (capability `gws-ea-email`) hands work in an email thread to
- *   `external-email` with `email_handoff`, and writes to the principal in one
- *   of their threads with `email_principal`.
- * - `external-email` (capability `gws-ea-email-external`) writes in its own
- *   thread with `email_send`, leaves main its account of the thread with
- *   `tell_main`, waking main and passing on files that came in the thread
- *   only when main must act now, and schedules on the principal's calendar
- *   with `free_time`, `book`, `change_booking` and `cancel_booking`, each
- *   bound by the host to the thread whose session calls it.
+ * `main` holds `gws-ea-email`: it hands thread work to `external-email` and
+ * writes to the principal in their own threads. `external-email` holds
+ * `gws-ea-email-external`, and the host binds each of its requests to the
+ * session that makes it.
  *
  * Both send the host's one `email_send` action, which answers each caller by
  * its own rules; each agent's tool has only the fields and limits that are its.
@@ -42,7 +36,7 @@ const WORKSPACE = '/workspace/agent';
 const INBOX = '/workspace/inbox';
 const MAX_FILES = 10;
 
-/** Whether `file`, after every link, is inside the folder `root`. */
+/** Resolves links on both sides first, so a symlink cannot lead out of `root`. */
 function isWithin(root: string, file: string): boolean {
   try {
     const relative = path.relative(fs.realpathSync(root), fs.realpathSync(file));
@@ -54,9 +48,8 @@ function isWithin(root: string, file: string): boolean {
 }
 
 /**
- * Copy the files a request names into its outbox, each by its file name, and
- * send those names. Every file is checked first, so a refusal stages nothing.
- * With `fromInbox`, each must be one that came in the session's thread.
+ * Every file is checked first, so a refusal stages nothing. With `fromInbox`,
+ * each must be one that came in the session's thread.
  */
 export function stageFiles(
   fields: Record<string, unknown>,
@@ -217,7 +210,6 @@ export const tellMain = requestTool({
   prepare: (fields, requestId) => stageFiles(fields, requestId, true),
 });
 
-/** The other side's zone: an answer then gives each time in it too, ready to write. */
 const THEIR_ZONE = {
   type: 'string',
   description: "The other side's time zone, such as Europe/Berlin, when you know it: the answer gives times in it too.",

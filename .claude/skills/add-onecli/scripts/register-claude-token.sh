@@ -11,8 +11,8 @@ set -euo pipefail
 #      OAuth dance works and its token is captured into a tempfile.
 #   2. Parse the sk-ant-oat…AA token out of the capture via the shared
 #      PTY-capture parser (setup/lib/captured-token.ts).
-#   3. Register it with OneCLI, or write it to an explicitly requested
-#      owner-only handoff file for a caller that owns its own isolated vault.
+#   3. Register it with OneCLI, or, with --output-file, write it to a new
+#      owner-only file for a caller that stores the token itself.
 #
 # Env overrides:
 #   SECRET_NAME   OneCLI secret name   (default: Anthropic)

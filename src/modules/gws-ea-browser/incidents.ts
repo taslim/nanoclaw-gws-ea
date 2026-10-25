@@ -1,12 +1,12 @@
 /**
- * Incidents (KTD10): spending that may have slipped past the host. Each is a row of its own, inserted in the
- * same transaction as its job's stop, and a job records one per kind and evidence. The job's delegating group
- * hears of each at once, and tells the principal; once that group's browser access was removed, main hears. An
- * incident its recorder learns of from its own answer is recorded told (KTD15), so no notice repeats the alarm.
+ * Incidents: spending that may have slipped past the host. Each is inserted in the same transaction as its job's
+ * stop, once per job, kind and evidence. The job's delegating group hears of each at once, to tell the principal;
+ * once that group's browser access was removed, main hears. An incident its recorder learns of from its own answer
+ * is recorded told, so no notice repeats the alarm.
  *
- * `unapproved_commit` is a confirmation page that showed a charge after an ordinary press. `late_confirmation`
- * is main reporting placed a purchase it had recorded not placed: the merchant's late order email, and possibly
- * a duplicate. Each notice is written after the stop commits; the host's sweep tells of any that did not go out.
+ * `unapproved_commit` is a confirmation page that showed a charge after an ordinary press. `late_confirmation` is
+ * a purchase recorded not placed that is later reported placed, so possibly bought twice. Each notice is written
+ * after the stop commits; the host's sweep tells of any that did not go out.
  */
 import { randomUUID } from 'node:crypto';
 
@@ -39,7 +39,7 @@ export interface NewIncident {
   readonly kind: IncidentKind;
   readonly site: string;
   readonly attemptId?: string;
-  /** What makes this incident this one: the same evidence for the same job and kind is recorded once. */
+  /** The same key for the same job and kind is recorded once. */
   readonly evidenceKey: string;
   readonly evidence: unknown;
   /** The agent that raised it hears of it in its own answer, so no notice goes out. */
@@ -47,9 +47,9 @@ export interface NewIncident {
 }
 
 /**
- * Records `incident` and stops its job (cancels it) in one transaction. Recording the same evidence again stops
- * nothing new, and `created` says which this was. The caller finishes the cancellation and tells of the incident
- * after this commits.
+ * Records `incident` and cancels its job in one transaction; recording the same evidence again stops nothing new,
+ * and `created` says which this was. The caller finishes the cancellation and tells of the incident after this
+ * commits.
  */
 export async function recordIncidentWithStop(
   store: BrowserStore,
@@ -83,7 +83,7 @@ export async function recordIncidentWithStop(
   });
 }
 
-/** What an unapproved commit's notice and the stopped action say of it, all host-read and host-formatted. */
+/** What the notice and the stopped action say of the incident, all host-read and host-formatted. */
 function unapprovedCommitFacts(incident: BrowserIncident): { reference: string; charged?: string } {
   const evidence = JSON.parse(incident.evidence_json) as ConfirmationEvidence;
   return {
@@ -113,7 +113,7 @@ function noticeText(incident: BrowserIncident, thread: string): string {
   }
 }
 
-/** Tells the incident's delegating group of it, once; a notice that cannot go out yet is retried by the sweep. */
+/** At most once; a notice that cannot go out yet is retried by the host's sweep. */
 export async function notifyIncident(id: string, db: DbDriver = getDb()): Promise<void> {
   const incident = await db.get<BrowserIncident>('SELECT * FROM gws_ea_browser_incidents WHERE id = ?', id);
   if (!incident || incident.notified_at) return;
@@ -125,7 +125,6 @@ export async function notifyIncident(id: string, db: DbDriver = getDb()): Promis
   });
 }
 
-/** The host's sweep: every incident whose notice has not gone out yet. */
 export async function notifyPendingIncidents(db: DbDriver = getDb()): Promise<void> {
   if (!(await db.hasTable('gws_ea_browser_incidents'))) return;
   for (const { id } of await db.all<{ id: string }>(
@@ -134,16 +133,15 @@ export async function notifyPendingIncidents(db: DbDriver = getDb()): Promise<vo
     await notifyIncident(id, db);
 }
 
-/** An ordinary press that bought something nobody approved: the confirmation showing its charge, and the merchant. */
+/** An ordinary press that bought something nobody approved. */
 export interface UnapprovedCommit {
   readonly site: string;
   readonly evidence: ConfirmationEvidence;
 }
 
 /**
- * Stops the job whose ordinary press `commit` came from: the incident and the cancellation in one transaction,
- * then the urgent notice and the cancellation's own work. The request reporting it answers for itself, so it is
- * never interrupted. Returns what the stopped action reports of the incident.
+ * Stops the job whose ordinary press `commit` came from, then sends the urgent notice. The request reporting it
+ * answers for itself, so the cancellation never interrupts it.
  */
 export async function stopForUnapprovedCommit(
   context: BrowserOperationContext,

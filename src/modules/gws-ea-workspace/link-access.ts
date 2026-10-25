@@ -1,15 +1,13 @@
 /**
- * The link check (R4, R18; KTD4, KTD5): no message goes to someone other
- * than the principal carrying a Google link they cannot open, and the agent
- * that wrote it learns why.
+ * The link check: no message goes to someone other than the principal
+ * carrying a Google link they cannot open, and the agent that wrote it
+ * learns why.
  *
  * One function over the texts a message carries and the people it reaches,
- * called where a message reaches someone other than the principal:
- * `sendToOutside` on an outside email's final recipients, the bridge's
- * handoff admission, and `assertInvitationShareable`. It reads only what
- * the assistant wrote, and never checks the principal's addresses, which it
- * tells apart exactly as the privacy check does (R1), so nothing `main`
- * sends the principal is checked.
+ * called wherever a message reaches someone other than the principal. It
+ * reads only what the assistant wrote, and never checks the principal's
+ * addresses, which it tells apart exactly as the privacy check does, so
+ * nothing `main` sends the principal is checked.
  *
  * "Confirmed" means a signal Google gives exactly, per link and recipient:
  *
@@ -39,17 +37,16 @@
  *    `LINKS_UNCHECKED`. A link it could decide is refused all the same.
  * 2. The host has no Drive access (not signed in, revoked, or a sign-in
  *    without Drive): a link that is not public is refused, telling main
- *    the operator must reconnect it, and `external-email` to wake main.
+ *    the operator must reconnect it, and any other writer to wake main.
  * 3. A definitive answer: refused, with a reason fitted to who wrote it.
  *    `main` hears who cannot open which link and its choices: share it with
  *    them (view-only by default), leave them out, or send it without the
- *    link; or, for a file it cannot share, whom to ask. `external-email`
+ *    link; or, for a file it cannot share, whom to ask. Any other writer
  *    hears only which of its recipients cannot open which link it wrote,
  *    nothing else of the file, and to wake main.
  *
- * A leaf (KTD4): it imports only the shared Google helpers, the profile's
- * addresses, the privacy module's link reading (`links.ts`), Drive, and the
- * visit.
+ * A leaf: the only module entry points it loads are the shared Google
+ * helpers' and the privacy module's (through `links.ts`).
  */
 import { setTimeout as delay } from 'node:timers/promises';
 
@@ -90,7 +87,6 @@ export type LinkCheck =
   | { readonly allowed: true }
   | {
       readonly allowed: false;
-      /** For the writer, fitted to who they are. */
       readonly reason: string;
     };
 
@@ -118,7 +114,6 @@ export interface LinkAccessOptions {
   readonly drive: DriveApi;
   /** The signed-out visit. */
   readonly probe: (target: ProbeTarget) => Promise<ProbeVerdict>;
-  /** The principal's addresses, as the profile holds them. */
   readonly principalAddresses?: () => Promise<PrincipalRecognizer>;
   readonly sleep?: (ms: number) => Promise<void>;
   readonly now?: () => Date;
@@ -133,7 +128,7 @@ export interface LinkAccess {
 const RETRY_DELAYS_MS: readonly number[] = [250, 1_000];
 /** How many addresses' permission ids the check keeps between messages. */
 const MAX_CACHED_PERMISSION_IDS = 1000;
-/** Files read at once. */
+/** Links checked at once. */
 const READS_AT_ONCE = 4;
 const OPERATOR_REASON = "the assistant's Google sign-in doesn't include Drive yet; the operator needs to reconnect it";
 
@@ -180,7 +175,10 @@ type Unconfirmed =
 
 type Outcome = 'opens' | typeof UNAVAILABLE | Unconfirmed;
 
-/** What Drive says of a file: nothing (no Drive access, or it could not answer), or the file and, when the assistant may read it, its access list. */
+/**
+ * Nothing when Drive cannot be asked or could not answer; else the file, when
+ * the assistant can see it, and its access list, when it may read that.
+ */
 type FileRead =
   | typeof UNAVAILABLE
   | typeof NO_DRIVE
@@ -221,9 +219,9 @@ export function createLinkAccess(options: LinkAccessOptions): LinkAccess {
   const now = options.now ?? (() => new Date());
   const principalAddresses = options.principalAddresses ?? loadPrincipalRecognizer;
   /**
-   * The permission id Drive gives each address, once read; a read in flight
-   * is shared. The oldest entry goes once it holds more addresses than
-   * `MAX_CACHED_PERMISSION_IDS`, so a long-running host never grows it without end.
+   * Each address's permission id, a read in flight shared. The oldest entry
+   * goes past `MAX_CACHED_PERMISSION_IDS`, so a long-running host never grows
+   * it without end.
    */
   const permissionIds = new Map<string, Promise<string | undefined>>();
 
@@ -297,7 +295,7 @@ export function createLinkAccess(options: LinkAccessOptions): LinkAccess {
     }
   }
 
-  /** Whether the recipient owns the file or holds a grant Drive lists for them; `UNAVAILABLE` when their id could not be read. */
+  /** Matched by address, domain or permission id; `UNAVAILABLE` when the recipient's id could not be read. */
   async function confirmedByDrive(
     recipient: string,
     users: readonly { readonly emailAddress?: string; readonly permissionId?: string }[],
@@ -418,7 +416,6 @@ function listed(items: readonly string[]): string {
 
 const CHOICES = 'leave them out, or send it without the link.';
 
-/** One sentence for `main`: who cannot open which link, why, and what it can do. */
 function sentenceForMain(url: string, who: string, why: Unconfirmed, principal: PrincipalRecognizer): string {
   switch (why.kind) {
     case 'not-shared':
@@ -462,7 +459,7 @@ function sentenceForMain(url: string, who: string, why: Unconfirmed, principal: 
   }
 }
 
-/** Why a refusal is what it is, so recipients refused for the same reason share one sentence. */
+/** Recipients refused for the same reason share one sentence. */
 function whyKey(why: Unconfirmed): string {
   return JSON.stringify(why);
 }
@@ -481,10 +478,10 @@ function reasonForMain(refused: readonly Refused[], principal: PrincipalRecogniz
 }
 
 /**
- * For `external-email`: which link each of its recipients cannot open, the
- * link it wrote and nothing else of the file, and to wake main for its
+ * For every writer but `main`: which link each of its recipients cannot open,
+ * the link it wrote and nothing else of the file, and to wake main for its
  * answer, since sharing the file, or reconnecting what checks it, is never
- * external-email's to do.
+ * theirs to do.
  * to: external-email
  */
 function reasonForExternalEmail(refused: readonly Refused[]): string {
@@ -544,10 +541,10 @@ async function driveToken(): Promise<string> {
 let shared: LinkAccess | undefined;
 
 /**
- * Check that everyone a message reaches, the principal aside, can open every
- * Google link in what the assistant wrote. Throws
- * `LinkCheckUnavailableError` when Google was too briefly unavailable to
- * decide.
+ * Checks artifact links (gws-ea-artifacts) first, then that everyone a
+ * message reaches but the principal can open every Google link in what the
+ * assistant wrote. Throws `LinkCheckUnavailableError` when Google was too
+ * briefly unavailable to decide.
  */
 export async function checkLinksOpenable(request: LinkCheckRequest): Promise<LinkCheck> {
   const artifacts = await checkArtifactLinksOpenable({

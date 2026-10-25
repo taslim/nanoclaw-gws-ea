@@ -33,14 +33,10 @@ function transformForWhatsApp(text: string): string {
   return text;
 }
 
-// WhatsApp tags `@<phone-digits>` (5–15 digit local part — covers short test
-// numbers up to ITU E.164 max). A leading `+` is accepted but stripped so
-// the literal in text matches the digits in the JID — WhatsApp clients
-// scan the rendered text for `@<digits>` and cross-reference it with the
-// contextInfo.mentionedJid list to draw the bold/clickable tag.
+// WhatsApp clients draw a tag only where the text's `@<digits>` matches a JID in contextInfo.mentionedJid, so a
+// leading `+` is stripped. 5–15 digits spans short test numbers up to the E.164 maximum.
 const MENTION_RE = /(^|[^\w@+])@\+?(\d{5,15})(?!\d)/g;
 
-/** Extract `@<digits>` mentions from text and normalize them. */
 export function parseWhatsAppMentions(text: string): { text: string; mentions: string[] } {
   const mentions = new Set<string>();
   const out = text.replace(MENTION_RE, (_full, lead: string, digits: string) => {
@@ -50,11 +46,7 @@ export function parseWhatsAppMentions(text: string): { text: string; mentions: s
   return { text: out, mentions: [...mentions] };
 }
 
-/**
- * Convert Claude's markdown to WhatsApp-native formatting and extract any
- * `@<phone>` mentions. Code-block regions are passed through untouched so
- * phone-like sequences inside code aren't tagged.
- */
+/** Code spans pass through untouched, so phone-like digits inside code are never tagged. */
 export function formatWhatsApp(text: string): { text: string; mentions: string[] } {
   const segments = splitProtectedRegions(text);
   const mentions = new Set<string>();

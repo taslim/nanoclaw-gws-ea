@@ -96,7 +96,7 @@ async function bookingFor(chat: string, eventId: string): Promise<ChatBooking | 
   );
 }
 
-/** Native chat ownership: no email thread, thread map, or Google grant is created for the agent. */
+/** The chat owns its bookings: no email thread, thread map, or Google grant is created for the agent. */
 export function createChatSchedulingTools(deps: SchedulingToolsDeps) {
   const calendar = () => deps.calendar();
   async function viewForChat(chatId: string) {

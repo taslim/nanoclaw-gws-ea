@@ -13,15 +13,13 @@ import {
 import { normalizePersonName, type PersonName, type NameOwner } from './person-name.js';
 import { ianaTimezone } from '../timezone.js';
 
-/** The template create stamps main from, the group it names, and the plugin it stamps into main's folder. */
 export const MAIN_TEMPLATE = 'gws-ea/main';
 export const MAIN_GROUP_NAME = 'main';
 export const MAIN_PLUGIN_NAME = 'gws-ea-main';
 
-/** The principal as create declared them, which seeds the profile when it first publishes main. */
 export interface PrincipalSeed {
   readonly name: PersonName;
-  /** Their home timezone; main's container runs in it, as the host derives it from the profile (KTD7). */
+  /** Main's container runs in it; the host derives that from the profile. */
   readonly timezone: string;
   /** One or more addresses; the profile then holds exactly these. */
   readonly emails: readonly string[];
@@ -34,7 +32,7 @@ export interface MainIdentityInput {
    * The principal, until main is published. Absent after: the profile is the
    * one source of their name, timezone and addresses, which the principal
    * changes through main and the operator through `gws-ea ncl`, and nothing
-   * here writes them again (KTD9).
+   * here writes them again.
    */
   readonly principal?: PrincipalSeed;
 }
@@ -46,7 +44,6 @@ export interface MainIdentityResult {
 
 export interface MainIdentityDependencies {
   readonly runNcl?: (config: InstanceRuntimeConfig, args: readonly string[]) => Promise<unknown>;
-  /** The instance's OneCLI administration; its own, with its admin key, by default. */
   readonly onecliAdmin?: (config: InstanceRuntimeConfig) => Promise<OnecliAdmin>;
 }
 
@@ -58,7 +55,7 @@ function safeString(value: unknown, label: string, maxLength = 256): string {
  * The main group `ncl groups create --template` answered with: the group it
  * stamped, or, when a group already carries the plugin, the group its restamp
  * plan names. Without `--yes` that plan is only a plan, and nothing is
- * restamped (KTD12).
+ * restamped.
  */
 function parseGroupResult(value: unknown): { id: string; name: string } {
   const data = unwrapData(value);
@@ -120,10 +117,9 @@ function validateInput(input: MainIdentityInput): MainIdentityInput {
 }
 
 /**
- * The principal as the profile is seeded with them. Their timezone is held as
- * main's container runs in it (`ianaTimezone`), the host deriving that from
- * the profile (KTD7): an offset or a miscased name would put main's clock on
- * the wrong offset or on UTC.
+ * The timezone is canonicalized (`ianaTimezone`) because main's container runs
+ * in it: an offset or a miscased name would put main's clock on the wrong
+ * offset or on UTC.
  */
 function validatePrincipalSeed(seed: PrincipalSeed, assistantWorkspaceEmail: string): PrincipalSeed {
   const timezone = ianaTimezone(safeString(seed.timezone, 'Principal timezone', 120));
@@ -135,10 +131,6 @@ function validatePrincipalSeed(seed: PrincipalSeed, assistantWorkspaceEmail: str
   };
 }
 
-/**
- * One or more addresses, lowercased and each once, none the assistant's own
- * or another spelling of one before it (`principalAddressesConflict`).
- */
 function validatePrincipalEmails(values: readonly string[], assistantWorkspaceEmail: string): readonly string[] {
   const emails = [
     ...new Set(
@@ -155,17 +147,12 @@ function validatePrincipalEmails(values: readonly string[], assistantWorkspaceEm
   return emails;
 }
 
-/** Whether the profile holds exactly the declared addresses, in any order. */
 function sameAddresses(held: unknown, declared: readonly string[]): boolean {
   if (!Array.isArray(held)) return false;
   const holding = new Set<unknown>(held);
   return holding.size === held.length && held.length === declared.length && declared.every((e) => holding.has(e));
 }
 
-/**
- * Main's OneCLI agent, created when missing, in all secret mode. A create
- * that finds the agent already there (a 409) reads it from the list.
- */
 async function reconcileAllSecretMode(admin: OnecliAdmin, agentGroupId: string): Promise<string> {
   let agent = exactAgent(await admin.listAgents(), agentGroupId);
   if (!agent) {
@@ -184,17 +171,15 @@ async function reconcileAllSecretMode(admin: OnecliAdmin, agentGroupId: string):
 }
 
 /**
- * Reconcile the canonical main group and its credential boundary. The profile
- * pointer is published last, so principal binding cannot observe a canonical
- * main until its provider, its shared skills, and instance-vault-wide OneCLI
- * access have been verified. Main's container runs in the principal's
+ * The profile pointer is published last, so principal binding cannot observe a
+ * canonical main until its provider, its shared skills, and instance-vault-wide
+ * OneCLI access have been verified. Main's container runs in the principal's
  * timezone, which the host derives from the profile in the same transaction
- * that publishes or reconciles it (KTD7), so nothing here sets it. The
- * principal seeds the profile only with main's first publication: after it,
- * a reconcile writes none of the principal's profile (KTD9).
- * Main is stamped from its template only when no group carries it yet: an
- * existing main is found, never restamped, so a customized template survives
- * every repair (R11, KTD12).
+ * that publishes or reconciles it, so nothing here sets it. The principal
+ * seeds the profile only with main's first publication: after it, a reconcile
+ * writes none of the principal's profile. Main is stamped from its template
+ * only when no group carries it yet: an existing main is found, never
+ * restamped, so a customized template survives every repair.
  */
 export async function reconcileMainIdentity(
   configInput: InstanceRuntimeConfig,
@@ -220,9 +205,9 @@ export async function reconcileMainIdentity(
     throw new GwsEaError('main_group_mismatch', 'Canonical main provider reconciliation did not persist');
   }
 
-  // Main's shared skills are the release's own list (KTD13), and this
-  // reconcile on create and update is the only place it is set: the host
-  // never rewrites it at start. Only an explicit list is checked here.
+  // Main's shared skills and capabilities are the release's own selection, and
+  // this reconcile on create and update is the only place they are set: the
+  // host never rewrites them at start. Only an explicit skill list is checked.
   const skills = unwrapData(await runNcl(config, ['gws-ea-main', 'reconcile', '--agent-group-id', group.id]));
   if (
     !isRecord(skills) ||

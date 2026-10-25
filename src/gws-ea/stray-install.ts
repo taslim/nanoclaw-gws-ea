@@ -3,8 +3,8 @@
  * itself a NanoClaw tree, so NanoClaw's own setup, `pnpm run dev`, a service
  * install, or `container/build.sh` run there creates an install no assistant
  * owns, keyed by the checkout path's hash. gws-ea is the only way NanoClaw
- * runs from this tree, so such an install is always a mistake: `create`,
- * `update`, and `cleanup` remove it whole, and `list` and `status` note it.
+ * runs from this tree, so such an install is always a mistake: gws-ea removes
+ * it whole, and its read-only commands only note it.
  */
 import { createHash } from 'node:crypto';
 import type { Stats } from 'node:fs';
@@ -36,35 +36,30 @@ import {
 import { GwsEaError } from './types.js';
 import { isRecord } from './validation.js';
 
-/** How long the check before `create` and `update`, and `list`'s and `status`'s note, wait on Docker. */
+/** How long a check the operator did not ask for waits on Docker. */
 const QUICK_CHECK_MS = 500;
 /** How long `gws-ea cleanup`, which the operator asked for, waits on Docker. */
 export const FULL_CHECK_MS = 10_000;
-/** How often, and for how long, removal waits for a host it stopped to go. */
 const HOST_POLL_MS = 500;
 const HOST_STOP_LIMIT_MS = 30_000;
 
-/** Boundary seams; each defaults to the real one. */
 export interface StraySeams {
   readonly platform?: InstanceServicePlatform;
   readonly homeDirectory?: string;
   readonly runCommand?: SanitizedCommandOutcomeRunner;
-  /** The active local Docker endpoint, which the teardown runs against. */
   readonly resolveDocker?: () => Promise<string>;
-  /** Sends SIGTERM to a host started by hand. */
   readonly terminate?: (pid: number) => void;
   readonly sleep?: (milliseconds: number) => Promise<void>;
 }
 
-/** The checkout gws-ea runs from. Only the launcher names it, so nothing else ever cleans a tree (KTD4). */
+/** The checkout gws-ea runs from. Only the launcher names it, so nothing else ever cleans a tree. */
 export interface ToolCheckout extends StraySeams {
   /** Its real path. */
   readonly root: string;
-  /** NanoClaw's own `.env` backup (`setup/uninstall/remove.ts`): a copy beside it, never clobbering one; its path. */
+  /** NanoClaw's `.env` backup (`setup/uninstall/remove.ts`): a copy beside it that never clobbers an earlier one. */
   readonly backupEnv: (envPath: string) => string;
 }
 
-/** Upstream's helpers removal stops the stray's host with; the launcher supplies them. */
 export interface StrayLauncher {
   readonly recordRemoved?: (part: string) => void;
   readonly recordEffect?: (changed: true | null) => void;
@@ -72,29 +67,26 @@ export interface StrayLauncher {
   readonly serviceHelpers: NanoclawServiceHelpers;
 }
 
-/** What a check found in the tool checkout. */
 export interface StrayInstall {
   readonly root: string;
-  /** Its service definitions. */
   readonly services: readonly string[];
-  /** Files in the checkout only an install leaves: its database, host socket, and nohup launcher. */
   readonly files: readonly string[];
   readonly containers: number;
   readonly imageTags: number;
-  /** Why Docker's containers and image tags went unchecked, when Docker did not answer in time. */
+  /** Why Docker's containers and image tags went unchecked; their counts are then 0. */
   readonly unchecked?: string;
 }
 
 /** Files in the checkout only an install leaves. `.env` and empty directories are not among them: tests leave those. */
 const INSTALL_FILES = ['data/v2.db', 'data/ncl.sock', 'start-nanoclaw.sh', 'nanoclaw.pid'] as const;
-/** gws-ea's own log, which `setup/gws-ea.ts` writes in the checkout it runs from. */
+/** gws-ea's own log, which `gws-ea.sh` writes in the checkout it runs from. */
 const OWN_LOG = 'gws-ea-setup.log';
 
 function plural(count: number, noun: string): string {
   return `${count} ${noun}${count === 1 ? '' : 's'}`;
 }
 
-/** Each part a check found, named for the operator; none means there is no stray install. */
+/** Named for the operator; empty when there is no stray install. */
 export function strayParts(stray: StrayInstall): string[] {
   return [
     ...stray.services,
@@ -104,14 +96,12 @@ export function strayParts(stray: StrayInstall): string[] {
   ];
 }
 
-/** The note `list` and `status` add beside their result when a stray install is present. */
 export function strayNote(stray: StrayInstall): string | undefined {
   const parts = strayParts(stray);
   if (parts.length === 0) return undefined;
   return `Note: a stray NanoClaw install is in ${stray.root} (${parts.join(', ')}); gws-ea cleanup removes it.`;
 }
 
-/** What is at `file` itself, never what a final symlink there points at; undefined when nothing is. */
 async function entryAt(file: string): Promise<Stats | undefined> {
   try {
     return await lstat(file);
@@ -125,7 +115,7 @@ async function exists(file: string): Promise<boolean> {
   return (await entryAt(file)) !== undefined;
 }
 
-/** Where the stray install lives: the slug NanoClaw derives from the checkout's own path, never from the environment (KTD3). */
+/** The slug NanoClaw derives from the checkout's own path, never from the environment. */
 function strayCoordinates(checkout: ToolCheckout) {
   const platform = checkout.platform ?? instanceServicePlatform();
   const homeDirectory = checkout.homeDirectory ?? os.homedir();
@@ -138,7 +128,7 @@ function strayCoordinates(checkout: ToolCheckout) {
   return { platform, homeDirectory, installId, containerImageBase, containerInstallLabel, services };
 }
 
-/** A checkout that is an assistant's, or that holds gws-ea's own state, is never cleaned (R8). */
+/** A checkout that is an assistant's, or that holds gws-ea's own state, is never cleaned. */
 async function guarded(root: string, paths: ControlPlanePaths): Promise<boolean> {
   const within = (inner: string, outer: string): boolean => inner === outer || isWithinDirectory(inner, outer);
   if (within(root, paths.stateRoot) || within(paths.stateRoot, root) || within(paths.configRoot, root)) return true;
@@ -197,15 +187,12 @@ export async function detectStrayInstall(
 }
 
 /**
- * Remove a stray install whole (R1, R2, R9). A host answering on the
- * checkout's socket is stopped first: one started by hand has relative
- * arguments no kill pattern matches (KTD5). gws-ea's own NanoClaw teardown
- * then removes the service, any host it left, the containers, and every tag
- * in the stray's image repository (KTD2). State goes only once no host
+ * A host answering on the checkout's socket is stopped first: one started by
+ * hand has relative arguments no kill pattern matches. gws-ea's own NanoClaw
+ * teardown then removes the rest of the install. State goes only once no host
  * answers, and `data/` last, so an interrupted removal stays detectable and
  * the next run finishes it. Each entry is removed by its own name, so one
- * linked elsewhere loses its link, never what it points at. Returns what it
- * removed, named for the operator.
+ * linked elsewhere loses its link, never what it points at.
  */
 export async function removeStrayInstall(
   checkout: ToolCheckout,
@@ -216,7 +203,7 @@ export async function removeStrayInstall(
   const stray = strayCoordinates(checkout);
   const run = checkout.runCommand ?? runSanitizedCommandOutcome;
   const sleep: (milliseconds: number) => Promise<void> = checkout.sleep ?? delay;
-  /** The PID of the host answering for this checkout; undefined only when nothing listens on its socket. */
+  /** Undefined only when nothing listens on the checkout's socket; `unanswered` when something does but gave no PID. */
   const host = async (): Promise<number | 'unanswered' | undefined> => {
     try {
       const status = await launcher.hostStatus.queryHost(root);

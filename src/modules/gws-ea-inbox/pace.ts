@@ -1,6 +1,6 @@
 /**
- * Human pace (KTD3, R62): an outside thread is worked 3 to 6 minutes after
- * its first message not yet answered, and all at once.
+ * Human pace: an outside thread is worked 3 to 6 minutes after its first
+ * message not yet answered, and all at once.
  *
  * A row written into an outside thread's session, `external-email`'s session
  * for a thread in the inbox (`email:inbox`), waits until the session's
@@ -9,37 +9,34 @@
  * reads a row before it is due, and the host sweep wakes the session once it
  * is, so everything that arrived meanwhile reaches the agent in one turn.
  * The router asks for the deadline as it writes each email, the principal's
- * included (index.ts). `main`'s handoff starts no wait of its own: it joins the
- * pending deadline when there is one, so it is worked with the mail already
- * waiting, and is otherwise due as written (`pendingDeadline`).
+ * on an outside thread included (index.ts). `main`'s handoff starts no wait
+ * of its own: it joins the pending deadline when there is one, so it is
+ * worked with the mail already waiting, and is otherwise due as written
+ * (`pendingDeadline`).
  *
  * A deadline is pending only while it is ahead and pace set it: a retried
- * message waits out its backoff, which holds no new mail. Once the agent
- * has a batch, the next row starts a new wait. No other session is delayed: the principal's own email and every
- * note to `main` are worked as they come.
+ * message waits out its backoff, which holds no new mail. Once the agent has
+ * a batch, the next row starts a new wait. No other session is delayed.
  *
- * Pace starts once `main` has handed the thread over (Slice 5 KTD8). Until
- * then every row the router writes into the thread's session is held: no
- * turn reads it and nothing waits on it or wakes for it. The handoff releases
- * what is held to the thread's pending deadline, with main's words.
+ * Pace starts once `main` has handed the thread over. Until then every row
+ * the router writes into the thread's session is held: no turn reads it and
+ * nothing waits on it or wakes for it. The handoff releases what is held to
+ * the thread's pending deadline, with main's words.
  */
 import { withExistingMailboxSession } from '../../session-manager.js';
 import type { Session } from '../../types.js';
 import { emailMessagingGroupIds } from './db.js';
 import { threadPlacement } from './thread-map.js';
 
-/** The shortest wait for an outside thread's first unanswered message. */
 const PACE_MIN_MS = 3 * 60_000;
-/** The longest. */
 const PACE_MAX_MS = 6 * 60_000;
 
-/** Whether the session is external-email's for one thread in the inbox. */
 async function isOutsideThread(session: Session): Promise<boolean> {
   const { inbox } = await emailMessagingGroupIds();
   return inbox !== null && session.messaging_group_id === inbox && session.thread_id !== null;
 }
 
-/** The deadline pace set that is still ahead in the session, if any. */
+/** Only a row never tried holds a deadline pace set: a retried one waits out its backoff. */
 async function waitingDeadline(session: Session): Promise<string | null> {
   const waiting = await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) =>
     mailbox.getWaitingMessages(),
@@ -47,7 +44,6 @@ async function waitingDeadline(session: Session): Promise<string | null> {
   return waiting?.find((message) => message.tries === 0)?.processAfter ?? null;
 }
 
-/** When a row written now into an outside thread's session is to be read: its pending deadline, or a new one. */
 async function outsideDeadline(session: Session): Promise<string> {
   return (
     (await waitingDeadline(session)) ??
@@ -55,30 +51,21 @@ async function outsideDeadline(session: Session): Promise<string> {
   );
 }
 
-/**
- * When a row written now into `session` is to be read: the outside thread's
- * pending deadline, or a new one. Null for every other session.
- */
+/** Null for every session but an outside thread's. */
 export async function paceDeadline(session: Session): Promise<string | null> {
   return (await isOutsideThread(session)) ? outsideDeadline(session) : null;
 }
 
-/** How a row written now into an outside thread's session waits: held for main, or else until its deadline. */
 export interface InboundPace {
-  /** The thread's pending deadline, or a new one. */
   readonly deadline: string;
   /**
    * Held for main, which wins over the deadline: an outside thread's mail is
-   * read only once main has placed the thread and handed it over, however
-   * the thread began.
+   * read only once main has handed the thread over, however the thread began.
    */
   readonly held: boolean;
 }
 
-/**
- * How a row the router writes now into `session` waits, from one look at
- * the inbox; undefined for every session but an outside thread's.
- */
+/** Undefined for every session but an outside thread's. */
 export async function inboundPace(session: Session): Promise<InboundPace | undefined> {
   const threadKey = session.thread_id;
   if (threadKey === null || !(await isOutsideThread(session))) return undefined;
@@ -86,10 +73,7 @@ export async function inboundPace(session: Session): Promise<InboundPace | undef
   return { deadline, held: (await threadPlacement(threadKey))?.released !== true };
 }
 
-/**
- * The outside thread's pending deadline, which a row written now joins;
- * null when none is ahead, and for every other session.
- */
+/** The deadline a row written now joins; null when none is ahead, and for every session but an outside thread's. */
 export async function pendingDeadline(session: Session): Promise<string | null> {
   return (await isOutsideThread(session)) ? waitingDeadline(session) : null;
 }

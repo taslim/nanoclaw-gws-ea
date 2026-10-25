@@ -75,7 +75,10 @@ const expectReply: ActionAnswer = async (content, session, requestId) => {
     return { until: expires, message: 'Their next answer will reach you in this chat.' };
   });
 };
-/** Close waits on the next human message; retain its identity until expiry so an interrupted mailbox write can replay. */
+/**
+ * The next message from an expected member consumes the wait; its id stays on the row until expiry, so a
+ * replay after an interrupted mailbox write still engages.
+ */
 export async function consumeExpectedChatReply(chatId: string, userId: string, messageId: string): Promise<boolean> {
   const chat = await getChat(chatId);
   if (!chat) return false;

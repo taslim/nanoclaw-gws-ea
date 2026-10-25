@@ -1,8 +1,8 @@
 /**
- * Proving a stopped assistant quiet before its fence (KTD18): `ps`, Docker,
+ * Proving a stopped assistant quiet before its fence: `ps`, Docker,
  * and `lsof` answer through a fake runner, except one check that the real
  * `lsof` finds a real idle opener, and Linux's process table is read from a
- * planted one. And the serving gate (KTD12): a started release serves only
+ * planted one. And the serving gate: a started release serves only
  * once its Google Chat receives, or when a broken Google sign-in is its only
  * fault, on the fixture's assistants.
  */
@@ -674,7 +674,7 @@ function signInNeeded(instanceId: string): string {
 }
 
 // Each case builds a git-backed machine and assistant, as the update and rollback cases below do.
-describe('the serving gate: a release serves once its Google Chat receives (KTD12)', { timeout: 90_000 }, () => {
+describe('the serving gate: a release serves once its Google Chat receives', { timeout: 90_000 }, () => {
   /** Run the gate on the assistant's live release, as an update or rollback runs it once the release started. */
   async function verifyLive(
     host: Machine,
@@ -744,7 +744,7 @@ describe('the serving gate: a release serves once its Google Chat receives (KTD1
   });
 });
 
-describe('update and rollback through the serving gate (KTD12)', { timeout: 90_000 }, () => {
+describe('update and rollback through the serving gate', { timeout: 90_000 }, () => {
   it('serves an update and a rollback whose only fault is a broken Google sign-in, reporting the sign-in needed', async () => {
     const host = await machine();
     const runtime = await assistant(host);

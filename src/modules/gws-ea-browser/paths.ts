@@ -11,7 +11,7 @@ export interface BrowserPaths {
   artifactsDir: string;
 }
 
-/** The policy owns a dedicated sibling profile; no foreign browser endpoint or profile is adopted. */
+/** Every path sits beside the policy file, so the browser never adopts a foreign profile. */
 export function browserPaths(policyFile: string): BrowserPaths {
   if (!path.isAbsolute(policyFile)) throw new Error('Browser policy path must be absolute');
   const root = path.dirname(policyFile);
@@ -82,7 +82,7 @@ export async function clearBrowserUploadStaging(paths: BrowserPaths): Promise<vo
   for (const entry of entries) await rm(path.join(directory, entry), { recursive: true, force: true });
 }
 
-/** Atomic owner-only files, including policy and Preferences; never follows an existing symlink. */
+/** Atomic and owner-only; refuses, never follows, an existing symlink or hard-linked file. */
 export async function writePrivateFile(file: string, data: string | Uint8Array): Promise<void> {
   await ensurePrivateDirectory(path.dirname(file));
   try {

@@ -9,8 +9,7 @@ import type {
 import { loadGatewayCatalog } from './catalog.js';
 import { resolveGatewaySelection } from './selection.js';
 
-// The connection contract lives with the host, which compiles only `src/`;
-// providers keep importing it from here.
+// The connection contract lives with the host, which compiles only `src/`; providers import it from here.
 export type {
   ChatGptOAuthCredential,
   GatewayCredentialConnection,

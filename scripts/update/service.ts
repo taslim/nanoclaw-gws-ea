@@ -16,7 +16,7 @@ export interface CommandRunner {
 }
 
 export interface CommandRunnerOptions {
-  /** The environment every command runs with. Unset = this process's environment. */
+  /** Unset = this process's environment. */
   env?: NodeJS.ProcessEnv;
 }
 
@@ -158,7 +158,6 @@ function escapeRegex(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
-/** The service and container names of the install `env` targets. */
 function installNames(projectRoot: string, env: ServiceEnvironment): InstallScopedNames {
   return getInstallScopedNames(env.installSlug ?? getInstallSlug(projectRoot));
 }

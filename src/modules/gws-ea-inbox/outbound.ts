@@ -1,6 +1,5 @@
 /**
- * Email to anyone but the principal (KTD5, KTD9; R61, R68, R75, R76), and
- * `email_send` for both agents.
+ * Email to anyone but the principal, and `email_send` for both agents.
  *
  * Ordinary delivery hands the channel adapter every send on `email:inbox`
  * (`sendToOutside`): `external-email`'s final text, and its `email_send`
@@ -8,14 +7,12 @@
  * side of the send ledger:
  *
  * - A reply answers the latest message on the thread's outside side that
- *   Gmail still holds, the assistant's own included: to everyone it placed
- *   (recipients.ts), quoting it, under its subject, in its Gmail thread, and
- *   referencing only Message-IDs the outside side has seen. A principal-only
- *   note in the same Gmail thread is never quoted, referenced, or addressed.
+ *   Gmail still holds, the assistant's own included, and references only
+ *   Message-IDs the outside side has seen. A principal-only note in the same
+ *   Gmail thread is never quoted, referenced, or addressed.
  * - `email_send` may name who it goes to, carry files, and write a thread's
  *   first email, which takes a subject and goes to everyone `main` named
- *   unless it names others. Final text in a thread with no message yet is
- *   refused with a reason that names `email_send`.
+ *   unless it names others.
  * - Every recipient passes the recipient guard (recipients.ts).
  * - A file goes only when `main` handed it over for this thread: its SHA-256
  *   must be recorded with the thread, and the host's copy is what is sent.
@@ -23,32 +20,19 @@
  * The private-values check runs here, as the email is built, on the email
  * that goes and the people it goes to; the privacy module's outbound guard
  * leaves these sends to it. What the assistant wrote is checked for everyone
- * the email reaches: its words as written and as both parts show them, its
- * link targets, its subject, the addresses it names, and the host's copies of
- * the files that go. What a reply carries over from the message it answers
- * (its subject, its people, and the quote under its attribution) shows its
- * readers what they already received, so it is checked only for anyone new
- * to the thread (`carriedOver`): the quote goes without them when it would
- * show them a private value, and the email does not go at all when its
- * subject or people would.
+ * the email reaches; what a reply carries over from the message it answers
+ * only for people not on that message (`carriedOver`).
  *
- * Then the link check (gws-ea-workspace's `checkLinksOpenable`, Slice 6
- * KTD4): every Google link in what the assistant wrote, its subject, words
- * and text files, must open for everyone the email reaches but the
- * principal. The quote is never read: its links are other people's. A
- * refusal tells external-email only who cannot open a link, and to tell
- * main. When Google is briefly unavailable, a reply waits for delivery's own
- * retry, and `email_send` answers that it can be tried again shortly.
- *
- * A send Gmail already took is answered from Gmail before anything is
- * checked again (send.ts), so a check that would refuse it now never reports
- * a sent email as unsent.
+ * Then the link check (gws-ea-workspace's `checkLinksOpenable`): every Google
+ * link in what the assistant wrote, its subject, words and text files, must
+ * open for everyone the email reaches but the principal. The quote is never
+ * read: its links are other people's. When Google is briefly unavailable, a
+ * reply waits for delivery's own retry, and `email_send` answers that it can
+ * be tried again shortly.
  *
  * For `main`, `email_send` writes to the principal in the thread it names,
- * by the rules of its replies there (principal-reply.ts): only to the address
- * Gmail verified wrote the thread's latest principal-only message, and never
- * in a thread that has none. It may carry any file `main` staged: the
- * principal may receive anything.
+ * by the rules of its replies there (principal-reply.ts). It may carry any
+ * file `main` staged: the principal may receive anything.
  *
  * Each request is answered once, a refusal or failure included:
  *
@@ -125,11 +109,10 @@ function refused(reason: string): OutboundRefusedError {
 // What a send asks for
 // ---------------------------------------------------------------------------
 
-/** An email to a thread's outside side, as a reply or `email_send` asks for it. */
 interface OutsideEmail extends EmailWords {
   /** A thread's first email's; a reply keeps its thread's. */
   readonly subject?: string;
-  /** Who it goes to, when it names them rather than replying to all. */
+  /** With neither this nor `cc`, a reply goes to all. */
   readonly to?: readonly string[];
   readonly cc?: readonly string[];
 }
@@ -146,7 +129,6 @@ function addressesOf(value: unknown, field: 'to' | 'cc'): string[] | undefined {
   });
 }
 
-/** The email a send's content asks for; refuses anything email cannot carry. */
 function outsideEmailOf(content: unknown): OutsideEmail {
   const words = emailWords(content);
   if (words === undefined || words.text.trim() === '') throw refused('An email carries words, as text.');
@@ -172,9 +154,8 @@ function outsideEmailOf(content: unknown): OutsideEmail {
 // Who it reaches
 // ---------------------------------------------------------------------------
 
-/** What a send answers, and who it reaches. */
 interface Plan {
-  /** The message it answers; undefined for a thread's first email. */
+  /** Undefined when Gmail holds no outside message of the thread, as before its first email. */
   readonly anchor: ParsedMail | undefined;
   readonly recipients: Recipients;
 }
@@ -205,7 +186,7 @@ async function outsideAnchor(runtime: InboxRuntime, threadKey: string): Promise<
 }
 
 async function planSend(runtime: InboxRuntime, threadKey: string, email: OutsideEmail): Promise<Plan> {
-  // The assistant's own Gmail address is never one of the people a reply goes to.
+  // Learn the assistant's own Gmail address, so `assistantAddresses` holds it and no reply goes to it.
   await runtime.gmailAddress();
   const anchor = await outsideAnchor(runtime, threadKey);
   if (email.to !== undefined || email.cc !== undefined) {
@@ -224,7 +205,6 @@ function sha256(data: Buffer): string {
   return createHash('sha256').update(data).digest('hex');
 }
 
-/** The host's copy of each file, each of which `main` must have handed over for this thread. */
 async function handedFiles(threadKey: string, files: readonly OutboundFile[]): Promise<OutboundFile[]> {
   const attachments: OutboundFile[] = [];
   for (const file of files) {
@@ -242,17 +222,16 @@ async function handedFiles(threadKey: string, files: readonly OutboundFile[]): P
   return attachments;
 }
 
-/** The text of the files that go, as the host holds them: each one's name, and its contents when they are text. */
 function filesText(files: readonly OutboundFile[]): string[] {
   return files.flatMap((file) => [file.filename, ...(isUtf8(file.data) ? [file.data.toString('utf8')] : [])]);
 }
 
 /**
  * What a reply carries over from the message it answers: its subject, its
- * people, and the quote under its attribution. Its readers received them;
- * anyone new to the thread sees them only when they hold no private value
- * for them. Otherwise the quote goes without them, and a subject or people
- * that would show them one refuse the email. Returns the quote that goes.
+ * people, and the quote under its attribution. Its readers received them, so
+ * only people not on that message are checked: a quote that would show them
+ * a private value is left out, and a subject or people that would refuse the
+ * email. Returns the quote that goes.
  */
 async function carriedOver(
   anchor: ParsedMail,
@@ -353,7 +332,7 @@ export async function sendToOutside(
 // email_send
 // ---------------------------------------------------------------------------
 
-/** The delivery action both agents send email with; the runner's tool of the same name sends it. */
+/** The runner's tool of the same name sends it. */
 export const EMAIL_SEND_ACTION = 'email_send';
 
 const THREAD_KEY = /^mail-[A-Za-z0-9-]{1,80}$/u;
@@ -377,7 +356,7 @@ const emailSendAction = defineGuardedAction({
   },
 });
 
-/** Hand an email to delivery, past every outbound guard, as any send on the channel goes. */
+/** Through delivery, so every outbound guard checks it as it checks any send on the channel. */
 async function deliverEmail(
   platformId: string,
   threadKey: string,
@@ -389,7 +368,6 @@ async function deliverEmail(
   await delivery.deliver(EMAIL_CHANNEL_TYPE, platformId, threadKey, 'chat', JSON.stringify(email), files);
 }
 
-/** The files a request names, read from its own outbox; refused unless each one is there. */
 function stagedFiles(session: Session, requestId: string, value: unknown): OutboundFile[] | undefined {
   if (value === undefined) return undefined;
   const names = Array.isArray(value) ? value.filter((name: unknown): name is string => typeof name === 'string') : [];
@@ -404,7 +382,6 @@ function stagedFiles(session: Session, requestId: string, value: unknown): Outbo
   return files;
 }
 
-/** `main` writes to the principal in one of their threads, as its replies there go, with any files it staged. */
 async function toPrincipal(
   content: Record<string, unknown>,
   session: Session,
@@ -429,7 +406,6 @@ async function toPrincipal(
   };
 }
 
-/** `external-email` writes in its own thread: a first email, a reply to whom it names, or one with files. */
 async function inThread(
   content: Record<string, unknown>,
   session: Session,
@@ -457,14 +433,12 @@ async function inThread(
   return { thread_key: threadKey, message: 'Your email is sent.' };
 }
 
-/** `email_send`, from `main` to the principal or from `external-email` in its own thread. */
 const emailSend: ActionAnswer = async (content, session, requestId) => {
   try {
     return session.agent_group_id === (await getMainAgentGroupId())
       ? await toPrincipal(content, session, requestId)
       : await inThread(content, session, requestId);
   } catch (error) {
-    // An outbound guard refused the email as written, or Google was too briefly unavailable to check its links.
     if (error instanceof OutboundRefusedError) throw forbidden(`Your email was not sent: ${error.reason}`);
     if (error instanceof LinkCheckUnavailableError) throw forbidden(`Your email was not sent: ${LINKS_UNCHECKED}`);
     throw error;
@@ -473,5 +447,4 @@ const emailSend: ActionAnswer = async (content, session, requestId) => {
 
 export const emailSendHandler = answeringAction(EMAIL_SEND_ACTION, emailSend);
 
-/** The guard `email_send` passes. */
 export const EMAIL_SEND_GUARD = answeredGuard(emailSendAction);

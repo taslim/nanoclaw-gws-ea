@@ -1,58 +1,19 @@
 /**
- * external-email's scheduling tools (KTD7; R69, R70, R71): four host
- * actions, each bound to the email thread whose session calls it
- * (`threadCalendarAction` in `guard.ts`). No argument names a thread, so a
- * call never reaches another thread's bookings.
+ * external-email's scheduling tools, each bound to the email thread whose
+ * session calls it (`threadCalendarAction` in `guard.ts`): no argument names
+ * a thread, so a call never reaches another thread's bookings.
  *
- *   free_time       { from, to, minutes, timezone? } → { windows, windows_not_listed, message }
- *   book            { start, minutes, title, notes?, location?, video_call?, invitees?, timezone? }
- *                                                     → { booking, start, end, message }
- *   change_booking  { booking, start?, minutes?, title?, location?, notes?, video_call?, timezone? }
- *                                                     → { booking, start, end, message }
- *   cancel_booking  { booking, timezone? }           → { booking, message }
- *
- * Every time an answer gives is ready to write, in the principal's zone and,
- * when a call gives `timezone`, the other side's.
- *
- * - `free_time` lists the free windows in the range from now on, from the
- *   principal's free/busy alone, in date order (`freeWindows` in
- *   `slots.ts`). The agent picks the times; each window is labeled, ready to
- *   write, in the principal's time zone and, when given, the counterpart's,
- *   inside whose waking day it falls, with a fit note from a fixed vocabulary
- *   that never echoes a preference, protected time included. It reads busy
- *   time on the principal's calendars alone, never adding the thread's, so a
- *   calendar no longer shared never fails it, and says when the thread has
- *   no calendar yet, so external-email asks main early.
  * - Nothing reserves a time before someone agrees to it: a time offered in
  *   one thread is any thread's until booked, and a booking blocks time as
  *   any other event of the principal's does (`blocksTime` in `slots.ts`).
- * - `book` always creates a new event at a time still free, inviting only
- *   people on the thread, with an invitation that passes the private-values
- *   check as its invitees would see it.
- * - `change_booking` and `cancel_booking` act only on an event this thread
- *   booked. A change keeps the event's id and is checked as `book` checks
- *   what it writes.
- * - `book` and `change_booking` refuse a time that has passed or gone, with
- *   word to offer others. Protected time is the agent's call, as any
- *   preference is.
- * - Every booking lists the principal as an accepted guest, its organizer
- *   (`guestsOn`); who a booking invites never counts them.
- * - `main` hears in one fact when a booking is made, changed or cancelled,
- *   with the thread's open matter, which a new booking joins (KTD11), and
- *   that matter's other threads to brief (R28).
- *
- * Bookings go only on the calendar `main` set for the thread (R11), while it
- * is a principal calendar the assistant can write to; no other calendar
- * stands in for it. Until there is one, `book` refuses with word to ask
- * main. `change_booking` and `cancel_booking` act on the calendar the
- * booking's record names, whatever the thread's calendar is now.
- * A booking is the thread's when its record names it and its event still
- * carries the booking tag the host gave it. It is forgotten once its event
- * is gone, but never because its calendar went out of sight (R14).
- *
- * Each request is answered once, a refusal or failure included. A replayed
- * request writes nothing twice: a booking's event id derives from the
- * request that made it.
+ * - Of times, the host refuses only one that has passed or is taken:
+ *   protected time is the agent's call, as any preference is.
+ * - `free_time` reads busy time on the principal's calendars alone, never
+ *   adding the thread's, so a calendar no longer shared never fails it.
+ * - `change_booking` and `cancel_booking` act on the calendar the booking's
+ *   record names, whatever the thread's calendar is now.
+ * - A replayed `book` makes no second event: its event id derives from the
+ *   request.
  */
 import { TIMEZONE } from '../../config.js';
 import { forbidden, invalidArgs, type ActionAnswer } from '../../cli/delivery-action.js';
@@ -106,61 +67,42 @@ import {
   type ThreadBooking,
 } from './thread-calendar.js';
 
-/** The private tag naming the thread an event was placed for. */
 export const TAG_THREAD = 'gwsEaThread';
 
-/** How many windows one `free_time` answer lists: about a week of days. */
+/** About a week of days. */
 const MAX_WINDOWS = 24;
-/** The longest range one `free_time` reads. */
 const MAX_RANGE_DAYS = 60;
 const MIN_MINUTES = 5;
 const MAX_MINUTES = 480;
-/** An invitation's title, as attendees see it on their calendars. */
 const TITLE_MAX = 120;
-/** Notes that help the attendees: a few paragraphs at most. */
 const NOTES_MAX = 2_000;
-/** A place: an address, a phone number, or a link. */
 const LOCATION_MAX = 500;
 const MAX_INVITEES = 20;
 const MINUTE = 60_000;
 const DAY = 24 * 60 * MINUTE;
 
-/** People named in prose: "a, b, and c". */
 const LIST = new Intl.ListFormat('en', { style: 'long', type: 'conjunction' });
 
-/** A booking's id, as `book` answered with it: its event's id, lowercase hex. */
+/** A booking's id is its event's id (`eventIdFor`). */
 const BOOKING_ID = /^[0-9a-f]{64}$/u;
 
 /**
- * What external-email does when only main can settle what comes next: an account alone never reaches main in time.
+ * For when only main can settle what comes next: an account left without a wake never reaches main in time.
  * to: external-email
  */
 const WAIT_FOR_MAIN = 'wake main with tell_main and wait for its answer';
 
-/**
- * What to do when an invitation would show its invitees a private detail.
- * Their guest list is never the detail: they are all people of the thread,
- * who see each other's addresses there.
- */
+/** The guest list is never the detail: every invitee is an address the thread already has. */
 const PRIVATE_DETAIL_ADVICE = `Write it without that detail, and do not hint at, spell out, or encode it. If it is the calendar's name, ${WAIT_FOR_MAIN}.`;
 
-/**
- * What a booking's answer says of main: the host tells main of each booking,
- * change and cancellation, so no wake is needed, and external-email still
- * ends its turn with its account of the thread.
- * to: external-email
- */
+/** to: external-email */
 const MAIN_IS_TOLD = 'The host tells main of it, so no wake is needed; still leave your account with tell_main.';
 
-/**
- * What external-email does while the thread has no calendar it can book on: main chooses it (R12, R13).
- * to: external-email
- */
+/** to: external-email */
 const ASK_FOR_CALENDAR = 'wake main with tell_main to ask which calendar to book on';
 /**
- * What `free_time` adds while main has set no calendar for the thread: every
- * call says it, so "once" spares main a second wake, and a time offered now
- * could be one main's choice of calendar rules out (KTD18).
+ * Every `free_time` call says it, so "once" spares main a second wake; a time
+ * offered now could be one main's choice of calendar rules out.
  * to: external-email
  */
 const NO_CALENDAR_YET =
@@ -208,24 +150,22 @@ async function principalView(): Promise<Principal> {
   };
 }
 
-/** The calling session's thread: the guard admitted only a thread's own session. */
+/** The guard admits only a thread's own session. */
 function threadKeyOf(session: Session): string {
   if (session.thread_id === null) throw new Error(`Session ${session.id} has no thread`);
   return session.thread_id;
 }
 
-/** What one thread's request reads and writes against. */
 interface ThreadView {
   readonly threadKey: string;
   readonly principal: Principal;
 }
 
 /**
- * The other threads of the open matter a booking's thread sits in, which the
- * time it settles must reach (R28). With `joining`, the booking's event first
- * joins that matter (KTD11), so the matter holds the time its thread settled.
- * The booking stands and main hears of it whatever happens here, so a failure
- * is logged and names no other thread.
+ * The other threads of the booking thread's open matter, which the time it
+ * settles must reach. With `joining`, the booking's event first joins that
+ * matter. The booking stands and main hears of it whatever happens here, so
+ * a failure is logged and names no other thread.
  */
 async function matterThreads(booking: ThreadBooking, joining: boolean): Promise<string[]> {
   /* eslint-disable no-catch-all/no-catch-all -- the booking already stands; its matter is best effort, never a retry that books again */
@@ -244,7 +184,6 @@ async function matterThreads(booking: ThreadBooking, joining: boolean): Promise<
 }
 
 export interface SchedulingToolsDeps {
-  /** The host's own Calendar client. */
   readonly calendar: () => MeetingsCalendarApi;
 }
 
@@ -265,12 +204,7 @@ export function createSchedulingTools(deps: SchedulingToolsDeps) {
     return { threadKey: threadKeyOf(session), principal: await principalView() };
   }
 
-  /**
-   * The calendar the thread books on: the one main set for it, while it is a
-   * principal calendar the assistant can write to. Refused, with word to ask
-   * main, until there is one, and never placed on some other calendar of
-   * theirs instead.
-   */
+  /** Only the one main set, while it is still bookable: never some other calendar of the principal's instead. */
   async function bookingCalendarOf(view: ThreadView): Promise<CalendarEntry> {
     const calendarId = await getThreadBookingCalendar(view.threadKey);
     if (calendarId === null) {
@@ -285,12 +219,7 @@ export function createSchedulingTools(deps: SchedulingToolsDeps) {
     );
   }
 
-  /**
-   * Time taken in `span`, read now from the principal's calendars and, for a
-   * write, the calendar it goes on: every event that blocks their time, the
-   * assistant's own included, apart from those in `ignore`: the event a
-   * write is itself moving or retrying.
-   */
+  /** `writing` adds the calendar a write goes on; `ignore` holds the event a write is itself moving or retrying. */
   async function busyIn(view: ThreadView, span: Span, ignore: ReadonlySet<string>, writing?: string): Promise<Span[]> {
     const { principal } = view;
     const margin = principal.rules.bufferMinutes * MINUTE + READ_MARGIN_MS;
@@ -310,12 +239,7 @@ export function createSchedulingTools(deps: SchedulingToolsDeps) {
       );
   }
 
-  /**
-   * Refuse, naming each, any time that has passed or is no longer free:
-   * what `book` and `change_booking` never place. A time no longer free is
-   * refused with word to offer others.
-   * to: external-email
-   */
+  /** to: external-email */
   async function assertAvailable(
     view: ThreadView,
     calendarId: string,
@@ -339,9 +263,10 @@ export function createSchedulingTools(deps: SchedulingToolsDeps) {
   }
 
   /**
-   * The calendar writes take turns across every thread: each looks at what
-   * is free and writes before the next looks, so two threads never take one
-   * time, and the second is told it has gone.
+   * Calendar writes take turns across every email thread and chat
+   * (`inSchedulingTurn`): each looks at what is free and writes before the
+   * next looks, so two never take one time, and the second is told it has
+   * gone.
    */
   function inTurn(answer: ActionAnswer): ActionAnswer {
     return (content, session, requestId) => inSchedulingTurn(() => answer(content, session, requestId));
@@ -351,7 +276,6 @@ export function createSchedulingTools(deps: SchedulingToolsDeps) {
   // What main hears
   // -------------------------------------------------------------------------
 
-  /** What happened to a booking, with what main needs to read of it. */
   type BookingChange =
     | {
         readonly kind: 'booked';
@@ -363,11 +287,9 @@ export function createSchedulingTools(deps: SchedulingToolsDeps) {
         readonly kind: 'changed';
         /** The request that changed it, so a replay tells main nothing twice. */
         readonly requestId: string;
-        /** Its time before, when the change moved it or changed its length. */
+        /** Absent when the change kept its time. */
         readonly was?: Span;
-        /** What else on the invitation is new: its title, place, notes, or Meet link. */
         readonly fresh: readonly string[];
-        /** Its new title, when it has one. */
         readonly title?: string;
       }
     | { readonly kind: 'cancelled' };
@@ -375,21 +297,17 @@ export function createSchedulingTools(deps: SchedulingToolsDeps) {
   interface BookingFact {
     readonly threadKey: string;
     readonly booking: ThreadBooking;
-    /** Its time now; for a cancellation, the time it had. */
+    /** For a cancellation, the time it had. */
     readonly span: Span;
     readonly invitees: readonly string[];
     readonly change: BookingChange;
   }
 
   /**
-   * Tell main of a booking the thread made, changed or cancelled, once: the
-   * note's id derives from the change. The note leads with what happened and
-   * to whom, in main's time zone, and ends with the ids main acts on, then
-   * the other threads of the thread's open matter (R28), which a new booking
-   * joins first (KTD11), and the matter itself. The booking stands whatever
-   * happens here, so a failure is logged, never thrown into a retry that
-   * would book again. A title, which external-email wrote from the thread,
-   * is framed as untrusted.
+   * Once per change: the note's id derives from it. The booking stands
+   * whatever happens here, so a failure is logged, never thrown into a retry
+   * that would book again. A title, which external-email wrote from the
+   * thread, is framed as untrusted.
    */
   async function tellMain(fact: BookingFact): Promise<void> {
     const { threadKey, booking, span, invitees, change } = fact;
@@ -514,11 +432,6 @@ export function createSchedulingTools(deps: SchedulingToolsDeps) {
     };
   };
 
-  /**
-   * The people a booking invites: those named, each one on the thread, or
-   * everyone on it when none are named; never the principal or the
-   * assistant, whose calendar the event is on.
-   */
   async function inviteesOf(value: unknown, view: ThreadView): Promise<string[]> {
     const addresses = await threadAddresses(view.threadKey);
     const onThread = new Set(addresses.map((entry) => entry.address));
@@ -540,7 +453,6 @@ export function createSchedulingTools(deps: SchedulingToolsDeps) {
     return invitees;
   }
 
-  /** Take back an event a failed booking may have left, if it is this thread's. Best effort, and logged. */
   async function withdraw(calendarId: string, eventId: string, threadKey: string): Promise<void> {
     /* eslint-disable no-catch-all/no-catch-all -- the booking already failed; withdrawing it is best effort and logged */
     try {
@@ -555,7 +467,6 @@ export function createSchedulingTools(deps: SchedulingToolsDeps) {
     /* eslint-enable no-catch-all/no-catch-all */
   }
 
-  /** What a booking writes: its time, the people it invites, and the invitation they see. */
   interface NewBooking {
     readonly eventId: string;
     readonly span: Span;
@@ -567,9 +478,9 @@ export function createSchedulingTools(deps: SchedulingToolsDeps) {
   }
 
   /**
-   * Create the booking's event and record it. Every check runs first, so a
-   * refusal writes nothing; a failure to create or record it takes back
-   * whatever the write left, and the agent sees the failure.
+   * Every check runs first, so a refusal writes nothing; a failure to create
+   * or record the event takes back whatever the write left, and the agent
+   * sees the failure.
    */
   async function placeBooking(view: ThreadView, wanted: NewBooking): Promise<ThreadBooking> {
     const { threadKey } = view;
@@ -625,12 +536,7 @@ export function createSchedulingTools(deps: SchedulingToolsDeps) {
     }
   }
 
-  /**
-   * Book a time someone agreed to (R71): always a new event, under an id
-   * derived from this request, at a time still free. It invites only people on the thread, with the invitation as they
-   * would see it passing the private-values check, and main hears. A replay
-   * of a request already booked only finishes what follows.
-   */
+  /** A replay of a request already booked writes no event, and only finishes what follows. */
   const book: ActionAnswer = async (content, session, requestId) => {
     const start = instantOf(content.start, 'start');
     const minutes = minutesOf(content.minutes);
@@ -667,13 +573,12 @@ export function createSchedulingTools(deps: SchedulingToolsDeps) {
   };
 
   /**
-   * The thread's booking named, with its event as Google holds it now:
-   * refused unless this thread booked it, the event is still on the
-   * calendar, and it still carries the booking tag. A booking whose event is
-   * gone is forgotten. Google answers 404 alike for an event gone and for
-   * every event on a calendar it no longer shows the assistant the events
-   * of, so on a 404 the calendar is read now: unless its events can still be
-   * read, the booking is kept, with word to ask main (R14).
+   * Refused unless this thread booked it, the event is still on the calendar,
+   * and it still carries the booking tag; a booking whose event is gone is
+   * forgotten. Google answers 404 alike for an event gone and for every event
+   * on a calendar whose events it no longer shows the assistant, so on a 404
+   * the calendar is read now: unless its events can still be read, the
+   * booking is kept.
    */
   async function ownBooking(content: Record<string, unknown>, view: ThreadView) {
     const eventId = bookingIdOf(content.booking);
@@ -704,14 +609,6 @@ export function createSchedulingTools(deps: SchedulingToolsDeps) {
     return { booking, event, span, invitees };
   }
 
-  /**
-   * Change a booking this thread made, in place under its own id: its start,
-   * its length, or what the invitation says. A new time is checked as `book`
-   * checks one; new text passes the private-values check as the invitees
-   * would see it, beside the calendar's name; and a Meet link needs a
-   * calendar that allows one. Google sends the invitees the update and main
-   * hears.
-   */
   const changeBooking: ActionAnswer = async (content, session, requestId) => {
     const start = content.start === undefined || content.start === null ? undefined : instantOf(content.start, 'start');
     const minutes = content.minutes === undefined || content.minutes === null ? undefined : minutesOf(content.minutes);
@@ -793,7 +690,6 @@ export function createSchedulingTools(deps: SchedulingToolsDeps) {
     };
   };
 
-  /** Cancel a booking this thread made: its event is deleted with Google's notice to the invitees. */
   const cancelBooking: ActionAnswer = async (content, session) => {
     const theirs = timezoneOf(content.timezone);
     const view = await viewOf(session);

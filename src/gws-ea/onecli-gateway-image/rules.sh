@@ -1,10 +1,10 @@
 #!/bin/sh
-# Egress firewall for the OneCLI gateway's network namespace (KTD2).
+# Egress firewall for the OneCLI gateway's network namespace.
 #
 # Applied to the filter-table OUTPUT chain ONLY -- never the nat table, so
 # Docker's embedded DNS at 127.0.0.11 keeps resolving (name resolution is
 # load-bearing: the gateway resolves `postgres` and every public host through
-# it). Fail closed: any error aborts before the gateway starts (R9).
+# it). Fail closed: any error aborts before the gateway starts.
 #
 # Allows: loopback, established/related replies, this instance's OWN backend
 # subnet on tcp/5432 (its Postgres) only. Rejects: every other private/reserved

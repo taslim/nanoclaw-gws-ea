@@ -2,9 +2,9 @@
  * The canonical `main` serves the principal alone, so it is wired only to
  * conversations no one else can read: a direct message mapped to a verified
  * principal owner, and the principal's own email conversation, which the
- * host created and stored (KTD1). Either way it is one shared session that
- * admits known senders only. The inbox's own policy pins the rest of the
- * email conversation's wiring.
+ * host created and stored. Either way it is one shared session that admits
+ * known senders only. The inbox's own policy pins the rest of the email
+ * conversation's wiring.
  */
 import { getDb } from '../../db/connection.js';
 import { getMessagingGroup } from '../../db/messaging-groups.js';

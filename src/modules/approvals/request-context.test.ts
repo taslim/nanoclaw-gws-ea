@@ -1,5 +1,5 @@
 /**
- * Requests in the agent's context (R10, KTD10) and their voice (R7, KTD14),
+ * Requests in the agent's context and their voice,
  * driven through the approvals primitive as GWS-EA uses it: `main` works in
  * the principal's DM under one shared session (here started by an email), and
  * a group space has an agent of its own.

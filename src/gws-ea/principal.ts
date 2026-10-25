@@ -14,7 +14,6 @@ import {
   unwrapData,
 } from './validation.js';
 
-/** The principal as bound: who Google resolved, and the DM the assistant opened with them. */
 export interface PrincipalBinding {
   /** `gchat:users/{numericId}`, as Chat names the person. */
   readonly userId: string;
@@ -27,7 +26,6 @@ export interface PrincipalBinding {
 
 export interface PrincipalBindingInput {
   readonly adapterInstance: string;
-  /** The one address the principal uses for Google Chat, as create named it (KTD11). */
   readonly chatEmail: string;
   /** When the bind step began. */
   readonly verifiedAt: string;
@@ -57,7 +55,6 @@ interface MainProfile {
   readonly principalDisplayName: string;
 }
 
-/** The DM the host opened, as its command answers. */
 type OpenedDm =
   | {
       readonly status: 'opened';
@@ -67,10 +64,7 @@ type OpenedDm =
     }
   | Extract<PrincipalBindingResult, { status: 'unavailable' }>;
 
-/**
- * How long the host may take to open the DM: it retries Google while Google
- * is unavailable before it answers.
- */
+/** Long because the host retries Google while it is unavailable before it answers. */
 const OPEN_DM_TIMEOUT_MS = 120_000;
 
 function safeIdentifier(value: unknown): string | undefined {
@@ -100,10 +94,6 @@ function invalidDm(problem: string): GwsEaError {
   return new GwsEaError('invalid_child_output', `The host's direct message with the principal ${problem}`);
 }
 
-/**
- * The host's answer: an open DM names the person by the numeric ID Chat knows
- * them by, never the address, and the conversation the adapter routes it to.
- */
 function parseOpenedDm(value: unknown): OpenedDm {
   const dm = unwrapData(value);
   if (!isRecord(dm)) throw invalidDm('is not an answer');
@@ -139,11 +129,9 @@ async function runBootstrap(
 }
 
 /**
- * The first message main receives. Main's `welcome` is the GWS-EA skill its
- * template stamps, which asks the principal for their calendars; NanoClaw's
- * own capability tour is not among main's skills (KTD11, KTD13). Passed
- * explicitly so NanoClaw's default, which can point at a channel addendum
- * for its own welcome, never reaches main.
+ * Passed explicitly so NanoClaw's default welcome, which can point at a channel
+ * addendum for NanoClaw's own welcome skill, never reaches main; main's
+ * `/welcome` is the skill the GWS-EA main template stamps.
  */
 export const GWS_EA_WELCOME_INSTRUCTION =
   'System instruction: run /welcome to introduce yourself to the principal in this new conversation.';
@@ -160,18 +148,13 @@ export function principalWelcomeEventId(
 }
 
 /**
- * Bind the principal through the DM the assistant opens (KTD11). The host
- * opens the assistant's DM with the one address create named; whoever Google
- * resolves for it is the principal. No message anyone sends the assistant
- * binds anyone, and another address is never tried.
+ * The host opens the assistant's DM with the one address create named;
+ * whoever Google resolves for it is the principal. No message anyone sends the
+ * assistant binds anyone, and another address is never tried.
  *
- * Binding order: the host opens the DM; the principal and that DM are bound;
- * then the host creates the principal's user, owner role, membership, and
- * main's DM wiring, which its canonical-main admission accepts or rejects;
- * then `init-first-agent` reuses those records and hands main its welcome,
- * once per stable event ID, so the welcome is the first message in the DM.
  * Every command is idempotent, so a retry after a crash repeats the whole
- * sequence safely.
+ * sequence safely; `init-first-agent` hands main its welcome once per stable
+ * event ID, after the wiring, so the welcome is the DM's first message.
  */
 export async function bindPrincipal(
   configInput: InstanceRuntimeConfig,

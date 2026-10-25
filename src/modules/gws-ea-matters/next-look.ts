@@ -5,10 +5,10 @@ import { parseZonedToUtc } from '../../timezone.js';
 import { MAX_DAILY_FIRES } from '../scheduling/create.js';
 
 /**
- * A matter's next look as `main` asks for it (KTD4): once, at a time, or
- * repeating on a cron expression read in the principal's time zone, as the
- * look for a yearly date does (R24). The scheduled task made from it is the
- * matter's only clock, so the matter stores the task's id and never the time.
+ * A matter's next look as `main` asks for it: once, at a time, or repeating on
+ * a cron expression read in the principal's time zone, as the look for a
+ * yearly date does. The scheduled task made from it is the matter's only
+ * clock, so the matter stores the task's id and never the time.
  */
 export type NextLook =
   | { readonly kind: 'once'; /** UTC, ISO 8601. */ readonly at: string }
@@ -56,7 +56,6 @@ function once(value: string, timezone: string, now: Date): NextLook {
   return { kind: 'once', at: at.toISOString() };
 }
 
-/** The interval's next run, or a refusal naming the expression when it has none. */
 function nextRun(interval: CronExpression, cron: string): number {
   try {
     return interval.next().getTime();
@@ -118,9 +117,8 @@ function repeating(value: string, timezone: string, now: Date): NextLook {
 }
 
 /**
- * The next look `input` asks for, read in `timezone`, or undefined when it
- * asks for none. A one-off look must be in the future; a repeating one must
- * have an upcoming run.
+ * Undefined when `input` asks for none. A one-off look must be in the future;
+ * a repeating one must have an upcoming run.
  */
 export function parseNextLook(input: NextLookInput, timezone: string, now: Date = new Date()): NextLook | undefined {
   if (input.at !== undefined && input.cron !== undefined) {

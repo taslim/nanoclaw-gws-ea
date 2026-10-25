@@ -1,11 +1,9 @@
 /**
- * The assistant's one Google sign-in (KTD2), run by the control plane. The
- * operator downloads a Desktop OAuth client from the Cloud console; gws-ea
- * signs the assistant in through Google's loopback flow with PKCE, accepts
- * the result only for the declared Workspace account with every required
- * scope, and keeps the grant in the instance's owner-only `secrets/`
- * directory, where the host refreshes it. The client secret and every token
- * stay out of process arguments and are registered for redaction on sight.
+ * The assistant's one Google sign-in, run by the control plane through
+ * Google's loopback flow with PKCE. The result is accepted only for the
+ * declared Workspace account with every required scope. The client secret and
+ * every token stay out of process arguments and are registered for redaction
+ * on sight.
  */
 import { createHash, randomBytes } from 'node:crypto';
 import { constants as fsConstants } from 'node:fs';
@@ -32,7 +30,6 @@ import { isRecord, parseJson } from './validation.js';
 export const GOOGLE_AUTHORIZATION_ENDPOINT = 'https://accounts.google.com/o/oauth2/v2/auth';
 export const GOOGLE_USERINFO_ENDPOINT = 'https://openidconnect.googleapis.com/v1/userinfo';
 
-/** How long the operator has to finish signing in once the browser opens. */
 const SIGN_IN_TIMEOUT_MS = 10 * 60_000;
 
 export interface GoogleOAuthClient {
@@ -60,11 +57,7 @@ function clientFrom(value: unknown, label: string): GoogleOAuthClient {
 /** Larger than any client download Google produces. */
 const MAX_CLIENT_FILE_BYTES = 64 * 1024;
 
-/**
- * The downloaded file, read as the browser saved it: setup keeps its own
- * owner-only copy, so the download's permissions do not matter. It must be
- * the file itself, not a link, and small enough to be a client download.
- */
+/** The download's permissions do not matter, since setup keeps its own owner-only copy. */
 async function readDownloadedJson(file: string): Promise<unknown> {
   let handle: Awaited<ReturnType<typeof open>>;
   try {
@@ -84,10 +77,7 @@ async function readDownloadedJson(file: string): Promise<unknown> {
   }
 }
 
-/**
- * Read the client JSON the operator downloaded. It must be a Desktop app
- * client, whose loopback redirect needs no registration.
- */
+/** Only a Desktop app client: its loopback redirect needs no registration. */
 export async function readGoogleOAuthClientFile(file: string): Promise<GoogleOAuthClient> {
   const value = await readDownloadedJson(file);
   if (!isRecord(value)) throw invalidClient('The Google OAuth client file is not a client download');
@@ -101,12 +91,12 @@ export async function readGoogleOAuthClientFile(file: string): Promise<GoogleOAu
   return clientFrom(value.installed, 'The Google OAuth client file');
 }
 
-/** Keep the client in the instance's secrets until a sign-in turns it into a grant. */
+/** Kept only until a sign-in turns it into a grant. */
 export async function storeGoogleOAuthClient(file: string, client: GoogleOAuthClient): Promise<void> {
   await writePrivate(file, { client_id: client.client_id, client_secret: client.client_secret });
 }
 
-/** The stored client, or undefined before the operator has supplied one. */
+/** Undefined before the operator supplies one, and after a sign-in moves it into the grant. */
 export async function readStoredGoogleOAuthClient(file: string): Promise<GoogleOAuthClient | undefined> {
   try {
     return clientFrom(
@@ -119,7 +109,6 @@ export async function readStoredGoogleOAuthClient(file: string): Promise<GoogleO
   }
 }
 
-/** Write the grant owner-only and atomically, registering its secrets first. */
 export async function writeGoogleGrant(file: string, grant: GoogleGrant): Promise<void> {
   registerSecret(grant.client_secret);
   for (const consent of grant.consents) registerSecret(consent.refresh_token);
@@ -144,7 +133,6 @@ function signInFailed(message: string): GwsEaError {
 const CALLBACK_PAGE = (heading: string): string =>
   `<!doctype html><meta charset="utf-8"><title>${heading}</title><p>${heading} You can close this tab.</p>`;
 
-/** One consent's request to Google: its PKCE verifier, its state, and the consent URL. */
 interface ConsentRequest {
   readonly verifier: string;
   readonly state: string;
@@ -176,16 +164,13 @@ function consentRequest(
 }
 
 /**
- * Google's redirects to the loopback server, one per consent, each resolving
- * with its query. The sign-in link the operator opens, on a path only this
- * sign-in knows, sends the browser to the first consent; each consent's
- * redirect but the last sends it on to the next, and the last shows how the
- * sign-in went. It listens at once, so no redirect is missed, but the time
- * limit, for the whole sign-in, starts only at `arm`, once the operator is
- * ready to sign in; `cancel` stops the wait. Only a redirect carrying a
- * consent's `state` counts: any other request to the port is refused, so
- * another local process can neither learn a consent's `state` nor cut the
- * operator's sign-in short.
+ * The sign-in link the operator opens, on a path only this sign-in knows,
+ * sends the browser to the first consent; each consent's redirect but the
+ * last sends it on to the next. It listens at once, so no redirect is missed,
+ * but the time limit for the whole sign-in starts only at `arm`, once the
+ * operator is ready. Only a redirect carrying a consent's `state` counts: any
+ * other request to the port is refused, so another local process can neither
+ * learn a consent's `state` nor cut the operator's sign-in short.
  */
 function awaitRedirects(
   server: Server,
@@ -269,11 +254,7 @@ export async function readJson(response: Response): Promise<unknown> {
   return response.json().catch(() => undefined);
 }
 
-/**
- * Turn one consent's redirect into its refresh token: exchange the code, and
- * accept it only from the declared account, which every consent proves by
- * asking for the account's identity.
- */
+/** Accepted only from the declared account, which every consent proves by asking for the account's identity. */
 async function completeConsent(
   input: AssistantSignInInput,
   account: string,
@@ -339,10 +320,8 @@ async function completeConsent(
 }
 
 /**
- * Sign the assistant in to Google: PKCE on a loopback redirect, offline
- * access, and a forced consent so Google returns a refresh token, for each of
- * the sign-in's consents in turn, from one short link. Returns the grant for
- * the caller to keep.
+ * Each consent is forced so Google returns a refresh token; one short link
+ * walks the operator through them all. The caller keeps the returned grant.
  */
 export async function signInAsAssistant(input: AssistantSignInInput): Promise<GoogleGrant> {
   const now = input.now ?? Date.now;

@@ -318,7 +318,7 @@ describe('provision journal v3', () => {
     }
   });
 
-  it("reads the runtime record from the assistant's physical state, with no release live (R17)", async () => {
+  it("reads the runtime record from the assistant's physical state, with no release live", async () => {
     const { paths, input } = await fixture();
     const id = input.instance_id;
     const operation = await acquireInstanceOperation(paths, id);

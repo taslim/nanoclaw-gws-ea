@@ -1,28 +1,28 @@
 /**
- * Removal from any partial state. A resource is observed only when
- * the provisioning step that owns it ever started: no journal means
- * nothing started, and a journal this launcher cannot read means every
- * resource is observed. An absent resource is done; an owned one is deleted
- * and observed again; a foreign one is refused by name; one that cannot be
- * observed pauses with evidence until the operator abandons it. Everything a
- * resource needs — Docker, NanoClaw's service helpers, the operator's and the
- * assistant's Google sign-ins — is checked before the first change, and
- * removal locks only its own instance, so one stuck removal
- * never blocks another assistant. NanoClaw's helpers stop the host; removal
- * then cleans up what they leave. The assistant's Google Chat subscription
- * goes after the host, which would only create it again, and before the
- * project, which takes its topic, its Pub/Sub subscription, and its
- * subscriber account with it (KTD13). The assistant's 1Password resources
- * go after the host too, once nothing can use them: their IDs are copied into
- * the receipt before anything changes, and the receipt outlives the instance
- * while a service account remains for the operator to revoke, or a creation
- * never proven for them to find by name and delete or revoke (KTD9).
+ * Removal from any partial state. A resource a provisioning step creates is
+ * observed only when that step ever started: no journal means nothing
+ * started, and a journal this launcher cannot read means every such resource
+ * is observed. Every other resource goes by its own evidence. An absent
+ * resource is done; an owned one is deleted and observed again; a foreign one
+ * is refused by name; one that cannot be observed pauses with evidence until
+ * the operator abandons it. What each pending resource needs is checked
+ * before the first change, except artifacts, whose refusal pauses inside its
+ * own step after earlier resources changed. Removal locks only its own
+ * instance, so one stuck removal never blocks another assistant. NanoClaw's
+ * helpers stop the host; removal then cleans up what they leave. The
+ * assistant's Google Chat subscription goes after the host, which would only
+ * create it again, and before the project, which takes its topic, its Pub/Sub
+ * subscription, and its subscriber account with it. The assistant's 1Password
+ * and artifact resources go after the host too, once nothing can use them,
+ * and their IDs are copied into the receipt before anything changes. The
+ * receipt outlives the instance while 1Password owes the operator something
+ * they have not closed, or when artifacts were abandoned.
  * An unfinished update or rollback never stops it: its releases, what is
  * kept with them, its snapshots, and its quarantined state all sit under the
  * instance root, and go with it. So does every image the assistant's
  * releases tagged or its rebuilds displaced, while the images assistants
- * share stay (KTD6). Nor does the phase the assistant is in (R9): fenced, it
- * is removed from its physical state.
+ * share stay. Nor does the phase the assistant is in: fenced, it is removed
+ * from its physical state.
  */
 import { access, rm } from 'node:fs/promises';
 import os from 'node:os';
@@ -129,16 +129,10 @@ export const REMOVAL_RESOURCES = [
 ] as const;
 export type RemovalResource = (typeof REMOVAL_RESOURCES)[number];
 
-/**
- * What an operator may leave behind when removal cannot observe it (`--abandon`):
- * the Google Cloud project, the assistant's Google Chat subscription when
- * Google refuses its sign-in, or its 1Password resources: a vault removal
- * cannot settle, and the service accounts only the operator can revoke.
- */
+/** What an operator may leave behind with `--abandon` when removal cannot observe or settle it. */
 export const ABANDONABLE_RESOURCES = ['gcp-project', 'chat-subscription', 'onepassword', 'artifacts'] as const;
 export type AbandonableResource = (typeof ABANDONABLE_RESOURCES)[number];
 
-/** What leaving each resource behind means, as a pause tells the operator. */
 const LEAVING_BEHIND: Readonly<Record<AbandonableResource, string>> = {
   'gcp-project':
     "Leave it behind only if it is already gone or is not this assistant's; removal records this evidence.",
@@ -156,7 +150,7 @@ function isAbandonable(resource: RemovalResource): resource is RemovalResource &
 
 const RECEIPT_SCHEMA_VERSION = 3 as const;
 const INVALID_RECORD = 'invalid_runtime_config';
-/** A receipt whose 1Password IDs cannot be read is never set aside: that would lose them. */
+/** A receipt naming resources it cannot read is never set aside: that would lose their IDs. */
 const UNREADABLE_CLEANUP = 'removal_receipt_unreadable';
 
 const RESOURCE_STEPS: Readonly<Record<RemovalResource, StepIdentity>> = {
@@ -175,7 +169,7 @@ interface Evidence {
   readonly evidence: string;
 }
 
-/** The durable record of a removal under way: its reservation snapshot and what each resource came to. */
+/** The durable record of a removal under way. */
 interface RemovalReceipt {
   readonly schema_version: typeof RECEIPT_SCHEMA_VERSION;
   readonly instance_id: string;
@@ -187,33 +181,29 @@ interface RemovalReceipt {
   readonly key_policy_unrestored?: Evidence;
   /** A member-domain policy `provision_gcp` relaxed that Google refused to restore. */
   readonly member_policy_unrestored?: Evidence;
-  /** The assistant's 1Password IDs and what became of them; kept here, outside the instance, until the operator closes it. */
+  /** Kept here, outside the instance, until the operator closes it. */
   readonly onepassword?: OnePasswordCleanup;
   readonly artifacts?: ArtifactsCleanup;
 }
 
-/** What local teardown uses, as the instance recorded it. */
 export interface LocalRuntime {
   readonly homeDirectory: string;
   readonly dockerEndpoint: string;
 }
 
-/** The human input removal may need, through the driver's `Interaction` port. */
 export interface RemovalInteraction {
   signInToGoogleCloud(account: string): Promise<void>;
 }
 
-/** What the driver supplies to one removal. */
 export interface RemovalOptions {
   readonly interaction: RemovalInteraction;
   /** Resources the operator accepts leaving behind if removal cannot observe them. */
   readonly abandon?: ReadonlySet<AbandonableResource>;
   readonly reporter?: StepReporter;
-  /** NanoClaw's service helpers (`scripts/update/service.ts`), which stop the host; the driver supplies them. */
+  /** NanoClaw's service helpers (`scripts/update/service.ts`), which stop the host. */
   readonly serviceHelpers?: NanoclawServiceHelpers;
   /** The operator's choice, confirmed with the removal, to delete an app-created vault that still holds items. */
   readonly deleteVault?: boolean;
-  /** How the 1Password CLI the host recorded is run. */
   readonly onePassword?: OnePasswordCliSeams;
 }
 
@@ -222,9 +212,7 @@ export interface RemovalDependencies extends RemovalOptions {
   readonly ncl?: typeof runInstanceNclJson;
   readonly whatsapp?: Omit<WhatsAppLogoutOptions, 'directory' | 'number'>;
   readonly platform?: InstanceServicePlatform;
-  /** Reaches Google as the assistant: its Chat token and its Workspace Events subscription. */
   readonly fetch?: typeof globalThis.fetch;
-  /** Runs local teardown: the service manager fallback, the stray-host kill, and Docker. */
   readonly runCommand?: SanitizedCommandOutcomeRunner;
   readonly runGcloud?: GcloudCommandRunner;
   /** Probe the recorded Docker endpoint, else resolve the active local one. */
@@ -240,14 +228,13 @@ export interface AbandonedResource {
 }
 
 export interface RemovalOutcome {
-  /** Resources removal observed and removed, or found already gone. */
+  /** Removed, or found already gone. 1Password is accounted for in `onepassword` instead. */
   readonly removed: readonly RemovalResource[];
   readonly abandoned: readonly AbandonedResource[];
   /** Why a lifted key-creation policy could not be restored. */
   readonly keyPolicyUnrestored?: string;
   /** Why a relaxed member-domain policy could not be restored. */
   readonly memberPolicyUnrestored?: string;
-  /** What became of the assistant's 1Password resources, and what only the operator can still do. */
   readonly onepassword?: OnePasswordRemovalOutcome;
 }
 
@@ -296,9 +283,11 @@ function entries<K extends string, V>(keys: readonly K[], value: unknown, parse:
 }
 
 /**
- * The receipt of a removal already under way. Unknown fields are ignored. A
- * receipt that cannot be read safely, or that another schema wrote, is set
- * aside: everything it could say is re-observed.
+ * The receipt of a removal already under way; unknown fields are ignored. One
+ * that cannot be read safely, or that another schema wrote, is set aside and
+ * its resources are observed again, except where that would lose IDs: a
+ * receipt naming artifacts that fails any check, or whose 1Password record
+ * cannot be parsed, stops removal with `removal_receipt_unreadable`.
  */
 async function readReceipt(paths: ControlPlanePaths, instanceId: string): Promise<RemovalReceipt | undefined> {
   let artifactEvidence = false;
@@ -357,7 +346,6 @@ async function readReceipt(paths: ControlPlanePaths, instanceId: string): Promis
   }
 }
 
-/** Which provisioning steps ever started, and whether `provision_gcp` left the key policy lifted. */
 interface ProvisioningRecord {
   readonly started: (step: ProvisionStepId) => boolean;
   readonly keyPolicyLifted: boolean;
@@ -450,13 +438,12 @@ async function readRecordedRuntime(
   };
 }
 
-/** Evaluate once, on first use. */
 function once<T>(evaluate: () => Promise<T>): () => Promise<T> {
   let value: Promise<T> | undefined;
   return () => (value ??= evaluate());
 }
 
-/** The assistant's Google sign-in, where every runtime keeps it: in the instance's secrets (`googleGrantFile`). */
+/** Where every runtime keeps the assistant's Google sign-in (`googleGrantFile`). */
 function grantFileOf(paths: ControlPlanePaths, instanceId: string): string {
   return path.join(paths.instanceRoot(instanceId), 'secrets', GOOGLE_GRANT_FILE_NAME);
 }
@@ -472,18 +459,17 @@ function googleRefuses(error: unknown): boolean {
   return error instanceof GoogleGrantRevokedError || error instanceof GoogleScopeNotGrantedError;
 }
 
-/** What Google, or reading the sign-in, answered: its message, which names no secret, redacted all the same. */
+/** The message names no secret; it is redacted all the same. */
 function answerOf(error: unknown): string {
   return redact(error instanceof Error ? error.message : String(error));
 }
 
-/** Why removal cannot see the assistant's Chat subscription. */
 interface ChatSubscriptionRefusal {
   readonly reason: string;
   readonly evidence: string;
 }
 
-/** How removal reaches the assistant's Chat subscription, which only the assistant's own sign-in can see. */
+/** Only the assistant's own sign-in can see its Chat subscription. */
 type ChatSubscriptionAccess =
   /** The assistant never signed in, so its host never subscribed. */
   | { readonly state: 'unsigned' }
@@ -535,7 +521,6 @@ async function chatSubscriptionAccess(
   return { state: 'signed-in', account: signedIn.account, api };
 }
 
-/** Delete every subscription the assistant holds on its Chat target, then observe that none is left. */
 async function deleteChatSubscriptions(api: WorkspaceEventsApi): Promise<void> {
   for (const subscription of await api.list()) await api.remove(subscription.name);
   const left = (await api.list()).filter((subscription) => subscription.state !== 'DELETED');
@@ -562,7 +547,6 @@ export function repositoryTags(listing: string, repository: string): string[] {
 /** The NanoClaw install a teardown removes: an assistant's, or a stray one in the gws-ea tool checkout. */
 export type NanoclawInstall = Omit<ServiceControlTarget, 'instanceId'>;
 
-/** What removing the host uses besides the install itself. */
 export interface NanoclawTeardown {
   readonly platform: InstanceServicePlatform;
   readonly run: SanitizedCommandOutcomeRunner;
@@ -598,11 +582,7 @@ function hostProcessPattern(install: NanoclawInstall, teardown: Pick<NanoclawTea
 
 /**
  * Stop the instance's host through NanoClaw's own service helpers, then clean
- * up whatever that stop leaves: the service definition (a launchd job whose
- * plist is gone, which NanoClaw cannot find, is stopped by its label, and a
- * systemd unit is disabled too, so neither login nor boot starts it again),
- * a host running outside the service, the agent containers (drained, then
- * removed with any that had already stopped), and the agent images.
+ * up whatever that stop leaves, so neither login nor boot starts it again.
  */
 export async function uninstallNanoclaw(install: NanoclawInstall, teardown: NanoclawTeardown): Promise<void> {
   const { platform, run, sleep } = teardown;
@@ -614,7 +594,7 @@ export async function uninstallNanoclaw(install: NanoclawInstall, teardown: Nano
     args: readonly string[],
     env: Readonly<Record<string, string>>,
   ): SanitizedCommand => ({ command: program, args, cwd: CONTROL_PLANE_ROOT, env, timeoutMs: 120_000 });
-  /** Runs a command and returns its raw outcome, for callers that read the exit code themselves. */
+  /** The raw outcome, for callers that read the exit code themselves. */
   const execute = (program: string, args: readonly string[], env: Readonly<Record<string, string>>) => {
     const command = commandFor(program, args, env);
     return run(command).then((outcome) => ({ command, outcome }));
@@ -712,11 +692,9 @@ export async function uninstallNanoclaw(install: NanoclawInstall, teardown: Nano
     if ((await containers()).length > 0) throw incomplete('NanoClaw containers remain after removal');
   }
 
-  // Every tag in the assistant's own image repository goes: each kept release's `:r-<release>`, the `:building` tag
-  // of an image a build had not yet labeled, and each agent group's own image. Removing a tag deletes its image only
+  // Every tag in the assistant's own image repository goes, whatever made it. Removing a tag deletes its image only
   // with the last tag naming it, so an agent image another assistant shares by content stays with that assistant's
-  // tags. Nothing outside the repository is named, so the OneCLI and gateway images assistants share stay
-  // too (KTD6).
+  // tags. Nothing outside the repository is named, so the OneCLI and gateway images assistants share stay too.
   const repository = getInstallScopedNames(installId).containerImageBase;
   const tagged = async (): Promise<string[]> =>
     repositoryTags(
@@ -735,7 +713,6 @@ export async function uninstallNanoclaw(install: NanoclawInstall, teardown: Nano
   for (const imageId of teardown.recordedImages) await reclaimImage(images, imageId);
 }
 
-/** OneCLI's Compose project, through the recorded Docker endpoint. */
 async function removeOnecli(
   paths: ControlPlanePaths,
   reservation: InstanceReservation,
@@ -811,7 +788,6 @@ export async function describeRemoval(
   };
 }
 
-/** Remove one assistant from whatever state it is in, holding only its own lock. */
 export async function removeAssistant(
   paths: ControlPlanePaths,
   instanceId: string,
@@ -949,7 +925,6 @@ async function removeLocked(
       (refusal) => activeStep()?.write(`${refusal.message}; signing in, then trying again\n`),
     );
   const chatSubscription = once(() => chatSubscriptionAccess(grantFileOf(paths, instanceId), dependencies.fetch));
-  /** Leave the resource behind when the operator accepts it, else pause with why removal cannot settle it. */
   const leaveBehind = (
     resource: AbandonableResource,
     refusal: { readonly reason: string; readonly evidence: string },
@@ -1123,8 +1098,8 @@ async function removeLocked(
       return undefined;
     },
     'instance-files': async () => {
-      // Includes browser/profile and host-only browser/staging.
-      // This runs only after the native NanoClaw stop/drain resource has completed.
+      // Includes browser/profile and host-only browser/staging. Teardown order puts this after the native NanoClaw
+      // stop and drain whenever removal owns the host.
       await rm(paths.instanceRoot(instanceId), { recursive: true, force: true });
       return undefined;
     },
@@ -1140,7 +1115,8 @@ async function removeLocked(
     );
   }
   await releaseInstanceReservation(paths, releaseReservation);
-  // Local removal is complete. A service account left to revoke, or a creation never proven, keeps the receipt until the operator closes it.
+  // Local removal is complete. A 1Password service account left to revoke, or a creation never proven, keeps the
+  // receipt until the operator closes it; abandoned artifacts keep it too.
   const cleanup = receipt.onepassword;
   const owed = cleanup !== undefined && onePasswordCleanupOwed(cleanup);
   if (cleanup && owed && !receipt.abandoned.onepassword && abandon.has('onepassword'))

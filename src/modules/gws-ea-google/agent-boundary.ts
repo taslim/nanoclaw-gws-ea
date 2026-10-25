@@ -1,5 +1,5 @@
 /**
- * Google failures as an agent hears them (R25). A sign-in Google no longer
+ * Google failures as an agent hears them. A sign-in Google no longer
  * accepts, or one that never granted a service, is the operator's to fix:
  * the agent hears that, then what it can do meanwhile, in its own terms.
  * The error's own message names the service and the remedy, so it stays for
@@ -19,7 +19,7 @@ export const GOOGLE_CONNECTION_DOWN_TEXT =
 /** What every agent hears first; each boundary adds that agent's own next step. */
 export const GOOGLE_CONNECTION_DOWN = `Y${GOOGLE_CONNECTION_DOWN_TEXT.slice(1)}.`;
 
-/** True when only a new sign-in, which is the operator's, would let Google answer. */
+/** Only a new sign-in, which is the operator's, would let Google answer. */
 export function isGoogleConnectionDown(error: unknown): boolean {
   return (
     error instanceof GoogleGrantRevokedError ||

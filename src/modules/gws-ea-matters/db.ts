@@ -14,25 +14,25 @@ import {
 } from '../gws-ea-browser/cancel.js';
 import { readChatLink } from './chat-links.js';
 
-/** What a matter links to (R3), in the order a matter lists them. */
+/** In the order a matter lists them. */
 export const LINK_KINDS = ['thread', 'event', 'file', 'person', 'memory', 'job', 'chat'] as const;
 export type LinkKind = (typeof LINK_KINDS)[number];
 
 /**
  * Pieces of work: each sits in at most one open matter, and placing it in
- * another moves it (R3). Only a piece is placed nowhere (R9).
+ * another moves it. Only a piece is placed nowhere.
  */
 export const PIECE_KINDS = ['thread', 'event', 'file', 'job'] as const satisfies readonly LinkKind[];
 export type PieceKind = (typeof PIECE_KINDS)[number];
 
-/** A link by id: a thread key, `<calendar id>/<event id>`, a Drive file id, a person id, or a memory path. */
+/** `reference` in the one spelling `canonicalReference` keeps for its kind, such as `<calendar id>/<event id>`. */
 export interface LinkRef {
   readonly kind: LinkKind;
   readonly reference: string;
 }
 
 export interface MatterLink extends LinkRef {
-  /** The agent that works this link and keeps its account of it (R7), or null while only `main` does. */
+  /** The agent that works this link and keeps its account of it, or null while only `main` does. */
   readonly handler: string | null;
   readonly linked_at: string;
   /** A chat handler's account of this matter, never shared with the chat's other matters. */
@@ -48,9 +48,9 @@ export interface StrandSummary {
 }
 
 /**
- * Everything the host keeps for a matter (R2): no status, stage, priority,
- * due date, owner or log. What a link's source records is read from the
- * source, never stored here (R4).
+ * Everything the host keeps for a matter: no status, stage, priority, due
+ * date, owner or log. What a link's source records is read from the source,
+ * never stored here.
  */
 export interface Matter {
   readonly id: string;
@@ -58,12 +58,12 @@ export interface Matter {
   readonly title: string;
   /** What the principal wants and what happens next, which `main` rewrites as things change. */
   readonly open_loop: string;
-  /** The project this matter is a strand of (R29), or null. */
+  /** The project this matter is a strand of. */
   readonly parent_id: string | null;
   readonly open: boolean;
-  /** How it ended, in a line: set while it is closed, and only then (R5). */
+  /** How it ended, in a line: set while it is closed, and only then. */
   readonly outcome: string | null;
-  /** The scheduled task that is its next look (KTD4), or null while none is recorded. */
+  /** The scheduled task that is its next look, or null while none is recorded. */
   readonly look_task_id: string | null;
   readonly links: readonly MatterLink[];
   /** A project's strands, open and closed, oldest first. */
@@ -92,7 +92,7 @@ export interface PlacedNowhere {
   readonly from: string | null;
 }
 
-/** An open matter as the open list shows it, its strands under it (R10). */
+/** An open matter as the open list shows it, its open strands under it. */
 export interface OpenMatterSummary {
   readonly id: string;
   readonly title: string;
@@ -126,7 +126,7 @@ export interface UpdateMatterInput {
   readonly outcome?: string;
   /** The project to make it a strand of, or null for none. */
   readonly parentId?: string | null;
-  /** A next look is being set: a closed matter reopens (KTD3), and an open one stays as it is. */
+  /** A next look is being set: a closed matter reopens, and an open one stays as it is. */
   readonly reopen?: boolean;
   readonly unlink?: readonly LinkRef[];
 }
@@ -165,7 +165,6 @@ function parseOutcome(value: string): string {
   return parseLine(value, 'Outcome', OUTCOME_MAX_LENGTH);
 }
 
-/** The open loop's lines, each trimmed, blank ones dropped. */
 function parseOpenLoop(value: string): string {
   const lines = value
     .split(/\r?\n/u)
@@ -250,12 +249,10 @@ export function canonicalReference(kind: LinkKind, value: string): string {
   }
 }
 
-/** A link's key in a map or a set: one for each kind and reference. */
 export function linkKey(kind: LinkKind, reference: string): string {
   return `${kind}\u0000${reference}`;
 }
 
-/** The links in their canonical spelling, each once, in the order given. */
 function parseLinks(links: readonly LinkRef[]): LinkRef[] {
   const parsed = new Map<string, LinkRef>();
   for (const link of links) {
@@ -311,7 +308,7 @@ function byKind(left: MatterLink, right: MatterLink): number {
   return LINK_KINDS.indexOf(left.kind) - LINK_KINDS.indexOf(right.kind);
 }
 
-/** One matter with its links and strands, open or closed (R5). */
+/** One matter with its links and strands, open or closed. */
 export async function getMatter(id: string): Promise<Matter | undefined> {
   const db = getDb();
   const row = await matterRow(id.trim());
@@ -353,16 +350,18 @@ export async function requireMatter(id: string): Promise<Matter> {
   return matter;
 }
 
-/** An open matter's slot for its next look (KTD4): the task it records, or null while it records none. */
+/** An open matter's slot for its next look: the task it records, or null while it records none. */
 export interface LookSlot {
   readonly id: string;
   readonly title: string;
   readonly look_task_id: string | null;
-  /** When the host heard that a run of this matter's look failed, until its loop brings the look back or another replaces it. */
+  /**
+   * When the host heard a run of this matter's look failed, until the matters loop brings it forward or another
+   * look replaces it.
+   */
   readonly look_failed_at: string | null;
 }
 
-/** Every open matter's look slot, oldest first. */
 export async function listOpenLookSlots(): Promise<LookSlot[]> {
   return getDb().all<LookSlot>(
     'SELECT id, title, look_task_id, look_failed_at FROM gws_ea_matters WHERE closed_at IS NULL ORDER BY created_at, id',
@@ -391,23 +390,17 @@ export async function listOpenMatters(): Promise<OpenMatterSummary[]> {
   }));
 }
 
-/** A link of an open matter, with the matter it sits in. */
 export interface OpenMatterLink extends LinkRef {
   readonly matter_id: string;
 }
 
-/** Every link of every open matter. */
 export async function listOpenMatterLinks(): Promise<OpenMatterLink[]> {
   return getDb().all<OpenMatterLink>(
     'SELECT matter_id, kind, reference FROM gws_ea_matter_links WHERE matter_open = 1 ORDER BY matter_id, linked_at, rowid',
   );
 }
 
-/**
- * The open matter a thread sits in, with that matter's threads in the order
- * they were placed, the thread among them, looked up by the thread alone;
- * undefined while it sits in none.
- */
+/** With that matter's threads in the order they were placed, this one among them; undefined while it sits in none. */
 export async function openMatterOfThread(
   threadKey: string,
 ): Promise<{ readonly matterId: string; readonly threads: readonly string[] } | undefined> {
@@ -424,7 +417,6 @@ export async function openMatterOfThread(
   return first === undefined ? undefined : { matterId: first.matter_id, threads: rows.map((row) => row.reference) };
 }
 
-/** Every closed matter, most recently closed first. */
 export async function listClosedMatters(): Promise<ClosedMatterSummary[]> {
   return getDb().all<ClosedMatterSummary>(
     `SELECT id, title, outcome, parent_id, closed_at FROM gws_ea_matters
@@ -437,10 +429,7 @@ export async function listClosedMatters(): Promise<ClosedMatterSummary[]> {
 // Writes: each in one transaction, with the links' open flag kept in step.
 // ---------------------------------------------------------------------------
 
-/**
- * The host keeps only references it can resolve: a thread the inbox knows,
- * a browser job main delegated (matters are main's), a person with a record.
- */
+/** The host keeps only references it can resolve. A job must be one main delegated, since matters are main's. */
 async function assertResolvable(link: LinkRef): Promise<void> {
   if (link.kind === 'chat' && (await readChatLink(link.reference)) === undefined) {
     throw new Error(`No chat ${link.reference} exists`);
@@ -462,7 +451,6 @@ async function touch(id: string, now: string): Promise<void> {
   await getDb().run('UPDATE gws_ea_matters SET updated_at = ? WHERE id = ?', now, id);
 }
 
-/** The open matter a piece sits in, with whoever works it there. */
 async function openHolder(
   link: LinkRef,
 ): Promise<{ readonly matter_id: string; readonly handler: string | null } | undefined> {
@@ -473,7 +461,6 @@ async function openHolder(
   );
 }
 
-/** The threads among a matter's links. */
 async function threadsOf(matterId: string): Promise<string[]> {
   const rows = await getDb().all<{ readonly reference: string }>(
     "SELECT reference FROM gws_ea_matter_links WHERE matter_id = ? AND kind = 'thread'",
@@ -482,7 +469,7 @@ async function threadsOf(matterId: string): Promise<string[]> {
   return rows.map((row) => row.reference);
 }
 
-/** Take a piece out of the open matter it sits in, inside the caller's transaction. */
+/** Inside the caller's transaction. */
 async function takeFromOpenMatter(
   link: LinkRef,
   now: string,
@@ -500,10 +487,9 @@ async function takeFromOpenMatter(
 }
 
 /**
- * Link each of `links` to the open matter `matterId`, inside the caller's
- * transaction. A piece in another open matter moves here, with whoever
- * works it; one already here stays as it is. A thread is placed (Slice 5
- * KTD8), and one main handed over is external-email's to work.
+ * Inside the caller's transaction. A piece in another open matter moves here,
+ * with whoever works it; one already here stays as it is. A thread is placed,
+ * and one main handed over is external-email's to work.
  */
 async function linkInto(
   matterId: string,
@@ -548,7 +534,6 @@ async function linkInto(
   return { moved, changed };
 }
 
-/** Refuse `projectId` as `matterId`'s project unless it is an open matter that is not itself a strand (KTD13). */
 async function assertProject(projectId: string, matterId: string): Promise<void> {
   if (projectId === matterId) throw new Error(`${matterId} cannot be its own project`);
   const project = await matterRow(projectId);
@@ -566,7 +551,7 @@ async function assertNoStrands(matterId: string): Promise<void> {
   if (strand) throw new Error(`${matterId} has strands: a project cannot be a strand of another`);
 }
 
-/** Refuse to reopen while one of the matter's pieces sits in another open matter (KTD3). */
+/** Refuse to reopen while one of the matter's pieces sits in another open matter. */
 async function assertReopenable(matterId: string): Promise<void> {
   const taken = await getDb().get<{
     readonly kind: PieceKind;
@@ -592,7 +577,6 @@ async function assertReopenable(matterId: string): Promise<void> {
   }
 }
 
-/** Open a matter, as a strand of `parentId` when given, placing `links` in it (R1–R3). */
 export async function openMatter(input: OpenMatterInput): Promise<Placed> {
   const title = parseTitle(input.title);
   const openLoop = parseOpenLoop(input.openLoop);
@@ -618,7 +602,6 @@ export async function openMatter(input: OpenMatterInput): Promise<Placed> {
   return { matter: await requireMatter(id), moved };
 }
 
-/** Place `links` in the open matter `id`, moving a piece from any other open matter (R3). */
 export async function placeInMatter(id: string, links: readonly LinkRef[]): Promise<Placed> {
   const matterId = id.trim();
   const parsed = parseLinks(links);
@@ -638,9 +621,8 @@ export async function placeInMatter(id: string, links: readonly LinkRef[]): Prom
 }
 
 /**
- * Place pieces nowhere, when nothing about them needs keeping (R9): each
- * leaves the open matter it sits in, and no matter opens. A closed matter
- * keeps its link.
+ * For pieces nothing about which needs keeping: each leaves the open matter it
+ * sits in, and no matter opens. A closed matter keeps its link.
  */
 export async function placeNowhere(links: readonly LinkRef[]): Promise<PlacedNowhere[]> {
   const parsed = parseLinks(links);
@@ -667,11 +649,10 @@ export async function placeNowhere(links: readonly LinkRef[]): Promise<PlacedNow
 }
 
 /**
- * Change a matter in one transaction (KTD3). Its title, open loop and, once
- * closed, its outcome change whether it is open or closed, without reopening
- * it. Its project and links change while it is open. `reopen` reopens a
- * closed matter, unless one of its pieces now sits in another open matter or
- * its project is closed.
+ * Its title, open loop and, once closed, its outcome change whether it is open
+ * or closed, without reopening it. Its project and links change while it is
+ * open. `reopen` reopens a closed matter, unless one of its pieces now sits in
+ * another open matter or its project is closed.
  */
 export async function updateMatter(input: UpdateMatterInput): Promise<Matter> {
   const id = input.id.trim();
@@ -750,10 +731,8 @@ export async function updateMatter(input: UpdateMatterInput): Promise<Matter> {
 }
 
 /**
- * Close a matter with its outcome in a line (R5). It stays readable with its
- * links. A project closes only once none of its strands is open (KTD13).
- * Its threads are main's to place again: new mail on one waits, held, until
- * main does (Slice 5 R27, KTD8).
+ * It stays readable with its links. Its threads are main's to place again:
+ * new mail on one waits, held, until main does.
  */
 export async function closeMatter(input: CloseMatterInput): Promise<Matter> {
   const id = input.id.trim();
@@ -801,11 +780,7 @@ export async function cancelClosedMatterJobs(): Promise<void> {
   for (const job of jobs) await cancelBrowserJob(job.reference);
 }
 
-/**
- * Name `handler` as the one working a piece in the open matter it sits in
- * (R7): what main handed over is the handler's to keep an account of.
- * Nothing changes for a piece in no open matter.
- */
+/** What main handed over is the handler's to keep an account of. A piece in no open matter is left as it is. */
 export async function setLinkHandler(link: LinkRef, handler: string): Promise<void> {
   await getDb().run(
     'UPDATE gws_ea_matter_links SET handler = ? WHERE kind = ? AND reference = ? AND matter_open = 1',
@@ -839,19 +814,15 @@ export async function setChatLinkAccount(
   if (changes === 0) throw new Error(`No open matter ${matterId} links chat ${chat}`);
 }
 
-/**
- * Mark that a run of the matter's look failed, or clear the mark (KTD7 step 3).
- * A matter that is gone, or closed since, is left as it is.
- */
+/** `at` null clears the mark. A matter that is gone, or closed since, is left as it is. */
 export async function markLookFailed(id: string, at: string | null): Promise<void> {
   await getDb().run('UPDATE gws_ea_matters SET look_failed_at = ? WHERE id = ? AND closed_at IS NULL', at, id);
 }
 
 /**
- * Record the scheduled task that is a matter's next look, or null when it
- * has none (KTD4). The task is the clock, so this is not a change to the
- * matter itself and leaves `updated_at` as it was. A new look has not
- * failed: it clears any mark the look it replaces left (KTD7 step 3).
+ * The task is the clock, so this is not a change to the matter itself and
+ * leaves `updated_at` as it was. A new look has not failed: it clears any
+ * mark the look it replaces left.
  */
 export async function recordLookTask(id: string, taskId: string | null): Promise<void> {
   const matterId = id.trim();

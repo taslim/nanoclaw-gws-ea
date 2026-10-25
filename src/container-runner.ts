@@ -583,33 +583,25 @@ export function watchGatewayAvailability(
   return unavailable;
 }
 
-/**
- * What a session admission policy judges: a session about to be spawned or
- * adopted. Every session start passes here before the gateway is asked and
- * before anything runs, spawned and adopted alike.
- */
+/** Every session start, spawned or adopted, is judged before the gateway is asked and before anything runs. */
 export interface SessionAdmissionInput {
   readonly disposition: 'create' | 'adopt';
   readonly key: GatewaySessionInput['key'];
 }
 
-/** A module's invariant on the sessions it may start; it refuses one by throwing. */
+/** Refuses a session by throwing. */
 export type SessionAdmissionPolicy = (input: SessionAdmissionInput) => void | Promise<void>;
 
 const sessionAdmissionPolicies = new Map<string, SessionAdmissionPolicy>();
 const SESSION_ADMISSION_POLICY_ID = /^[a-z0-9][a-z0-9._-]*:[a-z0-9][a-z0-9._-]*$/u;
 
-/**
- * Register an invariant checked before every session start, such as a group
- * whose configuration must not drift. IDs take the `module:name` form.
- */
+/** For an invariant on every session start, such as a group whose configuration must not drift. */
 export function registerSessionAdmissionPolicy(id: string, policy: SessionAdmissionPolicy): void {
   if (!SESSION_ADMISSION_POLICY_ID.test(id)) throw new Error(`Invalid session admission policy ID: ${id}`);
   if (sessionAdmissionPolicies.has(id)) throw new Error(`Session admission policy already registered: ${id}`);
   sessionAdmissionPolicies.set(id, policy);
 }
 
-/** Run every session admission policy; the first refusal stops the session from starting. */
 export async function assertSessionAdmitted(input: SessionAdmissionInput): Promise<void> {
   for (const policy of sessionAdmissionPolicies.values()) await policy(input);
 }
@@ -1073,10 +1065,10 @@ export async function resolveProviderContribution(
 }
 
 /**
- * The provider contract a session realizes. A group without
- * `conversation-context` keeps its sessions sealed: nothing of one session
- * reaches another, so each state volume that holds conversation state
- * (`ProviderStateVolume.sealedScope`) is realized per session.
+ * A group without `conversation-context` keeps its sessions sealed: nothing
+ * of one session reaches another, so each state volume that holds
+ * conversation state (`ProviderStateVolume.sealedScope`) is realized per
+ * session.
  */
 function sessionHostContract(provider: string, capabilities: readonly string[]): ProviderHostContract | undefined {
   const contract = getProviderHostContract(provider);
@@ -1086,10 +1078,9 @@ function sessionHostContract(provider: string, capabilities: readonly string[]):
 }
 
 /**
- * Realize a session's provider surfaces. A session that holds a volume on
- * its own also gets its own copy of each file the provider prepares there at
- * group init: written when the session first starts, then reconciled at each
- * start as a group's copy is at group init.
+ * A session that holds a volume on its own also gets its own copy of each
+ * file the provider prepares there at group init: written when the session
+ * first starts, then reconciled at each start as a group's copy is.
  */
 async function realizeSessionSurfaces(
   provider: string,

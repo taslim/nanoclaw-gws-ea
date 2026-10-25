@@ -1,8 +1,7 @@
 /**
- * Why words cannot go out as written: a weekday beside a date it does not
- * fall on (`weekday-check.ts`), with a date without a year read from today on
- * the principal's clock. No side effects, so the calendar tools check the
- * text of an invitation the same way the outbound guard checks a message.
+ * The weekday check (`weekday-check.ts`) with today on the principal's clock,
+ * and the refusal an agent reads. It writes nothing, so the calendar tools
+ * check an invitation's text the same way the outbound guard checks a message.
  */
 import { TIMEZONE } from '../../config.js';
 import { getDb } from '../../db/connection.js';
@@ -11,7 +10,6 @@ import { findWeekdayMismatch, type CalendarDate } from './weekday-check.js';
 
 const LIST = new Intl.ListFormat('en', { style: 'long', type: 'conjunction' });
 
-/** Today's date on the principal's clock. */
 async function today(): Promise<CalendarDate> {
   const timezone = (await getDb().hasTable('gws_ea_profile'))
     ? ((await getGwsEaProfile()).principal_timezone ?? TIMEZONE)
@@ -25,10 +23,7 @@ async function today(): Promise<CalendarDate> {
   return { year: parts.year, month: parts.month, day: parts.day };
 }
 
-/**
- * Why `texts` cannot go out as written, or undefined when every weekday they
- * pair with a date falls on it.
- */
+/** Undefined when every weekday `texts` pair with a date falls on it. */
 export async function weekdayRefusal(texts: readonly string[]): Promise<string | undefined> {
   const mismatch = findWeekdayMismatch(texts.join('\n'), await today());
   if (mismatch === undefined) return undefined;

@@ -1,7 +1,7 @@
 /**
- * Each link of a matter as its source says it is now (KTD5, R4): read live
- * through the host's own Google clients whenever a matter is rendered, and
- * never stored, so "did that go out?" is answered by Gmail, not by a copy.
+ * Each link of a matter as its source says it is now: read live through the
+ * host's own Google clients whenever a matter is rendered, and never stored,
+ * so "did that go out?" is answered by Gmail, not by a copy.
  *
  * - A thread: its latest message in Gmail, when it came, and whose turn it
  *   is. The latest is ours when the assistant sent it or it shows one of the
@@ -9,23 +9,22 @@
  * - An event: its time, whether it stands, and each guest's answer.
  * - A file: when it last changed and who changed it, and its open comments
  *   assigned to the assistant or mentioning it.
+ * - A chat or a browser job: as the host's own records say it is now.
  * - A person by name, and a memory file as its path for `main` to read.
  *
  * A forget reads the same sources for who is on an event or a file
  * (`linksOn`), which only Google knows.
  *
  * Every link is read at once with the others, under its own five-second
- * deadline, as the link check's Drive reads are. One that fails or is late
- * renders "couldn't read just now", or that the Google connection is the
- * operator's to restore when only a new sign-in would help, and the rest
- * render all the same.
+ * deadline. One that fails or is late renders "couldn't read just now", or
+ * that the Google connection is the operator's to restore when only a new
+ * sign-in would help, and the rest render all the same.
  *
  * The host's own words name someone only from what Google and the people
  * store say of an address: the principal and the assistant as themselves,
  * anyone with a record by name, and anyone the principal had forgotten by
- * neither name nor address (R26). What someone else wrote reaches `main`
- * framed as untrusted: a thread's subject, its From as written and Gmail's
- * excerpt, a file's title and comments, and another agent's account (KTD9).
+ * neither name nor address. What someone else wrote, another agent's account
+ * included, reaches `main` framed as untrusted.
  */
 import { log } from '../../log.js';
 import { formatLocalTime } from '../../timezone.js';
@@ -68,7 +67,7 @@ import { readChatLink } from './chat-links.js';
 /** How long one read may take before its link renders as unread. */
 export const READ_DEADLINE_MS = 5_000;
 const UNREAD = "couldn't read just now";
-/** A read only the operator's new Google sign-in would let through, in main's terms (R25). */
+/** A read only the operator's new Google sign-in would let through, in main's terms. */
 const NO_CONNECTION = `couldn't read: ${GOOGLE_CONNECTION_DOWN_TEXT}`;
 const FORGOTTEN = 'someone forgotten';
 const FRAME_LIMIT = 1_200;
@@ -78,7 +77,6 @@ const GUESTS_NAMED = 8;
 const COMMENTS_SHOWN = 3;
 const DAY_MS = 24 * 60 * 60 * 1000;
 
-/** Where a matter's links are read from. */
 export interface LiveSources {
   readonly gmail: Pick<GmailApi, 'getThread'>;
   readonly calendar: Pick<MeetingsCalendarApi, 'getEvent'>;
@@ -92,11 +90,6 @@ export interface LiveSources {
 
 let host: LiveSources | undefined;
 
-/**
- * Google as the host's own tokens reach it, as the inbox, meetings and
- * Workspace reach it, and each thread's account from the thread map. Built
- * on first use.
- */
 export function hostSources(): LiveSources {
   host ??= {
     gmail: createGmailApi({ token: () => hostGoogleAccessToken('gmail') }),
@@ -107,7 +100,7 @@ export function hostSources(): LiveSources {
   return host;
 }
 
-/** Who the host's words may name, and the zone it gives times in: read once for a render. */
+/** Read once for a render. */
 export interface Lens {
   readonly timezone: string;
   readonly principalName: string;
@@ -116,7 +109,6 @@ export interface Lens {
   readonly isForgotten: (handle: string) => boolean;
 }
 
-/** The lens for a render, the principal and the assistant both from one read of the profile. */
 export async function loadLens(timezone: string): Promise<Lens> {
   const profile = await getGwsEaProfile();
   return {
@@ -150,7 +142,7 @@ function unread(error: unknown): string {
 
 type Read<T> = { readonly ok: true; readonly value: T } | { readonly ok: false; readonly error: unknown };
 
-/** `read`'s answer, or why there is none: it failed, or missed the read deadline. Never rejects. */
+/** Never rejects: a read that fails or misses the deadline answers `ok: false`. */
 async function within<T>(what: string, read: () => Promise<T>): Promise<Read<T>> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   const late = new Promise<never>((_answer, fail) => {
@@ -224,7 +216,7 @@ function day(date: string): string {
   });
 }
 
-/** When an event is, in the principal's zone: an end on the same day by its time alone; an all-day event by its days. */
+/** In the principal's zone: an end on the same day by its time alone; an all-day event by its days. */
 function eventTime(start: EventTime | undefined, end: EventTime | undefined, timezone: string): string | undefined {
   if (start?.dateTime !== undefined) {
     const from = formatLocalTime(start.dateTime, timezone);
@@ -284,7 +276,7 @@ async function eventState(reference: string, calendar: LiveSources['calendar'], 
 // Files
 // ---------------------------------------------------------------------------
 
-/** A file's comments, or undefined when Drive's final word is that the assistant does not see them, as on a file it can only view. */
+/** Undefined when Drive's final word is that the assistant does not see them, as on a file it can only view. */
 async function commentsOn(fileId: string, drive: LiveSources['drive']): Promise<DriveComment[] | undefined> {
   try {
     return await drive.listComments(fileId);
@@ -294,7 +286,6 @@ async function commentsOn(fileId: string, drive: LiveSources['drive']): Promise<
   }
 }
 
-/** Open comments assigned to the assistant or mentioning it, newest first. */
 function forAssistant(comments: readonly DriveComment[], assistant: ReadonlySet<string>): DriveComment[] {
   return comments
     .filter(
@@ -420,7 +411,7 @@ async function linkState(link: MatterLink, sources: LiveSources, lens: Lens): Pr
   }
 }
 
-/** Who works the link besides `main`, and the account it last left on a thread (R7, KTD9). */
+/** Who works the link besides `main`, and the account it last left on a thread or chat. */
 async function handlerLines(link: MatterLink, sources: LiveSources, lens: Lens): Promise<string[]> {
   if (link.handler === null) return [];
   const handled = `  handled by ${link.handler}`;
@@ -443,11 +434,6 @@ async function handlerLines(link: MatterLink, sources: LiveSources, lens: Lens):
   ];
 }
 
-/**
- * Each link as one compact line, in the order given: its kind, its
- * reference, and what its source says of it now, with what someone else
- * wrote framed under it, then who works it and their account.
- */
 export async function readLinks(links: readonly MatterLink[], sources: LiveSources, lens: Lens): Promise<string[]> {
   return Promise.all(
     links.map(async (link) => {
@@ -462,7 +448,7 @@ export async function readLinks(links: readonly MatterLink[], sources: LiveSourc
 }
 
 // ---------------------------------------------------------------------------
-// Who is on an event or a file, for a forget (R26)
+// Who is on an event or a file, for a forget
 // ---------------------------------------------------------------------------
 
 /** An event or a file: the links whose people only Google knows. */
@@ -476,7 +462,6 @@ function present(address: string | undefined): address is string {
   return address !== undefined;
 }
 
-/** Everyone an event shows: its organizer and its guests. */
 async function eventAddresses(reference: string, calendar: LiveSources['calendar']): Promise<string[]> {
   const slash = reference.indexOf('/');
   const event = await calendar.getEvent(reference.slice(0, slash), reference.slice(slash + 1));
@@ -484,7 +469,7 @@ async function eventAddresses(reference: string, calendar: LiveSources['calendar
   return [event.organizer?.email, ...(event.attendees ?? []).map((attendee) => attendee.email)].filter(present);
 }
 
-/** A file's access list, or none when Drive's final word is that the assistant may not read it, as on a file it cannot share. */
+/** Empty when Drive's final word is that the assistant may not read the list, as on a file it cannot share. */
 async function accessTo(fileId: string, drive: LiveSources['drive']): Promise<DrivePermission[]> {
   try {
     return await drive.listPermissions(fileId);
@@ -494,7 +479,6 @@ async function accessTo(fileId: string, drive: LiveSources['drive']): Promise<Dr
   }
 }
 
-/** Everyone a file shows: its owners, whoever shared it or last changed it, and those it is shared with. */
 async function fileAddresses(fileId: string, drive: LiveSources['drive']): Promise<string[]> {
   const [file, access] = await Promise.all([drive.getFile(fileId), accessTo(fileId, drive)]);
   if (file === undefined) return [];
@@ -506,12 +490,7 @@ async function fileAddresses(fileId: string, drive: LiveSources['drive']): Promi
   ].filter(present);
 }
 
-/**
- * The events and files among `links` that someone is on, by `isTheirs` over
- * the addresses their sources show now, each read under its own deadline at
- * once with the others. One whose source fails or is late counts as theirs:
- * only a read could say it is not.
- */
+/** One whose source fails or is late counts as theirs: only a read could say it is not. */
 export async function linksOn(
   links: readonly EventOrFile[],
   isTheirs: (address: string) => boolean,

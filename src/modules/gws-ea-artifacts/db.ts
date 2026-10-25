@@ -122,7 +122,7 @@ export async function listArtifacts(
   );
   return { artifacts: rows.slice(0, limit), next_cursor: rows.length > limit ? rows[limit - 1].artifact_id : null };
 }
-/** Host-only authoritative source read. Callers enforce the relevant author or viewer authority before calling. */
+/** No authority check: callers enforce the relevant author or viewer authority first. */
 export async function getArtifactRevision(artifactId: string, revision: number): Promise<ArtifactRevision | undefined> {
   return getDb().get<ArtifactRevision>(
     'SELECT artifact_id,revision,title,html,source_hash,byte_count,created_at FROM gws_ea_artifact_revisions WHERE artifact_id=? AND revision=?',

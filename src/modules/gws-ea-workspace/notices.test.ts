@@ -1,7 +1,6 @@
 /**
- * Google's Docs and Drive activity mail as notes for `main` (R8, R14, R17,
- * AE5, KTD6): what a notice is read for, and the one note a poll's notices
- * become, against an in-memory Drive. The mail is shaped as Google sends it.
+ * Google's Docs and Drive activity mail as notes for `main`: what a notice is
+ * read for, and the one note a poll's notices become, against an in-memory Drive. The mail is shaped as Google sends it.
  */
 import { describe, expect, it } from 'vitest';
 
@@ -507,7 +506,7 @@ describe('a share', () => {
   });
 });
 
-describe('a request for access (AE5)', () => {
+describe('a request for access', () => {
   it('lists each request Drive shows waiting: who, the access asked for, and their message framed', async () => {
     const w = world();
     const fileId = (await w.drive.createFile({ name: 'Trip plan', mimeType: 'application/vnd.google-apps.document' }))
@@ -538,7 +537,7 @@ describe('a request for access (AE5)', () => {
     expect(text).not.toContain('give me the whole folder');
   });
 
-  it("marks a request from another Gmail spelling of a principal address as one of the principal's (R1)", async () => {
+  it("marks a request from another Gmail spelling of a principal address as one of the principal's", async () => {
     const w = world();
     const fileId = (await w.drive.createFile({ name: 'Trip plan', mimeType: 'application/vnd.google-apps.document' }))
       .id;
@@ -689,7 +688,7 @@ describe('a poll of many notices', () => {
   });
 });
 
-describe('the files a note is about (Slice 5 KTD11)', () => {
+describe('the files a note is about', () => {
   it('brings a file shared or commented on new, from whom Google names as having acted, and any other as it is', () => {
     const w = world();
     const pieces = workspaceNotePieces(

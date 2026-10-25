@@ -1,8 +1,7 @@
 /**
- * The gws-ea driver: terminal rendering, prompts, Google Cloud
- * guidance, and the interactive failure loop around the control-plane CLI.
- * Without a TTY it adds none of them, so every input comes from flags, the
- * environment, or the secrets file, and every stop is a durable line.
+ * The gws-ea driver: terminal rendering, prompts, Google Cloud guidance, and the interactive failure loop
+ * around the control-plane CLI. Without a TTY, or with `--json` or `--no-input`, it adds none of them, so
+ * every input comes from flags, the environment, or the secrets file, and every stop is a durable line.
  */
 import { realpathSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
@@ -48,10 +47,8 @@ interface RunningStep {
 }
 
 /**
- * Clack rendering: one spinner per labeled step, showing its waiting reason
- * and elapsed time. Upstream `startSpinner` cannot change its message while
- * running and stops failures with a success glyph under clack 1.2, so the
- * spinner is driven here with upstream's theme helpers.
+ * Upstream `startSpinner` cannot change its message while running, so a step's waiting reason needs the
+ * spinner driven here with upstream's theme helpers.
  */
 export function createTerminalPresenter(): Presenter {
   let running: RunningStep | undefined;
@@ -172,10 +169,7 @@ function terminalPrompts(providers: readonly SetupProviderEntry[]): InteractiveP
   };
 }
 
-/**
- * The terminal operator's choice among the accounts their 1Password app
- * holds, by exact ID; cancelled, enable reports the choice it needs instead.
- */
+/** Undefined when cancelled; enable then reports the choice it needs. */
 export async function chooseOnePasswordAccount(accounts: readonly OnePasswordAccount[]): Promise<string | undefined> {
   const chosen = await p.select({
     message: 'Which 1Password account should assistants keep their vaults in?',
@@ -190,9 +184,8 @@ export async function chooseOnePasswordAccount(accounts: readonly OnePasswordAcc
 }
 
 /**
- * Upstream's host readiness helpers, unchanged. They ship as untyped ESM
- * (`setup/lib/host-status.mjs`), so they are loaded by URL and checked here
- * rather than given a declaration file inside upstream's tree.
+ * Upstream ships these as untyped ESM (`setup/lib/host-status.mjs`), so they are loaded by URL and checked
+ * here rather than given a declaration file inside upstream's tree.
  */
 async function loadHostStatus(): Promise<HostStatusHelpers> {
   const helpers = (await import(new URL('./lib/host-status.mjs', import.meta.url).href)) as Record<string, unknown>;
@@ -209,7 +202,6 @@ async function loadHostStatus(): Promise<HostStatusHelpers> {
   };
 }
 
-/** Upstream's update-controller service helpers, unchanged: every assistant's host is controlled through them. */
 const serviceHelpers: NanoclawServiceHelpers = {
   createCommandRunner,
   detectService,
@@ -219,15 +211,11 @@ const serviceHelpers: NanoclawServiceHelpers = {
   verifyServiceHealth,
 };
 
-/**
- * The checkout this tool runs from, where a NanoClaw install gws-ea does not
- * manage is removed; its `.env` is kept aside with NanoClaw's own backup.
- */
+/** Where gws-ea removes a NanoClaw install it does not manage, keeping its `.env` aside with NanoClaw's backup. */
 function toolCheckout(): ToolCheckout {
   return { root: realpathSync(CONTROL_PLANE_ROOT), backupEnv };
 }
 
-/** What a retry does: a host service command, an update, or a cleanup runs again; the others re-check prerequisites and continue. */
 function retryOffer(command: FailureReport['command']): string {
   return command === 'start' ||
     command === 'stop' ||
@@ -239,10 +227,7 @@ function retryOffer(command: FailureReport['command']): string {
     : 'Retry now? gws-ea re-checks prerequisites, then continues from where it stopped.';
 }
 
-/**
- * This tool's provider setup, which an update holds the assistant's to: the
- * credential metadata each composed provider declares, as create reads them.
- */
+/** What an update holds the assistant's provider setup to, read without ambient configuration as create reads it. */
 function toolProviderSetup(providers: readonly SetupProviderEntry[]): () => Promise<ToolProviderSetup> {
   return async () => ({
     credentialMetadata: (id) =>
@@ -252,7 +237,6 @@ function toolProviderSetup(providers: readonly SetupProviderEntry[]): () => Prom
   });
 }
 
-/** Diagnosis first, then the retry offer. */
 async function handleFailure(report: FailureReport): Promise<'retry' | 'stop'> {
   await offerDiagnosis(report);
   const answer = await p.confirm({ message: retryOffer(report.command), initialValue: true, output: process.stderr });

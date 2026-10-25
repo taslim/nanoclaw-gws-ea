@@ -21,7 +21,7 @@ export async function listChats(): Promise<Chat[]> {
 export function chatIsActive(chat: Chat): boolean {
   return chat.state === 'connected' || chat.state === 'job';
 }
-/** Checked by native receive paths before attachment download; unrecorded and asking chats retain their media. */
+/** Native receive paths check this before reading a message or fetching its media; unrecorded and asking chats pass. */
 export async function chatAcceptsInbound(channel: string, platformId: string): Promise<boolean> {
   const db = getDb();
   if (!(await db.hasTable('gws_ea_chats'))) return true;

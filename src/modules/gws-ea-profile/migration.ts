@@ -51,11 +51,7 @@ export const gwsEaBrowserPointerMigration: ModuleMigration = {
   },
 };
 
-/**
- * Original web alias schema (KTD13). The later alias-confirmation migration
- * removes the obsolete delivery-probe field without changing the recorded
- * alias or its pending candidate.
- */
+/** `alias_probe_message_id` is dropped again by `gwsEaAliasConfirmationMigration`. */
 export const gwsEaWebAliasMigration: ModuleMigration = {
   version: 5,
   name: 'module:gws-ea-profile:web-alias',
@@ -97,9 +93,9 @@ export const gwsEaProfileMigration: ModuleMigration = {
 };
 
 /**
- * `external-email`'s agent group, beside main's. The host creates the group
- * once and records it here (src/modules/gws-ea-external-email). An assistant
- * from before it gains an empty pointer, which its next start fills.
+ * The host creates `external-email`'s group once and records it here
+ * (src/modules/gws-ea-external-email). An assistant from before it gains an
+ * empty pointer, which its next start fills.
  */
 export const gwsEaExternalEmailPointerMigration: ModuleMigration = {
   version: 3,
@@ -125,7 +121,7 @@ export const gwsEaPrincipalAddressesMigration: ModuleMigration = {
   },
 };
 
-/** Delivery probes are no longer part of alias setup; preserve recorded aliases and pending candidates. */
+/** Operator confirmation replaced the delivery probe, so a pending candidate now waits for the operator. */
 export const gwsEaAliasConfirmationMigration: ModuleMigration = {
   version: 9,
   name: 'module:gws-ea-profile:alias-confirmation',

@@ -1,16 +1,14 @@
 /**
  * One assistant's host service, controlled through NanoClaw's own update
  * controller helpers (`scripts/update/service.ts`) so the mechanics cannot
- * drift from NanoClaw's: detection, stop, start, container drain, and health.
- * `src/` cannot import `scripts/`, so the driver supplies the helpers and this
- * module binds them to one instance: its checkout, install, home, and Docker
- * endpoint. What gws-ea adds is the exact-ID targeting (NanoClaw's stop itself
- * waits until the host has exited, so nothing starts it again early), and on
- * systemd a reset of a unit's failed state before each start.
+ * drift from NanoClaw's. `src/` cannot import `scripts/`, so the driver
+ * supplies the helpers and this module binds them to one instance: its
+ * checkout, install, home, and Docker endpoint. What gws-ea adds is naming the
+ * install exactly (`installSlug`), and on systemd a reset of a unit's failed
+ * state before each start.
  *
  * Stop follows NanoClaw: agent containers are left for the next start to
- * adopt, and the stop lasts until the next start, login, or reboot. Only
- * an update's or rollback's fence and removal drain containers.
+ * adopt, and the stop lasts until the next start, login, or reboot.
  */
 import { setTimeout as delay } from 'node:timers/promises';
 
@@ -19,16 +17,15 @@ import { activeStep } from './run-log.js';
 import { serviceManagerEnvironment, type InstanceRuntimeConfig } from './service.js';
 import { GwsEaError } from './types.js';
 
-/** Where a host service sends the host's output and its errors. */
 export { hostLogFiles, type HostLogFiles } from './service.js';
 
-/** A `systemctl` call that a hung user bus would otherwise hold forever, the assistant fenced. */
+/** Bounds a `systemctl` call a hung user bus would otherwise hold forever, leaving the assistant down. */
 const SYSTEMCTL_TIMEOUT_MS = 30_000;
 
-/** NanoClaw's `ServiceMode`: how detection found the service run. */
+/** NanoClaw's `ServiceMode`. */
 export type NanoclawServiceMode = 'launchd' | 'systemd-user' | 'systemd-system' | 'nohup' | 'unmanaged' | 'none';
 
-/** NanoClaw's `ServiceHandle`: a service as detection found it. */
+/** NanoClaw's `ServiceHandle`. */
 export interface NanoclawServiceHandle {
   readonly mode: NanoclawServiceMode;
   readonly active: boolean;
@@ -61,7 +58,6 @@ export interface NanoclawServiceEnvironment {
   log?(message: string): void;
 }
 
-/** NanoClaw's update-controller service helpers, which the driver supplies. */
 export interface NanoclawServiceHelpers {
   readonly createCommandRunner: (options: { readonly env: NodeJS.ProcessEnv }) => NanoclawCommandRunner;
   readonly detectService: (projectRoot: string, env: NanoclawServiceEnvironment) => NanoclawServiceHandle;
@@ -76,11 +72,10 @@ export interface NanoclawServiceHelpers {
   ) => Promise<boolean>;
 }
 
-/** The one assistant a service control acts on, as its runtime records it. */
 export interface ServiceControlTarget {
-  /** Its instance ID, which the commands its refusals name take. */
+  /** Named in the recovery commands its refusals give. */
   readonly instanceId: string;
-  /** The live checkout the service runs from. */
+  /** The live release's link, which the service runs from. */
   readonly checkoutRoot: string;
   /** NanoClaw's install slug: the instance ID without dashes. */
   readonly installId: string;
@@ -88,7 +83,6 @@ export interface ServiceControlTarget {
   readonly dockerEndpoint: string;
 }
 
-/** The service a created assistant's own runtime record names (R18). */
 export function runtimeServiceTarget(
   runtime: Pick<
     InstanceRuntimeConfig,
@@ -104,7 +98,6 @@ export function runtimeServiceTarget(
   };
 }
 
-/** Boundary seams; each defaults to this process's. */
 export interface ServiceControlOptions {
   readonly recordEffect?: (changed: true | null) => void;
   readonly platform?: NodeJS.Platform;
@@ -129,11 +122,10 @@ export interface StartOptions {
 }
 
 export interface InstanceServiceControl {
-  /** The service as NanoClaw detects it now. */
   detect(): NanoclawServiceHandle;
-  /** Starts the host unless it runs; a running host is only restarted when its definition changed. */
+  /** A running host is restarted only when its definition changed. */
   start(options?: StartOptions): Promise<StartOutcome>;
-  /** Stops the host, leaving agent containers for the next start, and returns once it has exited. */
+  /** Leaves agent containers for the next start, and returns once the host has exited. */
   stop(): Promise<StopOutcome>;
   /**
    * Stops a launchd job by its label, and returns once it has gone. NanoClaw
@@ -153,11 +145,6 @@ function requireUid(uid: number | undefined): number {
   return uid;
 }
 
-/**
- * What every helper's command runs with: the operator's tools, this
- * assistant's home, Docker endpoint, and install, and on Linux the user bus
- * `systemctl --user` needs.
- */
 function commandEnvironment(
   target: ServiceControlTarget,
   platform: NodeJS.Platform,
@@ -201,9 +188,9 @@ export function createServiceControl(
   };
   const root = target.checkoutRoot;
   /**
-   * NanoClaw's helpers throw plain errors, which the operator is never shown
-   * (`safeErrorMessage`). Each failure keeps NanoClaw's own reason, which says
-   * what to do, in a gws-ea error, with NanoClaw's error as its cause.
+   * NanoClaw's helpers throw plain errors, which `safeErrorMessage` never
+   * shows the operator; their reasons say what to do, so each is rewrapped in
+   * a gws-ea error.
    */
   const reasonOf = (cause: unknown): string => (cause instanceof Error ? cause.message : String(cause));
   const detect = (): NanoclawServiceHandle => {
@@ -222,7 +209,6 @@ export function createServiceControl(
       `A NanoClaw host runs from ${root} outside its service (PID ${handle.name}); stop that process, then retry.`,
     );
   };
-  /** Starting needs the service NanoClaw installed; resume installs a missing one. */
   const installed = (handle: NanoclawServiceHandle): NanoclawServiceHandle => {
     if (handle.mode !== 'none') return handle;
     throw new GwsEaError(
@@ -264,7 +250,7 @@ export function createServiceControl(
     }
   };
 
-  /** Start the way NanoClaw's own transaction does: the service's handle, marked active. */
+  /** Marked active: NanoClaw's `startService` skips a handle that is not. */
   const startHandle = (handle: NanoclawServiceHandle): void => {
     try {
       options.recordEffect?.(null);
@@ -310,7 +296,7 @@ export function createServiceControl(
       try {
         await helpers.drainContainers(root, env, timeoutMs);
       } catch (cause) {
-        // NanoClaw's reasons (its timeout, a failed `docker ps`) end without a stop.
+        // NanoClaw's reasons (its timeout, a failed `docker ps`) end without a full stop.
         throw new GwsEaError(
           'containers_still_running',
           `NanoClaw did not stop the assistant's agent containers: ${reasonOf(cause)}.`,

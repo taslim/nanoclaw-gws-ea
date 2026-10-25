@@ -302,7 +302,7 @@ describe.skipIf(!chromePath)('open-web classification in native Chrome', { timeo
   it('keeps preparation on a transaction page ordinary and refuses its commits', async () => {
     await visit(OPEN_WEB.payment);
     expect(await facts(page.locator('#continue'))).toMatchObject({ transaction: true, region: { transaction: true } });
-    // AE1: a coupon and a quantity change on a checkout with a total and a saved card run as ordinary clicks.
+    // A coupon and a quantity change on a checkout with a total and a saved card run as ordinary clicks.
     await page.locator('#coupon').fill('AUTUMN10');
     for (const id of ['#apply', '#decrease', '#increase', '#remove', '#summary', '#edit', '#back'])
       expect(await classify(page.locator(id))).toBe('ordinary');
@@ -530,7 +530,7 @@ describe.skipIf(!chromePath)('the consent engine in native Chrome', { timeout: 3
       'SELECT id,site,origin,wording,kind,status FROM gws_ea_browser_consent_stops ORDER BY created_at',
     );
 
-  it('unticks a pre-ticked offers box on a free booking with a real click on its label (AE2)', async () => {
+  it('unticks a pre-ticked offers box on a free booking with a real click on its label', async () => {
     await visit(CONSENT.offers);
     expect(await checked('#offers')).toBe(true);
     expect(await pass(page.locator('#reserve'))).toEqual({ status: 'ready', agreements: [], addOns: [] });
@@ -540,7 +540,7 @@ describe.skipIf(!chromePath)('the consent engine in native Chrome', { timeout: 3
     expect(await stops()).toEqual([]);
   });
 
-  it('ticks an inverted newsletter box, which opts out, before the form submits (AE5)', async () => {
+  it('ticks an inverted newsletter box, which opts out, before the form submits', async () => {
     await visit(CONSENT.inverted);
     await page.locator('input[name="email"]').fill('morgan.ellery@example.test');
     expect(await act(['click', 'Sign up'])).toMatchObject({ status: 'stopped', reason: 'navigated' });
@@ -574,7 +574,7 @@ describe.skipIf(!chromePath)('the consent engine in native Chrome', { timeout: 3
     expect(await checked('#offers')).toBe(true);
   });
 
-  it('stops for a required opt-in, and after the principal agrees ticks only that box, until the wording changes or the grant is withdrawn (AE6)', async () => {
+  it('stops for a required opt-in, and after the principal agrees ticks only that box, until the wording changes or the grant is withdrawn', async () => {
     await visit(CONSENT.required);
     const stopped = await act(['click', 'Join']);
     const [stop] = await stops();
@@ -1635,7 +1635,7 @@ describe.skipIf(!chromePath)('cookie banners in native Chrome', { timeout: 30_00
   });
 });
 
-describe.skipIf(!chromePath)('personal data in native Chrome (KTD19, R34)', { timeout: 60_000 }, () => {
+describe.skipIf(!chromePath)('personal data in native Chrome', { timeout: 60_000 }, () => {
   const MOBILE = '+1 415 555 0134';
   const HOME = '123 Main Street, Springfield';
   let host: ErrandHost;
@@ -1888,7 +1888,7 @@ describe.skipIf(!chromePath)('purchases on unreviewed sites in native Chrome', {
     return result;
   };
 
-  it('reads an unreviewed shop’s checkout into one card, and after approval re-reads, presses and reports placed without recipe storage (AE3)', async () => {
+  it('reads an unreviewed shop’s checkout into one card, and after approval re-reads, presses and reports placed without recipe storage', async () => {
     await open(GENERIC.review);
     await getDb().exec('DROP TABLE gws_ea_browser_action_trace; DROP TABLE gws_ea_browser_recipes;');
     await run('note', [
@@ -1898,7 +1898,7 @@ describe.skipIf(!chromePath)('purchases on unreviewed sites in native Chrome', {
     expect(posts()).toEqual([]);
     const [approval] = await approvals();
     expect(sent).toHaveLength(1);
-    // One picture goes with it: the clip of the total and the commit control, and nothing else of the page (KTD6).
+    // One picture goes with it: the clip of the total and the commit control, and nothing else of the page.
     const [card] = cards();
     expect(card.pictures).toBe(1);
     expect(card.files).toHaveLength(1);
@@ -2097,7 +2097,7 @@ document.getElementById('updated').addEventListener('click', () => location.assi
     expect(await approvals()).toHaveLength(1);
   });
 
-  it('presses a free table itself with no card, unticking the offers box, and records a money-less attempt (AE2)', async () => {
+  it('presses a free table itself with no card, unticking the offers box, and records a money-less attempt', async () => {
     fixture.serve('https://table.example/book/r-7/confirm', placedPage('T-7731', '$0.00'));
     await open(CONSENT.offers);
     expect(await purchase('Reserve now')).toMatchObject({ status: 'booked', order_number: 'T-7731' });

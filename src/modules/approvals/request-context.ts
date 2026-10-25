@@ -1,11 +1,10 @@
 /**
- * Requests in the agent's context (R10, KTD10). A request the host posts into
- * a conversation (an approval, a new sender, a new channel) is a message there
- * from the assistant's own account, which the agent working in that
- * conversation would otherwise never see. So when one is posted, and when it
- * is answered or ends, a note goes into the session that conversation already
- * has, as context (trigger=0): it wakes nothing, and with no session there is
- * no note and no session is made.
+ * A request the host posts into a conversation is a message there from the
+ * assistant's own account, which the agent working in that conversation would
+ * otherwise never see. So when one is posted, and when it is answered or ends,
+ * a note goes into the session that conversation already has, as context
+ * (trigger=0): it wakes nothing, and with no session there is no note and no
+ * session is made.
  *
  * A note holds the request as fields: what the host holds as it is, and text
  * someone else supplied (a display name, a conversation's name, a reason an
@@ -13,8 +12,7 @@
  * names are not marked, and never its payload, which may hold secrets.
  *
  * Notes are written, not routed: a note has no sender, and the router's quiet
- * path admits only a sender with access. A note that cannot be written is
- * logged, and the request stands.
+ * path admits only a sender with access.
  */
 import { randomUUID } from 'node:crypto';
 
@@ -30,7 +28,6 @@ import { untrustedLine } from '../gws-ea-inbox/untrusted.js';
 /** The longest text someone else supplied that a note keeps. */
 const SUPPLIED_LIMIT = 200;
 
-/** The conversation a request was posted in, as its delivery addressed it. */
 export interface RequestConversation {
   readonly channelType: string;
   readonly platformId: string;
@@ -39,22 +36,19 @@ export interface RequestConversation {
   readonly threadId: string | null;
 }
 
-/** Text someone other than the host supplied, and where it came from. */
 export interface SuppliedText {
   readonly text: string;
   /** Named in its untrusted marker: the channel a name came from, or `agent` for an agent's words. */
   readonly source: string;
 }
 
-/** What a note says about a request beyond its title and answers. */
 export interface RequestDetails {
-  /** What the host holds: the exact packages or command, the gateway request, a sender's id. */
+  /** What the host itself holds, which a note shows as it is. */
   readonly facts?: Readonly<Record<string, string | readonly string[]>>;
-  /** Text someone else supplied, by what it is, each marked untrusted. */
+  /** Each marked untrusted in the note. */
   readonly supplied?: Readonly<Record<string, SuppliedText>>;
 }
 
-/** Details from several sources (the request, where it came from), as one. */
 export function combineDetails(...parts: ReadonlyArray<RequestDetails | undefined>): RequestDetails {
   const facts: Record<string, string | readonly string[]> = {};
   const supplied: Record<string, SuppliedText> = {};
@@ -72,7 +66,6 @@ export interface PostedRequest {
   readonly about: string;
   readonly title: string;
   readonly options: readonly NormalizedOption[];
-  /** Who answers it. */
   readonly answerFrom: string;
   readonly details?: RequestDetails;
 }
@@ -83,11 +76,10 @@ export interface RequestOutcome {
   readonly title: string;
   /** As the request shows it: the option chosen, or how it ended. */
   readonly outcome: string;
-  /** The reason the answer gave. */
+  /** A rejection's reason, or the resolution text of a request that expired or was withdrawn. */
   readonly reason?: string;
 }
 
-/** Note a request posted in `conversation`, in that conversation's session. */
 export function recordRequestPosted(conversation: RequestConversation, request: PostedRequest): Promise<void> {
   return writeNote(
     conversation,
@@ -104,7 +96,6 @@ export function recordRequestPosted(conversation: RequestConversation, request: 
   );
 }
 
-/** Note how a request posted in `conversation` was answered or ended, in that conversation's session. */
 export function recordRequestOutcome(conversation: RequestConversation, outcome: RequestOutcome): Promise<void> {
   return writeNote(conversation, outcome.id, 'A request posted in this conversation as your message has its outcome:', {
     request: outcome.id,

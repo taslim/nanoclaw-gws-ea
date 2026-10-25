@@ -1,5 +1,5 @@
 /**
- * The operator's browser access setting as a test needs it (KTD15): the
+ * The operator's browser access setting as a test needs it: the
  * owner-only policy file at `file`, read by every host check for the rest
  * of the test. With `agentGroupIds`, a version-2 list of exactly those
  * groups; without, version 1, main alone. The caller clears the stubbed

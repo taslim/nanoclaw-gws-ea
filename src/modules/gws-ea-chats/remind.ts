@@ -7,7 +7,7 @@ import { createScheduledTask, prepareScheduledTask } from '../scheduling/create.
 import { inChatConversation, requireServingChat } from './bridge.js';
 import { assertChatToolFields, chatToolsAction } from './expect.js';
 
-/** Stable native task identity across an interrupted chat cutover. */
+/** Deterministic, so a move repeated after an interruption copies each reminder once. */
 export function movedReminderId(sourceSession: string, sourceId: string): string {
   return `chat-move-reminder-${createHash('sha256').update(`${sourceSession}\0${sourceId}`).digest('hex')}`;
 }

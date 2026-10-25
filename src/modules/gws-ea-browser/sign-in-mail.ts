@@ -147,11 +147,11 @@ function awaitAssistantReply(
 }
 
 /**
- * A new account waiting for its verification email (F3). The host opens the
- * wait before the signup's activation, so the site's email cannot outrun it,
- * and binds its claim to that signup's site, origin and account: only mail
- * from that site, to that account, reaches the isolated interpreter for it.
- * The interpreter's one answer is held in host memory alone, never a record,
+ * A new account waiting for its verification email. The host opens the wait
+ * before the signup's activation, so the site's email cannot outrun it, and
+ * binds its claim to that signup's site, origin and account: only mail from
+ * that site, to that account, reaches the isolated interpreter for it. The
+ * interpreter's one answer is held in host memory alone, never a record,
  * until that signup's own verify step uses it or the claim expires.
  */
 interface SignupVerification {
@@ -172,7 +172,7 @@ function dropSignupVerification(verification: SignupVerification): void {
   for (const listener of [...verification.listeners]) listener();
 }
 
-/** The assistant's own mailbox receives this account's mail, including a +tag on one of its addresses. */
+/** Whether this account's mail reaches the assistant's own mailbox, a +tag on one of its addresses included. */
 async function assistantMailbox(account: string): Promise<boolean> {
   const address = account.toLowerCase();
   const tagged = /^([^@+]+)\+[^@]*(@.+)$/u.exec(address);
@@ -182,7 +182,8 @@ async function assistantMailbox(account: string): Promise<boolean> {
 
 /**
  * Opens a signup's verification wait, replacing any earlier one for it.
- * False when the account's mail does not reach the assistant's own inbox.
+ * False when no inbox is active or the account's mail does not reach the
+ * assistant's own inbox.
  */
 export async function openSignupVerification(input: {
   readonly jobId: string;
@@ -261,7 +262,6 @@ export async function takeSignupVerification(
   return claim ? { status: 'arrived', reply, claim } : { status: 'not_watched' };
 }
 
-/** Ends a signup's verification wait: its answer is dropped and its claim finished. */
 export async function finishSignupVerification(attemptId: string): Promise<void> {
   for (const verification of [...signupVerifications.values()])
     if (verification.attemptId === attemptId) {
@@ -370,9 +370,9 @@ async function consumeMagicLink(
 /**
  * Opens a signup's emailed verification link the same way: on its claim's
  * site, from the job's main document there, reading the landing page through
- * `landing` before the bearer document is cleared. An insecure or off-site
- * link is `refused` before anything opens it; a failure once opening began
- * throws, and the site may have taken the link by then.
+ * `landing` before the bearer document is cleared. An insecure, off-site or
+ * account-security link is `refused` before anything opens it; a failure
+ * once opening began throws, and the site may have taken the link by then.
  */
 export async function openVerificationLink<T>(
   context: BrowserExecutionContext,
@@ -533,7 +533,7 @@ export async function executeSignInCode(
         throw invalidArgs(
           "For a code the principal relays, target the site's one-time-code field: the host presses send itself once the wait is recorded.",
         );
-      // The assistant signs in with its web address, never one it converses from (KTD14).
+      // The assistant signs in with its web address, never one it converses from.
       const email = kind === 'username' ? await signInAddress(await target.element.inputValue()) : undefined;
       if (kind === 'username' && email === undefined) return { status: 'alias_unavailable' };
       const binding = await bindBrowserSecretField(
@@ -745,7 +745,7 @@ async function executeRelayCode(
       };
     });
     return result;
-    // eslint-disable-next-line no-catch-all/no-catch-all -- main's code and any native exception stay host-only; the fixed result is answered to both callers
+    // eslint-disable-next-line no-catch-all/no-catch-all -- the relayed code and any native exception stay host-only; the fixed result is answered to both callers
   } catch (_error) {
     return result;
   } finally {
@@ -754,7 +754,7 @@ async function executeRelayCode(
   }
 }
 
-/** Every main delivery only accepts durable references; the queue reads the original code under the job lock. */
+/** A relayed code is queued as durable references only; the queue reads the code from the relaying agent's outbox. */
 export function registerSignInMailDelivery(queue: () => BrowserQueue): void {
   registerDeliveryAction(
     'sign_in_reply',

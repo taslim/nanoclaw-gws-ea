@@ -49,7 +49,7 @@ const CONFIG_HASH_LABEL = 'com.docker.compose.config-hash';
 
 /** Pulling runs on its own clock: a slow registry never eats into the health wait. */
 const ONECLI_PULL_TIMEOUT_MS = 20 * 60_000;
-/** Building the wrapper gateway image (base already local; only the small firewall layer is added). */
+/** The base is already local, so building the wrapper adds only the small firewall layer. */
 const ONECLI_BUILD_TIMEOUT_MS = 10 * 60_000;
 /** `up --wait` itself waits `ONECLI_WAIT_TIMEOUT_SECONDS`; the margin covers creating the containers. */
 const UP_TIMEOUT_MS = (ONECLI_WAIT_TIMEOUT_SECONDS + 120) * 1_000;
@@ -83,7 +83,7 @@ interface ObservedOnecliVolume {
   readonly role: string | undefined;
 }
 
-/** What the service containers show; unlike an `Observation`, an absence always says why. */
+/** Unlike an `Observation`, an absence always says why. */
 type ServicesObservation =
   | { readonly status: 'present' }
   | { readonly status: 'absent'; readonly reason: string }
@@ -96,9 +96,7 @@ export interface ImportedCredential {
 
 export interface OnecliRuntimeDependencies {
   readonly recordEffect?: (changed: true | null) => void;
-  /** Runs Docker and the port-holder lookup. */
   readonly dockerCommandRunner?: OnecliCommandRunner;
-  /** Reaches the runtime's health endpoints and its admin API. */
   readonly fetch?: typeof globalThis.fetch;
   readonly ambientEnv?: NodeJS.ProcessEnv;
   readonly findPortHolder?: (port: number) => Promise<PortHolder | undefined>;
@@ -130,7 +128,6 @@ function verifiedRuntime(receipt: OnecliRuntimeReceipt): VerifiedOnecliRuntime {
   return verified;
 }
 
-/** What every Docker command against one instance shares: its layout, the runner, and Compose's environment. */
 interface OnecliDocker {
   readonly layout: OnecliRuntimeLayout;
   readonly runner: OnecliCommandRunner;
@@ -167,7 +164,6 @@ function buildComposeInvocation(layout: OnecliRuntimeLayout, args: readonly stri
   };
 }
 
-/** Docker's environment: the tool allowlist, the operator's HOME, and the instance's recorded endpoint. */
 function buildComposeEnvironment(
   layout: Pick<OnecliRuntimeLayout, 'dockerEndpoint'>,
   ambient: NodeJS.ProcessEnv = process.env,
@@ -178,10 +174,9 @@ function buildComposeEnvironment(
 }
 
 /**
- * Prepare the instance's private material. A new instance's Compose file is
- * rendered from this tool's tree, which is the release it deploys; an existing
- * one is the release's own record of what the instance runs, so it is never
- * rendered again here (KTD6).
+ * A new instance's Compose file is rendered from this tool's tree, which is the
+ * release it deploys; an existing one is the release's own record of what the
+ * instance runs, so it is never rendered again here.
  */
 async function prepareOnecliRuntime(layout: OnecliRuntimeLayout, pins: OnecliPins): Promise<void> {
   await preparePrivateDirectory(layout.rootDirectory);
@@ -201,16 +196,15 @@ async function prepareOnecliRuntime(layout: OnecliRuntimeLayout, pins: OnecliPin
   }
 }
 
-/** What the instance runs, as its own Compose file names it, with the content hash its gateway tag carries. */
 interface InstanceOnecliImages extends OnecliServiceImages {
   readonly gatewayHash: string;
 }
 
 /**
- * The images the instance's own Compose file runs, never recomputed from any
- * tree (KTD6). The app must run the OneCLI its release pinned, and the gateway
- * must be a wrapper tag, whose hash its image's provenance label carries. A
- * missing file raises the underlying ENOENT for the caller to interpret.
+ * Read from the instance's own Compose file, never recomputed from any tree.
+ * The app must run the OneCLI its release pinned, and the gateway must be a
+ * wrapper tag, whose hash its image's provenance label carries. A missing file
+ * raises the underlying ENOENT for the caller to interpret.
  */
 async function instanceOnecliImages(layout: OnecliRuntimeLayout, pins: OnecliPins): Promise<InstanceOnecliImages> {
   const images = parseOnecliComposeImages(await readOwnerOnlyFile(layout.composeFile));
@@ -229,12 +223,10 @@ async function instanceOnecliImages(layout: OnecliRuntimeLayout, pins: OnecliPin
 }
 
 /**
- * Build the instance's wrapper gateway image when it is not already present.
  * The tag encodes the build-context content hash, so an unchanged wrapper
- * reuses the shared image (KTD5). Only this tool's tree can be built here, so
- * a missing image another release built is refused rather than replaced by
- * this tool's firewall. The base is already local (pulled for the app
- * service), so only the small firewall layer is built.
+ * reuses the shared image. Only this tool's tree can be built here, so a
+ * missing image another release built is refused rather than replaced by this
+ * tool's firewall.
  */
 async function ensureWrapperGatewayImage(
   docker: OnecliDocker,
@@ -283,19 +275,16 @@ async function ensureWrapperGatewayImage(
   recordEffect?.(true);
 }
 
-/** The gateway image an instance runs, and the one the release an update stages runs. */
 export interface GatewayImageChange {
   readonly current: string;
   readonly release: string;
 }
 
 /**
- * Make the release's wrapper gateway image ready before an update's stop
- * (KTD8), from this tool's tree, which is the release it deploys (R6). Only
- * when its tag differs from the one the instance's Compose file names is
- * Docker asked for it, and built when absent; content-addressed tags never
- * collide, so a build never replaces what another assistant runs. The
- * Compose file and the running runtime are left for the switch.
+ * Runs before an update's stop, from this tool's tree, which is the release it
+ * deploys. Content-addressed tags never collide, so a build never replaces what
+ * another assistant runs. The Compose file and the running runtime are left for
+ * the switch.
  */
 export async function prepareReleaseGatewayImage(
   layout: OnecliRuntimeLayout,
@@ -317,13 +306,13 @@ interface GatewaySwitch {
 
 /**
  * Put back the Compose file a kept release runs with and bring the whole
- * project to it, at a switch to that release (KTD8, KTD15): the gateway image
- * the release names was built when it was staged, or by an earlier release,
- * and is still present, since assistant commands never delete one; only when
- * it is missing and this tool's tree builds the same content is it built
- * again, and otherwise it is refused before the Compose file changes. Compose
- * recreates only the services whose configuration changed, keeping every
- * volume. Run again after an interruption, it converges.
+ * project to it, at a switch to that release: the gateway image the release
+ * names was built when it was staged, or by an earlier release, and is still
+ * present, since assistant commands never delete one; only when it is missing
+ * and this tool's tree builds the same content is it built again, and
+ * otherwise it is refused before the Compose file changes. Compose recreates
+ * only the services whose configuration changed, keeping every volume. Run
+ * again after an interruption, it converges.
  *
  * The isolation probe then runs before returning when a container was
  * recreated, or when the file differs from `left`: a switch cut short after
@@ -455,14 +444,13 @@ export async function observeOnecliRuntime(
 }
 
 /**
- * Whether each service's container still runs the configuration the
- * instance's own Compose file gives now, by Compose's own config hash: the
- * one `up` labelled the container with, against `config --hash` through the
- * instance's invocation, so it is computed for the same resolved project
- * (KTD15). A service created from another configuration is absent, and the
- * repair's `up` recreates it, keeping its volumes. The hash covers each
- * service's image reference, ports, networks, mounts and labels; it does not
- * cover the networks and volumes themselves, nor what an image tag holds.
+ * Compares Compose's own config hash: the one `up` labelled the container
+ * with, against `config --hash` through the instance's invocation, so it is
+ * computed for the same resolved project. A service created from another
+ * configuration is absent, and the repair's `up` recreates it, keeping its
+ * volumes. The hash covers each service's image reference, ports, networks,
+ * mounts and labels; it does not cover the networks and volumes themselves,
+ * nor what an image tag holds.
  */
 async function configDrift(
   docker: OnecliDocker,
@@ -517,12 +505,11 @@ function serviceObservation(
 }
 
 /**
- * The health check. The runtime must run healthy from the configuration the
- * instance's own Compose file gives now, whose app is its pinned OneCLI
- * (OneCLI reports no version of its own), on its own networks and volumes,
- * and answer on its health endpoints. The receipt carries the local API key,
- * read once, for importing the provider credential and persisting the key
- * files.
+ * The runtime must run healthy from the configuration the instance's own
+ * Compose file gives now, whose app is its pinned OneCLI (OneCLI reports no
+ * version of its own), on its own networks and volumes, and answer on its
+ * health endpoints. The receipt carries the local API key, read once, for
+ * importing the provider credential and persisting the key files.
  */
 export async function verifyOnecliRuntime(
   layout: OnecliRuntimeLayout,
@@ -555,11 +542,6 @@ export async function verifyOnecliRuntime(
   return receipt;
 }
 
-/**
- * Store the provider credential in the verified runtime's vault, its value
- * only in the request body, unless a secret with its metadata is there
- * already.
- */
 export async function importProviderCredential(
   receipt: OnecliRuntimeReceipt,
   input: ProviderCredential,
@@ -798,7 +780,6 @@ async function assertOwnedOnecliNamedResources(docker: OnecliDocker): Promise<re
   return resources;
 }
 
-/** Containers in this instance's Compose project must carry its instance label; anything else stops the run. */
 function assertOwnedContainers(layout: OnecliRuntimeLayout, containers: readonly ObservedOnecliContainer[]): void {
   for (const container of containers) {
     if (container.instanceId !== layout.instanceId || container.project !== layout.project) {
@@ -810,10 +791,6 @@ function assertOwnedContainers(layout: OnecliRuntimeLayout, containers: readonly
   }
 }
 
-/**
- * Remove owned containers outside the three services, or duplicates of one,
- * and return the containers that remain.
- */
 async function cleanupOnecliDockerOrphans(docker: OnecliDocker): Promise<readonly ObservedOnecliContainer[]> {
   const { layout, runner, environment } = docker;
   const containers = await inspectProjectContainers(docker);
@@ -836,7 +813,6 @@ async function cleanupOnecliDockerOrphans(docker: OnecliDocker): Promise<readonl
   return kept;
 }
 
-/** The IDs of every container in the instance's Compose project. */
 async function projectContainerIds(docker: OnecliDocker): Promise<readonly string[]> {
   const { layout, runner, environment } = docker;
   const list = await runner({
@@ -887,19 +863,15 @@ async function inspectProjectContainers(docker: OnecliDocker): Promise<readonly 
  * false failure. A bare `fetch` would bypass the proxy and falsely pass, so raw
  * `http` is used; a CONNECT tunnel cannot be used because this gateway answers
  * CONNECT with 200 to MITM TLS before it touches the upstream. Any violation fails
- * closed (R11); provisioning refuses the runtime and spawns no agent. Cross-
- * instance isolation on the DB port (which needs a real peer listener and cannot
- * be probed for a non-HTTP port through an HTTP proxy), R4, R5, and R8 are proven
- * in the live re-proof, where a peer, a real credential, and a human approver exist.
+ * closed: provisioning refuses the runtime and spawns no agent. Cross-instance
+ * isolation on the DB port is not probed here: it needs a real peer listener, and
+ * a non-HTTP port cannot be probed through an HTTP proxy.
  */
 async function verifyAgentNetworkIsolation(docker: OnecliDocker, pins: OnecliPins): Promise<void> {
   const { layout, runner, environment } = docker;
   const script = [
     'const http = require("node:http");',
     'const dns = require("node:dns").promises;',
-    // Forward-proxy GET through the gateway. Reachable = the gateway returned any
-    // HTTP response (it connected to the upstream); blocked = it could not connect
-    // and reset/errored. "Any response" catches a leaked target that answers 5xx.
     'function reached(url){return new Promise((resolve)=>{let done=false;const finish=(v)=>{if(!done){done=true;resolve(v);}};',
     'const u=new URL(url);const req=http.request({host:"host.docker.internal",port:10255,method:"GET",path:url,headers:{Host:u.host},timeout:7000},',
     '(res)=>{res.resume();finish(true);});',
@@ -908,11 +880,8 @@ async function verifyAgentNetworkIsolation(docker: OnecliDocker, pins: OnecliPin
     '(res)=>{res.resume();resolve(res.statusCode===200);});req.on("timeout",()=>{req.destroy();resolve(false);});req.on("error",()=>resolve(false));});}',
     '(async()=>{',
     'if(!(await healthz()))throw new Error("gateway healthz unreachable");',
-    // R6: public egress must work.
     'if(!(await reached("http://example.com/")))throw new Error("public egress blocked");',
-    // R2: the instance\'s own OneCLI app admin API (a real private listener) must be blocked.
     'if(await reached("http://app:10254/v1/secrets"))throw new Error("own app admin API reachable through gateway");',
-    // R3: link-local / cloud metadata must be blocked (a real listener on a cloud host).
     'if(await reached("http://169.254.169.254/"))throw new Error("link-local/metadata reachable through gateway");',
     // The agent container itself cannot resolve backend hosts (defense in depth).
     'for(const host of ["app","postgres"]){try{await dns.lookup(host);throw new Error(host+" resolved by agent");}catch(e){if(String(e).includes("resolved by agent"))throw e;}}',
@@ -938,7 +907,7 @@ async function verifyAgentNetworkIsolation(docker: OnecliDocker, pins: OnecliPin
   });
 }
 
-/** Confirm the gateway image was built from the firewall content its tag names (KTD6). */
+/** The gateway image must have been built from the firewall content its tag names. */
 async function assertWrapperGatewayProvenance(docker: OnecliDocker, expected: InstanceOnecliImages): Promise<void> {
   const { runner, environment, layout } = docker;
   const { stdout } = await runner({
@@ -1077,17 +1046,11 @@ export function onecliSecretMatchesCredentialMetadata(
   );
 }
 
-/** What `findCredentialSecret`'s two refusals say. */
 export interface CredentialSecretRefusals {
   readonly ambiguous: string;
   readonly conflict: string;
 }
 
-/**
- * The one OneCLI secret named like `credential`, or undefined when there is
- * none. More than one raises `ambiguous_onecli_secret`; one whose metadata
- * differs raises `onecli_secret_conflict`.
- */
 export function findCredentialSecret(
   secrets: readonly Record<string, unknown>[],
   credential: ProviderCredentialMetadata,

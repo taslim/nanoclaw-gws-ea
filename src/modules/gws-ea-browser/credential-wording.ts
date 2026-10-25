@@ -54,10 +54,8 @@ const CHANGED_MEANWHILE = `the login was changed or removed in 1Password meanwhi
 
 /**
  * What 1Password holds for an attempt the host could not finish, in the
- * principal's words on the card (`mine`) and in main's note (`theirs`). A
- * confirmed one says which item holds the password the site took, and
- * whether the original login may still hold the old one, from its recorded
- * settlement.
+ * principal's words on the card (`mine`) and in the delegator's note
+ * (`theirs`).
  */
 /** to: main, delegator, principal */
 function vaultLeft(
@@ -157,10 +155,7 @@ function finishedWords(attempt: Pick<CredentialAttempt, 'kind' | 'site'>, vault:
     : `the site took the new password, which is in the assistant's 1Password vault as its own item, "New password for ${attempt.site}"; ${CHANGED_MEANWHILE}`;
 }
 
-/**
- * What the principal reads on the card: what happened, what 1Password keeps, and what releasing means.
- * to: principal
- */
+/** to: principal */
 export function releaseQuestion(attempt: CredentialAttempt): string {
   const account = `${quoted(attempt.username, 256)} on ${attempt.site}`;
   const uncertain = attempt.phase === 'unknown' || attempt.phase === 'awaiting_verification';
@@ -173,7 +168,6 @@ export function releaseQuestion(attempt: CredentialAttempt): string {
     .join('\n');
 }
 
-/** An attempt's recorded evidence, parsed; undefined when it has none. */
 export function parsedEvidence(attempt: Pick<CredentialAttempt, 'evidence_json'>): unknown {
   return attempt.evidence_json === null ? undefined : JSON.parse(attempt.evidence_json);
 }

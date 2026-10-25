@@ -35,9 +35,9 @@ export {
 const SWEEP_INTERVAL_MS = 60_000;
 
 /**
- * How long a stop waits for reconciles under way. A reconcile records the
- * inbound messages it gives up on and then reports them through the
- * inbound-failed hooks, so a stop that did not wait could lose the report.
+ * A reconcile records the inbound messages it gives up on and then reports
+ * them through the inbound-failed hooks, so a stop that did not wait for
+ * reconciles under way could lose the report.
  */
 const STOP_WAIT_MS = 10_000;
 
@@ -140,7 +140,6 @@ export function startHostSweep(): void {
   void sweep();
 }
 
-/** Stop the sweep, waiting up to `maxWaitMs` for reconciles already under way. */
 export async function stopHostSweep(maxWaitMs = STOP_WAIT_MS): Promise<void> {
   running = false;
   registerReconcileEnqueue(null);

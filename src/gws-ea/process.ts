@@ -13,7 +13,6 @@ import { createStreamRedactor, redact, registerSecret } from './redact.js';
 import { activeStep, type StepLog } from './run-log.js';
 import { GwsEaError } from './types.js';
 
-/** Ambient variables the instance host process inherits. */
 const INSTANCE_HOST_ENVIRONMENT_KEYS = [
   'PATH',
   'LANG',
@@ -26,8 +25,7 @@ const INSTANCE_HOST_ENVIRONMENT_KEYS = [
 ] as const;
 
 /**
- * Ambient variables every tool the control plane runs inherits. Never
- * SSH_AUTH_SOCK, GOOGLE_APPLICATION_CREDENTIALS, or any other CLOUDSDK_*,
+ * Never SSH_AUTH_SOCK, GOOGLE_APPLICATION_CREDENTIALS, or any other CLOUDSDK_*,
  * GWS_EA_*, ONECLI_*, or ANTHROPIC_* variable.
  */
 export const TOOL_ENVIRONMENT_KEYS = [
@@ -68,10 +66,7 @@ export interface SanitizedCommand {
   readonly timeoutMs?: number;
   /** Cap on parsed stdout. Streamed output is never capped. */
   readonly outputLimitBytes?: number;
-  /**
-   * Tee stdout and stderr, redacted, into the active step's raw log instead of
-   * returning stdout. Only for output nobody parses: image builds and compose.
-   */
+  /** Tee stdout and stderr, redacted, into the active step's raw log instead of returning stdout. */
   readonly stream?: boolean;
   /**
    * Keep both streams out of the raw log and every failure detail; the log
@@ -79,7 +74,7 @@ export interface SanitizedCommand {
    * secret before the caller can register it. Never with `stream`.
    */
   readonly privateOutput?: boolean;
-  /** Text written to the child's stdin, then closed. Never logged. */
+  /** Written to stdin, then closed; never logged. */
   readonly input?: string;
 }
 
@@ -98,7 +93,7 @@ export type SanitizedCommandOutcomeRunner = (command: SanitizedCommand) => Promi
 
 export interface PersistedExecutableOptions {
   readonly searchPath?: string;
-  /** Checkout roots besides the control plane's own, such as the instances root. */
+  /** Besides the control plane's own, which is always refused. */
   readonly checkoutRoots?: readonly string[];
 }
 
@@ -129,12 +124,10 @@ function buildEnvironment(
   return environment;
 }
 
-/** Whether an environment variable's name marks its value as a secret. */
 export function isSecretEnvironmentKey(key: string): boolean {
   return SECRET_ENVIRONMENT_KEY.test(key);
 }
 
-/** Environment for a tool the control plane runs: the tool allowlist plus explicit overrides. */
 export function buildToolEnvironment(
   ambient: NodeJS.ProcessEnv = process.env,
   overrides: Readonly<Record<string, string>> = {},
@@ -142,7 +135,6 @@ export function buildToolEnvironment(
   return buildEnvironment(TOOL_ENVIRONMENT_KEYS, ambient, overrides);
 }
 
-/** Environment for the instance host process: the host allowlist plus explicit overrides. */
 export function buildHostEnvironment(
   ambient: NodeJS.ProcessEnv = process.env,
   overrides: Readonly<Record<string, string>> = {},
@@ -150,7 +142,6 @@ export function buildHostEnvironment(
   return buildEnvironment(INSTANCE_HOST_ENVIRONMENT_KEYS, ambient, overrides);
 }
 
-/** The operator's PATH minus empty and relative entries. */
 function executableSearchPath(value: string | undefined): string[] {
   return (value ?? '').split(path.delimiter).filter((entry) => path.isAbsolute(entry));
 }
@@ -180,7 +171,6 @@ async function locateExecutable(command: string, searched: readonly string[]): P
   );
 }
 
-/** Resolve a tool from the operator's PATH, ignoring empty and relative entries. */
 export async function resolveExecutable(
   command: string,
   searchPath: string | undefined = process.env.PATH,
@@ -202,11 +192,9 @@ async function canonicalRoots(roots: readonly string[]): Promise<string[]> {
 }
 
 /**
- * Resolve an executable persisted into runtime.json and the service unit
- * (`node`, `onecli`) to its real path. Refused when group- or world-writable
- * itself, in a world-writable directory, inside any checkout, or inside a
- * temporary directory. Homebrew and /Applications commonly have group-writable
- * directories owned by root or the operator, so those are allowed.
+ * For an executable whose real path a record or service definition keeps.
+ * Homebrew and /Applications commonly have group-writable directories owned by
+ * root or the operator, so only a world-writable directory is refused.
  */
 export async function resolvePersistedExecutable(
   command: string,
@@ -240,7 +228,7 @@ function displayCommand(command: SanitizedCommand): string {
   return display.length > DISPLAY_CHARACTERS ? `${display.slice(0, DISPLAY_CHARACTERS)}…` : display;
 }
 
-/** Raw stderr kept as its newest whole lines within the bound, so a front trim never leaves part of a line or a secret on it. */
+/** Keeps the newest whole lines within the bound, so a front trim never leaves part of a line or of a secret. */
 function createRetainedStderr(): { append(chunk: string): void; text(): string } {
   let retained = '';
   // Set while the rest of a line the trim cut is dropped, through its newline.
@@ -290,7 +278,6 @@ function commandFailure(
   return new GwsEaError(code, message, cause === undefined ? { details } : { cause, details });
 }
 
-/** The error a caller raises for a command that exited non-zero. */
 export function commandExitError(command: SanitizedCommand, outcome: SanitizedCommandOutcome): GwsEaError {
   return commandFailure('command_failed', `Command failed (exit code ${outcome.exitCode})`, command, {
     exitCode: outcome.exitCode,
@@ -380,7 +367,6 @@ function execute(
   const timeoutMs = command.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const outputLimit = command.outputLimitBytes ?? DEFAULT_PARSED_OUTPUT_LIMIT_BYTES;
   return new Promise((resolve, reject) => {
-    // stdin is a pipe only when there is input; stdout and stderr are always pipes.
     const child = spawn(executable, [...command.args], {
       cwd: command.cwd,
       env: environment,
@@ -506,7 +492,6 @@ function indent(text: string): string {
     .join('\n');
 }
 
-/** The environment a command runs with, its PATH reduced to absolute entries, and the directories searched for it. */
 function commandEnvironment(command: SanitizedCommand): {
   readonly environment: Record<string, string>;
   readonly searched: readonly string[];
@@ -565,7 +550,6 @@ export const runSanitizedCommandOutcome: SanitizedCommandOutcomeRunner = async (
   }
 };
 
-/** A runner that raises `commandExitError` for any non-zero exit. */
 export function checkedRunner(runner: SanitizedCommandOutcomeRunner): SanitizedCommandRunner {
   return async (command) => {
     const outcome = await runner(command);
@@ -576,7 +560,6 @@ export function checkedRunner(runner: SanitizedCommandOutcomeRunner): SanitizedC
 
 export const runSanitizedCommand: SanitizedCommandRunner = checkedRunner(runSanitizedCommandOutcome);
 
-/** Re-raise a program that is not installed as `code`, keeping where the runner looked; rethrow anything else. */
 export function missingExecutable(error: unknown, code: string, message: string): never {
   if (error instanceof GwsEaError && error.code === 'executable_not_found') {
     throw new GwsEaError(code, message, { cause: error, ...(error.details ? { details: error.details } : {}) });
@@ -598,7 +581,7 @@ export function replaceProcess(
   return execve(executable, args, { ...environment });
 }
 
-/** Wait until everything already written to stdout and stderr is out: a replaced process cannot finish it. */
+/** A replaced process cannot finish writing what is already queued on stdout and stderr. */
 async function flushStandardStreams(): Promise<void> {
   await Promise.all(
     [process.stdout, process.stderr].map((stream) => new Promise<void>((resolve) => stream.write('', () => resolve()))),
@@ -606,12 +589,9 @@ async function flushStandardStreams(): Promise<void> {
 }
 
 /**
- * Hand this process to `command`, found and started as the runner would run
- * it: the executable resolved on the command's own PATH, from its working
- * directory, with exactly its environment. The tool inherits stdin, stdout,
- * stderr, and signals, and its exit code is the process's. Nothing is
- * replaced when the tool or its directory is missing. Only the command, its
- * arguments, working directory, and environment apply.
+ * The tool inherits stdin, stdout, stderr, and signals, and its exit code is
+ * the process's. Nothing is replaced when the tool or its directory is missing.
+ * Only the command, its arguments, working directory, and environment apply.
  */
 export async function replaceProcessWithCommand(
   command: SanitizedCommand,

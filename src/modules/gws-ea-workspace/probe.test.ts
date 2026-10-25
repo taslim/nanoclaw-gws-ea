@@ -1,5 +1,5 @@
 /**
- * The signed-out visit (KTD5): the one Google call made without the host's
+ * The signed-out visit: the one Google call made without the host's
  * token, for a link Drive cannot answer for. It carries no credential,
  * follows no redirect but one forms.gle hop to a form's responder page,
  * reads a capped body only for a form, and gives up on time.

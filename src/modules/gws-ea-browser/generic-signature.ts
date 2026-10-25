@@ -1,9 +1,9 @@
 /**
- * The generic signature (KTD4, KTD5): the fallback reader for any checkout no reviewed signature reads. It reads
- * the checkout around its commit control across frames and dialogs, in isolated worlds, into the generic fact
- * floor, and decides what the checkout is: a free commit (KTD3), a paid one with no saved payment method (R12),
- * one whose facts it cannot read (R13), or a card's facts. It is never a reviewed flow: it classifies no control
- * or route, so it never joins the classifier's flows and nothing is ever pressed directly because of it.
+ * The generic signature: the fallback reader for any checkout no reviewed signature reads. It reads the checkout
+ * around its commit control across frames and dialogs, in isolated worlds, into the generic fact floor, and decides
+ * what the checkout is: a free commit, a paid one with no saved payment method, one whose facts it cannot read, or
+ * a card's facts. It is never a reviewed flow: it classifies no control or route, so it never joins the
+ * classifier's flows and nothing is ever pressed directly because of it.
  *
  * Every fact comes from what the page shows; the vocabulary below is data, widened or narrowed here.
  */
@@ -65,7 +65,6 @@ const VOCABULARY = {
   /** What is charged now, as opposed to later. */
   dueNow:
     /\b(?:due|payable|to\s+pay|charged|paid)\s+(?:now|today|at\s+(?:booking|checkout)|when\s+you\s+book)\b|\bpay(?:ing)?\s+(?:now|today)\b|\bcharged\s+(?:on|at)\s+booking\b/iu,
-  /** Nothing is charged now. */
   nothingNow:
     /\bnothing\s+(?:is\s+)?(?:due|charged|to\s+pay)\b|\bno\s+(?:payment|charge)\s+(?:is\s+)?(?:due\s+)?(?:now|today|until)\b|\b(?:won'?t|will\s+not)\s+be\s+charged\b/iu,
   /** A summary line beside the items: subtotals, shipping, taxes, discounts. */
@@ -73,7 +72,6 @@ const VOCABULARY = {
     /\b(?:sub[\s-]?total|total|shipping|delivery\s+(?:fee|charge)|tax(?:es)?|vat|discount|coupon|promo|tip|gratuity|savings|balance|amount\s+due|due\s+(?:now|today))\b/iu,
   /** An item row's quantity: "× 2", "Qty: 2", "2 x". */
   quantity: /(?:^|\s)[×x]\s?\d{1,3}\b|\b(?:qty|quantity)\.?:?\s*\d{1,3}\b|^\d{1,3}\s?[×x]\s/iu,
-  /** A heading over the items. */
   itemsHeading:
     /^(?:items?|your\s+(?:order|items|bag|cart|basket|booking|reservation)|order\s+(?:summary|details)|in\s+your\s+(?:bag|cart|basket)|summary)$/iu,
   /** A booking described in words: "Table for 2", "Party of 4", "4 guests". */
@@ -88,7 +86,7 @@ const VOCABULARY = {
   noteField: /\b(?:notes?|instructions?|requests?|comments?|allerg\w*|occasion|special)\b/iu,
   signedInAs: /\b(?:signed|logged)\s+in\s+as:?\s+(.{1,120}?)\.?$/iu,
   greeting: /^(?:hello|hi|welcome(?:\s+back)?),?\s+([^!.,]{1,80})[!.]?$/iu,
-  /** Money, fee, hold, deposit, payment or trial wording that keeps a booking from being free (KTD3). */
+  /** Money, fee, hold, deposit, payment or trial wording that keeps a booking from being free. */
   freeBlocker:
     /\b(?:fees?|charges?|charged|deposits?|pre-?pa(?:y|id|yment)|payments?|pay|billing|billed|trial|subscriptions?|membership\s+fees?|credit\s+card|debit\s+card)\b|\b(?:card|payment|authori[sz]ation)\s+hold\b/iu,
   /** Wording that denies a charge: "No payment is needed", "No credit card required". A no-show is no denial. */
@@ -124,7 +122,7 @@ const VOCABULARY = {
   /** A press's name that can commit, for finding a checkout's next commit control. */
   commitWords:
     /\b(?:buy|pay|purchase|order|checkout|check\s*out|reserve|book|subscribe|donate|bid|register|rsvp|join|confirm|complete|continue|next|submit|place|proceed|review|finish|start)\b/iu,
-  /** A route that enters a checkout: what a redirect to a payment platform leaves from (KTD7). */
+  /** A route that enters a checkout: what a redirect to a payment platform leaves from. */
   checkoutPath:
     /(?:^|[/_.-])(?:checkout|cart|basket|bag|pay(?:ments?)?|orders?|book(?:ings?)?|reserv\w*|purchase)(?:[/_.-]|$)/iu,
 } as const satisfies Record<string, RegExp>;
@@ -150,7 +148,6 @@ interface Line {
   readonly money: readonly ConfirmationCharge[];
 }
 
-/** What the generic signature makes of one read. */
 export type GenericDecision =
   | { status: 'free'; facts: FreeCommitFacts }
   | { status: 'card_needed'; needed: CardNeeded }
@@ -158,7 +155,7 @@ export type GenericDecision =
   | { status: 'ready'; facts: PurchaseFacts; regions: CheckoutRegions };
 
 export interface GenericReadContext {
-  /** The merchant: the registrable domain of the top-level page the job entered checkout from (KTD7). */
+  /** The merchant: the registrable domain of the top-level page the job entered checkout from. */
   readonly merchant: string;
   readonly locator: StructuredBrowserLocator;
   /** The commit control's box on the main frame's viewport. */
@@ -171,10 +168,9 @@ const positive = (text: string): ConfirmationCharge[] => statedAmounts(text).fil
 const distinct = <T>(values: readonly T[]): T[] => [
   ...new Map(values.map((value) => [JSON.stringify(value), value])).values(),
 ];
-/** The smallest box around every box given; with `wholePixels`, the smallest whole-pixel one. */
+/** The smallest box around `boxes`; `wholePixels` widens it to whole pixels rather than rounding. */
 export function union(boxes: readonly CheckoutBox[], { wholePixels = false } = {}): CheckoutBox {
   const same = (edge: number): number => edge;
-  // Whole pixels widen the box: its left and top edges round down, its right and bottom edges up.
   const [down, up] = wholePixels ? [Math.floor, Math.ceil] : [same, same];
   const left = down(Math.min(...boxes.map((box) => box.x)));
   const top = down(Math.min(...boxes.map((box) => box.y)));
@@ -186,7 +182,6 @@ export function union(boxes: readonly CheckoutBox[], { wholePixels = false } = {
   };
 }
 
-/** The registrable domain of a web address, or undefined for anything but HTTP(S). */
 function siteOf(raw: string): string | undefined {
   if (!URL.canParse(raw)) return undefined;
   const url = new URL(raw);
@@ -205,7 +200,6 @@ function undenied(text: string): string {
   return text.replace(DENIALS, ' ');
 }
 
-/** Whether the text names money, a fee, a hold, a deposit, a payment or a trial that it does not deny. */
 function chargeWording(text: string): boolean {
   return VOCABULARY.freeBlocker.test(undenied(text));
 }
@@ -231,7 +225,6 @@ const FREQUENCY_UNITS: ReadonlyArray<readonly [RegExp, 'month' | 'year' | 'week'
   [/^(?:day|daily)$/u, 'day'],
 ];
 
-/** A recurring frequency as people say it, or undefined when the words name none. */
 function frequencyOf(text: string): string | undefined {
   const match = VOCABULARY.frequency.exec(text);
   if (!match) return undefined;
@@ -242,7 +235,7 @@ function frequencyOf(text: string): string | undefined {
   return { month: 'monthly', year: 'yearly', week: 'weekly', day: 'daily', quarter: 'quarterly' }[word];
 }
 
-/** A calendar date the text states, as noon UTC on that day; undefined when it states none it can read. */
+/** A date the text states, as noon UTC on that day, or the end of a trial it states in days from `now`. */
 function stateDate(text: string, now: number): string | undefined {
   const iso = /\b(20\d{2})-(\d{2})-(\d{2})\b/u.exec(text);
   const written =
@@ -301,7 +294,7 @@ function structuredBooking(read: CheckoutRead): { venue?: string; at?: string } 
   return found;
 }
 
-/** The booking the checkout describes (KTD21): venue, party size and time, each only when read. */
+/** The booking the checkout describes: venue, party size and time, each only when read. */
 function readBooking(read: CheckoutRead, lines: readonly Line[], label: string): GenericBookingFacts | undefined {
   const fields = read.region.fields.filter(
     (field) => field.value !== null && VOCABULARY.partyField.test(`${field.name} ${field.label}`),
@@ -354,7 +347,7 @@ const TERM_KINDS: ReadonlyArray<{
   { wording: VOCABULARY.conditionalFee, kind: 'conditional_fee' },
 ];
 
-/** The terms a checkout states (R13): each with its amount, or what about it cannot be read. */
+/** The terms a checkout states: each with its amount, or what about it cannot be read. */
 function readTerms(
   lines: readonly Line[],
   booking: GenericBookingFacts | undefined,
@@ -435,10 +428,6 @@ function readTerms(
   return { terms, missing: distinct(missing), boxes, currencies: distinct(currencies) };
 }
 
-/**
- * The items as the page shows them: quantity rows, the rows under an items heading, or a booking's own words,
- * else what the page shows of the booking itself.
- */
 function readItems(
   lines: readonly Line[],
   fields: readonly CheckoutField[],
@@ -466,7 +455,7 @@ function readItems(
   return shown.length ? [bounded(shown.join(', '))] : [];
 }
 
-/** The contact email (KTD5), lowercased; ambiguous when the checkout shows two. */
+/** Lowercased; `ambiguous` when the checkout shows more than one. */
 function readContactEmail(lines: readonly Line[], fields: readonly CheckoutField[]): string | 'ambiguous' | undefined {
   const fieldValues = distinct(
     fields
@@ -487,7 +476,7 @@ function readContactEmail(lines: readonly Line[], fields: readonly CheckoutField
   return shown.length === 1 ? shown[0] : shown.length > 1 ? 'ambiguous' : undefined;
 }
 
-/** A note that rides along with the order or booking (R4): what was written in its free-text fields. */
+/** A note that rides along with the order or booking: what was written in its free-text fields. */
 function readNote(fields: readonly CheckoutField[]): string | undefined {
   const notes = fields
     .filter((field) => {
@@ -535,8 +524,8 @@ function readPayment(
 }
 
 /**
- * Whether the page offers or holds a way to pay (KTD3): a card field in the checkout, or a saved payment method,
- * an express-pay button or payment entry in any frame. A booking beside one is never free, reviewed or not.
+ * Whether the page offers or holds a way to pay: a card field in the checkout, or a saved payment method, an
+ * express-pay button or payment entry in any frame. A booking beside one is never free, reviewed or not.
  */
 export function offersPayment(read: CheckoutRead): boolean {
   return (
@@ -551,8 +540,8 @@ export function offersPayment(read: CheckoutRead): boolean {
 }
 
 /**
- * What one read of an unreviewed checkout is (KTD3, KTD5), decided in order: free, needing a card, incomplete,
- * or a card's facts. Pure: the host's isolated-world read and the job's merchant are its only inputs.
+ * What one read of an unreviewed checkout is, decided in order: free, needing a card, incomplete, or a card's
+ * facts. Pure: the host's isolated-world read and the job's merchant are its only inputs.
  */
 export function decideGenericCheckout(
   read: CheckoutRead,
@@ -574,8 +563,8 @@ export function decideGenericCheckout(
   const note = readNote(read.region.fields);
   const payment = readPayment(read, lines);
 
-  // KTD3: free only when the booking's own form or dialog states no money and no charge wording, and nothing on
-  // the page offers or holds a way to pay.
+  // Free only when the booking's own form or dialog states no money and no charge wording, and nothing on the
+  // page offers or holds a way to pay.
   const free =
     !lines.some((line) => line.money.length || chargeWording(line.text)) &&
     !positive(label).length &&
@@ -693,7 +682,7 @@ export function decideGenericCheckout(
   };
 }
 
-// ---------------------------------------------------------------- where the job entered checkout (KTD7)
+// ---------------------------------------------------------------- where the job entered checkout
 
 interface CheckoutEntry {
   /** The site of the page's current top-level document. */
@@ -754,7 +743,7 @@ async function prepareGenericPage(page: Page): Promise<void> {
   });
 }
 
-/** The merchant a page's checkout belongs to (KTD7): where the job entered checkout from, else the page's site. */
+/** The merchant a page's checkout belongs to: where the job entered checkout from, else the page's site. */
 function checkoutMerchant(page: Page): string | undefined {
   const site = siteOf(page.url());
   const entry = entries.get(page);
@@ -763,7 +752,6 @@ function checkoutMerchant(page: Page): string | undefined {
 
 // ---------------------------------------------------------------- reading and pressing
 
-/** Re-finds an approved control by its locator, or undefined when the page no longer shows it there. */
 async function locate(page: Page, locator: StructuredBrowserLocator): Promise<ElementHandle | undefined> {
   return resolveLocator(page, locator).catch(() => undefined);
 }
@@ -812,7 +800,6 @@ async function findGenericCommit(page: Page): Promise<ElementHandle | undefined>
   return undefined;
 }
 
-/** Reads the checkout `target` commits, the approved one `expected` names, or the page's one commit control. */
 async function readGenericPurchase(
   page: Page,
   target?: ElementHandle,
@@ -867,8 +854,8 @@ async function readGenericPurchase(
 }
 
 /**
- * Waits for a press's result (KTD4): every document it loads, in any frame, through its redirects, until the
- * page is still; a press that loads nothing is given a short settle. Starts listening before the press.
+ * Waits for a press's result: every document it loads, in any frame, through its redirects, until the page is
+ * still; a press that loads nothing is given a short settle. Starts listening before the press.
  */
 async function waitForGenericResult(page: Page, timeoutMs: number): Promise<void> {
   const deadline = Date.now() + timeoutMs;
@@ -912,22 +899,21 @@ async function waitForGenericResult(page: Page, timeoutMs: number): Promise<void
   }
 }
 
-/** What a page shows after a press: a decline, or another failure. */
 export function pressRefusal(lines: readonly string[]): 'declined' | 'failed' | undefined {
   if (lines.some((line) => VOCABULARY.decline.test(line))) return 'declined';
   return lines.some((line) => VOCABULARY.failure.test(line)) ? 'failed' : undefined;
 }
 
-/** Whether a confirmation is the merchant's own, or its payment platform's: a document on another site proves nothing of its attempt. */
+/** A confirmation on any site but the merchant's or its payment platform's proves nothing of its attempt. */
 export function confirmsOnSite(confirmation: ConfirmationEvidence, site: string, platform?: string): boolean {
   const at = siteOf(confirmation.source);
   return at !== undefined && (at === site || at === platform);
 }
 
 /**
- * What a confirmation page proves of a paid attempt on an unreviewed site (KTD8): an order number on a document
- * of its merchant or payment platform, and any charge it states in the attempt's currency at its total or its
- * amount due now. The attempt's contact email keys the order number (KTD5).
+ * What a confirmation page proves of a paid attempt on an unreviewed site: an order number on a document of its
+ * merchant or payment platform, and any charge it states in the attempt's currency at its total or its amount due
+ * now. The attempt's contact email keys the order number.
  */
 async function readGenericEvidence(
   page: Page,
@@ -960,8 +946,8 @@ async function readGenericEvidence(
 }
 
 /**
- * The generic signature: any web page no reviewed signature matches. It has no reviewed routes or controls, and
- * no merchant records of its own: a confirmation page proves what it placed.
+ * Covers any web page no reviewed signature matches. It has no reviewed routes or controls, and no merchant
+ * records of its own: a confirmation page proves what it placed.
  */
 export const genericCheckoutSignature: MerchantSignature = {
   id: GENERIC_FLOW_ID,
@@ -969,7 +955,6 @@ export const genericCheckoutSignature: MerchantSignature = {
   matches: (url) => url.protocol === 'https:' || url.protocol === 'http:',
   classifyControl: () => Promise.resolve(undefined),
   classifyNavigation: () => undefined,
-  /** The generic verifier (KTD4): a connected, visible, enabled control on this page. */
   async verifyPurchaseControl(page, element) {
     const frame = await element.ownerFrame();
     return Boolean(frame && frame.page() === page && (await element.isVisible()) && (await element.isEnabled()));

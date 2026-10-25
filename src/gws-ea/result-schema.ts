@@ -1,4 +1,4 @@
-/** Published schemas for the managed wire contract and native result facts. */
+/** The result schemas command discovery publishes: the machine-readable wire contract. */
 import type { ResultSchema } from './command-definitions.js';
 import { VOICE_CAPABILITY } from './capabilities.js';
 import { OPERATION_PHASES } from './operation.js';
@@ -7,7 +7,7 @@ import { ARTIFACTS_CAPABILITY } from './artifacts-capability.js';
 import { ONEPASSWORD_CAPABILITY, ONEPASSWORD_PENDING_REASONS, ONEPASSWORD_SKIP_REASONS } from './onepassword.js';
 
 const text = { type: 'string' } as const;
-/** Native protocol text shares the published string shape, but retains its producer semantics. */
+// Distinct objects with the plain string shape: result.ts's redaction recognizes these protocol strings by identity.
 export const ERROR_CODE_SCHEMA = { type: 'string' } as const;
 export const RESUME_FLAGS_SCHEMA = { type: 'string' } as const;
 export const PROVISION_PHASE_SCHEMA = { type: 'string' } as const;
@@ -623,7 +623,6 @@ export function operationDataSchema(command: string): ResultSchema {
       throw new Error(`No operation data schema for ${command}`);
   }
 }
-/** Each command publishes its whole result, including normally handled error/pause paths. */
 export function managedResultSchema(data: ResultSchema): ResultSchema {
   return object({
     schema_version: { const: 1 },

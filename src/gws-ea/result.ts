@@ -9,7 +9,6 @@ import {
   type ResultSchema,
 } from './command-definitions.js';
 import type { StartOutcome, StopOutcome, RestartOutcome } from './service-control.js';
-/** Managed invocation facts, shared by the terminal and machine boundaries. */
 import type { ProvisionHumanPause } from './phases.js';
 import { redact, safeErrorCode, safeErrorMessage } from './redact.js';
 import { ERROR_CODE_SCHEMA, PROVISION_PHASE_SCHEMA, RESUME_FLAGS_SCHEMA } from './result-schema.js';
@@ -107,7 +106,6 @@ export function managedResult<T>(
     diagnostics: facts.diagnostics ?? {},
   };
 }
-/** Only declared literals at their own schema locations are protocol text; all other data stays redacted. */
 function schemaVariants(schema: unknown): readonly ResultSchema[] {
   if (!isRecord(schema)) return [];
   return [
@@ -168,6 +166,7 @@ function redactCommandArgv(argv: readonly string[]): readonly string[] {
   return [...argv.slice(0, offset), ...redactArguments(argv.slice(offset), command)];
 }
 
+/** A string is protocol text, left unredacted, only where the result schema declares it; all other data is redacted. */
 function redactValues(value: unknown, schemas: readonly ResultSchema[] = []): unknown {
   if (typeof value === 'string') {
     if (

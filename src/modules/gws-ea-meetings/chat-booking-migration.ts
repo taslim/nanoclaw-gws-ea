@@ -1,6 +1,6 @@
 import type { ModuleMigration } from '../../db/migrations/index.js';
 
-/** Keep an authorized mutation until Google and main's note are confirmed, before answering its tool. */
+/** Chat booking requests, kept so Google's write and main's note are confirmed before the tool is answered. */
 export const chatBookingRequestsMigration: ModuleMigration = {
   version: 1,
   name: 'module:gws-ea-meetings:chat-booking-requests',

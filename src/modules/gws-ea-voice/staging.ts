@@ -21,7 +21,7 @@ export class VoiceMediaError extends Error {
   }
 }
 
-/** Only inline bytes or native adapter-owned files beneath this instance's root. */
+/** Accepts only inline bytes or a file this user owns beneath `attachmentRoot`. */
 export async function readOriginalAudio(
   attachment: Readonly<Record<string, unknown>>,
   attachmentRoot: string,

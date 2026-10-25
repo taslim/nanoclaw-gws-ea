@@ -221,7 +221,7 @@ it('does not guess missing or ambiguous emissions, and never exports arbitrary r
   expect(JSON.stringify(evidence)).not.toContain(canary);
 });
 
-it('records an unconfirmed purchase as its operational code, never its attempt id (KTD18)', async () => {
+it('records an unconfirmed purchase as its operational code, never its attempt id', async () => {
   // The agent-runner's description test holds every code with an underscore that a browser tool names to this same
   // list; `unconfirmed` has none, so its place in the list is proven here.
   await getDb().run(

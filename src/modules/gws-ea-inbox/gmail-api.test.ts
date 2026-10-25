@@ -1,5 +1,5 @@
 /**
- * The host's Gmail client as a matter reads a thread (KTD5): one request for
+ * The host's Gmail client as a matter reads a thread: one request for
  * the thread's messages with only their headers, which name who wrote each,
  * when and about what beside the headers a send is found by, and Gmail's own
  * excerpt of each. Nothing of a message's body is fetched.

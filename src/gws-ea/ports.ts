@@ -5,7 +5,10 @@ import { GwsEaError, type AllocatedPorts } from './types.js';
 
 export type AllocatedPortName = keyof AllocatedPorts;
 
-/** OneCLI's two loopback ports, held until the reservation that claims them is written. */
+/**
+ * OneCLI's two loopback ports, held until the reservation that claims them is
+ * written; from then on the registry's claims keep them unique among assistants.
+ */
 export interface HeldLoopbackPorts {
   readonly ports: AllocatedPorts;
   release(): Promise<void>;
@@ -31,11 +34,6 @@ async function listenLoopback(server: Server): Promise<number> {
   return address.port;
 }
 
-/**
- * Allocate two distinct loopback ports. They stay held until the caller
- * releases them after reserving; the registry's port claims keep them unique
- * among assistants from then on, and each runtime binds its own on start.
- */
 export async function holdLoopbackPorts(): Promise<HeldLoopbackPorts> {
   const servers = [createServer(), createServer()] as const;
   const release = async (): Promise<void> => {
@@ -52,16 +50,12 @@ export async function holdLoopbackPorts(): Promise<HeldLoopbackPorts> {
   return { ports: { onecli_app: onecliApp, onecli_gateway: onecliGateway }, release };
 }
 
-/** The process listening on a TCP port, as `lsof` names it. */
 export interface PortHolder {
   readonly pid: number;
   readonly command: string | undefined;
 }
 
-/**
- * Who listens on `port`, where `lsof` can tell: undefined when nothing does,
- * or when `lsof` is missing or cannot say.
- */
+/** Undefined when nothing listens on `port`, or when `lsof` is missing or cannot say. */
 export async function findPortHolder(
   port: number,
   run: SanitizedCommandRunner = runSanitizedCommand,
@@ -88,7 +82,6 @@ export async function findPortHolder(
   return { pid, command: fields.find((field) => field.startsWith('c'))?.slice(1) || undefined };
 }
 
-/** A foreign process holds one of this assistant's allocated ports: name it. */
 export function portInUseError(label: string, port: number, holder: PortHolder, cause?: unknown): GwsEaError {
   const who = holder.command ? `${holder.command} (pid ${holder.pid})` : `pid ${holder.pid}`;
   return new GwsEaError(

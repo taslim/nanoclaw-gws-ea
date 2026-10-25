@@ -1,12 +1,10 @@
 /**
- * The matter a tool's request names (KTD11): `main` names one of its open
- * matters, and what the tool writes joins it. `create_event`,
- * `change_guests` and `respond_to_event` link their event, and
- * `email_handoff` its thread.
+ * The matter a tool's request names: `main` names one of its open matters, and
+ * what the tool writes joins it.
  *
  * The matter is checked before the tool writes anything, so a refusal writes
  * nothing; what the tool wrote stands whether or not it then joins. Matters
- * are main's alone (R8), so a request from any other group that names one is
+ * are main's alone, so a request from any other group that names one is
  * refused.
  */
 import { forbidden, invalidArgs } from '../../cli/delivery-action.js';
@@ -17,7 +15,6 @@ import { getMatter, placeInMatter, type LinkRef } from './db.js';
 
 const MATTER_ID = /^m-[0-9a-f]{12}$/u;
 
-/** The open matter a request's `matter` names, or undefined when it names none. */
 export async function requestedMatter(value: unknown, session: Session): Promise<string | undefined> {
   if (value === undefined || value === null) return undefined;
   if (session.agent_group_id !== (await getMainAgentGroupId())) {
@@ -33,10 +30,7 @@ export async function requestedMatter(value: unknown, session: Session): Promise
   return matter.id;
 }
 
-/**
- * `piece`, which the tool wrote, joins the matter its request named: the
- * sentence the tool's answer ends with, saying so, or why it did not.
- */
+/** Answers the sentence the tool's answer ends with: that `piece` joined the matter, or why it did not. */
 export async function joinRequestedMatter(matterId: string, piece: LinkRef): Promise<string> {
   /* eslint-disable no-catch-all/no-catch-all -- what the tool wrote stands; its answer says it did not join, never that the write failed */
   try {

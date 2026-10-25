@@ -1,16 +1,10 @@
 /**
- * A matter as `main` reads it (KTD5): one renderer for `ncl matters get`, a
- * look, a note about one of its links (KTD11), and placement. Its title and
- * open loop, its next look as its scheduled task holds it (KTD4), for a
- * strand its project's open loop and a line for each other strand (R30), for
- * a project its strands, and each link as its source says it is now
- * (`live.ts`). Every time is in the principal's zone, and every render says
- * when its links were read, so an old one is never taken for the present.
+ * A matter as `main` reads it, from one renderer wherever main reads a matter,
+ * and the open list placement shows beside a new piece. Every time is in the
+ * principal's zone, and every render says when its links were read, so an old
+ * one is never taken for the present.
  *
- * Beside it, the open list placement shows (R10): each open matter's title
- * and open loop, strands under their project.
- *
- * Bare data for `main`, never words for the principal (R6).
+ * Bare data for `main`, never words for the principal.
  */
 import { CronExpressionParser } from 'cron-parser';
 
@@ -29,7 +23,6 @@ export async function principalTimezone(): Promise<string> {
   return mainAgentGroupId === null ? TIMEZONE : resolveGroupTimezone(mainAgentGroupId);
 }
 
-/** A matter's next look as its scheduled task holds it now. */
 export interface NextLookView {
   /** When it next comes, ISO. */
   readonly at: string;
@@ -38,11 +31,7 @@ export interface NextLookView {
   readonly paused: boolean;
 }
 
-/**
- * The look task `taskId` names, while it is still to come, from whichever of
- * `main`'s conversations holds it; undefined when none does. The task is the
- * matter's only clock (KTD4).
- */
+/** Undefined when none of `main`'s conversations holds the task still to come. */
 export async function readNextLook(taskId: string): Promise<NextLookView | undefined> {
   const mainAgentGroupId = await getMainAgentGroupId();
   if (mainAgentGroupId === null) return undefined;
@@ -75,7 +64,6 @@ function strandLine(strand: { readonly id: string; readonly title: string; reado
   return `- ${strand.id}, ${strand.open ? 'open' : 'closed'}: ${strand.title}`;
 }
 
-/** A strand's project: its open loop, and a line for each of its other strands (R30). */
 function projectLines(matter: Matter, project: Matter | undefined): string[] {
   if (project === undefined) return [];
   const others = project.strands.filter((strand) => strand.id !== matter.id);
@@ -87,17 +75,11 @@ function projectLines(matter: Matter, project: Matter | undefined): string[] {
   ];
 }
 
-/** Who a render may name and the zone it gives times in, as they stand now. */
 export async function principalLens(): Promise<Lens> {
   return loadLens(await principalTimezone());
 }
 
-/**
- * The matter as it stands now, every link read fresh from its source by the
- * host's own Google clients, or by `sources` when given. A link whose source
- * fails or is late says so; the rest render all the same. `given` is the
- * lens a caller rendering several matters read once for all of them.
- */
+/** `given` is the lens a caller rendering several matters reads once for all of them. */
 export async function renderMatter(
   matter: Matter,
   sources: LiveSources = hostSources(),
@@ -128,7 +110,6 @@ function indented(text: string, indent: string): string[] {
   return text.split('\n').map((line) => `${indent}${line}`);
 }
 
-/** Every open matter's title and open loop, as `listOpenMatters` orders them, each project's strands under it. */
 export function renderOpenList(matters: readonly OpenMatterSummary[]): string {
   if (matters.length === 0) return 'Open matters: none.';
   return [

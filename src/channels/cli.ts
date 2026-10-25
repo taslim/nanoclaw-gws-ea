@@ -247,9 +247,8 @@ function createAdapter(): ChannelAdapter {
             sender: typeof payload.sender === 'string' ? payload.sender : 'cli',
             senderId: typeof payload.senderId === 'string' ? payload.senderId : `cli:${PLATFORM_ID}`,
           }),
-          // A caller-supplied ID is accepted only on this owner-only routed
-          // opcode. It makes installation bootstrap safely retryable without
-          // changing ordinary chat's random-ID semantics.
+          // Only this owner-only routed path accepts a caller's ID, so bootstrap can retry
+          // without a duplicate while ordinary chat keeps random IDs.
           deduplicate: suppliedId !== undefined,
         },
         replyTo: replyTo ?? undefined,

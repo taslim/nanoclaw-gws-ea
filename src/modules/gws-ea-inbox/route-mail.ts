@@ -1,53 +1,46 @@
 /**
- * Where each message goes (KTD1, KTD4, KTD9): to the part allowed to write to
- * everyone who can read it (R63), decided per message from who Gmail says
- * sent it and who it shows on it, never from where its thread began.
+ * Where each message goes: to the part allowed to write to everyone who can
+ * read it, decided per message from who Gmail says sent it and who it shows
+ * on it, never from where its thread began.
  *
- * - Google Calendar's mail, its own notifications and what it sends in
- *   someone's name (a guest's answer, an invitation) that Google signed
- *   (KTD12): one body-free note for `main` per poll, batched by the caller,
- *   when it is about an event on a principal calendar or the assistant's
- *   own, unless it is about the assistant's own change. Google-signed mail
- *   about any other calendar, or with no event link, goes by its From like
- *   any other mail.
- * - Google Docs' and Drive's activity mail: read only for the file, any
- *   comment, and the kind of activity, then batched by the caller into one
- *   note for `main` per poll (gws-ea-workspace/notices.ts). Each actor
- *   Google's Reply-To names but the principal is rate-limited.
+ * - Google Calendar's own notifications that Google signed: one body-free
+ *   note for `main` per poll, batched by the caller, when it is about an
+ *   event on a principal calendar or the assistant's own, unless it is about
+ *   the assistant's own change. Any other, or one naming no event the host
+ *   can read, reaches no agent. What Calendar sends in someone's name (a
+ *   guest's answer, an invitation) that Google signed joins that note on the
+ *   same terms, and otherwise goes by its From like any other mail.
+ * - Google Docs' and Drive's activity mail that Google signed: read into a
+ *   notice (gws-ea-workspace/notices.ts), then batched by the caller into one
+ *   note for `main` per poll. Each actor Google's Reply-To names but the
+ *   principal is rate-limited.
  * - Mail claiming either kind of Google sender that Google did not sign:
  *   dropped as forged.
- * - Auto-submitted mail, bounces, mailing lists, and bulk mail: archived.
+ * - Auto-submitted mail, bounces, mailing lists, and bulk mail: settled with
+ *   no agent reading it.
  * - The principal, as Gmail verified them, with no one but their addresses
  *   and the assistant on To and Cc: `main`, in the principal's own email
  *   conversation (`email:principal`).
  * - Everything else: `external-email`'s session for its thread, in the inbox
  *   (`email:inbox`), held there until `main` places the thread and hands it
- *   over (Slice 5 R9, KTD8). Mail main must place a thread for, or hand one
- *   over for, reaches main in one waking note per poll, batched by the
- *   caller: an outsider's email framed untrusted, or the principal's own
- *   words, never what they quote, as their instruction (R66), with the open
- *   matters beside a thread to place and the matter a placed one sits in.
- *   Once main hands a thread over, it reads only the principal's words in
- *   it, as information: one note for each message at most.
+ *   over. Meanwhile main hears of it in one waking note per poll, batched by
+ *   the caller: an outsider's email framed untrusted, or the principal's own
+ *   words, never what they quote, as their instruction. Main is asked once to
+ *   place a thread, so an outsider's later mail on it waits with the first,
+ *   unannounced. Once main hands a thread over, it reads only the principal's
+ *   words in it, as information: one note for each message at most.
  * - Of those, mail showing one of the principal's addresses that Gmail could
- *   not verify (R5, KTD3): the principal hears once for each address and
- *   reason, in their direct message, and `main` holds the same fact, until
- *   Gmail next verifies mail from that address.
+ *   not verify: the principal hears once for each address and reason, in
+ *   their direct message, and `main` holds the same fact, until Gmail next
+ *   verifies mail from that address.
  *
- * Each message is recorded in its thread (thread-map.ts), with its side and
- * the addresses it carried. `main` reads a thread's `mail-…` key last, after
- * the people and words it is about, since it names threads by it;
- * `external-email` works in one thread and never needs it. Every sender but
- * the principal is rate-limited per hour, on a message's first routing only,
- * and unverified mail in the principal's name as the address they listed.
- * What anyone but the principal wrote, and every message's From, To, Cc and
- * Reply-To as written, display names included, and its subject, reach an
- * agent framed as untrusted; the host's own words say only what Gmail and the
- * people store know of the sender (KTD4): the principal by name, a verified
- * sender with their level (and for `main` alone, their name in the store),
- * and an unverified one as unknown. The principal's words are theirs, and
- * what they quote or forward is not. Each message's files travel with it for
- * core to stage into the receiving session (KTD9).
+ * Every sender but the principal is rate-limited per hour, on a message's
+ * first routing only, and unverified mail in the principal's name as the
+ * address they listed. What anyone but the principal wrote, and every
+ * message's From, To, Cc and Reply-To as written, display names included,
+ * and its subject, reach an agent framed as untrusted; the host's own words
+ * say only what Gmail and the people store know of the sender. The
+ * principal's words are theirs, and what they quote or forward is not.
  */
 import { createHash } from 'node:crypto';
 
@@ -124,7 +117,7 @@ export const MESSAGES_PER_SENDER_PER_HOUR = 10;
 /** Gmail's largest attachment; a bigger file arrives as a note with its name and size. */
 export const MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024;
 const BODY_LIMIT = 20_000;
-/** The most of an email main reads to place its thread: external-email reads it whole. */
+/** The most of an outsider's held email that main reads; external-email reads up to `BODY_LIMIT`. */
 const PLACEMENT_LIMIT = 4_000;
 const WORDS_LIMIT = 8_000;
 const HEADERS_LIMIT = 2_000;
@@ -133,9 +126,8 @@ const LINE_LIMIT = 300;
 export interface RoutingContext {
   readonly assistant: ReadonlySet<string>;
   readonly auth: AuthContext;
-  /** The principal's calendars in the assistant's list, lowercased. */
+  /** The principal's calendars in the assistant's calendar list, lowercased as notices name them. */
   readonly principalCalendars: ReadonlySet<string>;
-  /** The principal's name and timezone, as the profile holds them; the install's timezone when it holds none. */
   readonly principal: { readonly name: string | null; readonly timezone: string };
   readonly at: Date;
 }
@@ -154,7 +146,7 @@ export async function loadRoutingContext(assistant: ReadonlySet<string>, at: Dat
   };
 }
 
-/** An email that waits, held, for main to place its thread or hand it over (Slice 5 KTD8), for the caller to batch. */
+/** An email held for main to place its thread or hand it over, for the caller to batch into one note. */
 export interface HeldMail {
   readonly threadKey: string;
   /** main has placed the thread, so the email waits only for main's handoff. */
@@ -177,13 +169,11 @@ function settled(outcome: RouteOutcome): Routed {
 type Principal = Extract<SenderVerdict, { kind: 'principal' }>;
 type Sender = Exclude<SenderVerdict, { kind: 'calendar-notification' | 'workspace-notification' }>;
 
-/** Precedence values of mail sent in bulk rather than written to the assistant. */
 const BULK_PRECEDENCE: ReadonlySet<string> = new Set(['bulk', 'list', 'junk']);
 
 /**
- * Auto-submitted mail, automatic replies, bounces, mailing lists, and bulk
- * mail: archived unread. An unsubscribe link alone is not enough: a person
- * may write from a sales tool that adds one.
+ * Mail no person wrote to the assistant. An unsubscribe link alone is not
+ * enough: a person may write from a sales tool that adds one.
  */
 function isAutomated(mail: ParsedMail): boolean {
   const autoSubmitted = headerValue(mail.headers, 'Auto-Submitted')?.split(';')[0]?.trim().toLowerCase();
@@ -207,9 +197,8 @@ async function overRateLimit(sender: string, at: Date): Promise<boolean> {
 }
 
 /**
- * Whether only the principal and the assistant can read it: Gmail verified
- * the principal sent it, and To and Cc name no one else. A To or Cc the host
- * cannot read as mailboxes rules no one out, so the message is outside.
+ * Whether only the principal and the assistant can read it. A To or Cc the
+ * host cannot read as mailboxes rules no one out, so the message is outside.
  */
 function isPrincipalOnly(mail: ParsedMail, verdict: SenderVerdict, context: RoutingContext): verdict is Principal {
   if (verdict.kind !== 'principal') return false;
@@ -222,24 +211,19 @@ function isPrincipalOnly(mail: ParsedMail, verdict: SenderVerdict, context: Rout
   );
 }
 
-/** An email address as people write one in a sentence. */
 const WRITTEN_ADDRESS = /[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}/gu;
 
 /**
- * Addresses a sender wrote in their own words, never in what they quoted: how
- * a participant loops someone in (R68), since they could forward the thread
- * to that person anyway.
+ * How a participant loops someone in: an address they wrote in their own
+ * words, never in what they quoted, since they could forward the thread to
+ * that person anyway.
  */
 function writtenAddresses(mail: ParsedMail): string[] {
   const { own } = splitQuoted(mail.text, mail.subject);
   return [...own.matchAll(WRITTEN_ADDRESS)].map(([address]) => address.toLowerCase());
 }
 
-/**
- * Record the message in its thread, a new one when it belongs to none: its
- * side, the addresses it carried, and for an outside message the addresses
- * its sender wrote. Safe to repeat. Returns the thread key.
- */
+/** Safe to repeat. Returns the thread key, a new thread's when the message belongs to none. */
 async function recordInThread(mail: ParsedMail, side: ThreadSide, context: RoutingContext): Promise<string> {
   const at = context.at.toISOString();
   const ours = (address: string): boolean => context.assistant.has(address);
@@ -273,7 +257,7 @@ async function recordInThread(mail: ParsedMail, side: ThreadSide, context: Routi
 // Files
 // ---------------------------------------------------------------------------
 
-/** A file as core stages it into the receiving session's own inbox (KTD9). */
+/** A file as core stages it into the receiving session's own inbox. */
 interface StagedFile {
   readonly name?: string;
   readonly mimeType: string;
@@ -334,20 +318,17 @@ function unfetchedLine(files: Files): string {
 
 const LIST = new Intl.ListFormat('en', { style: 'long', type: 'conjunction' });
 
-/** Words or addresses in a sentence: "a", "a and b", "a, b, and c". */
 export function listed(items: readonly string[]): string {
   return LIST.format(items);
 }
 
-/** The principal as the agents read them: by name, or as "the principal" when the profile has none. */
 function principalName(context: RoutingContext): string {
   return context.principal.name ?? 'the principal';
 }
 
-/** Who reads a message: `external-email` never learns a person record's name, only its level. */
+/** `external-email` never learns a person record's name, only its level. */
 type Reader = 'main' | 'external-email';
 
-/** What the people store holds of a verified sender: their level, and for main their name. */
 async function senderRecord(
   address: string,
   reader: Reader,
@@ -361,7 +342,7 @@ async function senderRecord(
   return person === undefined ? undefined : { level: person.level, name: person.name };
 }
 
-/** A level as the relationship it stands for, in a clause about the sender: never the level's own name. */
+/** The relationship a level stands for, never the level's own name. */
 function levelClause(level: PersonLevel, principal: string): string {
   switch (level) {
     case 'inner-circle':
@@ -379,11 +360,7 @@ function levelClause(level: PersonLevel, principal: string): string {
   }
 }
 
-/**
- * Who sent it, as Gmail verified them, in one sentence: the principal by
- * name, anyone else by address with what the people store holds of them, and
- * an unverified sender as unknown, never by the From they claim.
- */
+/** An unverified sender is unknown, never named by the From they claim. */
 async function senderLine(verdict: Sender, context: RoutingContext, reader: Reader): Promise<string> {
   const principal = principalName(context);
   switch (verdict.kind) {
@@ -408,7 +385,6 @@ async function senderLine(verdict: Sender, context: RoutingContext, reader: Read
   }
 }
 
-/** Everyone the email carried but the principal and the assistant, by address. */
 function othersOn(mail: ParsedMail, context: RoutingContext): string[] {
   return [
     ...new Set(
@@ -419,13 +395,8 @@ function othersOn(mail: ParsedMail, context: RoutingContext): string[] {
   ];
 }
 
-/** The headers that say who an email is from and to, which a reader sees with their display names. */
 const ADDRESS_HEADERS = ['From', 'To', 'Cc', 'Reply-To'] as const;
 
-/**
- * Who the email names, as its sender wrote them ("Dana Lee <dana@x>"), each
- * header on its own line, and its subject. Reply-To only when it has one.
- */
 function headerLines(mail: ParsedMail): string {
   const named = ADDRESS_HEADERS.flatMap((name) => {
     const value = decodeEncodedWords(headerValues(mail.headers, name).join(', ')).replace(/\s+/gu, ' ').trim();
@@ -434,12 +405,10 @@ function headerLines(mail: ParsedMail): string {
   return [...named, `Subject: ${mail.subject}`].join('\n');
 }
 
-/** The whole email, as anyone but the principal wrote it, up to `limit`: untrusted, its headers included. */
 function wholeMessage(mail: ParsedMail, limit = BODY_LIMIT): string {
   return untrusted(`${headerLines(mail)}\n\n${mail.text}`, limit);
 }
 
-/** Everyone the email's To and Cc name but the principal, the assistant and `sender`, by address. */
 function copiedOn(mail: ParsedMail, context: RoutingContext, sender?: string): string[] {
   return [
     ...new Set(
@@ -454,10 +423,8 @@ function copiedOn(mail: ParsedMail, context: RoutingContext, sender?: string): s
 }
 
 /**
- * The principal's email: its headers as written, untrusted, then their own
- * words, which instruct, and what they quote or forward, which does not.
- * When they wrote nothing, it says so, so nothing after it (a quote, or a
- * file and its speech) reads as their words.
+ * When the principal wrote nothing of their own, it says so, so nothing after
+ * it (a quote, or a file and its speech) reads as their words.
  */
 function principalWords(mail: ParsedMail, instruction: string): string {
   const { own, quoted } = splitQuoted(mail.text, mail.subject);
@@ -469,9 +436,9 @@ function principalWords(mail: ParsedMail, instruction: string): string {
 }
 
 /**
- * An email row: its text, its files, and its sender only when Gmail verified
- * them. The principal is their address as listed, whatever spelling they
- * wrote from, since only that spelling is a member of `main` (R2).
+ * The sender only when Gmail verified them. The principal is their address
+ * as listed, whatever spelling they wrote from, since only that spelling is
+ * a member of `main`.
  */
 function emailRow(
   mail: ParsedMail,
@@ -501,7 +468,7 @@ function emailRow(
 // Writing
 // ---------------------------------------------------------------------------
 
-/** Hand a row to the router; one an earlier attempt already wrote into its session is not written twice. */
+/** A row an earlier attempt already wrote into its session is not written twice. */
 async function deliver(
   runtime: InboxRuntime,
   platformId: string,
@@ -518,7 +485,7 @@ async function deliver(
   }
 }
 
-/** A note in `main`'s own session, with the matters of the pieces it is about; writing the same id again is a no-op. */
+/** Writing the same id again is a no-op. */
 async function writeMainNote(note: Pick<NoteForMain, 'id' | 'text' | 'wake' | 'pieces'>, at: Date): Promise<void> {
   const result = await writeNoteForMain({ ...note, timestamp: at.toISOString() });
   if (result === 'no-main' || result === 'no-principal') {
@@ -550,14 +517,13 @@ async function toMain(
   return settled('principal');
 }
 
-/** Why Gmail could not confirm the principal sent it, as main reads it. */
 function refusalClause(reason: PrincipalRefusal, address: string): string {
   switch (reason) {
     case 'no-gmail-results':
       return "Gmail's own check of it is missing";
     case 'sender-differs':
       return 'it names a different Sender';
-    // Mail with a List-Id is archived before any notice (KTD3), so this stays only to cover every reason the check gives.
+    // Mail with a List-Id is settled as automated before any notice, so this case only keeps the switch exhaustive.
     case 'mailing-list':
       return 'it came through a mailing list';
     case 'no-own-dkim':
@@ -572,11 +538,9 @@ function refusalClause(reason: PrincipalRefusal, address: string): string {
 }
 
 /**
- * Unsigned mail in the principal's name (R5, KTD3): the principal hears once
- * for each address and reason, by when Gmail received it, and main holds the
- * same fact, its subject framed as the sender's. Recorded before anyone is
- * told, so neither a retry nor a failed send repeats it, and a lost word is
- * not sent again.
+ * The principal hears once for each address and reason, and main holds the
+ * same fact. Recorded before anyone is told, so neither a retry nor a failed
+ * send repeats it, and a lost word is not sent again.
  */
 async function noticeUnsigned(
   mail: ParsedMail,
@@ -607,16 +571,14 @@ async function noticeUnsigned(
   }
 }
 
-/** What new mail in a thread waits for: main to place the thread, or, placed, only main's handoff. */
 type Awaiting = 'placement' | 'handoff';
 
-/** external-email's session for the thread, once mail or a handoff has opened one. */
+/** Undefined until mail or a handoff opens one. */
 async function threadSession(threadKey: string): Promise<Session | undefined> {
   const { inbox } = await emailMessagingGroupIds();
   return inbox === null ? undefined : findSession(inbox, threadKey);
 }
 
-/** Settle, unread, what is held in the thread's session: main placed it in no matter and never handed it over. */
 async function settleHeldMail(threadKey: string): Promise<void> {
   const session = await threadSession(threadKey);
   if (session === undefined) return;
@@ -624,9 +586,9 @@ async function settleHeldMail(threadKey: string): Promise<void> {
 }
 
 /**
- * Release what is held in a thread's session, as main's handoff does: it
- * joins the mail already waiting there, or is due now when none is. Returns
- * when it is due, null for now, which wakes nothing until the caller does.
+ * As main's handoff does: what is held joins the mail already waiting there,
+ * or is due now when none is. Returns when it is due; null means now, and
+ * nothing wakes the session until the caller does.
  */
 export async function releaseHeldMail(session: Session): Promise<string | null> {
   const processAfter = await pendingDeadline(session);
@@ -637,11 +599,10 @@ export async function releaseHeldMail(session: Session): Promise<string | null> 
 }
 
 /**
- * What new mail in the thread waits for (KTD8), or undefined once main has
- * handed the thread over. A thread in no matter that main has not handed
- * over since, placed nowhere or left there as its matter closed, waits to be
- * placed again, and what was held in it until now is settled unread, so a
- * later handoff never brings it back.
+ * Undefined once main has handed the thread over. A thread in no matter that
+ * main has not handed over since, placed nowhere or left there as its matter
+ * closed, waits to be placed again, and what was held in it until now is
+ * settled unread, so a later handoff never brings it back.
  */
 async function awaitedBy(threadKey: string): Promise<Awaiting | undefined> {
   const state = await threadPlacement(threadKey);
@@ -665,11 +626,8 @@ async function awaitedBy(threadKey: string): Promise<Awaiting | undefined> {
 }
 
 /**
- * What main reads of an email that waits for it: an outsider's, framed
- * untrusted, with who sent it and who else it names; or the principal's own
- * words, never what they quote, as their instruction (R66). A thread to
- * place brings the open matters it may belong to, and a placed one the
- * matter it sits in (KTD10, KTD11).
+ * A thread to place brings the open matters it may belong to, from who sent
+ * the email and what it answers; a placed one, the matter it sits in.
  */
 async function heldMail(
   mail: ParsedMail,
@@ -724,7 +682,7 @@ async function toThread(
   const files = await fetchFiles(runtime.gmail, mail);
 
   // One note for main at most: on a thread external-email works, the principal's own words, which external-email acts
-  // on there. main acts only on a part external-email hands it, so each ask has one actor (KTD13).
+  // on there. main acts only on a part external-email hands it, so each ask has one actor.
   if (awaiting === undefined && verdict.kind === 'principal') {
     const { own } = splitQuoted(mail.text, mail.subject);
     const others = othersOn(mail, context);
@@ -749,8 +707,8 @@ async function toThread(
   if (refused !== undefined) await noticeUnsigned(mail, refused, threadKey, context);
 
   // external-email works in this one thread, and reads whom the email names from its headers. The principal's words
-  // instruct it on this thread; what they ask beyond it, it hands to main (KTD13). What they attach is information,
-  // a recording as much as a file, so its files, which render after this text, are framed as theirs to pass to main.
+  // instruct it on this thread; what they ask beyond it, it hands to main. What they attach is information, a
+  // recording as much as a file, so its files, which render after this text, are framed as theirs to pass to main.
   /** to: external-email */
   const text =
     `${await senderLine(verdict, context, 'external-email')}\n` +
@@ -784,19 +742,20 @@ async function toThread(
   return { kind: 'held', held: await heldMail(mail, verdict, threadKey, awaiting, context) };
 }
 
-/** Whether a calendar notice is about an event on a principal calendar or the assistant's own. */
 function onKnownCalendar(notice: CalendarNotice, context: RoutingContext): boolean {
   return context.principalCalendars.has(notice.calendarId) || context.assistant.has(notice.calendarId);
 }
 
-/** Calendar news for the caller to batch, unless it is about the assistant's own recent change. */
 function calendarNews(notice: CalendarNotice, context: RoutingContext): Routed {
   return consumeOwnCalendarChange(notice.calendarId, notice.eventId, context.at)
     ? settled('calendar-own-change')
     : { kind: 'calendar', notice };
 }
 
-/** Reserve before normal routing and use a sealed system session with no channel return route. */
+/**
+ * Claimed sign-in mail skips normal routing; while its claim waits, it goes
+ * to a system session with no channel return route.
+ */
 export async function routeSignInMail(mail: ParsedMail, at: Date): Promise<boolean> {
   const profile = await getGwsEaProfile();
   if (principalRecognizer(profile.principal_emails).has(mail.from?.address)) return false;
@@ -851,10 +810,10 @@ export async function routeSignInMail(mail: ParsedMail, at: Date): Promise<boole
 }
 
 /**
- * Route one inbox message. An email that waits on main, a calendar
- * notification, or a Docs or Drive one comes back for the caller to batch.
- * `limited` counts the sender against the hourly limit: a message's first
- * routing does, a retry of one already counted does not.
+ * An email that waits on main, a calendar notification, or a Docs or Drive
+ * one comes back for the caller to batch. `limited` counts the sender against
+ * the hourly limit: a message's first routing does, a retry of one already
+ * counted does not.
  */
 export async function routeMail(
   mail: ParsedMail,
@@ -903,7 +862,7 @@ export async function routeMail(
     });
     return settled('forged-workspace-notification');
   }
-  // What Google Calendar sends in someone's name (KTD12), before the rule for its From refuses it.
+  // What Google Calendar sends in someone's name, before the rule for its From refuses it.
   const signedNotice = signedByGoogle(mail.headers) ? parseCalendarNotification(mail) : undefined;
   if (signedNotice !== undefined && onKnownCalendar(signedNotice, context)) return calendarNews(signedNotice, context);
 
@@ -927,7 +886,7 @@ export async function routeMail(
 // Batched notes
 // ---------------------------------------------------------------------------
 
-/** A key for one poll's batch of messages, the same whichever order they came in, so writing its note again is a no-op. */
+/** Order-independent, so writing the same batch's note again is a no-op. */
 function batchKey(gmailMessageIds: readonly string[]): string {
   return createHash('sha256')
     .update([...gmailMessageIds].sort().join('\u0000'))
@@ -935,17 +894,11 @@ function batchKey(gmailMessageIds: readonly string[]): string {
     .slice(0, 24);
 }
 
-/** What main reads first in the note about email that waits on it. */
 const HELD_INTRO =
   'Email is waiting on you. external-email reads none of it until you hand its thread over, ' +
   'and a thread you have not placed is placed first: in an open matter, a new one, or nowhere.';
 
-/**
- * One waking note for every email of a poll that waits on main (KTD8): each
- * thread to place, with the open matters beside it and those it may belong
- * to, and each thread placed and not yet handed over, with the matter it sits
- * in. Each thread to place counts as asked once the note is written.
- */
+/** One waking note for a poll's held email. Each thread to place counts as asked once the note is written. */
 export async function writeHeldNote(
   held: readonly { readonly gmailMessageId: string; readonly held: HeldMail }[],
   at: Date,
@@ -981,10 +934,7 @@ const CHANGE_WORDS: Readonly<Record<CalendarNotice['change'], string>> = {
   unknown: 'Something changed on an event',
 };
 
-/**
- * Who Calendar names as a new event's organizer, for the open matters it may
- * belong to (KTD10); undefined when Calendar cannot show it just now.
- */
+/** For the open matters a new event may belong to; undefined when Calendar cannot show it just now. */
 async function organizerOf(
   events: Pick<MeetingsCalendarApi, 'getEvent'>,
   notice: CalendarNotice,
@@ -1004,10 +954,9 @@ async function organizerOf(
 }
 
 /**
- * One note for every calendar notification of a poll, each change naming its
- * calendar, with no text from the emails. Each event's open matter comes with
+ * No text from the emails reaches main. Each event's open matter comes with
  * it, and a new event in none brings the open matters its organizer, as
- * Calendar names them, may tie it to (KTD11).
+ * Calendar names them, may tie it to.
  */
 export async function writeCalendarNote(
   notices: readonly { readonly gmailMessageId: string; readonly notice: CalendarNotice }[],

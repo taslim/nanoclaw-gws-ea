@@ -478,7 +478,7 @@ describe('instance roots', () => {
   });
 });
 
-describe('web alias claims (KTD13)', () => {
+describe('web alias claims', () => {
   it("claims, moves and drops one assistant's alias, changing nothing else", async () => {
     const paths = await testPaths();
     const input = reservation();

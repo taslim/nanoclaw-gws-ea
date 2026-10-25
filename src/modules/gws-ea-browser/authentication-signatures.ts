@@ -67,7 +67,7 @@ export function authenticationFieldKind(facts: AuthenticationFieldFacts): Browse
 /**
  * What marks a field's value as a credential, code or payment secret. Both
  * survive a show-password toggle, which only turns a password field's type to
- * text. The page-side scan in observe.ts builds its filter from these sources.
+ * text. The page-side scan in control-facts.ts builds its filter from these.
  */
 export const SECRET_AUTOCOMPLETE = /(?:current-password|new-password|one-time-code|cc-)/iu;
 export const SECRET_DESCRIPTION =
@@ -90,7 +90,6 @@ export function isSensitiveField(facts: SensitiveFieldFacts): boolean {
   );
 }
 
-/** The fields an authorized signup or password change fills, each with the value the host chose for it. */
 export type CredentialFormField = 'username' | 'current_password' | 'new_password' | 'confirmation';
 export type CredentialKind = 'signup' | 'rotation';
 export interface CredentialFieldFacts {
@@ -147,11 +146,7 @@ const VERIFICATION_CODE =
 const NOT_VERIFICATION_CODE =
   /(?:cc-|card|cvc|cvv|zip|postal|promo|coupon|discount|gift|referral|invite|voucher|security.?code|pass(?:word|wd))/iu;
 
-/**
- * A field for the code a new account's verification email carries: a short
- * text field marked as a one-time or verification code, never a payment,
- * address, promotion or password field.
- */
+/** A field for the code a new account's verification email carries. */
 export function verificationCodeFits(facts: CredentialFieldFacts): boolean {
   const description = `${facts.name} ${facts.id}`;
   return (

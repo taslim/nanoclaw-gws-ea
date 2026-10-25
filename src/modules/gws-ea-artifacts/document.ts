@@ -88,7 +88,7 @@ function walk(node: Node, visit: (element: Element) => void): void {
 function removeAttribute(element: Element, name: string): void {
   element.attrs = element.attrs.filter((attribute) => attribute.name !== name);
 }
-/** Bounded, standards-parsed, self-contained source. This validation is not the runtime network boundary. */
+/** Requires a bounded, self-contained source; this validation is not the runtime network boundary. */
 export function parseArtifactDocument(html: string): ArtifactDocument {
   if (Buffer.byteLength(html, 'utf8') > ARTIFACT_DOCUMENT_MAX_BYTES)
     throw new Error('Artifact source exceeds the 4 MiB limit.');
@@ -226,7 +226,6 @@ export function parseArtifactDocument(html: string): ArtifactDocument {
     lang: LANG.test(declaredLang) ? declaredLang : 'en',
   };
 }
-/** Add the trusted response nonce through the parser, including scripts nested in templates. */
 export function artifactExecutableHtml(document: ArtifactDocument, nonce: string): string {
   const parsed = parse(document.html);
   walk(parsed, (element) => {

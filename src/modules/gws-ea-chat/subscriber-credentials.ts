@@ -1,7 +1,7 @@
 /**
- * The subscriber's credential (KTD3, KTD6): the key of the service account
- * that may do nothing but pull the assistant's Chat subscription. It is read
- * from an owner-only file, never the environment, and the access token
+ * The subscriber's credential: the key of the service account that may do
+ * nothing but pull the assistant's Chat subscription. It is read from an
+ * owner-only file, never the environment, and the access token
  * google-auth-library's JWT client mints from it stays in this host's memory.
  */
 import { gaxios, JWT } from 'google-auth-library';
@@ -12,7 +12,6 @@ import { GwsEaError } from '../../gws-ea/types.js';
 import { isRecord } from '../../gws-ea/validation.js';
 import { GoogleApiError } from '../gws-ea-inbox/gmail-api.js';
 
-/** Pulling, acknowledging, and extending leases on a subscription. */
 export const PUBSUB_SCOPE = 'https://www.googleapis.com/auth/pubsub';
 
 /** The subscriber key is missing or unreadable, or Google refuses it. */
@@ -55,15 +54,14 @@ async function readSubscriberKey(file: string): Promise<SubscriberKey> {
 
 export interface SubscriberTokenOptions {
   readonly keyFile: string;
-  /** How the JWT client reaches Google's token endpoint; tests pass a fake. */
   readonly fetch?: typeof globalThis.fetch;
 }
 
 /**
- * A live Pub/Sub token for the subscriber. The key is read at the first call,
- * and again after Google refuses it, so a replaced key is picked up. Google
- * refusing the key is a `SubscriberCredentialError`; failing to reach Google
- * is a retryable `GoogleApiError`.
+ * The key is read at the first call, and again after any failure other than
+ * reaching Google, so a replaced key is picked up. Google refusing the key is
+ * a `SubscriberCredentialError`; failing to reach Google is a retryable
+ * `GoogleApiError`.
  */
 export function createSubscriberToken(options: SubscriberTokenOptions): () => Promise<string> {
   let client: Promise<JWT> | undefined;

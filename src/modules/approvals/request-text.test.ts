@@ -1,5 +1,5 @@
 /**
- * Someone else's text in a request (KTD14): one quoted line, capped, that
+ * Someone else's text in a request: one quoted line, capped, that
  * cannot close its quotes, hide characters, or carry a character reference or
  * Markdown link of its own. Chat's own mention and link markup is the
  * channel's to escape (gws-ea-chat's request-escape test).

@@ -1,4 +1,7 @@
-/** Canonical main's native host requests; no code enters the browser job's conversation. */
+/**
+ * A delegating group's host requests about its browser errands; no code enters the browser job's conversation.
+ * src/modules/gws-ea-browser/guidance.ts decides which groups hold them.
+ */
 import { requestTool } from '../action-request.js';
 import { registerTools } from './server.js';
 

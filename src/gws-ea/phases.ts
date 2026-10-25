@@ -1,9 +1,9 @@
 /**
- * The step engine. Each step owns resources it observes as present,
- * absent, or unknown, and the step is complete only when all are present.
- * A run checks completed runtime steps once, then advances the first
- * incomplete step onward; the journal records only when each step started and
- * completed, so resume needs no attempt bookkeeping.
+ * The step engine. Each step owns resources it observes as present, absent,
+ * or unknown, and the step is complete only when all are present. A run
+ * checks completed runtime steps once, then advances the first incomplete
+ * step onward; the journal keeps each step's start and completion, plus the
+ * last failure, so resume needs no attempt bookkeeping.
  */
 import { setTimeout as delay } from 'node:timers/promises';
 
@@ -19,11 +19,7 @@ import {
 import { activeStep } from './run-log.js';
 import { GwsEaError, PROVISION_STEPS, type ProvisionStepId } from './types.js';
 
-/**
- * Where provisioning paused: a journaled step, or, once every step is
- * complete, the optional vault 1Password enablement gives a new assistant or
- * the web alias an enabled browser needs (KTD13).
- */
+/** The phases beyond the journaled steps are optional resources provisioned once every step is complete. */
 export type ProvisionPausePhase = ProvisionStepId | 'provision_onepassword' | 'provision_alias';
 
 export interface ProvisionHumanPause {
@@ -33,11 +29,10 @@ export interface ProvisionHumanPause {
   readonly message: string;
   readonly details?: readonly string[];
   readonly actionUrl?: string;
-  /** The alias this prompt concerns, or null when the operator must name one. */
+  /** The alias asked about, or null when one must be named; an answer for a since-changed alias is dropped. */
   readonly aliasCandidate?: string | null;
   /** What the resume command adds once the person has acted; with `choices`, the chosen `id` follows it. */
   readonly resumeFlag?: string;
-  /** The options the person picks one of, such as the billing account to link. */
   readonly choices?: readonly { readonly id: string; readonly label: string }[];
   /**
    * Whether what the person was asked to do has happened, checked cheaply and
@@ -73,7 +68,7 @@ export interface StepResource<Context> {
    */
   readonly absentMeansStopped?: boolean;
   readonly observe: (context: Context) => Promise<Observation>;
-  /** Create or repair the resource; returns a pause when only a person can continue. */
+  /** Returns a pause when only a person can continue. */
   readonly apply: (context: Context) => Promise<ProvisionHumanPause | undefined>;
 }
 
@@ -92,11 +87,9 @@ export interface ProvisionStep<Context> {
 
 export type ProvisionSteps<Context> = Readonly<Record<ProvisionStepId, ProvisionStep<Context>>>;
 
-/** Seconds between observations of a resource that is not yet conclusive. */
 export const OBSERVATION_WAITS_SECONDS = [1, 2, 4, 8, 16, 30] as const;
 
 export interface ProvisionRuntime extends StepReporter {
-  /** Waits between observations. */
   readonly sleep?: (milliseconds: number) => Promise<void>;
   /** Renews the reserved account's Google sign-in when a step finds it expired. */
   readonly signIn?: () => Promise<void>;
@@ -108,10 +101,6 @@ export type ProvisionResult =
 
 type Pause = ProvisionHumanPause | undefined;
 
-/**
- * Observing and ensuring a step's resources, shared by the journaled run and
- * a single step run outside it.
- */
 function resourceRunner<Context>(context: Context, runtime: ProvisionRuntime) {
   const sleep = runtime.sleep ?? ((milliseconds: number) => delay(milliseconds));
 
@@ -155,7 +144,6 @@ function resourceRunner<Context>(context: Context, runtime: ProvisionRuntime) {
     });
   };
 
-  /** Bring one resource to present, applying only when it is absent. */
   const ensure = async (
     id: ProvisionStepId,
     resource: StepResource<Context>,
@@ -203,9 +191,8 @@ function resourceRunner<Context>(context: Context, runtime: ProvisionRuntime) {
 }
 
 /**
- * Run one step's resources outside the provision journal, as a command that
- * repairs or extends a created assistant does: the same observations, waits,
- * and sign-in retry, with nothing recorded as a provisioning step.
+ * For a command that repairs or extends a created assistant: the same
+ * observations, waits, and sign-in retry, with nothing recorded in the journal.
  */
 export async function runStepOutsideJournal<Context>(
   id: ProvisionStepId,
@@ -223,11 +210,7 @@ export async function runStepOutsideJournal<Context>(
   return pause ? { status: 'paused', pause } : { status: 'ready' };
 }
 
-/**
- * Run order: one liveness pass over completed runtime steps, then every
- * incomplete step in order. The caller runs prerequisites first and owns the
- * instance operation; a returned pause lets it release the lock.
- */
+/** The caller runs prerequisites first and owns the instance operation; a returned pause lets it release the lock. */
 export async function runProvisionSteps<Context>(
   operation: InstanceOperation,
   context: Context,
@@ -238,7 +221,6 @@ export async function runProvisionSteps<Context>(
   const completed = (id: ProvisionStepId): boolean => journal.steps[id]?.completed_at !== undefined;
   const runner = resourceRunner(context, runtime);
 
-  /** Run a step's body as a logged step, recording any failure in the journal. */
   const stepRun = (id: ProvisionStepId, label: string, body: () => Promise<Pause>): Promise<Pause> =>
     runStep(
       runtime,
@@ -260,11 +242,7 @@ export async function runProvisionSteps<Context>(
   const ensureAll = (id: ProvisionStepId, waitOnAbsent: boolean): Promise<Pause> =>
     runner.ensureAll(id, steps[id].resources, waitOnAbsent);
 
-  /**
-   * Whether a runtime step's resources all observe present at once, with no
-   * wait and no change. The look is logged but not rendered, so a runtime
-   * that is running adds nothing to the operator's screen.
-   */
+  /** Unlabeled, so the look is logged but not rendered: a running runtime adds nothing to the operator's screen. */
   const runningNow = (id: ProvisionStepId): Promise<boolean> =>
     runStep(runtime, { id }, async () => {
       for (const resource of steps[id].resources) {
@@ -275,10 +253,7 @@ export async function runProvisionSteps<Context>(
       return true;
     });
 
-  /**
-   * Liveness: nothing shown while the runtime runs. Otherwise the shown
-   * check observes again, waited on before any local repair.
-   */
+  /** When it is not running, the shown check waits on absent (unless `absentMeansStopped`) before any local repair. */
   const checkRuntime = async (id: ProvisionStepId): Promise<Pause> =>
     (await runningNow(id))
       ? undefined
@@ -292,7 +267,6 @@ export async function runProvisionSteps<Context>(
       return pause;
     });
 
-  /** Before handing a person a pause, re-check the runtime it depends on. */
   const confirmPause = async (id: ProvisionStepId, pause: ProvisionHumanPause): Promise<ProvisionHumanPause> => {
     for (const need of steps[id].pauseNeeds ?? []) {
       if (!steps[need].liveness || !completed(need)) continue;

@@ -1,5 +1,5 @@
 /**
- * The assistant's own agents are named by its display name (KTD1): main and
+ * The assistant's own agents are named by its display name: main and
  * whichever of `external-email` and the browser exist take it from the
  * profile, by the groups the profile records, at every reconcile and at
  * creation. Any other group keeps its own name.

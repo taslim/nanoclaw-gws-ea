@@ -572,7 +572,7 @@ describe("the principal's email addresses", () => {
     expect(await addresses()).toEqual(['morgan@example.test', 'morgan@work.example.test']);
   });
 
-  it("refuses the assistant's web alias, in any spelling that reaches it (KTD14)", async () => {
+  it("refuses the assistant's web alias, in any spelling that reaches it", async () => {
     await recordWebAlias('yaa@example.test');
     for (const email of ['yaa@example.test', 'YAA+shop@example.test']) {
       expect(await run('principal-addresses-add', { email }), email).toMatchObject({
@@ -693,7 +693,7 @@ describe("the principal's email addresses", () => {
     expect(section?.body).not.toMatch(/morgan@(work\.)?example\.test/u);
   });
 
-  it('names the field of the live list that carries each calendar’s access (R9)', async () => {
+  it('names the field of the live list that carries each calendar’s access', async () => {
     const listed = await run('principal-addresses-list', {}, agent(main.id));
     const [row] = listed.ok ? (listed.data as Array<Record<string, unknown>>) : [];
 
@@ -894,7 +894,7 @@ describe('character and audience-specific identity', () => {
   });
 });
 
-describe("the principal's name and timezone (R16, KTD9)", () => {
+describe("the principal's name and timezone", () => {
   const main = group('ag-main');
   const research = group('ag-research', 'research');
   const HOST: CallerContext = { caller: 'host' };

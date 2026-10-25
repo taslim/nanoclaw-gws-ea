@@ -114,7 +114,6 @@ export async function requestCreateAgentHold(content: Record<string, unknown>, s
     action: 'create_agent',
     payload: createAgentHoldPayload(content),
     title: 'Create an agent',
-    // The name the asking agent chose, as one quoted line, then the ask in the assistant's voice (KTD14).
     question: [
       `Name: ${quoted(name, NAME_LIMIT)}`,
       ...(template
@@ -212,7 +211,6 @@ export async function createAgent(
   }
 }
 
-/** The two destinations a new child gets, judged before it is created. */
 interface NewAgentWiring {
   /** The creator's row naming the child. */
   toChild: AgentDestination;
@@ -341,7 +339,7 @@ async function performCreateAgent(
   log.info('Agent group created', { agentGroupId, name, localName, folder, parent: sourceGroup.id });
 }
 
-/** Wire a new child into its creator's messaging, for both kinds of create, with the rows judged before it. */
+/** Wire a new child into its creator's messaging, for both kinds of create. */
 async function wireNewAgent({ toChild, toParent }: NewAgentWiring, session: Session): Promise<void> {
   // Insert bidirectional destination rows (= ACL grants).
   // Creator refers to child by the name it chose; child refers to creator as "parent".

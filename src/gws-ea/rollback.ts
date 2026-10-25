@@ -1,30 +1,19 @@
 /**
- * `rollback` (R3, R5, R10), and the revert of an update that failed once its
- * release started. A rollback returns an assistant to its rollback point
- * (KTD4): the release its last update left, and the snapshot that update
- * took of the state as the release left it. Its mode is decided while the
- * assistant is fenced, from the schema as it is then (KTD5): when neither the
- * central migrations nor the session tables moved since the snapshot, only
- * the code goes back and every message, memory, and setting since is kept;
- * otherwise the snapshot is restored, once its time and what it discards are
- * shown and confirmed. A restore renames the state aside whole into
- * `quarantine/<op>/` and clones the snapshot in its place, and hands the
- * host every person forgotten since the snapshot, to forget again (KTD8).
- * The switch itself moves no state.
+ * `rollback`, and the revert of an update that failed once its release
+ * started. A rollback returns an assistant to its rollback point: the release
+ * its last update left, and the snapshot that update took of the state as the
+ * release left it. Its mode is decided while the assistant is fenced, from the
+ * schema as it is then: when neither the central migrations nor the session
+ * tables moved since the snapshot, and no restore was asked for, only the code
+ * goes back and every message, memory, and setting since is kept; otherwise
+ * the snapshot is restored, once its time and what it discards are shown and
+ * confirmed. A restore moves the state aside whole into `quarantine/<op>/`;
+ * the switch itself moves no state.
  *
  * Each phase is recorded as it completes, so a rollback cut short anywhere is
  * continued by the next `rollback --id`. One that fails goes back to the
- * release it left (KTD5): the state it restored is renamed aside to
- * `quarantine/<op>-returned/` and the quarantined state put back, and the
- * release it left is switched to, started, and verified. When that fails
- * too, the record is closed for fix-forward (KTD9) once the state it
- * replaced is back; before that it stays open, going back, for the next
- * `rollback --id` to finish the return. An update whose release
- * cannot have started is not rolled back: the release it left is served
- * again and the update discarded. One whose release may have started (from
- * its switch on) is reverted by the same rules, from the snapshot it took and
- * committing by its own record; there is nothing to go back to when that
- * fails, so it is closed for fix-forward.
+ * release it left; when that fails too, the record is closed for fix-forward
+ * once the state it replaced is back.
  */
 import { createHash } from 'node:crypto';
 import { existsSync } from 'node:fs';
@@ -95,7 +84,6 @@ import { backupCentralDatabase, printableName, readForgottenFingerprints, readSc
 /** How many IDs and paths a discard summary lists; the counts are always whole. */
 const LISTED = 20;
 
-/** What a snapshot restore discards, diffed from the state as it is now against the snapshot (R3). */
 export interface DiscardSummary {
   /** Inbound messages the snapshot never received: they are lost. */
   readonly inbound: DiscardedRows;
@@ -111,7 +99,7 @@ export interface DiscardSummary {
   readonly files: { readonly count: number; readonly paths: readonly string[] };
   /** Agent groups created since: their OneCLI agents and grants stay in the vault, orphaned. */
   readonly orphanedAgents: readonly string[];
-  /** Job registry entries absent from the snapshot, with the chat each served. */
+  /** Job registry entries absent from the snapshot. */
   readonly jobAgents: readonly {
     readonly agent_group_id: string;
     readonly messaging_group_id: string;
@@ -121,19 +109,17 @@ export interface DiscardSummary {
 
 export interface DiscardedRows {
   readonly count: number;
-  /** The first of them, by ID. */
+  /** The first `LISTED` of them. */
   readonly ids: readonly string[];
 }
 
-/** Why a rollback restores the snapshot rather than only the code. */
 export type SnapshotReason = 'central_schema' | 'session_schema' | 'requested';
 
-/** What the operator sees before a snapshot restore, and confirms (R3). */
 export interface RollbackPreview {
   readonly instanceId: string;
   readonly from: ReleaseCoordinates;
   readonly to: ReleaseCoordinates;
-  /** When the update being undone fenced the assistant: the snapshot is its state as of then. */
+  /** When the update being undone fenced the assistant, which is when the snapshot was taken. */
   readonly snapshotAt: string;
   readonly reason: SnapshotReason;
   readonly discarded: DiscardSummary;
@@ -150,7 +136,6 @@ export interface RollbackRequest {
   readonly confirm?: (preview: RollbackPreview) => Promise<boolean>;
 }
 
-/** Where a rollback left the assistant. */
 export type RollbackOutcome =
   | ({
       readonly kind: 'rolled_back';
@@ -158,7 +143,7 @@ export type RollbackOutcome =
       readonly to: ReleaseCoordinates;
       /** The snapshot restored in snapshot mode; in code-only mode, the one left unused. */
       readonly snapshotAt: string;
-      /** Why its Google Chat waits on a new sign-in, which the release was served through (KTD12); null otherwise. */
+      /** Why its Google Chat waits on a new sign-in, which still counts as serving; null otherwise. */
       readonly signInNeeded: string | null;
     } & (
       | { readonly mode: 'code_only' }
@@ -175,7 +160,6 @@ export type RollbackOutcome =
   /** The snapshot restore was declined; the assistant runs `release` as before. */
   | { readonly kind: 'declined'; readonly release: ReleaseCoordinates };
 
-/** Which schema moved between two manifests (KTD5): the central migrations, else the session tables and columns. */
 export function sameSchema(left: SnapshotManifest, right: SnapshotManifest): 'same' | SnapshotReason {
   const sorted = (names: readonly string[]): string => JSON.stringify([...names].sort());
   if (sorted(left.central_migrations) !== sorted(right.central_migrations)) return 'central_schema';
@@ -189,9 +173,8 @@ export function sameSchema(left: SnapshotManifest, right: SnapshotManifest): 'sa
 }
 
 /**
- * Read a session database, or `empty` when the session has none. Session
- * databases keep a rollback journal (`journal_mode=DELETE`), so a read-only
- * open leaves nothing beside them.
+ * Session databases keep a rollback journal (`journal_mode=DELETE`), so a
+ * read-only open leaves nothing beside them.
  */
 function withDatabase<T>(file: string, empty: T, read: (database: Database.Database) => T): T {
   if (!existsSync(file)) return empty;
@@ -207,7 +190,7 @@ function hasTable(database: Database.Database, table: string): boolean {
   return database.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(table) !== undefined;
 }
 
-/** Every session directory under a checkout, keyed `<agent group>/<session>`. */
+/** Keyed `<agent group>/<session>`. */
 async function sessions(root: string): Promise<Map<string, string>> {
   const found = new Map<string, string>();
   const base = path.join(root, 'data', 'v2-sessions');
@@ -247,7 +230,7 @@ function columnsOf(database: Database.Database, table: string): Set<string> {
   );
 }
 
-/** A session's inbound messages, in order; a column an older session lacks reads as unknown. */
+/** A column an older session lacks reads as unknown. */
 function inboundRows(file: string): Map<string, InboundRow> {
   return withDatabase(file, new Map<string, InboundRow>(), (database) => {
     if (!hasTable(database, 'messages_in')) return new Map();
@@ -295,7 +278,7 @@ class RowTally {
   }
 }
 
-/** The key of each row of a table: its primary key, or the whole row when it has none. */
+/** Each row's primary key, or the whole row when the table has none. */
 function rowKeys(database: Database.Database, table: string): Set<string> {
   const quoted = `"${table.replaceAll('"', '""')}"`;
   const columns = database.prepare('SELECT name, pk FROM pragma_table_info(?)').all(table) as Array<{
@@ -354,7 +337,6 @@ function jobAgents(database: Database.Database): DiscardSummary['jobAgents'] {
     .all() as DiscardSummary['jobAgents'];
 }
 
-/** Rows the central database gained since the snapshot, by table, and the agent groups among them. */
 async function centralGains(
   current: string,
   snapshot: string,
@@ -380,7 +362,6 @@ async function centralGains(
   });
 }
 
-/** Every file under `groups/`, by path relative to it, with what it holds. */
 async function groupFiles(root: string): Promise<Map<string, string>> {
   const found = new Map<string, string>();
   const base = path.join(root, 'groups');
@@ -411,14 +392,7 @@ async function groupFiles(root: string): Promise<Map<string, string>> {
   return found;
 }
 
-/**
- * What restoring `snapshot` over `current` discards: inbound messages it
- * never received, messages handled since that run again (and which of those
- * are task firings), replies delivered since that are delivered again, the
- * central rows added since, the memory and group files changed since, and the
- * agent groups created since, whose OneCLI agents and grants would be left
- * orphaned. Both are only read.
- */
+/** What restoring `snapshot` over `current` discards; both are only read. */
 export async function summarizeDiscard(current: string, snapshot: string): Promise<DiscardSummary> {
   const inbound = new RowTally();
   const rerun = new RowTally();
@@ -458,7 +432,6 @@ export async function summarizeDiscard(current: string, snapshot: string): Promi
   };
 }
 
-/** Nothing recorded since the snapshot would be lost. */
 function isLossless(summary: DiscardSummary): boolean {
   return (
     summary.inbound.count === 0 &&
@@ -482,7 +455,6 @@ const REASONS: Readonly<Record<SnapshotReason, string>> = {
   requested: 'it was asked for',
 };
 
-/** A snapshot restore's preview, one fact per line (R3), with times in `timezone`. */
 export function rollbackPreviewLines(preview: RollbackPreview, timezone: string): string[] {
   const { discarded } = preview;
   const lines = [
@@ -509,7 +481,7 @@ export function rollbackPreviewLines(preview: RollbackPreview, timezone: string)
   ];
 }
 
-/** What a finished rollback did, as one sentence tail, with times in `timezone`. */
+/** A sentence's tail, for the caller to begin. */
 export function describeRollback(outcome: RollbackOutcome, timezone: string): string {
   switch (outcome.kind) {
     case 'rolled_back': {
@@ -528,7 +500,6 @@ export function describeRollback(outcome: RollbackOutcome, timezone: string): st
   }
 }
 
-/** A snapshot needs confirmation nobody can give. */
 function confirmationRequired(instanceId: string): GwsEaError {
   return new GwsEaError(
     'input_required',
@@ -536,7 +507,6 @@ function confirmationRequired(instanceId: string): GwsEaError {
   );
 }
 
-/** What a rollback returns from and to, and the snapshot it may restore. */
 interface RollbackPlan {
   readonly from: ReleaseCoordinates;
   readonly to: ReleaseCoordinates;
@@ -545,7 +515,6 @@ interface RollbackPlan {
   readonly request: RollbackRequest;
 }
 
-/** One rollback under way. */
 interface Rollback extends CutoverHost, RollbackPlan {
   /** The operation's name: `quarantine/<op>/` keeps the state a restore replaces. */
   readonly op: string;
@@ -556,9 +525,9 @@ interface Rollback extends CutoverHost, RollbackPlan {
 const STOP_LABEL = 'Stopping the assistant for the rollback…';
 
 /**
- * The rollback `record` is: a revert restores the snapshot its update took,
- * named as the update was, since it keeps the update's start; any other, the
- * rollback point's.
+ * A revert restores the snapshot its update took, which the rollback's own
+ * name finds because the rollback keeps the update's start; any other
+ * restores the rollback point's.
  */
 async function rollbackOf(host: CutoverHost, record: OperationRecord, request: RollbackRequest): Promise<Rollback> {
   const op = operationName(record.started_at);
@@ -570,7 +539,6 @@ async function rollbackOf(host: CutoverHost, record: OperationRecord, request: R
   return { ...host, from: record.from, to: record.to, op, snapshot: point?.snapshot ?? op, reverting, request };
 }
 
-/** The rollback's mode (KTD5): snapshot when asked, or when either schema moved since the snapshot; else code only. */
 function decideMode(
   current: SnapshotManifest,
   snapshot: SnapshotManifest,
@@ -581,7 +549,7 @@ function decideMode(
   return requested ? { mode: 'snapshot', reason: 'requested' } : { mode: 'code_only', reason: undefined };
 }
 
-/** Show what restoring the snapshot over `current` discards, and ask for it; undefined when nobody can be asked. */
+/** Presents what the restore discards, then asks for it; undefined when nobody can be asked. */
 async function confirmSnapshot(
   host: CutoverHost,
   plan: RollbackPlan,
@@ -622,10 +590,10 @@ async function assertConfirmable(host: CutoverHost, plan: RollbackPlan): Promise
 }
 
 /**
- * Write the forget handoff from the state a restore replaced (KTD8): every
- * identity forgotten there that the restored database does not record, for
- * the host to forget again before it routes anything. Read-only on both
- * databases; recomputed whole whenever the restore step runs.
+ * Write the forget handoff from the state a restore replaced: every identity
+ * forgotten there that the restored database does not record, for the host to
+ * forget again before it routes anything. Read-only on both databases;
+ * recomputed whole whenever the restore step runs.
  */
 async function handOffForgets(rollback: Rollback): Promise<void> {
   const { layout } = rollback;
@@ -637,14 +605,12 @@ async function handOffForgets(rollback: Rollback): Promise<void> {
   await writePeopleForgetHandoff(peopleForgetHandoffFile(path.join(layout.state, 'data')), { fingerprints: missing });
 }
 
-/** How deciding went: a mode, or a snapshot restore declined or that nobody can confirm. */
 type Decision = RollbackMode | 'declined' | 'unconfirmable';
 
 /**
- * `fenced` → `snapshotted`: decide the mode from the schema the fence read
- * (KTD5), show and confirm a snapshot restore, and restore it, handing off
- * the people forgotten since (KTD8). A restore that began is finished
- * without deciding again, since the state is no longer the one decided on.
+ * `fenced` → `snapshotted`, deciding from the schema the fence read. A restore
+ * that began is finished without deciding again, since the state is no longer
+ * the one decided on.
  */
 async function decideAndRestore(rollback: Rollback, record: OperationRecord): Promise<Decision> {
   const { layout, reporter } = rollback;
@@ -670,11 +636,6 @@ async function decideAndRestore(rollback: Rollback, record: OperationRecord): Pr
   return mode;
 }
 
-/**
- * The rollback's receipt, kept with the release it returned to: its mode,
- * fence and snapshot times, both schemas, and in snapshot mode what it
- * discarded, by count and ID. Written just before the commit.
- */
 async function writeRollbackReceipt(rollback: Rollback, record: OperationRecord): Promise<void> {
   const { layout, operation } = rollback;
   const snapshot = layout.snapshot(rollback.snapshot);
@@ -691,19 +652,16 @@ async function writeRollbackReceipt(rollback: Rollback, record: OperationRecord)
   });
 }
 
-/** The OneCLI version a release's receipt records. */
 async function pinsOf(rollback: Rollback, release: ReleaseCoordinates): Promise<{ readonly gateway: string }> {
   const { onecli } = await readDeployedSetup(rollback.operation.paths, reservationAt(rollback.reservation, release));
   return { gateway: onecli.gateway };
 }
 
 /**
- * Go back to the release a rollback left (KTD5), recorded first so a return
- * cut short is finished by the next `rollback --id`: the assistant fenced
- * again, the state a restore replaced put back (the state the rollback's
- * target produced kept in `quarantine/<op>-returned/`), the release it left
- * switched to, started, and verified, and the rollback discarded. A record
- * that carried a committed update's follow-ups gives them back.
+ * Go back to the release a rollback left, recorded first so a return cut short
+ * is finished by the next `rollback --id`. The state the rollback's target
+ * produced is kept in `quarantine/<op>-returned/`. A record that carried a
+ * committed update's follow-ups gives them back.
  */
 async function goBack(rollback: Rollback): Promise<void> {
   const { operation, layout } = rollback;
@@ -721,7 +679,6 @@ async function goBack(rollback: Rollback): Promise<void> {
   await discardOperation(operation);
 }
 
-/** A rollback that failed and went back, reported with where the assistant is and what can be done next. */
 function returned(rollback: Rollback, mode: RollbackMode | undefined, cause: unknown): GwsEaError {
   const id = rollback.operation.instanceId;
   const next =
@@ -735,7 +692,6 @@ function returned(rollback: Rollback, mode: RollbackMode | undefined, cause: unk
   );
 }
 
-/** A rollback that could not go back either, or a revert with nothing to go back to: closed for fix-forward (KTD9). */
 async function closedForFixForward(rollback: Rollback, cause: unknown, why: string): Promise<GwsEaError> {
   await closeOperationFailed(rollback.operation);
   const id = rollback.operation.instanceId;
@@ -752,7 +708,7 @@ async function closedForFixForward(rollback: Rollback, cause: unknown, why: stri
  * has put that state back, the record stays open and going back, so the next
  * `rollback --id` finishes the return, rather than a fix-forward building on
  * the restored snapshot while what the assistant recorded since stays in
- * quarantine (KTD5).
+ * quarantine.
  */
 async function returnFailed(rollback: Rollback, cause: unknown, why: string): Promise<GwsEaError> {
   if (!(await exists(rollback.layout.quarantine(rollback.op)))) return closedForFixForward(rollback, cause, why);
@@ -770,9 +726,8 @@ function deliberate(error: unknown): boolean {
 }
 
 /**
- * Re-establish the fence of a rollback resumed while fenced (KTD1): whatever
- * started since is stopped and the instance proven quiet again before
- * anything goes on, and the stop is recorded afresh.
+ * A rollback resumed while fenced may find something started since: it is
+ * stopped and the instance proven quiet again before anything goes on.
  */
 async function refence(rollback: Rollback, record: OperationRecord): Promise<OperationRecord> {
   const { layout } = rollback;
@@ -784,7 +739,6 @@ async function refence(rollback: Rollback, record: OperationRecord): Promise<Ope
   return recordOperationFacts(rollback.operation, { stop });
 }
 
-/** Fence the assistant for the rollback, reading the schema its host left. */
 async function fenceForRollback(rollback: Rollback): Promise<OperationRecord> {
   let manifest: SnapshotManifest | undefined;
   const stop = await fenceInstance(rollback, STOP_LABEL, () => {
@@ -794,10 +748,7 @@ async function fenceForRollback(rollback: Rollback): Promise<OperationRecord> {
 }
 
 /**
- * Carry a rollback from the phase its record reached until it is committed:
- * fenced; mode decided, confirmed, and restored; switched to the release it
- * returns to; started; main's skills reconciled and the release verified;
- * committed, by the registry or, reverting an update, by its own record. A
+ * Carry a rollback from the phase its record reached until it is committed. A
  * resume between the fence and the start fences again first.
  */
 async function runRollback(rollback: Rollback, start: OperationRecord): Promise<RollbackOutcome> {
@@ -927,11 +878,10 @@ async function rolledBack(
 }
 
 /**
- * Revert an update that is unfinished (KTD2). One whose release cannot have
- * started is discarded: the release it left is served again
- * (`serveLeftRelease`), its staged release kept. One whose release may have
- * started (`targetMayHaveStarted`) is rolled back by the rollback rules, from
- * the snapshot it took, the rollback replacing its record in one write so the
+ * An unfinished update whose release cannot have started is discarded and the
+ * release it left served again. One whose release may have started
+ * (`targetMayHaveStarted`) is rolled back by the rollback rules, from the
+ * snapshot it took, the rollback replacing its record in one write so the
  * gate never lifts. One with no release to return to is refused: it is fixed
  * forward, as is one whose release cannot read the browser policy.
  */
@@ -967,12 +917,8 @@ async function revertOpenUpdate(
 }
 
 /**
- * Roll the committed release back to the rollback point (KTD4). Every
- * refusal comes before anything changes: no rollback point, its release not
- * kept whole, the assistant not running the release the registry names, a
- * browser policy that release cannot read, or a snapshot restore nobody can
- * confirm. The release's agent image is provided
- * first, rebuilt hermetically when it is gone (KTD6).
+ * Every refusal comes before the assistant changes. The release's agent image
+ * is provided first, rebuilt hermetically when it is gone.
  */
 async function rollBackCommitted(
   operation: InstanceOperation,
@@ -1016,12 +962,7 @@ async function rollBackCommitted(
   return runRollback(await rollbackOf(host, record, request), record);
 }
 
-/**
- * `rollback --id`: continue whatever this assistant's record says is
- * unfinished, or roll its committed release back to its rollback point. An
- * open update is reverted, an open rollback continued, a committed
- * rollback's follow-ups left for the caller to run (`finishFollowUps`).
- */
+/** `rollback --id`. A committed rollback's follow-ups are left for the caller to run (`finishFollowUps`). */
 export async function rollBack(
   operation: InstanceOperation,
   dependencies: CutoverDependencies,
@@ -1041,22 +982,20 @@ export async function rollBack(
   return rollBackCommitted(operation, dependencies, request);
 }
 
-/** An automatic rollback shows what a snapshot restore discards in its step log; the update's confirmation covers it. */
+/** Shows what a snapshot restore discards in the step log; the update's own confirmation covers it. */
 const AUTOMATIC: RollbackRequest = {
   present: (preview) => activeStep()?.write(`${rollbackPreviewLines(preview, localTimezone()).join('\n')}\n`),
   confirm: async () => true,
 };
 
-/** This machine's timezone, which what a person reads is shown in. */
 export function localTimezone(): string {
   return Intl.DateTimeFormat().resolvedOptions().timeZone;
 }
 
 /**
- * Roll back an update that failed once its release started, by the rollback
- * rules, which its own confirmation covers; then run the rollback's
- * follow-ups, whose failure only leaves them for `rollback --id` to retry.
- * Returns where the assistant was left.
+ * For an update that failed once its release started; its own confirmation
+ * covers a snapshot restore. A follow-up failure only leaves them for
+ * `rollback --id` to retry.
  */
 export async function revertUpdate(
   operation: InstanceOperation,

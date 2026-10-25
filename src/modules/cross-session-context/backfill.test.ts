@@ -327,7 +327,7 @@ describe('backfillSession — existing session', () => {
 });
 
 describe('backfillSession — conversation-context', () => {
-  // R20: one thread's session never learns another's content in a group
+  // One thread's session never learns another's content in a group
   // without conversation-context.
   it('seeds nothing, and opens no sibling mailbox, for a group without it', async () => {
     groupCapabilities = new Set(['reply']);

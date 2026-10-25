@@ -960,7 +960,7 @@ describe('reactions', () => {
   });
 });
 
-describe('the working 👀 (R6)', () => {
+describe('the working 👀', () => {
   const PLATFORM = `gchat:${DM}`;
   const JUNO_1 = `${DM}/messages/juno.1`;
 
@@ -1362,7 +1362,7 @@ describe('requests', () => {
   });
 });
 
-describe('a picture on an approval request (KTD6)', () => {
+describe('a picture on an approval request', () => {
   // A host module's approval request, from requestApproval through the
   // host's delivery and the channel to Google, with a checkout's picture
   // beside it: Chat sees one upload and one message per card.

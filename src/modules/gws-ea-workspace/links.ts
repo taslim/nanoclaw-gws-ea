@@ -1,17 +1,18 @@
 /**
- * The Google links the link check reads (KTD5): exactly the Docs, Sheets,
- * Slides, Forms, Drawings and Drive shapes on exactly docs.google.com,
- * drive.google.com and forms.gle, however the scheme, userinfo, port or a
- * trailing dot on the host was written, since a visit only ever goes to an
- * https address rebuilt from the id.
+ * The Google links the link check reads: exactly the Docs, Sheets, Slides,
+ * Forms, Drawings and Drive shapes on exactly docs.google.com,
+ * drive.google.com and forms.gle, whether written with http or https,
+ * userinfo, a port or a trailing dot on the host, since a visit only ever
+ * goes to an https address rebuilt from the id.
  *
  * - A file link names a Drive item by its id: a Doc, Sheet, deck, form or
  *   drawing to edit, a Drive file (on either host) or folder, or `open?id=`
  *   and `uc?id=`. The `/u/N/` account and `/a/<domain>/` prefixes are read
  *   past, and a resource key is kept exactly.
- * - A form's responder link, `/forms/d/e/<id>/…`, a `/viewform` by file id,
- *   or a `forms.gle` short link, names who may answer through the form's own
- *   settings, not through Drive, so only a signed-out visit can judge it.
+ * - A form's responder link, `/forms/d/e/<id>/…`, a `/viewform` or
+ *   `/formResponse` by file id, or a `forms.gle` short link, names who may
+ *   answer through the form's own settings, not through Drive, so only a
+ *   signed-out visit can judge it.
  * - A file published to the web (`/d/e/<id>/pub`, or `/pub` by file id)
  *   opens for anyone while it stays published, again judged by a visit.
  *
@@ -20,7 +21,8 @@
  * text as written and among a markdown reader's link targets, the reading
  * the privacy check gives (`linkTargets`).
  *
- * A leaf (KTD4): it imports only the privacy module's link reading.
+ * A leaf: the only module entry point it loads is the privacy module's, for
+ * its link reading.
  */
 import { linkTargets } from '../gws-ea-privacy/index.js';
 
@@ -55,8 +57,7 @@ function isEditor(segment: string | undefined): segment is (typeof EDITORS)[numb
 }
 
 /**
- * A URL on exactly one of the three hosts, over http or https, with the host
- * it names. How it was written (http, userinfo, a port, or the host's
+ * How a URL was written (http, userinfo, a port, or the host's
  * fully-qualified spelling with one trailing dot, which a browser opens as
  * the host itself) doesn't excuse it from the check: the check reads only
  * the file id or form it names, and any visit goes to an https address
@@ -157,9 +158,8 @@ function identity(link: GoogleLink): string {
 }
 
 /**
- * The checked Google links in these texts, each file or form once, in the
- * order they first appear: every address written in them and every link
- * target a markdown reader sees.
+ * Each file or form once, in the order they first appear, from every address
+ * written in the texts and every link target a markdown reader sees.
  */
 export function googleLinksIn(texts: readonly string[]): GoogleLink[] {
   const found = new Map<string, GoogleLink>();

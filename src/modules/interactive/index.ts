@@ -49,7 +49,6 @@ async function handleInteractiveResponse(payload: ResponsePayload): Promise<bool
   });
 
   await deletePendingQuestion(payload.questionId);
-  // Answered: the question shows the choice where it was asked, when the channel left it as posted.
   await showRequestOutcome(getDeliveryAdapter(), payload, pq);
   log.info('Question response routed', {
     questionId: payload.questionId,

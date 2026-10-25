@@ -1,19 +1,18 @@
 /**
- * Authorized account creation and password changes in the host browser (F3,
- * F4, KTD7). Main records the authority for one browser job, site and
- * account: a signup, or a change on a Login this host saved (R18). That
- * record is the credential attempt itself (KTD6), so the browser can neither
- * create nor widen it.
+ * Authorized account creation and password changes in the host browser. The
+ * delegating agent records the authority for one browser job, site and
+ * account: a signup, or a change on a Login this host saved. That record is
+ * the credential attempt itself, so the browser can neither create nor widen
+ * it.
  *
  * The browser then names fresh element refs for the account's fields and the
  * control that activates them. The host binds every field and the control to
  * one document, node and HTTPS origin on the attempt's site, saves the
  * generated password durably, and records possible exposure before inserting
- * anything. It fills the whole group atomically through the native setter,
- * lets controlled (JS) forms see the values, activates the exact control
+ * anything. It fills the whole group atomically, activates the exact control
  * once, and reads the website's own response for the outcome. Success needs
  * host-read evidence from the site, never a model verdict, an HTTP status or
- * a URL change alone (KTD8). Values never leave host memory and 1Password.
+ * a URL change alone. Values never leave host memory and 1Password.
  *
  * An attempt past its one disclosure is never filled again, so a retry or
  * restart cannot submit a second time. Even a consent stop after filling
@@ -27,8 +26,8 @@
  * before the activation, binds the site, origin and account, and only the
  * host inserts the code or opens the link the isolated interpreter returned.
  * `reconcile` is read-only: it reads the site's late response, which counts
- * only in the same document the host was watching with no interaction since;
- * from `confirmed` it re-runs the vault's finalize.
+ * only on the same page the host was watching with no interaction since; from
+ * `confirmed` it re-runs the vault's finalize.
  */
 import { noVerifiedPrincipalMessage } from '../gws-ea-profile/approval-wording.js';
 import {
@@ -124,7 +123,7 @@ import {
 
 export interface CredentialOperationDependencies {
   readonly attempts: CredentialAttempts;
-  /** Frees the site of an attempt main's release request finds 1Password can now settle. */
+  /** Frees the site of an attempt a release request finds 1Password can now settle. */
   readonly queue?: () => BrowserQueue;
 }
 const DEFAULT_DEPENDENCIES: CredentialOperationDependencies = { attempts: credentialAttempts };
@@ -151,7 +150,7 @@ async function releaseCredentialSubmissions(authority: string): Promise<void> {
   credentialHeldPages.delete(authority);
 }
 
-// ---------------------------------------------------------------- main's authority
+// ---------------------------------------------------------------- the delegator's authority
 
 const AUTHORITY_FIELDS: ReadonlySet<string> = new Set([
   'action',
@@ -174,7 +173,7 @@ function recorded(attempt: CredentialAttempt, thread: string): Outcome {
   };
 }
 
-/** Main hears only whether the vault can be used now; the host keeps its reasons. */
+/** The delegator hears only whether the vault can be used now; the host keeps its reasons. */
 function vaultOutcome(reason: BrowserVaultReason): Outcome {
   if (reason === 'rate_limited') return { status: 'rate_limited' };
   return reason === 'no_item_for_site' ? { status: 'not_owned', reason: 'no_record' } : { status: 'vault_unavailable' };
@@ -184,10 +183,10 @@ function vaultOutcome(reason: BrowserVaultReason): Outcome {
  * An agent with browser access records the principal's delegation of one
  * signup or one password change for an exact job of its own, site and
  * account. A change binds the Login this host saved for that site and
- * username, checked fresh against its ownership record (R18); any other
- * Login, an edited one, or an account with no saved Login is refused here,
- * before the browser can act. Sign-in email, phone, two-factor and
- * payment-method changes have no operation.
+ * username, checked fresh against its ownership record; any other Login, an
+ * edited one, or an account with no saved Login is refused here, before the
+ * browser can act. Sign-in email, phone, two-factor and payment-method
+ * changes have no operation.
  * to: main, delegator
  */
 export async function credentialAuthorityRequest(
@@ -232,10 +231,10 @@ export async function credentialAuthorityRequest(
   );
   if (open) return recorded(open, job.thread_id);
   if (kind === 'signup') {
-    // The account is the assistant's own, under its web address (KTD14).
+    // Never an account in the principal's name, or under an address the assistant converses from.
     const stop = await signupAccountStop(username);
     if (stop) return { status: stop };
-    // A signup that may have reached the site is settled through its own job, never retried (KTD8).
+    // A signup that may have reached the site is settled through its own job, never retried.
     if (
       unresolved.some(
         (attempt) =>
@@ -263,7 +262,6 @@ export async function credentialAuthorityRequest(
 
 // ---------------------------------------------------------------- the principal's release
 
-/** The `pending_approvals.action` a principal's release resolves through. */
 export const CREDENTIAL_RELEASE_APPROVAL = 'browser_credential_release';
 
 const agentActor = (session: Session): GuardActor => ({
@@ -274,8 +272,8 @@ const agentActor = (session: Session): GuardActor => ({
 
 /**
  * An attempt the host cannot settle ends only on the principal's informed
- * decision, as an inconclusive purchase does: main asks, and the principal
- * confirms on their own card, knowing what may have happened (KTD8).
+ * decision, as an inconclusive purchase does: the delegator asks, and the
+ * principal confirms on their own card, knowing what may have happened.
  */
 export const credentialReleaseGuard = defineGuardedAction({
   action: 'gws_ea_browser.credential_release',
@@ -310,7 +308,7 @@ async function settledFirst(attempts: CredentialAttempts, attempt: CredentialAtt
     : undefined;
 }
 
-/** Main asks for the principal's decision on an attempt only they can now end; never a release by itself. */
+/** Asks for the principal's decision on an attempt only they can now end; never a release by itself. */
 async function credentialReleaseRequest(
   content: Record<string, unknown>,
   session: Session,
@@ -515,7 +513,6 @@ const VERIFY_FIELDS: ReadonlySet<string> = new Set([...REQUEST_FIELDS, 'code_fie
 const RECONCILE_FIELDS: ReadonlySet<string> = new Set(REQUEST_FIELDS);
 const AUTHORITY_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
 
-/** One submission of the form's fields: the operation itself. */
 export interface CredentialSubmitPayload extends Record<string, unknown> {
   authority: string;
   operation?: never;
@@ -587,7 +584,6 @@ type VaultState = 'finalized' | 'conflict' | 'pending';
 const vaultState = (status: CredentialFinalizeResult['status']): VaultState =>
   status === 'finalized' || status === 'conflict' ? status : 'pending';
 
-/** Finalize a confirmed attempt and report its website outcome with the vault's resulting state. */
 async function finalizedOutcome(
   attempt: Pick<CredentialAttempt, 'id' | 'kind'>,
   attempts: CredentialAttempts,
@@ -702,7 +698,6 @@ interface BoundField {
   readonly pinned: PinnedBrowserRef;
   readonly binding: NativeCredentialBinding;
 }
-/** The step a binding submits. */
 interface BindingScope {
   readonly step: 'credentials' | 'verification';
 }
@@ -876,10 +871,7 @@ interface ConsentStopped {
   readonly outcome: Outcome;
 }
 
-/**
- * The consent engine's check before a credential submission (KTD11): it accepts the site's own terms, opts
- * out of marketing and stops for any other agreement. A stop only when the submission must not go ahead.
- */
+/** The consent engine's choices before a credential submission; a stop only when the submission must not go ahead. */
 async function consentStop(
   context: BrowserExecutionContext,
   page: Page,
@@ -994,7 +986,6 @@ function websiteResult(kind: CredentialKind, before: SiteState, now: SiteState):
   return 'none';
 }
 
-/** Polls the site for its response until it answers or the wait, bounded by the request's budget, ends. */
 async function awaitSite<Result extends string>(
   context: BrowserExecutionContext,
   waitMs: number,
@@ -1094,7 +1085,6 @@ async function runStep(
   });
 }
 
-/** The values the browser's chosen fields receive, in the group's order. */
 function valuesFor(group: CredentialGroup, credential: CandidateCredential): string[] {
   return group.fields.map(({ role }) => {
     if (role === 'username') return credential.username;
@@ -1312,7 +1302,6 @@ async function disclosingStep(
     navigated,
     form: group.native.fields[0].formBackendNodeId === null ? 'formless' : 'form',
   });
-  /** An outcome left unknown after the control may have run: the response is watched for reconciliation. */
   const unknownAfterActivation = async (proof: CredentialEvidence): Promise<Outcome> => {
     await settle(() => attempts.markUnknown(saved.id, proof));
     watchResponse(saved.id, context, page, group, { step: 'credentials', before });
@@ -1413,7 +1402,6 @@ interface WatchedResponse extends SiteScope {
 }
 const watchedResponses = new Map<string, WatchedResponse>();
 
-/** Keeps the response to an activation whose outcome stayed unknown, for `reconcile` to read. */
 function watchResponse(
   id: string,
   context: BrowserExecutionContext,
@@ -1466,12 +1454,12 @@ async function attributable(
 }
 
 /**
- * Settles an attempt without submitting anything (KTD8). From unknown, only
- * the website's own late response to the watched activation counts: a
- * rejection, a request to verify the email, or success; after a verification
- * code, only the account's confirmation. Otherwise it stays unknown, and its
- * site stays held. From confirmed, the vault's finalize runs again, reading
- * everything fresh.
+ * Settles an attempt without submitting anything. From unknown, only the
+ * website's own late response to the watched activation counts: a rejection,
+ * a request to verify the email, or success; after a verification code, only
+ * the account's confirmation. Otherwise it stays unknown, and its site stays
+ * held. From confirmed, the vault's finalize runs again, reading everything
+ * fresh.
  */
 async function reconcile(
   context: BrowserExecutionContext,
@@ -1664,9 +1652,9 @@ async function confirmVerified(
 
 /**
  * A credential_form its worker could not answer itself: a crash, cut-off or
- * failure (KTD8). An attempt this request disclosed and left in flight
- * becomes unknown; the answer reports the attempt's recorded outcome. It is
- * never a purchase and never a reason to fill again.
+ * failure. An attempt this request disclosed and left in flight becomes
+ * unknown; the answer reports the attempt's recorded outcome. It is never a
+ * purchase and never a reason to fill again.
  */
 export async function recoverCredentialRequest(
   request: BrowserRequest,

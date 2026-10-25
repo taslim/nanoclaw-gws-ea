@@ -8,7 +8,7 @@ import { WHATSAPP_DEFAULTS } from './defaults.js';
 import { readWhatsAppLink, whatsappDirectory } from './paths.js';
 import { whatsAppLinking } from './link.js';
 
-/** The real active transport, for the link owner; absent before channel startup or without a link. */
+/** Undefined before channel startup or without a link record. */
 export function activeWhatsAppAdapter(): WhatsAppAdapter | undefined {
   return getChannelAdapterExact('whatsapp') as WhatsAppAdapter | undefined;
 }

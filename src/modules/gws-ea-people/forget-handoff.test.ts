@@ -1,5 +1,5 @@
 /**
- * A forget survives a snapshot rollback (R5, KTD8). gws-ea hands over the
+ * A forget survives a snapshot rollback. gws-ea hands over the
  * fingerprints the restored database lacks; the host records them, forgets
  * again whoever holds one, tells main, and deletes the handoff, all before
  * any inbound event routes.

@@ -1,5 +1,5 @@
 /**
- * Every GWS-EA approval words its own rejection (KTD14): the principal's no reads as their decision, with no
+ * Every GWS-EA approval words its own rejection: the principal's no reads as their decision, with no
  * "admin" and no action id. A module that tells the agent itself registers a null note, so the agent hears once.
  */
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';

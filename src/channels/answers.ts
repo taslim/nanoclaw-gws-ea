@@ -1,5 +1,5 @@
 /**
- * Answers in words to the requests a channel posts as text (KTD9; R8, R9, R11).
+ * Answers in words to the requests a channel posts as text.
  *
  * On a channel whose account shows no cards (ChatSdkBridgeConfig.textRequests),
  * a question or approval request is answered, in the conversation it was
@@ -38,20 +38,18 @@ import type { PostedRequest } from './chat-sdk-bridge.js';
 import type { QuestionRender } from './question-render-registry.js';
 
 /**
- * How long the bridge remembers a request it posted: whether one is still
- * open comes from its pending row, but an answer can find it only while it
- * is remembered. When each person last wrote is kept as long, since a plain
- * answer reads it against the requests posted since.
+ * Whether a request is still open comes from its pending row, but an answer
+ * can find it only while this remembers it. When each person last wrote is
+ * kept as long, since a plain answer reads it against the requests posted since.
  */
 export const POSTED_REQUEST_KEPT_MS = 30 * 24 * 60 * 60 * 1000;
 
-/** How long an answer taken is remembered: as long as Pub/Sub may deliver it again. */
+/** As long as Pub/Sub may deliver an answer again. */
 const ANSWER_KEPT_MS = 7 * 24 * 60 * 60 * 1000;
 
-/** A plain answer is for a question only this long after it at the least (AE3: a reply typed as it arrived is not). */
+/** A reply sooner than this after a question was typed as it arrived, so it is no plain answer to it. */
 const PLAIN_ANSWER_AFTER_MS = 5_000;
 
-/** How many of its newest requests a conversation's record holds. */
 const REQUESTS_PER_CONVERSATION = 100;
 
 // ---------------------------------------------------------------------------
@@ -69,7 +67,6 @@ function polarityOf(word: string): Polarity | undefined {
   return undefined;
 }
 
-/** Text as an answer reads it: in lower case, its spaces single, without what surrounds its letters and digits. */
 function bare(text: string): string {
   return text
     .replace(/\s+/gu, ' ')
@@ -77,27 +74,25 @@ function bare(text: string): string {
     .replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, '');
 }
 
-/** What may follow an answer that begins a reply: nothing, a space, or punctuation that does not run into a digit. */
+/** Nothing, a space, or punctuation that does not run into a digit (so "1.5" does not answer 1). */
 function endsAnswer(rest: string): boolean {
   return rest === '' || /^\s/u.test(rest) || (/^[,.;:!?)\]}…—–-]/u.test(rest) && !/^[,.:]\d/u.test(rest));
 }
 
-/** An option as a reply can name it. */
 interface NamedOption {
   readonly option: NormalizedOption;
-  /** Its label, bare; empty when the label has no letters or digits to name it by. */
+  /** The bare label; empty when it has no letters or digits to name it by. */
   readonly name: string;
-  /** Its number, for a request that lists its options by number. */
+  /** Absent on an approve/reject request, which is asked yes or no. */
   readonly number?: number;
   readonly polarity?: Polarity;
 }
 
 /**
- * The options a reply can choose, as the request asked for them
- * (chat-sdk-bridge howToAnswer). An approve/reject request is asked yes or
- * no: approve is the yes, reject the no, and a reason follows the no rather
- * than being an option of its own. Any other request lists its options by
- * number and name, and one named yes or no is chosen by that word too.
+ * As the request asked for them (chat-sdk-bridge howToAnswer). An
+ * approve/reject request is asked yes or no, and a reason follows the no
+ * rather than being an option of its own. Any other request lists its options
+ * by number and name, and one named yes or no is chosen by that word too.
  */
 function namedOptions(options: readonly NormalizedOption[]): NamedOption[] {
   if (approveRejectRequest(options)) {
@@ -116,7 +111,6 @@ function namedOptions(options: readonly NormalizedOption[]): NamedOption[] {
   });
 }
 
-/** The one option a reply that is nothing but an answer chooses: exactly, or by a prefix of one option's name only. */
 function wholeAnswer(text: string, named: readonly NamedOption[]): NamedOption | undefined {
   const reply = bare(text);
   if (reply === '') return undefined;
@@ -133,11 +127,7 @@ function wholeAnswer(text: string, named: readonly NamedOption[]): NamedOption |
   return prefixed.length === 1 ? prefixed[0] : undefined;
 }
 
-/**
- * The one option a reply begins with — a yes or no, a number, or an option's
- * whole name (the longest it begins with) — and the text after it. A prefix
- * chooses nothing here: "I think" must not choose Ignore.
- */
+/** Only a whole name counts here, never a prefix: "I think" must not choose Ignore. */
 function leadingAnswer(text: string, named: readonly NamedOption[]): { chosen: NamedOption; rest: string } | undefined {
   const reply = text
     .replace(/\s+/gu, ' ')
@@ -178,17 +168,15 @@ function leadingAnswer(text: string, named: readonly NamedOption[]): { chosen: N
   };
 }
 
-/** An answer read from words: the option chosen, and the reason given with a rejection. */
 export interface Choice {
   readonly value: string;
   readonly reason?: string;
 }
 
 /**
- * The answer some words give to a request with these options. `whole`: the
- * words are nothing but an answer, as a plain answer must be. `leading`: they
- * begin with one, as a quoted reply may, and for a request whose rejection
- * takes a reason, the text after a no is the reason.
+ * `whole`: the words are nothing but an answer, as a plain answer must be.
+ * `leading`: they begin with one, as a quoted reply may, and for a request
+ * whose rejection takes a reason, the text after a no is the reason.
  */
 export function readAnswer(
   text: string,
@@ -206,7 +194,7 @@ export function readAnswer(
   return { value: leading.chosen.option.value, ...(reason === '' ? {} : { reason }) };
 }
 
-/** The option a 👍 or 👎 chooses: approve or reject. A skin tone counts as the same emoji. */
+/** A skin tone or variation selector counts as the same emoji. */
 function thumbAnswer(emoji: string): string | undefined {
   const plain = emoji.replace(/[\u{1F3FB}-\u{1F3FF}]|\uFE0F/gu, '');
   if (plain === 'thumbs_up' || plain === '👍') return APPROVE_OPTION;
@@ -214,7 +202,6 @@ function thumbAnswer(emoji: string): string | undefined {
   return undefined;
 }
 
-/** The answer a reaction gives to a request with these options: only 👍 or 👎, and only on an approve/reject request. */
 export function reactionAnswer(emoji: string, options: readonly NormalizedOption[]): string | undefined {
   return approveRejectRequest(options) ? thumbAnswer(emoji) : undefined;
 }
@@ -223,21 +210,19 @@ export function reactionAnswer(emoji: string, options: readonly NormalizedOption
 // The records
 // ---------------------------------------------------------------------------
 
-/** A request posted in a conversation, as its record of requests holds it. */
 interface ConversationRequest {
   readonly messageId: string;
   /** When the platform recorded it, as ISO-8601; absent when the platform reported no time. */
   readonly postedAt?: string;
 }
 
-/** When a person last wrote in a DM: that message, and when they wrote the one before it. */
+/** A person's last message in a DM, and `before`: when they wrote the one before it. */
 interface LastWritten {
   readonly id: string;
   readonly at: number;
   readonly before?: number;
 }
 
-/** An answer taken: the request it answered. */
 interface TakenAnswer {
   readonly questionId: string;
 }
@@ -254,7 +239,7 @@ function answerKey(adapterName: string, answerId: string): string {
   return `text-request:${adapterName}:answer:${answerId}`;
 }
 
-/** Add a request the bridge posted to its conversation's record, so a plain answer there can find it. */
+/** So a plain answer in the conversation can find the request. */
 export async function indexPostedRequest(
   state: StateAdapter,
   adapterName: string,
@@ -273,48 +258,39 @@ export async function indexPostedRequest(
 // Taking answers
 // ---------------------------------------------------------------------------
 
-/** Someone's message, as the check reads it. */
 export interface ReplyIn {
-  /** The message's own id, the same each time the platform delivers it: the answer's id. */
+  /** The same each time the platform delivers the message: the answer's id. */
   readonly id: string;
-  /** The conversation it was written in, as the bridge's platform id. */
   readonly platformId: string;
   readonly userId: string;
-  /** The assistant's own message. */
   readonly isMe: boolean;
   readonly isDM: boolean;
   /** When the platform recorded it. */
   readonly at: Date;
   readonly text: string;
-  /** The message it quotes, when it quotes one. A quote that names no message replied to (a forward) has none. */
+  /** A quote that names no message replied to (a forward) has no `messageId`. */
   readonly quote?: { readonly messageId?: string };
 }
 
-/** Someone's reaction, as the check reads it. */
 export interface ReactionIn {
-  /** The reaction's own id, the same each time the platform delivers it: the answer's id. */
+  /** The same each time the platform delivers the reaction: the answer's id. */
   readonly id: string;
-  /** The conversation of the message reacted to, as the bridge's platform id. */
+  /** The conversation of the message reacted to. */
   readonly platformId: string;
   readonly userId: string;
-  /** The assistant's own reaction. */
   readonly isMe: boolean;
-  /** The emoji's name. */
   readonly emoji: string;
-  /** The message reacted to. */
   readonly messageId: string;
 }
 
-/** An answer to hand to the request's handler (ChannelSetup.onAction). */
+/** For the request's handler (ChannelSetup.onAction). */
 export interface Answer {
   readonly questionId: string;
   readonly value: string;
   readonly reason?: string;
-  /** Who answered. */
   readonly userId: string;
   /** The request's message. */
   readonly messageId: string;
-  /** The conversation the answer was given in. */
   readonly platformId: string;
 }
 
@@ -324,23 +300,23 @@ export interface AnswersOptions {
   /** The request the bridge posted as this message, while it takes answers (readPostedRequest). */
   readonly postedRequest: (messageId: string) => Promise<PostedRequest | undefined>;
   readonly render: (questionId: string) => Promise<QuestionRender | undefined>;
-  /** Hand an answer to its handler: resolves once the handler has finished, rejects when it fails. */
+  /** Rejects when the handler fails, which releases the answer for the platform's next delivery. */
   readonly dispatch: (answer: Answer) => Promise<void>;
   /** How a message mentioning the assistant writes it, as `@name`: a reply may begin with it. */
   readonly selfMention?: string;
 }
 
 export interface Answers {
-  /** Take a message as an answer when it is one: true once its answer is handled, or was already; false otherwise. */
+  /** True once its answer is handled, now or before; false when it is no answer. */
   takeMessage(reply: ReplyIn): Promise<boolean>;
-  /** Take a reaction as an answer when it is one: true once its answer is handled, or was already; false otherwise. */
+  /** True once its answer is handled, now or before; false when it is no answer. */
   takeReaction(reaction: ReactionIn): Promise<boolean>;
 }
 
 /** When a person wrote before a message: at a time, not on record, or not known because they have written since. */
 type Before = { readonly kind: 'at'; readonly at: number } | { readonly kind: 'none' } | { readonly kind: 'unknown' };
 
-/** The request an inbound may answer, and the answer it gives, read once earlier answers to it have settled. */
+/** `answer` is read only once earlier answers to the request have settled. */
 interface Candidate {
   readonly questionId: string;
   readonly answer: () => Promise<Answer | undefined>;
@@ -358,7 +334,6 @@ export function createAnswers(options: AnswersOptions): Answers {
   const { state, adapterName } = options;
   const queues = new Map<string, Promise<void>>();
 
-  /** Run work after the work already queued under its key, one at a time. */
   function serialized<T>(key: string, work: () => Promise<T>): Promise<T> {
     const run = (queues.get(key) ?? Promise.resolve()).then(work);
     const settled = run.then(
@@ -382,7 +357,6 @@ export function createAnswers(options: AnswersOptions): Answers {
     return endsAnswer(rest) ? rest.replace(/^[\s,:]+/u, '') : trimmed;
   }
 
-  /** The request posted as this message in this conversation, while it takes answers. */
   async function requestIn(platformId: string, messageId: string): Promise<PostedRequest | undefined> {
     const posted = await options.postedRequest(messageId);
     return posted?.platformId === platformId ? posted : undefined;
@@ -407,10 +381,8 @@ export function createAnswers(options: AnswersOptions): Answers {
   }
 
   /**
-   * The answer an inbound gives to the request posted as `messageId`, read
-   * when its turn comes: only while that message is still the request, and
-   * the request is open. An earlier answer may have resolved it, or posted
-   * the next request under the same question.
+   * Read when its turn comes, since an earlier answer may have resolved the
+   * request or posted the next one under the same question.
    */
   function candidate(
     inbound: { readonly platformId: string; readonly userId: string },
@@ -472,11 +444,7 @@ export function createAnswers(options: AnswersOptions): Answers {
     });
   }
 
-  /**
-   * The newest open question in a DM, when it was posted after the person
-   * last wrote there and at least 5 seconds before their reply. Approvals
-   * never take a plain answer, so they are passed over.
-   */
+  /** Approvals are passed over: they never take a plain answer. */
   async function plainCandidate(reply: ReplyIn, before: Before, text: string): Promise<Candidate | undefined> {
     if (before.kind === 'unknown') return undefined;
     const since = before.kind === 'at' ? before.at : -Infinity;

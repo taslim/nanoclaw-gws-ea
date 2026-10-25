@@ -1,4 +1,4 @@
-/** KTD13 / R21: each resident instruction file keeps its own cap and a reason for any raise. */
+/** Each resident instruction file keeps its own cap and a reason for any raise. */
 import fs from 'node:fs';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
@@ -105,7 +105,7 @@ function filesUnder(relative: string): string[] {
   });
 }
 
-/** Discover resident guidance, including newly selected skills; on-demand SKILL.md procedures are outside R21. */
+/** Discover resident guidance, including newly selected skills; on-demand SKILL.md procedures carry no cap. */
 function guidanceFiles(): string[] {
   const moduleFiles = fs
     .readdirSync(path.join(ROOT, 'src/modules'), { withFileTypes: true })

@@ -52,7 +52,6 @@ export async function handleApprovalsResponse(payload: ResponsePayload): Promise
   return true;
 }
 
-/** The decided request edited to its outcome, when the channel left it as posted. */
 function showOutcome(approval: PendingApproval, answer: ResponsePayload, reason?: string): Promise<void> {
   return showRequestOutcome(
     getDeliveryAdapter(),

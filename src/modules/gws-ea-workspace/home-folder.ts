@@ -1,11 +1,11 @@
 /**
- * The home folder (R2, R3, KTD3): one folder in the assistant's Drive where
- * `main` keeps what it makes for the principal, shared with every one of the
- * principal's addresses, so a file made there opens from any of their
- * accounts without a request for access (AE1).
+ * The home folder: one folder in the assistant's Drive where `main` keeps
+ * what it makes for the principal, shared with every one of the principal's
+ * addresses, so a file made there opens from any of their accounts without a
+ * request for access.
  *
- * The host keeps it on a timer, never at start. Each tick heals what changed
- * and leaves alone what people chose:
+ * The host keeps it on a timer that never holds up its start. Each tick heals
+ * what changed and leaves alone what people chose:
  *
  * - the folder exists: a trashed one is restored, and one deleted for good is
  *   made anew, its id recorded, and `main` told where it is;
@@ -64,7 +64,7 @@ export interface HomeFolderOptions {
 export interface HomeFolder {
   /** The folder's id as last recorded, for what reads it synchronously at each spawn. */
   folderId(): string | undefined;
-  /** Read the recorded folder from the database, as the host starts. */
+  /** Reads the recorded folder from the database alone, never from Google. */
   load(): Promise<void>;
   /** Reconcile once. Never throws: a failure is logged, and the next tick tries again. */
   tick(): Promise<void>;
@@ -78,8 +78,8 @@ function message(error: unknown): string {
 
 /**
  * Named for the assistant alone: an assistant has one principal, and nothing
- * in Drive follows the principal's name, which they can change (R16). The
- * name is given once, when the folder is made; the host never renames one.
+ * in Drive follows the principal's name, which they can change. The name is
+ * given once, when the folder is made; the host never renames one.
  */
 function homeFolderName(assistant: string): string {
   return `Principal · ${assistant}`;

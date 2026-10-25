@@ -1,5 +1,5 @@
 /**
- * The daily sync (KTD6): one recurring task in main's conversation, before
+ * The daily sync: one recurring task in main's conversation, before
  * the principal's day starts, whose pre-task script wakes main every day to look
  * ahead and read what has waited for it; and `ncl matters today`, the script of a morning rundown
  * the principal asks for. Driven through `ncl matters` and the host's pass
@@ -405,7 +405,7 @@ describe('the daily sync', () => {
     expect(await data(run('matters-sync', {}))).toEqual({ wakeAgent: true, data: [] });
   });
 
-  it('wakes main for each thread waiting to be placed: who its mail carried, when the latest came, and its Gmail thread (R27)', async () => {
+  it('wakes main for each thread waiting to be placed: who its mail carried, when the latest came, and its Gmail thread', async () => {
     await recordThreadMessage(
       { threadKey: THREAD, side: 'outside', gmailMessageId: 'g-1' },
       '2026-10-12T08:15:00.000Z',

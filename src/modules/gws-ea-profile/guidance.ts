@@ -1,13 +1,13 @@
 /**
  * A GWS-EA agent's guidance: how it works, as a required section of the
- * project document only that agent receives (src/project-doc-sections.ts).
+ * project document of each group it is for (src/project-doc-sections.ts).
  * The file ships with the release, read from the checkout the host runs
  * from as NanoClaw reads its other instruction files, and never lives where
  * the agent can edit it.
  *
  * A missing or empty file is tolerated but never silent, like a missing base
  * document (src/project-doc-compose.ts): throwing would fail every spawn.
- * The release preflight refuses a release without it.
+ * `guidance-caps.test.ts` fails when a registered file is missing.
  */
 import fs from 'node:fs';
 import path from 'node:path';
@@ -16,11 +16,10 @@ import { log } from '../../log.js';
 import { registerRequiredProjectDocSection } from '../../project-doc-sections.js';
 
 export type Guidance = {
-  /** The agent it is for, as the host's log names it. */
+  /** The agent's name in the host's log. */
   readonly agent: string;
-  /** The section's heading. */
   readonly heading: string;
-  /** The file, relative to the checkout. */
+  /** Relative to the checkout. */
   readonly file: string;
 } & (
   | {
@@ -28,14 +27,13 @@ export type Guidance = {
       readonly agentGroupId: () => Promise<string | null>;
     }
   | {
-      /** Whether `agentGroupId` receives it: guidance for every group a setting names. */
       readonly receives: (agentGroupId: string) => Promise<boolean>;
     }
 );
 
 const guidanceFiles = new Set<string>();
 
-/** Every registered guidance file, relative to the checkout: what the release's caps and command checks cover. */
+/** Relative to the checkout, with `/` separators. */
 export function registeredGuidanceFiles(): string[] {
   return [...guidanceFiles].sort();
 }

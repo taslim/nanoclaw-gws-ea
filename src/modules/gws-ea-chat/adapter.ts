@@ -1,34 +1,23 @@
 /**
- * The assistant's Google Chat channel (KTD1, KTD4): upstream's Chat SDK
- * adapter, signed in as the assistant's own Workspace account, with only how
- * its events arrive replaced. Everything the assistant sends, edits, or reacts with still goes
- * through upstream's adapter and its message model, but for a message with
- * files on it, which the SDK drops (below).
+ * The assistant's Google Chat channel: upstream's Chat SDK adapter, signed in
+ * as the assistant's own Workspace account, with how its events arrive
+ * replaced. Sending stays the SDK's except where a method below says why.
  *
- * Chat's events are pulled from Pub/Sub (delivery.ts), never pushed, so the
- * adapter declares itself polling, the bridge registers no webhook route for
- * it, and it refuses any webhook request. Each pulled event is read as the
- * assistant (hydrate.ts) and dispatched through the SDK as its webhook path
- * dispatches a message, with the DM and thread taken from the space's type.
- * The event's handler resolves only once every part is routed or found
- * gone, so the consumer acknowledges nothing before it is handled.
+ * Chat's events are pulled from Pub/Sub (delivery.ts), never pushed. Each
+ * pulled event is read as the assistant (hydrate.ts) and dispatched through
+ * the SDK as its webhook path dispatches a message, with the DM and thread
+ * taken from the space's type. The event's handler resolves only once every
+ * part is routed or deliberately dropped, so the consumer acknowledges nothing
+ * before it is handled.
  *
  * While a turn works on a message past a few seconds, the assistant shows 👀
- * on it (R6, KTD7), placed and removed by the name Chat gives it, never by
- * emoji: the SDK's own removal takes the first matching emoji, whoever placed
- * it. Each 👀 placed is recorded in the bridge's state store until it is
- * removed, so one left by a crash is removed when the channel next starts.
+ * on it, placed and removed by the name Chat gives it, never by emoji: the
+ * SDK's own removal takes the first matching emoji, whoever placed it. Each 👀
+ * placed is recorded in the bridge's state store until it is removed, so one
+ * left by a crash is removed when the channel next starts.
  *
- * Protected SDK methods this overrides, pinned by the SDK version and named
- * in the divergence guard: `handlePubSubMessageEvent` and
- * `normalizeBotMentions`. It also overrides `editMessage`: the SDK's text edit
- * names `cards_v2` in its update mask, which Google lets only a Chat app
- * update, so an edit made as the assistant updates the text alone.
- *
- * The SDK's post drops files, so the channel posts a message with files on
- * it itself, such as an approval request with its pictures (KTD6): each file
- * uploaded to the conversation, then one message with the text and every
- * upload.
+ * The SDK methods this overrides are pinned by the SDK version and named in
+ * the divergence guard (src/gws-ea/divergence.test.ts).
  */
 import { createHash, randomUUID } from 'node:crypto';
 
@@ -76,17 +65,15 @@ import { createChatMembershipReader, type AssistantChatChannel } from './members
 import { chatAcceptsInbound } from '../gws-ea-chats/db.js';
 
 /**
- * A reaction someone placed on a message in one of the assistant's
- * conversations, read from Chat. The SDK's own reaction dispatch is
- * fire-and-forget and swallows errors, so reactions reach the channel through
- * an awaited handler instead.
+ * The SDK's own reaction dispatch is fire-and-forget and swallows errors, so
+ * reactions reach the channel through an awaited handler instead.
  */
 export interface ChatReactionEvent extends Omit<ReactionEvent, 'thread' | 'message' | 'raw'> {
   /** The reaction's resource name, the same on every delivery. */
   readonly reactionName: string;
   /** The message reacted to, read as an inbound message is: its author's `isMe` marks the assistant's own. */
   readonly message: Message;
-  /** When it was placed: its event's time, as Google records it. */
+  /** Its event's time, as Google records it. */
   readonly reactedAt: Date;
   readonly raw: ChatReaction;
 }
@@ -99,33 +86,28 @@ export interface AssistantChatAdapterOptions {
   readonly botUserId: string;
   /** How a mention of the assistant reads in the text agents see: `@{userName}`. */
   readonly userName: string;
-  /** The assistant's OAuth client for Chat (hostChatAuth). */
   readonly auth: OAuth2Client;
   readonly hydrator: ChatHydrator;
-  /** The assistant's Chat token, for the calls the channel makes itself: its working 👀, and messages with files. */
+  /** For the Chat calls the adapter makes itself rather than through the SDK. */
   readonly chatToken: () => Promise<string>;
   readonly fetch?: typeof globalThis.fetch;
-  /** Starts pulling Chat's events into `onChatEvent`; started when the adapter initializes, stopped when it disconnects. */
   readonly startDelivery: (onChatEvent: (event: WorkspaceEvent) => Promise<void>) => ChatDelivery;
 }
 
-/** A message notification, as the SDK's Pub/Sub path reads one, with the space the channel read. */
+/** Shaped as the SDK's Pub/Sub path reads a message notification. */
 interface ChatNotification extends WorkspaceEventNotification {
   readonly message: ChatMessage;
   readonly space: { name: string; type: string };
 }
 
-/** One part of an event, read and ready to dispatch in its place. */
 interface ReadPart {
-  /** Where it falls in the event: when it was written, as Google records it. */
+  /** When Google records it was written; an event's parts dispatch in this order. */
   readonly at: number;
   dispatch(): Promise<void>;
 }
 
 const CHAT = 'https://chat.googleapis.com/v1';
-/** Where Chat takes a file's bytes (`media.upload`). */
 const CHAT_UPLOAD = 'https://chat.googleapis.com/upload/v1';
-/** How long a turn works on a message before the assistant shows 👀 on it (R6). */
 const WORKING_AFTER_MS = 3_000;
 const WORKING_EMOJI = '👀';
 /** The state-store record of each 👀 placed and not yet removed: its reaction name, by message name. */
@@ -136,7 +118,6 @@ const ENDED_KEPT = 1_000;
 const SDK_DEDUPE_TTL_MS = 10 * 60_000;
 const AUDIO_DISPATCH_COMPLETE = { gwsEaAudioCompleted: true } as const;
 
-/** The assistant's 👀 on one message a turn works on. */
 interface Working {
   /** Shows the 👀 once the turn has run WORKING_AFTER_MS; unset once it fired or the work ended. */
   timer?: NodeJS.Timeout;
@@ -156,9 +137,7 @@ function sdkDedupeKey(adapterName: string, messageId: string): string {
 }
 
 /**
- * The assistant's Google OAuth client for Chat: its token is the host's own
- * (KTD5), taken again before Google would expire it. The host's token
- * source hands out a token only while it has longer than
+ * The host's token source hands out a token only while it has longer than
  * `RENEW_BEFORE_EXPIRY_MS` to live, so the client holds each one no longer.
  */
 export function hostChatAuth(token: () => Promise<string>, fetch?: typeof globalThis.fetch): OAuth2Client {
@@ -182,11 +161,9 @@ export class AssistantChatAdapter
   private readonly membership: ReturnType<typeof createChatMembershipReader>;
   private delivery: ChatDelivery | undefined;
   private reactionHandler: ChatReactionHandler | undefined;
-  /** The 👀 of each message a turn works on, until it is off. */
   private readonly working = new Map<string, Working>();
   /** Messages whose work ended, oldest first. */
   private readonly ended = new Set<string>();
-  /** The record's writes, in the order they were asked for. */
   private recording: Promise<void> = Promise.resolve();
 
   constructor(options: AssistantChatAdapterOptions) {
@@ -227,11 +204,9 @@ export class AssistantChatAdapter
   }
 
   /**
-   * A turn is working on the message (each typing pulse that names it). Its
-   * 👀 shows once the turn has run WORKING_AFTER_MS, unless the work ended
-   * first, and never again once it has. Only a Chat message can carry it:
-   * one the host made itself, such as main's welcome to the principal, has
-   * nothing in Chat to react to.
+   * Called on each typing pulse that names the message. Only a Chat message
+   * can carry the 👀: one the host made itself, such as main's welcome to the
+   * principal, has nothing in Chat to react to.
    */
   workingOn(_threadId: string, messageId: string): Promise<void> {
     if (spaceOfMessage(messageId) === undefined) return Promise.resolve();
@@ -246,7 +221,7 @@ export class AssistantChatAdapter
     return Promise.resolve();
   }
 
-  /** The work on the message ended: its 👀 comes off, by the name Chat gave it, once Chat has placed it. */
+  /** Waits for a 👀 still being placed, then removes it by the name Chat gave it. */
   async endWorking(_threadId: string, messageId: string): Promise<void> {
     if (this.ended.has(messageId)) return;
     this.ended.add(messageId);
@@ -264,9 +239,9 @@ export class AssistantChatAdapter
   }
 
   /**
-   * Edit one of the assistant's messages, such as a request showing its
-   * outcome. A user may update only a message's text, never a card, so the
-   * update names the text alone; the assistant never posts a card.
+   * The SDK's text edit names `cardsV2` in its update mask, which Google lets
+   * only a Chat app update, so an edit made as the assistant names the text
+   * alone; the assistant never posts a card.
    */
   override async editMessage(
     threadId: string,
@@ -312,11 +287,10 @@ export class AssistantChatAdapter
   }
 
   /**
-   * Post a message with files on it as one message, the one a reaction or
-   * quote then answers (KTD6). Each file is uploaded to the conversation
-   * first, then the message is posted with its text and every upload, as the
-   * assistant. A file Chat does not take rejects with FilesNotAttachedError
-   * before any message is posted. A file's bytes go only to Google.
+   * The SDK's post drops files. One message carries the text and every upload,
+   * so a reaction or quote answers one message. A file Chat does not take
+   * rejects with FilesNotAttachedError before any message is posted. A file's
+   * bytes go only to Google.
    */
   async postWithFiles(
     threadId: string,
@@ -341,7 +315,7 @@ export class AssistantChatAdapter
     return { id: posted.name, threadId, raw: posted };
   }
 
-  /** Upload one file to the space (`media.upload`): its name, then its bytes. Resolves to what a message attaches. */
+  /** Resolves to the `attachmentDataRef` a message attaches. */
   private async upload(spaceName: string, file: OutboundFile): Promise<Record<string, unknown>> {
     const boundary = `gws-ea-${randomUUID()}`;
     const data = Buffer.concat([
@@ -375,23 +349,20 @@ export class AssistantChatAdapter
     return ref;
   }
 
-  /** No request reaches this host from Google: Chat's events are pulled. */
   override handleWebhook(_request: Request): Promise<Response> {
     return Promise.resolve(new Response('Google Chat events reach this host by Pub/Sub pull', { status: 404 }));
   }
 
-  /** Where reactions are handed once read; without a handler, a reaction is read and acknowledged. */
+  /** Without a handler, a reaction is read and acknowledged. */
   setReactionHandler(handler: ChatReactionHandler | undefined): void {
     this.reactionHandler = handler;
   }
 
   /**
-   * Handle one pulled event (KTD4): read each message or reaction it names,
-   * then dispatch them in the order they were written. Nothing is dispatched
-   * until every part is read, and dispatch stops at the first part not
-   * routed, so on redelivery the parts arrive in order again and the router
-   * drops the ones already routed. A part that is gone is acknowledged with
-   * the rest.
+   * Nothing is dispatched until every part is read, and dispatch stops at the
+   * first part that fails, so on redelivery the parts arrive in order again
+   * and the router drops the ones already routed. A part that is gone is
+   * acknowledged with the rest.
    */
   async handleChatEvent(event: WorkspaceEvent): Promise<void> {
     if (await this.membership.handle(event)) return;
@@ -421,13 +392,9 @@ export class AssistantChatAdapter
   }
 
   /**
-   * Dispatch one message as the SDK's webhook path does, and wait until it
-   * is routed. A DM is addressed with no thread and the `:dm` mark; any other
-   * space by the message's thread.
-   *
    * The SDK declares this method void, and its push handler drops what it
    * returns; that handler is reached only through handleWebhook, which
-   * refuses. handleChatEvent awaits it.
+   * refuses. handleChatEvent awaits it until the message is routed.
    */
   // eslint-disable-next-line @typescript-eslint/no-misused-promises -- the SDK's own caller is unreachable (above)
   protected override async handlePubSubMessageEvent(notification: WorkspaceEventNotification): Promise<void> {
@@ -462,10 +429,10 @@ export class AssistantChatAdapter
   }
 
   /**
-   * Mark a mention of the assistant as `@{userName}`, the form the SDK
+   * Writes a mention of the assistant as `@{userName}`, the form the SDK
    * detects. The assistant is a person, not a Chat app, so its mention is
-   * matched by its user name whatever the user type. Rewritten from the
-   * last mention back, so earlier offsets still hold.
+   * matched by its user resource name whatever the user type. Rewritten from
+   * the last mention back, so earlier offsets still hold.
    */
   protected override normalizeBotMentions(message: GoogleChatMessage): string {
     let text = message.text || '';
@@ -483,7 +450,7 @@ export class AssistantChatAdapter
     return text;
   }
 
-  /** Place the 👀 and record its name; a 👀 Chat refuses is not tried again. */
+  /** A 👀 Chat refuses is not tried again. */
   private async placeWorking(messageId: string, entry: Working): Promise<void> {
     let placed: unknown;
     try {
@@ -506,9 +473,9 @@ export class AssistantChatAdapter
   }
 
   /**
-   * Remove the 👀 by its name. One Chat no longer has, or no longer lets the
-   * assistant reach (404, 403), is gone. One that cannot be removed now stays
-   * recorded, and is removed when the channel next starts.
+   * One Chat no longer has, or no longer lets the assistant reach (404, 403),
+   * is gone. One that cannot be removed now stays recorded, and is removed
+   * when the channel next starts.
    */
   private async removeWorking(messageId: string, name: string): Promise<void> {
     try {
@@ -528,10 +495,7 @@ export class AssistantChatAdapter
     await this.recordWorking();
   }
 
-  /**
-   * Record every 👀 placed and not yet removed. Writes run one at a time,
-   * each recording what is placed when it runs.
-   */
+  /** Writes run one at a time, each recording what is placed when it runs. */
   private recordWorking(): Promise<void> {
     this.recording = this.recording
       .then(async () => {
@@ -549,7 +513,6 @@ export class AssistantChatAdapter
     return this.recording;
   }
 
-  /** Remove each 👀 a previous run placed and left (a crash), and clear its record. */
   private async removeLeftWorking(): Promise<void> {
     let recorded: unknown;
     try {
@@ -595,10 +558,7 @@ export class AssistantChatAdapter
     };
   }
 
-  /**
-   * The message with its sender named. The SDK caches the name it is given,
-   * so a later message from the same person reads it there too.
-   */
+  /** The SDK caches the name it is given, so a later message from the same person reads it there too. */
   private async withSenderName(message: ChatMessage): Promise<ChatMessage> {
     if (message.sender.name === this.botUserId) return message;
     const displayName = await this.hydrator.displayName(message.sender.name);
@@ -701,18 +661,12 @@ function gchatAudioSource(raw: Record<string, unknown>): AudioSource {
   return { kind: 'audio', ...(quote?.quoteType === 'FORWARD' ? { forwarded: true } : {}) };
 }
 
-/**
- * Google Chat's wiring defaults. Every DM engages; a group conversation
- * engages on a mention, which an operator can widen per wiring. Unknown
- * senders ask for approval in both.
- */
 export const GCHAT_DEFAULTS: ChannelDefaults = {
   dm: { engageMode: 'pattern', engagePattern: '.', threads: false, unknownSenderPolicy: 'request_approval' },
   group: { engageMode: 'mention', threads: true, unknownSenderPolicy: 'request_approval' },
   mentions: 'platform',
 };
 
-/** When Google recorded a message the assistant posted: the `createTime` of the message it returned. */
 function chatCreateTime(raw: unknown): Date | undefined {
   if (!isRecord(raw) || typeof raw.createTime !== 'string') return undefined;
   const at = new Date(raw.createTime);
@@ -735,12 +689,11 @@ export function escapeChatRequestText(text: string): string {
 }
 
 /**
- * The channel: the adapter behind the Chat SDK bridge. Pub/Sub may hand an
- * event out again after it was routed, so the router drops a copy already
- * queued. Google lets a user write only text, so questions and approval
- * requests post in words (R7), with any pictures they name attached (KTD6),
- * each remembered with the time Google recorded it. A request the host wrote
- * passes `escapeChatRequestText`, whatever its builder quoted.
+ * Pub/Sub may hand an event out again after it was routed, so the router drops
+ * a copy already queued. Google lets a user write only text, so questions and
+ * approval requests post in words, with any pictures they name attached, each
+ * remembered with the time Google recorded it. A request the host wrote passes
+ * `escapeChatRequestText`, whatever its builder quoted.
  */
 export function createAssistantChatChannel(adapter: AssistantChatAdapter): AssistantChatChannel {
   const channel = createChatSdkBridge({

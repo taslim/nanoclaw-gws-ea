@@ -1,23 +1,20 @@
 /**
- * The principal's access to the assistant's 1Password vault (KTD4, R4-R6,
- * R16). An agent with browser access asks, through its host request and
- * guard. The host binds the account and vault from its own records and
- * shares only with the principal's exact, confirmed 1Password user, through
- * the host management service account, which may grant access only on the
- * vaults it created. Actual access is read before any grant and after it, so a repeat
- * is safe and an unknown outcome is observed before anything is granted
- * again. A share answers with the link to the account's sign-in address and
- * the vault's exact name, which 1Password lists in the account's sidebar:
- * 1Password documents no link to a vault itself. Whatever stops sharing, the
- * principal gets one message to forward to their operator, naming the
+ * The principal's access to the assistant's 1Password vault. An agent with
+ * browser access asks, through its host request and guard. The host binds
+ * the account and vault from its own records and shares only with the
+ * principal's exact, confirmed 1Password user, through the host management
+ * service account, which may grant access only on the vaults it created. A
+ * share answers with the link to the account's sign-in address and the
+ * vault's exact name, which 1Password lists in the account's sidebar:
+ * 1Password documents no link to a vault itself. When sharing needs the
+ * operator, the principal gets one message to forward to them, naming the
  * assistant, account, vault and email: there is no request table, inbox or
  * notification route behind it.
  *
  * An email that is not one of the principal's addresses waits for the
  * principal's own confirmation, and binds only to the share it confirms: it
  * never becomes a principal address, so it changes no mail or calendar
- * authority. The principal's explicit retry after adding a login lists the
- * vault again at once.
+ * authority.
  */
 import { noVerifiedPrincipalMessage } from '../gws-ea-profile/approval-wording.js';
 import { answeredGuard, answeringAction, forbidden, invalidArgs } from '../../cli/delivery-action.js';
@@ -81,21 +78,17 @@ export interface VaultSharingProvider {
 }
 
 export interface VaultAccessDependencies {
-  /** The assistant's vault: its binding from local records, and the principal's explicit refresh. */
   readonly vault: Pick<BrowserVault, 'availability' | 'refresh'>;
-  /** Where the 1Password host policy is, located for every use. */
   readonly onePasswordPolicyFile: () => string | undefined;
-  /** The provider through the CLI the host policy recorded; undefined when this host cannot share. */
+  /** Undefined when this host cannot share. */
   readonly openProvider: (policy: OnePasswordHostPolicy) => Promise<VaultSharingProvider | undefined>;
 }
 
 /** View and edit, with the viewing that editing depends on: never management of the vault. */
 const PRINCIPAL_GRANT: readonly OnePasswordVaultPermission[] = ['allow_viewing', 'allow_editing'];
-/** The `pending_approvals.action` the principal's confirmation of another email resolves through. */
 const EMAIL_APPROVAL = 'browser_vault_email';
 const FIELDS: ReadonlySet<string> = new Set(['action', 'requestId', 'operation', 'email']);
 
-/** Why sharing needs the operator; each has its own sentence in the forwardable message. */
 type HandoffReason = 'not_a_member' | 'not_confirmed' | 'refused' | 'host_cannot_share' | 'unconfirmed';
 
 type ShareOutcome =
@@ -118,7 +111,6 @@ type ShareOutcome =
   | { readonly status: 'rate_limited' }
   | { readonly status: 'vault_unavailable' };
 
-/** The exact CLI the host policy recorded; a host where it cannot open does not share. */
 async function cliSharingProvider(policy: OnePasswordHostPolicy): Promise<VaultSharingProvider | undefined> {
   const opening = await OnePasswordCli.open({ command: policy.cliPath });
   return opening.status === 'ready' ? opening.cli : undefined;
@@ -151,7 +143,6 @@ export const vaultAccessGuard = defineGuardedAction({
 
 const emailPayload = (email: string): { readonly email: string } => ({ email });
 
-/** Another email for the principal's 1Password account is theirs only on their own confirmation. */
 const vaultEmailGuard = defineGuardedAction({
   action: 'gws_ea_browser.vault_email',
   grantActionName: EMAIL_APPROVAL,
@@ -191,7 +182,6 @@ interface MessageFacts {
   readonly guest: boolean;
 }
 
-/** What the principal forwards to their operator as it is: the assistant, account, exact vault and email. */
 async function operatorMessage(reason: HandoffReason, facts: MessageFacts): Promise<string> {
   const profile = await getGwsEaProfile();
   const name = profile.assistant_display_name ?? 'my assistant';
@@ -219,7 +209,6 @@ async function operatorMessage(reason: HandoffReason, facts: MessageFacts): Prom
   return `Could you give ${facts.email} view and edit access to the 1Password vault my assistant ${assistant} keeps its logins in? It is ${vault} in the 1Password account at ${facts.link} (ID ${facts.accountId}). ${why} Once that's done, I'll ask ${name} to check again.`;
 }
 
-/** How a failed provider call ends a share. */
 function failureKind(reason: OnePasswordFailureReason): 'rate_limited' | 'refused' | 'authority' | 'unknown' {
   switch (reason) {
     case 'rate_limited':
@@ -238,7 +227,6 @@ function failureKind(reason: OnePasswordFailureReason): 'rate_limited' | 'refuse
   }
 }
 
-/** How a share ends without access: a forwardable handoff, or a provider failure as one. */
 function endings(facts: Omit<MessageFacts, 'guest'>): {
   readonly handoff: (reason: HandoffReason, guest?: boolean) => Promise<ShareOutcome>;
   readonly failure: (reason: OnePasswordFailureReason) => Promise<ShareOutcome>;
@@ -330,7 +318,7 @@ async function shareVault(email: string, dependencies: VaultAccessDependencies):
   return after.userIds.includes(user.userId) ? shared : handoff('unconfirmed');
 }
 
-/** AE6: list the vault again now, so a login the principal just added is usable. */
+/** Lists the vault again now, so a login the principal just added is usable. */
 async function refreshVault(dependencies: VaultAccessDependencies): Promise<Record<string, unknown>> {
   try {
     await dependencies.vault.refresh();
@@ -407,8 +395,8 @@ async function vaultAccessRequest(
 }
 
 /**
- * What main is told once the principal confirmed another email and the host acted on it. The host keeps no
- * record of that email, so sharing with it later asks the principal again (KTD17).
+ * What the requesting agent is told once the principal confirmed another email and the host acted on it. The host
+ * keeps no record of that email, so sharing with it later asks the principal again.
  */
 function confirmedNote(email: string, outcome: ShareOutcome): string {
   const confirmed = `The principal confirmed ${email} as the email their 1Password account uses.`;
@@ -429,9 +417,8 @@ function confirmedNote(email: string, outcome: ShareOutcome): string {
 }
 
 /**
- * Main's `vault_access` host request, and the principal's confirmation of
- * another email. The browser module registers the defaults; nothing else
- * reaches the provider.
+ * The `vault_access` host request and the principal's confirmation of
+ * another email: the only way an agent reaches vault sharing.
  */
 export function registerVaultAccessDelivery(dependencies: VaultAccessDependencies = DEFAULT_DEPENDENCIES): void {
   registerDeliveryAction(

@@ -6,7 +6,7 @@ import { assistantOwnAddresses, getGwsEaProfile, listVerifiedPrincipalUsers } fr
 import { createFingerprintKey, fingerprintKeyFile, identityFingerprint, readFingerprintKey } from './fingerprint.js';
 import type { ForgottenFingerprint } from './forget-handoff.js';
 
-/** The fixed set of levels, closest first (R13). Anyone without a record is `unknown`, which is never stored. */
+/** Closest first. Anyone without a record is `unknown`, which is never stored. */
 export const PERSON_LEVELS = ['inner-circle', 'close', 'active', 'known'] as const;
 export type PersonLevel = (typeof PERSON_LEVELS)[number];
 
@@ -14,7 +14,7 @@ export type PersonLevel = (typeof PERSON_LEVELS)[number];
 export const CHANGE_SOURCES = ['principal', 'learned'] as const;
 export type ChangeSource = (typeof CHANGE_SOURCES)[number];
 
-/** Where an identity came from: the principal, the Workspace directory, or calendar history. */
+/** `directory` is the Workspace directory; `calendar`, calendar history. */
 export const IDENTITY_SOURCES = ['principal', 'directory', 'calendar'] as const;
 export type IdentitySource = (typeof IDENTITY_SOURCES)[number];
 
@@ -26,16 +26,15 @@ export interface PersonIdentity {
 }
 
 /**
- * What the host enforces about a person, and nothing else: who they are by
- * identity, and their one level. What `main` knows of them lives in its own
- * memory, one file per person that names this record's ID.
+ * Only what the host enforces: identities and one level. What `main` knows of
+ * the person lives in its own memory, one file per person naming this
+ * record's ID.
  */
 export interface Person {
   readonly id: string;
   readonly name: string;
   readonly level: PersonLevel;
   readonly level_source: ChangeSource;
-  /** A short account of why the person has this level. */
   readonly level_basis: string;
   readonly level_set_at: string;
   readonly identities: readonly PersonIdentity[];
@@ -53,7 +52,7 @@ export interface PersonSummary {
 export type FindMatch = 'identity' | 'name' | 'name-prefix';
 
 export interface FindPeopleResult {
-  /** How the people were found, or null when nobody matched. */
+  /** Null when nobody matched. */
   readonly matched_by: FindMatch | null;
   readonly people: readonly PersonSummary[];
 }
@@ -62,17 +61,15 @@ export interface FindPeopleResult {
 export interface AddPersonInput {
   readonly name: string;
   readonly level: string;
-  /** `principal` when the principal said so; `learned` when the assistant derived it. */
   readonly source: string;
   /**
    * Who chose the level, when it differs from `source`: `learned` when the
-   * principal gave the person but not where they stand, so the level stays
-   * the assistant's judgment and learning may revise it. Defaults to `source`.
+   * principal gave the person but not where they stand. Defaults to `source`.
    */
   readonly levelSource?: string;
   readonly basis: string;
   readonly identity?: string;
-  /** Where the identity came from; `principal` by default on the principal's word, required when learned. */
+  /** Defaults to `principal` on the principal's word; required when learned. */
   readonly identitySource?: string;
 }
 
@@ -117,7 +114,6 @@ export interface PersonToForget extends ForgottenPerson {
  */
 export type PersonForgetReview = (person: PersonToForget) => Promise<readonly string[]>;
 
-/** What forgetting a person answers main. */
 export interface ForgetAnswer {
   readonly forgotten: string;
   readonly name: string;
@@ -135,8 +131,7 @@ const CHANNEL_PATTERN = /^[a-z][a-z0-9-]{0,31}$/u;
 const HOOK_ID_PATTERN = /^[a-z0-9][a-z0-9._-]*:[a-z0-9][a-z0-9._-]*$/u;
 
 // ---------------------------------------------------------------------------
-// Forget hooks and reviews: other modules purge their own data for a
-// forgotten person, and put to main what only it can rewrite.
+// Forget hooks and reviews
 // ---------------------------------------------------------------------------
 
 const forgetHooks = new Map<string, PersonForgetHook>();
@@ -149,20 +144,18 @@ function registerOnce<T>(registry: Map<string, T>, what: string, id: string, ent
 }
 
 /**
- * Register a module's purge of its own data for a forgotten person, such as
- * the inbox's thread sessions and the person's addresses on its threads.
- * Hooks run in registration order before the record is deleted, so a failed
- * hook leaves the person to be forgotten again; each must therefore be
- * idempotent.
+ * Hooks run in registration order, after every review and before the record
+ * is deleted, so a failed hook leaves the person to be forgotten again: each
+ * must be idempotent.
  */
 export function registerPersonForgetHook(id: string, hook: PersonForgetHook): void {
   registerOnce(forgetHooks, 'Person forget hook', id, hook);
 }
 
 /**
- * Register what a module puts to main to rewrite for a forgotten person, such
- * as the matters whose words may name them. Reviews only read, and run before
- * any hook, so no module's purge hides from another what led to the person.
+ * What a module puts to main to rewrite for a forgotten person. Reviews only
+ * read, and all run before any hook, so no module's purge hides from another
+ * what led to the person.
  */
 export function registerPersonForgetReview(id: string, review: PersonForgetReview): void {
   registerOnce(forgetReviews, 'Person forget review', id, review);
@@ -330,7 +323,6 @@ interface IdentityToAdmit {
   readonly source: IdentitySource;
 }
 
-/** An identity to add, checked before any write: its handle, and a source its author may give. */
 function identityToAdmit(author: ChangeSource, value: string, source: string | undefined): IdentityToAdmit {
   return { handle: parseIdentity(value), source: identitySourceFor(author, source) };
 }
@@ -355,10 +347,9 @@ async function reservedIdentity(handle: string): Promise<string | undefined> {
 }
 
 /**
- * Give `personId` an identity, inside the caller's transaction. A forgotten
- * identity is refused to learning; the principal adding it back clears its
- * fingerprint. Without a key the store holds no fingerprints, which is
- * checked again here.
+ * Inside the caller's transaction. A forgotten identity is refused to
+ * learning; the principal adding it back clears its fingerprint. Without a key
+ * the store must hold no fingerprints, which is checked again here.
  */
 async function admitIdentity(
   identity: IdentityToAdmit,
@@ -405,8 +396,7 @@ async function admitIdentity(
 /**
  * Take `handle`, in every spelling that reaches the same mailbox, from
  * whichever person holds it, inside the caller's transaction. Not a forget:
- * no hook runs and no fingerprint is kept. Without the people store there is
- * nothing to take.
+ * no hook runs and no fingerprint is kept.
  */
 export async function removeMatchingIdentities(handle: string): Promise<void> {
   const db = getDb();
@@ -475,7 +465,7 @@ async function summarize(rows: readonly SummaryRow[]): Promise<PersonSummary[]> 
   return rows.map((row) => ({ ...row, identities: handles.get(row.id) ?? [] }));
 }
 
-/** The named people, by name. */
+/** Ordered by name. */
 async function summariesOf(ids: ReadonlySet<string>): Promise<PersonSummary[]> {
   if (ids.size === 0) return [];
   const placeholders = [...ids].map(() => '?').join(', ');
@@ -553,9 +543,8 @@ export async function findPeople(query: string): Promise<FindPeopleResult> {
 }
 
 /**
- * The level of the person an identity belongs to, or `unknown` when nobody
- * with a record holds it (R13). The only people fact that leaves the store
- * for the host: never a name.
+ * `unknown` when nobody with a record holds the identity. Never a name, so it
+ * is what a reader other than main may learn of a person.
  */
 export async function getPersonLevel(identity: string): Promise<PersonLevel | 'unknown'> {
   const handle = canonicalIdentity(identity);
@@ -574,7 +563,6 @@ export async function getPersonLevel(identity: string): Promise<PersonLevel | 'u
 // Writes
 // ---------------------------------------------------------------------------
 
-/** Keep a new person, with exactly one level. */
 export async function addPerson(input: AddPersonInput): Promise<Person> {
   const author = parseChangeSource(input.source);
   const levelSource = input.levelSource === undefined ? author : parseChangeSource(input.levelSource);
@@ -612,7 +600,6 @@ export async function addPerson(input: AddPersonInput): Promise<Person> {
   return requirePerson(id);
 }
 
-/** Change a person's name or identities, in one transaction. */
 export async function updatePerson(input: UpdatePersonInput): Promise<Person> {
   const author = parseChangeSource(input.source);
   const id = input.id.trim();
@@ -653,7 +640,7 @@ export async function updatePerson(input: UpdatePersonInput): Promise<Person> {
   return requirePerson(id);
 }
 
-/** Set a person's one level, with who set it and why; which level fits is main's judgment. */
+/** Not checked against the current level's source: which level fits is main's judgment. */
 export async function setPersonLevel(input: SetPersonLevelInput): Promise<Person> {
   const author = parseChangeSource(input.source);
   const level = parseLevel(input.level);
@@ -680,8 +667,8 @@ export async function setPersonLevel(input: SetPersonLevelInput): Promise<Person
 }
 
 /**
- * An `email:` user that NanoClaw grants access to is the operator's to
- * revoke; forgetting never removes a role or a membership on its own.
+ * An `email:` user who holds or gave a role or a membership is the operator's
+ * to change; forgetting never removes one on its own.
  */
 async function assertNoGrantedAccess(name: string, userIds: readonly string[]): Promise<void> {
   const db = getDb();
@@ -710,14 +697,13 @@ async function assertNoGrantedAccess(name: string, userIds: readonly string[]): 
 }
 
 /**
- * Forget a person on the principal's word (R16): every registered review
- * reads what main must rewrite, every registered hook purges its module's
- * data, then the record and its identities are deleted with the core `users`
- * and dropped-message rows of its `email:` identities. Only a keyed
- * fingerprint of each identity is kept, so learning cannot bring the person
- * back (KTD8). What `main` knows of them is in its memory, which the host
- * never reads: the answer names them and their identities so `main` can
- * clear it, with what else it wrote that may name them.
+ * Every review runs, then every hook, then one transaction deletes the record
+ * and its identities with the core `users`, `user_dms` and dropped-message
+ * rows of its `email:` identities. Only a keyed fingerprint of each identity
+ * is kept, so learning cannot bring the person back. What `main` knows of
+ * them is in its memory, which the host never reads: the answer names them
+ * and their identities so `main` can clear it, with what else it wrote that
+ * may name them.
  */
 export async function forgetPerson(input: ForgetPersonInput): Promise<ForgetAnswer> {
   const id = input.id.trim();
@@ -765,13 +751,12 @@ export async function forgetPerson(input: ForgetPersonInput): Promise<ForgetAnsw
 }
 
 // ---------------------------------------------------------------------------
-// After a snapshot restore: the forgets the restored state predates (KTD8)
+// After a snapshot restore: the forgets the restored state predates
 // ---------------------------------------------------------------------------
 
 /**
- * Record fingerprints that state a snapshot restore replaced held and the
- * restored state lacks, in one transaction. One already recorded keeps its
- * own time.
+ * Records the fingerprints the state a snapshot restore replaced held and the
+ * restored state lacks. One already recorded keeps its own time.
  */
 export async function recordForgottenFingerprints(rows: readonly ForgottenFingerprint[]): Promise<void> {
   const db = getDb();
@@ -788,10 +773,9 @@ export async function recordForgottenFingerprints(rows: readonly ForgottenFinger
 }
 
 /**
- * Whether an identity, such as `email:sam@example.com`, was forgotten at the
- * principal's request (KTD8), in any spelling that reaches the same mailbox:
- * a test against the fingerprints recorded now, for a reader that must never
- * show a forgotten person. Without a key the store holds no fingerprints.
+ * A test of whether an identity was forgotten, in any spelling that reaches
+ * the same mailbox, against the fingerprints recorded when it loads: a later
+ * forget is not seen. Without a key the store holds no fingerprints.
  */
 export async function loadForgottenMatcher(): Promise<(handle: string) => boolean> {
   const key = await loadFingerprintKey();

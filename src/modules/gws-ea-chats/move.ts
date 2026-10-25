@@ -101,7 +101,10 @@ async function sameMove(chat: Chat, state: MoveState): Promise<boolean> {
     stored.move_source_session_id === state.move_source_session_id && stored.move_request_id === state.move_request_id
   );
 }
-/** Repeated after admission and on recovery. Save the original pending set before the first mailbox pause. */
+/**
+ * Repeated after admission and on recovery. `admitChatMove` first saves which reminders were pending, since
+ * this pauses them all.
+ */
 export async function pauseMoveReminders(chatId: string): Promise<void> {
   const state = await moveState(chatId);
   if (!state.move_source_session_id) return;
@@ -140,7 +143,7 @@ async function drained(source: Session): Promise<boolean> {
 function seedId(source: Session, side: 'in' | 'out', id: string): string {
   return `chat-move-seed-${createHash('sha256').update(`${source.id}\0${side}\0${id}`).digest('hex')}`;
 }
-/** Rehydrate only attachments under this source session's inbox; the native writer owns the new paths. */
+/** Inlines only attachments inside this source session's inbox; `writeSessionMessage` gives them new paths. */
 function carriedContent(source: Session, content: string): string {
   const parsed: unknown = JSON.parse(content);
   if (!isRecord(parsed) || !Array.isArray(parsed.attachments)) return content;

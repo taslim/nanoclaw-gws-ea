@@ -1,4 +1,4 @@
-/** Personal-data disclosures (KTD19; R25, R34) against the real privacy store, central DB and delivery path. */
+/** Personal-data disclosures against the real privacy store, central DB and delivery path. */
 import fs from 'node:fs';
 import type { Frame } from 'playwright-core';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -77,7 +77,7 @@ afterEach(async () => {
   fs.rmSync(root, { recursive: true, force: true });
 });
 
-describe('record_disclosure (KTD19)', () => {
+describe('record_disclosure', () => {
   it('records one site and one stored value for the errand, by reference and never as a copy of the value', async () => {
     const recorded = {
       ok: true,
@@ -138,7 +138,7 @@ describe('record_disclosure (KTD19)', () => {
   });
 });
 
-describe('what a batch gives each site (KTD19, R34)', () => {
+describe('what a batch gives each site', () => {
   beforeEach(async () => {
     expect(await send(main, { thread: browser.thread_id, site: OSTERIA, value_id: mobile })).toMatchObject({
       ok: true,
@@ -206,7 +206,7 @@ describe('what a batch gives each site (KTD19, R34)', () => {
   });
 });
 
-describe('a disclosure stays with the group whose errand it was recorded for (KTD15)', () => {
+describe('a disclosure stays with the group whose errand it was recorded for', () => {
   it("lets no other group's errand use main's disclosure, nor record one against main's errand", async () => {
     writePolicy({ schemaVersion: 2, enabled: true, agentGroupIds: ['main', 'research'] });
     const research = (await resolveSystemSession('research', 'system:test:research')).session;

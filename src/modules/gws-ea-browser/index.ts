@@ -1,6 +1,6 @@
 import { configureBrowserSiteInfo } from './observe.js';
 import { readRecipeSiteInfo } from './recipe-store.js';
-/** Optional, host-owned Chrome runtime. Importing registers lifecycle only; Chrome is lazy. */
+/** Optional, host-owned Chrome runtime. Importing only registers; Chrome launches on first use, not at host start. */
 
 import { register } from '../../cli/registry.js';
 import { registerMigration } from '../../db/migrations/index.js';

@@ -8,7 +8,7 @@ export type MerchantPurchaseRead =
   | (Extract<MerchantCheckoutRead, { status: 'ready' }> & { signature: MerchantSignature })
   | Exclude<MerchantCheckoutRead, { status: 'ready' }>;
 
-/** The page's reviewed signature, which keeps precedence on its site, else the generic one for any web page. */
+/** A reviewed signature takes precedence on its site; the generic one covers any other web page. */
 export function merchantSignatureFor(page: Page): MerchantSignature | undefined {
   try {
     const url = new URL(page.url());
@@ -23,10 +23,7 @@ export function merchantSignatureFor(page: Page): MerchantSignature | undefined 
 export async function prepareMerchantPage(page: Page): Promise<void> {
   for (const signature of [...merchantSignatures, genericCheckoutSignature]) await signature.preparePage?.(page);
 }
-/**
- * Reads the page's checkout with its signature. A reviewed flow that no longer matches its page fails closed
- * for that flow; it never falls back to the generic one.
- */
+/** A reviewed flow that no longer matches its page fails closed; it never falls back to the generic signature. */
 export async function readMerchantPurchase(
   page: Page,
   target?: ElementHandle,
@@ -37,7 +34,6 @@ export async function readMerchantPurchase(
   const read = await signature.readPurchase(page, target, expected);
   return read.status === 'ready' ? { ...read, signature } : read;
 }
-/** The page's signature's evidence of the purchase `attempted` made. */
 export async function readMerchantPurchaseEvidence(
   page: Page,
   attempted: PurchaseFacts,

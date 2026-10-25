@@ -123,20 +123,16 @@ import { readBrowserPolicy } from '../modules/gws-ea-browser/policy.js';
 export interface ProductionProvisionOptions {
   /** Upstream's `.env` upsert, injected by the driver (`src/` cannot import `setup/`). */
   readonly upsertEnvVars: UpsertEnvVars;
-  /** Upstream's host readiness helpers, injected by the driver. */
   readonly hostStatus: HostStatusHelpers;
-  /** NanoClaw's service helpers, injected by the driver: the host starts as `gws-ea start` starts it. */
+  /** Provisioning (re)starts the host the way `gws-ea restart` does. */
   readonly serviceHelpers: NanoclawServiceHelpers;
-  /** Human input: credentials, sign-in, and decisions supplied on re-entry. */
   readonly interaction?: Interaction;
   readonly runtime?: ProvisionRuntime;
-  /** How the 1Password CLI the host recorded is run, for the vault a new assistant inherits. */
   readonly onePassword?: { readonly cli?: OnePasswordCliSeams };
 }
 
 export interface ProductionProvisionInput {
   readonly release: ResolvedRelease;
-  /** The provider setup the release's receipt records. */
   readonly releasePreflight: Pick<ReleasePreflightInput, 'provider' | 'providerCredential'>;
   readonly onecli: OnecliRuntimeLayout;
   readonly runtime: InstanceRuntimeConfig;
@@ -146,7 +142,7 @@ export interface ProductionProvisionInput {
   readonly identity: MainIdentityInput;
   /** The principal's name in the operator's messages: the published profile's, or create's before. */
   readonly principalDisplayName: string;
-  /** The address the principal uses for Google Chat, as create named it: the assistant opens its DM there (KTD11). */
+  /** The address the principal uses for Google Chat, as create named it: the assistant opens its DM there. */
   readonly principalChatEmail: string;
   readonly adapterInstance: string;
   /** The journal's start: only a principal bound after it counts. */
@@ -159,7 +155,7 @@ export interface ProductionProvisionInput {
   readonly identityDependencies?: MainIdentityDependencies;
   readonly principalDependencies?: PrincipalBindingDependencies;
   readonly hostStatus: HostStatusHelpers;
-  /** The assistant's Google sign-in (`sign_in_google`), and agents' access to it (`connect_google`; KTD2, KTD5). */
+  /** The assistant's Google sign-in (`sign_in_google`), and agents' access to it (`connect_google`). */
   readonly google: GoogleConnectionInput;
 }
 
@@ -182,7 +178,6 @@ type Observe = (context: ProductionProvisionContext) => Promise<Observation>;
 export interface ProductionProvisionDependencies {
   readonly observeCheckout: Observe;
   readonly stageRelease: typeof stageRelease;
-  /** `provision_gcp`'s resources. */
   readonly googleCloudResources: typeof googleCloudResources;
   readonly observeOnecli: Observe;
   readonly reconcileOnecliRuntime: typeof reconcileOnecliRuntime;
@@ -199,9 +194,7 @@ export interface ProductionProvisionDependencies {
   readonly verifyPrincipalBinding: (input: PrincipalBindingVerificationInput) => PrincipalBindingVerificationResult;
   readonly bindPrincipal: typeof bindPrincipal;
   readonly verifyConversation: (input: ConversationVerificationInput) => ConversationVerificationResult;
-  /** `sign_in_google`'s resources. */
   readonly googleSignInResources: typeof googleSignInResources;
-  /** `connect_google`'s resources. */
   readonly googleAccessResources: typeof googleAccessResources;
   readonly sleep: (milliseconds: number) => Promise<void>;
 }
@@ -227,7 +220,6 @@ async function defaultObserveCheckout(context: ProductionProvisionContext): Prom
   }
 }
 
-/** The receipt create's staging kept with this instance's release, checked against it. */
 function instanceReleaseReceipt(context: ProductionProvisionContext): Promise<ReleasePreflightReceipt> {
   const { paths, instanceId } = context.operation;
   return loadReleasePreflightReceipt(paths.releasePreflightFile(instanceId, context.input.release.commit), {
@@ -245,15 +237,15 @@ async function instanceOnecliPins(context: ProductionProvisionContext): Promise<
 }
 
 /**
- * Create's first release (KTD1): the assistant's `state/`, its marker first so
- * a `state/` there always names its assistant, then the reservation's release
- * staged as every release is (`stageRelease`), and the live link pointed at
- * it. Of the files kept with the release, create applies only gws-ea's `.env`
- * keys here: its OneCLI step renders and starts the Compose file and its
- * service step installs the service definition, each as the release kept it,
- * and installing the definition before the host can start would have launchd
- * start it at the next login. Run again, it finishes what a run cut short
- * began, restaging a release left incomplete.
+ * Create's first release: the assistant's `state/`, its marker first so a
+ * `state/` there always names its assistant, then the reservation's release
+ * staged as every release is (`stageRelease`), and the live link pointed at it.
+ * Of the files kept with the release, create applies only gws-ea's `.env` keys
+ * here: its OneCLI step renders and starts the Compose file and its service
+ * step installs the service definition, each as the release kept it, and
+ * installing the definition before the host can start would have launchd start
+ * it at the next login. Run again, it finishes what a run cut short began,
+ * restaging a release left incomplete.
  */
 async function ensureRelease(
   context: ProductionProvisionContext,
@@ -277,7 +269,6 @@ async function ensureRelease(
   await pointCurrent(layout, name);
 }
 
-/** The OneCLI runtime at the instance's pins, and the API key files the host and admin commands read. */
 async function defaultObserveOnecli(context: ProductionProvisionContext): Promise<Observation> {
   const seen = await observeOnecliRuntime(
     context.input.onecli,
@@ -381,11 +372,6 @@ async function observeInstanceHost(
   return PRESENT;
 }
 
-/**
- * Start the host and wait, with upstream `waitForHost`, until it answers and
- * connects Google Chat. A host that does not become ready stops the run with
- * its reason.
- */
 async function startInstanceHost(
   context: ProductionProvisionContext,
   dependencies: ProductionProvisionDependencies,
@@ -425,7 +411,7 @@ async function listOnecliAgents(context: ProductionProvisionContext): Promise<re
  * Main exists as published, runs in the principal's timezone as the profile
  * holds it, and its OneCLI agent injects every matching secret (all mode).
  * The principal's name and timezone are theirs to change through main, so
- * only the profile's own values count (KTD9).
+ * only the profile's own values count.
  */
 async function defaultObserveMainIdentity(context: ProductionProvisionContext): Promise<Observation> {
   try {
@@ -540,7 +526,6 @@ const EXCHANGE_REASONS: ReadonlySet<ConversationNotReadyReason> = new Set([
   'reply_not_delivered',
 ]);
 
-/** What a person is told when the conversation is still not ready. */
 const CONVERSATION_PAUSES: Readonly<Record<ConversationNotReadyReason, string>> = {
   binding_not_ready: 'The principal conversation is not ready yet; check the errors below, then resume.',
   session_not_ready:
@@ -581,7 +566,6 @@ async function principalPause(
   };
 }
 
-/** The principal in a pause before they are bound: their name and the address the assistant opens its DM with. */
 function unboundPrincipal(input: ProductionProvisionInput): string {
   return `Principal: ${input.principalDisplayName} (${input.principalChatEmail})`;
 }
@@ -696,12 +680,6 @@ function conversationInput(context: ProductionProvisionContext): ConversationVer
   };
 }
 
-/**
- * Production step composition over the validated provisioning primitives.
- * Each existing probe is one resource's observation. Dependencies are
- * injectable for boundary tests; omitted functions are the real checkout,
- * OneCLI, runtime, identity, principal, and mailbox implementations.
- */
 export function createProductionProvisionSteps(
   context: ProductionProvisionContext,
   overrides: Partial<ProductionProvisionDependencies> = {},
@@ -961,7 +939,6 @@ export interface ProductionBootstrapManifest {
   readonly home_directory: string;
   readonly platform: 'macos' | 'linux';
   readonly running_as_root: boolean;
-  /** The local Docker endpoint prerequisites resolved at create. */
   readonly docker_endpoint: string;
   readonly provider: {
     readonly id: string;
@@ -980,9 +957,9 @@ export interface ProductionBootstrapManifest {
     readonly principal_first_name: string;
     readonly principal_last_name: string | null;
     readonly principal_timezone: string;
-    /** The principal's addresses create collected: one or more, lowercased, each once. */
+    /** One or more, normalized, each once. */
     readonly principal_emails: readonly string[];
-    /** The one of them the principal uses for Google Chat, which the assistant opens its DM with (KTD11). */
+    /** The one of them the principal uses for Google Chat, which the assistant opens its DM with. */
     readonly principal_chat_email: string;
   };
 }
@@ -1122,7 +1099,7 @@ export async function installProductionBootstrapManifest(
   }
 }
 
-/** Remove only the staged bootstrap file after an unsuccessful reservation. */
+/** Undoes `installProductionBootstrapManifest`: the bootstrap file, and the instance root only while empty. */
 export async function removeProductionBootstrapManifest(paths: ControlPlanePaths, instanceId: string): Promise<void> {
   assertInstanceId(instanceId);
   await removePrivateFile(paths.bootstrapFile(instanceId));
@@ -1185,17 +1162,17 @@ interface ProvisionSource {
   readonly identity: MainIdentityInput;
   /** The principal's name in the operator's messages. */
   readonly principalDisplayName: string;
-  /** Main's published profile, once there is one. */
+  /** Undefined until main is published. */
   readonly profile: PersistedProfileIdentity | undefined;
 }
 
 /**
- * Create's principal seeds the profile once (KTD9). After main is
- * published, the profile is the one source of the principal's name,
- * timezone and addresses: the principal changes them through main and the
- * operator through `gws-ea ncl`, so they are read only from there. A
- * manifest that outlived publication (its removal was interrupted) seeds
- * nothing, so it cannot undo a change made since.
+ * Create's principal seeds the profile once. After main is published, the
+ * profile is the one source of the principal's name, timezone and addresses:
+ * the principal changes them through main and the operator through
+ * `gws-ea ncl`, so they are read only from there. A manifest that outlived
+ * publication (its removal was interrupted) seeds nothing, so it cannot undo a
+ * change made since.
  */
 export async function resolveProvisionSource(
   operation: InstanceOperation,
@@ -1270,7 +1247,6 @@ async function readInstanceState(paths: ControlPlanePaths, reservation: Instance
   return { ...(manifest ? { manifest } : {}), ...(runtime ? { runtime } : {}) };
 }
 
-/** The instance's OneCLI layout, run through the Docker endpoint it records. */
 export function instanceOnecliLayout(
   paths: ControlPlanePaths,
   reservation: InstanceReservation,
@@ -1287,12 +1263,11 @@ export function instanceOnecliLayout(
 }
 
 /**
- * What a created assistant's own record says it runs (KTD6): the provider,
- * credential metadata, and OneCLI cohort the receipt kept with the
- * reservation's release records, and the Postgres image its Compose file
- * names. An update holds the tool's release to these, never to the tool's
- * own tree. Everything is read physically, so it is there while no release
- * is live.
+ * What a created assistant's own record says it runs: the provider, credential
+ * metadata, and OneCLI cohort the receipt kept with the reservation's release
+ * records, and the Postgres image its Compose file names. An update holds the
+ * tool's release to these, never to the tool's own tree. Everything is read
+ * physically, so it is there while no release is live.
  */
 export async function readDeployedSetup(
   paths: ControlPlanePaths,
@@ -1331,10 +1306,9 @@ export async function recordedHost(
 }
 
 /**
- * The address the principal uses for Google Chat (KTD11). Create's setup file
- * names it, but the setup file is gone once main is published, before the
- * principal is bound, so the first run fixes it in the journal, which every
- * later run reads.
+ * The address the principal uses for Google Chat. Create's setup file names it,
+ * but the setup file is gone once main is published, before the principal is
+ * bound, so the first run fixes it in the journal, which every later run reads.
  */
 export async function fixPrincipalChatAddress(
   operation: InstanceOperation,
@@ -1353,7 +1327,6 @@ export async function fixPrincipalChatAddress(
   return manifest.identity.principal_chat_email;
 }
 
-/** Build the production context from temporary bootstrap input or authoritative instance state. */
 export async function runProductionProvision(
   operation: InstanceOperation,
   options: ProductionProvisionOptions,
@@ -1471,19 +1444,17 @@ export async function runProductionProvision(
     : result;
 }
 
-/** The step a create or resume shows while it provisions the vault a new assistant inherits. */
 const ONEPASSWORD_STEP = {
   id: 'provision_onepassword',
   label: "Provisioning the assistant's 1Password vault…",
 } as const;
 
 /**
- * Once every step is complete: the optional resources the operator's
- * enablement gives an assistant, its 1Password vault (KTD3), then, while its
- * browser is enabled, its configured web alias (KTD13). The assistant is
- * already talkable, so what waits here waits on the operator, with the cause
- * and the command that clears it; a resume of an assistant already
- * provisioned costs no request and no prompt.
+ * Once every step is complete: the optional resources the operator's enablement
+ * gives an assistant, its 1Password vault, then, while its browser is enabled,
+ * its configured web alias. The assistant is already talkable, so what waits
+ * here waits on the operator, with the cause and the command that clears it; a
+ * resume of an assistant already provisioned costs no request and no prompt.
  */
 export async function provisionAssistantResources(
   operation: InstanceOperation,

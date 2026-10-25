@@ -130,7 +130,6 @@ export function prepareScheduledTask(input: {
   return { name: input.name, prompt: input.prompt, recurrence, script, processAfter };
 }
 
-/** The group's live conversation a task comes back to; a task session has none. */
 function conversationFor(agentGroupId: string, session: Session): Session {
   if (session.agent_group_id !== agentGroupId) {
     throw new Error(`session ${session.id} belongs to agent group ${session.agent_group_id}, not ${agentGroupId}`);
@@ -143,8 +142,9 @@ function conversationFor(agentGroupId: string, session: Session): Session {
 /**
  * Persist a prepared task through NanoClaw's single task/session representation.
  * It runs in an isolated session of its own, or, given `session`, comes back
- * as a turn of that conversation. A caller-selected id reuses the first task in
- * that session, so replaying a durable host action cannot create a second task.
+ * as a turn of that conversation. A caller-chosen `id` returns the task
+ * already stored under it, so replaying a durable host action cannot create a
+ * second task.
  */
 export async function createScheduledTask(
   agentGroupId: string,

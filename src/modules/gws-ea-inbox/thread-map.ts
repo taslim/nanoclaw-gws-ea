@@ -1,41 +1,23 @@
 /**
- * The thread map (KTD2): every email thread the assistant is part of, by a
- * stable key in the `mail-…` format that exists before Gmail has a thread.
- * Its tables are described in migration.ts.
+ * The thread map: every email thread the assistant is part of, by a stable
+ * key in the `mail-…` format that exists before Gmail has a thread. Its
+ * tables are described in migration.ts.
  *
- * - A thread maps to its Gmail thread once there is one: the thread of the
- *   message that opened it, or of the first send in a thread `main` handed
- *   over (`createThread`, `attachGmailThread`, `recordSent`).
- * - A message belongs to the thread of its Gmail thread, else to the thread
- *   of the nearest Message-ID it answers, so a reply under a changed subject,
- *   which Gmail files as a new thread, stays in its thread (`findThreadFor`).
  * - Each message is recorded with its side: `principal` when only the
  *   principal and the assistant can read it, `outside` otherwise. A side
  *   replies against, and references, only its own messages, so a
  *   principal-only note never reaches a reply-all, and a reply-all never
- *   loses the outsiders to a note written after it (`threadMessages`,
- *   `visibleMessageIds`).
- * - A thread's addresses are those its messages carried and those `main`
- *   named (`recordThreadAddresses`). A forgotten person's go from every
- *   thread (`deleteThreadAddresses`).
- * - A thread holds the account the agent working it last left, each one in
- *   place of the one before, which `main` reads under the thread wherever a
- *   matter shows it (`setThreadAccount`, `threadAccount`). Forgetting a
- *   person clears it from every thread that may tell of them
- *   (`clearThreadAccounts`).
+ *   loses the outsiders to a note written after it.
  * - A thread is where `main` placed it: not yet, in an open matter, or
  *   nowhere, and handed over to `external-email` or not; until main hands it
- *   over, its mail waits, held (Slice 5 KTD8). Mail starts a thread unplaced,
- *   the matters store keeps a thread's placement in step with its matters,
- *   and the bridge hands it over (`threadPlacement`, `placeThread`,
- *   `releaseThread`, `holdThread`, `unplaceThread`, `listUnplacedThreads`).
+ *   over, its mail waits, held. Mail starts a thread unplaced, and the
+ *   matters store keeps a thread's placement in step with its matters.
  * - A file goes out in a thread only when `main` handed it over for it, by
- *   its SHA-256 (`recordThreadFile`, `findThreadFile`).
+ *   its SHA-256.
  * - A send never happens twice. Before Gmail is called, a pending record
  *   holds its pre-allocated Message-ID, so a retry of the same send on the
- *   same side finds it, and a reply to it already resolves. Once Gmail holds
- *   it, `recordSent` makes it the thread's message. Delivery deletes a
- *   reply's record once it recorded the send or gave up on it, so the same
+ *   same side finds it, and a reply to it already resolves. Delivery deletes
+ *   a reply's record once it recorded the send or gave up on it, so the same
  *   words sent later are a new send; an `email_send` request's record stays,
  *   so a replay of that request never sends again.
  *
@@ -71,11 +53,7 @@ function toThread(row: ThreadRow): Thread {
   return { threadKey: row.thread_key, gmailThreadId: row.gmail_thread_id, createdAt: row.created_at };
 }
 
-/**
- * A new thread: for a message that starts one, or one `main` hands over
- * before Gmail has it. A handoff gives the key it derived from its request,
- * so a replay of the request finds the thread it began.
- */
+/** A handoff gives the key it derived from its request, so a replay of the request finds the thread it began. */
 export async function createThread(
   gmailThreadId: string | null,
   at: string,
@@ -99,10 +77,7 @@ export async function getThread(threadKey: string): Promise<Thread | undefined> 
   return row ? toThread(row) : undefined;
 }
 
-/**
- * Give the thread this Gmail thread, unless it already has one or another
- * thread holds it. True when this call gave it.
- */
+/** False when the thread already has a Gmail thread or another thread holds this one. */
 export async function attachGmailThread(threadKey: string, gmailThreadId: string): Promise<boolean> {
   const { changes } = await getDb().run(
     `UPDATE gws_ea_threads SET gmail_thread_id = ?
@@ -119,21 +94,21 @@ export async function attachGmailThread(threadKey: string, gmailThreadId: string
 // Messages
 // ---------------------------------------------------------------------------
 
-/** What a message says of its thread: its Gmail thread, and the Message-IDs it answers. */
 export interface MessageThreading {
   readonly gmailThreadId: string;
   readonly inReplyTo: readonly string[];
   readonly references: readonly string[];
 }
 
-/** The most Message-IDs a message is matched by, nearest first: a header may name any number. */
+/** Bounds the Message-IDs a lookup reads, nearest first: a header may name any number. */
 const MAX_ANSWERED_IDS = 100;
 
 /**
- * The thread a message belongs to: the one holding its Gmail thread, else the
- * one holding the nearest Message-ID it answers (In-Reply-To, then References
- * from the newest back), whether a message the thread recorded or a send of
- * its still in flight.
+ * The thread holding the message's Gmail thread, else the one holding the
+ * nearest Message-ID it answers (In-Reply-To, then References from the newest
+ * back), whether a message the thread recorded or a send of its still in
+ * flight. Gmail files a reply under a changed subject as a new thread, which
+ * the Message-IDs keep in its thread.
  */
 export async function findThreadFor(message: MessageThreading): Promise<Thread | undefined> {
   const db = getDb();
@@ -186,19 +161,14 @@ function toMessage(row: MessageRow): ThreadMessage {
   };
 }
 
-/** A message a side's session received or sent, to record as the thread's. */
 export interface NewThreadMessage {
   readonly threadKey: string;
   readonly side: ThreadSide;
   readonly gmailMessageId: string;
-  /** Its Message-ID, when it has one. */
   readonly rfcMessageId?: string;
 }
 
-/**
- * Record a message as the thread's, after every message it learned of
- * before. A message already recorded keeps its thread, side, and place.
- */
+/** After every message the thread learned of before; one already recorded keeps its thread, side, and place. */
 export async function recordThreadMessage(message: NewThreadMessage, at: string): Promise<void> {
   await getDb().run(
     `INSERT INTO gws_ea_thread_messages (thread_key, position, side, gmail_message_id, rfc_message_id, recorded_at)
@@ -213,7 +183,6 @@ export async function recordThreadMessage(message: NewThreadMessage, at: string)
   );
 }
 
-/** The threads that recorded a message under any of these Message-IDs, each once. */
 export async function threadsWithMessageIds(rfcMessageIds: readonly string[]): Promise<string[]> {
   const ids = [...new Set(rfcMessageIds)].slice(0, MAX_ANSWERED_IDS);
   if (ids.length === 0) return [];
@@ -225,7 +194,6 @@ export async function threadsWithMessageIds(rfcMessageIds: readonly string[]): P
   return rows.map((row) => row.thread_key);
 }
 
-/** A side's messages in the thread, oldest first. */
 export async function threadMessages(threadKey: string, side: ThreadSide): Promise<ThreadMessage[]> {
   const rows = await getDb().all<MessageRow>(
     `SELECT ${MESSAGE_COLUMNS} FROM gws_ea_thread_messages WHERE thread_key = ? AND side = ? ORDER BY position`,
@@ -235,7 +203,7 @@ export async function threadMessages(threadKey: string, side: ThreadSide): Promi
   return rows.map(toMessage);
 }
 
-/** The Message-IDs of a side's messages in the thread, oldest first: all a reply on that side may reference. */
+/** All a reply on that side may reference, oldest first. */
 export async function visibleMessageIds(threadKey: string, side: ThreadSide): Promise<string[]> {
   const rows = await getDb().all<{ rfc_message_id: string }>(
     `SELECT rfc_message_id FROM gws_ea_thread_messages
@@ -261,10 +229,7 @@ export interface ThreadAddress {
   readonly source: AddressSource;
 }
 
-/**
- * Record addresses as the thread's, as they came; one already recorded that
- * way keeps its record. Throws for anything that is not an address.
- */
+/** One already recorded from the same source keeps its record. Throws for anything that is not an address. */
 export async function recordThreadAddresses(
   threadKey: string,
   addresses: readonly string[],
@@ -291,7 +256,6 @@ export async function recordThreadAddresses(
   });
 }
 
-/** Every address the thread has, in the order it gained them, each with how it came. */
 export async function threadAddresses(threadKey: string): Promise<ThreadAddress[]> {
   return getDb().all<ThreadAddress>(
     `SELECT address, source FROM gws_ea_thread_addresses
@@ -300,10 +264,6 @@ export async function threadAddresses(threadKey: string): Promise<ThreadAddress[
   );
 }
 
-/**
- * The threads an address `matches` is on, and those addresses, each once:
- * what forgetting a person reaches.
- */
 export async function threadsWithAddresses(
   matches: (address: string) => boolean,
 ): Promise<{ readonly threadKeys: readonly string[]; readonly addresses: readonly string[] }> {
@@ -317,7 +277,6 @@ export async function threadsWithAddresses(
   };
 }
 
-/** Delete these addresses from every thread, however each came. */
 export async function deleteThreadAddresses(addresses: readonly string[]): Promise<void> {
   const db = getDb();
   for (const address of addresses) await db.run('DELETE FROM gws_ea_thread_addresses WHERE address = ?', address);
@@ -330,13 +289,12 @@ export async function deleteThreadAddresses(addresses: readonly string[]): Promi
 /** The longest account the agent working a thread may leave: what a matter shows whole under the thread. */
 export const THREAD_ACCOUNT_MAX = 2_000;
 
-/** What the agent working a thread last said of it (KTD9): its words, and when, ISO. */
+/** What the agent working a thread last said of it; `at` is ISO. */
 export interface ThreadAccount {
   readonly text: string;
   readonly at: string;
 }
 
-/** The thread's account is now `text`, left at `at`, in place of any before it. Throws for a thread that does not exist. */
 export async function setThreadAccount(threadKey: string, text: string, at: string): Promise<void> {
   const { changes } = await getDb().run(
     'UPDATE gws_ea_threads SET account = ?, account_at = ? WHERE thread_key = ?',
@@ -347,7 +305,6 @@ export async function setThreadAccount(threadKey: string, text: string, at: stri
   if (changes === 0) throw new Error(`No email thread ${threadKey} exists`);
 }
 
-/** These threads hold no account, until the agent working each leaves its next one. */
 export async function clearThreadAccounts(threadKeys: readonly string[]): Promise<void> {
   const db = getDb();
   for (const threadKey of new Set(threadKeys)) {
@@ -355,7 +312,6 @@ export async function clearThreadAccounts(threadKeys: readonly string[]): Promis
   }
 }
 
-/** The account the agent working the thread last left on it, and when, or undefined while it has left none. */
 export async function threadAccount(threadKey: string): Promise<ThreadAccount | undefined> {
   const row = await getDb().get<{ account: string; account_at: string }>(
     'SELECT account, account_at FROM gws_ea_threads WHERE thread_key = ? AND account IS NOT NULL',
@@ -368,7 +324,7 @@ export async function threadAccount(threadKey: string): Promise<ThreadAccount | 
 // Placement
 // ---------------------------------------------------------------------------
 
-/** Where `main` placed the thread: not yet, in an open matter, or nowhere, as also once its matter closed. */
+/** Where `main` placed the thread; `nowhere` also once its matter closed. */
 export type Placement = 'unplaced' | 'matter' | 'nowhere';
 
 export interface ThreadPlacement {
@@ -377,10 +333,9 @@ export interface ThreadPlacement {
   readonly released: boolean;
 }
 
-/** The agent that works a thread main hands over, as the matter it sits in names it (Slice 5 R7). */
+/** The agent that works a thread main hands over, as the matter it sits in names it. */
 export const THREAD_HANDLER = 'external-email';
 
-/** Where main placed the thread and whether it handed it over, or undefined for a thread that does not exist. */
 export async function threadPlacement(threadKey: string): Promise<ThreadPlacement | undefined> {
   const row = await getDb().get<{ placement: Placement; released: number }>(
     'SELECT placement, released FROM gws_ea_threads WHERE thread_key = ?',
@@ -389,12 +344,11 @@ export async function threadPlacement(threadKey: string): Promise<ThreadPlacemen
   return row ? { placement: row.placement, released: row.released === 1 } : undefined;
 }
 
-/** main placed the thread in an open matter, or nowhere. */
 export async function placeThread(threadKey: string, placement: Exclude<Placement, 'unplaced'>): Promise<void> {
   await getDb().run('UPDATE gws_ea_threads SET placement = ? WHERE thread_key = ?', placement, threadKey);
 }
 
-/** main handed the thread over: its mail is external-email's from now on. Throws unless main has placed it. */
+/** Its mail is external-email's from now on. Throws unless main has placed the thread. */
 export async function releaseThread(threadKey: string): Promise<void> {
   const { changes } = await getDb().run(
     "UPDATE gws_ea_threads SET released = 1 WHERE thread_key = ? AND placement <> 'unplaced'",
@@ -445,22 +399,20 @@ export async function recordPlacementNote(threadKeys: readonly string[], noteId:
   });
 }
 
-/** A thread waiting for main to place it (Slice 5 R27). */
 export interface UnplacedThread {
   readonly threadKey: string;
   readonly gmailThreadId: string | null;
   /** The addresses its mail carried. */
   readonly people: readonly string[];
-  /** When its latest mail came in. */
   readonly latestAt: string;
   /** The note that last asked main to place it, or null while none has. */
   readonly placementNote: string | null;
 }
 
 /**
- * Every thread waiting for main to place it, the one whose latest mail is
- * oldest first: unplaced, with mail from outside. A thread only the
- * principal and the assistant are on waits for no placement.
+ * Unplaced threads with mail from outside, the one whose latest such mail is
+ * oldest first. A thread only the principal and the assistant are on waits
+ * for no placement.
  */
 export async function listUnplacedThreads(): Promise<UnplacedThread[]> {
   const rows = await getDb().all<{
@@ -497,19 +449,16 @@ export async function listUnplacedThreads(): Promise<UnplacedThread[]> {
 // Handed files
 // ---------------------------------------------------------------------------
 
-/** A file `main` handed over for a thread: its name, and where the host keeps its copy. */
 export interface ThreadFile {
   readonly fileName: string;
   readonly hostPath: string;
 }
 
 /**
- * Record a file `main` handed over for the thread, by its SHA-256. The same
- * bytes handed over again point the record at the newer copy.
- *
- * The copy is recorded by its place in the data directory. The host reaches
- * the data directory through the release folder it runs from, and a later
- * update prunes that folder, taking any path through it along.
+ * The same bytes handed over again point the record at the newer copy. The
+ * copy is recorded by its place in the data directory: the host reaches that
+ * directory through the release folder it runs from, and a later update
+ * prunes that folder, taking any path through it along.
  */
 export async function recordThreadFile(
   threadKey: string,
@@ -528,11 +477,7 @@ export async function recordThreadFile(
   );
 }
 
-/**
- * The file with this SHA-256 that `main` handed over for the thread, or
- * undefined: its copy as the host reaches the data directory now. Throws for
- * a copy recorded outside the data directory.
- */
+/** Its copy as the host reaches the data directory now. Throws for a copy recorded outside it. */
 export async function findThreadFile(threadKey: string, sha256: string): Promise<ThreadFile | undefined> {
   const row = await getDb().get<{ file_name: string; host_path: string }>(
     'SELECT file_name, host_path FROM gws_ea_thread_files WHERE thread_key = ? AND sha256 = ?',
@@ -570,13 +515,11 @@ export function readThreadFile(file: ThreadFile): Buffer {
 // Sends in flight
 // ---------------------------------------------------------------------------
 
-/** Whose sends a record belongs to: its thread, and the side the send writes to. */
 export interface SendScope {
   readonly threadKey: string;
   readonly side: ThreadSide;
 }
 
-/** A send about to be made, with the Message-ID allocated for it. */
 export interface NewSend {
   readonly id: string;
   readonly scope: SendScope;
@@ -584,14 +527,12 @@ export interface NewSend {
   readonly rfcMessageId: string;
 }
 
-/** A send in flight: pending until Gmail holds it, then sent, with Gmail's id for it. */
 export type SendRecord = NewSend &
   (
     | { readonly state: 'pending'; readonly gmailMessageId: null }
     | { readonly state: 'sent'; readonly gmailMessageId: string }
   );
 
-/** What Gmail holds for a send. */
 export interface SentMessage {
   readonly gmailMessageId: string;
   readonly gmailThreadId: string;
@@ -606,7 +547,6 @@ interface SendRow {
   gmail_message_id: string | null;
 }
 
-/** The oldest in-flight send of these words in this scope. */
 export async function findSend(scope: SendScope, contentHash: string): Promise<SendRecord | undefined> {
   const row = await getDb().get<SendRow>(
     `SELECT id, content_hash, rfc_message_id, gmail_message_id FROM gws_ea_thread_sends
@@ -624,7 +564,7 @@ export async function findSend(scope: SendScope, contentHash: string): Promise<S
     : { ...send, state: 'sent', gmailMessageId: row.gmail_message_id };
 }
 
-/** A pending send, written before Gmail is called. */
+/** Written before Gmail is called. */
 export async function insertPendingSend(send: NewSend, at: string): Promise<void> {
   await getDb().run(
     `INSERT INTO gws_ea_thread_sends (
@@ -640,11 +580,7 @@ export async function insertPendingSend(send: NewSend, at: string): Promise<void
   );
 }
 
-/**
- * Gmail holds the send: record it as sent, its message as the thread's on its
- * side, and its Gmail thread as the thread's when the thread has none yet.
- * Safe to repeat.
- */
+/** Safe to repeat. */
 export async function recordSent(send: Pick<NewSend, 'id' | 'scope'>, sent: SentMessage, at: string): Promise<void> {
   const db = getDb();
   await db.transaction(async () => {

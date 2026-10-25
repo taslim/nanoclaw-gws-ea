@@ -1,5 +1,5 @@
 /**
- * The OneCLI admin client against a real OneCLI (KTD14). It runs Docker, so
+ * The OneCLI admin client against a real OneCLI. It runs Docker, so
  * it is opt-in: with `GWS_EA_ONECLI_CONTRACT=1` it brings up a throwaway
  * OneCLI at the pinned gateway version the way gws-ea brings up an
  * assistant's (its own layout, Compose file, and reconcile, with the

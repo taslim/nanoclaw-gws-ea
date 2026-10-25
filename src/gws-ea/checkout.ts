@@ -16,7 +16,6 @@ import type { ReleaseSource } from './release-tracks.js';
 import { GwsEaError, shortCommit, type InstanceReservation } from './types.js';
 
 const COMMIT_PATTERN = /^[0-9a-f]{40}$/;
-/** A Git object ID, in a SHA-1 or a SHA-256 repository. */
 const OBJECT_ID_PATTERN = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 
 export interface ResolvedRelease {
@@ -41,11 +40,10 @@ export interface ReleaseCommandEnvironments {
 }
 
 /**
- * Git's own settings for the release commands, given in the environment so
- * no operator configuration is read: no automatic maintenance. After a fetch
- * Git otherwise starts it detached, and it goes on writing into a scratch
- * repository while the release removes it (`ENOTEMPTY`, seen live with Git
- * 2.54 on 2026-10-12).
+ * Given in the environment so no operator configuration is read. Automatic
+ * maintenance is off: after a fetch Git starts it detached, and it goes on
+ * writing into a scratch repository while the release removes it
+ * (`ENOTEMPTY`, seen with Git 2.54).
  */
 const RELEASE_GIT_SETTINGS = {
   GIT_CONFIG_COUNT: '1',
@@ -53,7 +51,6 @@ const RELEASE_GIT_SETTINGS = {
   GIT_CONFIG_VALUE_0: 'false',
 } as const;
 
-/** Build the tool environment rooted in storage owned by this release operation. */
 export async function prepareReleaseCommandEnvironments(ownerRoot: string): Promise<ReleaseCommandEnvironments> {
   const home = path.join(ownerRoot, '.release-home');
   await preparePrivateDirectory(home);
@@ -119,9 +116,8 @@ async function assertValidReleaseRef(
 }
 
 /**
- * Run `use` with release command environments whose HOME is a scratch
- * directory outside every instance, removed afterwards: Git reads no
- * operator configuration, and nothing is created under an instance.
+ * HOME is a scratch directory outside every instance, so Git reads no operator
+ * configuration and nothing is created under an instance.
  */
 async function withScratchEnvironments<T>(
   prefix: string,
@@ -135,10 +131,7 @@ async function withScratchEnvironments<T>(
   }
 }
 
-/**
- * The paths `git status` reports for a checkout, narrowed by `options`. Git
- * takes no optional lock, so its index is never rewritten.
- */
+/** Git takes no optional lock, so the checkout's index is never rewritten. */
 async function statusPaths(
   checkoutRoot: string,
   run: SanitizedCommandRunner,
@@ -157,7 +150,7 @@ async function statusPaths(
     .map((line) => line.slice(3));
 }
 
-/** The files a checkout's tracked tree differs in. Untracked files belong to no release. */
+/** Untracked files belong to no release. */
 function trackedChanges(
   checkoutRoot: string,
   run: SanitizedCommandRunner,
@@ -166,7 +159,6 @@ function trackedChanges(
   return statusPaths(checkoutRoot, run, environment, ['--untracked-files=no']);
 }
 
-/** The tool's own commit, read in its checkout; see `resolveToolCommit`. */
 async function readToolCommit(
   toolRoot: string,
   run: SanitizedCommandRunner,
@@ -198,10 +190,9 @@ async function readToolCommit(
 }
 
 /**
- * The tool's own commit: the release every create and update deploys, so
- * everything the tool writes is correct for it by construction. A tracked
- * change would make the tool differ from that commit and is refused, naming
- * its files; untracked files belong to no release.
+ * The release a create or update deploys, so everything the tool writes is
+ * correct for it by construction. A tracked change would make the tool differ
+ * from that commit, so it is refused.
  */
 export async function resolveToolCommit(toolRoot: string, runtime: CheckoutRuntime = {}): Promise<string> {
   const run = runtime.runCommand ?? runSanitizedCommand;
@@ -209,10 +200,9 @@ export async function resolveToolCommit(toolRoot: string, runtime: CheckoutRunti
 }
 
 /**
- * The ID of the Git tree `directory` holds at `commit`, read from the
- * repository at `root`: its own objects only, nothing fetched even lazily,
- * and no operator configuration read. The ID names the directory's committed
- * content exactly, whatever the working tree holds.
+ * Reads the repository's own objects only, fetching nothing even lazily, and
+ * no operator configuration. The ID names the directory's committed content
+ * exactly, whatever the working tree holds.
  */
 export async function committedTree(
   root: string,
@@ -247,9 +237,8 @@ export async function committedTree(
   });
 }
 
-/** Where an assistant's deployed commit stands against the tool's own release. */
 export interface ToolReleasePosition {
-  /** The tool's own commit: the release an update would deploy. */
+  /** The release an update would deploy. */
   readonly toolCommit: string;
   /**
    * `behind`: a strict ancestor of the tool's commit, so an update can move
@@ -260,9 +249,9 @@ export interface ToolReleasePosition {
 }
 
 /**
- * Place `commit` against the tool's own release using only the tool's own
- * history: nothing is fetched, even lazily, and the tool's index is never
- * refreshed. Track membership is left to update, which fetches the track.
+ * Uses only the tool's own history: nothing is fetched, even lazily, and the
+ * tool's index is never refreshed. Track membership is left to update, which
+ * fetches the track.
  */
 export async function locateAgainstToolRelease(
   toolRoot: string,
@@ -291,19 +280,18 @@ export interface TrackCommits {
   readonly deployedCommit?: string;
 }
 
-/** Where a commit stands on a release track. */
 export interface TrackPosition {
   /** The commit is reachable from the track's tip. */
   readonly onTrack: boolean;
   /**
-   * Where the deployed commit stands, when one was given: `behind` is a
-   * strict ancestor of the commit, the only place an update moves forward
-   * from; `elsewhere` is newer, diverged, or not in the track's history.
+   * Set when a deployed commit was given: `behind` is a strict ancestor of the
+   * commit, the only place an update moves forward from; `elsewhere` is newer,
+   * diverged, or with either commit off the track.
    */
   readonly deployed?: 'behind' | 'same' | 'elsewhere';
 }
 
-/** Which of `commits` the object database holds, never fetching one it lacks. */
+/** `environment` must turn lazy fetching off, or a commit the object database lacks is fetched. */
 async function presentCommits(
   repository: string,
   commits: readonly string[],
@@ -349,11 +337,9 @@ async function isAncestor(
 }
 
 /**
- * Fetch the track branch's history without blobs into a disposable object
- * database, and place `commit` (and an update's deployed commit) on it
- * (KTD4). Only the commit graph is read, and lazy fetching is off, so a
- * commit the history lacks counts as off the track rather than being fetched
- * from wherever else the remote keeps it.
+ * Fetches the track's history without blobs into a disposable object
+ * database. Lazy fetching is off, so a commit the history lacks counts as off
+ * the track rather than being fetched from wherever else the remote keeps it.
  */
 export async function locateOnTrack(
   source: ReleaseSource,
@@ -419,19 +405,17 @@ function stagingCheckoutRoot(checkoutRoot: string): string {
   return `${checkoutRoot}.staging`;
 }
 
-/** The physical folder of the release at `commit`, `<instance root>/<hex8>`, never reached through a link. */
+/** `<instance root>/<hex8>`, never reached through a link. */
 function releaseFolder(paths: ControlPlanePaths, instanceId: string, commit: string): string {
   return paths.instanceLayout(instanceId).release(releaseName(commit));
 }
 
 /**
- * Materialize a reservation view's release (KTD17) in its own physical
- * folder, `<instance root>/<hex8>`, which is where it runs: its installed
- * tools record their absolute paths, so it is never built elsewhere and
- * moved. Nothing outside the folder is written, the assistant's `state/`
- * included, and publishing a release does not make it live. A checkout is
- * published only at the view's commit with a clean tree: its folder and its
- * Git HEAD are what identify it.
+ * Built in the release's own physical folder, where it runs, never elsewhere
+ * and moved: its installed tools record their absolute paths. Nothing outside
+ * the folder is written, the assistant's `state/` included, and publishing a
+ * release does not make it live. A checkout is published only at the view's
+ * commit with a clean tree: its folder and its Git HEAD identify it.
  */
 export async function materializeReleaseCheckout(
   paths: ControlPlanePaths,
@@ -500,10 +484,6 @@ export async function materializeReleaseCheckout(
   }
 }
 
-/**
- * Move a staged checkout to `destination` once it sits at the reservation's
- * commit with a clean tree and nothing occupies the path.
- */
 async function promoteStagingCheckout(
   stagingRoot: string,
   destination: string,
@@ -516,10 +496,7 @@ async function promoteStagingCheckout(
   await rename(stagingRoot, destination);
 }
 
-/**
- * A checkout sits detached at `commit` with a clean tree. Git is told not to
- * take optional locks, so reading its status never rewrites the index.
- */
+/** Git takes no optional lock, so reading the status never rewrites the index. */
 async function assertCheckoutRoot(
   checkoutRoot: string,
   commit: string,
@@ -538,7 +515,6 @@ async function assertCheckoutRoot(
   if (status) throw new GwsEaError('checkout_drift', `Release checkout is not clean:\n${status}`);
 }
 
-/** A checkout's HEAD is detached at `commit`. */
 async function assertDetachedAt(
   checkoutRoot: string,
   commit: string,
@@ -569,7 +545,6 @@ async function assertDetachedAt(
   if (branch !== 'HEAD') throw new GwsEaError('checkout_not_detached', 'Release checkout HEAD must be detached');
 }
 
-/** A release folder is a physical directory at exactly its own real path: no link on the way to it. */
 async function assertPhysicalRelease(release: string): Promise<void> {
   const info = await lstat(release);
   if (info.isSymbolicLink() || !info.isDirectory()) {
@@ -580,11 +555,6 @@ async function assertPhysicalRelease(release: string): Promise<void> {
   }
 }
 
-/**
- * Verify the registry and the assistant's `state/` marker agree, and the
- * release the registry records is a physical folder whose HEAD is detached at
- * its commit with a clean tree.
- */
 export async function assertReleaseCheckoutAgreement(
   paths: ControlPlanePaths,
   instanceId: string,
@@ -599,12 +569,7 @@ export async function assertReleaseCheckoutAgreement(
   return reservation;
 }
 
-/**
- * The tracked files a live checkout differs in, once its HEAD is found
- * detached at `commit`. A live checkout's contract: untracked files belong to
- * no release, so they never count. Git's HOME is outside the instance, and Git
- * takes no optional lock, so nothing under the instance is created or changed.
- */
+/** Creates and changes nothing under the instance. */
 async function liveTrackedChanges(root: string, commit: string, run: SanitizedCommandRunner): Promise<string[]> {
   return withScratchEnvironments('gws-ea-checkout-', async ({ git }) => {
     await assertDetachedAt(root, commit, run, git);
@@ -612,13 +577,7 @@ async function liveTrackedChanges(root: string, commit: string, run: SanitizedCo
   });
 }
 
-/**
- * The live release as a read-only command observes it: the release the live
- * link names, which must be one of `commits` (the registry's, plus any an
- * unfinished update or rollback placed there), a physical folder with HEAD
- * detached at that commit, and no tracked changes, which are refused by name.
- * The assistant's `state/` must carry its marker. Returns the commit.
- */
+/** The live link must name one of `commits`, the releases the caller's records allow to be live. */
 export async function observeLiveCheckout(
   paths: ControlPlanePaths,
   reservation: InstanceReservation,
@@ -652,12 +611,6 @@ export async function observeLiveCheckout(
   return commit;
 }
 
-/**
- * The release an update moves from: the registry's, in its physical folder
- * with HEAD detached at its commit, and the assistant's `state/` carrying its
- * marker. A tracked edit would stay behind with the release it edits, so it
- * is refused, naming the files.
- */
 export async function assertDeploymentCheckoutUnmodified(
   paths: ControlPlanePaths,
   reservation: InstanceReservation,

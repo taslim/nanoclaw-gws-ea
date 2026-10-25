@@ -154,7 +154,6 @@ async function buildApprovalOptions(agentGroups: AgentGroup[], approverUserId?: 
   return options;
 }
 
-/** The people in a group chat besides whoever wrote, by name. */
 function otherParticipants(
   senderName: string | undefined,
   senderId: string | undefined,
@@ -191,7 +190,6 @@ function buildQuestionText(
   return `${who} sent me a direct message on ${channelType}.${note} ${AGENT_ACCESS_SCOPE_WARNING} How would you like to handle it?`;
 }
 
-/** The kind of conversation a registration asks about, in words. */
 const CONVERSATION_KINDS: Record<ResolvedConversation['type'], string> = {
   channel: 'a channel',
   group_dm: 'a group chat',

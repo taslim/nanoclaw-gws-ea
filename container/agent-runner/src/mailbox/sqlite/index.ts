@@ -93,7 +93,6 @@ function parseInboundMessage(row: MessageInRow): InboundMessage | undefined {
 
 export class SqliteAgentMailbox implements AgentMailbox {
   readonly operations: MailboxOperations = this;
-  /** The agent group this session belongs to, from the session the runner started with. */
   private agentGroupId: string | null = null;
 
   shouldRestartAfter(error: unknown): boolean {

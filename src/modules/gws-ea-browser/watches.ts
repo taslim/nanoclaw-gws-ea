@@ -67,7 +67,7 @@ interface WatchInput extends Record<string, unknown> {
   financial: { currency: string; max_total: string };
   until: string;
   release?: WatchReleaseInput;
-  /** On a site with no reader, the observation ref of the region that shows availability (KTD20). */
+  /** On a site with no reader, the observation ref of the region that shows availability. */
   region?: BrowserRef;
   /** A region watch to mark again, with the same bounds. */
   watch_id?: string;
@@ -106,7 +106,6 @@ function validateRelease(raw: unknown): WatchReleaseInput {
   if (raw.time_zone !== undefined && !timeZone) throw invalidArgs(watchMessage('releaseZone'));
   return { schedule, time: raw.time, wording: raw.wording.trim(), ...(timeZone ? { timeZone } : {}) };
 }
-/** The rule as stored: on the venue's zone as the host read it from the site, or else as the agent gave it. */
 function watchReleaseRule(input: WatchReleaseInput, hostTimeZone: string | undefined): WatchReleaseRule | undefined {
   const timeZone = hostTimeZone ?? input.timeZone;
   return timeZone ? { schedule: input.schedule, time: input.time, timeZone, wording: input.wording } : undefined;
@@ -199,8 +198,8 @@ function validateQueuedWatch(raw: Record<string, unknown>): Record<string, unkno
   return Object.fromEntries(Object.entries(raw).filter(([key]) => !['action', 'requestId', 'budget_ms'].includes(key)));
 }
 /**
- * Whether the host reads a site's availability itself (Resy): its watches book through the reader, never a region.
- * The site's own home counts as well as the address given, so no other host name on it avoids the reader.
+ * Whether the host reads a site's availability itself: its watches book through the reader, never a region. The
+ * site's own home counts as well as the address given, so no other host name on it avoids the reader.
  */
 function hasWatchReader(address: string, site: string): boolean {
   const urls = [new URL(address), new URL(`https://${site}/`)];
@@ -208,7 +207,7 @@ function hasWatchReader(address: string, site: string): boolean {
     (signature) => signature.readAvailability !== undefined && urls.some((url) => signature.matches(url)),
   );
 }
-/** A region watch's bounds (KTD20): the venue by the name its site shows, and one maximum for every charge. */
+/** A region watch's bounds: the venue by the name its site shows, and one maximum for every charge. */
 function regionWatchBounds(input: WatchInput, site: string): WatchBounds {
   const maxTotalMinor = amountMinor(input.financial.max_total, input.financial.currency)!;
   return {
@@ -269,7 +268,7 @@ type PreparedWatch =
       region?: { locator: StructuredBrowserLocator; text: string };
     }
   | { status: 'refused'; reason: string; exposure?: string; max_total?: string; message?: string };
-/** A reader watch's bounds and release (Resy): the venue, its zone and its terms as the host reads them. */
+/** A reader watch's venue, zone and terms come from the host's own read, not from the agent's input. */
 async function prepareReaderWatch(
   context: BrowserExecutionContext,
   input: WatchInput,
@@ -335,8 +334,8 @@ async function prepareReaderWatch(
   };
 }
 /**
- * A region watch on a site with no reader (KTD20): the recipe to the availability view, the region the agent marked
- * on it, and that region's normalized text as the baseline. Its release rule reads on the zone the agent gives.
+ * A region watch on a site with no reader: the recipe to the availability view, the region the agent marked on it,
+ * and that region's normalized text as the baseline. Its release rule reads on the zone the agent gives.
  */
 async function prepareRegionWatch(
   context: BrowserExecutionContext,
@@ -357,7 +356,6 @@ async function prepareRegionWatch(
     region: { locator: mark.region, text: mark.text },
   };
 }
-/** The recipe a watch checks with: read-only, on the watch's site, taking exactly the watch's inputs. */
 async function watchRecipe(input: WatchInput, site: string, db: DbDriver): Promise<BrowserRecipe | undefined> {
   const recipe = await loadRecipe(input.recipe_id, db);
   return recipe?.readOnly &&
@@ -486,9 +484,9 @@ export async function createBrowserWatch(
   return { status: approvalId ? 'awaiting_principal' : 'refused', watch_id: id, ...(approvalId ? marked : {}) };
 }
 /**
- * Marks a region watch's region again (KTD20) after the host could not find it, from a fresh observation of the view
- * its recipe reaches, with a new recipe when the route changed. Its bounds, approval and release stay; the new text is
- * its baseline, and it is checked again at once.
+ * Marks a region watch's region again after the host could not find it, from a fresh observation of the view its
+ * recipe reaches, with a new recipe when the route changed. Its bounds, approval and release stay; the new text is its
+ * baseline, and it is checked again at once.
  */
 async function markBrowserWatchAgain(
   context: BrowserExecutionContext,
@@ -658,7 +656,7 @@ export const listWatchesAction: BrowserQueuedAction = {
         status: watch.status,
         bounds: boundsOf(watch),
         release: watch.release_json ? (JSON.parse(watch.release_json) as WatchReleaseRule) : null,
-        // An armed check also waits out the principal's night, on their clock as it is now, unless a release comes first.
+        // An armed check also waits out the principal's night on their current clock, unless a release comes first.
         next_check_at:
           watch.status === 'armed'
             ? new Date(
@@ -670,7 +668,6 @@ export const listWatchesAction: BrowserQueuedAction = {
                 ),
               ).toISOString()
             : watch.next_check_at,
-        // A region watch's mark: when it was made, whether the host still finds it, and the text it compares against.
         region: watch.region_json
           ? {
               marked_at: watch.region_marked_at,

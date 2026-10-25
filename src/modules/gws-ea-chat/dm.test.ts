@@ -1,5 +1,5 @@
 /**
- * Opening the principal's DM at create (KTD11): the assistant asks Chat for
+ * Opening the principal's DM at create: the assistant asks Chat for
  * its DM with the one address create named, checks that Google answered with
  * a direct message between it and one person, and returns that person by the
  * numeric ID Chat knows them by, with the conversation the adapter routes

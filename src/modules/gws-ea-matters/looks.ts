@@ -1,24 +1,23 @@
 /**
- * A matter's next look (KTD4, R13): one slot on the matter, held by one
- * scheduled task that comes back as a turn of `main`'s conversation (KTD1).
- * The task is the matter's only clock: the matter records the task's id,
- * never a time.
+ * A matter's next look: one slot on the matter, held by one scheduled task
+ * that comes back as a turn of `main`'s conversation. The task is the
+ * matter's only clock: the matter records the task's id, never a time.
  *
  * - The task's prompt names only the matter's id, so a rename or a forget
  *   leaves nothing stale in it.
  * - Its pre-task script, `ncl matters look <id>`, prints the verdict the
  *   runner reads from a script's last line
  *   (`container/agent-runner/src/scheduling/task-script.ts`): the matter read
- *   live (KTD5) while it is open, and no wake once it has closed. A look never
+ *   live while it is open, and no wake once it has closed. A look never
  *   presents a stale matter, and a leftover one stays silent.
  * - `open`, `update` and `close` keep one look per matter. A new look is
  *   recorded before the one it replaces is cancelled, so the matter always
  *   names a live task, and a failure between the two leaves at most a stray
  *   the host's loop cancels (`loop.ts`). A repeating look is never replaced
- *   by a one-off, which would silently end a yearly date (R24): a one-off
- *   follow-up is a matter of its own.
- * - A look the host sets for a matter left without one (R14) is named apart,
- *   so today's list can say which matters came back that way.
+ *   by a one-off, which would silently end a yearly date: a one-off follow-up
+ *   is a matter of its own.
+ * - A look the host sets for a matter left without one is named apart, so
+ *   today's list can say which matters came back that way.
  *
  * Every change to a slot, and each pass of the host's loop, runs one at a
  * time, so a pass never reads a slot halfway through a change.
@@ -61,11 +60,7 @@ export function oneAtATime<T>(work: () => Promise<T>): Promise<T> {
   return run;
 }
 
-/**
- * `main`'s one shared conversation (`resolveMainConversation`), where every
- * note lands and every look and the daily sync come back: undefined until the
- * profile names main and the principal has a direct message.
- */
+/** Undefined while `resolveMainConversation` finds none. */
 export async function mainConversation(): Promise<Session | undefined> {
   const conversation = await resolveMainConversation();
   return typeof conversation === 'string' ? undefined : conversation.session;
@@ -85,7 +80,6 @@ export async function mainConversations(): Promise<Session[]> {
   return mainAgentGroupId === null ? [] : findConversationSessions(mainAgentGroupId);
 }
 
-/** A task as one of `main`'s conversations holds it. */
 export interface HeldTask {
   readonly session: Session;
   readonly task: TaskRecord;
@@ -96,7 +90,6 @@ export function seriesKey(task: TaskRecord): string {
   return task.seriesId ?? task.id;
 }
 
-/** The tasks `ids` name, each from whichever of `main`'s conversations holds it. */
 export async function findTasks(ids: readonly string[]): Promise<Map<string, HeldTask>> {
   const found = new Map<string, HeldTask>();
   for (const session of await mainConversations()) {
@@ -113,14 +106,12 @@ export async function findTasks(ids: readonly string[]): Promise<Map<string, Hel
   return found;
 }
 
-/** An open matter's look slot, with the task it records as one of main's conversations holds it. */
 export interface HeldSlot {
   readonly slot: LookSlot;
   /** Undefined while it records none, or none of main's conversations holds the one it records. */
   readonly held: HeldTask | undefined;
 }
 
-/** Every open matter's look slot, oldest first, each with its task as main's conversations hold it. */
 export async function listHeldLookSlots(): Promise<HeldSlot[]> {
   const slots = await listOpenLookSlots();
   const tasks = await findTasks(slots.flatMap((slot) => (slot.look_task_id === null ? [] : [slot.look_task_id])));
@@ -158,16 +149,15 @@ export function stillToCome(task: TaskRecord | undefined): boolean {
   }
 }
 
-/** A look `main` set is named `look <matter id>`; one the host set for a matter left without one, `back <matter id>`. */
+/** `look <matter id>` is a look `main` set; `back <matter id>`, one the host set for a matter left without one. */
 const LOOK_SERIES = /^(look|back)-(m-[0-9a-f]{12})-[0-9a-f]{4}$/u;
 
 export interface LookSeries {
   readonly matterId: string;
-  /** The host set it, at the daily sync, for a matter left without a look (R14). */
+  /** The host set it, at the daily sync, for a matter left without a look. */
   readonly handedBack: boolean;
 }
 
-/** The matter a task series is a look for, or undefined for any other task. */
 export function lookSeries(key: string): LookSeries | undefined {
   const match = LOOK_SERIES.exec(key);
   return match === null ? undefined : { matterId: match[2], handedBack: match[1] === 'back' };
@@ -194,11 +184,7 @@ async function createLook(
   return row.id;
 }
 
-/**
- * Give a matter its next look in `conversation`, replacing `previous`: the new
- * task is recorded before the old one is cancelled. The caller holds
- * `oneAtATime`.
- */
+/** The new task is recorded before `previous` is cancelled. The caller holds `oneAtATime`. */
 export async function setLook(
   conversation: Session,
   matterId: string,
@@ -211,7 +197,7 @@ export async function setLook(
   if (previous !== null) await cancelTaskSeries(previous);
 }
 
-/** Open a matter with its first next look (R13). Nothing is written while there is no conversation for it. */
+/** Nothing is written while there is no conversation for its look. */
 export function openMatterWithLook(input: OpenMatterInput, look: NextLook): Promise<Placed> {
   return oneAtATime(async () => {
     const conversation = await requireMainConversation();
@@ -221,10 +207,7 @@ export function openMatterWithLook(input: OpenMatterInput, look: NextLook): Prom
   });
 }
 
-/**
- * Change a matter, and with `look` move its next look, which reopens a
- * closed one (KTD3). A one-off look never replaces a repeating one.
- */
+/** With `look`, also moves its next look, which reopens a closed matter. A one-off never replaces a repeating look. */
 export function updateMatterAndLook(input: UpdateMatterInput, look: NextLook | undefined): Promise<Matter> {
   if (look === undefined) return updateMatter(input);
   return oneAtATime(async () => {
@@ -244,7 +227,6 @@ export function updateMatterAndLook(input: UpdateMatterInput, look: NextLook | u
   });
 }
 
-/** Close a matter, ending its next look (R5, R13). */
 export function closeMatterAndLook(input: CloseMatterInput): Promise<Matter> {
   return oneAtATime(async () => {
     const closed = await closeMatter(input);
@@ -262,7 +244,6 @@ export interface ScriptVerdict {
   readonly data?: readonly string[];
 }
 
-/** A look's verdict: its matter read live while it is open; no wake once it has closed or is gone. */
 export async function lookVerdict(id: string): Promise<ScriptVerdict> {
   const matter = await getMatter(id);
   if (matter === undefined || !matter.open) return { wakeAgent: false };

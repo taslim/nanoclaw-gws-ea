@@ -8,11 +8,12 @@
  * Default when only `core.ts` is imported: the core `send_message` /
  * `send_file` / `edit_message` / `add_reaction` tools are available.
  *
- * Each tool definition is granted by one capability key: `registerTools` takes it, and
- * `loadToolModule` attributes a whole module's tools to one key while it
- * loads. The runner's server serves only the tools of the keys its group
- * holds; a tool registered without a key is never served to a group. An explicit
- * variant can give another key its own schema and handler for the same name.
+ * Each tool definition is granted by one capability key: `registerTools`
+ * takes it, and `loadToolModule` attributes a whole module's tools to one key
+ * while it loads. The runner's server serves only the tools of the keys its
+ * group holds; a tool registered without a key is never served to a group. An
+ * explicit variant can give another key its own schema and handler for the
+ * same name.
  *
  * Installed feature modules can additively extend an already-registered
  * tool via `extendTool()` instead of editing the base tool's source —
@@ -66,7 +67,6 @@ export function registerToolVariant(tool: McpToolDefinition, capability: string)
   toolVariants.set(name, variants);
 }
 
-/** Every capability key a base tool or a variant is served under, for checks that must cover each one. */
 export function registeredToolCapabilities(): string[] {
   const keys = new Set(toolCapabilities.values());
   for (const variants of toolVariants.values()) for (const key of variants.keys()) keys.add(key);
@@ -74,10 +74,10 @@ export function registeredToolCapabilities(): string[] {
 }
 
 /**
- * Import a tool module whose tools one capability key grants. Every tool the
- * module registers while it loads is attributed to `capability`, so a module
- * needs no knowledge of capabilities. Loads must not overlap: attribution is
- * by load window, and a second load inside the first would mislabel tools.
+ * Every tool the module registers while it loads is attributed to
+ * `capability`, so a module needs no knowledge of capabilities. Loads must not
+ * overlap: attribution is by load window, and a second load inside the first
+ * would mislabel tools.
  */
 export async function loadToolModule(capability: string, load: () => Promise<unknown>): Promise<void> {
   if (loadingCapability !== undefined) {
@@ -92,9 +92,8 @@ export async function loadToolModule(capability: string, load: () => Promise<unk
 }
 
 /**
- * The tools a group's capability keys grant. Without `grants` every
- * registered tool is served — a test exercising a tool directly; the runner's
- * server always passes its group's keys.
+ * Without `grants` every registered tool is served — a test exercising a tool
+ * directly; the runner's server always passes its group's keys.
  */
 function isServed(name: string, grants: ReadonlySet<string> | undefined): boolean {
   if (!grants) return true;

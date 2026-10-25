@@ -1,8 +1,9 @@
 /**
- * Personal-data disclosures (KTD19; R25, R34). The principal's stored private values (a phone number, a date
- * of birth, a home address, as the privacy module holds them) and their email addresses go onto no website by
- * default. Main lets one errand give one site one stored value by recording a disclosure; its guidance keeps
- * disclosures to the sites the principal's own request names, never one a browser report brings up.
+ * Personal-data disclosures. The principal's stored private values (a phone number, a date of birth, a home
+ * address, as the privacy module holds them) and their email addresses go onto no website by default. A group
+ * with browser access lets one of its errands give one site one stored value by recording a disclosure; the
+ * `record_disclosure` tool's guidance keeps disclosures to the sites the principal's own request names, never
+ * one a browser report brings up.
  *
  * A disclosure is keyed on the errand's browser job, the site's registrable domain and the value's id in the
  * privacy store. The job names the group that delegated the errand, so a disclosure serves that errand alone:
@@ -35,20 +36,20 @@ import { registrableSite } from './commit-classifier.js';
 import type { BrowserAction } from './actions.js';
 import type { BrowserRef, PinnedBrowserRef } from './observe.js';
 
-// ---------------------------------------------------------------- main's disclosure
+// ---------------------------------------------------------------- the delegator's disclosure
 
 const DISCLOSURE_FIELDS: ReadonlySet<string> = new Set(['action', 'requestId', 'thread', 'site', 'value_id']);
 
-/** A site as main names it, an address or a bare domain: its registrable domain, or undefined for no public site. */
+/** A site as the delegator names it, an address or a bare domain: undefined for no public site. */
 function disclosureSite(named: string): string | undefined {
   const trimmed = named.trim();
   return registrableSite(/[/:]/u.test(trimmed) ? trimmed : `https://${trimmed}`);
 }
 
 /**
- * An agent with browser access records that one errand of its own may give one site one of the principal's
- * stored values, named by its id. None of the principal's addresses is ever disclosed (R34): a site gets the
- * assistant's web address. A repeat changes nothing.
+ * An agent with browser access records that one errand of its own may give one site one of the principal's stored
+ * values, named by its id. None of the principal's addresses is ever disclosed: a site gets the assistant's web
+ * address. A repeat changes nothing.
  * to: main, delegator
  */
 async function recordDisclosureRequest(

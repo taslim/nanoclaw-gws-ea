@@ -7,7 +7,7 @@ import { canonicalText, PRIVATE_VALUE_KINDS, uncheckableReason, type PrivateValu
 
 export interface PrivateValue {
   readonly id: string;
-  /** What the principal calls it, such as "Home". Never shown to anyone else. */
+  /** What the principal calls it, such as "Home". The host shows it only to the principal and their assistant. */
   readonly label: string;
   readonly kind: PrivateValueKind;
   /** As the principal wrote it. */
@@ -62,9 +62,8 @@ export async function getPrivateValue(id: string): Promise<PrivateValue | undefi
 }
 
 /**
- * Hold a private value. Refuses one the check could not match reliably.
- * Adding a value already held, in any spelling, changes nothing and returns
- * the held one.
+ * Refuses a value the check could not match reliably. A value already held,
+ * in any spelling, changes nothing and returns the held one.
  */
 export async function addPrivateValue(
   input: AddPrivateValueInput,
@@ -90,7 +89,7 @@ export async function addPrivateValue(
   });
 }
 
-/** Forget a private value, switching its check off. Callers decide who may; see `index.ts`. */
+/** Switches the value's check off. Callers decide who may; see `index.ts`. */
 export async function removePrivateValue(id: string): Promise<PrivateValue> {
   const db = getDb();
   return db.transaction(async () => {

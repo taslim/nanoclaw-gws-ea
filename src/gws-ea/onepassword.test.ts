@@ -176,7 +176,7 @@ describe('1Password release compatibility', () => {
   });
 });
 
-describe('enabling 1Password for existing and future assistants (AE1)', () => {
+describe('enabling 1Password for existing and future assistants', () => {
   it('gives two stopped assistants and a later creation distinct vaults and tokens, and a retry creates nothing', async () => {
     const first = await assistant();
     const second = await assistant();
@@ -666,7 +666,7 @@ describe('pausing on an assistant record enable cannot build on', () => {
   });
 });
 
-describe('disabling and re-enabling 1Password (R13, AE5)', () => {
+describe('disabling and re-enabling 1Password', () => {
   /** Two enabled assistants, sorted by ID, with what each recorded. */
   async function enabledPair() {
     const runtimes = [await assistant(), await assistant()].sort((left, right) =>
@@ -970,7 +970,7 @@ describe('choosing the 1Password account', () => {
   });
 });
 
-describe('1Password readiness (AE8)', () => {
+describe('1Password readiness', () => {
   it('shows recorded facts without a provider request', async () => {
     const runtime = await assistant();
     const before = await inspectOnePasswordCapability(paths, dependencies());

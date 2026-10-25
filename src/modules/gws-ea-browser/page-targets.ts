@@ -24,15 +24,13 @@ export function onUncoveredPageTarget(page: Page, listener: () => void): void {
   settingsFor(page).uncovered.add(listener);
 }
 
-/** The one pre-operation step: every setting reaches every current frame before an operation may act in it. */
+/** Whether every setting reaches every current frame; an operation may act only once it does. */
 export async function pageTargetsReady(page: Page): Promise<boolean> {
   return (await Promise.all(settingsFor(page).covered.map((covered) => covered()))).every(Boolean);
 }
 
-/** A protocol read that has not answered within this is no answer. */
 export const PROTOCOL_READ_TIMEOUT_MS = 2_000;
 
-/** `work`, or a rejection once `ms` pass without its answer. */
 export function withinTime<T>(work: Promise<T>, ms: number): Promise<T> {
   let timer: NodeJS.Timeout | undefined;
   return Promise.race([
@@ -43,15 +41,11 @@ export function withinTime<T>(work: Promise<T>, ms: number): Promise<T> {
   ]).finally(() => clearTimeout(timer));
 }
 
-/** A protocol read, bounded by PROTOCOL_READ_TIMEOUT_MS unless `ms` says otherwise. */
 export function bounded<T>(work: Promise<T>, ms = PROTOCOL_READ_TIMEOUT_MS): Promise<T> {
   return withinTime(work, ms);
 }
 
-/**
- * Every frame the page's targets host now, each mapped to the target hosting it, read through any
- * setting's sessions; undefined when the page's targets cannot all be read.
- */
+/** Each frame id to the id of the target hosting it now; undefined when the page's targets cannot all be read. */
 export async function pageTargetFrameHosts(page: Page): Promise<ReadonlyMap<string, string> | undefined> {
   for (const read of settingsFor(page).frameHosts) {
     const hosts = await read();
@@ -60,16 +54,13 @@ export async function pageTargetFrameHosts(page: Page): Promise<ReadonlyMap<stri
   return undefined;
 }
 
-/** The page's target id, once some setting covers it. */
+/** Undefined until some setting covers the page. */
 export function pageTargetId(page: Page): string | undefined {
   return settingsFor(page).targetId;
 }
 
 const ensuring = new WeakMap<Page, Promise<void>>();
-/**
- * A page with no setting yet gets sessions with none, so its frame trees stay readable. Concurrent
- * callers share one setup; one that fails is forgotten, so a later call tries again.
- */
+/** A page with no setting yet gets sessions with none, so its frame trees stay readable. */
 export async function ensurePageTargets(page: Page): Promise<void> {
   if (settingsFor(page).frameHosts.length) return;
   let pending = ensuring.get(page);
@@ -80,7 +71,6 @@ export async function ensurePageTargets(page: Page): Promise<void> {
   await pending;
 }
 
-/** A frame as a target's frame tree lists it. */
 export interface TreeFrame {
   id: string;
   parentId?: string;
@@ -92,7 +82,6 @@ export interface FrameTreeNode {
   childFrames?: FrameTreeNode[];
 }
 
-/** Every frame a target's frame tree lists: its own frame first, each frame before the frames it holds. */
 export function frameTreeFrames(tree: FrameTreeNode): TreeFrame[] {
   return [tree.frame, ...(tree.childFrames ?? []).flatMap(frameTreeFrames)];
 }

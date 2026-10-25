@@ -49,12 +49,11 @@ export interface ProviderStateVolume {
   containerPath: string;
   scope: 'group' | 'session';
   /**
-   * Where a `group` volume lives for a group whose sessions are sealed, one
-   * without the `conversation-context` capability. `session` declares that
-   * the volume holds conversation state, such as the provider's transcripts,
-   * that one session must never read from another: such a group realizes it
-   * per session, seeded from its declared files and its skill backings'
-   * template copies (see `sealedSessionContract`).
+   * `session` marks a `group` volume holding conversation state (such as the
+   * provider's transcripts) that one session must never read from another. A
+   * group without `conversation-context` realizes it per session, seeded from
+   * its declared files and its skill backings' template copies
+   * (`sealedSessionContract`).
    */
   sealedScope?: 'session';
   mode: 'ro' | 'rw';

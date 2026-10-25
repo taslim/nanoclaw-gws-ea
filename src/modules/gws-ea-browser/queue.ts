@@ -128,7 +128,7 @@ export class BrowserQueue {
     }
   }
 
-  /** Approval/relay workers create a fresh bounded attempt, never revive an answered tool request. */
+  /** Host-initiated work gets a fresh bounded request; it never revives an answered tool request. */
   async enqueueInternal(
     jobId: string,
     name: string,
@@ -396,11 +396,7 @@ export class BrowserQueue {
       .catch(() => log.warn('A held credential site could not be settled', { reason: 'settlement_failed' }));
   }
 
-  /**
-   * The answer for a request its worker can no longer answer from its own
-   * result: unconfirmed after a purchase commit marker, else the action's own
-   * recorded outcome, else interrupted.
-   */
+  /** The answer for a request its worker can no longer answer from its own result. */
   async interruptedAnswer(request: BrowserRequest, repeatSafe: boolean): Promise<Record<string, unknown>> {
     if (request.commit_started_at) return stopped('unconfirmed', false);
     return (await this.action(request.action)?.recover?.(request)) ?? stopped('interrupted', repeatSafe);

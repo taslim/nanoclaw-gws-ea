@@ -1,7 +1,7 @@
 /**
- * The assistant's inbox as a NanoClaw channel adapter (KTD1). Inbound, it
- * polls Gmail's history each minute for messages added to INBOX and routes
- * each one to the part allowed to write to its readers (route-mail.ts).
+ * The assistant's inbox as a NanoClaw channel adapter. Inbound, it polls
+ * Gmail's history each minute for messages added to INBOX and routes each
+ * one to the part allowed to write to its readers (route-mail.ts).
  * Outbound, `deliver` sends `main`'s email to the principal on
  * `email:principal` (principal-reply.ts), and `external-email`'s on
  * `email:inbox` (outbound.ts).
@@ -10,7 +10,7 @@
  * - a Gmail message ID routes once: each is recorded as settled;
  * - a known message not yet settled routes first, before new history, and
  *   without counting its sender again: a retry, or mail an update left to
- *   route (KTD10);
+ *   route;
  * - the history cursor advances only when every message up to it settled;
  * - a message that keeps failing is set aside after `MAX_ROUTING_ATTEMPTS`
  *   polls, the cursor moves past it, and the principal hears one sentence;
@@ -19,13 +19,10 @@
  * - an expired cursor (404) resyncs from the newest INBOX messages, which
  *   the settled record keeps from routing twice.
  *
- * Each poll also keeps the assistant's calendar list first: each principal
- * address's calendar in it, its access recorded, and notifications on for
- * the principal's calendars (calendar-notifications.ts). The mail that waits
- * for main to place its thread or hand it over, Calendar's notifications,
- * and Docs' and Drive's each become one note for `main` after the poll's
- * messages are routed; Drive failing as that note is written costs the note
- * detail, never the poll.
+ * Each regular poll syncs the assistant's calendar list first
+ * (calendar-notifications.ts). The mail that waits for main to place its
+ * thread or hand it over, Calendar's notifications, and Docs' and Drive's
+ * each become one note for `main` after the poll's messages are routed.
  */
 import type { ChannelAdapter, ChannelContextDefaults, ChannelDefaults, ChannelSetup } from '../../channels/adapter.js';
 import { log } from '../../log.js';
@@ -100,9 +97,9 @@ export const EMAIL_CHANNEL_DEFAULTS: ChannelDefaults = { dm: EMAIL_CONTEXT, grou
 export interface InboxDeps {
   readonly gmail: GmailApi;
   readonly calendar: CalendarListApi;
-  /** The principal's events as the host's own Calendar token reads them, for who organized a new one. */
+  /** Read with the host's own Calendar token, for who organized a new event. */
   readonly events: Pick<MeetingsCalendarApi, 'getEvent'>;
-  /** Drive as the host's own Drive token reaches it, for the details of Docs and Drive activity. */
+  /** Read with the host's own Drive token, for the details of Docs and Drive activity. */
   readonly drive: DriveApi;
   readonly now?: () => Date;
   readonly sleep?: (ms: number) => Promise<void>;
@@ -120,7 +117,6 @@ function reasonOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-/** Messages added to INBOX, once each, in history order. */
 function inboxAdditions(records: readonly GmailHistoryRecord[]): string[] {
   const ids: string[] = [];
   for (const record of records) {
@@ -158,10 +154,7 @@ export function createInbox(deps: InboxDeps): Inbox {
     },
   };
 
-  /**
-   * Route messages in order; true when every one settled or was set aside.
-   * `limited` counts each sender against the hourly limit.
-   */
+  /** True when every message settled or was set aside. `limited` counts each sender against the hourly limit. */
   async function routeBatch(
     ids: readonly string[],
     context: RoutingContext,
@@ -232,7 +225,7 @@ export function createInbox(deps: InboxDeps): Inbox {
       }
     }
 
-    /** Write one batch's note, then settle its notifications; failing to write it is each one's failed attempt. */
+    /** Failing to write the note is a failed attempt for each message in it. */
     const writeBatch = async (
       entries: readonly { readonly gmailMessageId: string }[],
       write: () => Promise<void>,
@@ -334,7 +327,7 @@ export function createInbox(deps: InboxDeps): Inbox {
       const { auth } = await loadRoutingContext(await assistantAddresses(), at);
       if (!mailOnly) await syncCalendarList(deps.calendar, auth.principalAddresses, at.toISOString());
       try {
-        // The assistant's own Gmail address is never "someone else" on a message.
+        // Learn the assistant's own Gmail address, so `assistantAddresses` holds it: it is never "someone else".
         await runtime.gmailAddress();
         // Read after the sync, so a calendar added this minute already counts as the principal's.
         const context = await loadRoutingContext(await assistantAddresses(), at);

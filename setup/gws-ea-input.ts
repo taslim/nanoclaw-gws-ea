@@ -40,7 +40,7 @@ interface PromptAdapter {
 }
 
 export interface GwsEaCreateInputDependencies {
-  /** Whether a person can answer prompts. Without one, every input comes from its flag or secret source. */
+  /** False when no person can answer prompts: every input then comes from its flag or secret source. */
   readonly interactive?: boolean;
   readonly providers?: readonly SetupProviderEntry[];
   readonly detectedTimezone?: string;
@@ -59,7 +59,6 @@ function cancelled(): never {
   throw new GwsEaError('cancelled', 'Assistant creation was cancelled');
 }
 
-/** Where create input comes from: its flag first, then a prompt when a person is present. */
 interface InputSource {
   readonly context: CreatePromptContext;
   readonly prompts: PromptAdapter;
@@ -144,11 +143,7 @@ function workspaceEmailProblem(value: string): string | undefined {
   return undefined;
 }
 
-/**
- * The principal's addresses from `--principal-email`, or asked for when a
- * person is present. Never the assistant's own address, and never two
- * spellings of one address (`principalAddressConflict`).
- */
+/** Never the assistant's own address, and never two spellings of one address (`principalAddressConflict`). */
 async function principalEmailsInput(source: InputSource, assistantWorkspaceEmail: string): Promise<string[]> {
   const assistant = assistantWorkspaceEmail.trim().toLowerCase();
   const provided = source.context.providedPrincipalEmails;
@@ -192,11 +187,7 @@ function principalEmailsFrom(value: string, assistant: string): { emails: string
   return { emails };
 }
 
-/**
- * Which of the principal's addresses they use for Google Chat, the one the
- * assistant opens its DM with (KTD11): their only address, or the one named
- * by flag or asked for, prefilled with their first. It must be one of theirs.
- */
+/** The address the assistant opens its Google Chat DM with; it must be one of the principal's. */
 async function principalChatEmailInput(source: InputSource, principalEmails: readonly string[]): Promise<string> {
   const [first, ...others] = principalEmails;
   if (first === undefined) throw new GwsEaError('input_required', "The principal's addresses are missing");

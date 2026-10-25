@@ -1,4 +1,4 @@
-/** Disposable Linux acceptance author. Run only through the host's opt-in native fixture. */
+/** Runs only in the disposable container src/modules/gws-ea-artifacts/native.test.ts starts when opted in. */
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import { requestAction } from '../action-request.js';

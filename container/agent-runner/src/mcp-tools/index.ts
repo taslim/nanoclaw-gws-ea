@@ -7,7 +7,7 @@
  * The server serves only the tools of the keys in the group's container.json.
  */
 import { loadConfig } from '../config.js';
-// core.ts names its own two keys: `reply` and `files-send`.
+// core.ts names its own capability keys.
 import './core.js';
 import { getAgentMailbox, readMailboxContext } from '../mailbox/index.js';
 import { loadToolModule, startMcpServer } from './server.js';
@@ -18,8 +18,7 @@ await loadToolModule('interactive', () => import('./interactive.js'));
 await loadToolModule('agents', () => import('./agents.js'));
 await loadToolModule('self-mod', () => import('./self-mod.js'));
 await loadToolModule('time', () => import('./time.js'));
-// The email tools name their own two keys, one for each agent, and
-// request_status and main's calendar tools their own: their tests load them
+// These modules name their own capability keys, so their tests can load them
 // ahead of this barrel.
 await import('./gws-ea-email.js');
 await import('./gws-ea-chat.js');

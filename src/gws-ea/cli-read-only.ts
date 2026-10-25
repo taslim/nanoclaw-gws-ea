@@ -1,10 +1,7 @@
 /**
- * The read-only commands `list`, `status`, and `logs`, which `cli.ts`
- * dispatches outside its attempt loop (KTD10).
- *
- * This module sits below `cli.ts` and imports nothing from it. Public grammar
- * lives in command-definitions; this module owns observation handlers,
- * explicit target resolution, and how an outside-attempt command ends.
+ * The read-only commands, which `cli.ts` dispatches outside its attempt loop.
+ * This module sits below `cli.ts` and imports nothing from it; their grammar
+ * lives in `command-definitions.ts`.
  */
 import { lstat } from 'node:fs/promises';
 import path from 'node:path';
@@ -29,20 +26,19 @@ export function requireOption(options: CommandOptions, name: string): string {
   return value;
 }
 
-/** `--id`: the exact assistant a command acts on. */
 export function targetInstance(options: CommandOptions): string {
   const instanceId = requireOption(options, 'id');
   assertInstanceId(instanceId);
   return instanceId;
 }
 
-/** How a command run outside the attempt loop ends: with an exit code, or by handing its process to a tool. */
+/** `replaceWith` hands the process over to a tool instead of exiting. */
 export type CommandEnd = { readonly exitCode: number } | { readonly replaceWith: SanitizedCommand };
 
 /**
- * What a read-only command may use (KTD10). It loads no secrets, starts no
- * run log, takes no lock, and repairs nothing, so it works in any state,
- * mid-update and mid-removal included.
+ * A read-only command loads no secrets, starts no run log, takes no lock, and
+ * repairs nothing, so it works in any state, mid-update and mid-removal
+ * included.
  */
 export interface ReadOnlyContext {
   readonly paths: ControlPlanePaths;
@@ -52,20 +48,17 @@ export interface ReadOnlyContext {
   readonly errorOutput: LineWriter;
   /** For the tools a command hands its process to: only the tool allowlist is read from it, never a secret. */
   readonly environment: NodeJS.ProcessEnv;
-  /** Upstream's service helpers, for observing (never controlling) an assistant's service. */
+  /** For observing an assistant's service, never controlling it. */
   readonly serviceHelpers?: NanoclawServiceHelpers;
-  /** Upstream's host readiness helpers, for asking a host its status. */
   readonly hostStatus?: HostStatusHelpers;
-  /** The checkout this tool runs from, which only the launcher names; `list` and `status` note a stray install there. */
+  /** Named only by the launcher; `list` and `status` note a stray install there. */
   readonly toolCheckout?: ToolCheckout;
 }
 
-/** Existing observation handler; its public grammar is owned by command-definitions. */
 export interface ReadOnlyCommand {
   run(context: ReadOnlyContext, options: CommandOptions): Promise<CommandEnd>;
 }
 
-/** The observation runtime `list` and `status` read through; everything it holds is read-only. */
 function observationRuntime(context: ReadOnlyContext): ReadOnlyCommandRuntime {
   return {
     paths: context.paths,
@@ -76,11 +69,7 @@ function observationRuntime(context: ReadOnlyContext): ReadOnlyCommandRuntime {
   };
 }
 
-/**
- * The note `list` and `status` add on stderr when the tool checkout holds a
- * stray NanoClaw install (R6). It is checked beside the command, so it adds
- * no wait, and a check that fails adds no note.
- */
+/** Checked alongside the command, so it adds no wait; a check that fails adds no note. */
 async function strayInstallNote(context: ReadOnlyContext): Promise<string | undefined> {
   if (!context.toolCheckout) return undefined;
   try {
@@ -91,7 +80,6 @@ async function strayInstallNote(context: ReadOnlyContext): Promise<string | unde
   }
 }
 
-/** Run `list` or `status`, then add the stray install note beside its result. */
 async function withStrayInstallNote(context: ReadOnlyContext, command: () => Promise<number>): Promise<CommandEnd> {
   const note = strayInstallNote(context);
   const exitCode = await command();
@@ -100,10 +88,7 @@ async function withStrayInstallNote(context: ReadOnlyContext, command: () => Pro
   return { exitCode };
 }
 
-/**
- * The observation handlers, bound by command-definitions and dispatched
- * outside the attempt loop after the shared parser validates their grammar.
- */
+/** Keyed by each observation handler's `command` in `command-definitions.ts`. */
 export const READ_ONLY_COMMANDS: ReadonlyMap<string, ReadOnlyCommand> = new Map([
   [
     'list',
@@ -137,7 +122,7 @@ export const READ_ONLY_COMMANDS: ReadonlyMap<string, ReadOnlyCommand> = new Map(
   ],
 ]);
 
-/** What `logs` notes about an unfinished update or rollback (KTD2), which never stops it. */
+/** A note only: an unfinished update or rollback never stops `logs`. */
 function operationNote(inspection: OperationInspection): string | undefined {
   switch (inspection.state) {
     case 'none':
@@ -158,7 +143,6 @@ function operationNote(inspection: OperationInspection): string | undefined {
   }
 }
 
-/** Refuse a log file that is missing, or that is not a regular file, before any tool opens it. */
 async function assertLogFile(file: string, name: string): Promise<void> {
   let isFile: boolean;
   try {
@@ -170,13 +154,7 @@ async function assertLogFile(file: string, name: string): Promise<void> {
   if (!isFile) throw new GwsEaError('unsafe_log', `The ${name} ${file} is not a regular file.`);
 }
 
-/**
- * `logs`: the assistant's host log, or its error log with `--errors`, at the
- * paths its service definition sends them to, read physically, in any phase.
- * The process is handed to `cat`, or to `tail -f` with `--follow`, so the
- * log streams as the file holds it. An unfinished update or rollback is
- * named first, on stderr.
- */
+/** Hands the process to `cat` or `tail -f`, so the log streams exactly as the file holds it. */
 async function showHostLog(context: ReadOnlyContext, options: CommandOptions): Promise<CommandEnd> {
   const instanceId = targetInstance(options);
   const reservation = await getInstanceReservation(context.paths, instanceId);

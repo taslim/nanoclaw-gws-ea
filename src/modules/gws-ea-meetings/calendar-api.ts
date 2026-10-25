@@ -1,23 +1,11 @@
 /**
- * The Google Calendar calls the scheduling tools and the handoff make with
- * the host's own Calendar token (KTD7): whether a calendar is one the
- * principal owns and the assistant can write to, and its name; an event's
- * organizer, attendees, time and the assistant's own tags, the events in an
- * interval, and the writes behind bookings, changes and cancellations.
- * No client library: each call is one `fetch` with the token in its header,
- * so it never reaches a container or an argument list.
+ * The host's own Google Calendar client. No client library: each call is one
+ * `fetch` with the token in its header, so the token never reaches a
+ * container or an argument list.
  *
- * Every event read for scheduling asks Google for its timing, status,
- * people, the assistant's own private tags, and the Meet link the host asked
- * Google to create, and every write asks for nothing back but the id, so no
- * title, description or location is ever fetched for external-email (R20).
- * main's calendar facts alone read titles and names (`listEventDetails`), and
- * never for external-email. main's guest-list change reads each guest whole,
- * only to write them back as they were, and the event's title, notes and
- * place, only to check them against whoever it invites; it writes over only
- * the version of the event it read, and none of it reaches an agent. main's
- * answer for the principal writes only the principal's own entry. Tests use
- * a fake with the same interface.
+ * `getEvent`, `listEvents` and every write fetch no title, description or
+ * location, so what they return can serve external-email. Only
+ * `listEventDetails` and `getGuests` read an event's words.
  */
 import { isRecord } from '../../gws-ea/validation.js';
 import type { CalendarListEntry } from '../gws-ea-inbox/calendar-notifications.js';
@@ -40,13 +28,9 @@ export interface EventAttendee {
   readonly self?: boolean;
 }
 
-/**
- * A Google Meet link on an event. Google creates one the host asks for
- * asynchronously: pending, then success or failure.
- */
+/** Google creates a requested Meet link asynchronously: pending, then success or failure. */
 export interface EventConference {
   readonly status: 'pending' | 'success' | 'failure';
-  /** The link people join by, once there is one. */
   readonly uri?: string;
 }
 
@@ -60,9 +44,8 @@ export interface CalendarEvent {
   readonly attendees?: readonly EventAttendee[];
   readonly start?: EventTime;
   readonly end?: EventTime;
-  /** The private extended properties the assistant tagged its own events with. */
+  /** Google's private extended properties, where the assistant marks its own events. */
   readonly tags?: Readonly<Record<string, string>>;
-  /** Its Meet link, when it has one or Google is creating one. */
   readonly conference?: EventConference;
 }
 
@@ -72,16 +55,11 @@ export interface CalendarEvent {
  */
 export type ListedEvent = Omit<CalendarEvent, 'id'> & { readonly id?: string };
 
-/** A person on an event as main's calendar facts read them, with the name they go by. */
 export interface DetailedAttendee extends EventAttendee {
   readonly displayName?: string;
 }
 
-/**
- * An event as main's calendar facts read it: its timing, status and people,
- * with its title, each person's name, and the series it belongs to. Never
- * read for external-email.
- */
+/** Carries titles and names, so it is never read for external-email. */
 export interface DetailedEvent {
   readonly id?: string;
   readonly iCalUID?: string;
@@ -90,7 +68,7 @@ export interface DetailedEvent {
   readonly summary?: string;
   readonly organizer?: { readonly email?: string; readonly self?: boolean };
   readonly attendees?: readonly DetailedAttendee[];
-  /** Google left the guest list out: too many guests to list. */
+  /** Google left some guests out of `attendees`. */
   readonly attendeesOmitted?: boolean;
   readonly recurringEventId?: string;
   /** An occurrence's start before it moved, the same on every copy of it. */
@@ -99,19 +77,14 @@ export interface DetailedEvent {
   readonly end?: EventTime;
 }
 
-/** Whether Google emails the attendees about a write. */
 export type SendUpdates = 'all' | 'none';
 
-/** A calendar-list entry with the calendar's own name, which the invitations of events on it show. */
+/** `summary` is the calendar's own name, which the invitations of events on it show. */
 export interface CalendarEntry extends CalendarListEntry {
   readonly summary?: string;
 }
 
-/**
- * A guest a write lists, with the answer it starts with. Google starts a
- * guest it is given no answer for at `needsAction`, the calendar's own owner
- * included.
- */
+/** Google starts a guest it is given no answer for at `needsAction`, the calendar's own owner included. */
 export interface GuestWrite {
   readonly email: string;
   readonly responseStatus?: 'accepted';
@@ -123,7 +96,6 @@ export interface GuestWrite {
  */
 export type GuestRecord = Readonly<Record<string, unknown>>;
 
-/** An event's guest list as Google holds it, with what says who may change it. */
 export interface EventGuests {
   /**
    * The version of the event this list was read from. Google gives the
@@ -141,7 +113,6 @@ export interface EventGuests {
   readonly recurringEventId?: string;
   /** The event repeats: a write on it changes every occurrence. */
   readonly recurrence?: readonly string[];
-  /** What the event says, which everyone it invites reads: its title, notes and place. */
   readonly summary?: string;
   readonly description?: string;
   readonly location?: string;
@@ -151,7 +122,6 @@ export interface EventGuests {
 export interface EventWrite {
   readonly summary?: string;
   readonly description?: string;
-  /** Where people meet: an address, a phone number, or a link of the other side's own. */
   readonly location?: string;
   /** Ask Google to create a Meet link, under a request id it ignores when repeated. */
   readonly conference?: { readonly requestId: string };
@@ -163,55 +133,47 @@ export interface EventWrite {
   readonly allDay?: boolean;
   /** Its repetition, as RRULE, EXRULE, RDATE and EXDATE lines. */
   readonly recurrence?: readonly string[];
-  /** Every guest, the event's own calendar owner among them; a write with them replaces the list. */
+  /** A write with them replaces the whole guest list, the calendar's owner included. */
   readonly attendees?: readonly GuestWrite[];
   readonly visibility?: 'default' | 'private';
   readonly transparency?: 'opaque' | 'transparent';
   /** `none` turns every reminder off; `default` keeps the calendar's own. */
   readonly reminders?: 'default' | 'none';
-  /** Private extended properties: the assistant's own marks on its events. */
+  /** Private extended properties. */
   readonly tags?: Readonly<Record<string, string>>;
   /** Restores an event deleted earlier under the same id. */
   readonly status?: 'confirmed';
 }
 
 /**
- * How a guest-list write went: `changed`, and nothing written, when the
- * event is no longer the version it was read at; `gone` when the event no
- * longer exists.
+ * `changed`: nothing written, since the event is no longer the version it
+ * was read at; `gone`: the event no longer exists.
  */
 export type GuestWriteResult = 'set' | 'changed' | 'gone';
 
-/** A new event: a write with its times. */
 export type NewEvent = EventWrite & { readonly start: string; readonly end: string };
 
 export interface MeetingsCalendarApi {
-  /** The assistant's calendar-list entry for a calendar, or undefined when it has none. */
+  /** Undefined when the calendar is not on the assistant's calendar list. */
   getCalendar(calendarId: string): Promise<CalendarEntry | undefined>;
-  /** Every entry of the assistant's calendar list. */
   listCalendars(): Promise<CalendarEntry[]>;
-  /** One event, or undefined when it does not exist. A deleted event reads as `cancelled`. */
+  /** Undefined when the event does not exist; a deleted event reads as `cancelled`. */
   getEvent(calendarId: string, eventId: string): Promise<CalendarEvent | undefined>;
   /** Every live event that overlaps the interval, recurring events expanded. */
   listEvents(calendarId: string, timeMin: string, timeMax: string): Promise<ListedEvent[]>;
-  /** As `listEvents`, with titles, names and series: for main's calendar facts alone. */
+  /** As `listEvents`, with titles, names and series: never for external-email. */
   listEventDetails(calendarId: string, timeMin: string, timeMax: string): Promise<DetailedEvent[]>;
-  /** Create an event under the id given; `exists` when Google already holds that id, deleted or not. */
+  /** `exists` when Google already holds that id, deleted or not. */
   insertEvent(
     calendarId: string,
     eventId: string,
     event: NewEvent,
     sendUpdates: SendUpdates,
   ): Promise<'created' | 'exists'>;
-  /** Change the fields given. */
   patchEvent(calendarId: string, eventId: string, event: EventWrite, sendUpdates: SendUpdates): Promise<void>;
-  /** An event's guests as Google holds them, with the event's version and words, or undefined when it does not exist. */
+  /** With the event's version and its title, notes and place; undefined when the event does not exist. */
   getGuests(calendarId: string, eventId: string): Promise<EventGuests | undefined>;
-  /**
-   * Replace an event's guests with these, each as given. With `etag`, only
-   * while the event is still that version: `changed`, and nothing written,
-   * when it has changed since.
-   */
+  /** Replaces the guest list, each guest as given; with `etag`, only while the event is still that version. */
   setGuests(
     calendarId: string,
     eventId: string,
@@ -231,17 +193,17 @@ export interface MeetingsCalendarApi {
     sendUpdates: SendUpdates,
     etag?: string,
   ): Promise<GuestWriteResult>;
-  /** Delete an event; `gone` when it was already deleted or never existed. */
+  /** `gone` when the event was already deleted or never existed. */
   deleteEvent(calendarId: string, eventId: string, sendUpdates: SendUpdates): Promise<'deleted' | 'gone'>;
 }
 
 const CALENDAR_API = 'https://www.googleapis.com/calendar/v3';
 const EVENT_FIELDS =
   'id,iCalUID,status,transparency,organizer(email),attendees(email,responseStatus,resource,organizer,self),start(dateTime,date),end(dateTime,date),extendedProperties(private),conferenceData(createRequest(status(statusCode)),entryPoints(entryPointType,uri))';
-/** What main's calendar facts read of an event: never written into anything external-email receives. */
+/** Includes titles and names, so nothing read with it may reach external-email. */
 const DETAIL_FIELDS =
   'id,iCalUID,status,transparency,summary,organizer(email,self),attendees(email,displayName,responseStatus,resource,self),attendeesOmitted,recurringEventId,originalStartTime(dateTime,date),start(dateTime,date),end(dateTime,date)';
-/** The conference type Google Meet is in a calendar's allowed conference types and a create request. */
+/** Google Meet's conference type, in a calendar's allowed types and in a create request. */
 const GOOGLE_MEET = 'hangoutsMeet';
 const MAX_PAGES = 10;
 
@@ -272,7 +234,6 @@ function toAttendee(value: unknown): EventAttendee | undefined {
   };
 }
 
-/** An event as main's calendar facts read it. */
 function toDetailedEvent(value: unknown): DetailedEvent {
   if (!isRecord(value)) throw new GoogleApiError(502, 'Google Calendar returned an unreadable event');
   const fields: Record<string, unknown> = {};
@@ -311,7 +272,6 @@ function toTags(value: unknown): Record<string, string> | undefined {
   return Object.keys(tags).length === 0 ? undefined : tags;
 }
 
-/** An event's Meet link as Google reports it: what it is creating, or what it has. */
 function toConference(value: unknown): EventConference | undefined {
   if (!isRecord(value)) return undefined;
   const status =
@@ -356,7 +316,6 @@ function toListedEvent(value: unknown): ListedEvent {
   };
 }
 
-/** One event read by its id: it always has one. */
 function toEvent(value: unknown): CalendarEvent {
   const event = toListedEvent(value);
   if (event.id === undefined) throw new GoogleApiError(502, 'Google Calendar returned an event without an id');
@@ -367,7 +326,6 @@ function eventTime(at: string, timeZone: string | undefined, allDay: boolean | u
   return { ...(allDay === true ? { date: at } : { dateTime: at }), ...(timeZone === undefined ? {} : { timeZone }) };
 }
 
-/** The request body for a write: only the fields it sets. */
 function eventBody(event: EventWrite, id?: string): Record<string, unknown> {
   return {
     ...(id === undefined ? {} : { id }),
@@ -431,12 +389,14 @@ function toCalendarEntry(value: unknown): CalendarEntry {
   };
 }
 
-/** Whether a calendar lets its events carry a Google Meet link. */
 export function allowsMeet(entry: CalendarListEntry): boolean {
   return entry.conferenceTypes?.includes(GOOGLE_MEET) === true;
 }
 
-/** The query a write sends: its notification choice, an id-only answer, and conference support when it asks for a link. */
+/**
+ * An id-only answer keeps the event's words out of every write's response;
+ * Google acts on a Meet request only with `conferenceDataVersion` 1.
+ */
 function writeParams(event: EventWrite, sendUpdates: SendUpdates): URLSearchParams {
   return new URLSearchParams({
     sendUpdates,
@@ -445,12 +405,10 @@ function writeParams(event: EventWrite, sendUpdates: SendUpdates): URLSearchPara
   });
 }
 
-/** Google's refusal of a call on an event that does not exist, or no longer does. */
 function isGone(error: unknown): boolean {
   return error instanceof GoogleApiError && (error.status === 404 || error.status === 410);
 }
 
-/** A guest-list write's result, from Google's refusal when it refused. */
 async function guestWrite(write: Promise<unknown>): Promise<GuestWriteResult> {
   try {
     await write;
@@ -463,7 +421,6 @@ async function guestWrite(write: Promise<unknown>): Promise<GuestWriteResult> {
   }
 }
 
-/** The real client, over the Calendar API. */
 export function createMeetingsCalendarApi(options: GoogleClientOptions): MeetingsCalendarApi {
   /**
    * Every page of a Google list, read whole: a listing too long to read fails
@@ -493,7 +450,6 @@ export function createMeetingsCalendarApi(options: GoogleClientOptions): Meeting
     );
   }
 
-  /** Every event in the interval, recurring events expanded. */
   function listPages<T>(
     calendarId: string,
     timeMin: string,

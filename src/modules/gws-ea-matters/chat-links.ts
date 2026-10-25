@@ -7,7 +7,7 @@ export interface ChatLinkState {
   readonly member_count: number;
 }
 
-/** A registered chat as its host records say it is now, absent when the chat module is not installed. */
+/** Undefined when the chat module is not installed or the chat is not one it registered. */
 export async function readChatLink(messagingGroupId: string): Promise<ChatLinkState | undefined> {
   const db = getDb();
   if (!(await db.hasTable('gws_ea_chats'))) return undefined;
@@ -25,7 +25,7 @@ export async function readChatLink(messagingGroupId: string): Promise<ChatLinkSt
   return { ...chat, member_count: members?.count ?? 0 };
 }
 
-/** The people whose identities the host has resolved in this chat's roster. */
+/** Only roster members the host has resolved to a person. */
 export async function chatMemberPeople(messagingGroupId: string): Promise<readonly string[]> {
   const db = getDb();
   if (!(await db.hasTable('gws_ea_chat_members'))) return [];

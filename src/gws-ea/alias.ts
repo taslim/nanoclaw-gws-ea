@@ -1,21 +1,14 @@
 /**
- * The assistant's web alias (KTD13): one address of its own that it uses for
+ * The assistant's web alias: one address of its own that it uses for
  * everything it does on the web in its own name. gws-ea derives its name,
  * the operator adds it in the Google Admin console and confirms it before
  * the host records it.
  *
- * The name is the assistant's name, lowercased, in ASCII, without spaces,
- * and reversed (R21); a palindrome moves its first letter to the end
- * instead. Later candidates number it: `onuj`, `onuj2`, `onuj3`, and so on.
- * A role address is never offered, and a name that gives no candidate (a
- * single repeated letter, or no ASCII letter at all) waits for the operator
- * to name the alias.
- *
- * The setup step runs once every journaled step is complete, and only while
- * the assistant's browser is enabled. It claims its candidate in the
- * registry under the machine lock, has the host ask for it, and pauses with
- * the Admin console steps; `--alias-added` records the confirmation, `--alias-taken`
- * moves to the next candidate, and `--alias <name>` uses the operator's own.
+ * The name is the assistant's name in lowercase ASCII letters and digits,
+ * reversed; a palindrome moves its first letter to the end instead. Later
+ * candidates number it: `onuj`, `onuj2`, `onuj3`, and so on. A role address
+ * is never offered, and a name that gives no candidate (a single repeated
+ * letter, or no ASCII letter at all) waits for the operator to name the alias.
  */
 import { runStep, type StepReporter } from './events.js';
 import { runInstanceNclJson } from './ncl.js';
@@ -26,18 +19,16 @@ import type { InstanceRuntimeConfig } from './service.js';
 import { GwsEaError } from './types.js';
 import { EMAIL_PATTERN, isRecord, optionalString, unwrapData } from './validation.js';
 
-/** The longest stem: room for a four-digit number within the 64 characters an address's local part allows. */
+/** Leaves room for a four-digit candidate number within the 64 characters a local part allows. */
 const MAX_STEM_LENGTH = 60;
-/** The longest local part Google Workspace takes for an address. */
 const MAX_LOCAL_PART_LENGTH = 64;
-/** The last numbered candidate; a stem's candidates stop there. */
 const MAX_CANDIDATE = 9_999;
 
 /**
- * Role addresses an alias never takes: the mailboxes RFC 2142 reserves, the
- * ones certificate authorities mail to prove control of a domain, and the
- * shared mailboxes sites and people treat as an organization's rather than
- * one person's. None ends in a digit, so only a stem itself can be one.
+ * The mailboxes RFC 2142 reserves, the ones certificate authorities mail to
+ * prove control of a domain, and the shared mailboxes sites and people treat
+ * as an organization's rather than one person's. None ends in a digit, so only
+ * an unnumbered stem can be one.
  */
 const ROLE_ADDRESS_NAMES: ReadonlySet<string> = new Set([
   'abuse',
@@ -84,12 +75,10 @@ const ROLE_ADDRESS_NAMES: ReadonlySet<string> = new Set([
   'www',
 ]);
 
-/** A name's alias stem, or why the operator must name the alias with `--alias`. */
 export type AliasStem =
   | { readonly status: 'derived'; readonly stem: string }
   | { readonly status: 'name_required'; readonly reason: string };
 
-/** `name` as an address can carry it: accents dropped, lowercased, ASCII letters and digits only. */
 function asciiName(name: string): string {
   return name
     .normalize('NFKD')
@@ -98,7 +87,6 @@ function asciiName(name: string): string {
     .replace(/[^a-z0-9]/gu, '');
 }
 
-/** The first candidate's name, before any number: the assistant's name reversed, or rotated when that reads the same. */
 export function aliasStem(assistantName: string): AliasStem {
   const name = asciiName(assistantName);
   if (!/[a-z]/u.test(name)) {
@@ -112,12 +100,10 @@ export function aliasStem(assistantName: string): AliasStem {
   return { status: 'derived', stem: stem.slice(0, MAX_STEM_LENGTH) };
 }
 
-/** The `index`th candidate: the stem, then the stem numbered from 2. */
 function candidateName(stem: string, index: number): string {
   return index === 1 ? stem : `${stem}${index}`;
 }
 
-/** Where `name` falls among the stem's candidates, or undefined when it is none of them. */
 function candidateIndex(stem: string, name: string): number | undefined {
   if (name === stem) return 1;
   if (!name.startsWith(stem)) return undefined;
@@ -125,7 +111,6 @@ function candidateIndex(stem: string, name: string): number | undefined {
   return /^[1-9][0-9]*$/u.test(suffix) && Number(suffix) >= 2 ? Number(suffix) : undefined;
 }
 
-/** The first candidate the stem gives at or after `index`, past a role address, or undefined when none is left. */
 function candidateFrom(stem: string, index: number): string | undefined {
   for (let next = index; next <= MAX_CANDIDATE; next += 1) {
     const name = candidateName(stem, next);
@@ -134,35 +119,29 @@ function candidateFrom(stem: string, index: number): string | undefined {
   return undefined;
 }
 
-/** The first name offered for a stem: the stem itself, unless it is a role address. */
 export function firstAliasCandidate(stem: string): string {
   // A role address never ends in a digit, so the stem numbered 2 never is one.
   return candidateFrom(stem, 1) ?? candidateName(stem, 2);
 }
 
 /**
- * The candidate after `current`, when the operator finds it taken: the next
- * number, or the first candidate when `current` is a name of the operator's
- * own. Undefined once the numbers run out.
+ * A `current` that is none of the stem's candidates, such as a name of the
+ * operator's own, restarts at the first. Undefined once the numbers run out.
  */
 export function aliasCandidateAfter(stem: string, current: string): string | undefined {
   const index = candidateIndex(stem, current);
   return index === undefined ? firstAliasCandidate(stem) : candidateFrom(stem, index + 1);
 }
 
-/** The alias the operator named with `--alias`: its local part, and its domain when they gave a whole address. */
+/** `domain` only when the operator gave `--alias` a whole address. */
 export interface AliasName {
   readonly local: string;
   readonly domain?: string;
 }
 
-/**
- * Letters, digits, and single dots, dashes or underscores between them, as
- * a Workspace address takes them; at least one letter.
- */
+/** A local part as a Workspace address takes it; `parseAliasName` also requires a letter. */
 const LOCAL_PART_PATTERN = /^[a-z0-9]+(?:[._-][a-z0-9]+)*$/u;
 
-/** The operator's own alias name, checked as the Admin console would take it, and never a role address. */
 export function parseAliasName(value: string): AliasName {
   const normalized = value.trim().toLowerCase();
   const at = normalized.indexOf('@');
@@ -187,17 +166,18 @@ export function parseAliasName(value: string): AliasName {
 // The setup step: after the journaled steps, while the browser is enabled
 // ---------------------------------------------------------------------------
 
-/** The operator's word on the alias: `--alias-added` (with `--alias`, for that name), `--alias-taken`, or `--alias`. */
+/**
+ * `--alias-added` confirms the candidate (or `--alias`'s name when given),
+ * `--alias-taken` moves to the next candidate, and `--alias` names the
+ * operator's own.
+ */
 export type AliasDecision = (
   | { readonly kind: 'added'; readonly name?: string }
   | { readonly kind: 'taken' }
   | { readonly kind: 'named'; readonly name: string }
 ) & { readonly expectedCandidate?: string | null };
 
-/**
- * The decision the alias flags make, or undefined without one; `--alias-taken`
- * moves past a name, so it stands alone.
- */
+/** `--alias-taken` moves past a name, so it combines with no other alias flag. */
 export function aliasDecision(flags: {
   readonly added: boolean;
   readonly taken: boolean;
@@ -213,13 +193,10 @@ export function aliasDecision(flags: {
   return flags.name === undefined ? undefined : { kind: 'named', name: flags.name };
 }
 
-/** The step a create, resume or browser enable shows while it sets the alias up. */
 export const ALIAS_STEP = { id: 'provision_alias', label: "Setting up the assistant's web alias…" } as const;
 
-/** Where the operator adds an alias: the Admin console's user list, which opens the assistant's account. */
 const ADMIN_CONSOLE_USERS_URL = 'https://admin.google.com/ac/users';
 
-/** The assistant as the alias step names it, from the profile its host serves. */
 export interface AliasIdentity {
   readonly name: string;
   readonly email: string;
@@ -227,13 +204,11 @@ export interface AliasIdentity {
   readonly principalEmails: readonly string[];
 }
 
-/** The alias's setup as the host reports it. */
 export interface HostAliasSetup {
   readonly alias: string | null;
   readonly candidate: string | null;
 }
 
-/** The running host's alias commands, and the profile they serve. */
 export interface AliasHost {
   identity(): Promise<AliasIdentity>;
   setup(): Promise<HostAliasSetup>;
@@ -257,7 +232,7 @@ function parseSetup(value: unknown): HostAliasSetup {
   return { alias: nullableText(data.alias), candidate: nullableText(data.candidate) };
 }
 
-/** The host's alias commands, run through `run`: `ncl <args> --json` against the assistant's own host. */
+/** `run` is `ncl <args> --json` against the assistant's own host. */
 export function aliasHost(run: (args: readonly string[]) => Promise<unknown>): AliasHost {
   return {
     async identity() {
@@ -289,7 +264,6 @@ export interface AliasStepInput {
 }
 
 export interface AliasStepOptions {
-  /** The operator's word on the alias, from the command's flags. */
   readonly decision?: AliasDecision;
   /** `ncl <args> --json` through the assistant's own host. */
   readonly ncl?: (runtime: InstanceRuntimeConfig, args: readonly string[]) => Promise<unknown>;
@@ -306,7 +280,6 @@ function pause(
   return { status: 'paused', pause: { kind: 'human-action', phase: ALIAS_STEP.id, code, message, details, ...extra } };
 }
 
-/** Where in the Admin console the alias is added, for `identity`'s account. */
 function aliasesPage(identity: AliasIdentity): string {
   return `Open ${identity.name} (${identity.email}), then User information > Alternate email addresses (email aliases)`;
 }
@@ -315,7 +288,6 @@ const TAKEN_HINT =
   'If the Admin console says the address is already in use, continue with --alias-taken for the next name';
 const OWN_NAME_HINT = 'To choose the name yourself, continue with --alias <name>';
 
-/** Ask the operator to add `address`: exactly where, and what to say if they cannot. */
 function addPause(identity: AliasIdentity, address: string): ProvisionResult {
   const at = address.lastIndexOf('@');
   return pause(
@@ -331,7 +303,6 @@ function addPause(identity: AliasIdentity, address: string): ProvisionResult {
   );
 }
 
-/** Ask the operator to name the alias, when no name of the assistant's own is left to offer. */
 function namePause(identity: AliasIdentity, reason: string): ProvisionResult {
   return pause(
     'alias_name_required',
@@ -347,7 +318,6 @@ function namePause(identity: AliasIdentity, reason: string): ProvisionResult {
 /** How `ncl` fails when the assistant's host does not answer at all, as when it is stopped. */
 const HOST_UNREACHABLE_CODES: ReadonlySet<string> = new Set(['command_failed', 'command_timeout']);
 
-/** The alias is set up through the running host, so a stopped assistant waits to be started. */
 function hostPause(instanceId: string, error: GwsEaError): ProvisionResult {
   return pause(
     'alias_host_unavailable',
@@ -357,11 +327,10 @@ function hostPause(instanceId: string, error: GwsEaError): ProvisionResult {
 }
 
 /**
- * Bring the assistant to an operator-confirmed web alias, or pause for the operator
- * (KTD13). A candidate is claimed in the registry, under the machine lock,
- * before the host asks for it, so two assistants are never asked to add the
- * same address; the host records the alias only after the operator confirms it.
- * Run under the assistant's instance lock, which the caller holds.
+ * A candidate is claimed in the registry, under the machine lock, before the
+ * host asks for it, so two assistants are never asked to add the same address;
+ * the host records the alias only once the operator confirms it. The caller
+ * holds the assistant's instance lock.
  */
 export async function ensureAssistantAlias(input: AliasStepInput, reporter: StepReporter): Promise<ProvisionResult> {
   const { paths, instanceId, host } = input;
@@ -407,7 +376,6 @@ export async function ensureAssistantAlias(input: AliasStepInput, reporter: Step
       const identity = await host.identity();
       const stem = aliasStem(identity.name);
 
-      /** Claim the first free candidate from `start`, skipping `skip`; undefined when none is left. */
       const claimFree = async (start: string | undefined, skip: string | null): Promise<string | undefined> => {
         if (stem.status !== 'derived') return undefined;
         const taken = new Set([
@@ -432,7 +400,6 @@ export async function ensureAssistantAlias(input: AliasStepInput, reporter: Step
       };
       const nameRequired = (): ProvisionResult =>
         namePause(identity, stem.status === 'derived' ? 'no name of its own is left to offer' : stem.reason);
-      /** Ask for the first free candidate from `start`, or for a name when none is left. */
       const offerFrom = async (start: string | undefined, skip: string | null): Promise<string | undefined> => {
         const address = await claimFree(start, skip);
         await propose(address ?? null);
@@ -497,7 +464,6 @@ function sameAddress(name: string, address: string): boolean {
   return parsed.local === address.slice(0, at) && (parsed.domain ?? address.slice(at + 1)) === address.slice(at + 1);
 }
 
-/** The operator's own name as an address, claimed for this assistant; refused when it is someone else's. */
 async function overrideAddress(
   name: string,
   identity: AliasIdentity,
@@ -526,11 +492,7 @@ async function overrideAddress(
   return address;
 }
 
-/**
- * The alias step for an assistant whose browser is enabled, through its
- * running host. The caller decides that the browser is enabled and holds
- * the assistant's instance lock.
- */
+/** The caller has checked that the browser is enabled and holds the assistant's instance lock. */
 export function runAliasStep(
   paths: ControlPlanePaths,
   instanceId: string,

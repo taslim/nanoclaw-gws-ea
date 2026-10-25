@@ -19,7 +19,7 @@ import { isRecord } from './validation.js';
 
 export interface ArtifactsCleanup {
   readonly schemaVersion: 1;
-  /** Only this assistant and exact shared resources; never credentials or content. */
+  /** This assistant's entry and the shared resources only; never a credential or content. */
   readonly ownership: ArtifactsOperatorConfig;
   readonly completed: readonly string[];
   readonly sharedRetained: boolean;

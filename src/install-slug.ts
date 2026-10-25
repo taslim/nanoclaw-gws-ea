@@ -24,7 +24,6 @@ export interface InstallScopedNames {
   readonly containerInstallLabel: string;
 }
 
-/** Names shared by every host and container resource owned by one install. */
 export function getInstallScopedNames(installSlug: string): InstallScopedNames {
   if (!INSTALL_ID_PATTERN.test(installSlug)) {
     throw new Error(`Install slug must be 1-32 chars of [a-z0-9_-] starting alphanumeric (got '${installSlug}')`);

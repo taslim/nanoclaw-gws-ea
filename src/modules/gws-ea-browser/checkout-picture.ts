@@ -1,7 +1,7 @@
 /**
- * The picture a purchase card carries (KTD6): one PNG clipped to the checkout's total and its commit control, never
- * the whole page. The host takes none on a page that may show a secret, and a picture it cannot take only leaves
- * the card saying so: it never holds the card back. Its bytes live in memory for the card's one posting.
+ * The picture a purchase card carries: one PNG clipped to the checkout's total and its commit control, never the
+ * whole page. The host takes none on a page that may show a secret, and a picture it cannot take only leaves the
+ * card saying so: it never holds the card back. Its bytes live in memory for the card's one posting.
  */
 import { log } from '../../log.js';
 import type { RequestPicture } from '../approvals/index.js';
@@ -15,7 +15,6 @@ import type { BrowserExecutionContext } from './actions.js';
 const PICTURE_TIMEOUT_MS = 10_000;
 const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
 
-/** A PNG's width and height, as its header states them. */
 function pngSize(data: Buffer): { width: number; height: number } | undefined {
   if (data.length < 24 || !data.subarray(0, 8).equals(PNG_SIGNATURE) || data.toString('latin1', 12, 16) !== 'IHDR')
     return undefined;

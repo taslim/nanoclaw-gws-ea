@@ -2,7 +2,7 @@ import * as structuredLocators from './locators.js';
 import { locateStructured } from './locators.js';
 import { createBrowserQueue, recoverAndStartBrowserQueue } from './index.js';
 /**
- * Wake-on-change watches against native Chrome (KTD20): an unreviewed booking site whose slot list changes, checked
+ * Wake-on-change watches against native Chrome: an unreviewed booking site whose slot list changes, checked
  * by the real scheduler and replay without the model. The signed-out context is the fixture's own page, since the
  * fixture's Chrome carries no host policy; the calendar and container wake are the other fixture boundaries.
  */
@@ -300,7 +300,7 @@ describe.skipIf(!chromePath)('wake-on-change watches in native Chrome', { timeou
   const watchWakes = (): number =>
     vi.mocked(requestWake).mock.calls.filter(([, reason]) => reason === 'browser-watch').length;
 
-  it('wakes the agent when "No tables" becomes 7:30 PM, never for its countdown, and the agent books the free table (AE11)', async () => {
+  it('wakes the agent when "No tables" becomes 7:30 PM, never for its countdown, and the agent books the free table', async () => {
     expect(await setWatch()).toMatchObject({
       status: 'armed',
       free_only: true,

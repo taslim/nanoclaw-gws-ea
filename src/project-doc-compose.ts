@@ -94,15 +94,15 @@ export interface ProjectDocSpec {
 /** The canonical instruction template, relative to the project root. */
 export const BASE_INSTRUCTIONS_PATH = path.join('container', 'CLAUDE.md');
 
-/** Placeholder inside the canon's Memory section for the provider override-files note. */
+/** Placeholder in the `memory` module instructions for the provider override-files note. */
 export const MEMORY_NOTE_PLACEHOLDER = '{{provider-memory-note}}';
 
 /**
  * Render canonical instructions with the provider's memory note substituted
  * (or the placeholder stripped without a trace). The no-facts render is
  * byte-identical to the template minus the placeholder paragraph. The
- * placeholder lives in the `memory` instructions, which only a group holding
- * `conversation-context` is taught.
+ * placeholder lives in the `memory` module instructions, so a group whose
+ * capabilities withhold those gets no note.
  */
 export function renderBaseInstructions(template: string, facts?: ProviderInstructionFacts): string {
   const files = facts?.nativeOverrideFiles ?? [];

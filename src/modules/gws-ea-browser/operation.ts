@@ -2,7 +2,7 @@ import type { Page } from 'playwright-core';
 
 export type BrowserOperationStop = 'timeout' | 'interrupted';
 
-/** One bounded browser operation. Its owner keeps its job lock until finish settles late SDK work. */
+/** Its owner keeps the job lock until `finish` settles: an aborted run's SDK work may still be in flight. */
 export class BrowserOperation {
   private readonly controller = new AbortController();
   private readonly timer: NodeJS.Timeout;

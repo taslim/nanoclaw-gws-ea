@@ -2,12 +2,12 @@
  * How a time reads in an email: its day, its times and its zone as people
  * write them; how an event the assistant writes tells its guests: on its
  * first write alone; and that an invitation carries no Google link its
- * guests cannot open (Slice 6 R4, KTD4). The bookings themselves are covered
+ * guests cannot open. The bookings themselves are covered
  * with the scheduling tools that make them (tools.test.ts).
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-/** The assistant's Drive and what a signed-out visit sees, for the link check (Slice 6 KTD5). */
+/** The assistant's Drive and what a signed-out visit sees, for the link check. */
 const workspace = vi.hoisted(() => ({ drive: undefined as unknown }));
 vi.mock('../gws-ea-workspace/drive-api.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../gws-ea-workspace/drive-api.js')>();

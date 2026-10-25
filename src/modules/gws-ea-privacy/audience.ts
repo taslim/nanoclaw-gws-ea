@@ -1,11 +1,11 @@
 /**
- * Who a send reaches (KTD7): the principal, or anyone else.
+ * Who a send reaches: the principal, or anyone else.
  *
  * The audience comes from the final recipients. A channel that addresses
  * mail registers a resolver that returns the exact addresses a send goes to,
  * the same list it sends with; the send is the principal's only when every
- * one of them is one of the principal's addresses, by the one rule that
- * recognizes them (R1), as the link check reads them too. Any other
+ * one of them is one of the principal's addresses, by the one recognizer
+ * every comparison with them uses (`loadPrincipalRecognizer`). Any other
  * send is the principal's only when it goes to a direct message mapped to a
  * verified principal. Everything else, an unknown or empty recipient list
  * included, is "others".
@@ -14,10 +14,6 @@ import { getDb } from '../../db/connection.js';
 import type { OutboundSend } from '../../delivery.js';
 import { loadPrincipalRecognizer } from '../gws-ea-profile/db.js';
 
-/**
- * Two clearances today. The check takes an audience rather than a send, so a
- * later clearance (family, say) needs no new path.
- */
 export type Audience = 'principal' | 'others';
 
 /** The bare email addresses a send on this channel goes to, exactly as the channel will send it. */
@@ -25,7 +21,6 @@ export type RecipientResolver = (send: OutboundSend) => readonly string[] | Prom
 
 const recipientResolvers = new Map<string, RecipientResolver>();
 
-/** Register the recipient list for every send on `channelType`. One resolver per channel type. */
 export function registerRecipientResolver(channelType: string, resolver: RecipientResolver): void {
   if (recipientResolvers.has(channelType)) {
     throw new Error(`A recipient resolver is already registered for ${channelType}`);
@@ -33,7 +28,6 @@ export function registerRecipientResolver(channelType: string, resolver: Recipie
   recipientResolvers.set(channelType, resolver);
 }
 
-/** The principal only when every address is one of the principal's (R1). */
 export async function audienceForAddresses(addresses: readonly string[]): Promise<Audience> {
   if (addresses.length === 0) return 'others';
   const principal = await loadPrincipalRecognizer();

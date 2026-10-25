@@ -46,7 +46,7 @@ vi.mock('./calendar-api.js', async (importOriginal) => {
   };
 });
 
-/** The assistant's Drive and what a signed-out visit sees, for the link check (Slice 6 KTD5). */
+/** The assistant's Drive and what a signed-out visit sees, for the link check. */
 const workspace = vi.hoisted(() => ({ drive: undefined as unknown }));
 vi.mock('../gws-ea-workspace/drive-api.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../gws-ea-workspace/drive-api.js')>();
@@ -105,7 +105,7 @@ const ASSISTANT = 'juno@northwind.example';
 const PRINCIPAL_GUEST = { email: PRINCIPAL, responseStatus: 'accepted', organizer: true };
 /** The assistant on an event of its own calendar, its organizer like the owner of any calendar. */
 const ASSISTANT_GUEST = { email: ASSISTANT, responseStatus: 'accepted', organizer: true };
-/** What every answer for an event on the assistant's own calendar says of who sees it (KTD10). */
+/** What every answer for an event on the assistant's own calendar says of who sees it. */
 const OWN_CALENDAR_VISIBILITY =
   'It is on your own calendar: anyone your calendar is shared with sees its details unless it is private, and in a company Workspace that can include colleagues.';
 
@@ -328,7 +328,7 @@ describe('create_event', () => {
     expect(own.message).toMatch(new RegExp(`Its guests: ${READ_ONLY}; Google emailed no one\\.`, 'u'));
   });
 
-  it('takes a calendar whose ID is another Gmail spelling of a listed address, its owner in any spelling the principal (R1)', async () => {
+  it('takes a calendar whose ID is another Gmail spelling of a listed address, its owner in any spelling the principal', async () => {
     await addPrincipalAddress('morgan.ellery@gmail.com');
     calendar.calendars.set(GMAIL_CALENDAR, { id: GMAIL_CALENDAR, accessRole: 'owner' });
 
@@ -397,7 +397,7 @@ describe('create_event', () => {
     },
   );
 
-  it('refuses, before anything reaches Google, notes that link a pre-read a guest cannot open (Slice 6 R4)', async () => {
+  it('refuses, before anything reaches Google, notes that link a pre-read a guest cannot open', async () => {
     const drive = new FakeDrive('juno@northwind.example');
     for (const person of [PRINCIPAL, REMY]) drive.addAccount(person);
     workspace.drive = drive;
@@ -667,7 +667,7 @@ describe('change_guests', () => {
     expect(calendar.writes).toEqual([]);
     expect(unchanged.message).toBe(`Nothing changed: ${NOEL} is not invited; the principal is already on it.`);
 
-    // Named in another Gmail spelling on their calendar of that address, the principal is still already on it (R1).
+    // Named in another Gmail spelling on their calendar of that address, the principal is still already on it.
     await addPrincipalAddress('morgan.ellery@gmail.com');
     calendar.calendars.set(GMAIL_CALENDAR, { id: GMAIL_CALENDAR, accessRole: 'owner' });
     calendar.put({
@@ -857,7 +857,7 @@ describe('change_guests', () => {
     expect(calendar.writes).toEqual([]);
   });
 
-  it('refuses, writing nothing, a guest list Google returned incomplete: written back, it would drop the guests left out (R9)', async () => {
+  it('refuses, writing nothing, a guest list Google returned incomplete: written back, it would drop the guests left out', async () => {
     calendar.put({
       ...teamSync([PRINCIPAL_GUEST, { email: REMY, responseStatus: 'accepted' }]),
       attendeesOmitted: true,
@@ -930,7 +930,7 @@ describe('respond_to_event', () => {
     return send(main, 'respond_to_event', { calendar: PRINCIPAL, event, response, ...more });
   }
 
-  it('puts the principal back as accepted on a meeting they organize, changing no one else and emailing no one (R2)', async () => {
+  it('puts the principal back as accepted on a meeting they organize, changing no one else and emailing no one', async () => {
     calendar.put(ownMeeting());
 
     const answered = data(await answer('teamsync01', 'accepted'));
@@ -965,7 +965,7 @@ describe('respond_to_event', () => {
     expect(calendar.writes).toEqual([]);
   });
 
-  it("answers someone else's invitation by writing only the principal's own entry, and Google is asked to tell the organizer (R3)", async () => {
+  it("answers someone else's invitation by writing only the principal's own entry, and Google is asked to tell the organizer", async () => {
     calendar.put(invitation());
 
     const answered = data(await answer('remyinvite1', 'declined'));
@@ -1003,7 +1003,7 @@ describe('respond_to_event', () => {
     expect(answered.message).toBe('Google now shows the principal as maybe going (tentative). Google emailed no one.');
   });
 
-  it('sends their entry back as Google holds it, under the address it names, and drops a note left with an earlier answer (KTD5)', async () => {
+  it('sends their entry back as Google holds it, under the address it names, and drops a note left with an earlier answer', async () => {
     const alias = 'morgan.e@northwind.example';
     calendar.put(invitation(self('accepted', { email: alias, comment: 'See you there', displayName: 'Morgan' })));
 
@@ -1017,7 +1017,7 @@ describe('respond_to_event', () => {
     ]);
   });
 
-  it('writes nothing when the answer already holds, and says so (R6)', async () => {
+  it('writes nothing when the answer already holds, and says so', async () => {
     calendar.put(ownMeeting('accepted'));
     calendar.put(invitation(self('declined')));
 
@@ -1030,7 +1030,7 @@ describe('respond_to_event', () => {
     expect(calendar.writes).toEqual([]);
   });
 
-  it('says whether the answer covers one occurrence or every occurrence of a series (R4)', async () => {
+  it('says whether the answer covers one occurrence or every occurrence of a series', async () => {
     calendar.put(invitation(self('needsAction'), { id: 'weekly1_20261012T160000Z', recurringEventId: 'weekly1' }));
     calendar.put(invitation(self('needsAction'), { id: 'weekly1', recurrence: ['RRULE:FREQ=WEEKLY;BYDAY=MO'] }));
 
@@ -1042,7 +1042,7 @@ describe('respond_to_event', () => {
     );
   });
 
-  it("refuses, writing nothing, any calendar but the principal's, one it may only read, and an event that is not there (R5)", async () => {
+  it("refuses, writing nothing, any calendar but the principal's, one it may only read, and an event that is not there", async () => {
     calendar.put({ ...invitation(), calendarId: ASSISTANT });
     calendar.put({ ...invitation(), calendarId: COLLEAGUE_CALENDAR });
     calendar.put({ ...invitation(), calendarId: READ_ONLY });
@@ -1115,7 +1115,7 @@ describe('respond_to_event', () => {
     ]);
   });
 
-  it('stops, writing nothing, when the principal answers it themselves while it runs (KTD6)', async () => {
+  it('stops, writing nothing, when the principal answers it themselves while it runs', async () => {
     calendar.put(invitation());
     calendar.changeAfterNextGuestRead(() => calendar.put(invitation(self('tentative'))));
     expect(refusal(await answer('remyinvite1', 'declined'))).toBe(
@@ -1187,7 +1187,7 @@ describe('respond_to_event', () => {
     );
   });
 
-  it('records no change of its own: a notice of the event after an answer still reaches main (KTD7)', async () => {
+  it('records no change of its own: a notice of the event after an answer still reaches main', async () => {
     calendar.put(invitation());
     data(await answer('remyinvite1', 'accepted'));
     expect(consumeOwnCalendarChange(PRINCIPAL, 'remyinvite1', new Date())).toBe(false);
@@ -1234,7 +1234,7 @@ describe('respond_to_event', () => {
   });
 });
 
-describe('the assistant’s own calendar (R19)', () => {
+describe('the assistant’s own calendar', () => {
   it('puts an event there with itself its one guest, no principal, emailing no one, and says who sees it', async () => {
     const created = data(await send(main, 'create_event', { ...FOCUS, calendar: ASSISTANT }));
 
@@ -1333,7 +1333,7 @@ describe('the assistant’s own calendar (R19)', () => {
     expect(calendar.writes).toEqual([expect.objectContaining({ op: 'guests', sendUpdates: 'all' })]);
   });
 
-  it('records no change of its own there, so a guest’s answer minutes later still reaches main (AE5, KTD12)', async () => {
+  it('records no change of its own there, so a guest’s answer minutes later still reaches main', async () => {
     const minutesLater = (): Date => new Date(Date.now() + 5 * 60_000);
     const own = String(data(await send(main, 'create_event', { ...FOCUS, calendar: ASSISTANT, guests: [NOEL] })).event);
     expect(consumeOwnCalendarChange(ASSISTANT, own, minutesLater())).toBe(false);
@@ -1350,7 +1350,7 @@ describe('the assistant’s own calendar (R19)', () => {
   });
 });
 
-describe('an open matter main names (KTD11)', () => {
+describe('an open matter main names', () => {
   async function boardDeck(): Promise<string> {
     const { matter } = await openMatter({
       title: 'Board deck',
@@ -1420,7 +1420,7 @@ describe('an open matter main names (KTD11)', () => {
     expect(await linked(matterId)).toEqual([]);
   });
 
-  it("is refused from any group but main, though it holds Google Calendar: matters are main's alone (R8)", async () => {
+  it("is refused from any group but main, though it holds Google Calendar: matters are main's alone", async () => {
     await createAgentGroup({ id: 'ag-other', name: 'other', folder: 'other', agent_provider: null, created_at: now() });
     await ensureContainerConfig('ag-other');
     const other = (await resolveSession('ag-other', 'mg-dm', null, 'agent-shared')).session;

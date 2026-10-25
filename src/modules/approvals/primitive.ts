@@ -56,10 +56,9 @@ import { detachApproval, finishApprovalWithdrawal } from './lifecycle.js';
  * Three-button approval UI. Plain Reject is the instant fast path; "Reject with
  * reason…" opts into the reason-capture flow, which holds the row and captures
  * the approver's next DM as a one-line reason relayed to the requesting agent
- * (reason-capture.ts). Where requests are text, the reason follows the no.
- * Shared by every module approval (create_agent, install_packages,
- * add_mcp_server). Gateway approvals use the core gateway coordinator's
- * two-button decision flow.
+ * (reason-capture.ts). Where requests are text, the reason follows the no
+ * (answers.ts). Shared by every module approval. Gateway approvals use the
+ * core gateway coordinator's two-button decision flow.
  */
 const APPROVAL_OPTIONS: RawOption[] = [
   { label: 'Approve', selectedLabel: '✅ Approved', value: APPROVE_OPTION, style: 'primary' },
@@ -90,10 +89,9 @@ export interface ApprovalHandlerContext {
 export type ApprovalHandler = (ctx: ApprovalHandlerContext) => Promise<void>;
 
 /**
- * What the requesting agent reads when its request is rejected, given the
- * rejected row and the approver's reason, if any (already clamped). `null`
- * writes no note: the module's required rejection finalizer durably records
- * its own notification before the rejection wakes the agent.
+ * What the requesting agent reads when its request is rejected; `reason` is
+ * already clamped. `null` writes no note: the module's rejection finalizer
+ * durably records its own notification before the rejection wakes the agent.
  */
 export type ApprovalRejectionNote = (
   approval: PendingApproval,
@@ -103,7 +101,7 @@ export type ApprovalRejectionNote = (
 export interface ApprovalHandlerOptions {
   /** The handler is idempotent and may resume an approved row after a host restart. */
   restartSafe?: boolean;
-  /** Words the rejection for this action; without it the agent reads the generic note (finalize.ts). */
+  /** Without it the agent reads the generic rejection note (finalize.ts). */
   rejectionNote?: ApprovalRejectionNote;
   /**
    * Required, idempotent rejection settlement. Persist module state and its
@@ -175,7 +173,7 @@ export interface ApprovalResolvedEvent {
   outcome: 'approve' | 'reject' | 'expired' | 'withdrawn';
   /** Namespaced user ID (`<channel>:<handle>`) of the resolving admin. Empty string if unknown. */
   userId: string;
-  /** The reason given with a rejection. */
+  /** The approver's reason with a rejection; the card's resolution text when expired or withdrawn. */
   reason?: string;
 }
 
@@ -190,11 +188,7 @@ export function registerApprovalResolvedHandler(handler: ApprovalResolvedHandler
   approvalResolvedHandlers.push(handler);
 }
 
-/**
- * Note the outcome in the conversation the request was posted in
- * (request-context.ts), then fire every registered approval-resolved
- * callback. Called by the response handler and finalizeReject.
- */
+/** Records the outcome in the conversation the request was posted in (request-context.ts) before the callbacks run. */
 export async function notifyApprovalResolved(event: ApprovalResolvedEvent): Promise<void> {
   await recordApprovalOutcome(event);
   for (const handler of approvalResolvedHandlers) {
@@ -261,9 +255,9 @@ export async function pickApprover(agentGroupId: string | null): Promise<string[
  * Walk the approver list and return the first (approverId, messagingGroup)
  * pair we can actually deliver to. Returns null if nobody is reachable.
  *
- * A verified principal's cards follow their current reachable profile DM.
- * Other approvers prefer the origin channel, then their list order. A
- * same-channel origin resolves through its exact adapter instance.
+ * A verified principal's cards go only to their current profile DM, when it
+ * is reachable. Other approvers prefer the origin channel, then their list
+ * order. A same-channel origin resolves through its exact adapter instance.
  */
 export async function pickApprovalDelivery(
   approvers: string[],
@@ -354,18 +348,16 @@ export interface RequestApprovalOptions {
   /** Host-authored context replacing the inferred conversation origin. */
   originLine?: string;
   /**
-   * Pictures that go with the card (KTD6), such as a checkout's total and
-   * its commit control, posted on the card's own message where the channel
-   * attaches files. Their bytes live only for this one posting: never in the
-   * approval row, the database or the logs. `null` is a picture meant for
-   * the card that could not be taken. A card whose pictures do not all reach
-   * its message, as one posted from anything kept after a restart, says
-   * they are unavailable.
+   * Posted on the card's own message where the channel attaches files. Their
+   * bytes live only for this one posting: never in the approval row, the
+   * database or the logs. `null` is a picture meant for the card that could
+   * not be taken. A card whose pictures do not all reach its message, as one
+   * posted from anything kept after a restart, says they are unavailable.
    */
   pictures?: readonly (RequestPicture | null)[];
 }
 
-/** A picture that goes with a card: PNG bytes held only in memory (RequestApprovalOptions.pictures). */
+/** Held only in memory (see `RequestApprovalOptions.pictures`). */
 export interface RequestPicture extends OutboundFile {
   mimeType: 'image/png';
 }
@@ -373,8 +365,8 @@ export interface RequestPicture extends OutboundFile {
 /**
  * Queue an approval request. Picks an approver, delivers the card to their
  * DM, and records the pending_approvals row. Fire-and-forget from the
- * caller's perspective beyond the returned durable id (or null on delivery
- * failure) — the admin's response kicks off the registered
+ * caller's perspective beyond the returned durable id (or null when it fails;
+ * the agent is told why) — the admin's response kicks off the registered
  * approval handler for this action via the response dispatcher.
  */
 export async function requestApproval(opts: RequestApprovalOptions): Promise<string | null> {

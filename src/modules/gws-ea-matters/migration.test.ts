@@ -1,6 +1,6 @@
 /**
- * The matters store (KTD3): the matters, with the host's mark for a failed
- * look (KTD7 step 3), and their links. An assistant from before this release
+ * The matters store: the matters, with the host's mark for a failed look,
+ * and their links. An assistant from before this release
  * gains them on its next start, exactly as a fresh install builds them.
  */
 import fs from 'node:fs';

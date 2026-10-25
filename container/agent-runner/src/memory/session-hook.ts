@@ -19,7 +19,7 @@ export const MEMORY_DELIVERY_STATE_DIR = '/workspace/.memory-delivered';
 export interface MemorySessionHookRegistration {
   readonly command: string;
   readonly legacyCommands: readonly string[];
-  /** When the hook injects memory. None means memory is off: no hook is installed, and any earlier one is removed. */
+  /** Empty means memory is off: no hook is installed, and any earlier one is removed. */
   readonly sources: readonly MemorySessionHookSource[];
 }
 
@@ -40,15 +40,13 @@ export const SEALED_MEMORY_SESSION_HOOK: MemorySessionHookRegistration = {
   sources: [],
 };
 
-/** The provider session a hook runs for, as its input names it. */
+/** `id` is the provider's session id, as the hook input names it. */
 export interface MemoryHookSession {
   readonly id: string;
   readonly stateDir?: string;
 }
 
 /**
- * Return the memory section for a session start, or nothing.
- *
  * A new context window (startup, clear, compact) always gets it. A resumed
  * one already holds the section last delivered to it, so it gets the section
  * only when that changed: an unchanged section would only grow the context
@@ -71,7 +69,6 @@ export function memoryContextForSessionStart(
   return section;
 }
 
-/** Record the section a session start delivered, as the one that session's next resume compares against. */
 export function recordMemoryDelivered(session: MemoryHookSession, section: string): void {
   writeFingerprint(fingerprintFile(session), fingerprintOf(section));
 }

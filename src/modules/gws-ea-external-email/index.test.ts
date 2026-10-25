@@ -331,7 +331,7 @@ describe("external-email's project document", () => {
     expect(GUIDANCE_TEXT).not.toMatch(/\bask main with `tell_main`/u);
   });
 
-  it("does this thread's part of the principal's own email and wakes main with the rest of their ask (AE6)", () => {
+  it("does this thread's part of the principal's own email and wakes main with the rest of their ask", () => {
     const tools = fs.readFileSync(
       path.resolve('container/agent-runner/src/mcp-tools/gws-ea-email-external.instructions.md'),
       'utf8',

@@ -57,7 +57,7 @@ export interface BrowserCapabilityObservation {
     readonly debugger: BrowserIsolationCheck;
   };
   readonly ready: boolean;
-  /** Who the policy grants the browser; null while it cannot be read. */
+  /** Null while the policy cannot be read. */
   readonly access: BrowserAccessView | null;
 }
 export interface BrowserOperationData {
@@ -69,28 +69,22 @@ export interface BrowserOperationData {
   readonly enabled: boolean;
   readonly changed: boolean;
   readonly access: BrowserAccessView;
-  /** What an enable's web alias step waits on the operator for (KTD13). */
+  /** Set when the enable's web alias step waits on the operator. */
   readonly pause?: OperationData['pause'];
 }
-/** Who the browser policy grants the browser (KTD15): main alone (version 1), or exactly the listed agent groups. */
+/** Version 1 grants the browser to main alone; version 2 to exactly the listed agent groups. */
 export type BrowserAccessView =
   | { readonly version: 1 }
   | { readonly version: 2; readonly agent_group_ids: readonly string[] };
-/**
- * What an enable sets about access: main alone (version 1), or exactly these
- * agent groups (version 2). Without one, it keeps what the policy holds.
- */
 export type BrowserAccessChange =
   | { readonly kind: 'main' }
   | { readonly kind: 'agent_groups'; readonly agentGroupIds: readonly string[] };
 type NclRunner = (runtime: InstanceRuntimeConfig, args: readonly string[]) => Promise<unknown>;
 export interface BrowserCapabilityDependencies {
   readonly recordEffect?: (changed: true | null) => void | Promise<unknown>;
-  /** How the running host is asked; a version-2 list is written only once it vouches for it. */
   readonly ncl?: NclRunner;
 }
 export interface BrowserEnableDependencies extends BrowserCapabilityDependencies {
-  /** The operator's word on the web alias step that follows the policy write; the step asks the host through `ncl`. */
   readonly alias?: Pick<AliasStepOptions, 'decision'>;
   /** Hears the alias step's progress. */
   readonly emit?: (event: RunEvent) => void;
@@ -129,8 +123,8 @@ async function storedPolicy(file: string): Promise<BrowserPolicyFile | undefined
 }
 
 /**
- * Run `work` under the assistant's native instance lock, or refuse at once
- * with `instance_busy`. The assistant's capabilities (browser, 1Password) share it.
+ * Refuses at once with `instance_busy` while another operation holds the
+ * assistant's instance lock, rather than waiting for it.
  */
 export async function withAssistantLock<T>(
   paths: ControlPlanePaths,
@@ -154,10 +148,9 @@ function accessView(access: BrowserAccessPolicy): BrowserAccessView {
 }
 
 /**
- * A version-2 list is written only once the running host reports that it
- * reads one, and when it names only agent groups that host has, none of them
- * the browser or external-email, which can never use the browser (KTD15). A
- * host that is not running cannot vouch for either.
+ * Only a running host can vouch that it reads a version-2 list and has each
+ * listed group. A sealed agent can never use the browser, and a chat job only
+ * while it is active.
  */
 async function assertHostMayList(
   runtime: InstanceRuntimeConfig,
@@ -220,10 +213,8 @@ async function assertHostMayList(
 }
 
 /**
- * Enable the browser. `access` sets who may use it: main alone, or exactly
- * the listed agent groups, which the running host must vouch for first; each
- * listed group shares the signed-in browser profile and the vault's logins.
- * Without it, the policy keeps whom it grants.
+ * Each listed group shares the signed-in browser profile and the vault's
+ * logins. Without `access`, the policy keeps whom it grants.
  */
 export async function enableBrowserCapability(
   paths: ControlPlanePaths,
@@ -273,10 +264,9 @@ export async function enableBrowserCapability(
 }
 
 /**
- * Enable the assistant's browser, then bring it to a configured web alias
- * (KTD13): under the assistant's lock again, and only while the policy still
- * enables the browser. An alias that waits on the operator returns as the
- * operation's pause, with the browser already enabled.
+ * The alias step takes the assistant's lock again and runs only while the
+ * policy still enables the browser. An alias that waits on the operator
+ * returns as the operation's pause, with the browser already enabled.
  */
 export async function enableBrowserWithAlias(
   paths: ControlPlanePaths,
@@ -301,7 +291,7 @@ export async function enableBrowserWithAlias(
   return { ...enabled, pause };
 }
 
-/** What continues an enable whose web alias waits: the pause's flag, or the input it names. */
+/** A resume flag with a `<placeholder>` asks the operator for input rather than naming a command to run. */
 export function browserAliasNextActions(instanceId: string, pause: NonNullable<OperationData['pause']>): NextAction[] {
   const command = ['gws-ea', 'capabilities', 'enable', 'browser', '--id', instanceId];
   const flag = pause.resumeFlag;
@@ -542,10 +532,10 @@ Promise.all(Object.entries(ports).map(([name,port])=>new Promise((resolve,reject
 }
 /* eslint-enable no-catch-all/no-catch-all */
 
-/** Where a release declares the browser policy versions its host reads (`BROWSER_POLICY_VERSIONS`). */
+/** Mirrors the release host's `BROWSER_POLICY_VERSIONS`. */
 const POLICY_VERSIONS_FILE = 'src/gws-ea/browser-compatibility.json';
 
-/** The browser policy versions a release's host reads; a release without the marker reads version 1 alone. */
+/** A release without a readable marker reads version 1 alone. */
 export async function releaseBrowserPolicyVersions(checkout: string): Promise<readonly number[]> {
   let item: unknown;
   try {
@@ -563,10 +553,8 @@ export async function releaseBrowserPolicyVersions(checkout: string): Promise<re
 }
 
 /**
- * Refuse a rollback to `release` (checked out at `checkout`) while the
- * assistant's browser policy is one that release cannot read: an older host
- * reads a version-2 access list as invalid, and the browser would be lost
- * (KTD15). Returning the browser to main alone first allows it.
+ * An older host reads a version-2 access list as invalid, so a rollback to it
+ * would lose the browser.
  */
 export async function assertBrowserPolicyReadable(
   runtime: InstanceRuntimeConfig,
@@ -598,7 +586,6 @@ export function browserCapabilityNextActions(capability: BrowserCapabilityObserv
     },
   ];
 }
-/** Who may use the browser, in the operator's words: a listed group shares its sign-ins and the vault's logins. */
 export function browserAccessLine(access: BrowserAccessView): string {
   if (access.version === 1) return 'main alone';
   if (access.agent_group_ids.length === 0) return 'no agent group';

@@ -78,7 +78,6 @@ export async function retiredChatGatewayDrift(group: string): Promise<string[]> 
     : ['its retired gateway identity still has secret assignments'];
 }
 
-/** A retired group keeps its gateway identity with no usable secret. */
 export async function retireChatGateway(group: string): Promise<void> {
   const client = admin();
   const current = await identity(client, group);

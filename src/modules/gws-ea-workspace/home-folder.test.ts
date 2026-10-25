@@ -1,5 +1,5 @@
 /**
- * The home folder (R2, AE1, KTD3): one folder in the assistant's Drive,
+ * The home folder: one folder in the assistant's Drive,
  * shared with every one of the principal's addresses, kept by a host tick
  * that heals what changed and leaves alone what people chose. Runs against
  * the real central DB and an in-memory Drive.
@@ -167,7 +167,7 @@ afterEach(async () => {
 });
 
 describe('the home folder', () => {
-  it('is made on the first tick, named for the assistant alone, and shared with every principal address so a Doc made in it opens from each (AE1)', async () => {
+  it('is made on the first tick, named for the assistant alone, and shared with every principal address so a Doc made in it opens from each', async () => {
     await setUpProfile();
     await world.home.tick();
 
@@ -443,7 +443,7 @@ describe('the home folder', () => {
     expect(sharedWith(id)).toContainEqual({ type: 'user', role: 'writer', email: WORK });
   });
 
-  it('finds access Drive names by another Gmail spelling of a listed address, and shares nothing again (R1)', async () => {
+  it('finds access Drive names by another Gmail spelling of a listed address, and shares nothing again', async () => {
     // Drive knows no permission id for the address, so only the access Drive lists can show it is held.
     const home = createHomeFolder({
       drive: { ...delegatingDriveApi(() => world.drive), permissionId: async () => undefined },

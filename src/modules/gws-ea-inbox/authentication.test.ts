@@ -1,7 +1,7 @@
 /**
  * Who a message is from, decided only from Gmail's own authentication
- * results (KTD4, R21, R22), why a message is not verified, as a fixed code
- * (KTD3), and whether Google signed it (KTD12). These are pure checks on a
+ * results, why a message is not verified, as a fixed code,
+ * and whether Google signed it. These are pure checks on a
  * message's headers.
  */
 import { describe, expect, it } from 'vitest';
@@ -146,7 +146,7 @@ describe('the principal', () => {
     ['dots, a +tag and capitals at Gmail', 'Pat.Principal+news@gmail.com', 'gmail.com'],
     ['the googlemail spelling, signed by googlemail.com', 'PatPrincipal@googlemail.com', 'googlemail.com'],
     ['capitals at another domain', 'Pat@Principal.Example', 'principal.example'],
-  ])('is recognized from %s, and named by the address as they listed it (AE1)', (_label, from, domain) => {
+  ])('is recognized from %s, and named by the address as they listed it', (_label, from, domain) => {
     expect(
       authenticateSender(message({ from: `Pat <${from}>`, results: results(domain, '20230601') }), CONTEXT),
     ).toEqual({
@@ -170,7 +170,7 @@ describe('the principal', () => {
     ['a +tag at another domain', 'pat+x@principal.example', 'principal.example'],
     ['a subdomain of gmail.com', 'pat.principal@mail.gmail.com', 'mail.gmail.com'],
     ['a domain that only begins with gmail.com', 'pat.principal@gmail.com.evil.example', 'gmail.com.evil.example'],
-  ])('takes %s, signed by its own domain, for an ordinary sender (R1)', (_label, address, domain) => {
+  ])('takes %s, signed by its own domain, for an ordinary sender', (_label, address, domain) => {
     expect(
       authenticateSender(message({ from: `Pat <${address}>`, results: results(domain, 'google') }), CONTEXT),
     ).toMatchObject({ kind: 'authenticated', address });
@@ -432,7 +432,7 @@ describe('anyone else', () => {
   });
 });
 
-describe("Google's signature (KTD12)", () => {
+describe("Google's signature", () => {
   /**
    * Gmail's results for mail Google Calendar sends in someone's name: signed
    * by google.com, from Google's own servers, so DMARC fails for the From

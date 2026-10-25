@@ -30,9 +30,8 @@ const DURATION = String.raw`(?:\d{1,2}:\d{2}(?::\d{2})?|\d+\s*${UNIT}\b(?:\s*,?\
 const PEOPLE = String.raw`(?:people|persons?|others?|users?|guests?|diners?|visitors?|travell?ers?|shoppers?|customers?)`;
 const SINCE = String.raw`(?:today|this\s+week|(?:in\s+)?the\s+(?:last|past)\s+\d+\s+(?:hours?|days?))`;
 /**
- * Text in a region that changes on its own, never availability (KTD20): stripped, with a separator before it, before
- * the region is compared. A slot's own time ("7:30 PM", "19:30") is availability and stays; a clock's is not. The
- * vocabulary is data, widened or narrowed here.
+ * Text in a region that changes on its own, never availability: stripped before the region is compared. A slot's own
+ * time ("7:30 PM", "19:30") is availability and stays; a clock's is not.
  */
 const VOLATILE_REGION_TEXT: Readonly<Record<string, RegExp>> = {
   /** A clock with seconds, which no slot shows: "19:42:13", "7:42:13 PM". */
@@ -69,9 +68,9 @@ const VOLATILE_SPANS = Object.values(VOLATILE_REGION_TEXT).map(
 );
 
 /**
- * A region's accessibility snapshot as a watch compares it (KTD20): its roles, names, states and text, without link
- * addresses (which carry sessions and cache keys) or volatile text. A line left with nothing but its role once its
- * volatile text is gone is dropped, so a counter that comes and goes changes nothing.
+ * A region's accessibility snapshot as a watch compares it: its roles, names, states and text, without link addresses
+ * (which carry sessions and cache keys) or volatile text. A line left with nothing but its role once its volatile text
+ * is gone is dropped, so a counter that comes and goes changes nothing.
  */
 export function normalizeWatchRegion(snapshot: string): string {
   const lines: string[] = [];
@@ -96,7 +95,7 @@ export function normalizeWatchRegion(snapshot: string): string {
   return lines.join('\n');
 }
 
-/** A region's normalized text where `region` finds it on `page`; undefined when the page no longer shows it there. */
+/** Undefined when the page no longer shows the region where `region` locates it. */
 export async function readWatchRegion(
   page: Page,
   region: StructuredBrowserLocator,
@@ -119,8 +118,8 @@ export type WatchRegionMark =
   | { status: 'refused'; reason: 'stale_ref' | 'region_off_route' | 'region_unmarkable' | 'region_too_large' };
 
 /**
- * The region the agent marked on its errand page from an observation ref (KTD20), on the page `recipe` reaches: its
- * structured locator and its normalized text, which becomes the watch's baseline. Nothing on the page is pressed.
+ * The region the agent marked from an observation ref, on the page `recipe` reaches: its structured locator and its
+ * normalized text, which becomes the watch's baseline. Nothing on the page is pressed.
  */
 export async function markWatchRegion(
   context: BrowserExecutionContext,
@@ -210,9 +209,9 @@ function structuralFailure(result: Record<string, unknown>): boolean {
 }
 
 /**
- * A region check after its replay (KTD20): the region's normalized text, or that the route to it or the region
- * itself is gone. A cookie banner left on the page, a challenge or an operational stop is a failed check instead,
- * so nothing the site shows over the page asks the agent to mark it again.
+ * A region check after its replay: the region's normalized text, or that the route to it or the region itself is gone.
+ * A cookie banner left on the page, a challenge or an operational stop fails or blocks the check instead, so nothing
+ * the site shows over the page asks the agent to mark it again.
  */
 async function readRegionCheck(
   context: BrowserWatchExecutionContext,
@@ -241,7 +240,7 @@ async function readRegionCheck(
   return covered ? { status: 'failed' } : { status: 'region_missing', reason: 'region_not_found' };
 }
 
-/** Model-free checks retain native check provenance and never insert fictional tool requests. */
+/** Model-free: the check runs under its watch-check id and inserts no tool request of its own. */
 export async function runBrowserWatchCheck(
   queue: BrowserQueue,
   input: BrowserWatchCheckInput,

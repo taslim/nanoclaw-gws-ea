@@ -294,11 +294,12 @@ The host makes every consent choice before a submission (`consent.ts`): site
 terms ticked, marketing and sharing opted out, and an agreement stops with
 `consent_required` until the principal grants that wording on that site. It
 rejects cookie banners before observations where a reject option shows. The
-principal's stored private values reach a site only through main's per-errand
-`record_disclosure`. Each browsing assistant's web alias (its name reversed,
-added and confirmed by the operator) is its email on every
-site and one of its addresses for mail routing. Browser policy version 2 lists
-the agent groups that may delegate (`access.ts`); version 1 means main alone.
+principal's stored private values reach a site only through a per-errand
+`record_disclosure` by the group that delegated the errand. Each browsing
+assistant's web alias (its name reversed, added and confirmed by the operator)
+is its email on every site and one of its addresses for mail routing. Browser
+policy version 2 lists the agent groups that may delegate (`access.ts`);
+version 1 means main alone.
 Watches on a site without a reader record a recipe, a marked region and its
 baseline, and wake the agent only when the region changes; release checks
 follow the venue's stated schedule.

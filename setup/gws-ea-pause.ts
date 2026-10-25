@@ -1,10 +1,6 @@
 /**
- * Attending a gws-ea pause at the terminal, so a run can go on in the same
- * process: a choice the pause offers, such as the billing account to link, is
- * made from its list; the Google Chat API configuration is confirmed in place;
- * the assistant's downloaded Google client is located; the web alias is
- * confirmed added, taken, or named; and what the person was asked to do is
- * waited for. Anything else stops, and the CLI reports how to resume.
+ * Attends a gws-ea pause at the terminal so a run can go on in the same process. A pause it cannot attend
+ * stops, and the CLI reports how to resume.
  */
 import * as p from '@clack/prompts';
 import os from 'node:os';
@@ -22,7 +18,7 @@ const WATCH_INTERVAL_MS = 3_000;
 const WATCH_LIMIT_MS = 30 * 60_000;
 const STOP: PauseResponse = { kind: 'stop' };
 
-/** Each question is cancelled when `signal` aborts, as a Ctrl-C or a stop signal does. */
+/** Each question must cancel when `signal` aborts, as Ctrl-C or a stop signal does. */
 interface PausePrompts {
   note(message: string, title?: string): void;
   info(message: string): void;
@@ -46,7 +42,7 @@ interface PausePrompts {
 
 export interface PauseDependencies {
   readonly prompts?: PausePrompts;
-  /** Waits between checks; resolves early when `signal` aborts. */
+  /** Resolves, not rejects, early when `signal` aborts. */
   readonly sleep?: (milliseconds: number, signal?: AbortSignal) => Promise<void>;
 }
 
@@ -59,15 +55,11 @@ const defaultPrompts: PausePrompts = {
   isCancel: (value) => p.isCancel(value),
 };
 
-/** A path as the operator types it: `~` is their home, and a relative path is from here. */
 function typedPath(value: string): string {
   return path.resolve(value === '~' || value.startsWith('~/') ? path.join(os.homedir(), value.slice(1)) : value);
 }
 
-/**
- * Where the operator saved the assistant's downloaded client: its path, an
- * empty string when they left it blank, or undefined when they cancelled.
- */
+/** An empty string when the operator left it blank; undefined when they cancelled. */
 async function askClientFile(prompts: PausePrompts, signal: AbortSignal): Promise<string | undefined> {
   const answer = await prompts.text({
     message: 'Where is the downloaded client JSON?',
@@ -86,7 +78,6 @@ const ALIAS_LABELS: Readonly<Record<AliasAnswer, string>> = {
   named: 'Use a name of my own',
 };
 
-/** The operator's own alias name, asked until the Admin console could take it; undefined when they cancel. */
 async function askAliasName(prompts: PausePrompts, signal: AbortSignal): Promise<string | undefined> {
   for (;;) {
     const answer = await prompts.text({ message: "The assistant's web alias", placeholder: 'onuj', signal });
@@ -103,9 +94,8 @@ async function askAliasName(prompts: PausePrompts, signal: AbortSignal): Promise
 }
 
 /**
- * A web alias pause (KTD13): where to add it, then what the operator says,
- * as the decision `--alias-added`, `--alias-taken` or `--alias <name>`
- * records. The run continues as soon as the operator confirms it.
+ * Each answer records the decision `--alias-added`, `--alias-taken` or `--alias <name>` would, tied to the
+ * candidate shown so an answer to a since-changed candidate is dropped.
  */
 async function attendAliasPause(
   pause: ProvisionHumanPause,

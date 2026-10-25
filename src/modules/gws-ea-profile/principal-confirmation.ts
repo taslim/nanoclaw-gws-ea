@@ -1,8 +1,6 @@
 /**
- * A request asking the principal to confirm a change an agent asked for. It
- * asks as the assistant, in the first person, never as the agent group that
- * asked. The address request (index.ts) and the private-value request
- * (gws-ea-privacy) both go through here.
+ * Asks the principal to confirm a change an agent asked for, as the
+ * assistant, in the first person, never as the agent group that asked.
  */
 import type { CallerContext } from '../../cli/frame.js';
 import { getAgentGroup } from '../../db/agent-groups.js';
@@ -23,7 +21,6 @@ export interface PrincipalConfirmation {
   readonly details: RequestDetails;
 }
 
-/** The caller as the guard judges it. */
 export function guardActor(ctx: CallerContext): GuardActor {
   return ctx.caller === 'host'
     ? { kind: 'host' }

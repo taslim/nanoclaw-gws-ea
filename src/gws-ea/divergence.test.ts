@@ -485,7 +485,7 @@ describe('recorded divergence: delivery consults outbound guards, and the runner
     // external-email is the counterpart's email thread (#3908, #3994).
     expect(pollLoop).not.toContain('deliverErrorResult');
     expect(pollLoop).not.toContain('FAILURE_NOTICE_FIELD');
-    // GWS-EA: the report, and each message the turn writes to a person, name the batch it answered (Slice 5 KTD12).
+    // GWS-EA: the report, and each message the turn writes to a person, name the batch it answered.
     expect(pollLoop).toContain('...(routing.batch === undefined ? {} : { batch: routing.batch })');
     const messagesOut = await readFile(path.join(originalCwd, 'container/agent-runner/src/db/messages-out.ts'), 'utf8');
     expect(messagesOut).toContain('mergeEntries(msg.content, { batch })');
@@ -1108,7 +1108,7 @@ describe("recorded divergence: the runner's tool barrel loads GWS-EA's tools", (
       expect(tools).toContain(`await import('./${module}.js');`);
     }
     expect(tools).not.toContain('gws-ea-meetings');
-    // Slice 5 R15: no tool times a conversation's own follow-through; a matter's look in main's conversation does.
+    // No tool times a conversation's own follow-through; a matter's look in main's conversation does.
     expect(tools).not.toContain("'./reminders.js'");
   });
 });

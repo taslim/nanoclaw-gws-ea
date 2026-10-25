@@ -1,5 +1,5 @@
 /**
- * Which links the link check reads (KTD5): exactly the Docs, Sheets,
+ * Which links the link check reads: exactly the Docs, Sheets,
  * Slides, Forms, Drawings and Drive shapes on docs.google.com,
  * drive.google.com and forms.gle, however their scheme, userinfo, port or a
  * trailing dot on the host is written. Every other URL passes untouched, and

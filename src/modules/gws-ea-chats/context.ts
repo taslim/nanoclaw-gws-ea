@@ -54,11 +54,10 @@ function withoutUntrustedWrapperNonces(text: string): string {
 const contextTails = new Map<string, Promise<void>>();
 
 /**
- * Host-owned context is written without a wake, and only when the chat's
- * facts differ from the last facts this session was told. Facts that change
- * back are told again under a new version, so the newest context row is
- * always the current one. Writes for one session run in order, and a write
- * repeated after a stop between the row and its record lands once.
+ * Written without a wake, and only when the facts differ from the last ones
+ * this session was told; facts that change back get a new version, so the
+ * newest context row is always current. Writes for one session run in order,
+ * and one repeated after a stop between the row and its record lands once.
  */
 export async function writeChatContext(session: Session): Promise<void> {
   const previous = contextTails.get(session.id) ?? Promise.resolve();

@@ -11,7 +11,7 @@ import { parseJson } from './validation.js';
 
 const MAX_PRIVATE_FILE_BYTES = 1024 * 1024;
 
-/** Each owner-only rule's refusal: its code and what it says before the file's path. */
+/** Each rule's refusal; its message is followed by the file's path. */
 type OwnerOnlyRefusals = Readonly<Record<'file' | 'owner' | 'mode' | 'size', readonly [code: string, message: string]>>;
 
 const OWNER_ONLY_STATE: OwnerOnlyRefusals = {
@@ -21,7 +21,6 @@ const OWNER_ONLY_STATE: OwnerOnlyRefusals = {
   size: ['unsafe_secret', 'Owner-only state exceeds its size limit'],
 };
 
-/** A regular file, owned by the current user, with no group or other permission bits, within the size limit. */
 function assertOwnerOnlyStat(
   info: Awaited<ReturnType<Awaited<ReturnType<typeof open>>['stat']>>,
   file: string,
@@ -55,16 +54,15 @@ export async function readOwnerOnlyFile(file: string): Promise<string> {
   }
 }
 
-/** An owner-only JSON state file; malformed JSON raises `code`. */
+/** Malformed JSON raises `code`; an unsafe file raises the owner-only state refusals. */
 export async function readOwnerOnlyJson(file: string, label: string, code: string): Promise<unknown> {
   return parseJson(await readOwnerOnlyFile(file), label, code);
 }
 
 /**
- * Read an operator-written file that must sit under `root`: a regular,
- * non-symlink file owned by the current user with no group or other
- * permission bits. Refusals raise `code` naming the file and the rule; a
- * missing file raises the underlying ENOENT for the caller to interpret.
+ * An operator-written file under `root`, held to the owner-only rules;
+ * refusals raise `code`, and a missing file raises the underlying ENOENT for
+ * the caller to interpret.
  */
 export async function readOperatorFile(file: string, root: string, label: string, code: string): Promise<string> {
   const absolute = path.resolve(file);

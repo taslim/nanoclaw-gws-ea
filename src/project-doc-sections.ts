@@ -12,11 +12,7 @@ export type RequiredProjectDocSectionProvider = (
 const providers = new Map<string, RequiredProjectDocSectionProvider>();
 const PROVIDER_ID_PATTERN = /^[a-z0-9][a-z0-9._-]*:[a-z0-9][a-z0-9._-]*$/u;
 
-/**
- * Register a host-rendered section that must survive project-document size
- * degradation. Modules own their data and rendering; core owns only this
- * provider-neutral composition seam.
- */
+/** A host-rendered section the project document's size ladder never drops; the registering module renders it. */
 export function registerRequiredProjectDocSection(id: string, provider: RequiredProjectDocSectionProvider): void {
   if (!PROVIDER_ID_PATTERN.test(id)) {
     throw new Error(`Project-document section provider "${id}" must use "<module-id>:<section-id>"`);

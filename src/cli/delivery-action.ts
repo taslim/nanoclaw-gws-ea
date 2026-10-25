@@ -10,8 +10,7 @@
  * through `writeActionResponse`: one `action_response` per request, keyed on
  * the request id the runner set (the id of the outbound message that carried
  * it), which the runner's tool polls for. `answeringAction` and
- * `answeredGuard` make such an action of a function that returns its answer
- * or throws: the host's twin of the runner's `requestTool`.
+ * `answeredGuard` are the host's twin of the runner's `requestTool`.
  */
 import { isUniqueViolation } from '../db/errors.js';
 import type { DeliveryGuardSpec, GuardedDeliveryHandler } from '../delivery-guard.js';
@@ -45,7 +44,6 @@ export async function writeActionResponse(session: Session, requestId: string, f
   }
 }
 
-/** The id of a request's answer in the calling session's inbound mailbox. */
 function answerId(requestId: string): string {
   return `action-resp-${requestId}`;
 }
@@ -61,25 +59,22 @@ export class ActionRefusal extends Error {
   }
 }
 
-/** A refusal of a request whose fields are not as the action takes them. */
 export function invalidArgs(message: string): ActionRefusal {
   return new ActionRefusal('invalid-args', message);
 }
 
-/** A refusal of a request the action will not do as asked. */
 export function forbidden(message: string): ActionRefusal {
   return new ActionRefusal('forbidden', message);
 }
 
 const REQUEST_ID = /^[A-Za-z0-9._:-]{1,128}$/u;
 
-/** The request id the runner set: the id of the outbound message that carried the request. */
 export function requestIdOf(content: Record<string, unknown>): string | undefined {
   const id = content.requestId;
   return typeof id === 'string' && REQUEST_ID.test(id) ? id : undefined;
 }
 
-/** What an answering action does with a request: the answer's data, or an `ActionRefusal` or failure thrown. */
+/** Returns the answer's data, or throws an `ActionRefusal` or a failure. */
 export type ActionAnswer = (
   content: Record<string, unknown>,
   session: Session,
@@ -95,7 +90,6 @@ export type ActionAnswer = (
  */
 export const ANSWER_LATER: unique symbol = Symbol('answer-later');
 
-/** An `ActionAnswer` that may hand its request to a durable worker (`ANSWER_LATER`). */
 export type DeferredActionAnswer = (
   content: Record<string, unknown>,
   session: Session,
@@ -110,21 +104,16 @@ function errorFrame(requestId: string, error: unknown): ResponseFrame {
   return { id: requestId, ok: false, error: { code: 'handler-error', message: `The host could not do it: ${reason}` } };
 }
 
-/**
- * Answer a request, then let go of the files it staged in its outbox: until
- * then a replay finds them where the first run did.
- */
+/** The outbox is cleared only after the answer, so until then a replay finds the staged files. */
 async function writeAnswer(session: Session, requestId: string, frame: ResponseFrame): Promise<void> {
   await writeActionResponse(session, requestId, frame);
   clearOutbox(session.agent_group_id, session.id, requestId);
 }
 
 /**
- * A delivery action that answers each request once, a refusal or failure
- * included. A request already answered is a replay of work already done,
- * whatever its answer, so it is not done again. A request without a request
- * id has no tool waiting on it, so nothing answers it. An answer returning
- * `ANSWER_LATER` leaves the request to the worker that answers it later.
+ * Answers each request once, a refusal or failure included. A request already
+ * answered is a replay of work already done, whatever its answer, so it is not
+ * done again.
  */
 export function answeringAction(action: string, answer: DeferredActionAnswer): GuardedDeliveryHandler {
   return async (content, session) => {

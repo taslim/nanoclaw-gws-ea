@@ -1,17 +1,17 @@
 /**
- * The open matters a new piece may belong to (KTD10, R10), found by the host
- * for `main` to decide: those that link the piece's sender, or someone at
- * the sender's organization, through the people store's records; a thread
- * the piece's reply chain answers; or, for an invitation, the thread that
- * booked it. Each comes with why.
+ * The open matters a new piece may belong to, found by the host for `main` to
+ * decide: those that link the piece's sender, or someone at the sender's
+ * organization, through the people store's records; a thread the piece's reply
+ * chain answers; or, for an invitation, the thread that booked it. Each comes
+ * with why.
  *
  * Only a sender Google names counts: the sender of mail Gmail
  * authenticated (`verifiedSender`), the account Drive names for a share or a
  * comment, or the organizer Calendar shows for an invitation. A piece from
  * anyone else gets no suggestions at all, so mail cannot claim a matter any
- * more than it can claim a level. An invitation's organizer is whoever the
- * invitation names, which one sent as a file in an email chooses freely, so a
- * note says so beside what it suggests from one (`main-note.ts`).
+ * more than it can claim a person's level. An invitation's organizer is whoever
+ * the invitation names, which one sent as a file in an email chooses freely, so
+ * a note says so beside what it suggests from one (`main-note.ts`).
  *
  * An organization is its domain, never a free-mail domain or the principal's
  * or the assistant's own, which say nothing of how two pieces relate.
@@ -35,12 +35,7 @@ export type CandidateReason = (typeof CANDIDATE_REASONS)[number];
 export interface NewPiece {
   readonly kind: PieceKind;
   readonly reference: string;
-  /**
-   * The address Google names it came from: for mail, `verifiedSender` of
-   * Gmail's verdict; for a share or a comment, the account Drive names; for
-   * an invitation, the organizer Calendar shows. Undefined when there is
-   * none, and then nothing is suggested.
-   */
+  /** Only an address Google names, as the module header lists; undefined suggests nothing. */
   readonly from: string | undefined;
   /** The Message-IDs mail answers: its In-Reply-To and References. */
   readonly answers?: readonly string[];
@@ -55,7 +50,6 @@ export interface Candidate {
   readonly reasons: readonly CandidateReason[];
 }
 
-/** Domains anyone can hold an address at. */
 const FREE_MAIL: ReadonlySet<string> = new Set([
   'aol.com',
   'fastmail.com',
@@ -81,11 +75,7 @@ const FREE_MAIL: ReadonlySet<string> = new Set([
   'zoho.com',
 ]);
 
-/**
- * The address Gmail's verdict verifies mail came from: the principal, or a
- * sender it authenticated. Undefined for anyone it could not verify, and for
- * Google's own notifications, whose person Calendar or Drive names.
- */
+/** Undefined for Google's own notifications too: Calendar or Drive names their person instead. */
 export function verifiedSender(verdict: SenderVerdict): string | undefined {
   switch (verdict.kind) {
     case 'principal':
@@ -107,24 +97,18 @@ export async function ownAddresses(): Promise<string[]> {
   return [...(await loadPrincipalRecognizer()).listed, ...(await assistantAddresses())];
 }
 
-/**
- * What `candidatesFor` reads for every piece, which a caller suggesting for
- * several pieces reads once: every link of every open matter, and the
- * principal's and the assistant's addresses, read on first use.
- */
+/** What a caller suggesting for several pieces reads once for all of them; `ownAddresses` is read on first use. */
 export interface CandidateReads {
   readonly links: readonly OpenMatterLink[];
   readonly ownAddresses: () => Promise<readonly string[]>;
 }
 
-/** The sender's organization, or undefined when their domain says nothing of one. */
 async function organizationOf(sender: string, own: () => Promise<readonly string[]>): Promise<string | undefined> {
   const domain = domainOf(sender);
   if (FREE_MAIL.has(domain)) return undefined;
   return (await own()).some((address) => domainOf(address.toLowerCase()) === domain) ? undefined : domain;
 }
 
-/** A person's email addresses, as their record holds them. */
 async function addressesOf(personId: string): Promise<string[]> {
   return ((await getPerson(personId))?.identities ?? []).flatMap(({ handle }) => {
     const address = handle.toLowerCase().startsWith('email:')
@@ -155,11 +139,7 @@ async function candidate(matter: Matter, reasons: ReadonlySet<CandidateReason>):
   };
 }
 
-/**
- * The open matters `piece` may belong to, strongest reason first, then most
- * recently changed. `reads` is what a caller suggesting for several pieces
- * read once for all of them.
- */
+/** Strongest reason first, then most recently changed. */
 export async function candidatesFor(piece: NewPiece, reads?: CandidateReads): Promise<Candidate[]> {
   const sender = piece.from === undefined ? undefined : normalizeAddress(piece.from);
   if (sender === undefined) return [];
@@ -215,7 +195,7 @@ export async function candidatesFor(piece: NewPiece, reads?: CandidateReads): Pr
   return Promise.all(ranked.map((matter) => candidate(matter, found.get(matter.id) ?? new Set())));
 }
 
-/** The suggestions as `main` reads them beside a new piece: each open matter with why. */
+/** As `main` reads them beside a new piece. */
 export function renderCandidates(candidates: readonly Candidate[]): string {
   const heading = 'Open matters it may belong to:';
   if (candidates.length === 0) {

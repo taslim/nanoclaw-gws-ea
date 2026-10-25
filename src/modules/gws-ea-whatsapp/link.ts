@@ -137,7 +137,7 @@ export class WhatsAppLinking {
     );
     this.timer.unref();
   }
-  /** Before channel startup, an interrupted attempt retains its deadline and restores the former state once expired. */
+  /** Before each channel startup: a pairing this process did not start expires at once; its own keeps its deadline. */
   async reconcile(): Promise<void> {
     const record = await readWhatsAppLink(this.options.directory);
     // Account state is outside release snapshots. Withdraw authority resurrected by restoring the central DB.

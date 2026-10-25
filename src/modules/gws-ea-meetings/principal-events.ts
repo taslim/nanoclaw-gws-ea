@@ -1,62 +1,16 @@
 /**
- * main's three writes on events, which `gog` cannot make with the principal
- * on the guest list (it sets no answer, and refuses to answer an event they
- * organize), nor with the private-details check on its invitations:
+ * The event writes `gog` cannot make: it sets no answer for the principal on
+ * the guest list, refuses to answer an event they organize, and runs no
+ * private-details check on its invitations.
  *
- *   create_event      { calendar, title, start, end, all_day?, timezone?, notes?, location?,
- *                       guests?, free?, private?, recurrence?, video_call?, matter? }
- *                                        → { calendar, event, start, end, message }
- *   change_guests     { calendar, event, add?, remove?, matter? }
- *                                        → { calendar, event, guests, message }
- *   respond_to_event  { calendar, event, response, matter? }
- *                                        → { calendar, event, response, message }
- *
- * - Each writes only to a calendar Google lets the assistant change that is
- *   the principal's or the assistant's own (KTD10), and `change_guests` only
- *   to an event that calendar organizes: what someone else organizes
- *   changes through them.
- * - On every event either writes on a principal calendar, the principal is
- *   a guest, accepted, as Google lists the organizer of an event they made
- *   themselves, unless they have answered it otherwise themselves; they
- *   never come off it. On the assistant's own calendar the assistant is that
- *   organizer, and the principal is a guest like any other, only when main
- *   invites them: the event takes their time only through the copy Google's
- *   invitation puts on their calendar. Its answer says who else sees it.
- * - `change_guests` writes each guest it keeps back exactly as Google holds
- *   them, so nobody else's answer or note changes, and only over the version
- *   of the event it read: a change that lands in between is read again and
- *   kept. A room booked on the event stays on it, and is never named a guest.
- * - `create_event` sends Google's invitation when it invites anyone but the
- *   principal, as a human assistant's invitation reaches its guests, and
- *   emails no one otherwise. `change_guests` sends Google's update when it
- *   invites or takes off anyone but the principal, and emails no one when
- *   the change is the principal's alone. On the assistant's own calendar,
- *   the principal hears of either as any guest does.
- * - Before either puts anyone on an event, it passes the private-details
- *   check as its guests outside the principal would see it: its title,
- *   notes and place, the calendar's name, and every address on its guest
- *   list but their own.
- * - `respond_to_event` sets the principal's own answer, accepted, tentative
- *   or declined, on an event on one of their calendars, and changes nothing
- *   else: on their own event it writes the guest list back with only their
- *   entry changed, emailing no one, and refuses a list Google returned
- *   incomplete; on someone else's it writes their entry alone, and Google
- *   is asked to tell the organizer unless that is another of their own
- *   addresses. It reads the answer back and says what Google holds. An
- *   answer carries no note: a word to the organizer goes through
- *   external-email.
- * - A `create_event` or `change_guests` write on a principal calendar is
- *   recorded as the assistant's own change, so Google's notification of it
- *   makes no note; one on the assistant's own calendar is not, so a guest's
- *   answer to it reaches main (KTD12). An answer is never recorded: Google
- *   may not notify it, and a record would swallow the next real notice.
- * - With `matter`, one of main's open matters, the event either writes on
- *   joins it (Slice 5 KTD11), checked before anything is written.
- *
- * Each request is answered once. A replayed `create_event` finds the event
- * it made, whose id derives from the request, and writes nothing more: its
- * guests heard of it from the first write, and a change made since stands.
- * It adds nothing when that event has since been deleted.
+ * - On a principal calendar the principal is on every event these tools
+ *   write, accepted unless they answered otherwise themselves, and never
+ *   taken off. On the assistant's own calendar the principal is a guest only
+ *   when invited: the event takes their time only through the copy Google's
+ *   invitation puts on their calendar.
+ * - An answer is never recorded as the assistant's own change: Google may
+ *   not notify it, and a record would swallow the next real notice.
+ * - A request's `matter` is checked before anything is written.
  */
 import { TIMEZONE } from '../../config.js';
 import { forbidden, invalidArgs, type ActionAnswer } from '../../cli/delivery-action.js';
@@ -100,22 +54,18 @@ const LOCATION_MAX = 500;
 const MAX_GUESTS = 50;
 const MAX_RECURRENCE = 10;
 const RECURRENCE_LINE_MAX = 500;
-/** The longest an event may last: a year. */
 const MAX_EVENT_DAYS = 366;
 /** Google's longest calendar id is an address. */
 const CALENDAR_ID_MAX = 254;
-/** How many times `change_guests` and `respond_to_event` read and write a guest list that keeps changing under them before they give up. */
 const GUEST_WRITE_ATTEMPTS = 3;
 const DAY = 24 * 60 * 60 * 1000;
 
 const DATE = /^\d{4}-\d{2}-\d{2}$/u;
 const RECURRENCE_LINE = /^(?:RRULE|EXRULE|RDATE|EXDATE)[:;]\S+$/u;
 
-/** Refusing an event Google returned only part of the guest list of: written back whole, the list would lose the rest. */
 const INCOMPLETE_LIST =
   "Google didn't return this event's whole guest list, so changing it could drop guests: ask the principal to change it in Google Calendar.";
 
-/** People named in prose: "a, b, and c". */
 const LIST = new Intl.ListFormat('en', { style: 'long', type: 'conjunction' });
 
 // ---------------------------------------------------------------------------
@@ -164,25 +114,20 @@ function recurrenceOf(value: unknown): string[] | undefined {
   return lines;
 }
 
-/** A guest's address as Google holds it, lowercased. */
 function emailOf(guest: GuestRecord): string | undefined {
   return typeof guest.email === 'string' ? guest.email.toLowerCase() : undefined;
 }
 
-/**
- * The addresses on a guest list that someone outside the principal sees
- * beside their own: a guest's own address tells them nothing.
- */
+/** A guest's own address tells them nothing, so an address counts as seen only when another outside guest sees it. */
 function addressesSeen(addresses: readonly string[], outside: readonly string[]): string[] {
   return addresses.filter((address) => outside.some((guest) => guest !== address));
 }
 
-/** "a is", "a and b are". */
 function are(addresses: readonly string[]): string {
   return `${LIST.format(addresses)} ${addresses.length === 1 ? 'is' : 'are'}`;
 }
 
-/** An all-day span, its days at UTC midnight, as people say it: "Monday, Oct 12", or "Monday, Oct 12 to Tuesday, Oct 13". */
+/** `first` and `last` are days at UTC midnight (`dateOf`), `last` included. */
 function daysLabel(first: number, last: number): string {
   return first === last ? dayLabel(first, 'UTC') : `${dayLabel(first, 'UTC')} to ${dayLabel(last, 'UTC')}`;
 }
@@ -204,49 +149,37 @@ function responseOf(value: unknown): Answer {
   throw invalidArgs('response must be accepted, tentative or declined');
 }
 
-/** Each answer as people say it. */
 const ANSWER_WORDS: Readonly<Record<Answer, string>> = {
   accepted: 'going',
   tentative: 'maybe going',
   declined: 'not going',
 };
 
-/** An answer, or its absence, as people say it, with Google's own word for it. */
 function answerWords(status: unknown): string {
   return isAnswer(status) ? `${ANSWER_WORDS[status]} (${status})` : 'not yet answered (needsAction)';
 }
 
-/** Which occurrences of an event an answer on it covers, ending a sentence. */
 function scopeWords(guests: EventGuests): string {
   if (guests.recurringEventId !== undefined) return ' on this occurrence only';
   return guests.recurrence === undefined ? '' : ' on every occurrence';
 }
 
-/** The principal on an event's guest list, as the end of a sentence naming its other guests. */
 const PRINCIPAL_WORDS: Readonly<Record<Answer, string>> = {
   accepted: 'and the principal, accepted',
   declined: 'and the principal, who declined it',
   tentative: 'and the principal, who answered maybe',
 };
 
-/** A tool's message, ending with whether the event joined the matter the request named, when it named one. */
 async function withMatter(message: string, matterId: string | undefined, calendarId: string, eventId: string) {
   return matterId === undefined
     ? message
     : `${message} ${await joinRequestedMatter(matterId, { kind: 'event', reference: `${calendarId}/${eventId}` })}`;
 }
 
-/** Whose calendar the tools write on (KTD10): one of the principal's, or the assistant's own. */
 type CalendarOwner = 'principal' | 'assistant';
 
-/**
- * What the answers say of a calendar's owner, the organizer of every event
- * the tools change on it.
- */
 interface OwnerWords {
-  /** Said of every event `create_event` adds there. */
   readonly added: string;
-  /** Refusing to take the owner off an event of theirs. */
   readonly stays: string;
   /** Ending "Nothing changed: …". */
   readonly alreadyOn: string;
@@ -272,21 +205,14 @@ const OWNER_WORDS: Readonly<Record<CalendarOwner, OwnerWords>> = {
   },
 };
 
-/**
- * Whether Google tells an event's guests of a write that invites, adds or
- * takes off `addresses`: on a principal calendar, only when one of them is
- * someone other than the principal, its organizer; on the assistant's own,
- * whenever there is anyone, the principal included.
- */
+/** On a principal calendar the principal is the organizer, so a change that touches only them emails no one. */
 function googleTells(owner: CalendarOwner, principal: PrincipalRecognizer, addresses: readonly string[]): boolean {
   return owner === 'assistant' ? addresses.length > 0 : addresses.some((address) => !principal.has(address));
 }
 
-/** What `change_guests` makes of an event's guest list as Google holds it. */
 interface GuestChange {
   /** The list to write back, or undefined when it already says what was asked. */
   readonly next: readonly GuestRecord[] | undefined;
-  /** Addresses the list gains, and those it loses. */
   readonly added: readonly string[];
   readonly removed: readonly string[];
   /** Who the event invites afterwards: neither the calendar's owner nor a room. */
@@ -300,13 +226,11 @@ interface GuestChange {
 }
 
 /**
- * The guest list `change_guests` writes on an event of the calendar
- * `calendarId`, the principal's or the assistant's own, worked out afresh
- * from each read of it: everyone kept exactly as Google holds them, those
- * named in `remove` taken off (never the calendar's owner, refused before
- * this), those in `add` appended, and the owner on it. Whatever the owner
- * answered stays theirs; only when they have no answer yet do they count as
- * accepted, as the organizer of an event they made themselves.
+ * Worked out afresh from each read of the list, everyone kept exactly as
+ * Google holds them. `remove` never names the calendar's owner (refused
+ * before this). Whatever the owner answered stays theirs; only with no
+ * answer yet do they count as accepted, as the organizer of an event they
+ * made themselves.
  */
 function guestChange(
   calendarId: string,
@@ -346,11 +270,7 @@ function guestChange(
   };
 }
 
-/**
- * Whose a calendar in the list is: the assistant's when one of its own
- * addresses names it, which can never be the principal's (R3); the
- * principal's by the rule every principal calendar is told by; or neither.
- */
+/** The assistant's when one of its own addresses names it, which can never be one of the principal's. */
 function ownerOf(
   entry: CalendarEntry,
   principal: PrincipalRecognizer,
@@ -361,11 +281,11 @@ function ownerOf(
 }
 
 /**
- * Record a write on a principal calendar as the assistant's own change, so
- * Google's notification of it produces no note. A write on the assistant's
- * own calendar is not recorded: the host turns notifications on only for
- * the principal's, so Google tells the assistant nothing of its own edits
- * there, and a record would swallow a guest's first answer (KTD12).
+ * A write on a principal calendar is recorded so Google's notification of it
+ * produces no note. One on the assistant's own calendar is not: the host
+ * turns notifications on only for the principal's, so Google tells the
+ * assistant nothing of its own edits there, and a record would swallow a
+ * guest's first answer.
  */
 function recordOwnChange(owner: CalendarOwner, calendarId: string, eventId: string): void {
   if (owner === 'principal') recordOwnCalendarChange(calendarId, eventId);
@@ -376,11 +296,9 @@ function recordOwnChange(owner: CalendarOwner, calendarId: string, eventId: stri
 // ---------------------------------------------------------------------------
 
 export interface PrincipalEventToolsDeps {
-  /** The host's own Calendar client. */
   readonly calendar: () => MeetingsCalendarApi;
 }
 
-/** A calendar the tools write on, with whose it is and the principal's addresses. */
 interface WritableCalendar {
   readonly entry: CalendarEntry;
   readonly owner: CalendarOwner;
@@ -390,12 +308,6 @@ interface WritableCalendar {
 export function createPrincipalEventTools(deps: PrincipalEventToolsDeps) {
   const calendar = () => deps.calendar();
 
-  /**
-   * The calendar named, for both tools (KTD10): the assistant's own, its
-   * primary calendar, named by one of its addresses; or one of the
-   * principal's. Refused when it is neither, or when Google lets the
-   * assistant see it but not change it.
-   */
   async function writableCalendarOf(calendarId: string): Promise<WritableCalendar> {
     const [entry, principal, assistant] = await Promise.all([
       calendar().getCalendar(calendarId),
@@ -561,7 +473,6 @@ export function createPrincipalEventTools(deps: PrincipalEventToolsDeps) {
     const words = OWNER_WORDS[owner];
     const organizer = entry.id.toLowerCase();
     if (remove.some((address) => isOwnerAddress(entry.id, address))) throw forbidden(words.stays);
-    /** The answer for the event as it now stands, which joins the matter the request named. */
     const answered = async (guests: readonly string[], message: string) => ({
       calendar: entry.id,
       event: eventId,
@@ -648,7 +559,6 @@ export function createPrincipalEventTools(deps: PrincipalEventToolsDeps) {
       throw forbidden("That is your own calendar: the principal's answer lives on their calendar, so answer there.");
     }
     const noEvent = `No event ${eventId} on that calendar.`;
-    /** The answer for the event as Google now holds it, which joins the matter the request named. */
     const answered = async (held: Answer, message: string) => ({
       calendar: entry.id,
       event: eventId,
@@ -689,7 +599,8 @@ export function createPrincipalEventTools(deps: PrincipalEventToolsDeps) {
         );
       }
 
-      // Their entry as Google holds it, under the address it names, with the new answer and no earlier note.
+      // Their entry as Google holds it, with the new answer and no earlier note: a word to the organizer goes
+      // through external-email.
       const { comment: _comment, ...kept } = own;
       const next: GuestRecord = { ...kept, responseStatus: response };
       const organizes = own.organizer === true;

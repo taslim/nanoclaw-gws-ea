@@ -180,7 +180,7 @@ export class WhatsAppIndex {
   releaseHeld(lid: string): void {
     this.db.prepare('DELETE FROM held_intake WHERE account=? AND lid=?').run(this.account(), lid);
   }
-  /** Abandon an unlinked account's queued input after transport quiescence, retaining handed-off message receipts. */
+  /** For an unlinked account, once its transport is quiet; messages already routed to the host are kept. */
   discardUnrouted(): void {
     const account = this.account();
     this.db.transaction(() => {

@@ -25,10 +25,7 @@ import { parseTemplate } from './parse.js';
 import { copyPluginDir } from './plugin-dir.js';
 
 export interface CreateAgentOptions {
-  /**
-   * The new group's id, when the caller chose it to judge the group's
-   * destinations before creating it (create_agent). Omit for a fresh one.
-   */
+  /** Preset when the caller needs the id before the group exists (create_agent judges its destinations first). */
   id?: string;
   name?: string;
   /** IANA timezone for the new group; template task schedules fire in it. Omit to follow the install default. */

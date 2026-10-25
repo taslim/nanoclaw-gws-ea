@@ -204,7 +204,7 @@ export class BrowserRuntime {
     return () => this.disconnectListeners.delete(listener);
   }
 
-  /** Stop owned processes and proxy; a future explicit enable may start a fresh runtime. */
+  /** Unlike shutdown(), the next reconcile or connection under an enabled policy restarts the proxy and Chrome. */
   stop(): Promise<void> {
     this.startup?.abort();
     return this.exclusive(() => this.stopOwned());

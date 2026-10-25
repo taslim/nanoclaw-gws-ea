@@ -36,7 +36,7 @@ async function ownsDebugger(owned: OwnedChrome, signal: AbortSignal): Promise<bo
       ['-w', '-nP', '-a', `-iTCP:${debuggerPort}`, '-sTCP:LISTEN', '-Fpfn'],
       { signal, timeout: 2_000, maxBuffer: 64 * 1024, encoding: 'utf8' },
       (error, stdout, stderr) => {
-        // lsof uses status 1 for an empty selection. Any diagnostics or other failure is unobservable.
+        // lsof exits 1 for an empty selection; any stderr or other failure leaves ownership unobservable.
         if (stderr || (error && !(error.code === 1 && !error.killed && !error.signal && stdout === ''))) {
           reject(new Error('Chrome listener ownership unavailable'));
         } else resolve(stdout);
@@ -119,7 +119,7 @@ async function discoverDebugger(debuggerPort: number, signal: AbortSignal): Prom
   return endpoint.href;
 }
 
-/** Native Playwright attachment to the verified loopback listener of the child we spawned. */
+/** Attaches only to a loopback listener proven, before and after discovery, to belong to the spawned child. */
 export async function connectChrome(
   owned: OwnedChrome,
   paths: BrowserPaths,
@@ -287,7 +287,7 @@ export async function createBackgroundPage(
   }
 }
 
-/** The same host-owned probes verify the persistent profile and each signed-out context. */
+/** Run on a probe page in every browser context before that context serves a job. */
 export async function verifyChromePolicy(page: Page): Promise<void> {
   const result: unknown = await page.evaluate(`new Promise((resolve) => {
     const peer = new RTCPeerConnection({iceServers: []});

@@ -58,30 +58,30 @@ export type NewSpendingAuthority = NewSpendingAuthorityFacts &
     | { kind: 'watch'; watchId: string; approvalId?: string; cardId?: never; guaranteeId?: never }
     | { kind: 'reservation_guarantee'; guaranteeId: string; approvalId?: never; cardId?: never }
   );
-/** Where an attempt's outcome came from (KTD8): its page, a later step of its checkout, the merchant's email or the principal. */
+/** Where an attempt's outcome came from: its page, a later checkout step, the merchant's email or the principal. */
 export type ResolutionSource = 'page' | 'email' | 'principal' | 'step';
 
-/** A purchase attempt, paid under an authority or free (KTD3), as the resolve function reads either. */
+/** A purchase attempt, paid under an authority or free, as the resolve function reads either. */
 export interface PurchaseAttemptRow {
   readonly id: string;
   readonly kind: 'paid' | 'free';
   /** The paid attempt's authority; a free attempt has none. */
   readonly authority_id: string | null;
   readonly job_id: string;
-  /** The merchant (KTD7). */
+  /** The merchant. */
   readonly site: string;
-  /** The contact email that keys a generic checkout's order numbers (KTD5). */
+  /** The contact email that keys a generic checkout's order numbers. */
   readonly account_key: string | null;
   readonly facts_json: string;
   readonly attempted_at: string;
   readonly resolution: 'committed' | 'not_committed' | null;
   readonly resolution_source: ResolutionSource | null;
   readonly evidence_json: string | null;
-  /** When it ended with no page proof either way: from then on main settles it (KTD8). */
+  /** When it ended with no page proof either way; then only a later page read or a recorded answer settles it. */
   readonly unconfirmed_at: string | null;
   /** When its delegating group heard that it is unconfirmed. */
   readonly notified_at: string | null;
-  /** The card that showed the principal main's recorded "not placed" for it (KTD9). */
+  /** The card that showed the principal the recorded "not placed" answer for it. */
   readonly answer_card_id: string | null;
 }
 const ATTEMPT_COLUMNS =
@@ -93,15 +93,14 @@ const ATTEMPT_TABLES = {
   free: 'gws_ea_browser_free_attempts',
 } as const satisfies Record<PurchaseAttemptRow['kind'], string>;
 
-/** An attempt's outcome, as one source learned it. */
 export interface AttemptResolution {
   readonly placed: boolean;
   readonly source: ResolutionSource;
-  /** What showed it: the page's evidence, the step's, or whose answer main recorded. */
+  /** What showed it: the page's evidence, the step's, or which group recorded the answer. */
   readonly evidence: Record<string, unknown>;
   /**
    * The merchant's own record of it, under its account key: a page always names one for a placed purchase, while
-   * an outcome from the merchant's email or the principal may name none (KTD8).
+   * an outcome from the merchant's email or the principal may name none.
    */
   readonly record?: { readonly id: string; readonly account: string | null };
   /** What a paid attempt's job hears of it, as its authority's outcome; by default, the outcome and its source. */
@@ -117,7 +116,7 @@ export type AttemptResolved =
   | { readonly status: 'resolved' | 'already_resolved' | 'record_used'; readonly attempt: PurchaseAttemptRow }
   | { readonly status: 'no_attempt' };
 
-/** What a paid attempt with no page proof answers its job (KTD8). */
+/** What a paid attempt with no page proof answers its job. */
 export function unconfirmedOutcome(attemptId: string): Record<string, unknown> {
   return { status: 'unconfirmed', attempt_id: attemptId, repeat_safe: false };
 }
@@ -152,7 +151,6 @@ export class PurchaseAuthorityStore {
       jobId,
     );
   }
-  /** The attempts on `site`, paid or free, with no recorded outcome. */
   async unresolved(site: string): Promise<string[]> {
     return (
       await this.db.all<{ id: string }>(
@@ -166,7 +164,7 @@ export class PurchaseAuthorityStore {
   attempt(id: string): Promise<PurchaseAttemptRow | undefined> {
     return this.db.get(`SELECT * FROM (${ATTEMPTS}) WHERE id = ?`, id);
   }
-  /** A job's unconfirmed attempts, paid or free, oldest first: what main records outcomes against (KTD9). */
+  /** A job's unconfirmed attempts, oldest first: the ones `record_purchase_outcome` settles. */
   unconfirmedOf(jobId: string): Promise<PurchaseAttemptRow[]> {
     return this.db.all(
       `SELECT * FROM (${ATTEMPTS}) WHERE job_id = ? AND resolution IS NULL AND unconfirmed_at IS NOT NULL ORDER BY attempted_at,id`,
@@ -181,7 +179,7 @@ export class PurchaseAuthorityStore {
       )
     ).map((row) => row.id);
   }
-  /** The attempts on `site` main recorded as not placed that no card has shown the principal yet (KTD9). */
+  /** Attempts on `site` with a recorded "not placed" answer that no card has shown the principal yet. */
   async recordedNotPlaced(site: string): Promise<Array<RecordedNotPlaced & { readonly id: string }>> {
     return this.db.all(
       `SELECT id,attempted_at AS attemptedAt,resolution_source AS source FROM (${ATTEMPTS})
@@ -190,7 +188,7 @@ export class PurchaseAuthorityStore {
       site,
     );
   }
-  /** Marks main's recorded answers as shown on `cardId`, so the next card on the site does not repeat them. */
+  /** Marks the recorded answers as shown on `cardId`, so the next card on the site does not repeat them. */
   async markRecordedShown(recorded: ReadonlyArray<{ readonly id: string }>, cardId: string): Promise<void> {
     for (const { id } of recorded) {
       const attempt = await this.attempt(id);
@@ -203,7 +201,7 @@ export class PurchaseAuthorityStore {
     }
   }
   /**
-   * Whether a purchase on `site` waits on an earlier one (KTD9): an attempt there with no recorded outcome that
+   * Whether a purchase on `site` waits on an earlier one: an attempt there with no recorded outcome that
    * the card's one-attempt exception does not name, or a site block no such attempt explains.
    */
   async waitsOnEarlier(site: string, exceptions: readonly string[] = []): Promise<boolean> {
@@ -375,8 +373,8 @@ export class PurchaseAuthorityStore {
       if (!job || job.cancelled || job.cancel_requested) throw new PurchaseAuthorityError('cancelled');
       if (authority.expires_at <= at) throw new PurchaseAuthorityError('expired');
       await this.checkCurrentFacts(authority, current, context.job.id);
-      // Another purchase on the merchant needs the principal's answer on its earlier ones, or the card's
-      // one-attempt exception for them (KTD9).
+      // Another purchase on the merchant waits for its earlier ones' outcomes, unless the card's one-attempt
+      // exception names them.
       if (await this.waitsOnEarlier(current.site, JSON.parse(authority.exception_ids_json) as string[]))
         throw new PurchaseAuthorityError('purchase_blocked');
       const lease = await this.db.get<{ job_id: string }>(
@@ -395,8 +393,8 @@ export class PurchaseAuthorityStore {
         throw new PurchaseAuthorityError('authority_unavailable');
       if (claim) await claim(this.db, authority, current);
       else if (current.reservation || current.generic?.booking) {
-        // A booking a card or the standing guarantee covers on a region watch's site spends its one booking
-        // (KTD20), and only a watch whose bounds the booking does not fall outside.
+        // A booking a card or the standing guarantee covers on a region watch's site spends its one booking,
+        // and only a watch whose bounds the booking does not fall outside.
         await claimRegionWatchCommit(this.db, {
           jobId: authority.job_id,
           site: current.site,
@@ -415,7 +413,7 @@ export class PurchaseAuthorityStore {
       if (!changed.changes) throw new PurchaseAuthorityError('authority_unavailable');
       await markBrowserRequestCommitStarted(this.db, context.request.id, at);
       // The attempted facts include a lower actual retail total, rather than the card's ceiling. A generic
-      // checkout's attempt names its payment platform, and its contact email keys its order numbers (KTD5, KTD7).
+      // checkout's attempt names its payment platform, and its contact email keys its order numbers.
       await this.db.run(
         `INSERT INTO gws_ea_browser_purchase_attempts(id,authority_id,job_id,site,facts_json,attempted_at,platform,account_key)
         VALUES(?,?,?,?,?,?,?,?)`,
@@ -433,7 +431,7 @@ export class PurchaseAuthorityStore {
   }
   /**
    * The facts a press carries against its authority: nothing material changed, the facts complete, every
-   * agreement still granted (KTD11), and a standing guarantee still covering them.
+   * agreement still granted, and a standing guarantee still covering them.
    */
   private async checkCurrentFacts(authority: SpendingAuthority, current: PurchaseFacts, jobId: string): Promise<void> {
     const change = materialPurchaseChange(
@@ -444,7 +442,7 @@ export class PurchaseAuthorityStore {
     if (change) throw new PurchaseAuthorityError('changed', change);
     if (!completePurchaseFacts(current))
       throw new PurchaseAuthorityError('changed', 'The financial terms are unavailable.');
-    // Every agreement the press carries stands approved, none withdrawn since the card (KTD11).
+    // Every agreement the press carries stands approved, none withdrawn since the card.
     if (current.agreements?.length && !(await agreementsGranted(this.db, current.site, current.agreements)))
       throw new PurchaseAuthorityError('changed', 'An agreement on this checkout is no longer approved.');
     if (authority.guarantee_id) {
@@ -464,7 +462,7 @@ export class PurchaseAuthorityStore {
   }
   /**
    * A further press of the same checkout under its approval, after the one `begin()` marked moved it to another
-   * step (KTD3): the same request, nothing material changed. The attempt stays one, holding the latest facts.
+   * step: the same request, nothing material changed. The attempt stays one, holding the latest facts.
    */
   async continueCommit(context: BrowserExecutionContext, authorityId: string, current: PurchaseFacts): Promise<void> {
     await context.assertActive();
@@ -491,15 +489,15 @@ export class PurchaseAuthorityStore {
     });
   }
   /**
-   * The one resolve function (KTD8): a compare-and-set on an unresolved attempt, paid or free, that records its
+   * The one resolve function: a compare-and-set on an unresolved attempt, paid or free, that records its
    * outcome and its source. In the same transaction it settles the attempt's authority, its watch's claim and
    * status, the site's block and the jobs waiting on the site; a resolved attempt's pending unconfirmed notice
-   * is never sent. After commit, the attempt's job hears what its page or its step showed (main's own answers
-   * are main's), and each waiting job is woken.
+   * is never sent. After commit, the attempt's job hears what its page or its step showed (a recorded answer
+   * is its recorder's own), and each waiting job is woken.
    */
   async resolve(attemptId: string, resolution: AttemptResolution): Promise<AttemptResolved> {
     const at = new Date().toISOString();
-    // Main's answers are its own to act on; the job hears only what its pages showed.
+    // A recorded answer is its recorder's to act on; the job hears only what its pages showed.
     const mainsAnswer = resolution.source === 'email' || resolution.source === 'principal';
     const result = await this.db.transaction(async (): Promise<AttemptResolved> => {
       const attempt = await this.attempt(attemptId);
@@ -553,7 +551,7 @@ export class PurchaseAuthorityStore {
         await this.settleRequestedCancellation(authority.job_id, at);
       }
       // The watch whose one booking this attempt claimed, by a watch's own authority, a card or guarantee booking
-      // on a region watch's site, or a free table there (KTD20), ends with it.
+      // on a region watch's site, or a free table there, ends with it.
       await finishWatchCommit(this.db, attempt.job_id, attempt.id, resolution.placed);
       if (!(await this.unresolved(attempt.site)).length) {
         await this.db.run('DELETE FROM gws_ea_browser_purchase_blocks WHERE site = ?', attempt.site);
@@ -580,7 +578,7 @@ export class PurchaseAuthorityStore {
   }
   /**
    * A merchant record already proving another attempt on the site under the same account key: the contact email
-   * a generic checkout keys its order numbers by, or a reviewed merchant's account (KTD5).
+   * a generic checkout keys its order numbers by, or a reviewed merchant's account.
    */
   private async recordUsed(
     attempt: PurchaseAttemptRow,
@@ -603,7 +601,7 @@ export class PurchaseAuthorityStore {
     );
   }
   /**
-   * An attempt that ended with no page proof either way (KTD8): unconfirmed, until its page, the merchant's
+   * An attempt that ended with no page proof either way: unconfirmed, until its page, the merchant's
    * email or the principal settles it. Its site's next purchase waits on it, and its delegating group hears of
    * it once, after commit. A paid attempt's authority is spent, and its job hears `unconfirmed`. Returns what
    * the attempt's job answers.

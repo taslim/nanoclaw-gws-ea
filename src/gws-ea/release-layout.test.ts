@@ -1,5 +1,5 @@
 /**
- * The release layout (KTD1, KTD4, KTD5): releases switch by one link and
+ * The release layout: releases switch by one link and
  * never move or copy state; a snapshot is a copy taken while fenced, retaken
  * after any later fence, and restored whole with what it replaces kept; and
  * NanoClaw itself, run from a release through the live link, finds its

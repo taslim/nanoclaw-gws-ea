@@ -1,6 +1,6 @@
 /**
  * No page in an agent's browser may reach a host where the gateway injects the
- * assistant's Google token (KTD10). Chromium's URL blocklist stops navigations,
+ * assistant's Google token. Chromium's URL blocklist stops navigations,
  * not a page's own requests, so the image starts Chromium through a launch
  * wrapper that sends it through the gateway and bypasses the gateway for
  * exactly those hosts, each in its plain and fully-qualified spelling. On the

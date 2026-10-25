@@ -24,7 +24,6 @@ export type RunEvent =
   | { readonly type: 'step-paused'; readonly step: string; readonly pause?: ProvisionHumanPause }
   | { readonly type: 'step-failed'; readonly step: string; readonly error: unknown; readonly rawLog?: string };
 
-/** Where a step reports: the driver's event listener and the run log. Both optional. */
 export interface StepReporter {
   readonly emit?: (event: RunEvent) => void;
   readonly run?: RunLog;
@@ -36,9 +35,8 @@ export interface StepIdentity {
 }
 
 /**
- * Run one named step: its commands log to its own raw log, and the driver
- * hears it start, wait, and complete, pause, or fail. `pauseOf` recognizes a
- * result that stops for a person; a thrown `PauseRequired` pauses too.
+ * With a run log, the step's commands log to its own raw log. `pauseOf` recognizes a result that stops for a
+ * person; a thrown `PauseRequired` pauses too.
  */
 export async function runStep<T>(
   reporter: StepReporter,
@@ -109,11 +107,6 @@ export class SignInRequired extends GwsEaError {
   }
 }
 
-/**
- * Run `work`; when it finds the Google sign-in expired, sign in once and run
- * it again. Without `signIn` the refusal stands. `onSignIn` hears the refusal
- * first, so the caller can log it.
- */
 export async function withGoogleSignIn<T>(
   work: () => Promise<T>,
   signIn: (() => Promise<void>) | undefined,
@@ -129,19 +122,16 @@ export async function withGoogleSignIn<T>(
   }
 }
 
-/** Human decisions supplied on re-entry. */
 export interface HumanDecisions {
   /** `--chat-configured`: the operator finished the Google Chat API configuration. */
   readonly chatConfigured: boolean;
   /** `--google-client-file`: the Desktop OAuth client the operator downloaded for the assistant's sign-in. */
   readonly googleClientFile?: string;
-  /** `--billing-account`: the billing account the operator chose to pay for the assistant's project. */
   readonly billingAccount?: string;
-  /** `--alias-added`, `--alias-taken`, `--alias <name>`: the operator's word on the web alias (KTD13). */
+  /** `--alias-added`, `--alias-taken`, `--alias <name>`: the operator's word on the web alias. */
   readonly alias?: AliasDecision;
 }
 
-/** The resume flag a billing-account choice is passed with. */
 export const BILLING_ACCOUNT_FLAG = '--billing-account';
 
 /**
@@ -157,7 +147,6 @@ export function decisionForChoice(resumeFlag: string | undefined, id: string): P
   }
 }
 
-/** Sign the assistant in to Google as its own account (KTD2). */
 export interface AssistantGoogleSignInRequest {
   readonly client: GoogleOAuthClient;
   /** The assistant's declared Workspace address. */
@@ -173,7 +162,6 @@ export function googleSignInPause({ account, resumeCommand }: AssistantGoogleSig
   ]);
 }
 
-/** What to do after a human pause: stop and report it, or run on with any decisions the person made. */
 export type PauseResponse =
   | { readonly kind: 'stop' }
   | { readonly kind: 'continue'; readonly decisions?: Partial<HumanDecisions> };
@@ -183,7 +171,6 @@ export interface ProviderCredentialRequest {
   readonly metadata: ProviderCredentialMetadata;
 }
 
-/** The engine's only way to obtain human input. */
 export interface Interaction {
   readonly decisions: HumanDecisions;
   requestProviderCredential(request: ProviderCredentialRequest): Promise<ProviderCredential>;
@@ -201,11 +188,10 @@ export interface Interaction {
    * `signal` aborts a wait, which then stops.
    */
   attendPause(pause: ProvisionHumanPause, signal: AbortSignal): Promise<PauseResponse>;
-  /** The same port, with the decisions made while attending a pause. */
   withDecisions(decisions: Partial<HumanDecisions>): Interaction;
 }
 
-/** What a person at the terminal can be asked. The driver supplies this only on a TTY. */
+/** Supplied by the driver only when a person can answer: on a TTY, without `--json` or `--no-input`. */
 export interface InteractivePrompts {
   providerCredential(providerId: string): Promise<ProviderCredential>;
   googleCloudSignIn(account?: string): Promise<void>;

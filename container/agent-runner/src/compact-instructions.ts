@@ -72,10 +72,10 @@ export function buildPostCompactionReminder(
 }
 
 /**
- * The compaction prompt's instructions. They name no product, audience or
- * tool beyond delivery, so the same text fits every agent, sealed sessions
- * included: "the people you serve" are whoever the agent's own instructions
- * say may direct it, so an outsider's words are never kept as a correction.
+ * Names no product, audience or tool beyond delivery, so the same text fits
+ * every agent, sealed sessions included: "the people you serve" are whoever
+ * the agent's own instructions say may direct it, so an outsider's words are
+ * never kept as a correction.
  */
 export function buildCompactInstructions(
   names: string[],

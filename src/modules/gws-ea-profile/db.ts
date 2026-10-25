@@ -29,12 +29,11 @@ export interface GwsEaProfile {
   readonly principal_last_name: string | null;
   readonly assistant_display_name: string | null;
   readonly assistant_workspace_email: string | null;
-  /** The assistant's configured web alias, one of its own addresses (KTD14), or null until one is recorded. */
+  /** The web alias the operator confirmed adding, one of the assistant's own addresses; null until confirmed. */
   readonly assistant_alias: string | null;
   readonly principal_display_name: string | null;
   readonly principal_timezone: string | null;
   readonly main_agent_group_id: string | null;
-  /** The agent group the host created for `external-email`, or null until it has. */
   readonly external_email_agent_group_id: string | null;
   readonly external_chat_agent_group_id: string | null;
   readonly browser_agent_group_id: string | null;
@@ -43,12 +42,6 @@ export interface GwsEaProfile {
   readonly principal_emails: readonly string[];
 }
 
-/**
- * Who a project document is written for (KTD14): `main` reads live pointers,
- * `external-email` gets nothing but names and its guidance, `browser` gives
- * the assistant's web alias to websites, and any other group what its
- * capabilities allow.
- */
 export type ProjectDocAudience = 'main' | 'external-email' | 'external-chat' | 'job' | 'browser' | 'other';
 
 export interface ReconcileGwsEaProfileInput {
@@ -98,15 +91,14 @@ export interface PublishedNameAndTimezone {
 }
 
 /**
- * The principal's addresses as every comparison with them reads them (R1,
- * R2): an address is theirs when it reaches one they listed
- * (`principalMatchKey`), and identity and bookkeeping use the spelling they
- * listed, never the one a message or a calendar wrote.
+ * The principal's addresses as every comparison with them reads them: an
+ * address is theirs when it reaches one they listed (`principalMatchKey`),
+ * and identity and bookkeeping use the spelling they listed, never the one a
+ * message or a calendar wrote.
  */
 export interface PrincipalRecognizer {
-  /** The listed spelling `address` reaches under R1, or undefined when it is none of the principal's. */
+  /** The listed spelling `address` reaches, or undefined when it is none of the principal's. */
   resolve(address: string | undefined): string | undefined;
-  /** Whether `address` reaches one of the principal's listed addresses under R1. */
   has(address: string | undefined): boolean;
   /** The listed addresses, sorted, as the profile holds them. */
   readonly listed: readonly string[];
@@ -132,7 +124,6 @@ function identifier(value: string, label: string): string {
   return value;
 }
 
-/** A principal address as the profile stores it (`normalizePrincipalEmail`); anything else is refused. */
 function principalEmail(value: string): string {
   const email = normalizePrincipalEmail(value);
   if (email === undefined) throw new Error(`Principal email address is invalid: ${JSON.stringify(value)}`);
@@ -141,7 +132,7 @@ function principalEmail(value: string): string {
 
 /**
  * The assistant and the principal are separate people, so no address is
- * both, and an address is listed in one spelling (R3).
+ * both, and an address is listed in one spelling.
  */
 function assertMayList(email: string, listed: readonly string[], assistant: readonly string[]): void {
   const conflict = principalAddressConflict(email, listed, assistant);
@@ -184,7 +175,6 @@ export async function listPrincipalAddresses(db: DbDriver = getDb()): Promise<Pr
   return db.all<PrincipalAddress>('SELECT email, added_at FROM gws_ea_principal_addresses ORDER BY email');
 }
 
-/** The addresses the profile holds, as listed and sorted. */
 async function heldAddresses(): Promise<string[]> {
   return (await listPrincipalAddresses()).map((address) => address.email);
 }
@@ -197,7 +187,7 @@ export function principalRecognizer(listed: readonly string[]): PrincipalRecogni
   return { resolve, has: (address) => resolve(address) !== undefined, listed: addresses };
 }
 
-/** The recognizer for the addresses the profile holds now; before its table exists, it recognizes no one. */
+/** Before the addresses table exists, it recognizes no one. */
 export async function loadPrincipalRecognizer(): Promise<PrincipalRecognizer> {
   if (!(await getDb().hasTable('gws_ea_principal_addresses'))) return principalRecognizer([]);
   return principalRecognizer(await heldAddresses());
@@ -213,16 +203,16 @@ export async function getMainAgentGroupId(): Promise<string | null> {
 
 /**
  * main's agent group as this host last read or named it, for code that must
- * answer synchronously, such as a container's environment at spawn (KTD2):
- * read as the host starts (`loadMainAgentGroupId`) and by any spawn that
- * comes first (`ensureMainAgentGroupIdLoaded`), and set when the profile
- * names main (`reconcileGwsEaProfile`), so a main named after the host
- * started is known on its next spawn. Undefined until this host reads it.
- * Main is never rebound, so it cannot go stale.
+ * answer synchronously, such as a container's environment at spawn: read as
+ * the host starts (`loadMainAgentGroupId`) and by any spawn that comes first
+ * (`ensureMainAgentGroupIdLoaded`), and set when the profile names main
+ * (`reconcileGwsEaProfile`), so a main named after the host started is known
+ * on its next spawn. Undefined until this host reads it. Main is never
+ * rebound, so it cannot go stale.
  */
 let knownMainAgentGroup: string | null | undefined;
 
-/** main's agent group as this host knows it, or null before the profile names one. */
+/** Null until this host has read or set a profile that names main. */
 export function knownMainAgentGroupId(): string | null {
   return knownMainAgentGroup ?? null;
 }
@@ -231,27 +221,18 @@ async function readMainAgentGroupId(): Promise<string | null> {
   return (await getDb().hasTable('gws_ea_profile')) ? getMainAgentGroupId() : null;
 }
 
-/** Read main's agent group from the profile into `knownMainAgentGroupId`, as the host starts. */
 export async function loadMainAgentGroupId(): Promise<void> {
   knownMainAgentGroup = await readMainAgentGroupId();
 }
 
-/**
- * Read main's agent group only if this host has not yet, as a spawn does
- * before its environment is composed. What the host's start read or the
- * profile named while this read ran stands.
- */
+/** What the host's start read or the profile named while this read ran stands over it. */
 export async function ensureMainAgentGroupIdLoaded(): Promise<void> {
   if (knownMainAgentGroup !== undefined) return;
   const read = await readMainAgentGroupId();
   knownMainAgentGroup ??= read;
 }
 
-/**
- * Refuse every caller but the host and the canonical main. A resource's
- * guard admits any agent whose CLI scope reaches it, so a resource that is
- * main's alone checks here; `resource` names it in the refusal.
- */
+/** A resource's guard admits any agent whose CLI scope reaches it, so a resource that is main's alone checks here. */
 export async function assertMainCaller(ctx: CallerContext, resource: string): Promise<void> {
   if (ctx.caller === 'host') return;
   const mainAgentGroupId = await getMainAgentGroupId();
@@ -260,7 +241,6 @@ export async function assertMainCaller(ctx: CallerContext, resource: string): Pr
   }
 }
 
-/** `external-email`'s agent group, or null until the host creates it. */
 export async function getExternalEmailAgentGroupId(): Promise<string | null> {
   const row = await getDb().get<{ external_email_agent_group_id: string | null }>(
     'SELECT external_email_agent_group_id FROM gws_ea_profile WHERE singleton = 1',
@@ -306,10 +286,6 @@ export async function setBrowserAgentGroupId(agentGroupId: string): Promise<void
   });
 }
 
-/**
- * Record the agent group the host created for `external-email`. Recording the
- * same group again changes nothing; the pointer never moves to another one.
- */
 export async function recordExternalEmailAgentGroupId(agentGroupId: string): Promise<void> {
   identifier(agentGroupId, 'external-email agent group ID');
   const db = getDb();
@@ -321,7 +297,6 @@ export async function recordExternalEmailAgentGroupId(agentGroupId: string): Pro
   });
 }
 
-/** Whom `agentGroupId`'s project document is written for. Without a profile every group is `other`. */
 export async function projectDocAudience(agentGroupId: string): Promise<ProjectDocAudience> {
   if (!(await getDb().hasTable('gws_ea_profile'))) return 'other';
   const row = await getDb().get<
@@ -371,10 +346,6 @@ export async function getGwsEaProfile(): Promise<GwsEaProfile> {
   };
 }
 
-/**
- * The addresses the profile names as the assistant's own (KTD14): its
- * Workspace email and, once configured, its web alias.
- */
 export function assistantOwnAddresses(
   profile: Pick<GwsEaProfile, 'assistant_workspace_email' | 'assistant_alias'> | undefined,
 ): string[] {
@@ -391,10 +362,9 @@ function emailIdentity(email: string): string {
 }
 
 /**
- * Hold `email` as one of the principal's addresses; holding it already
- * changes nothing. What is the principal's is no person's (KTD8), so a
- * person identity matching the address in any spelling leaves its record in
- * the same transaction. True when the address is new.
+ * What is the principal's is no person's, so a person identity matching the
+ * address in any spelling leaves its record, inside the caller's transaction.
+ * True when the address is new.
  */
 async function holdPrincipalAddress(email: string, addedAt: string): Promise<boolean> {
   const db = getDb();
@@ -408,11 +378,10 @@ async function holdPrincipalAddress(email: string, addedAt: string): Promise<boo
 }
 
 /**
- * Keep `main`'s members in step with the principal's addresses (KTD1): each
- * address's email identity is a member, so the principal's own email reaches
- * `main`, and an email identity no longer theirs is not. A member only, never
- * an owner or admin: no email identity holds a privilege. Safe to repeat;
- * nothing to do until `main` exists.
+ * The email identity of each of the principal's addresses is a member of
+ * `main`, so their own email reaches it, and one no longer theirs is not. A
+ * member only, never an owner or admin: no email identity holds a privilege.
+ * Safe to repeat.
  */
 export async function syncPrincipalMembers(): Promise<void> {
   const mainAgentGroupId = await getMainAgentGroupId();
@@ -432,11 +401,9 @@ export async function syncPrincipalMembers(): Promise<void> {
 }
 
 /**
- * Main's container runs in the principal's home timezone (KTD7), which the
- * profile holds: its container config's copy is derived here, whenever the
- * profile is reconciled or the principal changes it, so after either the two
- * agree. Written only when it differs, so a reconcile that changes nothing
- * leaves main's config as it was.
+ * Main's container runs in the principal's home timezone, which the profile
+ * holds; its container config's copy is derived here. Written only when it
+ * differs, so a reconcile that changes nothing leaves main's config as it was.
  */
 async function keepMainInPrincipalTimezone(mainAgentGroupId: string, timezone: string): Promise<void> {
   const config = await getContainerConfig(mainAgentGroupId);
@@ -446,11 +413,10 @@ async function keepMainInPrincipalTimezone(mainAgentGroupId: string, timezone: s
 }
 
 /**
- * The assistant's own agents, including its shared chat agent and live chat
- * jobs, are named by its display name (KTD1): each one's container config
- * copy is derived from the profile and job registry whenever
- * the profile is reconciled, so a rename reaches each on its next spawn.
- * Written only when it differs. Any other group keeps its own name.
+ * The assistant's own agents, the groups the profile names and its live job
+ * agents, carry its display name: each one's container config copy is
+ * derived here when the profile is reconciled, so a rename reaches each on
+ * its next spawn. Any other group keeps its own name.
  */
 async function keepAssistantAgentsNamed(name: string): Promise<void> {
   const row = await getDb().get<
@@ -497,7 +463,6 @@ export async function nameAssistantAgent(agentGroupId: string): Promise<void> {
   if (profile.assistant_display_name) await keepAssistantNamed(agentGroupId, profile.assistant_display_name);
 }
 
-/** The principal's structured name, display name and home timezone. */
 export async function principalNameAndTimezone(): Promise<PrincipalNameAndTimezone> {
   const profile = await getDb().get<
     Pick<GwsEaProfile, 'principal_first_name' | 'principal_last_name' | 'principal_timezone'>
@@ -514,7 +479,7 @@ export async function principalNameAndTimezone(): Promise<PrincipalNameAndTimezo
   };
 }
 
-/** Make the profile hold exactly `emails`, keeping when each one it already held was added. */
+/** Keeps `added_at` for each address the profile already held. */
 async function replacePrincipalAddresses(emails: readonly string[], addedAt: string): Promise<void> {
   const db = getDb();
   const wanted = new Set(emails);
@@ -576,10 +541,8 @@ export async function reconcileGwsEaProfile(input: ReconcileGwsEaProfileInput): 
 }
 
 /**
- * Change the principal's name, home timezone, or both, on the principal's
- * word (R16). The profile is their one source: main's container timezone is
- * derived from it in the same transaction. Shared name validation applies.
- * What the profile already holds is not written again. Returns the values before and after.
+ * The profile is the principal's one source: main's container timezone is
+ * derived from it in the same transaction.
  */
 export async function setPrincipalNameAndTimezone(change: {
   readonly firstName?: string;
@@ -641,7 +604,6 @@ async function assistantWorkspaceEmail(): Promise<string | null> {
   return profile?.assistant_workspace_email ?? null;
 }
 
-/** The assistant's own addresses as the profile holds them now (`assistantOwnAddresses`). */
 async function heldAssistantAddresses(): Promise<string[]> {
   return assistantOwnAddresses(
     await getDb().get<Pick<GwsEaProfile, 'assistant_workspace_email' | 'assistant_alias'>>(
@@ -665,14 +627,10 @@ export async function proposedPrincipalAddress(
 }
 
 // ---------------------------------------------------------------------------
-// The web alias (KTD13)
+// The web alias
 // ---------------------------------------------------------------------------
 
-/**
- * The assistant's web alias as its setup stands: the alias once a probe
- * verified it, and until then the address the operator was asked to add and
- * the Message-ID of the latest probe sent to it.
- */
+/** `alias` once the operator confirms adding it; until then `candidate`, the address they were asked to add. */
 export interface AliasSetup {
   readonly alias: string | null;
   readonly candidate: string | null;
@@ -688,7 +646,7 @@ export async function getAliasSetup(): Promise<AliasSetup> {
   return row;
 }
 
-/** Propose the address the operator must add. A recorded alias cannot be replaced here. */
+/** Null withdraws the candidate; a recorded alias is never replaced. */
 export async function proposeAliasCandidate(address: string | null): Promise<AliasSetup> {
   const candidate = address === null ? null : normalizePrincipalEmail(address);
   if (candidate === undefined) throw new Error(`The web alias is not an email address: ${JSON.stringify(address)}`);
@@ -715,7 +673,11 @@ export async function proposeAliasCandidate(address: string | null): Promise<Ali
   });
 }
 
-/** Record the operator's confirmation of exactly the current candidate, rechecking address conflicts. */
+/**
+ * True when `address` is recorded as the alias, now or before; false when it
+ * is no longer the candidate. Re-runs the proposal's checks first: the
+ * principal's addresses or the assistant's own may have changed since.
+ */
 export async function confirmAliasCandidate(address: string): Promise<boolean> {
   const candidate = normalizePrincipalEmail(address);
   if (candidate === undefined) throw new Error('The web alias is not an email address');
@@ -736,7 +698,6 @@ export async function confirmAliasCandidate(address: string): Promise<boolean> {
   });
 }
 
-/** A verified principal identity and its direct message with the assistant. */
 export interface PrincipalContact {
   readonly userId: string;
   readonly directMessage: MessagingGroup;
@@ -763,10 +724,11 @@ export async function recordPrincipalDmActivity(
 }
 
 /**
- * Where the principal last wrote a marked DM. An unavailable WhatsApp link
- * falls back to Google Chat; a changed phone remains unavailable until a new
- * binding. A channel can be pinned by a host notice. Detached conversations
- * remain a last resort for notes; senders check detached_at before delivery.
+ * Where the principal last wrote a marked DM. A WhatsApp DM counts only while
+ * the link is connected and bound to that identity, so an unavailable link
+ * falls back to their next DM and a changed phone stays unavailable until a
+ * new binding. `channelType` pins one channel. Detached conversations remain
+ * a last resort for notes; senders check detached_at before delivery.
  */
 export async function principalContact(channelType?: string): Promise<PrincipalContact | undefined> {
   const db = getDb();
@@ -807,8 +769,9 @@ export async function principalContact(channelType?: string): Promise<PrincipalC
 /**
  * The verified principal user who confirms a change on a card: the one
  * `principalContact` names, while the card can reach their direct message.
- * Undefined until a principal is bound, or while every direct message of
- * theirs is detached.
+ * Undefined until a principal is bound, while every direct message of theirs
+ * it may use is detached, or while their only direct messages are on a
+ * WhatsApp link that is down or whose bound phone changed.
  */
 export async function principalApproverUserId(): Promise<string | undefined> {
   const contact = await principalContact();

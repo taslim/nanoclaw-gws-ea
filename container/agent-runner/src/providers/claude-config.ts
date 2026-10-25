@@ -106,18 +106,16 @@ export const BASE_BUILTIN_TOOLS: readonly string[] = [
   'ToolSearch',
 ];
 
-/** The key that grants MCP servers other than NanoClaw's own: configured, plugin, and claude.ai connectors. */
+/** Grants MCP servers other than NanoClaw's own: configured, plugin, and claude.ai connectors. */
 export const MCP_SERVERS_CAPABILITY = 'mcp-servers';
 
-/** NanoClaw's own tool server, which serves only the tool modules the group holds. */
+/** Always reachable: it serves only the tool modules the group holds. */
 export const NANOCLAW_MCP_SERVER = 'nanoclaw';
 
 /**
- * What a group's capabilities allow of Claude's own surfaces.
- *
  * `tools` is undefined when every built-in key is held: the SDK then offers
- * its full default set, exactly as before capabilities existed. Otherwise it
- * is the explicit allowlist, and a built-in no held key names is never offered.
+ * its full default set. Otherwise it is the explicit allowlist, and a built-in
+ * no held key names is never offered.
  */
 export interface ClaudeCapabilityPolicy {
   tools?: readonly string[];
@@ -146,18 +144,15 @@ export function resolveClaudeCapabilityPolicy(grants: ReadonlySet<string>): Clau
   };
 }
 
-/** Whether a policy lets the agent call a built-in (non-MCP) tool. */
 export function allowsBuiltinTool(policy: ClaudeCapabilityPolicy, toolName: string): boolean {
   if (policy.withheldTools.includes(toolName)) return false;
   return policy.tools === undefined || policy.tools.includes(toolName);
 }
 
-/** Whether a policy lets the agent call an `mcp__<server>__<tool>` tool. */
 export function allowsMcpTool(policy: ClaudeCapabilityPolicy, toolName: string): boolean {
   return policy.externalMcpServers || toolName.startsWith(`mcp__${NANOCLAW_MCP_SERVER}__`);
 }
 
-/** The tool-shaping query options a policy produces. */
 export interface ClaudeToolOptions {
   tools?: string[];
   allowedTools: string[];
@@ -169,10 +164,10 @@ export interface ClaudeToolOptions {
 }
 
 /**
- * Shape the SDK query's tool options to a policy. A policy that withholds
- * nothing returns today's options unchanged. Without `mcp-servers` only
- * NanoClaw's own server is passed, MCP config files are ignored, and claude.ai
- * connectors are switched off, so no other server's command ever starts.
+ * A policy that withholds nothing, MCP servers included, changes no option.
+ * Without `mcp-servers` only NanoClaw's own server is passed, MCP config files
+ * are ignored, and claude.ai connectors are switched off, so no other server's
+ * command ever starts.
  */
 export function resolveClaudeToolOptions(
   policy: ClaudeCapabilityPolicy,
@@ -206,7 +201,6 @@ export function mcpAllowPattern(serverName: string): string {
 /** Claude Code's built-in plugin for authoring mods to its own interface, which a headless agent has no use for. */
 export const BUILTIN_PLUGIN_AUTHORING = 'plugin-authoring@builtin';
 
-/** The flag-level settings every Claude agent runs under. */
 export interface ClaudePolicySettings {
   syncClaudeAiSkills: false;
   syncClaudeAiPlugins: false;

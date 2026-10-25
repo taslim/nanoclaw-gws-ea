@@ -3,9 +3,8 @@
  * step render from this map instead of hardcoding provider names in the setup
  * flow (same capability-not-name rule as the host provider-container registry).
  *
- * `claude` is the built-in default: normal setup uses its standard auth step,
- * while product provisioning calls the same credential collector through the
- * `provisioning` capability. Every provider adds
+ * `claude` is the built-in default: setup runs the standard auth step for it,
+ * and gws-ea collects its credential through `provisioning`. Every provider adds
  * itself by shipping a `setup/providers/<name>.ts` with a top-level
  * `registerSetupProvider(...)` call and appending one import line to the
  * `setup/providers/index.ts` barrel — the same shape as the host and container
@@ -47,7 +46,7 @@ export interface SetupProviderEntry {
   hint: string;
   /** Provider-owned auth walk-through (vault-only). Absent → standard auth step. */
   runAuth?: () => Promise<void>;
-  /** Provider-owned credential flow reusable by an isolated product vault. */
+  /** How gws-ea collects this provider's credential for an assistant's own vault; absent, gws-ea cannot offer it. */
   provisioning?: SetupProviderProvisioning;
   /** Verifies the provider's payload is wired (files, barrels, Dockerfile pin). */
   runInstallCheck?: () => Promise<void>;

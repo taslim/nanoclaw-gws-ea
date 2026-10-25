@@ -730,7 +730,7 @@ describe('conversation-context capability', () => {
     expect(readEchoRows('s-dm-t2')).toHaveLength(1);
   });
 
-  // R20: a group without conversation-context keeps each thread's session
+  // A group without conversation-context keeps each thread's session
   // sealed — nothing said or sent in one ever lands in a sibling's.
   it('fans neither inbound nor delivered content into a sibling thread without it', async () => {
     await updateContainerConfigJson(AG, 'capabilities', ['reply']);

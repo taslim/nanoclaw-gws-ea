@@ -7,15 +7,14 @@ import { getBrowserAgentGroupId } from '../gws-ea-profile/db.js';
 import { registerGuidance } from '../gws-ea-profile/guidance.js';
 import { hasBrowserAccess, isMainAgentGroup } from './access.js';
 
-/** Whether a group may delegate to the browser, whether or not the operator has it enabled now (KTD15). */
+/** Whether a group may delegate to the browser, whether or not the operator has it enabled now. */
 async function delegates(agentGroupId: string): Promise<boolean> {
   return (await getDb().hasTable('gws_ea_profile')) && hasBrowserAccess(agentGroupId);
 }
 
 /**
- * The delegate tools reach exactly the groups the browser access setting
- * names, so enablement changes need no container restart; every request is
- * still checked by the host.
+ * The delegate tools reach exactly the groups the browser access setting grants, so enabling or disabling the
+ * browser needs no container restart; the host still checks every request.
  */
 export const BROWSER_DELEGATE_CAPABILITY = 'browser-delegate';
 registerCapability(BROWSER_DELEGATE_CAPABILITY, {
@@ -26,7 +25,7 @@ registerCapability(BROWSER_DELEGATE_CAPABILITY, {
 
 /**
  * Main records the purchases of a group whose browser access was removed (purchase-outcome.ts), so the tool
- * reaches main and every delegator, whatever the setting lists (KTD16); the host checks each recording's errand.
+ * reaches every delegator and main, whatever the setting lists; the host checks each recording's errand.
  */
 export const PURCHASE_OUTCOME_CAPABILITY = 'browser-purchase-outcome';
 registerCapability(PURCHASE_OUTCOME_CAPABILITY, {

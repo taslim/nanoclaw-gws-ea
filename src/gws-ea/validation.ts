@@ -9,7 +9,6 @@ import path from 'node:path';
 
 import { GwsEaError } from './types.js';
 
-/** An email address: a local part, `@`, and a dotted domain, with no whitespace. */
 export const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/u;
 
 /** An instance ID: a lowercase v4 UUID. */
@@ -44,9 +43,9 @@ const GMAIL_DOMAINS = new Set(['gmail.com', 'googlemail.com']);
 /**
  * One identity in every spelling that reaches the same mailbox: an email
  * handle lowercased, without its `+tag`, and, at Gmail, without the dots
- * Gmail ignores. Other handles are already canonical. Used only to widen a
- * protection (a fingerprint, a refusal), never to grant a level to a
- * different handle; who the principal is goes by `principalMatchKey`.
+ * Gmail ignores. Other handles are already canonical. It never grants a
+ * level to a different handle; who the principal is goes by
+ * `principalMatchKey`.
  */
 export function identityMatchKey(handle: string): string {
   if (!handle.toLowerCase().startsWith('email:')) return handle;
@@ -70,7 +69,7 @@ const FOLDABLE = /^[\x21-\x7e]+$/u;
 
 /**
  * A principal address's key under the one rule every comparison with the
- * principal's addresses uses (R1): at gmail.com and googlemail.com, which
+ * principal's addresses uses: at gmail.com and googlemail.com, which
  * Gmail delivers alike, lowercased, without its `+tag` or the dots Gmail
  * ignores; at any other domain, lowercased only, so the principal lists each
  * spelling they use there. Only those two domains exactly count, never a
@@ -90,11 +89,6 @@ export function principalMatchKey(address: string): string {
   return `${local.replaceAll('.', '') || local}@gmail.com`;
 }
 
-/**
- * The spelling in `listed` that `address` reaches under R1
- * (`principalMatchKey`), the one written exactly when it is listed;
- * undefined when it reaches none of them.
- */
 export function resolvePrincipalAddress(address: string, listed: readonly string[]): string | undefined {
   if (listed.includes(address)) return address;
   const key = principalMatchKey(address);
@@ -103,11 +97,10 @@ export function resolvePrincipalAddress(address: string, listed: readonly string
 
 /**
  * Why `email` cannot be one of the principal's addresses beside `listed`, or
- * undefined when it can (R3): it is one of the `assistant`'s own addresses
- * (its Workspace email and, once configured, its web alias) in any spelling
- * that reaches the assistant's mailbox (`identityMatchKey`, which widens a
- * refusal), or another spelling of a listed address under R1. The same
- * spelling again is no conflict.
+ * undefined when it can: it is one of the `assistant`'s own addresses in any
+ * spelling that reaches the assistant's mailbox, or another spelling of a
+ * listed address under `principalMatchKey`. The same spelling again is no
+ * conflict.
  */
 export function principalAddressConflict(
   email: string,
@@ -124,7 +117,6 @@ export function principalAddressConflict(
     : `${email} is another spelling of ${match}, already one of the principal's addresses`;
 }
 
-/** The first conflict (`principalAddressConflict`) in a list of addresses, each judged against those before it. */
 export function principalAddressesConflict(
   emails: readonly string[],
   assistant: readonly string[],
@@ -136,7 +128,6 @@ export function principalAddressesConflict(
   return undefined;
 }
 
-/** `value` trimmed, refused unless it is one line of 1 to `maxLength` characters; `label` names it in the refusal. */
 export function parseLine(value: string, label: string, maxLength: number): string {
   const text = value.trim();
   if (!text || text.length > maxLength || hasControlCharacters(text)) {
@@ -150,7 +141,6 @@ export function parseOptionalLine(value: string, label: string, maxLength: numbe
   return value.trim() === '' ? null : parseLine(value, label, maxLength);
 }
 
-/** Parse JSON text; malformed text raises `code`. */
 export function parseJson(source: string, label: string, code: string): unknown {
   try {
     return JSON.parse(source) as unknown;
@@ -169,7 +159,6 @@ export function requireRecord(value: unknown, label: string, code: string): Reco
   return value;
 }
 
-/** A non-empty, bounded string without control characters. */
 export function requireString(value: unknown, label: string, code: string, maxLength = 2_048): string {
   if (typeof value !== 'string' || value.length === 0 || value.length > maxLength || hasControlCharacters(value)) {
     throw new GwsEaError(code, `${label} is invalid`);
@@ -177,7 +166,6 @@ export function requireString(value: unknown, label: string, code: string, maxLe
   return value;
 }
 
-/** `record[key]` as a required string, named `<label> <key>` when invalid. */
 export function stringField(record: Record<string, unknown>, key: string, label: string, code: string): string {
   return requireString(record[key], `${label} ${key}`, code);
 }
@@ -186,21 +174,18 @@ export function optionalString(value: unknown): string | undefined {
   return typeof value === 'string' ? value : undefined;
 }
 
-/** `value` when it is a timestamp exactly as `Date#toISOString` writes it (ISO-8601 UTC), else undefined. */
 export function canonicalTimestamp(value: unknown): string | undefined {
   if (typeof value !== 'string') return undefined;
   const parsed = new Date(value);
   return Number.isFinite(parsed.getTime()) && parsed.toISOString() === value ? value : undefined;
 }
 
-/** A canonical timestamp (see `canonicalTimestamp`); anything else raises `code` with `message`. */
 export function requireCanonicalTimestamp(value: unknown, code: string, message: string): string {
   const timestamp = canonicalTimestamp(value);
   if (timestamp === undefined) throw new GwsEaError(code, message);
   return timestamp;
 }
 
-/** An absolute, normalized path. */
 export function requirePath(value: unknown, label: string, code: string): string {
   const result = requireString(value, label, code);
   if (!path.isAbsolute(result) || path.resolve(result) !== result) {
@@ -209,13 +194,11 @@ export function requirePath(value: unknown, label: string, code: string): string
   return result;
 }
 
-/** The socket path of a local `unix://` Docker endpoint, or undefined for any other endpoint. */
 export function unixSocketPath(endpoint: string): string | undefined {
   const socket = endpoint.startsWith('unix://') ? endpoint.slice('unix://'.length) : undefined;
   return socket && path.isAbsolute(socket) && !hasControlCharacters(socket) ? socket : undefined;
 }
 
-/** A recorded Docker endpoint: a local `unix://` socket. */
 export function requireDockerEndpoint(value: unknown, label: string, code: string): string {
   const endpoint = requireString(value, label, code);
   if (!unixSocketPath(endpoint)) throw new GwsEaError(code, `${label} must be a local unix:// socket`);

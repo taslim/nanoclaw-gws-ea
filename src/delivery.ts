@@ -128,7 +128,7 @@ const inflightChannelDeliveries = new Map<string, { readonly done: Promise<void>
 /** How long a stop waits for delivery passes under way, so one is not cut between a send and its record. */
 const STOP_WAIT_MS = 10_000;
 
-/** Wait only for a channel send already entered, through its mailbox receipt; queued guards and host actions do not block closure. */
+/** Waits only for a channel send already entered, up to STOP_WAIT_MS; queued guards and host actions do not block. */
 export async function waitForSessionChannelDelivery(sessionId: string): Promise<void> {
   const inflight = inflightChannelDeliveries.get(sessionId);
   if (!inflight) return;
@@ -243,7 +243,6 @@ export class OutboundRefusedError extends Error {
 const outboundGuards = new Map<string, OutboundGuard>();
 const OUTBOUND_GUARD_ID = /^[a-z0-9][a-z0-9._-]*:[a-z0-9][a-z0-9._-]*$/u;
 
-/** Register a check every outbound send must pass. IDs take the `module:name` form. */
 export function registerOutboundGuard(id: string, guard: OutboundGuard): void {
   if (!OUTBOUND_GUARD_ID.test(id)) throw new Error(`Invalid outbound guard ID: ${id}`);
   if (outboundGuards.has(id)) throw new Error(`Outbound guard already registered: ${id}`);
@@ -605,12 +604,12 @@ async function drainSession(session: Session): Promise<void> {
 }
 
 /**
- * Close a row a guard refused. It is recorded as not delivered (the
- * mailbox's terminal `failed` status), so it is never retried, and the agent
- * that wrote it is told why. Nothing else follows: no cross-session copy and
- * no post-delivery or delivery-failed hook, because nothing was sent and
- * nothing failed. A row that cannot be recorded stays queued; the guard
- * judges it again on the next poll, and the agent is told then.
+ * Recorded as not delivered (the mailbox's terminal `failed` status), so it
+ * is never retried, and the agent that wrote it is told why. Nothing else
+ * follows: no cross-session copy and no post-delivery or delivery-failed
+ * hook, because nothing was sent and nothing failed. A row that cannot be
+ * recorded stays queued; the guard judges it again on the next poll, and the
+ * agent is told then.
  */
 async function closeRefused(
   msg: OutboundMessage,
@@ -786,11 +785,10 @@ async function deliverMessage(
 
   // The agent names its own question, and an answer resolves by that id
   // alone: getAskQuestionRender reads a pending question before any approval,
-  // so a question carrying an open request's id (an approval, a channel or
-  // sender approval, another question) would let a plain "yes" to it decide
-  // that request. Refused before anything is stored or posted. The one taken
-  // id it may carry is its own — the pending question this same row stored
-  // on an earlier attempt whose send then failed.
+  // so a question carrying any open request's id would let a plain "yes" to
+  // it decide that request. Refused before anything is stored or posted. The
+  // one taken id it may carry is its own — the pending question this same row
+  // stored on an earlier attempt whose send then failed.
   if (content.type === 'ask_question' && content.questionId) {
     const questionId = content.questionId as string;
     if (await getAskQuestionRender(questionId)) {

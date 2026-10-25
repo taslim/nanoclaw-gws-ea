@@ -532,7 +532,7 @@ describe('a rollback closed for fix-forward with follow-ups left', GIT_HEAVY, ()
   });
 });
 
-describe('a person forgotten after the snapshot (KTD8)', GIT_HEAVY, () => {
+describe('a person forgotten after the snapshot', GIT_HEAVY, () => {
   it('is handed to the host to forget again when a rollback restores a snapshot from before the forget', async () => {
     const { host, runtime, next, state } = await updatedAssistant();
     // Forgotten after the snapshot, on the new release.

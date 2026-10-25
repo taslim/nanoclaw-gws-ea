@@ -1,9 +1,7 @@
 /**
- * Reading Chat's events (KTD1, KTD2). The subscription is name-only, so each
- * event carries only resource names; the host reads what they name as the
- * assistant, over Chat's REST API: the message, or the reaction among its
- * message's reactions, and the space the message is in. A batch event is
- * read as its parts.
+ * Reading Chat's events. The subscription is name-only, so each event carries
+ * only resource names; the host reads what they name as the assistant, over
+ * Chat's REST API.
  *
  * Under user authentication Chat names a person only by resource name and
  * type, so people's display names come from the People API with the host's
@@ -25,43 +23,38 @@ import { CHAT_MESSAGE_CREATED, CHAT_REACTION_CREATED } from './subscription.js';
 
 /** Several messages Google publishes as one event; the subscription receives them without asking. */
 export const CHAT_MESSAGE_BATCH_CREATED = 'google.workspace.chat.message.v1.batchCreated';
-/** Several reactions Google publishes as one event. */
 export const CHAT_REACTION_BATCH_CREATED = 'google.workspace.chat.reaction.v1.batchCreated';
-/** A one-to-one conversation's space type. */
 export const DIRECT_MESSAGE = 'DIRECT_MESSAGE';
 
 const CHAT = 'https://chat.googleapis.com/v1';
 const PEOPLE = 'https://people.googleapis.com/v1';
-/** How long a space's type and a person's name are kept. */
 const KEEP_MS = 60 * 60_000;
 /** The most reactions Chat lists in one page. */
 const REACTION_PAGE_SIZE = 200;
 
-/** One message or reaction an event names. */
 export interface ChatEventPart {
   readonly kind: 'message' | 'reaction';
   readonly name: string;
 }
 
-/** A space's name and its type: `DIRECT_MESSAGE`, `GROUP_CHAT`, or `SPACE`. */
+/** `type` is `DIRECT_MESSAGE`, `GROUP_CHAT`, or `SPACE`. */
 export interface ChatSpace {
   readonly name: string;
   readonly type: string;
 }
 
-/** The message a Chat message quotes, as Google describes it. */
 export interface QuotedMessageMetadata {
   readonly name: string;
   readonly quoteType?: string;
   readonly quotedMessageSnapshot?: { readonly sender?: string; readonly text?: string };
 }
 
-/** A message as the assistant reads it: the SDK's shape, with the message it quotes. */
+/** The SDK's message shape, plus the quote its type lacks. */
 export interface ChatMessage extends GoogleChatMessage {
   quotedMessageMetadata?: QuotedMessageMetadata;
 }
 
-/** A reaction as the assistant reads it, its emoji as Chat shows it. */
+/** `emoji` is the unicode character, or a custom emoji's name. */
 export interface ChatReaction {
   readonly name: string;
   readonly user: { readonly name: string; readonly type: string };
@@ -69,30 +62,26 @@ export interface ChatReaction {
 }
 
 export interface ChatHydrator {
-  /** The message; undefined when it is gone. */
+  /** Undefined when it is gone or unreadable. */
   message(name: string): Promise<ChatMessage | undefined>;
-  /** The space; undefined when it is gone. */
+  /** Undefined when it is gone or unreadable. */
   space(name: string): Promise<ChatSpace | undefined>;
-  /** The reaction, found among its message's; undefined when it or its message is gone. */
+  /** Found among its message's reactions; undefined when it or its message is gone. */
   reaction(name: string): Promise<ChatReaction | undefined>;
-  /** The person's display name; their user id when the assistant can see no profile for them. */
+  /** Falls back to the user id when no profile name can be read. */
   displayName(userId: string): Promise<string>;
 }
 
 export interface ChatHydratorOptions {
-  /** The assistant's Chat token. */
   readonly chatToken: () => Promise<string>;
-  /** The host's directory token, for people's names. */
   readonly directoryToken: () => Promise<string>;
   readonly fetch?: typeof globalThis.fetch;
 }
 
-/** The space a message is in: `spaces/{space}` of `spaces/{space}/messages/{message}`. */
 export function spaceOfMessage(name: string): string | undefined {
   return /^(spaces\/[^/]+)\/messages\/[^/]+$/u.exec(name)?.[1];
 }
 
-/** The message a reaction is on: `spaces/{space}/messages/{message}` of its reaction's name. */
 export function messageOfReaction(name: string): string | undefined {
   return /^(spaces\/[^/]+\/messages\/[^/]+)\/reactions\/[^/]+$/u.exec(name)?.[1];
 }
@@ -107,7 +96,7 @@ function batch(kind: ChatEventPart['kind'], entries: unknown): ChatEventPart[] {
     : [];
 }
 
-/** The messages and reactions an event names, in Google's order; none for an event the channel does not handle. */
+/** In Google's order; empty for an event type the channel does not handle. */
 export function chatEventParts(event: WorkspaceEvent): ChatEventPart[] {
   switch (event.type) {
     case CHAT_MESSAGE_CREATED:
@@ -188,7 +177,7 @@ function toQuote(value: unknown): QuotedMessageMetadata | undefined {
   };
 }
 
-/** A message, or undefined when Google returned one without what every message has. */
+/** Undefined when Google's answer lacks what every message has. */
 function toMessage(value: unknown): ChatMessage | undefined {
   if (!isRecord(value) || typeof value.name !== 'string' || typeof value.createTime !== 'string') return undefined;
   const sender = isRecord(value.sender) ? value.sender : undefined;
@@ -231,14 +220,12 @@ function toReaction(value: Record<string, unknown>): ChatReaction | undefined {
   };
 }
 
-/** A person's primary name, else their first. */
 function personName(value: unknown): string | undefined {
   const names = isRecord(value) ? records(value.names) : [];
   const primary = names.find((entry) => isRecord(entry.metadata) && entry.metadata.primary === true);
   return [primary, ...names].map((entry) => text(entry?.displayName)?.trim()).find((name) => !!name);
 }
 
-/** Undefined for a resource that is gone: Google has no such thing, or no longer lets the assistant read it. */
 async function unlessGone(read: () => Promise<unknown>): Promise<unknown> {
   try {
     return await read();

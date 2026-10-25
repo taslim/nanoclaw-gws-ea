@@ -1,8 +1,8 @@
 /**
  * The Workspace Events subscription that sends the assistant's Chat events to
- * its topic (KTD2), kept by the host for its whole life with the assistant's
- * own Chat token. One name-only subscription covers every space the
- * assistant is in (`//chat.googleapis.com/spaces/-`) and lives 7 days.
+ * its topic, kept by the host for its whole life with the assistant's own
+ * Chat token. One name-only subscription covers every space the assistant is
+ * in (`//chat.googleapis.com/spaces/-`) and lives 7 days.
  *
  * On start the host lists the subscriptions for that target and adopts the
  * one it finds, since Google allows one per user, OAuth client, and target.
@@ -28,14 +28,13 @@ import type { WorkspaceEvent } from './pubsub-pull.js';
 
 const WORKSPACE_EVENTS = 'https://workspaceevents.googleapis.com/v1';
 
-/** Every Chat space the assistant is a member of. */
 export const CHAT_SUBSCRIPTION_TARGET = '//chat.googleapis.com/spaces/-';
 export const CHAT_MESSAGE_CREATED = 'google.workspace.chat.message.v1.created';
 export const CHAT_REACTION_CREATED = 'google.workspace.chat.reaction.v1.created';
 export const CHAT_MEMBERSHIP_CREATED = 'google.workspace.chat.membership.v1.created';
 export const CHAT_MEMBERSHIP_UPDATED = 'google.workspace.chat.membership.v1.updated';
 export const CHAT_MEMBERSHIP_DELETED = 'google.workspace.chat.membership.v1.deleted';
-/** The events subscribed to. Their batch variants arrive without asking; reaction deletions are not wanted. */
+/** Their batch variants arrive without asking; reaction deletions are not wanted. */
 export const CHAT_EVENT_TYPES: readonly string[] = [
   CHAT_MESSAGE_CREATED,
   CHAT_REACTION_CREATED,
@@ -53,11 +52,8 @@ const HOUR_MS = 60 * 60_000;
 const DAY_MS = 24 * HOUR_MS;
 /** A name-only subscription's longest life. */
 const SUBSCRIPTION_LIFETIME_MS = 7 * DAY_MS;
-/** How long after a renewal the next is due. */
 const RENEW_AFTER_MS = DAY_MS;
-/** The longest the supervisor waits before looking at the clock again. */
 const CHECK_INTERVAL_MS = HOUR_MS;
-/** The wait after a failed attempt, doubling with each failure in a row up to an hour. */
 const RETRY_BASE_MS = 60_000;
 const RETRY_MAX_MS = HOUR_MS;
 const OPERATION_POLL_MS = 1_000;
@@ -65,19 +61,16 @@ const OPERATION_MAX_POLLS = 60;
 
 const LIST_FILTER = `(${CHAT_EVENT_TYPES.map((type) => `event_types:"${type}"`).join(' OR ')}) AND target_resource="${CHAT_SUBSCRIPTION_TARGET}"`;
 
-/** Whether an event is about a subscription's life, not about Chat. */
 export function isSubscriptionLifecycleEvent(event: WorkspaceEvent): boolean {
   return event.type.startsWith(LIFECYCLE_PREFIX);
 }
 
-/** A subscription, as far as the host reads it. */
 export interface WorkspaceSubscription {
   /** `subscriptions/{id}`. */
   readonly name: string;
   /** `ACTIVE`, `SUSPENDED`, or `DELETED`. */
   readonly state: string;
   readonly eventTypes: readonly string[];
-  /** The Pub/Sub topic it delivers to. */
   readonly topic: string | undefined;
   readonly expireTime: string | undefined;
   readonly suspensionReason: string | undefined;
@@ -144,9 +137,8 @@ function toOperation(value: unknown): Operation {
 }
 
 /**
- * The assistant's Workspace Events calls, which removal also makes once the
- * host is stopped (KTD13). Each change is a long-running operation, waited
- * for here.
+ * Also used by removal once the host is stopped (remove.ts). Each change is a
+ * long-running operation, waited for here.
  */
 export function createWorkspaceEventsApi(client: GoogleClientOptions) {
   async function finish(started: unknown, what: string): Promise<unknown> {
@@ -216,7 +208,7 @@ function expired(subscription: WorkspaceSubscription): boolean {
   return subscription.state === 'DELETED' || (!Number.isNaN(expires) && expires <= Date.now());
 }
 
-/** When the next renewal is due: a day after the last, which left it its whole life. */
+/** A day after the last renewal, which set its expiry a whole lifetime ahead. */
 function renewalDue(subscription: WorkspaceSubscription): number {
   const expires = Date.parse(subscription.expireTime ?? '');
   if (Number.isNaN(expires)) return Date.now() + RENEW_AFTER_MS;
@@ -236,25 +228,22 @@ function suspensionReason(data: Readonly<Record<string, unknown>>): string | nul
 export interface SubscriptionSupervisorOptions {
   /** `projects/{project}/topics/{topic}`: where the subscription must deliver. */
   readonly topic: string;
-  /** A live token for the assistant's own Chat access. */
   readonly token: () => Promise<string>;
   readonly health: ChatHealthRecorder;
   readonly fetch?: typeof globalThis.fetch;
 }
 
 export interface SubscriptionSupervisor {
-  /** Act on a lifecycle event Google sent about the adopted subscription; others are ignored. */
+  /** Events about any subscription but the adopted one are ignored. */
   handleLifecycleEvent(event: WorkspaceEvent): Promise<void>;
   stop(): Promise<void>;
 }
 
-/** Adopt or create the subscription now, and keep it for as long as the supervisor runs. */
 export function startSubscriptionSupervisor(options: SubscriptionSupervisorOptions): SubscriptionSupervisor {
   const api = createWorkspaceEventsApi({
     token: options.token,
     ...(options.fetch === undefined ? {} : { fetch: options.fetch }),
   });
-  /** The adopted subscription's name. */
   let adopted: string | undefined;
   let nextRunAt = Date.now();
   let failures = 0;

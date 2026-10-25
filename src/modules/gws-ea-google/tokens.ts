@@ -1,6 +1,5 @@
 /**
- * Access tokens minted from the assistant's grant (KTD1, KTD2, KTD6): one per
- * host-only service, and one per agent credential, each limited to exactly
+ * Access tokens minted from the assistant's grant, each limited to exactly
  * the scopes it wants that the grant holds. A token Google does not narrow
  * is refused rather than used: the inbox-modifying Gmail scope, in
  * particular, must stay out of every agent's reach.
@@ -20,7 +19,6 @@ import {
 
 export const GOOGLE_TOKEN_ENDPOINT = 'https://oauth2.googleapis.com/token';
 
-/** Renew a token this long before Google expires it. */
 export const RENEW_BEFORE_EXPIRY_MS = 15 * 60_000;
 
 /** Google refused the refresh token itself: the sign-in was revoked or expired, and only a new one helps. */
@@ -28,7 +26,6 @@ export class GoogleGrantRevokedError extends Error {
   readonly code = 'google_grant_revoked';
 }
 
-/** The host holds no Google sign-in for the assistant: only the operator's sign-in gives it one. */
 export class GoogleNotSignedInError extends Error {
   readonly code = 'google_not_signed_in';
 }
@@ -74,8 +71,8 @@ export interface TokenOptions {
 }
 
 /**
- * Exchange the refresh token of the consent that granted `scopes` for an
- * access token limited to exactly them; `label` names it in errors.
+ * Only the refresh token of a consent that granted every one of `scopes` mints
+ * them; `label` names the token in errors.
  */
 async function mintToken(
   grant: GoogleGrant,
@@ -137,10 +134,6 @@ async function mintToken(
   return { accessToken: payload.access_token, expiresAt: now() + payload.expires_in * 1_000, scopes: minted };
 }
 
-/**
- * A token for one service, limited to exactly the scopes of its that the
- * grant holds. When it holds none, Google is not asked.
- */
 export async function mintServiceToken(
   grant: GoogleGrant,
   service: GoogleServiceId,
@@ -153,9 +146,7 @@ export async function mintServiceToken(
 
 /** Why a credential's token carries its first service's scopes alone. */
 export interface CredentialFallback {
-  /** The scopes Google refused. */
   readonly refused: readonly string[];
-  /** Google's reason for refusing them. */
   readonly reason: string;
 }
 
@@ -169,12 +160,11 @@ export interface CredentialTokenOptions extends TokenOptions {
 }
 
 /**
- * The token an agent credential publishes (KTD1): its scopes the grant
- * holds, or undefined when it holds none. When Google gives a final refusal
- * for a credential serving more than one service, the token carries its
- * first service's scopes alone, so Calendar keeps working when Google
- * refuses Drive. A revoked grant and a failure worth retrying are thrown as
- * they are: a brief outage never cuts a service off.
+ * Undefined when the grant holds none of the credential's scopes. When Google
+ * gives a final refusal for a credential serving more than one service, the
+ * token carries its first service's scopes alone, so Calendar keeps working
+ * when Google refuses Drive. A revoked grant and a failure worth retrying are
+ * thrown as they are: a brief outage never cuts a service off.
  */
 export async function mintCredentialToken(
   grant: GoogleGrant,
@@ -204,13 +194,11 @@ export interface HostTokenSourceOptions extends TokenOptions {
 
 /** Tokens for the host-only services, held only in this process's memory. */
 export interface HostTokenSource {
-  /** A live token for a host-only service. */
   accessToken(service: HostGoogleServiceId): Promise<string>;
 }
 
 /**
- * The host's own tokens (KTD5, KTD6), minted from the grant on demand. It
- * needs nothing but the grant, so a channel that starts before the host's
+ * Needs nothing but the grant, so a channel that starts before the host's
  * modules has its token, whatever the gateway stores. A token is kept until
  * it is close to expiry, and a new sign-in replaces every token. A revoked
  * sign-in is not asked again until a new one is written; any other failure

@@ -16,7 +16,7 @@
 import { requestTool } from '../action-request.js';
 import { registerTools } from './server.js';
 
-/** Google Calendar's key, which also grants gog's calendar commands; named here, since the tools' tests load them ahead of the barrel. */
+/** Also grants gog's calendar commands. Named here, since the tools' tests load them ahead of the barrel. */
 const CALENDAR_CAPABILITY = 'google-calendar';
 
 /** How long a tool waits for the host; a request may still go through after that. */

@@ -270,7 +270,7 @@ describe.skipIf(!chromePath)('native reservation through the common purchase exe
         },
       });
     });
-    it('books a free reservation with no card on file itself, with no card, as a money-less attempt (R3)', async () => {
+    it('books a free reservation with no card on file itself, with no card, as a money-less attempt', async () => {
       fixtureState.selectedPayment = null;
       fixtureState.details.user = { id: 72, payment_methods: [] };
       // The booking sends this box's state, and Resy's reviewed record proves only a booking with it unticked.
@@ -314,7 +314,7 @@ describe.skipIf(!chromePath)('native reservation through the common purchase exe
       expect(fixture.submitted()).toBe(0);
       expect(await getDb().get('SELECT COUNT(*) AS count FROM gws_ea_browser_free_attempts')).toEqual({ count: 0 });
       // Resy's checkout document holds a booking bearer the host tracks as a secret, so its reader places no
-      // picture: each card names one with none beside it, which the card says is unavailable (KTD6).
+      // picture: each card names one with none beside it, which the card says is unavailable.
       expect(await pageMayShowSecret(fixture.page)).toBe(true);
       expect(cards.map(({ card, files }) => ({ pictures: card.pictures, files }))).toEqual([
         { pictures: 1, files: undefined },

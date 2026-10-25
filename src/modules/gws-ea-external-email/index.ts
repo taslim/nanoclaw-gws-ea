@@ -1,27 +1,12 @@
 /**
- * GWS-EA's `external-email` agent (KTD3, KTD5, KTD14): the part of the
- * assistant that writes every email to someone other than the principal.
- *
- *   - The host creates its agent group once, at start, from the release's
- *     template, and records it in the profile beside main (`./group.ts`).
- *   - It cannot drift into more reach. It is a protected group: every agent
- *     caller's `ncl` command that names it is denied, `main` included and
- *     whatever an admin approves, and so is any self-modification request
- *     from it. Before any session of it starts or is adopted, a session
- *     admission policy refuses one whose capabilities, configuration,
- *     stamped plugins, or provider differ from what the host stamped.
- *   - A destination admission policy keeps it apart from main and from every
- *     other group (`./destination-policy.ts`). The two work together only
- *     through the host: main's `email_handoff` and its own `tell_main`
- *     (`./bridge.ts`).
- *   - When an email it wrote cannot be sent, what arrived in its thread cannot
- *     be processed, or its work on a thread fails, main hears of it
- *     (`../gws-ea-notices`).
- *   - Its project document holds its guidance, read from the release, the
- *     two display names, and the principal's time zone, read from the profile
- *     at each spawn so that no email it reads repeats them; the profile and
- *     preferences sections leave it everything else out.
- *   - Status reads all of this through a hidden host-only command.
+ * GWS-EA's `external-email` agent: the part of the assistant that writes
+ * every email to someone other than the principal. It cannot drift into more
+ * reach. It is a protected group: every agent caller's `ncl` command that
+ * names it is denied, `main` included and whatever an admin approves, and so
+ * is any self-modification request from it. Before any session of it starts
+ * or is adopted, a session admission policy refuses one whose capabilities,
+ * configuration, stamped plugins, or provider differ from what the host
+ * stamped. It works with main only through the host (`./bridge.ts`).
  */
 import path from 'node:path';
 
@@ -54,7 +39,6 @@ export {
   EXTERNAL_EMAIL_TEMPLATE,
 } from './group.js';
 
-/** `external-email`'s agent group, as the profile records it, or null until the host creates it. */
 export async function getExternalEmailAgentGroupId(): Promise<string | null> {
   if (!(await getDb().hasTable('gws_ea_profile'))) return null;
   return readExternalEmailPointer();
@@ -93,7 +77,7 @@ registerRequiredProjectDocSection('gws-ea-external-email:principal', async (grou
   return { name: 'Principal', body: `You work for ${principal}, whose time zone is ${timezone}.` };
 });
 
-/** The guidance, relative to the checkout the host runs from, as NanoClaw reads its other instruction files. */
+/** Relative to the checkout the host runs from, as NanoClaw reads its other instruction files. */
 export const GUIDANCE_PATH = path.join('src', 'modules', 'gws-ea-external-email', 'guidance.md');
 
 registerGuidance('gws-ea-external-email:guidance', {
@@ -104,13 +88,12 @@ registerGuidance('gws-ea-external-email:guidance', {
 });
 
 export interface ExternalEmailHealth {
-  /** The group the profile records, or null when the host has not created it. */
+  /** Null until the host creates the group. */
   readonly agent_group_id: string | null;
   /** Each reason it may not start, and each destination that breaks its separation; empty when healthy. */
   readonly problems: readonly string[];
 }
 
-/** What status reports: whether external-email is as the host stamped it, and the stored destinations around it. */
 export async function externalEmailHealth(): Promise<ExternalEmailHealth> {
   const agentGroupId = await getExternalEmailAgentGroupId();
   const destinations = await destinationViolations();

@@ -67,7 +67,7 @@ beforeEach(async () => {
   };
   await createMessagingGroup(groupA);
   await createMessagingGroup({ ...groupA, id: 'chat-b', platform_id: '456@g.us' });
-  // U6 owns this table; exercise the agreed native columns without importing
+  // gws-ea-chats owns this table; exercise the agreed native columns without importing
   // that module's routing or lifecycle registrations into privacy tests.
   await getDb().exec(`CREATE TABLE gws_ea_chats (
     messaging_group_id TEXT PRIMARY KEY REFERENCES messaging_groups(id),

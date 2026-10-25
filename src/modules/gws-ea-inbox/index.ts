@@ -1,18 +1,16 @@
 /**
  * GWS-EA's inbox: the assistant's Gmail as an `email` channel with two
- * messaging groups (KTD1), and Google Calendar's mail as calendar news.
+ * messaging groups, and Google Calendar's mail as calendar news.
  *
  * - Inbound mail is routed per message to the part allowed to write to its
- *   readers (route-mail.ts): what only the principal and the assistant can
- *   read reaches `main` in the principal's own email conversation
- *   (`email:principal`); everything else reaches `external-email`'s session
- *   for its thread (`email:inbox`).
+ *   readers (route-mail.ts): a conversation only the principal and the
+ *   assistant can read is `main`'s (`email:principal`); one with anyone else
+ *   on it is `external-email`'s, a session per thread (`email:inbox`).
  * - `main`'s replies leave through ordinary delivery to the principal alone,
  *   which the audience check resolves to the same address
- *   (principal-reply.ts). `external-email`'s go to everyone on its thread,
- *   or to whom it names among the thread's addresses (outbound.ts,
- *   recipients.ts). `email_send` lets either write in a thread at any time,
- *   each by its own rules.
+ *   (principal-reply.ts). `external-email`'s go only to the thread's
+ *   addresses (outbound.ts, recipients.ts). `email_send` lets either write in
+ *   a thread at any time, each by its own rules.
  * - Mail is the principal's only when Gmail verified that the domain of one
  *   of their addresses sent it (authentication.ts). Mail in their name that
  *   Gmail could not verify is outside mail, and the principal hears of it
@@ -20,10 +18,6 @@
  * - Google Docs' and Drive's activity mail becomes one note for `main` per
  *   poll, read from Drive with the host's own Drive token
  *   (gws-ea-workspace/notices.ts).
- *
- * The host starts the inbox after `external-email` exists: it creates both
- * messaging groups and their wirings when absent, brings `main`'s members in
- * step with the principal's addresses, then polls each minute.
  */
 import fs from 'node:fs';
 
@@ -77,7 +71,6 @@ import {
 } from './thread-map.js';
 import { ensureInbox, ensurePrincipalConversation } from './wiring-policy.js';
 
-// The inbox's own state, its thread map, then what was added since (migration.ts).
 registerMigration(gwsEaInboxMigration);
 registerMigration(gwsEaInboxEmailChannelMigration);
 registerMigration(gwsEaInboxDropThreadHoldsMigration);
@@ -119,14 +112,14 @@ registerDeliveryAction(EMAIL_SEND_ACTION, emailSendHandler, EMAIL_SEND_GUARD);
 
 // A mail sender is only as trustworthy as the domain behind it, so no email
 // identity may hold a privilege: commands and approvals stay with chat users
-// the channel itself authenticates (KTD4).
+// the channel itself authenticates.
 registerRoleGrantPolicy('gws-ea-inbox:no-email-privilege', (grant) =>
   grant.user_id.startsWith(`${EMAIL_CHANNEL_TYPE}:`) ? 'an email identity never holds owner or admin' : undefined,
 );
 
-// An outside thread is worked at a human pace: what reaches its session waits for the thread's next turn (KTD3).
-// Before that, its mail waits, held, until main places the thread and hands it over (Slice 5 KTD8): a hold
-// wins over a time, as the router resolves them.
+// An outside thread is worked at a human pace: what reaches its session waits for the thread's next turn.
+// Before that, its mail waits, held, until main places the thread and hands it over: a hold wins over a time,
+// as the router resolves them.
 registerInboundDelay(async (_event, session) => {
   const pace = await inboundPace(session);
   if (pace === undefined) return null;
@@ -171,9 +164,8 @@ registerDeliveryFailedHook(async (failed) => {
 });
 
 /**
- * Remove a session and everything it holds. A container still running for it
- * is the host's orphan sweep to stop (`stopOrphanedSessions`), within a sweep
- * of the session's row going.
+ * A container still running for the session is the host's orphan sweep to
+ * stop (`stopOrphanedSessions`), within a sweep of the session's row going.
  */
 async function purgeSession(sessionId: string, agentGroupId: string): Promise<void> {
   await updateSession(sessionId, { status: 'closed' });
@@ -182,7 +174,6 @@ async function purgeSession(sessionId: string, agentGroupId: string): Promise<vo
   await deleteSession(sessionId);
 }
 
-/** Remove the `external-email` sessions of these threads. */
 async function purgeThreadSessions(threadKeys: readonly string[]): Promise<void> {
   const externalEmail = await getExternalEmailAgentGroupId();
   const threads = new Set(threadKeys);
@@ -215,7 +206,6 @@ registerPersonForgetHook('gws-ea-inbox:purge', async ({ handles }) => {
   });
 });
 
-// What status reads, from the host only: `getInboxHealth()`, in the shape status reads.
 register({
   name: 'gws-ea-inbox-health',
   description: "Report the inbox's health and its calendar notifications.",

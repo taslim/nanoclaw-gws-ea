@@ -43,8 +43,7 @@ import { deletePoliciesTouching, removeMessagePolicy } from './agent-message-pol
 /**
  * Write one destination, once every registered destination admission policy
  * admits it (`src/db/wiring-admission.ts`); a refusal throws and writes
- * nothing. Every writer goes through here: `ncl destinations add`, a
- * wiring's companion row, and `create_agent`.
+ * nothing. A writer that bypasses this escapes those policies.
  *
  * ⚠️  Caller responsibility: after this returns, call
  * `writeDestinations(row.agent_group_id, <sessionId>)` for each active

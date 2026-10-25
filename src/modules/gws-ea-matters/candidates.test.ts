@@ -1,5 +1,5 @@
 /**
- * What the host suggests for a new piece in no open matter (KTD10, R10): the
+ * What the host suggests for a new piece in no open matter: the
  * open matters that share its sender, by address or organization through
  * person records, a reply chain with one of their threads, or the event one
  * of their threads booked, each with why. Only a sender Gmail verified

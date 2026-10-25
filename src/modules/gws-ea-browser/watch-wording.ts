@@ -68,10 +68,6 @@ export function renderWatchCard(watch: WatchRow, venueTimeZone: string, principa
 }
 
 /** to: browser */
-/**
- * A paid venue whose terms can charge more than the principal's maximum: the terms the host read and what they come
- * to for the party, so the delegating agent can ask the principal for a higher maximum.
- */
 export function termsOverBounds(
   site: string,
   policy: ReservationPolicy,

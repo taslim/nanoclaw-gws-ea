@@ -1,6 +1,7 @@
-/** Reviewed host data for Amazon's standard US, one-time retail review flow.
- * Deliberately excludes one-click, Prime/trial enrolment, Subscribe & Save,
- * digital delivery, marketplace financing and every unreadable/drifted layout.
+/**
+ * Reviewed host data for Amazon's standard US, one-time retail review flow. Deliberately excludes one-click,
+ * Prime/trial enrolment, Subscribe & Save, digital delivery, marketplace financing and every unreadable/drifted
+ * layout.
  */
 import type { ElementHandle, Locator, Page } from 'playwright-core';
 import type { ActionClass, ReviewedMerchantFlow } from './control-policy.js';
@@ -386,7 +387,8 @@ async function readAmazonEvidence(page: Page): Promise<MerchantPurchaseEvidence 
     !status
   )
     return undefined;
-  // A cancelled/refunded existing order still committed. This signature has no authoritative negative-history evidence; absence remains inconclusive.
+  // A cancelled or refunded order still committed. This signature has no authoritative negative-history evidence,
+  // so absence remains inconclusive.
   const resolution = /^(?:Order placed|Not yet shipped|Shipped|Delivered|Cancelled|Refunded)$/iu.test(status)
     ? 'committed'
     : undefined;
@@ -435,6 +437,6 @@ export const amazonRetailSignature: MerchantSignature = {
 };
 /**
  * This closed list is host-reviewed code, never model or recipe registration. The generic signature is never
- * one of them: a flow that matched every page would press any control directly (KTD4).
+ * one of them: a flow that matched every page would press any control directly.
  */
 export const merchantSignatures: readonly MerchantSignature[] = [amazonRetailSignature, resyReservationSignature];

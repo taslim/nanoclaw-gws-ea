@@ -1,13 +1,13 @@
 /**
- * Private-value matching (KTD7): exact and explainable.
+ * Private-value matching: exact and explainable.
  *
  * A text and a value are read the same way, so a value matches however it is
  * formatted:
  *
  *   - percent-encoding is decoded, twice-encoded text included, so a value in
  *     a link's address is read as its reader's browser reads it;
- *   - Unicode is folded by compatibility (NFKC's mapping, so full-width and
- *     mathematical letters read as plain ones), diacritics are stripped,
+ *   - Unicode is folded by compatibility decomposition (NFKD, so full-width
+ *     and mathematical letters read as plain ones), diacritics are stripped,
  *     zero-width and other invisible characters are removed, and Latin
  *     letters that do not decompose (ø, ł, ß, æ) read as their plain
  *     spellings;
@@ -22,12 +22,12 @@
  * in "the other day", and "12 Elm Rd" not in "112 Elm Rd". A phone number
  * matches on its trailing seven digits within one phone-like run of digits
  * and phone punctuation, so a country code, trunk prefix, or grouping changes
- * nothing, and the digits of a date, a time, or a price never complete it.
+ * nothing, while digits in separate runs never combine.
  *
  * A value spelled out in words, written in another script's lookalike
  * letters, or deliberately encoded some other way is a known residual: only
- * an agent holding the value can encode it, and the one that does (main) has
- * other ways to the web; external-email never holds one.
+ * an agent holding the value can encode it, and external-email never holds
+ * one.
  */
 import { EMAIL_PATTERN } from '../../gws-ea/validation.js';
 
@@ -38,17 +38,15 @@ export type PrivateValueKind = (typeof PRIVATE_VALUE_KINDS)[number];
 const MAX_VALUE_LENGTH = 200;
 /** Shorter canonical text is too common to check reliably. */
 const MIN_PATTERN_LENGTH = 4;
-/** The longest canonical text a value may reduce to. */
 const MAX_PATTERN_LENGTH = 256;
 /** An address's first line is matched on its own only when it says this much. */
 const MIN_STREET_LINE_LENGTH = 6;
 const PHONE_MIN_DIGITS = 7;
 const PHONE_MAX_DIGITS = 15;
-/** A phone number matches on its trailing digits: the subscriber number survives every national and international form. */
+/** Trailing digits, because the subscriber number survives every national and international form. */
 const PHONE_MATCH_DIGITS = 7;
 const MAX_DECODE_ROUNDS = 3;
 
-/** A text reduced for matching. */
 export interface TextStream {
   /** Its canonical words, in order, each followed by a space. */
   readonly words: string;
@@ -56,12 +54,11 @@ export interface TextStream {
   readonly phoneRuns: readonly string[];
 }
 
-/** What a stored value matches. */
 export interface CompiledPrivateValue {
   readonly kind: PrivateValueKind;
   /** Canonical word sequences, in the form of `TextStream.words`; any one found whole in a text matches. */
   readonly words: readonly string[];
-  /** For a phone number, the trailing digits found within one phone-like run. */
+  /** A phone number's trailing digits, matched within one phone-like run; null for any other kind. */
   readonly digits: string | null;
 }
 
@@ -143,7 +140,6 @@ function asciiDigit(character: string): string {
   return digit;
 }
 
-/** Compatibility-decomposed, with every invisible character removed. */
 function visible(text: string): string {
   return text.normalize('NFKD').replace(IGNORABLE, '');
 }
@@ -198,7 +194,6 @@ function canonicalWord(word: string): string {
   return DROPPED_WORDS.has(word) ? '' : (STREET_WORDS.get(word) ?? word);
 }
 
-/** `text`'s canonical words, in order. */
 function canonicalWords(folded: string): string[] {
   return folded
     .split(NOT_WORD)
@@ -207,12 +202,11 @@ function canonicalWords(folded: string): string[] {
     .filter((word) => word !== '');
 }
 
-/** `text` reduced to its canonical letters and digits, run together. */
 export function canonicalText(text: string): string {
   return canonicalWords(foldText(text)).join('');
 }
 
-/** Words in the form `TextStream.words` holds them: each followed by a space, so a match never starts or ends inside one. */
+/** Each word followed by a space, as `TextStream.words` holds them, so a match never starts or ends inside one. */
 function wordStream(words: readonly string[]): string {
   return words.map((word) => `${word} `).join('');
 }
@@ -243,7 +237,6 @@ export function fieldStreamOf(fields: readonly string[]): TextStream {
 // Values
 // ---------------------------------------------------------------------------
 
-/** Why `value` cannot be checked reliably as a `kind`, or undefined when it can. */
 export function uncheckableReason(kind: PrivateValueKind, value: string): string | undefined {
   if (value.length > MAX_VALUE_LENGTH) {
     return `A private value is too long: keep it to ${MAX_VALUE_LENGTH} characters`;
@@ -262,7 +255,7 @@ export function uncheckableReason(kind: PrivateValueKind, value: string): string
     : `A private value needs at least ${MIN_PATTERN_LENGTH} letters or digits to be checked reliably`;
 }
 
-/** What a stored value matches. Never throws: a stored value is matched however it reads. */
+/** Never throws: a stored value is matched however it reads. */
 export function compilePrivateValue(kind: PrivateValueKind, value: string): CompiledPrivateValue {
   const words = canonicalWords(foldText(value));
   switch (kind) {
@@ -285,14 +278,12 @@ export function compilePrivateValue(kind: PrivateValueKind, value: string): Comp
   }
 }
 
-/** Whether `text` gives `value` away. */
 export function givesAway({ words: patterns, digits }: CompiledPrivateValue, text: TextStream): boolean {
   const words = ` ${text.words}`;
   if (patterns.some((pattern) => pattern !== '' && words.includes(` ${pattern}`))) return true;
   return digits !== null && digits !== '' && text.phoneRuns.some((run) => run.includes(digits));
 }
 
-/** The first value `text` gives away. */
 export function findPrivateValue(
   values: readonly CompiledPrivateValue[],
   text: TextStream,

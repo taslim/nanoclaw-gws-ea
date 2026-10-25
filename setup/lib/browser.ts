@@ -59,8 +59,8 @@ export function formatNoteLink(url: string): string | null {
 
 /**
  * Gate a browser-open on a confirm so the user is ready for their browser
- * to take focus. Managed callers use onDecline to return cancellation through
- * their own outcome boundary; other setup callers retain their existing policy.
+ * to take focus. `onDecline` turns a No or a cancel into the caller's own
+ * outcome; without it a No still opens the browser and a cancel exits setup.
  * On headless devices both the
  * prompt and the open are skipped — the URL is already surfaced inside
  * the surrounding note (via `formatNoteLink`).
@@ -79,8 +79,8 @@ export async function confirmThenOpen(
   if (isHeadless()) {
     // No browser to open here — ALWAYS surface the URL itself, and print it
     // RAW on the configured output: clack notes wrap long lines and inject
-    // gutter pipes and spaces mid-URL, breaking copy-paste (live-hit). Plain output is the
-    // rendering that keeps the URL contiguous.
+    // gutter pipes and spaces mid-URL, breaking copy-paste (live-hit). Plain
+    // output is the rendering that keeps the URL contiguous.
     p.log.info('Open this URL in a browser on any device:', { output });
     output.write(`\n${url}\n\n`);
     return;

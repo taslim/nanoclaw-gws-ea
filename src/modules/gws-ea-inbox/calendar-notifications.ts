@@ -1,12 +1,11 @@
 /**
- * The assistant's calendar list, kept by the inbox's poll (KTD4, KTD9; R7,
- * R8, R10, R36), and calendar news as Google Calendar's own notification
- * emails.
+ * The assistant's calendar list, kept by the inbox's poll, and calendar news
+ * as Google Calendar's own notification emails.
  *
  * A calendar is the principal's when its ID is one of their addresses (their
  * primary calendar) or its `dataOwner` is, in any spelling the one rule
- * recognizes (R1). The poll owns every write to the list, and each one
- * checks the whole list:
+ * recognizes. The poll owns every write to the list, and each one checks the
+ * whole list:
  *
  * - each listed address's main calendar is in the list: the poll adds it the
  *   first time it sees the address, and while Google answers that it is not
@@ -15,7 +14,8 @@
  *   how anyone stops that, so nothing records a calendar not to add;
  * - what the assistant can do with it is recorded per address (db.ts), and
  *   `main` is told once when that drops, since nobody else would look; a
- *   first reading or a rise tells no one, as both agents read it live;
+ *   first reading or a rise tells no one, since every booking reads access
+ *   live;
  * - a calendar the host added for an address no longer the principal's is
  *   taken out; one anyone else added never is;
  * - each principal calendar the assistant can read gets email notifications
@@ -27,10 +27,10 @@
  * Every principal calendar in the list, free/busy only or not, is recorded
  * for busy time to read; the assistant's own calendar never is.
  *
- * Each authenticated notification is read for one thing: the event link's
- * `eid`, which carries the event ID and its calendar. `main` hears only the
- * calendar, the event ID, and the kind of change, and reads the event from
- * the calendar itself; nothing else of the email reaches it.
+ * Each authenticated notification is read only for its event link's `eid`,
+ * which carries the event ID and its calendar, and the kind of change its
+ * subject names. Nothing else of the email reaches `main`, which reads the
+ * event from the calendar itself.
  */
 import { createHash } from 'node:crypto';
 
@@ -89,7 +89,6 @@ export interface CalendarListApi {
   unsubscribe(calendarId: string): Promise<void>;
 }
 
-/** The notifications the host keeps on for each principal calendar. */
 export const WANTED_NOTIFICATIONS: readonly CalendarNotification[] = [
   { type: 'eventCreation', method: 'email' },
   { type: 'eventChange', method: 'email' },
@@ -135,7 +134,6 @@ function toEntry(value: unknown): CalendarListEntry {
   };
 }
 
-/** The real client, over the Calendar API's calendar list. */
 export function createCalendarListApi(options: GoogleClientOptions): CalendarListApi {
   return {
     async list() {
@@ -178,7 +176,6 @@ export function createCalendarListApi(options: GoogleClientOptions): CalendarLis
   };
 }
 
-/** Whether a calendar is the principal's, by the two facts that decide it. */
 export function isPrincipalCalendar(entry: CalendarListEntry, principal: PrincipalRecognizer): boolean {
   if (entry.deleted === true) return false;
   return principal.has(entry.id) || principal.has(entry.dataOwner);
@@ -191,23 +188,16 @@ export function isPrincipalCalendar(entry: CalendarListEntry, principal: Princip
  */
 const CHANGING_ROLES: ReadonlySet<string> = new Set(['owner', 'writer', 'writerWithoutPrivateAccess']);
 
-/** Every access role the host knows. */
 const KNOWN_ROLES: ReadonlySet<string> = new Set([...CHANGING_ROLES, 'reader', 'freeBusyReader']);
 
-/** Whether Google lets the assistant change events on a calendar. */
 export function canChangeEvents(entry: Pick<CalendarListEntry, 'accessRole'>): boolean {
   return entry.accessRole !== undefined && CHANGING_ROLES.has(entry.accessRole);
 }
 
-/** Whether a calendar is shared with the assistant without its private events, so it writes none there. */
 export function hidesPrivateEvents(entry: Pick<CalendarListEntry, 'accessRole'>): boolean {
   return entry.accessRole === 'writerWithoutPrivateAccess';
 }
 
-/**
- * Whether the assistant can book on a calendar: one of the principal's that
- * Google lets it change events on.
- */
 export function isBookableCalendar(entry: CalendarListEntry, principal: PrincipalRecognizer): boolean {
   return isPrincipalCalendar(entry, principal) && canChangeEvents(entry);
 }
@@ -220,11 +210,7 @@ export function isReadable(entry: CalendarListEntry): boolean {
 /** Roles the poll has warned of since the host started, so a role is logged once rather than every minute. */
 const warnedRoles = new Set<string>();
 
-/**
- * Warn, once per role, of a principal calendar whose access role the host
- * does not know: the assistant neither reads nor books on it until the host
- * learns the role.
- */
+/** The assistant neither reads nor books on a calendar whose role the host does not know. */
 function warnOfUnknownRole(entry: CalendarListEntry): void {
   const role = entry.accessRole;
   if (role === undefined || KNOWN_ROLES.has(role) || warnedRoles.has(role)) return;
@@ -262,7 +248,6 @@ function dropsBelow(access: CalendarAccess, than: CalendarAccess): boolean {
   return ACCESS_ORDER[access] < ACCESS_ORDER[than];
 }
 
-/** What the assistant can do with a principal address's main calendar, by Google's access role for it. */
 function accessOf(entry: CalendarListEntry, principal: PrincipalRecognizer): CalendarAccess {
   if (isBookableCalendar(entry, principal)) return 'bookable';
   if (entry.accessRole === 'reader') return 'readable';
@@ -279,7 +264,6 @@ const ACCESS_WORDS: Readonly<Record<CalendarAccess, string>> = {
 
 const LOSSES = new Intl.ListFormat('en', { style: 'long', type: 'conjunction' });
 
-/** Main's note of a drop: the address, the access before and after, and what no longer works. */
 function dropText(address: string, before: CalendarAccess, after: CalendarAccess): string {
   const lost = (level: CalendarAccess) => !dropsBelow(before, level) && dropsBelow(after, level);
   const losses = [
@@ -294,12 +278,7 @@ function dropText(address: string, before: CalendarAccess, after: CalendarAccess
   );
 }
 
-/**
- * Keep each listed address's main calendar in the list and its access
- * recorded, and take out what the host added for an address no longer
- * listed. Returns the list as it now stands; each Google refusal is added
- * to `failures`.
- */
+/** Returns the list as it now stands; each Google refusal is added to `failures`. */
 async function keepAddressCalendars(
   api: CalendarListApi,
   principal: PrincipalRecognizer,
@@ -442,12 +421,9 @@ async function tellMainOfDrops(principal: PrincipalRecognizer, at: string): Prom
 }
 
 /**
- * One pass over the assistant's calendar list: each principal address's
- * calendar in it and its access recorded, main told of any drop,
- * notifications on for each principal calendar the assistant can read, and
- * which calendars are the principal's recorded. One calendar that refuses
- * does not stop the others; the sync is reported failing until every one
- * succeeds. A calendar that is simply not shared is no failure.
+ * One calendar that refuses does not stop the others; the sync is reported
+ * failing until every one succeeds. A calendar that is simply not shared is no
+ * failure.
  */
 export async function syncCalendarList(
   api: CalendarListApi,
@@ -541,7 +517,6 @@ function decodeEid(eid: string): { readonly eventId: string; readonly calendarId
   return { eventId, calendarId: expandCalendarRef(reference) };
 }
 
-/** The event a notification is about, or undefined when its links name none. */
 export function parseCalendarNotification(mail: ParsedMail): CalendarNotice | undefined {
   const sources = [mail.text, mail.html ?? ''];
   for (const source of sources) {

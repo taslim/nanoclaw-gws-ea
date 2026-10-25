@@ -9,7 +9,6 @@ import { sameCredentialMetadata, type ProviderCredentialMetadata } from '../prov
 import { exactVersion, parsePins, PIN_NAMES } from './pins.js';
 
 const INCOMPLETE = 'incomplete_release';
-/** gws-ea's pins inside a release checkout. */
 const RELEASE_PINS_FILE = 'src/gws-ea/versions.json';
 
 export interface SetupCommand {
@@ -118,10 +117,9 @@ async function assertRuntimeArtifacts(checkoutRoot: string): Promise<void> {
 }
 
 /**
- * The cohort a release records in its receipt: its package manager, and the
- * OneCLI gateway and SDK it pins. A release is the tool's own clean commit, so
- * these are the launcher's own pins by construction, and a frozen install
- * refuses a lockfile that disagrees with package.json.
+ * The cohort a release records in its receipt. A release is the tool's own
+ * clean commit, so these are the launcher's own pins by construction, and a
+ * frozen install refuses a lockfile that disagrees with package.json.
  */
 async function readReleaseCohort(
   checkoutRoot: string,
@@ -142,7 +140,6 @@ async function readReleaseCohort(
   };
 }
 
-/** The OneCLI cohort, Postgres image, and provider setup an assistant runs, as its own record says (KTD6). */
 export interface DeployedSetup {
   readonly onecli: ReleasePreflightResult['onecli'];
   readonly postgresImage: string;
@@ -150,21 +147,17 @@ export interface DeployedSetup {
   readonly providerCredential: ProviderCredentialMetadata;
 }
 
-/**
- * The same for the tool's release. The credential is the one the release's
- * setup declares for the assistant's provider, or undefined when the release
- * does not compose that provider.
- */
 export interface ReleaseSetup {
   readonly onecli: ReleasePreflightResult['onecli'];
   readonly postgresImage: string;
+  /** Undefined when the release does not compose the assistant's provider. */
   readonly providerCredential: ProviderCredentialMetadata | undefined;
 }
 
 /**
  * An update keeps the assistant's OneCLI and Postgres versions and its
- * provider setup (R9, KTD20): it neither migrates the OneCLI vault nor runs
- * provider setup again.
+ * provider setup: it neither migrates the OneCLI vault nor runs provider setup
+ * again.
  */
 export function assertUpdateKeepsSetup(deployed: DeployedSetup, release: ReleaseSetup): void {
   const retry = 'so run the update from a GWS-EA release that';

@@ -10,7 +10,7 @@ import { channelUserId, getChatMember, memberFact, recordChatSpeaker, setChatMem
 
 export type ExpectedChatReplyReader = (chatId: string, userId: string, messageId: string) => Promise<boolean>;
 const expectedReaders = new Map<string, ExpectedChatReplyReader>();
-/** The expected-replies owner supplies its real durable lookup; registration conveys no authority. */
+/** Every reader sees each human message, so each can consume its expectation; true only engages the agent. */
 export function registerExpectedChatReplyReader(id: string, read: ExpectedChatReplyReader): void {
   if (expectedReaders.has(id)) throw new Error(`Expected reply reader already registered: ${id}`);
   expectedReaders.set(id, read);

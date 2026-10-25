@@ -1,8 +1,8 @@
 /**
  * What an assistant keeps with each release besides its checkout, in
- * `kept/<release>/` (KTD1): the files the release runs with, rendered when it
- * was staged by the tool that is its own code, and its receipt, written last,
- * so a release is complete only once everything kept with it is there
+ * `kept/<release>/`: the files the release runs with, rendered when it was
+ * staged by the tool that is its own code, and its receipt, written last, so a
+ * release is complete only once everything kept with it is there
  * (`release-layout.ts`). A switch to a release applies these files
  * (`release-stage.ts`); nothing here changes once the receipt is written.
  */
@@ -17,7 +17,7 @@ import { INSTANCE_HOST_ENV_KEYS } from './service.js';
 import { GwsEaError } from './types.js';
 import { isRecord, requireRecord, requireString } from './validation.js';
 
-/** Where `kept/<release>/` keeps each file; the receipt's name is the one `release-layout.ts` checks for. */
+/** The receipt's name must be the one `release-layout.ts` checks for. */
 export interface KeptReleaseFiles {
   readonly receipt: string;
   readonly compose: string;
@@ -25,7 +25,6 @@ export interface KeptReleaseFiles {
   readonly hostEnvironment: string;
 }
 
-/** The files kept in `root`, a release's `kept/<release>/`. */
 export function keptReleaseFiles(root: string): KeptReleaseFiles {
   return {
     receipt: path.join(root, 'release-preflight.json'),
@@ -35,36 +34,26 @@ export function keptReleaseFiles(root: string): KeptReleaseFiles {
   };
 }
 
-/**
- * What a release runs with besides its checkout: its OneCLI Compose file, its
- * service definition, and gws-ea's `.env` keys, as the tool that staged it
- * rendered them for the assistant.
- */
+/** `hostEnvironment` holds only gws-ea's own `.env` keys (`INSTANCE_HOST_ENV_KEYS`). */
 export interface KeptRelease {
   readonly compose: string;
   readonly serviceDefinition: string;
   readonly hostEnvironment: Readonly<Record<string, string>>;
 }
 
-/** What a release's preflight established, kept as its receipt. */
 export interface ReleasePreflightReceipt extends ReleasePreflightResult {
   readonly schema_version: 1;
   readonly instance_id: string;
   readonly deployed_commit: string;
 }
 
-/** The receipt a release stages with: whose it is, its commit, and what its preflight established. */
 export interface ReleaseReceiptInput {
   readonly instanceId: string;
   readonly commit: string;
   readonly preflight: ReleasePreflightResult;
 }
 
-/**
- * Keep `files` with a staged release in `root`, its `kept/<release>/`, then
- * its receipt, last: until the receipt is there the release is incomplete, and
- * the next staging discards it whole.
- */
+/** The receipt goes last: until it is there the release is incomplete, and the next staging discards it whole. */
 export async function keepRelease(root: string, files: KeptRelease, receipt: ReleaseReceiptInput): Promise<void> {
   await preparePrivateDirectory(root);
   const kept = keptReleaseFiles(root);
@@ -74,7 +63,6 @@ export async function keepRelease(root: string, files: KeptRelease, receipt: Rel
   await writeReleasePreflightReceipt(kept.receipt, receipt.instanceId, receipt.commit, receipt.preflight);
 }
 
-/** gws-ea's `.env` keys kept with the release in `root`; a key gws-ea does not own is refused. */
 export async function readKeptHostEnvironment(root: string): Promise<Record<string, string>> {
   const file = keptReleaseFiles(root).hostEnvironment;
   const value = await readOwnerOnlyJson(file, 'Kept host environment', 'invalid_kept_release');
@@ -90,7 +78,6 @@ export async function readKeptHostEnvironment(root: string): Promise<Record<stri
   return environment;
 }
 
-/** The files kept with the release in `root`. */
 export async function readKeptRelease(root: string): Promise<KeptRelease> {
   const kept = keptReleaseFiles(root);
   const [compose, serviceDefinition, hostEnvironment] = await Promise.all([
@@ -101,7 +88,6 @@ export async function readKeptRelease(root: string): Promise<KeptRelease> {
   return { compose, serviceDefinition, hostEnvironment };
 }
 
-/** What a receipt must say to be this assistant's. */
 export interface ReleasePreflightExpectation {
   readonly instanceId: string;
   /** The commits the receipt may name: the reservation's, and mid-update the one an operation placed live. */
@@ -160,7 +146,6 @@ function validateReleasePreflightReceipt(
   return validated;
 }
 
-/** The receipt at `file`, checked against the assistant it must belong to. */
 export async function loadReleasePreflightReceipt(
   file: string,
   expectation: ReleasePreflightExpectation,
@@ -171,7 +156,6 @@ export async function loadReleasePreflightReceipt(
   );
 }
 
-/** Record what a release preflight established for `instanceId` at `deployedCommit`, owner-only, at `file`. */
 async function writeReleasePreflightReceipt(
   file: string,
   instanceId: string,

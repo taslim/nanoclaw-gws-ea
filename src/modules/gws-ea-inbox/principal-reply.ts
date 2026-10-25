@@ -1,20 +1,18 @@
 /**
- * `main`'s email to the principal (KTD1, R64): its reply in a thread only the
- * principal and the assistant can read, which ordinary delivery hands the
- * adapter for `email:principal`.
+ * `main`'s email to the principal: its reply in a thread only the principal
+ * and the assistant can read, which ordinary delivery hands the adapter for
+ * `email:principal`.
  *
- * It answers the thread's anchor: the latest message on the principal's side
- * that the principal wrote, which Gmail must still verify as theirs now. It
- * goes to that message's From address alone, never to its Reply-To, To, or
- * Cc, nor to the principal's other addresses, in that message's Gmail
- * thread, quoting it (render.ts), with any files `main` sent: the principal
- * may receive anything. A thread with no such message refuses it.
+ * It answers the latest message on the principal's side that the principal
+ * wrote, which Gmail must still verify as theirs now. It goes to that
+ * message's From address alone, never to its Reply-To, To, or Cc, nor to the
+ * principal's other addresses, with any files `main` sent: the principal may
+ * receive anything. A thread with no such message refuses it.
  *
  * The audience check resolves the same address (`principalRecipients`), so a
  * send clears the private-values check only because every recipient is one
- * of the principal's addresses. It is sent exactly once (send.ts), on the
- * thread's principal side of the send ledger. `main`'s `email_send` writes
- * here too, by thread key, so the same rules hold for it (outbound.ts).
+ * of the principal's addresses. `main`'s `email_send` writes here too, by
+ * thread key, so the same rules hold for it (outbound.ts).
  */
 import type { OutboundMessage } from '../../channels/adapter.js';
 import { OutboundRefusedError, type OutboundSend } from '../../delivery.js';
@@ -28,16 +26,15 @@ import { threadMessages, visibleMessageIds } from './thread-map.js';
 
 const REFUSED_BY = 'gws-ea-inbox:principal-thread';
 
-/** The message a reply to the principal answers, and the address Gmail verified wrote it. */
 interface Anchor {
   readonly mail: ParsedMail;
   readonly from: Mailbox;
 }
 
 /**
- * The latest message on the thread's principal side that the principal
- * wrote, skipping the assistant's own replies; undefined when there is none,
- * or when Gmail no longer verifies it as the principal's.
+ * The latest message on the thread's principal side that is not the
+ * assistant's own; undefined when there is none, or when it no longer
+ * verifies as the principal's.
  */
 async function principalAnchor(runtime: InboxRuntime, threadKey: string): Promise<Anchor | undefined> {
   await runtime.gmailAddress();
@@ -55,7 +52,7 @@ async function principalAnchor(runtime: InboxRuntime, threadKey: string): Promis
   return undefined;
 }
 
-/** Whether a send is `add_reaction`'s, which names an emoji and a message rather than words. */
+/** `add_reaction`'s sends name an emoji and a message rather than words. */
 function isReaction(content: unknown): boolean {
   return (
     typeof content === 'object' && content !== null && (content as { operation?: unknown }).operation === 'reaction'
@@ -70,7 +67,7 @@ export async function principalRecipients(send: OutboundSend): Promise<readonly 
   return anchor === undefined ? [] : [anchor.from.address];
 }
 
-/** The channel adapter's `deliver` for `email:principal`: send `main`'s reply, exactly once. */
+/** The channel adapter's `deliver` for `email:principal`. */
 export async function sendToPrincipal(
   runtime: InboxRuntime,
   threadKey: string | null,

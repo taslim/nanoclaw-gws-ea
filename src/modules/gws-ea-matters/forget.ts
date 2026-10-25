@@ -1,19 +1,19 @@
 /**
- * Forgetting a person across matters (Slice 5 R26, AE9). The people store
- * runs this module's review, then its hook, before it deletes the person:
+ * Forgetting a person across matters. The people store runs this module's
+ * review, then its hook, before it deletes the person:
  *
  * - The review puts to main every matter, open or closed, that links the
- *   person, links a thread, event or file they were on, or whose title, open
- *   loop or outcome may name them: a matter's words are main's, and only
- *   main rewrites them (KTD3). It reads before any hook purges, while the
- *   inbox still holds the person's addresses on its threads. Only Google
- *   knows who is on an event or a file, so those are read live (KTD5).
+ *   person or a thread, chat, event or file they were on, or whose title, open
+ *   loop or outcome may name them: a matter's words are main's, and only main
+ *   rewrites them. It reads before any hook purges, while the inbox still holds
+ *   the person's addresses on its threads. Only Google knows who is on an event
+ *   or a file, so those are read live.
  * - The hook takes the person off every matter and clears the account on
  *   each thread of a matter that linked them; the inbox clears those on the
  *   threads they were on. A matter left with nothing but memory files was
  *   kept only for them: it is deleted, and its look cancelled. A strand kept
  *   only for them goes with it, and a project one of whose strands stays is
- *   kept. Such a matter links no thread, so none is left to hold.
+ *   kept. Such a matter links no thread, so it leaves no thread account behind.
  *
  * Both repeat safely: once the hook has run, no matter links the person, and
  * running it again, as the forget after a snapshot restore may, changes
@@ -114,12 +114,6 @@ export async function mattersToRewrite(person: PersonToForget): Promise<string[]
     .map((matter) => `matter ${matter.id}`);
 }
 
-/**
- * Take the person off every matter, in one transaction: clear the account on
- * each thread of a matter that linked them, remove their links, and delete
- * the matters kept only for them, each strand before its project. Their
- * looks are cancelled after, one at a time with every other change to a look.
- */
 export function forgetFromMatters(person: ForgottenPerson): Promise<void> {
   return oneAtATime(async () => {
     const db = getDb();

@@ -15,7 +15,6 @@ import { ensureBrowserGroup, setBrowserAdmissionReady } from './group.js';
 
 import './destination-policy.js';
 
-/** Called by the browser composition on start, every use and periodic sweep, after request recovery. */
 export async function reconcileBrowserGroup(policyFile?: string): Promise<void> {
   try {
     await reconcileDestinations(policyFile);
@@ -28,10 +27,9 @@ export async function reconcileBrowserGroup(policyFile?: string): Promise<void> 
 }
 
 /**
- * Cancel every errand whose group may not delegate now, one opened before
- * its first host-browser request included: disabling cancels them all, and
- * removing a group from the access setting cancels its own (R28). Returns
- * the groups whose errands remain open sessions, for projection.
+ * Cancel every errand whose group may not delegate now, one opened before its first host-browser request included:
+ * disabling cancels them all, and removing a group from the access setting cancels its own. Returns the groups whose
+ * errands remain open sessions, for projection.
  */
 async function cancelErrandsOutside(browser: string, delegators: ReadonlySet<string>): Promise<Set<string>> {
   const sources = new Set<string>();
@@ -54,7 +52,7 @@ async function cancelErrandsOutside(browser: string, delegators: ReadonlySet<str
   return sources;
 }
 
-/** The edges between browser and one delegating group: its reports return trusted, its errands go out per thread. */
+/** `out` sends the group's errands per thread and marks browser's reports untrusted; `back` is those reports' route. */
 function edges(browser: string, delegator: BrowserDelegator): { back: AgentDestination; out: AgentDestination } {
   const created_at = new Date().toISOString();
   return {

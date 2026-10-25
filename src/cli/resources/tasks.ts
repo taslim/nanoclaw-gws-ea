@@ -300,7 +300,7 @@ async function mutateTask(
   return { series_id: id, touched };
 }
 
-/** Whether the running container has claimed one of the series' rows: the task is mid-turn. */
+/** True while the task is mid-turn: the running container has claimed one of the series' rows. */
 function seriesProcessing(mailbox: MailboxSession, seriesKey: string): boolean {
   return mailbox.getProcessingClaims().some((claim) => {
     const row = mailbox.getTask(claim.messageId);

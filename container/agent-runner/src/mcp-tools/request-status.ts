@@ -11,7 +11,7 @@ import { answerResult, readAnswer } from '../action-request.js';
 import { registerTools } from './server.js';
 import type { McpToolDefinition } from './types.js';
 
-/** The key that grants it: both of GWS-EA's agents hold it, since both send typed requests. */
+/** Any agent that sends typed requests needs this key to read a late answer. */
 const REQUEST_STATUS_CAPABILITY = 'request-status';
 
 const REQUEST_ID = /^act-[A-Za-z0-9-]{1,100}$/u;

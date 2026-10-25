@@ -1,9 +1,7 @@
 /**
- * Host-generated credentials, made durable before any website sees them
- * (KTD6). One row per operation holds its binding (browser job, assistant
- * instance, 1Password account and vault, website origin, registrable site and
- * username), a password change's source Login and version, the candidate
- * saved for it, and the phase it reached:
+ * Host-generated credentials, made durable before any website sees them. One
+ * row per operation records its binding, its candidate and the phase it
+ * reached:
  *
  *   preparing → saved → exposed → awaiting_verification → confirmed → finalized
  *   exposed | awaiting_verification → unknown → confirmed | rejected
@@ -17,11 +15,11 @@
  * deletes its candidate, so the old password stays nowhere the host keeps.
  * Settling is several 1Password writes and one phase move, so the decided
  * outcome is recorded first and any later pass resumes from it (`settlement`).
- * Passwords live only in 1Password and this process's memory: rows, results,
- * errors and logs carry identifiers and constant reasons. Each operation
- * issues at most one create, tagged with its own marker; a lost response is
- * reconciled by that marker, never by creating again. A finalized row is the
- * ownership record R18 relies on. Provider calls never run inside a DB
+ * Passwords live only in 1Password and this process's memory: rows, errors
+ * and logs carry identifiers and constant reasons. Each operation issues at
+ * most one create, tagged with its own marker; a lost response is reconciled
+ * by that marker, never by creating again. A finalized row is the ownership
+ * record a password change requires. Provider calls never run inside a DB
  * transaction, and every phase moves by compare-and-set.
  */
 import { randomUUID } from 'node:crypto';
@@ -66,21 +64,16 @@ export type CredentialAttemptPhase =
 export type CredentialConflictReason = 'ownership_mismatch' | 'password_changed' | 'login_removed';
 
 /**
- * How a confirmed change settles, recorded while it is still confirmed and
- * before the first 1Password write that removes what an undecided pass reads:
- * `promoted`, the original Login holds the new password and the candidate
- * goes; `kept`, the Login is left as edited and the candidate keeps only the
+ * `promoted`: the original Login holds the new password and the candidate
+ * goes; `kept`: the Login is left as edited and the candidate keeps only the
  * new password.
  */
 export type CredentialSettlement = 'promoted' | 'kept';
 
 /**
  * The phases only the principal's informed decision can end once the host
- * cannot settle them: whether the website took the credential is unknown, its
- * email verification never completed, the login it confirmed was changed in
- * 1Password before the host finished saving it, or 1Password cannot be
- * reached to finish saving a confirmed one (which `release` settles first
- * when it can).
+ * cannot settle them. A `confirmed` one is here because 1Password may never
+ * be reached to finish saving it; `release` settles it first when it can.
  */
 export const RELEASABLE_PHASES: readonly CredentialAttemptPhase[] = [
   'unknown',
@@ -134,7 +127,6 @@ export interface CandidateCredential {
 }
 
 type VaultFailure = { readonly status: 'vault_unavailable' } | { readonly status: 'rate_limited' };
-/** A fresh read of an active item, or `removed` once the vault's active listing no longer has it. */
 type FreshRead = { readonly value: VaultItemRead } | { readonly status: 'removed' } | VaultFailure;
 type Refused<Reason extends string> = { readonly status: 'refused'; readonly reason: Reason };
 type Saved = { readonly status: 'saved'; readonly attempt: CredentialAttempt };
@@ -193,7 +185,7 @@ export const MAX_USERNAME = 256;
 const now = (): string => new Date().toISOString();
 const refused = <Reason extends string>(reason: Reason): Refused<Reason> => ({ status: 'refused', reason });
 
-/** A provider step's value, or its bounded failure; any other error is the caller's own and passes through. */
+/** Only a vault error becomes a failure; any other, such as the job's `assertActive` stop, passes through. */
 async function provider<T>(step: Promise<T>): Promise<{ readonly value: T } | VaultFailure> {
   try {
     return { value: await step };
@@ -203,7 +195,6 @@ async function provider<T>(step: Promise<T>): Promise<{ readonly value: T } | Va
   }
 }
 
-/** One plain line: non-empty, bounded, with no surrounding whitespace or control characters. */
 export function line(value: unknown, max: number): value is string {
   return (
     typeof value === 'string' &&
@@ -214,12 +205,15 @@ export function line(value: unknown, max: number): value is string {
   );
 }
 
-/** R18: the Login still names the account and the site its record saved. */
 function ownershipHolds(record: Pick<CredentialAttempt, 'username' | 'site'>, read: VaultItemRead): boolean {
   return read.category === 'login' && read.username === record.username && read.domains.includes(record.site);
 }
 
-/** The candidate's values, if the item still is what this attempt saved: its kind, account and site. */
+/**
+ * Undefined unless the item is still what this attempt saved under its
+ * username: a signup's Login on its site, or a change's Password item that
+ * also holds the password it replaces.
+ */
 function candidateSecret(attempt: CredentialAttempt, read: VaultItemRead): CandidateSecret | undefined {
   const { password, previousPassword } = read;
   if (password === undefined || read.username !== attempt.username) return undefined;
@@ -243,9 +237,8 @@ export interface CredentialAttemptsOptions {
 }
 
 /**
- * The host's credential attempts. One instance holds this process's memory of
- * generated values; a new instance, like a restart, recovers them from the
- * candidates in 1Password.
+ * One instance holds this process's memory of generated values; a new
+ * instance, like a restart, recovers them from the candidates in 1Password.
  */
 export class CredentialAttempts {
   private readonly secrets = new Map<string, CandidateSecret>();
@@ -271,7 +264,6 @@ export class CredentialAttempts {
     return attempt;
   }
 
-  /** Every attempt not yet rejected or finalized, oldest first: what recovery resumes after a restart. */
   unresolved(): Promise<CredentialAttempt[]> {
     return this.db.all<CredentialAttempt>(
       `SELECT * FROM ${TABLE} WHERE phase NOT IN ('rejected','finalized') ORDER BY created_at, id`,
@@ -302,9 +294,10 @@ export class CredentialAttempts {
   }
 
   /**
-   * R18: whether the Login behind a listed handle is one this host saved, and
-   * still has the username and site it saved for this origin's site. Without a
-   * record it spends no provider request; with one, a single fresh read.
+   * Whether the Login behind a listed handle is one this host saved, and still
+   * has the username and site it saved for this origin's site. Without a
+   * record it spends no request beyond the cached listing; with one, a single
+   * fresh read.
    */
   async ownership(itemHandle: string, origin: string, assertActive = active): Promise<CredentialOwnership> {
     const item = await this.listedItem(itemHandle, origin, assertActive);
@@ -317,9 +310,9 @@ export class CredentialAttempts {
   }
 
   /**
-   * Main's delegation names an account, not a handle: the listed Login this
-   * host saved for the origin's site under that username, found from the
-   * listing and local records alone. `ownership` then checks it fresh.
+   * A delegation names an account, not a handle: the listed Login this host
+   * saved for the origin's site under that username, found from the listing
+   * and local records alone. `ownership` then checks it fresh.
    */
   async ownedHandle(
     origin: string,
@@ -377,7 +370,7 @@ export class CredentialAttempts {
     return this.require(id);
   }
 
-  /** Records an authorized signup's binding. Nothing is generated or saved yet, and no provider request is spent. */
+  /** Nothing is generated or saved yet, and no provider request is spent. */
   async prepareSignup(input: {
     readonly jobId: string;
     readonly origin: string;
@@ -394,8 +387,7 @@ export class CredentialAttempts {
   }
 
   /**
-   * Records an authorized change of a listed Login's password, which needs an
-   * ownership record for this origin's site (R18). One change per Login is
+   * Needs an ownership record for this origin's site. One change per Login is
    * open at a time: another job's change that disclosed nothing gives way and
    * its candidate is retired, while one that may have reached the site keeps
    * the Login busy. The Login's current state is checked fresh when the
@@ -419,7 +411,7 @@ export class CredentialAttempts {
       item.itemId,
     );
     if (open) {
-      // An idle job's unused authority would otherwise hold the Login forever: the sweep never abandons it.
+      // An idle job's unused authority would otherwise hold the Login forever: the job sweep never abandons it.
       const abandoned =
         open.job_id !== input.jobId && (open.phase === 'preparing' || open.phase === 'saved')
           ? await this.undisclosed(open.id)
@@ -470,7 +462,6 @@ export class CredentialAttempts {
     return listed.value ? failure : true;
   }
 
-  /** A change's original Login, read fresh, while it still matches its ownership record. */
   private async ownedSource(
     attempt: CredentialAttempt,
     assertActive: () => Promise<void>,
@@ -616,7 +607,6 @@ export class CredentialAttempts {
     return { status: 'saved', attempt: await this.require(id) };
   }
 
-  /** The candidate's values: from this process's memory, or else one read of the recorded candidate. */
   private async candidate(
     attempt: CredentialAttempt,
     assertActive: () => Promise<void>,
@@ -787,7 +777,6 @@ export class CredentialAttempts {
     return attempt;
   }
 
-  /** This attempt's settlements and releases in this process, one after another. */
   private async exclusive<T>(id: string, work: () => Promise<T>): Promise<T> {
     const run = (this.running.get(id) ?? Promise.resolve()).then(work, work);
     const settled = run.then(
@@ -871,7 +860,7 @@ export class CredentialAttempts {
 
   /**
    * Publishes a confirmed signup's Login, or writes a confirmed change into the
-   * original Login (KTD8), and records ownership. Everything is read fresh; a
+   * original Login, and records ownership. Everything is read fresh; a
    * vault failure leaves the attempt confirmed, and the next finalize resumes
    * from its recorded settlement. A settled attempt answers how it settled.
    */

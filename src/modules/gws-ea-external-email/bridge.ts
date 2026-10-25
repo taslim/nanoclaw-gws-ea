@@ -1,61 +1,28 @@
 /**
- * The bridge between the assistant's two parts (KTD4; R65–R68, R74, R75).
- * `main` and `external-email` work together through two host actions, never
- * through a raw agent-to-agent destination (`./destination-policy.ts`): core
- * routing picks a target session by peer affinity, which would misroute
- * between concurrent threads, and it frames and checks nothing.
+ * The bridge between the assistant's two parts. `main` and `external-email`
+ * work together through two host actions, never through a raw agent-to-agent
+ * destination (`./destination-policy.ts` refuses one): core routing follows
+ * replies and peer affinity, or opens its own threads, never an email
+ * thread's key, and runs none of the checks below.
  *
  *   email_handoff (main)           { thread_key?, people?, message, files?, calendar?, matter? } → { thread_key, message }
  *   tell_main     (external-email) { account, wake?, files? }                                  → { message }
  *
- * - `email_handoff` names one thread by its `mail-…` key, or starts one with
- *   the `people` it names. Either way the people it names are the thread's
- *   as `main` named them, so `external-email` may write to them, placing
- *   them on an email as it judges; only `main` brings someone new in (R68).
- *   Before anything crosses, the message, the people it names, each file's
- *   name, and each file that is text pass the private-values check (R67).
- *   Then every Google link in main's words and text files must open for
- *   everyone on the thread and everyone main names, the principal aside
- *   (Slice 6 KTD4), so main hears at once who cannot open which link and
- *   what it can do; the check when external-email sends stays the
- *   guarantee.
- *   Files are read only from the request's own outbox in the calling
- *   session, never from a path `main` names. Core stages them into the
- *   thread session's inbox, and each is recorded for the thread by its
- *   SHA-256, the only way a file goes out (KTD9). A `calendar` sets where
- *   the thread's bookings go: one of the principal's calendars the
- *   assistant can write to. Until `main` sets one, the thread books nothing
- *   (R11). A `matter`, one of main's open matters, is joined by the thread
- *   (Slice 5 KTD11).
- *   A thread is handed over only once main has placed it (Slice 5 R9,
- *   KTD8): one main has not placed is refused, saying so, unless the handoff
- *   names its matter, which places it there first. A thread main starts is
- *   placed as it begins, in the matter named or nowhere. Handing a thread
- *   over releases the mail held for it, and names external-email as working
- *   it in its open matter, so its account shows there (Slice 5 R7). The mail
- *   released and `main`'s words join the mail already waiting in the
- *   thread's session, or are due at once when none is (`releaseHeldMail`).
- * - `tell_main` keeps `external-email`'s account of its thread on the
- *   thread, in place of the last (Slice 5 R7, KTD9): what it did, what it
- *   learned that no source records, and where the thread stands. `main`
- *   reads it under the thread wherever a matter shows it, so the account is
- *   capped at what a matter shows whole. Only with `wake`, when main must
- *   act now, does it also go into `main`'s session as information, framed
- *   untrusted because it draws on what outsiders wrote, with the thread's
- *   open matter (Slice 5 KTD11), and wake it. The host's own words name only
- *   the thread's key, its addresses, each of the principal's marked by how
- *   it came to the thread, and the calendar the thread books on, so no name
- *   or subject a sender wrote passes as the host's, and main has what it
- *   weighs in setting that calendar (R13).
- *   Files that came in the thread go with a wake (Slice 6 KTD7), so main can
- *   keep one for the principal: read, as a handoff's are, only from the
- *   request's own outbox, none larger than mail brings into a thread, and
- *   saved in main's session with each one's SHA-256, framed as what others
- *   sent.
+ * - The people a handoff names become the thread's, so `external-email` may
+ *   write to them; only `main` brings someone new in (the inbox's recipient
+ *   guard).
+ * - A handoff's files are read only from the request's own outbox, never
+ *   from a path `main` names, and each is recorded for the thread by its
+ *   SHA-256, the only way a file goes out.
+ * - Until a handoff sets its `calendar`, the thread books nothing.
+ * - `tell_main` keeps the account on the thread in place of the last. Only
+ *   with `wake` does it also reach `main`'s session, framed untrusted because
+ *   it draws on what outsiders wrote, with any files from the thread, so main
+ *   can keep one for the principal.
  *
- * Each request is answered once, a refusal or failure included. A replayed
- * request writes nothing twice: a new thread's key and every row it writes
- * derive from the request, and an account it keeps again is the same one.
+ * A replayed request writes nothing twice: a new thread's key and every row
+ * it writes derive from the request, and an account it keeps again is the
+ * same one.
  */
 import { isUtf8 } from 'node:buffer';
 import { createHash } from 'node:crypto';
@@ -116,9 +83,7 @@ import { getExternalEmailAgentGroupId, getMainAgentGroupId } from '../gws-ea-pro
 import { isDuplicateNote, writeNoteForMain } from '../gws-ea-profile/main-note.js';
 import { checkLinksOpenable, LinkCheckUnavailableError, LINKS_UNCHECKED } from '../gws-ea-workspace/link-access.js';
 
-/** `main`'s action, which the runner's tool of the same name sends. */
 export const EMAIL_HANDOFF_ACTION = 'email_handoff';
-/** `external-email`'s action, which the runner's tool of the same name sends. */
 export const TELL_MAIN_ACTION = 'tell_main';
 
 const THREAD_KEY = /^mail-[A-Za-z0-9-]{1,80}$/u;
@@ -132,7 +97,6 @@ const CALENDAR_ID_MAX = 254;
 // Who may call
 // ---------------------------------------------------------------------------
 
-/** email_handoff: `main`, by the profile's pointer, and no one else. */
 const emailHandoffAction = defineGuardedAction({
   action: 'gws_ea_external_email.email_handoff',
   decide: async ({ actor }) => {
@@ -144,7 +108,6 @@ const emailHandoffAction = defineGuardedAction({
   },
 });
 
-/** tell_main: `external-email`, from the session of one email thread, whose key is the session's thread. */
 const tellMainAction = defineGuardedAction({
   action: 'gws_ea_external_email.tell_main',
   decide: async ({ actor }) => {
@@ -170,7 +133,6 @@ const tellMainAction = defineGuardedAction({
 // The request's fields
 // ---------------------------------------------------------------------------
 
-/** Text as written, trimmed: line breaks kept, and empty unless it is text with nothing else unprintable. */
 function writtenText(value: unknown): string {
   const text = typeof value === 'string' ? value.replace(/\r\n?/gu, '\n').trim() : '';
   return hasControlCharacters(text.replace(/[\n\t]/gu, ' ')) ? '' : text;
@@ -184,7 +146,6 @@ function messageOf(value: unknown): string {
   return message;
 }
 
-/** The people `main` names, each address normalized and listed once; none when it names no one. */
 function peopleOf(value: unknown): string[] {
   if (value === undefined) return [];
   if (!Array.isArray(value) || value.length > MAX_PEOPLE) {
@@ -220,13 +181,12 @@ function calendarIdOf(value: unknown): string | undefined {
   return calendarId;
 }
 
-/** Where a handoff goes, a thread that exists or a new one, and the people `main` names for it. */
 type Target = { readonly people: readonly string[] } & (
   | { readonly kind: 'thread'; readonly threadKey: string }
   | { readonly kind: 'new' }
 );
 
-/** Whether anyone but the principal and the assistant is on the thread: an outside message, or someone `main` named. */
+/** Anyone but the principal and the assistant: an outside message, or someone `main` named. */
 async function hasOutsideSide(threadKey: string): Promise<boolean> {
   if ((await threadMessages(threadKey, 'outside')).length > 0) return true;
   return (await threadAddresses(threadKey)).some((entry) => entry.source === 'main');
@@ -263,9 +223,9 @@ async function targetOf(content: Record<string, unknown>, context: RoutingContex
 }
 
 /**
- * The files staged in this request's outbox, read only as `readOutboxFiles`
- * reads them: never a link, and never a path outside it. Refused unless
- * every one named is there, with `nothing` saying what was not done.
+ * Refused unless every named file is in this request's outbox, which
+ * `readOutboxFiles` reads without following a link or leaving it. `nothing`
+ * opens the refusal, saying what was not done.
  */
 function stagedFiles(session: Session, requestId: string, names: readonly string[], nothing: string): OutboundFile[] {
   if (names.length === 0) return [];
@@ -303,12 +263,11 @@ async function bookingCalendarOf(calendarId: string, context: RoutingContext): P
 // email_handoff
 // ---------------------------------------------------------------------------
 
-/** An address as the host names it: the principal's marked as such. */
 function marked(address: string, context: RoutingContext): string {
   return context.auth.principalAddresses.has(address) ? `${address} (the principal's)` : address;
 }
 
-/** A new thread's key, from the request that hands it over, so a replay of the request finds it. */
+/** Derived from the request, so a replay of it finds the same thread. */
 function newThreadKey(session: Session, requestId: string): string {
   return `mail-${createHash('sha256').update(`${session.id}\u0000${requestId}`).digest('hex').slice(0, 32)}`;
 }
@@ -317,11 +276,7 @@ function sha256(data: Buffer): string {
   return createHash('sha256').update(data).digest('hex');
 }
 
-/**
- * What `external-email` reads: who the conversation is with, or whom it may
- * now write to, and the files it may send, then `main`'s words. It works in
- * this one conversation, so no thread key.
- */
+/** No thread key: `external-email` works only in this one conversation. */
 function handoffText(target: Target, message: string, files: readonly OutboundFile[], context: RoutingContext): string {
   const people = listed(target.people.map((address) => marked(address, context)));
   const sendable = files.length === 0 ? [] : [`You may send ${listed(files.map((file) => file.filename))} in it.`];
@@ -338,18 +293,16 @@ function handoffText(target: Target, message: string, files: readonly OutboundFi
     .join('\n');
 }
 
-/** A handoff every check admitted, before anything is written. */
 interface Admitted {
   readonly target: Target;
   readonly message: string;
   readonly files: readonly OutboundFile[];
   readonly bookingCalendar: string | undefined;
-  /** The open matter the thread joins. */
   readonly matter: string | undefined;
   readonly context: RoutingContext;
 }
 
-/** Everyone a handoff's words may reach: the people on the thread's messages, and everyone main named for it. */
+/** Everyone a handoff's words may reach: on the thread's messages or named by main, not merely mentioned. */
 async function threadPeople(target: Target): Promise<string[]> {
   const known =
     target.kind === 'thread'
@@ -361,8 +314,8 @@ async function threadPeople(target: Target): Promise<string[]> {
 }
 
 /**
- * Every Google link in main's words opens for everyone they may reach, so
- * main hears now, in its own words, who cannot open which link.
+ * An early check, so main hears now who cannot open which link; the check when
+ * `external-email` sends is the guarantee.
  */
 async function assertLinksOpenable(texts: readonly string[], target: Target): Promise<void> {
   const links = await checkLinksOpenable({ texts, recipients: await threadPeople(target), writer: 'main' }).catch(
@@ -376,9 +329,7 @@ async function assertLinksOpenable(texts: readonly string[], target: Target): Pr
 }
 
 /**
- * Check everything a handoff carries before anything is written: its
- * fields, its thread or people, its files, its matter, the private-values
- * check over every part that crosses, the link check, and its calendar.
+ * Every check runs before anything is written.
  * to: main
  */
 async function admit(content: Record<string, unknown>, session: Session, requestId: string): Promise<Admitted> {
@@ -407,16 +358,14 @@ async function admit(content: Record<string, unknown>, session: Session, request
   return { target, message, files, bookingCalendar, matter, context };
 }
 
-/** Whether main has placed the thread (Slice 5 KTD8): in an open matter, or nowhere. */
+/** Whether main has placed the thread, in an open matter or nowhere. */
 async function isPlaced(threadKey: string): Promise<boolean> {
   return (await threadPlacement(threadKey))?.placement !== 'unplaced';
 }
 
 /**
- * The thread's records: a new thread, placed nowhere until it joins its
- * matter, or an existing one placed in the matter named when main had not
- * placed it; either handed over to external-email, which works it in its
- * matter; the people main named; and the calendar it books on.
+ * A new thread is placed nowhere, which `releaseThread` requires; it joins its
+ * named matter only after the handoff stands, so a failed join never undoes it.
  */
 async function recordHandoff(threadKey: string, handoff: Admitted, at: string): Promise<void> {
   const { target, bookingCalendar, matter } = handoff;
@@ -437,12 +386,6 @@ async function recordHandoff(threadKey: string, handoff: Admitted, at: string): 
   });
 }
 
-/**
- * main's words, and its files, in the thread's session, with the mail held
- * there for main's handoff: read with the mail already waiting there, or
- * now, which wakes the session. Each file is recorded for the thread as core
- * stages it, in the session's own inbox.
- */
 async function writeHandoff(
   thread: Session,
   threadKey: string,
@@ -465,7 +408,7 @@ async function writeHandoff(
           })),
         }),
   });
-  // Each file is the thread's before main's words arrive, so the words never come without them.
+  // Recorded at the path core stages each file to, before main's words arrive, so the words never come without them.
   const inbox = path.join(sessionDir(thread.agent_group_id, thread.id), 'inbox', inboxFolderName(id));
   for (const file of files) {
     await recordThreadFile(
@@ -532,7 +475,6 @@ const handOver: ActionAnswer = async (content, session, requestId) => {
 const NOTHING_TOLD = 'main was told nothing';
 const MEGABYTE = 1024 * 1024;
 
-/** What external-email reads when its account is kept and main is left to its work. */
 const ACCOUNT_KEPT =
   'Your account of this thread is kept in place of the last. main reads it whenever it looks at this thread, and was not woken.';
 
@@ -553,7 +495,6 @@ function wakeOf(value: unknown): boolean {
   return value;
 }
 
-/** The files a word to main carries, as staged: none larger than mail brings into a thread. */
 function filesForMain(session: Session, requestId: string, names: readonly string[]): OutboundFile[] {
   const files = stagedFiles(session, requestId, names, NOTHING_TOLD);
   const large = files.find((file) => file.data.length > MAX_ATTACHMENT_BYTES);
@@ -565,12 +506,7 @@ function filesForMain(session: Session, requestId: string, names: readonly strin
   return files;
 }
 
-/**
- * How a principal address came to the thread, as main reads it, and how
- * strongly it says which calendar the thread books on: an address the mail
- * itself carried, as the sender wrote it, weighs most; one main named, then
- * one someone only mentioned.
- */
+/** How strongly each way a principal address came says which calendar the thread books on; lower ranks weigh more. */
 const PRINCIPAL_SOURCES: Readonly<Record<AddressSource, { readonly rank: number; readonly words: string }>> = {
   message: { rank: 0, words: "on the thread's mail as the sender wrote it" },
   main: { rank: 1, words: 'named by you' },
@@ -578,10 +514,9 @@ const PRINCIPAL_SOURCES: Readonly<Record<AddressSource, { readonly rank: number;
 };
 
 /**
- * The thread's people as main reads them, each once, in the order the thread
- * gained them, and never the assistant. Each of the principal's addresses is
- * marked by the strongest way it came, naming the address it reaches when
- * the sender spelled it another way.
+ * Each address once, in the order the thread gained it. A principal address is
+ * marked by the strongest way it came and, when the sender spelled it another
+ * way, the address it reaches.
  */
 function peopleForMain(addresses: readonly ThreadAddress[], context: RoutingContext): string[] {
   const strongest = new Map<string, AddressSource>();
@@ -600,13 +535,10 @@ function peopleForMain(addresses: readonly ThreadAddress[], context: RoutingCont
 }
 
 /**
- * The calendar the thread books on, as main reads it (R8): none yet; one the
- * assistant can book on; or one it no longer can, because the principal
- * stopped sharing it or narrowed it to reading or free/busy. An address's
- * main calendar is judged by the access the calendar poll recorded for it,
- * as `book` judges it, and any other by whether the poll still finds it
- * among the principal's. Read from the host's store alone, so it answers
- * while Google Calendar is down.
+ * Read from the host's store alone, so it answers while Google Calendar is
+ * down. An address's main calendar is judged by the access the calendar poll
+ * recorded for it, by the rule `book` applies; any other only by whether the
+ * poll still finds it among the principal's.
  */
 async function bookingCalendarWords(calendarId: string | null, context: RoutingContext): Promise<string> {
   if (calendarId === null) return 'The thread has no booking calendar yet.';
@@ -618,7 +550,7 @@ async function bookingCalendarWords(calendarId: string | null, context: RoutingC
     : `The thread's booking calendar, ${calendarId}, is no longer one the assistant can book on.`;
 }
 
-/** The host's words before external-email's: the thread, its people, how many files came with them, and its calendar. */
+/** Addresses only, so no name or subject a sender wrote passes as the host's words. */
 function tellMainStamp(
   threadKey: string,
   people: readonly string[],
@@ -635,11 +567,7 @@ function tellMainStamp(
   );
 }
 
-/**
- * Keep the account on the session's own thread, the only one a session may
- * write, whatever thread a request names. Only a wake writes it into main's
- * session, with any files.
- */
+/** The account goes on the session's own thread, the only one it may write, whatever thread a request names. */
 const tellMain: ActionAnswer = async (content, session, requestId) => {
   const account = accountOf(content.account);
   const wake = wakeOf(content.wake);
@@ -674,7 +602,6 @@ const tellMain: ActionAnswer = async (content, session, requestId) => {
   };
 };
 
-/** Each action, with its handler and its guard, as the module registers them. */
 export const BRIDGE_ACTIONS: ReadonlyArray<readonly [string, GuardedDeliveryHandler, DeliveryGuardSpec]> = [
   [EMAIL_HANDOFF_ACTION, answeringAction(EMAIL_HANDOFF_ACTION, handOver), answeredGuard(emailHandoffAction)],
   [TELL_MAIN_ACTION, answeringAction(TELL_MAIN_ACTION, tellMain), answeredGuard(tellMainAction)],

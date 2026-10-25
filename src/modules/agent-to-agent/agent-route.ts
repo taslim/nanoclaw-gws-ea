@@ -163,7 +163,7 @@ type A2aRoutePolicy = (input: {
 }) => Promise<string | undefined>;
 const routePolicies = new Map<string, A2aRoutePolicy>();
 
-/** Register a route policy. IDs take the `module:name` form, as a refusal names its policy. */
+/** IDs take the `module:name` form: a refusal names its policy. */
 export function registerA2aRoutePolicy(id: string, policy: A2aRoutePolicy): void {
   if (routePolicies.has(id)) throw new Error(`A2A route policy already registered: ${id}`);
   routePolicies.set(id, policy);
@@ -337,12 +337,7 @@ function parseMessageContent(contentStr: string): { text: string; files: string[
   }
 }
 
-/**
- * The request for a held message, in the assistant's voice (KTD14): which of
- * its agents it passes between first, each as one quoted line, then what the
- * sending agent wrote, in a fence sized to what the card limit leaves, and
- * what it attached. Exported for tests.
- */
+/** Exported for tests. */
 export function buildGateQuestion(sourceName: string, targetName: string, contentStr: string): string {
   const { text, files } = parseMessageContent(contentStr);
   const head = `From: ${quoted(sourceName, NAME_LIMIT)}\nTo: ${quoted(targetName, NAME_LIMIT)}\nMessage:\n`;
