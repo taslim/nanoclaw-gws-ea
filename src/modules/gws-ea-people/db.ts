@@ -202,6 +202,23 @@ export function mayNamePerson(person: Pick<PersonToForget, 'name' | 'handles'>, 
 }
 
 /**
+ * Whether another store's record of someone is the person's: their id, one of their handles as its key, or a
+ * stored email that reaches one of their addresses. The chat roster's forget step and the matters review share it,
+ * so the review flags exactly the chats the forget clears.
+ */
+export function isPersonsRecord(
+  person: ForgottenPerson,
+  record: { readonly personId: string | null; readonly key: string; readonly email: string | null },
+): boolean {
+  if (record.personId === person.id || person.handles.includes(record.key)) return true;
+  if (record.email === null) return false;
+  const address = identityMatchKey(`email:${record.email}`);
+  return person.handles.some(
+    (handle) => handle.toLowerCase().startsWith('email:') && identityMatchKey(handle) === address,
+  );
+}
+
+/**
  * An identity as the store holds it: `<channel>:<handle>` in NanoClaw's
  * user-id form, an email address lowercased. A bare address is an email
  * identity. Undefined when `value` cannot be one.

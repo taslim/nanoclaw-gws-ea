@@ -54,7 +54,7 @@ beforeEach(async () => {
   await initDb(path.join(root, 'central.db'), { role: 'test' });
   await runMigrations(getDb());
   const timestamp = new Date().toISOString();
-  await upsertUser({ id: PRINCIPAL, kind: 'whatsapp', display_name: 'Taslim', created_at: timestamp });
+  await upsertUser({ id: PRINCIPAL, kind: 'whatsapp', display_name: 'Morgan', created_at: timestamp });
   await bindVerifiedPrincipalUser(PRINCIPAL, timestamp);
   groupA = {
     id: 'chat-a',

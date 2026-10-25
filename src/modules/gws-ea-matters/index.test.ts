@@ -297,7 +297,7 @@ describe('GWS-EA matters ncl resource', () => {
 
   it.each<[string, Record<string, unknown>, RegExp]>([
     ['a matter and nowhere at once', { id: 'm-000000000000', nowhere: true, thread: THREAD_A }, /--nowhere/],
-    ['a person nowhere', { nowhere: true, person: 'p-000000000000' }, /only a thread, event or file/i],
+    ['a person nowhere', { nowhere: true, person: 'p-000000000000' }, /only a thread, event, file or job/i],
     ['no matter and not nowhere', { thread: THREAD_A }, /--id.*or --nowhere.*new matter.*ncl matters open/],
     ['nothing to place', { id: 'm-000000000000' }, /at least one/i],
     ['an unknown flag', { id: 'm-000000000000', link: THREAD_A }, /unknown flag --link/],

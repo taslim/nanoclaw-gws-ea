@@ -70,7 +70,7 @@ async function seed(platformId = 'room', mode: EngageMode = 'module'): Promise<v
     messaging_group_id: `mg-${platformId}`,
     agent_group_id: 'ag-1',
     engage_mode: mode,
-    engage_pattern: '^Robin',
+    engage_pattern: '^Avery',
     sender_scope: 'all',
     ignored_message_policy: 'drop',
     session_mode: 'shared',
@@ -111,7 +111,7 @@ beforeEach(async () => {
   fs.rmSync(TEST_DIR, { recursive: true, force: true });
   fs.mkdirSync(TEST_DIR, { recursive: true });
   await runMigrations(await initSqliteTestDb());
-  await createAgentGroup({ id: 'ag-1', name: 'Robin', folder: 'ag-1', agent_provider: null, created_at: timestamp });
+  await createAgentGroup({ id: 'ag-1', name: 'Avery', folder: 'ag-1', agent_provider: null, created_at: timestamp });
   refused = false;
   scopedOut = false;
   requestWake.mockClear();
@@ -151,7 +151,7 @@ describe('module engagement after preparation', () => {
     prepare.mockImplementation(async ({ content }) =>
       JSON.stringify({
         ...(JSON.parse(content) as Record<string, unknown>),
-        attachments: [{ type: 'audio', speech: { status: 'recognized', text: 'Robin, check Thursday.' } }],
+        attachments: [{ type: 'audio', speech: { status: 'recognized', text: 'Avery, check Thursday.' } }],
       }),
     );
     let decided: InboundEvent | undefined;
@@ -160,7 +160,7 @@ describe('module engagement after preparation', () => {
       expect(session.agent_group_id).toBe('ag-1');
       expect(messagingGroup.id).toBe('mg-room');
       expect(wiring.id).toBe('wiring-room');
-      return prepared.message.content.includes('Robin, check Thursday.');
+      return prepared.message.content.includes('Avery, check Thursday.');
     });
     await router.routeInbound(original);
 
@@ -177,10 +177,10 @@ describe('module engagement after preparation', () => {
     const decide = vi.fn(() => true);
     router.registerEngagementDecider(channelType, decide);
     refused = true;
-    await router.routeInbound(event('refused', 'Robin?'));
+    await router.routeInbound(event('refused', 'Avery?'));
     refused = false;
     scopedOut = true;
-    await router.routeInbound(event('scoped-out', 'Robin?'));
+    await router.routeInbound(event('scoped-out', 'Avery?'));
 
     expect(await rows()).toEqual([]);
     expect(prepare).not.toHaveBeenCalled();
@@ -194,7 +194,7 @@ describe('module engagement after preparation', () => {
     const decide = vi.fn(() => false);
     router.registerEngagementDecider(channelType, decide);
     await router.routeInbound(event('banter', 'Funny video.'));
-    await router.routeInbound(event('addressed', 'Robin, check Thursday.'));
+    await router.routeInbound(event('addressed', 'Avery, check Thursday.'));
 
     expect((await rows()).map(({ id, trigger }) => ({ id, trigger }))).toEqual([{ id: 'addressed:ag-1', trigger: 1 }]);
     expect(decide).not.toHaveBeenCalled();
@@ -236,15 +236,15 @@ describe('conversation-tail work', () => {
       }
       return request.content;
     });
-    const first = router.routeInbound(event('first', 'Robin, plan the trip.'));
+    const first = router.routeInbound(event('first', 'Avery, plan the trip.'));
     await started.wait;
     const cutover = router.runInConversationTail({ channelType, platformId: 'room' }, async () => {
       expect((await rows()).map(({ id }) => id)).toEqual(['first:ag-1']);
       return 'moved';
     });
-    const next = router.routeInbound(event('next', 'Robin, add Friday.'));
+    const next = router.routeInbound(event('next', 'Avery, add Friday.'));
     try {
-      await router.routeInbound(event('unrelated', 'Robin?', 'other'));
+      await router.routeInbound(event('unrelated', 'Avery?', 'other'));
       expect((await rows('other')).map(({ id }) => id)).toEqual(['unrelated:ag-1']);
       expect(await rows()).toEqual([]);
     } finally {
@@ -263,7 +263,7 @@ describe('conversation-tail work', () => {
         throw new Error('cutover failed');
       }),
     ).rejects.toThrow('cutover failed');
-    await router.routeInbound(event('next', 'Robin?'));
+    await router.routeInbound(event('next', 'Avery?'));
     expect((await rows()).map(({ id }) => id)).toEqual(['next:ag-1']);
   });
 });

@@ -66,7 +66,7 @@ async function fixture(peer = false) {
     stateRoot: path.join(root, 'state'),
   });
   const own = await reserve(paths, 'aya', 34000);
-  const other = peer ? await reserve(paths, 'robin', 35000) : undefined;
+  const other = peer ? await reserve(paths, 'avery', 35000) : undefined;
   const files = artifactsOperatorFiles(paths);
   await mkdir(files.root, { recursive: true, mode: 0o700 });
   const config: ArtifactsOperatorConfig = {

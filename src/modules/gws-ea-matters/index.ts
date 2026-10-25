@@ -252,7 +252,7 @@ registerResource({
       access: 'open',
       description:
         'Place pieces in an open matter, or nowhere when nothing about them needs keeping.\n\n' +
-        'A thread, event or file in another open matter moves here, and the answer names where it came from. To merge two matters, place one’s links in the other, then close it. With --nowhere, give threads, events or files and no matter: each leaves the open matter it was in, and no matter opens. ' +
+        'A thread, event, file or job in another open matter moves here, and the answer names where it came from. To merge two matters, place one’s links in the other, then close it. With --nowhere, give threads, events, files or jobs and no matter: each leaves the open matter it was in, and no matter opens. ' +
         'A thread waits to be placed before you hand it over with email_handoff, and external-email reads none of its mail until you do.',
       args: [
         {

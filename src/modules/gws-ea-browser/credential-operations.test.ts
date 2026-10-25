@@ -181,8 +181,8 @@ describe("main's credential authority", () => {
       const identity = (await getRequiredProjectDocSections(group)).find(
         (section) => section.name === 'Assistant Identity',
       )?.body;
-      const address = /verified web address is `([^`]+)`/u.exec(identity ?? '')?.[1];
-      if (address === undefined) throw new Error('The host did not supply a verified web address');
+      const address = /web address is `([^`]+)`/u.exec(identity ?? '')?.[1];
+      if (address === undefined) throw new Error('The host did not supply a web address');
       return address;
     };
 

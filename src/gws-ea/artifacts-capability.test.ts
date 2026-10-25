@@ -191,7 +191,7 @@ function cloudflareFixture() {
 async function provisionFixture() {
   const f = await fixture();
   const a = await f.assistant('a@example.test', 31000);
-  const claim = { hostname: 'views.example.test', path_prefix: '/robin', listen_port: 41000 };
+  const claim = { hostname: 'views.example.test', path_prefix: '/avery', listen_port: 41000 };
   await claimInstanceArtifacts(f.paths, a.instanceId, claim);
   const files = artifactsOperatorFiles(f.paths);
   await mkdir(files.root, { recursive: true, mode: 0o700 });
@@ -217,7 +217,7 @@ async function provisionFixture() {
     sleep: async () => {},
     ncl: async (runtime: typeof a.runtime, args: readonly string[]): Promise<unknown> => {
       if (args[0] === 'gws-ea-profile-get')
-        return { assistant_first_name: 'Robin', principal_emails: ['principal@example.test', 'second@example.test'] };
+        return { assistant_first_name: 'Avery', principal_emails: ['principal@example.test', 'second@example.test'] };
       if (args[0] === 'gws-ea-artifacts-admission-emails') return { emails };
       if (args[0] === 'gws-ea-artifacts-author-groups') return { group_ids: ['canonical', 'selected-author'] };
       if (args[0] === 'groups' && args[1] === 'restart') {
@@ -315,7 +315,7 @@ describe('artifacts operator capability', () => {
     const routes = f.api.ingress();
     expect(routes).toContainEqual({
       hostname: 'views.example.test',
-      path: '^/robin(/|$)',
+      path: '^/avery(/|$)',
       service: 'http://127.0.0.1:41000',
     });
     expect(routes).toContainEqual({
@@ -338,22 +338,22 @@ describe('artifacts operator capability', () => {
     const f = await provisionFixture();
     const b = await f.assistant('b@example.test', 31002);
     await claimInstanceArtifacts(f.paths, b.instanceId, {
-      hostname: 'robin.other.test',
+      hostname: 'avery.other.test',
       path_prefix: '',
       listen_port: 41001,
     });
     const result = await enableArtifactsCapability(
       f.paths,
       b.instanceId,
-      { assistantHostname: 'robin.other.test' },
+      { assistantHostname: 'avery.other.test' },
       f.dependencies,
     );
-    expect(result).toMatchObject({ hostname: 'robin.other.test', path_prefix: '', enabled: true });
+    expect(result).toMatchObject({ hostname: 'avery.other.test', path_prefix: '', enabled: true });
     expect(f.api.apps[0].destinations).toEqual([
-      { type: 'public', uri: 'robin.other.test', overrides: [{ behavior: 'public', path_pattern: '/public/*' }] },
+      { type: 'public', uri: 'avery.other.test', overrides: [{ behavior: 'public', path_pattern: '/public/*' }] },
     ]);
-    expect(f.api.ingress()).toContainEqual({ hostname: 'robin.other.test', service: 'http://127.0.0.1:41001' });
-    expect((await readArtifactsOperatorConfig(f.files.configFile))?.dns['robin.other.test'].zoneId).toBe(
+    expect(f.api.ingress()).toContainEqual({ hostname: 'avery.other.test', service: 'http://127.0.0.1:41001' });
+    expect((await readArtifactsOperatorConfig(f.files.configFile))?.dns['avery.other.test'].zoneId).toBe(
       'dedicated-zone',
     );
   });
@@ -543,8 +543,8 @@ describe('artifacts operator capability', () => {
       destinations: [
         {
           type: 'public',
-          uri: 'views.example.test/robin',
-          overrides: [{ behavior: 'public', path_pattern: '/robin/public/*' }],
+          uri: 'views.example.test/avery',
+          overrides: [{ behavior: 'public', path_pattern: '/avery/public/*' }],
         },
       ],
       allowed_idps: [f.api.idps[0].id],
@@ -557,7 +557,7 @@ describe('artifacts operator capability', () => {
     ]);
     expect(f.api.ingress()).toEqual([
       { hostname: 'unrelated.example.test', service: 'http://127.0.0.1:9876' },
-      { hostname: 'views.example.test', path: '^/robin(/|$)', service: 'http://127.0.0.1:41000' },
+      { hostname: 'views.example.test', path: '^/avery(/|$)', service: 'http://127.0.0.1:41000' },
       { service: 'http_status:404' },
     ]);
     const policy = await readArtifactsPolicy(instanceArtifactsPolicyFile(f.a.runtime));
@@ -688,12 +688,12 @@ describe('artifacts operator capability', () => {
     const results = await Promise.allSettled([
       claimInstanceArtifacts(f.paths, a.instanceId, {
         hostname: 'views.example.test',
-        path_prefix: '/robin',
+        path_prefix: '/avery',
         listen_port: 41000,
       }),
       claimInstanceArtifacts(f.paths, b.instanceId, {
         hostname: 'views.example.test',
-        path_prefix: '/robin',
+        path_prefix: '/avery',
         listen_port: 41001,
       }),
     ]);
@@ -709,7 +709,7 @@ describe('artifacts operator capability', () => {
     await disableArtifactsCapability(f.paths, winner.instanceId);
     expect(
       (await getInstanceReservation(f.paths, winner.instanceId)).exclusive_resource_claims.artifacts?.path_prefix,
-    ).toBe('/robin');
+    ).toBe('/avery');
   });
 
   it('closes origin policy before remote failure and show remains read-only', async () => {
@@ -723,7 +723,7 @@ describe('artifacts operator capability', () => {
         schemaVersion: 1,
         enabled: true,
         hostname: 'views.example.test',
-        pathPrefix: '/robin',
+        pathPrefix: '/avery',
         listenPort: 41000,
         accessIssuer: 'https://example.cloudflareaccess.com',
         accessAud: 'aud',

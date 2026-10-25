@@ -390,7 +390,7 @@ export function createLinkAccess(options: LinkAccessOptions): LinkAccess {
       if (refused.length > 0) {
         return {
           allowed: false,
-          reason: request.writer === 'main' ? reasonForMain(refused, principal) : reasonForExternalEmail(refused),
+          reason: request.writer === 'main' ? reasonForMain(refused, principal) : reasonForOtherWriters(refused),
         };
       }
       if (unavailable) throw new LinkCheckUnavailableError();
@@ -482,9 +482,9 @@ function reasonForMain(refused: readonly Refused[], principal: PrincipalRecogniz
  * the link it wrote and nothing else of the file, and to wake main for its
  * answer, since sharing the file, or reconnecting what checks it, is never
  * theirs to do.
- * to: external-email
+ * to: external-email, external-chat, job
  */
-function reasonForExternalEmail(refused: readonly Refused[]): string {
+function reasonForOtherWriters(refused: readonly Refused[]): string {
   const blocked = new Map<string, string[]>();
   const unchecked = new Set<string>();
   for (const { link, recipient, why } of refused) {

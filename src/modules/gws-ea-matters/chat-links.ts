@@ -1,4 +1,5 @@
 import { getDb } from '../../db/connection.js';
+import { isPersonsRecord, type ForgottenPerson } from '../gws-ea-people/db.js';
 
 export interface ChatLinkState {
   readonly name: string | null;
@@ -37,12 +38,18 @@ export async function chatMemberPeople(messagingGroupId: string): Promise<readon
 }
 
 /** Chat keys whose roster holds a person, read before that person's forget hooks remove the roster entry. */
-export async function chatsWithPerson(personId: string): Promise<ReadonlySet<string>> {
+export async function chatsWithPerson(person: ForgottenPerson): Promise<ReadonlySet<string>> {
   const db = getDb();
   if (!(await db.hasTable('gws_ea_chat_members'))) return new Set();
-  const rows = await db.all<{ readonly messaging_group_id: string }>(
-    'SELECT DISTINCT messaging_group_id FROM gws_ea_chat_members WHERE person_id = ?',
-    personId,
+  const rows = await db.all<{
+    readonly messaging_group_id: string;
+    readonly member_key: string;
+    readonly person_id: string | null;
+    readonly email: string | null;
+  }>('SELECT messaging_group_id, member_key, person_id, email FROM gws_ea_chat_members');
+  return new Set(
+    rows
+      .filter((row) => isPersonsRecord(person, { personId: row.person_id, key: row.member_key, email: row.email }))
+      .map((row) => row.messaging_group_id),
   );
-  return new Set(rows.map((row) => row.messaging_group_id));
 }

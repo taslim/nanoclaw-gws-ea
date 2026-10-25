@@ -36,7 +36,7 @@ import { requestWake } from '../../request-wake.js';
 import { pruneEchoBacklog } from '../cross-session-context/prune.js';
 import { outboundDbPath } from '../../mailbox/sqlite/paths.js';
 
-const deliveredU11 = vi.fn<ChannelAdapter['deliver']>(async () => undefined);
+const deliveredToChat = vi.fn<ChannelAdapter['deliver']>(async () => undefined);
 async function freshHost() {
   vi.resetModules();
   vi.doMock('../../container-runner.js', async (original) => ({
@@ -60,7 +60,7 @@ async function freshHost() {
       setup: async () => {},
       teardown: async () => {},
       isConnected: () => true,
-      deliver: deliveredU11,
+      deliver: deliveredToChat,
       fetchGroupMembers: async (platformId: string) => ({
         platformId,
         name: 'Trip',
@@ -101,7 +101,7 @@ async function freshHost() {
 }
 let host: Awaited<ReturnType<typeof freshHost>>;
 let requestSequence = 0;
-async function sendU11(
+async function sendChatRequest(
   session: Session,
   action: string,
   fields: Record<string, unknown>,
@@ -114,7 +114,7 @@ async function sendU11(
   if (!answer) throw new Error('No action response');
   return (JSON.parse(answer.content) as { frame: ResponseFrame }).frame;
 }
-function dataU11(frame: ResponseFrame): Record<string, unknown> {
+function chatData(frame: ResponseFrame): Record<string, unknown> {
   if (!frame.ok) throw new Error(frame.error.message);
   return frame.data as Record<string, unknown>;
 }
@@ -182,7 +182,7 @@ beforeEach(async () => {
   await host.db
     .getDb()
     .run(
-      "UPDATE gws_ea_profile SET assistant_first_name=COALESCE(assistant_first_name,'Juno'),principal_first_name=COALESCE(principal_first_name,'Morgan'),main_agent_group_id='main',external_chat_agent_group_id='external',assistant_first_name = 'Robin', assistant_last_name = NULL WHERE singleton=1",
+      "UPDATE gws_ea_profile SET assistant_first_name=COALESCE(assistant_first_name,'Juno'),principal_first_name=COALESCE(principal_first_name,'Morgan'),main_agent_group_id='main',external_chat_agent_group_id='external',assistant_first_name = 'Avery', assistant_last_name = NULL WHERE singleton=1",
     );
   await host.channels.initChannelAdapters(() => ({
     onInbound() {},
@@ -191,7 +191,7 @@ beforeEach(async () => {
     onAction() {},
   }));
   host.delivery.setDeliveryAdapter(host.channels.createChannelDeliveryAdapter());
-  deliveredU11.mockClear();
+  deliveredToChat.mockClear();
   await host.join.decideJoin({
     channelType: 'whatsapp',
     platformId: 'trip@g.us',
@@ -237,8 +237,8 @@ afterEach(async () => {
 });
 
 async function promote() {
-  return dataU11(
-    await sendU11(
+  return chatData(
+    await sendChatRequest(
       main,
       'chat_handoff',
       { chat: chatId, message: 'Plan the lake trip.', matter: 'nowhere', job: true },
@@ -354,9 +354,14 @@ it('moves the actual chat wiring, recent member and delivered assistant conversa
     mailbox.markDeliveryFailed('assistant-failed'),
   );
   await promote();
-  await inbound('during', 'Robin, can we meet Friday?');
-  dataU11(
-    await sendU11(main, 'chat_handoff', { chat: chatId, message: 'The principal prefers Friday.' }, 'during-main'),
+  await inbound('during', 'Avery, can we meet Friday?');
+  chatData(
+    await sendChatRequest(
+      main,
+      'chat_handoff',
+      { chat: chatId, message: 'The principal prefers Friday.' },
+      'during-main',
+    ),
   );
   expect((await read(old)).find((row) => row.id === 'during:external')).toMatchObject({
     status: 'held',
@@ -389,7 +394,7 @@ it('moves the actual chat wiring, recent member and delivered assistant conversa
   expect(rows.map((row) => row.content).join('\n')).toContain('I will check that shore.');
   expect(
     JSON.parse(rows.find((row) => row.content.includes('I will check that shore.'))?.content ?? '{}'),
-  ).toMatchObject({ sender: 'Robin', self: true });
+  ).toMatchObject({ sender: 'Avery', self: true });
   expect(rows.map((row) => row.content).join('\n')).not.toMatch(/Too old|This was never sent/);
   expect(rows.filter((row) => row.id === `during:${target.agent_group_id}`)).toMatchObject([
     { status: 'pending', trigger: true },
@@ -398,20 +403,27 @@ it('moves the actual chat wiring, recent member and delivered assistant conversa
   expect(rows.some((row) => row.content.includes('The principal prefers Friday.'))).toBe(true);
   await host.session.withMailboxSession(target.agent_group_id, target.id, (mailbox) => pruneEchoBacklog(mailbox));
   expect((await read(target)).filter((row) => row.channelType === 'chat-seed')).toHaveLength(2);
-  await inbound('during', 'Robin, can we meet Friday?');
-  await inbound('next', 'Robin, what about Saturday?');
+  await inbound('during', 'Avery, can we meet Friday?');
+  await inbound('next', 'Avery, what about Saturday?');
   expect((await read(target)).filter((row) => row.id === `during:${target.agent_group_id}`)).toHaveLength(1);
   expect((await read(target)).filter((row) => row.id === `next:${target.agent_group_id}`)).toHaveLength(1);
   expect((await read(old)).some((row) => row.id === 'next:external')).toBe(false);
-  dataU11(await sendU11(main, 'chat_handoff', { chat: chatId, message: 'Another job here.', job: true }, 'second-job'));
+  chatData(
+    await sendChatRequest(
+      main,
+      'chat_handoff',
+      { chat: chatId, message: 'Another job here.', job: true },
+      'second-job',
+    ),
+  );
   await host.move.resumeChatMoves();
   expect(await host.jobs.listJobAgents()).toHaveLength(1);
   expect((await host.chat.getChat(chatId))?.serving_agent_group_id).toBe(target.agent_group_id);
 });
 
 it('pauses native reminders immediately, moves live task rows once and preserves an originally paused reminder', async () => {
-  const pending = dataU11(
-    await sendU11(
+  const pending = chatData(
+    await sendChatRequest(
       old,
       'remind',
       { at: new Date(Date.now() + 3600_000).toISOString(), note: 'Choose the cabin.' },
@@ -466,7 +478,7 @@ it('pauses native reminders immediately, moves live task rows once and preserves
   });
   await host.delivery.deliverSessionMessages(target);
   await host.delivery.deliverSessionMessages(target);
-  expect(deliveredU11.mock.calls.filter(([, , , messageId]) => messageId === 'reminder-answer')).toHaveLength(1);
+  expect(deliveredToChat.mock.calls.filter(([, , , messageId]) => messageId === 'reminder-answer')).toHaveLength(1);
 });
 
 it('waits for a claimed reminder and its actual outbound delivery before stopping the old container', async () => {
@@ -504,7 +516,7 @@ it('waits for a claimed reminder and its actual outbound delivery before stoppin
   await host.move.moveChat(chatId);
   expect(runtime.kill).toHaveBeenCalledOnce();
   expect((await read(await jobSession())).filter((row) => row.kind === 'task')).toEqual([]);
-  expect(deliveredU11).toHaveBeenCalledOnce();
+  expect(deliveredToChat).toHaveBeenCalledOnce();
 });
 
 it('carries an admitted move through on the running host without waiting for the sweep', async () => {
@@ -533,8 +545,8 @@ it('carries an admitted move through on the running host without waiting for the
 });
 
 it('undoes a gateway creation failure, releases the intact old session and names the chat to main', async () => {
-  const pending = dataU11(
-    await sendU11(
+  const pending = chatData(
+    await sendChatRequest(
       old,
       'remind',
       { at: new Date(Date.now() + 3600_000).toISOString(), note: 'Keep this reminder.' },
@@ -552,7 +564,7 @@ it('undoes a gateway creation failure, releases the intact old session and names
     }),
   );
   await promote();
-  await inbound('failure-held', 'Robin, keep helping us.');
+  await inbound('failure-held', 'Avery, keep helping us.');
   gatewayFails = true;
   await host.move.moveChat(chatId);
   expect(await host.chat.getChat(chatId)).toMatchObject({ state: 'connected', serving_agent_group_id: 'external' });
@@ -567,8 +579,13 @@ it('undoes a gateway creation failure, releases the intact old session and names
   const notes = (await read(main)).filter((row) => row.id.startsWith('chat-move-failed-'));
   expect(notes).toHaveLength(1);
   expect(notes[0].content).toContain('Lake trip');
-  dataU11(
-    await sendU11(main, 'chat_handoff', { chat: chatId, message: 'Try this separately.', job: true }, 'new-attempt'),
+  chatData(
+    await sendChatRequest(
+      main,
+      'chat_handoff',
+      { chat: chatId, message: 'Try this separately.', job: true },
+      'new-attempt',
+    ),
   );
   await host.move.moveChat(chatId);
   expect((await read(main)).filter((row) => row.id.startsWith('chat-move-failed-'))).toHaveLength(2);
@@ -596,8 +613,8 @@ it('records job admission and the checked handoff durably without doing the move
       return mailbox(group, id, action);
     },
   );
-  const answer = dataU11(
-    await sendU11(
+  const answer = chatData(
+    await sendChatRequest(
       main,
       'chat_handoff',
       {
@@ -625,7 +642,7 @@ it('carries delayed owed input with its native deadline and engagement instead o
     timestamp: new Date().toISOString(),
     channelType: 'whatsapp',
     platformId: 'trip@g.us',
-    content: '{"text":"Robin, reply after the backoff."}',
+    content: '{"text":"Avery, reply after the backoff."}',
     trigger: true,
     processAfter: '2999-01-01T00:00:00.000Z',
   });
@@ -691,8 +708,8 @@ it.each([
         })),
       ),
     );
-    const reminder = dataU11(
-      await sendU11(
+    const reminder = chatData(
+      await sendChatRequest(
         old,
         'remind',
         { at: new Date(Date.now() + 3600_000).toISOString(), note: 'Move this once.' },
@@ -700,7 +717,7 @@ it.each([
       ),
     );
     await promote();
-    await inbound('held-once', 'Robin, Friday?');
+    await inbound('held-once', 'Avery, Friday?');
     const interruption = barrier();
     if (step === 'group-created') {
       const create = host.jobs.createJobAgent;
@@ -816,7 +833,7 @@ it.each([
     }
     vi.restoreAllMocks();
     await restart();
-    if (step === 'swapped') await inbound('after-swap', 'Robin, I arrived after the swap.');
+    if (step === 'swapped') await inbound('after-swap', 'Avery, I arrived after the swap.');
     await host.move.resumeChatMoves();
     const target = await jobSession();
     await expect(
@@ -871,7 +888,7 @@ it('serializes a route that already read the old wiring with the swap and carrie
     }
     return write(group, id, message);
   });
-  const route = inbound('racing', 'Robin, an input racing the move.');
+  const route = inbound('racing', 'Avery, an input racing the move.');
   await routing.reached;
   const tail = host.router.runInConversationTail;
   vi.spyOn(host.router, 'runInConversationTail').mockImplementation((address, work) => {
@@ -891,8 +908,8 @@ it('serializes a route that already read the old wiring with the swap and carrie
 });
 
 it('resumes an interrupted undo after the retired row and connected state, retaining reminder recovery until restoration finishes', async () => {
-  const reminder = dataU11(
-    await sendU11(
+  const reminder = chatData(
+    await sendChatRequest(
       old,
       'remind',
       { at: new Date(Date.now() + 3600_000).toISOString(), note: 'Restore me.' },
@@ -932,8 +949,8 @@ it('retires a move detached before the swap, then treats a genuine rejoin as a f
     processAfter: '2999-01-01T00:00:00.000Z',
     trigger: true,
   });
-  const reminder = dataU11(
-    await sendU11(
+  const reminder = chatData(
+    await sendChatRequest(
       old,
       'remind',
       { at: new Date(Date.now() + 3600_000).toISOString(), note: 'Old epoch.' },
@@ -990,8 +1007,8 @@ it('retires a move detached before the swap, then treats a genuine rejoin as a f
     joined: true,
     members: [{ key: 'whatsapp:11', name: 'Juno', isPrincipal: true }],
   });
-  dataU11(
-    await sendU11(
+  chatData(
+    await sendChatRequest(
       main,
       'chat_handoff',
       { chat: chatId, message: 'A new job in the rejoined chat.', matter: 'nowhere', job: true },
@@ -1060,8 +1077,8 @@ it('swaps the open matter’s native chat handler with the serving wiring', asyn
     openLoop: 'Choose dates',
     links: [{ kind: 'chat', reference: chatId }],
   });
-  dataU11(
-    await sendU11(
+  chatData(
+    await sendChatRequest(
       main,
       'chat_handoff',
       { chat: chatId, message: 'Work on this trip.', matter: matter.id, job: true },

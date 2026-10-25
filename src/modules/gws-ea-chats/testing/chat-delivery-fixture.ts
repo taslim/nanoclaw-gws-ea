@@ -19,7 +19,7 @@ export let members = [
   { key: 'whatsapp:22', name: 'Mira', isPrincipal: false },
   { key: 'whatsapp:11', name: 'Juno', isPrincipal: true },
 ];
-export const deliveredU11 = vi.fn<ChannelAdapter['deliver']>(async () => undefined);
+export const deliveredToChat = vi.fn<ChannelAdapter['deliver']>(async () => undefined);
 registerChannelAdapter('whatsapp', {
   factory: () => ({
     name: 'whatsapp',
@@ -28,22 +28,22 @@ registerChannelAdapter('whatsapp', {
     setup: async () => {},
     teardown: async () => {},
     isConnected: () => true,
-    deliver: deliveredU11,
+    deliver: deliveredToChat,
     fetchGroupMembers: async (platformId: string) => ({ platformId, name: 'Trip', members }),
   }),
 });
 export function platformMembers(value: typeof members): void {
   members = value;
 }
-export async function seedU11() {
+export async function seedChatDelivery() {
   members = [
     { key: 'whatsapp:22', name: 'Mira', isPrincipal: false },
     { key: 'whatsapp:11', name: 'Juno', isPrincipal: true },
   ];
-  deliveredU11.mockClear();
+  deliveredToChat.mockClear();
   const seeded = await seedContext();
   await getDb().run(
-    "UPDATE gws_ea_profile SET assistant_first_name = 'Robin', assistant_last_name = NULL, principal_timezone='UTC' WHERE singleton=1",
+    "UPDATE gws_ea_profile SET assistant_first_name = 'Avery', assistant_last_name = NULL, principal_timezone='UTC' WHERE singleton=1",
   );
   await initChannelAdapters(() => ({
     onInbound: () => {},
@@ -54,17 +54,17 @@ export async function seedU11() {
   setDeliveryAdapter(createChannelDeliveryAdapter());
   return seeded;
 }
-export async function cleanU11(root: string): Promise<void> {
+export async function cleanChatDelivery(root: string): Promise<void> {
   await teardownChannelAdapters();
   await closeDb();
   fs.rmSync(root, { recursive: true, force: true });
 }
 let sequence = 0;
-export async function sendU11(
+export async function sendChatRequest(
   session: Session,
   action: string,
   fields: Record<string, unknown>,
-  id = `u11-${++sequence}`,
+  id = `request-${++sequence}`,
 ): Promise<ResponseFrame> {
   const handler = getDeliveryAction(action);
   if (!handler) throw new Error(`${action} is not registered`);
@@ -80,11 +80,11 @@ export async function sendU11(
     db.close();
   }
 }
-export function dataU11(frame: ResponseFrame): Record<string, unknown> {
+export function chatData(frame: ResponseFrame): Record<string, unknown> {
   if (!frame.ok) throw new Error(frame.error.message);
   return frame.data as Record<string, unknown>;
 }
-export function refusalU11(frame: ResponseFrame): string {
+export function chatRefusal(frame: ResponseFrame): string {
   if (frame.ok) throw new Error(`Unexpected success: ${JSON.stringify(frame.data)}`);
   return frame.error.message;
 }

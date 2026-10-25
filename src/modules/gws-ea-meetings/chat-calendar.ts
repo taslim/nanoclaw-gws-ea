@@ -730,8 +730,7 @@ export function createChatSchedulingTools(deps: SchedulingToolsDeps) {
               row.request_id,
             );
           }
-          // A failed resume keeps its durable request for the next lifecycle pass.
-          // eslint-disable-next-line no-catch-all/no-catch-all
+          // eslint-disable-next-line no-catch-all/no-catch-all -- a failed resume keeps its durable request for the next lifecycle pass
         } catch (error) {
           log.warn('Chat booking request could not resume', { requestId: row.request_id, error });
         }

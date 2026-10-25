@@ -522,5 +522,7 @@ registerDeliveryAction(
     // A turn the principal started only partly, or not at all.
     if (first === undefined || rest.length > 0) await tellMainOfItsOwn('turn-failed', batch, carriedBy(rest, false));
   },
-  unguarded("reports a failure to the principal or main only; the principal's notice passes the outbound guard"),
+  unguarded(
+    "reports a failure to the principal, main, or a browser errand's delegating group only; the principal's notice passes the outbound guard",
+  ),
 );

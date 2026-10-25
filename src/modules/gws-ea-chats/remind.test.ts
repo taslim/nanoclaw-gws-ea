@@ -1,6 +1,6 @@
 import Database from 'better-sqlite3';
 import { afterEach, expect, it, vi } from 'vitest';
-const { ROOT } = vi.hoisted(() => ({ ROOT: `/tmp/chat-remind-u11-${process.pid}` }));
+const { ROOT } = vi.hoisted(() => ({ ROOT: `/tmp/chat-remind-${process.pid}` }));
 vi.mock('../../config.js', async (original) => ({
   ...(await original<typeof import('../../config.js')>()),
   DATA_DIR: ROOT,
@@ -11,18 +11,25 @@ import { deliverSessionMessages } from '../../delivery.js';
 import { outboundDbPath } from '../../mailbox/sqlite/paths.js';
 import { inboundDbPath } from '../../mailbox/sqlite/paths.js';
 import { reconcileSession } from '../../reconcile-session.js';
-import { cleanU11, dataU11, refusalU11, seedU11, sendU11, deliveredU11 } from './testing/u11-fixture.js';
+import {
+  cleanChatDelivery,
+  chatData,
+  chatRefusal,
+  seedChatDelivery,
+  sendChatRequest,
+  deliveredToChat,
+} from './testing/chat-delivery-fixture.js';
 afterEach(async () => {
   vi.useRealTimers();
   vi.mocked(requestWake).mockClear();
-  await cleanU11(ROOT);
+  await cleanChatDelivery(ROOT);
 });
 it('stores a real in-conversation reminder in the calling chat and wakes that session only when it becomes due', async () => {
-  const { session } = await seedU11();
+  const { session } = await seedChatDelivery();
   const at = new Date(Date.now() + 3_600_000).toISOString();
-  const reply = dataU11(await sendU11(session, 'remind', { at, note: 'Choose the venue.' }, 'same-reminder'));
+  const reply = chatData(await sendChatRequest(session, 'remind', { at, note: 'Choose the venue.' }, 'same-reminder'));
   expect(reply.at).toBe(at);
-  dataU11(await sendU11(session, 'remind', { at, note: 'Choose the venue.' }, 'same-reminder'));
+  chatData(await sendChatRequest(session, 'remind', { at, note: 'Choose the venue.' }, 'same-reminder'));
   const db = new Database(inboundDbPath(session.agent_group_id, session.id));
   try {
     const tasks = db.prepare("SELECT id,content,process_after,status FROM messages_in WHERE kind='task'").all() as {
@@ -67,7 +74,7 @@ it('stores a real in-conversation reminder in the calling chat and wakes that se
     );
   out.close();
   await deliverSessionMessages(session);
-  expect(deliveredU11).toHaveBeenCalledWith(
+  expect(deliveredToChat).toHaveBeenCalledWith(
     'context@g.us',
     null,
     expect.objectContaining({ kind: 'chat', content: { text: 'Choose the venue today.' } }),
@@ -75,25 +82,27 @@ it('stores a real in-conversation reminder in the calling chat and wakes that se
   );
 });
 it('refuses past times and cross-chat fields without creating a reminder', async () => {
-  const { session } = await seedU11();
-  expect(refusalU11(await sendU11(session, 'remind', { at: '2020-01-01T12:00:00Z', note: 'Old.' }))).toContain(
+  const { session } = await seedChatDelivery();
+  expect(chatRefusal(await sendChatRequest(session, 'remind', { at: '2020-01-01T12:00:00Z', note: 'Old.' }))).toContain(
     'future',
   );
   expect(
-    refusalU11(await sendU11(session, 'remind', { at: '2030-01-01T12:00:00Z', note: 'Other.', chat: 'another' })),
+    chatRefusal(
+      await sendChatRequest(session, 'remind', { at: '2030-01-01T12:00:00Z', note: 'Other.', chat: 'another' }),
+    ),
   ).toContain('Unknown field');
 });
 it('replays an interrupted action response into its existing native task instead of a second reminder', async () => {
-  const { session } = await seedU11();
+  const { session } = await seedChatDelivery();
   const fields = { at: new Date(Date.now() + 3_600_000).toISOString(), note: 'Confirm the venue.' };
-  const first = dataU11(await sendU11(session, 'remind', fields, 'interrupted-reminder'));
+  const first = chatData(await sendChatRequest(session, 'remind', fields, 'interrupted-reminder'));
   const db = new Database(inboundDbPath(session.agent_group_id, session.id));
   try {
     // Model a host stop after committing the task but before its action response was durable.
     db.prepare('DELETE FROM messages_in WHERE id=?').run('action-resp-interrupted-reminder');
     vi.useFakeTimers({ toFake: ['Date'] });
     vi.setSystemTime(new Date(Date.now() + 7_200_000));
-    expect(dataU11(await sendU11(session, 'remind', fields, 'interrupted-reminder'))).toEqual(first);
+    expect(chatData(await sendChatRequest(session, 'remind', fields, 'interrupted-reminder'))).toEqual(first);
     expect(db.prepare("SELECT id FROM messages_in WHERE kind='task'").all()).toEqual([{ id: first.reminder }]);
   } finally {
     db.close();

@@ -211,11 +211,11 @@ beforeEach(async () => {
   google.calendar = calendar;
   calendar.calendars.set('juno@example.com', { id: 'juno@example.com', accessRole: 'writer' });
   calendar.calendars.set('other@example.com', { id: 'other@example.com', accessRole: 'writer' });
-  workspace.drive = new FakeDrive('robin@example.com');
+  workspace.drive = new FakeDrive('avery@example.com');
   for (const id of ['main', 'external', 'job', 'peer'])
     await createAgentGroup({ id, name: id, folder: id, agent_provider: null, created_at: new Date().toISOString() });
   await getDb().run(
-    "UPDATE gws_ea_profile SET assistant_first_name=COALESCE(assistant_first_name,'Juno'),principal_first_name=COALESCE(principal_first_name,'Morgan'),main_agent_group_id='main',external_chat_agent_group_id='external',assistant_first_name = 'Robin', assistant_last_name = NULL WHERE singleton=1",
+    "UPDATE gws_ea_profile SET assistant_first_name=COALESCE(assistant_first_name,'Juno'),principal_first_name=COALESCE(principal_first_name,'Morgan'),main_agent_group_id='main',external_chat_agent_group_id='external',assistant_first_name = 'Avery', assistant_last_name = NULL WHERE singleton=1",
   );
   await getDb().run(
     "INSERT INTO users(id,kind,display_name,created_at) VALUES('whatsapp:11','whatsapp','Juno',?)",

@@ -30,7 +30,7 @@ vi.mock('../../log.js', () => ({
   log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn(), fatal: vi.fn() },
 }));
 import '../gws-ea-voice/index.js';
-import { seedU11, cleanU11 } from './testing/u11-fixture.js';
+import { seedChatDelivery, cleanChatDelivery } from './testing/chat-delivery-fixture.js';
 import { registerChannelAdapter } from '../../channels/channel-registry.js';
 import { GCHAT_DEFAULTS } from '../gws-ea-chat/adapter.js';
 import { getDb } from '../../db/connection.js';
@@ -60,13 +60,13 @@ registerChannelAdapter('gchat', {
 let chatId: string;
 beforeEach(async () => {
   fs.rmSync(ROOT, { recursive: true, force: true });
-  chatId = (await seedU11()).chat.messaging_group_id;
+  chatId = (await seedChatDelivery()).chat.messaging_group_id;
   send.mockClear();
   vi.mocked(startTypingRefresh).mockClear();
   vi.mocked(requestWake).mockClear();
   setDeliveryAdapter({ deliver: send });
 });
-afterEach(async () => cleanU11(ROOT));
+afterEach(async () => cleanChatDelivery(ROOT));
 function clear(platform: string, group: boolean, addressed = false, person = '22'): InboundEvent {
   return {
     channelType: 'whatsapp',
@@ -173,15 +173,15 @@ it.each([
   {
     label: 'direct caption with forwarded recording',
     source: { kind: 'audio', forwarded: true },
-    text: 'Robin, summarize this.',
+    text: 'Avery, summarize this.',
     forwarded: false,
     engaged: true,
   },
-  { label: 'forwarded message', source: undefined, text: 'Robin, check Thursday.', forwarded: true, engaged: false },
+  { label: 'forwarded message', source: undefined, text: 'Avery, check Thursday.', forwarded: true, engaged: false },
 ])(
   'engages only for direct content while retaining $label as chat context',
   async ({ source, text, forwarded, engaged }) => {
-    recognition.words = 'Robin, check Thursday.';
+    recognition.words = 'Avery, check Thursday.';
     await routeInbound({
       ...clear('context@g.us', true),
       message: {
@@ -208,6 +208,6 @@ it.each([
     );
     const stored = records?.find((record) => record.id.startsWith('source-content:'));
     expect(stored).toMatchObject({ trigger: engaged });
-    expect(stored?.content).toContain('Robin, check Thursday.');
+    expect(stored?.content).toContain('Avery, check Thursday.');
   },
 );

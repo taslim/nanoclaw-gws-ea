@@ -630,7 +630,7 @@ export async function placeNowhere(links: readonly LinkRef[]): Promise<PlacedNow
   const pieces = parsed.map((link) => {
     if (!isPiece(link.kind)) {
       throw new Error(
-        `Only a thread, event or file is placed nowhere: unlink the ${link.kind} ${link.reference} from its matter instead`,
+        `Only a thread, event, file or job is placed nowhere: unlink the ${link.kind} ${link.reference} from its matter instead`,
       );
     }
     return { kind: link.kind, reference: link.reference };
@@ -812,6 +812,17 @@ export async function setChatLinkAccount(
     chat,
   );
   if (changes === 0) throw new Error(`No open matter ${matterId} links chat ${chat}`);
+}
+
+/** In open and closed matters alike. */
+export async function clearChatLinkAccounts(messagingGroupIds: readonly string[]): Promise<void> {
+  const db = getDb();
+  for (const chat of new Set(messagingGroupIds)) {
+    await db.run(
+      "UPDATE gws_ea_matter_links SET account = NULL, account_at = NULL WHERE kind = 'chat' AND reference = ?",
+      chat,
+    );
+  }
 }
 
 /** `at` null clears the mark. A matter that is gone, or closed since, is left as it is. */

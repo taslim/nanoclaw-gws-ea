@@ -410,7 +410,6 @@ const STATE_REFUSALS: ReadonlySet<string> = new Set([
   'host_not_running',
   'release_not_newer',
   'rollback_unavailable',
-  'kept_release_mismatch',
   'rollback_failed',
   'tool_checkout_moved',
 ]);

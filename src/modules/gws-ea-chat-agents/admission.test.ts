@@ -108,7 +108,7 @@ beforeEach(async () => {
   );
   await runMigrations(await initTestDb());
   await getDb().run(
-    "UPDATE gws_ea_profile SET assistant_first_name = 'Robin', assistant_last_name = NULL, principal_first_name = 'Juno', principal_last_name = 'Hale', assistant_workspace_email = 'assistant@example.test' WHERE singleton = 1",
+    "UPDATE gws_ea_profile SET assistant_first_name = 'Avery', assistant_last_name = NULL, principal_first_name = 'Juno', principal_last_name = 'Hale', assistant_workspace_email = 'assistant@example.test' WHERE singleton = 1",
   );
   await createMessagingGroup({
     id: 'trip',
@@ -223,7 +223,7 @@ it('names casual and job sessions at creation, profile rename and startup reconc
   const external = await ensureExternalChatGroup();
   const job = await createJobAgent('trip');
   const groups = [external, job.agent_group_id];
-  for (const id of groups) expect((await materializeContainerJson(id)).assistantName).toBe('Robin');
+  for (const id of groups) expect((await materializeContainerJson(id)).assistantName).toBe('Avery');
   await createAgentGroup({
     id: 'main',
     name: 'main',
@@ -250,7 +250,7 @@ it('names casual and job sessions at creation, profile rename and startup reconc
 });
 
 it('composes browser guidance only for an explicitly granted active job and removes it on revocation', async () => {
-  await recordWebAlias('nibor@example.test');
+  await recordWebAlias('yreva@example.test');
   const external = await ensureExternalChatGroup();
   const job = await createJobAgent('trip');
   expect(await documentFor(external)).not.toContain('# Browser delegation');
@@ -258,7 +258,7 @@ it('composes browser guidance only for an explicitly granted active job and remo
   expect(withoutBrowser).not.toContain('# Browser delegation');
   expect(withoutBrowser).not.toContain('shared signed-in profile and vault');
   expect(withoutBrowser).not.toContain('`record_disclosure`');
-  expect(withoutBrowser).not.toContain('nibor@example.test');
+  expect(withoutBrowser).not.toContain('yreva@example.test');
   policy([job.agent_group_id]);
   expect(await documentFor(job.agent_group_id)).not.toContain('# Browser delegation');
   await activateJobAgent(job.agent_group_id);
@@ -272,7 +272,7 @@ it('composes browser guidance only for an explicitly granted active job and remo
   const identity = (await getRequiredProjectDocSections(group)).find(
     (section) => section.name === 'Assistant Identity',
   );
-  expect(identity?.body).toContain("Robin's verified web address is `nibor@example.test`.");
+  expect(identity?.body).toContain("Avery's web address is `yreva@example.test`.");
   expect(granted).toContain('shared signed-in profile and vault');
   expect(granted).toContain('`record_disclosure`');
   expect(granted).toContain('principal approvals');
@@ -284,7 +284,7 @@ it('composes browser guidance only for an explicitly granted active job and remo
   expect(revoked).not.toContain('# Browser delegation');
   expect(revoked).not.toContain('shared signed-in profile and vault');
   expect(revoked).not.toContain('`record_disclosure`');
-  expect(revoked).not.toContain('nibor@example.test');
+  expect(revoked).not.toContain('yreva@example.test');
 });
 
 it('creates one sealed shared agent and a job agent with separate exact stored shapes and model-only gateway identities', async () => {

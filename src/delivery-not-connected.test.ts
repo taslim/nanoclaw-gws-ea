@@ -50,7 +50,7 @@ afterEach(async () => {
 
 async function conversation(): Promise<Session> {
   const created_at = new Date().toISOString();
-  await createAgentGroup({ id: 'main', name: 'Robin', folder: 'main', agent_provider: null, created_at });
+  await createAgentGroup({ id: 'main', name: 'Avery', folder: 'main', agent_provider: null, created_at });
   for (const channel_type of ['whatsapp', 'gchat']) {
     await createMessagingGroup({
       id: channel_type,

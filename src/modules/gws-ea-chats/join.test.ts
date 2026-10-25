@@ -110,7 +110,7 @@ registerExpectedChatReplyReader('test:expected', async (chat, user) => expected.
 registerInboundPreparer((request) =>
   request.content.replace(
     '"speech":null',
-    '"speech":{"status":"recognized","text":"Robin, can you help?","language":"en"}',
+    '"speech":{"status":"recognized","text":"Avery, can you help?","language":"en"}',
   ),
 );
 const adapter: ChannelAdapter = {
@@ -216,7 +216,7 @@ beforeEach(async () => {
   for (const id of ['main', 'external', 'peer'])
     await createAgentGroup({ id, name: id, folder: id, agent_provider: null, created_at: new Date().toISOString() });
   await getDb().run(
-    "UPDATE gws_ea_profile SET assistant_first_name=COALESCE(assistant_first_name,'Juno'),principal_first_name=COALESCE(principal_first_name,'Morgan'),main_agent_group_id='main', external_chat_agent_group_id='external', assistant_first_name = 'Robin', assistant_last_name = NULL WHERE singleton=1",
+    "UPDATE gws_ea_profile SET assistant_first_name=COALESCE(assistant_first_name,'Juno'),principal_first_name=COALESCE(principal_first_name,'Morgan'),main_agent_group_id='main', external_chat_agent_group_id='external', assistant_first_name = 'Avery', assistant_last_name = NULL WHERE singleton=1",
   );
   await getDb().run(
     "INSERT INTO users (id,kind,display_name,created_at) VALUES ('whatsapp:11','whatsapp','Juno',?)",
@@ -238,7 +238,7 @@ beforeEach(async () => {
   gchatSpeaker = 'users/300';
   chatAdapter = new AssistantChatAdapter({
     botUserId: 'users/100',
-    userName: 'Robin',
+    userName: 'Avery',
     auth: hostChatAuth(async () => 'chat', chatFetch),
     chatToken: async () => 'chat',
     fetch: chatFetch,
@@ -275,7 +275,7 @@ afterEach(async () => {
 });
 
 it('settles a disconnected reply before rejoining without the principal and uses a fresh conversation', async () => {
-  await routeInbound(inbound('first', 'Robin'));
+  await routeInbound(inbound('first', 'Avery'));
   const chat = await group();
   const old = await getDb().get<Session>('SELECT * FROM sessions WHERE messaging_group_id=?', chat.id);
   if (!old) throw new Error('No original session');
@@ -308,9 +308,9 @@ it('settles a disconnected reply before rejoining without the principal and uses
       successful: [...mailbox.getDeliveredIds('delivered')],
     })),
   ).toEqual({ terminal: ['old-pending'], successful: [] });
-  await routeInbound(inbound('new-held', 'Robin'));
+  await routeInbound(inbound('new-held', 'Avery'));
   await routeInbound(
-    inbound('principal-admits', 'Robin', { authenticatedSender: { userId: 'whatsapp:11', kind: 'human' } }),
+    inbound('principal-admits', 'Avery', { authenticatedSender: { userId: 'whatsapp:11', kind: 'human' } }),
   );
   const fresh = await getDb().get<Session>(
     "SELECT * FROM sessions WHERE messaging_group_id=? AND status='active'",
@@ -327,7 +327,7 @@ it('settles a disconnected reply before rejoining without the principal and uses
 });
 
 it('refuses a prior conversation reply already selected before detach and principal-free rejoin', async () => {
-  await routeInbound(inbound('first', 'Robin'));
+  await routeInbound(inbound('first', 'Avery'));
   const chat = await group();
   const old = await getDb().get<Session>('SELECT * FROM sessions WHERE messaging_group_id=?', chat.id);
   if (!old) throw new Error('No original session');
@@ -366,7 +366,7 @@ it('refuses a prior conversation reply already selected before detach and princi
 });
 
 it('finishes stopping the previous chat container before opening another admission epoch', async () => {
-  await routeInbound(inbound('first', 'Robin'));
+  await routeInbound(inbound('first', 'Avery'));
   const chat = await group();
   const old = await getDb().get<Session>('SELECT * FROM sessions WHERE messaging_group_id=?', chat.id);
   if (!old) throw new Error('No original session');
@@ -414,7 +414,7 @@ it('finishes stopping the previous chat container before opening another admissi
 });
 
 it('records an already entered channel send before settling the closed conversation outbox', async () => {
-  await routeInbound(inbound('first', 'Robin'));
+  await routeInbound(inbound('first', 'Avery'));
   const chat = await group();
   const old = await getDb().get<Session>('SELECT * FROM sessions WHERE messaging_group_id=?', chat.id);
   if (!old) throw new Error('No original session');
@@ -486,8 +486,8 @@ it('joins silently from a WhatsApp membership event without a message or introdu
 });
 it('holds every asking message despite mentions and sends main one framed note', async () => {
   principal = false;
-  await routeInbound(inbound('held', 'Robin', { isMention: true }));
-  await routeInbound(inbound('again', '@Robin'));
+  await routeInbound(inbound('held', 'Avery', { isMention: true }));
+  await routeInbound(inbound('again', '@Avery'));
   expect(await rows()).toEqual([
     expect.objectContaining({ status: 'held', trigger: 1 }),
     expect.objectContaining({ status: 'held', trigger: 1 }),
@@ -526,7 +526,7 @@ it('keeps forwarded principal messages held and expires asking chats without lea
   await routeInbound(
     inbound('forward', '', {
       authenticatedSender: { userId: 'whatsapp:11', kind: 'human' },
-      content: JSON.stringify({ text: 'yes Robin', forwarded: true }),
+      content: JSON.stringify({ text: 'yes Avery', forwarded: true }),
     }),
   );
   expect(await getChat((await group()).id)).toMatchObject({ state: 'asking' });
@@ -536,7 +536,7 @@ it('keeps forwarded principal messages held and expires asking chats without lea
     expect.objectContaining({ status: 'completed' }),
     expect.objectContaining({ status: 'completed' }),
   ]);
-  await routeInbound(inbound('late', '@Robin', { isMention: true }));
+  await routeInbound(inbound('late', '@Avery', { isMention: true }));
   expect(await rows()).toHaveLength(2);
   expect(requestWake).not.toHaveBeenCalled();
 });
@@ -548,7 +548,7 @@ it('retains prepared voice while held and releases it through a principal DM adm
     }),
   );
   expect(await rows()).toEqual([
-    expect.objectContaining({ status: 'held', content: expect.stringContaining('Robin, can you help?') }),
+    expect.objectContaining({ status: 'held', content: expect.stringContaining('Avery, can you help?') }),
   ]);
   const id = (await group()).id;
   await getDb().run(
@@ -568,7 +568,7 @@ it('retains prepared voice while held and releases it through a principal DM adm
     expect.objectContaining({
       status: 'pending',
       trigger: 1,
-      content: expect.stringContaining('Robin, can you help?'),
+      content: expect.stringContaining('Avery, can you help?'),
     }),
   ]);
 });
@@ -638,8 +638,8 @@ it('keeps native agent destinations available but refuses channel grants and cha
 it('engages on its whole name, mention, own quote and expected replies, leaving banter and other quotes quiet', async () => {
   for (const [id, text, fields] of [
     ['banter', 'hello', {}],
-    ['name', 'hey robin!', {}],
-    ['at', '@Robin help', {}],
+    ['name', 'hey avery!', {}],
+    ['at', '@Avery help', {}],
     ['namesake', 'Robinhood', {}],
     ['mention', 'help', { isMention: true }],
     ['own', '', { content: JSON.stringify({ text: '', replyTo: { id: 'our-send' } }) }],
@@ -769,7 +769,7 @@ it('refreshes current membership for permission boundaries and records newly aut
 });
 it('recovers a committed admission whose held release was interrupted, preserving real engagement intent', async () => {
   principal = false;
-  await routeInbound(inbound('held-mention', 'Robin'));
+  await routeInbound(inbound('held-mention', 'Avery'));
   const id = (await group()).id;
   vi.spyOn(sessionManager, 'withExistingMailboxSession').mockRejectedValueOnce(new Error('Interrupted release'));
   await expect(
@@ -786,7 +786,7 @@ it('recovers a committed admission whose held release was interrupted, preservin
 });
 it('rejoins only on an actual assistant-added event, starts a fresh admission epoch and never revives clearances', async () => {
   principal = false;
-  await routeInbound(inbound('held', 'Robin'));
+  await routeInbound(inbound('held', 'Avery'));
   const id = (await group()).id;
   const old = await getChat(id);
   const secret = await addPrivateValue({ kind: 'other', value: 'Private fixture detail', label: 'Fixture' });
@@ -798,7 +798,7 @@ it('rejoins only on an actual assistant-added event, starts a fresh admission ep
     new Date().toISOString(),
   );
   await detachChat(id);
-  await routeInbound(inbound('late', 'Robin'));
+  await routeInbound(inbound('late', 'Avery'));
   const facts = {
     platformId: 'trip@g.us',
     name: 'New Trip',
@@ -823,7 +823,7 @@ it('rejoins only on an actual assistant-added event, starts a fresh admission ep
 });
 it('releases only the current serving agent’s held messages during lifecycle recovery', async () => {
   principal = false;
-  await routeInbound(inbound('old-held', 'Robin'));
+  await routeInbound(inbound('old-held', 'Avery'));
   const id = (await group()).id;
   const now = new Date().toISOString();
   await getDb().run(
@@ -840,7 +840,7 @@ it('releases only the current serving agent’s held messages during lifecycle r
     platformId: 'trip@g.us',
     channelType: 'whatsapp',
     threadId: null,
-    content: JSON.stringify({ text: 'Robin' }),
+    content: JSON.stringify({ text: 'Avery' }),
     trigger: true,
     status: 'held',
   });
@@ -892,7 +892,7 @@ it('admits an asking GChat space from the principal’s native authenticated mes
 });
 it('declines a held chat through main’s host boundary without adding a principal approval burden', async () => {
   principal = false;
-  await routeInbound(inbound('held', 'Robin'));
+  await routeInbound(inbound('held', 'Avery'));
   const id = (await group()).id;
   await declineChat(id);
   expect(await getChat(id)).toMatchObject({ state: 'declined' });
@@ -927,7 +927,7 @@ it('refreshes host context on a real engaged turn, including new verified levels
     }
   };
   expect(contextTexts()).toEqual([]);
-  await routeInbound(inbound('first-context', 'Robin, help.'));
+  await routeInbound(inbound('first-context', 'Avery, help.'));
   expect(contextTexts()).toHaveLength(1);
   await addPerson({
     name: 'Private person name',
@@ -937,7 +937,7 @@ it('refreshes host context on a real engaged turn, including new verified levels
     identity: 'whatsapp:22',
   });
   await routeInbound(
-    inbound('changed-context', 'Robin, new request.', {
+    inbound('changed-context', 'Avery, new request.', {
       authenticatedSender: { userId: 'whatsapp:22', displayName: 'Mira Updated', kind: 'human' },
     }),
   );
