@@ -565,9 +565,15 @@ export class AssistantChatAdapter
   private async withSenderName(message: ChatMessage): Promise<ChatMessage> {
     const quote = message.quotedMessageMetadata;
     const quoted = quote?.quotedMessageSnapshot?.sender;
+    const senderName =
+      message.sender.name === this.botUserId ? undefined : this.hydrator.displayName(message.sender.name);
     const [displayName, quotedName] = await Promise.all([
-      message.sender.name === this.botUserId ? undefined : this.hydrator.displayName(message.sender.name),
-      quoted === undefined || quoted === this.botUserId ? undefined : this.hydrator.displayName(quoted),
+      senderName,
+      quoted === undefined || quoted === this.botUserId
+        ? undefined
+        : quoted === message.sender.name
+          ? senderName
+          : this.hydrator.displayName(quoted),
     ]);
     return {
       ...message,
@@ -680,7 +686,8 @@ export function extractGchatReplyContext(raw: Record<string, unknown>): ReplyCon
   if (quote === undefined) return null;
   const snapshot = isRecord(quote.quotedMessageSnapshot) ? quote.quotedMessageSnapshot : undefined;
   const text = typeof snapshot?.text === 'string' ? snapshot.text : '';
-  const senderId = typeof snapshot?.sender === 'string' && snapshot.sender.trim() ? snapshot.sender : undefined;
+  const sender = typeof snapshot?.sender === 'string' && snapshot.sender.trim() ? snapshot.sender : undefined;
+  const senderId = sender !== undefined && /^users\/[^/\s]+$/u.test(sender) ? sender : undefined;
   const senderName =
     typeof snapshot?.senderName === 'string' && snapshot.senderName.trim() ? snapshot.senderName : undefined;
   const self = snapshot?.byAssistant === true;
@@ -688,7 +695,7 @@ export function extractGchatReplyContext(raw: Record<string, unknown>): ReplyCon
   const forwarded = quote.quoteType === 'FORWARD';
   if (!text.trim() && id === undefined && !forwarded) return null;
   return {
-    sender: senderName ?? senderId ?? 'unknown',
+    sender: senderName ?? sender ?? 'unknown',
     text,
     ...(self ? { self: true } : senderId === undefined ? {} : { senderId }),
     ...(id === undefined ? {} : { id }),

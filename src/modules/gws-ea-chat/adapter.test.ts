@@ -379,6 +379,26 @@ describe('messages', () => {
     });
   });
 
+  it('reads a name once when a member quotes their own message', async () => {
+    await start();
+    api.addMessage(
+      chatMessage(DM, 'juno.2', {
+        sender: { name: 'users/2001', type: 'HUMAN' },
+        text: 'Still true',
+        quotedMessageMetadata: {
+          name: `${DM}/messages/juno.1`,
+          quoteType: 'REPLY',
+          quotedMessageSnapshot: { sender: 'users/2001', text: 'Friday works' },
+        },
+      }),
+    );
+
+    await deliver!(messageEvent(`${DM}/messages/juno.2`));
+
+    expect(content().replyTo).toMatchObject({ sender: 'Juno Hale', senderId: 'users/2001' });
+    expect(api.requests.filter((request) => request.url.host === 'people.googleapis.com')).toHaveLength(1);
+  });
+
   it("marks a quote of the assistant's own message, and lists whom a message mentions", async () => {
     await start();
     api.addMessage(
@@ -1635,7 +1655,7 @@ describe('the reply context', () => {
           quotedMessageSnapshot: { sender: 'Remy Vance', text: 'Offsite moved to May.' },
         }),
       ),
-    ).toEqual({ sender: 'Remy Vance', senderId: 'Remy Vance', text: 'Offsite moved to May.', forwarded: true });
+    ).toEqual({ sender: 'Remy Vance', text: 'Offsite moved to May.', forwarded: true });
     expect(extractGchatReplyContext(quoting({ name: `${ROOM}/messages/remy.9`, quoteType: 'FORWARD' }))).toEqual({
       sender: 'unknown',
       text: '',

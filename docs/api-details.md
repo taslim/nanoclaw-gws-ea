@@ -142,7 +142,8 @@ Other engagement modes retain their existing delivery behavior.
 `createMessagingGroupAgent(wiring, { companionDestination: false })` writes the
 wiring without a group-wide channel destination. Its sessions can still reply
 to their originating chat: each session's destination map names that chat
-`this-chat`, never by the chat's own name, unless a destination already covers it. `runInConversationTail(address, work)` orders a
+`this-chat` (suffixed, `this-chat-2`, when another destination holds that name),
+never by the chat's own name, unless a destination already covers it. `runInConversationTail(address, work)` orders a
 host cutover between inbound messages for that adapter instance and chat.
 
 A linked adapter that is temporarily disconnected throws

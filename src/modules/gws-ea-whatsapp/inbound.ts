@@ -126,7 +126,15 @@ export function createWhatsAppInbound(options: WhatsAppInboundOptions) {
     for (const mention of context?.mentionedJid ?? []) {
       const jid = normalizedJid(mention);
       const own = self.includes(jid);
-      const mentioned = own ? undefined : await resolvePerson(socket, options.index, jid);
+      let mentioned;
+      if (!own) {
+        try {
+          mentioned = await resolvePerson(socket, options.index, jid);
+          /* eslint-disable-next-line no-catch-all/no-catch-all -- a mention's key is never worth the message: it routes with that mention unkeyed */
+        } catch (error) {
+          log.warn('WhatsApp mention could not be resolved', { mention: jid, err: error });
+        }
+      }
       if (own) mentions.add('you');
       else if (mentioned) mentions.add(`whatsapp:${mentioned.lid}`);
       const name = own ? socket.user?.name : options.index.name(jid);

@@ -214,6 +214,25 @@ describe('durable WhatsApp inbound and trusted context', () => {
     expect(h.content()[0].mentions).toEqual(['whatsapp:14000', 'you']);
     expect(h.messages()[0].isMention).toBe(true);
   });
+  it('routes a message whose mention cannot be resolved, without that mention key', async () => {
+    await h.start();
+    vi.spyOn(h.socket().signalRepository.lidMapping, 'getLIDForPN').mockRejectedValueOnce(new Error('usync down'));
+    await h.socket().emit('messages.upsert', {
+      type: 'notify',
+      messages: [
+        incoming('mention-outage', '', {
+          message: {
+            extendedTextMessage: {
+              text: '@15559990000 and @999000 hello',
+              contextInfo: { mentionedJid: ['15559990000@s.whatsapp.net', '999000@lid'] },
+            },
+          },
+        }),
+      ],
+    });
+    expect(h.content()[0].mentions).toEqual(['you']);
+    expect(h.messages()[0].isMention).toBe(true);
+  });
   it('emits reactions on own sends with the native target shape and no written text', async () => {
     const adapter = await h.start();
     const id = await adapter.deliver('team@g.us', null, { kind: 'chat', content: { text: 'Dinner is booked' } }, 'own');
