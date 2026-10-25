@@ -260,8 +260,6 @@ revoked or deleted them, close it with
 
 ```sh
 gws-ea capabilities enable browser --id 01234567-89ab-4def-8123-456789abcdef
-# Once the offered alias is added in the Google Admin console:
-gws-ea capabilities enable browser --id 01234567-89ab-4def-8123-456789abcdef --alias-added
 ```
 
 An assistant whose browser is enabled has one web alias: its address for
@@ -273,28 +271,29 @@ name that reads the same reversed moves its first letter to the end instead
 never offered, and later candidates are numbered (`onuj2`, `onuj3`).
 
 `capabilities enable browser`, and `create` or `resume` once the browser is
-enabled, pause after every other step with the candidate and where to add
-it: the assistant's account in the Admin console (Directory > Users), then
-User information > Alternate email addresses (email aliases). The candidate
-is claimed on this machine first, so no two assistants are asked for the
-same address. Continue the same command with one of:
+enabled, show the candidate and where to add it: the assistant's account in
+the Admin console (Directory > Users), then User information > Alternate
+email addresses (email aliases). The candidate is claimed on this machine
+first, so no two assistants are asked for the same address.
 
-- `--alias-added`: the alias is added. The assistant sends a short,
-  self-explaining test message to it and reads it back. An arrival records
-  the alias. A bounce means it is not added yet, and a copy through a Google
-  Group is refused. A new alias can take up to 24 hours to receive mail; run
-  the command again later without a flag to read the same message back.
-- `--alias-taken`: the Admin console says the address is in use; the next
-  candidate is offered.
-- `--alias <name>`: a name, or whole address, of your own; with
-  `--alias-added` once it is added. A name that gives no candidate, such as
-  one without ASCII letters, waits for this.
+At a terminal, the command waits while you configure it. Confirm that you
+added the exact address to the assistant's account, and the command records
+it and continues. If the Admin console says the name is taken, choose the
+next candidate; you can also enter a name of your own. No test email is sent.
 
-Until the alias is verified, `status` reports setup as incomplete: its
-`web_alias` probe is degraded, naming the address it waits on and the command
-that continues. The alias is set up through the running assistant, so a
-stopped one pauses until `gws-ea start`. A recorded alias is not changed by
-these flags.
+If you stop or run without input, the command reports setup as incomplete.
+The existing resume options are available for unattended runs:
+
+- `--alias-added`: confirm that you added the proposed alias.
+- `--alias-taken`: offer the next candidate when the name is already in use.
+- `--alias <name>`: propose your own name or whole address; combine with
+  `--alias-added` when you have already added it.
+
+Until you confirm, `status` reports the web alias as pending. Once recorded,
+it reports the alias as configured. Configuration is the operator's
+responsibility; gws-ea does not test delivery. Google can take up to 24 hours
+to apply a new alias. A stopped assistant must be started to record its
+profile. A recorded alias is not changed by these flags.
 
 ## Browser access
 

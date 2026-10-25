@@ -273,7 +273,7 @@ export async function enableBrowserCapability(
 }
 
 /**
- * Enable the assistant's browser, then bring it to a verified web alias
+ * Enable the assistant's browser, then bring it to a configured web alias
  * (KTD13): under the assistant's lock again, and only while the policy still
  * enables the browser. An alias that waits on the operator returns as the
  * operation's pause, with the browser already enabled.

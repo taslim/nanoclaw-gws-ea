@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { SqliteDriver } from '../../db/drivers/sqlite.js';
 import { migrations, runMigrations } from '../../db/migrations/index.js';
 import {
+  gwsEaAliasConfirmationMigration,
   gwsEaProfileMigration,
   gwsEaPrincipalAddressesMigration,
   gwsEaExternalEmailPointerMigration,
@@ -25,6 +26,7 @@ const profileMigrations = [
   gwsEaExternalChatPointerMigration,
   gwsEaPrincipalMessagesMigration,
   gwsEaPrincipalDmRoutingMigration,
+  gwsEaAliasConfirmationMigration,
 ];
 
 beforeEach(async () => {
@@ -58,5 +60,32 @@ describe('native structured profile schema', () => {
       assistant_last_name: null,
       principal_last_name: null,
     });
+  });
+});
+
+describe('alias confirmation schema', () => {
+  it.each([
+    { alias: 'onuj@example.test', candidate: null },
+    { alias: null, candidate: 'onuj@example.test' },
+  ])('drops obsolete probe data without changing alias setup: $alias / $candidate', async ({ alias, candidate }) => {
+    await db.close();
+    db = new SqliteDriver(new Database(':memory:'));
+    await runMigrations(
+      db,
+      profileMigrations.filter((migration) => migration !== gwsEaAliasConfirmationMigration),
+    );
+    await db.run(
+      'UPDATE gws_ea_profile SET assistant_alias = ?, alias_candidate = ?, alias_probe_message_id = ? WHERE singleton = 1',
+      alias,
+      candidate,
+      '<alias-check.old@example.test>',
+    );
+    await runMigrations(db, profileMigrations);
+    expect(await db.get('SELECT assistant_alias AS alias, alias_candidate AS candidate FROM gws_ea_profile')).toEqual({
+      alias,
+      candidate,
+    });
+    const columns = await db.all<{ name: string }>('PRAGMA table_info(gws_ea_profile)');
+    expect(columns.some((column) => column.name === 'alias_probe_message_id')).toBe(false);
   });
 });

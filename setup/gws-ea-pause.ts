@@ -78,19 +78,12 @@ async function askClientFile(prompts: PausePrompts, signal: AbortSignal): Promis
   return answer.trim() ? typedPath(answer.trim()) : '';
 }
 
-/** What the operator can say at a web alias pause, by its code; the one asking for a name takes it at once. */
-const ALIAS_ANSWERS: Readonly<Record<string, readonly AliasAnswer[]>> = {
-  alias_required: ['added', 'taken', 'named'],
-  alias_not_added: ['added', 'taken', 'named'],
-  alias_is_group: ['taken', 'named', 'added'],
-  alias_not_delivered: ['check', 'taken', 'named'],
-};
-type AliasAnswer = 'added' | 'taken' | 'named' | 'check';
+const ALIAS_ANSWERS = ['added', 'taken', 'named'] as const;
+type AliasAnswer = (typeof ALIAS_ANSWERS)[number];
 const ALIAS_LABELS: Readonly<Record<AliasAnswer, string>> = {
-  added: 'It is added',
+  added: 'I have added this alias to the assistant’s account',
   taken: 'The Admin console says it is already in use',
   named: 'Use a name of my own',
-  check: 'Check again',
 };
 
 /** The operator's own alias name, asked until the Admin console could take it; undefined when they cancel. */
@@ -112,8 +105,7 @@ async function askAliasName(prompts: PausePrompts, signal: AbortSignal): Promise
 /**
  * A web alias pause (KTD13): where to add it, then what the operator says,
  * as the decision `--alias-added`, `--alias-taken` or `--alias <name>`
- * records. Checking again for a test message decides nothing, so a probe
- * already sent is read back rather than sent again.
+ * records. The run continues as soon as the operator confirms it.
  */
 async function attendAliasPause(
   pause: ProvisionHumanPause,
@@ -121,32 +113,30 @@ async function attendAliasPause(
   prompts: PausePrompts,
   signal: AbortSignal,
 ): Promise<PauseResponse> {
+  const expected = pause.aliasCandidate === undefined ? {} : { expectedCandidate: pause.aliasCandidate };
   const named = async (): Promise<PauseResponse> => {
     const name = await askAliasName(prompts, signal);
-    return name === undefined ? STOP : { kind: 'continue', decisions: { alias: { kind: 'named', name } } };
+    return name === undefined ? STOP : { kind: 'continue', decisions: { alias: { kind: 'named', name, ...expected } } };
   };
   const context = [...(pause.details ?? []), ...(pause.actionUrl ? [`Open: ${pause.actionUrl}`] : [])];
   if (pause.code === 'alias_name_required') {
     prompts.note(shown, "The assistant's web alias");
     return named();
   }
-  const answers = ALIAS_ANSWERS[pause.code];
-  if (answers === undefined) return STOP;
+  if (pause.code !== 'alias_required') return STOP;
   if (context.length > 0) prompts.note(context.join('\n'), "The assistant's web alias");
   const selected = await prompts.select({
     message: pause.message,
-    options: answers.map((answer) => ({ value: answer, label: ALIAS_LABELS[answer] })),
+    options: ALIAS_ANSWERS.map((answer) => ({ value: answer, label: ALIAS_LABELS[answer] })),
     signal,
   });
   switch (selected) {
     case 'added':
-      return { kind: 'continue', decisions: { alias: { kind: 'added' } } };
+      return { kind: 'continue', decisions: { alias: { kind: 'added', ...expected } } };
     case 'taken':
-      return { kind: 'continue', decisions: { alias: { kind: 'taken' } } };
+      return { kind: 'continue', decisions: { alias: { kind: 'taken', ...expected } } };
     case 'named':
       return named();
-    case 'check':
-      return { kind: 'continue', decisions: { alias: undefined } };
     default:
       return STOP;
   }

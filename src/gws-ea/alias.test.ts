@@ -8,17 +8,13 @@ import { dispatch } from '../cli/dispatch.js';
 import { parseArgv } from '../cli/parse-argv.js';
 import { closeDb, initTestDb, runMigrations } from '../db/index.js';
 import { getAliasSetup } from '../modules/gws-ea-profile/db.js';
-import { setActiveInbox } from '../modules/gws-ea-inbox/runtime.js';
 import {
   ALIAS,
-  aliasInbox,
   ASSISTANT_EMAIL,
-  FakeAliasGmail,
   PRINCIPAL_EMAIL,
   publishAliasTestProfile,
-} from '../modules/gws-ea-inbox/testing/alias-mailbox.js';
+} from '../modules/gws-ea-profile/testing/alias-profile.js';
 import '../modules/gws-ea-profile/index.js';
-import '../modules/gws-ea-inbox/index.js';
 import {
   aliasCandidateAfter,
   aliasHost,
@@ -29,8 +25,8 @@ import {
   type AliasDecision,
   type AliasHost,
 } from './alias.js';
-import { runCli } from './cli.js';
-import type { RunEvent } from './events.js';
+import { runCli, type CliRuntime } from './cli.js';
+import type { InteractivePrompts, RunEvent } from './events.js';
 import { deriveGcpClaims } from './gcp-identity.js';
 import { reserveInstance } from './journal.js';
 import { resolveControlPlanePaths, type ControlPlanePaths } from './paths.js';
@@ -159,9 +155,7 @@ async function hostNcl(args: readonly string[]): Promise<unknown> {
 interface StepWorld {
   readonly paths: ControlPlanePaths;
   readonly instanceId: string;
-  readonly gmail: FakeAliasGmail;
   readonly events: RunEvent[];
-  readonly sleeps: number[];
   run(decision?: AliasDecision): Promise<ProvisionResult>;
   claimed(): Promise<string | undefined>;
 }
@@ -169,24 +163,38 @@ interface StepWorld {
 async function stepWorld(host: AliasHost = aliasHost(hostNcl)): Promise<StepWorld> {
   const paths = await testPaths();
   const reserved = await reserveInstance(paths, reservation(ASSISTANT_EMAIL, 31_002));
-  const gmail = new FakeAliasGmail();
-  setActiveInbox(aliasInbox(gmail));
   const events: RunEvent[] = [];
-  const sleeps: number[] = [];
   return {
     paths,
     instanceId: reserved.instance_id,
-    gmail,
     events,
-    sleeps,
     run: (decision) =>
       ensureAssistantAlias(
         { paths, instanceId: reserved.instance_id, host, ...(decision ? { decision } : {}) },
         { emit: (event) => events.push(event) },
-        async (milliseconds) => void sleeps.push(milliseconds),
       ),
     claimed: async () =>
       (await getInstanceReservation(paths, reserved.instance_id)).exclusive_resource_claims.alias_email,
+  };
+}
+
+function aliasTerminal(world: StepWorld, attendPause: InteractivePrompts['attendPause']): CliRuntime {
+  const unused = async (): Promise<never> => {
+    throw new Error('Unexpected setup prompt');
+  };
+  return {
+    paths: world.paths,
+    stdout: () => undefined,
+    stderr: () => undefined,
+    environment: {},
+    browserInspection: { ncl: async (_runtime, args) => hostNcl(args) },
+    prompts: {
+      providerCredential: unused,
+      googleCloudSignIn: unused,
+      googleAccount: unused,
+      googleWorkspaceSignIn: unused,
+      attendPause,
+    },
   };
 }
 
@@ -202,7 +210,6 @@ describe('the web alias setup step (KTD13)', () => {
   });
 
   afterEach(async () => {
-    setActiveInbox(undefined);
     await closeDb();
     for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true });
   });
@@ -225,93 +232,38 @@ describe('the web alias setup step (KTD13)', () => {
       ],
       resumeFlag: '--alias-added',
       actionUrl: 'https://admin.google.com/ac/users',
+      aliasCandidate: ALIAS,
     });
     expect(await world.claimed()).toBe(ALIAS);
-    await expect(getAliasSetup()).resolves.toEqual({ alias: null, candidate: ALIAS, probe_message_id: null });
-    expect(world.gmail.sent).toEqual([]);
+    await expect(getAliasSetup()).resolves.toEqual({ alias: null, candidate: ALIAS });
     expect(world.events).toContainEqual({ type: 'domain-effect', step: 'provision_alias', changed: true });
 
     // A resume before the operator confirms shows the same step again, changing nothing.
     expect(paused(await world.run())).toEqual(pause);
-    expect(world.gmail.sent).toEqual([]);
   });
 
-  it('records the alias once its probe arrives, keeping the claim, and a later run sends nothing', async () => {
+  it('records the alias on operator confirmation without sending mail, and a later run keeps it', async () => {
     const world = await stepWorld();
     await world.run();
-    world.gmail.onSend = (id) => world.gmail.deliver(id);
 
     await expect(world.run({ kind: 'added' })).resolves.toEqual({ status: 'ready' });
 
-    expect(world.gmail.sent).toHaveLength(1);
     await expect(getAliasSetup()).resolves.toMatchObject({ alias: ALIAS });
     expect(await world.claimed()).toBe(ALIAS);
     await expect(world.run()).resolves.toEqual({ status: 'ready' });
     await expect(world.run({ kind: 'added' })).resolves.toEqual({ status: 'ready' });
-    expect(world.gmail.sent).toHaveLength(1);
   });
 
   it('tries the first candidate at once when the operator says it is added before seeing it', async () => {
     const world = await stepWorld();
-    world.gmail.onSend = (id) => world.gmail.deliver(id);
 
     await expect(world.run({ kind: 'added' })).resolves.toEqual({ status: 'ready' });
     await expect(getAliasSetup()).resolves.toMatchObject({ alias: ALIAS });
-  });
-
-  it('stays pending as not added yet when the probe bounces', async () => {
-    const world = await stepWorld();
-    await world.run();
-    world.gmail.onSend = () => world.gmail.bounce();
-
-    const pause = paused(await world.run({ kind: 'added' }));
-
-    expect(pause).toMatchObject({
-      code: 'alias_not_added',
-      message: `The test message to ${ALIAS} bounced: it is not an alias of ${ASSISTANT_EMAIL} yet.`,
-      resumeFlag: '--alias-added',
-    });
-    expect(pause.details?.join('\n')).toMatch(/up to 24 hours/u);
-    await expect(getAliasSetup()).resolves.toMatchObject({ alias: null, candidate: ALIAS });
-    expect(world.sleeps).toEqual([]);
-  });
-
-  it('waits briefly, then stays pending with "up to 24 hours" when nothing arrives, and records a late arrival on resume', async () => {
-    const world = await stepWorld();
-    await world.run();
-
-    const pause = paused(await world.run({ kind: 'added' }));
-
-    expect(pause).toMatchObject({
-      code: 'alias_not_delivered',
-      message: `The test message to ${ALIAS} has not arrived yet: Google can take up to 24 hours to start delivering to a new alias.`,
-    });
-    expect(pause.resumeFlag).toBeUndefined();
-    expect(world.sleeps).toEqual([2_000, 3_000, 5_000, 5_000, 5_000, 10_000]);
-    expect(world.events.filter((event) => event.type === 'step-waiting')).toHaveLength(6);
-
-    world.gmail.deliver();
-    await expect(world.run()).resolves.toEqual({ status: 'ready' });
-    expect(world.gmail.sent).toHaveLength(1);
-    await expect(getAliasSetup()).resolves.toMatchObject({ alias: ALIAS });
-  });
-
-  it('refuses a copy that came through a Google Group', async () => {
-    const world = await stepWorld();
-    await world.run();
-    world.gmail.onSend = () => world.gmail.deliverThroughGroup('List-Id');
-
-    expect(paused(await world.run({ kind: 'added' }))).toMatchObject({
-      code: 'alias_is_group',
-      resumeFlag: '--alias-taken',
-    });
-    await expect(getAliasSetup()).resolves.toMatchObject({ alias: null });
   });
 
   it('moves a taken candidate to the next, and a resume after it offers only the new one', async () => {
     const world = await stepWorld();
     await world.run();
-    await world.run({ kind: 'added' });
 
     const next = paused(await world.run({ kind: 'taken' }));
     expect(next).toMatchObject({
@@ -323,7 +275,6 @@ describe('the web alias setup step (KTD13)', () => {
     await expect(getAliasSetup()).resolves.toEqual({
       alias: null,
       candidate: 'onuj2@example.test',
-      probe_message_id: null,
     });
 
     expect(paused(await world.run({ kind: 'taken' }))).toMatchObject({
@@ -341,14 +292,13 @@ describe('the web alias setup step (KTD13)', () => {
     });
     expect(await world.claimed()).toBe('juno.web@example.test');
 
-    world.gmail.onSend = (id) => world.gmail.deliver(id);
     await expect(world.run({ kind: 'added', name: 'juno.hale@example.test' })).resolves.toEqual({
       status: 'ready',
     });
     await expect(getAliasSetup()).resolves.toMatchObject({ alias: 'juno.hale@example.test' });
     expect(await world.claimed()).toBe('juno.hale@example.test');
 
-    // Once verified, the alias does not change here.
+    // Once configured, the alias does not change here.
     await expect(world.run({ kind: 'named', name: 'juno.hale' })).resolves.toEqual({ status: 'ready' });
     await expect(world.run({ kind: 'named', name: 'other' })).rejects.toMatchObject({ code: 'alias_recorded' });
     await expect(world.run({ kind: 'taken' })).rejects.toMatchObject({ code: 'alias_recorded' });
@@ -410,9 +360,139 @@ describe('the web alias setup step (KTD13)', () => {
     });
     expect(await enable('--alias-taken')).toMatchObject(asked('onuj2@example.test'));
     expect(await enable('--alias', 'Juno.Web')).toMatchObject(asked('juno.web@example.test'));
-    world.gmail.onSend = (id) => world.gmail.deliver(id);
     expect(await enable('--alias-added')).toMatchObject({ exit: 0, result: { outcome: 'succeeded' } });
     await expect(getAliasSetup()).resolves.toMatchObject({ alias: 'juno.web@example.test' });
+  });
+
+  it('waits for terminal confirmation and completes browser enabling in the same command', async () => {
+    const world = await stepWorld();
+    await persistTestRuntime(world.paths, await getInstanceReservation(world.paths, world.instanceId));
+    const pauses: string[] = [];
+    const unused = async (): Promise<never> => {
+      throw new Error('Unexpected setup prompt');
+    };
+    const exit = await runCli(['capabilities', 'enable', 'browser', '--id', world.instanceId], {
+      paths: world.paths,
+      stdout: () => undefined,
+      stderr: () => undefined,
+      environment: {},
+      browserInspection: { ncl: async (_runtime, args) => hostNcl(args) },
+      prompts: {
+        providerCredential: unused,
+        googleCloudSignIn: unused,
+        googleAccount: unused,
+        googleWorkspaceSignIn: unused,
+        attendPause: async (pause) => {
+          pauses.push(pause.code);
+          expect(await getAliasSetup()).toMatchObject({ alias: null, candidate: ALIAS });
+          return { kind: 'continue', decisions: { alias: { kind: 'added' } } };
+        },
+      },
+    });
+
+    expect(exit).toBe(0);
+    expect(pauses).toEqual(['alias_required']);
+    expect((await getAliasSetup()).alias).toBe(ALIAS);
+  });
+  it.each(['added', 'taken', 'named'] as const)(
+    're-prompts instead of applying a stale %s answer to a new candidate',
+    async (kind) => {
+      const world = await stepWorld();
+      await persistTestRuntime(world.paths, await getInstanceReservation(world.paths, world.instanceId));
+      const shown: string[] = [];
+      const exit = await runCli(
+        ['capabilities', 'enable', 'browser', '--id', world.instanceId],
+        aliasTerminal(world, async (pause) => {
+          shown.push(pause.message);
+          if (shown.length > 1) return { kind: 'stop' };
+          await hostNcl(['gws-ea-alias', 'propose', '--address', 'onuj2@example.test']);
+          const alias: AliasDecision = kind === 'named' ? { kind, name: 'stale.alias' } : { kind };
+          return { kind: 'continue', decisions: { alias } };
+        }),
+      );
+      expect(exit).toBe(10);
+      expect(shown).toHaveLength(2);
+      expect(shown[0]).toContain(`Add ${ALIAS} as an alias`);
+      expect(shown[1]).toContain('Add onuj2@example.test as an alias');
+      expect(await getAliasSetup()).toEqual({ alias: null, candidate: 'onuj2@example.test' });
+    },
+  );
+
+  it('discards a name supplied for an empty candidate after another command proposes an alias', async () => {
+    const world = await stepWorld();
+    await world.run();
+
+    expect(paused(await world.run({ kind: 'named', name: 'stale.alias', expectedCandidate: null }))).toMatchObject({
+      code: 'alias_required',
+      aliasCandidate: ALIAS,
+    });
+    expect(await getAliasSetup()).toEqual({ alias: null, candidate: ALIAS });
+  });
+
+  it('handles taken, custom name, and confirmation in one enabling command', async () => {
+    const world = await stepWorld();
+    await persistTestRuntime(world.paths, await getInstanceReservation(world.paths, world.instanceId));
+    const answers: AliasDecision[] = [{ kind: 'taken' }, { kind: 'named', name: 'juno.web' }, { kind: 'added' }];
+    const candidates: (string | null)[] = [];
+    const exit = await runCli(
+      ['capabilities', 'enable', 'browser', '--id', world.instanceId],
+      aliasTerminal(world, async () => {
+        candidates.push((await getAliasSetup()).candidate);
+        const answer = answers.shift();
+        if (answer === undefined) throw new Error('Unexpected alias prompt');
+        return { kind: 'continue', decisions: { alias: answer } };
+      }),
+    );
+    expect(exit).toBe(0);
+    expect(candidates).toEqual([ALIAS, 'onuj2@example.test', 'juno.web@example.test']);
+    expect(await getAliasSetup()).toEqual({ alias: 'juno.web@example.test', candidate: null });
+  });
+
+  it('ignores confirmation after a terminal interrupt and removes signal listeners', async () => {
+    const world = await stepWorld();
+    await persistTestRuntime(world.paths, await getInstanceReservation(world.paths, world.instanceId));
+    const signals = ['SIGINT', 'SIGTERM', 'SIGHUP'] as const;
+    const before = signals.map((signal) => process.listenerCount(signal));
+    const exit = await runCli(
+      ['capabilities', 'enable', 'browser', '--id', world.instanceId],
+      aliasTerminal(world, async (_pause, signal) => {
+        process.emit('SIGINT');
+        expect(signal.aborted).toBe(true);
+        return { kind: 'continue', decisions: { alias: { kind: 'added' } } };
+      }),
+    );
+    expect(exit).toBe(10);
+    expect(await getAliasSetup()).toEqual({ alias: null, candidate: ALIAS });
+    expect(signals.map((signal) => process.listenerCount(signal))).toEqual(before);
+  });
+
+  it('leaves the proposed alias pending when the operator stops at the terminal', async () => {
+    const world = await stepWorld();
+    await persistTestRuntime(world.paths, await getInstanceReservation(world.paths, world.instanceId));
+    const unused = async (): Promise<never> => {
+      throw new Error('Unexpected setup prompt');
+    };
+    let asked = false;
+    const exit = await runCli(['capabilities', 'enable', 'browser', '--id', world.instanceId], {
+      paths: world.paths,
+      stdout: () => undefined,
+      stderr: () => undefined,
+      environment: {},
+      browserInspection: { ncl: async (_runtime, args) => hostNcl(args) },
+      prompts: {
+        providerCredential: unused,
+        googleCloudSignIn: unused,
+        googleAccount: unused,
+        googleWorkspaceSignIn: unused,
+        attendPause: async () => {
+          asked = true;
+          return { kind: 'stop' };
+        },
+      },
+    });
+    expect(asked).toBe(true);
+    expect(exit).toBe(10);
+    expect(await getAliasSetup()).toEqual({ alias: null, candidate: ALIAS });
   });
 });
 
@@ -424,13 +504,13 @@ describe('a name that gives no alias', () => {
     return {
       proposed,
       identity: async () => ({ name, email: 'aaa@example.test', domain: 'example.test', principalEmails: [] }),
-      setup: async () => ({ alias: null, candidate, probeSent: false }),
+      setup: async () => ({ alias: null, candidate }),
       async propose(address) {
         proposed.push(address);
         candidate = address;
-        return { alias: null, candidate, probeSent: false };
+        return { alias: null, candidate };
       },
-      probe: async () => 'not_sent',
+      confirm: async (address) => ({ alias: address, candidate: null }),
     };
   }
 
@@ -463,7 +543,7 @@ describe('a name that gives no alias', () => {
   it('refuses a host report it cannot read', async () => {
     const paths = await testPaths();
     const { instance_id: instanceId } = await reserveInstance(paths, reservation('aaa@example.test', 31_002));
-    const host = aliasHost(async () => ({ alias: 'not an address', candidate: null, probe_sent: false }));
+    const host = aliasHost(async () => ({ alias: 'not an address', candidate: null }));
 
     await expect(ensureAssistantAlias({ paths, instanceId, host }, {})).rejects.toMatchObject({
       code: 'invalid_child_output',

@@ -125,9 +125,8 @@ const probes = object({
     retrying: nullable(count),
   }),
   web_alias: probe({
-    state: nullable(choices('not_needed', 'pending', 'verified')),
+    state: nullable(choices('not_needed', 'pending', 'configured')),
     address: nullable(text),
-    probe_sent: effect,
   }),
   voice: probe({
     enabled: effect,
@@ -262,6 +261,7 @@ const pause = object(
     message: text,
     details: array(text),
     actionUrl: text,
+    aliasCandidate: nullable(text),
     resumeFlag: RESUME_FLAGS_SCHEMA,
     choices: array(object({ id: text, label: text })),
   },

@@ -209,11 +209,9 @@ export interface WorkspaceFacts {
 /** The web alias an enabled browser needs (KTD13), as the running host records it; null when not observed. */
 export interface WebAliasFacts {
   /** `not_needed` while the browser is not enabled. */
-  readonly state: 'not_needed' | 'pending' | 'verified' | null;
-  /** The verified alias, or the address the operator was asked to add. */
+  readonly state: 'not_needed' | 'pending' | 'configured' | null;
+  /** The configured alias, or the address the operator was asked to add. */
   readonly address: string | null;
-  /** Whether a test message to the pending address was sent. */
-  readonly probe_sent: boolean | null;
 }
 
 export interface AssistantProbes {
@@ -254,7 +252,7 @@ export interface AssistantProbes {
   readonly principal: ProbeResult;
   /** Main's latest delivery result, and the replies the host is still retrying. */
   readonly delivery: ProbeResult & DeliveryFacts;
-  /** While the browser is enabled, its verified web alias; setup is incomplete until there is one (R23). */
+  /** While the browser is enabled, its configured web alias; setup is incomplete until there is one (R23). */
   readonly web_alias: ProbeResult & WebAliasFacts;
 }
 
@@ -986,30 +984,28 @@ function because(clause: string, reason: string | null): string {
 /** The command that continues the web alias's setup, with `--alias-added` once there is an address to add. */
 function webAliasArgv(instanceId: string, facts: WebAliasFacts): string[] {
   const command = ['gws-ea', 'capabilities', 'enable', 'browser', '--id', instanceId];
-  return facts.address !== null && facts.probe_sent === false ? [...command, '--alias-added'] : command;
+  return facts.address !== null ? [...command, '--alias-added'] : command;
 }
 
 /**
  * The web alias an enabled browser needs (KTD13): not needed while the
  * browser is not enabled, which the policy file says without asking the
  * host; otherwise the setup the running host records. Until the alias is
- * verified, setup is incomplete (R23), with what finishes it.
+ * configured, setup is incomplete (R23), with what finishes it.
  */
 async function webAliasProbe(subject: Subject): Promise<ProbeResult & WebAliasFacts> {
   const runtime = requireRuntime(subject.runtime);
   if (!(await readBrowserPolicy(instanceBrowserPolicyFile(runtime))).enabled) {
-    return { ...OK, state: 'not_needed', address: null, probe_sent: null };
+    return { ...OK, state: 'not_needed', address: null };
   }
   const setup = await aliasHost((args) => subject.observers.ncl(runtime, args)).setup();
-  if (setup.alias !== null) return { ...OK, state: 'verified', address: setup.alias, probe_sent: setup.probeSent };
-  const facts: WebAliasFacts = { state: 'pending', address: setup.candidate, probe_sent: setup.probeSent };
+  if (setup.alias !== null) return { ...OK, state: 'configured', address: setup.alias };
+  const facts: WebAliasFacts = { state: 'pending', address: setup.candidate };
   const continueWith = webAliasArgv(subject.reservation.instance_id, facts).join(' ');
   const reason =
     setup.candidate === null
       ? `the browser is enabled, but the assistant has no web alias yet. Run ${continueWith} to choose one.`
-      : setup.probeSent
-        ? `the web alias ${setup.candidate} is not verified yet, as its test message has not arrived. Check again with ${continueWith}.`
-        : `the web alias ${setup.candidate} is not added yet. Add it in the Google Admin console, then run ${continueWith}.`;
+      : `the web alias ${setup.candidate} needs the operator’s confirmation. Add it in the Google Admin console, then run ${continueWith}.`;
   return { status: 'degraded', reason: `Setup is incomplete: ${reason}`, ...facts };
 }
 
@@ -1332,7 +1328,7 @@ export async function observeAssistantStatus(
     probe<WorkspaceFacts>(() => workspaceProbe(subject), { account: null }),
     probe(() => principalProbe(subject), {}),
     probe<DeliveryFacts>(() => deliveryProbe(subject), { last: null, retrying: null }),
-    probe<WebAliasFacts>(() => webAliasProbe(subject), { state: null, address: null, probe_sent: null }),
+    probe<WebAliasFacts>(() => webAliasProbe(subject), { state: null, address: null }),
     probe<Omit<VoiceObservation, 'status' | 'reason'>>(
       () => observeLocalVoice(context.paths, requireRuntime(runtime), observers.ncl),
       {

@@ -296,7 +296,7 @@ terms ticked, marketing and sharing opted out, and an agreement stops with
 rejects cookie banners before observations where a reject option shows. The
 principal's stored private values reach a site only through main's per-errand
 `record_disclosure`. Each browsing assistant's web alias (its name reversed,
-added by the operator and verified by gws-ea's probe) is its email on every
+added and confirmed by the operator) is its email on every
 site and one of its addresses for mail routing. Browser policy version 2 lists
 the agent groups that may delegate (`access.ts`); version 1 means main alone.
 Watches on a site without a reader record a recipe, a marked region and its
