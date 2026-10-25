@@ -108,12 +108,12 @@ async function attendAliasPause(
     const name = await askAliasName(prompts, signal);
     return name === undefined ? STOP : { kind: 'continue', decisions: { alias: { kind: 'named', name, ...expected } } };
   };
-  const context = [...(pause.details ?? []), ...(pause.actionUrl ? [`Open: ${pause.actionUrl}`] : [])];
   if (pause.code === 'alias_name_required') {
     prompts.note(shown, "The assistant's web alias");
     return named();
   }
   if (pause.code !== 'alias_required') return STOP;
+  const context = pause.details ?? [];
   if (context.length > 0) prompts.note(context.join('\n'), "The assistant's web alias");
   const selected = await prompts.select({
     message: pause.message,

@@ -2611,7 +2611,6 @@ export async function runCli(args: readonly string[], runtime: CliRuntime = {}):
                 headline: `Browser enabled for assistant ${instanceId}; its web alias waits: ${pause.message}`,
                 details: [
                   ...(pause.details ?? []).map((detail) => `  ${detail}`),
-                  ...(pause.actionUrl ? [`Open: ${pause.actionUrl}`] : []),
                   ...nextActionLines(next.filter((action) => action.kind === 'command')),
                 ],
               });

@@ -79,7 +79,19 @@ const ALIAS_REQUIRED = pause({
   phase: 'provision_alias',
   code: 'alias_required',
   message: 'Add onuj@example.test as an alias of juno@example.test in the Google Admin console, then confirm it.',
-  details: ['Add the alternate email onuj on example.test, then Save'],
+  details: [
+    '1. Open Google Admin:',
+    '   https://admin.google.com/ac/users',
+    '',
+    '2. Select Juno (juno@example.test).',
+    '   Go to User information > Alternate email addresses (email aliases).',
+    '',
+    '3. Add the alias:',
+    '   Alternate email: onuj',
+    '   Domain: example.test',
+    '',
+    '4. Save, then return here to confirm.',
+  ],
   actionUrl: 'https://admin.google.com/ac/users',
   resumeFlag: '--alias-added',
   aliasCandidate: 'onuj@example.test',
@@ -92,10 +104,7 @@ describe("attending the web alias's pauses", () => {
       kind: 'continue',
       decisions: { alias: { kind: 'added', expectedCandidate: 'onuj@example.test' } },
     });
-    expect(added.note).toHaveBeenCalledWith(
-      'Add the alternate email onuj on example.test, then Save\nOpen: https://admin.google.com/ac/users',
-      "The assistant's web alias",
-    );
+    expect(added.note).toHaveBeenCalledWith(ALIAS_REQUIRED.details?.join('\n'), "The assistant's web alias");
     expect(added.select).toHaveBeenCalledWith(
       expect.objectContaining({
         message: ALIAS_REQUIRED.message,

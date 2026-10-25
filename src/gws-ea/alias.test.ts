@@ -225,10 +225,17 @@ describe('the web alias setup step', () => {
       code: 'alias_required',
       message: `Add ${ALIAS} as an alias of ${ASSISTANT_EMAIL} in the Google Admin console, then confirm it.`,
       details: [
-        `Open Juno (${ASSISTANT_EMAIL}), then User information > Alternate email addresses (email aliases)`,
-        'Add the alternate email onuj on example.test, then Save',
-        'If the Admin console says the address is already in use, continue with --alias-taken for the next name',
-        'To choose the name yourself, continue with --alias <name>',
+        '1. Open Google Admin:',
+        '   https://admin.google.com/ac/users',
+        '',
+        `2. Select Juno (${ASSISTANT_EMAIL}).`,
+        '   Go to User information > Alternate email addresses (email aliases).',
+        '',
+        '3. Add the alias:',
+        '   Alternate email: onuj',
+        '   Domain: example.test',
+        '',
+        '4. Save, then return here to confirm.',
       ],
       resumeFlag: '--alias-added',
       actionUrl: 'https://admin.google.com/ac/users',
@@ -480,13 +487,14 @@ describe('the web alias setup step', () => {
   it('leaves the proposed alias pending when the operator stops at the terminal', async () => {
     const world = await stepWorld();
     await persistTestRuntime(world.paths, await getInstanceReservation(world.paths, world.instanceId));
+    const stdout: string[] = [];
     const unused = async (): Promise<never> => {
       throw new Error('Unexpected setup prompt');
     };
     let asked = false;
     const exit = await runCli(['capabilities', 'enable', 'browser', '--id', world.instanceId], {
       paths: world.paths,
-      stdout: () => undefined,
+      stdout: (line) => stdout.push(line),
       stderr: () => undefined,
       environment: {},
       browserInspection: { ncl: async (_runtime, args) => hostNcl(args) },
@@ -503,6 +511,9 @@ describe('the web alias setup step', () => {
     });
     expect(asked).toBe(true);
     expect(exit).toBe(10);
+    expect(stdout.filter((line) => line.includes('https://admin.google.com/ac/users'))).toEqual([
+      '     https://admin.google.com/ac/users',
+    ]);
     expect(await getAliasSetup()).toEqual({ alias: null, candidate: ALIAS });
   });
 });
