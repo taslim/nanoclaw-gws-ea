@@ -558,11 +558,44 @@ export class AssistantChatAdapter
     };
   }
 
-  /** The SDK caches the name it is given, so a later message from the same person reads it there too. */
+  /**
+   * The SDK caches the name it is given, so a later message from the same person reads it there too. A quoted
+   * author is named the same way, or marked as the assistant.
+   */
   private async withSenderName(message: ChatMessage): Promise<ChatMessage> {
-    if (message.sender.name === this.botUserId) return message;
-    const displayName = await this.hydrator.displayName(message.sender.name);
-    return { ...message, sender: { ...message.sender, displayName } };
+    const quote = message.quotedMessageMetadata;
+    const quoted = quote?.quotedMessageSnapshot?.sender;
+    const [displayName, quotedName] = await Promise.all([
+      message.sender.name === this.botUserId ? undefined : this.hydrator.displayName(message.sender.name),
+      quoted === undefined || quoted === this.botUserId ? undefined : this.hydrator.displayName(quoted),
+    ]);
+    return {
+      ...message,
+      ...(displayName === undefined ? {} : { sender: { ...message.sender, displayName } }),
+      ...(quote?.quotedMessageSnapshot === undefined || quoted === undefined
+        ? {}
+        : {
+            quotedMessageMetadata: {
+              ...quote,
+              quotedMessageSnapshot: {
+                ...quote.quotedMessageSnapshot,
+                ...(quotedName === undefined ? { byAssistant: true } : { senderName: quotedName }),
+              },
+            },
+          }),
+    };
+  }
+
+  /** The users a message mentions by resource name, with `you` for the assistant. */
+  mentionsOf(raw: Record<string, unknown>): readonly string[] {
+    const message = isRecord(raw.message) ? raw.message : undefined;
+    const annotations: unknown[] = Array.isArray(message?.annotations) ? message.annotations : [];
+    const users = annotations.flatMap((annotation) => {
+      if (!isRecord(annotation) || annotation.type !== 'USER_MENTION' || !isRecord(annotation.userMention)) return [];
+      const user = isRecord(annotation.userMention.user) ? annotation.userMention.user : undefined;
+      return typeof user?.name === 'string' && user.name ? [user.name] : [];
+    });
+    return [...new Set(users.map((user) => (user === this.botUserId ? 'you' : user)))];
   }
 
   /** The message and its space, or undefined when either is gone. */
@@ -647,11 +680,20 @@ export function extractGchatReplyContext(raw: Record<string, unknown>): ReplyCon
   if (quote === undefined) return null;
   const snapshot = isRecord(quote.quotedMessageSnapshot) ? quote.quotedMessageSnapshot : undefined;
   const text = typeof snapshot?.text === 'string' ? snapshot.text : '';
-  const sender = typeof snapshot?.sender === 'string' && snapshot.sender.trim() ? snapshot.sender : 'unknown';
+  const senderId = typeof snapshot?.sender === 'string' && snapshot.sender.trim() ? snapshot.sender : undefined;
+  const senderName =
+    typeof snapshot?.senderName === 'string' && snapshot.senderName.trim() ? snapshot.senderName : undefined;
+  const self = snapshot?.byAssistant === true;
   const id = quote.quoteType !== 'FORWARD' && typeof quote.name === 'string' ? quote.name : undefined;
   const forwarded = quote.quoteType === 'FORWARD';
   if (!text.trim() && id === undefined && !forwarded) return null;
-  return { sender, text, ...(id === undefined ? {} : { id }), ...(forwarded ? { forwarded: true } : {}) };
+  return {
+    sender: senderName ?? senderId ?? 'unknown',
+    text,
+    ...(self ? { self: true } : senderId === undefined ? {} : { senderId }),
+    ...(id === undefined ? {} : { id }),
+    ...(forwarded ? { forwarded: true } : {}),
+  };
 }
 
 /** A native forward contains source audio; replying to a message does not forward a new recording. */
@@ -703,6 +745,7 @@ export function createAssistantChatChannel(adapter: AssistantChatAdapter): Assis
     defaults: GCHAT_DEFAULTS,
     extractReplyContext: extractGchatReplyContext,
     extractAudioSource: gchatAudioSource,
+    extractMentions: (raw) => adapter.mentionsOf(raw),
     redelivers: true,
     textRequests: { postedAt: chatCreateTime },
     escapeCardText: escapeChatRequestText,

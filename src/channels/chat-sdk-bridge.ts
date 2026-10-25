@@ -68,6 +68,10 @@ interface ConnectionAwareAdapter extends Adapter {
 export interface ReplyContext {
   text: string;
   sender: string;
+  /** The quoted author's platform user id, so the agent can tell who it was, not just their name. */
+  senderId?: string;
+  /** The agent's own message. */
+  self?: true;
   /** Absent when the platform does not name the message replied to. */
   id?: string;
   /** A native forward carries source material, never the sender's own words. */
@@ -483,6 +487,8 @@ export interface ChatSdkBridgeConfig {
   extractReplyContext?: ReplyContextExtractor;
   /** Native recording provenance, recovered before the SDK raw payload is dropped. */
   extractAudioSource?: (raw: Record<string, unknown>) => AudioSource;
+  /** The users a message mentions, as platform user ids, with `you` for the agent's own account. */
+  extractMentions?: (raw: Record<string, unknown>) => readonly string[];
   /**
    * Recover readable content the platform adapter left only in `message.raw`.
    * The returned text is appended to the message body and persisted; the raw
@@ -1030,6 +1036,10 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
       const replyTo = config.extractReplyContext(message.raw as Record<string, unknown>);
       if (replyTo) serialized.replyTo = replyTo;
     }
+    if (config.extractMentions && message.raw) {
+      const mentions = config.extractMentions(message.raw as Record<string, unknown>);
+      if (mentions.length > 0) serialized.mentions = mentions;
+    }
 
     // Project chat-sdk's nested author into the flat sender fields the router
     // expects (see src/router.ts extractAndUpsertUser). Native adapters already
@@ -1078,6 +1088,7 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
           target: {
             self,
             sender: target.fullName || target.userName || target.userId,
+            senderId: target.userId,
             excerpt: excerpt(reaction.message.text),
           },
         },

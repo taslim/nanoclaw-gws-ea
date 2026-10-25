@@ -915,6 +915,17 @@ describe('recorded divergence: a chat message names who spoke and whom they ment
     );
     expect(formatter).toContain('(senderId ? ` sender_id="${escapeXml(senderId)}"` : \'\')');
     expect(formatter).toContain(`(mentions.length > 0 ? \` mentions="\${escapeXml(mentions.join(','))}"\` : '')`);
+    // A quote and a reaction name their author the same way, and the agent's own message as you.
+    expect(formatter).toContain("const sender = own ? 'you' : replyTo.sender;");
+    expect(formatter).toContain('const idAttr = senderId ? ` from_id="${escapeXml(senderId)}"` : \'\';');
+    expect(formatter).toContain('const onId = target.self ? null : namespacedUserId(msg, target.senderId);');
+  });
+  it('lets a Chat SDK channel name mentions, a quoted author and a reacted-to author by platform user id', async () => {
+    const bridge = await readFile(path.join(originalCwd, 'src/channels/chat-sdk-bridge.ts'), 'utf8');
+    expect(bridge).toContain('extractMentions?: (raw: Record<string, unknown>) => readonly string[];');
+    expect(bridge).toContain('if (mentions.length > 0) serialized.mentions = mentions;');
+    expect(bridge).toContain("  senderId?: string;\n  /** The agent's own message. */\n  self?: true;");
+    expect(bridge).toContain('senderId: target.userId,');
   });
 });
 describe('recorded divergence: a module can hold an inbound message until it releases or settles it', () => {

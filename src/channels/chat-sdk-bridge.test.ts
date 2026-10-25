@@ -1127,7 +1127,10 @@ describe('createChatSdkBridge — reactions an adapter reads itself', () => {
               sender: 'Juno Hale',
               senderId: 'users/1001',
               senderName: 'Juno Hale',
-              reaction: { emoji: 'thumbs_up', target: { self: true, sender: 'Morgan', excerpt: ASSISTANT_TEXT } },
+              reaction: {
+                emoji: 'thumbs_up',
+                target: { self: true, sender: 'Morgan', senderId: 'users/9', excerpt: ASSISTANT_TEXT },
+              },
             },
             isMention: false,
             isGroup: false,

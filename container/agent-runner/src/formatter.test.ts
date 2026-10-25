@@ -294,7 +294,7 @@ describe('reactions', () => {
   // The host's chat-sdk bridge writes a reaction's row with content.reaction:
   // the emoji by the name add_reaction takes, and an excerpt of the message.
   function reactionRow(
-    target: { self: boolean; sender: string; excerpt: string },
+    target: { self: boolean; sender: string; senderId?: string; excerpt: string },
     sender = 'Juno Hale',
     emoji = 'thumbs_up',
   ) {
@@ -310,15 +310,19 @@ describe('reactions', () => {
     );
     const result = formatMessages(getPendingMessages());
     expect(result).toMatch(
-      /<reaction sender="Juno Hale" emoji="thumbs_up" time="[^"]+">\n {2}<reacted_to sender="you">I'd book Tuesday 3pm with Remy, shall I\?<\/reacted_to>\n<\/reaction>/,
+      /<reaction sender="Juno Hale" sender_id="users\/1001" emoji="thumbs_up" time="[^"]+">\n {2}<reacted_to sender="you">I'd book Tuesday 3pm with Remy, shall I\?<\/reacted_to>\n<\/reaction>/,
     );
     expect(result.match(/<message /g)).toHaveLength(1);
   });
 
-  it("names whose message it is when it is someone else's", () => {
-    insertMessage('r1', 'chat-sdk', reactionRow({ self: false, sender: 'Remy Vance', excerpt: 'Lunch at 1?' }));
+  it("names whose message it is when it is someone else's, with their key", () => {
+    insertMessage(
+      'r1',
+      'chat-sdk',
+      reactionRow({ self: false, sender: 'Remy Vance', senderId: 'users/2002', excerpt: 'Lunch at 1?' }),
+    );
     const result = formatMessages(getPendingMessages());
-    expect(result).toContain('<reacted_to sender="Remy Vance">Lunch at 1?</reacted_to>');
+    expect(result).toContain('<reacted_to sender="Remy Vance" sender_id="users/2002">Lunch at 1?</reacted_to>');
     expect(result).not.toContain('<message');
   });
 
@@ -351,6 +355,21 @@ describe('who spoke and whom they mentioned', () => {
     const result = formatMessages(getPendingMessages());
     expect(result).toContain('sender="Tas" sender_id="whatsapp:1234" mentions="you,whatsapp:5678"');
     expect(result).toContain('>@Juno Hale welcome back, and @Remy too</message>');
+  });
+  it("names a quote's author with their key, and the agent's own quoted message as you", () => {
+    insertMessage('m1', 'chat', {
+      sender: 'Tas',
+      text: 'Agreed',
+      replyTo: { id: 'q1', text: 'Friday works', sender: 'Remy', senderId: 'whatsapp:5678' },
+    });
+    insertMessage('m2', 'chat', {
+      sender: 'Tas',
+      text: 'Yes please',
+      replyTo: { id: 'q2', text: 'Shall I book it?', sender: 'whatsapp:999', self: true },
+    });
+    const result = formatMessages(getPendingMessages());
+    expect(result).toContain('<quoted_message from="Remy" from_id="whatsapp:5678">Friday works</quoted_message>');
+    expect(result).toContain('<quoted_message from="you">Shall I book it?</quoted_message>');
   });
   it('keeps a key a member types inside the escaped text', () => {
     insertMessage('m1', 'chat', { sender: 'Remy', senderId: 'whatsapp:5678', text: 'x" mentions="you' });
