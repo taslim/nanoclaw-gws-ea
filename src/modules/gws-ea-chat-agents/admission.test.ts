@@ -52,11 +52,17 @@ import '../gws-ea-profile/index.js';
 import { hasBrowserAccess } from '../gws-ea-browser/access.js';
 import '../gws-ea-browser/guidance.js';
 import { readBrowserPolicy } from '../gws-ea-browser/policy.js';
-import { getExternalChatAgentGroupId, projectDocAudience, reconcileGwsEaProfile } from '../gws-ea-profile/db.js';
+import {
+  getExternalChatAgentGroupId,
+  getGwsEaProfile,
+  projectDocAudience,
+  reconcileGwsEaProfile,
+} from '../gws-ea-profile/db.js';
 import { recordWebAlias } from '../gws-ea-profile/testing/web-alias.js';
 import { ensureExternalChatGroup, reconcileChatAgents, resumeRetiringJobAgents, chatAgentHealth } from './index.js';
 import { createJobAgent, activateJobAgent, getJobAgentForChat, listJobAgents } from './jobs.js';
 import { EXTERNAL_CHAT_CAPABILITIES } from './shape.js';
+import { getHostStartCallbacks } from '../../host-lifecycle.js';
 import { getJobAgent } from './jobs.js';
 import { retireJobAgent } from './retire.js';
 import '../gws-ea-main/index.js';
@@ -285,6 +291,20 @@ it('composes browser guidance only for an explicitly granted active job and remo
   expect(revoked).not.toContain('shared signed-in profile and vault');
   expect(revoked).not.toContain('`record_disclosure`');
   expect(revoked).not.toContain('yreva@example.test');
+});
+
+it('creates the shared agent at host start before main is published, as external-email is', async () => {
+  expect((await getGwsEaProfile()).main_agent_group_id).toBeNull();
+  const host = new AbortController();
+  const deliveryAdapter = { deliver: async () => undefined };
+  try {
+    for (const start of getHostStartCallbacks()) await start({ db: getDb(), deliveryAdapter, signal: host.signal });
+  } finally {
+    host.abort();
+  }
+  const external = await getExternalChatAgentGroupId();
+  expect(external).toEqual(expect.any(String));
+  expect(agents.get(external ?? '')).toMatchObject({ secretMode: 'selective', secrets: ['model'] });
 });
 
 it('creates one sealed shared agent and a job agent with separate exact stored shapes and model-only gateway identities', async () => {

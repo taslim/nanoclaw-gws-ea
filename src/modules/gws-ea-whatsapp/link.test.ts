@@ -69,6 +69,8 @@ let root: string;
 let linking: WhatsAppLinking;
 let sockets: FakeSocket[];
 let notices: WhatsAppLinkNotice[];
+/** Holds back each new socket's pairing announcement, as a slow or failing WhatsApp server would. */
+let holdPairingAnnouncement: boolean;
 let unobserve: (() => void) | undefined;
 const onInbound = vi.fn(async (platformId: string, threadId: string | null, message: InboundMessage) =>
   routeInbound({
@@ -135,6 +137,7 @@ beforeEach(async () => {
   });
   sockets = [];
   notices = [];
+  holdPairingAnnouncement = false;
   unobserve = registerWhatsAppObserver({
     onLinkNotice: async (notice) => {
       notices.push(notice);
@@ -147,9 +150,14 @@ beforeEach(async () => {
         ? createWhatsAppAdapter({
             directory,
             resolveVersion: async () => [2, 3000, 123456],
-            makeSocket: () => {
+            makeSocket: (config) => {
               const socket = new FakeSocket();
               sockets.push(socket);
+              // As Baileys does a moment after the socket opens, for credentials with no `me` to log in
+              // as, unless a test holds it back.
+              setTimeout(() => {
+                if (!holdPairingAnnouncement && !config.auth?.creds.me) void socket.announcePairing();
+              }, 0);
               return socket;
             },
           })
@@ -418,7 +426,7 @@ it('refuses an unmarked message and a non-main caller', async () => {
   expect(sockets).toHaveLength(0);
 });
 
-it('expires an unpaired closed connection, removes its credentials, releases the claim, and tells main', async () => {
+it('ends a pairing whose connection closes, removes its credentials, releases the claim, and tells main it closed', async () => {
   await marked('numbers', 'Use +15550000000 and +447700900123.');
   await linking.link('+15550000000', '+447700900123', caller);
   await sockets[0].emit('connection.update', { connection: 'close' });
@@ -427,11 +435,48 @@ it('expires an unpaired closed connection, removes its credentials, releases the
   expect(sockets).toHaveLength(1);
   expect(sockets[0].ended).toBe(true);
   await vi.waitFor(async () => {
-    expect((await mailboxRows()).some(({ content }) => content.includes('pairing code expired'))).toBe(true);
+    const notes = (await mailboxRows()).map(({ content }) => content).join('\n');
+    expect(notes).toContain('pairing connection closed before the account connected');
+    expect(notes).not.toContain('expired');
   });
   expect(
     (await getInstanceReservation(linking.options.paths, instanceId)).exclusive_resource_claims.whatsapp_number,
   ).toBeUndefined();
+});
+
+it('asks WhatsApp for a pairing code only once the new socket announces it can pair', async () => {
+  holdPairingAnnouncement = true;
+  await marked('numbers', 'Use +15550000000 and +447700900123.');
+  let settled = false;
+  const linked = linking.link('+15550000000', '+447700900123', caller).finally(() => {
+    settled = true;
+  });
+  await vi.waitFor(() => expect(sockets).toHaveLength(1));
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  expect(settled).toBe(false);
+  await sockets[0].announcePairing();
+  await expect(linked).resolves.toMatchObject({ state: 'linking', pairingCode: '12345678' });
+});
+
+it('reports a pairing connection that closes before it is ready, with no code and no expiry note', async () => {
+  holdPairingAnnouncement = true;
+  await marked('numbers', 'Use +15550000000 and +447700900123.');
+  const linked = linking.link('+15550000000', '+447700900123', caller);
+  await vi.waitFor(() => expect(sockets).toHaveLength(1));
+  await sockets[0].emit('connection.update', {
+    connection: 'close',
+    lastDisconnect: { error: new Error('Stream Errored (restart required)'), date: new Date() },
+  });
+  await expect(linked).rejects.toThrow(
+    'WhatsApp closed its pairing connection before it was ready: Stream Errored (restart required)',
+  );
+  expect(await linking.status()).toEqual({ state: 'unlinked' });
+  expect(
+    (await getInstanceReservation(linking.options.paths, instanceId)).exclusive_resource_claims.whatsapp_number,
+  ).toBeUndefined();
+  const notes = (await mailboxRows()).map(({ content }) => content).join('\n');
+  expect(notes).not.toContain('pairing code expired');
+  expect(notes).not.toContain('pairing connection closed');
 });
 
 it('refuses a connected account with a different authenticated number', async () => {
@@ -695,6 +740,12 @@ it('runs the registered main action and operator command through the same native
     ).toMatchObject({ ok: true, data: { state: 'linking', number: '+15550000000' } });
     expect(
       await dispatch(
+        { id: 'operator-link', command: 'gws-ea-whatsapp-link', args: { 'principal-number': '+447700900123' } },
+        { caller: 'host' },
+      ),
+    ).toMatchObject({ ok: false, error: { message: expect.stringContaining('Give both numbers') } });
+    expect(
+      await dispatch(
         { id: 'agent-status', command: 'gws-ea-whatsapp-status', args: {} },
         { caller: 'agent', sessionId: session.id, agentGroupId: 'main', messagingGroupId: 'principal-dm' },
       ),
@@ -782,6 +833,9 @@ it('abandons the interrupted pairing socket on host restart, restores unlinked a
   const state = new WhatsAppIndex(linking.options.directory, () => '15550000000@s.whatsapp.net');
   expect(state.unrouted()).toEqual([]);
   state.close();
+  const notes = (await mailboxRows()).map(({ content }) => content).join('\n');
+  expect(notes).toContain('pairing connection closed before the account connected');
+  expect(notes).not.toContain('pairing code expired');
 });
 
 it('refuses a delayed reply to the unlinked principal DM at the native delivery boundary after a fresh principal binds', async () => {

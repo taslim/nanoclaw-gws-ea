@@ -14,7 +14,7 @@ import { onHostStart } from '../../host-lifecycle.js';
 import { log } from '../../log.js';
 import { registerRequiredProjectDocSection } from '../../project-doc-sections.js';
 import { resolveTimezone } from '../../timezone.js';
-import { getExternalChatAgentGroupId, getGwsEaProfile, getMainAgentGroupId } from '../gws-ea-profile/db.js';
+import { getExternalChatAgentGroupId, getGwsEaProfile } from '../gws-ea-profile/db.js';
 import { registerGuidance } from '../gws-ea-profile/guidance.js';
 import { escapeMarkdownInline } from '../gws-ea-profile/markdown.js';
 import { chatAgentDrift } from './drift.js';
@@ -90,8 +90,10 @@ export async function resumeRetiringJobAgents(): Promise<void> {
   }
 }
 
+// Like external-email, the chat agents need only the profile: a new assistant's
+// host starts before its main is published, and publication names them.
 onHostStart(async () => {
-  if (!(await getDb().hasTable('gws_ea_profile')) || (await getMainAgentGroupId()) === null) return;
+  if (!(await getDb().hasTable('gws_ea_profile'))) return;
   await reconcileChatAgents();
 });
 

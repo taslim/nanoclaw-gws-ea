@@ -36,6 +36,8 @@ export async function transportHarness() {
         socketConfigs.push(config);
         const socket = new FakeSocket();
         sockets.push(socket);
+        // As Baileys does a moment after the socket opens, for credentials with no `me` to log in as.
+        if (!config.auth?.creds.me) setTimeout(() => void socket.announcePairing(), 0);
         return socket;
       },
       downloadMedia: download,

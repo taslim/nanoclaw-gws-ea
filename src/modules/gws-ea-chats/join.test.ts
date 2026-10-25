@@ -42,7 +42,11 @@ import { registerMigration, runMigrations } from '../../db/migrations/index.js';
 for (const migration of [gwsEaMattersMigration, gwsEaMatterJobsMigration, gwsEaMatterChatsMigration])
   registerMigration(migration);
 import { createAgentGroup } from '../../db/agent-groups.js';
-import { getMessagingGroupByPlatform, createMessagingGroupAgent } from '../../db/messaging-groups.js';
+import {
+  getMessagingGroupByPlatform,
+  createMessagingGroupAgent,
+  getMessagingGroupAgents,
+} from '../../db/messaging-groups.js';
 import { inboundDbPath, outboundDbPath } from '../../mailbox/sqlite/paths.js';
 import { ChannelNotConnectedError } from '../../channels/adapter.js';
 import {
@@ -581,6 +585,15 @@ it('holds an unknown private conversation and refuses unresolved senders before 
   );
   expect(await getMessagingGroupByPlatform('whatsapp', 'trip@g.us')).toBeUndefined();
   expect(requestWake).not.toHaveBeenCalled();
+});
+it('leaves a private conversation unclaimed until a principal is bound, so binding can wire it to main', async () => {
+  await getDb().run('DELETE FROM gws_ea_principal_users');
+  const notesBefore = note.mock.calls.length;
+  await routeInbound(inbound('before-binding', 'hello', { isGroup: false, isMention: true }, '22@lid'));
+  const dm = await getMessagingGroupByPlatform('whatsapp', '22@lid');
+  expect(dm && (await getChat(dm.id))).toBeFalsy();
+  expect(dm ? await getMessagingGroupAgents(dm.id) : []).toEqual([]);
+  expect(note.mock.calls.length).toBe(notesBefore);
 });
 it('detaches through membership removal, settles held rows and deletes chat clearances', async () => {
   principal = false;
