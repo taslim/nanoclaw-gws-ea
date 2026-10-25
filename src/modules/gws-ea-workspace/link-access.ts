@@ -482,7 +482,7 @@ function reasonForMain(refused: readonly Refused[], principal: PrincipalRecogniz
  * the link it wrote and nothing else of the file, and to wake main for its
  * answer, since sharing the file, or reconnecting what checks it, is never
  * theirs to do.
- * to: external-email
+ * to: external-email, external-chat, job
  */
 function reasonForExternalEmail(refused: readonly Refused[]): string {
   const blocked = new Map<string, string[]>();

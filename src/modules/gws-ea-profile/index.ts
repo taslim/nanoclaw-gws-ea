@@ -100,8 +100,8 @@ function assistantAddressSentence(assistant: string, email: string | null): stri
 
 function websiteEmailSentence(assistant: string, email: string | null): string {
   return email === null
-    ? ` ${assistant} has no verified web address.`
-    : ` ${assistant}'s verified web address is ${quotedAddress(email)}.`;
+    ? ` ${assistant} has no web address yet.`
+    : ` ${assistant}'s web address is ${quotedAddress(email)}.`;
 }
 
 function browserPrincipalAddressesSentence(principal: string, emails: readonly string[]): string {

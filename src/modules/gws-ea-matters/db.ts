@@ -630,7 +630,7 @@ export async function placeNowhere(links: readonly LinkRef[]): Promise<PlacedNow
   const pieces = parsed.map((link) => {
     if (!isPiece(link.kind)) {
       throw new Error(
-        `Only a thread, event or file is placed nowhere: unlink the ${link.kind} ${link.reference} from its matter instead`,
+        `Only a thread, event, file or job is placed nowhere: unlink the ${link.kind} ${link.reference} from its matter instead`,
       );
     }
     return { kind: link.kind, reference: link.reference };

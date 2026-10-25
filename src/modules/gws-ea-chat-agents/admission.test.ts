@@ -272,7 +272,7 @@ it('composes browser guidance only for an explicitly granted active job and remo
   const identity = (await getRequiredProjectDocSections(group)).find(
     (section) => section.name === 'Assistant Identity',
   );
-  expect(identity?.body).toContain("Robin's verified web address is `nibor@example.test`.");
+  expect(identity?.body).toContain("Robin's web address is `nibor@example.test`.");
   expect(granted).toContain('shared signed-in profile and vault');
   expect(granted).toContain('`record_disclosure`');
   expect(granted).toContain('principal approvals');

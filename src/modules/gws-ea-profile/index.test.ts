@@ -859,7 +859,7 @@ describe('character and audience-specific identity', () => {
     );
   });
 
-  it('keeps the verified web address available as an identity fact without web or vault procedures', async () => {
+  it('keeps the web address available as an identity fact without web or vault procedures', async () => {
     await recordWebAlias('onuj@example.test');
     writeBrowserAccess(path.join(TEST_ROOT, 'browser', 'policy.json'), { agentGroupIds: [main.id, research.id] });
     try {
@@ -869,7 +869,7 @@ describe('character and audience-specific identity', () => {
       expect(mainIdentity).toContain('`calendar_access`');
       expect(mainIdentity?.split(/\s+/u).filter(Boolean).length).toBeLessThanOrEqual(90);
       for (const candidate of [main, browser, research]) {
-        expect(await identity(candidate)).toContain("Juno's verified web address is `onuj@example.test`.");
+        expect(await identity(candidate)).toContain("Juno's web address is `onuj@example.test`.");
         expect(await identity(candidate)).not.toMatch(/1Password|alias_unavailable|vault|sign ?up|checkouts/u);
       }
     } finally {
@@ -880,8 +880,8 @@ describe('character and audience-specific identity', () => {
   it('makes a missing web address explicit and withholds its fact when browser access is removed', async () => {
     writeBrowserAccess(path.join(TEST_ROOT, 'browser', 'policy.json'), { agentGroupIds: [main.id] });
     try {
-      expect(await identity(browser)).toContain('Juno has no verified web address.');
-      expect(await identity(main)).toContain('Juno has no verified web address.');
+      expect(await identity(browser)).toContain('Juno has no web address yet.');
+      expect(await identity(main)).toContain('Juno has no web address yet.');
       expect(await identity(research)).not.toContain('web address');
       await recordWebAlias('onuj@example.test');
       expect(await identity(main)).toContain('`onuj@example.test`');

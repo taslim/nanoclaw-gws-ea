@@ -346,9 +346,9 @@ describe('opening and placing', () => {
   });
 
   it('places only pieces of work nowhere: a person or a memory file is unlinked from its matter instead', async () => {
-    await expect(placeNowhere([person(juno)])).rejects.toThrow(/only a thread, event or file/i);
+    await expect(placeNowhere([person(juno)])).rejects.toThrow(/only a thread, event, file or job/i);
     await expect(placeNowhere([{ kind: 'memory', reference: 'memory/acme.md' }])).rejects.toThrow(
-      /only a thread, event or file/i,
+      /only a thread, event, file or job/i,
     );
     await expect(placeNowhere([])).rejects.toThrow(/at least one/i);
   });
