@@ -1,5 +1,5 @@
 /**
- * The host's free-time arithmetic (KTD7; R69): wall-clock times across clock
+ * The host's free-time arithmetic: wall-clock times across clock
  * changes, which events block time, and the free windows free time lists
  * from the principal's preferences and both sides' waking days, each with the
  * fit every meeting inside it meets.
@@ -308,7 +308,7 @@ describe('which events block time', () => {
     expect(
       blocksTime(event({ attendees: [{ email: 'pat.lee+cal@googlemail.com', responseStatus: 'declined' }] }), work),
     ).toBe(false);
-    // Another provider may deliver a +tag elsewhere, so it is not the principal's answer (R1).
+    // Another provider may deliver a +tag elsewhere, so it is not the principal's answer.
     expect(
       blocksTime(event({ attendees: [{ email: 'pat+cal@principal.example', responseStatus: 'declined' }] }), work),
     ).toBe(true);

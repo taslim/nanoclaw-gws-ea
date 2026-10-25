@@ -40,7 +40,7 @@ export async function hasArtifactLinks(texts: readonly string[]): Promise<boolea
   return 'config' in policy && policy.config !== undefined && artifactUrls(texts, policy.config).length > 0;
 }
 
-/** Current host-confirmed chat identities. An unknown member is retained even beside known recipients. */
+/** Counts the principal and emails main supplied; any other member leaves the audience unknown. */
 export async function artifactAudienceForMembers(
   members: readonly Pick<ChatMember, 'is_principal' | 'email' | 'email_source'>[],
 ): Promise<{
@@ -64,7 +64,7 @@ export async function artifactAudienceForMembers(
     nonPrincipalChatMembers: members.some((member) => member.is_principal !== 1),
   };
 }
-/** Concrete local artifact URLs only: no network, Access token, source read or generic link registry. */
+/** Checks only URLs on the configured artifact host, locally: no network, Access token or source read. */
 export async function checkArtifactLinksOpenable(request: ArtifactLinkCheckRequest): Promise<ArtifactLinkCheck> {
   const policy = await readArtifactsPolicy();
   if (!('config' in policy) || !policy.config) return { allowed: true };

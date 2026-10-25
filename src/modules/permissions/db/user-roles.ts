@@ -1,26 +1,25 @@
 import type { UserRole, UserRoleKind } from '../../../types.js';
 import { getDb } from '../../../db/connection.js';
 
-/** A proposed grant, as every write path sees it. */
 export type RoleGrant = Pick<UserRole, 'user_id' | 'role' | 'agent_group_id'>;
 
 /**
- * A module's veto on granting a role: a reason refuses the grant, undefined
- * admits it. Policies see every write path, so a privilege a module rules out
+ * A module's veto on a role grant: a reason refuses it, undefined admits it.
+ * Every role write consults the policies, so a privilege a module rules out
  * (such as one for a sender whose identity a channel cannot prove) is never
- * stored at all.
+ * stored.
  */
 export type RoleGrantPolicy = (grant: RoleGrant) => string | undefined;
 
 const roleGrantPolicies = new Map<string, RoleGrantPolicy>();
 
-/** Register a role grant policy under a `<module>:<name>` id; a duplicate id throws. */
+/** `id` is `<module>:<name>`; a refusal's error names it. */
 export function registerRoleGrantPolicy(id: string, policy: RoleGrantPolicy): void {
   if (roleGrantPolicies.has(id)) throw new Error(`Role grant policy "${id}" is already registered`);
   roleGrantPolicies.set(id, policy);
 }
 
-/** Throw when any registered policy refuses the grant. Every role write calls this first. */
+/** Every role write calls this before it stores the row. */
 export function assertRoleGrantAdmitted(grant: RoleGrant): void {
   for (const [id, policy] of roleGrantPolicies) {
     const reason = policy(grant);

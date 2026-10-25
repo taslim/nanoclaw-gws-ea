@@ -1,23 +1,20 @@
 /**
- * The daily sync (KTD6): one recurring task in `main`'s conversation, kept by
- * the host (`loop.ts`), that wakes main seven days a week to look ahead
- * and read whatever has waited for it. It is the host's bookkeeping, never
- * a message to the principal: whether they hear about their day, and when, is main's
+ * The daily sync: one recurring task in `main`'s conversation, kept by the
+ * host (`loop.ts`), that wakes main seven days a week to look ahead and read
+ * whatever has waited for it. It is the host's bookkeeping, never a message to
+ * the principal: whether they hear about their day, and when, is main's
  * judgment, and a standing morning rundown is a task they ask for.
  *
  * - Its time is an hour before the earliest working-hours start in the
  *   principal's preferences, or 07:00 while they have none, in main's time
  *   zone, and it follows their working hours when those change. Nothing else
  *   sets it.
- * - Its pre-task script, `ncl matters sync`, always wakes main (character
- *   and roles KTD12), carrying unread notes, threads still waiting to be
- *   placed, later looks and a morning rundown's time. Monday's month view
- *   follows the occurrence's scheduled day in the principal's zone.
- * - The prompt asks main to look closely at the next few days, and on
- *   Mondays at the month through a subagent briefed with current priorities.
- *   The principal hears only what needs them, in one morning message.
- * - A matter left without a look, and a repeating look whose run failed,
- *   come back at its time (`loop.ts`), each as a look of its own (R14).
+ * - Its pre-task script, `ncl matters sync`, always wakes main, carrying
+ *   unread notes, threads still waiting to be placed, later looks and a
+ *   morning rundown's time. Monday's month view follows the occurrence's
+ *   scheduled day in the principal's zone.
+ * - A matter left without a look gets a look of its own at its time, and a
+ *   repeating look whose run failed is brought forward to it (`loop.ts`).
  *
  * `ncl matters today` prints the day as matters hold it, as the script of a
  * morning rundown the principal asks for: today's looks, the matters handed
@@ -79,7 +76,6 @@ function nextRun(recurrence: string, timezone: string): string {
   return CronExpressionParser.parse(recurrence, { tz: timezone }).next().toDate().toISOString();
 }
 
-/** The sync's cron: an hour before the earliest working-hours start the principal has, or 07:00 while they have none. */
 async function syncRecurrence(): Promise<string> {
   const starts = (await getSchedulingPreferenceValues()).working_hours.flatMap((day) =>
     day.off ? [] : [minuteOfDay(day.start)],
@@ -87,7 +83,7 @@ async function syncRecurrence(): Promise<string> {
   return daily(starts.length === 0 ? DEFAULT_SYNC_MINUTE : Math.max(0, Math.min(...starts) - BEFORE_WORK_MINUTES));
 }
 
-/** The sync series in main's conversations: a live one first, or else whichever holds its latest run. */
+/** A live sync first, else the latest row in the newest of main's conversations that holds one. */
 async function findSync(): Promise<HeldTask | undefined> {
   let latest: HeldTask | undefined;
   for (const session of await mainConversations()) {
@@ -134,13 +130,14 @@ async function occurrenceTaken({ session, task }: HeldTask): Promise<boolean> {
 }
 
 /**
- * Keep the release's sync prompt, script and time on each host pass (KTD12).
- * An identical task is left unchanged. A completed or failed row is the
- * sweep's to re-arm within a minute, as upstream's restamp leaves it; the
- * next pass replaces that successor. A due occurrence the runner has claimed
- * or finished runs its course, and is replaced the same way once re-armed.
- * Any other pending occurrence that is overdue or due today keeps its time
- * when the release or the principal's working hours change. The caller holds `oneAtATime`.
+ * Keep the release's sync prompt, script and time on each host pass. An
+ * identical task is left unchanged. A completed or failed row is the sweep's
+ * to re-arm within a minute, as upstream's restamp leaves it; the next pass
+ * replaces that successor. A due occurrence the runner has claimed or
+ * finished runs its course, and is replaced the same way once re-armed. Any
+ * other pending occurrence that is overdue or due today keeps its time when
+ * the release or the principal's working hours change. The caller holds
+ * `oneAtATime`.
  */
 export async function keepSync(conversation: Session): Promise<string> {
   const timezone = await resolveGroupTimezone(conversation.agent_group_id);
@@ -168,7 +165,6 @@ export async function keepSync(conversation: Session): Promise<string> {
   return createSync(conversation, recurrence, timezone, keepTime ? (task.processAfter ?? undefined) : undefined);
 }
 
-/** One part of what a script prints: its heading, and a line for each thing in it. */
 interface ScriptSection {
   readonly heading: string;
   readonly lines: readonly string[];
@@ -178,11 +174,7 @@ function sectionLines(section: ScriptSection): string[] {
   return section.lines.length === 0 ? [`${section.heading}: none.`] : [`${section.heading}:`, ...section.lines];
 }
 
-/**
- * A thread waiting to be placed, as main reads it in the sync, in today's
- * list and in the host's reminder: its key, who its mail carried, when its
- * latest came, and the Gmail thread to read it by.
- */
+/** The one line main reads for a thread waiting to be placed, wherever it is shown one. */
 export function unplacedThreadLine(thread: UnplacedThread, timezone: string): string {
   return [
     `- ${thread.threadKey}: ${thread.people.join(', ')}`,
@@ -305,11 +297,8 @@ async function looksBefore(before: string): Promise<DueLook[]> {
 }
 
 /**
- * Today as matters hold it, from the host's own records alone: today's
- * looks, by time and title, the matters the host handed back for lack of a
- * look (R14), and the threads still waiting to be placed (R27). It always
- * wakes main: it runs as the script of a rundown the principal asked for,
- * main's own list to fold into a rundown built from their calendar.
+ * Always wakes main: it runs as the script of a rundown the principal asked
+ * for, main's own list to fold into a rundown built from their calendar.
  */
 export async function todayVerdict(): Promise<ScriptVerdict> {
   const timezone = await principalTimezone();

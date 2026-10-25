@@ -1,23 +1,9 @@
 /**
- * KTD5's destination admission. A destination is an ACL grant: the row lets
- * its owner send free text to its target. `main` and `external-email`
+ * Destination admission for the email separation: `main` and `external-email`
  * exchange work only as typed requests through the host, and each email
- * conversation has one writer (KTD1), pinned by the messaging-group ids the
- * inbox stored:
- *
- *   - no destination joins `main` and `external-email`;
- *   - `external-email` addresses nothing but the inbox it is wired to, and
- *     only it addresses the inbox (`email:inbox`);
- *   - only `main` addresses the principal's email conversation
- *     (`email:principal`), once it is wired to it, and of the email
- *     conversations `main` addresses only that one;
- *   - no agent group addresses `external-email`, or any other email
- *     conversation.
- *
- * The check runs on every destination write (`createDestination`), so it
- * covers `ncl destinations add`, a wiring's companion row, and `create_agent`.
- * Status scans the stored rows with the same check, for any row written
- * before the check existed or behind it.
+ * conversation has one writer, pinned by the messaging-group ids the inbox
+ * stored. Status scans the stored rows with the same check, for any row
+ * written before the check existed or behind it.
  */
 import { getDb } from '../../db/connection.js';
 import { registerDestinationAdmissionPolicy } from '../../db/wiring-admission.js';
@@ -46,7 +32,6 @@ async function isWired(messagingGroupId: string, agentGroupId: string): Promise<
   return row !== undefined;
 }
 
-/** Why the destination breaks the separation, or undefined when it does not. */
 export async function destinationViolation(row: AgentDestination): Promise<string | undefined> {
   if (!(await getDb().hasTable('gws_ea_profile'))) return undefined;
   const [main, externalEmail, email] = await Promise.all([
@@ -82,7 +67,6 @@ registerDestinationAdmissionPolicy('gws-ea-external-email:separation', ({ propos
   destinationViolation(proposed),
 );
 
-/** Each stored destination that breaks the separation, named by its owner and local name. */
 export async function destinationViolations(): Promise<string[]> {
   const db = getDb();
   if (!(await db.hasTable('agent_destinations'))) return [];

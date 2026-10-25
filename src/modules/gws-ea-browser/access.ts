@@ -1,9 +1,9 @@
 /**
- * Who may use the browser (R27, R28, KTD15): one operator setting, the
- * browser policy. Version 1 grants main alone; version 2 exactly the agent
- * groups it lists. Every host check, the delegate tools, guidance and
- * destinations ask here, whether or not the operator has the browser
- * enabled now: enablement is checked beside each grant, as it always was.
+ * Who may use the browser: one operator setting, the browser policy. Version 1
+ * grants main alone; version 2 the agent groups it lists, less any job agent
+ * that is not active. Every check of who may use the browser asks here,
+ * whether or not the browser is enabled now: enablement is checked beside
+ * each grant.
  *
  * A listed group shares the one signed-in browser profile and the vault
  * logins, and approvals still go to the principal. Its errands are its own:
@@ -22,9 +22,9 @@ import {
 import { readBrowserPolicy, type BrowserPolicy } from './policy.js';
 
 /**
- * The agent groups `policy` grants the browser. An unreadable policy grants
- * as version 1 does, main alone: it also leaves the browser unavailable, so
- * that grant opens nothing, and main still knows to tell the principal.
+ * An unreadable policy grants as version 1 does, main alone: it also leaves
+ * the browser unavailable, so that grant opens nothing, and main still knows
+ * to tell the principal.
  */
 export async function browserAccessGroups(policy?: BrowserPolicy): Promise<readonly string[]> {
   const current = policy ?? (await readHostBrowserPolicy());
@@ -47,7 +47,6 @@ async function eligibleChatGroup(group: string): Promise<boolean> {
   return job === undefined || job.state === 'active';
 }
 
-/** Whether `agentGroupId` may use the browser under `policy` (the operator's current one by default). */
 export async function hasBrowserAccess(
   agentGroupId: string | null | undefined,
   policy?: BrowserPolicy,
@@ -55,19 +54,17 @@ export async function hasBrowserAccess(
   return typeof agentGroupId === 'string' && (await browserAccessGroups(policy)).includes(agentGroupId);
 }
 
-/** Whether `agentGroupId` is main's: the one group a browser check names, besides those it grants. */
+/** Main is the one group a browser check may name beyond the policy's grants. */
 export async function isMainAgentGroup(agentGroupId: string): Promise<boolean> {
   return agentGroupId === (await getMainAgentGroupId());
 }
 
-/** A group with browser access, and what the browser calls it. */
 export interface BrowserDelegator {
   readonly agentGroupId: string;
   /** `main` for main, as the browser's instructions name it; any other group by its own name, made unique. */
   readonly name: string;
 }
 
-/** The existing agent groups `policy` grants the browser, each with the name the browser addresses it by. */
 export async function browserDelegators(policy?: BrowserPolicy): Promise<readonly BrowserDelegator[]> {
   const main = (await getDb().hasTable('gws_ea_profile')) ? await getMainAgentGroupId() : null;
   const delegators: BrowserDelegator[] = [];
@@ -88,12 +85,11 @@ export async function browserDelegators(policy?: BrowserPolicy): Promise<readonl
 /** A browser errand thread, `system:a2a:<group>:<errand>`, as agent-to-agent opens one for the group that sent it. */
 const ERRAND_THREAD = /^system:a2a:([^:\s]+):\S+$/u;
 
-/** The agent group that opened errand `thread`, or undefined for any other thread. */
 export function errandSource(thread: string | null | undefined): string | undefined {
   return thread ? ERRAND_THREAD.exec(thread)?.[1] : undefined;
 }
 
-/** The native host validates sealed groups on every policy read; operator file reads stay DB-free. */
+/** Refuses a policy that lists a sealed group; `readBrowserPolicy` stays DB-free for operator file reads. */
 export async function readHostBrowserPolicy(file?: string): Promise<BrowserPolicy> {
   const policy = await readBrowserPolicy(file);
   if (policy.status === 'unavailable' || policy.access.version === 1) return policy;

@@ -1,11 +1,11 @@
 /**
- * What a page confirms was bought, booked or paid (KTD8, KTD10), read document by document in Playwright's
- * utility world, so page script cannot rewrite what the reader sees. One set of evidence rules serves the check
- * after every ordinary press and an approved purchase's proof from its page:
+ * What a page confirms was bought, booked or paid, read document by document in Playwright's utility world, so
+ * page script cannot patch the reader. One set of evidence rules judges what follows an ordinary press and an
+ * approved purchase's proof from its page:
  *
  *   - an order, booking or confirmation number, with thank-you or confirmation wording beside it;
  *   - what the document says was charged: a total, a payment or a deposit with its amount;
- *   - schema.org Order or Reservation data, when the document carries it, which stands for both.
+ *   - schema.org Order or Reservation data, whose reference needs no wording beside it.
  *
  * A charge is only ever what a document states: a waitlist number or a $0.00 registration charged nothing.
  */
@@ -14,7 +14,6 @@ import type { Frame, Page } from 'playwright-core';
 import { isRecord } from '../../gws-ea/validation.js';
 import { amountMinor } from './fingerprint.js';
 
-/** An amount a document says was charged, in minor units of its currency. */
 export interface ConfirmationCharge {
   readonly amountMinor: number;
   readonly currency: string;
@@ -23,7 +22,6 @@ export interface ConfirmationCharge {
 export interface ConfirmationEvidence {
   /** The document's origin and path; its query and fragment can carry tokens, so they are left out. */
   readonly source: string;
-  /** The order, booking or confirmation number it shows. */
   readonly reference: string;
   /** The largest amount it says was charged, paid or put down; absent when it states none. */
   readonly charged?: ConfirmationCharge;
@@ -31,22 +29,20 @@ export interface ConfirmationEvidence {
   readonly structured: boolean;
 }
 
-/** How long one document's read may take. */
 const READ_TIMEOUT_MS = 2_000;
-/** A label alone on its line, whose amount stands on the next: "Order total", then "$42.00". */
+/** Most words in a label alone on its line whose amount stands on the next: "Order total", then "$42.00". */
 const LABEL_WORDS = 4;
 
 /** "Total", never "subtotal": a pattern fragment the checkout reader's vocabulary shares. */
 export const TOTAL_WORD = String.raw`(?<!\bsub[\s-]?)\btotal\b`;
 
-/** What the reader recognizes in a document's words. Vocabulary is data: widen or narrow it here. */
+/** Vocabulary is data: widen or narrow it here. */
 const CONFIRMATION_VOCABULARY = {
   confirmed:
     /\bthank(?:s|\s+you)\b|\b(?:order|booking|reservation|appointment|registration|purchase|payment|subscription)\s+(?:(?:is|has\s+been|was)\s+)?(?:confirmed|placed|received|completed?|successful)\b|\byou(?:'re|’re|\s+are)\s+(?:all\s+set|booked|confirmed|registered)\b|\bconfirmation\b/iu,
   /** A labelled number: the label, then a token of letters, digits and dashes that holds a digit. */
   reference:
     /\b(?:order|confirmation|booking|reservation|reference|receipt|transaction|ticket|registration)\s*(?:number|no\.?|num|#|id|code)?\s*[:#]?\s*#?\s*((?=[A-Z0-9-]*\d)[A-Z0-9][A-Z0-9-]{2,39})\b/iu,
-  /** What was charged: a total, a payment, or what was paid, charged or put down as a deposit. A subtotal is none. */
   charge: new RegExp(String.raw`${TOTAL_WORD}|\b(?:paid|charged|payment|deposit)\b`, 'iu'),
 } as const satisfies Record<string, RegExp>;
 
@@ -63,7 +59,6 @@ function charge(currency: string, whole: string, fraction = ''): ConfirmationCha
   return minor === undefined ? undefined : { amountMinor: minor, currency };
 }
 
-/** Every amount a line states, with its currency. */
 export function statedAmounts(line: string): ConfirmationCharge[] {
   const found: ConfirmationCharge[] = [];
   for (const match of line.matchAll(AMOUNT)) {
@@ -80,7 +75,6 @@ export function statedAmounts(line: string): ConfirmationCharge[] {
   return found;
 }
 
-/** A document's visible text as its nonblank lines, each with its spacing collapsed. */
 function toLines(text: string): string[] {
   return text
     .split('\n')
@@ -88,7 +82,6 @@ function toLines(text: string): string[] {
     .filter(Boolean);
 }
 
-/** The amounts a document's lines say were charged: on a charge line, or alone on the line after a short label. */
 function textCharges(lines: readonly string[]): ConfirmationCharge[] {
   const found: ConfirmationCharge[] = [];
   lines.forEach((line, index) => {
@@ -166,7 +159,6 @@ function structuredEvidence(
   return found;
 }
 
-/** The largest charge, if any amount was stated. */
 function largest(charges: readonly ConfirmationCharge[]): ConfirmationCharge | undefined {
   return charges.reduce<ConfirmationCharge | undefined>(
     (best, candidate) => (!best || candidate.amountMinor > best.amountMinor ? candidate : best),
@@ -174,7 +166,7 @@ function largest(charges: readonly ConfirmationCharge[]): ConfirmationCharge | u
   );
 }
 
-/** One document's evidence, from its visible words and its structured data. */
+/** Undefined without a reference: structured data's, or a labelled number beside confirmation wording. */
 export function confirmationEvidence(
   address: string,
   text: string,
@@ -198,7 +190,7 @@ export function confirmationEvidence(
   };
 }
 
-/** One document's evidence; a document that went away, navigated or never answered within its bound has none. */
+/** A document that went away, navigated or never answered within its bound has none. */
 async function readFrame(frame: Frame): Promise<ConfirmationEvidence | undefined> {
   /* eslint-disable no-catch-all/no-catch-all -- what was pressed already ran: a document that cannot be read confirms nothing */
   try {
@@ -213,7 +205,7 @@ async function readFrame(frame: Frame): Promise<ConfirmationEvidence | undefined
   /* eslint-enable no-catch-all/no-catch-all */
 }
 
-/** The visible lines of every document on the page, the main document first; a document that cannot be read has none. */
+/** Every document's visible lines, the main document's first; a document that cannot be read adds none. */
 export async function readPageLines(page: Page): Promise<string[]> {
   const read = async (frame: Frame): Promise<string[]> => {
     /* eslint-disable no-catch-all/no-catch-all -- a document that went away or never answered within its bound shows nothing */
@@ -227,12 +219,11 @@ export async function readPageLines(page: Page): Promise<string[]> {
   return (await Promise.all(page.frames().map(read))).flat();
 }
 
-/** Whether evidence shows a charge: a nonzero total, payment or deposit. */
 export function showsCharge(evidence: ConfirmationEvidence): boolean {
   return (evidence.charged?.amountMinor ?? 0) > 0;
 }
 
-/** What each of the page's documents confirms, the main document first; one that confirms nothing is left out. */
+/** The main document's evidence first; a document that confirms nothing is left out. */
 export async function readConfirmations(page: Page): Promise<ConfirmationEvidence[]> {
   return (await Promise.all(page.frames().map(readFrame))).filter(
     (evidence): evidence is ConfirmationEvidence => evidence !== undefined,

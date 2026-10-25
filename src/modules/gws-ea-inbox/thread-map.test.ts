@@ -1,5 +1,5 @@
 /**
- * The thread map (KTD2): stable `mail-…` keys that exist before Gmail has a
+ * The thread map: stable `mail-…` keys that exist before Gmail has a
  * thread, each side's messages, the addresses a thread may be written to,
  * the account the agent working it left, and the ledger that sends each
  * email once.
@@ -242,7 +242,7 @@ describe("a thread's addresses", () => {
   });
 });
 
-describe("a thread's account (KTD9)", () => {
+describe("a thread's account", () => {
   it('is none until the agent working the thread leaves one, then only its newest, with when it was left', async () => {
     const { threadKey } = await createThread('g-acme', AT);
     expect(await threadAccount(threadKey)).toBeUndefined();

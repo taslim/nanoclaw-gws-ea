@@ -1,7 +1,7 @@
 import { zonedInstant } from './iso-time.js';
 import type { StructuredBrowserLocator } from './locators.js';
 
-/** The generic signature's flow (KTD4): any checkout no reviewed signature reads. */
+/** The generic signature's flow: any checkout no reviewed signature reads. */
 export const GENERIC_FLOW_ID = 'generic-checkout-v1';
 
 export interface FinancialCommitment {
@@ -26,9 +26,8 @@ export interface ReservationFacts {
   endAt: string;
   timeZone: string;
 }
-/** A booking as an unreviewed page states it (KTD21): each fact only when the host read it. */
+/** A booking as an unreviewed page states it: each fact only when the host read it. */
 export interface GenericBookingFacts {
-  /** The venue's name as the page shows it. */
   venue?: string;
   partySize?: number;
   /** The booking's start, when the page states it with its zone or UTC offset. */
@@ -38,26 +37,24 @@ export interface GenericBookingFacts {
   /** The time as the page words it. */
   timeText?: string;
 }
-/** The generic floor's own facts (KTD5). */
 export interface GenericCheckoutFacts {
-  /** The checkout origin's registrable domain where it is not the merchant's: a payment platform or booking frame (KTD7). */
+  /** The checkout origin's registrable domain where it is not the merchant's: a payment platform or booking frame. */
   platform?: string;
   /** No account is signed in. */
   guest: boolean;
   /** The contact email, lowercased: also the account key an order number is unique within. */
   contactEmail: string;
-  /** The items, as the page shows them. */
   items: string[];
   /** The saved payment method, as the page shows it. */
   payment: string;
-  /** A note that rides along with the order or booking (R4). */
+  /** A note that rides along with the order or booking. */
   note?: string;
   booking?: GenericBookingFacts;
 }
-/** What the host read of a free commit (KTD3): a booking or sign-up that states no money. */
+/** What the host read of a free commit: a booking or sign-up that states no money. */
 export interface FreeCommitFacts {
   flowId: string;
-  /** The merchant (KTD7). */
+  /** The merchant. */
   site: string;
   /** The checkout origin. */
   origin: string;
@@ -73,7 +70,7 @@ export interface FreeCommitFacts {
 }
 export interface PurchaseFacts {
   flowId: string;
-  /** The merchant: the registrable domain of the top-level page the job entered checkout from (KTD7). */
+  /** The merchant: the registrable domain of the top-level page the job entered checkout from. */
   site: string;
   /** The checkout origin: the origin of the document the commit control is in. */
   origin: string;
@@ -94,7 +91,7 @@ export interface PurchaseFacts {
   noCommitmentTerms?: string;
   /**
    * Agreements beyond the site's own terms that the checkout's form carries, each by its frame origin and exact
-   * wording: approving the card agrees to each, standing on the site (KTD11). Absent when there are none.
+   * wording: approving the card agrees to each, standing on the site. Absent when there are none.
    */
   agreements?: Array<{ origin: string; wording: string }>;
   /** Paid extras the site keeps selected after the host unticked them: charges the card names. Absent when none. */
@@ -147,8 +144,8 @@ export function venueKey(venue: string): string {
 }
 
 /**
- * The reservation a purchase books, for the delegated bounds and the standing guarantee (KTD21): a reviewed
- * signature's, or a generic booking whose venue, party size and time the host read. Undefined otherwise.
+ * The reservation a purchase books, for the delegated bounds and the standing guarantee: a reviewed signature's,
+ * or a generic booking whose venue, party size and time the host read. Undefined otherwise.
  */
 export function bookedReservation(
   facts: PurchaseFacts,
@@ -160,7 +157,6 @@ export function bookedReservation(
     : undefined;
 }
 
-/** Whether a booked reservation falls within main's recorded bounds. */
 export function withinReservationBounds(
   reservation: { venueId: string; partySize: number; at: string } | undefined,
   bounds: NonNullable<PurchaseBounds['reservation']>,
@@ -182,9 +178,8 @@ const CHECKOUT_PAGE_CHANGED = 'The checkout page changed.';
 const OUTSIDE_BOUNDS = 'The reservation no longer fits what you approved.';
 
 /**
- * The generic floor's material change (KTD5): a total or due-now increase, the currency, the items, the payment
- * method, the terms, the contact email, the note, the checkout origin, the booking and the consent facts. The
- * commit label is not one: a checkout's next step names its own. Volatile text never reaches these facts.
+ * The commit label is not a material change: a checkout's next step names its own. Volatile text never reaches
+ * these facts.
  */
 function genericMaterialChange(
   approved: PurchaseFacts,
@@ -316,14 +311,9 @@ export function isFreeReservation(facts: PurchaseFacts): boolean {
   );
 }
 
-/** An email address, whole. */
 const EMAIL = /^[^\s@]+@[^\s@]+\.[^\s@]+$/u;
 
-/**
- * The generic floor (KTD5): the merchant and checkout origin, the commit label and locator, the total, currency
- * and amount due now, the saved payment method, the contact email, the items, and every term readable. No
- * address, item id or form action is required.
- */
+/** The generic floor: unlike a reviewed signature's, it requires no address, item id or form action. */
 function completeGenericFacts(facts: PurchaseFacts): boolean {
   const generic = facts.generic;
   if (!generic || !facts.site || !facts.origin || !facts.account || !facts.control.label || !facts.control.locator)
@@ -391,15 +381,14 @@ export function completePurchaseFacts(facts: PurchaseFacts): boolean {
 /** A commit label that books rather than buys. */
 export const BOOKING_CONTROL = /\b(?:reserve|reservation|book(?:ing)?|table|rsvp|wait\s*list|waitlist)\b/iu;
 
-/** Whether the host-read free commit books rather than orders. */
 export function freeCommitBooks(facts: FreeCommitFacts): boolean {
   return Boolean(facts.booking) || BOOKING_CONTROL.test(facts.control.label);
 }
 
 /**
- * Whether the standing guarantee covers a booking (R38, KTD21): its venue, party size and time read and within
- * main's recorded bounds, nothing due now, and only cancellation or no-show fees whose whole exposure is within
- * the guarantee's limit. An unreviewed booking must also state its fee terms.
+ * Whether the standing guarantee covers a booking: its venue, party size and time read and within the delegator's
+ * recorded bounds, nothing due now, and only cancellation or no-show fees whose whole exposure is within the
+ * guarantee's limit. An unreviewed booking must also state its fee terms.
  */
 export function guaranteeCoversReservation(
   grant:

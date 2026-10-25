@@ -1,8 +1,8 @@
 /**
- * Prerequisites: what create and resume need from this machine and the
- * operator's Google sign-in, checked before anything is reserved and again on
- * every resume. Local checks run first, so a stopped Docker is named before
- * anyone is asked to sign in.
+ * What create and resume need from this machine and the operator's Google
+ * sign-in, checked before anything is reserved and again on every resume.
+ * Local checks run first, so a stopped Docker is named before anyone is asked
+ * to sign in.
  */
 import { request as httpRequest } from 'node:http';
 import os from 'node:os';
@@ -52,7 +52,6 @@ export type PrerequisiteRequest =
       readonly dockerEndpoint?: string;
     };
 
-/** What the prerequisites established about this host, as create records it. */
 export interface Prerequisites {
   readonly platform: 'macos' | 'linux';
   readonly homeDirectory: string;
@@ -68,9 +67,7 @@ export interface Prerequisites {
 export type PrerequisiteInteraction = Pick<Interaction, 'signInToGoogleCloud' | 'confirmGoogleAccount'>;
 
 export interface PrerequisiteDependencies {
-  /** Runs git, pnpm, docker, and gcloud. */
   readonly runCommand?: SanitizedCommandOutcomeRunner;
-  /** Resolves an executable the instance service will run (`node`). */
   readonly resolvePersisted?: typeof resolvePersistedExecutable;
   readonly node?: Pick<NodeJS.Process, 'version' | 'execPath' | 'execve'>;
   readonly platform?: NodeJS.Platform;
@@ -81,7 +78,7 @@ export interface PrerequisiteDependencies {
 /**
  * NanoClaw's longest socket under a state root: it binds `data/ncl.sock` and
  * `data/cli.sock`, as long as each other, in its working directory, which is
- * a release's physical folder, `<state root>/<8 hex>/<8 hex>` (KTD10).
+ * a release's physical folder, `<state root>/<8 hex>/<8 hex>`.
  */
 const LONGEST_SOCKET = path.join('12345678', '12345678', 'data', 'ncl.sock');
 
@@ -149,7 +146,6 @@ type DockerDaemonState =
   | { readonly state: 'running' }
   | { readonly state: 'stopped' | 'no-permission'; readonly evidence: string };
 
-/** Ask the daemon behind a unix socket for the Engine API's `GET /_ping`. */
 function pingDocker(socketPath: string): Promise<DockerDaemonState> {
   return new Promise((resolve) => {
     const request = httpRequest(
@@ -175,7 +171,6 @@ function pingDocker(socketPath: string): Promise<DockerDaemonState> {
   });
 }
 
-/** Whether a running Docker daemon answers at a local `unix://` endpoint. */
 export async function dockerAnswers(endpoint: string): Promise<boolean> {
   const socket = unixSocketPath(endpoint);
   return socket !== undefined && (await pingDocker(socket)).state === 'running';
@@ -193,9 +188,8 @@ function parseDockerContext(stdout: string): { readonly name: string; readonly e
 }
 
 /**
- * Resolve the active Docker context, under the same environment every tool
- * gets, to its endpoint. Only a local `unix://` socket answered by a
- * running daemon is accepted.
+ * Only a local `unix://` socket answered by a running daemon is accepted. The
+ * context is read under the same environment every tool gets.
  */
 export async function resolveDockerEndpoint(
   runner: SanitizedCommandOutcomeRunner = runSanitizedCommandOutcome,
@@ -270,7 +264,6 @@ function assertWorkspaceAccount(account: string): void {
   );
 }
 
-/** Create without `--google-account`: the signed-in account, once the operator confirms it. */
 async function confirmedAccount(
   interaction: PrerequisiteInteraction,
   runner: SanitizedCommandOutcomeRunner,
@@ -288,7 +281,6 @@ async function confirmedAccount(
   }
 }
 
-/** The Google account for this run, signed in with credentials that still refresh. */
 async function googleAccount(
   request: PrerequisiteRequest,
   interaction: PrerequisiteInteraction,
@@ -311,7 +303,6 @@ async function googleAccount(
   return account;
 }
 
-/** Check every prerequisite, guiding sign-in through the `Interaction` port, and report the host. */
 export async function checkPrerequisites(
   request: PrerequisiteRequest,
   interaction: PrerequisiteInteraction,

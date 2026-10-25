@@ -1,6 +1,6 @@
 /**
- * Every GWS-EA answer that pairs a `message` with other fields is reviewed
- * (KTD9): an agent reads a tool answer's `message` alone, so data it needs
+ * Every GWS-EA answer that pairs a `message` with other fields is reviewed:
+ * an agent reads a tool answer's `message` alone, so data it needs
  * must be rendered there, unless the fields beyond it are for the host's own
  * callers or the whole object is the agent's text. A new answer, or a new
  * field on one, fails here until it is reviewed and listed.
@@ -123,7 +123,7 @@ const REVIEWED: Readonly<Record<string, Review>> = {
   'gws-ea-browser/purchase-outcome.ts recordPurchaseOutcome: recorded, status, thread': {
     kind: 'rendered',
     reason:
-      "the possible duplicate's alarm says what was recorded first and what to do (KTD15); the thread is the recorder's own input",
+      "the possible duplicate's alarm says what was recorded first and what to do; the thread is the recorder's own input",
   },
   'gws-ea-browser/notices.ts notifyUnconfirmedPurchase: kind': {
     kind: 'host-only',
@@ -131,7 +131,7 @@ const REVIEWED: Readonly<Record<string, Review>> = {
   },
   'gws-ea-browser/purchase-wording.ts checkoutChanging: reason, repeat_safe, status': {
     kind: 'rendered',
-    reason: 'the change the host read is written into the sentence (U11)',
+    reason: 'the change the host read is written into the sentence',
   },
   'gws-ea-browser/purchase-wording.ts told: repeat_safe, safe_to_rebuild': {
     kind: 'read-whole',
@@ -149,7 +149,7 @@ const REVIEWED: Readonly<Record<string, Review>> = {
     },
   'gws-ea-browser/watch-wording.ts termsOverBounds: exposure, max_total, reason, status': {
     kind: 'rendered',
-    reason: 'the exposure, the maximum and the terms as the host read them are written into the sentence (U11)',
+    reason: 'the exposure, the maximum and the terms as the host read them are written into the sentence',
   },
   'gws-ea-chat/adapter.ts notification: eventTime, eventType, space, subscription, targetResource': {
     kind: 'host-only',

@@ -160,9 +160,8 @@ export async function realizeProviderSpawnSurfaces(
 }
 
 /**
- * Prepare one declared file in its volume: create it when missing, else
- * reconcile it. `sessionDirectory` names the session that holds a
- * session-scope volume, such as a sealed session's own copy of a group file.
+ * `sessionDirectory` is the session folder that holds a session-scope volume,
+ * such as a sealed session's own copy of a group file.
  */
 export function initializeFile(
   provider: string,

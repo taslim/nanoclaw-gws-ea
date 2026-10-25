@@ -165,7 +165,7 @@ function storedFrame(value: Record<string, unknown>, requestId: string): Respons
   throw new Error('Unreadable artifact share result.');
 }
 export interface ArtifactSharingDependencies {
-  /** Concrete Access admission owner. Invoked outside central transactions. */
+  /** Brings Cloudflare Access admission up to date: remote work, so never inside a central transaction. */
   readonly verifyAdmission: (config: ArtifactsPolicyFile) => Promise<void>;
   readonly publicationReady: (config: ArtifactsPolicyFile) => boolean | Promise<boolean>;
 }

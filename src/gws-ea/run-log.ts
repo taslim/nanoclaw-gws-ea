@@ -36,12 +36,12 @@ export interface StepLog {
   readonly name: string;
   /** Absolute path of this step's raw log; follows the run when an instance is reserved. */
   readonly rawLog: string;
-  /** Record a short parsed fact on this step's progression entry. */
+  /** A short fact shown on this step's `progress.log` entry. */
   fact(key: string, value: LogFieldValue): void;
   mark(status: 'paused'): void;
-  /** Append redacted text to this step's raw log. */
+  /** Redacted before it reaches the raw log. */
   write(text: string): void;
-  /** Record a dotenv file by its key names only. */
+  /** Records a dotenv file by its key names only, never its values. */
   envFile(file: string, contents: string): void;
 }
 
@@ -49,18 +49,17 @@ export interface RunLog {
   readonly id: string;
   readonly directory: string;
   readonly progressLog: string;
-  /** Secondary failure while recording a primary operation failure. */
+  /** Code of the first failure to write this run's logs, so a result can say its log is incomplete. */
   readonly loggingError?: string;
   step<T>(name: string, body: (step: StepLog) => Promise<T>): Promise<T>;
   userInput(key: string, value: string): void;
-  /** Move a pre-reservation run under its newly reserved instance. */
+  /** Moves a pre-reservation run under its newly reserved instance; a run under another instance is refused. */
   assignInstance(instanceId: string): Promise<void>;
   complete(): void;
   /** `step` is the step that paused, when a later check ran after it. */
   pause(reason: string, step?: string): void;
-  /** The run was stopped by a signal, such as Ctrl-C. */
   interrupt(signal: NodeJS.Signals): void;
-  /** Close the run as failed, naming the step that raised this error. */
+  /** Closes the run as failed, naming the innermost step that raised `error`. */
   abort(error: unknown): void;
 }
 
@@ -75,7 +74,7 @@ export interface StartRunOptions {
 
 const activeSteps = new AsyncLocalStorage<StepLog>();
 
-/** The step the current async context runs inside, if any. The command runner logs through it. */
+/** The step the current async context runs inside; the command runner logs through it. */
 export function activeStep(): StepLog | undefined {
   return activeSteps.getStore();
 }
@@ -276,7 +275,6 @@ class Run implements RunLog {
   }
 }
 
-/** Open a new run: register secrets first, then create its private, exclusive log directory. */
 export async function startRunLog(options: StartRunOptions): Promise<RunLog> {
   if (options.instanceId !== undefined) assertInstanceId(options.instanceId);
   await Promise.all((options.secretDirectories ?? []).map(registerSecretDirectory));

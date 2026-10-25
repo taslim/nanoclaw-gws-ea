@@ -1,11 +1,11 @@
 /**
- * Cookie banners (KTD12, R18): before each observation the browser agent receives, the host rejects a cookie
- * banner wherever it can see a reject option, and otherwise tells the agent the banner is there.
+ * Cookie banners: before each observation the browser agent receives, the host rejects a cookie banner wherever
+ * it can see a reject option, and otherwise tells the agent the banner is there.
  *
  * The rules are data: one per consent platform, naming its banner, its reject-all control and the control that
  * opens its second layer, plus a generic rule for any dialog or banner region that speaks of cookies, whose
  * controls are known by their labels. An isolated world in every frame reads the banners, open shadow roots and
- * cross-site consent frames included, so page script cannot fake what the host sees. The host presses with a
+ * cross-site consent frames included, so page script cannot answer for the reader. The host presses with a
  * real click, keeping its hit-target check, and only a control that cannot leave the page or submit a form
  * outside its banner and that the classifier reads as ordinary. Then it waits for the banner to close. Each page
  * load gets one reject and one second layer at most: a banner that comes back, or will not close, is reported
@@ -94,10 +94,8 @@ const COOKIE_BANNER_RULES: readonly CookieBannerRule[] = [
   },
 ];
 
-/** What a banner control does, read from its label. */
 export type CookieBannerControlKind = 'reject' | 'settings' | 'accept';
 
-/** Whole labels, in a few common languages besides English, each anchored at both ends. */
 const labels = (alternatives: readonly string[]): RegExp => new RegExp(`^(?:${alternatives.join('|')})$`, 'iu');
 const necessary = String.raw`(?:strictly\s+)?(?:necessary|essential|required)`;
 
@@ -239,7 +237,7 @@ export function chooseCookieBanners(regions: readonly CookieBannerRegionRead[], 
 }
 
 /**
- * What the host did about a cookie banner before an observation (R18):
+ * What the host did about a cookie banner before an observation:
  * - `rejected`: it pressed the banner's reject and the banner closed;
  * - `no_reject_option`: a banner shows with no reject the host can press, on either layer, so the agent chooses;
  * - `reappeared`: a banner shows again after the host rejected one on this page load, and it does not press again;
@@ -292,10 +290,7 @@ const ANSWER_WAIT_MS = 2_000;
 const FADE_WAIT_MS = 500;
 const POLL_MS = 100;
 
-/**
- * The isolated-world half: plain JavaScript holding the banner reader, the frame-owner reader and the exact-node
- * handoff. Every prototype it calls is the isolated world's own, so page script cannot answer for it.
- */
+/** Every prototype the isolated-world half calls is that world's own, so page script cannot answer for it. */
 const librarySource = String.raw`(sources) => {
   const rules = sources.rules;
   const cookieWords = new RegExp(sources.cookies, 'iu');
@@ -561,7 +556,6 @@ interface FrameOwner {
   readonly parent: HostedFrame;
   readonly objectId: string;
 }
-/** A banner the host found, in its frame. */
 interface FoundBanner extends CookieBannerChoice {
   readonly frame: HostedFrame;
 }
@@ -750,13 +744,13 @@ function loadFor(page: Page, loader: string): CookieBannerLoad {
   return load;
 }
 
+type CookieBannerOperation = Pick<ActivationIntent, 'scope' | 'assertActive' | 'remaining'>;
+
 /**
  * A real click on the control: found and confirmed in the isolated world, then pressed through the one
  * activation boundary every host press takes, which reads it fresh as ordinary and keeps Playwright's
  * hit-target check, never forced or dispatched.
  */
-type CookieBannerOperation = Pick<ActivationIntent, 'scope' | 'assertActive' | 'remaining'>;
-
 async function press(
   page: Page,
   round: BannerRound,
@@ -823,7 +817,7 @@ async function awaitSecondLayer(page: Page, assertActive?: () => Promise<void>):
 }
 
 /**
- * The cookie-banner pass the host runs before an observation (R18), inside the job's operation so its clicks run
+ * The cookie-banner pass the host runs before an observation, inside the job's operation so its clicks run
  * under the job's navigation guard. Answers what the observation reports, or undefined when no banner shows.
  * It never fails an observation: a page it cannot read keeps its banner for the agent.
  */

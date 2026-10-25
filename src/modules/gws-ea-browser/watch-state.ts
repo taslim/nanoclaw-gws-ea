@@ -35,8 +35,8 @@ export interface WatchFinancialBounds {
 }
 export interface WatchBounds {
   /**
-   * `region` for a watch on a site with no reader (KTD20): the agent watches the region it marked, and the host books
-   * only through the site's own checkout, read when the agent finds a table. Absent for a reader watch.
+   * `region` for a watch on a site with no reader: the agent watches the region it marked, and the host books only
+   * through the site's own checkout, read when the agent finds a table. Absent for a reader watch.
    */
   kind?: 'region';
   site: string;
@@ -76,7 +76,7 @@ export interface WatchRow {
   booking_recipe_version: number | null;
   /** The venue's release schedule, written once at creation; null when the venue states none. */
   release_json: string | null;
-  /** On a site with no reader (KTD20), the structured locator of the region the agent marked; null on a reader watch. */
+  /** The structured locator of the region the agent marked; null on a reader watch. */
   region_json: string | null;
   /** The region's normalized text as the agent last saw it: at its marking, then at each change that woke it. */
   region_baseline: string | null;
@@ -103,7 +103,7 @@ export const liveStates = ['armed', 'checking', 'preparing'] as const;
 export const watchDigest = (text: string): string => createHash('sha256').update(text).digest('hex');
 export const boundsOf = (watch: WatchRow): WatchBounds => JSON.parse(watch.bounds_json) as WatchBounds;
 const GENERIC_BOOKING_SPAN_MS = 2 * 60 * 60_000;
-/** The most a booking's terms can charge: each for every guest it is per, an unread amount without bound. */
+/** The most a booking's terms can charge: a per-person term counts per guest, an unread amount is unbounded. */
 export function financialExposure(
   commitments: ReadonlyArray<Pick<FinancialCommitment, 'amountMinor' | 'perPerson'>>,
   partySize: number,
@@ -144,7 +144,6 @@ export function watchSlotKey(slot: ReservationFacts): string {
 }
 export const getBrowserWatch = (id: string, db: DbDriver = getDb()): Promise<WatchRow | undefined> =>
   db.get<WatchRow>('SELECT * FROM gws_ea_browser_watches WHERE id = ?', id);
-/** The release instants a watch's recorded rule sets for its windows; none without a rule. */
 export function watchReleases(watch: WatchRow): number[] {
   if (!watch.release_json) return [];
   const bounds = boundsOf(watch);
@@ -281,7 +280,7 @@ export interface ClaimWatchInput {
   calendarCheckedReservation: ReservationFacts;
   at: string;
 }
-/** Joins the sole executor's authority/marker transaction. No mailbox, calendar or browser awaits here. */
+/** Runs inside the authority's commit transaction, so it awaits no mailbox, calendar or browser. */
 export async function claimWatchBooking(db: DbDriver, input: ClaimWatchInput): Promise<void> {
   const watch = await getBrowserWatch(input.watchId, db);
   const job = await db.get<{ cancelled: number; cancel_requested: number }>(
@@ -401,7 +400,6 @@ export async function emitWatchNotice(
 }
 
 const REGION_WAKE = /^(?:change|region_missing):/u;
-/** When a region watch woke the agent in the hour before `now`. */
 export async function regionWakesThisHour(db: DbDriver, watchId: string, now: number): Promise<number[]> {
   const notices = await db.all<{ event_key: string; created_at: string }>(
     'SELECT event_key,created_at FROM gws_ea_browser_watch_notices WHERE watch_id = ? AND created_at > ?',
@@ -423,9 +421,9 @@ async function latestBookingStep(db: DbDriver, jobId: string): Promise<number> {
   return Date.parse(step?.at ?? '') || 0;
 }
 /**
- * How much slower a region check runs (KTD20). The agent decides on each wake: a wake that no step toward a booking
- * followed (a free commit, a purchase card or an authority) matched nothing, and each such wake this hour doubles the
- * cadence; a booking step resets it. A shared check keeps its least-slowed member's pace; a reader watch never slows.
+ * How much slower a region check runs. A wake that no step toward a booking followed (a free commit, a purchase card
+ * or an authority) matched nothing, and each such wake this hour doubles the interval; a booking step resets it. A
+ * shared check keeps its least-slowed member's pace, and one that serves a reader watch never slows.
  */
 export async function regionWatchSlowdown(db: DbDriver, watches: readonly WatchRow[]): Promise<number> {
   const now = Date.now();
@@ -445,10 +443,10 @@ export type RegionCheckRead =
   | { status: 'region_read'; text: string }
   | { status: 'region_missing'; reason: 'region_not_found' | 'route_changed' };
 /**
- * Records what a check `checkId` read for a region watch it served (KTD20), while the watch is still that check's
- * and its region the one read. A changed text wakes the agent with the text before and after, untrusted, and the
- * baseline moves on; a change over the hourly cap keeps the old baseline, so it wakes once the hour allows. A
- * region found again ends its absence; one missing on two checks running wakes the agent once to mark it again.
+ * Records what check `checkId` read for a region watch it served, while the watch is still that check's and its region
+ * the one read. A changed text wakes the agent with the text before and after, untrusted, and the baseline moves on; a
+ * change over the hourly cap keeps the old baseline, so it wakes once the hour allows. A region found again ends its
+ * absence; one missing on two checks running wakes the agent once to mark it again.
  */
 export async function recordRegionCheck(
   db: DbDriver,
@@ -506,12 +504,12 @@ export async function recordRegionCheck(
 }
 
 /**
- * A booking that a region watch's errand commits on the watched site by a free commit or a card's approval spends
- * the job's one booking claim (KTD20), as the watch's own authority does: the watch stops checking, and the commit's
- * outcome ends it. A free commit's `booking`, as its page states it, spends only a watch it does not fall outside:
- * a table for another venue, party or time books and leaves every watch going, while one whose page leaves a fact
- * unstated may be the watched table and spends it. Joins the commit's transaction and waits on nothing outside the
- * database. A job with no such live region watch on the site, or whose claim is already spent, is left as it is.
+ * A commit a region watch's errand makes on the watched site other than through the watch's own authority spends the
+ * job's one booking claim as that authority would: the watch stops checking, and the commit's outcome ends it. A
+ * `booking`, as its page states it, spends only a watch it does not fall outside: a table for another venue, party or
+ * time books and leaves every watch going, while one whose page leaves a fact unstated may be the watched table and
+ * spends it. Joins the commit's transaction and waits on nothing outside the database. A job with no such live region
+ * watch on the site, or whose claim is already spent, is left as it is.
  */
 export async function claimRegionWatchCommit(
   db: DbDriver,
@@ -549,8 +547,7 @@ export async function claimRegionWatchCommit(
     );
 }
 /**
- * Ends the watch whose claim a commit took, whatever took it (the watch's own authority, a card or guarantee
- * booking, or a free table on a region watch's site), once the commit's attempt is unconfirmed (`placed`
+ * Ends the watch whose claim a commit took, whatever took it, once the commit's attempt is unconfirmed (`placed`
  * undefined) or resolved by any source. Joins the authority store's transaction; a claim already final is left.
  */
 export async function finishWatchCommit(
@@ -616,7 +613,7 @@ export async function deliverWatchNotices(db: DbDriver = getDb()): Promise<void>
   }
 }
 
-/** DB-only withdrawal used by cancellation and expiry; terminal card delivery follows commit. */
+/** DB-only: terminal card delivery for the withdrawn approvals follows the transaction's commit. */
 export async function detachBrowserWatchCards(
   jobId: string,
   status: 'cancelled' | 'expired',

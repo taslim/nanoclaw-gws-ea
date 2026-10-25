@@ -10,7 +10,7 @@ import {
 
 const creationTails = new WeakMap<ChromeConnection, Promise<void>>();
 
-/** Public availability checks get no cookies from the assistant's persistent account. */
+/** A fresh browser context, so the page gets no cookies from the assistant's persistent profile. */
 export async function withSignedOutBrowserPage<T>(
   connection: ChromeConnection,
   operation: (page: Page) => Promise<T>,

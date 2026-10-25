@@ -45,20 +45,14 @@ export function normalizeOptions(raws: RawOption[]): NormalizedOption[] {
 }
 
 /**
- * The option values of an approve/reject request. Every approval offers them
- * (module approvals, gateway holds, new-sender approvals); a channel whose
- * requests are text asks for them as yes or no, 👍 or 👎.
+ * The option values of an approve/reject request, which a channel whose
+ * requests are text asks for as yes or no, 👍 or 👎.
  */
 export const APPROVE_OPTION = 'approve';
 export const REJECT_OPTION = 'reject';
 /** A rejection that takes a reason. In words, the reason follows the no. */
 export const REJECT_WITH_REASON_OPTION = 'reject_with_reason';
 
-/**
- * Whether the options make an approve/reject request (approve, reject, and at
- * most a rejection with a reason) and whether its rejection takes a reason;
- * undefined for any other request.
- */
 export function approveRejectRequest(
   options: readonly NormalizedOption[],
 ): { readonly takesReason: boolean } | undefined {

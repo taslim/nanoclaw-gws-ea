@@ -455,7 +455,7 @@ export async function processQuery(
   // moved past them, so both doors check retry blocks against this window and
   // skip exact repeats. Follow-ups queued in between keep their own window.
   let nudgedWindow: SeqWindow | undefined;
-  // A person waiting in a live chat is reminded of after a while if nothing has gone out (acknowledge.ts).
+  // Each adopted turn starts or stops the wait acknowledge.ts reminds the agent of.
   const awaitAnswer = (): void => {
     if (routing.personWaiting === true) startWaiting(() => sentSince(turnStartSeq).length > 0);
     else stopWaiting();
@@ -883,11 +883,8 @@ function sendsFailureNotice(routing: RoutingContext): boolean {
 }
 
 /**
- * Report a failed turn to the host as a typed `turn_failed` system action
- * carrying the turn's route, the provider's error, the cause it recognized,
- * and the batch it answered. The host decides who hears about it and in what
- * words, and keeps the error in its log; nothing is written for the
- * conversation itself.
+ * The host decides who hears about a failed turn and in what words, and keeps
+ * the error in its log; nothing is written for the conversation itself.
  */
 async function reportTurnFailed(
   routing: RoutingContext,
@@ -1160,11 +1157,10 @@ function chatRowsInWindow(afterSeq: number, uptoSeq = Infinity): MessageOutRow[]
 }
 
 /**
- * Everything that went out after `afterSeq`: each chat row, and each request
- * that sends a message (an email) the host answered ok, which went out as
- * surely as a chat row (`deliveredByRequest`). The informed nudge quotes
- * them, and the acknowledgement reminder asks whether any went out. A lookup
- * error returns none, as chatRowsInWindow does.
+ * Each chat row after `afterSeq`, and each request that sends a message (an
+ * email) the host answered ok, which went out as surely as a chat row
+ * (`deliveredByRequest`). A lookup error returns none, as chatRowsInWindow
+ * does.
  */
 function sentSince(afterSeq: number): MessageOutRow[] {
   try {
@@ -1286,7 +1282,6 @@ function wasWrittenInWindow(dest: DestinationEntry, body: string, window: SeqWin
   });
 }
 
-/** Whether `content` is what the door writes for `body`: its words, with nothing beside them but the batch. */
 function isDoorText(content: string, body: string): boolean {
   let parsed: unknown;
   try {

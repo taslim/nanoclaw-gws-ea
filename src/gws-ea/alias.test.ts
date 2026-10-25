@@ -35,7 +35,7 @@ import { claimInstanceAlias, getInstanceReservation } from './registry.js';
 import { persistTestRuntime } from './testing/runtime-fixture.js';
 import { GwsEaError, type InstanceReservationInput } from './types.js';
 
-describe("the assistant's web alias name (R21)", () => {
+describe("the assistant's web alias name", () => {
   it('reverses the name, lowercased, in ASCII, without spaces', () => {
     expect(aliasStem('Juno')).toEqual({ status: 'derived', stem: 'onuj' });
     expect(aliasStem('Juno Hale')).toEqual({ status: 'derived', stem: 'elahonuj' });
@@ -203,7 +203,7 @@ function paused(result: ProvisionResult) {
   return result.pause;
 }
 
-describe('the web alias setup step (KTD13)', () => {
+describe('the web alias setup step', () => {
   beforeEach(async () => {
     await runMigrations(await initTestDb());
     await publishAliasTestProfile();

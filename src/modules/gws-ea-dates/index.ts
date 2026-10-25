@@ -2,15 +2,14 @@
  * GWS-EA's outgoing date check: nothing the assistant sends says a weekday
  * beside a date it does not fall on (`weekday-check.ts`).
  *
- * - An outbound guard at the delivery adapter reads every send before the
- *   channel does: main's replies to the principal in Chat or email,
- *   external-email's emails and `email_send`, cards, and host notices. A
- *   refused reply is never delivered, and its agent is told why and woken to
- *   send it again; a refused `email_send` fails the tool with the reason.
- *   The quote an email reply carries is added after the guard, so only the
- *   assistant's own words are read.
+ * - An outbound guard reads every send through the delivery adapter,
+ *   `email_send` included, before the channel does. A refused reply is never
+ *   delivered, and its agent is told why and woken to send it again; a
+ *   refused `email_send` fails the tool with the reason. The quote an email
+ *   reply carries is added after the guard, so only the assistant's own words
+ *   are read.
  * - `weekdayRefusal` gives the same check to writes that never pass a
- *   channel: the text of an invitation the assistant writes.
+ *   channel, such as the text of an invitation the assistant writes.
  *
  * A date without a year is read from today on the principal's clock. The
  * refusal names the pair and the weekday each reading falls on, so the
@@ -24,7 +23,7 @@ export { weekdayRefusal } from './refusal.js';
 
 export const WEEKDAY_GUARD_ID = 'gws-ea-dates:weekday';
 
-/** The outbound guard: refuses a send whose words pair a weekday with a date it does not fall on. Files are not read. */
+/** Reads the message's words only; attached files are not read. */
 export async function judgeDates(send: OutboundSend): Promise<OutboundGuardDecision> {
   const reason = await weekdayRefusal(messageStrings(send.content));
   return reason === undefined ? { effect: 'allow' } : { effect: 'refuse', reason };

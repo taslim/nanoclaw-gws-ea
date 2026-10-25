@@ -1,5 +1,5 @@
 /**
- * The host's guarantees for matters (KTD7, R13, R14, R16, R24, AE3): every
+ * The host's guarantees for matters: every
  * open matter has exactly one look still to come, a closed one none, the
  * daily sync always exists, and a failed repeating look comes back at the
  * next sync. Driven through `ncl` and the real sweep against main's real
@@ -125,7 +125,7 @@ afterEach(async () => {
 });
 
 describe("the host's guarantees for matters", () => {
-  it("gives a matter whose look ran with no new one a look at the next sync, once main's container is idle (AE3)", async () => {
+  it("gives a matter whose look ran with no new one a look at the next sync, once main's container is idle", async () => {
     const acme = await open('Acme renewal', { look: inDays(3) });
     const main = await mainSession();
     await runOccurrence(main, (await liveRow(acme.look_task_id)).id, 'completed');
@@ -159,7 +159,7 @@ describe("the host's guarantees for matters", () => {
     expect(paused?.status).toBe('cancelled');
   });
 
-  it('lets a yearly look re-arm itself after it runs, as the same one look (R24)', async () => {
+  it('lets a yearly look re-arm itself after it runs, as the same one look', async () => {
     const birthday = await open("Juno Hale's birthday", { 'look-cron': YEARLY });
     const main = await mainSession();
     await runOccurrence(main, (await liveRow(birthday.look_task_id)).id, 'completed');

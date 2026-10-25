@@ -1,23 +1,11 @@
 /**
- * The host's free-time arithmetic (KTD7; R69). Pure functions: no store, no
- * Google, no clock of their own.
+ * The host's free-time arithmetic. Pure functions: no store, no Google, no
+ * clock of their own. Wall-clock times become instants through the zone, so
+ * a day with a clock change is 23 or 25 hours long.
  *
- * - Wall-clock times become instants through the principal's timezone, so a
- *   day with a clock change is 23 or 25 hours long and every time is its real
- *   length. A wall time the clocks skip lands just after the change.
- * - An event blocks time unless it is cancelled, free (transparent), or an
- *   invitation the principal declined on that calendar; an all-day event
- *   covers the principal's whole local days. `free_time`, `book` and main's
- *   `find_conflicts` all read time through this one rule.
- * - Free time is every free window in the principal's waking day, widened
- *   by working hours that reach past it, clear of busy time by the buffer,
- *   inside the counterpart's waking day when their zone is known, and long
- *   enough for the meeting (`freeWindows`). Its edges sit on the quarter
- *   hour. Each window carries a fit note from a fixed vocabulary that every
- *   meeting inside it meets (`fitOf`), so a window is split where the fit
- *   changes. Protected time is one of those notes, not a wall: the agent
- *   picks the times, and judges who is worth bending a preference for; the
- *   host only says which are free.
+ * Protected time is a fit note, not a wall: the agent picks the times, and
+ * judges who is worth bending a preference for; the host only says which
+ * are free.
  */
 import {
   type PreferenceValue,
@@ -34,7 +22,7 @@ export interface Span {
   readonly end: number;
 }
 
-/** A calendar date on the principal's clock; `month` runs 1 to 12. */
+/** `month` runs 1 to 12. */
 export interface LocalDate {
   readonly year: number;
   readonly month: number;
@@ -51,7 +39,6 @@ export interface WeeklyRange extends ClockRange {
   readonly weekdays: ReadonlySet<Weekday>;
 }
 
-/** The principal's preferences, as free-time arithmetic needs them. */
 export interface SchedulingRules {
   /** Hours per weekday; a weekday without hours is not a working day. */
   readonly workingHours: ReadonlyMap<Weekday, ClockRange>;
@@ -60,11 +47,10 @@ export interface SchedulingRules {
   readonly bufferMinutes: number;
 }
 
-/** Free windows start and end on the quarter hour. */
 const EDGE_MINUTES = 15;
-/** The waking day, 07:00 to 22:00, which free time offers from on either side's clock: never the night. */
+/** Free time keeps to the waking day on either side's clock, widened on the principal's by their working hours. */
 const WAKING_HOURS: ClockRange = { start: 7 * 60, end: 22 * 60 };
-/** Working hours until the principal has any: Monday to Friday, 09:00 to 17:00. */
+/** Used while the principal has set no working hours. */
 const DEFAULT_WORKING_HOURS: ReadonlyMap<Weekday, ClockRange> = new Map(
   (['mon', 'tue', 'wed', 'thu', 'fri'] as const).map((day) => [day, { start: 9 * 60, end: 17 * 60 }]),
 );
@@ -79,7 +65,6 @@ const SUNDAY_FIRST: readonly Weekday[] = ['sun', 'mon', 'tue', 'wed', 'thu', 'fr
 // Time zones
 // ---------------------------------------------------------------------------
 
-/** An instant as ISO-8601 UTC, the way the store and Google take it. */
 export function iso(instant: number): string {
   return new Date(instant).toISOString();
 }
@@ -125,7 +110,7 @@ function wallClock(instant: number, timezone: string): WallClock {
   };
 }
 
-/** How far the zone's clock runs ahead of UTC at an instant. */
+/** Milliseconds the zone's clock runs ahead of UTC at `instant`. */
 function zoneOffset(instant: number, timezone: string): number {
   const wall = wallClock(instant, timezone);
   const asUtc = Date.UTC(wall.year, wall.month - 1, wall.day, wall.hour, wall.minute, wall.second);
@@ -135,9 +120,8 @@ function zoneOffset(instant: number, timezone: string): number {
 const pad = (value: number, width = 2): string => String(value).padStart(width, '0');
 
 /**
- * An instant as ISO-8601 on `timezone`'s clock with its UTC offset, such as
- * 2026-10-06T07:00-04:00: how an agent reads a time and gives it back to a
- * tool. Seconds appear only when the instant has them.
+ * Such as 2026-10-06T07:00-04:00: how an agent reads a time and gives it back
+ * to a tool. Seconds appear only when the instant has them.
  */
 export function zonedIso(instant: number, timezone: string): string {
   const wall = wallClock(instant, timezone);
@@ -154,10 +138,7 @@ export function zonedIso(instant: number, timezone: string): string {
   );
 }
 
-/**
- * The instant a wall-clock time names in `timezone`. A time the clocks repeat
- * takes its later occurrence; a time they skip lands just after the change.
- */
+/** A time the clocks repeat takes its later occurrence; a time they skip lands just after the change. */
 export function zonedInstant(date: LocalDate, minuteOfDay: number, timezone: string): number {
   const wall = Date.UTC(date.year, date.month - 1, date.day, 0, minuteOfDay);
   const first = zoneOffset(wall, timezone);
@@ -170,7 +151,6 @@ export function zonedInstant(date: LocalDate, minuteOfDay: number, timezone: str
   return wall - Math.min(second, third);
 }
 
-/** The local date an instant falls on, with its weekday and minute of the day. */
 function localTime(
   instant: number,
   timezone: string,
@@ -201,7 +181,6 @@ function compareDates(a: LocalDate, b: LocalDate): number {
 const DATE_PATTERN = /^(\d{4})-(\d{2})-(\d{2})$/u;
 const CLOCK_PATTERN = /^(\d{2}):(\d{2})$/u;
 
-/** A `YYYY-MM-DD` date that exists, or undefined. */
 function parseLocalDate(value: string): LocalDate | undefined {
   const match = DATE_PATTERN.exec(value);
   if (!match) return undefined;
@@ -214,7 +193,7 @@ function parseLocalDate(value: string): LocalDate | undefined {
     : undefined;
 }
 
-/** A 24-hour `HH:MM` as minutes of the day (`24:00` is 1440), or undefined. */
+/** `24:00` is allowed, as 1440: a range ending at the next midnight. */
 function parseClock(value: string): number | undefined {
   const match = CLOCK_PATTERN.exec(value);
   if (!match) return undefined;
@@ -227,7 +206,7 @@ function parseClock(value: string): number | undefined {
 // Events
 // ---------------------------------------------------------------------------
 
-/** An event's span: a timed event's instants, an all-day event's whole local days. */
+/** An all-day event covers its whole local days in `timezone`; undefined when Google gives no readable time. */
 export function eventSpan(event: Pick<ListedEvent, 'start' | 'end'>, timezone: string): Span | undefined {
   const { start, end } = event;
   if (start?.dateTime !== undefined && end?.dateTime !== undefined) {
@@ -243,16 +222,10 @@ export function eventSpan(event: Pick<ListedEvent, 'start' | 'end'>, timezone: s
 /** How strongly an answer commits the principal; the strongest across their addresses stands. */
 const ANSWER_RANK: Readonly<Record<string, number>> = { accepted: 3, tentative: 2, needsAction: 1, declined: 0 };
 
-/** Whether a guest-list entry speaks for the principal on this copy: the calendar's own entry, or one of their addresses. */
 export function isPrincipalAttendee(attendee: EventAttendee, principal: PrincipalRecognizer): boolean {
   return attendee.self === true || principal.has(attendee.email);
 }
 
-/**
- * The principal's answer on one copy of an event: the entry for the
- * calendar it sits on decides when there is one; otherwise their strongest
- * answer from any of their addresses.
- */
 export function principalAnswer(
   event: { readonly attendees?: readonly EventAttendee[] },
   principal: PrincipalRecognizer,
@@ -265,7 +238,6 @@ export function principalAnswer(
   );
 }
 
-/** The answer that commits the principal most, of several. */
 export function strongestAnswer(answers: readonly (string | undefined)[]): string | undefined {
   let strongest: string | undefined;
   for (const answer of answers) {
@@ -275,7 +247,7 @@ export function strongestAnswer(answers: readonly (string | undefined)[]): strin
   return strongest;
 }
 
-/** Whether an event takes the principal's time: not cancelled, not free, not declined by them on its calendar. */
+/** The one rule every read of the principal's busy time uses. */
 export function blocksTime(
   event: Pick<ListedEvent, 'status' | 'transparency' | 'attendees'>,
   principal: PrincipalRecognizer,
@@ -303,7 +275,6 @@ function weekly(value: {
   return range && { ...range, weekdays: new Set(value.weekdays) };
 }
 
-/** The rules free time keeps to, from the values the store holds: the default kind's preferred times and buffer. */
 export function schedulingRules(values: SchedulingPreferenceValues): SchedulingRules {
   const workingHours = new Map<Weekday, ClockRange>();
   for (const day of values.working_hours) {
@@ -334,7 +305,6 @@ function onDay(date: LocalDate, range: ClockRange, timezone: string): Span {
   return { start: zonedInstant(date, range.start, timezone), end: zonedInstant(date, range.end, timezone) };
 }
 
-/** Whether any part of a span falls inside one of the principal's protected windows, on every local day it touches. */
 function inProtectedTime(span: Span, rules: SchedulingRules, timezone: string): boolean {
   const last = localTime(span.end - 1, timezone);
   for (let date: LocalDate = localTime(span.start, timezone); compareDates(date, last) <= 0; date = nextDate(date)) {
@@ -346,7 +316,6 @@ function inProtectedTime(span: Span, rules: SchedulingRules, timezone: string): 
   return false;
 }
 
-/** Whether a span is clear of every busy time, by `bufferMinutes` either side. */
 export function isClear(span: Span, busy: readonly Span[], bufferMinutes = 0): boolean {
   const buffer = bufferMinutes * MINUTE;
   const padded = { start: span.start - buffer, end: span.end + buffer };
@@ -366,7 +335,6 @@ function insidePreferred(slot: Span, rules: SchedulingRules, timezone: string): 
   });
 }
 
-/** Whether a slot lies inside the principal's working hours that day. */
 function insideWorkingHours(slot: Span, rules: SchedulingRules, timezone: string): boolean {
   const local = localTime(slot.start, timezone);
   const hours = rules.workingHours.get(local.weekday);
@@ -376,18 +344,13 @@ function insideWorkingHours(slot: Span, rules: SchedulingRules, timezone: string
 }
 
 // ---------------------------------------------------------------------------
-// Free time, as external-email asks for it (KTD7)
+// Free time
 // ---------------------------------------------------------------------------
 
 /** How a time sits against the principal's preferences, best first: the only words free time says of them. */
 export const FITS = ['preferred', 'acceptable', 'outside usual hours', 'protected time'] as const;
 export type Fit = (typeof FITS)[number];
 
-/**
- * Protected time when any of it falls in a protected window; otherwise
- * preferred inside a preferred time, acceptable inside working hours, and
- * outside usual hours beyond them.
- */
 export function fitOf(span: Span, rules: SchedulingRules, timezone: string): Fit {
   if (inProtectedTime(span, rules, timezone)) return 'protected time';
   if (insidePreferred(span, rules, timezone)) return 'preferred';
@@ -401,7 +364,6 @@ export interface FreeTimeQuery {
   readonly lengthMinutes: number;
   /** Every window lies wholly inside it. */
   readonly window: Span;
-  /** Time already taken on the principal's calendars. */
   readonly busy: readonly Span[];
   readonly rules: SchedulingRules;
 }
@@ -411,7 +373,6 @@ export interface FreeWindow extends Span {
   readonly fit: Fit;
 }
 
-/** The hours free time offers from on a weekday: the waking day, widened by working hours that reach past it. */
 function offerHours(rules: SchedulingRules, weekday: Weekday): ClockRange {
   const working = rules.workingHours.get(weekday);
   return working
@@ -444,7 +405,6 @@ function within(spans: readonly Span[], keep: readonly Span[]): Span[] {
   );
 }
 
-/** The waking days on `timezone`'s clock that meet `span`. */
 function wakingDays(span: Span, timezone: string): Span[] {
   const days: Span[] = [];
   const last = localTime(span.end, timezone);
@@ -518,13 +478,6 @@ function byFit(run: Span, date: LocalDate, rules: SchedulingRules, timezone: str
   return merged;
 }
 
-/**
- * Every free window in the range: in the hours free time offers from, inside
- * the counterpart's waking day when their zone is known, from the range's
- * start on, clear of busy time by the buffer, on the quarter hour, long
- * enough for the meeting, and split where the fit changes. Listed in date
- * order.
- */
 export function freeWindows(query: FreeTimeQuery): FreeWindow[] {
   const { timezone, counterpartTimezone, rules, window } = query;
   const length = query.lengthMinutes * MINUTE;
@@ -545,5 +498,5 @@ export function freeWindows(query: FreeTimeQuery): FreeWindow[] {
   return windows.sort((a, b) => a.start - b.start);
 }
 
-/** One day, in milliseconds: how far calendar reads widen so all-day events are seen whole. */
+/** How far calendar reads widen so all-day events are seen whole. */
 export const READ_MARGIN_MS = DAY_MS;

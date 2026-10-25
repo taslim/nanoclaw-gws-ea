@@ -655,7 +655,7 @@ describe("GWS-EA service control through NanoClaw's helpers", () => {
     expect(sleep).toHaveBeenCalled();
   });
 
-  it("stops only the named assistant's job while another runs, and stops no agent container (AE3)", async () => {
+  it("stops only the named assistant's job while another runs, and stops no agent container", async () => {
     const home = await mkdtemp(path.join(os.tmpdir(), 'gws-ea-service-home-'));
     homes.push(home);
     const [a, b] = [INSTALL_ID, 'fedcba9876543210fedcba9876543210'].map((installId) =>

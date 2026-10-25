@@ -18,8 +18,9 @@
  * for policy refusals.
  *
  * Reactions and quiet events take the quiet path instead (routeQuietly):
- * a side-effect-free access check, and no messaging group, session, drop
- * record, or approval request is ever created for them.
+ * a side-effect-free access check, and no messaging group, drop record, or
+ * approval request is ever created for them. A quiet event only reaches a
+ * session that already exists.
  */
 import { getChannelAdapter, getChannelDefaults } from './channels/channel-registry.js';
 import { resolveThreadPolicy, resolveUnknownSenderPolicy } from './channels/channel-defaults.js';
@@ -214,27 +215,23 @@ function dispatchSessionCreated(event: SessionCreatedEvent): void {
   }
 }
 
-/** An inbound delay's answer that holds the message until a module releases it. */
 export const HOLD_UNTIL_RELEASED: unique symbol = Symbol('hold-until-released');
 
-/** A time the message waits for, a hold until a module releases it, or null for due now. */
+/** A time the message waits until, a hold, or null for due now. */
 export type InboundDelay = string | typeof HOLD_UNTIL_RELEASED | null;
 
 /**
- * Inbound-delay hook. Runs as the router writes a message into the session
- * it resolved for an agent, after the command gate.
+ * Runs as the router writes a message into the session it resolved for an
+ * agent, after the command gate. A time keeps the session from reading the
+ * message before then (the row's `process_after`); with several hooks the
+ * latest time wins. A delayed message does not wake the container: the host
+ * sweep wakes the session once the message is due.
  *
- * A module returns the time before which the session must not read the
- * message (the row's `process_after`), or null to leave it due now. With
- * several registered, the message waits for the latest time any names. A
- * delayed message does not wake the container: the host sweep wakes the
- * session once the message is due, and a running container reads it then.
- *
- * A module may instead answer HOLD_UNTIL_RELEASED, which wins over any time.
- * The message is written `held`: no turn reads it, no other session is given
- * a copy, and nothing wakes for it until a module releases the session's held
- * messages (the mailbox's `releaseHeldMessages`), which makes them due, or
- * settles them unread (`settleHeldMessages`).
+ * HOLD_UNTIL_RELEASED wins over any time. The message is written `held`: no
+ * turn reads it, no other session is given a copy, and nothing wakes for it
+ * until a module releases the session's held messages (the mailbox's
+ * `releaseHeldMessages`), which makes them due, or settles them unread
+ * (`settleHeldMessages`).
  */
 export type InboundDelayFn = (event: InboundEvent, session: Session) => InboundDelay | Promise<InboundDelay>;
 
@@ -244,7 +241,6 @@ export function registerInboundDelay(fn: InboundDelayFn): void {
   inboundDelays.push(fn);
 }
 
-/** A module's engagement inputs, after admitted inbound content has been prepared. */
 export interface EngagementDecisionRequest {
   readonly event: InboundEvent;
   readonly session: Session;
@@ -257,10 +253,11 @@ export type EngagementDecider = (request: EngagementDecisionRequest) => boolean 
 const engagementDeciders = new Map<string, EngagementDecider>();
 
 /**
- * Decide engagement for this channel's `module` wirings. Preparation may add
- * recognized speech; the decider receives that content and the unchanged
- * authenticated sender and message metadata. False, or no registered decider,
- * keeps the message as silent context without typing or a container wake.
+ * Decides engagement for this channel's `module` wirings, once the sender is
+ * admitted. Preparation may add recognized speech to the content; the
+ * authenticated sender and message metadata arrive unchanged. False, or no
+ * registered decider, keeps the message as silent context without typing or
+ * a container wake.
  */
 export function registerEngagementDecider(channelType: string, decide: EngagementDecider): void {
   if (engagementDeciders.has(channelType)) log.warn('Engagement decider overwritten', { channelType });
@@ -289,9 +286,9 @@ function safeParseContent(raw: string): { text?: string; sender?: string; sender
 const conversationTails = new Map<string, Promise<void>>();
 
 /**
- * Run host work in the conversation's inbound order. A cutover queued here
- * waits for the message already routing, and finishes before the next starts.
- * The caller receives its result or failure; failures never poison the tail.
+ * Runs host work in the conversation's inbound order: after the work already
+ * queued there, routing included, and before the next. The caller receives
+ * its result or failure; failures never poison the tail.
  */
 export async function runInConversationTail<T>(
   address: Pick<InboundEvent, 'channelType' | 'instance' | 'platformId'>,
@@ -624,14 +621,14 @@ async function routeInboundOrdered(event: InboundEvent): Promise<void> {
 }
 
 /**
- * The quiet path (KTD10), for reactions and quiet events. Neither is
- * something a person wrote to an agent, so neither sets off what a message
- * from someone unknown does: no messaging group is created, no channel or
- * sender approval is requested, and no drop is recorded. Each wired agent
- * the sender may reach (mayReachQuietly) gets the event: a quiet one as
- * context in the session the conversation already has, never waking it.
- * A reaction on the assistant's own message is addressed to it as a mention
- * is, so it engages the wiring whatever its engage mode and wakes the agent.
+ * The quiet path, for reactions and quiet events. Neither is something a
+ * person wrote to an agent, so neither sets off what a message from someone
+ * unknown does: no messaging group is created, no channel or sender approval
+ * is requested, and no drop is recorded. Each wired agent the sender may
+ * reach (mayReachQuietly) gets the event: a quiet one as context in the
+ * session the conversation already has, never waking it. A reaction on the
+ * assistant's own message is addressed to it as a mention is, so it engages
+ * the wiring whatever its engage mode and wakes the agent.
  */
 async function routeQuietly(event: InboundEvent, supportsThreads: boolean): Promise<void> {
   const found = await getMessagingGroupWithAgentCount(
@@ -665,11 +662,10 @@ async function routeQuietly(event: InboundEvent, supportsThreads: boolean): Prom
 }
 
 /**
- * Whether the sender may reach this wired agent, decided as the access gate
- * and the sender-scope gate decide it (a public conversation and a wiring
- * open to all senders, or owner / admin / member access) but without their
- * side effects: the access gate records the drop and asks an approver about
- * an unknown sender, and a reaction must never raise a request.
+ * The access and sender-scope gates' decision (a public conversation and a
+ * wiring open to all senders, or owner / admin / member access) without their
+ * side effects: the access gate records the drop and asks an approver about an
+ * unknown sender, and a reaction must never raise a request.
  */
 async function mayReachQuietly(
   userId: string | null,
@@ -699,6 +695,8 @@ async function mayReachQuietly(
  *                      session existence IS our subscription state; once
  *                      a thread has engaged us once, follow-ups arrive
  *                      with no mention and should still fire.
+ *   'module'         — undefined: the channel's `registerEngagementDecider`
+ *                      decides.
  */
 async function evaluateEngage(
   agent: MessagingGroupAgent,
@@ -743,9 +741,10 @@ async function evaluateEngage(
 }
 
 /**
- * How a routed message reaches an agent: waking it; stored as context
- * (trigger=0) for when it next wakes, in a session created if need be; or
- * stored as context only in a session that already exists (the quiet path).
+ * How a routed message reaches an agent. `wake`: as a trigger. `accumulate`:
+ * as context (trigger=0) for its next wake, in a session created if need be.
+ * `quiet`: as context only in a session that already exists. `module`: as the
+ * channel's engagement decider chooses, `wake` or `accumulate`.
  */
 type Delivery = 'wake' | 'accumulate' | 'quiet' | 'module';
 

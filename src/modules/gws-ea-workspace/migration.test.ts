@@ -1,5 +1,5 @@
 /**
- * The home folder's store (KTD3): one row for the folder, and the host's
+ * The home folder's store: one row for the folder, and the host's
  * record of each principal address's grant on it. An assistant from before
  * this release gains both tables on its next start, exactly as a fresh
  * install builds them.

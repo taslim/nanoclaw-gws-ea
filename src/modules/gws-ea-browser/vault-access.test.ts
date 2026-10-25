@@ -1,5 +1,5 @@
 /**
- * Principal access to the assistant's 1Password vault (KTD4, R4-R6, R16):
+ * Principal access to the assistant's 1Password vault:
  * only canonical main asks, through its real host request and guard; the
  * host binds the vault and account from its own records, shares only with
  * the principal's exact confirmed 1Password user, checks actual access
@@ -258,7 +258,7 @@ beforeEach(async () => {
     },
   });
 
-  // The assistant's provisioned records, as U2 writes them.
+  // The assistant's provisioned records, as 1Password provisioning writes them.
   const configRoot = path.join(vaultRoot, 'config');
   fs.mkdirSync(configRoot, { mode: 0o700 });
   const hostPaths = onePasswordHostPaths(configRoot);
@@ -348,7 +348,7 @@ afterEach(async () => {
 });
 
 describe('sharing with the principal', () => {
-  it("grants only the principal's exact confirmed user view and edit on the recorded vault, then verifies access (AE2)", async () => {
+  it("grants only the principal's exact confirmed user view and edit on the recorded vault, then verifies access", async () => {
     const data = answer(await ask({ operation: 'share' }));
     expect(data).toEqual({
       status: 'shared',
@@ -624,7 +624,7 @@ describe('who may ask, and for whom', () => {
     expect(await pendingApprovals()).toEqual([]);
   });
 
-  it("refuses the assistant's web alias as the principal's 1Password email, in any spelling that reaches it (KTD14)", async () => {
+  it("refuses the assistant's web alias as the principal's 1Password email, in any spelling that reaches it", async () => {
     await recordWebAlias('onuj@assistant.example.test');
     for (const email of ['onuj@assistant.example.test', 'Onuj+vault@assistant.example.test'])
       expect(await ask({ operation: 'share', email }), email).toMatchObject({
@@ -727,7 +727,7 @@ describe('who may ask, and for whom', () => {
   );
 });
 
-describe("the principal's retry after adding a login (AE6)", () => {
+describe("the principal's retry after adding a login", () => {
   const login = {
     id: 'item1',
     vaultId: VAULT_ID,

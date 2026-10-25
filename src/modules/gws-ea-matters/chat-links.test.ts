@@ -46,7 +46,7 @@ beforeEach(async () => {
   vi.setSystemTime(new Date(NOW));
   await runMigrations(await initTestDb());
   const db = getDb();
-  // U6 owns these records. This fixture is their agreed source contract;
+  // gws-ea-chats owns these records. This fixture is their agreed source contract;
   // every read, link, account and forget below runs through real stores.
   await db.exec(`
     CREATE TABLE gws_ea_chats (
@@ -94,7 +94,7 @@ afterEach(async () => {
 });
 
 describe('chat links on matters', () => {
-  it('keeps one chat in two open matters with independent accounts, including after one closes (AE15)', async () => {
+  it('keeps one chat in two open matters with independent accounts, including after one closes', async () => {
     const dinner = await open('Dinner Thursday');
     const trip = await open('Lake trip');
     await setChatLinkAccount(dinner.id, CHAT, HANDLER, 'Dinner is booked for Thursday.');

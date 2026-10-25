@@ -17,7 +17,6 @@ function parse(content: string): StubAuth | undefined {
   }
 }
 
-/** True for a ChatGPT login stand-in that still carries OneCLI's fixed account id. */
 export function stubNeedsAccountId(content: string): boolean {
   const auth = parse(content);
   return auth?.auth_mode === 'chatgpt' && auth.tokens?.account_id === STUB_ACCOUNT_ID;

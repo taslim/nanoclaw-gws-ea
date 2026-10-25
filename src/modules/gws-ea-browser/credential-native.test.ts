@@ -1146,7 +1146,7 @@ describe.skipIf(!chromePath)('native authorized signup and password change', { t
     30_000,
   );
 
-  describe('a box only the principal can agree to, which the form resets on every fill (KTD11)', () => {
+  describe('a box only the principal can agree to, which the form resets on every fill', () => {
     const stops = () =>
       getDb().all<{ id: string; site: string; origin: string; wording: string }>(
         'SELECT id,site,origin,wording FROM gws_ea_browser_consent_stops ORDER BY created_at',

@@ -257,13 +257,11 @@ export function renderOnecliCompose(
   );
 }
 
-/** The image each OneCLI service runs. */
 export type OnecliServiceImages = Readonly<Record<'postgres' | 'app' | 'gateway', string>>;
 
 /**
- * The images an instance's own Compose file runs. Only each service's image
- * is read, so a file any release rendered reads the same way; everything else
- * in it is that release's.
+ * Only each service's image is read, so a file any release rendered reads the
+ * same way; everything else in it is that release's.
  */
 export function parseOnecliComposeImages(source: string): OnecliServiceImages {
   let compose: unknown;

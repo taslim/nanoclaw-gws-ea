@@ -1,10 +1,9 @@
 /**
- * GWS-EA's definition of `main` (KTD12, KTD13): how a GWS-EA assistant
- * works, as a required project-doc section only `main` receives, and the
- * NanoClaw shared skills `main` loads. Both ship with the release, and
- * neither lives in a file the agent can edit, so the principal's own
- * standing instructions (the persona file) never collide with a product
- * update.
+ * GWS-EA's definition of `main`: how a GWS-EA assistant works, as a required
+ * project-doc section only `main` receives, and the shared skills `main`
+ * loads. Both ship with the release, and neither lives in a file the agent can
+ * edit, so the principal's own standing instructions (the persona file) never
+ * collide with a product update.
  */
 import path from 'node:path';
 
@@ -24,7 +23,7 @@ import { EXPOSED_GOOGLE_SKILLS } from '../gws-ea-google/grant.js';
 import { getMainAgentGroupId } from '../gws-ea-profile/db.js';
 import { registerGuidance } from '../gws-ea-profile/guidance.js';
 
-/** The guidance, relative to the checkout the host runs from, as NanoClaw reads its other instruction files. */
+/** Relative to the checkout the host runs from, as NanoClaw reads its other instruction files. */
 export const GUIDANCE_PATH = path.join('src', 'modules', 'gws-ea-main', 'guidance.md');
 
 export const MAIN_CHAT_CAPABILITY = 'gws-ea-chat';
@@ -37,11 +36,9 @@ registerCapability(MAIN_CHAT_CAPABILITY, {
 });
 
 /**
- * The shared skills (`container/skills/`) `main` loads: web research, every
- * Google capability's skill (`gws-ea-google`), WhatsApp formatting, and HTML
- * artifact design. Main's capabilities bound the list, so it receives each
- * skill only while it holds that capability. The template supplies `welcome`; no agent here
- * receives the gateway's own skill (`gws-ea-google` withholds it).
+ * Main's capabilities bound the list: it receives each skill only while it
+ * holds that skill's capability. The template supplies `welcome`, and
+ * `gws-ea-google` withholds the gateway's own skill from every agent.
  */
 export const MAIN_SHARED_SKILLS: readonly string[] = [
   'agent-browser',

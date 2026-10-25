@@ -1,6 +1,6 @@
+/** Browser job reads as well as cancellation. */
 import { formatLocalTimeWithZone } from '../../timezone.js';
 import { detachBrowserWatchCards } from './watch-state.js';
-/** Native job reads and cancellation, shared by delegation, matters and policy reconciliation. */
 import { answeredGuard, answeringAction, forbidden, invalidArgs } from '../../cli/delivery-action.js';
 import { getSession, updateSession } from '../../db/sessions.js';
 import { getDb } from '../../db/connection.js';
@@ -24,7 +24,7 @@ import { principalClock } from './watch-policy.js';
 import type { BrowserQueue } from './queue.js';
 
 export type BrowserJobState = 'idle' | 'working' | 'awaiting_principal' | 'watching' | 'cancelled';
-/** The purchase card the principal is asked: its merchant and money, and when it lapses on their clock. */
+/** An open purchase card; `expires` is on the principal's clock. */
 export interface BrowserJobCard {
   readonly site: string;
   readonly total: string;
@@ -32,8 +32,8 @@ export interface BrowserJobCard {
   readonly expires: string;
 }
 /**
- * A purchase of the job's with no page proof (KTD8), and the attempt id main records its outcome against: never
- * one a browser report gives (KTD9). Its press is on the principal's clock.
+ * A purchase of the job's with no page proof. `attempt_id` is the one `record_purchase_outcome` takes, never one a
+ * browser report gives; `pressed` is on the principal's clock.
  */
 export interface BrowserJobUnconfirmed {
   readonly attempt_id: string;
@@ -52,7 +52,7 @@ export interface BrowserJobView {
   readonly last_report?: { readonly at: string; readonly text: string };
 }
 
-/** The job's open card and unconfirmed purchases, as main reads them in the principal's time (KTD18). */
+/** The job's open card and unconfirmed purchases, with times on the principal's clock. */
 async function purchaseState(
   store: BrowserStore,
   jobId: string,
@@ -260,7 +260,7 @@ export async function cancelBrowserJobInTransaction(
 }
 
 let cancellationQueue: BrowserQueue | undefined;
-/** Composition supplies the running native queue; matters and disable use the same cancellation path. */
+/** Composition supplies the running native queue, for cancellations started outside it. */
 export function configureBrowserCancellation(queue: BrowserQueue): void {
   cancellationQueue = queue;
 }
@@ -434,7 +434,7 @@ export const browserDelegateGuard = defineGuardedAction({
   },
 });
 
-/** Relay and guarantee register their real handlers separately against this same guard. */
+/** Other delegate actions register their own handlers against the same `browserDelegateGuard`. */
 export function registerBrowserCancellationDelivery(queue: () => BrowserQueue): void {
   registerDeliveryAction(
     'cancel_job',

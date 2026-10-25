@@ -28,11 +28,7 @@ export type SessionMode = { kind: 'chat' } | { kind: 'task'; taskId: string };
 /** The capability that holds `send_message` (mcp-tools/core.ts). */
 export const REPLY_CAPABILITY = 'reply';
 
-/**
- * A chat turn with nothing to send. Every agent is told it, whatever it holds:
- * bare text is treated as a reply that missed its block, so a quiet turn is
- * `<internal>` alone.
- */
+/** Every chat agent is told it, whatever its capabilities: bare text is treated as a reply that missed its block. */
 const QUIET_ENDING =
   'When a turn has nothing to send, end it with only `<internal>…</internal>`: text outside every block reads as a reply that was never sent.';
 

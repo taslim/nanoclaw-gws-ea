@@ -168,7 +168,7 @@ describe('GWS-EA shared validation', () => {
     });
   });
 
-  describe("the principal's addresses (R1)", () => {
+  describe("the principal's addresses", () => {
     const LISTED = ['firstlast@gmail.com', 'pat@corp.example'];
 
     it.each([
@@ -209,7 +209,7 @@ describe('GWS-EA shared validation', () => {
       );
     });
 
-    it("refuses each of the assistant's own addresses in any spelling that reaches its mailbox (R3, KTD14)", () => {
+    it("refuses each of the assistant's own addresses in any spelling that reaches its mailbox", () => {
       const own = ['ea@corp.example', 'ae@corp.example'];
       expect(principalAddressConflict('ea+x@corp.example', [], own)).toBe(
         "ea+x@corp.example is the assistant's own address, not one of the principal's",
@@ -220,7 +220,7 @@ describe('GWS-EA shared validation', () => {
       expect(principalAddressConflict('pat@corp.example', [], [])).toBeUndefined();
     });
 
-    it('refuses another spelling of a listed address, naming it, but not the same spelling again (R3)', () => {
+    it('refuses another spelling of a listed address, naming it, but not the same spelling again', () => {
       expect(principalAddressConflict('first.last@gmail.com', LISTED, ['ea@corp.example'])).toBe(
         "first.last@gmail.com is another spelling of firstlast@gmail.com, already one of the principal's addresses",
       );

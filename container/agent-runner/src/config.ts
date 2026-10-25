@@ -22,9 +22,9 @@ export interface RunnerConfig {
   effort?: string;
   speed?: ProviderSpeed;
   /**
-   * The capability keys this group holds: the host resolves the group's
-   * stored list (or `all`) and writes it out explicitly, so the runner never
-   * expands a default itself. A missing or malformed list grants nothing.
+   * The host expands the group's stored list (or `all`) before writing it, so
+   * the runner never expands a default itself. A missing or malformed list
+   * grants nothing.
    */
   capabilities: ReadonlySet<string>;
 }
@@ -70,11 +70,7 @@ export function runnerConfigFromRaw(raw: Record<string, unknown>): RunnerConfig 
   };
 }
 
-/**
- * Deny-all unless the host wrote a list of keys. A container.json from a host
- * older than capabilities has none, and an agent then starts with no tools
- * rather than with every tool.
- */
+/** A container.json from a host older than capabilities has no list: its agent gets no tools, not every tool. */
 function readCapabilities(raw: Record<string, unknown>): ReadonlySet<string> {
   const value = raw.capabilities;
   if (Array.isArray(value) && value.every((key): key is string => typeof key === 'string')) return new Set(value);
@@ -83,9 +79,9 @@ function readCapabilities(raw: Record<string, unknown>): ReadonlySet<string> {
 }
 
 /**
- * The capabilities of the loaded config. Nothing is granted before
- * `loadConfig()` has run, so a provider or tool server built outside the
- * runner's startup can never hold more than its group was given.
+ * Nothing is granted before `loadConfig()` has run, so a provider or tool
+ * server built outside the runner's startup can never hold more than its group
+ * was given.
  */
 export function runnerCapabilities(): ReadonlySet<string> {
   return _config?.capabilities ?? NO_CAPABILITIES;

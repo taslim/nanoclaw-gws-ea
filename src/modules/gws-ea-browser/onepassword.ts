@@ -1,15 +1,11 @@
 /**
- * The host's path into the assistant's own 1Password vault (KTD5). It uses
- * only what provisioning recorded for this assistant: the host policy names
- * the account, this instance's resource record names the one vault it may
- * use, and the runtime token beside it is scoped to that vault. Login
- * metadata is listed once per binding and kept until an explicit refresh or a
- * write that changes what is listed (KTD11); a secret is resolved only at
- * fill time. The host-private writes behind credential attempts (KTD6) read
- * and save whole items here, in host memory only, and delete a candidate once
- * its operation no longer needs it. Item IDs, vault IDs, tokens
- * and values stay on the host: agents see opaque handles, titles and constant
- * reasons.
+ * The host's path into the assistant's own 1Password vault. It uses only what provisioning recorded for this
+ * assistant: the host policy names the account, this instance's resource record names the one vault it may use, and
+ * the runtime token beside it is scoped to that vault. Login metadata is listed once per binding and kept until an
+ * explicit refresh or a write that changes what is listed; a secret is resolved only at fill time. The host-private
+ * writes behind credential attempts read and save whole items here, in host memory only, and delete a candidate
+ * once its operation no longer needs it. Item IDs, vault IDs, tokens and values stay on the host: agents see opaque
+ * handles, titles and constant reasons.
  */
 import { randomUUID } from 'node:crypto';
 import path from 'node:path';
@@ -39,7 +35,6 @@ export class BrowserVaultError extends Error {
   }
 }
 
-/** A write or refresh failure as the agent sees it: a rate limit it can wait out, or an unavailable vault. */
 export function vaultFailureStatus(error: BrowserVaultError): 'rate_limited' | 'vault_unavailable' {
   return error.reason === 'rate_limited' ? 'rate_limited' : 'vault_unavailable';
 }
@@ -49,15 +44,13 @@ export interface BrowserVaultItem {
   item_handle: string;
 }
 
-/** Where the host finds its records. Each defaults to its host locator, re-read for every use. */
+/** Each defaults to its host locator, re-read for every use. */
 export interface BrowserVaultLocators {
   /** This assistant's browser policy, always `<instance root>/browser/policy.json`; it locates the instance root. */
   readonly browserPolicyFile?: string;
-  /** The operator's 1Password host policy. */
   readonly onePasswordPolicyFile?: string;
 }
 
-/** The host-process locator of the 1Password host policy, read like the voice and browser policy locators. */
 export function onePasswordPolicyFile(): string | undefined {
   return (
     process.env[ONEPASSWORD_POLICY_FILE_ENV]?.trim() ||
@@ -67,10 +60,9 @@ export function onePasswordPolicyFile(): string | undefined {
 }
 
 /**
- * Why the vault cannot be used: 1Password is not enabled on this host, or the
- * operator disabled it; this assistant's vault, runtime account or token is
- * not provisioned yet; or a record is unsafe, malformed, or names another
- * instance or account.
+ * Why the vault cannot be used: 1Password is not enabled on this host, or the operator disabled it; this
+ * assistant's vault, runtime account or token is not provisioned yet; or a record is unsafe, malformed, or names
+ * another instance or account.
  */
 export type BrowserVaultUnavailableReason = 'not_enabled' | 'disabled' | 'not_provisioned' | 'invalid_state';
 
@@ -102,9 +94,8 @@ function instanceRootOf(policyFile: string): string | undefined {
 }
 
 /**
- * Local reads only: the host policy, then this instance (named by the marker
- * in its own state) and the resource record for exactly that instance and the
- * policy's account, then its owner-only runtime token.
+ * Local reads only. The instance is the one the marker in its own state names, and its resource record must match
+ * both that instance and the policy's account.
  */
 async function readRuntimeAccess(locators: BrowserVaultLocators): Promise<RuntimeAccess> {
   const policyFile = locators.onePasswordPolicyFile ?? onePasswordPolicyFile();
@@ -162,17 +153,15 @@ export function websitePermitsOrigin(
   }
 }
 
-/** The registrable domain of an HTTPS URL, as autofill matches sites; undefined for anything else. */
 export function registrableDomain(raw: string): string | undefined {
   const url = httpsOrigin(raw);
   return (url && getDomain(url.hostname, { allowPrivateDomains: true })) || undefined;
 }
 
 /**
- * Every candidate the host saves carries its own operation's tag until it is
- * published: a lost create response is found by that exact marker, and no
- * ordinary suggestion lists a candidate. 1Password nests these tags under
- * one "gws-ea-pending" tag.
+ * Every candidate the host saves carries its own operation's tag until it is published: a lost create response is
+ * found by that exact marker, and no ordinary suggestion lists a candidate. 1Password nests these tags under one
+ * "gws-ea-pending" tag.
  */
 const CANDIDATE_TAG = 'gws-ea-pending';
 export const credentialCandidateTag = (operationId: string): string => `${CANDIDATE_TAG}/${operationId}`;
@@ -180,7 +169,7 @@ export const credentialCandidateTag = (operationId: string): string => `${CANDID
 const isCandidateTag = (tag: string): boolean => tag === CANDIDATE_TAG || tag.startsWith(`${CANDIDATE_TAG}/`);
 const pendingCandidate = (tags: readonly string[] | undefined): boolean => (tags ?? []).some(isCandidateTag);
 
-/** A rotation candidate's own section: the account it belongs to, and the password it replaces while the change is open. */
+/** A rotation candidate's own section: its account, and the password it replaces while the change is open. */
 const CHANGE_SECTION = 'gws-ea-password-change';
 
 /** One fresh read of an item, in host memory only: none of its values leave the host. */
@@ -194,7 +183,6 @@ export interface VaultItemRead {
   readonly pending: boolean;
   /** A Login's built-in username, or the account a rotation candidate belongs to. */
   readonly username: string | undefined;
-  /** The built-in password. */
   readonly password: string | undefined;
   /** The password a rotation candidate replaces, until the change no longer needs it. */
   readonly previousPassword: string | undefined;
@@ -344,7 +332,7 @@ export class BrowserVault {
     this.clearHold();
   }
 
-  /** The vault answered, the binding changed, or the principal retried: no failure holds the next attempt off. */
+  /** The vault answered, the binding changed, or an explicit refresh retries: no failure holds the next attempt off. */
   private clearHold(): void {
     this.failures = 0;
     this.unavailableUntil = 0;
@@ -373,11 +361,10 @@ export class BrowserVault {
   }
 
   /**
-   * A request that reaches or lists the vault under the binding of `epoch`.
-   * While these keep failing for any reason but the rate limit, each failure
-   * holds every use off twice as long as the last, from a minute up to an hour:
-   * page observations would otherwise spend, on a vault that stays unreachable,
-   * the daily request limit every service account in the account shares.
+   * A request that reaches or lists the vault under the binding of `epoch`. While these keep failing for any reason
+   * but the rate limit, each failure holds every use off twice as long as the last, from a minute up to an hour:
+   * page observations would otherwise spend, on a vault that stays unreachable, the daily request limit every
+   * service account in the account shares.
    */
   private async reach<T>(epoch: number, request: () => Promise<T>): Promise<T> {
     try {
@@ -501,7 +488,7 @@ export class BrowserVault {
     }
   }
 
-  /** Listings come from the cache; only the first use under a binding, or `refresh`, lists the vault. */
+  /** Listings come from the cache until a reset, `invalidate` or `refresh` has the vault listed again. */
   async itemsForOrigin(raw: string, assertActive = active): Promise<BrowserVaultItem[]> {
     if (!httpsOrigin(raw)) return [];
     const client = await this.ready(assertActive);
@@ -515,11 +502,10 @@ export class BrowserVault {
   }
 
   /**
-   * An explicit retry (AE6): list the vault's logins again now, bypassing the
-   * cache, so a login the principal just added is usable. Handles of logins
-   * still listed stay valid. It skips the hold after a failure to reach the
-   * vault, so one the principal just shared again is tried at once; a
-   * rate-limit backoff still holds, because that limit is the provider's own.
+   * An explicit retry: list the vault's logins again now, bypassing the cache, so a login the principal just added
+   * is usable. Handles of logins still listed stay valid. It skips the hold after a failure to reach the vault, so
+   * one the principal just shared again is tried at once; a rate-limit backoff still holds, because that limit is
+   * the provider's own.
    */
   async refresh(assertActive = active): Promise<void> {
     this.clearHold();
@@ -596,10 +582,9 @@ export class BrowserVault {
   }
 
   /**
-   * Saves a candidate. `beforeCreate` runs once the binding is ready and the
-   * request is about to be issued, so the caller records that a write may
-   * happen; a failure after it leaves the outcome unknown. The created item is
-   * returned without another liveness check, so the caller can record it first.
+   * `beforeCreate` runs once the binding is ready and the request is about to be issued, so the caller records that
+   * a write may happen; a failure after it leaves the outcome unknown. The created item is returned without another
+   * liveness check, so the caller can record it first.
    */
   async createCandidate(
     spec: VaultCandidateSpec,
@@ -619,9 +604,8 @@ export class BrowserVault {
   }
 
   /**
-   * Writes a new built-in password into exactly the item a fresh read
-   * returned, keeping every other field, section, tag, website and note. The
-   * read's version goes with it, so the provider can refuse a stale write.
+   * Writes a new built-in password into exactly the item a fresh read returned, keeping every other field, section,
+   * tag, website and note. The read's version goes with it, so the provider can refuse a stale write.
    */
   async replacePassword(read: VaultItemRead, password: string, assertActive = active): Promise<VaultItemRead> {
     const item = readItems.get(read);
@@ -645,8 +629,8 @@ export class BrowserVault {
   }
 
   /**
-   * A rotation candidate without the password it replaced: it then holds only
-   * the new password, for a change the original Login could not take.
+   * A rotation candidate without the password it replaced: it then holds only the new password, for a change the
+   * original Login could not take.
    */
   async forgetPreviousPassword(read: VaultItemRead, assertActive = active): Promise<VaultItemRead> {
     const item = readItems.get(read);

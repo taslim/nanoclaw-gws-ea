@@ -18,8 +18,8 @@ import { fileURLToPath } from 'url';
  * accumulated memory are never clobbered on a later wake. Every provider uses
  * the same tree.
  *
- * Only the index is seeded. The memory definition comes from the release
- * (context.ts), so `templates/system/` is no longer copied, and a copy an
+ * Only the index is seeded: the memory definition comes from the release
+ * (context.ts), so `templates/system/` is left uncopied, and a copy an
  * earlier release seeded stays on disk unread.
  */
 const TEMPLATES_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), 'templates');

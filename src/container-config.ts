@@ -265,10 +265,7 @@ export interface ContainerConfig {
   timezone?: string;
   /** Session isolation tier for the group's containers; absent = the composer's default ('container'). */
   runtimeTier?: 'container' | 'vm';
-  /**
-   * The capability keys the group holds, resolved to an explicit list (see
-   * src/capabilities.ts). The runner grants nothing that is not listed here.
-   */
+  /** Resolved to an explicit list (src/capabilities.ts); the runner grants nothing not listed here. */
   capabilities: string[];
 }
 

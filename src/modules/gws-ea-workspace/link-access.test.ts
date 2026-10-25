@@ -1,5 +1,5 @@
 /**
- * The link check's decision (R4, KTD4, KTD5): for each Google link in what
+ * The link check's decision: for each Google link in what
  * the assistant wrote and each recipient who is not the principal, only a
  * signal Google gives exactly confirms they can open it. Drive answers
  * first; a signed-out visit only when Drive cannot. A refusal speaks to the
@@ -168,7 +168,7 @@ describe('a file the assistant can share', () => {
   });
 });
 
-describe('a file the assistant can only view (AE3)', () => {
+describe('a file the assistant can only view', () => {
   it('refuses an outside recipient, naming the owner to main and nothing of the file to external-email', async () => {
     const { drive, visits, check } = world();
     const id = drive.shareWithAssistant({ name: 'Board deck', owner: MORGAN, role: 'reader', mimeType: DECK_TYPE });
@@ -324,7 +324,7 @@ describe('the principal', () => {
     expect(visits).toEqual([]);
   });
 
-  it('is every spelling the one rule recognizes, and never a +tag at another domain (R1)', async () => {
+  it('is every spelling the one rule recognizes, and never a +tag at another domain', async () => {
     const { drive, check, owned } = world();
     const id = await owned();
     expect(

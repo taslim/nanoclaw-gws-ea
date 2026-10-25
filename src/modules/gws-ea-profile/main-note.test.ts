@@ -1,8 +1,8 @@
 /**
- * Notes for main carry their matter (KTD11, R11): each open matter a note's
+ * Notes for main carry their matter: each open matter a note's
  * pieces sit in comes with it, rendered live once and stamped with when its
  * links were read, and a new invitation, share or comment in no open matter
- * brings the open matters it may belong to (KTD10). What cannot be read is
+ * brings the open matters it may belong to. What cannot be read is
  * left out, and the note is written all the same.
  *
  * Driven through the real note writers into main's real session; Google is
@@ -208,7 +208,7 @@ afterEach(async () => {
   fs.rmSync(DATA_DIR, { recursive: true, force: true });
 });
 
-describe('a note about a piece of an open matter (KTD11, R11)', () => {
+describe('a note about a piece of an open matter', () => {
   it('carries the matter, its links read live, stamped with when they were read', async () => {
     const acme = await open('Acme renewal', [
       thread(THREAD_JUNO),
@@ -289,7 +289,7 @@ describe('a note about pieces in no open matter', () => {
     expect(await onlyNote()).toBe('Nothing to carry.');
   });
 
-  it("carries the open matters Juno's new invitation may belong to, with why (F1)", async () => {
+  it("carries the open matters Juno's new invitation may belong to, with why", async () => {
     const acme = await open('Acme renewal', [thread(THREAD_JUNO), { kind: 'person', reference: juno }]);
     calendar.put({
       calendarId: MORGAN,
@@ -410,7 +410,7 @@ describe('what cannot be read', () => {
   });
 });
 
-describe('a matter a note names by id, and what a note records for the host (KTD12)', () => {
+describe('a matter a note names by id, and what a note records for the host', () => {
   it('carries the matter after its pieces’ own, and keeps both beside its words, for a failed turn to name again', async () => {
     const acme = await open('Acme renewal', [thread(THREAD_JUNO)]);
     const lunch = await open('Lunch with Remy Vance', [thread(THREAD_REMY)]);

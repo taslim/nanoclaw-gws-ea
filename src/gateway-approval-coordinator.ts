@@ -538,7 +538,6 @@ async function processGatewayRequest(
   }
 }
 
-/** What the host holds about a gateway request: where it goes, and what the gateway calls it. */
 function gatewayRequestDetails(request: GatewayApprovalRequest): RequestDetails {
   const facts: Record<string, string> = {};
   if (request.summary) {
@@ -688,7 +687,6 @@ export async function editExpiredGatewayApprovalCard(
   await editGatewayApprovalCard(row, resolution);
 }
 
-/** Show a gateway request through the shared terminal-card renderer. */
 async function editGatewayApprovalCard(row: PendingApproval, resolution: string): Promise<void> {
   if (!adapter || !row.platform_message_id || !row.channel_type || !row.platform_id) return;
   const threadId = (JSON.parse(row.payload) as { threadId?: string | null }).threadId ?? null;

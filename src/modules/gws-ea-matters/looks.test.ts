@@ -1,5 +1,5 @@
 /**
- * A matter's next look (KTD4, R13, R24): one slot, held by one scheduled
+ * A matter's next look: one slot, held by one scheduled
  * task that comes back as a turn of main's conversation, whose pre-task
  * script presents the matter read live. Driven through `ncl matters` against
  * main's real session mailbox; Google is in memory.
@@ -207,7 +207,7 @@ describe("a matter's next look", () => {
     });
   });
 
-  it('never replaces a repeating look with a one-off, which is a matter of its own (R24)', async () => {
+  it('never replaces a repeating look with a one-off, which is a matter of its own', async () => {
     const birthday = await open("Juno's birthday", { 'look-cron': '0 9 7 3 *' });
 
     expect(await run('matters-update', { id: birthday.id, look: inDays(2) })).toMatchObject(

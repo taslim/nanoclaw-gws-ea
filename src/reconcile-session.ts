@@ -142,14 +142,11 @@ export function shouldCloseTaskSession(
 }
 
 /**
- * Inbound-failed hooks.
- *
- * Registered modules hear, once per reconcile pass, about the inbound
- * messages the host gave up on after MAX_TRIES, each with where it came
- * from. They run after the mailbox work has committed and outside the
- * mailbox session, so a hook may open its own sessions or send through a
- * channel. Each invocation is isolated: a failing hook never affects the
- * reconcile or the hooks after it.
+ * Hears, once per reconcile pass, the inbound messages the host gave up on
+ * after MAX_TRIES, each with where it came from. Hooks run after the mailbox
+ * work has committed and outside the mailbox session, so one may open its own
+ * sessions or send through a channel; a failing hook affects neither the
+ * reconcile nor the hooks after it.
  */
 export type InboundFailedHook = (failed: readonly MessageRetry[], session: Session) => void | Promise<void>;
 
@@ -185,7 +182,7 @@ async function reconcileActiveSession(session: Session): Promise<void> {
   }
 }
 
-/** One mailbox pass. Returns the inbound messages it gave up on. */
+/** Returns the inbound messages this pass gave up on. */
 async function reconcileSessionMailbox(session: Session, agentGroupId: string): Promise<MessageRetry[]> {
   const failedMessages: MessageRetry[] = [];
   try {

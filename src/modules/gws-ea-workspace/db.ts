@@ -1,8 +1,6 @@
 /**
- * The home folder's store (see migration.ts): the folder's Drive id, the
- * folder `main` was last told of, the principal's addresses its grants were
- * last reconciled against, and the host's record of each address's grant.
- * Every timestamp is passed in as an ISO string; SQL never reads the clock.
+ * The home folder's store (see migration.ts). Every timestamp is passed in as
+ * an ISO string; SQL never reads the clock.
  */
 import { getDb } from '../../db/connection.js';
 
@@ -57,8 +55,8 @@ export async function getHomeFolder(): Promise<HomeFolderRecord> {
 }
 
 /**
- * Record a new folder. The grants recorded for the folder before it went
- * with it; the folder `main` was told of stays until it is told of this one.
+ * Drops the grants recorded for the previous folder; the folder `main` was
+ * told of stays until it is told of this one.
  */
 export async function recordHomeFolder(folderId: string, at: string): Promise<void> {
   const db = getDb();

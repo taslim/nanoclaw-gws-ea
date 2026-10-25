@@ -10,8 +10,6 @@
  * comes after the tool stopped waiting stays in the mailbox, unseen by the
  * poll loop, and `request_status` reads it, as often as asked.
  *
- * `requestTool` makes a tool of one such request: the tool is named after
- * the action it sends, and its answer, or its timeout, is what the agent reads.
  * A request that sends a message is marked as one, so the poll loop counts
  * its success as the turn's reply (`deliveredByRequest`).
  */
@@ -48,11 +46,10 @@ export type ActionRequestResult =
   | { readonly status: 'not-sent'; readonly reason: string };
 
 export interface ActionRequestOptions {
-  /** How long to wait for the host's answer. */
   readonly timeoutMs: number;
   /** The request sends a message when the host answers it ok (`deliveredByRequest`). */
   readonly delivers?: boolean;
-  /** How often to look for it; 500 ms by default. */
+  /** 500 by default. */
   readonly pollMs?: number;
   readonly signal?: AbortSignal;
   /**
@@ -80,7 +77,6 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
-/** The frame an answer row carries; an unreadable one is answered as a transport error. */
 function frameOf(content: string, requestId: string): ActionResponseFrame {
   let parsed: unknown;
   try {
@@ -143,11 +139,7 @@ export function deliveredByRequest(row: { readonly kind: string; readonly conten
   return answer !== undefined && frameOf(answer.content, request.requestId).ok;
 }
 
-/**
- * Send `action` with `fields` to the host and wait for its answer. The action
- * name, the request id and the mark of a request that sends a message are set
- * here and never taken from `fields`.
- */
+/** The action name, request id and `delivers` mark override any same-named `fields`. */
 export async function requestAction(
   action: string,
   fields: Readonly<Record<string, unknown>>,
@@ -208,7 +200,6 @@ function responseImage(value: unknown): value is ActionResponseImage {
   );
 }
 
-/** An answer as a tool returns it: its message or structured data, optional images, or a refusal. */
 export function answerResult(frame: ActionResponseFrame): CallToolResult {
   if (!frame.ok)
     return errorResult(
@@ -234,9 +225,7 @@ export function answerResult(frame: ActionResponseFrame): CallToolResult {
   };
 }
 
-/** A tool that sends one host action, by default the one of its own name. */
 export interface RequestToolSpec {
-  /** The tool's name. */
   readonly name: string;
   /** The host action it sends, when not its own name. */
   readonly action?: string;
@@ -246,7 +235,6 @@ export interface RequestToolSpec {
   readonly required: readonly string[];
   /** Close a tool's JSON schema when its host action accepts only the named fields. */
   readonly additionalProperties?: false;
-  /** Discriminated request shapes sharing one native host action. */
   readonly oneOf?: readonly object[];
   /** Whether making the same call again is safe: a repeat changes nothing twice. */
   readonly repeatable: boolean;
@@ -264,7 +252,6 @@ export interface RequestToolSpec {
   readonly prepare?: (fields: Record<string, unknown>, requestId: string) => Record<string, unknown> | string;
 }
 
-/** What a timeout tells the agent: the request may still go through, and whether to repeat it. */
 function timeoutText(requestId: string, repeatable: boolean): string {
   return (
     `The host has not answered request ${requestId} yet, and it may still go through. ` +
@@ -275,9 +262,8 @@ function timeoutText(requestId: string, repeatable: boolean): string {
 }
 
 /**
- * A tool that sends one request, named after itself unless it names another
- * action, and returns the host's answer. The host checks what each request means, so the tool checks only
- * that the required fields are there, and sends no field it does not take.
+ * The host checks what each request means, so the tool checks only that the
+ * required fields are there, and sends no field it does not take.
  */
 export function requestTool(spec: RequestToolSpec): McpToolDefinition {
   return {

@@ -212,7 +212,7 @@ describe('NanoClaw tool server capabilities', () => {
     ...registeredToolCapabilities().map<[string, readonly string[]]>((key) => [key, [key]]),
     ['all registered base tools', undefined],
   ])('keeps every description served for %s within 4,096 characters', async (_holding, grants) => {
-    // KTD15 / R23: Claude Code 2.1.296 keeps only 4,096 upfront characters.
+    // Claude Code 2.1.296 keeps only 4,096 upfront characters.
     // A gateway's non-first-party API address loads tools upfront. Serve each
     // key alone so a base definition cannot hide another key's variant; the
     // undefined case also covers every registered base tool without filtering.

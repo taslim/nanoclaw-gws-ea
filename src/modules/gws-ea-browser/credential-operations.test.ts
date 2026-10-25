@@ -134,7 +134,7 @@ function principalLogin(username = USERNAME): Item {
   });
 }
 
-/** The Login a finished signup saved: the only kind of Login whose password the assistant may change (R18). */
+/** The Login a finished signup saved: the only kind of Login whose password the assistant may change. */
 async function assistantLogin(): Promise<string> {
   const recorded = await ask({ operation: 'signup', site: `${ORIGIN}/join`, username: USERNAME });
   const id = String(recorded.authority);
@@ -1143,7 +1143,7 @@ describe("the principal's release of an attempt the host cannot settle", () => {
   });
 });
 
-describe("a signup's account email (KTD14; R20, R23, R25)", () => {
+describe("a signup's account email", () => {
   const recordedAttempts = () => getDb().all<CredentialAttempt>('SELECT * FROM gws_ea_browser_credential_attempts');
 
   beforeEach(async () => {

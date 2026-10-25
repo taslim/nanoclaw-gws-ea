@@ -11,7 +11,7 @@ import {
   type OptionDefinition,
 } from './command-definitions.js';
 
-/** Values passed to existing handlers: switches use 'true', and repeatables retain input order separately. */
+/** Switches hold 'true'; repeatable options are in `repeated` instead, in input order. */
 export type CommandOptions = Readonly<Record<string, string>>;
 export interface ParsedOptions {
   readonly options: CommandOptions;
@@ -21,7 +21,7 @@ export interface ParsedInvocation extends ParsedOptions {
   readonly definition: CommandDefinition;
   readonly arguments: readonly string[];
   readonly passThrough: readonly string[];
-  /** Original outer tokens, without the command path; journals and retry recipes retain the invocation. */
+  /** The tokens before `--`, without the command path, so a retry can parse the same invocation again. */
   readonly commandArgs: readonly string[];
   readonly help: boolean;
 }
@@ -92,7 +92,7 @@ function validateArguments(command: CommandDefinition, values: readonly string[]
     invalid(`Unexpected argument ${JSON.stringify(values[definitions.length])}`);
 }
 
-/** Pure grammar validation occurs before paths, credentials, locks, or lifecycle prerequisites are loaded. */
+/** Grammar only: runs before any path, credential, lock or lifecycle prerequisite is loaded. */
 export function parseInvocation(args: readonly string[]): ParsedInvocation {
   const delimiter = args.indexOf('--');
   const own = delimiter === -1 ? args : args.slice(0, delimiter);
@@ -119,7 +119,8 @@ export function parseInvocation(args: readonly string[]): ParsedInvocation {
         `Unknown command ${JSON.stringify(path.join(' '))}.${path[0] === 'capabilities' ? ' Run gws-ea help capabilities for supported actions.' : ''}`,
       );
     definition = candidates.find((command) => command.path.length === path.length);
-    // A capability-specific native leaf owns its scope/options; existing voice leaves keep their grammar.
+    // A command can prefix a longer one (`capabilities enable` takes voice as an argument; `capabilities enable
+    // browser` is its own command), so stop only when the next token does not continue a longer path.
     const next = own[index];
     if (
       definition &&
@@ -147,7 +148,7 @@ export function parseInvocation(args: readonly string[]): ParsedInvocation {
       index += 1;
     }
   }
-  // Leading common options must obey the selected command's output modes too.
+  // Common options before the command path were parsed before the command was known; check its output modes now.
   if (parsed.options.json === 'true' && (parsed.options.help === 'true' || definition.path[0] === 'help'))
     invalid('Help is human-only. Use gws-ea schema [command path] --json for machine discovery.');
   if (parsed.options.json === 'true' && !definition.outputModes.includes('json'))
@@ -183,7 +184,7 @@ export function parseInvocation(args: readonly string[]): ParsedInvocation {
   };
 }
 
-/** Scoped help/schema paths must identify an implemented command, even when --help is present. */
+/** A help or schema path must name a registered command or namespace, even under --help. */
 export function discoveryTarget(path: readonly string[]): DiscoveryTarget | undefined {
   if (path.length === 0) return undefined;
   const command = findCommand(path) ?? findNamespace(path);

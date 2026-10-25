@@ -1,15 +1,15 @@
 /**
- * Whether Chat is receiving (KTD12): the pull consumer and the Workspace
- * Events subscription each record what their last attempt found, and status
- * reads it through `gws-ea-chat health`. It lives in this host's memory only:
- * the host owns the subscription's whole life and keeps no local record of it
- * (KTD2), so a restarted host learns it all again from Google. A subscription
+ * Whether Chat is receiving: the pull consumer and the Workspace Events
+ * subscription each record what their last attempt found, and the control
+ * plane reads it through `gws-ea-chat health`. It lives in this host's memory
+ * only: the host owns the subscription's whole life and keeps no local record
+ * of it, so a restarted host learns it all again from Google. A subscription
  * recorded active reads as expired once its expiry passes: if every renewal
  * since failed, Google has stopped delivering.
  *
- * A broken Google sign-in is named as one: the assistant's grant refused,
- * or the subscription suspended for its authorization. Only a new sign-in
- * brings Chat back then, and status reports it as "sign-in needed".
+ * A broken Google sign-in is named as one: the assistant's grant refused, or
+ * the subscription suspended for its authorization. Only a new sign-in brings
+ * Chat back then.
  */
 import { GoogleApiError } from '../gws-ea-inbox/gmail-api.js';
 import { GoogleGrantRevokedError, GoogleScopeNotGrantedError, GoogleTokenError } from '../gws-ea-google/tokens.js';
@@ -17,11 +17,12 @@ import { SubscriberCredentialError } from './subscriber-credentials.js';
 
 /**
  * What kind of failure an attempt ended in:
- * - `sign_in_needed`: Google refuses the assistant's sign-in, or the
- *   subscription was suspended for its authorization.
+ * - `sign_in_needed`: Google refuses the assistant's sign-in, or it lacks the
+ *   Chat scopes.
  * - `subscriber_credential`: the subscriber key is missing or unreadable, or
  *   Google refuses it.
- * - `unreachable`: Google could not be reached, or asked to be asked later.
+ * - `unreachable`: Google could not be reached, rate-limited the call, or
+ *   failed on its side.
  * - `failed`: anything else, as its message says.
  */
 export type ChatErrorKind = 'sign_in_needed' | 'subscriber_credential' | 'unreachable' | 'failed';
@@ -66,7 +67,6 @@ export interface ChatHealth {
   readonly signInNeeded: boolean;
 }
 
-/** What the consumer and the supervisor write, and status reads. */
 export interface ChatHealthRecorder {
   consumer(update: Partial<ChatConsumerHealth>): void;
   subscription(update: Partial<ChatSubscriptionHealth>): void;
@@ -76,7 +76,7 @@ export interface ChatHealthRecorder {
 /**
  * Suspensions a new sign-in cannot lift: the topic is gone or refuses
  * Google's publisher, which the assistant's project must fix. Every other
- * reason is the assistant's authorization.
+ * reason is treated as the assistant's authorization.
  */
 const ENDPOINT_SUSPENSIONS: ReadonlySet<string> = new Set([
   'ENDPOINT_PERMISSION_DENIED',
@@ -114,12 +114,11 @@ export function createChatHealth(): ChatHealthRecorder {
   };
 }
 
-/** This host's Chat health, which the delivery it runs records and `gws-ea-chat health` reports. */
 export const chatHealth: ChatHealthRecorder = createChatHealth();
 
 /**
- * The kind of a failure, by the credential the call carried: the assistant's
- * own Chat token for the subscription, or the subscriber key for Pub/Sub.
+ * `credential` is what the failed call carried: the assistant's own Chat token
+ * for the subscription, or the subscriber key for Pub/Sub.
  */
 export function chatErrorKind(error: unknown, credential: 'assistant' | 'subscriber'): ChatErrorKind {
   if (error instanceof SubscriberCredentialError) return 'subscriber_credential';

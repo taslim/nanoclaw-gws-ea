@@ -1,4 +1,4 @@
-/** Removal-only native sign-out. The caller has stopped and drained this exact instance before opening it. */
+/** Native sign-out with no adapter running; the caller ensures no other socket holds this instance's credentials. */
 import fs from 'node:fs';
 import path from 'node:path';
 import {

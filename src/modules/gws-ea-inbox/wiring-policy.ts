@@ -1,20 +1,18 @@
 /**
- * The email channel's two messaging groups and their wirings (KTD1).
+ * The email channel's two messaging groups and their wirings.
  *
  * - The inbox (`email:inbox`): every thread anyone but the principal can
- *   read, mentions off and unknown senders admitted, each thread its own
- *   `external-email` session.
+ *   read, unknown senders admitted, each thread its own `external-email`
+ *   session.
  * - The principal's own email conversation (`email:principal`): what only
  *   the principal and the assistant can read, in `main`'s one shared
  *   session, admitting only known senders: the principal's verified email
  *   identities, which `main`'s members follow (gws-ea-profile).
  *
- * The host creates each group and its wiring when absent, recording the
- * group's id before the wiring so the policies govern it. A wiring admission
- * policy pins both shapes, by the stored ids, on every path that writes a
- * wiring, so drift is refused where it would happen: the inbox is wired only
- * to `external-email` and `external-email` only to the inbox; the principal's
- * conversation only to `main`.
+ * A wiring admission policy pins both shapes, by the stored ids, on every
+ * path that writes a wiring, so drift is refused where it would happen: the
+ * inbox is wired only to `external-email` and `external-email` only to the
+ * inbox; the principal's conversation only to `main`.
  */
 import { randomUUID } from 'node:crypto';
 
@@ -32,7 +30,6 @@ import { getMainAgentGroupId } from '../gws-ea-profile/db.js';
 import { emailMessagingGroupIds, getInboxState, updateInboxState, type InboxState } from './db.js';
 import { EMAIL_CHANNEL_TYPE, INBOX_PLATFORM_ID, PRINCIPAL_PLATFORM_ID } from './runtime.js';
 
-/** The inbox's pinned wiring, as every check and the host's own creation read it. */
 const INBOX_WIRING = {
   engage_mode: 'pattern',
   engage_pattern: '.',
@@ -42,7 +39,7 @@ const INBOX_WIRING = {
   threads: 1,
 } as const satisfies Partial<MessagingGroupAgent>;
 
-/** The principal's conversation's pinned wiring: `main`'s shared session, known senders only, each row keeping its thread. */
+/** Each row keeps its thread, though every one lands in `main`'s one shared session. */
 const PRINCIPAL_WIRING = {
   engage_mode: 'pattern',
   engage_pattern: '.',
@@ -52,12 +49,11 @@ const PRINCIPAL_WIRING = {
   threads: 1,
 } as const satisfies Partial<MessagingGroupAgent>;
 
-/** The inbox's messaging group, or null until the host creates it. */
+/** Null until the host creates the inbox. */
 export async function getInboxMessagingGroupId(): Promise<string | null> {
   return (await emailMessagingGroupIds()).inbox;
 }
 
-/** One of the channel's groups as the host creates it, and the state column that stores its id. */
 interface EmailGroup {
   /** Names its rows' ids. */
   readonly name: string;
@@ -65,10 +61,6 @@ interface EmailGroup {
   readonly group: Omit<MessagingGroup, 'id' | 'created_at'>;
 }
 
-/**
- * Create the group when absent and record its id, then its wiring to
- * `agentGroupId`. Returns the group's id.
- */
 async function ensureEmailGroup(
   email: EmailGroup,
   agentGroupId: string,
@@ -96,10 +88,7 @@ async function ensureEmailGroup(
   return id;
 }
 
-/**
- * Create the inbox's messaging group and its wiring to `external-email` when
- * either is absent. Run at host start, after `external-email` exists.
- */
+/** Run at host start, after `external-email` exists. */
 export async function ensureInbox(externalEmailAgentGroupId: string): Promise<string> {
   return ensureEmailGroup(
     {
@@ -119,10 +108,7 @@ export async function ensureInbox(externalEmailAgentGroupId: string): Promise<st
   );
 }
 
-/**
- * Create the principal's own email conversation and its wiring to `main`
- * when either is absent. Run at host start, once `main` exists.
- */
+/** Run at host start, once `main` exists. */
 export async function ensurePrincipalConversation(mainAgentGroupId: string): Promise<string> {
   return ensureEmailGroup(
     {

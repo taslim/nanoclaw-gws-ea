@@ -36,7 +36,7 @@ export const KIND_NOUNS: Readonly<Record<PrivateValueKind, string>> = {
   other: 'detail',
 };
 
-/** A kind as people say it, such as "phone number": what a refusal names in place of the value. */
+/** What a refusal names in place of the value, such as "phone number". */
 export function privateKindNoun(kind: PrivateValueKind): string {
   return KIND_NOUNS[kind];
 }
@@ -65,12 +65,11 @@ function unescapeHtml(html: string): string {
 }
 
 /**
- * A markdown text as a reader's mail client renders it (as the email
- * renderer in src/modules/gws-ea-inbox/render.ts writes it): its words, with
- * an image read as its words and the markup gone, and the targets of its
- * links. micromark resolves the markdown's character references, so
- * `1&#50;3` reads as the `123` a reader sees. Percent-encoding is decoded by
- * the matcher, like every text's.
+ * Markdown as a reader's mail client shows it once the inbox's renderer
+ * (gws-ea-inbox/render.ts) writes it: an image read as its alt text, the
+ * markup gone, and the targets of its links. micromark resolves the
+ * markdown's character references, so `1&#50;3` reads as the `123` a reader
+ * sees. Percent-encoding is decoded by the matcher, like every text's.
  */
 function rendered(text: string): { readonly words: string; readonly targets: readonly string[] } {
   const html = micromark(text, { extensions: [gfm()], htmlExtensions: [gfmHtml()] });
@@ -82,11 +81,7 @@ function rendered(text: string): { readonly words: string; readonly targets: rea
   };
 }
 
-/**
- * The targets of a markdown text's links as a reader's mail client renders
- * them, an autolinked address and a link behind its words alike. The
- * workspace's link check reads them beside the text as written.
- */
+/** As a mail client renders the markdown: an autolinked address and a link behind its words alike. */
 export function linkTargets(text: string): readonly string[] {
   return rendered(text).targets;
 }
@@ -119,11 +114,9 @@ function kindGivenAway(
 }
 
 /**
- * Check text bound for `audience`: the principal may receive anything; an
- * active chat may receive only the private values cleared for that chat.
- * `content` is one text, or the fields of one
- * write (a calendar event's title, location, description, and comments),
- * read in order so a value split across fields is found too.
+ * The principal may receive anything; `messagingGroupId` names an active chat
+ * whose cleared values it may also receive. `content` is one text or the
+ * fields of one write, read in order so a value split across fields is found.
  */
 export async function checkOutbound(
   content: string | readonly string[],
@@ -159,11 +152,7 @@ export function messageStrings(content: string): string[] {
   return parts;
 }
 
-/**
- * The text a send carries: every field of its message, each file's name, and
- * each file that is text. A binary file is a form of encoding the check
- * cannot read, a known residual alongside spelled-out values.
- */
+/** A binary file is an encoding the check cannot read: a known residual, like a spelled-out value. */
 function sendText(send: OutboundSend): string[] {
   const parts = messageStrings(send.content);
   for (const file of send.files ?? []) {
@@ -173,11 +162,7 @@ function sendText(send: OutboundSend): string[] {
   return parts;
 }
 
-/**
- * The outbound guard: refuses a send to anyone but the principal that gives an
- * uncleared private value away. Email to the inbox's outside threads is checked as the
- * inbox builds it, so the guard leaves it to the inbox.
- */
+/** Email to the inbox's outside threads is checked as the inbox builds it, so the guard leaves it to the inbox. */
 export async function judgeSend(send: OutboundSend): Promise<OutboundGuardDecision> {
   if (send.channelType === EMAIL_CHANNEL_TYPE && send.platformId === INBOX_PLATFORM_ID) return { effect: 'allow' };
   const target = await getDb().get<{ id: string }>(
@@ -192,13 +177,13 @@ export async function judgeSend(send: OutboundSend): Promise<OutboundGuardDecisi
   return kind ? { effect: 'refuse', reason: refusalReason(kind) } : { effect: 'allow' };
 }
 
-/** A stored value as the host browser names it: by its id and kind, never its value or label. */
+/** Names a stored value without its value or label. */
 export interface PrivateValueReference {
   readonly id: string;
   readonly kind: PrivateValueKind;
 }
 
-/** Exact private-value references in every reading the outbound check protects. */
+/** Every stored value `content` gives away, read as `checkOutbound` reads it but ignoring clearances. */
 export async function privateValuesGivenAway(
   content: string | readonly string[],
 ): Promise<readonly PrivateValueReference[]> {
@@ -207,7 +192,7 @@ export async function privateValuesGivenAway(
   return privateValuesInReadings(readings);
 }
 
-/** Complete immutable HTML and its revision title; no chat or browser clearance is transferable. */
+/** For a whole artifact revision, which no chat clearance or browser disclosure carries over to. */
 export async function privateValuesGivenAwayInHtml(
   html: string,
   title: string,

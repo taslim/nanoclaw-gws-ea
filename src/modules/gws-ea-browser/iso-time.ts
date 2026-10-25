@@ -52,7 +52,7 @@ function wallClock(at: number, timeZone: string): number {
     (((at % 1000) + 1000) % 1000)
   );
 }
-/** The calendar date `at` falls on, on the clock of IANA `timeZone`, as YYYY-MM-DD. */
+/** The YYYY-MM-DD date `at` falls on, on the clock of IANA `timeZone`. */
 export function zonedDate(at: number, timeZone: string): string {
   return new Date(wallClock(at, timeZone)).toISOString().slice(0, 10);
 }

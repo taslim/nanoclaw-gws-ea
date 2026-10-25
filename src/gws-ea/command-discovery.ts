@@ -30,7 +30,6 @@ function commandUsage(command: CommandDefinition): string {
   ].join(' ');
 }
 
-/** Human discovery is rendered directly from the same definitions as parsing. */
 export function helpLines(command?: DiscoveryTarget): readonly string[] {
   if (!command) {
     return [
@@ -140,7 +139,6 @@ interface CompletionState {
   readonly discovery?: CommandDefinition;
 }
 
-/** Paths, including scoped help/schema paths, come only from the registered grammar. */
 function completionStates(): ReadonlyMap<string, CompletionState> {
   const states = new Map<string, CompletionState>([['', { children: new Set() }]]);
   const add = (path: readonly string[], command: CommandDefinition, discovery?: CommandDefinition): void => {
@@ -166,7 +164,7 @@ function positionalChoices(state: CompletionState): readonly string[] {
   return state.discovery ? [] : (state.command?.arguments?.[0]?.choices ?? []);
 }
 
-/** Each shell consumes option values before following command words; -- terminates outer completion. */
+/** The script skips each option's value before matching command words, and completes nothing after `--`. */
 function wordCompletion(shell: Exclude<Shell, 'fish'>): string {
   const bash = shell === 'bash';
   const states = completionStates();
@@ -336,7 +334,7 @@ export async function toolVersion(): Promise<{
     if (/^[a-f0-9]{40,64}$/u.test(commit)) revision = commit;
   } catch (error) {
     if (!(error instanceof GwsEaError)) throw error;
-    // A packaged source tree can lack Git; the package release remains an actual release fact.
+    // A packaged source tree can lack Git; the package version still identifies the release.
   }
   return { tool: 'gws-ea', version: manifest.version, revision };
 }

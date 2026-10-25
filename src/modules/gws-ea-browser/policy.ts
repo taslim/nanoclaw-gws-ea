@@ -6,20 +6,18 @@ import { browserPaths, readPrivateFile, type BrowserPaths } from './paths.js';
 export const BROWSER_POLICY_FILE_ENV = 'GWS_EA_BROWSER_POLICY_FILE';
 export const SYSTEM_CHROME = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
 /**
- * The policy versions this host reads (KTD15): version 1 grants the browser
- * to main alone, version 2 to exactly the agent groups it lists. The host
- * reports them in its browser health and a release declares them in
- * `src/gws-ea/browser-compatibility.json`, so the launcher writes version 2
- * only to a host that reads it and never rolls back below it.
+ * The policy versions this host reads: version 1 grants the browser to main alone, version 2 to the agent groups it
+ * lists. The host reports them in its browser health and a release declares them in
+ * `src/gws-ea/browser-compatibility.json`, so the launcher writes version 2 only to a host that reads it and never
+ * rolls back below it.
  */
 export const BROWSER_POLICY_VERSIONS = [1, 2] as const;
-/** The most agent groups a version-2 policy lists. */
 const MAX_LISTED_GROUPS = 64;
 
 export type BrowserPolicyFile =
   | { schemaVersion: 1; enabled: boolean; chromePath?: string }
   | { schemaVersion: 2; enabled: boolean; chromePath?: string; agentGroupIds: string[] };
-/** Who may use the browser: main alone (version 1), or exactly the agent groups a version-2 policy lists. */
+/** Version 1 grants the browser to main alone; version 2 to the groups it lists, less those `access.ts` excludes. */
 export type BrowserAccessPolicy =
   | { readonly version: 1 }
   | { readonly version: 2; readonly agentGroupIds: readonly string[] };
@@ -50,18 +48,16 @@ export function browserPolicyFile(): string | undefined {
   );
 }
 
-/** An agent group ID as the host holds one: no whitespace or control character, at most 256 characters. */
 function isAgentGroupId(value: unknown): value is string {
   return typeof value === 'string' && /^[^\s\p{Cc}]{1,256}$/u.test(value);
 }
 
-/** A version-2 list naming each group once; anything else is no list. */
 function agentGroupList(value: unknown): string[] | undefined {
   if (!Array.isArray(value) || value.length > MAX_LISTED_GROUPS || !value.every(isAgentGroupId)) return undefined;
   return new Set(value).size === value.length ? value : undefined;
 }
 
-/** A policy file in a version this host reads, or undefined for anything else. */
+/** Undefined for a version this host does not read or for any key it does not know. */
 export function parseBrowserPolicyFile(value: unknown): BrowserPolicyFile | undefined {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) return undefined;
   const record = value as Record<string, unknown>;
@@ -79,7 +75,6 @@ export function parseBrowserPolicyFile(value: unknown): BrowserPolicyFile | unde
   return agentGroupIds && { schemaVersion: 2, enabled: record.enabled, ...chrome, agentGroupIds };
 }
 
-/** Who a policy file grants the browser. */
 export function browserAccessOf(file: BrowserPolicyFile): BrowserAccessPolicy {
   return file.schemaVersion === 1 ? { version: 1 } : { version: 2, agentGroupIds: file.agentGroupIds };
 }

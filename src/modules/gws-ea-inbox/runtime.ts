@@ -16,21 +16,20 @@ import { threadAddresses } from './thread-map.js';
 
 /** The channel type of the inbox, and so of every user it names (`email:<address>`). */
 export const EMAIL_CHANNEL_TYPE = 'email';
-/** The platform ID of the inbox's messaging group: every thread anyone but the principal can read. */
+/** The inbox's messaging group: every thread anyone but the principal can read. */
 export const INBOX_PLATFORM_ID = 'email:inbox';
-/** The platform ID of the principal's own email conversation with `main`. */
+/** The principal's own email conversation with `main`. */
 export const PRINCIPAL_PLATFORM_ID = 'email:principal';
 
 export interface InboxRuntime {
   readonly gmail: GmailApi;
-  /** The host's inbound side of the channel; undefined until the host sets the adapter up. */
+  /** Undefined until the host sets the adapter up. */
   setup(): ChannelSetup | undefined;
-  /** The assistant's own Gmail address, as Gmail reports it; asked of Gmail once. */
+  /** The assistant's own, as Gmail reports it, lowercased; asked of Gmail once. */
   gmailAddress(): Promise<string>;
-  /** That address when Gmail has already reported it, without asking. */
+  /** The Gmail address when Gmail has already reported it, without asking. */
   knownGmailAddress(): string | undefined;
   now(): Date;
-  /** Wait between retries of a Gmail call. */
   sleep(ms: number): Promise<void>;
   /** Wake the existing inbox loop after a sign-in claim changes. */
   wakeSignIn(): void;
@@ -48,17 +47,14 @@ export function activeInbox(): InboxRuntime | undefined {
 
 /**
  * The assistant's own addresses: never a recipient, and never "someone else"
- * on a message. Its web alias is one of them (KTD14), so mail to it routes
- * as mail to the assistant does, with no route of its own.
+ * on a message. Its web alias is one of them, so mail to it routes as mail to
+ * the assistant does, with no route of its own.
  */
 export async function assistantAddresses(): Promise<ReadonlySet<string>> {
   return assistantAddressesOf((await getDb().hasTable('gws_ea_profile')) ? await getGwsEaProfile() : undefined);
 }
 
-/**
- * The assistant's own addresses, from a profile already read: the ones it
- * names (its Workspace email and its web alias), and the one Gmail reported.
- */
+/** From a profile already read: the addresses it names, and the one Gmail reported, if it has. */
 export function assistantAddressesOf(profile: GwsEaProfile | undefined): ReadonlySet<string> {
   const addresses = new Set(assistantOwnAddresses(profile).map((address) => address.toLowerCase()));
   const known = active?.knownGmailAddress();
@@ -66,11 +62,7 @@ export function assistantAddressesOf(profile: GwsEaProfile | undefined): Readonl
   return addresses;
 }
 
-/**
- * Who a thread's conversation is with: everyone its messages carried and
- * everyone main named, never the principal, the assistant, or someone only
- * written about in it.
- */
+/** Never the principal, the assistant, or someone only written about in the thread. */
 export async function conversationPeople(threadKey: string): Promise<string[]> {
   const principal = await loadPrincipalRecognizer();
   const assistant = await assistantAddresses();

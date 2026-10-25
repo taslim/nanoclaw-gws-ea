@@ -101,8 +101,8 @@ function checkpoint(snapshot: Awaited<ReturnType<typeof snapshotBrowserStructure
   return recordedCheckpoint(snapshot);
 }
 /**
- * A watch's marked region (KTD20): the element's structured locator, recorded as a recipe step's target is, when its
- * page is where `recipe` ends (the same address path and heading; inputs may change its query). `off_route` when it is
+ * A watch's marked region: the element's structured locator, recorded as a recipe step's target is, when its page is
+ * where `recipe` ends (the same address path and heading; inputs may change its query). `off_route` when it is
  * elsewhere, undefined when no accessible role and name find the element again. A watch replays the recipe, then finds
  * the region by `locateStructured`.
  */
@@ -361,7 +361,7 @@ export async function executeRecipe(
       if (result.recording.status !== 'complete') recording.status = 'unavailable';
       recording.trace_indices.push(...result.recording.trace_indices);
     } else recording.status = 'unavailable';
-    // A step that bought something nobody approved has stopped the job: the replay ends with it (KTD10).
+    // A step that bought something nobody approved has stopped the job: the replay ends with it.
     if (result.reason === 'unapproved_commit') return { ...result, ...coverage(), step: index, repeat_safe: false };
     if (result.repeat_safe === false) repeatSafe = false;
     const observation =

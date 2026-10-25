@@ -1,22 +1,19 @@
 /**
- * Connecting the assistant to Google (KTD2, KTD5, KTD6), in two steps. The
- * `sign_in_google` step runs before the host starts, since the host talks in
- * Chat as the assistant from its first moment: the Workspace APIs in the
- * assistant's project, the OAuth client the operator downloads, and the
- * assistant's own sign-in. The `connect_google` step runs once the host is
- * up: agents' Google access, which the host publishes, and a live check that
- * the sign-in reaches the assistant's own calendar and Drive. `gws-ea
- * connect-google` runs both on an existing assistant. Each resource observes
- * before it changes anything, so running them again changes nothing.
+ * Connecting the assistant to Google, in two steps. `sign_in_google` runs
+ * before the host starts, since the host talks in Chat as the assistant from
+ * its first moment: the Workspace APIs, the OAuth client the operator
+ * downloads, and the assistant's own sign-in. `connect_google` runs once the
+ * host is up: agents' Google access, which the host publishes, and a live
+ * check that the sign-in reaches the assistant's own calendar and Drive.
  *
- * This step writes only the grant file. The running host's refresher is the
- * only writer of the gateway's Google secrets: it publishes them from a new
- * sign-in on its next tick, and this step waits until it has, reading
- * OneCLI's secret metadata and never its values.
+ * Neither step writes the gateway's Google secrets. The running host's
+ * refresher is their only writer, publishing them from a new sign-in on its
+ * next tick; `connect_google` waits until it has, reading OneCLI's secret
+ * metadata and never its values.
  *
  * The live check runs from here rather than an agent's container: the
- * gateway's injection is OneCLI's fixed behavior, proven live once (U1),
- * while what varies per assistant is the grant, its scopes, and the secrets.
+ * gateway's injection is OneCLI's fixed behavior, while what varies per
+ * assistant is the grant, its scopes, and the secrets.
  */
 import { setTimeout as delay } from 'node:timers/promises';
 
@@ -50,26 +47,22 @@ import { googleGrantFile, googleOAuthClientFile, instanceOnecliAdmin, type Insta
 import { GwsEaError } from './types.js';
 import { isRecord } from './validation.js';
 
-/** The resume flag that supplies the downloaded OAuth client. */
 export const GOOGLE_CLIENT_FILE_FLAG = '--google-client-file';
 
-/** Where the assistant's own primary calendar is read to prove the connection. */
 export const PRIMARY_CALENDAR_URL = 'https://www.googleapis.com/calendar/v3/users/me/calendarList/primary';
 
-/** Where the assistant's own Drive says whose it is, read to prove the connection reaches Drive. */
 export const DRIVE_ABOUT_URL = 'https://www.googleapis.com/drive/v3/about?fields=user(emailAddress)';
 
 export interface GoogleConnectionInput {
   readonly runtime: InstanceRuntimeConfig;
   /** The declared Workspace address the sign-in must be. */
   readonly assistantWorkspaceEmail: string;
-  /** The assistant's name, which its sign-in client's app is named after, when this run knows it. */
+  /** Names the sign-in client's app; undefined when this run does not know it. */
   readonly assistantName?: string;
   /** `--google-client-file`, when the operator supplied it on this run. */
   readonly clientFile?: string;
   /** The assistant's sign-in through the operator's browser; pauses when no one is at a terminal. */
   readonly signIn: (request: AssistantGoogleSignInRequest) => Promise<GoogleGrant>;
-  /** The command that continues this run. */
   readonly resumeCommand: string;
 }
 
@@ -81,18 +74,15 @@ export interface GoogleConnectionDependencies {
   readonly gcloud?: GcloudDependencies;
   readonly fetch?: typeof globalThis.fetch;
   readonly now?: () => number;
-  /** How the step waits between looks at the gateway while the host publishes. */
   readonly sleep?: (ms: number) => Promise<void>;
 }
 
-/** How often, and for how long, the step looks for the secrets the host publishes. */
 const PUBLISH_POLL_MS = 5_000;
 const PUBLISH_ATTEMPTS = 36;
 
 /** Gmail's API host, which any secret able to carry `gmail.modify` must be injected on. */
 const GMAIL_HOST = 'gmail.googleapis.com';
 
-/** Where, in the assistant's project, the operator creates its sign-in client. */
 export function googleClientConsoleUrl(projectId: string): string {
   const url = new URL('https://console.cloud.google.com/auth/overview');
   url.searchParams.set('project', projectId);
@@ -100,9 +90,9 @@ export function googleClientConsoleUrl(projectId: string): string {
 }
 
 /**
- * What the operator does on that page, its link first and one field to a
- * line, as Google has no API for it. The app is named after the assistant,
- * so the consent page names the operator's own assistant, not a vendor.
+ * The operator does this by hand because Google has no API for it. The app is
+ * named after the assistant so the consent page names the operator's own
+ * assistant, not a vendor.
  */
 export function googleClientSteps(gcp: { projectId: string; account: string }, assistantName?: string): string[] {
   return [
@@ -120,11 +110,6 @@ export function googleClientSteps(gcp: { projectId: string; account: string }, a
   ];
 }
 
-/**
- * Whether the assistant's sign-in still needs the client the operator
- * downloads: no sign-in yet, no client kept from an earlier run, and none
- * given on this one.
- */
 export async function googleClientNeeded(google: GoogleConnectionInput): Promise<boolean> {
   if (google.clientFile) return false;
   if (await readGoogleGrantFile(googleGrantFile(google.runtime))) return false;
@@ -142,16 +127,14 @@ function clientPause(context: GoogleConnectionContext): ProvisionHumanPause {
   };
 }
 
-/** One OneCLI secret's metadata. Values never come back from this read. */
 interface VaultSecret {
   readonly name: string;
   readonly hostPattern: string;
 }
 
 /**
- * Every secret OneCLI holds for this instance, by name and host, read with
- * the instance's admin key. Not observing the vault is no finding about it:
- * status reports a failed read as unknown.
+ * Not observing the vault is no finding about it, so an unreadable answer is a
+ * plain Error, which status reports as unknown.
  */
 async function listVaultSecrets(
   runtime: InstanceRuntimeConfig,
@@ -166,13 +149,11 @@ async function listVaultSecrets(
   });
 }
 
-/** Whether a OneCLI host pattern injects on `host`: the host itself, or a wildcard covering it. */
 function injectsOn(pattern: string, host: string): boolean {
   if (pattern === '*' || pattern === host) return true;
   return pattern.startsWith('*.') && host.endsWith(pattern.slice(1));
 }
 
-/** Whether the assistant has signed in as the declared account; else why not. */
 function signInProblem(grant: GoogleGrant | undefined, account: string): string | undefined {
   if (!grant) return 'the assistant has not signed in to Google yet';
   return grant.account === account.toLowerCase()
@@ -180,13 +161,11 @@ function signInProblem(grant: GoogleGrant | undefined, account: string): string 
     : `Google is signed in as ${grant.account}, not the assistant's account ${account}`;
 }
 
-/** Which scopes this release asks for that `grant` lacks, as a reason, or undefined when it holds them all. */
 function scopeProblem(grant: GoogleGrant): string | undefined {
   const missing = missingGoogleScopes(scopesOfGrant(grant));
   return missing.length > 0 ? `the sign-in lacks ${missing.join(', ')}` : undefined;
 }
 
-/** Whether `grant` is the declared account's, with every scope this release asks for; else why not. */
 export function grantProblem(grant: GoogleGrant | undefined, account: string): string | undefined {
   return signInProblem(grant, account) ?? (grant && scopeProblem(grant));
 }
@@ -196,15 +175,13 @@ function listed(names: readonly string[]): string {
   return `${names.slice(0, -1).join(', ')}, or ${names.at(-1)}`;
 }
 
-/** Why agents' published Google access falls short; `partial` when they hold the rest of it. */
+/** `partial`: agents hold the rest of their Google access. */
 type AccessProblem = { readonly reason: string; readonly partial: boolean };
 
 /**
- * Why the secrets the host publishes for agents do not each inject exactly one
- * token on their credential's host, or undefined when they do. Asked only of a
+ * Each credential needs exactly one secret, on its own host. Asked only of a
  * grant holding every scope this release asks for, from which the host
- * publishes every credential. Secrets it has not published yet are named
- * together, and agents hold the rest when it has published any.
+ * publishes every credential.
  */
 function publishedAccessProblem(secrets: readonly VaultSecret[]): AccessProblem | undefined {
   const missing: string[] = [];
@@ -243,15 +220,14 @@ function gmailModifyProblem(secrets: readonly VaultSecret[]): string | undefined
     : undefined;
 }
 
-/** How Google answers for the credential Calendar rides on, as the host would mint it. */
 type CalendarCredentialAnswer =
   | { readonly revoked: true }
   | { readonly revoked: false; readonly fallback?: CredentialFallback };
 
 /**
- * Whether Google still honors `grant`, asked by minting the credential
- * agents' Calendar rides on: a revoked or expired sign-in is refused, and a
- * Drive refusal leaves Calendar alone in the token the host publishes (KTD1).
+ * Asks Google by minting the credential agents' Calendar rides on: a revoked or
+ * expired sign-in is refused, and a Drive refusal leaves Calendar alone in the
+ * token the host publishes.
  */
 async function calendarCredentialAnswer(
   grant: GoogleGrant,
@@ -266,7 +242,6 @@ async function calendarCredentialAnswer(
   }
 }
 
-/** What Google refused of the credential Calendar rides on, which agents then have without. */
 function refusedBesideCalendar(fallback: CredentialFallback): string {
   return (
     `Google refuses ${fallback.refused.join(', ')} for the assistant's sign-in (${fallback.reason}), ` +
@@ -289,7 +264,6 @@ function tokenOptionsOf(dependencies: GoogleConnectionDependencies): TokenOption
   };
 }
 
-/** `sign_in_google`'s resources: the APIs, the OAuth client, and the assistant's own sign-in. */
 export function googleSignInResources(
   dependencies: GoogleConnectionDependencies = {},
 ): readonly StepResource<GoogleConnectionContext>[] {
@@ -347,10 +321,6 @@ export function googleSignInResources(
   ];
 }
 
-/**
- * `connect_google`'s resources, once the host runs: agents' Google access,
- * which the host publishes from the sign-in, and the live check.
- */
 export function googleAccessResources(
   dependencies: GoogleConnectionDependencies = {},
 ): readonly StepResource<GoogleConnectionContext>[] {
@@ -426,24 +396,21 @@ export function googleAccessResources(
   ];
 }
 
-/** Both steps' resources, in order, as `gws-ea connect-google` repairs a created assistant's connection. */
+/** For `gws-ea connect-google`, which repairs an existing assistant's connection. */
 export function googleConnectionResources(
   dependencies: GoogleConnectionDependencies = {},
 ): readonly StepResource<GoogleConnectionContext>[] {
   return [...googleSignInResources(dependencies), ...googleAccessResources(dependencies)];
 }
 
-/** The assistant's Google connection as `status` reports it. */
 export type GoogleConnectionReport =
   | { readonly status: 'connected'; readonly account: string }
   | { readonly status: 'degraded'; readonly account: string | null; readonly reason: string };
 
 /**
- * Observe the connection without changing it: the grant is the declared
- * account's, Google still accepts it, it holds every scope, no secret lets an
- * agent modify Gmail, OneCLI holds each secret the host publishes for agents,
- * and Google grants agents' Calendar credential in full rather than Calendar
- * alone (KTD1). Each problem names what repairs it.
+ * Changes nothing. Agents' Calendar credential counts as connected only when
+ * Google grants it in full, not Calendar alone; each degraded reason names its
+ * repair.
  */
 export async function observeGoogleConnection(
   runtime: InstanceRuntimeConfig,

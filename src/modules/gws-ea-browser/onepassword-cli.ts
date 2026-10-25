@@ -1,12 +1,9 @@
 /**
- * The one 1Password CLI boundary (KTD1). Each action is a fixed argument
- * list; no caller supplies an argument the CLI parses as a flag. Operator
- * calls authenticate through the operator's own desktop sign-in in exactly
- * the selected account and can never inherit a service-account or Connect
- * credential; service-account calls authenticate with exactly the token in
- * their file. Provider output never reaches a log or a result: every failure
- * is a constant reason, a minted token is captured privately before anything
- * else reads it, and nothing is retried here (KTD11).
+ * The one 1Password CLI boundary. Each action is a fixed argument list; no caller supplies an argument the CLI
+ * parses as a flag. Operator calls authenticate through the operator's own desktop sign-in in exactly the selected
+ * account and can never inherit a service-account or Connect credential; service-account calls authenticate with
+ * exactly the token in their file. Provider output never reaches a log or a result: every failure is a constant
+ * reason, a minted token is captured privately before anything else reads it, and nothing is retried here.
  */
 import { lstat } from 'node:fs/promises';
 import os from 'node:os';
@@ -115,9 +112,7 @@ export interface OnePasswordCliOptions {
 
 /** A person 1Password holds in the account, as a service account reads them. */
 export interface OnePasswordUser {
-  /** The exact provider user. */
   readonly userId: string;
-  /** The email 1Password holds for them. */
   readonly email: string;
   /** `MEMBER`, `GUEST` or `SERVICE_ACCOUNT` as 1Password reports it; anything else is `other`. */
   readonly type: 'member' | 'guest' | 'service_account' | 'other';
@@ -141,7 +136,7 @@ export interface OnePasswordRateLimit {
   readonly remaining: number;
 }
 
-/** The plan an account is on, which sets the daily request limit every service account in it shares (KTD11). */
+/** The plan an account is on, which sets the daily request limit every service account in it shares. */
 export type OnePasswordAccountType = 'individual' | 'families' | 'teams' | 'business';
 
 /** The CLI's account types, as `op account get` reports them. */
@@ -175,11 +170,9 @@ export interface ServiceAccountRequest {
 }
 
 /**
- * `recovered`: an earlier attempt's token is already captured; nothing was
- * minted. `outcome_unknown`: a service account may exist whose token was not
- * captured. Its creation record stays, so no retry mints another, until the
- * operator has revoked it on 1Password.com and `discardServiceAccountCreation`
- * clears the record.
+ * `recovered`: an earlier attempt's token is already captured; nothing was minted. `outcome_unknown`: a service
+ * account may exist whose token was not captured. Its creation record stays, so no retry mints another, until the
+ * operator has revoked it on 1Password.com and `discardServiceAccountCreation` clears the record.
  */
 export type ServiceAccountCreation =
   | { readonly status: 'created' }
@@ -205,9 +198,8 @@ type ProviderRejection = Extract<
 >;
 
 /**
- * Refusals the provider made before acting, recognized in its error text.
- * Only the 429 wording is documented; text matching none of these is never a
- * refusal, so a write it ends stays unknown.
+ * Refusals the provider made before acting, recognized in its error text. Only the 429 wording is documented; text
+ * matching none of these is never a refusal, so a write it ends stays unknown.
  */
 const REJECTIONS: ReadonlyArray<readonly [ProviderRejection, RegExp]> = [
   ['rate_limited', /\(429\)|too many requests|maximum number of this type of requests/iu],
@@ -268,7 +260,6 @@ function isFileSystemError(error: unknown): boolean {
   return /^E[A-Z0-9]+$/u.test(errorCode(error, ''));
 }
 
-/** The tool allowlist plus HOME; any 1Password variable is dropped, then the identity's own token added. */
 function cliEnvironment(ambient: NodeJS.ProcessEnv, token: string | undefined): Record<string, string> {
   // The allowlist names no OP_ variable; filtering anyway keeps authentication exactly the identity's.
   const inherited = Object.entries(buildToolEnvironment(ambient, { HOME: os.homedir() })).filter(
@@ -383,7 +374,6 @@ async function exists(file: string): Promise<boolean> {
   }
 }
 
-/** Whether an attempt to mint the token for `tokenFile` is recorded, its outcome not yet proven. */
 export function serviceAccountCreationUnproven(tokenFile: string): Promise<boolean> {
   return exists(creationRecord(tokenFile));
 }
@@ -395,9 +385,8 @@ export async function discardServiceAccountCreation(tokenFile: string): Promise<
 }
 
 /**
- * Disabling's half of a capture no one verified: the token goes, and its
- * creation stays unproven, so no retry mints over an account that may exist
- * until the operator revokes it on 1Password.com and discards the attempt.
+ * Disabling's half of a capture no one verified: the token goes, and its creation stays unproven, so no retry mints
+ * over an account that may exist until the operator revokes it on 1Password.com and discards the attempt.
  */
 export async function retireCapturedServiceAccount(tokenFile: string, name: string): Promise<void> {
   const record = creationRecord(tokenFile);
@@ -451,7 +440,6 @@ export class OnePasswordCli {
     return { status: 'ready', cli: new OnePasswordCli(invocation, version.text) };
   }
 
-  /** Run `args` as `identity`, or with no account selection or token when there is none. */
   async #invoke(identity: OnePasswordIdentity | undefined, args: readonly string[]): Promise<Ran> {
     if (identity === undefined)
       return run(this.#invocation, cliCommand(this.#invocation, args, undefined, OPERATOR_TIMEOUT_MS));
@@ -586,9 +574,8 @@ export class OnePasswordCli {
   }
 
   /**
-   * Whether `identity` can read exactly this vault: success names the vault
-   * the provider returned, its name, and the item count it reports; each is
-   * null when it reports none, so an unknown count is never an empty vault.
+   * Whether `identity` can read exactly this vault: success names the vault the provider returned, its name, and
+   * the item count it reports; each is null when it reports none, so an unknown count is never an empty vault.
    */
   async getVault(
     identity: OnePasswordIdentity,
@@ -656,7 +643,6 @@ export class OnePasswordCli {
     return { status: 'ok', userIds };
   }
 
-  /** The plan of the account `identity` authenticates to. */
   async accountType(
     identity: OnePasswordIdentity,
   ): Promise<OnePasswordResult<{ readonly accountType: OnePasswordAccountType }>> {
@@ -668,7 +654,7 @@ export class OnePasswordCli {
     return accountType ? { status: 'ok', accountType } : failed('unexpected_output');
   }
 
-  /** The service account's hourly usage and its account's shared daily usage (KTD11). */
+  /** The service account's hourly usage and its account's shared daily usage. */
   async rateLimits(
     identity: ServiceAccountIdentity,
   ): Promise<OnePasswordResult<{ readonly limits: readonly OnePasswordRateLimit[] }>> {
@@ -679,11 +665,10 @@ export class OnePasswordCli {
   }
 
   /**
-   * Mint a service account as the operator: a service account cannot. The
-   * output is registered for redaction and written to `tokenFile` before it
-   * is parsed, so a token the provider printed is never lost to a parsing
-   * failure and never re-minted: while an attempt's outcome is unproven, its
-   * creation record makes every retry `outcome_unknown`.
+   * Mint a service account as the operator: a service account cannot. The output is registered for redaction and
+   * written to `tokenFile` before it is parsed, so a token the provider printed is never lost to a parsing failure
+   * and never re-minted: while an attempt's outcome is unproven, its creation record makes every retry
+   * `outcome_unknown`.
    */
   async createServiceAccount(
     operator: OperatorIdentity,

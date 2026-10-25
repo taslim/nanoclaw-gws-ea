@@ -60,10 +60,7 @@ export interface MessageRetry {
   threadId: string | null;
 }
 
-/**
- * An inbound message as it arrived: its kind, the series a task belongs to,
- * its conversation, and its content, which names its sender.
- */
+/** An inbound message as it arrived; its content names its sender, and `seriesId` the series a task belongs to. */
 export interface InboundOrigin {
   id: string;
   kind: string;
@@ -74,7 +71,6 @@ export interface InboundOrigin {
   content: string;
 }
 
-/** A pending inbound message that waits for its `process_after`. */
 export interface WaitingMessage {
   id: string;
   /** Attempts so far: a retried message waits out its backoff. */
@@ -130,36 +126,28 @@ export interface InboundMailbox {
   replaceDestinations(entries: Destination[]): void;
   insertMessage(message: InboundMessage): Promise<void>;
   countDueMessages(): number;
-  /**
-   * How many due messages wait, waking nothing, as context for the next
-   * turn: pending non-trigger rows, excluding system tool replies and those
-   * on `exceptChannelType`.
-   */
+  /** Due messages that wake nothing and wait as context for the next turn, not counting `system` rows. */
   countUnreadContext(exceptChannelType: string): number;
   /**
-   * Release every held message: each becomes a pending trigger, due at
-   * `processAfter` (null: due now). With preserveTriggers, retain each row's
-   * original engagement instead. With preserveProcessAfter, retain each row's
-   * stored deadline. Returns how many it released.
+   * Every held message becomes a pending trigger due at `processAfter` (null:
+   * now). `preserveTriggers` keeps each row's own trigger; `preserveProcessAfter`
+   * keeps its stored `process_after`.
    */
   releaseHeldMessages(processAfter: string | null, options?: HeldReleaseOptions): number;
-  /**
-   * Settle every held message: each is completed unread, so no turn ever
-   * reads it and no later release brings it back. Returns how many it settled.
-   */
+  /** Completes every held message unread, so no turn reads it and no later release brings it back. */
   settleHeldMessages(): number;
-  /** Complete unread transferred pending/held rows only, after their durable destination insert. */
+  /** Completes the listed messages unread if they are still pending or held; any other status is left. */
   settleUnreadMessages(messageIds: readonly string[]): number;
   markMessageFailed(messageId: string): void;
   retryWithBackoff(messageId: string, backoffSec: number): void;
   getMessageForRetry(messageId: string, status: 'pending' | 'processing'): MessageRetry | undefined;
   /** Pending messages whose `process_after` is still ahead, soonest first. */
   getWaitingMessages(): WaitingMessage[];
-  /** Whether the mailbox holds a message with this id, whatever its status. */
+  /** Any status counts. */
   hasMessage(messageId: string): boolean;
   /** The messages with these ids, whatever their status, in the order they arrived; an id it lacks is left out. */
   getInboundMessages(messageIds: readonly string[]): InboundOrigin[];
-  /** Stable source identities and lifecycle facts, in arrival order, for resumable host cutovers. */
+  /** In arrival order; `since` is inclusive. */
   getInboundRecords(options?: { readonly since?: string; readonly status?: InboundStatus }): InboundRecord[];
   applyProcessingAcks(acks: ProcessingAck[]): void;
   getDeliveredIds(status?: 'delivered'): Set<string>;
@@ -197,9 +185,8 @@ export interface InboundMailbox {
 
 /** Host-visible outbound mailbox behavior. Storage layout and lifecycle are implementation-private. */
 export interface OutboundMailbox {
-  /** Stable outbound source rows since an inclusive timestamp, in arrival order. */
+  /** In arrival order; `since` is inclusive. */
   getOutboundRecords(since: string): OutboundRecord[];
-  /** Read one immutable container request by its exact outbound id. Host only. */
   getOutboundMessage(id: string): OutboundMessage | undefined;
   getTerminalProcessingAcks(): ProcessingAck[];
   getProcessingClaims(): ProcessingClaim[];
@@ -212,7 +199,7 @@ export interface OutboundMailbox {
 }
 
 export interface MailboxSession extends InboundMailbox, OutboundMailbox {
-  /** Latest successful delivered chat to this agent; failed and pending rows do not count. */
+  /** The latest chat to this agent marked delivered; failed and pending rows do not count. */
   getLatestDeliveredAgentReport(targetAgentGroupId: string): MailboxHistoryMessage | undefined;
 }
 

@@ -71,7 +71,7 @@ registerSignInMailDelivery(() => {
   throw new Error('Principal queue is provided by its own test.');
 });
 
-/** The assistant's web alias: its email on every site (KTD14). */
+/** The assistant's web alias: its email on every site. */
 const ALIAS = 'tnatsissa@example.com';
 
 let messages: GmailMessage[];
@@ -361,9 +361,9 @@ it('returns ambiguity when the interpreter cannot identify one credential', asyn
   expect(f.page.goto).not.toHaveBeenCalled();
 });
 
-describe("the assistant's email on a sign-in form (KTD14)", () => {
+describe("the assistant's email on a sign-in form", () => {
   it.each([
-    // Never an address the assistant converses from, even one the site filled in (R26).
+    // Never an address the assistant converses from, even one the site filled in.
     ['an address it converses from', 'Assistant@example.com', ALIAS],
     // The +tag spelling of the alias an account was registered with.
     ['a +tag of the alias', ' Tnatsissa+Shop@example.com ', 'tnatsissa+shop@example.com'],
@@ -374,7 +374,7 @@ describe("the assistant's email on a sign-in form (KTD14)", () => {
     expect(f.values).toEqual([email, '642981']);
   });
 
-  it('stops with alias_unavailable while no alias is recorded, before any wait or send (R23)', async () => {
+  it('stops with alias_unavailable while no alias is recorded, before any wait or send', async () => {
     await getDb().run('UPDATE gws_ea_profile SET assistant_alias = NULL WHERE singleton = 1');
     const f = fixture(true, 'assistant@example.com');
     await observePage(f.page);
@@ -615,7 +615,7 @@ it.each(['fill', 'restart'] as const)(
       'main',
       'browser',
     );
-    // The setting lists a second group: it may use the browser, but its relays reach only its own errands (R28, KTD15).
+    // The setting lists a second group: it may use the browser, but its relays reach only its own errands.
     writeBrowserAccess(`${root}/browser/policy.json`, { agentGroupIds: ['main', 'research'] });
     const source = (await resolveSystemSession('main', 'system:principal')).session;
     const research = (await resolveSystemSession('research', 'system:principal')).session;
@@ -808,7 +808,7 @@ describe('a signup waiting for its email verification', () => {
     expect(await takeSignupVerification(context(), 'attempt-1')).toEqual({ status: 'nothing_arrived' });
   });
 
-  it('watches a signup under the alias, and under a +tag of it, as mail to the assistant (KTD14)', async () => {
+  it('watches a signup under the alias, and under a +tag of it, as mail to the assistant', async () => {
     expect(await openSignupVerification({ ...signup, username: ALIAS })).toBe(true);
     expect(
       await openSignupVerification({

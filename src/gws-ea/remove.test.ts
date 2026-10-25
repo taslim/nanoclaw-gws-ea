@@ -840,7 +840,7 @@ describe('removal from any partial state', () => {
   });
 });
 
-describe("removal of the assistant's Google Chat subscription (KTD13)", () => {
+describe("removal of the assistant's Google Chat subscription", () => {
   const STARTED = [
     'materialize_checkout',
     'provision_gcp',
@@ -1896,7 +1896,7 @@ async function receiptOf(paths: ControlPlanePaths, input: InstanceReservationInp
   };
 }
 
-describe("removal of the assistant's 1Password resources (KTD9, AE5)", () => {
+describe("removal of the assistant's 1Password resources", () => {
   const STARTED = ['materialize_checkout', 'start_nanoclaw'] as const;
 
   async function setUp(options: Parameters<typeof assistantVault>[3] = {}) {

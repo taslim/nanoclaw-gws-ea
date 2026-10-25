@@ -50,10 +50,10 @@ export function getGatewayProvider(): GatewayProviderDefinition {
 let agentSkillsWithheld = false;
 
 /**
- * Withhold the gateway's agent skills from every agent. A module calls this
- * as it loads when its agents are taught their own way to the services the
- * gateway signs in to: the gateway's skill would teach a second one beside
- * it, connect links included. The gateway still carries the agents' traffic.
+ * Applies to every agent. A module calls this as it loads when its agents are
+ * taught their own way to the services the gateway signs in to: the gateway's
+ * skill would teach a second one beside it, connect links included. The
+ * gateway still carries the agents' traffic.
  */
 export function withholdGatewayAgentSkills(): void {
   agentSkillsWithheld = true;

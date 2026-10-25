@@ -1,4 +1,4 @@
-/** Inactive until the operator's shared host policy selects verified assets. */
+/** Recognition stays off until the operator's shared host policy selects verified assets. */
 import { realpath } from 'node:fs/promises';
 import path from 'node:path';
 import { extForMime } from '../../attachment-naming.js';
@@ -34,12 +34,7 @@ function failureReason(error: unknown): string {
   return 'recognition-failed';
 }
 
-/**
- * Whether a recording came in the principal's own private conversation: mail
- * on their own email conversation, or a verified principal user in a direct
- * message. An external-email thread is the inbox's, even for the principal's
- * own mail, and a shared space is never private.
- */
+/** The inbox is a shared conversation, so even the principal's own mail there is not private. */
 async function inPrincipalPrivateConversation(request: InboundPreparationRequest): Promise<boolean> {
   const conversation = request.messagingGroup;
   if (conversation.channel_type === EMAIL_CHANNEL_TYPE && conversation.platform_id === PRINCIPAL_PLATFORM_ID)
@@ -139,7 +134,7 @@ async function prepareRecord(
   return JSON.stringify(content);
 }
 
-/** Native content-only seam: caption, authority, and adapter source facts survive. */
+/** Touches only audio attachments' bytes, location, names and speech; the caption and adapter facts pass through. */
 export async function prepareVoiceContent(request: InboundPreparationRequest): Promise<string> {
   let value: unknown;
   try {

@@ -72,7 +72,7 @@ export async function recordChatSpeaker(chat: string, member: ChatMemberFact): P
       );
   });
 }
-/** Replace platform membership without replacing emails explicitly supplied in a handoff. */
+/** Replaces the stored roster with the platform's; a member still present keeps any email main or they supplied. */
 export async function refreshChatRoster(chat: string, members: readonly ChatMemberFact[]): Promise<void> {
   await getDb().transaction(async () => {
     const keys = new Set(members.map((member) => member.key));

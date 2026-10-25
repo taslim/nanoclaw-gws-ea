@@ -1,5 +1,5 @@
 /**
- * The inbox's migrations, squashed (R17, KTD11). Both live assistants applied
+ * The inbox's migrations, squashed. Both live assistants applied
  * an earlier chain under today's names (`testing/earlier-chain.ts`). The
  * runner skips a name already applied and ignores one it no longer
  * registers, so a fresh install builds today's tables directly, and an
@@ -43,7 +43,7 @@ const CALENDAR_ACCESS = 'module:gws-ea-inbox:calendar-access';
 const THREAD_ACCOUNTS = 'module:gws-ea-inbox:thread-accounts';
 const THREAD_PLACEMENT = 'module:gws-ea-inbox:thread-placement';
 
-/** The inbox's tables and its thread map's: the Slice 4 schema, and nothing of Slice 2's. */
+/** The inbox's tables and its thread map's after the squash, with none of the scheduling tables the earlier chain dropped. */
 const INBOX_TABLES = [
   'gws_ea_inbox_calendars',
   'gws_ea_inbox_messages',
@@ -57,7 +57,7 @@ const INBOX_TABLES = [
   'gws_ea_threads',
 ];
 
-/** Every table the inbox's migrations leave: the Slice 4 tables and those added since. */
+/** Every table the inbox's migrations leave: `INBOX_TABLES` and those later migrations add. */
 const ALL_INBOX_TABLES = [...INBOX_TABLES, 'gws_ea_inbox_unsigned_notices', 'gws_ea_inbox_calendar_access'].sort();
 
 /** The banned constructs of `src/db/migrations/portability.test.ts`, which covers built-in migrations only. */
@@ -149,7 +149,7 @@ function rowsOf(db: DbDriver): Record<string, unknown[]> {
   );
 }
 
-/** Work the earlier release wrote, through today's code: a row in every Slice 4 table. */
+/** Work the earlier release wrote, through today's code: a row in every `INBOX_TABLES` table. */
 async function writeSlice4Work(): Promise<void> {
   for (const [id, platformId] of [
     ['mg-inbox', INBOX_PLATFORM_ID],
@@ -238,11 +238,11 @@ describe('squashed migrations', () => {
   it.each([
     ['a fresh install', freshInstall],
     ['an install updated from the earlier chain', updatedInstall],
-  ])('leave %s only the inbox tables of Slice 4 and since, and no Slice 2 table', async (_install, install) => {
+  ])('leave %s only the inbox tables, and none of the dropped scheduling tables', async (_install, install) => {
     expect(inboxTables(await install())).toEqual(ALL_INBOX_TABLES);
   });
 
-  it('update an install on the earlier chain by dropping the holds, keeping every Slice 4 row, each thread with no account yet and handed over', async () => {
+  it('update an install on the earlier chain by dropping the holds, keeping every inbox row, each thread with no account yet and handed over', async () => {
     const db = await initSqliteTestDb();
     await runMigrations(db, earlierRelease());
     await writeSlice4Work();

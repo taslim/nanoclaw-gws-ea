@@ -29,7 +29,7 @@ export function purchaseMessage(kind: keyof typeof purchaseMessages): string {
 }
 
 /**
- * The answer of a checkout that changed after its third changed card: no fourth card; its job stops (R9).
+ * The answer of a checkout that changed after its third changed card: no fourth card; its job stops.
  * to: browser
  */
 export function checkoutChanging(change: string): Record<string, unknown> {
@@ -42,7 +42,7 @@ export function checkoutChanging(change: string): Record<string, unknown> {
 }
 
 /**
- * Why the host itself stopped a job: its checkout kept changing, or an incident's stop (KTD10).
+ * Why the host itself stopped a job: its checkout kept changing, or an incident's stop.
  * to: browser
  */
 function hostStop(

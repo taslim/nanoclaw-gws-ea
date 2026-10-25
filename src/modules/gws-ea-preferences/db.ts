@@ -29,10 +29,10 @@ export const PREFERENCE_SOURCES = ['principal', 'learned'] as const;
 export type PreferenceSource = (typeof PREFERENCE_SOURCES)[number];
 
 /**
- * Fields only `main` may read. A basis can quote the events a value was
- * learned from, and a reason says why the principal protects a time, so every
- * values read path (`getSchedulingPreferenceValues`, the project-document
- * summary, and any later compartment) leaves both out.
+ * Fields only `main` may read: a basis can quote the events a value was
+ * learned from, and a reason says why the principal protects a time. Every
+ * read but main's goes through `getSchedulingPreferenceValues`, which leaves
+ * both out.
  */
 export const MAIN_ONLY_PREFERENCE_FIELDS = ['basis', 'reason'] as const;
 export type MainOnlyPreferenceField = (typeof MAIN_ONLY_PREFERENCE_FIELDS)[number];
@@ -44,23 +44,22 @@ interface Provenance {
   readonly updated_at: string;
 }
 
-/** Hours for one weekday, or `off` when the principal does not work that day. Times are local `HH:MM`. */
+/** Times are local `HH:MM` in the principal's timezone. */
 export type WorkingHoursPreference = Provenance & { readonly weekday: Weekday } & (
     | { readonly off: false; readonly start: string; readonly end: string }
     | { readonly off: true }
   );
 
-/** A weekly time kept free, identified by its days and hours; `id` is its handle. */
+/** A weekly time kept free. No two windows share days and hours; `id` is the handle `ncl preferences` takes. */
 export interface ProtectedWindowPreference extends Provenance {
   readonly id: string;
   readonly weekdays: readonly Weekday[];
   readonly start: string;
   readonly end: string;
-  /** Why the principal protects it. Main-only. */
+  /** Main-only. */
   readonly reason: string | null;
 }
 
-/** The default length of a kind of meeting. */
 export interface MeetingLengthPreference extends Provenance {
   readonly meeting_kind: string;
   readonly minutes: number;
@@ -72,7 +71,6 @@ export interface BufferPreference extends Provenance {
   readonly minutes: number;
 }
 
-/** When a kind of meeting should preferably take place. */
 export interface PreferredTimePreference extends Provenance {
   readonly meeting_kind: string;
   readonly weekdays: readonly Weekday[];
@@ -88,7 +86,6 @@ export interface SchedulingPreferences {
   readonly preferred_times: readonly PreferredTimePreference[];
 }
 
-/** The stored shape of each kind of preference. */
 export interface PreferenceByKind {
   readonly 'working-hours': WorkingHoursPreference;
   readonly 'protected-window': ProtectedWindowPreference;
@@ -99,7 +96,7 @@ export interface PreferenceByKind {
 
 export type SchedulingPreference = PreferenceByKind[PreferenceKind];
 
-/** A preference without its main-only fields; distributes so each variant keeps its own value fields. */
+/** Distributes over a union, so each variant keeps its own value fields. */
 export type PreferenceValue<T> = T extends unknown ? Omit<T, MainOnlyPreferenceField> : never;
 
 export type SchedulingPreferenceValues = {
@@ -137,7 +134,7 @@ export type SetPreferenceInput = {
     } & ClockRangeInput)
 );
 
-/** Which preference to remove, and who is removing it: the principal, or the assistant on its own inference. */
+/** `source`: the principal, or the assistant on its own inference. */
 export type PreferenceTarget = { readonly source: string } & (
   | { readonly kind: 'working-hours'; readonly weekday: string }
   | { readonly kind: 'protected-window'; readonly id: string }
@@ -163,7 +160,6 @@ const WEEKDAY_ALIASES: ReadonlyMap<string, Weekday> = new Map(
   ]),
 );
 
-/** The tables keyed by kind of meeting, with the words their messages use. */
 const MEETING_KIND_TABLES = {
   'meeting-length': { table: 'gws_ea_pref_meeting_lengths', label: 'meeting length' },
   buffer: { table: 'gws_ea_pref_buffers', label: 'buffer' },
@@ -364,7 +360,7 @@ export async function getSchedulingPreferences(): Promise<SchedulingPreferences>
   };
 }
 
-/** The preference values with their source and update time, never their main-only basis or reason. */
+/** Never the main-only basis or reason. */
 export async function getSchedulingPreferenceValues(): Promise<SchedulingPreferenceValues> {
   const db = getDb();
   return {
@@ -383,9 +379,9 @@ export async function getSchedulingPreferenceValues(): Promise<SchedulingPrefere
 // ---------------------------------------------------------------------------
 
 /**
- * Store one preference, replacing the value it names. Rejects a value outside
- * its kind's shape. Whether a learned value should replace what the principal
- * said is main's judgment; the source and basis say which it was.
+ * Replaces the value it names whatever its source: whether a learned value
+ * should replace what the principal said is main's judgment, and the source
+ * and basis record which it was.
  */
 export function setSchedulingPreference<I extends SetPreferenceInput>(input: I): Promise<PreferenceByKind[I['kind']]>;
 export async function setSchedulingPreference(input: SetPreferenceInput): Promise<SchedulingPreference> {
@@ -544,11 +540,10 @@ export async function setSchedulingPreference(input: SetPreferenceInput): Promis
   }
 }
 
-/** Forget one preference, returning it to unset. Rejects a preference that is not set. */
+/** Throws when the preference is not set. */
 export async function removeSchedulingPreference(target: PreferenceTarget): Promise<RemovedPreference> {
   parseSource(target.source);
   const db = getDb();
-  /** Remove the one row `where` names. */
   const removeRow = async (table: string, where: string, key: string | number, missing: string) => {
     await db.transaction(async () => {
       if (!(await db.get(`SELECT 1 FROM ${table} WHERE ${where} = ?`, key))) throw new Error(missing);

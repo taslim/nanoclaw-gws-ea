@@ -1,21 +1,13 @@
 /**
- * The assistant's email on the web (KTD14; R20, R23, R25, R26). Its verified
- * alias is its email on every website: for its own accounts, which are in
- * its own name, and for bookings and checkouts made for the principal. The
- * addresses it converses from (its Workspace email, and the one Gmail
- * reports) never go onto a site. Whatever would put the assistant's email
- * on a site meets this:
- *
- * - text the browser types or selects, or an address it opens, that holds
- *   an address it converses from;
- * - a signup whose account is one;
- * - a sign-in by emailed code, where the host fills the email itself.
- *
- * Until gws-ea records an alias, each stops with `alias_unavailable`, so
- * main and the operator see that the assistant's setup is incomplete. Once
- * one is recorded, the first two are refused naming it, and a sign-in fills
- * it. A signup never opens an account under one of the principal's
- * addresses: their own accounts come only from their logins in 1Password.
+ * The assistant's email on the web. Its web alias is its email on every
+ * website: for its own accounts, which are in its own name, and for bookings
+ * and checkouts made for the principal. The addresses it converses from (its
+ * Workspace email, and the one Gmail reports) never go onto a site, and no
+ * signup opens an account under one of the principal's addresses: their own
+ * accounts come only from their logins in 1Password. Until gws-ea records an
+ * alias, whatever would put the assistant's email on a site stops with
+ * `alias_unavailable`, which tells the agent the assistant's setup is
+ * incomplete.
  */
 import { forbidden, invalidArgs } from '../../cli/delivery-action.js';
 import { getDb } from '../../db/connection.js';
@@ -23,20 +15,18 @@ import { identityMatchKey } from '../../gws-ea/validation.js';
 import { assistantAddressesOf } from '../gws-ea-inbox/runtime.js';
 import { getGwsEaProfile } from '../gws-ea-profile/db.js';
 
-/** An email address as people write one in text. */
 const WRITTEN_ADDRESS = /[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}/gu;
 
-/** One mailbox in every spelling that reaches it (`identityMatchKey`): any case, any +tag. */
+/** One mailbox in every spelling that reaches it (`identityMatchKey`): any case, any +tag, Gmail's dots. */
 function mailbox(address: string): string {
   return identityMatchKey(`email:${address.trim()}`);
 }
 
 interface WebIdentity {
-  /** The configured alias, or null until gws-ea records one. */
+  /** Null until gws-ea records the alias the operator confirmed. */
   readonly alias: string | null;
   /** Whether `address` reaches the assistant's mailbox other than through its alias: an address it converses from. */
   conversesFrom(address: string): boolean;
-  /** Whether `address` reaches one of the principal's mailboxes. */
   reachesPrincipal(address: string): boolean;
 }
 
@@ -57,8 +47,7 @@ async function webIdentity(): Promise<WebIdentity> {
  * What a browser batch meets when the text it gives a site (what it types or
  * selects, and the addresses it opens with their query decoded) holds an
  * address the assistant converses from: `alias_unavailable` while no alias is
- * recorded, and a refusal naming the alias once one is. Reads nothing unless
- * some of that text is written like an email address.
+ * recorded, and a refusal naming the alias once one is.
  */
 export async function givenAddressStop(texts: readonly string[]): Promise<'alias_unavailable' | undefined> {
   const written = texts.flatMap((text) => text.match(WRITTEN_ADDRESS) ?? []);
@@ -72,11 +61,11 @@ export async function givenAddressStop(texts: readonly string[]): Promise<'alias
 }
 
 /**
- * What a signup under `username` meets (R20, R23, R25): a refusal under one
- * of the principal's addresses, in any spelling that reaches theirs; under
- * an address the assistant converses from, `alias_unavailable` while no
- * alias is recorded and a refusal naming the alias once one is. Any other
- * username, the alias in any spelling included, may open an account.
+ * What a signup under `username` meets: a refusal under one of the
+ * principal's addresses, in any spelling that reaches theirs; under an
+ * address the assistant converses from, `alias_unavailable` while no alias is
+ * recorded and a refusal naming the alias once one is. Any other username,
+ * the alias in any spelling included, may open an account.
  */
 export async function signupAccountStop(username: string): Promise<'alias_unavailable' | undefined> {
   const identity = await webIdentity();
@@ -92,10 +81,10 @@ export async function signupAccountStop(username: string): Promise<'alias_unavai
 }
 
 /**
- * The email a sign-in by emailed code gives the site (R26): the alias, in
- * the spelling the field already holds when that reaches it (an account
- * opened under a +tag of it), never an address the assistant converses
- * from; undefined while no alias is recorded.
+ * The email a sign-in by emailed code gives the site: the alias, in the
+ * spelling the field already holds when that reaches it (an account opened
+ * under a +tag of it), never an address the assistant converses from;
+ * undefined while no alias is recorded.
  */
 export async function signInAddress(current: string): Promise<string | undefined> {
   const { alias } = await webIdentity();
@@ -104,7 +93,7 @@ export async function signInAddress(current: string): Promise<string | undefined
   return mailbox(held) === mailbox(alias) ? held : alias;
 }
 
-/** The assistant's verified web address, or null until gws-ea records one: a card names it as the assistant's. */
+/** Null until gws-ea records the alias the operator confirmed. */
 export async function assistantWebAddress(): Promise<string | null> {
   return (await webIdentity()).alias;
 }

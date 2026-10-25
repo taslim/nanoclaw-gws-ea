@@ -193,11 +193,9 @@ export interface RoutingContext {
    *  `<message to>` blocks are inert and the final text auto-appends to the
    *  series run log. */
   taskRun: boolean;
-  /** Every row in the batch is a scheduled task (echo rows aside). A task run,
-   *  unless each task was created to come back in its conversation: then it
-   *  is a turn like any other, except that its prose outside a block is
-   *  scratchpad, never nudged, so a task with nothing to say stays quiet;
-   *  absent is no. */
+  /** Every row in the batch is a scheduled task (echo rows aside). When such
+   *  a batch is not a task run, its prose outside a block is scratchpad, never
+   *  nudged, so a task with nothing to say stays quiet; absent is no. */
   tasksOnly?: boolean;
   /** Every non-echo row that woke this turn is a failure notice. */
   failureNoticeWake?: boolean;
@@ -207,16 +205,16 @@ export interface RoutingContext {
    */
   personWaiting?: boolean;
   /**
-   * The ids of the messages the turn answers, context that rode along
-   * included. Its failure report and each message it writes to a person name
-   * them, so the host can tell whose they were; absent is none.
+   * The ids of the messages the turn answers, trigger=0 context included but
+   * no session-echo row. Its failure report and each message it writes to a
+   * person name them, so the host can tell whose they were; absent is none.
    */
   batch?: readonly string[];
-  /** One unambiguous thread per A2A peer in this batch; null means ambiguous. */
+  /** The thread per A2A peer in this batch; null when the peer's rows name different threads or none. */
   agentThreads?: Readonly<Record<string, string | null>>;
 }
 
-/** The messages a turn over `messages` answers: all but other conversations' echoes. */
+/** Leaves out every session-echo row, this conversation's own dm/channel-timeline history included. */
 export function batchOf(messages: readonly MessageInRow[]): string[] {
   return messages.filter((m) => !isSessionEcho(m)).map((m) => m.id);
 }
@@ -236,8 +234,7 @@ export function extractRouting(messages: MessageInRow[]): RoutingContext {
   const waking = nonEcho.filter((m) => m.trigger !== 0);
   const preferred = nonEcho[0] && isFailureNotice(nonEcho[0]) ? waking.find((m) => !isFailureNotice(m)) : undefined;
   const first = preferred ?? nonEcho[0] ?? messages[0];
-  // Echo rows riding along with a task must not disable one-door delivery:
-  // at least one task row and no non-task/non-echo row.
+  // Echo rows riding along with a task must not disable one-door delivery.
   const tasksOnly =
     messages.some((m) => m.kind === 'task') && messages.every((m) => m.kind === 'task' || isSessionEcho(m));
   const agentThreads: Record<string, string | null> = {};
@@ -349,7 +346,7 @@ function formatPrincipalMark(value: unknown): string {
 interface ReactionContent {
   /** The emoji by the name add_reaction takes (thumbs_up). */
   emoji: string;
-  /** The message reacted to: an excerpt, and whether it is the agent's own (self). */
+  /** `self` marks the agent's own message. */
   target: { self: boolean; sender: string; excerpt: string };
 }
 
@@ -367,11 +364,7 @@ function readReaction(value: unknown): ReactionContent {
   };
 }
 
-/**
- * Render a reaction someone placed on a message: who, the emoji, and an
- * excerpt of the message, from "you" when it is the agent's own. Never a
- * <message>: there is nothing written to reply to, and no id to react to.
- */
+/** Never a <message>: there is nothing written to reply to, and no id to react to. */
 function formatReaction(msg: MessageInRow, reactor: unknown, value: unknown): string {
   const { emoji, target } = readReaction(value);
   const sender = typeof reactor === 'string' && reactor ? reactor : 'Unknown';
@@ -550,11 +543,10 @@ const NOT_LISTENED_ELSEWHERE =
   "You can't listen to this recording here. Its sender expects you heard it, so if it bears on the thread, say you couldn't listen to it and ask them to put it in writing, without saying why; handle the rest of the message as usual.";
 
 /**
- * The status line of a recording that was not heard, worded for its reader.
- * Its sender believes it was heard, so each line says to tell them and what
- * to ask for, or silence would read as if it had been. Only the principal's
- * own private conversation, as the host marked it, hears that their operator
- * can change it; a missing mark reads as anywhere else.
+ * Its sender believes the recording was heard, so each line says to tell them
+ * and what to ask for, or silence would read as if it had been. Only the
+ * principal's own private conversation, as the host marked it, hears that
+ * their operator can change it; a missing mark reads as anywhere else.
  */
 function speechStatusLine(speech: Record<string, unknown>): string {
   const principals = speech.inPrincipalPrivateConversation === true;

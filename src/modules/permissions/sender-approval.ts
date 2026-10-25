@@ -113,7 +113,7 @@ export async function requestSenderApproval(input: RequestSenderApprovalInput): 
   }
 
   const approvalId = generateId();
-  // Their id first, as the host holds it; the names they and the conversation go by, quoted.
+  // The host-held id leads; the sender's and conversation's names are someone else's text, so they are quoted.
   const who = describeSender(senderIdentity, senderName, 'Someone');
   const where = originMg?.name ? quoted(originMg.name, NAME_LIMIT) : `a ${originChannelType} conversation`;
 

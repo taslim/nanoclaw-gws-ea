@@ -85,9 +85,9 @@ import { assistantWebAddress } from './web-address.js';
 
 export const PURCHASE_APPROVAL = 'browser_purchase';
 export const PURCHASE_CARD_LIFE_MS = 24 * 60 * 60 * 1000;
-/** How many presses one approval covers on a checkout whose steps each ask to commit (KTD3). */
+/** How many presses one approval covers on a checkout whose steps each ask to commit. */
 const MAX_APPROVED_PRESSES = 3;
-/** How many changed cards one checkout gets before its job stops (R9). */
+/** How many changed cards one checkout gets before its job stops. */
 const MAX_CHANGED_CARDS = 3;
 let getPurchaseQueue: (() => BrowserQueue) | undefined;
 let commitsReady = false;
@@ -136,9 +136,9 @@ interface CheckoutConsent {
 }
 
 /**
- * The consent engine's pass on the checkout's form (KTD11): every choice the engine owns made, the agreements
- * the principal approved ticked, and what only the card can approve read for it. Inside a purchase the engine
- * never stops: its exceptions are the card's.
+ * The consent engine's pass on the checkout's form: every choice the engine owns made, the agreements the principal
+ * approved ticked, and what only the card can approve read for it. Inside a purchase the engine never stops: its
+ * exceptions are the card's.
  */
 async function checkoutConsent(
   context: BrowserExecutionContext,
@@ -245,7 +245,7 @@ export function purchaseBounds(payload: Record<string, unknown>, principalTimeZo
   };
 }
 
-/** The cards a job's checkout on `site` was sent again for, each naming what changed (R9). */
+/** How many cards a job's checkout on `site` was sent again for, each naming what changed. */
 async function changedCards(db: DbDriver, jobId: string, site: string): Promise<number> {
   const cards = await db.all<{ facts_json: string }>(
     'SELECT facts_json FROM gws_ea_browser_purchase_cards WHERE job_id = ? AND change_text IS NOT NULL',
@@ -255,9 +255,9 @@ async function changedCards(db: DbDriver, jobId: string, site: string): Promise<
 }
 
 /**
- * A purchase that waits on an earlier one on its merchant (KTD9, AE4): browsing the site goes on, and the host
- * wakes the job once main records the earlier one's outcome. An earlier one settled between the refusal and this
- * wait leaves the checkout to be read afresh.
+ * A purchase that waits on an earlier one on its merchant: browsing the site goes on, and the host wakes the job
+ * once the earlier one's outcome is recorded. An earlier one settled between the refusal and this wait leaves the
+ * checkout to be read afresh.
  */
 async function waitOnEarlierPurchase(
   context: BrowserExecutionContext,
@@ -269,7 +269,7 @@ async function waitOnEarlierPurchase(
     : { status: 'checkout_lapsed', repeat_safe: true };
 }
 
-/** Stops a job whose checkout kept changing (R9): its cards are withdrawn and its page closed. The agent reports. */
+/** Stops a job whose checkout kept changing: its cards are withdrawn and its page closed. The agent reports. */
 async function stopChangingCheckout(context: BrowserExecutionContext): Promise<void> {
   const stop = await context.store.db.transaction(() =>
     cancelBrowserJobInTransaction(context.job.thread_id, context.store),
@@ -316,7 +316,7 @@ async function requestPurchaseCard(
   });
   if (decision.effect === 'deny') throw forbidden(decision.reason);
   if (decision.effect !== 'hold') throw forbidden(purchaseMessage('notHeld'));
-  // The card's picture (KTD6), taken before anything durable changes; null leaves the card saying it is unavailable.
+  // The card's picture, taken before anything durable changes; null leaves the card saying it is unavailable.
   const picture = await checkoutPicture(context, facts);
   const expires = new Date(Date.now() + PURCHASE_CARD_LIFE_MS).toISOString();
   const detached = await db.transaction(async () => {
@@ -373,7 +373,7 @@ async function requestPurchaseCard(
   });
   // A synchronous card click may already have created the authority; never reopen its logical card.
   if (approvalId) {
-    // The principal has now seen main's recorded answers on this site: no later card repeats them.
+    // The principal has now seen this site's recorded not-placed answers: no later card repeats them.
     await authorities.markRecordedShown(detached.recorded, id);
     const posted = await getPendingApproval(approvalId);
     if (posted)
@@ -508,7 +508,7 @@ registerApprovalResolvedHandler(async (event) => {
 
 /**
  * What proves a press placed its purchase, and the merchant's record of it: a reviewed signature's record, or a
- * generic checkout's confirmation page (KTD4, KTD8), whose contact email keys the order number.
+ * generic checkout's confirmation page, whose contact email keys the order number.
  */
 async function verifyPlaced(
   page: Page,
@@ -530,7 +530,7 @@ async function verifyPlaced(
   };
 }
 
-/** A checkout's next step after an approved press that placed nothing (KTD3). */
+/** A checkout's next step after an approved press that placed nothing. */
 type CheckoutStep =
   /** Another step to press under the same approval. */
   | { kind: 'next'; element: ElementHandle; facts: PurchaseFacts }
@@ -542,9 +542,9 @@ type CheckoutStep =
   | { kind: 'unconfirmed' };
 
 /**
- * Reads a generic checkout after an approved press that placed nothing (KTD3). It presses on only when the page
- * moved to a different step (the pressed control gone, or the commit label changed), shows no error or decline
- * wording, and nothing material changed.
+ * Reads a generic checkout after an approved press that placed nothing. It presses on only when the page moved to a
+ * different step (the pressed control gone, or the commit label changed), shows no error or decline wording, and
+ * nothing material changed.
  */
 async function nextCheckoutStep(
   context: BrowserExecutionContext,
@@ -596,7 +596,7 @@ function unreadyCommit(read: Exclude<MerchantCheckoutRead, { status: 'ready' }>)
   }
 }
 
-/** Shared by purchase, recipes and native watches. The optional claim joins the same DB-only commit transaction. */
+/** The optional claim joins the same DB-only commit transaction. */
 export async function executeAuthorizedPurchase(
   context: BrowserExecutionContext,
   authorityId: string,
@@ -644,7 +644,6 @@ export async function executeAuthorizedPurchase(
         },
       );
     };
-    /** The outcome is told to the job, and the merchant's site goes to its waiters. */
     const settle = async (outcome: Record<string, unknown>): Promise<Record<string, unknown>> => {
       await notifyPurchaseOutcome(authority.id, store);
       await context.wakeWaiters(
@@ -685,7 +684,7 @@ export async function executeAuthorizedPurchase(
         await store.begin(context, authority.id, withConsent(immediate.facts, consent), commitClaim);
         marked = true;
       });
-      // An approval covers the checkout, not one control (KTD3): a middle step is pressed on, up to three presses.
+      // An approval covers the checkout, not one control: a middle step is pressed on, up to three presses.
       for (let presses = 1; ; presses++) {
         const placed = await verifyPlaced(page, authority, store, facts);
         if (placed) {
@@ -744,7 +743,7 @@ export async function executeAuthorizedPurchase(
           await store.continueCommit(context, authority.id, withConsent(immediate.facts, consent));
         });
       }
-      // No page proof either way: main settles it from the merchant's email or the principal (KTD8).
+      // No page proof either way: its outcome is recorded later, from the merchant's email or the principal.
       return settle(await store.unconfirm(authority.attempt_id));
     } catch (error) {
       if (marked) return settle(await store.unconfirm(authority.attempt_id));
@@ -776,8 +775,8 @@ export async function executeAuthorizedPurchase(
 }
 
 /**
- * A commit the host presses itself (KTD3, R3): an unreviewed checkout read as free, or a reviewed reservation
- * free by the same test, with the reviewed signature that reads it and proves its outcome.
+ * A commit the host presses itself: an unreviewed checkout read as free, or a reviewed reservation free by the same
+ * test, with the reviewed signature that reads it and proves its outcome.
  */
 type FreeCommit =
   | { readonly kind: 'generic'; readonly facts: FreeCommitFacts; readonly element: ElementHandle }
@@ -789,8 +788,8 @@ type FreeCommit =
     };
 
 /**
- * Whether a reviewed reservation is free by the test any site's booking takes (KTD3, R3): its reviewed facts
- * state no money and no terms, and nothing on the page offers or holds a way to pay. An unreadable page is not.
+ * Whether a reviewed reservation is free by the test any site's booking takes: its reviewed facts state no money and
+ * no terms, and nothing on the page offers or holds a way to pay. An unreadable page is not.
  */
 async function freeReservation(page: Page, facts: PurchaseFacts, element: ElementHandle): Promise<boolean> {
   if (!isFreeReservation(facts)) return false;
@@ -802,7 +801,6 @@ async function freeReservation(page: Page, facts: PurchaseFacts, element: Elemen
   }
 }
 
-/** Whether a re-read shows the same free commit: still free, and nothing about it changed. */
 async function stillFree(page: Page, free: FreeCommit, latest: MerchantPurchaseRead): Promise<boolean> {
   switch (free.kind) {
     case 'generic':
@@ -821,11 +819,9 @@ async function stillFree(page: Page, free: FreeCommit, latest: MerchantPurchaseR
 }
 
 /**
- * A free commit (KTD3): the host presses it itself, with no card. Like any purchase it waits on an earlier one
- * on its merchant (KTD9). It runs the consent check, writes a money-less attempt, presses, and reads the
- * booking's outcome: a reviewed signature's merchant record, or the page's confirmation, where one that shows a
- * charge after it is spending nobody approved (KTD10). With no proof either way it is unconfirmed, for main to
- * settle (KTD8).
+ * A free commit: the host presses it itself, with no card. Like any purchase it waits on an earlier one on its
+ * merchant. Its proof is a reviewed signature's merchant record or the page's confirmation, and a confirmation that
+ * shows a charge is spending nobody approved. With no proof either way it is unconfirmed.
  */
 async function commitFree(
   context: BrowserExecutionContext,
@@ -838,7 +834,7 @@ async function commitFree(
   const scope = { jobId: context.job.id, db };
   if (await store.waitOnEarlier(context.job.id, free.facts.site))
     return { answer: { status: 'waiting_on_earlier', site: free.facts.site, repeat_safe: true } };
-  // The consent engine's check, as before any submission (KTD11): every choice it owns made, or a stop.
+  // The consent engine's check, as before any submission: every choice it owns made, or a stop.
   const consent = await runConsentPass(page, free.element, { scope, assertActive: context.assertActive });
   if (consent.status === 'consent_required')
     return {
@@ -871,7 +867,7 @@ async function commitFree(
         await arrived;
       },
       {
-        // A reviewed flow admits its own exact control; a generic press its checkout origin (KTD4).
+        // A reviewed flow admits its own exact control; a generic press its checkout origin.
         ...(free.kind === 'generic' ? { checkout: { origin: free.facts.origin } } : {}),
         async commitStarted() {
           await context.assertActive();
@@ -890,7 +886,7 @@ async function commitFree(
             const at = new Date().toISOString();
             await markBrowserRequestCommitStarted(db, context.request.id, at);
             // Its account key: a generic checkout's contact email, or a reviewed merchant's account, as a paid
-            // attempt's is, under which an order number proves one attempt only (KTD8).
+            // attempt's is, under which an order number proves one attempt only.
             await db.run(
               `INSERT INTO gws_ea_browser_free_attempts(id,job_id,request_id,site,platform,account_key,facts_json,attempted_at)
               VALUES(?,?,?,?,?,?,?,?)`,
@@ -903,8 +899,8 @@ async function commitFree(
               JSON.stringify(free.facts),
               at,
             );
-            // A free table on a region watch's site spends the one booking of a watch it is within (KTD20);
-            // region watches live only on sites without a reviewed reader.
+            // A free table on a region watch's site spends the one booking of a watch it is within; region
+            // watches live only on sites without a reviewed reader.
             if (free.kind === 'generic' && freeCommitBooks(free.facts)) {
               await claimRegionWatchCommit(db, {
                 jobId: context.job.id,
@@ -961,7 +957,7 @@ async function commitFree(
   }
   const evidence = page.isClosed() ? undefined : await readConfirmation(page);
   // The merchant's own confirmation proves the booking, unless its number already proves another under the same
-  // contact email (KTD8).
+  // contact email.
   const confirmed =
     evidence !== undefined &&
     confirmsOnSite(evidence, free.facts.site, free.facts.platform) &&
@@ -990,16 +986,16 @@ async function commitFree(
 }
 
 /**
- * The purchase door (KTD3): the host reads the checkout the target commits and decides, in order, a free commit
- * it presses itself, a checkout that needs a card, one whose facts are incomplete, one that waits on an earlier
- * purchase on its merchant (KTD9), or a card for the principal.
+ * The purchase door: the host reads the checkout the target commits and decides, in order, a free commit it presses
+ * itself, a checkout that needs a card, one whose facts are incomplete, one that waits on an earlier purchase on its
+ * merchant, or a card for the principal.
  */
 export async function executeBrowserPurchase(
   context: BrowserExecutionContext,
   payload: Record<string, unknown>,
 ): Promise<Record<string, unknown>> {
   const page = await context.page();
-  // Spending nobody approved stops the job once its operation has ended (KTD10), as an ordinary press's does.
+  // Spending nobody approved stops the job once its operation has ended, as an ordinary press's does.
   const found: { unapproved?: UnapprovedCommit } = {};
   try {
     const answer = await withBrowserJobNavigation(context, page, async () => {
@@ -1041,7 +1037,7 @@ export async function executeBrowserPurchase(
             throw new Error(purchaseInvariantMessage('checkout', unknown));
           }
         }
-        // The merchant keeps its lease through a payment platform's own page (KTD7).
+        // The merchant keeps its lease through a payment platform's own page.
         if (read.facts.generic) {
           const lease = await new SiteLeaseStore(context.store.db).acquire(
             context.job.id,
@@ -1060,7 +1056,7 @@ export async function executeBrowserPurchase(
             : { ...watch, repeat_safe: false };
         const live = await store.liveForJob(context.job.id);
         if (live) return executeAuthorizedPurchase(context, live.id);
-        // A reviewed reservation free by the test any site's booking takes is the host's to press, with no card (R3).
+        // A reviewed reservation free by the test any site's booking takes is the host's to press, with no card.
         if (await freeReservation(page, facts, read.element)) {
           const free = await commitFree(context, page, {
             kind: 'reviewed',
@@ -1071,7 +1067,7 @@ export async function executeBrowserPurchase(
           found.unapproved = free.unapproved;
           return free.answer;
         }
-        // Another purchase on the merchant waits until main records the earlier one's outcome (KTD9, AE4).
+        // Another purchase on the merchant waits until the earlier one's outcome is recorded.
         if (await store.waitOnEarlier(context.job.id, facts.site))
           return { status: 'waiting_on_earlier', site: facts.site, repeat_safe: true };
         const bounds = purchaseBounds(payload, await principalClock());
@@ -1193,12 +1189,12 @@ async function enqueuePurchaseCommit(queue: BrowserQueue, id: string): Promise<v
     pending.generation,
   );
 }
-/** Must run before generic queue.start() interrupts the old request rows. */
+/** Must run before the startup sweep answers the old request rows interrupted. */
 export async function recoverBrowserPurchases(queue: BrowserQueue): Promise<void> {
   commitsReady = false;
   if (!(await queue.store.db.hasTable('gws_ea_browser_authorities'))) return;
   const store = new PurchaseAuthorityStore(queue.store.db);
-  // A press the stop cut off, paid or free, has no page proof either way: it is unconfirmed (KTD8).
+  // A press the stop cut off, paid or free, has no page proof either way: it is unconfirmed.
   for (const id of await store.unsettled()) await store.unconfirm(id);
   // Site blocks follow the attempts' own resolutions, so a resolved attempt never blocks its site again.
   await store.db.transaction(async () => {
@@ -1279,7 +1275,7 @@ export async function sweepBrowserPurchaseState(queue: BrowserQueue): Promise<vo
   await notifyPendingUnconfirmed(store.db);
   await notifyPurchaseWaiters(store.db);
 }
-/** Queue interruption calls this before publishing an uncertain marked request's answer: its press is unconfirmed. */
+/** The queue calls this before publishing an unconfirmed answer to a request whose commit had started. */
 export async function recordUnknownBrowserPurchaseRequest(requestId: string): Promise<void> {
   if (!(await getDb().hasTable('gws_ea_browser_authorities'))) return;
   const store = new PurchaseAuthorityStore();

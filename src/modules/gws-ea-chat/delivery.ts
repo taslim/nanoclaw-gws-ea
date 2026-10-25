@@ -1,9 +1,8 @@
 /**
- * The assistant's Chat delivery (KTD2, KTD3): the subscription supervisor
- * and the pull consumer, which the Chat channel starts when it initializes
- * and stops when it disconnects. The consumer hands each lifecycle event
- * about a subscription to the supervisor, and every Chat event to the
- * channel, whichever subscription it came through.
+ * The subscription supervisor and the pull consumer, which the Chat channel
+ * starts when it initializes and stops when it disconnects. A Chat event goes
+ * to the channel whichever subscription it came through, so one retained from
+ * an expired subscription is still handled.
  */
 import { hostGoogleAccessToken } from '../gws-ea-google/index.js';
 import type { ChatDeliveryConfig } from './config.js';
@@ -14,17 +13,10 @@ import { isSubscriptionLifecycleEvent, startSubscriptionSupervisor } from './sub
 
 export interface ChatDeliveryOptions {
   readonly config: ChatDeliveryConfig;
-  /**
-   * Handles one Chat event (a message or reaction, single or batched). It
-   * resolves once the event is routed, answered, or found permanent, and
-   * rejects when Pub/Sub must deliver it again.
-   */
+  /** Resolves once the event is handled; rejecting leaves it for Pub/Sub to deliver again. */
   readonly onChatEvent: (event: WorkspaceEvent) => Promise<void>;
-  /** The assistant's Chat token; the host's own by default. */
   readonly assistantToken?: () => Promise<string>;
-  /** The subscriber's Pub/Sub token; minted from the configured key file by default. */
   readonly subscriberToken?: () => Promise<string>;
-  /** Where health is recorded; this host's by default. */
   readonly health?: ChatHealthRecorder;
   readonly fetch?: typeof globalThis.fetch;
 }

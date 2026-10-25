@@ -13,7 +13,7 @@ const safeMultiline = (text: string) =>
 
 const safe = (text: string) => safeMultiline(text.replace(/[\r\n]/g, ' '));
 
-/** A summary's resource as shown: an HTTP request's method, host, and path, never its query or fragment. */
+/** An HTTP resource is shown as method, host and path, never its query or fragment. */
 export function gatewayRequestResource(resource: string): string {
   return /^(?:[A-Z]+ |https?:)/.test(resource) ? (resource.split(/[?#]/, 1)[0] ?? resource) : resource;
 }

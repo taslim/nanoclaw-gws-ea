@@ -1,8 +1,5 @@
 /**
- * The inbox's own tables (see migration.ts): its state, each message seen,
- * each sender's hourly count, the principal's calendars, what the assistant
- * can do with each principal address's calendar, and the unsigned mail in
- * the principal's name they were told of. The thread map has its own module
+ * The inbox's own tables (migration.ts); the thread map has its own module
  * (thread-map.ts). Every timestamp is passed in as an ISO string; SQL never
  * reads the clock.
  */
@@ -109,7 +106,6 @@ export async function isReservedSignInMail(gmailMessageId: string): Promise<bool
   return row?.outcome === 'browser-sign-in';
 }
 
-/** Where routing left a message, as its settled record names it. */
 export type RouteOutcome =
   | 'own'
   | 'browser-sign-in'
@@ -129,7 +125,7 @@ export type RouteOutcome =
   | 'workspace-note'
   | 'set-aside';
 
-/** Record where a message was routed. Its routing attempts end here. */
+/** Its routing attempts end here. */
 export async function settleMessage(gmailMessageId: string, outcome: RouteOutcome, at: string): Promise<void> {
   await getDb().run(
     `INSERT INTO gws_ea_inbox_messages (gmail_message_id, outcome, attempts, first_seen_at, settled_at)
@@ -143,7 +139,6 @@ export async function settleMessage(gmailMessageId: string, outcome: RouteOutcom
   );
 }
 
-/** Count one failed attempt to route a message; returns the attempts so far. */
 export async function recordFailedAttempt(gmailMessageId: string, at: string): Promise<number> {
   const db = getDb();
   await db.run(
@@ -168,7 +163,6 @@ export async function pruneSettledMessages(before: string): Promise<void> {
 // Per-sender rate
 // ---------------------------------------------------------------------------
 
-/** Count one message from `sender` in the window; returns the window's count. */
 export async function countSenderMessage(sender: string, windowStart: string): Promise<number> {
   const db = getDb();
   await db.run(
@@ -229,7 +223,6 @@ export async function replacePrincipalCalendars(calendarIds: readonly string[], 
  */
 export type CalendarAccess = 'bookable' | 'readable' | 'free-busy' | 'none';
 
-/** One address's calendar access as the calendar poll keeps it (see migration.ts). */
 export interface CalendarAccessRecord {
   /** The address as the principal listed it. */
   readonly address: string;
@@ -240,7 +233,6 @@ export interface CalendarAccessRecord {
   readonly hostAdded: boolean;
   /** When Google last answered for it. */
   readonly checkedAt: string;
-  /** When its access last changed. */
   readonly changedAt: string;
   /** The access main is taken to know: the first reading and every rise, and a drop once main is told of it. */
   readonly toldAccess: CalendarAccess;
@@ -311,7 +303,6 @@ export async function deleteCalendarAccess(address: string): Promise<void> {
   await getDb().run('DELETE FROM gws_ea_inbox_calendar_access WHERE address = ?', address);
 }
 
-/** One principal address's calendar access as main and status read it. */
 export interface AddressCalendarAccess {
   readonly address: string;
   /** `unchecked` until the calendar poll first reads it. */
@@ -321,10 +312,9 @@ export interface AddressCalendarAccess {
 }
 
 /**
- * Each of the `listed` addresses, in order, with its calendar access as the
- * calendar poll last read it from Google. The store alone, never Google: main
- * listing the addresses and status reading the inbox's health see the same
- * facts. Without the inbox's tables, every address is unchecked.
+ * As the calendar poll last read it, from the store alone, never Google, so
+ * every reader sees the same facts. Without the inbox's tables, every address
+ * is unchecked.
  */
 export async function principalCalendarAccess(listed: readonly string[]): Promise<AddressCalendarAccess[]> {
   const records = (await getDb().hasTable('gws_ea_inbox_calendar_access')) ? await listCalendarAccess() : [];

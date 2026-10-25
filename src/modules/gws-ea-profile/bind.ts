@@ -1,4 +1,4 @@
-/** Host-owned principal binding primitives shared by Google Chat and WhatsApp. No module entrypoint imports. */
+/** Principal binding shared by the channels that verify a principal. It imports no module entry point. */
 import { randomUUID } from 'node:crypto';
 
 import { getDb } from '../../db/connection.js';
@@ -40,7 +40,7 @@ export async function bindPrincipalIdentity(input: {
   });
 }
 
-/** Called only after the linking owner's authenticated phone-and-code proof. Never opens or sends a DM. */
+/** Call only after the principal's authenticated phone-and-code proof. Never opens or sends a DM. */
 export async function bindWhatsAppPrincipal(
   person: WhatsAppPerson,
   verifiedAt: string,

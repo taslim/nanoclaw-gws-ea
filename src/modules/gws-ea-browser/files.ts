@@ -22,10 +22,7 @@ const close = promisify(fs.close);
 export const BROWSER_DOWNLOAD_MAX_BYTES = 100 * 1024 * 1024;
 export const BROWSER_JOB_DOWNLOAD_MAX_BYTES = 500 * 1024 * 1024;
 
-/**
- * Make a directory's entries durable. Opened without following its last name
- * and without blocking, so a container-made link or FIFO there costs nothing.
- */
+/** Opened without following its last name and without blocking, so a container-made link or FIFO costs nothing. */
 async function syncDirectory(directory: string): Promise<void> {
   const handle = await open(
     directory,
@@ -390,7 +387,7 @@ export async function captureBrowserDownload(
       await activate();
       download = await event;
       if (overCap) await download.cancel();
-      // CDP reports Playwright's fixed artifacts directory, while allowAndName uses our request directory.
+      // CDP reports Playwright's fixed artifacts directory, while allowAndName uses this request's directory.
       const guid = path.basename(await download.path());
       if (!/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/iu.test(guid))
         throw new Error('Invalid native download identity');

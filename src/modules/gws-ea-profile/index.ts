@@ -88,12 +88,11 @@ function principalAddressesSentence(principal: string, emails: readonly string[]
     : ` ${principal}'s email addresses are ${quoted}.`;
 }
 
-/** An address quoted exactly in a code span when it can be. */
 function quotedAddress(email: string): string {
   return email.includes('`') ? escapeMarkdownInline(email) : `\`${email}\``;
 }
 
-/** The assistant's own address, where the principal shares calendars; quoted exactly when it can be. */
+/** The assistant's own address, where the principal shares calendars. */
 function assistantAddressSentence(assistant: string, email: string | null): string {
   if (email === null) return '';
   return ` ${assistant}'s own Google Workspace address is ${quotedAddress(email)}.`;
@@ -117,7 +116,7 @@ function browserPrincipalAddressesSentence(principal: string, emails: readonly s
  * Main changes the principal's addresses mid-conversation, and the calendar
  * poll keeps each one's calendar access, so it reads both live: a copy
  * composed when its container started would go stale the moment either
- * changed (R9).
+ * changed.
  * to: main
  */
 export const MAIN_PRINCIPAL_ADDRESSES_POINTER =
@@ -205,7 +204,8 @@ register({
       if (typeof value !== 'string' || value.length === 0) throw new Error(`${flag(key)} is required`);
       return value;
     };
-    // The principal's name and timezone seed the profile: create declares them, and nothing after it.
+    // An optional flag, refused when empty. The principal's name and timezone only seed the profile (see
+    // `reconcileGwsEaProfile`), while an omitted assistant last name clears the one held.
     const seed = (key: string): string | undefined => (raw[key] === undefined ? undefined : required(key));
     if (raw.principal_last_name !== undefined && raw.principal_first_name === undefined) {
       throw new Error('--principal-last-name requires --principal-first-name');
@@ -276,10 +276,9 @@ register({
 });
 
 /**
- * Only canonical main changes the principal's addresses on the principal's
- * word: canonical-main wiring admission lets it serve nothing but the
- * principal's own conversation. The operator reaches the same commands as the
- * host caller, through `gws-ea ncl`.
+ * Canonical-main wiring admission lets main serve nothing but the principal's
+ * own conversation, so its change is on the principal's word. The operator
+ * reaches the same commands as the host caller, through `gws-ea ncl`.
  */
 async function assertMayChangePrincipalAddresses(ctx: CallerContext): Promise<void> {
   if (ctx.caller === 'host') return;
@@ -300,16 +299,15 @@ function emailArgument(args: Record<string, unknown>): string {
 // ---------------------------------------------------------------------------
 
 /**
- * Whether the assistant's inbox exists (`getInboxMessagingGroupId`). From
- * then on, mail from a principal address authenticates as the principal and
- * carries their authority, so a new address widens who speaks for them.
+ * Once the inbox exists, mail from a principal address authenticates as the
+ * principal and carries their authority, so a new address widens who speaks
+ * for them.
  */
 async function inboxExists(): Promise<boolean> {
   if (!(await getDb().hasTable('gws_ea_inbox_state'))) return false;
   return (await getInboxState()).messaging_group_id !== null;
 }
 
-/** The `pending_approvals.action` an address card resolves through. */
 const ADD_ADDRESS_APPROVAL = 'principal_address_add';
 
 /** The card's payload, exactly as `requestApproval` stores it, so a grant binds to one address. */
@@ -386,11 +384,6 @@ registerApprovalHandler(
   },
 );
 
-/**
- * Add an address: directly for the operator, and for main until the inbox
- * exists; after that, main's new address waits for the principal's card.
- * One the profile already holds changes nothing, so it needs no card.
- */
 async function addAddress(args: Record<string, unknown>, ctx: CallerContext) {
   await assertMayChangePrincipalAddresses(ctx);
   const { email, held } = await proposedPrincipalAddress(emailArgument(args));
@@ -414,9 +407,8 @@ async function addAddress(args: Record<string, unknown>, ctx: CallerContext) {
 }
 
 /**
- * Each address with what the assistant can do with its main calendar, as
- * the inbox's calendar poll last read it from Google: the facts status shows
- * too. Adding or removing an address calls no one; the next poll acts on it.
+ * Calendar access as the inbox's calendar poll last read it from Google:
+ * adding or removing an address calls no one, and the next poll acts on it.
  */
 async function listAddresses() {
   const addresses = await listPrincipalAddresses();
@@ -484,7 +476,6 @@ registerResource({
 /** What the refusal to any caller but main says `principal-profile` holds. */
 const NAME_AND_TIMEZONE = 'name and timezone';
 
-/** One field a `set` changed, from and to what the profile held. */
 interface ProfileChange {
   readonly field: 'first_name' | 'last_name' | 'timezone';
   readonly from: string | null;
@@ -497,10 +488,7 @@ function profileChanges(before: PublishedNameAndTimezone, after: PublishedNameAn
     .map((field) => ({ field, from: before[field], to: after[field] }));
 }
 
-/**
- * The principal's receipt: every change, old and new, so a change they did
- * not ask for cannot pass unseen (KTD9).
- */
+/** Every change, old and new, so a change the principal did not ask for cannot pass unseen. */
 function receiptText(changes: readonly ProfileChange[]): string {
   const described = changes.map(({ field, from, to }) => {
     const label = field === 'first_name' ? 'first name' : field === 'last_name' ? 'last name' : 'home time zone';
@@ -509,10 +497,7 @@ function receiptText(changes: readonly ProfileChange[]): string {
   return `I updated your profile: ${LIST.format(described)}. If you didn't ask for this, tell me and I'll change it back.`;
 }
 
-/**
- * What follows the change, and when: the host's readers now, each agent's own copy on its next start.
- * to: main
- */
+/** to: main */
 const TAKES_EFFECT =
   "The times external-email offers use the new values now. Your own clock and the identity in your instructions follow at your next start; external-email's identity and email signature follow at its next start, with nothing for you to do.";
 

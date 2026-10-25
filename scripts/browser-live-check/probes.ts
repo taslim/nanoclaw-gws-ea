@@ -190,8 +190,7 @@ export async function localProbes(
     };
   });
   await add('clipboard_permissions', async () => {
-    // Permission denial is checked before attempting either API. No readText
-    // call runs, so clipboard contents cannot be read even if Chrome regresses.
+    // Only permission states are queried; no clipboard API runs, so contents stay unread even if Chrome regresses.
     const permissions = await page.evaluate(async () => {
       const names = ['clipboard-read', 'clipboard-write'] as const;
       const states: Record<string, string> = {};

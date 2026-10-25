@@ -1,42 +1,13 @@
 /**
- * main's calendar facts, counted by the host from Google's own answer
- * (R53), so no model copies, drops, or misreads an event:
+ * Calendar facts counted by the host from Google's own answer, so no model
+ * copies, drops, or misreads an event. They read every page of every
+ * principal calendar themselves: a calendar Google will not list fails the
+ * call rather than counting as empty, and nothing an agent saved or says it
+ * fetched decides the answer.
  *
- *   find_conflicts { start, end, candidate_ical_uid? } → { conflicts, conflicts_not_listed, message }
- *   people_stats   { people? }                         → { since, people, people_not_listed, events, message }
- *
- * - Both read every calendar of the principal's, by the ownership rule
- *   (`isPrincipalCalendar`), whole: every page of each, and a calendar Google
- *   will not list fails the call rather than counting as empty. They fetch
- *   what they count themselves, so nothing an agent saved or says it fetched
- *   decides the answer.
- * - `find_conflicts` lists every meeting that takes the principal's time
- *   over the candidate, by the one rule free time and booking read
- *   (`blocksTime`): cancelled events, free (transparent) ones, and those the
- *   principal declined on that calendar do not count; all-day busy events,
- *   free/busy-only blocks, and the assistant's own bookings do. The
- *   candidate's own copies, by iCalUID, never count. An all-day event runs
- *   midnight to midnight on the principal's clocks, so a day with a clock
- *   change is 23 or 25 hours long. A meeting on several of the principal's
- *   calendars is listed once, with each.
- * - `people_stats` counts, over the last six months, the meetings the
- *   principal organized or accepted with each person: an invitation they
- *   left unanswered, declined, or marked maybe never builds a record. The
- *   principal (each of their addresses, by the one rule that recognizes
- *   them), the assistant (in every spelling of its address), rooms, and
- *   meetings of more than eight people are left out, and a meeting on several
- *   calendars counts once. Each person's meetings are also counted by the
- *   calendar they sit on, each calendar whose copy counts on its own: where
- *   the principal meets them, which main weighs in choosing where to book
- *   (R13).
- *
- * Every time comes with a label ready to write on the principal's clock.
- * Titles and names other people wrote come back capped and wrapped as
- * untrusted text. The message is what main reads: each entry on its own line,
- * in plain words, calendars by their names, as many as fit its size, and how
- * many more there are; the fields stay for the host's own callers. A group
- * holding Google Calendar calls them (`guard.ts`); nothing here ever reaches
- * external-email.
+ * Only the message reaches the agent; `find_conflicts`'s other fields also
+ * serve host callers. Titles and names other people wrote come back capped
+ * and wrapped as untrusted text, and nothing here reaches external-email.
  */
 import { TIMEZONE } from '../../config.js';
 import { forbidden, invalidArgs, type ActionAnswer } from '../../cli/delivery-action.js';
@@ -68,10 +39,9 @@ import {
   zonedIso,
 } from './slots.js';
 
-/** The longest candidate `find_conflicts` checks: one meeting, or a trip. */
+/** One meeting, or a trip. */
 const MAX_WINDOW_DAYS = 14;
 const MAX_LISTED_CONFLICTS = 50;
-/** How far back `people_stats` counts. */
 const HISTORY_DAYS = 183;
 /** A meeting with more people than this says little about any one of them. */
 const MAX_MEETING_SIZE = 8;
@@ -80,29 +50,27 @@ const MAX_PEOPLE_ASKED = 100;
 const MAX_NAME_CHARS = 64;
 const MAX_TITLE_CHARS = 100;
 const MAX_ICAL_UID = 1_024;
-/** The most one answer's message carries, so a long list never crowds main's context. */
+/** So a long list never crowds the agent's context. */
 const MAX_MESSAGE_CHARS = 12_000;
 /** Room kept for the line saying how many more were not listed. */
 const NOT_LISTED_ROOM = 40;
 const DAY = 86_400_000;
 const MINUTE = 60_000;
 const LIST = new Intl.ListFormat('en', { style: 'long', type: 'conjunction' });
-/** The principal's answers in words; any other, or none, says nothing. */
 const ANSWER_WORDS: Readonly<Record<string, string>> = {
   accepted: 'accepted',
   tentative: 'maybe',
   needsAction: 'not answered yet',
   declined: 'declined',
 };
-/** Where the text other people wrote came from, as its untrusted wrapping names it. */
 const CALENDAR_SOURCE = 'google_calendar';
 
 export interface Conflict {
-  /** Every principal calendar the meeting sits on, as it counts there. */
+  /** Each principal calendar whose copy of the meeting takes the principal's time. */
   readonly calendars: readonly string[];
   readonly event_id: string | null;
   readonly ical_uid: string | null;
-  /** Wrapped as untrusted; null for a free/busy-only block. */
+  /** Wrapped as untrusted; null when no copy shows a title, as for a free/busy-only or hidden block. */
   readonly title: string | null;
   /** On the principal's clock, with its offset. */
   readonly start: string;
@@ -121,10 +89,7 @@ export interface PersonStats {
   /** Wrapped as untrusted; null when no counted meeting carried one. */
   readonly display_name: string | null;
   readonly meetings: number;
-  /**
-   * Those meetings by the principal calendar they sit on, most first: one on
-   * several calendars counts on each where its own copy counts.
-   */
+  /** Most first; a meeting on several calendars counts on each whose own copy counts. */
   readonly meetings_by_calendar: Readonly<Record<string, number>>;
   /** Meetings with the principal and this person alone; the assistant does not count. */
   readonly one_on_ones: number;
@@ -146,7 +111,6 @@ export interface PeopleCounts {
 }
 
 export interface CalendarFactsDeps {
-  /** The host's own Calendar client. */
   readonly calendar: () => MeetingsCalendarApi;
 }
 
@@ -156,7 +120,7 @@ export interface CalendarConflictResult extends Record<string, unknown> {
   message: string;
 }
 
-/** Native host callers share the same complete principal-calendar conflict read as the tool. */
+/** The complete read `find_conflicts` makes, for host callers. */
 export function findPrincipalCalendarConflicts(
   start: string,
   end: string,
@@ -165,7 +129,7 @@ export function findPrincipalCalendarConflicts(
   return createCalendarFactTools({ calendar: () => calendar }).findConflicts({ start, end });
 }
 
-/** One copy of an event, on the calendar it was read from. */
+/** One calendar's copy of an event. */
 interface Copy {
   readonly calendarId: string;
   readonly event: DetailedEvent;
@@ -174,12 +138,10 @@ interface Copy {
   readonly meeting: string;
 }
 
-/** Whose calendars, on whose clock, and who the principal is. */
 interface FactsView {
   readonly timezone: string;
   readonly addresses: PrincipalRecognizer;
   readonly calendars: readonly string[];
-  /** Each calendar's name as main speaks of it to the principal (`calendarNames`). */
   readonly names: ReadonlyMap<string, CalendarName>;
 }
 
@@ -204,16 +166,11 @@ function isRoom(attendee: DetailedAttendee): boolean {
   return attendee.resource === true || (attendee.email?.endsWith('@resource.calendar.google.com') ?? false);
 }
 
-/** "1 meeting", "3 meetings", "no one-on-ones". */
 function count(n: number, one: string, many = `${one}s`): string {
   return n === 0 ? `no ${many}` : `${n} ${n === 1 ? one : many}`;
 }
 
-/**
- * `head`, then as many entries as fit within the message's size, then how
- * many of `total` were not listed, so the count stays honest however many
- * the size or a cap left out.
- */
+/** Says how many of `total` were not listed, so the count stays honest whatever the size or a cap left out. */
 function listMessage(head: string, entries: readonly string[], total: number): string {
   const lines = [head];
   let size = head.length;
@@ -228,12 +185,11 @@ function listMessage(head: string, entries: readonly string[], total: number): s
 }
 
 /**
- * One conflict as main reads it. A block with no title, free/busy-only or
- * hidden, says in words that it takes all of its own time: a bare "busy" line
- * next to a titled meeting at the same start reads as that meeting's shadow,
- * and main once answered from the meeting's end alone. It names its calendar,
- * so it reads as a block of its own, but never by an address: two calendars
- * told apart only by their addresses need no telling apart for a busy block.
+ * A block with no title, free/busy-only or hidden, says in words that it
+ * takes all of its own time: a bare "busy" line next to a titled meeting at
+ * the same start reads as that meeting's shadow. It names its calendar, so it
+ * reads as a block of its own, but never by an address: two calendars told
+ * apart only by their addresses need no telling apart for a busy block.
  */
 function conflictLine(conflict: Conflict, view: FactsView): string {
   const overlapping = conflict.overlap_minutes === 0 ? 'under a minute' : count(conflict.overlap_minutes, 'minute');
@@ -261,7 +217,6 @@ function conflictLine(conflict: Conflict, view: FactsView): string {
   ].join('; ');
 }
 
-/** One person as main reads it, their name last, inside its markers. */
 function personLine(person: PersonStats, view: FactsView): string {
   const address = person.identity.replace(/^email:/u, '');
   if (person.meetings === 0) return `- ${address}: no meetings`;
@@ -304,10 +259,8 @@ export function createCalendarFactTools(deps: CalendarFactsDeps) {
   }
 
   /**
-   * Every copy on the principal's calendars that meets `span`, each with its
-   * span on the principal's clocks. A copy Google gives no readable time
-   * fails the call: a count that skipped it would be wrong without anyone
-   * knowing.
+   * A copy Google gives no readable time fails the call: a count that skipped
+   * it would be wrong without anyone knowing.
    */
   async function copiesIn(view: FactsView, span: Span): Promise<Copy[]> {
     const listings = await Promise.all(
@@ -339,10 +292,6 @@ export function createCalendarFactTools(deps: CalendarFactsDeps) {
     return `${first === last ? first : `${first} to ${last}`}, all day`;
   }
 
-  /**
-   * Every meeting that takes the principal's time over a candidate, by the
-   * rule free time and booking read; the candidate's own copies never count.
-   */
   const findConflicts = async (content: Record<string, unknown>): Promise<CalendarConflictResult> => {
     const start = instantOf(content.start, 'start');
     const end = instantOf(content.end, 'end');
@@ -397,10 +346,6 @@ export function createCalendarFactTools(deps: CalendarFactsDeps) {
     };
   };
 
-  /**
-   * Who the principal has met over the last six months, counted only from
-   * meetings they organized or accepted.
-   */
   const peopleStats: ActionAnswer = async (content) => {
     const asked = addressesOf(content.people, 'people', MAX_PEOPLE_ASKED);
     const view = await viewOf();

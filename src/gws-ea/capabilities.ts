@@ -1,4 +1,4 @@
-/** The shipped optional host catalog. Voice owns its actions, locks, policy, and asset recipe. */
+/** The capability catalog and voice's read-only inspection; voice's own actions live in `local-voice.ts`. */
 import { lstat } from 'node:fs/promises';
 import { BROWSER_CAPABILITY } from './browser-capability.js';
 import { ARTIFACTS_CAPABILITY } from './artifacts-capability.js';
@@ -251,7 +251,7 @@ export async function inspectVoiceConsumers(
   };
 }
 
-/** Local independent facts, plus bounded native health only for an explicit check. No runtime mutation. */
+/** Read-only; asks the hosts for voice health only on an explicit check (`checkConsumers`). */
 export async function inspectVoiceCapability(
   paths: ControlPlanePaths,
   options: VoiceCapabilityInspection = {},
@@ -314,7 +314,6 @@ export async function inspectVoiceCapability(
   };
 }
 
-/** Scope-conscious terminal facts use the same inspection data as machine output. */
 export function capabilityLines(
   capability: VoiceCapabilityObservation,
   detailed: boolean,
@@ -365,7 +364,7 @@ export function capabilityLines(
   return lines;
 }
 
-/** Handoffs follow observed facts; an unknown consumer never becomes evidence of readiness. */
+/** An unknown consumer is never taken as evidence of readiness. */
 export function voiceCapabilityNextActions(
   capability: VoiceCapabilityObservation,
   checked: boolean,
@@ -433,7 +432,6 @@ export function voiceCapabilityNextActions(
   return actions;
 }
 
-/** Exact recovery commands for the voice domain's existing error codes. */
 export function voiceCapabilityRecovery(
   error: unknown,
   request: {

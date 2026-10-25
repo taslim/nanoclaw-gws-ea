@@ -1,7 +1,6 @@
 /**
- * Terminal guidance for gws-ea's prerequisites: the Google Cloud sign-in and
- * account prompts behind the `Interaction` port, and guided fixes for missing
- * or stopped tools that continue the same run.
+ * Terminal side of gws-ea's prerequisites: the Google Cloud prompts behind the `Interaction` port, and guided
+ * fixes for missing or stopped tools that let the same run continue.
  */
 import * as p from '@clack/prompts';
 import os from 'node:os';
@@ -89,7 +88,7 @@ function defaultRunLogin(executable: string, args: readonly string[]): Promise<n
   return runInheritScript(executable, [...args], { env: buildInteractiveEnvironment(), output: process.stderr });
 }
 
-/** Locate gcloud (including the installer's default directory) and put it on PATH for later children. */
+/** Also searches the installer's default directory, and puts gcloud on PATH for later children. */
 async function locateGcloud(resolve: (searchPath: string) => Promise<string>): Promise<string> {
   const executable = await resolve(gcloudSearchPath()).catch((error: unknown) =>
     missingExecutable(
@@ -102,11 +101,7 @@ async function locateGcloud(resolve: (searchPath: string) => Promise<string>): P
   return executable;
 }
 
-/**
- * Interactive `gcloud auth login <account> --force`: the operator confirms,
- * then gcloud owns the terminal and the browser flow. Without an account the
- * operator picks one in the browser.
- */
+/** gcloud owns the terminal and the browser flow; without `account`, the operator picks one in the browser. */
 export async function signInToGoogleCloud(
   account?: string,
   dependencies: GoogleCloudSignInDependencies = {},
@@ -131,7 +126,6 @@ export async function signInToGoogleCloud(
   }
 }
 
-/** Whether the signed-in account should own the new assistant's Google Cloud project. */
 export async function confirmGoogleAccount(
   account: string,
   dependencies: Pick<GoogleCloudSignInDependencies, 'prompts'> = {},
@@ -145,19 +139,18 @@ export async function confirmGoogleAccount(
   return answer === true;
 }
 
-/** Rounds of guidance for one prerequisite before its failure stands. */
+/** Per prerequisite, before its failure stands. */
 const GUIDED_ROUNDS = 3;
 const DOCKER_START_WAIT_MS = 90_000;
 const DOCKER_POLL_MS = 2_000;
 
-/** A prerequisite the operator can fix while this run waits, then the run continues. */
 interface Fix {
   readonly title: string;
   /** What to do on this platform, ending in "return to this terminal". */
   readonly steps: string;
-  /** What gws-ea can do itself with the operator's yes; it reports whether that worked. */
+  /** A fix gws-ea makes itself on the operator's yes; `run` reports whether it worked. */
   readonly offer?: { readonly question: string; readonly run: () => Promise<boolean> };
-  /** Once the operator is done: put an installer's default location on PATH, or wait for a daemon. */
+  /** Runs once the operator is done, e.g. to put an installer's directory on PATH or wait for a daemon. */
   readonly settle?: (prompts: PromptAdapter) => Promise<void>;
 }
 
@@ -268,7 +261,6 @@ function fixFor(error: GwsEaError, dependencies: GuidedPrerequisiteDependencies)
   }
 }
 
-/** Offer gws-ea's own fix, or show the steps and wait for the operator; either way the run continues. */
 async function applyFix(fix: Fix, prompts: PromptAdapter, again: boolean): Promise<void> {
   if (fix.offer && !again) {
     const answer = await prompts.confirm({ message: fix.offer.question, initialValue: true });
@@ -290,11 +282,6 @@ async function applyFix(fix: Fix, prompts: PromptAdapter, again: boolean): Promi
   await confirm(prompts, `Continue after fixing ${fix.title}?`);
 }
 
-/**
- * The engine's prerequisite checks, guiding each missing or stopped tool: a
- * fix gws-ea can make itself is offered, anything else is shown with its
- * steps, and the same run continues once it is done.
- */
 export async function ensurePrerequisites(
   request: PrerequisiteRequest,
   interaction: GuidedInteraction,

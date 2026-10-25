@@ -24,11 +24,10 @@ export interface ChannelSetup {
   onMetadata(platformId: string, name?: string, isGroup?: boolean): void;
 
   /**
-   * Called when someone answers a question or approval request: a click on a
-   * card's button, or an answer in words on a channel whose requests are
-   * text. Waits for the same readiness as onInbound, then resolves once the
-   * answer's handler has finished and rejects when it fails, so a channel
-   * that redelivers can hand the answer over again.
+   * Called when someone answers a question or approval request, by a card's
+   * button or in words on a channel whose requests are text. Waits for the
+   * same readiness as onInbound, then settles with the answer's handler,
+   * rejecting when it fails so a channel that redelivers can hand it over again.
    */
   onAction(
     questionId: string,
@@ -44,13 +43,11 @@ export interface ChannelSetup {
   ): void | Promise<void>;
 }
 
-/** What a channel knows about an answer beyond the option it chose. */
 export interface ActionAnswer {
   /**
-   * The channel left the request as posted: the handler that resolves the
-   * answer edits it to its outcome once it has authorized it. Set for a
-   * request whose presentation defers resolution, and for every request on a
-   * channel whose requests are text.
+   * The channel left the request as posted, for the answer's handler to edit
+   * to its outcome once it has authorized the answer. Set when a request's
+   * presentation defers resolution, and on channels whose requests are text.
    */
   deferResolution?: boolean;
   /** The reason given with a rejection: in words, the text after the no. */
@@ -101,10 +98,9 @@ export interface InboundEvent {
      */
     authenticatedSender?: AuthenticatedSender;
     /**
-     * Retry-safe: the source may deliver this message again after it was
-     * routed, so a copy already queued in a session is dropped there. Set for
-     * owner-controlled routed admin messages and for channels whose platform
-     * redelivers (InboundMessage.deduplicate).
+     * Set when the source may deliver this message again, with the same id,
+     * after it was routed: a copy already queued in a session is dropped there
+     * (InboundMessage.deduplicate).
      */
     deduplicate?: boolean;
     /** Context only (InboundMessage.quiet). */
@@ -159,7 +155,8 @@ export interface InboundMessage {
    * the person may, and is otherwise dropped without a trace: no drop record,
    * no approval request. One that is not quiet, on the assistant's own
    * message, engages its conversation's wiring as a mention does. Message
-   * interceptors never take a reaction or a quiet event as a reply.
+   * interceptors see reactions and quiet events too, and must not take one as
+   * a reply.
    */
   reaction?: boolean;
 }
@@ -174,7 +171,7 @@ export interface AuthenticatedSender {
 export interface OutboundFile {
   filename: string;
   data: Buffer;
-  /** Its MIME type, when the sender knows it; a platform that needs one infers it from the name otherwise. */
+  /** Absent when unknown; an adapter then uses its own fallback, such as application/octet-stream. */
   mimeType?: string;
 }
 
@@ -343,12 +340,11 @@ export interface ChannelAdapter {
     anchor?: string,
   ): Promise<void>;
   /**
-   * The work on the message `anchor` in this conversation ended: something
-   * was sent here, a newer message arrived, or the turn went idle, failed to
-   * wake, or its container exited. Called once for each turn that worked on
-   * it, after the pulses that carried it. An adapter that marks the message
-   * while a turn works on it (the Google Chat assistant's 👀) takes its mark
-   * off here; adapters without such a mark omit this.
+   * The work on the message `anchor` in this conversation ended, for any of
+   * the reasons src/modules/typing lists. Called once for each turn that
+   * worked on it, after the pulses that carried it. An adapter that marks the
+   * message while a turn works on it (the Google Chat assistant's 👀) takes
+   * its mark off here; adapters without such a mark omit this.
    */
   endTyping?(platformId: string, threadId: string | null, anchor: string): Promise<void>;
   syncConversations?(): Promise<ConversationInfo[]>;

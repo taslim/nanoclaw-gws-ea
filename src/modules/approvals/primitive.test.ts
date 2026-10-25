@@ -215,7 +215,7 @@ describe('approval presentation and expiry', () => {
   });
 });
 
-describe('pictures on approval requests (KTD6)', () => {
+describe('pictures on approval requests', () => {
   it.each([
     ['names none, as before: the card alone', undefined, undefined],
     ['names one that could not be taken, with no file beside it', [null], 1],

@@ -21,7 +21,7 @@ export const ARTIFACTS_POLICY_FILE_ENV = 'GWS_EA_ARTIFACTS_POLICY_FILE';
 export const ARTIFACTS_POLICY_VERSIONS = [1] as const;
 export const ARTIFACTS_CAPABILITY = 'artifacts';
 
-/** Host-only capability coordinates. None of these are included in author results. */
+/** Host-only: author results carry none of it beyond the hostname and path prefix in artifact URLs. */
 export interface ArtifactsPolicyFile {
   readonly schemaVersion: 1;
   readonly enabled: boolean;
@@ -161,7 +161,7 @@ export async function readArtifactsPolicy(file = artifactsPolicyFile()): Promise
   /* eslint-enable no-catch-all/no-catch-all */
 }
 
-/** Current policy and stored selection, including retirement and sealed identities. No recursive capability resolution. */
+/** Reads the stored selection, not resolved capabilities: this is the capability's own `grantedTo`. */
 export async function hasArtifactsAccess(agentGroupId: string, policy?: ArtifactsPolicy): Promise<boolean> {
   if (
     !(policy ?? (await readArtifactsPolicy())).enabled ||
@@ -187,7 +187,7 @@ export async function hasArtifactsAccess(agentGroupId: string, policy?: Artifact
   return selection !== 'all' && selection.includes(ARTIFACTS_CAPABILITY);
 }
 
-/** Identity always comes from the persisted host session, never tool fields or stale schemas. */
+/** Identity comes from the freshly read host session, never from tool fields. */
 export async function artifactActor(session: Session, policy?: ArtifactsPolicy): Promise<ArtifactActor | undefined> {
   const current = await getSession(session.id);
   if (

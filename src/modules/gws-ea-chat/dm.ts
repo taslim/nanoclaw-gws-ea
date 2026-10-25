@@ -1,7 +1,7 @@
 /**
- * The principal's DM, opened by the assistant at create (KTD11): the
- * assistant writes first, so only the person Google resolves for the one
- * address create named can become the principal.
+ * The principal's DM, opened by the assistant at create: the assistant writes
+ * first, so only the person Google resolves for the one address create named
+ * can become the principal.
  *
  * Chat's `spaces.setup` returns the assistant's DM with that address,
  * opening it when there is none. Google must answer with a direct message
@@ -16,8 +16,7 @@
  *
  * The DM's conversation is the one the adapter routes that person's
  * messages to (adapter.ts): `gchat:{space}`, on the `gchat` instance. It is
- * kept strict, as every host-opened DM is (user-dm.ts): only the principal
- * is ever in it.
+ * kept strict: only the principal is ever in it.
  *
  * Google being briefly unavailable (unreachable, 429, 5xx) is retried, then
  * reported; any other refusal fails, naming the address. Another address is
@@ -34,11 +33,9 @@ import { DIRECT_MESSAGE } from './hydrate.js';
 const CHAT = 'https://chat.googleapis.com/v1';
 /** How long one call to Chat may take before it counts as unavailable. */
 const REQUEST_TIMEOUT_MS = 15_000;
-/** The waits before each further attempt while Google is unavailable. */
 const RETRY_WAITS_MS = [2_000, 5_000] as const;
 
 export type PrincipalDmResult =
-  /** The DM is open with the principal: their Chat user ID and the conversation it routes to. */
   | {
       readonly status: 'opened';
       readonly user_id: string;
@@ -49,16 +46,14 @@ export type PrincipalDmResult =
   | { readonly status: 'unavailable'; readonly reason: string };
 
 export interface OpenPrincipalDmOptions {
-  /** The assistant's Chat token. */
   readonly chatToken: () => Promise<string>;
   /** `users/{sub}`: how Chat names the assistant. */
   readonly assistantUserId: string;
   readonly fetch?: typeof globalThis.fetch;
-  /** Waits between attempts. */
   readonly sleep?: (milliseconds: number) => Promise<void>;
 }
 
-/** The DM as Chat answered it: its space, and the person in it with the assistant. */
+/** `userId` is the person in the DM with the assistant, as `gchat:users/{id}`. */
 interface DirectMessage {
   readonly space: string;
   readonly userId: string;
@@ -75,7 +70,6 @@ function notOneToOne(email: string, space: string): Error {
   );
 }
 
-/** The DM `spaces.setup` returns for the address, with its one other member. */
 async function readDirectMessage(email: string, options: OpenPrincipalDmOptions): Promise<DirectMessage> {
   const client: GoogleClientOptions = {
     token: options.chatToken,
@@ -121,9 +115,8 @@ async function readDirectMessage(email: string, options: OpenPrincipalDmOptions)
 }
 
 /**
- * The conversation the principal's DM routes to, made the first time and kept
- * after. It is inserted as the router inserts a first message's conversation,
- * so a message arriving meanwhile shares the row.
+ * Inserted as the router inserts a first message's conversation, so a message
+ * arriving meanwhile shares the row.
  */
 async function directMessageConversation(email: string, space: string): Promise<string> {
   const platformId = directMessagePlatformId(space);
@@ -144,7 +137,6 @@ async function directMessageConversation(email: string, space: string): Promise<
   return conversation.id;
 }
 
-/** Open the assistant's DM with the principal's Chat address `email` (KTD11). */
 export async function openPrincipalDm(email: string, options: OpenPrincipalDmOptions): Promise<PrincipalDmResult> {
   const sleep = options.sleep ?? ((milliseconds: number) => delay(milliseconds));
   let dm: DirectMessage | undefined;

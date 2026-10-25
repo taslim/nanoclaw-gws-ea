@@ -44,7 +44,7 @@ export type BrowserSecretFillResult = {
     | 'rate_limited';
 };
 
-/** The bound field's frame no longer shows the exact HTTPS origin it was bound on. */
+/** The field and its submit control are not in one frame on one HTTPS origin. */
 export class BrowserOriginMismatchError extends Error {
   constructor() {
     super('origin_mismatch');

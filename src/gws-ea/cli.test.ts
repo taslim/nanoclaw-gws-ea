@@ -2292,7 +2292,7 @@ describe('gws-ea connect-google', () => {
 });
 
 describe('gws-ea start, stop, and restart', () => {
-  it("stops only the named assistant's host while another runs, and stops neither one's agent containers (AE3)", async () => {
+  it("stops only the named assistant's host while another runs, and stops neither one's agent containers", async () => {
     const paths = await testPaths();
     const a = await createdAssistant(paths, 35_001);
     const b = await createdAssistant(paths, 35_011);

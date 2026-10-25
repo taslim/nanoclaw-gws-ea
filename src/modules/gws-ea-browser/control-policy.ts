@@ -5,9 +5,10 @@ import { consentClassChoice } from './consent.js';
 import type { ControlFacts } from './control-facts.js';
 import { merchantSignatures } from './merchant-signatures.js';
 
-/** What the open rule decides for every control and navigation (KTD1). */
+/** `submit` is an Enter or a host submit, which presses the control it is aimed at. */
 export type ActivationKind = 'click' | 'submit' | 'select' | 'download';
 
+/** What the open rule decides for every control and navigation. */
 export type ActionClass =
   | 'ordinary'
   | 'purchase_control'
@@ -75,9 +76,8 @@ export function pressesControl(facts: ControlFacts, kind: ActivationKind): boole
 }
 
 /**
- * The open rule (KTD1). Every control is decided fresh, in this order: blocked address, account security,
- * speaking, consent-class controls, purchase vocabulary, a commit on a transaction page, then ordinary.
- * `kind` is the action: an Enter or a host submit presses the control it is aimed at.
+ * The open rule. Every control is decided fresh, in this order: blocked address, account security, speaking,
+ * consent-class controls, purchase vocabulary, a commit on a transaction page, then ordinary.
  */
 export function classifyControlFacts(facts: ControlFacts, kind: ActivationKind = 'click'): ActionClass {
   const names = [facts.name, facts.visibleLabel ?? ''].map((name) => name.trim()).filter(Boolean);
@@ -149,8 +149,8 @@ function routeWords(url: URL): string | undefined {
 }
 
 /**
- * The open rule for a navigation: any public page loads, except a blocked address, an account-security,
- * speaking or purchase route. A reviewed flow keeps its exact routes; its other routes take the open rule.
+ * The open rule for a navigation: any page loads, except a blocked address, an account-security, speaking or
+ * purchase route. A reviewed flow keeps its exact routes; its other routes take the open rule.
  */
 export function classifyNavigationUrl(raw: string): ActionClass {
   let url: URL;
@@ -208,10 +208,9 @@ function credentialSecurityClass(evidence: string, kind: CredentialKind): Action
 }
 
 /**
- * A credential operation's own classification of a document address on its
- * site: HTTPS only, with financial, speaking and every security route other
- * than a change's own password route refused. Another site is left to the
- * generic rules (undefined).
+ * A credential operation's own classification of a document address on its site: HTTPS only, with financial,
+ * speaking and every security route other than a change's own password route refused. Another site is left to
+ * the generic rules (undefined).
  */
 export function classifyCredentialNavigation(raw: string, kind: CredentialKind, site: string): ActionClass | undefined {
   const url = httpsOrigin(raw);
@@ -227,10 +226,9 @@ export function classifyCredentialNavigation(raw: string, kind: CredentialKind, 
 }
 
 /**
- * Whether an authorized signup or password change may activate this control.
- * Visible money terms, purchase or subscription wording, unrelated security,
- * speaking and links are refused; so is any name outside the operation's own
- * vocabulary, as ambiguous. The form's destination must stay on the site.
+ * Whether an authorized signup or password change may activate this control. A transaction on the page,
+ * purchase or subscription wording, unrelated security, speaking and links are refused; so is any name outside
+ * the operation's own vocabulary, as ambiguous. The form's destination must stay on the site.
  */
 export function classifyCredentialControlFacts(
   facts: ControlFacts,

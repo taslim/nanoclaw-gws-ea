@@ -1,5 +1,5 @@
 /**
- * external-email's scheduling tools (KTD7; R69, R70, R71; AE67):
+ * external-email's scheduling tools:
  * `free_time`, `book`, `change_booking` and `cancel_booking`, each bound to
  * the email thread whose session calls it. Nothing reserves a time before
  * someone agrees to it, so the calendar writes of every thread take turns.
@@ -46,7 +46,7 @@ vi.mock('./calendar-api.js', async (importOriginal) => {
   };
 });
 
-/** The assistant's Drive and what a signed-out visit sees, for the link check (Slice 6 KTD5). */
+/** The assistant's Drive and what a signed-out visit sees, for the link check. */
 const workspace = vi.hoisted(() => ({ drive: undefined as unknown }));
 vi.mock('../gws-ea-workspace/drive-api.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../gws-ea-workspace/drive-api.js')>();
@@ -197,16 +197,16 @@ function gone(label: string): string {
   return `${label}: no longer free. Call free_time for times to offer instead.`;
 }
 
-/** What `free_time` adds while main has set no calendar for the thread's bookings (R12, KTD18). */
+/** What `free_time` adds while main has set no calendar for the thread's bookings. */
 const NO_CALENDAR_YET =
   "No calendar is set for this thread's bookings yet: wake main once with tell_main to ask which calendar to book on, and offer no time until it answers.";
-/** What `book` answers while main has set no calendar for the thread's bookings (R12). */
+/** What `book` answers while main has set no calendar for the thread's bookings. */
 const BOOKS_NOTHING_YET =
   "No calendar is set for this thread's bookings yet, so nothing was booked: wake main with tell_main to ask which calendar to book on, and book once it answers.";
-/** What `book` answers when the calendar main set can no longer be booked on (R8). */
+/** What `book` answers when the calendar main set can no longer be booked on. */
 const CANNOT_BOOK_THERE =
   "The calendar main set for this thread's bookings is no longer one the assistant can book on, so nothing was booked: wake main with tell_main to ask which calendar to book on, and book once it answers.";
-/** What a change or cancellation answers when Google no longer shows the booking's calendar's events (R14). */
+/** What a change or cancellation answers when Google no longer shows the booking's calendar's events. */
 const BOOKING_OUT_OF_SIGHT =
   'The assistant can no longer see the events on the calendar this booking is on, so it can neither change nor cancel it: wake main with tell_main and wait for its answer.';
 
@@ -584,7 +584,7 @@ describe('busy time on the principal’s other calendars', () => {
     expect(calendar.live(TEAM).map((event) => event.id)).toEqual(['evt-team']);
   });
 
-  it('never reads the assistant’s own calendar: an event there takes the principal’s time only through the copy its invitation put on theirs (R10, R19)', async () => {
+  it('never reads the assistant’s own calendar: an event there takes the principal’s time only through the copy its invitation put on theirs', async () => {
     calendar.calendars.set(JUNO, { id: JUNO, accessRole: 'owner' });
     await replacePrincipalCalendars([PRINCIPAL], now());
     const ownEvent = (id: string, start: string, end: string): StoredEvent => ({
@@ -802,7 +802,7 @@ describe('book', () => {
     },
   );
 
-  it('refuses a booking whose notes link a pre-read an invitee cannot open, naming the link and telling external-email to wake main (Slice 6 R4)', async () => {
+  it('refuses a booking whose notes link a pre-read an invitee cannot open, naming the link and telling external-email to wake main', async () => {
     const drive = new FakeDrive(JUNO);
     for (const person of [PRINCIPAL, REMY]) drive.addAccount(person);
     workspace.drive = drive;
@@ -916,7 +916,7 @@ describe('book', () => {
     expect(bookings()).toEqual([]);
   });
 
-  it('books on a calendar Google names by another Gmail spelling of a listed address, inviting no spelling of the principal (R1)', async () => {
+  it('books on a calendar Google names by another Gmail spelling of a listed address, inviting no spelling of the principal', async () => {
     await addPrincipalAddress('pat.lee@gmail.com');
     // A second Gmail address of theirs, whose calendar this booking is not on: only the principal rule leaves it off.
     await addPrincipalAddress('pat.home@gmail.com');
@@ -929,8 +929,8 @@ describe('book', () => {
   });
 });
 
-describe('the calendar a thread books on is main’s to set (R11, R12)', () => {
-  it('offers times before main sets one, saying none is set, books nothing until it does, then books there alone (AE3)', async () => {
+describe('the calendar a thread books on is main’s to set', () => {
+  it('offers times before main sets one, saying none is set, books nothing until it does, then books there alone', async () => {
     // A stranger wrote to the assistant, copying the principal; main has set no calendar for the thread.
     const { key, session } = await thread([STRANGER, PRINCIPAL], null);
     await addPrincipalAddress(PERSONAL);
@@ -993,7 +993,7 @@ describe('the calendar a thread books on is main’s to set (R11, R12)', () => {
   });
 });
 
-describe('a booking changes and is cancelled only by its own thread (AE67)', () => {
+describe('a booking changes and is cancelled only by its own thread', () => {
   it('moves at their request, in place, and main hears; a second meeting weeks later is a new event', async () => {
     const first = data(
       await send(sessionA, 'book', { start: TUESDAY_10AM, minutes: 45, title: 'Intro', invitees: [REMY] }),
@@ -1210,7 +1210,7 @@ describe('a booking changes and is cancelled only by its own thread (AE67)', () 
     { how: 'left the assistant’s calendar list', access: undefined },
     { how: 'was narrowed to free/busy only', access: 'freeBusyReader' },
   ])(
-    'keeps a booking whose calendar $how, telling external-email to ask main, so it still stands once shared back (R14)',
+    'keeps a booking whose calendar $how, telling external-email to ask main, so it still stands once shared back',
     async ({ access }) => {
       const booked = data(
         await send(sessionA, 'book', { start: TUESDAY_10AM, minutes: 30, title: 'Intro', invitees: [REMY] }),
@@ -1326,7 +1326,7 @@ describe('a booking changes and is cancelled only by its own thread (AE67)', () 
   });
 });
 
-describe('a booking from a thread in an open matter (KTD11, R28)', () => {
+describe('a booking from a thread in an open matter', () => {
   /** Remy's thread settles the time, and Jane's relays to it. */
   async function renewal(): Promise<string> {
     const { matter } = await openMatter({

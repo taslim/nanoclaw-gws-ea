@@ -1,5 +1,5 @@
 /**
- * A matter as `main` reads it (KTD5, R4, R11, R30): its words, its next look
+ * A matter as `main` reads it: its words, its next look
  * in the principal's time zone, its project and strands, and each link read
  * live from Gmail, Calendar and Drive every time, each read held to its own
  * deadline. Nothing a source says is stored; anyone forgotten is named by
@@ -226,7 +226,7 @@ describe('a matter as main reads it', () => {
     expect(rendered).toContain(`- thread ${THREAD_UNSENT}: nothing sent yet`);
   });
 
-  it('reads the sent message from Gmail on every look, and stores nothing it read (AE7)', async () => {
+  it('reads the sent message from Gmail on every look, and stores nothing it read', async () => {
     const { gmail, sources } = world();
     gmail.put('g-juno', { id: 'j1', from: `Juno Hale <${JUNO}>`, at: '2026-10-09T14:00:00.000Z' });
     const acme = await open('Acme renewal', 'Get the revised quote.', [{ kind: 'thread', reference: THREAD_JUNO }]);
@@ -435,7 +435,7 @@ describe('a matter as main reads it', () => {
     for (const named of ['Noel', NOEL, 'archer', 'Juno', JUNO]) expect(rendered).not.toContain(named);
   });
 
-  it("shows the account external-email left on a thread under it, as external-email's words (AE10)", async () => {
+  it("shows the account external-email left on a thread under it, as external-email's words", async () => {
     const { gmail, sources } = world();
     gmail.put('g-remy', { id: 'r1', from: `Remy Vance <${REMY}>`, at: '2026-10-10T14:00:00.000Z' });
     const acme = await open('Acme renewal', 'Renew.', [{ kind: 'thread', reference: THREAD_REMY }]);
@@ -465,7 +465,7 @@ describe('a matter as main reads it', () => {
     expect(unaccounted).not.toContain('its account');
   });
 
-  it("shows a strand its project's open loop and a line for each other strand, and a project its strands (R30)", async () => {
+  it("shows a strand its project's open loop and a line for each other strand, and a project its strands", async () => {
     const { sources } = world();
     const account = await open('Acme account', 'Keep Acme through renewal.\nBudget decision in Q1.');
     const renewal = await open('Renewal', 'Signed by Friday.', [], account.id);

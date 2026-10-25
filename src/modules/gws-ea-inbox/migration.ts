@@ -13,19 +13,16 @@ import type { ModuleMigration } from '../../db/migrations/index.js';
  */
 
 /**
- * The inbox's own state (KTD4, KTD9). No mail body is stored: a message is
- * kept by its Gmail id and read again when it is routed.
+ * The inbox's own state. No mail body is stored: a message is kept by its
+ * Gmail id and read again when it is routed.
  *
- * - `gws_ea_inbox_state`: the inbox's messaging group (`email:inbox`), the
- *   history cursor, the inbox's health and its calendar notifications', and
- *   the principal's own email conversation with `main` (`email:principal`).
- *   The wiring and destination policies pin both messaging groups by these
- *   stored ids.
+ * - `gws_ea_inbox_state`: the wiring and destination policies pin both email
+ *   messaging groups by the ids stored here.
  * - `gws_ea_inbox_messages`: each Gmail message seen, with its routing outcome
  *   once settled and its failed attempts until then, so a message routes once.
  * - `gws_ea_inbox_sender_counts`: messages per sender per hour.
  * - `gws_ea_inbox_calendars`: the principal's calendars in the assistant's
- *   calendar list, whose notifications the host turned on.
+ *   calendar list, free/busy only or not.
  */
 export const gwsEaInboxMigration: ModuleMigration = {
   version: 1,
@@ -73,8 +70,7 @@ export const gwsEaInboxMigration: ModuleMigration = {
 };
 
 /**
- * The thread map (KTD1, KTD2, KTD7, KTD9): every table keyed to an email
- * thread.
+ * The thread map: every table keyed to an email thread.
  *
  * - `gws_ea_threads`: each thread's stable `mail-…` key and its Gmail thread,
  *   which a thread `main` hands over gains on its first send, and the
@@ -206,10 +202,10 @@ export const gwsEaInboxRelativeFilePathsMigration: ModuleMigration = {
 };
 
 /**
- * Unsigned mail in the principal's name (R5, KTD3): one row for each listed
- * address and reason the principal was told of, written before they are told
- * and removed when Gmail next verifies mail from that address. Each failure
- * is told once, and a new one after verified mail is told again.
+ * Unsigned mail in the principal's name: one row for each listed address and
+ * reason the principal was told of, written before they are told and removed
+ * when Gmail next verifies mail from that address. Each failure is told once,
+ * and a new one after verified mail is told again.
  */
 export const gwsEaInboxUnsignedNoticesMigration: ModuleMigration = {
   version: 5,
@@ -227,14 +223,10 @@ export const gwsEaInboxUnsignedNoticesMigration: ModuleMigration = {
 };
 
 /**
- * What the assistant can do with each principal address's main calendar (R7,
- * R8, KTD4), as the calendar poll last read it from Google: one row per
- * listed address, written by the poll alone, from its first reading until
- * the address is removed. A row holds Google's id for the calendar while it
- * is in the assistant's calendar list, whether the host put it there (only
- * then does the host take it out), when Google last answered for it and when
- * its access last changed, and the access `main` is taken to know, which
- * stays above a drop until main is told of it.
+ * What the assistant can do with each principal address's main calendar, as
+ * the calendar poll last read it from Google: one row per listed address,
+ * written by the poll alone, from its first reading until the address is
+ * removed. `told_access` stays above a drop until main is told of it.
  */
 export const gwsEaInboxCalendarAccessMigration: ModuleMigration = {
   version: 6,
@@ -256,10 +248,9 @@ export const gwsEaInboxCalendarAccessMigration: ModuleMigration = {
 };
 
 /**
- * The account the agent working a thread last left on it (Slice 5 R7, KTD9):
- * what it did, what it learned that no source records, and where the thread
- * stands, in its words, with when it left it. Each account replaces the one
- * before, and a thread has none until its agent leaves one.
+ * The account the agent working a thread last left on it, with when it left
+ * it. Each account replaces the one before, and a thread has none until its
+ * agent leaves one.
  */
 export const gwsEaInboxThreadAccountsMigration: ModuleMigration = {
   version: 7,
@@ -273,9 +264,9 @@ export const gwsEaInboxThreadAccountsMigration: ModuleMigration = {
 };
 
 /**
- * Where `main` placed each thread (Slice 5 R9, R27, KTD8), and whether it
- * handed the thread over to `external-email`, which reads the thread's mail
- * only once it has; until then each email waits, held.
+ * Where `main` placed each thread, and whether it handed the thread over to
+ * `external-email`, which reads the thread's mail only once it has; until
+ * then each email waits, held.
  *
  * - `placement`: `unplaced` until main places it, in an open matter
  *   (`matter`), or `nowhere`, which is also where a thread is left once its

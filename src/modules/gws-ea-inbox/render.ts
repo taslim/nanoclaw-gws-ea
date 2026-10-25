@@ -1,23 +1,19 @@
 /**
- * Email that reads like a person's (R61, KTD6). The agent writes markdown, its
- * sign-off included; the email carries it as minimal HTML and as plain text,
- * with a reply's quote below the way Gmail quotes.
+ * Email that reads like a person's. The agent writes markdown, its sign-off
+ * included; the email carries it as minimal HTML and as plain text, with a
+ * reply's quote below the way Gmail quotes.
  *
  * The HTML is micromark's, with GFM and with raw HTML escaped, inside one
- * `<div dir="ltr">`. A line break the writer made inside a paragraph stays a
- * line break, as in any mail client, so an address keeps its lines and a
- * closing its signature directly under it.
- * The output is then narrowed: an image gives way to its words, and a link
- * whose target is not http(s) or mailto keeps only its words. With raw HTML
- * escaped, every tag in micromark's output is one micromark wrote, in a fixed
- * shape, so the narrowing reads that shape directly.
+ * `<div dir="ltr">`. The output is then narrowed: an image gives way to its
+ * words, and a link whose target is not http(s) or mailto keeps only its
+ * words. With raw HTML escaped, every tag in micromark's output is one
+ * micromark wrote, in a fixed shape, so the narrowing reads that shape
+ * directly.
  *
- * The plain text is read from the same markdown, parsed the same way into
- * its syntax tree (mdast), so it says what the HTML says, as a person types
- * an email: emphasis and code without their markers, a heading as its line,
- * a link as "words (address)" for the links the HTML keeps, a list with "- "
- * or "1. " bullets, a quote with "> ", and every paragraph and line break
- * where the writer put it.
+ * The plain text is read from the same markdown, parsed the same way into its
+ * syntax tree (mdast), so it says what the HTML says, as a person types an
+ * email: emphasis and code without their markers, and a link as "words
+ * (address)" only for the links the HTML keeps.
  */
 import type { FootnoteDefinition, Nodes, RootContent } from 'mdast';
 import { fromMarkdown } from 'mdast-util-from-markdown';
@@ -30,7 +26,6 @@ import { TIMEZONE } from '../../config.js';
 import { formatLocalTime } from '../../timezone.js';
 import { oneLine, type Mailbox } from './mime.js';
 
-/** The message a reply answers, as its readers received it. */
 export interface QuotedMessage {
   readonly from: Mailbox;
   readonly sentAt: Date;
@@ -41,7 +36,6 @@ export interface QuotedMessage {
 export interface EmailContent {
   /** What the agent wrote, in markdown, its sign-off included. */
   readonly markdown: string;
-  /** The message a reply answers, quoted below it. */
   readonly quote?: QuotedMessage;
 }
 
@@ -65,7 +59,11 @@ function escapeHtml(text: string): string {
   );
 }
 
-/** Every line ending inside a paragraph, outside code, as a hard break unless it already is one. */
+/**
+ * Every line ending inside a paragraph, outside code, becomes a hard break, as
+ * in any mail client, so an address keeps its lines and a closing its
+ * signature directly under it.
+ */
 function withLineBreaks(events: readonly MarkdownEvent[]): MarkdownEvent[] {
   const out: MarkdownEvent[] = [];
   let paragraphs = 0;
@@ -123,10 +121,6 @@ function indented(text: string, width: number): string {
   return text.replace(/\n(?=.)/gu, `\n${' '.repeat(width)}`);
 }
 
-/**
- * The markdown as plain text, as a person types the same email, from the
- * same parse as the HTML part: what each node shows, its markers dropped.
- */
 function plainText(markdown: string): string {
   const tree = fromMarkdown(markdown, { extensions: [gfm()], mdastExtensions: [gfmFromMarkdown()] });
   // Every definition, wherever written, the first of a name counting; and every footnote call, in the
@@ -223,7 +217,6 @@ function plainText(markdown: string): string {
 // The email
 // ---------------------------------------------------------------------------
 
-/** Someone else's text as it can be quoted: no control character but line breaks and tabs, no trailing blanks. */
 function quotedLines(text: string): string[] {
   return Array.from(text.replace(/\r\n?/gu, '\n'), (character) => {
     const code = character.codePointAt(0) ?? 0;
@@ -235,14 +228,12 @@ function quotedLines(text: string): string[] {
     .map((line) => line.trimEnd());
 }
 
-/** The line above a quote: who wrote it, and when, in the install timezone. */
 export function quotedBy(quote: QuotedMessage): string {
   const name = quote.from.displayName === undefined ? '' : oneLine(quote.from.displayName);
   const writer = name === '' ? quote.from.address : `${name} <${quote.from.address}>`;
   return `On ${formatLocalTime(quote.sentAt.toISOString(), TIMEZONE)}, ${writer} wrote:`;
 }
 
-/** The email's text and HTML: the body, as the agent wrote it, and a reply's quote. */
 export function renderEmail(content: EmailContent): RenderedEmail {
   const markdown = content.markdown.replace(/\r\n?/gu, '\n').trim();
   // micromark leaves a line ending after a trailing link definition, which writes nothing.

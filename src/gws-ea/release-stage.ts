@@ -1,12 +1,9 @@
 /**
- * Staging a release and switching to one (KTD1, KTD3). Create and update
- * stage a release the same way, while the assistant, if there is one, serves:
- * the release's checkout in its own folder, installed, built and checked, its
- * agent image, its links to the assistant's state, and what is kept with it
- * in `kept/<release>/`, its receipt last. Staging writes nothing into
- * `state/` and follows no link. A switch then applies the release's kept
- * files to the assistant while it is fenced, before the live link names the
- * release.
+ * Staging a release and switching to one. Create and update stage a release
+ * the same way, while the assistant, if there is one, serves; staging writes
+ * nothing into `state/` and follows no link. A switch then applies the
+ * release's kept files to the assistant while it is fenced, before the live
+ * link names the release.
  */
 import path from 'node:path';
 
@@ -46,17 +43,13 @@ import {
 } from './service.js';
 import type { InstanceReservation } from './types.js';
 
-/** A release to stage for an assistant. */
 export interface ReleaseStageRequest {
   readonly paths: ControlPlanePaths;
-  /** The assistant's reservation as it reads at the release: its source, track, and commit (KTD17). */
+  /** The assistant's reservation as it reads at the release, so its `deployed_commit` is the release staged. */
   readonly view: InstanceReservation;
-  /** The assistant's runtime, which the release's kept files are rendered for. */
   readonly runtime: InstanceRuntimeConfig;
   readonly onecli: OnecliRuntimeLayout;
-  /** The service manager the release's service definition is rendered for. */
   readonly service: ServiceLayoutOptions;
-  /** The provider setup the release's receipt records. */
   readonly provider: Pick<ReleasePreflightInput, 'provider' | 'providerCredential'>;
   /**
    * Run on the staged release, given its folder, before its links are made,
@@ -69,7 +62,6 @@ export interface ReleaseStageRequest {
 /** The boundaries staging crosses; each defaults to this process's. */
 export interface ReleaseStageSeams extends CheckoutRuntime {
   readonly recordEffect?: (changed: true | null) => void;
-  /** Runs the release's frozen install and its build. */
   readonly runSetupCommand?: ReleasePreflightRuntime['runSetupCommand'];
   /** The operator's environment, which Docker runs with. */
   readonly ambientEnv?: NodeJS.ProcessEnv;
@@ -77,13 +69,10 @@ export interface ReleaseStageSeams extends CheckoutRuntime {
 
 /**
  * Stage the release `request.view` names in `<root>/<hex8>/`. A complete one
- * is kept as it is: a release is never edited once its receipt is written
- * (R4). One left incomplete, by a run cut short anywhere, is removed whole and
- * staged again. Then, in order: the checkout, materialized at its final path;
- * its preflight (frozen install, build, clean tree, artifacts), whose result
- * becomes the receipt; its agent image, built hermetically (KTD6);
- * `beforeLink`; its links to the assistant's state and logs; and the files
- * kept with it, the receipt last.
+ * is kept as it is: a release is never edited once its receipt is written.
+ * One left incomplete, by a run cut short anywhere, is removed whole and
+ * staged again. The preflight's result becomes the receipt, which is written
+ * last.
  */
 export async function stageRelease(request: ReleaseStageRequest, seams: ReleaseStageSeams = {}): Promise<void> {
   const { paths, view, runtime } = request;
@@ -134,7 +123,6 @@ export async function stageRelease(request: ReleaseStageRequest, seams: ReleaseS
   );
 }
 
-/** Write `environment`, gws-ea's `.env` keys, into the physical `state/.env`, keeping every other writer's keys. */
 function writeStateEnvironment(
   state: string,
   environment: Readonly<Record<string, string>>,
@@ -151,8 +139,8 @@ function writeStateEnvironment(
 
 /**
  * Write gws-ea's `.env` keys kept with release `release` into the assistant's
- * physical `state/.env`, keeping every other writer's keys (upstream
- * `upsertEnvVars`). Never written through a link.
+ * physical `state/.env`, keeping every other writer's keys. Never written
+ * through a link.
  */
 export async function applyReleaseEnvironment(
   runtime: InstanceRuntimeConfig,
@@ -163,11 +151,9 @@ export async function applyReleaseEnvironment(
   writeStateEnvironment(layout.state, await readKeptHostEnvironment(layout.kept(release)), upsertEnvVars);
 }
 
-/** The complete release a switch applies, for the assistant it belongs to. */
 export interface ReleaseFilesTarget {
   readonly runtime: InstanceRuntimeConfig;
   readonly onecli: OnecliRuntimeLayout;
-  /** The release's commit. */
   readonly commit: string;
   /** The commit of the release the switch leaves, whose kept Compose file the OneCLI project ran. */
   readonly leaving: string;
@@ -175,17 +161,12 @@ export interface ReleaseFilesTarget {
 
 /**
  * Apply the files kept with the release `target` names to the assistant,
- * while it is fenced and before the live link names the release: gws-ea's
- * `.env` keys into `state/.env`; its OneCLI Compose file, put back and the
- * project brought up from it (`restoreReleaseGateway`), which recreates only
- * the services whose configuration differs and probes isolation when it did
- * or when the file differs from the one the release it leaves ran with, so a
- * failed probe refuses the release before its host starts (KTD15); and its
- * service definition, installed when it differs. Each part converges, so a
- * rerun after an apply cut short finishes it, and proves isolation again;
- * the project is brought up even when its file already matches, since a run
- * cut short after writing it may not have. Returns whether the service
- * definition changed, which a start needs.
+ * while it is fenced and before the live link names the release, so a failed
+ * OneCLI isolation probe (`restoreReleaseGateway`) refuses the release before
+ * its host starts. Each part converges, so a rerun after an apply cut short
+ * finishes it; the project is brought up even when its file already matches,
+ * since a run cut short after writing it may not have. Returns whether the
+ * service definition changed, which a start needs.
  */
 export async function applyReleaseFiles(
   target: ReleaseFilesTarget,

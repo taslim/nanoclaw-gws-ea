@@ -622,7 +622,7 @@ describe.skipIf(!chromePath)('reviewed merchant purchases through native host de
     expect(approval.question).toMatch(/Place your order/);
     expect(approval.question).toMatch(/Due now: \$85.00/);
     expect(approval.question).toMatch(/Due later: none/);
-    // The card names the errand in the principal's words, never its internal thread (KTD18).
+    // The card names the errand in the principal's words, never its internal thread.
     expect(approval.question.endsWith(`\n\n${ERRAND_ORIGIN_LINE}`)).toBe(true);
     expect(approval.question).not.toContain(session.thread_id!);
     // The reviewed reader places its order total and commit control: the card's one picture is clipped to both.
@@ -1156,7 +1156,7 @@ describe.skipIf(!chromePath)('reviewed merchant purchases through native host de
     });
     expect(await getDb().all('SELECT * FROM gws_ea_browser_purchase_blocks')).toHaveLength(1);
   });
-  it('makes another purchase on the site wait on an unconfirmed one while browsing it goes on, until main records the order email (AE4)', async () => {
+  it('makes another purchase on the site wait on an unconfirmed one while browsing it goes on, until main records the order email', async () => {
     confirmation = false;
     await buy();
     await click((await approvals())[0]);

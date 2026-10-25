@@ -1,12 +1,9 @@
 /**
- * Time MCP tools: time_now, time_resolve, time_convert, time_diff.
- *
  * Models get dates, weekdays, and offsets wrong when they work them out
- * themselves; these tools make that work deterministic. The interface is a
- * proven one, adopted unchanged — the same tools, the same inputs, and the same
- * `{ iso, formatted, day, zone }` shape — and everything is computed in the
- * container's timezone, which is the principal's, unless time_convert names
- * others.
+ * themselves; these tools make that work deterministic. The tool names, inputs
+ * and `{ iso, formatted, day, zone }` shape are a proven interface, adopted
+ * unchanged. Everything is computed in the container's timezone, which is the
+ * principal's, unless time_convert names others.
  *
  * A local wall-clock time becomes an instant explicitly. One that does not
  * exist (the clocks go forward over it) is an error, and one that happens twice
@@ -18,8 +15,6 @@
  * time. chrono works with JavaScript's local-time Date methods, so it is given
  * the reference as the zone's wall-clock fields and its answer is read back as
  * fields, never as a Date: the process timezone does not decide the result.
- * time_resolve reports what it read, what it assumed, and the other readings
- * the words could have had.
  */
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import * as chrono from 'chrono-node';
@@ -50,7 +45,6 @@ const ZERO_PADDED_HOUR = /(?:^|\D)0\d:\d{2}/;
 const DATE_FORMAT = 'EEE, MMM d yyyy';
 const TIME_FORMAT = 'h:mm a';
 
-/** A problem with the tool input, returned to the agent as an error result. */
 class TimeInputError extends Error {}
 
 function fail(message: string): never {
@@ -114,14 +108,13 @@ interface WallClock {
   millisecond: number;
 }
 
-/** An instant, or both instants when the local time it was read from happens twice. */
 type Moment =
   | { kind: 'exact'; at: ValidDateTime }
   | { kind: 'ambiguous'; earlier: ValidDateTime; later: ValidDateTime };
 
 interface Reading {
   moment: Moment;
-  /** The local wall clock that was read, in the zone it was read in. */
+  /** In the zone it was read in. */
   wall: WallClock;
   /** False when a day was given without a time of day. */
   timeStated: boolean;
@@ -169,7 +162,6 @@ function floating(wall: WallClock): ValidDateTime {
   return dt;
 }
 
-/** A calendar day as a whole number, for counting days between local dates. */
 function dayNumber(wall: WallClock): number {
   return Math.round(floating(dateOnly(wall)).toMillis() / DAY_MS);
 }
@@ -182,12 +174,10 @@ function describeTime(wall: WallClock): string {
   return floating(wall).setLocale('en-US').toFormat(TIME_FORMAT);
 }
 
-/** "Tue, Oct 13 2026 3:00 PM", or just the date when no time was stated. */
 function describe(wall: WallClock, withTime: boolean): string {
   return withTime ? `${describeDate(wall)} ${describeTime(wall)}` : describeDate(wall);
 }
 
-/** "2:30 AM on Sun, Mar 8 2026". */
 function describeLocalTime(wall: WallClock): string {
   return `${describeTime(wall)} on ${describeDate(wall)}`;
 }
@@ -266,7 +256,6 @@ function startOfDay(wall: WallClock, zone: string): ValidDateTime {
   return placeholderInstant(dateOnly(wall), zone);
 }
 
-/** The single instant a reading names, or an error naming both candidates when it names two. */
 function exactly(reading: Reading, label: string, zone: string): ValidDateTime {
   const { moment } = reading;
   if (moment.kind === 'exact') return moment.at;
@@ -478,7 +467,7 @@ function readNatural(text: string, zone: string, reference: ValidDateTime): Read
   };
 }
 
-/** Any accepted input: ISO first (exact and cheap), natural language otherwise. */
+/** ISO is tried first: it is exact and cheap. */
 function readInput(input: string, zone: string, reference: ValidDateTime): Reading {
   const text = input.trim();
   const reading = readIso(text, zone) ?? readNatural(text, zone, reference);
@@ -570,10 +559,7 @@ function prefixed(label: string, notes: string[]): string[] {
   return notes.map((note) => `${label}: ${note}`);
 }
 
-/**
- * The five time tools, computing in `zone`. The container registers them for
- * its own timezone; tests build them for any zone and a fixed clock.
- */
+/** The container registers them for its own timezone; tests build them for any zone and a fixed clock. */
 export function createTimeTools(zone: string, now: () => number = Date.now): McpToolDefinition[] {
   if (!isValidTimezone(zone)) throw new Error(`Time tools need an IANA timezone, got "${zone}"`);
 

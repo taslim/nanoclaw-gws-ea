@@ -124,11 +124,7 @@ export function countDueMessages(db: Database.Database): number {
   ).count;
 }
 
-/**
- * How many due messages wait, waking nothing, as context for the session's
- * next turn: pending non-trigger rows, excluding system tool replies and
- * those on `exceptChannelType`.
- */
+/** Due messages that wake nothing and wait as context for the session's next turn. */
 export function countUnreadContext(db: Database.Database, exceptChannelType: string): number {
   return (
     db
@@ -145,10 +141,9 @@ export function countUnreadContext(db: Database.Database, exceptChannelType: str
 }
 
 /**
- * Release every held message: each becomes a pending trigger, due at
- * `processAfter` (null: due now), so the sweep wakes the session for it once
- * it is due. With preserveTriggers, retain each row's original engagement.
- * Returns how many it released.
+ * Every held message becomes a pending trigger due at `processAfter` (null:
+ * now), so the sweep wakes the session for it once it is due.
+ * `preserveTriggers` keeps each row's own trigger.
  */
 export function releaseHeldMessages(
   db: Database.Database,
@@ -163,10 +158,7 @@ export function releaseHeldMessages(
     .run(options?.preserveTriggers === true ? 1 : 0, due).changes;
 }
 
-/**
- * Settle every held message: each is completed unread, so no turn ever reads
- * it and no later release brings it back. Returns how many it settled.
- */
+/** Completes every held message unread, so no turn reads it and no later release brings it back. */
 export function settleHeldMessages(db: Database.Database): number {
   return db.prepare("UPDATE messages_in SET status = 'completed' WHERE status = 'held'").run().changes;
 }

@@ -96,11 +96,7 @@ function presentConfig(row: ContainerConfigRow): Record<string, unknown> {
   };
 }
 
-/**
- * Parse `--capabilities` for `config update`. An agent may change only its
- * own list (and the command is held for approval); another group's list is
- * its operator's alone. Unknown keys are refused here, the only writer.
- */
+/** An agent's change to its own list is still held for approval: `config update` is approval-gated for agents. */
 function parseCapabilitiesFlag(
   value: unknown,
   id: string,

@@ -3,10 +3,8 @@ import { principalNameAndTimezone } from '../gws-ea-profile/db.js';
 import { zonedDate, zonedInstant } from './iso-time.js';
 
 /**
- * Operator-owned politeness defaults, not claims about a merchant's published limits.
- * Each time of day names its clock: quiet hours are the principal's night, a condition
- * of their clock now, read from their profile each time, never a stored time; a release
- * is the venue's own schedule, recorded with its watch on the venue's clock.
+ * Host politeness defaults, not claims about a merchant's published limits. Quiet hours are a condition of the
+ * principal's clock as it is now, never a stored time.
  */
 export interface WatchSitePolicy {
   floorMs: number;
@@ -32,7 +30,7 @@ const policies: Readonly<Record<string, WatchSitePolicy>> = Object.freeze({
   'opentable.com': { ...defaults },
   'exploretock.com': { ...defaults },
 });
-/** Unknown sender addresses stay empty until verified and reviewed as host policy. */
+/** A site's `notifySenders` stay empty until its sender addresses are verified and reviewed as host policy. */
 export function watchSitePolicy(site: string): WatchSitePolicy {
   return policies[site] ?? defaults;
 }
@@ -40,15 +38,10 @@ function clockHour(at: number, timeZone: string): number {
   const parts = new Intl.DateTimeFormat('en-US', { timeZone, hour: '2-digit', hourCycle: 'h23' }).formatToParts(at);
   return Number(parts.find((part) => part.type === 'hour')?.value);
 }
-/**
- * The principal's clock, which quiet hours and card times are read on: from the profile,
- * so a change they make through main holds at once; the install's until create seeds it,
- * as the rest of GWS-EA reads it.
- */
+/** Read from the profile on each call, so a timezone change holds at once; the install timezone until one is set. */
 export async function principalClock(): Promise<string> {
   return (await principalNameAndTimezone()).timezone ?? TIMEZONE;
 }
-/** The first minute from `at` outside the principal's quiet hours, on their clock in `principalTimeZone`. */
 export function watchQuietUntil(policy: WatchSitePolicy, at: number, principalTimeZone: string): number {
   let next = at;
   for (let count = 0; count < 24 * 60; count++) {
@@ -64,9 +57,9 @@ export function watchQuietUntil(policy: WatchSitePolicy, at: number, principalTi
   return next;
 }
 /**
- * A venue's stated release schedule, recorded once when its watch is set and never part
- * of the bounds the principal approves: tables for a date open some days before it, or
- * on a day of an earlier month, at a time on the venue's clock.
+ * A venue's stated release schedule, recorded once when its watch is set and never part of the bounds the principal
+ * approves: tables for a date open some days before it, or on a day of an earlier month, at a time on the venue's
+ * clock.
  */
 export interface WatchReleaseRule {
   schedule: { kind: 'days_ahead'; days: number } | { kind: 'monthly'; day: number; monthsAhead: number };
@@ -80,9 +73,9 @@ export interface WatchReleaseRule {
 /** The first check comes a few seconds after the release, once a venue that opens on the minute has opened. */
 const RELEASE_CHECK_DELAY_MS = 5_000;
 /**
- * Checks then run at the site's floor for ten minutes: long enough for a release that opens
- * late and for tables that come back when the first rush's checkouts are abandoned, and at
- * the default floor about a third of the hourly cap, which still bounds it.
+ * Checks then run at the site's floor: long enough for a release that opens late and for tables that come back when
+ * the first rush's checkouts are abandoned, and at the default floor about a third of the hourly cap, which still
+ * bounds it.
  */
 const RELEASE_BURST_MS = 10 * 60_000;
 
@@ -101,9 +94,8 @@ function releaseDate(schedule: WatchReleaseRule['schedule'], date: string): stri
   }
 }
 /**
- * The release instants a rule sets for each venue date the windows cover, read on the
- * venue's clock. A release that had passed when the watch was set (`createdAt`), or whose
- * check would come after the watch ends (`until`), sets none.
+ * The release instants a rule sets for each venue date the windows cover, read on the venue's clock. A release that
+ * had passed when the watch was set (`createdAt`), or whose check would come after the watch ends (`until`), sets none.
  */
 export function releaseInstants(
   rule: WatchReleaseRule,
@@ -134,8 +126,8 @@ function releaseBurstFrom(releases: readonly number[], at: number): number | und
   return first;
 }
 /**
- * When a check due at `due` may start: at once inside a release burst, which the
- * principal's night does not hold, otherwise once their night is over or a burst begins.
+ * When a check due at `due` may start: at once inside a release burst, which the principal's night does not hold,
+ * otherwise once their night is over or a burst begins.
  */
 export function watchStartAt(
   policy: WatchSitePolicy,
@@ -146,21 +138,19 @@ export function watchStartAt(
   return Math.min(watchQuietUntil(policy, due, principalTimeZone), releaseBurstFrom(releases, due) ?? Infinity);
 }
 /**
- * How often a watch with no reader may wake the browser agent in any hour (KTD20): every change it reports and
- * every request to mark its region again count, and a sixth change in the hour waits for the hour to allow it.
+ * How often a watch with no reader may wake the browser agent in any hour: every change it reports and every request
+ * to mark its region again count, and a change over the cap waits until the hour allows it.
  */
 export const WATCH_HOURLY_WAKES = 5;
-/** The most normalized text a marked region may hold (KTD20): the part that shows availability, not a whole page. */
+/** The most normalized text a marked region may hold: the part that shows availability, not a whole page. */
 export const WATCH_REGION_TEXT_LIMIT = 4_000;
-/** The longest a slowed watch waits between checks, before jitter, however many of its changes matched nothing. */
+/** Cap on a slowed watch's interval before jitter, however many of its changes matched nothing. */
 const WATCH_SLOWED_INTERVAL_MS = 60 * 60_000;
-/** How much slower a watch checks after `unmatched` wakes this hour that led to no booking: doubling, from none. */
+/** The interval multiplier after `unmatched` wakes this hour that led to no booking. */
 export function watchSlowdown(unmatched: number): number {
   return 2 ** Math.min(Math.max(0, unmatched), WATCH_HOURLY_WAKES);
 }
-/** What a watch's next check is planned from. */
 export interface WatchCheckPlanInput {
-  /** When the check just made ran. */
   readonly now: number;
   /** The earliest arrival the watch's windows allow. */
   readonly arrival: number;
@@ -168,15 +158,14 @@ export interface WatchCheckPlanInput {
   /** The interval the site's last plan chose, which this one never repeats. */
   readonly previous: number | null;
   readonly random?: () => number;
-  /** How much slower the watch checks, from `watchSlowdown`. */
+  /** A `watchSlowdown` multiplier. */
   readonly slowdown?: number;
 }
 /**
- * The one source of a watch's next check, after one at `now`: the floor inside a release
- * burst, otherwise a cadence that quickens as arrival nears, slowed by `slowdown` to at most an hour
- * when the watch's changes keep matching nothing, and never past a coming release check, nor so
- * close before one that the floor would hold it back. A bounded jitter avoids identical
- * intervals even when a deterministic random source repeats.
+ * A watch's next check after one at `now`: the floor inside a release burst, otherwise a cadence that quickens as
+ * arrival nears, slowed by `slowdown` to at most an hour when the watch's changes keep matching nothing. Never past a
+ * coming release check, nor so close before one that the floor would hold it back. Jitter, and the bump off
+ * `previous`, keep intervals from repeating even when a deterministic random source does.
  */
 export function nextWatchCheck(
   policy: WatchSitePolicy,

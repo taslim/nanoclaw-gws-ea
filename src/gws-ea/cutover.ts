@@ -1,22 +1,6 @@
 /**
- * What update and rollback share on the release layout (KTD1): the fence, the
- * one switch, and the host around them.
- *
- * The fence stops the assistant's service job and drains its agents, proves
- * the instance quiet (no process runs from its instance root, no container
- * carries its install's label or mounts its `state/`, nothing holds anything
- * under it open, Docker Desktop's own VM aside), and removes the live link,
- * so nothing can start a host until a
- * switch points the link again, not even the service manager after a reboot.
- * The switch, run only fenced, stamps the target release's upgrade tripwire
- * with its own script, resets the circuit breaker, applies the files kept
- * with the release (`applyReleaseFiles`), has the service manager read its
- * definition, and points the live link at it. Neither moves or copies state.
- *
- * The host side lives here too: the service started and checked through
- * NanoClaw's helpers, the checks that a started release serves (its Google
- * Chat receiving among them, KTD12), main's shared skills reconciled
- * (KTD16), and the follow-ups a committed release runs.
+ * What update and rollback share on the release layout: the fence, the one switch, and the host checks and
+ * follow-ups around them. Neither the fence nor the switch moves or copies state.
  */
 import { readdir, readFile, readlink, rm } from 'node:fs/promises';
 import path from 'node:path';
@@ -79,17 +63,15 @@ import { GwsEaError, releaseLine, type InstanceReservation, type ReleaseCoordina
 import { isRecord, parseJson, requireRecord, requireString, unwrapData } from './validation.js';
 import { hostLeaseLive, readDerivedImageGroups } from './verify.js';
 
-/** How long containers the drain stopped may take to be removed (`--rm` removes them after they exit). */
+/** `--rm` removes the containers the drain stopped only after they exit, so the proof waits for them. */
 const CONTAINER_POLL_MS = 1_000;
 const CONTAINER_LIMIT_MS = 30_000;
 const PROBE_TIMEOUT_MS = 60_000;
 /** The process a Linux VM runs as on macOS, as lsof names it (shortened). */
 const APPLE_VM = /^com\.apple\.Virtualization/u;
-/** The disk Docker Desktop's VM runs from, by name. */
 const DOCKER_DESKTOP_DISK = 'Docker.raw';
 const INVALID_DOCKER_OUTPUT = 'invalid_docker_output';
 
-/** The instance a fence proves quiet, with what Docker needs to look for its containers. */
 export interface QuietInstance {
   /** `<state root>/<hex8>`: every release, its state, and its records. */
   readonly instanceRoot: string;
@@ -100,19 +82,15 @@ export interface QuietInstance {
   readonly dockerEndpoint: string;
 }
 
-/** Boundary seams; each defaults to this process's. */
 export interface QuiescenceSeams {
-  /** Runs `ps`, Docker, and `lsof`. */
   readonly runCommand?: SanitizedCommandRunner;
   readonly platform?: NodeJS.Platform;
-  /** Where the tool environment is read. */
   readonly ambientEnv?: NodeJS.ProcessEnv;
   readonly sleep?: (milliseconds: number) => Promise<void>;
-  /** Where Linux's process table is read. */
   readonly procRoot?: string;
 }
 
-/** A process holding a file (or its working directory) open. */
+/** `file` may be the process's working directory. */
 export interface OpenFileHolder {
   readonly pid: number;
   readonly command: string;
@@ -128,10 +106,8 @@ function isInside(file: string, directory: string): boolean {
 }
 
 /**
- * Processes whose arguments name a path inside the instance root: its host,
- * its `ncl`, a script run from a release. One only reading the host's logs
- * (`gws-ea logs --follow`) touches no state. A tool started with relative
- * paths names none, which is what the open-file check is for.
+ * A process whose arguments name only paths under `logs/` (`gws-ea logs --follow`) touches no state. One started
+ * with relative paths names none; the open-file check catches it.
  */
 async function processesRunningFrom(
   instanceRoot: string,
@@ -158,7 +134,6 @@ async function processesRunningFrom(
   return found;
 }
 
-/** Docker, as the assistant reaches it. */
 function quietDocker(instance: QuietInstance, seams: QuiescenceSeams, args: readonly string[]) {
   return (seams.runCommand ?? runSanitizedCommand)({
     command: 'docker',
@@ -169,7 +144,6 @@ function quietDocker(instance: QuietInstance, seams: QuiescenceSeams, args: read
   });
 }
 
-/** Every container carrying the install's label, in any state. */
 async function labeledContainers(instance: QuietInstance, seams: QuiescenceSeams): Promise<string[]> {
   const label = getInstallScopedNames(instance.installId).containerInstallLabel;
   const { stdout } = await quietDocker(instance, seams, ['ps', '--all', '--quiet', '--filter', `label=${label}`]);
@@ -180,17 +154,12 @@ async function labeledContainers(instance: QuietInstance, seams: QuiescenceSeams
 }
 
 /**
- * Run `lsof` with the arguments after it, keeping any status but 1: lsof exits
- * 1 both when nothing it was asked about is open and, on macOS, once it found
- * what is open but skipped a process it may not inspect, so that status says
- * nothing about what it printed.
+ * lsof exits 1 both when nothing it was asked about is open and, on macOS, when it skipped a process it may not
+ * inspect, so status 1 says nothing about its output; any other failing status stands.
  */
 const LSOF = 'lsof "$@"; status=$?; [ "$status" -le 1 ] || exit "$status"';
 
-/**
- * `lsof` on everything under `directory`, in its field output, read whatever
- * its status; an error it meets is reported on stderr, and fails the check.
- */
+/** Its status cannot say whether lsof met an error, so anything on stderr fails the check. */
 async function lsofHolders(directory: string, seams: QuiescenceSeams): Promise<OpenFileHolder[]> {
   const { stdout, stderr } = await (seams.runCommand ?? runSanitizedCommand)({
     command: 'sh',
@@ -225,7 +194,6 @@ function unobservable(error: unknown): boolean {
   return ['ENOENT', 'ESRCH', 'EACCES', 'EPERM'].some((code) => isErrno(error, code));
 }
 
-/** Linux's process table: each process's working directory and open descriptors under `directory`. */
 async function procHolders(directory: string, procRoot: string): Promise<OpenFileHolder[]> {
   const holders: OpenFileHolder[] = [];
   for (const entry of await readdir(procRoot)) {
@@ -264,10 +232,8 @@ async function procHolders(directory: string, procRoot: string): Promise<OpenFil
 }
 
 /**
- * Every process holding anything under `directory` open, its working
- * directory included: `lsof` on macOS, the process table on Linux. A process
- * matched by its arguments misses one started with relative paths, or an
- * idle database connection; this sees both.
+ * Working directories included. Matching arguments misses a process started with relative paths, or an idle
+ * database connection; this sees both.
  */
 export async function openFileHolders(
   directory: string,
@@ -310,12 +276,9 @@ function summarizeHolders(holders: readonly OpenFileHolder[]): string {
 }
 
 /**
- * The holder that is Docker Desktop's own VM, when the assistant's Docker is
- * Docker Desktop: a Linux VM process holding Docker Desktop's disk open. On
- * macOS every container reaches the Mac's files through it, and it keeps a
- * file open for whatever its guest still caches, or leaked, long after the
- * container that read it has gone; it writes nothing of its own. Undefined
- * when no holder is that VM, so every holder still counts.
+ * The holder that is Docker Desktop's VM: an Apple VM process holding Docker Desktop's disk open. Every container
+ * reaches the Mac's files through it, and it keeps files open for what its guest still caches, or leaked, long
+ * after the container that read them has gone; it writes nothing of its own.
  */
 async function dockerDesktopVm(
   instance: QuietInstance,
@@ -326,7 +289,7 @@ async function dockerDesktopVm(
   const vms = [...new Set(holders.filter(({ command }) => APPLE_VM.test(command)).map(({ pid }) => pid))];
   if (vms.length === 0) return undefined;
   const { stdout: system } = await quietDocker(instance, seams, ['info', '--format', '{{.OperatingSystem}}']);
-  // Containers on another runtime are not ones this assistant's Docker can list.
+  // Another runtime's VM may serve containers this assistant's Docker cannot list, so its holds still count.
   if (system.trim() !== 'Docker Desktop') return undefined;
   for (const pid of vms) {
     const { stdout, stderr } = await (seams.runCommand ?? runSanitizedCommand)({
@@ -344,15 +307,13 @@ async function dockerDesktopVm(
   return undefined;
 }
 
-/** Whether a host folder is the state, inside it, or holds it, its links resolved. */
 function reachesState(source: string, state: string): boolean {
   const folder = canonicalPath(source);
   return isInside(folder, state) || isInside(state, folder);
 }
 
 /**
- * The host folder each named local volume binds, by name: a volume created
- * with `o=bind` and a `device` is a bind mount by another name. One with no
+ * A local volume created with `o=bind` and a `device` is a bind mount of that folder by another name; one with no
  * device keeps its data inside Docker, apart from the state.
  */
 async function localVolumeDevices(
@@ -383,12 +344,9 @@ async function localVolumeDevices(
 }
 
 /**
- * Every running container with a mount that can reach `state/`, whoever
- * started it, each with what reaches it. A bind mount, or a local volume
- * bound to a host folder, reaches it when its folder is the state, inside
- * it, or holds it, links resolved, since an agent container mounts the state
- * through its release's folder. A volume of any other driver could point
- * anywhere, so it counts too.
+ * Running containers, whoever started them, with a mount that can reach `state/`. A bind mount or bound local
+ * volume reaches it when its folder, links resolved, is the state, inside it, or holds it, since an agent container
+ * mounts the state through its release's folder. A volume of any other driver could point anywhere, so it counts.
  */
 async function containersReachingState(instance: QuietInstance, seams: QuiescenceSeams): Promise<string[]> {
   const { stdout: listed } = await quietDocker(instance, seams, ['ps', '--quiet', '--no-trunc']);
@@ -454,14 +412,10 @@ async function containersReachingState(instance: QuietInstance, seams: Quiescenc
 }
 
 /**
- * Prove a stopped assistant quiet (KTD1), each writer where it runs: no
- * process runs from its instance root, no container carries its install's
- * label in any state (those the drain stopped get a moment to be removed), no
- * running container can reach its `state/` through a mount, and no process holds anything under
- * it open, a database's `-wal`, `-shm`, and `-journal` side files included.
- * Docker Desktop's own VM is not a holder of its own: it is how containers
- * reach the Mac's files, and they are already accounted for. Refuses, naming
- * what it found, before anything is copied or moved.
+ * Checks each place a writer runs: processes running from the instance root, containers with its install's label in
+ * any state, running containers whose mounts reach `state/`, and any process holding something under `state/` open
+ * (a database's `-wal`, `-shm` and `-journal` files included). Docker Desktop's VM is not counted: the containers
+ * that reach the Mac's files through it are already checked. Refuses, naming what it found.
  */
 export async function assertInstanceQuiet(instance: QuietInstance, seams: QuiescenceSeams = {}): Promise<void> {
   const root = instance.instanceRoot;
@@ -496,30 +450,20 @@ export async function assertInstanceQuiet(instance: QuietInstance, seams: Quiesc
   if (others.length > 0) throw notQuiet(root, summarizeHolders(others));
 }
 
-/** OneCLI as a switch's host checks it; each step defaults to the real one. */
 export interface CutoverOnecli {
-  /**
-   * Re-verify the serving runtime before the fence (KTD15): observed by
-   * Compose's config hash, provenance, and ownership; anything but present is
-   * repaired by Compose, and probed for isolation, as create's repair is.
-   */
+  /** Before the fence: anything but present is repaired as create repairs it, isolation probe included. */
   reverify(layout: OnecliRuntimeLayout, pins: OnecliPins): Promise<void>;
-  /** Its health alone, once a release serves. */
+  /** Health only, never repairing, once a release serves. */
   observe(layout: OnecliRuntimeLayout, pins: OnecliPins): Promise<Observation>;
 }
 
-/** A cutover's boundary seams; each defaults to the real one. */
 export interface CutoverSeams {
-  /** Runs Git, Docker, `ps`, `lsof`, and the release's own scripts. */
   readonly runCommand?: SanitizedCommandRunner;
-  /** Where the tool environment of Docker and the release's scripts is read. */
   readonly ambientEnv?: NodeJS.ProcessEnv;
-  /** The service manager's platform and user, and the waits every poll takes. */
   readonly service?: ServiceControlOptions;
-  /** Reaches OneCLI's health endpoints and its admin API. */
   readonly fetch?: typeof globalThis.fetch;
   readonly onecli?: Partial<CutoverOnecli>;
-  /** `ncl <args> --json` through the assistant's own host. */
+  /** `ncl <args> --json`, answered by the assistant's own host. */
   readonly ncl?: (
     runtime: InstanceRuntimeConfig,
     args: readonly string[],
@@ -527,18 +471,14 @@ export interface CutoverSeams {
   ) => Promise<unknown>;
 }
 
-/** What a cutover needs from the driver, and its seams. */
 export interface CutoverDependencies extends CutoverSeams {
-  /** Upstream's service helpers (`scripts/update/service.ts`): the cutover stops and starts the host with them. */
   readonly serviceHelpers: NanoclawServiceHelpers;
-  /** Upstream's `.env` upsert (`setup/set-env.ts`): gws-ea's keys are written with it. */
   readonly upsertEnvVars: UpsertEnvVars;
-  /** Upstream's host readiness helpers: verification asks the host for its status. */
   readonly hostStatus: HostStatusHelpers;
   readonly reporter?: StepReporter;
 }
 
-/** What every step of one cutover works from, read once per run. */
+/** Read once per run, so every step of one cutover works from the same records. */
 export interface CutoverHost {
   readonly operation: InstanceOperation;
   readonly dependencies: CutoverDependencies;
@@ -554,7 +494,6 @@ export interface CutoverHost {
   readonly uid: number | undefined;
 }
 
-/** The assistant's one runtime record, read physically from its `state/`. */
 async function readCutoverRuntime(
   paths: ControlPlanePaths,
   reservation: InstanceReservation,
@@ -566,7 +505,6 @@ async function readCutoverRuntime(
   return runtime;
 }
 
-/** Read what one cutover works from: the reservation, the runtime, the layout, and the service. */
 export async function openCutoverHost(
   operation: InstanceOperation,
   dependencies: CutoverDependencies,
@@ -587,12 +525,10 @@ export async function openCutoverHost(
   };
 }
 
-/** How every cutover wait sleeps. */
 function cutoverSleep({ dependencies }: CutoverHost): (milliseconds: number) => Promise<void> {
   return dependencies.service?.sleep ?? ((milliseconds) => delay(milliseconds));
 }
 
-/** The instance as the quiescence proof looks for it. */
 function quietInstanceOf(host: CutoverHost): QuietInstance {
   return {
     instanceRoot: host.layout.root,
@@ -612,7 +548,6 @@ function cutoverQuiescence({ run, dependencies }: CutoverHost): QuiescenceSeams 
   };
 }
 
-/** What installing the assistant's service definition needs. */
 function cutoverServiceDependencies(host: CutoverHost): InstanceServiceDependencies {
   const { dependencies, runtime, uid } = host;
   return {
@@ -649,7 +584,6 @@ export function cutoverOnecli(host: CutoverHost): CutoverOnecli {
   };
 }
 
-/** Docker's environment for one assistant: the operator's tools, its home, and its Docker endpoint. */
 export function dockerEnvironment(
   runtime: InstanceRuntimeConfig,
   seams: Pick<CutoverSeams, 'ambientEnv'>,
@@ -660,7 +594,6 @@ export function dockerEnvironment(
   });
 }
 
-/** One assistant's images as `agent-image.ts` reaches them: from its instance directory, through its Docker. */
 export function assistantImageDocker(
   runtime: InstanceRuntimeConfig,
   seams: Pick<CutoverSeams, 'runCommand' | 'ambientEnv'>,
@@ -673,15 +606,10 @@ export function assistantImageDocker(
 }
 
 /**
- * Fence the assistant (KTD1): stop its service's job and drain its agents,
- * prove the instance quiet, then remove the live link, so nothing can start a
- * host until a switch points it again. `inspect` runs once nothing uses the
- * state and while the link is still there: an operation reads the schema the
- * host left, and an update checks its dry run still speaks for it. Fencing
- * an assistant already fenced stops whatever started since (a launchd job
- * loaded at login is booted out) and proves it quiet again; the link stays
- * absent. Reports the stop, ungraceful when the host left its claim lease
- * live.
+ * Removes the live link once the instance is proven quiet, so nothing, not even the service manager after a reboot,
+ * can start a host until a switch points it again. `inspect` runs while nothing uses the state and the link is still
+ * there. Fencing again stops whatever started since (a launchd job loaded at login is booted out). The stop is
+ * ungraceful when the host left its claim lease live.
  */
 export async function fenceInstance(host: CutoverHost, label: string, inspect?: () => void): Promise<OperationStop> {
   await runStep(host.reporter, { id: 'stop_host', label }, async () => {
@@ -699,17 +627,11 @@ export async function fenceInstance(host: CutoverHost, label: string, inspect?: 
 }
 
 /**
- * The one switch (KTD1), run only while the assistant is fenced and proven
- * quiet: stamp the target release's upgrade tripwire with its own script, so
- * the host it starts accepts exactly that release; reset the circuit
- * breaker, which counts only the crashes of the release it left; apply the
- * files kept with the release, its OneCLI project brought to its Compose file
- * and probed when that recreated a service or differs from the file of
- * `leaving`, the release the switch leaves, a failed probe refusing the
- * release before its host starts (KTD15); have the service manager read its
- * definition; and point the live link at it. Each step converges, so a
- * switch cut short is finished by running it again. Returns whether the
- * service definition changed, which the start needs.
+ * Run only while fenced and proven quiet. The target's upgrade tripwire is stamped with its own script, so its host
+ * accepts exactly that release, and the circuit breaker is reset, since it counts only the left release's crashes.
+ * A failed OneCLI probe, when applying the kept files recreated a gateway service or its Compose file differs from
+ * `leaving`'s, refuses the release before its host starts. Each step converges, so a switch cut short finishes when
+ * run again. Returns whether the service definition changed.
  */
 export async function switchTo(
   host: CutoverHost,
@@ -737,7 +659,6 @@ export async function switchTo(
   });
 }
 
-/** Start the release the live link names; a job still loaded is started afresh when its definition changed. */
 export async function startRelease(host: CutoverHost, definitionChanged: boolean, label: string): Promise<void> {
   await runStep(host.reporter, { id: 'start_release', label }, async () => {
     await host.service.start({ definitionChanged });
@@ -745,14 +666,10 @@ export async function startRelease(host: CutoverHost, definitionChanged: boolean
 }
 
 /**
- * Serve `move.from` again, the release an operation left, after the
- * operation stopped short of `move.to` serving. While the live link still
- * names `move.from`, nothing of its own was touched: the fence never removed
- * the link, or an earlier return already switched back; only its host is
- * started. Otherwise the assistant is fenced again, which stops whatever
- * started since and proves it quiet, `beforeSwitch` runs (a rollback's state
- * goes back), and `move.from` is switched to from `move.to`, its kept files
- * put back over whatever the operation's switch applied, and started.
+ * Serve `move.from` again after an operation stopped short of `move.to` serving. While the live link still names
+ * `move.from`, nothing of its own was touched, so only its host is started. Otherwise the assistant is fenced again,
+ * `beforeSwitch` runs (a rollback puts its state back), and the switch puts `move.from`'s kept files back over what
+ * the operation applied.
  */
 export async function serveLeftRelease(
   host: CutoverHost,
@@ -774,7 +691,6 @@ export async function serveLeftRelease(
 /** How long a started host may take to serve, and what a killed host's claim lease adds (`src/host-instance.ts`). */
 const HOST_READY_MS = 60_000;
 const HOST_LEASE_MS = 90_000;
-/** How often a started host is asked whether its Google Chat receives. */
 const CHAT_POLL_MS = 1_000;
 /** As long as the host's own `ncl` may take to answer while it starts. */
 const SKILLS_TIMEOUT_MS = 60_000;
@@ -784,7 +700,10 @@ function hostFailure(error: unknown, logs: string): string {
   return redact(message.replaceAll('logs/nanoclaw.error.log', path.join(logs, 'nanoclaw.error.log')));
 }
 
-/** The host serving the live release answers for its checkout, which NanoClaw's upgrade tripwire allows only at the commit it was stamped for. */
+/**
+ * A host answering for the live checkout serves the release, since NanoClaw's upgrade tripwire lets it start only at
+ * the commit it was stamped for.
+ */
 async function awaitServingHost(host: CutoverHost, budgetMs: number, subject: string): Promise<void> {
   try {
     await host.dependencies.hostStatus.waitForHost(host.runtime.checkout_root, { timeoutMs: budgetMs });
@@ -799,11 +718,10 @@ async function awaitServingHost(host: CutoverHost, budgetMs: number, subject: st
 }
 
 /**
- * Wait until the started host's Google Chat receives (KTD12): its consumer
- * connected and its subscription active, as `gws-ea-chat health` reports
- * them. A broken Google sign-in fails both and only a new sign-in repairs
- * it, so the release serves through it, and why is returned; anything else
- * that keeps Chat from receiving refuses the release.
+ * Receiving means the consumer is connected and the subscription active, as `gws-ea-chat health` reports. A broken
+ * Google sign-in fails only the subscription (the consumer pulls with the subscriber key), and only a new sign-in
+ * repairs it, so while the consumer is connected the release serves through it and the reason is returned; anything
+ * else that keeps Chat from receiving refuses the release.
  */
 async function awaitChatReceiving(host: CutoverHost, budgetMs: number, subject: string): Promise<string | null> {
   const ncl = host.dependencies.ncl ?? runInstanceNclJson;
@@ -826,11 +744,7 @@ async function awaitChatReceiving(host: CutoverHost, budgetMs: number, subject: 
   }
 }
 
-/**
- * Wait for the started host's service to be healthy, its `ncl` answering; a
- * killed host's claim lease lengthens the wait. Returns the budget every
- * later wait is allowed.
- */
+/** A killed host's claim lease lengthens the wait. Returns the budget every later wait is allowed. */
 async function awaitHealthyHost(host: CutoverHost, leaseHeld: boolean, subject: string): Promise<number> {
   const budget = leaseHeld ? HOST_READY_MS + HOST_LEASE_MS : HOST_READY_MS;
   if (!(await host.service.verifyHealth(budget))) {
@@ -839,16 +753,11 @@ async function awaitHealthyHost(host: CutoverHost, leaseHeld: boolean, subject: 
   return budget;
 }
 
-/** How a release that counts as serving serves. */
 export interface ServedRelease {
-  /**
-   * Why its Google Chat waits on a new Google sign-in, the release's only
-   * fault, which it serves through (KTD12); null while Chat receives.
-   */
+  /** Why Chat waits on a new Google sign-in, a fault the release serves through; null while Chat receives. */
   readonly signInNeeded: string | null;
 }
 
-/** What a release must show to count as serving. */
 export interface ServingRelease {
   /** The reservation with that release overlaid: its commit must be the live link's. */
   readonly view: InstanceReservation;
@@ -861,14 +770,8 @@ export interface ServingRelease {
 }
 
 /**
- * Check a started release serves. Its service is healthy; the live link names
- * the release, at its commit with no tracked changes, and the host answers
- * for it, which NanoClaw's upgrade tripwire allows only at the commit it was
- * stamped for; its Google Chat receives (KTD12); and OneCLI is healthy (a
- * gateway the switch recreated was probed before the start). When a broken
- * Google sign-in is all that keeps Chat from receiving, the release serves,
- * and says so. A killed host's claim lease can delay the new one, so it
- * lengthens every wait. A host that went down since it was started is
+ * The live link must name the release at its commit with no tracked changes. When a broken Google sign-in is all
+ * that keeps Chat from receiving, the release serves and says so. A host that went down since it was started is
  * started again; a running one is left as it is.
  */
 export async function verifyServingRelease(host: CutoverHost, release: ServingRelease): Promise<ServedRelease> {
@@ -888,10 +791,8 @@ export async function verifyServingRelease(host: CutoverHost, release: ServingRe
 }
 
 /**
- * Reconcile main's shared skills to the started release's own list (KTD16),
- * through the assistant's own `ncl` once its host answers, before the release
- * is verified: a release that changes the list reaches main this way, on
- * every update and rollback, never by restamping main's template.
+ * A release that changes main's shared skills reaches main only this way, never by restamping main's template. It
+ * runs before the release is verified, so it waits for a healthy host itself.
  */
 export async function reconcileMainSkills(host: CutoverHost, leaseHeld: boolean): Promise<void> {
   await runStep(host.reporter, { id: 'reconcile_main_skills', label: "Updating main's shared skills…" }, async () => {
@@ -918,11 +819,6 @@ export async function reconcileMainSkills(host: CutoverHost, leaseHeld: boolean)
   });
 }
 
-/**
- * The follow-ups a committed release runs (KTD4, KTD6): each agent group
- * running its own image has it rebuilt on the release's image, then whatever
- * nothing keeps any more is pruned.
- */
 export function releaseFollowUps(runtime: InstanceRuntimeConfig): OperationFollowUp[] {
   const base = getInstallScopedNames(runtime.install_id).containerImageBase;
   return [
@@ -948,17 +844,13 @@ function describeFollowUp(followUp: OperationFollowUp): string {
   }
 }
 
-/** Work that brings the release up to date, before any cleanup. */
 function isCleanup(followUp: OperationFollowUp): boolean {
   return followUp.kind !== 'rebuild_group_image';
 }
 
 /**
- * Rebuild an agent group's own image on the base the release runs with the
- * assistant's own `ncl` (KTD6): NanoClaw's `buildAgentGroupImage`, then a
- * restart of that group's containers. The image the group's tag named is
- * recorded first, to be reclaimed once nothing names it (KTD6). A group that
- * no longer runs its own image is done.
+ * The image the group's tag named is recorded before the rebuild, to be reclaimed once nothing names it. A group
+ * that no longer runs its own image is done.
  */
 async function rebuildGroupImage(
   operation: InstanceOperation,
@@ -983,7 +875,7 @@ async function rebuildGroupImage(
   );
 }
 
-/** Delete the releases, snapshots, and quarantines nothing keeps: the live release and the rollback point stay (KTD4). */
+/** Delete the releases, snapshots, and quarantines nothing keeps: the live release and the rollback point stay. */
 async function pruneReleases(
   operation: InstanceOperation,
   runtime: InstanceRuntimeConfig,
@@ -1000,7 +892,6 @@ async function pruneReleases(
   );
 }
 
-/** Run one follow-up. */
 async function runFollowUp(
   operation: InstanceOperation,
   runtime: InstanceRuntimeConfig,
@@ -1025,12 +916,9 @@ function sentenceCase(text: string): string {
 }
 
 /**
- * Run a committed update's or rollback's follow-ups (KTD2): the per-group
- * image rebuilds first, then, once they all succeeded, the cleanup: the
- * images they displaced, and the prune. Each is struck from the record as it
- * finishes, and the record is deleted with the last. A failure never rolls
- * back: it stays in the record, `status` reports it, and the next run of the
- * same command retries it.
+ * The image rebuilds run first; the cleanup runs only once they all succeeded. Each follow-up is struck from the
+ * record as it finishes, and the record is deleted with the last. A failure never rolls back: it stays in the record,
+ * `status` reports it, and the next run of the same command retries it.
  */
 export async function finishFollowUps(operation: InstanceOperation, dependencies: CutoverDependencies): Promise<void> {
   operation.assertActive();

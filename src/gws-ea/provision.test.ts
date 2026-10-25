@@ -2066,7 +2066,7 @@ describe('create on the release layout', () => {
     };
   }
 
-  /** The release layout create leaves (KTD1), as its directories hold it. */
+  /** The release layout create leaves, as its directories hold it. */
   async function expectReleaseLayout(create: Awaited<ReturnType<typeof releaseCreate>>): Promise<void> {
     const { layout, release, reserved } = create;
     expect(await readlink(layout.current)).toBe(release);
@@ -2840,7 +2840,7 @@ describe('the vault a new assistant inherits from 1Password enablement', () => {
   });
 });
 
-describe('the web alias an assistant with the browser enabled gets (KTD13)', () => {
+describe('the web alias an assistant with the browser enabled gets', () => {
   /** The running host as the alias step first reaches it: its profile, and no web alias asked for yet. */
   function aliasHostNcl() {
     const calls: string[] = [];

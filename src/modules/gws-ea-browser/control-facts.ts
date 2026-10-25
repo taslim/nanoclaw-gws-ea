@@ -1,6 +1,6 @@
 /**
  * What the host reads before it classifies an action: the control's facts and the page's transaction signal,
- * read in an isolated world in every frame, so page script cannot rewrite what the classifier sees.
+ * read in an isolated world in every frame, so page script cannot answer for the reader.
  */
 import { randomUUID } from 'node:crypto';
 import type { CDPSession, ElementHandle, Frame, Page } from 'playwright-core';
@@ -19,7 +19,6 @@ import {
 
 /** What the control's own form or dialog holds, read with the control. */
 export interface ControlRegion {
-  /** The control sits in an open dialog. */
   readonly dialog: boolean;
   /**
    * The control's form, or the open dialog around it, or for a control in neither its document outside every
@@ -45,8 +44,8 @@ export interface ControlRegion {
 }
 
 /**
- * The choice a click would toggle (KTD1 step 4): a label's control, the choice inside a clicked label or styled
- * wrapper, or the nearest checkbox, switch or radio around the target; a select for a selection.
+ * The choice a click would toggle: a label's control, the choice inside a clicked label or styled wrapper, or the
+ * nearest checkbox, switch or radio around the target; a select for a selection.
  */
 export interface ToggledChoice {
   readonly kind: 'checkbox' | 'switch' | 'radio' | 'select';
@@ -54,11 +53,9 @@ export interface ToggledChoice {
   readonly label: string;
   /** A radio option's question: its group's legend or label. */
   readonly group?: string;
-  /** A select's options, in order. */
   readonly options?: readonly string[];
 }
 
-/** The facts the classifier decides from. */
 export interface ControlFacts {
   name: string;
   visibleLabel?: string;
@@ -85,11 +82,10 @@ export interface ControlFacts {
   /** The control sits in a chat widget's frame. */
   chatFrame?: boolean;
   region?: ControlRegion;
-  /** The choice the action would toggle, when it toggles one. */
   toggles?: ToggledChoice;
   /**
    * The control is a field for payment details (a card number, security code or expiry, by its own name, label or
-   * autocomplete), or any field inside a processor's payment frame. Nothing is ever typed or chosen there (R12).
+   * autocomplete), or any field inside a processor's payment frame. Nothing is ever typed or chosen there.
    */
   cardEntry?: boolean;
 }
@@ -128,7 +124,6 @@ const PAGE_VOCABULARY = {
     /(?:^|[^a-z])(?:cc-[a-z-]+|card.?(?:number|num|no|holder|cvc|cvv|csc|code|security|expir\w*|exp)|cardnumber|(?:credit|debit).?card|cvc|cvv2?|csc|exp-?date|mm\s*\/\s*yy)(?:[^a-z]|$)/iu,
   /** A gift card's or voucher's code, which a checkout applies like a coupon: no card details. */
   giftCard: /gift|voucher/iu,
-  /** Input types that take no typed or chosen text. */
   noTextEntry: NO_TEXT_ENTRY,
   /** What marks a field's value as a credential, code or payment secret (authentication-signatures owns these). */
   secretAutocomplete: SECRET_AUTOCOMPLETE,
@@ -154,7 +149,7 @@ const PAGE_VOCABULARY = {
   chatOwner: /\b(?:chat|messenger|messaging|live\s*chat|conversations?|support\s+widget)\b/iu,
 } as const satisfies Record<string, RegExp>;
 
-/** A saved payment method as a page shows it, and an express-pay button's name, as the classifier reads both. */
+/** Shared with the generic checkout reader, so it reads a payment method as the classifier does. */
 export const PAYMENT_VOCABULARY = {
   savedCard: PAGE_VOCABULARY.savedCard,
   expressPay: PAGE_VOCABULARY.expressPay,
@@ -200,7 +195,6 @@ const PAYMENT_PROCESSORS: readonly string[] = [
   'pay-api.amazon.com',
 ];
 
-/** Whether a host belongs to a payment processor. */
 export function paymentProcessorHost(host: string): boolean {
   const name = host.toLowerCase();
   return PAYMENT_PROCESSORS.some((processor) => name === processor || name.endsWith(`.${processor}`));
@@ -228,10 +222,9 @@ const ACCOUNT_PATH =
   /(?:^|\/)(?:account|accounts|my-?account|profile|settings|preferences|security|user|me|wallet|payment-?methods?)(?:[/.]|$)/iu;
 
 /**
- * How an isolated world reads a choice, shared by the classifier's reader and the consent engine's
- * (consent.ts), so both read the same wording for the same box. Plain JavaScript statements: a choice's kind,
- * the choice a click toggles, its wording as the page shows it, and where that wording links. Visible text only;
- * a box with none is named by its accessible name, then its field name.
+ * How an isolated world reads a choice, shared by the classifier's reader and the consent engine's (consent.ts),
+ * so both read the same wording for the same box. Visible text only; a box with none is named by its accessible
+ * name, then its field name.
  */
 export const CHOICE_SOURCE = String.raw`
   const choiceParent = (node) => (node.parentNode instanceof ShadowRoot ? node.parentNode.host : node.parentElement);
@@ -522,7 +515,7 @@ const librarySource = String.raw`(sources) => {
   const secretField = (element) => textEntry(element) && (element.type === 'password' ||
     re.secretAutocomplete.test(element.getAttribute('autocomplete') || '') ||
     re.secretField.test([describe(element), labelsOf(element)].join(' ')));
-  // A field holding a secret (KTD6): a password, a code or payment details, by its type, autocomplete, names or
+  // A field holding a secret: a password, a code or payment details, by its type, autocomplete, names or
   // labels, so a show-password toggle that made it a text field still counts.
   const secretValue = (element) => (secretField(element) || cardEntryField(element)) &&
     typeof element.value === 'string' && element.value !== '';
@@ -827,12 +820,11 @@ export interface CheckoutField {
   /** A box's or a radio option's state; null for any other field. */
   readonly checked: boolean | null;
 }
-/** The checkout around a control: its form, else the open dialog around it, else its document (KTD3). */
+/** The checkout around a control: its form, else the open dialog around it, else its document. */
 export interface CheckoutRegion {
   readonly kind: 'form' | 'dialog' | 'document';
   /** The control's own accessible name. */
   readonly label: string;
-  /** The control's box on its document's viewport. */
   readonly controlBox: CheckoutBox;
   readonly lines: readonly CheckoutLine[];
   readonly fields: readonly CheckoutField[];
@@ -860,7 +852,6 @@ export interface CheckoutFrame {
 export interface CheckoutRead {
   readonly facts: ControlFacts;
   readonly region: CheckoutRegion;
-  /** The address of the control's frame. */
   readonly frameUrl: string;
   readonly frames: readonly CheckoutFrame[];
 }
@@ -900,7 +891,6 @@ export class ControlFactsUnavailableError extends Error {
   }
 }
 
-/** A read value as a plain object; undefined for null, an array or anything else. */
 export const record = (value: unknown): Record<string, unknown> | undefined =>
   typeof value === 'object' && value !== null && !Array.isArray(value) ? (value as Record<string, unknown>) : undefined;
 const flag = (value: unknown): boolean => value === true;
@@ -1049,7 +1039,7 @@ function parseRegion(value: unknown): CheckoutRegion | undefined {
 
 const TOGGLED_KINDS: ReadonlySet<unknown> = new Set(['checkbox', 'switch', 'radio', 'select']);
 
-/** The toggled choice as read, or undefined for none; anything malformed fails the whole read. */
+/** Null when the action toggles no choice; undefined when the read is malformed, which fails the whole read. */
 function parseToggled(value: unknown): ToggledChoice | null | undefined {
   if (value === null) return null;
   const choice = record(value);
@@ -1246,7 +1236,7 @@ export async function readPageControlFacts(page: Page, element: ElementHandle): 
 }
 
 /**
- * Reads a checkout around a control (KTD4): the control's facts, its form, dialog or document line by line with
+ * Reads a checkout around a control: the control's facts, its form, dialog or document line by line with
  * its fields, and every frame's words, wallets and payment entry, all in isolated worlds. Throws
  * ControlFactsUnavailableError when any part cannot be read; nothing is ever guessed.
  */
@@ -1257,10 +1247,10 @@ export async function readCheckoutRegion(page: Page, element: ElementHandle): Pr
 }
 
 /**
- * Host-only values of fields holding a secret (KTD6): passwords, codes or payment details, in every frame and
- * every shadow root, closed ones included. Each target's pierced DOM tree finds the fields, and each field's
- * value is read in its frame's isolated world, so page script cannot answer for it. Throws
- * ControlFactsUnavailableError when any part cannot be read; nothing is ever guessed.
+ * Host-only values of fields holding a secret: passwords, codes or payment details, in every frame and every
+ * shadow root, closed ones included. Each target's pierced DOM tree finds the fields, and each field's value is
+ * read in its frame's isolated world, so page script cannot answer for it. Throws ControlFactsUnavailableError
+ * when any part cannot be read; nothing is ever guessed.
  */
 export async function readPageSecretValues(page: Page): Promise<readonly string[]> {
   const values = new Set<string>();

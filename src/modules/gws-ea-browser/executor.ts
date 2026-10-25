@@ -188,7 +188,7 @@ function givenText(action: BrowserAction): string[] {
   return action.kind === 'form_input' ? action.fields.map((field) => field.value) : [];
 }
 
-/** Payment details are never entered (R12); passwords and codes only through the host's own fills. */
+/** Payment details are never entered; passwords and codes only through the host's own fills. */
 async function refuseFieldEntry(page: Page, target: PinnedBrowserRef): Promise<ControlFacts> {
   const facts = await readPageControlFacts(page, target.element);
   if (facts.cardEntry === true) throw new BrowserBatchStop('card_field');
@@ -197,8 +197,8 @@ async function refuseFieldEntry(page: Page, target: PinnedBrowserRef): Promise<C
 }
 
 /**
- * Types each value into its field, in order. Page script may submit or post as a field changes, so the fills run
- * inside one script-request window, as a press does (KTD2). Typing presses nothing: no confirmation check follows.
+ * Page script may submit or post as a field changes, so the fills run inside one script-request window, as a press
+ * does. Typing presses nothing: no confirmation check follows.
  */
 async function fieldInput(
   context: BrowserOperationContext,
@@ -220,7 +220,7 @@ class BrowserBatchStop extends Error {
   }
 }
 
-/** An ordinary press landed on a confirmation that shows a charge: it bought something nobody approved (KTD10). */
+/** An ordinary press landed on a confirmation that shows a charge: it bought something nobody approved. */
 class UnapprovedCommitStop extends BrowserBatchStop {
   constructor(readonly commit: UnapprovedCommit) {
     super('unapproved_commit');
@@ -233,8 +233,8 @@ const ACTIONABLE_WAIT_MS = 5_000;
 const CONFIRMATION_LOAD_MS = 5_000;
 
 /**
- * A native action on its element (KTD1): never forced or dispatched, so a control another element covers is
- * not pressed through its cover. It never waits on a navigation it starts; the action's window does.
+ * A native action on its element: never forced or dispatched, so a control another element covers is not
+ * pressed through its cover. It never waits on a navigation it starts; the action's window does.
  */
 async function nativeAction(
   context: BrowserOperationContext,
@@ -255,7 +255,7 @@ async function nativeAction(
 const ENTER_KEY = /^(?:Shift\+)?Enter$/u;
 const SPACE_KEY = /^(?:Shift\+)?Space$/u;
 
-/** Whether an action may run an ordinary press, whose result the confirmation check reads (KTD10). */
+/** Whether an action may run an ordinary press, whose result the confirmation check reads. */
 function mayPress(action: BrowserAction): boolean {
   if (action.kind === 'click') return true;
   if (action.kind === 'key') return ENTER_KEY.test(action.key) || SPACE_KEY.test(action.key);
@@ -275,9 +275,9 @@ function sameConfirmation(left: ConfirmationEvidence, right: ConfirmationEvidenc
 }
 
 /**
- * Whether `evidence` is the merchant's record of a purchase this job placed under an approval, confirmed for no
- * more than the approved total (KTD8): the same order number for more is something added to that order. A free
- * commit was approved for nothing, so a charge on its record is never its own.
+ * Whether `evidence` is the merchant's record of a purchase this job placed under an approval, confirmed for no more
+ * than the approved total: the same order number for more is something added to that order. A free commit was approved
+ * for nothing, so a charge on its record is never its own.
  */
 async function placedByJob(context: BrowserOperationContext, evidence: ConfirmationEvidence): Promise<boolean> {
   const { charged } = evidence;
@@ -296,10 +296,10 @@ async function placedByJob(context: BrowserOperationContext, evidence: Confirmat
 }
 
 /**
- * After an ordinary press: a new confirmation showing a charge means it bought something nobody approved (KTD10).
- * `site` is the merchant, the page's site when it was pressed. An order the page showed for the same charge before
- * the press (`before`) bought nothing, wherever the press shows it again: a press on a thank-you page, or its
- * receipt or tracking. Nor did the order this job's own approved purchase placed, for up to its approved total.
+ * After an ordinary press: a new confirmation showing a charge means it bought something nobody approved. `site` is the
+ * merchant, the page's site when it was pressed. An order the page showed for the same charge before the press
+ * (`before`) bought nothing, wherever the press shows it again: a press on a thank-you page, or its receipt or
+ * tracking. Nor did the order this job's own approved purchase placed, for up to its approved total.
  */
 async function unapprovedCommit(
   context: BrowserOperationContext,
@@ -360,7 +360,7 @@ export async function executeBrowserBatch(
   if (options.siteAccess && (!options.page || !options.readOnly))
     throw new Error('Signed-out site access requires an explicit read-only page');
   const { actions } = validateBrowserBatch(payload);
-  // Before any action runs: an address the assistant converses from never goes onto a site (KTD14).
+  // Before any action runs: an address the assistant converses from never goes onto a site.
   const addressStop = await givenAddressStop(actions.flatMap(givenText));
   if (addressStop) return { status: 'stopped', reason: addressStop, repeat_safe: true };
   const page = options.page ?? (await context.page());
@@ -376,7 +376,7 @@ export async function executeBrowserBatch(
     if (refused) return refused;
     throw error;
   }
-  // Spending nobody approved stops the job, once its operation has ended (KTD10).
+  // Spending nobody approved stops the job, once its operation has ended.
   return ran.unapproved
     ? { ...ran.answer, incident: await stopForUnapprovedCommit(context, ran.unapproved) }
     : ran.answer;
@@ -408,7 +408,6 @@ async function executeBatch(
   const navigated = (frame: ReturnType<Page['mainFrame']>): void => {
     if (frame === page.mainFrame()) ++navigation;
   };
-  /** Every activation carries the request's own deadline checks and budget. */
   let controls = new Map<string, BrowserActionControl>();
   const recordField = (
     target: PinnedBrowserRef,
@@ -443,8 +442,8 @@ async function executeBatch(
         }
       }
     } else refs = await pinBrowserRefs(page, requestedRefs);
-    // Before any action runs, the principal's personal data goes onto no site but where main disclosed it for this
-    // errand: each field's value goes to the site of the frame the field is in (KTD19).
+    // Before any action runs, the principal's personal data goes onto no site but where the errand's delegator
+    // disclosed it: each field's value goes to the site of the frame the field is in.
     const dataStop = await personalDataStop(context.store.db, context.job.id, actions, refs);
     if (dataStop) return { answer: { status: 'stopped', reason: dataStop, repeat_safe: true } };
     for (let index = 0; index < actions.length; index++) {
@@ -456,7 +455,7 @@ async function executeBatch(
       const site = registrableSite(page.url());
       let data: BrowserActionData = {};
       let trace: BrowserActionTrace | undefined;
-      // Whether an ordinary press ran, whose result the confirmation check reads (KTD10).
+      // Whether an ordinary press ran, whose result the confirmation check reads.
       let pressed = false;
       try {
         await context.assertActive();
@@ -484,7 +483,7 @@ async function executeBatch(
         if (options.readOnly && !(await isReadOnlyBrowserAction(page, action, refs)))
           throw new BrowserBatchStop('read_only');
         await context.assertActive();
-        // What the page already confirmed: a press that leaves it in place bought nothing (KTD10).
+        // What the page already confirmed: a press that leaves it in place bought nothing.
         const confirmedBefore = mayPress(action) ? await readConfirmations(page) : [];
         const target = 'ref' in action ? refs.get(action.ref) : undefined;
         if (['click', 'type', 'select', 'key', 'form_input', 'upload', 'download'].includes(action.kind))
@@ -643,7 +642,7 @@ async function executeBatch(
             break;
           }
           case 'screenshot':
-            // The same isolated-world scan as the card's picture, shadow roots included (KTD6).
+            // The same isolated-world scan as the card's picture, shadow roots included.
             if (await pageMayShowSecret(page)) throw new BrowserBatchStop('secret_field');
             else {
               const image = {
@@ -749,7 +748,7 @@ async function executeBatch(
   let observation;
   if (!page.isClosed()) {
     try {
-      // Still inside the job's operation: the host settles a cookie banner before it observes (R18).
+      // Still inside the job's operation: the host settles a cookie banner before it observes.
       const cookieBanner = await settleCookieBanners(page, {
         scope: { jobId: context.job.id, db: context.store.db },
         assertActive: context.assertActive,

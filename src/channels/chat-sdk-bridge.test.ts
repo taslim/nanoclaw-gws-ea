@@ -1675,7 +1675,7 @@ describe('createChatSdkBridge — requests as text', () => {
   });
 });
 
-describe('createChatSdkBridge — pictures on requests (KTD6)', () => {
+describe('createChatSdkBridge — pictures on requests', () => {
   // A request may name pictures that go with it, such as a checkout's total
   // and its commit control; their bytes ride beside its content as the
   // message's files. They go on the request's own message only through an

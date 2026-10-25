@@ -2,8 +2,8 @@ import type { DbDriver } from '../../db/driver.js';
 import type { ModuleMigration } from '../../db/migrations/index.js';
 
 /**
- * The person record (KTD8), its invariants held by the schema itself so a
- * writer that skips `db.ts` still cannot break them:
+ * The person record, its invariants held by the schema itself so a writer
+ * that skips `db.ts` still cannot break them:
  *
  * - each person has exactly one level from the fixed set, with its source;
  *   anyone without a record is unknown, so `unknown` is never stored;
@@ -12,9 +12,9 @@ import type { ModuleMigration } from '../../db/migrations/index.js';
  * - a forgotten identity survives only as a keyed fingerprint (an HMAC-SHA256
  *   hex digest), never as the handle itself.
  *
- * `match_key` is the identity as `fingerprint.ts` normalizes it (case, Gmail
- * dots, plus-addressing), so an address made the principal's can release
- * every spelling of it.
+ * `match_key` is the identity as `identityMatchKey` normalizes it (case,
+ * Gmail dots, plus-addressing), so an address made the principal's can
+ * release every spelling of it.
  *
  * The record also held an organization, notes, remembered names and the
  * principal's standing instructions, and capped a learned level at active;
@@ -80,7 +80,7 @@ export const gwsEaPeopleMigration: ModuleMigration = {
 
 const THIN_RECORD = 'module:gws-ea-people:thin-record';
 
-/** What the thin record would drop, as "<what>: <count>", or nothing when the store holds none of it. */
+/** As "<what>: <count>"; empty when the store holds none of what the thin record drops. */
 async function droppedData(db: DbDriver): Promise<string[]> {
   const counts: ReadonlyArray<readonly [string, string]> = [
     ['people with notes', 'SELECT COUNT(notes) AS count FROM gws_ea_people'],
@@ -97,14 +97,14 @@ async function droppedData(db: DbDriver): Promise<string[]> {
 }
 
 /**
- * The record keeps only what the host enforces (KTD10): a person's name,
- * identities, one level with who set it, and the forget fingerprints. What
- * `main` knows of a person (organization, notes, the names the principal uses
- * for them, and the principal's instructions about them) lives in `main`'s
- * memory files, and which level fits someone is `main`'s judgment, so the
- * record no longer caps a learned level. The migration carries nothing over:
- * it refuses, naming what it found and changing nothing, while any of that is
- * held, so an update's dry run stops before anything is lost.
+ * The record keeps only what the host enforces: a person's name, identities,
+ * one level with who set it, and the forget fingerprints. What `main` knows of
+ * a person (organization, notes, the names the principal uses for them, and
+ * the principal's instructions about them) lives in `main`'s memory files,
+ * and which level fits someone is `main`'s judgment, so the record no longer
+ * caps a learned level. The migration carries nothing over: it refuses,
+ * naming what it found and changing nothing, while any of that is held, so an
+ * update's dry run stops before anything is lost.
  *
  * Dropping a table constraint means recreating the table (new, copy, drop,
  * rename), so it runs with foreign keys off: dropping the old table must not

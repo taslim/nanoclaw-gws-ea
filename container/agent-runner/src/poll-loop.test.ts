@@ -1052,7 +1052,7 @@ describe('a conversation turn of only scheduled tasks', () => {
 });
 
 /**
- * A turn names the messages it answers (KTD12): its failure report carries
+ * A turn names the messages it answers: its failure report carries
  * them, and so does every message it writes to a person, by the poll loop or
  * by a tool, so the host can tell whether a failure is the principal's to
  * hear of.

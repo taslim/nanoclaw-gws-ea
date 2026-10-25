@@ -1,5 +1,5 @@
 /**
- * Forgetting a person across matters (Slice 5 R26, AE9): they leave every
+ * Forgetting a person across matters: they leave every
  * matter's links and the accounts on its threads, a matter kept only for
  * them goes with its look, and main is asked to rewrite every matter whose
  * pieces or words may name them. A look never shows them again.
@@ -251,7 +251,7 @@ afterEach(async () => {
 });
 
 describe('forgetting a person across matters', () => {
-  it('takes Juno off every matter, and deletes the matters kept only for her with their looks (AE9)', async () => {
+  it('takes Juno off every matter, and deletes the matters kept only for her with their looks', async () => {
     const birthday = await open("Juno's birthday", { person: juno, memory: JUNO_FILE }, { 'look-cron': YEARLY });
     const callBack = await open('Call back', { person: juno });
     const acme = await open('Acme renewal', { person: `${juno},${remy}`, thread: THREAD_REMY });

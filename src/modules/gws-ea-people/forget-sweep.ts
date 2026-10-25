@@ -1,8 +1,8 @@
 /**
- * Forgetting again after a snapshot restore (R5, KTD8). A rollback that
- * restores state from before a forget brings the forgotten person back: in
- * the people store, and in main's memory. Before any inbound event routes,
- * the host sweeps the handoff gws-ea left:
+ * Forgetting again after a snapshot restore. A rollback that restores state
+ * from before a forget brings the forgotten person back: in the people store,
+ * and in main's memory. Before any inbound event routes, the host sweeps the
+ * handoff gws-ea left:
  *
  *   1. it records the handed-over fingerprints, in one transaction;
  *   2. it keeps in the handoff the name of everyone holding a fingerprinted
@@ -11,7 +11,7 @@
  *   3. it forgets each through `forgetPerson`, reviews and hooks included,
  *      keeping in the handoff what each forget put to main to rewrite, as
  *      soon as it is known, since the forget took away what led to it; one
- *      it cannot forget (an identity with access in NanoClaw) is logged and
+ *      it cannot forget (such as one with access in NanoClaw) is logged and
  *      skipped, and their fingerprints still refuse learning;
  *   4. it tells main, in one note, whom to clear from its memory again and
  *      what to rewrite again, as the restore brought back main's words too;
@@ -123,9 +123,9 @@ async function forgetAgain(file: string): Promise<void> {
 }
 
 /**
- * Sweep the forget handoff at `file`, if there is one. Never throws: a sweep
- * that fails is logged, keeps the handoff for the next start, and lets the
- * host serve, since the fingerprints it recorded already refuse learning.
+ * Never throws: a failed sweep is logged and keeps the handoff for the next
+ * start, and the host serves on, since any fingerprints it recorded already
+ * refuse learning.
  */
 export async function sweepForgetHandoff(file: string): Promise<void> {
   /* eslint-disable no-catch-all/no-catch-all -- the host serves on; the handoff stays for its next start */

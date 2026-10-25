@@ -17,7 +17,7 @@ async function recover(id: string, work: () => Promise<void>): Promise<void> {
     log.error('Chat lifecycle item failed; it will resume', { id, error });
   }
 }
-/** One ordered loop for expiry and registered cutover/retirement resumes. */
+/** Expiry, each chat's upkeep and every registered lifecycle task run in one ordered loop. */
 export async function sweepChatLifecycle(): Promise<void> {
   if (!(await getDb().hasTable('gws_ea_chats'))) return;
   await recover('expiry', expireAskingChats);

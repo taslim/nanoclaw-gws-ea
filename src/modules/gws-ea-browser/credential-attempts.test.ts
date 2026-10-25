@@ -470,7 +470,7 @@ describe('password changes', () => {
     expect(await subject.unresolved()).toEqual([]);
   });
 
-  it('keeps both credentials while a change is uncertain, discloses no value, and settles it after a restart (AE4)', async () => {
+  it('keeps both credentials while a change is uncertain, discloses no value, and settles it after a restart', async () => {
     const results: unknown[] = [];
     const errors: unknown[] = [];
     const subject = service();

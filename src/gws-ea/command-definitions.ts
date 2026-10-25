@@ -18,7 +18,6 @@ import {
   ONEPASSWORD_DISABLE_SCHEMA,
   ONEPASSWORD_OPERATION_SCHEMA,
 } from './result-schema.js';
-/** The public grammar and discovery metadata, bound to existing domain handlers. */
 export type AttemptCommand =
   | 'create'
   | 'resume'
@@ -117,7 +116,6 @@ const googleClient: OptionDefinition = {
   ...value('google-client-file', 'file', "Desktop OAuth client downloaded for the assistant's Google sign-in."),
   valueKind: 'file',
 };
-/** The operator's word on the assistant's web alias (KTD13), wherever its setup step runs. */
 const aliasOptions: readonly OptionDefinition[] = [
   flag('alias-added', 'Confirm the offered web alias is added in the Google Admin console.'),
   flag('alias-taken', 'The Admin console refused the offered web alias as already in use; offer the next name.'),
@@ -874,7 +872,6 @@ export const COMMAND_DEFINITIONS: readonly CommandDefinition[] = [
   },
 ];
 
-/** Common flags share syntax; the selected command's output contract decides whether --json is accepted. */
 export function optionsFor(command: CommandDefinition): readonly OptionDefinition[] {
   return [
     ...command.options,
@@ -888,7 +885,7 @@ export function findCommand(path: readonly string[]): CommandDefinition | undefi
   );
 }
 
-/** Namespaces are derived from registered leaves, never fake operations. */
+/** A prefix of registered command paths, such as `capabilities`; a command at the exact path takes precedence. */
 export interface CommandNamespace {
   readonly path: readonly string[];
   readonly commands: readonly CommandDefinition[];

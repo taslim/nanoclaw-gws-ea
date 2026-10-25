@@ -1,16 +1,12 @@
 /**
- * GWS-EA's Google Chat, as the assistant's own account (KTD1–KTD4, KTD12).
- * Chat's events reach the host through a Workspace Events subscription the
- * host keeps (subscription.ts) and a Pub/Sub subscription it pulls
- * (pubsub-pull.ts), so the host needs no public endpoint. The `gchat`
- * channel registers here, as the email channel registers from its module:
- * upstream's Chat SDK adapter signed in as the assistant (adapter.ts), which
- * starts both when it initializes (delivery.ts) and reads each event it
- * pulls (hydrate.ts).
+ * GWS-EA's Google Chat, as the assistant's own account. Chat's events reach
+ * the host through a Workspace Events subscription the host keeps
+ * (subscription.ts) and a Pub/Sub subscription it pulls (pubsub-pull.ts), so
+ * the host needs no public endpoint. The `gchat` channel registers here, as
+ * the email channel registers from its module.
  *
- * A host without the assistant's Google sign-in or without Chat delivery
- * (config.ts) has no Chat channel. Status reads whether Chat is receiving
- * through `gws-ea-chat health`, and create opens the principal's DM through
+ * The control plane reads whether Chat is receiving through
+ * `gws-ea-chat health`, and opens the principal's DM through
  * `gws-ea-chat open-principal-dm` (dm.ts).
  */
 import type { ChannelAdapter } from '../../channels/adapter.js';
@@ -32,9 +28,8 @@ function errorMessage(error: unknown): string {
 }
 
 /**
- * The assistant's account from its grant. Chat knows the assistant by the
- * account's Google ID, which a grant from before Chat lacks: a grant this
- * host cannot read needs a new sign-in.
+ * Chat knows the assistant by the account's Google ID, which a grant from
+ * before Chat lacks: a grant this host cannot read needs a new sign-in.
  */
 async function signedInAssistant(): Promise<AssistantGoogleAccount> {
   let assistant: AssistantGoogleAccount | undefined;
@@ -68,7 +63,6 @@ async function createAssistantChat(delivery: ChatDeliveryConfig): Promise<Channe
 }
 
 registerChannelAdapter(GCHAT_CHANNEL_TYPE, {
-  // Only a host with the assistant's Google sign-in and its Chat delivery has Chat.
   factory: () => {
     if (googleGrantFilePath() === undefined) return null;
     const delivery = readChatDeliveryConfig();
@@ -77,8 +71,6 @@ registerChannelAdapter(GCHAT_CHANNEL_TYPE, {
   defaults: GCHAT_DEFAULTS,
 });
 
-// What status reads, from the host only: whether the consumer is connected, its last pull, the
-// subscription's state and expiry, and each side's last error kind.
 register({
   name: 'gws-ea-chat-health',
   description: 'Report whether Google Chat is receiving: the pull consumer and the subscription.',
@@ -92,8 +84,6 @@ register({
   handler: async () => chatHealth.read(),
 });
 
-// Create's binding, from the host only: the assistant opens its DM with the one address the
-// principal uses for Google Chat, and answers with the person Google resolved and its conversation.
 register({
   name: 'gws-ea-chat-open-principal-dm',
   description: "Open the assistant's direct message with the principal's Google Chat address.",

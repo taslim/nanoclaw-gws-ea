@@ -1,8 +1,7 @@
 /**
  * Test fixture: an assistant whose main agent ('main-p') serves one principal through their direct message
- * ('mg-principal'), with its browser agent ('browser-p') and another agent ('desk-p'), and the errands and notes
- * the host's purchase and incident suites read. Each suite mocks its own data root; nothing here reaches a
- * platform.
+ * ('mg-principal'), with its browser agent ('browser-p') and another agent ('desk-p'). Each suite mocks its own data
+ * root; nothing here reaches a platform.
  */
 import fs from 'node:fs';
 
@@ -16,7 +15,7 @@ import { BrowserStore, type BrowserJob } from './db.js';
 
 export const PRINCIPAL = 'gchat:users/principal';
 
-/** Writes the browser-access setting under `root`: every agent group, or only those listed. Returns its path. */
+/** Writes an enabled browser policy under `root`: version 1 (main alone) without a list, else version 2. */
 export function writeBrowserPolicy(root: string, agentGroupIds?: readonly string[]): string {
   const file = `${root}/browser/policy.json`;
   fs.mkdirSync(`${root}/browser`, { recursive: true });

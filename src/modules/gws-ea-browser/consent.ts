@@ -1,6 +1,6 @@
 /**
- * The consent engine (KTD11, R15–R17, R19): the host makes every checkbox, switch, radio and select choice in a
- * form before any submission it performs or lets run, and the principal approves the exceptions.
+ * The consent engine: the host makes every checkbox, switch, radio and select choice in a form before any
+ * submission it performs or lets run, and the principal approves the exceptions.
  *
  * An isolated world lists every choice in the target form, or in a formless control's region (the region the
  * classifier reads), with its wording, state and links. The engine reads each wording for its meaning: a box that
@@ -10,8 +10,8 @@
  * attestation, a fee acknowledgement, a box bundling the terms with anything, a double negative, or an opt-in the
  * site requires) stops with `consent_required` unless the principal approved that exact wording on that site
  * before. Functional choices stay the agent's. The host acts with real clicks on the box or its label, then reads
- * again after the page settles: a choice the site will not keep stops, so the check before the press is what the
- * page holds then.
+ * again after the page settles, so the check before the press is what the page holds then: an opt-out the site
+ * undoes stops, and an extra it keeps makes the press a purchase.
  *
  * Inside a purchase the agreements go on the purchase card instead, and an extra the site keeps selected
  * joins the facts the card shows as a charge.
@@ -45,7 +45,6 @@ import {
 
 // ---------------------------------------------------------------- what a choice's wording means
 
-/** What the engine reads a choice's wording as. */
 export type ConsentLabelKind =
   | 'terms'
   | 'marketing'
@@ -63,7 +62,7 @@ const siteTerms =
 const notSiteTerms =
   /\b(?:marketing|newsletters?|news|offers?|promotions?|promotional|partners?|third[\s-]+part(?:y|ies)|shar(?:e|ing)|advertis\w*|sponsors?|surveys?|updates|e-?mails?|sms|texts?|pay(?:ment|ments|ing)?|billing|billed|charges?|fees?|prices?|pricing|purchases?|orders?|sales?|trials?|subscri\w*|renew\w*|recurring|memberships?|plans?|cards?|credit|refunds?)\b|[$€£¥]/iu;
 
-/** Every document a terms box names, to read whose each one is: terms, conditions, agreements, policies, notices. */
+/** The documents a terms box may name, each read for whose it is. */
 const termsDocuments =
   /\b(?:terms(?:\s+of\s+(?:service|use))?|conditions(?:\s+of\s+use)?|agreements?|polic(?:y|ies)|notices?|statements?)\b/giu;
 
@@ -145,10 +144,7 @@ function readable(text: string): string {
     .replace(CONSENT_VOCABULARY.reassurance, ' ');
 }
 
-/**
- * Whether a box's wording accepts only the site's terms of service, terms and conditions, user agreement or
- * privacy policy. Marketing, data sharing and every money term keep their own authority.
- */
+/** Whether a box accepts only the site's terms: marketing, data sharing and money keep their own authority. */
 function termsConsentLabel(label: string): boolean {
   return siteTerms.test(label) && !notSiteTerms.test(label) && !moneyTerms.test(label);
 }
@@ -165,7 +161,7 @@ function wordsOf(text: string): string[] {
  * Whose terms a wording names: a possessive just before a document it names ("Klarna's Terms", "the seller's
  * terms"), a name directly before it ("the PayPal User Agreement"), or a name after "of" ("the terms of Afterpay").
  * The site naming itself ("our terms", "the site's terms", "the terms of this site") names no one; another party
- * named only as "their" is ''.
+ * named only by a pronoun ("their terms") is ''.
  */
 function termsOwners(words: string): string[] {
   const vocabulary = TERMS_OWNER_VOCABULARY;
@@ -207,7 +203,6 @@ function termsOwners(words: string): string[] {
       const name = nameRun([possessor, ...back.slice(near + 1)]).reverse();
       owners.push(name.length ? name.join(' ') : possessor);
     }
-    // A name after "of".
     if (ahead[0]?.toLowerCase() !== 'of') continue;
     const after = vocabulary.determiner.test(ahead[1] ?? '') ? ahead.slice(2) : ahead.slice(1);
     if (vocabulary.otherPronoun.test(after[0] ?? '')) owners.push('');
@@ -251,14 +246,14 @@ function linkedSite(link: string): string | undefined {
 
 /** Where a choice is read: the page's site, and the addresses its wording, question and description link to. */
 export interface ConsentPlace {
-  /** The site the page belongs to, whatever frame holds the choice (KTD7). */
+  /** The site the page belongs to, whatever frame holds the choice. */
   readonly site: string;
   readonly links: readonly string[];
 }
 
 /**
- * Whether terms are the site's own (R15): every party the wording names is the site, and every link in the
- * wording or its description stays on the site. Read with no site, any named party is another's.
+ * Whether terms are the site's own: every party the wording names is the site, and every link in the wording or
+ * its description stays on the site. Read with no site, any named party is another's.
  */
 function siteOwnTerms(words: string, place: ConsentPlace | undefined): boolean {
   const site = place?.site ?? '';
@@ -276,7 +271,7 @@ function negations(label: string): number {
 }
 
 /**
- * What a box's wording asks, read for its meaning (KTD11). The order decides the most binding reading first:
+ * What a box's wording asks, read for its meaning. The order decides the most binding reading first:
  * a double negative or a box bundling the site's terms with anything else cannot be read safely, an agreement
  * outranks an extra, an extra outranks marketing, and a box with no consent vocabulary is functional. Terms
  * that name or link to another party than the site the page belongs to are an agreement.
@@ -331,7 +326,7 @@ function classifyGroup(question: string, options: readonly string[], place?: Con
   return order.find((kind) => kinds.includes(kind)) ?? 'functional';
 }
 
-/** Whether a click on this choice is the consent engine's to make: any choice but a functional one (KTD1 step 4). */
+/** Whether a click on this choice is the consent engine's to make: any choice but a functional one. */
 export function consentClassChoice(choice: ToggledChoice): boolean {
   switch (choice.kind) {
     case 'checkbox':
@@ -365,7 +360,6 @@ export interface ConsentChoice {
   readonly checked: boolean;
   readonly required: boolean;
   readonly disabled: boolean;
-  /** A select's options. */
   readonly options?: readonly ConsentOption[];
 }
 /** A choice to set: a box, switch or radio option to this state, or a select to this option. */
@@ -394,7 +388,7 @@ export interface ConsentContext {
   readonly granted: ReadonlySet<string>;
   /**
    * The site the page belongs to, its top document's registrable domain: the only party whose own terms a box may
-   * accept, even inside another party's frame (R15, KTD7).
+   * accept, even inside another party's frame.
    */
   readonly site: string;
   readonly purchase: boolean;
@@ -411,7 +405,6 @@ const declines = (option: ConsentOption): boolean =>
   CONSENT_VOCABULARY.declines.test(readable(option.label)) || classifyConsentLabel(option.label) === 'opt_out';
 const affirms = (option: ConsentOption): boolean => CONSENT_VOCABULARY.affirms.test(readable(option.label));
 
-/** What the engine does with each choice in a form (KTD11), given the principal's grants. */
 export function decideConsent(choices: readonly ConsentChoice[], context: ConsentContext): ConsentDecision {
   const set: ConsentSetting[] = [];
   const items: ConsentItem[] = [];
@@ -559,10 +552,7 @@ const LIBRARY = '__gwsEaConsent';
 const SETTLE_MS = 200;
 const PRESS_TIMEOUT_MS = 2_000;
 
-/**
- * The isolated-world half: plain JavaScript holding the choice reader, the region rule the classifier reads
- * (control-facts), the exact-node handoff in both directions, and where a press lands on a box or its label.
- */
+/** The isolated-world half: plain JavaScript, its region rule a copy of the classifier's in control-facts. */
 const librarySource = String.raw`(() => {
   ${CHOICE_SOURCE}
   const getter = (type, name) => Object.getOwnPropertyDescriptor(type.prototype, name).get;
@@ -724,7 +714,7 @@ const librarySource = String.raw`(() => {
 
 const READER: IsolatedReader = { world: WORLD, global: LIBRARY, source: librarySource };
 
-/** What narrows the host's search for a choice's handle: its element, and its id, name and role. */
+/** Narrows the host's search for a choice's handle; the isolated world still confirms each node it is handed. */
 interface ChoiceHint {
   readonly element: 'input' | 'select' | 'role';
   readonly id: string;
@@ -1030,7 +1020,6 @@ export type ConsentPassResult =
     }
   | { readonly status: 'add_on'; readonly addOns: readonly string[] };
 
-/** The job a stop belongs to, and the database its stops and the principal's grants live in. */
 export interface ConsentScope {
   readonly jobId: string;
   readonly db: DbDriver;
@@ -1065,9 +1054,9 @@ function fingerprint(read: ConsentRead): string {
 }
 
 /**
- * The one consent check before every submission (KTD11): reads the control's form, makes every choice the
- * engine owns with real clicks, waits for the page to settle and reads again, so what it answers is what the
- * page holds just before the press. `ready` lets the press go; outside a purchase, `consent_required` names
+ * The one consent check before every submission: reads the control's form, makes every choice the engine owns
+ * with real clicks, waits for the page to settle and reads again, so what it answers is what the page holds just
+ * before the press. `ready` lets the press go; outside a purchase, `consent_required` names
  * the recorded stops, and whether the host had set a choice first, and `add_on` an extra the press would buy.
  * Nothing is pressed here.
  */
@@ -1145,12 +1134,10 @@ export function siteWording(wording: string, site: string): string {
   return untrusted(wording, 2000, site);
 }
 
-/** The stops an answer gives the browser, each wording as `siteWording` frames it. */
 export function consentStopsForAgent(stops: readonly ConsentStopView[]): ConsentStopView[] {
   return stops.map((stop) => ({ ...stop, wording: siteWording(stop.wording, stop.site) }));
 }
 
-/** A submission stopped for wording only the principal can agree to (`consent_required`). */
 export class BrowserConsentStop extends Error {
   readonly reason = 'consent_required';
   constructor(readonly stops: readonly ConsentStopView[]) {
@@ -1256,7 +1243,6 @@ export async function liveConsentGrants(db: DbDriver, site: string, origin: stri
   return new Set(rows.map((row) => row.wording));
 }
 
-/** Whether every agreement a purchase carries stands approved on its site. */
 export async function agreementsGranted(
   db: DbDriver,
   site: string,

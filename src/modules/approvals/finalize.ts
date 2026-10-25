@@ -21,9 +21,10 @@ interface RejectedApproval extends PendingApproval {
 const finalizing = new Set<string>();
 
 /**
- * Claim the rejection together with its reason. A required module finalizer
- * must settle its state and persist its notification before this row is
- * removed. Failures leave a rejected row for startup and host-sweep replay.
+ * Claims the rejection and its reason in one write; false when another answer
+ * claimed the row first. A module's rejection finalizer settles its state and
+ * notification before the row is removed, and any failure leaves the rejected
+ * row for replay at startup and on the host sweep.
  */
 export async function finalizeReject(
   approval: PendingApproval,

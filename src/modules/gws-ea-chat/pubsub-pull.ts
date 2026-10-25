@@ -1,18 +1,15 @@
 /**
- * The pull consumer (KTD3, KTD4): the host reaches out to Pub/Sub for the
- * assistant's Chat events, so nothing of the host is reachable from outside.
- * Plain REST over `fetch` with the subscriber's token, as the codebase's
- * other Google clients are: a long-poll `pull` of up to 100 events that
- * returns as soon as one lands, `acknowledge`, and `modifyAckDeadline`.
+ * The pull consumer: the host reaches out to Pub/Sub for the assistant's Chat
+ * events, so nothing of the host is reachable from outside. Plain REST over
+ * `fetch`, as the codebase's other Google clients are.
  *
  * An event is acknowledged only once it is handled: its handler resolved,
  * because it was routed, answered, or found to be permanent. A handler that
  * rejects leaves it unacknowledged, and Pub/Sub delivers it again once its
  * lease lapses, which paces the retries. REST does not extend leases the way
- * the gRPC client does, so the consumer extends every event still being
- * handled: waiting for the host to be ready, downloading an attachment,
- * running a slow answer such as an image build, or waiting its turn behind an
- * earlier event of its conversation.
+ * the gRPC client does, so the consumer extends the lease of every event still
+ * being handled or waiting its turn behind an earlier event of its
+ * conversation.
  *
  * Pub/Sub may deliver an event again while its first copy is still being
  * handled. That copy is neither handled nor acknowledged: acknowledging it
@@ -26,15 +23,13 @@ import { SubscriberCredentialError } from './subscriber-credentials.js';
 
 const PUBSUB = 'https://pubsub.googleapis.com/v1';
 
-/** The most events one pull takes. */
 const MAX_EVENTS_PER_PULL = 100;
-/** The subscription's ack deadline (KTD3), to which each extension renews an event's lease. */
+/** The `--ack-deadline` gcloud.ts creates the subscription with; each extension renews a lease to it. */
 export const ACK_DEADLINE_SECONDS = 60;
 /** How often leases are extended: a third of the deadline, so a lease survives one failed extension. */
 const LEASE_EXTENSION_INTERVAL_MS = 20_000;
 /** How long Google may hold a pull open before the consumer asks again. */
 const PULL_TIMEOUT_MS = 90_000;
-/** The wait after a failed call, doubling with each failure in a row up to a minute. */
 const BACKOFF_BASE_MS = 1_000;
 const BACKOFF_MAX_MS = 60_000;
 /** What `roles/pubsub.subscriber` holds, and all the subscriber needs. */
@@ -46,13 +41,13 @@ export interface WorkspaceEvent {
   readonly messageId: string;
   /** `ce-type`, such as `google.workspace.chat.message.v1.created`. */
   readonly type: string;
-  /** `ce-source`: a subscription lifecycle event's names its subscription. */
+  /** `ce-source`: for a subscription lifecycle event, its subscription. */
   readonly source: string;
   /** `ce-subject`: the resource the event is about. */
   readonly subject: string;
   /** `ce-time`, else when Pub/Sub received it. */
   readonly time: string;
-  /** The event's JSON data. A Chat event carries resource names only (KTD2), and a batch event several. */
+  /** A Chat event carries resource names only, and a batch event several. */
   readonly data: Readonly<Record<string, unknown>>;
 }
 
@@ -87,7 +82,7 @@ function toReceived(value: unknown): ReceivedMessage {
   };
 }
 
-/** The event a message carries; undefined when it carries none it could ever be read as. */
+/** Undefined when the message can never be read as an event, so it is acknowledged unhandled. */
 function decodeEvent(message: ReceivedMessage): WorkspaceEvent | undefined {
   const type = message.attributes['ce-type'];
   if (!type) return undefined;
@@ -125,11 +120,9 @@ function conversationOf(message: ReceivedMessage): string {
   return /^\/\/chat\.googleapis\.com\/(spaces\/[^/]+)/u.exec(subject)?.[1] ?? message.attributes['ce-source'] ?? '';
 }
 
-/** The subscriber's REST calls on one subscription. */
 function createPubSubApi(client: GoogleClientOptions, subscription: string) {
   const url = (method: string) => `${PUBSUB}/${subscription}:${method}`;
   return {
-    /** Refused unless Pub/Sub lets the subscriber pull this subscription. */
     async assertMayConsume(): Promise<void> {
       const payload = await googleJson(client, url('testIamPermissions'), {
         method: 'POST',
@@ -141,7 +134,6 @@ function createPubSubApi(client: GoogleClientOptions, subscription: string) {
       }
     },
 
-    /** The events Pub/Sub hands out now, waiting while it holds the pull open. */
     async pull(stop: AbortSignal): Promise<ReceivedMessage[]> {
       const patience = AbortSignal.timeout(PULL_TIMEOUT_MS);
       let payload: unknown;
@@ -196,12 +188,8 @@ function pause(ms: number, signal: AbortSignal): Promise<void> {
 export interface PullConsumerOptions {
   /** `projects/{project}/subscriptions/{subscription}`. */
   readonly subscription: string;
-  /** A live Pub/Sub token for the subscriber. */
   readonly token: () => Promise<string>;
-  /**
-   * Handles one event. It resolves once the event is handled, so it is
-   * acknowledged, and rejects when it must come again.
-   */
+  /** Resolving acknowledges the event; rejecting leaves it for Pub/Sub to deliver again. */
   readonly handle: (event: WorkspaceEvent) => Promise<void>;
   readonly health: ChatHealthRecorder;
   readonly fetch?: typeof globalThis.fetch;
@@ -217,12 +205,11 @@ export interface PullConsumer {
 }
 
 /**
- * Start pulling. Before its first pull, and after any failure, the consumer
- * proves Pub/Sub lets the subscriber pull, so health shows it connected
- * without waiting for an event. The events of one conversation, a Chat
- * space, are handled one after another in the order they were pulled, each
- * batch in event-time order, while other conversations and the next pull go
- * on without them.
+ * Before its first pull, and after any failure, the consumer proves Pub/Sub
+ * lets the subscriber pull, so health shows it connected without waiting for
+ * an event. The events of one conversation, a Chat space, are handled one
+ * after another in the order they were pulled, each batch in event-time
+ * order, while other conversations and the next pull go on without them.
  */
 export function startPullConsumer(options: PullConsumerOptions): PullConsumer {
   const api = createPubSubApi(
@@ -280,11 +267,6 @@ export function startPullConsumer(options: PullConsumerOptions): PullConsumer {
     }
   }
 
-  /**
-   * Queue a pulled batch in event-time order, each event behind the earlier
-   * ones of its conversation. Each is in flight from now, so its lease is
-   * extended while it waits its turn.
-   */
   function dispatch(received: readonly ReceivedMessage[]): void {
     const batch: { readonly message: ReceivedMessage; readonly event: WorkspaceEvent | undefined }[] = [];
     for (const message of received) {

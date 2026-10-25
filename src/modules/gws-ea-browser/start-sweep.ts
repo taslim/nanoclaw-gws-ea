@@ -11,8 +11,8 @@ export async function sweepBrowserStartup(queue: BrowserQueue): Promise<void> {
   await recoverBrowserPurchases(queue);
   await recoverBrowserWatchState(queue);
   await recoverConsentOutcomes();
-  // Each interrupted request records its own durable outcome before its answer: a credential
-  // attempt it disclosed becomes unknown, never a purchase, and is never submitted again.
+  // Each interrupted request's action records its own durable outcome before the answer: a credential
+  // attempt the request disclosed becomes unknown.
   for (const request of await queue.store.pending())
     await queue.finish(request, await queue.interruptedAnswer(request, !request.started_at));
   const credentials = await queue.store.db.hasTable('gws_ea_browser_credential_attempts');

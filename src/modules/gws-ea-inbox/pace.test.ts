@@ -1,7 +1,7 @@
 /**
- * Human pace (KTD3, R62, AE62): an outside thread is worked 3 to 6 minutes
+ * Human pace: an outside thread is worked 3 to 6 minutes
  * after its first message not yet answered, all at once, once main has
- * handed it over; until then its mail is held (Slice 5 KTD8).
+ * handed it over; until then its mail is held.
  *
  * Drives the real router, with pace registered as the inbox registers it,
  * the real session mailboxes and the real reconcile that wakes a session.

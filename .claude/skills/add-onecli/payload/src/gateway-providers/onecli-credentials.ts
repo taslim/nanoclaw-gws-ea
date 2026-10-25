@@ -31,7 +31,6 @@ export interface OneCliCredential {
   authMode?: 'oauth';
 }
 
-/** Where this installation's OneCLI management API is, and how to reach it. */
 export interface OneCliManagement {
   readonly url: string | undefined;
   readonly apiKey?: string | undefined;
@@ -258,7 +257,8 @@ export function createProviderCredentialConnection(
     {
       name: target.name,
       // OneCLI's `openai` type is its native ChatGPT-subscription record: it
-      // refreshes the token and injects the account header itself.
+      // injects the account header itself (the pinned OneCLI cannot refresh it;
+      // see encodeOneCliValue).
       type: target.kind === 'oauth' ? 'openai' : 'generic',
       hostPattern: target.host,
       ...(target.path ? { pathPattern: target.path } : {}),

@@ -169,7 +169,7 @@ export async function hasPendingSignInMail(at = new Date()): Promise<boolean> {
   return row !== undefined;
 }
 
-/** Main can name the host-recorded site without ever reading the waiting field or a credential. */
+/** The host-recorded site alone, so its reader names the site without seeing the waiting field or a credential. */
 export async function readPendingSignInSite(
   jobId: string,
 ): Promise<{ site: string; origin: string; expires_at: string } | undefined> {

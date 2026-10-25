@@ -13,12 +13,13 @@
  *   Mon 12, Tue 13 and Wed 14 October · Mon 28 – Fri 2 Oct
  *   Monday to Friday, 12–16 October
  *
- * A weekday alone ("Tuesday at 12:30"), a day without a month ("Friday the
- * 13th"), a time ("Friday 10:30"), or a count ("Monday, 5 people") is never a
- * pair. Lower-case "wed", "sat", "sun", "may", "march" or "august" are words,
- * not dates. Text in double quotation marks, in a quoted block (lines that
- * start with ">"), or inside untrusted-content markers is someone else's
- * words, and is not read.
+ * A weekday alone ("Tuesday at 12:30"), a time ("Friday 10:30"), or a count
+ * ("Monday, 5 people") is never a pair; nor is a day without a month ("Friday
+ * the 13th") unless a date earlier in the sentence gives it one. Lower-case
+ * "wed", "sat", "sun", "may", "march" or "august" are words, not dates. Text
+ * in double quotation marks, in a quoted block (lines that start with ">"),
+ * or inside untrusted-content markers is someone else's words, and is not
+ * read.
  *
  * A date without a year reads as its next occurrence within a year, or, when
  * it fell in the last four months, that one too: the pair stands when either
@@ -66,7 +67,6 @@ const RECENT_DAYS = 120;
 const AHEAD_DAYS = 366;
 const DAY_MS = 86_400_000;
 
-/** Where a token sits in the text. */
 interface At {
   readonly start: number;
   readonly end: number;
@@ -81,7 +81,6 @@ type Token = At &
     /** `stop` ends a sentence or clause: a full stop, ?, !, ; or a line break. */
     | { readonly kind: 'link' | 'open' | 'close' | 'comma' | 'stop' | 'other' }
   );
-/** A weekday or a month, with which one it is. */
 type Named = At & { readonly kind: 'weekday' | 'month'; readonly value: number };
 
 const TOKEN =
@@ -158,7 +157,7 @@ function tokenize(text: string): Token[] {
         Number.isNaN(value) ? { kind: 'other', start, end } : { kind: 'number', value, ordinal: false, start, end },
       );
     } else if (word !== undefined) {
-      // A full stop after a word ends a short form ("Oct.") or the sentence, never the date.
+      // A full stop after a weekday or month of up to five letters abbreviates it ("Oct."); else it ends the sentence.
       const end = start + word.length;
       const weekday = weekdayOf(word);
       const month = weekday === undefined ? monthOf(word) : undefined;
@@ -199,13 +198,13 @@ interface Pair {
   readonly day: number;
   readonly month: number;
   readonly year: number | undefined;
-  /** Other readings of the date (a numeric date read both ways). */
+  /** The swapped reading of a numeric date such as 10/15. */
   readonly alternative?: { readonly day: number; readonly month: number };
   readonly start: number;
   readonly end: number;
 }
 
-/** The date tokens from `index`: day and month in either order, with a year; the index after them. */
+/** A day and month in either order from `index`, with any year after them; `next` is the index after the date. */
 function dateAt(
   tokens: readonly Token[],
   index: number,
@@ -243,7 +242,6 @@ function dateAt(
   return undefined;
 }
 
-/** Every pair the tokens write, in order. */
 function pairsOf(tokens: readonly Token[]): Pair[] {
   const pairs: Pair[] = [];
   /** The month and year of the last pair in this sentence, which a later "Tuesday 13" in it shares. */

@@ -68,7 +68,7 @@ interface ConnectionAwareAdapter extends Adapter {
 export interface ReplyContext {
   text: string;
   sender: string;
-  /** The platform's id for the message replied to, when the platform names it. */
+  /** Absent when the platform does not name the message replied to. */
   id?: string;
   /** A native forward carries source material, never the sender's own words. */
   forwarded?: true;
@@ -78,12 +78,10 @@ export interface ReplyContext {
 // Reactions an adapter reads itself
 // ---------------------------------------------------------------------------
 
-/** A reaction someone placed on a message, as an adapter read it from its platform. */
 export interface InboundReaction {
   /** The reaction's own id, the same each time the platform delivers it. */
   readonly reactionName: string;
   readonly emoji: EmojiValue;
-  /** Who reacted. */
   readonly user: Author;
   /** The message reacted to, read as an inbound message is: `author.isMe` marks the assistant's own. */
   readonly message: ChatMessage;
@@ -93,11 +91,10 @@ export interface InboundReaction {
 }
 
 /**
- * An adapter that reads its platform's reactions itself and hands each one to
- * the bridge, awaiting the promise: it resolves once the reaction is routed
- * and rejects when routing fails, so a platform that redelivers hands the
- * reaction over again. The SDK's own reaction dispatch is fire-and-forget,
- * which such a platform cannot use. The adapter drops its own reactions.
+ * An adapter that reads its platform's reactions itself, because the SDK's
+ * own reaction dispatch is fire-and-forget. The handler's promise resolves
+ * once the reaction is routed and rejects when routing fails, so a platform
+ * that redelivers hands it over again. The adapter drops its own reactions.
  */
 export interface ReactionSource {
   readonly setReactionHandler: (handler: (reaction: InboundReaction) => Promise<void>) => void;
@@ -118,9 +115,8 @@ function isReactionSource(adapter: Adapter): adapter is Adapter & ReactionSource
  * (ChannelAdapter.endTyping); the adapter decides when to show its mark.
  */
 export interface WorkingIndicator {
-  /** A turn is working on the message: called on every typing pulse that names it. */
+  /** Called on every typing pulse that names the message. */
   readonly workingOn: (threadId: string, messageId: string) => Promise<void>;
-  /** The work on the message ended; the mark comes off. */
   readonly endWorking: (threadId: string, messageId: string) => Promise<void>;
 }
 
@@ -139,7 +135,7 @@ function isWorkingIndicator(adapter: Adapter): adapter is Adapter & WorkingIndic
  * cannot send, or post them apart from the text. It attaches every file or
  * posts nothing: a file it cannot attach rejects with FilesNotAttachedError
  * before anything is posted, so the bridge can post the message without
- * them. The bridge hands it the pictures a request names (KTD6).
+ * them. The bridge hands it the pictures a request names.
  */
 export interface FileAttacher {
   readonly postWithFiles: (
@@ -161,7 +157,7 @@ function isFileAttacher(adapter: Adapter): adapter is Adapter & FileAttacher {
   return typeof (adapter as Partial<FileAttacher>).postWithFiles === 'function';
 }
 
-/** An opt-in platform post whose delivery key makes repeated file-free text creates idempotent. */
+/** Posting file-free text again under the same `deliveryId` creates no second message. */
 export interface IdempotentTextPoster {
   readonly postTextOnce: (threadId: string, text: string, deliveryId: string) => Promise<RawMessage<unknown>>;
 }
@@ -170,7 +166,6 @@ function isIdempotentTextPoster(adapter: Adapter): adapter is Adapter & Idempote
   return typeof (adapter as Partial<IdempotentTextPoster>).postTextOnce === 'function';
 }
 
-/** How much of the message reacted to the agent sees with the reaction. */
 const REACTION_EXCERPT_CHARS = 200;
 
 function excerpt(text: string): string {
@@ -544,16 +539,14 @@ export interface ChatSdkBridgeConfig {
   maxTextLength?: number;
   /**
    * The platform shows this account no cards (Google Chat under user
-   * authentication), so requests are text. A question or approval request
-   * posts as its title, the question, and how to answer it in words, with no
-   * codes; a display card posts as text with its links. Every request is
-   * left as posted until the handler that resolves an answer edits it to its
-   * outcome: the bridge never edits one itself. Each request it posts is
-   * recorded by its message, by its question (readPostedRequest), and in its
-   * conversation, so an answer and the handler's edit both find it. A reply
-   * or reaction that answers a request (src/channels/answers.ts) goes to its
-   * handler through onAction instead of to the agent. Unset, requests post
-   * as cards.
+   * authentication), so a request posts as text saying how to answer it in
+   * words, and a display card as text with its links. The bridge never edits
+   * a request: it stays as posted until the handler that resolves an answer
+   * edits it to its outcome. Each request is recorded by its message, by its
+   * question (readPostedRequest), and in its conversation, so an answer and
+   * the handler's edit both find it. A reply or reaction that answers a
+   * request (src/channels/answers.ts) goes to its handler through onAction
+   * instead of to the agent. Unset, requests post as cards.
    */
   textRequests?: {
     /** When the platform recorded a message the adapter posted, read from postMessage's raw response. */
@@ -563,9 +556,7 @@ export interface ChatSdkBridgeConfig {
 
 /** A request the bridge posted as text (ChatSdkBridgeConfig.textRequests). */
 export interface PostedRequest {
-  /** The question id of its pending row. */
   readonly questionId: string;
-  /** The conversation it was posted in, as the bridge's platform id. */
   readonly platformId: string;
   /** When the platform recorded it, as ISO-8601; absent when the platform reported no time. */
   readonly postedAt?: string;
@@ -588,11 +579,6 @@ export async function readPostedRequest(
   return (await state.get<PostedRequest>(postedRequestKey(adapterName, messageId))) ?? undefined;
 }
 
-/**
- * How a request asks for its answer in words. An approve/reject request is
- * answered yes or no, by a quote or 👍/👎, with the reason after the no when
- * its rejection takes one; any other request lists its options by number.
- */
 function howToAnswer(options: readonly NormalizedOption[]): string {
   const approval = approveRejectRequest(options);
   if (approval) {
@@ -604,7 +590,6 @@ function howToAnswer(options: readonly NormalizedOption[]): string {
   return `${list}\n\nQuote this message with the number or name of your choice.`;
 }
 
-/** A question or approval request as text: its title, the question, the pictures it lacks, and how to answer it. */
 function textRequest(
   title: string,
   question: string,
@@ -615,10 +600,10 @@ function textRequest(
 }
 
 /**
- * The pictures a request names (KTD6), counted in its content's `pictures`.
- * Their bytes ride beside the content as the message's files, never in it,
- * and go with the request only when every one it names came with it. A
- * request posted from anything kept, as after a restart, has none.
+ * Counted in the request content's `pictures`. Their bytes ride beside the
+ * content as the message's files, never in it, and go with the request only
+ * when every one it names came with it. A request posted from anything kept,
+ * as after a restart, has none.
  */
 interface RequestPictures {
   readonly named: number;
@@ -636,19 +621,17 @@ function requestPictures(
   return named > 0 && files?.length === named ? { named, files } : { named };
 }
 
-/** How a request says the pictures it names are not on it, in the first person as every request speaks. */
 function picturesMissing(named: number): string {
   return named === 1
     ? "I couldn't attach the picture that goes with this."
     : "I couldn't attach the pictures that go with this.";
 }
 
-/** An answered request as text: what was asked, and its outcome where the answer was asked for. */
 function textOutcome({ title, question, resolution }: TerminalApprovalCard): string {
   return [`**${title}**`, question, resolution].filter(Boolean).join('\n\n');
 }
 
-/** A display card's content (send_card), as both of its renderings read it. */
+/** A send_card payload, as both of its renderings read it. */
 interface DisplayCard {
   readonly title: string;
   /** Its description, then each text child. */
@@ -657,10 +640,10 @@ interface DisplayCard {
 }
 
 /**
- * Read a display card. Non-URL actions are dropped: send_card's contract is
- * fire-and-forget, so a callback button would have nowhere to land. The
- * runner filters actions against LINK_ACTION_SCHEMA before writing the row;
- * the checks here still stand because any producer can write this payload.
+ * Non-URL actions are dropped: send_card's contract is fire-and-forget, so a
+ * callback button would have nowhere to land. The runner filters actions
+ * against LINK_ACTION_SCHEMA before writing the row; the checks here still
+ * stand because any producer can write this payload.
  */
 function readDisplayCard(spec: Record<string, unknown>): DisplayCard {
   const texts: string[] = [];
@@ -695,7 +678,6 @@ function readDisplayCard(spec: Record<string, unknown>): DisplayCard {
   return { title: (spec.title as string) || '', texts, links };
 }
 
-/** A display card as text: its title, its texts, and each link by its label. */
 function textDisplayCard({ title, texts, links }: DisplayCard): string {
   const linkLines = links.map((link) => `[${link.label}](${link.url})`).join('\n');
   return [title ? `**${title}**` : '', ...texts, linkLines].filter(Boolean).join('\n\n');
@@ -889,25 +871,16 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
   /** Registry/routing key for this bridge — also the app-context cache
    *  namespace. Default instances key by the platform name. */
   const instanceKey = config.instance ?? adapter.name;
-  /** The adapter's working mark, when it shows one. */
   const working = isWorkingIndicator(adapter) ? adapter : undefined;
-  /** The adapter, when it attaches files to the message it posts. */
   const attacher = isFileAttacher(adapter) ? adapter : undefined;
-  /** Set when requests are text on this platform (ChatSdkBridgeConfig.textRequests). */
   const textRequests = config.textRequests;
   let chat: Chat;
   let state: SqliteStateAdapter;
   let setupConfig: ChannelSetup;
-  /** Takes answers in words, when requests are text. */
   let answers: Answers | undefined;
   let gatewayAbort: AbortController | null = null;
 
-  /**
-   * Post a request with the pictures it names on its own message (KTD6):
-   * attached when every one came with it and the adapter attaches files, and
-   * otherwise posted without them, saying so. `compose` words the request,
-   * with that line when it is given.
-   */
+  /** `compose` is given a line saying the pictures are missing when they cannot go with the request. */
   async function postWithPictures(
     tid: string,
     pictures: RequestPictures,
@@ -929,7 +902,7 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
     return adapter.postMessage(tid, compose(picturesMissing(pictures.named)));
   }
 
-  /** A request the adapter posted; when requests are text, remember it, so an answer and its outcome find it. */
+  /** Records a text request so an answer and its outcome can find it. */
   async function rememberRequest(
     platformId: string,
     questionId: string,
@@ -950,9 +923,9 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
   }
 
   /**
-   * Whether a message answered a request, which then goes to the request's
-   * handler and is not routed. Only when requests are text; a handler that
-   * fails rejects, so the platform delivers the message again.
+   * True when the message answered a request, which then goes to its handler
+   * instead of being routed. A failing handler rejects, so the platform
+   * delivers the message again.
    */
   async function answeredBy(message: ChatMessage, threadId: string, isDM: boolean): Promise<boolean> {
     if (!answers) return false;
@@ -969,11 +942,6 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
     });
   }
 
-  /**
-   * The message an outcome for this question goes on: the one the handler
-   * named, when this question was posted as it, or else the question's
-   * newest posting.
-   */
   async function requestMessage(questionId: string, named: string | undefined): Promise<string | undefined> {
     if (named !== undefined && (await readPostedRequest(state, adapter.name, named))?.questionId === questionId) {
       return named;
@@ -981,11 +949,7 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
     return (await state.get<string>(requestMessageKey(adapter.name, questionId))) ?? named;
   }
 
-  /**
-   * Edit a request posted as text to the outcome its handler sent, addressed
-   * by its question id. Showing its outcome, the message takes no answer
-   * after this.
-   */
+  /** Once it shows its outcome, the message takes no further answer. */
   async function editRequestOutcome(tid: string, questionId: string, content: Record<string, unknown>): Promise<void> {
     const messageId = await requestMessage(
       questionId,
@@ -1094,11 +1058,9 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
   }
 
   /**
-   * A reaction as the router takes it (InboundMessage.reaction): its own id,
-   * so a redelivery is dropped, and quiet unless it is on the assistant's own
-   * message. Its content names who reacted, the emoji by the name
-   * add_reaction takes, and the message reacted to as an excerpt; it carries
-   * no text, so nothing reads it as something written.
+   * Quiet unless it is on the assistant's own message (InboundMessage.reaction).
+   * It carries no text, so nothing reads it as something written; its content
+   * names the emoji by the name add_reaction takes.
    */
   function reactionToInbound(reaction: InboundReaction, isGroup: boolean | undefined): InboundMessage {
     const reactor = reaction.user.fullName || reaction.user.userName || reaction.user.userId;
@@ -1486,7 +1448,7 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
       }
 
       // Ask question — a Card with buttons, or words when requests are text,
-      // with the pictures it names on the same message (KTD6)
+      // with the pictures it names on the same message
       if (content.type === 'ask_question' && content.questionId && content.options) {
         const questionId = content.questionId as string;
         const title = content.title as string;

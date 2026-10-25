@@ -389,7 +389,7 @@ describe('GWS-EA people store', () => {
     expect(await rowCount('gws_ea_people_identities')).toBe(0);
   });
 
-  it("refuses the assistant's web alias, in any spelling that reaches it, as a person identity (KTD14)", async () => {
+  it("refuses the assistant's web alias, in any spelling that reaches it, as a person identity", async () => {
     await recordWebAlias('onuj@example.test');
     for (const identity of ['email:Onuj@example.test', 'onuj+shop@example.test'])
       await expect(addPerson(pat({ identity })), identity).rejects.toThrow(/assistant's own/i);
@@ -573,7 +573,7 @@ describe('forgetting a person', () => {
     return id;
   }
 
-  it('deletes the record and its identities, purges its email users and dropped messages, calls every hook, keeps only keyed fingerprints (AE9), and answers with the name and identities to clear from memory and what else to rewrite', async () => {
+  it('deletes the record and its identities, purges its email users and dropped messages, calls every hook, keeps only keyed fingerprints, and answers with the name and identities to clear from memory and what else to rewrite', async () => {
     const id = await seedPat();
 
     expect(await forgetPerson({ id })).toEqual({

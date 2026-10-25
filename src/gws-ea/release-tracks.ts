@@ -11,7 +11,6 @@ const PRODUCT_TRACKS: Readonly<Record<string, string | null>> = productTracks;
 
 export interface ReleaseSource {
   readonly remote: string;
-  /** The branch ref the track resolves to an exact commit. */
   readonly ref: string;
 }
 

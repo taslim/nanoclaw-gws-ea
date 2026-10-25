@@ -15,17 +15,17 @@ import { GwsEaError } from './types.js';
  */
 export const CONTROL_PLANE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 
-/** The name of an instance's root under the state root: the first eight hex digits of its ID (KTD10). */
+/** The ID's first eight hex digits, short so NanoClaw's sockets under the root fit the OS limit (prerequisites.ts). */
 export function instanceRootName(instanceId: string): string {
   return instanceId.slice(0, 8);
 }
 
-/** The instance marker under `stateRoot`, the directory that holds NanoClaw's `data`. */
+/** `stateRoot` is an instance's state directory, the one holding NanoClaw's `data`. */
 export function instanceMarkerFile(stateRoot: string): string {
   return path.join(stateRoot, 'data', 'gws-ea', 'instance.json');
 }
 
-/** The runtime record under `stateRoot`, the directory that holds NanoClaw's `data`. */
+/** `stateRoot` is an instance's state directory, the one holding NanoClaw's `data`. */
 export function instanceRuntimeFile(stateRoot: string): string {
   return path.join(stateRoot, 'data', 'gws-ea', 'runtime.json');
 }
@@ -44,24 +44,22 @@ export interface ControlPlanePaths {
   logsRoot: string;
   preReservationLogsRoot: string;
   instanceLogsRoot(instanceId: string): string;
-  /** `<state root>/<first 8 hex of the ID>`: the assistant's releases, state, and records. */
   instanceRoot(instanceId: string): string;
-  /** The instance root's layout: its live link, its physical `state/` and `logs/`, and its releases. */
   instanceLayout(instanceId: string): InstanceLayout;
-  /** The live release's link, `<instance root>/nanoclaw`: what the service, `ncl`, and the host's status run from. */
+  /** The live release's link, `<instance root>/nanoclaw`, not a physical folder; absent while a switch is fenced. */
   checkoutRoot(instanceId: string): string;
   journalFile(instanceId: string): string;
-  /** The record of an update or rollback under way, beside the provision journal. */
+  /** The record of an update or rollback under way. */
   operationFile(instanceId: string): string;
-  /** The release a rollback returns to, and the snapshot of the state it left (KTD4). */
+  /** The release a rollback returns to, and the snapshot of the state it left. */
   rollbackPointFile(instanceId: string): string;
   instanceLock(instanceId: string): string;
-  /** The instance marker in the physical `state/`, which names the assistant the state belongs to. */
+  /** Names the assistant the physical `state/` belongs to. */
   markerFile(instanceId: string): string;
-  /** The runtime record in the physical `state/`, written once at create. */
+  /** In the physical `state/`, written once at create. */
   runtimeFile(instanceId: string): string;
   bootstrapFile(instanceId: string): string;
-  /** The receipt of the release at `commit`, kept with it in `kept/<hex8>/` and written last. */
+  /** Written last, so a release without its receipt is incomplete. */
   releasePreflightFile(instanceId: string, commit: string): string;
   removalFile(instanceId: string): string;
 }
@@ -129,7 +127,6 @@ export function resolveControlPlanePaths(overrides: ControlPlanePathOverrides = 
   };
 }
 
-/** Whether a regular file exists at `file`. */
 export async function isRegularFile(file: string): Promise<boolean> {
   try {
     return (await lstat(file)).isFile();
@@ -145,7 +142,6 @@ export function isWithinDirectory(target: string, root: string): boolean {
   return relative !== '' && relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative);
 }
 
-/** No permission bits for group or others: `0600`/`0700` or stricter. */
 export function isOwnerOnlyMode(mode: number): boolean {
   return (mode & 0o077) === 0;
 }

@@ -1,7 +1,6 @@
 /**
- * Test fixture: the 1Password SDK as an assistant's runtime service account
- * sees it, and the host and instance records that bind it. Tests mock
- * `createClient` to return `FakeOnePassword.client()`; nothing here reaches
+ * Test fixture: the 1Password SDK as an assistant's runtime service account sees it, and the host and instance
+ * records that bind it. Tests mock `createClient` to return `FakeOnePassword.client()`; nothing here reaches
  * 1Password.
  */
 import { mkdir } from 'node:fs/promises';
@@ -35,9 +34,8 @@ const fail = (): never => {
 };
 
 /**
- * The provider as the SDK presents it: item versions, the optimistic lock on
- * put, active listings, and faults that can land a write before failing, as a
- * lost response does. A full item carries no state, so a read returns an
+ * The provider as the SDK presents it: item versions, the optimistic lock on put, active listings, and faults that
+ * can land a write before failing, as a lost response does. A full item carries no state, so a read returns an
  * archived item like any other; only the listing tells it apart.
  */
 export class FakeOnePassword {
@@ -202,7 +200,7 @@ export interface VaultFixtureFiles {
   readonly tokenFile: string;
 }
 
-/** The host policy, instance marker, provisioned vault record and runtime token a ready vault reads, under `directory`. */
+/** The host policy, instance marker, vault record and runtime token a ready vault reads, under `directory`. */
 export async function writeVaultFixture(directory: string): Promise<VaultFixtureFiles> {
   const configRoot = path.join(directory, 'config');
   await mkdir(configRoot, { mode: 0o700 });

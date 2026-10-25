@@ -137,11 +137,6 @@ function safeParseContent(raw: string): { text?: string; sender?: string; sender
   }
 }
 
-/**
- * An answered approval's outcome: noted in the conversation it was posted in
- * (request-context.ts), and edited in place when the channel left it as
- * posted: what it asked, and the option the approver chose.
- */
 async function showApprovalOutcome(
   about: string,
   answer: ResponsePayload,

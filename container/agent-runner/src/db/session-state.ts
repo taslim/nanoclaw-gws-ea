@@ -103,7 +103,6 @@ export interface ReplyRoute {
   threadId: string | null;
 }
 
-/** The reply stamp as published: the turn's route, and the ids of the batch it answers. */
 export interface ReplyStamp extends ReplyRoute {
   batch: readonly string[];
 }
@@ -140,7 +139,6 @@ export function clearCurrentReplyRoute(): void {
   deleteValue(REPLY_ROUTE_KEY);
 }
 
-/** The ids a stamp names; a stamp that names none as strings names an empty batch. */
 function stampedBatch(value: unknown): string[] {
   return Array.isArray(value) && value.every((id: unknown): id is string => typeof id === 'string') ? value : [];
 }

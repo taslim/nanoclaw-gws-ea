@@ -1,12 +1,12 @@
-# Wrapper gateway image (KTD1/KTD5): the pinned OneCLI base plus an in-namespace
-# egress firewall applied before the gateway starts. The base ships none of the
-# firewall tooling, so it must be installed here (a bind-mounted rules script
-# alone cannot run without the iptables binary present in the image).
+# Wrapper gateway image: the pinned OneCLI base plus an in-namespace egress
+# firewall applied before the gateway starts. The base ships none of the
+# firewall tooling, so it is installed here: a bind-mounted rules script alone
+# cannot run without iptables in the image.
 #
-# ONECLI_BASE is fed from the existing `onecli-gateway` pin (src/gws-ea/versions.json).
-# GATEWAY_WRAPPER_HASH is the build-context content hash (Dockerfile + rules.sh +
-# entrypoint.sh + base tag), computed by the launcher and stamped as a provenance
-# label so runtime verification confirms the exact firewall content is running (KTD6).
+# ONECLI_BASE comes from the `onecli-gateway` pin (src/gws-ea/versions.json).
+# GATEWAY_WRAPPER_HASH is the launcher's hash of this build context and the base
+# tag, stamped as a provenance label so runtime verification confirms the exact
+# firewall content is running.
 ARG ONECLI_BASE
 FROM ${ONECLI_BASE}
 ARG GATEWAY_WRAPPER_HASH

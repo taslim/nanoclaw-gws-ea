@@ -31,10 +31,7 @@ async function readOnlyTarget(page: Page, target: PinnedBrowserRef, kind: Activa
     return false;
   return facts.formMethod === undefined || facts.formMethod.toLowerCase() === 'get';
 }
-/**
- * A read-only replay acts by the open rule, restricted to GET navigation: watches replay these without the
- * agent. Uploads and downloads never read only.
- */
+/** The open rule restricted to GET navigation, because watches replay read-only actions without the agent. */
 export async function isReadOnlyBrowserAction(
   page: Page,
   action: BrowserAction,
@@ -78,7 +75,7 @@ export async function isReadOnlyBrowserAction(
   return true;
 }
 
-/** Preparation projects existing core observation/native binding facts, with no browser operation or await. */
+/** Projects only facts observation and native binding already hold; it performs no browser operation. */
 export function prepareBrowserActionFacts(
   page: Page,
   action: BrowserAction,

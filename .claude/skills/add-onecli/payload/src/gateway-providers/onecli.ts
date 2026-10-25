@@ -1,5 +1,4 @@
 import { normalizeGatewayApprovalSummary } from '../gateway-approval-summary.js';
-/** OneCLI typed configuration and supervised native approval adapter. */
 import { OneCLI, type ContainerConfig, type ApprovalRequest } from '@onecli-sh/sdk';
 
 import { DATA_DIR } from '../config.js';
@@ -157,7 +156,6 @@ function monitorLease(signal: AbortSignal): Pick<GatewaySessionLease, 'onUnavail
   };
 }
 
-/** This installation's credentials for OneCLI's app and gateway APIs. */
 function authHeaders(): Record<string, string> {
   return {
     Authorization: `Bearer ${onecliApiKey || ''}`,

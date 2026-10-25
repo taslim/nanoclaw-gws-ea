@@ -169,7 +169,10 @@ async function readMembership(address: {
     members: await Promise.all(group.members.map((member) => memberFact('gchat', member.userId, member.name))),
   };
 }
-/** Refresh actual membership at invite/read/share boundaries. Owns the conversation tail; callers must not already hold it. */
+/**
+ * Membership read fresh from the platform, for decisions on who is in the chat. Takes the conversation
+ * tail; callers must not already hold it.
+ */
 export async function refreshChatMembership(chatId: string): Promise<ChatMember[]> {
   const group = await getMessagingGroup(chatId);
   if (!group || !(await getChat(chatId))) throw new Error('The chat does not exist.');

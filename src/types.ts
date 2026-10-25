@@ -224,7 +224,7 @@ export interface PendingQuestion {
   channel_type: string | null;
   thread_id: string | null;
   title: string;
-  /** What the question asks; empty on a row from before it was kept. */
+  /** Empty on a row from before the question text was kept. */
   question: string;
   options: import('./channels/ask-question.js').NormalizedOption[];
   /** When the asking agent stops waiting (ISO-8601 UTC); null on a row from before deadlines were kept. */
@@ -275,7 +275,6 @@ export interface PendingApproval {
 
 export interface AgentDestination {
   session_mode?: 'agent-shared' | 'per-thread';
-  /** Treat inbound messages from this destination as untrusted source material. */
   inbound_untrusted?: 0 | 1;
   agent_group_id: string;
   local_name: string;

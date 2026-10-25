@@ -28,7 +28,7 @@ export interface BrowserObservation {
   snapshot: string;
   delta?: { removed: string[]; added: string[] };
   site?: { origin: string; untrusted: true; [key: string]: unknown };
-  /** What the host did about a cookie banner just before this observation (R18); absent when none showed. */
+  /** What the host did about a cookie banner just before this observation; absent when none showed. */
   cookie_banner?: CookieBannerReport;
 }
 export interface BrowserRef {
@@ -125,19 +125,19 @@ interface BrowserSiteInfo {
   vault?(origins: readonly string[], assertActive: () => Promise<void>): Promise<Record<string, unknown>>;
 }
 let siteInfo: BrowserSiteInfo = {};
-/** Composition supplies the two known optional readers. Neither receives a Page or a native handle. */
+/** Set by the composition; neither reader receives a Page or a native handle. */
 export function configureBrowserSiteInfo(readers: BrowserSiteInfo): void {
   siteInfo = readers;
 }
 
 export interface ObservePageOptions {
-  /** What the host did about a cookie banner just before this observation (R18), for it to report. */
+  /** What the host did about a cookie banner just before this observation, for it to report. */
   readonly cookieBanner?: CookieBannerReport | undefined;
   readonly remaining?: () => number;
   readonly signal?: AbortSignal;
 }
 
-/** Allow first-use vault discovery up to ten seconds, while reserving a second for the required answer. */
+/** Allows optional site metadata up to ten seconds, reserving a second for the required answer. */
 async function optionalSiteInfo(
   work: (assertActive: () => Promise<void>) => Promise<Record<string, unknown>>,
   unavailable: Record<string, unknown>,

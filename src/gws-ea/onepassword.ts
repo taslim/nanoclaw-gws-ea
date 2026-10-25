@@ -1,14 +1,14 @@
 /**
- * Operator-led 1Password provisioning (KTD1-KTD3, KTD11). The operator's own
- * desktop sign-in selects one account and mints a host management service
- * account that may only create vaults. Per compatible assistant, that account
- * creates one vault and grants the operator management rights on it, so the
- * operator can mint the assistant's runtime service account with read and
- * write access to only that vault. Enable and operator-led create/resume run
- * the same reconciliation under the assistant's native instance lock: intent
- * is persisted before each provider creation, completion is recorded only
- * after verification, and recovery follows recorded IDs, never display names.
- * A creation whose outcome is unknown pauses for the operator rather than
+ * Operator-led 1Password provisioning. The operator's own desktop sign-in
+ * selects one account and mints a host management service account that may
+ * only create vaults. Per compatible assistant, that account creates one vault
+ * and grants the operator management rights on it, so the operator can mint
+ * the assistant's runtime service account with read and write access to only
+ * that vault. Enable and operator-led create/resume run the same
+ * reconciliation under the assistant's native instance lock: intent is
+ * persisted before each provider creation, completion is recorded only after
+ * verification, and recovery follows recorded IDs, never display names. A
+ * creation whose outcome is unknown pauses for the operator rather than
  * creating again. Tokens stay in their owner-only files; results carry IDs.
  */
 import { readFile } from 'node:fs/promises';
@@ -83,13 +83,16 @@ export const ONEPASSWORD_CAPABILITY = {
 /** The marker a release carries when it supports this policy and resource contract. */
 export const ONEPASSWORD_CONTRACT = 'gws-ea-onepassword-vault-1';
 const CONTRACT_FILE = 'src/gws-ea/onepassword-compatibility.json';
-/** What the management service account grants the operator on each vault it creates: enough to mint its runtime account. */
-/** Managing requires editing and viewing; a scripted grant lists every dependency. */
+/**
+ * What the management service account grants the operator on each vault it
+ * creates: enough to mint its runtime account. Managing requires editing and
+ * viewing, and a scripted grant must list every dependency.
+ */
 const OPERATOR_GRANT: readonly OnePasswordVaultPermission[] = ['allow_viewing', 'allow_editing', 'allow_managing'];
 const MANAGEMENT_NAME = 'GWS-EA management';
 /** An email address a provider name can hold whole. */
 const NAMEABLE_EMAIL = /^[A-Za-z0-9][A-Za-z0-9._@+-]{0,79}$/u;
-/** Who this module's discard flag names for the host management service account. */
+/** The `discardUnproven` value that names the host management service account. */
 export const MANAGEMENT_TARGET = 'management';
 
 export type OnePasswordReleaseCompatibility = 'compatible' | 'unsupported' | 'unknown';
@@ -187,14 +190,13 @@ function invalidArguments(message: string): GwsEaError {
   return new GwsEaError('invalid_arguments', message);
 }
 
-/** No token is captured and no unproven attempt waits for recovery: a creation would start fresh. */
 async function mintsFresh(tokenFile: string): Promise<boolean> {
   return (
     (await readOnePasswordToken(tokenFile)).status !== 'ready' && !(await serviceAccountCreationUnproven(tokenFile))
   );
 }
 
-/** A service-account creation was attempted here and is neither proven nor discarded. */
+/** An attempt left a creation record or a token here; it is unproven only while no ID is recorded for it. */
 export async function creationAttempted(tokenFile: string): Promise<boolean> {
   return (
     (await serviceAccountCreationUnproven(tokenFile)) || (await readOnePasswordToken(tokenFile)).status !== 'absent'
@@ -220,7 +222,6 @@ export function resourceNames(workspaceEmail: string, instanceId: string): Resou
   return { vault: `Assistant ${label}`, runtimeServiceAccount: `GWS-EA ${short} ${label}` };
 }
 
-/** One assistant's effects: whether it changed, and the run's own record of every effect. */
 class Effects {
   changed: Changed = false;
   readonly #record: ((changed: true | null) => void) | undefined;
@@ -294,7 +295,6 @@ function skipMessage(reason: OnePasswordSkipReason): string {
   }
 }
 
-/** A provider refusal as the assistant's pending reason, for the identity that met it. */
 function pendingReasonFor(
   reason: OnePasswordFailureReason,
   identity: 'operator' | 'management' | 'runtime',
@@ -336,7 +336,6 @@ interface Reconciliation {
   readonly policy: OnePasswordHostPolicy & { readonly managementServiceAccountId: string };
   /** Opens and verifies on first need, so an assistant already provisioned costs no request. */
   readonly connect: () => Promise<ConnectionResult>;
-  /** Binds each compatible host's policy locator, as create's runtime step and update do. */
   readonly upsertEnvVars?: UpsertEnvVars;
   readonly recordEffect?: (changed: true | null) => void;
 }
@@ -363,11 +362,7 @@ function provisioning(
   };
 }
 
-/**
- * Bring one assistant to a verified vault and runtime account, under its
- * instance lock, which the caller holds. Each provider creation is preceded
- * by its own intent record and followed by recording its exact ID.
- */
+/** The caller holds the assistant's instance lock. */
 async function reconcileAssistant(
   context: Reconciliation,
   instanceId: string,
@@ -514,7 +509,7 @@ async function reconcileAssistant(
   return provisioning(instanceId, 'ready', { changed: effects.changed, resources });
 }
 
-/** The assistant under its own lock; a lock another operation holds is a bounded pause, never a wait. */
+/** A lock another operation holds leaves the assistant pending; it is never waited on. */
 async function reconcileLocked(context: Reconciliation, instanceId: string): Promise<OnePasswordAssistantProvisioning> {
   try {
     return await withAssistantLock(context.paths, instanceId, () => reconcileAssistant(context, instanceId));
@@ -549,7 +544,6 @@ function cliError(
   }
 }
 
-/** A provider refusal at the host level, as a bounded error naming its recovery. */
 function hostProviderError(reason: OnePasswordFailureReason, identity: 'operator' | 'management'): GwsEaError {
   switch (reason) {
     case 'not_signed_in':
@@ -645,7 +639,6 @@ async function selectAccount(
   return { accountId: account.accountId, signInAddress };
 }
 
-/** The operator's own user in the account, through the desktop sign-in. */
 async function verifyOperator(cli: OnePasswordCli, operator: OperatorIdentity): Promise<string> {
   const who = await cli.whoami(operator);
   if (who.status !== 'ok') throw hostProviderError(who.reason, 'operator');
@@ -663,7 +656,6 @@ const MANAGEMENT_UNAVAILABLE: ReadonlySet<OnePasswordFailureReason> = new Set([
   'not_found',
 ]);
 
-/** The management account's token is missing, expired or revoked, as opposed to another refusal. */
 export function isManagementUnavailable(reason: OnePasswordFailureReason): boolean {
   return MANAGEMENT_UNAVAILABLE.has(reason);
 }
@@ -694,7 +686,7 @@ async function verifyManagement(
     );
 }
 
-/** Mint the host management service account, or recover one already captured. */
+/** Recovers a management account already captured rather than minting another. */
 async function bootstrapManagement(
   cli: OnePasswordCli,
   operator: OperatorIdentity,
@@ -880,7 +872,6 @@ export async function enableOnePassword(
   });
 }
 
-/** One assistant once 1Password is disabled: what happened to its local runtime token, and what only the operator can do. */
 export interface OnePasswordAssistantDisable {
   readonly instance_id: string;
   /** `pending` when its record cannot be used safely, so its token was kept for the operator to inspect. */
@@ -1004,10 +995,9 @@ async function retireRuntimeAccess(
 }
 
 /**
- * Disable 1Password on this host (KTD9). The disabled intent is published
- * first, under the host lock and every assistant's lock: each host re-reads
- * it before any listing, fill, disclosure, write or share, so running and
- * restarted hosts stop at once. Then each local runtime token is deleted.
+ * The disabled intent is published first, under the host lock and every
+ * assistant's lock: each host re-reads it before every vault use, so running
+ * and restarted hosts stop at once. Then each local runtime token is deleted.
  * Vaults and their items, every recorded ID, unfinished credential attempts
  * and the management service account stay; it needs no provider, and it
  * revokes nothing: the result names each account only the operator can revoke.
@@ -1049,17 +1039,14 @@ export async function disableOnePassword(
   });
 }
 
-/**
- * Whether the operator has 1Password enabled on this host; an unusable policy
- * counts, so its owner hears of it. A disabled host provisions nothing.
- */
+/** An unusable policy counts as enabled, so its owner hears of it. */
 export async function onePasswordEnabled(paths: ControlPlanePaths): Promise<boolean> {
   const read = await readOnePasswordHostPolicy(onePasswordHostPaths(paths.configRoot).policyFile);
   return read.status === 'invalid' || (read.status === 'ready' && read.policy.enabled);
 }
 
 /**
- * The same reconciliation for one assistant during its operator-led create or
+ * Enable's reconciliation for one assistant during its operator-led create or
  * resume, under the instance operation the caller holds. Undefined when
  * 1Password is not enabled on this host. An assistant already provisioned
  * costs no provider request and no desktop prompt.
@@ -1125,7 +1112,7 @@ export interface OnePasswordQuota {
   /** `unknown` when a usage lookup failed: never reported as no usage. */
   readonly status: 'not_checked' | 'observed' | 'unknown';
   readonly account_type: OnePasswordAccountType | null;
-  /** This host's provisioned assistants, which draw on the account's one daily limit with every other service account. */
+  /** This host's provisioned assistants; they share the account's one daily limit with every service account. */
   readonly sharing_assistant_ids: readonly string[];
   readonly daily: { readonly limit: number; readonly used: number; readonly remaining: number } | null;
   readonly hourly_per_token: { readonly read: number | null; readonly write: number | null } | null;
@@ -1199,7 +1186,6 @@ async function tokenState(file: string): Promise<OnePasswordTokenState> {
   return read.status === 'ready' ? 'present' : read.status;
 }
 
-/** One assistant's local facts: its release, record, token and any unproven creation. */
 async function localReadiness(
   paths: ControlPlanePaths,
   instanceId: string,
@@ -1494,7 +1480,6 @@ function enableCommand(...flags: string[]): NextAction {
   return { kind: 'command', argv: ['gws-ea', 'capabilities', 'enable', 'onepassword', ...flags] };
 }
 
-/** The concrete next step for one assistant's provisioning, or none when it is ready. */
 function assistantActions(entry: OnePasswordAssistantProvisioning): readonly NextAction[] {
   const external = (instruction: string | null): NextAction[] =>
     instruction ? [{ kind: 'external', instruction }] : [];
@@ -1560,7 +1545,6 @@ export function onePasswordRevocation(
     : undefined;
 }
 
-/** Every pending or skipped assistant's step, each once; a ready host is checked next. Replaced accounts are named to revoke. */
 export function onePasswordEnableNextActions(data: OnePasswordEnableData): readonly NextAction[] {
   const actions = distinctActions(data.assistants.flatMap(assistantActions));
   const revocation = onePasswordRevocation(
@@ -1577,7 +1561,6 @@ export function onePasswordEnableNextActions(data: OnePasswordEnableData): reado
   ];
 }
 
-/** What a disable leaves to the operator: each account to revoke, each unproven creation, each record to inspect. */
 export function onePasswordDisableNextActions(data: OnePasswordDisableData): readonly NextAction[] {
   const revocation = onePasswordRevocation(
     data.assistants.map((entry) => ({
@@ -1604,7 +1587,6 @@ export function onePasswordDisableNextActions(data: OnePasswordDisableData): rea
   ];
 }
 
-/** The terminal account of a disable: what stopped, what was kept, what was deleted locally, and what was not done. */
 export function onePasswordDisableReport(data: OnePasswordDisableData): {
   readonly headline: string;
   readonly details: readonly string[];
@@ -1632,7 +1614,6 @@ export function onePasswordDisableReport(data: OnePasswordDisableData): {
   };
 }
 
-/** The pause create or resume reports when 1Password provisioning waits on the operator. */
 export function onePasswordProvisioningDetails(entry: OnePasswordAssistantProvisioning): readonly string[] {
   return assistantActions(entry).map((action) =>
     action.kind === 'external' ? action.instruction : `Then: ${action.argv.join(' ')}`,
@@ -1745,7 +1726,7 @@ export function onePasswordCapabilityLines(
   return lines;
 }
 
-/** Exact recovery for this capability's host-level error codes; a busy command is retried as it was given. */
+/** `command` is what a busy run retries, as it was given. */
 export function onePasswordRecovery(error: unknown, command: 'enable' | 'disable' = 'enable'): readonly NextAction[] {
   if (!(error instanceof GwsEaError)) return [];
   const external: NextAction = { kind: 'external', instruction: error.message };

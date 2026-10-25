@@ -1,5 +1,5 @@
 /**
- * Nothing private reaches anyone but the principal (R24, R37, KTD7).
+ * Nothing private reaches anyone but the principal.
  *
  * Drives the real delivery path, the real ncl dispatcher, and the real
  * approvals flow against a real central DB and real session DBs. Only the
@@ -426,7 +426,7 @@ describe('removing a private value', () => {
 });
 
 describe('the audience check on delivery', () => {
-  it('refuses a reply that quotes the home address to a counterpart, and sends the rewritten one (AE6)', async () => {
+  it('refuses a reply that quotes the home address to a counterpart, and sends the rewritten one', async () => {
     await addHome();
     queue(external, {
       id: 'reply-1',
@@ -626,7 +626,7 @@ describe('the shared check', () => {
     expect(await audienceForAddresses([])).toBe('others');
   });
 
-  it('counts a Gmail spelling of a principal address as the principal, and a +tag at another domain as others (R1)', async () => {
+  it('counts a Gmail spelling of a principal address as the principal, and a +tag at another domain as others', async () => {
     await addPrincipalAddress('patlee@gmail.com');
     expect(await audienceForAddresses(['Pat.Lee+trip@googlemail.com', 'PAT@example.com'])).toBe('principal');
     expect(await audienceForAddresses(['pat+trip@example.com'])).toBe('others');
@@ -634,7 +634,7 @@ describe('the shared check', () => {
   });
 });
 
-describe("the host browser's reading of what a website receives (KTD19, R34)", () => {
+describe("the host browser's reading of what a website receives", () => {
   it('names each stored value a site would receive by its id and kind, never by its value or label', async () => {
     const home = await addHome();
     const cell = (await addPrivateValue({ label: 'Cell', kind: 'phone', value: '+1 415 555 0134' })).id;

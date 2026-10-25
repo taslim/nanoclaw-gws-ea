@@ -1,10 +1,9 @@
 /**
- * Probe until `done` holds for the answer, sleeping `intervalMs` between
- * probes for at most `limitMs` (each sleep counts its own length), or until
- * `signal` aborts. With `maxIntervalMs` the interval doubles up to it, as
- * vendors' retry guidance asks. It returns the last answer, so the caller
- * decides what an unfinished wait means; a probe that throws ends the wait
- * with its error.
+ * Probe until `done` holds, `signal` aborts, or the sleeps between probes reach
+ * `limitMs` (probe time does not count, and the last sleep may overrun it).
+ * With `maxIntervalMs` the interval doubles up to it, as vendors' retry
+ * guidance asks. Returns the last answer, so the caller decides what an
+ * unfinished wait means; a probe that throws ends the wait with its error.
  */
 export async function pollUntil<T>(
   probe: () => Promise<T>,

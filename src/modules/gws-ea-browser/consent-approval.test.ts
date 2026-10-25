@@ -243,7 +243,7 @@ describe('asking the principal for consent', () => {
     expect(approval.title).toBe('Agree to this on join.example?');
     expect(approval.question).toContain(`join.example asks me to agree to this:\n"${WORDING}"`);
     expect(approval.question).toContain('until you ask me to stop');
-    // The card names the errand in the principal's words, never its internal thread (KTD18).
+    // The card names the errand in the principal's words, never its internal thread.
     expect(approval.question.endsWith(`\n\n${ERRAND_ORIGIN_LINE}`)).toBe(true);
     expect(approval.question).not.toContain(job.thread_id);
     // Only the principal decides it.
@@ -580,7 +580,7 @@ describe.skipIf(!chromePath)('an approved wording in native Chrome', { timeout: 
     }
   }
 
-  it('stops, asks the principal on a card, and after approval ticks only that box on the next submission (AE6)', async () => {
+  it('stops, asks the principal on a card, and after approval ticks only that box on the next submission', async () => {
     page = await fixture.newPage();
     await page.goto(CONSENT.required, { waitUntil: 'load' });
     const stopped = await pass(page.locator('#join-button'));

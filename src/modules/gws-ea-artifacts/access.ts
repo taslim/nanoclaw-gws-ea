@@ -35,7 +35,6 @@ export function createArtifactIdentityVerifier(
     /* eslint-enable no-catch-all/no-catch-all */
   };
 }
-/** The origin checks live local authority on every wrapper, child and HEAD request. */
 export function createArtifactViewResolver(
   config: ArtifactsPolicyFile,
   verify: ArtifactIdentityVerifier = createArtifactIdentityVerifier(config.accessIssuer, config.accessAud),

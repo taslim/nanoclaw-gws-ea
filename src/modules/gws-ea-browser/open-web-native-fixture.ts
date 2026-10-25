@@ -15,7 +15,6 @@ import { chromium, type Browser, type Page } from 'playwright-core';
 import { prepareAuthenticationIsolation } from './authentication-submit.js';
 import type { BrowserRef } from './observe.js';
 
-/** The aria ref of the one control named `name` in an observation, with its generation. */
 export function refIn(observation: { snapshot: string; generation: number }, name: string): BrowserRef {
   const line = observation.snapshot.split('\n').find((candidate) => candidate.includes(`"${name}"`));
   const ref = line && /\[ref=((?:f\d+)?e\d+)\]/u.exec(line)?.[1];
@@ -40,7 +39,7 @@ export interface OpenWebFixture {
   readonly browser: Browser;
   /** Every request the fixture's sites received, in order. */
   readonly requests: OpenWebRequest[];
-  /** Serves `route` at an HTTPS address (its query is ignored), replacing what was there; its host becomes reachable. */
+  /** Serves `route` at an HTTPS address (query ignored), replacing what was there; its host becomes reachable. */
   serve(url: string, route: OpenWebRoute): void;
   /** Serves the shared pages alone again and forgets every request: what each test starts from. */
   reset(): void;
@@ -49,7 +48,6 @@ export interface OpenWebFixture {
   close(): Promise<void>;
 }
 
-/** Where the shared open-web pages live. */
 export const OPEN_WEB = {
   article: 'https://news.example/2026/10/17/autumn-menus-open-this-week',
   about: 'https://news.example/about',
@@ -86,7 +84,6 @@ export const OPEN_WEB = {
   perks: 'https://perks.example/offer',
 } as const;
 
-/** Where a payment processor's API and its card frame live in the fixture: stand-ins for Stripe's. */
 export const PROCESSOR = {
   confirm: 'https://api.stripe.com/v1/payment_intents/pi_fixture/confirm',
   methods: 'https://api.stripe.com/v1/payment_methods',
@@ -96,17 +93,14 @@ export const PROCESSOR = {
 /** How long a page timer waits before it acts: longer than a batch's action, its settle and its observation. */
 const PAGE_TIMER_MS = 3_000;
 
-/** A whole HTML document: its title, its body and, when given, one inline script after the body. */
 export const htmlPage = (title: string, body: string, script = ''): string =>
   `<!doctype html><html><head><meta charset="utf-8"><title>${title}</title></head><body>${body}${script ? `<script>${script}</script>` : ''}</body></html>`;
 const shopHeader = '<header><a href="/">Linen &amp; Co</a> <a href="/cart">Cart</a> <a href="/help">Help</a></header>';
-/** PayPal's Pay Later message for `amount`, as a merchant's page embeds it. */
 const payLaterFrame = (amount: string): string =>
   `<iframe id="pay-later" title="PayPal Pay Later message" src="https://www.paypal.com/credit-presentment/smart/message?amount=${amount}" style="width:320px;height:40px;border:0"></iframe>`;
 /** Stripe.js's hidden metrics frame, which a page loading Stripe.js holds whether or not it takes a payment. */
 const stripeMetricsFrame =
   '<iframe name="__privateStripeMetricsController0" src="https://js.stripe.com/v3/m-outer-fixture.html" aria-hidden="true" tabindex="-1" style="visibility:hidden;position:fixed;width:1px;height:1px;border:0"></iframe>';
-/** Page script's `post`, which writes on the page whether its POST went out or was refused. */
 const postScript = `const post = (url, body) => fetch(url, { method: 'POST', mode: 'no-cors', body }).then(
   () => 'sent',
   () => 'refused',
@@ -299,7 +293,7 @@ function restaurantPage(widget: string): string {
   );
 }
 
-/** A booking step: party size, a time, a note for the venue and a reservation. With `fee`, a card guarantees a stated fee. */
+/** A booking step: party size, a time, a venue note and a reservation; with `fee`, a card guarantees a stated fee. */
 function bookingWidget(fee: boolean): string {
   return htmlPage(
     'Reserve a table',
@@ -321,7 +315,6 @@ function reservationPage(): string {
   );
 }
 
-/** A contact form: name, email and a message. */
 function contactPage(): string {
   return htmlPage(
     'Contact us',
@@ -554,7 +547,6 @@ function perksOfferFrame(): string {
   );
 }
 
-/** Where the consent engine's pages live (KTD11). */
 export const CONSENT = {
   offers: 'https://table.example/book/r-7',
   inverted: 'https://join.example/newsletter',
@@ -586,8 +578,8 @@ ${choices}<button type="submit" id="join-button">${button}</button></form>`,
   );
 
 /**
- * A free table's booking step whose pre-ticked offers box is a styled label over a hidden input (AE2). The
- * page records whether the box changed under a real click.
+ * A free table's booking step whose pre-ticked offers box is a styled label over a hidden input. The page records
+ * whether the box changed under a real click.
  */
 function offersBookingPage(): string {
   return htmlPage(
@@ -686,7 +678,7 @@ function consentPages(): Record<string, OpenWebRoute> {
   return {
     [CONSENT.offers]: offersBookingPage(),
     'https://table.example/book/r-7/confirm': htmlPage('Booked', '<h1>Your table is booked</h1>'),
-    // A newsletter signup whose box opts out when ticked (AE5).
+    // A newsletter signup whose box opts out when ticked.
     [CONSENT.inverted]: signupPage(
       '/newsletter/joined',
       box('no_newsletter', 'Tick here if you do NOT want our newsletter'),
@@ -723,7 +715,7 @@ sms.addEventListener('click', (event) => {
       `const offers = document.getElementById('offers');
 offers.addEventListener('change', () => { if (!offers.checked) setTimeout(() => { offers.checked = true; }, 50); });`,
     ),
-    // A signup that will not submit without agreeing to marketing (AE6), beside an optional partner box.
+    // A signup that will not submit without agreeing to marketing, beside an optional partner box.
     [CONSENT.required]: signupPage(
       '/required-marketing/joined',
       `${box('marketing', 'I agree to receive marketing', 'required')}${box('partners', 'Send me partner offers')}`,
@@ -765,7 +757,6 @@ offers.addEventListener('change', () => { if (!offers.checked) setTimeout(() => 
   };
 }
 
-/** Where the cookie-banner pages live (R18). */
 export const COOKIE_BANNERS = {
   oneTrust: 'https://news.example/cookies/onetrust',
   oneTrustSettings: 'https://news.example/cookies/onetrust-settings',
@@ -929,7 +920,6 @@ document.getElementById('onetrust-reject-all-handler').addEventListener('click',
   );
 }
 
-/** The cookie-banner pages, by address. */
 function cookieBannerPages(): Record<string, OpenWebRoute> {
   return {
     [COOKIE_BANNERS.oneTrust]: oneTrustPage(false),
@@ -967,8 +957,8 @@ function cookieBannerPages(): Record<string, OpenWebRoute> {
 }
 
 /**
- * Where the personal-data pages live (KTD19): a restaurant the principal names, with its booking form and the
- * sign-in to their own account there, and another site whose pages ask for the same details.
+ * The personal-data pages: a restaurant the principal names, with its booking form and the sign-in to their own
+ * account there, and other sites whose pages ask for the same details.
  */
 export const PERSONAL_DATA = {
   booking: 'https://osteria.example/reserve',
@@ -1050,7 +1040,6 @@ function newsletterPage(): string {
   );
 }
 
-/** The personal-data pages, by address. */
 function personalDataPages(): Record<string, OpenWebRoute> {
   return {
     [PERSONAL_DATA.booking]: briefedBookingPage(),
@@ -1064,7 +1053,7 @@ function personalDataPages(): Record<string, OpenWebRoute> {
   };
 }
 
-/** Where the unreviewed checkouts live (KTD4): a pottery shop, its payment platform, and booking pages. */
+/** The unreviewed checkouts: a pottery shop, its payment platform, and booking pages. */
 export const GENERIC = {
   review: 'https://pottery.example/checkout/review',
   steps: 'https://pottery.example/checkout/steps',
@@ -1165,7 +1154,6 @@ function depositWidget(): string {
   );
 }
 
-/** The pottery shop's checkout pages and the booking pages, by address. */
 export function genericCheckoutPages(): Record<string, OpenWebRoute> {
   const items = ['Celadon mug × 2', 'Ash glaze bowl × 1'];
   const card = 'Visa ending in 4242';
@@ -1241,7 +1229,6 @@ export function genericCheckoutPages(): Record<string, OpenWebRoute> {
   };
 }
 
-/** The shared open-web pages, by address. */
 function openWebPages(): Record<string, OpenWebRoute> {
   return {
     [OPEN_WEB.article]: articlePage(),
@@ -1435,7 +1422,7 @@ export async function openWebFixture(chromePath: string): Promise<OpenWebFixture
   };
 }
 
-/** Where the watched booking site lives (KTD20): an unreviewed venue whose slot list changes between checks. */
+/** The watched booking site: an unreviewed venue whose slot list changes between checks. */
 export const WATCHED = {
   tables: 'https://larder.example/tables?date=2026-10-24&party=2',
   book: 'https://larder.example/book',

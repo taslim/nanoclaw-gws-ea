@@ -1218,7 +1218,7 @@ describe('status', () => {
     }
   });
 
-  it("shows each principal address's calendar access in every state, and never counts it against the inbox (AE4)", async () => {
+  it("shows each principal address's calendar access in every state, and never counts it against the inbox", async () => {
     const host = await machine();
     const reservation = await assistant(host, { label: 'alpha', port: 36_001 });
     const state = world(reservation);
@@ -1323,7 +1323,7 @@ describe('status', () => {
       schema_moved: false,
       reason: null,
     });
-    // Either schema moving alone makes a rollback restore the pre-update snapshot (KTD5).
+    // Either schema moving alone makes a rollback restore the pre-update snapshot.
     expect(central.rollback).toMatchObject({ available: true, previous_commit: previousCommit, schema_moved: true });
     expect(session.rollback).toMatchObject({ available: true, previous_commit: previousCommit, schema_moved: true });
     // Each fingerprint follows its own schema alone.

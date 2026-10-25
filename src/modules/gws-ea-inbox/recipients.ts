@@ -1,17 +1,11 @@
 /**
- * Who an email to a thread's outside side goes to (KTD5, R68).
- *
- * - A reply goes to everyone on the message it answers, placed the way a
- *   person replying to all would place them: its From and To on To, its Cc
- *   on Cc, and the assistant on neither (`replyAll`). A Reply-To is never
- *   read. When the message it answers is the assistant's own, that is its To
- *   and Cc.
- * - `external-email` may trim them or name others by judgment, but every
- *   recipient must be one of the thread's addresses: on one of its messages,
- *   or named by `main` (`threadRecipients`, the recipient guard). That one
- *   rule lets it loop in someone a participant put on the thread, who could
- *   have forwarded it to them anyway, and keeps it from writing to anyone
- *   new: only `main` brings someone in.
+ * Who an email to a thread's outside side goes to. A reply goes to everyone
+ * on the message it answers (`replyAll`); `external-email` may trim them or
+ * name others by judgment, but every recipient must be one of the thread's
+ * addresses (`threadRecipients`, the recipient guard). That one rule lets it
+ * loop in someone a participant put on the thread, who could have forwarded
+ * it to them anyway, and keeps it from writing to anyone new: only `main`
+ * brings someone in.
  */
 import { OutboundRefusedError } from '../../delivery.js';
 import type { ParsedMail } from './mime.js';
@@ -19,13 +13,15 @@ import { threadAddresses } from './thread-map.js';
 
 const REFUSED_BY = 'gws-ea-inbox:recipients';
 
-/** An email's recipients, each address once. */
 export interface Recipients {
   readonly to: readonly string[];
   readonly cc: readonly string[];
 }
 
-/** Everyone on a message, as a reply to all places them. */
+/**
+ * As a person replying to all places them. A Reply-To is never read. A reply
+ * to the assistant's own message goes to that message's To and Cc.
+ */
 export function replyAll(mail: ParsedMail, assistant: ReadonlySet<string>): Recipients {
   const others = (addresses: readonly string[]) => [...new Set(addresses)].filter((a) => !assistant.has(a));
   const to = others([...(mail.from ? [mail.from.address] : []), ...mail.to.map((mailbox) => mailbox.address)]);
@@ -33,11 +29,7 @@ export function replyAll(mail: ParsedMail, assistant: ReadonlySet<string>): Reci
   return { to, cc };
 }
 
-/**
- * The recipient guard: the recipients as sent, each once where it is first
- * placed. Refuses the assistant, anyone the thread never had, and an email
- * with no one on To.
- */
+/** The recipient guard. Returns each recipient once, where it is first placed. */
 export async function threadRecipients(
   threadKey: string,
   wanted: Recipients,

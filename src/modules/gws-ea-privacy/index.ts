@@ -1,21 +1,23 @@
 import { noVerifiedPrincipalMessage } from '../gws-ea-profile/approval-wording.js';
 /**
- * GWS-EA privacy: the principal's private values and the audience check
- * (R24, R37, KTD7).
+ * The principal's private values and the audience check that keeps them from
+ * everyone else.
  *
  * Private values are the ones the principal names, held in a main-only
- * store. A principal request can clear one value for its own active chat.
- * One check covers everything sent to anyone but the principal:
+ * store. A handoff that cites the principal's request in a chat clears every
+ * value it contains for that chat while the chat stays active. One check
+ * covers everything sent to anyone but the principal:
  *
- *   - an outbound guard at the delivery adapter, so agent replies, approval
- *     cards, and host notices all pass it. A refused send never reaches the
- *     channel, and its sender is told to write it again without the value.
- *     Email to the inbox's outside threads is the exception: the guard sees
- *     only the agent's words, while the inbox builds the email that goes, so
- *     the inbox runs `checkOutbound` itself, on the final email and its final
- *     recipients (gws-ea-inbox's `sendToOutside`);
- *   - `checkOutbound`, the same check for that email, the host's calendar
- *     writes, and main's handoff text, which never pass through a channel.
+ *   - an outbound guard at the delivery adapter, which every channel send
+ *     passes. A refused send never reaches the channel, and its sender is
+ *     told to write it again without the value. Email to the inbox's outside
+ *     threads is the exception: the guard sees only the agent's words, while
+ *     the inbox builds the email that goes, so the inbox runs `checkOutbound`
+ *     itself, on the final email and its final recipients (gws-ea-inbox's
+ *     `sendToOutside`);
+ *   - `checkOutbound`, the same check, for that email and for any text bound
+ *     for others that does not travel as a channel send, such as a host write
+ *     or a handoff to another agent.
  *
  * Each send is judged on its own: external-email never holds a private value
  * (main's handoffs are checked before they cross), so there is nothing for it
@@ -23,10 +25,10 @@ import { noVerifiedPrincipalMessage } from '../gws-ea-profile/approval-wording.j
  * its readers receive it: as written, as a mail client renders it, and the
  * targets of its links (`readingsOf`).
  *
- * Websites are the browser module's to guard (KTD19): it reads what each
- * site would receive through `loadPersonalData`, which names the values it
- * finds by reference, and refuses each on a site main has not disclosed it
- * to. No disclosure opens a site to one of the principal's addresses (R34).
+ * Websites are the browser module's to guard: it reads what each site would
+ * receive through `loadPersonalData`, which names the values it finds by
+ * reference, and refuses each on a site its errand has no disclosure for. No
+ * disclosure opens a site to one of the principal's addresses.
  *
  * A refusal names only the value's fixed kind, never the value or its label.
  * Removing a value switches its check off, so an agent's removal waits for
@@ -85,25 +87,21 @@ export const PRIVACY_GUARD_ID = 'gws-ea-privacy:audience';
 registerOutboundGuard(PRIVACY_GUARD_ID, judgeSend);
 
 // ---------------------------------------------------------------------------
-// What the host browser gives a website (KTD19, R34)
+// What the host browser gives a website
 // ---------------------------------------------------------------------------
 
-/** What the text one website receives gives away. */
 export interface PersonalDataReading {
-  /** The stored values it gives away. */
   readonly values: readonly PrivateValueReference[];
-  /** Whether it gives away one of the principal's addresses. */
   readonly principalAddress: boolean;
 }
 
 export interface PersonalData {
   /** No stored value and no principal address: nothing a website could be given. */
   readonly empty: boolean;
-  /** What `fields`, the text one website receives, read in order as one form's fields, give away. */
+  /** `fields` is everything one website receives, read in order as one form's fields. */
   read(fields: readonly string[]): PersonalDataReading;
 }
 
-/** An email address as people write one in text. */
 const WRITTEN_ADDRESS = /[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}/gu;
 
 /** One mailbox in every spelling that reaches it (`identityMatchKey`): any case, any `+tag`, and Gmail's dots. */
@@ -112,12 +110,11 @@ function mailbox(address: string): string {
 }
 
 /**
- * The principal's personal data as the host browser reads what a website receives (KTD19, R34): each stored
- * value, which main may disclose to one site, and each of the principal's addresses, which only the host's own
- * sign-in to their own account gives a site. A value is found however it is written and split across the
- * fields, a phone number across an area-code field and a number field included, and an address in any
- * spelling that reaches the principal's mailbox. Read through `db`, the browser's handle on the central
- * database; a reading names values by reference, so no value leaves this module.
+ * For reading what the host browser would give a website: each stored value, which only its errand's disclosure
+ * gives one site, and each of the principal's addresses, which only the host's own sign-in to their own account
+ * gives a site. A value is found however it is written and split across the fields, a phone number across an
+ * area-code field and a number field included, and an address in any spelling that reaches the principal's
+ * mailbox. A reading names values by reference, so no value leaves this module.
  */
 export async function loadPersonalData(db: DbDriver = getDb()): Promise<PersonalData> {
   const stored = (await db.hasTable('gws_ea_private_values')) ? await listPrivateValues(db) : [];
@@ -147,8 +144,8 @@ export async function loadPersonalData(db: DbDriver = getDb()): Promise<Personal
 }
 
 /**
- * A stored value as main's disclosure names it (KTD19): its id, kind and label, and whether it reaches one of
- * the principal's mailboxes, which no disclosure may open a site to (R34). Never the value itself.
+ * A stored value as a disclosure names it, never the value itself. `principalAddress` marks one that reaches the
+ * principal's mailbox, which no disclosure may open a site to.
  */
 export async function privateValueReference(
   id: string,
@@ -163,7 +160,6 @@ export async function privateValueReference(
 // Removal: held for the principal's card, because it switches a check off.
 // ---------------------------------------------------------------------------
 
-/** The `pending_approvals.action` a removal card resolves through. */
 const REMOVAL_APPROVAL = 'private_value_remove';
 
 /** The card's payload, exactly as `requestApproval` stores it, so a grant binds to one value. */

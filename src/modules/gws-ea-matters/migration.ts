@@ -1,32 +1,30 @@
 import type { ModuleMigration } from '../../db/migrations/index.js';
 
 /**
- * Matters (KTD3): what `main` must come back to, each with only what lives
- * nowhere else (R2) and links to where the facts live (R3, R4). The schema
- * holds what it can on its own, so a writer that skips `db.ts` still cannot
- * break it:
+ * Matters: what `main` must come back to, each with only what lives nowhere
+ * else and links to where the facts live. The schema holds what it can on its
+ * own, so a writer that skips `db.ts` still cannot break it:
  *
  * - a matter has a title, an open loop, an optional parent (a strand of that
- *   project, R29), and the task that is its next look (KTD4); it is open
- *   until it closes with an outcome, so an open matter never has one and a
- *   closed one always does (R5). There is no status, stage, priority, due
- *   date, owner or log;
- * - `look_failed_at` marks a failed look (KTD7 step 3). The runner settles a
- *   failed turn's rows as done, so a repeating look's next occurrence is
- *   armed on its next date as if it had run; the host marks the matter when
- *   it hears of the failure, and its loop brings that occurrence to the next
- *   daily sync, then clears the mark. It is the host's bookkeeping for one
- *   guarantee, never shown to `main` or anyone, and no status of the matter;
+ *   project), and the task that is its next look; it is open until it closes
+ *   with an outcome, so an open matter never has one and a closed one always
+ *   does. There is no status, stage, priority, due date, owner or log;
+ * - `look_failed_at` marks a failed look. The runner settles a failed turn's
+ *   rows as done, so a repeating look's next occurrence is armed on its next
+ *   date as if it had run; the host marks the matter when it hears of the
+ *   failure, and its loop brings that occurrence to the next daily sync, then
+ *   clears the mark. It is the host's bookkeeping for one guarantee, never
+ *   shown to `main` or anyone, and no status of the matter;
  * - a link is a reference by id: a thread key, `<calendar id>/<event id>`, a
  *   Drive file id, a person id, or a memory path. `handler` names the agent
- *   that works it (R7);
- * - a thread, event or file sits in at most one open matter (R3). SQLite's
- *   partial index cannot read another table, so each link carries its
- *   matter's open flag, which `db.ts` writes in the same transaction as the
- *   matter's open, close and reopen. A closed matter keeps its links.
+ *   that works it;
+ * - a thread, event or file sits in at most one open matter. SQLite's partial
+ *   index cannot read another table, so each link carries its matter's open
+ *   flag, which `db.ts` writes in the same transaction as the matter's open,
+ *   close and reopen. A closed matter keeps its links.
  *
- * Strands stay one level deep, and a project stays open while a strand is
- * (KTD13): rules across rows, which `db.ts` enforces.
+ * Strands stay one level deep, and a project stays open while a strand is:
+ * rules across rows, which `db.ts` enforces.
  */
 export const gwsEaMattersMigration: ModuleMigration = {
   version: 1,
@@ -66,7 +64,7 @@ export const gwsEaMattersMigration: ModuleMigration = {
   },
 };
 
-/** Job references join the native piece store; existing matter and link history is preserved. */
+/** Adds `job` as a piece kind, which like a thread sits in at most one open matter. */
 export const gwsEaMatterJobsMigration: ModuleMigration = {
   version: 1,
   name: 'module:gws-ea-matters:browser-jobs',

@@ -2,9 +2,9 @@ import type { BrowserRuntime } from './runtime.js';
 import { BROWSER_POLICY_VERSIONS } from './policy.js';
 
 /**
- * Host-only status includes the admitted debugger port, never its URL, browser identifier, credentials, cookies or page text.
- * `policyVersions` names the browser policy versions this host reads: the launcher writes a
- * version-2 access list only to a host that reports it (KTD15).
+ * Host-only status includes the admitted debugger port, never its URL, browser identifier, credentials, cookies or
+ * page text. `policyVersions` names the browser policy versions this host reads: the launcher writes a version-2
+ * access list only to a host that reports it.
  */
 export async function browserHealth(
   state: ReturnType<BrowserRuntime['state']>,

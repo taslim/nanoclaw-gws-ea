@@ -39,9 +39,9 @@ const protectedGroupPolicies = new Map<string, ProtectedGroupPolicy>();
 const PROTECTED_GROUP_POLICY_ID = /^[a-z0-9][a-z0-9._-]*:[a-z0-9][a-z0-9._-]*$/u;
 
 /**
- * Register a protected-group policy. Every agent caller's `ncl` command that
- * names a protected group is denied, and so is any self-modification request
- * from one (src/modules/self-mod/guard.ts). The host caller is unaffected.
+ * Every agent caller's `ncl` command that names a protected group is denied,
+ * as is whatever else consults `protectedGroupReason`. The host caller is
+ * unaffected.
  */
 export function registerProtectedGroupPolicy(id: string, policy: ProtectedGroupPolicy): void {
   if (!PROTECTED_GROUP_POLICY_ID.test(id)) throw new Error(`Invalid protected group policy ID: ${id}`);
@@ -49,7 +49,6 @@ export function registerProtectedGroupPolicy(id: string, policy: ProtectedGroupP
   protectedGroupPolicies.set(id, policy);
 }
 
-/** Why `agentGroupId` is protected, or undefined when no registered policy protects it. */
 export async function protectedGroupReason(agentGroupId: string): Promise<string | undefined> {
   for (const policy of protectedGroupPolicies.values()) {
     const reason = await policy(agentGroupId);
@@ -58,12 +57,6 @@ export async function protectedGroupReason(agentGroupId: string): Promise<string
   return undefined;
 }
 
-/**
- * The agent groups a command names, read from its canonical args
- * (./args.ts): its group arguments, `--id` where it is the group (groups,
- * destinations) or names a row of one (a wiring, a session), and both ends of
- * an agent message policy.
- */
 async function namedGroups(cmd: CommandDef, args: Record<string, unknown>): Promise<string[]> {
   const named = new Set<string>();
   const add = (value: unknown): void => {

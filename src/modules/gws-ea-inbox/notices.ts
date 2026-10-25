@@ -1,8 +1,6 @@
 /**
  * The inbox's plain sentences to the principal. Each goes once, through
- * gws-ea-notices, to the principal's direct message only: an email set
- * aside, an inbox it cannot reach, and mail in their name Gmail could not
- * confirm is theirs.
+ * gws-ea-notices, to the principal's direct message only.
  */
 import { formatLocalTime } from '../../timezone.js';
 import { sendPrincipalNotice } from '../gws-ea-notices/index.js';
@@ -49,7 +47,6 @@ export async function noticeUnhealthy(): Promise<void> {
   await sendPrincipalNotice(UNHEALTHY_NOTICE, 'inbox-unhealthy');
 }
 
-/** What the principal changes, if they sent the email, so Gmail can confirm their mail is theirs. */
 function unsignedFix(reason: PrincipalRefusal, domain: string): string {
   switch (reason) {
     case 'no-own-dkim':
@@ -58,7 +55,7 @@ function unsignedFix(reason: PrincipalRefusal, domain: string): string {
       return `whoever runs email for ${domain} needs to publish a DMARC policy for it so I can tell it's yours.`;
     case 'sender-differs':
       return 'send it straight from that address rather than through a service that sends it for you.';
-    // Mail with a List-Id is archived before any notice (KTD3), so this stays only to cover every reason the check gives.
+    // Mail with a List-Id is settled as automated before any notice, so this case only keeps the switch exhaustive.
     case 'mailing-list':
       return 'send it to me straight from that address rather than through a mailing list.';
     case 'no-gmail-results':
@@ -71,11 +68,8 @@ function unsignedFix(reason: PrincipalRefusal, domain: string): string {
 }
 
 /**
- * An email showing one of the principal's addresses that Gmail could not
- * confirm is theirs: the address as they listed it, when Gmail received it,
- * and the fix if they sent it, never anything its sender wrote. Once per
- * address and reason, as the inbox records it. Returns whether it was
- * delivered.
+ * Never anything its sender wrote. Once per address and reason, as the inbox
+ * records it; returns whether it was delivered.
  */
 export async function noticeUnsignedMail(input: {
   readonly address: string;

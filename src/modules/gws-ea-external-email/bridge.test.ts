@@ -1,10 +1,9 @@
 /**
- * The bridge between main and external-email (KTD4; R65–R68, R74, R75;
- * AE64): `email_handoff`, main's work for one email thread, and `tell_main`,
- * external-email's account of its thread, which wakes main only when asked
- * to, with any files that came in it (Slice 6 R15; Slice 5 R7, KTD9). A
+ * The bridge between main and external-email: `email_handoff`, main's work for
+ * one email thread, and `tell_main`, external-email's account of its thread,
+ * which wakes main only when asked to, with any files that came in it. A
  * thread is handed over only once main has placed it, and the handoff
- * releases the mail held for it (Slice 5 R9, KTD8).
+ * releases the mail held for it.
  *
  * Drives the real delivery actions and their guards, the thread map, the
  * privacy check, human pace, the session DBs, and the matters renderer with
@@ -57,7 +56,7 @@ vi.mock('../gws-ea-meetings/calendar-api.js', async (importOriginal) => {
   };
 });
 
-/** The assistant's Drive and what a signed-out visit sees, for the link check (Slice 6 KTD5). */
+/** The assistant's Drive and what a signed-out visit sees, for the link check. */
 const workspace = vi.hoisted(() => ({ drive: undefined as unknown }));
 vi.mock('../gws-ea-workspace/drive-api.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../gws-ea-workspace/drive-api.js')>();
@@ -371,7 +370,7 @@ afterEach(async () => {
 // ---------------------------------------------------------------------------
 
 describe('email_handoff', () => {
-  it('starts a thread with the people main names, who may then be written to, with main’s words in its session (AE64)', async () => {
+  it('starts a thread with the people main names, who may then be written to, with main’s words in its session', async () => {
     const frame = await handoff({
       people: [REMY, PRINCIPAL],
       message: 'Pat forwarded Remy’s lunch invitation and said to reply: yes to Thursday, and ask where.',
@@ -658,7 +657,7 @@ describe('email_handoff', () => {
     expect(await count('gws_ea_threads')).toBe(1);
   });
 
-  it('joins the thread it hands over, new or named, to the open matter main names (Slice 5 KTD11)', async () => {
+  it('joins the thread it hands over, new or named, to the open matter main names', async () => {
     const { matter } = await openMatter({
       title: 'Acme renewal',
       openLoop: 'Pat wants the renewal call this week.\nJane settles the time; Remy relays.',
@@ -700,7 +699,7 @@ describe('email_handoff', () => {
   });
 });
 
-describe('email_handoff and placement (Slice 5 R9, KTD8)', () => {
+describe('email_handoff and placement', () => {
   it('refuses a thread main has not placed, saying why, and leaves its mail held', async () => {
     const { key, session } = await inboundThread('g-coffee', JANE, 'unplaced');
     await heldMail(session, key, 'jane-1', 'Is Tuesday good for Pat?');
@@ -809,7 +808,7 @@ describe('email_handoff and placement (Slice 5 R9, KTD8)', () => {
 // tell_main
 // ---------------------------------------------------------------------------
 
-describe('a Google link in a handoff (Slice 6 R4, R18, KTD4)', () => {
+describe('a Google link in a handoff', () => {
   const docUrl = (id: string) => `https://docs.google.com/document/d/${id}/edit`;
 
   async function shared(name: string, people: readonly string[]): Promise<string> {
@@ -818,7 +817,7 @@ describe('a Google link in a handoff (Slice 6 R4, R18, KTD4)', () => {
     return id;
   }
 
-  it("refuses the principal's deck the assistant can only view, naming the principal as its owner, and hands nothing over (AE3)", async () => {
+  it("refuses the principal's deck the assistant can only view, naming the principal as its owner, and hands nothing over", async () => {
     const deck = drive.shareWithAssistant({
       name: 'Board deck',
       owner: PRINCIPAL,
@@ -883,7 +882,7 @@ function framed(source: string, text: string): string {
   ].join('\n');
 }
 
-describe("tell_main: external-email's account of its thread (R7, KTD9)", () => {
+describe("tell_main: external-email's account of its thread", () => {
   it('keeps the account and writes nothing into main’s conversation when main need not act now', async () => {
     const { key, session } = await inboundThread('g-order', REMY);
     const account = 'Asked Remy for the signed order form. He expects it from legal on Thursday.';
@@ -991,7 +990,7 @@ describe("tell_main: external-email's account of its thread (R7, KTD9)", () => {
     expect(await threadAccount(remy.key)).toMatchObject({ text: 'Remy asks for the board deck.' });
   });
 
-  it("shows on Remy's thread line, as external-email's words, the next time main reads the matter (AE10)", async () => {
+  it("shows on Remy's thread line, as external-email's words, the next time main reads the matter", async () => {
     const { key, session } = await inboundThread('g-acme', REMY);
     const { matter } = await openMatter({
       title: 'Acme renewal',
@@ -1063,7 +1062,7 @@ describe('tell_main with wake', () => {
     expect(vi.mocked(requestWake).mock.calls.map(([woken]) => woken.id)).toEqual([main.id]);
   });
 
-  it("carries the open matter its thread sits in, read live, after external-email's words (Slice 5 R11)", async () => {
+  it("carries the open matter its thread sits in, read live, after external-email's words", async () => {
     const { key, session } = await inboundThread('g-acme', REMY);
     const { matter } = await openMatter({
       title: 'Acme renewal',
@@ -1083,7 +1082,7 @@ describe('tell_main with wake', () => {
     expect(note).toContain(`\n- thread ${key}: `);
   });
 
-  it('marks each of the principal’s addresses by how it came to the thread, and says what calendar it books on (R13)', async () => {
+  it('marks each of the principal’s addresses by how it came to the thread, and says what calendar it books on', async () => {
     await addPrincipalAddress(PRINCIPAL_GMAIL);
     const { key, session } = await inboundThread('g-intro', STRANGER);
     // The stranger's email went to the principal's Gmail, spelled their own way, and named another of their addresses.
@@ -1162,7 +1161,7 @@ describe('tell_main with wake', () => {
     expect(await threadAccount(key)).toMatchObject({ text: 'Remy asks whether Pat eats fish.' });
   });
 
-  it('brings main the files external-email staged, saved in its session with each one’s SHA-256, framed as others’ (R15)', async () => {
+  it('brings main the files external-email staged, saved in its session with each one’s SHA-256, framed as others’', async () => {
     const { key, session } = await inboundThread('g-invoice', JANE);
     const invoice = Buffer.from([0x25, 0x50, 0x44, 0x46, 0xff, 0x00, 0x9c]);
     // A name the sender chose, written to steer whoever reads it.
@@ -1297,8 +1296,8 @@ describe('tell_main with wake', () => {
 // The calendar a thread books on
 // ---------------------------------------------------------------------------
 
-describe('the first booking on a thread an outsider started (R11–R13)', () => {
-  it('tells external-email to wake main before it offers a time, and books nothing until main sets the thread’s calendar; book then lands there alone (AE3, KTD18)', async () => {
+describe('the first booking on a thread an outsider started', () => {
+  it('tells external-email to wake main before it offers a time, and books nothing until main sets the thread’s calendar; book then lands there alone', async () => {
     // A stranger wrote to the assistant, copying the principal, and no default exists: no calendar is set.
     const { key, session } = await inboundThread('g-intro', STRANGER);
     await recordThreadAddresses(key, [PRINCIPAL], 'message', now());

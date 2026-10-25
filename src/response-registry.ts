@@ -50,7 +50,6 @@ export function getResponseHandlers(): readonly ResponseHandler[] {
   return responseHandlers;
 }
 
-/** A request as the handler that resolves it holds it: what was asked, and the options it offered. */
 export interface AnsweredRequest {
   readonly title: string;
   readonly question: string;
@@ -58,14 +57,11 @@ export interface AnsweredRequest {
 }
 
 /**
- * Show an answered request's outcome in place, when the channel left the
- * request as posted (ResponsePayload.deferResolution): edit it, addressed by
- * its question id in the conversation the answer came from, to what was
- * asked and the option the answer chose, with the reason given for a
- * rejection, quoted as someone else's text (quoted). The handler calls this
- * only once it has authorized the answer and resolved the request; an answer
- * it refuses leaves the request as it is. A failed edit is logged, and the
- * resolution stands.
+ * When the channel left the request as posted (ResponsePayload.deferResolution),
+ * edit it in place to what was asked and the option chosen, with a rejection's
+ * reason quoted as someone else's text. Call only once the answer is
+ * authorized and the request resolved; a refused answer leaves the request as
+ * posted. A failed edit is logged, and the resolution stands.
  */
 export async function showRequestOutcome(
   adapter: ChannelDeliveryAdapter | null,

@@ -1,5 +1,5 @@
 /**
- * Failure notices in main's own conversations (R38, Slice 5 R25): the
+ * Failure notices in main's own conversations: the
  * principal hears of a failure only when what failed was their own message,
  * one plain sentence in their direct message; anything else in main's
  * conversations (a note from the host, a look, the daily sync, another agent's
@@ -755,7 +755,7 @@ describe('a failed turn the runner reports', () => {
     expect(sent).toEqual([]);
   });
 
-  it('of the daily sync, tells Morgan nothing, and the look it was serving comes back at the next sync (AE12)', async () => {
+  it('of the daily sync, tells Morgan nothing, and the look it was serving comes back at the next sync', async () => {
     const { matter } = await openMatterWithLook(
       { title: 'Acme renewal', openLoop: 'Morgan wants it signed this quarter.', links: [] },
       { kind: 'once', at: new Date(Date.now() + 60_000).toISOString() },

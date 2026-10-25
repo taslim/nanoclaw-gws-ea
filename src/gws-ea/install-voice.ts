@@ -1,4 +1,4 @@
-/** The explicit operator recipe. Importing it never downloads or starts inference. */
+/** The operator's explicit voice install. Importing it never downloads or starts inference. */
 import { createHash } from 'node:crypto';
 import { chmod, copyFile, lstat, mkdir, mkdtemp, open, rename, rm } from 'node:fs/promises';
 import path from 'node:path';
@@ -122,7 +122,6 @@ async function retainBuildDiagnostic(file: string): Promise<void> {
     }
     // eslint-disable-next-line no-catch-all/no-catch-all -- Optional diagnostic collection must preserve the original build failure.
   } catch (error) {
-    // Diagnostic collection must not replace the failed build.
     try {
       step.write(`Build diagnostic unavailable (${errorCode(error)}): ${file}\n`);
       // eslint-disable-next-line no-catch-all/no-catch-all -- A broken diagnostic sink must not replace the original build failure.

@@ -5,11 +5,10 @@ export const INSTANCE_MARKER_SCHEMA_VERSION = 1 as const;
 export const GCHAT_CHANNEL_TYPE = 'gchat';
 
 /**
- * Provisioning steps in run order; a completed `verify_conversation` means the
- * assistant is ready. The host talks in Chat as the assistant from the moment
- * it starts, so Chat is configured and the assistant signed in before
- * `start_nanoclaw`; agents' Google access, which the running host publishes,
- * is connected after it.
+ * In run order; a completed `verify_conversation` means the assistant is
+ * ready. The host talks in Chat as the assistant from the moment it starts, so
+ * Chat is configured and the assistant signed in before `start_nanoclaw`;
+ * agents' Google access, which the running host publishes, is connected after.
  */
 export const PROVISION_STEPS = [
   'materialize_checkout',
@@ -39,8 +38,8 @@ export interface ArtifactsNamespaceClaim {
 }
 
 /**
- * What only this assistant may hold. Everything Google Cloud names is the
- * instance's own: the project is derived from its instance ID, and the
+ * What only this assistant may hold, except `gcp_account`, the operator's
+ * Google Cloud sign-in. The project is derived from the instance ID, and the
  * topic Google Chat publishes to, the pull subscription the host reads, and
  * the account that may only pull it are derived from the project.
  */
@@ -52,12 +51,12 @@ export interface ExclusiveResourceClaims {
   gchat_subscriber_account: string;
   workspace_email: string;
   /**
-   * The assistant's web alias (KTD13): the address the operator was asked to
-   * add, claimed when its setup pauses, and kept once verified. It shares the
-   * workspace email's mailbox key space, so no address is two assistants'.
+   * The web alias the operator was asked to add, claimed before it is offered
+   * and kept once verified. It shares the workspace email's mailbox key space,
+   * so no address is two assistants'.
    */
   alias_email?: string;
-  /** This assistant alone may link this E.164 WhatsApp account. */
+  /** E.164. */
   whatsapp_number?: string;
   artifacts?: ArtifactsNamespaceClaim;
   onecli_project: string;
@@ -74,20 +73,15 @@ export interface InstanceReservationInput {
 
 export type InstanceReservation = Readonly<InstanceReservationInput>;
 
-/**
- * Which release a reservation deploys: the only reservation fields an update
- * or rollback moves, and only through the registry compare-and-swap.
- */
+/** The only reservation fields an update or rollback moves, and only through `swapInstanceRelease`. */
 export type ReleaseCoordinates = Readonly<
   Pick<InstanceReservationInput, 'source_remote' | 'release_track' | 'deployed_commit'>
 >;
 
-/** A commit as messages show it: its first 12 hex digits. */
 export function shortCommit(commit: string): string {
   return commit.slice(0, 12);
 }
 
-/** A release as messages show it: its track and short commit. */
 export function releaseLine(release: ReleaseCoordinates): string {
   return `${release.release_track} ${shortCommit(release.deployed_commit)}`;
 }
@@ -113,13 +107,13 @@ export interface InstanceRegistry {
   instances: Record<string, InstanceReservation>;
 }
 
-/** Names the assistant a `state/` belongs to; which release runs is the live link and its Git HEAD (KTD2). */
+/** Names the assistant a `state/` belongs to; which release runs is the live link and its Git HEAD. */
 export interface InstanceMarker {
   schema_version: typeof INSTANCE_MARKER_SCHEMA_VERSION;
   instance_id: string;
 }
 
-/** Structured, non-secret facts about a failure, for rendering and diagnosis. */
+/** Non-secret facts about a failure, for rendering and diagnosis. */
 export type GwsEaErrorDetails = Readonly<Record<string, string | number | boolean | null | readonly string[]>>;
 
 export interface GwsEaErrorOptions {
@@ -139,7 +133,7 @@ export class GwsEaError extends Error {
   }
 }
 
-/** The running host’s account observation, also returned by the operator command socket. */
+/** As the running host reports it over its command socket. */
 export interface WhatsAppCommandData {
   readonly state: 'unlinked' | 'linking' | 'connected' | 'needs-relink';
   readonly number?: string;

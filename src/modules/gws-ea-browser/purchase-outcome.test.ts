@@ -2,7 +2,7 @@ import { claimRegionWatchCommit } from './watch-state.js';
 import { createBrowserQueue } from './index.js';
 import { holdBrowserRequest, stopHeldBrowserRequests } from './testing/held-request.js';
 /**
- * Purchase outcomes against a real central DB and real session DBs (KTD8, KTD9, KTD10): an attempt with no page
+ * Purchase outcomes against a real central DB and real session DBs: an attempt with no page
  * proof is unconfirmed and told once, main records its outcome through the one resolve function, and every edge
  * of the purchase state machine past the press settles the authority, the watch, the block and the waiting jobs.
  */
@@ -665,7 +665,7 @@ describe('a watch booking', () => {
   });
 });
 
-describe('a region watch (KTD20)', () => {
+describe('a region watch', () => {
   /** A region watch of `job` on `site`, armed, with the job's one booking still to spend. */
   async function regionWatch(job: BrowserJob, id: string, site: string): Promise<void> {
     const at = new Date().toISOString();

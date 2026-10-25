@@ -1,9 +1,9 @@
 /**
- * Keyed fingerprints of forgotten identities (KTD8). Forgetting a person
- * keeps only an HMAC of each identity, so learning cannot bring them back
- * while nothing readable about them remains. The key lives in an owner-only
- * file in the instance's secrets directory, beside the Google grant; it is
- * created once, by the first forget, and never replaced.
+ * Keyed fingerprints of forgotten identities. Forgetting a person keeps only
+ * an HMAC of each identity, so learning cannot bring them back while nothing
+ * readable about them remains. The key lives in an owner-only file in the
+ * instance's secrets directory, beside the Google grant; it is created once,
+ * by the first forget, and never replaced.
  */
 import { createHmac, randomBytes } from 'node:crypto';
 import path from 'node:path';
@@ -14,14 +14,13 @@ import { readOwnerOnlyFile, writeOwnerOnlyFileExclusive } from '../../gws-ea/sec
 import { identityMatchKey } from '../../gws-ea/validation.js';
 import { GOOGLE_GRANT_FILE_ENV } from '../gws-ea-google/grant.js';
 
-/** The key's file name in the instance's `secrets/` directory. */
 export const FINGERPRINT_KEY_FILE_NAME = 'people-fingerprint-key';
 
 const KEY_BYTES = 32;
 
 /**
- * Where the key lives: beside the Google grant, whose path the instance's
- * host is started with. Undefined on a host that is not a GWS-EA instance.
+ * Beside the Google grant, whose path the instance's host is started with.
+ * Undefined on a host that is not a GWS-EA instance.
  */
 export function fingerprintKeyFile(): string | undefined {
   const grantFile = process.env[GOOGLE_GRANT_FILE_ENV];
@@ -34,7 +33,7 @@ function decodeKey(contents: string, file: string): Buffer {
   return key;
 }
 
-/** The key, or undefined when its file does not exist. An unsafe or malformed file is refused. */
+/** Undefined when the file does not exist; an unsafe or malformed file throws. */
 export async function readFingerprintKey(file: string): Promise<Buffer | undefined> {
   try {
     return decodeKey(await readOwnerOnlyFile(file), file);
@@ -44,10 +43,7 @@ export async function readFingerprintKey(file: string): Promise<Buffer | undefin
   }
 }
 
-/**
- * Create the key in its private directory. Exclusive: a key another writer
- * created first is read back, never overwritten.
- */
+/** Exclusive: a key another writer created first is read back, never overwritten. */
 export async function createFingerprintKey(file: string): Promise<Buffer> {
   await assertPrivateDirectory(path.dirname(file));
   try {
@@ -60,7 +56,7 @@ export async function createFingerprintKey(file: string): Promise<Buffer> {
   return key;
 }
 
-/** The keyed fingerprint of an identity: HMAC-SHA256 of its match key, in hex. */
+/** Of the match key, so every spelling that reaches the same mailbox has one fingerprint. */
 export function identityFingerprint(key: Buffer, handle: string): string {
   return createHmac('sha256', key).update(identityMatchKey(handle), 'utf8').digest('hex');
 }

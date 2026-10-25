@@ -2,12 +2,12 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
-/** The whole section, header and definition included: Claude Code passes hook context under 10,000 characters inline. */
+/** Header and definition included: Claude Code passes hook context under 10,000 characters inline. */
 export const MEMORY_SECTION_BUDGET_CHARS = 10_000;
 export const MEMORY_INDEX_PATH = '/workspace/agent/memory/index.md';
 export const MEMORY_TRUNCATION_NOTICE = `[cut here to fit: the rest is in ${MEMORY_INDEX_PATH}. Move detail from the index into linked memory files, keeping every fact, so the index fits whole]`;
 
-/** The memory definition in force: where the hook reads it, and the path the agent is shown. */
+/** `file` is where the hook reads the definition; `path` is the one the agent is shown. */
 export interface MemoryDefinition {
   readonly file: string;
   readonly path: string;
@@ -63,7 +63,6 @@ function readMemoryFile(filePath: string): string {
   }
 }
 
-/** Cut the index from its end to `room` characters, at a line end where there is one, and say where the rest is. */
 function fitIndex(index: string, room: number): string {
   if (index.length <= room) return index;
 

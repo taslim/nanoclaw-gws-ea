@@ -14,7 +14,7 @@ async function activeChat(messagingGroupId: string, db: DbDriver): Promise<boole
   return row !== undefined && ACTIVE_CHAT_STATES.includes(row.state);
 }
 
-/** Host handoffs name exact stored values and prove the principal asked in this target chat. */
+/** Authorized only by the principal's own message in this chat; each reference must match a stored value. */
 export async function recordChatClearances(
   input: {
     readonly messagingGroupId: string;

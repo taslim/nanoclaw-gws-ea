@@ -18,7 +18,7 @@ export async function detachApproval(approvalId: string): Promise<PendingApprova
   });
 }
 
-/** Complete the post-commit half of a detached request exactly once at its caller. */
+/** The post-commit half of `detachApproval`; its caller runs it exactly once. */
 export async function finishApprovalWithdrawal(
   approval: PendingApproval,
   resolution: string,

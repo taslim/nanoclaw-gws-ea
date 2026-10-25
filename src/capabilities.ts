@@ -6,19 +6,16 @@
  * keys in `container_configs.capabilities`; `all` means every registered key
  * whose registry default is `on`. A key a module's own setting grants
  * (`grantedTo`) is held exactly where that setting says, whatever a group
- * stores. At spawn the host resolves both to an explicit list and writes it
- * into the read-only container.json, where
- * the runner builds the agent's tools from it alone and treats a missing or
- * malformed list as no capabilities at all.
+ * stores. At spawn the host resolves both to an explicit list in the
+ * read-only container.json, where the runner builds the agent's tools from it
+ * alone and treats a missing or malformed list as no capabilities at all.
  *
- * Each key declares what it brings on the host — the tool-module instructions
- * the project document inlines and the shared skills that need it — and core
- * code keyed by the exported constants applies its host effects (MCP servers,
- * cross-session context, the gateway skill). The runner
- * maps the same keys to its own tools: Claude's built-ins in
+ * Each key declares the tool-module instructions the project document inlines
+ * for it and the shared skills that need it; core code keyed by the exported
+ * constants applies its other host effects. The runner maps the same keys to
+ * its own tools: Claude's built-ins in
  * container/agent-runner/src/providers/claude-config.ts and NanoClaw's tool
- * modules in container/agent-runner/src/mcp-tools/index.ts. Modules add keys
- * with `registerCapability`.
+ * modules in container/agent-runner/src/mcp-tools/index.ts.
  *
  * `cli_scope` stays the only authority for `ncl`.
  */
@@ -28,7 +25,6 @@ import { log } from './log.js';
 export type CapabilityDefault = 'on' | 'off';
 
 export interface CapabilityDef {
-  /** What the key grants, for `ncl groups config` and its errors. */
   description: string;
   /** Whether a group stored as `all` holds it. */
   default: CapabilityDefault;
@@ -37,10 +33,9 @@ export interface CapabilityDef {
   /** Shared container skills that need the key. A skill no key names needs `shell`. */
   skills?: readonly string[];
   /**
-   * For a key a module's own setting grants rather than a group's stored
-   * selection: whether that setting names `agentGroupId` now. Such a key
-   * defaults off and is held by exactly the groups the setting names,
-   * whatever they store (`grantCapabilities`).
+   * For a key a module's own setting grants: whether that setting names
+   * `agentGroupId` now. Such a key must default off, and is held by exactly
+   * the groups the setting names, whatever they store.
    */
   grantedTo?: (agentGroupId: string) => Promise<boolean>;
 }
@@ -50,13 +45,12 @@ export const SHELL_CAPABILITY = 'shell';
 export const MCP_SERVERS_CAPABILITY = 'mcp-servers';
 export const CONVERSATION_CONTEXT_CAPABILITY = 'conversation-context';
 
-/** A group's stored capabilities: every default key, or an explicit list. */
 export type CapabilitySelection = 'all' | readonly string[];
 
 const KEY_RE = /^[a-z0-9][a-z0-9-]*$/;
 const registry = new Map<string, CapabilityDef>();
 
-/** Register a capability key. Keys are permanent identities; a duplicate or malformed key throws. */
+/** Keys are stored in group configs, so each is a permanent identity. */
 export function registerCapability(key: string, def: CapabilityDef): void {
   if (!KEY_RE.test(key) || key === 'all') {
     throw new Error(`Capability key "${key}" must be lowercase letters, digits and "-", and not "all"`);
@@ -67,7 +61,6 @@ export function registerCapability(key: string, def: CapabilityDef): void {
   registry.set(key, def);
 }
 
-/** Every registered key in registration order. */
 export function listCapabilityKeys(): string[] {
   return [...registry.keys()];
 }
@@ -138,9 +131,9 @@ function warnOnce(signature: string, message: string, data: Record<string, unkno
 }
 
 /**
- * Read the stored column. An absent column (the module migration has not run)
- * is `all`, as every group was before capabilities. An unreadable value is an
- * empty list: an isolation control fails closed, never open.
+ * An absent column (the module migration has not run) is `all`, as every
+ * group was before capabilities. An unreadable value is an empty list: an
+ * isolation control fails closed, never open.
  */
 export function parseStoredCapabilities(raw: string | undefined, groupName: string): CapabilitySelection {
   if (raw === undefined) return 'all';
@@ -157,10 +150,6 @@ export function parseStoredCapabilities(raw: string | undefined, groupName: stri
   return [];
 }
 
-/**
- * The explicit list a selection grants, in registry order. An unknown stored
- * key is ignored with a warning and never granted.
- */
 export function resolveCapabilities(selection: CapabilitySelection, groupName: string): string[] {
   if (selection === 'all') return [...registry].filter(([, def]) => def.default === 'on').map(([key]) => key);
   for (const key of selection) {
@@ -171,10 +160,7 @@ export function resolveCapabilities(selection: CapabilitySelection, groupName: s
   return listCapabilityKeys().filter((key) => selection.includes(key));
 }
 
-/**
- * Parse the `ncl groups config update --capabilities` value: `all`, or
- * comma-separated keys. Unknown keys are refused here, at the only write path.
- */
+/** Refuses an unknown key, where a stale stored one is only ignored when resolved. */
 export function parseCapabilitiesArg(input: string): CapabilitySelection {
   const value = input.trim();
   if (value === 'all') return 'all';
@@ -193,12 +179,7 @@ export function parseCapabilitiesArg(input: string): CapabilitySelection {
   return listCapabilityKeys().filter((key) => keys.includes(key));
 }
 
-/**
- * `resolved` (a group's stored selection, resolved) with each key a module's
- * setting grants (`grantedTo`) held exactly where it names `agentGroupId`
- * now: what a spawn writes, the project document teaches, and
- * `getGroupCapabilities` reads.
- */
+/** Applies `grantedTo` over a group's resolved stored selection, giving the keys the group actually holds. */
 export async function grantCapabilities(resolved: readonly string[], agentGroupId: string): Promise<string[]> {
   const held = new Set(resolved);
   for (const [key, def] of registry) {
@@ -209,7 +190,7 @@ export async function grantCapabilities(resolved: readonly string[], agentGroupI
   return listCapabilityKeys().filter((key) => held.has(key));
 }
 
-/** The capabilities an agent group holds now, read the way a spawn reads them. */
+/** Read the way a spawn reads them. */
 export async function getGroupCapabilities(agentGroupId: string): Promise<ReadonlySet<string>> {
   const stored = (await getContainerConfig(agentGroupId))?.capabilities;
   return new Set(
@@ -220,11 +201,7 @@ export async function getGroupCapabilities(agentGroupId: string): Promise<Readon
   );
 }
 
-/**
- * Whether a tool-module instruction document belongs in the project document.
- * A document no registered key names is left out and logged once: its tools
- * have no key, so no agent can call them.
- */
+/** A document no registered key names is left out: its tools have no key, so no agent can call them. */
 export function grantsInstructions(moduleName: string, grants: ReadonlySet<string>): boolean {
   let named = false;
   for (const [key, def] of registry) {
@@ -246,10 +223,9 @@ const instructionWithholdings: {
 }[] = [];
 
 /**
- * Withhold a capability's teaching where a product supplies its own
- * instructions: the documents its registry entry names, read when composing,
- * so a renamed document stays withheld. Only the project document changes;
- * the capability's tools stay held.
+ * For a product that supplies its own instructions for a capability. The
+ * documents are read from its registry entry when composing, so a renamed one
+ * stays withheld; the capability's tools stay held.
  */
 export function withholdCapabilityInstructions(
   key: string,
@@ -267,11 +243,7 @@ export async function getWithheldModuleInstructions(agentGroupId: string): Promi
   return modules;
 }
 
-/**
- * Bound a skill selection by capabilities. A skill is kept when the group
- * holds every key that names it; a skill no key names needs `shell`, because a
- * skill's commands run through the shell.
- */
+/** A skill no key names needs `shell`, because a skill's commands run through the shell. */
 export function skillsWithinCapabilities(skills: readonly string[], grants: ReadonlySet<string>): string[] {
   return skills.filter((skill) => {
     const needs = [...registry].filter(([, def]) => def.skills?.includes(skill)).map(([key]) => key);
@@ -279,7 +251,7 @@ export function skillsWithinCapabilities(skills: readonly string[], grants: Read
   });
 }
 
-/** Whether the agent is taught the selected gateway: credentials reach it only through commands it runs. */
+/** The gateway is taught only with `shell`: credentials reach the agent only through commands it runs. */
 export function teachesGateway(grants: ReadonlySet<string>): boolean {
   return grants.has(SHELL_CAPABILITY);
 }

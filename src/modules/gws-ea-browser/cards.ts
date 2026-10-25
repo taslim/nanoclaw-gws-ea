@@ -25,7 +25,7 @@ export interface PurchaseCard {
   notified_at: string | null;
 }
 /**
- * Where a browser errand's card (purchase, consent or watch) says it comes from (KTD18): the errand, in words the
+ * Where a browser errand's card (purchase, consent or watch) says it comes from: the errand, in words the
  * principal knows, never its internal thread.
  */
 export const ERRAND_ORIGIN_LINE = "From a website errand I'm working on for you.";
@@ -58,15 +58,15 @@ export function cardEventTime(at: string, venueTimeZone: string, principalTimeZo
     ? venue
     : `${venue} (${formatLocalTimeWithZone(at, principalTimeZone)})`;
 }
-/** An earlier purchase on the site main recorded as not placed, from the merchant's email or the principal (KTD9). */
+/** An earlier purchase on the site recorded as not placed, from the merchant's email or the principal. */
 export interface RecordedNotPlaced {
   readonly attemptedAt: string;
   readonly source: 'email' | 'principal';
 }
 /**
  * What a card says of earlier purchases on its site, never by id, which means nothing to the principal: how many
- * have no recorded outcome (the card's one-attempt exception), and each that main recorded as not placed since
- * the site's last card.
+ * have no recorded outcome (the card's one-attempt exception), and each recorded as not placed since the site's
+ * last card.
  */
 export interface EarlierPurchases {
   readonly unresolved: number;
@@ -92,13 +92,11 @@ function earlierLines(earlier: EarlierPurchases, principalTimeZone: string): str
 export interface CardIdentity {
   readonly alias?: string | null;
 }
-/** Whether `address` is the assistant's own web address. */
 function isAssistantAddress(address: string, identity: CardIdentity): boolean {
   return (
     Boolean(identity.alias) && identityMatchKey(`email:${address}`) === identityMatchKey(`email:${identity.alias}`)
   );
 }
-/** The terms a card lists, each with its amounts, trigger and dates. */
 function termLines(
   facts: PurchaseFacts,
   partySize: number | undefined,
@@ -122,7 +120,6 @@ function termLines(
   }
   return lines;
 }
-/** The extras a site keeps selected and the agreements approving the card makes, as every card lists them. */
 function choiceLines(facts: PurchaseFacts): string[] {
   return [
     ...(facts.addOns ?? []).map((addOn) => `Extra charge the site keeps selected: ${quoted(addOn, SELLER_TEXT_LIMIT)}`),
@@ -132,11 +129,7 @@ function choiceLines(facts: PurchaseFacts): string[] {
     ),
   ];
 }
-/**
- * An unreviewed checkout's card (KTD5, R8): the site and any payment platform, the account or that it is a guest
- * checkout, the items quoted as shown, the money, the saved payment method, the contact email and any note.
- * The assistant's own web address reads as the assistant's; no internal id appears.
- */
+/** An unreviewed checkout's card. The assistant's own web address reads as the assistant's; no internal id appears. */
 function renderGenericCard(
   facts: PurchaseFacts,
   earlier: EarlierPurchases,

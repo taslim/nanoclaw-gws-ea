@@ -1,5 +1,5 @@
 /**
- * Email that reads like a person's (R61, KTD6): the agent's markdown, its
+ * Email that reads like a person's: the agent's markdown, its
  * sign-off included, as minimal HTML and as the text it wrote, with a reply's
  * quote.
  */

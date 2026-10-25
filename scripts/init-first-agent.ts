@@ -78,7 +78,7 @@ interface Args {
   engagePattern?: string;
   /** Adapter instance registry key (e.g. telegram-mega); omitted = the channel's default instance. */
   instance?: string;
-  /** Stable routed-event ID for retry-safe bootstrap welcome delivery. */
+  /** Reused across bootstrap retries so the router queues the welcome once. */
   eventId?: string;
 }
 

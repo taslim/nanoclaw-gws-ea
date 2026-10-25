@@ -38,7 +38,7 @@ function stateFor(page: Page): PagePrivacyState {
   return state;
 }
 
-/** Public inventory bindings are redacted without claiming they are a filled credential. */
+/** Redaction only: unlike `registerPageSecret`, the value does not mark the page as possibly showing a secret. */
 export function registerPageRedaction(page: Page, value: string): void {
   if (!value) return;
   const secrets = stateFor(page).secrets;
@@ -63,8 +63,9 @@ interface DocumentTree {
   frame: { loaderId: string };
   childFrames?: DocumentTree[];
 }
-/** The page target's tree omits out-of-process frames. Their documents need no entry: none outlives the
- * main-frame document it was created under, and that document is always in this tree.
+/**
+ * The page target's tree omits out-of-process frames. Their documents need no entry: none outlives the main-frame
+ * document it was created under, and that document is always in this tree.
  */
 async function documentLoaders(page: Page): Promise<Set<string>> {
   let attached = documentSessions.get(page);
@@ -87,9 +88,10 @@ async function documentLoaders(page: Page): Promise<Set<string>> {
   return loaders;
 }
 
-/** Bind taint to native document identities before inserting a value or consuming a bearer URL.
- * All current frames are tainted: same-origin scripts and postMessage can copy a value into another frame's canvas.
- * Loader IDs remain remembered for the page lifetime, including a back/forward-cache restoration.
+/**
+ * Call before inserting a value or consuming a bearer URL. Every current frame is tainted, since same-origin scripts
+ * and postMessage can copy a value into another frame's canvas. Loader IDs stay tainted for the page's lifetime,
+ * a back/forward-cache restoration included.
  */
 export async function bindPageSecretDocuments(page: Page, value: string): Promise<void> {
   const state = stateFor(page);
@@ -113,7 +115,7 @@ export function redactPageText(page: Page, text: string): string {
   );
 }
 
-/** URL hostnames are canonicalized to lowercase before diagnostics read them. */
+/** Case-insensitive: URL parsing lowercases the hostname a diagnostic records. */
 export function pageHostnameIsPrivate(page: Page, hostname: string): boolean {
   const canonical = hostname.toLowerCase();
   return [...stateFor(page).secrets].some((secret) => canonical.includes(secret.toLowerCase()));
@@ -137,14 +139,14 @@ export function redactPageData(page: Page, value: unknown): unknown {
 declare const replayUrl: unique symbol;
 export type BrowserReplayUrl = string & { readonly [replayUrl]: true };
 
-/** Host URL state is validated from the native page, never reconstructed from presentation text. */
+/** Read from the native page, never from presentation text; undefined when redaction would change it. */
 export function browserPageReplayUrl(page: Page): BrowserReplayUrl | undefined {
   const raw = page.url();
   if (!URL.canParse(raw) || redactPageText(page, raw) !== raw) return undefined;
   return new URL(raw).href as BrowserReplayUrl;
 }
 
-/** Host-only isolated collection shares the native field reader used to protect pictures. */
+/** Registers each secret field's value for redaction and taints the current documents; true when it found one. */
 export async function collectSecretFields(page: Page): Promise<boolean> {
   if (!page.frames().length) return false;
   const values = await readPageSecretValues(page);
@@ -173,9 +175,9 @@ export async function pageHasSecret(page: Page): Promise<boolean> {
 }
 
 /**
- * Whether a picture could show a secret (KTD6): active exposure, observed or filled document taint, or an
- * isolated-world scan of every frame, shadow roots included, finds a field holding one. A scan that cannot
- * complete counts as finding one.
+ * Whether a picture could show a secret: active exposure, observed or filled document taint, or an isolated-world
+ * scan of every frame, shadow roots included, finds a field holding one. A scan that cannot complete counts as
+ * finding one.
  */
 export async function pageMayShowSecret(page: Page): Promise<boolean> {
   if (await hostSecretOnPage(page)) return true;

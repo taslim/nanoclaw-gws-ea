@@ -4,9 +4,9 @@
  * journal means nothing started, and every later write replaces it atomically
  * under the instance operation lock.
  *
- * Readers ignore unknown fields. A journal from before schema 3, or from
- * another step contract, is refused with guidance to remove and recreate the
- * assistant: pre-release instances are disposable.
+ * Readers ignore unknown fields. A journal of another schema or step contract
+ * is refused with guidance to remove and recreate the assistant: pre-release
+ * instances are disposable.
  *
  * The instance operation lock is here too, with its gate: a removal under way
  * refuses every command, and an unfinished update or rollback refuses every
@@ -53,14 +53,9 @@ import {
 export const PROVISION_JOURNAL_SCHEMA_VERSION = 3 as const;
 
 /**
- * The step contract this launcher provisions under, `PROVISION_STEPS`. Bump
- * it when a launcher can no longer read a journal an earlier launcher wrote:
- * the steps, their order, or what a completed step promises changed. Contract
- * 2 added the assistant's Google sign-in (`connect_google`) before the
- * welcome. Contract 3 signs the assistant in (`sign_in_google`) and confirms
- * the Chat configuration before the host starts, drops `establish_transport`
- * because the host pulls Chat's events, and binds the principal through the
- * DM the assistant opens with the address create named.
+ * The step contract of `PROVISION_STEPS`. Bump it when a launcher can no
+ * longer read a journal an earlier launcher wrote: the steps, their order, or
+ * what a completed step promises changed.
  */
 export const LAUNCHER_CONTRACT_VERSION = 3 as const;
 
@@ -108,7 +103,7 @@ export interface InstanceOperation {
   readonly [operationBrand]: true;
   /** Throws `operation_inactive` once released; every write under the lock checks it first. */
   assertActive(): void;
-  /** Evidence from persistent journal/receipt writes for the invocation result. */
+  /** Feeds the result's `changed`: null before a persistent write (unknown if it is cut short), true after it. */
   readonly recordEffect?: (changed: true | null) => void;
   release(): void;
 }
@@ -206,7 +201,6 @@ function parseJournal(value: unknown, instanceId: string): ProvisionJournal {
   };
 }
 
-/** Write a new journal for a reservation about to be published, before it becomes visible. */
 async function createProvisionJournal(paths: ControlPlanePaths, instanceId: string): Promise<ProvisionJournal> {
   assertInstanceId(instanceId);
   await preparePrivateDirectory(paths.instanceRoot(instanceId));
@@ -232,17 +226,12 @@ async function createProvisionJournal(paths: ControlPlanePaths, instanceId: stri
   return journal;
 }
 
-/** Discard the journal of a reservation that was never published. */
 async function discardProvisionJournal(paths: ControlPlanePaths, instanceId: string): Promise<void> {
   assertInstanceId(instanceId);
   await removePrivateFile(paths.journalFile(instanceId));
 }
 
-/**
- * Reserve an instance's claims and start its provision journal as one
- * operation under the machine lock: the journal is written before the
- * reservation is published, so a reserved instance always has one.
- */
+/** The journal is written before the reservation is published, so a reserved instance always has one. */
 export async function reserveInstance(
   paths: ControlPlanePaths,
   input: InstanceReservationInput,
@@ -263,11 +252,6 @@ export async function reserveInstance(
   });
 }
 
-/**
- * The commands that operate a created assistant refuse one whose create has
- * not finished (a provision step not yet completed), naming the resume that
- * finishes it.
- */
 export async function assertInstanceCreated(paths: ControlPlanePaths, instanceId: string): Promise<void> {
   const journal = await readProvisionJournal(paths, instanceId);
   if (!journalCreated(journal)) {
@@ -278,15 +262,11 @@ export async function assertInstanceCreated(paths: ControlPlanePaths, instanceId
   }
 }
 
-/** Whether every provision step is complete. */
 function journalCreated(journal: ProvisionJournal): boolean {
   return PROVISION_STEPS.every((step) => journal.steps[step]?.completed_at !== undefined);
 }
 
-/**
- * The runtime record of a fully created assistant, read from its own physical
- * `state/` (R18), so it is there while no release is live.
- */
+/** Read from the assistant's own physical `state/`, so it is there while no release is live. */
 export async function loadCreatedRuntime(paths: ControlPlanePaths, instanceId: string): Promise<InstanceRuntimeConfig> {
   await assertInstanceCreated(paths, instanceId);
   const runtime = await loadInstanceRuntimeConfig(paths.runtimeFile(instanceId));
@@ -336,7 +316,6 @@ async function updateProvisionJournal(
   return next;
 }
 
-/** Record a step's first start; a resumed step keeps its original start. */
 export function recordStepStarted(operation: InstanceOperation, step: ProvisionStepId): Promise<ProvisionJournal> {
   return updateProvisionJournal(operation, (journal) =>
     journal.steps[step]
@@ -363,7 +342,7 @@ function singleLine(value: string): string {
   return printable.replace(/\s+/gu, ' ').trim().slice(0, 1_000) || 'unknown';
 }
 
-/** Record why a step stopped; only a GWS-EA error's own message is kept, redacted. */
+/** Only a GWS-EA error's own message is kept, redacted. */
 export function recordStepFailure(
   operation: InstanceOperation,
   step: ProvisionStepId,
@@ -391,11 +370,7 @@ export function recordChatConfigurationConfirmed(operation: InstanceOperation): 
   );
 }
 
-/**
- * Fix the address the principal uses for Google Chat, as create named it, so
- * the bind step has it once create's setup file is gone; a different later
- * address is refused.
- */
+/** Fixed so the bind step has it once create's setup file is gone; a different later address is refused. */
 export function recordPrincipalChatAddress(operation: InstanceOperation, address: string): Promise<ProvisionJournal> {
   const email = principalChatEmail(address);
   return updateProvisionJournal(operation, (journal) => {
@@ -417,12 +392,7 @@ export function recordKeyPolicyLifted(operation: InstanceOperation, lifted: bool
 /** Commands that move the release need the step contract the assistant was provisioned under. */
 const CONTRACT_BOUND: ReadonlySet<OperationIntent['command']> = new Set(['update', 'rollback']);
 
-/**
- * Take the instance lock for one command, or null when another process holds
- * it. Under the lock the command must pass the gate: no removal under way, and
- * no unfinished update or rollback it would conflict with. `intent` names the
- * command; provisioning (create and resume) is the default.
- */
+/** Null when another process holds the lock. */
 export async function acquireInstanceOperation(
   paths: ControlPlanePaths,
   instanceId: string,

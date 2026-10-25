@@ -27,7 +27,6 @@ export interface InboxHealth {
   readonly calendarAccess: readonly AddressCalendarAccess[];
 }
 
-/** The inbox's health, as status reads it. */
 export async function getInboxHealth(): Promise<InboxHealth> {
   const state = await getInboxState();
   return {

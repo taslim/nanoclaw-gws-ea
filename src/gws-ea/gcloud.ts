@@ -67,10 +67,9 @@ const GCHAT_PUBLISHER = 'serviceAccount:chat-api-push@system.gserviceaccount.com
 const PUBLISHER_ROLE = 'roles/pubsub.publisher';
 const SUBSCRIBER_ROLE = 'roles/pubsub.subscriber';
 /**
- * The pull subscription (KTD3): the host extends the 60-second deadline while
- * it handles an event, the 7 days Google retains cover a host that is away,
- * the subscription never expires while it is idle, and an acknowledged event
- * is gone.
+ * The host extends the 60-second ack deadline while it handles an event, the
+ * 7 days of retention cover a host that is away, and an idle assistant's
+ * subscription never expires.
  */
 const SUBSCRIPTION_SETTINGS = [
   '--ack-deadline=60',
@@ -87,7 +86,6 @@ const DOMAIN_RESTRICTED_SHARING_CONSTRAINT = 'iam.allowedPolicyMemberDomains';
 /** The legacy and managed constraints of domain restricted sharing, either of which can refuse Google Chat. */
 const MEMBER_DOMAIN_CONSTRAINTS = [DOMAIN_RESTRICTED_SHARING_CONSTRAINT, 'iam.managed.allowedPolicyMembers'] as const;
 type MemberDomainConstraint = (typeof MEMBER_DOMAIN_CONSTRAINTS)[number];
-/** The one rule of a project-level organization policy (org-policies v2). */
 type PolicyRule = { readonly enforce: boolean } | { readonly allowAll: true };
 /**
  * The project-level rule that relaxes each: the legacy constraint is a list
@@ -100,10 +98,10 @@ const MEMBER_DOMAIN_RELAXED: Readonly<Record<MemberDomainConstraint, PolicyRule>
 /** Google's reason when the project has no policy of its own for a constraint. */
 const NO_PROJECT_POLICY = /\bPOLICY_NOT_FOUND\b/u;
 /**
- * The Workspace APIs the assistant's own Google sign-in holds scopes for
- * (KTD2), enabled by the Google connection. Nothing calls Drive Activity or
- * Drive Labels yet; they are enabled now so a capability that does needs no
- * new connection.
+ * The Workspace APIs the assistant's own Google sign-in holds scopes for,
+ * enabled by the Google connection. Nothing calls Drive Activity or Drive
+ * Labels yet; they are enabled now so a capability that does needs no new
+ * connection.
  */
 export const GOOGLE_WORKSPACE_APIS = [
   'calendar-json.googleapis.com',
@@ -117,7 +115,6 @@ export const GOOGLE_WORKSPACE_APIS = [
   'slides.googleapis.com',
   'forms.googleapis.com',
 ] as const;
-/** The legacy and managed constraints that can block service-account key creation. */
 const KEY_CREATION_CONSTRAINTS = [
   'iam.disableServiceAccountKeyCreation',
   'iam.managed.disableServiceAccountKeyCreation',
@@ -173,7 +170,6 @@ const ALREADY_EXISTS = [
   /Resource already exists in the project/u,
 ];
 
-/** Classify a failed gcloud command by its stderr. */
 export function classifyGcloudFailure(outcome: SanitizedCommandOutcome): GcloudFailureClass {
   const match = GCLOUD_FAILURES.find(([, patterns]) => patterns.some((pattern) => pattern.test(outcome.stderr)));
   return match?.[0] ?? 'anything-else';
@@ -192,13 +188,10 @@ export type GcloudCommandRunner = SanitizedCommandOutcomeRunner;
 
 export interface GcloudDependencies {
   readonly runCommand?: GcloudCommandRunner;
-  /** Waits between retries while Google makes a change usable. */
   readonly sleep?: (milliseconds: number) => Promise<void>;
-  /** Reports such a wait. */
   readonly onWait?: (reason: string) => void;
 }
 
-/** One assistant's reserved Google Cloud project. */
 export interface GcpProjectCoordinates {
   readonly instanceId: string;
   readonly projectId: string;
@@ -207,19 +200,16 @@ export interface GcpProjectCoordinates {
 }
 
 export interface GcpProjectInput extends GcpProjectCoordinates {
-  /** The subscriber account, whose key `credentialFile` holds. */
   readonly serviceAccountEmail: string;
   readonly credentialFile: string;
   /** The billing account the operator chose to link when several are open (`--billing-account`). */
   readonly billingAccount?: string;
 }
 
-/** A step context that names the assistant's Google Cloud project. */
 export interface GcpProjectContext {
   readonly input: { readonly gcp: GcpProjectInput };
 }
 
-/** What `provision_gcp`'s resources read from the step context. */
 export interface GcpStepContext extends GcpProjectContext {
   readonly operation: InstanceOperation;
 }
@@ -231,10 +221,8 @@ interface Ran {
   readonly outcome: SanitizedCommandOutcome;
 }
 
-/** A read that answered, or the failed command that did not. */
 type Read<Value> = { readonly value: Value } | { readonly failed: Ran };
 
-/** gcloud as the reserved account against one project. */
 type Gcloud = (args: readonly string[]) => Promise<Ran>;
 
 interface Project {
@@ -282,7 +270,6 @@ async function run(runner: GcloudCommandRunner, cwd: string, args: readonly stri
   return { command, outcome };
 }
 
-/** Run gcloud where any failure stops the caller, reported as the failed command. */
 async function runChecked(runner: GcloudCommandRunner, args: readonly string[]): Promise<string> {
   const { command, outcome } = await run(runner, CONTROL_PLANE_ROOT, args);
   if (outcome.exitCode !== 0) throw commandExitError(command, outcome);
@@ -326,7 +313,6 @@ function alreadyExists({ outcome }: Ran): boolean {
   return ALREADY_EXISTS.some((pattern) => pattern.test(outcome.stderr));
 }
 
-/** A command Google Cloud refused: the step stops with the failed command as evidence. */
 function gcloudFailed(message: string, { command, outcome }: Ran, code = 'gcloud_failed'): GwsEaError {
   const failure = commandExitError(command, outcome);
   return new GwsEaError(code, message, {
@@ -342,7 +328,6 @@ function evidence({ command, outcome }: Ran): string {
   return typeof tail === 'string' && tail ? `${failure.message}\n${tail}` : failure.message;
 }
 
-/** A read that did not decide: unknown, with the failed command as evidence. */
 function unknownRead(what: string, failed: Ran): Observation {
   return {
     status: 'unknown',
@@ -361,7 +346,6 @@ function parseJsonList(stdout: string, label: string): unknown[] {
   return list;
 }
 
-/** gcloud is on PATH and runs. */
 export async function assertGcloudInstalled(runner: GcloudCommandRunner = runSanitizedCommandOutcome): Promise<void> {
   await runChecked(runner, ['version', '--format=json']).catch((error: unknown) =>
     missingExecutable(
@@ -498,10 +482,6 @@ async function readUserManagedKeys(gcloud: Gcloud, gcp: GcpProjectInput): Promis
   };
 }
 
-/**
- * A service-account key for the reserved project and account. Only the fields
- * gws-ea uses are read; any other field is ignored.
- */
 export function parseGchatServiceAccountCredential(
   contents: string,
   expected: { readonly projectId: string; readonly serviceAccountEmail: string },
@@ -528,7 +508,6 @@ export function parseGchatServiceAccountCredential(
   return { projectId, privateKeyId, clientEmail };
 }
 
-/** A key file as found: missing, unusable (unreadable, wrong mode, or invalid), or valid. */
 async function readKeyFile(file: string, gcp: GcpProjectInput): Promise<KeyFile> {
   try {
     const contents = await readOwnerOnlyFile(file);
@@ -546,7 +525,6 @@ function stagingFile(gcp: GcpProjectInput): string {
   return `${gcp.credentialFile}.staging`;
 }
 
-/** `policy` names the organization policy Google refused to let the reserved account change. */
 function policyPermissionPause(coordinates: GcpProjectCoordinates, policy: string): ProvisionHumanPause {
   return {
     kind: 'human-action',
@@ -559,7 +537,6 @@ function policyPermissionPause(coordinates: GcpProjectCoordinates, policy: strin
   };
 }
 
-/** A constraint Google refused to change, and the refused command. */
 interface PolicyRefusal {
   readonly constraint: string;
   readonly refused: Ran;
@@ -581,10 +558,6 @@ function refusedPolicyChange(
   throw gcloudFailed(`Google Cloud could not ${change} ${constraint} on project ${coordinates.projectId}`, refused);
 }
 
-/**
- * Set each constraint's rule on the dedicated project only (org-policies v2),
- * from owner-only files, stopping at the first Google refuses.
- */
 async function setProjectPolicies(
   coordinates: GcpProjectCoordinates,
   policies: ReadonlyArray<{ readonly constraint: string; readonly rule: PolicyRule }>,
@@ -607,7 +580,6 @@ async function setProjectPolicies(
   }
 }
 
-/** Set both key-creation constraints on the dedicated project only. */
 function setKeyCreationPolicy(
   coordinates: GcpProjectCoordinates,
   enforce: boolean,
@@ -617,7 +589,6 @@ function setKeyCreationPolicy(
   return setProjectPolicies(coordinates, policies, dependencies);
 }
 
-/** For `provision_gcp`: a missing policy permission pauses for the operator; any other refusal stops. */
 async function changeKeyCreationPolicy(
   coordinates: GcpProjectCoordinates,
   enforce: boolean,
@@ -633,7 +604,6 @@ function memberDomainPolicy(constraint: MemberDomainConstraint): string {
   return `the member-domain policy (constraints/${constraint})`;
 }
 
-/** For `provision_gcp`: relax one member-domain constraint on the dedicated project only. */
 async function relaxMemberDomainConstraint(
   coordinates: GcpProjectCoordinates,
   constraint: MemberDomainConstraint,
@@ -663,15 +633,13 @@ async function readMemberDomainOverrides(
   return { value: overridden };
 }
 
-/** A member-domain restore Google refused: the failed read, or the override it would not delete. */
 type MemberDomainRestoreRefusal =
   | { readonly failed: Ran }
   | { readonly constraint: MemberDomainConstraint; readonly refused: Ran };
 
 /**
- * Delete each member-domain policy of the dedicated project's own, so the
- * project inherits its organization's again. Returns what Google refused, or
- * undefined once the project has none.
+ * Returns what Google refused, or undefined once the project inherits its
+ * organization's member-domain policies again.
  */
 async function restoreMemberDomainPolicy(
   coordinates: GcpProjectCoordinates,
@@ -689,7 +657,6 @@ async function restoreMemberDomainPolicy(
   return undefined;
 }
 
-/** Restore the dedicated project's key-creation policy, then clear the journal's lift. */
 async function restoreKeyCreationPolicy(context: GcpStepContext, dependencies: GcloudDependencies): Promise<Pause> {
   const pause = await changeKeyCreationPolicy(context.input.gcp, true, dependencies);
   if (!pause) await recordKeyPolicyLifted(context.operation, false);
@@ -697,9 +664,8 @@ async function restoreKeyCreationPolicy(context: GcpStepContext, dependencies: G
 }
 
 /**
- * Retry `attempt` while its answer is `pending`, backing off from 1 s to
- * 30 s as Google's retry guidance asks, for at most `limitMs`. Each wait is
- * reported with `reason`; the last answer is returned for the caller to judge.
+ * The 1 s to 30 s backoff is Google's retry guidance. Returns the last answer,
+ * pending or not, for the caller to judge.
  */
 function retryWhile<T>(
   attempt: () => Promise<T>,
@@ -733,11 +699,10 @@ async function keptLift({ operation, input }: GcpStepContext): Promise<string> {
 }
 
 /**
- * Create a key into the staging file. When the key-creation policy blocks it,
- * record the lift in the journal, lift the policy on the dedicated project,
- * and retry while Google applies the change. The lift stays until the key
- * exists, since restoring it early restarts Google's clock; a later run that
- * is refused again lifts again, which sets the value it already has.
+ * When the key-creation policy blocks the key, the lift is journaled before it
+ * is made. It stays until the key exists, since restoring it early restarts
+ * Google's clock; a later run that is refused again lifts again, which sets the
+ * value it already has.
  */
 async function createKey(context: GcpStepContext, dependencies: GcloudDependencies): Promise<Pause> {
   const gcp = context.input.gcp;
@@ -786,7 +751,6 @@ async function createKey(context: GcpStepContext, dependencies: GcloudDependenci
   return undefined;
 }
 
-/** Delete every user-managed key of the subscriber account, once it is confirmed to be this assistant's. */
 async function deleteUserManagedKeys(context: GcpStepContext, dependencies: GcloudDependencies): Promise<void> {
   const gcp = context.input.gcp;
   const gcloud = gcloudFor(gcp, dependencies);
@@ -874,7 +838,7 @@ async function replaceKey(context: GcpStepContext, dependencies: GcloudDependenc
   return undefined;
 }
 
-/** The project has every API in `apis` enabled; enabling them is idempotent. */
+/** Enabling an API that is already enabled is a no-op, so apply enables the whole list. */
 function enabledApisResource(
   name: string,
   apis: readonly string[],
@@ -907,7 +871,6 @@ function enabledApisResource(
   };
 }
 
-/** The Workspace APIs the assistant's sign-in holds scopes for, in its own project. */
 export function googleWorkspaceApisResource(dependencies: GcloudDependencies = {}): StepResource<GcpProjectContext> {
   return enabledApisResource('the Google Workspace APIs', GOOGLE_WORKSPACE_APIS, dependencies);
 }
@@ -1019,10 +982,9 @@ type PubsubKind = 'topics' | 'subscriptions';
 const PROJECT_POLICY_INITIALIZING = /organization policy to be properly initialized/u;
 
 /**
- * The topic or the subscription, found by its full name in the project's
- * conclusive list. A project created moments earlier may refuse it until
- * Google has set up the project's organization policy, so creation is
- * retried while Google says so.
+ * A project created moments earlier may refuse the topic or subscription until
+ * Google has set up the project's organization policy, so creation is retried
+ * while Google says so.
  */
 function pubsubResource(
   name: string,
@@ -1069,7 +1031,6 @@ function pubsubResource(
   };
 }
 
-/** One role on the topic or the subscription, for one member. */
 interface PubsubGrant {
   readonly kind: PubsubKind;
   readonly id: string;
@@ -1077,7 +1038,6 @@ interface PubsubGrant {
   readonly member: string;
 }
 
-/** Whether the grant is in the policy of the topic or the subscription. */
 async function observeGrant(gcloud: Gcloud, projectId: string, grant: PubsubGrant): Promise<Observation> {
   const { kind, id, role, member } = grant;
   const read = await gcloud(['pubsub', kind, 'get-iam-policy', id, `--project=${projectId}`, '--format=json']);
@@ -1118,7 +1078,6 @@ function refusingConstraint({ outcome }: Ran): string | undefined {
   return DOMAIN_RESTRICTED_SHARING.test(outcome.stderr) ? DOMAIN_RESTRICTED_SHARING_CONSTRAINT : undefined;
 }
 
-/** The member-domain constraint that refused an attempt, if one did. */
 function memberDomainRefusal(attempt: Ran): MemberDomainConstraint | undefined {
   if (succeeded(attempt)) return undefined;
   const constraint = refusingConstraint(attempt);
@@ -1395,7 +1354,6 @@ export async function restoreKeyCreationPolicyForRemoval(
   return refusal && `${refusal.constraint}: ${evidence(refusal.refused)}`;
 }
 
-/** A member-domain restore Google refused during removal, with its answer as evidence. */
 export interface MemberDomainRemovalRefusal {
   /** Google would not show the project's policies, or would not delete an override it showed. */
   readonly refused: 'read' | 'delete';

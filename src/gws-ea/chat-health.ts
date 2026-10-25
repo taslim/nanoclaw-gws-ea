@@ -1,9 +1,8 @@
 /**
- * Whether Google Chat is receiving (KTD12), as the assistant's own host
- * reports it through `ncl gws-ea-chat health`: its pull consumer connected to
- * Pub/Sub, and its Workspace Events subscription active. `status` shows it,
- * and a release serves only once it holds. A broken Google sign-in fails the
- * subscription, and only a new sign-in repairs it, so it is named as one
+ * Whether Google Chat is receiving, as the assistant's own host reports it
+ * through `ncl gws-ea-chat health`: its pull consumer connected to Pub/Sub,
+ * and its Workspace Events subscription active. A broken Google sign-in fails
+ * the subscription, and only a new sign-in repairs it, so it is named as one
  * ("sign-in needed"). The consumer pulls with the subscriber key, not the
  * sign-in, so a consumer that is down is its own failure even then.
  */
@@ -17,7 +16,6 @@ import { redact } from './redact.js';
 import { GwsEaError } from './types.js';
 import { isRecord } from './validation.js';
 
-/** The host's report, as `ncl` is asked for it. */
 export const CHAT_HEALTH_ARGS: readonly string[] = ['gws-ea-chat', 'health'];
 
 const ERROR_KINDS: Readonly<Record<ChatErrorKind, true>> = {
@@ -47,7 +45,7 @@ function nullableString(value: unknown): value is string | null {
   return value === null || typeof value === 'string';
 }
 
-/** A side's last failure, null when it has none, or undefined when it is malformed. */
+/** Null when the side has no failure; undefined when the report is malformed. */
 function parseError(value: unknown): ChatHealthError | null | undefined {
   if (value === null) return null;
   if (!isRecord(value) || !isErrorKind(value.kind) || typeof value.message !== 'string' || typeof value.at !== 'string')
@@ -55,7 +53,6 @@ function parseError(value: unknown): ChatHealthError | null | undefined {
   return { kind: value.kind, message: value.message, at: value.at };
 }
 
-/** The host's report with every field checked. */
 export function parseChatHealth(value: unknown): ChatHealth {
   const invalid = () => new GwsEaError('invalid_child_output', 'ncl returned an invalid Chat report');
   if (!isRecord(value) || !isRecord(value.consumer) || !isRecord(value.subscription)) throw invalid();
@@ -88,20 +85,14 @@ export function parseChatHealth(value: unknown): ChatHealth {
   };
 }
 
-/** Whether Chat receives, and when it does not, why, as a clause. */
 export type ChatReceiving =
   | { readonly state: 'receiving' }
   | { readonly state: 'sign_in_needed' | 'not_receiving'; readonly reason: string };
 
-/** `clause`, followed by a side's last failure when it has one. */
 function failing(clause: string, error: ChatHealthError | null): string {
   return error ? `${clause} (${redact(error.message)})` : clause;
 }
 
-/**
- * Whether Chat receives: the consumer connected and the subscription active.
- * A broken sign-in takes precedence over both, since it fails them too.
- */
 export function chatReceiving(health: ChatHealth, instanceId: string): ChatReceiving {
   const { consumer, subscription } = health;
   const signIn = `Sign the assistant in again with gws-ea connect-google --id ${instanceId}`;

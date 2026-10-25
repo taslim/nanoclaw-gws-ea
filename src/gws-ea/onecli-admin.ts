@@ -1,11 +1,10 @@
 /**
- * gws-ea's administration of an instance's OneCLI, over its REST API
- * (KTD14): the local API key, the vault's secrets, the agents, and an agent's
- * secret mode. Every call goes to the app URL it is given with the key it is
- * given, never to anything the environment names; it refuses a redirect and
- * has its own timeout. No answer's body ever reaches an error or a log: a new
- * secret's answer previews its value, and the agent list carries each
- * agent's access token.
+ * gws-ea's administration of an instance's OneCLI, over its REST API. Every
+ * call goes to the app URL it is given with the key it is given, never to
+ * anything the environment names; it refuses a redirect and has its own
+ * timeout. No answer's body ever reaches an error or a log: a new secret's
+ * answer previews its value, and the agent list carries each agent's access
+ * token.
  */
 import { registerSecret } from './redact.js';
 import { GwsEaError } from './types.js';
@@ -22,7 +21,7 @@ const DEFAULT_INJECTION_FORMAT = '{value}';
 
 export type OnecliSecretMode = 'all' | 'selective';
 
-/** One of the instance's OneCLI agents; its access token is never read. */
+/** The agent's access token is never read. */
 export interface OnecliAgent {
   readonly id: string;
   readonly identifier: string;
@@ -31,7 +30,6 @@ export interface OnecliAgent {
   readonly secretMode: string;
 }
 
-/** How OneCLI injects a generic secret: into a header, or into a query parameter. */
 export type OnecliInjection =
   | { readonly headerName: string; readonly valueFormat: string }
   | { readonly paramName: string; readonly paramFormat: string };
@@ -39,15 +37,15 @@ export type OnecliInjection =
 export interface OnecliAdmin {
   /** Every secret's metadata; values never come back. */
   listSecrets(): Promise<readonly Record<string, unknown>[]>;
-  /** Store `credential` as a new secret, its value only in the request body, and return the secret's ID. */
+  /** The value travels only in the request body; returns the new secret's ID. */
   createSecret(credential: ProviderCredential): Promise<string>;
   listAgents(): Promise<readonly OnecliAgent[]>;
-  /** Create an agent. One whose identifier exists already (409) is no failure: the list then names it. */
+  /** One whose identifier exists already (409) is no failure: the list then names it. */
   createAgent(agent: { readonly name: string; readonly identifier: string }): Promise<void>;
   setSecretMode(agentId: string, mode: OnecliSecretMode): Promise<void>;
-  /** Explicit secret assignments in the pinned OneCLI 1.42 API; values are never read. */
+  /** Explicit secret assignments, as the pinned OneCLI exposes them; values are never read. */
   listAgentSecretIds(agentId: string): Promise<readonly string[]>;
-  /** Replace the assignments, including an empty list when retiring a host-owned agent. */
+  /** Replaces every assignment; retiring a host-owned agent sends an empty list. */
   setAgentSecretIds(agentId: string, secretIds: readonly string[]): Promise<void>;
 }
 
@@ -64,7 +62,6 @@ interface OnecliEndpoint {
 interface OnecliCall {
   readonly method: 'GET' | 'POST' | 'PATCH' | 'PUT';
   readonly route: string;
-  /** What the call asks for, as an error names it. */
   readonly label: string;
   readonly body?: unknown;
   /** A failure status that still answers the call. */
@@ -72,10 +69,9 @@ interface OnecliCall {
 }
 
 /**
- * Send one call; an answer that is neither a success nor `accepted` is
- * refused. A transport error, a refusal, and an unreadable answer are each
- * reported by the call and its status alone, with no cause: a transport
- * error can quote the request, and a parse error the body.
+ * A transport error, a refusal, and an unreadable answer are each reported by
+ * the call and its status alone, with no cause: a transport error can quote the
+ * request, and a parse error the body.
  */
 async function send(endpoint: OnecliEndpoint, call: OnecliCall): Promise<Response> {
   let response: Response;
@@ -99,7 +95,6 @@ async function send(endpoint: OnecliEndpoint, call: OnecliCall): Promise<Respons
   return response;
 }
 
-/** Send one call whose answer is read, and read it. */
 async function read(endpoint: OnecliEndpoint, call: OnecliCall): Promise<unknown> {
   const response = await send(endpoint, call);
   try {
@@ -126,10 +121,9 @@ function parseAgent(agent: Record<string, unknown>): OnecliAgent {
 }
 
 /**
- * The injection OneCLI stores for a secret with this metadata, a format left
- * out defaulted as OneCLI defaults it; null when it injects neither a header
- * nor a parameter. Creating and matching a secret both read it, so a secret
- * stored without a format is found again.
+ * A format left out is defaulted as OneCLI defaults it, so a secret stored
+ * without one is found again; null when it injects neither a header nor a
+ * parameter.
  */
 export function onecliInjection(metadata: ProviderCredentialMetadata): OnecliInjection | null {
   if (metadata.headerName !== undefined) {
@@ -142,10 +136,9 @@ export function onecliInjection(metadata: ProviderCredentialMetadata): OnecliInj
 }
 
 /**
- * The instance's local API key, which OneCLI's local auth mode hands a
- * keyless caller on its loopback port, creating it on the first read. It is
- * only ever read, so every read returns the same key. It is registered for
- * redaction before it is returned.
+ * OneCLI's local auth mode hands the key to a keyless caller on its loopback
+ * port, creating it on the first read; it is only ever read, so every read
+ * returns the same key.
  */
 export async function fetchOnecliApiKey(url: string, dependencies: OnecliAdminDependencies = {}): Promise<string> {
   const answer = await read(
@@ -160,7 +153,6 @@ export async function fetchOnecliApiKey(url: string, dependencies: OnecliAdminDe
   return apiKey;
 }
 
-/** The OneCLI at `url`, administered with `apiKey`, which is registered for redaction. */
 export function createOnecliAdmin(
   url: string,
   apiKey: string,

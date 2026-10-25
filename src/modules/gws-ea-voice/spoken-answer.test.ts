@@ -1,5 +1,5 @@
 /**
- * Speech never answers a request (R12). On a channel whose requests are text
+ * Speech never answers a request. On a channel whose requests are text
  * (Google Chat under the assistant's account), the bridge decides whether a
  * message answers a request from the words the person typed, before the host
  * prepares any recording. A quote-reply to an approval request whose only

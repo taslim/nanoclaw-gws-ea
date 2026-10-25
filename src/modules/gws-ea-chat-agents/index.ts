@@ -66,7 +66,7 @@ export async function reconcileChatAgents(): Promise<void> {
   }
 }
 
-/** Startup and the chat lifecycle loop resume cleanup once the control-plane operation releases its lock. */
+/** Each chat lifecycle sweep re-runs this, so a retirement that failed or met a held instance lock resumes. */
 export async function resumeRetiringJobAgents(): Promise<void> {
   for (const job of await listJobAgents()) {
     if (job.state === 'retired') continue;

@@ -1,16 +1,15 @@
 /**
- * An assistant's 1Password resources at its removal (KTD9, R14, R15). Before
- * anything changes, the IDs cleanup needs are copied from the instance into
- * its removal receipt, which lives outside the instance and so outlives its
- * files. So is the name of each creation never proven, a vault or runtime
- * service account 1Password may hold with no recorded ID: its intent record
- * goes with the instance. Once the host has stopped, the local runtime token
- * goes. The vault is deleted only when this host's management service account
- * created it and it is empty, or the operator chose its deletion in the
- * removal's confirmation, and only through that same account: any other vault
- * is kept. Revoking a service account, and deleting or revoking an unproven
- * creation, is the operator's, on 1Password.com; the receipt names each one
- * until the operator closes it.
+ * An assistant's 1Password resources at its removal. Before anything changes,
+ * the IDs cleanup needs are copied from the instance into its removal receipt,
+ * which lives outside the instance and so outlives its files. So is the name
+ * of each creation never proven, a vault or runtime service account 1Password
+ * may hold with no recorded ID: its intent record goes with the instance. Once
+ * the host has stopped, the local runtime token goes. The vault is deleted only
+ * when this host's management service account created it and it is empty, or
+ * the operator chose its deletion in the removal's confirmation, and only
+ * through that same account: any other vault is kept. Revoking a service
+ * account, and deleting or revoking an unproven creation, is the operator's,
+ * on 1Password.com; the receipt names each one until the operator closes it.
  */
 import { lstat, rm } from 'node:fs/promises';
 
@@ -47,16 +46,15 @@ export interface OnePasswordUnprovenCreation {
   readonly name: string;
 }
 
-/** What removal keeps in its receipt of an assistant's 1Password resources: identifiers and outcomes, never a token. */
+/** Kept in the removal receipt: identifiers and outcomes, never a token. */
 export interface OnePasswordCleanup {
   readonly account_id: string;
   /** Null when no vault was recorded; one whose creation was never proven is named in `unproven`. */
   readonly vault_id: string | null;
-  /** The management service account that created the vault, the only identity that may delete it; null for any other creator. */
+  /** The management service account that created the vault, the only one that may delete it; null for any other. */
   readonly vault_creator: string | null;
   /** Every runtime service account the assistant held, current and retired: only the operator can revoke them. */
   readonly runtime_service_account_ids: readonly string[];
-  /** Creations never proven: removal cannot find them, so only the operator can delete or revoke them. */
   readonly unproven: readonly OnePasswordUnprovenCreation[];
   readonly selection: OnePasswordVaultSelection;
   /** What only the operator can do on 1Password.com; null when there is nothing to revoke or delete. */
@@ -92,7 +90,6 @@ export interface OnePasswordRemovalPreview {
   readonly unproven: readonly OnePasswordUnprovenCreation[];
 }
 
-/** What removal did, and what it leaves to the operator. */
 export interface OnePasswordRemovalOutcome {
   readonly account_id: string;
   /** Null, with `unrecorded`, when no vault was recorded. */
@@ -103,7 +100,6 @@ export interface OnePasswordRemovalOutcome {
   readonly runtime_token: 'deleted' | 'absent';
   /** Runtime service accounts removal did not revoke: revoking is the operator's, on 1Password.com. */
   readonly revoke_service_account_ids: readonly string[];
-  /** Creations never proven, which removal cannot find: deleting or revoking them is the operator's. */
   readonly unproven: readonly OnePasswordUnprovenCreation[];
   /** The receipt that keeps these until the operator closes it; null once nothing is tracked. */
   readonly receipt_file: string | null;
@@ -118,10 +114,6 @@ export interface OnePasswordBlock {
 const now = (): string => new Date().toISOString();
 const UNRECORDED = 'No vault was recorded for this assistant, so removal deletes none.';
 
-/**
- * What only the operator can do on 1Password.com: revoke each runtime service
- * account, and find each unproven creation by its name to delete or revoke it.
- */
 export function onePasswordOperatorActions(
   instanceId: string,
   serviceAccountIds: readonly string[],
@@ -157,7 +149,6 @@ export function onePasswordCleanupOwed(cleanup: OnePasswordCleanup): boolean {
   return cleanup.runtime_service_account_ids.length > 0 || cleanup.unproven.length > 0;
 }
 
-/** The facts a pause or abandonment records: every ID and unproven name the operator may need on 1Password.com. */
 export function onePasswordEvidence(cleanup: OnePasswordCleanup, reason: string): string {
   return [
     ...(cleanup.vault_id === null
@@ -178,11 +169,7 @@ export function onePasswordEvidence(cleanup: OnePasswordCleanup, reason: string)
   ].join('\n');
 }
 
-/**
- * Copy what removal needs from the assistant's own records, before anything
- * changes: each recorded ID, and the name of each creation never proven,
- * whose intent record goes with the instance.
- */
+/** Called before anything changes: the records it copies from go with the instance. */
 export async function captureOnePasswordCleanup(
   paths: ControlPlanePaths,
   reservation: InstanceReservation,
@@ -337,7 +324,7 @@ type Ownership =
   | { readonly status: 'unavailable'; readonly reason: string }
   | { readonly status: 'owned'; readonly cli: OnePasswordCli; readonly management: ServiceAccountIdentity };
 
-/** Whether this host may delete the vault, from local records alone: its account and its exact creator. */
+/** Whether this host may delete the vault, from local records alone, with no 1Password request. */
 async function localOwnership(
   paths: ControlPlanePaths,
   cleanup: OnePasswordCleanup,
@@ -412,7 +399,6 @@ async function ownership(
   return { status: 'owned', cli: opening.cli, management: local.management };
 }
 
-/** An empty vault is deleted; one that holds items only on the operator's explicit choice. */
 function deletes(count: number | null, selection: OnePasswordVaultSelection): boolean {
   return count === 0 || selection === 'delete';
 }
@@ -423,7 +409,7 @@ function keptReason(count: number | null): string {
     : 'It holds items, and its deletion was not chosen.';
 }
 
-/** What removal will do with the vault, read before the operator confirms: two management reads at most, no write. */
+/** Read before the operator confirms: two management reads at most, and no write. */
 export async function previewOnePasswordCleanup(
   paths: ControlPlanePaths,
   cleanup: OnePasswordCleanup,
@@ -571,7 +557,6 @@ export async function settleOnePasswordCleanup(
   );
 }
 
-/** The result's account of the cleanup, once removal has run every step it could. */
 export function onePasswordRemovalOutcome(
   cleanup: OnePasswordCleanup,
   leftBehind: string | undefined,

@@ -1,18 +1,15 @@
 /**
- * Agents' Google tokens (KTD1, KTD6). Each tick publishes a live token for
- * every agent credential through the selected gateway's credential
- * connection, renewing one close to expiry, so the first tick after the host
- * starts, or after the machine wakes, puts a fresh one in place. A credential
- * carries the scopes its services want that the grant holds, and a host the
- * grant holds nothing for gets nothing. The host is the only writer of these
- * credentials. The host's own tokens come from its token source
- * (`createHostTokenSource`), which needs no gateway.
+ * Agents' Google tokens. Each tick publishes a live token for every agent
+ * credential through the selected gateway's credential connection, renewing
+ * one close to expiry, so the first tick after the host starts, or after the
+ * machine wakes, puts a fresh one in place. The host is the only writer of
+ * these credentials.
  *
  * When Google refuses part of a credential while the grant still works, its
- * first service is published alone, so Calendar keeps working when Drive is
- * refused, and every tick asks for the full set again until Google grants it.
- * A revoked sign-in is reported once and not retried until a new grant is
- * written; any other failure is retried on the next tick.
+ * first service is published alone, and every tick asks for the full set
+ * again until Google grants it. A revoked sign-in is reported once and not
+ * retried until a new grant is written; any other failure is retried on the
+ * next tick.
  */
 import type {
   GatewayCredentialTarget,
@@ -50,7 +47,7 @@ export interface GoogleTokenRefresher {
   tick(): Promise<void>;
 }
 
-/** A credential's token in the gateway: when it expires, and whether it carries its first service alone. */
+/** `partial`: the token carries its credential's first service alone. */
 interface Published {
   readonly expiresAt: number;
   readonly partial: boolean;

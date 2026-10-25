@@ -12,13 +12,12 @@ export function browserSite(url: string): string {
 }
 
 /**
- * Credential phases whose site stays held by their job (KTD8): the website
- * may have taken a credential, and only that job may settle it. Another errand can neither submit there
- * again nor take the site meanwhile; every other site stays free.
+ * Credential phases whose site stays held by their job: the website may have taken a credential, and only that job
+ * may settle it. Another errand can neither submit there again nor take the site meanwhile; every other site stays
+ * free.
  */
 export const HELD_CREDENTIAL_PHASES = ['exposed', 'awaiting_verification', 'unknown', 'confirmed'] as const;
 
-/** The sites a job holds for its unresolved credential attempts. */
 export async function heldCredentialSites(db: DbDriver, jobId: string): Promise<Set<string>> {
   if (!(await db.hasTable('gws_ea_browser_credential_attempts'))) return new Set();
   const rows = await db.all<{ site: string }>(

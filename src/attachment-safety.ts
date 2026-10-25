@@ -24,10 +24,8 @@ export function isSafeAttachmentName(name: string): boolean {
 }
 
 /**
- * The inbox folder for a message's attachments. A platform message ID that is
- * already a safe file name names it directly; any other ID, such as a Google
- * Chat ID (`spaces/…/messages/…`), names it by a hash, so its attachments are
- * kept instead of refused.
+ * An ID that is not a safe file name, such as a Google Chat ID (`spaces/…/messages/…`), is hashed so its
+ * attachments are kept instead of refused.
  */
 export function inboxFolderName(messageId: string): string {
   return isSafeAttachmentName(messageId)

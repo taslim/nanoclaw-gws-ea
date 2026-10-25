@@ -212,17 +212,14 @@ import {
 /** Unlabeled prerequisite checks stay out of terminal progress. */
 const PREREQUISITES_STEP = { id: 'prerequisites' } as const;
 
-/** Signals that end a run, recorded in its log first. */
 const INTERRUPT_SIGNALS = ['SIGINT', 'SIGTERM', 'SIGHUP'] as const;
 
 /** Managed exits; native ncl and logs retain the delegated tool's exit contract. */
 export const EXIT_CODES = { ready: 0, paused: 10, failed: 1, usage: 2, busy: 75 } as const;
 
 type LineWriter = (line: string) => void;
-/** The attempts that act on an assistant's host service alone. */
 type ServiceCommand = Extract<Command, 'start' | 'stop' | 'restart'>;
 
-/** A stop summary. The line presenter prints it; the terminal presenter draws it with clack. */
 export interface StopReport {
   readonly outcome: 'ready' | 'paused' | 'failed' | 'busy' | 'diagnostic';
   readonly headline: string;
@@ -241,7 +238,6 @@ export interface Presenter {
   report(report: StopReport): void;
 }
 
-/** Everything the failure summary names, and what diagnosis and retry need. */
 export interface FailureReport {
   readonly command: Command;
   readonly step: string;
@@ -270,72 +266,54 @@ type RemoveAssistantRunner = (
 ) => Promise<RemovalOutcome | undefined>;
 
 export interface CliRuntime {
-  /** The operator’s WhatsApp commands use the same native host command socket as ncl. */
   whatsappNcl?: typeof runInstanceNclJson;
-  /** How the browser commands reach Chrome and the assistant's host, its web alias step included; tests substitute it. */
   browserInspection?: BrowserCapabilityInspection;
   artifacts?: ArtifactsCapabilityDependencies;
-  /** How the 1Password CLI is found and run; tests substitute the runner. */
   onePassword?: OnePasswordCliSeams;
-  /** A terminal's choice among the operator's 1Password accounts; absent, enable requires --account. */
+  /** Picks among the operator's 1Password accounts; absent, enable needs --account until one is recorded. */
   chooseOnePasswordAccount?: OnePasswordDependencies['chooseAccount'];
   paths?: ControlPlanePaths;
   stdout?: LineWriter;
   stderr?: LineWriter;
-  /** Where secret environment variables are read. */
   environment?: NodeJS.ProcessEnv;
-  /** Terminal rendering; durable lines on stdout and stderr when absent. */
+  /** Absent: plain lines on stdout and stderr. */
   presenter?: Presenter;
-  /** Terminal prompts. Absent means no person can be asked. */
+  /** Absent means no person can be asked. */
   prompts?: InteractivePrompts;
-  /** Interactive failure loop: diagnosis, then whether to retry. */
   onFailure?: (report: FailureReport) => Promise<'retry' | 'stop'>;
   advanceProvision?: AdvanceProvision;
-  /** Resolves the release create reserves: this tool's own commit on the track. */
   resolveReleaseTarget?: (request: CreateTargetRequest) => Promise<ReleaseTarget>;
   holdLoopbackPorts?: () => Promise<HeldLoopbackPorts>;
   collectCreateInputs?: (context: CreatePromptContext) => Promise<CreateSetupAnswers>;
   reserveInstance?: typeof reserveInstance;
-  /** Checks what create and resume need; the terminal driver adds guided installation. */
+  /** The terminal driver adds guided installation. */
   checkPrerequisites?: (request: PrerequisiteRequest, interaction: Interaction) => Promise<Prerequisites>;
   describeRemoval?: typeof describeRemoval;
   removeAssistant?: RemoveAssistantRunner;
   /** Absent means removal requires `--yes`. */
   confirmRemoval?: (preview: RemovalPreview) => Promise<boolean>;
-  /** Upstream's `.env` upsert (`setup/set-env.ts`), which the driver supplies. */
   upsertEnvVars?: UpsertEnvVars;
-  /** Upstream's host readiness helpers (`setup/lib/host-status.mjs`), which the driver supplies. */
   hostStatus?: HostStatusHelpers;
-  /** Upstream's service helpers (`scripts/update/service.ts`), which the driver supplies; they control each host. */
   serviceHelpers?: NanoclawServiceHelpers;
-  /** Replaces this process with the tool `ncl` and `logs` hand it to; tests substitute it. */
   execve?: NonNullable<NodeJS.Process['execve']>;
-  /** This tool's provider setup, which the driver reads from `setup/providers` when an update needs it. */
   toolProviderSetup?: () => Promise<ToolProviderSetup>;
   /** Absent means an update requires `--yes`. */
   confirmUpdate?: (preview: UpdatePreview) => Promise<boolean>;
   /** Asks once, after `update --all` shows its plan and before anything is staged; absent means it requires `--yes`. */
   confirmUpdateAll?: (plan: UpdateAllPlan) => Promise<boolean>;
-  /** The central migrations this tool's release applies, which `update --all`'s plan names; its registry when absent. */
+  /** The central migrations `update --all`'s plan names; absent, this tool's registered migrations. */
   releaseMigrations?: () => Promise<readonly string[]>;
   /** Asks before a rollback restores the pre-update snapshot; absent means that restore requires `--yes`. */
   confirmRollback?: (preview: RollbackPreview) => Promise<boolean>;
-  /** An update's boundary seams; each defaults to the real one. */
   update?: UpdateSeams;
   /** The checkout this tool runs from, which only the launcher names: a stray NanoClaw install there is removed. */
   toolCheckout?: ToolCheckout;
 }
 
-/** The launcher's helpers an update runs with. */
 type UpdateLauncher = Required<
   Pick<CliRuntime, 'serviceHelpers' | 'toolProviderSetup' | 'upsertEnvVars' | 'hostStatus'>
 >;
 
-/**
- * `update --all` moves every assistant on its own track and repository, so it
- * names no assistant, and moving one elsewhere stays a decision made for it
- * alone, with `update --id`.
- */
 function assertUpdatesEveryAssistant(options: CommandOptions): void {
   if (options.id !== undefined) throw new GwsEaError('invalid_arguments', 'Pass either --id or --all, not both.');
   if (options.track !== undefined || options['source-remote'] !== undefined) {
@@ -346,7 +324,6 @@ function assertUpdatesEveryAssistant(options: CommandOptions): void {
   }
 }
 
-/** `--abandon a,b`: resources removal may leave behind when it cannot observe them. */
 function parseAbandon(value: string | undefined): ReadonlySet<AbandonableResource> {
   const abandonable: readonly string[] = ABANDONABLE_RESOURCES;
   const resources = value === undefined ? [] : value.split(',');
@@ -402,7 +379,6 @@ function aliasDecisionOf(options: CommandOptions): AliasDecision | undefined {
   });
 }
 
-/** `--billing-account`: the billing account a pause offered, as Google names it. */
 function parseBillingAccount(value: string | undefined): string | undefined {
   if (value === undefined) return undefined;
   if (!GCP_BILLING_ACCOUNT_PATTERN.test(value)) {
@@ -425,16 +401,7 @@ function isBusy(error: unknown): boolean {
   );
 }
 
-/**
- * The assistant's state refused the command: an unfinished update or
- * rollback, a removal under way, a create not yet finished, no host service
- * installed to start, a stopped assistant an update cannot prove its release
- * on, a release that is not newer than the one it runs, no release of its own
- * kept to roll back to, or a rollback that went back to the release it left;
- * or, in a turn of `update --all`, the tool's checkout moved off the release
- * the run set out with. Its message names the command that moves the
- * assistant on; rerunning this one cannot.
- */
+/** Refusals by the assistant's state, which rerunning the same command cannot change, so no retry is offered. */
 const STATE_REFUSALS: ReadonlySet<string> = new Set([
   'operation_in_progress',
   'removal_in_progress',
@@ -456,7 +423,7 @@ function busy(): GwsEaError {
   return new GwsEaError('instance_busy', 'Instance operation is already in progress; no action was taken.');
 }
 
-/** Domain input validation runs in prepare, before an attempt can load prerequisites or make changes. */
+/** For refusals from `prepare`, which validates input before an attempt loads prerequisites or makes changes. */
 function initialInvocationExit(error: GwsEaError): number {
   return error.code === 'invalid_arguments' ||
     error.code === 'invalid_release_track' ||
@@ -497,7 +464,6 @@ function exitFact(details: GwsEaErrorDetails | undefined): string | undefined {
   return undefined;
 }
 
-/** A pause as the person reads it: what to do, and the command that continues; a choice gives one per option. */
 function pauseReport(pause: ProvisionHumanPause, resume: (extra?: string) => string, log: string): StopReport {
   const { choices, resumeFlag } = pause;
   return {
@@ -534,7 +500,6 @@ type Attempt =
   | { readonly status: 'done'; readonly exitCode: number }
   | { readonly status: 'failed'; readonly report: FailureReport; readonly retry: () => Promise<Attempt> };
 
-/** What one attempt knows about its instance as it runs. */
 interface AttemptState {
   instanceId?: string;
   reserved: boolean;
@@ -582,11 +547,7 @@ class Cli {
     this.#interruptedResult = interruptedResult;
   }
 
-  /**
-   * Validate arguments up front; the returned attempt reports every later
-   * failure itself. Each command has its own branch, so none falls through
-   * to another command's work.
-   */
+  /** Validates arguments up front; the returned attempt reports every later failure itself. */
   prepare(command: Command, invocation: ParsedInvocation): () => Promise<Attempt> {
     const { options, repeated, commandArgs: args } = invocation;
     switch (command) {
@@ -705,7 +666,7 @@ class Cli {
     }
   }
 
-  /** The command that continues from where an attempt stopped; `extra` carries a pause's decision flag. */
+  /** `extra` is a pause's decision flag, or for `remove` a resource to add to `--abandon`. */
   #continueCommand(plan: AttemptPlan, state: AttemptState, extra?: string): string {
     const secretsFile = plan.options['secrets-file'];
     const common = secretsFile ? `--secrets-file ${shellQuote(secretsFile)}` : undefined;
@@ -828,13 +789,11 @@ class Cli {
     return actions;
   }
 
-  /** Create and resume continue by resuming once the assistant is reserved; every other attempt is retried as given. */
   #nextAction(plan: AttemptPlan, state: AttemptState): string {
     const resumes = (plan.command === 'create' || plan.command === 'resume') && state.reserved;
     return `${resumes ? 'Resume' : 'Retry'} with: ${this.#continueCommand(plan, state)}`;
   }
 
-  /** Retrying a reserved create resumes it; every other attempt reruns as given. */
   #retry(plan: AttemptPlan, state: AttemptState): () => Promise<Attempt> {
     if (plan.command !== 'create' || !state.reserved || !state.instanceId) {
       return () => this.prepare(plan.command, parseInvocation([plan.command, ...plan.args]))();
@@ -934,10 +893,7 @@ class Cli {
     }
   }
 
-  /**
-   * Allocate the instance's ports and reserve it. The ports are held only
-   * until the reservation claims them; each runtime binds its own on start.
-   */
+  /** The ports are held only until the reservation claims them; each runtime binds its own on start. */
   async #reserve(
     state: AttemptState,
     track: string,
@@ -988,9 +944,8 @@ class Cli {
   }
 
   /**
-   * Provision until ready or paused. A terminal attends each pause, asking
-   * or waiting for what it needs, and provisioning runs on in the same
-   * process; without one, or when the person stops, the pause is reported.
+   * A terminal attends each pause and provisioning runs on in the same process; without one, or when the person
+   * stops, the pause is reported.
    */
   async #provision(reporter: StepReporter, operation: InstanceOperation, interaction: Interaction): Promise<Outcome> {
     let current = interaction;
@@ -1075,7 +1030,8 @@ class Cli {
       removed ? removed.removed.length > 0 || removed.abandoned.length > 0 : null,
     );
     state.data = { ...state.data, ...(removed ? { removal: removed } : {}) };
-    // Revoking a service account, or settling a creation never proven, is the operator's, on 1Password.com; then they close the receipt that names it.
+    // Revoking a service account, or settling a creation never proven, is the operator's, on 1Password.com; then
+    // they close the receipt that names it.
     const left = removed?.onepassword;
     const owed = left?.receipt_file
       ? onePasswordOperatorActions(instanceId, left.revoke_service_account_ids, left.unproven)
@@ -1094,17 +1050,8 @@ class Cli {
   }
 
   /**
-   * `start`, `stop`, and `restart` act on the assistant's host service alone,
-   * through NanoClaw's own helpers and with its semantics (KTD3): agent
-   * containers are left for the next start to adopt, and a stop lasts until
-   * the next start, login, or reboot. A start or restart ends only once the
-   * host answers on its CLI socket.
-   */
-  /**
-   * Connect a created assistant's own Google account (KTD5): the same
-   * resources as create's `sign_in_google` and `connect_google` steps, outside
-   * the provision journal, so a lost or outdated sign-in is repaired without
-   * recreating the assistant.
+   * Create's `sign_in_google` and `connect_google` resources, outside the provision journal, so a lost or outdated
+   * sign-in is repaired without recreating the assistant.
    */
   async #connectGoogleWork({ reporter, interaction }: Session, instanceId: string): Promise<Outcome> {
     const operation = await this.#acquire(reporter, instanceId, { command: 'connect-google' });
@@ -1233,7 +1180,6 @@ class Cli {
     return { serviceHelpers, toolProviderSetup, upsertEnvVars, hostStatus };
   }
 
-  /** `update --id`: one assistant's update, reported as its stop summary. */
   async #updateWork({ reporter, state }: Session, request: UpdateRequest, yes: boolean): Promise<Outcome> {
     const confirm = updateConfirmation(yes, this.#runtime.confirmUpdate);
     await this.#cleanStrayInstall(reporter, state);
@@ -1243,15 +1189,9 @@ class Cli {
   }
 
   /**
-   * One assistant's update, which `update --id` and each turn of `update
-   * --all` run: stage this tool's release beside the running assistant, show
-   * what the update changes, and once confirmed carry it through its switch
-   * to the committed release (R1, R2). An update already under way to this
-   * release is continued, not staged again; one with no release to return to
-   * is superseded by an update to another (KTD9); and a committed one's
-   * follow-ups are finished before anything else (KTD2), even when this
-   * release is the one already committed. Undefined when its preview was
-   * declined, which left the staging for the next update.
+   * An update already under way to this release is continued, not staged again; one with no release to return to is
+   * superseded by an update to another; a committed one's follow-ups are finished first, even when this release is
+   * the one already committed. Undefined when the preview was declined, which leaves the staging for the next update.
    */
   async #updateAssistant(
     reporter: Session['reporter'],
@@ -1284,7 +1224,7 @@ class Cli {
         if (sameRelease(unfinished.to, intent.target)) return { kind: 'completed', release: unfinished.to };
       }
       // The gate admitted this update: it continues an open update to this release, or supersedes one with no release
-      // to return to (KTD9), which is staged anew.
+      // to return to, which is staged anew.
       const continuing =
         unfinished?.phase !== 'committed' &&
         unfinished?.kind === 'update' &&
@@ -1310,12 +1250,8 @@ class Cli {
   }
 
   /**
-   * `update --all`: every assistant that can move to this tool's release, one
-   * at a time in `list` order, each through `update --id`'s own attempt, with
-   * its run log, progress, preview, and stop summary; the rest are skipped
-   * and named (see `update-all.ts`). The plan is confirmed once, at a
-   * terminal or by `--yes`; how, and the launcher, are settled before any
-   * assistant is read.
+   * Each assistant that can move runs `update --id`'s own attempt, one at a time in `list` order; the rest are skipped
+   * and named (`update-all.ts`). How the plan is confirmed, and the launcher, are settled before any assistant is read.
    */
   async #updateAll(yes: boolean): Promise<Attempt> {
     /* eslint-disable no-catch-all/no-catch-all -- The CLI boundary turns every failure before the first turn into a redacted summary and exit code. */
@@ -1426,11 +1362,8 @@ class Cli {
   }
 
   /**
-   * One assistant's turn in `update --all`: the attempt `update --id <id>`
-   * runs, pinned to the run's release, which reports its own end and recovery
-   * guidance. Its preview is shown, not asked about: the plan's confirmation
-   * covers it. A failure ends the turn without the interactive retry loop:
-   * the run stops there.
+   * Pinned to the run's release. Its preview is shown, not asked about, since the plan's confirmation covers it; a
+   * failure skips the interactive retry loop, and the run stops there.
    */
   async #updateTurn(
     instanceId: string,
@@ -1470,11 +1403,8 @@ class Cli {
   }
 
   /**
-   * `rollback`: return the assistant to its rollback point, or settle what
-   * its record says is unfinished (R3). A restore of the pre-update snapshot
-   * is shown first and needs confirmation: `--yes`, or a terminal to be asked
-   * on; a code-only rollback loses nothing and is not asked about. A
-   * committed rollback's follow-ups run last.
+   * Also settles what the record says is unfinished. A restore of the pre-update snapshot is shown first and needs
+   * `--yes` or a terminal's confirmation; a code-only rollback loses nothing and is not asked about.
    */
   async #rollbackWork({ reporter, state }: Session, instanceId: string, options: CommandOptions): Promise<Outcome> {
     const { serviceHelpers, upsertEnvVars, hostStatus, confirmRollback } = this.#runtime;
@@ -1513,7 +1443,6 @@ class Cli {
     }
   }
 
-  /** What stray handling needs, which only the launcher supplies. */
   #strayHandling(): (StrayLauncher & { readonly checkout: ToolCheckout }) | undefined {
     const { toolCheckout, hostStatus, serviceHelpers } = this.#runtime;
     return toolCheckout && hostStatus && serviceHelpers
@@ -1522,10 +1451,8 @@ class Cli {
   }
 
   /**
-   * What `create` and `update` start with (R3–R5): a stray NanoClaw install in
-   * the tool checkout is removed without asking, since gws-ea is the only way
-   * NanoClaw runs there. With none, nothing is printed; a failure is one
-   * warning, and the command goes on.
+   * A stray install is removed without asking, since gws-ea is the only way NanoClaw runs in the tool checkout; a
+   * failure is one warning, and the command goes on.
    */
   async #cleanStrayInstall(reporter: StepReporter, state?: AttemptState): Promise<void> {
     const stray = this.#strayHandling();
@@ -1619,7 +1546,7 @@ class Cli {
     else if (line) this.#presenter.report({ outcome: 'diagnostic', headline: line.text, details: [] });
   }
 
-  /** `cleanup`: what `create` and `update` start with, asked for, so Docker that cannot be checked is a failure (KTD7). */
+  /** Unlike the cleanup create and update start with, Docker that cannot be checked is a failure here. */
   async #cleanupWork({ reporter, state }: Session): Promise<Outcome> {
     const stray = this.#strayHandling();
     if (!stray) throw new GwsEaError('interactive_setup_unavailable', 'Run this command through the gws-ea launcher');
@@ -1686,7 +1613,7 @@ class Cli {
     const continueWith = (extra?: string): string => this.#continueCommand(plan, state, extra);
     let run: RunLog | undefined;
     // A signal while waiting on a pause stops the wait. Otherwise, or when the wait was already told to stop
-    // and has not (it may be stuck in a probe that cannot be aborted), the run ends, and its log says where.
+    // and has not (it may be stuck in a check that cannot be aborted), the run ends, and its log says where.
     const interrupted = (signal: NodeJS.Signals): void => {
       const waiting = this.#waiting;
       if (waiting && !waiting.signal.aborted) {
@@ -1893,7 +1820,6 @@ class Cli {
   }
 }
 
-/** A release served through a broken Google sign-in says so after where it left the assistant (KTD12). */
 function pauseFacts(pause: ProvisionHumanPause): NonNullable<OperationData['pause']> {
   const { settled: _settled, kind: _kind, ...facts } = pause;
   return facts;
@@ -1918,7 +1844,6 @@ function signInDetails(signInNeeded: string | null): string[] {
   return signInNeeded ? [`${signInNeeded}.`] : [];
 }
 
-/** Where an update leaves the assistant: on its release, the one it ran kept to roll back to when it has one. */
 function updatedOutcome(instanceId: string, updated: UpdatedAssistant): Outcome {
   return {
     status: 'ready',
@@ -1932,7 +1857,6 @@ function updatedOutcome(instanceId: string, updated: UpdatedAssistant): Outcome 
   };
 }
 
-/** Where a rollback left the assistant. */
 function rollbackOutcome(instanceId: string, outcome: RollbackOutcome, timezone: string): Outcome {
   switch (outcome.kind) {
     case 'rolled_back':
@@ -1976,7 +1900,6 @@ function finishedOutcome(instanceId: string, release: ReleaseCoordinates): Outco
   };
 }
 
-/** The stop summary of one assistant's update; undefined when its preview was declined. */
 function updateOutcome(instanceId: string, update: AssistantUpdate | undefined): Outcome {
   if (!update)
     return {
@@ -1992,15 +1915,11 @@ function updateOutcome(instanceId: string, update: AssistantUpdate | undefined):
   }
 }
 
-/** Confirmed without asking: `--yes`, or a turn of an `update --all` whose plan was confirmed. */
 async function confirmWithoutAsking(): Promise<boolean> {
   return true;
 }
 
-/**
- * `--yes` or a terminal supplies the existing confirmation. Missing consent
- * pauses only when the domain has produced its preview.
- */
+/** Without `--yes` or a terminal, the run pauses only once the domain has produced the preview to confirm. */
 function updateConfirmation<Preview>(
   yes: boolean,
   prompt: ((preview: Preview) => Promise<boolean>) | undefined,
@@ -2033,13 +1952,6 @@ async function verifyServing(
   });
 }
 
-/**
- * `ncl`: hand the process to the assistant's own `bin/ncl` with everything
- * after `--` untouched (KTD13), in the environment `buildInstanceCliCommand`
- * gives it. The gate is passed under the instance lock, which is released
- * just before the handover: `ncl` talks to the running host over its socket,
- * and a lock it held would outlive it.
- */
 function parseWhatsAppCommandData(value: unknown): WhatsAppCommandData {
   const invalid = () => new GwsEaError('invalid_child_output', 'The host returned an invalid WhatsApp link state.');
   if (!isRecord(value)) throw invalid();
@@ -2077,6 +1989,10 @@ function parseWhatsAppCommandData(value: unknown): WhatsAppCommandData {
   };
 }
 
+/**
+ * Admitted under the instance lock, which is released before the process is handed to `bin/ncl`: `ncl` talks to the
+ * running host over its socket, and a lock it held would outlive it.
+ */
 async function prepareNcl(
   paths: ControlPlanePaths,
   invocation: ParsedInvocation,
@@ -2111,11 +2027,7 @@ function reportStop(presenter: Presenter, error: unknown, details: readonly stri
   return usage.length ? EXIT_CODES.usage : EXIT_CODES.failed;
 }
 
-/**
- * Run a command outside the attempt loop: `ncl` and the read-only commands.
- * A failure becomes a stop summary and exit code; a command that asks for it
- * has the process handed to its tool, which then owns the exit code.
- */
+/** A command that ends with `replaceWith` has the process handed to that tool, which then owns the exit code. */
 async function runOutsideAttempts(
   presenter: Presenter,
   execve: CliRuntime['execve'],
@@ -2224,7 +2136,6 @@ function itemCount(count: number): string {
   return `${count} item${count === 1 ? '' : 's'}`;
 }
 
-/** What only the operator can do about runtime service accounts: removal deletes their tokens, never the accounts. */
 function serviceAccountLine(ids: readonly string[], prefix: string): string[] {
   if (!ids.length) return [];
   const one = ids.length === 1;
@@ -2233,7 +2144,7 @@ function serviceAccountLine(ids: readonly string[], prefix: string): string[] {
   ];
 }
 
-/** What 1Password may hold with no ID recorded: removal cannot find it, so only the operator can delete or revoke it. */
+/** An unproven creation has no recorded ID, so removal cannot find it; only the operator can settle it. */
 function unprovenLines(unproven: readonly OnePasswordUnprovenCreation[], prefix: string): string[] {
   return unproven.map(({ kind, name }) =>
     kind === 'vault'
@@ -2282,7 +2193,6 @@ function removalPreviewLines(preview: RemovalPreview): string[] {
   ];
 }
 
-/** What removal did with the assistant's 1Password resources, and what it could not do. */
 function onePasswordOutcomeLines(instanceId: string, outcome: OnePasswordRemovalOutcome): string[] {
   const count = outcome.item_count;
   const vault = ((): string => {
@@ -2314,7 +2224,6 @@ function onePasswordOutcomeLines(instanceId: string, outcome: OnePasswordRemoval
   ];
 }
 
-/** The 1Password CLI hooks for this process: its PATH and environment, with any test overrides on top. */
 function onePasswordSeams(
   environment: NodeJS.ProcessEnv,
   overrides: OnePasswordCliSeams | undefined,
@@ -2326,7 +2235,6 @@ function onePasswordSeams(
   };
 }
 
-/** What the operator must know after removal: the project deletion, the 1Password outcome, and anything left behind. */
 function removalSummary(preview: RemovalPreview, outcome: RemovalOutcome | undefined): string[] {
   const project = `Google Cloud project ${preview.gcpProject}`;
   const unobserved = (name: string): string =>
@@ -2386,7 +2294,7 @@ export async function runCli(args: readonly string[], runtime: CliRuntime = {}):
   const emitResult = (result: ManagedResult): void => {
     if (json && !resultWritten) output(resultJson(result));
   };
-  /** Outside journalled attempts, the boundary can still report the facts already observed before exit. */
+  /** Outside the attempt loop, an interrupted `--json` run still reports the facts observed before exit. */
   const observeInterruption = (facts: () => Pick<ManagedResult, 'changed' | 'data'>): (() => void) => {
     if (!json) return () => undefined;
     const interrupted = (signal: NodeJS.Signals): void => {

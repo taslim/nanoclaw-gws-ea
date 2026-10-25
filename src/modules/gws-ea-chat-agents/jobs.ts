@@ -62,7 +62,7 @@ export async function createJobAgent(chat: string): Promise<JobAgent> {
   return result;
 }
 
-/** Called inside the chat cutover's transaction once its wiring points at the new group. */
+/** Runs inside the chat cutover's transaction, before the new wiring: wiring admission requires an active job agent. */
 export async function activateJobAgent(group: string): Promise<void> {
   const row = await getJobAgent(group);
   if (row?.state === 'active') return;

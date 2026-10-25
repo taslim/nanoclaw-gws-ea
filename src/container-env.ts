@@ -13,23 +13,19 @@
  *
  * A contributor adds settings and never overrides one. A key that is not an
  * environment variable name, a key composition owns or already composed for
- * this container (the reserved set its caller passes: the timezone, the home
- * directory, the mailbox's keys, the model provider's and the gateway's), or a
- * key another contributor also set refuses the spawn as `spec-invalid`: the
- * session does not start while the collision stands. A collision means two
- * owners disagree about one setting, and letting either win silently would
- * hide that.
+ * this container (the reserved set its caller passes), or a key another
+ * contributor also set refuses the spawn as `spec-invalid`: the session does
+ * not start while the collision stands. A collision means two owners disagree
+ * about one setting, and letting either win silently would hide that.
  */
 import { specInvalid } from './drivers/types.js';
 
 export interface ContainerEnvContext {
-  /** The agent group being spawned. */
   readonly agentGroupId: string;
-  /** Its capabilities, resolved exactly as the spawn grants them. */
+  /** Resolved exactly as the spawn grants them. */
   readonly capabilities: ReadonlySet<string>;
 }
 
-/** A module's settings for one spawn; an empty record adds nothing. */
 export type ContainerEnvContributor = (ctx: ContainerEnvContext) => Readonly<Record<string, string>>;
 
 const contributors = new Map<string, ContainerEnvContributor>();
@@ -37,7 +33,6 @@ const CONTRIBUTOR_ID = /^[a-z0-9][a-z0-9._-]*:[a-z0-9][a-z0-9._-]*$/u;
 /** A POSIX environment variable name: nothing a realization could split into a second key. */
 const ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/u;
 
-/** Register a module's container env contributor. A malformed or duplicate id throws. */
 export function registerContainerEnv(id: string, contributor: ContainerEnvContributor): void {
   if (!CONTRIBUTOR_ID.test(id)) {
     throw new Error(`Container env contributor "${id}" must use "<module-id>:<contributor-id>"`);
@@ -46,11 +41,7 @@ export function registerContainerEnv(id: string, contributor: ContainerEnvContri
   contributors.set(id, contributor);
 }
 
-/**
- * Every contributor's settings for one spawn, merged. `reserved` names the
- * keys composition owns or has composed for this container; setting one of
- * them, or a key another contributor set, refuses the spawn.
- */
+/** `reserved` names the keys composition owns or has already composed for this container. */
 export function composeContainerEnv(ctx: ContainerEnvContext, reserved: ReadonlySet<string>): Record<string, string> {
   const env: Record<string, string> = {};
   const owners = new Map<string, string>();

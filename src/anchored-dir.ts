@@ -124,7 +124,7 @@ export class AnchoredDir {
     }
   }
 
-  /** Read one regular file within a hard byte bound, refusing concurrent size changes. */
+  /** Throws when the file is not regular, exceeds `maxBytes`, or changes while being read. */
   readFileBounded(name: string, maxBytes: number): Buffer {
     const fd = this.openReadFd(name);
     try {
@@ -273,7 +273,7 @@ function descriptorAlias(fd: number): string {
   throw new Error(`anchored directory I/O is not supported on ${process.platform}`);
 }
 
-/** Read an already-open descriptor with a pre-allocation bound and a growth probe. The caller owns the descriptor. */
+/** Leaves `fd` open for the caller. Throws when the file is not regular, exceeds `maxBytes`, or changes mid-read. */
 export function readRegularFileBounded(fd: number, maxBytes: number): Buffer {
   if (!Number.isSafeInteger(maxBytes) || maxBytes < 0) throw new Error('Invalid file byte limit');
   const before = fs.fstatSync(fd, { bigint: true });

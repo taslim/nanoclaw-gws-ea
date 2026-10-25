@@ -1,16 +1,14 @@
 /**
- * Purchase outcomes the page could not prove (KTD8, KTD9; R10, R11). An attempt with no page proof either way is
- * unconfirmed: its delegating group hears so once, and another purchase on its site waits on it while browsing
- * there goes on. The merchant's order email reaches main like any mail, and otherwise main asks the principal
- * once; main records what it learned through `record_purchase_outcome`, by the attempt id the host's unconfirmed
- * notice gave, never one a browser report gives.
+ * Purchase outcomes the page could not prove. An attempt with no page proof either way is unconfirmed: its delegating
+ * group hears so once, and another purchase on its site waits on it while browsing there goes on. That group records
+ * what it learns from the merchant's order email or the principal through `record_purchase_outcome`, by the attempt
+ * id the host's unconfirmed notice gave, never one a browser report gives.
  *
- * Every recording goes through the authority store's one resolve function: the first source to record an
- * outcome wins, and a later recording gets the recorded outcome back. A "placed" for an attempt recorded not
- * placed is the merchant's late confirmation of a possible duplicate: an incident, whose alarm is the recorder's
- * own answer (KTD15), so the request that raised it carries the alarm in every answer it is given, a replay's
- * included. Main records the attempts of a group whose browser access was removed, and that group hears
- * only that its errand stopped.
+ * Every recording goes through the authority store's one resolve function: the first source to record an outcome
+ * wins, and a later recording gets the recorded outcome back. A "placed" for an attempt recorded not placed is the
+ * merchant's late confirmation of a possible duplicate: an incident, whose alarm is the recorder's own answer, so the
+ * request that raised it carries the alarm in every answer it is given, a replay's included. Main records the
+ * attempts of a group whose browser access was removed, and that group hears only that its errand stopped.
  */
 import { answeredGuard, answeringAction, forbidden, invalidArgs, requestIdOf } from '../../cli/delivery-action.js';
 import { getDb } from '../../db/connection.js';
@@ -28,7 +26,7 @@ import { recordIncidentWithStop } from './incidents.js';
 import { attemptSummary, notifyUnconfirmedPurchase, tellDelegator } from './notices.js';
 import type { BrowserQueue } from './queue.js';
 
-/** Every delegator reads the attempt id in the host's unconfirmed notice; only main also reads job state. */
+/** Every delegator reads the attempt id in the host's unconfirmed notice. */
 const NO_SUCH_ATTEMPT =
   "That job made no purchase with that attempt id: use the attempt id the host's unconfirmed notice gave.";
 
@@ -69,7 +67,7 @@ const OUTCOME_FIELDS: ReadonlySet<string> = new Set([
   'source',
 ]);
 
-/** An answer as main recorded it, and its source. */
+/** The outcome first recorded, by the page or a recorder, in `record_purchase_outcome`'s terms. */
 function recordedAs(attempt: PurchaseAttemptRow): {
   outcome: 'placed' | 'not_placed';
   source: ResolutionSource | null;
@@ -78,9 +76,9 @@ function recordedAs(attempt: PurchaseAttemptRow): {
 }
 
 /**
- * Main records the outcome of an attempt its errand left unconfirmed, from the merchant's order email or the
- * principal's answer. The attempt is one of that errand's, named by the id the host's unconfirmed notice gave. The first recording
- * stands; a later one returns it, and a "placed" against a recorded "not placed" is a possible duplicate.
+ * The errand's delegating group records the outcome of an attempt it left unconfirmed, from the merchant's order
+ * email or the principal's answer, by the id the host's unconfirmed notice gave. The first recording stands; a later
+ * one returns it, and a "placed" against a recorded "not placed" is a possible duplicate.
  * to: main, delegator
  */
 export async function recordPurchaseOutcome(
@@ -165,11 +163,11 @@ interface RaisedBy {
 }
 
 /**
- * A purchase recorded not placed, reported placed after all (KTD10): the incident and its job's stop in one
- * transaction, then the cancellation's own work. The recorder's answer is the alarm, so the incident is recorded
- * told (KTD15) along with the request that raised it; a delegating group other than the recorder hears only that
- * its errand stopped. Whether this request raised the incident: now, or before the host stopped short of answering
- * it, so that its replay still carries the alarm and finishes the notice.
+ * A purchase recorded not placed, reported placed after all: the incident and its job's stop in one transaction, then
+ * the cancellation's own work. The recorder's answer is the alarm, so the incident is recorded told along with the
+ * request that raised it; a delegating group other than the recorder hears only that its errand stopped. Returns
+ * whether this request raised the incident: now, or before the host stopped short of answering it, so that its replay
+ * still carries the alarm and finishes the notice.
  */
 async function lateConfirmation(
   job: BrowserJob,

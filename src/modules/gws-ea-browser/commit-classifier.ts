@@ -24,11 +24,11 @@ import {
 import { BrowserConsentStop, runConsentPass, type ConsentScope } from './consent.js';
 
 /**
- * Why an activation was refused: its class, or a submission of a form holding a password, code or payment
- * field, which only the host's own sign-in and credential paths make.
+ * `secret_field`: a submission of a form holding a password, code or payment field, which only the host's own
+ * sign-in and credential paths make.
  */
 export type ActivationRefusal = Exclude<ActionClass, 'ordinary'> | 'secret_field';
-/** Why the navigation guard refused a document: its class, a site another job holds, or a read-only replay's non-GET. */
+/** `site_busy`: another job holds the site; `read_only`: a read-only replay's non-GET document. */
 export type NavigationRefusal = Exclude<ActionClass, 'ordinary'> | 'site_busy' | 'read_only';
 /** The open rule for an action on this control, with any reviewed flow's exact reading of it. */
 export async function classifyActivation(
@@ -70,8 +70,8 @@ export class BrowserActivationError extends Error {
 }
 
 /**
- * The consent engine's one check before a host-performed submission outside a purchase (KTD11): every choice
- * in the control's form made, or a stop. An extra the press would still buy makes it a purchase.
+ * The consent engine's one check before a submission outside a purchase: every choice in the control's form
+ * made, or a stop. An extra the press would still buy makes it a purchase.
  */
 async function consentBeforeSubmission(page: Page, element: ElementHandle, intent: ActivationIntent): Promise<void> {
   const consent = await runConsentPass(page, element, { scope: intent.scope, assertActive: intent.assertActive });
@@ -86,31 +86,29 @@ export class BrowserFramesUnreadyError extends BrowserActivationError {
   }
 }
 
-/** The stable, repeat-safe stop every executor answers when the guard refused to start its operation. */
+/** An executor's stop when the guard refused to start its operation: repeat-safe, since nothing ran. */
 export function framesUnreadyStop(error: unknown): import('./actions.js').BrowserBatchResult | undefined {
   return error instanceof BrowserFramesUnreadyError
     ? { status: 'stopped', reason: error.reason, repeat_safe: true }
     : undefined;
 }
 
-/** An approved purchase's own press (KTD4): the documents it may load while it runs, beyond the open rule. */
+/** An approved purchase's own press: the documents it may load while it runs, beyond the open rule. */
 interface ApprovedPress {
   /** The origin of the document the approved control commits from. */
   readonly origin: string;
-  /** Whether a document belongs to the press's own flow. */
   matches(url: URL): boolean;
   /** The flow's reading of its own route; undefined for a route it does not know, which stays refused. */
   classify(url: URL): ActionClass | undefined;
 }
 const approvedPresses = new WeakMap<Page, ApprovedPress>();
 
-/** What an approved purchase's press carries into the activation boundary. */
 export interface PurchaseAuthorityPress {
   /** Runs immediately before the press: the last re-read and the commit marker. */
   commitStarted(): Promise<void>;
   /**
-   * A generic checkout's origin (KTD4), for a page no reviewed flow reads: its control must sit in a document of
-   * this origin, and the press loads its own routes there.
+   * A generic checkout's origin, for a page no reviewed flow reads: its control must sit in a document of this
+   * origin, and the press loads its own routes there.
    */
   readonly checkout?: { readonly origin: string };
 }
@@ -150,28 +148,25 @@ async function approvedPress(
   };
 }
 
-/** All recipes, fills, watches and tool activations use this single boundary. */
 export interface ActivationIntent {
   kind: ActivationKind;
   /** Consent stops and grants belong to this operation's job, never ambient page state. */
   scope?: ConsentScope;
   /** Facts and final policy decision already required for this activation; recording never re-reads the control. */
   onFacts?: (facts: ControlFacts, classification: ActionClass) => void;
-  /** Host-only cancellation/deadline check immediately before a native authentication submit. */
+  /** Host-only cancellation/deadline check, run by the consent pass and before a native authentication submit. */
   assertActive?: () => Promise<void>;
-  /** The action's remaining budget: its script-request window never outlasts it. */
+  /** Milliseconds left in the action's budget: its script-request window never outlasts it. */
   remaining?: () => number;
 }
 
-/** What an activation did: whether an ordinary press ran, which may have bought something nobody approved (KTD10). */
 export interface ActivationResult {
+  /** An ordinary press ran, which may have bought something nobody approved. */
   readonly ordinaryPress: boolean;
 }
 
-/** The window an action gets when its caller names no budget. */
 const DEFAULT_ACTION_BUDGET_MS = 10_000;
 
-/** Whether the action submits the control's form natively: an Enter or host submit, or a press of its submit control. */
 function submitsForm(facts: ControlFacts, kind: ActivationIntent['kind']): boolean {
   if (facts.formAction === undefined) return false;
   if (kind === 'submit') return true;
@@ -182,11 +177,11 @@ function submitsForm(facts: ControlFacts, kind: ActivationIntent['kind']): boole
 }
 
 /**
- * The one boundary every activation passes (KTD1, KTD2). A fresh classification decides it: an approved
- * purchase's own press goes to its reviewed flow, anything commit-class is refused, and anything ordinary runs
- * as `operation`, the native action on the element, with Playwright's hit-target check kept. Before anything
- * that can submit a form, the consent pass makes every choice the consent engine owns (KTD11); during the
- * action, the page's script requests to payment processors and purchase routes are refused.
+ * The one boundary every activation passes. A fresh classification decides it: an approved purchase's press
+ * runs only on a control its approval covers, anything commit-class is refused, and anything ordinary runs as
+ * `operation`, the native action on the element, with Playwright's hit-target check kept. Before anything that
+ * can submit a form, the consent pass makes every choice the consent engine owns; during an ordinary action,
+ * the page's non-GET script requests to payment processors and purchase routes are refused.
  */
 export async function activateControl(
   page: Page,
@@ -253,20 +248,21 @@ export async function activateControl(
   return { ordinaryPress: pressed };
 }
 
-/** A paused document as the guard's policies read it: where it goes, how, and whether it is the page's own. */
 export type NavigationDocument = Pick<PausedDocument, 'method' | 'topLevel'>;
 
 export interface BrowserNavigationPolicy {
   /**
-   * A host-owned operation's own complete classification of a document on its
-   * site, replacing the generic one; undefined leaves the generic rules. Only
-   * an authorized credential operation installs one, for its activation.
+   * A complete classification that replaces the generic one, even where that refuses; undefined leaves the
+   * generic rules. Only an authorized credential operation installs one, for its activation.
    */
   decide?(url: URL): ActionClass | undefined;
-  /** A host-owned sign-in scope may recognize an otherwise unsupported bearer-link route. */
+  /**
+   * A refusal here replaces the generic class; `ordinary` replaces only an approved press's refusal of a route its
+   * flow does not know.
+   */
   classify?(url: URL): ActionClass;
   stripReferrer?: boolean;
-  /** A read-only replay's scope: every document it loads must be a GET, or it is refused as `read_only` (KTD2). */
+  /** Every document the scope loads must be a GET, or it is refused as `read_only`. */
   readOnly?: boolean;
   /** The site the scope's job leased for the page's current document as the scope began. */
   leasedSite?: string;
@@ -276,18 +272,21 @@ export interface BrowserNavigationPolicy {
 export interface BrowserNavigationGuard {
   reason(): NavigationRefusal | undefined;
   clearReason(): void;
-  /** Hold HTTP requests before credential callbacks run, including while waiting for consent. */
+  /**
+   * Refuses the page's HTTP requests, its frames' and windows' included, until this authority allows them, so a
+   * page's input handlers cannot submit a filled credential.
+   */
   holdSubmissions(authority: string): void;
-  /** Release only this authority's hold when it activates, settles or is explicitly released. */
+  /** Lifts only this authority's hold; another authority's keeps refusing. */
   allowSubmissions(authority: string): void;
   runWithPolicy<T>(policy: BrowserNavigationPolicy, operation: () => Promise<T>): Promise<T>;
   /**
-   * Runs one ordinary action inside its script-request window (KTD2): from the action's start, through a short
-   * settle, until any navigation it started commits, capped by `budgetMs`. Inside the window, the page's and
-   * every out-of-process frame's non-GET fetch, XHR and beacon requests to payment processors and purchase
-   * routes are refused; outside it nothing is paused. The caller goes on once every navigation the action
-   * started has committed and, unless the page's own document was replaced, its requests have gone quiet or the
-   * settle has ended; the rest of the window runs on in the background.
+   * Runs one ordinary action inside its script-request window: from the action's start, through a short settle,
+   * until any navigation it started commits, capped by `budgetMs`. Inside the window, the page's and every
+   * out-of-process frame's non-GET fetch, XHR and beacon requests to payment processors and purchase routes are
+   * refused; outside it nothing is paused. The caller goes on once every navigation the action started has
+   * committed and, unless the page's own document was replaced, its requests have gone quiet or the settle has
+   * ended; the rest of the window runs on in the background.
    */
   duringAction<T>(budgetMs: number, action: () => Promise<T>): Promise<T>;
   /** Resolves once every ordinary action's script-request window on the page has closed. */
@@ -295,7 +294,7 @@ export interface BrowserNavigationGuard {
 }
 const navigationGuards = new WeakMap<Page, Promise<BrowserNavigationGuard>>();
 
-/** The page's navigation guard: it decides the page's documents at the browser's document gate until the page closes. */
+/** One guard per page, deciding its documents at the browser's document gate until the page closes. */
 export function ensureBrowserNavigationGuard(page: Page): Promise<BrowserNavigationGuard> {
   let guard = navigationGuards.get(page);
   if (!guard) {
@@ -314,9 +313,9 @@ export function registrableSite(raw: string): string | undefined {
 }
 
 /**
- * A document no operation asked for (KTD2): page script acting between operations. It loads only when it is a
- * GET the open rule calls ordinary, on the site the job's lease admitted the page to; a frame's document, or a
- * window's, is judged by its page's site. Anything else is refused, and the next operation navigates again.
+ * A document no operation asked for: page script acting between operations. It loads only when it is a GET the
+ * open rule calls ordinary, on the site the job's lease admitted the page to; a frame's document, or a window's,
+ * is judged by its page's site. Anything else is refused, and the next operation navigates again.
  */
 function decideIdleDocument(
   url: string,
@@ -380,7 +379,6 @@ async function decideNavigation(
     if (scoped !== 'ordinary' || pressRefused) classification = scoped;
   }
   if (classification !== 'ordinary') return classification;
-  // A read-only replay follows GET navigation only.
   if (document.method !== 'GET' && scopes.some((policy) => policy.readOnly)) return 'read_only';
   let admitted: 'ordinary' | 'site_busy' | 'blocked_address' = 'ordinary';
   for (const policy of scopes)
@@ -389,9 +387,9 @@ async function decideNavigation(
   return admitted;
 }
 
-/** Script request types an ordinary action's window checks: what page script sends, a beacon included. */
+/** What page script sends, a beacon (`Ping`) included. */
 const SCRIPT_REQUEST_TYPES = ['XHR', 'Fetch', 'Ping'] as const;
-/** How long an ordinary action's window stays open after the action: a handler that awaits one round trip, then posts. */
+/** How long an action's window stays open after it: enough for a handler that awaits one round trip, then posts. */
 const ACTION_SETTLE_MS = 1_000;
 /**
  * How long the page must stay quiet before the action's caller goes on: after the action, and after each request
@@ -402,7 +400,6 @@ const ACTION_SETTLE_MS = 1_000;
 const NAVIGATION_START_MS = 250;
 const NAVIGATION_POLL_MS = 50;
 
-/** A script request an ordinary action may not send: anything but a GET, to a payment processor or a purchase route. */
 export function refusedScriptRequest(request: { method: string; url: string }): boolean {
   if (request.method.toUpperCase() === 'GET') return false;
   if (!URL.canParse(request.url)) return true;
@@ -520,15 +517,15 @@ async function installNavigationGuard(page: Page): Promise<BrowserNavigationGuar
       };
     },
   });
-  // Script requests during an ordinary action (KTD2), on the page and on every out-of-process frame, since a
-  // payment frame sends its own. Their sessions are set up on the first action; outside every action's window
-  // nothing pauses. Credential holds instead use the browser-level gate, which covers a new target's first request.
+  // Script requests during an ordinary action, on the page and on every out-of-process frame, since a payment
+  // frame sends its own. Their sessions are set up on the first action; outside every action's window nothing
+  // pauses. Credential holds instead use the browser-level gate, which covers a new target's first request.
   const scriptSessions = new Set<CDPSession>();
   let actions = 0;
   let covering: Promise<void> | undefined;
   // Each window that outlasts its action's return: the rest of its settle, then its cleanup.
   const settling = new Set<Promise<void>>();
-  /** Waits while `open` holds, until `until`; a closed page ends every wait. */
+  /** A closed page ends every wait. */
   const waitWhile = async (open: () => boolean, until: number): Promise<void> => {
     while (open() && !page.isClosed() && Date.now() < until)
       await sleep(Math.min(NAVIGATION_POLL_MS, until - Date.now()));
@@ -684,16 +681,15 @@ const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout
 
 export type BrowserSiteAccess = (url: URL) => Promise<'ordinary' | 'site_busy' | 'blocked_address'>;
 
-/** How a job's operation reaches its sites: a signed-out replay's own site access, and whether it only reads. */
 export interface BrowserJobAccess {
+  /** A signed-out replay's own site access, in place of the job's site leases. */
   readonly siteAccess?: BrowserSiteAccess;
-  /** Only GET documents load, as a read-only replay's (KTD2). */
   readonly readOnly?: boolean;
 }
 
 /**
  * Use around every host browser executor; nested secret scopes share this same page guard. The job leases each
- * top-level document's site (KTD7); a frame's document is classified, but never takes or waits on a lease.
+ * top-level document's site; a frame's document is classified, but never takes or waits on a lease.
  */
 export async function withBrowserJobNavigation<T>(
   context: BrowserOperationContext,

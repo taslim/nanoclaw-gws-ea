@@ -11,7 +11,6 @@ import {
 /** A paused document request as the gate hands it to its page. */
 export interface PausedDocument {
   url: string;
-  /** The request's HTTP method, as Chrome sends it. */
   method: string;
   headers: Record<string, string>;
   /**
@@ -40,7 +39,6 @@ export interface DocumentGate {
   register(targetId: string, page: GuardedPage): () => void;
 }
 
-/** The target facts placement reads. */
 interface TargetFacts {
   targetId: string;
   type: string;

@@ -241,7 +241,7 @@ export async function requestAddMcpServerHold(content: Record<string, unknown>, 
   // JSON-encode each field (exact boundaries, embedded newlines render as
   // visible \n escapes), escape invisibles/backticks, and wrap the payload
   // in a code fence — no payload content can add lines to the card, spoof
-  // another field, or break out of the fence. The fields come first.
+  // another field, or break out of the fence.
   const question = '```\n' + fields.join('\n') + '\n```\n' + "I'd like to add this MCP server to my tools.";
   if (Buffer.byteLength(question, 'utf8') > MCP_APPROVAL_CARD_MAX_BYTES) {
     await notifyAgent(

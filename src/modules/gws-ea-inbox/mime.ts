@@ -3,10 +3,11 @@
  * their thread.
  *
  * Inbound, headers, readable text, and a description of each file are taken;
- * the router fetches the files' bytes itself (KTD9). Outbound, an email is its rendered HTML and the plain text it
- * was written in (KTD6), quoted-printable, with any files after them. It is
- * addressed to exactly the To, Cc, and Bcc it is given, and no value can add a
- * header, because every header value is reduced to one line.
+ * the router fetches the files' bytes itself. Outbound, an email is its
+ * rendered HTML and the plain text it was written in, quoted-printable, with
+ * any files after them. It is addressed to exactly the To, Cc, and Bcc it is
+ * given, and no value can add a header, because every header value is reduced
+ * to one line.
  *
  * Bcc goes in a header because that is the only way `users.messages.send`
  * takes recipients: Gmail sends to the To, Cc, and Bcc headers of the raw
@@ -24,18 +25,17 @@ export interface MailHeader {
   readonly value: string;
 }
 
-/** One mailbox: its address, lowercased, and the display name it was written with, if any. */
+/** The address lowercased; the display name as written, if any. */
 export interface Mailbox {
   readonly address: string;
   readonly displayName?: string;
 }
 
-/** A file a message carries, as Gmail describes it: its bytes inline, or an id to fetch them by. */
 export interface MailAttachment {
   /** As the sender named it; empty when they named it nothing. */
   readonly filename: string;
   readonly mimeType: string;
-  /** Its size in bytes, as Gmail reports it. */
+  /** Bytes, as Gmail reports it. */
   readonly size: number;
   /** What Gmail fetches it by, when its bytes are not inline. */
   readonly attachmentId?: string;
@@ -43,7 +43,6 @@ export interface MailAttachment {
   readonly data?: string;
 }
 
-/** A Gmail message reduced to what routing reads. */
 export interface ParsedMail {
   readonly id: string;
   readonly threadId: string;
@@ -220,7 +219,6 @@ export function parseAddressList(value: string): Mailbox[] | undefined {
   return mailboxes.length > 0 ? mailboxes : undefined;
 }
 
-/** The `<id>` tokens of a Message-ID, In-Reply-To, or References header. */
 export function messageIdsOf(value: string | undefined): string[] {
   if (value === undefined) return [];
   return [...value.matchAll(/<[^<>\s]+>/gu)].map((match) => match[0]);
@@ -263,7 +261,6 @@ function decodeHtmlEntities(text: string): string {
   });
 }
 
-/** The readable text of an HTML part: tags and scripts dropped, breaks kept, entities decoded. */
 export function htmlToText(html: string): string {
   return decodeHtmlEntities(
     html
@@ -389,7 +386,6 @@ function startsHeaderBlock(lines: readonly string[], index: number): boolean {
   );
 }
 
-/** A forward's subject: `Fwd:` or `Fw:`, in any case, after any `Re:`. */
 const FORWARD_SUBJECT = /^\s*(?:re:\s*)*fwd?:/iu;
 
 /**
@@ -421,7 +417,6 @@ export function splitQuoted(text: string, subject = ''): { readonly own: string;
 // Outbound
 // ---------------------------------------------------------------------------
 
-/** An email as `buildMime` writes it. */
 export interface OutgoingMail {
   readonly from: Mailbox;
   /** The recipients, exactly as placed; together they are what the audience check saw. */
@@ -438,12 +433,10 @@ export interface OutgoingMail {
   /** The body as `renderEmail` made it: the plain text it was written in, and its HTML. */
   readonly text: string;
   readonly html: string;
-  /** Files sent after the body. */
   readonly attachments?: readonly OutboundFile[];
   readonly date: Date;
 }
 
-/** What every email's headers say about who it is from and to, and where it sits in its thread. */
 type Addressing = Omit<OutgoingMail, 'text' | 'html' | 'attachments'>;
 
 /** The longest line written: RFC 2045 holds encoded lines to 76 characters, and headers fold to the same. */
@@ -564,7 +557,6 @@ function addressingHeaders(mail: Addressing): string[] {
   ];
 }
 
-/** A MIME entity: its own headers, and its body as it goes on the wire. */
 interface Entity {
   readonly headers: readonly string[];
   readonly body: string;

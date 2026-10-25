@@ -44,7 +44,7 @@ export interface ArtifactsCloudflareApi {
   list(resource: string): Promise<Record<string, unknown>[]>;
 }
 
-/** Fixed-origin, bounded management calls. Raw response errors and credentials never enter diagnostics. */
+/** Raw response errors and the credential never enter diagnostics. */
 export function createArtifactsCloudflareApi(
   token: string,
   dependencies: ArtifactsCloudflareDependencies = {},
@@ -545,10 +545,10 @@ export interface ArtifactsAccessReconciliation {
   readonly operatorConfigFile: string;
   readonly accountId: string;
   readonly applicationId: string;
-  /** A callback re-reads current local admission after acquiring the shared machine lock. */
+  /** A callback is read once the machine lock is held, so it sees current local admission. */
   readonly emails: readonly string[] | (() => Promise<readonly string[]>);
 }
-/** Called outside DB transactions. Exact policy update + read verification; reductions revoke app sessions. */
+/** Call outside DB transactions. Removing an admitted email revokes the app's existing sessions. */
 export async function reconcileArtifactsAccessEmails(
   input: ArtifactsAccessReconciliation,
   dependencies: ArtifactsCloudflareDependencies = {},

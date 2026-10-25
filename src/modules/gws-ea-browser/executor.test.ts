@@ -78,7 +78,7 @@ it('returns screenshots in a top-level image envelope linked to their action, wh
   expect(screenshots).toBe(2);
 });
 
-describe("the assistant's own address in a site field (KTD14, R23)", () => {
+describe("the assistant's own address in a site field", () => {
   const opened = new Error('The batch opened its page');
   const context = {
     page: async () => {

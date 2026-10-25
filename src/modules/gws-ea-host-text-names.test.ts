@@ -1,5 +1,5 @@
 /**
- * Host text names only what its reader has (R27, KTD19). GWS-EA's host
+ * Host text names only what its reader has. GWS-EA's host
  * modules write the tool answers, refusals, notes and notices agents read. A
  * text that names a tool, a gog command or an `ncl` command its reader does
  * not hold sends that reader down a path that fails, so every prose string and
@@ -27,7 +27,7 @@
  * configures a group, so its names must exist, but no reader is checked.
  *
  * Resident guidance and instruction Markdown also names only `ncl` commands
- * every listed reader can use (R22 / KTD14). Its other names are not scanned:
+ * every listed reader can use. Its other names are not scanned:
  * a backticked `browser` may name the destination rather than the browser tool.
  *
  * What it cannot see: a tool named in plain words ("the Google tool"); a real

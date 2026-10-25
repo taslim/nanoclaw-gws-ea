@@ -1,7 +1,7 @@
 /**
- * The status and reason codes a browser request's answer may carry, as the host's evidence records them (KTD18).
- * Anything else in an answer is page or merchant text, and evidence never exports it. Each outcome the browser
- * agent's tools name is one of these; the agent-runner's tests read this list, so it stays free of imports.
+ * The status and reason codes a browser request's answer may carry, as the host's evidence records them. Anything
+ * else in an answer is page or merchant text, and evidence never exports it. Each outcome the browser agent's tools
+ * name is one of these; the agent-runner's tests read this list, so it stays free of imports.
  */
 export const OPERATIONAL_CODES: ReadonlySet<string> = new Set([
   // A batch and its actions.

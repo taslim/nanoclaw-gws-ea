@@ -41,7 +41,7 @@ export async function prepareAuthenticationIsolation(
   await registered;
 }
 
-/** The exact-node handoff selector registered for a prepared context; undefined until it is prepared. */
+/** The exact-node handoff selector; undefined until `prepareAuthenticationIsolation` ran for the context. */
 export function isolationSelector(context: BrowserContext): Promise<string> | undefined {
   return contextSelectors.get(context);
 }
@@ -70,7 +70,7 @@ export interface NativeFieldFacts {
   readonly: boolean;
   disabled: boolean;
 }
-/** A credential-form node as the isolated world reads it: the node itself, its form if any, and any submitter override. */
+/** As the isolated world reads a credential-form node; `override` holds the submitter's own form attributes. */
 export interface NativeCredentialFacts {
   origin: string;
   tag: string;
@@ -78,7 +78,7 @@ export interface NativeCredentialFacts {
   name: string;
   type: string;
   autocomplete: string;
-  /** The site marks the node required (`required` or `aria-required`), as read in the isolated world. */
+  /** `required` or `aria-required`. */
   required: boolean;
   override: { action: string; method: string; target: string } | null;
   form: { action: string; method: string; target: string; fields: NativeFieldFacts[] } | null;
@@ -190,9 +190,10 @@ async function withBoundNodes<T>(
   }
 }
 
-/** The value is a protocol argument, never executable source or a Playwright call-log argument.
- * Node, document, origin and form validation and the native setter run atomically in the isolated world.
- * Ambient focus is irrelevant: another frame cannot redirect this write.
+/**
+ * The value is a protocol argument, never executable source or a Playwright call-log argument. Node, document,
+ * origin and form validation and the native setter run atomically in the isolated world. Ambient focus is
+ * irrelevant: another frame cannot redirect this write.
  */
 export async function fillNativeAuthenticationField(
   frame: Frame,
@@ -252,7 +253,7 @@ export async function fillNativeAuthenticationField(
 export type CredentialFillResult = 'filled' | 'not_inserted' | 'changed';
 export type CredentialActivationResult = 'activated' | 'disabled' | 'changed' | 'uncertain';
 
-/** The credential group the browser chose: its fields, in value order, and the control that activates them. */
+/** The credential group the browser chose; `fields` are in the order of the values filled into them. */
 export interface NativeCredentialGroup {
   readonly fields: readonly NativeCredentialBinding[];
   readonly control: NativeCredentialBinding;
@@ -318,7 +319,7 @@ function credentialNodes(group: NativeCredentialGroup): number[] | undefined {
  * and form are revalidated and every value is set through the native setter
  * in one synchronous renderer call, before any page callback can run. Only
  * then are input and change events dispatched, so controlled (JS) forms see
- * the values; their callbacks may run arbitrary site code (KTD7). Focus is
+ * the values; their callbacks may run arbitrary site code. Focus is
  * irrelevant throughout. `not_inserted` means nothing reached the page.
  */
 export async function fillNativeCredentialGroup(

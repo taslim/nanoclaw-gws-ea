@@ -1,24 +1,21 @@
 /**
  * Notes the host writes for `main`, into its shared session, routed to the
- * principal's direct message so main's answer reaches the principal. The
- * inbox, the meetings, the bridge and the failure notices each write theirs
- * through here.
+ * principal's direct message so main's answer reaches the principal.
  *
- * A note names the pieces of work it is about (KTD11). Each open matter they
- * sit in comes with it, rendered live once however many of its pieces the
- * note names, and stamped with when its links were read, and so does each
- * matter it names by id. A new piece in no open matter (an invitation, a
- * share or a comment) brings instead the open matters it may belong to
- * (KTD10). Both are best effort: what cannot be read is left out, and the
- * note is written all the same.
+ * A note names the pieces of work it is about. Each open matter they sit in
+ * comes with it, rendered live once however many of its pieces the note
+ * names, and stamped with when its links were read, and so does each matter
+ * it names by id. A new piece in no open matter brings instead the open
+ * matters it may belong to. Both are best effort: what cannot be read is left
+ * out, and the note is written all the same.
  *
  * The note keeps the pieces and matters it names beside its words, for the
  * host alone: main reads only the words. A turn that fails reading the note
- * names them again (`noteNames`, KTD12).
+ * names them again (`noteNames`).
  *
- * Importing it loads no module entry point but the shared Google helpers'
- * (gws-ea-google), which load before every module that writes a note, so it
- * never reorders the registrations a module's `index.ts` makes.
+ * Importing it loads no GWS-EA module entry point but gws-ea-google's, which
+ * loads before every module that writes a note, so it never reorders the
+ * registrations a module's `index.ts` makes.
  */
 import { createHash } from 'node:crypto';
 
@@ -50,14 +47,14 @@ import { hostSources, type Lens } from '../gws-ea-matters/live.js';
 import { principalLens, renderMatter } from '../gws-ea-matters/render.js';
 import { getMainAgentGroupId, principalContact } from './db.js';
 
-/** A piece of work a note is about, by the id its writer holds (KTD11). */
+/** A piece of work a note is about, by the id its writer holds. */
 export interface NotePiece {
   readonly kind: PieceKind;
   readonly reference: string;
   /**
-   * Set when the note brings it new: an invitation, a share or a comment. In
-   * no open matter, the note carries the open matters it may belong to
-   * (KTD10), suggested only from whom Google verified it came from.
+   * Set when the note brings the piece new. In no open matter, the note
+   * carries the open matters it may belong to, and only when Google names
+   * who it came from.
    */
   readonly arrival?: Omit<NewPiece, 'kind' | 'reference'>;
 }
@@ -66,7 +63,6 @@ export interface NoteForMain {
   /** The message id; one derived from what the note reports makes writing it again a no-op. */
   readonly id: string;
   readonly timestamp: string;
-  /** The one plain explanation main reads. */
   readonly text: string;
   /** Whether main takes a turn now; otherwise the note waits for its next one. */
   readonly wake: boolean;
@@ -78,13 +74,11 @@ export interface NoteForMain {
   readonly matters?: readonly string[];
 }
 
-/** What a note records it is about. */
 export interface NoteNames {
   readonly pieces: readonly NotePiece[];
   readonly matters: readonly string[];
 }
 
-/** Nobody to write to: no main yet, or no principal direct message. */
 export type NoMainConversation = 'no-main' | 'no-principal';
 
 /** `already-written`: a note with this id is in main's session. */
@@ -97,8 +91,7 @@ export interface MainConversation {
 }
 
 /**
- * main's one shared conversation with the principal, where every note is
- * written and every look and the daily sync come back; its session is created
+ * main's one shared conversation with the principal; its session is created
  * the first time. Until the profile names main and the principal has a
  * direct message, which of the two is missing.
  */
@@ -112,7 +105,6 @@ export async function resolveMainConversation(): Promise<MainConversation | NoMa
   return { session, directMessage };
 }
 
-/** A write refused because a message with that id is already in the session. */
 export function isDuplicateNote(error: unknown): boolean {
   return isUniqueViolation(error) && error instanceof Error && /messages_in\.id\b/iu.test(error.message);
 }
@@ -144,7 +136,7 @@ const PIECE_WORDS: Readonly<Record<PieceKind, string>> = {
   job: 'Browser job',
 };
 
-/** `work`'s answer, or `fallback` once why it failed is logged: a note never waits on what it carries beside its text. */
+/** A note never waits on what it carries beside its text: a failure is logged and yields `fallback`. */
 async function bestEffort<T>(what: string, work: () => Promise<T>, fallback: T): Promise<T> {
   /* eslint-disable no-catch-all/no-catch-all -- a note is written without what could not be read, never held back by it */
   try {
@@ -158,27 +150,23 @@ async function bestEffort<T>(what: string, work: () => Promise<T>, fallback: T):
   /* eslint-enable no-catch-all/no-catch-all */
 }
 
-/** Run `read` once, on first use, however many of a note's parts ask for its result. */
 function once<T>(read: () => Promise<T>): () => Promise<T> {
   let result: Promise<T> | undefined;
   return () => (result ??= read());
 }
 
-/** A matter rendered live through the note's lens, or nothing once it is gone. */
 async function matterView(id: string, lens: () => Promise<Lens>): Promise<string[]> {
   const matter = await getMatter(id);
   return matter === undefined ? [] : [await renderMatter(matter, hostSources(), await lens())];
 }
 
 /**
- * What an invitation's person and organization rest on. Calendar shows the
- * organizer the invitation names, and an invitation sent as a file in an
- * email names whoever its sender chose.
+ * Calendar shows the organizer the invitation names, and an invitation sent
+ * as a file in an email names whoever its sender chose.
  */
 const NAMED_ORGANIZER =
   'The person and organization rest on the organizer the invitation names, which whoever sent it chose.';
 
-/** The open matters a new piece in none may belong to, with why; nothing when none is suggested. */
 async function suggestions(piece: NewPiece, reads: CandidateReads): Promise<string[]> {
   const candidates = await candidatesFor(piece, reads);
   if (candidates.length === 0) return [];
@@ -192,10 +180,8 @@ async function suggestions(piece: NewPiece, reads: CandidateReads): Promise<stri
 }
 
 /**
- * What a note brings with it: each open matter its pieces sit in, rendered
- * live once, in the order the note first names it, and then each matter it
- * names by id; then, for each new piece in no open matter, the open matters
- * it may belong to, when there are any.
+ * Matters in the order the note first names them, those its pieces sit in
+ * before those it names by id, then the suggestions for new pieces.
  */
 async function carried({ pieces, matters: named }: NoteNames): Promise<string[]> {
   if ((pieces.length === 0 && named.length === 0) || !(await getDb().hasTable('gws_ea_matter_links'))) return [];
@@ -225,7 +211,6 @@ async function carried({ pieces, matters: named }: NoteNames): Promise<string[]>
   return [...matters.flat(), ...suggested.flat()];
 }
 
-/** The pieces and matters a note's content records beside its words; nothing from content that records none. */
 export function noteNames(content: string): NoteNames {
   let parsed: unknown;
   try {
@@ -247,7 +232,6 @@ function isStrings(value: unknown): value is string[] {
   return Array.isArray(value) && value.every((entry: unknown) => typeof entry === 'string');
 }
 
-/** A recorded piece, or nothing for one that is not a piece's shape. */
 function notePieceOf(value: unknown): NotePiece[] {
   if (typeof value !== 'object' || value === null) return [];
   const { kind, reference, arrival } = value as Record<string, unknown>;

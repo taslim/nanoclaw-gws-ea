@@ -1,17 +1,16 @@
 /**
- * GWS-EA's work in Google Workspace (KTD2, KTD3). The host keeps the home
- * folder: one folder in the assistant's Drive, shared with every one of the
- * principal's addresses, where `main` keeps what it makes
- * (`./home-folder.ts`).
+ * GWS-EA's work in Google Workspace. The host keeps the home folder: one
+ * folder in the assistant's Drive, shared with every one of the principal's
+ * addresses, where `main` keeps what it makes (`./home-folder.ts`).
  *
  * - The host keeps it on a timer it starts without waiting on Google. The
- *   start reads only the database and the grant file, after checking both
- *   are there, and seeds the folder id spawns read; a spawn that comes
+ *   start reads only the database, once a Google sign-in is set up and the
+ *   tables exist, and seeds the folder id spawns read; a spawn that comes
  *   first reads it the same way before its environment is composed.
  * - Only the profile's `main` is told where it is, through its container's
- *   environment; `external-email` and every other group get nothing. A
- *   `main` named after the host started is told on its next spawn, and a
- *   running one by a note when the folder changes.
+ *   environment; no other group gets it. A `main` named after the host
+ *   started is told on its next spawn, and a running one by a note when the
+ *   folder changes.
  * - Drive is reached with the host's own Drive token, which never reaches a
  *   gateway or a container.
  */
@@ -33,20 +32,17 @@ import { gwsEaWorkspaceHomeFolderMigration } from './migration.js';
 
 registerMigration(gwsEaWorkspaceHomeFolderMigration);
 
-/** The container environment variable that tells `main` its home folder's Drive id. */
 export const HOME_FOLDER_ENV = 'GWS_EA_HOME_FOLDER_ID';
 
-/** How often the host reconciles the home folder. */
 const TICK_MS = 60_000;
 
 /**
- * The home folder spawns read, as the host starts and by any spawn that
- * comes first: null on a host that keeps none, and undefined until this host
- * reads it. A stopped host forgets what its start read.
+ * The folder spawns read: null on a host that keeps none, and undefined until
+ * the host's start or an earlier spawn reads it, and again once the host stops.
  */
 let home: HomeFolder | null | undefined;
 
-/** The folder as recorded, read from the database alone; null without a Google sign-in or the tables. */
+/** Reads the database alone; null without a Google sign-in setup or the tables. */
 async function loadHomeFolder(): Promise<HomeFolder | null> {
   const grantFile = googleGrantFilePath();
   if (!grantFile) return null;

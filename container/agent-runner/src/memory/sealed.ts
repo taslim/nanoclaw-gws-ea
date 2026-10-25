@@ -14,19 +14,13 @@ import {
   type MemorySessionHookRegistration,
 } from './session-hook.js';
 
-/** The host's key for a group whose sessions share context. */
 export const CONVERSATION_CONTEXT_CAPABILITY = 'conversation-context';
 
-/** Whether a group with these capabilities keeps its sessions sealed. A missing list holds nothing, so it does. */
+/** A missing capability list holds nothing, so its sessions are sealed. */
 export function sessionsSealed(capabilities: ReadonlySet<string>): boolean {
   return !capabilities.has(CONVERSATION_CONTEXT_CAPABILITY);
 }
 
-/**
- * Prepare a session's group memory, and return the memory hook its provider
- * registers: the shared tree and its hook for an unsealed session, and
- * neither for a sealed one.
- */
 export function prepareSessionMemory(sealed: boolean, baseDir?: string): MemorySessionHookRegistration {
   if (sealed) return SEALED_MEMORY_SESSION_HOOK;
   ensureMemoryScaffold(baseDir);

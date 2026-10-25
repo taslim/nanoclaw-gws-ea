@@ -33,7 +33,7 @@ import { EMAIL_PATTERN, INSTANCE_ID_PATTERN, isRecord, parseJson, requireString 
 const COMMIT_PATTERN = /^[0-9a-f]{40}$/;
 const ONECLI_PROJECT_PATTERN = /^[a-z0-9][a-z0-9_-]{0,62}$/;
 
-/** Readers keep every ownership value exact and ignore fields they do not use. */
+/** Readers ignore fields they do not use. */
 function requireString(value: unknown, label: string, maxLength?: number): string {
   return requireText(value, label, 'invalid_state', maxLength);
 }
@@ -53,11 +53,10 @@ async function pathExists(target: string): Promise<boolean> {
 }
 
 /**
- * A new instance ID whose root, `<state root>/<first 8 hex>`, is free: no
- * registered assistant has the same first eight hex
- * digits, and nothing is there yet. The ID is drawn again until one is
- * (KTD10). Checked under the machine lock; the reservation's claim on the
- * root then keeps a concurrent create from taking it too.
+ * Drawn until its root, `<state root>/<first 8 hex>`, is free: no registered
+ * assistant shares those digits and nothing is there yet. Checked under the
+ * machine lock; the reservation's claim on the root then keeps a concurrent
+ * create from taking it too.
  */
 export async function allocateInstanceId(
   paths: ControlPlanePaths,
@@ -189,7 +188,6 @@ function validateAliasEmail(value: unknown): string {
   return aliasEmail;
 }
 
-/** A release's source, track, and commit exactly as a reservation holds them; anything else raises `invalid_state`. */
 export function validateReleaseCoordinates(value: unknown): ReleaseCoordinates {
   if (!isRecord(value)) throw new GwsEaError('invalid_state', 'Release coordinates are invalid');
   const releaseTrack = requireString(value.release_track, 'release_track', 64);
@@ -276,7 +274,7 @@ export async function readRegistry(paths: ControlPlanePaths): Promise<InstanceRe
 function claimKeys(instance: InstanceReservation): string[] {
   const claims = instance.exclusive_resource_claims;
   const keys = [
-    // Two assistants never share a root (KTD10).
+    // Distinct IDs can still share a root's name, their first eight hex digits.
     `instance-root:${instanceRootName(instance.instance_id)}`,
     ...Object.values(instance.allocated_ports).map((port) => `port:${port}`),
     `gcp-project:${claims.gcp_project_id}`,
@@ -293,7 +291,6 @@ function claimKeys(instance: InstanceReservation): string[] {
   return keys;
 }
 
-/** Every mailbox the other assistants on this machine hold: their workspace emails and web aliases. */
 export function otherAssistantsMailboxes(registry: InstanceRegistry, instanceId: string): ReadonlySet<string> {
   return new Set(
     Object.values(registry.instances)
@@ -334,7 +331,7 @@ function assertNoClaimCollisions(instances: readonly InstanceReservation[]): voi
   }
 }
 
-/** Stable claims are retained on disable and cannot be silently renamed on re-enable. */
+/** The claim outlives a disable, and a re-enable must claim the same hostname, prefix and port. */
 export async function claimInstanceArtifacts(
   paths: ControlPlanePaths,
   instanceId: string,
@@ -388,11 +385,9 @@ export async function withMachineLock<T>(paths: ControlPlanePaths, callback: () 
   }
 }
 
-/** A validated reservation checked against the registry, ready to publish. */
 export interface StagedReservation {
-  /** Write the registry with the reservation added. */
   publish(): Promise<void>;
-  /** Whether the registry holds the reservation; a registry that cannot be read counts as holding it. */
+  /** A registry that cannot be read counts as holding the reservation. */
   published(): Promise<boolean>;
 }
 
@@ -468,10 +463,10 @@ export async function swapInstanceRelease(
 
 /**
  * Point one assistant's web alias claim at `aliasEmail`, or drop it when
- * undefined (KTD13). Under the machine lock, so of two assistants claiming
- * one address only the first holds it; an address another assistant holds
- * as its alias or workspace email is refused with `claim_conflict`. Nothing
- * else in the registry changes, and a claim already held writes nothing.
+ * undefined. Under the machine lock, so of two assistants claiming one
+ * address only the first holds it; an address another assistant holds as its
+ * alias or workspace email is refused with `claim_conflict`. Nothing else in
+ * the registry changes, and a claim already held writes nothing.
  */
 export async function claimInstanceAlias(
   paths: ControlPlanePaths,
@@ -500,7 +495,7 @@ export async function claimInstanceAlias(
   });
 }
 
-/** Add or release the optional account claim under the machine lock, without changing any other claim. */
+/** Undefined releases the claim; no other claim changes. */
 export async function claimInstanceWhatsApp(
   paths: ControlPlanePaths,
   instanceId: string,
@@ -566,7 +561,7 @@ function validateMarker(value: unknown): InstanceMarker {
   return { schema_version: INSTANCE_MARKER_SCHEMA_VERSION, instance_id: instanceId };
 }
 
-/** Read an instance marker; a missing file raises `marker_missing`. */
+/** A missing file raises `marker_missing`. */
 export async function readInstanceMarkerFile(file: string): Promise<InstanceMarker> {
   try {
     await assertPrivateStateFile(file);
@@ -614,7 +609,7 @@ export async function assertStateConsistent(paths: ControlPlanePaths, reservatio
   await assertStateMarker(state, reservation.instance_id);
 }
 
-/** Write the marker into the assistant's physical `state/`, creating it; one naming another assistant is refused. */
+/** Into the assistant's physical `state/`; an existing marker naming another assistant is refused. */
 export async function writeInstanceMarker(paths: ControlPlanePaths, instanceId: string): Promise<void> {
   await getInstanceReservation(paths, instanceId);
   const file = paths.markerFile(instanceId);

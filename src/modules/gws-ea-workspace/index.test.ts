@@ -1,5 +1,5 @@
 /**
- * The home folder's place in the host (KTD2, KTD3): the host starts keeping
+ * The home folder's place in the host: the host starts keeping
  * it without waiting on Google, and only the profile's `main` is told where
  * it is, a `main` named after the host started included. Google itself is
  * out of reach here: the host's Drive token is a stub that refuses.

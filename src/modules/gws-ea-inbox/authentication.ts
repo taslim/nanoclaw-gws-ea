@@ -1,8 +1,8 @@
 /**
- * Who a message is from, by Gmail's own authentication results (KTD4, R21,
- * R22). Nothing in a message's From line, display name, or body can make it
- * the principal's or give its sender an identity; only the results Gmail
- * wrote when it received the message can.
+ * Who a message is from, by Gmail's own authentication results. Nothing in a
+ * message's From line, display name, or body can make it the principal's or
+ * give its sender an identity; only the results Gmail wrote when it received
+ * the message can.
  *
  * Gmail's results are the topmost `Authentication-Results` header, inside the
  * block of trace headers Gmail prepends on delivery. A sender can write an
@@ -10,55 +10,38 @@
  * header with anything but Gmail's trace headers above it is never trusted.
  *
  * - The principal: one of their addresses, in any spelling the one rule
- *   recognizes (R1), as the single From mailbox, a `dkim=pass` from exactly
- *   the domain the From is written with, `dmarc=pass` (never
- *   `bestguesspass`), no differing Sender, and no List-Id: Gmail verified
- *   that the address's own domain sent it, whichever provider that is. The
- *   verdict names the address as the principal listed it (R2). A principal
- *   address that fails this is unauthenticated, never an ordinary sender, so
- *   it can neither instruct nor be mistaken for a counterpart.
- *   Anything the domain lets sign for it counts, a sending service included
- *   (accepted 2026-10-03 over per-domain selector pins the operator kept).
+ *   recognizes, as the single From mailbox, a `dkim=pass` from exactly the
+ *   domain the From is written with, `dmarc=pass` (never `bestguesspass`), no
+ *   differing Sender, and no List-Id: Gmail verified that the address's own
+ *   domain sent it, whichever provider that is. A principal address that
+ *   fails this is unauthenticated, never an ordinary sender, so it can
+ *   neither instruct nor be mistaken for a counterpart. Anything the domain
+ *   lets sign for it counts, a sending service included, rather than
+ *   per-domain selector pins the operator would have to keep.
  * - Google Calendar's notifications: the same rule for `google.com`.
- * - Google Docs' comment mail and Drive's share and access-request mail
- *   (KTD6): the same rule, with a DMARC pass for the sender's exact domain
- *   and a DKIM pass from `google.com` or `docs.google.com`, whichever Google
- *   signs that mail with.
+ * - Google Docs' comment mail and Drive's share and access-request mail: the
+ *   same rule, with a DMARC pass for the sender's exact domain and a DKIM
+ *   pass from `google.com` or `docs.google.com`, whichever Google signs that
+ *   mail with.
  * - Anyone else: `dmarc=pass` for the From domain, or a `dkim=pass` whose
  *   domain is aligned to it.
  *
- * Why a message is not verified is one of a fixed set of codes (KTD3); the
- * principal hears, once, of each code their own address fails with.
- *
- * Separately, `signedByGoogle` says whether Google itself signed a message
- * (KTD12): Google Calendar sends invitations and answers in the person's own
- * name, signed by google.com, so the route tells that mail apart before the
- * rule for its From applies.
+ * The principal hears, once, of each refusal code their own address fails
+ * with.
  */
 import { getDomain } from 'tldts';
 import type { PrincipalRecognizer } from '../gws-ea-profile/db.js';
 import { domainOf, headerValues, parseAddressList, type MailHeader, type Mailbox } from './mime.js';
 
 export interface AuthContext {
-  /** The principal's addresses, by the one rule that recognizes them (R1). */
   readonly principalAddresses: PrincipalRecognizer;
 }
 
 const PRINCIPAL_REFUSALS = ['no-gmail-results', 'sender-differs', 'mailing-list', 'no-own-dkim', 'no-dmarc'] as const;
 
-/**
- * Why the rule refuses mail from one of the principal's addresses (R4): no
- * results of Gmail's own at the top of the message, a differing Sender, a
- * mailing list, no DKIM pass from the From's own domain, or no DMARC pass.
- */
+/** `no-gmail-results`: none of Gmail's own results sit at the top of the message. */
 export type PrincipalRefusal = (typeof PRINCIPAL_REFUSALS)[number];
 
-/**
- * Why Gmail's results verify no one: a refusal of a principal address, or a
- * From that is not one mailbox, mail claiming one of Google's senders that
- * Google did not sign, or anyone else's mail with neither a DMARC pass nor an
- * aligned DKIM pass.
- */
 export type UnauthenticatedReason =
   | PrincipalRefusal
   | 'not-one-mailbox'
@@ -70,9 +53,9 @@ export type SenderVerdict =
   | {
       readonly kind: 'principal';
       /**
-       * The principal's address as they listed it, which the From reached
-       * (R2): the sender's identity. The From as written stays on the
-       * message, which is answered at it.
+       * The principal's address as they listed it, which the From reached:
+       * the sender's identity. The From as written stays on the message,
+       * which is answered at it.
        */
       readonly address: string;
       readonly displayName?: string;
@@ -192,7 +175,6 @@ function gmailResults(headers: readonly MailHeader[]): readonly AuthResult[] | u
   return undefined;
 }
 
-/** The one mailbox a header names; 'absent' or 'invalid' otherwise. */
 function singleMailbox(headers: readonly MailHeader[], name: string): Mailbox | 'absent' | 'invalid' {
   const values = headerValues(headers, name);
   if (values.length === 0) return 'absent';
@@ -231,7 +213,6 @@ function named(mailbox: Mailbox): { readonly displayName?: string } {
   return mailbox.displayName === undefined ? {} : { displayName: mailbox.displayName };
 }
 
-/** Decide who sent a message, from its headers alone. */
 export function authenticateSender(headers: readonly MailHeader[], context: AuthContext): SenderVerdict {
   const from = singleMailbox(headers, 'From');
   if (from === 'absent' || from === 'invalid') {
@@ -289,7 +270,6 @@ export function authenticateSender(headers: readonly MailHeader[], context: Auth
     : unauthenticated('no-aligned-pass');
 }
 
-/** One of the principal's addresses that an unverified message shows as its From, as they listed it, and why the rule refused it. */
 export interface RefusedPrincipalAddress {
   readonly address: string;
   readonly reason: PrincipalRefusal;
@@ -299,7 +279,10 @@ function isPrincipalRefusal(reason: UnauthenticatedReason): reason is PrincipalR
   return PRINCIPAL_REFUSALS.some((refusal) => refusal === reason);
 }
 
-/** The principal's address an unverified message's From reaches, and why it was refused; undefined for anyone else's. */
+/**
+ * The principal's address, as they listed it, that an unverified message's
+ * From reaches, and why it was refused; undefined for anyone else's.
+ */
 export function refusedPrincipalAddress(
   verdict: Extract<SenderVerdict, { kind: 'unauthenticated' }>,
   context: AuthContext,
@@ -310,11 +293,11 @@ export function refusedPrincipalAddress(
 
 /**
  * Whether Google itself signed the message, by Gmail's own results: a DKIM
- * pass from google.com, with no List-Id (KTD12). Google Calendar sends
- * invitations and guests' answers this way, in the person's own name, so
- * neither a DMARC pass for the From's domain nor any Sender is asked for:
- * Google's signature is what no one else can make. Only with an event link to
- * a calendar the route knows is such a message calendar mail.
+ * pass from google.com, with no List-Id. Google Calendar sends invitations
+ * and guests' answers this way, in the person's own name, so neither a DMARC
+ * pass for the From's domain nor any Sender is asked for: Google's signature
+ * is what no one else can make. Only with an event link to a calendar the
+ * route knows is such a message calendar mail.
  */
 export function signedByGoogle(headers: readonly MailHeader[]): boolean {
   const results = gmailResults(headers);

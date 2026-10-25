@@ -238,7 +238,7 @@ async function verifyArtifact(root: string, receipt: VoiceArtifactReceipt, execu
   }
 }
 
-/** Resolve verified, explicitly installed assets. Never downloads or repairs anything. */
+/** Never downloads or repairs anything: only explicitly installed assets resolve. */
 export async function verifyVoiceInstallation(installationDir: string): Promise<VerifiedVoiceInstallation> {
   if (!path.isAbsolute(installationDir))
     throw new VoiceAssetsError('invalid-assets', 'Voice installation must be absolute');

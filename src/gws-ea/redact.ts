@@ -5,10 +5,9 @@ import { isErrno } from '../community-portal/errors.js';
 import { GwsEaError } from './types.js';
 
 /**
- * Process-wide secret redaction for everything the control plane writes to a
- * log, an error, a fixture, or a diagnostic bundle. A secret learned anywhere
- * in the process is redacted everywhere in the process, so registration is
- * global rather than scoped to one run.
+ * Redaction is process-wide: a secret registered anywhere in the process is
+ * redacted everywhere in it, so registration is global rather than scoped to
+ * one run.
  */
 export const REDACTED = '[REDACTED]';
 
@@ -86,7 +85,6 @@ function redactPemBlocks(text: string): string {
   return result;
 }
 
-/** Redact registered secrets and known secret shapes from text bound for a log, error, or fixture. */
 export function redact(text: string): string {
   let result = text;
   for (const secret of secretsByLength) {
@@ -97,12 +95,10 @@ export function redact(text: string): string {
   return result;
 }
 
-/** A failure's code as gws-ea reports it: a GWS-EA error's own code, `unexpected` for anything else. */
 export function safeErrorCode(error: unknown): string {
   return error instanceof GwsEaError ? error.code : 'unexpected';
 }
 
-/** A failure's message as gws-ea reports it: only a GWS-EA error's own message, redacted, is ever shown. */
 export function safeErrorMessage(error: unknown): string {
   return error instanceof GwsEaError ? redact(error.message) : 'Unexpected control-plane failure.';
 }

@@ -53,12 +53,9 @@ export const BROWSER_CAPABILITIES: readonly string[] = [
 ];
 
 /**
- * Create the group when the profile names none, and return its ID. The
- * group, its configuration, and the pointer are written in one transaction,
- * so a host stopped part-way leaves no group the pointer misses; files the
- * template stamped before such a stop stay in a folder the next attempt does
- * not reuse. Once the profile names the assistant, the group carries that
- * name from creation. Once the pointer is recorded this changes nothing.
+ * The group, its configuration and the profile's pointer are written in one transaction, so a host stopped
+ * part-way leaves no group the pointer misses; files the template stamped before such a stop stay in a folder the
+ * next attempt does not reuse. Once the profile names the assistant, the group carries that name from creation.
  */
 export async function ensureBrowserGroup(): Promise<string> {
   const existing = await getBrowserAgentGroupId();
@@ -75,15 +72,11 @@ export async function ensureBrowserGroup(): Promise<string> {
   });
 }
 
-/** What a drift check judges beside the stored group: the session's own provider, when known. */
 export interface DriftContext {
   readonly sessionProvider?: string | null;
 }
 
-/**
- * Why `browser`, as it is stored now, may not start: one clause per
- * difference from what the host stamped. Empty when there is none.
- */
+/** Why `browser`, as stored now, may not start: one clause per difference from what the host stamped. */
 export async function browserGroupDrift(agentGroupId: string, context: DriftContext = {}): Promise<string[]> {
   const group = await getAgentGroup(agentGroupId);
   if (!group) return [`its agent group ${agentGroupId} no longer exists`];
@@ -124,10 +117,6 @@ function configurationDrift(row: ContainerConfigRow, groupName: string): string[
   return problems;
 }
 
-/**
- * Its folder holds its own template's plugin and no other, and no plugin
- * stamped a skill into the group's template-skill store.
- */
 function stampedPluginDrift(agentGroupId: string, folder: string): string[] {
   const problems: string[] = [];
   const others = directoryEntries(path.join(GROUPS_DIR, folder, 'plugins')).filter((name) => name !== BROWSER_PLUGIN);
@@ -137,7 +126,6 @@ function stampedPluginDrift(agentGroupId: string, folder: string): string[] {
   return problems;
 }
 
-/** The directories (and links) directly under `dir`; a missing directory holds none. */
 function directoryEntries(dir: string): string[] {
   if (!fs.existsSync(dir)) return [];
   return fs
@@ -147,7 +135,7 @@ function directoryEntries(dir: string): string[] {
     .sort();
 }
 
-/** A stored JSON column; one that does not parse is its own text, which counts as carrying something. */
+/** A column that does not parse is its own text, which counts as carrying something. */
 function storedJson(raw: string): unknown {
   try {
     return JSON.parse(raw) as unknown;
@@ -157,14 +145,14 @@ function storedJson(raw: string): unknown {
   }
 }
 
-/** A stored JSON object column; anything else counts as carrying something. */
+/** Anything but an object counts as carrying something. */
 function jsonRecord(raw: string): Record<string, unknown> {
   const parsed = storedJson(raw);
   if (typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)) return parsed as Record<string, unknown>;
   return { [raw]: parsed };
 }
 
-/** A stored JSON list column; anything else counts as carrying something. */
+/** Anything but a list counts as carrying something. */
 function jsonList(raw: string): unknown[] {
   const parsed = storedJson(raw);
   return Array.isArray(parsed) ? parsed : [parsed];

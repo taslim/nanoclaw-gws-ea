@@ -1,18 +1,17 @@
 /**
- * GWS-EA's matters (KTD3): what the assistant must come back to after the
- * current turn, however small (R1). Each matter holds the principal's words
- * for it, its open loop, links to where the facts live, its next look, and
- * whether it is open (R2); big projects split into strands one level deep
- * (R29, KTD13). Only `main` keeps matters, through main-only `ncl matters`
- * verbs whose answers are bare data for it, never words for the principal
- * (R6). `get` reads each link live from its source (KTD5, `render.ts`).
+ * GWS-EA's matters: what the assistant must come back to after the current
+ * turn, however small. Each matter holds the principal's words for it, its
+ * open loop, links to where the facts live, its next look, and whether it is
+ * open; big projects split into strands one level deep. Only `main` keeps
+ * matters, through main-only `ncl matters` verbs whose answers are bare data
+ * for it, never words for the principal. `get` reads each link live from its
+ * source (`render.ts`).
  *
  * A matter's next look is one scheduled task in main's conversation
- * (KTD4, `looks.ts`), the daily sync wakes main every day to look ahead and
- * read what waited for it (KTD6, `sync.ts`), and the host keeps both on time
- * without the model
- * (KTD7, `loop.ts`). Forgetting a person takes them off every matter
- * (R26, `forget.ts`).
+ * (`looks.ts`), the daily sync wakes main every day to look ahead and read
+ * what waited for it (`sync.ts`), and the host keeps both on time without the
+ * model (`loop.ts`). Forgetting a person takes them off every matter
+ * (`forget.ts`).
  */
 import { registerResource, type ColumnDef } from '../../cli/crud.js';
 import type { CallerContext } from '../../cli/frame.js';
@@ -49,7 +48,6 @@ onHostStart(async ({ signal }) => {
   void runMattersLoop(signal);
 });
 
-// A forgotten person leaves every matter, and main is asked to rewrite each one whose words may still tell of them.
 registerPersonForgetReview('gws-ea-matters:forget', mattersToRewrite);
 registerPersonForgetHook('gws-ea-matters:forget', forgetFromMatters);
 
@@ -57,7 +55,7 @@ registerPersonForgetHook('gws-ea-matters:forget', forgetFromMatters);
 // `ncl matters …` — main's read and write path.
 // ---------------------------------------------------------------------------
 
-/** The guard admits the host and any agent whose CLI scope reaches this resource; matters are the canonical main's alone. */
+/** The guard admits any agent whose CLI scope reaches this resource; matters are the canonical main's alone. */
 async function asMain<T>(ctx: CallerContext, work: () => Promise<T>): Promise<T> {
   await assertMainCaller(ctx, 'matters');
   return work();
@@ -113,7 +111,7 @@ function parentFrom(args: Record<string, unknown>): string | null | undefined {
   return value.trim() === '' ? null : value;
 }
 
-/** The next look `--look` or `--look-cron` asks for (KTD4), checked before anything is written. */
+/** Checked before anything is written. */
 async function nextLookFrom(args: Record<string, unknown>): Promise<NextLook | undefined> {
   return parseNextLook(
     { at: optionalString(args.look), cron: optionalString(args.look_cron) },

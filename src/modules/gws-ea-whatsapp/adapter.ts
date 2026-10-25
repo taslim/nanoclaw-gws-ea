@@ -72,9 +72,9 @@ export interface WhatsAppAdapterOptions {
 }
 export interface WhatsAppAdapter extends ChannelAdapter {
   openDM(handle: string): Promise<string>;
-  /** Wait for this connection attempt's socket construction, never for open. Also used after a new link record is saved. */
+  /** Resolves once this attempt's socket is constructed, not when it opens; re-reads the saved link record first. */
   reconnect(): Promise<void>;
-  /** U3 owns authorization and lifecycle; this requests the code only for a linking record. */
+  /** Authorization and the pairing lifecycle belong to `WhatsAppLinking`; this refuses unless the record is linking. */
   requestPairingCode(phoneNumber: string): Promise<string>;
   resolvePerson(jid: string, alternate?: string | null): Promise<WhatsAppPerson | undefined>;
   completeDelivery(rowId: string): void;

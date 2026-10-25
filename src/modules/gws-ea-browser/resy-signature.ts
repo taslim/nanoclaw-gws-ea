@@ -762,7 +762,7 @@ async function readPurchase(
     readSequence: state.sequence,
   };
   // No picture regions: this document holds the booking bearer the host tracks as a secret, so no picture of it
-  // is ever taken, and its card says the picture is unavailable (KTD6).
+  // is ever taken, and its card says the picture is unavailable.
   return { status: 'ready', facts, element };
 }
 function parsedPayment(value: unknown): Record<string, unknown> | undefined {

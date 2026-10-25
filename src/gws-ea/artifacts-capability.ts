@@ -791,8 +791,8 @@ export async function enableArtifactsCapability(
       await writePolicy(policyFile, enabledPolicy);
       let listening = false;
       const readinessDeadline = Date.now() + 30_000;
-      // The module recovers and binds asynchronously. Poll local readiness outside the machine lock,
-      // before ingress or connector availability can be a prerequisite for this listener.
+      // The host module binds asynchronously. Poll for its listener outside the machine lock, and before ingress
+      // opens or the connector starts, since the listener depends on neither.
       while (Date.now() < readinessDeadline) {
         if (
           availableHealth(
@@ -927,7 +927,7 @@ export async function disableArtifactsCapability(
   });
 }
 
-/** Read-only, bounded observation. Does not create, replace, reconcile, start or repair anything. */
+/** Read-only and bounded: creates, replaces, reconciles, starts and repairs nothing. */
 export async function inspectArtifactsCapability(
   paths: ControlPlanePaths,
   instanceId: string,

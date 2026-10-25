@@ -1,6 +1,5 @@
 /**
- * Email to the people on a thread, and `email_send` for both agents (KTD1,
- * KTD5, KTD9; R61, R68, R75, R76; AE63, AE65).
+ * Email to the people on a thread, and `email_send` for both agents.
  *
  * Drives the real router, delivery path, delivery actions, privacy guard,
  * thread map, and session DBs against an in-memory Gmail. Only the
@@ -39,7 +38,7 @@ vi.mock('../gws-ea-external-email/index.js', () => ({
   getExternalEmailAgentGroupId: vi.fn(async () => 'ag-external'),
 }));
 
-/** The assistant's Drive and what a signed-out visit sees, for the link check (Slice 6 KTD5). */
+/** The assistant's Drive and what a signed-out visit sees, for the link check. */
 const workspace = vi.hoisted(() => ({
   drive: undefined as unknown,
   visits: [] as string[],
@@ -607,7 +606,7 @@ afterEach(async () => {
 // ---------------------------------------------------------------------------
 
 describe("external-email's reply", () => {
-  it('goes to everyone the latest message placed, quoting it, and never touches a principal-only note (KTD5)', async () => {
+  it('goes to everyone the latest message placed, quoting it, and never touches a principal-only note', async () => {
     const { key, session } = await arrives({
       threadId: 'g-coffee',
       from: `Sam <${SAM}>`,
@@ -794,7 +793,7 @@ describe('email_send from external-email', () => {
     expect(gmail.sent).toHaveLength(1);
   });
 
-  it('sends to anyone a message put on the thread or main named, and refuses anyone else (AE63)', async () => {
+  it('sends to anyone a message put on the thread or main named, and refuses anyone else', async () => {
     const { key, session } = await arrives({ threadId: 'g-1', from: SAM, cc: [JANE], body: 'Looping in Jane.' });
     gmail.receive({ threadId: 'g-1', from: SAM, body: 'Jane dropped off this one; please keep her posted.' });
     await inbox.tick();
@@ -825,7 +824,7 @@ describe('email_send from external-email', () => {
     ['its words', { text: `Come by ${HOME} at noon.` }],
     ['its subject', { subject: 'Lunch at 12 Elm Road', text: 'See you there.' }],
     ['a link target', { text: 'Here are [directions](https://maps.example/?q=12&#32;Elm&#32;Road).' }],
-  ])('refuses a private value in %s (AE65)', async (_where, fields) => {
+  ])('refuses a private value in %s', async (_where, fields) => {
     const { session } = await handedOver([REMY]);
     const reason = refusalOf(await emailSend(session, { subject: 'Lunch', ...fields }));
     expect(reason).toMatch(/private address/u);
@@ -833,7 +832,7 @@ describe('email_send from external-email', () => {
     expect(gmail.sent).toEqual([]);
   });
 
-  it('refuses a private value in the text of a file it sends, or among the people it names (R8)', async () => {
+  it('refuses a private value in the text of a file it sends, or among the people it names', async () => {
     const { key, session } = await handedOver([REMY]);
     const directions = Buffer.from(`Parking is behind ${HOME}.`);
     await handFile(key, 'Directions.txt', directions);
@@ -897,7 +896,7 @@ describe('email_send from external-email', () => {
     expect(header(gmail.sent[0].headers, 'Subject')).toBe(`Re: Lunch at ${HOME}`);
   });
 
-  it('attaches only a file main handed over for this thread, as the host holds it (KTD9)', async () => {
+  it('attaches only a file main handed over for this thread, as the host holds it', async () => {
     const { key, session } = await handedOver([REMY]);
     const quote = Buffer.from('%PDF-1.4 the quote');
     const hostCopy = await handFile(key, 'Acme quote.pdf', quote);
@@ -964,7 +963,7 @@ describe('email_send from external-email', () => {
 });
 
 describe("main's email_send", () => {
-  it("writes to the principal in the thread main names: each forward in its own, a later outcome in its request's (KTD1)", async () => {
+  it("writes to the principal in the thread main names: each forward in its own, a later outcome in its request's", async () => {
     for (const [threadId, subject] of [
       ['g-a', 'Fwd: Quote'],
       ['g-b', 'Fwd: Dinner'],
@@ -1046,7 +1045,7 @@ describe("main's email_send", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Private values: each send judged on its own (R76)
+// Private values: each send judged on its own
 // ---------------------------------------------------------------------------
 
 describe('a private value in a reply', () => {
@@ -1150,7 +1149,7 @@ describe('every email to outsiders', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Google links (Slice 6 R4, KTD4, KTD5)
+// Google links
 // ---------------------------------------------------------------------------
 
 describe('a Google link in an email to outsiders', () => {
@@ -1285,7 +1284,7 @@ describe('a Google link in an email to outsiders', () => {
     expect(gmail.sent.map((sent) => [sent.to, sent.cc])).toEqual([[[PRINCIPAL], [SAM]]]);
   });
 
-  it('answers the principal at the Gmail spelling they wrote from, and checks no link for it (R2)', async () => {
+  it('answers the principal at the Gmail spelling they wrote from, and checks no link for it', async () => {
     await addPrincipalAddress('firstlast@gmail.com');
     const { key, session } = await arrives({
       threadId: 'g-2',

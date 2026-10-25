@@ -1,27 +1,23 @@
 /**
- * The Drive calls the host makes with its own Drive token (KTD1, KTD3): a
- * file and its access list, the permission id Drive gives an address, a
- * file's pending access requests, and its comments. No client library: each call is one
- * `fetch` with the token in its header, so the token never reaches a
- * container or an argument list. A share names one person, never a group,
- * and never asks Google to email them.
+ * The Drive calls the host makes with its own Drive token. No client library:
+ * each request is one `fetch` with the token in its header, so the token never
+ * reaches a container or an argument list. A share names one person, never a
+ * group, and never asks Google to email them.
  *
- * A leaf (KTD4): it imports only the shared Google helper, so the link
- * check and the inbox's notices can use it without loading a module's entry
- * point. Tests use a fake with the same interface (`testing/fake-drive.ts`).
+ * A leaf: it loads no module's entry point, so any module can reach Drive
+ * through it. Tests use a fake with the same interface
+ * (`testing/fake-drive.ts`).
  */
 import { isRecord } from '../../gws-ea/validation.js';
 import { GoogleApiError, googleJson, type GoogleClientOptions } from '../gws-ea-inbox/gmail-api.js';
 
 export const FOLDER_MIME_TYPE = 'application/vnd.google-apps.folder';
 
-/** A Google account as Drive names it on a file: its own address and its permission id. */
 export interface DriveUser {
   readonly emailAddress?: string;
   readonly permissionId?: string;
 }
 
-/** A file as the host reads it. */
 export interface DriveFile {
   readonly id: string;
   readonly name?: string;
@@ -29,40 +25,32 @@ export interface DriveFile {
   /** In the trash, from where it can be restored. A file deleted for good is not found at all. */
   readonly trashed?: boolean;
   readonly parents?: readonly string[];
-  /** Who owns the file; Drive shows this to anyone who can see it. */
+  /** Drive shows the owners to anyone who can see the file. */
   readonly owners?: readonly DriveUser[];
   /** Who shared the file with the assistant, when someone did. */
   readonly sharingUser?: DriveUser;
-  /** When the file was shared with the assistant. */
   readonly sharedWithMeTime?: string;
   /** Whether the assistant can change who has access; only then can it read the full access list. */
   readonly canShare?: boolean;
-  /** When anyone last changed it. */
   readonly modifiedTime?: string;
-  /** Who last changed it. */
   readonly lastModifyingUser?: DriveUser;
 }
 
-/**
- * A comment on a file, as the host reads it. Drive never says who wrote a
- * comment by address, so the host never names them.
- */
+/** Drive never says who wrote a comment by address, so the host never names them. */
 export interface DriveComment {
   readonly id: string;
-  /** Its words: someone else's text. */
+  /** Someone else's text. */
   readonly content?: string;
   readonly htmlContent?: string;
   /** The original text quoted by the comment, which can differ from the current document. */
   readonly quotedFileContent?: { readonly mimeType?: string; readonly value?: string };
   /** Non-deleted replies, whose contents become readable with a new file share too. */
   readonly replies?: readonly { readonly content?: string; readonly htmlContent?: string }[];
-  /** Resolved by one of its replies. */
   readonly resolved?: boolean;
   /** When it or any of its replies last changed. */
   readonly modifiedTime?: string;
   /** Who it is assigned to, as an action item. */
   readonly assigneeEmailAddress?: string;
-  /** Everyone it mentions. */
   readonly mentionedEmailAddresses?: readonly string[];
 }
 
@@ -71,11 +59,9 @@ export interface DrivePermissionDetail {
   readonly permissionType?: string;
   readonly role?: string;
   readonly inherited?: boolean;
-  /** The folder the access is inherited from. */
   readonly inheritedFrom?: string;
 }
 
-/** One entry on a file's access list. */
 export interface DrivePermission {
   /** For a person, the same id on every file: the id `permissionId` gives their address. */
   readonly id: string;
@@ -92,7 +78,6 @@ export interface DrivePermission {
   readonly permissionDetails?: readonly DrivePermissionDetail[];
 }
 
-/** The access a host share gives. */
 export type ShareRole = 'reader' | 'commenter' | 'writer';
 
 /** Someone's request for access to a file, waiting for an approver. */
@@ -117,15 +102,10 @@ export interface DriveApi {
     readonly mimeType: string;
     readonly parents?: readonly string[];
   }): Promise<DriveFile>;
-  /** Rename a file, or move it to the trash and back. */
   updateFile(fileId: string, changes: { readonly name?: string; readonly trashed?: boolean }): Promise<DriveFile>;
   /** Everyone with access to a file, access inherited from a folder above it included. */
   listPermissions(fileId: string): Promise<DrivePermission[]>;
-  /**
-   * Share a file with one person, without Google emailing them. When Google
-   * will not share with that address, the error is a share refusal
-   * (`isShareRefusal`).
-   */
+  /** Shares without Google emailing them; a share Google will not make throws a share refusal (`isShareRefusal`). */
   createPermission(
     fileId: string,
     input: { readonly emailAddress: string; readonly role: ShareRole },
@@ -136,7 +116,7 @@ export interface DriveApi {
   permissionId(emailAddress: string): Promise<string | undefined>;
   /** A file's pending requests for access; only someone who can share the file sees them. */
   listAccessProposals(fileId: string): Promise<DriveAccessProposal[]>;
-  /** A file's comments, resolved or not, oldest first; never deleted ones. */
+  /** Resolved or not; never deleted ones. */
   listComments(fileId: string): Promise<DriveComment[]>;
 }
 
@@ -148,7 +128,6 @@ const RATE_LIMITS: ReadonlySet<string> = new Set([
   'dailyLimitExceeded',
 ]);
 
-/** Whether Drive refused a call only to ask the caller to slow down: a 403 naming a rate limit. */
 export function isDriveRateLimit(error: unknown): boolean {
   return error instanceof GoogleApiError && error.status === 403 && RATE_LIMITS.has(error.reason ?? '');
 }
@@ -222,7 +201,6 @@ function toDetail(value: unknown): DrivePermissionDetail[] {
   ];
 }
 
-/** An access-list entry, or undefined for one without the id, type and role every entry has. */
 function toPermission(value: unknown): DrivePermission | undefined {
   if (
     !isRecord(value) ||
@@ -312,7 +290,7 @@ const COMMENT_FIELDS =
   'id,content,htmlContent,quotedFileContent(mimeType,value),replies(content,htmlContent,deleted),resolved,modifiedTime,assigneeEmailAddress,mentionedEmailAddresses';
 const PERMISSION_FIELDS =
   'id,type,role,emailAddress,domain,deleted,expirationTime,view,permissionDetails(permissionType,role,inherited,inheritedFrom)';
-/** Pages read before a list is refused as too long: an access list and its requests are short. */
+/** Pages, of up to 100 items each, read before a listing is refused as too long. */
 const MAX_PAGES = 20;
 
 function fileUrl(fileId: string, path = '', params: Record<string, string> = {}): string {
@@ -320,7 +298,6 @@ function fileUrl(fileId: string, path = '', params: Record<string, string> = {})
   return `${DRIVE}/files/${encodeURIComponent(fileId)}${path}?${search.toString()}`;
 }
 
-/** Every page of a listing, each item read by `read`; `key` names the page's array. */
 async function listPages<T>(
   options: GoogleClientOptions,
   url: (pageToken: string | undefined) => string,
@@ -354,7 +331,6 @@ export async function generateDriveFileId(options: GoogleClientOptions): Promise
   return payload.ids[0];
 }
 
-/** The real client, over Drive's REST API. */
 export function createDriveApi(options: GoogleClientOptions): DriveApi {
   return {
     async getFile(fileId) {

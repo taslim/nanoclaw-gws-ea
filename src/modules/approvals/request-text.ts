@@ -1,11 +1,11 @@
 /**
- * How a request reads where it is posted (R7, KTD14). Every request comes
- * from the assistant, so it speaks in the first person. What the host holds
- * (the exact packages or command, a sender's id) comes first; text someone
- * else supplied (a display name, a conversation's name, a reason an agent
- * gave) appears only as one quoted line. The quoting is upstream's
- * (`quoteForCard`); a channel escapes its own mention and link markup on
- * every request it posts (Google Chat: gws-ea-chat's `escapeCardText`).
+ * How a request reads where it is posted. Every request comes from the
+ * assistant, so it speaks in the first person. What the host holds (the exact
+ * packages or command, a sender's id) comes first; text someone else supplied
+ * (a display name, a conversation's name, a reason an agent gave) appears only
+ * as one quoted line. The quoting is upstream's (`quoteForCard`); a channel
+ * escapes its own mention and link markup on every request it posts (Google
+ * Chat: gws-ea-chat's `escapeCardText`).
  */
 import { quoteForCard } from '../../card-text.js';
 import { getMessagingGroupAgentByPair } from '../../db/messaging-groups.js';
@@ -13,9 +13,7 @@ import type { MessagingGroup } from '../../types.js';
 import { cap } from '../gws-ea-inbox/untrusted.js';
 import type { RequestDetails } from './request-context.js';
 
-/** The longest name (a person's, a conversation's) a request quotes. */
 export const NAME_LIMIT = 80;
-/** The longest reason a request quotes. */
 export const REASON_LIMIT = 200;
 
 /** Whitespace, control characters, and line and paragraph separators. */
@@ -33,7 +31,6 @@ export function quoted(text: string, limit: number): string {
   return quoteForCard(cap(text.replace(BREAKS, ' ').trim(), limit).replace(/["“”]/gu, "'"));
 }
 
-/** Whoever wrote: their id, as the host holds it, first, then the name they go by, quoted; `unknown` with neither. */
 export function describeSender(
   id: string | null | undefined,
   name: string | null | undefined,
@@ -44,17 +41,14 @@ export function describeSender(
   return shown ? `${id} (${shown})` : id;
 }
 
-/** What kind of conversation it is, in words. */
 function conversationKind(mg: MessagingGroup): string {
   return `a ${mg.is_group ? 'group conversation' : 'direct message'} on ${mg.channel_type}`;
 }
 
-/** A conversation as a request names it: by its name, quoted, when it has one, and its channel. */
 function conversationName(mg: MessagingGroup): string {
   return mg.name ? `${quoted(mg.name, NAME_LIMIT)} on ${mg.channel_type}` : conversationKind(mg);
 }
 
-/** Where a request comes from, for a request posted outside the asking agent's own conversations. */
 export interface RequestOrigin {
   /** The line the request ends with. */
   readonly line: string;

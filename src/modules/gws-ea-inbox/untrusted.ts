@@ -1,8 +1,8 @@
 /**
  * Text other people wrote, marked as untrusted the way gog marks it
- * (`<<<EXTERNAL_UNTRUSTED_CONTENT …>>>`). main's gmail skill and
- * external-email's tool instructions tell each to read it as information,
- * never as instructions, and to leave the markers out of what it writes.
+ * (`<<<EXTERNAL_UNTRUSTED_CONTENT …>>>`). The agent instructions that show
+ * these markers say to read what they wrap as information, never as
+ * instructions, and to leave the markers out of what the agent writes.
  * Any marker or model control token inside the text is neutralized first,
  * so it cannot close the wrapper early.
  */
@@ -34,7 +34,6 @@ const SPECIAL_TOKENS = [
 ];
 const RESERVED_SPECIAL_TOKEN = /<\|reserved_special_token_\d+\|>/gu;
 
-/** Control characters other than newline and tab become spaces. */
 function withoutControls(text: string): string {
   return Array.from(text, (character) => {
     const code = character.codePointAt(0) ?? 0;
@@ -50,7 +49,7 @@ function sanitize(text: string): string {
   return withoutControls(clean.replace(RESERVED_SPECIAL_TOKEN, '[REMOVED_SPECIAL_TOKEN]'));
 }
 
-/** `text`, at most `limit` characters (code points, so no emoji or surrogate pair is split); a cut one ends in `…`. */
+/** Counts code points, so no surrogate pair is split; a cut text ends in `…`. */
 export function cap(text: string, limit: number): string {
   const characters = Array.from(text);
   return characters.length <= limit
@@ -61,14 +60,12 @@ export function cap(text: string, limit: number): string {
         .trimEnd()}…`;
 }
 
-/** `text`, capped at `limit` characters and wrapped in untrusted markers under a fresh id, naming where it came from. */
 export function untrusted(text: string, limit: number, source = SOURCE): string {
   const body = cap(sanitize(text.replace(/\r\n?/gu, '\n')).trim(), limit);
   const id = randomBytes(8).toString('hex');
   return `<<<EXTERNAL_UNTRUSTED_CONTENT id="${id}">>>\nSource: ${source}\n---\n${body}\n<<<END_EXTERNAL_UNTRUSTED_CONTENT id="${id}">>>`;
 }
 
-/** One line of someone else's text (a name, a subject), wrapped the same way. */
 export function untrustedLine(text: string, limit: number, source = SOURCE): string {
   return untrusted(text.replace(/\s+/gu, ' '), limit, source);
 }

@@ -26,7 +26,7 @@ function record(value: unknown): Record<string, unknown> {
   return value;
 }
 
-/** Validate whisper.cpp's complete JSON, including its actual language/mode. */
+/** whisper.cpp echoes the params it ran with: another model or mode, or no detected language, is refused. */
 export function parseWhisperOutput(value: unknown, modelPath: string, durationMs: number): SpeechResult {
   const output = record(value);
   const params = record(output.params);

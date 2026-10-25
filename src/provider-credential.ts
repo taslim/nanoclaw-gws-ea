@@ -1,4 +1,4 @@
-/** Provider-owned credential description shared by setup and vault importers. */
+/** As its provider declares it: `value` is the secret; the rest names it and says how a gateway injects it. */
 export interface ProviderCredential {
   readonly name: string;
   readonly type: string;

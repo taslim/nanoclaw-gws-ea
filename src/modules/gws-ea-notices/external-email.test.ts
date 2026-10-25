@@ -1,5 +1,5 @@
 /**
- * external-email's failures reach main (R38: quiet never hides a problem).
+ * external-email's failures reach main: quiet never hides a problem.
  * When delivery gives up on an email it wrote, the host gives up on what
  * arrived in its thread, or its work on a thread fails, main hears one fact
  * naming who the conversation is with and the thread, and decides what the
@@ -488,7 +488,7 @@ describe('a failed turn in a thread', () => {
     expect(mainWakes()).toBe(2);
   });
 
-  it('carries the open matter the thread sits in (Slice 5 R11)', async () => {
+  it('carries the open matter the thread sits in', async () => {
     const { key, session } = await emailThread();
     const { matter } = await openMatter({
       title: 'Acme renewal',

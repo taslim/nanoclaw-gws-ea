@@ -30,7 +30,7 @@ registerWiringAdmissionPolicy('gws-ea-browser:errands-only', async ({ proposed }
     throw new Error('browser takes work only in a delegated errand, without a channel wiring');
 });
 
-// Browser addresses every agent with browser access, but each errand answers only the agent that opened it (R28).
+// Browser addresses every agent with browser access, but each errand answers only the agent that opened it.
 registerA2aRoutePolicy('gws-ea-browser:errand-reports', async ({ session, targetAgentGroupId }) => {
   if (!(await getDb().hasTable('gws_ea_profile')) || session.agent_group_id !== (await getBrowserAgentGroupId()))
     return undefined;

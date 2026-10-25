@@ -1,11 +1,11 @@
 /**
- * The host's guarantees for matters (KTD7, R13, R14, R16, R24): a pass every
- * minute, without the model, that keeps time for main.
+ * The host's guarantees for matters: a pass every minute, without the model,
+ * that keeps time for main.
  *
  * 1. The daily sync exists, at its time (`sync.ts`).
  * 2. Every open matter has a look still to come. One left without, because
  *    its look ran and no new one was set, or was cancelled, paused or lost,
- *    gets one at the next sync, named as handed back (R14).
+ *    gets one at the next sync, named as handed back.
  * 3. A repeating look whose latest run failed comes back at the next sync
  *    instead of at its next date, which its cron keeps: a failed birthday
  *    look comes back the next day, not next year. Its next occurrence is
@@ -13,9 +13,9 @@
  *    every reader of a series sees.
  * 4. Any other look task naming a matter is cancelled, so an open matter has
  *    one look and a closed one none.
- * 5. Threads still waiting to be placed ride on main's next turn of any kind
- *    (R27): one note that wakes nothing names them all, written once no
- *    earlier note asking main to place them is still to be read.
+ * 5. Threads still waiting to be placed ride on main's next turn of any kind:
+ *    one note that wakes nothing names them all, written unless each one's
+ *    last note asking main to place it is still to be read.
  *
  * Steps 2 and 3 wait while any of main's containers runs, so they never race
  * a turn that is about to set the look itself.
@@ -44,7 +44,6 @@ import {
 import { keepSync, unplacedThreadLine } from './sync.js';
 import { principalTimezone } from './render.js';
 
-/** How often the host makes its pass. */
 const PASS_MS = 60_000;
 const DAY_MS = 24 * 60 * 60 * 1000;
 
@@ -90,7 +89,6 @@ async function bringFailedRepeatsForward(sync: string, slots: readonly HeldSlot[
     const failed =
       (await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) =>
         repeats.filter(({ slot, key, processAfter }) => {
-          // A failed script shows in the series' runs; a failed turn, which the runner settles as done, only in the mark.
           const failed = slot.look_failed_at !== null || mailbox.trailingFailedRuns(key) > 0;
           if (failed && Date.parse(processAfter) - Date.parse(sync) > DAY_MS) {
             mailbox.updateTask(key, { processAfter: sync });
@@ -157,7 +155,7 @@ async function remindOfUnplacedThreads(conversation: Session): Promise<void> {
   }
 }
 
-/** One pass of the host's guarantees. Nothing to keep until main and the principal's conversation exist. */
+/** Nothing to keep until main and the principal's conversation exist. */
 export function keepMattersOnTime(): Promise<void> {
   return oneAtATime(async () => {
     const conversation = await mainConversation();
@@ -175,7 +173,6 @@ export function keepMattersOnTime(): Promise<void> {
   });
 }
 
-/** Keep matters on time until `signal` aborts: a pass now, then one a minute. */
 export async function runMattersLoop(signal: AbortSignal): Promise<void> {
   while (!signal.aborted) {
     /* eslint-disable no-catch-all/no-catch-all -- a background loop: every failure is logged and the next pass tries again */

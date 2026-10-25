@@ -180,8 +180,8 @@ export async function captureElementRole(element: ElementHandle): Promise<Browse
   throw new BrowserLocatorError('No accessible press role for this element');
 }
 /**
- * Reuses native names from the current core observation, with the freshly read control label as a candidate.
- * Every candidate must match this exact element through Playwright's native role/name locator. A second aria
+ * Reuses native names from the current core observation, with the freshly read control label as a candidate. A
+ * candidate is used only when Playwright's native role/name locator matches this exact element. A second aria
  * snapshot would replace Playwright's model ref map without advancing the observation generation.
  */
 export async function captureElementLocator(
@@ -196,7 +196,7 @@ export async function captureElementLocator(
   if (label) candidates.push({ role, name: label, children: [] });
   return captureLocator({ element, frame }, candidates);
 }
-/** The element a structured locator names, as a Playwright locator: its frames and its matches' count unchanged. */
+/** Refuses when its frames or its matches' count differ from those captured. */
 export async function locateStructured(
   page: Page,
   target: StructuredBrowserLocator,

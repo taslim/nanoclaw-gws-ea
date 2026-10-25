@@ -1,23 +1,22 @@
 /**
- * Where the host finds the assistant's Chat delivery (KTD3, KTD6): the
- * owner-only file holding the subscriber account's key, and the assistant's
- * Google Cloud project. The topic Google Chat publishes to and the pull
- * subscription the host reads are named from the project (gcp-identity.ts),
- * so nothing else is configured.
+ * Where the host finds the assistant's Chat delivery: the owner-only file
+ * holding the subscriber account's JSON key, and the assistant's Google Cloud
+ * project. The topic Google Chat publishes to and the pull subscription the
+ * host reads are named from the project (gcp-identity.ts), so nothing else is
+ * configured.
  *
  * gws-ea sets both keys in the host's environment, as it does the grant
- * file's; a hand-run host may set them in its `.env`. A host with neither has
- * no Chat delivery. The key itself never reaches the environment, a
- * container, or an argument list: only its path does.
+ * file's; a hand-run host may set them in its `.env`. The key itself never
+ * reaches the environment, a container, or an argument list: only its path
+ * does.
  *
- * A leaf: it loads no module, so the control plane can import the key names.
+ * Keep this free of Chat and host-runtime imports: the control plane imports
+ * the key names.
  */
 import { readEnvFile } from '../../env.js';
 import { deriveGchatEventsSubscription, deriveGchatEventsTopic } from '../../gws-ea/gcp-identity.js';
 
-/** The path of the owner-only file holding the subscriber account's JSON key. */
 export const GCHAT_SUBSCRIBER_KEY_FILE_ENV = 'GWS_EA_CHAT_SUBSCRIBER_KEY_FILE';
-/** The assistant's Google Cloud project, which holds the topic and the pull subscription. */
 export const GCHAT_PROJECT_ID_ENV = 'GWS_EA_GCP_PROJECT_ID';
 
 export interface ChatDeliveryConfig {
@@ -32,10 +31,7 @@ function configured(key: string): string | undefined {
   return process.env[key]?.trim() || readEnvFile([key])[key]?.trim() || undefined;
 }
 
-/**
- * This host's Chat delivery, or undefined when it has none. Only one of the
- * two keys set is a broken install, refused naming the missing key.
- */
+/** Undefined when neither key is set; throws when only one is. */
 export function readChatDeliveryConfig(): ChatDeliveryConfig | undefined {
   const subscriberKeyFile = configured(GCHAT_SUBSCRIBER_KEY_FILE_ENV);
   const projectId = configured(GCHAT_PROJECT_ID_ENV);

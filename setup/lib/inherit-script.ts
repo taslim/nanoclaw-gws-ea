@@ -17,7 +17,7 @@ const INTERACTIVE_ENVIRONMENT_KEYS = [
 ] as const;
 
 export interface InheritScriptOptions {
-  /** Route interactive child output beside the managed result; other setup callers retain inherited stdout. */
+  /** The child's stdout; unset, it inherits ours. Lets a caller keep its own stdout for a machine-read result. */
   readonly output?: NodeJS.WriteStream;
   readonly env?: Readonly<Record<string, string>>;
 }

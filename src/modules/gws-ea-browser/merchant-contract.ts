@@ -11,7 +11,7 @@ export interface CheckoutRegions {
   readonly total?: CheckoutBox;
   readonly control: CheckoutBox;
 }
-/** What a paid checkout with no saved payment method reports (R12): never anything typed into it. */
+/** What a paid checkout with no saved payment method reports: never anything typed into it. */
 export interface CardNeeded {
   readonly site: string;
   readonly account?: string;
@@ -20,8 +20,8 @@ export interface CardNeeded {
 }
 
 /**
- * A checkout as a signature reads it. `free` and `card_needed` are the generic signature's (KTD3, KTD5);
- * `facts_incomplete` names what could not be read, as does a reviewed flow whose page no longer matches it.
+ * `free` and `card_needed` come only from the generic signature; `facts_incomplete` names what could not be read,
+ * as does a reviewed flow whose page no longer matches it.
  */
 export type MerchantCheckoutRead =
   | { status: 'ready'; facts: PurchaseFacts; element: ElementHandle; regions?: CheckoutRegions }
@@ -32,7 +32,7 @@ export type MerchantCheckoutRead =
 
 /**
  * What a reviewed flow answers for a page it no longer matches: it fails closed, naming what was missing in words
- * main can pass to the principal.
+ * the delegating agent can pass to the principal.
  */
 export const REVIEWED_CHECKOUT_MISSING: MerchantCheckoutRead = {
   status: 'facts_incomplete',
@@ -92,7 +92,7 @@ export interface MerchantSignature extends ReviewedMerchantFlow {
   waitForResult(page: Page, timeoutMs: number): Promise<void>;
   /**
    * The merchant's own evidence of a purchase on the page. `attempted` names the attempt it must prove, which
-   * the generic signature reads a confirmation against (KTD8); a reviewed one reads its own record.
+   * the generic signature reads a confirmation against; a reviewed one reads its own record.
    */
   readEvidence(page: Page, attempted?: PurchaseFacts): Promise<MerchantPurchaseEvidence | undefined>;
   readAvailability?(page: Page, expected: { venueId: string; partySize: number }): Promise<ReservationAvailability>;

@@ -45,7 +45,7 @@ export async function withinBrowserRecordingBudget<T>(
   return withinTime(work(), budget).catch(() => undefined);
 }
 
-/** No page read and no executable invented checkpoint. The committed incomplete row survives a crash. */
+/** Reads no page. Its placeholder has no checkpoint and is marked incomplete, so no recipe saves a crashed step. */
 export async function reserveBrowserActionTrace(
   db: DbDriver,
   jobId: string,

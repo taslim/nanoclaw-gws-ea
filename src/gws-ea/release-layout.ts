@@ -1,6 +1,6 @@
 /**
  * An assistant's releases and its state, laid out so that switching releases
- * never moves or copies state (KTD1, design C). Under the instance root:
+ * never moves or copies state. Under the instance root:
  *
  *   nanoclaw -> 0123abcd   the live release: a relative link, the one path the
  *                          service definition names and NanoClaw runs from;
@@ -59,10 +59,9 @@ import { writePrivate } from '../community-portal/private-file.js';
 import { GwsEaError } from './types.js';
 import { canonicalTimestamp, isRecord } from './validation.js';
 
-/** NanoClaw's state roots, each reached from a release through `../state/<root>`; `.env` is the one file. */
+/** `.env` is a file; the other state roots are directories. */
 export const STATE_ROOTS = ['.env', 'data', 'groups', 'store'] as const;
 
-/** Every link a release holds, and the one target each may have. */
 const RELEASE_LINKS: ReadonlyMap<string, string> = new Map([
   ...STATE_ROOTS.map((root): [string, string] => [root, path.join('..', 'state', root)]),
   ['logs', path.join('..', 'logs')],
@@ -72,26 +71,21 @@ const RELEASE_NAME = /^[0-9a-f]{8}$/u;
 const COMMIT = /^[0-9a-f]{40}$/u;
 /** An operation's name: its start time, compact (`20261009T101500123Z`), so names sort by when operations began. */
 const OPERATION_NAME = /^\d{8}T\d{9}Z$/u;
-/** The file a release's receipt is: written last, so a release without it is incomplete. */
 const RECEIPT = 'release-preflight.json';
 const SNAPSHOT_RECORD = 'snapshot.json';
 const RETURNED = '-returned';
 
 export interface InstanceLayout {
   readonly root: string;
-  /** The live link, `<root>/nanoclaw`. */
+  /** The live link. */
   readonly current: string;
   readonly state: string;
   readonly logs: string;
-  /** `<root>/<name>`: one release's checkout. */
   release(name: string): string;
-  /** `<root>/kept/<name>`: what is kept with release `name` besides its checkout. */
   kept(name: string): string;
-  /** Release `name`'s receipt in `kept/<name>/`, written last: the release is complete once it exists. */
+  /** Written last: the release is complete once it exists. */
   receipt(name: string): string;
-  /** `<root>/snapshots/<op>`: the copy of `state/` operation `op` took while fenced. */
   snapshot(op: string): string;
-  /** `<root>/quarantine/<op>`: the state operation `op`'s snapshot restore replaced. */
   quarantine(op: string): string;
 }
 
@@ -129,19 +123,16 @@ function requireOperationName(op: string): string {
   return op;
 }
 
-/** The directory name of the release at `commit`. */
 export function releaseName(commit: string): string {
   if (!COMMIT.test(commit)) throw unsafe(`${JSON.stringify(commit)} is not a commit`);
   return commit.slice(0, 8);
 }
 
-/** The name an operation that began at `startedAt` (a canonical timestamp) keeps its snapshot and quarantine under. */
 export function operationName(startedAt: string): string {
   if (canonicalTimestamp(startedAt) === undefined) throw unsafe(`${JSON.stringify(startedAt)} is not a start time`);
   return requireOperationName(startedAt.replace(/[-:.]/gu, ''));
 }
 
-/** The entry at `target`, unfollowed, or undefined when there is none. */
 export async function lstatIfPresent(target: string): Promise<Stats | undefined> {
   try {
     return await lstat(target);
@@ -151,7 +142,7 @@ export async function lstatIfPresent(target: string): Promise<Stats | undefined>
   }
 }
 
-/** Whether there is an entry at `target`, unfollowed. */
+/** Unfollowed, so a dangling link exists. */
 export async function exists(target: string): Promise<boolean> {
   return (await lstatIfPresent(target)) !== undefined;
 }
@@ -166,11 +157,7 @@ export async function syncDirectory(directory: string): Promise<void> {
   }
 }
 
-/**
- * Create the assistant's state and log directories, owner-only, with each
- * state root a create has not made yet: directories, and `.env` as a file.
- * Only a create calls this; staging a release never creates state.
- */
+/** Creates each state root not made yet. Staging a release never creates state: only a create does. */
 export async function createState(layout: InstanceLayout): Promise<void> {
   await mkdir(layout.state, { recursive: true, mode: 0o700 });
   await mkdir(layout.logs, { recursive: true, mode: 0o700 });
@@ -218,7 +205,6 @@ async function assertLink(at: string, target: string): Promise<void> {
   }
 }
 
-/** A release directory with every link exactly in place. */
 async function assertLinkedRelease(layout: InstanceLayout, name: string): Promise<void> {
   const release = await physicalRelease(layout, name);
   for (const [link, target] of RELEASE_LINKS) await assertLink(path.join(release, link), target);
@@ -261,7 +247,6 @@ export async function readCurrent(layout: InstanceLayout): Promise<string | unde
   return target;
 }
 
-/** The JSON record at `file`, or undefined when there is no such file or it holds no record. */
 async function readRecordFile(file: string): Promise<Record<string, unknown> | undefined> {
   let value: unknown;
   try {
@@ -273,7 +258,6 @@ async function readRecordFile(file: string): Promise<Record<string, unknown> | u
   return isRecord(value) ? value : undefined;
 }
 
-/** The `epoch` a JSON record at `file` names, or undefined when there is no such file or it names none. */
 async function readEpoch(file: string): Promise<string | undefined> {
   const epoch = (await readRecordFile(file))?.epoch;
   return typeof epoch === 'string' && epoch ? epoch : undefined;
@@ -311,7 +295,6 @@ export async function fenceEnded(layout: InstanceLayout): Promise<string | undef
   return typeof ended === 'string' && RELEASE_NAME.test(ended) ? ended : undefined;
 }
 
-/** The epoch of the fence in force; refused unless a fence is. */
 async function assertFenced(layout: InstanceLayout, action: string): Promise<string> {
   const epoch = await readEpoch(fenceFile(layout));
   if ((await readCurrent(layout)) !== undefined || epoch === undefined) {
@@ -416,7 +399,6 @@ export async function takeSnapshot(layout: InstanceLayout, op: string, release: 
   return snapshot;
 }
 
-/** When snapshot `op` was taken, as the record kept with it says. */
 export async function snapshotTakenAt(layout: InstanceLayout, op: string): Promise<string> {
   const file = path.join(layout.snapshot(op), SNAPSHOT_RECORD);
   let value: unknown;
@@ -455,7 +437,7 @@ export async function restoreSnapshot(layout: InstanceLayout, snapshot: string, 
 
 /**
  * While fenced, undo operation `op`'s snapshot restore after its rollback
- * failed (KTD5): rename the state the rollback's target produced aside into
+ * failed: rename the state the rollback's target produced aside into
  * `quarantine/<op>-returned/`, then rename `quarantine/<op>/` back to
  * `state/`, so the assistant has exactly the state it had before. A return
  * cut short at either step is finished by running it again. A rollback whose
@@ -477,7 +459,7 @@ export async function returnQuarantinedState(layout: InstanceLayout, op: string)
   await syncDirectory(layout.root);
 }
 
-/** What a prune keeps besides the live release (KTD4). */
+/** What a prune keeps besides the live release. */
 export interface PruneKeep {
   /** The release a rollback returns to, and the snapshot taken as the assistant left it. */
   readonly rollbackPoint?: { readonly release: string; readonly snapshot: string };

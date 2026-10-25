@@ -15,7 +15,6 @@ import { hostLogFiles, type InstanceRuntimeConfig } from './service.js';
 import { GCHAT_CHANNEL_TYPE, GwsEaError } from './types.js';
 import { hasControlCharacters, requireCanonicalTimestamp } from './validation.js';
 
-/** How much of the error log's end is read, and how many of its lines are shown. */
 const ERROR_LOG_TAIL_BYTES = 64 * 1024;
 const ERROR_LOG_TAIL_LINES = 20;
 const ERROR_LOG_LINE_CHARACTERS = 300;
@@ -176,7 +175,6 @@ export function openWithoutSideFiles(file: string): Database.Database {
   return new Database(file, { readonly: true, fileMustExist: true });
 }
 
-/** Instance message state, opened as `openWithoutSideFiles` does; whatever cannot be opened is missing. */
 function openReadonly(file: string): Database.Database {
   try {
     return openWithoutSideFiles(file);
@@ -423,7 +421,6 @@ export function verifyTalkableConversation(input: ConversationVerificationInput)
   }
 }
 
-/** An assistant's central database under its state root. */
 export function centralDatabaseFile(stateRoot: string): string {
   return path.join(path.resolve(stateRoot), 'data', 'v2.db');
 }
@@ -432,7 +429,6 @@ function hasTable(database: Database.Database, name: string): boolean {
   return database.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(name) !== undefined;
 }
 
-/** Each session database under `stateRoot`'s `data`, keyed by its mailbox side: `inbound` or `outbound`. */
 function sessionDatabases(stateRoot: string): Array<{ readonly side: string; readonly file: string }> {
   const directories = (directory: string): string[] => {
     try {
@@ -457,9 +453,8 @@ function sessionDatabases(stateRoot: string): Array<{ readonly side: string; rea
 }
 
 /**
- * The schema the databases under `stateRoot`'s `data` record (KTD5): the central migrations
- * applied, in the order they ran, and every session table with its columns,
- * keyed `<side>.<table>` and merged across sessions. Only read, never changed.
+ * The central migrations in the order they ran, and every session table's
+ * columns, keyed `<side>.<table>` and merged across sessions.
  */
 export function readSchemaManifest(stateRoot: string): SnapshotManifest {
   const migrations = readCentralMigrations(stateRoot);
@@ -493,7 +488,6 @@ export function readSchemaManifest(stateRoot: string): SnapshotManifest {
   };
 }
 
-/** The central migrations the database under `stateRoot`'s `data` records, in the order they ran. Only read, never changed. */
 export function readCentralMigrations(stateRoot: string): string[] {
   const central = openReadonly(centralDatabaseFile(stateRoot));
   try {
@@ -509,10 +503,9 @@ export function readCentralMigrations(stateRoot: string): string[] {
 }
 
 /**
- * Whether a host left the central database under `stateRoot`'s `data` with
- * its claim lease still live at `now`: a host stopped gracefully marks its row
- * stopped, and one that was killed leaves it to expire, which delays the next
- * host's claims. A release without leases has none. Only read.
+ * Whether a host left its claim lease live at `now`: a host stopped gracefully
+ * marks its row stopped, and one that was killed leaves it to expire, which
+ * delays the next host's claims.
  */
 export function hostLeaseLive(stateRoot: string, now: string): boolean {
   const central = openReadonly(centralDatabaseFile(stateRoot));
@@ -528,11 +521,6 @@ export function hostLeaseLive(stateRoot: string, now: string): boolean {
   }
 }
 
-/**
- * The identities forgotten in the central database under `stateRoot`'s
- * `data`, as `gws_ea_people_fingerprints` keeps them (KTD8); none when it has
- * no such table. Only read.
- */
 export function readForgottenFingerprints(stateRoot: string): ForgottenFingerprint[] {
   const central = openReadonly(centralDatabaseFile(stateRoot));
   try {
@@ -551,10 +539,7 @@ export interface DerivedImageGroup {
   readonly name: string;
 }
 
-/**
- * The agent groups running a per-group image (`<imageBase>:<agent group ID>`,
- * NanoClaw's `buildAgentGroupImage` tag), by name. Only read, never changed.
- */
+/** `<imageBase>:<agent group ID>` is the tag NanoClaw's `buildAgentGroupImage` gives a group's own image. */
 export function readDerivedImageGroups(stateRoot: string, imageBase: string): DerivedImageGroup[] {
   const central = openReadonly(centralDatabaseFile(stateRoot));
   try {
@@ -574,10 +559,9 @@ export function readDerivedImageGroups(stateRoot: string, imageBase: string): De
 }
 
 /**
- * Copy the central database under `stateRoot`'s `data` to `destination` as one consistent
- * snapshot: an online backup whose every page moves in a single step, so a
- * write the running host makes meanwhile restarts the copy rather than
- * mixing into it. The live database is only read. The copy is owner-only.
+ * One consistent snapshot: an online backup whose every page moves in a
+ * single step, so a write the running host makes meanwhile restarts the copy
+ * rather than mixing into it.
  */
 export async function backupCentralDatabase(stateRoot: string, destination: string): Promise<void> {
   const central = openReadonly(centralDatabaseFile(stateRoot));
@@ -589,7 +573,6 @@ export async function backupCentralDatabase(stateRoot: string, destination: stri
   await chmod(destination, 0o600);
 }
 
-/** Main's latest delivery result, as its conversation's mailbox and the host's retry bookkeeping record it. */
 export interface LatestDelivery {
   readonly mainAgentGroupId: string;
   /** Main's conversation session, once it has one. */
@@ -601,7 +584,7 @@ export interface LatestDelivery {
   readonly lastError: string | undefined;
 }
 
-/** Main's latest delivery result, or undefined until main is published. Only read, never changed. */
+/** Undefined until main is published. */
 export function readLatestDelivery(stateRoot: string): LatestDelivery | undefined {
   const root = path.resolve(stateRoot);
   const central = openReadonly(centralDatabaseFile(root));
@@ -725,13 +708,12 @@ function millisecondOfDay(hours: number, minutes: number, seconds: number, milli
 }
 
 /**
- * A name an agent can choose (a file in its folder, a group, a task, a
- * message ID in its outbound mailbox), made safe to print on the operator's
- * terminal. Every control and format character, which could move the cursor,
- * erase or rewrite a line, reach the clipboard, or reorder text, is shown as
- * its JSON escape, and so is a backslash, so what is shown reads back as
- * exactly one name. Unlike a log line, nothing is dropped: the operator sees
- * the name the file really has. JSON output keeps the raw name.
+ * A name an agent can choose, made safe to print on the operator's terminal.
+ * Every control and format character, which could move the cursor, erase or
+ * rewrite a line, reach the clipboard, or reorder text, is shown as its JSON
+ * escape, and so is a backslash, so what is shown reads back as exactly one
+ * name. Unlike a log line, nothing is dropped: the operator sees the name the
+ * file really has. JSON output keeps the raw name.
  */
 export function printableName(name: string): string {
   return name.replace(/[\p{Cc}\p{Cf}\\]/gu, (character) => {

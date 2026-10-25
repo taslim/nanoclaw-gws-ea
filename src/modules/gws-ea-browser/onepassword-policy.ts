@@ -1,10 +1,8 @@
 /**
- * The private 1Password contracts (KTD2): one host policy beside the host
- * management token, under the control plane's configuration root, and per
- * assistant a runtime token in its secrets plus an owner-only record of the
- * provider resources it owns. Identifiers only ever leave these files; a
- * token is registered for redaction before anything reads it. Malformed or
- * unsafe state fails closed.
+ * The private 1Password contracts: one host policy beside the host management token, under the control plane's
+ * configuration root, and per assistant a runtime token in its secrets plus an owner-only record of the provider
+ * resources it owns. Identifiers only ever leave these files; a token is registered for redaction before it is
+ * returned. Malformed or unsafe state fails closed.
  */
 import path from 'node:path';
 
@@ -43,7 +41,7 @@ export function isOnePasswordId(value: unknown): value is string {
  */
 const SIGN_IN_ADDRESS = /^(?:[a-z\d](?:[a-z\d-]{0,61}[a-z\d])?\.){1,2}1password\.(?:com|ca|eu)$/u;
 
-/** The sign-in address `op account list` reports for an account, with or without its scheme; undefined for anything else. */
+/** A sign-in address as `op account list` reports it, with or without its scheme; undefined for anything else. */
 export function onePasswordSignInAddress(value: string): string | undefined {
   const address = value
     .trim()
@@ -53,14 +51,13 @@ export function onePasswordSignInAddress(value: string): string | undefined {
   return SIGN_IN_ADDRESS.test(address) ? address : undefined;
 }
 
-/** The link that opens the account on 1Password.com, built from its recorded sign-in address alone. */
 export function onePasswordAccountLink(policy: Pick<OnePasswordHostPolicy, 'signInAddress'>): string {
   return new URL(`https://${policy.signInAddress}/`).href;
 }
 
 /**
- * Every vault permission the CLI documents: the first three on Teams and
- * Families; on Business they group the granular permissions that follow.
+ * Every vault permission the CLI documents: the first three on Teams and Families; on Business they group the
+ * granular permissions that follow.
  */
 export const ONEPASSWORD_VAULT_PERMISSIONS = [
   'allow_viewing',
@@ -108,22 +105,21 @@ export interface OnePasswordHostPolicy {
   /** 2 added the disabled intent; a policy of any other version is refused. */
   readonly schemaVersion: 2;
   /**
-   * The operator's intent, re-read by the host before every vault use. False
-   * stops every fill, disclosure, write and share while the account, the
-   * management identity and every assistant's records are kept.
+   * The operator's intent, re-read by the host before every vault use. False stops every fill, disclosure, write
+   * and share while the account, the management identity and every assistant's records are kept.
    */
   readonly enabled: boolean;
   /** The one account every assistant on this host uses, by its exact ID: never a shorthand, URL or name. */
   readonly accountId: string;
   /**
-   * That account's sign-in address, as the operator's 1Password app listed it
-   * for exactly that ID (`op account list`): where its members open it on the
-   * web. It locates the account for people; the ID alone binds it.
+   * That account's sign-in address, as the operator's 1Password app listed it for exactly that ID
+   * (`op account list`): where its members open it on the web. It locates the account for people; the ID alone
+   * binds it.
    */
   readonly signInAddress: string;
-  /** The `op` the operator enabled, re-checked before each use: assistant services run with a PATH that may not reach it. */
+  /** The `op` the operator enabled, re-checked before each use: an assistant service's PATH may not reach it. */
   readonly cliPath: string;
-  /** The host management service account; null when the operator's CLI creates each vault itself (KTD1's fallback). */
+  /** Null in a policy this release refuses to provision under: it creates every vault through this account. */
   readonly managementServiceAccountId: string | null;
 }
 
@@ -133,12 +129,10 @@ export type OnePasswordHostPolicyRead =
   | { readonly status: 'invalid'; readonly problem: 'unsafe' | 'malformed' };
 
 export interface OnePasswordInstancePaths {
-  /** The runtime service account's token, in the instance's private secrets directory. */
   readonly runtimeTokenFile: string;
   /**
-   * The record of the provider resources the assistant owns. It holds
-   * identifiers, never values, so it sits outside `secrets/`, whose every
-   * file a run log registers for redaction.
+   * The record of the provider resources the assistant owns. It holds identifiers, never values, so it sits
+   * outside `secrets/`, whose every file a run log registers for redaction.
    */
   readonly resourceFile: string;
 }
@@ -150,7 +144,6 @@ export type OnePasswordVaultCreator =
 
 /** Access the management service account granted a person on a vault it created, as the provider accepted it. */
 export interface OnePasswordUserGrant {
-  /** The exact provider user. */
   readonly userId: string;
   readonly permissions: readonly OnePasswordVaultPermission[];
 }
@@ -164,21 +157,18 @@ export interface OnePasswordResources {
   /** Only a vault the app created is ever recorded: no vault is adopted. */
   readonly vault: { readonly id: string; readonly createdBy: OnePasswordVaultCreator };
   /**
-   * The operator's management rights on a vault the management service
-   * account created, which minting its runtime service account needs; null
-   * until the provider accepts the grant, and for a vault the operator created.
+   * The operator's management rights on a vault the management service account created, which minting its runtime
+   * service account needs; null until the provider accepts the grant, and for a vault the operator created.
    */
   readonly operatorGrant: OnePasswordUserGrant | null;
   /**
-   * Null while the vault exists and its runtime service account is not minted
-   * yet. Once set, that account holds exactly `ONEPASSWORD_RUNTIME_GRANT` on
-   * the vault, and its token is in the instance's runtime token file.
+   * Null while the vault exists and its runtime service account is not minted yet. Once set, that account holds
+   * exactly `ONEPASSWORD_RUNTIME_GRANT` on the vault, and its token is in the instance's runtime token file.
    */
   readonly runtimeServiceAccountId: string | null;
   /**
-   * Runtime service accounts whose local tokens were deleted when 1Password
-   * was disabled, oldest first. Only the operator can revoke them, on
-   * 1Password.com, so they stay named here until the assistant is removed.
+   * Runtime service accounts whose local tokens were deleted when 1Password was disabled, oldest first. Only the
+   * operator can revoke them, on 1Password.com, so they stay named here until the assistant is removed.
    */
   readonly retiredRuntimeServiceAccountIds: readonly string[];
 }
@@ -345,9 +335,8 @@ function parseResources(value: unknown): OnePasswordResources | undefined {
 }
 
 /**
- * An owner-only file in an owner-only directory, or why it cannot be read: a
- * missing file is absent; a refusal of the owner-only checks or by the file
- * system is unsafe state.
+ * An owner-only file in an owner-only directory, or why it cannot be read: a missing file is absent; a refusal of
+ * the owner-only checks or by the file system is unsafe state.
  */
 async function readPrivateState(file: string): Promise<{ readonly text: string } | 'absent' | 'unsafe'> {
   try {
@@ -360,7 +349,6 @@ async function readPrivateState(file: string): Promise<{ readonly text: string }
   }
 }
 
-/** Parsed JSON, or undefined for text that is not JSON; any other failure is thrown. */
 export function parseText(text: string): unknown {
   try {
     return JSON.parse(text) as unknown;
@@ -402,7 +390,7 @@ function resourceLocationMatches(file: string, instanceId: string): boolean {
   );
 }
 
-/** The resources of exactly `expected.instanceId`, and of `expected.accountId` when the caller holds the host policy. */
+/** Exactly `expected.instanceId`'s resources, and `expected.accountId`'s when the caller holds the host policy. */
 export async function readOnePasswordResources(
   file: string,
   expected: { readonly instanceId: string; readonly accountId?: string },
@@ -434,9 +422,8 @@ export async function writeOnePasswordResources(file: string, resources: OnePass
 }
 
 /**
- * A service account token file: one token, owner-only, in an owner-only
- * directory. The token is registered for redaction before it is returned;
- * an unsafe or malformed file is invalid, never repaired.
+ * A service account token file: one token, owner-only, in an owner-only directory. The token is registered for
+ * redaction before it is returned; an unsafe or malformed file is invalid, never repaired.
  */
 export async function readOnePasswordToken(file: string): Promise<OnePasswordTokenRead> {
   if (!isNormalizedAbsolute(file)) return { status: 'invalid' };

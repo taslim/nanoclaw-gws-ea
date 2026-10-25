@@ -1,4 +1,4 @@
-/** Concrete host primitives; admission of the principal's request belongs to chat_reach_out. */
+/** Admitting the principal's request belongs to `chat_reach_out` (gws-ea-chats/outreach.ts), not these primitives. */
 import { getBinaryNodeChild, jidNormalizedUser } from '@whiskeysockets/baileys';
 
 import type { OutboundMessage } from '../../channels/adapter.js';
@@ -40,7 +40,7 @@ export function createWhatsAppOutreach(options: {
     return `${person.lid}@lid`;
   }
   async function assertPublicWire(content: unknown): Promise<void> {
-    // An invitation reaches a nonmember; a clearance for the existing chat cannot authorize these fields.
+    // These fields reach people not yet in the chat, so no clearance for the chat can authorize them.
     const check = await checkOutbound(messageStrings(JSON.stringify(content)), 'others');
     if (!check.allowed) throw new OutboundRefusedError('gws-ea-privacy:audience', check.reason);
   }

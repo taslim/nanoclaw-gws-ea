@@ -21,7 +21,7 @@ export async function chatInboundDelay(session: Session): Promise<InboundDelay> 
   const chat = session.messaging_group_id === null ? undefined : await getChat(session.messaging_group_id);
   return chat && (chat.state === 'asking' || chat.state === 'moving') ? HOLD_UNTIL_RELEASED : null;
 }
-/** Called inside the conversation tail by the prepared engagement path. */
+/** Caller already holds the conversation tail; unlike `admitChat`, this does not take it. */
 export async function admitChatFromPrincipalMessage(chatId: string, messageId: string): Promise<Chat> {
   const principal = await requirePrincipalMessage(messageId, chatId);
   return releaseChat(chatId, principal.userId);
@@ -55,7 +55,10 @@ async function releaseChat(chatId: string, principalUserId?: string): Promise<Ch
   await releaseChatMessages(chatId);
   return chat;
 }
-/** Active state is durable admission; retry interrupted mailbox release without waking an ambient-only batch. */
+/**
+ * The active state is the durable admission, so the sweep can repeat an interrupted release. A released
+ * batch with no triggering message wakes no one.
+ */
 export async function releaseChatMessages(chatId: string, options: { readonly wake?: boolean } = {}): Promise<void> {
   const chat = await getChat(chatId);
   if (!chat || !chatIsActive(chat)) return;
@@ -121,7 +124,7 @@ async function closeChat(chatId: string, state: 'declined' | 'detached'): Promis
   await settleChatMessages(chatId);
   await resumeRetiringJobAgents();
 }
-/** After the central transition commits; safe to repeat after an interrupted detach, which the sweep does until it finishes. */
+/** Runs after a close commits; the sweep repeats it for a declined or detached chat until `settled_at` is set. */
 export async function settleChatMessages(chatId: string): Promise<void> {
   const chat = await getChat(chatId);
   const terminal = chat?.state === 'declined' || chat?.state === 'detached';
@@ -166,7 +169,7 @@ async function stopChatSession(sessionId: string): Promise<void> {
     });
   });
 }
-/** Host-only primitive: the calling action authorizes main; declining grants no authority or private context. */
+/** Checks no authority itself; the calling action decides who may decline. */
 export async function declineChat(chatId: string): Promise<void> {
   await inChatTail(chatId, () => closeChat(chatId, 'declined'));
 }
@@ -192,7 +195,7 @@ export async function expireAskingChats(now = Date.now()): Promise<void> {
   }
 }
 
-/** A checked main handoff places a new private conversation. Caller owns the tail and transaction. */
+/** Main's checked handoff admits an asking private conversation. Caller owns the tail and transaction. */
 export async function connectPrivateChatHandoff(chatId: string): Promise<void> {
   const group = await getMessagingGroup(chatId);
   const chat = await getChat(chatId);

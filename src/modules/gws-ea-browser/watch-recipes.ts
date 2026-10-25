@@ -67,7 +67,7 @@ async function promoteWatchRecipe(
     new Date().toISOString(),
   );
 }
-/** Called directly by save_recipe after its immutable source provenance has been persisted. */
+/** Takes a recipe already saved, so the source provenance it checks is the persisted one. */
 export async function linkWatchBookingRecipe(context: BrowserExecutionContext, recipe: BrowserRecipe): Promise<void> {
   if (
     recipe.readOnly ||

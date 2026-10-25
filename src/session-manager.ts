@@ -93,11 +93,9 @@ function sessionCreationKey(
 }
 
 /**
- * The session mode a wiring's messages in a conversation resolve under, given
- * its resolved thread policy (resolveThreadPolicy): a thread-enabled wiring in
- * a group chat gets a per-thread session regardless of its session_mode.
- * agent-shared is preserved (it's a cross-channel directive the adapter doesn't
- * know about), and DMs collapse sub-threads to one session (is_group=0).
+ * `threadsEnabled` is the resolved thread policy (resolveThreadPolicy).
+ * agent-shared is kept because it's a cross-channel directive the adapter
+ * doesn't know about; DMs (is_group=0) collapse sub-threads to one session.
  */
 export function effectiveSessionMode(
   wiring: Pick<MessagingGroupAgent, 'session_mode'>,
@@ -110,8 +108,8 @@ export function effectiveSessionMode(
 }
 
 /**
- * The active session a messaging group + thread already has, which
- * resolveSession would resolve to; never creates one.
+ * The active session resolveSession would resolve to, without ever creating
+ * one.
  *
  * Session modes:
  * - 'shared': one session per messaging group (ignores threadId)
@@ -186,8 +184,8 @@ export async function resolveTaskSession(
 }
 
 /**
- * Find or create a host-owned system thread without a messaging group.
- * With includeClosed, return closed sessions instead of creating replacements.
+ * A host-owned `system:` thread's session, which has no messaging group.
+ * includeClosed returns a closed one instead of creating a replacement.
  */
 export async function resolveSystemSession(
   agentGroupId: string,
@@ -603,7 +601,11 @@ export function readOutboxFiles(
   return files.length > 0 ? files : undefined;
 }
 
-/** Exactly one declared staged file, with a size bound before allocation. Missing staging is distinguishable for durable replays. */
+/**
+ * Undefined when nothing is staged under that name, which a durable replay
+ * must tell apart from a bad file (that throws). `maxBytes` is enforced
+ * before allocating.
+ */
 export function readOutboxFileBounded(
   agentGroupId: string,
   sessionId: string,
@@ -624,7 +626,10 @@ export function readOutboxFileBounded(
   }
 }
 
-/** Check out host-held bytes into only the requesting session's inbox, never an authored host path. */
+/**
+ * Host-held bytes go only into this session's inbox, never to a path the
+ * agent authored; a retry may reuse only the identical file.
+ */
 export function stageInboxFile(
   agentGroupId: string,
   sessionId: string,

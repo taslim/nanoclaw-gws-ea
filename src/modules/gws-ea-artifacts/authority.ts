@@ -312,7 +312,7 @@ export async function authorizeArtifactShare(
     principalMessage,
   };
 }
-/** The durable share handler owns holds and reentry. A grant cannot override fresh denial. */
+/** Holds and reentry belong to the durable share handler in sharing.ts. */
 export const artifactShareAction = defineGuardedAction({
   action: 'gws_ea_artifacts.share',
   grantActionName: ARTIFACT_SHARE_APPROVAL,

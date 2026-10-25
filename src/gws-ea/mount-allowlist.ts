@@ -31,18 +31,14 @@ export function nanoclawMountAllowlistFile(homeDirectory: string): string {
   return path.join(homeDirectory, '.config', 'nanoclaw', 'mount-allowlist.json');
 }
 
-/** NanoClaw's own expansion: `~` and `~/…` are the host's home; other entries resolve against its cwd. */
+/** Mirrors NanoClaw's `~` expansion; undefined for a relative entry, which NanoClaw resolves against its cwd. */
 function expandEntry(entry: string, homeDirectory: string): string | undefined {
   if (entry === '~') return homeDirectory;
   if (entry.startsWith('~/')) return path.join(homeDirectory, entry.slice(2));
   return path.isAbsolute(entry) ? entry : undefined;
 }
 
-/**
- * Keep gws-ea's roots in the allowlist's `blockedPatterns`, preserving every
- * other entry and field, then stop if an allowed root would expose them.
- * Without the file NanoClaw mounts nothing extra, so there is nothing to do.
- */
+/** Without the file NanoClaw mounts nothing extra, so there is nothing to protect. */
 export async function protectFromAgentMounts(roots: ProtectedRoots, location: MountAllowlistLocation): Promise<void> {
   const named = location.file ?? nanoclawMountAllowlistFile(location.homeDirectory);
   let file: string;

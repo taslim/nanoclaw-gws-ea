@@ -12,16 +12,15 @@ export function isValidTimezone(tz: string): boolean {
 }
 
 /**
- * `value`, trimmed, as an IANA zone correctly cased, or undefined when it is
- * no zone or a UTC offset. For a timezone a container runs in as its `TZ`,
- * which reads an offset such as `+05:30` with its sign flipped (POSIX counts
- * west of Greenwich as positive) and a miscased name (`europe/london`) as
- * UTC, though `Intl` accepts both. A name already cased as the zone database
- * writes it stays as given, even when it is another name for a zone
- * (`Asia/Kolkata`, `Etc/GMT+5`); a miscased one takes the zone's own
- * spelling. Each part of such a name opens with a capital and holds no two
- * in a row (`US/Pacific` aside, which takes its zone's spelling), so a part
- * in capitals is miscased.
+ * `value` as a correctly cased IANA zone, or undefined for no zone or a UTC
+ * offset. For a zone a container runs in as its `TZ`, which reads an offset
+ * such as `+05:30` with its sign flipped (POSIX counts west of Greenwich as
+ * positive) and a miscased name (`europe/london`) as UTC, though `Intl`
+ * accepts both. A name cased as the zone database writes it stays as given,
+ * even another name for a zone (`Asia/Kolkata`, `Etc/GMT+5`); a miscased one
+ * takes the zone's own spelling. Each part of such a name opens with a
+ * capital and holds no two in a row (`US/Pacific` aside, which takes its
+ * zone's spelling), so a part in capitals counts as miscased.
  */
 export function ianaTimezone(value: string): string | undefined {
   const zone = value.trim();
@@ -124,7 +123,6 @@ export function timeZoneLabel(timeZone: string, at: string): string {
         .formatToParts(new Date(at))
         .find((part) => part.type === 'timeZoneName')?.value ?? zone);
 }
-/** A moment on the clock of `timeZone`, labelled with it. */
 export function formatLocalTimeWithZone(at: string, timeZone: string): string {
   return `${formatLocalTime(at, timeZone)} ${timeZoneLabel(timeZone, at)}`;
 }

@@ -505,7 +505,7 @@ describe('binding the principal on a real instance', () => {
     };
   }
 
-  it('binds only the person behind the named address, welcomes them first in the DM the assistant opened, and routes their next message to main (AE7)', async () => {
+  it('binds only the person behind the named address, welcomes them first in the DM the assistant opened, and routes their next message to main', async () => {
     const instance = await runningInstance();
     await instance.publishMain();
     // A colleague writes to the assistant while it is being created.

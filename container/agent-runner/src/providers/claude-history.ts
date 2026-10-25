@@ -30,7 +30,7 @@ export interface ClaudeArchiveInput {
 export interface ClaudeContinuationRotationInput {
   continuation: string;
   assistantName?: string;
-  /** Whether a rotated transcript is archived first; a sealed session's never is. Defaults to true. */
+  /** Defaults to true; a sealed session's rotated transcript is never archived. */
   archive?: boolean;
   log(message: string): void;
 }

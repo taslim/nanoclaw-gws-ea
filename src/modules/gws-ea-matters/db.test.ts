@@ -86,7 +86,7 @@ describe('the matters schema', () => {
       'parent_id',
       'outcome',
       'look_task_id',
-      // The host's own mark for one guarantee (KTD7 step 3), never shown to main: no status.
+      // The host's own mark for a failed look, never shown to main: no status.
       'look_failed_at',
       'created_at',
       'updated_at',
@@ -354,7 +354,7 @@ describe('opening and placing', () => {
   });
 });
 
-describe("each thread's placement (Slice 5 KTD8)", () => {
+describe("each thread's placement", () => {
   it('keeps a thread placed while an open matter holds it, nowhere once taken out or its matter closes, and holds its mail again once its matter closes', async () => {
     expect(await threadPlacement(THREAD_A)).toEqual({ placement: 'unplaced', released: false });
     const acme = await open('Acme renewal', [thread(THREAD_A)]);

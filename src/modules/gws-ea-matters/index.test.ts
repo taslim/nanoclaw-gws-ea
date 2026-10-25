@@ -279,7 +279,7 @@ describe('GWS-EA matters ncl resource', () => {
     expect(await getMatter(acme.matter.id)).toMatchObject({ title: 'Acme renewal' });
   });
 
-  it('places a piece nowhere: no matter opens, and the answer names where it was (AE2)', async () => {
+  it('places a piece nowhere: no matter opens, and the answer names where it was', async () => {
     expect(await data(run('matters-place', { nowhere: true, thread: THREAD_B }))).toEqual({
       nowhere: [{ kind: 'thread', reference: THREAD_B, from: null }],
     });
@@ -315,7 +315,7 @@ describe('GWS-EA matters ncl resource', () => {
     );
   });
 
-  it('answers with ids and data, and nothing worded for the principal (R6)', async () => {
+  it('answers with ids and data, and nothing worded for the principal', async () => {
     const words = new Set(['Acme renewal', 'Renew the contract.', 'Signed.', 'Acme', 'Lease', 'Sign it.']);
     const answers: unknown[] = [];
     const keep = async <T>(response: Promise<ResponseFrame>): Promise<T> => {
@@ -372,7 +372,7 @@ describe('GWS-EA matters ncl resource', () => {
     expect(answers.every((answer) => typeof answer === 'object' && answer !== null)).toBe(true);
   });
 
-  it('reads a matter through ncl with each link as Google says it is now, and prints that view (KTD5)', async () => {
+  it('reads a matter through ncl with each link as Google says it is now, and prints that view', async () => {
     const gmail = google.gmail as FakeGmailThreads;
     const calendar = google.calendar as FakeCalendar;
     gmail.put('gmail-thread-a', {

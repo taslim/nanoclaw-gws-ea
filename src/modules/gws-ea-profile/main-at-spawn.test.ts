@@ -1,5 +1,5 @@
 /**
- * main's group as a spawn reads it (KTD2). A restarted host releases the
+ * main's group as a spawn reads it. A restarted host releases the
  * messages its channels held before its modules start, so one can spawn
  * main before the host's start reads the profile: the spawn's admission
  * reads it first, and main still gets the commands only main is given. An

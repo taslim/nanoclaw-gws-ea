@@ -298,7 +298,7 @@ describe('the release an update deploys', () => {
     });
   });
 
-  it('moves an assistant to a prod repository whose history contains its deployed commit (AE1)', async () => {
+  it('moves an assistant to a prod repository whose history contains its deployed commit', async () => {
     const paths = await controlPlanePaths();
     const dogfood = await releaseRepository(TRACK_BRANCH);
     const prod = await releaseRepository('main', dogfood);

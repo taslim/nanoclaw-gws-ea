@@ -1,8 +1,7 @@
 /**
- * The Gmail REST calls the inbox makes, behind a small typed client (KTD4).
- * No client library: each call is one `fetch` with the host's own Gmail
- * token in its header, so the token never reaches a container or an argument
- * list. Tests use a fake with the same interface.
+ * The Gmail REST calls the inbox makes, behind a small typed client. No
+ * client library: each call is one `fetch` with the host's own Gmail token in
+ * its header, so the token never reaches a container or an argument list.
  */
 import { isRecord } from '../../gws-ea/validation.js';
 
@@ -21,7 +20,6 @@ export class GoogleApiError extends Error {
     this.reason = options?.reason;
   }
 
-  /** Worth retrying: unreachable, rate-limited, or a server error. */
   get retryable(): boolean {
     return this.status === 0 || this.status === 429 || this.status >= 500;
   }
@@ -115,14 +113,10 @@ const REQUEST_TIMEOUT_MS = 30_000;
 
 /**
  * One JSON call to a Google API. With `allowNotFound`, a 404 returns
- * undefined; every other failure throws a `GoogleApiError`, with Google's
- * reason when its answer names one. With `ifMatch`,
- * a write applies only to the version of the resource that etag names, and
- * Google refuses it with 412 when the resource has changed since. With
- * `signal`, the call ends when it aborts instead of after 30 seconds, as a
- * long-poll that Google may hold open longer needs. With `content`, the
- * request sends those bytes as they are, under their own type, in place of
- * a JSON `body`: an upload's.
+ * undefined; every other failure throws a `GoogleApiError`. With `ifMatch`,
+ * Google refuses the write with 412 when the resource has changed since that
+ * etag. With `signal`, the call ends when it aborts instead of after 30
+ * seconds, as a long-poll that Google may hold open longer needs.
  */
 export async function googleJson(
   options: GoogleClientOptions,
@@ -273,13 +267,11 @@ function query(params: Record<string, string | readonly string[] | number | unde
 }
 
 const METADATA = { format: 'metadata', metadataHeaders: [...RECONCILIATION_HEADERS] } as const;
-/** A thread's messages: the headers a send is found by, and who wrote each, when, and about what (KTD5). */
 const THREAD_METADATA = {
   format: 'metadata',
   metadataHeaders: [...RECONCILIATION_HEADERS, 'From', 'Date', 'Subject'],
 } as const;
 
-/** The real client, over Gmail's REST API. */
 export function createGmailApi(options: GoogleClientOptions): GmailApi {
   return {
     async getProfile() {

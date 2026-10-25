@@ -62,7 +62,6 @@ function dmKey(channelType: string, platformId: string, instance: string = chann
   return `${instance}:${platformId}`;
 }
 
-/** A reason as the requesting agent receives it: trimmed, and capped at MAX_REASON_LEN. */
 export function clampReason(raw: string): string {
   const trimmed = raw.trim();
   if (trimmed.length <= MAX_REASON_LEN) return trimmed;

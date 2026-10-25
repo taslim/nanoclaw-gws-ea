@@ -14,12 +14,10 @@
  * Anchors: each conversation a turn is engaged from keeps its anchor, the
  * platform's id for the message the turn works on there. Pulses to that
  * conversation carry it, and `endTyping` fires once for it when that work
- * ends: anything is sent to the conversation (`endTypingInConversation`,
- * called for every send by the delivery adapter), a newer message arrives
- * there, the turn goes idle, its wake fails, or its container exits
- * (`stopTypingRefresh`). An adapter that marks the message while the turn
- * works (the Google Chat assistant's 👀) takes the mark off on that end;
- * adapters without `endTyping` see the same pulses as ever.
+ * ends: a send to the conversation, a newer message there, or the end of the
+ * turn (idle, a failed wake, an exited container). An adapter that marks the
+ * message while the turn works (the Google Chat assistant's 👀) takes the
+ * mark off then; adapters without `endTyping` see only the pulses.
  *
  * Default module status:
  *   - Lives in src/modules/ for signaling (not really core), but ships
@@ -73,14 +71,13 @@ interface TypingAdapter {
   ): Promise<void>;
 }
 
-/** One conversation a turn was engaged from. */
 interface TypingConversation {
   channelType: string;
   platformId: string;
   threadId: string | null;
   /** Adapter instance that owns the chat; undefined = default (= channelType). */
   instance?: string;
-  /** The message the turn works on here, until that work ends; then undefined. */
+  /** Platform id of the message the turn works on here; undefined once that work ends. */
   anchor?: string;
 }
 
@@ -133,7 +130,6 @@ async function triggerEnd(conversation: TypingConversation, anchor: string): Pro
   }
 }
 
-/** The work on the conversation's anchor ended: fire its end, once. */
 function endAnchor(conversation: TypingConversation): void {
   const { anchor } = conversation;
   if (anchor === undefined) return;
@@ -141,7 +137,6 @@ function endAnchor(conversation: TypingConversation): void {
   triggerEnd(conversation, anchor).catch(() => {});
 }
 
-/** The turn's work ended: stop the pulse and end every anchor still live. */
 function finishTyping(sessionId: string, entry: TypingTarget): void {
   clearInterval(entry.interval);
   typingRefreshers.delete(sessionId);
@@ -159,10 +154,9 @@ function isHeartbeatFresh(agentGroupId: string, sessionId: string): boolean {
 }
 
 /**
- * Start (or re-trigger) the typing refresh for a turn engaged from this
- * conversation. `anchor` is the platform's id for the message that engaged
- * it; a newer anchor in the same conversation ends the older one, and none
- * (a turn engaged by something no one wrote) leaves a live one in place.
+ * `anchor` is the platform's id for the message that engaged the turn; a
+ * newer anchor in the same conversation ends the older one, and none (a turn
+ * engaged by something no one wrote) leaves a live one in place.
  */
 export function startTypingRefresh(
   sessionId: string,
@@ -251,9 +245,8 @@ export function pauseTypingRefreshAfterDelivery(sessionId: string): void {
 }
 
 /**
- * Something was sent to this conversation: the work every turn anchored
- * there was showing has ended. The delivery adapter calls this for each
- * send it made, the agent's or the host's. Pulses go on.
+ * Call after every send to the conversation, the agent's or the host's: it
+ * ends each turn's anchor there, and pulses go on.
  */
 export function endTypingInConversation(
   channelType: string,
@@ -268,7 +261,7 @@ export function endTypingInConversation(
   }
 }
 
-/** The turn's work ended (its wake failed, or its container exited): stop the pulse and end its anchors. */
+/** Ends the turn's anchors as well as its pulse. */
 export function stopTypingRefresh(sessionId: string): void {
   const entry = typingRefreshers.get(sessionId);
   if (!entry) return;

@@ -1,10 +1,11 @@
 /**
- * The forget handoff (KTD8): how a forget survives a snapshot rollback. A
- * rollback that restores state from before a forget brings the forgotten
- * person back. gws-ea, as it restores, writes the fingerprints the restored
- * database lacks, read from the state it replaced, into this owner-only file
- * in the restored data directory; the people module's host start records
- * them, forgets again whoever holds one, tells main, and deletes the file.
+ * The forget handoff: how a forget survives a snapshot rollback. A rollback
+ * that restores state from before a forget brings the forgotten person back.
+ * gws-ea, as it restores, writes the fingerprints the restored database
+ * lacks, read from the state it replaced, into this owner-only file in the
+ * restored data directory; the people module, before the host routes
+ * anything, records them, forgets again whoever holds one, tells main, and
+ * deletes the file.
  *
  * Side-effect free: gws-ea imports it without loading the people module.
  */
@@ -29,7 +30,7 @@ export function peopleForgetHandoffFile(dataDir: string): string {
 /** One row of `gws_ea_people_fingerprints`. */
 export interface ForgottenFingerprint {
   readonly fingerprint: string;
-  /** When the identity was forgotten, as `Date#toISOString` writes it. */
+  /** As `Date#toISOString` writes it. */
   readonly forgotten_at: string;
 }
 
@@ -57,13 +58,12 @@ function parseFingerprint(value: unknown, index: number): ForgottenFingerprint {
   return { fingerprint, forgotten_at: forgottenAt };
 }
 
-/** One of the host's own lists, each entry a line. */
 function parseLines(value: unknown, field: string, what: string): string[] {
   if (!Array.isArray(value)) throw invalid(`${field} must be an array of ${what}`);
   return value.map((entry, index) => requireString(entry, `${LABEL} ${field}[${index}]`, INVALID));
 }
 
-/** The handoff in `value`, every row checked: a file with one bad row is refused whole. */
+/** A file with one bad row is refused whole. */
 function parseHandoff(value: unknown): PeopleForgetHandoff {
   if (!isRecord(value)) throw invalid('it must be an object');
   if (!Array.isArray(value.fingerprints)) throw invalid('fingerprints must be an array');
@@ -78,7 +78,7 @@ function parseHandoff(value: unknown): PeopleForgetHandoff {
   };
 }
 
-/** The handoff, or undefined when there is none. An unsafe or malformed file is refused. */
+/** Undefined when there is none; an unsafe or malformed file throws. */
 export async function readPeopleForgetHandoff(file: string): Promise<PeopleForgetHandoff | undefined> {
   let source: string;
   try {
@@ -90,7 +90,7 @@ export async function readPeopleForgetHandoff(file: string): Promise<PeopleForge
   return parseHandoff(parseJson(source, LABEL, INVALID));
 }
 
-/** Replace the handoff atomically, owner-only, in its existing directory; a handoff the host would refuse is never written. */
+/** Atomic and owner-only, in the file's existing directory; a handoff the host would refuse is never written. */
 export async function writePeopleForgetHandoff(file: string, handoff: PeopleForgetHandoff): Promise<void> {
   await writePrivateTextFile(file, `${JSON.stringify(parseHandoff(handoff), null, 2)}\n`);
 }

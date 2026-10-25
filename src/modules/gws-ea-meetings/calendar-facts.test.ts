@@ -845,7 +845,7 @@ describe('people_stats', () => {
     });
   });
 
-  it('says on which of the principal’s calendars they met each person, counting a meeting on several once in total (R13)', async () => {
+  it('says on which of the principal’s calendars they met each person, counting a meeting on several once in total', async () => {
     /** One meeting, with a copy on each principal calendar invited, each answering as given. */
     const meeting = (id: string, day: string, on: ReadonlyArray<readonly [string, string]>) => {
       for (const [calendarId] of on) {

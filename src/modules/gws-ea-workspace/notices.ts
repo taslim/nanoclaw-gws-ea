@@ -1,12 +1,11 @@
 /**
- * Google's Docs and Drive activity mail as notes for `main` (R8, R14, R17,
- * KTD6). Comments on files the assistant can see (new ones, replies,
- * mentions, assignments), files shared with it, and requests for access to
- * files it can share reach its inbox as Google's own notification mail,
- * which the inbox takes only when Gmail verified Google sent it
- * (`gws-ea-inbox/authentication.ts`). Nothing here changes a file or sends
- * anything: `main` reads comments and answers requests with `gog`, as its
- * gworkspace skill shows.
+ * Google's Docs and Drive activity mail as notes for `main`. Comments on
+ * files the assistant can see (new ones, replies, mentions, assignments),
+ * files shared with it, and requests for access to files it can share reach
+ * its inbox as Google's own notification mail, which the inbox takes only
+ * when Gmail verified Google sent it (`gws-ea-inbox/authentication.ts`).
+ * Nothing here changes a file or sends anything: `main` reads comments and
+ * answers requests with `gog`, as its gworkspace skill shows.
  *
  * - Reading a notice, as the inbox routes it: the file, any comment, and the
  *   kind of activity, from Google's own Docs and Drive links, never from the
@@ -17,7 +16,7 @@
  *   note goes without it. What the principal's addresses did comes first,
  *   and notices past the cap are only counted, so a flood costs a bounded
  *   number of Drive reads and one bounded note. The open matter of each file
- *   it lists comes with it (KTD11).
+ *   it lists comes with it.
  * - A share carries the principal's words only when Drive confirms it: the
  *   email is to the assistant and its links name one file; Google's Reply-To
  *   is the account Drive says shared that file; that account is one the home
@@ -27,8 +26,8 @@
  *   listed. Titles, whom Google says acted, and anyone else's words reach
  *   `main` framed untrusted.
  *
- * A leaf (KTD4): it loads no module's entry point but the shared Google
- * helpers', through the note writer.
+ * A leaf: it loads no module's entry point but the shared Google helpers',
+ * through the note writer.
  */
 import { createHash } from 'node:crypto';
 
@@ -69,7 +68,6 @@ export interface WorkspaceNotice {
   readonly fileCount: number;
   /** Who Google says acted: its Reply-To. A display name is anyone's to choose, so it reaches main framed. */
   readonly actor?: Mailbox;
-  /** Whether To names the assistant. */
   readonly toAssistant: boolean;
   /** When Gmail received it. */
   readonly receivedAt?: Date;
@@ -262,7 +260,7 @@ function noteReader(drive: DriveApi): NoteReader {
 export interface NoticeContext {
   /** The principal as main reads them: by name, or as "the principal". */
   readonly principalName: string;
-  /** The principal's addresses, by the one rule that recognizes them (R1). */
+  /** The principal's addresses, by the one rule that recognizes them. */
   readonly principalAddresses: PrincipalRecognizer;
   /**
    * The Drive permission ids the home folder recorded for the principal's
@@ -499,11 +497,11 @@ function noteNotices(
 }
 
 /**
- * The files a note lists notices of, for their open matters to come with it
- * (KTD11). A share or a comment brings its file new: in no open matter, the
- * note suggests the open matters it may belong to (KTD10) from whom Google
- * names as having acted, its Reply-To in mail Gmail verified Google sent.
- * Drive itself names no comment's author by address.
+ * The files a note lists notices of, for their open matters to come with it.
+ * A share or a comment brings its file new: in no open matter, the note
+ * suggests the open matters it may belong to from whom Google names as having
+ * acted, its Reply-To in mail Gmail verified Google sent. Drive itself names
+ * no comment's author by address.
  */
 export function workspaceNotePieces(notices: readonly WorkspaceNotice[], context: NoticeContext): NotePiece[] {
   return noteNotices(notices, context).listed.map((notice): NotePiece => {
