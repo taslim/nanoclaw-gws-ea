@@ -1,5 +1,4 @@
 import {
-  Browsers,
   DisconnectReason,
   makeWASocket,
   type BaileysEventEmitter,
@@ -33,7 +32,7 @@ import { downloadWhatsAppMedia } from './media-download.js';
 import { WhatsAppIndex } from './index-store.js';
 import { observeWhatsAppConnection, observeWhatsAppGroup } from './observers.js';
 import { createWhatsAppOutbound } from './outbound.js';
-import { resolveWaWebVersion } from './socket.js';
+import { resolveWaWebVersion, WHATSAPP_BROWSER } from './socket.js';
 export { resolveWaWebVersion } from './socket.js';
 import { readWhatsAppLink, writeWhatsAppLink, type WhatsAppLink, type WhatsAppPerson } from './paths.js';
 
@@ -295,11 +294,12 @@ export function createWhatsAppAdapter(options: WhatsAppAdapterOptions): WhatsApp
       version,
       auth: auth.state,
       logger,
-      browser: Browsers.macOS('Desktop'),
+      browser: WHATSAPP_BROWSER,
       markOnlineOnConnect: false,
       ...(link.pairing ? { qrTimeout: Math.max(1, link.pairing.expiresAt - now()) } : {}),
+      // Baileys' own history handling stays on: the sync WhatsApp sends once, at link, carries most of the
+      // LID-to-phone mappings identity depends on. History is never routed; nothing listens to messaging-history.set.
       syncFullHistory: false,
-      shouldSyncHistoryMessage: () => false,
       // rc14's native resend checks its memory cache before getMessage; every resend must consult the durable ledger.
       enableRecentMessageCache: false,
       getMessage: async (key) => {
