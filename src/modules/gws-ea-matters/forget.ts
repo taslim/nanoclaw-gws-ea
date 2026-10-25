@@ -10,10 +10,11 @@
  *   or a file, so those are read live.
  * - The hook takes the person off every matter and clears the account on
  *   each thread of a matter that linked them; the inbox clears those on the
- *   threads they were on. A matter left with nothing but memory files was
- *   kept only for them: it is deleted, and its look cancelled. A strand kept
- *   only for them goes with it, and a project one of whose strands stays is
- *   kept. Such a matter links no thread, so it leaves no thread account behind.
+ *   threads they were on, and the chat module those on chats whose roster
+ *   holds them. A matter left with nothing but memory files was kept only for
+ *   them: it is deleted, and its look cancelled. A strand kept only for them
+ *   goes with it, and a project one of whose strands stays is kept. Such a
+ *   matter links no thread, so it leaves no thread account behind.
  *
  * Both repeat safely: once the hook has run, no matter links the person, and
  * running it again, as the forget after a snapshot restore may, changes
@@ -131,12 +132,6 @@ export function forgetFromMatters(person: ForgottenPerson): Promise<void> {
         person.id,
       );
       await clearThreadAccounts(threads.map((thread) => thread.reference));
-      for (const chat of await chatsWithPerson(person.id)) {
-        await db.run(
-          "UPDATE gws_ea_matter_links SET account = NULL, account_at = NULL WHERE kind = 'chat' AND reference = ?",
-          chat,
-        );
-      }
       await db.run("DELETE FROM gws_ea_matter_links WHERE kind = 'person' AND reference = ?", person.id);
       const now = new Date().toISOString();
       for (const { matter_id } of linking) {

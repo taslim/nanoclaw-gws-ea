@@ -814,6 +814,17 @@ export async function setChatLinkAccount(
   if (changes === 0) throw new Error(`No open matter ${matterId} links chat ${chat}`);
 }
 
+/** In open and closed matters alike. */
+export async function clearChatLinkAccounts(messagingGroupIds: readonly string[]): Promise<void> {
+  const db = getDb();
+  for (const chat of new Set(messagingGroupIds)) {
+    await db.run(
+      "UPDATE gws_ea_matter_links SET account = NULL, account_at = NULL WHERE kind = 'chat' AND reference = ?",
+      chat,
+    );
+  }
+}
+
 /** `at` null clears the mark. A matter that is gone, or closed since, is left as it is. */
 export async function markLookFailed(id: string, at: string | null): Promise<void> {
   await getDb().run('UPDATE gws_ea_matters SET look_failed_at = ? WHERE id = ? AND closed_at IS NULL', at, id);

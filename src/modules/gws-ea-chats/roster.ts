@@ -1,5 +1,6 @@
 import { getDb } from '../../db/connection.js';
 import { identityMatchKey, normalizePrincipalEmail } from '../../gws-ea/validation.js';
+import { clearChatLinkAccounts } from '../gws-ea-matters/db.js';
 import type { ForgottenPerson } from '../gws-ea-people/db.js';
 import { isVerifiedPrincipalUser } from '../gws-ea-profile/db.js';
 
@@ -115,10 +116,38 @@ export async function setChatMemberEmail(
   if (result.changes === 0 && !(await getChatMember(chat, key)))
     throw new Error('The person is not a member of this chat.');
 }
+/**
+ * The person's chats lose their matter link accounts in the same transaction that deletes the rows: the
+ * roster is the only record of which chats those are.
+ */
 export async function forgetFromChatRosters(person: ForgottenPerson): Promise<void> {
-  await getDb().transaction(async () => {
-    await getDb().run('DELETE FROM gws_ea_chat_members WHERE person_id = ?', person.id);
-    for (const handle of person.handles)
-      await getDb().run('DELETE FROM gws_ea_chat_members WHERE member_key = ?', handle);
+  const handles = new Set(person.handles);
+  const emails = new Set(
+    person.handles.filter((handle) => handle.toLowerCase().startsWith('email:')).map(identityMatchKey),
+  );
+  const db = getDb();
+  await db.transaction(async () => {
+    const rows = await db.all<{
+      messaging_group_id: string;
+      member_key: string;
+      person_id: string | null;
+      email: string | null;
+    }>('SELECT messaging_group_id, member_key, person_id, email FROM gws_ea_chat_members');
+    const theirs = rows.filter(
+      (row) =>
+        row.person_id === person.id ||
+        handles.has(row.member_key) ||
+        (row.email !== null && emails.has(identityMatchKey(`email:${row.email}`))),
+    );
+    if (theirs.length === 0) return;
+    if (await db.hasTable('gws_ea_matter_links'))
+      await clearChatLinkAccounts(theirs.map((row) => row.messaging_group_id));
+    for (const row of theirs) {
+      await db.run(
+        'DELETE FROM gws_ea_chat_members WHERE messaging_group_id = ? AND member_key = ?',
+        row.messaging_group_id,
+        row.member_key,
+      );
+    }
   });
 }

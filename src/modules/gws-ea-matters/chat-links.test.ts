@@ -7,7 +7,7 @@ import '../gws-ea-inbox/index.js';
 import { addPerson } from '../gws-ea-people/db.js';
 import { candidatesFor } from './candidates.js';
 import { closeMatter, getMatter, openMatter, setChatLinkAccount, type Matter } from './db.js';
-import { forgetFromMatters, mattersToRewrite } from './forget.js';
+import { mattersToRewrite } from './forget.js';
 import './index.js';
 import { readLinks, type Lens, type LiveSources } from './live.js';
 
@@ -47,7 +47,7 @@ beforeEach(async () => {
   await runMigrations(await initTestDb());
   const db = getDb();
   // gws-ea-chats owns these records. This fixture is their agreed source contract;
-  // every read, link, account and forget below runs through real stores.
+  // every read, link, account and forget review below runs through real stores.
   await db.exec(`
     CREATE TABLE gws_ea_chats (
       messaging_group_id TEXT PRIMARY KEY REFERENCES messaging_groups(id),
@@ -131,18 +131,12 @@ describe('chat links on matters', () => {
     expect((await readLinks(current?.links ?? [], sources, lens)).join('\n')).toContain('detached; 2 members');
   });
 
-  it('forgets accounts and flags every matter whose chat roster held the person, leaving other chats alone', async () => {
+  it('flags every matter whose chat roster holds the person, leaving other chats alone', async () => {
     const dinner = await open('Dinner Thursday');
     const trip = await open('Lake trip');
-    const project = await open('Project', OTHER_CHAT);
-    for (const matter of [dinner, trip]) await setChatLinkAccount(matter.id, CHAT, HANDLER, 'Juno has confirmed.');
-    await setChatLinkAccount(project.id, OTHER_CHAT, HANDLER, 'The venue is confirmed.');
+    await open('Project', OTHER_CHAT);
     const person = { id: juno, name: 'Juno Hale', handles: ['email:juno@example.test'] };
     expect((await mattersToRewrite(person)).sort()).toEqual([dinner.id, trip.id].sort().map((id) => `matter ${id}`));
-    await forgetFromMatters(person);
-    await forgetFromMatters(person);
-    for (const matter of [dinner, trip]) expect((await getMatter(matter.id))?.links[0]?.account).toBeUndefined();
-    expect((await getMatter(project.id))?.links[0]?.account?.text).toBe('The venue is confirmed.');
   });
 
   it('suggests chat-linked matters from a sender the people store verifies as a chat member', async () => {
