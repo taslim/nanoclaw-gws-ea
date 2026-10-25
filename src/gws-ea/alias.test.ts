@@ -514,6 +514,8 @@ describe('the web alias setup step', () => {
     expect(stdout.filter((line) => line.includes('https://admin.google.com/ac/users'))).toEqual([
       '     https://admin.google.com/ac/users',
     ]);
+    expect(stdout.join('\n')).toContain('--alias-taken');
+    expect(stdout.join('\n')).toContain('--alias <name>');
     expect(await getAliasSetup()).toEqual({ alias: null, candidate: ALIAS });
   });
 });

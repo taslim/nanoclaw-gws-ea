@@ -2612,6 +2612,12 @@ export async function runCli(args: readonly string[], runtime: CliRuntime = {}):
                 details: [
                   ...(pause.details ?? []).map((detail) => `  ${detail}`),
                   ...nextActionLines(next.filter((action) => action.kind === 'command')),
+                  ...(pause.code === 'alias_required'
+                    ? [
+                        'If the address is already in use, replace --alias-added with --alias-taken to try the next name.',
+                        'To choose the name yourself, replace --alias-added with --alias <name>.',
+                      ]
+                    : []),
                 ],
               });
               emitResult(
