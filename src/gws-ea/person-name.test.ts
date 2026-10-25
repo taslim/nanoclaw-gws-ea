@@ -15,7 +15,7 @@ describe('structured identity names', () => {
     expect(displayPersonName(name)).toBe('Mary Ann');
   });
 
-  it.each(['name@example.com', '<name>', 'Robin\u2028Wu', 'Robin\u2029Wu'])(
+  it.each(['name@example.com', '<name>', 'Avery\u2028Wu', 'Avery\u2029Wu'])(
     'refuses invalid first name %j',
     (firstName) => {
       expect(() => normalizePersonName({ firstName, lastName: null }, 'principal')).toThrow();

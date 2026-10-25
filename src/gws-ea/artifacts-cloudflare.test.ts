@@ -30,7 +30,7 @@ describe('artifacts Cloudflare boundary', () => {
       assistants: {
         [instanceId]: {
           enabled: false,
-          claim: { hostname: 'views.example.test', path_prefix: '/robin', listen_port: 41000, unrecognized: 'discard' },
+          claim: { hostname: 'views.example.test', path_prefix: '/avery', listen_port: 41000, unrecognized: 'discard' },
           unrecognized: 'discard',
         },
       },
@@ -71,7 +71,7 @@ describe('artifacts Cloudflare boundary', () => {
     expect(parsed.dns).toEqual({ 'views.example.test': { id: 'dns', zoneId: 'zone' } });
     expect(parsed.assistants[instanceId]).toEqual({
       enabled: false,
-      claim: { hostname: 'views.example.test', path_prefix: '/robin', listen_port: 41000 },
+      claim: { hostname: 'views.example.test', path_prefix: '/avery', listen_port: 41000 },
     });
     expect(parsed.pending).toEqual({
       kind: 'tunnel',
@@ -99,7 +99,7 @@ describe('artifacts Cloudflare boundary', () => {
           [instanceId]: {
             enabled: false,
             applicationId: 7,
-            claim: { hostname: 'views.example.test', path_prefix: '/robin', listen_port: 41000 },
+            claim: { hostname: 'views.example.test', path_prefix: '/avery', listen_port: 41000 },
           },
         },
       },
@@ -121,7 +121,7 @@ describe('artifacts Cloudflare boundary', () => {
         assistants: {
           [instanceId]: {
             enabled: true,
-            claim: { hostname: 'views.example.test', path_prefix: '/robin', listen_port: 41000 },
+            claim: { hostname: 'views.example.test', path_prefix: '/avery', listen_port: 41000 },
           },
         },
       },

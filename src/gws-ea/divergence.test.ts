@@ -611,7 +611,7 @@ describe('recorded divergence: disconnected adapters keep durable sends pending'
     await db.runMigrations(await db.initTestDb());
     cleanups.push(() => db.closeDb());
     const created_at = new Date().toISOString();
-    await db.createAgentGroup({ id: 'ag-1', name: 'Robin', folder: 'main', agent_provider: null, created_at });
+    await db.createAgentGroup({ id: 'ag-1', name: 'Avery', folder: 'main', agent_provider: null, created_at });
     await db.createMessagingGroup({
       id: 'mg-1',
       channel_type: 'whatsapp',
@@ -676,7 +676,7 @@ describe('recorded divergence: disconnected adapters keep durable sends pending'
     await db.runMigrations(await db.initTestDb());
     cleanups.push(() => db.closeDb());
     const created_at = new Date().toISOString();
-    await db.createAgentGroup({ id: 'ag-1', name: 'Robin', folder: 'main', agent_provider: null, created_at });
+    await db.createAgentGroup({ id: 'ag-1', name: 'Avery', folder: 'main', agent_provider: null, created_at });
     await db.createMessagingGroup({
       id: 'mg-1',
       channel_type: 'whatsapp',
@@ -721,7 +721,7 @@ describe('recorded divergence: request-addressed conversation reminders', () => 
     const created_at = new Date().toISOString();
     await db.createAgentGroup({
       id: 'reminder-agent',
-      name: 'Robin',
+      name: 'Avery',
       folder: 'reminder-agent',
       agent_provider: null,
       created_at,
@@ -769,7 +769,7 @@ describe('recorded divergence: prepared module engagement and destination-free c
     await db.runMigrations(await db.initTestDb());
     cleanups.push(() => db.closeDb());
     const created_at = new Date().toISOString();
-    await db.createAgentGroup({ id: 'ag-1', name: 'Robin', folder: 'main', agent_provider: null, created_at });
+    await db.createAgentGroup({ id: 'ag-1', name: 'Avery', folder: 'main', agent_provider: null, created_at });
     await db.createMessagingGroup({
       id: 'mg-1',
       channel_type: 'whatsapp',
@@ -797,11 +797,11 @@ describe('recorded divergence: prepared module engagement and destination-free c
     expect(await db.getDb().all('SELECT * FROM agent_destinations')).toEqual([]);
     const router = await import('../router.js');
     const preparation = await import('../inbound-preparation.js');
-    preparation.registerInboundPreparer(({ content }) => Promise.resolve(content.replace('voice', 'Robin')));
+    preparation.registerInboundPreparer(({ content }) => Promise.resolve(content.replace('voice', 'Avery')));
     const order: string[] = [];
     router.registerEngagementDecider('whatsapp', ({ event }) => {
       order.push(event.message.id);
-      return event.message.content.includes('Robin');
+      return event.message.content.includes('Avery');
     });
     const event = (id: string, text: string): InboundEvent => ({
       channelType: 'whatsapp',

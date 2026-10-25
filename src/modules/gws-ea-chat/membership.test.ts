@@ -27,7 +27,7 @@ const fetch: typeof globalThis.fetch = async (input, init) => {
     });
   }
   if (url.hostname === 'people.googleapis.com')
-    return Response.json({ names: [{ displayName: url.pathname.endsWith('/200') ? 'Juno' : 'Robin' }] });
+    return Response.json({ names: [{ displayName: url.pathname.endsWith('/200') ? 'Juno' : 'Avery' }] });
   if (url.pathname === '/v1/spaces/room/messages/ours')
     return Response.json({
       name: 'spaces/room/messages/ours',
@@ -41,7 +41,7 @@ const fetch: typeof globalThis.fetch = async (input, init) => {
 function build() {
   return new AssistantChatAdapter({
     botUserId: assistant,
-    userName: 'Robin',
+    userName: 'Avery',
     auth: hostChatAuth(async () => 'chat', fetch),
     chatToken: async () => 'chat',
     fetch,
