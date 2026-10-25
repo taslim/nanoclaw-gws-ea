@@ -127,12 +127,7 @@ export async function forgetFromChatRosters(person: ForgottenPerson): Promise<vo
   );
   const db = getDb();
   await db.transaction(async () => {
-    const rows = await db.all<{
-      messaging_group_id: string;
-      member_key: string;
-      person_id: string | null;
-      email: string | null;
-    }>('SELECT messaging_group_id, member_key, person_id, email FROM gws_ea_chat_members');
+    const rows = await db.all<ChatMember>('SELECT * FROM gws_ea_chat_members');
     const theirs = rows.filter(
       (row) =>
         row.person_id === person.id ||
