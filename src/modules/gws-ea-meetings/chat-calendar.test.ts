@@ -231,14 +231,7 @@ it('honors an exact-chat principal clearance on invitation text without granting
   expect(chatRefusal(await sendChatRequest(session, 'chat_book', { ...fields, notes: '+14155550123' }))).toContain(
     'private',
   );
-  await getDb().run(
-    "INSERT INTO users(id,kind,display_name,created_at) VALUES('whatsapp:11','whatsapp','Juno',?)",
-    new Date().toISOString(),
-  );
-  await getDb().run(
-    "INSERT INTO gws_ea_principal_users(user_id,verified_at) VALUES('whatsapp:11',?)",
-    new Date().toISOString(),
-  );
+  // The fixture's bound principal, Juno, asks in this chat.
   await getDb().run(
     "INSERT INTO gws_ea_principal_messages(message_id,messaging_group_id,user_id,timestamp,text) VALUES('stored-principal',?,'whatsapp:11',?,'Share my phone number for this meeting.')",
     chatId,

@@ -34,6 +34,8 @@ export class FakeSocket implements WhatsAppSocket {
   profileAbout?: string;
   loggedOut = false;
   pairingCode = '12345678';
+  /** As in Baileys: a pairing request needs the open connection a QR announcement proves. */
+  pairable = false;
 
   readonly ev: BaileysEventEmitter = {
     on: <T extends keyof BaileysEventMap>(event: T, listener: (arg: BaileysEventMap[T]) => void): void => {
@@ -68,6 +70,11 @@ export class FakeSocket implements WhatsAppSocket {
   };
 
   async emit<T extends keyof BaileysEventMap>(event: T, arg: BaileysEventMap[T]): Promise<void> {
+    if (event === 'connection.update') {
+      const update = arg as BaileysEventMap['connection.update'];
+      if (update.qr) this.pairable = true;
+      if (update.connection === 'close') this.pairable = false;
+    }
     for (const listener of this.listeners.get(event) ?? []) await Promise.resolve(listener(arg));
   }
 
@@ -92,8 +99,15 @@ export class FakeSocket implements WhatsAppSocket {
   async sendPresenceUpdate(status: string, jid?: string): Promise<void> {
     this.presence.push({ status, jid });
   }
-  async requestPairingCode(_phone: string): Promise<string> {
+  async requestPairingCode(phone: string): Promise<string> {
+    if (!this.pairable) throw new Error('Connection Closed');
+    // As Baileys does: the requested phone becomes the credentials' `me` before anything is sent.
+    await this.emit('creds.update', { me: { id: `${phone}@s.whatsapp.net`, name: '~' } });
     return this.pairingCode;
+  }
+  /** What Baileys does on its own once the server is ready for a new device. */
+  announcePairing(): Promise<void> {
+    return this.emit('connection.update', { qr: 'fake-pairing-ref' });
   }
   async groupFetchAllParticipating(): Promise<Record<string, GroupMetadata>> {
     return Object.fromEntries(this.groups);

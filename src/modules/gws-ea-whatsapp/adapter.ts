@@ -74,7 +74,10 @@ export interface WhatsAppAdapter extends ChannelAdapter {
   openDM(handle: string): Promise<string>;
   /** Resolves once this attempt's socket is constructed, not when it opens; re-reads the saved link record first. */
   reconnect(): Promise<void>;
-  /** Authorization and the pairing lifecycle belong to `WhatsAppLinking`; this refuses unless the record is linking. */
+  /**
+   * Authorization and the pairing lifecycle belong to `WhatsAppLinking`; this refuses unless the record is linking,
+   * and asks only once the socket has announced it can pair.
+   */
   requestPairingCode(phoneNumber: string): Promise<string>;
   resolvePerson(jid: string, alternate?: string | null): Promise<WhatsAppPerson | undefined>;
   completeDelivery(rowId: string): void;
@@ -103,6 +106,49 @@ export interface WhatsAppAdapter extends ChannelAdapter {
   ): Promise<'added' | 'invited'>;
 }
 const logger = pino({ level: 'silent' });
+/**
+ * How long a new socket may take to announce it can pair. Added to the version
+ * lookup's own bounded wait, a link still answers inside the 30-second timeouts
+ * of main's tool and the operator command.
+ */
+const PAIRING_READY_MS = 15_000;
+
+/**
+ * Settles when Baileys announces the socket can pair (its first QR) or closes
+ * first: a pairing request sent before that finds no open connection.
+ */
+function pairingAnnounced(current: WhatsAppSocket): Promise<void> {
+  const announced = new Promise<void>((resolve, reject) => {
+    const settle = (update: BaileysEventMap['connection.update']): void => {
+      if (!update.qr && update.connection !== 'close') return;
+      current.ev.off('connection.update', settle);
+      if (update.qr) resolve();
+      else {
+        const reason = update.lastDisconnect?.error?.message;
+        reject(new Error(`WhatsApp closed its pairing connection before it was ready${reason ? `: ${reason}` : ''}`));
+      }
+    };
+    current.ev.on('connection.update', settle);
+  });
+  // Nothing awaits this unless a pairing is requested, so a close must not surface as an unhandled rejection.
+  announced.catch(() => undefined);
+  return announced;
+}
+
+async function withinPairingWait(announced: Promise<void>): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const late = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(
+      () => reject(new Error(`WhatsApp did not open a pairing connection within ${PAIRING_READY_MS / 1000} seconds`)),
+      PAIRING_READY_MS,
+    );
+  });
+  try {
+    await Promise.race([announced, late]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 export function createWhatsAppAdapter(options: WhatsAppAdapterOptions): WhatsAppAdapter {
   const now = options.now ?? Date.now;
@@ -110,6 +156,7 @@ export function createWhatsAppAdapter(options: WhatsAppAdapterOptions): WhatsApp
   const index = new WhatsAppIndex(options.directory, indexAccount);
   const state = new SqliteStateAdapter('gws-ea-whatsapp');
   let socket: WhatsAppSocket | undefined;
+  let pairable: { readonly socket: WhatsAppSocket; readonly announced: Promise<void> } | undefined;
   let connected = false;
   let stopped = false;
   let unlinking = false;
@@ -268,6 +315,7 @@ export function createWhatsAppAdapter(options: WhatsAppAdapterOptions): WhatsApp
       },
     });
     socket = current;
+    pairable = { socket: current, announced: pairingAnnounced(current) };
     const answers = createAnswers({
       state,
       adapterName: 'whatsapp',
@@ -433,8 +481,11 @@ export function createWhatsAppAdapter(options: WhatsAppAdapterOptions): WhatsApp
       const current = await readWhatsAppLink(options.directory);
       if (current?.state !== 'linking') throw new Error('WhatsApp is not linking an account');
       if (!socket || link?.state !== 'linking') await reconnect();
-      if (!socket) throw new ChannelNotConnectedError();
-      return socket.requestPairingCode(phoneNumber);
+      const pairing = socket;
+      if (!pairing || pairable?.socket !== pairing) throw new ChannelNotConnectedError();
+      await withinPairingWait(pairable.announced);
+      if (socket !== pairing) throw new Error('WhatsApp replaced its pairing connection before it was ready');
+      return pairing.requestPairingCode(phoneNumber);
     },
     async resolvePerson(jid, alternate) {
       if (!socket) throw new ChannelNotConnectedError();

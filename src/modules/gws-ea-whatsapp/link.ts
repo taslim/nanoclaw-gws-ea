@@ -67,6 +67,19 @@ function containsNumber(text: string, number: string): boolean {
 function containsBindingCode(text: string, code: string): boolean {
   return text.split(/\s+/u).some((word) => word.replace(/^[^A-Z0-9]+|[^A-Z0-9]+$/gu, '') === code);
 }
+/**
+ * How a pairing attempt ended: its code timed out, its connection closed
+ * before the account connected, or it failed while starting, which the link
+ * request itself reports.
+ */
+type PairingEnd = 'deadline' | 'closed' | 'failed';
+const PAIRING_END_NOTES: Readonly<Record<Exclude<PairingEnd, 'failed'>, string>> = {
+  deadline:
+    'The WhatsApp pairing code expired before the account connected. Tell the principal and get a fresh code when they are ready.',
+  closed:
+    "WhatsApp's pairing connection closed before the account connected. Tell the principal and get a fresh code when they are ready.",
+};
+
 function transport(): WhatsAppAdapter | undefined {
   return getChannelAdapterExact('whatsapp') as WhatsAppAdapter | undefined;
 }
@@ -79,6 +92,7 @@ function status(record: WhatsAppLink | undefined): WhatsAppLinkStatus {
 export class WhatsAppLinking {
   private readonly unregister: () => void;
   private timer: ReturnType<typeof setTimeout> | undefined;
+  private timerEnd: PairingEnd = 'deadline';
   private pairingDeadline: number | undefined;
   private tail: Promise<unknown> = Promise.resolve();
   private adapterStateTail: Promise<unknown> = Promise.resolve();
@@ -124,12 +138,13 @@ export class WhatsAppLinking {
   private notice(notice: WhatsAppLinkNotice): Promise<boolean> {
     return observeWhatsAppLinkNotice(notice);
   }
-  private arm(expiresAt: number): void {
+  private arm(expiresAt: number, end: PairingEnd = 'deadline'): void {
     if (this.timer) clearTimeout(this.timer);
+    this.timerEnd = end;
     this.timer = setTimeout(
       () => {
         this.timer = undefined;
-        void this.serialize(() => this.expire()).catch((error: unknown) =>
+        void this.serialize(() => this.expire(this.timerEnd)).catch((error: unknown) =>
           log.error('Could not expire WhatsApp pairing', { err: error }),
         );
       },
@@ -137,7 +152,7 @@ export class WhatsAppLinking {
     );
     this.timer.unref();
   }
-  /** Before each channel startup: a pairing this process did not start expires at once; its own keeps its deadline. */
+  /** Before each channel startup: a pairing this process did not start ends at once; its own keeps its deadline. */
   async reconcile(): Promise<void> {
     const record = await readWhatsAppLink(this.options.directory);
     // Account state is outside release snapshots. Withdraw authority resurrected by restoring the central DB.
@@ -152,8 +167,8 @@ export class WhatsAppLinking {
     if (record?.principal && record.principalVerifiedAt) await this.completeBinding(record);
     if (record?.state === 'needs-relink' && !record.pairing) await this.connection('close');
     if (!record?.pairing) return;
-    if (record.pairing.expiresAt <= Date.now() || this.pairingDeadline !== record.pairing.expiresAt)
-      await this.expire();
+    if (record.pairing.expiresAt <= Date.now()) await this.expire('deadline');
+    else if (this.pairingDeadline !== record.pairing.expiresAt) await this.expire('closed');
     else this.arm(record.pairing.expiresAt);
   }
   private async admitted(caller: WhatsAppLinkCaller, number?: string, principalNumber?: string): Promise<void> {
@@ -201,7 +216,7 @@ export class WhatsAppLinking {
       if (previous?.pairing && previous.pairing.expiresAt > Date.now())
         throw new Error('The current pairing code is still waiting to be entered.');
       if (previous?.pairing) {
-        await this.expire();
+        await this.expire('deadline');
         previous = await readWhatsAppLink(this.options.directory);
       }
       const profile = await getGwsEaProfile();
@@ -229,7 +244,7 @@ export class WhatsAppLinking {
         const pairingCode = await adapter.requestPairingCode(number.slice(1));
         return { ...status(await readWhatsAppLink(this.options.directory)), pairingCode };
       } catch (error) {
-        await this.expire();
+        await this.expire('failed');
         throw error;
       }
     });
@@ -288,7 +303,7 @@ export class WhatsAppLinking {
       await this.finishConnectedSetup();
     } else if (connection === 'close' && record.pairing) {
       // Do not teardown inside the transport's own awaited event: teardown waits for this event.
-      this.arm(Date.now());
+      this.arm(Date.now(), 'closed');
     } else if (connection === 'close' && record.state === 'needs-relink') {
       const outage = record.outage ?? { id: randomBytes(12).toString('hex') };
       await writeWhatsAppLink(this.options.directory, { ...record, outage });
@@ -365,7 +380,7 @@ export class WhatsAppLinking {
       index.close();
     }
   }
-  private async expire(): Promise<void> {
+  private async expire(end: PairingEnd): Promise<void> {
     const record = await readWhatsAppLink(this.options.directory);
     if (!record?.pairing) return;
     if (this.timer) clearTimeout(this.timer);
@@ -389,7 +404,11 @@ export class WhatsAppLinking {
       const auth = new WhatsAppAuthStore(this.options.directory);
       try {
         authenticated = auth.authenticated;
-        logoutProven = !!record.number && auth.loggedOut(`${record.number.slice(1)}@s.whatsapp.net`);
+        const account = record.number ? `${record.number.slice(1)}@s.whatsapp.net` : undefined;
+        logoutProven = !!account && auth.loggedOut(account);
+        // A code request leaves its phone in the credentials, and Baileys then logs in instead of
+        // registering, so the next pairing would never be offered. Keep only the logout proof.
+        if (!authenticated && logoutProven && account) auth.clear({ kind: 'logged-out', account });
       } finally {
         auth.close();
       }
@@ -411,10 +430,7 @@ export class WhatsAppLinking {
       await fs.rm(path.join(this.options.directory, 'link.json'), { force: true });
       await claimInstanceWhatsApp(this.options.paths, this.options.instanceId, undefined);
     }
-    await this.note(
-      `expired:${record.pairing.expiresAt}`,
-      'The WhatsApp pairing code expired before the account connected. Tell the principal and get a fresh code when they are ready.',
-    );
+    if (end !== 'failed') await this.note(`${end}:${record.pairing.expiresAt}`, PAIRING_END_NOTES[end]);
   }
   unlink(): Promise<WhatsAppLinkStatus> {
     return this.serialize(async () => {
@@ -507,10 +523,10 @@ for (const operation of ['link', 'unlink', 'status'] as const)
     hostOnly: true,
     parseArgs(raw) {
       for (const key of Object.keys(raw))
-        if (operation !== 'link' || !['number', 'principal-number'].includes(key))
-          throw new Error(`Unknown WhatsApp option: ${key}`);
+        if (operation !== 'link' || !['number', 'principal_number'].includes(key))
+          throw new Error(`Unknown WhatsApp option: --${key.replace(/_/gu, '-')}`);
       const number = raw.number;
-      const principal = raw['principal-number'];
+      const principal = raw.principal_number;
       if (
         (number !== undefined && typeof number !== 'string') ||
         (principal !== undefined && typeof principal !== 'string')

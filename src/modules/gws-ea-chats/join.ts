@@ -12,7 +12,11 @@ import { log } from '../../log.js';
 import { runInConversationTail } from '../../router.js';
 import type { MessagingGroup } from '../../types.js';
 import type { AssistantChatChannel } from '../gws-ea-chat/membership.js';
-import { getExternalChatAgentGroupId, isVerifiedPrincipalUser } from '../gws-ea-profile/db.js';
+import {
+  getExternalChatAgentGroupId,
+  isVerifiedPrincipalUser,
+  listVerifiedPrincipalUsers,
+} from '../gws-ea-profile/db.js';
 import { writeNoteForMain } from '../gws-ea-profile/main-note.js';
 import type { WhatsAppAdapter } from '../gws-ea-whatsapp/adapter.js';
 import { getChat, type Chat } from './db.js';
@@ -56,6 +60,10 @@ export async function notifyAskingChat(chat: Chat): Promise<void> {
 }
 /** Both membership events and the first message use the same facts and decision. Caller owns the conversation tail. */
 export async function decideJoin(facts: ChatJoinFacts): Promise<Chat | undefined> {
+  // Admission waits for a bound principal: until then no chat can be known to include
+  // them, main has no one to ask, and their own first DM must stay unclaimed so
+  // binding can wire it to main.
+  if ((await listVerifiedPrincipalUsers()).length === 0) return undefined;
   const external = await getExternalChatAgentGroupId();
   if (external === null) return undefined;
   const now = new Date().toISOString();

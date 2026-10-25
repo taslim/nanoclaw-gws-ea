@@ -184,6 +184,19 @@ beforeEach(async () => {
     .run(
       "UPDATE gws_ea_profile SET assistant_first_name=COALESCE(assistant_first_name,'Juno'),principal_first_name=COALESCE(principal_first_name,'Morgan'),main_agent_group_id='main',external_chat_agent_group_id='external',assistant_first_name = 'Avery', assistant_last_name = NULL WHERE singleton=1",
     );
+  // The chats' principal member is the bound principal, as on every assistant that admits chats.
+  await host.db
+    .getDb()
+    .run(
+      "INSERT OR IGNORE INTO users (id,kind,display_name,created_at) VALUES ('whatsapp:11','whatsapp','Juno',?)",
+      new Date().toISOString(),
+    );
+  await host.db
+    .getDb()
+    .run(
+      "INSERT INTO gws_ea_principal_users (user_id, verified_at) VALUES ('whatsapp:11',?)",
+      new Date().toISOString(),
+    );
   await host.channels.initChannelAdapters(() => ({
     onInbound() {},
     onInboundEvent() {},
