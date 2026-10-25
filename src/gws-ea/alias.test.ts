@@ -254,11 +254,22 @@ describe('the web alias setup step (KTD13)', () => {
     await expect(world.run({ kind: 'added' })).resolves.toEqual({ status: 'ready' });
   });
 
-  it('tries the first candidate at once when the operator says it is added before seeing it', async () => {
+  it('offers the first candidate without confirming it when no pending alias was shown', async () => {
     const world = await stepWorld();
 
-    await expect(world.run({ kind: 'added' })).resolves.toEqual({ status: 'ready' });
-    await expect(getAliasSetup()).resolves.toMatchObject({ alias: ALIAS });
+    expect(paused(await world.run({ kind: 'added' }))).toMatchObject({
+      code: 'alias_required',
+      aliasCandidate: ALIAS,
+    });
+    await expect(getAliasSetup()).resolves.toEqual({ alias: null, candidate: ALIAS });
+    expect(await world.claimed()).toBe(ALIAS);
+  });
+
+  it('confirms an explicitly named alias without a pending candidate', async () => {
+    const world = await stepWorld();
+
+    await expect(world.run({ kind: 'added', name: 'juno.web' })).resolves.toEqual({ status: 'ready' });
+    await expect(getAliasSetup()).resolves.toEqual({ alias: 'juno.web@example.test', candidate: null });
   });
 
   it('moves a taken candidate to the next, and a resume after it offers only the new one', async () => {

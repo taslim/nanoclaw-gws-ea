@@ -458,6 +458,7 @@ export async function ensureAssistantAlias(input: AliasStepInput, reporter: Step
           } else if (address === null) {
             address = (await offerFrom(firstCandidate, null)) ?? null;
             if (address === null) return nameRequired();
+            return addPause(identity, address);
           } else {
             await claim(address);
           }
