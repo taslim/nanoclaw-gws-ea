@@ -18,10 +18,10 @@ import type { ModuleMigration } from '../../db/migrations/index.js';
  * - a link is a reference by id: a thread key, `<calendar id>/<event id>`, a
  *   Drive file id, a person id, or a memory path. `handler` names the agent
  *   that works it;
- * - a thread, event or file sits in at most one open matter. SQLite's partial
- *   index cannot read another table, so each link carries its matter's open
- *   flag, which `db.ts` writes in the same transaction as the matter's open,
- *   close and reopen. A closed matter keeps its links.
+ * - a thread, event, file or job sits in at most one open matter. SQLite's
+ *   partial index cannot read another table, so each link carries its
+ *   matter's open flag, which `db.ts` writes in the same transaction as the
+ *   matter's open, close and reopen. A closed matter keeps its links.
  *
  * Strands stay one level deep, and a project stays open while a strand is:
  * rules across rows, which `db.ts` enforces.
