@@ -56,7 +56,9 @@ beforeEach(async () => {
     );
     CREATE TABLE gws_ea_chat_members (
       messaging_group_id TEXT NOT NULL REFERENCES messaging_groups(id),
-      person_id TEXT REFERENCES gws_ea_people(id)
+      member_key TEXT NOT NULL,
+      person_id TEXT REFERENCES gws_ea_people(id),
+      email TEXT
     );
   `);
   await createAgentGroup({ id: HANDLER, name: 'trip agent', folder: HANDLER, agent_provider: null, created_at: NOW });
@@ -84,8 +86,8 @@ beforeEach(async () => {
       identity: 'email:juno@example.test',
     })
   ).id;
-  await db.run('INSERT INTO gws_ea_chat_members VALUES (?, ?)', CHAT, juno);
-  await db.run('INSERT INTO gws_ea_chat_members VALUES (?, NULL)', CHAT);
+  await db.run('INSERT INTO gws_ea_chat_members VALUES (?, ?, ?, NULL)', CHAT, 'whatsapp:22', juno);
+  await db.run('INSERT INTO gws_ea_chat_members VALUES (?, ?, NULL, NULL)', CHAT, 'whatsapp:33');
 });
 
 afterEach(async () => {

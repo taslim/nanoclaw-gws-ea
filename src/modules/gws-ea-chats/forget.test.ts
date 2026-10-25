@@ -12,6 +12,7 @@ import '../gws-ea-inbox/index.js';
 import { closeDb, getDb } from '../../db/connection.js';
 import { GOOGLE_GRANT_FILE_ENV } from '../gws-ea-google/grant.js';
 import { closeMatter, openMatter, setChatLinkAccount } from '../gws-ea-matters/db.js';
+import { mattersToRewrite } from '../gws-ea-matters/forget.js';
 import { addPerson, forgetPerson } from '../gws-ea-people/db.js';
 import { decideJoin } from './join.js';
 import { forgetFromChatRosters, setChatMemberEmail, type ChatMemberFact } from './roster.js';
@@ -78,14 +79,17 @@ it('clears the account of every chat whose roster holds the forgotten person, in
   expect(await accountsOf(chat.messaging_group_id)).toEqual(cleared);
 });
 
-it('finds the person on a roster row that holds them only by handle', async () => {
+it('finds the person on a roster row that holds them only by handle, for the review and the forget', async () => {
   const { person } = await seedContext();
   const chat = await join('handle@g.us', [{ key: 'whatsapp:22', name: 'Mira', isPrincipal: false }]);
   await getDb().run(
     "UPDATE gws_ea_chat_members SET person_id = NULL WHERE messaging_group_id = ? AND member_key = 'whatsapp:22'",
     chat,
   );
-  await linkedAccount(chat, 'Mira is bringing dessert.');
+  const matter = await linkedAccount(chat, 'Mira is bringing dessert.');
+  expect(await mattersToRewrite({ id: person.id, name: person.name, handles: ['whatsapp:22'] })).toContain(
+    `matter ${matter}`,
+  );
 
   await forgetPerson({ id: person.id });
 
@@ -93,7 +97,7 @@ it('finds the person on a roster row that holds them only by handle', async () =
   expect(await getDb().all("SELECT * FROM gws_ea_chat_members WHERE member_key = 'whatsapp:22'")).toEqual([]);
 });
 
-it('finds the person on a roster row that holds them only by email', async () => {
+it('finds the person on a roster row that holds them only by email, for the review and the forget', async () => {
   await seedContext();
   const remy = await addPerson({
     name: 'Remy Vance',
@@ -104,7 +108,10 @@ it('finds the person on a roster row that holds them only by email', async () =>
   });
   const chat = await join('email@g.us', [{ key: 'whatsapp:44', name: 'Remy', isPrincipal: false }]);
   await setChatMemberEmail(chat, 'whatsapp:44', 'Remy@Example.test', 'main');
-  await linkedAccount(chat, 'Remy sent the agenda.');
+  const matter = await linkedAccount(chat, 'Remy sent the agenda.');
+  expect(await mattersToRewrite({ id: remy.id, name: remy.name, handles: ['email:remy@example.test'] })).toContain(
+    `matter ${matter}`,
+  );
 
   await forgetPerson({ id: remy.id });
 

@@ -80,7 +80,7 @@ export async function mattersToRewrite(person: PersonToForget): Promise<string[]
   const going = new Set((await keptOnlyFor(person.id)).map((matter) => matter.id));
   const isTheirs = addressOf(person.handles);
   const theirThreads = new Set((await threadsWithAddresses(isTheirs)).threadKeys);
-  const theirChats = await chatsWithPerson(person.id);
+  const theirChats = await chatsWithPerson(person);
   const links = await db.all<LinkRef & { readonly matter_id: string }>(
     'SELECT matter_id, kind, reference FROM gws_ea_matter_links',
   );

@@ -1,7 +1,7 @@
 import { getDb } from '../../db/connection.js';
 import { identityMatchKey, normalizePrincipalEmail } from '../../gws-ea/validation.js';
 import { clearChatLinkAccounts } from '../gws-ea-matters/db.js';
-import type { ForgottenPerson } from '../gws-ea-people/db.js';
+import { isPersonsRecord, type ForgottenPerson } from '../gws-ea-people/db.js';
 import { isVerifiedPrincipalUser } from '../gws-ea-profile/db.js';
 
 export interface ChatMemberFact {
@@ -121,18 +121,11 @@ export async function setChatMemberEmail(
  * roster is the only record of which chats those are.
  */
 export async function forgetFromChatRosters(person: ForgottenPerson): Promise<void> {
-  const handles = new Set(person.handles);
-  const emails = new Set(
-    person.handles.filter((handle) => handle.toLowerCase().startsWith('email:')).map(identityMatchKey),
-  );
   const db = getDb();
   await db.transaction(async () => {
     const rows = await db.all<ChatMember>('SELECT * FROM gws_ea_chat_members');
-    const theirs = rows.filter(
-      (row) =>
-        row.person_id === person.id ||
-        handles.has(row.member_key) ||
-        (row.email !== null && emails.has(identityMatchKey(`email:${row.email}`))),
+    const theirs = rows.filter((row) =>
+      isPersonsRecord(person, { personId: row.person_id, key: row.member_key, email: row.email }),
     );
     if (theirs.length === 0) return;
     if (await db.hasTable('gws_ea_matter_links'))
