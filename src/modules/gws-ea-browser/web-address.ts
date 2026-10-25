@@ -32,7 +32,7 @@ function mailbox(address: string): string {
 }
 
 interface WebIdentity {
-  /** The verified alias, or null until gws-ea records one. */
+  /** The configured alias, or null until gws-ea records one. */
   readonly alias: string | null;
   /** Whether `address` reaches the assistant's mailbox other than through its alias: an address it converses from. */
   conversesFrom(address: string): boolean;

@@ -119,7 +119,7 @@ const googleClient: OptionDefinition = {
 };
 /** The operator's word on the assistant's web alias (KTD13), wherever its setup step runs. */
 const aliasOptions: readonly OptionDefinition[] = [
-  flag('alias-added', 'Confirm the offered web alias is added in the Google Admin console; sends it a test message.'),
+  flag('alias-added', 'Confirm the offered web alias is added in the Google Admin console.'),
   flag('alias-taken', 'The Admin console refused the offered web alias as already in use; offer the next name.'),
   value('alias', 'name', "Use this name, or whole address, for the assistant's web alias instead of the offered one."),
 ];
@@ -285,7 +285,7 @@ export const COMMAND_DEFINITIONS: readonly CommandDefinition[] = [
     ],
     effects: [
       'Continues journaled provisioning and its pending human step.',
-      "Then sets up an enabled browser's web alias, verifying it with a test message once it is added.",
+      "Then asks the operator to confirm the enabled browser's web alias is added.",
     ],
     prerequisites: assistantPrerequisites,
     recovery: ["Rerun resume with the pause's supplied inputs, or remove the partially created assistant."],
@@ -620,7 +620,7 @@ export const COMMAND_DEFINITIONS: readonly CommandDefinition[] = [
           : command === 'enable'
             ? [
                 'Writes the enabled owner-only instance policy; host reconciliation activates the browser.',
-                "Then sets up the assistant's web alias: pauses until it is added in the Google Admin console, and verifies it with a test message.",
+                "Then shows the assistant's web alias and waits for the operator to confirm they added it in the Google Admin console.",
                 'With --agent-group, first asks the running assistant to confirm it reads an access list and has each group; neither browser nor external-email can be listed. A group no longer listed has its jobs cancelled.',
               ]
             : [

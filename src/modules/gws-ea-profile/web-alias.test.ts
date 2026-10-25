@@ -1,94 +1,101 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
+import { dispatch } from '../../cli/dispatch.js';
 import { closeDb, initTestDb, runMigrations } from '../../db/index.js';
-import { publishAliasTestProfile } from '../gws-ea-inbox/testing/alias-mailbox.js';
-import { getAliasSetup, proposeAliasCandidate, recordAliasProbe, recordVerifiedAlias } from './db.js';
+import { ALIAS, publishAliasTestProfile } from './testing/alias-profile.js';
+import { addPrincipalAddress, confirmAliasCandidate, getAliasSetup, proposeAliasCandidate } from './db.js';
 import './index.js';
-
-const PROBE = '<alias-check.0123456789abcdef0123456789abcdef@example.test>';
-const LATER_PROBE = '<alias-check.fedcba9876543210fedcba9876543210@example.test>';
 
 beforeEach(async () => {
   await runMigrations(await initTestDb());
   await publishAliasTestProfile();
 });
 
-afterEach(async () => {
-  await closeDb();
+afterEach(async () => closeDb());
+
+describe("the assistant's operator-confirmed web alias", () => {
+  it('keeps a proposal pending until the operator confirms it, then records it idempotently', async () => {
+    expect(await getAliasSetup()).toEqual({ alias: null, candidate: null });
+    expect(await proposeAliasCandidate('ONUJ@example.test')).toEqual({ alias: null, candidate: ALIAS });
+    expect(await confirmAliasCandidate(ALIAS)).toBe(true);
+    expect(await getAliasSetup()).toEqual({ alias: ALIAS, candidate: null });
+    expect(await confirmAliasCandidate(ALIAS)).toBe(true);
+  });
+
+  it('refuses a stale confirmation after a candidate changes or is withdrawn', async () => {
+    await proposeAliasCandidate(ALIAS);
+    await proposeAliasCandidate('onuj2@example.test');
+    expect(await confirmAliasCandidate(ALIAS)).toBe(false);
+    expect(await getAliasSetup()).toEqual({ alias: null, candidate: 'onuj2@example.test' });
+    await proposeAliasCandidate(null);
+    expect(await confirmAliasCandidate('onuj2@example.test')).toBe(false);
+    expect(await getAliasSetup()).toEqual({ alias: null, candidate: null });
+  });
+
+  it('rechecks principal-address conflicts at confirmation', async () => {
+    await proposeAliasCandidate(ALIAS);
+    await addPrincipalAddress(ALIAS);
+    await expect(confirmAliasCandidate(ALIAS)).rejects.toThrow(/principal's address/u);
+    expect((await getAliasSetup()).alias).toBeNull();
+  });
+
+  it('refuses invalid and conflicting proposals, and keeps a recorded alias fixed', async () => {
+    await expect(proposeAliasCandidate('Juno+web@example.test')).rejects.toThrow(/assistant's own address/u);
+    await expect(proposeAliasCandidate('Morgan@example.test')).rejects.toThrow(/principal's address/u);
+    await expect(proposeAliasCandidate('onuj')).rejects.toThrow(/not an email address/u);
+    await proposeAliasCandidate(ALIAS);
+    await confirmAliasCandidate(ALIAS);
+    await expect(proposeAliasCandidate('onuj2@example.test')).rejects.toThrow(/already/u);
+    expect(await confirmAliasCandidate('onuj2@example.test')).toBe(false);
+    expect((await getAliasSetup()).alias).toBe(ALIAS);
+  });
 });
 
-describe("the assistant's web alias in its profile (KTD13)", () => {
-  it('holds nothing until a candidate is proposed, and no alias until a probe proves it', async () => {
-    await expect(getAliasSetup()).resolves.toEqual({ alias: null, candidate: null, probe_message_id: null });
+describe('the profile-owned alias commands', () => {
+  const run = (command: string, args: Record<string, unknown> = {}) =>
+    dispatch({ id: command, command, args }, { caller: 'host' });
 
-    await expect(proposeAliasCandidate('ONUJ@example.test')).resolves.toEqual({
-      alias: null,
-      candidate: 'onuj@example.test',
-      probe_message_id: null,
+  it('records operator confirmation without a running inbox and rejects a changed candidate', async () => {
+    await run('gws-ea-alias-propose', { address: ALIAS });
+    expect(await run('gws-ea-alias-confirm', { address: 'onuj2@example.test' })).toMatchObject({ ok: false });
+    expect(await run('gws-ea-alias-confirm', { address: ALIAS })).toMatchObject({
+      ok: true,
+      data: { alias: ALIAS, candidate: null },
     });
-    await expect(recordAliasProbe('onuj@example.test', PROBE)).resolves.toBe(true);
-    await expect(getAliasSetup()).resolves.toEqual({
-      alias: null,
-      candidate: 'onuj@example.test',
-      probe_message_id: PROBE,
-    });
-
-    await expect(recordVerifiedAlias('onuj@example.test', PROBE)).resolves.toBe(true);
-    await expect(getAliasSetup()).resolves.toEqual({
-      alias: 'onuj@example.test',
-      candidate: null,
-      probe_message_id: null,
-    });
+    expect(await run('gws-ea-alias-get')).toMatchObject({ ok: true, data: { alias: ALIAS, candidate: null } });
   });
 
-  it('keeps a probe while the same candidate is proposed again, and forgets it for a new one', async () => {
-    await proposeAliasCandidate('onuj@example.test');
-    await recordAliasProbe('onuj@example.test', PROBE);
-
-    await proposeAliasCandidate('onuj@example.test');
-    await expect(getAliasSetup()).resolves.toMatchObject({ probe_message_id: PROBE });
-
-    await proposeAliasCandidate('onuj2@example.test');
-    await expect(getAliasSetup()).resolves.toEqual({
-      alias: null,
-      candidate: 'onuj2@example.test',
-      probe_message_id: null,
-    });
-    await proposeAliasCandidate(null);
-    await expect(getAliasSetup()).resolves.toEqual({ alias: null, candidate: null, probe_message_id: null });
+  it('withdraws a candidate and refuses missing or unknown fields', async () => {
+    await run('gws-ea-alias-propose', { address: ALIAS });
+    expect(await run('gws-ea-alias-propose', { none: true })).toMatchObject({ ok: true, data: { candidate: null } });
+    for (const [command, args] of [
+      ['gws-ea-alias-propose', {}],
+      ['gws-ea-alias-propose', { address: ALIAS, none: true }],
+      ['gws-ea-alias-confirm', {}],
+      ['gws-ea-alias-confirm', { address: ALIAS, send: true }],
+      ['gws-ea-alias-get', { address: ALIAS }],
+    ] as const)
+      expect(await run(command, args)).toMatchObject({ ok: false });
   });
 
-  it('never records a candidate the operator has moved on from, nor one a later probe replaced', async () => {
-    await proposeAliasCandidate('onuj@example.test');
-    await recordAliasProbe('onuj@example.test', PROBE);
-    // The operator found it taken and moved to the next candidate before the probe was read back.
-    await proposeAliasCandidate('onuj2@example.test');
-
-    await expect(recordAliasProbe('onuj@example.test', LATER_PROBE)).resolves.toBe(false);
-    await expect(recordVerifiedAlias('onuj@example.test', PROBE)).resolves.toBe(false);
-    await expect(getAliasSetup()).resolves.toEqual({
-      alias: null,
-      candidate: 'onuj2@example.test',
-      probe_message_id: null,
-    });
-
-    await recordAliasProbe('onuj2@example.test', PROBE);
-    await recordAliasProbe('onuj2@example.test', LATER_PROBE);
-    await expect(recordVerifiedAlias('onuj2@example.test', PROBE)).resolves.toBe(false);
-    await expect(recordVerifiedAlias('onuj2@example.test', LATER_PROBE)).resolves.toBe(true);
-    await expect(getAliasSetup()).resolves.toMatchObject({ alias: 'onuj2@example.test' });
-  });
-
-  it("refuses a candidate that is the assistant's own address, the principal's, malformed, or after one is verified", async () => {
-    await expect(proposeAliasCandidate('Juno@example.test')).rejects.toThrow(/assistant's own address/u);
-    await expect(proposeAliasCandidate('morgan@example.test')).rejects.toThrow(/principal's address/u);
-    await expect(proposeAliasCandidate('onuj')).rejects.toThrow(/not an email address/u);
-
-    await proposeAliasCandidate('onuj@example.test');
-    await recordAliasProbe('onuj@example.test', PROBE);
-    await recordVerifiedAlias('onuj@example.test', PROBE);
-    await expect(proposeAliasCandidate('onuj2@example.test')).rejects.toThrow(/already onuj@example.test/u);
-    await expect(recordAliasProbe('onuj@example.test', LATER_PROBE)).resolves.toBe(false);
-    await expect(getAliasSetup()).resolves.toMatchObject({ alias: 'onuj@example.test', candidate: null });
+  it('keeps every alias command operator-only', async () => {
+    for (const [command, args] of [
+      ['gws-ea-alias-get', {}],
+      ['gws-ea-alias-propose', { address: ALIAS }],
+      ['gws-ea-alias-confirm', { address: ALIAS }],
+    ] as const) {
+      expect(
+        await dispatch(
+          { id: command, command, args },
+          {
+            caller: 'agent',
+            sessionId: 'session-main',
+            agentGroupId: 'ag-main',
+            messagingGroupId: 'mg-dm',
+          },
+        ),
+      ).toMatchObject({ ok: false, error: { message: expect.stringMatching(/operator-only/u) } });
+    }
+    expect(await getAliasSetup()).toEqual({ alias: null, candidate: null });
   });
 });

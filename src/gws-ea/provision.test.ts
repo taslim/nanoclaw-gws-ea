@@ -2854,9 +2854,9 @@ describe('the web alias an assistant with the browser enabled gets (KTD13)', () 
             principal_emails: ['principal@example.test'],
           };
         case 'gws-ea-alias get':
-          return { alias: null, candidate: null, probe_sent: false };
+          return { alias: null, candidate: null };
         case 'gws-ea-alias propose':
-          return { alias: null, candidate: args[args.indexOf('--address') + 1], probe_sent: false };
+          return { alias: null, candidate: args[args.indexOf('--address') + 1] };
         default:
           throw new Error(`unexpected ncl ${args.join(' ')}`);
       }

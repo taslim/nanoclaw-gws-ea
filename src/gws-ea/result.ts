@@ -31,7 +31,7 @@ export interface OperationData {
   readonly preparation?: { readonly bootstrap_manifest: 'retained' | 'unknown'; readonly reservation: 'unknown' };
   readonly pause?: Pick<
     ProvisionHumanPause,
-    'phase' | 'code' | 'message' | 'details' | 'actionUrl' | 'resumeFlag' | 'choices'
+    'phase' | 'code' | 'message' | 'details' | 'actionUrl' | 'aliasCandidate' | 'resumeFlag' | 'choices'
   >;
   readonly preview?: RemovalPreview | UpdatePreview | RollbackPreview;
   readonly staging?: { readonly retained: true; readonly release: import('./types.js').ReleaseCoordinates };

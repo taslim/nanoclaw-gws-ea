@@ -52,10 +52,9 @@ export const gwsEaBrowserPointerMigration: ModuleMigration = {
 };
 
 /**
- * The assistant's web alias (KTD13): the alias once a probe verifies it, and
- * until then the candidate the operator was asked to add and the Message-ID
- * of the probe sent to it. All three are written together by one
- * compare-and-set; a profile from before holds none.
+ * Original web alias schema (KTD13). The later alias-confirmation migration
+ * removes the obsolete delivery-probe field without changing the recorded
+ * alias or its pending candidate.
  */
 export const gwsEaWebAliasMigration: ModuleMigration = {
   version: 5,
@@ -123,5 +122,14 @@ export const gwsEaPrincipalAddressesMigration: ModuleMigration = {
         added_at  TEXT NOT NULL
       );
     `);
+  },
+};
+
+/** Delivery probes are no longer part of alias setup; preserve recorded aliases and pending candidates. */
+export const gwsEaAliasConfirmationMigration: ModuleMigration = {
+  version: 9,
+  name: 'module:gws-ea-profile:alias-confirmation',
+  async up(db) {
+    await db.exec('ALTER TABLE gws_ea_profile DROP COLUMN alias_probe_message_id;');
   },
 };

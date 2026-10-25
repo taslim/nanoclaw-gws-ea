@@ -82,6 +82,7 @@ const ALIAS_REQUIRED = pause({
   details: ['Add the alternate email onuj on example.test, then Save'],
   actionUrl: 'https://admin.google.com/ac/users',
   resumeFlag: '--alias-added',
+  aliasCandidate: 'onuj@example.test',
 });
 
 describe("attending the web alias's pauses", () => {
@@ -89,7 +90,7 @@ describe("attending the web alias's pauses", () => {
     const added = prompts('added');
     await expect(attendPause(ALIAS_REQUIRED, new AbortController().signal, { prompts: added })).resolves.toEqual({
       kind: 'continue',
-      decisions: { alias: { kind: 'added' } },
+      decisions: { alias: { kind: 'added', expectedCandidate: 'onuj@example.test' } },
     });
     expect(added.note).toHaveBeenCalledWith(
       'Add the alternate email onuj on example.test, then Save\nOpen: https://admin.google.com/ac/users',
@@ -99,7 +100,7 @@ describe("attending the web alias's pauses", () => {
       expect.objectContaining({
         message: ALIAS_REQUIRED.message,
         options: [
-          { value: 'added', label: 'It is added' },
+          { value: 'added', label: 'I have added this alias to the assistant’s account' },
           { value: 'taken', label: 'The Admin console says it is already in use' },
           { value: 'named', label: 'Use a name of my own' },
         ],
@@ -108,13 +109,16 @@ describe("attending the web alias's pauses", () => {
 
     await expect(
       attendPause(ALIAS_REQUIRED, new AbortController().signal, { prompts: prompts('taken') }),
-    ).resolves.toEqual({ kind: 'continue', decisions: { alias: { kind: 'taken' } } });
+    ).resolves.toEqual({
+      kind: 'continue',
+      decisions: { alias: { kind: 'taken', expectedCandidate: 'onuj@example.test' } },
+    });
 
     const named = prompts('named');
     named.text.mockResolvedValueOnce('postmaster').mockResolvedValueOnce(' Juno.Web ');
     await expect(attendPause(ALIAS_REQUIRED, new AbortController().signal, { prompts: named })).resolves.toEqual({
       kind: 'continue',
-      decisions: { alias: { kind: 'named', name: 'Juno.Web' } },
+      decisions: { alias: { kind: 'named', name: 'Juno.Web', expectedCandidate: 'onuj@example.test' } },
     });
     // A name the Admin console would refuse, or a role address, is asked for again.
     expect(named.info).toHaveBeenCalledWith(expect.stringContaining('role address'));
@@ -125,30 +129,6 @@ describe("attending the web alias's pauses", () => {
     ).resolves.toEqual({ kind: 'stop' });
   });
 
-  it('checks again for a test message not yet arrived, without sending another', async () => {
-    const waiting = pause({
-      phase: 'provision_alias',
-      code: 'alias_not_delivered',
-      message: 'The test message to onuj@example.test has not arrived yet.',
-      details: [],
-    });
-    const terminal = prompts('check');
-
-    await expect(attendPause(waiting, new AbortController().signal, { prompts: terminal })).resolves.toEqual({
-      kind: 'continue',
-      decisions: { alias: undefined },
-    });
-    expect(terminal.select).toHaveBeenCalledWith(
-      expect.objectContaining({
-        options: [
-          { value: 'check', label: 'Check again' },
-          { value: 'taken', label: 'The Admin console says it is already in use' },
-          { value: 'named', label: 'Use a name of my own' },
-        ],
-      }),
-    );
-  });
-
   it('asks for a name when the assistant has none to offer, and stops while its host is down', async () => {
     const unnamed = pause({
       phase: 'provision_alias',
@@ -156,10 +136,11 @@ describe("attending the web alias's pauses", () => {
       message: 'Name Aaa\'s web alias: "Aaa" reads the same reversed and rotated.',
       details: [],
       resumeFlag: '--alias <name>',
+      aliasCandidate: null,
     });
     await expect(attendPause(unnamed, new AbortController().signal, { prompts: prompts('aaa.web') })).resolves.toEqual({
       kind: 'continue',
-      decisions: { alias: { kind: 'named', name: 'aaa.web' } },
+      decisions: { alias: { kind: 'named', name: 'aaa.web', expectedCandidate: null } },
     });
 
     const stopped = prompts('added');

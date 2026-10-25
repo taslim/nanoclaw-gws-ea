@@ -104,7 +104,7 @@ export function resolvePrincipalAddress(address: string, listed: readonly string
 /**
  * Why `email` cannot be one of the principal's addresses beside `listed`, or
  * undefined when it can (R3): it is one of the `assistant`'s own addresses
- * (its Workspace email and, once verified, its web alias) in any spelling
+ * (its Workspace email and, once configured, its web alias) in any spelling
  * that reaches the assistant's mailbox (`identityMatchKey`, which widens a
  * refusal), or another spelling of a listed address under R1. The same
  * spelling again is no conflict.

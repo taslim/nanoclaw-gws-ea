@@ -373,7 +373,27 @@ function nextActionLines(actions: readonly NextAction[]): string[] {
   );
 }
 
-/** The web alias decision `--alias-added`, `--alias-taken` and `--alias <name>` make (KTD13). */
+async function attendBrowserAliasPause(
+  pause: NonNullable<BrowserOperationData['pause']>,
+  prompts: InteractivePrompts,
+  presenter: Presenter,
+): Promise<AliasDecision | undefined> {
+  const waiting = new AbortController();
+  const interrupt = (): void => waiting.abort();
+  for (const signal of INTERRUPT_SIGNALS) process.on(signal, interrupt);
+  presenter.suspend();
+  try {
+    const response = await prompts.attendPause({ ...pause, kind: 'human-action' }, waiting.signal);
+    const answer = response.kind === 'continue' && !waiting.signal.aborted ? response.decisions?.alias : undefined;
+    return answer && pause.aliasCandidate !== undefined
+      ? { ...answer, expectedCandidate: pause.aliasCandidate }
+      : answer;
+  } finally {
+    presenter.resume();
+    for (const signal of INTERRUPT_SIGNALS) process.off(signal, interrupt);
+  }
+}
+
 function aliasDecisionOf(options: CommandOptions): AliasDecision | undefined {
   return aliasDecision({
     added: options['alias-added'] === 'true',
@@ -2650,23 +2670,32 @@ export async function runCli(args: readonly string[], runtime: CliRuntime = {}):
             const agentGroupIds = invocation.repeated['agent-group'] ?? [];
             if (agentGroupIds.length > 0 && options['main-only'] === 'true')
               throw new GwsEaError('invalid_arguments', 'Use --agent-group or --main-only, not both.');
-            const decision = aliasDecisionOf(options);
-            const enabled = await enableBrowserWithAlias(
-              paths,
-              instanceId,
-              {
-                ...dependencies,
-                ncl: runtime.browserInspection?.ncl,
-                alias: { decision },
-                emit: (event) => presenter.event(event),
-              },
-              agentGroupIds.length > 0
-                ? { kind: 'agent_groups', agentGroupIds }
-                : options['main-only'] === 'true'
-                  ? { kind: 'main' }
-                  : undefined,
-            );
+            let decision = aliasDecisionOf(options);
+            const enable = () =>
+              enableBrowserWithAlias(
+                paths,
+                instanceId,
+                {
+                  ...dependencies,
+                  ncl: runtime.browserInspection?.ncl,
+                  alias: { decision },
+                  emit: (event) => presenter.event(event),
+                },
+                agentGroupIds.length > 0
+                  ? { kind: 'agent_groups', agentGroupIds }
+                  : options['main-only'] === 'true'
+                    ? { kind: 'main' }
+                    : undefined,
+              );
+            let enabled = await enable();
             data = enabled;
+            while (enabled.pause && runtime.prompts) {
+              const answer = await attendBrowserAliasPause(enabled.pause, runtime.prompts, presenter);
+              if (answer === undefined) break;
+              decision = answer;
+              enabled = await enable();
+              data = enabled;
+            }
             if (enabled.pause) {
               const pause = enabled.pause;
               const next = browserAliasNextActions(instanceId, pause);

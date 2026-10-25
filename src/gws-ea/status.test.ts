@@ -943,7 +943,7 @@ describe('status', () => {
     expect(observed.status.probes.external_email).toMatchObject({ status: 'ok' });
   });
 
-  it('reports the web alias an enabled browser needs: not needed, pending with what to do, then verified', async () => {
+  it('reports the web alias an enabled browser needs: not needed, pending with what to do, then configured', async () => {
     const host = await machine();
     const reservation = await assistant(host, { label: 'alpha', port: 36_001 });
     const id = reservation.instance_id;
@@ -959,31 +959,29 @@ describe('status', () => {
     const observe = (setup: unknown) => statusJson(host, state, id, { ...healthy, ncl: reporting(setup) });
     const enable = ['gws-ea', 'capabilities', 'enable', 'browser', '--id', id];
 
-    const disabled = await observe({ alias: null, candidate: null, probe_sent: false });
+    const disabled = await observe({ alias: null, candidate: null });
     expect(disabled.status.probes.web_alias).toEqual({
       status: 'ok',
       reason: null,
       state: 'not_needed',
       address: null,
-      probe_sent: null,
     });
     expect(asked).not.toContain('gws-ea-alias get');
 
     await enableBrowserCapability(host.paths, id);
-    const unchosen = await observe({ alias: null, candidate: null, probe_sent: false });
+    const unchosen = await observe({ alias: null, candidate: null });
     expect(unchosen.status.probes.web_alias).toEqual({
       status: 'degraded',
       reason: `Setup is incomplete: the browser is enabled, but the assistant has no web alias yet. Run gws-ea capabilities enable browser --id ${id} to choose one.`,
       state: 'pending',
       address: null,
-      probe_sent: false,
     });
     expect(unchosen.nextActions).toContainEqual({ kind: 'command', argv: enable });
 
-    const unadded = await observe({ alias: null, candidate: 'onuj@example.test', probe_sent: false });
+    const unadded = await observe({ alias: null, candidate: 'onuj@example.test' });
     expect(unadded.status.probes.web_alias).toMatchObject({
       status: 'degraded',
-      reason: `Setup is incomplete: the web alias onuj@example.test is not added yet. Add it in the Google Admin console, then run gws-ea capabilities enable browser --id ${id} --alias-added.`,
+      reason: `Setup is incomplete: the web alias onuj@example.test needs the operator’s confirmation. Add it in the Google Admin console, then run gws-ea capabilities enable browser --id ${id} --alias-added.`,
       address: 'onuj@example.test',
     });
     expect(unadded.nextActions).toContainEqual({ kind: 'command', argv: [...enable, '--alias-added'] });
@@ -993,27 +991,18 @@ describe('status', () => {
       argv: ['gws-ea', 'logs', '--id', id, '--errors'],
     });
 
-    const unverified = await observe({ alias: null, candidate: 'onuj@example.test', probe_sent: true });
-    expect(unverified.status.probes.web_alias).toMatchObject({
-      status: 'degraded',
-      reason: `Setup is incomplete: the web alias onuj@example.test is not verified yet, as its test message has not arrived. Check again with gws-ea capabilities enable browser --id ${id}.`,
-      probe_sent: true,
-    });
-    expect(unverified.nextActions).toContainEqual({ kind: 'command', argv: enable });
-
-    const verified = await observe({ alias: 'onuj@example.test', candidate: null, probe_sent: false });
-    expect(verified.status.probes.web_alias).toEqual({
+    const configured = await observe({ alias: 'onuj@example.test', candidate: null });
+    expect(configured.status.probes.web_alias).toEqual({
       status: 'ok',
       reason: null,
-      state: 'verified',
+      state: 'configured',
       address: 'onuj@example.test',
-      probe_sent: false,
     });
-    expect(verified.nextActions).toEqual([]);
+    expect(configured.nextActions).toEqual([]);
 
     const { runtime, output } = command(host, state, {
       ...healthy,
-      ncl: reporting({ alias: null, candidate: 'onuj@example.test', probe_sent: false }),
+      ncl: reporting({ alias: null, candidate: 'onuj@example.test' }),
     });
     expect(await runStatusCommand(runtime, { instanceId: id, json: false })).toBe(0);
     expect(output.stdout).toContain('  Web alias: pending onuj@example.test');

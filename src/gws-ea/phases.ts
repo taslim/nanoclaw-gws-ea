@@ -33,6 +33,8 @@ export interface ProvisionHumanPause {
   readonly message: string;
   readonly details?: readonly string[];
   readonly actionUrl?: string;
+  /** The alias this prompt concerns, or null when the operator must name one. */
+  readonly aliasCandidate?: string | null;
   /** What the resume command adds once the person has acted; with `choices`, the chosen `id` follows it. */
   readonly resumeFlag?: string;
   /** The options the person picks one of, such as the billing account to link. */

@@ -1480,7 +1480,7 @@ const ONEPASSWORD_STEP = {
 /**
  * Once every step is complete: the optional resources the operator's
  * enablement gives an assistant, its 1Password vault (KTD3), then, while its
- * browser is enabled, its verified web alias (KTD13). The assistant is
+ * browser is enabled, its configured web alias (KTD13). The assistant is
  * already talkable, so what waits here waits on the operator, with the cause
  * and the command that clears it; a resume of an assistant already
  * provisioned costs no request and no prompt.

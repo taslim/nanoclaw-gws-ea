@@ -360,12 +360,10 @@ describe('assistant browser capability', () => {
 });
 
 describe('the browser access setting', () => {
-  /** The running host as `ncl` reaches it: what it reads, its profile, its agent groups and its verified web alias. */
   function host(options: { readonly versions?: readonly number[]; readonly down?: boolean } = {}) {
     const ncl = async (_runtime: unknown, args: readonly string[]): Promise<unknown> => {
       if (options.down) throw new Error('host down');
-      if (args.join(' ') === 'gws-ea-alias get')
-        return { alias: 'onuj@example.test', candidate: null, probe_sent: false };
+      if (args.join(' ') === 'gws-ea-alias get') return { alias: 'onuj@example.test', candidate: null };
       if (args[0] === 'gws-ea-browser-health')
         return {
           schemaVersion: 1,
@@ -516,7 +514,6 @@ describe('the browser access setting', () => {
         paths: f.paths,
         stdout: (line) => stdout.push(line),
         stderr: () => undefined,
-        // The assistant's web alias is already verified, so the grant completes without a pause.
         browserInspection: { ncl: host({ versions: [1, 2] }).ncl },
       },
     );

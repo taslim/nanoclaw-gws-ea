@@ -1,8 +1,8 @@
 /**
  * The assistant's web alias (KTD13): one address of its own that it uses for
  * everything it does on the web in its own name. gws-ea derives its name,
- * the operator adds it in the Google Admin console, and a probe email from
- * the assistant to the alias verifies it before the host records it.
+ * the operator adds it in the Google Admin console and confirms it before
+ * the host records it.
  *
  * The name is the assistant's name, lowercased, in ASCII, without spaces,
  * and reversed (R21); a palindrome moves its first letter to the end
@@ -14,11 +14,9 @@
  * The setup step runs once every journaled step is complete, and only while
  * the assistant's browser is enabled. It claims its candidate in the
  * registry under the machine lock, has the host ask for it, and pauses with
- * the Admin console steps; `--alias-added` sends the probe, `--alias-taken`
+ * the Admin console steps; `--alias-added` records the confirmation, `--alias-taken`
  * moves to the next candidate, and `--alias <name>` uses the operator's own.
  */
-import { setTimeout as delay } from 'node:timers/promises';
-
 import { runStep, type StepReporter } from './events.js';
 import { runInstanceNclJson } from './ncl.js';
 import type { ControlPlanePaths } from './paths.js';
@@ -190,10 +188,11 @@ export function parseAliasName(value: string): AliasName {
 // ---------------------------------------------------------------------------
 
 /** The operator's word on the alias: `--alias-added` (with `--alias`, for that name), `--alias-taken`, or `--alias`. */
-export type AliasDecision =
+export type AliasDecision = (
   | { readonly kind: 'added'; readonly name?: string }
   | { readonly kind: 'taken' }
-  | { readonly kind: 'named'; readonly name: string };
+  | { readonly kind: 'named'; readonly name: string }
+) & { readonly expectedCandidate?: string | null };
 
 /**
  * The decision the alias flags make, or undefined without one; `--alias-taken`
@@ -220,9 +219,6 @@ export const ALIAS_STEP = { id: 'provision_alias', label: "Setting up the assist
 /** Where the operator adds an alias: the Admin console's user list, which opens the assistant's account. */
 const ADMIN_CONSOLE_USERS_URL = 'https://admin.google.com/ac/users';
 
-/** Seconds between read-backs of a probe just sent, before the step pauses until a later resume. */
-const PROBE_READ_BACK_WAITS_SECONDS = [2, 3, 5, 5, 5, 10] as const;
-
 /** The assistant as the alias step names it, from the profile its host serves. */
 export interface AliasIdentity {
   readonly name: string;
@@ -235,19 +231,14 @@ export interface AliasIdentity {
 export interface HostAliasSetup {
   readonly alias: string | null;
   readonly candidate: string | null;
-  readonly probeSent: boolean;
 }
-
-/** Where the host's probe left the candidate (`gws-ea-alias probe`; src/modules/gws-ea-inbox/alias-probe.ts). */
-const PROBE_OUTCOMES = ['verified', 'bounced', 'group', 'not_yet', 'not_sent', 'superseded'] as const;
-export type ProbeOutcome = (typeof PROBE_OUTCOMES)[number];
 
 /** The running host's alias commands, and the profile they serve. */
 export interface AliasHost {
   identity(): Promise<AliasIdentity>;
   setup(): Promise<HostAliasSetup>;
   propose(address: string | null): Promise<HostAliasSetup>;
-  probe(address: string, send: boolean): Promise<ProbeOutcome>;
+  confirm(address: string): Promise<HostAliasSetup>;
 }
 
 function invalidHostOutput(): GwsEaError {
@@ -262,8 +253,8 @@ function nullableText(value: unknown): string | null {
 
 function parseSetup(value: unknown): HostAliasSetup {
   const data = unwrapData(value);
-  if (!isRecord(data) || typeof data.probe_sent !== 'boolean') throw invalidHostOutput();
-  return { alias: nullableText(data.alias), candidate: nullableText(data.candidate), probeSent: data.probe_sent };
+  if (!isRecord(data)) throw invalidHostOutput();
+  return { alias: nullableText(data.alias), candidate: nullableText(data.candidate) };
 }
 
 /** The host's alias commands, run through `run`: `ncl <args> --json` against the assistant's own host. */
@@ -286,14 +277,7 @@ export function aliasHost(run: (args: readonly string[]) => Promise<unknown>): A
     setup: async () => parseSetup(await run(['gws-ea-alias', 'get'])),
     propose: async (address) =>
       parseSetup(await run(['gws-ea-alias', 'propose', ...(address === null ? ['--none'] : ['--address', address])])),
-    async probe(address, send) {
-      const result = unwrapData(
-        await run(['gws-ea-alias', 'probe', '--address', address, ...(send ? ['--send'] : [])]),
-      );
-      const outcome = isRecord(result) ? result.outcome : undefined;
-      if (!PROBE_OUTCOMES.some((known) => known === outcome)) throw invalidHostOutput();
-      return outcome as ProbeOutcome;
-    },
+    confirm: async (address) => parseSetup(await run(['gws-ea-alias', 'confirm', '--address', address])),
   };
 }
 
@@ -317,7 +301,7 @@ function pause(
   code: string,
   message: string,
   details: readonly string[],
-  extra: Pick<ProvisionHumanPause, 'resumeFlag' | 'actionUrl'> = {},
+  extra: Pick<ProvisionHumanPause, 'resumeFlag' | 'actionUrl' | 'aliasCandidate'> = {},
 ): ProvisionResult {
   return { status: 'paused', pause: { kind: 'human-action', phase: ALIAS_STEP.id, code, message, details, ...extra } };
 }
@@ -343,7 +327,7 @@ function addPause(identity: AliasIdentity, address: string): ProvisionResult {
       TAKEN_HINT,
       OWN_NAME_HINT,
     ],
-    { resumeFlag: '--alias-added', actionUrl: ADMIN_CONSOLE_USERS_URL },
+    { resumeFlag: '--alias-added', actionUrl: ADMIN_CONSOLE_USERS_URL, aliasCandidate: address },
   );
 }
 
@@ -356,7 +340,7 @@ function namePause(identity: AliasIdentity, reason: string): ProvisionResult {
       `Choose an address on ${identity.domain} for everything ${identity.name} does on the web in its own name`,
       'Continue with --alias <name>; once it is added in the Google Admin console, with --alias <name> --alias-added',
     ],
-    { resumeFlag: '--alias <name>' },
+    { resumeFlag: '--alias <name>', aliasCandidate: null },
   );
 }
 
@@ -372,70 +356,16 @@ function hostPause(instanceId: string, error: GwsEaError): ProvisionResult {
   );
 }
 
-/** What a probe's read-back means for the operator, once it did not verify the alias. */
-function probePause(
-  identity: AliasIdentity,
-  address: string,
-  outcome: Exclude<ProbeOutcome, 'verified'>,
-): ProvisionResult {
-  switch (outcome) {
-    case 'bounced':
-      return pause(
-        'alias_not_added',
-        `The test message to ${address} bounced: it is not an alias of ${identity.email} yet.`,
-        [
-          `Add it in the Google Admin console if you have not: ${aliasesPage(identity)}`,
-          'A new alias can take up to 24 hours to start receiving mail; then continue with --alias-added to send another test message',
-          TAKEN_HINT,
-        ],
-        { resumeFlag: '--alias-added', actionUrl: ADMIN_CONSOLE_USERS_URL },
-      );
-    case 'group':
-      return pause(
-        'alias_is_group',
-        `${address} is a Google Group: the test message reached ${identity.name} as a group member, not as an alias.`,
-        [
-          'Continue with --alias-taken for the next name, or --alias <name> for one of your own',
-          'Or delete the group, add the alias in the Google Admin console, and continue with --alias-added',
-        ],
-        { resumeFlag: '--alias-taken' },
-      );
-    case 'not_yet':
-      return pause(
-        'alias_not_delivered',
-        `The test message to ${address} has not arrived yet: Google can take up to 24 hours to start delivering to a new alias.`,
-        [
-          'Resume later to read it back again; nothing more is sent',
-          'If the Admin console refused the address, continue with --alias-taken or --alias <name> instead',
-        ],
-      );
-    case 'not_sent':
-      return addPause(identity, address);
-    case 'superseded':
-      throw new GwsEaError(
-        'alias_candidate_changed',
-        `The web alias candidate changed while ${address} was being checked; run the command again.`,
-      );
-    default: {
-      const unhandled: never = outcome;
-      throw new GwsEaError('invalid_child_output', `Unknown alias probe outcome ${String(unhandled)}`);
-    }
-  }
-}
-
 /**
- * Bring the assistant to a verified web alias, or pause for the operator
+ * Bring the assistant to an operator-confirmed web alias, or pause for the operator
  * (KTD13). A candidate is claimed in the registry, under the machine lock,
  * before the host asks for it, so two assistants are never asked to add the
- * same address; the host records the alias only when its probe arrives.
+ * same address; the host records the alias only after the operator confirms it.
  * Run under the assistant's instance lock, which the caller holds.
  */
-export async function ensureAssistantAlias(
-  input: AliasStepInput,
-  reporter: StepReporter,
-  sleep: (milliseconds: number) => Promise<void> = (milliseconds) => delay(milliseconds),
-): Promise<ProvisionResult> {
-  const { paths, instanceId, host, decision } = input;
+export async function ensureAssistantAlias(input: AliasStepInput, reporter: StepReporter): Promise<ProvisionResult> {
+  const { paths, instanceId, host } = input;
+  let decision = input.decision;
   const changed = (): void => reporter.emit?.({ type: 'domain-effect', step: ALIAS_STEP.id, changed: true });
   const claim = async (address: string | undefined): Promise<void> => {
     const before = (await getInstanceReservation(paths, instanceId)).exclusive_resource_claims.alias_email;
@@ -454,6 +384,10 @@ export async function ensureAssistantAlias(
         if (error instanceof GwsEaError && HOST_UNREACHABLE_CODES.has(error.code)) return hostPause(instanceId, error);
         throw error;
       }
+      // The operator may have answered while another command changed the candidate.
+      if (decision?.expectedCandidate !== undefined && decision.expectedCandidate !== setup.candidate) {
+        decision = undefined;
+      }
       const propose = async (address: string | null): Promise<void> => {
         await host.propose(address);
         if (setup.candidate !== address) changed();
@@ -463,10 +397,10 @@ export async function ensureAssistantAlias(
         if (decision?.kind === 'taken' || (named !== undefined && !sameAddress(named, setup.alias))) {
           throw new GwsEaError(
             'alias_recorded',
-            `The assistant's web alias is already ${setup.alias}, verified; it is not changed here.`,
+            `The assistant's web alias is already ${setup.alias}, configured; it is not changed here.`,
           );
         }
-        // A verified alias stays the assistant's own on this machine, whatever wrote the registry since.
+        // A configured alias stays the assistant's own on this machine, whatever wrote the registry since.
         await claim(setup.alias);
         return READY;
       }
@@ -507,25 +441,11 @@ export async function ensureAssistantAlias(
       };
       const firstCandidate = stem.status === 'derived' ? firstAliasCandidate(stem.stem) : undefined;
 
-      /** Probe `address`, sending a new probe with `send`, and wait briefly for a probe just sent. */
-      const probe = async (address: string, send: boolean): Promise<ProvisionResult> => {
-        let outcome = await host.probe(address, send);
-        if (send) changed();
-        for (const seconds of send ? PROBE_READ_BACK_WAITS_SECONDS : []) {
-          if (outcome !== 'not_yet') break;
-          reporter.emit?.({
-            type: 'step-waiting',
-            step: ALIAS_STEP.id,
-            reason: `Waiting for the test message to reach ${address}…`,
-          });
-          await sleep(seconds * 1_000);
-          outcome = await host.probe(address, false);
-        }
-        if (outcome === 'verified') {
-          changed();
-          return READY;
-        }
-        return probePause(identity, address, outcome);
+      const confirm = async (address: string): Promise<ProvisionResult> => {
+        const confirmed = await host.confirm(address);
+        if (confirmed.alias !== address) throw invalidHostOutput();
+        changed();
+        return READY;
       };
 
       switch (decision?.kind) {
@@ -538,10 +458,11 @@ export async function ensureAssistantAlias(
           } else if (address === null) {
             address = (await offerFrom(firstCandidate, null)) ?? null;
             if (address === null) return nameRequired();
+            return addPause(identity, address);
           } else {
             await claim(address);
           }
-          return decision.kind === 'added' ? probe(address, true) : addPause(identity, address);
+          return decision.kind === 'added' ? confirm(address) : addPause(identity, address);
         }
         case 'taken': {
           const after = setup.candidate;
@@ -558,7 +479,7 @@ export async function ensureAssistantAlias(
             return address === undefined ? nameRequired() : addPause(identity, address);
           }
           await claim(setup.candidate);
-          return setup.probeSent ? probe(setup.candidate, false) : addPause(identity, setup.candidate);
+          return addPause(identity, setup.candidate);
         }
         default: {
           const unhandled: never = decision;
