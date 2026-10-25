@@ -14,9 +14,9 @@ const ROOT = path.resolve(import.meta.dirname, '../..');
 /** New sizes plus small editing margins; these are file caps, never an aggregate budget. */
 const CAPS: Readonly<Record<string, { readonly words: number; readonly reason: string }>> = {
   'src/modules/gws-ea-profile/character.md': {
-    words: 720,
+    words: 750,
     reason:
-      "689 words of shared identity and trust: review restored 'repeat', the mistake rule's limits, 'confident without hedging' and the one password rule; plus 31. Role-specific memory stays in main.",
+      "689 words of shared identity and trust: review restored 'repeat', the mistake rule's limits, 'confident without hedging' and the one password rule; then 52 for copyable codes and shaping complex messages to cut the reader's load; plus 9. Role-specific memory stays in main.",
   },
   'src/modules/gws-ea-main/guidance.md': {
     words: 2_420,
