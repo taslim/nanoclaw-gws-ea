@@ -943,7 +943,7 @@ it('releases a newly claimed namespace after provisioning fails before any assis
       zoneId: 'zone',
       hostname: 'views.example.test',
       credentialFile: source,
-      cloudflaredPath: process.execPath,
+      cloudflaredPath: '/usr/bin/true',
     },
     f.dependencies,
   );
