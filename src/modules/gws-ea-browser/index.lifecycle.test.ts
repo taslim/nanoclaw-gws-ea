@@ -538,6 +538,10 @@ describe('optional host browser lifecycle', () => {
       await ensureBrowserPaths(browserPaths(file));
 
       vi.stubEnv('GWS_EA_BROWSER_ROOT', file);
+      const inspectAvailability = availability.browserAvailability;
+      vi.spyOn(availability, 'browserAvailability').mockImplementation((root) =>
+        inspectAvailability(root, process.env.GWS_EA_BROWSER_TEST_CHROME),
+      );
       vi.spyOn(signInMail, 'recoverBrowserSignInMail').mockResolvedValue();
       vi.spyOn(signInMail, 'cleanupBrowserSignInMail').mockResolvedValue();
       vi.spyOn(startup, 'sweepBrowserStartup').mockResolvedValue();
