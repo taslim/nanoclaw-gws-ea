@@ -1075,7 +1075,7 @@ async function provisionArtifactsAssistant(
           live !== undefined &&
           assistant === undefined &&
           retained === undefined &&
-          previousPolicy.config === undefined &&
+          !previousPolicy.config?.enabled &&
           !(live.pending?.kind === 'application' && live.pending.target === instanceId);
         if (live && assistant) {
           await writeArtifactsOperatorConfig(file, {

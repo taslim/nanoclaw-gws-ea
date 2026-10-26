@@ -571,12 +571,16 @@ describe('artifacts operator capability', () => {
 
   it('retains an ambiguous create and only resumes after exact operator acknowledgment', async () => {
     const f = await provisionFixture();
+    const claim = (await getInstanceReservation(f.paths, f.a.instanceId)).exclusive_resource_claims.artifacts;
+    if (!claim) throw new Error('Fixture namespace is missing');
+    await releaseInstanceArtifacts(f.paths, f.a.instanceId, claim);
     f.api.lose('application');
     await expect(provisionForAssistant(f.paths, f.a.instanceId, {}, f.dependencies)).rejects.toMatchObject({
       code: 'artifacts_cloudflare_unavailable',
     });
     const pending = (await readArtifactsOperatorConfig(f.files.configFile))?.pending;
     expect(pending?.kind).toBe('application');
+    expect((await getInstanceReservation(f.paths, f.a.instanceId)).exclusive_resource_claims.artifacts).toBeDefined();
     await expect(provisionForAssistant(f.paths, f.a.instanceId, {}, f.dependencies)).rejects.toMatchObject({
       code: 'artifacts_create_unproven',
     });
@@ -919,36 +923,61 @@ it.each([503, 429, 'network', 'reconnecting'] as const)(
   },
 );
 
-it('releases a newly claimed namespace after provisioning fails before any assistant resource is recorded', async () => {
-  const f = await provisionFixture();
-  const oldClaim = (await getInstanceReservation(f.paths, f.a.instanceId)).exclusive_resource_claims.artifacts;
-  if (!oldClaim) throw new Error('Fixture namespace is missing');
-  await releaseInstanceArtifacts(f.paths, f.a.instanceId, oldClaim);
-  const config = (await readArtifactsOperatorConfig(f.files.configFile))!;
-  await writeArtifactsOperatorConfig(f.files.configFile, { ...config, teamName: 'wrong-team' });
-  const failed = await installArtifactsConnector(f.paths, {}, f.dependencies);
-  expect(failed.assistants).toEqual([
-    expect.objectContaining({ instance_id: f.a.instanceId, outcome: 'pending', reason: 'artifacts_team_invalid' }),
-  ]);
-  expect((await getInstanceReservation(f.paths, f.a.instanceId)).exclusive_resource_claims.artifacts).toBeUndefined();
-  expect((await readArtifactsOperatorConfig(f.files.configFile))?.assistants).toEqual({});
-  expect(await uninstallArtifactsConnector(f.paths, f.dependencies)).toMatchObject({ outcome: 'removed' });
-  const source = path.join(f.paths.configRoot, 'corrected-management-credential');
-  await writeFile(source, 'secret-corrected-management-fixture', { mode: 0o600 });
-  const corrected = await installArtifactsConnector(
-    f.paths,
-    {
-      accountId: 'account',
-      teamName: 'team',
-      zoneId: 'zone',
-      hostname: 'views.example.test',
-      credentialFile: source,
-      cloudflaredPath: '/usr/bin/true',
-    },
-    f.dependencies,
-  );
-  expect(corrected.assistants).toEqual([expect.objectContaining({ instance_id: f.a.instanceId, outcome: 'ready' })]);
-});
+it.each([false, true])(
+  'releases a newly claimed namespace after early provisioning failure (stale disabled policy: %s)',
+  async (stalePolicy) => {
+    const f = await provisionFixture();
+    const oldClaim = (await getInstanceReservation(f.paths, f.a.instanceId)).exclusive_resource_claims.artifacts;
+    if (!oldClaim) throw new Error('Fixture namespace is missing');
+    await releaseInstanceArtifacts(f.paths, f.a.instanceId, oldClaim);
+    if (stalePolicy) {
+      const policyFile = instanceArtifactsPolicyFile(f.a.runtime);
+      await mkdir(path.dirname(policyFile), { recursive: true, mode: 0o700 });
+      await writeFile(
+        policyFile,
+        JSON.stringify({
+          schemaVersion: 1,
+          enabled: false,
+          hostname: oldClaim.hostname,
+          pathPrefix: oldClaim.path_prefix,
+          listenPort: oldClaim.listen_port,
+          accessIssuer: 'https://team.cloudflareaccess.com',
+          accessAud: 'retired-aud',
+          cloudflare: {
+            accountId: 'account',
+            applicationId: 'retired-app',
+            operatorConfigFile: f.files.configFile,
+          },
+        }),
+        { mode: 0o600 },
+      );
+    }
+    const config = (await readArtifactsOperatorConfig(f.files.configFile))!;
+    await writeArtifactsOperatorConfig(f.files.configFile, { ...config, teamName: 'wrong-team' });
+    const failed = await installArtifactsConnector(f.paths, {}, f.dependencies);
+    expect(failed.assistants).toEqual([
+      expect.objectContaining({ instance_id: f.a.instanceId, outcome: 'pending', reason: 'artifacts_team_invalid' }),
+    ]);
+    expect((await getInstanceReservation(f.paths, f.a.instanceId)).exclusive_resource_claims.artifacts).toBeUndefined();
+    expect((await readArtifactsOperatorConfig(f.files.configFile))?.assistants).toEqual({});
+    expect(await uninstallArtifactsConnector(f.paths, f.dependencies)).toMatchObject({ outcome: 'removed' });
+    const source = path.join(f.paths.configRoot, 'corrected-management-credential');
+    await writeFile(source, 'secret-corrected-management-fixture', { mode: 0o600 });
+    const corrected = await installArtifactsConnector(
+      f.paths,
+      {
+        accountId: 'account',
+        teamName: 'team',
+        zoneId: 'zone',
+        hostname: 'views.example.test',
+        credentialFile: source,
+        cloudflaredPath: '/usr/bin/true',
+      },
+      f.dependencies,
+    );
+    expect(corrected.assistants).toEqual([expect.objectContaining({ instance_id: f.a.instanceId, outcome: 'ready' })]);
+  },
+);
 
 it('repairs a positively observed Access admission mismatch on a published assistant', async () => {
   const f = await provisionFixture();

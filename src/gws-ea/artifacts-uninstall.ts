@@ -173,7 +173,7 @@ export async function uninstallArtifactsConnector(
         const policy = await readArtifactsPolicy(
           path.join(paths.instanceRoot(reservation.instance_id), 'artifacts', 'policy.json'),
         );
-        if (policy.status === 'unavailable' || policy.config)
+        if (policy.status === 'unavailable' || policy.enabled)
           throw new GwsEaError(
             'artifacts_owner_missing',
             'A claimed artifact namespace has local resources but no owned resource record.',

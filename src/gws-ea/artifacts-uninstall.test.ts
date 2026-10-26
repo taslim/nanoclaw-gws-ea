@@ -335,6 +335,25 @@ it('releases a claim with no configuration or local resource policy without cont
   expect((await readRegistry(f.paths)).instances[id].exclusive_resource_claims.artifacts).toBeUndefined();
 });
 
+it('releases a new bare claim beside the disabled policy retained by a completed uninstall', async () => {
+  const f = await fixture(1);
+  const id = Object.keys(f.config.assistants)[0];
+  const claim = f.config.assistants[id].claim;
+  expect(await uninstallArtifactsConnector(f.paths, f.dependencies)).toMatchObject({ outcome: 'removed' });
+  const stalePolicy = await readFile(f.policyFiles[0], 'utf8');
+  expect((await readArtifactsPolicy(f.policyFiles[0])).enabled).toBe(false);
+  await claimInstanceArtifacts(f.paths, id, claim);
+  const result = await uninstallArtifactsConnector(f.paths, {
+    fetch: async () => {
+      throw new Error('The completed uninstall already deleted its remote resources');
+    },
+  });
+  expect(result).toMatchObject({ outcome: 'removed', changed: true });
+  expect((await readRegistry(f.paths)).instances[id].exclusive_resource_claims.artifacts).toBeUndefined();
+  expect(await readFile(f.policyFiles[0], 'utf8')).toBe(stalePolicy);
+  expect(await inspectArtifactsUninstall(f.paths)).toBeUndefined();
+});
+
 it('keeps an unproven application creation fenced after releasing its resource-free namespace claim', async () => {
   const f = await fixture(0);
   const id = await claimWithoutResources(f);
