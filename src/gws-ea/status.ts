@@ -927,7 +927,7 @@ function because(clause: string, reason: string | null): string {
 }
 
 function webAliasArgv(instanceId: string, facts: WebAliasFacts): string[] {
-  const command = ['gws-ea', 'capabilities', 'enable', 'browser', '--id', instanceId];
+  const command = ['gws-ea', 'connectors', 'enable', 'browser', '--id', instanceId];
   return facts.address !== null ? [...command, '--alias-added'] : command;
 }
 

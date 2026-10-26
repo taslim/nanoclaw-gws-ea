@@ -1,7 +1,7 @@
 /** The capability catalog and voice's read-only inspection; voice's own actions live in `local-voice.ts`. */
 import { lstat } from 'node:fs/promises';
 import { BROWSER_CAPABILITY } from './browser-capability.js';
-import { ARTIFACTS_CAPABILITY } from './artifacts-capability.js';
+import { ARTIFACTS_CAPABILITY } from './artifacts-connector.js';
 import type { OnePasswordCapabilityCatalog } from './onepassword.js';
 
 import { formatLocalTime } from '../timezone.js';
@@ -203,7 +203,7 @@ async function inspectAssistant(
       reason:
         compatibility === 'unknown'
           ? 'Release compatibility could not be established.'
-          : 'Run gws-ea capabilities check voice to observe the consumer.',
+          : 'Run gws-ea connectors check voice to observe the consumer.',
     };
   try {
     const health = parseVoiceHealth(await (options.ncl ?? runInstanceNclJson)(runtime, VOICE_HEALTH_ARGS));
@@ -371,7 +371,7 @@ export function voiceCapabilityNextActions(
 ): readonly NextAction[] {
   const command = (action: (typeof VOICE_CAPABILITY.actions)[number], ...args: string[]): NextAction => ({
     kind: 'command',
-    argv: ['gws-ea', 'capabilities', action, 'voice', ...args],
+    argv: ['gws-ea', 'connectors', action, 'voice', ...args],
   });
   if (capability.availability.status === 'unsupported')
     return [
@@ -446,13 +446,13 @@ export function voiceCapabilityRecovery(
   const installOptions = [...(model ? ['--model', model] : []), ...(request.cmake ? ['--cmake', request.cmake] : [])];
   const command = (action: 'install' | 'enable' | 'disable' | 'uninstall' | 'check'): NextAction => ({
     kind: 'command',
-    argv: ['gws-ea', 'capabilities', action, 'voice', ...(action === 'install' ? installOptions : [])],
+    argv: ['gws-ea', 'connectors', action, 'voice', ...(action === 'install' ? installOptions : [])],
   });
   const retry: NextAction = {
     kind: 'command',
     argv: [
       'gws-ea',
-      'capabilities',
+      'connectors',
       request.action ?? 'install',
       'voice',
       ...(request.action === 'install' || !request.action ? installOptions : []),

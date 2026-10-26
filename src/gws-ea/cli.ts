@@ -6,7 +6,7 @@ import {
   voiceCapabilityNextActions,
   browserCapabilityCatalog,
   artifactsCapabilityCatalog,
-} from './capabilities.js';
+} from './connectors.js';
 import {
   disableArtifactsCapability,
   enableArtifactsCapability,
@@ -14,7 +14,7 @@ import {
   type ArtifactsCapabilityDependencies,
   type ArtifactsCapabilityObservation,
   type ArtifactsOperationData,
-} from './artifacts-capability.js';
+} from './artifacts-connector.js';
 import { aliasDecision, type AliasDecision } from './alias.js';
 import {
   browserAccessLine,
@@ -2634,7 +2634,7 @@ export async function runCli(args: readonly string[], runtime: CliRuntime = {}):
           } else if (command === 'disable') {
             data = await disableBrowserCapability(paths, instanceId, dependencies);
           } else throw new GwsEaError('invalid_arguments', `Browser does not support ${command}.`);
-          actions = [{ kind: 'command', argv: ['gws-ea', 'capabilities', 'check', 'browser', '--id', instanceId] }];
+          actions = [{ kind: 'command', argv: ['gws-ea', 'connectors', 'check', 'browser', '--id', instanceId] }];
           presenter.report({
             outcome: 'ready',
             headline: `Browser ${data.enabled ? 'enabled' : 'disabled'} for assistant ${instanceId}.`,
@@ -2815,8 +2815,8 @@ export async function runCli(args: readonly string[], runtime: CliRuntime = {}):
       let changed: Changed = false;
       let data:
         | import('./result.js').VoiceOperationData
-        | import('./capabilities.js').VoiceCapabilityObservation
-        | import('./capabilities.js').CapabilityList
+        | import('./connectors.js').VoiceCapabilityObservation
+        | import('./connectors.js').CapabilityList
         | null = null;
       const stopObservingInterruption = observeInterruption(() => ({ changed, data }));
       try {
@@ -2863,7 +2863,7 @@ export async function runCli(args: readonly string[], runtime: CliRuntime = {}):
             const model = options.model ?? DEFAULT_VOICE_MODEL;
             if (model !== 'base' && model !== 'small' && model !== 'large-v3-turbo-q5_0')
               throw new GwsEaError('invalid_arguments', 'Voice model must be base, small, or large-v3-turbo-q5_0.');
-            run = await startRunLog({ paths, command: 'capabilities install', meta: { model } });
+            run = await startRunLog({ paths, command: 'connectors install', meta: { model } });
             const installed = await run.step('install voice', async (step) => {
               stepLog = step.rawLog;
               return installLocalVoice(
@@ -2872,7 +2872,7 @@ export async function runCli(args: readonly string[], runtime: CliRuntime = {}):
                 dependencies,
               );
             });
-            actions = [{ kind: 'command', argv: ['gws-ea', 'capabilities', 'enable', 'voice'] }];
+            actions = [{ kind: 'command', argv: ['gws-ea', 'connectors', 'enable', 'voice'] }];
             data = { name: 'voice', scope: 'host', installation_dir: installed.installationDir, enabled: false };
             presenter.report({
               outcome: 'ready',
@@ -2893,7 +2893,7 @@ export async function runCli(args: readonly string[], runtime: CliRuntime = {}):
               unknown_assistant_ids: capability.unknown_assistant_ids,
               future_compatible_assistants: true,
             };
-            actions = [{ kind: 'command', argv: ['gws-ea', 'capabilities', 'check', 'voice'] }];
+            actions = [{ kind: 'command', argv: ['gws-ea', 'connectors', 'check', 'voice'] }];
             presenter.report({
               outcome: 'ready',
               headline: 'Voice enabled host-wide for every compatible current and future assistant.',

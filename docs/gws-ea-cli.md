@@ -6,7 +6,7 @@ service, and recovery records. Optional capabilities have host scope.
 
 Start with `gws-ea --help`. Use `gws-ea help update` or `gws-ea update --help`
 for a command's flags, scope, effects, prerequisites, recovery, and examples.
-`gws-ea help capabilities install` and `gws-ea capabilities install --help`
+`gws-ea help connectors install` and `gws-ea connectors install --help`
 print identical help. Invalid paths remain errors even with `--help`.
 See [the voice guide](gws-ea-voice.md) for optional voice installation,
 activation, and health checks, [1Password vaults](#1password-vaults) for
@@ -25,13 +25,13 @@ operator config root; the default root is `~/.config/gws-ea`, respecting
 `XDG_CONFIG_HOME` and `GWS_EA_CONFIG_ROOT`.
 
 ```sh
-gws-ea capabilities enable artifacts --id <instance_id> \
+gws-ea connectors enable artifacts --id <instance_id> \
   --account <cloudflare_account_id> --team <access_team_subdomain> \
   --zone <active_zone_id> --hostname views.example.com \
   --credential-file <absolute_owner_only_token_file>
-gws-ea capabilities show artifacts --id <instance_id>
-gws-ea capabilities check artifacts --id <instance_id>
-gws-ea capabilities disable artifacts --id <instance_id>
+gws-ea connectors show artifacts --id <instance_id>
+gws-ea connectors check artifacts --id <instance_id>
+gws-ea connectors disable artifacts --id <instance_id>
 ```
 
 The first enable records this host's shared hostname and account. Later enables
@@ -189,9 +189,9 @@ by its own lifecycle and ownership rules.
 ## 1Password vaults
 
 ```sh
-gws-ea capabilities enable onepassword
-gws-ea capabilities check onepassword
-gws-ea capabilities disable onepassword
+gws-ea connectors enable onepassword
+gws-ea connectors check onepassword
+gws-ea connectors disable onepassword
 gws-ea remove --id 01234567-89ab-4def-8123-456789abcdef --delete-vault
 ```
 
@@ -259,7 +259,7 @@ revoked or deleted them, close it with
 ## Web alias
 
 ```sh
-gws-ea capabilities enable browser --id 01234567-89ab-4def-8123-456789abcdef
+gws-ea connectors enable browser --id 01234567-89ab-4def-8123-456789abcdef
 ```
 
 An assistant whose browser is enabled has one web alias: its address for
@@ -270,7 +270,7 @@ name that reads the same reversed moves its first letter to the end instead
 (`Anna` gives `nnaa`). Role addresses such as `admin` or `postmaster` are
 never offered, and later candidates are numbered (`onuj2`, `onuj3`).
 
-`capabilities enable browser`, and `create` or `resume` once the browser is
+`connectors enable browser`, and `create` or `resume` once the browser is
 enabled, show the candidate and where to add it: the assistant's account in
 the Admin console (Directory > Users), then User information > Alternate
 email addresses (email aliases). The candidate is claimed on this machine
@@ -299,10 +299,10 @@ profile. A recorded alias is not changed by these flags.
 
 ```sh
 # Let main and one more agent group use the browser:
-gws-ea capabilities enable browser --id 01234567-89ab-4def-8123-456789abcdef \
+gws-ea connectors enable browser --id 01234567-89ab-4def-8123-456789abcdef \
   --agent-group <main_agent_group_id> --agent-group <agent_group_id>
 # Back to main alone:
-gws-ea capabilities enable browser --id 01234567-89ab-4def-8123-456789abcdef --main-only
+gws-ea connectors enable browser --id 01234567-89ab-4def-8123-456789abcdef --main-only
 ```
 
 By default only the assistant's main agent delegates browser errands. Repeat
@@ -314,13 +314,13 @@ profile and the vault's logins; its purchase, consent and watch approvals still
 go to the principal, and its errands, cards and notices stay its own. A group
 removed from the list has its errands cancelled.
 
-`disable` and a plain `enable` keep the list, and `capabilities show browser`
+`disable` and a plain `enable` keep the list, and `connectors show browser`
 reports it. While a list is in place, `rollback`, and reverting an open update,
 are refused to a release that cannot read it; `--main-only` lifts that.
 
 ### Browser diagnosis and release acceptance
 
-`gws-ea capabilities check browser --id <full-id>` checks the selected managed
+`gws-ea connectors check browser --id <full-id>` checks the selected managed
 assistant without starting Chrome. It reports proxy and debugger isolation
 separately on that assistant network's existing host-gateway route. A stopped
 Chrome reports debugger `not_run` and can remain ready when proxy isolation

@@ -35,7 +35,7 @@ export function helpLines(command?: DiscoveryTarget): readonly string[] {
     return [
       'Usage: gws-ea <command> [options]',
       'Operate managed Google Workspace assistants and their optional capabilities.',
-      ...(['Assistants', 'Service', 'Advanced', 'Capabilities', 'Discovery'] as const).flatMap((group) => [
+      ...(['Assistants', 'Service', 'Advanced', 'Connectors', 'Discovery'] as const).flatMap((group) => [
         '',
         `${group}:`,
         ...COMMAND_DEFINITIONS.filter((definition) => definition.group === group).map(

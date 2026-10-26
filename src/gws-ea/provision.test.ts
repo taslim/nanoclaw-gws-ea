@@ -2835,7 +2835,7 @@ describe('the vault a new assistant inherits from 1Password enablement', () => {
     const paused = (await finish(harness, provider)) as Extract<ProvisionResult, { status: 'paused' }>;
     expect(paused.pause).toMatchObject({ code: 'onepassword_vault_creation_unproven' });
     expect(paused.pause.details).toContain(
-      `Then: gws-ea capabilities enable onepassword --discard-unproven ${harness.instanceId}`,
+      `Then: gws-ea connectors enable onepassword --discard-unproven ${harness.instanceId}`,
     );
   });
 });

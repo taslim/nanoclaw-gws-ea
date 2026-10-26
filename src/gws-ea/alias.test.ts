@@ -344,12 +344,12 @@ describe('the web alias setup step', () => {
     expect(await world.claimed()).toBe('onuj3@example.test');
   });
 
-  it("takes the operator's word on it from capabilities enable browser", async () => {
+  it("takes the operator's word on it from connectors enable browser", async () => {
     const world = await stepWorld();
     await persistTestRuntime(world.paths, await getInstanceReservation(world.paths, world.instanceId));
     const enable = async (...flags: string[]) => {
       const stdout: string[] = [];
-      const exit = await runCli(['capabilities', 'enable', 'browser', '--id', world.instanceId, ...flags, '--json'], {
+      const exit = await runCli(['connectors', 'enable', 'browser', '--id', world.instanceId, ...flags, '--json'], {
         paths: world.paths,
         stdout: (line) => stdout.push(line),
         stderr: () => undefined,
@@ -371,7 +371,7 @@ describe('the web alias setup step', () => {
           { kind: 'external', url: 'https://admin.google.com/ac/users' },
           {
             kind: 'command',
-            argv: ['gws-ea', 'capabilities', 'enable', 'browser', '--id', world.instanceId, '--alias-added'],
+            argv: ['gws-ea', 'connectors', 'enable', 'browser', '--id', world.instanceId, '--alias-added'],
           },
         ],
       },
@@ -389,7 +389,7 @@ describe('the web alias setup step', () => {
     const unused = async (): Promise<never> => {
       throw new Error('Unexpected setup prompt');
     };
-    const exit = await runCli(['capabilities', 'enable', 'browser', '--id', world.instanceId], {
+    const exit = await runCli(['connectors', 'enable', 'browser', '--id', world.instanceId], {
       paths: world.paths,
       stdout: () => undefined,
       stderr: () => undefined,
@@ -419,7 +419,7 @@ describe('the web alias setup step', () => {
       await persistTestRuntime(world.paths, await getInstanceReservation(world.paths, world.instanceId));
       const shown: string[] = [];
       const exit = await runCli(
-        ['capabilities', 'enable', 'browser', '--id', world.instanceId],
+        ['connectors', 'enable', 'browser', '--id', world.instanceId],
         aliasTerminal(world, async (pause) => {
           shown.push(pause.message);
           if (shown.length > 1) return { kind: 'stop' };
@@ -453,7 +453,7 @@ describe('the web alias setup step', () => {
     const answers: AliasDecision[] = [{ kind: 'taken' }, { kind: 'named', name: 'juno.web' }, { kind: 'added' }];
     const candidates: (string | null)[] = [];
     const exit = await runCli(
-      ['capabilities', 'enable', 'browser', '--id', world.instanceId],
+      ['connectors', 'enable', 'browser', '--id', world.instanceId],
       aliasTerminal(world, async () => {
         candidates.push((await getAliasSetup()).candidate);
         const answer = answers.shift();
@@ -472,7 +472,7 @@ describe('the web alias setup step', () => {
     const signals = ['SIGINT', 'SIGTERM', 'SIGHUP'] as const;
     const before = signals.map((signal) => process.listenerCount(signal));
     const exit = await runCli(
-      ['capabilities', 'enable', 'browser', '--id', world.instanceId],
+      ['connectors', 'enable', 'browser', '--id', world.instanceId],
       aliasTerminal(world, async (_pause, signal) => {
         process.emit('SIGINT');
         expect(signal.aborted).toBe(true);
@@ -492,7 +492,7 @@ describe('the web alias setup step', () => {
       throw new Error('Unexpected setup prompt');
     };
     let asked = false;
-    const exit = await runCli(['capabilities', 'enable', 'browser', '--id', world.instanceId], {
+    const exit = await runCli(['connectors', 'enable', 'browser', '--id', world.instanceId], {
       paths: world.paths,
       stdout: (line) => stdout.push(line),
       stderr: () => undefined,

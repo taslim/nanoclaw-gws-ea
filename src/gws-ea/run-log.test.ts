@@ -90,7 +90,7 @@ describe('GWS-EA run log', () => {
   });
 
   it('preserves the primary error when recording the failed step runs out of disk space', async () => {
-    const run = await startRunLog({ paths: await controlPlanePaths(), command: 'capabilities install' });
+    const run = await startRunLog({ paths: await controlPlanePaths(), command: 'connectors install' });
     const primary = new GwsEaError('voice_build_failed', 'compiler failed');
     vi.spyOn(fs, 'appendFileSync').mockImplementation(() => {
       throw Object.assign(new Error('disk full'), { code: 'ENOSPC' });

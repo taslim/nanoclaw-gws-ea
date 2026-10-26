@@ -224,7 +224,7 @@ frame; agents see opaque item handles and outcomes only.
 
 The operator provisions 1Password host-wide (see
 [docs/gws-ea-cli.md](docs/gws-ea-cli.md)). In
-`gws-ea capabilities enable onepassword`, their desktop sign-in mints a host
+`gws-ea connectors enable onepassword`, their desktop sign-in mints a host
 management service account that may only create vaults, and the host records
 the account's ID with its sign-in address as the app lists it. It creates one vault
 for each compatible assistant, and for each one created later, and the operator

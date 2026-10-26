@@ -1,9 +1,9 @@
 /** The result schemas command discovery publishes: the machine-readable wire contract. */
 import type { ResultSchema } from './command-definitions.js';
-import { VOICE_CAPABILITY } from './capabilities.js';
+import { VOICE_CAPABILITY } from './connectors.js';
 import { OPERATION_PHASES } from './operation.js';
 import { BROWSER_CAPABILITY } from './browser-capability.js';
-import { ARTIFACTS_CAPABILITY } from './artifacts-capability.js';
+import { ARTIFACTS_CAPABILITY } from './artifacts-connector.js';
 import { ONEPASSWORD_CAPABILITY, ONEPASSWORD_PENDING_REASONS, ONEPASSWORD_SKIP_REASONS } from './onepassword.js';
 
 const text = { type: 'string' } as const;

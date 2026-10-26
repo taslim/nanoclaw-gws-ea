@@ -27,9 +27,9 @@ function invoke(args: readonly string[], env: NodeJS.ProcessEnv = environment())
 
 describe('actual driver streams', () => {
   it('retains the same plain observation under redirected, quiet, and NO_COLOR output', async () => {
-    const plain = await invoke(['capabilities', 'check', 'voice']);
-    const quiet = await invoke(['capabilities', 'check', 'voice', '--quiet']);
-    const noColor = await invoke(['capabilities', 'check', 'voice'], {
+    const plain = await invoke(['connectors', 'check', 'voice']);
+    const quiet = await invoke(['connectors', 'check', 'voice', '--quiet']);
+    const noColor = await invoke(['connectors', 'check', 'voice'], {
       ...environment(),
       NO_COLOR: '1',
       FORCE_COLOR: '3',
@@ -53,10 +53,10 @@ describe('actual driver streams', () => {
   });
 
   it('prints one UTC machine observation and no diagnostic or question', async () => {
-    const { stdout, stderr } = await invoke(['capabilities', 'check', 'voice', '--json', '--no-input']);
+    const { stdout, stderr } = await invoke(['connectors', 'check', 'voice', '--json', '--no-input']);
     expect(JSON.parse(stdout)).toMatchObject({
       schema_version: 1,
-      command: 'capabilities check',
+      command: 'connectors check',
       outcome: 'succeeded',
       changed: false,
       data: {

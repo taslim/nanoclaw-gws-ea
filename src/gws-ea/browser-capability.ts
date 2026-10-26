@@ -293,7 +293,7 @@ export async function enableBrowserWithAlias(
 
 /** A resume flag with a `<placeholder>` asks the operator for input rather than naming a command to run. */
 export function browserAliasNextActions(instanceId: string, pause: NonNullable<OperationData['pause']>): NextAction[] {
-  const command = ['gws-ea', 'capabilities', 'enable', 'browser', '--id', instanceId];
+  const command = ['gws-ea', 'connectors', 'enable', 'browser', '--id', instanceId];
   const flag = pause.resumeFlag;
   return [
     ...(pause.actionUrl ? [{ kind: 'external' as const, instruction: pause.message, url: pause.actionUrl }] : []),
@@ -391,7 +391,7 @@ export async function inspectBrowserCapability(
   };
   const notRun: BrowserIsolationCheck = {
     status: 'not_run',
-    reason: 'Run capabilities check browser to observe active host listeners.',
+    reason: 'Run connectors check browser to observe active host listeners.',
   };
   const checks: Record<'proxy' | 'debugger', BrowserIsolationCheck> = { proxy: notRun, debugger: notRun };
   const run = options.runCommand ?? runSanitizedCommandOutcome;
@@ -567,7 +567,7 @@ export async function assertBrowserPolicyReadable(
   const id = runtime.instance_id;
   throw new GwsEaError(
     'rollback_unavailable',
-    `Assistant ${id}'s browser access lists agent groups, which ${release} cannot read: rolled back, it would lose the browser. Return the browser to main alone with gws-ea capabilities enable browser --id ${id} --main-only (and disable it again if it should stay off), then roll back.`,
+    `Assistant ${id}'s browser access lists agent groups, which ${release} cannot read: rolled back, it would lose the browser. Return the browser to main alone with gws-ea connectors enable browser --id ${id} --main-only (and disable it again if it should stay off), then roll back.`,
   );
 }
 
@@ -577,7 +577,7 @@ export function browserCapabilityNextActions(capability: BrowserCapabilityObserv
       kind: 'command',
       argv: [
         'gws-ea',
-        'capabilities',
+        'connectors',
         capability.activation === 'disabled' ? 'enable' : 'check',
         'browser',
         '--id',

@@ -137,7 +137,7 @@ verification cannot discover external session revocation by itself.
 
 ## Recovery and verification
 
-Use `capabilities show artifacts --id …` for local observation and `check` for
+Use `connectors show artifacts --id …` for local observation and `check` for
 bounded verification; neither repairs. Optional startup failure leaves ordinary
 conversation available. The origin stays unavailable until Access prerequisites
 and its local listener are verified. New named admission can remain pending;

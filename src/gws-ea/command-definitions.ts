@@ -1,6 +1,6 @@
-import { VOICE_CAPABILITY } from './capabilities.js';
+import { VOICE_CAPABILITY } from './connectors.js';
 import { BROWSER_CAPABILITY } from './browser-capability.js';
-import { ARTIFACTS_CAPABILITY } from './artifacts-capability.js';
+import { ARTIFACTS_CAPABILITY } from './artifacts-connector.js';
 import { MANAGEMENT_TARGET, ONEPASSWORD_CAPABILITY } from './onepassword.js';
 import {
   managedResultSchema,
@@ -72,7 +72,7 @@ export interface ArgumentDefinition {
 export interface CommandDefinition {
   readonly path: readonly string[];
   readonly summary: string;
-  readonly group: 'Assistants' | 'Service' | 'Advanced' | 'Capabilities' | 'Discovery';
+  readonly group: 'Assistants' | 'Service' | 'Advanced' | 'Connectors' | 'Discovery';
   readonly handler: CommandHandler;
   readonly options: readonly OptionDefinition[];
   readonly arguments?: readonly ArgumentDefinition[];
@@ -462,8 +462,8 @@ export const COMMAND_DEFINITIONS: readonly CommandDefinition[] = [
   ...(['list', ...VOICE_CAPABILITY.actions] as const).map((command): CommandDefinition => {
     if (command === 'list' || command === 'show' || command === 'check')
       return {
-        path: ['capabilities', command],
-        group: 'Capabilities',
+        path: ['connectors', command],
+        group: 'Connectors',
         handler: { kind: 'capability', command },
         summary:
           command === 'list'
@@ -492,14 +492,14 @@ export const COMMAND_DEFINITIONS: readonly CommandDefinition[] = [
         ],
         prerequisites: observationPrerequisites,
         recovery: ['Inspect capability facts; use its explicit install, enable, disable, or uninstall action.'],
-        examples: [`gws-ea capabilities ${command}${command === 'list' ? '' : ' voice'} --json`],
+        examples: [`gws-ea connectors ${command}${command === 'list' ? '' : ' voice'} --json`],
         outputModes: managedModes,
         resultSchema: managedResultSchema(command === 'list' ? CAPABILITY_LIST_SCHEMA : VOICE_CAPABILITY_SCHEMA),
       };
     if (command === 'install')
       return {
-        path: ['capabilities', 'install'],
-        group: 'Capabilities',
+        path: ['connectors', 'install'],
+        group: 'Connectors',
         handler: { kind: 'capability', command: 'install' },
         summary: 'Build and select shared local voice assets, initially disabled.',
         scope: 'host',
@@ -529,15 +529,15 @@ export const COMMAND_DEFINITIONS: readonly CommandDefinition[] = [
         recovery: [
           'Preflight identifies the failed tool and manual repair; system tools are never installed automatically.',
           'Download/build failures retain private run/step logs and a retry preserving --model and --cmake.',
-          'For corrupt assets: capabilities disable voice, capabilities uninstall voice, then capabilities install voice with the original --model.',
+          'For corrupt assets: connectors disable voice, connectors uninstall voice, then connectors install voice with the original --model.',
         ],
-        examples: ['gws-ea capabilities install voice --model large-v3-turbo-q5_0'],
+        examples: ['gws-ea connectors install voice --model large-v3-turbo-q5_0'],
         outputModes: managedModes,
         resultSchema: managedResultSchema(VOICE_OPERATION_SCHEMA),
       };
     return {
-      path: ['capabilities', command],
-      group: 'Capabilities',
+      path: ['connectors', command],
+      group: 'Connectors',
       handler: { kind: 'capability', command },
       scope: 'host',
       options: [],
@@ -570,15 +570,15 @@ export const COMMAND_DEFINITIONS: readonly CommandDefinition[] = [
             : 'Voice must be disabled, every managed consumer proven drained, and recipe-owned files have no open holders.',
       ],
       recovery: ['Follow the reported policy, asset, or consumer blocker; check observes readiness without repair.'],
-      examples: [`gws-ea capabilities ${command} voice`],
+      examples: [`gws-ea connectors ${command} voice`],
       outputModes: managedModes,
       resultSchema: managedResultSchema(VOICE_OPERATION_SCHEMA),
     };
   }),
   ...BROWSER_CAPABILITY.actions.map(
     (command): CommandDefinition => ({
-      path: ['capabilities', command, 'browser'],
-      group: 'Capabilities',
+      path: ['connectors', command, 'browser'],
+      group: 'Connectors',
       handler: { kind: 'capability', command, name: 'browser' },
       scope: 'assistant',
       summary:
@@ -629,14 +629,14 @@ export const COMMAND_DEFINITIONS: readonly CommandDefinition[] = [
         'Google Chrome at its absolute configured path on the host.',
       ],
       recovery: [
-        'Inspect capabilities check browser --id <instance_id>; restore any reported Chrome, policy, host or Docker prerequisite.',
+        'Inspect connectors check browser --id <instance_id>; restore any reported Chrome, policy, host or Docker prerequisite.',
       ],
       examples: [
-        `gws-ea capabilities ${command} browser --id <instance_id>`,
+        `gws-ea connectors ${command} browser --id <instance_id>`,
         ...(command === 'enable'
           ? [
-              'gws-ea capabilities enable browser --id <instance_id> --alias-added',
-              'gws-ea capabilities enable browser --id <instance_id> --agent-group <main_id> --agent-group <agent_group_id>',
+              'gws-ea connectors enable browser --id <instance_id> --alias-added',
+              'gws-ea connectors enable browser --id <instance_id> --agent-group <main_id> --agent-group <agent_group_id>',
             ]
           : []),
       ],
@@ -648,8 +648,8 @@ export const COMMAND_DEFINITIONS: readonly CommandDefinition[] = [
   ),
   ...ARTIFACTS_CAPABILITY.actions.map(
     (command): CommandDefinition => ({
-      path: ['capabilities', command, 'artifacts'],
-      group: 'Capabilities',
+      path: ['connectors', command, 'artifacts'],
+      group: 'Connectors',
       handler: { kind: 'capability', command, name: 'artifacts' },
       scope: 'assistant',
       summary:
@@ -717,10 +717,10 @@ export const COMMAND_DEFINITIONS: readonly CommandDefinition[] = [
         'Cloudflare account, Access team, active DNS zone and API permissions; cloudflared 2025.4.0 or later.',
       ],
       recovery: [
-        'Run capabilities check artifacts --id <instance_id>; resolve the reported ownership, policy, account, capacity or host prerequisite.',
+        'Run connectors check artifacts --id <instance_id>; resolve the reported ownership, policy, account, capacity or host prerequisite.',
         'For an interrupted create, inspect the exact journal attempt, remove any resource it created, then enable with --discard-unproven <attempt>. Never identify ownership by friendly name alone.',
       ],
-      examples: [`gws-ea capabilities ${command} artifacts --id <instance_id>`],
+      examples: [`gws-ea connectors ${command} artifacts --id <instance_id>`],
       outputModes: managedModes,
       resultSchema: managedResultSchema(
         command === 'show' || command === 'check' ? ARTIFACTS_CAPABILITY_SCHEMA : ARTIFACTS_OPERATION_SCHEMA,
@@ -729,8 +729,8 @@ export const COMMAND_DEFINITIONS: readonly CommandDefinition[] = [
   ),
   ...ONEPASSWORD_CAPABILITY.actions.map(
     (command): CommandDefinition => ({
-      path: ['capabilities', command, 'onepassword'],
-      group: 'Capabilities',
+      path: ['connectors', command, 'onepassword'],
+      group: 'Connectors',
       handler: { kind: 'capability', command, name: 'onepassword' },
       scope: 'host',
       summary:
@@ -785,13 +785,13 @@ export const COMMAND_DEFINITIONS: readonly CommandDefinition[] = [
             : ['A readable managed registry; check also needs the CLI the host recorded.'],
       recovery: [
         command === 'disable'
-          ? 'Rerun capabilities disable onepassword after a refusal; it continues deleting the tokens that remain. Enable again with capabilities enable onepassword.'
-          : 'Follow the reported per-assistant cause; rerun capabilities enable onepassword to continue, or --discard-unproven after removing what an interrupted creation left.',
+          ? 'Rerun connectors disable onepassword after a refusal; it continues deleting the tokens that remain. Enable again with connectors enable onepassword.'
+          : 'Follow the reported per-assistant cause; rerun connectors enable onepassword to continue, or --discard-unproven after removing what an interrupted creation left.',
       ],
       examples: [
         command === 'enable'
-          ? 'gws-ea capabilities enable onepassword --account <account_id>'
-          : `gws-ea capabilities ${command} onepassword --json`,
+          ? 'gws-ea connectors enable onepassword --account <account_id>'
+          : `gws-ea connectors ${command} onepassword --json`,
       ],
       outputModes: managedModes,
       resultSchema: managedResultSchema(

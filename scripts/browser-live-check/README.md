@@ -40,7 +40,7 @@ port may appear in host evidence; endpoint URLs, WebSocket paths and browser IDs
 stay private. This is accessible to trusted host processes and, through host
 forwarding, ordinary Docker bridge containers. It provides no pipe exclusivity.
 
-`gws-ea capabilities check browser --id <full-id>` separately checks the proxy
+`gws-ea connectors check browser --id <full-id>` separately checks the proxy
 and active debugger through the managed assistant network's existing host-gateway
 route, without launching Chrome. Stopped Chrome reports debugger `not_run`;
 starting, missing, invalid, changed or unobservable active targets prevent a ready
@@ -87,7 +87,7 @@ external actions taken after startup but before health verification.
 
 Use the deployed merged commit SHA, an absolute evidence directory, and the
 **deployed assistant's** socket. The socket is its `<checkout>/data/ncl.sock`;
-`gws-ea capabilities check browser --id <full-id>` identifies/checks the selected
+`gws-ea connectors check browser --id <full-id>` identifies/checks the selected
 assistant. Do not use `data/ncl.sock` from this operator checkout.
 
 ```sh
@@ -251,9 +251,9 @@ Keep real fixtures or records for native assertions in the source artifacts.
 Record `vault_secret_confinement` and the `onepassword_*` scenarios on two
 disposable dogfood assistants, in a 1Password account the operator authorized
 for disposable resources; no principal account or Login is a test fixture. The
-operator runs `gws-ea capabilities enable|check|disable onepassword` and
+operator runs `gws-ea connectors enable|check|disable onepassword` and
 `gws-ea remove` themselves. Receipts cite resource IDs from
-`gws-ea capabilities show onepassword --json` and the 1Password.com vault,
+`gws-ea connectors show onepassword --json` and the 1Password.com vault,
 access and service-account pages, never a password or token. A request cost is
 the account usage `check` reports before and after the operation, less the
 cost of a `check` itself.

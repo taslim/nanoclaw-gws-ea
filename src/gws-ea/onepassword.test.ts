@@ -350,7 +350,7 @@ describe('enabling 1Password for existing and future assistants', () => {
     expect(provider.vaults.size).toBe(2);
     expect(onePasswordEnableNextActions(partial)).toContainEqual({
       kind: 'command',
-      argv: ['gws-ea', 'capabilities', 'enable', 'onepassword'],
+      argv: ['gws-ea', 'connectors', 'enable', 'onepassword'],
     });
 
     provider.after = undefined;
@@ -453,7 +453,7 @@ describe('recovering an interrupted enable', () => {
     expect(unproven.assistants[0].message).toContain(`Assistant aya.${runtime.instance_id.slice(0, 8)}@example.test`);
     expect(onePasswordEnableNextActions(unproven)).toContainEqual({
       kind: 'command',
-      argv: ['gws-ea', 'capabilities', 'enable', 'onepassword', '--discard-unproven', runtime.instance_id],
+      argv: ['gws-ea', 'connectors', 'enable', 'onepassword', '--discard-unproven', runtime.instance_id],
     });
 
     // A retry never creates another vault while the first may exist.
@@ -553,10 +553,10 @@ describe('recovering an interrupted enable', () => {
     expect(unverified.assistants[0]).toMatchObject({ outcome: 'pending', reason: 'runtime_unverified' });
     expect(onePasswordEnableNextActions(unverified)).toEqual(
       expect.arrayContaining([
-        { kind: 'command', argv: ['gws-ea', 'capabilities', 'enable', 'onepassword'] },
+        { kind: 'command', argv: ['gws-ea', 'connectors', 'enable', 'onepassword'] },
         {
           kind: 'command',
-          argv: ['gws-ea', 'capabilities', 'enable', 'onepassword', '--discard-unproven', runtime.instance_id],
+          argv: ['gws-ea', 'connectors', 'enable', 'onepassword', '--discard-unproven', runtime.instance_id],
         },
       ]),
     );
@@ -734,7 +734,7 @@ describe('disabling and re-enabling 1Password', () => {
       records.map((record) => [record.runtimeServiceAccountId]),
     );
     expect(onePasswordCapabilityNextActions(shown, false)).toEqual([
-      { kind: 'command', argv: ['gws-ea', 'capabilities', 'enable', 'onepassword'] },
+      { kind: 'command', argv: ['gws-ea', 'connectors', 'enable', 'onepassword'] },
     ]);
     const again = await disableOnePassword(paths);
     expect(
@@ -983,7 +983,7 @@ describe('1Password readiness', () => {
       }),
     ]);
     expect(onePasswordCapabilityNextActions(before, false)).toEqual([
-      { kind: 'command', argv: ['gws-ea', 'capabilities', 'enable', 'onepassword'] },
+      { kind: 'command', argv: ['gws-ea', 'connectors', 'enable', 'onepassword'] },
     ]);
 
     await enable();
@@ -1072,7 +1072,7 @@ describe('1Password readiness', () => {
     expect(checked.quota).toMatchObject({ status: 'unknown', daily: null });
     expect(onePasswordCapabilityNextActions(checked, true)).toContainEqual({
       kind: 'command',
-      argv: ['gws-ea', 'capabilities', 'enable', 'onepassword'],
+      argv: ['gws-ea', 'connectors', 'enable', 'onepassword'],
     });
   });
 
@@ -1113,22 +1113,22 @@ describe('the native 1Password capability commands', () => {
   it('enables, checks and lists through the published result contracts, with no token in any output or log', async () => {
     const runtime = await assistant();
 
-    const enabled = await run(['capabilities', 'enable', 'onepassword', '--account', ACCOUNT_ID, '--json']);
+    const enabled = await run(['connectors', 'enable', 'onepassword', '--account', ACCOUNT_ID, '--json']);
     expect(enabled.code).toBe(0);
     const result = JSON.parse(enabled.stdout) as Record<string, unknown>;
-    expectResultContract('capabilities enable onepassword', result);
+    expectResultContract('connectors enable onepassword', result);
     expect(result).toMatchObject({
       outcome: 'succeeded',
       changed: true,
       data: { account_id: ACCOUNT_ID, assistants: [{ instance_id: runtime.instance_id, outcome: 'ready' }] },
-      next_actions: [{ kind: 'command', argv: ['gws-ea', 'capabilities', 'check', 'onepassword'] }],
+      next_actions: [{ kind: 'command', argv: ['gws-ea', 'connectors', 'check', 'onepassword'] }],
     });
 
-    const checked = await run(['capabilities', 'check', 'onepassword', '--json']);
+    const checked = await run(['connectors', 'check', 'onepassword', '--json']);
     expect(checked.code).toBe(0);
-    expectResultContract('capabilities check onepassword', JSON.parse(checked.stdout));
-    const listed = await run(['capabilities', 'list', '--json']);
-    expectResultContract('capabilities list', JSON.parse(listed.stdout));
+    expectResultContract('connectors check onepassword', JSON.parse(checked.stdout));
+    const listed = await run(['connectors', 'list', '--json']);
+    expectResultContract('connectors list', JSON.parse(listed.stdout));
     expect(JSON.parse(listed.stdout)).toMatchObject({
       data: {
         capabilities: [
@@ -1139,10 +1139,10 @@ describe('the native 1Password capability commands', () => {
         ],
       },
     });
-    const human = await run(['capabilities', 'check', 'onepassword']);
+    const human = await run(['connectors', 'check', 'onepassword']);
     expect(human.stdout).toContain('Account type: families');
 
-    const again = await run(['capabilities', 'enable', 'onepassword', '--json']);
+    const again = await run(['connectors', 'enable', 'onepassword', '--json']);
     expect(JSON.parse(again.stdout)).toMatchObject({ outcome: 'succeeded', changed: false });
 
     const everything = [enabled, checked, listed, human, again]
@@ -1158,14 +1158,14 @@ describe('the native 1Password capability commands', () => {
 
   it('disables and re-enables through the published contracts, saying what was kept, deleted and still to revoke', async () => {
     const runtime = await assistant();
-    await run(['capabilities', 'enable', 'onepassword', '--account', ACCOUNT_ID, '--json']);
+    await run(['connectors', 'enable', 'onepassword', '--account', ACCOUNT_ID, '--json']);
     const record = (await resourcesOf(runtime))!;
     const retired = record.runtimeServiceAccountId!;
 
-    const disabled = await run(['capabilities', 'disable', 'onepassword', '--json']);
+    const disabled = await run(['connectors', 'disable', 'onepassword', '--json']);
     expect(disabled.code).toBe(0);
     const result = JSON.parse(disabled.stdout) as Record<string, unknown>;
-    expectResultContract('capabilities disable onepassword', result);
+    expectResultContract('connectors disable onepassword', result);
     expect(result).toMatchObject({
       outcome: 'succeeded',
       changed: true,
@@ -1181,7 +1181,7 @@ describe('the native 1Password capability commands', () => {
       instruction: expect.stringContaining(retired),
     });
 
-    const human = await run(['capabilities', 'disable', 'onepassword']);
+    const human = await run(['connectors', 'disable', 'onepassword']);
     expect(human.code).toBe(0);
     const text = human.stdout + human.stderr;
     expect(text).toContain('1Password disabled');
@@ -1190,15 +1190,15 @@ describe('the native 1Password capability commands', () => {
     expect(text).toContain('1Password.com');
     expect(text).not.toMatch(/\brevoked\b/iu);
 
-    const reenabled = await run(['capabilities', 'enable', 'onepassword', '--json']);
+    const reenabled = await run(['connectors', 'enable', 'onepassword', '--json']);
     expect(reenabled.code).toBe(0);
     const again = JSON.parse(reenabled.stdout) as Record<string, unknown>;
-    expectResultContract('capabilities enable onepassword', again);
+    expectResultContract('connectors enable onepassword', again);
     expect(again).toMatchObject({
       outcome: 'succeeded',
       data: { assistants: [{ vault_id: record.vault.id, retired_service_account_ids: [retired] }] },
     });
-    const listed = await run(['capabilities', 'list', '--json']);
+    const listed = await run(['connectors', 'list', '--json']);
     expect(JSON.parse(listed.stdout)).toMatchObject({
       data: {
         capabilities: [
@@ -1219,10 +1219,10 @@ describe('the native 1Password capability commands', () => {
   });
 
   it('reports a host where 1Password was never enabled as already disabled, changing nothing', async () => {
-    const disabled = await run(['capabilities', 'disable', 'onepassword', '--json']);
+    const disabled = await run(['connectors', 'disable', 'onepassword', '--json']);
     expect(disabled.code).toBe(0);
     const result = JSON.parse(disabled.stdout) as Record<string, unknown>;
-    expectResultContract('capabilities disable onepassword', result);
+    expectResultContract('connectors disable onepassword', result);
     expect(result).toMatchObject({ outcome: 'succeeded', changed: false, data: { enabled: false, assistants: [] } });
     expect(await exists(onePasswordHostPaths(paths.configRoot).directory)).toBe(false);
   });
@@ -1233,23 +1233,23 @@ describe('the native 1Password capability commands', () => {
       if (args[0] === 'service-account' && args.includes('--vault')) provider.signedIn = false;
     };
     await assistant();
-    const partial = await run(['capabilities', 'enable', 'onepassword', '--account', ACCOUNT_ID, '--json']);
+    const partial = await run(['connectors', 'enable', 'onepassword', '--account', ACCOUNT_ID, '--json']);
     expect(partial.code).toBe(10);
     const result = JSON.parse(partial.stdout) as { next_actions: unknown[] };
-    expectResultContract('capabilities enable onepassword', result);
+    expectResultContract('connectors enable onepassword', result);
     expect(result).toMatchObject({ outcome: 'paused', changed: true });
     expect(result.next_actions).toContainEqual({
       kind: 'command',
-      argv: ['gws-ea', 'capabilities', 'enable', 'onepassword'],
+      argv: ['gws-ea', 'connectors', 'enable', 'onepassword'],
     });
   });
 
   it('pauses for an explicit account without prompting, offering one command per account', async () => {
     await assistant();
-    const paused = await run(['capabilities', 'enable', 'onepassword', '--json']);
+    const paused = await run(['connectors', 'enable', 'onepassword', '--json']);
     expect(paused.code).toBe(10);
     const result = JSON.parse(paused.stdout) as Record<string, unknown>;
-    expectResultContract('capabilities enable onepassword', result);
+    expectResultContract('connectors enable onepassword', result);
     expect(result).toMatchObject({
       outcome: 'paused',
       changed: false,
@@ -1257,15 +1257,15 @@ describe('the native 1Password capability commands', () => {
     });
     expect(result.next_actions).toContainEqual({
       kind: 'command',
-      argv: ['gws-ea', 'capabilities', 'enable', 'onepassword', '--account', ACCOUNT_ID],
+      argv: ['gws-ea', 'connectors', 'enable', 'onepassword', '--account', ACCOUNT_ID],
     });
-    const invalid = await run(['capabilities', 'enable', 'onepassword', '--account', 'hale.1password.com']);
+    const invalid = await run(['connectors', 'enable', 'onepassword', '--account', 'hale.1password.com']);
     expect(invalid.code).toBe(2);
   });
 
   it('reports a missing CLI as a failure naming the installation, before any state changes', async () => {
     const stdout: string[] = [];
-    const code = await runCli(['capabilities', 'enable', 'onepassword', '--account', ACCOUNT_ID, '--json'], {
+    const code = await runCli(['connectors', 'enable', 'onepassword', '--account', ACCOUNT_ID, '--json'], {
       paths,
       environment: { PATH: root },
       stdout: (line) => stdout.push(line),
@@ -1274,7 +1274,7 @@ describe('the native 1Password capability commands', () => {
     });
     expect(code).toBe(1);
     const result = JSON.parse(stdout.join('\n')) as Record<string, unknown>;
-    expectResultContract('capabilities enable onepassword', result);
+    expectResultContract('connectors enable onepassword', result);
     expect(result).toMatchObject({ outcome: 'failed', changed: false, error: { code: 'onepassword_cli_missing' } });
     expect(await exists(onePasswordHostPaths(paths.configRoot).directory)).toBe(false);
   });

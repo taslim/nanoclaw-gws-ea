@@ -376,7 +376,7 @@ describe('host-wide optional voice commands', () => {
       return append(...args);
     });
     const exit = await runCli(
-      ['capabilities', 'install', 'voice', '--cmake', path.join(paths.configRoot, 'missing'), '--json'],
+      ['connectors', 'install', 'voice', '--cmake', path.join(paths.configRoot, 'missing'), '--json'],
       { paths, ...io.runtime },
     );
     expect(exit).toBe(1);
@@ -389,7 +389,7 @@ describe('host-wide optional voice commands', () => {
     appendSpy.mockRestore();
     const retry = lines();
     expect(
-      await runCli(['capabilities', 'install', 'voice', '--cmake', path.join(paths.configRoot, 'missing'), '--json'], {
+      await runCli(['connectors', 'install', 'voice', '--cmake', path.join(paths.configRoot, 'missing'), '--json'], {
         paths,
         ...retry.runtime,
       }),
@@ -402,19 +402,19 @@ describe('host-wide optional voice commands', () => {
     const io = lines();
     const cmake = path.join(paths.configRoot, 'missing cmake');
     expect(
-      await runCli(['capabilities', 'install', 'voice', '--model', 'small', '--cmake', cmake, '--json'], {
+      await runCli(['connectors', 'install', 'voice', '--model', 'small', '--cmake', cmake, '--json'], {
         paths,
         ...io.runtime,
         environment: { PATH: paths.configRoot },
       }),
     ).toBe(1);
     const result = JSON.parse(io.out.join('\n')) as { diagnostics: { run_log: string; step_log: string } };
-    expectResultContract('capabilities install', result);
+    expectResultContract('connectors install', result);
     expect(result).toMatchObject({
       error: { code: 'voice_build_prerequisite', message: expect.stringContaining(cmake) },
       next_actions: [
         { kind: 'external', instruction: expect.stringContaining('Correct --cmake') },
-        { kind: 'command', argv: ['gws-ea', 'capabilities', 'install', 'voice', '--model', 'small', '--cmake', cmake] },
+        { kind: 'command', argv: ['gws-ea', 'connectors', 'install', 'voice', '--model', 'small', '--cmake', cmake] },
       ],
       diagnostics: { run_log: expect.any(String), step_log: expect.any(String) },
     });
@@ -430,7 +430,7 @@ describe('host-wide optional voice commands', () => {
       mode: 0o700,
     });
     const io = lines();
-    expect(await runCli(['capabilities', 'install', 'voice', '--cmake', cmake], { paths, ...io.runtime })).toBe(1);
+    expect(await runCli(['connectors', 'install', 'voice', '--cmake', cmake], { paths, ...io.runtime })).toBe(1);
     expect(io.err.join('\n')).toContain('broken developer path');
     expect(io.err.join('\n')).toContain('Log:');
     expect(io.err.join('\n')).toContain('Correct --cmake');
@@ -447,7 +447,7 @@ describe('host-wide optional voice commands', () => {
     const fetch = vi.spyOn(globalThis, 'fetch');
     try {
       expect(
-        await runCli(['capabilities', 'install', 'voice'], {
+        await runCli(['connectors', 'install', 'voice'], {
           paths,
           ...io.runtime,
           environment: { PATH: paths.configRoot },
@@ -469,13 +469,13 @@ describe('host-wide optional voice commands', () => {
     const fetch = vi.spyOn(globalThis, 'fetch');
     try {
       expect(
-        await runCli(['capabilities', 'enable', 'voice'], {
+        await runCli(['connectors', 'enable', 'voice'], {
           paths,
           stdout: (line) => stdout.push(line),
           stderr: (line) => stderr.push(line),
         }),
       ).toBe(1);
-      expect(stderr.join('\n')).toContain('gws-ea capabilities install voice');
+      expect(stderr.join('\n')).toContain('gws-ea connectors install voice');
       expect(stderr.join('\n')).not.toContain('Unknown command');
       expect(fetch).not.toHaveBeenCalled();
       await expect(readFile(path.join(paths.configRoot, 'voice.json'), 'utf8')).rejects.toMatchObject({
@@ -489,17 +489,17 @@ describe('host-wide optional voice commands', () => {
   it('returns native errors and exact recovery commands for absent assets in JSON', async () => {
     const paths = await testPaths();
     const io = lines();
-    expect(await runCli(['capabilities', 'enable', 'voice', '--json'], { paths, ...io.runtime })).toBe(1);
-    expectResultContract('capabilities enable', JSON.parse(io.out.join('\n')));
+    expect(await runCli(['connectors', 'enable', 'voice', '--json'], { paths, ...io.runtime })).toBe(1);
+    expectResultContract('connectors enable', JSON.parse(io.out.join('\n')));
     expect(JSON.parse(io.out.join('\n'))).toMatchObject({
       schema_version: 1,
-      command: 'capabilities enable',
+      command: 'connectors enable',
       outcome: 'failed',
       changed: false,
       error: { code: 'voice_not_installed' },
       next_actions: [
-        { kind: 'command', argv: ['gws-ea', 'capabilities', 'install', 'voice'] },
-        { kind: 'command', argv: ['gws-ea', 'capabilities', 'enable', 'voice'] },
+        { kind: 'command', argv: ['gws-ea', 'connectors', 'install', 'voice'] },
+        { kind: 'command', argv: ['gws-ea', 'connectors', 'enable', 'voice'] },
       ],
     });
   });
@@ -508,7 +508,7 @@ describe('host-wide optional voice commands', () => {
     const paths = await testPaths();
     const stderr: string[] = [];
     expect(
-      await runCli(['capabilities', 'enable', 'voice', '--id', randomUUID()], {
+      await runCli(['connectors', 'enable', 'voice', '--id', randomUUID()], {
         paths,
         stdout: () => undefined,
         stderr: (line) => stderr.push(line),

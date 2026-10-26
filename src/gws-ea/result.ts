@@ -1,4 +1,4 @@
-import type { CapabilityList, VoiceCapabilityObservation } from './capabilities.js';
+import type { CapabilityList, VoiceCapabilityObservation } from './connectors.js';
 import type { BrowserCapabilityObservation, BrowserOperationData } from './browser-capability.js';
 import type { OnePasswordCapabilityObservation, OnePasswordDisableData, OnePasswordEnableData } from './onepassword.js';
 import {

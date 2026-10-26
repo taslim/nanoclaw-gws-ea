@@ -4,7 +4,7 @@ import path from 'node:path';
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
-import { inspectVoiceCapability } from './capabilities.js';
+import { inspectVoiceCapability } from './connectors.js';
 import { resolveControlPlanePaths } from './paths.js';
 
 let root: string;

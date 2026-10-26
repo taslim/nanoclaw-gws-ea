@@ -23,20 +23,20 @@ const scenarios = [
     includes: '--track',
     excludes: 'install',
   },
-  { words: ['gws-ea', 'help', 'capabilities', ''], includes: 'install', excludes: 'create' },
-  { words: ['gws-ea', 'schema', 'capabilities', ''], includes: 'install', excludes: 'create' },
+  { words: ['gws-ea', 'help', 'connectors', ''], includes: 'install', excludes: 'create' },
+  { words: ['gws-ea', 'schema', 'connectors', ''], includes: 'install', excludes: 'create' },
   { words: ['gws-ea', 'help', '--version', ''], includes: '--help', excludes: 'create' },
-  { words: ['gws-ea', 'capabilities', 'install', 'voice', ''], includes: '--model', excludes: 'voice' },
-  { words: ['gws-ea', 'capabilities', 'enable', 'browser', ''], includes: '--id', excludes: '--model' },
-  { words: ['gws-ea', 'capabilities', 'check', 'browser', ''], includes: '--id', excludes: '--model' },
-  { words: ['gws-ea', 'capabilities', 'enable', ''], includes: 'onepassword', excludes: '--id' },
-  { words: ['gws-ea', 'capabilities', 'enable', 'onepassword', ''], includes: '--account', excludes: '--id' },
-  { words: ['gws-ea', 'capabilities', 'check', 'onepassword', ''], includes: '--json', excludes: '--account' },
-  { words: ['gws-ea', 'capabilities', 'disable', ''], includes: 'onepassword', excludes: '--id' },
-  { words: ['gws-ea', 'capabilities', 'disable', 'onepassword', ''], includes: '--json', excludes: '--account' },
+  { words: ['gws-ea', 'connectors', 'install', 'voice', ''], includes: '--model', excludes: 'voice' },
+  { words: ['gws-ea', 'connectors', 'enable', 'browser', ''], includes: '--id', excludes: '--model' },
+  { words: ['gws-ea', 'connectors', 'check', 'browser', ''], includes: '--id', excludes: '--model' },
+  { words: ['gws-ea', 'connectors', 'enable', ''], includes: 'onepassword', excludes: '--id' },
+  { words: ['gws-ea', 'connectors', 'enable', 'onepassword', ''], includes: '--account', excludes: '--id' },
+  { words: ['gws-ea', 'connectors', 'check', 'onepassword', ''], includes: '--json', excludes: '--account' },
+  { words: ['gws-ea', 'connectors', 'disable', ''], includes: 'onepassword', excludes: '--id' },
+  { words: ['gws-ea', 'connectors', 'disable', 'onepassword', ''], includes: '--json', excludes: '--account' },
   { words: ['gws-ea', 'remove', '--id', 'id', ''], includes: '--delete-vault', excludes: '--account' },
   {
-    words: ['gws-ea', 'capabilities', 'install', 'voice', '--model', '=', 'sm'],
+    words: ['gws-ea', 'connectors', 'install', 'voice', '--model', '=', 'sm'],
     includes: 'small',
     excludes: '--model',
   },
@@ -106,7 +106,7 @@ words=(${words.map(quote).join(' ')}); CURRENT=${words.length}; _gws_ea`,
           '--private',
           '-c',
           `source ${quote(script)}
-for input in 'gws-ea help capabilities ' 'gws-ea schema capabilities ' 'gws-ea create --assistant-first-name capabilities --t' 'gws-ea capabilities install voice '
+for input in 'gws-ea help connectors ' 'gws-ea schema connectors ' 'gws-ea create --assistant-first-name capabilities --t' 'gws-ea connectors install voice '
   echo SCENARIO
   complete -C "$input"
 end

@@ -250,7 +250,7 @@ function pendingMessage(
     case 'instance_busy':
       return 'Another operation holds this assistant; retry once it finishes.';
     case 'cli_unavailable':
-      return 'The 1Password CLI this host recorded is missing or too old. Install a current one, then run gws-ea capabilities enable onepassword to record it.';
+      return 'The 1Password CLI this host recorded is missing or too old. Install a current one, then run gws-ea connectors enable onepassword to record it.';
     case 'policy_invalid':
       return `The 1Password host policy cannot be used safely${facts.file ? ` (${facts.file})` : ''}. Inspect it before retrying.`;
     case 'sign_in_required':
@@ -1463,7 +1463,7 @@ export async function inspectOnePasswordCapability(
   };
 }
 
-/** The catalog entry `capabilities list` shows, from the host policy alone. */
+/** The catalog entry `connectors list` shows, from the host policy alone. */
 export async function onePasswordCapabilityCatalog(paths: ControlPlanePaths): Promise<OnePasswordCapabilityCatalog> {
   const read = await readOnePasswordHostPolicy(onePasswordHostPaths(paths.configRoot).policyFile);
   return {
@@ -1477,7 +1477,7 @@ export async function onePasswordCapabilityCatalog(paths: ControlPlanePaths): Pr
 }
 
 function enableCommand(...flags: string[]): NextAction {
-  return { kind: 'command', argv: ['gws-ea', 'capabilities', 'enable', 'onepassword', ...flags] };
+  return { kind: 'command', argv: ['gws-ea', 'connectors', 'enable', 'onepassword', ...flags] };
 }
 
 function assistantActions(entry: OnePasswordAssistantProvisioning): readonly NextAction[] {
@@ -1556,7 +1556,7 @@ export function onePasswordEnableNextActions(data: OnePasswordEnableData): reado
   return [
     ...(actions.length
       ? actions
-      : [{ kind: 'command', argv: ['gws-ea', 'capabilities', 'check', 'onepassword'] } as const]),
+      : [{ kind: 'command', argv: ['gws-ea', 'connectors', 'check', 'onepassword'] } as const]),
     ...(revocation ? [revocation] : []),
   ];
 }
@@ -1583,7 +1583,7 @@ export function onePasswordDisableNextActions(data: OnePasswordDisableData): rea
         ? [{ kind: 'external' as const, instruction: `Assistant ${entry.instance_id}: ${entry.reason}` }]
         : []),
     ]),
-    { kind: 'command', argv: ['gws-ea', 'capabilities', 'show', 'onepassword'] },
+    { kind: 'command', argv: ['gws-ea', 'connectors', 'show', 'onepassword'] },
   ];
 }
 
@@ -1609,7 +1609,7 @@ export function onePasswordDisableReport(data: OnePasswordDisableData): {
             'Deleting a token does not revoke its service account on 1Password.com; see below for what is still yours to do.',
           ]
         : []),
-      'Enable it again with gws-ea capabilities enable onepassword: each assistant keeps its vault and gets a new runtime service account through your 1Password sign-in.',
+      'Enable it again with gws-ea connectors enable onepassword: each assistant keeps its vault and gets a new runtime service account through your 1Password sign-in.',
     ],
   };
 }
@@ -1656,7 +1656,7 @@ export function onePasswordCapabilityNextActions(
   if (checked && observation.cli.status === 'unavailable') actions.push(enableCommand());
   if (checked && observation.management.status === 'failed')
     actions.push({ kind: 'external', instruction: pendingMessage('management_unavailable', {}) });
-  if (!checked) actions.push({ kind: 'command', argv: ['gws-ea', 'capabilities', 'check', 'onepassword'] });
+  if (!checked) actions.push({ kind: 'command', argv: ['gws-ea', 'connectors', 'check', 'onepassword'] });
   return distinctActions(actions);
 }
 
@@ -1750,7 +1750,7 @@ export function onePasswordRecovery(error: unknown, command: 'enable' | 'disable
     case 'registry_busy':
       return [
         { kind: 'external', instruction: 'Let the other operation finish, then retry.' },
-        { kind: 'command', argv: ['gws-ea', 'capabilities', command, 'onepassword'] },
+        { kind: 'command', argv: ['gws-ea', 'connectors', command, 'onepassword'] },
       ];
     case 'onepassword_cli_missing':
     case 'onepassword_cli_untrusted':
@@ -1770,7 +1770,7 @@ export function onePasswordRecovery(error: unknown, command: 'enable' | 'disable
     case 'onepassword_wrong_account':
     case 'onepassword_binding_unavailable':
     case 'onepassword_nothing_unproven':
-      return [external, { kind: 'command', argv: ['gws-ea', 'capabilities', 'check', 'onepassword'] }];
+      return [external, { kind: 'command', argv: ['gws-ea', 'connectors', 'check', 'onepassword'] }];
     default:
       return [];
   }

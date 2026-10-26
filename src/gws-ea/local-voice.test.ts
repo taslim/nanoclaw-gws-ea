@@ -5,7 +5,7 @@ import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { runCli } from './cli.js';
-import { capabilityLines, inspectVoiceCapability } from './capabilities.js';
+import { capabilityLines, inspectVoiceCapability } from './connectors.js';
 import { writePrivate } from '../community-portal/private-file.js';
 import { processLock } from '../community-portal/process-lock.js';
 import { deriveGcpClaims } from './gcp-identity.js';
@@ -294,7 +294,7 @@ describe('shared voice operator lifecycle', () => {
     const release = await processLock(paths.registryLock);
     const output: string[] = [];
     try {
-      const exit = await runCli(['capabilities', 'enable', 'voice', '--json'], {
+      const exit = await runCli(['connectors', 'enable', 'voice', '--json'], {
         paths,
         stdout: (line) => output.push(line),
         stderr: () => undefined,
@@ -306,7 +306,7 @@ describe('shared voice operator lifecycle', () => {
         error: { code: 'registry_busy' },
         next_actions: [
           { kind: 'external', instruction: expect.any(String) },
-          { kind: 'command', argv: ['gws-ea', 'capabilities', 'enable', 'voice'] },
+          { kind: 'command', argv: ['gws-ea', 'connectors', 'enable', 'voice'] },
         ],
       });
       expect((await readLocalVoicePolicy(paths)).enabled).toBe(false);
@@ -572,13 +572,13 @@ describe('native public capability journeys', () => {
     return { exit, result: JSON.parse(stdout.join('\n')) as Record<string, unknown>, stderr };
   }
   it('lists supported voice separately from absent assets and disabled policy without creating state', async () => {
-    const answer = await invoke(['capabilities', 'list']);
+    const answer = await invoke(['connectors', 'list']);
     expect(answer).toMatchObject({
       exit: 0,
       result: {
-        command: 'capabilities list',
+        command: 'connectors list',
         changed: false,
-        next_actions: [{ kind: 'command', argv: ['gws-ea', 'capabilities', 'install', 'voice'] }],
+        next_actions: [{ kind: 'command', argv: ['gws-ea', 'connectors', 'install', 'voice'] }],
         data: {
           capabilities: [
             {
@@ -618,32 +618,32 @@ describe('native public capability journeys', () => {
     const installation = await assets('small');
     await policy(installation, enabled);
     await rm(installation.installationDir, { recursive: true });
-    expect(await invoke(['capabilities', 'show', 'voice'])).toMatchObject({
+    expect(await invoke(['connectors', 'show', 'voice'])).toMatchObject({
       exit: 0,
       result: {
         data: { assets: { status: 'absent', selected_model: 'small', provenance: null } },
         next_actions: [
-          ...(enabled ? [{ kind: 'command', argv: ['gws-ea', 'capabilities', 'disable', 'voice'] }] : []),
-          { kind: 'command', argv: ['gws-ea', 'capabilities', 'install', 'voice', '--model', 'small'] },
+          ...(enabled ? [{ kind: 'command', argv: ['gws-ea', 'connectors', 'disable', 'voice'] }] : []),
+          { kind: 'command', argv: ['gws-ea', 'connectors', 'install', 'voice', '--model', 'small'] },
         ],
       },
     });
     if (enabled) {
       const human: string[] = [];
       expect(
-        await runCli(['capabilities', 'show', 'voice'], {
+        await runCli(['connectors', 'show', 'voice'], {
           paths,
           stdout: (line) => human.push(line),
           stderr: (line) => human.push(line),
           environment: {},
         }),
       ).toBe(0);
-      expect(human.join('\n')).toContain('gws-ea capabilities disable voice');
-      expect(human.join('\n')).toContain('gws-ea capabilities install voice --model small');
-      expect((await invoke(['capabilities', 'disable', 'voice'])).exit).toBe(0);
+      expect(human.join('\n')).toContain('gws-ea connectors disable voice');
+      expect(human.join('\n')).toContain('gws-ea connectors install voice --model small');
+      expect((await invoke(['connectors', 'disable', 'voice'])).exit).toBe(0);
     }
     installer.build.mockResolvedValue(installation);
-    expect((await invoke(['capabilities', 'install', 'voice', '--model', 'small'])).exit).toBe(0);
+    expect((await invoke(['connectors', 'install', 'voice', '--model', 'small'])).exit).toBe(0);
     expect(installer.build).toHaveBeenCalledWith(
       expect.anything(),
       expect.objectContaining({ model: 'small' }),
@@ -654,21 +654,21 @@ describe('native public capability journeys', () => {
     const installation = await assets('small');
     await policy(installation);
     installed.delete(installation.installationDir);
-    const answer = await invoke(['capabilities', 'enable', 'voice']);
+    const answer = await invoke(['connectors', 'enable', 'voice']);
     expect(answer).toMatchObject({
       exit: 1,
       result: {
         error: { code: 'voice_assets_invalid' },
         next_actions: [
-          { kind: 'command', argv: ['gws-ea', 'capabilities', 'disable', 'voice'] },
-          { kind: 'command', argv: ['gws-ea', 'capabilities', 'uninstall', 'voice'] },
-          { kind: 'command', argv: ['gws-ea', 'capabilities', 'install', 'voice', '--model', 'small'] },
+          { kind: 'command', argv: ['gws-ea', 'connectors', 'disable', 'voice'] },
+          { kind: 'command', argv: ['gws-ea', 'connectors', 'uninstall', 'voice'] },
+          { kind: 'command', argv: ['gws-ea', 'connectors', 'install', 'voice', '--model', 'small'] },
         ],
       },
     });
     const human: string[] = [];
     expect(
-      await runCli(['capabilities', 'enable', 'voice'], {
+      await runCli(['connectors', 'enable', 'voice'], {
         paths,
         upsertEnvVars,
         stdout: (line) => human.push(line),
@@ -677,9 +677,9 @@ describe('native public capability journeys', () => {
       }),
     ).toBe(1);
     const text = human.join('\n');
-    expect(text).toContain('gws-ea capabilities disable voice');
-    expect(text).toContain('gws-ea capabilities uninstall voice');
-    expect(text).toContain('gws-ea capabilities install voice --model small');
+    expect(text).toContain('gws-ea connectors disable voice');
+    expect(text).toContain('gws-ea connectors uninstall voice');
+    expect(text).toContain('gws-ea connectors install voice --model small');
   });
   it('installs inactive, enables two compatible assistants once, and retains unknown compatibility', async () => {
     const first = await assistant(34000);
@@ -688,11 +688,11 @@ describe('native public capability journeys', () => {
     await writeFile(path.join(unknown.checkout_root, 'src/gws-ea/voice-compatibility.json'), '{');
     const installation = await assets();
     installer.build.mockResolvedValue(installation);
-    expect(await invoke(['capabilities', 'install', 'voice', '--model', 'base'])).toMatchObject({
+    expect(await invoke(['connectors', 'install', 'voice', '--model', 'base'])).toMatchObject({
       exit: 0,
-      result: { command: 'capabilities install', changed: true, data: { enabled: false } },
+      result: { command: 'connectors install', changed: true, data: { enabled: false } },
     });
-    expect(await invoke(['capabilities', 'show', 'voice'])).toMatchObject({
+    expect(await invoke(['connectors', 'show', 'voice'])).toMatchObject({
       exit: 0,
       result: {
         changed: false,
@@ -701,13 +701,13 @@ describe('native public capability journeys', () => {
           assets: { status: 'verified', selected_model: 'base', provenance: { model: 'base' } },
         },
         next_actions: [
-          { kind: 'command', argv: ['gws-ea', 'capabilities', 'enable', 'voice'] },
+          { kind: 'command', argv: ['gws-ea', 'connectors', 'enable', 'voice'] },
           { kind: 'external', instruction: expect.stringContaining(unknown.instance_id) },
           { kind: 'command', argv: ['gws-ea', 'status', '--id', unknown.instance_id] },
         ],
       },
     });
-    const enabled = await invoke(['capabilities', 'enable', 'voice']);
+    const enabled = await invoke(['connectors', 'enable', 'voice']);
     expect(enabled).toMatchObject({
       exit: 0,
       result: {
@@ -723,7 +723,7 @@ describe('native public capability journeys', () => {
       expect(await readFile(path.join(runtime.state_root, '.env'), 'utf8')).toContain(voicePolicyFile(paths));
     expect(hostProbe).not.toHaveBeenCalled();
     hostProbe.mockResolvedValue(health({ enabled: true, readiness: 'ready' }));
-    expect(await invoke(['capabilities', 'check', 'voice'])).toMatchObject({
+    expect(await invoke(['connectors', 'check', 'voice'])).toMatchObject({
       exit: 0,
       result: {
         changed: false,
@@ -755,7 +755,7 @@ describe('native public capability journeys', () => {
     });
     const before = await readFile(voicePolicyFile(paths), 'utf8');
     const beforeMetadata = await lstat(voicePolicyFile(paths));
-    const answer = await invoke(['capabilities', 'check', 'voice']);
+    const answer = await invoke(['connectors', 'check', 'voice']);
     expect(answer).toMatchObject({
       exit: 0,
       result: {
@@ -794,7 +794,7 @@ describe('native public capability journeys', () => {
     ]);
     expect(installer.build).not.toHaveBeenCalled();
     await writePrivate(voicePolicyFile(paths), { schemaVersion: 1, enabled: false, installationDir: null });
-    expect(await invoke(['capabilities', 'check', 'voice'])).toMatchObject({
+    expect(await invoke(['connectors', 'check', 'voice'])).toMatchObject({
       exit: 0,
       result: {
         data: {
@@ -810,12 +810,12 @@ describe('native public capability journeys', () => {
     });
     await policy(installation);
     hostProbe.mockRejectedValue(new Error('host unreachable'));
-    expect(await invoke(['capabilities', 'uninstall', 'voice'])).toMatchObject({
+    expect(await invoke(['connectors', 'uninstall', 'voice'])).toMatchObject({
       exit: 1,
       result: {
         changed: false,
         error: { code: 'voice_drain_unproven' },
-        next_actions: expect.arrayContaining([{ kind: 'command', argv: ['gws-ea', 'capabilities', 'check', 'voice'] }]),
+        next_actions: expect.arrayContaining([{ kind: 'command', argv: ['gws-ea', 'connectors', 'check', 'voice'] }]),
       },
     });
   });
@@ -824,12 +824,12 @@ describe('native public capability journeys', () => {
     const external = { ...installation, installationDir: root };
     installed.set(root, external);
     await policy(external);
-    expect(await invoke(['capabilities', 'show', 'voice'])).toMatchObject({
+    expect(await invoke(['connectors', 'show', 'voice'])).toMatchObject({
       exit: 0,
       result: { data: { assets: { status: 'invalid' } } },
     });
     await writeFile(voicePolicyFile(paths), '{');
-    expect(await invoke(['capabilities', 'show', 'voice'])).toMatchObject({
+    expect(await invoke(['connectors', 'show', 'voice'])).toMatchObject({
       exit: 0,
       result: { data: { activation: { status: 'unknown', enabled: null }, assets: { status: 'unknown' } } },
     });

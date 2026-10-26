@@ -57,12 +57,12 @@ describe('native capability driver', () => {
         return true;
       });
       const { confirm, spinner, note } = prompts;
-      expect(await main(['capabilities', 'check', 'voice', mode], { interactive: true })).toBe(0);
+      expect(await main(['connectors', 'check', 'voice', mode], { interactive: true })).toBe(0);
       if (mode === '--json') {
-        expectResultContract('capabilities check', JSON.parse(output.join('')));
+        expectResultContract('connectors check', JSON.parse(output.join('')));
         expect(JSON.parse(output.join(''))).toMatchObject({
           schema_version: 1,
-          command: 'capabilities check',
+          command: 'connectors check',
           outcome: 'succeeded',
           changed: false,
           data: { name: 'voice', assets: { status: 'absent' }, activation: { status: 'disabled' } },
@@ -98,10 +98,10 @@ describe('native capability driver', () => {
       });
       vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
 
-      expect(await main(['capabilities', 'check', 'onepassword', mode], { interactive: true })).toBe(0);
+      expect(await main(['connectors', 'check', 'onepassword', mode], { interactive: true })).toBe(0);
       if (mode === '--json') {
         const checked = JSON.parse(output.join('')) as unknown;
-        expectResultContract('capabilities check onepassword', checked);
+        expectResultContract('connectors check onepassword', checked);
         expect(checked).toMatchObject({
           outcome: 'succeeded',
           changed: false,
@@ -111,10 +111,10 @@ describe('native capability driver', () => {
       expect(await readdir(path.join(root, 'config'))).toEqual([]);
 
       output.length = 0;
-      expect(await main(['capabilities', 'enable', 'onepassword', mode], { interactive: true })).toBe(1);
+      expect(await main(['connectors', 'enable', 'onepassword', mode], { interactive: true })).toBe(1);
       if (mode === '--json') {
         const enabled = JSON.parse(output.join('')) as unknown;
-        expectResultContract('capabilities enable onepassword', enabled);
+        expectResultContract('connectors enable onepassword', enabled);
         expect(enabled).toMatchObject({ outcome: 'failed', error: { code: 'onepassword_cli_missing' } });
       }
       const { confirm, spinner, note, select, text, password } = prompts;

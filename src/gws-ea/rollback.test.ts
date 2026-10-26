@@ -253,7 +253,7 @@ describe('gws-ea rollback when no schema moved', GIT_HEAVY, () => {
 
     expect(await run(['rollback', '--id', runtime.instance_id])).toBe(1);
 
-    expect(err.join('\n')).toContain(`capabilities enable browser --id ${runtime.instance_id} --main-only`);
+    expect(err.join('\n')).toContain(`connectors enable browser --id ${runtime.instance_id} --main-only`);
     expect(state.events.slice(events)).toEqual([]);
     expect(await readlink(runtime.checkout_root)).toBe(releaseName(next.commit));
     expect(await readOperationRecord(host.paths, runtime.instance_id)).toBeUndefined();

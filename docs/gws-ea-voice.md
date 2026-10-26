@@ -19,16 +19,16 @@ processes are private to an instance.
 Run these commands from the operator's existing gws-ea checkout:
 
 ```sh
-gws-ea capabilities list
-gws-ea capabilities show voice
-gws-ea capabilities install voice
-gws-ea capabilities enable voice
-gws-ea capabilities check voice
+gws-ea connectors list
+gws-ea connectors show voice
+gws-ea connectors install voice
+gws-ea connectors enable voice
+gws-ea connectors check voice
 gws-ea status --id <instance_id> --details
 ```
 
-Use `gws-ea help capabilities` to discover available actions and
-`gws-ea help capabilities install` for installation options.
+Use `gws-ea help connectors` to discover available actions and
+`gws-ea help connectors install` for installation options.
 
 Installation is explicit and leaves voice disabled. Package installation,
 container builds, assistant creation, ordinary updates, and incoming notes never
@@ -69,7 +69,7 @@ after publication retains that directory disabled for inspection or retry;
 failure cleanup never deletes a published installation.
 
 The default model is `base`. Larger models are explicit operator choices through
-`capabilities install voice --model small` or `--model large-v3-turbo-q5_0`.
+`connectors install voice --model small` or `--model large-v3-turbo-q5_0`.
 Disable voice before changing the selected installation. Real principal-note
 quality qualification and Google Chat live acceptance remain pending; the
 default is not a claim that those launch gates passed. Recorded engine smoke
@@ -86,11 +86,11 @@ policy locator. This is a native configuration binding, not per-assistant
 enablement. Enabling binds current instances; creates and release cutovers bind
 future compatible hosts. Hosts read the shared policy for each note.
 
-`capabilities list` distinguishes supported host functionality, installed
+`connectors list` distinguishes supported host functionality, installed
 recipe-owned directories, the selected assets, and host activation. `capabilities
 show voice` reports the selected model, exact recipe and source provenance,
 installation prerequisites, current release compatibility, and readiness limits.
-`capabilities check voice --json` verifies assets and queries only bounded native
+`connectors check voice --json` verifies assets and queries only bounded native
 voice health. It retains unknown compatibility and unreachable consumers;
 missing or corrupt assets never count as drained consumers. These observations
 do not download, enable, restart, or process recordings. Principal response
@@ -126,8 +126,8 @@ operator repair commands.
 ## Disable and remove
 
 ```sh
-gws-ea capabilities disable voice
-gws-ea capabilities uninstall voice
+gws-ea connectors disable voice
+gws-ea connectors uninstall voice
 ```
 
 Disablement stops new recognition everywhere without restarting text service.

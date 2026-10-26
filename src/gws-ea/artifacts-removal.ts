@@ -9,7 +9,7 @@ import {
   writeArtifactsOperatorConfig,
   type ArtifactsOperatorConfig,
 } from './artifacts-cloudflare.js';
-import { renderArtifactsConnectorService, setArtifactsIngress } from './artifacts-capability.js';
+import { renderArtifactsConnectorService, setArtifactsIngress } from './artifacts-connector.js';
 import type { ControlPlanePaths } from './paths.js';
 import { runSanitizedCommandOutcome, buildToolEnvironment, type SanitizedCommandOutcomeRunner } from './process.js';
 import { readRegistry, withMachineLock } from './registry.js';

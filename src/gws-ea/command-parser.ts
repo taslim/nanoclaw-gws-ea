@@ -85,7 +85,7 @@ function validateArguments(command: CommandDefinition, values: readonly string[]
     if (definition.required && value === undefined) invalid(`Missing required ${definition.name}`);
     if (value !== undefined && definition.choices && !definition.choices.includes(value))
       invalid(
-        `${definition.name} must be ${definition.choices.join(', ')}.${definition.name === 'capability' ? ' Run gws-ea capabilities list for supported capabilities.' : ''}`,
+        `${definition.name} must be ${definition.choices.join(', ')}.${definition.name === 'capability' ? ' Run gws-ea connectors list for supported capabilities.' : ''}`,
       );
   }
   if (!definitions.some((argument) => argument.variadic) && values.length > definitions.length)
@@ -116,10 +116,10 @@ export function parseInvocation(args: readonly string[]): ParsedInvocation {
     );
     if (candidates.length === 0)
       invalid(
-        `Unknown command ${JSON.stringify(path.join(' '))}.${path[0] === 'capabilities' ? ' Run gws-ea help capabilities for supported actions.' : ''}`,
+        `Unknown command ${JSON.stringify(path.join(' '))}.${path[0] === 'connectors' ? ' Run gws-ea help connectors for supported actions.' : ''}`,
       );
     definition = candidates.find((command) => command.path.length === path.length);
-    // A command can prefix a longer one (`capabilities enable` takes voice as an argument; `capabilities enable
+    // A command can prefix a longer one (`connectors enable` takes voice as an argument; `connectors enable
     // browser` is its own command), so stop only when the next token does not continue a longer path.
     const next = own[index];
     if (

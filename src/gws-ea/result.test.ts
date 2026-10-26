@@ -133,7 +133,7 @@ describe('managed result redaction', () => {
 
   it('keeps recovery command grammar but consumes and redacts argument values', () => {
     for (const secret of [
-      'capabilities',
+      'connectors',
       '--secrets-file',
       '--source-remote',
       '--chat-configured',
@@ -143,7 +143,7 @@ describe('managed result redaction', () => {
       'next_actions',
     ])
       registerSecret(secret);
-    const result = managedResult('capabilities install', {
+    const result = managedResult('connectors install', {
       outcome: 'failed',
       next_actions: [
         { kind: 'command', argv: ['gws-ea', 'resume', '--id', 'succeeded', '--secrets-file', '--chat-configured'] },
@@ -151,17 +151,17 @@ describe('managed result redaction', () => {
           kind: 'command',
           argv: ['gws-ea', 'update', '--source-remote=connect-google', '--quiet'],
         },
-        { kind: 'command', argv: ['gws-ea', 'capabilities', 'install', 'voice', '--model', 'large-v3-turbo-q5_0'] },
-        { kind: 'command', argv: ['gws-ea', 'capabilities', 'next_actions', '--chat-configured'] },
+        { kind: 'command', argv: ['gws-ea', 'connectors', 'install', 'voice', '--model', 'large-v3-turbo-q5_0'] },
+        { kind: 'command', argv: ['gws-ea', 'connectors', 'next_actions', '--chat-configured'] },
         { kind: 'command', argv: ['gws-ea', 'ncl', '--id', 'succeeded', '--', '--chat-configured'] },
       ],
     });
     expect(JSON.parse(resultJson(result))).toMatchObject({
-      command: 'capabilities install',
+      command: 'connectors install',
       next_actions: [
         { kind: 'command', argv: ['gws-ea', 'resume', '--id', REDACTED, '--secrets-file', REDACTED] },
         { kind: 'command', argv: ['gws-ea', 'update', `--source-remote=${REDACTED}`, '--quiet'] },
-        { kind: 'command', argv: ['gws-ea', 'capabilities', 'install', 'voice', '--model', REDACTED] },
+        { kind: 'command', argv: ['gws-ea', 'connectors', 'install', 'voice', '--model', REDACTED] },
         { kind: 'command', argv: ['gws-ea', REDACTED, REDACTED, REDACTED] },
         { kind: 'command', argv: ['gws-ea', 'ncl', '--id', REDACTED, '--', REDACTED] },
       ],

@@ -14,7 +14,7 @@ import {
   enableArtifactsCapability,
   inspectArtifactsCapability,
   instanceArtifactsPolicyFile,
-} from './artifacts-capability.js';
+} from './artifacts-connector.js';
 import {
   artifactsOperatorFiles,
   readArtifactsOperatorConfig,
@@ -277,7 +277,7 @@ describe('artifacts operator capability', () => {
     const stdout: string[] = [];
     const stderr: string[] = [];
     expect(
-      await runCli(['capabilities', 'show', 'artifacts', '--id', f.a.instanceId, '--json'], {
+      await runCli(['connectors', 'show', 'artifacts', '--id', f.a.instanceId, '--json'], {
         paths: f.paths,
         artifacts: f.dependencies,
         environment: {},
@@ -286,7 +286,7 @@ describe('artifacts operator capability', () => {
       }),
     ).toBe(0);
     const result: unknown = JSON.parse(stdout.join('\n'));
-    expectResultContract('capabilities show artifacts', result);
+    expectResultContract('connectors show artifacts', result);
     expect(result).toMatchObject({
       outcome: 'succeeded',
       changed: false,
@@ -666,7 +666,7 @@ describe('artifacts operator capability', () => {
   it('publishes the four scoped native commands and no install or token argument', async () => {
     const output: string[] = [];
     expect(
-      await runCli(['schema', 'capabilities', '--json'], { stdout: (line) => output.push(line), environment: {} }),
+      await runCli(['schema', 'connectors', '--json'], { stdout: (line) => output.push(line), environment: {} }),
     ).toBe(0);
     const schema = JSON.parse(output.join('\n')) as {
       commands: { path: string[]; scope: string; options: { name: string; required: boolean }[] }[];

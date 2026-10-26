@@ -219,7 +219,7 @@ export async function installVoiceAssets(
     } catch (error) {
       throw new GwsEaError(
         'voice_assets_invalid',
-        'Existing voice assets are invalid. Disable voice, run gws-ea capabilities uninstall voice, then gws-ea capabilities install voice.',
+        'Existing voice assets are invalid. Disable voice, run gws-ea connectors uninstall voice, then gws-ea connectors install voice.',
         { cause: error, details: { model } },
       );
     }

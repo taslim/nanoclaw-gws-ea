@@ -957,7 +957,7 @@ describe('status', () => {
         return args.join(' ') === 'gws-ea-alias get' ? setup : healthy.ncl(runtime, args);
       };
     const observe = (setup: unknown) => statusJson(host, state, id, { ...healthy, ncl: reporting(setup) });
-    const enable = ['gws-ea', 'capabilities', 'enable', 'browser', '--id', id];
+    const enable = ['gws-ea', 'connectors', 'enable', 'browser', '--id', id];
 
     const disabled = await observe({ alias: null, candidate: null });
     expect(disabled.status.probes.web_alias).toEqual({
@@ -972,7 +972,7 @@ describe('status', () => {
     const unchosen = await observe({ alias: null, candidate: null });
     expect(unchosen.status.probes.web_alias).toEqual({
       status: 'degraded',
-      reason: `Setup is incomplete: the browser is enabled, but the assistant has no web alias yet. Run gws-ea capabilities enable browser --id ${id} to choose one.`,
+      reason: `Setup is incomplete: the browser is enabled, but the assistant has no web alias yet. Run gws-ea connectors enable browser --id ${id} to choose one.`,
       state: 'pending',
       address: null,
     });
@@ -981,7 +981,7 @@ describe('status', () => {
     const unadded = await observe({ alias: null, candidate: 'onuj@example.test' });
     expect(unadded.status.probes.web_alias).toMatchObject({
       status: 'degraded',
-      reason: `Setup is incomplete: the web alias onuj@example.test needs the operator’s confirmation. Add it in the Google Admin console, then run gws-ea capabilities enable browser --id ${id} --alias-added.`,
+      reason: `Setup is incomplete: the web alias onuj@example.test needs the operator’s confirmation. Add it in the Google Admin console, then run gws-ea connectors enable browser --id ${id} --alias-added.`,
       address: 'onuj@example.test',
     });
     expect(unadded.nextActions).toContainEqual({ kind: 'command', argv: [...enable, '--alias-added'] });

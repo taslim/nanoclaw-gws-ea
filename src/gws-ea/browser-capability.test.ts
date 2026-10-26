@@ -316,7 +316,7 @@ describe('assistant browser capability', () => {
     const f = await fixture();
     for (const command of ['enable', 'show', 'check', 'disable'] as const) {
       const stdout: string[] = [];
-      const exit = await runCli(['capabilities', command, 'browser', '--id', f.instanceId, '--json'], {
+      const exit = await runCli(['connectors', command, 'browser', '--id', f.instanceId, '--json'], {
         paths: f.paths,
         stdout: (line) => stdout.push(line),
         stderr: () => undefined,
@@ -349,13 +349,13 @@ describe('assistant browser capability', () => {
     }
     const stdout: string[] = [];
     expect(
-      await runCli(['capabilities', 'list', '--json'], {
+      await runCli(['connectors', 'list', '--json'], {
         paths: f.paths,
         stdout: (line) => stdout.push(line),
         stderr: () => undefined,
       }),
     ).toBe(0);
-    expectResultContract('capabilities list', JSON.parse(stdout.join('\n')));
+    expectResultContract('connectors list', JSON.parse(stdout.join('\n')));
   });
 });
 
@@ -509,7 +509,7 @@ describe('the browser access setting', () => {
     const f = await fixture();
     const stdout: string[] = [];
     const exit = await runCli(
-      ['capabilities', 'enable', 'browser', '--id', f.instanceId, '--agent-group', 'ag-research', '--json'],
+      ['connectors', 'enable', 'browser', '--id', f.instanceId, '--agent-group', 'ag-research', '--json'],
       {
         paths: f.paths,
         stdout: (line) => stdout.push(line),
@@ -519,11 +519,11 @@ describe('the browser access setting', () => {
     );
     expect(exit).toBe(0);
     const result: unknown = JSON.parse(stdout.join('\n'));
-    expectResultContract('capabilities enable browser', result);
+    expectResultContract('connectors enable browser', result);
     expect(result).toMatchObject({ data: { access: { version: 2, agent_group_ids: ['ag-research'] } } });
     const lines: string[] = [];
     expect(
-      await runCli(['capabilities', 'show', 'browser', '--id', f.instanceId], {
+      await runCli(['connectors', 'show', 'browser', '--id', f.instanceId], {
         paths: f.paths,
         stdout: (line) => lines.push(line),
         stderr: () => undefined,
@@ -535,7 +535,7 @@ describe('the browser access setting', () => {
     const errors: string[] = [];
     expect(
       await runCli(
-        ['capabilities', 'enable', 'browser', '--id', f.instanceId, '--agent-group', 'ag-research', '--main-only'],
+        ['connectors', 'enable', 'browser', '--id', f.instanceId, '--agent-group', 'ag-research', '--main-only'],
         { paths: f.paths, stdout: () => undefined, stderr: (line) => errors.push(line) },
       ),
     ).not.toBe(0);
