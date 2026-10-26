@@ -20,11 +20,24 @@ export interface WhatsAppContent {
   readonly isGroup: boolean;
   readonly fromMe: boolean;
   readonly forwarded: boolean;
+  /** Member keys, with `you` for the assistant. */
+  readonly mentions?: readonly string[];
   readonly attachments?: readonly WhatsAppAttachment[];
-  readonly replyTo?: { readonly id: string; readonly text?: string; readonly sender?: string };
+  readonly replyTo?: {
+    readonly id: string;
+    readonly text?: string;
+    readonly sender?: string;
+    readonly senderId?: string;
+    readonly self?: true;
+  };
   readonly reaction?: {
     readonly emoji: string;
-    readonly target: { readonly self: boolean; readonly sender: string; readonly excerpt: string };
+    readonly target: {
+      readonly self: boolean;
+      readonly sender: string;
+      readonly senderId?: string;
+      readonly excerpt: string;
+    };
   };
 }
 
@@ -105,15 +118,41 @@ export function createWhatsAppInbound(options: WhatsAppInboundOptions) {
       raw,
     );
     if (!isGroup && person) options.onDirectMessage(person, at);
+    const self = [socket.user?.id, socket.user?.lid]
+      .filter((jid): jid is string => typeof jid === 'string')
+      .map(normalizedJid);
+    // Names make the text readable; the keys say for certain who each mention is.
+    const mentions = new Set<string>();
     for (const mention of context?.mentionedJid ?? []) {
       const jid = normalizedJid(mention);
-      const name = options.index.name(jid);
+      const own = self.includes(jid);
+      let mentioned;
+      if (!own) {
+        try {
+          mentioned = await resolvePerson(socket, options.index, jid);
+          /* eslint-disable-next-line no-catch-all/no-catch-all -- a mention's key is never worth the message: it routes with that mention unkeyed */
+        } catch (error) {
+          log.warn('WhatsApp mention could not be resolved', { mention: jid, err: error });
+        }
+      }
+      if (own) mentions.add('you');
+      else if (mentioned) mentions.add(`whatsapp:${mentioned.lid}`);
+      const name = own ? socket.user?.name : options.index.name(jid);
       if (name) text = text.replaceAll(`@${jid.split('@')[0]}`, `@${name}`);
     }
     const quotedId = context?.stanzaId || undefined;
     const quoted = quotedId ? options.index.message(platformId, quotedId) : undefined;
     const reaction = message.reactionMessage;
     const target = reaction?.key?.id ? options.index.message(platformId, reaction.key.id) : undefined;
+    /** The index keeps a message's author as its member key; the agent reads their name beside it. */
+    const author = (stored: { readonly sender: string; readonly fromMe: boolean }) => {
+      if (stored.fromMe) return { sender: socket.user?.name || 'you', self: true as const };
+      const jid = stored.sender.replace(/^whatsapp:/u, '');
+      return {
+        sender: options.index.name(jid.includes('@') ? jid : `${jid}@lid`) || stored.sender,
+        senderId: stored.sender,
+      };
+    };
     const attachments = await inboundMedia(
       raw,
       message,
@@ -129,26 +168,22 @@ export function createWhatsAppInbound(options: WhatsAppInboundOptions) {
       isGroup,
       fromMe: false,
       forwarded,
+      ...(mentions.size ? { mentions: [...mentions] } : {}),
       ...(attachments.length ? { attachments } : {}),
-      ...(quotedId
-        ? { replyTo: { id: quotedId, ...(quoted ? { text: quoted.text, sender: quoted.sender } : {}) } }
-        : {}),
+      ...(quotedId ? { replyTo: { id: quotedId, ...(quoted ? { text: quoted.text, ...author(quoted) } : {}) } } : {}),
       ...(reaction?.key?.id
         ? {
             reaction: {
               emoji: reaction.text ?? '',
               target: {
+                ...(target ? author(target) : { sender: 'unknown' }),
                 self: target?.fromMe === true,
-                sender: target?.sender ?? 'unknown',
                 excerpt: target?.text.slice(0, 280) ?? '',
               },
             },
           }
         : {}),
     };
-    const self = [socket.user?.id, socket.user?.lid]
-      .filter((jid): jid is string => typeof jid === 'string')
-      .map(normalizedJid);
     const mentioned = (context?.mentionedJid ?? []).some((jid) => self.includes(normalizedJid(jid)));
     const inbound: InboundMessage = {
       id,

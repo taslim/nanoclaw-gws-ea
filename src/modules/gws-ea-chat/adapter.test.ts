@@ -356,15 +356,15 @@ describe('messages', () => {
     expect(api.requests.filter((request) => request.url.host === 'people.googleapis.com')).toEqual([]);
   });
 
-  it('gives the agent the quoted text, its sender, and the name of the message replied to', async () => {
+  it('gives the agent the quoted text, its author by name and id, and the name of the message replied to', async () => {
     await start();
     api.addMessage(
       chatMessage(DM, 'remy.2', {
         text: 'yes',
         quotedMessageMetadata: {
-          name: `${DM}/messages/morgan.1`,
+          name: `${DM}/messages/juno.1`,
           quoteType: 'REPLY',
-          quotedMessageSnapshot: { sender: 'Morgan Ellery', text: 'Shall I move Thursday to Friday?' },
+          quotedMessageSnapshot: { sender: 'users/2001', text: 'Shall I move Thursday to Friday?' },
         },
       }),
     );
@@ -372,10 +372,69 @@ describe('messages', () => {
     await deliver!(messageEvent(`${DM}/messages/remy.2`));
 
     expect(content().replyTo).toEqual({
-      id: `${DM}/messages/morgan.1`,
-      sender: 'Morgan Ellery',
+      id: `${DM}/messages/juno.1`,
+      sender: 'Juno Hale',
+      senderId: 'users/2001',
       text: 'Shall I move Thursday to Friday?',
     });
+  });
+
+  it('reads a name once when a member quotes their own message', async () => {
+    await start();
+    api.addMessage(
+      chatMessage(DM, 'juno.2', {
+        sender: { name: 'users/2001', type: 'HUMAN' },
+        text: 'Still true',
+        quotedMessageMetadata: {
+          name: `${DM}/messages/juno.1`,
+          quoteType: 'REPLY',
+          quotedMessageSnapshot: { sender: 'users/2001', text: 'Friday works' },
+        },
+      }),
+    );
+
+    await deliver!(messageEvent(`${DM}/messages/juno.2`));
+
+    expect(content().replyTo).toMatchObject({ sender: 'Juno Hale', senderId: 'users/2001' });
+    expect(api.requests.filter((request) => request.url.host === 'people.googleapis.com')).toHaveLength(1);
+  });
+
+  it("marks a quote of the assistant's own message, and lists whom a message mentions", async () => {
+    await start();
+    api.addMessage(
+      chatMessage(DM, 'remy.3', {
+        text: '@Juno Hale and you, see this',
+        annotations: [
+          {
+            type: 'USER_MENTION',
+            startIndex: 0,
+            length: 10,
+            userMention: { user: { name: 'users/2001', type: 'HUMAN' }, type: 'MENTION' },
+          },
+          {
+            type: 'USER_MENTION',
+            startIndex: 15,
+            length: 3,
+            userMention: { user: { name: ASSISTANT, type: 'HUMAN' }, type: 'MENTION' },
+          },
+        ],
+        quotedMessageMetadata: {
+          name: `${DM}/messages/assistant.1`,
+          quoteType: 'REPLY',
+          quotedMessageSnapshot: { sender: ASSISTANT, text: 'Friday at 3?' },
+        },
+      }),
+    );
+
+    await deliver!(messageEvent(`${DM}/messages/remy.3`));
+
+    expect(content().replyTo).toEqual({
+      id: `${DM}/messages/assistant.1`,
+      sender: ASSISTANT,
+      self: true,
+      text: 'Friday at 3?',
+    });
+    expect(content().mentions).toEqual(['users/2001', 'you']);
   });
 
   it('preserves forwarded audio facts, caption, authenticated participant and original source ID', async () => {
@@ -940,11 +999,16 @@ describe('reactions', () => {
     expect(routed[0]!.message).not.toHaveProperty('quiet');
     expect(content(0).reaction).toEqual({
       emoji: 'thumbs_up',
-      target: { self: true, sender: 'morgan', excerpt: 'Shall I move Thursday to Friday?' },
+      target: {
+        self: true,
+        sender: 'morgan',
+        senderId: 'users/100000000000000000001',
+        excerpt: 'Shall I move Thursday to Friday?',
+      },
     });
     expect(content(1).reaction).toEqual({
       emoji: 'thumbs_up',
-      target: { self: false, sender: 'Juno Hale', excerpt: 'Lunch at 1?' },
+      target: { self: false, sender: 'Juno Hale', senderId: 'users/2001', excerpt: 'Lunch at 1?' },
     });
   });
 

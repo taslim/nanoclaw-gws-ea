@@ -39,6 +39,7 @@ export async function renderChatContext(chatId: string): Promise<string> {
       untrustedLine(member.name ?? 'Unnamed member', 500, 'chat member name'),
     );
   }
+  lines.push("A message's sender_id and mentions name these member keys; `you` is you.");
   const matters = await chatMatterIds(chatId);
   lines.push(
     `Open matter keys: ${matters.length === 0 ? 'none' : matters.join(', ')}. Use a key with tell_main when more than one is open.`,

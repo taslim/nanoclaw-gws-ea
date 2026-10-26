@@ -478,6 +478,11 @@ themselves are never shown.
   <message id="5" from="family" sender="John" time="Jan 1, 10:00 AM">Check this PR</message>
   ```
   A reply carries a `reply_to` attribute and an inline `<quoted_message from="…">…</quoted_message>`.
+  A channel message also carries `sender_id`, the sender's namespaced platform key, and `mentions`
+  when the adapter recorded them (member keys, with `you` for the agent). A quote names its author
+  in `from` with `from_id`, and a reaction and the message it reacts to carry `sender_id`; the
+  agent's own message reads as `you`. Names in the text stay readable; these attributes come from
+  the adapter, never from what a member typed.
 
 - **`chat-sdk`** — same `<message>` shape, fields extracted from the serialized Chat SDK
   message. Attachments are appended inline: `[image: screenshot.png — saved to /workspace/…]`

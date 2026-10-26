@@ -142,6 +142,9 @@ const POLICY: Policy = {
     'gws-ea-browser/purchase-wording.ts': {
       authority_id: "a field of the commit the host queues itself; its refusal reaches the host's queue",
     },
+    'gws-ea-chats/context.ts': {
+      sender_id: 'an attribute of each message tag the chat agent reads, written by the runner formatter',
+    },
     'gws-ea-chat/subscription.ts': {
       target_resource: "a field in the filter the host sends Google's Workspace Events API",
     },

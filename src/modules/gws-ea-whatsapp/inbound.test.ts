@@ -146,9 +146,31 @@ describe('durable WhatsApp inbound and trusted context', () => {
         }),
       ],
     });
-    expect(h.content()[0].replyTo).toEqual({ id, text: 'The host wrote this', sender: 'whatsapp:999000' });
+    expect(h.content()[0].replyTo).toEqual({ id, text: 'The host wrote this', sender: 'Assistant', self: true });
     expect(h.content()[0].text).toBe('A reply');
     expect(h.messages()[0].isMention).toBe(true);
+  });
+  it('names a quoted member by their name, with their key', async () => {
+    await h.start();
+    await h.socket().emit('messages.upsert', { type: 'notify', messages: [incoming('original', 'Friday works')] });
+    await h.socket().emit('messages.upsert', {
+      type: 'notify',
+      messages: [
+        incoming('answer', '', {
+          key: { id: 'answer', remoteJid: 'team@g.us', participant: '14000@lid' },
+          pushName: 'Maya',
+          message: {
+            extendedTextMessage: { text: 'Agreed', contextInfo: { stanzaId: 'original', participant: '12000@lid' } },
+          },
+        }),
+      ],
+    });
+    expect(h.content()[1].replyTo).toEqual({
+      id: 'original',
+      text: 'Friday works',
+      sender: 'Pat',
+      senderId: 'whatsapp:12000',
+    });
   });
   it('never repeats an unknown quote’s claimed sender or text', async () => {
     await h.start();
@@ -172,7 +194,7 @@ describe('durable WhatsApp inbound and trusted context', () => {
     expect(h.content()[0].replyTo).toEqual({ id: 'never-stored' });
     expect(h.messages()[0].isMention).toBe(false);
   });
-  it('renders known mention pills as names and recognizes either assistant address', async () => {
+  it("renders known mention pills as names, the assistant's own as its name, and recognizes either assistant address", async () => {
     await h.start();
     await h.socket().emit('contacts.upsert', [{ id: '14000@lid', name: 'Maya' }]);
     await h.socket().emit('messages.upsert', {
@@ -188,7 +210,27 @@ describe('durable WhatsApp inbound and trusted context', () => {
         }),
       ],
     });
-    expect(h.content()[0].text).toBe('@Maya and @999000 hello');
+    expect(h.content()[0].text).toBe('@Maya and @Assistant hello');
+    expect(h.content()[0].mentions).toEqual(['whatsapp:14000', 'you']);
+    expect(h.messages()[0].isMention).toBe(true);
+  });
+  it('routes a message whose mention cannot be resolved, without that mention key', async () => {
+    await h.start();
+    vi.spyOn(h.socket().signalRepository.lidMapping, 'getLIDForPN').mockRejectedValueOnce(new Error('usync down'));
+    await h.socket().emit('messages.upsert', {
+      type: 'notify',
+      messages: [
+        incoming('mention-outage', '', {
+          message: {
+            extendedTextMessage: {
+              text: '@15559990000 and @999000 hello',
+              contextInfo: { mentionedJid: ['15559990000@s.whatsapp.net', '999000@lid'] },
+            },
+          },
+        }),
+      ],
+    });
+    expect(h.content()[0].mentions).toEqual(['you']);
     expect(h.messages()[0].isMention).toBe(true);
   });
   it('emits reactions on own sends with the native target shape and no written text', async () => {
@@ -204,7 +246,7 @@ describe('durable WhatsApp inbound and trusted context', () => {
     });
     expect(h.content()[0]).toMatchObject({
       text: '',
-      reaction: { emoji: '🎉', target: { self: true, sender: 'whatsapp:999000', excerpt: 'Dinner is booked' } },
+      reaction: { emoji: '🎉', target: { self: true, sender: 'Assistant', excerpt: 'Dinner is booked' } },
     });
     expect(h.messages()[0]).toMatchObject({ reaction: true, quiet: false });
   });

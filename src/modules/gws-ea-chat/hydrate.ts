@@ -46,7 +46,13 @@ export interface ChatSpace {
 export interface QuotedMessageMetadata {
   readonly name: string;
   readonly quoteType?: string;
-  readonly quotedMessageSnapshot?: { readonly sender?: string; readonly text?: string };
+  readonly quotedMessageSnapshot?: {
+    readonly sender?: string;
+    readonly text?: string;
+    /** Set by the channel: Chat's snapshot names its author by resource name only. */
+    readonly senderName?: string;
+    readonly byAssistant?: true;
+  };
 }
 
 /** The SDK's message shape, plus the quote its type lacks. */

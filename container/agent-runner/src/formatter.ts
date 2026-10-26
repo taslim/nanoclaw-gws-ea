@@ -169,8 +169,11 @@ export function isRunnerCommand(msg: MessageInRow, providerName: string): boolea
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 function extractSenderId(msg: MessageInRow, content: any): string | null {
-  const raw: string | null = content?.senderId || content?.author?.userId || null;
-  if (!raw) return null;
+  return namespacedUserId(msg, content?.senderId || content?.author?.userId);
+}
+
+function namespacedUserId(msg: MessageInRow, raw: unknown): string | null {
+  if (typeof raw !== 'string' || !raw) return null;
   // Already namespaced (e.g. "telegram:123") — use as-is.
   if (raw.includes(':')) return raw;
   // Raw platform id from chat-sdk serialization — prefix with channel type.
@@ -316,22 +319,42 @@ function formatChatMessages(messages: MessageInRow[]): string {
 function formatSingleChat(msg: MessageInRow): string {
   if (isSessionEcho(msg)) return formatEchoMessage(msg);
   const content = parseContent(msg.content);
-  if (content.reaction !== undefined) return formatReaction(msg, content.sender, content.reaction);
+  if (content.reaction !== undefined) return formatReaction(msg, content);
   const sender = content.sender || content.author?.fullName || content.author?.userName || 'Unknown';
   const time = formatLocalTime(msg.timestamp, TIMEZONE);
   const text = content.text || '';
   const idAttr = msg.seq != null ? ` id="${msg.seq}"` : '';
   const replyAttr = content.replyTo?.id ? ` reply_to="${escapeXml(String(content.replyTo.id))}"` : '';
-  const replyPrefix = formatReplyContext(content.replyTo);
+  const replyPrefix = formatReplyContext(msg, content.replyTo);
   const linksSuffix = formatLinks(content.links, text);
   const attachmentsSuffix = formatAttachments(content.attachments);
   const appContextSuffix = formatAppContext(content.app_context);
 
   const fromAttr = originAttr(msg);
   const threadAttr = msg.channel_type === 'agent' && msg.thread_id ? ` thread="${escapeXml(msg.thread_id)}"` : '';
+  const identityAttrs = msg.channel_type === 'agent' ? '' : formatIdentityAttrs(msg, content);
 
   const principalMark = msg.channel_type === 'agent' ? '' : formatPrincipalMark(content.principalMessage);
-  return `${principalMark}<message${idAttr}${fromAttr}${threadAttr} sender="${escapeXml(sender)}" time="${escapeXml(time)}"${replyAttr}>${replyPrefix}${escapeXml(text)}${linksSuffix}${attachmentsSuffix}${appContextSuffix}</message>`;
+  return `${principalMark}<message${idAttr}${fromAttr}${threadAttr} sender="${escapeXml(sender)}"${identityAttrs} time="${escapeXml(time)}"${replyAttr}>${replyPrefix}${escapeXml(text)}${linksSuffix}${attachmentsSuffix}${appContextSuffix}</message>`;
+}
+
+/**
+ * Names in the text are for reading; these platform keys, written by the adapter and never by a member, say
+ * exactly who spoke and whom they mentioned (`you` is the agent).
+ */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function formatIdentityAttrs(msg: MessageInRow, content: any): string {
+  const senderId = extractSenderId(msg, content);
+  const mentions = Array.isArray(content.mentions)
+    ? content.mentions.flatMap((key: unknown) => {
+        const id = key === 'you' ? key : namespacedUserId(msg, key);
+        return id ? [id] : [];
+      })
+    : [];
+  return (
+    (senderId ? ` sender_id="${escapeXml(senderId)}"` : '') +
+    (mentions.length > 0 ? ` mentions="${escapeXml(mentions.join(','))}"` : '')
+  );
 }
 
 function formatPrincipalMark(value: unknown): string {
@@ -346,8 +369,8 @@ function formatPrincipalMark(value: unknown): string {
 interface ReactionContent {
   /** The emoji by the name add_reaction takes (thumbs_up). */
   emoji: string;
-  /** `self` marks the agent's own message. */
-  target: { self: boolean; sender: string; excerpt: string };
+  /** `self` marks the agent's own message; `senderId` is its author's platform key. */
+  target: { self: boolean; sender: string; senderId?: string; excerpt: string };
 }
 
 function readReaction(value: unknown): ReactionContent {
@@ -359,18 +382,22 @@ function readReaction(value: unknown): ReactionContent {
     target: {
       self: target.self === true,
       sender: typeof target.sender === 'string' ? target.sender : 'Unknown',
+      ...(typeof target.senderId === 'string' && target.senderId ? { senderId: target.senderId } : {}),
       excerpt: typeof target.excerpt === 'string' ? target.excerpt : '',
     },
   };
 }
 
 /** Never a <message>: there is nothing written to reply to, and no id to react to. */
-function formatReaction(msg: MessageInRow, reactor: unknown, value: unknown): string {
-  const { emoji, target } = readReaction(value);
-  const sender = typeof reactor === 'string' && reactor ? reactor : 'Unknown';
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function formatReaction(msg: MessageInRow, content: any): string {
+  const { emoji, target } = readReaction(content.reaction);
+  const sender = typeof content.sender === 'string' && content.sender ? content.sender : 'Unknown';
+  const senderId = extractSenderId(msg, content);
   const time = formatLocalTime(msg.timestamp, TIMEZONE);
   const on = target.self ? 'you' : target.sender;
-  return `<reaction${originAttr(msg)} sender="${escapeXml(sender)}" emoji="${escapeXml(emoji)}" time="${escapeXml(time)}">\n  <reacted_to sender="${escapeXml(on)}">${escapeXml(target.excerpt)}</reacted_to>\n</reaction>`;
+  const onId = target.self ? null : namespacedUserId(msg, target.senderId);
+  return `<reaction${originAttr(msg)} sender="${escapeXml(sender)}"${senderId ? ` sender_id="${escapeXml(senderId)}"` : ''} emoji="${escapeXml(emoji)}" time="${escapeXml(time)}">\n  <reacted_to sender="${escapeXml(on)}"${onId ? ` sender_id="${escapeXml(onId)}"` : ''}>${escapeXml(target.excerpt)}</reacted_to>\n</reaction>`;
 }
 
 /**
@@ -470,17 +497,22 @@ function formatSystemMessage(msg: MessageInRow): string {
  *
  * Matches v1 format (src/v1/router.ts:10-18): `<quoted_message from="X">Y</quoted_message>`.
  * Requires BOTH sender and text — if only id is present the reply_to attribute
- * on the parent <message> carries the link without an inline preview.
+ * on the parent <message> carries the link without an inline preview. The
+ * agent's own message reads `from="you"`; another's carries `from_id`, its
+ * platform key, beside the name, as a message's `sender_id` does.
  *
  * No truncation here (v1 didn't truncate).
  */
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-function formatReplyContext(replyTo: any): string {
+function formatReplyContext(msg: MessageInRow, replyTo: any): string {
   if (!replyTo) return '';
-  const sender = replyTo.sender;
+  const own = replyTo.self === true;
+  const sender = own ? 'you' : replyTo.sender;
   const text = replyTo.text;
   if (!sender || !text) return '';
-  return `\n  <quoted_message from="${escapeXml(sender)}">${escapeXml(text)}</quoted_message>\n`;
+  const senderId = own ? null : namespacedUserId(msg, replyTo.senderId);
+  const idAttr = senderId ? ` from_id="${escapeXml(senderId)}"` : '';
+  return `\n  <quoted_message from="${escapeXml(sender)}"${idAttr}>${escapeXml(text)}</quoted_message>\n`;
 }
 
 /**
