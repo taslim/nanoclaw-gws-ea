@@ -1,3 +1,4 @@
+import { useAvailableBrowser } from './testing/browser-runtime.js';
 import { repairBrowserWatchChecks } from './scheduler.js';
 import fs from 'node:fs';
 import { EventEmitter } from 'node:events';
@@ -38,6 +39,7 @@ let store: BrowserStore;
 let session: Session;
 let actions: BrowserActions;
 beforeEach(async () => {
+  useAvailableBrowser();
   actions = browserActions;
   fs.rmSync(root, { recursive: true, force: true });
   await runMigrations(await initTestDb());
@@ -59,10 +61,10 @@ afterEach(async () => {
 });
 
 it('rechecks operator enablement for a previously live browser job', async () => {
-  const file = `${root}/browser/policy.json`;
+  const file = `${root}/browser`;
   fs.mkdirSync(`${root}/browser`, { recursive: true, mode: 0o700 });
-  fs.writeFileSync(file, JSON.stringify({ schemaVersion: 1, enabled: true }), { mode: 0o600 });
-  vi.stubEnv('GWS_EA_BROWSER_POLICY_FILE', file);
+
+  vi.stubEnv('GWS_EA_BROWSER_ROOT', file);
   setBrowserAdmissionReady(true);
   const input = {
     actor: { kind: 'agent' as const, agentGroupId: session.agent_group_id, sessionId: session.id },
@@ -72,7 +74,7 @@ it('rechecks operator enablement for a previously live browser job', async () =>
   setBrowserAdmissionReady(false);
   expect(await guard(browserRequestGuard, input)).toMatchObject({ effect: 'deny' });
   setBrowserAdmissionReady(true);
-  fs.writeFileSync(file, JSON.stringify({ schemaVersion: 1, enabled: false }));
+  vi.stubEnv('GWS_EA_BROWSER_ROOT', '');
   expect(await guard(browserRequestGuard, input)).toMatchObject({ effect: 'deny' });
 });
 
@@ -693,10 +695,10 @@ it('closes a page acquired after timeout before another owner can take the job',
 });
 
 it('bounds a real watch check with its own provenance and keeps late work quarantined', async () => {
-  const file = `${root}/browser/policy.json`;
+  const file = `${root}/browser`;
   fs.mkdirSync(`${root}/browser`, { recursive: true, mode: 0o700 });
-  fs.writeFileSync(file, JSON.stringify({ schemaVersion: 1, enabled: true }), { mode: 0o600 });
-  vi.stubEnv('GWS_EA_BROWSER_POLICY_FILE', file);
+
+  vi.stubEnv('GWS_EA_BROWSER_ROOT', file);
   const queue = createQueue({ ...runtime, connection: async () => ({}) as ChromeConnection });
   const job = await store.jobForSession(session);
   if (!job) throw new Error('Expected native job');

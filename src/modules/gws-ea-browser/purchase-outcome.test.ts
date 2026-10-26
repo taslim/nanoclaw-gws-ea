@@ -1,3 +1,4 @@
+import { useAvailableBrowser } from './testing/browser-runtime.js';
 import { claimRegionWatchCommit } from './watch-state.js';
 import { createBrowserQueue } from './index.js';
 import { holdBrowserRequest, stopHeldBrowserRequests } from './testing/held-request.js';
@@ -45,7 +46,7 @@ import { readBrowserJob } from './cancel.js';
 import { BrowserStore, type BrowserJob } from './db.js';
 import { GENERIC_FLOW_ID, type PurchaseFacts } from './fingerprint.js';
 import { SiteLeaseStore } from './leases.js';
-import { errand, notes, principalReachable, seedAssistant, writeBrowserPolicy } from './principal-fixture.js';
+import { errand, notes, principalReachable, seedAssistant, configurePrincipalBrowser } from './principal-fixture.js';
 import { notifyPendingIncidents } from './incidents.js';
 import { notifyPendingUnconfirmed, recordPurchaseOutcome } from './purchase-outcome.js';
 import { recoverBrowserPurchases } from './purchase.js';
@@ -96,7 +97,7 @@ const runtime: ConstructorParameters<typeof BrowserQueue>[1] = {
 };
 
 let main: Session;
-const policy = (agentGroupIds?: readonly string[]): string => writeBrowserPolicy(root, agentGroupIds);
+const policy = (agentGroupIds?: readonly string[]): Promise<string> => configurePrincipalBrowser(root, agentGroupIds);
 
 const unconfirmedNotes = async (session: Session): Promise<string[]> =>
   (await notes(session)).filter((text) => text.includes('so it is unconfirmed'));
@@ -184,10 +185,11 @@ const authority = (attemptId: string) =>
 const blocks = () => getDb().all<{ site: string }>('SELECT site FROM gws_ea_browser_purchase_blocks ORDER BY site');
 
 beforeEach(async () => {
+  useAvailableBrowser();
   fs.rmSync(root, { recursive: true, force: true });
-  vi.stubEnv('GWS_EA_BROWSER_POLICY_FILE', policy());
   await runMigrations(await initTestDb());
   main = await seedAssistant();
+  vi.stubEnv('GWS_EA_BROWSER_ROOT', await policy());
   await principalReachable();
 });
 
@@ -434,7 +436,7 @@ describe('main recording an unconfirmed purchase', () => {
   });
 
   it('tells a delegating group other than the recorder that its errand stopped, as information only', async () => {
-    policy(['main-p', 'desk-p']);
+    await policy(['main-p', 'desk-p']);
     const desk = (await resolveSession('desk-p', null, null, 'agent-shared')).session;
     const { session, job } = await errand('desk-p', 'aprons');
     await writeSessionMessage('browser-p', session.id, {
@@ -449,7 +451,7 @@ describe('main recording an unconfirmed purchase', () => {
     });
     const id = await unconfirmed(job, 'aprons');
     // Removed from the browser setting, the desk's purchase falls to main to record.
-    policy(['main-p']);
+    await policy(['main-p']);
     await record(job.thread_id, id, 'not_placed', 'principal');
     const answer = await record(job.thread_id, id, 'placed', 'email');
     expect(answer.message).toContain('Tell the principal now.');
@@ -505,7 +507,7 @@ describe('main recording an unconfirmed purchase', () => {
   });
 
   it("refuses another group's attempt, and lets main record one whose group's browser access was removed", async () => {
-    policy(['main-p', 'desk-p']);
+    await policy(['main-p', 'desk-p']);
     const desk = (await resolveSession('desk-p', null, null, 'agent-shared')).session;
     const ask = (from: Session, thread: string, attemptId: string, outcome: 'placed' | 'not_placed') =>
       recordAsTool(from, { thread, attempt_id: attemptId, outcome, source: 'principal' });
@@ -522,7 +524,7 @@ describe('main recording an unconfirmed purchase', () => {
       refused('No browser job of yours exists for that thread.'),
     );
     // Removed from the browser setting, it records nothing: its errand's notice and its answer fall to main.
-    policy(['main-p']);
+    await policy(['main-p']);
     expect(await ask(desk, job.thread_id, id, 'placed')).toMatchObject(
       refused('Only an agent with browser access records a purchase outcome.'),
     );
@@ -531,7 +533,7 @@ describe('main recording an unconfirmed purchase', () => {
     expect(await ask(main, job.thread_id, id, 'not_placed')).toMatchObject(recorded);
     expect(await attempt(id)).toMatchObject({ resolution: 'not_committed', resolution_source: 'principal' });
     // Main records whatever the setting lists.
-    policy(['desk-p']);
+    await policy(['desk-p']);
     expect(await ask(main, mine.job.thread_id, own, 'placed')).toMatchObject(recorded);
   });
 });

@@ -283,6 +283,10 @@ export async function main(argv: readonly string[], options: { readonly interact
     chooseOnePasswordAccount,
     collectCreateInputs,
     checkPrerequisites: (request, interaction) => ensurePrerequisites(request, interaction),
+    confirmOnePasswordUninstall: async (preview) => {
+      p.note(preview.vaults.map((vault) => `${vault.instance_id}: vault ${vault.vault_id ?? 'unrecorded'}, items ${vault.item_count ?? 'unknown'}, credential work ${vault.credential_attempts ?? 'unknown'}`).join('\n'), '1Password vault deletion', { output: process.stderr });
+      return (await p.confirm({ message: 'Delete every owned assistant vault and its saved passwords?', initialValue: false, output: process.stderr })) === true;
+    },
     confirmRemoval: async (preview) =>
       (await p.confirm({ message: removalQuestion(preview), initialValue: false, output: process.stderr })) === true,
     confirmUpdate: async (preview) =>

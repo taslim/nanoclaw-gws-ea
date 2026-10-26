@@ -8,6 +8,7 @@ import path from 'node:path';
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
+import * as connectorProvisioning from './connector-provisioning.js';
 import { runCli, type CliRuntime, type FailureReport } from './cli.js';
 import type { CreatePromptContext } from './create-input.js';
 import { runStep, withPendingAction, type InteractivePrompts, type PauseResponse } from './events.js';
@@ -409,7 +410,7 @@ describe('host-wide optional voice commands', () => {
       }),
     ).toBe(1);
     const result = JSON.parse(io.out.join('\n')) as { diagnostics: { run_log: string; step_log: string } };
-    expectResultContract('connectors install', result);
+    expectResultContract('connectors install voice', result);
     expect(result).toMatchObject({
       error: { code: 'voice_build_prerequisite', message: expect.stringContaining(cmake) },
       next_actions: [
@@ -462,53 +463,33 @@ describe('host-wide optional voice commands', () => {
       fetch.mockRestore();
     }
   });
-  it('names explicit installation when enabling absent voice assets, without an instance or a download', async () => {
+  it('fails voice check with a structured not-ready result and install recovery', async () => {
     const paths = await testPaths();
-    const stdout: string[] = [];
-    const stderr: string[] = [];
+    const io = lines();
     const fetch = vi.spyOn(globalThis, 'fetch');
     try {
-      expect(
-        await runCli(['connectors', 'enable', 'voice'], {
-          paths,
-          stdout: (line) => stdout.push(line),
-          stderr: (line) => stderr.push(line),
-        }),
-      ).toBe(1);
-      expect(stderr.join('\n')).toContain('gws-ea connectors install voice');
-      expect(stderr.join('\n')).not.toContain('Unknown command');
-      expect(fetch).not.toHaveBeenCalled();
-      await expect(readFile(path.join(paths.configRoot, 'voice.json'), 'utf8')).rejects.toMatchObject({
-        code: 'ENOENT',
+      expect(await runCli(['connectors', 'check', 'voice', '--json'], { paths, ...io.runtime })).toBe(1);
+      const result = JSON.parse(io.out.join('\n'));
+      expectResultContract('connectors check voice', result);
+      expect(result).toMatchObject({
+        command: 'connectors check voice',
+        outcome: 'failed',
+        changed: false,
+        error: { code: 'voice_not_ready' },
+        data: { setup: 'not_installed', readiness: { status: 'not_ready', checked: true } },
+        next_actions: expect.arrayContaining([{ kind: 'command', argv: ['gws-ea', 'connectors', 'install', 'voice'] }]),
       });
+      expect(fetch).not.toHaveBeenCalled();
     } finally {
       fetch.mockRestore();
     }
-  });
-
-  it('returns native errors and exact recovery commands for absent assets in JSON', async () => {
-    const paths = await testPaths();
-    const io = lines();
-    expect(await runCli(['connectors', 'enable', 'voice', '--json'], { paths, ...io.runtime })).toBe(1);
-    expectResultContract('connectors enable', JSON.parse(io.out.join('\n')));
-    expect(JSON.parse(io.out.join('\n'))).toMatchObject({
-      schema_version: 1,
-      command: 'connectors enable',
-      outcome: 'failed',
-      changed: false,
-      error: { code: 'voice_not_installed' },
-      next_actions: [
-        { kind: 'command', argv: ['gws-ea', 'connectors', 'install', 'voice'] },
-        { kind: 'command', argv: ['gws-ea', 'connectors', 'enable', 'voice'] },
-      ],
-    });
   });
 
   it('rejects per-assistant voice configuration', async () => {
     const paths = await testPaths();
     const stderr: string[] = [];
     expect(
-      await runCli(['connectors', 'enable', 'voice', '--id', randomUUID()], {
+      await runCli(['connectors', 'install', 'voice', '--id', randomUUID()], {
         paths,
         stdout: () => undefined,
         stderr: (line) => stderr.push(line),
@@ -2350,6 +2331,35 @@ describe('gws-ea start, stop, and restart', () => {
           NANOCLAW_INSTALL_ID: a.install_id,
         }),
       });
+    },
+  );
+
+  it.each(['start', 'restart'] as const)(
+    '%s keeps the assistant ready when optional connector setup is pending',
+    async (command) => {
+      const paths = await testPaths();
+      const a = await createdAssistant(paths, 35001);
+      const { helpers } = nanoclawServices({ [a.install_id]: true });
+      const io = lines();
+      const provision = vi.spyOn(connectorProvisioning, 'provisionInstalledConnectors').mockResolvedValue({
+        pending: [{ name: 'onepassword', reason: 'operator_sign_in_needed', message: 'Operator sign-in is needed.' }],
+        next_actions: [{ kind: 'command', argv: ['gws-ea', 'connectors', 'install', 'onepassword'] }],
+      });
+      try {
+        expect(
+          await runCli([command, '--id', a.instance_id, '--json'], { paths, ...io.runtime, serviceHelpers: helpers }),
+        ).toBe(0);
+        const result = JSON.parse(io.out.join('\n'));
+        expectResultContract(command, result);
+        expect(result).toMatchObject({
+          outcome: 'succeeded',
+          next_actions: [{ kind: 'command', argv: ['gws-ea', 'connectors', 'install', 'onepassword'] }],
+        });
+        expect(provision).toHaveBeenCalledOnce();
+        expect(provision.mock.calls[0][2]?.onePassword?.operatorTerminal).toBe(false);
+      } finally {
+        provision.mockRestore();
+      }
     },
   );
 

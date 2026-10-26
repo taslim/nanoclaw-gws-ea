@@ -259,15 +259,39 @@ export class CredentialAttempts {
   }
 
   private async require(id: string): Promise<CredentialAttempt> {
+    await this.settleRemovedVault();
     const attempt = await this.get(id);
     if (!attempt) throw new CredentialAttemptError('not_found');
     return attempt;
   }
 
-  unresolved(): Promise<CredentialAttempt[]> {
+  async unresolved(): Promise<CredentialAttempt[]> {
+    await this.settleRemovedVault();
     return this.db.all<CredentialAttempt>(
       `SELECT * FROM ${TABLE} WHERE phase NOT IN ('rejected','finalized') ORDER BY created_at, id`,
     );
+  }
+
+  /** A replacement binding proves the old vault was removed; unavailable credentials alone do not. */
+  private async settleRemovedVault(): Promise<void> {
+    const availability = await this.vault.availability();
+    if (availability.status !== 'available') return;
+    const { accountId, vaultId } = availability.binding;
+    const removed = await this.db.all<{ readonly id: string }>(
+      `SELECT id FROM ${TABLE} WHERE phase NOT IN ('rejected','finalized') AND (account_id != ? OR vault_id != ?)`,
+      accountId,
+      vaultId,
+    );
+    if (!removed.length) return;
+    await this.db.run(
+      `UPDATE ${TABLE} SET phase = 'rejected', evidence_json = ?, updated_at = ?
+       WHERE phase NOT IN ('rejected','finalized') AND (account_id != ? OR vault_id != ?)`,
+      JSON.stringify({ reason: 'vault_removed' }),
+      now(),
+      accountId,
+      vaultId,
+    );
+    for (const { id } of removed) this.secrets.delete(id);
   }
 
   /** An item's ownership record: the latest finalized attempt that saved it. Edits in 1Password never touch it. */

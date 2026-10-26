@@ -31,8 +31,9 @@ import { parseIsoTimestamp } from '../mailbox/model.js';
 import { formatLocalTime } from '../timezone.js';
 import { parseInvocation } from './command-parser.js';
 import releaseTracks from './release-tracks.json' with { type: 'json' };
+import * as browserAvailability from '../modules/gws-ea-browser/availability.js';
+import { useAvailableBrowser } from '../modules/gws-ea-browser/testing/browser-runtime.js';
 import { deriveGcpClaims } from './gcp-identity.js';
-import { enableBrowserCapability } from './browser-capability.js';
 import { acquireInstanceOperation, reserveInstance } from './journal.js';
 import { createOnecliRuntimeLayout, renderOnecliCompose } from './onecli-compose.js';
 import { wrapperImageTag } from './onecli-gateway-image.js';
@@ -57,7 +58,12 @@ import { redact } from './redact.js';
 import { operationName } from './release-layout.js';
 import { writeInstanceMarker } from './registry.js';
 import type { NextAction } from './result.js';
-import { createInstanceRuntimeConfig, persistInstanceRuntime, type HostStatusHelpers } from './service.js';
+import {
+  createInstanceRuntimeConfig,
+  persistInstanceRuntime,
+  type HostStatusHelpers,
+  type InstanceRuntimeConfig,
+} from './service.js';
 import type { NanoclawServiceHelpers } from './service-control.js';
 import {
   PROBE_NAMES,
@@ -76,6 +82,7 @@ const roots: string[] = [];
 
 afterEach(async () => {
   vi.unstubAllEnvs();
+  vi.restoreAllMocks();
   for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true });
 });
 
@@ -111,6 +118,7 @@ const STATUS_FIELDS = [
   'operation',
   'removal_in_progress',
   'release',
+  'connectors',
   'rollback',
   'schema',
   'main_turn',
@@ -129,6 +137,7 @@ interface Machine {
 }
 
 async function machine(): Promise<Machine> {
+  useAvailableBrowser();
   const root = await realpath(await mkdtemp(path.join(os.tmpdir(), 'gws-ea-status-')));
   roots.push(root);
   const paths = resolveControlPlanePaths({
@@ -434,6 +443,10 @@ function ncl(state: World): StatusObservers['ncl'] {
       throw new GwsEaError('command_failed', 'ncl exited with code 1', { details: { exitCode: 1 } });
     }
     switch (args.join(' ')) {
+      case 'gws-ea-alias get':
+        return { alias: 'web@example.test', candidate: null };
+      case 'gws-ea-browser-health':
+        return { schemaVersion: 1, available: true, proxy: { state: 'stopped' }, chrome: { state: 'stopped' } };
       case 'gws-ea-profile get':
         return { main_agent_group_id: MAIN, assistant_display_name: 'Aya' };
       case 'gws-ea-external-email health':
@@ -552,6 +565,7 @@ function command(host: Machine, state: World, observers: Partial<StatusObservers
   const output: Output = { stdout: [], stderr: [] };
   const runtime: ReadOnlyCommandRuntime = {
     paths: host.paths,
+    browserInspection: { runCommand: async () => ({ exitCode: 0, stdout: 'Google Chrome 142.0.0.0', stderr: '' }) },
     stdout: (line) => output.stdout.push(line),
     stderr: (line) => output.stderr.push(line),
     serviceHelpers: serviceHelpers(state, host.root),
@@ -584,6 +598,7 @@ async function statusJson(host: Machine, state: World, instanceId: string, obser
 
 type ProbeShape = { status: string; reason: string | null } & Record<string, unknown>;
 interface StatusShape {
+  connectors: { name: string; setup: string }[];
   main_turn: {
     provider: string | null;
     last: { status: string; at: string; cause: string | null } | null;
@@ -943,7 +958,79 @@ describe('status', () => {
     expect(observed.status.probes.external_email).toMatchObject({ status: 'ok' });
   });
 
-  it('reports the web alias an enabled browser needs: not needed, pending with what to do, then configured', async () => {
+  it('runs isolation only under details and reports a reachable host listener as degraded', async () => {
+    const host = await machine();
+    const reservation = await assistant(host, { label: 'alpha', port: 36001 });
+    const state = world(reservation);
+    const healthy = healthyObservers(state);
+    const observers = {
+      ...healthy,
+      ncl: async (runtime: InstanceRuntimeConfig, args: readonly string[]) =>
+        args.join(' ') === 'gws-ea-browser-health'
+          ? {
+              schemaVersion: 1,
+              available: true,
+              proxy: { state: 'listening', port: 31001 },
+              chrome: { state: 'running', pid: 123, debuggerPort: 9222 },
+            }
+          : healthy.ncl(runtime, args),
+    };
+    const runCommand = vi.fn(async (request: SanitizedCommand) => ({
+      exitCode: 0,
+      stderr: '',
+      stdout:
+        request.command === 'docker' ? JSON.stringify({ proxy: true, debugger: false }) : 'Google Chrome 142.0.0.0',
+    }));
+    const plain = command(host, state, observers);
+    const plainRuntime = { ...plain.runtime, browserInspection: { runCommand } };
+    expect(await runStatusCommand(plainRuntime, { instanceId: reservation.instance_id, json: true })).toBe(0);
+    expect(runCommand).not.toHaveBeenCalled();
+    const detailed = command(host, state, observers);
+    const detailedRuntime = { ...detailed.runtime, browserInspection: { runCommand } };
+    expect(
+      await runStatusCommand(detailedRuntime, { instanceId: reservation.instance_id, json: true, details: true }),
+    ).toBe(0);
+    const result = JSON.parse(detailed.output.stdout.join('\n'));
+    expectResultContract('status', result);
+    expect(result.data.probes.browser).toMatchObject({
+      status: 'degraded',
+      isolation: { isolation: { status: 'failed' } },
+    });
+    expect(runCommand.mock.calls.some(([request]) => request.command === 'docker')).toBe(true);
+    expect(result.next_actions).toContainEqual({
+      kind: 'external',
+      instruction: expect.stringContaining('Docker network isolation'),
+    });
+  });
+
+  it('reports missing Chrome independently from optional alias and connector setup', async () => {
+    const host = await machine();
+    const reservation = await assistant(host, { label: 'alpha', port: 36001 });
+    const state = world(reservation);
+    vi.mocked(browserAvailability.browserAvailability).mockResolvedValue({
+      available: false,
+      reason: 'chrome-missing',
+    });
+    const healthy = healthyObservers(state);
+    const observed = await statusJson(host, state, reservation.instance_id, {
+      ...healthy,
+      ncl: async (runtime, args) =>
+        args.join(' ') === 'gws-ea-alias get' ? { alias: null, candidate: null } : healthy.ncl(runtime, args),
+    });
+    expect(observed.status.probes.browser).toMatchObject({ status: 'degraded', chrome: 'missing' });
+    expect(observed.status.probes.web_alias).toMatchObject({ status: 'ok', state: 'not_configured' });
+    expect(observed.nextActions).toContainEqual({
+      kind: 'external',
+      instruction: expect.stringContaining('install Google Chrome'),
+    });
+    expect(observed.status.connectors.map((entry) => [entry.name, entry.setup])).toEqual([
+      ['voice', 'not_installed'],
+      ['onepassword', 'not_installed'],
+      ['artifacts', 'not_installed'],
+    ]);
+  });
+
+  it('reports optional web identity independently: not configured, pending confirmation, then configured', async () => {
     const host = await machine();
     const reservation = await assistant(host, { label: 'alpha', port: 36_001 });
     const id = reservation.instance_id;
@@ -957,31 +1044,22 @@ describe('status', () => {
         return args.join(' ') === 'gws-ea-alias get' ? setup : healthy.ncl(runtime, args);
       };
     const observe = (setup: unknown) => statusJson(host, state, id, { ...healthy, ncl: reporting(setup) });
-    const enable = ['gws-ea', 'connectors', 'enable', 'browser', '--id', id];
+    const enable = ['gws-ea', 'alias', '--id', id];
 
     const disabled = await observe({ alias: null, candidate: null });
     expect(disabled.status.probes.web_alias).toEqual({
       status: 'ok',
       reason: null,
-      state: 'not_needed',
+      state: 'not_configured',
       address: null,
     });
-    expect(asked).not.toContain('gws-ea-alias get');
-
-    await enableBrowserCapability(host.paths, id);
-    const unchosen = await observe({ alias: null, candidate: null });
-    expect(unchosen.status.probes.web_alias).toEqual({
-      status: 'degraded',
-      reason: `Setup is incomplete: the browser is enabled, but the assistant has no web alias yet. Run gws-ea connectors enable browser --id ${id} to choose one.`,
-      state: 'pending',
-      address: null,
-    });
-    expect(unchosen.nextActions).toContainEqual({ kind: 'command', argv: enable });
+    expect(asked).toContain('gws-ea-alias get');
+    expect(disabled.nextActions).toContainEqual({ kind: 'command', argv: ['gws-ea', 'alias', '--id', id] });
 
     const unadded = await observe({ alias: null, candidate: 'onuj@example.test' });
     expect(unadded.status.probes.web_alias).toMatchObject({
       status: 'degraded',
-      reason: `Setup is incomplete: the web alias onuj@example.test needs the operator’s confirmation. Add it in the Google Admin console, then run gws-ea connectors enable browser --id ${id} --alias-added.`,
+      reason: `The web alias onuj@example.test needs confirmation. Add it in Google Admin, then run gws-ea alias --id ${id} --alias-added.`,
       address: 'onuj@example.test',
     });
     expect(unadded.nextActions).toContainEqual({ kind: 'command', argv: [...enable, '--alias-added'] });
@@ -1423,8 +1501,8 @@ describe('status', () => {
       await runStatusCommand(text.runtime, { instanceId: unstarted.instance_id, json: false, details: true }),
     ).toBe(0);
     const voice = text.output.stdout.find((line) => /\bvoice\b/u.test(line));
-    expect(voice).toContain('host enablement unknown');
-    expect(voice).not.toContain('disabled host-wide');
+    expect(voice).toContain('not installed');
+    expect(voice).toContain('not checked');
   });
 
   it('says an assistant a switch has fenced is fenced, observing its state and service physically', async () => {

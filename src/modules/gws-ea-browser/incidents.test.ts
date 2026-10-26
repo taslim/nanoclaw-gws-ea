@@ -1,3 +1,4 @@
+import { useAvailableBrowser } from './testing/browser-runtime.js';
 /** Incidents against a real central DB and real session DBs: recorded with their job's stop, told once. */
 import fs from 'node:fs';
 
@@ -31,7 +32,7 @@ import './index.js';
 import type { ConfirmationEvidence } from './confirmation.js';
 import { BrowserStore, type BrowserJob } from './db.js';
 import { notifyPendingIncidents, recordIncidentWithStop, stopForUnapprovedCommit } from './incidents.js';
-import { errand, notes, principalReachable, seedAssistant, writeBrowserPolicy } from './principal-fixture.js';
+import { errand, notes, principalReachable, seedAssistant, configurePrincipalBrowser } from './principal-fixture.js';
 import type { BrowserExecutionContext } from './actions.js';
 
 const EVIDENCE: ConfirmationEvidence = {
@@ -53,10 +54,11 @@ const incidents = () =>
   );
 
 beforeEach(async () => {
+  useAvailableBrowser();
   fs.rmSync(root, { recursive: true, force: true });
-  vi.stubEnv('GWS_EA_BROWSER_POLICY_FILE', writeBrowserPolicy(root));
   await runMigrations(await initTestDb());
   main = await seedAssistant();
+  vi.stubEnv('GWS_EA_BROWSER_ROOT', await configurePrincipalBrowser(root));
   vi.mocked(requestWake).mockClear();
 });
 
@@ -102,7 +104,7 @@ describe('an unapproved commit', () => {
 
   it('is told to another group with browser access in the session it delegated from, never main', async () => {
     await principalReachable();
-    writeBrowserPolicy(root, ['main-p', 'desk-p']);
+    await configurePrincipalBrowser(root, ['main-p', 'desk-p']);
     const desk = (await resolveSession('desk-p', null, null, 'agent-shared')).session;
     const { session, job } = await errand('desk-p', 'restock');
     await writeSessionMessage('browser-p', session.id, {

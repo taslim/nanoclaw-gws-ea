@@ -9,15 +9,17 @@ import {
   getDestinations,
 } from '../agent-to-agent/db/agent-destinations.js';
 import { getBrowserAgentGroupId } from '../gws-ea-profile/db.js';
-import { browserDelegators, errandSource, type BrowserDelegator, readHostBrowserPolicy } from './access.js';
+import { browserDelegators, errandSource, type BrowserDelegator } from './access.js';
 import { cancelBrowserJob } from './cancel.js';
 import { ensureBrowserGroup, setBrowserAdmissionReady } from './group.js';
 
+import { browserConfigured } from './availability.js';
+
 import './destination-policy.js';
 
-export async function reconcileBrowserGroup(policyFile?: string): Promise<void> {
+export async function reconcileBrowserGroup(root?: string): Promise<void> {
   try {
-    await reconcileDestinations(policyFile);
+    await reconcileDestinations(root);
   } catch (error) {
     // On-use reconciliation shares the same admission boundary as startup and
     // sweeps. A partially projected map cannot keep a previous ready state.
@@ -28,7 +30,7 @@ export async function reconcileBrowserGroup(policyFile?: string): Promise<void> 
 
 /**
  * Cancel every errand whose group may not delegate now, one opened before its first host-browser request included:
- * disabling cancels them all, and removing a group from the access setting cancels its own. Returns the groups whose
+ * an unconfigured root cancels them all, and revoking a group’s grant cancels its own. Returns the groups whose
  * errands remain open sessions, for projection.
  */
 async function cancelErrandsOutside(browser: string, delegators: ReadonlySet<string>): Promise<Set<string>> {
@@ -87,11 +89,10 @@ function sameEdge(row: AgentDestination | undefined, wanted: AgentDestination): 
   );
 }
 
-async function reconcileDestinations(policyFile?: string): Promise<void> {
+async function reconcileDestinations(root?: string): Promise<void> {
   if (!(await getDb().hasTable('gws_ea_profile'))) return;
-  const policy = await readHostBrowserPolicy(policyFile);
-  const granted = await browserDelegators(policy);
-  const delegators = policy.enabled ? granted : [];
+  const granted = await browserDelegators();
+  const delegators = browserConfigured(root) ? granted : [];
   const existing = await getBrowserAgentGroupId();
   const sources =
     existing === null

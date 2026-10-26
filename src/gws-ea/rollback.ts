@@ -28,7 +28,6 @@ import { writePrivate } from '../community-portal/private-file.js';
 import { peopleForgetHandoffFile, writePeopleForgetHandoff } from '../modules/gws-ea-people/forget-handoff.js';
 import { formatLocalTime } from '../timezone.js';
 import { provideReleaseImage, readInstallCjkFonts } from './agent-image-release.js';
-import { assertBrowserPolicyReadable } from './browser-capability.js';
 import { committedTree } from './checkout.js';
 import {
   assistantImageDocker,
@@ -899,11 +898,6 @@ async function revertOpenUpdate(
     );
   }
   const host = await openCutoverHost(operation, dependencies);
-  await assertBrowserPolicyReadable(
-    host.runtime,
-    host.layout.release(releaseName(update.from.deployed_commit)),
-    releaseLine(update.from),
-  );
   if (!targetMayHaveStarted(update)) {
     await serveLeftRelease(host, update);
     await discardOperation(operation);
@@ -940,7 +934,6 @@ async function rollBackCommitted(
   }
   const name = releaseName(to.deployed_commit);
   if (!(await isReleaseComplete(layout, name))) throw unavailable(`no longer keeps ${releaseLine(to)} whole`);
-  await assertBrowserPolicyReadable(runtime, layout.release(name), releaseLine(to));
   await runStep(
     host.reporter,
     { id: 'prepare_agent_image', label: "Preparing the previous release's agent image…" },

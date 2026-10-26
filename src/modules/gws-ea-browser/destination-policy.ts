@@ -4,6 +4,7 @@ import type { AgentDestination } from '../../types.js';
 import { registerA2aRoutePolicy } from '../agent-to-agent/agent-route.js';
 import { getBrowserAgentGroupId } from '../gws-ea-profile/db.js';
 import { errandSource, hasBrowserAccess } from './access.js';
+import { browserAvailability, browserUnavailableMessage } from './availability.js';
 
 /** Browser is a sealed tool agent, reachable only from the agent groups with browser access. */
 export async function browserDestinationViolation(row: AgentDestination): Promise<string | undefined> {
@@ -37,4 +38,12 @@ registerA2aRoutePolicy('gws-ea-browser:errand-reports', async ({ session, target
   return session.messaging_group_id === null && errandSource(session.thread_id) === targetAgentGroupId
     ? undefined
     : 'An errand reports only to the agent that delegated it.';
+});
+
+/** Keep the named destination while Chrome is missing, but refuse before a sealed errand is created. */
+registerA2aRoutePolicy('gws-ea-browser:availability', async ({ targetAgentGroupId }) => {
+  if (!(await getDb().hasTable('gws_ea_profile')) || targetAgentGroupId !== (await getBrowserAgentGroupId()))
+    return undefined;
+  const availability = await browserAvailability();
+  return availability.available ? undefined : browserUnavailableMessage(availability.reason);
 });

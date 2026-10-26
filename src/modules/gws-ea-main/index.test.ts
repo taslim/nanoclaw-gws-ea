@@ -95,7 +95,7 @@ async function startHost(): Promise<void> {
 beforeEach(async () => {
   fs.rmSync(TEST_ROOT, { recursive: true, force: true });
   fs.mkdirSync(TEST_ROOT, { recursive: true });
-  vi.stubEnv('GWS_EA_BROWSER_POLICY_FILE', path.join(TEST_ROOT, 'browser-policy.json'));
+  vi.stubEnv('GWS_EA_BROWSER_ROOT', path.join(TEST_ROOT, 'browser'));
   await runMigrations(await initTestDb());
 });
 

@@ -41,6 +41,8 @@ export type CommandEnd = { readonly exitCode: number } | { readonly replaceWith:
  * included.
  */
 export interface ReadOnlyContext {
+  readonly browserInspection?: ReadOnlyCommandRuntime['browserInspection'];
+  readonly connectorInspection?: ReadOnlyCommandRuntime['connectorInspection'];
   readonly paths: ControlPlanePaths;
   /** The command's result; scripts read it. */
   readonly output: LineWriter;
@@ -62,6 +64,8 @@ export interface ReadOnlyCommand {
 function observationRuntime(context: ReadOnlyContext): ReadOnlyCommandRuntime {
   return {
     paths: context.paths,
+    browserInspection: context.browserInspection,
+    connectorInspection: context.connectorInspection,
     stdout: context.output,
     stderr: context.errorOutput,
     serviceHelpers: context.serviceHelpers,

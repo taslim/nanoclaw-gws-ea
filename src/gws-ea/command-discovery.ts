@@ -34,7 +34,7 @@ export function helpLines(command?: DiscoveryTarget): readonly string[] {
   if (!command) {
     return [
       'Usage: gws-ea <command> [options]',
-      'Operate managed Google Workspace assistants and their optional capabilities.',
+      'Operate managed Google Workspace assistants and their optional connectors.',
       ...(['Assistants', 'Service', 'Advanced', 'Connectors', 'Discovery'] as const).flatMap((group) => [
         '',
         `${group}:`,
@@ -57,17 +57,25 @@ export function helpLines(command?: DiscoveryTarget): readonly string[] {
       '  10 human prerequisite; 75 busy; 128 + signal interrupted. ncl and logs retain native exits.',
     ];
   }
-  if ('commands' in command)
+  if ('commands' in command) {
+    const target =
+      command.path[0] === 'connectors'
+        ? `${command.path.join(' ')} ${command.path.length === 1 ? '<action> <name>' : '<name>'}`
+        : `${command.path.join(' ')} <action>`;
     return [
-      `Usage: gws-ea ${command.path.join(' ')} <action> [options]`,
-      'Operate optional capabilities. Assistant-scoped browser commands require an explicit --id; voice and 1Password are host-wide.',
+      `Usage: gws-ea ${target} [options]`,
+      'Operate optional connectors. Each action declares shared installation, account and assistant effects.',
       '',
       'Scope: each registered command declares host or assistant ownership.',
       'Commands:',
       ...command.commands.map((definition) => `  ${definition.path.join(' ')}  ${definition.summary}`),
       '',
-      `Run gws-ea help ${command.path.join(' ')} <action> for effects, prerequisites, and recovery.`,
+      `Run gws-ea help ${target} for effects, prerequisites, and recovery.`,
+      ...(command.path[0] === 'connectors'
+        ? ['Example: gws-ea help connectors install voice. Use gws-ea connectors list for the catalog.']
+        : []),
     ];
+  }
   return [
     `Usage: gws-ea ${commandUsage(command)}`,
     command.summary,

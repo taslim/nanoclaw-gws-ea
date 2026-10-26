@@ -1,3 +1,5 @@
+import { configureBrowserAccess } from './testing/browser-access.js';
+import { useAvailableBrowser } from './testing/browser-runtime.js';
 import { createBrowserQueue } from './index.js';
 import fs from 'node:fs';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -34,6 +36,7 @@ import { credentialAttempts } from './credential-attempts.js';
 
 let session: Session;
 beforeEach(async () => {
+  useAvailableBrowser();
   await runMigrations(await initTestDb());
   for (const id of ['main', 'browser'])
     await createAgentGroup({ id, name: id, folder: id, agent_provider: null, created_at: new Date().toISOString() });
@@ -45,16 +48,16 @@ beforeEach(async () => {
   session = (await resolveSystemSession('browser', 'system:a2a:main:cancel')).session;
 });
 afterEach(async () => {
-  delete process.env.GWS_EA_BROWSER_POLICY_FILE;
+  delete process.env.GWS_EA_BROWSER_ROOT;
   await closeDb();
   fs.rmSync(root, { recursive: true, force: true });
 });
 
 it('admits canonical main alone and denies browser delegation while the operator policy is disabled', async () => {
-  const file = `${root}/browser/policy.json`;
+  const file = `${root}/browser`;
   fs.mkdirSync(`${root}/browser`, { recursive: true, mode: 0o700 });
-  fs.writeFileSync(file, JSON.stringify({ schemaVersion: 1, enabled: true }), { mode: 0o600 });
-  process.env.GWS_EA_BROWSER_POLICY_FILE = file;
+
+  process.env.GWS_EA_BROWSER_ROOT = file;
   expect(
     await guard(browserDelegateGuard, { actor: { kind: 'agent', agentGroupId: 'main' }, payload: {} }),
   ).toMatchObject({ effect: 'allow' });
@@ -62,7 +65,7 @@ it('admits canonical main alone and denies browser delegation while the operator
     expect(await guard(browserDelegateGuard, { actor: { kind: 'agent', agentGroupId }, payload: {} })).toMatchObject({
       effect: 'deny',
     });
-  fs.writeFileSync(file, JSON.stringify({ schemaVersion: 1, enabled: false }));
+  vi.stubEnv('GWS_EA_BROWSER_ROOT', '');
   expect(
     await guard(browserDelegateGuard, { actor: { kind: 'agent', agentGroupId: 'main' }, payload: {} }),
   ).toMatchObject({ effect: 'deny' });
@@ -292,7 +295,7 @@ describe('cancelling a job with credential attempts', () => {
   });
 });
 
-describe('a second agent group the browser access setting lists', () => {
+describe('an explicitly granted second agent group', () => {
   const bounds = {
     venue_id: 'bistro-ellery',
     party_size: 2,
@@ -308,12 +311,10 @@ describe('a second agent group the browser access setting lists', () => {
   beforeEach(async () => {
     for (const id of ['research', 'other'])
       await createAgentGroup({ id, name: id, folder: id, agent_provider: null, created_at: new Date().toISOString() });
-    const file = `${root}/browser/policy.json`;
+    const file = `${root}/browser`;
     fs.mkdirSync(`${root}/browser`, { recursive: true, mode: 0o700 });
-    fs.writeFileSync(file, JSON.stringify({ schemaVersion: 2, enabled: true, agentGroupIds: ['main', 'research'] }), {
-      mode: 0o600,
-    });
-    process.env.GWS_EA_BROWSER_POLICY_FILE = file;
+
+    await configureBrowserAccess(file, ['research']);
     main = (await resolveSystemSession('main', 'system:test:main')).session;
     research = (await resolveSystemSession('research', 'system:test:research')).session;
     other = (await resolveSystemSession('other', 'system:test:other')).session;
@@ -362,16 +363,14 @@ describe('a second agent group the browser access setting lists', () => {
       });
   });
 
-  it('refuses a group the setting does not list, and main once it lists only others', async () => {
+  it('refuses an ungranted group while main always retains authority', async () => {
     expect(refusal(await send(other, 'cancel_job', { thread: researchThread }))).toBe(
       'Only an agent with browser access may manage browser jobs.',
     );
-    fs.writeFileSync(
-      `${root}/browser/policy.json`,
-      JSON.stringify({ schemaVersion: 2, enabled: true, agentGroupIds: ['research'] }),
-    );
-    expect(refusal(await send(main, 'cancel_job', { thread: mainThread }))).toBe(
-      'Only an agent with browser access may manage browser jobs.',
-    );
+
+    await configureBrowserAccess(`${root}/browser`, ['research']);
+    expect(
+      await guard(browserDelegateGuard, { actor: { kind: 'agent', agentGroupId: 'main' }, payload: {} }),
+    ).toMatchObject({ effect: 'allow' });
   });
 });

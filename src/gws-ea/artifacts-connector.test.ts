@@ -6,12 +6,16 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { claimInstanceArtifacts, getInstanceReservation } from './registry.js';
 import { deriveGcpClaims } from './gcp-identity.js';
-import { reserveInstance } from './journal.js';
-import { resolveControlPlanePaths } from './paths.js';
+import { reserveInstance, withInstanceOperation } from './journal.js';
+import { resolveControlPlanePaths, type ControlPlanePaths } from './paths.js';
+import { GwsEaError } from './types.js';
 import { persistTestRuntime } from './testing/runtime-fixture.js';
 import {
-  disableArtifactsCapability,
-  enableArtifactsCapability,
+  installArtifactsConnector,
+  provisionAssistantArtifacts,
+  artifactsReleaseCompatibility,
+  type ArtifactsCapabilityOptions,
+  type ArtifactsCapabilityDependencies,
   inspectArtifactsCapability,
   instanceArtifactsPolicyFile,
 } from './artifacts-connector.js';
@@ -24,8 +28,7 @@ import {
 } from './artifacts-cloudflare.js';
 import { isRecord } from './validation.js';
 import { readArtifactsPolicy } from '../modules/gws-ea-artifacts/policy.js';
-import { runCli } from './cli.js';
-import { expectResultContract } from './testing/result-contract.js';
+import { withArtifactsHostLock } from './artifacts-uninstall.js';
 
 const roots: string[] = [];
 afterEach(async () => {
@@ -55,9 +58,27 @@ async function fixture() {
         onecli_project: `gws-ea-${instanceId.replaceAll('-', '')}`,
       },
     });
-    return { instanceId, runtime: await persistTestRuntime(paths, reservation) };
+    const runtime = await persistTestRuntime(paths, reservation);
+    const marker = path.join(runtime.checkout_root, 'src/gws-ea/artifacts-compatibility.json');
+    await mkdir(path.dirname(marker), { recursive: true });
+    await writeFile(marker, JSON.stringify({ schemaVersion: 1, contract: 'gws-ea-artifacts-1' }));
+    return { instanceId, runtime };
   }
   return { root, paths, assistant };
+}
+
+async function provisionForAssistant(
+  paths: ControlPlanePaths,
+  instanceId: string,
+  options: ArtifactsCapabilityOptions = {},
+  dependencies: ArtifactsCapabilityDependencies = {},
+) {
+  const installed = await installArtifactsConnector(paths, options, dependencies);
+  const assistant = installed.assistants.find((entry) => entry.instance_id === instanceId);
+  if (assistant?.outcome !== 'ready')
+    throw new GwsEaError(assistant?.reason ?? 'artifacts_not_ready', assistant?.message ?? 'Artifacts are not ready.');
+  const observed = await inspectArtifactsCapability(paths, instanceId);
+  return { ...assistant, enabled: true, hostname: observed.hostname, path_prefix: observed.path_prefix };
 }
 
 function cloudflareFixture() {
@@ -265,40 +286,23 @@ describe('artifacts operator capability', () => {
   it('reuses an explicitly typed operator PIN without claiming ownership', async () => {
     const f = await provisionFixture();
     f.api.idps.push({ id: 'operator-pin', type: 'onetimepin' });
-    await enableArtifactsCapability(f.paths, f.a.instanceId, {}, f.dependencies);
+    await provisionForAssistant(f.paths, f.a.instanceId, {}, f.dependencies);
     expect((await readArtifactsOperatorConfig(f.files.configFile))?.pin).toEqual({ id: 'operator-pin', owned: false });
     expect(
       f.api.requests.some((request) => request.method === 'POST' && request.resource.endsWith('/identity_providers')),
     ).toBe(false);
   });
 
-  it('publishes real read-only CLI results against the artifact schema without remote calls', async () => {
+  it('observes local artifact state without remote requests or repair', async () => {
     const f = await provisionFixture();
-    const stdout: string[] = [];
-    const stderr: string[] = [];
-    expect(
-      await runCli(['connectors', 'show', 'artifacts', '--id', f.a.instanceId, '--json'], {
-        paths: f.paths,
-        artifacts: f.dependencies,
-        environment: {},
-        stdout: (line) => stdout.push(line),
-        stderr: (line) => stderr.push(line),
-      }),
-    ).toBe(0);
-    const result: unknown = JSON.parse(stdout.join('\n'));
-    expectResultContract('connectors show artifacts', result);
+    const result = await inspectArtifactsCapability(f.paths, f.a.instanceId, f.dependencies);
     expect(result).toMatchObject({
-      outcome: 'succeeded',
-      changed: false,
-      data: {
-        activation: 'disabled',
-        ready: false,
-        operator: { status: 'configured', hostname: 'views.example.test' },
-      },
+      activation: 'disabled',
+      ready: false,
+      operator: { status: 'configured', hostname: 'views.example.test' },
     });
     expect(f.api.requests).toEqual([]);
-    expect(stderr).toEqual([]);
-    expect(stdout.join('\n')).not.toContain('secret-');
+    expect(JSON.stringify(result)).not.toContain('secret-');
   });
   it('serializes two assistants against one tunnel without losing either route', async () => {
     const f = await provisionFixture();
@@ -308,10 +312,8 @@ describe('artifacts operator capability', () => {
       path_prefix: '/milo',
       listen_port: 41001,
     });
-    await Promise.all([
-      enableArtifactsCapability(f.paths, f.a.instanceId, {}, f.dependencies),
-      enableArtifactsCapability(f.paths, b.instanceId, {}, f.dependencies),
-    ]);
+    const installed = await installArtifactsConnector(f.paths, {}, f.dependencies);
+    expect(installed.assistants.every((entry) => entry.outcome === 'ready')).toBe(true);
     const routes = f.api.ingress();
     expect(routes).toContainEqual({
       hostname: 'views.example.test',
@@ -330,7 +332,6 @@ describe('artifacts operator capability', () => {
       f.api.requests.filter((request) => request.method === 'POST' && request.resource.endsWith('/cfd_tunnel')),
     ).toHaveLength(1);
     expect(f.api.dns).toHaveLength(1);
-    await disableArtifactsCapability(f.paths, f.a.instanceId, f.dependencies);
     expect(f.api.ingress().some((route) => route.path === '^/milo(/|$)')).toBe(true);
   });
 
@@ -342,14 +343,11 @@ describe('artifacts operator capability', () => {
       path_prefix: '',
       listen_port: 41001,
     });
-    const result = await enableArtifactsCapability(
-      f.paths,
-      b.instanceId,
-      { assistantHostname: 'avery.other.test' },
-      f.dependencies,
-    );
+    const result = await provisionForAssistant(f.paths, b.instanceId, {}, f.dependencies);
     expect(result).toMatchObject({ hostname: 'avery.other.test', path_prefix: '', enabled: true });
-    expect(f.api.apps[0].destinations).toEqual([
+    const applicationId = (await readArtifactsOperatorConfig(f.files.configFile))?.assistants[b.instanceId]
+      ?.applicationId;
+    expect(f.api.apps.find((app) => app.id === applicationId)?.destinations).toEqual([
       { type: 'public', uri: 'avery.other.test', overrides: [{ behavior: 'public', path_pattern: '/public/*' }] },
     ]);
     expect(f.api.ingress()).toContainEqual({ hostname: 'avery.other.test', service: 'http://127.0.0.1:41001' });
@@ -358,13 +356,18 @@ describe('artifacts operator capability', () => {
     );
   });
 
-  it('refreshes each current eligible author through native restart without a wake message, including zero-running results', async () => {
+  it('refreshes eligible authors only during first activation and verifies a ready assistant without restarting', async () => {
     const f = await provisionFixture();
-    await enableArtifactsCapability(f.paths, f.a.instanceId, {}, f.dependencies);
+    await provisionForAssistant(f.paths, f.a.instanceId, {}, f.dependencies);
     expect(f.restarts).toEqual([
       ['groups', 'restart', '--id', 'canonical'],
       ['groups', 'restart', '--id', 'selected-author'],
     ]);
+    const before = await readFile(instanceArtifactsPolicyFile(f.a.runtime), 'utf8');
+    const repeated = await provisionForAssistant(f.paths, f.a.instanceId, {}, f.dependencies);
+    expect(repeated.changed).toBe(false);
+    expect(f.restarts).toHaveLength(2);
+    expect(await readFile(instanceArtifactsPolicyFile(f.a.runtime), 'utf8')).toBe(before);
   });
 
   it('waits for delayed local listener readiness before exposing ingress', async () => {
@@ -391,7 +394,7 @@ describe('artifacts operator capability', () => {
         return f.dependencies.ncl(runtime, args);
       },
     };
-    expect(await enableArtifactsCapability(f.paths, f.a.instanceId, {}, dependencies)).toMatchObject({ enabled: true });
+    expect(await provisionForAssistant(f.paths, f.a.instanceId, {}, dependencies)).toMatchObject({ enabled: true });
     expect(observations).toBeGreaterThanOrEqual(4);
     expect(waits).toEqual([500, 500, 500]);
     expect((await readArtifactsOperatorConfig(f.files.configFile))?.assistants[f.a.instanceId]?.publicationReady).toBe(
@@ -414,7 +417,7 @@ describe('artifacts operator capability', () => {
         return f.api.transport(input, init);
       }) satisfies typeof fetch,
     };
-    await expect(enableArtifactsCapability(f.paths, f.a.instanceId, {}, dependencies)).rejects.toMatchObject({
+    await expect(provisionForAssistant(f.paths, f.a.instanceId, {}, dependencies)).rejects.toMatchObject({
       code: 'artifacts_not_ready',
     });
     expect((await readArtifactsPolicy(instanceArtifactsPolicyFile(f.a.runtime))).enabled).toBe(false);
@@ -440,7 +443,7 @@ describe('artifacts operator capability', () => {
           ? { policyVersions: [1], enabled: false, availability: 'unavailable', listener: { state: 'stopped' } }
           : f.dependencies.ncl(runtime, args),
     };
-    await expect(enableArtifactsCapability(f.paths, f.a.instanceId, {}, dependencies)).rejects.toMatchObject({
+    await expect(provisionForAssistant(f.paths, f.a.instanceId, {}, dependencies)).rejects.toMatchObject({
       code: 'artifacts_listener_unavailable',
     });
     expect((await readArtifactsPolicy(instanceArtifactsPolicyFile(f.a.runtime))).enabled).toBe(false);
@@ -449,41 +452,23 @@ describe('artifacts operator capability', () => {
     expect(now - started).toBe(30_000);
   });
 
-  it('closes policy before a failed remote disable and retains all ownership for retry', async () => {
-    const f = await provisionFixture();
-    await enableArtifactsCapability(f.paths, f.a.instanceId, {}, f.dependencies);
-    f.api.reject(403);
-    await expect(disableArtifactsCapability(f.paths, f.a.instanceId, f.dependencies)).rejects.toMatchObject({
-      code: 'artifacts_cloudflare_forbidden',
-    });
-    expect((await readArtifactsPolicy(instanceArtifactsPolicyFile(f.a.runtime))).enabled).toBe(false);
-    expect((await readArtifactsOperatorConfig(f.files.configFile))?.assistants[f.a.instanceId]).toMatchObject({
-      enabled: false,
-      publicationReady: false,
-      applicationId: f.api.apps[0].id,
-    });
-    f.api.reject(undefined);
-    await disableArtifactsCapability(f.paths, f.a.instanceId, f.dependencies);
-    expect(f.api.ingress().some((route) => route.hostname === 'views.example.test')).toBe(false);
-  });
-
   it('retains a lost DNS create and never adopts a matching unrecorded DNS record', async () => {
     const f = await provisionFixture();
     f.api.lose('dns');
-    await expect(enableArtifactsCapability(f.paths, f.a.instanceId, {}, f.dependencies)).rejects.toMatchObject({
+    await expect(provisionForAssistant(f.paths, f.a.instanceId, {}, f.dependencies)).rejects.toMatchObject({
       code: 'artifacts_cloudflare_unavailable',
     });
     expect((await readArtifactsOperatorConfig(f.files.configFile))?.pending).toMatchObject({
       kind: 'dns',
       target: 'views.example.test',
     });
-    await expect(enableArtifactsCapability(f.paths, f.a.instanceId, {}, f.dependencies)).rejects.toMatchObject({
+    await expect(provisionForAssistant(f.paths, f.a.instanceId, {}, f.dependencies)).rejects.toMatchObject({
       code: 'artifacts_create_unproven',
     });
     expect(f.api.dns).toHaveLength(1);
     const pending = (await readArtifactsOperatorConfig(f.files.configFile))?.pending;
     await expect(
-      enableArtifactsCapability(f.paths, f.a.instanceId, { discardUnproven: pending?.key }, f.dependencies),
+      provisionForAssistant(f.paths, f.a.instanceId, { discardUnproven: pending?.key }, f.dependencies),
     ).rejects.toMatchObject({ code: 'artifacts_dns_conflict' });
     expect(f.api.dns).toHaveLength(1);
   });
@@ -491,7 +476,7 @@ describe('artifacts operator capability', () => {
   it('reports a missing operator account and never provisions with incomplete domain configuration', async () => {
     const f = await provisionFixture();
     await rm(f.files.configFile);
-    await expect(enableArtifactsCapability(f.paths, f.a.instanceId, {}, f.dependencies)).rejects.toMatchObject({
+    await expect(provisionForAssistant(f.paths, f.a.instanceId, {}, f.dependencies)).rejects.toMatchObject({
       code: 'artifacts_operator_required',
     });
     expect(f.api.requests).toEqual([]);
@@ -500,7 +485,7 @@ describe('artifacts operator capability', () => {
   it('refuses account permission failures and application limits without reporting enabled', async () => {
     const f = await provisionFixture();
     f.api.reject(403);
-    await expect(enableArtifactsCapability(f.paths, f.a.instanceId, {}, f.dependencies)).rejects.toMatchObject({
+    await expect(provisionForAssistant(f.paths, f.a.instanceId, {}, f.dependencies)).rejects.toMatchObject({
       code: 'artifacts_cloudflare_forbidden',
     });
     expect((await readArtifactsPolicy(instanceArtifactsPolicyFile(f.a.runtime))).enabled).toBe(false);
@@ -511,7 +496,7 @@ describe('artifacts operator capability', () => {
         type: 'self_hosted',
         destinations: [{ type: 'public', uri: `foreign-${index}.example.test` }],
       });
-    await expect(enableArtifactsCapability(f.paths, f.a.instanceId, {}, f.dependencies)).rejects.toMatchObject({
+    await expect(provisionForAssistant(f.paths, f.a.instanceId, {}, f.dependencies)).rejects.toMatchObject({
       code: 'artifacts_cloudflare_capacity',
     });
     expect(f.api.apps).toHaveLength(500);
@@ -524,7 +509,7 @@ describe('artifacts operator capability', () => {
       type: 'self_hosted',
       destinations: [{ type: 'public', uri: 'views.example.test' }],
     });
-    await expect(enableArtifactsCapability(f.paths, f.a.instanceId, {}, f.dependencies)).rejects.toMatchObject({
+    await expect(provisionForAssistant(f.paths, f.a.instanceId, {}, f.dependencies)).rejects.toMatchObject({
       code: 'artifacts_access_conflict',
     });
     expect(f.api.apps).toEqual([
@@ -534,7 +519,7 @@ describe('artifacts operator capability', () => {
   });
   it('provisions current Access/PIN contracts before ingress and keeps tokens host-only', async () => {
     const f = await provisionFixture();
-    const result = await enableArtifactsCapability(f.paths, f.a.instanceId, {}, f.dependencies);
+    const result = await provisionForAssistant(f.paths, f.a.instanceId, {}, f.dependencies);
     expect(result.enabled).toBe(true);
     expect(f.api.idps[0]).toMatchObject({ type: 'onetimepin', config: {} });
     const app = f.api.apps[0];
@@ -582,31 +567,25 @@ describe('artifacts operator capability', () => {
     );
     expect(appCreate).toBeLessThan(ingressPut);
     expect(f.api.requests.some((request) => request.resource.endsWith('/connections'))).toBe(true);
-    await disableArtifactsCapability(f.paths, f.a.instanceId, f.dependencies);
-    expect(f.api.ingress()).toEqual([
-      { hostname: 'unrelated.example.test', service: 'http://127.0.0.1:9876' },
-      { service: 'http_status:404' },
-    ]);
-    expect((await readArtifactsPolicy(instanceArtifactsPolicyFile(f.a.runtime))).enabled).toBe(false);
   });
 
   it('retains an ambiguous create and only resumes after exact operator acknowledgment', async () => {
     const f = await provisionFixture();
     f.api.lose('application');
-    await expect(enableArtifactsCapability(f.paths, f.a.instanceId, {}, f.dependencies)).rejects.toMatchObject({
+    await expect(provisionForAssistant(f.paths, f.a.instanceId, {}, f.dependencies)).rejects.toMatchObject({
       code: 'artifacts_cloudflare_unavailable',
     });
     const pending = (await readArtifactsOperatorConfig(f.files.configFile))?.pending;
     expect(pending?.kind).toBe('application');
-    await expect(enableArtifactsCapability(f.paths, f.a.instanceId, {}, f.dependencies)).rejects.toMatchObject({
+    await expect(provisionForAssistant(f.paths, f.a.instanceId, {}, f.dependencies)).rejects.toMatchObject({
       code: 'artifacts_create_unproven',
     });
     expect(f.api.apps).toHaveLength(1);
     await expect(
-      enableArtifactsCapability(f.paths, f.a.instanceId, { discardUnproven: 'wrong' }, f.dependencies),
+      provisionForAssistant(f.paths, f.a.instanceId, { discardUnproven: 'wrong' }, f.dependencies),
     ).rejects.toMatchObject({ code: 'artifacts_attempt_mismatch' });
     f.api.apps.splice(0); // The operator removed the unproven application before acknowledging it.
-    await enableArtifactsCapability(f.paths, f.a.instanceId, { discardUnproven: pending?.key }, f.dependencies);
+    await provisionForAssistant(f.paths, f.a.instanceId, { discardUnproven: pending?.key }, f.dependencies);
     expect(f.api.apps).toHaveLength(1);
     expect((await readArtifactsOperatorConfig(f.files.configFile))?.resolvedAttempts).toEqual([
       expect.objectContaining({ kind: 'application', resolution: 'operator_removed', key: pending?.key }),
@@ -616,11 +595,11 @@ describe('artifacts operator capability', () => {
   it('recovers a lost full-config PUT by reading the exact current config without duplicate creates', async () => {
     const f = await provisionFixture();
     f.api.lose('put');
-    await expect(enableArtifactsCapability(f.paths, f.a.instanceId, {}, f.dependencies)).rejects.toMatchObject({
+    await expect(provisionForAssistant(f.paths, f.a.instanceId, {}, f.dependencies)).rejects.toMatchObject({
       code: 'artifacts_cloudflare_unavailable',
     });
     expect((await readArtifactsPolicy(instanceArtifactsPolicyFile(f.a.runtime))).enabled).toBe(false);
-    await enableArtifactsCapability(f.paths, f.a.instanceId, {}, f.dependencies);
+    await provisionForAssistant(f.paths, f.a.instanceId, {}, f.dependencies);
     expect(f.api.apps).toHaveLength(1);
     expect(f.api.dns).toHaveLength(1);
     expect(f.api.ingress().filter((route) => route.hostname === 'views.example.test')).toHaveLength(1);
@@ -628,7 +607,7 @@ describe('artifacts operator capability', () => {
 
   it('keeps read-only checks from repairing missing PIN or exposing provider response secrets', async () => {
     const f = await provisionFixture();
-    await enableArtifactsCapability(f.paths, f.a.instanceId, {}, f.dependencies);
+    await provisionForAssistant(f.paths, f.a.instanceId, {}, f.dependencies);
     const before = await readFile(f.files.configFile, 'utf8');
     f.api.idps.splice(0);
     const start = f.api.requests.length;
@@ -645,7 +624,7 @@ describe('artifacts operator capability', () => {
 
   it('read-verifies exact email changes, reuses existing admission and revokes sessions after reduction', async () => {
     const f = await provisionFixture();
-    await enableArtifactsCapability(f.paths, f.a.instanceId, {}, f.dependencies);
+    await provisionForAssistant(f.paths, f.a.instanceId, {}, f.dependencies);
     const config = await readArtifactsOperatorConfig(f.files.configFile);
     const applicationId = config!.assistants[f.a.instanceId].applicationId!;
     const input = {
@@ -663,25 +642,7 @@ describe('artifacts operator capability', () => {
     expect(await reconcileArtifactsAccessEmails(input, f.dependencies)).toMatchObject({ changed: false });
     expect(f.api.requests.slice(start).every((request) => request.method === 'GET')).toBe(true);
   });
-  it('publishes the four scoped native commands and no install or token argument', async () => {
-    const output: string[] = [];
-    expect(
-      await runCli(['schema', 'connectors', '--json'], { stdout: (line) => output.push(line), environment: {} }),
-    ).toBe(0);
-    const schema = JSON.parse(output.join('\n')) as {
-      commands: { path: string[]; scope: string; options: { name: string; required: boolean }[] }[];
-    };
-    const commands = schema.commands.filter((command) => command.path[2] === 'artifacts');
-    expect(commands.map((command) => command.path[1])).toEqual(['show', 'check', 'enable', 'disable']);
-    expect(
-      commands.every(
-        (command) =>
-          command.scope === 'assistant' && command.options.some((option) => option.name === 'id' && option.required),
-      ),
-    ).toBe(true);
-    expect(commands.flatMap((command) => command.options).some((option) => option.name === 'token')).toBe(false);
-  });
-  it('serializes first-name claims and preserves the winner across rename and disable', async () => {
+  it('serializes first-name claims and preserves the winner across rename', async () => {
     const f = await fixture();
     const a = await f.assistant('a@example.test', 31000);
     const b = await f.assistant('b@example.test', 31002);
@@ -706,13 +667,12 @@ describe('artifacts operator capability', () => {
         listen_port: 41000,
       }),
     ).rejects.toMatchObject({ code: 'claim_conflict' });
-    await disableArtifactsCapability(f.paths, winner.instanceId);
     expect(
       (await getInstanceReservation(f.paths, winner.instanceId)).exclusive_resource_claims.artifacts?.path_prefix,
     ).toBe('/avery');
   });
 
-  it('closes origin policy before remote failure and show remains read-only', async () => {
+  it('shows a stopped origin policy without changing its owner-only file', async () => {
     const f = await fixture();
     const a = await f.assistant('a@example.test', 31000);
     const policyFile = instanceArtifactsPolicyFile(a.runtime);
@@ -735,7 +695,9 @@ describe('artifacts operator capability', () => {
       }),
       { mode: 0o600 },
     );
-    await disableArtifactsCapability(f.paths, a.instanceId);
+    const policy = await readArtifactsPolicy(policyFile);
+    if (policy.status === 'unavailable' || !policy.config) throw new Error('Missing fixture policy');
+    await writeFile(policyFile, JSON.stringify({ ...policy.config, enabled: false }), { mode: 0o600 });
     expect((await readArtifactsPolicy(policyFile)).enabled).toBe(false);
     const before = await readFile(policyFile, 'utf8');
     const shown = await inspectArtifactsCapability(f.paths, a.instanceId);
@@ -743,4 +705,124 @@ describe('artifacts operator capability', () => {
     expect(await readFile(policyFile, 'utf8')).toBe(before);
     expect((await stat(policyFile)).mode & 0o777).toBe(0o600);
   });
+});
+
+it('installs for every compatible reachable assistant and reports stopped assistants pending', async () => {
+  const f = await provisionFixture();
+  const stopped = await f.assistant('stopped@example.test', 31002);
+  const installed = await installArtifactsConnector(
+    f.paths,
+    {},
+    {
+      ...f.dependencies,
+      ncl: async (runtime, args) => {
+        if (runtime.instance_id === stopped.instanceId) throw new Error('socket unavailable');
+        return f.dependencies.ncl(runtime, args);
+      },
+    },
+  );
+  expect(installed.assistants).toEqual(
+    expect.arrayContaining([
+      expect.objectContaining({ instance_id: f.a.instanceId, outcome: 'ready' }),
+      expect.objectContaining({
+        instance_id: stopped.instanceId,
+        outcome: 'pending',
+        reason: 'artifacts_host_unavailable',
+      }),
+    ]),
+  );
+  expect((await readArtifactsOperatorConfig(f.files.configFile))?.assistants[stopped.instanceId]).toBeUndefined();
+});
+
+it('provisions a previously stopped assistant through its existing instance operation', async () => {
+  const f = await provisionFixture();
+  const result = await withInstanceOperation(f.paths, f.a.instanceId, (operation) =>
+    provisionAssistantArtifacts(operation, f.dependencies),
+  );
+  expect(result).toMatchObject({ instance_id: f.a.instanceId, outcome: 'ready', changed: true });
+  const again = await withInstanceOperation(f.paths, f.a.instanceId, (operation) =>
+    provisionAssistantArtifacts(operation, f.dependencies),
+  );
+  expect(again).toMatchObject({ outcome: 'ready', changed: false });
+  expect(f.restarts).toHaveLength(2);
+});
+
+it('keeps an incomplete profile pending without creating provider resources', async () => {
+  const f = await provisionFixture();
+  const result = await installArtifactsConnector(
+    f.paths,
+    {},
+    {
+      ...f.dependencies,
+      ncl: async (runtime, args) =>
+        args[0] === 'gws-ea-profile-get'
+          ? { assistant_first_name: 'Avery', principal_emails: [] }
+          : f.dependencies.ncl(runtime, args),
+    },
+  );
+  expect(result.assistants).toContainEqual(
+    expect.objectContaining({
+      instance_id: f.a.instanceId,
+      outcome: 'pending',
+      reason: 'artifacts_profile_unavailable',
+    }),
+  );
+  expect(f.api.requests).toEqual([]);
+});
+
+it('reports unsupported and malformed release markers independently from profile readiness', async () => {
+  const f = await provisionFixture();
+  const marker = path.join(f.a.runtime.checkout_root, 'src/gws-ea/artifacts-compatibility.json');
+  await rm(marker);
+  expect(await artifactsReleaseCompatibility(f.a.runtime.checkout_root)).toBe('unsupported');
+  const unsupported = await installArtifactsConnector(f.paths, {}, f.dependencies);
+  expect(unsupported.assistants).toContainEqual(
+    expect.objectContaining({ outcome: 'unsupported', reason: 'release_unsupported' }),
+  );
+  await writeFile(marker, '{');
+  expect(await artifactsReleaseCompatibility(f.a.runtime.checkout_root)).toBe('unknown');
+  const unknown = await installArtifactsConnector(f.paths, {}, f.dependencies);
+  expect(unknown.assistants).toContainEqual(expect.objectContaining({ outcome: 'pending', reason: 'release_unknown' }));
+  expect(f.api.requests).toEqual([]);
+});
+
+it('rotates only the stored management token when reinstalling with a credential file', async () => {
+  const f = await provisionFixture();
+  await installArtifactsConnector(f.paths, {}, f.dependencies);
+  const before = await readArtifactsOperatorConfig(f.files.configFile);
+  const credentialFile = path.join(f.paths.configRoot, 'replacement-token');
+  await writeFile(credentialFile, 'replacement-management-fixture', { mode: 0o600 });
+  const repeated = await installArtifactsConnector(f.paths, { credentialFile }, f.dependencies);
+  expect(repeated.changed).toBe(true);
+  expect(await readFile(before!.credentialFile, 'utf8')).toBe('replacement-management-fixture');
+  expect((await readArtifactsOperatorConfig(f.files.configFile))?.assistants).toEqual(before?.assistants);
+  expect(f.restarts).toHaveLength(2);
+});
+
+it('reports a single unproven provider creation pending for every assistant without further effects', async () => {
+  const f = await provisionFixture();
+  await f.assistant('second@example.test', 31002);
+  f.api.lose('application');
+  const initial = await installArtifactsConnector(f.paths, {}, f.dependencies);
+  expect(initial.assistants).toHaveLength(2);
+  const before = f.api.requests.length;
+  const repeated = await installArtifactsConnector(f.paths, {}, f.dependencies);
+  expect(
+    repeated.assistants.every(
+      (assistant) => assistant.outcome === 'pending' && assistant.reason === 'artifacts_create_unproven',
+    ),
+  ).toBe(true);
+  expect(f.api.requests).toHaveLength(before);
+  expect(f.api.apps).toHaveLength(1);
+});
+
+it('returns a pending operation hook immediately while the host connector lock is held', async () => {
+  const f = await provisionFixture();
+  await withArtifactsHostLock(f.paths, async () => {
+    const result = await withInstanceOperation(f.paths, f.a.instanceId, (operation) =>
+      provisionAssistantArtifacts(operation, f.dependencies),
+    );
+    expect(result).toMatchObject({ outcome: 'pending', reason: 'artifacts_busy', changed: false });
+  });
+  expect(f.api.requests).toEqual([]);
 });

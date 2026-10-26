@@ -56,7 +56,10 @@ export async function chatAgentDrift(
   const baseline = kind === 'external-chat' ? EXTERNAL_CHAT_CAPABILITIES : JOB_CHAT_CAPABILITIES;
   const problems: string[] = [];
   const stored = parseStoredCapabilities(config.capabilities, group.name);
-  if (stored === 'all' || !sameKeys(stored, baseline)) problems.push('its stored capabilities differ from the release');
+  const granted = kind === 'job' && stored !== 'all' && stored.includes('browser-delegate');
+  const storedBaseline = [...baseline, ...(granted ? ['browser-delegate'] : [])];
+  if (stored === 'all' || !sameKeys(stored, storedBaseline))
+    problems.push('its stored capabilities differ from the release');
   const expected = [
     ...baseline,
     ...(kind === 'job' && (await hasBrowserAccess(groupId)) ? ['browser-delegate', 'browser-purchase-outcome'] : []),

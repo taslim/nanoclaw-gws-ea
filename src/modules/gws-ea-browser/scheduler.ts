@@ -19,7 +19,8 @@ import type { ParsedMail } from '../gws-ea-inbox/mime.js';
 import { registerInboxObserver } from '../gws-ea-inbox/observers.js';
 import { cancelBrowserJob } from './cancel.js';
 import type { ReservationAvailability } from './merchant-contract.js';
-import { readHostBrowserPolicy } from './access.js';
+import { browserAvailability, browserConfigured } from './availability.js';
+
 import type { BrowserQueue } from './queue.js';
 import type { StructuredBrowserLocator } from './locators.js';
 
@@ -152,13 +153,14 @@ export class BrowserWatchScheduler {
   private async runTick(): Promise<void> {
     const db = this.queue.store.db;
     if (!(await db.hasTable('gws_ea_browser_watches')) || this.controller.signal.aborted) return;
-    if (!(await readHostBrowserPolicy()).enabled) {
+    if (!browserConfigured()) {
       const jobs = await db.all<{ job_id: string }>(
         "SELECT DISTINCT job_id FROM gws_ea_browser_watches WHERE status IN ('awaiting_principal','armed','checking','preparing','booking')",
       );
       for (const job of jobs) await cancelBrowserJob(job.job_id, this.queue.store);
       return;
     }
+    if (!(await browserAvailability()).available) return;
     await expireBrowserWatches(db);
     await deliverWatchNotices(db);
     const rows = await db.all<WatchRow>(

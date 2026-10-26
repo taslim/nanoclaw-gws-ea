@@ -561,8 +561,8 @@ function attachmentText(value: unknown): string {
  * each names their operator, the only one who can change it.
  */
 const OPERATOR_LIMITS: ReadonlyMap<string, string> = new Map([
-  ['operator-setup-required', "voice notes are off, and only the principal's operator can turn them on"],
-  ['operator-enablement-required', "voice notes are off, and only the principal's operator can turn them on"],
+  ['operator-setup-required', "voice notes need a local installation only the principal's operator can set up"],
+  ['operator-enablement-required', "voice notes need a local installation only the principal's operator can set up"],
   ['operator-update-required', "voice notes need an update only the principal's operator can make"],
   [
     'voice-installation-unhealthy',

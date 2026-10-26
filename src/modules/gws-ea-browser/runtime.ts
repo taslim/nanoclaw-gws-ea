@@ -3,22 +3,27 @@ import type { Page } from 'playwright-core';
 import { browserDiagnosticsUnsafe } from './authentication-signatures.js';
 import { prepareChromeProfile, spawnChrome, stopChrome, type OwnedChrome } from './chrome.js';
 import { connectChrome, verifyChromePolicy, type ChromeConnection } from './connection.js';
-import { DEFAULT_BROWSER_POLICY, type BrowserPolicy } from './policy.js';
-import { readHostBrowserPolicy } from './access.js';
+import {
+  browserAvailability,
+  browserConfigured,
+  browserUnavailableMessage,
+  SYSTEM_CHROME,
+  type BrowserAvailability,
+} from './availability.js';
 import { startPublicBrowserProxy, type PublicBrowserProxy } from './proxy.js';
 import { JobWindows } from './windows.js';
 
 export class BrowserUnavailableError extends Error {
   readonly code = 'browser_unavailable';
   constructor() {
-    super('Browser is unavailable; the operator can check browser health.');
+    super('Browser is unavailable; ask your operator to check Chrome and browser health.');
   }
 }
 
-type EnabledPolicy = Extract<BrowserPolicy, { enabled: true }>;
+type AvailableBrowser = Extract<BrowserAvailability, { available: true }>;
 
 export class BrowserRuntime {
-  private policy: BrowserPolicy = DEFAULT_BROWSER_POLICY;
+  private availability: BrowserAvailability = { available: false, reason: 'browser-root-unconfigured' };
   private proxy: PublicBrowserProxy | undefined;
   private attached: ChromeConnection | undefined;
   private windows: JobWindows | undefined;
@@ -34,8 +39,9 @@ export class BrowserRuntime {
   private readonly disconnectListeners = new Set<() => void>();
 
   constructor(
-    private readonly policyFile?: string,
+    private readonly root?: string,
     private readonly admissionReady: () => boolean = () => true,
+    private readonly chromePath: string = SYSTEM_CHROME,
   ) {}
 
   private exclusive<T>(operation: () => Promise<T>): Promise<T> {
@@ -47,56 +53,56 @@ export class BrowserRuntime {
     return result;
   }
 
-  /** Re-read policy on each use; enabled policy prewarms the proxy without starting Chrome. */
+  /** Check availability on each use; a configured browser prewarms the proxy without starting Chrome. */
   async reconcile(): Promise<void> {
-    if (this.startup && !(await readHostBrowserPolicy(this.policyFile)).enabled) this.startup?.abort();
-    return this.exclusive(() => this.reconcilePolicy());
+    if (this.startup && !(await browserAvailability(this.root, this.chromePath)).available) this.startup?.abort();
+    return this.exclusive(() => this.reconcileAvailability());
   }
 
-  private async reconcilePolicy(): Promise<void> {
+  private async reconcileAvailability(): Promise<void> {
     if (this.stopped) {
       await this.stopOwned();
       return;
     }
-    const current = await readHostBrowserPolicy(this.policyFile);
-    if (!current.enabled) {
-      this.policy = current;
+    const current = await browserAvailability(this.root, this.chromePath);
+    if (!current.available) {
+      this.availability = current;
       await this.stopOwned();
       return;
     }
     if (browserDiagnosticsUnsafe()) {
-      this.policy = current;
+      this.availability = current;
       await this.stopOwned();
       this.lastFailure = { reason: 'browser_unavailable', at: new Date().toISOString() };
       return;
     }
     if (
-      this.policy.enabled &&
-      (this.policy.paths.policyFile !== current.paths.policyFile || this.policy.chromePath !== current.chromePath)
+      this.availability.available &&
+      (this.availability.paths.root !== current.paths.root || this.availability.chromePath !== current.chromePath)
     ) {
       await this.stopOwned();
     }
-    this.policy = current;
+    this.availability = current;
     if (!this.proxy) this.proxy = await startPublicBrowserProxy();
   }
 
-  async assertEnabled(): Promise<void> {
+  async assertAvailable(): Promise<void> {
     await this.reconcile();
-    if (!this.policy.enabled) throw new BrowserUnavailableError();
+    if (!this.availability.available) throw new BrowserUnavailableError();
   }
 
   /** Host internals only. No endpoint/session/browser object is ever serialized to a tool response. */
   connection(): Promise<ChromeConnection> {
     return this.exclusive(async () => {
-      await this.reconcilePolicy();
-      if (this.stopped || !this.policy.enabled || !this.proxy) throw new BrowserUnavailableError();
+      await this.reconcileAvailability();
+      if (this.stopped || !this.availability.available || !this.proxy) throw new BrowserUnavailableError();
       await this.retiring;
       if (this.attached?.browser.isConnected()) return this.attached;
-      return this.launch(this.policy, this.proxy);
+      return this.launch(this.availability, this.proxy);
     });
   }
 
-  private async launch(policy: EnabledPolicy, proxy: PublicBrowserProxy): Promise<ChromeConnection> {
+  private async launch(policy: AvailableBrowser, proxy: PublicBrowserProxy): Promise<ChromeConnection> {
     this.starting = true;
     const generation = ++this.generation;
     const startup = new AbortController();
@@ -187,7 +193,7 @@ export class BrowserRuntime {
     const windows = this.windows;
     if (!windows) throw new BrowserUnavailableError();
     const page = await windows.pageForJob(jobId);
-    await this.assertEnabled();
+    await this.assertAvailable();
     if (!this.windows || this.windows !== windows || page.isClosed()) throw new BrowserUnavailableError();
     return page;
   }
@@ -204,7 +210,7 @@ export class BrowserRuntime {
     return () => this.disconnectListeners.delete(listener);
   }
 
-  /** Unlike shutdown(), the next reconcile or connection under an enabled policy restarts the proxy and Chrome. */
+  /** Unlike shutdown(), the next reconcile or connection while Chrome is available restarts the proxy and Chrome. */
   stop(): Promise<void> {
     this.startup?.abort();
     return this.exclusive(() => this.stopOwned());
@@ -240,7 +246,8 @@ export class BrowserRuntime {
   }
 
   state(): {
-    enabled: boolean;
+    configured: boolean;
+    available: boolean;
     ready: boolean;
     reason?: string;
     proxy: { state: 'listening'; port: number } | { state: 'stopped' };
@@ -251,9 +258,10 @@ export class BrowserRuntime {
     lastFailure: { reason: 'browser_unavailable'; at: string } | null;
   } {
     return {
-      enabled: this.policy.enabled,
-      ready: this.admissionReady() && this.policy.enabled && this.proxy !== undefined && !this.stopped,
-      ...(this.policy.enabled ? {} : { reason: this.policy.reason }),
+      configured: browserConfigured(this.root),
+      available: this.availability.available,
+      ready: this.admissionReady() && this.availability.available && this.proxy !== undefined && !this.stopped,
+      ...(this.availability.available ? {} : { reason: browserUnavailableMessage(this.availability.reason) }),
       proxy: this.proxy ? { state: 'listening', port: this.proxy.port } : { state: 'stopped' },
       chrome: this.attached
         ? {

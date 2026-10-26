@@ -74,8 +74,8 @@ For ad-hoc central queries from skills or scripts, use the in-tree wrapper rathe
 | `src/modules/approvals/primitive.ts` | `pickApprover`, `pickApprovalDelivery`, `requestApproval` (returns approval id), approval-handler registry with opt-in restart-safe handlers |
 | `src/modules/approvals/lifecycle.ts` | Approval withdrawal and expiry: DB-only detach, then card edit/notification after commit |
 | `src/modules/agent-to-agent/` | Native destination ACLs and routing, including per-thread tool-agent sessions and untrusted inbound framing |
-| `src/modules/gws-ea-browser/` | Optional host Playwright runtime, owned loopback Chrome CDP connection, public-only proxy, job queue, sign-in, the open-rule classifier, consent engine, reviewed and generic purchase readers, purchase authority, recipes and wake-on-change watches |
-| `src/gws-ea/onepassword*.ts` + `src/modules/gws-ea-browser/{onepassword*,credential-*,vault-access}.ts` | 1Password: operator provisioning, disable and removal cleanup; the sanitized `op` CLI boundary and host vault client; durable credential attempts for signups and owned password changes; main's vault sharing with the principal |
+| `src/modules/gws-ea-browser/` | Built-in host Playwright runtime, owned loopback Chrome CDP connection, public-only proxy, job queue, sign-in, the open-rule classifier, consent engine, reviewed and generic purchase readers, purchase authority, recipes and wake-on-change watches |
+| `src/gws-ea/onepassword*.ts` + `src/modules/gws-ea-browser/{onepassword*,credential-*,vault-access}.ts` | 1Password: operator provisioning and resumable uninstall/removal cleanup; the sanitized `op` CLI boundary and host vault client; durable credential attempts for signups and owned password changes; main's vault sharing with the principal |
 | `src/command-gate.ts` | Router-side admin command gate — queries `user_roles` directly (no env var, no container-side check) |
 | `src/modules/permissions/user-dm.ts` | Cold-DM resolution + `user_dms` cache |
 | `src/group-init.ts` | Per-agent-group filesystem scaffold (CLAUDE.md, skills) — agent-runner source is a shared read-only mount, not copied per group |
@@ -147,8 +147,8 @@ chooses a tool job by peer affinity. A per-thread destination suits a tool
 agent that runs one session per delegated errand; its reports to the delegating
 agent are untrusted information, and worker-style subagents remain the normal
 pattern for other work. GWS-EA's `browser` is such a sealed tool agent; its
-reports to the agent that delegated the errand (`main`, or a group the browser
-access setting lists) are framed as untrusted.
+reports to the agent that delegated the errand (`main`, or an eligible group
+explicitly granted `browser-delegate`) are framed as untrusted.
 
 Key files: `src/modules/agent-to-agent/db/agent-destinations.ts`,
 `src/modules/agent-to-agent/db/threaded-destinations.ts`, and
@@ -211,9 +211,23 @@ transaction, call DB-only `detachApproval` inside it, then
 card/notification path. Only handlers registered with `{ restartSafe: true }`
 resume an approved row at host start; they must make re-entry idempotent.
 
+### Operator connectors
+
+A connector is optional functionality where gws-ea manages setup beyond its base
+install: shared voice assets, assistant 1Password vaults, or Cloudflare artifact
+serving. The typed catalog in `src/gws-ea/connectors.ts` supplies `install`,
+`uninstall`, `show` and `check` for each. Installation/configuration is host-wide;
+voice assets are shared and account resources are per assistant. Access remains
+in native agent capability grants and principal/reader permissions. Local
+`list`/`show` never hash assets or call providers; `check` verifies without repair
+and succeeds only for a ready target. Browser is built in because gws-ea only
+detects its Chrome prerequisite. Connector hooks run after create/resume and
+committed update/start/restart; optional provisioning cannot fail a committed
+release, and rollback never provisions.
+
 ### Host browser credentials
 
-The optional GWS-EA host browser has a separate sign-in boundary from API
+The built-in GWS-EA host browser has a separate sign-in boundary from API
 credential injection: its Chrome traffic uses a per-assistant public-only proxy,
 never the credential gateway. It signs in with logins from the assistant's own
 1Password vault and with emailed codes and magic links, including a code the
@@ -224,10 +238,13 @@ frame; agents see opaque item handles and outcomes only.
 
 The operator provisions 1Password host-wide (see
 [docs/gws-ea-cli.md](docs/gws-ea-cli.md)). In
-`gws-ea connectors enable onepassword`, their desktop sign-in mints a host
+`gws-ea connectors install onepassword`, their desktop sign-in mints a host
 management service account that may only create vaults, and the host records
 the account's ID with its sign-in address as the app lists it. It creates one vault
-for each compatible assistant, and for each one created later, and the operator
+for each compatible assistant; create, update, start and restart reconcile pending
+setup through the same provisioning step. Existing vaults and credentials stay.
+When desktop approval is needed, an operator terminal is required; otherwise
+setup remains pending without calling `op`. The operator
 mints that assistant's runtime service account with read/write access to only
 its vault. A signup or password change saves the generated password in the
 vault before any site sees it. Passwords change only on logins the host saved
@@ -244,17 +261,18 @@ share answers with the recorded sign-in address as a link and the vault's exact
 name (1Password documents no link to a vault itself). When it cannot, the
 principal gets a message to forward to their operator.
 
-`disable` stops every vault use at once and deletes runtime tokens, keeping
-vaults, items, IDs and the management account; re-enabling mints replacement
-runtime accounts through the operator's sign-in. Removal deletes the runtime
-token once the host stops, and the vault only when this host's management
-account created it and it is empty or `--delete-vault` was confirmed. Nothing
-revokes a service account: the operator does that on 1Password.com, and the
-removal receipt outside the instance keeps their IDs until
-`--abandon onepassword` closes it. Every service account in the 1Password
-account shares one daily request limit; `capabilities check onepassword`
-reports its usage, and an exhausted limit returns `rate_limited` without
-retries. Tokens are owner-only host files (the management token under the
+`connectors uninstall onepassword` previews every vault and active credential
+attempt, then requires terminal confirmation or `--delete-vaults`. It stops all
+vault use before deleting verified owned vaults and local tokens, with the
+management token last. An interrupted cleanup resumes from the host receipt;
+unproven creations and every service-account ID remain for manual cleanup on
+1Password.com. `--abandon` closes that receipt after its operator actions.
+Per-assistant removal keeps its own `--delete-vault` choice and
+`--abandon onepassword` receipt. Nothing revokes service accounts automatically.
+Every service account in the 1Password account shares one daily request limit;
+`connectors check onepassword` reports its usage, and an exhausted limit returns
+`rate_limited` without retries. Tokens are owner-only host files (the management
+token under the
 control plane's config root, each runtime token in instance secrets), outside
 snapshots and container mounts. Profile and staging data live under
 `<instance root>/browser/`, outside routine snapshot roots. There is no
@@ -297,9 +315,17 @@ rejects cookie banners before observations where a reject option shows. The
 principal's stored private values reach a site only through a per-errand
 `record_disclosure` by the group that delegated the errand. Each browsing
 assistant's web alias (its name reversed, added and confirmed by the operator)
-is its email on every site and one of its addresses for mail routing. Browser
-policy version 2 lists the agent groups that may delegate (`access.ts`);
-version 1 means main alone.
+is its email on every site and one of its addresses for mail routing. Alias
+setup is optional during create/resume (`--skip-alias`) and available later with
+`gws-ea alias --id`; public browsing works without it, while address disclosure
+stops with `alias_unavailable`. Browser availability requires Chrome at the
+standard `/Applications/Google Chrome.app` path; gws-ea never installs Chrome.
+Main always delegates, sealed browser/external-email/external-chat groups never
+do, and other groups, including active job agents, require an explicit stored
+`browser-delegate` capability. `all` does not grant it. Updating makes browsing
+available and retires earlier access lists; their records remain for rollback.
+`gws-ea status --details` observes the managed browser network's proxy and
+debugger isolation.
 Watches on a site without a reader record a recipe, a marked region and its
 baseline, and wake the agent only when the region changes; release checks
 follow the venue's stated schedule.
@@ -308,7 +334,7 @@ The host has one concrete runtime (`runtime.ts`), composed by `index.ts` with th
 closed action handlers and lifecycle work. `operation.ts` owns deadline, abort
 and page mechanics; `executor.ts` binds targets once and runs ordinary native
 Playwright actions under fresh policy. Shared locators and page privacy sit
-below recipes, checkout readers and credentials. The DB-free policy file reader serves the operator; native host callers explicitly
+below recipes, checkout readers and credentials. Native host callers explicitly
 validate sealed-group access through `access.ts`, without import-time callbacks.
 Chrome quits through native `Browser.close` and waits for its owned child to exit
 before forced fallback, preserving freshly written profile cookies. Chrome's

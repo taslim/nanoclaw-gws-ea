@@ -1,3 +1,4 @@
+import { useAvailableBrowser } from './testing/browser-runtime.js';
 import fs from 'node:fs';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 
@@ -26,27 +27,26 @@ import '../gws-ea-profile/index.js';
 import './index.js';
 import './guidance.js';
 import { browserGroupDrift, ensureBrowserGroup, setBrowserAdmissionReady } from './group.js';
-import { writeBrowserAccess } from './testing/browser-access.js';
+import { configureBrowserAccess } from './testing/browser-access.js';
 
 beforeEach(async () => {
+  useAvailableBrowser();
   setBrowserAdmissionReady(true);
   fs.rmSync(ROOT, { recursive: true, force: true });
   await runMigrations(await initTestDb());
 });
 afterEach(async () => {
   setBrowserAdmissionReady(false);
-  delete process.env.GWS_EA_BROWSER_POLICY_FILE;
+  delete process.env.GWS_EA_BROWSER_ROOT;
   await closeDb();
   fs.rmSync(ROOT, { recursive: true, force: true });
 });
 
 it('stamps the exact sealed composition once and refuses capability drift at admission', async () => {
   fs.mkdirSync(`${ROOT}/browser`, { recursive: true, mode: 0o700 });
-  const policy = `${ROOT}/browser/policy.json`;
-  fs.writeFileSync(policy, JSON.stringify({ schemaVersion: 1, enabled: true }), {
-    mode: 0o600,
-  });
-  process.env.GWS_EA_BROWSER_POLICY_FILE = policy;
+  const policy = `${ROOT}/browser`;
+
+  process.env.GWS_EA_BROWSER_ROOT = policy;
   const id = await ensureBrowserGroup();
   expect(await ensureBrowserGroup()).toBe(id);
   expect(await getBrowserAgentGroupId()).toBe(id);
@@ -70,12 +70,12 @@ it('stamps the exact sealed composition once and refuses capability drift at adm
   await expect(
     assertSessionAdmitted({ disposition: 'create', key: { installSlug: 'test', agentGroupId: id, sessionId: 'job' } }),
   ).rejects.toThrow('browser may not start');
-  // A stored selection never grants the delegate tools: the browser access setting does.
+  // The default all selection excludes delegation; main receives it through its authority.
   expect(resolveCapabilities('all', 'main')).not.toContain('browser-delegate');
   expect(resolveCapabilities('all', 'main')).not.toContain('browser');
 });
 
-it('keeps active main guidance conditional so enablement changes need no container restart', async () => {
+it('keeps main guidance stable while browser availability changes', async () => {
   const main = { id: 'main', name: 'main', folder: 'main', agent_provider: null, created_at: new Date().toISOString() };
   await createAgentGroup(main);
   const { getDb } = await import('../../db/connection.js');
@@ -83,15 +83,15 @@ it('keeps active main guidance conditional so enablement changes need no contain
     `UPDATE gws_ea_profile SET assistant_first_name=COALESCE(assistant_first_name,'Juno'),principal_first_name=COALESCE(principal_first_name,'Morgan'),main_agent_group_id = ? WHERE singleton = 1`,
     main.id,
   );
-  const file = `${ROOT}/browser/policy.json`;
+  const file = `${ROOT}/browser`;
   fs.mkdirSync(`${ROOT}/browser`, { recursive: true, mode: 0o700 });
-  process.env.GWS_EA_BROWSER_POLICY_FILE = file;
+  process.env.GWS_EA_BROWSER_ROOT = file;
   const original = await getRequiredProjectDocSections(main);
   const initialGuidance = original.find((section) => section.name === 'Browser delegation')?.body;
   expect(initialGuidance).toContain('Access can change during a conversation');
   expect(initialGuidance).toContain('shared signed-in profile and vault');
   expect(initialGuidance).toContain('try each new errand');
-  fs.writeFileSync(file, JSON.stringify({ schemaVersion: 1, enabled: true }), { mode: 0o600 });
+
   const sections = await getRequiredProjectDocSections(main);
   const guidance = sections.find((section) => section.name === 'Browser delegation')?.body;
   expect(guidance).toBe(initialGuidance);
@@ -100,7 +100,12 @@ it('keeps active main guidance conditional so enablement changes need no contain
   expect(guidance).toContain('Never ask for or accept card details in chat');
   expect(guidance).toContain('there is no way to use card details sent to you');
   expect(guidance).toContain('adds one on the site or finishes checkout themselves');
-  expect(guidance).toContain('tell the principal their operator needs to enable it');
+  expect(guidance).toContain(
+    'If `browser` is an unknown destination, ask the principal’s operator to check this group’s browser access grant.',
+  );
+  expect(guidance).toContain(
+    'If the host explicitly reports that Chrome is unavailable, ask the operator to check Chrome.',
+  );
   expect(guidance).toContain(
     "only to a site the principal's request names, or the booking platform embedded in that site",
   );
@@ -108,7 +113,7 @@ it('keeps active main guidance conditional so enablement changes need no contain
   expect(guidance).not.toMatch(/relay_code|no_item_for_site|vault_unavailable|outcome_unknown|--job/u);
   // Operator setup stays the operator's: main never relays its commands or provider-administration terms.
   expect(guidance).not.toMatch(/gws-ea|capabilit|service account/iu);
-  fs.writeFileSync(file, JSON.stringify({ schemaVersion: 1, enabled: false }));
+  vi.stubEnv('GWS_EA_BROWSER_ROOT', '');
   expect(
     (await getRequiredProjectDocSections(main)).find((section) => section.name === 'Browser delegation')?.body,
   ).toBe(initialGuidance);
@@ -127,11 +132,9 @@ it('admits only canonical main errand sessions to the sealed browser group', asy
     'main',
   );
   fs.mkdirSync(`${ROOT}/browser`, { recursive: true, mode: 0o700 });
-  const policy = `${ROOT}/browser/policy.json`;
-  fs.writeFileSync(policy, JSON.stringify({ schemaVersion: 1, enabled: true }), {
-    mode: 0o600,
-  });
-  process.env.GWS_EA_BROWSER_POLICY_FILE = policy;
+  const policy = `${ROOT}/browser`;
+
+  process.env.GWS_EA_BROWSER_ROOT = policy;
   const id = await ensureBrowserGroup();
   const own = (await resolveSystemSession(id, 'system:a2a:main:errand')).session;
   await expect(
@@ -157,7 +160,7 @@ it('admits only canonical main errand sessions to the sealed browser group', asy
   }
 });
 
-it('hands the delegate tools to main under version 1, enabled or not, and to no other group', async () => {
+it('hands the delegate tools to main to main by default and to explicitly granted groups', async () => {
   for (const id of ['main', 'research']) {
     await createAgentGroup({ id, name: id, folder: id, agent_provider: null, created_at: new Date().toISOString() });
     await ensureContainerConfig(id);
@@ -168,16 +171,20 @@ it('hands the delegate tools to main under version 1, enabled or not, and to no 
   );
   expect((await getGroupCapabilities('main')).has('browser-delegate')).toBe(true);
   expect((await getGroupCapabilities('research')).has('browser-delegate')).toBe(false);
-  // Stored explicitly, the key is still the setting's to grant.
+  // A stored explicit key grants delegation to an ordinary group.
   await updateContainerConfigJson('research', 'capabilities', ['reply', 'browser-delegate']);
-  expect((await materializeContainerJson('research')).capabilities).toEqual(['reply']);
+  expect((await materializeContainerJson('research')).capabilities).toEqual([
+    'reply',
+    'browser-delegate',
+    'browser-purchase-outcome',
+  ]);
   expect((await materializeContainerJson('main')).capabilities).toContain('browser-delegate');
   expect(
     JSON.parse(fs.readFileSync(`${ROOT}/groups/main/container.json`, 'utf8')) as { capabilities: string[] },
   ).toMatchObject({ capabilities: expect.arrayContaining(['browser-delegate']) });
 });
 
-it('hands record_purchase_outcome to main and every delegator, main off the access list included', async () => {
+it('hands record_purchase_outcome to main and every delegator, main always included', async () => {
   for (const id of ['main', 'research', 'desk']) {
     await createAgentGroup({ id, name: id, folder: id, agent_provider: null, created_at: new Date().toISOString() });
     await ensureContainerConfig(id);
@@ -186,23 +193,23 @@ it('hands record_purchase_outcome to main and every delegator, main off the acce
     `UPDATE gws_ea_profile SET assistant_first_name=COALESCE(assistant_first_name,'Juno'),principal_first_name=COALESCE(principal_first_name,'Morgan'),main_agent_group_id = ? WHERE singleton = 1`,
     'main',
   );
-  writeBrowserAccess(`${ROOT}/browser/policy.json`, { agentGroupIds: ['research'] });
+  await configureBrowserAccess(`${ROOT}/browser`, ['research']);
   // Main records the purchases of a group that lost access, so it holds the tool the unconfirmed note names.
-  expect((await getGroupCapabilities('main')).has('browser-delegate')).toBe(false);
+  expect((await getGroupCapabilities('main')).has('browser-delegate')).toBe(true);
   expect((await getGroupCapabilities('main')).has('browser-purchase-outcome')).toBe(true);
   expect((await getGroupCapabilities('research')).has('browser-purchase-outcome')).toBe(true);
   expect((await getGroupCapabilities('desk')).has('browser-purchase-outcome')).toBe(false);
   expect((await materializeContainerJson('main')).capabilities).toContain('browser-purchase-outcome');
 });
 
-it('admits the errands of every listed group, and no longer main once the list leaves it out', async () => {
+it('admits the errands of every explicitly granted group and always main', async () => {
   for (const id of ['main', 'research'])
     await createAgentGroup({ id, name: id, folder: id, agent_provider: null, created_at: new Date().toISOString() });
   await getDb().run(
     `UPDATE gws_ea_profile SET assistant_first_name=COALESCE(assistant_first_name,'Juno'),principal_first_name=COALESCE(principal_first_name,'Morgan'),main_agent_group_id = ? WHERE singleton = 1`,
     'main',
   );
-  writeBrowserAccess(`${ROOT}/browser/policy.json`, { agentGroupIds: ['research'] });
+  await configureBrowserAccess(`${ROOT}/browser`, ['research']);
   const id = await ensureBrowserGroup();
   const admit = async (thread: string) =>
     assertSessionAdmitted({
@@ -210,5 +217,5 @@ it('admits the errands of every listed group, and no longer main once the list l
       key: { installSlug: 'test', agentGroupId: id, sessionId: (await resolveSystemSession(id, thread)).session.id },
     });
   await expect(admit('system:a2a:research:errand')).resolves.toBeUndefined();
-  await expect(admit('system:a2a:main:errand')).rejects.toThrow('errand delegated by an agent with browser access');
+  await expect(admit('system:a2a:main:errand')).resolves.toBeUndefined();
 });

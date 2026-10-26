@@ -1,3 +1,4 @@
+import { useAvailableBrowser } from './testing/browser-runtime.js';
 import { BrowserLocatorError, resolveLocator } from './locators.js';
 import { classifyNavigationUrl } from './control-policy.js';
 import { readCheckoutRegion, readPageControlFacts } from './control-facts.js';
@@ -172,10 +173,8 @@ interface ErrandHost {
 async function startErrandHost(thread: string): Promise<ErrandHost> {
   fs.rmSync(root, { recursive: true, force: true });
   fs.mkdirSync(`${root}/browser`, { recursive: true });
-  fs.writeFileSync(`${root}/browser/policy.json`, JSON.stringify({ schemaVersion: 1, enabled: true }), {
-    mode: 0o600,
-  });
-  process.env.GWS_EA_BROWSER_POLICY_FILE = `${root}/browser/policy.json`;
+
+  process.env.GWS_EA_BROWSER_ROOT = `${root}/browser`;
   await runMigrations(await initTestDb());
   const now = new Date().toISOString();
   for (const id of ['main-p', 'browser-p'])
@@ -253,7 +252,7 @@ async function stopErrandHost(host: ErrandHost | undefined): Promise<void> {
   setBrowserAdmissionReady(false);
   await host?.queue.stop();
   await host?.page.context().close();
-  delete process.env.GWS_EA_BROWSER_POLICY_FILE;
+  delete process.env.GWS_EA_BROWSER_ROOT;
   await closeDb();
   fs.rmSync(root, { recursive: true, force: true });
 }
@@ -286,6 +285,7 @@ describe.skipIf(!chromePath)('open-web classification in native Chrome', { timeo
   let page: Page;
 
   beforeEach(async () => {
+    useAvailableBrowser();
     page = await fixture.newPage();
   });
   afterEach(async () => {

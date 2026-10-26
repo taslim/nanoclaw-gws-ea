@@ -1,6 +1,6 @@
 # Optional local voice notes
 
-Voice is an operator capability. One installation and one enablement apply to
+Voice is an operator connector. One installation makes recognition available to
 every compatible assistant on the host, including assistants created or updated
 later. There is no assistant voice switch or principal installation approval.
 The current receiving channel is Google Chat. The preparation contract and
@@ -14,7 +14,7 @@ Original recordings stay in the assistant's private session storage. Models
 and programs are shared; recordings, temporary files, transcripts, and inference
 processes are private to an instance.
 
-## Install and enable
+## Install
 
 Run these commands from the operator's existing gws-ea checkout:
 
@@ -22,20 +22,20 @@ Run these commands from the operator's existing gws-ea checkout:
 gws-ea connectors list
 gws-ea connectors show voice
 gws-ea connectors install voice
-gws-ea connectors enable voice
 gws-ea connectors check voice
 gws-ea status --id <instance_id> --details
 ```
 
 Use `gws-ea help connectors` to discover available actions and
-`gws-ea help connectors install` for installation options.
+`gws-ea help connectors install voice` for installation options.
 
-Installation is explicit and leaves voice disabled. Package installation,
-container builds, assistant creation, ordinary updates, and incoming notes never
-download a recognizer or model. Repeating installation verifies and reuses an
-existing installation. A concurrent host voice operation returns busy; retry
-after it finishes. Enabling absent or corrupt assets gives the installation or
-repair prerequisite and downloads nothing.
+Installation downloads, builds and verifies pinned assets, selects them in the
+shared host policy and binds managed assistants. A busy assistant is reported
+and picked up by its next create or release cutover. Package installation,
+container builds, assistant creation, ordinary updates and incoming notes never
+download a recognizer or model. Repeating installation verifies and reuses
+existing assets. A concurrent host voice operation returns busy; retry after
+it finishes.
 
 The recipe supports macOS and Linux on arm64 or x64. It needs C/C++ compilers,
 make, CMake, and tar. macOS builds embed Metal support; Linux builds use the
@@ -65,12 +65,14 @@ paths are absolute in the receipt and do not depend on an interactive Homebrew
 PATH at service runtime. Source, build, model, and license provenance stay with
 the installation. Download checksums and model sizes are checked before
 publication; interrupted or failed builds publish no installation. A failure
-after publication retains that directory disabled for inspection or retry;
-failure cleanup never deletes a published installation.
+after publication retains that directory for inspection or retry; failure cleanup
+never deletes a published installation.
 
 The default model is `base`. Larger models are explicit operator choices through
 `connectors install voice --model small` or `--model large-v3-turbo-q5_0`.
-Disable voice before changing the selected installation. Real principal-note
+Reinstalling with another model swaps the shared selection in one command. Old
+model directories still held by a process remain until a later install or
+uninstall can prove they are unheld. Real principal-note
 quality qualification and Google Chat live acceptance remain pending; the
 default is not a claim that those launch gates passed. Recorded engine smoke
 proves the pinned interface, decoding, and silence handling, and does not prove
@@ -83,30 +85,29 @@ installation is under `<state root>/voice/<recipe>-<platform>-<architecture>-<mo
 The operator roots also respect `GWS_EA_CONFIG_ROOT` and `GWS_EA_STATE_ROOT`.
 Instance `.env` files carry only `GWS_EA_VOICE_POLICY_FILE`, the same absolute
 policy locator. This is a native configuration binding, not per-assistant
-enablement. Enabling binds current instances; creates and release cutovers bind
+enablement. Installation binds current instances; creates and release cutovers bind
 future compatible hosts. Hosts read the shared policy for each note.
 
-`connectors list` distinguishes supported host functionality, installed
-recipe-owned directories, the selected assets, and host activation. `capabilities
-show voice` reports the selected model, exact recipe and source provenance,
-installation prerequisites, current release compatibility, and readiness limits.
-`connectors check voice --json` verifies assets and queries only bounded native
-voice health. It retains unknown compatibility and unreachable consumers;
-missing or corrupt assets never count as drained consumers. These observations
-do not download, enable, restart, or process recordings. Principal response
-preferences remain principal-owned. Inspection returns exit 0 when the
-observation completed, including absent assets, corrupt assets, disabled policy,
-or unreachable consumers retained as facts; it does not mean voice is ready.
-Every inspection includes `observed_at` in ISO UTC. Human observation and
-verified-build times use the install timezone; stored receipt times are unchanged.
-Every managed JSON result uses the schema-version-1 envelope. Invalid or
-unsupported invocations return exit 2; operational failure returns 1 and busy
-returns 75. Voice failures retain native error codes and structured next actions
-when the domain has an exact recovery command.
-Human and JSON inspection handoffs follow the observed state: install absent
-assets, enable verified disabled assets, check enabled consumers, or inspect and
-repair unknown state. Unsupported assistant releases receive an update command.
-Enabled missing assets receive disablement before reinstalling the selected model.
+`connectors list` and `connectors show voice` read local records without hashing
+assets or calling a host. They distinguish installed records, shared selection,
+release compatibility and readiness limits; readiness is not checked.
+`connectors check voice --json` verifies asset hashes and queries bounded native
+voice health without downloads, repair, restarts or processing recordings.
+Missing or corrupt assets never count as drained consumers.
+
+`list` and `show` exit 0 once observed. `check` exits 0 only when its target is
+ready. By default the target is the host and observed supported assistants;
+stopped or unreachable assistants are not checked, and unsupported releases
+receive an update command without failing the host check. Add `--id <full-id>`
+to require that selected assistant to be ready. A legacy installed but stopped
+selection is reported as such, with install as its next action.
+
+Every inspection includes `observed_at` in ISO UTC and common setup, readiness,
+scope, prerequisite, compatibility and next-action facts. Every managed JSON
+result uses the schema-version-1 envelope. Invalid invocations return 2,
+operational failure returns 1, pauses return 10 and busy returns 75. Voice
+failures retain native error codes and exact recovery commands where available.
+Principal response preferences remain principal-owned.
 
 `status --json` reports the global flag, verified/absent/invalid assets, release
 compatibility, observed host readiness, queued and active preparation, and the
@@ -120,30 +121,27 @@ An unsupported rollback reports that voice needs an operator update and keeps
 text available. Updating, rolling back, or removing one assistant never changes
 the host policy or shared cache. A malformed policy or unhealthy optional
 installation produces a bounded voice limitation and leaves text service
-available. Inspect or restore a valid disabled policy before running the
-operator repair commands.
+available. Inspect or restore a valid policy before running the operator repair commands.
 
-## Disable and remove
+## Uninstall
 
 ```sh
-gws-ea connectors disable voice
 gws-ea connectors uninstall voice
 ```
 
-Disablement stops new recognition everywhere without restarting text service.
-It retains assets and lets preparation already under way finish. Removal
-requires disabled policy and proof that managed consumers have drained, covering
-the whole preparation window before policy reads as well as actual processes
-holding any installed model or program open. An unreachable host is not proof
-of idle work. Let a running host finish its notes, or stop the affected assistant
-and wait for its processes and containers to become quiet, then retry removal.
-No live text host is stopped by these commands.
+Uninstall stops new recognition everywhere before taking instance locks or
+checking drainage. It then proves managed consumers drained, covering the
+whole preparation window and actual processes holding any installed model or
+program open. An unreachable host or missing runtime is not proof of idle work.
+Let running hosts finish their notes, or stop the affected assistant and wait
+for its processes and containers to become quiet, then retry uninstall. No live
+text host is stopped by this command.
 
-Host policy, instance operation locks, and the registry reservation lock prevent
-concurrent enablement, cutover, or create from racing asset deletion. Removal
-checks every model directory this recipe owns, including older selections, and
-leaves unrelated cache entries untouched. Selection is cleared while disabled
-before files are removed, so an interrupted removal stays safely disabled.
+Host policy, instance operation locks and the registry reservation lock prevent
+cutover or create from racing asset deletion. Uninstall checks every model
+directory this recipe owns, including older selections, and leaves unrelated
+cache entries untouched. Selection is cleared before deletion, so a refused or
+interrupted uninstall leaves recognition stopped and can be rerun safely.
 
 Runtime bounds are 64 MiB encoded input, 30 minutes decoded audio, two minutes
 decoding, ten minutes recognition, and eight pending notes per assistant host

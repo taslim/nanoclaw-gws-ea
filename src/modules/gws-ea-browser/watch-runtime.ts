@@ -14,7 +14,8 @@ import { collectSecretFields, redactPageText } from './page-privacy.js';
 import { browserSite, type SiteLease } from './leases.js';
 import { merchantSignatureFor } from './merchant-read.js';
 import type { ReservationAvailability, ReservationPolicy } from './merchant-contract.js';
-import { readHostBrowserPolicy } from './access.js';
+import { browserAvailability } from './availability.js';
+
 import type { BrowserQueue } from './queue.js';
 import type { BrowserExecutionContext, BrowserWatchExecutionContext } from './actions.js';
 import { BrowserOperation } from './operation.js';
@@ -274,7 +275,7 @@ export async function runBrowserWatchCheck(
           current.cancel_requested ||
           !check ||
           check.finished_at ||
-          !(await readHostBrowserPolicy()).enabled
+          !(await browserAvailability()).available
         )
           throw new Error('Watch check is no longer active');
         operation.assertActive();

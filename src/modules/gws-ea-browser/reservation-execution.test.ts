@@ -1,3 +1,4 @@
+import { useAvailableBrowser } from './testing/browser-runtime.js';
 import { createBrowserQueue, recoverAndStartBrowserQueue } from './index.js';
 /** Native Chrome + real queue/authority/claims. Only calendar service and container wake are fixture boundaries. */
 import fs from 'node:fs';
@@ -65,6 +66,7 @@ describe.skipIf(!chromePath)('native reservation through the common purchase exe
     return (JSON.parse(request?.answer_json ?? '{}') as { data: Record<string, unknown> }).data;
   }
   beforeEach(async () => {
+    useAvailableBrowser();
     if (!chromePath) throw new Error('Chrome required');
     vi.useFakeTimers({ toFake: ['Date'] });
     vi.setSystemTime(new Date('2026-10-15T12:00:00.000Z'));
@@ -84,11 +86,9 @@ describe.skipIf(!chromePath)('native reservation through the common purchase exe
     if (!job) throw new Error('No browser job');
     jobId = job.id;
     fs.mkdirSync(`${root}/browser`, { recursive: true, mode: 0o700 });
-    const policyFile = `${root}/browser/policy.json`;
-    fs.writeFileSync(policyFile, JSON.stringify({ schemaVersion: 1, enabled: true }), {
-      mode: 0o600,
-    });
-    process.env.GWS_EA_BROWSER_POLICY_FILE = policyFile;
+    const policyFile = `${root}/browser`;
+
+    process.env.GWS_EA_BROWSER_ROOT = policyFile;
     fixtureState = freeResyTable();
     fixture = await resyFixture(chromePath, fixtureState);
     await resyReservationSignature.preparePage?.(fixture.page);
@@ -125,7 +125,7 @@ describe.skipIf(!chromePath)('native reservation through the common purchase exe
   afterEach(async () => {
     await queue?.stop();
     await fixture?.close();
-    delete process.env.GWS_EA_BROWSER_POLICY_FILE;
+    delete process.env.GWS_EA_BROWSER_ROOT;
     await closeDb();
     fs.rmSync(root, { recursive: true, force: true });
     vi.useRealTimers();

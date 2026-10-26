@@ -140,7 +140,7 @@ beforeEach(async () => {
   agents.clear();
   vi.stubEnv('ONECLI_URL', 'http://gateway.test');
   vi.stubEnv('ONECLI_API_KEY', `oc_${'k'.repeat(32)}`);
-  vi.stubEnv('GWS_EA_BROWSER_POLICY_FILE', `${ROOT}/browser/policy.json`);
+  vi.stubEnv('GWS_EA_BROWSER_ROOT', `${ROOT}/browser`);
   vi.stubGlobal(
     'fetch',
     vi.fn(async (input: string | URL | Request, init?: RequestInit) => {

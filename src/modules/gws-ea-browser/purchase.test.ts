@@ -1,3 +1,4 @@
+import { useAvailableBrowser } from './testing/browser-runtime.js';
 import { createBrowserQueue, recoverAndStartBrowserQueue } from './index.js';
 import { holdBrowserRequest, stopHeldBrowserRequests } from './testing/held-request.js';
 /** Real delivery, approval, central DB, mailbox and native DOM. Only the container wake is mocked. */
@@ -452,12 +453,11 @@ describe.skipIf(!chromePath)('reviewed merchant purchases through native host de
     if (certificateRoot) fs.rmSync(certificateRoot, { recursive: true, force: true });
   });
   beforeEach(async () => {
+    useAvailableBrowser();
     fs.rmSync(root, { recursive: true, force: true });
     fs.mkdirSync(`${root}/browser`, { recursive: true });
-    fs.writeFileSync(`${root}/browser/policy.json`, JSON.stringify({ schemaVersion: 1, enabled: true }), {
-      mode: 0o600,
-    });
-    process.env.GWS_EA_BROWSER_POLICY_FILE = `${root}/browser/policy.json`;
+
+    process.env.GWS_EA_BROWSER_ROOT = `${root}/browser`;
     await runMigrations(await initTestDb());
     for (const id of ['main-p', 'browser-p'])
       await createAgentGroup({ id, name: id, folder: id, agent_provider: null, created_at: new Date().toISOString() });
@@ -539,7 +539,7 @@ describe.skipIf(!chromePath)('reviewed merchant purchases through native host de
     setBrowserAdmissionReady(false);
     await queue?.stop();
     await page?.context().close();
-    delete process.env.GWS_EA_BROWSER_POLICY_FILE;
+    delete process.env.GWS_EA_BROWSER_ROOT;
     await closeDb();
     fs.rmSync(root, { recursive: true, force: true });
   });

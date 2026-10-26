@@ -1,57 +1,26 @@
+import { provisionInstalledConnectors } from './connector-provisioning.js';
+import { CONNECTOR_CATALOG, connectorDefinition, type ConnectorLifecycleContext } from './connectors.js';
+import { connectorLines } from './connector-inspection.js';
+import { voiceCapabilityRecovery } from './voice-inspection.js';
+import { type ArtifactsCapabilityDependencies } from './artifacts-connector.js';
+import { aliasDecision, runAliasStep, aliasNextActions, type AliasDecision } from './alias.js';
+import { withAssistantLock } from './assistant-lock.js';
+import { loadInstanceRuntimeConfig } from './service.js';
 import {
-  capabilityLines,
-  inspectVoiceCapability,
-  inspectVoiceConsumers,
-  voiceCapabilityRecovery,
-  voiceCapabilityNextActions,
-  browserCapabilityCatalog,
-  artifactsCapabilityCatalog,
-} from './connectors.js';
-import {
-  disableArtifactsCapability,
-  enableArtifactsCapability,
-  inspectArtifactsCapability,
-  type ArtifactsCapabilityDependencies,
-  type ArtifactsCapabilityObservation,
-  type ArtifactsOperationData,
-} from './artifacts-connector.js';
-import { aliasDecision, type AliasDecision } from './alias.js';
-import {
-  browserAccessLine,
-  browserCapabilityLines,
-  browserCapabilityNextActions,
-  browserAliasNextActions,
-  disableBrowserCapability,
-  enableBrowserWithAlias,
-  inspectBrowserCapability,
-  type BrowserCapabilityInspection,
-  type BrowserCapabilityObservation,
-  type BrowserOperationData,
-} from './browser-capability.js';
-import {
-  disableOnePassword,
-  enableOnePassword,
-  inspectOnePasswordCapability,
-  onePasswordCapabilityCatalog,
-  onePasswordCapabilityLines,
-  onePasswordDisableNextActions,
-  onePasswordDisableReport,
-  onePasswordEnableNextActions,
+  onePasswordInstallNextActions,
   onePasswordErrorPauses,
-  onePasswordCapabilityNextActions,
   onePasswordRecovery,
-  type OnePasswordCapabilityObservation,
   type OnePasswordCliSeams,
   type OnePasswordDependencies,
-  type OnePasswordDisableData,
-  type OnePasswordEnableData,
 } from './onepassword.js';
+import { previewOnePasswordUninstall, type OnePasswordUninstallPreview } from './onepassword-uninstall.js';
 import os from 'node:os';
 import {
   combineEffects,
   managedResult,
   resultJson,
   type Changed,
+  type CommandData,
   type ManagedResult,
   type NextAction,
   type OperationData,
@@ -107,9 +76,6 @@ import {
   type InstanceOperation,
 } from './journal.js';
 import { type OperationIntent, readOperationRecord } from './operation.js';
-import { disableLocalVoice, enableLocalVoice, installLocalVoice, uninstallLocalVoice } from './local-voice.js';
-import { DEFAULT_VOICE_MODEL } from './install-voice.js';
-import type { VoiceModelId } from './voice-assets.js';
 import { resolveControlPlanePaths, type ControlPlanePaths } from './paths.js';
 import { googleConnectionResources } from './google-connection.js';
 import {
@@ -267,7 +233,8 @@ type RemoveAssistantRunner = (
 
 export interface CliRuntime {
   whatsappNcl?: typeof runInstanceNclJson;
-  browserInspection?: BrowserCapabilityInspection;
+  aliasNcl?: import('./alias.js').AliasStepOptions['ncl'];
+  browserInspection?: import('./browser-isolation.js').BrowserIsolationInspection;
   artifacts?: ArtifactsCapabilityDependencies;
   onePassword?: OnePasswordCliSeams;
   /** Picks among the operator's 1Password accounts; absent, enable needs --account until one is recorded. */
@@ -292,6 +259,7 @@ export interface CliRuntime {
   removeAssistant?: RemoveAssistantRunner;
   /** Absent means removal requires `--yes`. */
   confirmRemoval?: (preview: RemovalPreview) => Promise<boolean>;
+  confirmOnePasswordUninstall?: (preview: OnePasswordUninstallPreview) => Promise<boolean>;
   upsertEnvVars?: UpsertEnvVars;
   hostStatus?: HostStatusHelpers;
   serviceHelpers?: NanoclawServiceHelpers;
@@ -350,8 +318,8 @@ function nextActionLines(actions: readonly NextAction[]): string[] {
   );
 }
 
-async function attendBrowserAliasPause(
-  pause: NonNullable<BrowserOperationData['pause']>,
+async function attendAliasPause(
+  pause: NonNullable<OperationData['pause']>,
   prompts: InteractivePrompts,
   presenter: Presenter,
 ): Promise<AliasDecision | undefined> {
@@ -538,6 +506,8 @@ class Cli {
   #rolloutPlan: UpdateAllPlan | undefined;
   #rolloutTargets = new Map<string, UpdateTargetResult>();
   #rolloutCleanup: OperationData['cleanup'];
+  #connectorNextActions: readonly NextAction[] = [];
+  readonly #connectorRateLimit = { limited: false };
 
   constructor(runtime: CliRuntime, presenter: Presenter, interruptedResult: (result: ManagedResult) => void) {
     this.#paths = runtime.paths ?? resolveControlPlanePaths();
@@ -560,6 +530,11 @@ class Cli {
             args,
             options,
             meta: { track },
+            decisions: {
+              chatConfigured: false,
+              skipAlias: options['skip-alias'] === 'true',
+              ...(aliasDecisionOf(options) ? { alias: aliasDecisionOf(options) } : {}),
+            },
             work: (session) => this.#createWork(session, options, track, source, principalEmails),
           });
       }
@@ -575,6 +550,7 @@ class Cli {
             instanceId,
             decisions: {
               chatConfigured: options['chat-configured'] === 'true',
+              skipAlias: options['skip-alias'] === 'true',
               ...(billingAccount ? { billingAccount } : {}),
               ...(alias ? { alias } : {}),
               ...(options['google-client-file']
@@ -827,7 +803,12 @@ class Cli {
       serviceHelpers,
       interaction: options.interaction,
       runtime: options.runtime,
-      onePassword: { cli: { ambient: this.#runtime.environment ?? process.env, ...this.#runtime.onePassword } },
+      onePassword: {
+        cli: { ambient: this.#runtime.environment ?? process.env, ...this.#runtime.onePassword },
+        operatorTerminal: Boolean(this.#runtime.prompts),
+        rateLimitState: this.#connectorRateLimit,
+      },
+      artifacts: this.#runtime.artifacts,
     });
   }
 
@@ -952,7 +933,8 @@ class Cli {
       const result = await runStep(reporter, { id: 'provision' }, () =>
         this.#advance(operation, { interaction: current, runtime: reporter }),
       );
-      if (result.status !== 'paused') return { status: 'ready', message: `Instance ${operation.instanceId} is ready.` };
+      if (result.status !== 'paused')
+        return { status: 'ready', message: `Instance ${operation.instanceId} is ready.`, actions: result.nextActions };
       const response = await this.#attend(current, result.pause);
       if (response.kind === 'stop') return result;
       if (response.decisions) current = current.withDecisions(response.decisions);
@@ -1125,12 +1107,14 @@ class Cli {
           state.changed = combineEffects(state.changed, started === 'started');
           state.data = { ...state.data, service: { action: command, result: started } };
           await verifyServing(reporter, service, instanceId);
+          const connectorActions = await this.#provisionConnectors(operation, reporter);
           return {
             status: 'ready',
             message:
               started === 'started'
                 ? `Assistant ${instanceId} started.`
                 : `Assistant ${instanceId} is already running.`,
+            actions: connectorActions,
           };
         }
         case 'stop': {
@@ -1157,12 +1141,14 @@ class Cli {
           state.changed = combineEffects(state.changed, restarted === 'restarted' || restarted === 'started');
           state.data = { ...state.data, service: { action: command, result: restarted } };
           await verifyServing(reporter, service, instanceId);
+          const connectorActions = await this.#provisionConnectors(operation, reporter);
           return {
             status: 'ready',
             message:
               restarted === 'restarted'
                 ? `Assistant ${instanceId} restarted.`
                 : `Assistant ${instanceId} was not running; it is now started.`,
+            actions: connectorActions,
           };
         }
       }
@@ -1184,7 +1170,8 @@ class Cli {
     await this.#cleanStrayInstall(reporter, state);
     const update = await this.#updateAssistant(reporter, request, confirm, this.#updateLauncher(), state);
     if (update) state.data = { ...state.data, update };
-    return updateOutcome(request.instanceId, update);
+    const outcome = updateOutcome(request.instanceId, update);
+    return outcome.status === 'ready' ? { ...outcome, actions: state.data.connector_next_actions } : outcome;
   }
 
   /**
@@ -1220,7 +1207,11 @@ class Cli {
       const unfinished = await readOperationRecord(this.#paths, request.instanceId);
       if (unfinished?.phase === 'committed') {
         await finishFollowUps(operation, dependencies);
-        if (sameRelease(unfinished.to, intent.target)) return { kind: 'completed', release: unfinished.to };
+        if (sameRelease(unfinished.to, intent.target)) {
+          const nextActions = await this.#provisionConnectors(operation, reporter);
+          state.data = { ...state.data, connector_next_actions: nextActions };
+          return { kind: 'completed', release: unfinished.to };
+        }
       }
       // The gate admitted this update: it continues an open update to this release, or supersedes one with no release
       // to return to, which is staged anew.
@@ -1238,10 +1229,31 @@ class Cli {
         const { staging: _staging, ...accepted } = state.data;
         state.data = accepted;
       }
-      return { kind: 'updated', updated: await continueUpdate(operation, dependencies) };
+      const updated = await continueUpdate(operation, dependencies);
+      const nextActions = await this.#provisionConnectors(operation, reporter);
+      state.data = { ...state.data, connector_next_actions: nextActions };
+      return { kind: 'updated', updated };
     } finally {
       operation.release();
     }
+  }
+
+  async #provisionConnectors(operation: InstanceOperation, reporter: StepReporter): Promise<readonly NextAction[]> {
+    const result = await provisionInstalledConnectors(operation, reporter, {
+      onePassword: {
+        cli: onePasswordSeams(this.#runtime.environment ?? process.env, this.#runtime.onePassword),
+        upsertEnvVars: this.#runtime.upsertEnvVars,
+        operatorTerminal: Boolean(this.#runtime.prompts),
+        rateLimitState: this.#connectorRateLimit,
+      },
+      artifacts: this.#runtime.artifacts,
+    });
+    for (const pending of result.pending) this.#presenter.line(`${pending.name}: ${pending.message}`);
+    const actions = [...this.#connectorNextActions, ...result.next_actions];
+    this.#connectorNextActions = actions.filter(
+      (entry, index) => actions.findIndex((other) => JSON.stringify(other) === JSON.stringify(entry)) === index,
+    );
+    return result.next_actions;
   }
 
   #rolloutStop(): ManagedResult | undefined {
@@ -1256,6 +1268,7 @@ class Cli {
     /* eslint-disable no-catch-all/no-catch-all -- The CLI boundary turns every failure before the first turn into a redacted summary and exit code. */
     let plan: UpdateAllPlan | undefined;
     this.#rolloutChanged = false;
+    this.#connectorNextActions = [];
     this.#rolloutLogs = [];
     this.#rolloutStopped = undefined;
     this.#rolloutPlan = undefined;
@@ -1325,7 +1338,7 @@ class Cli {
         changed: this.#rolloutChanged,
         data: { plan, targets: summary.targets, ...(this.#rolloutCleanup ? { cleanup: this.#rolloutCleanup } : {}) },
         ...(stopped?.error ? { error: new GwsEaError(stopped.error.code, stopped.error.message) } : {}),
-        next_actions: stopped?.next_actions ?? [],
+        next_actions: [...this.#connectorNextActions, ...(stopped?.next_actions ?? [])],
         diagnostics: stopped?.diagnostics ?? (this.#rolloutLogs[0] ? { run_log: this.#rolloutLogs[0] } : {}),
       });
       return { status: 'done', exitCode: summary.exitCode ?? EXIT_CODES[summary.outcome] };
@@ -1380,7 +1393,8 @@ class Cli {
       work: async ({ reporter, state }) => {
         turn.ended = await this.#updateAssistant(reporter, request, confirmWithoutAsking, launcher, state);
         if (turn.ended) state.data = { ...state.data, update: turn.ended };
-        return updateOutcome(instanceId, turn.ended);
+        const outcome = updateOutcome(instanceId, turn.ended);
+        return outcome.status === 'ready' ? { ...outcome, actions: state.data.connector_next_actions } : outcome;
       },
     });
     if (this.result) {
@@ -2316,6 +2330,7 @@ export async function runCli(args: readonly string[], runtime: CliRuntime = {}):
       prompts: _prompts,
       onFailure: _failure,
       confirmRemoval: _remove,
+      confirmOnePasswordUninstall: _vaults,
       confirmUpdate: _update,
       confirmUpdateAll: _all,
       confirmRollback: _rollback,
@@ -2451,504 +2466,240 @@ export async function runCli(args: readonly string[], runtime: CliRuntime = {}):
         return reportStop(presenter, error);
       }
     }
-    case 'capability': {
-      const command = handler.command;
-      if (handler.name === 'artifacts') {
-        let changed: Changed = false;
-        let data: ArtifactsCapabilityObservation | ArtifactsOperationData | null = null;
-        const stop = observeInterruption(() => ({ changed, data }));
-        try {
-          const paths = runtime.paths ?? resolveControlPlanePaths();
-          const instanceId = targetInstance(options);
-          const dependencies = {
-            ...runtime.artifacts,
-            recordEffect: (effect: true | null) => {
-              changed = combineEffects(changed, effect);
-            },
-          };
-          if (command === 'show' || command === 'check') {
-            data = await inspectArtifactsCapability(paths, instanceId, { ...dependencies, check: command === 'check' });
-            const failed = command === 'check' && !data.ready;
-            if (!json)
-              output(
-                `Artifacts: ${data.activation}. Remote: ${data.remote}. Listener: ${data.listener}.${data.reason ? ` ${data.reason}` : ''}`,
-              );
-            emitResult(
-              managedResult(invocation.definition.path.join(' '), {
-                outcome: failed ? 'failed' : 'succeeded',
-                changed,
-                data,
-                ...(failed
-                  ? {
-                      error: new GwsEaError(
-                        'artifacts_check_failed',
-                        'Artifact readiness was not established. Inspect the reported prerequisites.',
-                      ),
-                    }
-                  : {}),
-              }),
-            );
-            return failed ? EXIT_CODES.failed : EXIT_CODES.ready;
-          }
-          if (command === 'enable')
-            data = await enableArtifactsCapability(
+    case 'alias': {
+      const paths = runtime.paths ?? resolveControlPlanePaths();
+      const instanceId = targetInstance(options);
+      let changed: Changed = false;
+      let data: OperationData = { instance_id: instanceId };
+      const stop = observeInterruption(() => ({ changed, data }));
+      try {
+        let decision = aliasDecisionOf(options);
+        for (;;) {
+          const result = await withAssistantLock(paths, instanceId, async () =>
+            runAliasStep(
               paths,
               instanceId,
+              await loadInstanceRuntimeConfig(paths.runtimeFile(instanceId)),
               {
-                accountId: options.account,
-                teamName: options.team,
-                zoneId: options.zone,
-                hostname: options.hostname,
-                credentialFile: options['credential-file'],
-                assistantHostname: options['assistant-hostname'],
-                cloudflaredPath: options.cloudflared,
-                discardUnproven: options['discard-unproven'],
-              },
-              dependencies,
-            );
-          else if (command === 'disable') data = await disableArtifactsCapability(paths, instanceId, dependencies);
-          else throw new GwsEaError('invalid_arguments', `Artifacts do not support ${command}.`);
-          if (!json) output(`Artifacts ${data.enabled ? 'enabled' : 'disabled'} for assistant ${instanceId}.`);
-          emitResult(managedResult(invocation.definition.path.join(' '), { outcome: 'succeeded', changed, data }));
-          return EXIT_CODES.ready;
-          // eslint-disable-next-line no-catch-all/no-catch-all -- The managed CLI boundary retains effects and emits only redacted domain failures.
-        } catch (cause) {
-          const error =
-            cause instanceof GwsEaError
-              ? cause
-              : new GwsEaError(
-                  'artifacts_operation_failed',
-                  'Artifacts operation failed. Inspect the owner-only configuration and running host.',
-                  { cause },
-                );
-          emitResult(
-            managedResult(invocation.definition.path.join(' '), {
-              outcome: isBusy(error) ? 'busy' : 'failed',
-              changed,
-              data,
-              error,
-            }),
-          );
-          return reportStop(presenter, error);
-        } finally {
-          stop();
-        }
-      }
-      if (handler.name === 'browser') {
-        let changed: Changed = false;
-        let data: BrowserCapabilityObservation | BrowserOperationData | null = null;
-        const stop = observeInterruption(() => ({ changed, data }));
-        try {
-          const paths = runtime.paths ?? resolveControlPlanePaths();
-          const instanceId = targetInstance(options);
-          const dependencies = {
-            recordEffect: (effect: true | null) => {
-              changed = combineEffects(changed, effect);
-            },
-          };
-          let actions: readonly NextAction[] = [];
-          if (command === 'show' || command === 'check') {
-            data = await inspectBrowserCapability(paths, instanceId, {
-              ...runtime.browserInspection,
-              check: command === 'check',
-            });
-            actions = browserCapabilityNextActions(data);
-            const failed = command === 'check' && !data.ready;
-            if (!json) for (const line of [...browserCapabilityLines(data), ...nextActionLines(actions)]) output(line);
-            emitResult(
-              managedResult(invocation.definition.path.join(' '), {
-                outcome: failed ? 'failed' : 'succeeded',
-                changed,
-                data,
-                next_actions: actions,
-                ...(failed
-                  ? {
-                      error: new GwsEaError(
-                        'browser_check_failed',
-                        'Browser readiness was not established. Inspect the reported prerequisite and isolation facts.',
-                      ),
-                    }
-                  : {}),
-              }),
-            );
-            return failed ? EXIT_CODES.failed : EXIT_CODES.ready;
-          }
-          if (command === 'enable') {
-            const agentGroupIds = invocation.repeated['agent-group'] ?? [];
-            if (agentGroupIds.length > 0 && options['main-only'] === 'true')
-              throw new GwsEaError('invalid_arguments', 'Use --agent-group or --main-only, not both.');
-            let decision = aliasDecisionOf(options);
-            const enable = () =>
-              enableBrowserWithAlias(
-                paths,
-                instanceId,
-                {
-                  ...dependencies,
-                  ncl: runtime.browserInspection?.ncl,
-                  alias: { decision },
-                  emit: (event) => presenter.event(event),
+                emit: (event) => {
+                  if (event.type === 'domain-effect') changed = combineEffects(changed, event.changed);
+                  presenter.event(event);
                 },
-                agentGroupIds.length > 0
-                  ? { kind: 'agent_groups', agentGroupIds }
-                  : options['main-only'] === 'true'
-                    ? { kind: 'main' }
-                    : undefined,
-              );
-            let enabled = await enable();
-            data = enabled;
-            while (enabled.pause && runtime.prompts) {
-              const answer = await attendBrowserAliasPause(enabled.pause, runtime.prompts, presenter);
-              if (answer === undefined) break;
-              decision = answer;
-              enabled = await enable();
-              data = enabled;
-            }
-            if (enabled.pause) {
-              const pause = enabled.pause;
-              const next = browserAliasNextActions(instanceId, pause);
-              presenter.report({
-                outcome: 'paused',
-                headline: `Browser enabled for assistant ${instanceId}; its web alias waits: ${pause.message}`,
-                details: [
-                  ...(pause.details ?? []).map((detail) => `  ${detail}`),
-                  ...nextActionLines(next.filter((action) => action.kind === 'command')),
-                  ...(pause.code === 'alias_required'
-                    ? [
-                        'If the address is already in use, replace --alias-added with --alias-taken to try the next name.',
-                        'To choose the name yourself, replace --alias-added with --alias <name>.',
-                      ]
-                    : []),
-                ],
-              });
-              emitResult(
-                managedResult(invocation.definition.path.join(' '), {
-                  outcome: 'paused',
-                  changed,
-                  data,
-                  error: new GwsEaError(pause.code, pause.message),
-                  next_actions: next,
-                }),
-              );
-              return EXIT_CODES.paused;
-            }
-          } else if (command === 'disable') {
-            data = await disableBrowserCapability(paths, instanceId, dependencies);
-          } else throw new GwsEaError('invalid_arguments', `Browser does not support ${command}.`);
-          actions = [{ kind: 'command', argv: ['gws-ea', 'connectors', 'check', 'browser', '--id', instanceId] }];
-          presenter.report({
-            outcome: 'ready',
-            headline: `Browser ${data.enabled ? 'enabled' : 'disabled'} for assistant ${instanceId}.`,
-            details: [`Access: ${browserAccessLine(data.access)}.`, ...nextActionLines(actions)],
-          });
-          emitResult(
-            managedResult(invocation.definition.path.join(' '), {
-              outcome: 'succeeded',
-              changed,
-              data,
-              next_actions: actions,
-            }),
-          );
-          return EXIT_CODES.ready;
-          // eslint-disable-next-line no-catch-all/no-catch-all -- Every browser operation retains its observed effects in the managed boundary.
-        } catch (cause) {
-          const error =
-            cause instanceof GwsEaError
-              ? cause
-              : new GwsEaError(
-                  'browser_operation_failed',
-                  'Browser operation failed. Inspect the instance policy and its owner-only permissions before retrying.',
-                  { cause },
-                );
-          const cancelled = error.code === 'cancelled';
-          const actions: readonly NextAction[] = [
-            {
-              kind: 'external',
-              instruction:
-                'Inspect the named assistant’s browser policy, permissions, runtime, and service state before retrying.',
-            },
-          ];
-          emitResult(
-            managedResult(invocation.definition.path.join(' '), {
-              outcome: cancelled ? 'cancelled' : isBusy(error) ? 'busy' : 'failed',
-              changed,
-              data,
-              error,
-              next_actions: actions,
-            }),
-          );
-          if (cancelled) {
-            presenter.report({ outcome: 'ready', headline: error.message, details: [] });
-            return EXIT_CODES.ready;
-          }
-          return reportStop(presenter, error, nextActionLines(actions));
-        } finally {
-          stop();
-        }
-      }
-      if (handler.name === 'onepassword') {
-        let changed: Changed = false;
-        let data: OnePasswordCapabilityObservation | OnePasswordEnableData | OnePasswordDisableData | null = null;
-        let run: RunLog | undefined;
-        const stop = observeInterruption(() => ({ changed, data }));
-        const commandPath = invocation.definition.path.join(' ');
-        try {
-          const paths = runtime.paths ?? resolveControlPlanePaths();
-          registerErrorSecrets();
-          const cli = onePasswordSeams(environment, runtime.onePassword);
-          if (command === 'show' || command === 'check') {
-            const observation = await inspectOnePasswordCapability(paths, { check: command === 'check', cli });
-            data = observation;
-            const actions = onePasswordCapabilityNextActions(observation, command === 'check');
-            if (!json)
-              for (const line of [...onePasswordCapabilityLines(observation, true), ...nextActionLines(actions)])
-                output(line);
-            emitResult(managedResult(commandPath, { outcome: 'succeeded', changed, data, next_actions: actions }));
-            return EXIT_CODES.ready;
-          }
-          if (command === 'disable') {
-            const disabled = await disableOnePassword(paths, {
-              recordEffect: (effect) => {
-                changed = combineEffects(changed, effect);
               },
-            });
-            data = disabled;
-            const actions = onePasswordDisableNextActions(disabled);
-            const report = onePasswordDisableReport(disabled);
-            presenter.report({
-              outcome: 'ready',
-              headline: report.headline,
-              details: [...report.details, ...nextActionLines(actions)],
-            });
-            emitResult(managedResult(commandPath, { outcome: 'succeeded', changed, data, next_actions: actions }));
-            return EXIT_CODES.ready;
-          }
-          if (command !== 'enable') throw new GwsEaError('invalid_arguments', `1Password does not support ${command}.`);
-          run = await startRunLog({ paths, command: commandPath });
-          const enabled = await run.step('enable onepassword', () =>
-            enableOnePassword(
-              paths,
-              {
-                ...(options.account === undefined ? {} : { accountId: options.account }),
-                ...(options['discard-unproven'] === undefined ? {} : { discardUnproven: options['discard-unproven'] }),
-              },
-              {
-                cli,
-                ...(runtime.upsertEnvVars ? { upsertEnvVars: runtime.upsertEnvVars } : {}),
-                ...(runtime.chooseOnePasswordAccount ? { chooseAccount: runtime.chooseOnePasswordAccount } : {}),
-                recordEffect: (effect) => {
-                  changed = combineEffects(changed, effect);
-                },
-                progress: (line) => presenter.line(line),
-              },
+              { decision, ncl: runtime.aliasNcl },
             ),
           );
-          data = enabled;
-          run.complete();
-          const waiting = enabled.assistants.filter((assistant) => assistant.outcome === 'pending');
-          const actions = onePasswordEnableNextActions(enabled);
+          data = {
+            instance_id: instanceId,
+            ...(result.status === 'paused' ? { pause: pauseFacts(result.pause) } : {}),
+          };
+          if (result.status === 'paused' && runtime.prompts) {
+            const answer = await attendAliasPause(result.pause, runtime.prompts, presenter);
+            if (answer !== undefined) {
+              decision = answer;
+              continue;
+            }
+          }
+          const paused = result.status === 'paused';
+          const actions = paused ? aliasNextActions(instanceId, result.pause) : [];
           presenter.report({
-            outcome: waiting.length ? 'paused' : 'ready',
-            headline: waiting.length
-              ? `1Password is enabled in account ${enabled.account_id}; ${waiting.length} assistant${waiting.length === 1 ? '' : 's'} still wait${waiting.length === 1 ? 's' : ''}.`
-              : `1Password is enabled in account ${enabled.account_id} for every compatible current and future assistant.`,
+            outcome: paused ? 'paused' : 'ready',
+            headline: paused ? result.pause.message : `Web alias configured for assistant ${instanceId}.`,
             details: [
-              ...enabled.assistants.map(
-                (assistant) =>
-                  `Assistant ${assistant.instance_id}: ${assistant.outcome}${assistant.vault_id ? `, vault ${assistant.vault_id}` : ''}${assistant.message ? `. ${assistant.message}` : ''}`,
-              ),
+              ...(result.status === 'paused'
+                ? [
+                    ...(result.pause.details ?? []).map((detail) => `  ${detail}`),
+                    'Use --alias-taken for another suggestion, or --alias <name> for your own address.',
+                  ]
+                : []),
               ...nextActionLines(actions),
-              `Log: ${run.progressLog}`,
             ],
           });
           emitResult(
-            managedResult(commandPath, {
-              outcome: waiting.length ? 'paused' : 'succeeded',
-              changed,
-              data,
-              next_actions: actions,
-              diagnostics: { run_log: run.progressLog },
-            }),
+            managedResult('alias', { outcome: paused ? 'paused' : 'succeeded', changed, data, next_actions: actions }),
           );
-          return waiting.length ? EXIT_CODES.paused : EXIT_CODES.ready;
-          // eslint-disable-next-line no-catch-all/no-catch-all -- Every 1Password operation retains its observed effects in the managed boundary.
-        } catch (cause) {
-          const error =
-            cause instanceof GwsEaError
-              ? cause
-              : new GwsEaError(
-                  'onepassword_operation_failed',
-                  `1Password ${command} failed (${errorCode(cause)}). Inspect the host's 1Password files and permissions, and the retained log if present, before retrying.`,
-                  { cause },
-                );
-          try {
-            run?.abort(cause);
-            // eslint-disable-next-line no-catch-all/no-catch-all -- A full or unavailable log must not suppress the managed result.
-          } catch (_logError) {
-            /* The managed result below still reports the failure. */
-          }
-          registerErrorSecrets();
-          const actions = onePasswordRecovery(error, command === 'disable' ? 'disable' : 'enable');
-          const paused = onePasswordErrorPauses(error);
-          const details = [...nextActionLines(actions), ...(run ? [`Log: ${run.progressLog}`] : [])];
-          emitResult(
-            managedResult(commandPath, {
-              outcome: paused ? 'paused' : isBusy(error) ? 'busy' : 'failed',
-              changed,
-              data,
-              error,
-              next_actions: actions,
-              diagnostics: run ? { run_log: run.progressLog } : {},
-            }),
-          );
-          if (paused) {
-            presenter.report({ outcome: 'paused', headline: safeErrorMessage(error), details });
-            return EXIT_CODES.paused;
-          }
-          return reportStop(presenter, error, details);
-        } finally {
-          stop();
+          return paused ? EXIT_CODES.paused : EXIT_CODES.ready;
         }
+      } catch (cause) {
+        const error =
+          cause instanceof GwsEaError
+            ? cause
+            : new GwsEaError(
+                'alias_operation_failed',
+                'Web alias setup failed. Inspect this assistant’s identity and host state.',
+                { cause },
+              );
+        emitResult(managedResult('alias', { outcome: isBusy(error) ? 'busy' : 'failed', changed, data, error }));
+        return reportStop(presenter, error);
+      } finally {
+        stop();
       }
+    }
+    case 'connector': {
+      const commandPath = invocation.definition.path.join(' ');
+      const paths = runtime.paths ?? resolveControlPlanePaths();
+      let changed: Changed = false;
+      let data: CommandData | null = null;
       let run: RunLog | undefined;
       let stepLog: string | undefined;
       let actions: readonly NextAction[] = [];
-      let changed: Changed = false;
-      let data:
-        | import('./result.js').VoiceOperationData
-        | import('./connectors.js').VoiceCapabilityObservation
-        | import('./connectors.js').CapabilityList
-        | null = null;
-      const stopObservingInterruption = observeInterruption(() => ({ changed, data }));
+      const stop = observeInterruption(() => ({ changed, data }));
+      const recordEffect = (effect: true | null): void => {
+        changed = combineEffects(changed, effect);
+      };
       try {
-        const paths = runtime.paths ?? resolveControlPlanePaths();
         registerErrorSecrets();
-        const dependencies = {
-          environment,
-          upsertEnvVars: runtime.upsertEnvVars,
-          serviceHelpers: runtime.serviceHelpers,
-          progress: (line: string) => presenter.line(line),
-          recordEffect: (effect: true | null) => {
-            changed = combineEffects(changed, effect);
-          },
-        };
-        switch (command) {
-          case 'list':
-          case 'show':
-          case 'check': {
-            const capability = await inspectVoiceCapability(paths, { checkConsumers: command === 'check' });
-            actions = voiceCapabilityNextActions(capability, command === 'check');
-            const browser = command === 'list' ? await browserCapabilityCatalog(paths) : undefined;
-            const artifacts = command === 'list' ? await artifactsCapabilityCatalog(paths) : undefined;
-            const onePassword = command === 'list' ? await onePasswordCapabilityCatalog(paths) : undefined;
-            data =
-              command === 'list' && browser && onePassword
-                ? { capabilities: [capability, browser, onePassword, ...(artifacts ? [artifacts] : [])] }
-                : capability;
-            if (!json)
-              for (const line of [...capabilityLines(capability, command !== 'list'), ...nextActionLines(actions)])
-                output(line);
-            if (!json && browser)
-              output(
-                `browser (assistant): ${browser.summary} Actions: ${browser.actions.join(', ')}. Assistants: ${browser.assistant_ids.join(', ') || 'none'}.`,
-              );
-            if (!json && onePassword)
-              output(
-                `onepassword (host): ${onePassword.summary} Actions: ${onePassword.actions.join(', ')}. Activation: ${onePassword.activation}.`,
-              );
-            if (!json && artifacts)
-              output(`artifacts (assistant): ${artifacts.summary} Actions: ${artifacts.actions.join(', ')}.`);
-            break;
-          }
-          case 'install': {
-            const model = options.model ?? DEFAULT_VOICE_MODEL;
-            if (model !== 'base' && model !== 'small' && model !== 'large-v3-turbo-q5_0')
-              throw new GwsEaError('invalid_arguments', 'Voice model must be base, small, or large-v3-turbo-q5_0.');
-            run = await startRunLog({ paths, command: 'connectors install', meta: { model } });
-            const installed = await run.step('install voice', async (step) => {
-              stepLog = step.rawLog;
-              return installLocalVoice(
-                paths,
-                { model: model satisfies VoiceModelId, ...(options.cmake ? { cmake: options.cmake } : {}) },
-                dependencies,
-              );
-            });
-            actions = [{ kind: 'command', argv: ['gws-ea', 'connectors', 'enable', 'voice'] }];
-            data = { name: 'voice', scope: 'host', installation_dir: installed.installationDir, enabled: false };
-            presenter.report({
-              outcome: 'ready',
-              headline: `Voice assets installed at ${installed.installationDir}; voice remains disabled.`,
-              details: nextActionLines(actions),
-            });
-            break;
-          }
-          case 'enable': {
-            await enableLocalVoice(paths, dependencies);
-            const capability = await inspectVoiceConsumers(paths);
-            data = {
-              name: 'voice',
-              scope: 'host',
-              enabled: true,
-              compatible_assistant_ids: capability.compatible_assistant_ids,
-              unsupported_assistant_ids: capability.unsupported_assistant_ids,
-              unknown_assistant_ids: capability.unknown_assistant_ids,
-              future_compatible_assistants: true,
-            };
-            actions = [{ kind: 'command', argv: ['gws-ea', 'connectors', 'check', 'voice'] }];
-            presenter.report({
-              outcome: 'ready',
-              headline: 'Voice enabled host-wide for every compatible current and future assistant.',
-              details: [
-                `Compatible current assistants: ${capability.compatible_assistant_ids.join(', ') || 'none observed'}`,
-                `Unknown compatibility: ${capability.unknown_assistant_ids.join(', ') || 'none observed'}`,
-                ...nextActionLines(actions),
-              ],
-            });
-            break;
-          }
-          case 'disable':
-            await disableLocalVoice(paths, dependencies);
-            data = { name: 'voice', scope: 'host', enabled: false };
-            presenter.report({
-              outcome: 'ready',
-              headline: 'Voice disabled host-wide; shared assets retained and existing preparation finishes.',
-              details: [],
-            });
-            break;
-          case 'uninstall':
-            await uninstallLocalVoice(paths, dependencies);
-            data = { name: 'voice', scope: 'host', enabled: false };
-            presenter.report({
-              outcome: 'ready',
-              headline: 'Recipe-owned voice assets removed; text service remains available.',
-              details: [],
-            });
-            break;
+        if (handler.command === 'list' || handler.command === 'show' || handler.command === 'check') {
+          const checked = handler.command === 'check';
+          const inspection = {
+            check: checked,
+            instanceId: options.id,
+            onePassword: onePasswordSeams(environment, runtime.onePassword),
+            artifacts: runtime.artifacts,
+            serviceHelpers: runtime.serviceHelpers,
+            hostStatus: runtime.hostStatus,
+          };
+          const observations =
+            handler.command === 'list'
+              ? await Promise.all(CONNECTOR_CATALOG.map((connector) => connector.inspect(paths, inspection)))
+              : [await connectorDefinition(handler.name).inspect(paths, inspection)];
+          data = handler.command === 'list' ? { connectors: observations } : observations[0];
+          actions = observations.flatMap((observation) => observation.next_actions);
+          const failed = checked && observations.some((observation) => observation.readiness.status !== 'ready');
+          if (!json)
+            for (const observation of observations)
+              for (const line of connectorLines(observation, handler.command !== 'list')) output(line);
+          if (!json) for (const line of nextActionLines(actions)) output(line);
+          emitResult(
+            managedResult(commandPath, {
+              outcome: failed ? 'failed' : 'succeeded',
+              changed: false,
+              data,
+              next_actions: actions,
+              ...(failed
+                ? {
+                    error: new GwsEaError(
+                      `${observations[0].name}_not_ready`,
+                      'Connector readiness was not established. Inspect the structured reasons and next actions.',
+                    ),
+                  }
+                : {}),
+            }),
+          );
+          return failed ? EXIT_CODES.failed : EXIT_CODES.ready;
         }
-        run?.complete();
+        const name = handler.name;
+        let paused = false;
+        const lifecycleContext: ConnectorLifecycleContext = {
+          paths,
+          options,
+          voice: {
+            environment,
+            upsertEnvVars: runtime.upsertEnvVars,
+            serviceHelpers: runtime.serviceHelpers,
+            progress: (line) => presenter.line(line),
+            recordEffect,
+          },
+          onePassword: {
+            cli: onePasswordSeams(environment, runtime.onePassword),
+            upsertEnvVars: runtime.upsertEnvVars,
+            chooseAccount: runtime.chooseOnePasswordAccount,
+            operatorTerminal: Boolean(runtime.prompts),
+            progress: (line) => presenter.line(line),
+            recordEffect,
+            rateLimitState: { limited: false },
+          },
+          artifacts: { ...runtime.artifacts, recordEffect },
+        };
+        if (name === 'onepassword' && handler.command === 'uninstall') {
+          const dependencies = lifecycleContext.onePassword;
+          let confirmed = options['delete-vaults'] === 'true';
+          let confirmedPreview: OnePasswordUninstallPreview | undefined;
+          if (!confirmed && options.abandon !== 'true' && runtime.confirmOnePasswordUninstall) {
+            const preview = await previewOnePasswordUninstall(paths, dependencies);
+            confirmed = await runtime.confirmOnePasswordUninstall(preview);
+            if (confirmed) confirmedPreview = preview;
+          }
+          const result = await connectorDefinition('onepassword').uninstall({
+            ...lifecycleContext,
+            deleteVaults: confirmed,
+            confirmedPreview,
+          });
+          data = result;
+          paused = result.outcome === 'paused';
+          actions = [
+            ...(paused
+              ? [
+                  {
+                    kind: 'command' as const,
+                    argv: ['gws-ea', 'connectors', 'uninstall', name, ...(confirmedPreview ? [] : ['--delete-vaults'])],
+                  },
+                ]
+              : []),
+            ...(result.revoke_service_account_ids.length
+              ? [
+                  {
+                    kind: 'external' as const,
+                    instruction: `Revoke these service accounts on 1Password.com: ${result.revoke_service_account_ids.join(', ')}. Then close the receipt with gws-ea connectors uninstall onepassword --abandon.`,
+                  },
+                ]
+              : []),
+          ];
+        } else {
+          const lifecycle = handler.command;
+          run = await startRunLog({ paths, command: commandPath });
+          const result = await run.step(`${handler.command} ${name}`, async (step) => {
+            stepLog = step.rawLog;
+            return connectorDefinition(name)[lifecycle](lifecycleContext);
+          });
+          data = result;
+          if (result.name === 'onepassword' && 'enabled' in result) {
+            paused = result.assistants.some((assistant) => assistant.outcome === 'pending');
+            actions = onePasswordInstallNextActions(result);
+          } else if (result.name === 'artifacts') {
+            paused =
+              'assistants' in result
+                ? result.assistants.some((assistant) => assistant.outcome === 'pending')
+                : result.outcome === 'pending';
+            actions = paused
+              ? [{ kind: 'command', argv: ['gws-ea', 'connectors', handler.command, name] }]
+              : [{ kind: 'command', argv: ['gws-ea', 'connectors', 'show', name] }];
+          } else
+            actions =
+              handler.command === 'install' ? [{ kind: 'command', argv: ['gws-ea', 'connectors', 'check', name] }] : [];
+          run.complete();
+        }
+        presenter.report({
+          outcome: paused ? 'paused' : 'ready',
+          headline: `${name}: ${handler.command}${paused ? ' has pending work' : ' completed'}.`,
+          details: [
+            ...(data && 'reason' in data && typeof data.reason === 'string' ? [data.reason] : []),
+            ...nextActionLines(actions),
+          ],
+        });
         emitResult(
-          managedResult(invocation.definition.path.join(' '), {
-            outcome: 'succeeded',
+          managedResult(commandPath, {
+            outcome: paused ? 'paused' : 'succeeded',
             changed,
             data,
             next_actions: actions,
-            diagnostics: run ? { run_log: run.progressLog } : {},
+            diagnostics: { ...(run ? { run_log: run.progressLog } : {}), ...(stepLog ? { step_log: stepLog } : {}) },
           }),
         );
-        return EXIT_CODES.ready;
-        // eslint-disable-next-line no-catch-all/no-catch-all -- Every managed voice failure has the same result boundary.
+        return paused ? EXIT_CODES.paused : EXIT_CODES.ready;
       } catch (cause) {
+        const name = handler.command === 'list' ? undefined : handler.name;
         let error =
           cause instanceof GwsEaError
             ? cause
             : new GwsEaError(
-                'voice_operation_failed',
-                `Voice ${command} failed (${errorCode(cause)}). Inspect the operator state directories, permissions, available disk space, and retained log if present before retrying.`,
+                'connector_operation_failed',
+                'Connector operation failed. Inspect the recorded configuration and diagnostics before retrying.',
                 { cause },
               );
         let logFailure = run?.loggingError;
         try {
           run?.abort(cause);
-          // eslint-disable-next-line no-catch-all/no-catch-all -- A full or unavailable log must not suppress the managed result.
         } catch (logError) {
           logFailure = errorCode(logError);
         }
@@ -2958,18 +2709,22 @@ export async function runCli(args: readonly string[], runtime: CliRuntime = {}):
             `${error.message} Diagnostic log incomplete (${logFailure}); check available disk space and permissions before retrying.`,
             { cause: error, details: { ...error.details, logFailure } },
           );
-        registerErrorSecrets();
-        const actions = voiceCapabilityRecovery(error, {
-          action: command,
-          ...(options.model ? { model: options.model } : {}),
-          ...(options.cmake ? { cmake: options.cmake } : {}),
-        });
-        const details = nextActionLines(actions);
-        if (run) details.push(`Log: ${run.progressLog}`);
-        if (stepLog) details.push(`Step log: ${stepLog}`);
+        const paused = name === 'onepassword' && onePasswordErrorPauses(error);
+        actions =
+          name === 'voice'
+            ? voiceCapabilityRecovery(error, {
+                action: handler.command === 'list' ? undefined : handler.command,
+                model: options.model,
+                cmake: options.cmake,
+              })
+            : name === 'onepassword'
+              ? onePasswordRecovery(error, handler.command === 'uninstall' ? 'uninstall' : 'install')
+              : name
+                ? [{ kind: 'command', argv: ['gws-ea', 'connectors', 'show', name] }]
+                : [];
         emitResult(
-          managedResult(invocation.definition.path.join(' '), {
-            outcome: isBusy(error) ? 'busy' : 'failed',
+          managedResult(commandPath, {
+            outcome: paused ? 'paused' : isBusy(error) ? 'busy' : 'failed',
             changed,
             data,
             error,
@@ -2977,10 +2732,22 @@ export async function runCli(args: readonly string[], runtime: CliRuntime = {}):
             diagnostics: { ...(run ? { run_log: run.progressLog } : {}), ...(stepLog ? { step_log: stepLog } : {}) },
           }),
         );
-        const tail = error.details?.stderrTail;
-        return reportStop(presenter, error, details, typeof tail === 'string' ? tail : undefined);
+        if (paused) {
+          presenter.report({ outcome: 'paused', headline: error.message, details: nextActionLines(actions) });
+          return EXIT_CODES.paused;
+        }
+        return reportStop(
+          presenter,
+          error,
+          [
+            ...nextActionLines(actions),
+            ...(run ? [`Log: ${run.progressLog}`] : []),
+            ...(stepLog ? [`Step log: ${stepLog}`] : []),
+          ],
+          typeof error.details?.stderrTail === 'string' ? error.details.stderrTail : undefined,
+        );
       } finally {
-        stopObservingInterruption();
+        stop();
       }
     }
     case 'observation': {
@@ -2998,6 +2765,11 @@ export async function runCli(args: readonly string[], runtime: CliRuntime = {}):
               serviceHelpers: runtime.serviceHelpers,
               hostStatus: runtime.hostStatus,
               toolCheckout: runtime.toolCheckout,
+              browserInspection: runtime.browserInspection,
+              connectorInspection: {
+                onePassword: onePasswordSeams(environment, runtime.onePassword),
+                artifacts: runtime.artifacts,
+              },
             },
             options,
           ),

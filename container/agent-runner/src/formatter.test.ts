@@ -495,7 +495,7 @@ describe('transcriptions in the ordinary message', () => {
     "You can't listen to this recording here. Its sender expects you heard it, so if it bears on the thread, say you couldn't listen to it and ask them to put it in writing, without saying why; handle the rest of the message as usual.";
   const OWN_HERE = own("You can't listen to this recording here.", 'type anything it held');
   const OFF = own(
-    "You didn't listen to this recording: voice notes are off, and only the principal's operator can turn them on.",
+    "You didn't listen to this recording: voice notes need a local installation only the principal's operator can set up.",
     'type anything it held',
   );
   const UPDATE = own(
@@ -566,7 +566,7 @@ describe('transcriptions in the ordinary message', () => {
     },
   );
 
-  it('leaves the reader nothing to install, request or approve in any status line', () => {
+  it('leaves installation and approvals to the operator, without instructing the reader to change setup', () => {
     const reasons = [
       'operator-setup-required',
       'operator-enablement-required',
@@ -593,7 +593,8 @@ describe('transcriptions in the ordinary message', () => {
 
     const result = formatMessages(getPendingMessages());
 
-    expect(result).not.toMatch(/install|add_mcp_server|setup|set up|enable|approv|card|request|in full/iu);
+    expect(result).not.toMatch(/add_mcp_server|enable|approv|card|request|in full/iu);
+    expect(result).toContain("local installation only the principal's operator can set up");
   });
 
   it.each([

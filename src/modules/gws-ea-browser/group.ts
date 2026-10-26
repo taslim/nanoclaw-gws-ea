@@ -5,7 +5,8 @@ import path from 'node:path';
 import { registerProtectedGroupPolicy } from '../../cli/guard.js';
 import { registerSessionAdmissionPolicy } from '../../container-runner.js';
 import { getSession } from '../../db/sessions.js';
-import { readHostBrowserPolicy, errandSource, hasBrowserAccess } from './access.js';
+import { browserAvailability } from './availability.js';
+import { errandSource, hasBrowserAccess } from './access.js';
 import './capability.js';
 import '../capabilities/index.js';
 
@@ -166,15 +167,12 @@ registerProtectedGroupPolicy('gws-ea-browser:host-owned', async (agentGroupId) =
 
 registerSessionAdmissionPolicy('gws-ea-browser:stamped-reach', async ({ key }) => {
   if (!(await getDb().hasTable('gws_ea_profile')) || key.agentGroupId !== (await getBrowserAgentGroupId())) return;
-  const policy = await readHostBrowserPolicy();
-  if (!policy.enabled) throw new Error('browser may not start: the operator must enable it');
+  const policy = await browserAvailability();
+  if (!policy.available)
+    throw new Error('browser may not start: Chrome or browser state is unavailable; ask your operator');
   if (!browserAdmissionReady()) throw new Error('browser may not start: host browser recovery is unavailable');
   const session = await getSession(key.sessionId);
-  if (
-    !session ||
-    session.messaging_group_id !== null ||
-    !(await hasBrowserAccess(errandSource(session.thread_id), policy))
-  )
+  if (!session || session.messaging_group_id !== null || !(await hasBrowserAccess(errandSource(session.thread_id))))
     throw new Error('browser may not start outside an errand delegated by an agent with browser access');
   const problems = await browserGroupDrift(key.agentGroupId, { sessionProvider: session?.agent_provider ?? null });
   if (problems.length > 0) throw new Error(`browser may not start: ${problems.join('; ')}`);

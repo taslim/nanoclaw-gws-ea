@@ -162,10 +162,6 @@ export function parseAliasName(value: string): AliasName {
   return domain === undefined ? { local } : { local, domain };
 }
 
-// ---------------------------------------------------------------------------
-// The setup step: after the journaled steps, while the browser is enabled
-// ---------------------------------------------------------------------------
-
 /**
  * `--alias-added` confirms the candidate (or `--alias`'s name when given),
  * `--alias-taken` moves to the next candidate, and `--alias` names the
@@ -491,7 +487,7 @@ async function overrideAddress(
   return address;
 }
 
-/** The caller has checked that the browser is enabled and holds the assistant's instance lock. */
+/** The caller holds the assistant’s instance lock. */
 export function runAliasStep(
   paths: ControlPlanePaths,
   instanceId: string,
@@ -509,4 +505,24 @@ export function runAliasStep(
     },
     reporter,
   );
+}
+
+/** Recovery for identity setup is independent of browser availability. */
+export function aliasNextActions(
+  instanceId: string,
+  pause: Pick<ProvisionHumanPause, 'resumeFlag' | 'message' | 'actionUrl'>,
+): readonly import('./result.js').NextAction[] {
+  return [
+    ...(pause.actionUrl ? [{ kind: 'external' as const, instruction: pause.message, url: pause.actionUrl }] : []),
+    {
+      kind: 'command',
+      argv: [
+        'gws-ea',
+        'alias',
+        '--id',
+        instanceId,
+        ...(pause.resumeFlag && !pause.resumeFlag.includes('<') ? pause.resumeFlag.split(' ') : []),
+      ],
+    },
+  ];
 }

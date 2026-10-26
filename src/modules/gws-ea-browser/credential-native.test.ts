@@ -400,7 +400,7 @@ describe.skipIf(!chromePath)('native authorized signup and password change', { t
     await new Promise<void>((resolve) => proxy.listen(0, '127.0.0.1', resolve));
     const proxyAddress = proxy.address();
     if (!proxyAddress || typeof proxyAddress === 'string') throw new Error('Proxy fixture did not bind');
-    const paths = browserPaths(join(root, 'browser', 'policy.json'));
+    const paths = browserPaths(join(root, 'browser'));
     await prepareChromeProfile(paths);
     connection = await connectChrome(
       await spawnChrome({ chromePath, paths, proxyUrl: `http://127.0.0.1:${proxyAddress.port}` }),

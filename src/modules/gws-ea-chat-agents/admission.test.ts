@@ -21,8 +21,6 @@ vi.mock('../../env.js', async (original) => ({
 }));
 
 import { getGroupCapabilities, registerCapability } from '../../capabilities.js';
-import { processLock } from '../../community-portal/process-lock.js';
-import { readEnvFile } from '../../env.js';
 import { assertSessionAdmitted, buildMounts, syncSkillSymlinks } from '../../container-runner.js';
 import { configFromDb, materializeContainerJson } from '../../container-config.js';
 import {
@@ -51,7 +49,8 @@ import { resolveSystemSession } from '../../session-manager.js';
 import '../gws-ea-profile/index.js';
 import { hasBrowserAccess } from '../gws-ea-browser/access.js';
 import '../gws-ea-browser/guidance.js';
-import { readBrowserPolicy } from '../gws-ea-browser/policy.js';
+import { configureBrowserAccess } from '../gws-ea-browser/testing/browser-access.js';
+import { useAvailableBrowser } from '../gws-ea-browser/testing/browser-runtime.js';
 import {
   getExternalChatAgentGroupId,
   getGwsEaProfile,
@@ -59,7 +58,7 @@ import {
   reconcileGwsEaProfile,
 } from '../gws-ea-profile/db.js';
 import { recordWebAlias } from '../gws-ea-profile/testing/web-alias.js';
-import { ensureExternalChatGroup, reconcileChatAgents, resumeRetiringJobAgents, chatAgentHealth } from './index.js';
+import { ensureExternalChatGroup, reconcileChatAgents, chatAgentHealth } from './index.js';
 import { createJobAgent, activateJobAgent, getJobAgentForChat, listJobAgents } from './jobs.js';
 import { EXTERNAL_CHAT_CAPABILITIES } from './shape.js';
 import { getHostStartCallbacks } from '../../host-lifecycle.js';
@@ -71,22 +70,19 @@ const agents = new Map<
   string,
   { id: string; identifier: string; name: string; secretMode: string; secrets: string[] }
 >();
-const POLICY = path.join(ROOT, 'browser/policy.json');
+const BROWSER_ROOT = path.join(ROOT, 'browser');
 let nextId = 0;
-
-function policy(ids: readonly string[]): void {
-  fs.mkdirSync(path.dirname(POLICY), { recursive: true, mode: 0o700 });
-  fs.writeFileSync(POLICY, JSON.stringify({ schemaVersion: 2, enabled: true, agentGroupIds: ids }), { mode: 0o600 });
-}
+const configureDelegation = async (ids: readonly string[]): Promise<void> => configureBrowserAccess(BROWSER_ROOT, ids);
 
 beforeEach(async () => {
+  useAvailableBrowser();
   fs.rmSync(ROOT, { recursive: true, force: true });
   agents.clear();
   nextId = 0;
   vi.stubEnv('ONECLI_URL', 'http://gateway.test');
   vi.stubEnv('ONECLI_API_KEY', `oc_${'k'.repeat(32)}`);
   vi.stubEnv('NANOCLAW_INSTALL_ID', '11111111111141118111111111111111');
-  vi.stubEnv('GWS_EA_BROWSER_POLICY_FILE', POLICY);
+  vi.stubEnv('GWS_EA_BROWSER_ROOT', BROWSER_ROOT);
   vi.stubGlobal(
     'fetch',
     vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
@@ -265,7 +261,7 @@ it('composes browser guidance only for an explicitly granted active job and remo
   expect(withoutBrowser).not.toContain('shared signed-in profile and vault');
   expect(withoutBrowser).not.toContain('`record_disclosure`');
   expect(withoutBrowser).not.toContain('yreva@example.test');
-  policy([job.agent_group_id]);
+  await configureDelegation([job.agent_group_id]);
   expect(await documentFor(job.agent_group_id)).not.toContain('# Browser delegation');
   await activateJobAgent(job.agent_group_id);
   await reconcileChatAgents();
@@ -285,7 +281,7 @@ it('composes browser guidance only for an explicitly granted active job and remo
   expect(granted).not.toContain('# Executive Assistant');
   expect(granted).not.toContain('assistant@example.test');
   expect(await documentFor(external)).not.toContain('# Browser delegation');
-  policy([]);
+  await configureDelegation([]);
   const revoked = await documentFor(job.agent_group_id);
   expect(revoked).not.toContain('# Browser delegation');
   expect(revoked).not.toContain('shared signed-in profile and vault');
@@ -350,28 +346,19 @@ it('creates one sealed shared agent and a job agent with separate exact stored s
   await expect(admit(job.agent_group_id)).resolves.toBeUndefined();
 });
 
-it('allows a job browser grant only after explicit authorization and refuses the shared agent even through a supplied policy', async () => {
+it('allows a job browser grant only after explicit authorization and refuses the shared agent even with its stored key', async () => {
   const external = await ensureExternalChatGroup();
   const job = await createJobAgent('trip');
   await activateJobAgent(job.agent_group_id);
   expect(await hasBrowserAccess(job.agent_group_id)).toBe(false);
-  policy([job.agent_group_id]);
+  await configureDelegation([job.agent_group_id]);
   expect(await hasBrowserAccess(job.agent_group_id)).toBe(true);
   expect(await getGroupCapabilities(job.agent_group_id)).toContain('browser-delegate');
   await expect(admit(job.agent_group_id)).resolves.toBeUndefined();
   await reconcileChatAgents();
   expect(await hasBrowserAccess(job.agent_group_id)).toBe(true);
-  const grant = await readBrowserPolicy();
-  expect(
-    await hasBrowserAccess(external, {
-      ...grant,
-      status: 'disabled',
-      enabled: false,
-      reason: 'operator-enablement-required',
-      access: { version: 2, agentGroupIds: [external] },
-    }),
-  ).toBe(false);
-  policy([external]);
+  expect(await hasBrowserAccess(external)).toBe(false);
+  await configureDelegation([external]);
   expect(await hasBrowserAccess(external)).toBe(false);
   expect(await getGroupCapabilities(external)).not.toContain('browser-delegate');
   const group = await getAgentGroup(external);
@@ -460,47 +447,6 @@ it('resumes interrupted retirement at host reconciliation and never re-grants th
   expect(agents.get(job.agent_group_id)?.secrets).toEqual([]);
 });
 
-it('honors the operator instance lock and re-reads the list before revoking only the retiring grant', async () => {
-  const job = await createJobAgent('trip');
-  await activateJobAgent(job.agent_group_id);
-  await createAgentGroup({
-    id: 'researcher',
-    name: 'Researcher',
-    folder: 'researcher',
-    agent_provider: null,
-    created_at: new Date().toISOString(),
-  });
-  policy([job.agent_group_id]);
-  const release = await processLock(path.join(ROOT, 'locks/11111111-1111-4111-8111-111111111111.lock'));
-  if (!release) throw new Error('No fixture lock');
-  try {
-    await expect(retireJobAgent(job.agent_group_id)).rejects.toMatchObject({ code: 'instance_busy' });
-    await expect(reconcileChatAgents()).resolves.toBeUndefined();
-    await expect(admit(job.agent_group_id)).rejects.toThrow('retiring');
-    const external = await getExternalChatAgentGroupId();
-    if (!external) throw new Error('No shared chat agent');
-    await expect(admit(external)).resolves.toBeUndefined();
-    expect(JSON.parse(fs.readFileSync(POLICY, 'utf8')).agentGroupIds).toEqual([job.agent_group_id]);
-    policy([job.agent_group_id, 'researcher']);
-  } finally {
-    release();
-  }
-  await resumeRetiringJobAgents();
-  expect(JSON.parse(fs.readFileSync(POLICY, 'utf8')).agentGroupIds).toEqual(['researcher']);
-  expect(await hasBrowserAccess('researcher')).toBe(true);
-});
-
-it('leaves the policy unchanged when a needed mutation has no bound native lock', async () => {
-  const job = await createJobAgent('trip');
-  await activateJobAgent(job.agent_group_id);
-  policy([job.agent_group_id]);
-  const original = fs.readFileSync(POLICY, 'utf8');
-  vi.mocked(readEnvFile).mockReturnValueOnce({});
-  await expect(retireJobAgent(job.agent_group_id)).rejects.toThrow('bound assistant lock');
-  expect(fs.readFileSync(POLICY, 'utf8')).toBe(original);
-  expect(await getJobAgent(job.agent_group_id)).toMatchObject({ state: 'retiring' });
-});
-
 it('retires one job through native browser cancellation without revoking an unrelated job', async () => {
   await import('../gws-ea-browser/index.js');
   await runMigrations(getDb());
@@ -568,8 +514,8 @@ it('retires one job through native browser cancellation without revoking an unre
   } finally {
     peerMap.close();
   }
-  policy([first.agent_group_id, second.agent_group_id]);
-  await reconcileBrowserGroup(POLICY);
+  await configureDelegation([first.agent_group_id, second.agent_group_id]);
+  await reconcileBrowserGroup(BROWSER_ROOT);
   const browser = await getBrowserAgentGroupId();
   if (!browser) throw new Error('No browser');
   const session = (await resolveSystemSession(browser, `system:a2a:${first.agent_group_id}:errand`)).session;
@@ -603,7 +549,7 @@ it('retires one job through native browser cancellation without revoking an unre
   expect(agents.get(first.agent_group_id)?.secrets).toEqual([]);
   const retiredGroup = await getAgentGroup(first.agent_group_id);
   expect(retiredGroup && fs.existsSync(path.join(ROOT, 'groups', retiredGroup.folder))).toBe(true);
-  policy([first.agent_group_id, second.agent_group_id]);
+  await configureDelegation([first.agent_group_id, second.agent_group_id]);
   expect(await hasBrowserAccess(first.agent_group_id)).toBe(false);
   expect(await hasBrowserAccess(second.agent_group_id)).toBe(true);
 });

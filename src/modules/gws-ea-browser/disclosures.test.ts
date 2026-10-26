@@ -1,3 +1,5 @@
+import { configureBrowserAccess } from './testing/browser-access.js';
+import { useAvailableBrowser } from './testing/browser-runtime.js';
 /** Personal-data disclosures against the real privacy store, central DB and delivery path. */
 import fs from 'node:fs';
 import type { Frame } from 'playwright-core';
@@ -48,11 +50,8 @@ const fieldsOn = (url: string, frames: Readonly<Record<string, string>> = {}): F
 const stop = (url: string, actions: BrowserAction[], of: BrowserJob = job) =>
   personalDataStop(getDb(), of.id, actions, fieldsOn(url));
 
-function writePolicy(policy: Record<string, unknown>): void {
-  fs.writeFileSync(`${root}/browser/policy.json`, JSON.stringify(policy), { mode: 0o600 });
-}
-
 beforeEach(async () => {
+  useAvailableBrowser();
   await runMigrations(await initTestDb());
   for (const id of ['main', 'browser', 'research', 'other'])
     await createAgentGroup({ id, name: id, folder: id, agent_provider: null, created_at: new Date().toISOString() });
@@ -65,14 +64,14 @@ beforeEach(async () => {
   mobile = (await addPrivateValue({ label: 'Mobile', kind: 'phone', value: MOBILE })).id;
   home = (await addPrivateValue({ label: 'Home', kind: 'address', value: HOME })).id;
   fs.mkdirSync(`${root}/browser`, { recursive: true, mode: 0o700 });
-  writePolicy({ schemaVersion: 1, enabled: true });
-  process.env.GWS_EA_BROWSER_POLICY_FILE = `${root}/browser/policy.json`;
+  await configureBrowserAccess(`${root}/browser`);
+  process.env.GWS_EA_BROWSER_ROOT = `${root}/browser`;
   main = (await resolveSystemSession('main', 'system:test:main')).session;
   browser = (await resolveSystemSession('browser', 'system:a2a:main:dinner')).session;
   job = (await new BrowserStore().jobForSession(browser))!;
 });
 afterEach(async () => {
-  delete process.env.GWS_EA_BROWSER_POLICY_FILE;
+  delete process.env.GWS_EA_BROWSER_ROOT;
   await closeDb();
   fs.rmSync(root, { recursive: true, force: true });
 });
@@ -208,7 +207,7 @@ describe('what a batch gives each site', () => {
 
 describe('a disclosure stays with the group whose errand it was recorded for', () => {
   it("lets no other group's errand use main's disclosure, nor record one against main's errand", async () => {
-    writePolicy({ schemaVersion: 2, enabled: true, agentGroupIds: ['main', 'research'] });
+    await configureBrowserAccess(`${root}/browser`, ['research']);
     const research = (await resolveSystemSession('research', 'system:test:research')).session;
     const errand = (await resolveSystemSession('browser', 'system:a2a:research:dinner')).session;
     const theirs = (await new BrowserStore().jobForSession(errand))!;

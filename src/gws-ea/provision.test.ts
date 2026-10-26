@@ -21,9 +21,8 @@ import {
   type StepResource,
 } from './phases.js';
 import { onePasswordHostPaths, onePasswordInstancePaths } from '../modules/gws-ea-browser/onepassword-policy.js';
-import { enableOnePassword, ONEPASSWORD_CONTRACT } from './onepassword.js';
+import { installOnePassword, ONEPASSWORD_CONTRACT } from './onepassword.js';
 import type { AliasStepOptions } from './alias.js';
-import { instanceBrowserPolicyFile } from './browser-capability.js';
 import { getInstanceReservation } from './registry.js';
 import {
   createProductionProvisionSteps,
@@ -335,7 +334,7 @@ describe('step engine', () => {
   it('runs a fresh instance in order, recording when each step started and completed', async () => {
     const engine = await engineFixture();
 
-    await expect(engine.run()).resolves.toEqual({ status: 'ready' });
+    await expect(engine.run()).resolves.toMatchObject({ status: 'ready' });
 
     expect(startedSteps(engine.events)).toEqual([...PROVISION_STEPS]);
     expect(engine.world.applied).toEqual([...PROVISION_STEPS]);
@@ -360,7 +359,7 @@ describe('step engine', () => {
     expect(interrupted.steps.start_onecli).toEqual({ started_at: expect.any(String) });
     expect(interrupted.last_error).toMatchObject({ step: 'start_onecli', code: 'unexpected' });
 
-    await expect(engine.run()).resolves.toEqual({ status: 'ready' });
+    await expect(engine.run()).resolves.toMatchObject({ status: 'ready' });
     expect(engine.world.applied.filter((name) => name === 'start_onecli')).toHaveLength(1);
     const resumed = await engine.journal();
     expect(resumed.steps.start_onecli?.started_at).toBe(interrupted.steps.start_onecli?.started_at);
@@ -378,7 +377,7 @@ describe('step engine', () => {
     };
     engine.world.present.add('host');
 
-    await expect(engine.run()).resolves.toEqual({ status: 'ready' });
+    await expect(engine.run()).resolves.toMatchObject({ status: 'ready' });
     expect(engine.world.applied).toContain('identity');
     expect(engine.world.applied).not.toContain('host');
   });
@@ -388,7 +387,7 @@ describe('step engine', () => {
     engine.world.present.add('provision_gcp');
     engine.world.unknownFor.set('provision_gcp', 2);
 
-    await expect(engine.run()).resolves.toEqual({ status: 'ready' });
+    await expect(engine.run()).resolves.toMatchObject({ status: 'ready' });
     expect(engine.world.applied).not.toContain('provision_gcp');
     expect(engine.sleeps).toEqual([1_000, 2_000]);
     expect(engine.events.filter((event) => event.type === 'step-waiting')).toEqual([
@@ -425,7 +424,7 @@ describe('step engine', () => {
     };
     engine.world.unknownFor.set('provision_gcp', 1);
 
-    await expect(engine.run()).resolves.toEqual({ status: 'ready' });
+    await expect(engine.run()).resolves.toMatchObject({ status: 'ready' });
     expect(engine.world.applied).toContain('provision_gcp');
     expect(engine.sleeps).toEqual([]);
   });
@@ -435,7 +434,7 @@ describe('step engine', () => {
     // Absent before the change, then absent twice more while the change propagates.
     engine.world.startingFor.set('provision_gcp', 3);
 
-    await expect(engine.run()).resolves.toEqual({ status: 'ready' });
+    await expect(engine.run()).resolves.toMatchObject({ status: 'ready' });
     expect(engine.world.applied.filter((name) => name === 'provision_gcp')).toHaveLength(1);
     expect(engine.sleeps).toEqual([1_000, 2_000]);
     expect(engine.events.filter((event) => event.type === 'step-waiting')).toEqual([
@@ -491,7 +490,7 @@ describe('step engine', () => {
     expect((await engine.journal()).steps.provision_gcp?.completed_at).toBeUndefined();
 
     engine.world.pauseOnObserve.clear();
-    await expect(engine.run()).resolves.toEqual({ status: 'ready' });
+    await expect(engine.run()).resolves.toMatchObject({ status: 'ready' });
     expect(engine.world.applied.filter((name) => name === 'provision_gcp')).toHaveLength(1);
   });
 
@@ -500,7 +499,7 @@ describe('step engine', () => {
     engine.world.signInExpiresAfterApply.add('provision_gcp');
     const run = await startRunLog({ paths: engine.paths, command: 'resume', instanceId: engine.instanceId });
 
-    await expect(engine.run(run)).resolves.toEqual({ status: 'ready' });
+    await expect(engine.run(run)).resolves.toMatchObject({ status: 'ready' });
 
     expect(engine.signIns).toEqual(['signed in']);
     expect(engine.world.applied.filter((name) => name === 'provision_gcp')).toHaveLength(1);
@@ -528,7 +527,7 @@ describe('step engine', () => {
     expect(paused.steps.provision_gcp?.completed_at).toBeUndefined();
     expect(paused.last_error).toBeUndefined();
 
-    await expect(engine.run()).resolves.toEqual({ status: 'ready' });
+    await expect(engine.run()).resolves.toMatchObject({ status: 'ready' });
     expect(engine.world.applied.filter((name) => name === 'provision_gcp')).toHaveLength(1);
   });
 
@@ -593,7 +592,7 @@ describe('step engine', () => {
     engine.world.startingFor.set('start_onecli', 2);
     engine.world.observed.length = 0;
     engine.events.length = 0;
-    await expect(engine.run()).resolves.toEqual({ status: 'ready' });
+    await expect(engine.run()).resolves.toMatchObject({ status: 'ready' });
 
     // A first look at each, logged but not shown; only the runtime still starting gets the shown check.
     expect(engine.events.slice(0, 3)).toEqual([
@@ -635,10 +634,10 @@ describe('step engine', () => {
 
   it('repairs a stopped runtime locally only after the bounded wait', async () => {
     const engine = await engineFixture();
-    await expect(engine.run()).resolves.toEqual({ status: 'ready' });
+    await expect(engine.run()).resolves.toMatchObject({ status: 'ready' });
 
     engine.world.present.delete('start_nanoclaw');
-    await expect(engine.run()).resolves.toEqual({ status: 'ready' });
+    await expect(engine.run()).resolves.toMatchObject({ status: 'ready' });
 
     expect(engine.sleeps).toEqual(FULL_WAIT);
     expect(engine.world.applied.filter((name) => name === 'start_nanoclaw')).toHaveLength(2);
@@ -1454,11 +1453,15 @@ describe('production provision step composition', () => {
       }).start_onecli;
       const sleeps: number[] = [];
       const runtime = { sleep: async (milliseconds: number) => void sleeps.push(milliseconds) };
-      await expect(runAlone(operation, context, 'start_onecli', step, runtime)).resolves.toEqual({ status: 'ready' });
+      await expect(runAlone(operation, context, 'start_onecli', step, runtime)).resolves.toMatchObject({
+        status: 'ready',
+      });
       expect(reconcileOnecliRuntime).not.toHaveBeenCalled();
 
       stopped = true;
-      await expect(runAlone(operation, context, 'start_onecli', step, runtime)).resolves.toEqual({ status: 'ready' });
+      await expect(runAlone(operation, context, 'start_onecli', step, runtime)).resolves.toMatchObject({
+        status: 'ready',
+      });
       expect(step.resources[0]!.absentMeansStopped).toBe(true);
       expect(sleeps).toEqual([]);
       expect(reconcileOnecliRuntime).toHaveBeenCalledOnce();
@@ -1534,7 +1537,7 @@ describe('production provision step composition', () => {
         status: 'absent',
         reason: expect.stringContaining('API key'),
       });
-      await expect(runAlone(operation, context, 'start_onecli', step)).resolves.toEqual({ status: 'ready' });
+      await expect(runAlone(operation, context, 'start_onecli', step)).resolves.toMatchObject({ status: 'ready' });
       expect(reconcileOnecliRuntime).toHaveBeenCalledOnce();
       await expect(step.resources[0]!.observe(context)).resolves.toEqual(PRESENT);
     });
@@ -1793,7 +1796,7 @@ describe('production provision step composition', () => {
         observeMainIdentity: async () => (identified ? PRESENT : ABSENT),
       }).start_nanoclaw;
 
-      await expect(runAlone(operation, context, 'start_nanoclaw', step)).resolves.toEqual({ status: 'ready' });
+      await expect(runAlone(operation, context, 'start_nanoclaw', step)).resolves.toMatchObject({ status: 'ready' });
       expect(queryHost).toHaveBeenCalledWith(paths.checkoutRoot(reserved.instance_id));
       expect(waitForHost).not.toHaveBeenCalled();
       expect(reconcileInstanceRuntime).not.toHaveBeenCalled();
@@ -1844,7 +1847,7 @@ describe('production provision step composition', () => {
 
       await expect(
         runAlone(operation, context, 'start_nanoclaw', step, { emit: (event) => void events.push(event) }),
-      ).resolves.toEqual({ status: 'ready' });
+      ).resolves.toMatchObject({ status: 'ready' });
       expect(reconcileInstanceRuntime).toHaveBeenCalledOnce();
       expect(waitForHost).toHaveBeenCalledWith(paths.checkoutRoot(reserved.instance_id), {
         channel: 'gchat',
@@ -1938,10 +1941,14 @@ describe('production provision step composition', () => {
         sleep: async (milliseconds: number) => void sleeps.push(milliseconds),
         emit: (event: RunEvent) => void events.push(event),
       };
-      await expect(runAlone(operation, context, 'start_nanoclaw', step, runtime)).resolves.toEqual({ status: 'ready' });
+      await expect(runAlone(operation, context, 'start_nanoclaw', step, runtime)).resolves.toMatchObject({
+        status: 'ready',
+      });
 
       host = 2;
-      await expect(runAlone(operation, context, 'start_nanoclaw', step, runtime)).resolves.toEqual({ status: 'ready' });
+      await expect(runAlone(operation, context, 'start_nanoclaw', step, runtime)).resolves.toMatchObject({
+        status: 'ready',
+      });
       // The first look, logged but not shown, finds the host starting; the shown check waits for it.
       expect(sleeps).toEqual([1_000]);
       expect(events).toContainEqual({
@@ -1958,7 +1965,9 @@ describe('production provision step composition', () => {
 
       sleeps.length = 0;
       host = 'stopped';
-      await expect(runAlone(operation, context, 'start_nanoclaw', step, runtime)).resolves.toEqual({ status: 'ready' });
+      await expect(runAlone(operation, context, 'start_nanoclaw', step, runtime)).resolves.toMatchObject({
+        status: 'ready',
+      });
       expect(step.resources[0]!.absentMeansStopped).toBe(true);
       expect(sleeps).toEqual([]);
       expect(reconcileInstanceRuntime).toHaveBeenCalledOnce();
@@ -2111,7 +2120,7 @@ describe('create on the release layout', () => {
   it('leaves exactly the release layout: the live link, the release and its links, state, logs, and what is kept', async () => {
     const create = await releaseCreate();
 
-    await expect(create.runReleaseStep()).resolves.toEqual({ status: 'ready' });
+    await expect(create.runReleaseStep()).resolves.toMatchObject({ status: 'ready' });
 
     await expectReleaseLayout(create);
     // The release runs its own agent image, built for it while staging.
@@ -2134,7 +2143,7 @@ describe('create on the release layout', () => {
     await expect(lstat(layout.kept(release))).rejects.toMatchObject({ code: 'ENOENT' });
     await expect(lstat(layout.current)).rejects.toMatchObject({ code: 'ENOENT' });
 
-    await expect(create.runReleaseStep()).resolves.toEqual({ status: 'ready' });
+    await expect(create.runReleaseStep()).resolves.toMatchObject({ status: 'ready' });
 
     // A fresh checkout, installed again: the killed install's work is gone with the release it began.
     expect(create.staging.git.filter((subcommand) => subcommand === 'init')).toHaveLength(2);
@@ -2486,7 +2495,7 @@ describe('production step order and pause outcomes', () => {
     ).resolves.toContain('"providerCredential"');
 
     harness.principal = 'bound';
-    await expect(harness.run()).resolves.toEqual({ status: 'ready' });
+    await expect(harness.run()).resolves.toMatchObject({ status: 'ready' });
     expect(harness.sleeps).toEqual([]);
     expect(harness.effects.filter((effect) => !effect.startsWith('bindPrincipal'))).toEqual([
       'stageRelease',
@@ -2541,7 +2550,7 @@ describe('production step order and pause outcomes', () => {
     expect(harness.binds.map((bind) => bind.chatEmail)).toEqual(['principal@example.test']);
 
     harness.principal = 'bound';
-    await expect(harness.run()).resolves.toEqual({ status: 'ready' });
+    await expect(harness.run()).resolves.toMatchObject({ status: 'ready' });
     expect(harness.binds.map((bind) => bind.chatEmail)).toEqual(['principal@example.test', 'principal@example.test']);
   });
 
@@ -2551,7 +2560,7 @@ describe('production step order and pause outcomes', () => {
     harness.crashAfterBinding = true;
 
     await expect(harness.run()).rejects.toThrow('The process died after binding the principal');
-    await expect(harness.run()).resolves.toEqual({ status: 'ready' });
+    await expect(harness.run()).resolves.toMatchObject({ status: 'ready' });
     expect(harness.effects.filter((effect) => effect === 'bindPrincipal:bound')).toHaveLength(1);
   });
 
@@ -2691,7 +2700,7 @@ describe('production step order and pause outcomes', () => {
     harness.conversationReasons = [];
     harness.conversationReady = true;
     await expect(paused.pause.settled?.()).resolves.toBe(true);
-    await expect(harness.run()).resolves.toEqual({ status: 'ready' });
+    await expect(harness.run()).resolves.toMatchObject({ status: 'ready' });
   });
 
   it('stops waiting on a delivery after a minute, and names it without a watch', async () => {
@@ -2720,7 +2729,7 @@ describe('production step order and pause outcomes', () => {
     });
 
     harness.conversationReady = true;
-    await expect(harness.run()).resolves.toEqual({ status: 'ready' });
+    await expect(harness.run()).resolves.toMatchObject({ status: 'ready' });
     expect(harness.effects.filter((effect) => effect === 'bindPrincipal:bound')).toHaveLength(1);
   });
 });
@@ -2734,16 +2743,16 @@ describe('the vault a new assistant inherits from 1Password enablement', () => {
     const harness = await productionHarness();
     const provider = new FakeOnePassword();
     // Enabled while this assistant was still being created: enable leaves it to its own create.
-    const enabled = await enableOnePassword(
+    const enabled = await installOnePassword(
       harness.paths,
       { accountId: ACCOUNT_ID },
-      { cli: provider.cli(), upsertEnvVars },
+      { cli: provider.cli(), upsertEnvVars, operatorTerminal: true },
     );
     expect(enabled.assistants).toMatchObject([
       { instance_id: harness.instanceId, outcome: 'skipped', reason: 'not_created' },
     ]);
     harness.principal = 'bound';
-    await expect(harness.run()).resolves.toEqual({ status: 'ready' });
+    await expect(harness.run()).resolves.toMatchObject({ status: 'ready' });
     const runtime = harness.lastContext!.input.runtime;
     // Its runtime predates the locator binding; the vault's reconciliation binds it.
     await persistInstanceRuntime(runtime, upsertEnvVars);
@@ -2761,7 +2770,8 @@ describe('the vault a new assistant inherits from 1Password enablement', () => {
       provisionAssistantResources(
         operation,
         { emit: (event) => events.push(event) },
-        { cli: provider.cli(), upsertEnvVars },
+        { cli: provider.cli(), upsertEnvVars, operatorTerminal: true },
+        { skip: true },
       ),
     );
   }
@@ -2769,10 +2779,10 @@ describe('the vault a new assistant inherits from 1Password enablement', () => {
   it('changes nothing and asks nothing on a host without 1Password', async () => {
     const harness = await productionHarness();
     harness.principal = 'bound';
-    await expect(harness.run()).resolves.toEqual({ status: 'ready' });
+    await expect(harness.run()).resolves.toMatchObject({ status: 'ready' });
     const provider = new FakeOnePassword();
     const events: RunEvent[] = [];
-    await expect(finish(harness, provider, events)).resolves.toEqual({ status: 'ready' });
+    await expect(finish(harness, provider, events)).resolves.toMatchObject({ status: 'ready' });
     expect(provider.calls).toEqual([]);
     expect(events).toEqual([]);
   });
@@ -2781,15 +2791,11 @@ describe('the vault a new assistant inherits from 1Password enablement', () => {
     const { harness, provider } = await createdOnEnabledHost();
     const events: RunEvent[] = [];
 
-    await expect(finish(harness, provider, events)).resolves.toEqual({ status: 'ready' });
+    await expect(finish(harness, provider, events)).resolves.toMatchObject({ status: 'ready' });
 
     expect(provider.vaults.size).toBe(1);
     expect([...provider.vaults.values()][0].name).toBe('Assistant assistant@example.com');
-    expect(events).toContainEqual({
-      type: 'step-started',
-      step: 'provision_onepassword',
-      label: "Provisioning the assistant's 1Password vault…",
-    });
+    expect(events).toContainEqual({ type: 'domain-effect', step: 'provision_connectors', changed: true });
     const runtime = harness.lastContext!.input.runtime;
     expect((await readFile(onePasswordInstancePaths(runtime.instance_root).runtimeTokenFile, 'utf8')).trim()).toBe(
       [...provider.serviceAccounts.values()].find((account) => account.access !== 'create_vaults')?.token,
@@ -2799,7 +2805,7 @@ describe('the vault a new assistant inherits from 1Password enablement', () => {
     );
 
     const calls = provider.calls.length;
-    await expect(finish(harness, provider)).resolves.toEqual({ status: 'ready' });
+    await expect(finish(harness, provider)).resolves.toMatchObject({ status: 'ready' });
     // Already provisioned: no request and no desktop prompt.
     expect(provider.calls.length).toBe(calls);
     expect(provider.vaults.size).toBe(1);
@@ -2820,7 +2826,7 @@ describe('the vault a new assistant inherits from 1Password enablement', () => {
     expect(provider.vaults.size).toBe(0);
 
     provider.signedIn = true;
-    await expect(finish(harness, provider)).resolves.toEqual({ status: 'ready' });
+    await expect(finish(harness, provider)).resolves.toMatchObject({ status: 'ready' });
     expect(provider.vaults.size).toBe(1);
   });
 
@@ -2834,8 +2840,9 @@ describe('the vault a new assistant inherits from 1Password enablement', () => {
     };
     const paused = (await finish(harness, provider)) as Extract<ProvisionResult, { status: 'paused' }>;
     expect(paused.pause).toMatchObject({ code: 'onepassword_vault_creation_unproven' });
+    expect(paused.pause.message).toContain('without gws-ea recording it');
     expect(paused.pause.details).toContain(
-      `Then: gws-ea connectors enable onepassword --discard-unproven ${harness.instanceId}`,
+      `Then: gws-ea connectors install onepassword --discard-unproven ${harness.instanceId}`,
     );
   });
 });
@@ -2864,39 +2871,33 @@ describe('the web alias an assistant with the browser enabled gets', () => {
     return { ncl, calls };
   }
 
-  async function readyAssistant(browser: boolean) {
+  async function readyAssistant() {
     const harness = await productionHarness();
     harness.principal = 'bound';
-    await expect(harness.run()).resolves.toEqual({ status: 'ready' });
+    await expect(harness.run()).resolves.toMatchObject({ status: 'ready' });
     const runtime = harness.lastContext!.input.runtime;
     await persistInstanceRuntime(runtime, upsertEnvVars);
-    if (browser) {
-      await mkdir(path.dirname(instanceBrowserPolicyFile(runtime)), { recursive: true, mode: 0o700 });
-      await writeFile(instanceBrowserPolicyFile(runtime), `${JSON.stringify({ schemaVersion: 1, enabled: true })}\n`, {
-        mode: 0o600,
-      });
-    }
     return harness;
   }
 
-  function finish(harness: ProductionHarness, alias: AliasStepOptions, events: RunEvent[] = []) {
+  function finish(harness: ProductionHarness, alias: AliasStepOptions & { skip?: boolean }, events: RunEvent[] = []) {
     return withInstanceOperation(harness.paths, harness.instanceId, (operation) =>
       provisionAssistantResources(operation, { emit: (event) => events.push(event) }, {}, alias),
     );
   }
 
-  it('never pauses for an alias, nor asks the host, while the browser is disabled', async () => {
-    const harness = await readyAssistant(false);
+  it('skips optional identity durably without asking the host', async () => {
+    const harness = await readyAssistant();
     const host = aliasHostNcl();
     const events: RunEvent[] = [];
 
-    await expect(finish(harness, { ncl: host.ncl }, events)).resolves.toEqual({ status: 'ready' });
+    await expect(finish(harness, { ncl: host.ncl, skip: true }, events)).resolves.toMatchObject({ status: 'ready' });
     expect(host.calls).toEqual([]);
     expect(events).toEqual([]);
   });
 
   it('pauses with the candidate claimed once every step is complete', async () => {
-    const harness = await readyAssistant(true);
+    const harness = await readyAssistant();
     const host = aliasHostNcl();
     const events: RunEvent[] = [];
 

@@ -143,7 +143,7 @@ describe('managed result redaction', () => {
       'next_actions',
     ])
       registerSecret(secret);
-    const result = managedResult('connectors install', {
+    const result = managedResult('connectors install voice', {
       outcome: 'failed',
       next_actions: [
         { kind: 'command', argv: ['gws-ea', 'resume', '--id', 'succeeded', '--secrets-file', '--chat-configured'] },
@@ -157,7 +157,7 @@ describe('managed result redaction', () => {
       ],
     });
     expect(JSON.parse(resultJson(result))).toMatchObject({
-      command: 'connectors install',
+      command: 'connectors install voice',
       next_actions: [
         { kind: 'command', argv: ['gws-ea', 'resume', '--id', REDACTED, '--secrets-file', REDACTED] },
         { kind: 'command', argv: ['gws-ea', 'update', `--source-remote=${REDACTED}`, '--quiet'] },

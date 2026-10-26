@@ -214,7 +214,7 @@ async function stopConnector(
 
 export async function settleArtifactsCleanup(
   paths: ControlPlanePaths,
-  instanceId: string,
+  instanceId: string | null,
   initial: ArtifactsCleanup,
   options: {
     readonly fetch?: typeof fetch;
@@ -278,8 +278,8 @@ export async function settleArtifactsCleanup(
         };
         cleanup = { ...cleanup, ownership: recorded };
       }
-      const own = recorded.assistants[instanceId];
-      const currentOwn = live?.assistants[instanceId];
+      const own = instanceId === null ? undefined : recorded.assistants[instanceId];
+      const currentOwn = instanceId === null ? undefined : live?.assistants[instanceId];
       if (
         currentOwn &&
         (currentOwn.applicationId !== own?.applicationId ||
@@ -299,6 +299,8 @@ export async function settleArtifactsCleanup(
           ),
       ];
       const shared = peers.length > 0;
+      if (instanceId === null && shared)
+        throw new GwsEaError('artifacts_shared_in_use', 'Assistant namespace claims still need to be settled.');
       cleanup = {
         ...cleanup,
         completed:
@@ -335,7 +337,9 @@ export async function settleArtifactsCleanup(
         const account = `/accounts/${recorded.accountId}`;
         await step('ingress', async () => {
           if (config.tunnelId && !(await absent(`${account}/cfd_tunnel/${config.tunnelId}`))) {
-            const claim = own?.claim ?? registry.instances[instanceId]?.exclusive_resource_claims.artifacts;
+            const claim =
+              own?.claim ??
+              (instanceId === null ? undefined : registry.instances[instanceId]?.exclusive_resource_claims.artifacts);
             if (claim) await setArtifactsIngress(api, config, claim, false);
           }
         });
@@ -382,7 +386,7 @@ export async function settleArtifactsCleanup(
       if (shared) {
         if (!live) throw new GwsEaError('artifacts_owner_missing', 'Shared ownership record is missing.');
         const assistants = { ...live.assistants };
-        delete assistants[instanceId];
+        if (instanceId !== null) delete assistants[instanceId];
         const dns = Object.fromEntries(
           Object.entries(live.dns).filter(([, record]) => !cleanup.completed.includes(`dns:${record.id}`)),
         );

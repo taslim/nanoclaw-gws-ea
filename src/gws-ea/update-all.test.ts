@@ -55,6 +55,8 @@ import type { NanoclawServiceHelpers } from './service-control.js';
 import { releaseOf, type ReleaseCoordinates } from './types.js';
 import type { UpdatePreview } from './update.js';
 import { registeredReleaseMigrations, type UpdateAllPlan } from './update-all.js';
+import { installOnePassword, ONEPASSWORD_CONTRACT } from './onepassword.js';
+import { ACCOUNT_ID, FakeOnePassword } from './testing/onepassword-fixture.js';
 import { releaseName } from './release-layout.js';
 
 afterEach(async () => {
@@ -175,6 +177,42 @@ async function expectOnRelease(host: Machine, runtime: InstanceRuntimeConfig, co
 }
 
 describe('gws-ea update --all', GIT_HEAVY, () => {
+  it('finishes newly compatible updates without an operator terminal and deduplicates connector setup actions', async () => {
+    const host = await machine();
+    const first = await assistant(host, { port: 37001 });
+    const second = await assistant(host, { port: 37101 });
+    const provider = new FakeOnePassword();
+    await installOnePassword(
+      host.paths,
+      { accountId: ACCOUNT_ID },
+      { cli: provider.cli(), upsertEnvVars: () => undefined, operatorTerminal: true },
+    );
+    const next = await nextRelease(host, {
+      'src/gws-ea/onepassword-compatibility.json': JSON.stringify({ schemaVersion: 1, contract: ONEPASSWORD_CONTRACT }),
+    });
+    const machineFleet = await fleet(host, next, [first, second]);
+    const { run, out } = fleetCli(machineFleet, { onePassword: provider.cli() });
+    const calls = provider.calls.length;
+    expect(await run(['update', '--all', '--yes', '--no-input', '--json'])).toBe(0);
+    const result = JSON.parse(out.join('\n'));
+    expectResultContract('update', result);
+    expect(result).toMatchObject({
+      outcome: 'succeeded',
+      data: {
+        targets: expect.arrayContaining([
+          { instance_id: first.instance_id, outcome: 'completed', update: expect.any(Object) },
+          { instance_id: second.instance_id, outcome: 'completed', update: expect.any(Object) },
+        ]),
+      },
+    });
+    expect(result.next_actions).toEqual([
+      { kind: 'command', argv: ['gws-ea', 'connectors', 'install', 'onepassword'] },
+    ]);
+    expect(provider.calls.length).toBe(calls);
+    expect((await getInstanceReservation(host.paths, first.instance_id)).deployed_commit).toBe(next.commit);
+    expect((await getInstanceReservation(host.paths, second.instance_id)).deployed_commit).toBe(next.commit);
+  });
+
   it('keeps the active assistant interruption handler authoritative and removes bulk handlers afterwards', async () => {
     const host = await machine();
     const first = await assistant(host, { port: 37_001 });

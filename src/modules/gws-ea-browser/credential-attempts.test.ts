@@ -38,7 +38,7 @@ let directory: string;
 let tokenFile: string;
 let fake: FakeOnePassword;
 let vault: BrowserVault;
-let browserPolicyFile: string;
+let browserRoot: string;
 let onePasswordPolicyFile: string;
 const output: string[] = [];
 
@@ -54,7 +54,7 @@ async function writeHostPolicy(enabled: boolean): Promise<void> {
   });
 }
 
-const newVault = (): BrowserVault => new BrowserVault({ browserPolicyFile, onePasswordPolicyFile });
+const newVault = (): BrowserVault => new BrowserVault({ browserRoot, onePasswordPolicyFile });
 const service = (options: { vault?: BrowserVault } = {}): CredentialAttempts =>
   new CredentialAttempts({ db: getDb(), vault: options.vault ?? vault });
 const rows = (): Promise<CredentialAttempt[]> => getDb().all('SELECT * FROM gws_ea_browser_credential_attempts');
@@ -136,7 +136,7 @@ beforeEach(async () => {
   await writeHostPolicy(true);
   const instanceRoot = path.join(directory, INSTANCE_ID.slice(0, 8));
   await mkdir(instanceRoot, { mode: 0o700 });
-  browserPolicyFile = path.join(instanceRoot, 'browser', 'policy.json');
+  browserRoot = path.join(instanceRoot, 'browser');
   await writePrivateFile(
     path.join(instanceRoot, 'state', 'data', 'gws-ea', 'instance.json'),
     JSON.stringify({ schema_version: 1, instance_id: INSTANCE_ID }),
@@ -962,5 +962,33 @@ describe('phases', () => {
     await expect(subject.prepareSignup({ jobId: JOB, origin: ORIGIN, username: 'a\nb' })).rejects.toMatchObject({
       reason: 'invalid_request',
     });
+  });
+});
+
+describe('deleted vault bindings', () => {
+  it('settles durable attempts for a replaced vault without spending provider work or disturbing the new vault', async () => {
+    const subject = service();
+    const attempt = expectPrepared(await subject.prepareSignup({ jobId: JOB, origin: ORIGIN, username: USERNAME }));
+    expect(await subject.save(attempt.id)).toMatchObject({ status: 'saved' });
+    const replacement = 'replacementvault0000000001';
+    const files = onePasswordInstancePaths(path.dirname(browserRoot));
+    await writeOnePasswordResources(files.resourceFile, {
+      schemaVersion: 2,
+      instanceId: INSTANCE_ID,
+      accountId: ACCOUNT_ID,
+      vault: { id: replacement, createdBy: { kind: 'operator' } },
+      operatorGrant: null,
+      runtimeServiceAccountId: RUNTIME_ID,
+      retiredRuntimeServiceAccountIds: [],
+    });
+    fake.calls.length = 0;
+    const restarted = service({ vault: newVault() });
+    expect(await restarted.unresolved()).toEqual([]);
+    expect(await restarted.get(attempt.id)).toMatchObject({
+      phase: 'rejected',
+      evidence_json: JSON.stringify({ reason: 'vault_removed' }),
+    });
+    expect(fake.calls).toEqual([]);
+    expect(await restarted.disclose(attempt.id, { jobId: JOB, origin: ORIGIN })).toMatchObject({ status: 'refused' });
   });
 });

@@ -1,3 +1,4 @@
+import { useAvailableBrowser } from './testing/browser-runtime.js';
 import { createBrowserQueue, recoverAndStartBrowserQueue } from './index.js';
 import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
@@ -64,7 +65,7 @@ import { registerMigration } from '../../db/migrations/index.js';
 import '../gws-ea-profile/index.js';
 import { addPrincipalAddress } from '../gws-ea-profile/db.js';
 import { recordWebAlias } from '../gws-ea-profile/testing/web-alias.js';
-import { writeBrowserAccess } from './testing/browser-access.js';
+import { configureBrowserAccess } from './testing/browser-access.js';
 
 registerMigration(gwsEaInboxMigration);
 registerSignInMailDelivery(() => {
@@ -79,7 +80,8 @@ let nextReply: SignInReply;
 let read: ReturnType<typeof vi.fn>;
 let list: ReturnType<typeof vi.fn>;
 beforeEach(async () => {
-  vi.stubEnv('GWS_EA_BROWSER_POLICY_FILE', `${root}/missing-${randomUUID()}.json`);
+  useAvailableBrowser();
+  vi.stubEnv('GWS_EA_BROWSER_ROOT', `${root}/missing-${randomUUID()}.json`);
   await runMigrations(await initTestDb());
   await getDb().run(
     'UPDATE gws_ea_profile SET assistant_workspace_email = ? WHERE singleton = 1',
@@ -616,7 +618,7 @@ it.each(['fill', 'restart'] as const)(
       'browser',
     );
     // The setting lists a second group: it may use the browser, but its relays reach only its own errands.
-    writeBrowserAccess(`${root}/browser/policy.json`, { agentGroupIds: ['main', 'research'] });
+    await configureBrowserAccess(`${root}/browser`, ['main', 'research']);
     const source = (await resolveSystemSession('main', 'system:principal')).session;
     const research = (await resolveSystemSession('research', 'system:principal')).session;
     const browser = (await resolveSystemSession('browser', 'system:a2a:main:job')).session;

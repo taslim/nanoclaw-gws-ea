@@ -123,6 +123,7 @@ export async function withGoogleSignIn<T>(
 }
 
 export interface HumanDecisions {
+  readonly skipAlias?: boolean;
   /** `--chat-configured`: the operator finished the Google Chat API configuration. */
   readonly chatConfigured: boolean;
   /** `--google-client-file`: the Desktop OAuth client the operator downloaded for the assistant's sign-in. */

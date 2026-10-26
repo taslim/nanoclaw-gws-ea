@@ -23,7 +23,7 @@ import { browserVault, BrowserVaultError, websitePermitsOrigin } from './onepass
 const SECRET = 'fixture-secret-must-stay-host-only';
 beforeEach(() => {
   configureBrowserSiteInfo({ vault: readVaultSiteInfo });
-  vi.stubEnv('GWS_EA_BROWSER_POLICY_FILE', join(tmpdir(), `browser-test-disabled-${randomUUID()}.json`));
+  vi.stubEnv('GWS_EA_BROWSER_ROOT', join(tmpdir(), `browser-test-disabled-${randomUUID()}.json`));
 });
 afterEach(() => {
   vi.unstubAllEnvs();

@@ -20,7 +20,7 @@ import { activeStep } from './run-log.js';
 import { GwsEaError, PROVISION_STEPS, type ProvisionStepId } from './types.js';
 
 /** The phases beyond the journaled steps are optional resources provisioned once every step is complete. */
-export type ProvisionPausePhase = ProvisionStepId | 'provision_onepassword' | 'provision_alias';
+export type ProvisionPausePhase = ProvisionStepId | 'provision_onepassword' | 'provision_artifacts' | 'provision_alias';
 
 export interface ProvisionHumanPause {
   readonly kind: 'human-action';
@@ -31,6 +31,7 @@ export interface ProvisionHumanPause {
   readonly actionUrl?: string;
   /** The alias asked about, or null when one must be named; an answer for a since-changed alias is dropped. */
   readonly aliasCandidate?: string | null;
+  readonly optional?: boolean;
   /** What the resume command adds once the person has acted; with `choices`, the chosen `id` follows it. */
   readonly resumeFlag?: string;
   readonly choices?: readonly { readonly id: string; readonly label: string }[];
@@ -96,7 +97,7 @@ export interface ProvisionRuntime extends StepReporter {
 }
 
 export type ProvisionResult =
-  | { readonly status: 'ready' }
+  | { readonly status: 'ready'; readonly nextActions?: readonly import('./result.js').NextAction[] }
   | { readonly status: 'paused'; readonly pause: ProvisionHumanPause };
 
 type Pause = ProvisionHumanPause | undefined;

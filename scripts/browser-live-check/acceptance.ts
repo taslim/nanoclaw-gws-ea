@@ -44,7 +44,7 @@ export const acceptanceScenarios = [
   'onepassword_owned_change',
   'onepassword_change_refused',
   'onepassword_fresh_login',
-  'onepassword_disable_reenable',
+  'onepassword_uninstall_reinstall',
   'onepassword_scoped_removal',
   'onepassword_pooled_quota',
 ] as const;

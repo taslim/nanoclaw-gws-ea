@@ -12,7 +12,8 @@ import { readPendingSignInSite } from '../gws-ea-inbox/claims.js';
 import { attemptSummary } from './notices.js';
 import { getBrowserAgentGroupId } from '../gws-ea-profile/db.js';
 import type { DbDriver } from '../../db/driver.js';
-import { errandSource, hasBrowserAccess, readHostBrowserPolicy } from './access.js';
+import { browserAvailability } from './availability.js';
+import { errandSource, hasBrowserAccess } from './access.js';
 import { BrowserStore, type BrowserJob } from './db.js';
 import { credentialAttempts, type CredentialAttempt } from './credential-attempts.js';
 import { heldCredentialSites, SiteLeaseStore } from './leases.js';
@@ -426,10 +427,10 @@ export async function sweepBrowserJobSessions(
 export const browserDelegateGuard = defineGuardedAction({
   action: 'gws_ea_browser.delegate',
   async decide({ actor }) {
-    const policy = await readHostBrowserPolicy();
-    if (actor.kind !== 'agent' || !(await hasBrowserAccess(actor.agentGroupId, policy)))
+    const policy = await browserAvailability();
+    if (actor.kind !== 'agent' || !(await hasBrowserAccess(actor.agentGroupId)))
       return DENY('Only an agent with browser access may manage browser jobs.');
-    if (!policy.enabled) return DENY('The operator needs to enable the browser for this assistant.');
+    if (!policy.available) return DENY('Browser is unavailable; ask your operator to check Chrome.');
     return ALLOW('An agent with browser access manages its own browser errands.');
   },
 });
@@ -440,8 +441,8 @@ export function registerBrowserCancellationDelivery(queue: () => BrowserQueue): 
     'cancel_job',
     answeringAction('cancel_job', async (content, session) => {
       if (typeof content.thread !== 'string' || !content.thread) throw invalidArgs('thread is required');
-      if (!(await readHostBrowserPolicy()).enabled)
-        throw forbidden('The operator needs to enable the browser for this assistant.');
+      if (!(await browserAvailability()).available)
+        throw forbidden('Browser is unavailable; ask your operator to check Chrome.');
       configureBrowserCancellation(queue());
       // Each agent cancels only the errands it opened.
       const result = await cancelBrowserJob(content.thread, undefined, session.agent_group_id);

@@ -1,3 +1,4 @@
+import { useAvailableBrowser } from './testing/browser-runtime.js';
 import fs from 'node:fs';
 import Database from 'better-sqlite3';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -129,12 +130,11 @@ describe('standing reservation guarantees through native host delivery', () => {
   let main: Session;
 
   beforeEach(async () => {
+    useAvailableBrowser();
     fs.rmSync(ROOT, { recursive: true, force: true });
     fs.mkdirSync(`${ROOT}/browser`, { recursive: true, mode: 0o700 });
-    fs.writeFileSync(`${ROOT}/browser/policy.json`, JSON.stringify({ schemaVersion: 1, enabled: true }), {
-      mode: 0o600,
-    });
-    process.env.GWS_EA_BROWSER_POLICY_FILE = `${ROOT}/browser/policy.json`;
+
+    process.env.GWS_EA_BROWSER_ROOT = `${ROOT}/browser`;
     await runMigrations(await initTestDb());
     const at = new Date().toISOString();
     for (const id of ['rg-main', 'rg-browser'])
@@ -161,7 +161,7 @@ describe('standing reservation guarantees through native host delivery', () => {
     main = (await resolveSession('rg-main', 'rg-dm', null, 'agent-shared')).session;
   });
   afterEach(async () => {
-    delete process.env.GWS_EA_BROWSER_POLICY_FILE;
+    delete process.env.GWS_EA_BROWSER_ROOT;
     await closeDb();
     fs.rmSync(ROOT, { recursive: true, force: true });
   });

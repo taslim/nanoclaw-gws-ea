@@ -61,7 +61,7 @@ import { openMatter } from '../gws-ea-matters/db.js';
 import '../gws-ea-matters/index.js';
 import './index.js';
 import '../gws-ea-browser/index.js';
-import { writeBrowserAccess } from '../gws-ea-browser/testing/browser-access.js';
+import { configureBrowserAccess } from '../gws-ea-browser/testing/browser-access.js';
 
 const PRINCIPAL_USER = 'gchat:users/pat';
 const PAT = 'pat@northwind.example';
@@ -329,7 +329,7 @@ describe('a sealed browser errand failure', () => {
       agent_provider: null,
       created_at: now(),
     });
-    writeBrowserAccess(`${TEST_DIR}/browser/policy.json`, { agentGroupIds: ['ag-main', 'ag-research'] });
+    await configureBrowserAccess(`${TEST_DIR}/browser`, ['ag-main', 'ag-research']);
     const desk = (await resolveSession('ag-research', null, null, 'agent-shared')).session;
     const errand = (await resolveSystemSession('ag-browser', 'system:a2a:ag-research:desk-job')).session;
     await writeSessionMessage('ag-browser', errand.id, {

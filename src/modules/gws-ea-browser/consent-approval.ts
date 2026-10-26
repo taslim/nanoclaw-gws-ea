@@ -20,7 +20,8 @@ import type { Session } from '../../types.js';
 import { registerApprovalHandler, requestApproval } from '../approvals/index.js';
 import { registerApprovalResolvedHandler, type ApprovalResolvedEvent } from '../approvals/primitive.js';
 import { isVerifiedPrincipalUser, principalApproverUserId } from '../gws-ea-profile/db.js';
-import { hasBrowserAccess, readHostBrowserPolicy } from './access.js';
+import { browserAvailability } from './availability.js';
+import { hasBrowserAccess } from './access.js';
 import { browserDelegateGuard } from './cancel.js';
 import { ERRAND_ORIGIN_LINE, SELLER_TEXT_LIMIT } from './cards.js';
 import {
@@ -67,7 +68,8 @@ export const browserConsentGuard = defineGuardedAction({
       job.cancelled
     )
       return DENY('The browser job is no longer live.');
-    if (!(await readHostBrowserPolicy()).enabled) return DENY('Browser is disabled.');
+    if (!(await browserAvailability()).available)
+      return DENY('Browser is unavailable; ask your operator to check Chrome.');
     const principal = await principalApproverUserId();
     return principal
       ? HOLD('Agreeing to anything beyond a site’s own terms is the principal’s decision.', principal)

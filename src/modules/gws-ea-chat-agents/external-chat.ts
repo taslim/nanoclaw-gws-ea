@@ -1,4 +1,6 @@
 import { getDb } from '../../db/connection.js';
+import { getContainerConfig } from '../../db/container-configs.js';
+import { parseStoredCapabilities } from '../../capabilities.js';
 import { updateContainerConfigJson, updateContainerConfigScalars } from '../../db/container-configs.js';
 import { createAgentFromTemplate } from '../../templates/create-agent.js';
 import {
@@ -17,8 +19,11 @@ import {
 export async function reconcileChatShape(group: string, kind: 'external-chat' | 'job'): Promise<void> {
   await nameAssistantAgent(group);
   await updateContainerConfigScalars(group, { cli_scope: 'disabled' });
+  const selection = parseStoredCapabilities((await getContainerConfig(group))?.capabilities, group);
+  const browser = kind === 'job' && selection !== 'all' && selection.includes('browser-delegate');
   await updateContainerConfigJson(group, 'capabilities', [
     ...(kind === 'external-chat' ? EXTERNAL_CHAT_CAPABILITIES : JOB_CHAT_CAPABILITIES),
+    ...(browser ? ['browser-delegate'] : []),
   ]);
   await updateContainerConfigJson(group, 'skills', [...CHAT_SHARED_SKILLS]);
 }

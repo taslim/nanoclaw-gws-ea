@@ -321,7 +321,7 @@ export function parseOnePasswordCleanup(value: unknown): OnePasswordCleanup | un
 
 type Ownership =
   | { readonly status: 'not_owned'; readonly reason: string }
-  | { readonly status: 'unavailable'; readonly reason: string }
+  | { readonly status: 'unavailable'; readonly reason: string; readonly unverified?: boolean }
   | { readonly status: 'owned'; readonly cli: OnePasswordCli; readonly management: ServiceAccountIdentity };
 
 /** Whether this host may delete the vault, from local records alone, with no 1Password request. */
@@ -373,7 +373,13 @@ async function ownership(
   paths: ControlPlanePaths,
   cleanup: OnePasswordCleanup,
   seams: OnePasswordCliSeams | undefined,
+  rateLimitState?: { limited: boolean },
 ): Promise<Ownership> {
+  if (rateLimitState?.limited)
+    return {
+      status: 'unavailable',
+      reason: '1Password is rate limited; no further provider request is made in this run.',
+    };
   const local = await localOwnership(paths, cleanup);
   if (local.status !== 'owned') return local;
   const opening = await OnePasswordCli.open({ ...seams, command: local.cliPath });
@@ -384,16 +390,20 @@ async function ownership(
     };
   const creator = cleanup.vault_creator ?? '';
   const who = await opening.cli.whoami(local.management);
-  if (who.status === 'failed')
+  if (who.status === 'failed') {
+    if (who.reason === 'rate_limited' && rateLimitState) rateLimitState.limited = true;
     return {
       status: 'unavailable',
+      unverified: isManagementUnavailable(who.reason) || who.reason === 'wrong_account',
       reason: isManagementUnavailable(who.reason)
         ? managementUnavailable(creator, local.management.tokenFile).message
         : `1Password answered ${who.reason.replaceAll('_', ' ')} for the host management service account ${creator}.`,
     };
+  }
   if (who.userId !== creator)
     return {
       status: 'unavailable',
+      unverified: true,
       reason: `The host management token authenticates as another service account than ${creator}, which created the vault; it is never used in its place.`,
     };
   return { status: 'owned', cli: opening.cli, management: local.management };
@@ -414,6 +424,7 @@ export async function previewOnePasswordCleanup(
   paths: ControlPlanePaths,
   cleanup: OnePasswordCleanup,
   seams: OnePasswordCliSeams | undefined,
+  rateLimitState?: { limited: boolean },
 ): Promise<OnePasswordRemovalPreview> {
   const vaultId = cleanup.vault_id;
   const facts = {
@@ -431,7 +442,7 @@ export async function previewOnePasswordCleanup(
       vault: cleanup.vault.outcome,
       reason: cleanup.vault.reason,
     };
-  const owner = await ownership(paths, cleanup, seams);
+  const owner = await ownership(paths, cleanup, seams, rateLimitState);
   if (owner.status === 'not_owned') return { ...base, item_count: null, vault: 'retain', reason: owner.reason };
   const unreadable = (why: string): OnePasswordRemovalPreview =>
     cleanup.selection === 'delete'
@@ -444,10 +455,12 @@ export async function previewOnePasswordCleanup(
       : { ...base, item_count: null, vault: 'retain', reason: `${keptReason(null)} ${why}` };
   if (owner.status === 'unavailable') return unreadable(owner.reason);
   const got = await owner.cli.getVault(owner.management, vaultId);
-  if (got.status === 'failed')
+  if (got.status === 'failed') {
+    if (got.reason === 'rate_limited' && rateLimitState) rateLimitState.limited = true;
     return got.reason === 'not_found'
       ? { ...base, item_count: null, vault: 'gone', reason: 'It is already gone from 1Password.' }
       : unreadable(`1Password answered ${got.reason.replaceAll('_', ' ')} when its items were counted.`);
+  }
   return deletes(got.itemCount, cleanup.selection)
     ? {
         ...base,
@@ -498,6 +511,10 @@ export async function settleOnePasswordCleanup(
   options: {
     readonly seams: OnePasswordCliSeams | undefined;
     readonly record: (next: OnePasswordCleanup) => Promise<void>;
+    /** Host-wide uninstall keeps runtime tokens until its vault has been settled. */
+    readonly deleteRuntimeToken?: boolean;
+    /** Uninstall records an unusable ownership token for manual cleanup; ordinary removal keeps its existing pause. */
+    readonly retainUnverifiedOwnership?: boolean;
   },
 ): Promise<OnePasswordBlock | undefined> {
   let current = cleanup;
@@ -505,7 +522,7 @@ export async function settleOnePasswordCleanup(
     current = next;
     await options.record(next);
   };
-  if (!current.runtime_token) {
+  if (options.deleteRuntimeToken !== false && !current.runtime_token) {
     const { runtimeTokenFile } = onePasswordInstancePaths(paths.instanceRoot(instanceId));
     const present = await exists(runtimeTokenFile);
     // The instance's own file, deleted whatever its mode: it goes with the instance anyway.
@@ -523,6 +540,13 @@ export async function settleOnePasswordCleanup(
   const owner = await ownership(paths, current, options.seams);
   if (owner.status === 'not_owned') return settle('retained', null, owner.reason);
   if (owner.status === 'unavailable') {
+    if (owner.unverified && options.retainUnverifiedOwnership) {
+      await save({
+        ...current,
+        unproven: [...current.unproven, { kind: 'service_account', name: 'GWS-EA management' }],
+      });
+      return settle('retained', null, owner.reason);
+    }
     if (current.selection === 'delete') return blocked(owner.reason);
     return settle('retained', null, `${keptReason(null)} ${owner.reason}`);
   }
@@ -534,6 +558,7 @@ export async function settleOnePasswordCleanup(
         ? settle('deleted', null, 'Removal deleted it.')
         : settle('gone', null, 'It was already gone from 1Password.');
     const why = `1Password answered ${got.reason.replaceAll('_', ' ')} when its items were counted.`;
+    if (got.reason === 'forbidden' && options.retainUnverifiedOwnership) return settle('retained', null, why);
     if (current.selection === 'delete') return blocked(why);
     return settle('retained', null, `${keptReason(null)} ${why}`);
   }
@@ -542,6 +567,14 @@ export async function settleOnePasswordCleanup(
 
   if (!current.deletion_requested_at) await save({ ...current, deletion_requested_at: now() });
   const deleted = await cli.deleteVault(management, vaultId);
+  if (deleted.status === 'failed' && deleted.reason === 'rate_limited')
+    return blocked('1Password is rate limited. Rerun removal once its request limit resets.');
+  if (deleted.status === 'failed' && deleted.reason === 'forbidden' && options.retainUnverifiedOwnership)
+    return settle(
+      'retained',
+      count,
+      '1Password refused deletion by this management account; the vault is retained for manual cleanup.',
+    );
   // Whatever the request answered, only an observed absence counts as deleted.
   const after = await cli.getVault(management, vaultId);
   if (after.status === 'failed' && after.reason === 'not_found')
