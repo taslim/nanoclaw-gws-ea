@@ -280,24 +280,23 @@ function pause(
   return { status: 'paused', pause: { kind: 'human-action', phase: ALIAS_STEP.id, code, message, details, ...extra } };
 }
 
-function aliasesPage(identity: AliasIdentity): string {
-  return `Open ${identity.name} (${identity.email}), then User information > Alternate email addresses (email aliases)`;
-}
-
-const TAKEN_HINT =
-  'If the Admin console says the address is already in use, continue with --alias-taken for the next name';
-const OWN_NAME_HINT = 'To choose the name yourself, continue with --alias <name>';
-
 function addPause(identity: AliasIdentity, address: string): ProvisionResult {
   const at = address.lastIndexOf('@');
   return pause(
     'alias_required',
     `Add ${address} as an alias of ${identity.email} in the Google Admin console, then confirm it.`,
     [
-      aliasesPage(identity),
-      `Add the alternate email ${address.slice(0, at)} on ${address.slice(at + 1)}, then Save`,
-      TAKEN_HINT,
-      OWN_NAME_HINT,
+      '1. Open Google Admin:',
+      `   ${ADMIN_CONSOLE_USERS_URL}`,
+      '',
+      `2. Select ${identity.name} (${identity.email}).`,
+      '   Go to User information > Alternate email addresses (email aliases).',
+      '',
+      '3. Add the alias:',
+      `   Alternate email: ${address.slice(0, at)}`,
+      `   Domain: ${address.slice(at + 1)}`,
+      '',
+      '4. Save, then return here to confirm.',
     ],
     { resumeFlag: '--alias-added', actionUrl: ADMIN_CONSOLE_USERS_URL, aliasCandidate: address },
   );
