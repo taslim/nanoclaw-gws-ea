@@ -883,6 +883,24 @@ async function hostHealth(
   return (dependencies.ncl ?? runInstanceNclJson)(runtime, ['gws-ea-artifacts-health'], { timeoutMs });
 }
 
+async function waitForArtifactListener(
+  runtime: InstanceRuntimeConfig,
+  dependencies: ArtifactsCapabilityDependencies,
+  port: number,
+): Promise<boolean> {
+  const deadline = Date.now() + 30_000;
+  while (Date.now() < deadline) {
+    if (
+      availableHealth(await hostHealth(runtime, dependencies, Math.min(5000, deadline - Date.now())), port) &&
+      Date.now() <= deadline
+    )
+      return true;
+    const remaining = deadline - Date.now();
+    if (remaining > 0) await (dependencies.sleep ?? delay)(Math.min(500, remaining));
+  }
+  return false;
+}
+
 async function provisionArtifactsAssistant(
   paths: ControlPlanePaths,
   instanceId: string,
@@ -916,6 +934,14 @@ async function provisionArtifactsAssistant(
   if (recorded?.publicationReady) {
     const current = await inspectArtifactsCapability(paths, instanceId, { ...dependencies, check: true });
     if (current.ready) return operation(instanceId, recorded.claim, true, false);
+    if (current.activation === 'enabled' && current.remote === 'verified') {
+      if (await waitForArtifactListener(runtime, dependencies, recorded.claim.listen_port))
+        return operation(instanceId, recorded.claim, true, false);
+      throw new GwsEaError(
+        'artifacts_listener_unavailable',
+        'The running assistant has not verified its artifact listener. Its existing artifact configuration is retained.',
+      );
+    }
   }
   await dependencies.recordEffect?.(null);
   const retained = reservation.exclusive_resource_claims.artifacts;
@@ -975,25 +1001,9 @@ async function provisionArtifactsAssistant(
     };
     await writePolicy(policyFile, { ...enabledPolicy, enabled: false });
     await writePolicy(policyFile, enabledPolicy);
-    let listening = false;
-    const readinessDeadline = Date.now() + 30_000;
     // The host module binds asynchronously. Poll for its listener outside the machine lock, and before ingress
     // opens or the connector starts, since the listener depends on neither.
-    while (Date.now() < readinessDeadline) {
-      if (
-        availableHealth(
-          await hostHealth(runtime, dependencies, Math.min(5000, readinessDeadline - Date.now())),
-          claim.listen_port,
-        ) &&
-        Date.now() <= readinessDeadline
-      ) {
-        listening = true;
-        break;
-      }
-      const remaining = readinessDeadline - Date.now();
-      if (remaining > 0) await (dependencies.sleep ?? delay)(Math.min(500, remaining));
-    }
-    if (!listening)
+    if (!(await waitForArtifactListener(runtime, dependencies, claim.listen_port)))
       throw new GwsEaError(
         'artifacts_listener_unavailable',
         'The running assistant has not verified its artifact listener. Artifact ingress remains closed.',

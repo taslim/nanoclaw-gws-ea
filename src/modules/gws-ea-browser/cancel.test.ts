@@ -12,7 +12,7 @@ vi.mock('../../config.js', async (original) => ({
   ...(await original<typeof import('../../config.js')>()),
   DATA_DIR: root,
 }));
-import { closeDb, createAgentGroup, getDb, initTestDb, runMigrations } from '../../db/index.js';
+import { closeDb, createAgentGroup, createPendingApproval, getDb, initTestDb, runMigrations } from '../../db/index.js';
 import { resolveSystemSession } from '../../session-manager.js';
 import type { Session } from '../../types.js';
 import '../gws-ea-profile/index.js';
@@ -25,6 +25,7 @@ import {
   finishBrowserJobCancellation,
   finishRequestedCancellation,
   readBrowserJob,
+  registerBrowserCancellationDelivery,
   sweepBrowserJobSessions,
 } from './cancel.js';
 import { getSession, updateSession } from '../../db/sessions.js';
@@ -33,6 +34,7 @@ import { browserWatchesMigration } from './migration.js';
 import { deliverAction as send, refusal } from './testing/delivery-answer.js';
 import { vaultAccessGuard } from './vault-access.js';
 import { credentialAttempts } from './credential-attempts.js';
+import { browserAvailability } from './availability.js';
 
 let session: Session;
 beforeEach(async () => {
@@ -46,6 +48,17 @@ beforeEach(async () => {
     'browser',
   );
   session = (await resolveSystemSession('browser', 'system:a2a:main:cancel')).session;
+  const queue = createBrowserQueue(new BrowserStore(), {
+    pageForJob: async () => {
+      throw new Error('Cancellation must not open a page');
+    },
+    connection: async () => {
+      throw new Error('Cancellation must not launch Chrome');
+    },
+    closeJob: async () => undefined,
+    onDisconnected: () => () => undefined,
+  });
+  registerBrowserCancellationDelivery(() => queue);
 });
 afterEach(async () => {
   delete process.env.GWS_EA_BROWSER_ROOT;
@@ -333,6 +346,64 @@ describe('an explicitly granted second agent group', () => {
       data: { status: 'cancelled' },
     });
     expect(await readBrowserJob(mainThread)).toMatchObject({ state: 'idle' });
+  });
+
+  it('cancels only its own job while Chrome is unavailable, retaining access and ownership checks', async () => {
+    const job = (await readBrowserJob(researchThread))!.job;
+    await readBrowserJob(mainThread);
+    const at = new Date().toISOString();
+    await getDb().run(
+      `INSERT INTO gws_ea_browser_watches(id,job_id,site,check_recipe_id,check_recipe_version,parameters_json,check_key,bounds_json,status,created_at,updated_at,next_check_at) VALUES('offline-watch',?,'resy.com','recipe',1,'{}','key','{}','awaiting_principal',?,?,?)`,
+      job.id,
+      at,
+      at,
+      at,
+    );
+    await createPendingApproval({
+      approval_id: 'offline-watch-card',
+      request_id: 'offline-watch-setup',
+      action: 'browser_watch_setup',
+      payload: JSON.stringify({ watchId: 'offline-watch' }),
+      created_at: at,
+      title: 'Watch for a table?',
+      options_json: '[]',
+    });
+    vi.mocked(browserAvailability).mockResolvedValue({ available: false, reason: 'chrome-missing' });
+
+    expect(refusal(await send(main, 'cancel_job', { thread: researchThread }))).toBe(
+      'No delegated browser job exists for that thread.',
+    );
+    expect(refusal(await send(other, 'cancel_job', { thread: researchThread }))).toBe(
+      'Only an agent with browser access may manage browser jobs.',
+    );
+    expect(refusal(await send(session, 'cancel_job', { thread: researchThread }))).toBe(
+      'Only an agent with browser access may manage browser jobs.',
+    );
+    await configureBrowserAccess(`${root}/browser`, []);
+    expect(refusal(await send(research, 'cancel_job', { thread: researchThread }))).toBe(
+      'Only an agent with browser access may manage browser jobs.',
+    );
+    await configureBrowserAccess(`${root}/browser`, ['research']);
+    const cancelled = await send(research, 'cancel_job', { thread: researchThread });
+    expect(refusal(cancelled)).toBeUndefined();
+    expect(cancelled).toMatchObject({
+      ok: true,
+      data: { status: 'cancelled', thread: researchThread },
+    });
+    expect(await readBrowserJob(mainThread)).toMatchObject({ state: 'idle' });
+    expect(await readBrowserJob(researchThread)).toMatchObject({ state: 'cancelled' });
+    expect(await getDb().get('SELECT status FROM gws_ea_browser_watches WHERE id=?', 'offline-watch')).toEqual({
+      status: 'cancelled',
+    });
+    expect(
+      await getDb().get('SELECT approval_id FROM pending_approvals WHERE approval_id=?', 'offline-watch-card'),
+    ).toBeUndefined();
+    expect(
+      await guard(browserDelegateGuard, {
+        actor: { kind: 'agent', agentGroupId: research.agent_group_id },
+        payload: {},
+      }),
+    ).toMatchObject({ effect: 'deny' });
   });
 
   it("never lets main reach its jobs, nor it main's", async () => {

@@ -747,6 +747,69 @@ it('provisions a previously stopped assistant through its existing instance oper
   expect(f.restarts).toHaveLength(2);
 });
 
+it('waits for an already activated listener without reprovisioning or restarting authors', async () => {
+  const f = await provisionFixture();
+  await withInstanceOperation(f.paths, f.a.instanceId, (operation) =>
+    provisionAssistantArtifacts(operation, f.dependencies),
+  );
+  const mutations = f.api.requests.filter((request) => request.method !== 'GET').length;
+  const providerReads = f.api.requests.filter((request) => request.resource === '/zones/zone').length;
+  const restarts = f.restarts.length;
+  let probes = 0;
+  let waits = 0;
+  const dependencies = {
+    ...f.dependencies,
+    sleep: async () => {
+      waits += 1;
+    },
+    ncl: async (runtime: typeof f.a.runtime, args: readonly string[]) => {
+      if (args[0] === 'gws-ea-artifacts-health' && ++probes <= 3)
+        return { policyVersions: [1], enabled: true, listener: { state: 'starting' } };
+      return f.dependencies.ncl(runtime, args);
+    },
+  };
+  const result = await withInstanceOperation(f.paths, f.a.instanceId, (operation) =>
+    provisionAssistantArtifacts(operation, dependencies),
+  );
+  expect(result).toMatchObject({ outcome: 'ready', changed: false });
+  expect(waits).toBeGreaterThan(0);
+  expect(f.api.requests.filter((request) => request.resource === '/zones/zone')).toHaveLength(providerReads + 1);
+  expect(f.api.requests.filter((request) => request.method !== 'GET')).toHaveLength(mutations);
+  expect(f.restarts).toHaveLength(restarts);
+});
+
+it('keeps an activated configuration intact when its listener does not recover within the bound', async () => {
+  const f = await provisionFixture();
+  await withInstanceOperation(f.paths, f.a.instanceId, (operation) =>
+    provisionAssistantArtifacts(operation, f.dependencies),
+  );
+  const before = await readArtifactsOperatorConfig(f.files.configFile);
+  const policy = await readFile(instanceArtifactsPolicyFile(f.a.runtime), 'utf8');
+  const mutations = f.api.requests.filter((request) => request.method !== 'GET').length;
+  const restarts = f.restarts.length;
+  let clock = Date.now();
+  const started = clock;
+  vi.spyOn(Date, 'now').mockImplementation(() => clock);
+  const result = await withInstanceOperation(f.paths, f.a.instanceId, (operation) =>
+    provisionAssistantArtifacts(operation, {
+      ...f.dependencies,
+      sleep: async (milliseconds) => {
+        clock += milliseconds;
+      },
+      ncl: async (runtime, args) =>
+        args[0] === 'gws-ea-artifacts-health'
+          ? { policyVersions: [1], enabled: true, listener: { state: 'starting' } }
+          : f.dependencies.ncl(runtime, args),
+    }),
+  );
+  expect(result).toMatchObject({ outcome: 'pending', reason: 'artifacts_listener_unavailable', changed: false });
+  expect(clock - started).toBe(30_000);
+  expect(await readArtifactsOperatorConfig(f.files.configFile)).toEqual(before);
+  expect(await readFile(instanceArtifactsPolicyFile(f.a.runtime), 'utf8')).toBe(policy);
+  expect(f.api.requests.filter((request) => request.method !== 'GET')).toHaveLength(mutations);
+  expect(f.restarts).toHaveLength(restarts);
+});
+
 it('keeps an incomplete profile pending without creating provider resources', async () => {
   const f = await provisionFixture();
   const result = await installArtifactsConnector(

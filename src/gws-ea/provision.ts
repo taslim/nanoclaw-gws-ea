@@ -1461,14 +1461,20 @@ export async function provisionAssistantResources(
         phase: actionable.name === 'onepassword' ? 'provision_onepassword' : 'provision_artifacts',
         code: `${actionable.name}_${actionable.reason}`,
         message: `The assistant is ready; ${actionable.name} setup waits. ${actionable.message}`,
+        ...(actionable.reason === 'operator_sign_in_needed' && onePassword.operatorTerminal === false
+          ? { optional: true }
+          : {}),
         details: [
-          ...connectors.next_actions.flatMap((action) =>
-            action.kind === 'command'
-              ? [
-                  `Then: ${action.argv.join(' ')}${actionable.name === 'onepassword' && ['vault_creation_unproven', 'service_account_creation_unproven'].includes(actionable.reason) ? ` --discard-unproven ${operation.instanceId}` : ''}`,
-                ]
-              : [action.instruction],
-          ),
+          ...connectors.next_actions.flatMap((action) => {
+            if (action.kind !== 'command') return [action.instruction];
+            const discardUnproven =
+              actionable.name === 'onepassword' &&
+              ['vault_creation_unproven', 'service_account_creation_unproven'].includes(actionable.reason) &&
+              action.argv.slice(0, 4).join(' ') === 'gws-ea connectors install onepassword';
+            return [
+              `Then: ${action.argv.join(' ')}${discardUnproven ? ` --discard-unproven ${operation.instanceId}` : ''}`,
+            ];
+          }),
           `Continue with gws-ea resume --id ${operation.instanceId}.`,
         ],
       },

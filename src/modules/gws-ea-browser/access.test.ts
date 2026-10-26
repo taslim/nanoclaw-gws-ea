@@ -1,11 +1,4 @@
-import fs from 'node:fs';
-import { afterEach, beforeEach, expect, it, vi } from 'vitest';
-
-const ROOT = await vi.hoisted(async () => {
-  const { tmpdir } = await import('node:os');
-  const { join } = await import('node:path');
-  return join(tmpdir(), 'browser-policy-tests');
-});
+import { afterEach, beforeEach, expect, it } from 'vitest';
 
 import { closeDb, createAgentGroup, getDb, initTestDb, runMigrations } from '../../db/index.js';
 import '../gws-ea-profile/index.js';
@@ -14,7 +7,6 @@ import { browserAccessGroups, browserDelegators, errandSource, hasBrowserAccess 
 import { ensureContainerConfig, updateContainerConfigJson } from '../../db/container-configs.js';
 
 beforeEach(async () => {
-  fs.mkdirSync(`${ROOT}/browser`, { recursive: true, mode: 0o700 });
   await runMigrations(await initTestDb());
   for (const [id, name] of [
     ['ag-main', 'main'],
@@ -35,7 +27,6 @@ beforeEach(async () => {
 });
 afterEach(async () => {
   await closeDb();
-  fs.rmSync(ROOT, { recursive: true, force: true });
 });
 
 it('always grants main and requires an explicit stored key for every other group', async () => {

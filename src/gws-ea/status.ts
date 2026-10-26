@@ -27,7 +27,7 @@ import {
   type BrowserIsolationObservation,
   type BrowserIsolationInspection,
 } from './browser-isolation.js';
-import { CONNECTOR_NAMES } from './connectors.js';
+import { CONNECTOR_ACTIONS, CONNECTOR_NAMES, connectorDefinition } from './connectors.js';
 import { inspectConnector, type ConnectorObservation, type ConnectorInspection } from './connector-inspection.js';
 import type { ChatSubscriptionState } from '../modules/gws-ea-chat/health.js';
 import { formatLocalTime } from '../timezone.js';
@@ -217,7 +217,7 @@ export interface WebAliasFacts {
 }
 
 export interface BrowserStatus extends ProbeResult {
-  readonly chrome: 'available' | 'missing' | 'not_checked';
+  readonly chrome: 'available' | 'missing' | 'unavailable' | 'not_checked';
   readonly isolation: BrowserIsolationObservation | null;
 }
 
@@ -985,8 +985,15 @@ async function browserProbe(subject: Subject, active: boolean): Promise<BrowserS
       reason:
         availability.reason === 'chrome-missing'
           ? 'Install Google Chrome at /Applications/Google Chrome.app. Ask your operator to install it; gws-ea does not install browsers.'
-          : 'The browser root is unavailable. Ask your operator to inspect this assistant’s state.',
-      chrome: 'missing',
+          : availability.reason === 'chrome-not-launchable'
+            ? 'Chrome is installed but cannot be launched. Ask your operator to inspect its file permissions and diagnostics.'
+            : 'The browser root is unavailable. Ask your operator to inspect this assistant’s state.',
+      chrome:
+        availability.reason === 'chrome-missing'
+          ? 'missing'
+          : availability.reason === 'chrome-not-launchable'
+            ? 'unavailable'
+            : 'not_checked',
       isolation,
     };
   const health = unwrapData(await subject.observers.ncl(requireRuntime(subject.runtime), ['gws-ea-browser-health']));
@@ -1264,16 +1271,48 @@ export async function observeAssistantStatus(
   const serviceObservation = await observeService(context, runtime);
   const active = serviceObservation.state === 'running';
   const connectors = await Promise.all(
-    CONNECTOR_NAMES.map((name) =>
-      inspectConnector(context.paths, name, {
-        ...context.connectorInspection,
-        instanceId,
-        check: active,
-        serviceHelpers: context.serviceHelpers,
-        hostStatus: context.hostStatus,
-        voice: { ...context.connectorInspection?.voice, ncl: observers.ncl },
-      }),
-    ),
+    CONNECTOR_NAMES.map(async (name): Promise<ConnectorObservation> => {
+      try {
+        return await inspectConnector(context.paths, name, {
+          ...context.connectorInspection,
+          instanceId,
+          check: active,
+          serviceHelpers: context.serviceHelpers,
+          hostStatus: context.hostStatus,
+          voice: { ...context.connectorInspection?.voice, ncl: observers.ncl },
+        });
+        // eslint-disable-next-line no-catch-all/no-catch-all -- Each optional connector is an independent observation; invalid local records cannot hide the other status probes.
+      } catch (_error) {
+        const definition = connectorDefinition(name);
+        const reason = `${name} records could not be observed. Ask your operator to inspect its owner-only local configuration.`;
+        return {
+          name,
+          summary: definition.summary,
+          observed_at: observedAt,
+          target: instanceId,
+          actions: CONNECTOR_ACTIONS,
+          scope: definition.scope,
+          account: definition.account,
+          compatibility: 'unknown',
+          prerequisites: definition.prerequisites.map((requirement) => ({ requirement, status: 'unknown', reason })),
+          setup: 'unknown',
+          readiness: { status: 'unknown', checked: false },
+          assistants: [
+            {
+              instance_id: instanceId,
+              compatibility: 'unknown',
+              setup: 'unknown',
+              readiness: { status: 'unknown', checked: false },
+              reasons: [reason],
+              next_actions: [],
+            },
+          ],
+          reasons: [reason],
+          next_actions: [{ kind: 'external', instruction: reason }],
+          details: [],
+        };
+      }
+    }),
   );
 
   const main = once(() => publishedMain(subject));

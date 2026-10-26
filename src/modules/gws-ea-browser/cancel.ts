@@ -1,7 +1,7 @@
 /** Browser job reads as well as cancellation. */
 import { formatLocalTimeWithZone } from '../../timezone.js';
 import { detachBrowserWatchCards } from './watch-state.js';
-import { answeredGuard, answeringAction, forbidden, invalidArgs } from '../../cli/delivery-action.js';
+import { answeredGuard, answeringAction, invalidArgs } from '../../cli/delivery-action.js';
 import { getSession, updateSession } from '../../db/sessions.js';
 import { getDb } from '../../db/connection.js';
 import { registerDeliveryAction } from '../../delivery.js';
@@ -435,19 +435,26 @@ export const browserDelegateGuard = defineGuardedAction({
   },
 });
 
-/** Other delegate actions register their own handlers against the same `browserDelegateGuard`. */
+/** Local job management remains available when the browser prerequisite is unavailable. */
+export const browserManagementGuard = defineGuardedAction({
+  action: 'gws_ea_browser.manage',
+  async decide({ actor }) {
+    if (actor.kind !== 'agent' || !(await hasBrowserAccess(actor.agentGroupId)))
+      return DENY('Only an agent with browser access may manage browser jobs.');
+    return ALLOW('An agent with browser access manages its own browser errands.');
+  },
+});
+
 export function registerBrowserCancellationDelivery(queue: () => BrowserQueue): void {
   registerDeliveryAction(
     'cancel_job',
     answeringAction('cancel_job', async (content, session) => {
       if (typeof content.thread !== 'string' || !content.thread) throw invalidArgs('thread is required');
-      if (!(await browserAvailability()).available)
-        throw forbidden('Browser is unavailable; ask your operator to check Chrome.');
       configureBrowserCancellation(queue());
       // Each agent cancels only the errands it opened.
       const result = await cancelBrowserJob(content.thread, undefined, session.agent_group_id);
       return { status: result.status, thread: result.thread };
     }),
-    answeredGuard(browserDelegateGuard),
+    answeredGuard(browserManagementGuard),
   );
 }

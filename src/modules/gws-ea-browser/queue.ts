@@ -40,7 +40,7 @@ export const browserRequestGuard = defineGuardedAction({
   async decide({ actor }) {
     if (actor.kind !== 'agent' || !actor.sessionId) return DENY('Only a live browser job may use the host browser.');
     if (!(await browserAvailability()).available)
-      return DENY('Browser is unavailable; ask your operator to check Chrome.');
+      return DENY('Browser is unavailable; ask your operator to check the browser root and Chrome.');
     if (!browserAdmissionReady())
       return DENY('The browser is temporarily unavailable; the operator can check browser health.');
     const session = await getSession(actor.sessionId);

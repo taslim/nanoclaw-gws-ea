@@ -160,9 +160,9 @@ export class BrowserWatchScheduler {
       for (const job of jobs) await cancelBrowserJob(job.job_id, this.queue.store);
       return;
     }
-    if (!(await browserAvailability()).available) return;
     await expireBrowserWatches(db);
     await deliverWatchNotices(db);
+    if (!(await browserAvailability()).available) return;
     const rows = await db.all<WatchRow>(
       "SELECT w.* FROM gws_ea_browser_watches w JOIN gws_ea_browser_jobs j ON j.id=w.job_id WHERE w.status='armed' AND j.cancelled=0 AND j.cancel_requested=0 ORDER BY w.next_check_at,w.created_at,w.id",
     );

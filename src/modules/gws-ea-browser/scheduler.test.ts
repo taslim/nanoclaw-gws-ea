@@ -144,6 +144,37 @@ function availability(partySize = 4): Extract<ReservationAvailability, { status:
 }
 const freeCalendar = async () => ({ conflicts: [], conflicts_not_listed: 0, message: 'Free' });
 
+it('expires watches and delivers pending notices without Chrome, without running checks', async () => {
+  await arm('expired-offline', 'expired', 4, 1, bounds.site, {
+    bounds: { until: new Date(Date.now() - 1000).toISOString() },
+  });
+  await arm('notice-offline', 'waiting');
+  await getDb().run(
+    'INSERT INTO gws_ea_browser_watch_notices(watch_id,event_key,outcome_json,created_at) VALUES(?,?,?,?)',
+    'notice-offline',
+    'blocked',
+    JSON.stringify({ status: 'blocked', reason: 'calendar_unavailable' }),
+    new Date().toISOString(),
+  );
+  const { scheduler, checks } = countingScheduler();
+  vi.mocked(browserAvailability).mockResolvedValueOnce({ available: false, reason: 'chrome-missing' });
+
+  await scheduler.tick();
+
+  expect(await getDb().all('SELECT id,status FROM gws_ea_browser_watches ORDER BY id')).toEqual([
+    { id: 'expired-offline', status: 'expired' },
+    { id: 'notice-offline', status: 'armed' },
+  ]);
+  expect(await getDb().all('SELECT watch_id,delivered_at FROM gws_ea_browser_watch_notices ORDER BY watch_id')).toEqual(
+    [
+      { watch_id: 'expired-offline', delivered_at: expect.any(String) },
+      { watch_id: 'notice-offline', delivered_at: expect.any(String) },
+    ],
+  );
+  expect(checks()).toBe(0);
+  expect(await getDb().all('SELECT id FROM gws_ea_browser_watch_checks')).toEqual([]);
+});
+
 it('preserves armed watches and pending cards while Chrome is missing, then checks when it returns', async () => {
   await arm('armed', 'ready');
   await arm('pending', 'pending');

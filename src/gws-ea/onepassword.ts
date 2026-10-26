@@ -800,21 +800,25 @@ export async function installOnePassword(
   if (discard !== undefined && discard !== MANAGEMENT_TARGET && !INSTANCE_ID_PATTERN.test(discard))
     throw invalidArguments(`--discard-unproven must be ${MANAGEMENT_TARGET} or a full assistant ID.`);
   const { inspectOnePasswordUninstall } = await import('./onepassword-uninstall.js');
-  if ((await inspectOnePasswordUninstall(paths)).incomplete)
+  const assertUninstallComplete = async (): Promise<void> => {
+    const inspection = await inspectOnePasswordUninstall(paths);
+    if (!inspection.incomplete) return;
+    const completed = inspection.receipt?.completed === true;
     throw new GwsEaError(
       'onepassword_uninstall_incomplete',
-      'Finish gws-ea connectors uninstall onepassword before installing again.',
+      completed
+        ? 'Inspect the uninstall receipt and finish its manual cleanup on 1Password.com before acknowledging it with gws-ea connectors uninstall onepassword --abandon.'
+        : 'Finish gws-ea connectors uninstall onepassword before installing again.',
+      { details: { uninstall_completed: completed } },
     );
+  };
+  await assertUninstallComplete();
   if (dependencies.operatorTerminal === false)
     throw new GwsEaError('onepassword_operator_sign_in_needed', pendingMessage('operator_sign_in_needed', {}));
   // Nothing on disk changes until a trusted, current CLI is found.
   const cli = await openCli(dependencies.cli);
   return withOnePasswordHostLock(paths, async () => {
-    if ((await inspectOnePasswordUninstall(paths)).incomplete)
-      throw new GwsEaError(
-        'onepassword_uninstall_incomplete',
-        'Finish gws-ea connectors uninstall onepassword before installing again.',
-      );
+    await assertUninstallComplete();
     const effects = new Effects(dependencies.recordEffect);
     const hostPaths = onePasswordHostPaths(paths.configRoot);
     const existing = await readOnePasswordHostPolicy(hostPaths.policyFile);
@@ -1593,6 +1597,19 @@ export function onePasswordRecovery(
       ]);
     }
     case 'onepassword_uninstall_incomplete':
+      return [
+        external,
+        {
+          kind: 'command',
+          argv: [
+            'gws-ea',
+            'connectors',
+            'uninstall',
+            'onepassword',
+            ...(error.details?.uninstall_completed === true ? ['--abandon'] : []),
+          ],
+        },
+      ];
     case 'onepassword_removal_pending':
       return [external, { kind: 'command', argv: ['gws-ea', 'connectors', 'uninstall', 'onepassword'] }];
     case 'onepassword_management_unproven':

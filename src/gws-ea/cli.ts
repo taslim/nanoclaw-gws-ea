@@ -804,7 +804,7 @@ class Cli {
       interaction: options.interaction,
       runtime: options.runtime,
       onePassword: {
-        cli: { ambient: this.#runtime.environment ?? process.env, ...this.#runtime.onePassword },
+        cli: onePasswordSeams(this.#runtime.environment ?? process.env, this.#runtime.onePassword),
         operatorTerminal: Boolean(this.#runtime.prompts),
         rateLimitState: this.#connectorRateLimit,
       },

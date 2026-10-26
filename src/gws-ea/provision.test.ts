@@ -4,6 +4,7 @@ import path from 'node:path';
 import Database from 'better-sqlite3';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { NanoclawServiceHelpers } from './service-control.js';
+import * as connectorProvisioning from './connector-provisioning.js';
 
 import { PauseRequired, pendingActionOf, SignInRequired, type RunEvent } from './events.js';
 import { deriveGcpClaims, deriveGcpProjectId } from './gcp-identity.js';
@@ -2844,6 +2845,59 @@ describe('the vault a new assistant inherits from 1Password enablement', () => {
     expect(paused.pause.details).toContain(
       `Then: gws-ea connectors install onepassword --discard-unproven ${harness.instanceId}`,
     );
+  });
+
+  it('reports operator-only vault setup as optional without calling op from a non-interactive create', async () => {
+    const { harness, provider } = await createdOnEnabledHost();
+    const calls = provider.calls.length;
+    const result = await withInstanceOperation(harness.paths, harness.instanceId, (operation) =>
+      provisionAssistantResources(
+        operation,
+        {},
+        { cli: provider.cli(), upsertEnvVars, operatorTerminal: false },
+        { skip: true },
+      ),
+    );
+    expect(result).toMatchObject({
+      status: 'paused',
+      pause: {
+        code: 'onepassword_operator_sign_in_needed',
+        optional: true,
+        details: expect.arrayContaining(['Then: gws-ea connectors install onepassword']),
+      },
+    });
+    expect(provider.calls).toHaveLength(calls);
+  });
+
+  it('keeps the 1Password discard target off the pending artifacts install command', async () => {
+    const harness = await productionHarness();
+    const provisioning = vi.spyOn(connectorProvisioning, 'provisionInstalledConnectors').mockResolvedValue({
+      pending: [
+        { name: 'onepassword', reason: 'vault_creation_unproven', message: 'Vault creation is unproven.' },
+        { name: 'artifacts', reason: 'setup_pending', message: 'Artifacts setup is pending.' },
+      ],
+      next_actions: [
+        { kind: 'command', argv: ['gws-ea', 'connectors', 'install', 'onepassword'] },
+        { kind: 'command', argv: ['gws-ea', 'connectors', 'install', 'artifacts'] },
+      ],
+    });
+    try {
+      const result = await withInstanceOperation(harness.paths, harness.instanceId, (operation) =>
+        provisionAssistantResources(operation, {}),
+      );
+      expect(result).toMatchObject({
+        status: 'paused',
+        pause: {
+          details: [
+            `Then: gws-ea connectors install onepassword --discard-unproven ${harness.instanceId}`,
+            'Then: gws-ea connectors install artifacts',
+            `Continue with gws-ea resume --id ${harness.instanceId}.`,
+          ],
+        },
+      });
+    } finally {
+      provisioning.mockRestore();
+    }
   });
 });
 

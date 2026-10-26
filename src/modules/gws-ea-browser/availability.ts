@@ -12,7 +12,11 @@ export type BrowserAvailability =
   | { readonly available: true; readonly paths: BrowserPaths; readonly chromePath: string }
   | {
       readonly available: false;
-      readonly reason: 'browser-root-unconfigured' | 'browser-path-unavailable' | 'chrome-missing';
+      readonly reason:
+        | 'browser-root-unconfigured'
+        | 'browser-path-unavailable'
+        | 'chrome-missing'
+        | 'chrome-not-launchable';
     };
 
 export function browserRoot(): string | undefined {
@@ -53,11 +57,14 @@ export async function browserAvailability(
     return { available: false, reason: 'browser-path-unavailable' };
   }
   try {
-    if (!(await stat(chromePath)).isFile()) return { available: false, reason: 'chrome-missing' };
+    if (!(await stat(chromePath)).isFile()) return { available: false, reason: 'chrome-not-launchable' };
     await access(chromePath, constants.X_OK);
   } catch (error) {
     if (!(error instanceof Error)) throw error;
-    return { available: false, reason: 'chrome-missing' };
+    return {
+      available: false,
+      reason: isErrno(error, 'ENOENT') || isErrno(error, 'ENOTDIR') ? 'chrome-missing' : 'chrome-not-launchable',
+    };
   }
   return { available: true, paths, chromePath };
 }
@@ -65,7 +72,13 @@ export async function browserAvailability(
 export function browserUnavailableMessage(
   reason: Extract<BrowserAvailability, { available: false }>['reason'],
 ): string {
-  return reason === 'chrome-missing'
-    ? 'Chrome is not installed in its standard location; ask your operator to install Google Chrome.'
-    : 'The browser is unavailable; ask your operator to check this assistant’s browser state.';
+  switch (reason) {
+    case 'chrome-missing':
+      return 'Chrome is not installed in its standard location; ask your operator to install Google Chrome.';
+    case 'chrome-not-launchable':
+      return 'Chrome is installed but cannot be launched; ask your operator to check its file permissions and diagnostics.';
+    case 'browser-root-unconfigured':
+    case 'browser-path-unavailable':
+      return 'The browser is unavailable; ask your operator to check this assistant’s browser state.';
+  }
 }

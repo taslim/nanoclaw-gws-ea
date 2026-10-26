@@ -9,6 +9,7 @@ import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import * as connectorProvisioning from './connector-provisioning.js';
+import * as productionProvisioning from './provision.js';
 import { runCli, type CliRuntime, type FailureReport } from './cli.js';
 import type { CreatePromptContext } from './create-input.js';
 import { runStep, withPendingAction, type InteractivePrompts, type PauseResponse } from './events.js';
@@ -825,6 +826,35 @@ describe('gws-ea usage', () => {
 });
 
 describe('gws-ea stop summaries and exit codes', () => {
+  it('passes the operator PATH into production create/resume connector provisioning', async () => {
+    const paths = await testPaths();
+    const input = await reserveInstance(paths, reservation());
+    const production = vi
+      .spyOn(productionProvisioning, 'runProductionProvision')
+      .mockResolvedValue({ status: 'paused', pause: DM_PAUSE });
+    try {
+      await runCli(['resume', '--id', input.instance_id], {
+        paths,
+        ...lines().runtime,
+        environment: { PATH: '/operator/custom/bin' },
+        checkPrerequisites: async () => PREREQUISITES,
+        upsertEnvVars: () => undefined,
+        hostStatus: { queryHost: async () => ({}), waitForHost: async () => undefined },
+        serviceHelpers: nanoclawServices({}).helpers,
+      });
+      expect(production).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          onePassword: expect.objectContaining({
+            cli: expect.objectContaining({ searchPath: '/operator/custom/bin' }),
+          }),
+        }),
+      );
+    } finally {
+      production.mockRestore();
+    }
+  });
+
   it('prints the failing step, cause, next action, log paths, and redacted tail, then exits 1', async () => {
     const paths = await testPaths();
     const input = await reserveInstance(paths, reservation());

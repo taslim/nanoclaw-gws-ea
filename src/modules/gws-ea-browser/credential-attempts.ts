@@ -278,14 +278,14 @@ export class CredentialAttempts {
     if (availability.status !== 'available') return;
     const { accountId, vaultId } = availability.binding;
     const removed = await this.db.all<{ readonly id: string }>(
-      `SELECT id FROM ${TABLE} WHERE phase NOT IN ('rejected','finalized') AND (account_id != ? OR vault_id != ?)`,
+      `SELECT id FROM ${TABLE} WHERE phase IN ('preparing','saved') AND (account_id != ? OR vault_id != ?)`,
       accountId,
       vaultId,
     );
     if (!removed.length) return;
     await this.db.run(
       `UPDATE ${TABLE} SET phase = 'rejected', evidence_json = ?, updated_at = ?
-       WHERE phase NOT IN ('rejected','finalized') AND (account_id != ? OR vault_id != ?)`,
+       WHERE phase IN ('preparing','saved') AND (account_id != ? OR vault_id != ?)`,
       JSON.stringify({ reason: 'vault_removed' }),
       now(),
       accountId,

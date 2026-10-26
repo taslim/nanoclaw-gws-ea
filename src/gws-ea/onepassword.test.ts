@@ -15,6 +15,7 @@ import {
   writeOnePasswordResources,
 } from '../modules/gws-ea-browser/onepassword-policy.js';
 import { deriveGcpClaims } from './gcp-identity.js';
+import { inspectConnector } from './connector-inspection.js';
 import type { InteractivePrompts } from './events.js';
 import { captureOnePasswordCleanup } from './onepassword-removal.js';
 import { reserveInstance, withInstanceOperation } from './journal.js';
@@ -1501,7 +1502,23 @@ describe('host-wide 1Password uninstall', () => {
     });
     expect(provider.vaults.size).toBe(1);
     expect((await inspectOnePasswordUninstall(paths)).incomplete).toBe(true);
-    await expect(enable()).rejects.toMatchObject({ code: 'onepassword_uninstall_incomplete' });
+    const blockedInstall = await enable().catch((error: unknown) => error);
+    expect(blockedInstall).toMatchObject({ code: 'onepassword_uninstall_incomplete' });
+    const abandon = {
+      kind: 'command',
+      argv: ['gws-ea', 'connectors', 'uninstall', 'onepassword', '--abandon'],
+    };
+    expect(onePasswordRecovery(blockedInstall)).toContainEqual(abandon);
+    const observation = await inspectConnector(paths, 'onepassword');
+    expect(observation.next_actions).toContainEqual(abandon);
+    expect(observation.next_actions).not.toContainEqual({
+      kind: 'command',
+      argv: ['gws-ea', 'connectors', 'uninstall', 'onepassword'],
+    });
+    expect(onePasswordRecovery(blockedInstall)[0]).toMatchObject({
+      kind: 'external',
+      instruction: expect.stringContaining('manual cleanup'),
+    });
     await uninstallOnePassword(paths, { abandon: true }, { cli: provider.cli() });
     expect((await inspectOnePasswordUninstall(paths)).status).toBe('absent');
   });

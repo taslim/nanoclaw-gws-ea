@@ -145,7 +145,7 @@ async function observeUninstall(paths: ControlPlanePaths, name: ConnectorName): 
         reasons.push(
           `1Password uninstall is incomplete. Its ownership and recovery receipt is ${inspection.receipt_file}.`,
         );
-        actions.push(uninstall(name));
+        if (!inspection.receipt?.completed) actions.push(uninstall(name));
       }
       if (inspection.receipt) {
         for (const generation of [...inspection.receipt.history, inspection.receipt]) {
@@ -167,7 +167,7 @@ async function observeUninstall(paths: ControlPlanePaths, name: ConnectorName): 
         reasons.push(instruction);
         actions.push({ kind: 'external', instruction });
       }
-      if (inspection.status === 'completed')
+      if (inspection.receipt?.completed)
         actions.push({ kind: 'command', argv: ['gws-ea', 'connectors', 'uninstall', name, '--abandon'] });
       return { incomplete: inspection.incomplete, unknown: false, reasons, nextActions: actions };
     }

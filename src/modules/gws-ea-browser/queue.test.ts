@@ -75,7 +75,10 @@ it('rechecks operator enablement for a previously live browser job', async () =>
   expect(await guard(browserRequestGuard, input)).toMatchObject({ effect: 'deny' });
   setBrowserAdmissionReady(true);
   vi.stubEnv('GWS_EA_BROWSER_ROOT', '');
-  expect(await guard(browserRequestGuard, input)).toMatchObject({ effect: 'deny' });
+  expect(await guard(browserRequestGuard, input)).toMatchObject({
+    effect: 'deny',
+    reason: expect.stringMatching(/browser root.*Chrome/),
+  });
 });
 
 const runtime = {

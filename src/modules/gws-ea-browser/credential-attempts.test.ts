@@ -966,6 +966,46 @@ describe('phases', () => {
 });
 
 describe('deleted vault bindings', () => {
+  it.each(['exposed', 'awaiting_verification', 'unknown', 'confirmed', 'conflict', 'rejected', 'finalized'] as const)(
+    'preserves a %s credential attempt when the vault binding changes',
+    async (phase) => {
+      const subject = service();
+      const attempt = expectPrepared(await subject.prepareSignup({ jobId: JOB, origin: ORIGIN, username: USERNAME }));
+      expect(await subject.save(attempt.id)).toMatchObject({ status: 'saved' });
+      expect(await subject.disclose(attempt.id, { jobId: JOB, origin: ORIGIN })).toMatchObject({ status: 'disclosed' });
+      await getDb().run(
+        'UPDATE gws_ea_browser_credential_attempts SET phase=?,evidence_json=? WHERE id=?',
+        phase,
+        JSON.stringify({ outcome: 'recorded-before-vault-change' }),
+        attempt.id,
+      );
+      const files = onePasswordInstancePaths(path.dirname(browserRoot));
+      await writeOnePasswordResources(files.resourceFile, {
+        schemaVersion: 2,
+        instanceId: INSTANCE_ID,
+        accountId: ACCOUNT_ID,
+        vault: { id: 'replacementvault0000000001', createdBy: { kind: 'operator' } },
+        operatorGrant: null,
+        runtimeServiceAccountId: RUNTIME_ID,
+        retiredRuntimeServiceAccountIds: [],
+      });
+      const restarted = service({ vault: newVault() });
+
+      await restarted.unresolved();
+
+      expect(await restarted.get(attempt.id)).toMatchObject({
+        phase,
+        evidence_json: JSON.stringify({ outcome: 'recorded-before-vault-change' }),
+      });
+      if (phase === 'exposed') {
+        await expect(restarted.markUnknown(attempt.id)).resolves.toMatchObject({ phase: 'unknown' });
+        await expect(restarted.markConfirmed(attempt.id, { account_page: 'verified' })).resolves.toMatchObject({
+          phase: 'confirmed',
+        });
+      }
+    },
+  );
+
   it('settles durable attempts for a replaced vault without spending provider work or disturbing the new vault', async () => {
     const subject = service();
     const attempt = expectPrepared(await subject.prepareSignup({ jobId: JOB, origin: ORIGIN, username: USERNAME }));

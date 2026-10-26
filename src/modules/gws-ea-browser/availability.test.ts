@@ -54,6 +54,15 @@ it('keeps an unconfigured host unavailable', async () => {
   });
 });
 
+it('distinguishes an installed Chrome that cannot be launched from a missing binary', async () => {
+  const chrome = path.join(temporary, 'chrome');
+  await writeFile(chrome, '#!/bin/sh\nexit 0\n', { mode: 0o600 });
+  expect(await browserAvailability(temporary, chrome)).toEqual({
+    available: false,
+    reason: 'chrome-not-launchable',
+  });
+});
+
 it('ignores an existing retired policy and leaves its contents untouched', async () => {
   const root = temporary;
   const retiredPolicy = path.join(root, 'policy.json');

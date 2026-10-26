@@ -129,7 +129,7 @@ const probes = object({
     address: nullable(text),
   }),
   browser: probe({
-    chrome: choices('available', 'missing', 'not_checked'),
+    chrome: choices('available', 'missing', 'unavailable', 'not_checked'),
     isolation: nullable(
       object({
         instance_id: text,

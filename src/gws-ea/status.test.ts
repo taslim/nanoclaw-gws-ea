@@ -32,6 +32,7 @@ import { formatLocalTime } from '../timezone.js';
 import { parseInvocation } from './command-parser.js';
 import releaseTracks from './release-tracks.json' with { type: 'json' };
 import * as browserAvailability from '../modules/gws-ea-browser/availability.js';
+import * as connectorInspection from './connector-inspection.js';
 import { useAvailableBrowser } from '../modules/gws-ea-browser/testing/browser-runtime.js';
 import { deriveGcpClaims } from './gcp-identity.js';
 import { acquireInstanceOperation, reserveInstance } from './journal.js';
@@ -612,6 +613,34 @@ interface StatusShape {
 }
 
 describe('status', () => {
+  it('keeps independent observations when one connector cannot be inspected', async () => {
+    const host = await machine();
+    const reservation = await assistant(host, { label: 'alpha', port: 36_001 });
+    const state = world(reservation);
+    const inspect = connectorInspection.inspectConnector;
+    vi.spyOn(connectorInspection, 'inspectConnector').mockImplementation((paths, name, options) => {
+      if (name === 'onepassword') throw new Error(SENTINEL);
+      return inspect(paths, name, options);
+    });
+    const { status, output } = await statusJson(host, state, reservation.instance_id, healthyObservers(state));
+    expect(status.connectors).toContainEqual(
+      expect.objectContaining({
+        name: 'onepassword',
+        setup: 'unknown',
+        readiness: { status: 'unknown', checked: false },
+      }),
+    );
+    expect(status.connectors).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ name: 'voice', setup: 'not_installed' }),
+        expect.objectContaining({ name: 'artifacts', setup: 'not_installed' }),
+      ]),
+    );
+    expect(status.probes.host.status).toBe('ok');
+    expect(status.probes.chat.status).toBe('ok');
+    expect(output.stdout.join('\n')).not.toContain(SENTINEL);
+  });
+
   it.each(['credentials', 'billing', 'unknown'] as const)(
     'keeps a failed main turn (%s) informational beside healthy conversation probes',
     async (cause) => {
@@ -1028,6 +1057,26 @@ describe('status', () => {
       ['onepassword', 'not_installed'],
       ['artifacts', 'not_installed'],
     ]);
+  });
+
+  it('reports installed Chrome permissions independently from the browser root', async () => {
+    const host = await machine();
+    const reservation = await assistant(host, { label: 'alpha', port: 36_001 });
+    const state = world(reservation);
+    vi.mocked(browserAvailability.browserAvailability).mockResolvedValue({
+      available: false,
+      reason: 'chrome-not-launchable',
+    });
+    const observed = await statusJson(host, state, reservation.instance_id, healthyObservers(state));
+    expect(observed.status.probes.browser).toMatchObject({
+      status: 'degraded',
+      chrome: 'unavailable',
+      reason: expect.stringContaining('file permissions'),
+    });
+    expect(observed.nextActions).not.toContainEqual({
+      kind: 'external',
+      instruction: expect.stringContaining('install Google Chrome'),
+    });
   });
 
   it('reports optional web identity independently: not configured, pending confirmation, then configured', async () => {
