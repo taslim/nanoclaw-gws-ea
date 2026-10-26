@@ -70,6 +70,29 @@ export interface OnePasswordUninstallPreview {
     readonly credential_attempts: number | null;
   })[];
 }
+/** Operator-visible deletion decisions, shared by terminal confirmation and paused command output. */
+export function onePasswordUninstallPreviewLines(preview: OnePasswordUninstallPreview): readonly string[] {
+  return preview.vaults.map((vault) => {
+    const intent = (() => {
+      switch (vault.vault) {
+        case 'delete':
+          return vault.owned ? 'DELETE' : 'KEEP (ownership unverified)';
+        case 'retain':
+          return 'KEEP';
+        case 'retained':
+          return 'KEEP (already retained)';
+        case 'deleted':
+          return 'DELETED';
+        case 'gone':
+          return 'GONE';
+        case 'unrecorded':
+          return 'UNRECORDED';
+      }
+    })();
+    return `${intent}: assistant ${vault.instance_id}, vault ${vault.vault_id ?? 'unrecorded'}, items ${vault.item_count ?? 'unknown'}, active credential work ${vault.credential_attempts ?? 'unknown'}, ownership ${vault.owned ? 'proven' : 'not proven'}. ${vault.reason}`;
+  });
+}
+
 export interface OnePasswordUninstallData {
   readonly name: 'onepassword';
   readonly scope: 'host';

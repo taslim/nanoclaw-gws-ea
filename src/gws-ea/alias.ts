@@ -514,6 +514,9 @@ export function aliasNextActions(
 ): readonly import('./result.js').NextAction[] {
   return [
     ...(pause.actionUrl ? [{ kind: 'external' as const, instruction: pause.message, url: pause.actionUrl }] : []),
+    ...(pause.resumeFlag?.includes('<')
+      ? [{ kind: 'external' as const, instruction: `Supply the input requested by ${pause.resumeFlag}.` }]
+      : []),
     {
       kind: 'command',
       argv: [

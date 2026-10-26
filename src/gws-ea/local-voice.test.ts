@@ -620,6 +620,20 @@ describe('shared voice operator lifecycle', () => {
 });
 
 describe('voice readiness observation', () => {
+  it.each([false, true])(
+    'keeps the selected small model in stopped recovery with compatible=%s',
+    async (compatible) => {
+      const runtime = await assistant(33110, compatible);
+      const installation = await assets('small');
+      await policy(installation);
+      const ncl = async () => health();
+      const inspection = await inspectVoiceCapability(paths, { checkConsumers: true, ncl });
+      for (const snapshot of [undefined, inspection])
+        expect((await observeLocalVoice(paths, runtime, ncl, snapshot)).reason).toContain(
+          'gws-ea connectors install voice --model small',
+        );
+    },
+  );
   it.each([false, true])('reuses one inspected snapshot while preserving recent failure=%s', async (failed) => {
     const runtime = await assistant(33100);
     const installation = await assets();
@@ -753,6 +767,57 @@ describe('native public capability journeys', () => {
     });
     return { exit, result: JSON.parse(stdout.join('\n')) as Record<string, unknown>, stderr };
   }
+  it.each(['queued', 'busy', 'unreachable'] as const)(
+    'reports incomplete voice uninstall after %s until owned assets are removed',
+    async (state) => {
+      const runtime = await assistant(34800);
+      const installation = await assets('small');
+      await policy(installation, true);
+      const release = state === 'busy' ? await processLock(paths.instanceLock(runtime.instance_id)) : null;
+      try {
+        await expect(
+          uninstallLocalVoice(paths, {
+            ncl: async () => {
+              if (state === 'unreachable') throw new Error('Host is unreachable');
+              return health({ queued: 1 });
+            },
+            fileHolders: async () => [],
+          }),
+        ).rejects.toMatchObject({
+          code: state === 'busy' ? 'instance_busy' : state === 'queued' ? 'voice_not_drained' : 'voice_drain_unproven',
+        });
+      } finally {
+        release?.();
+      }
+      expect((await lstat(installation.installationDir)).isDirectory()).toBe(true);
+      vi.mocked(verifyVoiceInstallation).mockClear();
+      const recovery = { kind: 'command', argv: ['gws-ea', 'connectors', 'uninstall', 'voice'] };
+      const unfinished = { name: 'voice', setup: 'uninstall_incomplete', next_actions: [recovery] };
+      expect(await invoke(['connectors', 'show', 'voice'])).toMatchObject({ exit: 0, result: { data: unfinished } });
+      expect(await invoke(['connectors', 'list'])).toMatchObject({
+        exit: 0,
+        result: { data: { connectors: expect.arrayContaining([expect.objectContaining(unfinished)]) } },
+      });
+      expect(verifyVoiceInstallation).not.toHaveBeenCalled();
+      expect(hostProbe).not.toHaveBeenCalled();
+      expect(await invoke(['connectors', 'check', 'voice'])).toMatchObject({
+        exit: 1,
+        result: { data: { ...unfinished, readiness: { status: 'not_ready', checked: true } } },
+      });
+      expect(await observeLocalVoice(paths, runtime, async () => health())).toMatchObject({
+        status: 'degraded',
+        assets: 'unknown',
+        reason: expect.stringContaining('gws-ea connectors uninstall voice'),
+      });
+      await uninstallLocalVoice(paths, { ncl: async () => health(), fileHolders: async () => [] });
+      await expect(lstat(installation.installationDir)).rejects.toMatchObject({ code: 'ENOENT' });
+      expect(await invoke(['connectors', 'show', 'voice'])).toMatchObject({
+        exit: 0,
+        result: { data: { setup: 'not_installed' } },
+      });
+      expect(installer.build).not.toHaveBeenCalled();
+    },
+  );
   it('lists local connector records without hashing assets, querying a host, or installing anything', async () => {
     const installation = await assets();
     await policy(installation, true);

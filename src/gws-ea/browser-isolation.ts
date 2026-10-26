@@ -37,17 +37,18 @@ function validListenerPort(value: unknown): value is number {
 }
 
 function observedListeners(health: unknown) {
+  const available = isRecord(health) ? (health.available === undefined ? health.enabled : health.available) : undefined;
   if (
     !isRecord(health) ||
     health.schemaVersion !== 1 ||
-    typeof health.available !== 'boolean' ||
+    typeof available !== 'boolean' ||
     !isRecord(health.proxy) ||
     (health.proxy.state !== 'listening' && health.proxy.state !== 'stopped')
   )
     throw new Error('Invalid browser health');
   const chrome = isRecord(health.chrome) ? health.chrome : undefined;
   return {
-    available: health.available,
+    available,
     proxyState: health.proxy.state,
     proxyPort: validListenerPort(health.proxy.port) ? health.proxy.port : undefined,
     chromeState: typeof chrome?.state === 'string' ? chrome.state : 'unknown',
@@ -106,7 +107,8 @@ export async function inspectBrowserIsolation(
       chrome = {
         ...chrome,
         status: 'unavailable',
-        reason: 'Google Chrome is missing or cannot report its version at the standard installation path.',
+        reason:
+          'Google Chrome could not report its version at the standard installation path. Ask your operator to inspect its file permissions and browser diagnostics.',
       };
     }
     const ncl = options.ncl ?? runInstanceNclJson;

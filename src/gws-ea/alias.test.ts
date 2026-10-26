@@ -17,6 +17,7 @@ import {
 import '../modules/gws-ea-profile/index.js';
 import {
   aliasCandidateAfter,
+  aliasNextActions,
   aliasHost,
   aliasStem,
   ensureAssistantAlias,
@@ -580,10 +581,15 @@ describe('a name that gives no alias', () => {
     const run = (decision?: AliasDecision) =>
       ensureAssistantAlias({ paths, instanceId, host, ...(decision ? { decision } : {}) }, {});
 
-    expect(paused(await run())).toMatchObject({
+    const firstPause = paused(await run());
+    expect(firstPause).toMatchObject({
       code: 'alias_name_required',
       message: expect.stringMatching(/^Name Aaa's web alias: "Aaa" reads the same reversed/u),
       resumeFlag: '--alias <name>',
+    });
+    expect(aliasNextActions(instanceId, firstPause)).toContainEqual({
+      kind: 'external',
+      instruction: 'Supply the input requested by --alias <name>.',
     });
     expect(paused(await run({ kind: 'taken' }))).toMatchObject({ code: 'alias_name_required' });
     expect(paused(await run({ kind: 'named', name: 'juno.web' }))).toMatchObject({ code: 'alias_required' });

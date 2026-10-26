@@ -1126,7 +1126,13 @@ async function localReadiness(
     runtime = await loadInstanceRuntimeConfig(paths.runtimeFile(instanceId));
   } catch (error) {
     if (isErrno(error, 'ENOENT')) return { readiness: { ...base, reason: skipMessage('not_created') } };
-    throw error;
+    if (!(error instanceof Error)) throw error;
+    return {
+      readiness: {
+        ...base,
+        reason: `Assistant runtime configuration is invalid or inaccessible. Inspect gws-ea status --id ${instanceId}.`,
+      },
+    };
   }
   const compatibility = await onePasswordReleaseCompatibility(runtime.checkout_root);
   if (compatibility !== 'compatible')

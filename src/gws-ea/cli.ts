@@ -13,7 +13,11 @@ import {
   type OnePasswordCliSeams,
   type OnePasswordDependencies,
 } from './onepassword.js';
-import { previewOnePasswordUninstall, type OnePasswordUninstallPreview } from './onepassword-uninstall.js';
+import {
+  onePasswordUninstallPreviewLines,
+  previewOnePasswordUninstall,
+  type OnePasswordUninstallPreview,
+} from './onepassword-uninstall.js';
 import os from 'node:os';
 import {
   combineEffects,
@@ -72,6 +76,7 @@ import {
   acquireInstanceOperation,
   loadCreatedRuntime,
   readProvisionJournal,
+  recordAliasSkipped,
   reserveInstance,
   type InstanceOperation,
 } from './journal.js';
@@ -930,6 +935,7 @@ class Cli {
   async #provision(reporter: StepReporter, operation: InstanceOperation, interaction: Interaction): Promise<Outcome> {
     let current = interaction;
     for (;;) {
+      if (current.decisions.skipAlias) await recordAliasSkipped(operation);
       const result = await runStep(reporter, { id: 'provision' }, () =>
         this.#advance(operation, { interaction: current, runtime: reporter }),
       );
@@ -955,6 +961,7 @@ class Cli {
     const operation = await this.#acquire(reporter, instanceId, { command: 'resume' });
     if (!operation) throw busy();
     try {
+      if (interaction.decisions.skipAlias) await recordAliasSkipped(operation);
       await runStep(reporter, PREREQUISITES_STEP, async () => {
         // An instance this launcher cannot continue is refused before sign-in is asked for.
         await readProvisionJournal(this.#paths, instanceId);
@@ -2543,6 +2550,7 @@ export async function runCli(args: readonly string[], runtime: CliRuntime = {}):
       let run: RunLog | undefined;
       let stepLog: string | undefined;
       let actions: readonly NextAction[] = [];
+      let previewLines: readonly string[] = [];
       const stop = observeInterruption(() => ({ changed, data }));
       const recordEffect = (effect: true | null): void => {
         changed = combineEffects(changed, effect);
@@ -2627,6 +2635,7 @@ export async function runCli(args: readonly string[], runtime: CliRuntime = {}):
           });
           data = result;
           paused = result.outcome === 'paused';
+          if (paused) previewLines = onePasswordUninstallPreviewLines(result.preview);
           actions = [
             ...(paused
               ? [
@@ -2661,9 +2670,15 @@ export async function runCli(args: readonly string[], runtime: CliRuntime = {}):
               'assistants' in result
                 ? result.assistants.some((assistant) => assistant.outcome === 'pending')
                 : result.outcome === 'pending';
-            actions = paused
-              ? [{ kind: 'command', argv: ['gws-ea', 'connectors', handler.command, name] }]
-              : [{ kind: 'command', argv: ['gws-ea', 'connectors', 'show', name] }];
+            actions = [
+              {
+                kind: 'command',
+                argv: ['gws-ea', 'connectors', paused ? handler.command : 'show', name],
+              },
+              ...('operator_actions' in result
+                ? result.operator_actions.map((instruction) => ({ kind: 'external' as const, instruction }))
+                : []),
+            ];
           } else
             actions =
               handler.command === 'install' ? [{ kind: 'command', argv: ['gws-ea', 'connectors', 'check', name] }] : [];
@@ -2673,6 +2688,7 @@ export async function runCli(args: readonly string[], runtime: CliRuntime = {}):
           outcome: paused ? 'paused' : 'ready',
           headline: `${name}: ${handler.command}${paused ? ' has pending work' : ' completed'}.`,
           details: [
+            ...previewLines,
             ...(data && 'reason' in data && typeof data.reason === 'string' ? [data.reason] : []),
             ...nextActionLines(actions),
           ],

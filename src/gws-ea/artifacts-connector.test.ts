@@ -4,7 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { claimInstanceArtifacts, getInstanceReservation } from './registry.js';
+import { claimInstanceArtifacts, getInstanceReservation, releaseInstanceArtifacts } from './registry.js';
 import { deriveGcpClaims } from './gcp-identity.js';
 import { reserveInstance, withInstanceOperation } from './journal.js';
 import { resolveControlPlanePaths, type ControlPlanePaths } from './paths.js';
@@ -28,7 +28,7 @@ import {
 } from './artifacts-cloudflare.js';
 import { isRecord } from './validation.js';
 import { readArtifactsPolicy } from '../modules/gws-ea-artifacts/policy.js';
-import { withArtifactsHostLock } from './artifacts-uninstall.js';
+import { uninstallArtifactsConnector, withArtifactsHostLock } from './artifacts-uninstall.js';
 
 const roots: string[] = [];
 afterEach(async () => {
@@ -612,7 +612,7 @@ describe('artifacts operator capability', () => {
     f.api.idps.splice(0);
     const start = f.api.requests.length;
     expect(await inspectArtifactsCapability(f.paths, f.a.instanceId, { ...f.dependencies, check: true })).toMatchObject(
-      { ready: false, remote: 'unavailable' },
+      { ready: false, remote: 'mismatch' },
     );
     expect(f.api.requests.slice(start).every((request) => request.method === 'GET')).toBe(true);
     expect(await readFile(f.files.configFile, 'utf8')).toBe(before);
@@ -888,4 +888,111 @@ it('returns a pending operation hook immediately while the host connector lock i
     expect(result).toMatchObject({ outcome: 'pending', reason: 'artifacts_busy', changed: false });
   });
   expect(f.api.requests).toEqual([]);
+});
+
+it.each([503, 429, 'network', 'reconnecting'] as const)(
+  'keeps a published assistant intact when verification is unavailable (%s)',
+  async (failure) => {
+    const f = await provisionFixture();
+    await withInstanceOperation(f.paths, f.a.instanceId, (operation) =>
+      provisionAssistantArtifacts(operation, f.dependencies),
+    );
+    const config = await readFile(f.files.configFile, 'utf8');
+    const policy = await readFile(instanceArtifactsPolicyFile(f.a.runtime), 'utf8');
+    const restarts = f.restarts.length;
+    const mutations = f.api.requests.filter((request) => request.method !== 'GET').length;
+    const send: typeof fetch = async (input, init) => {
+      if (failure === 'network') throw new Error('An observed transport outage');
+      if (typeof failure === 'number') return Response.json({ success: false }, { status: failure });
+      if (String(input).endsWith('/connections'))
+        return Response.json({ success: true, result: [{ is_pending_reconnect: true }] });
+      return f.api.transport(input, init);
+    };
+    const result = await withInstanceOperation(f.paths, f.a.instanceId, (operation) =>
+      provisionAssistantArtifacts(operation, { ...f.dependencies, fetch: send }),
+    );
+    expect(result).toMatchObject({ outcome: 'pending', changed: false });
+    expect(await readFile(f.files.configFile, 'utf8')).toBe(config);
+    expect(await readFile(instanceArtifactsPolicyFile(f.a.runtime), 'utf8')).toBe(policy);
+    expect(f.api.requests.filter((request) => request.method !== 'GET')).toHaveLength(mutations);
+    expect(f.restarts).toHaveLength(restarts);
+  },
+);
+
+it('releases a newly claimed namespace after provisioning fails before any assistant resource is recorded', async () => {
+  const f = await provisionFixture();
+  const oldClaim = (await getInstanceReservation(f.paths, f.a.instanceId)).exclusive_resource_claims.artifacts;
+  if (!oldClaim) throw new Error('Fixture namespace is missing');
+  await releaseInstanceArtifacts(f.paths, f.a.instanceId, oldClaim);
+  const config = (await readArtifactsOperatorConfig(f.files.configFile))!;
+  await writeArtifactsOperatorConfig(f.files.configFile, { ...config, teamName: 'wrong-team' });
+  const failed = await installArtifactsConnector(f.paths, {}, f.dependencies);
+  expect(failed.assistants).toEqual([
+    expect.objectContaining({ instance_id: f.a.instanceId, outcome: 'pending', reason: 'artifacts_team_invalid' }),
+  ]);
+  expect((await getInstanceReservation(f.paths, f.a.instanceId)).exclusive_resource_claims.artifacts).toBeUndefined();
+  expect((await readArtifactsOperatorConfig(f.files.configFile))?.assistants).toEqual({});
+  expect(await uninstallArtifactsConnector(f.paths, f.dependencies)).toMatchObject({ outcome: 'removed' });
+  const source = path.join(f.paths.configRoot, 'corrected-management-credential');
+  await writeFile(source, 'secret-corrected-management-fixture', { mode: 0o600 });
+  const corrected = await installArtifactsConnector(
+    f.paths,
+    {
+      accountId: 'account',
+      teamName: 'team',
+      zoneId: 'zone',
+      hostname: 'views.example.test',
+      credentialFile: source,
+      cloudflaredPath: process.execPath,
+    },
+    f.dependencies,
+  );
+  expect(corrected.assistants).toEqual([expect.objectContaining({ instance_id: f.a.instanceId, outcome: 'ready' })]);
+});
+
+it('repairs a positively observed Access admission mismatch on a published assistant', async () => {
+  const f = await provisionFixture();
+  await withInstanceOperation(f.paths, f.a.instanceId, (operation) =>
+    provisionAssistantArtifacts(operation, f.dependencies),
+  );
+  const config = (await readArtifactsOperatorConfig(f.files.configFile))!;
+  const assistant = config.assistants[f.a.instanceId];
+  const policies = f.api.policies.get(assistant.applicationId!);
+  if (!policies?.[0]) throw new Error('Fixture policy missing');
+  policies[0].include = [{ email: { email: 'outdated@example.test' } }];
+  expect(await inspectArtifactsCapability(f.paths, f.a.instanceId, { ...f.dependencies, check: true })).toMatchObject({
+    remote: 'mismatch',
+  });
+  const result = await withInstanceOperation(f.paths, f.a.instanceId, (operation) =>
+    provisionAssistantArtifacts(operation, f.dependencies),
+  );
+  expect(result).toMatchObject({ outcome: 'ready', changed: true });
+  expect(await inspectArtifactsCapability(f.paths, f.a.instanceId, { ...f.dependencies, check: true })).toMatchObject({
+    ready: true,
+  });
+});
+
+it('retains an unproven fresh application create until its durable uninstall receipt fences cleanup', async () => {
+  const f = await provisionFixture();
+  const existingClaim = (await getInstanceReservation(f.paths, f.a.instanceId)).exclusive_resource_claims.artifacts;
+  if (!existingClaim) throw new Error('Fixture namespace is missing');
+  await releaseInstanceArtifacts(f.paths, f.a.instanceId, existingClaim);
+  f.api.lose('application');
+  const result = await installArtifactsConnector(f.paths, {}, f.dependencies);
+  expect(result.assistants).toEqual([
+    expect.objectContaining({
+      instance_id: f.a.instanceId,
+      outcome: 'pending',
+      reason: 'artifacts_cloudflare_unavailable',
+    }),
+  ]);
+  const pending = (await readArtifactsOperatorConfig(f.files.configFile))?.pending;
+  expect(pending).toMatchObject({ kind: 'application', target: f.a.instanceId });
+  expect((await getInstanceReservation(f.paths, f.a.instanceId)).exclusive_resource_claims.artifacts).toBeDefined();
+  expect(await uninstallArtifactsConnector(f.paths, f.dependencies)).toMatchObject({ outcome: 'pending' });
+  expect((await getInstanceReservation(f.paths, f.a.instanceId)).exclusive_resource_claims.artifacts).toBeUndefined();
+  expect((await readArtifactsOperatorConfig(f.files.configFile))?.pending).toEqual(pending);
+  await expect(installArtifactsConnector(f.paths, {}, f.dependencies)).rejects.toMatchObject({
+    code: 'artifacts_uninstall_incomplete',
+  });
 });

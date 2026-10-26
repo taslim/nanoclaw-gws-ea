@@ -21,6 +21,7 @@ import {
   onePasswordInstancePaths,
   readOnePasswordHostPolicy,
   readOnePasswordResources,
+  readOnePasswordToken,
 } from '../modules/gws-ea-browser/onepassword-policy.js';
 import {
   creationAttempted,
@@ -392,6 +393,14 @@ async function ownership(
   const who = await opening.cli.whoami(local.management);
   if (who.status === 'failed') {
     if (who.reason === 'rate_limited' && rateLimitState) rateLimitState.limited = true;
+    if (
+      who.reason === 'token_unavailable' &&
+      (await readOnePasswordToken(local.management.tokenFile)).status !== 'absent'
+    )
+      return {
+        status: 'unavailable',
+        reason: `The host management token at ${local.management.tokenFile} could not be read safely. Inspect its owner-only file and directory, then retry.`,
+      };
     return {
       status: 'unavailable',
       unverified: isManagementUnavailable(who.reason) || who.reason === 'wrong_account',

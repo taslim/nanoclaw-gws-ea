@@ -30,6 +30,10 @@ describe('local CLI discovery and grammar', () => {
     expect(await runCli(['help', 'connectors'], root.runtime)).toBe(0);
     expect(root.stdout.join('\n')).toContain('gws-ea help connectors <action> <name>');
     expect(root.stdout.join('\n')).toContain('gws-ea help connectors install voice');
+    expect(root.stdout.join('\n')).toContain('Installation: host; configuration: host; resources: host.');
+    expect(root.stdout.join('\n')).toContain('Installation: host; configuration: host; resources: assistant.');
+    expect(root.stdout.join('\n')).toContain('Every compatible managed assistant; recordings remain private.');
+    expect(root.stdout.join('\n')).toContain('Scope: assistant-or-registry');
     const action = capture();
     expect(await runCli(['help', 'connectors', 'install'], action.runtime)).toBe(0);
     expect(action.stdout.join('\n')).toContain('gws-ea help connectors install <name>');

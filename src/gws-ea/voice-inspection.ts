@@ -11,6 +11,7 @@ import {
   readLocalVoicePolicy,
   voiceReleaseCompatibility,
   VOICE_HEALTH_ARGS,
+  VOICE_UNINSTALL_INCOMPLETE_REASON,
   type ObservedVoiceHealth,
   type VoiceReleaseCompatibility,
 } from './local-voice.js';
@@ -281,23 +282,28 @@ export async function inspectVoiceCapability(
       ),
     );
   const selected = installations.find((installation) => installation.directory === selectedDirectory);
+  const remaining = installations.filter((installation) => installation.status !== 'absent');
   const assets: VoiceCapabilityObservation['assets'] = {
     status:
       activation.status === 'unknown'
         ? 'unknown'
         : selectedDirectory === null
-          ? 'absent'
+          ? remaining.length
+            ? 'recorded'
+            : 'absent'
           : (selected?.status ?? 'invalid'),
     reason:
       activation.status === 'unknown'
         ? 'The selected installation cannot be observed from the policy.'
-        : selectedDirectory !== null && !selected
-          ? 'Selected assets are outside this recipe-owned host cache.'
-          : (selected?.reason ?? null),
+        : selectedDirectory === null && activation.status === 'disabled' && remaining.length
+          ? VOICE_UNINSTALL_INCOMPLETE_REASON
+          : selectedDirectory !== null && !selected
+            ? 'Selected assets are outside this recipe-owned host cache.'
+            : (selected?.reason ?? null),
     selected_directory: selectedDirectory,
     // Directory identity retains the operator's selection; provenance separately proves verified assets.
     selected_model: selected?.model ?? null,
-    installations: installations.filter((installation) => installation.status !== 'absent'),
+    installations: remaining,
     provenance: selected?.receipt ?? null,
   };
   const consumers = await inspectVoiceConsumers(paths, options);

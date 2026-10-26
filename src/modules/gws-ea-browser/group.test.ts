@@ -101,10 +101,10 @@ it('keeps main guidance stable while browser availability changes', async () => 
   expect(guidance).toContain('there is no way to use card details sent to you');
   expect(guidance).toContain('adds one on the site or finishes checkout themselves');
   expect(guidance).toContain(
-    'If `browser` is an unknown destination, ask the principal’s operator to check this group’s browser access grant.',
+    'If `browser` is unknown in main, tell the principal to ask their operator to configure the browser root; elsewhere, to check the group’s access grant.',
   );
   expect(guidance).toContain(
-    'If the host explicitly reports that Chrome is unavailable, ask the operator to check Chrome.',
+    'If the host reports Chrome unavailable, tell the principal to ask their operator to check Chrome.',
   );
   expect(guidance).toContain(
     "only to a site the principal's request names, or the booking platform embedded in that site",

@@ -287,3 +287,81 @@ it('fails closed on unreadable ownership and malformed receipts instead of repor
   await expect(inspectArtifactsUninstall(f.paths)).rejects.toMatchObject({ code: 'artifacts_uninstall_invalid' });
   expect(f.mutations).toEqual([]);
 });
+
+async function claimWithoutResources(f: Awaited<ReturnType<typeof fixture>>) {
+  const id = randomUUID();
+  await reserveInstance(f.paths, {
+    instance_id: id,
+    release_track: 'dogfood',
+    source_remote: 'https://example.test/repo.git',
+    deployed_commit: 'a'.repeat(40),
+    allocated_ports: { onecli_app: 48000, onecli_gateway: 48001 },
+    exclusive_resource_claims: {
+      ...deriveGcpClaims(id),
+      gcp_account: 'operator@example.test',
+      workspace_email: 'unprovisioned@example.test',
+      onecli_project: `gws-ea-${id.replaceAll('-', '')}`,
+    },
+  });
+  await claimInstanceArtifacts(f.paths, id, {
+    hostname: 'views.example.com',
+    path_prefix: '/unprovisioned',
+    listen_port: 48002,
+  });
+  return id;
+}
+
+it('uninstalls a host with a namespace claim but no assistant remote resource record', async () => {
+  const f = await fixture(0);
+  const id = await claimWithoutResources(f);
+  const result = await uninstallArtifactsConnector(f.paths, f.dependencies);
+  expect(result).toMatchObject({ outcome: 'removed', changed: true });
+  expect((await readRegistry(f.paths)).instances[id].exclusive_resource_claims.artifacts).toBeUndefined();
+  expect(f.resources.size).toBe(0);
+  expect(await readArtifactsOperatorConfig(f.files.configFile)).toBeUndefined();
+  expect(await inspectArtifactsUninstall(f.paths)).toBeUndefined();
+});
+
+it('releases a claim with no configuration or local resource policy without contacting Cloudflare', async () => {
+  const f = await fixture(0);
+  const id = await claimWithoutResources(f);
+  await rm(f.files.configFile);
+  const result = await uninstallArtifactsConnector(f.paths, {
+    fetch: async () => {
+      throw new Error('A claim alone owns no remote resources');
+    },
+  });
+  expect(result).toMatchObject({ outcome: 'removed', changed: true });
+  expect((await readRegistry(f.paths)).instances[id].exclusive_resource_claims.artifacts).toBeUndefined();
+});
+
+it('keeps an unproven application creation fenced after releasing its resource-free namespace claim', async () => {
+  const f = await fixture(0);
+  const id = await claimWithoutResources(f);
+  const pending = {
+    kind: 'application' as const,
+    key: randomUUID(),
+    target: id,
+    startedAt: new Date().toISOString(),
+    resource: '/accounts/account/access/apps',
+    fingerprint: 'b'.repeat(64),
+  };
+  await writeArtifactsOperatorConfig(f.files.configFile, { ...f.config, pending });
+  expect(await uninstallArtifactsConnector(f.paths, f.dependencies)).toMatchObject({ outcome: 'pending' });
+  expect((await readRegistry(f.paths)).instances[id].exclusive_resource_claims.artifacts).toBeUndefined();
+  expect((await inspectArtifactsUninstall(f.paths))?.shared.ownership.pending).toEqual(pending);
+  expect(await exists(f.config.credentialFile)).toBe(true);
+  await expect(installArtifactsConnector(f.paths, {}, f.dependencies)).rejects.toMatchObject({
+    code: 'artifacts_uninstall_incomplete',
+  });
+});
+
+it('returns operator token revocation and original credential-file cleanup after uninstall completes', async () => {
+  const f = await fixture(1);
+  const result = await uninstallArtifactsConnector(f.paths, f.dependencies);
+  expect(result).toMatchObject({ outcome: 'removed', operator_actions: [expect.stringContaining('Revoke')] });
+  expect(result.operator_actions.join(' ')).toContain('Cloudflare');
+  expect(result.operator_actions.join(' ')).toContain('--credential-file');
+  expect(result.operator_actions.join(' ')).toContain('delete');
+  expect(await exists(f.config.credentialFile)).toBe(false);
+});

@@ -68,7 +68,12 @@ export function helpLines(command?: DiscoveryTarget): readonly string[] {
       '',
       'Scope: each registered command declares host or assistant ownership.',
       'Commands:',
-      ...command.commands.map((definition) => `  ${definition.path.join(' ')}  ${definition.summary}`),
+      ...command.commands.flatMap((definition) => [
+        `  ${definition.path.join(' ')}  ${definition.summary}`,
+        ...(definition.handler.kind === 'connector'
+          ? [`    Scope: ${definition.scope}`, ...definition.effects.map((effect) => `    ${effect}`)]
+          : []),
+      ]),
       '',
       `Run gws-ea help ${target} for effects, prerequisites, and recovery.`,
       ...(command.path[0] === 'connectors'

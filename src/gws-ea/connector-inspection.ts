@@ -90,9 +90,12 @@ const readiness = (checked: boolean, ready = false): ConnectorReadiness => ({
   status: checked ? (ready ? 'ready' : 'not_ready') : 'not_checked',
   checked,
 });
-const repair = (name: ConnectorName): NextAction => ({
+const repair = (
+  name: ConnectorName,
+  model?: VoiceCapabilityObservation['assets']['selected_model'],
+): Extract<NextAction, { kind: 'command' }> => ({
   kind: 'command',
-  argv: ['gws-ea', 'connectors', 'install', name],
+  argv: ['gws-ea', 'connectors', 'install', name, ...(name === 'voice' && model ? ['--model', model] : [])],
 });
 const uninstall = (name: ConnectorName): NextAction => ({
   kind: 'command',
@@ -261,6 +264,7 @@ export async function inspectConnector(
   if (options.instanceId) await getInstanceReservation(paths, options.instanceId);
   const ids = options.instanceId ? [options.instanceId] : Object.keys((await readRegistry(paths)).instances).sort();
   const removal = await observeUninstall(paths, name);
+  let uninstallIncomplete = removal.incomplete;
   const canCheck = checked && !removal.incomplete && !removal.unknown;
   const unavailable = new Set<string>();
   if (canCheck)
@@ -279,6 +283,7 @@ export async function inspectConnector(
   let compatible: ConnectorCompatibility = 'compatible';
   let hostReady = false;
   let needsRepair = false;
+  let installRecovery = repair(name);
   let details: ConnectorObservation['details'];
   if (name === 'voice') {
     const ncl = options.voice?.ncl ?? runInstanceNclJson;
@@ -297,8 +302,18 @@ export async function inspectConnector(
       },
     });
     details = voice;
-    setup =
-      voice.assets.status === 'absent'
+    installRecovery = repair(name, voice.assets.selected_model);
+    if (
+      voice.activation.status === 'disabled' &&
+      voice.assets.selected_directory === null &&
+      voice.assets.installations.length > 0
+    ) {
+      uninstallIncomplete = true;
+      hostActions.push(uninstall(name));
+    }
+    setup = uninstallIncomplete
+      ? 'uninstall_incomplete'
+      : voice.assets.status === 'absent'
         ? 'not_installed'
         : voice.assets.status === 'invalid'
           ? 'failed'
@@ -312,7 +327,7 @@ export async function inspectConnector(
     if (voice.activation.reason) reasons.push(voice.activation.reason);
     if (voice.assets.reason) reasons.push(voice.assets.reason);
     if (setup === 'installed' && voice.activation.status === 'disabled') {
-      reasons.push('Installed, stopped. Run gws-ea connectors install voice to make recognition available.');
+      reasons.push(`Installed, stopped. Run ${installRecovery.argv.join(' ')} to make recognition available.`);
       needsRepair = true;
     }
     for (const assistant of voice.assistants) {
@@ -324,15 +339,16 @@ export async function inspectConnector(
         setup,
         readiness: readiness(observed, assistant.readiness === 'ready'),
         reasons: assistant.reason ? [assistant.reason] : [],
-        next_actions:
-          assistant.compatibility === 'unsupported'
+        next_actions: uninstallIncomplete
+          ? [uninstall(name)]
+          : assistant.compatibility === 'unsupported'
             ? [update(assistant.instance_id)]
             : unavailable.has(assistant.instance_id)
               ? [start(assistant.instance_id)]
               : assistant.compatibility === 'unknown'
                 ? [status(assistant.instance_id)]
                 : observed && assistant.readiness !== 'ready'
-                  ? [repair(name)]
+                  ? [installRecovery]
                   : [],
       });
     }
@@ -485,7 +501,7 @@ export async function inspectConnector(
     }
     details = observations;
   }
-  if (removal.incomplete) setup = 'uninstall_incomplete';
+  if (uninstallIncomplete) setup = 'uninstall_incomplete';
   else if (removal.unknown) setup = 'unknown';
   if (setup === 'not_installed') reasons.push(`${name} is not installed.`);
   const selected = options.instanceId
@@ -503,8 +519,8 @@ export async function inspectConnector(
           assistant.readiness.status === 'ready',
       );
   const ready = hostReady && targetReady && setup === 'installed';
-  if (!removal.incomplete && !removal.unknown && (needsRepair || setup !== 'installed' || (checked && !hostReady)))
-    hostActions.push(repair(name));
+  if (!uninstallIncomplete && !removal.unknown && (needsRepair || setup !== 'installed' || (checked && !hostReady)))
+    hostActions.push(installRecovery);
   return {
     name,
     summary: definition.summary,

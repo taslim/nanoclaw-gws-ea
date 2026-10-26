@@ -282,7 +282,7 @@ export const ARTIFACTS_CAPABILITY_SCHEMA = object({
   hostname: nullable(text),
   path_prefix: nullable(text),
   policy_file: text,
-  remote: choices('not_checked', 'verified', 'unavailable'),
+  remote: choices('not_checked', 'verified', 'mismatch', 'unavailable'),
   listener: choices('not_checked', 'listening', 'unavailable'),
   ready: bool,
   reason: nullable(text),
@@ -537,6 +537,7 @@ export const CONNECTOR_OPERATION_SCHEMA = {
       changed: bool,
       reason: nullable(text),
       receipt_file: nullable(text),
+      operator_actions: array(text),
     }),
   ],
 };

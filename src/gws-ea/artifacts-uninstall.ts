@@ -13,7 +13,7 @@ import type { ArtifactsCapabilityDependencies } from './artifacts-connector.js';
 import { preparePrivateDirectory, type ControlPlanePaths } from './paths.js';
 import { readRegistry, releaseInstanceArtifacts, withMachineLock } from './registry.js';
 import { readOwnerOnlyJson, removePrivateFile, writePrivateTextFile } from './secrets.js';
-import { GwsEaError } from './types.js';
+import { GwsEaError, type ArtifactsNamespaceClaim } from './types.js';
 import { INSTANCE_ID_PATTERN, isRecord } from './validation.js';
 
 export interface ArtifactsUninstallReceipt {
@@ -34,6 +34,7 @@ export interface ArtifactsConnectorUninstallData {
   readonly changed: boolean;
   readonly reason: string | null;
   readonly receipt_file: string | null;
+  readonly operator_actions: readonly string[];
 }
 
 export function artifactsUninstallFile(paths: Pick<ControlPlanePaths, 'configRoot'>): string {
@@ -164,22 +165,41 @@ export async function uninstallArtifactsConnector(
           'artifacts_busy',
           'The assistant registry changed while artifacts uninstall acquired its locks. Retry uninstall.',
         );
-      if (
-        !receipt &&
-        !config &&
-        Object.values(currentRegistry.instances).some((reservation) => reservation.exclusive_resource_claims.artifacts)
-      )
-        throw new GwsEaError('artifacts_owner_missing', 'A claimed artifact namespace has no owned resource record.');
-      if (!receipt && !config)
+      const unrecordedClaims: { readonly instanceId: string; readonly claim: ArtifactsNamespaceClaim }[] = [];
+      for (const reservation of Object.values(currentRegistry.instances)) {
+        const claim = reservation.exclusive_resource_claims.artifacts;
+        if (!claim || config?.assistants[reservation.instance_id] || receipt?.assistants[reservation.instance_id])
+          continue;
+        const policy = await readArtifactsPolicy(
+          path.join(paths.instanceRoot(reservation.instance_id), 'artifacts', 'policy.json'),
+        );
+        if (policy.status === 'unavailable' || policy.config)
+          throw new GwsEaError(
+            'artifacts_owner_missing',
+            'A claimed artifact namespace has local resources but no owned resource record.',
+          );
+        unrecordedClaims.push({ instanceId: reservation.instance_id, claim });
+      }
+      const releaseUnrecordedClaims = async (): Promise<void> => {
+        for (const { instanceId, claim } of unrecordedClaims) {
+          await dependencies.recordEffect?.(null);
+          await releaseInstanceArtifacts(paths, instanceId, claim);
+          await effect();
+        }
+      };
+      if (!receipt && !config) {
+        await releaseUnrecordedClaims();
         return {
           name: 'artifacts',
           scope: 'host',
           installed: false,
           outcome: 'removed',
-          changed: false,
+          changed,
           reason: null,
           receipt_file: null,
+          operator_actions: [],
         };
+      }
       if (!receipt) {
         if (!config) throw new GwsEaError('artifacts_owner_missing', 'Artifacts ownership is unavailable.');
         const assistants: Record<string, ArtifactsCleanup> = {};
@@ -199,12 +219,6 @@ export async function uninstallArtifactsConnector(
             sharedRetained: false,
           };
         }
-        if (
-          Object.values(currentRegistry.instances).some(
-            (reservation) => reservation.exclusive_resource_claims.artifacts && !assistants[reservation.instance_id],
-          )
-        )
-          throw new GwsEaError('artifacts_owner_missing', 'A claimed artifact namespace has no owned resource record.');
         receipt = {
           schemaVersion: 1,
           started_at: new Date().toISOString(),
@@ -218,6 +232,7 @@ export async function uninstallArtifactsConnector(
         await recordReceipt(paths, receipt);
         await effect();
       }
+      await releaseUnrecordedClaims();
       if (!receipt.stopped) {
         for (const id of ids) {
           const file = path.join(paths.instanceRoot(id), 'artifacts', 'policy.json');
@@ -268,6 +283,7 @@ export async function uninstallArtifactsConnector(
             changed,
             reason: blocked.reason,
             receipt_file: artifactsUninstallFile(paths),
+            operator_actions: [],
           };
         }
         const owned = cleanup.ownership.assistants[id];
@@ -300,6 +316,7 @@ export async function uninstallArtifactsConnector(
             changed,
             reason: blocked.reason,
             receipt_file: artifactsUninstallFile(paths),
+            operator_actions: [],
           };
         }
       }
@@ -313,6 +330,9 @@ export async function uninstallArtifactsConnector(
         changed,
         reason: null,
         receipt_file: null,
+        operator_actions: [
+          `Revoke the Cloudflare management API token for account ${receipt.shared.ownership.accountId}, then delete the original operator credential file supplied with --credential-file. gws-ea removed its stored credential copy.`,
+        ],
       };
     });
   });

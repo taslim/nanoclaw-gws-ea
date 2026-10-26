@@ -1032,6 +1032,114 @@ describe('status', () => {
     });
   });
 
+  it.each([
+    { health: { enabled: true }, status: 'ok' },
+    { health: { available: false, enabled: true }, status: 'degraded' },
+  ] as const)(
+    'reads deployed browser health with current availability taking precedence: %j',
+    async ({ health, status }) => {
+      const host = await machine();
+      const reservation = await assistant(host, { label: 'alpha', port: 36001 });
+      const state = world(reservation);
+      const healthy = healthyObservers(state);
+      const observed = await statusJson(host, state, reservation.instance_id, {
+        ...healthy,
+        ncl: async (runtime, args) =>
+          args.join(' ') === 'gws-ea-browser-health'
+            ? { schemaVersion: 1, ...health, proxy: { state: 'stopped' }, chrome: { state: 'stopped' } }
+            : healthy.ncl(runtime, args),
+      });
+      expect(observed.status.probes.browser.status).toBe(status);
+      expect(observed.status.probes.external_email.status).toBe('ok');
+    },
+  );
+
+  it.each([false, true])(
+    'reports local missing Chrome on a stopped assistant without browser queries, details=%s',
+    async (details) => {
+      const host = await machine();
+      const reservation = await assistant(host, { label: 'alpha', port: 36001 });
+      const state = world(reservation);
+      state.active.clear();
+      state.serving.clear();
+      vi.mocked(browserAvailability.browserAvailability).mockResolvedValue({
+        available: false,
+        reason: 'chrome-missing',
+      });
+      const healthy = healthyObservers(state);
+      const ncl = vi.fn(healthy.ncl);
+      const runCommand = vi.fn(async () => ({ exitCode: 0, stdout: '', stderr: '' }));
+      const invocation = command(host, state, { ...healthy, ncl });
+      expect(
+        await runStatusCommand(
+          { ...invocation.runtime, browserInspection: { runCommand } },
+          { instanceId: reservation.instance_id, json: true, details },
+        ),
+      ).toBe(0);
+      const result = JSON.parse(invocation.output.stdout.join('\n')) as {
+        data: StatusShape;
+        next_actions: readonly NextAction[];
+      };
+      expectResultContract('status', result);
+      expect(result.data.probes.browser).toMatchObject({ status: 'degraded', chrome: 'missing', isolation: null });
+      expect(result.next_actions).toContainEqual({
+        kind: 'external',
+        instruction: expect.stringContaining('install Google Chrome'),
+      });
+      expect(ncl.mock.calls.filter(([, args]) => args.join(' ') === 'gws-ea-browser-health')).toHaveLength(0);
+      expect(runCommand).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(['available', 'disabled', 'legacy-disabled', 'malformed'] as const)(
+    'reports an installed Chrome version failure as unavailable with %s host health',
+    async (hostHealth) => {
+      const host = await machine();
+      const reservation = await assistant(host, { label: 'alpha', port: 36001 });
+      const state = world(reservation);
+      const healthy = healthyObservers(state);
+      const invocation = command(host, state, {
+        ...healthy,
+        ncl: async (runtime, args) => {
+          if (args.join(' ') !== 'gws-ea-browser-health') return healthy.ncl(runtime, args);
+          if (hostHealth === 'malformed') return {};
+          return {
+            schemaVersion: 1,
+            ...(hostHealth === 'legacy-disabled' ? { enabled: false } : { available: hostHealth === 'available' }),
+            proxy: { state: 'stopped' },
+            chrome: { state: 'stopped' },
+          };
+        },
+      });
+      const runCommand = vi.fn(async () => ({ exitCode: 1, stdout: '', stderr: 'cannot execute Chrome' }));
+      expect(
+        await runStatusCommand(
+          { ...invocation.runtime, browserInspection: { runCommand } },
+          { instanceId: reservation.instance_id, json: true, details: true },
+        ),
+      ).toBe(0);
+      const result = JSON.parse(invocation.output.stdout.join('\n')) as {
+        data: StatusShape;
+        next_actions: readonly NextAction[];
+      };
+      expectResultContract('status', result);
+      expect(result.data.probes.browser).toMatchObject({
+        status: 'degraded',
+        chrome: 'unavailable',
+        reason: expect.stringContaining('diagnostics'),
+      });
+      expect(result.next_actions).toContainEqual({
+        kind: 'external',
+        instruction: expect.stringContaining('diagnostics'),
+      });
+      expect(result.next_actions).not.toContainEqual({
+        kind: 'external',
+        instruction: expect.stringContaining('install Google Chrome'),
+      });
+      expect(runCommand).toHaveBeenCalledOnce();
+    },
+  );
+
   it('reports missing Chrome independently from optional alias and connector setup', async () => {
     const host = await machine();
     const reservation = await assistant(host, { label: 'alpha', port: 36001 });

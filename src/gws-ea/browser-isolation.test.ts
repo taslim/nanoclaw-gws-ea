@@ -41,6 +41,34 @@ async function fixture() {
 }
 const chrome = async (_command: SanitizedCommand) => ({ stdout: 'Google Chrome 141.0.0.0\n', stderr: '', exitCode: 0 });
 describe('browser network-isolation observation', () => {
+  it.each([
+    { flags: { enabled: true }, status: 'passed', ready: true },
+    { flags: { available: false, enabled: true }, status: 'not_run', ready: false },
+    { flags: { available: 'invalid', enabled: true }, status: 'unknown', ready: false },
+  ] as const)(
+    'reads deployed browser availability without overriding current facts: %j',
+    async ({ flags, status, ready }) => {
+      const f = await fixture();
+      const commands: string[] = [];
+      const result = await inspectBrowserIsolation(f.paths, f.instanceId, {
+        check: true,
+        ncl: async () => ({
+          schemaVersion: 1,
+          ...flags,
+          proxy: { state: 'listening', port: 41444 },
+          chrome: { state: 'stopped' },
+        }),
+        runCommand: async (command) => {
+          commands.push(command.command);
+          return command.command === 'docker'
+            ? { stdout: '{"proxy":false}', stderr: '', exitCode: 0 }
+            : chrome(command);
+        },
+      });
+      expect(result).toMatchObject({ ready, isolation: { status } });
+      expect(commands.includes('docker')).toBe(ready);
+    },
+  );
   it('reports Chrome missing and unobservable host isolation without writing anything', async () => {
     const f = await fixture();
     const result = await inspectBrowserIsolation(f.paths, f.instanceId, {

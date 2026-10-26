@@ -964,21 +964,15 @@ async function webAliasProbe(subject: Subject): Promise<ProbeResult & WebAliasFa
 }
 
 async function browserProbe(subject: Subject, active: boolean): Promise<BrowserStatus> {
-  if (!active)
-    return {
-      status: 'unknown',
-      reason: 'Assistant is stopped; browser readiness was not checked.',
-      chrome: 'not_checked',
-      isolation: null,
-    };
   const availability = await browserAvailability(path.join(requireRuntime(subject.runtime).instance_root, 'browser'));
-  const isolation = subject.context.details
-    ? await inspectBrowserIsolation(subject.context.paths, subject.reservation.instance_id, {
-        ...subject.context.browserInspection,
-        ncl: subject.observers.ncl,
-        check: true,
-      })
-    : null;
+  const isolation =
+    active && subject.context.details
+      ? await inspectBrowserIsolation(subject.context.paths, subject.reservation.instance_id, {
+          ...subject.context.browserInspection,
+          ncl: subject.observers.ncl,
+          check: true,
+        })
+      : null;
   if (!availability.available)
     return {
       status: 'degraded',
@@ -996,18 +990,26 @@ async function browserProbe(subject: Subject, active: boolean): Promise<BrowserS
             : 'not_checked',
       isolation,
     };
+  if (!active)
+    return {
+      status: 'unknown',
+      reason: 'Assistant is stopped; browser readiness was not checked.',
+      chrome: 'available',
+      isolation: null,
+    };
+  if (isolation?.chrome.status === 'unavailable')
+    return { status: 'degraded', reason: isolation.chrome.reason, chrome: 'unavailable', isolation };
   const health = unwrapData(await subject.observers.ncl(requireRuntime(subject.runtime), ['gws-ea-browser-health']));
-  if (!isRecord(health) || typeof health.available !== 'boolean')
+  const available = isRecord(health) ? (health.available === undefined ? health.enabled : health.available) : undefined;
+  if (!isRecord(health) || typeof available !== 'boolean')
     throw new Unobservable('Browser readiness could not be observed.');
-  if (!health.available || (isRecord(health.chrome) && health.chrome.state === 'unavailable'))
+  if (!available || (isRecord(health.chrome) && health.chrome.state === 'unavailable'))
     return {
       status: 'degraded',
       reason: 'The host browser cannot launch Chrome. Ask your operator to inspect its browser diagnostics.',
       chrome: 'available',
       isolation,
     };
-  if (isolation?.chrome.status === 'unavailable')
-    return { status: 'degraded', reason: isolation.chrome.reason, chrome: 'missing', isolation };
   if (isolation?.isolation.status === 'failed' || isolation?.isolation.status === 'unknown')
     return {
       status: isolation.isolation.status === 'failed' ? 'degraded' : 'unknown',

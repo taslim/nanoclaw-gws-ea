@@ -1,9 +1,21 @@
 import { randomUUID } from 'node:crypto';
-import { lstat, mkdir, mkdtemp, readdir, readFile, realpath, rm, stat, symlink, writeFile } from 'node:fs/promises';
+import {
+  chmod,
+  lstat,
+  mkdir,
+  mkdtemp,
+  readdir,
+  readFile,
+  realpath,
+  rm,
+  stat,
+  symlink,
+  writeFile,
+} from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { processLock } from '../community-portal/process-lock.js';
 import {
@@ -58,6 +70,7 @@ import {
 } from './testing/onepassword-fixture.js';
 import { expectResultContract } from './testing/result-contract.js';
 import { GwsEaError } from './types.js';
+import * as secrets from './secrets.js';
 
 const { upsertEnvVars } = (await import(path.join(CONTROL_PLANE_ROOT, 'setup', 'set-env.ts'))) as {
   readonly upsertEnvVars: UpsertEnvVars;
@@ -79,6 +92,7 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
+  vi.restoreAllMocks();
   await rm(root, { recursive: true, force: true });
 });
 
@@ -860,6 +874,34 @@ describe('management-account ownership during repair', () => {
 });
 
 describe('1Password readiness', () => {
+  it.each([false, true])('keeps a malformed runtime local to its assistant when installed=%s', async (installed) => {
+    const healthy = await assistant();
+    const malformed = await assistant();
+    if (installed) await enable();
+    await writeFile(paths.runtimeFile(malformed.instance_id), '{');
+    const cli = { ...provider.cli(), runCommand: vi.fn(provider.runCommand) };
+
+    const observation = await inspectOnePasswordCapability(paths, { cli });
+
+    expect(observation.assistants).toHaveLength(2);
+    expect(observation.assistants.find(({ instance_id }) => instance_id === healthy.instance_id)).toMatchObject({
+      compatibility: 'compatible',
+      provisioning: installed ? 'ready' : 'absent',
+    });
+    expect(observation.assistants.find(({ instance_id }) => instance_id === malformed.instance_id)).toMatchObject({
+      compatibility: 'unknown',
+      access: { status: 'not_checked' },
+      reason: expect.stringContaining('runtime'),
+    });
+    const connector = await inspectConnector(paths, 'onepassword', { onePassword: cli });
+    expect(connector.assistants.find(({ instance_id }) => instance_id === malformed.instance_id)).toMatchObject({
+      compatibility: 'unknown',
+      readiness: { checked: false, status: 'not_checked' },
+      next_actions: [{ kind: 'command', argv: ['gws-ea', 'status', '--id', malformed.instance_id] }],
+    });
+    expect(cli.runCommand).not.toHaveBeenCalled();
+  });
+
   it('shows recorded facts without a provider request', async () => {
     const runtime = await assistant();
     const before = await inspectOnePasswordCapability(paths, dependencies());
@@ -1552,6 +1594,52 @@ describe('host-wide 1Password uninstall', () => {
     expect(provider.vaults.size).toBe(1);
     expect(await exists(onePasswordInstancePaths(runtime.instance_root).runtimeTokenFile)).toBe(false);
   });
+
+  it.each(['unsafe mode', 'temporary read failure'] as const)(
+    'pauses uninstall for a management token with %s and deletes its vault after repair',
+    async (failure) => {
+      const runtime = await assistant();
+      await enable();
+      const resources = await resourcesOf(runtime);
+      if (!resources) throw new Error('not provisioned');
+      const host = onePasswordHostPaths(paths.configRoot);
+      const files = onePasswordInstancePaths(runtime.instance_root);
+      const readOwnerOnlyFile = secrets.readOwnerOnlyFile;
+      const fault =
+        failure === 'temporary read failure'
+          ? vi.spyOn(secrets, 'readOwnerOnlyFile').mockImplementation(async (file) => {
+              if (file === host.managementTokenFile)
+                throw Object.assign(new Error('Too many open files'), { code: 'EMFILE' });
+              return readOwnerOnlyFile(file);
+            })
+          : undefined;
+      if (failure === 'unsafe mode') await chmod(host.managementTokenFile, 0o644);
+
+      const paused = await uninstall();
+
+      expect(paused).toMatchObject({ outcome: 'paused' });
+      expect(provider.vaults.has(resources.vault.id)).toBe(true);
+      for (const file of [host.managementTokenFile, host.policyFile, files.resourceFile, files.runtimeTokenFile])
+        expect(await exists(file)).toBe(true);
+      const receipt = await inspectOnePasswordUninstall(paths);
+      expect(receipt.receipt?.completed).toBe(false);
+      expect(receipt.receipt?.assistants[runtime.instance_id].cleanup.vault).toBeUndefined();
+      expect(receipt.receipt?.assistants[runtime.instance_id].cleanup.unproven).not.toContainEqual({
+        kind: 'service_account',
+        name: 'GWS-EA management',
+      });
+
+      fault?.mockRestore();
+      if (failure === 'unsafe mode') await chmod(host.managementTokenFile, 0o600);
+      expect(await uninstall()).toMatchObject({
+        outcome: 'completed',
+        assistants: [{ vault: 'deleted', vault_id: resources.vault.id }],
+      });
+      expect(provider.vaults.has(resources.vault.id)).toBe(false);
+      expect(await exists(host.managementTokenFile)).toBe(false);
+      expect(provider.calls.filter((call) => call.args[0] === 'vault' && call.args[1] === 'delete')).toHaveLength(1);
+    },
+  );
 
   it('keeps the name of a captured but unverified runtime account after removing its token', async () => {
     const runtime = await assistant();

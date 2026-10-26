@@ -90,8 +90,8 @@ async function artifactsConfig() {
   return files;
 }
 
-async function voiceInstallation() {
-  const directory = voiceInstallationDirectory(paths, 'base');
+async function voiceInstallation(model: voiceAssets.VoiceModelId = 'base') {
+  const directory = voiceInstallationDirectory(paths, model);
   await mkdir(directory, { recursive: true, mode: 0o700 });
   const entry = (file: string, size: number, sha256: string) => ({ file, size, sha256 });
   const receipt: voiceAssets.VoiceAssetReceipt = {
@@ -99,15 +99,15 @@ async function voiceInstallation() {
     recipe: voiceAssets.VOICE_RECIPE_ID,
     platform: process.platform === 'linux' ? 'linux' : 'darwin',
     architecture: process.arch === 'x64' ? 'x64' : 'arm64',
-    model: 'base',
+    model,
     builtAt: new Date().toISOString(),
     artifacts: {
       ffmpeg: entry('bin/ffmpeg', 1, '0'.repeat(64)),
       whisperCli: entry('bin/whisper-cli', 1, '0'.repeat(64)),
       model: entry(
-        `models/${voiceAssets.VOICE_MODEL_CATALOG.base.filename}`,
-        voiceAssets.VOICE_MODEL_CATALOG.base.size,
-        voiceAssets.VOICE_MODEL_CATALOG.base.sha256,
+        `models/${voiceAssets.VOICE_MODEL_CATALOG[model].filename}`,
+        voiceAssets.VOICE_MODEL_CATALOG[model].size,
+        voiceAssets.VOICE_MODEL_CATALOG[model].sha256,
       ),
       vad: entry(
         `models/${voiceAssets.VOICE_SOURCE_ARTIFACTS.vad.filename}`,
@@ -250,6 +250,50 @@ describe('uniform connector observations', () => {
       assistants: [{ instance_id: id, readiness: { status: 'not_checked' } }],
     });
     expect(ncl).not.toHaveBeenCalled();
+  });
+  it('preserves the selected non-default model in installed, stopped voice recovery', async () => {
+    const installed = await voiceInstallation('small');
+    await writePrivate(voicePolicyFile(paths), {
+      schemaVersion: 1,
+      enabled: false,
+      installationDir: installed.installationDir,
+    });
+    const observed = await inspectConnector(paths, 'voice');
+    expect(observed.next_actions).toContainEqual({
+      kind: 'command',
+      argv: ['gws-ea', 'connectors', 'install', 'voice', '--model', 'small'],
+    });
+    expect(observed.reasons).toContain(
+      'Installed, stopped. Run gws-ea connectors install voice --model small to make recognition available.',
+    );
+  });
+  it('preserves the selected non-default model in not-ready voice consumer recovery', async () => {
+    const installed = await voiceInstallation('small');
+    vi.spyOn(voiceAssets, 'verifyVoiceInstallation').mockResolvedValue(installed);
+    const id = await assistant();
+    await writeFile(
+      path.join(paths.checkoutRoot(id), 'src/gws-ea/voice-compatibility.json'),
+      JSON.stringify({ schemaVersion: 1, recipe: voiceAssets.VOICE_RECIPE_ID }),
+    );
+    const observed = await inspectConnector(paths, 'voice', {
+      check: true,
+      voice: {
+        ncl: async () => ({
+          schemaVersion: 1,
+          recipe: voiceAssets.VOICE_RECIPE_ID,
+          enabled: true,
+          readiness: 'unavailable',
+          queued: 0,
+          inflight: 0,
+          lastOutcome: null,
+          lastFailure: null,
+        }),
+      },
+    });
+    expect(observed.assistants[0]?.next_actions).toContainEqual({
+      kind: 'command',
+      argv: ['gws-ea', 'connectors', 'install', 'voice', '--model', 'small'],
+    });
   });
   it('keeps local onepassword and artifacts reads free of provider requests', async () => {
     const provider = await installedOnePassword();

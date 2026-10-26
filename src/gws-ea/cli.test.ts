@@ -9,6 +9,8 @@ import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import * as connectorProvisioning from './connector-provisioning.js';
+import { connectorDefinition } from './connectors.js';
+import type { OnePasswordUninstallPreview } from './onepassword-uninstall.js';
 import * as productionProvisioning from './provision.js';
 import { runCli, type CliRuntime, type FailureReport } from './cli.js';
 import type { CreatePromptContext } from './create-input.js';
@@ -16,7 +18,8 @@ import { runStep, withPendingAction, type InteractivePrompts, type PauseResponse
 import { RECORDED_GCLOUD_REAUTHENTICATION_FAILED } from './fixtures/recordings.js';
 import type { GoogleConnectionContext } from './google-connection.js';
 import { deriveGcpClaims } from './gcp-identity.js';
-import { acquireInstanceOperation, recordStepCompleted, reserveInstance } from './journal.js';
+import { acquireInstanceOperation, readProvisionJournal, recordStepCompleted, reserveInstance } from './journal.js';
+import { getInstanceReservation } from './registry.js';
 import { createOnecliRuntimeLayout } from './onecli-compose.js';
 import { advanceOperation, beginOperation } from './operation.js';
 import { resolveControlPlanePaths, type ControlPlanePaths } from './paths.js';
@@ -1568,6 +1571,65 @@ describe('gws-ea secrets inputs', () => {
 });
 
 describe('gws-ea release sources', () => {
+  it.each([
+    CHAT_PAUSE,
+    { kind: 'human-action', phase: 'sign_in_google', code: 'google_sign_in_required', message: 'Sign in.' },
+    {
+      kind: 'human-action',
+      phase: 'provision_onepassword',
+      code: 'operator_sign_in_needed',
+      message: 'Sign in to 1Password.',
+    },
+  ] satisfies readonly ProvisionHumanPause[])(
+    'retains --skip-alias through create, an earlier $phase pause, and plain resume',
+    async (pause) => {
+      const paths = await testPaths();
+      const output = lines();
+      let first = true;
+      const aliasNcl = vi.fn(async (): Promise<never> => {
+        throw new Error('Skipped identity setup must not contact the alias host');
+      });
+      const runtime: Partial<CliRuntime> = {
+        paths,
+        ...output.runtime,
+        ...createRuntime(),
+        advanceProvision: async (operation, { runtime: reporter }) => {
+          if (!first)
+            return productionProvisioning.provisionAssistantResources(operation, reporter, {}, { ncl: aliasNcl });
+          first = false;
+          const reserved = await getInstanceReservation(paths, operation.instanceId);
+          const home = path.join(paths.configRoot, 'home');
+          await mkdir(home, { mode: 0o700 });
+          const layout = createOnecliRuntimeLayout({
+            instanceId: reserved.instance_id,
+            instanceRoot: paths.instanceRoot(reserved.instance_id),
+            project: reserved.exclusive_resource_claims.onecli_project,
+            appPort: reserved.allocated_ports.onecli_app,
+            gatewayPort: reserved.allocated_ports.onecli_gateway,
+            dockerEndpoint: 'unix:///var/run/docker.sock',
+          });
+          await persistInstanceRuntime(
+            createInstanceRuntimeConfig(paths, reserved, layout, {
+              nodePath: process.execPath,
+              homeDirectory: home,
+              selectedProvider: 'claude',
+              dockerEndpoint: 'unix:///var/run/docker.sock',
+            }),
+            () => undefined,
+          );
+          return { status: 'paused', pause };
+        },
+      };
+      expect(await runCli(['create', '--track', 'dogfood', '--no-input', '--skip-alias'], runtime)).toBe(10);
+      const [instanceId] = Object.keys((await readRegistry(paths)).instances);
+      expect(instanceId).toBeDefined();
+      expect(await runCli(['resume', '--id', instanceId, '--no-input'], runtime)).toBe(0);
+      expect((await readProvisionJournal(paths, instanceId)).decisions.alias_skipped_at).toEqual(expect.any(String));
+      expect(aliasNcl).not.toHaveBeenCalled();
+      expect((await getInstanceReservation(paths, instanceId)).exclusive_resource_claims.alias_email).toBeUndefined();
+    },
+  );
+
   it("installs dogfood from the public repository's integration branch without asking for a remote", async () => {
     const paths = await testPaths();
     const resolved: CreateTargetRequest[] = [];
@@ -3122,6 +3184,91 @@ describe('gws-ea WhatsApp operator commands', () => {
       expect(JSON.parse(io.out.join('\n')).data.state).toBe(
         operation === 'link' ? 'linking' : operation === 'unlink' ? 'unlinked' : 'needs-relink',
       );
+    },
+  );
+});
+
+describe('connector uninstall operator output', () => {
+  it('shows each paused vault deletion decision and unknown counts in human output', async () => {
+    const paths = await testPaths();
+    const io = lines();
+    const preview: OnePasswordUninstallPreview = {
+      account_id: 'account',
+      management_service_account_id: 'management',
+      management_creation_unproven: false,
+      vaults: [
+        {
+          instance_id: '11111111-1111-4111-8111-111111111111',
+          account_id: 'account',
+          vault_id: 'vault-delete',
+          owned: true,
+          item_count: 7,
+          vault: 'delete',
+          reason: 'Its deletion was chosen for this owned vault.',
+          runtime_service_account_ids: [],
+          unproven: [],
+          credential_attempts: 3,
+        },
+        {
+          instance_id: '22222222-2222-4222-8222-222222222222',
+          account_id: 'account',
+          vault_id: 'vault-keep',
+          owned: false,
+          item_count: null,
+          vault: 'retain',
+          reason: 'This host management account did not create it.',
+          runtime_service_account_ids: [],
+          unproven: [],
+          credential_attempts: null,
+        },
+      ],
+    };
+    vi.spyOn(connectorDefinition('onepassword'), 'uninstall').mockResolvedValue({
+      name: 'onepassword',
+      scope: 'host',
+      outcome: 'paused',
+      changed: false,
+      preview,
+      assistants: [],
+      receipt_file: null,
+      revoke_service_account_ids: [],
+      reason: 'Confirm deletion of the owned vaults.',
+    });
+    expect(await runCli(['connectors', 'uninstall', 'onepassword', '--no-input'], { paths, ...io.runtime })).toBe(10);
+    const output = io.out.join('\n');
+    expect(output).toMatch(/DELETE.*11111111-1111-4111-8111-111111111111.*vault-delete.*items 7.*credential work 3/u);
+    expect(output).toMatch(
+      /KEEP.*22222222-2222-4222-8222-222222222222.*vault-keep.*items unknown.*credential work unknown/u,
+    );
+    expect(output).toContain('This host management account did not create it.');
+    expect(output).not.toContain('items 0');
+  });
+
+  it.each([false, true])(
+    'retains artifacts operator cleanup actions in human and JSON output (json=%s)',
+    async (json) => {
+      const paths = await testPaths();
+      const io = lines();
+      const instruction = 'Revoke the Cloudflare management API token, then delete the original --credential-file.';
+      vi.spyOn(connectorDefinition('artifacts'), 'uninstall').mockResolvedValue({
+        name: 'artifacts',
+        scope: 'host',
+        installed: false,
+        outcome: 'removed',
+        changed: true,
+        reason: null,
+        receipt_file: null,
+        operator_actions: [instruction],
+      });
+      expect(
+        await runCli(['connectors', 'uninstall', 'artifacts', ...(json ? ['--json'] : [])], { paths, ...io.runtime }),
+      ).toBe(0);
+      const output = io.out.join('\n');
+      if (json) {
+        const result: unknown = JSON.parse(output);
+        expectResultContract('connectors uninstall artifacts', result);
+        expect(result).toMatchObject({ next_actions: expect.arrayContaining([{ kind: 'external', instruction }]) });
+      } else expect(output).toContain(instruction);
     },
   );
 });

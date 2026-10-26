@@ -44,10 +44,10 @@ vi.mock('./authentication-submit.js', async (importOriginal) => {
   };
 });
 
-import { closeDb, getDb, initSqliteTestDb } from '../../db/connection.js';
+import { closeDb, getDb } from '../../db/connection.js';
 import { createAgentGroup, initTestDb, runMigrations } from '../../db/index.js';
 import { registerMigration } from '../../db/migrations/index.js';
-import { getSessionsByAgentGroup } from '../../db/sessions.js';
+import { createSession, getSessionsByAgentGroup } from '../../db/sessions.js';
 import '../gws-ea-profile/index.js';
 import { routeSignInMail } from '../gws-ea-inbox/route-mail.js';
 import { parseGmailMessage } from '../gws-ea-inbox/mime.js';
@@ -63,13 +63,6 @@ import { recordConsentGrant } from './consent.js';
 import { executeBrowserBatch } from './executor.js';
 
 import './index.js';
-import {
-  browserConsentMigration,
-  browserCredentialAttemptsMigration,
-  browserCredentialConsentHoldMigration,
-  browserCredentialUncertaintyMigration,
-  browserSiteLeasesMigration,
-} from './migration.js';
 import { observePage, type BrowserRef } from './observe.js';
 import { BrowserVault } from './onepassword.js';
 import {
@@ -410,16 +403,32 @@ describe.skipIf(!chromePath)('native authorized signup and password change', { t
   }, 30_000);
 
   beforeEach(async () => {
-    const db = await initSqliteTestDb();
-    await browserSiteLeasesMigration.up(db);
-    await browserCredentialAttemptsMigration.up(db);
-    await browserCredentialConsentHoldMigration.up(db);
-    await browserCredentialUncertaintyMigration.up(db);
-    // Consent stops name their job; this suite's job needs no other row.
-    await db.exec(
-      `CREATE TABLE gws_ea_browser_jobs(id TEXT PRIMARY KEY); INSERT INTO gws_ea_browser_jobs VALUES('${JOB}');`,
+    const db = await initTestDb();
+    await runMigrations(db);
+    const createdAt = new Date().toISOString();
+    for (const id of ['main', 'browser'])
+      await createAgentGroup({ id, name: id, folder: id, agent_provider: null, created_at: createdAt });
+    await createSession({
+      id: 'native-browser-session',
+      agent_group_id: 'browser',
+      messaging_group_id: null,
+      thread_id: JOB,
+      agent_provider: null,
+      status: 'active',
+      container_status: 'idle',
+      last_active: null,
+      created_at: createdAt,
+    });
+    await db.run(
+      `INSERT INTO gws_ea_browser_jobs(id,thread_id,browser_session_id,source_agent_group_id,created_at,updated_at)
+       VALUES(?,?,?,?,?,?)`,
+      JOB,
+      JOB,
+      'native-browser-session',
+      'main',
+      createdAt,
+      createdAt,
     );
-    await browserConsentMigration.up(db);
     const directory = await realpath(await mkdtemp(join(root, 'vault-')));
     const files = await writeVaultFixture(directory);
     onePasswordPolicyFile = files.onePasswordPolicyFile;
@@ -1197,19 +1206,23 @@ describe.skipIf(!chromePath)('native authorized signup and password change', { t
       expect((await attempts.get(authority.id))?.candidate_item_id).toBe(uncertain?.candidate_item_id);
       // Queue history includes the consent card request and the refused no-op refill: neither interacted
       // with the page, so the response remains attributable to this attempt's one disclosure.
-      await getDb().exec(
-        'CREATE TABLE gws_ea_browser_requests(id TEXT PRIMARY KEY,job_id TEXT,action TEXT,payload_json TEXT,started_at TEXT)',
-      );
       for (const [id, action, payload] of [
         ['socket-consent', 'request_consent', { stop_id: (await stops())[0].id }],
         ['socket-no-refill', 'credential_form', { authority: authority.id, ...controls }],
       ] as const)
         await getDb().run(
-          'INSERT INTO gws_ea_browser_requests VALUES(?,?,?,?,?)',
+          `INSERT INTO gws_ea_browser_requests
+           (id,job_id,session_id,request_id,action,payload_json,budget_ms,accepted_at,started_at,answered_at)
+           VALUES(?,?,?,?,?,?,?,?,?,?)`,
           id,
           JOB,
+          'native-browser-session',
+          id,
           action,
           JSON.stringify(payload),
+          60_000,
+          new Date().toISOString(),
+          new Date().toISOString(),
           new Date().toISOString(),
         );
       answerSlow();

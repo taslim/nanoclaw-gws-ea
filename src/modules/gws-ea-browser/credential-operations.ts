@@ -433,16 +433,30 @@ async function applyCredentialRelease(
 /**
  * Finishes saving confirmed attempts that wait only on 1Password, with no job
  * to drive them: when the browser starts, and when a job is refused a site
- * one of them holds (`sites`). Each that settles frees its site. A vault out
- * of reach, or a spent request limit, ends the pass: the rest would only
- * spend more.
+ * one of them holds (`sites`). Attempts settled by vault removal free their
+ * non-purchase sites too. A vault out of reach, or a spent request limit,
+ * ends the pass: the rest would only spend more.
  */
 export async function settleConfirmedAttempts(
   queue: BrowserQueue,
   sites?: ReadonlySet<string>,
   attempts: CredentialAttempts = credentialAttempts,
 ): Promise<void> {
-  for (const attempt of await attempts.unresolved()) {
+  const unresolved = await attempts.unresolved();
+  const removed = await queue.store.db.all<CredentialAttempt>(
+    `SELECT a.* FROM gws_ea_browser_credential_attempts a
+       JOIN gws_ea_browser_site_leases l ON l.job_id = a.job_id AND l.site = a.site
+      WHERE a.phase = 'rejected' AND l.state <> 'purchase'`,
+  );
+  for (const attempt of removed) {
+    if (sites && !sites.has(attempt.site)) continue;
+    const evidence: unknown = attempt.evidence_json === null ? null : JSON.parse(attempt.evidence_json);
+    if (!isRecord(evidence) || evidence.reason !== 'vault_removed') continue;
+    watchedResponses.delete(attempt.id);
+    await finishSignupVerification(attempt.id);
+    await freeSite(queue, attempt, `credential-vault-removed-${attempt.id}`);
+  }
+  for (const attempt of unresolved) {
     if (attempt.phase !== 'confirmed' || (sites && !sites.has(attempt.site))) continue;
     let result: CredentialFinalizeResult;
     try {
@@ -458,8 +472,8 @@ export async function settleConfirmedAttempts(
 }
 
 /**
- * After a job's request: the sites it was refused that another job holds
- * only for a confirmed credential attempt settle now, without that job.
+ * After a job's request: settle confirmed attempts holding refused sites,
+ * or free those whose vault was removed, without their job.
  */
 export async function settleRefusedSites(
   queue: BrowserQueue,
@@ -471,8 +485,10 @@ export async function settleRefusedSites(
   const held = await db.all<{ site: string }>(
     `SELECT DISTINCT w.site FROM gws_ea_browser_site_waiters w
        JOIN gws_ea_browser_site_leases l ON l.site = w.site AND l.job_id <> w.job_id
-       JOIN gws_ea_browser_credential_attempts a ON a.job_id = l.job_id AND a.site = w.site AND a.phase = 'confirmed'
+       JOIN gws_ea_browser_credential_attempts a ON a.job_id = l.job_id AND a.site = w.site
+         AND a.phase IN (${HELD_CREDENTIAL_PHASES.map(() => '?').join(',')},'rejected')
       WHERE w.job_id = ?`,
+    ...HELD_CREDENTIAL_PHASES,
     jobId,
   );
   if (held.length) await settleConfirmedAttempts(queue, new Set(held.map((row) => row.site)), attempts);

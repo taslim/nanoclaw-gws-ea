@@ -1,6 +1,6 @@
 /** One operator policy; assistants never own voice enablement or shared assets. */
 import type { VoiceCapabilityObservation } from './voice-inspection.js';
-import { readFile, rm } from 'node:fs/promises';
+import { lstat, readFile, rm } from 'node:fs/promises';
 import path from 'node:path';
 
 import { isErrno } from '../community-portal/errors.js';
@@ -41,6 +41,8 @@ import {
 } from './voice-assets.js';
 
 export const VOICE_HEALTH_ARGS = ['gws-ea-voice-health'] as const;
+export const VOICE_UNINSTALL_INCOMPLETE_REASON =
+  'Voice uninstall is incomplete. Run gws-ea connectors uninstall voice to remove the remaining owned assets.';
 export function voicePolicyFile(paths: Pick<ControlPlanePaths, 'configRoot'>): string {
   return path.join(paths.configRoot, 'voice.json');
 }
@@ -317,6 +319,18 @@ function ownedVoiceDirectories(paths: ControlPlanePaths): string[] {
   return (Object.keys(VOICE_MODEL_CATALOG) as VoiceModelId[]).map((model) => voiceInstallationDirectory(paths, model));
 }
 
+async function hasOwnedVoiceAssets(paths: ControlPlanePaths): Promise<boolean> {
+  for (const directory of ownedVoiceDirectories(paths)) {
+    try {
+      await lstat(directory);
+      return true;
+    } catch (error) {
+      if (!isErrno(error, 'ENOENT')) throw error;
+    }
+  }
+  return false;
+}
+
 async function proveIdle(
   runtime: InstanceRuntimeConfig,
   dependencies: VoiceOperatorDependencies,
@@ -459,7 +473,16 @@ export async function observeLocalVoice(
     ? (observedAssistant?.compatibility ?? 'unknown')
     : await voiceReleaseCompatibility(runtime.checkout_root);
   if (inspection?.activation.enabled === null) return { ...view, compatibility, reason: inspection.activation.reason };
-  if (!policy.installationDir)
+  if (!policy.installationDir) {
+    if (!policy.enabled && (inspection ? inspection.assets.installations.length > 0 : await hasOwnedVoiceAssets(paths)))
+      return {
+        ...view,
+        status: 'degraded',
+        reason: VOICE_UNINSTALL_INCOMPLETE_REASON,
+        enabled: false,
+        compatibility,
+        readiness: 'unavailable',
+      };
     return {
       ...view,
       status: policy.enabled ? 'degraded' : 'ok',
@@ -469,11 +492,13 @@ export async function observeLocalVoice(
       compatibility,
       readiness: 'unavailable',
     };
+  }
+  let selectedModel = inspection?.assets.selected_model;
   try {
     if (inspection) {
       if (inspection.assets.status !== 'verified')
         throw new Error(inspection.assets.reason ?? 'Asset verification was not established.');
-    } else await verifyVoiceInstallation(policy.installationDir);
+    } else selectedModel = (await verifyVoiceInstallation(policy.installationDir)).receipt.model;
     // eslint-disable-next-line no-catch-all/no-catch-all -- Asset verification is an observation boundary; any failure is optional capability state, never a repair.
   } catch (error) {
     return {
@@ -486,12 +511,13 @@ export async function observeLocalVoice(
       readiness: 'unavailable',
     };
   }
+  const installCommand = `gws-ea connectors install voice${selectedModel ? ` --model ${selectedModel}` : ''}`;
   if (compatibility !== 'compatible')
     return {
       ...view,
       status: !policy.enabled ? 'ok' : compatibility === 'unsupported' ? 'degraded' : 'unknown',
       reason: !policy.enabled
-        ? 'Voice is installed, stopped. Run gws-ea connectors install voice.'
+        ? `Voice is installed, stopped. Run ${installCommand}.`
         : 'This release needs an operator update for voice; text service remains available.',
       enabled: policy.enabled,
       assets: 'verified',
@@ -547,7 +573,7 @@ export async function observeLocalVoice(
     return {
       ...facts,
       status: 'ok',
-      reason: 'Voice is installed, stopped. Run gws-ea connectors install voice.',
+      reason: `Voice is installed, stopped. Run ${installCommand}.`,
       readiness: 'unavailable',
     };
   if (!health.enabled || health.readiness !== 'ready' || health.lastFailure)
