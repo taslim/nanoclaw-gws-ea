@@ -599,8 +599,7 @@ it('checks an artifact-only handoff before exposing it to chat members', async (
     JSON.stringify({
       schemaVersion: 1,
       enabled: true,
-      hostname: 'views.example.com',
-      pathPrefix: '/aya',
+      hostname: 'aya.example.com',
       listenPort: 9123,
       accessIssuer: 'https://team.cloudflareaccess.com',
       accessAud: 'aud',
@@ -609,7 +608,7 @@ it('checks an artifact-only handoff before exposing it to chat members', async (
     { mode: 0o600 },
   );
   vi.stubEnv('GWS_EA_WEB_POLICY_FILE', policy);
-  const message = 'https://views.example.com/aya/share/11111111-1111-4111-8111-111111111111';
+  const message = 'https://aya.example.com/artifacts/share/11111111-1111-4111-8111-111111111111';
   expect(
     refused(
       await request(main, 'chat_handoff', {
@@ -631,8 +630,7 @@ it('checks a member-supplied email for Google access beside a public artifact li
     JSON.stringify({
       schemaVersion: 1,
       enabled: true,
-      hostname: 'views.example.com',
-      pathPrefix: '/aya',
+      hostname: 'aya.example.com',
       listenPort: 9123,
       accessIssuer: 'https://team.cloudflareaccess.com',
       accessAud: 'aud',
@@ -663,7 +661,7 @@ it('checks a member-supplied email for Google access beside a public artifact li
   const file = await drive.createFile({ name: 'Private itinerary', mimeType: 'application/vnd.google-apps.document' });
   const fields = {
     chat: id,
-    message: `https://docs.google.com/document/d/${file.id}/edit https://views.example.com/aya/public/${share}`,
+    message: `https://docs.google.com/document/d/${file.id}/edit https://aya.example.com/artifacts/public/${share}`,
     matter: 'nowhere',
   };
   expect(refused(await request(main, 'chat_handoff', fields))).toContain('mira@example.com');
@@ -680,8 +678,7 @@ it('requires native principal membership for private artifact handoffs while ret
     JSON.stringify({
       schemaVersion: 1,
       enabled: true,
-      hostname: 'views.example.com',
-      pathPrefix: '/aya',
+      hostname: 'aya.example.com',
       listenPort: 9123,
       accessIssuer: 'https://team.cloudflareaccess.com',
       accessAud: 'aud',
@@ -709,13 +706,15 @@ it('requires native principal membership for private artifact handoffs while ret
   );
   const fields = {
     chat: id,
-    message: `https://views.example.com/aya/${saved.artifact_id}`,
+    message: `https://aya.example.com/artifacts/${saved.artifact_id}`,
     matter: 'nowhere',
     people: [{ member: 'whatsapp:22', email: 'juno@example.com' }],
   };
   expect(refused(await request(main, 'chat_handoff', fields))).toContain('artifact access');
   expect(await listChatHandoffs(id)).toEqual([]);
-  accepted(await request(main, 'chat_handoff', { ...fields, message: `https://views.example.com/aya/share/${share}` }));
+  accepted(
+    await request(main, 'chat_handoff', { ...fields, message: `https://aya.example.com/artifacts/share/${share}` }),
+  );
   members = members.filter((member) => member.isPrincipal);
   accepted(await request(main, 'chat_handoff', { chat: id, message: fields.message, matter: 'nowhere' }));
   expect(await listChatHandoffs(id)).toHaveLength(2);

@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { createServer, request as httpRequest, type Server } from 'node:http';
 import { afterEach, describe, expect, it } from 'vitest';
+import { createWebHandler } from '../gws-ea-web/server.js';
 import { createArtifactViewHandler, type ArtifactViewRoute } from './server.js';
 
 const id = '12345678-1234-4321-8321-123456789abc';
@@ -17,14 +18,16 @@ async function fixture(selectedHash = sourceHash) {
   let authorized = true;
   const routes: ArtifactViewRoute[] = [];
   server = createServer(
-    createArtifactViewHandler({
-      hostname: 'artifact.test',
-      pathPrefix: '/alex',
-      resolve: async (_request, route) => {
-        routes.push(route);
-        return authorized ? { title: 'Revision title', html, sourceHash: selectedHash } : undefined;
-      },
-    }),
+    createWebHandler(
+      'artifact.test',
+      createArtifactViewHandler({
+        hostname: 'artifact.test',
+        resolve: async (_request, route) => {
+          routes.push(route);
+          return authorized ? { title: 'Revision title', html, sourceHash: selectedHash } : undefined;
+        },
+      }),
+    ),
   );
   await new Promise<void>((resolve) => server!.listen(0, '127.0.0.1', resolve));
   const address = server.address();
@@ -63,7 +66,7 @@ async function fixture(selectedHash = sourceHash) {
 describe('view-only artifact origin', () => {
   it('reauthorizes each selected wrapper and hash-pinned child, including HEAD and revocation', async () => {
     const { request, revoke, routes } = await fixture();
-    for (const route of [`/alex/${id}`, `/alex/share/${id}`, `/alex/public/${id}`]) {
+    for (const route of [`/artifacts/${id}`, `/artifacts/share/${id}`, `/artifacts/public/${id}`]) {
       const wrapper = await request(route);
       expect(wrapper.status).toBe(200);
       expect(wrapper.headers.get('cache-control')).toBe('no-store');
@@ -79,29 +82,37 @@ describe('view-only artifact origin', () => {
       expect(head.headers.get('cache-control')).toBe('no-store');
     }
     expect(routes.map((route) => route.audience)).toContain('share');
-    expect((await request(`/alex/${id}/frame/${'a'.repeat(64)}`)).status).toBe(404);
+    expect((await request(`/artifacts/${id}/frame/${'a'.repeat(64)}`)).status).toBe(404);
     revoke();
-    expect((await request(`/alex/${id}/frame/${sourceHash}`)).status).toBe(404);
+    expect((await request(`/artifacts/${id}/frame/${sourceHash}`)).status).toBe(404);
   });
-  it('rejects host, prefix, method, query, source/history and encoded aliases before resolving', async () => {
+  it('rejects host, nonartifact paths, method, query, source/history and encoded aliases before resolving', async () => {
     const { request, routes } = await fixture();
     for (const route of [
+      '/',
+      '/artifact',
+      '/artifactsx',
+      '/other',
+      `/%61rtifacts/${id}`,
       `/other/${id}`,
-      `/alex/${id}?revision=1`,
-      `/alex/${id}/source`,
-      `/alex/${id}/history`,
-      `/alex/%31${id.slice(1)}`,
-      `/alex/${id}/frame/${sourceHash}/`,
+      `/artifacts/${id}?revision=1`,
+      `/artifacts/${id}/source`,
+      `/artifacts/${id}/history`,
+      `/artifacts/%31${id.slice(1)}`,
+      `/artifacts/${id}/frame/${sourceHash}/`,
     ]) {
-      expect((await request(route)).status).toBe(404);
+      const response = await request(route);
+      expect(response.status).toBe(404);
+      expect(response.headers.get('cache-control')).toBe('no-store');
+      expect(response.headers.get('content-security-policy')).toContain("default-src 'none'");
     }
-    expect((await request(`/alex/${id}`, 'GET', 'other.test')).status).toBe(404);
-    expect((await request(`/alex/${id}`, 'POST')).status).toBe(405);
+    expect((await request(`/artifacts/${id}`, 'GET', 'other.test')).status).toBe(404);
+    expect((await request(`/artifacts/${id}`, 'POST')).status).toBe(405);
     expect(routes).toHaveLength(0);
   });
   it('refuses corrupt content whose stored source hash no longer matches', async () => {
     const { request } = await fixture('f'.repeat(64));
-    const response = await request(`/alex/${id}`);
+    const response = await request(`/artifacts/${id}`);
     expect(response.status).toBe(503);
     expect(response.headers.get('cache-control')).toBe('no-store');
     expect(await response.text()).toBe('');

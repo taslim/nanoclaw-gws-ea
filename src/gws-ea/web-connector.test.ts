@@ -668,7 +668,6 @@ describe('web operator capability', () => {
         schemaVersion: 1,
         enabled: true,
         hostname: 'views.example.test',
-        pathPrefix: '/avery',
         listenPort: 41000,
         accessIssuer: 'https://example.cloudflareaccess.com',
         accessAud: 'aud',
@@ -934,7 +933,6 @@ it.each([false, true])(
           schemaVersion: 1,
           enabled: false,
           hostname: oldClaim.hostname,
-          pathPrefix: '/artifacts',
           listenPort: oldClaim.listen_port,
           accessIssuer: 'https://team.cloudflareaccess.com',
           accessAud: 'retired-aud',
@@ -997,7 +995,7 @@ it('repairs a positively observed Access admission mismatch on a published assis
   });
 });
 
-it('retains an unproven fresh application create until its durable uninstall receipt fences cleanup', async () => {
+it('retains an unproven application creation and its recorded-DNS claim through uninstall', async () => {
   const f = await provisionFixture();
   const existingClaim = (await getInstanceReservation(f.paths, f.a.instanceId)).exclusive_resource_claims.web;
   if (!existingClaim) throw new Error('Fixture namespace is missing');
@@ -1013,9 +1011,10 @@ it('retains an unproven fresh application create until its durable uninstall rec
   ]);
   const pending = (await readWebOperatorConfig(f.files.configFile))?.pending;
   expect(pending).toMatchObject({ kind: 'application', target: f.a.instanceId });
-  expect((await getInstanceReservation(f.paths, f.a.instanceId)).exclusive_resource_claims.web).toBeDefined();
+  const retainedClaim = (await getInstanceReservation(f.paths, f.a.instanceId)).exclusive_resource_claims.web;
+  expect(retainedClaim).toBeDefined();
   expect(await uninstallWebConnector(f.paths, f.dependencies)).toMatchObject({ outcome: 'pending' });
-  expect((await getInstanceReservation(f.paths, f.a.instanceId)).exclusive_resource_claims.web).toBeUndefined();
+  expect((await getInstanceReservation(f.paths, f.a.instanceId)).exclusive_resource_claims.web).toEqual(retainedClaim);
   expect((await readWebOperatorConfig(f.files.configFile))?.pending).toEqual(pending);
   await expect(installWebConnector(f.paths, {}, f.dependencies)).rejects.toMatchObject({
     code: 'web_uninstall_incomplete',

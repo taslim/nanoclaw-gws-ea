@@ -1,4 +1,8 @@
 /** Local discovery and bounded verification share one connector result contract. */
+import { existsSync } from 'node:fs';
+
+import { asciiName } from './alias.js';
+import { centralDatabaseFile, openWithoutSideFiles } from './verify.js';
 import type { OnePasswordCliSeams, OnePasswordCapabilityObservation } from './onepassword.js';
 import {
   inspectOnePasswordCapability,
@@ -8,6 +12,7 @@ import {
 import { inspectOnePasswordUninstall } from './onepassword-uninstall.js';
 import {
   inspectWebCapability,
+  assertWebHostnameAvailable,
   supportedCloudflaredVersion,
   webReleaseCompatibility,
   inspectWebUninstall,
@@ -25,7 +30,7 @@ import {
 import { runInstanceNclJson } from './ncl.js';
 import { buildToolEnvironment, runSanitizedCommandOutcome } from './process.js';
 import { readRegistry, getInstanceReservation } from './registry.js';
-import { loadInstanceRuntimeConfig, type HostStatusHelpers } from './service.js';
+import { loadInstanceRuntimeConfig, type HostStatusHelpers, type InstanceRuntimeConfig } from './service.js';
 import { createServiceControl, runtimeServiceTarget, type NanoclawServiceHelpers } from './service-control.js';
 import type { ControlPlanePaths } from './paths.js';
 import type { NextAction } from './result.js';
@@ -190,6 +195,25 @@ async function observeUninstall(paths: ControlPlanePaths, name: ConnectorName): 
   }
 }
 
+/** Read the current name without invoking a host or creating SQLite side files. */
+function webFirstName(runtime: InstanceRuntimeConfig): string | undefined {
+  const file = centralDatabaseFile(runtime.state_root);
+  if (!existsSync(file)) return undefined;
+  const database = openWithoutSideFiles(file);
+  try {
+    if (!database.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'gws_ea_profile'").get())
+      return undefined;
+    const profile: unknown = database
+      .prepare('SELECT assistant_first_name FROM gws_ea_profile WHERE singleton = 1')
+      .get();
+    return isRecord(profile) && typeof profile.assistant_first_name === 'string'
+      ? profile.assistant_first_name
+      : undefined;
+  } finally {
+    database.close();
+  }
+}
+
 /** Verify shared prerequisites even on a host with no eligible assistants; every provider call is a GET. */
 async function checkWebHost(
   paths: ControlPlanePaths,
@@ -230,7 +254,7 @@ async function checkWebHost(
       return [
         'missing',
         'satisfied',
-        'The recorded artifact hostname does not belong to its active Cloudflare zone and account.',
+        'The recorded Cloudflare zone is inactive, belongs to another account, or no longer matches its apex.',
       ];
     const organization = await api.request('GET', `/accounts/${config.accountId}/access/organizations`);
     if (!isRecord(organization) || organization.auth_domain !== `${config.teamName}.cloudflareaccess.com`)
@@ -444,7 +468,46 @@ export async function inspectConnector(
         const runtime = await loadInstanceRuntimeConfig(paths.runtimeFile(id));
         compatibility = await webReleaseCompatibility(runtime.checkout_root);
         const live = canCheck && compatibility === 'compatible' && !unavailable.has(id);
-        const observation = await inspectWebCapability(paths, id, { ...options.web, check: live });
+        let observation = await inspectWebCapability(paths, id, { ...options.web, check: live });
+        if (config && !observation.hostname && compatibility === 'compatible') {
+          const firstName = webFirstName(runtime);
+          if (firstName !== undefined) {
+            const label = asciiName(firstName).slice(0, 63);
+            if (!/[a-z]/u.test(label))
+              observation = {
+                ...observation,
+                reason_code: 'web_name_unusable',
+                reason: `“${firstName}” has no Latin letter for a web address. Recreate this assistant under a first name with a Latin letter.`,
+              };
+            else {
+              const hostname = `${label}.${config.zoneApex}`;
+              const holder = Object.values((await readRegistry(paths)).instances).find(
+                (candidate) =>
+                  candidate.instance_id !== id && candidate.exclusive_resource_claims.web?.hostname === hostname,
+              );
+              if (holder)
+                observation = {
+                  ...observation,
+                  reason_code: 'web_hostname_claimed',
+                  reason: `${hostname} is already held by assistant ${holder.instance_id}. Recreate this assistant under another first name, or remove the holder.`,
+                };
+              else if (live) {
+                try {
+                  await assertWebHostnameAvailable(config, hostname, options.web);
+                  // eslint-disable-next-line no-catch-all/no-catch-all -- A failed read-only preflight is an inspection fact; no claim or repair follows it.
+                } catch (cause) {
+                  observation = {
+                    ...observation,
+                    remote:
+                      cause instanceof GwsEaError && cause.code === 'web_hostname_foreign' ? 'mismatch' : 'unavailable',
+                    reason_code: cause instanceof GwsEaError ? cause.code : 'web_hostname_unobserved',
+                    reason: cause instanceof GwsEaError ? cause.message : 'The web hostname could not be observed.',
+                  };
+                }
+              }
+            }
+          }
+        }
         observations.push(observation);
         const state: ConnectorSetup =
           observation.activation === 'enabled'
@@ -459,7 +522,7 @@ export async function inspectConnector(
         const why = observation.reason
           ? [observation.reason]
           : state === 'pending'
-            ? ['Artifact serving has not been provisioned for this assistant.']
+            ? ['Web has not been provisioned for this assistant.']
             : [];
         if (unavailable.has(id)) why.push('The assistant is stopped or unreachable; serving was not checked.');
         assistants.push({
@@ -475,9 +538,11 @@ export async function inspectConnector(
                 ? [status(id)]
                 : unavailable.has(id)
                   ? [start(id)]
-                  : state !== 'installed' || (observed && !observation.ready)
-                    ? [repair(name)]
-                    : [],
+                  : ['web_name_unusable', 'web_hostname_claimed'].includes(observation.reason_code ?? '')
+                    ? []
+                    : state !== 'installed' || (observed && !observation.ready)
+                      ? [repair(name)]
+                      : [],
         });
         // eslint-disable-next-line no-catch-all/no-catch-all -- An unreadable runtime remains unknown local state; other assistants and connectors still report.
       } catch (_error) {
@@ -486,7 +551,7 @@ export async function inspectConnector(
           compatibility,
           setup: 'unknown',
           readiness: readiness(false),
-          reasons: ['Assistant runtime or local artifact state could not be observed.'],
+          reasons: ['Assistant runtime or local web state could not be observed.'],
           next_actions: [status(id)],
         });
       }
@@ -550,7 +615,7 @@ export function connectorLines(
           : onePasswordCapabilityLines(details, true, timezone)
         ).slice(1, -1)
       : details.flatMap((assistant) => [
-          `  Assistant ${assistant.instance_id}: ${assistant.hostname ?? 'hostname not configured'}`,
+          `  Assistant ${assistant.instance_id}: ${assistant.hostname ? `https://${assistant.hostname}` : 'address not provisioned'}`,
           `    Origin: ${assistant.activation}; remote: ${assistant.remote.replaceAll('_', ' ')}; listener: ${assistant.listener.replaceAll('_', ' ')}`,
         ]);
   return [

@@ -20,6 +20,8 @@ import { removeAssistant, type RemovalDependencies } from './remove.js';
 import { writePrivateTextFile } from './secrets.js';
 import { renderLaunchdService, renderSystemdService } from './service-definition.js';
 import type { InstanceReservationInput } from './types.js';
+import { inspectWebUninstall, uninstallWebConnector } from './web-uninstall.js';
+import { webConnectorInstalled } from './web-connector.js';
 import { runCli } from './cli.js';
 import { expectResultContract } from './testing/result-contract.js';
 
@@ -129,8 +131,10 @@ async function fixture(peer = false) {
     const method = options?.method ?? 'GET';
     if (method !== 'GET') {
       // The actual native removal receipt must precede every external mutation.
-      const receipt = JSON.parse(await readFile(paths.removalFile(own.instance_id), 'utf8')) as { web?: unknown };
-      expect(receipt.web).toBeDefined();
+      if (await exists(paths.removalFile(own.instance_id))) {
+        const receipt = JSON.parse(await readFile(paths.removalFile(own.instance_id), 'utf8')) as { web?: unknown };
+        expect(receipt.web).toBeDefined();
+      } else expect((await inspectWebUninstall(paths))?.stopped).toBe(true);
       effects.push(`${method} ${resource}`);
     }
     if (resource.endsWith('/configurations')) {
@@ -201,25 +205,48 @@ it('removes only the assistant app and ingress while disabled peer intent keeps 
   expect((await readRegistry(f.paths)).instances[f.other!.instance_id]).toEqual(beforePeer);
 });
 
-it('removes exact owned last-assistant resources and only then deletes credentials and ownership config', async () => {
-  const f = await fixture();
+it('removes the last assistant while keeping the installed connector, tunnel, PIN and credentials for the next assistant', async () => {
+  const { f, definitionFile } = await launchdFixture();
+  const before = await readWebOperatorConfig(f.files.configFile);
   await removeAssistant(f.paths, f.own.instance_id, f.dependencies);
+  expect(await exists(definitionFile)).toBe(true);
   expect(f.effects.filter((effect) => effect.startsWith('DELETE'))).toEqual([
     'DELETE /accounts/account/access/apps/own-app',
     'DELETE /zones/zone/dns_records/dns',
-    'DELETE /accounts/account/cfd_tunnel/tunnel',
-    'DELETE /accounts/account/access/identity_providers/pin',
   ]);
-  expect(await exists(f.config.credentialFile)).toBe(false);
-  expect(await exists(f.files.tokenFile)).toBe(false);
-  expect(await exists(f.files.configFile)).toBe(false);
+  expect(f.resources.has('/accounts/account/cfd_tunnel/tunnel')).toBe(true);
+  expect(f.resources.has('/accounts/account/access/identity_providers/pin')).toBe(true);
+  expect(await exists(f.config.credentialFile)).toBe(true);
+  expect(await exists(f.files.tokenFile)).toBe(true);
+  expect(await readWebOperatorConfig(f.files.configFile)).toEqual({ ...before, assistants: {}, dns: {} });
   expect(await exists(f.paths.removalFile(f.own.instance_id))).toBe(false);
   expect((await readRegistry(f.paths)).instances[f.own.instance_id]).toBeUndefined();
+  expect(await webConnectorInstalled(f.paths)).toBe(true);
+  const next = await reserve(f.paths, 'juno', 34000);
+  expect(next.exclusive_resource_claims.web?.hostname).toBe('juno.example.com');
+  expect((await readWebOperatorConfig(f.files.configFile))?.tunnelId).toBe('tunnel');
+});
+
+it('keeps an unrelated recorded DNS name when the last assistant is removed', async () => {
+  const f = await fixture();
+  await writeWebOperatorConfig(f.files.configFile, {
+    ...f.config,
+    dns: {
+      ...f.config.dns,
+      'other.example.com': { id: 'peer-dns', zoneId: 'zone' },
+    },
+  });
+  await removeAssistant(f.paths, f.own.instance_id, f.dependencies);
+  expect(f.resources.has('/zones/zone/dns_records/dns')).toBe(false);
+  expect(f.resources.has('/zones/zone/dns_records/peer-dns')).toBe(true);
+  expect((await readWebOperatorConfig(f.files.configFile))?.dns).toEqual({
+    'other.example.com': { id: 'peer-dns', zoneId: 'zone' },
+  });
 });
 
 it('retains exact cleanup evidence and the claim across remote failure, then resumes without recreating resources', async () => {
   const f = await fixture();
-  f.fail('/accounts/account/cfd_tunnel/tunnel');
+  f.fail('/zones/zone/dns_records/dns');
   await expect(removeAssistant(f.paths, f.own.instance_id, f.dependencies)).rejects.toMatchObject({
     resource: 'web',
   });
@@ -231,10 +258,10 @@ it('retains exact cleanup evidence and the claim across remote failure, then res
   f.fail();
   await removeAssistant(f.paths, f.own.instance_id, f.dependencies);
   expect(f.effects.filter((effect) => effect === 'DELETE /accounts/account/access/apps/own-app')).toHaveLength(1);
-  expect(await exists(f.files.configFile)).toBe(false);
+  expect(await exists(f.files.configFile)).toBe(true);
 });
 
-it('retains a useful receipt through credential deletion failure and retries local cleanup without another API credential', async () => {
+it('retains an uninstall receipt through credential deletion failure and retries local cleanup without another API credential', async () => {
   const f = await fixture();
   let spoiled = false;
   const send: typeof fetch = async (url, options) => {
@@ -245,24 +272,24 @@ it('retains a useful receipt through credential deletion failure and retries loc
     }
     return response;
   };
-  await expect(removeAssistant(f.paths, f.own.instance_id, { ...f.dependencies, fetch: send })).rejects.toMatchObject({
-    resource: 'web',
+  expect(await uninstallWebConnector(f.paths, { ...f.dependencies, fetch: send })).toMatchObject({
+    outcome: 'pending',
   });
-  const receipt = JSON.parse(await readFile(f.paths.removalFile(f.own.instance_id), 'utf8')) as {
-    web: { completed: string[]; ownership: { tunnelId: string } };
-  };
-  expect(receipt.web.completed).toContain('remote');
-  expect(receipt.web.ownership.tunnelId).toBe('tunnel');
+  const receipt = await inspectWebUninstall(f.paths);
+  expect(receipt?.shared.completed).toContain('remote');
+  expect(receipt?.shared.ownership.tunnelId).toBe('tunnel');
   expect(await exists(f.files.tokenFile)).toBe(false);
   expect(await exists(f.files.configFile)).toBe(true);
   expect(await exists(f.config.credentialFile)).toBe(true);
   await chmod(f.config.credentialFile, 0o600);
-  await removeAssistant(f.paths, f.own.instance_id, {
-    ...f.dependencies,
-    fetch: async () => {
-      throw new Error('Remote cleanup already settled');
-    },
-  });
+  expect(
+    await uninstallWebConnector(f.paths, {
+      ...f.dependencies,
+      fetch: async () => {
+        throw new Error('Remote cleanup already settled');
+      },
+    }),
+  ).toMatchObject({ outcome: 'removed' });
   expect(await exists(f.config.credentialFile)).toBe(false);
   expect(await exists(f.files.configFile)).toBe(false);
 });
@@ -314,24 +341,26 @@ it('continues removal after the operator explicitly resolves the exact unproven 
     resolvedAttempts: [{ ...pending, resolution: 'operator_removed', resolvedAt: new Date().toISOString() }],
   });
   await removeAssistant(f.paths, f.own.instance_id, f.dependencies);
-  expect(await exists(f.files.configFile)).toBe(false);
+  expect(await exists(f.files.configFile)).toBe(true);
   expect((await readRegistry(f.paths)).instances[f.own.instance_id]).toBeUndefined();
 });
 
-it('does not delete a pre-existing PIN or a tunnel routing an unrelated service', async () => {
+it('keeps a pre-existing PIN and unrelated tunnel service when removing the last assistant', async () => {
   const f = await fixture();
   await writeWebOperatorConfig(f.files.configFile, { ...f.config, pin: { id: 'pin', owned: false } });
   f.ingress().config.ingress.unshift({ hostname: 'foreign.example.test', service: 'http://127.0.0.1:9191' });
-  await expect(removeAssistant(f.paths, f.own.instance_id, f.dependencies)).rejects.toMatchObject({
-    resource: 'web',
-  });
+  await removeAssistant(f.paths, f.own.instance_id, f.dependencies);
   expect(f.resources.has('/accounts/account/cfd_tunnel/tunnel')).toBe(true);
   expect(f.resources.has('/accounts/account/access/identity_providers/pin')).toBe(true);
+  expect(f.ingress().config.ingress).toEqual([
+    { hostname: 'foreign.example.test', service: 'http://127.0.0.1:9191' },
+    { service: 'http_status:404' },
+  ]);
   expect(await exists(f.config.credentialFile)).toBe(true);
-  f.ingress().config.ingress.splice(0, 1);
-  await removeAssistant(f.paths, f.own.instance_id, f.dependencies);
-  expect(f.resources.has('/accounts/account/access/identity_providers/pin')).toBe(true);
-  expect(f.effects.some((effect) => effect === 'DELETE /accounts/account/access/identity_providers/pin')).toBe(false);
+  expect(f.effects.filter((effect) => effect.startsWith('DELETE'))).toEqual([
+    'DELETE /accounts/account/access/apps/own-app',
+    'DELETE /zones/zone/dns_records/dns',
+  ]);
 });
 
 it('keeps a stopped connector receipt through a service failure and removes only its exact verified definition', async () => {
@@ -363,23 +392,18 @@ it('keeps a stopped connector receipt through a service failure and removes only
   const observed: string[][] = [];
   const runCommand: NonNullable<RemovalDependencies['runCommand']> = async (command) => {
     observed.push([...command.args]);
-    expect(JSON.parse(await readFile(f.paths.removalFile(f.own.instance_id), 'utf8'))).toHaveProperty(
-      'web.ownership.connector.label',
-      label,
-    );
+    expect((await inspectWebUninstall(f.paths))?.shared.ownership.connector?.label).toBe(label);
     return {
       stdout: command.args.includes('show') ? `LoadState=loaded\nActiveState=${fail ? 'active' : 'inactive'}\n` : '',
       stderr: '',
       exitCode: command.args.includes('disable') && fail ? 1 : 0,
     };
   };
-  await expect(removeAssistant(f.paths, f.own.instance_id, { ...f.dependencies, runCommand })).rejects.toMatchObject({
-    resource: 'web',
-  });
+  expect(await uninstallWebConnector(f.paths, { ...f.dependencies, runCommand })).toMatchObject({ outcome: 'pending' });
   expect(await exists(definitionFile)).toBe(true);
   expect(f.resources.has('/accounts/account/cfd_tunnel/tunnel')).toBe(true);
   fail = false;
-  await removeAssistant(f.paths, f.own.instance_id, { ...f.dependencies, runCommand });
+  expect(await uninstallWebConnector(f.paths, { ...f.dependencies, runCommand })).toMatchObject({ outcome: 'removed' });
   expect(await exists(definitionFile)).toBe(false);
   expect(observed).toContainEqual(['--user', 'disable', '--now', `${label}.service`]);
   expect(observed.at(-1)).toEqual(['--user', 'daemon-reload']);
@@ -451,23 +475,25 @@ async function launchdFixture() {
 }
 
 it.each([true, false])(
-  'removes the exact owned launchd connector and credentials (initially running: %s)',
+  'uninstalls the exact owned launchd connector and credentials (initially running: %s)',
   async (initiallyRunning) => {
     const { f, label, definitionFile } = await launchdFixture();
     let running = initiallyRunning;
     const commands: string[][] = [];
-    await removeAssistant(f.paths, f.own.instance_id, {
-      ...f.dependencies,
-      runCommand: async (command) => {
-        commands.push([...command.args]);
-        if (command.args[0] === 'bootout') running = false;
-        return {
-          stdout: '',
-          stderr: '',
-          exitCode: command.args[0] === 'print' && !running ? 113 : 0,
-        };
-      },
-    });
+    expect(
+      await uninstallWebConnector(f.paths, {
+        ...f.dependencies,
+        runCommand: async (command) => {
+          commands.push([...command.args]);
+          if (command.args[0] === 'bootout') running = false;
+          return {
+            stdout: '',
+            stderr: '',
+            exitCode: command.args[0] === 'print' && !running ? 113 : 0,
+          };
+        },
+      }),
+    ).toMatchObject({ outcome: 'removed' });
     const exact = `gui/${process.getuid?.()}/${label}`;
     expect(commands).toEqual(
       initiallyRunning
@@ -485,7 +511,7 @@ it.each([true, false])(
 
 it('preserves an unknown receipt schema containing exact artifact IDs instead of overwriting its evidence', async () => {
   const f = await fixture();
-  f.fail('/accounts/account/cfd_tunnel/tunnel');
+  f.fail('/zones/zone/dns_records/dns');
   await expect(removeAssistant(f.paths, f.own.instance_id, f.dependencies)).rejects.toMatchObject({
     resource: 'web',
   });
@@ -503,7 +529,7 @@ it('preserves an unknown receipt schema containing exact artifact IDs instead of
 
 it('publishes artifact abandonment and its exact durable receipt through the native JSON removal contract', async () => {
   const f = await fixture();
-  f.fail('/accounts/account/cfd_tunnel/tunnel');
+  f.fail('/zones/zone/dns_records/dns');
   const output: string[] = [];
   expect(
     await runCli(['remove', '--id', f.own.instance_id, '--yes', '--abandon', 'web', '--json'], {
@@ -528,12 +554,12 @@ it.each([112, 5])(
   'keeps connector files when launchd print fails with exit %s despite absent-job wording',
   async (exitCode) => {
     const { f, definitionFile } = await launchdFixture();
-    await expect(
-      removeAssistant(f.paths, f.own.instance_id, {
+    expect(
+      await uninstallWebConnector(f.paths, {
         ...f.dependencies,
         runCommand: async () => ({ stdout: '', stderr: 'Could not find service', exitCode }),
       }),
-    ).rejects.toMatchObject({ resource: 'web' });
+    ).toMatchObject({ outcome: 'pending' });
     expect(await exists(definitionFile)).toBe(true);
     expect(await exists(f.config.credentialFile)).toBe(true);
     expect(await exists(f.files.tokenFile)).toBe(true);

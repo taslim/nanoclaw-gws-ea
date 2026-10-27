@@ -36,8 +36,7 @@ let serial = 0;
 const policy: WebPolicyFile = {
   schemaVersion: 1,
   enabled: true,
-  hostname: 'views.example.com',
-  pathPrefix: '/aya',
+  hostname: 'aya.example.com',
   listenPort: 9123,
   accessIssuer: 'https://team.cloudflareaccess.com',
   accessAud: 'assistant-aud',
@@ -137,7 +136,7 @@ it('saves through the guarded mailbox path, recovers response loss after staging
   const fields = { create_key: 'key', title: 'Trip', file: 'view.html' };
   stage(author, id);
   const first = accepted(await request(author, 'artifact_save', fields, id));
-  expect(first.url).toBe(`https://views.example.com/aya/${String(first.artifact_id)}`);
+  expect(first.url).toBe(`https://aya.example.com/artifacts/${String(first.artifact_id)}`);
   expect(fs.existsSync(path.dirname(path.join(sessionDir('author', author.id), 'outbox', id, 'view.html')))).toBe(
     false,
   );
@@ -364,4 +363,47 @@ it('pages sharing metadata without limiting stored shares and keeps artifact lis
   ]);
   expect(JSON.stringify(listed)).not.toContain('guest-');
   expect(JSON.stringify(listed)).not.toContain('named-044');
+});
+
+it('keeps save, revise, checkout, list and delete available with enabled web policy while no origin runs', async () => {
+  const before = await getDb().all('SELECT id,container_status FROM sessions ORDER BY id');
+  const saved = await made();
+  const revisionId = 'outage-revise';
+  stage(author, revisionId, '<p>Revised during the origin outage</p>');
+  const revised = accepted(
+    await request(
+      author,
+      'artifact_save',
+      {
+        artifact_id: saved.artifact_id,
+        expected_revision: 1,
+        title: 'Outage revision',
+        file: 'view.html',
+      },
+      revisionId,
+    ),
+  );
+  expect(revised.revision).toBe(2);
+  const checkout = accepted(
+    await request(author, 'artifact_read', { artifact_id: saved.artifact_id, checkout: true }, 'outage-checkout'),
+  );
+  expect(
+    fs.readFileSync(
+      path.join(sessionDir('author', author.id), String(checkout.file).slice('/workspace/'.length)),
+      'utf8',
+    ),
+  ).toBe('<p>Revised during the origin outage</p>');
+  expect(accepted(await request(author, 'artifact_list', {})).artifacts).toEqual([
+    expect.objectContaining({ artifact_id: saved.artifact_id, head_revision: 2 }),
+  ]);
+  expect(
+    accepted(
+      await request(author, 'artifact_delete', {
+        artifact_id: saved.artifact_id,
+        expected_generation: revised.generation,
+      }),
+    ),
+  ).toMatchObject({ deleted: true });
+  expect((await getGroupCapabilities('author')).has('artifacts')).toBe(true);
+  expect(await getDb().all('SELECT id,container_status FROM sessions ORDER BY id')).toEqual(before);
 });

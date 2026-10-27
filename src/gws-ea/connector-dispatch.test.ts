@@ -94,6 +94,10 @@ it.each(['list', 'show'] as const)(
             }
           : onePassword,
     });
+    if (command === 'list') {
+      const names = (result as { data: { connectors: { name: string }[] } }).data.connectors.map(({ name }) => name);
+      expect(names).toEqual(['voice', 'onepassword', 'web']);
+    }
     expect(runCommand).not.toHaveBeenCalled();
   },
 );

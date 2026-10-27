@@ -57,7 +57,7 @@ import type { PrincipalBinding } from './principal.js';
 import { runSanitizedCommand, type SanitizedCommand } from './process.js';
 import { redact } from './redact.js';
 import { operationName } from './release-layout.js';
-import { writeInstanceMarker } from './registry.js';
+import { claimInstanceWeb, writeInstanceMarker } from './registry.js';
 import type { NextAction } from './result.js';
 import {
   createInstanceRuntimeConfig,
@@ -613,6 +613,36 @@ interface StatusShape {
 }
 
 describe('status', () => {
+  it.each([false, true])(
+    'shows the web address and assistant pending reason in human status (details: %s)',
+    async (details) => {
+      const host = await machine();
+      const reservation = await assistant(host, { label: 'alpha', port: 36_001 });
+      await claimInstanceWeb(host.paths, reservation.instance_id, { hostname: 'aya.example.test', listen_port: 36004 });
+      const inspect = connectorInspection.inspectConnector;
+      vi.spyOn(connectorInspection, 'inspectConnector').mockImplementation(async (paths, name, options) => {
+        const observation = await inspect(paths, name, options);
+        return name !== 'web'
+          ? observation
+          : {
+              ...observation,
+              assistants: observation.assistants.map((entry) => ({
+                ...entry,
+                reasons: ['Web activation is waiting for the assistant listener.'],
+              })),
+            };
+      });
+      const state = world(reservation);
+      const shown = command(host, state, healthyObservers(state));
+      expect(await runStatusCommand(shown.runtime, { instanceId: reservation.instance_id, json: false, details })).toBe(
+        0,
+      );
+      const human = shown.output.stdout.join('\n');
+      expect(human).toContain('https://aya.example.test');
+      expect(human).toContain('Web activation is waiting for the assistant listener.');
+    },
+  );
+
   it('keeps independent observations when one connector cannot be inspected', async () => {
     const host = await machine();
     const reservation = await assistant(host, { label: 'alpha', port: 36_001 });

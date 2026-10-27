@@ -31,7 +31,7 @@ import {
 } from './authority.js';
 import { artifactDigest, artifactRequestResult, getArtifactRequest } from './db.js';
 import { artifactActor } from './policy.js';
-import { readWebPolicy, type WebPolicyFile } from '../gws-ea-web/policy.js';
+import { readWebPolicy, webPolicyDigest, type WebPolicyFile } from '../gws-ea-web/policy.js';
 
 interface Reservation {
   readonly input: ArtifactShareInput;
@@ -112,7 +112,7 @@ export async function artifactAdmissionEmails(): Promise<string[]> {
   return [...new Set([...principals, ...grants.map(({ email }) => email)])].sort();
 }
 function shareUrl(config: WebPolicyFile, kind: 'named' | 'public', id: string): string {
-  return `https://${config.hostname}${config.pathPrefix}/${kind === 'named' ? 'share' : 'public'}/${id}`;
+  return `https://${config.hostname}/artifacts/${kind === 'named' ? 'share' : 'public'}/${id}`;
 }
 function reservation(value: string): Reservation {
   const payload: unknown = JSON.parse(value);
@@ -405,7 +405,7 @@ export class ArtifactSharing {
         scope_hash: authority.scopeHash,
         share_id: shareId,
         generation,
-        policy_hash: artifactDigest(policy.config),
+        policy_hash: webPolicyDigest(policy.config),
       };
       const encoded = JSON.stringify(payload);
       if (Buffer.byteLength(encoded, 'utf8') > 16384)
@@ -524,7 +524,7 @@ export class ArtifactSharing {
       return;
     }
     const policy = await readWebPolicy();
-    if (policy.status !== 'enabled' || artifactDigest(policy.config) !== held.policy_hash)
+    if (policy.status !== 'enabled' || webPolicyDigest(policy.config) !== held.policy_hash)
       throw forbidden('Artifact capability coordinates changed.');
     if (!(await this.dependencies.publicationReady(policy.config))) {
       if (grant)
@@ -538,7 +538,7 @@ export class ArtifactSharing {
       const fresh = await readWebPolicy();
       if (
         fresh.status !== 'enabled' ||
-        artifactDigest(fresh.config) !== held.policy_hash ||
+        webPolicyDigest(fresh.config) !== held.policy_hash ||
         current.scopeHash !== held.scope_hash ||
         !(await this.dependencies.publicationReady(fresh.config))
       )

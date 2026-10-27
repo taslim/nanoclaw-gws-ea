@@ -28,7 +28,9 @@ import { upsertUser } from '../permissions/db/users.js';
 import { ARTIFACT_ACTIONS } from './actions.js';
 import { ArtifactSharing } from './sharing.js';
 import { createArtifactViewHandler } from './server.js';
-import { createArtifactIdentityVerifier, createArtifactViewResolver } from './access.js';
+import { createArtifactViewResolver } from './access.js';
+import { createWebIdentity, createWebIdentityVerifier } from '../gws-ea-web/access.js';
+import { createWebHandler } from '../gws-ea-web/server.js';
 import type { WebPolicyFile } from '../gws-ea-web/policy.js';
 
 let origin: Server | undefined;
@@ -92,8 +94,7 @@ it.skipIf(!process.env.GWS_EA_ARTIFACT_NATIVE_IMAGE)(
     const config: WebPolicyFile = {
       schemaVersion: 1,
       enabled: true,
-      hostname: 'views.example.com',
-      pathPrefix: '/aya',
+      hostname: 'aya.example.com',
       listenPort: 9123,
       accessIssuer: 'https://fixture.cloudflareaccess.com',
       accessAud: 'fixture-aud',
@@ -108,7 +109,7 @@ it.skipIf(!process.env.GWS_EA_ARTIFACT_NATIVE_IMAGE)(
     const keys = await generateKeyPair('RS256');
     const jwk = { ...(await exportJWK(keys.publicKey)), kid: 'native-fixture', alg: 'RS256' };
     const jwks = vi.fn(async () => Response.json({ keys: [jwk] }));
-    const verifier = createArtifactIdentityVerifier(config.accessIssuer, config.accessAud, jwks);
+    const verifier = createWebIdentityVerifier(config.accessIssuer, config.accessAud, jwks);
     const identities = new Map<string, string>();
     for (const email of [
       'principal@example.com',
@@ -128,7 +129,13 @@ it.skipIf(!process.env.GWS_EA_ARTIFACT_NATIVE_IMAGE)(
           .sign(keys.privateKey),
       );
     origin = createServer(
-      createArtifactViewHandler({ ...config, resolve: createArtifactViewResolver(config, verifier) }),
+      createWebHandler(
+        config.hostname,
+        createArtifactViewHandler({
+          hostname: config.hostname,
+          resolve: createArtifactViewResolver(config, createWebIdentity(config, verifier)),
+        }),
+      ),
     );
     await new Promise<void>((resolve) => origin!.listen(0, '127.0.0.1', resolve));
     const address = origin.address();
@@ -156,9 +163,9 @@ it.skipIf(!process.env.GWS_EA_ARTIFACT_NATIVE_IMAGE)(
       });
     const stages: string[] = [];
     async function check(stage: Checkpoint): Promise<void> {
-      const privatePath = `/aya/${stage.saved.artifact_id}`;
-      const namedPath = `/aya/share/${stage.named.share_id}`;
-      const publicPath = `/aya/public/${stage.published.share_id}`;
+      const privatePath = `/artifacts/${stage.saved.artifact_id}`;
+      const namedPath = `/artifacts/share/${stage.named.share_id}`;
+      const publicPath = `/artifacts/public/${stage.published.share_id}`;
       const head = stage.revised?.source_hash ?? stage.saved.source_hash;
       for (const email of ['principal@example.com', 'second@example.com']) {
         const response = await view(privatePath, email);
@@ -167,7 +174,7 @@ it.skipIf(!process.env.GWS_EA_ARTIFACT_NATIVE_IMAGE)(
       }
       for (const email of ['alex@example.com', 'sam@example.com']) {
         expect((await view(privatePath, email)).status).toBe(404);
-        expect((await view(`/aya/${stage.other.artifact_id}`, email)).status).toBe(404);
+        expect((await view(`/artifacts/${stage.other.artifact_id}`, email)).status).toBe(404);
         const named = await view(namedPath, email);
         expect(named.status).toBe(stage.stage === 'revoked' ? 404 : 200);
         if (named.status === 200) expect(named.body).toContain(`/frame/${stage.saved.source_hash}`);
@@ -340,7 +347,7 @@ it.skipIf(!process.env.GWS_EA_ARTIFACT_NATIVE_IMAGE)(
     expect(stages).toEqual(['initial', 'private-revised', 'replaced', 'revoked']);
     expect(admissions).toBe(1);
     expect(jwks).toHaveBeenCalledTimes(1);
-    const measuredPath = `/aya/${authorEvidence.measured.artifact_id}`;
+    const measuredPath = `/artifacts/${authorEvidence.measured.artifact_id}`;
     expect((await view(measuredPath, 'second@example.com')).status).toBe(200);
     const durations: number[] = [];
     for (let index = 0; index < 50; index++) {

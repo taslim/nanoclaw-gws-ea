@@ -10,7 +10,6 @@ const config: WebPolicyFile = {
   schemaVersion: 1,
   enabled: true,
   hostname: 'views.example.com',
-  pathPrefix: '/aya',
   listenPort: 9123,
   accessIssuer: 'https://team.cloudflareaccess.com',
   accessAud: 'assistant-aud',
@@ -23,7 +22,7 @@ beforeEach(() => {
 afterEach(() => {
   fs.rmSync(ROOT, { recursive: true, force: true });
 });
-it('retains complete disabled coordinates, distinguishes absence from malformed state and accepts a dedicated host prefix', async () => {
+it('retains complete disabled coordinates, distinguishes absence from malformed state', async () => {
   const file = path.join(ROOT, 'policy.json');
   expect(await readWebPolicy(file)).toEqual({ status: 'disabled', enabled: false });
   fs.writeFileSync(file, JSON.stringify(config), { mode: 0o600 });
@@ -33,7 +32,6 @@ it('retains complete disabled coordinates, distinguishes absence from malformed 
   expect(await readWebPolicy(file)).toEqual({ status: 'disabled', enabled: false, config: disabled });
   fs.writeFileSync(file, '{broken');
   expect(await readWebPolicy(file)).toMatchObject({ status: 'unavailable', enabled: false });
-  expect(parseWebPolicyFile({ ...config, pathPrefix: '' })).toEqual({ ...config, pathPrefix: '' });
 });
 it.each([
   { schemaVersion: 2 },
@@ -68,25 +66,7 @@ it.each(['symlink', 'fifo', 'mode', 'oversized'] as const)('refuses unsafe %s po
   expect(await readWebPolicy(file)).toMatchObject({ status: 'unavailable', enabled: false });
 });
 
-it('accepts canonical encoded first names and refuses ambiguous or escaping segments', () => {
-  for (const name of ['élise', '李', "o'neil", 'mary-jane', 'a.b']) {
-    const pathPrefix = `/${encodeURIComponent(name)}`;
-    expect(parseWebPolicyFile({ ...config, pathPrefix })?.pathPrefix).toBe(pathPrefix);
-  }
-  for (const pathPrefix of [
-    '/%61ya',
-    '/%2f',
-    '/%5C',
-    '/%00',
-    '/.',
-    '/..',
-    '/%70ublic',
-    '/Élise',
-    '/%C3%89lise',
-    '/mary%20jane',
-    '/%ef%bc%a1',
-    '/%',
-  ]) {
-    expect(parseWebPolicyFile({ ...config, pathPrefix }), pathPrefix).toBeUndefined();
-  }
+it('refuses the removed path-prefix field, including the old fixed mount', () => {
+  for (const pathPrefix of ['', '/aya', '/artifacts'])
+    expect(parseWebPolicyFile({ ...config, pathPrefix })).toBeUndefined();
 });

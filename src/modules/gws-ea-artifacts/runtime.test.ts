@@ -43,9 +43,40 @@ import { parseArtifactShare } from './authority.js';
 import { getArtifactRevision, listArtifacts, prepareArtifactSource, saveArtifact } from './db.js';
 import { artifactActor, hasArtifactsAccess } from './policy.js';
 import { ArtifactsRuntime } from './runtime.js';
+import { WebRuntime, type WebRuntimeDependencies } from '../gws-ea-web/runtime.js';
+import { createArtifactViewHandler } from './server.js';
+import { createArtifactViewResolver } from './access.js';
+import { artifactAdmissionEmails } from './sharing.js';
 import type { WebPolicyFile } from '../gws-ea-web/policy.js';
 import type { Session } from '../../types.js';
-let runtime: ArtifactsRuntime;
+function createRuntime(dependencies: WebRuntimeDependencies = {}) {
+  const web = new WebRuntime(
+    (config, identity) =>
+      createArtifactViewHandler({ hostname: config.hostname, resolve: createArtifactViewResolver(config, identity) }),
+    artifactAdmissionEmails,
+    dependencies,
+  );
+  const artifacts = new ArtifactsRuntime({
+    verifyAdmission: (config) => web.verifyAdmission(config),
+    publicationReady: (config) => web.publicationReady(config),
+  });
+  return {
+    sharing: artifacts.sharing,
+    health: () => web.health(),
+    start: (signal: AbortSignal) => {
+      web.start(signal);
+      artifacts.start(signal);
+    },
+    stop: async () => {
+      await Promise.all([artifacts.stop(), web.stop()]);
+    },
+    reconcile: async () => {
+      await artifacts.reconcile();
+      await web.reconcile();
+    },
+  };
+}
+let runtime: ReturnType<typeof createRuntime>;
 let policy: WebPolicyFile;
 let main: Session;
 let publication: Record<string, unknown>;
@@ -100,8 +131,7 @@ beforeEach(async () => {
   policy = {
     schemaVersion: 1,
     enabled: true,
-    hostname: 'views.example.com',
-    pathPrefix: '/artifacts',
+    hostname: 'aya.example.com',
     listenPort: await freePort(),
     accessIssuer: 'https://team.cloudflareaccess.com',
     accessAud: 'aud',
@@ -189,7 +219,7 @@ beforeEach(async () => {
     else throw new Error(`Unexpected fixture request: ${parsed.pathname}`);
     return Response.json({ success: true, result });
   };
-  runtime = new ArtifactsRuntime({
+  runtime = createRuntime({
     reconcileAccess: (input) => reconcileWebAccessEmails(input, { fetch: fetcher }),
   });
 });
@@ -456,7 +486,7 @@ it('does not bind after shutdown interrupts real Access verification, and leaves
   const observed = new Promise<void>((resolve) => {
     entered = resolve;
   });
-  runtime = new ArtifactsRuntime({
+  runtime = createRuntime({
     reconcileAccess: (input) =>
       reconcileWebAccessEmails(input, {
         fetch: async (url, options) => {
@@ -506,7 +536,7 @@ it('refuses a late startup verification after disable and restores unexpired sav
   const observed = new Promise<void>((resolve) => {
     entered = resolve;
   });
-  runtime = new ArtifactsRuntime({
+  runtime = createRuntime({
     reconcileAccess: (input) =>
       reconcileWebAccessEmails(input, {
         fetch: async (url, options) => {
@@ -547,7 +577,7 @@ it('denies a publication that expires during downtime on the first restarted ori
   await runtime.stop();
   vi.useFakeTimers({ toFake: ['Date'] });
   vi.setSystemTime(Date.parse(expiry) + 1000);
-  runtime = new ArtifactsRuntime({
+  runtime = createRuntime({
     reconcileAccess: (input) => reconcileWebAccessEmails(input, { fetch: fetcher }),
   });
   await runtime.reconcile();
@@ -588,7 +618,7 @@ it('restores central HTML and pointers through the native snapshot roots, then r
   await initDb(central, { role: 'test' });
   expect(await getDb().get('SELECT html FROM gws_ea_artifact_revisions')).toEqual({ html: '<p>Public source</p>' });
   expect(await getDb().get('SELECT state FROM gws_ea_artifact_shares')).toEqual({ state: 'active' });
-  runtime = new ArtifactsRuntime({
+  runtime = createRuntime({
     reconcileAccess: (input) => reconcileWebAccessEmails(input, { fetch: fetcher }),
   });
   expect(await runtime.health()).toMatchObject({ availability: 'unavailable' });
@@ -597,4 +627,40 @@ it('restores central HTML and pointers through the native snapshot roots, then r
   expect(emails).toEqual(['principal@example.com']);
   expect(httpCalls.filter(({ method }) => method === 'PUT')).toHaveLength(1);
   expect((await get(`/artifacts/public/${share.share_id}`)).status).toBe(200);
+});
+
+it('expires pending publication intent on the independent artifact tick while the web origin stays down', async () => {
+  const maintenance = new ArtifactsRuntime({ verifyAdmission: async () => {}, publicationReady: async () => false });
+  const expiry = new Date(Date.now() + 60000).toISOString();
+  await maintenance.sharing.submit(
+    main,
+    'outage-expiry',
+    parseArtifactShare({
+      ...publication,
+      operation: 'public_publish',
+      expires_at: expiry,
+      principal_message: { id: 'mark', messaging_group_id: 'chat' },
+    }),
+  );
+  expect(await getDb().get("SELECT state FROM gws_ea_artifact_requests WHERE request_id='outage-expiry'")).toEqual({
+    state: 'pending',
+  });
+  vi.useFakeTimers({ toFake: ['Date', 'setInterval', 'clearInterval'] });
+  const controller = new AbortController();
+  maintenance.start(controller.signal);
+  try {
+    await maintenance.reconcile();
+    vi.setSystemTime(Date.parse(expiry) + 1000);
+    await vi.advanceTimersByTimeAsync(1000);
+    await maintenance.reconcile();
+    expect(await getDb().get("SELECT state FROM gws_ea_artifact_requests WHERE request_id='outage-expiry'")).toEqual({
+      state: 'settled',
+    });
+    expect(await getDb().get('SELECT state FROM gws_ea_artifact_shares')).toEqual({ state: 'revoked' });
+    expect(await runtime.health()).toMatchObject({ availability: 'unavailable', listener: { state: 'stopped' } });
+    expect(httpCalls).toEqual([]);
+  } finally {
+    controller.abort();
+    await maintenance.stop();
+  }
 });

@@ -35,8 +35,7 @@ beforeEach(async () => {
     JSON.stringify({
       schemaVersion: 1,
       enabled: true,
-      hostname: 'views.example.com',
-      pathPrefix: '/aya',
+      hostname: 'aya.example.com',
       listenPort: 9123,
       accessIssuer: 'https://team.cloudflareaccess.com',
       accessAud: 'aud',

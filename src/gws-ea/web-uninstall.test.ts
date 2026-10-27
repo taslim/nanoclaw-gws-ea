@@ -87,7 +87,6 @@ async function fixture(assistantCount = 2, ownedPin = true) {
         schemaVersion: 1,
         enabled: true,
         hostname: claim.hostname,
-        pathPrefix: '/artifacts',
         listenPort: claim.listen_port,
         accessIssuer: 'https://team.cloudflareaccess.com',
         accessAud: `aud${i}`,
@@ -107,7 +106,11 @@ async function fixture(assistantCount = 2, ownedPin = true) {
     cloudflaredPath: '/usr/local/bin/cloudflared',
     tunnelId: 'tunnel',
     pin: { id: 'pin', owned: ownedPin },
-    dns: { 'views.example.com': { id: 'dns', zoneId: 'zone' } },
+    dns: assistantCount
+      ? Object.fromEntries(
+          Object.values(assistants).map(({ claim }, i) => [claim.hostname, { id: `dns${i}`, zoneId: 'zone' }]),
+        )
+      : { 'views.example.com': { id: 'dns', zoneId: 'zone' } },
     assistants,
   };
   await writeWebOperatorConfig(files.configFile, config);
@@ -119,7 +122,7 @@ async function fixture(assistantCount = 2, ownedPin = true) {
       { id: assistant.applicationId },
     ]),
     ['/accounts/account/cfd_tunnel/tunnel', { id: 'tunnel', config_src: 'cloudflare' }],
-    ['/zones/zone/dns_records/dns', { id: 'dns' }],
+    ...Object.values(config.dns).map((dns): [string, unknown] => [`/zones/zone/dns_records/${dns.id}`, { id: dns.id }]),
     ['/accounts/account/access/identity_providers/pin', { id: 'pin', type: 'onetimepin' }],
   ]);
   let ingress: { config: { ingress: readonly unknown[] } } = {
@@ -309,6 +312,69 @@ it('uninstalls a host with a namespace claim but no assistant remote resource re
   expect(await inspectWebUninstall(f.paths)).toBeUndefined();
 });
 
+it('retains a partial assistant claim until its recorded DNS cleanup settles', async () => {
+  const f = await fixture(0);
+  const id = await claimWithoutResources(f);
+  f.fail('/zones/zone/dns_records/dns');
+  expect(await uninstallWebConnector(f.paths, f.dependencies)).toMatchObject({ outcome: 'pending' });
+  expect((await readRegistry(f.paths)).instances[id].exclusive_resource_claims.web).toEqual({
+    hostname: 'views.example.com',
+    listen_port: 48002,
+  });
+  const receipt = await inspectWebUninstall(f.paths);
+  expect(receipt?.completed_assistant_ids).toEqual([]);
+  expect(receipt?.assistants[id].ownership.assistants[id]).toEqual({
+    claim: { hostname: 'views.example.com', listen_port: 48002 },
+    enabled: false,
+  });
+  expect(f.mutations).not.toContain('DELETE /accounts/account/cfd_tunnel/tunnel');
+  f.fail();
+  expect(await uninstallWebConnector(f.paths, f.dependencies)).toMatchObject({ outcome: 'removed' });
+  expect((await readRegistry(f.paths)).instances[id].exclusive_resource_claims.web).toBeUndefined();
+  expect(f.resources.size).toBe(0);
+  expect(await inspectWebUninstall(f.paths)).toBeUndefined();
+});
+
+it('retains a partial assistant claim and exact pending DNS attempt until the operator resolves it', async () => {
+  const f = await fixture(0);
+  const id = await claimWithoutResources(f);
+  const pending = {
+    kind: 'dns' as const,
+    key: randomUUID(),
+    target: 'views.example.com',
+    startedAt: new Date().toISOString(),
+    resource: '/zones/zone/dns_records',
+    fingerprint: 'b'.repeat(64),
+  };
+  await writeWebOperatorConfig(f.files.configFile, { ...f.config, dns: {}, pending });
+  expect(await uninstallWebConnector(f.paths, f.dependencies)).toMatchObject({ outcome: 'pending' });
+  expect((await readRegistry(f.paths)).instances[id].exclusive_resource_claims.web?.hostname).toBe('views.example.com');
+  const receipt = await inspectWebUninstall(f.paths);
+  expect(receipt?.assistants[id].ownership.pending).toEqual(pending);
+  expect(receipt?.assistants[id].ownership.assistants[id]).toEqual({
+    claim: { hostname: 'views.example.com', listen_port: 48002 },
+    enabled: false,
+  });
+  expect(f.mutations.some((effect) => effect.startsWith('DELETE'))).toBe(false);
+  // The operator removes the possible remote creation before acknowledging its exact journal entry.
+  f.resources.delete('/zones/zone/dns_records/dns');
+  await writeWebOperatorConfig(f.files.configFile, {
+    ...f.config,
+    dns: {},
+    resolvedAttempts: [
+      {
+        ...pending,
+        resolution: 'operator_removed',
+        resolvedAt: new Date().toISOString(),
+      },
+    ],
+  });
+  expect(await uninstallWebConnector(f.paths, f.dependencies)).toMatchObject({ outcome: 'removed' });
+  expect((await readRegistry(f.paths)).instances[id].exclusive_resource_claims.web).toBeUndefined();
+  expect(f.resources.size).toBe(0);
+  expect(await inspectWebUninstall(f.paths)).toBeUndefined();
+});
+
 it('releases a claim with no configuration or local resource policy without contacting Cloudflare', async () => {
   const f = await fixture(0);
   const id = await claimWithoutResources(f);
@@ -352,7 +418,7 @@ it('keeps an unproven application creation fenced after releasing its resource-f
     resource: '/accounts/account/access/apps',
     fingerprint: 'b'.repeat(64),
   };
-  await writeWebOperatorConfig(f.files.configFile, { ...f.config, pending });
+  await writeWebOperatorConfig(f.files.configFile, { ...f.config, dns: {}, pending });
   expect(await uninstallWebConnector(f.paths, f.dependencies)).toMatchObject({ outcome: 'pending' });
   expect((await readRegistry(f.paths)).instances[id].exclusive_resource_claims.web).toBeUndefined();
   expect((await inspectWebUninstall(f.paths))?.shared.ownership.pending).toEqual(pending);
@@ -370,4 +436,46 @@ it('returns operator token revocation and original credential-file cleanup after
   expect(result.operator_actions.join(' ')).toContain('--credential-file');
   expect(result.operator_actions.join(' ')).toContain('delete');
   expect(await exists(f.config.credentialFile)).toBe(false);
+});
+
+it('installs a different verified zone after uninstall removes the previous connector ownership', async () => {
+  const f = await fixture(0);
+  expect(await uninstallWebConnector(f.paths, f.dependencies)).toMatchObject({ outcome: 'removed' });
+  const credentialFile = path.join(f.paths.configRoot, 'new-zone-credential');
+  await writePrivateTextFile(credentialFile, randomBytes(32).toString('hex'));
+  const requests: string[] = [];
+  expect(
+    await installWebConnector(
+      f.paths,
+      {
+        accountId: 'new-account',
+        teamName: 'new-team',
+        zoneId: 'new-zone',
+        credentialFile,
+        cloudflaredPath: '/usr/bin/true',
+      },
+      {
+        fetch: async (input, init) => {
+          const resource = new URL(String(input)).pathname;
+          requests.push(`${init?.method} ${resource}`);
+          const result = resource.endsWith('/zones/new-zone')
+            ? { id: 'new-zone', status: 'active', name: 'another.example', account: { id: 'new-account' } }
+            : { auth_domain: 'new-team.cloudflareaccess.com' };
+          return Response.json({ success: true, result });
+        },
+      },
+    ),
+  ).toMatchObject({ installed: true, assistants: [] });
+  expect(await readWebOperatorConfig(f.files.configFile)).toMatchObject({
+    accountId: 'new-account',
+    teamName: 'new-team',
+    zoneId: 'new-zone',
+    zoneApex: 'another.example',
+    assistants: {},
+    dns: {},
+  });
+  expect(requests).toEqual([
+    'GET /client/v4/zones/new-zone',
+    'GET /client/v4/accounts/new-account/access/organizations',
+  ]);
 });

@@ -29,7 +29,7 @@ const scenarios = [
   { words: ['gws-ea', 'connectors', 'install', 'voice', ''], includes: '--model', excludes: 'voice' },
   { words: ['gws-ea', 'connectors', 'show', 'voice', ''], includes: '--id', excludes: '--model' },
   { words: ['gws-ea', 'connectors', 'check', 'web', ''], includes: '--id', excludes: '--model' },
-  { words: ['gws-ea', 'connectors', 'install', ''], includes: 'onepassword', excludes: '--id' },
+  { words: ['gws-ea', 'connectors', 'install', ''], includes: 'web', excludes: 'artifacts' },
   { words: ['gws-ea', 'connectors', 'install', 'onepassword', ''], includes: '--account', excludes: '--id' },
   { words: ['gws-ea', 'connectors', 'check', 'onepassword', ''], includes: '--json', excludes: '--account' },
   { words: ['gws-ea', 'connectors', 'uninstall', ''], includes: 'onepassword', excludes: '--id' },

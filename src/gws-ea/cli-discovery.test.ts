@@ -53,6 +53,7 @@ describe('local CLI discovery and grammar', () => {
       JSON.parse(io.stdout.join('\n'));
     expect(schema.commands).toHaveLength(13);
     expect(schema.commands.some((command) => command.path.includes('browser'))).toBe(false);
+    expect(schema.commands.some((command) => command.path.includes('artifacts'))).toBe(false);
     for (const name of ['voice', 'onepassword', 'web']) {
       const commands = schema.commands.filter((command) => command.path[2] === name);
       expect(commands.map((command) => command.path[1])).toEqual(['install', 'uninstall', 'show', 'check']);
@@ -169,6 +170,7 @@ describe('local CLI discovery and grammar', () => {
     { args: ['connectors', 'install', 'voice', '--invented', '--json'], command: 'connectors install voice' },
     { args: ['--json', 'connectors', 'invented', 'voice'], command: 'connectors invented voice' },
     { args: ['connectors', 'install', 'calendar', '--json'], command: 'connectors install calendar' },
+    { args: ['connectors', 'install', 'artifacts', '--json'], command: 'connectors install artifacts' },
   ])('retains the requested nested path in usage for $command', async ({ args, command }) => {
     const io = capture();
     expect(await runCli(args, io.runtime)).toBe(2);

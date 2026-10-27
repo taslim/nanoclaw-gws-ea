@@ -185,7 +185,7 @@ export function validateReservation(value: unknown): InstanceReservation {
   const allocatedPorts = validatePorts(value.allocated_ports);
   const claims = validateClaims(value.exclusive_resource_claims, instanceId);
   if (claims.web && Object.values(allocatedPorts).includes(claims.web.listen_port))
-    throw new GwsEaError('invalid_claim', 'The artifact listener must have its own distinct port');
+    throw new GwsEaError('invalid_claim', 'The web listener must have its own distinct port');
   return {
     instance_id: instanceId,
     release_track: release.release_track,
@@ -305,7 +305,7 @@ export async function claimInstanceWeb(
     const previous = stored.exclusive_resource_claims.web;
     if (previous) {
       if (JSON.stringify(previous) !== JSON.stringify(validateWebClaim(claim)))
-        throw new GwsEaError('claim_conflict', 'Existing artifact links retain their claimed hostname and port.');
+        throw new GwsEaError('claim_conflict', 'The existing web address retains its claimed hostname and port.');
       return stored;
     }
     await preflight?.(registry);
@@ -334,7 +334,7 @@ export async function releaseInstanceWeb(
     const current = stored?.exclusive_resource_claims.web;
     if (!stored || !current) return;
     if (JSON.stringify(current) !== JSON.stringify(claim))
-      throw new GwsEaError('reservation_mismatch', 'Artifact namespace changed during cleanup; refusing release.');
+      throw new GwsEaError('reservation_mismatch', 'Web namespace changed during cleanup; refusing release.');
     const { web: _web, ...claims } = stored.exclusive_resource_claims;
     const next = validateReservation({ ...stored, exclusive_resource_claims: claims });
     await writePrivate(paths.registryFile, {

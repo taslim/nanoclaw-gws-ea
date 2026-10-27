@@ -461,7 +461,7 @@ export const STATUS_DATA_SCHEMA = object({
 });
 export const CONNECTOR_LIST_SCHEMA = object({ connectors: array(CONNECTOR_OBSERVATION_SCHEMA) });
 export const ALIAS_OPERATION_SCHEMA = object({ instance_id: text, pause }, ['instance_id']);
-const artifactProvisioning = object({
+const webProvisioning = object({
   instance_id: text,
   outcome: choices('ready', 'pending', 'unsupported'),
   reason: nullable(text),
@@ -526,7 +526,7 @@ export const CONNECTOR_OPERATION_SCHEMA = {
       scope: { const: 'host' },
       installed: { const: true },
       changed: bool,
-      assistants: array(artifactProvisioning),
+      assistants: array(webProvisioning),
     }),
     object({
       name: { const: 'web' },

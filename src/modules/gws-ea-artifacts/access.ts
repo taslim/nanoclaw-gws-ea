@@ -1,57 +1,26 @@
 import type { IncomingMessage } from 'node:http';
-import { createRemoteJWKSet, customFetch, jwtVerify } from 'jose';
 import { getDb } from '../../db/connection.js';
-import { normalizePrincipalEmail } from '../../gws-ea/validation.js';
 import { listPrincipalAddresses } from '../gws-ea-profile/db.js';
-import { artifactDigest } from './db.js';
-import { readWebPolicy, type WebPolicyFile } from '../gws-ea-web/policy.js';
+import { readWebPolicy, webPolicyDigest, type WebPolicyFile } from '../gws-ea-web/policy.js';
+import { createWebIdentity, type WebIdentity } from '../gws-ea-web/access.js';
 import type { ArtifactViewRoute, AuthorizedArtifactView } from './server.js';
 
-export type ArtifactIdentityVerifier = (token: string | undefined) => Promise<string | undefined>;
-/** One configured key cache per running origin. Token headers cannot choose its key endpoint. */
-export function createArtifactIdentityVerifier(
-  issuer: string,
-  audience: string,
-  fetcher: typeof fetch = fetch,
-): ArtifactIdentityVerifier {
-  const keys = createRemoteJWKSet(new URL(`${issuer}/cdn-cgi/access/certs`), {
-    [customFetch]: fetcher,
-    timeoutDuration: 5000,
-  });
-  return async (token) => {
-    if (!token || token.length > 32 * 1024) return undefined;
-    /* eslint-disable no-catch-all/no-catch-all -- all malformed or unverifiable identities deny this request */
-    try {
-      const { payload } = await jwtVerify(token, keys, {
-        algorithms: ['RS256'],
-        issuer,
-        audience,
-        requiredClaims: ['exp', 'email', 'iss', 'aud'],
-      });
-      return typeof payload.email === 'string' ? normalizePrincipalEmail(payload.email) : undefined;
-    } catch {
-      return undefined;
-    }
-    /* eslint-enable no-catch-all/no-catch-all */
-  };
-}
 export function createArtifactViewResolver(
   config: WebPolicyFile,
-  verify: ArtifactIdentityVerifier = createArtifactIdentityVerifier(config.accessIssuer, config.accessAud),
+  identity: WebIdentity = createWebIdentity(config),
 ): (request: IncomingMessage, route: ArtifactViewRoute) => Promise<AuthorizedArtifactView | undefined> {
   return async (request, route) => {
     const policy = await readWebPolicy();
-    if (policy.status !== 'enabled' || artifactDigest(policy.config) !== artifactDigest(config)) return undefined;
+    if (policy.status !== 'enabled' || webPolicyDigest(policy.config) !== webPolicyDigest(config)) return undefined;
     let email: string | undefined;
     let principal = false;
     if (route.audience !== 'public') {
-      const assertion = request.headers['cf-access-jwt-assertion'];
-      email = await verify(typeof assertion === 'string' ? assertion : undefined);
+      email = await identity(request);
       if (!email) return undefined;
       principal = (await listPrincipalAddresses()).some((address) => address.email === email);
       if (route.audience === 'private' && !principal) return undefined;
       const fresh = await readWebPolicy();
-      if (fresh.status !== 'enabled' || artifactDigest(fresh.config) !== artifactDigest(config)) return undefined;
+      if (fresh.status !== 'enabled' || webPolicyDigest(fresh.config) !== webPolicyDigest(config)) return undefined;
     }
     const now = new Date().toISOString();
     if (route.audience === 'private') {

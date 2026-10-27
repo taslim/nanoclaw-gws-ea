@@ -292,8 +292,7 @@ async function target(paths: ControlPlanePaths, instanceId: string) {
   return { reservation, runtime, policyFile: instanceWebPolicyFile(runtime) };
 }
 async function writePolicy(file: string, policy: WebPolicyFile): Promise<void> {
-  if (!parseWebPolicyFile(policy))
-    throw new GwsEaError('web_policy_invalid', 'Artifact policy coordinates are invalid.');
+  if (!parseWebPolicyFile(policy)) throw new GwsEaError('web_policy_invalid', 'Web policy coordinates are invalid.');
   await preparePrivateDirectory(path.dirname(file));
   await writePrivateTextFile(file, `${JSON.stringify(policy)}\n`);
 }
@@ -456,6 +455,45 @@ function assertNoAccessOverlap(apps: readonly Record<string, unknown>[], hostnam
   }
 }
 
+/** Read-only hostname preflight; callers decide whether its result permits a claim or only reports readiness. */
+export async function assertWebHostnameAvailable(
+  config: WebOperatorConfig,
+  hostname: string,
+  dependencies: WebCapabilityDependencies = {},
+): Promise<void> {
+  const api = await webApi(config, dependencies);
+  for (const name of [hostname, `*.${config.zoneApex}`]) {
+    const records = await api.list(`/zones/${config.zoneId}/dns_records?name=${encodeURIComponent(name)}`);
+    for (const record of records) {
+      if (record.id !== config.dns[name]?.id)
+        throw new GwsEaError(
+          'web_hostname_foreign',
+          `DNS record ${name} (${cloudflareId(record)}) already covers ${hostname}. Remove that unowned record and rerun gws-ea connectors install web.`,
+        );
+    }
+  }
+  assertNoAccessOverlap(await api.list(`/accounts/${config.accountId}/access/apps`), hostname);
+  if (config.tunnelId) {
+    const current = await api.request(
+      'GET',
+      `/accounts/${config.accountId}/cfd_tunnel/${config.tunnelId}/configurations`,
+    );
+    const routes = isRecord(current) && isRecord(current.config) ? current.config.ingress : undefined;
+    if (!Array.isArray(routes) || !routes.every(isRecord))
+      throw new GwsEaError('web_tunnel_invalid', 'The recorded tunnel ingress could not be verified.');
+    for (const route of routes) {
+      if (
+        overlapsHostname(route.hostname, hostname) ||
+        (route.hostname === undefined && (route.path !== undefined || route.service !== 'http_status:404'))
+      )
+        throw new GwsEaError(
+          'web_hostname_foreign',
+          `Tunnel route ${String(route.hostname ?? '*')} already covers ${hostname}. Remove that unowned route and rerun gws-ea connectors install web.`,
+        );
+    }
+  }
+}
+
 async function claimNamespace(
   paths: ControlPlanePaths,
   instanceId: string,
@@ -467,7 +505,10 @@ async function claimNamespace(
   if (previous) return previous;
   const label = asciiName(firstName).slice(0, 63);
   if (!/[a-z]/u.test(label))
-    throw new GwsEaError('web_name_unusable', `“${firstName}” has no Latin letter for a web address.`);
+    throw new GwsEaError(
+      'web_name_unusable',
+      `“${firstName}” has no Latin letter for a web address. Recreate this assistant under a first name with a Latin letter.`,
+    );
   const hostname = `${label}.${config.zoneApex}`;
   const server = createServer();
   await new Promise<void>((resolve, reject) => {
@@ -484,40 +525,13 @@ async function claimNamespace(
           assistant.instance_id !== instanceId && assistant.exclusive_resource_claims.web?.hostname === hostname,
       );
       if (holder)
-        throw new GwsEaError('web_hostname_claimed', `${hostname} is already held by assistant ${holder.instance_id}.`);
+        throw new GwsEaError(
+          'web_hostname_claimed',
+          `${hostname} is already held by assistant ${holder.instance_id}. Recreate this assistant under another first name, or remove the holder.`,
+        );
       const live = await readWebOperatorConfig(webOperatorFiles(paths).configFile);
       if (!live) throw new GwsEaError('web_not_installed', 'Web is not installed on this operator host.');
-      const api = await webApi(live, dependencies);
-      for (const name of [hostname, `*.${live.zoneApex}`]) {
-        const records = await api.list(`/zones/${live.zoneId}/dns_records?name=${encodeURIComponent(name)}`);
-        for (const record of records) {
-          if (record.id !== live.dns[name]?.id)
-            throw new GwsEaError(
-              'web_hostname_foreign',
-              `DNS record ${name} (${cloudflareId(record)}) already covers ${hostname}. Remove that unowned record and rerun gws-ea connectors install web.`,
-            );
-        }
-      }
-      assertNoAccessOverlap(await api.list(`/accounts/${live.accountId}/access/apps`), hostname);
-      if (live.tunnelId) {
-        const current = await api.request(
-          'GET',
-          `/accounts/${live.accountId}/cfd_tunnel/${live.tunnelId}/configurations`,
-        );
-        const routes = isRecord(current) && isRecord(current.config) ? current.config.ingress : undefined;
-        if (!Array.isArray(routes) || !routes.every(isRecord))
-          throw new GwsEaError('web_tunnel_invalid', 'The recorded tunnel ingress could not be verified.');
-        for (const route of routes) {
-          if (
-            overlapsHostname(route.hostname, hostname) ||
-            (route.hostname === undefined && (route.path !== undefined || route.service !== 'http_status:404'))
-          )
-            throw new GwsEaError(
-              'web_hostname_foreign',
-              `Tunnel route ${String(route.hostname ?? '*')} already covers ${hostname}. Remove that unowned route and rerun gws-ea connectors install web.`,
-            );
-        }
-      }
+      await assertWebHostnameAvailable(live, hostname, dependencies);
     });
     return claim;
   } finally {
@@ -680,7 +694,7 @@ async function provision(
           'pin',
           randomUUID(),
           `${account}/access/identity_providers`,
-          { name: 'Artifact email PIN', type: 'onetimepin', config: {} },
+          { name: 'Web email PIN', type: 'onetimepin', config: {} },
           (id) => ({ ...config, pin: { id, owned: true } }),
         );
     }
@@ -723,7 +737,7 @@ async function provision(
     assertDns(record, claim.hostname, config.tunnelId!, ownedDns.id);
     let assistant: WebRemoteAssistant = config.assistants[instanceId] ?? { claim, enabled: false };
     if (JSON.stringify(assistant.claim) !== JSON.stringify(claim))
-      throw new GwsEaError('web_owner_mismatch', 'Recorded artifact namespace does not match the assistant claim.');
+      throw new GwsEaError('web_owner_mismatch', 'Recorded web namespace does not match the assistant claim.');
     const apps = await api.list(`${account}/access/apps`);
     assertNoAccessOverlap(apps, claim.hostname, assistant.applicationId);
     if (!assistant.applicationId) {
@@ -999,14 +1013,14 @@ async function provisionWebAssistant(
         return operation(instanceId, recorded.claim, true, false);
       throw new GwsEaError(
         'web_listener_unavailable',
-        'The running assistant has not verified its artifact listener. Its existing artifact configuration is retained.',
+        'The running assistant has not verified its web listener. Its existing web configuration is retained.',
       );
     }
     ownershipMismatch = confirmedOwnershipMismatch(current.reason_code);
     if (current.remote !== 'mismatch')
       throw new GwsEaError(
         'web_not_ready',
-        `${current.reason ?? 'Artifact prerequisites could not be observed.'} The existing artifact configuration is retained.`,
+        `${current.reason ?? 'Web prerequisites could not be observed.'} The existing web configuration is retained.`,
       );
   }
   await dependencies.recordEffect?.(null);
@@ -1021,7 +1035,7 @@ async function provisionWebAssistant(
       !Array.isArray(current.emails) ||
       !current.emails.every((email): email is string => typeof email === 'string')
     )
-      throw new GwsEaError('web_profile_unavailable', 'The host could not read authoritative artifact admission.');
+      throw new GwsEaError('web_profile_unavailable', 'The host could not read authoritative web admission.');
     const exact = webEmails(current.emails);
     if (!principalEmails.every((email) => exact.includes(email)))
       throw new GwsEaError(
@@ -1049,7 +1063,6 @@ async function provisionWebAssistant(
       schemaVersion: 1,
       enabled: true,
       hostname: claim.hostname,
-      pathPrefix: '/artifacts',
       listenPort: claim.listen_port,
       accessIssuer: `https://${provisioned.teamName}.cloudflareaccess.com`,
       accessAud: assistant.aud!,
@@ -1065,7 +1078,7 @@ async function provisionWebAssistant(
     if (!(await waitForArtifactListener(runtime, dependencies, claim.listen_port)))
       throw new GwsEaError(
         'web_listener_unavailable',
-        'The running assistant has not verified its artifact listener. Artifact ingress remains closed.',
+        'The running assistant has not verified its web listener. Web ingress remains closed.',
       );
     await withMachineLock(paths, async () => {
       const live = await readWebOperatorConfig(webOperatorFiles(paths).configFile);
@@ -1078,7 +1091,7 @@ async function provisionWebAssistant(
     if (observed.remote !== 'verified' || observed.listener !== 'listening')
       throw new GwsEaError(
         'web_not_ready',
-        'Artifact prerequisites have not all been verified. Check this connector after resolving the reported prerequisite.',
+        'Web prerequisites have not all been verified. Check this connector after resolving the reported prerequisite.',
       );
     if (!preserveEnabled) {
       const authors = await ncl(runtime, ['gws-ea-artifacts-author-groups']);
@@ -1105,7 +1118,7 @@ async function provisionWebAssistant(
         policy.status !== 'enabled' ||
         JSON.stringify(policy.config) !== JSON.stringify(activationPolicy)
       )
-        throw new GwsEaError('web_disabled', 'Artifact coordinates changed before activation completed.');
+        throw new GwsEaError('web_disabled', 'Web coordinates changed before activation completed.');
       await writeWebOperatorConfig(file, {
         ...live,
         assistants: { ...live.assistants, [instanceId]: { ...current, publicationReady: true } },
@@ -1206,7 +1219,6 @@ export async function inspectWebCapability(
         throw new GwsEaError('web_not_provisioned', 'Web have incomplete or unresolved provisioning.');
       if (
         coordinates.hostname !== assistant.claim.hostname ||
-        coordinates.pathPrefix !== '/artifacts' ||
         coordinates.listenPort !== assistant.claim.listen_port ||
         coordinates.accessAud !== assistant.aud ||
         coordinates.accessIssuer !== `https://${config.teamName}.cloudflareaccess.com` ||
@@ -1217,7 +1229,7 @@ export async function inspectWebCapability(
       )
         throw new GwsEaError(
           'web_owner_mismatch',
-          'Artifact policy does not match current owned resources and enabled intent.',
+          'Web policy does not match current owned resources and enabled intent.',
         );
       const api = await webApi(config, dependencies);
       await verifyCoordinates(api, config, config.zoneApex);
@@ -1289,7 +1301,7 @@ export async function inspectWebCapability(
               expectedRoutes[0].originRequest.access.required === true)
           : expectedRoutes.length !== 0)
       )
-        throw new GwsEaError('web_tunnel_unverified', 'Artifact ingress does not match current policy.');
+        throw new GwsEaError('web_tunnel_unverified', 'Web ingress does not match current policy.');
       const connections = await api.request('GET', `${account}/cfd_tunnel/${config.tunnelId}/connections`);
       if (
         policy.enabled &&
@@ -1304,7 +1316,7 @@ export async function inspectWebCapability(
         reason = 'The running host listener is not available at its claimed port.';
       else if (policy.enabled && assistant.publicationReady !== true)
         reason =
-          'Artifact activation has not completed. Rerun gws-ea connectors install web to verify and finish activation.';
+          'Web activation has not completed. Rerun gws-ea connectors install web to verify and finish activation.';
       // eslint-disable-next-line no-catch-all/no-catch-all -- Optional status never exposes raw API, process or credential failures.
     } catch (cause) {
       reasonCode = cause instanceof GwsEaError ? cause.code : 'web_host_unavailable';
@@ -1330,7 +1342,7 @@ export async function inspectWebCapability(
       reason =
         cause instanceof GwsEaError
           ? cause.message
-          : 'Artifact prerequisites could not be observed. Check the owner-only configuration and running host.';
+          : 'Web prerequisites could not be observed. Check the owner-only configuration and running host.';
     }
   }
   return {

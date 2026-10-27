@@ -58,5 +58,5 @@ export async function artifactActor(session: Session, policy?: WebPolicy): Promi
   };
 }
 export function artifactPrivateUrl(config: WebPolicyFile, artifactId: string): string {
-  return `https://${config.hostname}${config.pathPrefix}/${encodeURIComponent(artifactId)}`;
+  return `https://${config.hostname}/artifacts/${encodeURIComponent(artifactId)}`;
 }

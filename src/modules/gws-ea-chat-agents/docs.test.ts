@@ -136,8 +136,7 @@ function enableArtifacts(): void {
     JSON.stringify({
       schemaVersion: 1,
       enabled: true,
-      hostname: 'views.example.com',
-      pathPrefix: '/aya',
+      hostname: 'aya.example.com',
       listenPort: 9123,
       accessIssuer: 'https://team.cloudflareaccess.com',
       accessAud: 'aud',
@@ -156,7 +155,7 @@ async function privateArtifactLink(): Promise<string> {
     { create_key: 'report', title: 'Report' },
     prepareArtifactSource(Buffer.from('<p>Report</p>')),
   );
-  return `https://views.example.com/aya/${saved.artifact_id}`;
+  return `https://aya.example.com/artifacts/${saved.artifact_id}`;
 }
 async function outsideFile(): Promise<string> {
   const file = await drive.createFile({ name: 'Outside document', mimeType: 'application/vnd.google-apps.document' });
@@ -783,7 +782,7 @@ it('keeps an ambiguous folder under the same reserved ID when Drive cannot confi
 it('checks artifact-only links before an edit or a document share exposes them', async () => {
   const file = await made();
   enableArtifacts();
-  const link = 'https://views.example.com/aya/share/11111111-1111-4111-8111-111111111111';
+  const link = 'https://aya.example.com/artifacts/share/11111111-1111-4111-8111-111111111111';
   expect(
     refused(
       await request(job, 'doc_edit', { file, revision: await observedRevision(file), find: 'the lake', replace: link }),

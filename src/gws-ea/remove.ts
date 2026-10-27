@@ -13,7 +13,7 @@
  * assistant's Google Chat subscription goes after the host, which would only
  * create it again, and before the project, which takes its topic, its Pub/Sub
  * subscription, and its subscriber account with it. The assistant's 1Password
- * and artifact resources go after the host too, once nothing can use them,
+ * and web resources go after the host too, once nothing can use them,
  * and their IDs are copied into the receipt before anything changes. The
  * receipt outlives the instance while 1Password owes the operator something
  * they have not closed, or when web were abandoned.
@@ -150,7 +150,7 @@ const UNREADABLE_CLEANUP = 'removal_receipt_unreadable';
 const RESOURCE_STEPS: Readonly<Record<RemovalResource, StepIdentity>> = {
   whatsapp: { id: 'remove_whatsapp', label: 'Signing out the assistant’s WhatsApp device…' },
   nanoclaw: { id: 'remove_nanoclaw', label: 'Stopping NanoClaw…' },
-  web: { id: 'remove_web', label: 'Removing the assistant’s owned artifact access…' },
+  web: { id: 'remove_web', label: 'Removing the assistant’s owned web access…' },
   'chat-subscription': { id: 'remove_chat_subscription', label: 'Deleting the Google Chat subscription…' },
   onepassword: { id: 'remove_onepassword', label: "Cleaning up the assistant's 1Password vault and token…" },
   'gcp-project': { id: 'remove_gcp_project', label: 'Deleting the Google Cloud project…' },
@@ -284,10 +284,10 @@ function entries<K extends string, V>(keys: readonly K[], value: unknown, parse:
  * cannot be parsed, stops removal with `removal_receipt_unreadable`.
  */
 async function readReceipt(paths: ControlPlanePaths, instanceId: string): Promise<RemovalReceipt | undefined> {
-  let artifactEvidence = false;
+  let webEvidence = false;
   try {
     const raw = await readOwnerOnlyJson(paths.removalFile(instanceId), 'Removal receipt', 'invalid_removal');
-    artifactEvidence = isRecord(raw) && raw.web !== undefined;
+    webEvidence = isRecord(raw) && raw.web !== undefined;
     if (!isRecord(raw) || raw.instance_id !== instanceId) {
       throw new GwsEaError('invalid_removal', 'Removal receipt does not match this instance');
     }
@@ -308,7 +308,7 @@ async function readReceipt(paths: ControlPlanePaths, instanceId: string): Promis
     if (raw.web !== undefined && !web)
       throw new GwsEaError(
         UNREADABLE_CLEANUP,
-        `The removal receipt ${paths.removalFile(instanceId)} names artifact resources it cannot read safely; removal stops so their IDs are not lost.`,
+        `The removal receipt ${paths.removalFile(instanceId)} names web resources it cannot read safely; removal stops so their IDs are not lost.`,
       );
     if (raw.onepassword !== undefined && !onepassword)
       throw new GwsEaError(
@@ -329,10 +329,10 @@ async function readReceipt(paths: ControlPlanePaths, instanceId: string): Promis
     };
   } catch (error) {
     if (isErrno(error, 'ENOENT')) return undefined;
-    if (artifactEvidence && error instanceof GwsEaError && error.code !== UNREADABLE_CLEANUP)
+    if (webEvidence && error instanceof GwsEaError && error.code !== UNREADABLE_CLEANUP)
       throw new GwsEaError(
         UNREADABLE_CLEANUP,
-        `The artifact removal receipt ${paths.removalFile(instanceId)} cannot be interpreted safely. Preserve its exact ownership evidence before retrying.`,
+        `The web removal receipt ${paths.removalFile(instanceId)} cannot be interpreted safely. Preserve its exact ownership evidence before retrying.`,
       );
     if (!(error instanceof GwsEaError) || error.code === UNREADABLE_CLEANUP) throw error;
     activeStep()?.write(`${error.message}; its resources are observed again\n`);

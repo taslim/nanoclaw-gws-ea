@@ -42,6 +42,8 @@ import { upsertUser } from '../permissions/db/users.js';
 import { getApprovalHandler, getApprovalRejectionFinalizer } from '../approvals/primitive.js';
 import { addPrivateValue } from '../gws-ea-privacy/db.js';
 import { createArtifactViewResolver } from './access.js';
+import { createWebIdentity } from '../gws-ea-web/access.js';
+import { webPolicyDigest } from '../gws-ea-web/policy.js';
 import { ARTIFACT_SHARE_APPROVAL, authorizeArtifactShare, parseArtifactShare } from './authority.js';
 import { artifactDigest, deleteArtifact, prepareArtifactSource, saveArtifact } from './db.js';
 import { artifactAdmissionEmails, artifactShares, ArtifactSharing } from './sharing.js';
@@ -54,8 +56,7 @@ let remote = vi.fn(async (_config: WebPolicyFile): Promise<void> => {});
 const policy: WebPolicyFile = {
   schemaVersion: 1,
   enabled: true,
-  hostname: 'views.example.com',
-  pathPrefix: '/aya',
+  hostname: 'aya.example.com',
   listenPort: 9123,
   accessIssuer: 'https://team.cloudflareaccess.com',
   accessAud: 'aud',
@@ -98,7 +99,10 @@ function request(email?: string): IncomingMessage {
   return message;
 }
 async function view(id: string, audience: 'private' | 'share' | 'public', email?: string) {
-  const resolver = createArtifactViewResolver(policy, async (identity) => identity);
+  const resolver = createArtifactViewResolver(
+    policy,
+    createWebIdentity(policy, async (identity) => identity),
+  );
   return resolver(request(email), { id, audience, viewPath: '/' });
 }
 beforeEach(async () => {
@@ -438,7 +442,7 @@ async function seedApproval(requestId: string, text: string) {
     scope_hash: authority.scopeHash,
     share_id: shareId,
     generation: 1,
-    policy_hash: artifactDigest(policy),
+    policy_hash: webPolicyDigest(policy),
   };
   const now = new Date().toISOString();
   await getDb().transaction(async () => {
@@ -622,7 +626,7 @@ it('advances bounded recovery past more than 32 held requests and resumes a late
       scope_hash: authority.scopeHash,
       share_id: shareId,
       generation: 1,
-      policy_hash: artifactDigest(policy),
+      policy_hash: webPolicyDigest(policy),
     }),
     now,
   );

@@ -1,72 +1,142 @@
-import { expect, it, vi } from 'vitest';
+import fs from 'node:fs';
+import path from 'node:path';
+import { IncomingMessage } from 'node:http';
+import { Socket } from 'node:net';
 import { exportJWK, generateKeyPair, SignJWT } from 'jose';
-import { createArtifactIdentityVerifier } from './access.js';
+import { afterEach, beforeEach, expect, it, vi } from 'vitest';
+const ROOT = await vi.hoisted(async () => {
+  const { realpathSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  return join(realpathSync(tmpdir()), `artifact-access-${process.pid}`);
+});
+vi.mock('../../config.js', async (original) => ({
+  ...(await original<typeof import('../../config.js')>()),
+  DATA_DIR: ROOT,
+}));
+vi.mock('../../log.js', () => ({ log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() } }));
+import '../index.js';
+import { closeDb, createAgentGroup, createSession, getDb, initTestDb, runMigrations } from '../../db/index.js';
+import { createWebIdentity, createWebIdentityVerifier } from '../gws-ea-web/access.js';
+import type { WebPolicyFile } from '../gws-ea-web/policy.js';
+import { createArtifactViewResolver } from './access.js';
+import { prepareArtifactSource, saveArtifact } from './db.js';
 
-it('verifies only configured RS256 issuer, audience, lifetime and email using cached configured JWKS', async () => {
-  const { privateKey, publicKey } = await generateKeyPair('RS256');
-  const jwk = { ...(await exportJWK(publicKey)), kid: 'first', alg: 'RS256', use: 'sig' };
-  const urls: string[] = [];
-  const verify = createArtifactIdentityVerifier('https://team.cloudflareaccess.com', 'app', async (input) => {
-    urls.push(String(input));
-    return Response.json({ keys: [jwk] });
-  });
-  const token = (claims: Record<string, unknown> = {}, issuer = 'https://team.cloudflareaccess.com', aud = 'app') =>
-    new SignJWT({ email: 'Principal@Example.com', ...claims })
-      .setProtectedHeader({ alg: 'RS256', kid: 'first', jku: 'https://evil.example/keys' })
-      .setIssuer(issuer)
+const config: WebPolicyFile = {
+  schemaVersion: 1,
+  enabled: true,
+  hostname: 'aya.example.com',
+  listenPort: 9123,
+  accessIssuer: 'https://team.cloudflareaccess.com',
+  accessAud: 'aya-aud',
+  cloudflare: { accountId: 'account', applicationId: 'aya', operatorConfigFile: '/private/tmp/operator.json' },
+};
+const named = '11111111-1111-4111-8111-111111111111';
+const other = '22222222-2222-4222-8222-222222222222';
+const published = '33333333-3333-4333-8333-333333333333';
+let artifactId: string;
+let otherArtifactId: string;
+let key: Awaited<ReturnType<typeof generateKeyPair>>;
+let keys: ReturnType<typeof vi.fn<typeof fetch>>;
+let resolve: ReturnType<typeof createArtifactViewResolver>;
+async function view(id: string, audience: 'private' | 'share' | 'public', email?: string, aud = 'aya-aud') {
+  const request = new IncomingMessage(new Socket());
+  if (email)
+    request.headers['cf-access-jwt-assertion'] = await new SignJWT({ email })
+      .setProtectedHeader({ alg: 'RS256', kid: 'current' })
+      .setIssuer(config.accessIssuer)
       .setAudience(aud)
       .setExpirationTime('1h')
-      .sign(privateKey);
-  expect(await verify(await token())).toBe('principal@example.com');
-  expect(await verify(await token())).toBe('principal@example.com');
-  expect(urls).toEqual(['https://team.cloudflareaccess.com/cdn-cgi/access/certs']);
-  expect(await verify(await token({}, 'https://evil.example'))).toBeUndefined();
-  expect(await verify(await token({}, undefined, 'other'))).toBeUndefined();
-  expect(await verify(await token({ email: 'invalid' }))).toBeUndefined();
-  expect(await verify(await token({ nbf: Math.floor(Date.now() / 1000) + 3600 }))).toBeUndefined();
-  const expired = await new SignJWT({ email: 'principal@example.com' })
-    .setProtectedHeader({ alg: 'RS256', kid: 'first' })
-    .setIssuer('https://team.cloudflareaccess.com')
-    .setAudience('app')
-    .setExpirationTime(1)
-    .sign(privateKey);
-  expect(await verify(expired)).toBeUndefined();
-  expect(await verify('forged')).toBeUndefined();
-  expect(await verify(undefined)).toBeUndefined();
-});
-
-it('refreshes the configured JWKS for a rotated key and rejects a forged signature and symmetric algorithm', async () => {
-  const first = await generateKeyPair('RS256');
-  const second = await generateKeyPair('RS256');
-  let keys = [{ ...(await exportJWK(first.publicKey)), kid: 'first', alg: 'RS256' }];
-  let reads = 0;
-  const verify = createArtifactIdentityVerifier('https://team.cloudflareaccess.com', 'app', async () => {
-    reads++;
-    return Response.json({ keys });
+      .sign(key.privateKey);
+  return resolve(request, { id, audience, viewPath: `/artifacts/${id}` });
+}
+beforeEach(async () => {
+  fs.mkdirSync(ROOT, { recursive: true });
+  fs.writeFileSync(path.join(ROOT, 'policy.json'), JSON.stringify(config), { mode: 0o600 });
+  vi.stubEnv('GWS_EA_WEB_POLICY_FILE', path.join(ROOT, 'policy.json'));
+  await runMigrations(await initTestDb());
+  const now = new Date().toISOString();
+  await createAgentGroup({ id: 'main', name: 'Aya', folder: 'main', agent_provider: null, created_at: now });
+  await createSession({
+    id: 'session',
+    agent_group_id: 'main',
+    messaging_group_id: null,
+    thread_id: null,
+    agent_provider: null,
+    status: 'active',
+    container_status: 'idle',
+    last_active: now,
+    created_at: now,
   });
-  const sign = (key: Awaited<ReturnType<typeof generateKeyPair>>['privateKey'], kid: string) =>
-    new SignJWT({ email: 'guest@example.com' })
-      .setProtectedHeader({ alg: 'RS256', kid })
-      .setIssuer('https://team.cloudflareaccess.com')
-      .setAudience('app')
-      .setExpirationTime('1h')
-      .sign(key);
-  expect(await verify(await sign(first.privateKey, 'first'))).toBe('guest@example.com');
-  expect(await verify(await sign(second.privateKey, 'first'))).toBeUndefined();
-  keys = [{ ...(await exportJWK(second.publicKey)), kid: 'second', alg: 'RS256' }];
-  const now = Date.now();
-  const clock = vi.spyOn(Date, 'now').mockReturnValue(now + 31000);
-  try {
-    expect(await verify(await sign(second.privateKey, 'second'))).toBe('guest@example.com');
-  } finally {
-    clock.mockRestore();
-  }
-  expect(reads).toBe(2);
-  const symmetric = await new SignJWT({ email: 'guest@example.com' })
-    .setProtectedHeader({ alg: 'HS256' })
-    .setIssuer('https://team.cloudflareaccess.com')
-    .setAudience('app')
-    .setExpirationTime('1h')
-    .sign(new Uint8Array(32));
-  expect(await verify(symmetric)).toBeUndefined();
+  await getDb().run('INSERT INTO gws_ea_principal_addresses(email,added_at) VALUES(?,?)', 'principal@example.com', now);
+  const source = prepareArtifactSource(Buffer.from('<p>Exact selected report</p>'));
+  const saved = await saveArtifact(
+    { agentGroupId: 'main', sessionId: 'session', isMain: true },
+    { requestId: 'save', action: 'save', fingerprint: 'save' },
+    { create_key: 'report', title: 'Report' },
+    source,
+  );
+  artifactId = saved.artifact_id;
+  otherArtifactId = (
+    await saveArtifact(
+      { agentGroupId: 'main', sessionId: 'session', isMain: true },
+      { requestId: 'save-other', action: 'save', fingerprint: 'save-other' },
+      { create_key: 'other', title: 'Other report' },
+      source,
+    )
+  ).artifact_id;
+  for (const [id, kind] of [
+    [named, 'named'],
+    [other, 'named'],
+    [published, 'public'],
+  ])
+    await getDb().run(
+      "INSERT INTO gws_ea_artifact_shares(share_id,artifact_id,kind,revision,source_hash,generation,state,scope_hash,created_at,updated_at) VALUES(?,?,?,1,?,1,'active','scope',?,?)",
+      id,
+      artifactId,
+      kind,
+      source.source_hash,
+      now,
+      now,
+    );
+  await getDb().run(
+    'INSERT INTO gws_ea_artifact_share_recipients(share_id,email) VALUES(?,?)',
+    named,
+    'remy@example.com',
+  );
+  await getDb().run(
+    'INSERT INTO gws_ea_artifact_share_recipients(share_id,email) VALUES(?,?)',
+    other,
+    'other@example.com',
+  );
+  key = await generateKeyPair('RS256');
+  const jwk = { ...(await exportJWK(key.publicKey)), kid: 'current', alg: 'RS256' };
+  keys = vi.fn(async () => Response.json({ keys: [jwk] }));
+  resolve = createArtifactViewResolver(
+    config,
+    createWebIdentity(config, createWebIdentityVerifier(config.accessIssuer, config.accessAud, keys)),
+  );
+});
+afterEach(async () => {
+  await closeDb();
+  vi.unstubAllEnvs();
+  fs.rmSync(ROOT, { recursive: true, force: true });
+});
+it('checks the exact artifact audience after a real Access JWT, including a peer application token', async () => {
+  expect(await view(named, 'share', 'remy@example.com')).toMatchObject({ html: '<p>Exact selected report</p>' });
+  expect(await view(artifactId, 'private', 'remy@example.com')).toBeUndefined();
+  expect(await view(otherArtifactId, 'private', 'remy@example.com')).toBeUndefined();
+  expect(await view(other, 'share', 'remy@example.com')).toBeUndefined();
+  expect(await view(artifactId, 'private', 'principal@example.com', 'juno-aud')).toBeUndefined();
+  expect(await view(artifactId, 'private', 'principal@example.com')).toBeDefined();
+});
+it('serves a live public publication without identity verification and denies revocation or policy disable immediately', async () => {
+  expect(await view(published, 'public')).toMatchObject({ html: '<p>Exact selected report</p>' });
+  expect(keys).not.toHaveBeenCalled();
+  await getDb().run("UPDATE gws_ea_artifact_shares SET state='revoked' WHERE share_id=?", published);
+  expect(await view(published, 'public')).toBeUndefined();
+  await getDb().run("UPDATE gws_ea_artifact_shares SET state='active' WHERE share_id=?", published);
+  fs.writeFileSync(path.join(ROOT, 'policy.json'), JSON.stringify({ ...config, enabled: false }));
+  expect(await view(published, 'public')).toBeUndefined();
+  expect(keys).not.toHaveBeenCalled();
 });

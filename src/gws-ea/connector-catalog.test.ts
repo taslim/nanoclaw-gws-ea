@@ -20,6 +20,7 @@ describe('connector command contract', () => {
       ['connectors', 'enable', 'voice'],
       ['connectors', 'disable', 'onepassword'],
       ['connectors', 'check', 'browser'],
+      ['connectors', 'install', 'artifacts'],
       ['browser', 'enable'],
     ])
       expect(() => parseInvocation(args)).toThrow();

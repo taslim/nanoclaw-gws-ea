@@ -544,8 +544,7 @@ describe("main's skills", () => {
     const policy: WebPolicyFile = {
       schemaVersion: 1,
       enabled: true,
-      hostname: 'views.example.com',
-      pathPrefix: '/aya',
+      hostname: 'aya.example.com',
       listenPort: 9123,
       accessIssuer: 'https://team.cloudflareaccess.com',
       accessAud: 'assistant-aud',

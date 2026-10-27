@@ -3,7 +3,12 @@ import path from 'node:path';
 import { isErrno } from '../community-portal/errors.js';
 import { processLock } from '../community-portal/process-lock.js';
 import { readWebPolicy } from '../modules/gws-ea-web/policy.js';
-import { webOperatorFiles, readWebOperatorConfig, writeWebOperatorConfig } from './web-cloudflare.js';
+import {
+  webOperatorFiles,
+  readWebOperatorConfig,
+  writeWebOperatorConfig,
+  type WebRemoteAssistant,
+} from './web-cloudflare.js';
 import { parseWebCleanup, settleWebCleanup, type WebCleanup } from './web-removal.js';
 import type { WebCapabilityDependencies } from './web-connector.js';
 import { preparePrivateDirectory, type ControlPlanePaths } from './paths.js';
@@ -156,6 +161,7 @@ export async function uninstallWebConnector(
           'The assistant registry changed while web uninstall acquired its locks. Retry uninstall.',
         );
       const unrecordedClaims: { readonly instanceId: string; readonly claim: WebNamespaceClaim }[] = [];
+      const partialAssistants: Record<string, WebRemoteAssistant> = {};
       for (const reservation of Object.values(currentRegistry.instances)) {
         const claim = reservation.exclusive_resource_claims.web;
         if (!claim || config?.assistants[reservation.instance_id] || receipt?.assistants[reservation.instance_id])
@@ -166,9 +172,14 @@ export async function uninstallWebConnector(
         if (policy.status === 'unavailable' || policy.enabled)
           throw new GwsEaError(
             'web_owner_missing',
-            'A claimed artifact namespace has local resources but no owned resource record.',
+            'A claimed web namespace has local resources but no owned resource record.',
           );
-        unrecordedClaims.push({ instanceId: reservation.instance_id, claim });
+        if (
+          config?.dns[claim.hostname] ||
+          (config?.pending?.kind === 'dns' && config.pending.target === claim.hostname)
+        )
+          partialAssistants[reservation.instance_id] = { claim, enabled: false };
+        else unrecordedClaims.push({ instanceId: reservation.instance_id, claim });
       }
       const releaseUnrecordedClaims = async (): Promise<void> => {
         for (const { instanceId, claim } of unrecordedClaims) {
@@ -193,15 +204,12 @@ export async function uninstallWebConnector(
       if (!receipt) {
         if (!config) throw new GwsEaError('web_owner_missing', 'Web ownership is unavailable.');
         const assistants: Record<string, WebCleanup> = {};
-        for (const [id, assistant] of Object.entries(config.assistants).sort(([left], [right]) =>
-          left.localeCompare(right),
+        for (const [id, assistant] of Object.entries({ ...partialAssistants, ...config.assistants }).sort(
+          ([left], [right]) => left.localeCompare(right),
         )) {
           const claim = currentRegistry.instances[id]?.exclusive_resource_claims.web;
           if (claim && JSON.stringify(claim) !== JSON.stringify(assistant.claim))
-            throw new GwsEaError(
-              'web_owner_mismatch',
-              'A recorded artifact namespace differs from its registry claim.',
-            );
+            throw new GwsEaError('web_owner_mismatch', 'A recorded web namespace differs from its registry claim.');
           assistants[id] = {
             schemaVersion: 1,
             ownership: { ...config, assistants: { [id]: assistant } },
@@ -282,33 +290,29 @@ export async function uninstallWebConnector(
         await recordReceipt(paths, receipt);
         await effect();
       }
-      // Per-assistant cleanup may already have removed shared resources. Its latest progress is authoritative.
-      const lastId = receipt.completed_assistant_ids.at(-1);
-      const last = lastId ? receipt.assistants[lastId] : undefined;
-      if (!last || last.sharedRetained) {
-        const blocked = await settleWebCleanup(paths, null, receipt.shared, {
-          fetch: dependencies.fetch,
-          runCommand: dependencies.runCommand,
-          record: async (shared) => {
-            if (!receipt) throw new Error('Missing web uninstall receipt');
-            receipt = { ...receipt, shared };
-            await recordReceipt(paths, receipt);
-          },
-        });
-        if (blocked) {
-          receipt = { ...receipt, reason: blocked.evidence };
+      // Only uninstall settles the shared connector after every assistant's resources are gone.
+      const blocked = await settleWebCleanup(paths, null, receipt.shared, {
+        fetch: dependencies.fetch,
+        runCommand: dependencies.runCommand,
+        record: async (shared) => {
+          if (!receipt) throw new Error('Missing web uninstall receipt');
+          receipt = { ...receipt, shared };
           await recordReceipt(paths, receipt);
-          return {
-            name: 'web',
-            scope: 'host',
-            installed: false,
-            outcome: 'pending',
-            changed,
-            reason: blocked.reason,
-            receipt_file: webUninstallFile(paths),
-            operator_actions: [],
-          };
-        }
+        },
+      });
+      if (blocked) {
+        receipt = { ...receipt, reason: blocked.evidence };
+        await recordReceipt(paths, receipt);
+        return {
+          name: 'web',
+          scope: 'host',
+          installed: false,
+          outcome: 'pending',
+          changed,
+          reason: blocked.reason,
+          receipt_file: webUninstallFile(paths),
+          operator_actions: [],
+        };
       }
       await removePrivateFile(webUninstallFile(paths));
       await effect();

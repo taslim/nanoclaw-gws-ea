@@ -108,7 +108,7 @@ export async function captureWebCleanup(
     if (own && JSON.stringify(own.claim) !== JSON.stringify(claim))
       return {
         status: 'unreadable',
-        ...refusal(paths, 'The artifact ownership record does not match the reserved namespace.'),
+        ...refusal(paths, 'The web ownership record does not match the reserved namespace.'),
       };
     return {
       status: 'captured',
@@ -234,7 +234,7 @@ export async function settleWebCleanup(
       )
         throw new GwsEaError('web_owner_mismatch', 'The receipt does not name this operator and assistant ownership.');
       if (!live && !cleanup.completed.includes('remote'))
-        throw new GwsEaError('web_owner_missing', 'The exact artifact ownership record is missing.');
+        throw new GwsEaError('web_owner_missing', 'The exact web ownership record is missing.');
       if (
         live &&
         (live.accountId !== recorded.accountId ||
@@ -243,7 +243,7 @@ export async function settleWebCleanup(
           JSON.stringify(live.pin) !== JSON.stringify(recorded.pin) ||
           JSON.stringify(live.connector) !== JSON.stringify(recorded.connector))
       )
-        throw new GwsEaError('web_owner_mismatch', 'Artifact shared ownership changed during removal.');
+        throw new GwsEaError('web_owner_mismatch', 'Web shared ownership changed during removal.');
       if (live) {
         for (const [hostname, dns] of Object.entries(recorded.dns)) {
           const current = live.dns[hostname];
@@ -295,14 +295,12 @@ export async function settleWebCleanup(
             candidate.exclusive_resource_claims.web ? [candidate.exclusive_resource_claims.web] : [],
           ),
       ];
-      const shared = peers.length > 0;
-      if (instanceId === null && shared)
+      const retainShared = instanceId !== null;
+      if (!retainShared && peers.length > 0)
         throw new GwsEaError('web_shared_in_use', 'Assistant namespace claims still need to be settled.');
       cleanup = {
         ...cleanup,
-        completed:
-          cleanup.sharedRetained && !shared ? cleanup.completed.filter((key) => key !== 'remote') : cleanup.completed,
-        sharedRetained: shared,
+        sharedRetained: retainShared,
       };
       await options.record(cleanup);
       const step = async (key: string, action: () => Promise<void>): Promise<void> => {
@@ -312,7 +310,7 @@ export async function settleWebCleanup(
         await options.record(cleanup);
       };
       if (!cleanup.completed.includes('remote')) {
-        if (!live) throw new GwsEaError('web_owner_missing', 'The exact artifact ownership record is missing.');
+        if (!live) throw new GwsEaError('web_owner_missing', 'The exact web ownership record is missing.');
         const config = live;
         const api = await webApi(config, { fetch: options.fetch });
         const absent = async (resource: string): Promise<boolean> => {
@@ -341,17 +339,20 @@ export async function settleWebCleanup(
           }
         });
         if (own?.applicationId) await remove('application', `${account}/access/apps/${own.applicationId}`);
+        const claim =
+          own?.claim ??
+          (instanceId === null ? undefined : registry.instances[instanceId]?.exclusive_resource_claims.web);
         const pending = recorded.pending;
-        if (pending && (pending.target === instanceId || pending.target === own?.claim.hostname || !shared))
+        if (pending && (pending.target === instanceId || pending.target === claim?.hostname || !retainShared))
           throw new GwsEaError(
             'web_create_unproven',
             `Unproven ${pending.kind} creation ${pending.key} must be resolved or explicitly abandoned.`,
           );
         for (const [hostname, dns] of Object.entries(recorded.dns)) {
-          if (!peers.some((claim) => claim.hostname === hostname))
+          if ((!retainShared || hostname === claim?.hostname) && !peers.some((peer) => peer.hostname === hostname))
             await remove(`dns:${dns.id}`, `/zones/${dns.zoneId}/dns_records/${dns.id}`);
         }
-        if (!shared) {
+        if (!retainShared) {
           if (recorded.tunnelId && !(await absent(`${account}/cfd_tunnel/${recorded.tunnelId}`))) {
             const remaining = await api.request('GET', `${account}/cfd_tunnel/${recorded.tunnelId}/configurations`);
             if (
@@ -380,7 +381,7 @@ export async function settleWebCleanup(
         }
         await step('remote', async () => undefined);
       }
-      if (shared) {
+      if (retainShared) {
         if (!live) throw new GwsEaError('web_owner_missing', 'Shared ownership record is missing.');
         const assistants = { ...live.assistants };
         if (instanceId !== null) delete assistants[instanceId];
@@ -400,7 +401,7 @@ export async function settleWebCleanup(
     if (!(cause instanceof Error)) throw cause;
     return refusal(
       paths,
-      cause instanceof GwsEaError ? cause.message : 'A remote or local artifact cleanup boundary failed.',
+      cause instanceof GwsEaError ? cause.message : 'A remote or local web cleanup boundary failed.',
       cleanup,
     );
   }

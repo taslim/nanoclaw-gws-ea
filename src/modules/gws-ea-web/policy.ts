@@ -1,4 +1,5 @@
 import path from 'node:path';
+import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import { readRegularFileBounded } from '../../anchored-dir.js';
 import { readEnvFile } from '../../env.js';
@@ -7,12 +8,11 @@ import { isRecord } from '../../gws-ea/validation.js';
 export const WEB_POLICY_FILE_ENV = 'GWS_EA_WEB_POLICY_FILE';
 export const WEB_POLICY_VERSIONS = [1] as const;
 
-/** Host-only: author results carry none of it beyond the hostname and path prefix in artifact URLs. */
+/** Host-only: author results carry none of it beyond the hostname in artifact URLs. */
 export interface WebPolicyFile {
   readonly schemaVersion: 1;
   readonly enabled: boolean;
   readonly hostname: string;
-  readonly pathPrefix: string;
   readonly listenPort: number;
   readonly accessIssuer: string;
   readonly accessAud: string;
@@ -29,45 +29,14 @@ export type WebPolicy =
 
 const HOST = /^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/u;
 const ID = /^[a-zA-Z0-9_-]{1,256}$/u;
-const RESERVED = new Set(['public', 'private', 'guest', 'assets', 'api', 'cdn-cgi', 'health', 'login', 'logout']);
-
-function validPrefix(value: string): boolean {
-  if (value === '') return true;
-  if (!value.startsWith('/')) return false;
-  let decoded: string;
-  try {
-    decoded = decodeURIComponent(value.slice(1));
-  } catch (error) {
-    if (error instanceof URIError) return false;
-    throw error;
-  }
-  if (
-    !decoded ||
-    decoded === '.' ||
-    decoded === '..' ||
-    /[\\/\p{Cc}]/u.test(decoded) ||
-    RESERVED.has(decoded.toLowerCase())
-  )
-    return false;
-  const canonical = decoded.normalize('NFKC').toLowerCase().replace(/\s+/gu, '-');
-  return decoded === canonical && value === `/${encodeURIComponent(canonical)}`;
-}
-
 export function parseWebPolicyFile(value: unknown): WebPolicyFile | undefined {
   if (
     !isRecord(value) ||
     Object.keys(value).some(
       (key) =>
-        ![
-          'schemaVersion',
-          'enabled',
-          'hostname',
-          'pathPrefix',
-          'listenPort',
-          'accessIssuer',
-          'accessAud',
-          'cloudflare',
-        ].includes(key),
+        !['schemaVersion', 'enabled', 'hostname', 'listenPort', 'accessIssuer', 'accessAud', 'cloudflare'].includes(
+          key,
+        ),
     )
   )
     return undefined;
@@ -77,8 +46,6 @@ export function parseWebPolicyFile(value: unknown): WebPolicyFile | undefined {
     typeof value.enabled !== 'boolean' ||
     typeof value.hostname !== 'string' ||
     !HOST.test(value.hostname) ||
-    typeof value.pathPrefix !== 'string' ||
-    !validPrefix(value.pathPrefix) ||
     typeof value.listenPort !== 'number' ||
     !Number.isSafeInteger(value.listenPort) ||
     value.listenPort < 1 ||
@@ -101,7 +68,6 @@ export function parseWebPolicyFile(value: unknown): WebPolicyFile | undefined {
     schemaVersion: 1,
     enabled: value.enabled,
     hostname: value.hostname,
-    pathPrefix: value.pathPrefix,
     listenPort: value.listenPort,
     accessIssuer: value.accessIssuer,
     accessAud: value.accessAud,
@@ -145,4 +111,11 @@ export async function readWebPolicy(file = webPolicyFile()): Promise<WebPolicy> 
     return { status: 'unavailable', enabled: false, reason: 'invalid-web-policy' };
   }
   /* eslint-enable no-catch-all/no-catch-all */
+}
+
+/** Digest of the complete host policy, including ownership and admission coordinates. */
+export function webPolicyDigest(value: WebPolicyFile | undefined): string {
+  return createHash('sha256')
+    .update(JSON.stringify(value) ?? '')
+    .digest('hex');
 }

@@ -28,11 +28,7 @@ function artifactUrls(texts: readonly string[], config: WebPolicyFile): readonly
     ),
   ].filter((written) => {
     const url = URL.parse(written);
-    return (
-      url !== null &&
-      url.hostname.replace(/\.$/u, '') === config.hostname &&
-      (url.pathname === config.pathPrefix || url.pathname.startsWith(`${config.pathPrefix}/`))
-    );
+    return url !== null && url.hostname.replace(/\.$/u, '') === config.hostname;
   });
 }
 export async function hasArtifactLinks(texts: readonly string[]): Promise<boolean> {
@@ -84,11 +80,11 @@ export async function checkArtifactLinksOpenable(request: ArtifactLinkCheckReque
   for (const written of urls) {
     const url = URL.parse(written);
     if (!url || url.hostname.replace(/\.$/u, '') !== config.hostname) continue;
-    if (url.pathname !== config.pathPrefix && !url.pathname.startsWith(`${config.pathPrefix}/`)) continue;
     if (policy.status !== 'enabled' || !(await getDb().hasTable('gws_ea_artifacts'))) return refuse(written);
     if (url.origin !== `https://${config.hostname}` || url.username || url.password || url.search || url.hash)
       return refuse(written);
-    const suffix = url.pathname.slice(config.pathPrefix.length);
+    if (!url.pathname.startsWith('/artifacts/')) return refuse(written);
+    const suffix = url.pathname.slice('/artifacts'.length);
     const match = new RegExp(`^/(?:((?:share|public))/)?(${UUID})$`, 'u').exec(suffix);
     if (!match || written !== `https://${config.hostname}${url.pathname}`) return refuse(written);
     const now = new Date().toISOString();
