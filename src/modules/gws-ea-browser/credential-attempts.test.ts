@@ -12,7 +12,8 @@ import {
   writeOnePasswordHostPolicy,
   writeOnePasswordResources,
 } from './onepassword-policy.js';
-import { browserCredentialAttemptsMigration } from './migration.js';
+import { browserCredentialAttemptsMigration, browserQueueMigration } from './migration.js';
+import { heldCredentialSites } from './leases.js';
 import { BrowserVault } from './onepassword.js';
 import { FakeOnePassword } from './onepassword-fixture.js';
 import { writePrivateFile } from './paths.js';
@@ -38,7 +39,7 @@ let directory: string;
 let tokenFile: string;
 let fake: FakeOnePassword;
 let vault: BrowserVault;
-let browserPolicyFile: string;
+let browserRoot: string;
 let onePasswordPolicyFile: string;
 const output: string[] = [];
 
@@ -54,7 +55,7 @@ async function writeHostPolicy(enabled: boolean): Promise<void> {
   });
 }
 
-const newVault = (): BrowserVault => new BrowserVault({ browserPolicyFile, onePasswordPolicyFile });
+const newVault = (): BrowserVault => new BrowserVault({ browserRoot, onePasswordPolicyFile });
 const service = (options: { vault?: BrowserVault } = {}): CredentialAttempts =>
   new CredentialAttempts({ db: getDb(), vault: options.vault ?? vault });
 const rows = (): Promise<CredentialAttempt[]> => getDb().all('SELECT * FROM gws_ea_browser_credential_attempts');
@@ -136,7 +137,7 @@ beforeEach(async () => {
   await writeHostPolicy(true);
   const instanceRoot = path.join(directory, INSTANCE_ID.slice(0, 8));
   await mkdir(instanceRoot, { mode: 0o700 });
-  browserPolicyFile = path.join(instanceRoot, 'browser', 'policy.json');
+  browserRoot = path.join(instanceRoot, 'browser');
   await writePrivateFile(
     path.join(instanceRoot, 'state', 'data', 'gws-ea', 'instance.json'),
     JSON.stringify({ schema_version: 1, instance_id: INSTANCE_ID }),
@@ -158,6 +159,7 @@ beforeEach(async () => {
   sdk.create.mockImplementation(async () => fake.client());
   vault = newVault();
   await runMigrations(await initTestDb());
+  await browserQueueMigration.up(getDb());
   await browserCredentialAttemptsMigration.up(getDb());
   output.length = 0;
   for (const level of ['debug', 'info', 'warn', 'error'] as const)
@@ -962,5 +964,118 @@ describe('phases', () => {
     await expect(subject.prepareSignup({ jobId: JOB, origin: ORIGIN, username: 'a\nb' })).rejects.toMatchObject({
       reason: 'invalid_request',
     });
+  });
+});
+
+describe('deleted vault bindings', () => {
+  it.each(['exposed', 'rejected', 'finalized'] as const)(
+    'preserves a %s credential attempt when the vault binding changes',
+    async (phase) => {
+      const subject = service();
+      const attempt = expectPrepared(await subject.prepareSignup({ jobId: JOB, origin: ORIGIN, username: USERNAME }));
+      expect(await subject.save(attempt.id)).toMatchObject({ status: 'saved' });
+      expect(await subject.disclose(attempt.id, { jobId: JOB, origin: ORIGIN })).toMatchObject({ status: 'disclosed' });
+      await getDb().run(
+        'UPDATE gws_ea_browser_credential_attempts SET phase=?,evidence_json=? WHERE id=?',
+        phase,
+        JSON.stringify({ outcome: 'recorded-before-vault-change' }),
+        attempt.id,
+      );
+      const files = onePasswordInstancePaths(path.dirname(browserRoot));
+      await writeOnePasswordResources(files.resourceFile, {
+        schemaVersion: 2,
+        instanceId: INSTANCE_ID,
+        accountId: ACCOUNT_ID,
+        vault: { id: 'replacementvault0000000001', createdBy: { kind: 'operator' } },
+        operatorGrant: null,
+        runtimeServiceAccountId: RUNTIME_ID,
+        retiredRuntimeServiceAccountIds: [],
+      });
+      const restarted = service({ vault: newVault() });
+
+      await restarted.unresolved();
+
+      expect(await restarted.get(attempt.id)).toMatchObject({
+        phase,
+        evidence_json: JSON.stringify({ outcome: 'recorded-before-vault-change' }),
+      });
+    },
+  );
+
+  it.each(['awaiting_verification', 'unknown', 'confirmed', 'conflict'] as const)(
+    'settles an inactive %s attempt for a removed vault while retaining its disclosure and settlement facts',
+    async (phase) => {
+      const subject = service();
+      const { itemId } = await ownedLogin(subject);
+      const { attempt } = await changedPassword(subject, itemId);
+      const evidence = { reason: 'site_outcome_recorded', account_page: 'verified' };
+      await getDb().run(
+        'UPDATE gws_ea_browser_credential_attempts SET phase=?,evidence_json=?,settlement=?,conflict_reason=? WHERE id=?',
+        phase,
+        JSON.stringify(evidence),
+        phase === 'confirmed' ? 'promoted' : phase === 'conflict' ? 'kept' : null,
+        phase === 'conflict' ? 'password_changed' : null,
+        attempt.id,
+      );
+      const before = await subject.get(attempt.id);
+      const files = onePasswordInstancePaths(path.dirname(browserRoot));
+      await writeOnePasswordResources(files.resourceFile, {
+        schemaVersion: 2,
+        instanceId: INSTANCE_ID,
+        accountId: ACCOUNT_ID,
+        vault: { id: 'replacementvault0000000001', createdBy: { kind: 'operator' } },
+        operatorGrant: null,
+        runtimeServiceAccountId: RUNTIME_ID,
+        retiredRuntimeServiceAccountIds: [],
+      });
+      fake.calls.length = 0;
+      const restarted = service({ vault: newVault() });
+
+      expect(await restarted.unresolved()).toEqual([]);
+
+      const settled = await restarted.get(attempt.id);
+      expect(settled).toMatchObject({
+        phase: 'rejected',
+        exposed_at: before?.exposed_at,
+        candidate_item_id: before?.candidate_item_id,
+        settlement: before?.settlement,
+        conflict_reason: before?.conflict_reason,
+      });
+      expect(JSON.parse(settled!.evidence_json!)).toEqual({
+        ...evidence,
+        reason: 'vault_removed',
+        prior_reason: evidence.reason,
+        prior_phase: phase,
+      });
+      expect(await heldCredentialSites(getDb(), JOB)).toEqual(new Set());
+      expect(fake.items.has(before!.candidate_item_id!)).toBe(true);
+      expect(fake.calls).toEqual([]);
+    },
+  );
+
+  it('settles durable attempts for a replaced vault without spending provider work or disturbing the new vault', async () => {
+    const subject = service();
+    const attempt = expectPrepared(await subject.prepareSignup({ jobId: JOB, origin: ORIGIN, username: USERNAME }));
+    expect(await subject.save(attempt.id)).toMatchObject({ status: 'saved' });
+    const replacement = 'replacementvault0000000001';
+    const files = onePasswordInstancePaths(path.dirname(browserRoot));
+    await writeOnePasswordResources(files.resourceFile, {
+      schemaVersion: 2,
+      instanceId: INSTANCE_ID,
+      accountId: ACCOUNT_ID,
+      vault: { id: replacement, createdBy: { kind: 'operator' } },
+      operatorGrant: null,
+      runtimeServiceAccountId: RUNTIME_ID,
+      retiredRuntimeServiceAccountIds: [],
+    });
+    fake.calls.length = 0;
+    const restarted = service({ vault: newVault() });
+    expect(await restarted.unresolved()).toEqual([]);
+    expect(await restarted.get(attempt.id)).toMatchObject({
+      phase: 'rejected',
+      evidence_json: JSON.stringify({ reason: 'vault_removed', prior_phase: 'saved' }),
+    });
+    expect(fake.calls).toEqual([]);
+    expect(await restarted.disclose(attempt.id, { jobId: JOB, origin: ORIGIN })).toMatchObject({ status: 'refused' });
   });
 });

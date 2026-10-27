@@ -15,7 +15,7 @@ import type { AgentGroup, User } from '../../types.js';
 import { registerMigration } from '../../db/migrations/index.js';
 import { recordCalendarAccess } from '../gws-ea-inbox/db.js';
 import { gwsEaInboxCalendarAccessMigration } from '../gws-ea-inbox/migration.js';
-import { writeBrowserAccess } from '../gws-ea-browser/testing/browser-access.js';
+import { configureBrowserAccess } from '../gws-ea-browser/testing/browser-access.js';
 import { addPerson, getPerson, updatePerson } from '../gws-ea-people/db.js';
 import { gwsEaPeopleMigration, gwsEaPeopleThinRecordMigration } from '../gws-ea-people/migration.js';
 import { upsertUserDm } from '../permissions/db/user-dms.js';
@@ -861,7 +861,7 @@ describe('character and audience-specific identity', () => {
 
   it('keeps the web address available as an identity fact without web or vault procedures', async () => {
     await recordWebAlias('onuj@example.test');
-    writeBrowserAccess(path.join(TEST_ROOT, 'browser', 'policy.json'), { agentGroupIds: [main.id, research.id] });
+    await configureBrowserAccess(path.join(TEST_ROOT, 'browser'), [main.id, research.id]);
     try {
       const mainIdentity = await identity(main);
       expect(mainIdentity).toContain("Juno's own Google Workspace address is `juno@example.test`.");
@@ -878,15 +878,15 @@ describe('character and audience-specific identity', () => {
   });
 
   it('makes a missing web address explicit and withholds its fact when browser access is removed', async () => {
-    writeBrowserAccess(path.join(TEST_ROOT, 'browser', 'policy.json'), { agentGroupIds: [main.id] });
+    await configureBrowserAccess(path.join(TEST_ROOT, 'browser'), [main.id]);
     try {
       expect(await identity(browser)).toContain('Juno has no web address yet.');
       expect(await identity(main)).toContain('Juno has no web address yet.');
       expect(await identity(research)).not.toContain('web address');
       await recordWebAlias('onuj@example.test');
       expect(await identity(main)).toContain('`onuj@example.test`');
-      writeBrowserAccess(path.join(TEST_ROOT, 'browser', 'policy.json'), { agentGroupIds: [research.id] });
-      expect(await identity(main)).not.toContain('web address');
+      await configureBrowserAccess(path.join(TEST_ROOT, 'browser'), [research.id]);
+      expect(await identity(main)).toContain('`onuj@example.test`');
       expect(await identity(research)).toContain('`onuj@example.test`');
     } finally {
       vi.unstubAllEnvs();

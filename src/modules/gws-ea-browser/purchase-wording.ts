@@ -6,7 +6,7 @@ import type { IncidentKind } from './incidents.js';
 const purchaseMessages = {
   live: 'Only a live browser job can request a purchase.',
   noLiveJob: 'The browser job is no longer live.',
-  disabled: 'Browser is disabled.',
+  disabled: 'Browser is unavailable; ask your operator to check Chrome.',
   principal: 'A purchase requires the principal to confirm the complete merchant facts.',
   iso: 'Use a real ISO date, or a date and time with a UTC offset.',
   unknownField: 'Unknown purchase field.',

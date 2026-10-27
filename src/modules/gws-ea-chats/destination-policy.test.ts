@@ -25,13 +25,15 @@ import { inboundDbPath } from '../../mailbox/sqlite/paths.js';
 import { routeAgentMessage } from '../agent-to-agent/agent-route.js';
 import { reconcileBrowserGroup } from '../gws-ea-browser/reconcile.js';
 import { BrowserStore } from '../gws-ea-browser/db.js';
-import { writeBrowserAccess } from '../gws-ea-browser/testing/browser-access.js';
+import { useAvailableBrowser } from '../gws-ea-browser/testing/browser-runtime.js';
+import { configureBrowserAccess } from '../gws-ea-browser/testing/browser-access.js';
 import { createDestination } from '../agent-to-agent/db/agent-destinations.js';
 import type { Session } from '../../types.js';
 
 let source: Session;
 let other: Session;
 beforeEach(async () => {
+  useAvailableBrowser();
   fs.rmSync(ROOT, { recursive: true, force: true });
   await runMigrations(await initTestDb());
   const now = new Date().toISOString();
@@ -99,8 +101,8 @@ it('routes an explicitly configured native agent connection and refuses an uncon
   await expect(routeAgentMessage(send('unconnected', 'unconnected'), source)).rejects.toThrow();
 });
 it('preserves explicit job browser delegation, source-bound untrusted replies and another authorized delegator on revocation', async () => {
-  const policy = `${ROOT}/browser/policy.json`;
-  writeBrowserAccess(policy, { agentGroupIds: ['job', 'other'] });
+  const policy = `${ROOT}/browser`;
+  await configureBrowserAccess(policy, ['job', 'other']);
   await reconcileBrowserGroup();
   await routeAgentMessage(send('job-errand', 'browser', 'new'), source);
   await routeAgentMessage(send('other-errand', 'browser', 'new'), other);
@@ -117,7 +119,7 @@ it('preserves explicit job browser delegation, source-bound untrusted replies an
   if (!requestId) throw new Error('Missing delivered native errand');
   await routeAgentMessage({ ...send('job-report', 'job'), in_reply_to: requestId }, jobErrand);
   expect(messages(source)[0]?.content).toContain('EXTERNAL_UNTRUSTED_CONTENT');
-  writeBrowserAccess(policy, { agentGroupIds: ['other'] });
+  await configureBrowserAccess(policy, ['other']);
   await reconcileBrowserGroup();
   expect(
     await getDb().get('SELECT cancelled FROM gws_ea_browser_jobs WHERE thread_id = ?', jobErrand.thread_id),

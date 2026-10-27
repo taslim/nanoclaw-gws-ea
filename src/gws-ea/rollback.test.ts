@@ -241,23 +241,21 @@ describe('gws-ea rollback when no schema moved', GIT_HEAVY, () => {
     expect(state.events).toEqual([]);
   });
 
-  it('refuses, changing nothing, while a browser access list the earlier release cannot read is in place', async () => {
+  it('leaves the old browser policy untouched when rolling back to its earlier reader', async () => {
     const { host, runtime, next, state } = await updatedAssistant();
     const policy = path.join(runtime.instance_root, 'browser', 'policy.json');
     await mkdir(path.dirname(policy), { recursive: true, mode: 0o700 });
     await writeFile(policy, JSON.stringify({ schemaVersion: 2, enabled: false, agentGroupIds: ['ag-main'] }), {
       mode: 0o600,
     });
-    const events = state.events.length;
-    const { run, err } = cli(host, state, next, runtime);
+    const original = await readFile(policy, 'utf8');
+    const { run } = cli(host, state, next, runtime);
 
-    expect(await run(['rollback', '--id', runtime.instance_id])).toBe(1);
+    expect(await run(['rollback', '--id', runtime.instance_id])).toBe(0);
 
-    expect(err.join('\n')).toContain(`capabilities enable browser --id ${runtime.instance_id} --main-only`);
-    expect(state.events.slice(events)).toEqual([]);
-    expect(await readlink(runtime.checkout_root)).toBe(releaseName(next.commit));
+    expect(await readFile(policy, 'utf8')).toBe(original);
+    expect(await readlink(runtime.checkout_root)).toBe(releaseName(host.first));
     expect(await readOperationRecord(host.paths, runtime.instance_id)).toBeUndefined();
-    expect((await readRollbackPoint(host.paths, runtime.instance_id))?.release).toEqual(release(host, host.first));
   });
 
   it('goes back to the release it left, serving, when something holds its state open at the fence', async () => {

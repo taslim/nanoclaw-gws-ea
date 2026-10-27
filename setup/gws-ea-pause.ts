@@ -186,7 +186,14 @@ export async function attendPause(
     };
   }
 
-  if (pause.phase === 'provision_alias') return attendAliasPause(pause, shown, prompts, signal);
+  if (pause.phase === 'provision_alias') {
+    const setNow = pause.optional
+      ? await prompts.confirm({ message: 'Set up the optional web alias now?', initialValue: false, signal })
+      : true;
+    if (setNow === false) return { kind: 'continue', decisions: { skipAlias: true } };
+    if (setNow !== true) return STOP;
+    return attendAliasPause(pause, shown, prompts, signal);
+  }
 
   if (pause.code === 'google_client_required') {
     prompts.note(shown, "The assistant's Google sign-in client");

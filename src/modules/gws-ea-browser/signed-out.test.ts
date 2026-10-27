@@ -18,7 +18,7 @@ describe.skipIf(!chromePath)('native signed-out watch pages', { timeout: 30_000 
   beforeAll(async () => {
     if (!chromePath) throw new Error('A Chromium executable is required.');
     root = await mkdtemp(join(tmpdir(), 'nanoclaw-signed-out-native-'));
-    const paths = browserPaths(join(root, 'browser', 'policy.json'));
+    const paths = browserPaths(join(root, 'browser'));
     await prepareChromeProfile(paths);
     connection = await connectChrome(await spawnChrome({ chromePath, paths, proxyUrl: 'http://127.0.0.1:9' }), paths);
     await connection.context.addCookies([

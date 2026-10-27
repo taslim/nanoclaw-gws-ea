@@ -1,3 +1,4 @@
+import { useAvailableBrowser } from './testing/browser-runtime.js';
 import fs from 'node:fs';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 const root = await vi.hoisted(async () => {
@@ -88,6 +89,7 @@ async function recordBounds(changes: Record<string, unknown> = {}, caller = main
   return (JSON.parse(row.content) as { frame: ResponseFrame }).frame;
 }
 beforeEach(async () => {
+  useAvailableBrowser();
   await runMigrations(await initTestDb());
   for (const id of ['bounds-main', 'bounds-browser'])
     await createAgentGroup({ id, name: id, folder: id, agent_provider: null, created_at: new Date().toISOString() });
@@ -100,11 +102,9 @@ beforeEach(async () => {
   browser = (await resolveSystemSession('bounds-browser', 'system:a2a:bounds-main:reservation')).session;
   await new BrowserStore().jobForSession(browser);
   fs.mkdirSync(`${root}/browser`, { recursive: true, mode: 0o700 });
-  const policy = `${root}/browser/policy.json`;
-  fs.writeFileSync(policy, JSON.stringify({ schemaVersion: 1, enabled: true }), {
-    mode: 0o600,
-  });
-  process.env.GWS_EA_BROWSER_POLICY_FILE = policy;
+  const policy = `${root}/browser`;
+
+  process.env.GWS_EA_BROWSER_ROOT = policy;
   await getDb().run(
     'INSERT INTO gws_ea_browser_reservation_guarantees(id,approval_id,principal_user_id,currency,max_total_minor,created_at) VALUES(?,?,?,?,?,?)',
     'standing',
@@ -116,7 +116,7 @@ beforeEach(async () => {
   );
 });
 afterEach(async () => {
-  delete process.env.GWS_EA_BROWSER_POLICY_FILE;
+  delete process.env.GWS_EA_BROWSER_ROOT;
   await closeDb();
   fs.rmSync(root, { recursive: true, force: true });
 });

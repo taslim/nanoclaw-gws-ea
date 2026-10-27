@@ -16,12 +16,18 @@ nothing else) links.
 
 ## Operation and access
 
-Enable this optional capability for an assistant through the
-[operator CLI](gws-ea-cli.md#html-artifacts). It uses a Named Cloudflare Tunnel and
-one Access application per assistant. The default is one operator hostname with
-the assistant's first name as its stable prefix. A dedicated assistant hostname
-is supported in an active zone of the configured account. Prefix collisions fail
-before ingress opens; they are resolved with another configured hostname.
+Install this optional connector host-wide through the
+[operator CLI](gws-ea-cli.md#html-artifacts). It records one Cloudflare account,
+Access team and shared hostname, then provisions a shared Named Cloudflare Tunnel and
+a separate Access application for each compatible running assistant with a
+complete profile.
+Other assistants remain pending; create, resume, update, start and restart retry
+installed-connector setup. A repeated install verifies a ready assistant without
+restarting its author containers.
+
+Each assistant's first name is its stable prefix on the shared hostname.
+Prefix collisions fail before ingress opens; gws-ea adds no generated suffix.
+The current install has no per-assistant hostname override.
 
 Cloudflare credentials and connector tokens are host-only, separate files.
 Management permissions cover the selected account/zones and the required Tunnel,
@@ -46,7 +52,7 @@ depends on the operator host and connector being available.
 A guest cannot browse drafts, history, another artifact or a listing. A private
 edit does not alter a named grant or public snapshot. Explicit replacement names
 the new revision and current share generation. A public replacement preserves its
-public URL. Withdrawal, deletion, expiry and disablement stop origin access;
+public URL. Withdrawal, deletion, expiry and connector uninstall stop origin access;
 copies already downloaded cannot be recalled.
 
 There is no default expiry and no implicit upkeep schedule. A later source change
@@ -67,8 +73,8 @@ file. Include styles, scripts, SVG and data assets inline. A typical page is
 8–20 KB; the hard single-document limit is 4 MiB including real data and images.
 Preserve the information within that limit instead of truncating it.
 
-Canonical main gains the capability when the assistant enables it. Other eligible
-groups require explicit `artifacts` selection, with file-read/write permissions
+Canonical main gains the capability when artifacts is provisioned for the
+assistant. Other eligible groups require explicit `artifacts` selection, with file-read/write permissions
 for authoring. Sealed browser and external-message agents do not inherit it.
 Workers manage their own artifacts and hand references to main; main can oversee
 assistant-owned content and handles external sharing. Current host authority is
@@ -132,29 +138,35 @@ and named routes verify the expected issuer, RS256 signature, application AUD,
 time claims and email through `jose`; only the configured issuer provides JWKS.
 An assertion for one assistant cannot authorize another. Every content/error
 response uses `no-store`. Current principal removal, grant revocation, expiry and
-capability disablement win over an otherwise valid unexpired JWT. Offline JWT
+closed origin policy all override an otherwise valid unexpired JWT. Offline JWT
 verification cannot discover external session revocation by itself.
 
 ## Recovery and verification
 
-Use `capabilities show artifacts --id …` for local observation and `check` for
+Use `connectors show artifacts --id …` for local observation and `check` for
 bounded verification; neither repairs. Optional startup failure leaves ordinary
 conversation available. The origin stays unavailable until Access prerequisites
 and its local listener are verified. New named admission can remain pending;
-native request status reports the eventual outcome. Revoke/delete/disable during
+native request status reports the eventual outcome. Revoke/delete/uninstall during
 an in-flight update cannot be undone by its late response.
-Publication also waits for completed operator activation, including verified
+Publication also waits for completed operator setup, including verified
 ingress and an active connector. A local listener alone cannot settle it as
-usable. If activation is interrupted, `check` reports it and `enable` resumes
+usable. If setup is interrupted, `check` reports it and `install` resumes
 verification before publication can proceed.
 
 Central-data snapshots contain immutable HTML and pointers. Update/restore
 reconciles remote intent before serving; unknown policy compatibility fails
-closed. Disable preserves content and namespace. Removal follows the assistant's
-owned-resource receipt, retaining shared Tunnel, DNS and PIN resources while
-other assistants need them. Inspect any reported unproven create rather than
-identifying ownership by a friendly name. Only after removing its possible
-resource should the operator acknowledge that exact attempt.
+closed. `connectors uninstall artifacts` closes every assistant origin before
+any remote deletion, then removes verified owned per-assistant resources and
+shared resources last. Issued links stop working. Local HTML content and
+external PIN providers or unrelated tunnel routes remain. The host receipt
+resumes interrupted cleanup, and provisioning waits until cleanup completes.
+Per-assistant removal follows its separate owned-resource receipt and keeps
+shared resources while peers need them.
+
+Inspect any reported unproven create rather than identifying ownership by a
+friendly name. Only after removing its possible resource should the operator
+acknowledge that exact attempt with `--discard-unproven`.
 
 Focused host suites live in `src/modules/gws-ea-artifacts/`; runner suites live
 in `container/agent-runner/src/artifacts/` and the artifact MCP tests. Browser

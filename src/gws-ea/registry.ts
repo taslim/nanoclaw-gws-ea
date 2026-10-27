@@ -361,6 +361,30 @@ export async function claimInstanceArtifacts(
   });
 }
 
+/** Release only the exact namespace whose owned remote resources have been settled. */
+export async function releaseInstanceArtifacts(
+  paths: ControlPlanePaths,
+  instanceId: string,
+  expected: ArtifactsNamespaceClaim,
+): Promise<void> {
+  assertInstanceId(instanceId);
+  const claim = validateArtifactsClaim(expected);
+  await withMachineLock(paths, async () => {
+    const registry = await readRegistryFile(paths);
+    const stored = registry.instances[instanceId];
+    const current = stored?.exclusive_resource_claims.artifacts;
+    if (!stored || !current) return;
+    if (JSON.stringify(current) !== JSON.stringify(claim))
+      throw new GwsEaError('reservation_mismatch', 'Artifact namespace changed during cleanup; refusing release.');
+    const { artifacts: _artifacts, ...claims } = stored.exclusive_resource_claims;
+    const next = validateReservation({ ...stored, exclusive_resource_claims: claims });
+    await writePrivate(paths.registryFile, {
+      ...registry,
+      instances: { ...registry.instances, [instanceId]: next },
+    });
+  });
+}
+
 async function acquireMachineLock(paths: ControlPlanePaths): Promise<() => void> {
   await preparePrivateDirectory(paths.configRoot);
   const deadline = Date.now() + 5_000;

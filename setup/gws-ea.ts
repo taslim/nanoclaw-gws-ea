@@ -21,6 +21,7 @@ import { parseInvocation } from '../src/gws-ea/command-parser.js';
 import { runCli, type CliRuntime, type FailureReport, type Presenter } from '../src/gws-ea/cli.js';
 import type { InteractivePrompts } from '../src/gws-ea/events.js';
 import { removalQuestion } from '../src/gws-ea/remove.js';
+import { onePasswordUninstallPreviewLines } from '../src/gws-ea/onepassword-uninstall.js';
 import type { OnePasswordAccount } from '../src/modules/gws-ea-browser/onepassword-cli.js';
 import { CONTROL_PLANE_ROOT } from '../src/gws-ea/paths.js';
 import type { ToolProviderSetup } from '../src/gws-ea/release-target.js';
@@ -283,6 +284,18 @@ export async function main(argv: readonly string[], options: { readonly interact
     chooseOnePasswordAccount,
     collectCreateInputs,
     checkPrerequisites: (request, interaction) => ensurePrerequisites(request, interaction),
+    confirmOnePasswordUninstall: async (preview) => {
+      p.note(onePasswordUninstallPreviewLines(preview).join('\n'), '1Password vault deletion', {
+        output: process.stderr,
+      });
+      return (
+        (await p.confirm({
+          message: 'Delete every owned assistant vault and its saved passwords?',
+          initialValue: false,
+          output: process.stderr,
+        })) === true
+      );
+    },
     confirmRemoval: async (preview) =>
       (await p.confirm({ message: removalQuestion(preview), initialValue: false, output: process.stderr })) === true,
     confirmUpdate: async (preview) =>

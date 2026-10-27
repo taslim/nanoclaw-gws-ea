@@ -1,63 +1,15 @@
-import path from 'node:path';
-import { processLock } from '../../community-portal/process-lock.js';
 import { isContainerRunning, killContainer } from '../../container-runner.js';
 import { getDb } from '../../db/connection.js';
 import { getSessionsByAgentGroup, updateSession } from '../../db/sessions.js';
-import { readEnvFile } from '../../env.js';
-import { assertInstanceId } from '../../gws-ea/registry.js';
-import { GwsEaError } from '../../gws-ea/types.js';
 import { deleteAllDestinationsTouching, getDestinationReferencers } from '../agent-to-agent/db/agent-destinations.js';
 import { writeDestinations } from '../agent-to-agent/write-destinations.js';
-import { readPrivateFile, writePrivateFile } from '../gws-ea-browser/paths.js';
-import { browserPolicyFile, parseBrowserPolicyFile } from '../gws-ea-browser/policy.js';
 import { reconcileBrowserGroup } from '../gws-ea-browser/reconcile.js';
 import { retireChatGateway } from './gateway.js';
 import { getJobAgent } from './jobs.js';
 
-async function revokeBrowser(group: string): Promise<void> {
-  const file = browserPolicyFile();
-  if (!file) return;
-  const stored = readEnvFile(['GWS_EA_INSTANCE_LOCK_FILE', 'NANOCLAW_INSTALL_ID']);
-  const lock = stored.GWS_EA_INSTANCE_LOCK_FILE;
-  if (!lock) {
-    try {
-      await readPrivateFile(file, 16 * 1024);
-    } catch (error) {
-      if (error instanceof Error && 'code' in error && error.code === 'ENOENT') return;
-      throw error;
-    }
-    throw new Error('Job retirement needs the bound assistant lock before changing browser access');
-  }
-  const instanceId = path.basename(lock, '.lock');
-  assertInstanceId(instanceId);
-  const install = process.env.NANOCLAW_INSTALL_ID || stored.NANOCLAW_INSTALL_ID;
-  if (!path.isAbsolute(lock) || !lock.endsWith('.lock') || instanceId.replaceAll('-', '') !== install)
-    throw new Error('Job retirement lock does not belong to this assistant');
-  const release = await processLock(lock);
-  if (!release) throw new GwsEaError('instance_busy', 'Instance operation is already in progress');
-  try {
-    await removeBrowserGrant(file, group);
-  } finally {
-    release();
-  }
-  await reconcileBrowserGroup(file);
-}
-
-async function removeBrowserGrant(file: string, group: string): Promise<void> {
-  let raw: string;
-  try {
-    raw = await readPrivateFile(file, 16 * 1024);
-  } catch (error) {
-    if (error instanceof Error && 'code' in error && error.code === 'ENOENT') return;
-    throw error;
-  }
-  const policy = parseBrowserPolicyFile(JSON.parse(raw));
-  if (!policy) throw new Error('Cannot revoke job browser access from an invalid browser policy');
-  if (policy.schemaVersion === 2 && policy.agentGroupIds.includes(group))
-    await writePrivateFile(
-      file,
-      JSON.stringify({ ...policy, agentGroupIds: policy.agentGroupIds.filter((id) => id !== group) }),
-    );
+async function revokeBrowser(): Promise<void> {
+  // The durable retiring state closes the grant before edges and errands reconcile.
+  await reconcileBrowserGroup();
 }
 
 /** A durable retiring row resumes after any interrupted external cleanup. */
@@ -69,7 +21,7 @@ export async function retireJobAgent(group: string): Promise<void> {
     new Date().toISOString(),
     group,
   );
-  await revokeBrowser(group);
+  await revokeBrowser();
   await retireChatGateway(group);
   const peers = await getDb().transaction(async () => {
     const row = await getJobAgent(group);

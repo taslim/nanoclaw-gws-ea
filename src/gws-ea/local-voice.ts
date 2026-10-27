@@ -1,5 +1,6 @@
 /** One operator policy; assistants never own voice enablement or shared assets. */
-import { readFile, rm } from 'node:fs/promises';
+import type { VoiceCapabilityObservation } from './voice-inspection.js';
+import { lstat, readFile, rm } from 'node:fs/promises';
 import path from 'node:path';
 
 import { isErrno } from '../community-portal/errors.js';
@@ -40,6 +41,8 @@ import {
 } from './voice-assets.js';
 
 export const VOICE_HEALTH_ARGS = ['gws-ea-voice-health'] as const;
+export const VOICE_UNINSTALL_INCOMPLETE_REASON =
+  'Voice uninstall is incomplete. Run gws-ea connectors uninstall voice to remove the remaining owned assets.';
 export function voicePolicyFile(paths: Pick<ControlPlanePaths, 'configRoot'>): string {
   return path.join(paths.configRoot, 'voice.json');
 }
@@ -122,7 +125,9 @@ export async function voiceReleaseCompatibility(checkout: string): Promise<Voice
     const item: unknown = JSON.parse(
       await readFile(path.join(checkout, 'src/gws-ea/voice-compatibility.json'), 'utf8'),
     );
-    return isRecord(item) && item.schemaVersion === 1 && item.recipe === VOICE_RECIPE_ID ? 'compatible' : 'unsupported';
+    if (!isRecord(item) || !Number.isSafeInteger(item.schemaVersion) || typeof item.recipe !== 'string')
+      return 'unknown';
+    return item.schemaVersion === 1 && item.recipe === VOICE_RECIPE_ID ? 'compatible' : 'unsupported';
   } catch (error) {
     if (isErrno(error, 'ENOENT')) return 'unsupported';
     if (error instanceof SyntaxError) return 'unknown';
@@ -167,6 +172,7 @@ export interface VoiceOperatorDependencies extends VoiceInstallDependencies {
 async function withManagedInstances<T>(
   paths: ControlPlanePaths,
   work: (runtimes: readonly InstanceRuntimeConfig[], unobservedInstanceIds: readonly string[]) => Promise<T>,
+  skipBusy?: (instanceId: string) => void,
 ): Promise<T> {
   return withMachineLock(paths, async () => {
     const releases: Array<() => void> = [];
@@ -177,11 +183,16 @@ async function withManagedInstances<T>(
       for (const id of ids) {
         await preparePrivateDirectory(path.dirname(paths.instanceLock(id)));
         const release = await processLock(paths.instanceLock(id));
-        if (!release)
+        if (!release) {
+          if (skipBusy) {
+            skipBusy(id);
+            continue;
+          }
           throw new GwsEaError(
             'instance_busy',
             `Assistant ${id} is undergoing another operation; retry after it finishes.`,
           );
+        }
         releases.push(release);
         try {
           runtimes.push(await loadInstanceRuntimeConfig(paths.runtimeFile(id)));
@@ -197,7 +208,7 @@ async function withManagedInstances<T>(
   });
 }
 
-/** Explicit installation selects assets while leaving the shared policy disabled. */
+/** Installing verified shared assets makes recognition available immediately. */
 export async function installLocalVoice(
   paths: ControlPlanePaths,
   request: VoiceInstallRequest = {},
@@ -205,95 +216,129 @@ export async function installLocalVoice(
 ): Promise<VerifiedVoiceInstallation> {
   return underVoiceLock(paths, async () => {
     const policy = await readLocalVoicePolicy(paths);
-    if (policy.enabled)
-      throw new GwsEaError(
-        'voice_enabled',
-        'Run gws-ea capabilities disable voice before installing or selecting voice assets.',
-      );
+    const directories = ownedVoiceDirectories(paths);
+    if (policy.installationDir && !directories.includes(policy.installationDir))
+      throw new GwsEaError('voice_assets_unowned', 'Selected voice assets are outside this recipe-owned host cache.');
     dependencies.recordEffect?.(null);
     const installation = await installVoiceAssets(paths, request, dependencies);
     dependencies.recordEffect?.(null);
     await writePrivate(voicePolicyFile(paths), {
       schemaVersion: 1,
-      enabled: false,
+      enabled: true,
       installationDir: installation.installationDir,
     } satisfies VoiceHostPolicy);
     dependencies.recordEffect?.(true);
+    const busyInstanceIds: string[] = [];
+    await withManagedInstances(
+      paths,
+      async (runtimes, missing) => {
+        const upsert = dependencies.upsertEnvVars;
+        if (runtimes.length && !upsert)
+          throw new GwsEaError(
+            'voice_binding_unavailable',
+            'The gws-ea launcher must supply its native environment writer to install voice.',
+          );
+        if (upsert)
+          for (const runtime of runtimes) {
+            dependencies.recordEffect?.(null);
+            await bindInstanceHostPolicies(runtime, paths.configRoot, upsert);
+            dependencies.recordEffect?.(true);
+          }
+        for (const id of missing)
+          dependencies.progress?.(
+            `Assistant ${id}: runtime is not recorded yet; creation will bind shared voice automatically.`,
+          );
+        const previousDirectories: string[] = [];
+        for (const directory of directories) {
+          if (directory === installation.installationDir) continue;
+          try {
+            await assertOwnedDirectory(directory);
+            previousDirectories.push(directory);
+          } catch (error) {
+            if (!isErrno(error, 'ENOENT')) throw error;
+          }
+        }
+        if (previousDirectories.length === 0) return;
+        const unobserved = [...busyInstanceIds, ...missing];
+        if (unobserved.length) {
+          dependencies.progress?.(
+            `Retaining previous voice assets because voice work cannot be observed for assistants ${unobserved.join(', ')}.`,
+          );
+          return;
+        }
+        // Admission counts before reading the policy. After publishing the new
+        // selection, zero counters prove no note still owns the previous one,
+        // including the gap between ffmpeg exiting and whisper starting. Keep
+        // instance locks through removal so a lifecycle operation cannot race
+        // this consumer proof.
+        for (const runtime of runtimes) {
+          try {
+            await proveIdle(runtime, dependencies, { requireDisabledPolicy: false });
+            // eslint-disable-next-line no-catch-all/no-catch-all -- Any unproved consumer state retains assets; installing the new selection still succeeds.
+          } catch (_error) {
+            dependencies.progress?.(
+              `Retaining previous voice assets because assistant ${runtime.instance_id} has active or unobserved voice work.`,
+            );
+            return;
+          }
+        }
+        for (const directory of previousDirectories) {
+          let holders: readonly OpenFileHolder[];
+          try {
+            holders = await (dependencies.fileHolders ?? openFileHolders)(directory);
+            // eslint-disable-next-line no-catch-all/no-catch-all -- An unobservable process may still own these files; retain them for a later install or uninstall.
+          } catch (_error) {
+            dependencies.progress?.(
+              `Retaining previous voice assets because file holders cannot be observed: ${directory}`,
+            );
+            continue;
+          }
+          if (holders.length) {
+            dependencies.progress?.(
+              `Retaining previous voice assets while process ${holders[0].pid} uses them: ${directory}`,
+            );
+            continue;
+          }
+          dependencies.recordEffect?.(null);
+          await rm(directory, { recursive: true });
+          dependencies.recordEffect?.(true);
+        }
+      },
+      (id) => {
+        busyInstanceIds.push(id);
+        dependencies.progress?.(
+          `Assistant ${id}: another operation is running; its next create, update or rollback binds shared voice automatically.`,
+        );
+      },
+    );
     return installation;
   });
 }
 
-/** One enablement, inherited by every compatible current and future release. */
-export async function enableLocalVoice(
-  paths: ControlPlanePaths,
-  dependencies: VoiceOperatorDependencies = {},
-): Promise<VoiceHostPolicy> {
-  return underVoiceLock(paths, async () => {
-    const policy = await readLocalVoicePolicy(paths);
-    if (!policy.installationDir)
-      throw new GwsEaError(
-        'voice_not_installed',
-        'Voice is not installed. Run gws-ea capabilities install voice, then gws-ea capabilities enable voice.',
-      );
-    const model = (Object.keys(VOICE_MODEL_CATALOG) as VoiceModelId[]).find(
-      (model) => voiceInstallationDirectory(paths, model) === policy.installationDir,
-    );
-    if (!model)
-      throw new GwsEaError(
-        'voice_assets_unowned',
-        'Selected voice assets are outside this operator recipe-owned cache.',
-      );
+function ownedVoiceDirectories(paths: ControlPlanePaths): string[] {
+  return (Object.keys(VOICE_MODEL_CATALOG) as VoiceModelId[]).map((model) => voiceInstallationDirectory(paths, model));
+}
+
+async function hasOwnedVoiceAssets(paths: ControlPlanePaths): Promise<boolean> {
+  for (const directory of ownedVoiceDirectories(paths)) {
     try {
-      const installation = await verifyVoiceInstallation(policy.installationDir);
-      if (installation.receipt.model !== model)
-        throw new GwsEaError('voice_assets_invalid', 'Selected model differs from its recipe-owned directory.');
+      await lstat(directory);
+      return true;
     } catch (error) {
-      throw new GwsEaError(
-        'voice_assets_invalid',
-        'Voice assets are unhealthy. Run gws-ea capabilities disable voice, gws-ea capabilities uninstall voice, then gws-ea capabilities install voice.',
-        { cause: error, details: { model } },
-      );
+      if (!isErrno(error, 'ENOENT')) throw error;
     }
-    return withManagedInstances(paths, async (runtimes) => {
-      const upsert = dependencies.upsertEnvVars;
-      if (runtimes.length && !upsert)
-        throw new GwsEaError(
-          'voice_binding_unavailable',
-          'The gws-ea launcher must supply its native environment writer to enable voice.',
-        );
-      if (upsert)
-        for (const runtime of runtimes) {
-          dependencies.recordEffect?.(null);
-          await bindInstanceHostPolicies(runtime, paths.configRoot, upsert);
-          dependencies.recordEffect?.(true);
-        }
-      const enabled = { ...policy, enabled: true } satisfies VoiceHostPolicy;
-      dependencies.recordEffect?.(null);
-      await writePrivate(voicePolicyFile(paths), enabled);
-      dependencies.recordEffect?.(true);
-      return enabled;
-    });
-  });
+  }
+  return false;
 }
 
-/** Stops new recognition without restarting text service or deleting assets. */
-export async function disableLocalVoice(
-  paths: ControlPlanePaths,
-  dependencies: Pick<VoiceOperatorDependencies, 'recordEffect'> = {},
-): Promise<VoiceHostPolicy> {
-  return underVoiceLock(paths, async () => {
-    const disabled = { ...(await readLocalVoicePolicy(paths)), enabled: false } satisfies VoiceHostPolicy;
-    dependencies.recordEffect?.(null);
-    await writePrivate(voicePolicyFile(paths), disabled);
-    dependencies.recordEffect?.(true);
-    return disabled;
-  });
-}
-
-async function proveIdle(runtime: InstanceRuntimeConfig, dependencies: VoiceOperatorDependencies): Promise<void> {
+async function proveIdle(
+  runtime: InstanceRuntimeConfig,
+  dependencies: VoiceOperatorDependencies,
+  options: { readonly requireDisabledPolicy: boolean } = { requireDisabledPolicy: true },
+): Promise<void> {
   const compatibility = await voiceReleaseCompatibility(runtime.checkout_root);
   if (compatibility === 'unsupported') return;
-  const drain = `Assistant ${runtime.instance_id}: wait for voice work to finish, or run gws-ea stop --id ${runtime.instance_id}, then retry gws-ea capabilities uninstall voice.`;
+  const drain = `Assistant ${runtime.instance_id}: wait for voice work to finish, or run gws-ea stop --id ${runtime.instance_id}, then retry gws-ea connectors uninstall voice.`;
   const service = dependencies.serviceHelpers
     ? createServiceControl(dependencies.serviceHelpers, runtimeServiceTarget(runtime)).detect()
     : undefined;
@@ -330,35 +375,31 @@ async function proveIdle(runtime: InstanceRuntimeConfig, dependencies: VoiceOper
       details: { instanceId: runtime.instance_id },
     });
   }
-  if (health.enabled || health.queued || health.inflight)
+  if ((options.requireDisabledPolicy && health.enabled) || health.queued || health.inflight)
     throw new GwsEaError(
       'voice_not_drained',
-      `The assistant still has voice work or has not observed disablement. ${drain}`,
+      `The assistant still has voice work or has not observed the stopped policy. ${drain}`,
       { details: { instanceId: runtime.instance_id } },
     );
 }
 
-/** Deletion is disabled-first, fenced against enable/cutover, and proves orphaned asset consumers absent. */
+/** Stop admission before waiting for every managed consumer and orphaned child to drain. */
 export async function uninstallLocalVoice(
   paths: ControlPlanePaths,
   dependencies: VoiceOperatorDependencies = {},
 ): Promise<void> {
   return underVoiceLock(paths, async () => {
     const policy = await readLocalVoicePolicy(paths);
-    if (policy.enabled)
-      throw new GwsEaError(
-        'voice_enabled',
-        'Run gws-ea capabilities disable voice before gws-ea capabilities uninstall voice.',
-      );
+    dependencies.recordEffect?.(null);
+    await writePrivate(voicePolicyFile(paths), emptyPolicy());
+    dependencies.recordEffect?.(true);
     try {
       await assertPrivateDirectory(path.join(paths.stateRoot, 'voice'));
     } catch (error) {
       if (!isErrno(error, 'ENOENT')) throw error;
     }
     const directories: string[] = [];
-    const ownedDirectories = (Object.keys(VOICE_MODEL_CATALOG) as VoiceModelId[]).map((model) =>
-      voiceInstallationDirectory(paths, model),
-    );
+    const ownedDirectories = ownedVoiceDirectories(paths);
     for (const directory of ownedDirectories) {
       try {
         await assertOwnedDirectory(directory);
@@ -376,7 +417,7 @@ export async function uninstallLocalVoice(
       if (unobservedInstanceIds.length)
         throw new GwsEaError(
           'voice_drain_unproven',
-          `Runtime configuration is missing for assistant ${unobservedInstanceIds.join(', ')}; its voice work cannot be observed. Restore the recorded runtime or finish removing that assistant before retrying gws-ea capabilities uninstall voice.`,
+          `Runtime configuration is missing for assistant ${unobservedInstanceIds.join(', ')}; its voice work cannot be observed. Restore the recorded runtime or finish removing that assistant before retrying gws-ea connectors uninstall voice.`,
         );
       for (const runtime of runtimes) await proveIdle(runtime, dependencies);
       for (const directory of directories) {
@@ -384,13 +425,9 @@ export async function uninstallLocalVoice(
         if (holders.length)
           throw new GwsEaError(
             'voice_not_drained',
-            `Voice assets are held by process ${holders[0].pid}; let it exit before retrying gws-ea capabilities uninstall voice.`,
+            `Voice assets are held by process ${holders[0].pid}; let it exit before retrying gws-ea connectors uninstall voice.`,
           );
       }
-      // Clear selection before any deletion so a partial removal remains safely disabled.
-      dependencies.recordEffect?.(null);
-      await writePrivate(voicePolicyFile(paths), emptyPolicy());
-      dependencies.recordEffect?.(true);
       for (const directory of directories) await rm(directory, { recursive: true });
     });
   });
@@ -414,6 +451,7 @@ export async function observeLocalVoice(
   paths: ControlPlanePaths,
   runtime: InstanceRuntimeConfig,
   ncl: (runtime: InstanceRuntimeConfig, args: readonly string[]) => Promise<unknown> = runInstanceNclJson,
+  inspection?: VoiceCapabilityObservation,
 ): Promise<VoiceObservation> {
   const view: VoiceObservation = {
     status: 'unknown',
@@ -427,9 +465,24 @@ export async function observeLocalVoice(
     last_outcome: null,
     last_failure: null,
   };
-  const policy = await readLocalVoicePolicy(paths);
-  const compatibility = await voiceReleaseCompatibility(runtime.checkout_root);
-  if (!policy.installationDir)
+  const observedAssistant = inspection?.assistants.find((entry) => entry.instance_id === runtime.instance_id);
+  const policy = inspection
+    ? { enabled: inspection.activation.enabled === true, installationDir: inspection.assets.selected_directory }
+    : await readLocalVoicePolicy(paths);
+  const compatibility = inspection
+    ? (observedAssistant?.compatibility ?? 'unknown')
+    : await voiceReleaseCompatibility(runtime.checkout_root);
+  if (inspection?.activation.enabled === null) return { ...view, compatibility, reason: inspection.activation.reason };
+  if (!policy.installationDir) {
+    if (!policy.enabled && (inspection ? inspection.assets.installations.length > 0 : await hasOwnedVoiceAssets(paths)))
+      return {
+        ...view,
+        status: 'degraded',
+        reason: VOICE_UNINSTALL_INCOMPLETE_REASON,
+        enabled: false,
+        compatibility,
+        readiness: 'unavailable',
+      };
     return {
       ...view,
       status: policy.enabled ? 'degraded' : 'ok',
@@ -439,8 +492,13 @@ export async function observeLocalVoice(
       compatibility,
       readiness: 'unavailable',
     };
+  }
+  let selectedModel = inspection?.assets.selected_model;
   try {
-    await verifyVoiceInstallation(policy.installationDir);
+    if (inspection) {
+      if (inspection.assets.status !== 'verified')
+        throw new Error(inspection.assets.reason ?? 'Asset verification was not established.');
+    } else selectedModel = (await verifyVoiceInstallation(policy.installationDir)).receipt.model;
     // eslint-disable-next-line no-catch-all/no-catch-all -- Asset verification is an observation boundary; any failure is optional capability state, never a repair.
   } catch (error) {
     return {
@@ -453,12 +511,13 @@ export async function observeLocalVoice(
       readiness: 'unavailable',
     };
   }
+  const installCommand = `gws-ea connectors install voice${selectedModel ? ` --model ${selectedModel}` : ''}`;
   if (compatibility !== 'compatible')
     return {
       ...view,
       status: !policy.enabled ? 'ok' : compatibility === 'unsupported' ? 'degraded' : 'unknown',
       reason: !policy.enabled
-        ? 'Voice is disabled host-wide.'
+        ? `Voice is installed, stopped. Run ${installCommand}.`
         : 'This release needs an operator update for voice; text service remains available.',
       enabled: policy.enabled,
       assets: 'verified',
@@ -467,7 +526,27 @@ export async function observeLocalVoice(
     };
   let health: ObservedVoiceHealth;
   try {
-    health = parseVoiceHealth(await ncl(runtime, VOICE_HEALTH_ARGS));
+    if (inspection) {
+      if (
+        !observedAssistant ||
+        observedAssistant.consumer.status !== 'observed' ||
+        observedAssistant.consumer.enabled === null ||
+        observedAssistant.consumer.queued === null ||
+        observedAssistant.consumer.inflight === null
+      )
+        throw new Error(observedAssistant?.reason ?? 'Consumer readiness was not observed.');
+      health = {
+        schemaVersion: 1,
+        recipe: VOICE_RECIPE_ID,
+        enabled: observedAssistant.consumer.enabled,
+        readiness: observedAssistant.readiness === 'ready' ? 'ready' : 'unavailable',
+        reason: observedAssistant.reason,
+        queued: observedAssistant.consumer.queued,
+        inflight: observedAssistant.consumer.inflight,
+        lastOutcome: observedAssistant.last_outcome,
+        lastFailure: observedAssistant.last_failure,
+      };
+    } else health = parseVoiceHealth(await ncl(runtime, VOICE_HEALTH_ARGS));
     // eslint-disable-next-line no-catch-all/no-catch-all -- A failed host query is unknown readiness, never evidence of healthy recognition.
   } catch (error) {
     return {
@@ -491,12 +570,17 @@ export async function observeLocalVoice(
     last_failure: health.lastFailure,
   };
   if (!policy.enabled)
-    return { ...facts, status: 'ok', reason: 'Voice is disabled host-wide.', readiness: 'unavailable' };
+    return {
+      ...facts,
+      status: 'ok',
+      reason: `Voice is installed, stopped. Run ${installCommand}.`,
+      readiness: 'unavailable',
+    };
   if (!health.enabled || health.readiness !== 'ready' || health.lastFailure)
     return {
       ...facts,
       status: 'degraded',
-      reason: health.lastFailure?.reason ?? health.reason ?? 'The host has not observed voice enablement.',
+      reason: health.lastFailure?.reason ?? health.reason ?? 'The host has not observed installed voice.',
     };
   if (health.lastOutcome?.status !== 'recognized')
     return {

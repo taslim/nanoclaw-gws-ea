@@ -9,8 +9,7 @@ import { promisify } from 'node:util';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { buildChromeLaunch, prepareChromeProfile, spawnChrome } from './chrome.js';
-import { browserPaths, ensureBrowserPaths, writePrivateFile } from './paths.js';
-import { readBrowserPolicy } from './policy.js';
+import { browserPaths, ensureBrowserPaths } from './paths.js';
 
 vi.mock('node:child_process', async (load) => {
   const original = await load<typeof import('node:child_process')>();
@@ -28,7 +27,7 @@ afterEach(async () => {
 
 describe('dedicated Chrome profile and launch', () => {
   it('uses an explicit loopback debugger port, dedicated profile, public proxy and background flags only', () => {
-    const paths = browserPaths(path.join(root, 'browser', 'policy.json'));
+    const paths = browserPaths(path.join(root, 'browser'));
     const launch = buildChromeLaunch({
       chromePath: '/Applications/Chrome with spaces.app/Chrome',
       paths,
@@ -69,7 +68,7 @@ describe('dedicated Chrome profile and launch', () => {
     expect(() =>
       buildChromeLaunch({
         chromePath: '/fixture/chrome',
-        paths: browserPaths(path.join(root, 'browser', 'policy.json')),
+        paths: browserPaths(path.join(root, 'browser')),
         proxyUrl: 'http://127.0.0.1:45678',
         debuggerPort,
       }),
@@ -95,7 +94,7 @@ describe('dedicated Chrome profile and launch', () => {
       const pending = spawnChrome(
         {
           chromePath: '/fixture/chrome',
-          paths: browserPaths(path.join(root, 'browser', 'policy.json')),
+          paths: browserPaths(path.join(root, 'browser')),
           proxyUrl: 'http://127.0.0.1:45678',
         },
         controller.signal,
@@ -113,7 +112,7 @@ describe('dedicated Chrome profile and launch', () => {
   });
 
   it('sets a child-only umask and preserves argv verbatim', async () => {
-    const paths = browserPaths(path.join(root, 'browser', 'policy.json'));
+    const paths = browserPaths(path.join(root, 'browser'));
     const launch = buildChromeLaunch({
       chromePath: process.execPath,
       paths,
@@ -134,7 +133,7 @@ describe('dedicated Chrome profile and launch', () => {
   });
 
   it('keeps profile/staging private and rewrites WebRTC preference on reopening without losing site state', async () => {
-    const paths = browserPaths(path.join(root, 'browser', 'policy.json'));
+    const paths = browserPaths(path.join(root, 'browser'));
     await ensureBrowserPaths(paths);
     await prepareChromeProfile(paths);
     const pref = path.join(paths.profileDir, 'Default', 'Preferences');
@@ -166,7 +165,7 @@ describe('dedicated Chrome profile and launch', () => {
   });
 
   it('retains Chrome’s version sentinel without following it, only at the profile root', async () => {
-    const paths = browserPaths(path.join(root, 'browser', 'policy.json'));
+    const paths = browserPaths(path.join(root, 'browser'));
     await ensureBrowserPaths(paths);
     const sentinel = path.join(paths.profileDir, 'RunningChromeVersion');
     await symlink('155.0.8059.85:1', sentinel);
@@ -181,7 +180,7 @@ describe('dedicated Chrome profile and launch', () => {
   });
 
   it('drops every service worker registration while Chrome is stopped', async () => {
-    const paths = browserPaths(path.join(root, 'browser', 'policy.json'));
+    const paths = browserPaths(path.join(root, 'browser'));
     await prepareChromeProfile(paths);
     // A worker registered before would answer navigations without a request the gate sees.
     const workers = path.join(paths.profileDir, 'Default', 'Service Worker');
@@ -192,7 +191,7 @@ describe('dedicated Chrome profile and launch', () => {
   });
 
   it('removes orphaned upload copies while retaining unhanded downloads before a fresh Chrome launch', async () => {
-    const paths = browserPaths(path.join(root, 'browser', 'policy.json'));
+    const paths = browserPaths(path.join(root, 'browser'));
     await ensureBrowserPaths(paths);
     const upload = path.join(paths.stagingDir, 'uploads', 'orphan');
     await mkdir(upload, { recursive: true, mode: 0o700 });
@@ -203,34 +202,5 @@ describe('dedicated Chrome profile and launch', () => {
     await prepareChromeProfile(paths);
     expect(await readdir(path.join(paths.stagingDir, 'uploads'))).toEqual([]);
     expect(await readFile(path.join(download, 'invoice.pdf'), 'utf8')).toBe('only valid download');
-  });
-
-  it('reads required optional-capability policy on each use and never adopts configurable profiles', async () => {
-    const paths = browserPaths(path.join(root, 'browser', 'policy.json'));
-    expect(await readBrowserPolicy(paths.policyFile)).toMatchObject({ enabled: false, status: 'disabled' });
-    await ensureBrowserPaths(paths);
-    await writePrivateFile(paths.policyFile, JSON.stringify({ schemaVersion: 1, enabled: true }));
-    expect(await readBrowserPolicy(paths.policyFile)).toMatchObject({
-      enabled: true,
-      status: 'enabled',
-      paths,
-    });
-    await writePrivateFile(paths.policyFile, JSON.stringify({ schemaVersion: 1, enabled: 'yes' }));
-    expect(await readBrowserPolicy(paths.policyFile)).toMatchObject({ enabled: false, status: 'unavailable' });
-    await writePrivateFile(paths.policyFile, JSON.stringify({ schemaVersion: 1, enabled: true }));
-    await chmod(paths.policyFile, 0o644);
-    expect(await readBrowserPolicy(paths.policyFile)).toMatchObject({ enabled: false, status: 'unavailable' });
-    expect((await lstat(paths.policyFile)).mode & 0o777).toBe(0o644);
-    await writePrivateFile(paths.policyFile, JSON.stringify({ schemaVersion: 1, enabled: false }));
-    expect(await readBrowserPolicy(paths.policyFile)).toMatchObject({ enabled: false, status: 'disabled' });
-    await writePrivateFile(
-      paths.policyFile,
-      JSON.stringify({ schemaVersion: 1, enabled: true, profileDir: '/personal' }),
-    );
-    expect(await readBrowserPolicy(paths.policyFile)).toMatchObject({
-      enabled: false,
-      status: 'unavailable',
-      reason: 'invalid-browser-policy',
-    });
   });
 });

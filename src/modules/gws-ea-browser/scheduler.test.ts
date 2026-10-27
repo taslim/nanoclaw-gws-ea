@@ -1,3 +1,4 @@
+import { useAvailableBrowser } from './testing/browser-runtime.js';
 import { createBrowserQueue } from './index.js';
 import fs from 'node:fs';
 import { getEventListeners } from 'node:events';
@@ -13,12 +14,13 @@ vi.mock('../../config.js', async (original) => ({
   TIMEZONE: 'America/New_York',
 }));
 vi.mock('../../request-wake.js', () => ({ requestWake: vi.fn(async () => true) }));
-import { closeDb, createAgentGroup, getDb, initTestDb, runMigrations } from '../../db/index.js';
+import { closeDb, createAgentGroup, createPendingApproval, getDb, initTestDb, runMigrations } from '../../db/index.js';
 import { requestWake } from '../../request-wake.js';
 import { resolveSystemSession } from '../../session-manager.js';
 import '../gws-ea-profile/index.js';
 import './index.js';
 import { BrowserStore } from './db.js';
+import { browserAvailability } from './availability.js';
 import { type BrowserQueue } from './queue.js';
 import { browserWatchesMigration } from './migration.js';
 import { createBrowserWatchScheduler, type BrowserWatchCheckResult } from './scheduler.js';
@@ -32,6 +34,7 @@ import { setPrincipalNameAndTimezone } from '../gws-ea-profile/db.js';
 let queue: BrowserQueue;
 let jobId: string;
 beforeEach(async () => {
+  useAvailableBrowser();
   vi.useFakeTimers({ toFake: ['Date'] });
   vi.setSystemTime(new Date('2026-10-15T12:00:00Z'));
   await runMigrations(await initTestDb());
@@ -58,13 +61,13 @@ beforeEach(async () => {
     async closeJob() {},
     onDisconnected: () => () => undefined,
   });
-  const file = `${root}/browser/policy.json`;
+  const file = `${root}/browser`;
   fs.mkdirSync(`${root}/browser`, { recursive: true, mode: 0o700 });
-  fs.writeFileSync(file, JSON.stringify({ schemaVersion: 1, enabled: true }), { mode: 0o600 });
-  process.env.GWS_EA_BROWSER_POLICY_FILE = file;
+
+  process.env.GWS_EA_BROWSER_ROOT = file;
 });
 afterEach(async () => {
-  delete process.env.GWS_EA_BROWSER_POLICY_FILE;
+  delete process.env.GWS_EA_BROWSER_ROOT;
   await closeDb();
   fs.rmSync(root, { recursive: true, force: true });
   vi.useRealTimers();
@@ -140,6 +143,95 @@ function availability(partySize = 4): Extract<ReservationAvailability, { status:
   };
 }
 const freeCalendar = async () => ({ conflicts: [], conflicts_not_listed: 0, message: 'Free' });
+
+it('expires watches and delivers pending notices without Chrome, without running checks', async () => {
+  await arm('expired-offline', 'expired', 4, 1, bounds.site, {
+    bounds: { until: new Date(Date.now() - 1000).toISOString() },
+  });
+  await arm('notice-offline', 'waiting');
+  await getDb().run(
+    'INSERT INTO gws_ea_browser_watch_notices(watch_id,event_key,outcome_json,created_at) VALUES(?,?,?,?)',
+    'notice-offline',
+    'blocked',
+    JSON.stringify({ status: 'blocked', reason: 'calendar_unavailable' }),
+    new Date().toISOString(),
+  );
+  const { scheduler, checks } = countingScheduler();
+  vi.mocked(browserAvailability).mockResolvedValueOnce({ available: false, reason: 'chrome-missing' });
+
+  await scheduler.tick();
+
+  expect(await getDb().all('SELECT id,status FROM gws_ea_browser_watches ORDER BY id')).toEqual([
+    { id: 'expired-offline', status: 'expired' },
+    { id: 'notice-offline', status: 'armed' },
+  ]);
+  expect(await getDb().all('SELECT watch_id,delivered_at FROM gws_ea_browser_watch_notices ORDER BY watch_id')).toEqual(
+    [
+      { watch_id: 'expired-offline', delivered_at: expect.any(String) },
+      { watch_id: 'notice-offline', delivered_at: expect.any(String) },
+    ],
+  );
+  expect(checks()).toBe(0);
+  expect(await getDb().all('SELECT id FROM gws_ea_browser_watch_checks')).toEqual([]);
+});
+
+it('preserves armed watches and pending cards while Chrome is missing, then checks when it returns', async () => {
+  await arm('armed', 'ready');
+  await arm('pending', 'pending');
+  await getDb().run("UPDATE gws_ea_browser_watches SET status='awaiting_principal' WHERE id='pending'");
+  await createPendingApproval({
+    approval_id: 'pending-watch-card',
+    request_id: 'pending-watch-setup',
+    action: 'browser_watch_setup',
+    payload: JSON.stringify({ watchId: 'pending' }),
+    created_at: new Date().toISOString(),
+    title: 'Watch for a table?',
+    options_json: '[]',
+  });
+  const { scheduler, checks } = countingScheduler();
+  vi.mocked(browserAvailability).mockResolvedValueOnce({ available: false, reason: 'chrome-missing' });
+
+  await scheduler.tick();
+
+  expect(await getDb().get('SELECT cancelled,cancel_requested FROM gws_ea_browser_jobs WHERE id=?', jobId)).toEqual({
+    cancelled: 0,
+    cancel_requested: 0,
+  });
+  expect(await getDb().all('SELECT id,status FROM gws_ea_browser_watches ORDER BY id')).toEqual([
+    { id: 'armed', status: 'armed' },
+    { id: 'pending', status: 'awaiting_principal' },
+  ]);
+  expect(await getDb().get('SELECT status FROM pending_approvals WHERE approval_id=?', 'pending-watch-card')).toEqual({
+    status: 'pending',
+  });
+  expect(checks()).toBe(0);
+  expect(await getDb().all('SELECT id FROM gws_ea_browser_watch_checks')).toEqual([]);
+
+  await scheduler.tick();
+
+  expect(checks()).toBe(1);
+  expect(await getDb().all('SELECT outcome FROM gws_ea_browser_watch_checks')).toEqual([{ outcome: 'ready' }]);
+  expect(await getDb().get('SELECT status FROM gws_ea_browser_watches WHERE id=?', 'armed')).toEqual({
+    status: 'armed',
+  });
+  expect(await getDb().get('SELECT status FROM pending_approvals WHERE approval_id=?', 'pending-watch-card')).toEqual({
+    status: 'pending',
+  });
+});
+
+it('cancels armed watch errands when the browser root is no longer configured', async () => {
+  await arm('armed', 'ready');
+  const { scheduler, checks } = countingScheduler();
+  vi.stubEnv('GWS_EA_BROWSER_ROOT', 'relative/browser');
+
+  await scheduler.tick();
+
+  expect(await getDb().get('SELECT cancelled FROM gws_ea_browser_jobs WHERE id=?', jobId)).toEqual({ cancelled: 1 });
+  expect(await getDb().get('SELECT status FROM gws_ea_browser_watches WHERE id=?', 'armed')).toEqual({
+    status: 'cancelled',
+  });
+  expect(checks()).toBe(0);
+});
 
 it('releases the host abort subscription when stopped and still honors host shutdown', async () => {
   const host = new AbortController();

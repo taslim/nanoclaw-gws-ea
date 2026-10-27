@@ -37,7 +37,7 @@ import { assertInstanceId } from './registry.js';
 import { instanceLayout, readCurrent, releaseName } from './release-layout.js';
 import { GCHAT_PROJECT_ID_ENV, GCHAT_SUBSCRIBER_KEY_FILE_ENV } from '../modules/gws-ea-chat/config.js';
 import { GOOGLE_GRANT_FILE_ENV, GOOGLE_GRANT_FILE_NAME } from '../modules/gws-ea-google/grant.js';
-import { BROWSER_POLICY_FILE_ENV } from '../modules/gws-ea-browser/policy.js';
+import { BROWSER_ROOT_ENV } from '../modules/gws-ea-browser/availability.js';
 import { ARTIFACTS_POLICY_FILE_ENV } from '../modules/gws-ea-artifacts/policy.js';
 import { ONEPASSWORD_POLICY_FILE_ENV, onePasswordHostPaths } from '../modules/gws-ea-browser/onepassword-policy.js';
 import { VOICE_POLICY_FILE_ENV } from '../modules/gws-ea-voice/config.js';
@@ -307,7 +307,7 @@ export const INSTANCE_HOST_ENV_KEYS = [
   'NANOCLAW_EGRESS_NETWORK',
   'ONECLI_GATEWAY_CONTAINER',
   'ONECLI_URL',
-  BROWSER_POLICY_FILE_ENV,
+  BROWSER_ROOT_ENV,
   ARTIFACTS_POLICY_FILE_ENV,
 ] as const;
 
@@ -322,7 +322,7 @@ export function instanceHostConfiguration(config: InstanceRuntimeConfig): Readon
     NANOCLAW_EGRESS_NETWORK: config.agent_egress_network,
     ONECLI_GATEWAY_CONTAINER: config.onecli_gateway_container,
     ONECLI_URL: config.onecli_app_url,
-    [BROWSER_POLICY_FILE_ENV]: path.join(config.instance_root, 'browser', 'policy.json'),
+    [BROWSER_ROOT_ENV]: path.join(config.instance_root, 'browser'),
     [ARTIFACTS_POLICY_FILE_ENV]: path.join(config.instance_root, 'artifacts', 'policy.json'),
   };
 }

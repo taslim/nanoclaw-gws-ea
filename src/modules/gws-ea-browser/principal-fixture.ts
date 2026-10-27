@@ -3,7 +3,7 @@
  * ('mg-principal'), with its browser agent ('browser-p') and another agent ('desk-p'). Each suite mocks its own data
  * root; nothing here reaches a platform.
  */
-import fs from 'node:fs';
+import { configureBrowserAccess } from './testing/browser-access.js';
 
 import { createAgentGroup, createMessagingGroup, getDb } from '../../db/index.js';
 import { resolveSession, resolveSystemSession, withExistingMailboxSession } from '../../session-manager.js';
@@ -15,18 +15,11 @@ import { BrowserStore, type BrowserJob } from './db.js';
 
 export const PRINCIPAL = 'gchat:users/principal';
 
-/** Writes an enabled browser policy under `root`: version 1 (main alone) without a list, else version 2. */
-export function writeBrowserPolicy(root: string, agentGroupIds?: readonly string[]): string {
-  const file = `${root}/browser/policy.json`;
-  fs.mkdirSync(`${root}/browser`, { recursive: true });
-  fs.writeFileSync(
-    file,
-    JSON.stringify(
-      agentGroupIds ? { schemaVersion: 2, enabled: true, agentGroupIds } : { schemaVersion: 1, enabled: true },
-    ),
-    { mode: 0o600 },
-  );
-  return file;
+/** Configure the assistant browser root and native delegation grants. */
+export async function configurePrincipalBrowser(root: string, agentGroupIds: readonly string[] = []): Promise<string> {
+  const browserRoot = `${root}/browser`;
+  await configureBrowserAccess(browserRoot, agentGroupIds);
+  return browserRoot;
 }
 
 /** The principal's user and direct message, which nothing reaches until `principalReachable`. */

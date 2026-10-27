@@ -1,3 +1,4 @@
+import { useAvailableBrowser } from './testing/browser-runtime.js';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -7,9 +8,10 @@ import { createDestination } from '../agent-to-agent/db/agent-destinations.js';
 import { assertWiringAdmitted } from '../../db/wiring-admission.js';
 import '../gws-ea-profile/index.js';
 import './destination-policy.js';
-import { writeBrowserAccess } from './testing/browser-access.js';
+import { configureBrowserAccess } from './testing/browser-access.js';
 
 beforeEach(async () => {
+  useAvailableBrowser();
   await runMigrations(await initTestDb());
   for (const id of ['main', 'browser', 'external'])
     await createAgentGroup({ id, name: id, folder: id, agent_provider: null, created_at: new Date().toISOString() });
@@ -20,7 +22,7 @@ beforeEach(async () => {
   );
 });
 afterEach(async () => {
-  delete process.env.GWS_EA_BROWSER_POLICY_FILE;
+  delete process.env.GWS_EA_BROWSER_ROOT;
   await closeDb();
 });
 
@@ -75,10 +77,10 @@ it('refuses direct channel wiring to the browser even from a trusted host caller
   ).rejects.toThrow('delegated errand');
 });
 
-it('admits the edge pair of each group a version-2 list names, and no other', async () => {
+it('admits edge pairs for main and each explicitly granted group', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'browser-destination-policy-'));
   try {
-    writeBrowserAccess(path.join(root, 'browser', 'policy.json'), { agentGroupIds: ['external'], enabled: false });
+    await configureBrowserAccess(path.join(root, 'browser'), ['external']);
     const out = {
       agent_group_id: 'external',
       local_name: 'browser',
@@ -97,12 +99,15 @@ it('admits the edge pair of each group a version-2 list names, and no other', as
       session_mode: 'agent-shared',
       inbound_untrusted: 0,
     });
-    await expect(createDestination({ ...out, agent_group_id: 'main' })).rejects.toThrow(
-      'only an agent with browser access may address browser',
-    );
-    await expect(
-      createDestination({ ...out, agent_group_id: 'browser', local_name: 'main', target_id: 'main' }),
-    ).rejects.toThrow('browser may address only the agents with browser access');
+    await createDestination({ ...out, agent_group_id: 'main' });
+    await createDestination({
+      ...out,
+      agent_group_id: 'browser',
+      local_name: 'main',
+      target_id: 'main',
+      session_mode: 'agent-shared',
+      inbound_untrusted: 0,
+    });
     await expect(createDestination({ ...out, local_name: 'trusted-browser', inbound_untrusted: 0 })).rejects.toThrow(
       'untrusted',
     );

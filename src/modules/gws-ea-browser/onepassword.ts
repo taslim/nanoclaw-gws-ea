@@ -25,8 +25,7 @@ import {
   readOnePasswordResources,
   readOnePasswordToken,
 } from './onepassword-policy.js';
-import { browserPaths } from './paths.js';
-import { browserPolicyFile } from './policy.js';
+import { browserRoot } from './availability.js';
 
 export type BrowserVaultReason = 'vault_unavailable' | 'rate_limited' | 'no_item_for_site' | 'origin_mismatch';
 export class BrowserVaultError extends Error {
@@ -46,8 +45,8 @@ export interface BrowserVaultItem {
 
 /** Each defaults to its host locator, re-read for every use. */
 export interface BrowserVaultLocators {
-  /** This assistant's browser policy, always `<instance root>/browser/policy.json`; it locates the instance root. */
-  readonly browserPolicyFile?: string;
+  /** This assistant's browser policy, always `<instance root>/browser`; it locates the instance root. */
+  readonly browserRoot?: string;
   readonly onePasswordPolicyFile?: string;
 }
 
@@ -85,12 +84,8 @@ type RuntimeAccess =
 const unavailable = (reason: BrowserVaultUnavailableReason): RuntimeAccess => ({ status: 'unavailable', reason });
 
 /** The instance root a browser policy path names, only where provisioning puts that policy. */
-function instanceRootOf(policyFile: string): string | undefined {
-  if (!isNormalizedAbsolute(policyFile)) return undefined;
-  const { root } = browserPaths(policyFile);
-  return path.basename(policyFile) === 'policy.json' && path.basename(root) === 'browser'
-    ? path.dirname(root)
-    : undefined;
+function instanceRootOf(root: string): string | undefined {
+  return isNormalizedAbsolute(root) && path.basename(root) === 'browser' ? path.dirname(root) : undefined;
 }
 
 /**
@@ -104,7 +99,7 @@ async function readRuntimeAccess(locators: BrowserVaultLocators): Promise<Runtim
   if (host.status !== 'ready') return unavailable(host.status === 'absent' ? 'not_enabled' : 'invalid_state');
   // The operator's published disable stops every use, however far a job got.
   if (!host.policy.enabled) return unavailable('disabled');
-  const located = locators.browserPolicyFile ?? browserPolicyFile();
+  const located = locators.browserRoot ?? browserRoot();
   const instanceRoot = located ? instanceRootOf(located) : undefined;
   if (!instanceRoot) return unavailable('invalid_state');
   let instanceId: string;

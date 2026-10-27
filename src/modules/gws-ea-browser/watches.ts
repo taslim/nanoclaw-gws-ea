@@ -35,7 +35,8 @@ import { browserSite } from './leases.js';
 import { amountMinor } from './fingerprint.js';
 import { merchantSignatures } from './merchant-signatures.js';
 import { readBrowserRef, type BrowserRef } from './observe.js';
-import { browserDelegators, readHostBrowserPolicy } from './access.js';
+import { browserAvailability } from './availability.js';
+import { browserDelegators } from './access.js';
 import { executeRecipe } from './recipes.js';
 import { loadRecipe, recipeCheckKey, type BrowserRecipe } from './recipe-store.js';
 import { type StructuredBrowserLocator } from './locators.js';
@@ -233,7 +234,7 @@ const watchSetupGuard = defineGuardedAction({
     if (
       actor.kind !== 'agent' ||
       !actor.sessionId ||
-      !(await readHostBrowserPolicy()).enabled ||
+      !(await browserAvailability()).available ||
       typeof payload.watchId !== 'string'
     )
       return DENY(watchMessage('live'));

@@ -19,7 +19,8 @@ import {
   type PurchaseBounds,
   type PurchaseFacts,
 } from './fingerprint.js';
-import { readHostBrowserPolicy } from './access.js';
+import { browserAvailability } from './availability.js';
+
 import type { BrowserExecutionContext } from './actions.js';
 import type { WatchBounds } from './watch-state.js';
 
@@ -360,7 +361,7 @@ export class PurchaseAuthorityStore {
     claim?: (db: DbDriver, authority: SpendingAuthority, immediatelyRereadFacts: PurchaseFacts) => Promise<void>,
   ): Promise<SpendingAuthority> {
     await context.assertActive();
-    if (!(await readHostBrowserPolicy()).enabled) throw new PurchaseAuthorityError('authority_unavailable');
+    if (!(await browserAvailability()).available) throw new PurchaseAuthorityError('authority_unavailable');
     return this.db.transaction(async () => {
       const authority = await this.get(authorityId);
       const at = new Date().toISOString();

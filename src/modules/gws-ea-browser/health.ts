@@ -1,13 +1,17 @@
+import { getDb } from '../../db/connection.js';
 import type { BrowserRuntime } from './runtime.js';
-import { BROWSER_POLICY_VERSIONS } from './policy.js';
 
-/**
- * Host-only status includes the admitted debugger port, never its URL, browser identifier, credentials, cookies or
- * page text. `policyVersions` names the browser policy versions this host reads: the launcher writes a version-2
- * access list only to a host that reports it.
- */
+/** Host-only listener facts never include endpoints, browser IDs, page text or credentials. */
 export async function browserHealth(
   state: ReturnType<BrowserRuntime['state']>,
-): Promise<{ schemaVersion: 1; policyVersions: readonly number[] } & ReturnType<BrowserRuntime['state']>> {
-  return { schemaVersion: 1, policyVersions: BROWSER_POLICY_VERSIONS, ...state };
+): Promise<{ schemaVersion: 1; credentialAttempts: number } & ReturnType<BrowserRuntime['state']>> {
+  const db = getDb();
+  const credentialAttempts = (await db.hasTable('gws_ea_browser_credential_attempts'))
+    ? ((
+        await db.get<{ count: number }>(
+          "SELECT COUNT(*) AS count FROM gws_ea_browser_credential_attempts WHERE phase NOT IN ('rejected','finalized')",
+        )
+      )?.count ?? 0)
+    : 0;
+  return { schemaVersion: 1, ...state, credentialAttempts };
 }

@@ -1,3 +1,4 @@
+import { useAvailableBrowser } from './testing/browser-runtime.js';
 import fs from 'node:fs';
 import Database from 'better-sqlite3';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -24,6 +25,8 @@ import { upsertUser } from '../permissions/db/users.js';
 import './index.js';
 import { guaranteeCoversReservation } from './fingerprint.js';
 import { reservationGuaranteeRequest } from './reservation-guarantee.js';
+import { browserAvailability } from './availability.js';
+import { deliverAction as send, refusal } from './testing/delivery-answer.js';
 import type { PurchaseBounds, PurchaseFacts } from './fingerprint.js';
 const bounds: PurchaseBounds = {
   reservation: {
@@ -129,12 +132,11 @@ describe('standing reservation guarantees through native host delivery', () => {
   let main: Session;
 
   beforeEach(async () => {
+    useAvailableBrowser();
     fs.rmSync(ROOT, { recursive: true, force: true });
     fs.mkdirSync(`${ROOT}/browser`, { recursive: true, mode: 0o700 });
-    fs.writeFileSync(`${ROOT}/browser/policy.json`, JSON.stringify({ schemaVersion: 1, enabled: true }), {
-      mode: 0o600,
-    });
-    process.env.GWS_EA_BROWSER_POLICY_FILE = `${ROOT}/browser/policy.json`;
+
+    process.env.GWS_EA_BROWSER_ROOT = `${ROOT}/browser`;
     await runMigrations(await initTestDb());
     const at = new Date().toISOString();
     for (const id of ['rg-main', 'rg-browser'])
@@ -161,7 +163,7 @@ describe('standing reservation guarantees through native host delivery', () => {
     main = (await resolveSession('rg-main', 'rg-dm', null, 'agent-shared')).session;
   });
   afterEach(async () => {
-    delete process.env.GWS_EA_BROWSER_POLICY_FILE;
+    delete process.env.GWS_EA_BROWSER_ROOT;
     await closeDb();
     fs.rmSync(ROOT, { recursive: true, force: true });
   });
@@ -227,6 +229,37 @@ describe('standing reservation guarantees through native host delivery', () => {
       (await getDb().get<{ revoked_at: string }>('SELECT revoked_at FROM gws_ea_browser_reservation_guarantees'))
         ?.revoked_at,
     ).toBeTruthy();
+  });
+
+  it('reads and revokes through delivery without Chrome while refusing new proposals', async () => {
+    await answer(await propose('active-before-offline', '100.00'), 'approve');
+    await propose('pending-before-offline', '200.00');
+    vi.mocked(browserAvailability).mockResolvedValue({ available: false, reason: 'chrome-missing' });
+
+    expect(await send(main, 'reservation_guarantee', { operation: 'read' })).toMatchObject({
+      ok: true,
+      data: { status: 'active', currency: 'USD', max_total: '100.00' },
+    });
+    expect(
+      refusal(
+        await send(main, 'reservation_guarantee', { operation: 'propose', currency: 'USD', max_total: '300.00' }),
+      ),
+    ).toContain('Browser is unavailable');
+    expect(await send(main, 'reservation_guarantee', { operation: 'revoke' })).toMatchObject({
+      ok: true,
+      data: { status: 'revoked' },
+    });
+    expect(await getDb().all('SELECT * FROM pending_approvals')).toEqual([]);
+    expect(
+      await getDb().get(
+        'SELECT status FROM gws_ea_browser_guarantee_proposals WHERE request_id=?',
+        `${main.id}:pending-before-offline`,
+      ),
+    ).toEqual({ status: 'withdrawn' });
+    expect(await send(main, 'reservation_guarantee', { operation: 'read' })).toMatchObject({
+      ok: true,
+      data: { status: 'not_configured' },
+    });
   });
 
   it.each([

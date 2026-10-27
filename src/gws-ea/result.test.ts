@@ -3,9 +3,32 @@ import { describe, expect, it } from 'vitest';
 import { registerSecret, REDACTED } from './redact.js';
 import { managedResult, resultJson, type OperationData } from './result.js';
 import type { AssistantListing } from './status.js';
+import { expectResultContract } from './testing/result-contract.js';
 import { GwsEaError } from './types.js';
 
 describe('managed result redaction', () => {
+  it.each(['create', 'resume', 'connect-google', 'update'])(
+    'publishes the same recovery action contract for %s connector follow-ups and its envelope',
+    (command) => {
+      const actions = [
+        { kind: 'command', argv: ['gws-ea', 'connectors', 'install', 'onepassword'] },
+        { kind: 'external', instruction: 'Open the account console' },
+        { kind: 'external', instruction: 'Open the account console', url: 'https://example.test/management' },
+      ] as const;
+      const result = JSON.parse(
+        resultJson(
+          managedResult(command, {
+            outcome: 'paused',
+            data: { connector_next_actions: actions },
+            next_actions: actions,
+          }),
+        ),
+      );
+      expectResultContract(command, result);
+      expect(result.data.connector_next_actions).toEqual(result.next_actions);
+      expect(result.data.connector_next_actions[2].url).toBe('https://example.test/management');
+    },
+  );
   it('keeps native envelope identifiers while hiding the same credentials in raw text', () => {
     for (const secret of ['succeeded', 'invalid_arguments', 'connect-google', 'external', 'next_actions'])
       registerSecret(secret);
@@ -133,7 +156,7 @@ describe('managed result redaction', () => {
 
   it('keeps recovery command grammar but consumes and redacts argument values', () => {
     for (const secret of [
-      'capabilities',
+      'connectors',
       '--secrets-file',
       '--source-remote',
       '--chat-configured',
@@ -143,7 +166,7 @@ describe('managed result redaction', () => {
       'next_actions',
     ])
       registerSecret(secret);
-    const result = managedResult('capabilities install', {
+    const result = managedResult('connectors install voice', {
       outcome: 'failed',
       next_actions: [
         { kind: 'command', argv: ['gws-ea', 'resume', '--id', 'succeeded', '--secrets-file', '--chat-configured'] },
@@ -151,17 +174,17 @@ describe('managed result redaction', () => {
           kind: 'command',
           argv: ['gws-ea', 'update', '--source-remote=connect-google', '--quiet'],
         },
-        { kind: 'command', argv: ['gws-ea', 'capabilities', 'install', 'voice', '--model', 'large-v3-turbo-q5_0'] },
-        { kind: 'command', argv: ['gws-ea', 'capabilities', 'next_actions', '--chat-configured'] },
+        { kind: 'command', argv: ['gws-ea', 'connectors', 'install', 'voice', '--model', 'large-v3-turbo-q5_0'] },
+        { kind: 'command', argv: ['gws-ea', 'connectors', 'next_actions', '--chat-configured'] },
         { kind: 'command', argv: ['gws-ea', 'ncl', '--id', 'succeeded', '--', '--chat-configured'] },
       ],
     });
     expect(JSON.parse(resultJson(result))).toMatchObject({
-      command: 'capabilities install',
+      command: 'connectors install voice',
       next_actions: [
         { kind: 'command', argv: ['gws-ea', 'resume', '--id', REDACTED, '--secrets-file', REDACTED] },
         { kind: 'command', argv: ['gws-ea', 'update', `--source-remote=${REDACTED}`, '--quiet'] },
-        { kind: 'command', argv: ['gws-ea', 'capabilities', 'install', 'voice', '--model', REDACTED] },
+        { kind: 'command', argv: ['gws-ea', 'connectors', 'install', 'voice', '--model', REDACTED] },
         { kind: 'command', argv: ['gws-ea', REDACTED, REDACTED, REDACTED] },
         { kind: 'command', argv: ['gws-ea', 'ncl', '--id', REDACTED, '--', REDACTED] },
       ],

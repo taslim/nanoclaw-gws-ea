@@ -64,10 +64,12 @@ import {
   FakeOnePassword,
   FIXTURE_TOKEN,
   FIXTURE_VAULT_ID,
+  FIXTURE_INSTANCE_ID,
   writeVaultFixture,
   type VaultFixtureFiles,
 } from './onepassword-fixture.js';
 import { writePrivateFile } from './paths.js';
+import { onePasswordInstancePaths, readOnePasswordResources, writeOnePasswordResources } from './onepassword-policy.js';
 import { BrowserQueue } from './queue.js';
 import type { BrowserExecutionContext } from './actions.js';
 import { openSignupVerification } from './sign-in-mail.js';
@@ -108,6 +110,7 @@ beforeEach(async () => {
 
 afterEach(async () => {
   vi.restoreAllMocks();
+  vi.useRealTimers();
   await closeDb();
   fs.rmSync(root, { recursive: true, force: true });
   await rm(directory, { recursive: true, force: true });
@@ -709,14 +712,23 @@ describe("the principal's release of an attempt the host cannot settle", () => {
       db.close();
     }
   };
-  const holdSite = () =>
-    getDb().run(
-      "INSERT INTO gws_ea_browser_site_leases VALUES ('shop.example', ?, 'active', ?)",
-      job.thread_id,
-      new Date().toISOString(),
-    );
+  const holdSite = (at = new Date().toISOString()) =>
+    getDb().run("INSERT INTO gws_ea_browser_site_leases VALUES ('shop.example', ?, 'active', ?)", job.thread_id, at);
   const lease = () =>
     getDb().get<{ job_id: string }>("SELECT job_id FROM gws_ea_browser_site_leases WHERE site = 'shop.example'");
+  async function replaceVaultBinding(): Promise<void> {
+    const resourcesFile = onePasswordInstancePaths(path.dirname(files.browserRoot)).resourceFile;
+    const binding = await readOnePasswordResources(resourcesFile, { instanceId: FIXTURE_INSTANCE_ID });
+    if (binding.status !== 'ready') throw new Error('Missing vault fixture binding');
+    const replacement = 'replacementvault0000000001';
+    await writeOnePasswordResources(resourcesFile, {
+      ...binding.resources,
+      vault: { id: replacement, createdBy: { kind: 'operator' } },
+    });
+    fake = new FakeOnePassword(replacement);
+    vault = new BrowserVault(files);
+    attempts = new CredentialAttempts({ db: getDb(), vault });
+  }
   /** 1Password as the principal sees it: every item, version and field, and nothing archived. */
   const vaultState = () => JSON.stringify([[...fake.items.entries()], [...fake.archived]]);
 
@@ -1074,6 +1086,176 @@ describe("the principal's release of an attempt the host cannot settle", () => {
     await settleConfirmedAttempts(queue, undefined, attempts);
     expect(await attempts.get(id)).toMatchObject({ phase: 'finalized', owned_item_id: itemId });
     expect(await lease()).toBeUndefined();
+  });
+
+  it.each(['unknown', 'awaiting_verification', 'confirmed', 'conflict'] as const)(
+    'frees the site of an old-vault %s attempt and finishes a later current-vault attempt',
+    async (phase) => {
+      const { id } = await confirmedChange();
+      await holdSite('2026-01-01T00:00:00.000Z');
+      await getDb().run(
+        'UPDATE gws_ea_browser_credential_attempts SET phase=?,created_at=? WHERE id=?',
+        phase,
+        '2026-01-01T00:00:00.000Z',
+        id,
+      );
+      const other = (await resolveSystemSession('browser', 'system:a2a:main:waiting-for-old-vault')).session;
+      await queue.store.jobForSession(other);
+      expect(await queue.leases.acquire(other.thread_id!, ORIGIN)).toMatchObject({ acquired: false });
+      await replaceVaultBinding();
+      const nextOrigin = 'https://accounts.next-shop.example';
+      const prepared = await attempts.prepareSignup({ jobId: job.thread_id!, origin: nextOrigin, username: USERNAME });
+      if (prepared.status !== 'prepared') throw new Error(prepared.status);
+      const next = prepared.attempt;
+      await attempts.save(next.id);
+      await attempts.disclose(next.id, { jobId: job.thread_id!, origin: nextOrigin });
+      await attempts.markAwaitingVerification(next.id);
+      await attempts.markConfirmed(next.id, { account_page: 'verified' });
+      const wake = vi.spyOn(queue, 'wakeWaiters');
+
+      await settleConfirmedAttempts(queue, undefined, attempts);
+
+      expect(await attempts.get(next.id)).toMatchObject({ phase: 'finalized' });
+      expect(await attempts.get(id)).toMatchObject({ phase: 'rejected' });
+      expect(await lease()).toBeUndefined();
+      expect(wake.mock.calls.flatMap(([jobs]) => jobs)).toContain(other.thread_id);
+      expect(await queue.leases.acquire(other.thread_id!, ORIGIN)).toMatchObject({ acquired: true });
+    },
+  );
+
+  it('records the in-flight website outcome before settling a removed-vault attempt', async () => {
+    const id = await disclosedSignup();
+    await holdSite('2026-01-01T00:00:00.000Z');
+    const owner = await queue.store.jobForSession(job);
+    if (!owner) throw new Error('Missing browser job');
+    await queue.store.accept(owner, job, 'active-credential-press', 'credential_form', { authority: id }, 60_000);
+    const request = await queue.store.nextPending(owner.id);
+    if (!request) throw new Error('Missing browser request');
+    await queue.store.start(request.id);
+    await replaceVaultBinding();
+
+    await attempts.markAwaitingVerification(id);
+    expect(await attempts.markConfirmed(id, { account_page: 'verified', signal: 'success_text' })).toMatchObject({
+      phase: 'confirmed',
+    });
+    expect(await attempts.unresolved()).toEqual([expect.objectContaining({ id, phase: 'confirmed' })]);
+    expect(await lease()).toEqual({ job_id: job.thread_id });
+    await getDb().run(
+      'UPDATE gws_ea_browser_requests SET answered_at=? WHERE id=?',
+      new Date().toISOString(),
+      request.id,
+    );
+
+    await settleConfirmedAttempts(queue, undefined, attempts);
+
+    const settled = await attempts.get(id);
+    expect(settled).toMatchObject({ phase: 'rejected', exposed_at: expect.any(String) });
+    expect(JSON.parse(settled!.evidence_json!)).toEqual({
+      account_page: 'verified',
+      signal: 'success_text',
+      reason: 'vault_removed',
+      prior_phase: 'confirmed',
+    });
+    expect(await lease()).toBeUndefined();
+  });
+
+  it('wakes a site waiter when an earlier observation already settled a removed-vault attempt', async () => {
+    const id = await disclosedSignup();
+    await attempts.markUnknown(id, { signal: 'interrupted' });
+    await holdSite('2026-01-01T00:00:00.000Z');
+    await replaceVaultBinding();
+    expect(await attempts.unresolved()).toEqual([]);
+    const other = (await resolveSystemSession('browser', 'system:a2a:main:waiting-for-retired-vault')).session;
+    await queue.store.jobForSession(other);
+    expect(await queue.leases.acquire(other.thread_id!, ORIGIN)).toMatchObject({ acquired: false });
+    const wake = vi.spyOn(queue, 'wakeWaiters').mockResolvedValue(undefined);
+
+    await settleRefusedSites(queue, other.thread_id!, attempts);
+
+    expect(await lease()).toBeUndefined();
+    expect(wake.mock.calls.flatMap(([jobs]) => jobs)).toContain(other.thread_id);
+    expect(fake.calls).toEqual([]);
+  });
+
+  it.each([0, 1])(
+    'keeps a same-job site lease reacquired %i ms after vault retirement on later sweeps',
+    async (elapsed) => {
+      const id = await disclosedSignup();
+      await attempts.markUnknown(id, { signal: 'interrupted' });
+      await holdSite('2026-01-01T00:00:00.000Z');
+      await replaceVaultBinding();
+      expect(await attempts.unresolved()).toEqual([]);
+      const retired = await attempts.get(id);
+      if (!retired) throw new Error('Missing retired attempt');
+      expect(retired.phase).toBe('rejected');
+      await queue.leases.release(job.thread_id!, 'shop.example');
+      vi.useFakeTimers({ toFake: ['Date'] });
+      vi.setSystemTime(new Date(Date.parse(retired.updated_at) + elapsed));
+      expect(await queue.leases.acquire(job.thread_id!, ORIGIN)).toMatchObject({ acquired: true });
+      const other = (await resolveSystemSession('browser', 'system:a2a:main:waiting-for-new-work')).session;
+      await queue.store.jobForSession(other);
+      expect(await queue.leases.acquire(other.thread_id!, ORIGIN)).toMatchObject({ acquired: false });
+      const wake = vi.spyOn(queue, 'wakeWaiters').mockResolvedValue(undefined);
+
+      await settleConfirmedAttempts(queue, undefined, attempts);
+      await settleRefusedSites(queue, other.thread_id!, attempts);
+
+      expect(await lease()).toEqual({ job_id: job.thread_id });
+      expect(wake.mock.calls.flatMap(([jobs]) => jobs)).not.toContain(other.thread_id);
+      expect(await queue.leases.acquire(other.thread_id!, ORIGIN)).toMatchObject({ acquired: false });
+      expect(fake.calls).toEqual([]);
+
+      await queue.leases.markIdle(job.thread_id!, 'shop.example');
+      await queue.start();
+      try {
+        await queue.accept('list_watches', {}, job, 'finished-new-work');
+        await queue.idle();
+        expect(await lease()).toBeUndefined();
+        expect(wake.mock.calls.flatMap(([jobs]) => jobs)).toContain(other.thread_id);
+      } finally {
+        await queue.stop();
+      }
+    },
+  );
+
+  it('keeps a same-job site lease reacquired between retirement selection and release', async () => {
+    const id = await disclosedSignup();
+    await attempts.markUnknown(id, { signal: 'interrupted' });
+    await holdSite('2026-01-01T00:00:00.000Z');
+    await replaceVaultBinding();
+    expect(await attempts.unresolved()).toEqual([]);
+    const retired = await attempts.get(id);
+    if (!retired) throw new Error('Missing retired attempt');
+    const other = (await resolveSystemSession('browser', 'system:a2a:main:waiting-for-raced-work')).session;
+    await queue.store.jobForSession(other);
+    expect(await queue.leases.acquire(other.thread_id!, ORIGIN)).toMatchObject({ acquired: false });
+    const releaseLease = queue.leases.release.bind(queue.leases);
+    const release = vi.spyOn(queue.leases, 'release').mockImplementationOnce(async (...args) => {
+      vi.useFakeTimers({ toFake: ['Date'] });
+      vi.setSystemTime(new Date(Date.parse(retired.updated_at) + 1));
+      expect(await queue.leases.acquire(job.thread_id!, ORIGIN)).toMatchObject({ acquired: true });
+      return releaseLease(...args);
+    });
+    const wake = vi.spyOn(queue, 'wakeWaiters').mockResolvedValue(undefined);
+
+    await settleConfirmedAttempts(queue, undefined, attempts);
+
+    expect(release).toHaveBeenCalledOnce();
+    expect(await lease()).toEqual({ job_id: job.thread_id });
+    expect(wake.mock.calls.flatMap(([jobs]) => jobs)).not.toContain(other.thread_id);
+    expect(await queue.leases.acquire(other.thread_id!, ORIGIN)).toMatchObject({ acquired: false });
+  });
+
+  it('keeps a purchase lease when settling a removed-vault credential attempt', async () => {
+    const { id } = await confirmedChange();
+    await holdSite();
+    await getDb().run("UPDATE gws_ea_browser_site_leases SET state='purchase' WHERE site='shop.example'");
+    await replaceVaultBinding();
+
+    await settleConfirmedAttempts(queue, undefined, attempts);
+
+    expect(await attempts.get(id)).toMatchObject({ phase: 'rejected' });
+    expect(await lease()).toEqual({ job_id: job.thread_id });
   });
 
   it('settles the confirmed change holding a site another job was refused', async () => {

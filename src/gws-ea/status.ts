@@ -5,7 +5,7 @@ import { managedResult, resultJson, type NextAction } from './result.js';
  * observers report. They start no run log, take no lock, repair nothing, and
  * write no file; observers may read the instance-held credentials they
  * already use, but never the operator's secrets file or secret environment
- * variables. The isolation probe stays a create and update gate.
+ * variables. The browser isolation probe runs only with status --details.
  *
  * Every observation is live, and registry values are shown as the record,
  * never as health. A probe that throws becomes its own result, so one failing
@@ -20,13 +20,20 @@ import { createHash } from 'node:crypto';
 import { errorCode, isErrno } from '../community-portal/errors.js';
 import { getInstallScopedNames } from '../install-slug.js';
 import type { ProviderTurnCause } from '../mailbox/model.js';
-import { readBrowserPolicy } from '../modules/gws-ea-browser/policy.js';
+import { browserAvailability } from '../modules/gws-ea-browser/availability.js';
+import path from 'node:path';
+import {
+  inspectBrowserIsolation,
+  type BrowserIsolationObservation,
+  type BrowserIsolationInspection,
+} from './browser-isolation.js';
+import { CONNECTOR_ACTIONS, CONNECTOR_NAMES, connectorDefinition } from './connectors.js';
+import { inspectConnector, type ConnectorObservation, type ConnectorInspection } from './connector-inspection.js';
 import type { ChatSubscriptionState } from '../modules/gws-ea-chat/health.js';
 import { formatLocalTime } from '../timezone.js';
 import { taggedImageId } from './agent-image.js';
 import { releaseImageTag } from './agent-image-release.js';
 import { aliasHost } from './alias.js';
-import { instanceBrowserPolicyFile } from './browser-capability.js';
 import { CHAT_HEALTH_ARGS, chatReceiving, parseChatHealth } from './chat-health.js';
 import { locateAgainstToolRelease, observeLiveCheckout } from './checkout.js';
 import { MAIN_GROUP_NAME } from './identity.js';
@@ -201,15 +208,21 @@ export interface WorkspaceFacts {
   /** The Google account the assistant is signed in as. */
   readonly account: string | null;
 }
-/** The web alias an enabled browser needs, as the running host records it; null when not observed. */
+/** Optional web identity, as the running host records it. */
 export interface WebAliasFacts {
-  /** `not_needed` while the browser is not enabled. */
-  readonly state: 'not_needed' | 'pending' | 'configured' | null;
+  /** An unrequested alias is not configured; an outstanding candidate is pending. */
+  readonly state: 'not_configured' | 'pending' | 'configured' | null;
   /** The configured alias, or the address the operator was asked to add; null when there is neither. */
   readonly address: string | null;
 }
 
+export interface BrowserStatus extends ProbeResult {
+  readonly chrome: 'available' | 'missing' | 'unavailable' | 'not_checked';
+  readonly isolation: BrowserIsolationObservation | null;
+}
+
 export interface AssistantProbes {
+  readonly browser: BrowserStatus;
   readonly voice: VoiceObservation;
   /** The live checkout agrees with its record: marker, detached commit, no tracked changes. */
   readonly checkout: ProbeResult & CheckoutFacts;
@@ -236,7 +249,7 @@ export interface AssistantProbes {
   readonly principal: ProbeResult;
   /** Main's latest delivery result, and the replies the host is still retrying. */
   readonly delivery: ProbeResult & DeliveryFacts;
-  /** While the browser is enabled, its configured web alias; setup is incomplete until there is one. */
+  /** Optional alias identity, with an owed confirmation when a candidate exists. */
   readonly web_alias: ProbeResult & WebAliasFacts;
 }
 
@@ -257,6 +270,7 @@ export const PROBE_NAMES = [
   'principal',
   'delivery',
   'web_alias',
+  'browser',
   'voice',
 ] as const satisfies readonly (keyof AssistantProbes)[];
 
@@ -359,6 +373,7 @@ export interface AssistantStatus {
   readonly schema: SchemaView;
   readonly main_turn: MainTurnView;
   readonly probes: AssistantProbes;
+  readonly connectors: readonly ConnectorObservation[];
 }
 
 export interface StatusObservers {
@@ -377,6 +392,9 @@ export interface StatusObservers {
 }
 
 export interface ObservationContext {
+  readonly details?: boolean;
+  readonly connectorInspection?: ConnectorInspection;
+  readonly browserInspection?: BrowserIsolationInspection;
   readonly paths: ControlPlanePaths;
   /** NanoClaw's service helpers (`scripts/update/service.ts`); without them service state is unknown. */
   readonly serviceHelpers?: NanoclawServiceHelpers;
@@ -927,25 +945,79 @@ function because(clause: string, reason: string | null): string {
 }
 
 function webAliasArgv(instanceId: string, facts: WebAliasFacts): string[] {
-  const command = ['gws-ea', 'capabilities', 'enable', 'browser', '--id', instanceId];
+  const command = ['gws-ea', 'alias', '--id', instanceId];
   return facts.address !== null ? [...command, '--alias-added'] : command;
 }
 
-/** Whether the browser is enabled comes from its policy file, without asking the host. */
+/** Alias identity is independent of browser availability. An unrequested alias is informational. */
 async function webAliasProbe(subject: Subject): Promise<ProbeResult & WebAliasFacts> {
   const runtime = requireRuntime(subject.runtime);
-  if (!(await readBrowserPolicy(instanceBrowserPolicyFile(runtime))).enabled) {
-    return { ...OK, state: 'not_needed', address: null };
-  }
   const setup = await aliasHost((args) => subject.observers.ncl(runtime, args)).setup();
   if (setup.alias !== null) return { ...OK, state: 'configured', address: setup.alias };
+  if (setup.candidate === null) return { ...OK, state: 'not_configured', address: null };
   const facts: WebAliasFacts = { state: 'pending', address: setup.candidate };
-  const continueWith = webAliasArgv(subject.reservation.instance_id, facts).join(' ');
-  const reason =
-    setup.candidate === null
-      ? `the browser is enabled, but the assistant has no web alias yet. Run ${continueWith} to choose one.`
-      : `the web alias ${setup.candidate} needs the operator’s confirmation. Add it in the Google Admin console, then run ${continueWith}.`;
-  return { status: 'degraded', reason: `Setup is incomplete: ${reason}`, ...facts };
+  return {
+    status: 'degraded',
+    reason: `The web alias ${setup.candidate} needs confirmation. Add it in Google Admin, then run ${webAliasArgv(subject.reservation.instance_id, facts).join(' ')}.`,
+    ...facts,
+  };
+}
+
+async function browserProbe(subject: Subject, active: boolean): Promise<BrowserStatus> {
+  const availability = await browserAvailability(path.join(requireRuntime(subject.runtime).instance_root, 'browser'));
+  const isolation =
+    active && subject.context.details
+      ? await inspectBrowserIsolation(subject.context.paths, subject.reservation.instance_id, {
+          ...subject.context.browserInspection,
+          ncl: subject.observers.ncl,
+          check: true,
+        })
+      : null;
+  if (!availability.available)
+    return {
+      status: 'degraded',
+      reason:
+        availability.reason === 'chrome-missing'
+          ? 'Install Google Chrome at /Applications/Google Chrome.app. Ask your operator to install it; gws-ea does not install browsers.'
+          : availability.reason === 'chrome-not-launchable'
+            ? 'Chrome is installed but cannot be launched. Ask your operator to inspect its file permissions and diagnostics.'
+            : 'The browser root is unavailable. Ask your operator to inspect this assistant’s state.',
+      chrome:
+        availability.reason === 'chrome-missing'
+          ? 'missing'
+          : availability.reason === 'chrome-not-launchable'
+            ? 'unavailable'
+            : 'not_checked',
+      isolation,
+    };
+  if (!active)
+    return {
+      status: 'unknown',
+      reason: 'Assistant is stopped; browser readiness was not checked.',
+      chrome: 'available',
+      isolation: null,
+    };
+  if (isolation?.chrome.status === 'unavailable')
+    return { status: 'degraded', reason: isolation.chrome.reason, chrome: 'unavailable', isolation };
+  const health = unwrapData(await subject.observers.ncl(requireRuntime(subject.runtime), ['gws-ea-browser-health']));
+  const available = isRecord(health) ? (health.available === undefined ? health.enabled : health.available) : undefined;
+  if (!isRecord(health) || typeof available !== 'boolean')
+    throw new Unobservable('Browser readiness could not be observed.');
+  if (!available || (isRecord(health.chrome) && health.chrome.state === 'unavailable'))
+    return {
+      status: 'degraded',
+      reason: 'The host browser cannot launch Chrome. Ask your operator to inspect its browser diagnostics.',
+      chrome: 'available',
+      isolation,
+    };
+  if (isolation?.isolation.status === 'failed' || isolation?.isolation.status === 'unknown')
+    return {
+      status: isolation.isolation.status === 'failed' ? 'degraded' : 'unknown',
+      reason: isolation.isolation.reason,
+      chrome: 'available',
+      isolation,
+    };
+  return { ...OK, chrome: 'available', isolation };
 }
 
 /**
@@ -1198,6 +1270,53 @@ export async function observeAssistantStatus(
   };
   const runtime = await readRuntimeRecord(context.paths, reservation);
   const subject: Subject = { context, observers, reservation, inspection, runtime, current };
+  const serviceObservation = await observeService(context, runtime);
+  const active = serviceObservation.state === 'running';
+  const connectors = await Promise.all(
+    CONNECTOR_NAMES.map(async (name): Promise<ConnectorObservation> => {
+      try {
+        return await inspectConnector(context.paths, name, {
+          ...context.connectorInspection,
+          instanceId,
+          check: active,
+          serviceHelpers: context.serviceHelpers,
+          hostStatus: context.hostStatus,
+          voice: { ...context.connectorInspection?.voice, ncl: observers.ncl },
+        });
+        // eslint-disable-next-line no-catch-all/no-catch-all -- Each optional connector is an independent observation; invalid local records cannot hide the other status probes.
+      } catch (_error) {
+        const definition = connectorDefinition(name);
+        const reason = `${name} records could not be observed. Ask your operator to inspect its owner-only local configuration.`;
+        return {
+          name,
+          summary: definition.summary,
+          observed_at: observedAt,
+          target: instanceId,
+          actions: CONNECTOR_ACTIONS,
+          scope: definition.scope,
+          account: definition.account,
+          compatibility: 'unknown',
+          prerequisites: definition.prerequisites.map((requirement) => ({ requirement, status: 'unknown', reason })),
+          setup: 'unknown',
+          readiness: { status: 'unknown', checked: false },
+          assistants: [
+            {
+              instance_id: instanceId,
+              compatibility: 'unknown',
+              setup: 'unknown',
+              readiness: { status: 'unknown', checked: false },
+              reasons: [reason],
+              next_actions: [],
+            },
+          ],
+          reasons: [reason],
+          next_actions: [{ kind: 'external', instruction: reason }],
+          details: [],
+        };
+      }
+    }),
+  );
+
   const main = once(() => publishedMain(subject));
   const agents = once(() => onecliAgents(subject));
   const chatAgents = once(async () =>
@@ -1221,12 +1340,13 @@ export async function observeAssistantStatus(
     principal,
     delivery,
     webAlias,
+    browser,
     voice,
     rollback,
   ] = await Promise.all([
     probe<CheckoutFacts>(() => checkoutProbe(subject), { commit: null }),
     probe<ImageFacts>(() => imageProbe(subject), { tag: null }),
-    observeService(context, runtime),
+    Promise.resolve(serviceObservation),
     probe(() => hostProbe(subject), {}),
     probe<ChatFacts>(() => chatProbe(subject), {
       consumer_connected: null,
@@ -1251,9 +1371,37 @@ export async function observeAssistantStatus(
     probe<WorkspaceFacts>(() => workspaceProbe(subject), { account: null }),
     probe(() => principalProbe(subject), {}),
     probe<DeliveryFacts>(() => deliveryProbe(subject), { last: null, retrying: null }),
-    probe<WebAliasFacts>(() => webAliasProbe(subject), { state: null, address: null }),
+    active
+      ? probe<WebAliasFacts>(() => webAliasProbe(subject), { state: null, address: null })
+      : Promise.resolve({
+          status: 'unknown' as const,
+          reason: 'Assistant is stopped; alias identity was not checked.',
+          state: reservation.exclusive_resource_claims.alias_email ? null : ('not_configured' as const),
+          address: reservation.exclusive_resource_claims.alias_email ?? null,
+        }),
+    probe<Omit<BrowserStatus, 'status' | 'reason'>>(() => browserProbe(subject, active), {
+      chrome: 'not_checked' as const,
+      isolation: null,
+    }),
     probe<Omit<VoiceObservation, 'status' | 'reason'>>(
-      () => observeLocalVoice(context.paths, requireRuntime(runtime), observers.ncl),
+      async () => {
+        const observation = connectors.find((entry) => entry.name === 'voice')!;
+        if (!('assets' in observation.details)) throw new Unobservable('Voice records could not be read.');
+        if (active)
+          return observeLocalVoice(context.paths, requireRuntime(runtime), observers.ncl, observation.details);
+        return {
+          status: observation.setup === 'not_installed' ? 'ok' : 'unknown',
+          reason: 'Assistant is stopped; voice readiness was not checked.',
+          enabled: observation.details.activation.enabled,
+          assets: observation.details.assets.status === 'recorded' ? 'unknown' : observation.details.assets.status,
+          compatibility: observation.assistants[0]?.compatibility ?? 'unknown',
+          readiness: 'unknown',
+          queued: null,
+          inflight: null,
+          last_outcome: null,
+          last_failure: null,
+        } as const;
+      },
       {
         enabled: null,
         assets: 'unknown' as const,
@@ -1269,6 +1417,7 @@ export async function observeAssistantStatus(
   ]);
   return {
     ...record,
+    connectors,
     rollback,
     schema: schemaView(live),
     main_turn: observeMainTurn(subject),
@@ -1289,6 +1438,7 @@ export async function observeAssistantStatus(
       principal,
       delivery,
       web_alias: webAlias,
+      browser,
       voice,
     },
   };
@@ -1495,6 +1645,8 @@ function probeDetail(name: (typeof PROBE_NAMES)[number], probes: AssistantProbes
     }
     case 'web_alias':
       return webAliasSummary(probes.web_alias);
+    case 'browser':
+      return `Chrome ${probes.browser.chrome}${probes.browser.isolation ? `; isolation ${probes.browser.isolation.isolation.status}` : ''}`;
     case 'voice': {
       const voice = probes.voice;
       const enabled =
@@ -1522,7 +1674,8 @@ function probeDetail(name: (typeof PROBE_NAMES)[number], probes: AssistantProbes
 }
 
 function webAliasSummary(alias: WebAliasFacts): string {
-  if (alias.state === null) return 'unknown';
+  if (alias.state === null) return alias.address ? `not observed; claimed ${alias.address}` : 'not observed';
+  if (alias.state === 'not_configured') return 'not set';
   return alias.address === null ? alias.state.replace('_', ' ') : `${alias.state} ${alias.address}`;
 }
 
@@ -1587,6 +1740,13 @@ function renderStatusDetails(status: AssistantStatus, timezone: string): string[
     ...operation.slice(1).map((line) => `             ${line}`),
     `  Schema:    ${schemaLine}`,
     mainTurnLine(status.main_turn, timezone),
+    ...status.connectors.map(
+      (entry) =>
+        `  ${entry.name}: ${entry.setup.replaceAll('_', ' ')}; ${entry.readiness.status.replaceAll('_', ' ')}${entry.reasons.length ? `; ${entry.reasons.join(' ')}` : ''}`,
+    ),
+    ...statusActions(status).flatMap((action) =>
+      action.kind === 'command' ? [`  Next: ${recoveryCommandLine(action.argv)}`] : [`  Next: ${action.instruction}`],
+    ),
     'Probes:',
   ];
   for (const name of PROBE_NAMES) {
@@ -1616,7 +1776,16 @@ function conversationSummary(status: AssistantStatus): string {
     'principal',
     'delivery',
   ] as const;
-  const degraded = names.filter((name) => status.probes[name].status === 'degraded');
+  const degraded = [
+    ...names.filter((name) => status.probes[name].status === 'degraded'),
+    ...status.connectors
+      .filter(
+        (entry) =>
+          ['pending', 'failed', 'uninstall_incomplete'].includes(entry.setup) ||
+          entry.next_actions.some((action) => action.kind === 'external'),
+      )
+      .map((entry) => entry.name),
+  ];
   const unknown = names.filter((name) => status.probes[name].status === 'unknown');
   if (degraded.length === 0 && unknown.length === 0)
     return 'ready (observed host, Chat, identities, authorization, and delivery)';
@@ -1636,6 +1805,11 @@ function renderStatus(status: AssistantStatus, timezone: string, details: boolea
   return [
     `Assistant ${status.instance_id}`,
     `  Account: ${status.registry.account}`,
+    ...status.connectors.map(
+      (entry) =>
+        `  ${entry.name}: ${entry.setup.replaceAll('_', ' ')}; ${entry.assistants[0]?.readiness.status.replaceAll('_', ' ') ?? entry.readiness.status.replaceAll('_', ' ')}${entry.reasons.length ? `; ${entry.reasons.join(' ')}` : ''}`,
+    ),
+    `  Browser: ${status.probes.browser.status}; Chrome ${status.probes.browser.chrome}${status.probes.browser.reason ? `; ${status.probes.browser.reason}` : ''}`,
     `  Service: ${status.probes.service.state}${status.probes.service.reason ? `; ${status.probes.service.reason}` : ''}`,
     `  Conversation: ${conversationSummary(status)}`,
     mainTurnLine(status.main_turn, timezone),
@@ -1643,9 +1817,7 @@ function renderStatus(status: AssistantStatus, timezone: string, details: boolea
     `  External chat: ${status.probes.external_chat.agent_group_id ?? 'unknown'}; ${status.probes.external_chat.status}${status.probes.external_chat.reason ? `; ${status.probes.external_chat.reason}` : ''}`,
     `  Job agents: ${probeDetail('job_agents', status.probes, timezone)}; ${status.probes.job_agents.status}`,
     ...(status.probes.job_agents.jobs ?? []).map(jobAgentLine),
-    ...(status.probes.web_alias.state === 'not_needed'
-      ? []
-      : [`  Web alias: ${webAliasSummary(status.probes.web_alias)}`]),
+    `  Web alias: ${webAliasSummary(status.probes.web_alias)}`,
     `  Phase: ${phaseDetail(status.phase)}`,
     `  Release: ${status.registry.track} ${shortCommit(status.release.deployed_commit)}; ${status.release.behind_tool_release === null ? 'tool comparison unknown (see --details)' : status.release.behind_tool_release ? 'tool release is newer' : 'not behind tool release'}`,
     `  Operation: ${operation.length === 0 ? 'none' : operation[0]!}`,
@@ -1675,11 +1847,31 @@ function statusActions(status: AssistantStatus): NextAction[] {
     ];
   if (operation.state === 'failed') return [command('update')];
   if (operation.state === 'committed') return [command(operation.kind)];
-  const actions: NextAction[] = [];
+  const actions: NextAction[] = status.connectors.flatMap((entry) =>
+    entry.next_actions.filter(
+      (action) => entry.setup !== 'not_installed' || action.kind === 'external' || action.argv.includes('--abandon'),
+    ),
+  );
   if (status.probes.service.state === 'not_installed') actions.push(command('resume'));
   if (status.probes.chat.sign_in_needed === true || status.probes.workspace.status === 'degraded')
     actions.push(command('connect-google'));
-  if (status.probes.web_alias.state === 'pending')
+  if (status.probes.browser.status === 'degraded')
+    actions.push({
+      kind: 'external',
+      instruction:
+        status.probes.browser.chrome === 'missing'
+          ? 'Ask your operator to install Google Chrome at /Applications/Google Chrome.app, then run gws-ea status --id ' +
+            status.instance_id +
+            ' --details.'
+          : 'Ask your operator to inspect the browser diagnostics and Docker network isolation, then run gws-ea status --id ' +
+            status.instance_id +
+            ' --details.',
+    });
+  if (
+    status.probes.web_alias.state === 'pending' ||
+    (status.probes.web_alias.state === 'not_configured' &&
+      ['running', 'unmanaged'].includes(status.probes.service.state))
+  )
     actions.push({ kind: 'command', argv: webAliasArgv(status.instance_id, status.probes.web_alias) });
   if (status.main_turn.last?.cause === 'credentials')
     actions.push({
@@ -1687,8 +1879,18 @@ function statusActions(status: AssistantStatus): NextAction[] {
       instruction:
         "For the recorded credential failure, check this assistant's provider sign-in in its operator credential console. A later successful turn confirms recovery. Keep credentials out of chat.",
     });
-  // Voice is optional, and a web alias still pending is setup to finish: neither sends the operator to the logs.
-  if (PROBE_NAMES.some((name) => name !== 'voice' && name !== 'web_alias' && status.probes[name].status !== 'ok'))
+  if (
+    PROBE_NAMES.some(
+      (name) =>
+        name !== 'voice' &&
+        name !== 'web_alias' &&
+        status.probes[name].status !== 'ok' &&
+        (name !== 'browser' ||
+          status.probes.browser.chrome !== 'missing' ||
+          status.probes.browser.isolation?.isolation.status === 'failed' ||
+          status.probes.browser.isolation?.isolation.status === 'unknown'),
+    )
+  )
     actions.push({ kind: 'command', argv: ['gws-ea', 'logs', '--id', status.instance_id, '--errors'] });
   return actions;
 }
@@ -1719,7 +1921,7 @@ export async function runStatusCommand(
 ): Promise<number> {
   let status: AssistantStatus;
   try {
-    status = await observeAssistantStatus(runtime, options.instanceId);
+    status = await observeAssistantStatus({ ...runtime, details: options.details }, options.instanceId);
     // eslint-disable-next-line no-catch-all/no-catch-all -- The command boundary turns a failure into a redacted message and exit code.
   } catch (error) {
     if (options.json) runtime.stdout(resultJson(managedResult('status', { outcome: 'failed', error })));

@@ -6,6 +6,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import {
   readProvisionJournal,
   recordChatConfigurationConfirmed,
+  recordAliasSkipped,
   recordPrincipalChatAddress,
   type InstanceOperation,
   type ProvisionJournal,
@@ -100,7 +101,7 @@ import {
   type ProviderCredentialMetadata,
 } from '../provider-credential.js';
 import { googleChatConfigurationUrl } from './chat-configuration.js';
-import { googleSignInPause, runStep, type Interaction, type StepReporter } from './events.js';
+import { googleSignInPause, type Interaction, type StepReporter } from './events.js';
 import {
   GOOGLE_CLIENT_FILE_FLAG,
   googleAccessResources,
@@ -110,15 +111,9 @@ import {
   type GoogleConnectionInput,
 } from './google-connection.js';
 import { googleCloudResources, parseGchatServiceAccountCredential, type GcpProjectInput } from './gcloud.js';
-import {
-  onePasswordEnabled,
-  onePasswordProvisioningDetails,
-  provisionAssistantVault,
-  type OnePasswordCliSeams,
-} from './onepassword.js';
-import { runAliasStep, type AliasStepOptions } from './alias.js';
-import { instanceBrowserPolicyFile } from './browser-capability.js';
-import { readBrowserPolicy } from '../modules/gws-ea-browser/policy.js';
+import { provisionInstalledConnectors, type ConnectorProvisioningDependencies } from './connector-provisioning.js';
+import { runAliasStep, aliasHost, type AliasStepOptions } from './alias.js';
+import { claimInstanceAlias } from './registry.js';
 
 export interface ProductionProvisionOptions {
   /** Upstream's `.env` upsert, injected by the driver (`src/` cannot import `setup/`). */
@@ -128,7 +123,8 @@ export interface ProductionProvisionOptions {
   readonly serviceHelpers: NanoclawServiceHelpers;
   readonly interaction?: Interaction;
   readonly runtime?: ProvisionRuntime;
-  readonly onePassword?: { readonly cli?: OnePasswordCliSeams };
+  readonly onePassword?: ConnectorProvisioningDependencies['onePassword'];
+  readonly artifacts?: ConnectorProvisioningDependencies['artifacts'];
 }
 
 export interface ProductionProvisionInput {
@@ -1439,78 +1435,68 @@ export async function runProductionProvision(
         operation,
         provisionRuntime,
         { ...options.onePassword, upsertEnvVars: options.upsertEnvVars },
-        alias ? { decision: alias } : {},
+        { ...(alias ? { decision: alias } : {}), skip: interaction?.decisions.skipAlias },
+        options.artifacts,
       )
     : result;
 }
 
-const ONEPASSWORD_STEP = {
-  id: 'provision_onepassword',
-  label: "Provisioning the assistant's 1Password vault…",
-} as const;
-
-/**
- * Once every step is complete: the optional resources the operator's enablement
- * gives an assistant, its 1Password vault, then, while its browser is enabled,
- * its configured web alias. The assistant is already talkable, so what waits
- * here waits on the operator, with the cause and the command that clears it; a
- * resume of an assistant already provisioned costs no request and no prompt.
- */
+/** Optional connector setup and identity run only after the assistant is talkable. */
 export async function provisionAssistantResources(
   operation: InstanceOperation,
   reporter: StepReporter,
-  onePassword: { readonly cli?: OnePasswordCliSeams; readonly upsertEnvVars?: UpsertEnvVars } = {},
-  alias: AliasStepOptions = {},
+  onePassword: ConnectorProvisioningDependencies['onePassword'] = {},
+  alias: AliasStepOptions & { readonly skip?: boolean } = {},
+  artifacts: ConnectorProvisioningDependencies['artifacts'] = {},
 ): Promise<ProvisionResult> {
-  const vault = await provisionAssistantVaultStep(operation, reporter, onePassword);
-  return vault.status === 'ready' ? provisionBrowserAlias(operation, reporter, alias) : vault;
-}
-
-/** The web alias, once the assistant's browser is enabled; an assistant that never browses is not held up. */
-async function provisionBrowserAlias(
-  operation: InstanceOperation,
-  reporter: StepReporter,
-  alias: AliasStepOptions,
-): Promise<ProvisionResult> {
-  const { paths, instanceId } = operation;
-  let runtime: InstanceRuntimeConfig;
-  try {
-    runtime = await loadInstanceRuntimeConfig(paths.runtimeFile(instanceId));
-  } catch (error) {
-    // Without a runtime record no browser was ever enabled for it.
-    if (isErrno(error, 'ENOENT')) return { status: 'ready' };
-    throw error;
-  }
-  if (!(await readBrowserPolicy(instanceBrowserPolicyFile(runtime))).enabled) return { status: 'ready' };
-  return runAliasStep(paths, instanceId, runtime, reporter, alias);
-}
-
-async function provisionAssistantVaultStep(
-  operation: InstanceOperation,
-  reporter: StepReporter,
-  onePassword: { readonly cli?: OnePasswordCliSeams; readonly upsertEnvVars?: UpsertEnvVars },
-): Promise<ProvisionResult> {
-  if (!(await onePasswordEnabled(operation.paths))) return { status: 'ready' };
-  return runStep(
-    reporter,
-    ONEPASSWORD_STEP,
-    async (): Promise<ProvisionResult> => {
-      const vault = await provisionAssistantVault(operation, {
-        ...onePassword,
-        ...(operation.recordEffect ? { recordEffect: operation.recordEffect } : {}),
-      });
-      if (vault?.outcome !== 'pending' || vault.reason === null) return { status: 'ready' };
-      return {
-        status: 'paused',
-        pause: {
-          kind: 'human-action',
-          phase: ONEPASSWORD_STEP.id,
-          code: `onepassword_${vault.reason}`,
-          message: `The assistant is ready, but its 1Password vault waits. ${vault.message ?? ''}`.trim(),
-          details: onePasswordProvisioningDetails(vault),
-        },
-      };
-    },
-    (result) => (result.status === 'paused' ? result.pause : undefined),
+  const connectors = await provisionInstalledConnectors(operation, reporter, { onePassword, artifacts });
+  const actionable = connectors.pending.find(
+    (entry) => !['rate_limited', 'instance_busy', 'onepassword_busy', 'artifacts_busy'].includes(entry.reason),
   );
+  if (actionable)
+    return {
+      status: 'paused',
+      pause: {
+        kind: 'human-action',
+        phase: actionable.name === 'onepassword' ? 'provision_onepassword' : 'provision_artifacts',
+        code: `${actionable.name}_${actionable.reason}`,
+        message: `The assistant is ready; ${actionable.name} setup waits. ${actionable.message}`,
+        ...(actionable.reason === 'operator_sign_in_needed' && onePassword.operatorTerminal === false
+          ? { optional: true }
+          : {}),
+        details: [
+          ...connectors.next_actions.flatMap((action) => {
+            if (action.kind !== 'command') return [action.instruction];
+            const discardUnproven =
+              actionable.name === 'onepassword' &&
+              ['vault_creation_unproven', 'service_account_creation_unproven'].includes(actionable.reason) &&
+              action.argv.slice(0, 4).join(' ') === 'gws-ea connectors install onepassword';
+            return [
+              `Then: ${action.argv.join(' ')}${discardUnproven ? ` --discard-unproven ${operation.instanceId}` : ''}`,
+            ];
+          }),
+          `Continue with gws-ea resume --id ${operation.instanceId}.`,
+        ],
+      },
+    };
+  const journal = await readProvisionJournal(operation.paths, operation.instanceId);
+  if (alias.skip || journal.decisions.alias_skipped_at) {
+    if (!journal.decisions.alias_skipped_at) await recordAliasSkipped(operation);
+    const reservation = await getInstanceReservation(operation.paths, operation.instanceId);
+    if (reservation.exclusive_resource_claims.alias_email) {
+      const runtime = await loadInstanceRuntimeConfig(operation.paths.runtimeFile(operation.instanceId));
+      const host = aliasHost((args) => (alias.ncl ?? runInstanceNclJson)(runtime, args));
+      const setup = await host.setup();
+      if (!setup.alias) {
+        await host.propose(null);
+        await claimInstanceAlias(operation.paths, operation.instanceId, undefined);
+      }
+    }
+    return { status: 'ready', nextActions: connectors.next_actions };
+  }
+  const runtime = await loadInstanceRuntimeConfig(operation.paths.runtimeFile(operation.instanceId));
+  const result = await runAliasStep(operation.paths, operation.instanceId, runtime, reporter, alias);
+  return result.status === 'ready'
+    ? { ...result, nextActions: connectors.next_actions }
+    : { ...result, pause: { ...result.pause, optional: true } };
 }

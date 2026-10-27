@@ -259,15 +259,51 @@ export class CredentialAttempts {
   }
 
   private async require(id: string): Promise<CredentialAttempt> {
+    await this.settleRemovedVault();
     const attempt = await this.get(id);
     if (!attempt) throw new CredentialAttemptError('not_found');
     return attempt;
   }
 
-  unresolved(): Promise<CredentialAttempt[]> {
+  async unresolved(): Promise<CredentialAttempt[]> {
+    await this.settleRemovedVault();
     return this.db.all<CredentialAttempt>(
       `SELECT * FROM ${TABLE} WHERE phase NOT IN ('rejected','finalized') ORDER BY created_at, id`,
     );
+  }
+
+  /** A replacement binding proves removal. An in-flight press records its site outcome before settlement. */
+  private async settleRemovedVault(): Promise<void> {
+    const availability = await this.vault.availability();
+    if (availability.status !== 'available') return;
+    const { accountId, vaultId } = availability.binding;
+    const inactive = `NOT EXISTS (SELECT 1 FROM gws_ea_browser_requests r
+      WHERE r.job_id = ${TABLE}.job_id AND r.started_at IS NOT NULL AND r.answered_at IS NULL)`;
+    const removed = await this.db.all<CredentialAttempt>(
+      `SELECT * FROM ${TABLE}
+       WHERE phase IN ('preparing','saved','awaiting_verification','unknown','confirmed','conflict')
+         AND (account_id != ? OR vault_id != ?) AND ${inactive}`,
+      accountId,
+      vaultId,
+    );
+    for (const attempt of removed) {
+      const recorded: unknown = attempt.evidence_json === null ? {} : JSON.parse(attempt.evidence_json);
+      const evidence = isRecord(recorded) ? recorded : {};
+      const changed = await this.db.run(
+        `UPDATE ${TABLE} SET phase = 'rejected', evidence_json = ?, updated_at = ?
+         WHERE id = ? AND phase = ? AND ${inactive}`,
+        JSON.stringify({
+          ...evidence,
+          ...(Object.hasOwn(evidence, 'reason') ? { prior_reason: evidence.reason } : {}),
+          reason: 'vault_removed',
+          prior_phase: attempt.phase,
+        }),
+        now(),
+        attempt.id,
+        attempt.phase,
+      );
+      if (changed.changes) this.secrets.delete(attempt.id);
+    }
   }
 
   /** An item's ownership record: the latest finalized attempt that saved it. Edits in 1Password never touch it. */

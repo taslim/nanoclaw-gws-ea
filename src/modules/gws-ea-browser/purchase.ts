@@ -73,7 +73,8 @@ import {
   type MerchantPurchaseRead,
 } from './merchant-read.js';
 import { disposeBrowserRefs, pinBrowserRefs, readBrowserRef } from './observe.js';
-import { readHostBrowserPolicy } from './access.js';
+import { browserAvailability } from './availability.js';
+
 import { writeBrowserNotice } from './notices.js';
 import { notifyPendingUnconfirmed } from './purchase-outcome.js';
 import { type BrowserQueue, registerBrowserActionDelivery } from './queue.js';
@@ -117,7 +118,7 @@ export const browserPurchaseGuard = defineGuardedAction({
       session.status !== 'active'
     )
       return DENY(purchaseMessage('noLiveJob'));
-    if (!(await readHostBrowserPolicy()).enabled) return DENY(purchaseMessage('disabled'));
+    if (!(await browserAvailability()).available) return DENY(purchaseMessage('disabled'));
     const principal = await principalApproverUserId();
     return principal ? HOLD(purchaseMessage('principal'), principal) : DENY(noVerifiedPrincipalMessage());
   },

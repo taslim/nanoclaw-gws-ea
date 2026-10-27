@@ -1,22 +1,13 @@
-import { VOICE_CAPABILITY } from './capabilities.js';
-import { BROWSER_CAPABILITY } from './browser-capability.js';
-import { ARTIFACTS_CAPABILITY } from './artifacts-capability.js';
-import { MANAGEMENT_TARGET, ONEPASSWORD_CAPABILITY } from './onepassword.js';
+import { CONNECTOR_CATALOG, CONNECTOR_ACTIONS, type ConnectorName, type ConnectorAction } from './connectors.js';
 import {
   managedResultSchema,
   operationDataSchema,
   LIST_DATA_SCHEMA,
   STATUS_DATA_SCHEMA,
-  CAPABILITY_LIST_SCHEMA,
-  VOICE_CAPABILITY_SCHEMA,
-  VOICE_OPERATION_SCHEMA,
-  BROWSER_CAPABILITY_SCHEMA,
-  BROWSER_OPERATION_SCHEMA,
-  ARTIFACTS_CAPABILITY_SCHEMA,
-  ARTIFACTS_OPERATION_SCHEMA,
-  ONEPASSWORD_CAPABILITY_SCHEMA,
-  ONEPASSWORD_DISABLE_SCHEMA,
-  ONEPASSWORD_OPERATION_SCHEMA,
+  CONNECTOR_OBSERVATION_SCHEMA,
+  CONNECTOR_LIST_SCHEMA,
+  CONNECTOR_OPERATION_SCHEMA,
+  ALIAS_OPERATION_SCHEMA,
 } from './result-schema.js';
 export type AttemptCommand =
   | 'create'
@@ -35,11 +26,9 @@ export type CommandHandler =
   | { readonly kind: 'observation'; readonly command: 'list' | 'status' | 'logs' }
   | { readonly kind: 'native'; readonly command: 'ncl' }
   | { readonly kind: 'whatsapp'; readonly command: 'link' | 'unlink' | 'status' }
-  | {
-      readonly kind: 'capability';
-      readonly command: 'list' | 'show' | 'check' | 'install' | 'enable' | 'disable' | 'uninstall';
-      readonly name?: 'browser' | 'onepassword' | 'artifacts';
-    }
+  | { readonly kind: 'connector'; readonly command: 'list' }
+  | { readonly kind: 'connector'; readonly command: ConnectorAction; readonly name: ConnectorName }
+  | { readonly kind: 'alias' }
   | { readonly kind: 'discovery'; readonly command: 'help' | 'schema' | 'completion' | 'version' };
 
 export type OutputMode = 'human' | 'json' | 'native' | 'shell';
@@ -72,7 +61,7 @@ export interface ArgumentDefinition {
 export interface CommandDefinition {
   readonly path: readonly string[];
   readonly summary: string;
-  readonly group: 'Assistants' | 'Service' | 'Advanced' | 'Capabilities' | 'Discovery';
+  readonly group: 'Assistants' | 'Service' | 'Advanced' | 'Connectors' | 'Discovery';
   readonly handler: CommandHandler;
   readonly options: readonly OptionDefinition[];
   readonly arguments?: readonly ArgumentDefinition[];
@@ -207,6 +196,8 @@ export const COMMAND_DEFINITIONS: readonly CommandDefinition[] = [
     summary: 'Provision one assistant and verify its conversation path.',
     scope: 'new-assistant',
     options: [
+      ...aliasOptions,
+      flag('skip-alias', 'Skip optional web alias setup; configure it later with gws-ea alias.'),
       value('track', 'track', 'Release track (dogfood or prod; other tracks require --source-remote).', true),
       value('source-remote', 'remote', 'Repository holding this committed tool release.'),
       value('google-account', 'email', 'Operator Google Cloud account.'),
@@ -279,6 +270,7 @@ export const COMMAND_DEFINITIONS: readonly CommandDefinition[] = [
       value('billing-account', 'id', 'Billing account offered by a provisioning pause.'),
       googleClient,
       ...aliasOptions,
+      flag('skip-alias', 'Skip optional web alias setup; configure it later with gws-ea alias.'),
       secrets,
     ],
     effects: [
@@ -459,350 +451,61 @@ export const COMMAND_DEFINITIONS: readonly CommandDefinition[] = [
     outputModes: managedModes,
     resultSchema: managedResultSchema(operationDataSchema('cleanup')),
   },
-  ...(['list', ...VOICE_CAPABILITY.actions] as const).map((command): CommandDefinition => {
-    if (command === 'list' || command === 'show' || command === 'check')
-      return {
-        path: ['capabilities', command],
-        group: 'Capabilities',
-        handler: { kind: 'capability', command },
-        summary:
-          command === 'list'
-            ? 'List optional capabilities, their ownership, and observed state.'
-            : command === 'show'
-              ? 'Show voice scope, assets, compatibility, prerequisites, and readiness limits.'
-              : 'Verify selected voice assets and observe managed consumers without changing state.',
-        scope: 'host',
-        options: [],
-        ...(command === 'list'
-          ? {}
-          : {
-              arguments: [
-                {
-                  name: 'capability',
-                  description: 'Shipped capability to inspect.',
-                  required: true,
-                  choices: [VOICE_CAPABILITY.name],
-                },
-              ],
-            }),
+  {
+    path: ['connectors', 'list'],
+    group: 'Connectors',
+    handler: { kind: 'connector', command: 'list' },
+    summary: 'List optional connectors, their scope and locally recorded setup.',
+    scope: 'host',
+    options: [],
+    effects: ['Read-only local records; no asset hashing, provider calls or readiness probes.'],
+    prerequisites: observationPrerequisites,
+    recovery: ['Use connectors show or check for the named connector.'],
+    examples: ['gws-ea connectors list --json'],
+    outputModes: managedModes,
+    resultSchema: managedResultSchema(CONNECTOR_LIST_SCHEMA),
+  },
+  ...CONNECTOR_CATALOG.flatMap((connector) =>
+    CONNECTOR_ACTIONS.map(
+      (command): CommandDefinition => ({
+        path: ['connectors', command, connector.name],
+        group: 'Connectors',
+        handler: { kind: 'connector', command, name: connector.name },
+        summary: `${command === 'install' ? 'Set up' : command === 'uninstall' ? 'Remove' : command === 'check' ? 'Verify' : 'Inspect'} ${connector.name}. ${connector.summary}`,
+        scope: command === 'show' || command === 'check' ? 'assistant-or-registry' : 'host',
+        options: connector.options[command],
         effects: [
-          command === 'check'
-            ? 'Read-only asset verification and bounded native voice health probes; no downloads, enablement, restart, or recording processing.'
-            : 'Read-only local capability and release inspection; consumer readiness requires check.',
+          ...connector.effects[command],
+          `Installation: ${connector.scope.installation}; configuration: ${connector.scope.configuration}; resources: ${connector.scope.resources}.`,
+          connector.account,
+          connector.scope.access,
         ],
-        prerequisites: observationPrerequisites,
-        recovery: ['Inspect capability facts; use its explicit install, enable, disable, or uninstall action.'],
-        examples: [`gws-ea capabilities ${command}${command === 'list' ? '' : ' voice'} --json`],
-        outputModes: managedModes,
-        resultSchema: managedResultSchema(command === 'list' ? CAPABILITY_LIST_SCHEMA : VOICE_CAPABILITY_SCHEMA),
-      };
-    if (command === 'install')
-      return {
-        path: ['capabilities', 'install'],
-        group: 'Capabilities',
-        handler: { kind: 'capability', command: 'install' },
-        summary: 'Build and select shared local voice assets, initially disabled.',
-        scope: 'host',
-        arguments: [
-          {
-            name: 'capability',
-            description: 'Shipped capability to install.',
-            required: true,
-            choices: [VOICE_CAPABILITY.name],
-          },
-        ],
-        options: [
-          {
-            name: 'model',
-            type: 'string',
-            valueName: 'base|small|large-v3-turbo-q5_0',
-            choices: VOICE_CAPABILITY.models,
-            description: `Voice model; defaults to ${VOICE_CAPABILITY.default_model}.`,
-          },
-          { ...value('cmake', '/absolute/path', 'Explicit CMake executable.'), valueKind: 'file' },
-        ],
-        effects: [
-          'Downloads and builds pinned shared host assets; installation leaves recognition disabled.',
-          'Verifies and reuses a valid existing installation without downloads.',
-        ],
-        prerequisites: VOICE_CAPABILITY.prerequisites,
+        prerequisites: connector.prerequisites,
         recovery: [
-          'Preflight identifies the failed tool and manual repair; system tools are never installed automatically.',
-          'Download/build failures retain private run/step logs and a retry preserving --model and --cmake.',
-          'For corrupt assets: capabilities disable voice, capabilities uninstall voice, then capabilities install voice with the original --model.',
+          `Inspect the reported reason; rerun gws-ea connectors ${command === 'uninstall' ? 'uninstall' : 'install'} ${connector.name} to continue setup or cleanup.`,
         ],
-        examples: ['gws-ea capabilities install voice --model large-v3-turbo-q5_0'],
+        examples: [`gws-ea connectors ${command} ${connector.name}`],
         outputModes: managedModes,
-        resultSchema: managedResultSchema(VOICE_OPERATION_SCHEMA),
-      };
-    return {
-      path: ['capabilities', command],
-      group: 'Capabilities',
-      handler: { kind: 'capability', command },
-      scope: 'host',
-      options: [],
-      arguments: [
-        {
-          name: 'capability',
-          description: 'Shipped capability to operate.',
-          required: true,
-          choices: [VOICE_CAPABILITY.name],
-        },
-      ],
-      summary:
-        command === 'enable'
-          ? 'Enable voice for compatible current and future assistants.'
-          : command === 'disable'
-            ? 'Prevent new recognition while retaining shared assets.'
-            : 'Remove recipe-owned voice assets after managed consumers drain.',
-      effects: [
-        command === 'enable'
-          ? 'Enables voice host-wide; recognition success is not established.'
-          : command === 'disable'
-            ? 'Disables new recognition; existing preparation finishes and assets remain.'
-            : 'Removes recipe-owned assets only; unreachable consumers do not prove drainage.',
-      ],
-      prerequisites: [
-        command === 'enable'
-          ? 'Valid recipe-owned voice assets must already be installed.'
-          : command === 'disable'
-            ? 'Host-wide voice lock must be free.'
-            : 'Voice must be disabled, every managed consumer proven drained, and recipe-owned files have no open holders.',
-      ],
-      recovery: ['Follow the reported policy, asset, or consumer blocker; check observes readiness without repair.'],
-      examples: [`gws-ea capabilities ${command} voice`],
-      outputModes: managedModes,
-      resultSchema: managedResultSchema(VOICE_OPERATION_SCHEMA),
-    };
-  }),
-  ...BROWSER_CAPABILITY.actions.map(
-    (command): CommandDefinition => ({
-      path: ['capabilities', command, 'browser'],
-      group: 'Capabilities',
-      handler: { kind: 'capability', command, name: 'browser' },
-      scope: 'assistant',
-      summary:
-        command === 'show'
-          ? 'Show one assistant’s browser policy and prerequisites.'
-          : command === 'check'
-            ? 'Check Chrome and agent-network isolation without changing state.'
-            : command === 'enable'
-              ? 'Enable one assistant’s host browser; it signs in with emailed codes and links, and its 1Password vault once provisioned.'
-              : 'Disable one assistant’s browser.',
-      options:
-        command === 'enable'
-          ? [
-              id,
-              ...aliasOptions,
-              {
-                ...value(
-                  'agent-group',
-                  'agent_group_id',
-                  'An agent group that may use the browser, in place of main alone; repeat for each. Each shares the signed-in browser profile and the vault’s logins.',
-                ),
-                repeatable: true,
-              },
-              flag('main-only', 'Let main alone use the browser again, forgetting any listed agent groups.'),
-            ]
-          : [id],
-      effects:
-        command === 'show' || command === 'check'
-          ? [
-              'Read-only observation; no policy writes, downloads, service changes, or host reconciliation.',
-              ...(command === 'check'
-                ? [
-                    'Runs a bounded temporary container on the assistant network using its existing release image; never pulls an image.',
-                  ]
-                : []),
-            ]
-          : command === 'enable'
-            ? [
-                'Writes the enabled owner-only instance policy; host reconciliation activates the browser.',
-                "Then shows the assistant's web alias and waits for the operator to confirm they added it in the Google Admin console.",
-                'With --agent-group, first asks the running assistant to confirm it reads an access list and has each group; neither browser nor external-email can be listed. A group no longer listed has its jobs cancelled.',
-              ]
-            : [
-                'Writes disabled policy, keeping any listed agent groups; the host stops jobs and withdraws cards on reconciliation, including after restart.',
-              ],
-      prerequisites: [
-        'An explicitly named managed assistant with a readable runtime record.',
-        'Google Chrome at its absolute configured path on the host.',
-      ],
-      recovery: [
-        'Inspect capabilities check browser --id <instance_id>; restore any reported Chrome, policy, host or Docker prerequisite.',
-      ],
-      examples: [
-        `gws-ea capabilities ${command} browser --id <instance_id>`,
-        ...(command === 'enable'
-          ? [
-              'gws-ea capabilities enable browser --id <instance_id> --alias-added',
-              'gws-ea capabilities enable browser --id <instance_id> --agent-group <main_id> --agent-group <agent_group_id>',
-            ]
-          : []),
-      ],
-      outputModes: managedModes,
-      resultSchema: managedResultSchema(
-        command === 'show' || command === 'check' ? BROWSER_CAPABILITY_SCHEMA : BROWSER_OPERATION_SCHEMA,
-      ),
-    }),
+        resultSchema: managedResultSchema(
+          command === 'show' || command === 'check' ? CONNECTOR_OBSERVATION_SCHEMA : CONNECTOR_OPERATION_SCHEMA,
+        ),
+      }),
+    ),
   ),
-  ...ARTIFACTS_CAPABILITY.actions.map(
-    (command): CommandDefinition => ({
-      path: ['capabilities', command, 'artifacts'],
-      group: 'Capabilities',
-      handler: { kind: 'capability', command, name: 'artifacts' },
-      scope: 'assistant',
-      summary:
-        command === 'enable'
-          ? 'Provision private HTML artifacts through an owned Cloudflare tunnel and email PIN.'
-          : command === 'disable'
-            ? 'Close artifact serving immediately and remove this assistant’s ingress.'
-            : `Read-only ${command === 'check' ? 'verification' : 'observation'} of artifact policy and prerequisites.`,
-      options:
-        command === 'enable'
-          ? [
-              id,
-              value('account', 'account_id', 'Cloudflare account for this operator host; required on first enable.'),
-              value('team', 'team_name', 'Exact Cloudflare Access team subdomain; required on first enable.'),
-              value(
-                'zone',
-                'zone_id',
-                'Active Cloudflare zone in this account for the shared hostname; required on first enable.',
-              ),
-              value('hostname', 'hostname', 'Shared operator hostname; required on first enable.'),
-              {
-                ...value(
-                  'credential-file',
-                  'file',
-                  'Owner-only file inside the operator config root containing the Cloudflare management API token.',
-                ),
-                valueKind: 'file',
-              },
-              value(
-                'assistant-hostname',
-                'hostname',
-                'Dedicated hostname for this assistant in an active zone of the same account; claims its root.',
-              ),
-              {
-                ...value(
-                  'cloudflared',
-                  'file',
-                  'Trusted absolute cloudflared executable; otherwise resolves cloudflared from PATH.',
-                ),
-                valueKind: 'file',
-              },
-              value(
-                'discard-unproven',
-                'attempt',
-                'Confirm you inspected and removed the resource an interrupted create may have left, then clear only that exact recorded attempt.',
-              ),
-            ]
-          : [id],
-      effects:
-        command === 'show' || command === 'check'
-          ? [
-              'Read-only observation; check makes bounded management and native host requests. No repair or service change.',
-            ]
-          : command === 'enable'
-            ? [
-                'Claims a stable first-name namespace and loopback port before remote effects.',
-                'Creates only journaled Access, PIN, DNS and named-tunnel resources; runs a host-only connector with a separate token file.',
-                'An ambiguous create blocks retries until the operator resolves and explicitly acknowledges its exact attempt.',
-              ]
-            : [
-                'Publishes disabled origin policy before remote cleanup, retaining content and stable namespace claims.',
-              ],
-      prerequisites: [
-        'An explicitly named managed assistant with a compatible running host.',
-        'Cloudflare account, Access team, active DNS zone and API permissions; cloudflared 2025.4.0 or later.',
-      ],
-      recovery: [
-        'Run capabilities check artifacts --id <instance_id>; resolve the reported ownership, policy, account, capacity or host prerequisite.',
-        'For an interrupted create, inspect the exact journal attempt, remove any resource it created, then enable with --discard-unproven <attempt>. Never identify ownership by friendly name alone.',
-      ],
-      examples: [`gws-ea capabilities ${command} artifacts --id <instance_id>`],
-      outputModes: managedModes,
-      resultSchema: managedResultSchema(
-        command === 'show' || command === 'check' ? ARTIFACTS_CAPABILITY_SCHEMA : ARTIFACTS_OPERATION_SCHEMA,
-      ),
-    }),
-  ),
-  ...ONEPASSWORD_CAPABILITY.actions.map(
-    (command): CommandDefinition => ({
-      path: ['capabilities', command, 'onepassword'],
-      group: 'Capabilities',
-      handler: { kind: 'capability', command, name: 'onepassword' },
-      scope: 'host',
-      summary:
-        command === 'show'
-          ? 'Show the 1Password account, management identity and each assistant’s recorded vault.'
-          : command === 'check'
-            ? 'Verify each assistant’s vault access and the account’s shared request usage.'
-            : command === 'enable'
-              ? 'Provision one vault and runtime service account for every compatible current and future assistant.'
-              : 'Stop every assistant’s vault use and delete its runtime token, keeping vaults and their IDs.',
-      options:
-        command === 'enable'
-          ? [
-              value(
-                'account',
-                'account_id',
-                'The exact 1Password account assistants use; needed only before the host has one.',
-              ),
-              value(
-                'discard-unproven',
-                `instance_id|${MANAGEMENT_TARGET}`,
-                'After deleting or revoking what an interrupted creation may have left in 1Password, forget that attempt.',
-              ),
-            ]
-          : [],
-      effects:
-        command === 'show'
-          ? ['Read-only local records; no 1Password request, prompt or repair.']
-          : command === 'check'
-            ? [
-                'Read-only service-account requests: identities, one vault read per assistant and the shared usage; each counts against the account limit.',
-                'Never prompts the operator, writes to a vault or repairs anything.',
-              ]
-            : command === 'disable'
-              ? [
-                  'Publishes the disabled intent first: running and restarted hosts refuse every vault listing, fill, disclosure, write and share.',
-                  'Then deletes each assistant’s runtime token from this host; vaults, their items, recorded IDs, unfinished credential attempts and the management service account stay.',
-                  'Makes no 1Password request and revokes nothing: the result names each runtime service account to revoke on 1Password.com.',
-                ]
-              : [
-                  "Verifies the operator's 1Password desktop sign-in, which may ask for approval in the app.",
-                  'Creates or reuses the host management service account and records the host policy.',
-                  'Creates a vault for each compatible assistant, running or stopped, and mints its runtime service account; never starts Chrome or a service.',
-                  'Keeps finished assistants on a partial run; a retry continues only what is incomplete.',
-                  'After a disable, reuses each vault and mints a replacement runtime service account, naming the earlier ones to revoke.',
-                ],
-      prerequisites:
-        command === 'enable'
-          ? [...ONEPASSWORD_CAPABILITY.prerequisites]
-          : command === 'disable'
-            ? ['The host 1Password lock and every assistant’s instance lock must be free.']
-            : ['A readable managed registry; check also needs the CLI the host recorded.'],
-      recovery: [
-        command === 'disable'
-          ? 'Rerun capabilities disable onepassword after a refusal; it continues deleting the tokens that remain. Enable again with capabilities enable onepassword.'
-          : 'Follow the reported per-assistant cause; rerun capabilities enable onepassword to continue, or --discard-unproven after removing what an interrupted creation left.',
-      ],
-      examples: [
-        command === 'enable'
-          ? 'gws-ea capabilities enable onepassword --account <account_id>'
-          : `gws-ea capabilities ${command} onepassword --json`,
-      ],
-      outputModes: managedModes,
-      resultSchema: managedResultSchema(
-        command === 'enable'
-          ? ONEPASSWORD_OPERATION_SCHEMA
-          : command === 'disable'
-            ? ONEPASSWORD_DISABLE_SCHEMA
-            : ONEPASSWORD_CAPABILITY_SCHEMA,
-      ),
-    }),
-  ),
+  {
+    path: ['alias'],
+    group: 'Assistants',
+    handler: { kind: 'alias' },
+    summary: 'Set or confirm the assistant’s optional web identity alias.',
+    scope: 'assistant',
+    options: [id, ...aliasOptions],
+    effects: ['Claims a proposed address and records it only after the operator confirms adding it in Google Admin.'],
+    prerequisites: assistantPrerequisites,
+    recovery: ['Rerun alias with the reported alias confirmation or a new candidate.'],
+    examples: ['gws-ea alias --id <instance_id>', 'gws-ea alias --id <instance_id> --alias-added'],
+    outputModes: managedModes,
+    resultSchema: managedResultSchema(ALIAS_OPERATION_SCHEMA),
+  },
   ...(['help', 'schema'] as const).map(
     (command): CommandDefinition => ({
       path: [command],

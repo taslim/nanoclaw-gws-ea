@@ -1,3 +1,5 @@
+import { configureBrowserAccess } from './testing/browser-access.js';
+import { useAvailableBrowser } from './testing/browser-runtime.js';
 import { recoverBrowserWatchState } from './watch-state.js';
 import { repairBrowserWatchChecks } from './scheduler.js';
 import {
@@ -87,6 +89,7 @@ function freeFacts(): PurchaseFacts {
 }
 let jobId: string;
 beforeEach(async () => {
+  useAvailableBrowser();
   vi.useFakeTimers({ toFake: ['Date'] });
   vi.setSystemTime(new Date('2026-10-15T12:00:00Z'));
   await runMigrations(await initTestDb());
@@ -102,16 +105,16 @@ beforeEach(async () => {
   const job = await new BrowserStore().jobForSession(session);
   if (!job) throw new Error('Expected native browser job');
   jobId = job.id;
-  const file = `${root}/browser/policy.json`;
+  const file = `${root}/browser`;
   fs.mkdirSync(`${root}/browser`, { recursive: true, mode: 0o700 });
-  fs.writeFileSync(file, JSON.stringify({ schemaVersion: 1, enabled: true }), { mode: 0o600 });
-  process.env.GWS_EA_BROWSER_POLICY_FILE = file;
+
+  process.env.GWS_EA_BROWSER_ROOT = file;
 });
 afterEach(async () => {
   await stopHeldBrowserRequests();
   vi.restoreAllMocks();
   vi.useRealTimers();
-  delete process.env.GWS_EA_BROWSER_POLICY_FILE;
+  delete process.env.GWS_EA_BROWSER_ROOT;
   await closeDb();
   fs.rmSync(root, { recursive: true, force: true });
 });
@@ -1391,15 +1394,8 @@ describe('a watch the principal declines', () => {
       agent_provider: null,
       created_at: new Date().toISOString(),
     });
-    fs.writeFileSync(
-      process.env.GWS_EA_BROWSER_POLICY_FILE!,
-      JSON.stringify({
-        schemaVersion: 2,
-        enabled: true,
-        agentGroupIds: ['watch-planner'],
-      }),
-      { mode: 0o600 },
-    );
+
+    await configureBrowserAccess(`${root}/browser`, ['watch-planner']);
     const delegated = (await resolveSystemSession('watch-browser', 'system:a2a:watch-planner:table')).session;
     const job = await new BrowserStore().jobForSession(delegated);
     expect(job).toBeDefined();

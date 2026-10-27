@@ -37,7 +37,8 @@ import {
   type PinnedBrowserRef,
 } from './observe.js';
 import { pageMayShowSecret } from './page-privacy.js';
-import { readHostBrowserPolicy } from './access.js';
+import { browserAvailability } from './availability.js';
+
 import { browserOperationId, type BrowserOperationContext, type BrowserQueuedAction } from './actions.js';
 import {
   reserveBrowserActionTrace,
@@ -657,8 +658,8 @@ async function executeBatch(
             break;
           case 'upload':
             if (target) {
-              const policy = await readHostBrowserPolicy();
-              if (!policy.enabled) throw new BrowserBatchStop('browser_unavailable');
+              const policy = await browserAvailability();
+              if (!policy.available) throw new BrowserBatchStop('browser_unavailable');
               const staged = await stageBrowserUpload(
                 sessionDir(context.session.agent_group_id, context.session.id),
                 path.join(policy.paths.stagingDir, 'uploads'),
@@ -681,8 +682,8 @@ async function executeBatch(
           case 'download':
             if (context.kind === 'watch_check') throw new BrowserBatchStop('read_only');
             if (target) {
-              const policy = await readHostBrowserPolicy();
-              if (!policy.enabled) throw new BrowserBatchStop('browser_unavailable');
+              const policy = await browserAvailability();
+              if (!policy.available) throw new BrowserBatchStop('browser_unavailable');
               data = await captureBrowserDownload(
                 context,
                 page,

@@ -1,3 +1,4 @@
+import { useAvailableBrowser } from './testing/browser-runtime.js';
 /** Real owned Chrome, background windows and TLS origins; all traffic terminates in this fixture. */
 import { execFileSync } from 'node:child_process';
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
@@ -139,7 +140,7 @@ describe.skipIf(!chromePath)('native host secret fill', { timeout: 30_000 }, () 
     await new Promise<void>((resolve) => proxy.listen(0, '127.0.0.1', resolve));
     const proxyAddress = proxy.address();
     if (!proxyAddress || typeof proxyAddress === 'string') throw new Error('Proxy fixture did not bind');
-    const paths = browserPaths(join(root, 'browser', 'policy.json'));
+    const paths = browserPaths(join(root, 'browser'));
     await prepareChromeProfile(paths);
     connection = await connectChrome(
       await spawnChrome({ chromePath, paths, proxyUrl: `http://127.0.0.1:${proxyAddress.port}` }),
@@ -149,7 +150,8 @@ describe.skipIf(!chromePath)('native host secret fill', { timeout: 30_000 }, () 
   }, 30_000);
 
   beforeEach(async () => {
-    vi.stubEnv('GWS_EA_BROWSER_POLICY_FILE', join(root, 'browser', 'policy.json'));
+    useAvailableBrowser();
+    vi.stubEnv('GWS_EA_BROWSER_ROOT', join(root, 'browser'));
     await browserSiteLeasesMigration.up(await initSqliteTestDb());
     posts.length = 0;
     parentDocuments.length = 0;

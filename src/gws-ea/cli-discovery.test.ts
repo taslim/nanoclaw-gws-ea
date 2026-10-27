@@ -25,77 +25,47 @@ function capture() {
 }
 
 describe('local CLI discovery and grammar', () => {
-  it('declares only the four assistant browser actions with native scoped options', async () => {
+  it('describes WhatsApp namespace help as assistant link management', async () => {
     const io = capture();
-    expect(await runCli(['schema', 'capabilities', '--json'], io.runtime)).toBe(0);
-    const schema: { commands: { path: string[]; scope: string; options: { name: string; required: boolean }[] }[] } =
-      JSON.parse(io.stdout.join('\n'));
-    const browser = schema.commands.filter((command) => command.path[2] === 'browser');
-    expect(browser.map((command) => command.path[1])).toEqual(['show', 'check', 'enable', 'disable']);
-    expect(browser.every((command) => command.scope === 'assistant')).toBe(true);
-    expect(browser.every((command) => command.options.some((option) => option.name === 'id' && option.required))).toBe(
-      true,
-    );
-    const missing = capture();
-    expect(await runCli(['capabilities', 'show', 'browser'], missing.runtime)).toBe(2);
-    expect(missing.stderr.join('\n')).toContain('--id');
-    const voice = capture();
-    expect(
-      await runCli(['capabilities', 'enable', 'voice', '--id', '00000000-0000-4000-8000-000000000001'], voice.runtime),
-    ).toBe(2);
-    expect(voice.stderr.join('\n')).toContain('Unknown option --id');
-    for (const action of ['install', 'uninstall']) {
-      const unsupported = capture();
-      expect(await runCli(['capabilities', action, 'browser', '--json'], unsupported.runtime)).toBe(2);
-    }
-    const invalid = capture();
-    expect(await runCli(['capabilities', 'check', 'browser', '--id', 'partial', '--json'], invalid.runtime)).toBe(2);
-    expect(JSON.parse(invalid.stdout.join('\n')).command).toBe('capabilities check browser');
+    expect(await runCli(['help', 'whatsapp'], io.runtime)).toBe(0);
+    const text = io.stdout.join('\n');
+    expect(text).toContain('assistant’s WhatsApp link');
+    expect(text).not.toContain('Operate optional connectors');
+    expect(io.runtime.checkPrerequisites).not.toHaveBeenCalled();
   });
-  it('declares the host-wide 1Password actions, naming the account and an unproven attempt only on enable', async () => {
+  it('guides namespace help to complete named connector commands', async () => {
+    const root = capture();
+    expect(await runCli(['help', 'connectors'], root.runtime)).toBe(0);
+    expect(root.stdout.join('\n')).toContain('gws-ea help connectors <action> <name>');
+    expect(root.stdout.join('\n')).toContain('gws-ea help connectors install voice');
+    expect(root.stdout.join('\n')).toContain('Installation: host; configuration: host; resources: host.');
+    expect(root.stdout.join('\n')).toContain('Installation: host; configuration: host; resources: assistant.');
+    expect(root.stdout.join('\n')).toContain('Every compatible managed assistant; recordings remain private.');
+    expect(root.stdout.join('\n')).toContain('Scope: assistant-or-registry');
+    const action = capture();
+    expect(await runCli(['help', 'connectors', 'install'], action.runtime)).toBe(0);
+    expect(action.stdout.join('\n')).toContain('gws-ea help connectors install <name>');
+  });
+  it('publishes four host lifecycle and targeted inspection paths for every connector', async () => {
     const io = capture();
-    expect(await runCli(['schema', 'capabilities', '--json'], io.runtime)).toBe(0);
+    expect(await runCli(['schema', 'connectors', '--json'], io.runtime)).toBe(0);
     const schema: { commands: { path: string[]; scope: string; options: { name: string; required: boolean }[] }[] } =
       JSON.parse(io.stdout.join('\n'));
-    const onepassword = schema.commands.filter((command) => command.path[2] === 'onepassword');
-    expect(onepassword.map((command) => command.path[1])).toEqual(['show', 'check', 'enable', 'disable']);
-    expect(onepassword.every((command) => command.scope === 'host')).toBe(true);
-    const own = (action: string) =>
-      onepassword
-        .find((command) => command.path[1] === action)
-        ?.options.filter((option) => !['help', 'json', 'no-input', 'quiet'].includes(option.name))
-        .map((option) => [option.name, option.required]);
-    expect(own('show')).toEqual([]);
-    expect(own('check')).toEqual([]);
-    expect(own('disable')).toEqual([]);
-    expect(own('enable')).toEqual([
-      ['account', false],
-      ['discard-unproven', false],
-    ]);
-    const scoped = capture();
-    expect(
-      await runCli(
-        ['capabilities', 'enable', 'onepassword', '--id', '00000000-0000-4000-8000-000000000001'],
-        scoped.runtime,
-      ),
-    ).toBe(2);
-    expect(scoped.stderr.join('\n')).toContain('Unknown option --id');
-    for (const action of ['install', 'uninstall']) {
-      const unsupported = capture();
-      expect(await runCli(['capabilities', action, 'onepassword', '--json'], unsupported.runtime)).toBe(2);
+    expect(schema.commands).toHaveLength(13);
+    expect(schema.commands.some((command) => command.path.includes('browser'))).toBe(false);
+    for (const name of ['voice', 'onepassword', 'artifacts']) {
+      const commands = schema.commands.filter((command) => command.path[2] === name);
+      expect(commands.map((command) => command.path[1])).toEqual(['install', 'uninstall', 'show', 'check']);
+      for (const command of commands) {
+        const targeted = ['show', 'check'].includes(command.path[1]);
+        expect(command.options.some((option) => option.name === 'id' && !option.required)).toBe(targeted);
+      }
     }
     const help = capture();
-    expect(await runCli(['help', 'capabilities', 'enable', 'onepassword'], help.runtime)).toBe(0);
+    expect(await runCli(['help', 'connectors', 'install', 'onepassword'], help.runtime)).toBe(0);
     expect(help.stdout.join('\n')).toContain('--account <account_id>');
-    expect(help.stdout.join('\n')).toContain('Scope: host');
-    // Enable names what the operator's host needs: a current `op` and the signed-in desktop app's CLI integration.
-    expect(help.stdout.join('\n')).toMatch(/1Password CLI \(op\) 2\.29 or later/u);
     expect(help.stdout.join('\n')).toContain('Integrate with 1Password CLI');
     expect(help.runtime.checkPrerequisites).not.toHaveBeenCalled();
-    // Removal never revokes a service account; its help names how the kept receipt is closed afterwards.
-    const remove = capture();
-    expect(await runCli(['help', 'remove'], remove.runtime)).toBe(0);
-    expect(remove.stdout.join('\n')).toContain('--yes --abandon onepassword');
   });
   it.each([
     ['help', 'update'],
@@ -121,7 +91,7 @@ describe('local CLI discovery and grammar', () => {
     ['status', '--help', '--json'],
     ['schema', '--help', '--json'],
     ['--json', '--help'],
-    ['capabilities', 'install', '--help', '--json'],
+    ['connectors', 'install', 'voice', '--help', '--json'],
   ])('rejects machine help %j with one JSON usage result and schema guidance', async (...args) => {
     const io = capture();
     expect(await runCli(args, io.runtime)).toBe(2);
@@ -171,14 +141,14 @@ describe('local CLI discovery and grammar', () => {
   });
 
   it.each([
-    ['help', 'capabilities'],
-    ['capabilities', '--help'],
-    ['help', 'capabilities', 'install'],
-    ['capabilities', 'install', '--help'],
+    ['help', 'connectors'],
+    ['connectors', '--help'],
+    ['help', 'connectors', 'install', 'voice'],
+    ['connectors', 'install', 'voice', '--help'],
   ])('discovers capability namespaces and operations for %j', async (...args) => {
     const io = capture();
     expect(await runCli(args, io.runtime)).toBe(0);
-    expect(io.stdout.join('\n')).toContain('gws-ea capabilities');
+    expect(io.stdout.join('\n')).toContain('gws-ea connectors');
     expect(io.stdout.join('\n')).toContain('host');
     expect(io.stdout.join('\n')).not.toContain('install-voice');
     expect(io.stderr).toEqual([]);
@@ -188,17 +158,17 @@ describe('local CLI discovery and grammar', () => {
   it('renders identical help for both capability install forms', async () => {
     const direct = capture();
     const requested = capture();
-    expect(await runCli(['capabilities', 'install', '--help'], direct.runtime)).toBe(0);
-    expect(await runCli(['help', 'capabilities', 'install'], requested.runtime)).toBe(0);
+    expect(await runCli(['connectors', 'install', 'voice', '--help'], direct.runtime)).toBe(0);
+    expect(await runCli(['help', 'connectors', 'install', 'voice'], requested.runtime)).toBe(0);
     expect(direct.stdout).toEqual(requested.stdout);
     expect(direct.stdout.join('\n')).toContain('--model');
     expect(direct.stdout.join('\n')).toContain('--cmake');
   });
 
   it.each([
-    { args: ['capabilities', 'install', 'voice', '--invented', '--json'], command: 'capabilities install' },
-    { args: ['--json', 'capabilities', 'invented', 'voice'], command: 'capabilities invented voice' },
-    { args: ['capabilities', 'enable', 'calendar', '--json'], command: 'capabilities enable' },
+    { args: ['connectors', 'install', 'voice', '--invented', '--json'], command: 'connectors install voice' },
+    { args: ['--json', 'connectors', 'invented', 'voice'], command: 'connectors invented voice' },
+    { args: ['connectors', 'install', 'calendar', '--json'], command: 'connectors install calendar' },
   ])('retains the requested nested path in usage for $command', async ({ args, command }) => {
     const io = capture();
     expect(await runCli(args, io.runtime)).toBe(2);
@@ -210,42 +180,15 @@ describe('local CLI discovery and grammar', () => {
       error: { code: 'invalid_arguments' },
     });
     expect(io.stderr.join('\n')).toMatch(/Unknown option|Unknown command|voice/u);
-    if (args.includes('invented')) expect(io.stderr.join('\n')).toContain('gws-ea help capabilities');
-    if (args.includes('calendar')) expect(io.stderr.join('\n')).toContain('gws-ea capabilities list');
+    if (args.includes('invented')) expect(io.stderr.join('\n')).toContain('gws-ea help connectors');
+    if (args.includes('calendar')) expect(io.stderr.join('\n')).toContain('gws-ea help connectors');
   });
 
-  it('rejects removed root voice paths and retains their capability protocol beside browser leaves', async () => {
-    const io = capture();
-    expect(await runCli(['schema', 'capabilities', '--json'], io.runtime)).toBe(0);
-    const schema = JSON.parse(io.stdout.join('\n')) as {
-      commands: { path: string[]; arguments: { choices?: string[] }[] }[];
-    };
-    expect(schema.commands.map((command) => command.path.join(' '))).toEqual([
-      'capabilities list',
-      'capabilities show',
-      'capabilities check',
-      'capabilities install',
-      'capabilities enable',
-      'capabilities disable',
-      'capabilities uninstall',
-      'capabilities show browser',
-      'capabilities check browser',
-      'capabilities enable browser',
-      'capabilities disable browser',
-      'capabilities show artifacts',
-      'capabilities check artifacts',
-      'capabilities enable artifacts',
-      'capabilities disable artifacts',
-      'capabilities show onepassword',
-      'capabilities check onepassword',
-      'capabilities enable onepassword',
-      'capabilities disable onepassword',
-    ]);
-    expect(schema.commands.slice(1, 7).every((command) => command.arguments[0].choices?.join() === 'voice')).toBe(true);
+  it('rejects removed root voice paths', async () => {
     for (const command of ['install-voice', 'enable-voice', 'disable-voice', 'uninstall-voice']) {
-      const removed = capture();
-      expect(await runCli([command], removed.runtime)).toBe(2);
-      expect(removed.stderr.join('\n')).toContain('Unknown command');
+      const io = capture();
+      expect(await runCli([command], io.runtime)).toBe(2);
+      expect(io.stderr.join('\n')).toContain('Unknown command');
     }
   });
 
@@ -367,7 +310,7 @@ describe('local CLI discovery and grammar', () => {
       `${generated}
 COMP_WORDS=(gws-ea --quiet update --s); COMP_CWORD=3; _gws_ea
 printf '%s\\n' "\${COMPREPLY[@]}"
-COMP_WORDS=(gws-ea capabilities install voice --model=small); COMP_CWORD=4; _gws_ea
+COMP_WORDS=(gws-ea connectors install voice --model=small); COMP_CWORD=4; _gws_ea
 printf '%s\\n' "\${COMPREPLY[@]}"
 COMP_WORDS=(gws-ea ncl --id id -- groups --j); COMP_CWORD=6; _gws_ea
 printf 'child-candidates:%s\\n' "\${#COMPREPLY[@]}"

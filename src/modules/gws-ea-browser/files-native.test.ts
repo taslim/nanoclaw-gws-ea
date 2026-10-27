@@ -1,3 +1,4 @@
+import { useAvailableBrowser } from './testing/browser-runtime.js';
 /** Native Chrome file bytes, the production connection/window boundary and real durable job records. */
 import fs from 'node:fs';
 import path from 'node:path';
@@ -32,7 +33,7 @@ import { ensureBrowserNavigationGuard } from './commit-classifier.js';
 import { executeBrowserBatch } from './executor.js';
 
 import { observePage, type BrowserRef } from './observe.js';
-import { browserPaths, writePrivateFile } from './paths.js';
+import { browserPaths } from './paths.js';
 import type { BrowserExecutionContext } from './actions.js';
 import { JobWindows } from './windows.js';
 
@@ -41,7 +42,7 @@ const invoice = Buffer.concat([Buffer.from('%PDF-1.7\nNative invoice bytes\n'), 
 const sha256 = (bytes: Uint8Array): string => createHash('sha256').update(bytes).digest('hex');
 
 describe.skipIf(!chromePath)('native Chrome file transfers', { timeout: 30_000 }, () => {
-  const paths = browserPaths(path.join(root, 'browser', 'policy.json'));
+  const paths = browserPaths(path.join(root, 'browser'));
   const sockets = new Set<Socket>();
   let server: Server;
   let connection: ChromeConnection;
@@ -55,7 +56,7 @@ describe.skipIf(!chromePath)('native Chrome file transfers', { timeout: 30_000 }
   beforeAll(async () => {
     if (!chromePath) throw new Error('Native Chrome path required');
     await prepareChromeProfile(paths);
-    await writePrivateFile(paths.policyFile, JSON.stringify({ schemaVersion: 1, enabled: true, chromePath }));
+
     server = createServer((request, response) => {
       const address = request.url ?? '';
       if (request.method !== 'GET' || !/^http:\/\/(?:fixture|elsewhere)\.example\//u.test(address)) {
@@ -101,7 +102,8 @@ describe.skipIf(!chromePath)('native Chrome file transfers', { timeout: 30_000 }
   }, 30_000);
 
   beforeEach(async () => {
-    vi.stubEnv('GWS_EA_BROWSER_POLICY_FILE', paths.policyFile);
+    useAvailableBrowser();
+    vi.stubEnv('GWS_EA_BROWSER_ROOT', paths.root);
     await runMigrations(await initTestDb());
     for (const id of ['main-files', 'browser-files'])
       await createAgentGroup({ id, name: id, folder: id, agent_provider: null, created_at: new Date().toISOString() });

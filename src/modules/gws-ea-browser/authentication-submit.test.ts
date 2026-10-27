@@ -30,7 +30,7 @@ describe.skipIf(!chromePath)('native authentication submission', { timeout: 30_0
   beforeAll(async () => {
     if (!chromePath) throw new Error('A Chromium executable is required.');
     root = await mkdtemp(join(tmpdir(), 'nanoclaw-auth-native-'));
-    const paths = browserPaths(join(root, 'browser', 'policy.json'));
+    const paths = browserPaths(join(root, 'browser'));
     await prepareChromeProfile(paths);
     connection = await connectChrome(await spawnChrome({ chromePath, paths, proxyUrl: 'http://127.0.0.1:9' }), paths);
     await prepareAuthenticationIsolation(connection.context);

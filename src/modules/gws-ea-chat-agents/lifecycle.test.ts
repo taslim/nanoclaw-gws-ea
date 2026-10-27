@@ -49,7 +49,7 @@ beforeEach(async () => {
   vi.stubEnv('ONECLI_URL', 'http://gateway.test');
   vi.stubEnv('ONECLI_API_KEY', `oc_${'k'.repeat(32)}`);
   vi.stubEnv('NANOCLAW_INSTALL_ID', '11111111111141118111111111111111');
-  vi.stubEnv('GWS_EA_BROWSER_POLICY_FILE', path.join(storage.root, 'browser/policy.json'));
+  vi.stubEnv('GWS_EA_BROWSER_ROOT', path.join(storage.root, 'browser'));
   vi.stubGlobal(
     'fetch',
     vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
@@ -163,13 +163,8 @@ it('reports actual capability and gateway drift separately for every job while r
 it('reconciles the release shape at update startup while preserving an explicitly authorized job browser grant', async () => {
   const external = await ensureExternalChatGroup();
   const active = await job('active');
-  const policyFile = path.join(storage.root, 'browser/policy.json');
-  fs.mkdirSync(path.dirname(policyFile), { recursive: true, mode: 0o700 });
-  fs.writeFileSync(policyFile, JSON.stringify({ schemaVersion: 2, enabled: true, agentGroupIds: [active] }), {
-    mode: 0o600,
-  });
   await updateContainerConfigJson(external, 'capabilities', ['shell']);
-  await updateContainerConfigJson(active, 'capabilities', ['shell']);
+  await updateContainerConfigJson(active, 'capabilities', ['shell', 'browser-delegate']);
   agents.get(active)!.secretMode = 'all';
   await reconcileChatAgents();
   expect(await hasBrowserAccess(active)).toBe(true);

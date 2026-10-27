@@ -10,7 +10,7 @@ import { createServer as createHttpServer, type Server as HttpServer } from 'nod
 import { createServer as createHttpsServer, type Server as HttpsServer } from 'node:https';
 import { connect, type Socket } from 'node:net';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import type { CDPSession, Page } from 'playwright-core';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -44,10 +44,10 @@ vi.mock('./authentication-submit.js', async (importOriginal) => {
   };
 });
 
-import { closeDb, getDb, initSqliteTestDb } from '../../db/connection.js';
+import { closeDb, getDb } from '../../db/connection.js';
 import { createAgentGroup, initTestDb, runMigrations } from '../../db/index.js';
 import { registerMigration } from '../../db/migrations/index.js';
-import { getSessionsByAgentGroup } from '../../db/sessions.js';
+import { createSession, getSessionsByAgentGroup } from '../../db/sessions.js';
 import '../gws-ea-profile/index.js';
 import { routeSignInMail } from '../gws-ea-inbox/route-mail.js';
 import { parseGmailMessage } from '../gws-ea-inbox/mime.js';
@@ -58,27 +58,28 @@ import { ensureBrowserNavigationGuard } from './commit-classifier.js';
 import { prepareChromeProfile, spawnChrome } from './chrome.js';
 import { connectChrome, type ChromeConnection } from './connection.js';
 import { CredentialAttempts, type CredentialAttempt } from './credential-attempts.js';
-import { executeCredentialForm, recoverCredentialAttempts } from './credential-operations.js';
+import { executeCredentialForm, recoverCredentialAttempts, settleConfirmedAttempts } from './credential-operations.js';
 import { recordConsentGrant } from './consent.js';
 import { executeBrowserBatch } from './executor.js';
 
-import './index.js';
-import {
-  browserConsentMigration,
-  browserCredentialAttemptsMigration,
-  browserCredentialConsentHoldMigration,
-  browserCredentialUncertaintyMigration,
-  browserSiteLeasesMigration,
-} from './migration.js';
+import { createBrowserQueue } from './index.js';
+import { BrowserStore } from './db.js';
 import { observePage, type BrowserRef } from './observe.js';
 import { BrowserVault } from './onepassword.js';
 import {
   FakeOnePassword,
   FIXTURE_ACCOUNT_ID,
+  FIXTURE_INSTANCE_ID,
   FIXTURE_SIGN_IN_ADDRESS,
   writeVaultFixture,
+  type VaultFixtureFiles,
 } from './onepassword-fixture.js';
-import { writeOnePasswordHostPolicy } from './onepassword-policy.js';
+import {
+  onePasswordInstancePaths,
+  readOnePasswordResources,
+  writeOnePasswordHostPolicy,
+  writeOnePasswordResources,
+} from './onepassword-policy.js';
 import { browserPaths } from './paths.js';
 import type { BrowserExecutionContext } from './actions.js';
 import { answerSignInReply, recoverBrowserSignInMail } from './sign-in-mail.js';
@@ -244,6 +245,7 @@ describe.skipIf(!chromePath)('native authorized signup and password change', { t
   let fake: FakeOnePassword;
   let attempts: CredentialAttempts;
   let vault: BrowserVault;
+  let files: VaultFixtureFiles;
   let onePasswordPolicyFile: string;
   let remaining = 20_000;
   const sockets = new Set<Socket>();
@@ -400,7 +402,7 @@ describe.skipIf(!chromePath)('native authorized signup and password change', { t
     await new Promise<void>((resolve) => proxy.listen(0, '127.0.0.1', resolve));
     const proxyAddress = proxy.address();
     if (!proxyAddress || typeof proxyAddress === 'string') throw new Error('Proxy fixture did not bind');
-    const paths = browserPaths(join(root, 'browser', 'policy.json'));
+    const paths = browserPaths(join(root, 'browser'));
     await prepareChromeProfile(paths);
     connection = await connectChrome(
       await spawnChrome({ chromePath, paths, proxyUrl: `http://127.0.0.1:${proxyAddress.port}` }),
@@ -410,18 +412,34 @@ describe.skipIf(!chromePath)('native authorized signup and password change', { t
   }, 30_000);
 
   beforeEach(async () => {
-    const db = await initSqliteTestDb();
-    await browserSiteLeasesMigration.up(db);
-    await browserCredentialAttemptsMigration.up(db);
-    await browserCredentialConsentHoldMigration.up(db);
-    await browserCredentialUncertaintyMigration.up(db);
-    // Consent stops name their job; this suite's job needs no other row.
-    await db.exec(
-      `CREATE TABLE gws_ea_browser_jobs(id TEXT PRIMARY KEY); INSERT INTO gws_ea_browser_jobs VALUES('${JOB}');`,
+    const db = await initTestDb();
+    await runMigrations(db);
+    const createdAt = new Date().toISOString();
+    for (const id of ['main', 'browser'])
+      await createAgentGroup({ id, name: id, folder: id, agent_provider: null, created_at: createdAt });
+    await createSession({
+      id: 'native-browser-session',
+      agent_group_id: 'browser',
+      messaging_group_id: null,
+      thread_id: JOB,
+      agent_provider: null,
+      status: 'active',
+      container_status: 'idle',
+      last_active: null,
+      created_at: createdAt,
+    });
+    await db.run(
+      `INSERT INTO gws_ea_browser_jobs(id,thread_id,browser_session_id,source_agent_group_id,created_at,updated_at)
+       VALUES(?,?,?,?,?,?)`,
+      JOB,
+      JOB,
+      'native-browser-session',
+      'main',
+      createdAt,
+      createdAt,
     );
-    await browserConsentMigration.up(db);
     const directory = await realpath(await mkdtemp(join(root, 'vault-')));
-    const files = await writeVaultFixture(directory);
+    files = await writeVaultFixture(directory);
     onePasswordPolicyFile = files.onePasswordPolicyFile;
     vault = new BrowserVault(files);
     fake = new FakeOnePassword();
@@ -1197,19 +1215,23 @@ describe.skipIf(!chromePath)('native authorized signup and password change', { t
       expect((await attempts.get(authority.id))?.candidate_item_id).toBe(uncertain?.candidate_item_id);
       // Queue history includes the consent card request and the refused no-op refill: neither interacted
       // with the page, so the response remains attributable to this attempt's one disclosure.
-      await getDb().exec(
-        'CREATE TABLE gws_ea_browser_requests(id TEXT PRIMARY KEY,job_id TEXT,action TEXT,payload_json TEXT,started_at TEXT)',
-      );
       for (const [id, action, payload] of [
         ['socket-consent', 'request_consent', { stop_id: (await stops())[0].id }],
         ['socket-no-refill', 'credential_form', { authority: authority.id, ...controls }],
       ] as const)
         await getDb().run(
-          'INSERT INTO gws_ea_browser_requests VALUES(?,?,?,?,?)',
+          `INSERT INTO gws_ea_browser_requests
+           (id,job_id,session_id,request_id,action,payload_json,budget_ms,accepted_at,started_at,answered_at)
+           VALUES(?,?,?,?,?,?,?,?,?,?)`,
           id,
           JOB,
+          'native-browser-session',
+          id,
           action,
           JSON.stringify(payload),
+          60_000,
+          new Date().toISOString(),
+          new Date().toISOString(),
           new Date().toISOString(),
         );
       answerSlow();
@@ -1257,6 +1279,77 @@ describe.skipIf(!chromePath)('native authorized signup and password change', { t
       // One candidate, one disclosure's value, and no answer that carries it.
       expect(fake.calls.filter((call) => call === 'create')).toHaveLength(1);
       expect(JSON.stringify([held, pending, done])).not.toContain(password);
+    }, 30_000);
+
+    it("clears a retired consent submission hold without releasing its job's refreshed site lease", async () => {
+      await page.goto(`${SITE}/waiver-on-fill`);
+      const authority = await signupAuthority();
+      expect(await fill(authority, await refs(SIGNUP))).toMatchObject({
+        status: 'outcome_unknown',
+        reason: 'consent_required',
+      });
+      expect(await attempts.get(authority.id)).toMatchObject({ phase: 'unknown', exposed_at: expect.any(String) });
+      expect(posts).toEqual([]);
+
+      const resourceFile = onePasswordInstancePaths(dirname(files.browserRoot)).resourceFile;
+      const binding = await readOnePasswordResources(resourceFile, { instanceId: FIXTURE_INSTANCE_ID });
+      if (binding.status !== 'ready') throw new Error('Missing vault fixture binding');
+      const replacement = 'replacementvault0000000001';
+      await writeOnePasswordResources(resourceFile, {
+        ...binding.resources,
+        vault: { id: replacement, createdBy: { kind: 'operator' } },
+      });
+      fake = new FakeOnePassword(replacement);
+      vault = new BrowserVault(files);
+      attempts = new CredentialAttempts({ db: getDb(), vault });
+      expect(await attempts.unresolved()).toEqual([]);
+      const retired = await attempts.get(authority.id);
+      if (!retired) throw new Error('Missing retired attempt');
+      expect(retired).toMatchObject({ phase: 'rejected' });
+
+      const refreshedAt = new Date(Date.parse(retired.updated_at) + 1).toISOString();
+      vi.useFakeTimers({ toFake: ['Date'] });
+      vi.setSystemTime(new Date(refreshedAt));
+      try {
+        await executeBrowserBatch(context(), { actions: [{ kind: 'observe' }] }, { record: false });
+      } finally {
+        vi.useRealTimers();
+      }
+      const queue = createBrowserQueue(new BrowserStore(), {
+        pageForJob: async () => page,
+        connection: async () => connection,
+        closeJob: async () => page.close(),
+        onDisconnected: () => () => undefined,
+      });
+      const waiter = 'waiting-for-current-work';
+      expect(await queue.leases.acquire(waiter, SITE)).toMatchObject({ acquired: false });
+      const wake = vi.spyOn(queue, 'wakeWaiters').mockResolvedValue(undefined);
+      const lease = () =>
+        getDb().get<{ job_id: string; updated_at: string }>(
+          'SELECT job_id,updated_at FROM gws_ea_browser_site_leases WHERE site = ?',
+          'shop.example',
+        );
+      expect(await lease()).toEqual({ job_id: JOB, updated_at: refreshedAt });
+      expect(
+        await page.evaluate(
+          "fetch('/ordinary-save', { method: 'POST', body: 'before=retirement-cleanup' }).then(() => 'submitted', () => 'blocked')",
+        ),
+      ).toBe('blocked');
+
+      await settleConfirmedAttempts(queue, undefined, attempts);
+
+      expect(await lease()).toEqual({ job_id: JOB, updated_at: refreshedAt });
+      expect(
+        await getDb().all('SELECT job_id FROM gws_ea_browser_site_waiters WHERE site = ?', 'shop.example'),
+      ).toEqual([{ job_id: waiter }]);
+      expect(wake.mock.calls.flatMap(([jobs]) => jobs)).not.toContain(waiter);
+      expect(
+        await page.evaluate(
+          "fetch('/ordinary-save', { method: 'POST', body: 'safe=current-work' }).then(() => 'submitted', () => 'blocked')",
+        ),
+      ).toBe('submitted');
+      expect(posts.map((post) => [post.path, post.body])).toEqual([['/ordinary-save', 'safe=current-work']]);
+      expect(await queue.leases.acquire(waiter, SITE)).toMatchObject({ acquired: false });
     }, 30_000);
 
     for (const address of [

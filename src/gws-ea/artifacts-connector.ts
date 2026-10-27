@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { mkdir } from 'node:fs/promises';
+import { mkdir, readFile } from 'node:fs/promises';
 import { createServer } from 'node:net';
 import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -10,7 +10,8 @@ import {
   readArtifactsPolicy,
   type ArtifactsPolicyFile,
 } from '../modules/gws-ea-artifacts/policy.js';
-import { withAssistantLock } from './browser-capability.js';
+import { withAssistantLock } from './assistant-lock.js';
+import type { InstanceOperation } from './journal.js';
 import {
   artifactsAccessApplication,
   artifactsApi,
@@ -40,16 +41,26 @@ import {
   type SanitizedCommandOutcomeRunner,
 } from './process.js';
 import { registerSecret } from './redact.js';
-import { claimInstanceArtifacts, getInstanceReservation, withMachineLock } from './registry.js';
+import {
+  claimInstanceArtifacts,
+  getInstanceReservation,
+  readRegistry,
+  releaseInstanceArtifacts,
+  withMachineLock,
+} from './registry.js';
 import { readOperatorFile, readOwnerOnlyFile, writePrivateTextFile } from './secrets.js';
 import { loadInstanceRuntimeConfig, serviceManagerEnvironment, type InstanceRuntimeConfig } from './service.js';
 import { renderLaunchdService, renderSystemdService } from './service-definition.js';
 import { GwsEaError, type ArtifactsNamespaceClaim } from './types.js';
 import { isRecord } from './validation.js';
+import { inspectArtifactsUninstall, withArtifactsHostLock } from './artifacts-uninstall.js';
+
+export { inspectArtifactsUninstall, uninstallArtifactsConnector } from './artifacts-uninstall.js';
+export type { ArtifactsConnectorUninstallData, ArtifactsUninstallReceipt } from './artifacts-uninstall.js';
 
 export const ARTIFACTS_CAPABILITY = {
   name: 'artifacts',
-  actions: ['show', 'check', 'enable', 'disable'],
+  actions: ['install', 'uninstall', 'show', 'check'],
   scope: 'assistant',
   summary: 'Serve private HTML views and explicitly shared revisions through Cloudflare Access.',
 } as const;
@@ -59,7 +70,6 @@ export interface ArtifactsCapabilityOptions {
   readonly zoneId?: string;
   readonly hostname?: string;
   readonly credentialFile?: string;
-  readonly assistantHostname?: string;
   readonly cloudflaredPath?: string;
   readonly discardUnproven?: string;
 }
@@ -79,7 +89,7 @@ export interface ArtifactsCapabilityObservation {
   readonly hostname: string | null;
   readonly path_prefix: string | null;
   readonly policy_file: string;
-  readonly remote: 'not_checked' | 'verified' | 'unavailable';
+  readonly remote: 'not_checked' | 'verified' | 'mismatch' | 'unavailable';
   readonly listener: 'not_checked' | 'listening' | 'unavailable';
   readonly ready: boolean;
   readonly reason: string | null;
@@ -102,6 +112,181 @@ export interface ArtifactsOperationData {
   readonly changed: boolean;
   readonly hostname: string | null;
   readonly path_prefix: string | null;
+}
+
+export interface ArtifactsAssistantProvisioning {
+  readonly instance_id: string;
+  readonly outcome: 'ready' | 'pending' | 'unsupported';
+  readonly reason: string | null;
+  readonly message: string | null;
+  readonly changed: boolean;
+}
+
+export interface ArtifactsConnectorOperation {
+  readonly name: 'artifacts';
+  readonly scope: 'host';
+  readonly installed: true;
+  readonly changed: boolean;
+  readonly assistants: readonly ArtifactsAssistantProvisioning[];
+}
+
+export type ArtifactsReleaseCompatibility = 'compatible' | 'unsupported' | 'unknown';
+const ARTIFACTS_CONTRACT = 'gws-ea-artifacts-1';
+
+export async function artifactsReleaseCompatibility(checkout: string): Promise<ArtifactsReleaseCompatibility> {
+  try {
+    const marker: unknown = JSON.parse(
+      await readFile(path.join(checkout, 'src/gws-ea/artifacts-compatibility.json'), 'utf8'),
+    );
+    if (!isRecord(marker) || marker.schemaVersion !== 1 || typeof marker.contract !== 'string') return 'unknown';
+    return marker.contract === ARTIFACTS_CONTRACT ? 'compatible' : 'unsupported';
+  } catch (cause) {
+    if (isErrno(cause, 'ENOENT') || isErrno(cause, 'ENOTDIR')) return 'unsupported';
+    if (cause instanceof SyntaxError) return 'unknown';
+    throw cause;
+  }
+}
+
+export async function artifactsConnectorInstalled(paths: ControlPlanePaths): Promise<boolean> {
+  if (await inspectArtifactsUninstall(paths)) return false;
+  return (await readArtifactsOperatorConfig(artifactsOperatorFiles(paths).configFile)) !== undefined;
+}
+
+async function provisionRecordedAssistant(
+  paths: ControlPlanePaths,
+  instanceId: string,
+  dependencies: ArtifactsCapabilityDependencies,
+): Promise<ArtifactsAssistantProvisioning> {
+  let changed = false;
+  try {
+    const config = await readArtifactsOperatorConfig(artifactsOperatorFiles(paths).configFile);
+    if (config?.pending)
+      return {
+        instance_id: instanceId,
+        outcome: 'pending',
+        reason: 'artifacts_create_unproven',
+        message: `Unproven ${config.pending.kind} creation ${config.pending.key} must be resolved before provisioning.`,
+        changed,
+      };
+    const runtime = await loadInstanceRuntimeConfig(paths.runtimeFile(instanceId));
+    const compatibility = await artifactsReleaseCompatibility(runtime.checkout_root);
+    if (compatibility !== 'compatible')
+      return {
+        instance_id: instanceId,
+        outcome: compatibility === 'unsupported' ? 'unsupported' : 'pending',
+        reason: compatibility === 'unsupported' ? 'release_unsupported' : 'release_unknown',
+        message:
+          compatibility === 'unsupported'
+            ? 'Update this assistant to a release that supports artifacts.'
+            : 'The assistant release compatibility marker is unreadable.',
+        changed,
+      };
+    const result = await provisionArtifactsAssistant(paths, instanceId, {
+      ...dependencies,
+      recordEffect: async (effect) => {
+        if (effect === true) changed = true;
+        await dependencies.recordEffect?.(effect);
+      },
+    });
+    return { instance_id: instanceId, outcome: 'ready', reason: null, message: null, changed: result.changed };
+  } catch (cause) {
+    if (!(cause instanceof Error)) throw cause;
+    return {
+      instance_id: instanceId,
+      outcome: 'pending',
+      reason: cause instanceof GwsEaError ? cause.code : 'artifacts_host_unavailable',
+      message:
+        cause instanceof GwsEaError
+          ? cause.message
+          : 'The assistant host or artifacts prerequisites could not be observed. Start the assistant and rerun connector installation.',
+      changed,
+    };
+  }
+}
+
+/** Configure the host once, then reconcile every registered assistant using its native instance lock. */
+export async function installArtifactsConnector(
+  paths: ControlPlanePaths,
+  options: ArtifactsCapabilityOptions = {},
+  dependencies: ArtifactsCapabilityDependencies = {},
+): Promise<ArtifactsConnectorOperation> {
+  return withArtifactsHostLock(paths, async () => {
+    const uninstall = await inspectArtifactsUninstall(paths);
+    if (uninstall) {
+      if (options.discardUnproven) {
+        await dependencies.recordEffect?.(null);
+        await configure(paths, { discardUnproven: options.discardUnproven });
+        await dependencies.recordEffect?.(true);
+      }
+      throw new GwsEaError(
+        'artifacts_uninstall_incomplete',
+        'Finish artifacts uninstall before installing it again. Rerun gws-ea connectors uninstall artifacts.',
+      );
+    }
+    await dependencies.recordEffect?.(null);
+    const previous = await readArtifactsOperatorConfig(artifactsOperatorFiles(paths).configFile);
+    const config = await configure(paths, options);
+    let changed =
+      previous === undefined || options.credentialFile !== undefined || options.discardUnproven !== undefined;
+    if (changed) await dependencies.recordEffect?.(true);
+    const assistants: ArtifactsAssistantProvisioning[] = [];
+    for (const instanceId of Object.keys((await readRegistry(paths)).instances).sort()) {
+      let result: ArtifactsAssistantProvisioning;
+      try {
+        result = await withAssistantLock(paths, instanceId, () =>
+          provisionRecordedAssistant(paths, instanceId, dependencies),
+        );
+      } catch (cause) {
+        if (!(cause instanceof GwsEaError)) throw cause;
+        result = {
+          instance_id: instanceId,
+          outcome: 'pending',
+          reason: cause.code,
+          message: cause.message,
+          changed: false,
+        };
+      }
+      assistants.push(result);
+      changed ||= result.changed;
+    }
+    if (config.pending && assistants.length === 0)
+      throw new GwsEaError(
+        'artifacts_create_unproven',
+        `Unproven ${config.pending.kind} creation ${config.pending.key} must be resolved before provisioning.`,
+      );
+    return { name: 'artifacts', scope: 'host', installed: true, changed, assistants };
+  });
+}
+
+/** Called by create/update/start while their existing instance operation is held. */
+export async function provisionAssistantArtifacts(
+  operation: InstanceOperation,
+  dependencies: ArtifactsCapabilityDependencies = {},
+): Promise<ArtifactsAssistantProvisioning | undefined> {
+  operation.assertActive();
+  if (!(await artifactsConnectorInstalled(operation.paths))) return undefined;
+  try {
+    return await withArtifactsHostLock(operation.paths, async () => {
+      operation.assertActive();
+      if (!(await artifactsConnectorInstalled(operation.paths))) return undefined;
+      return provisionRecordedAssistant(operation.paths, operation.instanceId, {
+        ...dependencies,
+        recordEffect: async (effect) => {
+          operation.recordEffect?.(effect);
+          await dependencies.recordEffect?.(effect);
+        },
+      });
+    });
+  } catch (cause) {
+    if (!(cause instanceof GwsEaError)) throw cause;
+    return {
+      instance_id: operation.instanceId,
+      outcome: 'pending',
+      reason: cause.code,
+      message: cause.message,
+      changed: false,
+    };
+  }
 }
 export function instanceArtifactsPolicyFile(runtime: Pick<InstanceRuntimeConfig, 'instance_root'>): string {
   return path.join(runtime.instance_root, 'artifacts', 'policy.json');
@@ -186,7 +371,7 @@ async function configure(
     if (!options.accountId || !options.teamName || !options.zoneId || !options.hostname || !options.credentialFile)
       throw new GwsEaError(
         'artifacts_operator_required',
-        'First enable requires --account, --team, --zone, --hostname and --credential-file under the operator config root.',
+        'First install requires --account, --team, --zone, --hostname and --credential-file under the operator config root.',
       );
     const credentialFile = path.join(files.root, 'management-token');
     const config = parseArtifactsOperatorConfig({
@@ -560,6 +745,11 @@ function assertDns(record: unknown, hostname: string, tunnelId: string, expected
     throw new GwsEaError('artifacts_dns_mismatch', 'The owned DNS record no longer points at the recorded tunnel.');
 }
 
+export function supportedCloudflaredVersion(output: string): boolean {
+  const match = /^cloudflared version (\d{4})\.(\d+)\.(\d+)\b/u.exec(output.trim());
+  return match !== null && (Number(match[1]) > 2025 || (Number(match[1]) === 2025 && Number(match[2]) >= 4));
+}
+
 async function verifyConnectorExecutable(
   config: ArtifactsOperatorConfig,
   runtime: InstanceRuntimeConfig,
@@ -573,8 +763,7 @@ async function verifyConnectorExecutable(
     timeoutMs: 5000,
     outputLimitBytes: 4096,
   });
-  const match = /^cloudflared version (\d{4})\.(\d+)\.(\d+)\b/u.exec(result.stdout.trim());
-  if (result.exitCode !== 0 || !match || Number(match[1]) < 2025 || (Number(match[1]) === 2025 && Number(match[2]) < 4))
+  if (result.exitCode !== 0 || !supportedCloudflaredVersion(result.stdout))
     throw new GwsEaError(
       'artifacts_connector_unsupported',
       'cloudflared 2025.4.0 or later is required for the owner-only run-token file.',
@@ -700,231 +889,213 @@ async function hostHealth(
   return (dependencies.ncl ?? runInstanceNclJson)(runtime, ['gws-ea-artifacts-health'], { timeoutMs });
 }
 
-export async function enableArtifactsCapability(
+async function waitForArtifactListener(
+  runtime: InstanceRuntimeConfig,
+  dependencies: ArtifactsCapabilityDependencies,
+  port: number,
+): Promise<boolean> {
+  const deadline = Date.now() + 30_000;
+  while (Date.now() < deadline) {
+    if (
+      availableHealth(await hostHealth(runtime, dependencies, Math.min(5000, deadline - Date.now())), port) &&
+      Date.now() <= deadline
+    )
+      return true;
+    const remaining = deadline - Date.now();
+    if (remaining > 0) await (dependencies.sleep ?? delay)(Math.min(500, remaining));
+  }
+  return false;
+}
+
+async function provisionArtifactsAssistant(
   paths: ControlPlanePaths,
   instanceId: string,
-  options: ArtifactsCapabilityOptions = {},
   dependencies: ArtifactsCapabilityDependencies = {},
 ): Promise<ArtifactsOperationData> {
-  return withAssistantLock(paths, instanceId, async () => {
-    const { runtime, policyFile, reservation } = await target(paths, instanceId);
-    const ncl = dependencies.ncl ?? runInstanceNclJson;
-    const profile = await ncl(runtime, ['gws-ea-profile-get']);
+  const { runtime, policyFile, reservation } = await target(paths, instanceId);
+  const ncl = dependencies.ncl ?? runInstanceNclJson;
+  const profile = await ncl(runtime, ['gws-ea-profile-get']);
+  if (
+    !isRecord(profile) ||
+    typeof profile.assistant_first_name !== 'string' ||
+    !Array.isArray(profile.principal_emails) ||
+    !profile.principal_emails.every((email): email is string => typeof email === 'string') ||
+    !profile.principal_emails.length
+  )
+    throw new GwsEaError(
+      'artifacts_profile_unavailable',
+      'Artifacts require the assistant first name and all confirmed principal email addresses from the running host.',
+    );
+  const principalEmails = artifactsEmails(profile.principal_emails);
+  const health = await hostHealth(runtime, dependencies);
+  if (!isRecord(health) || !Array.isArray(health.policyVersions) || !health.policyVersions.includes(1))
+    throw new GwsEaError(
+      'artifacts_release_unsupported',
+      'Update and start the assistant before installing artifacts.',
+    );
+  const config = await readArtifactsOperatorConfig(artifactsOperatorFiles(paths).configFile);
+  if (!config) throw new GwsEaError('artifacts_not_installed', 'Artifacts is not installed on this operator host.');
+  await verifyConnectorExecutable(config, runtime, dependencies);
+  const recorded = config.assistants[instanceId];
+  if (recorded?.publicationReady) {
+    const current = await inspectArtifactsCapability(paths, instanceId, { ...dependencies, check: true });
+    if (current.ready) return operation(instanceId, recorded.claim, true, false);
+    if (current.activation === 'enabled' && current.remote === 'verified') {
+      if (await waitForArtifactListener(runtime, dependencies, recorded.claim.listen_port))
+        return operation(instanceId, recorded.claim, true, false);
+      throw new GwsEaError(
+        'artifacts_listener_unavailable',
+        'The running assistant has not verified its artifact listener. Its existing artifact configuration is retained.',
+      );
+    }
+    if (current.remote !== 'mismatch')
+      throw new GwsEaError(
+        'artifacts_not_ready',
+        `${current.reason ?? 'Artifact prerequisites could not be observed.'} The existing artifact configuration is retained.`,
+      );
+  }
+  const previousPolicy = await readArtifactsPolicy(policyFile);
+  if (previousPolicy.status === 'unavailable')
+    throw new GwsEaError('artifacts_policy_invalid', 'Artifacts policy is invalid or inaccessible.');
+  await dependencies.recordEffect?.(null);
+  const retained = reservation.exclusive_resource_claims.artifacts;
+  const hostname = retained?.hostname ?? config.hostname;
+  const prefix = retained?.path_prefix ?? artifactsPathPrefix(profile.assistant_first_name);
+  const claim = await claimNamespace(paths, instanceId, hostname, prefix);
+  await dependencies.recordEffect?.(true);
+  const currentEmails = async (): Promise<readonly string[]> => {
+    const current = await ncl(runtime, ['gws-ea-artifacts-admission-emails']);
     if (
-      !isRecord(profile) ||
-      typeof profile.assistant_first_name !== 'string' ||
-      !Array.isArray(profile.principal_emails) ||
-      !profile.principal_emails.every((email): email is string => typeof email === 'string') ||
-      !profile.principal_emails.length
+      !isRecord(current) ||
+      !Array.isArray(current.emails) ||
+      !current.emails.every((email): email is string => typeof email === 'string')
     )
       throw new GwsEaError(
         'artifacts_profile_unavailable',
-        'Artifacts require the assistant first name and all confirmed principal email addresses from the running host.',
+        'The host could not read authoritative artifact admission.',
       );
-    const principalEmails = artifactsEmails(profile.principal_emails);
-    const health = await hostHealth(runtime, dependencies);
-    if (!isRecord(health) || !Array.isArray(health.policyVersions) || !health.policyVersions.includes(1))
+    const exact = artifactsEmails(current.emails);
+    if (!principalEmails.every((email) => exact.includes(email)))
       throw new GwsEaError(
-        'artifacts_release_unsupported',
-        'Update and start the assistant before enabling artifacts.',
+        'artifacts_profile_changed',
+        'Principal addresses changed during installation. Retry with the current profile.',
       );
-    await dependencies.recordEffect?.(null);
-    const config = await configure(paths, options);
-    await verifyConnectorExecutable(config, runtime, dependencies);
-    const retained = reservation.exclusive_resource_claims.artifacts;
-    const hostname = options.assistantHostname ?? retained?.hostname ?? config.hostname;
-    const prefix =
-      retained?.path_prefix ?? (options.assistantHostname ? '' : artifactsPathPrefix(profile.assistant_first_name));
-    const claim = await claimNamespace(paths, instanceId, hostname, prefix);
-    await dependencies.recordEffect?.(true);
-    const currentEmails = async (): Promise<readonly string[]> => {
-      const current = await ncl(runtime, ['gws-ea-artifacts-admission-emails']);
-      if (
-        !isRecord(current) ||
-        !Array.isArray(current.emails) ||
-        !current.emails.every((email): email is string => typeof email === 'string')
-      )
-        throw new GwsEaError(
-          'artifacts_profile_unavailable',
-          'The host could not read authoritative artifact admission.',
-        );
-      const exact = artifactsEmails(current.emails);
-      if (!principalEmails.every((email) => exact.includes(email)))
-        throw new GwsEaError(
-          'artifacts_profile_changed',
-          'Principal addresses changed during enable. Retry with the current profile.',
-        );
-      return exact;
+    return exact;
+  };
+  let enabledPolicy: ArtifactsPolicyFile | undefined = previousPolicy.config;
+  try {
+    if (enabledPolicy?.enabled) await writePolicy(policyFile, { ...enabledPolicy, enabled: false });
+    const provisioned = await provision(paths, instanceId, claim, await currentEmails(), dependencies);
+    const assistant = provisioned.assistants[instanceId];
+    await reconcileArtifactsAccessEmails(
+      {
+        operatorConfigFile: artifactsOperatorFiles(paths).configFile,
+        accountId: provisioned.accountId,
+        applicationId: assistant.applicationId!,
+        emails: currentEmails,
+      },
+      dependencies,
+    );
+    enabledPolicy = {
+      schemaVersion: 1,
+      enabled: true,
+      hostname: claim.hostname,
+      pathPrefix: claim.path_prefix,
+      listenPort: claim.listen_port,
+      accessIssuer: `https://${provisioned.teamName}.cloudflareaccess.com`,
+      accessAud: assistant.aud!,
+      cloudflare: {
+        accountId: provisioned.accountId,
+        applicationId: assistant.applicationId!,
+        operatorConfigFile: artifactsOperatorFiles(paths).configFile,
+      },
     };
-    const previousPolicy = await readArtifactsPolicy(policyFile);
-    if (previousPolicy.status === 'unavailable')
-      throw new GwsEaError('artifacts_policy_invalid', 'Artifacts policy is invalid or inaccessible.');
-    let enabledPolicy: ArtifactsPolicyFile | undefined = previousPolicy.config;
-    try {
-      if (enabledPolicy?.enabled) await writePolicy(policyFile, { ...enabledPolicy, enabled: false });
-      const provisioned = await provision(paths, instanceId, claim, await currentEmails(), dependencies);
-      const assistant = provisioned.assistants[instanceId];
-      await reconcileArtifactsAccessEmails(
-        {
-          operatorConfigFile: artifactsOperatorFiles(paths).configFile,
-          accountId: provisioned.accountId,
-          applicationId: assistant.applicationId!,
-          emails: currentEmails,
-        },
-        dependencies,
+    await writePolicy(policyFile, { ...enabledPolicy, enabled: false });
+    await writePolicy(policyFile, enabledPolicy);
+    // The host module binds asynchronously. Poll for its listener outside the machine lock, and before ingress
+    // opens or the connector starts, since the listener depends on neither.
+    if (!(await waitForArtifactListener(runtime, dependencies, claim.listen_port)))
+      throw new GwsEaError(
+        'artifacts_listener_unavailable',
+        'The running assistant has not verified its artifact listener. Artifact ingress remains closed.',
       );
-      enabledPolicy = {
-        schemaVersion: 1,
-        enabled: true,
-        hostname: claim.hostname,
-        pathPrefix: claim.path_prefix,
-        listenPort: claim.listen_port,
-        accessIssuer: `https://${provisioned.teamName}.cloudflareaccess.com`,
-        accessAud: assistant.aud!,
-        cloudflare: {
-          accountId: provisioned.accountId,
-          applicationId: assistant.applicationId!,
-          operatorConfigFile: artifactsOperatorFiles(paths).configFile,
-        },
-      };
-      await writePolicy(policyFile, { ...enabledPolicy, enabled: false });
-      await writePolicy(policyFile, enabledPolicy);
-      let listening = false;
-      const readinessDeadline = Date.now() + 30_000;
-      // The host module binds asynchronously. Poll for its listener outside the machine lock, and before ingress
-      // opens or the connector starts, since the listener depends on neither.
-      while (Date.now() < readinessDeadline) {
-        if (
-          availableHealth(
-            await hostHealth(runtime, dependencies, Math.min(5000, readinessDeadline - Date.now())),
-            claim.listen_port,
-          ) &&
-          Date.now() <= readinessDeadline
-        ) {
-          listening = true;
-          break;
-        }
-        const remaining = readinessDeadline - Date.now();
-        if (remaining > 0) await (dependencies.sleep ?? delay)(Math.min(500, remaining));
-      }
-      if (!listening)
-        throw new GwsEaError(
-          'artifacts_listener_unavailable',
-          'The running assistant has not verified its artifact listener. Artifact ingress remains closed.',
-        );
-      await withMachineLock(paths, async () => {
-        const live = await readArtifactsOperatorConfig(artifactsOperatorFiles(paths).configFile);
-        if (!live?.assistants[instanceId]?.enabled)
-          throw new GwsEaError('artifacts_disabled', 'Artifacts were disabled while enabling.');
-        await setArtifactsIngress(await artifactsApi(live, dependencies), live, claim, true);
-      });
-      await startConnector(paths, runtime, dependencies);
-      const observed = await inspectArtifactsCapability(paths, instanceId, { ...dependencies, check: true });
-      if (observed.remote !== 'verified' || observed.listener !== 'listening')
-        throw new GwsEaError(
-          'artifacts_not_ready',
-          'Artifact prerequisites have not all been verified. Check this capability after resolving the reported prerequisite.',
-        );
-      const authors = await ncl(runtime, ['gws-ea-artifacts-author-groups']);
+    await withMachineLock(paths, async () => {
+      const live = await readArtifactsOperatorConfig(artifactsOperatorFiles(paths).configFile);
+      if (!live?.assistants[instanceId]?.enabled)
+        throw new GwsEaError('artifacts_disabled', 'Artifacts were disabled while provisioning.');
+      await setArtifactsIngress(await artifactsApi(live, dependencies), live, claim, true);
+    });
+    await startConnector(paths, runtime, dependencies);
+    const observed = await inspectArtifactsCapability(paths, instanceId, { ...dependencies, check: true });
+    if (observed.remote !== 'verified' || observed.listener !== 'listening')
+      throw new GwsEaError(
+        'artifacts_not_ready',
+        'Artifact prerequisites have not all been verified. Check this connector after resolving the reported prerequisite.',
+      );
+    const authors = await ncl(runtime, ['gws-ea-artifacts-author-groups']);
+    if (
+      !isRecord(authors) ||
+      !Array.isArray(authors.group_ids) ||
+      !authors.group_ids.every((id): id is string => typeof id === 'string' && id.length > 0)
+    )
+      throw new GwsEaError('artifacts_authors_unavailable', 'The host could not read current artifact author groups.');
+    for (const groupId of new Set(authors.group_ids)) await ncl(runtime, ['groups', 'restart', '--id', groupId]);
+    const activationPolicy = enabledPolicy;
+    await withMachineLock(paths, async () => {
+      const file = artifactsOperatorFiles(paths).configFile;
+      const live = await readArtifactsOperatorConfig(file);
+      const current = live?.assistants[instanceId];
+      const policy = await readArtifactsPolicy(policyFile);
       if (
-        !isRecord(authors) ||
-        !Array.isArray(authors.group_ids) ||
-        !authors.group_ids.every((id): id is string => typeof id === 'string' && id.length > 0)
+        !live ||
+        !current?.enabled ||
+        current.applicationId !== activationPolicy.cloudflare.applicationId ||
+        current.aud !== activationPolicy.accessAud ||
+        JSON.stringify(current.claim) !== JSON.stringify(claim) ||
+        policy.status !== 'enabled' ||
+        JSON.stringify(policy.config) !== JSON.stringify(activationPolicy)
       )
-        throw new GwsEaError(
-          'artifacts_authors_unavailable',
-          'The host could not read current artifact author groups.',
-        );
-      for (const groupId of new Set(authors.group_ids)) await ncl(runtime, ['groups', 'restart', '--id', groupId]);
-      const activationPolicy = enabledPolicy;
+        throw new GwsEaError('artifacts_disabled', 'Artifact coordinates changed before activation completed.');
+      await writeArtifactsOperatorConfig(file, {
+        ...live,
+        assistants: { ...live.assistants, [instanceId]: { ...current, publicationReady: true } },
+      });
+    });
+    return operation(instanceId, claim, true, true);
+  } catch (cause) {
+    if (enabledPolicy) await writePolicy(policyFile, { ...enabledPolicy, enabled: false });
+    /* eslint-disable no-catch-all/no-catch-all -- Origin is already closed; retain the original failure when remote cleanup is also unavailable. */
+    let releaseUnrecordedClaim = false;
+    try {
       await withMachineLock(paths, async () => {
         const file = artifactsOperatorFiles(paths).configFile;
         const live = await readArtifactsOperatorConfig(file);
-        const current = live?.assistants[instanceId];
-        const policy = await readArtifactsPolicy(policyFile);
-        if (
-          !live ||
-          !current?.enabled ||
-          current.applicationId !== activationPolicy.cloudflare.applicationId ||
-          current.aud !== activationPolicy.accessAud ||
-          JSON.stringify(current.claim) !== JSON.stringify(claim) ||
-          policy.status !== 'enabled' ||
-          JSON.stringify(policy.config) !== JSON.stringify(activationPolicy)
-        )
-          throw new GwsEaError('artifacts_disabled', 'Artifact coordinates changed before activation completed.');
-        await writeArtifactsOperatorConfig(file, {
-          ...live,
-          assistants: { ...live.assistants, [instanceId]: { ...current, publicationReady: true } },
-        });
+        const assistant = live?.assistants[instanceId];
+        releaseUnrecordedClaim =
+          live !== undefined &&
+          assistant === undefined &&
+          retained === undefined &&
+          !previousPolicy.config?.enabled &&
+          !(live.pending?.kind === 'application' && live.pending.target === instanceId);
+        if (live && assistant) {
+          await writeArtifactsOperatorConfig(file, {
+            ...live,
+            assistants: {
+              ...live.assistants,
+              [instanceId]: { ...live.assistants[instanceId], enabled: false, publicationReady: false },
+            },
+          });
+          if (live.tunnelId)
+            await setArtifactsIngress(await artifactsApi(live, dependencies), live, assistant.claim, false);
+        }
       });
-      return operation(instanceId, claim, true, true);
-    } catch (cause) {
-      if (enabledPolicy) await writePolicy(policyFile, { ...enabledPolicy, enabled: false });
-      /* eslint-disable no-catch-all/no-catch-all -- Origin is already closed; retain the original failure when remote cleanup is also unavailable. */
-      try {
-        await withMachineLock(paths, async () => {
-          const file = artifactsOperatorFiles(paths).configFile;
-          const live = await readArtifactsOperatorConfig(file);
-          const assistant = live?.assistants[instanceId];
-          if (live && assistant) {
-            await writeArtifactsOperatorConfig(file, {
-              ...live,
-              assistants: {
-                ...live.assistants,
-                [instanceId]: { ...live.assistants[instanceId], enabled: false, publicationReady: false },
-              },
-            });
-            if (live.tunnelId)
-              await setArtifactsIngress(await artifactsApi(live, dependencies), live, assistant.claim, false);
-          }
-        });
-      } catch (_cleanupCause) {
-        /* The disabled policy is authoritative; check observes pending ingress cleanup. */
-      }
-      /* eslint-enable no-catch-all/no-catch-all */
-      throw cause;
+    } catch (_cleanupCause) {
+      /* The disabled policy is authoritative; check observes pending ingress cleanup. */
     }
-  });
-}
-
-export async function disableArtifactsCapability(
-  paths: ControlPlanePaths,
-  instanceId: string,
-  dependencies: ArtifactsCapabilityDependencies = {},
-): Promise<ArtifactsOperationData> {
-  return withAssistantLock(paths, instanceId, async () => {
-    const { policyFile, reservation } = await target(paths, instanceId);
-    const policy = await readArtifactsPolicy(policyFile);
-    if (policy.status === 'unavailable')
-      throw new GwsEaError(
-        'artifacts_policy_invalid',
-        'Invalid artifacts policy already fails closed. Restore its owner-only coordinates before cleanup.',
-      );
-    let changed = false;
-    if (policy.config?.enabled) {
-      await dependencies.recordEffect?.(null);
-      await writePolicy(policyFile, { ...policy.config, enabled: false });
-      changed = true;
-      await dependencies.recordEffect?.(true);
-    }
-    await withMachineLock(paths, async () => {
-      const file = artifactsOperatorFiles(paths).configFile;
-      const config = await readArtifactsOperatorConfig(file);
-      const assistant = config?.assistants[instanceId];
-      if (!config || !assistant) return;
-      if (assistant.enabled || assistant.publicationReady) {
-        await dependencies.recordEffect?.(null);
-        await writeArtifactsOperatorConfig(file, {
-          ...config,
-          assistants: { ...config.assistants, [instanceId]: { ...assistant, enabled: false, publicationReady: false } },
-        });
-        changed = true;
-        await dependencies.recordEffect?.(true);
-      }
-      await setArtifactsIngress(await artifactsApi(config, dependencies), config, assistant.claim, false);
-    });
-    return operation(instanceId, reservation.exclusive_resource_claims.artifacts, false, changed);
-  });
+    /* eslint-enable no-catch-all/no-catch-all */
+    if (releaseUnrecordedClaim) await releaseInstanceArtifacts(paths, instanceId, claim);
+    throw cause;
+  }
 }
 
 /** Read-only and bounded: creates, replaces, reconciles, starts and repairs nothing. */
@@ -1014,9 +1185,13 @@ export async function inspectArtifactsCapability(
       if (
         !isRecord(admission) ||
         !Array.isArray(admission.emails) ||
-        !admission.emails.every((email): email is string => typeof email === 'string') ||
-        JSON.stringify(artifactsEmails(admission.emails)) !== JSON.stringify(admitted)
+        !admission.emails.every((email): email is string => typeof email === 'string')
       )
+        throw new GwsEaError(
+          'artifacts_admission_unavailable',
+          'The host’s current artifact readers could not be observed.',
+        );
+      if (JSON.stringify(artifactsEmails(admission.emails)) !== JSON.stringify(admitted))
         throw new GwsEaError(
           'artifacts_access_unverified',
           'Cloudflare admission does not match the host’s current intended readers.',
@@ -1071,10 +1246,26 @@ export async function inspectArtifactsCapability(
       if (policy.enabled && listener !== 'listening')
         reason = 'The running host listener is not available at its claimed port.';
       else if (policy.enabled && assistant.publicationReady !== true)
-        reason = 'Artifact activation has not completed. Re-run enable to verify and finish activation.';
+        reason =
+          'Artifact activation has not completed. Rerun gws-ea connectors install artifacts to verify and finish activation.';
       // eslint-disable-next-line no-catch-all/no-catch-all -- Optional status never exposes raw API, process or credential failures.
     } catch (cause) {
-      remote = 'unavailable';
+      remote =
+        cause instanceof GwsEaError &&
+        (cause.details?.status === 404 ||
+          [
+            'artifacts_owner_mismatch',
+            'artifacts_zone_invalid',
+            'artifacts_pin_missing',
+            'artifacts_access_mismatch',
+            'artifacts_access_unverified',
+            'artifacts_dns_missing',
+            'artifacts_dns_mismatch',
+            'artifacts_tunnel_invalid',
+            'artifacts_tunnel_unverified',
+          ].includes(cause.code))
+          ? 'mismatch'
+          : 'unavailable';
       listener = 'unavailable';
       reason =
         cause instanceof GwsEaError

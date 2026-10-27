@@ -56,7 +56,7 @@ export async function launchProbeBrowser(
   } = {},
 ): Promise<ProbeBrowser> {
   const root = await mkdtemp(join(tmpdir(), 'nanoclaw-browser-probe-'));
-  const paths = browserPaths(join(root, 'policy.json'));
+  const paths = browserPaths(root);
   let refusingProxy: Awaited<ReturnType<typeof denyAllProxy>> | undefined;
   let owned: OwnedChrome | undefined;
   let connection: ChromeConnection | undefined;

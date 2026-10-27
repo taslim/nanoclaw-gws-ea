@@ -1,3 +1,4 @@
+import * as availability from './availability.js';
 import { mkdtemp, rm } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -26,18 +27,19 @@ import * as startup from './start-sweep.js';
 import * as chrome from './chrome.js';
 import * as connection from './connection.js';
 import { JobWindows } from './windows.js';
-import { browserPaths, ensureBrowserPaths, writePrivateFile } from './paths.js';
+import { browserPaths, ensureBrowserPaths } from './paths.js';
 
 let root: string;
 let runtime: BrowserRuntime;
 let file: string;
 beforeEach(async () => {
   root = await mkdtemp(path.join(os.tmpdir(), 'browser-lifecycle-'));
-  file = path.join(root, 'browser', 'policy.json');
-  runtime = new BrowserRuntime(file);
+  file = path.join(root, 'browser');
+  runtime = new BrowserRuntime(file, undefined, process.env.GWS_EA_BROWSER_TEST_CHROME ?? process.execPath);
 });
 afterEach(async () => {
   await runtime.stop();
+  vi.restoreAllMocks();
   vi.unstubAllEnvs();
   await rm(root, { recursive: true, force: true });
 });
@@ -218,7 +220,7 @@ describe('optional host browser lifecycle', () => {
 
   it('does not admit a browser while Playwright protocol diagnostics can expose credentials', async () => {
     await ensureBrowserPaths(browserPaths(file));
-    await writePrivateFile(file, JSON.stringify({ schemaVersion: 1, enabled: true }));
+
     const spawn = vi.spyOn(chrome, 'spawnChrome').mockImplementation(() => {
       throw new Error('Would spawn Chrome while protocol diagnostics are enabled');
     });
@@ -228,7 +230,8 @@ describe('optional host browser lifecycle', () => {
       await expect(runtime.connection()).rejects.toMatchObject({ code: 'browser_unavailable' });
       expect(spawn).not.toHaveBeenCalled();
       expect(runtime.state()).toMatchObject({
-        enabled: true,
+        configured: true,
+        available: true,
         proxy: { state: 'stopped' },
         lastFailure: { reason: 'browser_unavailable' },
       });
@@ -236,57 +239,55 @@ describe('optional host browser lifecycle', () => {
       spawn.mockRestore();
     }
   });
-  it('does no browser work without an enabled policy', async () => {
+  it('does no browser work without a configured root', async () => {
+    runtime = new BrowserRuntime('');
     await runtime.reconcile();
     expect(runtime.state()).toMatchObject({
-      enabled: false,
+      configured: false,
+      available: false,
       proxy: { state: 'stopped' },
       chrome: { state: 'stopped' },
     });
     await expect(runtime.pageForJob('job')).rejects.toMatchObject({ code: 'browser_unavailable' });
   });
-  it('prewarms the public proxy with no job or token and stops it on policy disable', async () => {
+  it('prewarms the public proxy with no job or token and stops it on Chrome removal', async () => {
     await ensureBrowserPaths(browserPaths(file));
-    await writePrivateFile(file, JSON.stringify({ schemaVersion: 1, enabled: true }));
+
     await runtime.reconcile();
     const state = runtime.state();
     expect(state).toMatchObject({
-      enabled: true,
+      configured: true,
+      available: true,
       proxy: { state: 'listening' },
       chrome: { state: 'stopped' },
       windows: 0,
     });
     if (state.proxy.state !== 'listening') throw new Error('Proxy not started');
     expect(await listening(state.proxy.port)).toBe(true);
-    await writePrivateFile(file, JSON.stringify({ schemaVersion: 1, enabled: false }));
+    vi.spyOn(availability, 'browserAvailability').mockResolvedValue({ available: false, reason: 'chrome-missing' });
     await runtime.reconcile();
     expect(await listening(state.proxy.port)).toBe(false);
-    expect(runtime.state()).toMatchObject({ enabled: false, proxy: { state: 'stopped' } });
+    expect(runtime.state()).toMatchObject({ configured: true, available: false, proxy: { state: 'stopped' } });
   });
-  it('never reopens the proxy after host shutdown even while the policy stays enabled', async () => {
+  it('never reopens the proxy after host shutdown even while the Chrome stays available', async () => {
     await ensureBrowserPaths(browserPaths(file));
-    await writePrivateFile(file, JSON.stringify({ schemaVersion: 1, enabled: true }));
+
     await runtime.reconcile();
     await runtime.shutdown();
     await runtime.reconcile();
     await expect(runtime.connection()).rejects.toMatchObject({ code: 'browser_unavailable' });
     expect(runtime.state().proxy).toEqual({ state: 'stopped' });
   });
-  it('keeps messaging-host health available when its owned Chrome cannot spawn', async () => {
+  it('keeps messaging-host health available when Chrome is missing', async () => {
+    runtime = new BrowserRuntime(file, undefined, '/no-such-browser-runtime/chrome');
     await ensureBrowserPaths(browserPaths(file));
-    await writePrivateFile(
-      file,
-      JSON.stringify({
-        schemaVersion: 1,
-        enabled: true,
-        chromePath: '/no-such-browser-runtime/chrome',
-      }),
-    );
+
     await expect(runtime.pageForJob('job')).rejects.toMatchObject({ code: 'browser_unavailable' });
     expect(runtime.state()).toMatchObject({
-      enabled: true,
-      chrome: { state: 'unavailable' },
-      lastFailure: { reason: 'browser_unavailable' },
+      configured: true,
+      available: false,
+      chrome: { state: 'stopped' },
+      reason: expect.stringContaining('Chrome is not installed'),
     });
   });
   it('registers the exact native actions once and reads host-only health without initializing them again', async () => {
@@ -311,6 +312,7 @@ describe('optional host browser lifecycle', () => {
     for (const name of names)
       if (internal.has(name)) expect(delivery.getDeliveryAction(name)).toBeUndefined();
       else expect(delivery.getDeliveryAction(name)).toBeTypeOf('function');
+    await initTestDb();
     const health = lookup('gws-ea-browser-health');
     expect(health).toMatchObject({ access: 'hidden', hostOnly: true });
     if (!health) throw new Error('Expected native health command');
@@ -321,8 +323,9 @@ describe('optional host browser lifecycle', () => {
       for (let index = 0; index < 2; index++)
         expect(await health.handler(health.parseArgs({}), { caller: 'host' })).toMatchObject({
           schemaVersion: 1,
-          policyVersions: [1, 2],
-          enabled: false,
+
+          configured: false,
+          available: false,
           proxy: { state: 'stopped' },
           chrome: { state: 'stopped' },
         });
@@ -330,6 +333,7 @@ describe('optional host browser lifecycle', () => {
       expect(reconcile).not.toHaveBeenCalled();
       expect(getHostStartCallbacks()).toEqual(callbacks);
     } finally {
+      await closeDb();
       registration.mockRestore();
       reconcile.mockRestore();
     }
@@ -339,14 +343,7 @@ describe('optional host browser lifecycle', () => {
     async () => {
       vi.stubEnv('PATH', '/usr/local/bin:/usr/bin:/bin');
       await ensureBrowserPaths(browserPaths(file));
-      await writePrivateFile(
-        file,
-        JSON.stringify({
-          schemaVersion: 1,
-          enabled: true,
-          chromePath: process.env.GWS_EA_BROWSER_TEST_CHROME,
-        }),
-      );
+
       const [first, second] = await Promise.all([runtime.pageForJob('first'), runtime.pageForJob('second')]);
       expect(first).not.toBe(second);
       expect(first.viewportSize()).toBeNull();
@@ -366,14 +363,7 @@ describe('optional host browser lifecycle', () => {
     'stops the owned Chrome after its connection loses target setup',
     async () => {
       await ensureBrowserPaths(browserPaths(file));
-      await writePrivateFile(
-        file,
-        JSON.stringify({
-          schemaVersion: 1,
-          enabled: true,
-          chromePath: process.env.GWS_EA_BROWSER_TEST_CHROME,
-        }),
-      );
+
       const connect = connection.connectChrome;
       const spawn = vi.spyOn(chrome, 'spawnChrome');
       vi.spyOn(connection, 'connectChrome').mockImplementationOnce(async (child, paths) => {
@@ -399,7 +389,7 @@ describe('optional host browser lifecycle', () => {
   );
   it('bounds a stalled attach and disposes a late success without publishing it', async () => {
     await ensureBrowserPaths(browserPaths(file));
-    await writePrivateFile(file, JSON.stringify({ schemaVersion: 1, enabled: true }));
+
     await runtime.reconcile();
     const child = Object.assign(new EventEmitter(), { pid: 12345, exitCode: null as number | null, signalCode: null });
     vi.spyOn(chrome, 'spawnChrome').mockResolvedValue({ child: child as ChildProcess, debuggerPort: 45679 });
@@ -441,48 +431,59 @@ describe('optional host browser lifecycle', () => {
     }
   });
 
-  it.each(['shutdown', 'disable'] as const)('cancels pending setup on %s and closes a later attach', async (action) => {
-    await ensureBrowserPaths(browserPaths(file));
-    await writePrivateFile(file, JSON.stringify({ schemaVersion: 1, enabled: true }));
-    await runtime.reconcile();
-    const child = Object.assign(new EventEmitter(), { pid: 12345, exitCode: null as number | null, signalCode: null });
-    vi.spyOn(chrome, 'spawnChrome').mockResolvedValue({ child: child as ChildProcess, debuggerPort: 45679 });
-    vi.spyOn(chrome, 'stopChrome').mockImplementation(async () => {
-      child.exitCode = 0;
-      child.emit('exit', 0, null);
-    });
-    let entered!: () => void;
-    const connecting = new Promise<void>((resolve) => {
-      entered = resolve;
-    });
-    let resolveConnection!: (attached: connection.ChromeConnection) => void;
-    vi.spyOn(connection, 'connectChrome').mockImplementation(() => {
-      entered();
-      return new Promise((resolve) => {
-        resolveConnection = resolve;
-      });
-    });
-    const close = vi.fn(async () => undefined);
-    const pending = runtime.connection();
-    const rejected = expect(pending).rejects.toMatchObject({ code: 'browser_unavailable' });
-    try {
-      await connecting;
-      if (action === 'disable') await writePrivateFile(file, JSON.stringify({ schemaVersion: 1, enabled: false }));
-      await (action === 'shutdown' ? runtime.shutdown() : runtime.reconcile());
-      await rejected;
-      expect(child.exitCode).toBe(0);
-      expect(runtime.state()).toMatchObject({ ready: false, proxy: { state: 'stopped' }, windows: 0 });
-      resolveConnection({ child, close } as unknown as connection.ChromeConnection);
-      await vi.waitFor(() => expect(close).toHaveBeenCalledOnce());
-      expect(runtime.state().chrome.state).not.toBe('running');
-    } finally {
-      vi.restoreAllMocks();
-    }
-  });
+  it.each(['shutdown', 'chrome-removed'] as const)(
+    'cancels pending setup on %s and closes a later attach',
+    async (action) => {
+      await ensureBrowserPaths(browserPaths(file));
 
-  it('keeps the single startup deadline through background policy admission and retires before client disposal', async () => {
+      await runtime.reconcile();
+      const child = Object.assign(new EventEmitter(), {
+        pid: 12345,
+        exitCode: null as number | null,
+        signalCode: null,
+      });
+      vi.spyOn(chrome, 'spawnChrome').mockResolvedValue({ child: child as ChildProcess, debuggerPort: 45679 });
+      vi.spyOn(chrome, 'stopChrome').mockImplementation(async () => {
+        child.exitCode = 0;
+        child.emit('exit', 0, null);
+      });
+      let entered!: () => void;
+      const connecting = new Promise<void>((resolve) => {
+        entered = resolve;
+      });
+      let resolveConnection!: (attached: connection.ChromeConnection) => void;
+      vi.spyOn(connection, 'connectChrome').mockImplementation(() => {
+        entered();
+        return new Promise((resolve) => {
+          resolveConnection = resolve;
+        });
+      });
+      const close = vi.fn(async () => undefined);
+      const pending = runtime.connection();
+      const rejected = expect(pending).rejects.toMatchObject({ code: 'browser_unavailable' });
+      try {
+        await connecting;
+        if (action === 'chrome-removed')
+          vi.spyOn(availability, 'browserAvailability').mockResolvedValue({
+            available: false,
+            reason: 'chrome-missing',
+          });
+        await (action === 'shutdown' ? runtime.shutdown() : runtime.reconcile());
+        await rejected;
+        expect(child.exitCode).toBe(0);
+        expect(runtime.state()).toMatchObject({ ready: false, proxy: { state: 'stopped' }, windows: 0 });
+        resolveConnection({ child, close } as unknown as connection.ChromeConnection);
+        await vi.waitFor(() => expect(close).toHaveBeenCalledOnce());
+        expect(runtime.state().chrome.state).not.toBe('running');
+      } finally {
+        vi.restoreAllMocks();
+      }
+    },
+  );
+
+  it('keeps the single startup deadline through background browser admission and retires before client disposal', async () => {
     await ensureBrowserPaths(browserPaths(file));
-    await writePrivateFile(file, JSON.stringify({ schemaVersion: 1, enabled: true }));
+
     await runtime.reconcile();
     const child = Object.assign(new EventEmitter(), { pid: 12345, exitCode: null as number | null, signalCode: null });
     vi.spyOn(chrome, 'spawnChrome').mockResolvedValue({ child: child as ChildProcess, debuggerPort: 45679 });
@@ -535,11 +536,12 @@ describe('optional host browser lifecycle', () => {
       const db = await initTestDb();
       vi.spyOn(scheduling, 'repairBrowserWatchChecks').mockResolvedValue();
       await ensureBrowserPaths(browserPaths(file));
-      await writePrivateFile(
-        file,
-        JSON.stringify({ schemaVersion: 1, enabled: true, chromePath: process.env.GWS_EA_BROWSER_TEST_CHROME }),
+
+      vi.stubEnv('GWS_EA_BROWSER_ROOT', file);
+      const inspectAvailability = availability.browserAvailability;
+      vi.spyOn(availability, 'browserAvailability').mockImplementation((root) =>
+        inspectAvailability(root, process.env.GWS_EA_BROWSER_TEST_CHROME),
       );
-      vi.stubEnv('GWS_EA_BROWSER_POLICY_FILE', file);
       vi.spyOn(signInMail, 'recoverBrowserSignInMail').mockResolvedValue();
       vi.spyOn(signInMail, 'cleanupBrowserSignInMail').mockResolvedValue();
       vi.spyOn(startup, 'sweepBrowserStartup').mockResolvedValue();

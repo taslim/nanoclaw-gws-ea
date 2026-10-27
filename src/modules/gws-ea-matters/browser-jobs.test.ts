@@ -198,12 +198,7 @@ it("never links another agent's browser job into main's matters", async () => {
     created_at: new Date().toISOString(),
   });
   fs.mkdirSync(`${root}/browser`, { recursive: true, mode: 0o700 });
-  fs.writeFileSync(
-    `${root}/browser/policy.json`,
-    JSON.stringify({ schemaVersion: 2, enabled: true, agentGroupIds: ['main', 'research'] }),
-    { mode: 0o600 },
-  );
-  vi.stubEnv('GWS_EA_BROWSER_POLICY_FILE', `${root}/browser/policy.json`);
+  vi.stubEnv('GWS_EA_BROWSER_ROOT', `${root}/browser`);
   try {
     const foreign = 'system:a2a:research:desk-job';
     await resolveSystemSession('browser', foreign);

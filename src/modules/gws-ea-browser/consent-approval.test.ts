@@ -1,3 +1,4 @@
+import { useAvailableBrowser } from './testing/browser-runtime.js';
 import { createBrowserQueue, recoverAndStartBrowserQueue } from './index.js';
 /** The principal's side of the consent engine: real approvals, delivery, central DB and mailbox. Only the container wake is mocked. */
 import fs from 'node:fs';
@@ -57,10 +58,11 @@ let sent: Array<{ platformId: string; content: string }>;
 let page: Page | undefined;
 
 beforeEach(async () => {
+  useAvailableBrowser();
   fs.rmSync(root, { recursive: true, force: true });
   fs.mkdirSync(`${root}/browser`, { recursive: true });
-  fs.writeFileSync(`${root}/browser/policy.json`, JSON.stringify({ schemaVersion: 1, enabled: true }), { mode: 0o600 });
-  process.env.GWS_EA_BROWSER_POLICY_FILE = `${root}/browser/policy.json`;
+
+  process.env.GWS_EA_BROWSER_ROOT = `${root}/browser`;
   await runMigrations(await initTestDb());
   for (const id of ['main-p', 'browser-p', 'other-p'])
     await createAgentGroup({ id, name: id, folder: id, agent_provider: null, created_at: new Date().toISOString() });
@@ -126,7 +128,7 @@ afterEach(async () => {
   await queue?.stop();
   await page?.context().close();
   page = undefined;
-  delete process.env.GWS_EA_BROWSER_POLICY_FILE;
+  delete process.env.GWS_EA_BROWSER_ROOT;
   await closeDb();
   fs.rmSync(root, { recursive: true, force: true });
 });

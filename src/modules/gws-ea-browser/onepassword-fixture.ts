@@ -195,7 +195,7 @@ export class FakeOnePassword {
 }
 
 export interface VaultFixtureFiles {
-  readonly browserPolicyFile: string;
+  readonly browserRoot: string;
   readonly onePasswordPolicyFile: string;
   readonly tokenFile: string;
 }
@@ -231,7 +231,7 @@ export async function writeVaultFixture(directory: string): Promise<VaultFixture
   });
   await writePrivateFile(files.runtimeTokenFile, FIXTURE_TOKEN);
   return {
-    browserPolicyFile: path.join(instanceRoot, 'browser', 'policy.json'),
+    browserRoot: path.join(instanceRoot, 'browser'),
     onePasswordPolicyFile,
     tokenFile: files.runtimeTokenFile,
   };

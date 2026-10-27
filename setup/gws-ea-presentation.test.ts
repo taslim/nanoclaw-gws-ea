@@ -27,16 +27,16 @@ function invoke(args: readonly string[], env: NodeJS.ProcessEnv = environment())
 
 describe('actual driver streams', () => {
   it('retains the same plain observation under redirected, quiet, and NO_COLOR output', async () => {
-    const plain = await invoke(['capabilities', 'check', 'voice']);
-    const quiet = await invoke(['capabilities', 'check', 'voice', '--quiet']);
-    const noColor = await invoke(['capabilities', 'check', 'voice'], {
+    const plain = await invoke(['connectors', 'show', 'voice']);
+    const quiet = await invoke(['connectors', 'show', 'voice', '--quiet']);
+    const noColor = await invoke(['connectors', 'show', 'voice'], {
       ...environment(),
       NO_COLOR: '1',
       FORCE_COLOR: '3',
     });
     for (const result of [plain, quiet, noColor]) {
       expect(result.stdout).toContain('voice (host)');
-      expect(result.stdout).toContain('activation: disabled');
+      expect(result.stdout).toContain('not installed');
       expect(result.stdout).toContain('Observed:');
       expect(result.stdout).not.toMatch(/\x1b\[/u);
       expect(
@@ -53,16 +53,16 @@ describe('actual driver streams', () => {
   });
 
   it('prints one UTC machine observation and no diagnostic or question', async () => {
-    const { stdout, stderr } = await invoke(['capabilities', 'check', 'voice', '--json', '--no-input']);
+    const { stdout, stderr } = await invoke(['connectors', 'show', 'voice', '--json', '--no-input']);
     expect(JSON.parse(stdout)).toMatchObject({
       schema_version: 1,
-      command: 'capabilities check',
+      command: 'connectors show voice',
       outcome: 'succeeded',
       changed: false,
       data: {
         observed_at: expect.stringMatching(/^\d{4}-\d\d-\d\dT.*Z$/u),
-        activation: { enabled: false },
-        assets: { status: 'absent' },
+        setup: 'not_installed',
+        readiness: { status: 'not_checked', checked: false },
       },
     });
     expect(stderr).toBe('');

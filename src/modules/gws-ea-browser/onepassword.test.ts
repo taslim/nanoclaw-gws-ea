@@ -32,7 +32,7 @@ const SECRET = 'fixture-password-private';
 let directory: string;
 let instanceRoot: string;
 let onePasswordPolicyFile: string;
-let browserPolicyFile: string;
+let browserRoot: string;
 let tokenFile: string;
 let resourceFile: string;
 let markerFile: string;
@@ -67,7 +67,7 @@ const hostPolicy = (enabled = true) => ({
   cliPath: '/opt/homebrew/bin/op',
   managementServiceAccountId: MANAGEMENT_ID,
 });
-const vault = (): BrowserVault => new BrowserVault({ browserPolicyFile, onePasswordPolicyFile });
+const vault = (): BrowserVault => new BrowserVault({ browserRoot, onePasswordPolicyFile });
 const requests = (): number =>
   [sdk.create, sdk.vaults, sdk.list, sdk.resolve].reduce((total, call) => total + call.mock.calls.length, 0);
 
@@ -79,7 +79,7 @@ beforeEach(async () => {
   await writeOnePasswordHostPolicy(onePasswordPolicyFile, hostPolicy());
   instanceRoot = path.join(directory, INSTANCE_ID.slice(0, 8));
   await mkdir(instanceRoot, { mode: 0o700 });
-  browserPolicyFile = path.join(instanceRoot, 'browser', 'policy.json');
+  browserRoot = path.join(instanceRoot, 'browser');
   markerFile = path.join(instanceRoot, 'state', 'data', 'gws-ea', 'instance.json');
   await writePrivateFile(markerFile, JSON.stringify({ schema_version: 1, instance_id: INSTANCE_ID }));
   ({ runtimeTokenFile: tokenFile, resourceFile } = onePasswordInstancePaths(instanceRoot));
@@ -189,7 +189,7 @@ describe('availability from the provisioned resources', () => {
     await writeOnePasswordResources(resourceFile, resources());
     await rm(onePasswordPolicyFile);
     expect(await vault().availability()).toEqual({ status: 'unavailable', reason: 'not_enabled' });
-    expect(await new BrowserVault({ browserPolicyFile, onePasswordPolicyFile: '' }).availability()).toEqual({
+    expect(await new BrowserVault({ browserRoot, onePasswordPolicyFile: '' }).availability()).toEqual({
       status: 'unavailable',
       reason: 'not_enabled',
     });
@@ -248,12 +248,12 @@ describe('availability from the provisioned resources', () => {
     expect(await vault().availability()).toEqual({ status: 'unavailable', reason: 'invalid_state' });
     await writePrivateFile(markerFile, JSON.stringify({ schema_version: 1, instance_id: INSTANCE_ID }));
     for (const located of ['', path.join(instanceRoot, 'policy.json'), path.join(instanceRoot, 'browser', 'x.json')])
-      expect(await new BrowserVault({ browserPolicyFile: located, onePasswordPolicyFile }).availability()).toEqual({
+      expect(await new BrowserVault({ browserRoot: located, onePasswordPolicyFile }).availability()).toEqual({
         status: 'unavailable',
         reason: 'invalid_state',
       });
     await expect(
-      new BrowserVault({ browserPolicyFile: '', onePasswordPolicyFile }).itemsForOrigin('https://shop.example'),
+      new BrowserVault({ browserRoot: '', onePasswordPolicyFile }).itemsForOrigin('https://shop.example'),
     ).rejects.toMatchObject({ reason: 'vault_unavailable' });
     expect(sdk.create).not.toHaveBeenCalled();
     expect(await vault().availability()).toMatchObject({ status: 'available' });

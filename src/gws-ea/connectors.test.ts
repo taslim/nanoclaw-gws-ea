@@ -4,7 +4,7 @@ import path from 'node:path';
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
-import { inspectVoiceCapability } from './capabilities.js';
+import { inspectVoiceCapability } from './voice-inspection.js';
 import { resolveControlPlanePaths } from './paths.js';
 
 let root: string;
@@ -25,7 +25,7 @@ describe('shipped voice capability catalog', () => {
     expect(voice).toMatchObject({
       name: 'voice',
       observed_at: expect.stringMatching(/^\d{4}-\d\d-\d\dT.*Z$/u),
-      actions: ['show', 'check', 'install', 'enable', 'disable', 'uninstall'],
+      actions: ['install', 'uninstall', 'show', 'check'],
       scope: 'host',
       availability: { status: 'unsupported', platform: 'win32' },
       activation: { status: 'disabled', enabled: false },

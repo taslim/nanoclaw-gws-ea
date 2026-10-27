@@ -13,10 +13,11 @@ import {
 } from '../approvals/index.js';
 import { registerApprovalResolvedHandler } from '../approvals/primitive.js';
 import { isVerifiedPrincipalUser, principalApproverUserId } from '../gws-ea-profile/db.js';
-import { hasBrowserAccess, readHostBrowserPolicy } from './access.js';
+import { browserAvailability } from './availability.js';
+import { hasBrowserAccess } from './access.js';
 import { PurchaseAuthorityStore, type SpendingAuthority } from './authority.js';
 import { readIsoTime } from './iso-time.js';
-import { browserDelegateGuard, resolveBrowserJob } from './cancel.js';
+import { browserDelegateGuard, browserManagementGuard, resolveBrowserJob } from './cancel.js';
 import { agreementsGranted } from './consent.js';
 import {
   guaranteeCoversReservation,
@@ -166,10 +167,10 @@ const guaranteeGuard = defineGuardedAction({
   grantActionName: GUARANTEE_APPROVAL,
   grantCoversRequest: (grant, input) => grant.payload === JSON.stringify(input.payload),
   async decide({ actor }) {
-    const policy = await readHostBrowserPolicy();
-    if (actor.kind !== 'agent' || !(await hasBrowserAccess(actor.agentGroupId, policy)))
+    const policy = await browserAvailability();
+    if (actor.kind !== 'agent' || !(await hasBrowserAccess(actor.agentGroupId)))
       return DENY('Only an agent with browser access may propose a reservation guarantee.');
-    if (!policy.enabled) return DENY('Browser is disabled.');
+    if (!policy.available) return DENY('Browser is unavailable; ask your operator to check Chrome.');
     const principal = await principalApproverUserId();
     return principal
       ? HOLD('Only the principal can authorize a standing reservation guarantee.', principal)
@@ -268,10 +269,8 @@ export async function reservationGuaranteeRequest(
   session: Session,
   requestId: string,
 ): Promise<Record<string, unknown>> {
-  const policy = await readHostBrowserPolicy();
-  if (!(await hasBrowserAccess(session.agent_group_id, policy)))
+  if (!(await hasBrowserAccess(session.agent_group_id)))
     throw forbidden('Only an agent with browser access may manage reservation guarantees.');
-  if (!policy.enabled) throw forbidden('Browser is disabled.');
   if (Object.keys(content).some((key) => !['action', 'requestId', 'operation', 'currency', 'max_total'].includes(key)))
     throw invalidArgs('Unknown reservation_guarantee field.');
   const operation = content.operation;
@@ -314,6 +313,8 @@ export async function reservationGuaranteeRequest(
       await finishApprovalWithdrawal(row, 'Withdrawn: the standing reservation guarantee was revoked.');
     return { status: 'revoked' };
   }
+  if (!(await browserAvailability()).available)
+    throw forbidden('Browser is unavailable; ask your operator to check Chrome.');
   if (
     typeof content.currency !== 'string' ||
     !/^[A-Z]{3}$/u.test(content.currency) ||
@@ -402,6 +403,6 @@ export function registerReservationGuaranteeDelivery(): void {
   registerDeliveryAction(
     'reservation_guarantee',
     answeringAction('reservation_guarantee', reservationGuaranteeRequest),
-    answeredGuard(browserDelegateGuard),
+    answeredGuard(browserManagementGuard),
   );
 }

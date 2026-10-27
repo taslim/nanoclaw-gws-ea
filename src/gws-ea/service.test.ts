@@ -106,22 +106,20 @@ async function fixture(): Promise<{ config: InstanceRuntimeConfig; home: string;
 }
 
 describe('GWS-EA instance runtime', () => {
-  it('persists the derived per-assistant browser policy locator without persisting browser state', async () => {
+  it('persists the derived per-assistant browser root locator without persisting browser state', async () => {
     const { config } = await fixture();
     await persistInstanceRuntime(config, upsertEnvVars);
-    const policy = path.join(config.instance_root, 'browser', 'policy.json');
-    expect(await readFile(path.join(config.state_root, '.env'), 'utf8')).toContain(
-      `GWS_EA_BROWSER_POLICY_FILE=${policy}\n`,
-    );
+    const policy = path.join(config.instance_root, 'browser');
+    expect(await readFile(path.join(config.state_root, '.env'), 'utf8')).toContain(`GWS_EA_BROWSER_ROOT=${policy}\n`);
     const stored: unknown = JSON.parse(
       await readFile(path.join(config.state_root, 'data/gws-ea/runtime.json'), 'utf8'),
     );
     expect(JSON.stringify(stored)).not.toContain('browser');
     await expect(stat(path.join(config.instance_root, 'browser'))).rejects.toMatchObject({ code: 'ENOENT' });
     await persistInstanceRuntime(config, upsertEnvVars);
-    expect(
-      (await readFile(path.join(config.state_root, '.env'), 'utf8')).match(/GWS_EA_BROWSER_POLICY_FILE=/gu),
-    ).toHaveLength(1);
+    expect((await readFile(path.join(config.state_root, '.env'), 'utf8')).match(/GWS_EA_BROWSER_ROOT=/gu)).toHaveLength(
+      1,
+    );
   });
   it("binds the custom root's shared host policy locators, voice and 1Password, without adding per-assistant runtime state", async () => {
     const { config } = await fixture();
@@ -461,7 +459,7 @@ describe('GWS-EA instance runtime', () => {
         `NANOCLAW_EGRESS_NETWORK=${config.agent_egress_network}`,
         `ONECLI_GATEWAY_CONTAINER=${config.onecli_gateway_container}`,
         `ONECLI_URL=${config.onecli_app_url}`,
-        `GWS_EA_BROWSER_POLICY_FILE=${path.join(config.instance_root, 'browser', 'policy.json')}`,
+        `GWS_EA_BROWSER_ROOT=${path.join(config.instance_root, 'browser')}`,
         `GWS_EA_ARTIFACTS_POLICY_FILE=${path.join(config.instance_root, 'artifacts', 'policy.json')}`,
       ].sort(),
     );

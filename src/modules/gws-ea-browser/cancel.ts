@@ -1,7 +1,7 @@
 /** Browser job reads as well as cancellation. */
 import { formatLocalTimeWithZone } from '../../timezone.js';
 import { detachBrowserWatchCards } from './watch-state.js';
-import { answeredGuard, answeringAction, forbidden, invalidArgs } from '../../cli/delivery-action.js';
+import { answeredGuard, answeringAction, invalidArgs } from '../../cli/delivery-action.js';
 import { getSession, updateSession } from '../../db/sessions.js';
 import { getDb } from '../../db/connection.js';
 import { registerDeliveryAction } from '../../delivery.js';
@@ -12,7 +12,8 @@ import { readPendingSignInSite } from '../gws-ea-inbox/claims.js';
 import { attemptSummary } from './notices.js';
 import { getBrowserAgentGroupId } from '../gws-ea-profile/db.js';
 import type { DbDriver } from '../../db/driver.js';
-import { errandSource, hasBrowserAccess, readHostBrowserPolicy } from './access.js';
+import { browserAvailability } from './availability.js';
+import { errandSource, hasBrowserAccess } from './access.js';
 import { BrowserStore, type BrowserJob } from './db.js';
 import { credentialAttempts, type CredentialAttempt } from './credential-attempts.js';
 import { heldCredentialSites, SiteLeaseStore } from './leases.js';
@@ -426,27 +427,34 @@ export async function sweepBrowserJobSessions(
 export const browserDelegateGuard = defineGuardedAction({
   action: 'gws_ea_browser.delegate',
   async decide({ actor }) {
-    const policy = await readHostBrowserPolicy();
-    if (actor.kind !== 'agent' || !(await hasBrowserAccess(actor.agentGroupId, policy)))
+    const policy = await browserAvailability();
+    if (actor.kind !== 'agent' || !(await hasBrowserAccess(actor.agentGroupId)))
       return DENY('Only an agent with browser access may manage browser jobs.');
-    if (!policy.enabled) return DENY('The operator needs to enable the browser for this assistant.');
+    if (!policy.available) return DENY('Browser is unavailable; ask your operator to check Chrome.');
     return ALLOW('An agent with browser access manages its own browser errands.');
   },
 });
 
-/** Other delegate actions register their own handlers against the same `browserDelegateGuard`. */
+/** Local job management remains available when the browser prerequisite is unavailable. */
+export const browserManagementGuard = defineGuardedAction({
+  action: 'gws_ea_browser.manage',
+  async decide({ actor }) {
+    if (actor.kind !== 'agent' || !(await hasBrowserAccess(actor.agentGroupId)))
+      return DENY('Only an agent with browser access may manage browser jobs.');
+    return ALLOW('An agent with browser access manages its own browser errands.');
+  },
+});
+
 export function registerBrowserCancellationDelivery(queue: () => BrowserQueue): void {
   registerDeliveryAction(
     'cancel_job',
     answeringAction('cancel_job', async (content, session) => {
       if (typeof content.thread !== 'string' || !content.thread) throw invalidArgs('thread is required');
-      if (!(await readHostBrowserPolicy()).enabled)
-        throw forbidden('The operator needs to enable the browser for this assistant.');
       configureBrowserCancellation(queue());
       // Each agent cancels only the errands it opened.
       const result = await cancelBrowserJob(content.thread, undefined, session.agent_group_id);
       return { status: result.status, thread: result.thread };
     }),
-    answeredGuard(browserDelegateGuard),
+    answeredGuard(browserManagementGuard),
   );
 }

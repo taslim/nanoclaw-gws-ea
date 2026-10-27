@@ -8,13 +8,18 @@ import path from 'node:path';
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
+import * as connectorProvisioning from './connector-provisioning.js';
+import { connectorDefinition } from './connectors.js';
+import type { OnePasswordUninstallPreview } from './onepassword-uninstall.js';
+import * as productionProvisioning from './provision.js';
 import { runCli, type CliRuntime, type FailureReport } from './cli.js';
 import type { CreatePromptContext } from './create-input.js';
 import { runStep, withPendingAction, type InteractivePrompts, type PauseResponse } from './events.js';
 import { RECORDED_GCLOUD_REAUTHENTICATION_FAILED } from './fixtures/recordings.js';
 import type { GoogleConnectionContext } from './google-connection.js';
 import { deriveGcpClaims } from './gcp-identity.js';
-import { acquireInstanceOperation, recordStepCompleted, reserveInstance } from './journal.js';
+import { acquireInstanceOperation, readProvisionJournal, recordStepCompleted, reserveInstance } from './journal.js';
+import { getInstanceReservation } from './registry.js';
 import { createOnecliRuntimeLayout } from './onecli-compose.js';
 import { advanceOperation, beginOperation } from './operation.js';
 import { resolveControlPlanePaths, type ControlPlanePaths } from './paths.js';
@@ -376,7 +381,7 @@ describe('host-wide optional voice commands', () => {
       return append(...args);
     });
     const exit = await runCli(
-      ['capabilities', 'install', 'voice', '--cmake', path.join(paths.configRoot, 'missing'), '--json'],
+      ['connectors', 'install', 'voice', '--cmake', path.join(paths.configRoot, 'missing'), '--json'],
       { paths, ...io.runtime },
     );
     expect(exit).toBe(1);
@@ -389,7 +394,7 @@ describe('host-wide optional voice commands', () => {
     appendSpy.mockRestore();
     const retry = lines();
     expect(
-      await runCli(['capabilities', 'install', 'voice', '--cmake', path.join(paths.configRoot, 'missing'), '--json'], {
+      await runCli(['connectors', 'install', 'voice', '--cmake', path.join(paths.configRoot, 'missing'), '--json'], {
         paths,
         ...retry.runtime,
       }),
@@ -402,19 +407,19 @@ describe('host-wide optional voice commands', () => {
     const io = lines();
     const cmake = path.join(paths.configRoot, 'missing cmake');
     expect(
-      await runCli(['capabilities', 'install', 'voice', '--model', 'small', '--cmake', cmake, '--json'], {
+      await runCli(['connectors', 'install', 'voice', '--model', 'small', '--cmake', cmake, '--json'], {
         paths,
         ...io.runtime,
         environment: { PATH: paths.configRoot },
       }),
     ).toBe(1);
     const result = JSON.parse(io.out.join('\n')) as { diagnostics: { run_log: string; step_log: string } };
-    expectResultContract('capabilities install', result);
+    expectResultContract('connectors install voice', result);
     expect(result).toMatchObject({
       error: { code: 'voice_build_prerequisite', message: expect.stringContaining(cmake) },
       next_actions: [
         { kind: 'external', instruction: expect.stringContaining('Correct --cmake') },
-        { kind: 'command', argv: ['gws-ea', 'capabilities', 'install', 'voice', '--model', 'small', '--cmake', cmake] },
+        { kind: 'command', argv: ['gws-ea', 'connectors', 'install', 'voice', '--model', 'small', '--cmake', cmake] },
       ],
       diagnostics: { run_log: expect.any(String), step_log: expect.any(String) },
     });
@@ -430,7 +435,7 @@ describe('host-wide optional voice commands', () => {
       mode: 0o700,
     });
     const io = lines();
-    expect(await runCli(['capabilities', 'install', 'voice', '--cmake', cmake], { paths, ...io.runtime })).toBe(1);
+    expect(await runCli(['connectors', 'install', 'voice', '--cmake', cmake], { paths, ...io.runtime })).toBe(1);
     expect(io.err.join('\n')).toContain('broken developer path');
     expect(io.err.join('\n')).toContain('Log:');
     expect(io.err.join('\n')).toContain('Correct --cmake');
@@ -447,7 +452,7 @@ describe('host-wide optional voice commands', () => {
     const fetch = vi.spyOn(globalThis, 'fetch');
     try {
       expect(
-        await runCli(['capabilities', 'install', 'voice'], {
+        await runCli(['connectors', 'install', 'voice'], {
           paths,
           ...io.runtime,
           environment: { PATH: paths.configRoot },
@@ -462,53 +467,33 @@ describe('host-wide optional voice commands', () => {
       fetch.mockRestore();
     }
   });
-  it('names explicit installation when enabling absent voice assets, without an instance or a download', async () => {
+  it('fails voice check with a structured not-ready result and install recovery', async () => {
     const paths = await testPaths();
-    const stdout: string[] = [];
-    const stderr: string[] = [];
+    const io = lines();
     const fetch = vi.spyOn(globalThis, 'fetch');
     try {
-      expect(
-        await runCli(['capabilities', 'enable', 'voice'], {
-          paths,
-          stdout: (line) => stdout.push(line),
-          stderr: (line) => stderr.push(line),
-        }),
-      ).toBe(1);
-      expect(stderr.join('\n')).toContain('gws-ea capabilities install voice');
-      expect(stderr.join('\n')).not.toContain('Unknown command');
-      expect(fetch).not.toHaveBeenCalled();
-      await expect(readFile(path.join(paths.configRoot, 'voice.json'), 'utf8')).rejects.toMatchObject({
-        code: 'ENOENT',
+      expect(await runCli(['connectors', 'check', 'voice', '--json'], { paths, ...io.runtime })).toBe(1);
+      const result = JSON.parse(io.out.join('\n'));
+      expectResultContract('connectors check voice', result);
+      expect(result).toMatchObject({
+        command: 'connectors check voice',
+        outcome: 'failed',
+        changed: false,
+        error: { code: 'voice_not_ready' },
+        data: { setup: 'not_installed', readiness: { status: 'not_ready', checked: true } },
+        next_actions: expect.arrayContaining([{ kind: 'command', argv: ['gws-ea', 'connectors', 'install', 'voice'] }]),
       });
+      expect(fetch).not.toHaveBeenCalled();
     } finally {
       fetch.mockRestore();
     }
-  });
-
-  it('returns native errors and exact recovery commands for absent assets in JSON', async () => {
-    const paths = await testPaths();
-    const io = lines();
-    expect(await runCli(['capabilities', 'enable', 'voice', '--json'], { paths, ...io.runtime })).toBe(1);
-    expectResultContract('capabilities enable', JSON.parse(io.out.join('\n')));
-    expect(JSON.parse(io.out.join('\n'))).toMatchObject({
-      schema_version: 1,
-      command: 'capabilities enable',
-      outcome: 'failed',
-      changed: false,
-      error: { code: 'voice_not_installed' },
-      next_actions: [
-        { kind: 'command', argv: ['gws-ea', 'capabilities', 'install', 'voice'] },
-        { kind: 'command', argv: ['gws-ea', 'capabilities', 'enable', 'voice'] },
-      ],
-    });
   });
 
   it('rejects per-assistant voice configuration', async () => {
     const paths = await testPaths();
     const stderr: string[] = [];
     expect(
-      await runCli(['capabilities', 'enable', 'voice', '--id', randomUUID()], {
+      await runCli(['connectors', 'install', 'voice', '--id', randomUUID()], {
         paths,
         stdout: () => undefined,
         stderr: (line) => stderr.push(line),
@@ -844,6 +829,35 @@ describe('gws-ea usage', () => {
 });
 
 describe('gws-ea stop summaries and exit codes', () => {
+  it('passes the operator PATH into production create/resume connector provisioning', async () => {
+    const paths = await testPaths();
+    const input = await reserveInstance(paths, reservation());
+    const production = vi
+      .spyOn(productionProvisioning, 'runProductionProvision')
+      .mockResolvedValue({ status: 'paused', pause: DM_PAUSE });
+    try {
+      await runCli(['resume', '--id', input.instance_id], {
+        paths,
+        ...lines().runtime,
+        environment: { PATH: '/operator/custom/bin' },
+        checkPrerequisites: async () => PREREQUISITES,
+        upsertEnvVars: () => undefined,
+        hostStatus: { queryHost: async () => ({}), waitForHost: async () => undefined },
+        serviceHelpers: nanoclawServices({}).helpers,
+      });
+      expect(production).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          onePassword: expect.objectContaining({
+            cli: expect.objectContaining({ searchPath: '/operator/custom/bin' }),
+          }),
+        }),
+      );
+    } finally {
+      production.mockRestore();
+    }
+  });
+
   it('prints the failing step, cause, next action, log paths, and redacted tail, then exits 1', async () => {
     const paths = await testPaths();
     const input = await reserveInstance(paths, reservation());
@@ -1557,6 +1571,65 @@ describe('gws-ea secrets inputs', () => {
 });
 
 describe('gws-ea release sources', () => {
+  it.each([
+    CHAT_PAUSE,
+    { kind: 'human-action', phase: 'sign_in_google', code: 'google_sign_in_required', message: 'Sign in.' },
+    {
+      kind: 'human-action',
+      phase: 'provision_onepassword',
+      code: 'operator_sign_in_needed',
+      message: 'Sign in to 1Password.',
+    },
+  ] satisfies readonly ProvisionHumanPause[])(
+    'retains --skip-alias through create, an earlier $phase pause, and plain resume',
+    async (pause) => {
+      const paths = await testPaths();
+      const output = lines();
+      let first = true;
+      const aliasNcl = vi.fn(async (): Promise<never> => {
+        throw new Error('Skipped identity setup must not contact the alias host');
+      });
+      const runtime: Partial<CliRuntime> = {
+        paths,
+        ...output.runtime,
+        ...createRuntime(),
+        advanceProvision: async (operation, { runtime: reporter }) => {
+          if (!first)
+            return productionProvisioning.provisionAssistantResources(operation, reporter, {}, { ncl: aliasNcl });
+          first = false;
+          const reserved = await getInstanceReservation(paths, operation.instanceId);
+          const home = path.join(paths.configRoot, 'home');
+          await mkdir(home, { mode: 0o700 });
+          const layout = createOnecliRuntimeLayout({
+            instanceId: reserved.instance_id,
+            instanceRoot: paths.instanceRoot(reserved.instance_id),
+            project: reserved.exclusive_resource_claims.onecli_project,
+            appPort: reserved.allocated_ports.onecli_app,
+            gatewayPort: reserved.allocated_ports.onecli_gateway,
+            dockerEndpoint: 'unix:///var/run/docker.sock',
+          });
+          await persistInstanceRuntime(
+            createInstanceRuntimeConfig(paths, reserved, layout, {
+              nodePath: process.execPath,
+              homeDirectory: home,
+              selectedProvider: 'claude',
+              dockerEndpoint: 'unix:///var/run/docker.sock',
+            }),
+            () => undefined,
+          );
+          return { status: 'paused', pause };
+        },
+      };
+      expect(await runCli(['create', '--track', 'dogfood', '--no-input', '--skip-alias'], runtime)).toBe(10);
+      const [instanceId] = Object.keys((await readRegistry(paths)).instances);
+      expect(instanceId).toBeDefined();
+      expect(await runCli(['resume', '--id', instanceId, '--no-input'], runtime)).toBe(0);
+      expect((await readProvisionJournal(paths, instanceId)).decisions.alias_skipped_at).toEqual(expect.any(String));
+      expect(aliasNcl).not.toHaveBeenCalled();
+      expect((await getInstanceReservation(paths, instanceId)).exclusive_resource_claims.alias_email).toBeUndefined();
+    },
+  );
+
   it("installs dogfood from the public repository's integration branch without asking for a remote", async () => {
     const paths = await testPaths();
     const resolved: CreateTargetRequest[] = [];
@@ -2353,6 +2426,35 @@ describe('gws-ea start, stop, and restart', () => {
     },
   );
 
+  it.each(['start', 'restart'] as const)(
+    '%s keeps the assistant ready when optional connector setup is pending',
+    async (command) => {
+      const paths = await testPaths();
+      const a = await createdAssistant(paths, 35001);
+      const { helpers } = nanoclawServices({ [a.install_id]: true });
+      const io = lines();
+      const provision = vi.spyOn(connectorProvisioning, 'provisionInstalledConnectors').mockResolvedValue({
+        pending: [{ name: 'onepassword', reason: 'operator_sign_in_needed', message: 'Operator sign-in is needed.' }],
+        next_actions: [{ kind: 'command', argv: ['gws-ea', 'connectors', 'install', 'onepassword'] }],
+      });
+      try {
+        expect(
+          await runCli([command, '--id', a.instance_id, '--json'], { paths, ...io.runtime, serviceHelpers: helpers }),
+        ).toBe(0);
+        const result = JSON.parse(io.out.join('\n'));
+        expectResultContract(command, result);
+        expect(result).toMatchObject({
+          outcome: 'succeeded',
+          next_actions: [{ kind: 'command', argv: ['gws-ea', 'connectors', 'install', 'onepassword'] }],
+        });
+        expect(provision).toHaveBeenCalledOnce();
+        expect(provision.mock.calls[0][2]?.onePassword?.operatorTerminal).toBe(false);
+      } finally {
+        provision.mockRestore();
+      }
+    },
+  );
+
   it('fails a start whose host never answers on its CLI socket, naming where its errors are', async () => {
     const paths = await testPaths();
     const a = await createdAssistant(paths, 35_001);
@@ -3082,6 +3184,91 @@ describe('gws-ea WhatsApp operator commands', () => {
       expect(JSON.parse(io.out.join('\n')).data.state).toBe(
         operation === 'link' ? 'linking' : operation === 'unlink' ? 'unlinked' : 'needs-relink',
       );
+    },
+  );
+});
+
+describe('connector uninstall operator output', () => {
+  it('shows each paused vault deletion decision and unknown counts in human output', async () => {
+    const paths = await testPaths();
+    const io = lines();
+    const preview: OnePasswordUninstallPreview = {
+      account_id: 'account',
+      management_service_account_id: 'management',
+      management_creation_unproven: false,
+      vaults: [
+        {
+          instance_id: '11111111-1111-4111-8111-111111111111',
+          account_id: 'account',
+          vault_id: 'vault-delete',
+          owned: true,
+          item_count: 7,
+          vault: 'delete',
+          reason: 'Its deletion was chosen for this owned vault.',
+          runtime_service_account_ids: [],
+          unproven: [],
+          credential_attempts: 3,
+        },
+        {
+          instance_id: '22222222-2222-4222-8222-222222222222',
+          account_id: 'account',
+          vault_id: 'vault-keep',
+          owned: false,
+          item_count: null,
+          vault: 'retain',
+          reason: 'This host management account did not create it.',
+          runtime_service_account_ids: [],
+          unproven: [],
+          credential_attempts: null,
+        },
+      ],
+    };
+    vi.spyOn(connectorDefinition('onepassword'), 'uninstall').mockResolvedValue({
+      name: 'onepassword',
+      scope: 'host',
+      outcome: 'paused',
+      changed: false,
+      preview,
+      assistants: [],
+      receipt_file: null,
+      revoke_service_account_ids: [],
+      reason: 'Confirm deletion of the owned vaults.',
+    });
+    expect(await runCli(['connectors', 'uninstall', 'onepassword', '--no-input'], { paths, ...io.runtime })).toBe(10);
+    const output = io.out.join('\n');
+    expect(output).toMatch(/DELETE.*11111111-1111-4111-8111-111111111111.*vault-delete.*items 7.*credential work 3/u);
+    expect(output).toMatch(
+      /KEEP.*22222222-2222-4222-8222-222222222222.*vault-keep.*items unknown.*credential work unknown/u,
+    );
+    expect(output).toContain('This host management account did not create it.');
+    expect(output).not.toContain('items 0');
+  });
+
+  it.each([false, true])(
+    'retains artifacts operator cleanup actions in human and JSON output (json=%s)',
+    async (json) => {
+      const paths = await testPaths();
+      const io = lines();
+      const instruction = 'Revoke the Cloudflare management API token, then delete the original --credential-file.';
+      vi.spyOn(connectorDefinition('artifacts'), 'uninstall').mockResolvedValue({
+        name: 'artifacts',
+        scope: 'host',
+        installed: false,
+        outcome: 'removed',
+        changed: true,
+        reason: null,
+        receipt_file: null,
+        operator_actions: [instruction],
+      });
+      expect(
+        await runCli(['connectors', 'uninstall', 'artifacts', ...(json ? ['--json'] : [])], { paths, ...io.runtime }),
+      ).toBe(0);
+      const output = io.out.join('\n');
+      if (json) {
+        const result: unknown = JSON.parse(output);
+        expectResultContract('connectors uninstall artifacts', result);
+        expect(result).toMatchObject({ next_actions: expect.arrayContaining([{ kind: 'external', instruction }]) });
+      } else expect(output).toContain(instruction);
     },
   );
 });

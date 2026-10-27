@@ -1,3 +1,4 @@
+import { useAvailableBrowser } from './testing/browser-runtime.js';
 /**
  * Principal access to the assistant's 1Password vault:
  * only canonical main asks, through its real host request and guard; the
@@ -147,7 +148,7 @@ class FakeOnePassword implements VaultSharingProvider {
 let onePassword: FakeOnePassword;
 let vault: BrowserVault;
 let onePasswordPolicyFile: string;
-let browserPolicyFile: string;
+let browserRoot: string;
 let resourceFile: string;
 let main: Session;
 let browser: Session;
@@ -247,6 +248,7 @@ function expectNoSecrets(value: unknown): void {
 }
 
 beforeEach(async () => {
+  useAvailableBrowser();
   fs.rmSync(ROOT, { recursive: true, force: true });
   fs.mkdirSync(vaultRoot, { recursive: true, mode: 0o700 });
   await runMigrations(await initTestDb());
@@ -266,7 +268,7 @@ beforeEach(async () => {
   await writeHostPolicy();
   await writePrivateFile(hostPaths.managementTokenFile, MANAGEMENT_TOKEN);
   fs.mkdirSync(instanceRoot, { mode: 0o700 });
-  browserPolicyFile = path.join(instanceRoot, 'browser', 'policy.json');
+  browserRoot = path.join(instanceRoot, 'browser');
   await writePrivateFile(
     path.join(instanceRoot, 'state', 'data', 'gws-ea', 'instance.json'),
     JSON.stringify({ schema_version: 1, instance_id: INSTANCE_ID }),
@@ -283,7 +285,7 @@ beforeEach(async () => {
     retiredRuntimeServiceAccountIds: [],
   });
   await writePrivateFile(files.runtimeTokenFile, RUNTIME_TOKEN);
-  vault = new BrowserVault({ browserPolicyFile, onePasswordPolicyFile });
+  vault = new BrowserVault({ browserRoot, onePasswordPolicyFile });
   vi.clearAllMocks();
   sdk.create.mockResolvedValue({
     vaults: { list: sdk.vaults },
@@ -339,7 +341,7 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
-  delete process.env.GWS_EA_BROWSER_POLICY_FILE;
+  delete process.env.GWS_EA_BROWSER_ROOT;
   delete process.env.GWS_EA_ONEPASSWORD_POLICY_FILE;
   // Leave the delivery action as the browser module registers it.
   registerVaultAccessDelivery();
@@ -575,7 +577,7 @@ describe('the operator handoff', () => {
 
   it('as wired by the browser module, hands off when the recorded CLI cannot open', async () => {
     registerVaultAccessDelivery();
-    process.env.GWS_EA_BROWSER_POLICY_FILE = browserPolicyFile;
+    process.env.GWS_EA_BROWSER_ROOT = browserRoot;
     process.env.GWS_EA_ONEPASSWORD_POLICY_FILE = onePasswordPolicyFile;
     const data = answer(await ask({ operation: 'share' }));
     expect(data).toMatchObject({ status: 'operator_needed', reason: 'host_cannot_share' });

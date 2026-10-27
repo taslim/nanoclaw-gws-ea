@@ -5,20 +5,18 @@ import { randomUUID } from 'node:crypto';
 
 export interface BrowserPaths {
   root: string;
-  policyFile: string;
   profileDir: string;
   stagingDir: string;
   artifactsDir: string;
 }
 
-/** Every path sits beside the policy file, so the browser never adopts a foreign profile. */
-export function browserPaths(policyFile: string): BrowserPaths {
-  if (!path.isAbsolute(policyFile)) throw new Error('Browser policy path must be absolute');
-  const root = path.dirname(policyFile);
+/** Browser state lives under one assistant-owned root; personal profiles are never adopted. */
+export function browserPaths(root: string): BrowserPaths {
+  if (!path.isAbsolute(root) || path.resolve(root) !== root)
+    throw new Error('Browser root must be a normalized absolute path');
   const stagingDir = path.join(root, 'staging');
   return {
     root,
-    policyFile,
     profileDir: path.join(root, 'profile'),
     stagingDir,
     artifactsDir: path.join(stagingDir, 'artifacts'),

@@ -15,7 +15,7 @@ import {
 import os from 'node:os';
 import path from 'node:path';
 
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { processLock } from '../community-portal/process-lock.js';
 import {
@@ -23,28 +23,36 @@ import {
   onePasswordInstancePaths,
   readOnePasswordHostPolicy,
   readOnePasswordResources,
+  writeOnePasswordHostPolicy,
   writeOnePasswordResources,
 } from '../modules/gws-ea-browser/onepassword-policy.js';
 import { deriveGcpClaims } from './gcp-identity.js';
+import { inspectConnector } from './connector-inspection.js';
+import type { InteractivePrompts } from './events.js';
+import { captureOnePasswordCleanup } from './onepassword-removal.js';
 import { reserveInstance, withInstanceOperation } from './journal.js';
+import { readRegistry } from './registry.js';
 import { createOnecliRuntimeLayout } from './onecli-compose.js';
-import { serviceAccountCreationUnproven } from '../modules/gws-ea-browser/onepassword-cli.js';
 import {
-  disableOnePassword,
-  enableOnePassword,
+  installOnePassword,
   inspectOnePasswordCapability,
   onePasswordEnabled,
   onePasswordCapabilityLines,
-  onePasswordEnableNextActions,
+  onePasswordInstallNextActions,
   onePasswordCapabilityNextActions,
   onePasswordRecovery,
   onePasswordReleaseCompatibility,
   ONEPASSWORD_CONTRACT,
   provisionAssistantVault,
   type OnePasswordDependencies,
-  type OnePasswordEnableRequest,
+  type OnePasswordInstallRequest,
 } from './onepassword.js';
-import { runCli } from './cli.js';
+import {
+  inspectOnePasswordUninstall,
+  onePasswordUninstallFile,
+  previewOnePasswordUninstall,
+  uninstallOnePassword,
+} from './onepassword-uninstall.js';
 import { CONTROL_PLANE_ROOT, resolveControlPlanePaths, type ControlPlanePaths } from './paths.js';
 import {
   createInstanceRuntimeConfig,
@@ -62,6 +70,7 @@ import {
 } from './testing/onepassword-fixture.js';
 import { expectResultContract } from './testing/result-contract.js';
 import { GwsEaError } from './types.js';
+import * as secrets from './secrets.js';
 
 const { upsertEnvVars } = (await import(path.join(CONTROL_PLANE_ROOT, 'setup', 'set-env.ts'))) as {
   readonly upsertEnvVars: UpsertEnvVars;
@@ -83,6 +92,7 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
+  vi.restoreAllMocks();
   await rm(root, { recursive: true, force: true });
 });
 
@@ -142,9 +152,9 @@ async function assistant(
 
 async function enable(
   overrides: Partial<OnePasswordDependencies> = {},
-  request: OnePasswordEnableRequest = { accountId: ACCOUNT_ID },
+  request: OnePasswordInstallRequest = { accountId: ACCOUNT_ID },
 ) {
-  return enableOnePassword(paths, request, dependencies(overrides));
+  return installOnePassword(paths, request, dependencies(overrides));
 }
 
 async function resourcesOf(runtime: InstanceRuntimeConfig) {
@@ -176,7 +186,95 @@ describe('1Password release compatibility', () => {
   });
 });
 
-describe('enabling 1Password for existing and future assistants', () => {
+describe('1Password marker validation', () => {
+  it.each([
+    { marker: {}, expected: 'unknown' },
+    { marker: { schemaVersion: 1, contract: 42 }, expected: 'unknown' },
+    { marker: { schemaVersion: 1, contract: 'gws-ea-onepassword-vault-2' }, expected: 'unsupported' },
+    { marker: { schemaVersion: 2, contract: ONEPASSWORD_CONTRACT }, expected: 'unsupported' },
+  ])('distinguishes a malformed marker from a valid unsupported marker: $marker', async ({ marker, expected }) => {
+    const release = path.join(root, 'marker-release');
+    await mkdir(path.join(release, 'src/gws-ea'), { recursive: true });
+    await writeFile(path.join(release, 'src/gws-ea/onepassword-compatibility.json'), JSON.stringify(marker));
+    expect(await onePasswordReleaseCompatibility(release)).toBe(expected);
+  });
+});
+
+describe('installing 1Password for existing and future assistants', () => {
+  it('leaves a new vault pending without touching the operator sign-in when no terminal is present', async () => {
+    await enable();
+    const runtime = await assistant();
+    provider.calls.length = 0;
+    const result = await withInstanceOperation(paths, runtime.instance_id, (operation) =>
+      provisionAssistantVault(operation, {
+        ...dependencies(),
+        operatorTerminal: false,
+        cli: {
+          ...provider.cli(),
+          runCommand: async () => {
+            throw new Error('op must not run without an operator terminal');
+          },
+        },
+      }),
+    );
+    expect(result).toMatchObject({ outcome: 'pending', reason: 'operator_sign_in_needed' });
+    expect(provider.calls).toEqual([]);
+    expect(provider.vaults.size).toBe(0);
+  });
+
+  it('leaves provisioning pending while the connector host lock is held', async () => {
+    await enable();
+    const runtime = await assistant();
+    const release = await processLock(path.join(paths.configRoot, 'onepassword.lock'));
+    if (!release) throw new Error('The test did not acquire the host lock');
+    provider.calls.length = 0;
+    try {
+      const result = await withInstanceOperation(paths, runtime.instance_id, (operation) =>
+        provisionAssistantVault(operation, dependencies()),
+      );
+      expect(result).toMatchObject({ outcome: 'pending', reason: 'onepassword_busy', changed: false });
+      expect(provider.calls).toEqual([]);
+    } finally {
+      release();
+    }
+  });
+
+  it('keeps existing ready bindings without an operator terminal and shares a rate limit across hooks', async () => {
+    const ready = await assistant();
+    await enable();
+    const record = await resourcesOf(ready);
+    const neverOpens = {
+      ...provider.cli(),
+      runCommand: async () => {
+        throw new Error('A ready binding must not launch op');
+      },
+    };
+    const alreadyReady = await withInstanceOperation(paths, ready.instance_id, (operation) =>
+      provisionAssistantVault(operation, { ...dependencies(), operatorTerminal: false, cli: neverOpens }),
+    );
+    expect(alreadyReady).toMatchObject({ outcome: 'ready', vault_id: record?.vault.id, changed: false });
+    const first = await assistant();
+    const second = await assistant();
+    const state = { limited: false };
+    provider.before = () => ({ exitCode: 1, stderr: '[ERROR] (429) Too Many Requests' });
+    const limited = await withInstanceOperation(paths, first.instance_id, (operation) =>
+      provisionAssistantVault(operation, { ...dependencies(), operatorTerminal: true, rateLimitState: state }),
+    );
+    expect(limited).toMatchObject({ outcome: 'pending', reason: 'rate_limited' });
+    expect(state.limited).toBe(true);
+    provider.calls.length = 0;
+    const skipped = await withInstanceOperation(paths, second.instance_id, (operation) =>
+      provisionAssistantVault(operation, {
+        ...dependencies(),
+        operatorTerminal: true,
+        rateLimitState: state,
+        cli: neverOpens,
+      }),
+    );
+    expect(skipped).toMatchObject({ outcome: 'pending', reason: 'rate_limited', changed: false });
+    expect(provider.calls).toEqual([]);
+  });
+
   it('gives two stopped assistants and a later creation distinct vaults and tokens, and a retry creates nothing', async () => {
     const first = await assistant();
     const second = await assistant();
@@ -322,7 +420,7 @@ describe('enabling 1Password for existing and future assistants', () => {
     expect(provider.vaults.size).toBe(1);
     expect(await exists(onePasswordInstancePaths(old.instance_root).resourceFile)).toBe(false);
     expect(await readFile(path.join(old.state_root, '.env'), 'utf8')).not.toContain('GWS_EA_ONEPASSWORD_POLICY_FILE');
-    expect(onePasswordEnableNextActions(enabled)).toEqual(
+    expect(onePasswordInstallNextActions(enabled)).toEqual(
       expect.arrayContaining([
         { kind: 'command', argv: ['gws-ea', 'update', '--id', old.instance_id] },
         { kind: 'command', argv: ['gws-ea', 'resume', '--id', unfinished.instance_id] },
@@ -348,9 +446,9 @@ describe('enabling 1Password for existing and future assistants', () => {
     // The second vault exists and is recorded; only its runtime account is missing.
     expect((await resourcesOf(second))?.runtimeServiceAccountId).toBeNull();
     expect(provider.vaults.size).toBe(2);
-    expect(onePasswordEnableNextActions(partial)).toContainEqual({
+    expect(onePasswordInstallNextActions(partial)).toContainEqual({
       kind: 'command',
-      argv: ['gws-ea', 'capabilities', 'enable', 'onepassword'],
+      argv: ['gws-ea', 'connectors', 'install', 'onepassword'],
     });
 
     provider.after = undefined;
@@ -451,9 +549,9 @@ describe('recovering an interrupted enable', () => {
     const unproven = await enable();
     expect(unproven.assistants[0]).toMatchObject({ outcome: 'pending', reason: 'vault_creation_unproven' });
     expect(unproven.assistants[0].message).toContain(`Assistant aya.${runtime.instance_id.slice(0, 8)}@example.test`);
-    expect(onePasswordEnableNextActions(unproven)).toContainEqual({
+    expect(onePasswordInstallNextActions(unproven)).toContainEqual({
       kind: 'command',
-      argv: ['gws-ea', 'capabilities', 'enable', 'onepassword', '--discard-unproven', runtime.instance_id],
+      argv: ['gws-ea', 'connectors', 'install', 'onepassword', '--discard-unproven', runtime.instance_id],
     });
 
     // A retry never creates another vault while the first may exist.
@@ -462,7 +560,7 @@ describe('recovering an interrupted enable', () => {
 
     // The operator deletes the stray vault in 1Password, then clears the attempt.
     provider.vaults.clear();
-    const cleared = await enableOnePassword(
+    const cleared = await installOnePassword(
       paths,
       { accountId: ACCOUNT_ID, discardUnproven: runtime.instance_id },
       dependencies(),
@@ -511,7 +609,7 @@ describe('recovering an interrupted enable', () => {
     // The operator revokes the unproven account on 1Password.com, then clears the attempt.
     const stray = [...provider.serviceAccounts.values()].find((account) => account.access !== 'create_vaults')!;
     provider.serviceAccounts.delete(stray.id);
-    const cleared = await enableOnePassword(
+    const cleared = await installOnePassword(
       paths,
       { accountId: ACCOUNT_ID, discardUnproven: runtime.instance_id },
       dependencies(),
@@ -534,7 +632,7 @@ describe('recovering an interrupted enable', () => {
     expect(await exists(onePasswordHostPaths(paths.configRoot).policyFile)).toBe(false);
 
     provider.serviceAccounts.clear();
-    const cleared = await enableOnePassword(
+    const cleared = await installOnePassword(
       paths,
       { accountId: ACCOUNT_ID, discardUnproven: 'management' },
       dependencies(),
@@ -551,12 +649,12 @@ describe('recovering an interrupted enable', () => {
         : undefined;
     const unverified = await enable();
     expect(unverified.assistants[0]).toMatchObject({ outcome: 'pending', reason: 'runtime_unverified' });
-    expect(onePasswordEnableNextActions(unverified)).toEqual(
+    expect(onePasswordInstallNextActions(unverified)).toEqual(
       expect.arrayContaining([
-        { kind: 'command', argv: ['gws-ea', 'capabilities', 'enable', 'onepassword'] },
+        { kind: 'command', argv: ['gws-ea', 'connectors', 'install', 'onepassword'] },
         {
           kind: 'command',
-          argv: ['gws-ea', 'capabilities', 'enable', 'onepassword', '--discard-unproven', runtime.instance_id],
+          argv: ['gws-ea', 'connectors', 'install', 'onepassword', '--discard-unproven', runtime.instance_id],
         },
       ]),
     );
@@ -585,7 +683,7 @@ describe('recovering an interrupted enable', () => {
         : undefined;
     await expect(enable()).rejects.toMatchObject({ code: 'onepassword_management_unproven' });
     provider.before = undefined;
-    const cleared = await enableOnePassword(
+    const cleared = await installOnePassword(
       paths,
       { accountId: ACCOUNT_ID, discardUnproven: 'management' },
       dependencies(),
@@ -597,9 +695,9 @@ describe('recovering an interrupted enable', () => {
     const runtime = await assistant();
     await enable();
     await expect(
-      enableOnePassword(paths, { discardUnproven: runtime.instance_id }, dependencies()),
+      installOnePassword(paths, { discardUnproven: runtime.instance_id }, dependencies()),
     ).rejects.toMatchObject({ code: 'onepassword_nothing_unproven' });
-    await expect(enableOnePassword(paths, { discardUnproven: 'management' }, dependencies())).rejects.toMatchObject({
+    await expect(installOnePassword(paths, { discardUnproven: 'management' }, dependencies())).rejects.toMatchObject({
       code: 'onepassword_nothing_unproven',
     });
     expect((await resourcesOf(runtime))?.runtimeServiceAccountId).not.toBeNull();
@@ -663,226 +761,6 @@ describe('pausing on an assistant record enable cannot build on', () => {
     expect(paused.assistants[0].message).toContain(resourceFile);
     expect(provider.vaults.size).toBe(0);
     expect(await readFile(resourceFile, 'utf8')).toBe('{"schemaVersion": 2,');
-  });
-});
-
-describe('disabling and re-enabling 1Password', () => {
-  /** Two enabled assistants, sorted by ID, with what each recorded. */
-  async function enabledPair() {
-    const runtimes = [await assistant(), await assistant()].sort((left, right) =>
-      left.instance_id.localeCompare(right.instance_id),
-    );
-    const enabled = await enable();
-    const records = await Promise.all(runtimes.map(async (runtime) => (await resourcesOf(runtime))!));
-    return { runtimes, records, management: enabled.management_service_account_id };
-  }
-
-  it('publishes the disabled intent, then deletes each runtime token, keeping vaults, IDs and the management account', async () => {
-    const { runtimes, records, management } = await enabledPair();
-    const hostPaths = onePasswordHostPaths(paths.configRoot);
-    const managementToken = await readFile(hostPaths.managementTokenFile, 'utf8');
-    const vaults = new Map(provider.vaults);
-    const calls = provider.calls.length;
-    const effects: (true | null)[] = [];
-
-    const disabled = await disableOnePassword(paths, { recordEffect: (effect) => effects.push(effect) });
-
-    // Disabling needs no provider: it works with 1Password unreachable, and revokes nothing.
-    expect(provider.calls.length).toBe(calls);
-    expect(provider.serviceAccounts.size).toBe(3);
-    expect(disabled).toMatchObject({
-      name: 'onepassword',
-      enabled: false,
-      account_id: ACCOUNT_ID,
-      management_service_account_id: management,
-    });
-    expect(disabled.assistants).toEqual(
-      runtimes.map((runtime, index) => ({
-        instance_id: runtime.instance_id,
-        outcome: 'disabled',
-        reason: null,
-        changed: true,
-        vault_id: records[index].vault.id,
-        runtime_token: 'deleted',
-        revoke_service_account_ids: [records[index].runtimeServiceAccountId],
-        unproven_service_account: null,
-      })),
-    );
-    expect(effects.at(-1)).toBe(true);
-    const policy = await readOnePasswordHostPolicy(hostPaths.policyFile);
-    expect(policy).toMatchObject({
-      status: 'ready',
-      policy: { enabled: false, accountId: ACCOUNT_ID, managementServiceAccountId: management },
-    });
-    expect(await readFile(hostPaths.managementTokenFile, 'utf8')).toBe(managementToken);
-    expect(provider.vaults).toEqual(vaults);
-    for (const [index, runtime] of runtimes.entries()) {
-      expect(await exists(onePasswordInstancePaths(runtime.instance_root).runtimeTokenFile)).toBe(false);
-      expect(await resourcesOf(runtime)).toEqual({
-        ...records[index],
-        runtimeServiceAccountId: null,
-        retiredRuntimeServiceAccountIds: [records[index].runtimeServiceAccountId],
-      });
-    }
-    expect(await onePasswordEnabled(paths)).toBe(false);
-
-    // Readiness and the catalog say so, naming the identities still to revoke; repeating changes nothing.
-    const shown = await inspectOnePasswordCapability(paths, dependencies());
-    expect(shown.activation.status).toBe('disabled');
-    expect(shown.account_id).toBe(ACCOUNT_ID);
-    expect(shown.assistants.map((entry) => entry.retired_service_account_ids)).toEqual(
-      records.map((record) => [record.runtimeServiceAccountId]),
-    );
-    expect(onePasswordCapabilityNextActions(shown, false)).toEqual([
-      { kind: 'command', argv: ['gws-ea', 'capabilities', 'enable', 'onepassword'] },
-    ]);
-    const again = await disableOnePassword(paths);
-    expect(
-      again.assistants.map((entry) => [entry.changed, entry.runtime_token, entry.revoke_service_account_ids]),
-    ).toEqual(records.map((record) => [false, 'absent', [record.runtimeServiceAccountId]]));
-  });
-
-  it('publishes the disabled intent before any token goes, so a failed unlink still stops every vault use', async () => {
-    const { runtimes } = await enabledPair();
-    // The second token cannot be deleted safely: another account could have replaced it.
-    const stuck = onePasswordInstancePaths(runtimes[1].instance_root).runtimeTokenFile;
-    await chmod(stuck, 0o644);
-
-    await expect(disableOnePassword(paths)).rejects.toThrow();
-
-    expect(await onePasswordEnabled(paths)).toBe(false);
-    expect(await exists(onePasswordInstancePaths(runtimes[0].instance_root).runtimeTokenFile)).toBe(false);
-    await chmod(stuck, 0o600);
-    const finished = await disableOnePassword(paths);
-    expect(finished.assistants.map((entry) => entry.runtime_token)).toEqual(['absent', 'deleted']);
-  });
-
-  it('refuses before publishing anything while another operation holds an assistant', async () => {
-    const { runtimes } = await enabledPair();
-    await mkdir(path.dirname(paths.instanceLock(runtimes[1].instance_id)), { recursive: true, mode: 0o700 });
-    const release = await processLock(paths.instanceLock(runtimes[1].instance_id));
-    if (!release) throw new Error('The lock was not free');
-    try {
-      await expect(disableOnePassword(paths)).rejects.toMatchObject({ code: 'instance_busy' });
-    } finally {
-      release();
-    }
-    expect(await onePasswordEnabled(paths)).toBe(true);
-    for (const runtime of runtimes)
-      expect(await exists(onePasswordInstancePaths(runtime.instance_root).runtimeTokenFile)).toBe(true);
-  });
-
-  it('re-enables on the same vaults, minting replacement runtime accounts only with the operator, and names the old ones', async () => {
-    const { runtimes, records, management } = await enabledPair();
-    await disableOnePassword(paths);
-    const before = provider.calls.length;
-
-    // Replacement needs the operator's own sign-in; without it nothing is minted.
-    provider.signedIn = false;
-    await expect(enable(undefined, {})).rejects.toMatchObject({ code: 'onepassword_sign_in_required' });
-    expect(provider.serviceAccounts.size).toBe(3);
-    expect(await onePasswordEnabled(paths)).toBe(false);
-    provider.signedIn = true;
-
-    const reenabled = await enable(undefined, {});
-
-    expect(reenabled.management_service_account_id).toBe(management);
-    expect(provider.vaults.size).toBe(2);
-    const calls = provider.calls.slice(before);
-    expect(calls.filter((call) => call.args.join(' ').startsWith('vault create'))).toEqual([]);
-    const minted = calls.filter((call) => call.args[0] === 'service-account' && call.args[1] === 'create');
-    expect(minted).toHaveLength(2);
-    // Minted by the operator's desktop sign-in, never by a service account.
-    expect(minted.every((call) => call.env?.OP_SERVICE_ACCOUNT_TOKEN === undefined)).toBe(true);
-    for (const [index, runtime] of runtimes.entries()) {
-      const record = (await resourcesOf(runtime))!;
-      expect(record.vault).toEqual(records[index].vault);
-      expect(record.runtimeServiceAccountId).not.toBeNull();
-      expect(record.runtimeServiceAccountId).not.toBe(records[index].runtimeServiceAccountId);
-      expect(record.retiredRuntimeServiceAccountIds).toEqual([records[index].runtimeServiceAccountId]);
-      expect(await runtimeToken(runtime)).toBe(provider.serviceAccounts.get(record.runtimeServiceAccountId!)!.token);
-      expect(reenabled.assistants[index]).toMatchObject({
-        outcome: 'ready',
-        vault_id: records[index].vault.id,
-        runtime_service_account_id: record.runtimeServiceAccountId,
-        retired_service_account_ids: [records[index].runtimeServiceAccountId],
-      });
-    }
-    const instructions = onePasswordEnableNextActions(reenabled)
-      .flatMap((action) => (action.kind === 'external' ? [action.instruction] : []))
-      .join('\n');
-    for (const record of records) expect(instructions).toContain(record.runtimeServiceAccountId!);
-    expect(instructions).toContain('1Password.com');
-    expect(await onePasswordEnabled(paths)).toBe(true);
-  });
-
-  it('provisions nothing for an assistant created while 1Password is disabled', async () => {
-    await assistant();
-    await enable();
-    await disableOnePassword(paths);
-    const created = await assistant();
-    const calls = provider.calls.length;
-    const result = await withInstanceOperation(paths, created.instance_id, (operation) =>
-      provisionAssistantVault(operation, dependencies()),
-    );
-    expect(result).toBeUndefined();
-    expect(provider.calls.length).toBe(calls);
-    expect(await exists(onePasswordInstancePaths(created.instance_root).resourceFile)).toBe(false);
-  });
-
-  it('turns a captured but unrecorded runtime token into an unproven creation, never minting over it', async () => {
-    const runtime = await assistant();
-    // The token was captured; this process died verifying it.
-    let crashed = false;
-    provider.before = (args) => {
-      if (!crashed && args.join(' ') === 'whoami --format json' && provider.serviceAccounts.size === 2) {
-        crashed = true;
-        throw new Error('The process was killed');
-      }
-      return undefined;
-    };
-    await expect(enable()).rejects.toThrow('The process was killed');
-    provider.before = undefined;
-    const tokenFile = onePasswordInstancePaths(runtime.instance_root).runtimeTokenFile;
-
-    const disabled = await disableOnePassword(paths);
-
-    expect(disabled.assistants[0]).toMatchObject({
-      runtime_token: 'deleted',
-      revoke_service_account_ids: [],
-      unproven_service_account: `GWS-EA ${runtime.instance_id.slice(0, 8)} aya.${runtime.instance_id.slice(0, 8)}@example.test`,
-    });
-    expect(await exists(tokenFile)).toBe(false);
-    expect(await serviceAccountCreationUnproven(tokenFile)).toBe(true);
-    const accounts = provider.serviceAccounts.size;
-    const reenabled = await enable(undefined, {});
-    expect(reenabled.assistants[0]).toMatchObject({ outcome: 'pending', reason: 'service_account_creation_unproven' });
-    expect(provider.serviceAccounts.size).toBe(accounts);
-  });
-
-  it('names the expired management account and its recovery, and never substitutes a new one for its vaults', async () => {
-    const { records, management } = await enabledPair();
-    const hostPaths = onePasswordHostPaths(paths.configRoot);
-    const policy = await readFile(hostPaths.policyFile, 'utf8');
-    // The management account's token was revoked or expired on 1Password.com.
-    provider.serviceAccounts.delete(management);
-    // Disabling still works: it needs no provider.
-    await disableOnePassword(paths);
-
-    for (let attempt = 0; attempt < 2; attempt += 1) {
-      const error = await enable(undefined, {}).catch((caught: unknown) => caught);
-      expect(error).toMatchObject({ code: 'onepassword_management_unavailable' });
-      const message = error instanceof Error ? error.message : '';
-      expect(message).toContain(management);
-      expect(message).toContain(hostPaths.managementTokenFile);
-      expect(onePasswordRecovery(error)).toContainEqual({ kind: 'external', instruction: message });
-    }
-    // Nothing was minted or created, and the policy still names the account that created every vault.
-    expect([...provider.serviceAccounts.values()].filter((account) => account.access === 'create_vaults')).toEqual([]);
-    expect(provider.serviceAccounts.size).toBe(2);
-    expect(provider.vaults.size).toBe(2);
-    expect(await readFile(hostPaths.policyFile, 'utf8')).toBe(policy.replace('"enabled": true', '"enabled": false'));
-    for (const record of records) expect(provider.vaults.get(record.vault.id)?.creator).toBe(management);
   });
 });
 
@@ -952,10 +830,10 @@ describe('choosing the 1Password account', () => {
 
   it('refuses a missing or outdated CLI before anything else', async () => {
     await expect(
-      enableOnePassword(paths, { accountId: ACCOUNT_ID }, dependencies({ cli: { searchPath: root } })),
+      installOnePassword(paths, { accountId: ACCOUNT_ID }, dependencies({ cli: { searchPath: root } })),
     ).rejects.toMatchObject({ code: 'onepassword_cli_missing' });
     await expect(
-      enableOnePassword(
+      installOnePassword(
         paths,
         { accountId: ACCOUNT_ID },
         dependencies({
@@ -970,7 +848,60 @@ describe('choosing the 1Password account', () => {
   });
 });
 
+describe('management-account ownership during repair', () => {
+  it('names an expired management account and never substitutes a new creator for existing vaults', async () => {
+    await assistant();
+    await assistant();
+    const installed = await enable();
+    const management = installed.management_service_account_id;
+    const host = onePasswordHostPaths(paths.configRoot);
+    const before = await readFile(host.policyFile, 'utf8');
+    provider.serviceAccounts.delete(management);
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const error = await enable(undefined, {}).catch((caught: unknown) => caught);
+      expect(error).toMatchObject({ code: 'onepassword_management_unavailable' });
+      const message = error instanceof Error ? error.message : '';
+      expect(message).toContain(management);
+      expect(message).toContain(host.managementTokenFile);
+      expect(onePasswordRecovery(error)).toContainEqual({ kind: 'external', instruction: message });
+    }
+    expect([...provider.serviceAccounts.values()].filter((account) => account.access === 'create_vaults')).toEqual([]);
+    expect(provider.serviceAccounts.size).toBe(2);
+    expect(provider.vaults.size).toBe(2);
+    expect(await readFile(host.policyFile, 'utf8')).toBe(before);
+    expect([...provider.vaults.values()].every((vault) => vault.creator === management)).toBe(true);
+  });
+});
+
 describe('1Password readiness', () => {
+  it.each([false, true])('keeps a malformed runtime local to its assistant when installed=%s', async (installed) => {
+    const healthy = await assistant();
+    const malformed = await assistant();
+    if (installed) await enable();
+    await writeFile(paths.runtimeFile(malformed.instance_id), '{');
+    const cli = { ...provider.cli(), runCommand: vi.fn(provider.runCommand) };
+
+    const observation = await inspectOnePasswordCapability(paths, { cli });
+
+    expect(observation.assistants).toHaveLength(2);
+    expect(observation.assistants.find(({ instance_id }) => instance_id === healthy.instance_id)).toMatchObject({
+      compatibility: 'compatible',
+      provisioning: installed ? 'ready' : 'absent',
+    });
+    expect(observation.assistants.find(({ instance_id }) => instance_id === malformed.instance_id)).toMatchObject({
+      compatibility: 'unknown',
+      access: { status: 'not_checked' },
+      reason: expect.stringContaining('runtime'),
+    });
+    const connector = await inspectConnector(paths, 'onepassword', { onePassword: cli });
+    expect(connector.assistants.find(({ instance_id }) => instance_id === malformed.instance_id)).toMatchObject({
+      compatibility: 'unknown',
+      readiness: { checked: false, status: 'not_checked' },
+      next_actions: [{ kind: 'command', argv: ['gws-ea', 'status', '--id', malformed.instance_id] }],
+    });
+    expect(cli.runCommand).not.toHaveBeenCalled();
+  });
+
   it('shows recorded facts without a provider request', async () => {
     const runtime = await assistant();
     const before = await inspectOnePasswordCapability(paths, dependencies());
@@ -983,7 +914,7 @@ describe('1Password readiness', () => {
       }),
     ]);
     expect(onePasswordCapabilityNextActions(before, false)).toEqual([
-      { kind: 'command', argv: ['gws-ea', 'capabilities', 'enable', 'onepassword'] },
+      { kind: 'command', argv: ['gws-ea', 'connectors', 'install', 'onepassword'] },
     ]);
 
     await enable();
@@ -1034,6 +965,43 @@ describe('1Password readiness', () => {
     expect(JSON.stringify(checked)).not.toMatch(/ops_/u);
   });
 
+  it('checks only selected reachable runtime accounts while preserving the management check', async () => {
+    const selected = await assistant();
+    const stopped = await assistant();
+    await enable();
+    provider.calls.length = 0;
+    const filtered = await inspectOnePasswordCapability(paths, {
+      ...dependencies(),
+      check: true,
+      instanceId: selected.instance_id,
+      checkAssistantIds: [],
+    });
+    expect(filtered.assistants).toEqual([
+      expect.objectContaining({ instance_id: selected.instance_id, access: { status: 'not_checked', reason: null } }),
+    ]);
+    expect(filtered.management.status).toBe('verified');
+    expect(provider.serviceAccountCalls().some((args) => args[0] === 'vault')).toBe(false);
+    const records = [await resourcesOf(selected), await resourcesOf(stopped)];
+    provider.calls.length = 0;
+    const reachable = await inspectOnePasswordCapability(paths, {
+      ...dependencies(),
+      check: true,
+      checkAssistantIds: [selected.instance_id],
+    });
+    expect(reachable.assistants.find((entry) => entry.instance_id === selected.instance_id)?.access.status).toBe(
+      'verified',
+    );
+    expect(reachable.assistants.find((entry) => entry.instance_id === stopped.instance_id)?.access.status).toBe(
+      'not_checked',
+    );
+    expect(
+      provider
+        .serviceAccountCalls()
+        .filter((args) => args[0] === 'vault')
+        .map((args) => args[2]),
+    ).toEqual([records[0]?.vault.id]);
+  });
+
   it('reports a failed usage lookup as unknown, never as zero', async () => {
     await assistant();
     await enable();
@@ -1072,7 +1040,7 @@ describe('1Password readiness', () => {
     expect(checked.quota).toMatchObject({ status: 'unknown', daily: null });
     expect(onePasswordCapabilityNextActions(checked, true)).toContainEqual({
       kind: 'command',
-      argv: ['gws-ea', 'capabilities', 'enable', 'onepassword'],
+      argv: ['gws-ea', 'connectors', 'install', 'onepassword'],
     });
   });
 
@@ -1086,7 +1054,21 @@ describe('1Password readiness', () => {
   });
 });
 
-describe('the native 1Password capability commands', () => {
+describe('the native 1Password connector commands', () => {
+  const unexpectedPrompt = async (): Promise<never> => {
+    throw new Error('An unrelated provisioning prompt was reached');
+  };
+  const prompts: InteractivePrompts = {
+    providerCredential: unexpectedPrompt,
+    googleCloudSignIn: unexpectedPrompt,
+    googleAccount: unexpectedPrompt,
+    googleWorkspaceSignIn: unexpectedPrompt,
+    attendPause: unexpectedPrompt,
+  };
+  let runCli: (typeof import('./cli.js'))['runCli'];
+  beforeEach(async () => {
+    ({ runCli } = await import('./cli.js'));
+  });
   async function run(args: readonly string[]) {
     const stdout: string[] = [];
     const stderr: string[] = [];
@@ -1096,6 +1078,7 @@ describe('the native 1Password capability commands', () => {
       stdout: (line) => stdout.push(line),
       stderr: (line) => stderr.push(line),
       onePassword: dependencies().cli,
+      prompts,
       upsertEnvVars,
     });
     return { code, stdout: stdout.join('\n'), stderr: stderr.join('\n') };
@@ -1110,42 +1093,30 @@ describe('the native 1Password capability commands', () => {
     );
   }
 
-  it('enables, checks and lists through the published result contracts, with no token in any output or log', async () => {
-    const runtime = await assistant();
-
-    const enabled = await run(['capabilities', 'enable', 'onepassword', '--account', ACCOUNT_ID, '--json']);
-    expect(enabled.code).toBe(0);
-    const result = JSON.parse(enabled.stdout) as Record<string, unknown>;
-    expectResultContract('capabilities enable onepassword', result);
-    expect(result).toMatchObject({
-      outcome: 'succeeded',
-      changed: true,
-      data: { account_id: ACCOUNT_ID, assistants: [{ instance_id: runtime.instance_id, outcome: 'ready' }] },
-      next_actions: [{ kind: 'command', argv: ['gws-ea', 'capabilities', 'check', 'onepassword'] }],
-    });
-
-    const checked = await run(['capabilities', 'check', 'onepassword', '--json']);
+  it('installs from a terminal, checks and lists through the published contracts, with no token in output or logs', async () => {
+    await assistant();
+    const installed = await run(['connectors', 'install', 'onepassword', '--account', ACCOUNT_ID]);
+    expect(installed.code).toBe(0);
+    expect(installed.stdout).toContain('install completed');
+    const checked = await run(['connectors', 'check', 'onepassword', '--json']);
     expect(checked.code).toBe(0);
-    expectResultContract('capabilities check onepassword', JSON.parse(checked.stdout));
-    const listed = await run(['capabilities', 'list', '--json']);
-    expectResultContract('capabilities list', JSON.parse(listed.stdout));
+    expectResultContract('connectors check onepassword', JSON.parse(checked.stdout));
+    const listed = await run(['connectors', 'list', '--json']);
+    expectResultContract('connectors list', JSON.parse(listed.stdout));
     expect(JSON.parse(listed.stdout)).toMatchObject({
       data: {
-        capabilities: [
+        connectors: [
           { name: 'voice' },
-          { name: 'browser' },
-          { name: 'onepassword', activation: 'enabled' },
+          { name: 'onepassword', setup: 'installed', readiness: { status: 'not_checked', checked: false } },
           { name: 'artifacts' },
         ],
       },
     });
-    const human = await run(['capabilities', 'check', 'onepassword']);
+    const human = await run(['connectors', 'check', 'onepassword']);
     expect(human.stdout).toContain('Account type: families');
-
-    const again = await run(['capabilities', 'enable', 'onepassword', '--json']);
-    expect(JSON.parse(again.stdout)).toMatchObject({ outcome: 'succeeded', changed: false });
-
-    const everything = [enabled, checked, listed, human, again]
+    const again = await run(['connectors', 'install', 'onepassword']);
+    expect(again.code).toBe(0);
+    const everything = [installed, checked, listed, human, again]
       .map((output) => output.stdout + output.stderr)
       .join('\n');
     const logs = await treeText(paths.logsRoot);
@@ -1156,126 +1127,604 @@ describe('the native 1Password capability commands', () => {
     }
   });
 
-  it('disables and re-enables through the published contracts, saying what was kept, deleted and still to revoke', async () => {
-    const runtime = await assistant();
-    await run(['capabilities', 'enable', 'onepassword', '--account', ACCOUNT_ID, '--json']);
-    const record = (await resourcesOf(runtime))!;
-    const retired = record.runtimeServiceAccountId!;
-
-    const disabled = await run(['capabilities', 'disable', 'onepassword', '--json']);
-    expect(disabled.code).toBe(0);
-    const result = JSON.parse(disabled.stdout) as Record<string, unknown>;
-    expectResultContract('capabilities disable onepassword', result);
-    expect(result).toMatchObject({
-      outcome: 'succeeded',
-      changed: true,
-      data: {
-        enabled: false,
-        assistants: [
-          { instance_id: runtime.instance_id, runtime_token: 'deleted', revoke_service_account_ids: [retired] },
-        ],
-      },
-    });
-    expect(result.next_actions).toContainEqual({
-      kind: 'external',
-      instruction: expect.stringContaining(retired),
-    });
-
-    const human = await run(['capabilities', 'disable', 'onepassword']);
-    expect(human.code).toBe(0);
-    const text = human.stdout + human.stderr;
-    expect(text).toContain('1Password disabled');
-    expect(text).toContain(`Kept: every vault and its items`);
-    expect(text).toContain(retired);
-    expect(text).toContain('1Password.com');
-    expect(text).not.toMatch(/\brevoked\b/iu);
-
-    const reenabled = await run(['capabilities', 'enable', 'onepassword', '--json']);
-    expect(reenabled.code).toBe(0);
-    const again = JSON.parse(reenabled.stdout) as Record<string, unknown>;
-    expectResultContract('capabilities enable onepassword', again);
-    expect(again).toMatchObject({
-      outcome: 'succeeded',
-      data: { assistants: [{ vault_id: record.vault.id, retired_service_account_ids: [retired] }] },
-    });
-    const listed = await run(['capabilities', 'list', '--json']);
-    expect(JSON.parse(listed.stdout)).toMatchObject({
-      data: {
-        capabilities: [
-          { name: 'voice' },
-          { name: 'browser' },
-          { name: 'onepassword', activation: 'enabled' },
-          { name: 'artifacts' },
-        ],
-      },
-    });
-
-    const everything = [disabled, human, reenabled].map((output) => output.stdout + output.stderr).join('\n');
-    const logs = await treeText(paths.logsRoot);
-    for (const token of provider.tokens) {
-      expect(everything).not.toContain(token);
-      expect(logs).not.toContain(token);
-    }
-  });
-
-  it('reports a host where 1Password was never enabled as already disabled, changing nothing', async () => {
-    const disabled = await run(['capabilities', 'disable', 'onepassword', '--json']);
-    expect(disabled.code).toBe(0);
-    const result = JSON.parse(disabled.stdout) as Record<string, unknown>;
-    expectResultContract('capabilities disable onepassword', result);
-    expect(result).toMatchObject({ outcome: 'succeeded', changed: false, data: { enabled: false, assistants: [] } });
-    expect(await exists(onePasswordHostPaths(paths.configRoot).directory)).toBe(false);
-  });
-
-  it('pauses a partial enable with exit 10 and the step that continues it', async () => {
+  it('pauses a partially provisioned terminal install with the command that continues it', async () => {
+    await assistant();
     await assistant();
     provider.after = (args) => {
       if (args[0] === 'service-account' && args.includes('--vault')) provider.signedIn = false;
     };
-    await assistant();
-    const partial = await run(['capabilities', 'enable', 'onepassword', '--account', ACCOUNT_ID, '--json']);
+    const partial = await run(['connectors', 'install', 'onepassword', '--account', ACCOUNT_ID]);
     expect(partial.code).toBe(10);
-    const result = JSON.parse(partial.stdout) as { next_actions: unknown[] };
-    expectResultContract('capabilities enable onepassword', result);
-    expect(result).toMatchObject({ outcome: 'paused', changed: true });
-    expect(result.next_actions).toContainEqual({
-      kind: 'command',
-      argv: ['gws-ea', 'capabilities', 'enable', 'onepassword'],
-    });
+    expect(partial.stdout + partial.stderr).toContain('connectors install onepassword');
+    expect(provider.vaults.size).toBe(2);
   });
 
-  it('pauses for an explicit account without prompting, offering one command per account', async () => {
+  it('pauses noninteractive install before calling op and preserves its structured continuation', async () => {
     await assistant();
-    const paused = await run(['capabilities', 'enable', 'onepassword', '--json']);
+    const paused = await run(['connectors', 'install', 'onepassword', '--account', ACCOUNT_ID, '--json']);
     expect(paused.code).toBe(10);
-    const result = JSON.parse(paused.stdout) as Record<string, unknown>;
-    expectResultContract('capabilities enable onepassword', result);
+    const result: unknown = JSON.parse(paused.stdout);
+    expectResultContract('connectors install onepassword', result);
     expect(result).toMatchObject({
       outcome: 'paused',
       changed: false,
-      error: { code: 'onepassword_account_required' },
+      error: { code: 'onepassword_operator_sign_in_needed' },
+      next_actions: expect.arrayContaining([
+        { kind: 'command', argv: ['gws-ea', 'connectors', 'install', 'onepassword'] },
+      ]),
     });
-    expect(result.next_actions).toContainEqual({
-      kind: 'command',
-      argv: ['gws-ea', 'capabilities', 'enable', 'onepassword', '--account', ACCOUNT_ID],
-    });
-    const invalid = await run(['capabilities', 'enable', 'onepassword', '--account', 'hale.1password.com']);
+    expect(provider.calls).toEqual([]);
+    const invalid = await run(['connectors', 'install', 'onepassword', '--account', 'hale.1password.com']);
     expect(invalid.code).toBe(2);
   });
 
-  it('reports a missing CLI as a failure naming the installation, before any state changes', async () => {
+  it('reports a missing CLI before any domain state changes', async () => {
     const stdout: string[] = [];
-    const code = await runCli(['capabilities', 'enable', 'onepassword', '--account', ACCOUNT_ID, '--json'], {
+    const stderr: string[] = [];
+    const code = await runCli(['connectors', 'install', 'onepassword', '--account', ACCOUNT_ID], {
       paths,
       environment: { PATH: root },
+      prompts,
       stdout: (line) => stdout.push(line),
-      stderr: () => undefined,
+      stderr: (line) => stderr.push(line),
       upsertEnvVars,
     });
     expect(code).toBe(1);
-    const result = JSON.parse(stdout.join('\n')) as Record<string, unknown>;
-    expectResultContract('capabilities enable onepassword', result);
-    expect(result).toMatchObject({ outcome: 'failed', changed: false, error: { code: 'onepassword_cli_missing' } });
-    expect(await exists(onePasswordHostPaths(paths.configRoot).directory)).toBe(false);
+    expect(stdout.join('\n') + stderr.join('\n')).toContain('1Password CLI');
+    expect(await onePasswordEnabled(paths)).toBe(false);
+    expect(await exists(onePasswordHostPaths(paths.configRoot).policyFile)).toBe(false);
+  });
+});
+
+describe('host-wide 1Password uninstall', () => {
+  const uninstall = (deleteVaults = true) =>
+    uninstallOnePassword(
+      paths,
+      { deleteVaults },
+      { cli: provider.cli(), ncl: async () => ({ credentialAttempts: 2 }) },
+    );
+
+  it('previews a nonempty vault without creating a receipt or changing files and provider records', async () => {
+    const runtime = await assistant();
+    await enable();
+    const resources = await resourcesOf(runtime);
+    if (!resources) throw new Error('not provisioned');
+    provider.vaults.get(resources.vault.id)!.items = 3;
+    const host = onePasswordHostPaths(paths.configRoot);
+    const files = onePasswordInstancePaths(runtime.instance_root);
+    const before = await Promise.all(
+      [host.policyFile, host.managementTokenFile, files.resourceFile, files.runtimeTokenFile].map((file) =>
+        readFile(file, 'utf8'),
+      ),
+    );
+    const result = await uninstall(false);
+    expect(result).toMatchObject({
+      outcome: 'paused',
+      changed: false,
+      receipt_file: null,
+      preview: { vaults: [{ vault_id: resources.vault.id, item_count: 3, credential_attempts: 2 }] },
+    });
+    expect(await exists(onePasswordUninstallFile(paths))).toBe(false);
+    expect(
+      await Promise.all(
+        [host.policyFile, host.managementTokenFile, files.resourceFile, files.runtimeTokenFile].map((file) =>
+          readFile(file, 'utf8'),
+        ),
+      ),
+    ).toEqual(before);
+    expect(provider.vaults.has(resources.vault.id)).toBe(true);
+    expect(provider.calls.filter((call) => call.args[0] === 'vault' && call.args[1] === 'delete')).toEqual([]);
+  });
+
+  it.each(['before the uninstall call', 'during the uninstall preview'] as const)(
+    'requires a fresh confirmation when an owned vault is registered %s',
+    async (registration) => {
+      const first = await assistant();
+      await enable();
+      const confirmedPreview = await previewOnePasswordUninstall(paths, { cli: provider.cli() });
+      expect(confirmedPreview.vaults.map(({ instance_id }) => instance_id)).toEqual([first.instance_id]);
+      let second: InstanceRuntimeConfig | undefined;
+      let protectedFiles: string[] = [];
+      let before: string[] = [];
+      const register = async (): Promise<void> => {
+        second = await assistant();
+        const provisioned = await withInstanceOperation(paths, second.instance_id, (operation) =>
+          provisionAssistantVault(operation, dependencies()),
+        );
+        expect(provisioned?.outcome).toBe('ready');
+        const host = onePasswordHostPaths(paths.configRoot);
+        protectedFiles = [
+          host.policyFile,
+          host.managementTokenFile,
+          ...[first, second].flatMap((runtime) => {
+            const files = onePasswordInstancePaths(runtime.instance_root);
+            return [files.resourceFile, files.runtimeTokenFile];
+          }),
+        ];
+        before = await Promise.all(protectedFiles.map((file) => readFile(file, 'utf8')));
+      };
+      if (registration === 'before the uninstall call') await register();
+      // A separately read terminal preview is the approval, even when deletion was confirmed as a boolean too.
+      const request = { deleteVaults: true, confirmedPreview };
+      const result = await uninstallOnePassword(paths, request, {
+        cli: provider.cli(),
+        ncl: async () => {
+          if (!second) await register();
+          return { credentialAttempts: 2 };
+        },
+      });
+      expect(result).toMatchObject({ outcome: 'paused', changed: false, receipt_file: null });
+      if (!second) throw new Error('The concurrent assistant was not registered');
+      expect(result.preview.vaults.map(({ instance_id }) => instance_id).sort()).toEqual(
+        [first.instance_id, second.instance_id].sort(),
+      );
+      expect(await Promise.all(protectedFiles.map((file) => readFile(file, 'utf8')))).toEqual(before);
+      expect(await exists(onePasswordUninstallFile(paths))).toBe(false);
+      expect(provider.vaults.size).toBe(2);
+      expect(provider.calls.filter((call) => call.args[0] === 'vault' && call.args[1] === 'delete')).toEqual([]);
+      const freshConfirmation = { confirmedPreview: result.preview };
+      expect(await uninstallOnePassword(paths, freshConfirmation, { cli: provider.cli() })).toMatchObject({
+        outcome: 'completed',
+        changed: true,
+      });
+      expect(provider.vaults.size).toBe(0);
+    },
+  );
+
+  it('requires a fresh confirmation when the same vault becomes eligible for deletion', async () => {
+    const runtime = await assistant();
+    await enable();
+    const resources = await resourcesOf(runtime);
+    if (!resources) throw new Error('not provisioned');
+    const files = onePasswordInstancePaths(runtime.instance_root);
+    await writeOnePasswordResources(files.resourceFile, {
+      ...resources,
+      vault: { ...resources.vault, createdBy: { kind: 'operator' } },
+    });
+    const confirmedPreview = await previewOnePasswordUninstall(paths, { cli: provider.cli() });
+    expect(confirmedPreview.vaults[0]).toMatchObject({ owned: false, vault: 'retain' });
+    await writeOnePasswordResources(files.resourceFile, resources);
+    const request = { deleteVaults: true, confirmedPreview };
+    const result = await uninstallOnePassword(paths, request, { cli: provider.cli() });
+    expect(result).toMatchObject({
+      outcome: 'paused',
+      changed: false,
+      receipt_file: null,
+      preview: { vaults: [{ vault_id: resources.vault.id, owned: true, vault: 'delete' }] },
+    });
+    expect(await exists(onePasswordUninstallFile(paths))).toBe(false);
+    expect(await onePasswordEnabled(paths)).toBe(true);
+    expect(await exists(files.runtimeTokenFile)).toBe(true);
+    expect(provider.vaults.has(resources.vault.id)).toBe(true);
+  });
+
+  it.each(['account', 'management account', 'vault'] as const)(
+    'requires a fresh confirmation when the %s identity changes',
+    async (identity) => {
+      const runtime = await assistant();
+      await enable();
+      const resources = await resourcesOf(runtime);
+      if (!resources) throw new Error('not provisioned');
+      const confirmedPreview = await previewOnePasswordUninstall(paths, { cli: provider.cli() });
+      const files = onePasswordInstancePaths(runtime.instance_root);
+      const host = onePasswordHostPaths(paths.configRoot);
+      const policy = await readOnePasswordHostPolicy(host.policyFile);
+      if (policy.status !== 'ready') throw new Error('No host policy');
+      if (identity === 'vault') {
+        const previous = provider.vaults.get(resources.vault.id);
+        if (!previous) throw new Error('No provider vault');
+        const id = providerId('REPLACEMENTVAULT', 99);
+        provider.vaults.set(id, { ...previous, id });
+        await writeOnePasswordResources(files.resourceFile, { ...resources, vault: { ...resources.vault, id } });
+      } else {
+        await writeOnePasswordHostPolicy(host.policyFile, {
+          ...policy.policy,
+          ...(identity === 'account'
+            ? { accountId: OTHER_ACCOUNT_ID }
+            : { managementServiceAccountId: providerId('REPLACEMENTMANAGEMENT', 99) }),
+        });
+      }
+      const protectedFiles = [host.policyFile, host.managementTokenFile, files.resourceFile, files.runtimeTokenFile];
+      const before = await Promise.all(protectedFiles.map((file) => readFile(file, 'utf8')));
+      const request = { deleteVaults: true, confirmedPreview };
+      const result = await uninstallOnePassword(paths, request, { cli: provider.cli() });
+      expect(result).toMatchObject({ outcome: 'paused', changed: false, receipt_file: null });
+      expect(await Promise.all(protectedFiles.map((file) => readFile(file, 'utf8')))).toEqual(before);
+      expect(await exists(onePasswordUninstallFile(paths))).toBe(false);
+      expect(provider.calls.filter((call) => call.args[0] === 'vault' && call.args[1] === 'delete')).toEqual([]);
+    },
+  );
+
+  it('keeps explicit --delete-vaults authorization for an owned vault registered during the preview', async () => {
+    await assistant();
+    await enable();
+    let registered = false;
+    const result = await uninstallOnePassword(
+      paths,
+      { deleteVaults: true },
+      {
+        cli: provider.cli(),
+        ncl: async () => {
+          if (!registered) {
+            registered = true;
+            const second = await assistant();
+            const provisioned = await withInstanceOperation(paths, second.instance_id, (operation) =>
+              provisionAssistantVault(operation, dependencies()),
+            );
+            expect(provisioned?.outcome).toBe('ready');
+          }
+          return { credentialAttempts: 0 };
+        },
+      },
+    );
+    expect(result).toMatchObject({ outcome: 'completed', changed: true });
+    expect(result.assistants).toHaveLength(2);
+    expect(provider.vaults.size).toBe(0);
+  });
+
+  it('shares a rate limit through the fresh preview without changing the newly discovered vaults', async () => {
+    await assistant();
+    await enable();
+    const confirmedPreview = await previewOnePasswordUninstall(paths, { cli: provider.cli() });
+    const state = { limited: false };
+    let previews = 0;
+    let limited = false;
+    const result = await uninstallOnePassword(
+      paths,
+      { confirmedPreview },
+      {
+        cli: {
+          ...provider.cli(),
+          runCommand: async (command) => {
+            if (limited) throw new Error('Provider work continued after the fresh preview was rate limited');
+            if (previews > 1 && command.args[0] === 'whoami') {
+              limited = true;
+              return { stdout: '', stderr: '[ERROR] (429) Too Many Requests', exitCode: 1 };
+            }
+            return provider.runCommand(command);
+          },
+        },
+        rateLimitState: state,
+        ncl: async () => {
+          previews += 1;
+          if (previews === 1) {
+            const second = await assistant();
+            const provisioned = await withInstanceOperation(paths, second.instance_id, (operation) =>
+              provisionAssistantVault(operation, dependencies()),
+            );
+            expect(provisioned?.outcome).toBe('ready');
+          }
+          return { credentialAttempts: 0 };
+        },
+      },
+    );
+    expect(result).toMatchObject({ outcome: 'paused', changed: false, receipt_file: null });
+    expect(result.preview.vaults).toHaveLength(2);
+    expect(result.preview.vaults.every(({ item_count }) => item_count === null)).toBe(true);
+    expect(state.limited).toBe(true);
+    expect(await exists(onePasswordUninstallFile(paths))).toBe(false);
+    expect(await onePasswordEnabled(paths)).toBe(true);
+    expect(provider.vaults.size).toBe(2);
+  });
+
+  it('deletes owned vaults before their tokens, keeps every revocation, and handles another install generation', async () => {
+    const first = await assistant();
+    const second = await assistant();
+    const installed = await enable();
+    const host = onePasswordHostPaths(paths.configRoot);
+    const expectedRevocations = [
+      installed.management_service_account_id,
+      ...installed.assistants.map((entry) => entry.runtime_service_account_id),
+    ].sort();
+    const tokenByVault = new Map<string, string>();
+    for (const runtime of [first, second]) {
+      const record = await resourcesOf(runtime);
+      if (!record) throw new Error('not provisioned');
+      tokenByVault.set(record.vault.id, onePasswordInstancePaths(runtime.instance_root).runtimeTokenFile);
+    }
+    const result = await uninstallOnePassword(
+      paths,
+      { deleteVaults: true },
+      {
+        cli: {
+          ...provider.cli(),
+          runCommand: async (command) => {
+            if (command.args[0] === 'vault' && command.args[1] === 'delete') {
+              expect(await onePasswordEnabled(paths)).toBe(false);
+              expect(await exists(host.managementTokenFile)).toBe(true);
+              expect(await exists(tokenByVault.get(command.args[2])!)).toBe(true);
+            }
+            return provider.runCommand(command);
+          },
+        },
+        ncl: async () => ({ credentialAttempts: 0 }),
+      },
+    );
+    expect(result).toMatchObject({ outcome: 'completed', changed: true });
+    expect(result.assistants.map((entry) => entry.vault)).toEqual(['deleted', 'deleted']);
+    expect([...result.revoke_service_account_ids].sort()).toEqual(expectedRevocations);
+    expect(provider.vaults.size).toBe(0);
+    for (const runtime of [first, second]) {
+      const files = onePasswordInstancePaths(runtime.instance_root);
+      expect(await exists(files.runtimeTokenFile)).toBe(false);
+      expect(await exists(files.resourceFile)).toBe(false);
+    }
+    expect(await exists(host.managementTokenFile)).toBe(false);
+    expect(await exists(host.policyFile)).toBe(false);
+    expect((await inspectOnePasswordUninstall(paths)).status).toBe('completed');
+    provider.before = undefined;
+    const reinstalled = await enable();
+    expect(reinstalled.assistants.every((entry) => entry.outcome === 'ready')).toBe(true);
+    const again = await uninstall();
+    expect(again.outcome).toBe('completed');
+    expect(provider.vaults.size).toBe(0);
+    expect(again.revoke_service_account_ids).toEqual(expect.arrayContaining(expectedRevocations));
+    expect(again.revoke_service_account_ids).toHaveLength(6);
+    expect(await uninstallOnePassword(paths, { abandon: true }, { cli: provider.cli() })).toMatchObject({
+      outcome: 'completed',
+      receipt_file: null,
+    });
+    expect((await inspectOnePasswordUninstall(paths)).status).toBe('absent');
+  });
+
+  it('resumes after an interrupted confirmed deletion without deleting that vault twice', async () => {
+    await assistant();
+    await assistant();
+    await enable();
+    provider.calls.length = 0;
+    provider.after = (args) => {
+      if (args[0] === 'vault' && args[1] === 'delete') {
+        provider.after = undefined;
+        throw new GwsEaError('test_interrupted', 'The process stopped after the provider deleted the vault');
+      }
+    };
+    await expect(uninstall()).rejects.toMatchObject({ code: 'test_interrupted' });
+    expect(provider.vaults.size).toBe(1);
+    expect((await inspectOnePasswordUninstall(paths)).incomplete).toBe(true);
+    const blockedInstall = await enable().catch((error: unknown) => error);
+    expect(blockedInstall).toMatchObject({ code: 'onepassword_uninstall_incomplete' });
+    expect(onePasswordRecovery(blockedInstall)).toContainEqual({
+      kind: 'command',
+      argv: ['gws-ea', 'connectors', 'uninstall', 'onepassword'],
+    });
+    expect(await uninstall()).toMatchObject({ outcome: 'completed' });
+    const deletions = provider.calls.filter((call) => call.args[0] === 'vault' && call.args[1] === 'delete');
+    expect(deletions).toHaveLength(2);
+    expect(new Set(deletions.map((call) => call.args[2])).size).toBe(2);
+  });
+
+  it('stops every provider request after a deletion is rate limited and resumes next run', async () => {
+    const runtime = await assistant();
+    await enable();
+    let limited = false;
+    provider.before = (args) => {
+      if (limited) throw new Error('Provider work continued after the account rate limit');
+      if (args[0] === 'vault' && args[1] === 'delete') {
+        limited = true;
+        return { exitCode: 1, stderr: '[ERROR] (429) Too Many Requests' };
+      }
+      return undefined;
+    };
+    expect(await uninstall()).toMatchObject({ outcome: 'paused', reason: expect.stringContaining('rate limited') });
+    expect(await exists(onePasswordInstancePaths(runtime.instance_root).runtimeTokenFile)).toBe(true);
+    provider.before = undefined;
+    expect(await uninstall()).toMatchObject({ outcome: 'completed' });
+  });
+
+  it('retains a foreign-owned vault and completes without using a replacement management identity', async () => {
+    const runtime = await assistant();
+    await enable();
+    const resources = await resourcesOf(runtime);
+    if (!resources) throw new Error('not provisioned');
+    await writeOnePasswordResources(onePasswordInstancePaths(runtime.instance_root).resourceFile, {
+      ...resources,
+      vault: { ...resources.vault, createdBy: { kind: 'operator' } },
+    });
+    const result = await uninstall();
+    expect(result).toMatchObject({
+      outcome: 'completed',
+      assistants: [{ vault: 'retained', vault_id: resources.vault.id }],
+    });
+    expect(provider.vaults.has(resources.vault.id)).toBe(true);
+  });
+
+  it('preserves an unproven vault for manual cleanup and keeps reinstall fenced until acknowledged', async () => {
+    await assistant();
+    provider.after = (args) => {
+      if (args[0] === 'vault' && args[1] === 'create') {
+        provider.after = undefined;
+        throw new GwsEaError('command_timeout', 'Command timed out');
+      }
+    };
+    await enable();
+    const result = await uninstall();
+    expect(result).toMatchObject({
+      outcome: 'completed',
+      assistants: [{ vault: 'unrecorded', unproven: [{ kind: 'vault' }] }],
+    });
+    expect(provider.vaults.size).toBe(1);
+    expect((await inspectOnePasswordUninstall(paths)).incomplete).toBe(true);
+    const blockedInstall = await enable().catch((error: unknown) => error);
+    expect(blockedInstall).toMatchObject({ code: 'onepassword_uninstall_incomplete' });
+    const abandon = {
+      kind: 'command',
+      argv: ['gws-ea', 'connectors', 'uninstall', 'onepassword', '--abandon'],
+    };
+    expect(onePasswordRecovery(blockedInstall)).toContainEqual(abandon);
+    const observation = await inspectConnector(paths, 'onepassword');
+    expect(observation.next_actions).toContainEqual(abandon);
+    expect(observation.next_actions).not.toContainEqual({
+      kind: 'command',
+      argv: ['gws-ea', 'connectors', 'uninstall', 'onepassword'],
+    });
+    expect(onePasswordRecovery(blockedInstall)[0]).toMatchObject({
+      kind: 'external',
+      instruction: expect.stringContaining('manual cleanup'),
+    });
+    await uninstallOnePassword(paths, { abandon: true }, { cli: provider.cli() });
+    expect((await inspectOnePasswordUninstall(paths)).status).toBe('absent');
+  });
+
+  it('stops preview provider work after a 429 and changes nothing even with deletion confirmed', async () => {
+    await assistant();
+    await assistant();
+    await enable();
+    let limited = false;
+    provider.before = () => {
+      if (limited) throw new Error('A second request followed the rate limit');
+      limited = true;
+      return { exitCode: 1, stderr: '[ERROR] (429) Too Many Requests' };
+    };
+    const result = await uninstall();
+    expect(result).toMatchObject({ outcome: 'paused', changed: false, receipt_file: null });
+    expect(await onePasswordEnabled(paths)).toBe(true);
+    expect(provider.vaults.size).toBe(2);
+  });
+
+  it('records an unverified management token and retains its vault for manual cleanup', async () => {
+    const runtime = await assistant();
+    const installed = await enable();
+    await rm(onePasswordHostPaths(paths.configRoot).managementTokenFile);
+    const result = await uninstall();
+    expect(result).toMatchObject({
+      outcome: 'completed',
+      assistants: [{ vault: 'retained', unproven: [{ kind: 'service_account', name: 'GWS-EA management' }] }],
+    });
+    expect(result.revoke_service_account_ids).toContain(installed.management_service_account_id);
+    expect(provider.vaults.size).toBe(1);
+    expect(await exists(onePasswordInstancePaths(runtime.instance_root).runtimeTokenFile)).toBe(false);
+  });
+
+  it.each(['unsafe mode', 'temporary read failure'] as const)(
+    'pauses uninstall for a management token with %s and deletes its vault after repair',
+    async (failure) => {
+      const runtime = await assistant();
+      await enable();
+      const resources = await resourcesOf(runtime);
+      if (!resources) throw new Error('not provisioned');
+      const host = onePasswordHostPaths(paths.configRoot);
+      const files = onePasswordInstancePaths(runtime.instance_root);
+      const readOwnerOnlyFile = secrets.readOwnerOnlyFile;
+      const fault =
+        failure === 'temporary read failure'
+          ? vi.spyOn(secrets, 'readOwnerOnlyFile').mockImplementation(async (file) => {
+              if (file === host.managementTokenFile)
+                throw Object.assign(new Error('Too many open files'), { code: 'EMFILE' });
+              return readOwnerOnlyFile(file);
+            })
+          : undefined;
+      if (failure === 'unsafe mode') await chmod(host.managementTokenFile, 0o644);
+
+      const paused = await uninstall();
+
+      expect(paused).toMatchObject({ outcome: 'paused' });
+      expect(provider.vaults.has(resources.vault.id)).toBe(true);
+      for (const file of [host.managementTokenFile, host.policyFile, files.resourceFile, files.runtimeTokenFile])
+        expect(await exists(file)).toBe(true);
+      const receipt = await inspectOnePasswordUninstall(paths);
+      expect(receipt.receipt?.completed).toBe(false);
+      expect(receipt.receipt?.assistants[runtime.instance_id].cleanup.vault).toBeUndefined();
+      expect(receipt.receipt?.assistants[runtime.instance_id].cleanup.unproven).not.toContainEqual({
+        kind: 'service_account',
+        name: 'GWS-EA management',
+      });
+
+      fault?.mockRestore();
+      if (failure === 'unsafe mode') await chmod(host.managementTokenFile, 0o600);
+      expect(await uninstall()).toMatchObject({
+        outcome: 'completed',
+        assistants: [{ vault: 'deleted', vault_id: resources.vault.id }],
+      });
+      expect(provider.vaults.has(resources.vault.id)).toBe(false);
+      expect(await exists(host.managementTokenFile)).toBe(false);
+      expect(provider.calls.filter((call) => call.args[0] === 'vault' && call.args[1] === 'delete')).toHaveLength(1);
+    },
+  );
+
+  it('keeps the name of a captured but unverified runtime account after removing its token', async () => {
+    const runtime = await assistant();
+    provider.before = (args) => {
+      if (args.join(' ') === 'whoami --format json' && provider.serviceAccounts.size === 2)
+        throw new Error('The process stopped while verifying the runtime token');
+      return undefined;
+    };
+    await expect(enable()).rejects.toThrow('The process stopped');
+    provider.before = undefined;
+    const result = await uninstall();
+    expect(result).toMatchObject({
+      outcome: 'completed',
+      assistants: [
+        {
+          vault: 'deleted',
+          runtime_token: 'deleted',
+          unproven: [
+            {
+              kind: 'service_account',
+              name: `GWS-EA ${runtime.instance_id.slice(0, 8)} aya.${runtime.instance_id.slice(0, 8)}@example.test`,
+            },
+          ],
+        },
+      ],
+    });
+    expect(await exists(onePasswordInstancePaths(runtime.instance_root).runtimeTokenFile)).toBe(false);
+    const receipt = await inspectOnePasswordUninstall(paths);
+    expect(receipt.status).toBe('completed');
+    expect(receipt.receipt?.assistants[runtime.instance_id].cleanup.unproven).toEqual(result.assistants[0].unproven);
+    expect(provider.serviceAccounts.size).toBe(2);
+  });
+
+  it.each(['revoke-only', 'abandoned'] as const)(
+    'refuses unsettled removal but permits a %s receipt',
+    async (settled) => {
+      const runtime = await assistant();
+      await enable();
+      const captured = await captureOnePasswordCleanup(
+        paths,
+        (await readRegistry(paths)).instances[runtime.instance_id],
+        'delete',
+      );
+      if (captured.status !== 'captured') throw new Error('not captured');
+      await mkdir(paths.removalRoot, { recursive: true, mode: 0o700 });
+      const removal = paths.removalFile(runtime.instance_id);
+      await writeFile(removal, JSON.stringify({ onepassword: captured.cleanup }), { mode: 0o600 });
+      await expect(uninstall()).rejects.toMatchObject({ code: 'onepassword_removal_pending' });
+      expect(await onePasswordEnabled(paths)).toBe(true);
+      expect(await exists(onePasswordUninstallFile(paths))).toBe(false);
+      await writeFile(
+        removal,
+        JSON.stringify(
+          settled === 'abandoned'
+            ? {
+                onepassword: captured.cleanup,
+                abandoned: {
+                  onepassword: { at: new Date().toISOString(), evidence: 'The operator accepted manual cleanup' },
+                },
+              }
+            : {
+                onepassword: {
+                  ...captured.cleanup,
+                  vault: { outcome: 'deleted', item_count: 0, reason: 'Verified gone', at: new Date().toISOString() },
+                },
+              },
+        ),
+        { mode: 0o600 },
+      );
+      expect(await uninstall()).toMatchObject({ outcome: 'completed' });
+    },
+  );
+
+  it('refuses a busy assistant before publishing stopped or creating a receipt', async () => {
+    const runtime = await assistant();
+    await enable();
+    const release = await processLock(paths.instanceLock(runtime.instance_id));
+    if (!release) throw new Error('No lock');
+    try {
+      await expect(uninstall()).rejects.toMatchObject({ code: 'instance_busy' });
+      expect(await onePasswordEnabled(paths)).toBe(true);
+      expect(await exists(onePasswordUninstallFile(paths))).toBe(false);
+      expect(provider.vaults.size).toBe(1);
+    } finally {
+      release();
+    }
   });
 });

@@ -66,6 +66,7 @@ export interface JournalStep {
 
 /** Human decisions, fixed once made. */
 export interface JournalDecisions {
+  readonly alias_skipped_at?: string;
   /** `--chat-configured`: the operator finished the Google Chat API configuration. */
   readonly chat_configuration_confirmed_at?: string;
   /** The address the principal uses for Google Chat, as create named it: the one the assistant opens its DM with. */
@@ -148,6 +149,9 @@ function principalChatEmail(value: unknown): string {
 function parseDecisions(value: unknown): JournalDecisions {
   if (!isRecord(value)) throw invalid('Provision journal decisions are invalid');
   return {
+    ...(value.alias_skipped_at === undefined
+      ? {}
+      : { alias_skipped_at: timestamp(value.alias_skipped_at, 'Alias skip') }),
     ...(value.chat_configuration_confirmed_at === undefined
       ? {}
       : { chat_configuration_confirmed_at: timestamp(value.chat_configuration_confirmed_at, 'Chat confirmation') }),
@@ -357,6 +361,14 @@ export function recordStepFailure(
     ...(log ? { log: singleLine(log) } : {}),
   };
   return updateProvisionJournal(operation, (journal) => ({ ...journal, last_error: failure }));
+}
+
+export function recordAliasSkipped(operation: InstanceOperation): Promise<ProvisionJournal> {
+  return updateProvisionJournal(operation, (journal) =>
+    journal.decisions.alias_skipped_at
+      ? journal
+      : { ...journal, decisions: { ...journal.decisions, alias_skipped_at: new Date().toISOString() } },
+  );
 }
 
 export function recordChatConfigurationConfirmed(operation: InstanceOperation): Promise<ProvisionJournal> {

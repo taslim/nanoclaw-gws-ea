@@ -19,7 +19,6 @@ import { processLock } from '../community-portal/process-lock.js';
 import {
   discardServiceAccountCreation,
   OnePasswordCli,
-  retireCapturedServiceAccount,
   serviceAccountCreationUnproven,
   type OnePasswordAccount,
   type OnePasswordAccountType,
@@ -47,7 +46,7 @@ import {
   type OnePasswordVaultPermission,
 } from '../modules/gws-ea-browser/onepassword-policy.js';
 import { formatLocalTime } from '../timezone.js';
-import { withAssistantLock } from './browser-capability.js';
+import { withAssistantLock } from './assistant-lock.js';
 import type { InstanceOperation } from './journal.js';
 import { preparePrivateDirectory, type ControlPlanePaths } from './paths.js';
 import { exists } from './release-layout.js';
@@ -65,7 +64,7 @@ import { INSTANCE_ID_PATTERN, isRecord } from './validation.js';
 
 export const ONEPASSWORD_CAPABILITY = {
   name: 'onepassword',
-  actions: ['show', 'check', 'enable', 'disable'],
+  actions: ['install', 'uninstall', 'show', 'check'],
   scope: 'host',
   summary: 'Give each compatible assistant its own 1Password vault for the logins it fills and saves.',
   prerequisites: [
@@ -101,9 +100,16 @@ export type OnePasswordReleaseCompatibility = 'compatible' | 'unsupported' | 'un
 export async function onePasswordReleaseCompatibility(checkout: string): Promise<OnePasswordReleaseCompatibility> {
   try {
     const item: unknown = JSON.parse(await readFile(path.join(checkout, CONTRACT_FILE), 'utf8'));
-    return isRecord(item) && item.schemaVersion === 1 && item.contract === ONEPASSWORD_CONTRACT
-      ? 'compatible'
-      : 'unsupported';
+    if (
+      !isRecord(item) ||
+      typeof item.schemaVersion !== 'number' ||
+      !Number.isSafeInteger(item.schemaVersion) ||
+      item.schemaVersion < 1 ||
+      typeof item.contract !== 'string' ||
+      !item.contract.trim()
+    )
+      return 'unknown';
+    return item.schemaVersion === 1 && item.contract === ONEPASSWORD_CONTRACT ? 'compatible' : 'unsupported';
   } catch (error) {
     if (isErrno(error, 'ENOENT') || isErrno(error, 'ENOTDIR')) return 'unsupported';
     if (error instanceof SyntaxError) return 'unknown';
@@ -114,6 +120,8 @@ export async function onePasswordReleaseCompatibility(checkout: string): Promise
 /** Why an assistant's provisioning waits; each names its own recovery. */
 export const ONEPASSWORD_PENDING_REASONS = [
   'instance_busy',
+  'onepassword_busy',
+  'operator_sign_in_needed',
   'cli_unavailable',
   'policy_invalid',
   'sign_in_required',
@@ -152,7 +160,7 @@ export interface OnePasswordAssistantProvisioning {
   readonly retired_service_account_ids: readonly string[];
 }
 
-export interface OnePasswordEnableData {
+export interface OnePasswordInstallData {
   readonly name: 'onepassword';
   readonly scope: 'host';
   readonly enabled: true;
@@ -162,7 +170,7 @@ export interface OnePasswordEnableData {
   readonly future_compatible_assistants: true;
 }
 
-export interface OnePasswordEnableRequest {
+export interface OnePasswordInstallRequest {
   /** The exact account to use; only needed before the host has one. */
   readonly accountId?: string;
   /**
@@ -184,6 +192,10 @@ export interface OnePasswordDependencies {
   readonly chooseAccount?: (accounts: readonly OnePasswordAccount[]) => Promise<string | undefined>;
   readonly recordEffect?: (changed: true | null) => void;
   readonly progress?: (line: string) => void;
+  /** True only when the operator's terminal can handle desktop approval. */
+  readonly operatorTerminal?: boolean;
+  /** Shared by a bulk operation so a rate limit prevents later provider work. */
+  readonly rateLimitState?: { limited: boolean };
 }
 
 function invalidArguments(message: string): GwsEaError {
@@ -247,10 +259,14 @@ function pendingMessage(
   facts: { readonly names?: ResourceNames; readonly serviceAccountId?: string | null; readonly file?: string },
 ): string {
   switch (reason) {
+    case 'onepassword_busy':
+      return 'Another 1Password operation holds the host; retry once it finishes.';
+    case 'operator_sign_in_needed':
+      return 'Run gws-ea connectors install onepassword from an operator terminal to finish the vault, approving the 1Password app when it asks.';
     case 'instance_busy':
       return 'Another operation holds this assistant; retry once it finishes.';
     case 'cli_unavailable':
-      return 'The 1Password CLI this host recorded is missing or too old. Install a current one, then run gws-ea capabilities enable onepassword to record it.';
+      return 'The 1Password CLI this host recorded is missing or too old. Install a current one, then run gws-ea connectors install onepassword to record it.';
     case 'policy_invalid':
       return `The 1Password host policy cannot be used safely${facts.file ? ` (${facts.file})` : ''}. Inspect it before retrying.`;
     case 'sign_in_required':
@@ -285,7 +301,7 @@ function pendingMessage(
 function skipMessage(reason: OnePasswordSkipReason): string {
   switch (reason) {
     case 'release_unsupported':
-      return 'This release does not support 1Password vaults; update it, then enable 1Password again.';
+      return 'This release does not support 1Password vaults; update it, then install 1Password again.';
     case 'release_unknown':
       return 'Release compatibility could not be established; inspect the assistant.';
     case 'not_created':
@@ -315,7 +331,11 @@ function pendingReasonFor(
     case 'unexpected_output':
     case 'failed':
     case 'outcome_unknown':
-      return identity === 'runtime' ? 'runtime_unverified' : 'provider_failed';
+      return identity === 'runtime'
+        ? 'runtime_unverified'
+        : identity === 'operator'
+          ? 'operator_sign_in_needed'
+          : 'provider_failed';
   }
 }
 
@@ -577,7 +597,7 @@ async function openCli(seams: OnePasswordCliSeams | undefined, command?: string)
   throw opening.reason === 'cli_too_old' ? cliError(opening.reason, opening.version) : cliError(opening.reason);
 }
 
-async function underHostLock<T>(paths: ControlPlanePaths, work: () => Promise<T>): Promise<T> {
+export async function withOnePasswordHostLock<T>(paths: ControlPlanePaths, work: () => Promise<T>): Promise<T> {
   await preparePrivateDirectory(paths.configRoot);
   const release = await processLock(path.join(paths.configRoot, 'onepassword.lock'));
   if (!release)
@@ -769,19 +789,36 @@ async function discardAssistantAttempt(paths: ControlPlanePaths, instanceId: str
  * the others are reported and left untouched. A partial enable keeps what it
  * finished, reports what waits, and a retry continues only what is incomplete.
  */
-export async function enableOnePassword(
+export async function installOnePassword(
   paths: ControlPlanePaths,
-  request: OnePasswordEnableRequest = {},
+  request: OnePasswordInstallRequest = {},
   dependencies: OnePasswordDependencies = {},
-): Promise<OnePasswordEnableData> {
+): Promise<OnePasswordInstallData> {
   if (request.accountId !== undefined && !isOnePasswordId(request.accountId))
     throw invalidArguments('--account must be an exact 1Password account ID (26 letters and digits).');
   const discard = request.discardUnproven;
   if (discard !== undefined && discard !== MANAGEMENT_TARGET && !INSTANCE_ID_PATTERN.test(discard))
     throw invalidArguments(`--discard-unproven must be ${MANAGEMENT_TARGET} or a full assistant ID.`);
+  const { inspectOnePasswordUninstall } = await import('./onepassword-uninstall.js');
+  const assertUninstallComplete = async (): Promise<void> => {
+    const inspection = await inspectOnePasswordUninstall(paths);
+    if (!inspection.incomplete) return;
+    const completed = inspection.receipt?.completed === true;
+    throw new GwsEaError(
+      'onepassword_uninstall_incomplete',
+      completed
+        ? 'Inspect the uninstall receipt and finish its manual cleanup on 1Password.com before acknowledging it with gws-ea connectors uninstall onepassword --abandon.'
+        : 'Finish gws-ea connectors uninstall onepassword before installing again.',
+      { details: { uninstall_completed: completed } },
+    );
+  };
+  await assertUninstallComplete();
+  if (dependencies.operatorTerminal === false)
+    throw new GwsEaError('onepassword_operator_sign_in_needed', pendingMessage('operator_sign_in_needed', {}));
   // Nothing on disk changes until a trusted, current CLI is found.
   const cli = await openCli(dependencies.cli);
-  return underHostLock(paths, async () => {
+  return withOnePasswordHostLock(paths, async () => {
+    await assertUninstallComplete();
     const effects = new Effects(dependencies.recordEffect);
     const hostPaths = onePasswordHostPaths(paths.configRoot);
     const existing = await readOnePasswordHostPolicy(hostPaths.policyFile);
@@ -803,7 +840,7 @@ export async function enableOnePassword(
     if (!upsertEnvVars && ids.length)
       throw new GwsEaError(
         'onepassword_binding_unavailable',
-        'The gws-ea launcher must supply its native environment writer to enable 1Password.',
+        'The gws-ea launcher must supply its native environment writer to install 1Password.',
       );
 
     const { accountId, signInAddress } = await selectAccount(
@@ -872,34 +909,8 @@ export async function enableOnePassword(
   });
 }
 
-export interface OnePasswordAssistantDisable {
-  readonly instance_id: string;
-  /** `pending` when its record cannot be used safely, so its token was kept for the operator to inspect. */
-  readonly outcome: 'disabled' | 'pending';
-  readonly reason: string | null;
-  readonly changed: Changed;
-  readonly vault_id: string | null;
-  /** Deleted by this run, already absent, or kept beside a record that cannot be used safely. */
-  readonly runtime_token: 'deleted' | 'absent' | 'kept';
-  /** Every runtime service account whose token is gone from this host: deleting a token never revokes its account. */
-  readonly revoke_service_account_ids: readonly string[];
-  /** The name of a runtime service account whose creation was never verified, so it may exist unrecorded. */
-  readonly unproven_service_account: string | null;
-}
-
-export interface OnePasswordDisableData {
-  readonly name: 'onepassword';
-  readonly scope: 'host';
-  readonly enabled: false;
-  /** Null when 1Password was never enabled on this host. */
-  readonly account_id: string | null;
-  /** Kept for re-enabling and removal; no assistant can use it while disabled. */
-  readonly management_service_account_id: string | null;
-  readonly assistants: readonly OnePasswordAssistantDisable[];
-}
-
 /** Every registered assistant's instance lock, or none: a busy one refuses before anything changes. */
-async function underEveryAssistantLock<T>(
+export async function withOnePasswordAssistantLocks<T>(
   paths: ControlPlanePaths,
   instanceIds: readonly string[],
   work: () => Promise<T>,
@@ -923,122 +934,6 @@ async function underEveryAssistantLock<T>(
   }
 }
 
-/**
- * Delete one assistant's local runtime token, under its lock, once the
- * disabled intent is published. The account it authenticates stays on
- * 1Password.com until the operator revokes it, so its ID moves to the
- * record's retired accounts, deleted token first: a crash in between leaves a
- * recorded account without a token, which a rerun retires.
- */
-async function retireRuntimeAccess(
-  paths: ControlPlanePaths,
-  instanceId: string,
-  accountId: string,
-  recordEffect: OnePasswordDependencies['recordEffect'],
-): Promise<OnePasswordAssistantDisable> {
-  const effects = new Effects(recordEffect);
-  const files = onePasswordInstancePaths(paths.instanceRoot(instanceId));
-  const entry = (facts: Partial<OnePasswordAssistantDisable>): OnePasswordAssistantDisable => ({
-    instance_id: instanceId,
-    outcome: 'disabled',
-    reason: null,
-    changed: effects.changed,
-    vault_id: null,
-    runtime_token: 'absent',
-    revoke_service_account_ids: [],
-    unproven_service_account: null,
-    ...facts,
-  });
-  const read = await readOnePasswordResources(files.resourceFile, { instanceId, accountId });
-  if (read.status === 'invalid')
-    return entry({
-      outcome: 'pending',
-      reason: pendingMessage('resources_invalid', { file: files.resourceFile }),
-      runtime_token: (await tokenState(files.runtimeTokenFile)) === 'absent' ? 'absent' : 'kept',
-    });
-  // A runtime token is only ever minted for a recorded vault.
-  if (read.status === 'absent') return entry({});
-  let resources = read.resources;
-  const present = (await tokenState(files.runtimeTokenFile)) !== 'absent';
-  let unproven: string | null = null;
-  const current = resources.runtimeServiceAccountId;
-  if (current !== null) {
-    if (present) {
-      effects.starting();
-      await removePrivateFile(files.runtimeTokenFile);
-      effects.done();
-    }
-    resources = {
-      ...resources,
-      runtimeServiceAccountId: null,
-      retiredRuntimeServiceAccountIds: [...resources.retiredRuntimeServiceAccountIds, current],
-    };
-    effects.starting();
-    await writeOnePasswordResources(files.resourceFile, resources);
-    effects.done();
-  } else if (present || (await serviceAccountCreationUnproven(files.runtimeTokenFile))) {
-    // A token captured but never verified names an account gws-ea cannot identify: it stays an unproven creation.
-    const reservation = await getInstanceReservation(paths, instanceId);
-    unproven = resourceNames(reservation.exclusive_resource_claims.workspace_email, instanceId).runtimeServiceAccount;
-    if (present) {
-      effects.starting();
-      await retireCapturedServiceAccount(files.runtimeTokenFile, unproven);
-      effects.done();
-    }
-  }
-  return entry({
-    vault_id: resources.vault.id,
-    runtime_token: present ? 'deleted' : 'absent',
-    revoke_service_account_ids: resources.retiredRuntimeServiceAccountIds,
-    unproven_service_account: unproven,
-  });
-}
-
-/**
- * The disabled intent is published first, under the host lock and every
- * assistant's lock: each host re-reads it before every vault use, so running
- * and restarted hosts stop at once. Then each local runtime token is deleted.
- * Vaults and their items, every recorded ID, unfinished credential attempts
- * and the management service account stay; it needs no provider, and it
- * revokes nothing: the result names each account only the operator can revoke.
- */
-export async function disableOnePassword(
-  paths: ControlPlanePaths,
-  dependencies: Pick<OnePasswordDependencies, 'recordEffect'> = {},
-): Promise<OnePasswordDisableData> {
-  return underHostLock(paths, async () => {
-    const hostPaths = onePasswordHostPaths(paths.configRoot);
-    const read = await readOnePasswordHostPolicy(hostPaths.policyFile);
-    if (read.status === 'invalid')
-      throw new GwsEaError(
-        'onepassword_policy_invalid',
-        `The 1Password host policy cannot be used safely (${read.problem}). Inspect ${hostPaths.policyFile} before retrying.`,
-      );
-    const disabled = { name: 'onepassword', scope: 'host', enabled: false } as const;
-    if (read.status === 'absent')
-      return { ...disabled, account_id: null, management_service_account_id: null, assistants: [] };
-    const { policy } = read;
-    const ids = Object.keys((await readRegistry(paths)).instances).sort();
-    return underEveryAssistantLock(paths, ids, async () => {
-      if (policy.enabled) {
-        const effects = new Effects(dependencies.recordEffect);
-        effects.starting();
-        await writeOnePasswordHostPolicy(hostPaths.policyFile, { ...policy, enabled: false });
-        effects.done();
-      }
-      const assistants: OnePasswordAssistantDisable[] = [];
-      for (const id of ids)
-        assistants.push(await retireRuntimeAccess(paths, id, policy.accountId, dependencies.recordEffect));
-      return {
-        ...disabled,
-        account_id: policy.accountId,
-        management_service_account_id: policy.managementServiceAccountId,
-        assistants,
-      };
-    });
-  });
-}
-
 /** An unusable policy counts as enabled, so its owner hears of it. */
 export async function onePasswordEnabled(paths: ControlPlanePaths): Promise<boolean> {
   const read = await readOnePasswordHostPolicy(onePasswordHostPaths(paths.configRoot).policyFile);
@@ -1046,63 +941,84 @@ export async function onePasswordEnabled(paths: ControlPlanePaths): Promise<bool
 }
 
 /**
- * Enable's reconciliation for one assistant during its operator-led create or
+ * Install's reconciliation for one assistant during its operator-led create or
  * resume, under the instance operation the caller holds. Undefined when
  * 1Password is not enabled on this host. An assistant already provisioned
  * costs no provider request and no desktop prompt.
  */
 export async function provisionAssistantVault(
   operation: InstanceOperation,
-  dependencies: Pick<OnePasswordDependencies, 'cli' | 'upsertEnvVars' | 'recordEffect'> = {},
+  dependencies: Pick<
+    OnePasswordDependencies,
+    'cli' | 'upsertEnvVars' | 'recordEffect' | 'operatorTerminal' | 'rateLimitState'
+  > = {},
 ): Promise<OnePasswordAssistantProvisioning | undefined> {
   operation.assertActive();
   const { paths, instanceId } = operation;
-  const hostPaths = onePasswordHostPaths(paths.configRoot);
-  const read = await readOnePasswordHostPolicy(hostPaths.policyFile);
-  if (read.status === 'absent' || (read.status === 'ready' && !read.policy.enabled)) return undefined;
-  const hostPending = (reason: OnePasswordPendingReason): OnePasswordAssistantProvisioning =>
-    provisioning(instanceId, 'pending', {
-      reason,
-      message: pendingMessage(reason, { file: hostPaths.policyFile }),
-      changed: false,
+  const { inspectOnePasswordUninstall } = await import('./onepassword-uninstall.js');
+  if ((await inspectOnePasswordUninstall(paths)).incomplete) return undefined;
+  const pending = (reason: OnePasswordPendingReason): OnePasswordAssistantProvisioning =>
+    provisioning(instanceId, 'pending', { reason, message: pendingMessage(reason, {}), changed: false });
+  if (dependencies.rateLimitState?.limited) return pending('rate_limited');
+  try {
+    return await withOnePasswordHostLock(paths, async () => {
+      if ((await inspectOnePasswordUninstall(paths)).incomplete) return undefined;
+      const hostPaths = onePasswordHostPaths(paths.configRoot);
+      const read = await readOnePasswordHostPolicy(hostPaths.policyFile);
+      if (read.status === 'absent' || (read.status === 'ready' && !read.policy.enabled)) return undefined;
+      const hostPending = (reason: OnePasswordPendingReason): OnePasswordAssistantProvisioning =>
+        provisioning(instanceId, 'pending', {
+          reason,
+          message: pendingMessage(reason, { file: hostPaths.policyFile }),
+          changed: false,
+        });
+      if (read.status === 'invalid') return hostPending('policy_invalid');
+      const managementServiceAccountId = read.policy.managementServiceAccountId;
+      if (managementServiceAccountId === null) return hostPending('policy_invalid');
+      const policy = { ...read.policy, managementServiceAccountId };
+      let connection: Promise<ConnectionResult> | undefined;
+      const connect = async (): Promise<ConnectionResult> => {
+        if (dependencies.operatorTerminal === false) return { status: 'pending', reason: 'operator_sign_in_needed' };
+        let cli: OnePasswordCli;
+        try {
+          cli = await openCli(dependencies.cli, policy.cliPath);
+        } catch (error) {
+          if (error instanceof GwsEaError && error.code.startsWith('onepassword_cli_'))
+            return { status: 'pending', reason: 'cli_unavailable' };
+          throw error;
+        }
+        const operator: OperatorIdentity = { kind: 'operator', accountId: policy.accountId };
+        const who = await cli.whoami(operator);
+        if (who.status !== 'ok') return { status: 'pending', reason: pendingReasonFor(who.reason, 'operator') };
+        const management: ServiceAccountIdentity = {
+          kind: 'service_account',
+          accountId: policy.accountId,
+          tokenFile: hostPaths.managementTokenFile,
+        };
+        const verified = await cli.whoami(management);
+        if (verified.status !== 'ok')
+          return { status: 'pending', reason: pendingReasonFor(verified.reason, 'management') };
+        if (verified.userId !== managementServiceAccountId)
+          return { status: 'pending', reason: 'management_unavailable' };
+        return { status: 'ok', connection: { cli, operator, operatorUserId: who.userId, management } };
+      };
+      const result = await reconcileAssistant(
+        {
+          paths,
+          policy,
+          connect: () => (connection ??= connect()),
+          ...(dependencies.upsertEnvVars ? { upsertEnvVars: dependencies.upsertEnvVars } : {}),
+          ...(dependencies.recordEffect ? { recordEffect: dependencies.recordEffect } : {}),
+        },
+        instanceId,
+      );
+      if (result.reason === 'rate_limited' && dependencies.rateLimitState) dependencies.rateLimitState.limited = true;
+      return result;
     });
-  if (read.status === 'invalid') return hostPending('policy_invalid');
-  const managementServiceAccountId = read.policy.managementServiceAccountId;
-  if (managementServiceAccountId === null) return hostPending('policy_invalid');
-  const policy = { ...read.policy, managementServiceAccountId };
-  let connection: Promise<ConnectionResult> | undefined;
-  const connect = async (): Promise<ConnectionResult> => {
-    let cli: OnePasswordCli;
-    try {
-      cli = await openCli(dependencies.cli, policy.cliPath);
-    } catch (error) {
-      if (error instanceof GwsEaError && error.code.startsWith('onepassword_cli_'))
-        return { status: 'pending', reason: 'cli_unavailable' };
-      throw error;
-    }
-    const operator: OperatorIdentity = { kind: 'operator', accountId: policy.accountId };
-    const who = await cli.whoami(operator);
-    if (who.status !== 'ok') return { status: 'pending', reason: pendingReasonFor(who.reason, 'operator') };
-    const management: ServiceAccountIdentity = {
-      kind: 'service_account',
-      accountId: policy.accountId,
-      tokenFile: hostPaths.managementTokenFile,
-    };
-    const verified = await cli.whoami(management);
-    if (verified.status !== 'ok') return { status: 'pending', reason: pendingReasonFor(verified.reason, 'management') };
-    if (verified.userId !== managementServiceAccountId) return { status: 'pending', reason: 'management_unavailable' };
-    return { status: 'ok', connection: { cli, operator, operatorUserId: who.userId, management } };
-  };
-  return reconcileAssistant(
-    {
-      paths,
-      policy,
-      connect: () => (connection ??= connect()),
-      ...(dependencies.upsertEnvVars ? { upsertEnvVars: dependencies.upsertEnvVars } : {}),
-      ...(dependencies.recordEffect ? { recordEffect: dependencies.recordEffect } : {}),
-    },
-    instanceId,
-  );
+  } catch (error) {
+    if (error instanceof GwsEaError && error.code === 'onepassword_busy') return pending('onepassword_busy');
+    throw error;
+  }
 }
 
 export type OnePasswordTokenState = 'present' | 'absent' | 'invalid';
@@ -1167,17 +1083,13 @@ export interface OnePasswordCapabilityObservation {
   readonly future_compatible_assistants: true;
 }
 
-export interface OnePasswordCapabilityCatalog {
-  readonly name: 'onepassword';
-  readonly scope: 'host';
-  readonly actions: typeof ONEPASSWORD_CAPABILITY.actions;
-  readonly summary: string;
-  readonly activation: 'enabled' | 'disabled' | 'unknown';
-}
-
 export interface OnePasswordInspection {
   /** Make service-account requests: identities, vault reads and the shared usage. */
   readonly check?: boolean;
+  /** Limit local observations and provider work to one selected assistant. */
+  readonly instanceId?: string;
+  /** Check runtime credentials only for reachable assistants selected by the caller. */
+  readonly checkAssistantIds?: readonly string[];
   readonly cli?: OnePasswordCliSeams;
 }
 
@@ -1214,7 +1126,13 @@ async function localReadiness(
     runtime = await loadInstanceRuntimeConfig(paths.runtimeFile(instanceId));
   } catch (error) {
     if (isErrno(error, 'ENOENT')) return { readiness: { ...base, reason: skipMessage('not_created') } };
-    throw error;
+    if (!(error instanceof Error)) throw error;
+    return {
+      readiness: {
+        ...base,
+        reason: `Assistant runtime configuration is invalid or inaccessible. Inspect gws-ea status --id ${instanceId}.`,
+      },
+    };
   }
   const compatibility = await onePasswordReleaseCompatibility(runtime.checkout_root);
   if (compatibility !== 'compatible')
@@ -1268,7 +1186,7 @@ async function localReadiness(
         resources.runtimeServiceAccountId !== null && token !== 'present'
           ? pendingMessage('runtime_token_unavailable', { serviceAccountId: resources.runtimeServiceAccountId })
           : resources.runtimeServiceAccountId === null && retired.length
-            ? `Its runtime token was deleted when 1Password was disabled; enabling it again mints a replacement. Revoke ${retired.join(', ')} on 1Password.com if still listed.`
+            ? `Its runtime token was deleted when 1Password was stopped; installing it again mints a replacement. Revoke ${retired.join(', ')} on 1Password.com if still listed.`
             : null,
     },
   };
@@ -1276,7 +1194,7 @@ async function localReadiness(
 
 const LIMIT_SPENT = "Not checked: 1Password's request limit is spent.";
 const DISABLED_REASON =
-  'The operator disabled 1Password: no assistant can use its vault. Every vault, its items and the recorded IDs are kept.';
+  '1Password vault use is stopped. Rerun gws-ea connectors uninstall onepassword to finish the recorded cleanup.';
 
 function checkReason(reason: OnePasswordFailureReason): string {
   return `1Password answered ${reason.replaceAll('_', ' ')}.`;
@@ -1343,7 +1261,9 @@ export async function inspectOnePasswordCapability(
   const read = await readOnePasswordHostPolicy(hostPaths.policyFile);
   const policy = read.status === 'ready' ? read.policy : undefined;
   const activation = hostActivation(read, hostPaths.policyFile);
-  const ids = Object.keys((await readRegistry(paths)).instances).sort();
+  const ids = Object.keys((await readRegistry(paths)).instances)
+    .filter((id) => options.instanceId === undefined || id === options.instanceId)
+    .sort();
   const locals = [];
   for (const id of ids) locals.push({ id, ...(await localReadiness(paths, id, policy?.accountId)) });
   const sharing = locals.filter((local) => local.readiness.provisioning === 'ready').map((local) => local.id);
@@ -1426,7 +1346,13 @@ export async function inspectOnePasswordCapability(
         };
       }
       for (const [index, local] of locals.entries()) {
-        if (local.readiness.provisioning !== 'ready' || !local.resources || !local.files) continue;
+        if (
+          (options.checkAssistantIds !== undefined && !options.checkAssistantIds.includes(local.id)) ||
+          local.readiness.provisioning !== 'ready' ||
+          !local.resources ||
+          !local.files
+        )
+          continue;
         const runtimeIdentity: ServiceAccountIdentity = {
           kind: 'service_account',
           accountId: policy.accountId,
@@ -1463,21 +1389,8 @@ export async function inspectOnePasswordCapability(
   };
 }
 
-/** The catalog entry `capabilities list` shows, from the host policy alone. */
-export async function onePasswordCapabilityCatalog(paths: ControlPlanePaths): Promise<OnePasswordCapabilityCatalog> {
-  const read = await readOnePasswordHostPolicy(onePasswordHostPaths(paths.configRoot).policyFile);
-  return {
-    name: ONEPASSWORD_CAPABILITY.name,
-    scope: ONEPASSWORD_CAPABILITY.scope,
-    actions: ONEPASSWORD_CAPABILITY.actions,
-    summary: ONEPASSWORD_CAPABILITY.summary,
-    activation:
-      read.status === 'invalid' ? 'unknown' : read.status === 'ready' && read.policy.enabled ? 'enabled' : 'disabled',
-  };
-}
-
-function enableCommand(...flags: string[]): NextAction {
-  return { kind: 'command', argv: ['gws-ea', 'capabilities', 'enable', 'onepassword', ...flags] };
+function installCommand(...flags: string[]): NextAction {
+  return { kind: 'command', argv: ['gws-ea', 'connectors', 'install', 'onepassword', ...flags] };
 }
 
 function assistantActions(entry: OnePasswordAssistantProvisioning): readonly NextAction[] {
@@ -1496,13 +1409,15 @@ function assistantActions(entry: OnePasswordAssistantProvisioning): readonly Nex
       return [];
     case 'vault_creation_unproven':
     case 'service_account_creation_unproven':
-      return [...external(entry.message), enableCommand('--discard-unproven', entry.instance_id)];
+      return [...external(entry.message), installCommand('--discard-unproven', entry.instance_id)];
     case 'runtime_unverified':
-      return [...external(entry.message), enableCommand(), enableCommand('--discard-unproven', entry.instance_id)];
+      return [...external(entry.message), installCommand(), installCommand('--discard-unproven', entry.instance_id)];
     case 'instance_busy':
+    case 'onepassword_busy':
+    case 'operator_sign_in_needed':
     case 'rate_limited':
     case 'provider_failed':
-      return [...external(entry.message), enableCommand()];
+      return [...external(entry.message), installCommand()];
     case 'cli_unavailable':
     case 'policy_invalid':
     case 'sign_in_required':
@@ -1513,7 +1428,7 @@ function assistantActions(entry: OnePasswordAssistantProvisioning): readonly Nex
     case 'runtime_token_unavailable':
     case 'resources_invalid':
     case 'vault_not_owned':
-      return [...external(entry.message), enableCommand()];
+      return [...external(entry.message), installCommand()];
   }
 }
 
@@ -1545,7 +1460,7 @@ export function onePasswordRevocation(
     : undefined;
 }
 
-export function onePasswordEnableNextActions(data: OnePasswordEnableData): readonly NextAction[] {
+export function onePasswordInstallNextActions(data: OnePasswordInstallData): readonly NextAction[] {
   const actions = distinctActions(data.assistants.flatMap(assistantActions));
   const revocation = onePasswordRevocation(
     data.assistants.map((entry) => ({
@@ -1556,68 +1471,9 @@ export function onePasswordEnableNextActions(data: OnePasswordEnableData): reado
   return [
     ...(actions.length
       ? actions
-      : [{ kind: 'command', argv: ['gws-ea', 'capabilities', 'check', 'onepassword'] } as const]),
+      : [{ kind: 'command', argv: ['gws-ea', 'connectors', 'check', 'onepassword'] } as const]),
     ...(revocation ? [revocation] : []),
   ];
-}
-
-export function onePasswordDisableNextActions(data: OnePasswordDisableData): readonly NextAction[] {
-  const revocation = onePasswordRevocation(
-    data.assistants.map((entry) => ({
-      instanceId: entry.instance_id,
-      serviceAccountIds: entry.revoke_service_account_ids,
-    })),
-  );
-  return [
-    ...(revocation ? [revocation] : []),
-    ...data.assistants.flatMap((entry): NextAction[] => [
-      ...(entry.unproven_service_account
-        ? [
-            {
-              kind: 'external' as const,
-              instruction: `Assistant ${entry.instance_id}: 1Password may hold a runtime service account named "${entry.unproven_service_account}" that gws-ea never verified. Revoke it on 1Password.com under Developer > Directory if it is listed.`,
-            },
-          ]
-        : []),
-      ...(entry.reason
-        ? [{ kind: 'external' as const, instruction: `Assistant ${entry.instance_id}: ${entry.reason}` }]
-        : []),
-    ]),
-    { kind: 'command', argv: ['gws-ea', 'capabilities', 'show', 'onepassword'] },
-  ];
-}
-
-export function onePasswordDisableReport(data: OnePasswordDisableData): {
-  readonly headline: string;
-  readonly details: readonly string[];
-} {
-  if (data.account_id === null)
-    return { headline: '1Password is not enabled on this host; nothing was changed.', details: [] };
-  return {
-    headline: '1Password disabled host-wide: no assistant can use its vault until it is enabled again.',
-    details: [
-      `Kept: every vault and its items, each assistant's recorded IDs and unfinished credential attempts, and the host management service account ${data.management_service_account_id ?? 'none'}, which no assistant can use while disabled.`,
-      ...data.assistants.map((entry) =>
-        entry.runtime_token === 'deleted'
-          ? `Assistant ${entry.instance_id}: runtime token deleted from this host.`
-          : entry.runtime_token === 'kept'
-            ? `Assistant ${entry.instance_id}: runtime token kept, because its record cannot be used safely.`
-            : `Assistant ${entry.instance_id}: no runtime token was on this host.`,
-      ),
-      ...(data.assistants.some((entry) => entry.revoke_service_account_ids.length)
-        ? [
-            'Deleting a token does not revoke its service account on 1Password.com; see below for what is still yours to do.',
-          ]
-        : []),
-      'Enable it again with gws-ea capabilities enable onepassword: each assistant keeps its vault and gets a new runtime service account through your 1Password sign-in.',
-    ],
-  };
-}
-
-export function onePasswordProvisioningDetails(entry: OnePasswordAssistantProvisioning): readonly string[] {
-  return assistantActions(entry).map((action) =>
-    action.kind === 'external' ? action.instruction : `Then: ${action.argv.join(' ')}`,
-  );
 }
 
 /** Handoffs follow observed facts; an unchecked or unknown fact is never evidence of readiness. */
@@ -1625,7 +1481,7 @@ export function onePasswordCapabilityNextActions(
   observation: OnePasswordCapabilityObservation,
   checked: boolean,
 ): readonly NextAction[] {
-  if (observation.activation.status === 'disabled') return [enableCommand()];
+  if (observation.activation.status === 'disabled') return [installCommand()];
   if (observation.activation.status === 'unknown')
     return [{ kind: 'external', instruction: observation.activation.reason ?? 'Inspect the 1Password host policy.' }];
   const actions: NextAction[] = [];
@@ -1639,10 +1495,10 @@ export function onePasswordCapabilityNextActions(
             {},
           ),
         },
-        enableCommand('--discard-unproven', assistant.instance_id),
+        installCommand('--discard-unproven', assistant.instance_id),
       );
     else if (assistant.compatibility === 'compatible' && assistant.provisioning !== 'ready')
-      actions.push(enableCommand());
+      actions.push(installCommand());
     else if (assistant.compatibility === 'unsupported')
       actions.push({ kind: 'command', argv: ['gws-ea', 'update', '--id', assistant.instance_id] });
     else if (assistant.compatibility === 'unknown')
@@ -1653,10 +1509,10 @@ export function onePasswordCapabilityNextActions(
         instruction: `Assistant ${assistant.instance_id} cannot read its vault: ${assistant.access.reason ?? 'unknown'} Inspect its runtime service account on 1Password.com.`,
       });
   }
-  if (checked && observation.cli.status === 'unavailable') actions.push(enableCommand());
+  if (checked && observation.cli.status === 'unavailable') actions.push(installCommand());
   if (checked && observation.management.status === 'failed')
     actions.push({ kind: 'external', instruction: pendingMessage('management_unavailable', {}) });
-  if (!checked) actions.push({ kind: 'command', argv: ['gws-ea', 'capabilities', 'check', 'onepassword'] });
+  if (!checked) actions.push({ kind: 'command', argv: ['gws-ea', 'connectors', 'check', 'onepassword'] });
   return distinctActions(actions);
 }
 
@@ -1727,7 +1583,10 @@ export function onePasswordCapabilityLines(
 }
 
 /** `command` is what a busy run retries, as it was given. */
-export function onePasswordRecovery(error: unknown, command: 'enable' | 'disable' = 'enable'): readonly NextAction[] {
+export function onePasswordRecovery(
+  error: unknown,
+  command: 'install' | 'uninstall' = 'install',
+): readonly NextAction[] {
   if (!(error instanceof GwsEaError)) return [];
   const external: NextAction = { kind: 'external', instruction: error.message };
   switch (error.code) {
@@ -1740,37 +1599,54 @@ export function onePasswordRecovery(error: unknown, command: 'enable' | 'disable
           kind: 'external',
           instruction: `Account ${accountId}: ${Array.isArray(labels) ? (labels[index] ?? '') : ''}`.trim(),
         },
-        enableCommand('--account', accountId),
+        installCommand('--account', accountId),
       ]);
     }
+    case 'onepassword_uninstall_incomplete':
+      return [
+        external,
+        {
+          kind: 'command',
+          argv: [
+            'gws-ea',
+            'connectors',
+            'uninstall',
+            'onepassword',
+            ...(error.details?.uninstall_completed === true ? ['--abandon'] : []),
+          ],
+        },
+      ];
+    case 'onepassword_removal_pending':
+      return [external, { kind: 'command', argv: ['gws-ea', 'connectors', 'uninstall', 'onepassword'] }];
     case 'onepassword_management_unproven':
-      return [external, enableCommand('--discard-unproven', MANAGEMENT_TARGET)];
+      return [external, installCommand('--discard-unproven', MANAGEMENT_TARGET)];
     case 'onepassword_busy':
     case 'instance_busy':
     case 'registry_busy':
       return [
         { kind: 'external', instruction: 'Let the other operation finish, then retry.' },
-        { kind: 'command', argv: ['gws-ea', 'capabilities', command, 'onepassword'] },
+        { kind: 'command', argv: ['gws-ea', 'connectors', command, 'onepassword'] },
       ];
     case 'onepassword_cli_missing':
     case 'onepassword_cli_untrusted':
     case 'onepassword_cli_unavailable':
     case 'onepassword_cli_too_old':
+    case 'onepassword_operator_sign_in_needed':
     case 'onepassword_sign_in_required':
     case 'onepassword_rate_limited':
     case 'onepassword_forbidden':
     case 'onepassword_provider_failed':
     case 'onepassword_account_unknown':
-      return [external, enableCommand()];
+      return [external, installCommand()];
     case 'onepassword_account_mismatch':
-      return [external, enableCommand()];
+      return [external, installCommand()];
     case 'onepassword_policy_invalid':
     case 'onepassword_management_unavailable':
     case 'onepassword_management_mismatch':
     case 'onepassword_wrong_account':
     case 'onepassword_binding_unavailable':
     case 'onepassword_nothing_unproven':
-      return [external, { kind: 'command', argv: ['gws-ea', 'capabilities', 'check', 'onepassword'] }];
+      return [external, { kind: 'command', argv: ['gws-ea', 'connectors', 'check', 'onepassword'] }];
     default:
       return [];
   }
@@ -1782,6 +1658,9 @@ export function onePasswordErrorPauses(error: unknown): boolean {
     error instanceof GwsEaError &&
     [
       'onepassword_account_required',
+      'onepassword_operator_sign_in_needed',
+      'onepassword_uninstall_incomplete',
+      'onepassword_removal_pending',
       'onepassword_sign_in_required',
       'onepassword_management_unproven',
       'onepassword_rate_limited',

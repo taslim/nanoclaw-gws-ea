@@ -1,9 +1,9 @@
 /** The result schemas command discovery publishes: the machine-readable wire contract. */
 import type { ResultSchema } from './command-definitions.js';
-import { VOICE_CAPABILITY } from './capabilities.js';
+import { VOICE_CAPABILITY } from './voice-inspection.js';
+import { CONNECTOR_ACTIONS } from './connectors.js';
 import { OPERATION_PHASES } from './operation.js';
-import { BROWSER_CAPABILITY } from './browser-capability.js';
-import { ARTIFACTS_CAPABILITY } from './artifacts-capability.js';
+import { ARTIFACTS_CAPABILITY } from './artifacts-connector.js';
 import { ONEPASSWORD_CAPABILITY, ONEPASSWORD_PENDING_REASONS, ONEPASSWORD_SKIP_REASONS } from './onepassword.js';
 
 const text = { type: 'string' } as const;
@@ -125,12 +125,34 @@ const probes = object({
     retrying: nullable(count),
   }),
   web_alias: probe({
-    state: nullable(choices('not_needed', 'pending', 'configured')),
+    state: nullable(choices('not_configured', 'pending', 'configured')),
     address: nullable(text),
+  }),
+  browser: probe({
+    chrome: choices('available', 'missing', 'unavailable', 'not_checked'),
+    isolation: nullable(
+      object({
+        instance_id: text,
+        observed_at: time,
+        chrome: object({
+          path: text,
+          status: choices('not_checked', 'available', 'unavailable'),
+          version: nullable(text),
+          reason: nullable(text),
+        }),
+        isolation: object({
+          status: choices('not_run', 'passed', 'failed', 'unknown'),
+          reason: nullable(text),
+          proxy: object({ status: choices('not_run', 'passed', 'failed', 'unknown'), reason: nullable(text) }),
+          debugger: object({ status: choices('not_run', 'passed', 'failed', 'unknown'), reason: nullable(text) }),
+        }),
+        ready: bool,
+      }),
+    ),
   }),
   voice: probe({
     enabled: effect,
-    assets: choices('verified', 'absent', 'invalid', 'unknown'),
+    assets: choices('verified', 'recorded', 'absent', 'invalid', 'unknown'),
     compatibility: choices('compatible', 'unsupported', 'unknown'),
     readiness: choices('ready', 'unavailable', 'unknown'),
     queued: nullable(count),
@@ -154,34 +176,6 @@ export const LIST_DATA_SCHEMA = object({
       removal_in_progress: bool,
     }),
   ),
-});
-export const STATUS_DATA_SCHEMA = object({
-  instance_id: text,
-  observed_at: time,
-  phase,
-  registry: object({ account: text, track: text, source_remote: text, deployed_commit: text }),
-  operation,
-  removal_in_progress: bool,
-  release: releaseView,
-  rollback: object({ available: bool, previous_commit: nullable(text), schema_moved: effect, reason: nullable(text) }),
-  schema: object({
-    central_fingerprint: nullable(text),
-    session_fingerprint: nullable(text),
-    latest_migration: nullable(text),
-    reason: nullable(text),
-  }),
-  main_turn: object({
-    provider: nullable(text),
-    last: nullable(
-      object({
-        status: choices('completed', 'failed'),
-        at: time,
-        cause: nullable(choices('credentials', 'billing', 'unknown')),
-      }),
-    ),
-    reason: nullable(text),
-  }),
-  probes,
 });
 const artifactReceipt = object({ file: text, size: count, sha256: text });
 const voiceReceipt = object({
@@ -208,7 +202,7 @@ export const VOICE_CAPABILITY_SCHEMA = object({
   availability: object({ status: choices('supported', 'unsupported'), platform: text, architecture: text }),
   activation: object({ status: choices('enabled', 'disabled', 'unknown'), enabled: effect, reason: nullable(text) }),
   assets: object({
-    status: choices('verified', 'absent', 'invalid', 'unknown'),
+    status: choices('verified', 'recorded', 'absent', 'invalid', 'unknown'),
     reason: nullable(text),
     selected_directory: nullable(text),
     selected_model: nullable(voiceModel),
@@ -216,7 +210,7 @@ export const VOICE_CAPABILITY_SCHEMA = object({
       object({
         model: voiceModel,
         directory: text,
-        status: choices('verified', 'absent', 'invalid', 'unknown'),
+        status: choices('verified', 'recorded', 'absent', 'invalid', 'unknown'),
         reason: nullable(text),
         receipt: nullable(voiceReceipt),
       }),
@@ -262,44 +256,11 @@ const pause = object(
     details: array(text),
     actionUrl: text,
     aliasCandidate: nullable(text),
+    optional: bool,
     resumeFlag: RESUME_FLAGS_SCHEMA,
     choices: array(object({ id: text, label: text })),
   },
   ['phase', 'code', 'message'],
-);
-const browserMetadata = {
-  name: { const: 'browser' },
-  scope: { const: 'assistant' },
-  actions: array(choices(...BROWSER_CAPABILITY.actions)),
-  summary: text,
-};
-const browserAccess = {
-  oneOf: [object({ version: { const: 1 } }), object({ version: { const: 2 }, agent_group_ids: array(text) })],
-};
-const browserIsolationCheck = { status: choices('not_run', 'passed', 'failed', 'unknown'), reason: nullable(text) };
-export const BROWSER_CAPABILITY_SCHEMA = object({
-  ...browserMetadata,
-  instance_id: text,
-  observed_at: time,
-  activation: choices('enabled', 'disabled', 'unavailable'),
-  policy_file: text,
-  chrome: object({
-    path: text,
-    status: choices('not_checked', 'available', 'unavailable'),
-    version: nullable(text),
-    reason: nullable(text),
-  }),
-  isolation: object({
-    ...browserIsolationCheck,
-    proxy: object(browserIsolationCheck),
-    debugger: object(browserIsolationCheck),
-  }),
-  ready: bool,
-  access: nullable(browserAccess),
-});
-export const BROWSER_OPERATION_SCHEMA = object(
-  { ...browserMetadata, instance_id: text, enabled: bool, changed: bool, access: browserAccess, pause },
-  [...Object.keys(browserMetadata), 'instance_id', 'enabled', 'changed', 'access'],
 );
 const onePasswordMetadata = {
   name: { const: 'onepassword' },
@@ -321,7 +282,7 @@ export const ARTIFACTS_CAPABILITY_SCHEMA = object({
   hostname: nullable(text),
   path_prefix: nullable(text),
   policy_file: text,
-  remote: choices('not_checked', 'verified', 'unavailable'),
+  remote: choices('not_checked', 'verified', 'mismatch', 'unavailable'),
   listener: choices('not_checked', 'listening', 'unavailable'),
   ready: bool,
   reason: nullable(text),
@@ -412,35 +373,6 @@ export const ONEPASSWORD_OPERATION_SCHEMA = object({
   ),
   future_compatible_assistants: { const: true },
 });
-export const ONEPASSWORD_DISABLE_SCHEMA = object({
-  name: { const: 'onepassword' },
-  scope: { const: 'host' },
-  enabled: { const: false },
-  account_id: nullable(text),
-  management_service_account_id: nullable(text),
-  assistants: array(
-    object({
-      instance_id: text,
-      outcome: choices('disabled', 'pending'),
-      reason: nullable(text),
-      changed: effect,
-      vault_id: nullable(text),
-      runtime_token: choices('deleted', 'absent', 'kept'),
-      revoke_service_account_ids: array(text),
-      unproven_service_account: nullable(text),
-    }),
-  ),
-});
-export const CAPABILITY_LIST_SCHEMA = object({
-  capabilities: array({
-    oneOf: [
-      VOICE_CAPABILITY_SCHEMA,
-      object({ ...browserMetadata, assistant_ids: array(text) }),
-      object({ ...artifactsMetadata, assistant_ids: array(text) }),
-      object({ ...onePasswordMetadata, activation: choices('enabled', 'disabled', 'unknown') }),
-    ],
-  }),
-});
 export const VOICE_OPERATION_SCHEMA = object(
   {
     name: { const: 'voice' },
@@ -454,12 +386,165 @@ export const VOICE_OPERATION_SCHEMA = object(
   },
   ['name', 'scope'],
 );
+const connectorName = choices('voice', 'onepassword', 'artifacts');
+const nextAction = {
+  oneOf: [
+    object({ kind: { const: 'command' }, argv: array(text) }),
+    object({ kind: { const: 'external' }, instruction: text, url: text }, ['kind', 'instruction']),
+  ],
+};
+const setupState = choices('not_installed', 'installed', 'pending', 'uninstall_incomplete', 'unknown', 'failed');
+const readinessState = object({ status: choices('ready', 'not_ready', 'not_checked', 'unknown'), checked: bool });
+const connectorAssistant = object({
+  instance_id: text,
+  compatibility: choices('compatible', 'unsupported', 'unknown'),
+  setup: setupState,
+  readiness: readinessState,
+  reasons: array(text),
+  next_actions: array(nextAction),
+});
+export const CONNECTOR_OBSERVATION_SCHEMA = object({
+  name: connectorName,
+  summary: text,
+  observed_at: time,
+  target: nullable(text),
+  actions: array(choices(...CONNECTOR_ACTIONS)),
+  scope: object({
+    installation: { const: 'host' },
+    configuration: { const: 'host' },
+    resources: choices('host', 'assistant'),
+    access: text,
+  }),
+  account: text,
+  compatibility: choices('compatible', 'unsupported', 'unknown'),
+  prerequisites: array(
+    object({
+      requirement: text,
+      status: choices('satisfied', 'missing', 'not_checked', 'unknown'),
+      reason: nullable(text),
+    }),
+  ),
+  setup: setupState,
+  readiness: readinessState,
+  assistants: array(connectorAssistant),
+  reasons: array(text),
+  next_actions: array(nextAction),
+  details: { oneOf: [VOICE_CAPABILITY_SCHEMA, ONEPASSWORD_CAPABILITY_SCHEMA, array(ARTIFACTS_CAPABILITY_SCHEMA)] },
+});
+export const STATUS_DATA_SCHEMA = object({
+  instance_id: text,
+  observed_at: time,
+  phase,
+  registry: object({ account: text, track: text, source_remote: text, deployed_commit: text }),
+  operation,
+  removal_in_progress: bool,
+  release: releaseView,
+  rollback: object({ available: bool, previous_commit: nullable(text), schema_moved: effect, reason: nullable(text) }),
+  schema: object({
+    central_fingerprint: nullable(text),
+    session_fingerprint: nullable(text),
+    latest_migration: nullable(text),
+    reason: nullable(text),
+  }),
+  main_turn: object({
+    provider: nullable(text),
+    last: nullable(
+      object({
+        status: choices('completed', 'failed'),
+        at: time,
+        cause: nullable(choices('credentials', 'billing', 'unknown')),
+      }),
+    ),
+    reason: nullable(text),
+  }),
+  probes,
+  connectors: array(CONNECTOR_OBSERVATION_SCHEMA),
+});
+export const CONNECTOR_LIST_SCHEMA = object({ connectors: array(CONNECTOR_OBSERVATION_SCHEMA) });
+export const ALIAS_OPERATION_SCHEMA = object({ instance_id: text, pause }, ['instance_id']);
+const artifactProvisioning = object({
+  instance_id: text,
+  outcome: choices('ready', 'pending', 'unsupported'),
+  reason: nullable(text),
+  message: nullable(text),
+  changed: bool,
+});
+const unprovenCreations = array(object({ kind: choices('vault', 'service_account'), name: text }));
+const onePasswordPreviewFields = {
+  account_id: text,
+  vault_id: nullable(text),
+  owned: bool,
+  item_count: nullable(count),
+  vault: choices('delete', 'retain', 'deleted', 'retained', 'gone', 'unrecorded'),
+  reason: text,
+  runtime_service_account_ids: array(text),
+  unproven: unprovenCreations,
+};
+const onePasswordOutcomeFields = {
+  account_id: text,
+  vault_id: nullable(text),
+  vault: choices('deleted', 'retained', 'gone', 'left_behind', 'unrecorded'),
+  item_count: nullable(count),
+  reason: text,
+  runtime_token: choices('deleted', 'absent'),
+  revoke_service_account_ids: array(text),
+  unproven: unprovenCreations,
+  receipt_file: nullable(text),
+};
+export const CONNECTOR_OPERATION_SCHEMA = {
+  oneOf: [
+    VOICE_OPERATION_SCHEMA,
+    ONEPASSWORD_OPERATION_SCHEMA,
+    object({
+      name: { const: 'onepassword' },
+      scope: { const: 'host' },
+      outcome: choices('paused', 'completed'),
+      changed: effect,
+      preview: object({
+        account_id: nullable(text),
+        management_service_account_id: nullable(text),
+        management_creation_unproven: bool,
+        vaults: array(
+          object({
+            instance_id: text,
+            credential_attempts: nullable(count),
+            ...onePasswordPreviewFields,
+          }),
+        ),
+      }),
+      assistants: array(
+        object({
+          instance_id: text,
+          ...onePasswordOutcomeFields,
+        }),
+      ),
+      receipt_file: nullable(text),
+      revoke_service_account_ids: array(text),
+      reason: nullable(text),
+    }),
+    object({
+      name: { const: 'artifacts' },
+      scope: { const: 'host' },
+      installed: { const: true },
+      changed: bool,
+      assistants: array(artifactProvisioning),
+    }),
+    object({
+      name: { const: 'artifacts' },
+      scope: { const: 'host' },
+      installed: { const: false },
+      outcome: choices('removed', 'pending'),
+      changed: bool,
+      reason: nullable(text),
+      receipt_file: nullable(text),
+      operator_actions: array(text),
+    }),
+  ],
+};
 const cleanup = object(
   { checkout: text, removed: array(text), incomplete: bool, error: object({ code: ERROR_CODE_SCHEMA, message: text }) },
   ['checkout', 'removed'],
 );
-const vaultOutcome = ['deleted', 'retained', 'gone'] as const;
-const unprovenCreations = array(object({ kind: choices('vault', 'service_account'), name: text }));
 const removalPreview = object({
   instanceId: text,
   checkout: text,
@@ -468,14 +553,7 @@ const removalPreview = object({
   onecliProject: text,
   onepassword: nullable(
     object({
-      account_id: text,
-      vault_id: nullable(text),
-      owned: bool,
-      item_count: nullable(count),
-      vault: choices('delete', 'retain', ...vaultOutcome, 'unrecorded'),
-      reason: text,
-      runtime_service_account_ids: array(text),
-      unproven: unprovenCreations,
+      ...onePasswordPreviewFields,
     }),
   ),
 });
@@ -490,15 +568,7 @@ const removal = object(
     keyPolicyUnrestored: text,
     memberPolicyUnrestored: text,
     onepassword: object({
-      account_id: text,
-      vault_id: nullable(text),
-      vault: choices(...vaultOutcome, 'left_behind', 'unrecorded'),
-      item_count: nullable(count),
-      reason: text,
-      runtime_token: choices('deleted', 'absent'),
-      revoke_service_account_ids: array(text),
-      unproven: unprovenCreations,
-      receipt_file: nullable(text),
+      ...onePasswordOutcomeFields,
     }),
   },
   ['removed', 'abandoned'],
@@ -574,6 +644,7 @@ const rollback = {
 const identity = { instance_id: text };
 const common = {
   ...identity,
+  connector_next_actions: array(nextAction),
   cleanup,
   preparation: object({ bootstrap_manifest: choices('retained', 'unknown'), reservation: { const: 'unknown' } }),
 };

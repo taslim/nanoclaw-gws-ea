@@ -367,7 +367,7 @@ describe('explicit pinned voice recipe', () => {
     async (engine, available) => {
       const secret = 'fixture-configure-secret-92734';
       registerSecret(secret);
-      const run = await startRunLog({ paths, command: 'capabilities install' });
+      const run = await startRunLog({ paths, command: 'connectors install' });
       let log = '';
       const base = compiler([]);
       await expect(
@@ -412,7 +412,7 @@ describe('explicit pinned voice recipe', () => {
   it('drops the partial first diagnostic line before redaction at the byte limit', async () => {
     const secret = 'boundary-secret-92734';
     registerSecret(secret);
-    const run = await startRunLog({ paths, command: 'capabilities install' });
+    const run = await startRunLog({ paths, command: 'connectors install' });
     let log = '';
     const base = compiler([]);
     await expect(
@@ -444,7 +444,7 @@ describe('explicit pinned voice recipe', () => {
   });
 
   it('cleans scratch and preserves the build failure when the diagnostic sink fails', async () => {
-    const run = await startRunLog({ paths, command: 'capabilities install' });
+    const run = await startRunLog({ paths, command: 'connectors install' });
     const base = compiler([]);
     await expect(
       run.step('build', async (step) =>

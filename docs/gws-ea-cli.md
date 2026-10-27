@@ -2,60 +2,96 @@
 
 `gws-ea` manages Google Workspace assistants from this tool checkout. Each
 assistant has a separate full ID, owned resources, creation journal, release,
-service, and recovery records. Optional capabilities have host scope.
+service, and recovery records.
 
 Start with `gws-ea --help`. Use `gws-ea help update` or `gws-ea update --help`
 for a command's flags, scope, effects, prerequisites, recovery, and examples.
-`gws-ea help capabilities install` and `gws-ea capabilities install --help`
-print identical help. Invalid paths remain errors even with `--help`.
-See [the voice guide](gws-ea-voice.md) for optional voice installation,
-activation, and health checks, [1Password vaults](#1password-vaults) for
-assistants' saved logins, [web alias](#web-alias) for the address an
-assistant's browser uses, and [browser access](#browser-access) for which of
-its agents may use the browser. [HTML artifacts](gws-ea-artifacts.md) covers
-private information views and explicit sharing through Cloudflare Access.
+`gws-ea help connectors install voice` and
+`gws-ea connectors install voice --help` print identical help. Invalid paths
+remain errors even with `--help`.
+
+## Connectors and scopes
+
+A connector provides optional functionality that gws-ea sets up outside the
+base install: downloaded programs or models, or provisioned accounts, vaults
+and services. The catalog contains `voice`, `onepassword` and `artifacts`.
+Each has four commands:
+
+```sh
+gws-ea connectors list
+gws-ea connectors install <name>
+gws-ea connectors uninstall <name>
+gws-ea connectors show <name> [--id <instance_id>]
+gws-ea connectors check <name> [--id <instance_id>]
+```
+
+Installation and configuration belong to the operator host. Voice shares
+immutable programs and models; 1Password and artifacts keep separate resources
+for each assistant in the operator's selected account. Access remains a
+separate decision: agent permissions, the principal's vault membership, and
+artifact reader grants retain their own boundaries. Installing a connector
+makes its supported functionality available without a second switch.
+
+`list` and `show` read local records only: no asset hashing, provider requests,
+provisioning or repair. Their readiness is `not_checked`, and they exit 0 once
+observed. `check` performs bounded read-only verification and exits 0 only when
+its target is ready; a failure uses `<name>_not_ready`. Without `--id`, it checks
+the host and observed supported assistants. Stopped or unreachable assistants
+remain `not_checked`, and unsupported releases get an update command; neither
+fails the host check. With `--id`, that selected assistant must be ready.
+Every observation carries compatibility, prerequisites, setup, readiness and
+whether it was checked, scope, reasons and next actions, with connector details.
+
+Create, resume, update, start and restart reconcile installed connectors for
+eligible assistants. Existing resources are retained. A missing prerequisite
+or operator approval becomes pending with the next action; optional setup never
+fails a committed update. Rollback does not provision connectors.
+
+See [voice](gws-ea-voice.md), [1Password vaults](#1password-vaults), and
+[HTML artifacts](gws-ea-artifacts.md) for their lifecycle details. The
+[built-in browser](#browser-access) detects Chrome; the [web alias](#web-alias)
+is optional assistant identity.
 
 ## HTML artifacts
 
-Artifacts are optional per assistant. The operator needs an active Cloudflare
-DNS zone, an Access team, an account-scoped management token with the required
-Tunnel, DNS, Access application/policy and identity-provider permissions, and
-`cloudflared` 2025.4.0 or later. Keep the token in an owner-only file inside the
-operator config root; the default root is `~/.config/gws-ea`, respecting
+The operator needs an active Cloudflare DNS zone, an Access team, an
+account-scoped management token with the required Tunnel, DNS, Access
+application/policy and identity-provider permissions, and `cloudflared`
+2025.4.0 or later. Keep the token in an owner-only file inside the operator
+config root; the default root is `~/.config/gws-ea`, respecting
 `XDG_CONFIG_HOME` and `GWS_EA_CONFIG_ROOT`.
 
 ```sh
-gws-ea capabilities enable artifacts --id <instance_id> \
+gws-ea connectors install artifacts \
   --account <cloudflare_account_id> --team <access_team_subdomain> \
   --zone <active_zone_id> --hostname views.example.com \
   --credential-file <absolute_owner_only_token_file>
-gws-ea capabilities show artifacts --id <instance_id>
-gws-ea capabilities check artifacts --id <instance_id>
-gws-ea capabilities disable artifacts --id <instance_id>
+gws-ea connectors show artifacts
+gws-ea connectors check artifacts --id <instance_id>
+gws-ea connectors uninstall artifacts
 ```
 
-The first enable records this host's shared hostname and account. Later enables
-reuse them. An assistant named Aya claims `/aya`; another Aya cannot claim that
-prefix on the same hostname. Use `--assistant-hostname aya.other.example.com`
-with an active zone in the same account for a separate hostname. No identity ID
-or generated suffix is added to public links. Existing namespace claims remain
-stable through disable and re-enable.
+The first install records the host's shared hostname and account, then provisions
+compatible running assistants with complete profiles. Others remain pending.
+Later installs reuse the configuration and verify ready assistants without
+restarting author containers. Pass `--credential-file` again to rotate the
+management token. An assistant named Aya claims `/aya`; another Aya cannot
+claim that prefix on the shared hostname. Claims have no generated suffix.
 
 The principal asks for a view in conversation and opens its private link with an
 email PIN. Every currently confirmed principal address can open private views.
 Named guests use their exact invited email; public snapshots need no sign-in.
-Check the operator's current Cloudflare Access seat allowance for the intended
-principal and guest identities. Viewing requires the operator host and connector
-to be running. Ordinary authoring and reading make no Cloudflare management calls.
+Check the operator's Cloudflare Access seat allowance for the intended readers.
+Viewing requires the operator host and tunnel process to be running. Ordinary
+authoring and reading make no Cloudflare management calls.
 
-`show` and `check` observe without repair. Enable verifies the owned resources,
-listener and connector before reporting readiness. Disable immediately closes
-origin access and removes this assistant's ingress while retaining content,
-publication intent and name claims. Re-enable verifies prerequisites and restores
-only unchanged, unexpired intent. For interrupted provisioning, inspect the exact
-reported attempt and remove any resource it created before acknowledging that
-attempt with `--discard-unproven <attempt>`. See the [artifact guide](gws-ea-artifacts.md)
-for retention, recovery, removal and native tool details.
+Uninstall closes every assistant's origin before removing verified owned
+Cloudflare resources, shared resources last. Issued links stop working; local
+content and external resources remain. The host receipt makes interrupted
+cleanup resumable. Inspect an exact unproven creation and remove any resource
+it created before acknowledging it with `--discard-unproven <attempt>`.
+See the [artifact guide](gws-ea-artifacts.md) for retention, recovery, removal
+and native tool details.
 
 ## Find and inspect an assistant
 
@@ -69,8 +105,13 @@ gws-ea logs --id 01234567-89ab-4def-8123-456789abcdef --errors
 Copy the full ID from `list`; IDs are never selected implicitly or abbreviated.
 Narrow output uses stacked records, preserving full IDs. Default status shows
 identity, service and conversation condition, active operation, observation time,
-and useful next actions. `--details` adds probe facts and technical diagnostics.
-Status observes without repair, credentials, a run log, or an operation lock.
+and useful next actions. Browser availability, optional alias identity and each
+connector appear independently. Not installed is informational; owed operator
+setup is degraded. A stopped assistant shows local facts without live connector
+checks. `--details` adds probe facts, browser network isolation and technical diagnostics.
+Status observes without repair, a run log or an operation lock. Live checks may
+use existing host credentials within their connector boundary; output never
+contains their values.
 Degraded and unknown observations still exit 0: read the facts, not only the exit.
 Unknown or unreachable services and consumers do not establish health or drainage.
 Human times use the install timezone; machine observations are ISO UTC.
@@ -119,6 +160,11 @@ different purposes:
   principal addresses when several are supplied.
 - `--provider`: the agent runtime. Its credential identity is independent of
   those Google accounts.
+
+Creation offers optional web alias setup after the assistant is talkable. At a
+terminal, decline it to finish without an alias, or use `--skip-alias` on create
+or resume. That decision is retained on resume and releases an outstanding
+unconfirmed candidate. Set the alias later with `gws-ea alias --id <full-id>`.
 
 Creation may pause for an external prerequisite. Once the result confirms an
 assistant ID, continue its journal with `resume`; `remove` tears down a partial
@@ -189,30 +235,34 @@ by its own lifecycle and ownership rules.
 ## 1Password vaults
 
 ```sh
-gws-ea capabilities enable onepassword
-gws-ea capabilities check onepassword
-gws-ea capabilities disable onepassword
-gws-ea remove --id 01234567-89ab-4def-8123-456789abcdef --delete-vault
+gws-ea connectors install onepassword
+gws-ea connectors check onepassword
+gws-ea connectors uninstall onepassword --delete-vaults
+# After completing the receipt's manual revocation actions:
+gws-ea connectors uninstall onepassword --abandon
 ```
 
-`enable` needs the 1Password CLI (`op`) 2.29 or later in an operator-owned
-location on this host's PATH (for example `brew install 1password-cli`), and the
-1Password desktop app signed in to the account assistants use, with Settings >
-Developer > Integrate with 1Password CLI turned on. The operator must be an owner
-or administrator allowed to create service accounts. The first run selects the
-account (`--account <account_id>`, or a terminal choice), recording its ID with
-the sign-in address the app lists for it, and the app may ask for approval. It
-creates a host management service account that may only create
-vaults. Then, for each compatible assistant, running or stopped, it creates a
-vault named after the assistant's address and a runtime service account with
-read and write access to only that vault. It never enables a browser or starts
-Chrome. Later `create` and `resume` provision new assistants the same way,
-through the same desktop sign-in; a wait there pauses with the assistant
-already talkable. An older release is skipped; `update` it, then rerun
-`enable`. A partial run keeps finished assistants, and a rerun continues the
-rest. When a creation's outcome is unknown, the result names what to delete or
-revoke on 1Password.com; then `--discard-unproven <instance_id|management>`
-forgets that attempt.
+Install needs the 1Password CLI (`op`) 2.29 or later in an operator-owned location
+on this host's PATH (for example `brew install 1password-cli`), and the 1Password
+desktop app signed in to the account assistants use, with Settings > Developer >
+Integrate with 1Password CLI turned on. The operator must be an owner or
+administrator allowed to create service accounts. The first run selects the
+account (`--account <account_id>`, or a terminal choice), records its ID and
+sign-in address, and may ask for desktop approval. It creates a host management
+service account that may only create vaults, then one vault and one read/write
+runtime service account for each compatible assistant. Browser use does not
+start as part of installation.
+
+Create and resume provision new assistants; update provisions newly compatible
+ones, and start and restart retry pending setup. Existing vaults and credentials
+are never replaced. When desktop approval is needed without an operator
+terminal, no sign-in is attempted: setup stays pending. Create pauses for an
+actionable operator prerequisite with `resume`; a committed update remains
+ready and names `connectors install onepassword` as its next action. A partial
+install retains finished assistants, and rerunning continues the rest. For an
+unknown creation outcome, follow the reported cleanup on 1Password.com, then
+use `--discard-unproven <instance_id|management>` to acknowledge that exact
+attempt.
 
 `show` reads local records only. `check` spends service-account requests on
 identities, one vault read per assistant, and the account's usage. It never
@@ -242,86 +292,88 @@ person; the principal then asks the assistant to check again. After adding a
 login in 1Password, the principal asks the assistant to retry, which lists the
 vault again.
 
-`disable` stops every assistant's vault use at once and deletes their runtime
-tokens. Vaults, items, recorded IDs, unfinished credential attempts and the
-management service account stay. `enable` again reuses each vault and mints
-replacement runtime service accounts through the desktop sign-in. `remove`
-previews the vault and its item count, deletes the runtime token after the host
-stops, and deletes the vault only when this host's management service account
-created it and it is empty or `--delete-vault` was confirmed; never another
-vault. gws-ea never revokes a service account: revoke the ones disable and
-removal results name on 1Password.com under Developer > Directory. A removal
-receipt keeps their IDs after the assistant is gone, and the names of any vault
-or runtime service account whose creation was never proven; once you have
-revoked or deleted them, close it with
+Uninstall previews every recorded vault, its observed item count and active
+credential attempts. It requires a terminal confirmation or `--delete-vaults`;
+without either it pauses and changes nothing. It stops all vault use first,
+deletes only vaults proven to have been created by this host's management
+account, then removes local tokens and resource records, with the management
+account's local token last. Every owned vault's contents are included in the
+confirmation. A rate limit or interruption leaves a resumable host receipt;
+rerun uninstall to continue. Install refuses while resource cleanup is incomplete.
+
+Gws-ea cannot revoke a service account. The receipt retains every recorded ID,
+including retired accounts, and unproven creations for manual cleanup on
+1Password.com. `show` reports it until you finish those actions and close it
+with `connectors uninstall onepassword --abandon`. A receipt containing only
+manual revocations does not block a new install. Per-assistant `remove` keeps
+its separate preview and `--delete-vault` choice; its receipt is closed with
 `gws-ea remove --id <full-id> --yes --abandon onepassword`.
 
 ## Web alias
 
 ```sh
-gws-ea capabilities enable browser --id 01234567-89ab-4def-8123-456789abcdef
+gws-ea alias --id 01234567-89ab-4def-8123-456789abcdef
 ```
 
-An assistant whose browser is enabled has one web alias: its address for
-everything it does on the web in its own name, guest bookings and checkouts
-made for the principal included. The alias is the assistant's name,
-lowercased, in ASCII, without spaces, and reversed (`Juno` gives `onuj`). A
-name that reads the same reversed moves its first letter to the end instead
-(`Anna` gives `nnaa`). Role addresses such as `admin` or `postmaster` are
-never offered, and later candidates are numbered (`onuj2`, `onuj3`).
+An assistant may have one web alias: its email for actions on the web in its own
+name, guest bookings and checkouts for the principal included, and one of its
+mail-routing addresses. Setup offers it independently of browser availability.
+Public browsing works without it; an action that would disclose the assistant's
+address stops with `alias_unavailable` until it is configured.
 
-`capabilities enable browser`, and `create` or `resume` once the browser is
-enabled, show the candidate and where to add it: the assistant's account in
-the Admin console (Directory > Users), then User information > Alternate
-email addresses (email aliases). The candidate is claimed on this machine
-first, so no two assistants are asked for the same address.
+The default alias is the assistant's name, lowercased, in ASCII, without spaces,
+and reversed (`Juno` gives `onuj`). A name that reads the same reversed moves
+its first letter to the end (`Anna` gives `nnaa`). Role addresses such as
+`admin` or `postmaster` are never offered; later candidates are numbered.
 
-At a terminal, the command waits while you configure it. Confirm that you
-added the exact address to the assistant's account, and the command records
-it and continues. If the Admin console says the name is taken, choose the
-next candidate; you can also enter a name of your own. No test email is sent.
+`alias --id`, or optional alias setup during create/resume, shows the candidate
+and where to add it: the assistant's account in Google Admin (Directory > Users),
+then User information > Alternate email addresses. The candidate is claimed on
+this machine first. Confirm that you added that exact address; if it is taken,
+choose the next candidate or a name of your own. No test email is sent.
 
-If you stop or run without input, the command reports setup as incomplete.
-The existing resume options are available for unattended runs:
+The command pauses with its next action when confirmation is still needed.
+These flags work with `alias --id` and create/resume:
 
 - `--alias-added`: confirm that you added the proposed alias.
 - `--alias-taken`: offer the next candidate when the name is already in use.
 - `--alias <name>`: propose your own name or whole address; combine with
   `--alias-added` when you have already added it.
 
-Until you confirm, `status` reports the web alias as pending. Once recorded,
-it reports the alias as configured. Configuration is the operator's
-responsibility; gws-ea does not test delivery. Google can take up to 24 hours
-to apply a new alias. A stopped assistant must be started to record its
-profile. A recorded alias is not changed by these flags.
+`--skip-alias` belongs to create/resume. An unrequested alias is informational;
+an outstanding candidate is pending and needs confirmation. A recorded alias
+is configured and is not changed by these flags. Gws-ea does not test delivery;
+Google can take up to 24 hours to apply a new alias. Start a stopped assistant
+before recording its profile identity.
 
 ## Browser access
 
-```sh
-# Let main and one more agent group use the browser:
-gws-ea capabilities enable browser --id 01234567-89ab-4def-8123-456789abcdef \
-  --agent-group <main_agent_group_id> --agent-group <agent_group_id>
-# Back to main alone:
-gws-ea capabilities enable browser --id 01234567-89ab-4def-8123-456789abcdef --main-only
-```
+Browsing is built in. Gws-ea detects Google Chrome at
+`/Applications/Google Chrome.app`; it never installs a browser and supports no
+custom browser path. Missing Chrome refuses a new delegation with a reason and
+asks the principal to contact their operator. It does not remove destinations
+or cancel existing errands merely because the binary is missing. A launch
+failure ends the affected work through the unavailable path.
 
-By default only the assistant's main agent delegates browser errands. Repeat
-`--agent-group` to list exactly the agent groups that may; include main's ID to
-keep it. Before writing the list, gws-ea asks the running assistant to confirm
-that it reads access lists and has each group. The browser and external-email
-groups can never be listed. A listed group shares the one signed-in browser
-profile and the vault's logins; its purchase, consent and watch approvals still
-go to the principal, and its errands, cards and notices stay its own. A group
-removed from the list has its errands cancelled.
+Main always delegates browser errands. Sealed browser, external-email and
+external-chat groups never do. Other groups, including active job agents, need
+`browser-delegate` explicitly selected in their stored agent capabilities;
+`all` does not grant it. Use the existing capability permission and approval
+flow. A permitted group shares the assistant's signed-in browser profile and
+vault logins; purchase, consent and watch approvals still go to the principal,
+and its errands, cards and notices stay its own. Revoking its permission
+cancels its errands.
 
-`disable` and a plain `enable` keep the list, and `capabilities show browser`
-reports it. While a list is in place, `rollback`, and reverting an open update,
-are refused to a release that cannot read it; `--main-only` lifts that.
+Updating an existing assistant makes built-in browsing available when Chrome is
+present. Retired version-2 access lists no longer grant delegation: select
+`browser-delegate` for other groups that should retain access. Retired local
+policy records are left untouched for rollback.
 
 ### Browser diagnosis and release acceptance
 
-`gws-ea capabilities check browser --id <full-id>` checks the selected managed
-assistant without starting Chrome. It reports proxy and debugger isolation
+`gws-ea status --id <full-id> --details` checks the selected managed
+assistant's browser network isolation without starting Chrome. It reports
+proxy and debugger isolation
 separately on that assistant network's existing host-gateway route. A stopped
 Chrome reports debugger `not_run` and can remain ready when proxy isolation
 passes. Starting Chrome, missing or malformed running-listener metadata, changed

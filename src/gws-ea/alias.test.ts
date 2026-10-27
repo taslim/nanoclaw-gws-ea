@@ -17,6 +17,7 @@ import {
 import '../modules/gws-ea-profile/index.js';
 import {
   aliasCandidateAfter,
+  aliasNextActions,
   aliasHost,
   aliasStem,
   ensureAssistantAlias,
@@ -28,8 +29,10 @@ import {
 import { runCli, type CliRuntime } from './cli.js';
 import type { InteractivePrompts, RunEvent } from './events.js';
 import { deriveGcpClaims } from './gcp-identity.js';
-import { reserveInstance } from './journal.js';
+import { readProvisionJournal, withInstanceOperation, reserveInstance } from './journal.js';
 import { resolveControlPlanePaths, type ControlPlanePaths } from './paths.js';
+import { provisionAssistantResources } from './provision.js';
+import { expectResultContract } from './testing/result-contract.js';
 import type { ProvisionResult } from './phases.js';
 import { claimInstanceAlias, getInstanceReservation } from './registry.js';
 import { persistTestRuntime } from './testing/runtime-fixture.js';
@@ -187,7 +190,7 @@ function aliasTerminal(world: StepWorld, attendPause: InteractivePrompts['attend
     stdout: () => undefined,
     stderr: () => undefined,
     environment: {},
-    browserInspection: { ncl: async (_runtime, args) => hostNcl(args) },
+    aliasNcl: async (_runtime, args) => hostNcl(args),
     prompts: {
       providerCredential: unused,
       googleCloudSignIn: unused,
@@ -344,20 +347,49 @@ describe('the web alias setup step', () => {
     expect(await world.claimed()).toBe('onuj3@example.test');
   });
 
-  it("takes the operator's word on it from capabilities enable browser", async () => {
+  it('releases a proposed alias on skip and remembers the choice on a later resume', async () => {
+    const world = await stepWorld();
+    await persistTestRuntime(world.paths, await getInstanceReservation(world.paths, world.instanceId));
+    await world.run();
+    expect(await world.claimed()).toBe(ALIAS);
+    const skip = await withInstanceOperation(world.paths, world.instanceId, (operation) =>
+      provisionAssistantResources(operation, {}, {}, { skip: true, ncl: async (_runtime, args) => hostNcl(args) }),
+    );
+    expect(skip).toMatchObject({ status: 'ready' });
+    expect(await getAliasSetup()).toEqual({ alias: null, candidate: null });
+    expect(await world.claimed()).toBeUndefined();
+    expect((await readProvisionJournal(world.paths, world.instanceId)).decisions.alias_skipped_at).toBeDefined();
+    const resumed = await withInstanceOperation(world.paths, world.instanceId, (operation) =>
+      provisionAssistantResources(
+        operation,
+        {},
+        {},
+        {
+          ncl: async () => {
+            throw new Error('A skipped alias must not be proposed on resume');
+          },
+        },
+      ),
+    );
+    expect(resumed).toMatchObject({ status: 'ready' });
+  });
+
+  it("takes the operator's word on it from gws-ea alias", async () => {
     const world = await stepWorld();
     await persistTestRuntime(world.paths, await getInstanceReservation(world.paths, world.instanceId));
     const enable = async (...flags: string[]) => {
       const stdout: string[] = [];
-      const exit = await runCli(['capabilities', 'enable', 'browser', '--id', world.instanceId, ...flags, '--json'], {
+      const exit = await runCli(['alias', '--id', world.instanceId, ...flags, '--json'], {
         paths: world.paths,
         stdout: (line) => stdout.push(line),
         stderr: () => undefined,
-        browserInspection: { ncl: (_runtime, args) => hostNcl(args) },
+        aliasNcl: (_runtime, args) => hostNcl(args),
       });
-      return { exit, result: JSON.parse(stdout.join('\n')) as unknown };
+      const result: unknown = JSON.parse(stdout.join('\n'));
+      expectResultContract('alias', result);
+      return { exit, result };
     };
-    // Each candidate the step claims is a change, reported even when the browser policy already stood.
+    // Each candidate the step claims is a change, reported independently of browser availability.
     const asked = (address: string) => ({
       exit: 10,
       result: { changed: true, data: { pause: { message: expect.stringContaining(`Add ${address} as an alias`) } } },
@@ -371,7 +403,7 @@ describe('the web alias setup step', () => {
           { kind: 'external', url: 'https://admin.google.com/ac/users' },
           {
             kind: 'command',
-            argv: ['gws-ea', 'capabilities', 'enable', 'browser', '--id', world.instanceId, '--alias-added'],
+            argv: ['gws-ea', 'alias', '--id', world.instanceId, '--alias-added'],
           },
         ],
       },
@@ -382,19 +414,19 @@ describe('the web alias setup step', () => {
     await expect(getAliasSetup()).resolves.toMatchObject({ alias: 'juno.web@example.test' });
   });
 
-  it('waits for terminal confirmation and completes browser enabling in the same command', async () => {
+  it('waits for terminal confirmation and completes alias setup in the same command', async () => {
     const world = await stepWorld();
     await persistTestRuntime(world.paths, await getInstanceReservation(world.paths, world.instanceId));
     const pauses: string[] = [];
     const unused = async (): Promise<never> => {
       throw new Error('Unexpected setup prompt');
     };
-    const exit = await runCli(['capabilities', 'enable', 'browser', '--id', world.instanceId], {
+    const exit = await runCli(['alias', '--id', world.instanceId], {
       paths: world.paths,
       stdout: () => undefined,
       stderr: () => undefined,
       environment: {},
-      browserInspection: { ncl: async (_runtime, args) => hostNcl(args) },
+      aliasNcl: async (_runtime, args) => hostNcl(args),
       prompts: {
         providerCredential: unused,
         googleCloudSignIn: unused,
@@ -419,7 +451,7 @@ describe('the web alias setup step', () => {
       await persistTestRuntime(world.paths, await getInstanceReservation(world.paths, world.instanceId));
       const shown: string[] = [];
       const exit = await runCli(
-        ['capabilities', 'enable', 'browser', '--id', world.instanceId],
+        ['alias', '--id', world.instanceId],
         aliasTerminal(world, async (pause) => {
           shown.push(pause.message);
           if (shown.length > 1) return { kind: 'stop' };
@@ -447,13 +479,13 @@ describe('the web alias setup step', () => {
     expect(await getAliasSetup()).toEqual({ alias: null, candidate: ALIAS });
   });
 
-  it('handles taken, custom name, and confirmation in one enabling command', async () => {
+  it('handles taken, custom name, and confirmation in one alias command', async () => {
     const world = await stepWorld();
     await persistTestRuntime(world.paths, await getInstanceReservation(world.paths, world.instanceId));
     const answers: AliasDecision[] = [{ kind: 'taken' }, { kind: 'named', name: 'juno.web' }, { kind: 'added' }];
     const candidates: (string | null)[] = [];
     const exit = await runCli(
-      ['capabilities', 'enable', 'browser', '--id', world.instanceId],
+      ['alias', '--id', world.instanceId],
       aliasTerminal(world, async () => {
         candidates.push((await getAliasSetup()).candidate);
         const answer = answers.shift();
@@ -472,7 +504,7 @@ describe('the web alias setup step', () => {
     const signals = ['SIGINT', 'SIGTERM', 'SIGHUP'] as const;
     const before = signals.map((signal) => process.listenerCount(signal));
     const exit = await runCli(
-      ['capabilities', 'enable', 'browser', '--id', world.instanceId],
+      ['alias', '--id', world.instanceId],
       aliasTerminal(world, async (_pause, signal) => {
         process.emit('SIGINT');
         expect(signal.aborted).toBe(true);
@@ -492,12 +524,12 @@ describe('the web alias setup step', () => {
       throw new Error('Unexpected setup prompt');
     };
     let asked = false;
-    const exit = await runCli(['capabilities', 'enable', 'browser', '--id', world.instanceId], {
+    const exit = await runCli(['alias', '--id', world.instanceId], {
       paths: world.paths,
       stdout: (line) => stdout.push(line),
       stderr: () => undefined,
       environment: {},
-      browserInspection: { ncl: async (_runtime, args) => hostNcl(args) },
+      aliasNcl: async (_runtime, args) => hostNcl(args),
       prompts: {
         providerCredential: unused,
         googleCloudSignIn: unused,
@@ -549,10 +581,15 @@ describe('a name that gives no alias', () => {
     const run = (decision?: AliasDecision) =>
       ensureAssistantAlias({ paths, instanceId, host, ...(decision ? { decision } : {}) }, {});
 
-    expect(paused(await run())).toMatchObject({
+    const firstPause = paused(await run());
+    expect(firstPause).toMatchObject({
       code: 'alias_name_required',
       message: expect.stringMatching(/^Name Aaa's web alias: "Aaa" reads the same reversed/u),
       resumeFlag: '--alias <name>',
+    });
+    expect(aliasNextActions(instanceId, firstPause)).toContainEqual({
+      kind: 'external',
+      instruction: 'Supply the input requested by --alias <name>.',
     });
     expect(paused(await run({ kind: 'taken' }))).toMatchObject({ code: 'alias_name_required' });
     expect(paused(await run({ kind: 'named', name: 'juno.web' }))).toMatchObject({ code: 'alias_required' });

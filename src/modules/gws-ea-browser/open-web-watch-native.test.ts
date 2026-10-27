@@ -1,3 +1,4 @@
+import { useAvailableBrowser } from './testing/browser-runtime.js';
 import * as structuredLocators from './locators.js';
 import { locateStructured } from './locators.js';
 import { createBrowserQueue, recoverAndStartBrowserQueue } from './index.js';
@@ -94,14 +95,12 @@ async function freshBrowserState(): Promise<void> {
   vi.mocked(requestWake).mockClear();
   fs.rmSync(root, { recursive: true, force: true });
   fs.mkdirSync(`${root}/browser`, { recursive: true, mode: 0o700 });
-  fs.writeFileSync(`${root}/browser/policy.json`, JSON.stringify({ schemaVersion: 1, enabled: true }), {
-    mode: 0o600,
-  });
-  process.env.GWS_EA_BROWSER_POLICY_FILE = `${root}/browser/policy.json`;
+
+  process.env.GWS_EA_BROWSER_ROOT = `${root}/browser`;
   await runMigrations(await initTestDb());
 }
 async function clearBrowserState(): Promise<void> {
-  delete process.env.GWS_EA_BROWSER_POLICY_FILE;
+  delete process.env.GWS_EA_BROWSER_ROOT;
   await closeDb();
   fs.rmSync(root, { recursive: true, force: true });
   vi.useRealTimers();
@@ -158,6 +157,7 @@ describe.skipIf(!chromePath)('wake-on-change watches in native Chrome', { timeou
     await fixture?.close();
   });
   beforeEach(async () => {
+    useAvailableBrowser();
     // Date moves on in real time from the errand's afternoon, a week before the dinner; a test may jump it.
     vi.useFakeTimers({ toFake: ['Date'], shouldAdvanceTime: true });
     vi.setSystemTime(new Date('2026-10-17T19:00:00.000Z'));

@@ -1,6 +1,7 @@
-import type { CapabilityList, VoiceCapabilityObservation } from './capabilities.js';
-import type { BrowserCapabilityObservation, BrowserOperationData } from './browser-capability.js';
-import type { OnePasswordCapabilityObservation, OnePasswordDisableData, OnePasswordEnableData } from './onepassword.js';
+import type { ConnectorObservation } from './connector-inspection.js';
+import type { OnePasswordInstallData } from './onepassword.js';
+import type { OnePasswordUninstallData } from './onepassword-uninstall.js';
+import type { ArtifactsConnectorOperation, ArtifactsConnectorUninstallData } from './artifacts-connector.js';
 import {
   COMMAND_DEFINITIONS,
   findCommand,
@@ -26,11 +27,12 @@ export type NextAction =
   | { readonly kind: 'command'; readonly argv: readonly string[] }
   | { readonly kind: 'external'; readonly instruction: string; readonly url?: string };
 export interface OperationData {
+  readonly connector_next_actions?: readonly NextAction[];
   readonly instance_id?: string;
   readonly preparation?: { readonly bootstrap_manifest: 'retained' | 'unknown'; readonly reservation: 'unknown' };
   readonly pause?: Pick<
     ProvisionHumanPause,
-    'phase' | 'code' | 'message' | 'details' | 'actionUrl' | 'aliasCandidate' | 'resumeFlag' | 'choices'
+    'phase' | 'code' | 'message' | 'details' | 'actionUrl' | 'aliasCandidate' | 'resumeFlag' | 'choices' | 'optional'
   >;
   readonly preview?: RemovalPreview | UpdatePreview | RollbackPreview;
   readonly staging?: { readonly retained: true; readonly release: import('./types.js').ReleaseCoordinates };
@@ -64,13 +66,12 @@ export type CommandData =
   | WhatsAppCommandData
   | OperationData
   | VoiceOperationData
-  | CapabilityList
-  | VoiceCapabilityObservation
-  | BrowserCapabilityObservation
-  | BrowserOperationData
-  | OnePasswordCapabilityObservation
-  | OnePasswordEnableData
-  | OnePasswordDisableData
+  | { readonly connectors: readonly ConnectorObservation[] }
+  | ConnectorObservation
+  | OnePasswordInstallData
+  | OnePasswordUninstallData
+  | ArtifactsConnectorOperation
+  | ArtifactsConnectorUninstallData
   | AssistantListing
   | AssistantStatus;
 export interface ManagedResult<T = CommandData> {

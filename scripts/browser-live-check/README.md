@@ -40,7 +40,7 @@ port may appear in host evidence; endpoint URLs, WebSocket paths and browser IDs
 stay private. This is accessible to trusted host processes and, through host
 forwarding, ordinary Docker bridge containers. It provides no pipe exclusivity.
 
-`gws-ea capabilities check browser --id <full-id>` separately checks the proxy
+`gws-ea status --id <full-id> --details` separately checks the proxy
 and active debugger through the managed assistant network's existing host-gateway
 route, without launching Chrome. Stopped Chrome reports debugger `not_run`;
 starting, missing, invalid, changed or unobservable active targets prevent a ready
@@ -87,7 +87,7 @@ external actions taken after startup but before health verification.
 
 Use the deployed merged commit SHA, an absolute evidence directory, and the
 **deployed assistant's** socket. The socket is its `<checkout>/data/ncl.sock`;
-`gws-ea capabilities check browser --id <full-id>` identifies/checks the selected
+`gws-ea status --id <full-id> --details` identifies/checks the selected
 assistant. Do not use `data/ncl.sock` from this operator checkout.
 
 ```sh
@@ -227,13 +227,13 @@ its reference. Preserve the receipt and associated private source artifacts.
 | `quiet_spaces`                 | Owner observes no unwanted Space switch throughout the active-desktop checks.                                                                                                                                                                                                                                                                  |
 | `public_only_egress`           | Loopback, link-local, LAN, rebinding, QUIC and non-proxied WebRTC attempts are refused; include live proxy probe evidence.                                                                                                                                                                                                                     |
 | `watch_soak`                   | At least 72 actual hours of native checks, no site block/account warning, and the watch stayed within the site's policy. See below.                                                                                                                                                                                                            |
-| `onepassword_provisioning`     | Enabling covers two assistants, one stopped, with distinct vaults and runtime service accounts (a management-created vault, an operator-minted account, recorded grants); a rerun creates none; a later `create` provisions a third; no browser or Chrome starts.                                                                              |
+| `onepassword_provisioning`     | Install covers two assistants, one stopped, with distinct vaults and runtime service accounts (a management-created vault, an operator-minted account, recorded grants); a rerun creates none; a later `create` provisions a third; no browser or Chrome starts.                                                                               |
 | `onepassword_sharing`          | A confirmed member principal gets view and edit on only their assistant's vault, and its link opens their account, where the named vault is listed. A non-member or new guest gets the forwardable message, with no invitation promise, CLI terms or request to enable anything; a re-ask after the operator acts answers `shared`.            |
 | `onepassword_signup`           | An authorized signup saves the generated password before the site sees it. A host restart during its input callback recovers the same saved candidate: one account, one Login, no second submission.                                                                                                                                           |
 | `onepassword_owned_change`     | A change on an unedited assistant-created Login reaches the site once. Confirmed, the Login holds the new password with the principal's other edits, and no candidate or previous password remains; timed out, 1Password keeps both. No tool output or screenshot holds either.                                                                |
 | `onepassword_change_refused`   | A change on a Login the principal added, and on an assistant-created Login whose username the principal edited, is refused before any page insertion with a plain explanation.                                                                                                                                                                 |
 | `onepassword_fresh_login`      | A Login the principal adds in 1Password is used on their explicit retry, while the browser still cannot read its password.                                                                                                                                                                                                                     |
-| `onepassword_disable_reenable` | Disable stops vault use on running and restarted hosts and deletes runtime tokens, keeping vault items; re-enable reuses each vault, mints new runtime accounts and names the old ones to revoke.                                                                                                                                              |
+| `onepassword_uninstall_reinstall` | Confirmed uninstall stops vault use and deletes verified owned vaults and tokens; the receipt names every account for manual revocation. A later install creates a new generation without losing earlier cleanup IDs.                                                                                 |
 | `onepassword_scoped_removal`   | Removing one assistant deletes its token and only its own previewed vault, leaves the peer and the management account working, and keeps a receipt naming each service account to revoke on 1Password.com.                                                                                                                                     |
 | `onepassword_pooled_quota`     | `check` shows the account type, daily limit, usage and every sharing assistant. With the limit nearly spent by the peer, a fill returns `rate_limited` without a retry burst. Record each operation's request cost.                                                                                                                            |
 
@@ -251,9 +251,9 @@ Keep real fixtures or records for native assertions in the source artifacts.
 Record `vault_secret_confinement` and the `onepassword_*` scenarios on two
 disposable dogfood assistants, in a 1Password account the operator authorized
 for disposable resources; no principal account or Login is a test fixture. The
-operator runs `gws-ea capabilities enable|check|disable onepassword` and
+operator runs `gws-ea connectors install|check|uninstall onepassword` and
 `gws-ea remove` themselves. Receipts cite resource IDs from
-`gws-ea capabilities show onepassword --json` and the 1Password.com vault,
+`gws-ea connectors show onepassword --json` and the 1Password.com vault,
 access and service-account pages, never a password or token. A request cost is
 the account usage `check` reports before and after the operation, less the
 cost of a `check` itself.
