@@ -1,7 +1,6 @@
 /** Local discovery and bounded verification share one connector result contract. */
 import { existsSync } from 'node:fs';
 
-import { asciiName } from './alias.js';
 import { centralDatabaseFile, openWithoutSideFiles } from './verify.js';
 import type { OnePasswordCliSeams, OnePasswordCapabilityObservation } from './onepassword.js';
 import {
@@ -13,7 +12,9 @@ import { inspectOnePasswordUninstall } from './onepassword-uninstall.js';
 import {
   inspectWebCapability,
   assertWebHostnameAvailable,
+  assertWebHostnameUnclaimed,
   supportedCloudflaredVersion,
+  webHostnameFor,
   webReleaseCompatibility,
   inspectWebUninstall,
   type WebCapabilityDependencies,
@@ -471,38 +472,32 @@ export async function inspectConnector(
         if (config && !observation.hostname && compatibility === 'compatible') {
           const firstName = webFirstName(runtime);
           if (firstName !== undefined) {
-            const label = asciiName(firstName).slice(0, 63);
-            if (!/[a-z]/u.test(label))
+            let hostname: string | undefined;
+            try {
+              const candidate = webHostnameFor(firstName, config.zoneApex);
+              assertWebHostnameUnclaimed(await readRegistry(paths), id, candidate);
+              hostname = candidate;
+            } catch (cause) {
+              if (!(cause instanceof GwsEaError) || !['web_name_unusable', 'web_hostname_claimed'].includes(cause.code))
+                throw cause;
               observation = {
                 ...observation,
-                reason_code: 'web_name_unusable',
-                reason: `“${firstName}” has no Latin letter for a web address. Recreate this assistant under a first name with a Latin letter.`,
+                reason_code: cause.code,
+                reason: cause.message,
               };
-            else {
-              const hostname = `${label}.${config.zoneApex}`;
-              const holder = Object.values((await readRegistry(paths)).instances).find(
-                (candidate) =>
-                  candidate.instance_id !== id && candidate.exclusive_resource_claims.web?.hostname === hostname,
-              );
-              if (holder)
+            }
+            if (hostname && live) {
+              try {
+                await assertWebHostnameAvailable(config, hostname, options.web);
+                // eslint-disable-next-line no-catch-all/no-catch-all -- A failed read-only preflight is an inspection fact; no claim or repair follows it.
+              } catch (cause) {
                 observation = {
                   ...observation,
-                  reason_code: 'web_hostname_claimed',
-                  reason: `${hostname} is already held by assistant ${holder.instance_id}. Recreate this assistant under another first name, or remove the holder.`,
+                  remote:
+                    cause instanceof GwsEaError && cause.code === 'web_hostname_foreign' ? 'mismatch' : 'unavailable',
+                  reason_code: cause instanceof GwsEaError ? cause.code : 'web_hostname_unobserved',
+                  reason: cause instanceof GwsEaError ? cause.message : 'The web hostname could not be observed.',
                 };
-              else if (live) {
-                try {
-                  await assertWebHostnameAvailable(config, hostname, options.web);
-                  // eslint-disable-next-line no-catch-all/no-catch-all -- A failed read-only preflight is an inspection fact; no claim or repair follows it.
-                } catch (cause) {
-                  observation = {
-                    ...observation,
-                    remote:
-                      cause instanceof GwsEaError && cause.code === 'web_hostname_foreign' ? 'mismatch' : 'unavailable',
-                    reason_code: cause instanceof GwsEaError ? cause.code : 'web_hostname_unobserved',
-                    reason: cause instanceof GwsEaError ? cause.message : 'The web hostname could not be observed.',
-                  };
-                }
               }
             }
           }

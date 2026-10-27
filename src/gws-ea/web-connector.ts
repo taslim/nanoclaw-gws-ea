@@ -48,7 +48,7 @@ import {
 import { readOperatorFile, readOwnerOnlyFile, writePrivateTextFile } from './secrets.js';
 import { loadInstanceRuntimeConfig, serviceManagerEnvironment, type InstanceRuntimeConfig } from './service.js';
 import { renderLaunchdService, renderSystemdService } from './service-definition.js';
-import { GwsEaError, type WebNamespaceClaim } from './types.js';
+import { GwsEaError, type InstanceRegistry, type WebNamespaceClaim } from './types.js';
 import { isRecord } from './validation.js';
 import { inspectWebUninstall, withWebHostLock } from './web-uninstall.js';
 
@@ -494,6 +494,28 @@ export async function assertWebHostnameAvailable(
   }
 }
 
+export function webHostnameFor(firstName: string, zoneApex: string): string {
+  const label = asciiName(firstName).slice(0, 63);
+  if (!/[a-z]/u.test(label))
+    throw new GwsEaError(
+      'web_name_unusable',
+      `“${firstName}” has no Latin letter for a web address. Recreate this assistant under a first name with a Latin letter.`,
+    );
+  return `${label}.${zoneApex}`;
+}
+
+export function assertWebHostnameUnclaimed(registry: InstanceRegistry, instanceId: string, hostname: string): void {
+  const holder = Object.values(registry.instances).find(
+    (assistant) =>
+      assistant.instance_id !== instanceId && assistant.exclusive_resource_claims.web?.hostname === hostname,
+  );
+  if (holder)
+    throw new GwsEaError(
+      'web_hostname_claimed',
+      `${hostname} is already held by assistant ${holder.instance_id}. Recreate this assistant under another first name, or remove the holder.`,
+    );
+}
+
 async function claimNamespace(
   paths: ControlPlanePaths,
   instanceId: string,
@@ -503,13 +525,7 @@ async function claimNamespace(
 ): Promise<WebNamespaceClaim> {
   const previous = (await getInstanceReservation(paths, instanceId)).exclusive_resource_claims.web;
   if (previous) return previous;
-  const label = asciiName(firstName).slice(0, 63);
-  if (!/[a-z]/u.test(label))
-    throw new GwsEaError(
-      'web_name_unusable',
-      `“${firstName}” has no Latin letter for a web address. Recreate this assistant under a first name with a Latin letter.`,
-    );
-  const hostname = `${label}.${config.zoneApex}`;
+  const hostname = webHostnameFor(firstName, config.zoneApex);
   const server = createServer();
   await new Promise<void>((resolve, reject) => {
     server.once('error', reject);
@@ -520,15 +536,7 @@ async function claimNamespace(
     if (!address || typeof address === 'string') throw new Error('No loopback listener');
     const claim = { hostname, listen_port: address.port };
     await claimInstanceWeb(paths, instanceId, claim, async (registry) => {
-      const holder = Object.values(registry.instances).find(
-        (assistant) =>
-          assistant.instance_id !== instanceId && assistant.exclusive_resource_claims.web?.hostname === hostname,
-      );
-      if (holder)
-        throw new GwsEaError(
-          'web_hostname_claimed',
-          `${hostname} is already held by assistant ${holder.instance_id}. Recreate this assistant under another first name, or remove the holder.`,
-        );
+      assertWebHostnameUnclaimed(registry, instanceId, hostname);
       const live = await readWebOperatorConfig(webOperatorFiles(paths).configFile);
       if (!live) throw new GwsEaError('web_not_installed', 'Web is not installed on this operator host.');
       await assertWebHostnameAvailable(live, hostname, dependencies);

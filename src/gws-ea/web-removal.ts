@@ -382,7 +382,7 @@ export async function settleWebCleanup(
         await step('remote', async () => undefined);
       }
       if (retainShared) {
-        if (!live) throw new GwsEaError('web_owner_missing', 'Shared ownership record is missing.');
+        if (!live) return;
         const assistants = { ...live.assistants };
         if (instanceId !== null) delete assistants[instanceId];
         const dns = Object.fromEntries(

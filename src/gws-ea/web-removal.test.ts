@@ -261,6 +261,65 @@ it('retains exact cleanup evidence and the claim across remote failure, then res
   expect(await exists(f.files.configFile)).toBe(true);
 });
 
+it('resumes interrupted assistant removal after web uninstall deletes the shared ownership record', async () => {
+  const f = await fixture();
+  await expect(
+    removeAssistant(f.paths, f.own.instance_id, {
+      ...f.dependencies,
+      reporter: {
+        emit: (event) => {
+          if (event.type === 'step-completed' && event.step === 'remove_web')
+            throw new Error('Removal interrupted before recording web completion');
+        },
+      },
+    }),
+  ).rejects.toThrow('Removal interrupted before recording web completion');
+  const receipt = JSON.parse(await readFile(f.paths.removalFile(f.own.instance_id), 'utf8')) as unknown;
+  expect(receipt).toHaveProperty('web.completed', expect.arrayContaining(['remote']));
+  expect(receipt).not.toHaveProperty('completed.web');
+  expect(await uninstallWebConnector(f.paths, f.dependencies)).toMatchObject({ outcome: 'removed' });
+  expect(await exists(f.files.configFile)).toBe(false);
+  const effects = [...f.effects];
+
+  const outcome = await removeAssistant(f.paths, f.own.instance_id, {
+    ...f.dependencies,
+    fetch: async () => {
+      throw new Error('Completed remote cleanup must not be repeated');
+    },
+  });
+  expect(outcome.removed).toContain('web');
+  expect(f.effects).toEqual(effects);
+  expect(await exists(f.paths.removalFile(f.own.instance_id))).toBe(false);
+  expect(await exists(f.paths.instanceRoot(f.own.instance_id))).toBe(false);
+  expect((await readRegistry(f.paths)).instances[f.own.instance_id]).toBeUndefined();
+});
+
+it('preserves an incomplete cleanup receipt and claim when the shared ownership record is missing', async () => {
+  const f = await fixture();
+  f.fail('/zones/zone/dns_records/dns');
+  await expect(removeAssistant(f.paths, f.own.instance_id, f.dependencies)).rejects.toMatchObject({ resource: 'web' });
+  const receipt = JSON.parse(await readFile(f.paths.removalFile(f.own.instance_id), 'utf8')) as unknown;
+  expect(receipt).toHaveProperty('web.completed', expect.not.arrayContaining(['remote']));
+  await rm(f.files.configFile);
+  const effects = [...f.effects];
+
+  await expect(
+    removeAssistant(f.paths, f.own.instance_id, {
+      ...f.dependencies,
+      fetch: async () => {
+        throw new Error('Missing ownership must block before any provider request');
+      },
+    }),
+  ).rejects.toMatchObject({ resource: 'web' });
+  expect(f.effects).toEqual(effects);
+  expect(await exists(f.paths.removalFile(f.own.instance_id))).toBe(true);
+  expect((await readRegistry(f.paths)).instances[f.own.instance_id]?.exclusive_resource_claims.web).toEqual(
+    f.own.exclusive_resource_claims.web,
+  );
+  expect(f.resources.has('/zones/zone/dns_records/dns')).toBe(true);
+  expect(await exists(f.config.credentialFile)).toBe(true);
+});
+
 it('retains an uninstall receipt through credential deletion failure and retries local cleanup without another API credential', async () => {
   const f = await fixture();
   let spoiled = false;
