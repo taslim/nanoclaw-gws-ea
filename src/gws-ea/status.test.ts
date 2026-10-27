@@ -987,10 +987,15 @@ describe('status', () => {
     expect(observed.status.probes.external_email).toMatchObject({ status: 'ok' });
   });
 
-  it('runs isolation only under details and reports a reachable host listener as degraded', async () => {
+  it.each([false, true])('keeps isolation faults actionable with missing Chrome=%s', async (chromeMissing) => {
     const host = await machine();
     const reservation = await assistant(host, { label: 'alpha', port: 36001 });
     const state = world(reservation);
+    if (chromeMissing)
+      vi.mocked(browserAvailability.browserAvailability).mockResolvedValue({
+        available: false,
+        reason: 'chrome-missing',
+      });
     const healthy = healthyObservers(state);
     const observers = {
       ...healthy,
@@ -1028,7 +1033,11 @@ describe('status', () => {
     expect(runCommand.mock.calls.some(([request]) => request.command === 'docker')).toBe(true);
     expect(result.next_actions).toContainEqual({
       kind: 'external',
-      instruction: expect.stringContaining('Docker network isolation'),
+      instruction: expect.stringContaining(chromeMissing ? 'install Google Chrome' : 'Docker network isolation'),
+    });
+    expect(result.next_actions).toContainEqual({
+      kind: 'command',
+      argv: ['gws-ea', 'logs', '--id', reservation.instance_id, '--errors'],
     });
   });
 
@@ -1140,7 +1149,7 @@ describe('status', () => {
     },
   );
 
-  it('reports missing Chrome independently from optional alias and connector setup', async () => {
+  it.each([false, true])('reports missing Chrome independently with a workspace fault=%s', async (workspaceFault) => {
     const host = await machine();
     const reservation = await assistant(host, { label: 'alpha', port: 36001 });
     const state = world(reservation);
@@ -1151,6 +1160,9 @@ describe('status', () => {
     const healthy = healthyObservers(state);
     const observed = await statusJson(host, state, reservation.instance_id, {
       ...healthy,
+      ...(workspaceFault
+        ? { google: async () => ({ status: 'degraded' as const, account: null, reason: 'Sign-in expired.' }) }
+        : {}),
       ncl: async (runtime, args) =>
         args.join(' ') === 'gws-ea-alias get' ? { alias: null, candidate: null } : healthy.ncl(runtime, args),
     });
@@ -1160,6 +1172,15 @@ describe('status', () => {
       kind: 'external',
       instruction: expect.stringContaining('install Google Chrome'),
     });
+    expect(observed.nextActions).toEqual(
+      workspaceFault
+        ? expect.arrayContaining([
+            { kind: 'command', argv: ['gws-ea', 'logs', '--id', reservation.instance_id, '--errors'] },
+          ])
+        : expect.not.arrayContaining([
+            { kind: 'command', argv: ['gws-ea', 'logs', '--id', reservation.instance_id, '--errors'] },
+          ]),
+    );
     expect(observed.status.connectors.map((entry) => [entry.name, entry.setup])).toEqual([
       ['voice', 'not_installed'],
       ['onepassword', 'not_installed'],
@@ -1184,6 +1205,10 @@ describe('status', () => {
     expect(observed.nextActions).not.toContainEqual({
       kind: 'external',
       instruction: expect.stringContaining('install Google Chrome'),
+    });
+    expect(observed.nextActions).toContainEqual({
+      kind: 'command',
+      argv: ['gws-ea', 'logs', '--id', reservation.instance_id, '--errors'],
     });
   });
 

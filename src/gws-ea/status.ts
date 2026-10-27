@@ -1879,8 +1879,18 @@ function statusActions(status: AssistantStatus): NextAction[] {
       instruction:
         "For the recorded credential failure, check this assistant's provider sign-in in its operator credential console. A later successful turn confirms recovery. Keep credentials out of chat.",
     });
-  // Voice is optional, and a web alias still pending is setup to finish: neither sends the operator to the logs.
-  if (PROBE_NAMES.some((name) => name !== 'voice' && name !== 'web_alias' && status.probes[name].status !== 'ok'))
+  if (
+    PROBE_NAMES.some(
+      (name) =>
+        name !== 'voice' &&
+        name !== 'web_alias' &&
+        status.probes[name].status !== 'ok' &&
+        (name !== 'browser' ||
+          status.probes.browser.chrome !== 'missing' ||
+          status.probes.browser.isolation?.isolation.status === 'failed' ||
+          status.probes.browser.isolation?.isolation.status === 'unknown'),
+    )
+  )
     actions.push({ kind: 'command', argv: ['gws-ea', 'logs', '--id', status.instance_id, '--errors'] });
   return actions;
 }

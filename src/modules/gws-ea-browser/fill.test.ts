@@ -1,6 +1,3 @@
-import { randomUUID } from 'node:crypto';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import type { Page } from 'playwright-core';
 import {
@@ -23,7 +20,8 @@ import { browserVault, BrowserVaultError, websitePermitsOrigin } from './onepass
 const SECRET = 'fixture-secret-must-stay-host-only';
 beforeEach(() => {
   configureBrowserSiteInfo({ vault: readVaultSiteInfo });
-  vi.stubEnv('GWS_EA_BROWSER_ROOT', join(tmpdir(), `browser-test-disabled-${randomUUID()}.json`));
+  // A nonempty relative root is unavailable and cannot fall back to the operator's .env.
+  vi.stubEnv('GWS_EA_BROWSER_ROOT', 'unconfigured-browser-root');
 });
 afterEach(() => {
   vi.unstubAllEnvs();

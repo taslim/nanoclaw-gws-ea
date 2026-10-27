@@ -64,7 +64,9 @@ export function helpLines(command?: DiscoveryTarget): readonly string[] {
         : `${command.path.join(' ')} <action>`;
     return [
       `Usage: gws-ea ${target} [options]`,
-      'Operate optional connectors. Each action declares shared installation, account and assistant effects.',
+      command.path[0] === 'connectors'
+        ? 'Operate optional connectors. Each action declares shared installation, account and assistant effects.'
+        : 'Manage the assistant’s WhatsApp link.',
       '',
       'Scope: each registered command declares host or assistant ownership.',
       'Commands:',

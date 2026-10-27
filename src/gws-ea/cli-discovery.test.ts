@@ -25,6 +25,14 @@ function capture() {
 }
 
 describe('local CLI discovery and grammar', () => {
+  it('describes WhatsApp namespace help as assistant link management', async () => {
+    const io = capture();
+    expect(await runCli(['help', 'whatsapp'], io.runtime)).toBe(0);
+    const text = io.stdout.join('\n');
+    expect(text).toContain('assistant’s WhatsApp link');
+    expect(text).not.toContain('Operate optional connectors');
+    expect(io.runtime.checkPrerequisites).not.toHaveBeenCalled();
+  });
   it('guides namespace help to complete named connector commands', async () => {
     const root = capture();
     expect(await runCli(['help', 'connectors'], root.runtime)).toBe(0);

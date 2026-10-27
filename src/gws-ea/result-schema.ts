@@ -644,12 +644,7 @@ const rollback = {
 const identity = { instance_id: text };
 const common = {
   ...identity,
-  connector_next_actions: array({
-    oneOf: [
-      object({ kind: { const: 'command' }, argv: array(text) }),
-      object({ kind: { const: 'external' }, instruction: text }),
-    ],
-  }),
+  connector_next_actions: array(nextAction),
   cleanup,
   preparation: object({ bootstrap_manifest: choices('retained', 'unknown'), reservation: { const: 'unknown' } }),
 };
