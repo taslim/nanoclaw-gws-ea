@@ -45,4 +45,5 @@ import './gws-ea-meetings/index.js';
 import './gws-ea-matters/index.js';
 import './community-portal/index.js';
 import './gws-ea-browser/index.js';
+import './gws-ea-web/index.js';
 import './gws-ea-artifacts/index.js';

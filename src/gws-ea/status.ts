@@ -1722,6 +1722,15 @@ function mainTurnLine({ provider, last, reason }: MainTurnView, timezone: string
   return `  Last observed agent outcome (main): ${detail}`;
 }
 
+function webStatusDetail(observation: ConnectorObservation, instanceId: string): string {
+  if (observation.name !== 'web' || 'name' in observation.details) return '';
+  const address = observation.details.find((assistant) => assistant.instance_id === instanceId)?.hostname;
+  const assistant = observation.assistants.find((entry) => entry.instance_id === instanceId);
+  return [...(address ? [`https://${address}`] : []), ...(assistant?.reasons ?? [])]
+    .map((detail) => `; ${detail}`)
+    .join('');
+}
+
 function renderStatusDetails(status: AssistantStatus, timezone: string): string[] {
   const { registry, schema } = status;
   const operation = operationDetail(status.instance_id, status.operation, status.removal_in_progress);
@@ -1742,7 +1751,7 @@ function renderStatusDetails(status: AssistantStatus, timezone: string): string[
     mainTurnLine(status.main_turn, timezone),
     ...status.connectors.map(
       (entry) =>
-        `  ${entry.name}: ${entry.setup.replaceAll('_', ' ')}; ${entry.readiness.status.replaceAll('_', ' ')}${entry.reasons.length ? `; ${entry.reasons.join(' ')}` : ''}`,
+        `  ${entry.name}: ${entry.setup.replaceAll('_', ' ')}; ${entry.readiness.status.replaceAll('_', ' ')}${entry.reasons.length ? `; ${entry.reasons.join(' ')}` : ''}${webStatusDetail(entry, status.instance_id)}`,
     ),
     ...statusActions(status).flatMap((action) =>
       action.kind === 'command' ? [`  Next: ${recoveryCommandLine(action.argv)}`] : [`  Next: ${action.instruction}`],
@@ -1807,7 +1816,7 @@ function renderStatus(status: AssistantStatus, timezone: string, details: boolea
     `  Account: ${status.registry.account}`,
     ...status.connectors.map(
       (entry) =>
-        `  ${entry.name}: ${entry.setup.replaceAll('_', ' ')}; ${entry.assistants[0]?.readiness.status.replaceAll('_', ' ') ?? entry.readiness.status.replaceAll('_', ' ')}${entry.reasons.length ? `; ${entry.reasons.join(' ')}` : ''}`,
+        `  ${entry.name}: ${entry.setup.replaceAll('_', ' ')}; ${entry.assistants[0]?.readiness.status.replaceAll('_', ' ') ?? entry.readiness.status.replaceAll('_', ' ')}${entry.reasons.length ? `; ${entry.reasons.join(' ')}` : ''}${webStatusDetail(entry, status.instance_id)}`,
     ),
     `  Browser: ${status.probes.browser.status}; Chrome ${status.probes.browser.chrome}${status.probes.browser.reason ? `; ${status.probes.browser.reason}` : ''}`,
     `  Service: ${status.probes.service.state}${status.probes.service.reason ? `; ${status.probes.service.reason}` : ''}`,

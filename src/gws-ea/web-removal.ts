@@ -2,14 +2,14 @@ import path from 'node:path';
 
 import { isErrno } from '../community-portal/errors.js';
 import {
-  artifactsApi,
-  artifactsOperatorFiles,
-  parseArtifactsOperatorConfig,
-  readArtifactsOperatorConfig,
-  writeArtifactsOperatorConfig,
-  type ArtifactsOperatorConfig,
-} from './artifacts-cloudflare.js';
-import { renderArtifactsConnectorService, setArtifactsIngress } from './artifacts-connector.js';
+  webApi,
+  webOperatorFiles,
+  parseWebOperatorConfig,
+  readWebOperatorConfig,
+  writeWebOperatorConfig,
+  type WebOperatorConfig,
+} from './web-cloudflare.js';
+import { renderWebConnectorService, setWebIngress } from './web-connector.js';
 import type { ControlPlanePaths } from './paths.js';
 import { runSanitizedCommandOutcome, buildToolEnvironment, type SanitizedCommandOutcomeRunner } from './process.js';
 import { readRegistry, withMachineLock } from './registry.js';
@@ -17,29 +17,29 @@ import { readOwnerOnlyFile, removePrivateFile } from './secrets.js';
 import { GwsEaError, type InstanceReservation } from './types.js';
 import { isRecord } from './validation.js';
 
-export interface ArtifactsCleanup {
+export interface WebCleanup {
   readonly schemaVersion: 1;
   /** This assistant's entry and the shared resources only; never a credential or content. */
-  readonly ownership: ArtifactsOperatorConfig;
+  readonly ownership: WebOperatorConfig;
   readonly completed: readonly string[];
   readonly sharedRetained: boolean;
 }
-export interface ArtifactsCleanupBlock {
+export interface WebCleanupBlock {
   readonly reason: string;
   readonly evidence: string;
 }
-export type ArtifactsCapture =
+export type WebCapture =
   | { readonly status: 'none' }
-  | { readonly status: 'captured'; readonly cleanup: ArtifactsCleanup }
-  | ({ readonly status: 'unreadable' } & ArtifactsCleanupBlock);
+  | { readonly status: 'captured'; readonly cleanup: WebCleanup }
+  | ({ readonly status: 'unreadable' } & WebCleanupBlock);
 
-export function parseArtifactsCleanup(value: unknown): ArtifactsCleanup | undefined {
+export function parseWebCleanup(value: unknown): WebCleanup | undefined {
   if (
     !isRecord(value) ||
     value.schemaVersion !== 1 ||
     !Array.isArray(value.completed) ||
     !value.completed.every(
-      (entry): entry is string =>
+      (entry: unknown): entry is string =>
         typeof entry === 'string' &&
         /^(?:ingress|application|connector|tunnel|pin|remote|tunnel-token|management-token|dns:[a-zA-Z0-9_-]{1,256})$/u.test(
           entry,
@@ -51,7 +51,7 @@ export function parseArtifactsCleanup(value: unknown): ArtifactsCleanup | undefi
   try {
     return {
       schemaVersion: 1,
-      ownership: parseArtifactsOperatorConfig(value.ownership),
+      ownership: parseWebOperatorConfig(value.ownership),
       completed: value.completed,
       sharedRetained: value.sharedRetained,
     };
@@ -60,13 +60,13 @@ export function parseArtifactsCleanup(value: unknown): ArtifactsCleanup | undefi
     throw cause;
   }
 }
-function refusal(paths: ControlPlanePaths, message: string, cleanup?: ArtifactsCleanup): ArtifactsCleanupBlock {
+function refusal(paths: ControlPlanePaths, message: string, cleanup?: WebCleanup): WebCleanupBlock {
   const config = cleanup?.ownership;
   return {
-    reason: 'Artifacts cleanup could not be verified. Its ownership record and credentials remain for retry.',
+    reason: 'Web cleanup could not be verified. Its ownership record and credentials remain for retry.',
     evidence: [
       message,
-      `Ownership record: ${artifactsOperatorFiles(paths).configFile}`,
+      `Ownership record: ${webOperatorFiles(paths).configFile}`,
       ...(config
         ? [
             `Cloudflare account: ${config.accountId}`,
@@ -91,24 +91,24 @@ function refusal(paths: ControlPlanePaths, message: string, cleanup?: ArtifactsC
     ].join('\n'),
   };
 }
-export async function captureArtifactsCleanup(
+export async function captureWebCleanup(
   paths: ControlPlanePaths,
   reservation: InstanceReservation,
-): Promise<ArtifactsCapture> {
-  const claim = reservation.exclusive_resource_claims.artifacts;
+): Promise<WebCapture> {
+  const claim = reservation.exclusive_resource_claims.web;
   if (!claim) return { status: 'none' };
   try {
-    const config = await readArtifactsOperatorConfig(artifactsOperatorFiles(paths).configFile);
+    const config = await readWebOperatorConfig(webOperatorFiles(paths).configFile);
     if (!config)
       return {
         status: 'unreadable',
-        ...refusal(paths, 'The claimed artifacts namespace has no readable ownership record.'),
+        ...refusal(paths, 'The claimed web namespace has no readable ownership record.'),
       };
     const own = config.assistants[reservation.instance_id];
     if (own && JSON.stringify(own.claim) !== JSON.stringify(claim))
       return {
         status: 'unreadable',
-        ...refusal(paths, 'The artifact ownership record does not match the reserved namespace.'),
+        ...refusal(paths, 'The web ownership record does not match the reserved namespace.'),
       };
     return {
       status: 'captured',
@@ -127,20 +127,20 @@ export async function captureArtifactsCleanup(
 
 async function stopConnector(
   paths: ControlPlanePaths,
-  config: ArtifactsOperatorConfig,
+  config: WebOperatorConfig,
   run: SanitizedCommandOutcomeRunner,
 ): Promise<void> {
   const connector = config.connector;
   if (!connector) return;
-  const files = artifactsOperatorFiles(paths);
-  const expected = renderArtifactsConnectorService(files, config.cloudflaredPath, connector);
+  const files = webOperatorFiles(paths);
+  const expected = renderWebConnectorService(files, config.cloudflaredPath, connector);
   const stored = await readOwnerOnlyFile(connector.definitionFile).catch((cause: unknown) => {
     if (isErrno(cause, 'ENOENT')) return undefined;
     throw cause;
   });
   if (stored !== undefined && stored !== expected)
     throw new GwsEaError(
-      'artifacts_connector_conflict',
+      'web_connector_conflict',
       'The recorded connector definition was changed; it was left untouched.',
     );
   const invoke = (command: string, args: readonly string[]) =>
@@ -165,7 +165,7 @@ async function stopConnector(
   if (connector.manager === 'launchd') {
     const uid = process.getuid?.();
     if (uid === undefined)
-      throw new GwsEaError('artifacts_connector_unavailable', 'Cannot identify the connector service user.');
+      throw new GwsEaError('web_connector_unavailable', 'Cannot identify the connector service user.');
     const service = `gui/${uid}/${connector.label}`;
     const absent = (result: { readonly exitCode: number }) => result.exitCode === 113;
     const observed = await invoke('launchctl', ['print', service]);
@@ -176,7 +176,7 @@ async function stopConnector(
         !absent(await invoke('launchctl', ['print', service]))
       )
         throw new GwsEaError(
-          'artifacts_connector_unavailable',
+          'web_connector_unavailable',
           'The recorded connector service could not be stopped and verified absent.',
         );
     }
@@ -197,7 +197,7 @@ async function stopConnector(
       (stopped.exitCode !== 0 && !/^LoadState=not-found$/mu.test(observed.stdout))
     )
       throw new GwsEaError(
-        'artifacts_connector_unavailable',
+        'web_connector_unavailable',
         'The recorded connector service could not be stopped and verified inactive.',
       );
   }
@@ -206,38 +206,35 @@ async function stopConnector(
     const prefix = connector.manager === 'systemd-user' ? ['--user'] : [];
     if ((await invoke('systemctl', [...prefix, 'daemon-reload'])).exitCode !== 0)
       throw new GwsEaError(
-        'artifacts_connector_unavailable',
+        'web_connector_unavailable',
         'The connector definition was removed but systemd could not reload.',
       );
   }
 }
 
-export async function settleArtifactsCleanup(
+export async function settleWebCleanup(
   paths: ControlPlanePaths,
   instanceId: string | null,
-  initial: ArtifactsCleanup,
+  initial: WebCleanup,
   options: {
     readonly fetch?: typeof fetch;
     readonly runCommand?: SanitizedCommandOutcomeRunner;
-    readonly record: (cleanup: ArtifactsCleanup) => Promise<void>;
+    readonly record: (cleanup: WebCleanup) => Promise<void>;
   },
-): Promise<ArtifactsCleanupBlock | undefined> {
+): Promise<WebCleanupBlock | undefined> {
   let cleanup = initial;
   try {
     await withMachineLock(paths, async () => {
-      const files = artifactsOperatorFiles(paths);
-      const live = await readArtifactsOperatorConfig(files.configFile);
+      const files = webOperatorFiles(paths);
+      const live = await readWebOperatorConfig(files.configFile);
       let recorded = cleanup.ownership;
       if (
         recorded.credentialFile !== path.join(files.root, 'management-token') ||
         Object.keys(recorded.assistants).some((id) => id !== instanceId)
       )
-        throw new GwsEaError(
-          'artifacts_owner_mismatch',
-          'The receipt does not name this operator and assistant ownership.',
-        );
+        throw new GwsEaError('web_owner_mismatch', 'The receipt does not name this operator and assistant ownership.');
       if (!live && !cleanup.completed.includes('remote'))
-        throw new GwsEaError('artifacts_owner_missing', 'The exact artifact ownership record is missing.');
+        throw new GwsEaError('web_owner_missing', 'The exact web ownership record is missing.');
       if (
         live &&
         (live.accountId !== recorded.accountId ||
@@ -246,12 +243,12 @@ export async function settleArtifactsCleanup(
           JSON.stringify(live.pin) !== JSON.stringify(recorded.pin) ||
           JSON.stringify(live.connector) !== JSON.stringify(recorded.connector))
       )
-        throw new GwsEaError('artifacts_owner_mismatch', 'Artifact shared ownership changed during removal.');
+        throw new GwsEaError('web_owner_mismatch', 'Web shared ownership changed during removal.');
       if (live) {
         for (const [hostname, dns] of Object.entries(recorded.dns)) {
           const current = live.dns[hostname];
           if (current && (current.id !== dns.id || current.zoneId !== dns.zoneId))
-            throw new GwsEaError('artifacts_owner_mismatch', 'The recorded DNS ownership changed during removal.');
+            throw new GwsEaError('web_owner_mismatch', 'The recorded DNS ownership changed during removal.');
         }
         const previous = recorded.pending;
         if (
@@ -266,7 +263,7 @@ export async function settleArtifactsCleanup(
           )
         )
           throw new GwsEaError(
-            'artifacts_create_unproven',
+            'web_create_unproven',
             'The receipt still names an unproven creation without an explicit recorded resolution.',
           );
         const { pending: _pending, resolvedAttempts: _resolved, ...owned } = recorded;
@@ -286,7 +283,7 @@ export async function settleArtifactsCleanup(
           currentOwn.policyId !== own?.policyId ||
           JSON.stringify(currentOwn.claim) !== JSON.stringify(own?.claim))
       )
-        throw new GwsEaError('artifacts_owner_mismatch', 'The assistant Access ownership changed during removal.');
+        throw new GwsEaError('web_owner_mismatch', 'The assistant Access ownership changed during removal.');
       const registry = await readRegistry(paths);
       const peers = [
         ...Object.values(live?.assistants ?? {})
@@ -295,17 +292,15 @@ export async function settleArtifactsCleanup(
         ...Object.values(registry.instances)
           .filter((candidate) => candidate.instance_id !== instanceId)
           .flatMap((candidate) =>
-            candidate.exclusive_resource_claims.artifacts ? [candidate.exclusive_resource_claims.artifacts] : [],
+            candidate.exclusive_resource_claims.web ? [candidate.exclusive_resource_claims.web] : [],
           ),
       ];
-      const shared = peers.length > 0;
-      if (instanceId === null && shared)
-        throw new GwsEaError('artifacts_shared_in_use', 'Assistant namespace claims still need to be settled.');
+      const retainShared = instanceId !== null;
+      if (!retainShared && peers.length > 0)
+        throw new GwsEaError('web_shared_in_use', 'Assistant namespace claims still need to be settled.');
       cleanup = {
         ...cleanup,
-        completed:
-          cleanup.sharedRetained && !shared ? cleanup.completed.filter((key) => key !== 'remote') : cleanup.completed,
-        sharedRetained: shared,
+        sharedRetained: retainShared,
       };
       await options.record(cleanup);
       const step = async (key: string, action: () => Promise<void>): Promise<void> => {
@@ -315,9 +310,9 @@ export async function settleArtifactsCleanup(
         await options.record(cleanup);
       };
       if (!cleanup.completed.includes('remote')) {
-        if (!live) throw new GwsEaError('artifacts_owner_missing', 'The exact artifact ownership record is missing.');
+        if (!live) throw new GwsEaError('web_owner_missing', 'The exact web ownership record is missing.');
         const config = live;
-        const api = await artifactsApi(config, { fetch: options.fetch });
+        const api = await webApi(config, { fetch: options.fetch });
         const absent = async (resource: string): Promise<boolean> => {
           try {
             const result = await api.request('GET', resource);
@@ -332,29 +327,32 @@ export async function settleArtifactsCleanup(
             if (await absent(resource)) return;
             await api.request('DELETE', resource);
             if (!(await absent(resource)))
-              throw new GwsEaError('artifacts_cleanup_unverified', `Cloudflare resource is still present: ${resource}`);
+              throw new GwsEaError('web_cleanup_unverified', `Cloudflare resource is still present: ${resource}`);
           });
         const account = `/accounts/${recorded.accountId}`;
         await step('ingress', async () => {
           if (config.tunnelId && !(await absent(`${account}/cfd_tunnel/${config.tunnelId}`))) {
             const claim =
               own?.claim ??
-              (instanceId === null ? undefined : registry.instances[instanceId]?.exclusive_resource_claims.artifacts);
-            if (claim) await setArtifactsIngress(api, config, claim, false);
+              (instanceId === null ? undefined : registry.instances[instanceId]?.exclusive_resource_claims.web);
+            if (claim) await setWebIngress(api, config, claim, false);
           }
         });
         if (own?.applicationId) await remove('application', `${account}/access/apps/${own.applicationId}`);
+        const claim =
+          own?.claim ??
+          (instanceId === null ? undefined : registry.instances[instanceId]?.exclusive_resource_claims.web);
         const pending = recorded.pending;
-        if (pending && (pending.target === instanceId || pending.target === own?.claim.hostname || !shared))
+        if (pending && (pending.target === instanceId || pending.target === claim?.hostname || !retainShared))
           throw new GwsEaError(
-            'artifacts_create_unproven',
+            'web_create_unproven',
             `Unproven ${pending.kind} creation ${pending.key} must be resolved or explicitly abandoned.`,
           );
         for (const [hostname, dns] of Object.entries(recorded.dns)) {
-          if (!peers.some((claim) => claim.hostname === hostname))
+          if ((!retainShared || hostname === claim?.hostname) && !peers.some((peer) => peer.hostname === hostname))
             await remove(`dns:${dns.id}`, `/zones/${dns.zoneId}/dns_records/${dns.id}`);
         }
-        if (!shared) {
+        if (!retainShared) {
           if (recorded.tunnelId && !(await absent(`${account}/cfd_tunnel/${recorded.tunnelId}`))) {
             const remaining = await api.request('GET', `${account}/cfd_tunnel/${recorded.tunnelId}/configurations`);
             if (
@@ -362,7 +360,7 @@ export async function settleArtifactsCleanup(
               !isRecord(remaining.config) ||
               !Array.isArray(remaining.config.ingress) ||
               remaining.config.ingress.some(
-                (route) =>
+                (route: unknown) =>
                   !isRecord(route) ||
                   route.hostname !== undefined ||
                   route.path !== undefined ||
@@ -370,7 +368,7 @@ export async function settleArtifactsCleanup(
               )
             )
               throw new GwsEaError(
-                'artifacts_tunnel_conflict',
+                'web_tunnel_conflict',
                 'The owned tunnel still routes an unrelated service; shared resources were left untouched.',
               );
           }
@@ -383,14 +381,14 @@ export async function settleArtifactsCleanup(
         }
         await step('remote', async () => undefined);
       }
-      if (shared) {
-        if (!live) throw new GwsEaError('artifacts_owner_missing', 'Shared ownership record is missing.');
+      if (retainShared) {
+        if (!live) return;
         const assistants = { ...live.assistants };
         if (instanceId !== null) delete assistants[instanceId];
         const dns = Object.fromEntries(
           Object.entries(live.dns).filter(([, record]) => !cleanup.completed.includes(`dns:${record.id}`)),
         );
-        await writeArtifactsOperatorConfig(files.configFile, { ...live, assistants, dns });
+        await writeWebOperatorConfig(files.configFile, { ...live, assistants, dns });
       } else {
         await step('connector', () => stopConnector(paths, recorded, options.runCommand ?? runSanitizedCommandOutcome));
         await step('tunnel-token', () => removePrivateFile(files.tokenFile));
@@ -403,7 +401,7 @@ export async function settleArtifactsCleanup(
     if (!(cause instanceof Error)) throw cause;
     return refusal(
       paths,
-      cause instanceof GwsEaError ? cause.message : 'A remote or local artifact cleanup boundary failed.',
+      cause instanceof GwsEaError ? cause.message : 'A remote or local web cleanup boundary failed.',
       cleanup,
     );
   }

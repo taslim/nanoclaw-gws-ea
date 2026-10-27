@@ -22,15 +22,14 @@ let artifactId: string;
 let sourceHash: string;
 const shareId = '11111111-1111-4111-8111-111111111111';
 const publicId = '22222222-2222-4222-8222-222222222222';
-const base = 'https://views.example.com/aya';
+const base = 'https://aya.example.com/artifacts';
 function policy(enabled = true) {
   fs.writeFileSync(
     path.join(ROOT, 'policy.json'),
     JSON.stringify({
       schemaVersion: 1,
       enabled,
-      hostname: 'views.example.com',
-      pathPrefix: '/aya',
+      hostname: 'aya.example.com',
       listenPort: 9123,
       accessIssuer: 'https://team.cloudflareaccess.com',
       accessAud: 'aud',
@@ -45,7 +44,7 @@ async function check(url: string, recipients = ['juno@example.com']) {
 beforeEach(async () => {
   fs.mkdirSync(ROOT, { recursive: true });
   policy();
-  vi.stubEnv('GWS_EA_ARTIFACTS_POLICY_FILE', path.join(ROOT, 'policy.json'));
+  vi.stubEnv('GWS_EA_WEB_POLICY_FILE', path.join(ROOT, 'policy.json'));
   await runMigrations(await initTestDb());
   const now = new Date().toISOString();
   await createAgentGroup({ id: 'main', name: 'Main', folder: 'main', agent_provider: null, created_at: now });
@@ -267,5 +266,24 @@ it.each(['private', 'named', 'public'] as const)(
       await expect(sent).rejects.toBeInstanceOf(OutboundRefusedError);
       expect(deliver).not.toHaveBeenCalled();
     }
+  },
+);
+
+it.each(['/', '/other', '/artifact', '/artifactsx', '/%61rtifacts/public/22222222-2222-4222-8222-222222222222'])(
+  'refuses every noncanonical address on the assistant host: %s',
+  async (route) => {
+    const { setDeliveryAdapter, OutboundRefusedError } = await import('../../delivery.js');
+    const deliver = vi.fn(async () => undefined);
+    const channel = setDeliveryAdapter({ deliver });
+    await expect(
+      channel.deliver(
+        'gchat',
+        'unknown-room',
+        null,
+        'chat',
+        JSON.stringify({ text: `https://aya.example.com${route}` }),
+      ),
+    ).rejects.toBeInstanceOf(OutboundRefusedError);
+    expect(deliver).not.toHaveBeenCalled();
   },
 );

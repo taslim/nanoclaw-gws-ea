@@ -6,51 +6,30 @@ import { resolveControlPlanePaths, type ControlPlanePaths } from './paths.js';
 import { registerSecret } from './redact.js';
 import { withMachineLock } from './registry.js';
 import { readOperatorFile, readOwnerOnlyJson, writePrivateTextFile } from './secrets.js';
-import { GwsEaError, type ArtifactsNamespaceClaim } from './types.js';
+import { GwsEaError, type WebNamespaceClaim } from './types.js';
 import { hasControlCharacters, INSTANCE_ID_PATTERN, isRecord, normalizePrincipalEmail } from './validation.js';
 
-const RESERVED = new Set(['public', 'private', 'guest', 'assets', 'api', 'cdn-cgi', 'health', 'login', 'logout']);
 const ID = /^[a-zA-Z0-9_-]{1,256}$/u;
 const HOST = /^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/u;
 const MAX_RESPONSE_BYTES = 1024 * 1024;
 
-export function artifactsPathPrefix(firstName: string): string {
-  const slug = firstName.trim().normalize('NFKC').toLowerCase().replace(/\s+/gu, '-');
-  if (!slug || slug.length > 160 || slug === '.' || slug === '..' || /[\\/%\p{Cc}]/u.test(slug) || RESERVED.has(slug))
-    throw new GwsEaError(
-      'artifacts_invalid_name',
-      'The assistant first name cannot be used as a public path. Configure a dedicated assistant hostname.',
-    );
-  return `/${encodeURIComponent(slug)}`;
+export function webIngress(claim: WebNamespaceClaim): Record<string, unknown> & { path: string } {
+  return { hostname: claim.hostname, path: '^/artifacts(/|$)', service: `http://127.0.0.1:${claim.listen_port}` };
 }
 
-/** cloudflared matches Go URL.Path, which is decoded, while public URLs retain canonical encoding. */
-export function artifactsIngress(claim: ArtifactsNamespaceClaim): Record<string, unknown> & { path?: string } {
-  return {
-    hostname: claim.hostname,
-    ...(claim.path_prefix === ''
-      ? {}
-      : { path: `^${decodeURIComponent(claim.path_prefix).replace(/[.*+?^${}()|[\]\\]/gu, '\\$&')}(/|$)` }),
-    service: `http://127.0.0.1:${claim.listen_port}`,
-  };
-}
-
-export interface ArtifactsCloudflareDependencies {
+export interface WebCloudflareDependencies {
   readonly fetch?: typeof fetch;
   readonly sleep?: (milliseconds: number) => Promise<void>;
 }
-export interface ArtifactsCloudflareApi {
+export interface WebCloudflareApi {
   request(method: 'GET' | 'POST' | 'PUT' | 'DELETE', resource: string, body?: unknown): Promise<unknown>;
   list(resource: string): Promise<Record<string, unknown>[]>;
 }
 
 /** Raw response errors and the credential never enter diagnostics. */
-export function createArtifactsCloudflareApi(
-  token: string,
-  dependencies: ArtifactsCloudflareDependencies = {},
-): ArtifactsCloudflareApi {
+export function createWebCloudflareApi(token: string, dependencies: WebCloudflareDependencies = {}): WebCloudflareApi {
   if (!token || /\s/u.test(token))
-    throw new GwsEaError('artifacts_credential_invalid', 'Cloudflare credential file must hold one API token.');
+    throw new GwsEaError('web_credential_invalid', 'Cloudflare credential file must hold one API token.');
   registerSecret(token);
   const send = dependencies.fetch ?? fetch;
   const sleep = dependencies.sleep ?? delay;
@@ -64,7 +43,7 @@ export function createArtifactsCloudflareApi(
     for (let attempt = 0; attempt < 2; attempt++) {
       const remaining = deadline - Date.now();
       if (remaining <= 0)
-        throw new GwsEaError('artifacts_cloudflare_timeout', 'The bounded Cloudflare operation deadline was reached.');
+        throw new GwsEaError('web_cloudflare_timeout', 'The bounded Cloudflare operation deadline was reached.');
       let response: Response;
       let envelope: unknown;
       try {
@@ -94,7 +73,7 @@ export function createArtifactsCloudflareApi(
         envelope = JSON.parse(Buffer.concat(chunks).toString('utf8'));
       } catch (_cause) {
         throw new GwsEaError(
-          'artifacts_cloudflare_unavailable',
+          'web_cloudflare_unavailable',
           'Cloudflare did not return a verifiable response. An interrupted create remains recorded and must be resolved before retrying.',
         );
       }
@@ -112,16 +91,14 @@ export function createArtifactsCloudflareApi(
           continue;
         }
         throw new GwsEaError(
-          'artifacts_cloudflare_rate_limited',
+          'web_cloudflare_rate_limited',
           'Cloudflare rate limited this operation. Retry after the reported delay.',
           { details: { retry_after_seconds: seconds ?? null, definite_rejection: true } },
         );
       }
       if (!response.ok || !isRecord(envelope) || envelope.success !== true) {
         const code =
-          response.status === 401 || response.status === 403
-            ? 'artifacts_cloudflare_forbidden'
-            : 'artifacts_cloudflare_rejected';
+          response.status === 401 || response.status === 403 ? 'web_cloudflare_forbidden' : 'web_cloudflare_rejected';
         throw new GwsEaError(
           code,
           'Cloudflare refused this operation. Check the configured account, resource permissions and Access capacity.',
@@ -145,22 +122,19 @@ export function createArtifactsCloudflareApi(
           `${resource}${resource.includes('?') ? '&' : '?'}per_page=100&page=${page}`,
         );
         if (!isRecord(envelope) || !Array.isArray(envelope.result) || !envelope.result.every(isRecord))
-          throw new GwsEaError('artifacts_cloudflare_invalid', 'Cloudflare returned an invalid resource list.');
+          throw new GwsEaError('web_cloudflare_invalid', 'Cloudflare returned an invalid resource list.');
         records.push(...envelope.result);
         const pages = isRecord(envelope.result_info) ? envelope.result_info.total_pages : undefined;
         if (pages === undefined ? envelope.result.length < 100 : typeof pages === 'number' && page >= pages)
           return records;
       }
-      throw new GwsEaError(
-        'artifacts_cloudflare_capacity',
-        'Cloudflare resource discovery exceeded its bounded page limit.',
-      );
+      throw new GwsEaError('web_cloudflare_capacity', 'Cloudflare resource discovery exceeded its bounded page limit.');
     },
   };
 }
 
-export interface ArtifactsRemoteAssistant {
-  readonly claim: ArtifactsNamespaceClaim;
+export interface WebRemoteAssistant {
+  readonly claim: WebNamespaceClaim;
   readonly applicationId?: string;
   readonly policyId?: string;
   readonly aud?: string;
@@ -168,9 +142,9 @@ export interface ArtifactsRemoteAssistant {
   readonly publicationReady?: boolean;
   readonly revokePending?: boolean;
 }
-type ArtifactsCreateKind = 'pin' | 'tunnel' | 'application' | 'policy' | 'dns';
-export interface ArtifactsCreateAttempt {
-  readonly kind: ArtifactsCreateKind;
+type WebCreateKind = 'pin' | 'tunnel' | 'application' | 'policy' | 'dns';
+export interface WebCreateAttempt {
+  readonly kind: WebCreateKind;
   readonly key: string;
   readonly target: string;
   readonly startedAt: string;
@@ -178,16 +152,16 @@ export interface ArtifactsCreateAttempt {
   readonly fingerprint: string;
   readonly name?: string;
 }
-export interface ArtifactsResolvedAttempt extends ArtifactsCreateAttempt {
+export interface WebResolvedAttempt extends WebCreateAttempt {
   readonly resolvedAt: string;
   readonly resolution: 'operator_removed';
 }
-export interface ArtifactsOperatorConfig {
+export interface WebOperatorConfig {
   readonly schemaVersion: 1;
   readonly accountId: string;
   readonly teamName: string;
   readonly zoneId: string;
-  readonly hostname: string;
+  readonly zoneApex: string;
   readonly credentialFile: string;
   readonly cloudflaredPath: string;
   readonly connector?: {
@@ -199,21 +173,21 @@ export interface ArtifactsOperatorConfig {
   readonly tunnelId?: string;
   readonly pin?: { readonly id: string; readonly owned: boolean };
   readonly dns: Readonly<Record<string, { readonly id: string; readonly zoneId: string }>>;
-  readonly assistants: Readonly<Record<string, ArtifactsRemoteAssistant>>;
-  readonly pending?: ArtifactsCreateAttempt;
-  readonly resolvedAttempts?: readonly ArtifactsResolvedAttempt[];
+  readonly assistants: Readonly<Record<string, WebRemoteAssistant>>;
+  readonly pending?: WebCreateAttempt;
+  readonly resolvedAttempts?: readonly WebResolvedAttempt[];
 }
 
-export function artifactsOperatorFiles(paths: Pick<ControlPlanePaths, 'configRoot'>) {
-  const root = path.join(paths.configRoot, 'artifacts');
+export function webOperatorFiles(paths: Pick<ControlPlanePaths, 'configRoot'>) {
+  const root = path.join(paths.configRoot, 'web');
   return { root, configFile: path.join(root, 'config.json'), tokenFile: path.join(root, 'tunnel-token') };
 }
 
-export function parseArtifactsOperatorConfig(value: unknown): ArtifactsOperatorConfig {
+export function parseWebOperatorConfig(value: unknown): WebOperatorConfig {
   const invalid = (): never => {
     throw new GwsEaError(
-      'artifacts_operator_invalid',
-      'Artifacts operator configuration is invalid. Restore its owner-only record.',
+      'web_operator_invalid',
+      'Web operator configuration is invalid. Restore its owner-only record.',
     );
   };
   if (
@@ -225,8 +199,8 @@ export function parseArtifactsOperatorConfig(value: unknown): ArtifactsOperatorC
     !ID.test(value.zoneId) ||
     typeof value.teamName !== 'string' ||
     !/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/u.test(value.teamName) ||
-    typeof value.hostname !== 'string' ||
-    !HOST.test(value.hostname) ||
+    typeof value.zoneApex !== 'string' ||
+    !HOST.test(value.zoneApex) ||
     typeof value.credentialFile !== 'string' ||
     !path.isAbsolute(value.credentialFile) ||
     typeof value.cloudflaredPath !== 'string' ||
@@ -241,7 +215,7 @@ export function parseArtifactsOperatorConfig(value: unknown): ArtifactsOperatorC
     return candidate;
   };
   const tunnelId = optionalId(value.tunnelId);
-  let pin: ArtifactsOperatorConfig['pin'];
+  let pin: WebOperatorConfig['pin'];
   if (value.pin !== undefined) {
     if (
       !isRecord(value.pin) ||
@@ -265,7 +239,7 @@ export function parseArtifactsOperatorConfig(value: unknown): ArtifactsOperatorC
       return invalid();
     dns[hostname] = { id: record.id, zoneId: record.zoneId };
   }
-  const assistants: Record<string, ArtifactsRemoteAssistant> = {};
+  const assistants: Record<string, WebRemoteAssistant> = {};
   const applications = new Set<string>();
   for (const [instanceId, assistant] of Object.entries(value.assistants)) {
     if (!INSTANCE_ID_PATTERN.test(instanceId)) return invalid();
@@ -274,21 +248,12 @@ export function parseArtifactsOperatorConfig(value: unknown): ArtifactsOperatorC
     if (
       typeof claim.hostname !== 'string' ||
       !HOST.test(claim.hostname) ||
-      typeof claim.path_prefix !== 'string' ||
       typeof claim.listen_port !== 'number' ||
       !Number.isInteger(claim.listen_port) ||
       claim.listen_port < 1 ||
       claim.listen_port > 65535
     )
       return invalid();
-    if (claim.path_prefix !== '') {
-      try {
-        if (artifactsPathPrefix(decodeURIComponent(claim.path_prefix.slice(1))) !== claim.path_prefix) return invalid();
-      } catch (cause) {
-        if (cause instanceof URIError || cause instanceof GwsEaError) return invalid();
-        throw cause;
-      }
-    }
     const applicationId = optionalId(assistant.applicationId);
     const policyId = optionalId(assistant.policyId);
     const aud = optionalId(assistant.aud);
@@ -303,7 +268,7 @@ export function parseArtifactsOperatorConfig(value: unknown): ArtifactsOperatorC
     if (assistant.revokePending !== undefined && typeof assistant.revokePending !== 'boolean') return invalid();
     if (assistant.publicationReady !== undefined && typeof assistant.publicationReady !== 'boolean') return invalid();
     assistants[instanceId] = {
-      claim: { hostname: claim.hostname, path_prefix: claim.path_prefix, listen_port: claim.listen_port },
+      claim: { hostname: claim.hostname, listen_port: claim.listen_port },
       enabled: assistant.enabled,
       ...(typeof assistant.publicationReady === 'boolean' ? { publicationReady: assistant.publicationReady } : {}),
       ...(applicationId === undefined ? {} : { applicationId }),
@@ -312,7 +277,7 @@ export function parseArtifactsOperatorConfig(value: unknown): ArtifactsOperatorC
       ...(typeof assistant.revokePending === 'boolean' ? { revokePending: assistant.revokePending } : {}),
     };
   }
-  let connector: ArtifactsOperatorConfig['connector'];
+  let connector: WebOperatorConfig['connector'];
   if (value.connector !== undefined) {
     const record = value.connector;
     if (
@@ -323,7 +288,7 @@ export function parseArtifactsOperatorConfig(value: unknown): ArtifactsOperatorC
       typeof record.homeDirectory !== 'string' ||
       !path.isAbsolute(record.homeDirectory) ||
       typeof record.label !== 'string' ||
-      !/^com\.gws-ea\.artifacts\.[0-9a-f]{16}$/u.test(record.label)
+      !/^com\.gws-ea\.web\.[0-9a-f]{16}$/u.test(record.label)
     )
       return invalid();
     const expected =
@@ -340,7 +305,7 @@ export function parseArtifactsOperatorConfig(value: unknown): ArtifactsOperatorC
       label: record.label,
     };
   }
-  const attempt = (candidate: unknown): ArtifactsCreateAttempt => {
+  const attempt = (candidate: unknown): WebCreateAttempt => {
     if (
       !isRecord(candidate) ||
       (candidate.kind !== 'pin' &&
@@ -375,7 +340,7 @@ export function parseArtifactsOperatorConfig(value: unknown): ArtifactsOperatorC
     };
   };
   const pending = value.pending === undefined ? undefined : attempt(value.pending);
-  let resolvedAttempts: ArtifactsResolvedAttempt[] | undefined;
+  let resolvedAttempts: WebResolvedAttempt[] | undefined;
   if (value.resolvedAttempts !== undefined) {
     if (!Array.isArray(value.resolvedAttempts) || value.resolvedAttempts.length > 64) return invalid();
     resolvedAttempts = value.resolvedAttempts.map((entry: unknown) => {
@@ -395,7 +360,7 @@ export function parseArtifactsOperatorConfig(value: unknown): ArtifactsOperatorC
     accountId: value.accountId,
     teamName: value.teamName,
     zoneId: value.zoneId,
-    hostname: value.hostname,
+    zoneApex: value.zoneApex,
     credentialFile: value.credentialFile,
     cloudflaredPath: value.cloudflaredPath,
     dns,
@@ -408,53 +373,45 @@ export function parseArtifactsOperatorConfig(value: unknown): ArtifactsOperatorC
   };
 }
 
-export async function readArtifactsOperatorConfig(file: string): Promise<ArtifactsOperatorConfig | undefined> {
+export async function readWebOperatorConfig(file: string): Promise<WebOperatorConfig | undefined> {
   try {
-    const config = parseArtifactsOperatorConfig(
-      await readOwnerOnlyJson(file, 'Artifacts operator configuration', 'artifacts_operator_invalid'),
+    const config = parseWebOperatorConfig(
+      await readOwnerOnlyJson(file, 'Web operator configuration', 'web_operator_invalid'),
     );
     if (config.credentialFile !== path.join(path.dirname(file), 'management-token'))
-      throw new GwsEaError('artifacts_operator_invalid', 'Cloudflare management credential path is not canonical.');
+      throw new GwsEaError('web_operator_invalid', 'Cloudflare management credential path is not canonical.');
     return config;
   } catch (cause) {
     if (isErrno(cause, 'ENOENT')) return undefined;
     throw cause;
   }
 }
-export async function writeArtifactsOperatorConfig(file: string, config: ArtifactsOperatorConfig): Promise<void> {
-  await writePrivateTextFile(file, `${JSON.stringify(parseArtifactsOperatorConfig(config))}\n`);
+export async function writeWebOperatorConfig(file: string, config: WebOperatorConfig): Promise<void> {
+  await writePrivateTextFile(file, `${JSON.stringify(parseWebOperatorConfig(config))}\n`);
 }
-export async function artifactsApi(
-  config: ArtifactsOperatorConfig,
-  dependencies: ArtifactsCloudflareDependencies = {},
-): Promise<ArtifactsCloudflareApi> {
+export async function webApi(
+  config: WebOperatorConfig,
+  dependencies: WebCloudflareDependencies = {},
+): Promise<WebCloudflareApi> {
   const root = path.dirname(path.dirname(config.credentialFile));
   const token = (
-    await readOperatorFile(
-      config.credentialFile,
-      root,
-      'Cloudflare management credential',
-      'artifacts_credential_invalid',
-    )
+    await readOperatorFile(config.credentialFile, root, 'Cloudflare management credential', 'web_credential_invalid')
   ).trim();
-  return createArtifactsCloudflareApi(token, dependencies);
+  return createWebCloudflareApi(token, dependencies);
 }
 export function cloudflareId(value: unknown): string {
   if (!isRecord(value) || typeof value.id !== 'string' || !ID.test(value.id))
-    throw new GwsEaError('artifacts_cloudflare_invalid', 'Cloudflare did not return an exact resource ID.');
+    throw new GwsEaError('web_cloudflare_invalid', 'Cloudflare did not return an exact resource ID.');
   return value.id;
 }
-export function artifactsEmails(emails: readonly string[]): string[] {
+export function webEmails(emails: readonly string[]): string[] {
   const normalized = emails.map((email) => normalizePrincipalEmail(email));
   if (normalized.some((email) => email === undefined) || normalized.length > 1000)
-    throw new GwsEaError(
-      'artifacts_email_invalid',
-      'Access admission requires at most 1000 exact valid email addresses.',
-    );
+    throw new GwsEaError('web_email_invalid', 'Access admission requires at most 1000 exact valid email addresses.');
   return [...new Set(normalized.filter((email): email is string => email !== undefined))].sort();
 }
-export function artifactsEmailPolicy(emails: readonly string[]): Record<string, unknown> {
-  const exact = artifactsEmails(emails);
+export function webEmailPolicy(emails: readonly string[]): Record<string, unknown> {
+  const exact = webEmails(emails);
   return {
     name: 'Artifact readers',
     decision: exact.length ? 'allow' : 'deny',
@@ -480,23 +437,23 @@ export function verifiedPolicyEmails(value: unknown): string[] {
     (value.exclude !== undefined && (!Array.isArray(value.exclude) || value.exclude.length > 0)) ||
     (value.require !== undefined && (!Array.isArray(value.require) || value.require.length > 0))
   )
-    throw new GwsEaError('artifacts_access_mismatch', 'The owned Access policy no longer has exact email admission.');
-  const emails = value.include.map((rule) =>
+    throw new GwsEaError('web_access_mismatch', 'The owned Access policy no longer has exact email admission.');
+  const emails = value.include.map((rule: unknown) =>
     isRecord(rule) && Object.keys(rule).length === 1 && isRecord(rule.email) && typeof rule.email.email === 'string'
       ? rule.email.email
       : '',
   );
-  return artifactsEmails(emails);
+  return webEmails(emails);
 }
-export function artifactsAccessApplication(claim: ArtifactsNamespaceClaim, pinId: string): Record<string, unknown> {
+export function webAccessApplication(claim: WebNamespaceClaim, pinId: string): Record<string, unknown> {
   return {
-    name: `Artifacts ${claim.hostname}${claim.path_prefix}`,
+    name: `Web ${claim.hostname}/artifacts`,
     type: 'self_hosted',
     destinations: [
       {
         type: 'public',
-        uri: `${claim.hostname}${claim.path_prefix}`,
-        overrides: [{ behavior: 'public', path_pattern: `${claim.path_prefix}/public/*` }],
+        uri: `${claim.hostname}/artifacts`,
+        overrides: [{ behavior: 'public', path_pattern: `/artifacts/public/*` }],
       },
     ],
     allowed_idps: [pinId],
@@ -506,15 +463,32 @@ export function artifactsAccessApplication(claim: ArtifactsNamespaceClaim, pinId
   };
 }
 
-export function assertArtifactsApplication(
-  value: unknown,
-  assistant: ArtifactsRemoteAssistant,
-  config: ArtifactsOperatorConfig,
-): void {
+export function assertWebApplication(value: unknown, assistant: WebRemoteAssistant, config: WebOperatorConfig): void {
   const destination =
     isRecord(value) && Array.isArray(value.destinations) && value.destinations.length === 1
       ? value.destinations[0]
       : undefined;
+  if (
+    !isRecord(value) ||
+    typeof value.id !== 'string' ||
+    typeof value.aud !== 'string' ||
+    !isRecord(destination) ||
+    typeof destination.uri !== 'string'
+  )
+    throw new GwsEaError(
+      'web_access_unverified',
+      'Cloudflare did not return verifiable Access application coordinates.',
+    );
+  if (
+    isRecord(value) &&
+    (value.id !== assistant.applicationId ||
+      value.aud !== assistant.aud ||
+      (isRecord(destination) && destination.uri !== `${assistant.claim.hostname}/artifacts`))
+  )
+    throw new GwsEaError(
+      'web_application_mismatch',
+      'The owned Access application no longer points at its recorded assistant address and audience.',
+    );
   const overrides =
     isRecord(destination) && Array.isArray(destination.overrides) && destination.overrides.length === 1
       ? destination.overrides[0]
@@ -526,22 +500,22 @@ export function assertArtifactsApplication(
     value.aud !== assistant.aud ||
     !isRecord(destination) ||
     destination.type !== 'public' ||
-    destination.uri !== `${assistant.claim.hostname}${assistant.claim.path_prefix}` ||
+    destination.uri !== `${assistant.claim.hostname}/artifacts` ||
     !isRecord(overrides) ||
     overrides.behavior !== 'public' ||
-    overrides.path_pattern !== `${assistant.claim.path_prefix}/public/*` ||
+    overrides.path_pattern !== `/artifacts/public/*` ||
     !Array.isArray(value.allowed_idps) ||
     value.allowed_idps.length !== 1 ||
     value.allowed_idps[0] !== config.pin?.id ||
     value.auto_redirect_to_identity !== true
   )
     throw new GwsEaError(
-      'artifacts_access_mismatch',
+      'web_access_mismatch',
       'The owned Access application no longer matches its recorded destination, audience or PIN identity provider.',
     );
 }
 
-export interface ArtifactsAccessReconciliation {
+export interface WebAccessReconciliation {
   readonly operatorConfigFile: string;
   readonly accountId: string;
   readonly applicationId: string;
@@ -549,49 +523,49 @@ export interface ArtifactsAccessReconciliation {
   readonly emails: readonly string[] | (() => Promise<readonly string[]>);
 }
 /** Call outside DB transactions. Removing an admitted email revokes the app's existing sessions. */
-export async function reconcileArtifactsAccessEmails(
-  input: ArtifactsAccessReconciliation,
-  dependencies: ArtifactsCloudflareDependencies = {},
+export async function reconcileWebAccessEmails(
+  input: WebAccessReconciliation,
+  dependencies: WebCloudflareDependencies = {},
 ): Promise<{ readonly verified: true; readonly emails: readonly string[]; readonly changed: boolean }> {
   const configRoot = path.dirname(path.dirname(input.operatorConfigFile));
   const paths = resolveControlPlanePaths({ configRoot });
-  if (artifactsOperatorFiles(paths).configFile !== input.operatorConfigFile)
-    throw new GwsEaError('artifacts_operator_invalid', 'Artifacts operator configuration path is not canonical.');
+  if (webOperatorFiles(paths).configFile !== input.operatorConfigFile)
+    throw new GwsEaError('web_operator_invalid', 'Web operator configuration path is not canonical.');
   return withMachineLock(paths, async () => {
-    let config = await readArtifactsOperatorConfig(input.operatorConfigFile);
+    let config = await readWebOperatorConfig(input.operatorConfigFile);
     if (!config || config.accountId !== input.accountId)
-      throw new GwsEaError('artifacts_access_mismatch', 'Artifacts Cloudflare account is not the recorded owner.');
+      throw new GwsEaError('web_access_mismatch', 'Web Cloudflare account is not the recorded owner.');
     const entry = Object.entries(config.assistants).find(
       ([, assistant]) => assistant.applicationId === input.applicationId,
     );
     if (!entry || !entry[1].enabled || !entry[1].policyId)
-      throw new GwsEaError('artifacts_disabled', 'Artifacts are disabled or their Access resources are incomplete.');
+      throw new GwsEaError('web_disabled', 'Web are disabled or their Access resources are incomplete.');
     const [instanceId, assistant] = entry;
-    const emails = artifactsEmails(typeof input.emails === 'function' ? await input.emails() : input.emails);
-    const api = await artifactsApi(config, dependencies);
+    const emails = webEmails(typeof input.emails === 'function' ? await input.emails() : input.emails);
+    const api = await webApi(config, dependencies);
     const appPath = `/accounts/${config.accountId}/access/apps/${input.applicationId}`;
-    assertArtifactsApplication(await api.request('GET', appPath), assistant, config);
+    assertWebApplication(await api.request('GET', appPath), assistant, config);
     const policies = await api.list(`${appPath}/policies`);
     if (policies.length !== 1 || policies[0].id !== assistant.policyId)
-      throw new GwsEaError('artifacts_access_mismatch', 'Unexpected policies exist on the owned Access application.');
+      throw new GwsEaError('web_access_mismatch', 'Unexpected policies exist on the owned Access application.');
     const previous = verifiedPolicyEmails(policies[0]);
     const changed = JSON.stringify(previous) !== JSON.stringify(emails);
     const reduction = previous.some((email) => !emails.includes(email));
     if (reduction && !assistant.revokePending) {
       config = { ...config, assistants: { ...config.assistants, [instanceId]: { ...assistant, revokePending: true } } };
-      await writeArtifactsOperatorConfig(input.operatorConfigFile, config);
+      await writeWebOperatorConfig(input.operatorConfigFile, config);
     }
-    if (changed) await api.request('PUT', `${appPath}/policies/${assistant.policyId}`, artifactsEmailPolicy(emails));
+    if (changed) await api.request('PUT', `${appPath}/policies/${assistant.policyId}`, webEmailPolicy(emails));
     const verified = verifiedPolicyEmails(await api.request('GET', `${appPath}/policies/${assistant.policyId}`));
     if (JSON.stringify(verified) !== JSON.stringify(emails))
-      throw new GwsEaError('artifacts_access_unverified', 'Cloudflare email admission has not converged.');
+      throw new GwsEaError('web_access_unverified', 'Cloudflare email admission has not converged.');
     if (reduction || assistant.revokePending) {
       await api.request('POST', `${appPath}/revoke_tokens`);
       config = {
         ...config,
         assistants: { ...config.assistants, [instanceId]: { ...assistant, revokePending: false } },
       };
-      await writeArtifactsOperatorConfig(input.operatorConfigFile, config);
+      await writeWebOperatorConfig(input.operatorConfigFile, config);
     }
     return { verified: true, emails, changed };
   });

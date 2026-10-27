@@ -214,7 +214,7 @@ resume an approved row at host start; they must make re-entry idempotent.
 ### Operator connectors
 
 A connector is optional functionality where gws-ea manages setup beyond its base
-install: shared voice assets, assistant 1Password vaults, or Cloudflare artifact
+install: shared voice assets, assistant 1Password vaults, or Cloudflare web
 serving. The typed catalog in `src/gws-ea/connectors.ts` supplies `install`,
 `uninstall`, `show` and `check` for each. Installation/configuration is host-wide;
 voice assets are shared and account resources are per assistant. Access remains
@@ -224,6 +224,13 @@ and succeeds only for a ready target. Browser is built in because gws-ea only
 detects its Chrome prerequisite. Connector hooks run after create/resume and
 committed update/start/restart; optional provisioning cannot fail a committed
 release, and rollback never provisions.
+
+The `web` connector owns one claimed `<first-name>.<zone apex>` hostname and
+loopback port per assistant, stable across renames. It serves only artifacts at
+`/artifacts`; web owns policy, listener and identity, and artifacts owns object
+and sharing authority. Transient serving failures retain author tools. Removing
+an assistant settles only its DNS, route and Access app; shared resources remain
+until connector uninstall, which closes all policies before remote cleanup.
 
 ### Host browser credentials
 

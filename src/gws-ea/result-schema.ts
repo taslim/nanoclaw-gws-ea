@@ -3,7 +3,7 @@ import type { ResultSchema } from './command-definitions.js';
 import { VOICE_CAPABILITY } from './voice-inspection.js';
 import { CONNECTOR_ACTIONS } from './connectors.js';
 import { OPERATION_PHASES } from './operation.js';
-import { ARTIFACTS_CAPABILITY } from './artifacts-connector.js';
+import { WEB_CAPABILITY } from './web-connector.js';
 import { ONEPASSWORD_CAPABILITY, ONEPASSWORD_PENDING_REASONS, ONEPASSWORD_SKIP_REASONS } from './onepassword.js';
 
 const text = { type: 'string' } as const;
@@ -268,40 +268,39 @@ const onePasswordMetadata = {
   actions: array(choices(...ONEPASSWORD_CAPABILITY.actions)),
   summary: text,
 };
-const artifactsMetadata = {
-  name: { const: 'artifacts' },
+const webMetadata = {
+  name: { const: 'web' },
   scope: { const: 'assistant' },
-  actions: array(choices(...ARTIFACTS_CAPABILITY.actions)),
+  actions: array(choices(...WEB_CAPABILITY.actions)),
   summary: text,
 };
-export const ARTIFACTS_CAPABILITY_SCHEMA = object({
-  ...artifactsMetadata,
+export const WEB_CAPABILITY_SCHEMA = object({
+  ...webMetadata,
   instance_id: text,
   observed_at: time,
   activation: choices('enabled', 'disabled', 'unavailable'),
   hostname: nullable(text),
-  path_prefix: nullable(text),
   policy_file: text,
   remote: choices('not_checked', 'verified', 'mismatch', 'unavailable'),
   listener: choices('not_checked', 'listening', 'unavailable'),
   ready: bool,
   reason: nullable(text),
+  reason_code: nullable(text),
   operator: object({
     status: choices('configured', 'missing', 'unavailable'),
     account_id: nullable(text),
     team_name: nullable(text),
     zone_id: nullable(text),
-    hostname: nullable(text),
+    zone_apex: nullable(text),
     pending: nullable(object({ kind: text, attempt: text, started_at: time })),
   }),
 });
-export const ARTIFACTS_OPERATION_SCHEMA = object({
-  ...artifactsMetadata,
+export const WEB_OPERATION_SCHEMA = object({
+  ...webMetadata,
   instance_id: text,
   enabled: bool,
   changed: bool,
   hostname: nullable(text),
-  path_prefix: nullable(text),
 });
 const onePasswordCheck = choices('not_checked', 'verified', 'failed');
 const onePasswordToken = choices('present', 'absent', 'invalid');
@@ -386,7 +385,7 @@ export const VOICE_OPERATION_SCHEMA = object(
   },
   ['name', 'scope'],
 );
-const connectorName = choices('voice', 'onepassword', 'artifacts');
+const connectorName = choices('voice', 'onepassword', 'web');
 const nextAction = {
   oneOf: [
     object({ kind: { const: 'command' }, argv: array(text) }),
@@ -429,7 +428,7 @@ export const CONNECTOR_OBSERVATION_SCHEMA = object({
   assistants: array(connectorAssistant),
   reasons: array(text),
   next_actions: array(nextAction),
-  details: { oneOf: [VOICE_CAPABILITY_SCHEMA, ONEPASSWORD_CAPABILITY_SCHEMA, array(ARTIFACTS_CAPABILITY_SCHEMA)] },
+  details: { oneOf: [VOICE_CAPABILITY_SCHEMA, ONEPASSWORD_CAPABILITY_SCHEMA, array(WEB_CAPABILITY_SCHEMA)] },
 });
 export const STATUS_DATA_SCHEMA = object({
   instance_id: text,
@@ -462,7 +461,7 @@ export const STATUS_DATA_SCHEMA = object({
 });
 export const CONNECTOR_LIST_SCHEMA = object({ connectors: array(CONNECTOR_OBSERVATION_SCHEMA) });
 export const ALIAS_OPERATION_SCHEMA = object({ instance_id: text, pause }, ['instance_id']);
-const artifactProvisioning = object({
+const webProvisioning = object({
   instance_id: text,
   outcome: choices('ready', 'pending', 'unsupported'),
   reason: nullable(text),
@@ -523,14 +522,14 @@ export const CONNECTOR_OPERATION_SCHEMA = {
       reason: nullable(text),
     }),
     object({
-      name: { const: 'artifacts' },
+      name: { const: 'web' },
       scope: { const: 'host' },
       installed: { const: true },
       changed: bool,
-      assistants: array(artifactProvisioning),
+      assistants: array(webProvisioning),
     }),
     object({
-      name: { const: 'artifacts' },
+      name: { const: 'web' },
       scope: { const: 'host' },
       installed: { const: false },
       outcome: choices('removed', 'pending'),
@@ -560,10 +559,10 @@ const removalPreview = object({
 const removal = object(
   {
     removed: array(
-      choices('whatsapp', 'nanoclaw', 'artifacts', 'chat-subscription', 'gcp-project', 'onecli', 'instance-files'),
+      choices('whatsapp', 'nanoclaw', 'web', 'chat-subscription', 'gcp-project', 'onecli', 'instance-files'),
     ),
     abandoned: array(
-      object({ resource: choices('gcp-project', 'chat-subscription', 'onepassword', 'artifacts'), evidence: text }),
+      object({ resource: choices('gcp-project', 'chat-subscription', 'onepassword', 'web'), evidence: text }),
     ),
     keyPolicyUnrestored: text,
     memberPolicyUnrestored: text,
@@ -645,6 +644,7 @@ const identity = { instance_id: text };
 const common = {
   ...identity,
   connector_next_actions: array(nextAction),
+  connector_pending: array(object({ name: connectorName, reason: text, message: text })),
   cleanup,
   preparation: object({ bootstrap_manifest: choices('retained', 'unknown'), reservation: { const: 'unknown' } }),
 };

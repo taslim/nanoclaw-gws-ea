@@ -56,7 +56,8 @@ it('runs no script on an unscripted page and lets only its own links leave, whil
     document: plain,
     nonce,
     title: 'Plan',
-    childUrl: 'https://views.example.com/a/frame/x',
+    childUrl:
+      'https://aya.example.com/artifacts/12345678-1234-4321-8321-123456789abc/frame/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
   }).body;
   expect(plainViewer).toContain('<html lang="pt">');
   expect(plainViewer).toContain('sandbox="allow-popups allow-popups-to-escape-sandbox"');
@@ -66,8 +67,13 @@ it('runs no script on an unscripted page and lets only its own links leave, whil
   expect(scriptedChild.headers['content-security-policy']).toMatch(/sandbox allow-scripts$/u);
   expect(scriptedChild.headers['connection-allowlist']).toBeDefined();
   expect(
-    renderArtifactViewer({ document: scripted, nonce, title: 'Plan', childUrl: 'https://views.example.com/a/frame/x' })
-      .body,
+    renderArtifactViewer({
+      document: scripted,
+      nonce,
+      title: 'Plan',
+      childUrl:
+        'https://aya.example.com/artifacts/12345678-1234-4321-8321-123456789abc/frame/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+    }).body,
   ).toContain('sandbox="allow-scripts"');
 });
 const fixtureHtml = `<!doctype html><html><head><style>body{font:18px system-ui;margin:20px}button,input{font:inherit}svg{max-width:100%}</style></head><body><h1>Budget scenario</h1><p>Base budget: $42</p><label>Multiplier <input id="factor" type="number" value="2"></label><button id="calculate">Calculate</button><output id="result">84</output><p><a href="https://example.com/source">Evidence</a></p><script>document.querySelector('#calculate').addEventListener('click',()=>document.querySelector('#result').textContent=42*Number(document.querySelector('#factor').value));</script></body></html>`;
@@ -92,7 +98,7 @@ async function pageFixture(
 ): Promise<{ context: BrowserContext; page: Awaited<ReturnType<BrowserContext['newPage']>> }> {
   const context = await browser.newContext({ ...(userAgent ? { userAgent } : {}) });
   const page = await context.newPage();
-  await page.goto(origin);
+  await page.goto(`${origin}/artifacts/12345678-1234-4321-8321-123456789abc`);
   return { context, page };
 }
 describe.skipIf(!executablePath)('actual Chromium artifact boundary', () => {
@@ -111,7 +117,9 @@ describe.skipIf(!executablePath)('actual Chromium artifact boundary', () => {
         return;
       }
       const document = parseArtifactDocument(source);
-      const child = request.url === '/frame';
+      const child =
+        request.url ===
+        '/artifacts/12345678-1234-4321-8321-123456789abc/frame/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
       if (child) frameRequests += 1;
       const rendered = child
         ? renderArtifactChild({ document, nonce })
@@ -119,7 +127,8 @@ describe.skipIf(!executablePath)('actual Chromium artifact boundary', () => {
             document,
             nonce,
             title: '</title><script>bad()</script>',
-            childUrl: 'https://artifact.test/frame',
+            childUrl:
+              'https://artifact.test/artifacts/12345678-1234-4321-8321-123456789abc/frame/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
           });
       const headers = { ...rendered.headers };
       if (child && mode !== 'enforced') {
@@ -241,9 +250,11 @@ describe.skipIf(!executablePath)('actual Chromium artifact boundary', () => {
       await popup.waitForLoadState();
       expect(await popup.content()).toContain('Direct source opened');
       expect(await page.locator('details').getAttribute('open')).toBeNull();
+      const fragmentUrl = `${origin}/artifacts/12345678-1234-4321-8321-123456789abc/frame/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa#end`;
       await frame.locator('a[href="#end"]').focus();
       await page.keyboard.press('Enter');
-      expect(frame.url()).toBe(`${origin}/frame#end`);
+      await frame.waitForURL(fragmentUrl);
+      expect(frame.url()).toBe(fragmentUrl);
     } finally {
       await context.close();
     }
@@ -295,7 +306,13 @@ describe.skipIf(!executablePath)('actual Chromium artifact boundary', () => {
       const { context, page } = await pageFixture();
       try {
         await page.waitForTimeout(500);
-        const child = page.frames().find((frame) => frame.url() === `${origin}/frame`);
+        const child = page
+          .frames()
+          .find(
+            (frame) =>
+              frame.url() ===
+              `${origin}/artifacts/12345678-1234-4321-8321-123456789abc/frame/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa`,
+          );
         if (child) {
           expect(await child.locator('html').getAttribute('data-attack-started'), attack).toBe('yes');
         } else {

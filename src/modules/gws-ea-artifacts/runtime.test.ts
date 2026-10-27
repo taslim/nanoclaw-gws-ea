@@ -30,12 +30,12 @@ import {
 import { resolveSystemSession } from '../../session-manager.js';
 import { inboundDbPath } from '../../mailbox/sqlite/paths.js';
 import {
-  artifactsAccessApplication,
-  artifactsEmailPolicy,
-  readArtifactsOperatorConfig,
-  reconcileArtifactsAccessEmails,
-  writeArtifactsOperatorConfig,
-} from '../../gws-ea/artifacts-cloudflare.js';
+  webAccessApplication,
+  webEmailPolicy,
+  readWebOperatorConfig,
+  reconcileWebAccessEmails,
+  writeWebOperatorConfig,
+} from '../../gws-ea/web-cloudflare.js';
 import { lookup } from '../../cli/registry.js';
 import { bindVerifiedPrincipalUser } from '../gws-ea-profile/db.js';
 import { upsertUser } from '../permissions/db/users.js';
@@ -43,10 +43,41 @@ import { parseArtifactShare } from './authority.js';
 import { getArtifactRevision, listArtifacts, prepareArtifactSource, saveArtifact } from './db.js';
 import { artifactActor, hasArtifactsAccess } from './policy.js';
 import { ArtifactsRuntime } from './runtime.js';
-import type { ArtifactsPolicyFile } from './policy.js';
+import { WebRuntime, type WebRuntimeDependencies } from '../gws-ea-web/runtime.js';
+import { createArtifactViewHandler } from './server.js';
+import { createArtifactViewResolver } from './access.js';
+import { artifactAdmissionEmails } from './sharing.js';
+import type { WebPolicyFile } from '../gws-ea-web/policy.js';
 import type { Session } from '../../types.js';
-let runtime: ArtifactsRuntime;
-let policy: ArtifactsPolicyFile;
+function createRuntime(dependencies: WebRuntimeDependencies = {}) {
+  const web = new WebRuntime(
+    (config, identity) =>
+      createArtifactViewHandler({ hostname: config.hostname, resolve: createArtifactViewResolver(config, identity) }),
+    artifactAdmissionEmails,
+    dependencies,
+  );
+  const artifacts = new ArtifactsRuntime({
+    verifyAdmission: (config) => web.verifyAdmission(config),
+    publicationReady: (config) => web.publicationReady(config),
+  });
+  return {
+    sharing: artifacts.sharing,
+    health: () => web.health(),
+    start: (signal: AbortSignal) => {
+      web.start(signal);
+      artifacts.start(signal);
+    },
+    stop: async () => {
+      await Promise.all([artifacts.stop(), web.stop()]);
+    },
+    reconcile: async () => {
+      await artifacts.reconcile();
+      await web.reconcile();
+    },
+  };
+}
+let runtime: ReturnType<typeof createRuntime>;
+let policy: WebPolicyFile;
 let main: Session;
 let publication: Record<string, unknown>;
 let httpCalls: Array<{ method: string; path: string }>;
@@ -95,29 +126,28 @@ function get(
   });
 }
 beforeEach(async () => {
-  fs.mkdirSync(path.join(ROOT, 'operator', 'artifacts'), { recursive: true, mode: 0o700 });
-  const operatorConfigFile = path.join(ROOT, 'operator', 'artifacts', 'config.json');
+  fs.mkdirSync(path.join(ROOT, 'operator', 'web'), { recursive: true, mode: 0o700 });
+  const operatorConfigFile = path.join(ROOT, 'operator', 'web', 'config.json');
   policy = {
     schemaVersion: 1,
     enabled: true,
-    hostname: 'views.example.com',
-    pathPrefix: '/aya',
+    hostname: 'aya.example.com',
     listenPort: await freePort(),
     accessIssuer: 'https://team.cloudflareaccess.com',
     accessAud: 'aud',
     cloudflare: { accountId: 'account', applicationId: 'app', operatorConfigFile },
   };
   writePolicy();
-  vi.stubEnv('GWS_EA_ARTIFACTS_POLICY_FILE', path.join(ROOT, 'policy.json'));
-  const tokenFile = path.join(ROOT, 'operator', 'artifacts', 'management-token');
+  vi.stubEnv('GWS_EA_WEB_POLICY_FILE', path.join(ROOT, 'policy.json'));
+  const tokenFile = path.join(ROOT, 'operator', 'web', 'management-token');
   fs.writeFileSync(tokenFile, 'deterministic-fixture-token', { mode: 0o600 });
-  const claim = { hostname: policy.hostname, path_prefix: policy.pathPrefix, listen_port: policy.listenPort };
-  await writeArtifactsOperatorConfig(operatorConfigFile, {
+  const claim = { hostname: policy.hostname, listen_port: policy.listenPort };
+  await writeWebOperatorConfig(operatorConfigFile, {
     schemaVersion: 1,
     accountId: 'account',
     zoneId: 'zone',
     teamName: 'team',
-    hostname: policy.hostname,
+    zoneApex: 'example.com',
     credentialFile: tokenFile,
     cloudflaredPath: '/usr/local/bin/cloudflared',
     dns: {},
@@ -174,8 +204,8 @@ beforeEach(async () => {
     if (unavailable) return Response.json({ success: false }, { status: 403 });
     const appPath = '/client/v4/accounts/account/access/apps/app';
     let result: unknown;
-    if (parsed.pathname === appPath) result = { ...artifactsAccessApplication(claim, 'pin'), id: 'app', aud: 'aud' };
-    else if (parsed.pathname === `${appPath}/policies`) result = [{ id: 'policy', ...artifactsEmailPolicy(emails) }];
+    if (parsed.pathname === appPath) result = { ...webAccessApplication(claim, 'pin'), id: 'app', aud: 'aud' };
+    else if (parsed.pathname === `${appPath}/policies`) result = [{ id: 'policy', ...webEmailPolicy(emails) }];
     else if (parsed.pathname === `${appPath}/policies/policy`) {
       if (options?.method === 'PUT') {
         const body = JSON.parse(String(options.body)) as {
@@ -184,13 +214,13 @@ beforeEach(async () => {
         };
         emails = body.decision === 'deny' ? [] : body.include.flatMap((rule) => (rule.email ? [rule.email.email] : []));
       }
-      result = { id: 'policy', ...artifactsEmailPolicy(emails) };
+      result = { id: 'policy', ...webEmailPolicy(emails) };
     } else if (parsed.pathname === `${appPath}/revoke_tokens`) result = {};
     else throw new Error(`Unexpected fixture request: ${parsed.pathname}`);
     return Response.json({ success: true, result });
   };
-  runtime = new ArtifactsRuntime({
-    reconcileAccess: (input) => reconcileArtifactsAccessEmails(input, { fetch: fetcher }),
+  runtime = createRuntime({
+    reconcileAccess: (input) => reconcileWebAccessEmails(input, { fetch: fetcher }),
   });
 });
 afterEach(async () => {
@@ -243,10 +273,10 @@ it.each(['failed', 'verified'] as const)(
   'keeps publication pending while external provisioning is %s',
   async (outcome) => {
     const file = policy.cloudflare.operatorConfigFile;
-    const config = await readArtifactsOperatorConfig(file);
+    const config = await readWebOperatorConfig(file);
     if (!config) throw new Error('Missing owned operator configuration');
     const instanceId = '00000000-0000-4000-8000-000000000001';
-    await writeArtifactsOperatorConfig(file, {
+    await writeWebOperatorConfig(file, {
       ...config,
       assistants: {
         ...config.assistants,
@@ -271,7 +301,7 @@ it.each(['failed', 'verified'] as const)(
     expect(await getDb().get('SELECT state FROM gws_ea_artifact_shares')).toEqual({ state: 'pending' });
     if (outcome === 'failed') writePolicy(false);
     else
-      await writeArtifactsOperatorConfig(file, {
+      await writeWebOperatorConfig(file, {
         ...config,
         assistants: {
           ...config.assistants,
@@ -333,23 +363,27 @@ it('verifies Access before a real loopback origin becomes healthy, and keeps sav
   const share = await getDb().get<{ share_id: string }>('SELECT share_id FROM gws_ea_artifact_shares');
   if (!share) throw new Error('No applied publication');
   for (const method of ['GET', 'HEAD']) {
-    const page = await get(`/aya/public/${share.share_id}`, method);
+    const page = await get(`/artifacts/public/${share.share_id}`, method);
     expect(page.status).toBe(200);
     expect(page.cache).toBe('no-store');
     expect(method === 'HEAD' ? page.body === '' : page.body.includes('Report')).toBe(true);
   }
-  expect((await get(`/aya/${String(publication.artifact_id)}`)).status).toBe(404);
-  expect((await get(`/aya/${String(publication.artifact_id)}`, 'GET', policy.hostname, identity)).status).toBe(200);
-  expect((await get(`/aya/${String(publication.artifact_id)}`, 'HEAD', policy.hostname, identity)).status).toBe(200);
+  expect((await get(`/artifacts/${String(publication.artifact_id)}`)).status).toBe(404);
+  expect((await get(`/artifacts/${String(publication.artifact_id)}`, 'GET', policy.hostname, identity)).status).toBe(
+    200,
+  );
+  expect((await get(`/artifacts/${String(publication.artifact_id)}`, 'HEAD', policy.hostname, identity)).status).toBe(
+    200,
+  );
   expect(keys).toHaveBeenCalledTimes(1);
-  expect((await get(`/aya/public/${share.share_id}`, 'GET', 'wrong.example.com')).status).toBe(404);
+  expect((await get(`/artifacts/public/${share.share_id}`, 'GET', 'wrong.example.com')).status).toBe(404);
   await runtime.reconcile();
   expect(httpCalls.length).toBe(3);
   writePolicy(false);
   expect(await runtime.health()).toMatchObject({ availability: 'disabled', listener: { state: 'stopped' } });
-  expect((await get(`/aya/public/${share.share_id}`, 'HEAD')).status).toBe(404);
+  expect((await get(`/artifacts/public/${share.share_id}`, 'HEAD')).status).toBe(404);
   await runtime.reconcile();
-  await expect(get(`/aya/public/${share.share_id}`)).rejects.toThrow();
+  await expect(get(`/artifacts/public/${share.share_id}`)).rejects.toThrow();
 });
 it('fails optional readiness closed, retries safely, and checks local coordinates without an ingress/connector cycle', async () => {
   await runtime.sharing.submit(
@@ -378,7 +412,7 @@ it('fails optional readiness closed, retries safely, and checks local coordinate
   fs.writeFileSync(path.join(ROOT, 'policy.json'), JSON.stringify({ ...policy, accessAud: 'wrong' }), { mode: 0o600 });
   expect(await runtime.health()).toMatchObject({ availability: 'unavailable' });
   await runtime.reconcile();
-  await expect(get('/aya/public/00000000-0000-4000-8000-000000000002')).rejects.toThrow();
+  await expect(get('/artifacts/public/00000000-0000-4000-8000-000000000002')).rejects.toThrow();
 });
 it('reconciles principal reductions locally first, updates exact email policy and revokes sessions without repeated writes', async () => {
   await runtime.reconcile();
@@ -390,8 +424,8 @@ it('reconciles principal reductions locally first, updates exact email policy an
   const count = httpCalls.length;
   await runtime.reconcile();
   expect(httpCalls).toHaveLength(count);
-  expect(lookup('gws-ea-artifacts-health')).toMatchObject({ hostOnly: true, access: 'hidden' });
-  expect(lookup('gws-ea-artifacts-admission-emails')).toMatchObject({ hostOnly: true, access: 'hidden' });
+  expect(lookup('gws-ea-web-health')).toMatchObject({ hostOnly: true, access: 'hidden' });
+  expect(lookup('gws-ea-web-admission-emails')).toMatchObject({ hostOnly: true, access: 'hidden' });
 });
 
 it('keeps disabled and unsupported optional policy local, with read-only health and central authoring data intact', async () => {
@@ -405,7 +439,7 @@ it('keeps disabled and unsupported optional policy local, with read-only health 
   expect(await runtime.health()).toMatchObject({
     enabled: false,
     availability: 'unavailable',
-    reason: 'invalid-artifacts-policy',
+    reason: 'invalid-web-policy',
   });
   expect(fs.readFileSync(path.join(ROOT, 'policy.json'))).toEqual(original);
   expect(httpCalls).toEqual([]);
@@ -452,9 +486,9 @@ it('does not bind after shutdown interrupts real Access verification, and leaves
   const observed = new Promise<void>((resolve) => {
     entered = resolve;
   });
-  runtime = new ArtifactsRuntime({
+  runtime = createRuntime({
     reconcileAccess: (input) =>
-      reconcileArtifactsAccessEmails(input, {
+      reconcileWebAccessEmails(input, {
         fetch: async (url, options) => {
           entered?.();
           await gate;
@@ -471,7 +505,7 @@ it('does not bind after shutdown interrupts real Access verification, and leaves
   await stopped;
   expect(await runtime.health()).toMatchObject({ availability: 'unavailable', listener: { state: 'stopped' } });
   await runtime.reconcile();
-  await expect(get('/aya/public/absent')).rejects.toThrow();
+  await expect(get('/artifacts/public/absent')).rejects.toThrow();
   const server = createServer();
   await new Promise<void>((resolve, reject) => {
     server.once('error', reject);
@@ -502,9 +536,9 @@ it('refuses a late startup verification after disable and restores unexpired sav
   const observed = new Promise<void>((resolve) => {
     entered = resolve;
   });
-  runtime = new ArtifactsRuntime({
+  runtime = createRuntime({
     reconcileAccess: (input) =>
-      reconcileArtifactsAccessEmails(input, {
+      reconcileWebAccessEmails(input, {
         fetch: async (url, options) => {
           entered?.();
           await gate;
@@ -518,10 +552,10 @@ it('refuses a late startup verification after disable and restores unexpired sav
   release?.();
   await starting;
   expect(await runtime.health()).toMatchObject({ availability: 'disabled', listener: { state: 'stopped' } });
-  await expect(get(`/aya/public/${share.share_id}`)).rejects.toThrow();
+  await expect(get(`/artifacts/public/${share.share_id}`)).rejects.toThrow();
   writePolicy();
   await runtime.reconcile();
-  expect((await get(`/aya/public/${share.share_id}`)).status).toBe(200);
+  expect((await get(`/artifacts/public/${share.share_id}`)).status).toBe(200);
 });
 
 it('denies a publication that expires during downtime on the first restarted origin request', async () => {
@@ -539,15 +573,15 @@ it('denies a publication that expires during downtime on the first restarted ori
   );
   const share = await getDb().get<{ share_id: string }>('SELECT share_id FROM gws_ea_artifact_shares');
   if (!share) throw new Error('Missing publication');
-  expect((await get(`/aya/public/${share.share_id}`)).status).toBe(200);
+  expect((await get(`/artifacts/public/${share.share_id}`)).status).toBe(200);
   await runtime.stop();
   vi.useFakeTimers({ toFake: ['Date'] });
   vi.setSystemTime(Date.parse(expiry) + 1000);
-  runtime = new ArtifactsRuntime({
-    reconcileAccess: (input) => reconcileArtifactsAccessEmails(input, { fetch: fetcher }),
+  runtime = createRuntime({
+    reconcileAccess: (input) => reconcileWebAccessEmails(input, { fetch: fetcher }),
   });
   await runtime.reconcile();
-  expect((await get(`/aya/public/${share.share_id}`)).status).toBe(404);
+  expect((await get(`/artifacts/public/${share.share_id}`)).status).toBe(404);
   expect(await getDb().get('SELECT html FROM gws_ea_artifact_revisions')).toEqual({ html: '<p>Public source</p>' });
 });
 
@@ -584,13 +618,49 @@ it('restores central HTML and pointers through the native snapshot roots, then r
   await initDb(central, { role: 'test' });
   expect(await getDb().get('SELECT html FROM gws_ea_artifact_revisions')).toEqual({ html: '<p>Public source</p>' });
   expect(await getDb().get('SELECT state FROM gws_ea_artifact_shares')).toEqual({ state: 'active' });
-  runtime = new ArtifactsRuntime({
-    reconcileAccess: (input) => reconcileArtifactsAccessEmails(input, { fetch: fetcher }),
+  runtime = createRuntime({
+    reconcileAccess: (input) => reconcileWebAccessEmails(input, { fetch: fetcher }),
   });
   expect(await runtime.health()).toMatchObject({ availability: 'unavailable' });
-  await expect(get(`/aya/public/${share.share_id}`)).rejects.toThrow();
+  await expect(get(`/artifacts/public/${share.share_id}`)).rejects.toThrow();
   await runtime.reconcile();
   expect(emails).toEqual(['principal@example.com']);
   expect(httpCalls.filter(({ method }) => method === 'PUT')).toHaveLength(1);
-  expect((await get(`/aya/public/${share.share_id}`)).status).toBe(200);
+  expect((await get(`/artifacts/public/${share.share_id}`)).status).toBe(200);
+});
+
+it('expires pending publication intent on the independent artifact tick while the web origin stays down', async () => {
+  const maintenance = new ArtifactsRuntime({ verifyAdmission: async () => {}, publicationReady: async () => false });
+  const expiry = new Date(Date.now() + 60000).toISOString();
+  await maintenance.sharing.submit(
+    main,
+    'outage-expiry',
+    parseArtifactShare({
+      ...publication,
+      operation: 'public_publish',
+      expires_at: expiry,
+      principal_message: { id: 'mark', messaging_group_id: 'chat' },
+    }),
+  );
+  expect(await getDb().get("SELECT state FROM gws_ea_artifact_requests WHERE request_id='outage-expiry'")).toEqual({
+    state: 'pending',
+  });
+  vi.useFakeTimers({ toFake: ['Date', 'setInterval', 'clearInterval'] });
+  const controller = new AbortController();
+  maintenance.start(controller.signal);
+  try {
+    await maintenance.reconcile();
+    vi.setSystemTime(Date.parse(expiry) + 1000);
+    await vi.advanceTimersByTimeAsync(1000);
+    await maintenance.reconcile();
+    expect(await getDb().get("SELECT state FROM gws_ea_artifact_requests WHERE request_id='outage-expiry'")).toEqual({
+      state: 'settled',
+    });
+    expect(await getDb().get('SELECT state FROM gws_ea_artifact_shares')).toEqual({ state: 'revoked' });
+    expect(await runtime.health()).toMatchObject({ availability: 'unavailable', listener: { state: 'stopped' } });
+    expect(httpCalls).toEqual([]);
+  } finally {
+    controller.abort();
+    await maintenance.stop();
+  }
 });

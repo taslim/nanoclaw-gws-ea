@@ -27,7 +27,8 @@ import {
   type ArtifactActor,
   type ArtifactSave,
 } from './db.js';
-import { artifactActor, artifactPrivateUrl, readArtifactsPolicy, type ArtifactsPolicyFile } from './policy.js';
+import { artifactActor, artifactPrivateUrl } from './policy.js';
+import { readWebPolicy, type WebPolicyFile } from '../gws-ea-web/policy.js';
 import { parseArtifactDocument } from './document.js';
 import { artifactShares, artifactShareSummary } from './sharing.js';
 
@@ -106,8 +107,8 @@ export function parseArtifactSave(content: Record<string, unknown>): ArtifactSav
     expected_revision: positiveInteger(content.expected_revision, 'expected_revision'),
   };
 }
-async function authority(session: Session): Promise<{ actor: ArtifactActor; config: ArtifactsPolicyFile }> {
-  const policy = await readArtifactsPolicy();
+async function authority(session: Session): Promise<{ actor: ArtifactActor; config: WebPolicyFile }> {
+  const policy = await readWebPolicy();
   const actor = await artifactActor(session, policy);
   if (!actor || policy.status !== 'enabled')
     throw forbidden('Artifacts are unavailable to this session under the current capability policy.');

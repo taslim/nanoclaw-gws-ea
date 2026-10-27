@@ -5,33 +5,30 @@ import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 
 import { isErrno } from '../community-portal/errors.js';
-import {
-  parseArtifactsPolicyFile,
-  readArtifactsPolicy,
-  type ArtifactsPolicyFile,
-} from '../modules/gws-ea-artifacts/policy.js';
+import { parseWebPolicyFile, readWebPolicy, type WebPolicyFile } from '../modules/gws-ea-web/policy.js';
+import { asciiName } from './alias.js';
 import { withAssistantLock } from './assistant-lock.js';
 import type { InstanceOperation } from './journal.js';
 import {
-  artifactsAccessApplication,
-  artifactsApi,
-  artifactsEmailPolicy,
-  artifactsEmails,
-  artifactsIngress,
-  artifactsOperatorFiles,
-  artifactsPathPrefix,
-  assertArtifactsApplication,
+  webAccessApplication,
+  webApi,
+  webEmailPolicy,
+  webEmails,
+  webIngress,
+  webOperatorFiles,
+  assertWebApplication,
   cloudflareId,
-  parseArtifactsOperatorConfig,
-  readArtifactsOperatorConfig,
-  reconcileArtifactsAccessEmails,
+  createWebCloudflareApi,
+  parseWebOperatorConfig,
+  readWebOperatorConfig,
+  reconcileWebAccessEmails,
   verifiedPolicyEmails,
-  writeArtifactsOperatorConfig,
-  type ArtifactsCloudflareApi,
-  type ArtifactsCloudflareDependencies,
-  type ArtifactsOperatorConfig,
-  type ArtifactsRemoteAssistant,
-} from './artifacts-cloudflare.js';
+  writeWebOperatorConfig,
+  type WebCloudflareApi,
+  type WebCloudflareDependencies,
+  type WebOperatorConfig,
+  type WebRemoteAssistant,
+} from './web-cloudflare.js';
 import { runInstanceNclJson } from './ncl.js';
 import { preparePrivateDirectory, type ControlPlanePaths } from './paths.js';
 import {
@@ -42,79 +39,77 @@ import {
 } from './process.js';
 import { registerSecret } from './redact.js';
 import {
-  claimInstanceArtifacts,
+  claimInstanceWeb,
   getInstanceReservation,
   readRegistry,
-  releaseInstanceArtifacts,
+  releaseInstanceWeb,
   withMachineLock,
 } from './registry.js';
 import { readOperatorFile, readOwnerOnlyFile, writePrivateTextFile } from './secrets.js';
 import { loadInstanceRuntimeConfig, serviceManagerEnvironment, type InstanceRuntimeConfig } from './service.js';
 import { renderLaunchdService, renderSystemdService } from './service-definition.js';
-import { GwsEaError, type ArtifactsNamespaceClaim } from './types.js';
+import { GwsEaError, type InstanceRegistry, type WebNamespaceClaim } from './types.js';
 import { isRecord } from './validation.js';
-import { inspectArtifactsUninstall, withArtifactsHostLock } from './artifacts-uninstall.js';
+import { inspectWebUninstall, withWebHostLock } from './web-uninstall.js';
 
-export { inspectArtifactsUninstall, uninstallArtifactsConnector } from './artifacts-uninstall.js';
-export type { ArtifactsConnectorUninstallData, ArtifactsUninstallReceipt } from './artifacts-uninstall.js';
+export { inspectWebUninstall, uninstallWebConnector } from './web-uninstall.js';
+export type { WebConnectorUninstallData, WebUninstallReceipt } from './web-uninstall.js';
 
-export const ARTIFACTS_CAPABILITY = {
-  name: 'artifacts',
+export const WEB_CAPABILITY = {
+  name: 'web',
   actions: ['install', 'uninstall', 'show', 'check'],
   scope: 'assistant',
   summary: 'Serve private HTML views and explicitly shared revisions through Cloudflare Access.',
 } as const;
-export interface ArtifactsCapabilityOptions {
+export interface WebCapabilityOptions {
   readonly accountId?: string;
   readonly teamName?: string;
   readonly zoneId?: string;
-  readonly hostname?: string;
   readonly credentialFile?: string;
   readonly cloudflaredPath?: string;
   readonly discardUnproven?: string;
 }
-export interface ArtifactsCapabilityDependencies extends ArtifactsCloudflareDependencies {
+export interface WebCapabilityDependencies extends WebCloudflareDependencies {
   readonly ncl?: typeof runInstanceNclJson;
   readonly runCommand?: SanitizedCommandOutcomeRunner;
   readonly recordEffect?: (changed: true | null) => void | Promise<unknown>;
 }
-export interface ArtifactsCapabilityObservation {
-  readonly name: 'artifacts';
+export interface WebCapabilityObservation {
+  readonly name: 'web';
   readonly scope: 'assistant';
-  readonly actions: typeof ARTIFACTS_CAPABILITY.actions;
+  readonly actions: typeof WEB_CAPABILITY.actions;
   readonly summary: string;
   readonly instance_id: string;
   readonly observed_at: string;
   readonly activation: 'enabled' | 'disabled' | 'unavailable';
   readonly hostname: string | null;
-  readonly path_prefix: string | null;
   readonly policy_file: string;
   readonly remote: 'not_checked' | 'verified' | 'mismatch' | 'unavailable';
   readonly listener: 'not_checked' | 'listening' | 'unavailable';
   readonly ready: boolean;
   readonly reason: string | null;
+  readonly reason_code: string | null;
   readonly operator: {
     readonly status: 'configured' | 'missing' | 'unavailable';
     readonly account_id: string | null;
     readonly team_name: string | null;
     readonly zone_id: string | null;
-    readonly hostname: string | null;
+    readonly zone_apex: string | null;
     readonly pending: { readonly kind: string; readonly attempt: string; readonly started_at: string } | null;
   };
 }
-export interface ArtifactsOperationData {
-  readonly name: 'artifacts';
+export interface WebOperationData {
+  readonly name: 'web';
   readonly scope: 'assistant';
-  readonly actions: typeof ARTIFACTS_CAPABILITY.actions;
+  readonly actions: typeof WEB_CAPABILITY.actions;
   readonly summary: string;
   readonly instance_id: string;
   readonly enabled: boolean;
   readonly changed: boolean;
   readonly hostname: string | null;
-  readonly path_prefix: string | null;
 }
 
-export interface ArtifactsAssistantProvisioning {
+export interface WebAssistantProvisioning {
   readonly instance_id: string;
   readonly outcome: 'ready' | 'pending' | 'unsupported';
   readonly reason: string | null;
@@ -122,24 +117,24 @@ export interface ArtifactsAssistantProvisioning {
   readonly changed: boolean;
 }
 
-export interface ArtifactsConnectorOperation {
-  readonly name: 'artifacts';
+export interface WebConnectorOperation {
+  readonly name: 'web';
   readonly scope: 'host';
   readonly installed: true;
   readonly changed: boolean;
-  readonly assistants: readonly ArtifactsAssistantProvisioning[];
+  readonly assistants: readonly WebAssistantProvisioning[];
 }
 
-export type ArtifactsReleaseCompatibility = 'compatible' | 'unsupported' | 'unknown';
-const ARTIFACTS_CONTRACT = 'gws-ea-artifacts-1';
+export type WebReleaseCompatibility = 'compatible' | 'unsupported' | 'unknown';
+const WEB_CONTRACT = 'gws-ea-web-1';
 
-export async function artifactsReleaseCompatibility(checkout: string): Promise<ArtifactsReleaseCompatibility> {
+export async function webReleaseCompatibility(checkout: string): Promise<WebReleaseCompatibility> {
   try {
     const marker: unknown = JSON.parse(
-      await readFile(path.join(checkout, 'src/gws-ea/artifacts-compatibility.json'), 'utf8'),
+      await readFile(path.join(checkout, 'src/gws-ea/web-compatibility.json'), 'utf8'),
     );
     if (!isRecord(marker) || marker.schemaVersion !== 1 || typeof marker.contract !== 'string') return 'unknown';
-    return marker.contract === ARTIFACTS_CONTRACT ? 'compatible' : 'unsupported';
+    return marker.contract === WEB_CONTRACT ? 'compatible' : 'unsupported';
   } catch (cause) {
     if (isErrno(cause, 'ENOENT') || isErrno(cause, 'ENOTDIR')) return 'unsupported';
     if (cause instanceof SyntaxError) return 'unknown';
@@ -147,29 +142,29 @@ export async function artifactsReleaseCompatibility(checkout: string): Promise<A
   }
 }
 
-export async function artifactsConnectorInstalled(paths: ControlPlanePaths): Promise<boolean> {
-  if (await inspectArtifactsUninstall(paths)) return false;
-  return (await readArtifactsOperatorConfig(artifactsOperatorFiles(paths).configFile)) !== undefined;
+export async function webConnectorInstalled(paths: ControlPlanePaths): Promise<boolean> {
+  if (await inspectWebUninstall(paths)) return false;
+  return (await readWebOperatorConfig(webOperatorFiles(paths).configFile)) !== undefined;
 }
 
 async function provisionRecordedAssistant(
   paths: ControlPlanePaths,
   instanceId: string,
-  dependencies: ArtifactsCapabilityDependencies,
-): Promise<ArtifactsAssistantProvisioning> {
+  dependencies: WebCapabilityDependencies,
+): Promise<WebAssistantProvisioning> {
   let changed = false;
   try {
-    const config = await readArtifactsOperatorConfig(artifactsOperatorFiles(paths).configFile);
+    const config = await readWebOperatorConfig(webOperatorFiles(paths).configFile);
     if (config?.pending)
       return {
         instance_id: instanceId,
         outcome: 'pending',
-        reason: 'artifacts_create_unproven',
+        reason: 'web_create_unproven',
         message: `Unproven ${config.pending.kind} creation ${config.pending.key} must be resolved before provisioning.`,
         changed,
       };
     const runtime = await loadInstanceRuntimeConfig(paths.runtimeFile(instanceId));
-    const compatibility = await artifactsReleaseCompatibility(runtime.checkout_root);
+    const compatibility = await webReleaseCompatibility(runtime.checkout_root);
     if (compatibility !== 'compatible')
       return {
         instance_id: instanceId,
@@ -177,11 +172,11 @@ async function provisionRecordedAssistant(
         reason: compatibility === 'unsupported' ? 'release_unsupported' : 'release_unknown',
         message:
           compatibility === 'unsupported'
-            ? 'Update this assistant to a release that supports artifacts.'
+            ? 'Update this assistant to a release that supports web.'
             : 'The assistant release compatibility marker is unreadable.',
         changed,
       };
-    const result = await provisionArtifactsAssistant(paths, instanceId, {
+    const result = await provisionWebAssistant(paths, instanceId, {
       ...dependencies,
       recordEffect: async (effect) => {
         if (effect === true) changed = true;
@@ -194,44 +189,44 @@ async function provisionRecordedAssistant(
     return {
       instance_id: instanceId,
       outcome: 'pending',
-      reason: cause instanceof GwsEaError ? cause.code : 'artifacts_host_unavailable',
+      reason: cause instanceof GwsEaError ? cause.code : 'web_host_unavailable',
       message:
         cause instanceof GwsEaError
           ? cause.message
-          : 'The assistant host or artifacts prerequisites could not be observed. Start the assistant and rerun connector installation.',
+          : 'The assistant host or web prerequisites could not be observed. Start the assistant and rerun connector installation.',
       changed,
     };
   }
 }
 
 /** Configure the host once, then reconcile every registered assistant using its native instance lock. */
-export async function installArtifactsConnector(
+export async function installWebConnector(
   paths: ControlPlanePaths,
-  options: ArtifactsCapabilityOptions = {},
-  dependencies: ArtifactsCapabilityDependencies = {},
-): Promise<ArtifactsConnectorOperation> {
-  return withArtifactsHostLock(paths, async () => {
-    const uninstall = await inspectArtifactsUninstall(paths);
+  options: WebCapabilityOptions = {},
+  dependencies: WebCapabilityDependencies = {},
+): Promise<WebConnectorOperation> {
+  return withWebHostLock(paths, async () => {
+    const uninstall = await inspectWebUninstall(paths);
     if (uninstall) {
       if (options.discardUnproven) {
         await dependencies.recordEffect?.(null);
-        await configure(paths, { discardUnproven: options.discardUnproven });
+        await configure(paths, { discardUnproven: options.discardUnproven }, dependencies);
         await dependencies.recordEffect?.(true);
       }
       throw new GwsEaError(
-        'artifacts_uninstall_incomplete',
-        'Finish artifacts uninstall before installing it again. Rerun gws-ea connectors uninstall artifacts.',
+        'web_uninstall_incomplete',
+        'Finish web uninstall before installing it again. Rerun gws-ea connectors uninstall web.',
       );
     }
     await dependencies.recordEffect?.(null);
-    const previous = await readArtifactsOperatorConfig(artifactsOperatorFiles(paths).configFile);
-    const config = await configure(paths, options);
+    const previous = await readWebOperatorConfig(webOperatorFiles(paths).configFile);
+    const config = await configure(paths, options, dependencies);
     let changed =
       previous === undefined || options.credentialFile !== undefined || options.discardUnproven !== undefined;
     if (changed) await dependencies.recordEffect?.(true);
-    const assistants: ArtifactsAssistantProvisioning[] = [];
+    const assistants: WebAssistantProvisioning[] = [];
     for (const instanceId of Object.keys((await readRegistry(paths)).instances).sort()) {
-      let result: ArtifactsAssistantProvisioning;
+      let result: WebAssistantProvisioning;
       try {
         result = await withAssistantLock(paths, instanceId, () =>
           provisionRecordedAssistant(paths, instanceId, dependencies),
@@ -251,24 +246,24 @@ export async function installArtifactsConnector(
     }
     if (config.pending && assistants.length === 0)
       throw new GwsEaError(
-        'artifacts_create_unproven',
+        'web_create_unproven',
         `Unproven ${config.pending.kind} creation ${config.pending.key} must be resolved before provisioning.`,
       );
-    return { name: 'artifacts', scope: 'host', installed: true, changed, assistants };
+    return { name: 'web', scope: 'host', installed: true, changed, assistants };
   });
 }
 
 /** Called by create/update/start while their existing instance operation is held. */
-export async function provisionAssistantArtifacts(
+export async function provisionAssistantWeb(
   operation: InstanceOperation,
-  dependencies: ArtifactsCapabilityDependencies = {},
-): Promise<ArtifactsAssistantProvisioning | undefined> {
+  dependencies: WebCapabilityDependencies = {},
+): Promise<WebAssistantProvisioning | undefined> {
   operation.assertActive();
-  if (!(await artifactsConnectorInstalled(operation.paths))) return undefined;
+  if (!(await webConnectorInstalled(operation.paths))) return undefined;
   try {
-    return await withArtifactsHostLock(operation.paths, async () => {
+    return await withWebHostLock(operation.paths, async () => {
       operation.assertActive();
-      if (!(await artifactsConnectorInstalled(operation.paths))) return undefined;
+      if (!(await webConnectorInstalled(operation.paths))) return undefined;
       return provisionRecordedAssistant(operation.paths, operation.instanceId, {
         ...dependencies,
         recordEffect: async (effect) => {
@@ -288,54 +283,53 @@ export async function provisionAssistantArtifacts(
     };
   }
 }
-export function instanceArtifactsPolicyFile(runtime: Pick<InstanceRuntimeConfig, 'instance_root'>): string {
-  return path.join(runtime.instance_root, 'artifacts', 'policy.json');
+export function instanceWebPolicyFile(runtime: Pick<InstanceRuntimeConfig, 'instance_root'>): string {
+  return path.join(runtime.instance_root, 'web', 'policy.json');
 }
 async function target(paths: ControlPlanePaths, instanceId: string) {
   const reservation = await getInstanceReservation(paths, instanceId);
   const runtime = await loadInstanceRuntimeConfig(paths.runtimeFile(instanceId));
-  return { reservation, runtime, policyFile: instanceArtifactsPolicyFile(runtime) };
+  return { reservation, runtime, policyFile: instanceWebPolicyFile(runtime) };
 }
-async function writePolicy(file: string, policy: ArtifactsPolicyFile): Promise<void> {
-  if (!parseArtifactsPolicyFile(policy))
-    throw new GwsEaError('artifacts_policy_invalid', 'Artifact policy coordinates are invalid.');
+async function writePolicy(file: string, policy: WebPolicyFile): Promise<void> {
+  if (!parseWebPolicyFile(policy)) throw new GwsEaError('web_policy_invalid', 'Web policy coordinates are invalid.');
   await preparePrivateDirectory(path.dirname(file));
   await writePrivateTextFile(file, `${JSON.stringify(policy)}\n`);
 }
 function operation(
   instanceId: string,
-  claim: ArtifactsNamespaceClaim | undefined,
+  claim: WebNamespaceClaim | undefined,
   enabled: boolean,
   changed: boolean,
-): ArtifactsOperationData {
+): WebOperationData {
   return {
-    ...ARTIFACTS_CAPABILITY,
+    ...WEB_CAPABILITY,
     instance_id: instanceId,
     enabled,
     changed,
     hostname: claim?.hostname ?? null,
-    path_prefix: claim?.path_prefix ?? null,
   };
 }
 
 async function configure(
   paths: ControlPlanePaths,
-  options: ArtifactsCapabilityOptions,
-): Promise<ArtifactsOperatorConfig> {
-  const files = artifactsOperatorFiles(paths);
+  options: WebCapabilityOptions,
+  dependencies: WebCapabilityDependencies,
+): Promise<WebOperatorConfig> {
+  const files = webOperatorFiles(paths);
   return withMachineLock(paths, async () => {
     await preparePrivateDirectory(files.root);
-    let existing = await readArtifactsOperatorConfig(files.configFile);
+    let existing = await readWebOperatorConfig(files.configFile);
     if (existing) {
       if (options.discardUnproven) {
         if (!existing.pending || existing.pending.key !== options.discardUnproven)
           throw new GwsEaError(
-            'artifacts_attempt_mismatch',
+            'web_attempt_mismatch',
             'Only the exact unresolved attempt may be acknowledged after its possible remote resource was removed.',
           );
         if ((existing.resolvedAttempts?.length ?? 0) >= 64)
           throw new GwsEaError(
-            'artifacts_attempt_capacity',
+            'web_attempt_capacity',
             'The retained recovery receipt is full. Preserve and inspect it before further provisioning.',
           );
         const { pending, ...rest } = existing;
@@ -346,13 +340,13 @@ async function configure(
             { ...pending, resolvedAt: new Date().toISOString(), resolution: 'operator_removed' },
           ],
         };
-        await writeArtifactsOperatorConfig(files.configFile, existing);
+        await writeWebOperatorConfig(files.configFile, existing);
       }
-      for (const key of ['accountId', 'teamName', 'zoneId', 'hostname', 'cloudflaredPath'] as const)
+      for (const key of ['accountId', 'teamName', 'zoneId', 'cloudflaredPath'] as const)
         if (options[key] !== undefined && options[key] !== existing[key])
           throw new GwsEaError(
-            'artifacts_operator_conflict',
-            'The operator account, team, zone, hostname and connector retain their recorded coordinates.',
+            'web_operator_conflict',
+            'The operator account, team, zone and connector retain their recorded coordinates.',
           );
       if (options.credentialFile) {
         const token = (
@@ -360,108 +354,87 @@ async function configure(
             options.credentialFile,
             paths.configRoot,
             'Cloudflare management credential',
-            'artifacts_credential_invalid',
+            'web_credential_invalid',
           )
         ).trim();
         registerSecret(token);
+        await verifyCoordinates(createWebCloudflareApi(token, dependencies), existing, existing.zoneApex);
         await writePrivateTextFile(existing.credentialFile, token);
       }
       return existing;
     }
-    if (!options.accountId || !options.teamName || !options.zoneId || !options.hostname || !options.credentialFile)
+    if (!options.accountId || !options.teamName || !options.zoneId || !options.credentialFile)
       throw new GwsEaError(
-        'artifacts_operator_required',
-        'First install requires --account, --team, --zone, --hostname and --credential-file under the operator config root.',
+        'web_operator_required',
+        'First install requires --account, --team, --zone and --credential-file under the operator config root.',
       );
     const credentialFile = path.join(files.root, 'management-token');
-    const config = parseArtifactsOperatorConfig({
-      schemaVersion: 1,
-      accountId: options.accountId,
-      teamName: options.teamName,
-      zoneId: options.zoneId,
-      hostname: options.hostname,
-      credentialFile,
-      cloudflaredPath: await resolvePersistedExecutable(options.cloudflaredPath ?? 'cloudflared'),
-      dns: {},
-      assistants: {},
-    });
     const token = (
       await readOperatorFile(
         options.credentialFile,
         paths.configRoot,
         'Cloudflare management credential',
-        'artifacts_credential_invalid',
+        'web_credential_invalid',
       )
     ).trim();
     registerSecret(token);
+    const zoneApex = await verifyCoordinates(createWebCloudflareApi(token, dependencies), {
+      accountId: options.accountId,
+      teamName: options.teamName,
+      zoneId: options.zoneId,
+    });
+    const config = parseWebOperatorConfig({
+      schemaVersion: 1,
+      accountId: options.accountId,
+      teamName: options.teamName,
+      zoneId: options.zoneId,
+      zoneApex,
+      credentialFile,
+      cloudflaredPath: await resolvePersistedExecutable(options.cloudflaredPath ?? 'cloudflared'),
+      dns: {},
+      assistants: {},
+    });
     await writePrivateTextFile(credentialFile, token);
-    await writeArtifactsOperatorConfig(files.configFile, config);
+    await writeWebOperatorConfig(files.configFile, config);
     return config;
   });
 }
 
-async function claimNamespace(
-  paths: ControlPlanePaths,
-  instanceId: string,
-  hostname: string,
-  prefix: string,
-): Promise<ArtifactsNamespaceClaim> {
-  const previous = (await getInstanceReservation(paths, instanceId)).exclusive_resource_claims.artifacts;
-  if (previous) {
-    if (previous.hostname !== hostname)
-      throw new GwsEaError('claim_conflict', 'Existing artifact links retain their claimed hostname.');
-    return previous;
-  }
-  const server = createServer();
-  await new Promise<void>((resolve, reject) => {
-    server.once('error', reject);
-    server.listen(0, '127.0.0.1', resolve);
-  });
-  try {
-    const address = server.address();
-    if (!address || typeof address === 'string') throw new Error('No loopback listener');
-    const claim = { hostname, path_prefix: prefix, listen_port: address.port };
-    await claimInstanceArtifacts(paths, instanceId, claim);
-    return claim;
-  } finally {
-    await new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
-  }
+async function verifyCoordinates(
+  api: WebCloudflareApi,
+  config: Pick<WebOperatorConfig, 'accountId' | 'teamName' | 'zoneId'>,
+  expectedApex?: string,
+): Promise<string> {
+  const zone = await api.request('GET', `/zones/${config.zoneId}`);
+  if (
+    !isRecord(zone) ||
+    zone.id !== config.zoneId ||
+    zone.status !== 'active' ||
+    !isRecord(zone.account) ||
+    zone.account.id !== config.accountId ||
+    typeof zone.name !== 'string' ||
+    (expectedApex !== undefined && zone.name !== expectedApex)
+  )
+    throw new GwsEaError(
+      'web_zone_invalid',
+      'The selected zone must be active and belong to the configured Cloudflare account.',
+    );
+  const organization = await api.request('GET', `/accounts/${config.accountId}/access/organizations`);
+  if (!isRecord(organization) || organization.auth_domain !== `${config.teamName}.cloudflareaccess.com`)
+    throw new GwsEaError('web_team_invalid', 'The configured Access team does not belong to this account.');
+  return zone.name;
 }
 
-async function verifyZone(
-  api: ArtifactsCloudflareApi,
-  config: ArtifactsOperatorConfig,
-  hostname: string,
-): Promise<string> {
-  const configured = await api.request('GET', `/zones/${config.zoneId}`);
-  const suitable = (zone: unknown): zone is Record<string, unknown> =>
-    isRecord(zone) &&
-    zone.status === 'active' &&
-    isRecord(zone.account) &&
-    zone.account.id === config.accountId &&
-    typeof zone.name === 'string' &&
-    (hostname === zone.name || hostname.endsWith(`.${zone.name}`));
-  if (suitable(configured)) return cloudflareId(configured);
-  if (hostname === config.hostname)
-    throw new GwsEaError(
-      'artifacts_zone_invalid',
-      'The default hostname must belong to the configured active zone and account.',
-    );
-  const zones = (await api.list(`/zones?account.id=${config.accountId}&status=active`))
-    .filter(suitable)
-    .sort((a, b) => String(b.name).length - String(a.name).length);
-  if (!zones.length)
-    throw new GwsEaError(
-      'artifacts_zone_invalid',
-      'The assistant hostname has no active zone in the configured account.',
-    );
-  return cloudflareId(zones[0]);
+function overlapsHostname(candidate: unknown, hostname: string): boolean {
+  return (
+    typeof candidate === 'string' &&
+    (candidate.toLowerCase() === hostname ||
+      candidate === '*' ||
+      (candidate.startsWith('*.') && hostname.endsWith(candidate.toLowerCase().slice(1))))
+  );
 }
-function assertNoAccessOverlap(
-  apps: readonly Record<string, unknown>[],
-  claim: ArtifactsNamespaceClaim,
-  ownedId?: string,
-): void {
+
+function assertNoAccessOverlap(apps: readonly Record<string, unknown>[], hostname: string, ownedId?: string): void {
   for (const app of apps) {
     if (app.id === ownedId) continue;
     const destinations: unknown[] = Array.isArray(app.destinations) ? app.destinations : [];
@@ -473,41 +446,125 @@ function assertNoAccessOverlap(
       ),
     ];
     for (const uri of uris) {
-      if (typeof uri !== 'string') continue;
-      const slash = uri.indexOf('/');
-      const host = (slash < 0 ? uri : uri.slice(0, slash)).toLowerCase();
-      const prefix = slash < 0 ? '' : uri.slice(slash).replace(/\/*\*?$/u, '');
-      const sameHost =
-        host === claim.hostname || (host.startsWith('*.') && claim.hostname.endsWith(host.slice(1))) || host === '*';
-      if (!sameHost) continue;
-      if (
-        prefix.includes('*') ||
-        prefix === '' ||
-        claim.path_prefix === '' ||
-        prefix === claim.path_prefix ||
-        prefix.startsWith(`${claim.path_prefix}/`) ||
-        claim.path_prefix.startsWith(`${prefix}/`)
-      )
+      if (typeof uri === 'string' && overlapsHostname(uri.split('/')[0], hostname))
         throw new GwsEaError(
-          'artifacts_access_conflict',
-          'An existing Access destination overlaps this assistant namespace. No existing resource was adopted or overwritten.',
+          'web_hostname_foreign',
+          `Access destination ${uri} already covers ${hostname}. Remove that unowned destination and rerun gws-ea connectors install web.`,
         );
     }
   }
 }
 
+/** Read-only hostname preflight; callers decide whether its result permits a claim or only reports readiness. */
+export async function assertWebHostnameAvailable(
+  config: WebOperatorConfig,
+  hostname: string,
+  dependencies: WebCapabilityDependencies = {},
+): Promise<void> {
+  const api = await webApi(config, dependencies);
+  for (const name of [hostname, `*.${config.zoneApex}`]) {
+    const records = await api.list(`/zones/${config.zoneId}/dns_records?name=${encodeURIComponent(name)}`);
+    for (const record of records) {
+      if (record.id !== config.dns[name]?.id)
+        throw new GwsEaError(
+          'web_hostname_foreign',
+          `DNS record ${name} (${cloudflareId(record)}) already covers ${hostname}. Remove that unowned record and rerun gws-ea connectors install web.`,
+        );
+    }
+  }
+  assertNoAccessOverlap(await api.list(`/accounts/${config.accountId}/access/apps`), hostname);
+  if (config.tunnelId) {
+    const current = await api.request(
+      'GET',
+      `/accounts/${config.accountId}/cfd_tunnel/${config.tunnelId}/configurations`,
+    );
+    const routes = isRecord(current) && isRecord(current.config) ? current.config.ingress : undefined;
+    if (!Array.isArray(routes) || !routes.every(isRecord))
+      throw new GwsEaError('web_tunnel_invalid', 'The recorded tunnel ingress could not be verified.');
+    for (const route of routes) {
+      if (
+        overlapsHostname(route.hostname, hostname) ||
+        (route.hostname === undefined && (route.path !== undefined || route.service !== 'http_status:404'))
+      )
+        throw new GwsEaError(
+          'web_hostname_foreign',
+          `Tunnel route ${String(route.hostname ?? '*')} already covers ${hostname}. Remove that unowned route and rerun gws-ea connectors install web.`,
+        );
+    }
+  }
+}
+
+export function webHostnameFor(firstName: string, zoneApex: string): string {
+  const label = asciiName(firstName).slice(0, 63);
+  if (!/[a-z]/u.test(label))
+    throw new GwsEaError(
+      'web_name_unusable',
+      `“${firstName}” has no Latin letter for a web address. Recreate this assistant under a first name with a Latin letter.`,
+    );
+  const hostname = `${label}.${zoneApex}`;
+  if (hostname.length > 253)
+    throw new GwsEaError(
+      'web_name_unusable',
+      'The derived web address exceeds the 253-character DNS hostname limit. Recreate this assistant under a shorter first name, or reinstall web with a shorter zone.',
+    );
+  return hostname;
+}
+
+export function assertWebHostnameUnclaimed(registry: InstanceRegistry, instanceId: string, hostname: string): void {
+  const holder = Object.values(registry.instances).find(
+    (assistant) =>
+      assistant.instance_id !== instanceId && assistant.exclusive_resource_claims.web?.hostname === hostname,
+  );
+  if (holder)
+    throw new GwsEaError(
+      'web_hostname_claimed',
+      `${hostname} is already held by assistant ${holder.instance_id}. Recreate this assistant under another first name, or remove the holder.`,
+    );
+}
+
+async function claimNamespace(
+  paths: ControlPlanePaths,
+  instanceId: string,
+  firstName: string,
+  config: WebOperatorConfig,
+  dependencies: WebCapabilityDependencies,
+): Promise<WebNamespaceClaim> {
+  const previous = (await getInstanceReservation(paths, instanceId)).exclusive_resource_claims.web;
+  if (previous) return previous;
+  const hostname = webHostnameFor(firstName, config.zoneApex);
+  const server = createServer();
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  try {
+    const address = server.address();
+    if (!address || typeof address === 'string') throw new Error('No loopback listener');
+    const claim = { hostname, listen_port: address.port };
+    await claimInstanceWeb(paths, instanceId, claim, async (registry) => {
+      assertWebHostnameUnclaimed(registry, instanceId, hostname);
+      const live = await readWebOperatorConfig(webOperatorFiles(paths).configFile);
+      if (!live) throw new GwsEaError('web_not_installed', 'Web is not installed on this operator host.');
+      await assertWebHostnameAvailable(live, hostname, dependencies);
+    });
+    return claim;
+  } finally {
+    await new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
+  }
+}
+
 /** Must run under the machine lock: remote PUT replaces the complete tunnel configuration. */
-export async function setArtifactsIngress(
-  api: ArtifactsCloudflareApi,
-  config: ArtifactsOperatorConfig,
-  claim: ArtifactsNamespaceClaim,
+export async function setWebIngress(
+  api: WebCloudflareApi,
+  config: WebOperatorConfig,
+  claim: WebNamespaceClaim,
   enabled: boolean,
 ): Promise<void> {
   if (!config.tunnelId) return;
   const resource = `/accounts/${config.accountId}/cfd_tunnel/${config.tunnelId}/configurations`;
   const remote = await api.request('GET', resource);
   if (!isRecord(remote) || (remote.config !== undefined && remote.config !== null && !isRecord(remote.config)))
-    throw new GwsEaError('artifacts_tunnel_invalid', 'Cloudflare tunnel configuration is invalid.');
+    throw new GwsEaError('web_tunnel_unverified', 'Cloudflare tunnel configuration is invalid.');
   const current = isRecord(remote.config) ? remote.config : {};
   if (
     isRecord(current.originRequest) &&
@@ -515,23 +572,23 @@ export async function setArtifactsIngress(
     current.originRequest.access.required === true
   )
     throw new GwsEaError(
-      'artifacts_tunnel_conflict',
+      'web_tunnel_conflict',
       'Global tunnel Access enforcement would block the explicitly public namespace.',
     );
   const ingress = current.ingress === undefined ? [] : current.ingress;
   if (!Array.isArray(ingress) || !ingress.every(isRecord))
-    throw new GwsEaError('artifacts_tunnel_invalid', 'Cloudflare tunnel ingress is invalid.');
-  const expected = artifactsIngress(claim);
+    throw new GwsEaError('web_tunnel_unverified', 'Cloudflare tunnel ingress is invalid.');
+  const expected = webIngress(claim);
   const retained: Record<string, unknown>[] = [];
   for (const route of ingress) {
     if (route.hostname === claim.hostname && route.path === expected.path) {
       if (route.service !== expected.service)
-        throw new GwsEaError('artifacts_tunnel_conflict', 'The claimed tunnel route points to an unowned service.');
+        throw new GwsEaError('web_tunnel_conflict', 'The claimed tunnel route points to an unowned service.');
       continue;
     }
     if (route.hostname === undefined && route.path === undefined) {
       if (route.service !== 'http_status:404')
-        throw new GwsEaError('artifacts_tunnel_conflict', 'The tunnel has an unowned catch-all service.');
+        throw new GwsEaError('web_tunnel_conflict', 'The tunnel has an unowned catch-all service.');
       continue;
     }
     const overlappingHost =
@@ -544,62 +601,74 @@ export async function setArtifactsIngress(
     if (
       overlappingHost &&
       !Object.values(config.assistants).some((assistant) => {
-        const owned = artifactsIngress(assistant.claim);
+        const owned = webIngress(assistant.claim);
         return owned.hostname === route.hostname && owned.path === route.path && owned.service === route.service;
       })
     )
-      throw new GwsEaError('artifacts_tunnel_conflict', 'An unowned tunnel route overlaps this assistant hostname.');
+      throw new GwsEaError('web_tunnel_conflict', 'An unowned tunnel route overlaps this assistant hostname.');
     retained.push(route);
   }
   const next = { ...current, ingress: [...retained, ...(enabled ? [expected] : []), { service: 'http_status:404' }] };
   if (JSON.stringify(current) !== JSON.stringify(next)) await api.request('PUT', resource, { config: next });
   const verified = await api.request('GET', resource);
   if (!isRecord(verified) || !isRecord(verified.config) || JSON.stringify(verified.config) !== JSON.stringify(next))
-    throw new GwsEaError('artifacts_tunnel_unverified', 'Cloudflare tunnel ingress has not converged.');
+    throw new GwsEaError('web_tunnel_unverified', 'Cloudflare tunnel ingress has not converged.');
+}
+
+function confirmedOwnershipMismatch(code: string | null): boolean {
+  return [
+    'web_dns_missing',
+    'web_dns_mismatch',
+    'web_application_mismatch',
+    'web_tunnel_invalid',
+    'web_owned_resource_missing',
+  ].includes(code ?? '');
+}
+
+async function readOwnedResource(api: WebCloudflareApi, resource: string): Promise<unknown> {
+  try {
+    return await api.request('GET', resource);
+  } catch (cause) {
+    if (cause instanceof GwsEaError && cause.details?.status === 404)
+      throw new GwsEaError('web_owned_resource_missing', 'Cloudflare reports a recorded Web resource missing.', {
+        cause,
+      });
+    throw cause;
+  }
 }
 
 async function provision(
   paths: ControlPlanePaths,
   instanceId: string,
-  claim: ArtifactsNamespaceClaim,
+  claim: WebNamespaceClaim,
   emails: readonly string[],
-  dependencies: ArtifactsCapabilityDependencies,
-): Promise<ArtifactsOperatorConfig> {
-  const file = artifactsOperatorFiles(paths).configFile;
+  dependencies: WebCapabilityDependencies,
+): Promise<WebOperatorConfig> {
+  const file = webOperatorFiles(paths).configFile;
   return withMachineLock(paths, async () => {
-    const loaded = await readArtifactsOperatorConfig(file);
-    if (!loaded) throw new GwsEaError('artifacts_operator_required', 'Artifacts operator configuration is missing.');
-    let config: ArtifactsOperatorConfig = loaded;
-    const previous = config.assistants[instanceId];
-    if (previous?.publicationReady) {
-      config = {
-        ...config,
-        assistants: { ...config.assistants, [instanceId]: { ...previous, publicationReady: false } },
-      };
-      await writeArtifactsOperatorConfig(file, config);
-    }
+    const loaded = await readWebOperatorConfig(file);
+    if (!loaded) throw new GwsEaError('web_operator_required', 'Web operator configuration is missing.');
+    let config: WebOperatorConfig = loaded;
     if (config.pending)
       throw new GwsEaError(
-        'artifacts_create_unproven',
+        'web_create_unproven',
         'An interrupted Cloudflare create is unresolved. Inspect the recorded attempt and resolve its exact remote outcome before retrying; resources are never adopted by name.',
         { details: { resource: config.pending.kind, attempt: config.pending.key } },
       );
-    const api = await artifactsApi(config, dependencies);
+    const api = await webApi(config, dependencies);
     const account = `/accounts/${config.accountId}`;
-    const zoneId = await verifyZone(api, config, claim.hostname);
-    const organization = await api.request('GET', `${account}/access/organizations`);
-    if (!isRecord(organization) || organization.auth_domain !== `${config.teamName}.cloudflareaccess.com`)
-      throw new GwsEaError('artifacts_team_invalid', 'The configured Access team does not belong to this account.');
-    const save = async (next: ArtifactsOperatorConfig): Promise<void> => {
-      await writeArtifactsOperatorConfig(file, next);
+    await verifyCoordinates(api, config, config.zoneApex);
+    const zoneId = config.zoneId;
+    const save = async (next: WebOperatorConfig): Promise<void> => {
+      await writeWebOperatorConfig(file, next);
       config = next;
     };
     const create = async (
-      kind: NonNullable<ArtifactsOperatorConfig['pending']>['kind'],
+      kind: NonNullable<WebOperatorConfig['pending']>['kind'],
       key: string,
       resource: string,
       body: unknown,
-      recorded: (id: string) => ArtifactsOperatorConfig,
+      recorded: (id: string) => WebOperatorConfig,
     ): Promise<void> => {
       await save({
         ...config,
@@ -630,7 +699,7 @@ async function provision(
     const idps = await api.list(`${account}/access/identity_providers`);
     if (config.pin) {
       if (!idps.some((idp) => idp.id === config?.pin?.id && idp.type === 'onetimepin'))
-        throw new GwsEaError('artifacts_pin_missing', 'The recorded one-time-PIN identity provider is missing.');
+        throw new GwsEaError('web_pin_missing', 'The recorded one-time-PIN identity provider is missing.');
     } else {
       const pin = idps.find((idp) => idp.type === 'onetimepin');
       if (pin) await save({ ...config, pin: { id: cloudflareId(pin), owned: false } });
@@ -639,76 +708,34 @@ async function provision(
           'pin',
           randomUUID(),
           `${account}/access/identity_providers`,
-          { name: 'Artifact email PIN', type: 'onetimepin', config: {} },
+          { name: 'Web email PIN', type: 'onetimepin', config: {} },
           (id) => ({ ...config, pin: { id, owned: true } }),
         );
     }
-    let assistant: ArtifactsRemoteAssistant = config.assistants[instanceId] ?? { claim, enabled: false };
-    if (JSON.stringify(assistant.claim) !== JSON.stringify(claim))
-      throw new GwsEaError(
-        'artifacts_owner_mismatch',
-        'Recorded artifact namespace does not match the assistant claim.',
-      );
-    const apps = await api.list(`${account}/access/apps`);
-    assertNoAccessOverlap(apps, claim, assistant.applicationId);
-    if (!assistant.applicationId) {
-      if (apps.length >= 500)
-        throw new GwsEaError(
-          'artifacts_cloudflare_capacity',
-          'The Cloudflare account has reached its Access application limit.',
-        );
-      await create(
-        'application',
-        instanceId,
-        `${account}/access/apps`,
-        artifactsAccessApplication(claim, config.pin!.id),
-        (id) => ({
-          ...config,
-          assistants: { ...config.assistants, [instanceId]: { ...assistant, applicationId: id } },
-        }),
-      );
-      assistant = config.assistants[instanceId];
-    }
-    const appPath = `${account}/access/apps/${assistant.applicationId}`;
-    const app = await api.request('GET', appPath);
-    if (!isRecord(app) || typeof app.aud !== 'string')
-      throw new GwsEaError('artifacts_access_unverified', 'Cloudflare did not return the application audience.');
-    if (!assistant.aud) {
-      assistant = { ...assistant, aud: app.aud };
-      await save({ ...config, assistants: { ...config.assistants, [instanceId]: assistant } });
-    }
-    assertArtifactsApplication(app, assistant, config);
-    const policies = await api.list(`${appPath}/policies`);
-    if (!assistant.policyId) {
-      if (policies.length)
-        throw new GwsEaError(
-          'artifacts_access_conflict',
-          'The owned application has an unrecorded policy. It was left unchanged.',
-        );
-      await create('policy', instanceId, `${appPath}/policies`, artifactsEmailPolicy(emails), (id) => ({
-        ...config,
-        assistants: { ...config.assistants, [instanceId]: { ...assistant, policyId: id } },
-      }));
-      assistant = config.assistants[instanceId];
-    } else if (policies.length !== 1 || policies[0].id !== assistant.policyId)
-      throw new GwsEaError('artifacts_access_conflict', 'The owned application has unexpected policies.');
     if (!config.tunnelId)
       await create(
         'tunnel',
         randomUUID(),
         `${account}/cfd_tunnel`,
-        { name: `gws-ea-artifacts-${randomUUID()}`, config_src: 'cloudflare' },
+        { name: `gws-ea-web-${randomUUID()}`, config_src: 'cloudflare' },
         (id) => ({ ...config, tunnelId: id }),
       );
-    const tunnel = await api.request('GET', `${account}/cfd_tunnel/${config.tunnelId}`);
-    if (!isRecord(tunnel) || tunnel.id !== config.tunnelId || tunnel.config_src !== 'cloudflare' || tunnel.deleted_at)
-      throw new GwsEaError('artifacts_tunnel_invalid', 'The recorded remotely managed tunnel is unavailable.');
+    const tunnel = await readOwnedResource(api, `${account}/cfd_tunnel/${config.tunnelId}`);
+    if (
+      !isRecord(tunnel) ||
+      typeof tunnel.id !== 'string' ||
+      typeof tunnel.config_src !== 'string' ||
+      (tunnel.deleted_at !== null && typeof tunnel.deleted_at !== 'string')
+    )
+      throw new GwsEaError('web_tunnel_unobserved', 'Cloudflare did not return a verifiable tunnel record.');
+    if (tunnel.id !== config.tunnelId || tunnel.config_src !== 'cloudflare' || tunnel.deleted_at)
+      throw new GwsEaError('web_tunnel_invalid', 'The recorded remotely managed tunnel is unavailable.');
     const dns = config.dns[claim.hostname];
     if (!dns) {
       const existing = await api.list(`/zones/${zoneId}/dns_records?name=${encodeURIComponent(claim.hostname)}`);
       if (existing.length)
         throw new GwsEaError(
-          'artifacts_dns_conflict',
+          'web_dns_conflict',
           'The hostname already has DNS records that this operator does not own.',
         );
       await create(
@@ -720,13 +747,59 @@ async function provision(
       );
     }
     const ownedDns = config.dns[claim.hostname];
-    const record = await api.request('GET', `/zones/${ownedDns.zoneId}/dns_records/${ownedDns.id}`);
+    const record = await readOwnedResource(api, `/zones/${ownedDns.zoneId}/dns_records/${ownedDns.id}`);
     assertDns(record, claim.hostname, config.tunnelId!, ownedDns.id);
+    let assistant: WebRemoteAssistant = config.assistants[instanceId] ?? { claim, enabled: false };
+    if (JSON.stringify(assistant.claim) !== JSON.stringify(claim))
+      throw new GwsEaError('web_owner_mismatch', 'Recorded web namespace does not match the assistant claim.');
+    const apps = await api.list(`${account}/access/apps`);
+    assertNoAccessOverlap(apps, claim.hostname, assistant.applicationId);
+    if (!assistant.applicationId) {
+      if (apps.length >= 500)
+        throw new GwsEaError(
+          'web_cloudflare_capacity',
+          'The Cloudflare account has reached its Access application limit.',
+        );
+      await create(
+        'application',
+        instanceId,
+        `${account}/access/apps`,
+        webAccessApplication(claim, config.pin!.id),
+        (id) => ({
+          ...config,
+          assistants: { ...config.assistants, [instanceId]: { ...assistant, applicationId: id } },
+        }),
+      );
+      assistant = config.assistants[instanceId];
+    }
+    const appPath = `${account}/access/apps/${assistant.applicationId}`;
+    const app = await readOwnedResource(api, appPath);
+    if (!isRecord(app) || typeof app.aud !== 'string')
+      throw new GwsEaError('web_access_unverified', 'Cloudflare did not return the application audience.');
+    if (!assistant.aud) {
+      assistant = { ...assistant, aud: app.aud };
+      await save({ ...config, assistants: { ...config.assistants, [instanceId]: assistant } });
+    }
+    assertWebApplication(app, assistant, config);
+    const policies = await api.list(`${appPath}/policies`);
+    if (!assistant.policyId) {
+      if (policies.length)
+        throw new GwsEaError(
+          'web_access_conflict',
+          'The owned application has an unrecorded policy. It was left unchanged.',
+        );
+      await create('policy', instanceId, `${appPath}/policies`, webEmailPolicy(emails), (id) => ({
+        ...config,
+        assistants: { ...config.assistants, [instanceId]: { ...assistant, policyId: id } },
+      }));
+      assistant = config.assistants[instanceId];
+    } else if (policies.length !== 1 || policies[0].id !== assistant.policyId)
+      throw new GwsEaError('web_access_conflict', 'The owned application has unexpected policies.');
     const token = await api.request('GET', `${account}/cfd_tunnel/${config.tunnelId}/token`);
     if (typeof token !== 'string' || !token || /\s/u.test(token))
-      throw new GwsEaError('artifacts_tunnel_invalid', 'Cloudflare tunnel run token is unavailable.');
+      throw new GwsEaError('web_tunnel_token_unavailable', 'Cloudflare tunnel run token is unavailable.');
     registerSecret(token);
-    await writePrivateTextFile(artifactsOperatorFiles(paths).tokenFile, token);
+    await writePrivateTextFile(webOperatorFiles(paths).tokenFile, token);
     assistant = { ...assistant, enabled: true };
     await save({ ...config, assistants: { ...config.assistants, [instanceId]: assistant } });
     return config;
@@ -736,13 +809,21 @@ async function provision(
 function assertDns(record: unknown, hostname: string, tunnelId: string, expectedId: string): void {
   if (
     !isRecord(record) ||
+    typeof record.id !== 'string' ||
+    typeof record.type !== 'string' ||
+    typeof record.name !== 'string' ||
+    typeof record.content !== 'string' ||
+    typeof record.proxied !== 'boolean'
+  )
+    throw new GwsEaError('web_dns_unverified', 'Cloudflare did not return a verifiable DNS record.');
+  if (
     record.id !== expectedId ||
     record.type !== 'CNAME' ||
     record.name !== hostname ||
     record.content !== `${tunnelId}.cfargotunnel.com` ||
     record.proxied !== true
   )
-    throw new GwsEaError('artifacts_dns_mismatch', 'The owned DNS record no longer points at the recorded tunnel.');
+    throw new GwsEaError('web_dns_mismatch', 'The owned DNS record no longer points at the recorded tunnel.');
 }
 
 export function supportedCloudflaredVersion(output: string): boolean {
@@ -751,9 +832,9 @@ export function supportedCloudflaredVersion(output: string): boolean {
 }
 
 async function verifyConnectorExecutable(
-  config: ArtifactsOperatorConfig,
+  config: WebOperatorConfig,
   runtime: InstanceRuntimeConfig,
-  dependencies: ArtifactsCapabilityDependencies,
+  dependencies: WebCapabilityDependencies,
 ): Promise<void> {
   const result = await (dependencies.runCommand ?? runSanitizedCommandOutcome)({
     command: config.cloudflaredPath,
@@ -765,15 +846,15 @@ async function verifyConnectorExecutable(
   });
   if (result.exitCode !== 0 || !supportedCloudflaredVersion(result.stdout))
     throw new GwsEaError(
-      'artifacts_connector_unsupported',
+      'web_connector_unsupported',
       'cloudflared 2025.4.0 or later is required for the owner-only run-token file.',
     );
 }
 
-export function renderArtifactsConnectorService(
-  files: ReturnType<typeof artifactsOperatorFiles>,
+export function renderWebConnectorService(
+  files: ReturnType<typeof webOperatorFiles>,
   cloudflaredPath: string,
-  connector: NonNullable<ArtifactsOperatorConfig['connector']>,
+  connector: NonNullable<WebOperatorConfig['connector']>,
 ): string {
   const input = {
     programArguments: [cloudflaredPath, 'tunnel', '--no-autoupdate', 'run', '--token-file', files.tokenFile],
@@ -793,17 +874,17 @@ export function renderArtifactsConnectorService(
 async function startConnector(
   paths: ControlPlanePaths,
   runtime: InstanceRuntimeConfig,
-  dependencies: ArtifactsCapabilityDependencies,
+  dependencies: WebCapabilityDependencies,
 ): Promise<void> {
   await withMachineLock(paths, async () => {
-    const files = artifactsOperatorFiles(paths);
-    const loaded = await readArtifactsOperatorConfig(files.configFile);
-    if (!loaded?.tunnelId) throw new GwsEaError('artifacts_tunnel_invalid', 'The tunnel has not been provisioned.');
-    let config: ArtifactsOperatorConfig = loaded;
+    const files = webOperatorFiles(paths);
+    const loaded = await readWebOperatorConfig(files.configFile);
+    if (!loaded?.tunnelId) throw new GwsEaError('web_tunnel_invalid', 'The tunnel has not been provisioned.');
+    let config: WebOperatorConfig = loaded;
     const uid = process.getuid?.();
     if (uid === undefined || !['darwin', 'linux'].includes(process.platform))
-      throw new GwsEaError('unsupported_platform', 'Artifacts connector service needs macOS or Linux.');
-    const label = `com.gws-ea.artifacts.${createHash('sha256').update(paths.configRoot).digest('hex').slice(0, 16)}`;
+      throw new GwsEaError('unsupported_platform', 'Web connector service needs macOS or Linux.');
+    const label = `com.gws-ea.web.${createHash('sha256').update(paths.configRoot).digest('hex').slice(0, 16)}`;
     const manager = process.platform === 'darwin' ? 'launchd' : uid === 0 ? 'systemd-system' : 'systemd-user';
     const definitionFile =
       manager === 'launchd'
@@ -819,25 +900,25 @@ async function startConnector(
         config.connector.label !== connector.label ||
         config.connector.homeDirectory !== connector.homeDirectory)
     )
-      throw new GwsEaError('artifacts_connector_conflict', 'The shared connector service coordinates changed.');
-    const definition = renderArtifactsConnectorService(files, config.cloudflaredPath, connector);
+      throw new GwsEaError('web_connector_conflict', 'The shared connector service coordinates changed.');
+    const definition = renderWebConnectorService(files, config.cloudflaredPath, connector);
     const stored = await readOwnerOnlyFile(definitionFile).catch((cause: unknown) => {
       if (isErrno(cause, 'ENOENT')) return undefined;
       throw cause;
     });
     if (!config.connector && stored !== undefined)
       throw new GwsEaError(
-        'artifacts_connector_conflict',
+        'web_connector_conflict',
         'An unowned service definition already exists at the connector path.',
       );
     if (stored !== undefined && stored !== definition)
       throw new GwsEaError(
-        'artifacts_connector_conflict',
+        'web_connector_conflict',
         'The owned connector service definition was changed outside this capability.',
       );
     if (!config.connector) {
       config = { ...config, connector };
-      await writeArtifactsOperatorConfig(files.configFile, config);
+      await writeWebOperatorConfig(files.configFile, config);
     }
     if (stored === undefined) {
       await mkdir(path.dirname(definitionFile), { recursive: true, mode: 0o700 });
@@ -857,14 +938,14 @@ async function startConnector(
       const domain = `gui/${uid}`;
       const current = await invoke('launchctl', ['print', `${domain}/${label}`]);
       if (current.exitCode !== 0 && (await invoke('launchctl', ['bootstrap', domain, definitionFile])).exitCode !== 0)
-        throw new GwsEaError('artifacts_connector_failed', 'The owned cloudflared launchd service could not start.');
+        throw new GwsEaError('web_connector_failed', 'The owned cloudflared launchd service could not start.');
     } else {
       const args = manager === 'systemd-user' ? ['--user'] : [];
       if (
         (await invoke('systemctl', [...args, 'daemon-reload'])).exitCode !== 0 ||
         (await invoke('systemctl', [...args, 'enable', '--now', `${label}.service`])).exitCode !== 0
       )
-        throw new GwsEaError('artifacts_connector_failed', 'The owned cloudflared systemd service could not start.');
+        throw new GwsEaError('web_connector_failed', 'The owned cloudflared systemd service could not start.');
     }
   });
 }
@@ -883,15 +964,15 @@ function availableHealth(value: unknown, port: number): boolean {
 }
 async function hostHealth(
   runtime: InstanceRuntimeConfig,
-  dependencies: ArtifactsCapabilityDependencies,
+  dependencies: WebCapabilityDependencies,
   timeoutMs?: number,
 ): Promise<unknown> {
-  return (dependencies.ncl ?? runInstanceNclJson)(runtime, ['gws-ea-artifacts-health'], { timeoutMs });
+  return (dependencies.ncl ?? runInstanceNclJson)(runtime, ['gws-ea-web-health'], { timeoutMs });
 }
 
 async function waitForArtifactListener(
   runtime: InstanceRuntimeConfig,
-  dependencies: ArtifactsCapabilityDependencies,
+  dependencies: WebCapabilityDependencies,
   port: number,
 ): Promise<boolean> {
   const deadline = Date.now() + 30_000;
@@ -907,11 +988,11 @@ async function waitForArtifactListener(
   return false;
 }
 
-async function provisionArtifactsAssistant(
+async function provisionWebAssistant(
   paths: ControlPlanePaths,
   instanceId: string,
-  dependencies: ArtifactsCapabilityDependencies = {},
-): Promise<ArtifactsOperationData> {
+  dependencies: WebCapabilityDependencies = {},
+): Promise<WebOperationData> {
   const { runtime, policyFile, reservation } = await target(paths, instanceId);
   const ncl = dependencies.ncl ?? runInstanceNclJson;
   const profile = await ncl(runtime, ['gws-ea-profile-get']);
@@ -919,77 +1000,73 @@ async function provisionArtifactsAssistant(
     !isRecord(profile) ||
     typeof profile.assistant_first_name !== 'string' ||
     !Array.isArray(profile.principal_emails) ||
-    !profile.principal_emails.every((email): email is string => typeof email === 'string') ||
+    !profile.principal_emails.every((email: unknown): email is string => typeof email === 'string') ||
     !profile.principal_emails.length
   )
     throw new GwsEaError(
-      'artifacts_profile_unavailable',
-      'Artifacts require the assistant first name and all confirmed principal email addresses from the running host.',
+      'web_profile_unavailable',
+      'Web requires the assistant first name and all confirmed principal email addresses from the running host.',
     );
-  const principalEmails = artifactsEmails(profile.principal_emails);
+  const principalEmails = webEmails(profile.principal_emails);
   const health = await hostHealth(runtime, dependencies);
   if (!isRecord(health) || !Array.isArray(health.policyVersions) || !health.policyVersions.includes(1))
-    throw new GwsEaError(
-      'artifacts_release_unsupported',
-      'Update and start the assistant before installing artifacts.',
-    );
-  const config = await readArtifactsOperatorConfig(artifactsOperatorFiles(paths).configFile);
-  if (!config) throw new GwsEaError('artifacts_not_installed', 'Artifacts is not installed on this operator host.');
+    throw new GwsEaError('web_release_unsupported', 'Update and start the assistant before installing web.');
+  const config = await readWebOperatorConfig(webOperatorFiles(paths).configFile);
+  if (!config) throw new GwsEaError('web_not_installed', 'Web is not installed on this operator host.');
   await verifyConnectorExecutable(config, runtime, dependencies);
+  const previousPolicy = await readWebPolicy(policyFile);
+  if (previousPolicy.status === 'unavailable')
+    throw new GwsEaError('web_policy_invalid', 'Web policy is invalid or inaccessible.');
+  let ownershipMismatch = false;
   const recorded = config.assistants[instanceId];
   if (recorded?.publicationReady) {
-    const current = await inspectArtifactsCapability(paths, instanceId, { ...dependencies, check: true });
+    const current = await inspectWebCapability(paths, instanceId, { ...dependencies, check: true });
     if (current.ready) return operation(instanceId, recorded.claim, true, false);
     if (current.activation === 'enabled' && current.remote === 'verified') {
       if (await waitForArtifactListener(runtime, dependencies, recorded.claim.listen_port))
         return operation(instanceId, recorded.claim, true, false);
       throw new GwsEaError(
-        'artifacts_listener_unavailable',
-        'The running assistant has not verified its artifact listener. Its existing artifact configuration is retained.',
+        'web_listener_unavailable',
+        'The running assistant has not verified its web listener. Its existing web configuration is retained.',
       );
     }
+    ownershipMismatch = confirmedOwnershipMismatch(current.reason_code);
     if (current.remote !== 'mismatch')
       throw new GwsEaError(
-        'artifacts_not_ready',
-        `${current.reason ?? 'Artifact prerequisites could not be observed.'} The existing artifact configuration is retained.`,
+        'web_not_ready',
+        `${current.reason ?? 'Web prerequisites could not be observed.'} The existing web configuration is retained.`,
       );
   }
-  const previousPolicy = await readArtifactsPolicy(policyFile);
-  if (previousPolicy.status === 'unavailable')
-    throw new GwsEaError('artifacts_policy_invalid', 'Artifacts policy is invalid or inaccessible.');
   await dependencies.recordEffect?.(null);
-  const retained = reservation.exclusive_resource_claims.artifacts;
-  const hostname = retained?.hostname ?? config.hostname;
-  const prefix = retained?.path_prefix ?? artifactsPathPrefix(profile.assistant_first_name);
-  const claim = await claimNamespace(paths, instanceId, hostname, prefix);
+  const retained = reservation.exclusive_resource_claims.web;
+  const claim =
+    retained ?? (await claimNamespace(paths, instanceId, profile.assistant_first_name, config, dependencies));
   await dependencies.recordEffect?.(true);
   const currentEmails = async (): Promise<readonly string[]> => {
-    const current = await ncl(runtime, ['gws-ea-artifacts-admission-emails']);
+    const current = await ncl(runtime, ['gws-ea-web-admission-emails']);
     if (
       !isRecord(current) ||
       !Array.isArray(current.emails) ||
-      !current.emails.every((email): email is string => typeof email === 'string')
+      !current.emails.every((email: unknown): email is string => typeof email === 'string')
     )
-      throw new GwsEaError(
-        'artifacts_profile_unavailable',
-        'The host could not read authoritative artifact admission.',
-      );
-    const exact = artifactsEmails(current.emails);
+      throw new GwsEaError('web_profile_unavailable', 'The host could not read authoritative web admission.');
+    const exact = webEmails(current.emails);
     if (!principalEmails.every((email) => exact.includes(email)))
       throw new GwsEaError(
-        'artifacts_profile_changed',
+        'web_profile_changed',
         'Principal addresses changed during installation. Retry with the current profile.',
       );
     return exact;
   };
-  let enabledPolicy: ArtifactsPolicyFile | undefined = previousPolicy.config;
+  const preserveEnabled = previousPolicy.enabled && !ownershipMismatch;
+  let enabledPolicy: WebPolicyFile | undefined = previousPolicy.config;
   try {
-    if (enabledPolicy?.enabled) await writePolicy(policyFile, { ...enabledPolicy, enabled: false });
+    if (ownershipMismatch && enabledPolicy) await writePolicy(policyFile, { ...enabledPolicy, enabled: false });
     const provisioned = await provision(paths, instanceId, claim, await currentEmails(), dependencies);
     const assistant = provisioned.assistants[instanceId];
-    await reconcileArtifactsAccessEmails(
+    await reconcileWebAccessEmails(
       {
-        operatorConfigFile: artifactsOperatorFiles(paths).configFile,
+        operatorConfigFile: webOperatorFiles(paths).configFile,
         accountId: provisioned.accountId,
         applicationId: assistant.applicationId!,
         emails: currentEmails,
@@ -1000,52 +1077,52 @@ async function provisionArtifactsAssistant(
       schemaVersion: 1,
       enabled: true,
       hostname: claim.hostname,
-      pathPrefix: claim.path_prefix,
       listenPort: claim.listen_port,
       accessIssuer: `https://${provisioned.teamName}.cloudflareaccess.com`,
       accessAud: assistant.aud!,
       cloudflare: {
         accountId: provisioned.accountId,
         applicationId: assistant.applicationId!,
-        operatorConfigFile: artifactsOperatorFiles(paths).configFile,
+        operatorConfigFile: webOperatorFiles(paths).configFile,
       },
     };
-    await writePolicy(policyFile, { ...enabledPolicy, enabled: false });
     await writePolicy(policyFile, enabledPolicy);
     // The host module binds asynchronously. Poll for its listener outside the machine lock, and before ingress
     // opens or the connector starts, since the listener depends on neither.
     if (!(await waitForArtifactListener(runtime, dependencies, claim.listen_port)))
       throw new GwsEaError(
-        'artifacts_listener_unavailable',
-        'The running assistant has not verified its artifact listener. Artifact ingress remains closed.',
+        'web_listener_unavailable',
+        'The running assistant has not verified its web listener. Web ingress remains closed.',
       );
     await withMachineLock(paths, async () => {
-      const live = await readArtifactsOperatorConfig(artifactsOperatorFiles(paths).configFile);
+      const live = await readWebOperatorConfig(webOperatorFiles(paths).configFile);
       if (!live?.assistants[instanceId]?.enabled)
-        throw new GwsEaError('artifacts_disabled', 'Artifacts were disabled while provisioning.');
-      await setArtifactsIngress(await artifactsApi(live, dependencies), live, claim, true);
+        throw new GwsEaError('web_disabled', 'Web was disabled while provisioning.');
+      await setWebIngress(await webApi(live, dependencies), live, claim, true);
     });
     await startConnector(paths, runtime, dependencies);
-    const observed = await inspectArtifactsCapability(paths, instanceId, { ...dependencies, check: true });
+    const observed = await inspectWebCapability(paths, instanceId, { ...dependencies, check: true });
     if (observed.remote !== 'verified' || observed.listener !== 'listening')
       throw new GwsEaError(
-        'artifacts_not_ready',
-        'Artifact prerequisites have not all been verified. Check this connector after resolving the reported prerequisite.',
+        'web_not_ready',
+        'Web prerequisites have not all been verified. Check this connector after resolving the reported prerequisite.',
       );
-    const authors = await ncl(runtime, ['gws-ea-artifacts-author-groups']);
-    if (
-      !isRecord(authors) ||
-      !Array.isArray(authors.group_ids) ||
-      !authors.group_ids.every((id): id is string => typeof id === 'string' && id.length > 0)
-    )
-      throw new GwsEaError('artifacts_authors_unavailable', 'The host could not read current artifact author groups.');
-    for (const groupId of new Set(authors.group_ids)) await ncl(runtime, ['groups', 'restart', '--id', groupId]);
+    if (!recorded?.publicationReady || !preserveEnabled) {
+      const authors = await ncl(runtime, ['gws-ea-artifacts-author-groups']);
+      if (
+        !isRecord(authors) ||
+        !Array.isArray(authors.group_ids) ||
+        !authors.group_ids.every((id: unknown): id is string => typeof id === 'string' && id.length > 0)
+      )
+        throw new GwsEaError('web_authors_unavailable', 'The host could not read current artifact author groups.');
+      for (const groupId of new Set(authors.group_ids)) await ncl(runtime, ['groups', 'restart', '--id', groupId]);
+    }
     const activationPolicy = enabledPolicy;
     await withMachineLock(paths, async () => {
-      const file = artifactsOperatorFiles(paths).configFile;
-      const live = await readArtifactsOperatorConfig(file);
+      const file = webOperatorFiles(paths).configFile;
+      const live = await readWebOperatorConfig(file);
       const current = live?.assistants[instanceId];
-      const policy = await readArtifactsPolicy(policyFile);
+      const policy = await readWebPolicy(policyFile);
       if (
         !live ||
         !current?.enabled ||
@@ -1055,80 +1132,83 @@ async function provisionArtifactsAssistant(
         policy.status !== 'enabled' ||
         JSON.stringify(policy.config) !== JSON.stringify(activationPolicy)
       )
-        throw new GwsEaError('artifacts_disabled', 'Artifact coordinates changed before activation completed.');
-      await writeArtifactsOperatorConfig(file, {
+        throw new GwsEaError('web_disabled', 'Web coordinates changed before activation completed.');
+      await writeWebOperatorConfig(file, {
         ...live,
         assistants: { ...live.assistants, [instanceId]: { ...current, publicationReady: true } },
       });
     });
     return operation(instanceId, claim, true, true);
   } catch (cause) {
+    if (preserveEnabled && !confirmedOwnershipMismatch(cause instanceof GwsEaError ? cause.code : null)) throw cause;
     if (enabledPolicy) await writePolicy(policyFile, { ...enabledPolicy, enabled: false });
     /* eslint-disable no-catch-all/no-catch-all -- Origin is already closed; retain the original failure when remote cleanup is also unavailable. */
     let releaseUnrecordedClaim = false;
     try {
       await withMachineLock(paths, async () => {
-        const file = artifactsOperatorFiles(paths).configFile;
-        const live = await readArtifactsOperatorConfig(file);
+        const file = webOperatorFiles(paths).configFile;
+        const live = await readWebOperatorConfig(file);
         const assistant = live?.assistants[instanceId];
         releaseUnrecordedClaim =
           live !== undefined &&
           assistant === undefined &&
           retained === undefined &&
           !previousPolicy.config?.enabled &&
-          !(live.pending?.kind === 'application' && live.pending.target === instanceId);
+          live.dns[claim.hostname] === undefined &&
+          !(live.pending?.kind === 'dns' && live.pending.target === claim.hostname) &&
+          !(live.pending && live.pending.target === instanceId);
         if (live && assistant) {
-          await writeArtifactsOperatorConfig(file, {
+          await writeWebOperatorConfig(file, {
             ...live,
             assistants: {
               ...live.assistants,
               [instanceId]: { ...live.assistants[instanceId], enabled: false, publicationReady: false },
             },
           });
-          if (live.tunnelId)
-            await setArtifactsIngress(await artifactsApi(live, dependencies), live, assistant.claim, false);
+          if (live.tunnelId) await setWebIngress(await webApi(live, dependencies), live, assistant.claim, false);
         }
       });
     } catch (_cleanupCause) {
       /* The disabled policy is authoritative; check observes pending ingress cleanup. */
     }
     /* eslint-enable no-catch-all/no-catch-all */
-    if (releaseUnrecordedClaim) await releaseInstanceArtifacts(paths, instanceId, claim);
+    if (releaseUnrecordedClaim) await releaseInstanceWeb(paths, instanceId, claim);
     throw cause;
   }
 }
 
 /** Read-only and bounded: creates, replaces, reconciles, starts and repairs nothing. */
-export async function inspectArtifactsCapability(
+export async function inspectWebCapability(
   paths: ControlPlanePaths,
   instanceId: string,
-  dependencies: ArtifactsCapabilityDependencies & { readonly check?: boolean } = {},
-): Promise<ArtifactsCapabilityObservation> {
+  dependencies: WebCapabilityDependencies & { readonly check?: boolean } = {},
+): Promise<WebCapabilityObservation> {
   const { runtime, policyFile, reservation } = await target(paths, instanceId);
-  const policy = await readArtifactsPolicy(policyFile);
+  const policy = await readWebPolicy(policyFile);
   const coordinates = policy.status === 'unavailable' ? undefined : policy.config;
-  const claim = reservation.exclusive_resource_claims.artifacts;
-  let remote: ArtifactsCapabilityObservation['remote'] = 'not_checked';
-  let listener: ArtifactsCapabilityObservation['listener'] = 'not_checked';
-  let reason: string | null = policy.status === 'unavailable' ? 'Artifacts policy is invalid or inaccessible.' : null;
-  let config: ArtifactsOperatorConfig | undefined;
-  let operator: ArtifactsCapabilityObservation['operator'] = {
+  const claim = reservation.exclusive_resource_claims.web;
+  let remote: WebCapabilityObservation['remote'] = 'not_checked';
+  let listener: WebCapabilityObservation['listener'] = 'not_checked';
+  let reasonCode: string | null = null;
+  let reason: string | null = policy.status === 'unavailable' ? 'Web policy is invalid or inaccessible.' : null;
+  let config: WebOperatorConfig | undefined;
+  let operator: WebCapabilityObservation['operator'] = {
     status: 'missing',
     account_id: null,
     team_name: null,
     zone_id: null,
-    hostname: null,
+    zone_apex: null,
     pending: null,
   };
   try {
-    config = await readArtifactsOperatorConfig(artifactsOperatorFiles(paths).configFile);
+    config = await readWebOperatorConfig(webOperatorFiles(paths).configFile);
     if (config)
       operator = {
         status: 'configured',
         account_id: config.accountId,
         team_name: config.teamName,
         zone_id: config.zoneId,
-        hostname: config.hostname,
+        zone_apex: config.zoneApex,
         pending: config.pending
           ? { kind: config.pending.kind, attempt: config.pending.key, started_at: config.pending.startedAt }
           : null,
@@ -1136,7 +1216,7 @@ export async function inspectArtifactsCapability(
     // eslint-disable-next-line no-catch-all/no-catch-all -- Read-only optional configuration failure remains observable without exposing file contents.
   } catch (_cause) {
     operator = { ...operator, status: 'unavailable' };
-    reason = 'Artifacts operator configuration is invalid or inaccessible.';
+    reason = 'Web operator configuration is invalid or inaccessible.';
   }
   if (dependencies.check) {
     try {
@@ -1150,67 +1230,70 @@ export async function inspectArtifactsCapability(
         !coordinates ||
         config.pending
       )
-        throw new GwsEaError('artifacts_not_provisioned', 'Artifacts have incomplete or unresolved provisioning.');
+        throw new GwsEaError('web_not_provisioned', 'Web have incomplete or unresolved provisioning.');
       if (
         coordinates.hostname !== assistant.claim.hostname ||
-        coordinates.pathPrefix !== assistant.claim.path_prefix ||
         coordinates.listenPort !== assistant.claim.listen_port ||
         coordinates.accessAud !== assistant.aud ||
         coordinates.accessIssuer !== `https://${config.teamName}.cloudflareaccess.com` ||
         coordinates.cloudflare.accountId !== config.accountId ||
         coordinates.cloudflare.applicationId !== assistant.applicationId ||
-        coordinates.cloudflare.operatorConfigFile !== artifactsOperatorFiles(paths).configFile ||
+        coordinates.cloudflare.operatorConfigFile !== webOperatorFiles(paths).configFile ||
         policy.enabled !== assistant.enabled
       )
         throw new GwsEaError(
-          'artifacts_owner_mismatch',
-          'Artifact policy does not match current owned resources and enabled intent.',
+          'web_owner_mismatch',
+          'Web policy does not match current owned resources and enabled intent.',
         );
-      const api = await artifactsApi(config, dependencies);
-      await verifyZone(api, config, assistant.claim.hostname);
+      const api = await webApi(config, dependencies);
+      await verifyCoordinates(api, config, config.zoneApex);
       const account = `/accounts/${config.accountId}`;
       const idp = await api.request('GET', `${account}/access/identity_providers/${config.pin.id}`);
       if (!isRecord(idp) || idp.type !== 'onetimepin')
-        throw new GwsEaError('artifacts_pin_missing', 'The recorded PIN provider is missing.');
-      assertArtifactsApplication(
-        await api.request('GET', `${account}/access/apps/${assistant.applicationId}`),
+        throw new GwsEaError('web_pin_missing', 'The recorded PIN provider is missing.');
+      assertWebApplication(
+        await readOwnedResource(api, `${account}/access/apps/${assistant.applicationId}`),
         assistant,
         config,
       );
       const policies = await api.list(`${account}/access/apps/${assistant.applicationId}/policies`);
       if (policies.length !== 1 || policies[0].id !== assistant.policyId)
-        throw new GwsEaError('artifacts_access_mismatch', 'Unexpected Access policies exist.');
+        throw new GwsEaError('web_access_mismatch', 'Unexpected Access policies exist.');
       const admitted = verifiedPolicyEmails(policies[0]);
-      const admission = await (dependencies.ncl ?? runInstanceNclJson)(runtime, ['gws-ea-artifacts-admission-emails']);
+      const admission = await (dependencies.ncl ?? runInstanceNclJson)(runtime, ['gws-ea-web-admission-emails']);
       if (
         !isRecord(admission) ||
         !Array.isArray(admission.emails) ||
-        !admission.emails.every((email): email is string => typeof email === 'string')
+        !admission.emails.every((email: unknown): email is string => typeof email === 'string')
       )
+        throw new GwsEaError('web_admission_unavailable', 'The host’s current artifact readers could not be observed.');
+      if (JSON.stringify(webEmails(admission.emails)) !== JSON.stringify(admitted))
         throw new GwsEaError(
-          'artifacts_admission_unavailable',
-          'The host’s current artifact readers could not be observed.',
-        );
-      if (JSON.stringify(artifactsEmails(admission.emails)) !== JSON.stringify(admitted))
-        throw new GwsEaError(
-          'artifacts_access_unverified',
+          'web_access_admission_drift',
           'Cloudflare admission does not match the host’s current intended readers.',
         );
       const dns = config.dns[assistant.claim.hostname];
-      if (!dns) throw new GwsEaError('artifacts_dns_missing', 'The owned DNS record is missing.');
+      if (!dns) throw new GwsEaError('web_dns_missing', 'The owned DNS record is missing.');
       assertDns(
-        await api.request('GET', `/zones/${dns.zoneId}/dns_records/${dns.id}`),
+        await readOwnedResource(api, `/zones/${dns.zoneId}/dns_records/${dns.id}`),
         assistant.claim.hostname,
         config.tunnelId,
         dns.id,
       );
-      const tunnel = await api.request('GET', `${account}/cfd_tunnel/${config.tunnelId}`);
-      if (!isRecord(tunnel) || tunnel.id !== config.tunnelId || tunnel.config_src !== 'cloudflare' || tunnel.deleted_at)
-        throw new GwsEaError('artifacts_tunnel_invalid', 'The recorded remotely managed tunnel is unavailable.');
+      const tunnel = await readOwnedResource(api, `${account}/cfd_tunnel/${config.tunnelId}`);
+      if (
+        !isRecord(tunnel) ||
+        typeof tunnel.id !== 'string' ||
+        typeof tunnel.config_src !== 'string' ||
+        (tunnel.deleted_at !== null && typeof tunnel.deleted_at !== 'string')
+      )
+        throw new GwsEaError('web_tunnel_unobserved', 'Cloudflare did not return a verifiable tunnel record.');
+      if (tunnel.id !== config.tunnelId || tunnel.config_src !== 'cloudflare' || tunnel.deleted_at)
+        throw new GwsEaError('web_tunnel_invalid', 'The recorded remotely managed tunnel is unavailable.');
       const configuration = await api.request('GET', `${account}/cfd_tunnel/${config.tunnelId}/configurations`);
       const ingress =
         isRecord(configuration) && isRecord(configuration.config) ? configuration.config.ingress : undefined;
-      const expected = artifactsIngress(assistant.claim);
+      const expected = webIngress(assistant.claim);
       const origin =
         isRecord(configuration) && isRecord(configuration.config) ? configuration.config.originRequest : undefined;
       const expectedRoutes = Array.isArray(ingress)
@@ -1232,14 +1315,14 @@ export async function inspectArtifactsCapability(
               expectedRoutes[0].originRequest.access.required === true)
           : expectedRoutes.length !== 0)
       )
-        throw new GwsEaError('artifacts_tunnel_unverified', 'Artifact ingress does not match current policy.');
+        throw new GwsEaError('web_tunnel_unverified', 'Web ingress does not match current policy.');
       const connections = await api.request('GET', `${account}/cfd_tunnel/${config.tunnelId}/connections`);
       if (
         policy.enabled &&
         (!Array.isArray(connections) ||
-          !connections.some((connection) => isRecord(connection) && connection.is_pending_reconnect !== true))
+          !connections.some((connection: unknown) => isRecord(connection) && connection.is_pending_reconnect !== true))
       )
-        throw new GwsEaError('artifacts_connector_unavailable', 'No active tunnel connection was observed.');
+        throw new GwsEaError('web_connector_unavailable', 'No active tunnel connection was observed.');
       remote = 'verified';
       const health = await hostHealth(runtime, dependencies);
       listener = policy.enabled && availableHealth(health, assistant.claim.listen_port) ? 'listening' : 'unavailable';
@@ -1247,22 +1330,25 @@ export async function inspectArtifactsCapability(
         reason = 'The running host listener is not available at its claimed port.';
       else if (policy.enabled && assistant.publicationReady !== true)
         reason =
-          'Artifact activation has not completed. Rerun gws-ea connectors install artifacts to verify and finish activation.';
+          'Web activation has not completed. Rerun gws-ea connectors install web to verify and finish activation.';
       // eslint-disable-next-line no-catch-all/no-catch-all -- Optional status never exposes raw API, process or credential failures.
     } catch (cause) {
+      reasonCode = cause instanceof GwsEaError ? cause.code : 'web_host_unavailable';
       remote =
         cause instanceof GwsEaError &&
         (cause.details?.status === 404 ||
           [
-            'artifacts_owner_mismatch',
-            'artifacts_zone_invalid',
-            'artifacts_pin_missing',
-            'artifacts_access_mismatch',
-            'artifacts_access_unverified',
-            'artifacts_dns_missing',
-            'artifacts_dns_mismatch',
-            'artifacts_tunnel_invalid',
-            'artifacts_tunnel_unverified',
+            'web_owned_resource_missing',
+            'web_owner_mismatch',
+            'web_zone_invalid',
+            'web_pin_missing',
+            'web_application_mismatch',
+            'web_access_mismatch',
+            'web_access_admission_drift',
+            'web_dns_missing',
+            'web_dns_mismatch',
+            'web_tunnel_invalid',
+            'web_tunnel_unverified',
           ].includes(cause.code))
           ? 'mismatch'
           : 'unavailable';
@@ -1270,16 +1356,16 @@ export async function inspectArtifactsCapability(
       reason =
         cause instanceof GwsEaError
           ? cause.message
-          : 'Artifact prerequisites could not be observed. Check the owner-only configuration and running host.';
+          : 'Web prerequisites could not be observed. Check the owner-only configuration and running host.';
     }
   }
   return {
-    ...ARTIFACTS_CAPABILITY,
+    ...WEB_CAPABILITY,
     instance_id: instanceId,
     observed_at: new Date().toISOString(),
     activation: policy.status === 'unavailable' ? 'unavailable' : policy.enabled ? 'enabled' : 'disabled',
-    hostname: coordinates?.hostname ?? claim?.hostname ?? null,
-    path_prefix: coordinates?.pathPrefix ?? claim?.path_prefix ?? null,
+    // A policy closed by uninstall keeps its old hostname; only the registry claim still owns an address.
+    hostname: claim?.hostname ?? (policy.enabled ? coordinates?.hostname : undefined) ?? null,
     policy_file: policyFile,
     remote,
     listener,
@@ -1289,6 +1375,7 @@ export async function inspectArtifactsCapability(
       listener === 'listening' &&
       config?.assistants[instanceId]?.publicationReady === true,
     reason,
+    reason_code: reasonCode,
     operator,
   };
 }

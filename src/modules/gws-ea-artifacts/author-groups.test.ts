@@ -20,15 +20,14 @@ it('observes only canonical main and explicitly selected live eligible authors, 
   const policy = {
     schemaVersion: 1,
     enabled: true,
-    hostname: 'views.example.com',
-    pathPrefix: '/aya',
+    hostname: 'aya.example.com',
     listenPort: 32123,
     accessIssuer: 'https://team.cloudflareaccess.com',
     accessAud: 'aud',
     cloudflare: { accountId: 'account', applicationId: 'app', operatorConfigFile: path.join(root, 'config.json') },
   };
   await writeFile(file, JSON.stringify(policy), { mode: 0o600 });
-  vi.stubEnv('GWS_EA_ARTIFACTS_POLICY_FILE', file);
+  vi.stubEnv('GWS_EA_WEB_POLICY_FILE', file);
   await runMigrations(await initTestDb());
   const now = new Date().toISOString();
   for (const id of ['canonical', 'writer', 'retired', 'sealed', 'unselected', 'all']) {

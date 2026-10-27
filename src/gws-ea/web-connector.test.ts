@@ -4,31 +4,34 @@ import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { claimInstanceArtifacts, getInstanceReservation, releaseInstanceArtifacts } from './registry.js';
+import { claimInstanceWeb, getInstanceReservation, releaseInstanceWeb } from './registry.js';
 import { deriveGcpClaims } from './gcp-identity.js';
 import { reserveInstance, withInstanceOperation } from './journal.js';
 import { resolveControlPlanePaths, type ControlPlanePaths } from './paths.js';
+import { inspectConnector } from './connector-inspection.js';
+import { managedResult } from './result.js';
+import { expectResultContract } from './testing/result-contract.js';
 import { GwsEaError } from './types.js';
 import { persistTestRuntime } from './testing/runtime-fixture.js';
 import {
-  installArtifactsConnector,
-  provisionAssistantArtifacts,
-  artifactsReleaseCompatibility,
-  type ArtifactsCapabilityOptions,
-  type ArtifactsCapabilityDependencies,
-  inspectArtifactsCapability,
-  instanceArtifactsPolicyFile,
-} from './artifacts-connector.js';
+  installWebConnector,
+  provisionAssistantWeb,
+  webReleaseCompatibility,
+  type WebCapabilityOptions,
+  type WebCapabilityDependencies,
+  inspectWebCapability,
+  instanceWebPolicyFile,
+} from './web-connector.js';
 import {
-  artifactsOperatorFiles,
-  readArtifactsOperatorConfig,
-  reconcileArtifactsAccessEmails,
-  writeArtifactsOperatorConfig,
-  type ArtifactsOperatorConfig,
-} from './artifacts-cloudflare.js';
+  webOperatorFiles,
+  readWebOperatorConfig,
+  reconcileWebAccessEmails,
+  writeWebOperatorConfig,
+  type WebOperatorConfig,
+} from './web-cloudflare.js';
 import { isRecord } from './validation.js';
-import { readArtifactsPolicy } from '../modules/gws-ea-artifacts/policy.js';
-import { uninstallArtifactsConnector, withArtifactsHostLock } from './artifacts-uninstall.js';
+import { readWebPolicy } from '../modules/gws-ea-web/policy.js';
+import { uninstallWebConnector, withWebHostLock } from './web-uninstall.js';
 
 const roots: string[] = [];
 afterEach(async () => {
@@ -37,7 +40,7 @@ afterEach(async () => {
 });
 
 async function fixture() {
-  const root = await realpath(await mkdtemp(path.join(os.tmpdir(), 'artifacts-capability-')));
+  const root = await realpath(await mkdtemp(path.join(os.tmpdir(), 'web-capability-')));
   roots.push(root);
   const paths = resolveControlPlanePaths({
     configRoot: path.join(root, 'config'),
@@ -59,9 +62,9 @@ async function fixture() {
       },
     });
     const runtime = await persistTestRuntime(paths, reservation);
-    const marker = path.join(runtime.checkout_root, 'src/gws-ea/artifacts-compatibility.json');
+    const marker = path.join(runtime.checkout_root, 'src/gws-ea/web-compatibility.json');
     await mkdir(path.dirname(marker), { recursive: true });
-    await writeFile(marker, JSON.stringify({ schemaVersion: 1, contract: 'gws-ea-artifacts-1' }));
+    await writeFile(marker, JSON.stringify({ schemaVersion: 1, contract: 'gws-ea-web-1' }));
     return { instanceId, runtime };
   }
   return { root, paths, assistant };
@@ -70,18 +73,18 @@ async function fixture() {
 async function provisionForAssistant(
   paths: ControlPlanePaths,
   instanceId: string,
-  options: ArtifactsCapabilityOptions = {},
-  dependencies: ArtifactsCapabilityDependencies = {},
+  options: WebCapabilityOptions = {},
+  dependencies: WebCapabilityDependencies = {},
 ) {
-  const installed = await installArtifactsConnector(paths, options, dependencies);
+  const installed = await installWebConnector(paths, options, dependencies);
   const assistant = installed.assistants.find((entry) => entry.instance_id === instanceId);
   if (assistant?.outcome !== 'ready')
-    throw new GwsEaError(assistant?.reason ?? 'artifacts_not_ready', assistant?.message ?? 'Artifacts are not ready.');
-  const observed = await inspectArtifactsCapability(paths, instanceId);
-  return { ...assistant, enabled: true, hostname: observed.hostname, path_prefix: observed.path_prefix };
+    throw new GwsEaError(assistant?.reason ?? 'web_not_ready', assistant?.message ?? 'Web are not ready.');
+  const observed = await inspectWebCapability(paths, instanceId);
+  return { ...assistant, enabled: true, hostname: observed.hostname };
 }
 
-function cloudflareFixture() {
+function cloudflareFixture(zoneApex = 'example.test') {
   const requests: { method: string; resource: string; body: Record<string, unknown> | undefined }[] = [];
   const idps: Record<string, unknown>[] = [];
   const apps: Record<string, unknown>[] = [];
@@ -107,7 +110,7 @@ function cloudflareFixture() {
     if (resource === '/zones/zone' || resource === '/zones/dedicated-zone')
       return reply({
         id: resource.endsWith('/zone') ? 'zone' : 'dedicated-zone',
-        name: resource.endsWith('/zone') ? 'example.test' : 'other.test',
+        name: resource.endsWith('/zone') ? zoneApex : 'other.test',
         status: 'active',
         account: { id: 'account' },
       });
@@ -209,28 +212,29 @@ function cloudflareFixture() {
   };
 }
 
-async function provisionFixture() {
+async function provisionFixture(zoneApex = 'example.test') {
   const f = await fixture();
   const a = await f.assistant('a@example.test', 31000);
-  const claim = { hostname: 'views.example.test', path_prefix: '/avery', listen_port: 41000 };
-  await claimInstanceArtifacts(f.paths, a.instanceId, claim);
-  const files = artifactsOperatorFiles(f.paths);
+  const claim = { hostname: 'views.example.test', listen_port: 41000 };
+  await claimInstanceWeb(f.paths, a.instanceId, claim);
+  const files = webOperatorFiles(f.paths);
   await mkdir(files.root, { recursive: true, mode: 0o700 });
-  const config: ArtifactsOperatorConfig = {
+  const config: WebOperatorConfig = {
     schemaVersion: 1,
     accountId: 'account',
     zoneId: 'zone',
     teamName: 'team',
-    hostname: 'views.example.test',
+    zoneApex,
     credentialFile: path.join(files.root, 'management-token'),
     cloudflaredPath: '/usr/local/bin/cloudflared',
     dns: {},
     assistants: {},
   };
   await writeFile(config.credentialFile, 'secret-management-fixture', { mode: 0o600 });
-  await writeArtifactsOperatorConfig(files.configFile, config);
-  const api = cloudflareFixture();
+  await writeWebOperatorConfig(files.configFile, config);
+  const api = cloudflareFixture(zoneApex);
   let emails = ['principal@example.test', 'second@example.test'];
+  let firstName = 'Avery';
   const commands: string[][] = [];
   const restarts: string[][] = [];
   const dependencies = {
@@ -238,15 +242,15 @@ async function provisionFixture() {
     sleep: async () => {},
     ncl: async (runtime: typeof a.runtime, args: readonly string[]): Promise<unknown> => {
       if (args[0] === 'gws-ea-profile-get')
-        return { assistant_first_name: 'Avery', principal_emails: ['principal@example.test', 'second@example.test'] };
-      if (args[0] === 'gws-ea-artifacts-admission-emails') return { emails };
+        return { assistant_first_name: firstName, principal_emails: ['principal@example.test', 'second@example.test'] };
+      if (args[0] === 'gws-ea-web-admission-emails') return { emails };
       if (args[0] === 'gws-ea-artifacts-author-groups') return { group_ids: ['canonical', 'selected-author'] };
       if (args[0] === 'groups' && args[1] === 'restart') {
         restarts.push([...args]);
         return { restarted: 0 };
       }
-      if (args[0] === 'gws-ea-artifacts-health') {
-        const policy = await readArtifactsPolicy(instanceArtifactsPolicyFile(runtime));
+      if (args[0] === 'gws-ea-web-health') {
+        const policy = await readWebPolicy(instanceWebPolicyFile(runtime));
         return {
           policyVersions: [1],
           enabled: policy.enabled,
@@ -276,18 +280,21 @@ async function provisionFixture() {
     dependencies,
     commands,
     restarts,
+    firstName: (name: string) => {
+      firstName = name;
+    },
     emails: (next: string[]) => {
       emails = next;
     },
   };
 }
 
-describe('artifacts operator capability', () => {
+describe('web operator capability', () => {
   it('reuses an explicitly typed operator PIN without claiming ownership', async () => {
     const f = await provisionFixture();
     f.api.idps.push({ id: 'operator-pin', type: 'onetimepin' });
     await provisionForAssistant(f.paths, f.a.instanceId, {}, f.dependencies);
-    expect((await readArtifactsOperatorConfig(f.files.configFile))?.pin).toEqual({ id: 'operator-pin', owned: false });
+    expect((await readWebOperatorConfig(f.files.configFile))?.pin).toEqual({ id: 'operator-pin', owned: false });
     expect(
       f.api.requests.some((request) => request.method === 'POST' && request.resource.endsWith('/identity_providers')),
     ).toBe(false);
@@ -295,11 +302,11 @@ describe('artifacts operator capability', () => {
 
   it('observes local artifact state without remote requests or repair', async () => {
     const f = await provisionFixture();
-    const result = await inspectArtifactsCapability(f.paths, f.a.instanceId, f.dependencies);
+    const result = await inspectWebCapability(f.paths, f.a.instanceId, f.dependencies);
     expect(result).toMatchObject({
       activation: 'disabled',
       ready: false,
-      operator: { status: 'configured', hostname: 'views.example.test' },
+      operator: { status: 'configured', zone_apex: 'example.test' },
     });
     expect(f.api.requests).toEqual([]);
     expect(JSON.stringify(result)).not.toContain('secret-');
@@ -307,22 +314,21 @@ describe('artifacts operator capability', () => {
   it('serializes two assistants against one tunnel without losing either route', async () => {
     const f = await provisionFixture();
     const b = await f.assistant('b@example.test', 31002);
-    await claimInstanceArtifacts(f.paths, b.instanceId, {
-      hostname: 'views.example.test',
-      path_prefix: '/milo',
+    await claimInstanceWeb(f.paths, b.instanceId, {
+      hostname: 'milo.example.test',
       listen_port: 41001,
     });
-    const installed = await installArtifactsConnector(f.paths, {}, f.dependencies);
+    const installed = await installWebConnector(f.paths, {}, f.dependencies);
     expect(installed.assistants.every((entry) => entry.outcome === 'ready')).toBe(true);
     const routes = f.api.ingress();
     expect(routes).toContainEqual({
       hostname: 'views.example.test',
-      path: '^/avery(/|$)',
+      path: '^/artifacts(/|$)',
       service: 'http://127.0.0.1:41000',
     });
     expect(routes).toContainEqual({
-      hostname: 'views.example.test',
-      path: '^/milo(/|$)',
+      hostname: 'milo.example.test',
+      path: '^/artifacts(/|$)',
       service: 'http://127.0.0.1:41001',
     });
     expect(routes).toContainEqual({ hostname: 'unrelated.example.test', service: 'http://127.0.0.1:9876' });
@@ -331,29 +337,8 @@ describe('artifacts operator capability', () => {
     expect(
       f.api.requests.filter((request) => request.method === 'POST' && request.resource.endsWith('/cfd_tunnel')),
     ).toHaveLength(1);
-    expect(f.api.dns).toHaveLength(1);
-    expect(f.api.ingress().some((route) => route.path === '^/milo(/|$)')).toBe(true);
-  });
-
-  it('uses a dedicated hostname root in another active zone of the same account', async () => {
-    const f = await provisionFixture();
-    const b = await f.assistant('b@example.test', 31002);
-    await claimInstanceArtifacts(f.paths, b.instanceId, {
-      hostname: 'avery.other.test',
-      path_prefix: '',
-      listen_port: 41001,
-    });
-    const result = await provisionForAssistant(f.paths, b.instanceId, {}, f.dependencies);
-    expect(result).toMatchObject({ hostname: 'avery.other.test', path_prefix: '', enabled: true });
-    const applicationId = (await readArtifactsOperatorConfig(f.files.configFile))?.assistants[b.instanceId]
-      ?.applicationId;
-    expect(f.api.apps.find((app) => app.id === applicationId)?.destinations).toEqual([
-      { type: 'public', uri: 'avery.other.test', overrides: [{ behavior: 'public', path_pattern: '/public/*' }] },
-    ]);
-    expect(f.api.ingress()).toContainEqual({ hostname: 'avery.other.test', service: 'http://127.0.0.1:41001' });
-    expect((await readArtifactsOperatorConfig(f.files.configFile))?.dns['avery.other.test'].zoneId).toBe(
-      'dedicated-zone',
-    );
+    expect(f.api.dns).toHaveLength(2);
+    expect(f.api.ingress().some((route) => route.hostname === 'milo.example.test')).toBe(true);
   });
 
   it('refreshes eligible authors only during first activation and verifies a ready assistant without restarting', async () => {
@@ -363,12 +348,65 @@ describe('artifacts operator capability', () => {
       ['groups', 'restart', '--id', 'canonical'],
       ['groups', 'restart', '--id', 'selected-author'],
     ]);
-    const before = await readFile(instanceArtifactsPolicyFile(f.a.runtime), 'utf8');
+    const before = await readFile(instanceWebPolicyFile(f.a.runtime), 'utf8');
     const repeated = await provisionForAssistant(f.paths, f.a.instanceId, {}, f.dependencies);
     expect(repeated.changed).toBe(false);
     expect(f.restarts).toHaveLength(2);
-    expect(await readFile(instanceArtifactsPolicyFile(f.a.runtime), 'utf8')).toBe(before);
+    expect(await readFile(instanceWebPolicyFile(f.a.runtime), 'utf8')).toBe(before);
   });
+
+  it.each([undefined, false] as const)(
+    'refreshes authors before completing interrupted activation with publicationReady=%s',
+    async (publicationReady) => {
+      const f = await provisionFixture();
+      await provisionForAssistant(f.paths, f.a.instanceId, {}, f.dependencies);
+      const config = await readWebOperatorConfig(f.files.configFile);
+      if (!config) throw new Error('Missing fixture ownership');
+      const { publicationReady: _completed, ...assistant } = config.assistants[f.a.instanceId];
+      await writeWebOperatorConfig(f.files.configFile, {
+        ...config,
+        assistants: {
+          ...config.assistants,
+          [f.a.instanceId]: { ...assistant, ...(publicationReady === undefined ? {} : { publicationReady }) },
+        },
+      });
+      const policyFile = instanceWebPolicyFile(f.a.runtime);
+      const enabledPolicy = await readFile(policyFile, 'utf8');
+      f.restarts.length = 0;
+      const refreshStates: { publicationReady: boolean; enabled: boolean }[] = [];
+      await provisionForAssistant(
+        f.paths,
+        f.a.instanceId,
+        {},
+        {
+          ...f.dependencies,
+          ncl: async (runtime, args) => {
+            if (args[0] === 'groups' && args[1] === 'restart') {
+              refreshStates.push({
+                publicationReady:
+                  (await readWebOperatorConfig(f.files.configFile))?.assistants[f.a.instanceId]?.publicationReady ===
+                  true,
+                enabled: (await readWebPolicy(policyFile)).enabled,
+              });
+            }
+            return f.dependencies.ncl(runtime, args);
+          },
+        },
+      );
+      expect(f.restarts).toEqual([
+        ['groups', 'restart', '--id', 'canonical'],
+        ['groups', 'restart', '--id', 'selected-author'],
+      ]);
+      expect(refreshStates).toEqual([
+        { publicationReady: false, enabled: true },
+        { publicationReady: false, enabled: true },
+      ]);
+      expect((await readWebOperatorConfig(f.files.configFile))?.assistants[f.a.instanceId]?.publicationReady).toBe(
+        true,
+      );
+      expect(await readFile(policyFile, 'utf8')).toBe(enabledPolicy);
+    },
+  );
 
   it('waits for delayed local listener readiness before exposing ingress', async () => {
     const f = await provisionFixture();
@@ -380,10 +418,10 @@ describe('artifacts operator capability', () => {
         waits.push(milliseconds);
       },
       ncl: async (runtime: typeof f.a.runtime, args: readonly string[]) => {
-        const policy = await readArtifactsPolicy(instanceArtifactsPolicyFile(runtime));
-        if (args[0] === 'gws-ea-artifacts-health' && policy.enabled) {
+        const policy = await readWebPolicy(instanceWebPolicyFile(runtime));
+        if (args[0] === 'gws-ea-web-health' && policy.enabled) {
           expect(
-            (await readArtifactsOperatorConfig(f.files.configFile))?.assistants[f.a.instanceId]?.publicationReady,
+            (await readWebOperatorConfig(f.files.configFile))?.assistants[f.a.instanceId]?.publicationReady,
           ).not.toBe(true);
           observations++;
           if (observations <= 4)
@@ -397,9 +435,7 @@ describe('artifacts operator capability', () => {
     expect(await provisionForAssistant(f.paths, f.a.instanceId, {}, dependencies)).toMatchObject({ enabled: true });
     expect(observations).toBeGreaterThanOrEqual(4);
     expect(waits).toEqual([500, 500, 500]);
-    expect((await readArtifactsOperatorConfig(f.files.configFile))?.assistants[f.a.instanceId]?.publicationReady).toBe(
-      true,
-    );
+    expect((await readWebOperatorConfig(f.files.configFile))?.assistants[f.a.instanceId]?.publicationReady).toBe(true);
   });
 
   it('never admits publication when ingress opens but final connector verification fails', async () => {
@@ -410,7 +446,7 @@ describe('artifacts operator capability', () => {
         if (String(input).endsWith('/connections')) {
           expect(f.api.ingress().some((route) => route.hostname === 'views.example.test')).toBe(true);
           expect(
-            (await readArtifactsOperatorConfig(f.files.configFile))?.assistants[f.a.instanceId]?.publicationReady,
+            (await readWebOperatorConfig(f.files.configFile))?.assistants[f.a.instanceId]?.publicationReady,
           ).not.toBe(true);
           throw new Error('Fixture connector verification failed');
         }
@@ -418,10 +454,10 @@ describe('artifacts operator capability', () => {
       }) satisfies typeof fetch,
     };
     await expect(provisionForAssistant(f.paths, f.a.instanceId, {}, dependencies)).rejects.toMatchObject({
-      code: 'artifacts_not_ready',
+      code: 'web_not_ready',
     });
-    expect((await readArtifactsPolicy(instanceArtifactsPolicyFile(f.a.runtime))).enabled).toBe(false);
-    expect((await readArtifactsOperatorConfig(f.files.configFile))?.assistants[f.a.instanceId]).toMatchObject({
+    expect((await readWebPolicy(instanceWebPolicyFile(f.a.runtime))).enabled).toBe(false);
+    expect((await readWebOperatorConfig(f.files.configFile))?.assistants[f.a.instanceId]).toMatchObject({
       enabled: false,
       publicationReady: false,
     });
@@ -439,14 +475,14 @@ describe('artifacts operator capability', () => {
         now += milliseconds;
       },
       ncl: async (runtime: typeof f.a.runtime, args: readonly string[]) =>
-        args[0] === 'gws-ea-artifacts-health'
+        args[0] === 'gws-ea-web-health'
           ? { policyVersions: [1], enabled: false, availability: 'unavailable', listener: { state: 'stopped' } }
           : f.dependencies.ncl(runtime, args),
     };
     await expect(provisionForAssistant(f.paths, f.a.instanceId, {}, dependencies)).rejects.toMatchObject({
-      code: 'artifacts_listener_unavailable',
+      code: 'web_listener_unavailable',
     });
-    expect((await readArtifactsPolicy(instanceArtifactsPolicyFile(f.a.runtime))).enabled).toBe(false);
+    expect((await readWebPolicy(instanceWebPolicyFile(f.a.runtime))).enabled).toBe(false);
     expect(f.api.ingress().some((route) => route.hostname === 'views.example.test')).toBe(false);
     expect(f.commands.some((args) => args[0] === 'bootstrap')).toBe(false);
     expect(now - started).toBe(30_000);
@@ -456,20 +492,20 @@ describe('artifacts operator capability', () => {
     const f = await provisionFixture();
     f.api.lose('dns');
     await expect(provisionForAssistant(f.paths, f.a.instanceId, {}, f.dependencies)).rejects.toMatchObject({
-      code: 'artifacts_cloudflare_unavailable',
+      code: 'web_cloudflare_unavailable',
     });
-    expect((await readArtifactsOperatorConfig(f.files.configFile))?.pending).toMatchObject({
+    expect((await readWebOperatorConfig(f.files.configFile))?.pending).toMatchObject({
       kind: 'dns',
       target: 'views.example.test',
     });
     await expect(provisionForAssistant(f.paths, f.a.instanceId, {}, f.dependencies)).rejects.toMatchObject({
-      code: 'artifacts_create_unproven',
+      code: 'web_create_unproven',
     });
     expect(f.api.dns).toHaveLength(1);
-    const pending = (await readArtifactsOperatorConfig(f.files.configFile))?.pending;
+    const pending = (await readWebOperatorConfig(f.files.configFile))?.pending;
     await expect(
       provisionForAssistant(f.paths, f.a.instanceId, { discardUnproven: pending?.key }, f.dependencies),
-    ).rejects.toMatchObject({ code: 'artifacts_dns_conflict' });
+    ).rejects.toMatchObject({ code: 'web_dns_conflict' });
     expect(f.api.dns).toHaveLength(1);
   });
 
@@ -477,7 +513,7 @@ describe('artifacts operator capability', () => {
     const f = await provisionFixture();
     await rm(f.files.configFile);
     await expect(provisionForAssistant(f.paths, f.a.instanceId, {}, f.dependencies)).rejects.toMatchObject({
-      code: 'artifacts_operator_required',
+      code: 'web_operator_required',
     });
     expect(f.api.requests).toEqual([]);
   });
@@ -486,9 +522,9 @@ describe('artifacts operator capability', () => {
     const f = await provisionFixture();
     f.api.reject(403);
     await expect(provisionForAssistant(f.paths, f.a.instanceId, {}, f.dependencies)).rejects.toMatchObject({
-      code: 'artifacts_cloudflare_forbidden',
+      code: 'web_cloudflare_forbidden',
     });
-    expect((await readArtifactsPolicy(instanceArtifactsPolicyFile(f.a.runtime))).enabled).toBe(false);
+    expect((await readWebPolicy(instanceWebPolicyFile(f.a.runtime))).enabled).toBe(false);
     f.api.reject(undefined);
     for (let index = 0; index < 500; index++)
       f.api.apps.push({
@@ -497,7 +533,7 @@ describe('artifacts operator capability', () => {
         destinations: [{ type: 'public', uri: `foreign-${index}.example.test` }],
       });
     await expect(provisionForAssistant(f.paths, f.a.instanceId, {}, f.dependencies)).rejects.toMatchObject({
-      code: 'artifacts_cloudflare_capacity',
+      code: 'web_cloudflare_capacity',
     });
     expect(f.api.apps).toHaveLength(500);
   });
@@ -510,7 +546,7 @@ describe('artifacts operator capability', () => {
       destinations: [{ type: 'public', uri: 'views.example.test' }],
     });
     await expect(provisionForAssistant(f.paths, f.a.instanceId, {}, f.dependencies)).rejects.toMatchObject({
-      code: 'artifacts_access_conflict',
+      code: 'web_hostname_foreign',
     });
     expect(f.api.apps).toEqual([
       { id: 'foreign', type: 'self_hosted', destinations: [{ type: 'public', uri: 'views.example.test' }] },
@@ -528,8 +564,8 @@ describe('artifacts operator capability', () => {
       destinations: [
         {
           type: 'public',
-          uri: 'views.example.test/avery',
-          overrides: [{ behavior: 'public', path_pattern: '/avery/public/*' }],
+          uri: 'views.example.test/artifacts',
+          overrides: [{ behavior: 'public', path_pattern: '/artifacts/public/*' }],
         },
       ],
       allowed_idps: [f.api.idps[0].id],
@@ -542,12 +578,12 @@ describe('artifacts operator capability', () => {
     ]);
     expect(f.api.ingress()).toEqual([
       { hostname: 'unrelated.example.test', service: 'http://127.0.0.1:9876' },
-      { hostname: 'views.example.test', path: '^/avery(/|$)', service: 'http://127.0.0.1:41000' },
+      { hostname: 'views.example.test', path: '^/artifacts(/|$)', service: 'http://127.0.0.1:41000' },
       { service: 'http_status:404' },
     ]);
-    const policy = await readArtifactsPolicy(instanceArtifactsPolicyFile(f.a.runtime));
+    const policy = await readWebPolicy(instanceWebPolicyFile(f.a.runtime));
     expect(policy).toMatchObject({ enabled: true, config: { accessAud: app.aud } });
-    const owned = await readArtifactsOperatorConfig(f.files.configFile);
+    const owned = await readWebOperatorConfig(f.files.configFile);
     expect(owned).toMatchObject({
       pin: { owned: true },
       tunnelId: 'tunnel',
@@ -557,7 +593,7 @@ describe('artifacts operator capability', () => {
     expect(await readFile(f.files.tokenFile, 'utf8')).toBe('secret-run-fixture');
     expect(JSON.stringify(f.commands)).not.toContain('secret-run-fixture');
     expect(
-      JSON.stringify(await inspectArtifactsCapability(f.paths, f.a.instanceId, { ...f.dependencies, check: true })),
+      JSON.stringify(await inspectWebCapability(f.paths, f.a.instanceId, { ...f.dependencies, check: true })),
     ).not.toContain('secret-');
     const appCreate = f.api.requests.findIndex(
       (request) => request.method === 'POST' && request.resource.endsWith('/apps'),
@@ -571,27 +607,27 @@ describe('artifacts operator capability', () => {
 
   it('retains an ambiguous create and only resumes after exact operator acknowledgment', async () => {
     const f = await provisionFixture();
-    const claim = (await getInstanceReservation(f.paths, f.a.instanceId)).exclusive_resource_claims.artifacts;
+    const claim = (await getInstanceReservation(f.paths, f.a.instanceId)).exclusive_resource_claims.web;
     if (!claim) throw new Error('Fixture namespace is missing');
-    await releaseInstanceArtifacts(f.paths, f.a.instanceId, claim);
+    await releaseInstanceWeb(f.paths, f.a.instanceId, claim);
     f.api.lose('application');
     await expect(provisionForAssistant(f.paths, f.a.instanceId, {}, f.dependencies)).rejects.toMatchObject({
-      code: 'artifacts_cloudflare_unavailable',
+      code: 'web_cloudflare_unavailable',
     });
-    const pending = (await readArtifactsOperatorConfig(f.files.configFile))?.pending;
+    const pending = (await readWebOperatorConfig(f.files.configFile))?.pending;
     expect(pending?.kind).toBe('application');
-    expect((await getInstanceReservation(f.paths, f.a.instanceId)).exclusive_resource_claims.artifacts).toBeDefined();
+    expect((await getInstanceReservation(f.paths, f.a.instanceId)).exclusive_resource_claims.web).toBeDefined();
     await expect(provisionForAssistant(f.paths, f.a.instanceId, {}, f.dependencies)).rejects.toMatchObject({
-      code: 'artifacts_create_unproven',
+      code: 'web_create_unproven',
     });
     expect(f.api.apps).toHaveLength(1);
     await expect(
       provisionForAssistant(f.paths, f.a.instanceId, { discardUnproven: 'wrong' }, f.dependencies),
-    ).rejects.toMatchObject({ code: 'artifacts_attempt_mismatch' });
+    ).rejects.toMatchObject({ code: 'web_attempt_mismatch' });
     f.api.apps.splice(0); // The operator removed the unproven application before acknowledging it.
     await provisionForAssistant(f.paths, f.a.instanceId, { discardUnproven: pending?.key }, f.dependencies);
     expect(f.api.apps).toHaveLength(1);
-    expect((await readArtifactsOperatorConfig(f.files.configFile))?.resolvedAttempts).toEqual([
+    expect((await readWebOperatorConfig(f.files.configFile))?.resolvedAttempts).toEqual([
       expect.objectContaining({ kind: 'application', resolution: 'operator_removed', key: pending?.key }),
     ]);
   });
@@ -600,9 +636,9 @@ describe('artifacts operator capability', () => {
     const f = await provisionFixture();
     f.api.lose('put');
     await expect(provisionForAssistant(f.paths, f.a.instanceId, {}, f.dependencies)).rejects.toMatchObject({
-      code: 'artifacts_cloudflare_unavailable',
+      code: 'web_cloudflare_unavailable',
     });
-    expect((await readArtifactsPolicy(instanceArtifactsPolicyFile(f.a.runtime))).enabled).toBe(false);
+    expect((await readWebPolicy(instanceWebPolicyFile(f.a.runtime))).enabled).toBe(false);
     await provisionForAssistant(f.paths, f.a.instanceId, {}, f.dependencies);
     expect(f.api.apps).toHaveLength(1);
     expect(f.api.dns).toHaveLength(1);
@@ -615,13 +651,14 @@ describe('artifacts operator capability', () => {
     const before = await readFile(f.files.configFile, 'utf8');
     f.api.idps.splice(0);
     const start = f.api.requests.length;
-    expect(await inspectArtifactsCapability(f.paths, f.a.instanceId, { ...f.dependencies, check: true })).toMatchObject(
-      { ready: false, remote: 'mismatch' },
-    );
+    expect(await inspectWebCapability(f.paths, f.a.instanceId, { ...f.dependencies, check: true })).toMatchObject({
+      ready: false,
+      remote: 'mismatch',
+    });
     expect(f.api.requests.slice(start).every((request) => request.method === 'GET')).toBe(true);
     expect(await readFile(f.files.configFile, 'utf8')).toBe(before);
     f.api.reject(403);
-    const shown = await inspectArtifactsCapability(f.paths, f.a.instanceId, { ...f.dependencies, check: true });
+    const shown = await inspectWebCapability(f.paths, f.a.instanceId, { ...f.dependencies, check: true });
     expect(JSON.stringify(shown)).not.toContain('secret-management-fixture');
     expect(shown.reason).toContain('permissions');
   });
@@ -629,7 +666,7 @@ describe('artifacts operator capability', () => {
   it('read-verifies exact email changes, reuses existing admission and revokes sessions after reduction', async () => {
     const f = await provisionFixture();
     await provisionForAssistant(f.paths, f.a.instanceId, {}, f.dependencies);
-    const config = await readArtifactsOperatorConfig(f.files.configFile);
+    const config = await readWebOperatorConfig(f.files.configFile);
     const applicationId = config!.assistants[f.a.instanceId].applicationId!;
     const input = {
       operatorConfigFile: f.files.configFile,
@@ -637,13 +674,13 @@ describe('artifacts operator capability', () => {
       applicationId,
       emails: async () => ['principal@example.test', 'guest@example.test'],
     };
-    const first = await reconcileArtifactsAccessEmails(input, f.dependencies);
+    const first = await reconcileWebAccessEmails(input, f.dependencies);
     expect(first).toEqual({ verified: true, changed: true, emails: ['guest@example.test', 'principal@example.test'] });
     expect(
       f.api.requests.some((request) => request.method === 'POST' && request.resource.endsWith('/revoke_tokens')),
     ).toBe(true);
     const start = f.api.requests.length;
-    expect(await reconcileArtifactsAccessEmails(input, f.dependencies)).toMatchObject({ changed: false });
+    expect(await reconcileWebAccessEmails(input, f.dependencies)).toMatchObject({ changed: false });
     expect(f.api.requests.slice(start).every((request) => request.method === 'GET')).toBe(true);
   });
   it('serializes first-name claims and preserves the winner across rename', async () => {
@@ -651,35 +688,32 @@ describe('artifacts operator capability', () => {
     const a = await f.assistant('a@example.test', 31000);
     const b = await f.assistant('b@example.test', 31002);
     const results = await Promise.allSettled([
-      claimInstanceArtifacts(f.paths, a.instanceId, {
+      claimInstanceWeb(f.paths, a.instanceId, {
         hostname: 'views.example.test',
-        path_prefix: '/avery',
         listen_port: 41000,
       }),
-      claimInstanceArtifacts(f.paths, b.instanceId, {
+      claimInstanceWeb(f.paths, b.instanceId, {
         hostname: 'views.example.test',
-        path_prefix: '/avery',
         listen_port: 41001,
       }),
     ]);
     expect(results.filter((result) => result.status === 'fulfilled')).toHaveLength(1);
     const winner = results[0].status === 'fulfilled' ? a : b;
     await expect(
-      claimInstanceArtifacts(f.paths, winner.instanceId, {
-        hostname: 'views.example.test',
-        path_prefix: '/renamed',
+      claimInstanceWeb(f.paths, winner.instanceId, {
+        hostname: 'renamed.example.test',
         listen_port: 41000,
       }),
     ).rejects.toMatchObject({ code: 'claim_conflict' });
-    expect(
-      (await getInstanceReservation(f.paths, winner.instanceId)).exclusive_resource_claims.artifacts?.path_prefix,
-    ).toBe('/avery');
+    expect((await getInstanceReservation(f.paths, winner.instanceId)).exclusive_resource_claims.web?.hostname).toBe(
+      'views.example.test',
+    );
   });
 
   it('shows a stopped origin policy without changing its owner-only file', async () => {
     const f = await fixture();
     const a = await f.assistant('a@example.test', 31000);
-    const policyFile = instanceArtifactsPolicyFile(a.runtime);
+    const policyFile = instanceWebPolicyFile(a.runtime);
     await mkdir(path.dirname(policyFile), { recursive: true, mode: 0o700 });
     await writeFile(
       policyFile,
@@ -687,24 +721,23 @@ describe('artifacts operator capability', () => {
         schemaVersion: 1,
         enabled: true,
         hostname: 'views.example.test',
-        pathPrefix: '/avery',
         listenPort: 41000,
         accessIssuer: 'https://example.cloudflareaccess.com',
         accessAud: 'aud',
         cloudflare: {
           accountId: 'account',
           applicationId: 'app',
-          operatorConfigFile: path.join(f.paths.configRoot, 'artifacts', 'config.json'),
+          operatorConfigFile: path.join(f.paths.configRoot, 'web', 'config.json'),
         },
       }),
       { mode: 0o600 },
     );
-    const policy = await readArtifactsPolicy(policyFile);
+    const policy = await readWebPolicy(policyFile);
     if (policy.status === 'unavailable' || !policy.config) throw new Error('Missing fixture policy');
     await writeFile(policyFile, JSON.stringify({ ...policy.config, enabled: false }), { mode: 0o600 });
-    expect((await readArtifactsPolicy(policyFile)).enabled).toBe(false);
+    expect((await readWebPolicy(policyFile)).enabled).toBe(false);
     const before = await readFile(policyFile, 'utf8');
-    const shown = await inspectArtifactsCapability(f.paths, a.instanceId);
+    const shown = await inspectWebCapability(f.paths, a.instanceId);
     expect(shown.activation).toBe('disabled');
     expect(await readFile(policyFile, 'utf8')).toBe(before);
     expect((await stat(policyFile)).mode & 0o777).toBe(0o600);
@@ -714,7 +747,7 @@ describe('artifacts operator capability', () => {
 it('installs for every compatible reachable assistant and reports stopped assistants pending', async () => {
   const f = await provisionFixture();
   const stopped = await f.assistant('stopped@example.test', 31002);
-  const installed = await installArtifactsConnector(
+  const installed = await installWebConnector(
     f.paths,
     {},
     {
@@ -731,21 +764,21 @@ it('installs for every compatible reachable assistant and reports stopped assist
       expect.objectContaining({
         instance_id: stopped.instanceId,
         outcome: 'pending',
-        reason: 'artifacts_host_unavailable',
+        reason: 'web_host_unavailable',
       }),
     ]),
   );
-  expect((await readArtifactsOperatorConfig(f.files.configFile))?.assistants[stopped.instanceId]).toBeUndefined();
+  expect((await readWebOperatorConfig(f.files.configFile))?.assistants[stopped.instanceId]).toBeUndefined();
 });
 
 it('provisions a previously stopped assistant through its existing instance operation', async () => {
   const f = await provisionFixture();
   const result = await withInstanceOperation(f.paths, f.a.instanceId, (operation) =>
-    provisionAssistantArtifacts(operation, f.dependencies),
+    provisionAssistantWeb(operation, f.dependencies),
   );
   expect(result).toMatchObject({ instance_id: f.a.instanceId, outcome: 'ready', changed: true });
   const again = await withInstanceOperation(f.paths, f.a.instanceId, (operation) =>
-    provisionAssistantArtifacts(operation, f.dependencies),
+    provisionAssistantWeb(operation, f.dependencies),
   );
   expect(again).toMatchObject({ outcome: 'ready', changed: false });
   expect(f.restarts).toHaveLength(2);
@@ -753,9 +786,7 @@ it('provisions a previously stopped assistant through its existing instance oper
 
 it('waits for an already activated listener without reprovisioning or restarting authors', async () => {
   const f = await provisionFixture();
-  await withInstanceOperation(f.paths, f.a.instanceId, (operation) =>
-    provisionAssistantArtifacts(operation, f.dependencies),
-  );
+  await withInstanceOperation(f.paths, f.a.instanceId, (operation) => provisionAssistantWeb(operation, f.dependencies));
   const mutations = f.api.requests.filter((request) => request.method !== 'GET').length;
   const providerReads = f.api.requests.filter((request) => request.resource === '/zones/zone').length;
   const restarts = f.restarts.length;
@@ -767,13 +798,13 @@ it('waits for an already activated listener without reprovisioning or restarting
       waits += 1;
     },
     ncl: async (runtime: typeof f.a.runtime, args: readonly string[]) => {
-      if (args[0] === 'gws-ea-artifacts-health' && ++probes <= 3)
+      if (args[0] === 'gws-ea-web-health' && ++probes <= 3)
         return { policyVersions: [1], enabled: true, listener: { state: 'starting' } };
       return f.dependencies.ncl(runtime, args);
     },
   };
   const result = await withInstanceOperation(f.paths, f.a.instanceId, (operation) =>
-    provisionAssistantArtifacts(operation, dependencies),
+    provisionAssistantWeb(operation, dependencies),
   );
   expect(result).toMatchObject({ outcome: 'ready', changed: false });
   expect(waits).toBeGreaterThan(0);
@@ -784,39 +815,37 @@ it('waits for an already activated listener without reprovisioning or restarting
 
 it('keeps an activated configuration intact when its listener does not recover within the bound', async () => {
   const f = await provisionFixture();
-  await withInstanceOperation(f.paths, f.a.instanceId, (operation) =>
-    provisionAssistantArtifacts(operation, f.dependencies),
-  );
-  const before = await readArtifactsOperatorConfig(f.files.configFile);
-  const policy = await readFile(instanceArtifactsPolicyFile(f.a.runtime), 'utf8');
+  await withInstanceOperation(f.paths, f.a.instanceId, (operation) => provisionAssistantWeb(operation, f.dependencies));
+  const before = await readWebOperatorConfig(f.files.configFile);
+  const policy = await readFile(instanceWebPolicyFile(f.a.runtime), 'utf8');
   const mutations = f.api.requests.filter((request) => request.method !== 'GET').length;
   const restarts = f.restarts.length;
   let clock = Date.now();
   const started = clock;
   vi.spyOn(Date, 'now').mockImplementation(() => clock);
   const result = await withInstanceOperation(f.paths, f.a.instanceId, (operation) =>
-    provisionAssistantArtifacts(operation, {
+    provisionAssistantWeb(operation, {
       ...f.dependencies,
       sleep: async (milliseconds) => {
         clock += milliseconds;
       },
       ncl: async (runtime, args) =>
-        args[0] === 'gws-ea-artifacts-health'
+        args[0] === 'gws-ea-web-health'
           ? { policyVersions: [1], enabled: true, listener: { state: 'starting' } }
           : f.dependencies.ncl(runtime, args),
     }),
   );
-  expect(result).toMatchObject({ outcome: 'pending', reason: 'artifacts_listener_unavailable', changed: false });
+  expect(result).toMatchObject({ outcome: 'pending', reason: 'web_listener_unavailable', changed: false });
   expect(clock - started).toBe(30_000);
-  expect(await readArtifactsOperatorConfig(f.files.configFile)).toEqual(before);
-  expect(await readFile(instanceArtifactsPolicyFile(f.a.runtime), 'utf8')).toBe(policy);
+  expect(await readWebOperatorConfig(f.files.configFile)).toEqual(before);
+  expect(await readFile(instanceWebPolicyFile(f.a.runtime), 'utf8')).toBe(policy);
   expect(f.api.requests.filter((request) => request.method !== 'GET')).toHaveLength(mutations);
   expect(f.restarts).toHaveLength(restarts);
 });
 
 it('keeps an incomplete profile pending without creating provider resources', async () => {
   const f = await provisionFixture();
-  const result = await installArtifactsConnector(
+  const result = await installWebConnector(
     f.paths,
     {},
     {
@@ -831,7 +860,7 @@ it('keeps an incomplete profile pending without creating provider resources', as
     expect.objectContaining({
       instance_id: f.a.instanceId,
       outcome: 'pending',
-      reason: 'artifacts_profile_unavailable',
+      reason: 'web_profile_unavailable',
     }),
   );
   expect(f.api.requests).toEqual([]);
@@ -839,30 +868,30 @@ it('keeps an incomplete profile pending without creating provider resources', as
 
 it('reports unsupported and malformed release markers independently from profile readiness', async () => {
   const f = await provisionFixture();
-  const marker = path.join(f.a.runtime.checkout_root, 'src/gws-ea/artifacts-compatibility.json');
+  const marker = path.join(f.a.runtime.checkout_root, 'src/gws-ea/web-compatibility.json');
   await rm(marker);
-  expect(await artifactsReleaseCompatibility(f.a.runtime.checkout_root)).toBe('unsupported');
-  const unsupported = await installArtifactsConnector(f.paths, {}, f.dependencies);
+  expect(await webReleaseCompatibility(f.a.runtime.checkout_root)).toBe('unsupported');
+  const unsupported = await installWebConnector(f.paths, {}, f.dependencies);
   expect(unsupported.assistants).toContainEqual(
     expect.objectContaining({ outcome: 'unsupported', reason: 'release_unsupported' }),
   );
   await writeFile(marker, '{');
-  expect(await artifactsReleaseCompatibility(f.a.runtime.checkout_root)).toBe('unknown');
-  const unknown = await installArtifactsConnector(f.paths, {}, f.dependencies);
+  expect(await webReleaseCompatibility(f.a.runtime.checkout_root)).toBe('unknown');
+  const unknown = await installWebConnector(f.paths, {}, f.dependencies);
   expect(unknown.assistants).toContainEqual(expect.objectContaining({ outcome: 'pending', reason: 'release_unknown' }));
   expect(f.api.requests).toEqual([]);
 });
 
 it('rotates only the stored management token when reinstalling with a credential file', async () => {
   const f = await provisionFixture();
-  await installArtifactsConnector(f.paths, {}, f.dependencies);
-  const before = await readArtifactsOperatorConfig(f.files.configFile);
+  await installWebConnector(f.paths, {}, f.dependencies);
+  const before = await readWebOperatorConfig(f.files.configFile);
   const credentialFile = path.join(f.paths.configRoot, 'replacement-token');
   await writeFile(credentialFile, 'replacement-management-fixture', { mode: 0o600 });
-  const repeated = await installArtifactsConnector(f.paths, { credentialFile }, f.dependencies);
+  const repeated = await installWebConnector(f.paths, { credentialFile }, f.dependencies);
   expect(repeated.changed).toBe(true);
   expect(await readFile(before!.credentialFile, 'utf8')).toBe('replacement-management-fixture');
-  expect((await readArtifactsOperatorConfig(f.files.configFile))?.assistants).toEqual(before?.assistants);
+  expect((await readWebOperatorConfig(f.files.configFile))?.assistants).toEqual(before?.assistants);
   expect(f.restarts).toHaveLength(2);
 });
 
@@ -870,13 +899,13 @@ it('reports a single unproven provider creation pending for every assistant with
   const f = await provisionFixture();
   await f.assistant('second@example.test', 31002);
   f.api.lose('application');
-  const initial = await installArtifactsConnector(f.paths, {}, f.dependencies);
+  const initial = await installWebConnector(f.paths, {}, f.dependencies);
   expect(initial.assistants).toHaveLength(2);
   const before = f.api.requests.length;
-  const repeated = await installArtifactsConnector(f.paths, {}, f.dependencies);
+  const repeated = await installWebConnector(f.paths, {}, f.dependencies);
   expect(
     repeated.assistants.every(
-      (assistant) => assistant.outcome === 'pending' && assistant.reason === 'artifacts_create_unproven',
+      (assistant) => assistant.outcome === 'pending' && assistant.reason === 'web_create_unproven',
     ),
   ).toBe(true);
   expect(f.api.requests).toHaveLength(before);
@@ -885,53 +914,71 @@ it('reports a single unproven provider creation pending for every assistant with
 
 it('returns a pending operation hook immediately while the host connector lock is held', async () => {
   const f = await provisionFixture();
-  await withArtifactsHostLock(f.paths, async () => {
+  await withWebHostLock(f.paths, async () => {
     const result = await withInstanceOperation(f.paths, f.a.instanceId, (operation) =>
-      provisionAssistantArtifacts(operation, f.dependencies),
+      provisionAssistantWeb(operation, f.dependencies),
     );
-    expect(result).toMatchObject({ outcome: 'pending', reason: 'artifacts_busy', changed: false });
+    expect(result).toMatchObject({ outcome: 'pending', reason: 'web_busy', changed: false });
   });
   expect(f.api.requests).toEqual([]);
 });
 
-it.each([503, 429, 'network', 'reconnecting'] as const)(
-  'keeps a published assistant intact when verification is unavailable (%s)',
-  async (failure) => {
-    const f = await provisionFixture();
-    await withInstanceOperation(f.paths, f.a.instanceId, (operation) =>
-      provisionAssistantArtifacts(operation, f.dependencies),
-    );
-    const config = await readFile(f.files.configFile, 'utf8');
-    const policy = await readFile(instanceArtifactsPolicyFile(f.a.runtime), 'utf8');
-    const restarts = f.restarts.length;
-    const mutations = f.api.requests.filter((request) => request.method !== 'GET').length;
-    const send: typeof fetch = async (input, init) => {
-      if (failure === 'network') throw new Error('An observed transport outage');
-      if (typeof failure === 'number') return Response.json({ success: false }, { status: failure });
-      if (String(input).endsWith('/connections'))
-        return Response.json({ success: true, result: [{ is_pending_reconnect: true }] });
-      return f.api.transport(input, init);
-    };
+it.each([
+  503,
+  429,
+  'network',
+  'reconnecting',
+  'malformed DNS',
+  'malformed DNS empty',
+  'malformed DNS missing content',
+  'malformed Access',
+  'malformed tunnel',
+] as const)('keeps a published assistant intact when verification is unavailable (%s)', async (failure) => {
+  const f = await provisionFixture();
+  await withInstanceOperation(f.paths, f.a.instanceId, (operation) => provisionAssistantWeb(operation, f.dependencies));
+  const config = await readFile(f.files.configFile, 'utf8');
+  const policy = await readFile(instanceWebPolicyFile(f.a.runtime), 'utf8');
+  const restarts = f.restarts.length;
+  const mutations = f.api.requests.filter((request) => request.method !== 'GET').length;
+  const send: typeof fetch = async (input, init) => {
+    if (failure === 'network') throw new Error('An observed transport outage');
+    if (typeof failure === 'string' && failure.startsWith('malformed DNS') && /\/dns_records\//u.test(String(input))) {
+      const { content: _content, ...incomplete } = f.api.dns[0];
+      return Response.json({
+        success: true,
+        result: failure === 'malformed DNS' ? null : failure === 'malformed DNS empty' ? {} : incomplete,
+      });
+    }
+    if (failure === 'malformed Access' && /\/access\/apps\/[^/]+$/u.test(String(input)))
+      return Response.json({ success: true, result: {} });
+    if (failure === 'malformed tunnel' && /\/cfd_tunnel\/tunnel$/u.test(String(input)))
+      return Response.json({ success: true, result: {} });
+    if (typeof failure === 'number') return Response.json({ success: false }, { status: failure });
+    if (String(input).endsWith('/connections'))
+      return Response.json({ success: true, result: [{ is_pending_reconnect: true }] });
+    return f.api.transport(input, init);
+  };
+  for (let attempt = 0; attempt < 2; attempt++) {
     const result = await withInstanceOperation(f.paths, f.a.instanceId, (operation) =>
-      provisionAssistantArtifacts(operation, { ...f.dependencies, fetch: send }),
+      provisionAssistantWeb(operation, { ...f.dependencies, fetch: send }),
     );
     expect(result).toMatchObject({ outcome: 'pending', changed: false });
-    expect(await readFile(f.files.configFile, 'utf8')).toBe(config);
-    expect(await readFile(instanceArtifactsPolicyFile(f.a.runtime), 'utf8')).toBe(policy);
-    expect(f.api.requests.filter((request) => request.method !== 'GET')).toHaveLength(mutations);
-    expect(f.restarts).toHaveLength(restarts);
-  },
-);
+  }
+  expect(await readFile(f.files.configFile, 'utf8')).toBe(config);
+  expect(await readFile(instanceWebPolicyFile(f.a.runtime), 'utf8')).toBe(policy);
+  expect(f.api.requests.filter((request) => request.method !== 'GET')).toHaveLength(mutations);
+  expect(f.restarts).toHaveLength(restarts);
+});
 
 it.each([false, true])(
   'releases a newly claimed namespace after early provisioning failure (stale disabled policy: %s)',
   async (stalePolicy) => {
     const f = await provisionFixture();
-    const oldClaim = (await getInstanceReservation(f.paths, f.a.instanceId)).exclusive_resource_claims.artifacts;
+    const oldClaim = (await getInstanceReservation(f.paths, f.a.instanceId)).exclusive_resource_claims.web;
     if (!oldClaim) throw new Error('Fixture namespace is missing');
-    await releaseInstanceArtifacts(f.paths, f.a.instanceId, oldClaim);
+    await releaseInstanceWeb(f.paths, f.a.instanceId, oldClaim);
     if (stalePolicy) {
-      const policyFile = instanceArtifactsPolicyFile(f.a.runtime);
+      const policyFile = instanceWebPolicyFile(f.a.runtime);
       await mkdir(path.dirname(policyFile), { recursive: true, mode: 0o700 });
       await writeFile(
         policyFile,
@@ -939,7 +986,6 @@ it.each([false, true])(
           schemaVersion: 1,
           enabled: false,
           hostname: oldClaim.hostname,
-          pathPrefix: oldClaim.path_prefix,
           listenPort: oldClaim.listen_port,
           accessIssuer: 'https://team.cloudflareaccess.com',
           accessAud: 'retired-aud',
@@ -952,24 +998,23 @@ it.each([false, true])(
         { mode: 0o600 },
       );
     }
-    const config = (await readArtifactsOperatorConfig(f.files.configFile))!;
-    await writeArtifactsOperatorConfig(f.files.configFile, { ...config, teamName: 'wrong-team' });
-    const failed = await installArtifactsConnector(f.paths, {}, f.dependencies);
+    const config = (await readWebOperatorConfig(f.files.configFile))!;
+    await writeWebOperatorConfig(f.files.configFile, { ...config, teamName: 'wrong-team' });
+    const failed = await installWebConnector(f.paths, {}, f.dependencies);
     expect(failed.assistants).toEqual([
-      expect.objectContaining({ instance_id: f.a.instanceId, outcome: 'pending', reason: 'artifacts_team_invalid' }),
+      expect.objectContaining({ instance_id: f.a.instanceId, outcome: 'pending', reason: 'web_team_invalid' }),
     ]);
-    expect((await getInstanceReservation(f.paths, f.a.instanceId)).exclusive_resource_claims.artifacts).toBeUndefined();
-    expect((await readArtifactsOperatorConfig(f.files.configFile))?.assistants).toEqual({});
-    expect(await uninstallArtifactsConnector(f.paths, f.dependencies)).toMatchObject({ outcome: 'removed' });
+    expect((await getInstanceReservation(f.paths, f.a.instanceId)).exclusive_resource_claims.web).toBeUndefined();
+    expect((await readWebOperatorConfig(f.files.configFile))?.assistants).toEqual({});
+    expect(await uninstallWebConnector(f.paths, f.dependencies)).toMatchObject({ outcome: 'removed' });
     const source = path.join(f.paths.configRoot, 'corrected-management-credential');
     await writeFile(source, 'secret-corrected-management-fixture', { mode: 0o600 });
-    const corrected = await installArtifactsConnector(
+    const corrected = await installWebConnector(
       f.paths,
       {
         accountId: 'account',
         teamName: 'team',
         zoneId: 'zone',
-        hostname: 'views.example.test',
         credentialFile: source,
         cloudflaredPath: '/usr/bin/true',
       },
@@ -981,47 +1026,365 @@ it.each([false, true])(
 
 it('repairs a positively observed Access admission mismatch on a published assistant', async () => {
   const f = await provisionFixture();
-  await withInstanceOperation(f.paths, f.a.instanceId, (operation) =>
-    provisionAssistantArtifacts(operation, f.dependencies),
-  );
-  const config = (await readArtifactsOperatorConfig(f.files.configFile))!;
+  await withInstanceOperation(f.paths, f.a.instanceId, (operation) => provisionAssistantWeb(operation, f.dependencies));
+  const config = (await readWebOperatorConfig(f.files.configFile))!;
   const assistant = config.assistants[f.a.instanceId];
   const policies = f.api.policies.get(assistant.applicationId!);
   if (!policies?.[0]) throw new Error('Fixture policy missing');
   policies[0].include = [{ email: { email: 'outdated@example.test' } }];
-  expect(await inspectArtifactsCapability(f.paths, f.a.instanceId, { ...f.dependencies, check: true })).toMatchObject({
+  expect(await inspectWebCapability(f.paths, f.a.instanceId, { ...f.dependencies, check: true })).toMatchObject({
     remote: 'mismatch',
   });
+  const beforePolicy = await readFile(instanceWebPolicyFile(f.a.runtime), 'utf8');
+  const restarts = f.restarts.length;
   const result = await withInstanceOperation(f.paths, f.a.instanceId, (operation) =>
-    provisionAssistantArtifacts(operation, f.dependencies),
+    provisionAssistantWeb(operation, f.dependencies),
   );
+  expect(await readFile(instanceWebPolicyFile(f.a.runtime), 'utf8')).toBe(beforePolicy);
+  expect(f.restarts).toHaveLength(restarts);
   expect(result).toMatchObject({ outcome: 'ready', changed: true });
-  expect(await inspectArtifactsCapability(f.paths, f.a.instanceId, { ...f.dependencies, check: true })).toMatchObject({
+  expect(await inspectWebCapability(f.paths, f.a.instanceId, { ...f.dependencies, check: true })).toMatchObject({
     ready: true,
   });
 });
 
-it('retains an unproven fresh application create until its durable uninstall receipt fences cleanup', async () => {
+it('retains an unproven application creation and its recorded-DNS claim through uninstall', async () => {
   const f = await provisionFixture();
-  const existingClaim = (await getInstanceReservation(f.paths, f.a.instanceId)).exclusive_resource_claims.artifacts;
+  const existingClaim = (await getInstanceReservation(f.paths, f.a.instanceId)).exclusive_resource_claims.web;
   if (!existingClaim) throw new Error('Fixture namespace is missing');
-  await releaseInstanceArtifacts(f.paths, f.a.instanceId, existingClaim);
+  await releaseInstanceWeb(f.paths, f.a.instanceId, existingClaim);
   f.api.lose('application');
-  const result = await installArtifactsConnector(f.paths, {}, f.dependencies);
+  const result = await installWebConnector(f.paths, {}, f.dependencies);
   expect(result.assistants).toEqual([
     expect.objectContaining({
       instance_id: f.a.instanceId,
       outcome: 'pending',
-      reason: 'artifacts_cloudflare_unavailable',
+      reason: 'web_cloudflare_unavailable',
     }),
   ]);
-  const pending = (await readArtifactsOperatorConfig(f.files.configFile))?.pending;
+  const pending = (await readWebOperatorConfig(f.files.configFile))?.pending;
   expect(pending).toMatchObject({ kind: 'application', target: f.a.instanceId });
-  expect((await getInstanceReservation(f.paths, f.a.instanceId)).exclusive_resource_claims.artifacts).toBeDefined();
-  expect(await uninstallArtifactsConnector(f.paths, f.dependencies)).toMatchObject({ outcome: 'pending' });
-  expect((await getInstanceReservation(f.paths, f.a.instanceId)).exclusive_resource_claims.artifacts).toBeUndefined();
-  expect((await readArtifactsOperatorConfig(f.files.configFile))?.pending).toEqual(pending);
-  await expect(installArtifactsConnector(f.paths, {}, f.dependencies)).rejects.toMatchObject({
-    code: 'artifacts_uninstall_incomplete',
+  const retainedClaim = (await getInstanceReservation(f.paths, f.a.instanceId)).exclusive_resource_claims.web;
+  expect(retainedClaim).toBeDefined();
+  expect(await uninstallWebConnector(f.paths, f.dependencies)).toMatchObject({ outcome: 'pending' });
+  expect((await getInstanceReservation(f.paths, f.a.instanceId)).exclusive_resource_claims.web).toEqual(retainedClaim);
+  expect((await readWebOperatorConfig(f.files.configFile))?.pending).toEqual(pending);
+  await expect(installWebConnector(f.paths, {}, f.dependencies)).rejects.toMatchObject({
+    code: 'web_uninstall_incomplete',
   });
+});
+
+async function releaseFixtureClaim(f: Awaited<ReturnType<typeof provisionFixture>>): Promise<void> {
+  const claim = (await getInstanceReservation(f.paths, f.a.instanceId)).exclusive_resource_claims.web;
+  if (!claim) throw new Error('Fixture claim is missing');
+  await releaseInstanceWeb(f.paths, f.a.instanceId, claim);
+}
+
+it.each([
+  ['Aya', 'aya'],
+  ['Mary Jane', 'maryjane'],
+  ['Zoë', 'zoe'],
+  ['Søren', 'soren'],
+  ['Łukasz', 'lukasz'],
+  ['Weiß', 'weiss'],
+  ['Ægir Œ Đ Ð Þ', 'aegiroeddth'],
+  ['A'.repeat(70), 'a'.repeat(63)],
+])('claims the ASCII first-name hostname for %s', async (name, label) => {
+  const f = await provisionFixture();
+  await releaseFixtureClaim(f);
+  f.firstName(name);
+  const result = await provisionForAssistant(f.paths, f.a.instanceId, {}, f.dependencies);
+  expect(result.hostname).toBe(`${label}.example.test`);
+  const claim = (await getInstanceReservation(f.paths, f.a.instanceId)).exclusive_resource_claims.web;
+  expect(claim).toEqual({ hostname: `${label}.example.test`, listen_port: expect.any(Number) });
+  expect(f.api.apps[0].destinations).toEqual([
+    {
+      type: 'public',
+      uri: `${label}.example.test/artifacts`,
+      overrides: [{ behavior: 'public', path_pattern: '/artifacts/public/*' }],
+    },
+  ]);
+  f.firstName('李娜');
+  expect((await provisionForAssistant(f.paths, f.a.instanceId, {}, f.dependencies)).hostname).toBe(
+    `${label}.example.test`,
+  );
+});
+
+it('reports an unusable first name without storing a claim or creating resources', async () => {
+  const f = await provisionFixture();
+  await releaseFixtureClaim(f);
+  f.firstName('李娜');
+  const result = await installWebConnector(f.paths, {}, f.dependencies);
+  expect(result.assistants).toContainEqual(
+    expect.objectContaining({ outcome: 'pending', reason: 'web_name_unusable' }),
+  );
+  expect((await getInstanceReservation(f.paths, f.a.instanceId)).exclusive_resource_claims.web).toBeUndefined();
+  expect(f.api.requests.filter((request) => request.method !== 'GET')).toEqual([]);
+});
+
+it.each([
+  ['A', 253],
+  ['Aa', 254],
+] as const)('validates the full web hostname for %s (%i characters) before claiming', async (name, length) => {
+  const zoneApex = ['a'.repeat(63), 'b'.repeat(63), 'c'.repeat(63), 'd'.repeat(59)].join('.');
+  const f = await provisionFixture(zoneApex);
+  await releaseFixtureClaim(f);
+  f.firstName(name);
+  const result = await installWebConnector(f.paths, {}, f.dependencies);
+  const claim = (await getInstanceReservation(f.paths, f.a.instanceId)).exclusive_resource_claims.web;
+  if (length === 253) {
+    expect(result.assistants).toContainEqual(expect.objectContaining({ outcome: 'ready' }));
+    expect(claim?.hostname).toBe(`a.${zoneApex}`);
+    expect(claim?.hostname).toHaveLength(253);
+  } else {
+    expect(result.assistants).toContainEqual(
+      expect.objectContaining({ outcome: 'pending', reason: 'web_name_unusable' }),
+    );
+    expect(claim).toBeUndefined();
+    expect(f.api.requests).toEqual([]);
+  }
+});
+
+it('names the existing hostname holder without claiming or creating for a second assistant', async () => {
+  const f = await provisionFixture();
+  await releaseFixtureClaim(f);
+  f.firstName('Aya');
+  await provisionForAssistant(f.paths, f.a.instanceId, {}, f.dependencies);
+  const second = await f.assistant('second@example.test', 31002);
+  const mutations = f.api.requests.filter((request) => request.method !== 'GET').length;
+  const result = await installWebConnector(f.paths, {}, f.dependencies);
+  expect(result.assistants).toContainEqual(
+    expect.objectContaining({
+      instance_id: second.instanceId,
+      outcome: 'pending',
+      reason: 'web_hostname_claimed',
+      message: expect.stringContaining(f.a.instanceId),
+    }),
+  );
+  expect((await getInstanceReservation(f.paths, second.instanceId)).exclusive_resource_claims.web).toBeUndefined();
+  expect(f.api.requests.filter((request) => request.method !== 'GET')).toHaveLength(mutations);
+});
+
+it.each(['exact DNS', 'wildcard DNS', 'wildcard Access', 'own tunnel'] as const)(
+  'preflights foreign %s before storing a claim or creating resources',
+  async (kind) => {
+    const f = await provisionFixture();
+    await releaseFixtureClaim(f);
+    f.firstName('Aya');
+    if (kind.endsWith('DNS'))
+      f.api.dns.push({ id: 'foreign-dns', name: kind === 'exact DNS' ? 'aya.example.test' : '*.example.test' });
+    if (kind === 'wildcard Access')
+      f.api.apps.push({ id: 'foreign-app', destinations: [{ type: 'public', uri: '*.example.test/artifacts' }] });
+    if (kind === 'own tunnel') {
+      const config = (await readWebOperatorConfig(f.files.configFile))!;
+      await writeWebOperatorConfig(f.files.configFile, { ...config, tunnelId: 'tunnel' });
+      f.api.ingress().unshift({ hostname: 'aya.example.test', service: 'http://127.0.0.1:9999' });
+    }
+    const result = await installWebConnector(f.paths, {}, f.dependencies);
+    expect(result.assistants).toContainEqual(
+      expect.objectContaining({
+        outcome: 'pending',
+        reason: 'web_hostname_foreign',
+        message: expect.stringContaining('aya.example.test'),
+      }),
+    );
+    expect((await getInstanceReservation(f.paths, f.a.instanceId)).exclusive_resource_claims.web).toBeUndefined();
+    expect(f.api.requests.filter((request) => request.method !== 'GET')).toEqual([]);
+  },
+);
+
+it('keeps provisioning an existing claim after a foreign wildcard DNS record appears in the zone', async () => {
+  const f = await provisionFixture();
+  f.firstName('Aya');
+  f.api.dns.push({ id: 'foreign-wildcard', name: '*.example.test' });
+  const result = await provisionForAssistant(f.paths, f.a.instanceId, {}, f.dependencies);
+  expect(result.hostname).toBe('views.example.test');
+  expect((await getInstanceReservation(f.paths, f.a.instanceId)).exclusive_resource_claims.web?.hostname).toBe(
+    'views.example.test',
+  );
+});
+
+it('reports no address from the closed policy uninstall leaves, including after a reinstall leaves the name pending', async () => {
+  const f = await provisionFixture();
+  const oldClaim = (await getInstanceReservation(f.paths, f.a.instanceId)).exclusive_resource_claims.web;
+  if (!oldClaim) throw new Error('Fixture namespace is missing');
+  await releaseInstanceWeb(f.paths, f.a.instanceId, oldClaim);
+  const policyFile = instanceWebPolicyFile(f.a.runtime);
+  await mkdir(path.dirname(policyFile), { recursive: true, mode: 0o700 });
+  await writeFile(
+    policyFile,
+    JSON.stringify({
+      schemaVersion: 1,
+      enabled: false,
+      hostname: oldClaim.hostname,
+      listenPort: oldClaim.listen_port,
+      accessIssuer: 'https://team.cloudflareaccess.com',
+      accessAud: 'retired-aud',
+      cloudflare: { accountId: 'account', applicationId: 'retired-app', operatorConfigFile: f.files.configFile },
+    }),
+    { mode: 0o600 },
+  );
+  expect(await inspectWebCapability(f.paths, f.a.instanceId)).toMatchObject({
+    activation: 'disabled',
+    hostname: null,
+  });
+  f.firstName('Aya');
+  f.api.dns.push({ id: 'foreign-dns', name: 'aya.example.test' });
+  const reinstalled = await installWebConnector(f.paths, {}, f.dependencies);
+  expect(reinstalled.assistants).toContainEqual(
+    expect.objectContaining({ instance_id: f.a.instanceId, outcome: 'pending', reason: 'web_hostname_foreign' }),
+  );
+  expect((await inspectWebCapability(f.paths, f.a.instanceId)).hostname).toBeNull();
+});
+
+it('releases a resource-free claim when DNS creation loses a name race, without creating Access', async () => {
+  const f = await provisionFixture();
+  await releaseFixtureClaim(f);
+  const result = await installWebConnector(
+    f.paths,
+    {},
+    {
+      ...f.dependencies,
+      fetch: async (input, init) =>
+        String(input).endsWith('/dns_records') && init?.method === 'POST'
+          ? Response.json({ success: false }, { status: 409 })
+          : f.api.transport(input, init),
+    },
+  );
+  expect(result.assistants).toContainEqual(
+    expect.objectContaining({ outcome: 'pending', reason: 'web_cloudflare_rejected' }),
+  );
+  expect((await getInstanceReservation(f.paths, f.a.instanceId)).exclusive_resource_claims.web).toBeUndefined();
+  expect(f.api.apps).toEqual([]);
+  expect(f.api.policies.size).toBe(0);
+  expect(f.api.ingress().filter((route) => route.hostname === 'avery.example.test')).toEqual([]);
+});
+
+it.each(['recorded', 'pending'] as const)('retains a fresh claim when its first DNS create is %s', async (state) => {
+  const f = await provisionFixture();
+  await releaseFixtureClaim(f);
+  if (state === 'pending') f.api.lose('dns');
+  const result = await installWebConnector(
+    f.paths,
+    {},
+    {
+      ...f.dependencies,
+      fetch: async (input, init) =>
+        state === 'recorded' && String(input).endsWith('/access/apps') && init?.method === 'POST'
+          ? Response.json({ success: false }, { status: 409 })
+          : f.api.transport(input, init),
+    },
+  );
+  expect(result.assistants).toContainEqual(expect.objectContaining({ outcome: 'pending' }));
+  expect((await getInstanceReservation(f.paths, f.a.instanceId)).exclusive_resource_claims.web?.hostname).toBe(
+    'avery.example.test',
+  );
+  const config = (await readWebOperatorConfig(f.files.configFile))!;
+  if (state === 'recorded')
+    expect(config.dns['avery.example.test']).toEqual({ id: expect.any(String), zoneId: 'zone' });
+  else expect(config.pending).toMatchObject({ kind: 'dns', target: 'avery.example.test' });
+  expect(f.api.apps).toEqual([]);
+});
+
+it.each(['wrong team', 'outside account', 'inactive zone'] as const)(
+  'rejects %s before writing first operator configuration',
+  async (failure) => {
+    const f = await fixture();
+    await mkdir(f.paths.configRoot, { recursive: true, mode: 0o700 });
+    const credentialFile = path.join(f.paths.configRoot, 'source-token');
+    await writeFile(credentialFile, 'secret-management-fixture', { mode: 0o600 });
+    const api = cloudflareFixture();
+    await expect(
+      installWebConnector(
+        f.paths,
+        {
+          accountId: 'account',
+          teamName: failure === 'wrong team' ? 'wrong' : 'team',
+          zoneId: 'zone',
+          credentialFile,
+          cloudflaredPath: '/usr/bin/true',
+        },
+        {
+          fetch: async (input, init) => {
+            if (String(input).endsWith('/zones/zone') && failure !== 'wrong team')
+              return Response.json({
+                success: true,
+                result: {
+                  id: 'zone',
+                  name: 'example.test',
+                  status: failure === 'inactive zone' ? 'pending' : 'active',
+                  account: { id: failure === 'outside account' ? 'foreign' : 'account' },
+                },
+              });
+            return api.transport(input, init);
+          },
+        },
+      ),
+    ).rejects.toMatchObject({ code: failure === 'wrong team' ? 'web_team_invalid' : 'web_zone_invalid' });
+    expect(await readWebOperatorConfig(webOperatorFiles(f.paths).configFile)).toBeUndefined();
+    await expect(readFile(path.join(webOperatorFiles(f.paths).root, 'management-token'))).rejects.toMatchObject({
+      code: 'ENOENT',
+    });
+  },
+);
+
+it('publishes the Web failure code through the connector result contract', async () => {
+  const f = await provisionFixture();
+  await provisionForAssistant(f.paths, f.a.instanceId, {}, f.dependencies);
+  f.api.reject(503);
+  const observation = await inspectConnector(f.paths, 'web', {
+    instanceId: f.a.instanceId,
+    check: true,
+    web: f.dependencies,
+  });
+  expect(observation.details).toEqual([
+    expect.objectContaining({ reason_code: 'web_cloudflare_rejected', activation: 'enabled' }),
+  ]);
+  expect(observation.assistants[0]).toMatchObject({ setup: 'installed', readiness: { status: 'not_ready' } });
+  expectResultContract(
+    'connectors check web',
+    managedResult('connectors check web', { outcome: 'failed', data: observation }),
+  );
+});
+
+it.each(['DNS', 'Access'] as const)(
+  'closes tools after Cloudflare confirms the owned %s resource points elsewhere',
+  async (resource) => {
+    const f = await provisionFixture();
+    await provisionForAssistant(f.paths, f.a.instanceId, {}, f.dependencies);
+    if (resource === 'DNS') f.api.dns[0].content = 'foreign.cfargotunnel.com';
+    else f.api.apps[0].destinations = [{ type: 'public', uri: 'foreign.example.test/artifacts' }];
+    const result = await installWebConnector(f.paths, {}, f.dependencies);
+    expect(result.assistants).toContainEqual(
+      expect.objectContaining({
+        outcome: 'pending',
+        reason: resource === 'DNS' ? 'web_dns_mismatch' : 'web_application_mismatch',
+      }),
+    );
+    expect((await readWebPolicy(instanceWebPolicyFile(f.a.runtime))).enabled).toBe(false);
+    expect((await readWebOperatorConfig(f.files.configFile))?.assistants[f.a.instanceId].enabled).toBe(false);
+    if (resource === 'DNS') expect(f.api.dns[0].content).toBe('foreign.cfargotunnel.com');
+    else expect(f.api.apps[0].destinations).toEqual([{ type: 'public', uri: 'foreign.example.test/artifacts' }]);
+  },
+);
+
+it('repairs a missing owned ingress route without closing tools or recreating resources', async () => {
+  const f = await provisionFixture();
+  await provisionForAssistant(f.paths, f.a.instanceId, {}, f.dependencies);
+  const policy = await readFile(instanceWebPolicyFile(f.a.runtime), 'utf8');
+  const config = await readWebOperatorConfig(f.files.configFile);
+  const restarts = f.restarts.length;
+  const creates = f.api.requests.filter((request) => request.method === 'POST').length;
+  const index = f.api.ingress().findIndex((route) => route.hostname === 'views.example.test');
+  f.api.ingress().splice(index, 1);
+  expect(await inspectWebCapability(f.paths, f.a.instanceId, { ...f.dependencies, check: true })).toMatchObject({
+    remote: 'mismatch',
+    reason_code: 'web_tunnel_unverified',
+  });
+  const result = await provisionForAssistant(f.paths, f.a.instanceId, {}, f.dependencies);
+  expect(result).toMatchObject({ outcome: 'ready', changed: true });
+  expect(await readFile(instanceWebPolicyFile(f.a.runtime), 'utf8')).toBe(policy);
+  expect((await readWebOperatorConfig(f.files.configFile))?.assistants).toEqual(config?.assistants);
+  expect(f.restarts).toHaveLength(restarts);
+  expect(f.api.requests.filter((request) => request.method === 'POST')).toHaveLength(creates);
 });

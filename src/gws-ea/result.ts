@@ -1,7 +1,7 @@
 import type { ConnectorObservation } from './connector-inspection.js';
 import type { OnePasswordInstallData } from './onepassword.js';
 import type { OnePasswordUninstallData } from './onepassword-uninstall.js';
-import type { ArtifactsConnectorOperation, ArtifactsConnectorUninstallData } from './artifacts-connector.js';
+import type { WebConnectorOperation, WebConnectorUninstallData } from './web-connector.js';
 import {
   COMMAND_DEFINITIONS,
   findCommand,
@@ -27,6 +27,7 @@ export type NextAction =
   | { readonly kind: 'command'; readonly argv: readonly string[] }
   | { readonly kind: 'external'; readonly instruction: string; readonly url?: string };
 export interface OperationData {
+  readonly connector_pending?: readonly import('./connector-provisioning.js').PendingConnector[];
   readonly connector_next_actions?: readonly NextAction[];
   readonly instance_id?: string;
   readonly preparation?: { readonly bootstrap_manifest: 'retained' | 'unknown'; readonly reservation: 'unknown' };
@@ -70,8 +71,8 @@ export type CommandData =
   | ConnectorObservation
   | OnePasswordInstallData
   | OnePasswordUninstallData
-  | ArtifactsConnectorOperation
-  | ArtifactsConnectorUninstallData
+  | WebConnectorOperation
+  | WebConnectorUninstallData
   | AssistantListing
   | AssistantStatus;
 export interface ManagedResult<T = CommandData> {

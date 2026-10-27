@@ -67,7 +67,11 @@ export async function readKeptHostEnvironment(root: string): Promise<Record<stri
   const file = keptReleaseFiles(root).hostEnvironment;
   const value = await readOwnerOnlyJson(file, 'Kept host environment', 'invalid_kept_release');
   if (!isRecord(value)) throw new GwsEaError('invalid_kept_release', `${file} holds no environment`);
-  const owned: readonly string[] = [...INSTANCE_HOST_ENV_KEYS, 'GWS_EA_BROWSER_POLICY_FILE'];
+  const owned: readonly string[] = [
+    ...INSTANCE_HOST_ENV_KEYS,
+    'GWS_EA_BROWSER_POLICY_FILE',
+    'GWS_EA_ARTIFACTS_POLICY_FILE',
+  ];
   const environment: Record<string, string> = {};
   for (const [key, entry] of Object.entries(value)) {
     if (!owned.includes(key) || typeof entry !== 'string') {

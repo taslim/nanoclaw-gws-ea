@@ -1108,7 +1108,7 @@ describe('the native 1Password connector commands', () => {
         connectors: [
           { name: 'voice' },
           { name: 'onepassword', setup: 'installed', readiness: { status: 'not_checked', checked: false } },
-          { name: 'artifacts' },
+          { name: 'web' },
         ],
       },
     });

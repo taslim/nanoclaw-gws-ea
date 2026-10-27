@@ -16,51 +16,28 @@ export interface AuthorizedArtifactView {
 }
 export interface ArtifactViewServerOptions {
   readonly hostname: string;
-  readonly pathPrefix: string;
   /** Must resolve the current selected revision and current audience authority on every request, including HEAD/child. */
   readonly resolve: (request: IncomingMessage, route: ArtifactViewRoute) => Promise<AuthorizedArtifactView | undefined>;
 }
 const UUID = '[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}';
-function parseRoute(url: string, prefix: string): ArtifactViewRoute | undefined {
-  if (!url.startsWith(`${prefix}/`)) return undefined;
-  const route = url.slice(prefix.length);
+function parseRoute(url: string): ArtifactViewRoute | undefined {
+  if (!url.startsWith('/artifacts/')) return undefined;
+  const route = url.slice('/artifacts'.length);
   const match = new RegExp(`^/(?:((?:share|public))/)?(${UUID})(/frame/([a-f0-9]{64}))?$`, 'u').exec(route);
   if (!match) return undefined;
   return {
     audience: match[1] === 'share' ? 'share' : match[1] === 'public' ? 'public' : 'private',
     id: match[2],
-    viewPath: `${prefix}/${match[1] ? `${match[1]}/` : ''}${match[2]}`,
+    viewPath: `/artifacts/${match[1] ? `${match[1]}/` : ''}${match[2]}`,
     ...(match[4] ? { expectedSourceHash: match[4] } : {}),
   };
-}
-function canonicalPrefix(prefix: string): boolean {
-  if (prefix === '') return true;
-  if (!prefix.startsWith('/')) return false;
-  let decoded: string;
-  try {
-    decoded = decodeURIComponent(prefix.slice(1));
-  } catch (error) {
-    if (error instanceof URIError) return false;
-    throw error;
-  }
-  return (
-    decoded !== '' &&
-    decoded !== '.' &&
-    decoded !== '..' &&
-    !/[\\/\p{Cc}]/u.test(decoded) &&
-    decoded === decoded.normalize('NFKC').toLowerCase().replace(/\s+/gu, '-') &&
-    prefix === `/${encodeURIComponent(decoded)}`
-  );
 }
 /** View-only origin. The caller owns listening and supplies real current authorization; there is no permissive default. */
 export function createArtifactViewHandler(
   options: ArtifactViewServerOptions,
 ): (request: IncomingMessage, response: ServerResponse) => void {
-  if (
-    !/^(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,63}$/u.test(options.hostname) ||
-    !canonicalPrefix(options.pathPrefix)
-  )
-    throw new Error('Invalid canonical artifact host or prefix.');
+  if (!/^(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,63}$/u.test(options.hostname))
+    throw new Error('Invalid canonical artifact host.');
   return (request, response) => {
     const finish = (status: number, body = ''): void => {
       response.writeHead(status, {
@@ -71,15 +48,7 @@ export function createArtifactViewHandler(
       });
       response.end(request.method === 'HEAD' ? undefined : body);
     };
-    if (request.headers.host !== options.hostname || !request.url) {
-      finish(404);
-      return;
-    }
-    if (request.method !== 'GET' && request.method !== 'HEAD') {
-      finish(405);
-      return;
-    }
-    const route = parseRoute(request.url, options.pathPrefix);
+    const route = request.url ? parseRoute(request.url) : undefined;
     if (!route) {
       finish(404);
       return;

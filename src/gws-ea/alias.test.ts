@@ -40,6 +40,9 @@ import { GwsEaError, type InstanceReservationInput } from './types.js';
 
 describe("the assistant's web alias name", () => {
   it('reverses the name, lowercased, in ASCII, without spaces', () => {
+    expect(aliasStem('Søren')).toEqual({ status: 'derived', stem: 'neros' });
+    expect(aliasStem('Łukasz')).toEqual({ status: 'derived', stem: 'zsakul' });
+    expect(aliasStem('Weiß')).toEqual({ status: 'derived', stem: 'ssiew' });
     expect(aliasStem('Juno')).toEqual({ status: 'derived', stem: 'onuj' });
     expect(aliasStem('Juno Hale')).toEqual({ status: 'derived', stem: 'elahonuj' });
     expect(aliasStem('  Rémy  Vance ')).toEqual({ status: 'derived', stem: 'ecnavymer' });

@@ -21,7 +21,7 @@ import { getRequiredProjectDocSections } from '../../project-doc-sections.js';
 import { runnerToolCapabilities, unknownToolNames } from '../../test-utils/runner-tools.js';
 import type { AgentGroup } from '../../types.js';
 import { reconcileGwsEaProfile } from '../gws-ea-profile/db.js';
-import { ARTIFACTS_POLICY_FILE_ENV, type ArtifactsPolicyFile } from '../gws-ea-artifacts/policy.js';
+import { WEB_POLICY_FILE_ENV, type WebPolicyFile } from '../gws-ea-web/policy.js';
 import '../gws-ea-artifacts/capability.js';
 import '../gws-ea-profile/index.js';
 import { GUIDANCE_PATH, MAIN_SHARED_SKILLS } from './index.js';
@@ -541,11 +541,10 @@ describe("main's skills", () => {
     const peer = group('ag-peer', 'main');
     for (const value of [main, author, peer]) await createGroup(value);
     await publishMain(main);
-    const policy: ArtifactsPolicyFile = {
+    const policy: WebPolicyFile = {
       schemaVersion: 1,
       enabled: true,
-      hostname: 'views.example.com',
-      pathPrefix: '/aya',
+      hostname: 'aya.example.com',
       listenPort: 9123,
       accessIssuer: 'https://team.cloudflareaccess.com',
       accessAud: 'assistant-aud',
@@ -553,7 +552,7 @@ describe("main's skills", () => {
     };
     const policyFile = path.join(TEST_ROOT, 'artifacts-policy.json');
     fs.writeFileSync(policyFile, JSON.stringify(policy), { mode: 0o600 });
-    vi.stubEnv(ARTIFACTS_POLICY_FILE_ENV, policyFile);
+    vi.stubEnv(WEB_POLICY_FILE_ENV, policyFile);
     await dispatch(
       { id: 'main-skills', command: 'gws-ea-main-reconcile', args: { 'agent-group-id': main.id } },
       { caller: 'host' },

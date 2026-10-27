@@ -30,7 +30,8 @@ import {
   type ArtifactShareInput,
 } from './authority.js';
 import { artifactDigest, artifactRequestResult, getArtifactRequest } from './db.js';
-import { artifactActor, readArtifactsPolicy, type ArtifactsPolicyFile } from './policy.js';
+import { artifactActor } from './policy.js';
+import { readWebPolicy, webPolicyDigest, type WebPolicyFile } from '../gws-ea-web/policy.js';
 
 interface Reservation {
   readonly input: ArtifactShareInput;
@@ -62,7 +63,7 @@ const SHARE_JOIN =
   'gws_ea_artifact_shares s LEFT JOIN gws_ea_artifact_revisions r ON r.artifact_id=s.artifact_id AND r.revision=s.revision';
 export async function artifactShares(
   artifactId: string,
-  config: ArtifactsPolicyFile,
+  config: WebPolicyFile,
   after = '',
 ): Promise<{ readonly shares: ArtifactShareMetadata[]; readonly shares_next_cursor: string | null }> {
   const rows = await getDb().all<ShareRow>(
@@ -83,7 +84,7 @@ export async function artifactShares(
     shares_next_cursor: rows.length > 1 ? share.share_id : null,
   };
 }
-export async function artifactShareSummary(artifactId: string, config: ArtifactsPolicyFile) {
+export async function artifactShareSummary(artifactId: string, config: WebPolicyFile) {
   const named = { active: 0, pending: 0, revoked: 0 };
   const counts = await getDb().all<{ state: ArtifactShareMetadata['state']; count: number }>(
     "SELECT state,COUNT(*) AS count FROM gws_ea_artifact_shares WHERE artifact_id=? AND kind='named' GROUP BY state",
@@ -110,8 +111,8 @@ export async function artifactAdmissionEmails(): Promise<string[]> {
   );
   return [...new Set([...principals, ...grants.map(({ email }) => email)])].sort();
 }
-function shareUrl(config: ArtifactsPolicyFile, kind: 'named' | 'public', id: string): string {
-  return `https://${config.hostname}${config.pathPrefix}/${kind === 'named' ? 'share' : 'public'}/${id}`;
+function shareUrl(config: WebPolicyFile, kind: 'named' | 'public', id: string): string {
+  return `https://${config.hostname}/artifacts/${kind === 'named' ? 'share' : 'public'}/${id}`;
 }
 function reservation(value: string): Reservation {
   const payload: unknown = JSON.parse(value);
@@ -166,8 +167,8 @@ function storedFrame(value: Record<string, unknown>, requestId: string): Respons
 }
 export interface ArtifactSharingDependencies {
   /** Brings Cloudflare Access admission up to date: remote work, so never inside a central transaction. */
-  readonly verifyAdmission: (config: ArtifactsPolicyFile) => Promise<void>;
-  readonly publicationReady: (config: ArtifactsPolicyFile) => boolean | Promise<boolean>;
+  readonly verifyAdmission: (config: WebPolicyFile) => Promise<void>;
+  readonly publicationReady: (config: WebPolicyFile) => boolean | Promise<boolean>;
 }
 export class ArtifactSharing {
   private readonly running = new Set<string>();
@@ -262,7 +263,7 @@ export class ArtifactSharing {
         now,
         frame.data.share_id,
       );
-      const policy = await readArtifactsPolicy();
+      const policy = await readWebPolicy();
       const ready = policy.status === 'enabled' && (await this.dependencies.publicationReady(policy.config));
       frame = {
         ...frame,
@@ -357,7 +358,7 @@ export class ArtifactSharing {
     let completed: ResponseFrame | undefined;
     await getDb().transaction(async () => {
       const authority = await authorizeArtifactShare(session, input);
-      const policy = await readArtifactsPolicy();
+      const policy = await readWebPolicy();
       if (policy.status !== 'enabled') throw forbidden('Artifacts are unavailable.');
       const decision = await guard(artifactShareAction, {
         actor: { kind: 'agent', agentGroupId: session.agent_group_id, sessionId: session.id },
@@ -404,7 +405,7 @@ export class ArtifactSharing {
         scope_hash: authority.scopeHash,
         share_id: shareId,
         generation,
-        policy_hash: artifactDigest(policy.config),
+        policy_hash: webPolicyDigest(policy.config),
       };
       const encoded = JSON.stringify(payload);
       if (Buffer.byteLength(encoded, 'utf8') > 16384)
@@ -522,8 +523,8 @@ export class ArtifactSharing {
       }
       return;
     }
-    const policy = await readArtifactsPolicy();
-    if (policy.status !== 'enabled' || artifactDigest(policy.config) !== held.policy_hash)
+    const policy = await readWebPolicy();
+    if (policy.status !== 'enabled' || webPolicyDigest(policy.config) !== held.policy_hash)
       throw forbidden('Artifact capability coordinates changed.');
     if (!(await this.dependencies.publicationReady(policy.config))) {
       if (grant)
@@ -534,10 +535,10 @@ export class ArtifactSharing {
     let frame: ResponseFrame | undefined;
     await getDb().transaction(async () => {
       const current = await authorizeArtifactShare(session, held.input, { requestId });
-      const fresh = await readArtifactsPolicy();
+      const fresh = await readWebPolicy();
       if (
         fresh.status !== 'enabled' ||
-        artifactDigest(fresh.config) !== held.policy_hash ||
+        webPolicyDigest(fresh.config) !== held.policy_hash ||
         current.scopeHash !== held.scope_hash ||
         !(await this.dependencies.publicationReady(fresh.config))
       )

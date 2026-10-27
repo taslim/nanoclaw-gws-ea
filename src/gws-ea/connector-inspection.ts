@@ -1,4 +1,7 @@
 /** Local discovery and bounded verification share one connector result contract. */
+import { existsSync } from 'node:fs';
+
+import { centralDatabaseFile, openWithoutSideFiles } from './verify.js';
 import type { OnePasswordCliSeams, OnePasswordCapabilityObservation } from './onepassword.js';
 import {
   inspectOnePasswordCapability,
@@ -7,19 +10,17 @@ import {
 } from './onepassword.js';
 import { inspectOnePasswordUninstall } from './onepassword-uninstall.js';
 import {
-  inspectArtifactsCapability,
+  inspectWebCapability,
+  assertWebHostnameAvailable,
+  assertWebHostnameUnclaimed,
   supportedCloudflaredVersion,
-  artifactsReleaseCompatibility,
-  inspectArtifactsUninstall,
-  type ArtifactsCapabilityDependencies,
-  type ArtifactsCapabilityObservation,
-} from './artifacts-connector.js';
-import {
-  readArtifactsOperatorConfig,
-  artifactsOperatorFiles,
-  artifactsApi,
-  type ArtifactsOperatorConfig,
-} from './artifacts-cloudflare.js';
+  webHostnameFor,
+  webReleaseCompatibility,
+  inspectWebUninstall,
+  type WebCapabilityDependencies,
+  type WebCapabilityObservation,
+} from './web-connector.js';
+import { readWebOperatorConfig, webOperatorFiles, webApi, type WebOperatorConfig } from './web-cloudflare.js';
 import { CONNECTOR_ACTIONS, connectorDefinition, type ConnectorName, type ConnectorDefinition } from './connectors.js';
 import {
   inspectVoiceCapability,
@@ -30,7 +31,7 @@ import {
 import { runInstanceNclJson } from './ncl.js';
 import { buildToolEnvironment, runSanitizedCommandOutcome } from './process.js';
 import { readRegistry, getInstanceReservation } from './registry.js';
-import { loadInstanceRuntimeConfig, type HostStatusHelpers } from './service.js';
+import { loadInstanceRuntimeConfig, type HostStatusHelpers, type InstanceRuntimeConfig } from './service.js';
 import { createServiceControl, runtimeServiceTarget, type NanoclawServiceHelpers } from './service-control.js';
 import type { ControlPlanePaths } from './paths.js';
 import type { NextAction } from './result.js';
@@ -72,17 +73,14 @@ export interface ConnectorObservation {
   readonly assistants: readonly ConnectorAssistantObservation[];
   readonly reasons: readonly string[];
   readonly next_actions: readonly NextAction[];
-  readonly details:
-    | VoiceCapabilityObservation
-    | OnePasswordCapabilityObservation
-    | readonly ArtifactsCapabilityObservation[];
+  readonly details: VoiceCapabilityObservation | OnePasswordCapabilityObservation | readonly WebCapabilityObservation[];
 }
 export interface ConnectorInspection {
   readonly check?: boolean;
   readonly instanceId?: string;
   readonly voice?: VoiceCapabilityInspection;
   readonly onePassword?: OnePasswordCliSeams;
-  readonly artifacts?: ArtifactsCapabilityDependencies;
+  readonly web?: WebCapabilityDependencies;
   readonly serviceHelpers?: NanoclawServiceHelpers;
   readonly hostStatus?: Pick<HostStatusHelpers, 'queryHost'>;
 }
@@ -174,13 +172,13 @@ async function observeUninstall(paths: ControlPlanePaths, name: ConnectorName): 
         actions.push({ kind: 'command', argv: ['gws-ea', 'connectors', 'uninstall', name, '--abandon'] });
       return { incomplete: inspection.incomplete, unknown: false, reasons, nextActions: actions };
     }
-    if (name === 'artifacts') {
-      const receipt = await inspectArtifactsUninstall(paths);
+    if (name === 'web') {
+      const receipt = await inspectWebUninstall(paths);
       if (receipt)
         return {
           incomplete: true,
           unknown: false,
-          reasons: ['Artifacts uninstall is incomplete.', ...(receipt.reason ? [receipt.reason] : [])],
+          reasons: ['Web uninstall is incomplete.', ...(receipt.reason ? [receipt.reason] : [])],
           nextActions: [uninstall(name)],
         };
     }
@@ -198,17 +196,35 @@ async function observeUninstall(paths: ControlPlanePaths, name: ConnectorName): 
   }
 }
 
+function webFirstName(runtime: InstanceRuntimeConfig): string | undefined {
+  const file = centralDatabaseFile(runtime.state_root);
+  if (!existsSync(file)) return undefined;
+  const database = openWithoutSideFiles(file);
+  try {
+    if (!database.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'gws_ea_profile'").get())
+      return undefined;
+    const profile: unknown = database
+      .prepare('SELECT assistant_first_name FROM gws_ea_profile WHERE singleton = 1')
+      .get();
+    return isRecord(profile) && typeof profile.assistant_first_name === 'string'
+      ? profile.assistant_first_name
+      : undefined;
+  } finally {
+    database.close();
+  }
+}
+
 /** Verify shared prerequisites even on a host with no eligible assistants; every provider call is a GET. */
-async function checkArtifactsHost(
+async function checkWebHost(
   paths: ControlPlanePaths,
-  config: ArtifactsOperatorConfig,
-  dependencies: ArtifactsCapabilityDependencies,
+  config: WebOperatorConfig,
+  dependencies: WebCapabilityDependencies,
 ): Promise<readonly [ConnectorPrerequisite['status'], ConnectorPrerequisite['status'], string | null]> {
   try {
     const result = await (dependencies.runCommand ?? runSanitizedCommandOutcome)({
       command: config.cloudflaredPath,
       args: ['--version'],
-      cwd: artifactsOperatorFiles(paths).root,
+      cwd: webOperatorFiles(paths).root,
       env: buildToolEnvironment({}, { HOME: config.connector?.homeDirectory ?? process.env.HOME ?? '/' }),
       timeoutMs: 5000,
       outputLimitBytes: 4096,
@@ -224,7 +240,7 @@ async function checkArtifactsHost(
     ];
   }
   try {
-    const api = await artifactsApi(config, dependencies);
+    const api = await webApi(config, dependencies);
     const zone = await api.request('GET', `/zones/${config.zoneId}`);
     if (
       !isRecord(zone) ||
@@ -233,12 +249,12 @@ async function checkArtifactsHost(
       !isRecord(zone.account) ||
       zone.account.id !== config.accountId ||
       typeof zone.name !== 'string' ||
-      !(config.hostname === zone.name || config.hostname.endsWith(`.${zone.name}`))
+      config.zoneApex !== zone.name
     )
       return [
         'missing',
         'satisfied',
-        'The recorded artifact hostname does not belong to its active Cloudflare zone and account.',
+        'The recorded Cloudflare zone is inactive, belongs to another account, or no longer matches its apex.',
       ];
     const organization = await api.request('GET', `/accounts/${config.accountId}/access/organizations`);
     if (!isRecord(organization) || organization.auth_domain !== `${config.teamName}.cloudflareaccess.com`)
@@ -420,14 +436,14 @@ export async function inspectConnector(
       });
     }
   } else {
-    let config: ArtifactsOperatorConfig | undefined;
+    let config: WebOperatorConfig | undefined;
     try {
-      config = await readArtifactsOperatorConfig(artifactsOperatorFiles(paths).configFile);
+      config = await readWebOperatorConfig(webOperatorFiles(paths).configFile);
       setup = config ? 'installed' : 'not_installed';
       // eslint-disable-next-line no-catch-all/no-catch-all -- Invalid optional local configuration remains a fact in discovery rather than hiding the catalog.
     } catch (_error) {
       setup = 'unknown';
-      reasons.push('Artifacts operator configuration is invalid or inaccessible.');
+      reasons.push('Web operator configuration is invalid or inaccessible.');
     }
     if (config?.pending) {
       setup = 'pending';
@@ -439,20 +455,53 @@ export async function inspectConnector(
         });
     }
     if (canCheck && config && !config.pending) {
-      const [account, executable, reason] = await checkArtifactsHost(paths, config, options.artifacts ?? {});
+      const [account, executable, reason] = await checkWebHost(paths, config, options.web ?? {});
       prerequisiteStates[0] = account;
       prerequisiteStates[1] = executable;
       hostReady = account === 'satisfied' && executable === 'satisfied';
       if (reason) reasons.push(reason);
     }
-    const observations: ArtifactsCapabilityObservation[] = [];
+    const observations: WebCapabilityObservation[] = [];
     for (const id of ids) {
       let compatibility: ConnectorCompatibility = 'unknown';
       try {
         const runtime = await loadInstanceRuntimeConfig(paths.runtimeFile(id));
-        compatibility = await artifactsReleaseCompatibility(runtime.checkout_root);
+        compatibility = await webReleaseCompatibility(runtime.checkout_root);
         const live = canCheck && compatibility === 'compatible' && !unavailable.has(id);
-        const observation = await inspectArtifactsCapability(paths, id, { ...options.artifacts, check: live });
+        let observation = await inspectWebCapability(paths, id, { ...options.web, check: live });
+        if (config && !observation.hostname && compatibility === 'compatible') {
+          const firstName = webFirstName(runtime);
+          if (firstName !== undefined) {
+            let hostname: string | undefined;
+            try {
+              const candidate = webHostnameFor(firstName, config.zoneApex);
+              assertWebHostnameUnclaimed(await readRegistry(paths), id, candidate);
+              hostname = candidate;
+            } catch (cause) {
+              if (!(cause instanceof GwsEaError) || !['web_name_unusable', 'web_hostname_claimed'].includes(cause.code))
+                throw cause;
+              observation = {
+                ...observation,
+                reason_code: cause.code,
+                reason: cause.message,
+              };
+            }
+            if (hostname && live) {
+              try {
+                await assertWebHostnameAvailable(config, hostname, options.web);
+                // eslint-disable-next-line no-catch-all/no-catch-all -- A failed read-only preflight is an inspection fact; no claim or repair follows it.
+              } catch (cause) {
+                observation = {
+                  ...observation,
+                  remote:
+                    cause instanceof GwsEaError && cause.code === 'web_hostname_foreign' ? 'mismatch' : 'unavailable',
+                  reason_code: cause instanceof GwsEaError ? cause.code : 'web_hostname_unobserved',
+                  reason: cause instanceof GwsEaError ? cause.message : 'The web hostname could not be observed.',
+                };
+              }
+            }
+          }
+        }
         observations.push(observation);
         const state: ConnectorSetup =
           observation.activation === 'enabled'
@@ -467,7 +516,7 @@ export async function inspectConnector(
         const why = observation.reason
           ? [observation.reason]
           : state === 'pending'
-            ? ['Artifact serving has not been provisioned for this assistant.']
+            ? ['Web has not been provisioned for this assistant.']
             : [];
         if (unavailable.has(id)) why.push('The assistant is stopped or unreachable; serving was not checked.');
         assistants.push({
@@ -483,9 +532,11 @@ export async function inspectConnector(
                 ? [status(id)]
                 : unavailable.has(id)
                   ? [start(id)]
-                  : state !== 'installed' || (observed && !observation.ready)
-                    ? [repair(name)]
-                    : [],
+                  : ['web_name_unusable', 'web_hostname_claimed'].includes(observation.reason_code ?? '')
+                    ? []
+                    : state !== 'installed' || (observed && !observation.ready)
+                      ? [repair(name)]
+                      : [],
         });
         // eslint-disable-next-line no-catch-all/no-catch-all -- An unreadable runtime remains unknown local state; other assistants and connectors still report.
       } catch (_error) {
@@ -494,7 +545,7 @@ export async function inspectConnector(
           compatibility,
           setup: 'unknown',
           readiness: readiness(false),
-          reasons: ['Assistant runtime or local artifact state could not be observed.'],
+          reasons: ['Assistant runtime or local web state could not be observed.'],
           next_actions: [status(id)],
         });
       }
@@ -558,7 +609,7 @@ export function connectorLines(
           : onePasswordCapabilityLines(details, true, timezone)
         ).slice(1, -1)
       : details.flatMap((assistant) => [
-          `  Assistant ${assistant.instance_id}: ${assistant.hostname ?? 'hostname not configured'}${assistant.path_prefix ?? ''}`,
+          `  Assistant ${assistant.instance_id}: ${assistant.hostname ? `https://${assistant.hostname}` : 'address not provisioned'}`,
           `    Origin: ${assistant.activation}; remote: ${assistant.remote.replaceAll('_', ' ')}; listener: ${assistant.listener.replaceAll('_', ' ')}`,
         ]);
   return [

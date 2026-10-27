@@ -35,8 +35,7 @@ beforeEach(async () => {
     JSON.stringify({
       schemaVersion: 1,
       enabled: true,
-      hostname: 'views.example.com',
-      pathPrefix: '/aya',
+      hostname: 'aya.example.com',
       listenPort: 9123,
       accessIssuer: 'https://team.cloudflareaccess.com',
       accessAud: 'aud',
@@ -44,7 +43,7 @@ beforeEach(async () => {
     }),
     { mode: 0o600 },
   );
-  vi.stubEnv('GWS_EA_ARTIFACTS_POLICY_FILE', policy);
+  vi.stubEnv('GWS_EA_WEB_POLICY_FILE', policy);
   await runMigrations(await initTestDb());
   const now = new Date().toISOString();
   for (const id of ['canonical', 'worker']) {

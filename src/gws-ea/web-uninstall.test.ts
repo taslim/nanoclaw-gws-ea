@@ -6,29 +6,21 @@ import path from 'node:path';
 import { afterEach, expect, it } from 'vitest';
 
 import { processLock } from '../community-portal/process-lock.js';
-import { readArtifactsPolicy } from '../modules/gws-ea-artifacts/policy.js';
+import { readWebPolicy } from '../modules/gws-ea-web/policy.js';
 import {
-  artifactsIngress,
-  artifactsOperatorFiles,
-  readArtifactsOperatorConfig,
-  writeArtifactsOperatorConfig,
-  type ArtifactsOperatorConfig,
-} from './artifacts-cloudflare.js';
-import {
-  artifactsConnectorInstalled,
-  installArtifactsConnector,
-  type ArtifactsCapabilityDependencies,
-} from './artifacts-connector.js';
+  webIngress,
+  webOperatorFiles,
+  readWebOperatorConfig,
+  writeWebOperatorConfig,
+  type WebOperatorConfig,
+} from './web-cloudflare.js';
+import { webConnectorInstalled, installWebConnector, type WebCapabilityDependencies } from './web-connector.js';
 import { deriveGcpClaims } from './gcp-identity.js';
 import { reserveInstance } from './journal.js';
 import { resolveControlPlanePaths } from './paths.js';
-import { claimInstanceArtifacts, readRegistry } from './registry.js';
+import { claimInstanceWeb, readRegistry } from './registry.js';
 import { writePrivateTextFile } from './secrets.js';
-import {
-  artifactsUninstallFile,
-  inspectArtifactsUninstall,
-  uninstallArtifactsConnector,
-} from './artifacts-uninstall.js';
+import { webUninstallFile, inspectWebUninstall, uninstallWebConnector } from './web-uninstall.js';
 import type { InstanceReservationInput } from './types.js';
 
 const roots: string[] = [];
@@ -43,15 +35,15 @@ const exists = (file: string): Promise<boolean> =>
   );
 
 async function fixture(assistantCount = 2, ownedPin = true) {
-  const root = await mkdtemp(path.join(os.tmpdir(), 'artifacts-uninstall-'));
+  const root = await mkdtemp(path.join(os.tmpdir(), 'web-uninstall-'));
   roots.push(root);
   const paths = resolveControlPlanePaths({
     configRoot: path.join(root, 'config'),
     stateRoot: path.join(root, 'state'),
   });
-  const files = artifactsOperatorFiles(paths);
+  const files = webOperatorFiles(paths);
   await mkdir(files.root, { recursive: true, mode: 0o700 });
-  const assistants: Record<string, ArtifactsOperatorConfig['assistants'][string]> = {};
+  const assistants: Record<string, WebOperatorConfig['assistants'][string]> = {};
   const policyFiles: string[] = [];
   const contentFiles: string[] = [];
   for (let i = 0; i < assistantCount; i++) {
@@ -70,12 +62,11 @@ async function fixture(assistantCount = 2, ownedPin = true) {
       },
     };
     await reserveInstance(paths, input);
-    const reservation = await claimInstanceArtifacts(paths, id, {
-      hostname: 'views.example.com',
-      path_prefix: `/assistant${i}`,
+    const reservation = await claimInstanceWeb(paths, id, {
+      hostname: `assistant${i}.example.com`,
       listen_port: 34002 + i * 10,
     });
-    const claim = reservation.exclusive_resource_claims.artifacts;
+    const claim = reservation.exclusive_resource_claims.web;
     if (!claim) throw new Error('Missing fixture namespace');
     assistants[id] = {
       claim,
@@ -85,7 +76,7 @@ async function fixture(assistantCount = 2, ownedPin = true) {
       enabled: true,
       publicationReady: true,
     };
-    const policyFile = path.join(paths.instanceRoot(id), 'artifacts/policy.json');
+    const policyFile = path.join(paths.instanceRoot(id), 'web/policy.json');
     const contentFile = path.join(paths.instanceRoot(id), 'artifacts/content.html');
     policyFiles.push(policyFile);
     contentFiles.push(contentFile);
@@ -96,29 +87,33 @@ async function fixture(assistantCount = 2, ownedPin = true) {
         schemaVersion: 1,
         enabled: true,
         hostname: claim.hostname,
-        pathPrefix: claim.path_prefix,
         listenPort: claim.listen_port,
         accessIssuer: 'https://team.cloudflareaccess.com',
         accessAud: `aud${i}`,
         cloudflare: { accountId: 'account', applicationId: `app${i}`, operatorConfigFile: files.configFile },
       }),
     );
+    await mkdir(path.dirname(contentFile), { recursive: true, mode: 0o700 });
     await writePrivateTextFile(contentFile, `saved artifact ${i}`);
   }
-  const config: ArtifactsOperatorConfig = {
+  const config: WebOperatorConfig = {
     schemaVersion: 1,
     accountId: 'account',
     teamName: 'team',
     zoneId: 'zone',
-    hostname: 'views.example.com',
+    zoneApex: 'example.com',
     credentialFile: path.join(files.root, 'management-token'),
     cloudflaredPath: '/usr/local/bin/cloudflared',
     tunnelId: 'tunnel',
     pin: { id: 'pin', owned: ownedPin },
-    dns: { 'views.example.com': { id: 'dns', zoneId: 'zone' } },
+    dns: assistantCount
+      ? Object.fromEntries(
+          Object.values(assistants).map(({ claim }, i) => [claim.hostname, { id: `dns${i}`, zoneId: 'zone' }]),
+        )
+      : { 'views.example.com': { id: 'dns', zoneId: 'zone' } },
     assistants,
   };
-  await writeArtifactsOperatorConfig(files.configFile, config);
+  await writeWebOperatorConfig(files.configFile, config);
   await writePrivateTextFile(config.credentialFile, randomBytes(32).toString('hex'));
   await writePrivateTextFile(files.tokenFile, randomBytes(32).toString('hex'));
   const resources = new Map<string, unknown>([
@@ -127,15 +122,12 @@ async function fixture(assistantCount = 2, ownedPin = true) {
       { id: assistant.applicationId },
     ]),
     ['/accounts/account/cfd_tunnel/tunnel', { id: 'tunnel', config_src: 'cloudflare' }],
-    ['/zones/zone/dns_records/dns', { id: 'dns' }],
+    ...Object.values(config.dns).map((dns): [string, unknown] => [`/zones/zone/dns_records/${dns.id}`, { id: dns.id }]),
     ['/accounts/account/access/identity_providers/pin', { id: 'pin', type: 'onetimepin' }],
   ]);
   let ingress: { config: { ingress: readonly unknown[] } } = {
     config: {
-      ingress: [
-        ...Object.values(assistants).map(({ claim }) => artifactsIngress(claim)),
-        { service: 'http_status:404' },
-      ],
+      ingress: [...Object.values(assistants).map(({ claim }) => webIngress(claim)), { service: 'http_status:404' }],
     },
   };
   let failDelete: string | undefined;
@@ -145,8 +137,8 @@ async function fixture(assistantCount = 2, ownedPin = true) {
     const method = options?.method ?? 'GET';
     if (method !== 'GET') {
       // Provider effects must be fenced by durable ownership and every origin being closed.
-      expect((await inspectArtifactsUninstall(paths))?.stopped).toBe(true);
-      for (const policyFile of policyFiles) expect((await readArtifactsPolicy(policyFile)).enabled).toBe(false);
+      expect((await inspectWebUninstall(paths))?.stopped).toBe(true);
+      for (const policyFile of policyFiles) expect((await readWebPolicy(policyFile)).enabled).toBe(false);
       mutations.push(`${method} ${resource}`);
     }
     if (resource.endsWith('/configurations')) {
@@ -161,7 +153,7 @@ async function fixture(assistantCount = 2, ownedPin = true) {
     const found = resources.get(resource);
     return found ? Response.json({ success: true, result: found }) : Response.json({ success: false }, { status: 404 });
   };
-  const dependencies: ArtifactsCapabilityDependencies = {
+  const dependencies: WebCapabilityDependencies = {
     fetch: send,
     runCommand: async () => {
       throw new Error('Unexpected service manager');
@@ -191,30 +183,29 @@ async function fixture(assistantCount = 2, ownedPin = true) {
 
 it('closes every assistant before remote effects, settles claims and removes shared resources last while retaining content', async () => {
   const f = await fixture();
-  const result = await uninstallArtifactsConnector(f.paths, f.dependencies);
+  const result = await uninstallWebConnector(f.paths, f.dependencies);
   expect(result).toMatchObject({ outcome: 'removed', installed: false, changed: true, receipt_file: null });
   expect(f.resources.size).toBe(0);
   const lastApp = Math.max(...f.mutations.map((entry, i) => (entry.includes('/access/apps/') ? i : -1)));
   const tunnel = f.mutations.indexOf('DELETE /accounts/account/cfd_tunnel/tunnel');
   expect(tunnel).toBeGreaterThan(lastApp);
-  expect(await readArtifactsOperatorConfig(f.files.configFile)).toBeUndefined();
-  expect(await inspectArtifactsUninstall(f.paths)).toBeUndefined();
+  expect(await readWebOperatorConfig(f.files.configFile)).toBeUndefined();
+  expect(await inspectWebUninstall(f.paths)).toBeUndefined();
   expect(await exists(f.config.credentialFile)).toBe(false);
   expect(await exists(f.files.tokenFile)).toBe(false);
   for (const content of f.contentFiles) expect(await readFile(content, 'utf8')).toMatch(/^saved artifact \d$/u);
   for (const reservation of Object.values((await readRegistry(f.paths)).instances))
-    expect(reservation.exclusive_resource_claims.artifacts).toBeUndefined();
-  expect(await uninstallArtifactsConnector(f.paths, f.dependencies)).toMatchObject({
+    expect(reservation.exclusive_resource_claims.web).toBeUndefined();
+  expect(await uninstallWebConnector(f.paths, f.dependencies)).toMatchObject({
     outcome: 'removed',
     changed: false,
   });
   const id = Object.keys(f.config.assistants)[0];
-  const next = await claimInstanceArtifacts(f.paths, id, {
+  const next = await claimInstanceWeb(f.paths, id, {
     hostname: 'new.example.com',
-    path_prefix: '/renamed',
     listen_port: 45000,
   });
-  expect(next.exclusive_resource_claims.artifacts?.hostname).toBe('new.example.com');
+  expect(next.exclusive_resource_claims.web?.hostname).toBe('new.example.com');
 });
 
 it('journals interruption and resumes only unsettled resources while fencing all provisioning', async () => {
@@ -222,31 +213,31 @@ it('journals interruption and resumes only unsettled resources while fencing all
   const ids = Object.keys(f.config.assistants).sort();
   const lastApp = f.config.assistants[ids[1]].applicationId;
   f.fail(`/accounts/account/access/apps/${lastApp}`);
-  expect(await uninstallArtifactsConnector(f.paths, f.dependencies)).toMatchObject({
+  expect(await uninstallWebConnector(f.paths, f.dependencies)).toMatchObject({
     outcome: 'pending',
     installed: false,
     changed: true,
   });
-  const receipt = await inspectArtifactsUninstall(f.paths);
+  const receipt = await inspectWebUninstall(f.paths);
   expect(receipt?.completed_assistant_ids).toEqual([ids[0]]);
   expect(receipt?.reason).toContain('Cloudflare');
-  expect(await artifactsConnectorInstalled(f.paths)).toBe(false);
+  expect(await webConnectorInstalled(f.paths)).toBe(false);
   expect(await exists(f.config.credentialFile)).toBe(true);
   const before = [...f.mutations];
-  await expect(installArtifactsConnector(f.paths, {}, f.dependencies)).rejects.toMatchObject({
-    code: 'artifacts_uninstall_incomplete',
+  await expect(installWebConnector(f.paths, {}, f.dependencies)).rejects.toMatchObject({
+    code: 'web_uninstall_incomplete',
   });
   expect(f.mutations).toEqual(before);
   f.fail();
-  expect(await uninstallArtifactsConnector(f.paths, f.dependencies)).toMatchObject({ outcome: 'removed' });
+  expect(await uninstallWebConnector(f.paths, f.dependencies)).toMatchObject({ outcome: 'removed' });
   const firstApp = f.config.assistants[ids[0]].applicationId;
   expect(f.mutations.filter((entry) => entry === `DELETE /accounts/account/access/apps/${firstApp}`)).toHaveLength(1);
-  expect(await inspectArtifactsUninstall(f.paths)).toBeUndefined();
+  expect(await inspectWebUninstall(f.paths)).toBeUndefined();
 });
 
 it('retains an external PIN while removing only recorded owned resources', async () => {
   const f = await fixture(1, false);
-  expect(await uninstallArtifactsConnector(f.paths, f.dependencies)).toMatchObject({ outcome: 'removed' });
+  expect(await uninstallWebConnector(f.paths, f.dependencies)).toMatchObject({ outcome: 'removed' });
   expect([...f.resources.keys()]).toEqual(['/accounts/account/access/identity_providers/pin']);
   expect(f.mutations).not.toContain('DELETE /accounts/account/access/identity_providers/pin');
 });
@@ -254,8 +245,8 @@ it('retains an external PIN while removing only recorded owned resources', async
 it('retains an owned tunnel with unrelated routes and keeps local credentials for an exact retry', async () => {
   const f = await fixture(1);
   f.unrelatedIngress();
-  expect(await uninstallArtifactsConnector(f.paths, f.dependencies)).toMatchObject({ outcome: 'pending' });
-  expect((await inspectArtifactsUninstall(f.paths))?.reason).toContain('unrelated service');
+  expect(await uninstallWebConnector(f.paths, f.dependencies)).toMatchObject({ outcome: 'pending' });
+  expect((await inspectWebUninstall(f.paths))?.reason).toContain('unrelated service');
   expect(await exists(f.files.tokenFile)).toBe(true);
   expect(await exists(f.config.credentialFile)).toBe(true);
   expect(f.mutations).not.toContain('DELETE /accounts/account/cfd_tunnel/tunnel');
@@ -267,9 +258,9 @@ it('refuses a busy assistant without opening an uninstall receipt or changing an
   const release = await processLock(f.paths.instanceLock(id));
   if (!release) throw new Error('Could not acquire fixture instance lock');
   try {
-    await expect(uninstallArtifactsConnector(f.paths, f.dependencies)).rejects.toMatchObject({ code: 'instance_busy' });
-    expect(await inspectArtifactsUninstall(f.paths)).toBeUndefined();
-    expect((await readArtifactsPolicy(f.policyFiles[0])).enabled).toBe(true);
+    await expect(uninstallWebConnector(f.paths, f.dependencies)).rejects.toMatchObject({ code: 'instance_busy' });
+    expect(await inspectWebUninstall(f.paths)).toBeUndefined();
+    expect((await readWebPolicy(f.policyFiles[0])).enabled).toBe(true);
     expect(f.mutations).toEqual([]);
   } finally {
     release();
@@ -279,12 +270,12 @@ it('refuses a busy assistant without opening an uninstall receipt or changing an
 it('fails closed on unreadable ownership and malformed receipts instead of reporting removed', async () => {
   const f = await fixture(1);
   await rm(f.files.configFile);
-  await expect(uninstallArtifactsConnector(f.paths, f.dependencies)).rejects.toMatchObject({
-    code: 'artifacts_owner_missing',
+  await expect(uninstallWebConnector(f.paths, f.dependencies)).rejects.toMatchObject({
+    code: 'web_owner_missing',
   });
-  const receiptFile = artifactsUninstallFile(f.paths);
+  const receiptFile = webUninstallFile(f.paths);
   await writePrivateTextFile(receiptFile, JSON.stringify({ schemaVersion: 1 }));
-  await expect(inspectArtifactsUninstall(f.paths)).rejects.toMatchObject({ code: 'artifacts_uninstall_invalid' });
+  await expect(inspectWebUninstall(f.paths)).rejects.toMatchObject({ code: 'web_uninstall_invalid' });
   expect(f.mutations).toEqual([]);
 });
 
@@ -303,9 +294,8 @@ async function claimWithoutResources(f: Awaited<ReturnType<typeof fixture>>) {
       onecli_project: `gws-ea-${id.replaceAll('-', '')}`,
     },
   });
-  await claimInstanceArtifacts(f.paths, id, {
+  await claimInstanceWeb(f.paths, id, {
     hostname: 'views.example.com',
-    path_prefix: '/unprovisioned',
     listen_port: 48002,
   });
   return id;
@@ -314,44 +304,107 @@ async function claimWithoutResources(f: Awaited<ReturnType<typeof fixture>>) {
 it('uninstalls a host with a namespace claim but no assistant remote resource record', async () => {
   const f = await fixture(0);
   const id = await claimWithoutResources(f);
-  const result = await uninstallArtifactsConnector(f.paths, f.dependencies);
+  const result = await uninstallWebConnector(f.paths, f.dependencies);
   expect(result).toMatchObject({ outcome: 'removed', changed: true });
-  expect((await readRegistry(f.paths)).instances[id].exclusive_resource_claims.artifacts).toBeUndefined();
+  expect((await readRegistry(f.paths)).instances[id].exclusive_resource_claims.web).toBeUndefined();
   expect(f.resources.size).toBe(0);
-  expect(await readArtifactsOperatorConfig(f.files.configFile)).toBeUndefined();
-  expect(await inspectArtifactsUninstall(f.paths)).toBeUndefined();
+  expect(await readWebOperatorConfig(f.files.configFile)).toBeUndefined();
+  expect(await inspectWebUninstall(f.paths)).toBeUndefined();
+});
+
+it('retains a partial assistant claim until its recorded DNS cleanup settles', async () => {
+  const f = await fixture(0);
+  const id = await claimWithoutResources(f);
+  f.fail('/zones/zone/dns_records/dns');
+  expect(await uninstallWebConnector(f.paths, f.dependencies)).toMatchObject({ outcome: 'pending' });
+  expect((await readRegistry(f.paths)).instances[id].exclusive_resource_claims.web).toEqual({
+    hostname: 'views.example.com',
+    listen_port: 48002,
+  });
+  const receipt = await inspectWebUninstall(f.paths);
+  expect(receipt?.completed_assistant_ids).toEqual([]);
+  expect(receipt?.assistants[id].ownership.assistants[id]).toEqual({
+    claim: { hostname: 'views.example.com', listen_port: 48002 },
+    enabled: false,
+  });
+  expect(f.mutations).not.toContain('DELETE /accounts/account/cfd_tunnel/tunnel');
+  f.fail();
+  expect(await uninstallWebConnector(f.paths, f.dependencies)).toMatchObject({ outcome: 'removed' });
+  expect((await readRegistry(f.paths)).instances[id].exclusive_resource_claims.web).toBeUndefined();
+  expect(f.resources.size).toBe(0);
+  expect(await inspectWebUninstall(f.paths)).toBeUndefined();
+});
+
+it('retains a partial assistant claim and exact pending DNS attempt until the operator resolves it', async () => {
+  const f = await fixture(0);
+  const id = await claimWithoutResources(f);
+  const pending = {
+    kind: 'dns' as const,
+    key: randomUUID(),
+    target: 'views.example.com',
+    startedAt: new Date().toISOString(),
+    resource: '/zones/zone/dns_records',
+    fingerprint: 'b'.repeat(64),
+  };
+  await writeWebOperatorConfig(f.files.configFile, { ...f.config, dns: {}, pending });
+  expect(await uninstallWebConnector(f.paths, f.dependencies)).toMatchObject({ outcome: 'pending' });
+  expect((await readRegistry(f.paths)).instances[id].exclusive_resource_claims.web?.hostname).toBe('views.example.com');
+  const receipt = await inspectWebUninstall(f.paths);
+  expect(receipt?.assistants[id].ownership.pending).toEqual(pending);
+  expect(receipt?.assistants[id].ownership.assistants[id]).toEqual({
+    claim: { hostname: 'views.example.com', listen_port: 48002 },
+    enabled: false,
+  });
+  expect(f.mutations.some((effect) => effect.startsWith('DELETE'))).toBe(false);
+  // The operator removes the possible remote creation before acknowledging its exact journal entry.
+  f.resources.delete('/zones/zone/dns_records/dns');
+  await writeWebOperatorConfig(f.files.configFile, {
+    ...f.config,
+    dns: {},
+    resolvedAttempts: [
+      {
+        ...pending,
+        resolution: 'operator_removed',
+        resolvedAt: new Date().toISOString(),
+      },
+    ],
+  });
+  expect(await uninstallWebConnector(f.paths, f.dependencies)).toMatchObject({ outcome: 'removed' });
+  expect((await readRegistry(f.paths)).instances[id].exclusive_resource_claims.web).toBeUndefined();
+  expect(f.resources.size).toBe(0);
+  expect(await inspectWebUninstall(f.paths)).toBeUndefined();
 });
 
 it('releases a claim with no configuration or local resource policy without contacting Cloudflare', async () => {
   const f = await fixture(0);
   const id = await claimWithoutResources(f);
   await rm(f.files.configFile);
-  const result = await uninstallArtifactsConnector(f.paths, {
+  const result = await uninstallWebConnector(f.paths, {
     fetch: async () => {
       throw new Error('A claim alone owns no remote resources');
     },
   });
   expect(result).toMatchObject({ outcome: 'removed', changed: true });
-  expect((await readRegistry(f.paths)).instances[id].exclusive_resource_claims.artifacts).toBeUndefined();
+  expect((await readRegistry(f.paths)).instances[id].exclusive_resource_claims.web).toBeUndefined();
 });
 
 it('releases a new bare claim beside the disabled policy retained by a completed uninstall', async () => {
   const f = await fixture(1);
   const id = Object.keys(f.config.assistants)[0];
   const claim = f.config.assistants[id].claim;
-  expect(await uninstallArtifactsConnector(f.paths, f.dependencies)).toMatchObject({ outcome: 'removed' });
+  expect(await uninstallWebConnector(f.paths, f.dependencies)).toMatchObject({ outcome: 'removed' });
   const stalePolicy = await readFile(f.policyFiles[0], 'utf8');
-  expect((await readArtifactsPolicy(f.policyFiles[0])).enabled).toBe(false);
-  await claimInstanceArtifacts(f.paths, id, claim);
-  const result = await uninstallArtifactsConnector(f.paths, {
+  expect((await readWebPolicy(f.policyFiles[0])).enabled).toBe(false);
+  await claimInstanceWeb(f.paths, id, claim);
+  const result = await uninstallWebConnector(f.paths, {
     fetch: async () => {
       throw new Error('The completed uninstall already deleted its remote resources');
     },
   });
   expect(result).toMatchObject({ outcome: 'removed', changed: true });
-  expect((await readRegistry(f.paths)).instances[id].exclusive_resource_claims.artifacts).toBeUndefined();
+  expect((await readRegistry(f.paths)).instances[id].exclusive_resource_claims.web).toBeUndefined();
   expect(await readFile(f.policyFiles[0], 'utf8')).toBe(stalePolicy);
-  expect(await inspectArtifactsUninstall(f.paths)).toBeUndefined();
+  expect(await inspectWebUninstall(f.paths)).toBeUndefined();
 });
 
 it('keeps an unproven application creation fenced after releasing its resource-free namespace claim', async () => {
@@ -365,22 +418,64 @@ it('keeps an unproven application creation fenced after releasing its resource-f
     resource: '/accounts/account/access/apps',
     fingerprint: 'b'.repeat(64),
   };
-  await writeArtifactsOperatorConfig(f.files.configFile, { ...f.config, pending });
-  expect(await uninstallArtifactsConnector(f.paths, f.dependencies)).toMatchObject({ outcome: 'pending' });
-  expect((await readRegistry(f.paths)).instances[id].exclusive_resource_claims.artifacts).toBeUndefined();
-  expect((await inspectArtifactsUninstall(f.paths))?.shared.ownership.pending).toEqual(pending);
+  await writeWebOperatorConfig(f.files.configFile, { ...f.config, dns: {}, pending });
+  expect(await uninstallWebConnector(f.paths, f.dependencies)).toMatchObject({ outcome: 'pending' });
+  expect((await readRegistry(f.paths)).instances[id].exclusive_resource_claims.web).toBeUndefined();
+  expect((await inspectWebUninstall(f.paths))?.shared.ownership.pending).toEqual(pending);
   expect(await exists(f.config.credentialFile)).toBe(true);
-  await expect(installArtifactsConnector(f.paths, {}, f.dependencies)).rejects.toMatchObject({
-    code: 'artifacts_uninstall_incomplete',
+  await expect(installWebConnector(f.paths, {}, f.dependencies)).rejects.toMatchObject({
+    code: 'web_uninstall_incomplete',
   });
 });
 
 it('returns operator token revocation and original credential-file cleanup after uninstall completes', async () => {
   const f = await fixture(1);
-  const result = await uninstallArtifactsConnector(f.paths, f.dependencies);
+  const result = await uninstallWebConnector(f.paths, f.dependencies);
   expect(result).toMatchObject({ outcome: 'removed', operator_actions: [expect.stringContaining('Revoke')] });
   expect(result.operator_actions.join(' ')).toContain('Cloudflare');
   expect(result.operator_actions.join(' ')).toContain('--credential-file');
   expect(result.operator_actions.join(' ')).toContain('delete');
   expect(await exists(f.config.credentialFile)).toBe(false);
+});
+
+it('installs a different verified zone after uninstall removes the previous connector ownership', async () => {
+  const f = await fixture(0);
+  expect(await uninstallWebConnector(f.paths, f.dependencies)).toMatchObject({ outcome: 'removed' });
+  const credentialFile = path.join(f.paths.configRoot, 'new-zone-credential');
+  await writePrivateTextFile(credentialFile, randomBytes(32).toString('hex'));
+  const requests: string[] = [];
+  expect(
+    await installWebConnector(
+      f.paths,
+      {
+        accountId: 'new-account',
+        teamName: 'new-team',
+        zoneId: 'new-zone',
+        credentialFile,
+        cloudflaredPath: '/usr/bin/true',
+      },
+      {
+        fetch: async (input, init) => {
+          const resource = new URL(String(input)).pathname;
+          requests.push(`${init?.method} ${resource}`);
+          const result = resource.endsWith('/zones/new-zone')
+            ? { id: 'new-zone', status: 'active', name: 'another.example', account: { id: 'new-account' } }
+            : { auth_domain: 'new-team.cloudflareaccess.com' };
+          return Response.json({ success: true, result });
+        },
+      },
+    ),
+  ).toMatchObject({ installed: true, assistants: [] });
+  expect(await readWebOperatorConfig(f.files.configFile)).toMatchObject({
+    accountId: 'new-account',
+    teamName: 'new-team',
+    zoneId: 'new-zone',
+    zoneApex: 'another.example',
+    assistants: {},
+    dns: {},
+  });
+  expect(requests).toEqual([
+    'GET /client/v4/zones/new-zone',
+    'GET /client/v4/accounts/new-account/access/organizations',
+  ]);
 });

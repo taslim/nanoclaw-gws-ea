@@ -16,18 +16,25 @@ nothing else) links.
 
 ## Operation and access
 
-Install this optional connector host-wide through the
-[operator CLI](gws-ea-cli.md#html-artifacts). It records one Cloudflare account,
-Access team and shared hostname, then provisions a shared Named Cloudflare Tunnel and
-a separate Access application for each compatible running assistant with a
-complete profile.
-Other assistants remain pending; create, resume, update, start and restart retry
-installed-connector setup. A repeated install verifies a ready assistant without
-restarting its author containers.
+Install the optional `web` connector host-wide through the
+[operator CLI](gws-ea-cli.md#assistant-web). It verifies and records one Cloudflare
+account, Access team and active zone, then provisions a shared Named Cloudflare
+Tunnel and a separate DNS record and Access application for each compatible
+running assistant with a complete profile. Artifacts is the first feature on
+that address; there is no artifacts connector or second activation step.
 
-Each assistant's first name is its stable prefix on the shared hostname.
-Prefix collisions fail before ingress opens; gws-ea adds no generated suffix.
-The current install has no per-assistant hostname override.
+An assistant named Aya claims `aya.example.com` on zone `example.com`. Its first
+name uses the shared ASCII reduction, capped at 63 characters, with no suffix or
+override. The claim survives renames. An unusable name or a duplicate leaves web
+pending with the reason and holder; recreate under another first name or remove
+the holder. A foreign exact or wildcard DNS record, Access destination or tunnel
+route leaves the name unclaimed until the operator resolves it. Other setup
+prerequisites remain pending; create, resume, update, start and restart retry
+installed web setup. A repeated install verifies a ready assistant without
+restarting its authors.
+
+Only canonical `/artifacts` routes reach the feature. Root, other paths, encoded
+aliases, another Host and methods other than GET and HEAD serve no content.
 
 Cloudflare credentials and connector tokens are host-only, separate files.
 Management permissions cover the selected account/zones and the required Tunnel,
@@ -43,11 +50,11 @@ need no login. Identity seats and account capacity depend on the operator's
 Cloudflare plan; verify that allowance before inviting readers. Viewing also
 depends on the operator host and connector being available.
 
-| Link                           | Content and authority                                                        |
-| ------------------------------ | ---------------------------------------------------------------------------- |
-| `/aya/<artifact_id>`           | Current private head; current principal addresses only                       |
-| `/aya/share/<share_id>`        | The granted revision; its exact active named audience or a current principal |
-| `/aya/public/<publication_id>` | The selected active public revision                                          |
+| Link | Content and authority |
+| --- | --- |
+| `/artifacts/<artifact_id>` | Current private head; current principal addresses only |
+| `/artifacts/share/<share_id>` | The granted revision; its exact active named audience or a current principal |
+| `/artifacts/public/<publication_id>` | The selected active public revision |
 
 A guest cannot browse drafts, history, another artifact or a listing. A private
 edit does not alter a named grant or public snapshot. Explicit replacement names
@@ -73,8 +80,9 @@ file. Include styles, scripts, SVG and data assets inline. A typical page is
 8–20 KB; the hard single-document limit is 4 MiB including real data and images.
 Preserve the information within that limit instead of truncating it.
 
-Canonical main gains the capability when artifacts is provisioned for the
-assistant. Other eligible groups require explicit `artifacts` selection, with file-read/write permissions
+Canonical main gains the capability when web is provisioned for the
+assistant. A temporary listener, tunnel or verification outage leaves authoring
+available; uninstall, removal or confirmed ownership loss closes it. Other eligible groups require explicit `artifacts` selection, with file-read/write permissions
 for authoring. Sealed browser and external-message agents do not inherit it.
 Workers manage their own artifacts and hand references to main; main can oversee
 assistant-owned content and handles external sharing. Current host authority is
@@ -143,7 +151,7 @@ verification cannot discover external session revocation by itself.
 
 ## Recovery and verification
 
-Use `connectors show artifacts --id …` for local observation and `check` for
+Use `connectors show web --id …` for local observation and `check` for
 bounded verification; neither repairs. Optional startup failure leaves ordinary
 conversation available. The origin stays unavailable until Access prerequisites
 and its local listener are verified. New named admission can remain pending;
@@ -156,13 +164,16 @@ verification before publication can proceed.
 
 Central-data snapshots contain immutable HTML and pointers. Update/restore
 reconciles remote intent before serving; unknown policy compatibility fails
-closed. `connectors uninstall artifacts` closes every assistant origin before
+closed. `connectors uninstall web` closes every assistant origin before
 any remote deletion, then removes verified owned per-assistant resources and
 shared resources last. Issued links stop working. Local HTML content and
 external PIN providers or unrelated tunnel routes remain. The host receipt
 resumes interrupted cleanup, and provisioning waits until cleanup completes.
 Per-assistant removal follows its separate owned-resource receipt and keeps
-shared resources while peers need them.
+the shared connector, tunnel, PIN, configuration and tokens even when the last
+assistant is removed. Only connector uninstall removes shared resources. Its
+result instructs the operator to revoke the management token in Cloudflare and
+remove the original credential file.
 
 Inspect any reported unproven create rather than identifying ownership by a
 friendly name. Only after removing its possible resource should the operator
@@ -195,5 +206,6 @@ Before deployment, complete that live check with two disposable assistants:
 sign in with every principal address, verify exact named-guest access and
 cross-assistant denial, open public snapshots without signing in, then withdraw
 access while retaining an old session. Verify `no-store`, namespace collisions,
-Tunnel delivery and last/non-last assistant cleanup. The PR's local acceptance
+Tunnel delivery, per-assistant cleanup with shared resources retained, and
+connector uninstall with shared resources removed. The PR's local acceptance
 does not replace this deployment gate.

@@ -2869,16 +2869,42 @@ describe('the vault a new assistant inherits from 1Password enablement', () => {
     expect(provider.calls).toHaveLength(calls);
   });
 
-  it('keeps the 1Password discard target off the pending artifacts install command', async () => {
+  it.each(['web_name_unusable', 'web_hostname_claimed', 'web_hostname_foreign'])(
+    'continues through alias setup when web is pending for %s',
+    async (reason) => {
+      const harness = await productionHarness();
+      const provisioning = vi.spyOn(connectorProvisioning, 'provisionInstalledConnectors').mockResolvedValue({
+        pending: [{ name: 'web', reason, message: 'The address cannot be claimed.' }],
+        next_actions:
+          reason === 'web_hostname_foreign'
+            ? [{ kind: 'command', argv: ['gws-ea', 'connectors', 'install', 'web'] }]
+            : [],
+      });
+      try {
+        const result = await withInstanceOperation(harness.paths, harness.instanceId, (operation) =>
+          provisionAssistantResources(operation, {}, {}, { skip: true }),
+        );
+        expect(result).toMatchObject({ status: 'ready', pendingConnectors: [{ name: 'web', reason }] });
+        expect(
+          (await readProvisionJournal(harness.paths, harness.instanceId)).decisions.alias_skipped_at,
+        ).toBeDefined();
+        expect(result).not.toHaveProperty('pause');
+      } finally {
+        provisioning.mockRestore();
+      }
+    },
+  );
+
+  it('keeps the 1Password discard target off the pending web install command', async () => {
     const harness = await productionHarness();
     const provisioning = vi.spyOn(connectorProvisioning, 'provisionInstalledConnectors').mockResolvedValue({
       pending: [
         { name: 'onepassword', reason: 'vault_creation_unproven', message: 'Vault creation is unproven.' },
-        { name: 'artifacts', reason: 'setup_pending', message: 'Artifacts setup is pending.' },
+        { name: 'web', reason: 'setup_pending', message: 'Web setup is pending.' },
       ],
       next_actions: [
         { kind: 'command', argv: ['gws-ea', 'connectors', 'install', 'onepassword'] },
-        { kind: 'command', argv: ['gws-ea', 'connectors', 'install', 'artifacts'] },
+        { kind: 'command', argv: ['gws-ea', 'connectors', 'install', 'web'] },
       ],
     });
     try {
@@ -2890,7 +2916,7 @@ describe('the vault a new assistant inherits from 1Password enablement', () => {
         pause: {
           details: [
             `Then: gws-ea connectors install onepassword --discard-unproven ${harness.instanceId}`,
-            'Then: gws-ea connectors install artifacts',
+            'Then: gws-ea connectors install web',
             `Continue with gws-ea resume --id ${harness.instanceId}.`,
           ],
         },

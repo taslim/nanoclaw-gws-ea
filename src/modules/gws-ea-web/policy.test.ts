@@ -3,14 +3,13 @@ import path from 'node:path';
 import { tmpdir } from 'node:os';
 import { execFileSync } from 'node:child_process';
 import { afterEach, beforeEach, expect, it } from 'vitest';
-import { parseArtifactsPolicyFile, readArtifactsPolicy, type ArtifactsPolicyFile } from './policy.js';
+import { parseWebPolicyFile, readWebPolicy, type WebPolicyFile } from './policy.js';
 
 const ROOT = path.join(fs.realpathSync(tmpdir()), `gws-ea-artifact-policy-${process.pid}`);
-const config: ArtifactsPolicyFile = {
+const config: WebPolicyFile = {
   schemaVersion: 1,
   enabled: true,
   hostname: 'views.example.com',
-  pathPrefix: '/aya',
   listenPort: 9123,
   accessIssuer: 'https://team.cloudflareaccess.com',
   accessAud: 'assistant-aud',
@@ -23,17 +22,16 @@ beforeEach(() => {
 afterEach(() => {
   fs.rmSync(ROOT, { recursive: true, force: true });
 });
-it('retains complete disabled coordinates, distinguishes absence from malformed state and accepts a dedicated host prefix', async () => {
+it('retains complete disabled coordinates, distinguishes absence from malformed state', async () => {
   const file = path.join(ROOT, 'policy.json');
-  expect(await readArtifactsPolicy(file)).toEqual({ status: 'disabled', enabled: false });
+  expect(await readWebPolicy(file)).toEqual({ status: 'disabled', enabled: false });
   fs.writeFileSync(file, JSON.stringify(config), { mode: 0o600 });
-  expect(await readArtifactsPolicy(file)).toEqual({ status: 'enabled', enabled: true, config });
+  expect(await readWebPolicy(file)).toEqual({ status: 'enabled', enabled: true, config });
   const disabled = { ...config, enabled: false };
   fs.writeFileSync(file, JSON.stringify(disabled));
-  expect(await readArtifactsPolicy(file)).toEqual({ status: 'disabled', enabled: false, config: disabled });
+  expect(await readWebPolicy(file)).toEqual({ status: 'disabled', enabled: false, config: disabled });
   fs.writeFileSync(file, '{broken');
-  expect(await readArtifactsPolicy(file)).toMatchObject({ status: 'unavailable', enabled: false });
-  expect(parseArtifactsPolicyFile({ ...config, pathPrefix: '' })).toEqual({ ...config, pathPrefix: '' });
+  expect(await readWebPolicy(file)).toMatchObject({ status: 'unavailable', enabled: false });
 });
 it.each([
   { schemaVersion: 2 },
@@ -50,7 +48,7 @@ it.each([
 ])('fails closed on malformed or unsupported policy %j', async (change) => {
   const file = path.join(ROOT, 'policy.json');
   fs.writeFileSync(file, JSON.stringify({ ...config, ...change }), { mode: 0o600 });
-  expect(await readArtifactsPolicy(file)).toMatchObject({ status: 'unavailable', enabled: false });
+  expect(await readWebPolicy(file)).toMatchObject({ status: 'unavailable', enabled: false });
 });
 it.each(['symlink', 'fifo', 'mode', 'oversized'] as const)('refuses unsafe %s policy without hanging', async (kind) => {
   const file = path.join(ROOT, 'policy.json');
@@ -65,28 +63,10 @@ it.each(['symlink', 'fifo', 'mode', 'oversized'] as const)('refuses unsafe %s po
   }
   if (kind === 'mode') fs.chmodSync(file, 0o644);
   if (kind === 'oversized') fs.writeFileSync(file, Buffer.alloc(16 * 1024 + 1));
-  expect(await readArtifactsPolicy(file)).toMatchObject({ status: 'unavailable', enabled: false });
+  expect(await readWebPolicy(file)).toMatchObject({ status: 'unavailable', enabled: false });
 });
 
-it('accepts canonical encoded first names and refuses ambiguous or escaping segments', () => {
-  for (const name of ['élise', '李', "o'neil", 'mary-jane', 'a.b']) {
-    const pathPrefix = `/${encodeURIComponent(name)}`;
-    expect(parseArtifactsPolicyFile({ ...config, pathPrefix })?.pathPrefix).toBe(pathPrefix);
-  }
-  for (const pathPrefix of [
-    '/%61ya',
-    '/%2f',
-    '/%5C',
-    '/%00',
-    '/.',
-    '/..',
-    '/%70ublic',
-    '/Élise',
-    '/%C3%89lise',
-    '/mary%20jane',
-    '/%ef%bc%a1',
-    '/%',
-  ]) {
-    expect(parseArtifactsPolicyFile({ ...config, pathPrefix }), pathPrefix).toBeUndefined();
-  }
+it('refuses the removed path-prefix field, including the old fixed mount', () => {
+  for (const pathPrefix of ['', '/aya', '/artifacts'])
+    expect(parseWebPolicyFile({ ...config, pathPrefix })).toBeUndefined();
 });
