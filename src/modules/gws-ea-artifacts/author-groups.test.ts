@@ -28,7 +28,7 @@ it('observes only canonical main and explicitly selected live eligible authors, 
     cloudflare: { accountId: 'account', applicationId: 'app', operatorConfigFile: path.join(root, 'config.json') },
   };
   await writeFile(file, JSON.stringify(policy), { mode: 0o600 });
-  vi.stubEnv('GWS_EA_ARTIFACTS_POLICY_FILE', file);
+  vi.stubEnv('GWS_EA_WEB_POLICY_FILE', file);
   await runMigrations(await initTestDb());
   const now = new Date().toISOString();
   for (const id of ['canonical', 'writer', 'retired', 'sealed', 'unselected', 'all']) {

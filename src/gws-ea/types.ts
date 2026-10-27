@@ -31,9 +31,8 @@ export interface AllocatedPorts {
 }
 
 /** A retained public namespace and host-only listener claim. Identity stays internal. */
-export interface ArtifactsNamespaceClaim {
+export interface WebNamespaceClaim {
   readonly hostname: string;
-  readonly path_prefix: string;
   readonly listen_port: number;
 }
 
@@ -58,7 +57,7 @@ export interface ExclusiveResourceClaims {
   alias_email?: string;
   /** E.164. */
   whatsapp_number?: string;
-  artifacts?: ArtifactsNamespaceClaim;
+  web?: WebNamespaceClaim;
   onecli_project: string;
 }
 

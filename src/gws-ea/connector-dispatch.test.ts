@@ -89,7 +89,7 @@ it.each(['list', 'show'] as const)(
               connectors: expect.arrayContaining([
                 expect.objectContaining({ name: 'voice' }),
                 expect.objectContaining(onePassword),
-                expect.objectContaining({ name: 'artifacts' }),
+                expect.objectContaining({ name: 'web' }),
               ]),
             }
           : onePassword,

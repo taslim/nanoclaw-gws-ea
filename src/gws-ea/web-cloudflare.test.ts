@@ -1,11 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import {
-  artifactsIngress,
-  artifactsPathPrefix,
-  createArtifactsCloudflareApi,
-  parseArtifactsOperatorConfig,
-} from './artifacts-cloudflare.js';
+import { webIngress, createWebCloudflareApi, parseWebOperatorConfig } from './web-cloudflare.js';
 
 const instanceId = '00000000-0000-4000-8000-000000000001';
 const attemptKey = '00000000-0000-4000-8000-000000000002';
@@ -14,14 +9,14 @@ const operatorConfig = () => ({
   accountId: 'account',
   zoneId: 'zone',
   teamName: 'team',
-  hostname: 'views.example.test',
-  credentialFile: '/operator/artifacts/management-token',
+  zoneApex: 'example.test',
+  credentialFile: '/operator/web/management-token',
   cloudflaredPath: '/usr/local/bin/cloudflared',
   dns: {},
   assistants: {},
 });
 
-describe('artifacts Cloudflare boundary', () => {
+describe('web Cloudflare boundary', () => {
   it('constructs only validated owned fields, including nested recovery and service records', () => {
     const raw = {
       ...operatorConfig(),
@@ -30,16 +25,16 @@ describe('artifacts Cloudflare boundary', () => {
       assistants: {
         [instanceId]: {
           enabled: false,
-          claim: { hostname: 'views.example.test', path_prefix: '/avery', listen_port: 41000, unrecognized: 'discard' },
+          claim: { hostname: 'views.example.test', listen_port: 41000, unrecognized: 'discard' },
           unrecognized: 'discard',
         },
       },
       pin: { id: 'pin', owned: false, unrecognized: 'discard' },
       connector: {
         manager: 'systemd-user',
-        definitionFile: '/home/operator/.config/systemd/user/com.gws-ea.artifacts.0000000000000000.service',
+        definitionFile: '/home/operator/.config/systemd/user/com.gws-ea.web.0000000000000000.service',
         homeDirectory: '/home/operator',
-        label: 'com.gws-ea.artifacts.0000000000000000',
+        label: 'com.gws-ea.web.0000000000000000',
         unrecognized: 'discard',
       },
       pending: {
@@ -66,12 +61,12 @@ describe('artifacts Cloudflare boundary', () => {
         },
       ],
     };
-    const parsed = parseArtifactsOperatorConfig(raw);
+    const parsed = parseWebOperatorConfig(raw);
     expect(JSON.stringify(parsed)).not.toContain('unrecognized');
     expect(parsed.dns).toEqual({ 'views.example.test': { id: 'dns', zoneId: 'zone' } });
     expect(parsed.assistants[instanceId]).toEqual({
       enabled: false,
-      claim: { hostname: 'views.example.test', path_prefix: '/avery', listen_port: 41000 },
+      claim: { hostname: 'views.example.test', listen_port: 41000 },
     });
     expect(parsed.pending).toEqual({
       kind: 'tunnel',
@@ -87,7 +82,7 @@ describe('artifacts Cloudflare boundary', () => {
       resolution: 'operator_removed',
       resolvedAt: '2026-10-23T00:00:00.000Z',
     });
-    expect(parseArtifactsOperatorConfig(JSON.parse(JSON.stringify(parsed)))).toEqual(parsed);
+    expect(parseWebOperatorConfig(JSON.parse(JSON.stringify(parsed)))).toEqual(parsed);
   });
 
   it.each([
@@ -99,18 +94,7 @@ describe('artifacts Cloudflare boundary', () => {
           [instanceId]: {
             enabled: false,
             applicationId: 7,
-            claim: { hostname: 'views.example.test', path_prefix: '/avery', listen_port: 41000 },
-          },
-        },
-      },
-    },
-    {
-      label: 'ambiguous namespace',
-      patch: {
-        assistants: {
-          [instanceId]: {
-            enabled: false,
-            claim: { hostname: 'views.example.test', path_prefix: '/a%2Fb', listen_port: 41000 },
+            claim: { hostname: 'views.example.test', listen_port: 41000 },
           },
         },
       },
@@ -121,7 +105,7 @@ describe('artifacts Cloudflare boundary', () => {
         assistants: {
           [instanceId]: {
             enabled: true,
-            claim: { hostname: 'views.example.test', path_prefix: '/avery', listen_port: 41000 },
+            claim: { hostname: 'views.example.test', listen_port: 41000 },
           },
         },
       },
@@ -133,7 +117,7 @@ describe('artifacts Cloudflare boundary', () => {
           manager: 'systemd-user',
           definitionFile: '/unrelated.service',
           homeDirectory: '/home/operator',
-          label: 'com.gws-ea.artifacts.0000000000000000',
+          label: 'com.gws-ea.web.0000000000000000',
         },
       },
     },
@@ -167,34 +151,22 @@ describe('artifacts Cloudflare boundary', () => {
       },
     },
   ])('refuses malformed nested $label', ({ patch }) => {
-    expect(() => parseArtifactsOperatorConfig({ ...operatorConfig(), ...patch })).toThrow(
-      expect.objectContaining({ code: 'artifacts_operator_invalid' }),
+    expect(() => parseWebOperatorConfig({ ...operatorConfig(), ...patch })).toThrow(
+      expect.objectContaining({ code: 'web_operator_invalid' }),
     );
   });
-  it('claims a canonical first-name segment and matches the decoded Go URL path', () => {
-    const pathPrefix = artifactsPathPrefix('  María del Mar  ');
-    expect(pathPrefix).toBe('/mar%C3%ADa-del-mar');
-    expect(artifactsIngress({ hostname: 'views.example.test', path_prefix: pathPrefix, listen_port: 41234 })).toEqual({
-      hostname: 'views.example.test',
-      path: '^/maría-del-mar(/|$)',
+  it('exposes only the fixed artifacts mount on the assistant hostname', () => {
+    expect(webIngress({ hostname: 'aya.example.test', listen_port: 41234 })).toEqual({
+      hostname: 'aya.example.test',
+      path: '^/artifacts(/|$)',
       service: 'http://127.0.0.1:41234',
     });
-    expect(artifactsIngress({ hostname: 'views.example.test', path_prefix: '/a.b', listen_port: 41234 }).path).toBe(
-      '^/a\\.b(/|$)',
-    );
   });
-
-  it.each(['', '.', '..', 'public', 'a/b', 'a\\b', 'a%2fb', 'a\u0000b'])(
-    'refuses ambiguous or reserved first name %j',
-    (name) => {
-      expect(() => artifactsPathPrefix(name)).toThrow();
-    },
-  );
 
   it('bounds rate-limit retries and never exposes Cloudflare response material', async () => {
     let requests = 0;
     const delays: number[] = [];
-    const api = createArtifactsCloudflareApi('private-token-fixture', {
+    const api = createWebCloudflareApi('private-token-fixture', {
       fetch: async () => {
         requests++;
         return new Response(JSON.stringify({ success: false, errors: [{ message: 'private-token-fixture' }] }), {
@@ -207,7 +179,7 @@ describe('artifacts Cloudflare boundary', () => {
       },
     });
     await expect(api.request('GET', '/accounts/account/access/apps')).rejects.toMatchObject({
-      code: 'artifacts_cloudflare_rate_limited',
+      code: 'web_cloudflare_rate_limited',
       message: 'Cloudflare rate limited this operation. Retry after the reported delay.',
     });
     expect(requests).toBe(2);

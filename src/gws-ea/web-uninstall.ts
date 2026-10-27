@@ -2,32 +2,28 @@ import path from 'node:path';
 
 import { isErrno } from '../community-portal/errors.js';
 import { processLock } from '../community-portal/process-lock.js';
-import { readArtifactsPolicy } from '../modules/gws-ea-artifacts/policy.js';
-import {
-  artifactsOperatorFiles,
-  readArtifactsOperatorConfig,
-  writeArtifactsOperatorConfig,
-} from './artifacts-cloudflare.js';
-import { parseArtifactsCleanup, settleArtifactsCleanup, type ArtifactsCleanup } from './artifacts-removal.js';
-import type { ArtifactsCapabilityDependencies } from './artifacts-connector.js';
+import { readWebPolicy } from '../modules/gws-ea-web/policy.js';
+import { webOperatorFiles, readWebOperatorConfig, writeWebOperatorConfig } from './web-cloudflare.js';
+import { parseWebCleanup, settleWebCleanup, type WebCleanup } from './web-removal.js';
+import type { WebCapabilityDependencies } from './web-connector.js';
 import { preparePrivateDirectory, type ControlPlanePaths } from './paths.js';
-import { readRegistry, releaseInstanceArtifacts, withMachineLock } from './registry.js';
+import { readRegistry, releaseInstanceWeb, withMachineLock } from './registry.js';
 import { readOwnerOnlyJson, removePrivateFile, writePrivateTextFile } from './secrets.js';
-import { GwsEaError, type ArtifactsNamespaceClaim } from './types.js';
+import { GwsEaError, type WebNamespaceClaim } from './types.js';
 import { INSTANCE_ID_PATTERN, isRecord } from './validation.js';
 
-export interface ArtifactsUninstallReceipt {
+export interface WebUninstallReceipt {
   readonly schemaVersion: 1;
   readonly started_at: string;
-  readonly assistants: Readonly<Record<string, ArtifactsCleanup>>;
+  readonly assistants: Readonly<Record<string, WebCleanup>>;
   readonly completed_assistant_ids: readonly string[];
-  readonly shared: ArtifactsCleanup;
+  readonly shared: WebCleanup;
   readonly stopped: boolean;
   readonly reason: string | null;
 }
 
-export interface ArtifactsConnectorUninstallData {
-  readonly name: 'artifacts';
+export interface WebConnectorUninstallData {
+  readonly name: 'web';
   readonly scope: 'host';
   readonly installed: false;
   readonly outcome: 'removed' | 'pending';
@@ -37,16 +33,16 @@ export interface ArtifactsConnectorUninstallData {
   readonly operator_actions: readonly string[];
 }
 
-export function artifactsUninstallFile(paths: Pick<ControlPlanePaths, 'configRoot'>): string {
-  return path.join(paths.configRoot, 'connectors', 'artifacts-uninstall.json');
+export function webUninstallFile(paths: Pick<ControlPlanePaths, 'configRoot'>): string {
+  return path.join(paths.configRoot, 'connectors', 'web-uninstall.json');
 }
 
 /** Shared by install, operation-scoped provisioning and uninstall; never waits on another operation. */
-export async function withArtifactsHostLock<T>(paths: ControlPlanePaths, work: () => Promise<T>): Promise<T> {
+export async function withWebHostLock<T>(paths: ControlPlanePaths, work: () => Promise<T>): Promise<T> {
   const root = path.join(paths.configRoot, 'connectors');
   await preparePrivateDirectory(root);
-  const release = await processLock(path.join(root, 'artifacts.lock'));
-  if (!release) throw new GwsEaError('artifacts_busy', 'Another artifacts connector operation is in progress.');
+  const release = await processLock(path.join(root, 'web.lock'));
+  if (!release) throw new GwsEaError('web_busy', 'Another web connector operation is in progress.');
   try {
     return await work();
   } finally {
@@ -55,24 +51,18 @@ export async function withArtifactsHostLock<T>(paths: ControlPlanePaths, work: (
 }
 
 /** Local evidence only. A malformed receipt refuses new provisioning rather than silently adopting resources. */
-export async function inspectArtifactsUninstall(
-  paths: ControlPlanePaths,
-): Promise<ArtifactsUninstallReceipt | undefined> {
+export async function inspectWebUninstall(paths: ControlPlanePaths): Promise<WebUninstallReceipt | undefined> {
   let raw: unknown;
   try {
-    raw = await readOwnerOnlyJson(
-      artifactsUninstallFile(paths),
-      'Artifacts uninstall receipt',
-      'artifacts_uninstall_invalid',
-    );
+    raw = await readOwnerOnlyJson(webUninstallFile(paths), 'Web uninstall receipt', 'web_uninstall_invalid');
   } catch (cause) {
     if (isErrno(cause, 'ENOENT')) return undefined;
     throw cause;
   }
   const invalid = (): never => {
     throw new GwsEaError(
-      'artifacts_uninstall_invalid',
-      'The artifacts uninstall receipt is invalid; restore its owner-only record.',
+      'web_uninstall_invalid',
+      'The web uninstall receipt is invalid; restore its owner-only record.',
     );
   };
   if (
@@ -87,9 +77,9 @@ export async function inspectArtifactsUninstall(
     (raw.reason !== null && typeof raw.reason !== 'string')
   )
     return invalid();
-  const assistants: Record<string, ArtifactsCleanup> = {};
+  const assistants: Record<string, WebCleanup> = {};
   for (const [id, value] of Object.entries(raw.assistants)) {
-    const cleanup = parseArtifactsCleanup(value);
+    const cleanup = parseWebCleanup(value);
     if (
       !INSTANCE_ID_PATTERN.test(id) ||
       !cleanup ||
@@ -99,7 +89,7 @@ export async function inspectArtifactsUninstall(
     assistants[id] = cleanup;
   }
   if (raw.completed_assistant_ids.some((id) => !(id in assistants))) return invalid();
-  const shared = parseArtifactsCleanup(raw.shared);
+  const shared = parseWebCleanup(raw.shared);
   if (!shared || Object.keys(shared.ownership.assistants).length !== 0) return invalid();
   return {
     schemaVersion: 1,
@@ -112,8 +102,8 @@ export async function inspectArtifactsUninstall(
   };
 }
 
-async function recordReceipt(paths: ControlPlanePaths, receipt: ArtifactsUninstallReceipt): Promise<void> {
-  await writePrivateTextFile(artifactsUninstallFile(paths), `${JSON.stringify(receipt)}\n`);
+async function recordReceipt(paths: ControlPlanePaths, receipt: WebUninstallReceipt): Promise<void> {
+  await writePrivateTextFile(webUninstallFile(paths), `${JSON.stringify(receipt)}\n`);
 }
 
 async function withInstanceLocks<T>(
@@ -136,14 +126,14 @@ async function withInstanceLocks<T>(
 }
 
 /** Close every origin before remote effects, then resume exact ownership records until shared cleanup finishes. */
-export async function uninstallArtifactsConnector(
+export async function uninstallWebConnector(
   paths: ControlPlanePaths,
-  dependencies: ArtifactsCapabilityDependencies = {},
-): Promise<ArtifactsConnectorUninstallData> {
-  return withArtifactsHostLock(paths, async () => {
-    let receipt = await inspectArtifactsUninstall(paths);
-    const files = artifactsOperatorFiles(paths);
-    const config = await readArtifactsOperatorConfig(files.configFile);
+  dependencies: WebCapabilityDependencies = {},
+): Promise<WebConnectorUninstallData> {
+  return withWebHostLock(paths, async () => {
+    let receipt = await inspectWebUninstall(paths);
+    const files = webOperatorFiles(paths);
+    const config = await readWebOperatorConfig(files.configFile);
     const registry = await readRegistry(paths);
     const ids = [
       ...new Set([
@@ -162,20 +152,20 @@ export async function uninstallArtifactsConnector(
       const currentRegistry = await readRegistry(paths);
       if (Object.keys(currentRegistry.instances).some((id) => !ids.includes(id)))
         throw new GwsEaError(
-          'artifacts_busy',
-          'The assistant registry changed while artifacts uninstall acquired its locks. Retry uninstall.',
+          'web_busy',
+          'The assistant registry changed while web uninstall acquired its locks. Retry uninstall.',
         );
-      const unrecordedClaims: { readonly instanceId: string; readonly claim: ArtifactsNamespaceClaim }[] = [];
+      const unrecordedClaims: { readonly instanceId: string; readonly claim: WebNamespaceClaim }[] = [];
       for (const reservation of Object.values(currentRegistry.instances)) {
-        const claim = reservation.exclusive_resource_claims.artifacts;
+        const claim = reservation.exclusive_resource_claims.web;
         if (!claim || config?.assistants[reservation.instance_id] || receipt?.assistants[reservation.instance_id])
           continue;
-        const policy = await readArtifactsPolicy(
-          path.join(paths.instanceRoot(reservation.instance_id), 'artifacts', 'policy.json'),
+        const policy = await readWebPolicy(
+          path.join(paths.instanceRoot(reservation.instance_id), 'web', 'policy.json'),
         );
         if (policy.status === 'unavailable' || policy.enabled)
           throw new GwsEaError(
-            'artifacts_owner_missing',
+            'web_owner_missing',
             'A claimed artifact namespace has local resources but no owned resource record.',
           );
         unrecordedClaims.push({ instanceId: reservation.instance_id, claim });
@@ -183,14 +173,14 @@ export async function uninstallArtifactsConnector(
       const releaseUnrecordedClaims = async (): Promise<void> => {
         for (const { instanceId, claim } of unrecordedClaims) {
           await dependencies.recordEffect?.(null);
-          await releaseInstanceArtifacts(paths, instanceId, claim);
+          await releaseInstanceWeb(paths, instanceId, claim);
           await effect();
         }
       };
       if (!receipt && !config) {
         await releaseUnrecordedClaims();
         return {
-          name: 'artifacts',
+          name: 'web',
           scope: 'host',
           installed: false,
           outcome: 'removed',
@@ -201,15 +191,15 @@ export async function uninstallArtifactsConnector(
         };
       }
       if (!receipt) {
-        if (!config) throw new GwsEaError('artifacts_owner_missing', 'Artifacts ownership is unavailable.');
-        const assistants: Record<string, ArtifactsCleanup> = {};
+        if (!config) throw new GwsEaError('web_owner_missing', 'Web ownership is unavailable.');
+        const assistants: Record<string, WebCleanup> = {};
         for (const [id, assistant] of Object.entries(config.assistants).sort(([left], [right]) =>
           left.localeCompare(right),
         )) {
-          const claim = currentRegistry.instances[id]?.exclusive_resource_claims.artifacts;
+          const claim = currentRegistry.instances[id]?.exclusive_resource_claims.web;
           if (claim && JSON.stringify(claim) !== JSON.stringify(assistant.claim))
             throw new GwsEaError(
-              'artifacts_owner_mismatch',
+              'web_owner_mismatch',
               'A recorded artifact namespace differs from its registry claim.',
             );
           assistants[id] = {
@@ -235,8 +225,8 @@ export async function uninstallArtifactsConnector(
       await releaseUnrecordedClaims();
       if (!receipt.stopped) {
         for (const id of ids) {
-          const file = path.join(paths.instanceRoot(id), 'artifacts', 'policy.json');
-          const policy = await readArtifactsPolicy(file);
+          const file = path.join(paths.instanceRoot(id), 'web', 'policy.json');
+          const policy = await readWebPolicy(file);
           if (policy.status !== 'unavailable' && policy.config?.enabled) {
             await dependencies.recordEffect?.(null);
             await writePrivateTextFile(file, `${JSON.stringify({ ...policy.config, enabled: false })}\n`);
@@ -244,10 +234,10 @@ export async function uninstallArtifactsConnector(
           }
         }
         await withMachineLock(paths, async () => {
-          const live = await readArtifactsOperatorConfig(files.configFile);
+          const live = await readWebOperatorConfig(files.configFile);
           if (!live) return;
           await dependencies.recordEffect?.(null);
-          await writeArtifactsOperatorConfig(files.configFile, {
+          await writeWebOperatorConfig(files.configFile, {
             ...live,
             assistants: Object.fromEntries(
               Object.entries(live.assistants).map(([id, assistant]) => [
@@ -263,11 +253,11 @@ export async function uninstallArtifactsConnector(
       }
       for (const [id, cleanup] of Object.entries(receipt.assistants)) {
         if (receipt.completed_assistant_ids.includes(id)) continue;
-        const blocked = await settleArtifactsCleanup(paths, id, cleanup, {
+        const blocked = await settleWebCleanup(paths, id, cleanup, {
           fetch: dependencies.fetch,
           runCommand: dependencies.runCommand,
           record: async (next) => {
-            if (!receipt) throw new Error('Missing artifacts uninstall receipt');
+            if (!receipt) throw new Error('Missing web uninstall receipt');
             receipt = { ...receipt, assistants: { ...receipt.assistants, [id]: next } };
             await recordReceipt(paths, receipt);
           },
@@ -276,18 +266,18 @@ export async function uninstallArtifactsConnector(
           receipt = { ...receipt, reason: blocked.evidence };
           await recordReceipt(paths, receipt);
           return {
-            name: 'artifacts',
+            name: 'web',
             scope: 'host',
             installed: false,
             outcome: 'pending',
             changed,
             reason: blocked.reason,
-            receipt_file: artifactsUninstallFile(paths),
+            receipt_file: webUninstallFile(paths),
             operator_actions: [],
           };
         }
         const owned = cleanup.ownership.assistants[id];
-        if (owned) await releaseInstanceArtifacts(paths, id, owned.claim);
+        if (owned) await releaseInstanceWeb(paths, id, owned.claim);
         receipt = { ...receipt, completed_assistant_ids: [...receipt.completed_assistant_ids, id], reason: null };
         await recordReceipt(paths, receipt);
         await effect();
@@ -296,11 +286,11 @@ export async function uninstallArtifactsConnector(
       const lastId = receipt.completed_assistant_ids.at(-1);
       const last = lastId ? receipt.assistants[lastId] : undefined;
       if (!last || last.sharedRetained) {
-        const blocked = await settleArtifactsCleanup(paths, null, receipt.shared, {
+        const blocked = await settleWebCleanup(paths, null, receipt.shared, {
           fetch: dependencies.fetch,
           runCommand: dependencies.runCommand,
           record: async (shared) => {
-            if (!receipt) throw new Error('Missing artifacts uninstall receipt');
+            if (!receipt) throw new Error('Missing web uninstall receipt');
             receipt = { ...receipt, shared };
             await recordReceipt(paths, receipt);
           },
@@ -309,21 +299,21 @@ export async function uninstallArtifactsConnector(
           receipt = { ...receipt, reason: blocked.evidence };
           await recordReceipt(paths, receipt);
           return {
-            name: 'artifacts',
+            name: 'web',
             scope: 'host',
             installed: false,
             outcome: 'pending',
             changed,
             reason: blocked.reason,
-            receipt_file: artifactsUninstallFile(paths),
+            receipt_file: webUninstallFile(paths),
             operator_actions: [],
           };
         }
       }
-      await removePrivateFile(artifactsUninstallFile(paths));
+      await removePrivateFile(webUninstallFile(paths));
       await effect();
       return {
-        name: 'artifacts',
+        name: 'web',
         scope: 'host',
         installed: false,
         outcome: 'removed',

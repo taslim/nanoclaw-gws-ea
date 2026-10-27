@@ -5,7 +5,7 @@ import { randomUUID } from 'node:crypto';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import * as onepassword from './onepassword.js';
-import * as artifacts from './artifacts-connector.js';
+import * as web from './web-connector.js';
 import { provisionInstalledConnectors } from './connector-provisioning.js';
 import { reserveInstance, withInstanceOperation } from './journal.js';
 import { resolveControlPlanePaths } from './paths.js';
@@ -46,15 +46,15 @@ describe('optional connector provisioning', () => {
     const result = await withInstanceOperation(paths, id, (operation) => provisionInstalledConnectors(operation, {}));
     expect(result).toEqual({ pending: [], next_actions: [] });
   });
-  it('continues from a vault failure to artifacts, preserving ordered next actions for a serving caller', async () => {
+  it('continues from a vault failure to web, preserving ordered next actions for a serving caller', async () => {
     const { paths, id } = await assistant();
     const called: string[] = [];
     vi.spyOn(onepassword, 'provisionAssistantVault').mockImplementation(async () => {
       called.push('onepassword');
       throw new GwsEaError('rate_limited', 'The vault request limit is exhausted.');
     });
-    vi.spyOn(artifacts, 'provisionAssistantArtifacts').mockImplementation(async () => {
-      called.push('artifacts');
+    vi.spyOn(web, 'provisionAssistantWeb').mockImplementation(async () => {
+      called.push('web');
       return {
         instance_id: id,
         outcome: 'pending',
@@ -64,16 +64,37 @@ describe('optional connector provisioning', () => {
       };
     });
     const result = await withInstanceOperation(paths, id, (operation) => provisionInstalledConnectors(operation, {}));
-    expect(called).toEqual(['onepassword', 'artifacts']);
+    expect(called).toEqual(['onepassword', 'web']);
     expect(result?.pending).toEqual([
       { name: 'onepassword', reason: 'rate_limited', message: 'The vault request limit is exhausted.' },
-      { name: 'artifacts', reason: 'profile_incomplete', message: 'Complete the assistant profile.' },
+      { name: 'web', reason: 'profile_incomplete', message: 'Complete the assistant profile.' },
     ]);
     expect(result?.next_actions).toEqual([
       { kind: 'command', argv: ['gws-ea', 'connectors', 'install', 'onepassword'] },
-      { kind: 'command', argv: ['gws-ea', 'connectors', 'install', 'artifacts'] },
+      { kind: 'command', argv: ['gws-ea', 'connectors', 'install', 'web'] },
     ]);
   });
+  it.each(['web_name_unusable', 'web_hostname_claimed', 'web_hostname_foreign'])(
+    'offers web recovery only for a foreign hostname (%s)',
+    async (reason) => {
+      const { paths, id } = await assistant();
+      vi.spyOn(web, 'provisionAssistantWeb').mockResolvedValue({
+        instance_id: id,
+        outcome: 'pending',
+        reason,
+        message: 'Web pending.',
+        changed: false,
+      });
+      const result = await withInstanceOperation(paths, id, (operation) => provisionInstalledConnectors(operation, {}));
+      expect(result?.pending).toEqual([{ name: 'web', reason, message: 'Web pending.' }]);
+      expect(result?.next_actions).toEqual(
+        reason === 'web_hostname_foreign'
+          ? [{ kind: 'command', argv: ['gws-ea', 'connectors', 'install', 'web'] }]
+          : [],
+      );
+    },
+  );
+
   it('shares the rate-limit fence across assistants while retaining their separate pending results', async () => {
     const { paths, id } = await assistant();
     const rateLimitState = { limited: false };
@@ -91,7 +112,7 @@ describe('optional connector provisioning', () => {
         retired_service_account_ids: [],
       };
     });
-    vi.spyOn(artifacts, 'provisionAssistantArtifacts').mockResolvedValue(undefined);
+    vi.spyOn(web, 'provisionAssistantWeb').mockResolvedValue(undefined);
     for (let turn = 0; turn < 2; turn++) {
       const result = await withInstanceOperation(paths, id, (operation) =>
         provisionInstalledConnectors(operation, {}, { onePassword: { rateLimitState } }),

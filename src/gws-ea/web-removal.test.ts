@@ -6,16 +6,16 @@ import path from 'node:path';
 import { afterEach, expect, it, vi } from 'vitest';
 
 import {
-  artifactsIngress,
-  artifactsOperatorFiles,
-  readArtifactsOperatorConfig,
-  writeArtifactsOperatorConfig,
-  type ArtifactsOperatorConfig,
-} from './artifacts-cloudflare.js';
+  webIngress,
+  webOperatorFiles,
+  readWebOperatorConfig,
+  writeWebOperatorConfig,
+  type WebOperatorConfig,
+} from './web-cloudflare.js';
 import { deriveGcpClaims } from './gcp-identity.js';
 import { recordStepStarted, reserveInstance, withInstanceOperation } from './journal.js';
 import { resolveControlPlanePaths, type ControlPlanePaths } from './paths.js';
-import { claimInstanceArtifacts, readRegistry, writeInstanceMarker } from './registry.js';
+import { claimInstanceWeb, readRegistry, writeInstanceMarker } from './registry.js';
 import { removeAssistant, type RemovalDependencies } from './remove.js';
 import { writePrivateTextFile } from './secrets.js';
 import { renderLaunchdService, renderSystemdService } from './service-definition.js';
@@ -52,14 +52,13 @@ async function reserve(paths: ControlPlanePaths, name: string, port: number) {
   await reserveInstance(paths, input);
   await writeInstanceMarker(paths, id);
   await withInstanceOperation(paths, id, async (operation) => recordStepStarted(operation, 'start_nanoclaw'));
-  return claimInstanceArtifacts(paths, id, {
-    hostname: 'views.example.com',
-    path_prefix: `/${name}`,
+  return claimInstanceWeb(paths, id, {
+    hostname: `${name}.example.com`,
     listen_port: port + 2,
   });
 }
 async function fixture(peer = false) {
-  const root = await mkdtemp(path.join(os.tmpdir(), 'artifacts-remove-'));
+  const root = await mkdtemp(path.join(os.tmpdir(), 'web-remove-'));
   roots.push(root);
   const paths = resolveControlPlanePaths({
     configRoot: path.join(root, 'config'),
@@ -67,22 +66,25 @@ async function fixture(peer = false) {
   });
   const own = await reserve(paths, 'aya', 34000);
   const other = peer ? await reserve(paths, 'avery', 35000) : undefined;
-  const files = artifactsOperatorFiles(paths);
+  const files = webOperatorFiles(paths);
   await mkdir(files.root, { recursive: true, mode: 0o700 });
-  const config: ArtifactsOperatorConfig = {
+  const config: WebOperatorConfig = {
     schemaVersion: 1,
     accountId: 'account',
     teamName: 'team',
     zoneId: 'zone',
-    hostname: 'views.example.com',
+    zoneApex: 'example.com',
     credentialFile: path.join(files.root, 'management-token'),
     cloudflaredPath: '/usr/local/bin/cloudflared',
     tunnelId: 'tunnel',
     pin: { id: 'pin', owned: true },
-    dns: { 'views.example.com': { id: 'dns', zoneId: 'zone' } },
+    dns: {
+      'aya.example.com': { id: 'dns', zoneId: 'zone' },
+      ...(other ? { 'avery.example.com': { id: 'peer-dns', zoneId: 'zone' } } : {}),
+    },
     assistants: {
       [own.instance_id]: {
-        claim: own.exclusive_resource_claims.artifacts!,
+        claim: own.exclusive_resource_claims.web!,
         applicationId: 'own-app',
         policyId: 'own-policy',
         aud: 'own-aud',
@@ -91,7 +93,7 @@ async function fixture(peer = false) {
       ...(other
         ? {
             [other.instance_id]: {
-              claim: other.exclusive_resource_claims.artifacts!,
+              claim: other.exclusive_resource_claims.web!,
               applicationId: 'peer-app',
               policyId: 'peer-policy',
               aud: 'peer-aud',
@@ -101,7 +103,7 @@ async function fixture(peer = false) {
         : {}),
     },
   };
-  await writeArtifactsOperatorConfig(files.configFile, config);
+  await writeWebOperatorConfig(files.configFile, config);
   await writePrivateTextFile(config.credentialFile, randomBytes(32).toString('hex'));
   await writePrivateTextFile(files.tokenFile, randomBytes(32).toString('hex'));
   const resources = new Map<string, unknown>([
@@ -109,12 +111,13 @@ async function fixture(peer = false) {
     ['/accounts/account/access/apps/peer-app', { id: 'peer-app' }],
     ['/accounts/account/cfd_tunnel/tunnel', { id: 'tunnel', config_src: 'cloudflare' }],
     ['/zones/zone/dns_records/dns', { id: 'dns' }],
+    ['/zones/zone/dns_records/peer-dns', { id: 'peer-dns' }],
     ['/accounts/account/access/identity_providers/pin', { id: 'pin', type: 'onetimepin' }],
   ]);
   let ingress = {
     config: {
       ingress: [
-        ...Object.values(config.assistants).map(({ claim }) => artifactsIngress(claim)),
+        ...Object.values(config.assistants).map(({ claim }) => webIngress(claim)),
         { service: 'http_status:404' },
       ],
     },
@@ -126,8 +129,8 @@ async function fixture(peer = false) {
     const method = options?.method ?? 'GET';
     if (method !== 'GET') {
       // The actual native removal receipt must precede every external mutation.
-      const receipt = JSON.parse(await readFile(paths.removalFile(own.instance_id), 'utf8')) as { artifacts?: unknown };
-      expect(receipt.artifacts).toBeDefined();
+      const receipt = JSON.parse(await readFile(paths.removalFile(own.instance_id), 'utf8')) as { web?: unknown };
+      expect(receipt.web).toBeDefined();
       effects.push(`${method} ${resource}`);
     }
     if (resource.endsWith('/configurations')) {
@@ -178,20 +181,21 @@ it('removes only the assistant app and ingress while disabled peer intent keeps 
   const f = await fixture(true);
   const beforePeer = (await readRegistry(f.paths)).instances[f.other!.instance_id];
   const outcome = await removeAssistant(f.paths, f.own.instance_id, f.dependencies);
-  expect(outcome.removed).toContain('artifacts');
+  expect(outcome.removed).toContain('web');
   expect(f.effects[0]).toBe('host-stopped');
   expect(f.resources.has('/accounts/account/access/apps/own-app')).toBe(false);
   expect(f.resources.has('/accounts/account/access/apps/peer-app')).toBe(true);
   expect(f.effects.filter((effect) => effect.startsWith('DELETE'))).toEqual([
     'DELETE /accounts/account/access/apps/own-app',
+    'DELETE /zones/zone/dns_records/dns',
   ]);
   expect(f.ingress().config.ingress).toEqual([
-    artifactsIngress(f.config.assistants[f.other!.instance_id].claim),
+    webIngress(f.config.assistants[f.other!.instance_id].claim),
     { service: 'http_status:404' },
   ]);
   expect(await exists(f.config.credentialFile)).toBe(true);
   expect(await exists(f.files.tokenFile)).toBe(true);
-  expect((await readArtifactsOperatorConfig(f.files.configFile))?.assistants).toEqual({
+  expect((await readWebOperatorConfig(f.files.configFile))?.assistants).toEqual({
     [f.other!.instance_id]: f.config.assistants[f.other!.instance_id],
   });
   expect((await readRegistry(f.paths)).instances[f.other!.instance_id]).toEqual(beforePeer);
@@ -217,13 +221,13 @@ it('retains exact cleanup evidence and the claim across remote failure, then res
   const f = await fixture();
   f.fail('/accounts/account/cfd_tunnel/tunnel');
   await expect(removeAssistant(f.paths, f.own.instance_id, f.dependencies)).rejects.toMatchObject({
-    resource: 'artifacts',
+    resource: 'web',
   });
   const receipt = await readFile(f.paths.removalFile(f.own.instance_id), 'utf8');
   expect(receipt).toContain('own-app');
   expect(receipt).toContain('tunnel');
   expect(await exists(f.config.credentialFile)).toBe(true);
-  expect((await readRegistry(f.paths)).instances[f.own.instance_id]?.exclusive_resource_claims.artifacts).toBeDefined();
+  expect((await readRegistry(f.paths)).instances[f.own.instance_id]?.exclusive_resource_claims.web).toBeDefined();
   f.fail();
   await removeAssistant(f.paths, f.own.instance_id, f.dependencies);
   expect(f.effects.filter((effect) => effect === 'DELETE /accounts/account/access/apps/own-app')).toHaveLength(1);
@@ -242,13 +246,13 @@ it('retains a useful receipt through credential deletion failure and retries loc
     return response;
   };
   await expect(removeAssistant(f.paths, f.own.instance_id, { ...f.dependencies, fetch: send })).rejects.toMatchObject({
-    resource: 'artifacts',
+    resource: 'web',
   });
   const receipt = JSON.parse(await readFile(f.paths.removalFile(f.own.instance_id), 'utf8')) as {
-    artifacts: { completed: string[]; ownership: { tunnelId: string } };
+    web: { completed: string[]; ownership: { tunnelId: string } };
   };
-  expect(receipt.artifacts.completed).toContain('remote');
-  expect(receipt.artifacts.ownership.tunnelId).toBe('tunnel');
+  expect(receipt.web.completed).toContain('remote');
+  expect(receipt.web.ownership.tunnelId).toBe('tunnel');
   expect(await exists(f.files.tokenFile)).toBe(false);
   expect(await exists(f.files.configFile)).toBe(true);
   expect(await exists(f.config.credentialFile)).toBe(true);
@@ -268,18 +272,18 @@ it('records an unproven creation and preserves its exact evidence after explicit
   const pending = {
     kind: 'dns' as const,
     key: randomUUID(),
-    target: f.config.hostname,
+    target: f.own.exclusive_resource_claims.web!.hostname,
     startedAt: new Date().toISOString(),
     resource: '/zones/zone/dns_records',
     fingerprint: 'b'.repeat(64),
     name: 'unproven-exact-host',
   };
-  await writeArtifactsOperatorConfig(f.files.configFile, { ...f.config, pending });
+  await writeWebOperatorConfig(f.files.configFile, { ...f.config, pending });
   const outcome = await removeAssistant(f.paths, f.own.instance_id, {
     ...f.dependencies,
-    abandon: new Set(['artifacts']),
+    abandon: new Set(['web']),
   });
-  expect(outcome.abandoned).toContainEqual({ resource: 'artifacts', evidence: expect.stringContaining(pending.key) });
+  expect(outcome.abandoned).toContainEqual({ resource: 'web', evidence: expect.stringContaining(pending.key) });
   const receipt = await readFile(f.paths.removalFile(f.own.instance_id), 'utf8');
   expect(receipt).toContain(pending.fingerprint);
   expect(receipt).toContain(pending.resource);
@@ -296,16 +300,16 @@ it('continues removal after the operator explicitly resolves the exact unproven 
   const pending = {
     kind: 'dns' as const,
     key: randomUUID(),
-    target: f.config.hostname,
+    target: f.own.exclusive_resource_claims.web!.hostname,
     startedAt: new Date().toISOString(),
     resource: '/zones/zone/dns_records',
     fingerprint: 'b'.repeat(64),
   };
-  await writeArtifactsOperatorConfig(f.files.configFile, { ...f.config, pending });
+  await writeWebOperatorConfig(f.files.configFile, { ...f.config, pending });
   await expect(removeAssistant(f.paths, f.own.instance_id, f.dependencies)).rejects.toMatchObject({
-    resource: 'artifacts',
+    resource: 'web',
   });
-  await writeArtifactsOperatorConfig(f.files.configFile, {
+  await writeWebOperatorConfig(f.files.configFile, {
     ...f.config,
     resolvedAttempts: [{ ...pending, resolution: 'operator_removed', resolvedAt: new Date().toISOString() }],
   });
@@ -316,10 +320,10 @@ it('continues removal after the operator explicitly resolves the exact unproven 
 
 it('does not delete a pre-existing PIN or a tunnel routing an unrelated service', async () => {
   const f = await fixture();
-  await writeArtifactsOperatorConfig(f.files.configFile, { ...f.config, pin: { id: 'pin', owned: false } });
+  await writeWebOperatorConfig(f.files.configFile, { ...f.config, pin: { id: 'pin', owned: false } });
   f.ingress().config.ingress.unshift({ hostname: 'foreign.example.test', service: 'http://127.0.0.1:9191' });
   await expect(removeAssistant(f.paths, f.own.instance_id, f.dependencies)).rejects.toMatchObject({
-    resource: 'artifacts',
+    resource: 'web',
   });
   expect(f.resources.has('/accounts/account/cfd_tunnel/tunnel')).toBe(true);
   expect(f.resources.has('/accounts/account/access/identity_providers/pin')).toBe(true);
@@ -332,10 +336,10 @@ it('does not delete a pre-existing PIN or a tunnel routing an unrelated service'
 
 it('keeps a stopped connector receipt through a service failure and removes only its exact verified definition', async () => {
   const f = await fixture();
-  const label = 'com.gws-ea.artifacts.0123456789abcdef';
+  const label = 'com.gws-ea.web.0123456789abcdef';
   const definitionFile = path.join(f.root, '.config/systemd/user', `${label}.service`);
   const connector = { manager: 'systemd-user' as const, label, definitionFile, homeDirectory: f.root };
-  await writeArtifactsOperatorConfig(f.files.configFile, { ...f.config, connector });
+  await writeWebOperatorConfig(f.files.configFile, { ...f.config, connector });
   await mkdir(path.dirname(definitionFile), { recursive: true, mode: 0o700 });
   await writePrivateTextFile(
     definitionFile,
@@ -360,7 +364,7 @@ it('keeps a stopped connector receipt through a service failure and removes only
   const runCommand: NonNullable<RemovalDependencies['runCommand']> = async (command) => {
     observed.push([...command.args]);
     expect(JSON.parse(await readFile(f.paths.removalFile(f.own.instance_id), 'utf8'))).toHaveProperty(
-      'artifacts.ownership.connector.label',
+      'web.ownership.connector.label',
       label,
     );
     return {
@@ -370,7 +374,7 @@ it('keeps a stopped connector receipt through a service failure and removes only
     };
   };
   await expect(removeAssistant(f.paths, f.own.instance_id, { ...f.dependencies, runCommand })).rejects.toMatchObject({
-    resource: 'artifacts',
+    resource: 'web',
   });
   expect(await exists(definitionFile)).toBe(true);
   expect(f.resources.has('/accounts/account/cfd_tunnel/tunnel')).toBe(true);
@@ -385,9 +389,9 @@ it('fails honestly on unreadable operator ownership without releasing the namesp
   const f = await fixture();
   await writePrivateTextFile(f.files.configFile, '{broken');
   await expect(removeAssistant(f.paths, f.own.instance_id, f.dependencies)).rejects.toMatchObject({
-    resource: 'artifacts',
+    resource: 'web',
   });
-  expect((await readRegistry(f.paths)).instances[f.own.instance_id]?.exclusive_resource_claims.artifacts).toBeDefined();
+  expect((await readRegistry(f.paths)).instances[f.own.instance_id]?.exclusive_resource_claims.web).toBeDefined();
   expect(await readFile(f.files.configFile, 'utf8')).toBe('{broken');
   expect(await exists(f.paths.instanceRoot(f.own.instance_id))).toBe(true);
   expect(f.effects).toEqual(['host-stopped']);
@@ -420,10 +424,10 @@ it('removes an assistant with no artifact intent despite an unreadable optional 
 
 async function launchdFixture() {
   const f = await fixture();
-  const label = 'com.gws-ea.artifacts.0123456789abcdef';
+  const label = 'com.gws-ea.web.0123456789abcdef';
   const definitionFile = path.join(f.root, 'Library/LaunchAgents', `${label}.plist`);
   const connector = { manager: 'launchd' as const, label, definitionFile, homeDirectory: f.root };
-  await writeArtifactsOperatorConfig(f.files.configFile, { ...f.config, connector });
+  await writeWebOperatorConfig(f.files.configFile, { ...f.config, connector });
   await mkdir(path.dirname(definitionFile), { recursive: true, mode: 0o700 });
   await writePrivateTextFile(
     definitionFile,
@@ -483,7 +487,7 @@ it('preserves an unknown receipt schema containing exact artifact IDs instead of
   const f = await fixture();
   f.fail('/accounts/account/cfd_tunnel/tunnel');
   await expect(removeAssistant(f.paths, f.own.instance_id, f.dependencies)).rejects.toMatchObject({
-    resource: 'artifacts',
+    resource: 'web',
   });
   const file = f.paths.removalFile(f.own.instance_id);
   const receipt = JSON.parse(await readFile(file, 'utf8')) as Record<string, unknown>;
@@ -502,7 +506,7 @@ it('publishes artifact abandonment and its exact durable receipt through the nat
   f.fail('/accounts/account/cfd_tunnel/tunnel');
   const output: string[] = [];
   expect(
-    await runCli(['remove', '--id', f.own.instance_id, '--yes', '--abandon', 'artifacts', '--json'], {
+    await runCli(['remove', '--id', f.own.instance_id, '--yes', '--abandon', 'web', '--json'], {
       paths: f.paths,
       stdout: (line) => output.push(line),
       stderr: () => undefined,
@@ -513,7 +517,7 @@ it('publishes artifact abandonment and its exact durable receipt through the nat
   expectResultContract('remove', result);
   expect(result).toHaveProperty('data.removal.abandoned', [
     {
-      resource: 'artifacts',
+      resource: 'web',
       evidence: expect.stringContaining(`Removal receipt: ${f.paths.removalFile(f.own.instance_id)}`),
     },
   ]);
@@ -529,7 +533,7 @@ it.each([112, 5])(
         ...f.dependencies,
         runCommand: async () => ({ stdout: '', stderr: 'Could not find service', exitCode }),
       }),
-    ).rejects.toMatchObject({ resource: 'artifacts' });
+    ).rejects.toMatchObject({ resource: 'web' });
     expect(await exists(definitionFile)).toBe(true);
     expect(await exists(f.config.credentialFile)).toBe(true);
     expect(await exists(f.files.tokenFile)).toBe(true);

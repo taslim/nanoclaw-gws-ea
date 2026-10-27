@@ -9,16 +9,12 @@ import type {
   OnePasswordUninstallDependencies,
   OnePasswordUninstallPreview,
 } from './onepassword-uninstall.js';
-import type {
-  ArtifactsCapabilityDependencies,
-  ArtifactsConnectorOperation,
-  ArtifactsConnectorUninstallData,
-} from './artifacts-connector.js';
+import type { WebCapabilityDependencies, WebConnectorOperation, WebConnectorUninstallData } from './web-connector.js';
 import type { OptionDefinition } from './command-definitions.js';
 import { DEFAULT_VOICE_MODEL } from './install-voice.js';
 import { VOICE_MODEL_CATALOG } from './voice-assets.js';
 
-export const CONNECTOR_NAMES = ['voice', 'onepassword', 'artifacts'] as const;
+export const CONNECTOR_NAMES = ['voice', 'onepassword', 'web'] as const;
 export type ConnectorName = (typeof CONNECTOR_NAMES)[number];
 export const CONNECTOR_ACTIONS = ['install', 'uninstall', 'show', 'check'] as const;
 export type ConnectorAction = (typeof CONNECTOR_ACTIONS)[number];
@@ -26,26 +22,26 @@ export type ConnectorOperation =
   | { readonly name: 'voice'; readonly scope: 'host'; readonly enabled: boolean; readonly installation_dir?: string }
   | OnePasswordInstallData
   | OnePasswordUninstallData
-  | ArtifactsConnectorOperation
-  | ArtifactsConnectorUninstallData;
+  | WebConnectorOperation
+  | WebConnectorUninstallData;
 export interface ConnectorLifecycleContext {
   readonly paths: ControlPlanePaths;
   readonly options: CommandOptions;
   readonly voice: VoiceOperatorDependencies;
   readonly onePassword: OnePasswordDependencies & OnePasswordUninstallDependencies;
-  readonly artifacts: ArtifactsCapabilityDependencies;
+  readonly web: WebCapabilityDependencies;
   readonly deleteVaults?: boolean;
   readonly confirmedPreview?: OnePasswordUninstallPreview;
 }
 interface ConnectorInstallResults {
   voice: Extract<ConnectorOperation, { name: 'voice' }>;
   onepassword: OnePasswordInstallData;
-  artifacts: ArtifactsConnectorOperation;
+  web: WebConnectorOperation;
 }
 interface ConnectorUninstallResults {
   voice: Extract<ConnectorOperation, { name: 'voice' }>;
   onepassword: OnePasswordUninstallData;
-  artifacts: ArtifactsConnectorUninstallData;
+  web: WebConnectorUninstallData;
 }
 export interface ConnectorDefinitionFor<Name extends ConnectorName> {
   readonly inspect: (paths: ControlPlanePaths, options?: ConnectorInspection) => Promise<ConnectorObservation>;
@@ -200,25 +196,23 @@ export const CONNECTOR_CATALOG: readonly ConnectorDefinition[] = [
     },
   },
   {
-    name: 'artifacts',
+    name: 'web',
     inspect: async (paths, options) =>
-      (await import('./connector-inspection.js')).inspectConnector(paths, 'artifacts', options),
-    install: async ({ paths, options, artifacts }) =>
-      (await import('./artifacts-connector.js')).installArtifactsConnector(
+      (await import('./connector-inspection.js')).inspectConnector(paths, 'web', options),
+    install: async ({ paths, options, web }) =>
+      (await import('./web-connector.js')).installWebConnector(
         paths,
         {
           accountId: options.account,
           teamName: options.team,
           zoneId: options.zone,
-          hostname: options.hostname,
           credentialFile: options['credential-file'],
           cloudflaredPath: options.cloudflared,
           discardUnproven: options['discard-unproven'],
         },
-        artifacts,
+        web,
       ),
-    uninstall: async ({ paths, artifacts }) =>
-      (await import('./artifacts-connector.js')).uninstallArtifactsConnector(paths, artifacts),
+    uninstall: async ({ paths, web }) => (await import('./web-connector.js')).uninstallWebConnector(paths, web),
     summary: 'Serve private HTML views through owned Cloudflare Access and tunnel resources.',
     prerequisites: [
       'An operator Cloudflare account, Access team, active DNS zone and management permissions.',
@@ -236,7 +230,6 @@ export const CONNECTOR_CATALOG: readonly ConnectorDefinition[] = [
         value('account', 'account_id', 'Cloudflare account; required for first setup.'),
         value('team', 'team_name', 'Cloudflare Access team; required for first setup.'),
         value('zone', 'zone_id', 'Active Cloudflare DNS zone.'),
-        value('hostname', 'hostname', 'Shared operator hostname.'),
         file('credential-file', 'Owner-only Cloudflare management credential under the operator config root.'),
         file('cloudflared', 'Trusted absolute cloudflared executable.'),
         value('discard-unproven', 'attempt', 'Acknowledge the exact interrupted remote create after cleaning it up.'),

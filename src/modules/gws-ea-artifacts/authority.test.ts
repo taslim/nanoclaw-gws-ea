@@ -44,7 +44,7 @@ beforeEach(async () => {
     }),
     { mode: 0o600 },
   );
-  vi.stubEnv('GWS_EA_ARTIFACTS_POLICY_FILE', policy);
+  vi.stubEnv('GWS_EA_WEB_POLICY_FILE', policy);
   await runMigrations(await initTestDb());
   const now = new Date().toISOString();
   for (const id of ['canonical', 'worker']) {

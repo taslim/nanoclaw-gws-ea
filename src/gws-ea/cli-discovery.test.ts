@@ -53,7 +53,7 @@ describe('local CLI discovery and grammar', () => {
       JSON.parse(io.stdout.join('\n'));
     expect(schema.commands).toHaveLength(13);
     expect(schema.commands.some((command) => command.path.includes('browser'))).toBe(false);
-    for (const name of ['voice', 'onepassword', 'artifacts']) {
+    for (const name of ['voice', 'onepassword', 'web']) {
       const commands = schema.commands.filter((command) => command.path[2] === name);
       expect(commands.map((command) => command.path[1])).toEqual(['install', 'uninstall', 'show', 'check']);
       for (const command of commands) {

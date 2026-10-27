@@ -6,7 +6,7 @@
  * resource is done; an owned one is deleted and observed again; a foreign one
  * is refused by name; one that cannot be observed pauses with evidence until
  * the operator abandons it. What each pending resource needs is checked
- * before the first change, except artifacts, whose refusal pauses inside its
+ * before the first change, except web, whose refusal pauses inside its
  * own step after earlier resources changed. Removal locks only its own
  * instance, so one stuck removal never blocks another assistant. NanoClaw's
  * helpers stop the host; removal then cleans up what they leave. The
@@ -16,7 +16,7 @@
  * and artifact resources go after the host too, once nothing can use them,
  * and their IDs are copied into the receipt before anything changes. The
  * receipt outlives the instance while 1Password owes the operator something
- * they have not closed, or when artifacts were abandoned.
+ * they have not closed, or when web were abandoned.
  * An unfinished update or rollback never stops it: its releases, what is
  * kept with them, its snapshots, and its quarantined state all sit under the
  * instance root, and go with it. So does every image the assistant's
@@ -45,12 +45,7 @@ import {
 } from '../modules/gws-ea-google/tokens.js';
 import { GoogleApiError } from '../modules/gws-ea-inbox/gmail-api.js';
 import { reclaimImage } from './agent-image-release.js';
-import {
-  captureArtifactsCleanup,
-  parseArtifactsCleanup,
-  settleArtifactsCleanup,
-  type ArtifactsCleanup,
-} from './artifacts-removal.js';
+import { captureWebCleanup, parseWebCleanup, settleWebCleanup, type WebCleanup } from './web-removal.js';
 import { PauseRequired, runStep, withGoogleSignIn, type StepIdentity, type StepReporter } from './events.js';
 import {
   assertGcloudInstalled,
@@ -120,7 +115,7 @@ import { canonicalTimestamp, isRecord, requireDockerEndpoint, requirePath } from
 export const REMOVAL_RESOURCES = [
   'whatsapp',
   'nanoclaw',
-  'artifacts',
+  'web',
   'chat-subscription',
   'onepassword',
   'gcp-project',
@@ -130,7 +125,7 @@ export const REMOVAL_RESOURCES = [
 export type RemovalResource = (typeof REMOVAL_RESOURCES)[number];
 
 /** What an operator may leave behind with `--abandon` when removal cannot observe or settle it. */
-export const ABANDONABLE_RESOURCES = ['gcp-project', 'chat-subscription', 'onepassword', 'artifacts'] as const;
+export const ABANDONABLE_RESOURCES = ['gcp-project', 'chat-subscription', 'onepassword', 'web'] as const;
 export type AbandonableResource = (typeof ABANDONABLE_RESOURCES)[number];
 
 const LEAVING_BEHIND: Readonly<Record<AbandonableResource, string>> = {
@@ -140,8 +135,7 @@ const LEAVING_BEHIND: Readonly<Record<AbandonableResource, string>> = {
     'Leaving it behind is safe: once the project is deleted it delivers nowhere, and Google deletes it within 7 days; removal records this evidence.',
   onepassword:
     'Leaving it behind keeps the vault and its items in 1Password and stops tracking its service accounts and any creation never proven; removal records their IDs and names as evidence, so you can delete or revoke them yourself on 1Password.com.',
-  artifacts:
-    'Leaving artifacts behind retains the exact Cloudflare IDs, unresolved creation attempts and connector coordinates in the removal receipt. Its shared ownership record and credentials remain for manual cleanup; no resource is adopted or deleted by name.',
+  web: 'Leaving web behind retains the exact Cloudflare IDs, unresolved creation attempts and connector coordinates in the removal receipt. Its shared ownership record and credentials remain for manual cleanup; no resource is adopted or deleted by name.',
 };
 
 function isAbandonable(resource: RemovalResource): resource is RemovalResource & AbandonableResource {
@@ -156,7 +150,7 @@ const UNREADABLE_CLEANUP = 'removal_receipt_unreadable';
 const RESOURCE_STEPS: Readonly<Record<RemovalResource, StepIdentity>> = {
   whatsapp: { id: 'remove_whatsapp', label: 'Signing out the assistant’s WhatsApp device…' },
   nanoclaw: { id: 'remove_nanoclaw', label: 'Stopping NanoClaw…' },
-  artifacts: { id: 'remove_artifacts', label: 'Removing the assistant’s owned artifact access…' },
+  web: { id: 'remove_web', label: 'Removing the assistant’s owned artifact access…' },
   'chat-subscription': { id: 'remove_chat_subscription', label: 'Deleting the Google Chat subscription…' },
   onepassword: { id: 'remove_onepassword', label: "Cleaning up the assistant's 1Password vault and token…" },
   'gcp-project': { id: 'remove_gcp_project', label: 'Deleting the Google Cloud project…' },
@@ -183,7 +177,7 @@ interface RemovalReceipt {
   readonly member_policy_unrestored?: Evidence;
   /** Kept here, outside the instance, until the operator closes it. */
   readonly onepassword?: OnePasswordCleanup;
-  readonly artifacts?: ArtifactsCleanup;
+  readonly web?: WebCleanup;
 }
 
 export interface LocalRuntime {
@@ -286,14 +280,14 @@ function entries<K extends string, V>(keys: readonly K[], value: unknown, parse:
  * The receipt of a removal already under way; unknown fields are ignored. One
  * that cannot be read safely, or that another schema wrote, is set aside and
  * its resources are observed again, except where that would lose IDs: a
- * receipt naming artifacts that fails any check, or whose 1Password record
+ * receipt naming web that fails any check, or whose 1Password record
  * cannot be parsed, stops removal with `removal_receipt_unreadable`.
  */
 async function readReceipt(paths: ControlPlanePaths, instanceId: string): Promise<RemovalReceipt | undefined> {
   let artifactEvidence = false;
   try {
     const raw = await readOwnerOnlyJson(paths.removalFile(instanceId), 'Removal receipt', 'invalid_removal');
-    artifactEvidence = isRecord(raw) && raw.artifacts !== undefined;
+    artifactEvidence = isRecord(raw) && raw.web !== undefined;
     if (!isRecord(raw) || raw.instance_id !== instanceId) {
       throw new GwsEaError('invalid_removal', 'Removal receipt does not match this instance');
     }
@@ -310,8 +304,8 @@ async function readReceipt(paths: ControlPlanePaths, instanceId: string): Promis
     const keyPolicyUnrestored = evidenceOf(raw.key_policy_unrestored);
     const memberPolicyUnrestored = evidenceOf(raw.member_policy_unrestored);
     const onepassword = raw.onepassword === undefined ? undefined : parseOnePasswordCleanup(raw.onepassword);
-    const artifacts = raw.artifacts === undefined ? undefined : parseArtifactsCleanup(raw.artifacts);
-    if (raw.artifacts !== undefined && !artifacts)
+    const web = raw.web === undefined ? undefined : parseWebCleanup(raw.web);
+    if (raw.web !== undefined && !web)
       throw new GwsEaError(
         UNREADABLE_CLEANUP,
         `The removal receipt ${paths.removalFile(instanceId)} names artifact resources it cannot read safely; removal stops so their IDs are not lost.`,
@@ -331,7 +325,7 @@ async function readReceipt(paths: ControlPlanePaths, instanceId: string): Promis
       ...(keyPolicyUnrestored ? { key_policy_unrestored: keyPolicyUnrestored } : {}),
       ...(memberPolicyUnrestored ? { member_policy_unrestored: memberPolicyUnrestored } : {}),
       ...(onepassword ? { onepassword } : {}),
-      ...(artifacts ? { artifacts } : {}),
+      ...(web ? { web } : {}),
     };
   } catch (error) {
     if (isErrno(error, 'ENOENT')) return undefined;
@@ -843,10 +837,10 @@ async function removeLocked(
   const recorded = await readRecordedRuntime(paths, reservation);
   const onePassword = await onePasswordCapture(paths, reservation, existing, dependencies.deleteVault);
   if (onePassword.status === 'captured') receipt = { ...receipt, onepassword: onePassword.cleanup };
-  const artifacts = existing?.artifacts
-    ? { status: 'captured' as const, cleanup: existing.artifacts }
-    : await captureArtifactsCleanup(paths, reservation);
-  if (artifacts.status === 'captured') receipt = { ...receipt, artifacts: artifacts.cleanup };
+  const web = existing?.web
+    ? { status: 'captured' as const, cleanup: existing.web }
+    : await captureWebCleanup(paths, reservation);
+  if (web.status === 'captured') receipt = { ...receipt, web: web.cleanup };
   // Released last, so a released reservation left only local files and the receipt behind.
   const released = registry.instances[instanceId] === undefined;
   const started = (step: ProvisionStepId): boolean => !released && provisioning.started(step);
@@ -863,7 +857,7 @@ async function removeLocked(
   const owned: Readonly<Record<RemovalResource, boolean>> = {
     whatsapp: hasWhatsApp,
     nanoclaw: started('start_nanoclaw'),
-    artifacts: artifacts.status !== 'none',
+    web: web.status !== 'none',
     // The host keeps the subscription from its start, with the assistant's sign-in.
     'chat-subscription': started('start_nanoclaw'),
     'gcp-project': started('provision_gcp'),
@@ -1011,17 +1005,17 @@ async function removeLocked(
       await requireUninstall()(reservation, await localRuntime());
       return undefined;
     },
-    artifacts: async () => {
-      if (artifacts.status === 'unreadable') return leaveBehind('artifacts', artifacts);
-      const cleanup = receipt.artifacts;
+    web: async () => {
+      if (web.status === 'unreadable') return leaveBehind('web', web);
+      const cleanup = receipt.web;
       if (!cleanup) return undefined;
-      const blocked = await settleArtifactsCleanup(paths, instanceId, cleanup, {
+      const blocked = await settleWebCleanup(paths, instanceId, cleanup, {
         fetch: dependencies.fetch,
         runCommand: run,
-        record: (next) => record((current) => ({ ...current, artifacts: next })),
+        record: (next) => record((current) => ({ ...current, web: next })),
       });
       return blocked
-        ? leaveBehind('artifacts', { ...blocked, evidence: `${blocked.evidence}\nRemoval receipt: ${file}` })
+        ? leaveBehind('web', { ...blocked, evidence: `${blocked.evidence}\nRemoval receipt: ${file}` })
         : undefined;
     },
     'chat-subscription': async () => {
@@ -1116,7 +1110,7 @@ async function removeLocked(
   }
   await releaseInstanceReservation(paths, releaseReservation);
   // Local removal is complete. A 1Password service account left to revoke, or a creation never proven, keeps the
-  // receipt until the operator closes it; abandoned artifacts keep it too.
+  // receipt until the operator closes it; abandoned web keep it too.
   const cleanup = receipt.onepassword;
   const owed = cleanup !== undefined && onePasswordCleanupOwed(cleanup);
   if (cleanup && owed && !receipt.abandoned.onepassword && abandon.has('onepassword'))
@@ -1133,7 +1127,7 @@ async function removeLocked(
         },
       },
     }));
-  const retained = (owed && !receipt.abandoned.onepassword) || receipt.abandoned.artifacts !== undefined;
+  const retained = (owed && !receipt.abandoned.onepassword) || receipt.abandoned.web !== undefined;
   if (!retained) await removePrivateFile(file);
 
   return {

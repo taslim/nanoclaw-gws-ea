@@ -45,13 +45,13 @@ import { createArtifactViewResolver } from './access.js';
 import { ARTIFACT_SHARE_APPROVAL, authorizeArtifactShare, parseArtifactShare } from './authority.js';
 import { artifactDigest, deleteArtifact, prepareArtifactSource, saveArtifact } from './db.js';
 import { artifactAdmissionEmails, artifactShares, ArtifactSharing } from './sharing.js';
-import type { ArtifactsPolicyFile } from './policy.js';
+import type { WebPolicyFile } from '../gws-ea-web/policy.js';
 
 let main: Session;
 let input: Record<string, unknown>;
 let sharing: ArtifactSharing;
-let remote = vi.fn(async (_config: ArtifactsPolicyFile): Promise<void> => {});
-const policy: ArtifactsPolicyFile = {
+let remote = vi.fn(async (_config: WebPolicyFile): Promise<void> => {});
+const policy: WebPolicyFile = {
   schemaVersion: 1,
   enabled: true,
   hostname: 'views.example.com',
@@ -104,7 +104,7 @@ async function view(id: string, audience: 'private' | 'share' | 'public', email?
 beforeEach(async () => {
   fs.mkdirSync(ROOT, { recursive: true });
   writePolicy();
-  vi.stubEnv('GWS_EA_ARTIFACTS_POLICY_FILE', path.join(ROOT, 'policy.json'));
+  vi.stubEnv('GWS_EA_WEB_POLICY_FILE', path.join(ROOT, 'policy.json'));
   await runMigrations(await initTestDb());
   const now = new Date().toISOString();
   await createAgentGroup({ id: 'canonical', name: 'Aya', folder: 'canonical', agent_provider: null, created_at: now });
@@ -153,7 +153,7 @@ beforeEach(async () => {
     recipients: [{ email: 'juno@example.com' }],
     principal_message: { id: 'mark', messaging_group_id: 'chat' },
   };
-  remote = vi.fn(async (_config: ArtifactsPolicyFile): Promise<void> => {});
+  remote = vi.fn(async (_config: WebPolicyFile): Promise<void> => {});
   sharing = new ArtifactSharing({ verifyAdmission: remote, publicationReady: () => true });
   sharing.registerApprovals();
 });

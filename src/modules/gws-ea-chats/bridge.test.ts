@@ -608,7 +608,7 @@ it('checks an artifact-only handoff before exposing it to chat members', async (
     }),
     { mode: 0o600 },
   );
-  vi.stubEnv('GWS_EA_ARTIFACTS_POLICY_FILE', policy);
+  vi.stubEnv('GWS_EA_WEB_POLICY_FILE', policy);
   const message = 'https://views.example.com/aya/share/11111111-1111-4111-8111-111111111111';
   expect(
     refused(
@@ -640,7 +640,7 @@ it('checks a member-supplied email for Google access beside a public artifact li
     }),
     { mode: 0o600 },
   );
-  vi.stubEnv('GWS_EA_ARTIFACTS_POLICY_FILE', policy);
+  vi.stubEnv('GWS_EA_WEB_POLICY_FILE', policy);
   const source = prepareArtifactSource(Buffer.from('<p>Public report</p>'));
   const saved = await saveArtifact(
     { agentGroupId: 'main', sessionId: main.id, isMain: true },
@@ -689,7 +689,7 @@ it('requires native principal membership for private artifact handoffs while ret
     }),
     { mode: 0o600 },
   );
-  vi.stubEnv('GWS_EA_ARTIFACTS_POLICY_FILE', policy);
+  vi.stubEnv('GWS_EA_WEB_POLICY_FILE', policy);
   const source = prepareArtifactSource(Buffer.from('<p>Principal report</p>'));
   const saved = await saveArtifact(
     { agentGroupId: 'main', sessionId: main.id, isMain: true },

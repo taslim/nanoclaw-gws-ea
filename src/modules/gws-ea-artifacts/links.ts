@@ -6,7 +6,7 @@ import { EMAIL_CHANNEL_TYPE, INBOX_PLATFORM_ID } from '../gws-ea-inbox/runtime.j
 import { resolveAudience } from '../gws-ea-privacy/audience.js';
 import { linkTargets, messageStrings } from '../gws-ea-privacy/outbound.js';
 import { listPrincipalAddresses } from '../gws-ea-profile/db.js';
-import { readArtifactsPolicy, type ArtifactsPolicyFile } from './policy.js';
+import { readWebPolicy, type WebPolicyFile } from '../gws-ea-web/policy.js';
 
 interface ArtifactLinkCheckRequest {
   readonly texts: readonly string[];
@@ -18,7 +18,7 @@ type ArtifactLinkCheck = { readonly allowed: true } | { readonly allowed: false;
 const URLS = /https?:\/\/[^\s<>"'`\\]+/giu;
 const TRAILING = /[.,;:!?)\]}*'"]+$/u;
 const UUID = '[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}';
-function artifactUrls(texts: readonly string[], config: ArtifactsPolicyFile): readonly string[] {
+function artifactUrls(texts: readonly string[], config: WebPolicyFile): readonly string[] {
   return [
     ...new Set(
       texts.flatMap((text) => [
@@ -36,7 +36,7 @@ function artifactUrls(texts: readonly string[], config: ArtifactsPolicyFile): re
   });
 }
 export async function hasArtifactLinks(texts: readonly string[]): Promise<boolean> {
-  const policy = await readArtifactsPolicy();
+  const policy = await readWebPolicy();
   return 'config' in policy && policy.config !== undefined && artifactUrls(texts, policy.config).length > 0;
 }
 
@@ -66,7 +66,7 @@ export async function artifactAudienceForMembers(
 }
 /** Checks only URLs on the configured artifact host, locally: no network, Access token or source read. */
 export async function checkArtifactLinksOpenable(request: ArtifactLinkCheckRequest): Promise<ArtifactLinkCheck> {
-  const policy = await readArtifactsPolicy();
+  const policy = await readWebPolicy();
   if (!('config' in policy) || !policy.config) return { allowed: true };
   const { config } = policy;
   const urls = artifactUrls(request.texts, config);
@@ -140,7 +140,7 @@ export async function checkArtifactLinksOpenable(request: ArtifactLinkCheckReque
 export async function judgeArtifactSend(send: OutboundSend): Promise<OutboundGuardDecision> {
   // The inbox builds its final outside recipients and checks them in sendToOutside.
   if (send.channelType === EMAIL_CHANNEL_TYPE && send.platformId === INBOX_PLATFORM_ID) return { effect: 'allow' };
-  const policy = await readArtifactsPolicy();
+  const policy = await readWebPolicy();
   if (!('config' in policy) || !policy.config) return { effect: 'allow' };
   const texts = messageStrings(send.content);
   for (const file of send.files ?? []) {

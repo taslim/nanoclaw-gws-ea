@@ -27,13 +27,13 @@ import { inboundDbPath } from '../../mailbox/sqlite/paths.js';
 import { resolveSystemSession, sessionDir } from '../../session-manager.js';
 import type { Session } from '../../types.js';
 import { ARTIFACT_ACTIONS } from './actions.js';
-import { ARTIFACTS_POLICY_FILE_ENV, type ArtifactsPolicyFile } from './policy.js';
+import { WEB_POLICY_FILE_ENV, type WebPolicyFile } from '../gws-ea-web/policy.js';
 
 let author: Session;
 let main: Session;
 let peer: Session;
 let serial = 0;
-const policy: ArtifactsPolicyFile = {
+const policy: WebPolicyFile = {
   schemaVersion: 1,
   enabled: true,
   hostname: 'views.example.com',
@@ -101,7 +101,7 @@ async function made(session = author, id = `save-${++serial}`): Promise<Record<s
 beforeEach(async () => {
   fs.rmSync(ROOT, { recursive: true, force: true });
   fs.mkdirSync(ROOT, { recursive: true });
-  vi.stubEnv(ARTIFACTS_POLICY_FILE_ENV, path.join(ROOT, 'policy.json'));
+  vi.stubEnv(WEB_POLICY_FILE_ENV, path.join(ROOT, 'policy.json'));
   writePolicy();
   await runMigrations(await initTestDb());
   for (const id of ['canonical', 'author', 'peer', 'sealed', 'sealed-email', 'sealed-chat']) {

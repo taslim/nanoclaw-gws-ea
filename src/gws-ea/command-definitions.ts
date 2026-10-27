@@ -380,7 +380,7 @@ export const COMMAND_DEFINITIONS: readonly CommandDefinition[] = [
       ),
       value(
         'abandon',
-        'gcp-project,chat-subscription,onepassword,artifacts',
+        'gcp-project,chat-subscription,onepassword,web',
         'Explicit owned external resources removal may leave behind when they cannot be observed; onepassword also closes the receipt naming service accounts you revoked. Artifact abandonment retains exact cleanup evidence.',
       ),
     ],

@@ -3244,31 +3244,50 @@ describe('connector uninstall operator output', () => {
     expect(output).not.toContain('items 0');
   });
 
-  it.each([false, true])(
-    'retains artifacts operator cleanup actions in human and JSON output (json=%s)',
-    async (json) => {
-      const paths = await testPaths();
-      const io = lines();
-      const instruction = 'Revoke the Cloudflare management API token, then delete the original --credential-file.';
-      vi.spyOn(connectorDefinition('artifacts'), 'uninstall').mockResolvedValue({
-        name: 'artifacts',
-        scope: 'host',
-        installed: false,
-        outcome: 'removed',
-        changed: true,
-        reason: null,
-        receipt_file: null,
-        operator_actions: [instruction],
-      });
-      expect(
-        await runCli(['connectors', 'uninstall', 'artifacts', ...(json ? ['--json'] : [])], { paths, ...io.runtime }),
-      ).toBe(0);
-      const output = io.out.join('\n');
-      if (json) {
-        const result: unknown = JSON.parse(output);
-        expectResultContract('connectors uninstall artifacts', result);
-        expect(result).toMatchObject({ next_actions: expect.arrayContaining([{ kind: 'external', instruction }]) });
-      } else expect(output).toContain(instruction);
-    },
-  );
+  it.each([false, true])('retains web operator cleanup actions in human and JSON output (json=%s)', async (json) => {
+    const paths = await testPaths();
+    const io = lines();
+    const instruction = 'Revoke the Cloudflare management API token, then delete the original --credential-file.';
+    vi.spyOn(connectorDefinition('web'), 'uninstall').mockResolvedValue({
+      name: 'web',
+      scope: 'host',
+      installed: false,
+      outcome: 'removed',
+      changed: true,
+      reason: null,
+      receipt_file: null,
+      operator_actions: [instruction],
+    });
+    expect(
+      await runCli(['connectors', 'uninstall', 'web', ...(json ? ['--json'] : [])], { paths, ...io.runtime }),
+    ).toBe(0);
+    const output = io.out.join('\n');
+    if (json) {
+      const result: unknown = JSON.parse(output);
+      expectResultContract('connectors uninstall web', result);
+      expect(result).toMatchObject({ next_actions: expect.arrayContaining([{ kind: 'external', instruction }]) });
+    } else expect(output).toContain(instruction);
+  });
+});
+
+it('reports a pending web hostname in ready resume JSON without an install or resume action', async () => {
+  const paths = await testPaths();
+  const input = await reserveInstance(paths, reservation());
+  const io = lines();
+  const pending = {
+    name: 'web' as const,
+    reason: 'web_hostname_claimed',
+    message: 'aya.example.test is held by assistant 00000000-0000-4000-8000-000000000001.',
+  };
+  expect(
+    await runCli(['resume', '--id', input.instance_id, '--json'], {
+      paths,
+      ...io.runtime,
+      checkPrerequisites: async () => PREREQUISITES,
+      advanceProvision: async () => ({ status: 'ready', pendingConnectors: [pending], nextActions: [] }),
+    }),
+  ).toBe(0);
+  const result: unknown = JSON.parse(io.out.join('\n'));
+  expect(result).toMatchObject({ outcome: 'succeeded', data: { connector_pending: [pending] }, next_actions: [] });
+  expectResultContract('resume', result);
 });

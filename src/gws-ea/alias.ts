@@ -79,11 +79,15 @@ export type AliasStem =
   | { readonly status: 'derived'; readonly stem: string }
   | { readonly status: 'name_required'; readonly reason: string };
 
-function asciiName(name: string): string {
+export function asciiName(name: string): string {
   return name
     .normalize('NFKD')
     .replace(/\p{M}/gu, '')
     .toLowerCase()
+    .replace(
+      /[øæœłđðþß]/gu,
+      (letter) => ({ ø: 'o', æ: 'ae', œ: 'oe', ł: 'l', đ: 'd', ð: 'd', þ: 'th', ß: 'ss' })[letter] ?? letter,
+    )
     .replace(/[^a-z0-9]/gu, '');
 }
 

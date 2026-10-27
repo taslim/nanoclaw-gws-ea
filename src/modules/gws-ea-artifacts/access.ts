@@ -4,7 +4,7 @@ import { getDb } from '../../db/connection.js';
 import { normalizePrincipalEmail } from '../../gws-ea/validation.js';
 import { listPrincipalAddresses } from '../gws-ea-profile/db.js';
 import { artifactDigest } from './db.js';
-import { readArtifactsPolicy, type ArtifactsPolicyFile } from './policy.js';
+import { readWebPolicy, type WebPolicyFile } from '../gws-ea-web/policy.js';
 import type { ArtifactViewRoute, AuthorizedArtifactView } from './server.js';
 
 export type ArtifactIdentityVerifier = (token: string | undefined) => Promise<string | undefined>;
@@ -36,11 +36,11 @@ export function createArtifactIdentityVerifier(
   };
 }
 export function createArtifactViewResolver(
-  config: ArtifactsPolicyFile,
+  config: WebPolicyFile,
   verify: ArtifactIdentityVerifier = createArtifactIdentityVerifier(config.accessIssuer, config.accessAud),
 ): (request: IncomingMessage, route: ArtifactViewRoute) => Promise<AuthorizedArtifactView | undefined> {
   return async (request, route) => {
-    const policy = await readArtifactsPolicy();
+    const policy = await readWebPolicy();
     if (policy.status !== 'enabled' || artifactDigest(policy.config) !== artifactDigest(config)) return undefined;
     let email: string | undefined;
     let principal = false;
@@ -50,7 +50,7 @@ export function createArtifactViewResolver(
       if (!email) return undefined;
       principal = (await listPrincipalAddresses()).some((address) => address.email === email);
       if (route.audience === 'private' && !principal) return undefined;
-      const fresh = await readArtifactsPolicy();
+      const fresh = await readWebPolicy();
       if (fresh.status !== 'enabled' || artifactDigest(fresh.config) !== artifactDigest(config)) return undefined;
     }
     const now = new Date().toISOString();

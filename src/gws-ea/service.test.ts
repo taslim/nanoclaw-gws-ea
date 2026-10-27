@@ -460,7 +460,7 @@ describe('GWS-EA instance runtime', () => {
         `ONECLI_GATEWAY_CONTAINER=${config.onecli_gateway_container}`,
         `ONECLI_URL=${config.onecli_app_url}`,
         `GWS_EA_BROWSER_ROOT=${path.join(config.instance_root, 'browser')}`,
-        `GWS_EA_ARTIFACTS_POLICY_FILE=${path.join(config.instance_root, 'artifacts', 'policy.json')}`,
+        `GWS_EA_WEB_POLICY_FILE=${path.join(config.instance_root, 'web', 'policy.json')}`,
       ].sort(),
     );
   });

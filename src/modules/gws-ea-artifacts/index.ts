@@ -20,11 +20,11 @@ registerDeliveryAction('artifact_share', runtime.sharing.handler, runtime.sharin
 runtime.sharing.registerApprovals();
 onHostStart(({ signal }) => runtime.start(signal));
 onHostShutdown(() => runtime.stop());
-for (const name of ['gws-ea-artifacts-health', 'gws-ea-artifacts-admission-emails'] as const) {
+for (const name of ['gws-ea-web-health', 'gws-ea-web-admission-emails'] as const) {
   register({
     name,
     description:
-      name === 'gws-ea-artifacts-health'
+      name === 'gws-ea-web-health'
         ? 'Observe local artifact origin availability.'
         : 'Read authoritative artifact admission intent.',
     access: 'hidden',
@@ -34,7 +34,7 @@ for (const name of ['gws-ea-artifacts-health', 'gws-ea-artifacts-admission-email
       return undefined;
     },
     handler: async () =>
-      name === 'gws-ea-artifacts-health' ? runtime.health() : { emails: await artifactAdmissionEmails() },
+      name === 'gws-ea-web-health' ? runtime.health() : { emails: await artifactAdmissionEmails() },
   });
 }
 

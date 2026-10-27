@@ -1,9 +1,9 @@
 import { createServer, type Server } from 'node:http';
-import { readArtifactsOperatorConfig, reconcileArtifactsAccessEmails } from '../../gws-ea/artifacts-cloudflare.js';
+import { readWebOperatorConfig, reconcileWebAccessEmails } from '../../gws-ea/web-cloudflare.js';
 import { log } from '../../log.js';
 import { createArtifactViewResolver } from './access.js';
 import { artifactDigest } from './db.js';
-import { ARTIFACTS_POLICY_VERSIONS, readArtifactsPolicy, type ArtifactsPolicyFile } from './policy.js';
+import { WEB_POLICY_VERSIONS, readWebPolicy, type WebPolicyFile } from '../gws-ea-web/policy.js';
 import { createArtifactViewHandler } from './server.js';
 import { artifactAdmissionEmails, ArtifactSharing } from './sharing.js';
 
@@ -15,13 +15,13 @@ export interface ArtifactsHealth {
   readonly reason?: string;
 }
 export interface ArtifactsRuntimeDependencies {
-  readonly reconcileAccess?: typeof reconcileArtifactsAccessEmails;
+  readonly reconcileAccess?: typeof reconcileWebAccessEmails;
 }
 /** One optional origin and one non-overlapping reconciliation tick per host. */
 export class ArtifactsRuntime {
   readonly sharing: ArtifactSharing;
   private server: Server | undefined;
-  private config: ArtifactsPolicyFile | undefined;
+  private config: WebPolicyFile | undefined;
   private verified: string | undefined;
   private verifying: Promise<void> | undefined;
   private recovered = false;
@@ -50,8 +50,8 @@ export class ArtifactsRuntime {
       },
     });
   }
-  private async coordinatesMatch(config: ArtifactsPolicyFile, publication = false): Promise<boolean> {
-    const operator = await readArtifactsOperatorConfig(config.cloudflare.operatorConfigFile);
+  private async coordinatesMatch(config: WebPolicyFile, publication = false): Promise<boolean> {
+    const operator = await readWebOperatorConfig(config.cloudflare.operatorConfigFile);
     const assistant = operator
       ? Object.values(operator.assistants).find(
           (candidate) => candidate.applicationId === config.cloudflare.applicationId,
@@ -64,11 +64,11 @@ export class ArtifactsRuntime {
       (!publication || assistant.publicationReady === true) &&
       assistant.aud === config.accessAud &&
       assistant.claim.hostname === config.hostname &&
-      assistant.claim.path_prefix === config.pathPrefix &&
+      config.pathPrefix === '/artifacts' &&
       assistant.claim.listen_port === config.listenPort
     );
   }
-  private async verifyAdmission(config: ArtifactsPolicyFile): Promise<void> {
+  private async verifyAdmission(config: WebPolicyFile): Promise<void> {
     if (!(await this.coordinatesMatch(config))) throw new Error('Artifact coordinates do not match their owner.');
     if (this.retryPolicy === artifactDigest(config) && Date.now() < this.retryAt)
       throw new Error('Artifact admission retry is deferred.');
@@ -80,7 +80,7 @@ export class ArtifactsRuntime {
     }
     if (this.verified === desired) return;
     const task = async (): Promise<void> => {
-      const result = await (this.dependencies.reconcileAccess ?? reconcileArtifactsAccessEmails)({
+      const result = await (this.dependencies.reconcileAccess ?? reconcileWebAccessEmails)({
         ...config.cloudflare,
         emails: artifactAdmissionEmails,
       });
@@ -100,7 +100,7 @@ export class ArtifactsRuntime {
     }
   }
   async health(): Promise<ArtifactsHealth> {
-    const policy = await readArtifactsPolicy();
+    const policy = await readWebPolicy();
     let coordinates = false;
     /* eslint-disable no-catch-all/no-catch-all -- health observes malformed optional state without repairing it */
     try {
@@ -116,7 +116,7 @@ export class ArtifactsRuntime {
       policy.status === 'enabled' &&
       artifactDigest(policy.config) === artifactDigest(this.config);
     return {
-      policyVersions: ARTIFACTS_POLICY_VERSIONS,
+      policyVersions: WEB_POLICY_VERSIONS,
       enabled: policy.status === 'enabled',
       availability: policy.status === 'disabled' ? 'disabled' : listening ? 'available' : 'unavailable',
       listener: listening && this.config ? { state: 'listening', port: this.config.listenPort } : { state: 'stopped' },
@@ -156,7 +156,7 @@ export class ArtifactsRuntime {
   private async maintain(): Promise<void> {
     /* eslint-disable no-catch-all/no-catch-all -- optional origin failure closes serving without aborting chat startup */
     try {
-      const policy = await readArtifactsPolicy();
+      const policy = await readWebPolicy();
       if (policy.status !== 'enabled') {
         this.ready = false;
         this.verified = undefined;
@@ -175,7 +175,7 @@ export class ArtifactsRuntime {
         this.recovered = true;
       } else await this.sharing.reconcile();
       await this.verifyAdmission(policy.config);
-      const fresh = await readArtifactsPolicy();
+      const fresh = await readWebPolicy();
       if (
         this.stopped ||
         fresh.status !== 'enabled' ||

@@ -7,19 +7,14 @@ import {
 } from './onepassword.js';
 import { inspectOnePasswordUninstall } from './onepassword-uninstall.js';
 import {
-  inspectArtifactsCapability,
+  inspectWebCapability,
   supportedCloudflaredVersion,
-  artifactsReleaseCompatibility,
-  inspectArtifactsUninstall,
-  type ArtifactsCapabilityDependencies,
-  type ArtifactsCapabilityObservation,
-} from './artifacts-connector.js';
-import {
-  readArtifactsOperatorConfig,
-  artifactsOperatorFiles,
-  artifactsApi,
-  type ArtifactsOperatorConfig,
-} from './artifacts-cloudflare.js';
+  webReleaseCompatibility,
+  inspectWebUninstall,
+  type WebCapabilityDependencies,
+  type WebCapabilityObservation,
+} from './web-connector.js';
+import { readWebOperatorConfig, webOperatorFiles, webApi, type WebOperatorConfig } from './web-cloudflare.js';
 import { CONNECTOR_ACTIONS, connectorDefinition, type ConnectorName, type ConnectorDefinition } from './connectors.js';
 import {
   inspectVoiceCapability,
@@ -72,17 +67,14 @@ export interface ConnectorObservation {
   readonly assistants: readonly ConnectorAssistantObservation[];
   readonly reasons: readonly string[];
   readonly next_actions: readonly NextAction[];
-  readonly details:
-    | VoiceCapabilityObservation
-    | OnePasswordCapabilityObservation
-    | readonly ArtifactsCapabilityObservation[];
+  readonly details: VoiceCapabilityObservation | OnePasswordCapabilityObservation | readonly WebCapabilityObservation[];
 }
 export interface ConnectorInspection {
   readonly check?: boolean;
   readonly instanceId?: string;
   readonly voice?: VoiceCapabilityInspection;
   readonly onePassword?: OnePasswordCliSeams;
-  readonly artifacts?: ArtifactsCapabilityDependencies;
+  readonly web?: WebCapabilityDependencies;
   readonly serviceHelpers?: NanoclawServiceHelpers;
   readonly hostStatus?: Pick<HostStatusHelpers, 'queryHost'>;
 }
@@ -174,13 +166,13 @@ async function observeUninstall(paths: ControlPlanePaths, name: ConnectorName): 
         actions.push({ kind: 'command', argv: ['gws-ea', 'connectors', 'uninstall', name, '--abandon'] });
       return { incomplete: inspection.incomplete, unknown: false, reasons, nextActions: actions };
     }
-    if (name === 'artifacts') {
-      const receipt = await inspectArtifactsUninstall(paths);
+    if (name === 'web') {
+      const receipt = await inspectWebUninstall(paths);
       if (receipt)
         return {
           incomplete: true,
           unknown: false,
-          reasons: ['Artifacts uninstall is incomplete.', ...(receipt.reason ? [receipt.reason] : [])],
+          reasons: ['Web uninstall is incomplete.', ...(receipt.reason ? [receipt.reason] : [])],
           nextActions: [uninstall(name)],
         };
     }
@@ -199,16 +191,16 @@ async function observeUninstall(paths: ControlPlanePaths, name: ConnectorName): 
 }
 
 /** Verify shared prerequisites even on a host with no eligible assistants; every provider call is a GET. */
-async function checkArtifactsHost(
+async function checkWebHost(
   paths: ControlPlanePaths,
-  config: ArtifactsOperatorConfig,
-  dependencies: ArtifactsCapabilityDependencies,
+  config: WebOperatorConfig,
+  dependencies: WebCapabilityDependencies,
 ): Promise<readonly [ConnectorPrerequisite['status'], ConnectorPrerequisite['status'], string | null]> {
   try {
     const result = await (dependencies.runCommand ?? runSanitizedCommandOutcome)({
       command: config.cloudflaredPath,
       args: ['--version'],
-      cwd: artifactsOperatorFiles(paths).root,
+      cwd: webOperatorFiles(paths).root,
       env: buildToolEnvironment({}, { HOME: config.connector?.homeDirectory ?? process.env.HOME ?? '/' }),
       timeoutMs: 5000,
       outputLimitBytes: 4096,
@@ -224,7 +216,7 @@ async function checkArtifactsHost(
     ];
   }
   try {
-    const api = await artifactsApi(config, dependencies);
+    const api = await webApi(config, dependencies);
     const zone = await api.request('GET', `/zones/${config.zoneId}`);
     if (
       !isRecord(zone) ||
@@ -233,7 +225,7 @@ async function checkArtifactsHost(
       !isRecord(zone.account) ||
       zone.account.id !== config.accountId ||
       typeof zone.name !== 'string' ||
-      !(config.hostname === zone.name || config.hostname.endsWith(`.${zone.name}`))
+      config.zoneApex !== zone.name
     )
       return [
         'missing',
@@ -420,14 +412,14 @@ export async function inspectConnector(
       });
     }
   } else {
-    let config: ArtifactsOperatorConfig | undefined;
+    let config: WebOperatorConfig | undefined;
     try {
-      config = await readArtifactsOperatorConfig(artifactsOperatorFiles(paths).configFile);
+      config = await readWebOperatorConfig(webOperatorFiles(paths).configFile);
       setup = config ? 'installed' : 'not_installed';
       // eslint-disable-next-line no-catch-all/no-catch-all -- Invalid optional local configuration remains a fact in discovery rather than hiding the catalog.
     } catch (_error) {
       setup = 'unknown';
-      reasons.push('Artifacts operator configuration is invalid or inaccessible.');
+      reasons.push('Web operator configuration is invalid or inaccessible.');
     }
     if (config?.pending) {
       setup = 'pending';
@@ -439,20 +431,20 @@ export async function inspectConnector(
         });
     }
     if (canCheck && config && !config.pending) {
-      const [account, executable, reason] = await checkArtifactsHost(paths, config, options.artifacts ?? {});
+      const [account, executable, reason] = await checkWebHost(paths, config, options.web ?? {});
       prerequisiteStates[0] = account;
       prerequisiteStates[1] = executable;
       hostReady = account === 'satisfied' && executable === 'satisfied';
       if (reason) reasons.push(reason);
     }
-    const observations: ArtifactsCapabilityObservation[] = [];
+    const observations: WebCapabilityObservation[] = [];
     for (const id of ids) {
       let compatibility: ConnectorCompatibility = 'unknown';
       try {
         const runtime = await loadInstanceRuntimeConfig(paths.runtimeFile(id));
-        compatibility = await artifactsReleaseCompatibility(runtime.checkout_root);
+        compatibility = await webReleaseCompatibility(runtime.checkout_root);
         const live = canCheck && compatibility === 'compatible' && !unavailable.has(id);
-        const observation = await inspectArtifactsCapability(paths, id, { ...options.artifacts, check: live });
+        const observation = await inspectWebCapability(paths, id, { ...options.web, check: live });
         observations.push(observation);
         const state: ConnectorSetup =
           observation.activation === 'enabled'
@@ -558,7 +550,7 @@ export function connectorLines(
           : onePasswordCapabilityLines(details, true, timezone)
         ).slice(1, -1)
       : details.flatMap((assistant) => [
-          `  Assistant ${assistant.instance_id}: ${assistant.hostname ?? 'hostname not configured'}${assistant.path_prefix ?? ''}`,
+          `  Assistant ${assistant.instance_id}: ${assistant.hostname ?? 'hostname not configured'}`,
           `    Origin: ${assistant.activation}; remote: ${assistant.remote.replaceAll('_', ' ')}; listener: ${assistant.listener.replaceAll('_', ' ')}`,
         ]);
   return [

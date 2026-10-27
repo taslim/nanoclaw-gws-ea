@@ -145,7 +145,7 @@ function enableArtifacts(): void {
     }),
     { mode: 0o600 },
   );
-  vi.stubEnv('GWS_EA_ARTIFACTS_POLICY_FILE', policy);
+  vi.stubEnv('GWS_EA_WEB_POLICY_FILE', policy);
 }
 async function privateArtifactLink(): Promise<string> {
   enableArtifacts();

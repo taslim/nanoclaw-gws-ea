@@ -2,7 +2,7 @@ import { provisionInstalledConnectors } from './connector-provisioning.js';
 import { CONNECTOR_CATALOG, connectorDefinition, type ConnectorLifecycleContext } from './connectors.js';
 import { connectorLines } from './connector-inspection.js';
 import { voiceCapabilityRecovery } from './voice-inspection.js';
-import { type ArtifactsCapabilityDependencies } from './artifacts-connector.js';
+import { type WebCapabilityDependencies } from './web-connector.js';
 import { aliasDecision, runAliasStep, aliasNextActions, type AliasDecision } from './alias.js';
 import { withAssistantLock } from './assistant-lock.js';
 import { loadInstanceRuntimeConfig } from './service.js';
@@ -240,7 +240,7 @@ export interface CliRuntime {
   whatsappNcl?: typeof runInstanceNclJson;
   aliasNcl?: import('./alias.js').AliasStepOptions['ncl'];
   browserInspection?: import('./browser-isolation.js').BrowserIsolationInspection;
-  artifacts?: ArtifactsCapabilityDependencies;
+  web?: WebCapabilityDependencies;
   onePassword?: OnePasswordCliSeams;
   /** Picks among the operator's 1Password accounts; absent, enable needs --account until one is recorded. */
   chooseOnePasswordAccount?: OnePasswordDependencies['chooseAccount'];
@@ -813,7 +813,7 @@ class Cli {
         operatorTerminal: Boolean(this.#runtime.prompts),
         rateLimitState: this.#connectorRateLimit,
       },
-      artifacts: this.#runtime.artifacts,
+      web: this.#runtime.web,
     });
   }
 
@@ -872,7 +872,7 @@ class Cli {
     const operation = await this.#acquire(reporter, instanceId, { command: 'create' });
     if (!operation) throw busy();
     try {
-      return await this.#provision(reporter, operation, interaction);
+      return await this.#provision(reporter, operation, interaction, state);
     } finally {
       operation.release();
     }
@@ -932,15 +932,30 @@ class Cli {
    * A terminal attends each pause and provisioning runs on in the same process; without one, or when the person
    * stops, the pause is reported.
    */
-  async #provision(reporter: StepReporter, operation: InstanceOperation, interaction: Interaction): Promise<Outcome> {
+  async #provision(
+    reporter: StepReporter,
+    operation: InstanceOperation,
+    interaction: Interaction,
+    state: AttemptState,
+  ): Promise<Outcome> {
     let current = interaction;
     for (;;) {
       if (current.decisions.skipAlias) await recordAliasSkipped(operation);
       const result = await runStep(reporter, { id: 'provision' }, () =>
         this.#advance(operation, { interaction: current, runtime: reporter }),
       );
-      if (result.status !== 'paused')
-        return { status: 'ready', message: `Instance ${operation.instanceId} is ready.`, actions: result.nextActions };
+      if (result.status !== 'paused') {
+        if (result.pendingConnectors?.length)
+          state.data = { ...state.data, connector_pending: result.pendingConnectors };
+        return {
+          status: 'ready',
+          message: [
+            `Instance ${operation.instanceId} is ready.`,
+            ...(result.pendingConnectors ?? []).map((connector) => `${connector.name}: ${connector.message}`),
+          ].join(' '),
+          actions: result.nextActions,
+        };
+      }
       const response = await this.#attend(current, result.pause);
       if (response.kind === 'stop') return result;
       if (response.decisions) current = current.withDecisions(response.decisions);
@@ -957,7 +972,7 @@ class Cli {
     }
   }
 
-  async #resumeWork({ reporter, interaction }: Session, instanceId: string): Promise<Outcome> {
+  async #resumeWork({ reporter, interaction, state }: Session, instanceId: string): Promise<Outcome> {
     const operation = await this.#acquire(reporter, instanceId, { command: 'resume' });
     if (!operation) throw busy();
     try {
@@ -970,7 +985,7 @@ class Cli {
         const host = await recordedHost(this.#paths, reservation);
         await this.#checkPrerequisites({ command: 'resume', paths: this.#paths, account, ...host }, interaction);
       });
-      return await this.#provision(reporter, operation, interaction);
+      return await this.#provision(reporter, operation, interaction, state);
     } finally {
       operation.release();
     }
@@ -1253,7 +1268,7 @@ class Cli {
         operatorTerminal: Boolean(this.#runtime.prompts),
         rateLimitState: this.#connectorRateLimit,
       },
-      artifacts: this.#runtime.artifacts,
+      web: this.#runtime.web,
     });
     for (const pending of result.pending) this.#presenter.line(`${pending.name}: ${pending.message}`);
     const actions = [...this.#connectorNextActions, ...result.next_actions];
@@ -2266,8 +2281,7 @@ function removalSummary(preview: RemovalPreview, outcome: RemovalOutcome | undef
       'sign-in; with the project deleted it delivers nowhere, and Google deletes it within 7 days.',
     onepassword:
       "No longer tracked: the assistant's 1Password resources named below; settle any that remain yourself on 1Password.com.",
-    artifacts:
-      'Left behind: the exact artifact resources named below. Their ownership record, credentials and removal receipt remain for manual cleanup.',
+    web: 'Left behind: the exact artifact resources named below. Their ownership record, credentials and removal receipt remain for manual cleanup.',
   };
   return [
     ...(outcome?.removed.includes('gcp-project')
@@ -2275,7 +2289,7 @@ function removalSummary(preview: RemovalPreview, outcome: RemovalOutcome | undef
       : []),
     ...(outcome?.onepassword ? onePasswordOutcomeLines(preview.instanceId, outcome.onepassword) : []),
     ...(outcome?.abandoned.flatMap(({ resource, evidence }) =>
-      resource === 'onepassword' || resource === 'artifacts'
+      resource === 'onepassword' || resource === 'web'
         ? [leftBehind[resource], ...evidence.split('\n').map((line) => `  ${line}`)]
         : [leftBehind[resource]],
     ) ?? []),
@@ -2563,7 +2577,7 @@ export async function runCli(args: readonly string[], runtime: CliRuntime = {}):
             check: checked,
             instanceId: options.id,
             onePassword: onePasswordSeams(environment, runtime.onePassword),
-            artifacts: runtime.artifacts,
+            web: runtime.web,
             serviceHelpers: runtime.serviceHelpers,
             hostStatus: runtime.hostStatus,
           };
@@ -2617,7 +2631,7 @@ export async function runCli(args: readonly string[], runtime: CliRuntime = {}):
             recordEffect,
             rateLimitState: { limited: false },
           },
-          artifacts: { ...runtime.artifacts, recordEffect },
+          web: { ...runtime.web, recordEffect },
         };
         if (name === 'onepassword' && handler.command === 'uninstall') {
           const dependencies = lifecycleContext.onePassword;
@@ -2665,16 +2679,26 @@ export async function runCli(args: readonly string[], runtime: CliRuntime = {}):
           if (result.name === 'onepassword' && 'enabled' in result) {
             paused = result.assistants.some((assistant) => assistant.outcome === 'pending');
             actions = onePasswordInstallNextActions(result);
-          } else if (result.name === 'artifacts') {
+          } else if (result.name === 'web') {
             paused =
               'assistants' in result
                 ? result.assistants.some((assistant) => assistant.outcome === 'pending')
                 : result.outcome === 'pending';
+            const namingOnly =
+              'assistants' in result &&
+              paused &&
+              result.assistants
+                .filter((assistant) => assistant.outcome === 'pending')
+                .every((assistant) => ['web_name_unusable', 'web_hostname_claimed'].includes(assistant.reason ?? ''));
             actions = [
-              {
-                kind: 'command',
-                argv: ['gws-ea', 'connectors', paused ? handler.command : 'show', name],
-              },
+              ...(namingOnly
+                ? []
+                : [
+                    {
+                      kind: 'command' as const,
+                      argv: ['gws-ea', 'connectors', paused ? handler.command : 'show', name],
+                    },
+                  ]),
               ...('operator_actions' in result
                 ? result.operator_actions.map((instruction) => ({ kind: 'external' as const, instruction }))
                 : []),
@@ -2689,6 +2713,13 @@ export async function runCli(args: readonly string[], runtime: CliRuntime = {}):
           headline: `${name}: ${handler.command}${paused ? ' has pending work' : ' completed'}.`,
           details: [
             ...previewLines,
+            ...(data && 'assistants' in data && Array.isArray(data.assistants)
+              ? data.assistants.flatMap((assistant: unknown) =>
+                  isRecord(assistant) && typeof assistant.message === 'string'
+                    ? [`Assistant ${String(assistant.instance_id)}: ${assistant.message}`]
+                    : [],
+                )
+              : []),
             ...(data && 'reason' in data && typeof data.reason === 'string' ? [data.reason] : []),
             ...nextActionLines(actions),
           ],
@@ -2784,7 +2815,7 @@ export async function runCli(args: readonly string[], runtime: CliRuntime = {}):
               browserInspection: runtime.browserInspection,
               connectorInspection: {
                 onePassword: onePasswordSeams(environment, runtime.onePassword),
-                artifacts: runtime.artifacts,
+                web: runtime.web,
               },
             },
             options,

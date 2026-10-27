@@ -633,7 +633,7 @@ describe('status', () => {
     expect(status.connectors).toEqual(
       expect.arrayContaining([
         expect.objectContaining({ name: 'voice', setup: 'not_installed' }),
-        expect.objectContaining({ name: 'artifacts', setup: 'not_installed' }),
+        expect.objectContaining({ name: 'web', setup: 'not_installed' }),
       ]),
     );
     expect(status.probes.host.status).toBe('ok');
@@ -1184,7 +1184,7 @@ describe('status', () => {
     expect(observed.status.connectors.map((entry) => [entry.name, entry.setup])).toEqual([
       ['voice', 'not_installed'],
       ['onepassword', 'not_installed'],
-      ['artifacts', 'not_installed'],
+      ['web', 'not_installed'],
     ]);
   });
 

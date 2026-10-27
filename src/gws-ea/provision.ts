@@ -124,7 +124,7 @@ export interface ProductionProvisionOptions {
   readonly interaction?: Interaction;
   readonly runtime?: ProvisionRuntime;
   readonly onePassword?: ConnectorProvisioningDependencies['onePassword'];
-  readonly artifacts?: ConnectorProvisioningDependencies['artifacts'];
+  readonly web?: ConnectorProvisioningDependencies['web'];
 }
 
 export interface ProductionProvisionInput {
@@ -1436,7 +1436,7 @@ export async function runProductionProvision(
         provisionRuntime,
         { ...options.onePassword, upsertEnvVars: options.upsertEnvVars },
         { ...(alias ? { decision: alias } : {}), skip: interaction?.decisions.skipAlias },
-        options.artifacts,
+        options.web,
       )
     : result;
 }
@@ -1447,18 +1447,27 @@ export async function provisionAssistantResources(
   reporter: StepReporter,
   onePassword: ConnectorProvisioningDependencies['onePassword'] = {},
   alias: AliasStepOptions & { readonly skip?: boolean } = {},
-  artifacts: ConnectorProvisioningDependencies['artifacts'] = {},
+  web: ConnectorProvisioningDependencies['web'] = {},
 ): Promise<ProvisionResult> {
-  const connectors = await provisionInstalledConnectors(operation, reporter, { onePassword, artifacts });
+  const connectors = await provisionInstalledConnectors(operation, reporter, { onePassword, web });
   const actionable = connectors.pending.find(
-    (entry) => !['rate_limited', 'instance_busy', 'onepassword_busy', 'artifacts_busy'].includes(entry.reason),
+    (entry) =>
+      ![
+        'rate_limited',
+        'instance_busy',
+        'onepassword_busy',
+        'web_busy',
+        'web_name_unusable',
+        'web_hostname_claimed',
+        'web_hostname_foreign',
+      ].includes(entry.reason),
   );
   if (actionable)
     return {
       status: 'paused',
       pause: {
         kind: 'human-action',
-        phase: actionable.name === 'onepassword' ? 'provision_onepassword' : 'provision_artifacts',
+        phase: actionable.name === 'onepassword' ? 'provision_onepassword' : 'provision_web',
         code: `${actionable.name}_${actionable.reason}`,
         message: `The assistant is ready; ${actionable.name} setup waits. ${actionable.message}`,
         ...(actionable.reason === 'operator_sign_in_needed' && onePassword.operatorTerminal === false
@@ -1492,11 +1501,11 @@ export async function provisionAssistantResources(
         await claimInstanceAlias(operation.paths, operation.instanceId, undefined);
       }
     }
-    return { status: 'ready', nextActions: connectors.next_actions };
+    return { status: 'ready', nextActions: connectors.next_actions, pendingConnectors: connectors.pending };
   }
   const runtime = await loadInstanceRuntimeConfig(operation.paths.runtimeFile(operation.instanceId));
   const result = await runAliasStep(operation.paths, operation.instanceId, runtime, reporter, alias);
   return result.status === 'ready'
-    ? { ...result, nextActions: connectors.next_actions }
+    ? { ...result, nextActions: connectors.next_actions, pendingConnectors: connectors.pending }
     : { ...result, pause: { ...result.pause, optional: true } };
 }

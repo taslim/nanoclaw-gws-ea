@@ -45,7 +45,7 @@ async function check(url: string, recipients = ['juno@example.com']) {
 beforeEach(async () => {
   fs.mkdirSync(ROOT, { recursive: true });
   policy();
-  vi.stubEnv('GWS_EA_ARTIFACTS_POLICY_FILE', path.join(ROOT, 'policy.json'));
+  vi.stubEnv('GWS_EA_WEB_POLICY_FILE', path.join(ROOT, 'policy.json'));
   await runMigrations(await initTestDb());
   const now = new Date().toISOString();
   await createAgentGroup({ id: 'main', name: 'Main', folder: 'main', agent_provider: null, created_at: now });

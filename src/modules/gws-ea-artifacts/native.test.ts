@@ -29,7 +29,7 @@ import { ARTIFACT_ACTIONS } from './actions.js';
 import { ArtifactSharing } from './sharing.js';
 import { createArtifactViewHandler } from './server.js';
 import { createArtifactIdentityVerifier, createArtifactViewResolver } from './access.js';
-import type { ArtifactsPolicyFile } from './policy.js';
+import type { WebPolicyFile } from '../gws-ea-web/policy.js';
 
 let origin: Server | undefined;
 afterEach(async () => {
@@ -89,7 +89,7 @@ it.skipIf(!process.env.GWS_EA_ARTIFACT_NATIVE_IMAGE)(
     );
     const main = (await resolveSystemSession('canonical', 'system:artifacts-native')).session;
     const author = (await resolveSystemSession('author', 'system:artifacts-native')).session;
-    const config: ArtifactsPolicyFile = {
+    const config: WebPolicyFile = {
       schemaVersion: 1,
       enabled: true,
       hostname: 'views.example.com',
@@ -104,7 +104,7 @@ it.skipIf(!process.env.GWS_EA_ARTIFACT_NATIVE_IMAGE)(
       },
     };
     fs.writeFileSync(path.join(ROOT, 'policy.json'), JSON.stringify(config), { mode: 0o600 });
-    vi.stubEnv('GWS_EA_ARTIFACTS_POLICY_FILE', path.join(ROOT, 'policy.json'));
+    vi.stubEnv('GWS_EA_WEB_POLICY_FILE', path.join(ROOT, 'policy.json'));
     const keys = await generateKeyPair('RS256');
     const jwk = { ...(await exportJWK(keys.publicKey)), kid: 'native-fixture', alg: 'RS256' };
     const jwks = vi.fn(async () => Response.json({ keys: [jwk] }));

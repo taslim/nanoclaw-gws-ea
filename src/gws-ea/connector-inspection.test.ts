@@ -12,7 +12,7 @@ import { reserveInstance } from './journal.js';
 import { resolveControlPlanePaths, type ControlPlanePaths } from './paths.js';
 import { installOnePassword, ONEPASSWORD_CONTRACT } from './onepassword.js';
 import { onePasswordUninstallFile } from './onepassword-uninstall.js';
-import { artifactsOperatorFiles, writeArtifactsOperatorConfig } from './artifacts-cloudflare.js';
+import { webOperatorFiles, writeWebOperatorConfig } from './web-cloudflare.js';
 import { ACCOUNT_ID, FakeOnePassword } from './testing/onepassword-fixture.js';
 import { voiceInstallationDirectory } from './install-voice.js';
 import { voicePolicyFile } from './local-voice.js';
@@ -71,17 +71,17 @@ async function installedOnePassword() {
   await installOnePassword(paths, { accountId: ACCOUNT_ID }, { cli: provider.cli(), upsertEnvVars: () => undefined });
   return provider;
 }
-async function artifactsConfig() {
-  const files = artifactsOperatorFiles(paths);
+async function webConfig() {
+  const files = webOperatorFiles(paths);
   const credentialFile = path.join(files.root, 'management-token');
   await mkdir(files.root, { recursive: true, mode: 0o700 });
   await writeFile(credentialFile, 'fixture-token', { mode: 0o600 });
-  await writeArtifactsOperatorConfig(files.configFile, {
+  await writeWebOperatorConfig(files.configFile, {
     schemaVersion: 1,
     accountId: 'account',
     teamName: 'team',
     zoneId: 'zone',
-    hostname: 'views.example.test',
+    zoneApex: 'example.test',
     credentialFile,
     cloudflaredPath: '/opt/homebrew/bin/cloudflared',
     dns: {},
@@ -129,7 +129,7 @@ async function voiceInstallation(model: voiceAssets.VoiceModelId = 'base') {
 }
 
 describe('uniform connector observations', () => {
-  it.each(['voice', 'onepassword', 'artifacts'] as const)(
+  it.each(['voice', 'onepassword', 'web'] as const)(
     'reports absent %s locally and a failed check without creating setup',
     async (name) => {
       const local = await inspectConnector(paths, name);
@@ -295,9 +295,9 @@ describe('uniform connector observations', () => {
       argv: ['gws-ea', 'connectors', 'install', 'voice', '--model', 'small'],
     });
   });
-  it('keeps local onepassword and artifacts reads free of provider requests', async () => {
+  it('keeps local onepassword and web reads free of provider requests', async () => {
     const provider = await installedOnePassword();
-    await artifactsConfig();
+    await webConfig();
     const calls = provider.calls.length;
     const send = vi.fn<typeof fetch>(() => {
       throw new Error('Local observation called provider');
@@ -305,11 +305,11 @@ describe('uniform connector observations', () => {
     const command = vi.fn(() => {
       throw new Error('Local observation ran process');
     });
-    for (const name of ['onepassword', 'artifacts'] as const) {
+    for (const name of ['onepassword', 'web'] as const) {
       expect(
         await inspectConnector(paths, name, {
           onePassword: provider.cli(),
-          artifacts: { fetch: send, runCommand: command },
+          web: { fetch: send, runCommand: command },
         }),
       ).toMatchObject({ setup: 'installed', readiness: { checked: false, status: 'not_checked' } });
     }
@@ -326,15 +326,15 @@ describe('uniform connector observations', () => {
     expect(human).toContain('a recorded write grant is not a tested write');
   });
   it('verifies artifact host prerequisites even when no assistant exists', async () => {
-    await artifactsConfig();
+    await webConfig();
     const requests: string[] = [];
     const send: typeof fetch = async (input, init) => {
       requests.push(`${init?.method} ${new URL(String(input)).pathname}`);
       return new Response(JSON.stringify({ success: false }), { status: 403 });
     };
-    const observed = await inspectConnector(paths, 'artifacts', {
+    const observed = await inspectConnector(paths, 'web', {
       check: true,
-      artifacts: {
+      web: {
         fetch: send,
         runCommand: async () => ({ exitCode: 0, stdout: 'cloudflared version 2025.4.0', stderr: '' }),
       },
@@ -344,7 +344,7 @@ describe('uniform connector observations', () => {
     expect(requests.every((request) => request.startsWith('GET '))).toBe(true);
   });
   it('readies a configured artifact host only after verifying its account, zone, team and executable', async () => {
-    await artifactsConfig();
+    await webConfig();
     const requests: string[] = [];
     const send: typeof fetch = async (input, init) => {
       const resource = new URL(String(input)).pathname;
@@ -354,9 +354,9 @@ describe('uniform connector observations', () => {
         : { auth_domain: 'team.cloudflareaccess.com' };
       return new Response(JSON.stringify({ success: true, result }));
     };
-    const observed = await inspectConnector(paths, 'artifacts', {
+    const observed = await inspectConnector(paths, 'web', {
       check: true,
-      artifacts: {
+      web: {
         fetch: send,
         runCommand: async () => ({ exitCode: 0, stdout: 'cloudflared version 2025.4.0', stderr: '' }),
       },
@@ -365,9 +365,9 @@ describe('uniform connector observations', () => {
     expect(requests).toEqual(['GET /client/v4/zones/zone', 'GET /client/v4/accounts/account/access/organizations']);
   });
   it('reports invalid local artifact configuration without hiding other connector observations', async () => {
-    const files = await artifactsConfig();
+    const files = await webConfig();
     await writeFile(files.configFile, '{', { mode: 0o600 });
-    expect(await inspectConnector(paths, 'artifacts')).toMatchObject({
+    expect(await inspectConnector(paths, 'web')).toMatchObject({
       setup: 'unknown',
       readiness: { checked: false },
     });
