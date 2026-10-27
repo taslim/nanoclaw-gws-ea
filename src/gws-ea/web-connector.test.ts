@@ -1193,6 +1193,50 @@ it.each(['exact DNS', 'wildcard DNS', 'wildcard Access', 'own tunnel'] as const)
   },
 );
 
+it('keeps provisioning an existing claim after a foreign wildcard DNS record appears in the zone', async () => {
+  const f = await provisionFixture();
+  f.firstName('Aya');
+  f.api.dns.push({ id: 'foreign-wildcard', name: '*.example.test' });
+  const result = await provisionForAssistant(f.paths, f.a.instanceId, {}, f.dependencies);
+  expect(result.hostname).toBe('views.example.test');
+  expect((await getInstanceReservation(f.paths, f.a.instanceId)).exclusive_resource_claims.web?.hostname).toBe(
+    'views.example.test',
+  );
+});
+
+it('reports no address from the closed policy uninstall leaves, including after a reinstall leaves the name pending', async () => {
+  const f = await provisionFixture();
+  const oldClaim = (await getInstanceReservation(f.paths, f.a.instanceId)).exclusive_resource_claims.web;
+  if (!oldClaim) throw new Error('Fixture namespace is missing');
+  await releaseInstanceWeb(f.paths, f.a.instanceId, oldClaim);
+  const policyFile = instanceWebPolicyFile(f.a.runtime);
+  await mkdir(path.dirname(policyFile), { recursive: true, mode: 0o700 });
+  await writeFile(
+    policyFile,
+    JSON.stringify({
+      schemaVersion: 1,
+      enabled: false,
+      hostname: oldClaim.hostname,
+      listenPort: oldClaim.listen_port,
+      accessIssuer: 'https://team.cloudflareaccess.com',
+      accessAud: 'retired-aud',
+      cloudflare: { accountId: 'account', applicationId: 'retired-app', operatorConfigFile: f.files.configFile },
+    }),
+    { mode: 0o600 },
+  );
+  expect(await inspectWebCapability(f.paths, f.a.instanceId)).toMatchObject({
+    activation: 'disabled',
+    hostname: null,
+  });
+  f.firstName('Aya');
+  f.api.dns.push({ id: 'foreign-dns', name: 'aya.example.test' });
+  const reinstalled = await installWebConnector(f.paths, {}, f.dependencies);
+  expect(reinstalled.assistants).toContainEqual(
+    expect.objectContaining({ instance_id: f.a.instanceId, outcome: 'pending', reason: 'web_hostname_foreign' }),
+  );
+  expect((await inspectWebCapability(f.paths, f.a.instanceId)).hostname).toBeNull();
+});
+
 it('releases a resource-free claim when DNS creation loses a name race, without creating Access', async () => {
   const f = await provisionFixture();
   await releaseFixtureClaim(f);

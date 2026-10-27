@@ -1364,7 +1364,8 @@ export async function inspectWebCapability(
     instance_id: instanceId,
     observed_at: new Date().toISOString(),
     activation: policy.status === 'unavailable' ? 'unavailable' : policy.enabled ? 'enabled' : 'disabled',
-    hostname: coordinates?.hostname ?? claim?.hostname ?? null,
+    // A policy closed by uninstall keeps its old hostname; only the registry claim still owns an address.
+    hostname: claim?.hostname ?? (policy.enabled ? coordinates?.hostname : undefined) ?? null,
     policy_file: policyFile,
     remote,
     listener,
