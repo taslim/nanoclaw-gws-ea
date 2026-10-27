@@ -5,7 +5,6 @@ import type { WebIdentity } from './access.js';
 import type { WebPolicyFile } from './policy.js';
 import { WebRuntime, type WebReadiness } from './runtime.js';
 
-/** Explicit composition: web knows only the artifact handler and its admission-email source. */
 export function startWebOrigin(
   artifacts: (config: WebPolicyFile, identity: WebIdentity) => RequestListener,
   admissionEmails: () => Promise<readonly string[]>,

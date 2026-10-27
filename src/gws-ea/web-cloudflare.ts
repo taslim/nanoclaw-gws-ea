@@ -438,7 +438,7 @@ export function verifiedPolicyEmails(value: unknown): string[] {
     (value.require !== undefined && (!Array.isArray(value.require) || value.require.length > 0))
   )
     throw new GwsEaError('web_access_mismatch', 'The owned Access policy no longer has exact email admission.');
-  const emails = value.include.map((rule) =>
+  const emails = value.include.map((rule: unknown) =>
     isRecord(rule) && Object.keys(rule).length === 1 && isRecord(rule.email) && typeof rule.email.email === 'string'
       ? rule.email.email
       : '',

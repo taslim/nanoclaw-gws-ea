@@ -986,7 +986,7 @@ async function provisionWebAssistant(
     !isRecord(profile) ||
     typeof profile.assistant_first_name !== 'string' ||
     !Array.isArray(profile.principal_emails) ||
-    !profile.principal_emails.every((email): email is string => typeof email === 'string') ||
+    !profile.principal_emails.every((email: unknown): email is string => typeof email === 'string') ||
     !profile.principal_emails.length
   )
     throw new GwsEaError(
@@ -1033,7 +1033,7 @@ async function provisionWebAssistant(
     if (
       !isRecord(current) ||
       !Array.isArray(current.emails) ||
-      !current.emails.every((email): email is string => typeof email === 'string')
+      !current.emails.every((email: unknown): email is string => typeof email === 'string')
     )
       throw new GwsEaError('web_profile_unavailable', 'The host could not read authoritative web admission.');
     const exact = webEmails(current.emails);
@@ -1098,7 +1098,7 @@ async function provisionWebAssistant(
       if (
         !isRecord(authors) ||
         !Array.isArray(authors.group_ids) ||
-        !authors.group_ids.every((id): id is string => typeof id === 'string' && id.length > 0)
+        !authors.group_ids.every((id: unknown): id is string => typeof id === 'string' && id.length > 0)
       )
         throw new GwsEaError('web_authors_unavailable', 'The host could not read current artifact author groups.');
       for (const groupId of new Set(authors.group_ids)) await ncl(runtime, ['groups', 'restart', '--id', groupId]);
@@ -1250,7 +1250,7 @@ export async function inspectWebCapability(
       if (
         !isRecord(admission) ||
         !Array.isArray(admission.emails) ||
-        !admission.emails.every((email): email is string => typeof email === 'string')
+        !admission.emails.every((email: unknown): email is string => typeof email === 'string')
       )
         throw new GwsEaError('web_admission_unavailable', 'The host’s current artifact readers could not be observed.');
       if (JSON.stringify(webEmails(admission.emails)) !== JSON.stringify(admitted))
@@ -1306,7 +1306,7 @@ export async function inspectWebCapability(
       if (
         policy.enabled &&
         (!Array.isArray(connections) ||
-          !connections.some((connection) => isRecord(connection) && connection.is_pending_reconnect !== true))
+          !connections.some((connection: unknown) => isRecord(connection) && connection.is_pending_reconnect !== true))
       )
         throw new GwsEaError('web_connector_unavailable', 'No active tunnel connection was observed.');
       remote = 'verified';

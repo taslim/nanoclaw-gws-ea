@@ -77,7 +77,9 @@ export async function inspectWebUninstall(paths: ControlPlanePaths): Promise<Web
     !Number.isFinite(Date.parse(raw.started_at)) ||
     !isRecord(raw.assistants) ||
     !Array.isArray(raw.completed_assistant_ids) ||
-    !raw.completed_assistant_ids.every((id): id is string => typeof id === 'string' && INSTANCE_ID_PATTERN.test(id)) ||
+    !raw.completed_assistant_ids.every(
+      (id: unknown): id is string => typeof id === 'string' && INSTANCE_ID_PATTERN.test(id),
+    ) ||
     typeof raw.stopped !== 'boolean' ||
     (raw.reason !== null && typeof raw.reason !== 'string')
   )
@@ -290,7 +292,6 @@ export async function uninstallWebConnector(
         await recordReceipt(paths, receipt);
         await effect();
       }
-      // Only uninstall settles the shared connector after every assistant's resources are gone.
       const blocked = await settleWebCleanup(paths, null, receipt.shared, {
         fetch: dependencies.fetch,
         runCommand: dependencies.runCommand,

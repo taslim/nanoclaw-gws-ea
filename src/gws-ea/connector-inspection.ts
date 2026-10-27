@@ -195,7 +195,6 @@ async function observeUninstall(paths: ControlPlanePaths, name: ConnectorName): 
   }
 }
 
-/** Read the current name without invoking a host or creating SQLite side files. */
 function webFirstName(runtime: InstanceRuntimeConfig): string | undefined {
   const file = centralDatabaseFile(runtime.state_root);
   if (!existsSync(file)) return undefined;

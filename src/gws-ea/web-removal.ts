@@ -39,7 +39,7 @@ export function parseWebCleanup(value: unknown): WebCleanup | undefined {
     value.schemaVersion !== 1 ||
     !Array.isArray(value.completed) ||
     !value.completed.every(
-      (entry): entry is string =>
+      (entry: unknown): entry is string =>
         typeof entry === 'string' &&
         /^(?:ingress|application|connector|tunnel|pin|remote|tunnel-token|management-token|dns:[a-zA-Z0-9_-]{1,256})$/u.test(
           entry,
@@ -360,7 +360,7 @@ export async function settleWebCleanup(
               !isRecord(remaining.config) ||
               !Array.isArray(remaining.config.ingress) ||
               remaining.config.ingress.some(
-                (route) =>
+                (route: unknown) =>
                   !isRecord(route) ||
                   route.hostname !== undefined ||
                   route.path !== undefined ||
