@@ -250,11 +250,11 @@ describe.skipIf(!executablePath)('actual Chromium artifact boundary', () => {
       await popup.waitForLoadState();
       expect(await popup.content()).toContain('Direct source opened');
       expect(await page.locator('details').getAttribute('open')).toBeNull();
+      const fragmentUrl = `${origin}/artifacts/12345678-1234-4321-8321-123456789abc/frame/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa#end`;
       await frame.locator('a[href="#end"]').focus();
       await page.keyboard.press('Enter');
-      expect(frame.url()).toBe(
-        `${origin}/artifacts/12345678-1234-4321-8321-123456789abc/frame/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa#end`,
-      );
+      await frame.waitForURL(fragmentUrl);
+      expect(frame.url()).toBe(fragmentUrl);
     } finally {
       await context.close();
     }
