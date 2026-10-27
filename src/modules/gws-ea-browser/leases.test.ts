@@ -3,7 +3,7 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { SqliteDriver } from '../../db/drivers/sqlite.js';
 import { heldCredentialSites, SiteLeaseStore } from './leases.js';
@@ -19,6 +19,8 @@ beforeEach(async () => {
   leases = new SiteLeaseStore(db);
 });
 afterEach(async () => {
+  vi.restoreAllMocks();
+  vi.useRealTimers();
   await db.close();
   await rm(root, { recursive: true, force: true });
 });
@@ -71,6 +73,64 @@ describe('persistent browser site leases', () => {
     expect(await leases.acquire('second', 'https://shop.example/')).toMatchObject({ acquired: false });
   });
 
+  it('releases an obsolete lease to its waiters when its last mutation predates retirement', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime('2026-01-01T00:00:00.000Z');
+    await leases.acquire('first', 'https://shop.example/');
+    await leases.acquire('second', 'https://shop.example/');
+
+    expect(await leases.release('first', 'shop.example', '2026-01-01T00:00:01.000Z')).toEqual(['second']);
+    expect(await leases.owned('first', 'shop.example')).toBe(false);
+    expect(await leases.acquire('second', 'https://shop.example/')).toMatchObject({ acquired: true });
+  });
+
+  it.each([
+    ['reacquired', '2026-01-01T00:00:01.000Z'],
+    ['reacquired', '2026-01-01T00:00:02.000Z'],
+    ['marked idle', '2026-01-01T00:00:01.000Z'],
+    ['marked idle', '2026-01-01T00:00:02.000Z'],
+  ] as const)('keeps a lease %s at %s from historical cleanup, then permits normal release', async (mutation, at) => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime('2026-01-01T00:00:00.000Z');
+    await leases.acquire('first', 'https://shop.example/');
+    await leases.acquire('second', 'https://shop.example/');
+    vi.setSystemTime(at);
+    if (mutation === 'reacquired') await leases.acquire('first', 'https://shop.example/');
+    else await leases.markIdle('first', 'shop.example');
+
+    expect(await leases.release('first', 'shop.example', '2026-01-01T00:00:01.000Z')).toEqual([]);
+    expect(await leases.owned('first', 'shop.example')).toBe(true);
+    expect(await db.all('SELECT job_id FROM gws_ea_browser_site_waiters')).toEqual([{ job_id: 'second' }]);
+    expect(await leases.release('first', 'shop.example')).toEqual(['second']);
+    expect(await leases.owned('first', 'shop.example')).toBe(false);
+  });
+
+  it.each(['reacquired', 'held for purchase'] as const)(
+    'does not release or wake waiters for a lease %s after selection but before deletion',
+    async (mutation) => {
+      vi.useFakeTimers({ toFake: ['Date'] });
+      vi.setSystemTime('2026-01-01T00:00:00.000Z');
+      await leases.acquire('first', 'https://shop.example/');
+      await leases.acquire('second', 'https://shop.example/');
+      const run = db.run.bind(db);
+      let raced = false;
+      vi.spyOn(db, 'run').mockImplementation(async (sql, ...params) => {
+        if (!raced && sql.startsWith('DELETE FROM gws_ea_browser_site_leases')) {
+          raced = true;
+          vi.setSystemTime(mutation === 'reacquired' ? '2026-01-01T00:00:02.000Z' : '2026-01-01T00:00:00.500Z');
+          if (mutation === 'reacquired') await leases.acquire('first', 'https://shop.example/');
+          else await leases.holdForPurchase('first', 'shop.example');
+        }
+        return run(sql, ...params);
+      });
+
+      expect(await leases.release('first', 'shop.example', '2026-01-01T00:00:01.000Z')).toEqual([]);
+      expect(raced).toBe(true);
+      expect(await leases.owned('first', 'shop.example')).toBe(true);
+      expect(await db.all('SELECT job_id FROM gws_ea_browser_site_waiters')).toEqual([{ job_id: 'second' }]);
+    },
+  );
+
   describe('while a credential change on a site is unresolved', () => {
     const attempt = async (id: string, jobId: string, site: string, phase: string): Promise<void> => {
       const at = new Date().toISOString();
@@ -102,6 +162,7 @@ describe('persistent browser site leases', () => {
         expect(await leases.acquire('second', 'https://www.shop.example/')).toMatchObject({ acquired: false });
         expect(await leases.release('first')).toEqual([]);
         expect(await leases.release('first', 'shop.example')).toEqual([]);
+        expect(await leases.release('first', 'shop.example', '2099-01-01T00:00:00.000Z')).toEqual([]);
         expect(await db.all('SELECT site, job_id FROM gws_ea_browser_site_leases')).toEqual([
           { site: 'shop.example', job_id: 'first' },
         ]);

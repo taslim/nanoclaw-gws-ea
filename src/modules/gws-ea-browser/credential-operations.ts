@@ -375,13 +375,15 @@ async function freeSite(
   queue: BrowserQueue,
   attempt: Pick<CredentialAttempt, 'id' | 'job_id' | 'site'>,
   eventId: string,
+  updatedBefore?: string,
 ): Promise<void> {
   await releaseCredentialSubmissions(attempt.id);
   const running = await queue.store.db.get<{ present: number }>(
     'SELECT 1 AS present FROM gws_ea_browser_requests WHERE job_id = ? AND started_at IS NOT NULL AND answered_at IS NULL LIMIT 1',
     attempt.job_id,
   );
-  if (!running) await queue.wakeWaiters(await queue.leases.release(attempt.job_id, attempt.site), eventId);
+  if (!running)
+    await queue.wakeWaiters(await queue.leases.release(attempt.job_id, attempt.site, updatedBefore), eventId);
   await finishRequestedCancellation(attempt.job_id, queue);
 }
 
@@ -454,7 +456,7 @@ export async function settleConfirmedAttempts(
     if (!isRecord(evidence) || evidence.reason !== 'vault_removed') continue;
     watchedResponses.delete(attempt.id);
     await finishSignupVerification(attempt.id);
-    await freeSite(queue, attempt, `credential-vault-removed-${attempt.id}`);
+    await freeSite(queue, attempt, `credential-vault-removed-${attempt.id}`, attempt.updated_at);
   }
   for (const attempt of unresolved) {
     if (attempt.phase !== 'confirmed' || (sites && !sites.has(attempt.site))) continue;

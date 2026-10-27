@@ -149,30 +149,53 @@ export class SiteLeaseStore {
   /**
    * The caller wakes returned jobs after commit; it never awaits delivery inside a transaction.
    * A site the job holds for an unresolved credential attempt stays leased to it.
+   * Historical cleanup may release only non-purchase leases last mutated strictly before its cutoff.
    */
-  async release(jobId: string, site?: string): Promise<string[]> {
+  async release(jobId: string, site?: string, updatedBefore?: string): Promise<string[]> {
     return this.db.transaction(async () => {
       const credentials = await heldCredentialSites(this.db, jobId);
+      const cutoff = updatedBefore ?? null;
       const held = (
         site === undefined
-          ? await this.db.all<{ site: string }>('SELECT site FROM gws_ea_browser_site_leases WHERE job_id = ?', jobId)
+          ? await this.db.all<{ site: string }>(
+              `SELECT site FROM gws_ea_browser_site_leases WHERE job_id = ?
+                 AND (CAST(? AS TEXT) IS NULL OR (state <> 'purchase' AND updated_at < ?))`,
+              jobId,
+              cutoff,
+              cutoff,
+            )
           : await this.db.all<{ site: string }>(
-              'SELECT site FROM gws_ea_browser_site_leases WHERE job_id = ? AND site = ?',
+              `SELECT site FROM gws_ea_browser_site_leases WHERE job_id = ? AND site = ?
+                 AND (CAST(? AS TEXT) IS NULL OR (state <> 'purchase' AND updated_at < ?))`,
               jobId,
               site,
+              cutoff,
+              cutoff,
             )
       ).filter((row) => !credentials.has(row.site));
       const waiting = new Set<string>();
       for (const row of held) {
+        const released = await this.db.run(
+          `DELETE FROM gws_ea_browser_site_leases WHERE site = ? AND job_id = ?
+             AND (CAST(? AS TEXT) IS NULL OR (state <> 'purchase' AND updated_at < ?))`,
+          row.site,
+          jobId,
+          cutoff,
+          cutoff,
+        );
+        if (!released.changes) continue;
         const waiters = await this.db.all<{ job_id: string }>(
           'SELECT job_id FROM gws_ea_browser_site_waiters WHERE site = ? ORDER BY requested_at, job_id',
           row.site,
         );
         for (const waiter of waiters) waiting.add(waiter.job_id);
-        await this.db.run('DELETE FROM gws_ea_browser_site_leases WHERE site = ? AND job_id = ?', row.site, jobId);
+        if (updatedBefore !== undefined)
+          await this.db.run('DELETE FROM gws_ea_browser_site_waiters WHERE job_id = ? AND site = ?', jobId, row.site);
       }
-      if (site === undefined) await this.db.run('DELETE FROM gws_ea_browser_site_waiters WHERE job_id = ?', jobId);
-      else await this.db.run('DELETE FROM gws_ea_browser_site_waiters WHERE job_id = ? AND site = ?', jobId, site);
+      if (updatedBefore === undefined) {
+        if (site === undefined) await this.db.run('DELETE FROM gws_ea_browser_site_waiters WHERE job_id = ?', jobId);
+        else await this.db.run('DELETE FROM gws_ea_browser_site_waiters WHERE job_id = ? AND site = ?', jobId, site);
+      }
       return [...waiting];
     });
   }
