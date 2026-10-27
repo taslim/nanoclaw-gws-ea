@@ -14,7 +14,7 @@ remain errors even with `--help`.
 
 A connector provides optional functionality that gws-ea sets up outside the
 base install: downloaded programs or models, or provisioned accounts, vaults
-and services. The catalog contains `voice`, `onepassword` and `artifacts`.
+and services. The catalog contains `voice`, `onepassword` and `web`.
 Each has four commands:
 
 ```sh
@@ -26,7 +26,7 @@ gws-ea connectors check <name> [--id <instance_id>]
 ```
 
 Installation and configuration belong to the operator host. Voice shares
-immutable programs and models; 1Password and artifacts keep separate resources
+immutable programs and models; 1Password and web keep separate resources
 for each assistant in the operator's selected account. Access remains a
 separate decision: agent permissions, the principal's vault membership, and
 artifact reader grants retain their own boundaries. Installing a connector
@@ -52,7 +52,12 @@ See [voice](gws-ea-voice.md), [1Password vaults](#1password-vaults), and
 [built-in browser](#browser-access) detects Chrome; the [web alias](#web-alias)
 is optional assistant identity.
 
-## HTML artifacts
+## Assistant web
+
+The `web` connector gives each assistant a stable address such as
+`aya.example.com`. Artifacts is its first feature, at `/artifacts`; the root and
+all other paths return 404. There is one connector install and no separate
+artifacts switch.
 
 The operator needs an active Cloudflare DNS zone, an Access team, an
 account-scoped management token with the required Tunnel, DNS, Access
@@ -62,36 +67,52 @@ config root; the default root is `~/.config/gws-ea`, respecting
 `XDG_CONFIG_HOME` and `GWS_EA_CONFIG_ROOT`.
 
 ```sh
-gws-ea connectors install artifacts \
+gws-ea connectors install web \
   --account <cloudflare_account_id> --team <access_team_subdomain> \
-  --zone <active_zone_id> --hostname views.example.com \
+  --zone <active_zone_id> \
   --credential-file <absolute_owner_only_token_file>
-gws-ea connectors show artifacts
-gws-ea connectors check artifacts --id <instance_id>
-gws-ea connectors uninstall artifacts
+gws-ea connectors show web
+gws-ea connectors check web --id <instance_id>
+gws-ea connectors uninstall web
 ```
 
-The first install records the host's shared hostname and account, then provisions
-compatible running assistants with complete profiles. Others remain pending.
-Later installs reuse the configuration and verify ready assistants without
-restarting author containers. Pass `--credential-file` again to rotate the
-management token. An assistant named Aya claims `/aya`; another Aya cannot
-claim that prefix on the shared hostname. Claims have no generated suffix.
+Install verifies the account, Access team and active zone before recording
+configuration. It uses the selected zone's apex: zone `example.com` gives Aya
+`aya.example.com`, within Universal SSL's first-level coverage. There is no
+`--hostname` option. Later installs reuse the fixed coordinates and verify ready
+assistants without restarting their author containers. Pass `--credential-file`
+again to rotate the management token; changing the zone requires uninstall first.
 
-The principal asks for a view in conversation and opens its private link with an
+The address label uses the web alias's ASCII name reduction, capped at 63
+characters. The claim stays fixed across assistant renames. A name with no Latin
+letter or one another assistant holds leaves web pending; recreate under another
+first name, or remove the holder. There is no suffix or override. A foreign DNS
+record, including a covering wildcard, Access destination or tunnel route also
+leaves web pending without claiming the name or creating assistant resources.
+The reason names the conflict; remove it and rerun install. These web conditions
+let create/resume continue to the alias step.
+
+The principal requests a view in conversation and opens its private link with an
 email PIN. Every currently confirmed principal address can open private views.
 Named guests use their exact invited email; public snapshots need no sign-in.
 Check the operator's Cloudflare Access seat allowance for the intended readers.
-Viewing requires the operator host and tunnel process to be running. Ordinary
-authoring and reading make no Cloudflare management calls.
+Viewing requires the operator host and tunnel process. A temporary serving or
+verification outage leaves the artifact tools available and `check web` not ready;
+ordinary authoring and viewing make no Cloudflare management calls.
 
-Uninstall closes every assistant's origin before removing verified owned
-Cloudflare resources, shared resources last. Issued links stop working; local
-content and external resources remain. The host receipt makes interrupted
-cleanup resumable. Inspect an exact unproven creation and remove any resource
-it created before acknowledging it with `--discard-unproven <attempt>`.
-See the [artifact guide](gws-ea-artifacts.md) for retention, recovery, removal
-and native tool details.
+Removing one assistant deletes only its DNS record, route and Access application.
+Even removing the last assistant retains the installed connector's tunnel, PIN,
+service, configuration and tokens for the next assistant. Uninstall closes every
+assistant's policy first, then removes verified owned assistant resources and
+shared resources last. Issued links stop working; local content and external
+resources remain. Its receipt resumes interrupted cleanup, and its result tells
+the operator to revoke the management token and remove the original credential
+file. Inspect an exact unproven creation and remove any resource it created before
+acknowledging it with `--discard-unproven <attempt>`.
+
+A rollback to a release without the web contract serves nothing. `check web`
+reports that assistant unsupported and offers `gws-ea update --id`.
+See the [artifact guide](gws-ea-artifacts.md) for retention, sharing and native tools.
 
 ## Find and inspect an assistant
 
