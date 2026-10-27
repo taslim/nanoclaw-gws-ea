@@ -355,6 +355,59 @@ describe('web operator capability', () => {
     expect(await readFile(instanceWebPolicyFile(f.a.runtime), 'utf8')).toBe(before);
   });
 
+  it.each([undefined, false] as const)(
+    'refreshes authors before completing interrupted activation with publicationReady=%s',
+    async (publicationReady) => {
+      const f = await provisionFixture();
+      await provisionForAssistant(f.paths, f.a.instanceId, {}, f.dependencies);
+      const config = await readWebOperatorConfig(f.files.configFile);
+      if (!config) throw new Error('Missing fixture ownership');
+      const { publicationReady: _completed, ...assistant } = config.assistants[f.a.instanceId];
+      await writeWebOperatorConfig(f.files.configFile, {
+        ...config,
+        assistants: {
+          ...config.assistants,
+          [f.a.instanceId]: { ...assistant, ...(publicationReady === undefined ? {} : { publicationReady }) },
+        },
+      });
+      const policyFile = instanceWebPolicyFile(f.a.runtime);
+      const enabledPolicy = await readFile(policyFile, 'utf8');
+      f.restarts.length = 0;
+      const refreshStates: { publicationReady: boolean; enabled: boolean }[] = [];
+      await provisionForAssistant(
+        f.paths,
+        f.a.instanceId,
+        {},
+        {
+          ...f.dependencies,
+          ncl: async (runtime, args) => {
+            if (args[0] === 'groups' && args[1] === 'restart') {
+              refreshStates.push({
+                publicationReady:
+                  (await readWebOperatorConfig(f.files.configFile))?.assistants[f.a.instanceId]?.publicationReady ===
+                  true,
+                enabled: (await readWebPolicy(policyFile)).enabled,
+              });
+            }
+            return f.dependencies.ncl(runtime, args);
+          },
+        },
+      );
+      expect(f.restarts).toEqual([
+        ['groups', 'restart', '--id', 'canonical'],
+        ['groups', 'restart', '--id', 'selected-author'],
+      ]);
+      expect(refreshStates).toEqual([
+        { publicationReady: false, enabled: true },
+        { publicationReady: false, enabled: true },
+      ]);
+      expect((await readWebOperatorConfig(f.files.configFile))?.assistants[f.a.instanceId]?.publicationReady).toBe(
+        true,
+      );
+      expect(await readFile(policyFile, 'utf8')).toBe(enabledPolicy);
+    },
+  );
+
   it('waits for delayed local listener readiness before exposing ingress', async () => {
     const f = await provisionFixture();
     let observations = 0;

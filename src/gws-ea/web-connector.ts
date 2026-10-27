@@ -1093,7 +1093,7 @@ async function provisionWebAssistant(
         'web_not_ready',
         'Web prerequisites have not all been verified. Check this connector after resolving the reported prerequisite.',
       );
-    if (!preserveEnabled) {
+    if (!recorded?.publicationReady || !preserveEnabled) {
       const authors = await ncl(runtime, ['gws-ea-artifacts-author-groups']);
       if (
         !isRecord(authors) ||
