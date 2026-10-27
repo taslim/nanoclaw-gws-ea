@@ -91,7 +91,7 @@ async function installedOnePassword() {
   await installOnePassword(paths, { accountId: ACCOUNT_ID }, { cli: provider.cli(), upsertEnvVars: () => undefined });
   return provider;
 }
-async function webConfig() {
+async function webConfig(zoneApex = 'example.test') {
   const files = webOperatorFiles(paths);
   const credentialFile = path.join(files.root, 'management-token');
   await mkdir(files.root, { recursive: true, mode: 0o700 });
@@ -101,7 +101,7 @@ async function webConfig() {
     accountId: 'account',
     teamName: 'team',
     zoneId: 'zone',
-    zoneApex: 'example.test',
+    zoneApex,
     credentialFile,
     cloudflaredPath: '/opt/homebrew/bin/cloudflared',
     dns: {},
@@ -495,6 +495,48 @@ it('reports an unclaimed foreign DNS record during check using only GETs and lea
   expect(await readFile(files.configFile, 'utf8')).toBe(before);
   expect((await readRegistry(paths)).instances[id].exclusive_resource_claims.web).toBeUndefined();
 });
+
+it.each([false, true])(
+  'reports an overlong derived web hostname without hostname preflight (check: %s)',
+  async (check) => {
+    const zoneApex = ['a'.repeat(63), 'b'.repeat(63), 'c'.repeat(63), 'd'.repeat(59)].join('.');
+    const files = await webConfig(zoneApex);
+    const id = await assistant('compatible', 'Aa');
+    const before = await readFile(files.configFile, 'utf8');
+    const requests: string[] = [];
+    const observed = await inspectConnector(paths, 'web', {
+      check,
+      web: {
+        runCommand: async () => ({ exitCode: 0, stdout: 'cloudflared version 2025.4.0', stderr: '' }),
+        fetch: async (input) => {
+          const resource = new URL(String(input)).pathname;
+          requests.push(resource);
+          if (resource.endsWith('/zones/zone'))
+            return Response.json({
+              success: true,
+              result: { id: 'zone', status: 'active', name: zoneApex, account: { id: 'account' } },
+            });
+          if (resource.endsWith('/access/organizations'))
+            return Response.json({ success: true, result: { auth_domain: 'team.cloudflareaccess.com' } });
+          throw new Error('Invalid hostname reached Cloudflare preflight');
+        },
+      },
+    });
+    expect(observed.assistants).toContainEqual(
+      expect.objectContaining({
+        instance_id: id,
+        setup: 'pending',
+        reasons: [expect.stringContaining('253-character DNS hostname limit')],
+        next_actions: [],
+      }),
+    );
+    expect(requests).toEqual(
+      check ? ['/client/v4/zones/zone', '/client/v4/accounts/account/access/organizations'] : [],
+    );
+    expect(await readFile(files.configFile, 'utf8')).toBe(before);
+    expect((await readRegistry(paths)).instances[id].exclusive_resource_claims.web).toBeUndefined();
+  },
+);
 
 it('reports a pre-web release unsupported with update recovery and leaves its Cloudflare resources untouched', async () => {
   const files = await webConfig();

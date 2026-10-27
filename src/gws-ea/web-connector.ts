@@ -501,7 +501,13 @@ export function webHostnameFor(firstName: string, zoneApex: string): string {
       'web_name_unusable',
       `“${firstName}” has no Latin letter for a web address. Recreate this assistant under a first name with a Latin letter.`,
     );
-  return `${label}.${zoneApex}`;
+  const hostname = `${label}.${zoneApex}`;
+  if (hostname.length > 253)
+    throw new GwsEaError(
+      'web_name_unusable',
+      'The derived web address exceeds the 253-character DNS hostname limit. Recreate this assistant under a shorter first name, or reinstall web with a shorter zone.',
+    );
+  return hostname;
 }
 
 export function assertWebHostnameUnclaimed(registry: InstanceRegistry, instanceId: string, hostname: string): void {

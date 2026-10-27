@@ -84,7 +84,7 @@ async function provisionForAssistant(
   return { ...assistant, enabled: true, hostname: observed.hostname };
 }
 
-function cloudflareFixture() {
+function cloudflareFixture(zoneApex = 'example.test') {
   const requests: { method: string; resource: string; body: Record<string, unknown> | undefined }[] = [];
   const idps: Record<string, unknown>[] = [];
   const apps: Record<string, unknown>[] = [];
@@ -110,7 +110,7 @@ function cloudflareFixture() {
     if (resource === '/zones/zone' || resource === '/zones/dedicated-zone')
       return reply({
         id: resource.endsWith('/zone') ? 'zone' : 'dedicated-zone',
-        name: resource.endsWith('/zone') ? 'example.test' : 'other.test',
+        name: resource.endsWith('/zone') ? zoneApex : 'other.test',
         status: 'active',
         account: { id: 'account' },
       });
@@ -212,7 +212,7 @@ function cloudflareFixture() {
   };
 }
 
-async function provisionFixture() {
+async function provisionFixture(zoneApex = 'example.test') {
   const f = await fixture();
   const a = await f.assistant('a@example.test', 31000);
   const claim = { hostname: 'views.example.test', listen_port: 41000 };
@@ -224,7 +224,7 @@ async function provisionFixture() {
     accountId: 'account',
     zoneId: 'zone',
     teamName: 'team',
-    zoneApex: 'example.test',
+    zoneApex,
     credentialFile: path.join(files.root, 'management-token'),
     cloudflaredPath: '/usr/local/bin/cloudflared',
     dns: {},
@@ -232,7 +232,7 @@ async function provisionFixture() {
   };
   await writeFile(config.credentialFile, 'secret-management-fixture', { mode: 0o600 });
   await writeWebOperatorConfig(files.configFile, config);
-  const api = cloudflareFixture();
+  const api = cloudflareFixture(zoneApex);
   let emails = ['principal@example.test', 'second@example.test'];
   let firstName = 'Avery';
   const commands: string[][] = [];
@@ -1120,6 +1120,29 @@ it('reports an unusable first name without storing a claim or creating resources
   );
   expect((await getInstanceReservation(f.paths, f.a.instanceId)).exclusive_resource_claims.web).toBeUndefined();
   expect(f.api.requests.filter((request) => request.method !== 'GET')).toEqual([]);
+});
+
+it.each([
+  ['A', 253],
+  ['Aa', 254],
+] as const)('validates the full web hostname for %s (%i characters) before claiming', async (name, length) => {
+  const zoneApex = ['a'.repeat(63), 'b'.repeat(63), 'c'.repeat(63), 'd'.repeat(59)].join('.');
+  const f = await provisionFixture(zoneApex);
+  await releaseFixtureClaim(f);
+  f.firstName(name);
+  const result = await installWebConnector(f.paths, {}, f.dependencies);
+  const claim = (await getInstanceReservation(f.paths, f.a.instanceId)).exclusive_resource_claims.web;
+  if (length === 253) {
+    expect(result.assistants).toContainEqual(expect.objectContaining({ outcome: 'ready' }));
+    expect(claim?.hostname).toBe(`a.${zoneApex}`);
+    expect(claim?.hostname).toHaveLength(253);
+  } else {
+    expect(result.assistants).toContainEqual(
+      expect.objectContaining({ outcome: 'pending', reason: 'web_name_unusable' }),
+    );
+    expect(claim).toBeUndefined();
+    expect(f.api.requests).toEqual([]);
+  }
 });
 
 it('names the existing hostname holder without claiming or creating for a second assistant', async () => {
