@@ -812,14 +812,15 @@ export function createBookingTools(deps: BookingToolsDeps) {
     };
   }
 
-  async function dropAndRefuse(row: BookingRequest, error: ActionRefusal): Promise<never> {
-    await deleteBookingRequest(row.sessionId, row.requestId);
+  /** Resume deletes its own row only once the refusal is in the mailbox, so a failed answer write retries. */
+  async function dropAndRefuse(row: BookingRequest, error: ActionRefusal, recovering: boolean): Promise<never> {
+    if (!recovering) await deleteBookingRequest(row.sessionId, row.requestId);
     throw error;
   }
 
   async function connectionDown(row: BookingRequest, view: BookingView, error: unknown): Promise<never> {
     log.error('A booking found the Google connection down', { requestId: row.requestId, owner: row.owner, err: error });
-    return dropAndRefuse(row, forbidden(`${GOOGLE_CONNECTION_DOWN} ${view.surface.words.connectionStep}`));
+    return dropAndRefuse(row, forbidden(`${GOOGLE_CONNECTION_DOWN} ${view.surface.words.connectionStep}`), false);
   }
 
   async function checkFailure(
@@ -828,7 +829,7 @@ export function createBookingTools(deps: BookingToolsDeps) {
     error: unknown,
     recovering: boolean,
   ): Promise<never> {
-    if (error instanceof ActionRefusal) return dropAndRefuse(row, error);
+    if (error instanceof ActionRefusal) return dropAndRefuse(row, error, recovering);
     if (!recovering && isGoogleConnectionDown(error)) return connectionDown(row, view, error);
     throw error;
   }
@@ -850,7 +851,7 @@ export function createBookingTools(deps: BookingToolsDeps) {
       return connectionDown(row, view, error);
     }
     if (isPermanentGoogleFailure(error))
-      return dropAndRefuse(row, forbidden(`Google refused this booking request: ${error.message}`));
+      return dropAndRefuse(row, forbidden(`Google refused this booking request: ${error.message}`), recovering);
     log.warn('Booking write awaits Google confirmation', { requestId: row.requestId, owner: row.owner, error });
     return ANSWER_LATER;
   }

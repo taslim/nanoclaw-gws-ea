@@ -658,6 +658,31 @@ it('drops a replayed write Google refuses for good, answering the refusal withou
   expect(calendar.writes).toEqual([]);
 });
 
+it('keeps a recovered refusal’s request until the refusal is in the mailbox', async () => {
+  await mainSession();
+  const row = await pendingBook(emailSession, 'refusal-write-failed', false);
+  vi.spyOn(calendar, 'insertEvent').mockRejectedValue(new GoogleApiError(400, 'Invalid calendar operation'));
+  const write = sessionMessages.writeSessionMessage;
+  let refuseAnswer = true;
+  vi.spyOn(sessionMessages, 'writeSessionMessage').mockImplementation(async (...args) => {
+    if (args[2].id === `action-resp-${row.requestId}` && refuseAnswer) {
+      refuseAnswer = false;
+      throw new Error('Mailbox writer unavailable');
+    }
+    return write(...args);
+  });
+  await reads.resumePending();
+  expect(responseIn(emailSession, row.requestId)).toBeUndefined();
+  expect(await getBookingRequest(row.sessionId, row.requestId)).toMatchObject({ applied: false });
+  await reads.resumePending();
+  expect(responseIn(emailSession, row.requestId)).toMatchObject({
+    ok: false,
+    error: { code: 'forbidden', message: expect.stringContaining('Google refused this booking request') },
+  });
+  expect(await getBookingRequest(row.sessionId, row.requestId)).toBeUndefined();
+  expect(calendar.writes).toEqual([]);
+});
+
 it('owns a live replay before awaiting its original mailbox timestamp so recovery cannot settle it concurrently', async () => {
   await mainSession();
   const row = await pendingBook(emailSession, 'origin-read-in-flight', true);
