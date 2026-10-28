@@ -29,7 +29,12 @@ import {
   getMessagingGroupForOwnDestination,
 } from './db/messaging-groups.js';
 import { clearDeliveryAttempt, listExhaustedDeliveryAttempts, recordDeliveryAttempt } from './db/coordination.js';
-import { runGuarded, type DeliveryGuardSpec, type GuardedDeliveryHandler } from './delivery-guard.js';
+import {
+  RetryDeliveryError,
+  runGuarded,
+  type DeliveryGuardSpec,
+  type GuardedDeliveryHandler,
+} from './delivery-guard.js';
 import { isUnguarded, type Unguarded } from './guard/index.js';
 import { mapConcurrent } from './concurrency.js';
 import { fanOutboundMessage } from './modules/cross-session-context/index.js';
@@ -45,6 +50,7 @@ import type { OutboundMessage } from './mailbox/index.js';
 const ACTIVE_POLL_MS = 1000;
 const SWEEP_POLL_MS = 60_000;
 const MAX_DELIVERY_ATTEMPTS = 3;
+let lastDeferredWarningAt: number | undefined;
 /**
  * Sessions drained in parallel per poll tick. A visit is one mailbox round
  * trip (read the queue) plus the channel sends; serially, a tick scaled as
@@ -546,6 +552,22 @@ async function drainSession(session: Session): Promise<void> {
       }
     } catch (err) {
       if (err instanceof ChannelNotConnectedError) continue;
+      if (err instanceof RetryDeliveryError) {
+        const now = Date.now();
+        if (
+          lastDeferredWarningAt === undefined ||
+          now < lastDeferredWarningAt ||
+          now - lastDeferredWarningAt >= SWEEP_POLL_MS
+        ) {
+          lastDeferredWarningAt = now;
+          log.warn('Action delivery deferred; its outbound request remains pending', {
+            messageId: msg.id,
+            sessionId: session.id,
+            causeType: err.cause instanceof Error ? err.cause.name : err.name,
+          });
+        }
+        continue;
+      }
       if (err instanceof OutboundRefusedError) {
         await closeRefused(msg, session, agentGroup.id, err);
         continue;

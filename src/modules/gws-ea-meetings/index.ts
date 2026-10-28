@@ -95,6 +95,7 @@ for (const [action, answer] of [
         answer,
         async (session) => (await resolveBookingSurface(session)).surface.words.connectionStep,
       ),
+      booking.completeAnswer,
     ),
     answeredGuard(bookingAction),
   );

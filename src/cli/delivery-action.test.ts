@@ -19,7 +19,7 @@ import { getDeliveryAction } from '../delivery.js';
 import { inboundDbPath } from '../mailbox/sqlite/paths.js';
 import { resolveSession, sessionDir } from '../session-manager.js';
 import type { Session } from '../types.js';
-import { runGuarded } from '../delivery-guard.js';
+import { RetryDeliveryError, runGuarded } from '../delivery-guard.js';
 import { ALLOW, DENY, defineGuardedAction, HOLD } from '../guard/index.js';
 import { ANSWER_LATER, ActionRefusal, answeredGuard, answeringAction, writeActionResponse } from './delivery-action.js';
 
@@ -185,5 +185,35 @@ describe('an answering action', () => {
     expect(frameOf('g-2')).toEqual([
       { id: 'g-2', ok: false, error: { code: 'forbidden', message: 'This request cannot wait for an approval.' } },
     ]);
+  });
+});
+
+describe('durable answer completion', () => {
+  it('retries an unfinished completion on an answered request without running its work again or clearing its files early', async () => {
+    const requestId = 'completion-retry';
+    const dir = path.join(sessionDir(session.agent_group_id, session.id), 'outbox', requestId);
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, 'agenda.pdf'), 'agenda');
+    const answer = vi.fn(async () => ({ message: 'Booked.' }));
+    const complete = vi.fn(async () => {});
+    complete.mockRejectedValueOnce(new Error('Wake publication unavailable'));
+    const handler = answeringAction('fixture', answer, complete);
+    await expect(handler({ requestId }, session)).rejects.toBeInstanceOf(RetryDeliveryError);
+    expect(answers(requestId)).toHaveLength(1);
+    expect(fs.existsSync(dir)).toBe(true);
+    await handler({ requestId }, session);
+    expect(answer).toHaveBeenCalledTimes(1);
+    expect(complete).toHaveBeenCalledTimes(2);
+    expect(fs.existsSync(dir)).toBe(false);
+    expect(answers(requestId)).toHaveLength(1);
+  });
+
+  it('propagates an explicit delivery retry without publishing a false handler failure', async () => {
+    const retry = new RetryDeliveryError('No durable owner yet.');
+    const handler = answeringAction('fixture', async () => {
+      throw retry;
+    });
+    await expect(handler({ requestId: 'storage-retry' }, session)).rejects.toBe(retry);
+    expect(answers('storage-retry')).toEqual([]);
   });
 });

@@ -13,7 +13,7 @@
  * `answeredGuard` are the host's twin of the runner's `requestTool`.
  */
 import { isUniqueViolation } from '../db/errors.js';
-import type { DeliveryGuardSpec, GuardedDeliveryHandler } from '../delivery-guard.js';
+import { RetryDeliveryError, type DeliveryGuardSpec, type GuardedDeliveryHandler } from '../delivery-guard.js';
 import { registerDeliveryAction } from '../delivery.js';
 import { unguarded, type GuardedAction } from '../guard/index.js';
 import { log } from '../log.js';
@@ -105,9 +105,36 @@ function errorFrame(requestId: string, error: unknown): ResponseFrame {
 }
 
 /** The outbox is cleared only after the answer, so until then a replay finds the staged files. */
-async function writeAnswer(session: Session, requestId: string, frame: ResponseFrame): Promise<void> {
-  await writeActionResponse(session, requestId, frame);
+export type AnswerCompletion = (session: Session, requestId: string) => Promise<void>;
+
+async function completeAnswer(session: Session, requestId: string, completion?: AnswerCompletion): Promise<void> {
+  if (completion) {
+    try {
+      await completion(session, requestId);
+    } catch (error) {
+      throw new RetryDeliveryError('The published action answer still needs delivery completion.', { cause: error });
+    }
+  }
   clearOutbox(session.agent_group_id, session.id, requestId);
+}
+
+async function writeAnswer(
+  session: Session,
+  requestId: string,
+  frame: ResponseFrame,
+  completion?: AnswerCompletion,
+): Promise<void> {
+  try {
+    await writeActionResponse(session, requestId, frame);
+  } catch (error) {
+    if (completion)
+      throw new RetryDeliveryError(
+        error instanceof Error ? error.message : 'The action answer could not be published.',
+        { cause: error },
+      );
+    throw error;
+  }
+  await completeAnswer(session, requestId, completion);
 }
 
 /**
@@ -115,7 +142,11 @@ async function writeAnswer(session: Session, requestId: string, frame: ResponseF
  * answered is a replay of work already done, whatever its answer, so it is not
  * done again.
  */
-export function answeringAction(action: string, answer: DeferredActionAnswer): GuardedDeliveryHandler {
+export function answeringAction(
+  action: string,
+  answer: DeferredActionAnswer,
+  completion?: AnswerCompletion,
+): GuardedDeliveryHandler {
   return async (content, session) => {
     const requestId = requestIdOf(content);
     if (requestId === undefined) {
@@ -127,16 +158,16 @@ export function answeringAction(action: string, answer: DeferredActionAnswer): G
     );
     if (answered === true) {
       log.info('Action request already answered; not done again', { action, requestId, sessionId: session.id });
-      clearOutbox(session.agent_group_id, session.id, requestId);
+      await completeAnswer(session, requestId, completion);
       return;
     }
     let frame: ResponseFrame;
-    /* eslint-disable no-catch-all/no-catch-all -- every request is answered, a failure included; nothing is rethrown into a retry */
     try {
       const data = await answer(content, session, requestId);
       if (data === ANSWER_LATER) return;
       frame = { id: requestId, ok: true, data };
     } catch (error) {
+      if (error instanceof RetryDeliveryError) throw error;
       if (error instanceof ActionRefusal) {
         log.info('Action request refused', { action, requestId, sessionId: session.id, reason: error.message });
       } else {
@@ -144,8 +175,7 @@ export function answeringAction(action: string, answer: DeferredActionAnswer): G
       }
       frame = errorFrame(requestId, error);
     }
-    /* eslint-enable no-catch-all/no-catch-all */
-    await writeAnswer(session, requestId, frame);
+    await writeAnswer(session, requestId, frame, completion);
   };
 }
 

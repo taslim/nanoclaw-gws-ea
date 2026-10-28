@@ -22,10 +22,10 @@ export const bookingsMigration: ModuleMigration = {
         request_json TEXT NOT NULL,
         owner_kind TEXT NOT NULL CHECK(owner_kind IN ('thread','chat')),
         owner_key TEXT NOT NULL,
-        calendar_id TEXT NOT NULL,
-        event_id TEXT NOT NULL,
-        start_at TEXT NOT NULL,
-        end_at TEXT NOT NULL,
+        calendar_id TEXT,
+        event_id TEXT,
+        start_at TEXT,
+        end_at TEXT,
         event_etag TEXT,
         request_mark TEXT,
         carried_over INTEGER NOT NULL DEFAULT 0 CHECK(carried_over IN (0,1)),
@@ -33,6 +33,12 @@ export const bookingsMigration: ModuleMigration = {
         result_json TEXT,
         reported INTEGER NOT NULL DEFAULT 0 CHECK(reported IN (0,1)),
         created_at TEXT NOT NULL,
+        CHECK (
+          (calendar_id IS NOT NULL AND event_id IS NOT NULL AND start_at IS NOT NULL AND end_at IS NOT NULL)
+          OR (calendar_id IS NULL AND event_id IS NULL AND start_at IS NULL AND end_at IS NULL
+              AND event_etag IS NULL AND request_mark IS NULL AND carried_over=0
+              AND applied=1 AND reported=1 AND result_json IS NOT NULL)
+        ),
         PRIMARY KEY(session_id,request_id)
       );
       CREATE INDEX gws_ea_booking_requests_pending ON gws_ea_booking_requests(created_at,session_id,request_id);

@@ -38,7 +38,7 @@ import { recordChatClearances } from '../gws-ea-privacy/clearance.js';
 import { GoogleApiError } from '../gws-ea-inbox/gmail-api.js';
 import { GoogleNotSignedInError } from '../gws-ea-google/tokens.js';
 import { log } from '../../log.js';
-import { ANSWER_LATER } from '../../cli/delivery-action.js';
+import { ANSWER_LATER, answeringAction } from '../../cli/delivery-action.js';
 import { bookingSurfaceFor, resolveBookingSurface } from './booking-surface.js';
 
 const PRINCIPAL = 'juno@example.com';
@@ -465,6 +465,13 @@ it.each([false, true])(
       });
     if (taken) {
       await expect(reads.book(BOOK, emailSession, 'not-inserted')).rejects.toThrow('no longer free');
+      expect(await getBookingRequest(emailSession.id, 'not-inserted')).toMatchObject({ applied: true, reported: true });
+      await answeringAction(
+        'book',
+        reads.book,
+        reads.completeAnswer,
+      )({ ...BOOK, requestId: 'not-inserted' }, emailSession);
+      await reads.resumePending();
       expect(await getBookingRequest(emailSession.id, 'not-inserted')).toBeUndefined();
       expect(calendar.live(TEAM)).toEqual([]);
     } else {
@@ -591,7 +598,19 @@ it.each(['free', 'taken', 'moved'] as const)('rechecks an unapplied change when 
       state === 'taken' ? 'no longer free' : 'meeting changed since it was checked',
     );
     expect(calendar.writes.map((entry) => entry.op)).toEqual(['insert']);
-    if (state === 'taken') expect(await getBookingRequest(emailSession.id, 'unapplied-change')).toBeUndefined();
+    if (state === 'taken') {
+      expect(await getBookingRequest(emailSession.id, 'unapplied-change')).toMatchObject({
+        applied: true,
+        reported: true,
+      });
+      await answeringAction(
+        'change_booking',
+        reads.changeBooking,
+        reads.completeAnswer,
+      )({ ...content, requestId: 'unapplied-change' }, emailSession);
+      await reads.resumePending();
+      expect(await getBookingRequest(emailSession.id, 'unapplied-change')).toBeUndefined();
+    }
     if (state === 'moved') expect(calendar.event(TEAM, id)?.start?.dateTime).toBe('2026-10-22T14:00:00Z');
   }
 });
@@ -640,9 +659,20 @@ it.each([
   expect(calendar.writes).toEqual([]);
 });
 
-it('drops a request refused with no Google token after recording, and gives the surface’s connection step', async () => {
+it('retains a certain no-token refusal through publication, cleans its request and gives the surface’s connection step', async () => {
   calendar.failNext({ op: 'insert', error: new GoogleNotSignedInError('No token') });
   await expect(reads.book(BOOK, emailSession, 'no-token')).rejects.toThrow("couldn't do on this thread");
+  expect(await getBookingRequest(emailSession.id, 'no-token')).toMatchObject({
+    applied: true,
+    reported: true,
+    resultJson: expect.stringContaining('connection'),
+  });
+  await answeringAction(
+    'book',
+    (_content, target, requestId) => reads.book(BOOK, target, requestId),
+    reads.completeAnswer,
+  )({ ...BOOK, requestId: 'no-token' }, emailSession);
+  await reads.resumePending();
   expect(await getBookingRequest(emailSession.id, 'no-token')).toBeUndefined();
   expect(calendar.writes).toEqual([]);
 });
@@ -839,6 +869,17 @@ it('gives a no-change answer with its current video link without sending an upda
   expect(result.message).toContain('Google Meet link');
   expect(result.message).toContain('nothing changed');
   expect(calendar.writes.map((entry) => entry.op)).toEqual(['insert']);
+  expect(await getBookingRequest(chatSession.id, 'unchanged')).toMatchObject({
+    state: 'answer',
+    applied: true,
+    reported: true,
+  });
+  await answeringAction(
+    'change_booking',
+    reads.changeBooking,
+    reads.completeAnswer,
+  )({ booking: id, start: BOOK.start, requestId: 'unchanged' }, chatSession);
+  await reads.resumePending();
   expect(await getBookingRequest(chatSession.id, 'unchanged')).toBeUndefined();
 });
 

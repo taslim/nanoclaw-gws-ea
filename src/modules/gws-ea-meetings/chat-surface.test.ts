@@ -556,6 +556,10 @@ it.each(['patch', 'delete'] as const)(
       ),
     ).toContain('permission refused');
     expect(
+      await getDb().get('SELECT applied,reported FROM gws_ea_booking_requests WHERE request_id=?', `refused-${op}`),
+    ).toEqual({ applied: 1, reported: 1 });
+    await createBookingTools({ calendar: () => calendar }).resumePending();
+    expect(
       await getDb().all('SELECT request_id FROM gws_ea_booking_requests WHERE request_id=?', `refused-${op}`),
     ).toEqual([]);
     expect(calendarNotes(main, op === 'patch' ? 'changed' : 'cancelled')).toEqual([]);

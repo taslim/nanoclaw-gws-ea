@@ -61,3 +61,11 @@ export async function runGuarded(
   }
   await handler(content, session);
 }
+
+/** The action still belongs to its durable outbound request, so delivery must retry without acknowledging it. */
+export class RetryDeliveryError extends Error {
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, options);
+    this.name = 'RetryDeliveryError';
+  }
+}

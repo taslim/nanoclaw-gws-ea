@@ -133,6 +133,7 @@ it('carries Juno Hale’s thread booking, the chat booking and unanswered reques
   });
   expect(await bookingOwner('juno.hale@EXAMPLE.COM', 'event-mira')).toEqual(CHAT);
   expect(await getBookingRequest('session-juno', 'change-venue')).toEqual({
+    state: 'write',
     sessionId: 'session-juno',
     requestId: 'change-venue',
     action: 'change',
@@ -239,5 +240,50 @@ it('keeps the original mutation ledger and pending index when adding initial boo
     sql: 'CREATE INDEX gws_ea_booking_requests_pending ON gws_ea_booking_requests(created_at,session_id,request_id)',
   });
   await expectOldTablesGone(db);
+  expect(await db.all('PRAGMA foreign_key_check')).toEqual([]);
+});
+
+it('admits terminal answers with no mutation coordinates while rejecting incomplete intents after migration', async () => {
+  const db = await releasedDatabase();
+  await seedChat(db);
+  await oldRequest(db, 'carried-intent', 'change', 0, null, 0, 0);
+  await migrate(db);
+  const frame = JSON.stringify({
+    id: 'terminal-calendar-unset',
+    ok: false,
+    error: { code: 'forbidden', message: 'Ask main which calendar to use.' },
+  });
+  await db.run(
+    `INSERT INTO gws_ea_booking_requests(session_id,request_id,action,fingerprint,request_json,owner_kind,owner_key,applied,reported,result_json,created_at)
+     VALUES(?,?,?,?,?,?,?,1,1,?,?)`,
+    'session-juno',
+    'terminal-calendar-unset',
+    'book',
+    'terminal-fingerprint',
+    '{"title":"Venue visit"}',
+    'chat',
+    CHAT.key,
+    frame,
+    AT,
+  );
+  expect(await getBookingRequest('session-juno', 'terminal-calendar-unset')).toMatchObject({
+    state: 'answer',
+    answerJson: frame,
+    applied: true,
+    reported: true,
+  });
+  expect(await getBookingRequest('session-juno', 'carried-intent')).toMatchObject({
+    state: 'write',
+    carriedOver: true,
+    eventEtag: null,
+    requestMark: null,
+    applied: false,
+  });
+  await expect(
+    db.run('UPDATE gws_ea_booking_requests SET reported=0 WHERE request_id=?', 'terminal-calendar-unset'),
+  ).rejects.toThrow(/CHECK/u);
+  await expect(
+    db.run('UPDATE gws_ea_booking_requests SET start_at=? WHERE request_id=?', AT, 'terminal-calendar-unset'),
+  ).rejects.toThrow(/CHECK/u);
   expect(await db.all('PRAGMA foreign_key_check')).toEqual([]);
 });
