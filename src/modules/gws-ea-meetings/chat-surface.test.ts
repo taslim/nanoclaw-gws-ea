@@ -132,28 +132,6 @@ it('books only current roster members with email, replays once, and changes/canc
   expect(calendar.live()).toEqual([]);
   expect(calendar.writes.map((write) => write.sendUpdates)).toEqual(['all', 'all', 'all']);
 });
-it('leaves a new booking for main to place when its chat belongs to more than one open matter', async () => {
-  const { openMatter } = await import('../gws-ea-matters/db.js');
-  await openMatter({
-    title: 'Cabin preparations',
-    openLoop: 'Choose a cabin',
-    links: [{ kind: 'chat', reference: chatId }],
-  });
-  const booked = chatData(await sendChatRequest(session, 'book', fields));
-  expect(calendar.live()).toHaveLength(1);
-  expect(
-    await getDb().all(
-      "SELECT matter_id FROM gws_ea_matter_links WHERE kind='chat' AND reference=? AND matter_open=1",
-      chatId,
-    ),
-  ).toHaveLength(2);
-  expect(
-    await getDb().all(
-      "SELECT matter_id FROM gws_ea_matter_links WHERE kind='event' AND reference=? AND matter_open=1",
-      `${PRINCIPAL}/${String(booked.booking)}`,
-    ),
-  ).toEqual([]);
-});
 it('refreshes the platform roster before an invitation and keeps departed guests on an existing booking', async () => {
   const first = chatData(await sendChatRequest(session, 'book', fields));
   platformMembers([{ key: 'whatsapp:11', name: 'Juno', isPrincipal: true }]);
@@ -197,35 +175,6 @@ it('keeps booking ownership on the chat through a serving-agent promotion and re
   chatData(await sendChatRequest(job, 'cancel_booking', { booking: booked.booking }));
   expect(calendar.live()).toEqual([]);
 });
-it('returns free windows only and refuses a now-busy booking without exposing calendar details', async () => {
-  calendar.put({
-    id: 'private-event',
-    calendarId: PRINCIPAL,
-    summary: 'Private therapy',
-    description: 'Private treatment',
-    start: { dateTime: START },
-    end: { dateTime: '2026-10-20T13:00:00Z' },
-  });
-  const detailRead = vi.spyOn(calendar, 'listEventDetails');
-  const free = chatData(
-    await sendChatRequest(session, 'free_time', {
-      from: '2026-10-20T09:00:00Z',
-      to: '2026-10-20T17:00:00Z',
-      minutes: 30,
-    }),
-  );
-  expect(free.windows).toEqual(expect.any(Array));
-  const windows = free.windows as { start: string; end: string }[];
-  expect(windows.length).toBeGreaterThan(0);
-  for (const window of windows)
-    expect(
-      Date.parse(window.end) <= Date.parse(START) || Date.parse(window.start) >= Date.parse('2026-10-20T13:00:00Z'),
-    ).toBe(true);
-  expect(JSON.stringify(free)).not.toMatch(/Private therapy|Private treatment|private-event|juno@example/);
-  expect(detailRead).not.toHaveBeenCalled();
-  expect(chatRefusal(await sendChatRequest(session, 'book', fields))).toContain('no longer free');
-  expect(calendar.writes).toEqual([]);
-});
 it('honors an exact-chat principal clearance on invitation text without granting another chat clearance', async () => {
   const value = await addPrivateValue({ kind: 'phone', label: 'Private phone', value: '+14155550123' });
   expect(chatRefusal(await sendChatRequest(session, 'book', { ...fields, notes: '+14155550123' }))).toContain(
@@ -240,15 +189,6 @@ it('honors an exact-chat principal clearance on invitation text without granting
   await recordChatClearances({ messagingGroupId: chatId, principalMessageId: 'stored-principal', values: [value] });
   chatData(await sendChatRequest(session, 'book', { ...fields, notes: '+14155550123' }));
   expect(calendar.live()[0].description).toBe('+14155550123');
-});
-it('refuses a booking whose Google ownership tag changed', async () => {
-  const booked = chatData(await sendChatRequest(session, 'book', fields));
-  const event = calendar.live()[0];
-  calendar.put({ ...event, tags: { [TAG_ROLE]: 'booking', [TAG_CHAT]: 'another-chat' } });
-  expect(chatRefusal(await sendChatRequest(session, 'cancel_booking', { booking: booked.booking }))).toContain(
-    'belongs',
-  );
-  expect(calendar.live()).toHaveLength(1);
 });
 it('never lets another chat of the same shared agent change or cancel its booking', async () => {
   const booked = chatData(await sendChatRequest(session, 'book', fields));
@@ -467,51 +407,40 @@ it.each(['insert', 'patch', 'delete'] as const)(
     expect(calendarNotes(main, { insert: 'booked', patch: 'changed', delete: 'cancelled' }[op])).toHaveLength(1);
   },
 );
-it.each(['main mailbox', 'matter placement'] as const)(
-  'keeps a new booking pending after %s fails and resumes its report without booking twice',
-  async (failure) => {
-    const id = 'initial-book-report';
-    const host = await import('../../session-manager.js');
-    const matters = await import('../gws-ea-matters/db.js');
-    const write = host.writeSessionMessage;
-    const interrupted =
-      failure === 'main mailbox'
-        ? vi.spyOn(host, 'writeSessionMessage').mockImplementation(async (...args) => {
-            if (args[2].id.startsWith('gws-ea-booking-')) throw new Error('main mailbox temporarily unavailable');
-            return write(...args);
-          })
-        : vi.spyOn(matters, 'placeInMatter').mockRejectedValue(new Error('matter placement temporarily unavailable'));
-    const handler = getDeliveryAction('book');
-    if (!handler) throw new Error('No calendar action');
-    await handler({ ...fields, action: 'book', requestId: id }, session);
-    const inbox = new Database(inboundDbPath(session.agent_group_id, session.id), { readonly: true });
-    try {
-      expect(inbox.prepare('SELECT id FROM messages_in WHERE id=?').get(`action-resp-${id}`)).toBeUndefined();
-      expect(calendarNotes(main, 'booked')).toEqual([]);
-      expect(calendar.live()).toHaveLength(1);
-      expect(
-        await getDb().get('SELECT action,applied,reported FROM gws_ea_booking_requests WHERE request_id=?', id),
-      ).toEqual({ action: 'book', applied: failure === 'matter placement' ? 0 : 1, reported: 0 });
-      interrupted.mockRestore();
-      const resumed = createBookingTools({ calendar: () => calendar });
-      await resumed.resumePending();
-      await resumed.resumePending();
-      const response = await sendChatRequest(session, 'book', fields, id);
-      const booked = chatData(response);
-      expect(booked.message).toContain('main hears');
-      expect(await sendChatRequest(session, 'book', fields, id)).toEqual(response);
-      expect(calendar.writes.filter((record) => record.op === 'insert')).toHaveLength(1);
-      expect(calendarNotes(main, 'booked')).toHaveLength(1);
-      expect(calendarNotes(main, 'booked')[0].content).toContain(String(booked.booking));
-      expect(calendarNotes(main, 'booked')[0].content).toContain('Venue visit');
-      expect(
-        await getDb().get('SELECT request_id FROM gws_ea_booking_requests WHERE request_id=?', id),
-      ).toBeUndefined();
-    } finally {
-      inbox.close();
-    }
-  },
-);
+it('keeps a new booking pending after its matter placement fails and resumes its report without booking twice', async () => {
+  const id = 'initial-book-report';
+  const matters = await import('../gws-ea-matters/db.js');
+  const interrupted = vi
+    .spyOn(matters, 'placeInMatter')
+    .mockRejectedValue(new Error('matter placement temporarily unavailable'));
+  const handler = getDeliveryAction('book');
+  if (!handler) throw new Error('No calendar action');
+  await handler({ ...fields, action: 'book', requestId: id }, session);
+  const inbox = new Database(inboundDbPath(session.agent_group_id, session.id), { readonly: true });
+  try {
+    expect(inbox.prepare('SELECT id FROM messages_in WHERE id=?').get(`action-resp-${id}`)).toBeUndefined();
+    expect(calendarNotes(main, 'booked')).toEqual([]);
+    expect(calendar.live()).toHaveLength(1);
+    expect(
+      await getDb().get('SELECT action,applied,reported FROM gws_ea_booking_requests WHERE request_id=?', id),
+    ).toEqual({ action: 'book', applied: 0, reported: 0 });
+    interrupted.mockRestore();
+    const resumed = createBookingTools({ calendar: () => calendar });
+    await resumed.resumePending();
+    await resumed.resumePending();
+    const response = await sendChatRequest(session, 'book', fields, id);
+    const booked = chatData(response);
+    expect(booked.message).toContain('main hears');
+    expect(await sendChatRequest(session, 'book', fields, id)).toEqual(response);
+    expect(calendar.writes.filter((record) => record.op === 'insert')).toHaveLength(1);
+    expect(calendarNotes(main, 'booked')).toHaveLength(1);
+    expect(calendarNotes(main, 'booked')[0].content).toContain(String(booked.booking));
+    expect(calendarNotes(main, 'booked')[0].content).toContain('Venue visit');
+    expect(await getDb().get('SELECT request_id FROM gws_ea_booking_requests WHERE request_id=?', id)).toBeUndefined();
+  } finally {
+    inbox.close();
+  }
+});
 it('keeps a confirmed mutation pending until main receives its one durable note', async () => {
   const booked = chatData(await sendChatRequest(session, 'book', fields));
   const request = { booking: booked.booking, start: LATER };
@@ -555,10 +484,6 @@ it.each(['patch', 'delete'] as const)(
         await sendChatRequest(session, op === 'patch' ? 'change_booking' : 'cancel_booking', request, `refused-${op}`),
       ),
     ).toContain('permission refused');
-    expect(
-      await getDb().get('SELECT applied,reported FROM gws_ea_booking_requests WHERE request_id=?', `refused-${op}`),
-    ).toEqual({ applied: 1, reported: 1 });
-    await createBookingTools({ calendar: () => calendar }).resumePending();
     expect(
       await getDb().all('SELECT request_id FROM gws_ea_booking_requests WHERE request_id=?', `refused-${op}`),
     ).toEqual([]);

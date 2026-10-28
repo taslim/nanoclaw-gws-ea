@@ -28,15 +28,7 @@ type Review =
  * `src/modules`, its other fields sorted, a spread written `...name`.
  */
 const REVIEWED: Readonly<Record<string, Review>> = {
-  'gws-ea-meetings/booking.ts terminalFrame: code': {
-    kind: 'host-only',
-    reason: 'the response frame keeps its transport error code; the rendered error message explains the refusal',
-  },
-  'gws-ea-meetings/booking.ts unreadableFrame: code': {
-    kind: 'host-only',
-    reason: 'the refusal message explains the unconfirmed outcome and next step; the code classifies it for the host',
-  },
-  'gws-ea-meetings/booking.ts frame: code': {
+  'gws-ea-meetings/booking.ts answerRequest: code': {
     kind: 'host-only',
     reason: 'the response frame keeps its transport error code; the rendered error message explains the refusal',
   },
@@ -50,16 +42,15 @@ const REVIEWED: Readonly<Record<string, Review>> = {
   },
   'gws-ea-meetings/booking.ts removedOutcome: booking': {
     kind: 'host-only',
-    reason: 'the host retains the event identity; the refusal explains removal and asks main before booking again',
+    reason: 'the host retains the event identity; the refusal explains removal and asks main before another time',
   },
   'gws-ea-meetings/booking.ts unknownOutcome: booking': {
-    kind: 'rendered',
-    reason: 'the message names the booking id and explains the uncertain outcome and next step',
+    kind: 'host-only',
+    reason: 'the host retains the event identity for main; the message tells the agent to wait for main',
   },
   'gws-ea-meetings/booking.ts absentOutcome: booking': {
     kind: 'host-only',
-    reason:
-      'the host retains the event identity; the refusal explains that no booking remains and asks main before another attempt',
+    reason: 'the host retains the event identity; the refusal says nothing was booked and main hears the same',
   },
   "gws-ea-meetings/booking.ts successOutcome: ...(row.action === 'cancel' ? {} : { start: iso(span.start), end: iso(span.end) }), booking":
     {
@@ -67,14 +58,13 @@ const REVIEWED: Readonly<Record<string, Review>> = {
       reason:
         'the message gives the resulting time and conference, supplies a new booking id on book, and confirms cancellation; other booking ids echo the request',
     },
-  'gws-ea-meetings/booking.ts request: booking, end, start': {
+  'gws-ea-meetings/booking.ts check: booking, end, start': {
     kind: 'rendered',
     reason: 'the no-change message gives the current time and conference; the booking id is the request input',
   },
   'gws-ea-meetings/booking.ts resumePending: code': {
     kind: 'host-only',
-    reason:
-      'the saved response frame keeps its transport classification while the error message fully explains the outcome',
+    reason: 'the response frame keeps its transport error code; the rendered error message explains the refusal',
   },
 
   'gws-ea-artifacts/sharing.ts failure: code': {

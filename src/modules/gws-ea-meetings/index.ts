@@ -93,9 +93,8 @@ for (const [action, answer] of [
       withConnectionStep(
         action,
         answer,
-        async (session) => (await resolveBookingSurface(session)).surface.words.connectionStep,
+        async (session) => (await resolveBookingSurface(session)).words.connectionStep,
       ),
-      booking.completeAnswer,
     ),
     answeredGuard(bookingAction),
   );

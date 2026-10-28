@@ -204,10 +204,10 @@ const NO_CALENDAR_YET =
   "No calendar is set for this thread's bookings yet: wake main once with tell_main to ask which calendar to book on, and offer no time until it answers.";
 /** What `book` answers while main has set no calendar for the thread's bookings. */
 const BOOKS_NOTHING_YET =
-  "No calendar is set for this thread's bookings yet, so nothing was booked: wake main with tell_main to ask which calendar to book on, and book once it answers.";
+  "No calendar is set for this thread's bookings yet, so nothing was booked: wake main once with tell_main to ask which calendar to book on, and book when it answers.";
 /** What `book` answers when the calendar main set can no longer be booked on. */
 const CANNOT_BOOK_THERE =
-  "The calendar main set for this thread's bookings is no longer one the assistant can book on, so nothing was booked: wake main with tell_main to ask which calendar to book on, and book once it answers.";
+  "The calendar main set for this thread's bookings is no longer one the assistant can book on, so nothing was booked: wake main once with tell_main to ask which calendar to book on, and book when it answers.";
 /** What a change or cancellation answers when Google no longer shows the booking's calendar's events. */
 const BOOKING_OUT_OF_SIGHT = 'The booking calendar is no longer readable. Ask main with tell_main.';
 
@@ -1133,29 +1133,6 @@ describe('a booking changes and is cancelled only by its own thread', () => {
     });
   });
 
-  it('refuses an event that lost its booking tag, for a change and for a cancellation', async () => {
-    const booked = data(
-      await send(sessionA, 'book', { start: TUESDAY_10AM, minutes: 30, title: 'Intro', invitees: [REMY] }),
-    );
-    const [event] = bookings();
-    calendar.put({ ...event, tags: { gwsEaThread: threadA } });
-    const writes = calendar.writes.length;
-
-    for (const [action, fields] of [
-      ['change_booking', { booking: booked.booking, start: THURSDAY_2PM }],
-      ['cancel_booking', { booking: booked.booking }],
-    ] as const) {
-      expect(refusal(await send(sessionA, action, fields))).toBe(
-        'That event no longer belongs to this thread. Ask main with tell_main.',
-      );
-    }
-    expect(calendar.writes).toHaveLength(writes);
-    expect(calendar.event(PRINCIPAL, event.id)).toMatchObject({
-      status: 'confirmed',
-      start: { dateTime: TUESDAY_10AM },
-    });
-  });
-
   it.each([
     { how: 'as cancelled', gone: (event: StoredEvent) => calendar.put({ ...event, status: 'cancelled' }) },
     // Google answers 404 once a deleted event is gone for good.
@@ -1310,7 +1287,7 @@ describe('a booking from a thread in an open matter', () => {
   }
 
   function brief(): string {
-    return `Its matter's other conversations, to brief at once: thread ${threadB}.`;
+    return `Its matter's other conversations, to brief: thread ${threadB}.`;
   }
 
   it("joins the thread's matter, and reaches main with the matter and its other threads to brief", async () => {

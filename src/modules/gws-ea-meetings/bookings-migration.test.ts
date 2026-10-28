@@ -133,7 +133,6 @@ it('carries Juno Hale’s thread booking, the chat booking and unanswered reques
   });
   expect(await bookingOwner('juno.hale@EXAMPLE.COM', 'event-mira')).toEqual(CHAT);
   expect(await getBookingRequest('session-juno', 'change-venue')).toEqual({
-    state: 'write',
     sessionId: 'session-juno',
     requestId: 'change-venue',
     action: 'change',
@@ -145,7 +144,6 @@ it('carries Juno Hale’s thread booking, the chat booking and unanswered reques
     startAt: '2026-10-20T12:00:00.000Z',
     endAt: '2026-10-20T12:30:00.000Z',
     eventEtag: null,
-    requestMark: null,
     carriedOver: true,
     applied: false,
     resultJson: null,
@@ -199,7 +197,7 @@ it('migrates a fresh database through the full chain and safely skips a repeated
   });
 });
 
-it('keeps the original mutation ledger and pending index when adding initial bookings, then carries every unanswered request into the shared ledger', async () => {
+it('carries every unanswered request from a database that predates the chat booking reports', async () => {
   const db = await initSqliteTestDb();
   await runMigrations(
     db,
@@ -216,11 +214,6 @@ it('keeps the original mutation ledger and pending index when adding initial boo
 
   expect(await db.all('SELECT * FROM gws_ea_chat_booking_requests')).toEqual(before);
   await oldRequest(db, 'book-venue', 'book', 0, null, 0, 0);
-  expect(
-    await db.get("SELECT sql FROM sqlite_master WHERE type='index' AND name='gws_ea_chat_booking_requests_pending'"),
-  ).toEqual({
-    sql: 'CREATE INDEX gws_ea_chat_booking_requests_pending ON gws_ea_chat_booking_requests(answered,created_at)',
-  });
 
   await migrate(db);
 
@@ -234,56 +227,6 @@ it('keeps the original mutation ledger and pending index when adding initial boo
       carriedOver: true,
     },
   ]);
-  expect(
-    await db.get("SELECT sql FROM sqlite_master WHERE type='index' AND name='gws_ea_booking_requests_pending'"),
-  ).toEqual({
-    sql: 'CREATE INDEX gws_ea_booking_requests_pending ON gws_ea_booking_requests(created_at,session_id,request_id)',
-  });
   await expectOldTablesGone(db);
-  expect(await db.all('PRAGMA foreign_key_check')).toEqual([]);
-});
-
-it('admits terminal answers with no mutation coordinates while rejecting incomplete intents after migration', async () => {
-  const db = await releasedDatabase();
-  await seedChat(db);
-  await oldRequest(db, 'carried-intent', 'change', 0, null, 0, 0);
-  await migrate(db);
-  const frame = JSON.stringify({
-    id: 'terminal-calendar-unset',
-    ok: false,
-    error: { code: 'forbidden', message: 'Ask main which calendar to use.' },
-  });
-  await db.run(
-    `INSERT INTO gws_ea_booking_requests(session_id,request_id,action,fingerprint,request_json,owner_kind,owner_key,applied,reported,result_json,created_at)
-     VALUES(?,?,?,?,?,?,?,1,1,?,?)`,
-    'session-juno',
-    'terminal-calendar-unset',
-    'book',
-    'terminal-fingerprint',
-    '{"title":"Venue visit"}',
-    'chat',
-    CHAT.key,
-    frame,
-    AT,
-  );
-  expect(await getBookingRequest('session-juno', 'terminal-calendar-unset')).toMatchObject({
-    state: 'answer',
-    answerJson: frame,
-    applied: true,
-    reported: true,
-  });
-  expect(await getBookingRequest('session-juno', 'carried-intent')).toMatchObject({
-    state: 'write',
-    carriedOver: true,
-    eventEtag: null,
-    requestMark: null,
-    applied: false,
-  });
-  await expect(
-    db.run('UPDATE gws_ea_booking_requests SET reported=0 WHERE request_id=?', 'terminal-calendar-unset'),
-  ).rejects.toThrow(/CHECK/u);
-  await expect(
-    db.run('UPDATE gws_ea_booking_requests SET start_at=? WHERE request_id=?', AT, 'terminal-calendar-unset'),
-  ).rejects.toThrow(/CHECK/u);
   expect(await db.all('PRAGMA foreign_key_check')).toEqual([]);
 });

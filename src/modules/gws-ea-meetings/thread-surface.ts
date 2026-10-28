@@ -9,12 +9,11 @@ export function threadSurface(threadKey: string): BookingSurface {
   const owner = { kind: 'thread', key: threadKey } as const;
   return {
     owner,
+    writer: 'external-email',
     /** to: external-email */
     words: {
       ownerLabel: 'this thread',
       connectionStep: "Wake main with tell_main, saying what you couldn't do on this thread, and wait for main.",
-      waitForMain: 'wake main with tell_main and wait for its answer',
-      askForCalendar: 'wake main with tell_main to ask which calendar to book on',
     },
     calendarId: () => getThreadBookingCalendar(threadKey),
     async invitationPeople() {
@@ -29,8 +28,8 @@ export function threadSurface(threadKey: string): BookingSurface {
         empty: 'Name someone on the thread to invite: the booking invites nobody else.',
       };
     },
-    async privacyFor(_recipients, writer) {
-      return { writer };
+    async privacyFor() {
+      return {};
     },
     async beforeWrite() {},
     inWrite: (work) => work(),

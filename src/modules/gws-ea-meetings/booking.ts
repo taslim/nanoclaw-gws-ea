@@ -10,7 +10,6 @@ import {
 } from '../../cli/delivery-action.js';
 import { resolveGroupTimezone } from '../../container-config.js';
 import { getDb } from '../../db/connection.js';
-import { RetryDeliveryError } from '../../delivery-guard.js';
 import { getMessagingGroup } from '../../db/messaging-groups.js';
 import { isUniqueViolation } from '../../db/errors.js';
 import { getSession } from '../../db/sessions.js';
@@ -32,7 +31,6 @@ import { writeNoteForMain } from '../gws-ea-profile/main-note.js';
 import { getSchedulingPreferenceValues } from '../gws-ea-preferences/db.js';
 import {
   getGwsEaProfile,
-  getExternalChatAgentGroupId,
   getMainAgentGroupId,
   principalRecognizer,
   type PrincipalRecognizer,
@@ -66,12 +64,9 @@ import {
   markBookingRequestReported,
   recordBooking,
   recordBookingRequest,
-  recordBookingAnswer,
   type BookingRequest,
-  type BookingAnswerRequest,
-  type PendingBookingRequest,
 } from './bookings-db.js';
-import { bookingSurfaceFor, resolveBookingSurface, type BookingSurfaceContext } from './booking-surface.js';
+import { bookingSurfaceFor, resolveBookingSurface, type BookingSurface } from './booking-surface.js';
 import { addressesOf, flagOf, instantOf, lineOf, notesOf, timezoneOf } from './fields.js';
 import {
   blocksTime,
@@ -91,27 +86,30 @@ const MAX_RANGE_DAYS = 60;
 const MINUTE = 60_000;
 const DAY = 24 * 60 * MINUTE;
 const TOOL_WAIT_MS = 120_000;
+const RATE_LIMITS: readonly string[] = [
+  'rateLimitExceeded',
+  'userRateLimitExceeded',
+  'quotaExceeded',
+  'dailyLimitExceeded',
+];
 
-class UnreadableBookingStateError extends Error {}
+/** to: external-email, external-chat, job */
+const WAIT_FOR_MAIN = 'wake main with tell_main and wait for its answer';
+/** to: external-email, external-chat, job */
+const ASK_FOR_CALENDAR = 'wake main once with tell_main to ask which calendar to book on';
 
-function savedBookingJson(json: string): unknown {
-  try {
-    return JSON.parse(json);
-  } catch (error) {
-    if (!(error instanceof SyntaxError)) throw error;
-    throw new UnreadableBookingStateError('The saved booking JSON is unreadable.', { cause: error });
-  }
-}
-
+/** The shared `retryable` counts every 403 as final, but Google lifts a rate limit. */
 function isPermanentGoogleFailure(error: unknown): error is GoogleApiError {
   return (
     error instanceof GoogleApiError &&
     !error.retryable &&
-    !(
-      error.status === 403 &&
-      ['rateLimitExceeded', 'userRateLimitExceeded', 'quotaExceeded', 'dailyLimitExceeded'].includes(error.reason ?? '')
-    )
+    !(error.status === 403 && RATE_LIMITS.includes(error.reason ?? ''))
   );
+}
+
+/** Whether an answer at `at` comes after the runners stopped waiting for a request made at `since`. */
+function pastToolWait(since: string, at = Date.now()): boolean {
+  return at - Date.parse(since) >= TOOL_WAIT_MS;
 }
 
 interface Principal {
@@ -119,18 +117,11 @@ interface Principal {
   readonly rules: SchedulingRules;
   readonly addresses: PrincipalRecognizer;
 }
-interface BookingView extends BookingSurfaceContext {
+interface BookingView {
+  readonly surface: BookingSurface;
   readonly principal: Principal;
   startedAt: string;
-  readonly answerExists?: boolean;
 }
-
-type BookingAnswer = (
-  content: Record<string, unknown>,
-  session: Session,
-  requestId: string,
-  view: BookingView,
-) => ReturnType<DeferredActionAnswer>;
 
 function minutesOf(value: unknown): number {
   if (typeof value !== 'number' || !Number.isInteger(value) || value < 5 || value > 480)
@@ -163,13 +154,15 @@ export interface BookingToolsDeps {
 
 export function createBookingTools(deps: BookingToolsDeps) {
   const calendar = () => deps.calendar();
-  const inFlight = new Map<string, number>();
-  const ownChangeRequests = new Set<string>();
+  // Delivery serializes each session, so at most one live handler holds a request.
+  const inFlight = new Set<string>();
+  // Each record excuses one notification, so a settlement retried in this runtime records its change once.
+  const ownChanges = new Set<string>();
   const requestKey = (sessionId: string, requestId: string): string => JSON.stringify([sessionId, requestId]);
 
-  async function answeredMessage(session: Session, requestId: string, createdAt: string) {
+  async function answeredMessage(session: Session, requestId: string, since: string) {
     return withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) =>
-      mailbox.getInboundRecords({ since: createdAt }).find((message) => message.id === `action-resp-${requestId}`),
+      mailbox.getInboundRecords({ since }).find((message) => message.id === `action-resp-${requestId}`),
     );
   }
 
@@ -183,6 +176,7 @@ export function createBookingTools(deps: BookingToolsDeps) {
     else if (frame.ok === false && isRecord(frame.error) && typeof frame.error.message === 'string')
       words = frame.error.message;
     else throw new Error('The saved booking answer has no readable outcome.');
+    // The runner hands its agent chat rows only; a system row would never reach it.
     const destination = session.messaging_group_id ? await getMessagingGroup(session.messaging_group_id) : undefined;
     try {
       await writeSessionMessage(session.agent_group_id, session.id, {
@@ -206,15 +200,11 @@ export function createBookingTools(deps: BookingToolsDeps) {
     await requestWake(session, 'cli');
   }
 
-  async function deliverAnswer(
-    session: Session,
-    requestId: string,
-    createdAt: string,
-    frame: ResponseFrame,
-  ): Promise<void> {
+  /** A mailbox that already holds an answer keeps it, and any wake repeats that answer. */
+  async function deliverAnswer(session: Session, requestId: string, since: string, frame: ResponseFrame) {
     await writeActionResponse(session, requestId, frame);
-    const answer = await answeredMessage(session, requestId, createdAt);
-    if (answer && Date.parse(answer.timestamp) - Date.parse(createdAt) >= TOOL_WAIT_MS)
+    const answer = await answeredMessage(session, requestId, since);
+    if (answer && pastToolWait(since, Date.parse(answer.timestamp)))
       await wakeLateAnswer(session, requestId, answer.content);
     clearOutbox(session.agent_group_id, session.id, requestId);
   }
@@ -227,185 +217,87 @@ export function createBookingTools(deps: BookingToolsDeps) {
     );
   }
 
-  async function completeAnswer(session: Session, requestId: string): Promise<void> {
-    const startedAt =
-      (await requestStartedAt(session, requestId)) ?? (await getBookingRequest(session.id, requestId))?.createdAt;
-    if (startedAt === undefined) return;
-    const answer = await answeredMessage(session, requestId, startedAt);
-    if (answer && Date.parse(answer.timestamp) - Date.parse(startedAt) >= TOOL_WAIT_MS)
-      await wakeLateAnswer(session, requestId, answer.content);
-  }
-
-  function terminalFrame(row: BookingAnswerRequest): ResponseFrame {
-    const stored = savedBookingJson(row.answerJson);
-    if (!isRecord(stored) || stored.id !== row.requestId)
-      throw new UnreadableBookingStateError('The saved terminal booking answer is unreadable.');
-    if (stored.ok === true && isRecord(stored.data) && typeof stored.data.message === 'string')
-      return { id: row.requestId, ok: true, data: stored.data };
-    if (
-      stored.ok === false &&
-      isRecord(stored.error) &&
-      (stored.error.code === 'forbidden' || stored.error.code === 'invalid-args') &&
-      typeof stored.error.message === 'string'
-    )
-      return { id: row.requestId, ok: false, error: { code: stored.error.code, message: stored.error.message } };
-    throw new UnreadableBookingStateError('The saved terminal booking answer has no outcome.');
-  }
-
-  async function unreadableFrame(row: PendingBookingRequest): Promise<Extract<ResponseFrame, { ok: false }>> {
-    const surface = bookingSurfaceFor(row.owner);
-    const event = row.state === 'write' ? `; event ${row.eventId} on calendar ${row.calendarId}` : '';
-    const reported = await writeNoteForMain({
-      id: `gws-ea-booking-unreadable-${eventIdFor(row.sessionId, row.requestId)}`,
-      timestamp: new Date().toISOString(),
-      wake: true,
-      text: `The saved booking state is unreadable for request ${row.requestId} to ${row.action} (${row.owner.kind} ${row.owner.key}${event}). It may or may not have gone through in Google. Check the calendar before acting again; the host will not replay this request.`,
-      pieces: [
-        ...(row.owner.kind === 'thread' ? [{ kind: 'thread' as const, reference: row.owner.key }] : []),
-        ...(row.state === 'write' ? [{ kind: 'event' as const, reference: `${row.calendarId}/${row.eventId}` }] : []),
-      ],
-    });
-    if (reported === 'no-main' || reported === 'no-principal')
-      log.warn('Nobody to tell of unreadable booking state', { owner: row.owner, requestId: row.requestId, reported });
-    return {
-      id: row.requestId,
-      ok: false,
-      error: {
-        code: 'forbidden',
-        message: `The saved booking state is unreadable, so its outcome cannot be confirmed. Main hears the same. ${surface.words.waitForMain} before acting on it again.`,
-      },
-    };
-  }
-
-  async function terminalAnswer(row: BookingAnswerRequest): Promise<ResponseFrame> {
-    try {
-      return terminalFrame(row);
-    } catch (error) {
-      if (!(error instanceof UnreadableBookingStateError)) throw error;
-      return unreadableFrame(row);
-    }
-  }
-
-  function resultOf(frame: ResponseFrame): Record<string, unknown> {
-    if (frame.ok && isRecord(frame.data)) return frame.data;
-    if (!frame.ok && (frame.error.code === 'forbidden' || frame.error.code === 'invalid-args'))
-      throw new ActionRefusal(frame.error.code, frame.error.message);
-    throw new Error('The saved terminal booking answer has no outcome.');
-  }
-
-  async function terminalResult(row: BookingAnswerRequest): Promise<Record<string, unknown>> {
-    return resultOf(await terminalAnswer(row));
-  }
-
   async function viewOf(session: Session, startedAt = new Date().toISOString()): Promise<BookingView> {
-    return { ...(await resolveBookingSurface(session)), principal: await principalView(), startedAt };
+    return { surface: await resolveBookingSurface(session), principal: await principalView(), startedAt };
   }
 
-  function bound(
+  async function answerRequest(
     action: BookingRequest['action'],
-    answer: BookingAnswer,
     fields: readonly string[],
-  ): DeferredActionAnswer {
-    return async (content, session, requestId) => {
-      const handlerStartedAt = new Date().toISOString();
-      const key = requestKey(session.id, requestId);
-      inFlight.set(key, (inFlight.get(key) ?? 0) + 1);
-      try {
-        const startedAt = (await requestStartedAt(session, requestId)) ?? handlerStartedAt;
-        const existing = await getBookingRequest(session.id, requestId);
-        if (existing?.state === 'answer') {
-          if (existing.action !== action || existing.fingerprint !== eventIdFor(JSON.stringify(content)))
-            throw forbidden('This booking request ID was already used for different work.');
-          if (!(await bookingSurfaceFor(existing.owner).stillServing(session)))
+    content: Record<string, unknown>,
+    session: Session,
+    requestId: string,
+  ): ReturnType<DeferredActionAnswer> {
+    // Read before any await: the tool began waiting no later than this.
+    const enteredAt = new Date().toISOString();
+    const startedAt = (await requestStartedAt(session, requestId)) ?? enteredAt;
+    assertChatToolFields(content, fields);
+    const view = await viewOf(session, startedAt);
+    await view.surface.beforeWrite();
+    let frame: ResponseFrame;
+    let result: Record<string, unknown> | typeof ANSWER_LATER = ANSWER_LATER;
+    let refusal: ActionRefusal | undefined;
+    try {
+      result = await view.surface.inWrite(() =>
+        inSchedulingTurn(async () => {
+          // A resume sweep ahead in the turn may have answered it and dropped its row.
+          const answered = await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) =>
+            mailbox.hasMessage(`action-resp-${requestId}`),
+          );
+          if (answered === true) return ANSWER_LATER;
+          if (!(await view.surface.stillServing(session)))
             throw forbidden('This session no longer serves this booking’s owner.');
-          const frame = await terminalAnswer(existing);
-          if (Date.now() - Date.parse(existing.createdAt) >= TOOL_WAIT_MS)
-            await deliverAnswer(session, requestId, existing.createdAt, frame);
-          return resultOf(frame);
-        }
-        const view = await viewOf(session, startedAt);
-        let preparationRefusal: ActionRefusal | undefined;
-        try {
-          assertChatToolFields(content, fields);
-          if (!existing?.applied) await view.surface.beforeWrite();
-        } catch (error) {
-          if (!(error instanceof ActionRefusal)) throw error;
-          preparationRefusal = error;
-        }
-        const frame = await view.surface.inWrite(() =>
-          inSchedulingTurn(async (): Promise<ResponseFrame | typeof ANSWER_LATER> => {
-            const answered = await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) =>
-              mailbox.hasMessage(`action-resp-${requestId}`),
-            );
-            if (answered) {
-              await completeAnswer(session, requestId);
-              return ANSWER_LATER;
-            }
-            let response: ResponseFrame;
-            try {
-              if (preparationRefusal) throw preparationRefusal;
-              if (!(await view.surface.stillServing(session)))
-                throw forbidden('This session no longer serves this booking’s owner.');
-              const result = await answer(content, session, requestId, view);
-              if (result === ANSWER_LATER) return result;
-              response = { id: requestId, ok: true, data: result };
-            } catch (error) {
-              if (!(error instanceof ActionRefusal)) throw error;
-              response = { id: requestId, ok: false, error: { code: error.code, message: error.message } };
-            }
-            const saved =
-              (await getBookingRequest(session.id, requestId)) ??
-              (await recordBookingAnswer({
-                sessionId: session.id,
-                requestId,
-                action,
-                fingerprint: eventIdFor(JSON.stringify(content)),
-                requestJson: JSON.stringify(content),
-                owner: view.surface.owner,
-                createdAt: view.startedAt,
-                answerJson: JSON.stringify(response),
-              }));
-            return saved.state === 'answer' ? terminalAnswer(saved) : response;
-          }),
-        );
-        if (frame === ANSWER_LATER) return frame;
-        if (Date.now() - Date.parse(view.startedAt) >= TOOL_WAIT_MS)
-          await deliverAnswer(session, requestId, view.startedAt, frame);
-        if (frame.ok && isRecord(frame.data)) return frame.data;
-        if (!frame.ok && (frame.error.code === 'forbidden' || frame.error.code === 'invalid-args'))
-          throw new ActionRefusal(frame.error.code, frame.error.message);
-        throw new Error('The booking answer has no outcome.');
+          return request(action, content, session, requestId, view);
+        }),
+      );
+      if (result === ANSWER_LATER || !pastToolWait(view.startedAt)) return result;
+      frame = { id: requestId, ok: true, data: result };
+    } catch (error) {
+      if (!(error instanceof ActionRefusal) || !pastToolWait(view.startedAt)) throw error;
+      refusal = error;
+      frame = { id: requestId, ok: false, error: { code: error.code, message: error.message } };
+    }
+    await deliverAnswer(session, requestId, view.startedAt, frame);
+    if (refusal) throw refusal;
+    return result;
+  }
+
+  function bound(action: BookingRequest['action'], fields: readonly string[]): DeferredActionAnswer {
+    return async (content, session, requestId) => {
+      const key = requestKey(session.id, requestId);
+      // Held before the first await, so a resume sweep leaves the request to this handler.
+      inFlight.add(key);
+      try {
+        return await answerRequest(action, fields, content, session, requestId);
       } catch (error) {
-        if (error instanceof ActionRefusal || error instanceof RetryDeliveryError) throw error;
-        throw new RetryDeliveryError(
-          'Booking preparation or answer delivery could not finish; its outbound request must retry.',
-          { cause: error },
-        );
+        // Before its row exists nothing reached Google, so the failure is answered as any tool's is.
+        if (error instanceof ActionRefusal || (await getBookingRequest(session.id, requestId)) === undefined)
+          throw error;
+        log.warn('Booking request awaits settlement or reporting', { requestId, sessionId: session.id, error });
+        return ANSWER_LATER;
       } finally {
-        const remaining = (inFlight.get(key) ?? 1) - 1;
-        if (remaining === 0) inFlight.delete(key);
-        else inFlight.set(key, remaining);
+        inFlight.delete(key);
       }
     };
   }
 
   /** to: external-email, external-chat, job */
   async function bookingCalendarOf(view: BookingView, offering = false): Promise<CalendarEntry> {
-    const { words } = view.surface;
+    const { ownerLabel } = view.surface.words;
     const id = await view.surface.calendarId();
     if (id === null) {
       if (offering)
         throw forbidden(
-          `No calendar is set for ${words.ownerLabel}'s bookings yet: wake main once with tell_main to ask which calendar to book on, and offer no time until it answers.`,
+          `No calendar is set for ${ownerLabel}'s bookings yet: ${ASK_FOR_CALENDAR}, and offer no time until it answers.`,
         );
       throw forbidden(
-        `No calendar is set for ${words.ownerLabel}'s bookings yet, so nothing was booked: ${words.askForCalendar}, and book once it answers.`,
+        `No calendar is set for ${ownerLabel}'s bookings yet, so nothing was booked: ${ASK_FOR_CALENDAR}, and book when it answers.`,
       );
     }
     const entry = await calendar().getCalendar(id);
     if (entry !== undefined && isBookableCalendar(entry, view.principal.addresses)) return entry;
     throw forbidden(
-      `The calendar main set for ${words.ownerLabel}'s bookings is no longer one the assistant can book on, so ${offering ? 'no time was offered' : 'nothing was booked'}: ${words.askForCalendar}, and ${offering ? 'offer times' : 'book'} once it answers.`,
+      `The calendar main set for ${ownerLabel}'s bookings is no longer one the assistant can book on, so ${offering ? 'no time was offered' : 'nothing was booked'}: ${ASK_FOR_CALENDAR}, and ${offering ? 'offer times' : 'book'} when it answers.`,
     );
   }
 
@@ -501,7 +393,7 @@ export function createBookingTools(deps: BookingToolsDeps) {
     const answer =
       windows.length === 0
         ? [
-            `Nothing in that range is free for ${minutes} minutes${theirs === undefined ? '' : ' and inside their waking day'}: ask for another range, or ${view.surface.words.waitForMain}.`,
+            `Nothing in that range is free for ${minutes} minutes${theirs === undefined ? '' : ' and inside their waking day'}: ask for another range, or ${WAIT_FOR_MAIN}.`,
           ]
         : [
             `Free for ${minutes} minutes: any start that ends by a window's end.`,
@@ -520,32 +412,45 @@ export function createBookingTools(deps: BookingToolsDeps) {
     readonly fresh: readonly string[];
   }
   interface BookingOutcome {
-    readonly kind: 'success' | 'removed' | 'changed' | 'unknown' | 'absent' | 'refused';
+    readonly kind: 'success' | 'removed' | 'changed' | 'unknown' | 'absent';
     readonly result: Record<string, unknown>;
     readonly span: Span;
     readonly conference?: EventConference;
     readonly refusal?: string;
-    readonly refusalCode?: ActionRefusal['code'];
   }
+  /** One Google write; a change or cancellation carries the version its checks read. */
+  type Write =
+    | { readonly action: 'book'; readonly fields: NewEvent }
+    | {
+        readonly action: 'change';
+        readonly fields: EventWrite;
+        readonly tags: Readonly<Record<string, string>> | undefined;
+        readonly etag: string;
+      }
+    | { readonly action: 'cancel'; readonly etag: string };
 
   const list = new Intl.ListFormat('en', { style: 'long', type: 'conjunction' });
   /** to: external-email, external-chat, job */
   const privateAdvice = 'Write it without that detail, or ask main with tell_main.';
+  /** to: external-email, external-chat, job */
+  const removedWords =
+    'That booking is no longer on the calendar; the principal or main may have removed it. Before offering another time, wake main with tell_main.';
   const tagRequest = 'gwsEaRequest';
   const ownerTag = (view: BookingView): string => (view.surface.owner.kind === 'thread' ? 'gwsEaThread' : 'gwsEaChat');
   const spanOf = (row: BookingRequest): Span => ({ start: Date.parse(row.startAt), end: Date.parse(row.endAt) });
+  const markOf = (row: BookingRequest): string => eventIdFor('booking-change', row.sessionId, row.requestId);
 
   function contentOf(row: BookingRequest): Record<string, unknown> {
-    const stored = savedBookingJson(row.requestJson);
-    if (!isRecord(stored)) throw new UnreadableBookingStateError('The saved booking request is unreadable.');
+    const stored: unknown = JSON.parse(row.requestJson);
+    if (!isRecord(stored)) throw new Error('The saved booking request is unreadable.');
     if (row.carriedOver) return stored;
-    if (!isRecord(stored.content)) throw new UnreadableBookingStateError('The saved booking content is unreadable.');
+    if (!isRecord(stored.content)) throw new Error('The saved booking content is unreadable.');
     return stored.content;
   }
 
   function preparedOf(row: BookingRequest): PreparedRequest {
     const content = contentOf(row);
-    const stored = savedBookingJson(row.requestJson);
+    const stored: unknown = JSON.parse(row.requestJson);
     if (row.carriedOver) return { content, invitees: [], previous: spanOf(row), video: false, fresh: [] };
     if (
       !isRecord(stored) ||
@@ -559,7 +464,7 @@ export function createBookingTools(deps: BookingToolsDeps) {
       !stored.fresh.every((v: unknown) => typeof v === 'string') ||
       (stored.title !== undefined && typeof stored.title !== 'string')
     )
-      throw new UnreadableBookingStateError('The saved booking details are unreadable.');
+      throw new Error('The saved booking details are unreadable.');
     return {
       content,
       invitees: stored.invitees,
@@ -571,18 +476,18 @@ export function createBookingTools(deps: BookingToolsDeps) {
   }
 
   function outcomeOf(row: BookingRequest): BookingOutcome {
-    const stored = row.resultJson === null ? undefined : savedBookingJson(row.resultJson);
-    if (!isRecord(stored)) throw new UnreadableBookingStateError('The saved booking result is unreadable.');
+    const stored: unknown = row.resultJson === null ? undefined : JSON.parse(row.resultJson);
+    if (!isRecord(stored)) throw new Error('The saved booking result is unreadable.');
     if (row.carriedOver && !isRecord(stored.result)) return { kind: 'success', result: stored, span: spanOf(row) };
     if (
-      !['success', 'removed', 'changed', 'unknown', 'absent', 'refused'].includes(String(stored.kind)) ||
+      !['success', 'removed', 'changed', 'unknown', 'absent'].includes(String(stored.kind)) ||
       !isRecord(stored.result) ||
       !isRecord(stored.span) ||
       typeof stored.span.start !== 'number' ||
       typeof stored.span.end !== 'number' ||
       (stored.refusal !== undefined && typeof stored.refusal !== 'string')
     )
-      throw new UnreadableBookingStateError('The saved booking outcome is unreadable.');
+      throw new Error('The saved booking outcome is unreadable.');
     const kind = stored.kind as BookingOutcome['kind'];
     const conference =
       isRecord(stored.conference) && ['success', 'pending', 'failure'].includes(String(stored.conference.status))
@@ -597,39 +502,34 @@ export function createBookingTools(deps: BookingToolsDeps) {
       span: { start: stored.span.start, end: stored.span.end },
       ...(conference === undefined ? {} : { conference }),
       ...(stored.refusal === undefined ? {} : { refusal: stored.refusal }),
-      ...(stored.refusalCode === 'forbidden' || stored.refusalCode === 'invalid-args'
-        ? { refusalCode: stored.refusalCode }
-        : {}),
     };
-  }
-
-  /** to: external-email, external-chat, job */
-  function removedWords(view: BookingView): string {
-    return `That booking is no longer on the calendar. The principal or main may have removed it. ${view.surface.words.waitForMain}; book again only once main says to.`;
   }
 
   /** to: external-email, external-chat, job */
   function changedOutcome(row: BookingRequest, event: CalendarEvent, view: BookingView): BookingOutcome {
     const span = eventSpan(event, view.principal.timezone) ?? spanOf(row);
-    const message = `The meeting changed since it was checked. It now stands at ${slotLabel(span, view.principal.timezone)}. Ask main with tell_main before changing it again.`;
+    const when = bothZones(span, view.principal.timezone, timezoneOf(preparedOf(row).content.timezone));
+    const message = `The principal or main changed the meeting since it was checked. It now stands at ${when}. Ask main with tell_main before acting on it again.`;
     return { kind: 'changed', span, result: { booking: row.eventId, message }, refusal: message };
   }
 
-  /** to: external-email, external-chat, job */
-  function removedOutcome(row: BookingRequest, view: BookingView): BookingOutcome {
-    const message = removedWords(view);
-    return { kind: 'removed', span: spanOf(row), result: { booking: row.eventId, message }, refusal: message };
+  function removedOutcome(row: BookingRequest): BookingOutcome {
+    return {
+      kind: 'removed',
+      span: spanOf(row),
+      result: { booking: row.eventId, message: removedWords },
+      refusal: removedWords,
+    };
   }
 
-  /** to: external-email, external-chat, job */
-  function unknownOutcome(row: BookingRequest, view: BookingView): BookingOutcome {
-    const message = `This request to ${row.action} booking ${row.eventId} may or may not have gone through in Google. Main hears the same. ${view.surface.words.waitForMain} before acting on it again.`;
+  function unknownOutcome(row: BookingRequest): BookingOutcome {
+    const subject = { book: 'This booking', change: 'This change', cancel: 'This cancellation' }[row.action];
+    const message = `${subject} may or may not have gone through in Google. Main hears the same; wait for main before acting on it again.`;
     return { kind: 'unknown', span: spanOf(row), result: { booking: row.eventId, message } };
   }
 
-  /** to: external-email, external-chat, job */
-  function absentOutcome(row: BookingRequest, view: BookingView): BookingOutcome {
-    const message = `This booking is not on the calendar. The pending booking request was not carried out. ${view.surface.words.waitForMain} before booking again.`;
+  function absentOutcome(row: BookingRequest): BookingOutcome {
+    const message = 'This booking was not made; main hears the same.';
     return { kind: 'absent', span: spanOf(row), result: { booking: row.eventId, message }, refusal: message };
   }
 
@@ -674,7 +574,10 @@ export function createBookingTools(deps: BookingToolsDeps) {
     else if (outcome.kind === 'changed')
       text = `The meeting${withWhom} changed since it was checked; it now stands at ${lasting}. The pending ${row.action} was not written again. ${ids}`;
     else if (outcome.kind === 'removed')
-      text = `${row.action === 'book' ? 'Booked a meeting' : 'The meeting'}${withWhom} for ${lasting}, then it was removed from the calendar. It was not restored. ${ids}`;
+      text =
+        row.action === 'book'
+          ? `Booked a meeting${withWhom} for ${lasting}, then it was removed from the calendar. It was not restored. ${ids}`
+          : `The meeting${withWhom} at ${lasting} was removed from the calendar while the change was pending. It was not restored. ${ids}`;
     else if (row.action === 'cancel')
       text = `Cancelled the meeting${withWhom} on ${when(outcome.span)}. Google sent them the cancellation. ${ids}`;
     else if (row.action === 'book')
@@ -690,13 +593,8 @@ export function createBookingTools(deps: BookingToolsDeps) {
     if (prepared.title !== undefined)
       text += `\nIts ${row.action === 'change' ? 'new ' : ''}title, as written in the ${row.owner.kind}, is untrusted:\n${untrustedLine(prepared.title, 120, row.owner.kind === 'chat' ? 'chat' : 'gmail')}`;
     const matters = await view.surface.openMatters();
-    const others = [
-      ...new Map(
-        matters.flatMap((matter) => matter.conversations).map((owner) => [`${owner.kind}:${owner.key}`, owner]),
-      ).values(),
-    ];
-    if (others.length > 0)
-      text += `\nIts matter's other conversations, to brief at once: ${list.format(others.map((owner) => `${owner.kind} ${owner.key}`))}.`;
+    if (outcome.kind === 'success' && matters.length === 1 && matters[0].conversations.length > 0)
+      text += `\nIts matter's other conversations, to brief: ${list.format(matters[0].conversations.map((owner) => `${owner.kind} ${owner.key}`))}.`;
     const result = await writeNoteForMain({
       id: `gws-ea-booking-${eventIdFor(row.sessionId, row.requestId)}`,
       timestamp: new Date().toISOString(),
@@ -719,13 +617,9 @@ export function createBookingTools(deps: BookingToolsDeps) {
     outcome: BookingOutcome,
   ): Promise<Record<string, unknown>> {
     const key = requestKey(row.sessionId, row.requestId);
-    if (
-      !view.answerExists &&
-      !ownChangeRequests.has(key) &&
-      (outcome.kind === 'success' || (outcome.kind === 'removed' && row.action === 'book'))
-    ) {
+    if (!ownChanges.has(key) && (outcome.kind === 'success' || (outcome.kind === 'removed' && row.action === 'book'))) {
       recordOwnCalendarChange(row.calendarId, row.eventId);
-      ownChangeRequests.add(key);
+      ownChanges.add(key);
     }
     await getDb().transaction(async () => {
       if (!row.applied) {
@@ -745,8 +639,8 @@ export function createBookingTools(deps: BookingToolsDeps) {
       if ((row.action === 'cancel' && outcome.kind === 'success') || outcome.kind === 'removed')
         await deleteBooking(row.calendarId, row.eventId);
     });
-    if (!row.reported && outcome.kind !== 'refused') await reportRequest(row, view, outcome);
-    if (outcome.refusal !== undefined) throw new ActionRefusal(outcome.refusalCode ?? 'forbidden', outcome.refusal);
+    if (!row.reported) await reportRequest(row, view, outcome);
+    if (outcome.refusal !== undefined) throw forbidden(outcome.refusal);
     return outcome.result;
   }
 
@@ -769,7 +663,7 @@ export function createBookingTools(deps: BookingToolsDeps) {
       throw invalidArgs(`booking must be the id book gave you in ${view.surface.words.ownerLabel}.`);
     if (await hasPendingBookingRequest(view.surface.owner, eventId))
       throw forbidden(
-        'An earlier request for this booking is still waiting for confirmation or reporting. Its first answer will reach you; wait for it before changing the booking again.',
+        'An earlier request for this booking is still being confirmed. Its answer will reach you; wait for it before changing the booking again.',
       );
     const booking = await getBooking(view.surface.owner, eventId);
     if (!booking)
@@ -782,15 +676,15 @@ export function createBookingTools(deps: BookingToolsDeps) {
     }
     if (!event || event.status === 'cancelled') {
       await deleteBooking(booking.calendarId, eventId);
-      throw forbidden(removedWords(view));
+      throw forbidden(removedWords);
     }
     if (!owns(event, view))
       throw forbidden(`That event no longer belongs to ${view.surface.words.ownerLabel}. Ask main with tell_main.`);
     const span = eventSpan(event, view.principal.timezone);
     if (!span) throw forbidden('The booking has no readable time. Ask main with tell_main.');
-    if (event.etag === undefined)
-      throw forbidden('Google supplied no version for this booking. Ask main with tell_main.');
-    return { booking, event, span, invitees: inviteesOn(event, view) };
+    const { etag } = event;
+    if (etag === undefined) throw forbidden("This booking can't be changed safely right now. Ask main with tell_main.");
+    return { booking, event, etag, span, invitees: inviteesOn(event, view) };
   }
 
   /** to: external-email, external-chat, job */
@@ -806,7 +700,8 @@ export function createBookingTools(deps: BookingToolsDeps) {
         texts: [fields.summary, fields.description, fields.location],
         shown: [entry?.summary],
         recipients,
-        ...(await view.surface.privacyFor(recipients, view.writer)),
+        writer: view.surface.writer,
+        ...(await view.surface.privacyFor(recipients)),
       },
       changing ? 'The booking was not changed' : 'The booking was not made',
       privateAdvice,
@@ -847,19 +742,18 @@ export function createBookingTools(deps: BookingToolsDeps) {
     content: Record<string, unknown>,
     view: BookingView,
     eventId: string,
-    calendarId?: string,
-    preparedInvitees?: readonly string[],
+    stored?: { readonly calendarId: string; readonly invitees: readonly string[] },
   ) {
     const entry = await bookingCalendarOf(view);
-    if (calendarId !== undefined && entry.id !== calendarId)
+    if (stored !== undefined && entry.id !== stored.calendarId)
       throw forbidden('The booking calendar changed before this request was confirmed. Ask main with tell_main.');
-    const invitees = await inviteesOf(preparedInvitees ?? content.invitees, view);
+    const invitees = await inviteesOf(stored?.invitees ?? content.invitees, view);
     const fields = bookFields(content, view, invitees, eventId, entry.id);
     const span = { start: Date.parse(fields.start), end: Date.parse(fields.end) };
     await assertAvailable(view, entry.id, [span], new Set([eventId]));
     await checkShareable(view, entry, invitees, fields, false);
     if (fields.conference !== undefined && !allowsMeet(entry))
-      throw forbidden('This calendar does not allow Google Meet links. Give a location instead.');
+      throw forbidden('This calendar does not allow Google Meet links.');
     return { entry, fields, span, invitees };
   }
 
@@ -870,12 +764,11 @@ export function createBookingTools(deps: BookingToolsDeps) {
     event: CalendarEvent,
     calendarId: string,
     requestId: string,
-    target?: Span,
   ) {
     const previous = eventSpan(event, view.principal.timezone);
     if (!previous) throw forbidden('The booking has no readable time. Ask main with tell_main.');
     const start = content.start === undefined ? previous.start : instantOf(content.start, 'start');
-    const span = target ?? {
+    const span = {
       start,
       end:
         start + (content.minutes === undefined ? previous.end - previous.start : minutesOf(content.minutes) * MINUTE),
@@ -902,8 +795,7 @@ export function createBookingTools(deps: BookingToolsDeps) {
       throw forbidden('The booking calendar is no longer bookable. Ask main with tell_main.');
     const invitees = inviteesOn(event, view);
     await checkShareable(view, entry, invitees, fields, true);
-    if (linking && !allowsMeet(entry))
-      throw forbidden('This calendar does not allow Google Meet links. Give a location instead.');
+    if (linking && !allowsMeet(entry)) throw forbidden('This calendar does not allow Google Meet links.');
     return {
       fields,
       span,
@@ -920,19 +812,14 @@ export function createBookingTools(deps: BookingToolsDeps) {
     };
   }
 
-  async function retainAndRefuse(row: BookingRequest, error: ActionRefusal): Promise<never> {
-    const outcome: BookingOutcome = {
-      kind: 'refused',
-      result: {},
-      span: spanOf(row),
-      refusal: error.message,
-      refusalCode: error.code,
-    };
-    await getDb().transaction(async () => {
-      await markBookingRequestApplied(row.sessionId, row.requestId, JSON.stringify(outcome));
-      await markBookingRequestReported(row.sessionId, row.requestId);
-    });
+  async function dropAndRefuse(row: BookingRequest, error: ActionRefusal): Promise<never> {
+    await deleteBookingRequest(row.sessionId, row.requestId);
     throw error;
+  }
+
+  async function connectionDown(row: BookingRequest, view: BookingView, error: unknown): Promise<never> {
+    log.error('A booking found the Google connection down', { requestId: row.requestId, owner: row.owner, err: error });
+    return dropAndRefuse(row, forbidden(`${GOOGLE_CONNECTION_DOWN} ${view.surface.words.connectionStep}`));
   }
 
   async function checkFailure(
@@ -941,10 +828,8 @@ export function createBookingTools(deps: BookingToolsDeps) {
     error: unknown,
     recovering: boolean,
   ): Promise<never> {
-    if (error instanceof ActionRefusal) return retainAndRefuse(row, error);
-    if (recovering && isGoogleConnectionDown(error)) throw error;
-    if (isGoogleConnectionDown(error))
-      return retainAndRefuse(row, forbidden(`${GOOGLE_CONNECTION_DOWN} ${view.surface.words.connectionStep}`));
+    if (error instanceof ActionRefusal) return dropAndRefuse(row, error);
+    if (!recovering && isGoogleConnectionDown(error)) return connectionDown(row, view, error);
     throw error;
   }
 
@@ -953,115 +838,210 @@ export function createBookingTools(deps: BookingToolsDeps) {
     view: BookingView,
     error: unknown,
     recovering: boolean,
-  ): Promise<typeof ANSWER_LATER | Record<string, unknown>> {
+  ): ReturnType<DeferredActionAnswer> {
     if (error instanceof GoogleApiError && error.status === 412) {
       const event = await calendar().getEvent(row.calendarId, row.eventId);
       return event && event.status !== 'cancelled'
         ? finishRequest(row, view, changedOutcome(row, event, view))
         : settleRequest(row, view, false, recovering);
     }
-    if (recovering && isGoogleConnectionDown(error)) throw error;
-    if (isGoogleConnectionDown(error))
-      return retainAndRefuse(row, forbidden(`${GOOGLE_CONNECTION_DOWN} ${view.surface.words.connectionStep}`));
+    if (isGoogleConnectionDown(error)) {
+      if (recovering) throw error;
+      return connectionDown(row, view, error);
+    }
     if (isPermanentGoogleFailure(error))
-      return retainAndRefuse(row, forbidden(`Google refused this booking request: ${error.message}`));
+      return dropAndRefuse(row, forbidden(`Google refused this booking request: ${error.message}`));
     log.warn('Booking write awaits Google confirmation', { requestId: row.requestId, owner: row.owner, error });
     return ANSWER_LATER;
   }
 
-  /* eslint-disable no-catch-all/no-catch-all -- a durable intent stays unanswered on uncertain Google or local failures */
-  async function applyRequest(
+  /** `read-back` when Google's answer leaves the outcome to the event it now holds. */
+  async function send(row: BookingRequest, write: Write): Promise<'sent' | 'read-back'> {
+    if (write.action === 'book')
+      return (await calendar().insertEvent(row.calendarId, row.eventId, write.fields, 'all')) === 'exists'
+        ? 'read-back'
+        : 'sent';
+    if (write.action === 'change') {
+      await calendar().patchEvent(
+        row.calendarId,
+        row.eventId,
+        { ...write.fields, tags: { ...write.tags, [tagRequest]: markOf(row) } },
+        'all',
+        write.etag,
+      );
+      return 'sent';
+    }
+    try {
+      return (await calendar().deleteEvent(row.calendarId, row.eventId, 'all', write.etag)) === 'gone'
+        ? 'read-back'
+        : 'sent';
+    } catch (error) {
+      if (error instanceof GoogleApiError && (error.status === 404 || error.status === 410)) return 'read-back';
+      throw error;
+    }
+  }
+
+  /* eslint-disable no-catch-all/no-catch-all -- writeFailure and checkFailure settle what they know and rethrow the rest */
+  async function write(
     row: BookingRequest,
     view: BookingView,
-    event?: CalendarEvent,
-    recovering = false,
+    next: Write,
+    recovering: boolean,
   ): ReturnType<DeferredActionAnswer> {
-    const content = contentOf(row);
-    if (row.action === 'book') {
-      const { fields } = await checkedBook(content, view, row.eventId, row.calendarId, preparedOf(row).invitees).catch(
-        (error: unknown) => checkFailure(row, view, error, recovering),
-      );
-      try {
-        const result = await calendar().insertEvent(row.calendarId, row.eventId, fields, 'all');
-        if (result === 'exists') return settleRequest(row, view, false, recovering);
-      } catch (error) {
-        return writeFailure(row, view, error, recovering);
-      }
-    } else if (row.action === 'change') {
-      if (!event || row.eventEtag === null) return finishRequest(row, view, unknownOutcome(row, view));
-      const checked = await checkedChange(content, view, event, row.calendarId, row.requestId, spanOf(row)).catch(
-        (error: unknown) => checkFailure(row, view, error, recovering),
-      );
-      try {
-        await calendar().patchEvent(
-          row.calendarId,
-          row.eventId,
-          { ...checked.fields, tags: { ...event.tags, [tagRequest]: row.requestMark ?? '' } },
-          'all',
-          row.eventEtag,
-        );
-      } catch (error) {
-        return writeFailure(row, view, error, recovering);
-      }
-    } else {
-      try {
-        const deleted = await calendar().deleteEvent(row.calendarId, row.eventId, 'all', row.eventEtag ?? undefined);
-        if (deleted === 'gone') return settleRequest(row, view, false, recovering);
-      } catch (error) {
-        if (error instanceof GoogleApiError && (error.status === 404 || error.status === 410))
-          return settleRequest(row, view, false, recovering);
-        return writeFailure(row, view, error, recovering);
-      }
+    let sent: 'sent' | 'read-back';
+    try {
+      sent = await send(row, next);
+    } catch (error) {
+      return writeFailure(row, view, error, recovering);
     }
-    const observed = row.action === 'cancel' ? undefined : await calendar().getEvent(row.calendarId, row.eventId);
-    if (row.action !== 'cancel' && !observed) {
+    if (sent === 'read-back') return settleRequest(row, view, false, recovering);
+    if (row.action === 'cancel') return finishRequest(row, view, successOutcome(row, view));
+    const observed = await calendar().getEvent(row.calendarId, row.eventId);
+    if (!observed) {
       const entry = await calendar().getCalendar(row.calendarId);
-      return finishRequest(
-        row,
-        view,
-        entry && isReadable(entry) ? removedOutcome(row, view) : unknownOutcome(row, view),
-      );
+      return finishRequest(row, view, entry && isReadable(entry) ? removedOutcome(row) : unknownOutcome(row));
     }
-    if (observed?.status === 'cancelled') return finishRequest(row, view, removedOutcome(row, view));
+    if (observed.status === 'cancelled') return finishRequest(row, view, removedOutcome(row));
     return finishRequest(row, view, successOutcome(row, view, observed));
   }
+
+  /** The live checks again, over what Google now holds, for a request it does not show. */
+  async function rechecked(row: BookingRequest, view: BookingView, event: CalendarEvent | undefined): Promise<Write> {
+    const content = contentOf(row);
+    if (row.action === 'book') {
+      const stored = { calendarId: row.calendarId, invitees: preparedOf(row).invitees };
+      return { action: 'book', fields: (await checkedBook(content, view, row.eventId, stored)).fields };
+    }
+    if (event === undefined || row.eventEtag === null)
+      throw new Error('A change or cancellation replays only over the version it was checked against.');
+    if (row.action === 'cancel') return { action: 'cancel', etag: row.eventEtag };
+    const { fields } = await checkedChange(content, view, event, row.calendarId, row.requestId);
+    return { action: 'change', fields, tags: event.tags, etag: row.eventEtag };
+  }
+
+  async function replay(
+    row: BookingRequest,
+    view: BookingView,
+    event: CalendarEvent | undefined,
+    recovering: boolean,
+  ): ReturnType<DeferredActionAnswer> {
+    let next: Write;
+    try {
+      next = await rechecked(row, view, event);
+    } catch (error) {
+      return checkFailure(row, view, error, recovering);
+    }
+    return write(row, view, next, recovering);
+  }
+  /* eslint-enable no-catch-all/no-catch-all */
 
   async function settleRequest(
     row: BookingRequest,
     view: BookingView,
     replayAllowed: boolean,
-    recovering = false,
+    recovering: boolean,
   ): ReturnType<DeferredActionAnswer> {
-    preparedOf(row);
     if (row.applied) return finishRequest(row, view, outcomeOf(row));
     const event = await calendar().getEvent(row.calendarId, row.eventId);
     if (!event) {
       const entry = await calendar().getCalendar(row.calendarId);
-      if (!entry || !isReadable(entry)) return finishRequest(row, view, unknownOutcome(row, view));
+      if (!entry || !isReadable(entry)) return finishRequest(row, view, unknownOutcome(row));
       if (row.action === 'cancel') return finishRequest(row, view, successOutcome(row, view));
-      if (row.action === 'change') return finishRequest(row, view, removedOutcome(row, view));
+      if (row.action === 'change') return finishRequest(row, view, removedOutcome(row));
       return replayAllowed && !row.carriedOver
-        ? applyRequest(row, view, undefined, recovering)
-        : finishRequest(row, view, absentOutcome(row, view));
+        ? replay(row, view, undefined, recovering)
+        : finishRequest(row, view, absentOutcome(row));
     }
     if (event.status === 'cancelled')
-      return finishRequest(row, view, row.action === 'cancel' ? successOutcome(row, view) : removedOutcome(row, view));
-    if (!owns(event, view)) return finishRequest(row, view, unknownOutcome(row, view));
+      return finishRequest(row, view, row.action === 'cancel' ? successOutcome(row, view) : removedOutcome(row));
+    if (!owns(event, view)) return finishRequest(row, view, unknownOutcome(row));
     if (row.action === 'book') return finishRequest(row, view, successOutcome(row, view, event));
-    if (row.action === 'change' && row.requestMark !== null && event.tags?.[tagRequest] === row.requestMark)
+    if (row.action === 'change' && event.tags?.[tagRequest] === markOf(row))
       return finishRequest(row, view, successOutcome(row, view, event));
-    if (row.eventEtag === null) return finishRequest(row, view, unknownOutcome(row, view));
+    if (row.eventEtag === null) return finishRequest(row, view, unknownOutcome(row));
     if (event.etag !== row.eventEtag) return finishRequest(row, view, changedOutcome(row, event, view));
-    if (!replayAllowed || row.carriedOver) return finishRequest(row, view, unknownOutcome(row, view));
-    if (row.action === 'change') {
-      try {
-        await assertAvailable(view, row.calendarId, [spanOf(row)], new Set([row.eventId]));
-      } catch (error) {
-        if (error instanceof ActionRefusal) return retainAndRefuse(row, error);
-        throw error;
-      }
+    if (!replayAllowed || row.carriedOver) return finishRequest(row, view, unknownOutcome(row));
+    return replay(row, view, event, recovering);
+  }
+
+  interface BookingCheck {
+    readonly write: Write;
+    readonly calendarId: string;
+    readonly eventId: string;
+    readonly span: Span;
+    readonly etag: string | null;
+    readonly prepared: PreparedRequest;
+  }
+
+  async function check(
+    action: BookingRequest['action'],
+    content: Record<string, unknown>,
+    requestId: string,
+    view: BookingView,
+  ): Promise<BookingCheck | { readonly unchanged: Record<string, unknown> }> {
+    if (action === 'book') {
+      const eventId = eventIdFor('booking', view.surface.owner.kind, view.surface.owner.key, requestId);
+      const { entry, fields, span, invitees } = await checkedBook(content, view, eventId);
+      return {
+        write: { action, fields },
+        calendarId: entry.id,
+        eventId,
+        span,
+        etag: null,
+        prepared: {
+          content,
+          invitees,
+          previous: span,
+          title: fields.summary,
+          video: fields.conference !== undefined,
+          fresh: [],
+        },
+      };
     }
-    return applyRequest(row, view, event, recovering);
+    const owned = await ownBooking(content, view);
+    const { calendarId, eventId } = owned.booking;
+    if (action === 'cancel') {
+      timezoneOf(content.timezone);
+      return {
+        write: { action, etag: owned.etag },
+        calendarId,
+        eventId,
+        span: owned.span,
+        etag: owned.etag,
+        prepared: {
+          content,
+          invitees: owned.invitees,
+          previous: owned.span,
+          video: owned.event.conference !== undefined,
+          fresh: [],
+        },
+      };
+    }
+    const changed = await checkedChange(content, view, owned.event, calendarId, requestId);
+    if (Object.keys(changed.fields).length === 0)
+      return {
+        unchanged: {
+          booking: eventId,
+          start: iso(changed.span.start),
+          end: iso(changed.span.end),
+          message: `The booking already stands at ${bothZones(changed.span, view.principal.timezone, timezoneOf(content.timezone))}${conferenceWords(owned.event.conference)}: nothing changed.`,
+        },
+      };
+    return {
+      write: { action, fields: changed.fields, tags: owned.event.tags, etag: owned.etag },
+      calendarId,
+      eventId,
+      span: changed.span,
+      etag: owned.etag,
+      prepared: {
+        content,
+        invitees: changed.invitees,
+        previous: changed.previous,
+        title: changed.title,
+        video: changed.video,
+        fresh: changed.fresh,
+      },
+    };
   }
 
   async function request(
@@ -1072,141 +1052,50 @@ export function createBookingTools(deps: BookingToolsDeps) {
     view: BookingView,
   ): ReturnType<DeferredActionAnswer> {
     const fingerprint = eventIdFor(JSON.stringify(content));
-    let row: PendingBookingRequest | undefined;
-    try {
-      row = await getBookingRequest(session.id, requestId);
-    } catch (error) {
-      throw new RetryDeliveryError('Booking intent could not be read; its outbound request must retry.', {
-        cause: error,
-      });
+    const saved = await getBookingRequest(session.id, requestId);
+    if (saved) {
+      if (saved.action !== action || saved.fingerprint !== fingerprint)
+        throw forbidden('This booking request ID was already used for different work.');
+      if (saved.owner.kind !== view.surface.owner.kind || saved.owner.key !== view.surface.owner.key)
+        throw forbidden('This booking request belongs to another conversation.');
+      view.startedAt = saved.createdAt;
+      return settleRequest(saved, view, true, false);
     }
-    let intentAttempted = false;
-    if (row && (row.action !== action || row.fingerprint !== fingerprint))
-      throw forbidden('This booking request ID was already used for different work.');
-    if (row && (row.owner.kind !== view.surface.owner.kind || row.owner.key !== view.surface.owner.key))
-      throw forbidden('This booking request belongs to another conversation.');
+    let intent: Awaited<ReturnType<typeof check>>;
     try {
-      if (row) {
-        view.startedAt = row.createdAt;
-        return row.state === 'answer' ? await terminalResult(row) : await settleRequest(row, view, true);
-      }
-      let prepared: PreparedRequest;
-      let event: CalendarEvent | undefined;
-      let span: Span;
-      let calendarId: string;
-      let eventId: string;
-      if (action === 'book') {
-        eventId = eventIdFor('booking', view.surface.owner.kind, view.surface.owner.key, requestId);
-        const checked = await checkedBook(content, view, eventId);
-        calendarId = checked.entry.id;
-        span = checked.span;
-        prepared = {
-          content,
-          invitees: checked.invitees,
-          previous: span,
-          title: checked.fields.summary,
-          video: checked.fields.conference !== undefined,
-          fresh: [],
-        };
-      } else {
-        const owned = await ownBooking(content, view);
-        event = owned.event;
-        calendarId = owned.booking.calendarId;
-        eventId = owned.booking.eventId;
-        if (action === 'change') {
-          const checked = await checkedChange(content, view, event, calendarId, requestId);
-          span = checked.span;
-          if (Object.keys(checked.fields).length === 0)
-            return {
-              booking: eventId,
-              start: iso(span.start),
-              end: iso(span.end),
-              message: `The booking already stands at ${bothZones(span, view.principal.timezone, timezoneOf(content.timezone))}${conferenceWords(event.conference)}: nothing changed.`,
-            };
-          prepared = {
-            content,
-            invitees: checked.invitees,
-            previous: checked.previous,
-            title: checked.title,
-            video: checked.video,
-            fresh: checked.fresh,
-          };
-        } else {
-          timezoneOf(content.timezone);
-          span = owned.span;
-          prepared = {
-            content,
-            invitees: owned.invitees,
-            previous: span,
-            video: event.conference !== undefined,
-            fresh: [],
-          };
-        }
-      }
-      intentAttempted = true;
-      row = await recordBookingRequest({
-        sessionId: session.id,
-        requestId,
-        action,
-        fingerprint,
-        requestJson: JSON.stringify(prepared),
-        owner: view.surface.owner,
-        calendarId,
-        eventId,
-        startAt: iso(span.start),
-        endAt: iso(span.end),
-        eventEtag: event?.etag ?? null,
-        requestMark: action === 'change' ? eventIdFor('booking-change', session.id, requestId) : null,
-        createdAt: view.startedAt,
-      });
-      return await applyRequest(row, view, event);
+      intent = await check(action, content, requestId, view);
     } catch (error) {
-      if (!row && intentAttempted) {
-        throw new RetryDeliveryError(
-          'Booking intent recording could not be confirmed; its outbound request must retry.',
-          { cause: error },
-        );
-      }
-      if (!row) {
-        if (isGoogleConnectionDown(error))
-          throw forbidden(`${GOOGLE_CONNECTION_DOWN} ${view.surface.words.connectionStep}`);
-        if (isPermanentGoogleFailure(error)) throw forbidden(`Google refused this booking request: ${error.message}`);
-        throw error;
-      }
-      if (error instanceof UnreadableBookingStateError) {
-        const frame = await unreadableFrame(row);
-        throw forbidden(frame.error.message);
-      }
-      let current: PendingBookingRequest | undefined;
-      try {
-        current = await getBookingRequest(row.sessionId, row.requestId);
-      } catch (readError) {
-        log.warn('Booking settlement could not be read; the request stays unanswered', { requestId, error, readError });
-        return ANSWER_LATER;
-      }
-      if (
-        error instanceof ActionRefusal &&
-        (!current ||
-          current.state === 'answer' ||
-          (current.applied && current.reported && outcomeOf(current).refusal === error.message))
-      )
-        throw error;
-      log.warn('Durable booking request awaits settlement or reporting', { requestId, owner: row.owner, error });
-      return ANSWER_LATER;
+      if (isPermanentGoogleFailure(error)) throw forbidden(`Google refused this booking request: ${error.message}`);
+      throw error;
     }
+    if ('unchanged' in intent) return intent.unchanged;
+    const row = await recordBookingRequest({
+      sessionId: session.id,
+      requestId,
+      action,
+      fingerprint,
+      requestJson: JSON.stringify(intent.prepared),
+      owner: view.surface.owner,
+      calendarId: intent.calendarId,
+      eventId: intent.eventId,
+      startAt: iso(intent.span.start),
+      endAt: iso(intent.span.end),
+      eventEtag: intent.etag,
+      createdAt: view.startedAt,
+    });
+    return write(row, view, intent.write, false);
   }
 
+  /* eslint-disable no-catch-all/no-catch-all -- one row's failure is retried next sweep and never stops the others */
   async function resumePending(): Promise<void> {
     if (!(await getDb().hasTable('gws_ea_booking_requests'))) return;
-    const pendingRequests = await listPendingBookingRequests();
-    for (const pending of pendingRequests) {
+    for (const pending of await listPendingBookingRequests()) {
       const key = requestKey(pending.sessionId, pending.requestId);
       if (inFlight.has(key)) continue;
       try {
-        const surface = bookingSurfaceFor(pending.owner);
         const candidate = await getSession(pending.sessionId);
+        const surface = await bookingSurfaceFor(pending.owner, candidate);
         if (
-          pending.state === 'write' &&
           !pending.applied &&
           candidate &&
           !pending.carriedOver &&
@@ -1221,56 +1110,21 @@ export function createBookingTools(deps: BookingToolsDeps) {
             if (!row) return;
             const session = await getSession(row.sessionId);
             const answered = session ? await answeredMessage(session, row.requestId, row.createdAt) : undefined;
-            const view: BookingView = {
-              surface,
-              writer:
-                row.owner.kind === 'thread'
-                  ? 'external-email'
-                  : session?.agent_group_id === (await getExternalChatAgentGroupId())
-                    ? 'external-chat'
-                    : 'job',
-              principal: await principalView(),
-              startedAt: row.createdAt,
-              answerExists: answered !== undefined,
-            };
+            const view: BookingView = { surface, principal: await principalView(), startedAt: row.createdAt };
             const replayAllowed =
-              row.state === 'write' &&
-              !answered &&
-              !row.carriedOver &&
-              session !== undefined &&
-              (await surface.stillServing(session));
+              !answered && !row.carriedOver && session !== undefined && (await surface.stillServing(session));
             let frame: ResponseFrame;
             try {
-              const result =
-                row.state === 'answer'
-                  ? await terminalResult(row)
-                  : await settleRequest(row, view, replayAllowed, true);
+              const result = await settleRequest(row, view, replayAllowed, true);
               if (result === ANSWER_LATER) return;
               frame = { id: row.requestId, ok: true, data: result };
             } catch (error) {
-              if (error instanceof UnreadableBookingStateError) frame = await unreadableFrame(row);
-              else {
-                if (!(error instanceof ActionRefusal)) throw error;
-                const current = await getBookingRequest(row.sessionId, row.requestId);
-                if (
-                  current &&
-                  current.state !== 'answer' &&
-                  !(current.applied && current.reported && outcomeOf(current).refusal === error.message)
-                )
-                  throw error;
-                frame = { id: row.requestId, ok: false, error: { code: error.code, message: error.message } };
-              }
+              if (!(error instanceof ActionRefusal)) throw error;
+              frame = { id: row.requestId, ok: false, error: { code: error.code, message: error.message } };
             }
-            if (session) {
-              if (!answered) await deliverAnswer(session, row.requestId, row.createdAt, frame);
-              else {
-                if (Date.parse(answered.timestamp) - Date.parse(row.createdAt) >= TOOL_WAIT_MS)
-                  await wakeLateAnswer(session, row.requestId, answered.content);
-                clearOutbox(session.agent_group_id, session.id, row.requestId);
-              }
-            }
+            if (session) await deliverAnswer(session, row.requestId, row.createdAt, frame);
             await deleteBookingRequest(row.sessionId, row.requestId);
-            ownChangeRequests.delete(key);
+            ownChanges.delete(key);
           }),
         );
       } catch (error) {
@@ -1282,31 +1136,22 @@ export function createBookingTools(deps: BookingToolsDeps) {
       }
     }
   }
-
   /* eslint-enable no-catch-all/no-catch-all */
+
   return {
     resumePending,
-    completeAnswer,
     freeTime,
-    book: bound('book', (content, session, requestId, view) => request('book', content, session, requestId, view), [
+    book: bound('book', ['start', 'minutes', 'title', 'notes', 'location', 'video_call', 'invitees', 'timezone']),
+    changeBooking: bound('change', [
+      'booking',
       'start',
       'minutes',
       'title',
       'notes',
       'location',
       'video_call',
-      'invitees',
       'timezone',
     ]),
-    changeBooking: bound(
-      'change',
-      (content, session, requestId, view) => request('change', content, session, requestId, view),
-      ['booking', 'start', 'minutes', 'title', 'notes', 'location', 'video_call', 'timezone'],
-    ),
-    cancelBooking: bound(
-      'cancel',
-      (content, session, requestId, view) => request('cancel', content, session, requestId, view),
-      ['booking', 'timezone'],
-    ),
+    cancelBooking: bound('cancel', ['booking', 'timezone']),
   };
 }

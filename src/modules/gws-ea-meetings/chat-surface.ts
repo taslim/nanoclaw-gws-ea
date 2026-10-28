@@ -5,18 +5,17 @@ import { refreshChatMembership } from '../gws-ea-chats/join.js';
 import { listChatMembers } from '../gws-ea-chats/roster.js';
 import { bookingMatters, type BookingSurface } from './booking-surface.js';
 
-export function chatSurface(chatId: string): BookingSurface {
+export function chatSurface(chatId: string, writer: 'external-chat' | 'job'): BookingSurface {
   const owner = { kind: 'chat', key: chatId } as const;
   const knownEmails = async (): Promise<string[]> =>
     (await listChatMembers(chatId)).flatMap((member) => (member.email === null ? [] : [member.email.toLowerCase()]));
   return {
     owner,
+    writer,
     /** to: external-chat, job */
     words: {
       ownerLabel: 'this chat',
       connectionStep: "Wake main with tell_main, saying what you couldn't do in this chat, and wait for main.",
-      waitForMain: 'wake main with tell_main and wait for its answer',
-      askForCalendar: 'wake main with tell_main to ask which calendar to book on',
     },
     calendarId: () => getChatCalendar(chatId),
     async invitationPeople() {
@@ -30,9 +29,9 @@ export function chatSurface(chatId: string): BookingSurface {
         empty: 'No current chat member has an email address to invite. Ask main or the members for their addresses.',
       };
     },
-    async privacyFor(recipients, writer) {
+    async privacyFor(recipients) {
       const known = new Set(await knownEmails());
-      return { writer, ...(recipients.every((address) => known.has(address.toLowerCase())) ? { chatId } : {}) };
+      return recipients.every((address) => known.has(address.toLowerCase())) ? { chatId } : {};
     },
     async beforeWrite() {
       await refreshChatMembership(chatId);

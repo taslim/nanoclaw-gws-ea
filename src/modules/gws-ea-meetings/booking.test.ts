@@ -1,4 +1,3 @@
-import Database from 'better-sqlite3';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const ROOT = vi.hoisted(() => `/tmp/booking-reads-${process.pid}`);
@@ -8,45 +7,41 @@ vi.mock('../../config.js', async (original) => ({
 }));
 vi.mock('../../request-wake.js', () => ({ requestWake: vi.fn(async () => true) }));
 
-import '../gws-ea-inbox/index.js';
-import '../gws-ea-preferences/index.js';
-import { inboundDbPath } from '../../mailbox/sqlite/paths.js';
 import { getDb } from '../../db/connection.js';
-import { ensureContainerConfig, updateContainerConfigScalars } from '../../db/container-configs.js';
 import * as bookingStorage from './bookings-db.js';
 import { createAgentGroup } from '../../db/agent-groups.js';
-import { createMessagingGroup } from '../../db/messaging-groups.js';
 import { resolveSession } from '../../session-manager.js';
 import type { Session } from '../../types.js';
-import { addPrincipalAddress, recordExternalEmailAgentGroupId } from '../gws-ea-profile/db.js';
 import { replacePrincipalCalendars } from '../gws-ea-inbox/db.js';
-import { createThread, recordThreadAddresses } from '../gws-ea-inbox/thread-map.js';
-import { cleanChatDelivery, platformMembers, seedChatDelivery } from '../gws-ea-chats/testing/chat-delivery-fixture.js';
-import { setChatMemberEmail } from '../gws-ea-chats/roster.js';
+import { recordThreadAddresses } from '../gws-ea-inbox/thread-map.js';
+import { platformMembers } from '../gws-ea-chats/testing/chat-delivery-fixture.js';
 import { setChatCalendar } from '../gws-ea-chats/handoffs.js';
 import { placeInMatter, openMatter } from '../gws-ea-matters/db.js';
-import { FakeCalendar } from './testing/fake-calendar.js';
+import type { FakeCalendar } from './testing/fake-calendar.js';
+import {
+  answerData,
+  BOOK,
+  cleanBookingFixture,
+  LATER,
+  mainSession,
+  MIRA,
+  notesIn,
+  PRINCIPAL,
+  seedBookingFixture,
+  TEAM,
+  type BookingTools,
+} from './testing/booking-fixture.js';
 import { setThreadBookingCalendar } from './thread-calendar.js';
-import { createBookingTools } from './booking.js';
-import { bookingsMigration } from './bookings-migration.js';
 import { getBooking, getBookingRequest } from './bookings-db.js';
-import { chatBookingRequestsMigration } from './chat-booking-migration.js';
-import { chatBookingReportsMigration } from './chat-booking-report-migration.js';
 import * as mainNotesModule from '../gws-ea-profile/main-note.js';
 import { addPrivateValue } from '../gws-ea-privacy/db.js';
 import { recordChatClearances } from '../gws-ea-privacy/clearance.js';
 import { GoogleApiError } from '../gws-ea-inbox/gmail-api.js';
 import { GoogleNotSignedInError } from '../gws-ea-google/tokens.js';
 import { log } from '../../log.js';
-import { ANSWER_LATER, answeringAction } from '../../cli/delivery-action.js';
+import { ANSWER_LATER } from '../../cli/delivery-action.js';
 import { bookingSurfaceFor, resolveBookingSurface } from './booking-surface.js';
 
-const PRINCIPAL = 'juno@example.com';
-const ASSISTANT = 'avery@example.com';
-const MIRA = 'mira@example.com';
-const TEAM = 'visits@group.calendar.google.com';
-const BOOK = { start: '2026-10-20T12:00:00Z', minutes: 30, title: 'Venue visit' };
-const LATER = '2026-10-21T12:00:00Z';
 const RANGE = { from: '2026-10-20T09:00:00Z', to: '2026-10-20T17:00:00Z', minutes: 30, timezone: 'Europe/Paris' };
 let calendar: FakeCalendar;
 let thread: string;
@@ -54,60 +49,12 @@ let chat: string;
 let matterId: string;
 let emailSession: Session;
 let chatSession: Session;
-let reads: ReturnType<typeof createBookingTools>;
+let reads: BookingTools;
 
 beforeEach(async () => {
-  vi.useFakeTimers({ now: new Date('2026-10-18T12:00:00Z'), toFake: ['Date'] });
-  const seeded = await seedChatDelivery();
-  for (const migration of [chatBookingRequestsMigration, chatBookingReportsMigration, bookingsMigration]) {
-    if (migration.sqliteOnly) throw new Error('Expected portable migration');
-    await migration.up(getDb());
-  }
-  chatSession = seeded.session;
-  matterId = seeded.matter.id;
-  chat = chatSession.messaging_group_id ?? '';
-  await createAgentGroup({
-    id: 'email',
-    name: 'email',
-    folder: 'email',
-    agent_provider: null,
-    created_at: new Date().toISOString(),
-  });
-  await createMessagingGroup({
-    id: 'mail',
-    channel_type: 'email',
-    platform_id: 'mail',
-    name: 'Mail',
-    is_group: 1,
-    unknown_sender_policy: 'public',
-    created_at: new Date().toISOString(),
-  });
-  await recordExternalEmailAgentGroupId('email');
-  await addPrincipalAddress(PRINCIPAL);
-  await getDb().run('UPDATE gws_ea_profile SET assistant_workspace_email=? WHERE singleton=1', ASSISTANT);
-  await replacePrincipalCalendars([PRINCIPAL], new Date().toISOString());
-  ({ threadKey: thread } = await createThread(null, new Date().toISOString()));
-  await recordThreadAddresses(thread, [PRINCIPAL, ASSISTANT, MIRA], 'message', new Date().toISOString());
-  emailSession = (await resolveSession('email', 'mail', thread, 'per-thread')).session;
-  await setThreadBookingCalendar(thread, TEAM);
-  await setChatCalendar(chat, TEAM);
-  await setChatMemberEmail(chat, 'whatsapp:22', MIRA, 'main');
-  await setChatMemberEmail(chat, 'whatsapp:11', PRINCIPAL, 'main');
-  calendar = new FakeCalendar();
-  calendar.calendars.set(PRINCIPAL, { id: PRINCIPAL, accessRole: 'writer' });
-  calendar.calendars.set(TEAM, {
-    id: TEAM,
-    dataOwner: PRINCIPAL,
-    accessRole: 'writer',
-    conferenceTypes: ['hangoutsMeet'],
-  });
-  reads = createBookingTools({ calendar: () => calendar });
+  ({ calendar, thread, chat, matterId, emailSession, chatSession, tools: reads } = await seedBookingFixture());
 });
-afterEach(async () => {
-  vi.restoreAllMocks();
-  vi.useRealTimers();
-  await cleanChatDelivery(ROOT);
-});
+afterEach(cleanBookingFixture);
 
 it('offers the same windows in text with both-zone labels from either real surface, including the booking calendar', async () => {
   calendar.put({
@@ -227,8 +174,8 @@ it('requires the actual stored serving session and refuses a fabricated thread b
 
 it('keeps owner-bound calendars and linked conversations available after its session disappears', async () => {
   await placeInMatter(matterId, [{ kind: 'thread', reference: thread }]);
-  const email = bookingSurfaceFor({ kind: 'thread', key: thread });
-  const spoken = bookingSurfaceFor({ kind: 'chat', key: chat });
+  const email = await bookingSurfaceFor({ kind: 'thread', key: thread }, undefined);
+  const spoken = await bookingSurfaceFor({ kind: 'chat', key: chat }, undefined);
   await getDb().run('DELETE FROM sessions WHERE id IN (?,?)', emailSession.id, chatSession.id);
   expect(await email.calendarId()).toBe(TEAM);
   expect(await spoken.calendarId()).toBe(TEAM);
@@ -257,13 +204,13 @@ it('uses job privacy and supplies chat clearances only for recipients who are al
     chat,
   );
   const session = (await resolveSession('job', chat, null, 'shared')).session;
-  const { surface, writer } = await resolveBookingSurface(session);
-  expect(writer).toBe('job');
-  expect(await surface.privacyFor([MIRA], writer)).toEqual({ writer: 'job', chatId: chat });
-  expect(await surface.privacyFor([MIRA, 'guest@outside.example'], writer)).toEqual({ writer: 'job' });
+  const surface = await resolveBookingSurface(session);
+  expect(surface.writer).toBe('job');
+  expect(await surface.privacyFor([MIRA])).toEqual({ chatId: chat });
+  expect(await surface.privacyFor([MIRA, 'guest@outside.example'])).toEqual({});
   platformMembers([{ key: 'whatsapp:11', name: 'Juno', isPrincipal: true }]);
   await surface.beforeWrite();
-  expect(await surface.privacyFor([MIRA], writer)).toEqual({ writer: 'job' });
+  expect(await surface.privacyFor([MIRA])).toEqual({});
 });
 
 it('uses each surface’s invitation authority and excludes the principal and assistant from invitations', async () => {
@@ -333,41 +280,6 @@ it('retains a timed-out insert that Google applied and never withdraws its invit
   expect(calendar.writes.map((write) => write.op)).toEqual(['insert']);
 });
 
-async function mainSession(): Promise<Session> {
-  const now = new Date().toISOString();
-  await ensureContainerConfig('main');
-  await updateContainerConfigScalars('main', { timezone: 'Europe/Paris' });
-  await getDb().run("INSERT INTO users(id,kind,display_name,created_at) VALUES('gchat:juno','gchat','Juno',?)", now);
-  await getDb().run("INSERT INTO gws_ea_principal_users(user_id,verified_at) VALUES('gchat:juno',?)", now);
-  await createMessagingGroup({
-    id: 'principal-dm',
-    channel_type: 'gchat',
-    platform_id: 'spaces/juno',
-    name: 'Juno',
-    is_group: 0,
-    unknown_sender_policy: 'strict',
-    created_at: now,
-  });
-  await getDb().run(
-    "INSERT INTO user_dms(user_id,channel_type,messaging_group_id,resolved_at) VALUES('gchat:juno','gchat','principal-dm',?)",
-    now,
-  );
-  return (await resolveSession('main', 'principal-dm', null, 'agent-shared')).session;
-}
-function notesIn(session: Session): string[] {
-  const db = new Database(inboundDbPath(session.agent_group_id, session.id), { readonly: true });
-  try {
-    return (
-      db.prepare("SELECT content FROM messages_in WHERE id LIKE 'gws-ea-booking-%'").all() as { content: string }[]
-    ).map((row) => row.content);
-  } finally {
-    db.close();
-  }
-}
-function answerData(answer: Awaited<ReturnType<typeof reads.book>>): Record<string, unknown> {
-  if (answer === ANSWER_LATER) throw new Error('The booking still awaits settlement');
-  return answer;
-}
 async function booked(session = chatSession): Promise<string> {
   return String(answerData(await reads.book(BOOK, session, 'initial')).booking);
 }
@@ -404,14 +316,6 @@ it.each(['thread', 'chat'] as const)(
     ).toEqual({ matter_id: matterId });
   },
 );
-
-it('does not place a chat booking when its owner has two open matters', async () => {
-  await openMatter({ title: 'Cabin', openLoop: 'Choose dates', links: [{ kind: 'chat', reference: chat }] });
-  const id = await booked();
-  expect(
-    await getDb().get("SELECT matter_id FROM gws_ea_matter_links WHERE kind='event' AND reference=?", `${TEAM}/${id}`),
-  ).toBeUndefined();
-});
 
 it('keeps a reporting failure pending and preserves main’s later matter relocation on retry', async () => {
   const main = await mainSession();
@@ -465,13 +369,6 @@ it.each([false, true])(
       });
     if (taken) {
       await expect(reads.book(BOOK, emailSession, 'not-inserted')).rejects.toThrow('no longer free');
-      expect(await getBookingRequest(emailSession.id, 'not-inserted')).toMatchObject({ applied: true, reported: true });
-      await answeringAction(
-        'book',
-        reads.book,
-        reads.completeAnswer,
-      )({ ...BOOK, requestId: 'not-inserted' }, emailSession);
-      await reads.resumePending();
       expect(await getBookingRequest(emailSession.id, 'not-inserted')).toBeUndefined();
       expect(calendar.live(TEAM)).toEqual([]);
     } else {
@@ -565,7 +462,7 @@ it.each(['patch', 'delete'] as const)('uses If-Match to preserve an edit that ra
   await expect(action(content, chatSession, 'race')).rejects.toThrow(
     'It now stands at Thursday, Oct 22, 2:00–2:30 PM UTC. Ask main',
   );
-  await expect(action(content, chatSession, 'race')).rejects.toThrow('meeting changed since it was checked');
+  await expect(action(content, chatSession, 'race')).rejects.toThrow('changed the meeting since it was checked');
   expect(calendar.event(TEAM, id)?.start?.dateTime).toBe('2026-10-22T14:00:00Z');
   expect(calendar.writes.map((entry) => entry.op)).toEqual(['insert']);
   expect(notesIn(main)[1]).toContain('was not written again');
@@ -595,22 +492,10 @@ it.each(['free', 'taken', 'moved'] as const)('rechecks an unapplied change when 
     expect(calendar.writes.map((entry) => entry.op)).toEqual(['insert', 'patch']);
   } else {
     await expect(reads.changeBooking(content, emailSession, 'unapplied-change')).rejects.toThrow(
-      state === 'taken' ? 'no longer free' : 'meeting changed since it was checked',
+      state === 'taken' ? 'no longer free' : 'changed the meeting since it was checked',
     );
     expect(calendar.writes.map((entry) => entry.op)).toEqual(['insert']);
-    if (state === 'taken') {
-      expect(await getBookingRequest(emailSession.id, 'unapplied-change')).toMatchObject({
-        applied: true,
-        reported: true,
-      });
-      await answeringAction(
-        'change_booking',
-        reads.changeBooking,
-        reads.completeAnswer,
-      )({ ...content, requestId: 'unapplied-change' }, emailSession);
-      await reads.resumePending();
-      expect(await getBookingRequest(emailSession.id, 'unapplied-change')).toBeUndefined();
-    }
+    if (state === 'taken') expect(await getBookingRequest(emailSession.id, 'unapplied-change')).toBeUndefined();
     if (state === 'moved') expect(calendar.event(TEAM, id)?.start?.dateTime).toBe('2026-10-22T14:00:00Z');
   }
 });
@@ -620,7 +505,7 @@ it('refuses new work while the booking has an unreported request, and refuses ch
   calendar.failNext({ op: 'patch', error: new Error('Network timed out') });
   expect(await reads.changeBooking({ booking: id, start: LATER }, chatSession, 'first')).toBe(ANSWER_LATER);
   await expect(reads.changeBooking({ booking: id, title: 'Another plan' }, chatSession, 'second')).rejects.toThrow(
-    'Its first answer will reach you',
+    'Its answer will reach you',
   );
   await expect(
     reads.changeBooking({ booking: id, start: '2026-10-22T12:00:00Z' }, chatSession, 'first'),
@@ -659,42 +544,39 @@ it.each([
   expect(calendar.writes).toEqual([]);
 });
 
-it('retains a certain no-token refusal through publication, cleans its request and gives the surface’s connection step', async () => {
+it('drops a request refused with no Google token after recording, and gives the surface’s connection step', async () => {
   calendar.failNext({ op: 'insert', error: new GoogleNotSignedInError('No token') });
   await expect(reads.book(BOOK, emailSession, 'no-token')).rejects.toThrow("couldn't do on this thread");
-  expect(await getBookingRequest(emailSession.id, 'no-token')).toMatchObject({
-    applied: true,
-    reported: true,
-    resultJson: expect.stringContaining('connection'),
-  });
-  await answeringAction(
-    'book',
-    (_content, target, requestId) => reads.book(BOOK, target, requestId),
-    reads.completeAnswer,
-  )({ ...BOOK, requestId: 'no-token' }, emailSession);
-  await reads.resumePending();
   expect(await getBookingRequest(emailSession.id, 'no-token')).toBeUndefined();
   expect(calendar.writes).toEqual([]);
 });
 
-it.each(['missing-label', 'foreign-label', 'removed'] as const)(
-  'refuses a change when the stored event is %s',
-  async (state) => {
-    const id = await booked(emailSession);
-    const event = calendar.event(TEAM, id);
-    if (!event) throw new Error('No event');
-    calendar.put({
-      ...event,
-      ...(state === 'removed'
-        ? { status: 'cancelled' }
-        : { tags: { gwsEaRole: 'booking', ...(state === 'foreign-label' ? { gwsEaThread: 'another-thread' } : {}) } }),
-    });
-    await expect(reads.changeBooking({ booking: id, start: LATER }, emailSession, 'not-owned')).rejects.toThrow(
-      state === 'removed' ? 'no longer on the calendar' : 'no longer belongs',
-    );
-    expect(calendar.writes.map((entry) => entry.op)).toEqual(['insert']);
-  },
-);
+describe.each(['thread', 'chat'] as const)('a %s booking', (kind) => {
+  it.each(['missing-label', 'foreign-label', 'removed'] as const)(
+    'is neither changed nor cancelled when the stored event is %s',
+    async (state) => {
+      const session = kind === 'thread' ? emailSession : chatSession;
+      const id = await booked(session);
+      const event = calendar.event(TEAM, id);
+      if (!event) throw new Error('No event');
+      const label = kind === 'thread' ? 'gwsEaThread' : 'gwsEaChat';
+      calendar.put({
+        ...event,
+        ...(state === 'removed'
+          ? { status: 'cancelled' }
+          : { tags: { gwsEaRole: 'booking', ...(state === 'foreign-label' ? { [label]: 'another-owner' } : {}) } }),
+      });
+      await expect(reads.changeBooking({ booking: id, start: LATER }, session, 'not-owned')).rejects.toThrow(
+        state === 'removed' ? 'no longer on the calendar' : `That event no longer belongs to this ${kind}.`,
+      );
+      if (state !== 'removed')
+        await expect(reads.cancelBooking({ booking: id }, session, 'not-owned-cancel')).rejects.toThrow(
+          `That event no longer belongs to this ${kind}.`,
+        );
+      expect(calendar.writes.map((entry) => entry.op)).toEqual(['insert']);
+    },
+  );
+});
 
 it.each(['thread', 'chat'] as const)(
   'lets a %s time-only change keep guests main added, while checking new text against every guest',
@@ -736,7 +618,7 @@ it('refuses another cancellation while the first cancellation is applied but its
   expect(await getBooking({ kind: 'chat', key: chat }, id)).toBeUndefined();
   expect(await getBookingRequest(chatSession.id, 'cancel-report')).toMatchObject({ applied: true, reported: false });
   await expect(reads.cancelBooking({ booking: id }, chatSession, 'second-cancel')).rejects.toThrow(
-    'Its first answer will reach you',
+    'Its answer will reach you',
   );
   expect(answerData(await reads.cancelBooking({ booking: id }, chatSession, 'cancel-report')).message).toContain(
     'Cancelled:',
@@ -806,7 +688,7 @@ it('keeps a carried-over unknown result unknown after reporting fails and is ret
   const content = { booking: id, start: LATER };
   expect(await reads.changeBooking(content, chatSession, 'carry-change')).toBe(ANSWER_LATER);
   await getDb().run(
-    'UPDATE gws_ea_booking_requests SET carried_over=1,event_etag=NULL,request_mark=NULL,request_json=? WHERE session_id=? AND request_id=?',
+    'UPDATE gws_ea_booking_requests SET carried_over=1,event_etag=NULL,request_json=? WHERE session_id=? AND request_id=?',
     JSON.stringify(content),
     chatSession.id,
     'carry-change',
@@ -835,12 +717,8 @@ it('reports a carried-over absent book as not carried out and keeps that refusal
     chatSession.id,
     'carry-book',
   );
-  await expect(reads.book(BOOK, chatSession, 'carry-book')).rejects.toThrow(
-    'pending booking request was not carried out',
-  );
-  await expect(reads.book(BOOK, chatSession, 'carry-book')).rejects.toThrow(
-    'pending booking request was not carried out',
-  );
+  await expect(reads.book(BOOK, chatSession, 'carry-book')).rejects.toThrow('This booking was not made');
+  await expect(reads.book(BOOK, chatSession, 'carry-book')).rejects.toThrow('This booking was not made');
   expect(notesIn(main)).toHaveLength(1);
   expect(notesIn(main)[0]).toContain('pending booking request was not carried out');
   expect(notesIn(main)[0]).not.toContain('may or may not');
@@ -869,17 +747,6 @@ it('gives a no-change answer with its current video link without sending an upda
   expect(result.message).toContain('Google Meet link');
   expect(result.message).toContain('nothing changed');
   expect(calendar.writes.map((entry) => entry.op)).toEqual(['insert']);
-  expect(await getBookingRequest(chatSession.id, 'unchanged')).toMatchObject({
-    state: 'answer',
-    applied: true,
-    reported: true,
-  });
-  await answeringAction(
-    'change_booking',
-    reads.changeBooking,
-    reads.completeAnswer,
-  )({ booking: id, start: BOOK.start, requestId: 'unchanged' }, chatSession);
-  await reads.resumePending();
   expect(await getBookingRequest(chatSession.id, 'unchanged')).toBeUndefined();
 });
 
@@ -952,3 +819,65 @@ it.each(['book', 'change'] as const)(
     expect(await getBookingRequest(emailSession.id, 'write-then-unreadable')).toMatchObject({ reported: true });
   },
 );
+
+it.each(['book', 'change'] as const)('checks a live %s once, then writes what it checked', async (action) => {
+  const id = action === 'change' ? await booked(emailSession) : undefined;
+  const listing = vi.spyOn(calendar, 'listEvents');
+  const calendars = vi.spyOn(calendar, 'getCalendar');
+  answerData(
+    id === undefined
+      ? await reads.book(BOOK, emailSession, 'checked-once')
+      : await reads.changeBooking({ booking: id, start: LATER }, emailSession, 'checked-once'),
+  );
+  expect(listing.mock.calls.map(([calendarId]) => calendarId).sort()).toEqual([PRINCIPAL, TEAM].sort());
+  expect(calendars).toHaveBeenCalledTimes(1);
+});
+
+it.each(['overlaps another event', 'has started'] as const)(
+  'replays an unconfirmed title-only change whose own slot now %s',
+  async (state) => {
+    const id = await booked(emailSession);
+    calendar.failNext({ op: 'patch', error: new Error('Network timed out'), afterApplying: false });
+    const content = { booking: id, title: 'New venue title' };
+    expect(await reads.changeBooking(content, emailSession, 'title-replay')).toBe(ANSWER_LATER);
+    if (state === 'has started') vi.setSystemTime(Date.parse(BOOK.start) + 60_000);
+    else
+      calendar.put({
+        calendarId: TEAM,
+        id: 'new-overlap',
+        start: { dateTime: BOOK.start },
+        end: { dateTime: '2026-10-20T13:00:00Z' },
+      });
+    expect(answerData(await reads.changeBooking(content, emailSession, 'title-replay')).message).toContain(
+      'The booking stands at',
+    );
+    expect(calendar.event(TEAM, id)).toMatchObject({ summary: 'New venue title' });
+    expect(calendar.writes.map((entry) => entry.op)).toEqual(['insert', 'patch']);
+  },
+);
+
+it.each([
+  ['a booking in its one open matter', 'booked', true],
+  ['a booking whose chat is in two open matters', 'two matters', false],
+  ['a booking removed before it was confirmed', 'removed', false],
+] as const)('places and names the matter’s other conversations to brief only for %s', async (_name, state, named) => {
+  const main = await mainSession();
+  await placeInMatter(matterId, [{ kind: 'thread', reference: thread }]);
+  if (state === 'two matters')
+    await openMatter({ title: 'Cabin', openLoop: 'Choose dates', links: [{ kind: 'chat', reference: chat }] });
+  if (state === 'removed') {
+    calendar.failNext({ op: 'insert', error: new Error('Network timed out'), afterApplying: true });
+    expect(await reads.book(BOOK, chatSession, 'brief')).toBe(ANSWER_LATER);
+    calendar.put({ ...calendar.live()[0], status: 'cancelled' });
+    await expect(reads.book(BOOK, chatSession, 'brief')).rejects.toThrow('no longer on the calendar');
+  } else answerData(await reads.book(BOOK, chatSession, 'brief'));
+  expect(notesIn(main)).toHaveLength(1);
+  if (named) expect(notesIn(main)[0]).toContain(`Its matter's other conversations, to brief: thread ${thread}.`);
+  else expect(notesIn(main)[0]).not.toContain('other conversations');
+  expect(
+    await getDb().all(
+      "SELECT matter_id FROM gws_ea_matter_links WHERE kind='event' AND reference=?",
+      `${TEAM}/${calendar.events[0].id}`,
+    ),
+  ).toEqual(named ? [{ matter_id: matterId }] : []);
+});

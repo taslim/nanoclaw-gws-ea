@@ -22,23 +22,16 @@ export const bookingsMigration: ModuleMigration = {
         request_json TEXT NOT NULL,
         owner_kind TEXT NOT NULL CHECK(owner_kind IN ('thread','chat')),
         owner_key TEXT NOT NULL,
-        calendar_id TEXT,
-        event_id TEXT,
-        start_at TEXT,
-        end_at TEXT,
+        calendar_id TEXT NOT NULL,
+        event_id TEXT NOT NULL,
+        start_at TEXT NOT NULL,
+        end_at TEXT NOT NULL,
         event_etag TEXT,
-        request_mark TEXT,
         carried_over INTEGER NOT NULL DEFAULT 0 CHECK(carried_over IN (0,1)),
         applied INTEGER NOT NULL DEFAULT 0 CHECK(applied IN (0,1)),
         result_json TEXT,
         reported INTEGER NOT NULL DEFAULT 0 CHECK(reported IN (0,1)),
         created_at TEXT NOT NULL,
-        CHECK (
-          (calendar_id IS NOT NULL AND event_id IS NOT NULL AND start_at IS NOT NULL AND end_at IS NOT NULL)
-          OR (calendar_id IS NULL AND event_id IS NULL AND start_at IS NULL AND end_at IS NULL
-              AND event_etag IS NULL AND request_mark IS NULL AND carried_over=0
-              AND applied=1 AND reported=1 AND result_json IS NOT NULL)
-        ),
         PRIMARY KEY(session_id,request_id)
       );
       CREATE INDEX gws_ea_booking_requests_pending ON gws_ea_booking_requests(created_at,session_id,request_id);
@@ -49,9 +42,9 @@ export const bookingsMigration: ModuleMigration = {
         SELECT 'chat',messaging_group_id,calendar_id,event_id,booked_at FROM gws_ea_chat_bookings;
       INSERT INTO gws_ea_booking_requests(
         session_id,request_id,action,fingerprint,request_json,owner_kind,owner_key,calendar_id,event_id,
-        start_at,end_at,event_etag,request_mark,carried_over,applied,result_json,reported,created_at
+        start_at,end_at,event_etag,carried_over,applied,result_json,reported,created_at
       ) SELECT session_id,request_id,action,fingerprint,request_json,'chat',messaging_group_id,calendar_id,event_id,
-        start_at,end_at,NULL,NULL,1,applied,result_json,reported,created_at
+        start_at,end_at,NULL,1,applied,result_json,reported,created_at
         FROM gws_ea_chat_booking_requests WHERE answered=0;
       DROP TABLE gws_ea_chat_booking_requests;
       DROP TABLE gws_ea_chat_bookings;

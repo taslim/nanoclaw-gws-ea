@@ -22,52 +22,49 @@ export interface InvitationPeople {
 }
 
 export interface BookingPrivacy {
-  readonly writer: BookingWriter;
   readonly chatId?: string;
 }
 
 export interface BookingSurface {
   readonly owner: BookingOwner;
+  /** Who writes, so a refused link is explained in words fitted to them. */
+  readonly writer: BookingWriter;
   readonly words: {
     readonly ownerLabel: string;
     readonly connectionStep: string;
-    readonly waitForMain: string;
-    readonly askForCalendar: string;
   };
   calendarId(): Promise<string | null>;
   invitationPeople(): Promise<InvitationPeople>;
-  privacyFor(recipients: readonly string[], writer: BookingWriter): Promise<BookingPrivacy>;
+  /** A chat's clearances apply only while every recipient is a current member with a known email. */
+  privacyFor(recipients: readonly string[]): Promise<BookingPrivacy>;
   beforeWrite(): Promise<void>;
   inWrite<T>(work: () => Promise<T>): Promise<T>;
   stillServing(session: Session): Promise<boolean>;
   openMatters(): Promise<readonly BookingMatter[]>;
 }
 
-export interface BookingSurfaceContext {
-  readonly surface: BookingSurface;
-  readonly writer: BookingWriter;
+/** A session gone from its chat writes nothing more, so its writer then never reaches a privacy check. */
+async function chatWriter(session: Session | undefined): Promise<'external-chat' | 'job'> {
+  return session?.agent_group_id === (await getExternalChatAgentGroupId()) ? 'external-chat' : 'job';
 }
 
 /** Recovery reads belong to the durable owner even after its calling session has gone. */
-export function bookingSurfaceFor(owner: BookingOwner): BookingSurface {
-  return owner.kind === 'thread' ? threadSurface(owner.key) : chatSurface(owner.key);
+export async function bookingSurfaceFor(owner: BookingOwner, session: Session | undefined): Promise<BookingSurface> {
+  return owner.kind === 'thread' ? threadSurface(owner.key) : chatSurface(owner.key, await chatWriter(session));
 }
 
 /** Session authorization is separate from owner-bound reads needed to finish reporting. */
-export async function resolveBookingSurface(session: Session): Promise<BookingSurfaceContext> {
+export async function resolveBookingSurface(session: Session): Promise<BookingSurface> {
   if (session.agent_group_id === (await getExternalEmailAgentGroupId()) && session.thread_id !== null) {
     const surface = threadSurface(session.thread_id);
     if (!(await surface.stillServing(session)))
       throw forbidden(
         'This conversation is not the active session of an email thread, so it has no times to offer or book.',
       );
-    return { surface, writer: 'external-email' };
+    return surface;
   }
   const chat = await requireServingChat(session);
-  return {
-    surface: chatSurface(chat.messaging_group_id),
-    writer: session.agent_group_id === (await getExternalChatAgentGroupId()) ? 'external-chat' : 'job',
-  };
+  return chatSurface(chat.messaging_group_id, await chatWriter(session));
 }
 
 export async function bookingMatters(ids: readonly string[], owner: BookingOwner): Promise<BookingMatter[]> {

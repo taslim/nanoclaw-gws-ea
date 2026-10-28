@@ -1,5 +1,4 @@
 import fs from 'node:fs';
-import { AsyncLocalStorage } from 'node:async_hooks';
 import path from 'node:path';
 import Database from 'better-sqlite3';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
@@ -11,169 +10,58 @@ vi.mock('../../config.js', async (original) => ({
 }));
 vi.mock('../../request-wake.js', () => ({ requestWake: vi.fn(async () => true) }));
 
-import '../gws-ea-inbox/index.js';
-import '../gws-ea-preferences/index.js';
 import { sessionDir } from '../../session-manager.js';
 import * as sessionMessages from '../../session-manager.js';
-import { inboundDbPath, outboundDbPath } from '../../mailbox/sqlite/paths.js';
+import { outboundDbPath } from '../../mailbox/sqlite/paths.js';
 import { getDb } from '../../db/connection.js';
-import { ensureContainerConfig, updateContainerConfigScalars } from '../../db/container-configs.js';
-import { createAgentGroup } from '../../db/agent-groups.js';
-import { createMessagingGroup } from '../../db/messaging-groups.js';
-import { resolveSession } from '../../session-manager.js';
 import type { Session } from '../../types.js';
-import { addPrincipalAddress, recordExternalEmailAgentGroupId } from '../gws-ea-profile/db.js';
-import { replacePrincipalCalendars } from '../gws-ea-inbox/db.js';
-import { createThread, recordThreadAddresses } from '../gws-ea-inbox/thread-map.js';
-import { cleanChatDelivery, seedChatDelivery } from '../gws-ea-chats/testing/chat-delivery-fixture.js';
-import { setChatMemberEmail } from '../gws-ea-chats/roster.js';
-import { setChatCalendar } from '../gws-ea-chats/handoffs.js';
-import { FakeCalendar } from './testing/fake-calendar.js';
-import { setThreadBookingCalendar } from './thread-calendar.js';
-import { createBookingTools } from './booking.js';
 import * as bookingStorage from './bookings-db.js';
 import * as calendarModule from './calendar-api.js';
 import { getHostStartCallbacks, getHostShutdownCallbacks } from '../../host-lifecycle.js';
 import { requestWake } from '../../request-wake.js';
 import { deliverSessionMessages, registerDeliveryAction } from '../../delivery.js';
 import { unguarded } from '../../guard/index.js';
-import { getDeliveryAttempt } from '../../db/coordination.js';
 import * as calendarNotifications from '../gws-ea-inbox/calendar-notifications.js';
-import type { ResponseFrame } from '../../cli/frame.js';
-import { bookingsMigration } from './bookings-migration.js';
 import { getBooking, getBookingRequest } from './bookings-db.js';
-import { chatBookingRequestsMigration } from './chat-booking-migration.js';
-import { chatBookingReportsMigration } from './chat-booking-report-migration.js';
 import * as mainNotesModule from '../gws-ea-profile/main-note.js';
 import * as profileStorage from '../gws-ea-profile/db.js';
 import { GoogleNotSignedInError } from '../gws-ea-google/tokens.js';
 import { GoogleApiError } from '../gws-ea-inbox/gmail-api.js';
 import { ANSWER_LATER, answeringAction, writeActionResponse } from '../../cli/delivery-action.js';
+import type { FakeCalendar } from './testing/fake-calendar.js';
+import {
+  answerData,
+  BOOK,
+  cleanBookingFixture,
+  deferred,
+  LATER,
+  mainSession,
+  messagesIn,
+  notesIn,
+  responseIn,
+  seedBookingFixture,
+  TEAM,
+  wakeMessages,
+  type BookingTools,
+} from './testing/booking-fixture.js';
 
-const PRINCIPAL = 'juno@example.com';
-const ASSISTANT = 'avery@example.com';
-const MIRA = 'mira@example.com';
-const TEAM = 'visits@group.calendar.google.com';
-const BOOK = { start: '2026-10-20T12:00:00Z', minutes: 30, title: 'Venue visit' };
-const LATER = '2026-10-21T12:00:00Z';
 let calendar: FakeCalendar;
 let thread: string;
 let chat: string;
 let emailSession: Session;
 let chatSession: Session;
-let reads: ReturnType<typeof createBookingTools>;
+let reads: BookingTools;
 
 beforeEach(async () => {
   vi.mocked(requestWake).mockClear();
-  vi.useFakeTimers({ now: new Date('2026-10-18T12:00:00Z'), toFake: ['Date'] });
-  const seeded = await seedChatDelivery();
-  for (const migration of [chatBookingRequestsMigration, chatBookingReportsMigration, bookingsMigration]) {
-    if (migration.sqliteOnly) throw new Error('Expected portable migration');
-    await migration.up(getDb());
-  }
-  chatSession = seeded.session;
-  chat = chatSession.messaging_group_id ?? '';
-  await createAgentGroup({
-    id: 'email',
-    name: 'email',
-    folder: 'email',
-    agent_provider: null,
-    created_at: new Date().toISOString(),
-  });
-  await createMessagingGroup({
-    id: 'mail',
-    channel_type: 'email',
-    platform_id: 'mail',
-    name: 'Mail',
-    is_group: 1,
-    unknown_sender_policy: 'public',
-    created_at: new Date().toISOString(),
-  });
-  await recordExternalEmailAgentGroupId('email');
-  await addPrincipalAddress(PRINCIPAL);
-  await getDb().run('UPDATE gws_ea_profile SET assistant_workspace_email=? WHERE singleton=1', ASSISTANT);
-  await replacePrincipalCalendars([PRINCIPAL], new Date().toISOString());
-  ({ threadKey: thread } = await createThread(null, new Date().toISOString()));
-  await recordThreadAddresses(thread, [PRINCIPAL, ASSISTANT, MIRA], 'message', new Date().toISOString());
-  emailSession = (await resolveSession('email', 'mail', thread, 'per-thread')).session;
-  await setThreadBookingCalendar(thread, TEAM);
-  await setChatCalendar(chat, TEAM);
-  await setChatMemberEmail(chat, 'whatsapp:22', MIRA, 'main');
-  await setChatMemberEmail(chat, 'whatsapp:11', PRINCIPAL, 'main');
-  calendar = new FakeCalendar();
-  calendar.calendars.set(PRINCIPAL, { id: PRINCIPAL, accessRole: 'writer' });
-  calendar.calendars.set(TEAM, {
-    id: TEAM,
-    dataOwner: PRINCIPAL,
-    accessRole: 'writer',
-    conferenceTypes: ['hangoutsMeet'],
-  });
-  reads = createBookingTools({ calendar: () => calendar });
+  ({ calendar, thread, chat, emailSession, chatSession, tools: reads } = await seedBookingFixture());
 });
-afterEach(async () => {
-  vi.restoreAllMocks();
-  vi.useRealTimers();
-  await cleanChatDelivery(ROOT);
-});
+afterEach(cleanBookingFixture);
 
-async function mainSession(): Promise<Session> {
-  const now = new Date().toISOString();
-  await ensureContainerConfig('main');
-  await updateContainerConfigScalars('main', { timezone: 'Europe/Paris' });
-  await getDb().run("INSERT INTO users(id,kind,display_name,created_at) VALUES('gchat:juno','gchat','Juno',?)", now);
-  await getDb().run("INSERT INTO gws_ea_principal_users(user_id,verified_at) VALUES('gchat:juno',?)", now);
-  await createMessagingGroup({
-    id: 'principal-dm',
-    channel_type: 'gchat',
-    platform_id: 'spaces/juno',
-    name: 'Juno',
-    is_group: 0,
-    unknown_sender_policy: 'strict',
-    created_at: now,
-  });
-  await getDb().run(
-    "INSERT INTO user_dms(user_id,channel_type,messaging_group_id,resolved_at) VALUES('gchat:juno','gchat','principal-dm',?)",
-    now,
-  );
-  return (await resolveSession('main', 'principal-dm', null, 'agent-shared')).session;
-}
-function notesIn(session: Session): string[] {
-  const db = new Database(inboundDbPath(session.agent_group_id, session.id), { readonly: true });
-  try {
-    return (
-      db.prepare("SELECT content FROM messages_in WHERE id LIKE 'gws-ea-booking-%'").all() as { content: string }[]
-    ).map((row) => row.content);
-  } finally {
-    db.close();
-  }
-}
-function answerData(answer: Awaited<ReturnType<typeof reads.book>>): Record<string, unknown> {
-  if (answer === ANSWER_LATER) throw new Error('The booking still awaits settlement');
-  return answer;
-}
 async function booked(session = chatSession): Promise<string> {
   return String(answerData(await reads.book(BOOK, session, 'initial')).booking);
 }
 
-interface InboundRow {
-  id: string;
-  kind: string;
-  content: string;
-  seq: number;
-  trigger: number;
-}
-function messagesIn(session: Session): InboundRow[] {
-  const db = new Database(inboundDbPath(session.agent_group_id, session.id), { readonly: true });
-  try {
-    return db.prepare('SELECT id,kind,content,seq,trigger FROM messages_in ORDER BY seq').all() as InboundRow[];
-  } finally {
-    db.close();
-  }
-}
-function responseIn(session: Session, requestId: string): ResponseFrame | undefined {
-  const row = messagesIn(session).find((message) => message.id === `action-resp-${requestId}`);
-  return row ? (JSON.parse(row.content) as { frame: ResponseFrame }).frame : undefined;
-}
 it('resumes a lost thread insert, reports main and answers the waiting tool without another invitation', async () => {
   const main = await mainSession();
   calendar.failNext({ op: 'insert', error: new Error('Google answer lost'), afterApplying: true });
@@ -184,15 +72,6 @@ it('resumes a lost thread insert, reports main and answers the waiting tool with
   expect(calendar.writes.map((write) => write.op)).toEqual(['insert']);
 });
 
-function deferred<T>() {
-  let resolve!: (value: T | PromiseLike<T>) => void;
-  let reject!: (error: Error) => void;
-  const promise = new Promise<T>((yes, no) => {
-    resolve = yes;
-    reject = no;
-  });
-  return { promise, resolve, reject };
-}
 async function holdLiveBooking() {
   const entered = deferred<void>();
   const release = deferred<void>();
@@ -211,19 +90,11 @@ async function holdLiveBooking() {
 function bookingWakes(session: Session) {
   return vi.mocked(requestWake).mock.calls.filter(([target]) => target.id === session.id);
 }
-function wakeMessages(session: Session) {
-  return messagesIn(session)
-    .filter((message) => message.id.startsWith('gws-ea-booking-answer-'))
-    .map((message) => ({
-      ...message,
-      content: message.kind === 'chat' ? (JSON.parse(message.content) as { text: string }).text : message.content,
-    }));
-}
 async function pendingBook(session: Session, id: string, applied = true, start = BOOK.start) {
   calendar.failNext({ op: 'insert', error: new Error('Google answer lost'), afterApplying: applied });
   expect(await reads.book({ ...BOOK, start }, session, id)).toBe(ANSWER_LATER);
   const row = await getBookingRequest(session.id, id);
-  if (!row || row.state !== 'write') throw new Error('No durable booking request');
+  if (!row) throw new Error('No durable booking request');
   return row;
 }
 
@@ -404,7 +275,7 @@ it('keeps a carried-over change without a version unconfirmed through a reportin
   calendar.failNext({ op: 'patch', error: new Error('Lost answer') });
   expect(await reads.changeBooking({ booking: id, start: LATER }, chatSession, 'legacy-change')).toBe(ANSWER_LATER);
   await getDb().run(
-    'UPDATE gws_ea_booking_requests SET carried_over=1,event_etag=NULL,request_mark=NULL,request_json=? WHERE session_id=? AND request_id=?',
+    'UPDATE gws_ea_booking_requests SET carried_over=1,event_etag=NULL,request_json=? WHERE session_id=? AND request_id=?',
     JSON.stringify({ booking: id, start: LATER }),
     chatSession.id,
     'legacy-change',
@@ -472,46 +343,6 @@ it('skips a durable request still owned by its live handler', async () => {
   release.resolve();
   expect(answerData(await live).message).toContain('Booked:');
   expect(calendar.writes.map((write) => write.op)).toEqual(['insert']);
-});
-
-it('keeps a duplicate live handler owned until its last sibling finishes', async () => {
-  await mainSession();
-  const entered = deferred<void>();
-  const release = deferred<void>();
-  const insert = calendar.insertEvent.bind(calendar);
-  vi.spyOn(calendar, 'insertEvent').mockImplementationOnce(async (...args) => {
-    const result = await insert(...args);
-    entered.resolve();
-    await release.promise;
-    return result;
-  });
-  const caller = new AsyncLocalStorage<'first' | 'second'>();
-  const first = caller.run('first', () => reads.book(BOOK, emailSession, 'duplicate-live'));
-  await entered.promise;
-  const second = caller.run('second', () => reads.book(BOOK, emailSession, 'duplicate-live'));
-  const secondEntered = deferred<void>();
-  const secondRelease = deferred<void>();
-  const get = bookingStorage.getBookingRequest;
-  vi.spyOn(bookingStorage, 'getBookingRequest').mockImplementation(async (...args) => {
-    const row = await get(...args);
-    if (caller.getStore() === 'second' && row?.requestId === 'duplicate-live' && row.reported) {
-      secondEntered.resolve();
-      await secondRelease.promise;
-    }
-    return row;
-  });
-  release.resolve();
-  await first;
-  await secondEntered.promise;
-  try {
-    await reads.resumePending();
-    expect(responseIn(emailSession, 'duplicate-live')).toBeUndefined();
-  } finally {
-    secondRelease.resolve();
-  }
-  await second;
-  expect(calendar.writes.map((write) => write.op)).toEqual(['insert']);
-  expect(await getBookingRequest(emailSession.id, 'duplicate-live')).toMatchObject({ applied: true, reported: true });
 });
 
 it('re-reads the request after waiting for the scheduling turn and leaves a completed request alone', async () => {
@@ -587,7 +418,7 @@ it('cleans an answered row and staged files without turning an early answer into
   await mainSession();
   const result = answerData(await reads.book(BOOK, emailSession, 'answered'));
   const row = await getBookingRequest(emailSession.id, 'answered');
-  if (!row || row.state !== 'write') throw new Error('Missing applied booking');
+  if (!row) throw new Error('Missing applied booking');
   expect(calendarNotifications.consumeOwnCalendarChange(TEAM, row.eventId, new Date())).toBe(true);
   await writeActionResponse(emailSession, 'answered', { id: 'answered', ok: true, data: result });
   const outbox = path.join(sessionDir(emailSession.agent_group_id, emailSession.id), 'outbox', 'answered');
@@ -704,7 +535,7 @@ async function wasDelivered(session: Session, requestId: string): Promise<boolea
 function registerBookingDelivery(action: string, answer: typeof reads.book): void {
   registerDeliveryAction(
     action,
-    answeringAction(action, answer, reads.completeAnswer),
+    answeringAction(action, answer),
     unguarded('test exercises booking delivery ownership'),
   );
 }
@@ -728,120 +559,6 @@ it('counts time before handler entry from the original outbound and writes an ag
   });
 });
 
-it.each(['response', 'wake'] as const)(
-  'retains the original late refusal through failed %s publication even after booking becomes possible',
-  async (failure) => {
-    await mainSession();
-    const action = `late-refused-${failure}`;
-    registerBookingDelivery(action, reads.book);
-    await getDb().run('UPDATE gws_ea_threads SET booking_calendar_id=NULL WHERE thread_key=?', thread);
-    enqueueBooking(emailSession, action, action, BOOK);
-    vi.setSystemTime(Date.now() + 120_001);
-    const write = sessionMessages.writeSessionMessage;
-    let failed = false;
-    vi.spyOn(sessionMessages, 'writeSessionMessage').mockImplementation(async (...args) => {
-      if (!failed && args[2].id.startsWith(failure === 'response' ? 'action-resp-' : 'gws-ea-booking-answer-')) {
-        failed = true;
-        throw new Error('Mailbox publication interrupted');
-      }
-      return write(...args);
-    });
-    await deliverSessionMessages(emailSession);
-    expect(await getBookingRequest(emailSession.id, action)).toBeDefined();
-    await setThreadBookingCalendar(thread, TEAM);
-    await reads.resumePending();
-    await deliverSessionMessages(emailSession);
-    expect(responseIn(emailSession, action)).toMatchObject({
-      ok: false,
-      error: { code: 'forbidden', message: expect.stringContaining('No calendar is set') },
-    });
-    expect(wakeMessages(emailSession)).toHaveLength(1);
-    expect(wakeMessages(emailSession)[0].content).toContain('No calendar is set');
-    expect(calendar.writes).toEqual([]);
-    expect(await wasDelivered(emailSession, action)).toBe(true);
-    expect(await getBookingRequest(emailSession.id, action)).toBeUndefined();
-  },
-);
-
-it.each(['response', 'wake'] as const)(
-  'retains an original late no-change answer through failed %s publication',
-  async (failure) => {
-    await mainSession();
-    const id = await booked(emailSession);
-    await writeActionResponse(emailSession, 'initial', {
-      id: 'initial',
-      ok: true,
-      data: { booking: id, message: 'Booked.' },
-    });
-    await reads.resumePending();
-    const action = `late-unchanged-${failure}`;
-    registerBookingDelivery(action, reads.changeBooking);
-    const content = { booking: id, start: BOOK.start };
-    enqueueBooking(emailSession, action, action, content);
-    vi.setSystemTime(Date.now() + 120_001);
-    const write = sessionMessages.writeSessionMessage;
-    let failed = false;
-    vi.spyOn(sessionMessages, 'writeSessionMessage').mockImplementation(async (...args) => {
-      if (!failed && args[2].id.startsWith(failure === 'response' ? 'action-resp-' : 'gws-ea-booking-answer-')) {
-        failed = true;
-        throw new Error('Mailbox publication interrupted');
-      }
-      return write(...args);
-    });
-    await deliverSessionMessages(emailSession);
-    expect(await getBookingRequest(emailSession.id, action)).toBeDefined();
-    const current = calendar.event(TEAM, id);
-    if (!current) throw new Error('Missing booked event');
-    calendar.put({ ...current, start: { dateTime: LATER }, end: { dateTime: '2026-10-21T12:30:00Z' } });
-    await reads.resumePending();
-    await deliverSessionMessages(emailSession);
-    expect(responseIn(emailSession, action)).toMatchObject({
-      ok: true,
-      data: { message: expect.stringContaining('nothing changed') },
-    });
-    expect(wakeMessages(emailSession)).toHaveLength(1);
-    expect(wakeMessages(emailSession)[0].content).toContain('nothing changed');
-    expect(calendar.event(TEAM, id)?.start?.dateTime).toBe(LATER);
-    expect(calendar.writes.map((entry) => entry.op)).toEqual(['insert']);
-    expect(await getBookingRequest(emailSession.id, action)).toBeUndefined();
-  },
-);
-
-it.each(['lookup', 'rolled-back-intent'] as const)(
-  'keeps the original outbound through repeated %s failures, then answers once',
-  async (failure) => {
-    await mainSession();
-    const action = `storage-retry-${failure}`;
-    registerBookingDelivery(action, reads.book);
-    enqueueBooking(emailSession, action, action, BOOK);
-    const originalRecord = bookingStorage.recordBookingRequest;
-    const storage =
-      failure === 'lookup'
-        ? vi.spyOn(bookingStorage, 'getBookingRequest').mockRejectedValue(new Error('Central read unavailable'))
-        : vi.spyOn(bookingStorage, 'recordBookingRequest').mockImplementation(async (request) =>
-            getDb().transaction(async () => {
-              await originalRecord(request);
-              throw new Error('Intent transaction rolled back');
-            }),
-          );
-    for (let attempt = 0; attempt < 4; attempt += 1) {
-      await deliverSessionMessages(emailSession);
-      expect(await wasDelivered(emailSession, action)).toBe(false);
-      expect(await getDeliveryAttempt(action)).toBeUndefined();
-      expect(responseIn(emailSession, action)).toBeUndefined();
-      expect(calendar.writes).toEqual([]);
-    }
-    storage.mockRestore();
-    expect(await getBookingRequest(emailSession.id, action)).toBeUndefined();
-    await deliverSessionMessages(emailSession);
-    expect(await wasDelivered(emailSession, action)).toBe(true);
-    expect(responseIn(emailSession, action)).toMatchObject({ ok: true });
-    await reads.resumePending();
-    expect(await getBookingRequest(emailSession.id, action)).toBeUndefined();
-    expect(calendar.writes.map((entry) => entry.op)).toEqual(['insert']);
-  },
-);
-
 it.each([400, 403, 404])('answers a permanent Google %s refusal before recording an intent', async (status) => {
   const action = `permanent-google-${status}`;
   registerBookingDelivery(action, reads.book);
@@ -861,357 +578,84 @@ it.each([400, 403, 404])('answers a permanent Google %s refusal before recording
 it.each([
   new GoogleApiError(0, 'Connection interrupted'),
   new GoogleApiError(429, 'Too many requests'),
-  new GoogleApiError(503, 'Service unavailable'),
-  ...['rateLimitExceeded', 'userRateLimitExceeded', 'quotaExceeded', 'dailyLimitExceeded'].map(
-    (reason) => new GoogleApiError(403, 'Quota exhausted', { reason }),
-  ),
-])('keeps a transient pre-intent Google failure retryable: %s', async (error) => {
-  const action = 'transient-google';
+  new GoogleApiError(403, 'Quota exhausted', { reason: 'rateLimitExceeded' }),
+  new Error('Calendar list unreadable'),
+])('answers an unexpected failure before its row exists as the tool’s error, once: %s', async (error) => {
+  const action = 'unrecorded-failure';
   registerBookingDelivery(action, reads.book);
   enqueueBooking(emailSession, action, action, BOOK);
-  const get = vi.spyOn(calendar, 'getCalendar').mockRejectedValue(error);
-  for (let attempt = 0; attempt < 4; attempt += 1) {
-    await deliverSessionMessages(emailSession);
-    expect(responseIn(emailSession, action)).toBeUndefined();
-    expect(await wasDelivered(emailSession, action)).toBe(false);
-    expect(await getDeliveryAttempt(action)).toBeUndefined();
-  }
-  get.mockRestore();
+  const read = vi.spyOn(calendar, 'getCalendar').mockRejectedValue(error);
   await deliverSessionMessages(emailSession);
-  expect(responseIn(emailSession, action)).toMatchObject({ ok: true });
-  expect(calendar.writes.map((write) => write.op)).toEqual(['insert']);
-});
-
-it('keeps the certain pre-intent Google refusal through failed late response publication', async () => {
-  await mainSession();
-  const action = 'permanent-google-publication';
-  registerBookingDelivery(action, reads.book);
-  enqueueBooking(emailSession, action, action, BOOK);
-  vi.setSystemTime(Date.now() + 120_001);
-  vi.spyOn(calendar, 'getCalendar').mockRejectedValueOnce(new GoogleApiError(400, 'Calendar request refused'));
-  const write = sessionMessages.writeSessionMessage;
-  vi.spyOn(sessionMessages, 'writeSessionMessage')
-    .mockRejectedValueOnce(new Error('Response publication interrupted'))
-    .mockImplementation(write);
   await deliverSessionMessages(emailSession);
-  expect(await wasDelivered(emailSession, action)).toBe(false);
-  expect(responseIn(emailSession, action)).toBeUndefined();
-  await deliverSessionMessages(emailSession);
-  expect(responseIn(emailSession, action)).toMatchObject({
-    ok: false,
-    error: { code: 'forbidden', message: expect.stringContaining('Google refused this booking request') },
-  });
-  expect(wakeMessages(emailSession)).toHaveLength(1);
-  expect(calendar.writes).toEqual([]);
-});
-
-it.each([
-  ['request syntax', false, 'request_json', '{'],
-  ['request shape', false, 'request_json', '{}'],
-  ['landed request syntax', true, 'request_json', '{'],
-  ['applied result syntax', true, 'result_json', '{'],
-  ['applied result shape', true, 'result_json', '{}'],
-] as const)(
-  'reports unreadable %s to main and answers without another calendar write',
-  async (_, landed, column, json) => {
-    const main = await mainSession();
-    const row = await pendingBook(emailSession, 'unreadable-write', landed);
-    if (column === 'result_json')
-      await getDb().run(
-        'UPDATE gws_ea_booking_requests SET applied=1 WHERE session_id=? AND request_id=?',
-        row.sessionId,
-        row.requestId,
-      );
-    await getDb().run(
-      `UPDATE gws_ea_booking_requests SET ${column}=? WHERE session_id=? AND request_id=?`,
-      json,
-      row.sessionId,
-      row.requestId,
-    );
-    vi.setSystemTime(Date.now() + 120_001);
-    const writesBefore = [...calendar.writes];
-    await reads.resumePending();
-    expect(notesIn(main)).toHaveLength(1);
-    expect(notesIn(main)[0]).toContain('may or may not have gone through in Google');
-    expect(notesIn(main)[0]).toContain(row.eventId);
-    expect(notesIn(main)[0]).toContain(row.owner.key);
-    expect(responseIn(emailSession, row.requestId)).toMatchObject({
-      ok: false,
-      error: { code: 'forbidden', message: expect.stringContaining('saved booking state is unreadable') },
-    });
-    expect(wakeMessages(emailSession)).toHaveLength(1);
-    expect(calendar.writes).toEqual(writesBefore);
-    expect(await getBookingRequest(row.sessionId, row.requestId)).toBeUndefined();
-  },
-);
-
-it('answers a live replay of unreadable pending intent after warning main without replaying its mutation', async () => {
-  const main = await mainSession();
-  const action = 'unreadable-live-intent';
-  registerBookingDelivery(action, reads.book);
-  calendar.failNext({ op: 'insert', error: new Error('Google answer lost') });
-  expect(await reads.book({ ...BOOK, action, requestId: action }, emailSession, action)).toBe(ANSWER_LATER);
-  const row = await getBookingRequest(emailSession.id, action);
-  if (!row || row.state !== 'write') throw new Error('No durable booking request');
-  await getDb().run(
-    'UPDATE gws_ea_booking_requests SET request_json=? WHERE session_id=? AND request_id=?',
-    '{',
-    row.sessionId,
-    row.requestId,
-  );
-  enqueueBooking(emailSession, action, action, BOOK);
-  await deliverSessionMessages(emailSession);
-  expect(notesIn(main)).toHaveLength(1);
-  expect(notesIn(main)[0]).toContain(row.eventId);
-  expect(responseIn(emailSession, action)).toMatchObject({ ok: false, error: { code: 'forbidden' } });
+  expect(responseIn(emailSession, action)).toMatchObject({ ok: false, error: { code: 'handler-error' } });
   expect(await wasDelivered(emailSession, action)).toBe(true);
+  expect(read).toHaveBeenCalledTimes(1);
+  expect(await getBookingRequest(emailSession.id, action)).toBeUndefined();
   expect(calendar.writes).toEqual([]);
-  await reads.resumePending();
-  expect(await getBookingRequest(row.sessionId, row.requestId)).toBeUndefined();
-  expect(notesIn(main)).toHaveLength(1);
 });
 
-it.each([
-  ['live', '{'],
-  ['live', '{}'],
-  ['live', '{"id":"unreadable-answer","ok":true,"data":{}}'],
-  ['recovery', '{'],
-] as const)('settles an unreadable terminal answer during %s: %s', async (mode, json) => {
+it('leaves an unexpected failure after its row exists for resume to settle and answer', async () => {
   const main = await mainSession();
-  const action = 'unreadable-answer';
+  const action = 'recorded-failure';
   registerBookingDelivery(action, reads.book);
   enqueueBooking(emailSession, action, action, BOOK);
-  await getDb().run('UPDATE gws_ea_threads SET booking_calendar_id=NULL WHERE thread_key=?', thread);
-  await expect(reads.book({ ...BOOK, action, requestId: action }, emailSession, action)).rejects.toMatchObject({
-    code: 'forbidden',
-  });
-  await getDb().run(
-    'UPDATE gws_ea_booking_requests SET result_json=? WHERE session_id=? AND request_id=?',
-    json,
-    emailSession.id,
-    action,
-  );
-  await setThreadBookingCalendar(thread, TEAM);
-  vi.setSystemTime(Date.now() + 120_001);
-  if (mode === 'live') await deliverSessionMessages(emailSession);
-  else await reads.resumePending();
-  expect(notesIn(main)).toHaveLength(1);
-  expect(notesIn(main)[0]).toContain('may or may not have gone through in Google');
-  expect(notesIn(main)[0]).toContain(thread);
-  expect(responseIn(emailSession, action)).toMatchObject({
-    ok: false,
-    error: { code: 'forbidden', message: expect.stringContaining('saved booking state is unreadable') },
-  });
+  vi.spyOn(calendar, 'getEvent').mockRejectedValueOnce(new Error('Read-back interrupted'));
+  await deliverSessionMessages(emailSession);
+  expect(await wasDelivered(emailSession, action)).toBe(true);
+  expect(responseIn(emailSession, action)).toBeUndefined();
+  expect(await getBookingRequest(emailSession.id, action)).toMatchObject({ applied: false });
   await reads.resumePending();
-  expect(await getBookingRequest(emailSession.id, action)).toBeUndefined();
+  expect(responseIn(emailSession, action)).toMatchObject({ ok: true, data: { booking: calendar.live()[0].id } });
   expect(notesIn(main)).toHaveLength(1);
-  expect(wakeMessages(emailSession)).toHaveLength(1);
-  expect(calendar.writes).toEqual([]);
+  expect(calendar.writes.map((entry) => entry.op)).toEqual(['insert']);
 });
 
-it.each(['report', 'response'] as const)(
-  'retains unreadable intent and its identity through failed %s publication',
-  async (failure) => {
-    const main = await mainSession();
-    const row = await pendingBook(emailSession, 'unreadable-publication', true);
-    await getDb().run(
-      'UPDATE gws_ea_booking_requests SET request_json=? WHERE session_id=? AND request_id=?',
-      '{',
-      row.sessionId,
-      row.requestId,
-    );
-    if (failure === 'report') {
-      const write = mainNotesModule.writeNoteForMain;
-      vi.spyOn(mainNotesModule, 'writeNoteForMain')
-        .mockRejectedValueOnce(new Error('Main report interrupted'))
-        .mockImplementation(write);
-    } else {
-      const write = sessionMessages.writeSessionMessage;
-      vi.spyOn(sessionMessages, 'writeSessionMessage').mockImplementation(async (...args) => {
-        if (args[2].id === `action-resp-${row.requestId}`) throw new Error('Response interrupted');
-        return write(...args);
-      });
-    }
-    await reads.resumePending();
-    expect(responseIn(emailSession, row.requestId)).toBeUndefined();
-    expect(await getBookingRequest(row.sessionId, row.requestId)).toMatchObject({
-      owner: row.owner,
-      calendarId: row.calendarId,
-      eventId: row.eventId,
-      requestJson: '{',
-    });
-    vi.restoreAllMocks();
-    await reads.resumePending();
-    expect(notesIn(main)).toHaveLength(1);
-    expect(responseIn(emailSession, row.requestId)).toMatchObject({ ok: false, error: { code: 'forbidden' } });
-    expect(await getBookingRequest(row.sessionId, row.requestId)).toBeUndefined();
-    expect(calendar.writes.map((write) => write.op)).toEqual(['insert']);
-  },
-);
-
-it.each(['response', 'wake'] as const)(
-  'keeps a recovered terminal refusal until its %s publishes without retrying Google',
-  async (failure) => {
-    await mainSession();
-    const row = await pendingBook(emailSession, `terminal-recheck-${failure}`, false);
-    calendar.put({
-      calendarId: TEAM,
-      id: 'principal-filled-slot',
-      start: { dateTime: BOOK.start },
-      end: { dateTime: '2026-10-20T12:30:00Z' },
-    });
-    vi.setSystemTime(Date.now() + 120_001);
-    const write = sessionMessages.writeSessionMessage;
-    let failed = false;
-    vi.spyOn(sessionMessages, 'writeSessionMessage').mockImplementation(async (...args) => {
-      if (!failed && args[2].id.startsWith(failure === 'response' ? 'action-resp-' : 'gws-ea-booking-answer-')) {
-        failed = true;
-        throw new Error('Mailbox publication interrupted');
-      }
-      return write(...args);
-    });
-    await reads.resumePending();
-    expect(await getBookingRequest(row.sessionId, row.requestId)).toMatchObject({ applied: true, reported: true });
-    calendar.remove(TEAM, 'principal-filled-slot');
-    await reads.resumePending();
-    expect(responseIn(emailSession, row.requestId)).toMatchObject({
-      ok: false,
-      error: { code: 'forbidden', message: expect.stringContaining('no longer free') },
-    });
-    expect(wakeMessages(emailSession)).toHaveLength(1);
-    expect(calendar.writes).toEqual([]);
-    expect(await getBookingRequest(row.sessionId, row.requestId)).toBeUndefined();
-  },
-);
-
-it('records one own-change notification per request across report retries and one more after a host restart', async () => {
+it('leaves a replay whose preparation fails after its row exists for resume, which settles it once', async () => {
   await mainSession();
-  vi.spyOn(mainNotesModule, 'writeNoteForMain').mockRejectedValue(new Error('Main mailbox unavailable'));
+  const action = 'preparation-unavailable';
+  registerBookingDelivery(action, reads.book);
+  enqueueBooking(emailSession, action, action, BOOK);
+  calendar.failNext({ op: 'insert', error: new Error('Answer lost'), afterApplying: true });
+  expect(await reads.book(BOOK, emailSession, action)).toBe(ANSWER_LATER);
+  vi.spyOn(profileStorage, 'getGwsEaProfile').mockRejectedValueOnce(new Error('Profile store unavailable'));
+  await deliverSessionMessages(emailSession);
+  expect(responseIn(emailSession, action)).toBeUndefined();
+  expect(await getBookingRequest(emailSession.id, action)).toMatchObject({ applied: false });
+  await reads.resumePending();
+  expect(responseIn(emailSession, action)).toMatchObject({ ok: true });
+  expect(calendar.writes.map((entry) => entry.op)).toEqual(['insert']);
+});
+
+it('records the assistant’s own calendar change once while main’s note is retried', async () => {
+  await mainSession();
+  const note = vi.spyOn(mainNotesModule, 'writeNoteForMain').mockRejectedValue(new Error('Main mailbox unavailable'));
   expect(await reads.book(BOOK, emailSession, 'own-change-retry')).toBe(ANSWER_LATER);
   const row = await getBookingRequest(emailSession.id, 'own-change-retry');
-  if (!row || row.state !== 'write') throw new Error('Missing request');
+  if (!row) throw new Error('Missing request');
   expect(calendarNotifications.consumeOwnCalendarChange(TEAM, row.eventId, new Date())).toBe(true);
   await reads.resumePending();
   expect(calendarNotifications.consumeOwnCalendarChange(TEAM, row.eventId, new Date())).toBe(false);
-  const restarted = createBookingTools({ calendar: () => calendar });
-  await restarted.resumePending();
-  expect(calendarNotifications.consumeOwnCalendarChange(TEAM, row.eventId, new Date())).toBe(true);
-  await restarted.resumePending();
-  expect(calendarNotifications.consumeOwnCalendarChange(TEAM, row.eventId, new Date())).toBe(false);
-  vi.mocked(mainNotesModule.writeNoteForMain).mockResolvedValue('written');
-  await restarted.resumePending();
+  note.mockResolvedValue('written');
+  await reads.resumePending();
   expect(responseIn(emailSession, row.requestId)).toMatchObject({ ok: true });
   expect(calendarNotifications.consumeOwnCalendarChange(TEAM, row.eventId, new Date())).toBe(false);
   expect(await getBookingRequest(row.sessionId, row.requestId)).toBeUndefined();
 });
 
-it('retains a certain Google refusal through failed response publication and never reissues its mutation', async () => {
+it('drops a replayed write Google refuses for good, answering the refusal without writing again', async () => {
   await mainSession();
   const row = await pendingBook(emailSession, 'google-refused-recovery', false);
   calendar.failNext({ op: 'insert', error: new GoogleApiError(400, 'Invalid calendar operation') });
   const insert = vi.spyOn(calendar, 'insertEvent');
-  const write = sessionMessages.writeSessionMessage;
-  vi.spyOn(sessionMessages, 'writeSessionMessage')
-    .mockImplementationOnce(async () => {
-      throw new Error('Mailbox unavailable');
-    })
-    .mockImplementation(write);
-  await reads.resumePending();
-  expect(await getBookingRequest(row.sessionId, row.requestId)).toMatchObject({
-    state: 'write',
-    applied: true,
-    reported: true,
-  });
-  expect(responseIn(emailSession, row.requestId)).toBeUndefined();
   await reads.resumePending();
   expect(responseIn(emailSession, row.requestId)).toMatchObject({
     ok: false,
     error: { code: 'forbidden', message: expect.stringContaining('Google refused this booking request') },
   });
+  expect(await getBookingRequest(row.sessionId, row.requestId)).toBeUndefined();
+  await reads.resumePending();
   expect(insert).toHaveBeenCalledTimes(1);
   expect(calendar.writes).toEqual([]);
-  expect(await getBookingRequest(row.sessionId, row.requestId)).toBeUndefined();
-});
-
-it('settles an intent whose commit succeeded but whose returned result was lost, without answering a false failure', async () => {
-  await mainSession();
-  const action = 'intent-commit-response-lost';
-  registerBookingDelivery(action, reads.book);
-  enqueueBooking(emailSession, action, action, BOOK);
-  const record = bookingStorage.recordBookingRequest;
-  vi.spyOn(bookingStorage, 'recordBookingRequest').mockImplementationOnce(async (request) => {
-    await record(request);
-    throw new Error('Commit response lost');
-  });
-  await deliverSessionMessages(emailSession);
-  expect(await wasDelivered(emailSession, action)).toBe(false);
-  expect(responseIn(emailSession, action)).toBeUndefined();
-  expect(await getBookingRequest(emailSession.id, action)).toMatchObject({ state: 'write', applied: false });
-  await deliverSessionMessages(emailSession);
-  expect(responseIn(emailSession, action)).toMatchObject({ ok: true });
-  expect(await wasDelivered(emailSession, action)).toBe(true);
-  expect(calendar.writes.map((entry) => entry.op)).toEqual(['insert']);
-});
-
-it.each(['refusal', 'no-change'] as const)(
-  'preserves an early %s when response publication fails before circumstances change',
-  async (outcome) => {
-    await mainSession();
-    const id = outcome === 'no-change' ? await booked(emailSession) : undefined;
-    if (outcome === 'refusal')
-      await getDb().run('UPDATE gws_ea_threads SET booking_calendar_id=NULL WHERE thread_key=?', thread);
-    const action = `early-${outcome}-delivery`;
-    const content = id === undefined ? BOOK : { booking: id, start: BOOK.start };
-    registerBookingDelivery(action, id === undefined ? reads.book : reads.changeBooking);
-    enqueueBooking(emailSession, action, action, content);
-    const write = sessionMessages.writeSessionMessage;
-    vi.spyOn(sessionMessages, 'writeSessionMessage')
-      .mockImplementationOnce(async () => {
-        throw new Error('Early response interrupted');
-      })
-      .mockImplementation(write);
-    await deliverSessionMessages(emailSession);
-    expect(await wasDelivered(emailSession, action)).toBe(false);
-    expect(responseIn(emailSession, action)).toBeUndefined();
-    if (id === undefined) await setThreadBookingCalendar(thread, TEAM);
-    else {
-      const event = calendar.event(TEAM, id);
-      if (!event) throw new Error('Missing booked event');
-      calendar.put({ ...event, start: { dateTime: LATER }, end: { dateTime: '2026-10-21T12:30:00Z' } });
-    }
-    await deliverSessionMessages(emailSession);
-    expect(responseIn(emailSession, action)).toMatchObject(
-      outcome === 'refusal'
-        ? { ok: false, error: { code: 'forbidden', message: expect.stringContaining('No calendar is set') } }
-        : { ok: true, data: { message: expect.stringContaining('nothing changed') } },
-    );
-    expect(calendar.writes.map((entry) => entry.op)).toEqual(id === undefined ? [] : ['insert']);
-    expect(wakeMessages(emailSession)).toEqual([]);
-    expect(await wasDelivered(emailSession, action)).toBe(true);
-    await reads.resumePending();
-    expect(await getBookingRequest(emailSession.id, action)).toBeUndefined();
-  },
-);
-
-it('keeps an interrupted write unanswered when preparation storage is unavailable, then settles it once', async () => {
-  await mainSession();
-  const action = 'preparation-storage-unavailable';
-  registerBookingDelivery(action, reads.book);
-  enqueueBooking(emailSession, action, action, BOOK);
-  calendar.failNext({ op: 'insert', error: new Error('Initial delivery interrupted'), afterApplying: true });
-  await answeringAction(action, reads.book, reads.completeAnswer)({ ...BOOK, action, requestId: action }, emailSession);
-  const profile = vi
-    .spyOn(profileStorage, 'getGwsEaProfile')
-    .mockRejectedValueOnce(new Error('Profile store unavailable'));
-  await deliverSessionMessages(emailSession);
-  expect(await wasDelivered(emailSession, action)).toBe(false);
-  expect(responseIn(emailSession, action)).toBeUndefined();
-  expect(await getBookingRequest(emailSession.id, action)).toMatchObject({ state: 'write', applied: false });
-  profile.mockRestore();
-  await deliverSessionMessages(emailSession);
-  expect(responseIn(emailSession, action)).toMatchObject({ ok: true });
-  expect(await wasDelivered(emailSession, action)).toBe(true);
-  expect(calendar.writes.map((entry) => entry.op)).toEqual(['insert']);
 });
 
 it('owns a live replay before awaiting its original mailbox timestamp so recovery cannot settle it concurrently', async () => {

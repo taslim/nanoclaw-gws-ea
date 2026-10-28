@@ -15,7 +15,6 @@ import {
   markBookingRequestReported,
   recordBooking,
   recordBookingRequest,
-  recordBookingAnswer,
   type NewBookingRequest,
 } from './bookings-db.js';
 import { bookingsMigration } from './bookings-migration.js';
@@ -38,7 +37,6 @@ function request(overrides: Partial<NewBookingRequest> = {}): NewBookingRequest 
     startAt: '2026-10-20T12:00:00.000Z',
     endAt: '2026-10-20T12:30:00.000Z',
     eventEtag: '"version-before-change"',
-    requestMark: 'mark-venue-change',
     createdAt: AT,
     ...overrides,
   };
@@ -76,15 +74,8 @@ it('records both owner kinds, finds their own events and finds an owner with any
 
 it('keeps the first request for a matching fingerprint and refuses different work under the same id', async () => {
   const first = await recordBookingRequest(request());
-  expect(first).toEqual({
-    ...request(),
-    state: 'write',
-    carriedOver: false,
-    applied: false,
-    resultJson: null,
-    reported: false,
-  });
-  const replay = await recordBookingRequest(request({ eventEtag: '"newer-version"', requestMark: 'newer-mark' }));
+  expect(first).toEqual({ ...request(), carriedOver: false, applied: false, resultJson: null, reported: false });
+  const replay = await recordBookingRequest(request({ eventEtag: '"newer-version"' }));
   expect(replay).toEqual(first);
   await expect(recordBookingRequest(request({ fingerprint: 'different-work' }))).rejects.toThrow(/different/u);
   expect(await getBookingRequest('session-juno', 'change-venue')).toEqual(first);
@@ -127,48 +118,4 @@ it('lists unfinished requests oldest first across owners and keeps them after th
 
   expect((await listPendingBookingRequests()).map((row) => row.requestId)).toEqual(['older', 'newer']);
   expect(await getBookingRequest('session-juno', 'older')).toMatchObject({ owner: CHAT });
-});
-
-it('stores a terminal answer without mutation identifiers, keeps its first response and releases it after delivery', async () => {
-  const answer = {
-    sessionId: 'session-juno',
-    requestId: 'refused-without-calendar',
-    action: 'book' as const,
-    fingerprint: 'refused-fingerprint',
-    requestJson: '{"title":"Venue visit"}',
-    owner: THREAD,
-    createdAt: AT,
-    answerJson: JSON.stringify({
-      id: 'refused-without-calendar',
-      ok: false,
-      error: { code: 'forbidden', message: 'Ask main which calendar to use.' },
-    }),
-  };
-  const saved = await recordBookingAnswer(answer);
-  expect(saved).toEqual({ ...answer, state: 'answer', applied: true, reported: true });
-  expect(await recordBookingAnswer({ ...answer, answerJson: '{"replacement":true}' })).toEqual(saved);
-  await expect(recordBookingAnswer({ ...answer, fingerprint: 'different' })).rejects.toThrow('different work');
-  expect(await listPendingBookingRequests()).toEqual([saved]);
-  expect(
-    await getDb().get(
-      'SELECT calendar_id,event_id,start_at,end_at,event_etag,request_mark FROM gws_ea_booking_requests WHERE request_id=?',
-      answer.requestId,
-    ),
-  ).toEqual({ calendar_id: null, event_id: null, start_at: null, end_at: null, event_etag: null, request_mark: null });
-  await expect(
-    getDb().run('UPDATE gws_ea_booking_requests SET applied=0 WHERE request_id=?', answer.requestId),
-  ).rejects.toThrow(/CHECK/u);
-  await expect(
-    getDb().run('UPDATE gws_ea_booking_requests SET event_id=? WHERE request_id=?', 'invented-event', answer.requestId),
-  ).rejects.toThrow(/CHECK/u);
-  await deleteBookingRequest(answer.sessionId, answer.requestId);
-  expect(await listPendingBookingRequests()).toEqual([]);
-});
-
-it('rejects partially specified mutation intents rather than treating them as terminal answers', async () => {
-  await recordBookingRequest(request());
-  await expect(
-    getDb().run('UPDATE gws_ea_booking_requests SET calendar_id=NULL WHERE request_id=?', 'change-venue'),
-  ).rejects.toThrow(/CHECK/u);
-  expect(await getBookingRequest('session-juno', 'change-venue')).toMatchObject({ state: 'write', applied: false });
 });
