@@ -66,7 +66,6 @@ vi.mock('../gws-ea-workspace/probe.js', async (importOriginal) => ({
 import type { ResponseFrame } from '../../cli/frame.js';
 import { getDb } from '../../db/connection.js';
 import { ensureContainerConfig, updateContainerConfigScalars } from '../../db/container-configs.js';
-import { sqliteRaw } from '../../db/drivers/sqlite.js';
 import { closeDb, createAgentGroup, createMessagingGroup, initTestDb, runMigrations } from '../../db/index.js';
 import { isContainerRunning, killContainer } from '../../container-runner.js';
 import { getDeliveryAction } from '../../delivery.js';
@@ -97,11 +96,14 @@ import { replacePrincipalCalendars } from '../gws-ea-inbox/db.js';
 import { createThread, recordThreadAddresses, threadAddresses } from '../gws-ea-inbox/thread-map.js';
 import { closeMatter, getMatter, openMatter } from '../gws-ea-matters/db.js';
 import '../gws-ea-matters/index.js';
+import '../gws-ea-chats/index.js';
 import './index.js';
 import { FITS } from './slots.js';
 import { FakeCalendar, type StoredEvent } from './testing/fake-calendar.js';
 import { FakeDrive } from '../gws-ea-workspace/testing/fake-drive.js';
 import { setThreadBookingCalendar } from './thread-calendar.js';
+import { createBookingTools } from './booking.js';
+import { getBooking, getBookingRequest } from './bookings-db.js';
 
 const JUNO = 'juno@northwind.example';
 const PRINCIPAL = 'pat@northwind.example';
@@ -197,18 +199,17 @@ function gone(label: string): string {
   return `${label}: no longer free. Call free_time for times to offer instead.`;
 }
 
-/** What `free_time` adds while main has set no calendar for the thread's bookings. */
+/** What `free_time` answers while main has set no calendar for the thread's bookings. */
 const NO_CALENDAR_YET =
   "No calendar is set for this thread's bookings yet: wake main once with tell_main to ask which calendar to book on, and offer no time until it answers.";
 /** What `book` answers while main has set no calendar for the thread's bookings. */
 const BOOKS_NOTHING_YET =
-  "No calendar is set for this thread's bookings yet, so nothing was booked: wake main with tell_main to ask which calendar to book on, and book once it answers.";
+  "No calendar is set for this thread's bookings yet, so nothing was booked: wake main once with tell_main to ask which calendar to book on, and book when it answers.";
 /** What `book` answers when the calendar main set can no longer be booked on. */
 const CANNOT_BOOK_THERE =
-  "The calendar main set for this thread's bookings is no longer one the assistant can book on, so nothing was booked: wake main with tell_main to ask which calendar to book on, and book once it answers.";
+  "The calendar main set for this thread's bookings is no longer one the assistant can book on, so nothing was booked: wake main once with tell_main to ask which calendar to book on, and book when it answers.";
 /** What a change or cancellation answers when Google no longer shows the booking's calendar's events. */
-const BOOKING_OUT_OF_SIGHT =
-  'The assistant can no longer see the events on the calendar this booking is on, so it can neither change nor cancel it: wake main with tell_main and wait for its answer.';
+const BOOKING_OUT_OF_SIGHT = 'The booking calendar is no longer readable. Ask main with tell_main.';
 
 /** The principal on an event of theirs, as Google lists the organizer of an event they made themselves. */
 const PRINCIPAL_GUEST = { email: PRINCIPAL, responseStatus: 'accepted', organizer: true };
@@ -346,10 +347,10 @@ afterEach(async () => {
 });
 
 describe('the scheduling tools', () => {
-  it('answer only external-email, from an email thread’s own session', async () => {
+  it('refuses main and external-email sessions without a real thread', async () => {
     const fromMain = await send(main, 'free_time', { ...RANGE, minutes: 30 });
     expect(fromMain.ok).toBe(false);
-    expect(refusal(fromMain)).toMatch(/Only external-email/u);
+    expect(refusal(fromMain)).toContain('not the serving session');
 
     const { session: noThread } = await resolveSession('ag-external', 'mg-inbox', 'mail-not-a-thread', 'per-thread');
     const { session: signIn } = await resolveSystemSession('ag-external', 'system:browser-sign-in:claim');
@@ -359,8 +360,8 @@ describe('the scheduling tools', () => {
         ['change_booking', { booking: 'foreign', title: 'Changed' }],
         ['cancel_booking', { booking: 'foreign' }],
       ] as const) {
-        expect(refusal(await send(caller, action, fields))).toBe(
-          'This conversation is not an email thread, so it has no times to offer or book.',
+        expect(refusal(await send(caller, action, fields))).toMatch(
+          /not the (?:active session of an email thread|serving session)/u,
         );
       }
     }
@@ -651,28 +652,18 @@ describe('book', () => {
     expect(event.conference?.status).toBe('success');
     expect(booked.booking).toBe(event.id);
     expect(booked.message).toBe(
-      `Booked: Tuesday, Oct 6, 10:00–10:30 AM BST. Google sends ${REMY} the invitation from the principal's calendar, ` +
-        `with a Google Meet link (${String(event.conference?.uri)}). The host tells main of it, so no wake is needed; still leave your account with tell_main. ` +
-        `To change or cancel it, give booking ${event.id}.`,
+      `Booked: Tuesday, Oct 6, 10:00–10:30 AM BST, with a Google Meet link (${String(event.conference?.uri)}). Google sends the invitation; main hears. To change or cancel it, give booking ${event.id}.`,
     );
     expect(calendar.writes.find((write) => write.eventId === event.id)?.sendUpdates).toBe('all');
 
     const [fact] = mainHeard();
-    expect(
-      fact.startsWith(
-        `Booked a meeting with ${REMY} for Tuesday, Oct 6, 11:00–11:30 AM CEST (30 minutes), by video call. ` +
-          'Google sent them the invitation. Its title, as written in the thread:\n<<<EXTERNAL_UNTRUSTED_CONTENT',
-      ),
-      fact,
-    ).toBe(true);
-    // The title external-email wrote reaches main only inside the untrusted frame; the ids main acts on come last.
-    expect(fact.indexOf('Coffee: Pat and Remy')).toBeGreaterThan(fact.indexOf('<<<EXTERNAL_UNTRUSTED_CONTENT'));
-    expect(fact).toMatch(
-      new RegExp(
-        `\\n<<<END_EXTERNAL_UNTRUSTED_CONTENT id="[0-9a-f]+">>>\\n\\(thread ${threadA}; event ${event.id} on calendar ${PRINCIPAL}\\)$`,
-        'u',
-      ),
+    expect(fact).toContain(
+      `Booked a meeting with ${REMY} for Tuesday, Oct 6, 11:00–11:30 AM CEST (30 minutes), by video call. Google sent them the invitation.`,
     );
+    expect(fact).toContain(`(thread ${threadA}; event ${event.id} on calendar ${PRINCIPAL})`);
+    expect(fact).toContain('Its title, as written in the thread, is untrusted:\n<<<EXTERNAL_UNTRUSTED_CONTENT');
+    expect(fact.indexOf('Coffee: Pat and Remy')).toBeGreaterThan(fact.indexOf('<<<EXTERNAL_UNTRUSTED_CONTENT'));
+    expect(fact).toMatch(/\n<<<END_EXTERNAL_UNTRUSTED_CONTENT id="[0-9a-f]+">>>$/u);
   });
 
   it('answers with the time ready to write in both zones, and refuses notes whose weekday and date disagree, writing nothing', async () => {
@@ -706,12 +697,10 @@ describe('book', () => {
     data(await send(sessionA, 'book', { start: TUESDAY_10AM, minutes: 30, title: 'Catch-up' }));
     expect(invited(bookings()[0])?.sort()).toEqual([JANE, REMY]);
     // Without a Meet link, main hears of no video call.
-    expect(mainHeard()[0]).toMatch(
-      new RegExp(
-        `^Booked a meeting with ${JANE} and ${REMY} for Tuesday, Oct 6, 11:00–11:30 AM CEST \\(30 minutes\\)\\. Google sent them the invitation\\. Its title`,
-        'u',
-      ),
+    expect(mainHeard()[0]).toContain(
+      `Booked a meeting with ${JANE} and ${REMY} for Tuesday, Oct 6, 11:00–11:30 AM CEST (30 minutes). Google sent them the invitation.`,
     );
+    expect(mainHeard()[0]).not.toContain('by video call');
   });
 
   it('invites, when it names nobody, only the people in the conversation, not someone a sender only wrote about', async () => {
@@ -796,7 +785,7 @@ describe('book', () => {
         }),
       );
       expect(answer).toMatch(/the principal's private address\./u);
-      expect(answer).toMatch(/If it is the calendar's name, wake main with tell_main and wait for its answer\.$/u);
+      expect(answer).toMatch(/Write it without that detail, or ask main with tell_main\.$/u);
       expect(answer).not.toContain('Rosewood');
       expect(calendar.writes).toEqual([]);
     },
@@ -824,40 +813,37 @@ describe('book', () => {
     expect(calendar.writes).toEqual([]);
   });
 
-  it('leaves no half-made event when Google fails, and the agent sees the failure', async () => {
-    calendar.failNext({ op: 'insert', error: new GoogleApiError(503, 'Backend Error'), afterApplying: true });
-
-    const frame = await send(sessionA, 'book', {
-      start: TUESDAY_10AM,
-      minutes: 30,
-      title: 'Catch-up',
-      invitees: [REMY],
-    });
-    expect(frame).toMatchObject({ ok: false, error: { code: 'handler-error' } });
-    expect(refusal(frame)).toMatch(/Backend Error/u);
-    expect(bookings()).toEqual([]);
-    expect(await getDb().get('SELECT 1 FROM gws_ea_thread_bookings')).toBeUndefined();
+  it('keeps a booking pending when its ownership record cannot be written, then recovers without withdrawing or inviting twice', async () => {
+    await getDb().exec(`CREATE TEMP TRIGGER no_booking_record BEFORE INSERT ON gws_ea_bookings
+      BEGIN SELECT RAISE(ABORT, 'database is locked'); END`);
+    const requestId = 'ownership-write-failed';
+    const fields = { start: TUESDAY_10AM, minutes: 30, title: 'Catch-up', invitees: [REMY] };
+    const handler = getDeliveryAction('book');
+    if (!handler) throw new Error('No booking action');
+    await handler({ ...fields, action: 'book', requestId }, sessionA);
+    const [event] = bookings();
+    expect(event).toBeDefined();
+    expect(calendar.writes.map((write) => write.op)).toEqual(['insert']);
+    expect(await getBooking({ kind: 'thread', key: threadA }, event.id)).toBeUndefined();
+    expect(await getBookingRequest(sessionA.id, requestId)).toMatchObject({ applied: false, reported: false });
     expect(mainHeard()).toEqual([]);
-  });
+    const inbox = new Database(inboundDbPath(sessionA.agent_group_id, sessionA.id), { readonly: true });
+    try {
+      expect(inbox.prepare('SELECT id FROM messages_in WHERE id=?').get(`action-resp-${requestId}`)).toBeUndefined();
+    } finally {
+      inbox.close();
+    }
+    await getDb().exec('DROP TRIGGER no_booking_record');
 
-  it('withdraws a booking whose record cannot be written, so no event is left that its thread cannot change', async () => {
-    const raw = sqliteRaw(getDb());
-    raw.exec(
-      `CREATE TEMP TRIGGER no_booking_record BEFORE INSERT ON gws_ea_thread_bookings
-       BEGIN SELECT RAISE(ABORT, 'database is locked'); END`,
-    );
-    const frame = await send(sessionA, 'book', {
-      start: TUESDAY_10AM,
-      minutes: 30,
-      title: 'Catch-up',
-      invitees: [REMY],
-    });
-    raw.exec('DROP TRIGGER no_booking_record');
+    const resumed = createBookingTools({ calendar: () => calendar });
+    await resumed.resumePending();
+    await resumed.resumePending();
 
-    expect(frame).toMatchObject({ ok: false, error: { code: 'handler-error' } });
-    expect(refusal(frame)).toMatch(/database is locked/u);
-    expect(bookings()).toEqual([]);
-    expect(mainHeard()).toEqual([]);
+    expect(data(await send(sessionA, 'book', fields, requestId)).booking).toBe(event.id);
+    expect(await getBooking({ kind: 'thread', key: threadA }, event.id)).toMatchObject({ calendarId: PRINCIPAL });
+    expect(calendar.writes.map((write) => write.op)).toEqual(['insert']);
+    expect(mainHeard()).toHaveLength(1);
+    expect(mainHeard()[0]).toContain(`event ${event.id} on calendar ${PRINCIPAL}`);
   });
 
   it('books a time once when two threads ask for it at the same moment', async () => {
@@ -930,46 +916,35 @@ describe('book', () => {
 });
 
 describe('the calendar a thread books on is main’s to set', () => {
-  it('offers times before main sets one, saying none is set, books nothing until it does, then books there alone', async () => {
-    // A stranger wrote to the assistant, copying the principal; main has set no calendar for the thread.
+  it('refuses times before main sets a calendar without reading Google, then offers and books there alone', async () => {
     const { key, session } = await thread([STRANGER, PRINCIPAL], null);
     await addPrincipalAddress(PERSONAL);
     calendar.calendars.set(PERSONAL, { id: PERSONAL, accessRole: 'owner', summary: PERSONAL });
     await replacePrincipalCalendars([PRINCIPAL, PERSONAL], now());
     calendar.put({ ...busy('evt-wed', WEDNESDAY_10AM, '2026-10-07T10:00:00.000Z'), calendarId: PERSONAL });
     const wednesdayMorning = { from: '2026-10-07T09:00:00+01:00', to: '2026-10-07T12:00:00+01:00', minutes: 30 };
+    const read = vi.spyOn(calendar, 'listEvents');
+    const calendars = vi.spyOn(calendar, 'listCalendars');
+    expect(refusal(await send(session, 'free_time', wednesdayMorning))).toBe(NO_CALENDAR_YET);
+    const request = { start: THURSDAY_2PM, minutes: 30, title: 'Intro', invitees: [STRANGER] };
+    expect(refusal(await send(session, 'book', request))).toBe(BOOKS_NOTHING_YET);
+    expect(read).not.toHaveBeenCalled();
+    expect(calendars).not.toHaveBeenCalled();
+    expect(calendar.writes).toEqual([]);
 
+    await setThreadBookingCalendar(key, PERSONAL);
     const offered = data(await send(session, 'free_time', wednesdayMorning)) as { windows: Free[]; message: string };
-    // Busy time on every calendar of theirs counts, with none set for the thread.
     expect(offered.windows.map((free) => free.principal_time)).toEqual([
       'Wednesday, Oct 7, 9:00–10:00 AM BST',
       'Wednesday, Oct 7, 11:00 AM–12:00 PM BST',
     ]);
-    expect(offered.message.split('\n').at(-1)).toBe(NO_CALENDAR_YET);
-    // Nor does a range with nothing free leave it out.
-    calendar.put(busy('evt-wed-all', '2026-10-07T08:00:00.000Z', '2026-10-07T11:00:00.000Z'));
-    expect(
-      (data(await send(session, 'free_time', wednesdayMorning)) as { message: string }).message.split('\n'),
-    ).toEqual([
-      'Nothing in that range is free for 30 minutes: ask for another range, or wake main with tell_main and wait for its answer.',
-      NO_CALENDAR_YET,
-    ]);
-
-    const request = { start: THURSDAY_2PM, minutes: 30, title: 'Intro', invitees: [STRANGER] };
-    expect(refusal(await send(session, 'book', request))).toBe(BOOKS_NOTHING_YET);
-    expect(calendar.writes).toEqual([]);
-
-    // main sets PERSONAL for the thread: the booking lands there and nowhere else.
-    await setThreadBookingCalendar(key, PERSONAL);
-    expect((data(await send(session, 'free_time', wednesdayMorning)) as { message: string }).message).not.toContain(
-      NO_CALENDAR_YET,
-    );
+    expect(offered.message).not.toContain(NO_CALENDAR_YET);
     const booked = data(await send(session, 'book', request));
     expect(calendar.event(PERSONAL, String(booked.booking))).toMatchObject({ start: { dateTime: THURSDAY_2PM } });
     expect(calendar.writes.map((write) => write.calendarId)).toEqual([PERSONAL]);
   });
 
-  it('still offers times when the calendar main set is no longer shared, and books nothing there or anywhere else', async () => {
+  it('refuses times when the calendar main set is no longer shared, and books nothing there or anywhere else', async () => {
     calendar.calendars.set(TEAM, { id: TEAM, accessRole: 'owner', dataOwner: PRINCIPAL, summary: 'Pat – work' });
     await setThreadBookingCalendar(threadA, TEAM);
     // The principal unshared it: it left the assistant's list, and Google answers 404 for its events.
@@ -980,12 +955,9 @@ describe('the calendar a thread books on is main’s to set', () => {
       return listEvents(calendarId, timeMin, timeMax);
     };
 
-    const { windows, message } = data(await send(sessionA, 'free_time', { ...RANGE, minutes: 30 })) as {
-      windows: Free[];
-      message: string;
-    };
-    expect(windows.length).toBeGreaterThan(0);
-    expect(message).not.toContain(NO_CALENDAR_YET);
+    expect(refusal(await send(sessionA, 'free_time', { ...RANGE, minutes: 30 }))).toContain(
+      'no longer one the assistant can book on',
+    );
     expect(
       refusal(await send(sessionA, 'book', { start: TUESDAY_10AM, minutes: 30, title: 'Catch-up', invitees: [REMY] })),
     ).toBe(CANNOT_BOOK_THERE);
@@ -1002,8 +974,7 @@ describe('a booking changes and is cancelled only by its own thread', () => {
     const moved = data(await send(sessionA, 'change_booking', { booking: first.booking, start: THURSDAY_2PM }));
     expect(moved).toMatchObject({ booking: first.booking, start: THURSDAY_2PM, end: '2026-10-08T13:45:00.000Z' });
     expect(moved.message).toBe(
-      'Changed: Thursday, Oct 8, 2:00–2:45 PM BST. Google sends the invitees the update. ' +
-        'The host tells main of it, so no wake is needed; still leave your account with tell_main.',
+      'The booking stands at Thursday, Oct 8, 2:00–2:45 PM BST. Google sends any update; main hears.',
     );
     expect(calendar.event(PRINCIPAL, String(first.booking))).toMatchObject({
       start: { dateTime: THURSDAY_2PM },
@@ -1060,23 +1031,21 @@ describe('a booking changes and is cancelled only by its own thread', () => {
       start: { dateTime: TUESDAY_10AM },
       conference: { status: 'success' },
     });
-    expect(changed.message).toMatch(/^Changed: Tuesday, Oct 6, 10:00–10:30 AM BST, with a Google Meet link \(https:/u);
+    expect(changed.message).toMatch(
+      /^The booking stands at Tuesday, Oct 6, 10:00–10:30 AM BST, with a Google Meet link \(https:/u,
+    );
     const [patch] = calendar.writes.filter((write) => write.op === 'patch');
     expect(patch).toMatchObject({ eventId: booked.booking, sendUpdates: 'all' });
     expect(patch.fields?.start).toBeUndefined();
 
     const fact = mainHeard().at(-1) ?? '';
-    expect(
-      fact.startsWith(
-        `Changed the meeting with ${REMY} on Tuesday, Oct 6, 11:00–11:30 AM CEST: a new title, place, notes, and Google Meet link. ` +
-          'Google sent them the update. Its new title, as written in the thread:\n<<<EXTERNAL_UNTRUSTED_CONTENT',
-      ),
-      fact,
-    ).toBe(true);
-    expect(fact.indexOf('Intro: Pat and Remy')).toBeGreaterThan(fact.indexOf('<<<EXTERNAL_UNTRUSTED_CONTENT'));
-    expect(fact.endsWith(`>>>\n(thread ${threadA}; event ${String(booked.booking)} on calendar ${PRINCIPAL})`)).toBe(
-      true,
+    expect(fact).toContain(
+      `Changed the meeting with ${REMY} on Tuesday, Oct 6, 11:00–11:30 AM CEST (30 minutes), with a new title, note, place, and video link, by video call. Google sent them the update.`,
     );
+    expect(fact).toContain(`(thread ${threadA}; event ${String(booked.booking)} on calendar ${PRINCIPAL})`);
+    expect(fact).toContain('Its new title, as written in the thread, is untrusted:\n<<<EXTERNAL_UNTRUSTED_CONTENT');
+    expect(fact.indexOf('Intro: Pat and Remy')).toBeGreaterThan(fact.indexOf('<<<EXTERNAL_UNTRUSTED_CONTENT'));
+    expect(fact).toMatch(/\n<<<END_EXTERNAL_UNTRUSTED_CONTENT id="[0-9a-f]+">>>$/u);
   });
 
   it('refuses new text carrying a private value, as the invitees would see it, and a Meet link the calendar does not allow, writing nothing', async () => {
@@ -1096,6 +1065,7 @@ describe('a booking changes and is cancelled only by its own thread', () => {
     expect(refusal(await send(sessionA, 'change_booking', { booking: booked.booking, title: 'Catch-up' }))).toMatch(
       /the principal's private address\./u,
     );
+    calendar.calendars.set(PRINCIPAL, { id: PRINCIPAL, accessRole: 'writer', summary: 'Pat' });
     expect(refusal(await send(sessionA, 'change_booking', { booking: booked.booking, video_call: true }))).toMatch(
       /does not allow Google Meet links/u,
     );
@@ -1152,35 +1122,12 @@ describe('a booking changes and is cancelled only by its own thread', () => {
     );
 
     expect(refusal(await send(sessionB, 'change_booking', { booking: booked.booking, start: THURSDAY_2PM }))).toMatch(
-      /This thread has no booking/u,
+      /There is no such booking for this thread/u,
     );
     expect(refusal(await send(sessionB, 'cancel_booking', { booking: booked.booking }))).toMatch(
-      /This thread has no booking/u,
+      /There is no such booking for this thread/u,
     );
     expect(calendar.event(PRINCIPAL, String(booked.booking))).toMatchObject({
-      status: 'confirmed',
-      start: { dateTime: TUESDAY_10AM },
-    });
-  });
-
-  it('refuses an event that lost its booking tag, for a change and for a cancellation', async () => {
-    const booked = data(
-      await send(sessionA, 'book', { start: TUESDAY_10AM, minutes: 30, title: 'Intro', invitees: [REMY] }),
-    );
-    const [event] = bookings();
-    calendar.put({ ...event, tags: { gwsEaThread: threadA } });
-    const writes = calendar.writes.length;
-
-    for (const [action, fields] of [
-      ['change_booking', { booking: booked.booking, start: THURSDAY_2PM }],
-      ['cancel_booking', { booking: booked.booking }],
-    ] as const) {
-      expect(refusal(await send(sessionA, action, fields))).toBe(
-        'That event is no longer a booking this thread may change: wake main with tell_main and wait for its answer.',
-      );
-    }
-    expect(calendar.writes).toHaveLength(writes);
-    expect(calendar.event(PRINCIPAL, event.id)).toMatchObject({
       status: 'confirmed',
       start: { dateTime: TUESDAY_10AM },
     });
@@ -1200,9 +1147,9 @@ describe('a booking changes and is cancelled only by its own thread', () => {
       deleted(event);
 
       expect(refusal(await send(sessionA, 'change_booking', { booking: booked.booking, start: THURSDAY_2PM }))).toMatch(
-        /no longer on the principal/u,
+        /no longer on the calendar/u,
       );
-      expect(await getDb().get('SELECT 1 FROM gws_ea_thread_bookings')).toBeUndefined();
+      expect(await getDb().get('SELECT 1 FROM gws_ea_bookings')).toBeUndefined();
     },
   );
 
@@ -1296,8 +1243,7 @@ describe('a booking changes and is cancelled only by its own thread', () => {
     );
 
     expect(data(await send(sessionA, 'cancel_booking', { booking: booked.booking })).message).toBe(
-      'Cancelled: Tuesday, Oct 6, 10:00–10:30 AM BST. Google sends the invitees the cancellation. ' +
-        'The host tells main of it, so no wake is needed; still leave your account with tell_main.',
+      'Cancelled: Tuesday, Oct 6, 10:00–10:30 AM BST. Google sends the cancellation; main hears.',
     );
     expect(calendar.event(PRINCIPAL, String(booked.booking))?.status).toBe('cancelled');
     expect(calendar.writes.at(-1)).toMatchObject({ op: 'delete', sendUpdates: 'all' });
@@ -1307,7 +1253,7 @@ describe('a booking changes and is cancelled only by its own thread', () => {
         `(thread ${threadA}; event ${String(booked.booking)} on calendar ${PRINCIPAL})`,
     ]);
     expect(refusal(await send(sessionA, 'cancel_booking', { booking: booked.booking }))).toMatch(
-      /This thread has no booking/u,
+      /There is no such booking for this thread/u,
     );
   });
 
@@ -1341,7 +1287,7 @@ describe('a booking from a thread in an open matter', () => {
   }
 
   function brief(): string {
-    return `Its matter's other threads, to brief at once: thread ${threadB}.`;
+    return `Its matter's other conversations, to brief: thread ${threadB}.`;
   }
 
   it("joins the thread's matter, and reaches main with the matter and its other threads to brief", async () => {
@@ -1359,10 +1305,8 @@ describe('a booking from a thread in an open matter', () => {
     ]);
     const [fact, ...others] = mainHeard();
     expect(others).toEqual([]);
-    expect(fact).toContain(
-      `\n(thread ${threadA}; event ${String(booked.booking)} on calendar ${PRINCIPAL})\n${brief()}\n\n` +
-        `Matter ${matterId}, open: Acme renewal\n`,
-    );
+    expect(fact).toContain(`(thread ${threadA}; event ${String(booked.booking)} on calendar ${PRINCIPAL})`);
+    expect(fact).toContain(`${brief()}\n\nMatter ${matterId}, open: Acme renewal\n`);
     // The matter once, though the note names both its thread and its new event.
     expect(fact.split(`Matter ${matterId}, open`)).toHaveLength(2);
     expect(fact).toMatch(new RegExp(`\\n- event ${event}: Oct 6, 2026, [^\\n]*; confirmed;`, 'u'));
@@ -1379,9 +1323,11 @@ describe('a booking from a thread in an open matter', () => {
 
     const [, moved, cancelled] = mainHeard();
     expect(moved).toMatch(/^Rescheduled the meeting /u);
-    expect(moved).toContain(`on calendar ${PRINCIPAL})\n${brief()}\n\n`);
+    expect(moved).toContain(`on calendar ${PRINCIPAL})`);
+    expect(moved).toContain(`${brief()}\n\n`);
     expect(cancelled).toMatch(/^Cancelled the meeting /u);
-    expect(cancelled).toContain(`on calendar ${PRINCIPAL})\n${brief()}\n\n`);
+    expect(cancelled).toContain(`on calendar ${PRINCIPAL})`);
+    expect(cancelled).toContain(`${brief()}\n\n`);
   });
 
   it('joins no matter, and names no thread, once the matter has closed', async () => {
@@ -1393,9 +1339,9 @@ describe('a booking from a thread in an open matter', () => {
     );
 
     expect((await getMatter(matterId))?.links.map((link) => link.kind)).toEqual(['thread', 'thread']);
-    expect(mainHeard()[0]).toMatch(
-      new RegExp(`\\(thread ${threadA}; event ${String(booked.booking)} on calendar ${PRINCIPAL}\\)$`, 'u'),
-    );
+    expect(mainHeard()[0]).toContain(`(thread ${threadA}; event ${String(booked.booking)} on calendar ${PRINCIPAL})`);
+    expect(mainHeard()[0]).not.toContain("Its matter's other conversations");
+    expect(mainHeard()[0]).not.toContain(`Matter ${matterId}`);
   });
 });
 

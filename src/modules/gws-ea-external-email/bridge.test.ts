@@ -118,6 +118,7 @@ import { getThreadBookingCalendar } from '../gws-ea-meetings/thread-calendar.js'
 import { GoogleApiError } from '../gws-ea-inbox/gmail-api.js';
 import { LINKS_UNCHECKED } from '../gws-ea-workspace/link-access.js';
 import { FakeDrive } from '../gws-ea-workspace/testing/fake-drive.js';
+import '../gws-ea-chats/index.js';
 import '../gws-ea-meetings/index.js';
 import './index.js';
 
@@ -1304,21 +1305,28 @@ describe('the first booking on a thread an outsider started', () => {
     await replacePrincipalCalendars([PRINCIPAL, TEAM_CALENDAR, SHARED_CALENDAR], now());
     const day = 24 * 60 * 60_000;
 
-    const offered = data(
-      await request(session, 'free_time', {
-        from: new Date(Date.now() + day).toISOString(),
-        to: new Date(Date.now() + 8 * day).toISOString(),
-        minutes: 30,
-      }),
-    );
-    expect(String(offered.message).split('\n').at(-1)).toBe(
+    const range = {
+      from: new Date(Date.now() + day).toISOString(),
+      to: new Date(Date.now() + 8 * day).toISOString(),
+      minutes: 30,
+    };
+    const reads = vi.spyOn(calendar, 'listEvents');
+    const calendars = vi.spyOn(calendar, 'listCalendars');
+    expect(refusal(await request(session, 'free_time', range))).toBe(
       "No calendar is set for this thread's bookings yet: wake main once with tell_main to ask which calendar to book on, and offer no time until it answers.",
     );
-    const [first] = offered.windows as ReadonlyArray<{ readonly start: string }>;
-    const agreed = { start: first.start, minutes: 30, title: 'Intro: Pat and Noel' };
-    expect(refusal(await request(session, 'book', agreed))).toBe(
-      "No calendar is set for this thread's bookings yet, so nothing was booked: wake main with tell_main to ask which calendar to book on, and book once it answers.",
-    );
+    expect(
+      refusal(
+        await request(session, 'book', {
+          start: new Date(Date.now() + 2 * day).toISOString(),
+          minutes: 30,
+          title: 'Intro: Pat and Noel',
+        }),
+      ),
+    ).toContain('No calendar is set');
+    expect(reads).not.toHaveBeenCalled();
+    expect(calendars).not.toHaveBeenCalled();
+    expect(calendar.writes).toEqual([]);
 
     data(
       await request(session, 'tell_main', {
@@ -1338,6 +1346,9 @@ describe('the first booking on a thread an outsider started', () => {
         calendar: TEAM_CALENDAR,
       }),
     );
+    const offered = data(await request(session, 'free_time', range));
+    const [first] = offered.windows as ReadonlyArray<{ readonly start: string }>;
+    const agreed = { start: first.start, minutes: 30, title: 'Intro: Pat and Noel' };
     const booked = data(await request(session, 'book', agreed));
 
     expect(calendar.event(TEAM_CALENDAR, String(booked.booking))).toMatchObject({

@@ -138,6 +138,7 @@ import { getMatter, listOpenMatters, openMatter } from '../gws-ea-matters/db.js'
 import '../gws-ea-matters/index.js';
 import { keepMattersOnTime } from '../gws-ea-matters/loop.js';
 import { syncVerdict, todayVerdict } from '../gws-ea-matters/sync.js';
+import '../gws-ea-meetings/index.js';
 import { FakeCalendar as FakeEvents } from '../gws-ea-meetings/testing/fake-calendar.js';
 import '../gws-ea-workspace/index.js';
 import { recordFolderGrant } from '../gws-ea-workspace/db.js';

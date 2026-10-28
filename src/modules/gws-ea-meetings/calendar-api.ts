@@ -37,6 +37,8 @@ export interface EventConference {
 /** An event as the host reads it: no title, description or location. */
 export interface CalendarEvent {
   readonly id: string;
+  /** The version used to avoid overwriting an intervening edit. */
+  readonly etag?: string;
   readonly iCalUID?: string;
   readonly status?: string;
   readonly transparency?: string;
@@ -170,7 +172,13 @@ export interface MeetingsCalendarApi {
     event: NewEvent,
     sendUpdates: SendUpdates,
   ): Promise<'created' | 'exists'>;
-  patchEvent(calendarId: string, eventId: string, event: EventWrite, sendUpdates: SendUpdates): Promise<void>;
+  patchEvent(
+    calendarId: string,
+    eventId: string,
+    event: EventWrite,
+    sendUpdates: SendUpdates,
+    etag?: string,
+  ): Promise<void>;
   /** With the event's version and its title, notes and place; undefined when the event does not exist. */
   getGuests(calendarId: string, eventId: string): Promise<EventGuests | undefined>;
   /** Replaces the guest list, each guest as given; with `etag`, only while the event is still that version. */
@@ -194,12 +202,17 @@ export interface MeetingsCalendarApi {
     etag?: string,
   ): Promise<GuestWriteResult>;
   /** `gone` when the event was already deleted or never existed. */
-  deleteEvent(calendarId: string, eventId: string, sendUpdates: SendUpdates): Promise<'deleted' | 'gone'>;
+  deleteEvent(
+    calendarId: string,
+    eventId: string,
+    sendUpdates: SendUpdates,
+    etag?: string,
+  ): Promise<'deleted' | 'gone'>;
 }
 
 const CALENDAR_API = 'https://www.googleapis.com/calendar/v3';
 const EVENT_FIELDS =
-  'id,iCalUID,status,transparency,organizer(email),attendees(email,responseStatus,resource,organizer,self),start(dateTime,date),end(dateTime,date),extendedProperties(private),conferenceData(createRequest(status(statusCode)),entryPoints(entryPointType,uri))';
+  'id,etag,iCalUID,status,transparency,organizer(email),attendees(email,responseStatus,resource,organizer,self),start(dateTime,date),end(dateTime,date),extendedProperties(private),conferenceData(createRequest(status(statusCode)),entryPoints(entryPointType,uri))';
 /** Includes titles and names, so nothing read with it may reach external-email. */
 const DETAIL_FIELDS =
   'id,iCalUID,status,transparency,summary,organizer(email,self),attendees(email,displayName,responseStatus,resource,self),attendeesOmitted,recurringEventId,originalStartTime(dateTime,date),start(dateTime,date),end(dateTime,date)';
@@ -295,6 +308,7 @@ function toListedEvent(value: unknown): ListedEvent {
   const organizerEmail = isRecord(value.organizer) ? optionalString(value.organizer.email) : undefined;
   const start = toTime(value.start);
   const end = toTime(value.end);
+  const etag = optionalString(value.etag);
   const iCalUID = optionalString(value.iCalUID);
   const status = optionalString(value.status);
   const transparency = optionalString(value.transparency);
@@ -302,6 +316,7 @@ function toListedEvent(value: unknown): ListedEvent {
   const conference = toConference(value.conferenceData);
   return {
     ...(id === undefined ? {} : { id }),
+    ...(etag === undefined ? {} : { etag }),
     ...(iCalUID === undefined ? {} : { iCalUID }),
     ...(status === undefined ? {} : { status }),
     ...(transparency === undefined ? {} : { transparency }),
@@ -506,11 +521,12 @@ export function createMeetingsCalendarApi(options: GoogleClientOptions): Meeting
       }
     },
 
-    async patchEvent(calendarId, eventId, event, sendUpdates) {
+    async patchEvent(calendarId, eventId, event, sendUpdates, etag) {
       const params = writeParams(event, sendUpdates);
       await googleJson(options, `${eventUrl(calendarId, eventId)}?${params.toString()}`, {
         method: 'PATCH',
         body: eventBody(event),
+        ...(etag === undefined ? {} : { ifMatch: etag }),
       });
     },
 
@@ -576,10 +592,13 @@ export function createMeetingsCalendarApi(options: GoogleClientOptions): Meeting
       );
     },
 
-    async deleteEvent(calendarId, eventId, sendUpdates) {
+    async deleteEvent(calendarId, eventId, sendUpdates, etag) {
       const params = new URLSearchParams({ sendUpdates });
       try {
-        await googleJson(options, `${eventUrl(calendarId, eventId)}?${params.toString()}`, { method: 'DELETE' });
+        await googleJson(options, `${eventUrl(calendarId, eventId)}?${params.toString()}`, {
+          method: 'DELETE',
+          ...(etag === undefined ? {} : { ifMatch: etag }),
+        });
         return 'deleted';
       } catch (error) {
         if (isGone(error)) return 'gone';

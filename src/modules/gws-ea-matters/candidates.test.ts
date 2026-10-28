@@ -7,11 +7,13 @@
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { closeDb, getDb, initTestDb, runMigrations } from '../../db/index.js';
+import { closeDb, createAgentGroup, createMessagingGroup, getDb, initTestDb, runMigrations } from '../../db/index.js';
 import type { SenderVerdict } from '../gws-ea-inbox/authentication.js';
 import '../gws-ea-inbox/index.js';
 import { createThread, recordThreadMessage } from '../gws-ea-inbox/thread-map.js';
-import { recordThreadBooking } from '../gws-ea-meetings/thread-calendar.js';
+import '../gws-ea-chats/index.js';
+import '../gws-ea-meetings/index.js';
+import { recordBooking } from '../gws-ea-meetings/bookings-db.js';
 import { addPerson } from '../gws-ea-people/db.js';
 import '../gws-ea-people/index.js';
 import { addPrincipalAddress } from '../gws-ea-profile/db.js';
@@ -149,10 +151,52 @@ describe('suggesting open matters for a new piece', () => {
 
   it('suggests the matter whose thread booked an invitation', async () => {
     const acme = await open('Acme kickoff', [{ kind: 'thread', reference: THREAD_QUOTE }]);
-    await recordThreadBooking({ threadKey: THREAD_QUOTE, calendarId: MORGAN, eventId: 'kickoff1', bookedAt: NOW });
+    await recordBooking({
+      owner: { kind: 'thread', key: THREAD_QUOTE },
+      calendarId: MORGAN,
+      eventId: 'kickoff1',
+      bookedAt: NOW,
+    });
 
     expect(await candidatesFor({ kind: 'event', reference: KICKOFF, from: 'juno@acme.example' })).toEqual([
       { id: acme, title: 'Acme kickoff', project: null, reasons: ['booking'] },
+    ]);
+  });
+
+  it('suggests the matter whose chat booked an invitation, without matching a thread with the same key', async () => {
+    const chat = 'mail-juno-venue';
+    await createMessagingGroup({
+      id: chat,
+      channel_type: 'whatsapp',
+      platform_id: 'venue-group',
+      name: 'Venue visit',
+      is_group: 1,
+      unknown_sender_policy: 'strict',
+      created_at: NOW,
+    });
+    await createAgentGroup({
+      id: 'external-chat',
+      name: 'External chat',
+      folder: 'external-chat',
+      agent_provider: null,
+      created_at: NOW,
+    });
+    await getDb().run(
+      'INSERT INTO gws_ea_chats(messaging_group_id,state,serving_agent_group_id,principal_present,created_at,updated_at) VALUES(?,?,?,?,?,?)',
+      chat,
+      'connected',
+      'external-chat',
+      1,
+      NOW,
+      NOW,
+    );
+    await createThread('g-same-key', NOW, chat);
+    const venue = await open('Venue visit', [{ kind: 'chat', reference: chat }]);
+    await open('Separate email', [{ kind: 'thread', reference: chat }]);
+    await recordBooking({ owner: { kind: 'chat', key: chat }, calendarId: MORGAN, eventId: 'venue1', bookedAt: NOW });
+
+    expect(await candidatesFor({ kind: 'event', reference: `${MORGAN}/venue1`, from: 'mira@venue.example' })).toEqual([
+      { id: venue, title: 'Venue visit', project: null, reasons: ['booking'] },
     ]);
   });
 

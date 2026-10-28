@@ -227,7 +227,10 @@ describe('the email tools', () => {
 
   it('tell main that a thread books only on the calendar a handoff sets, with no calendar standing in for it', () => {
     const calendar = emailHandoff.tool.inputSchema.properties?.calendar as { readonly description: string };
-    expect(calendar.description).toContain('Until one is set, external-email can offer times but books nothing.');
+    expect(calendar.description).toContain('Set one before external-email offers times or books.');
+    expect(freeTime.tool.description).toContain(
+      "Main must have set this thread's booking calendar before you offer times.",
+    );
     expect(calendar.description).not.toMatch(/primary/iu);
   });
 
@@ -575,13 +578,12 @@ describe('a request the host is slow to answer', () => {
     }
   }
 
-  it('says not to repeat a request that would send, write or book twice, and request_status reads the late answer', async () => {
+  it('keeps the existing timeout advice for other writes, and request_status reads the late answer', async () => {
     for (const [tool, args] of [
       [emailHandoff, { thread_key: 'mail-inbound-1', message: 'Avoid Friday.' }],
       [emailToPrincipal, { thread_key: 'mail-inbound-1', text: 'Done.' }],
       [emailSend, { text: 'Hello' }],
       [tellMain, { account: 'Looped in.', wake: true }],
-      [book, { start: '2026-10-13T12:30:00-07:00', minutes: 30, title: 'Catch up' }],
     ] as const) {
       const result = await timedOut(tool, args);
       expect(result.isError, tool.tool.name).toBe(true);
@@ -596,16 +598,29 @@ describe('a request the host is slow to answer', () => {
     ]);
   });
 
-  it('says a request that changes nothing twice may be made again', async () => {
-    for (const [tool, args] of [
-      [freeTime, { from: '2026-10-12T09:00:00-07:00', to: '2026-10-16T17:00:00-07:00', minutes: 30 }],
-      [changeBooking, { booking: 'a'.repeat(64), start: '2026-10-14T09:30:00-07:00' }],
-      [cancelBooking, { booking: 'a'.repeat(64) }],
-    ] as const) {
-      expect(text(await timedOut(tool, args)), tool.tool.name).toMatch(
-        /or make the same call again: a repeat changes nothing twice/,
-      );
-    }
+  it.each<[string, McpToolDefinition, Record<string, unknown>]>([
+    ['book', book, { start: '2026-10-13T12:30:00-07:00', minutes: 30, title: 'Catch up' }],
+    ['change_booking', changeBooking, { booking: 'a'.repeat(64), start: '2026-10-14T09:30:00-07:00' }],
+    ['cancel_booking', cancelBooking, { booking: 'a'.repeat(64) }],
+  ])('waits for %s’s host answer after timeout without inviting another write', async (name, tool, args) => {
+    const result = await timedOut(tool, args);
+    const [row] = getUndeliveredMessages();
+    expect(result.isError, name).toBe(true);
+    expect(text(result), name).toContain(`request ${row.id}`);
+    expect(text(result), name).toContain('The answer will arrive in a host message.');
+    expect(text(result), name).toContain('Do not send this request again.');
+    expect(text(result), name).not.toContain('make the same call again');
+  });
+
+  it('says free_time may be made again after timeout', async () => {
+    const result = await timedOut(freeTime, {
+      from: '2026-10-12T09:00:00-07:00',
+      to: '2026-10-16T17:00:00-07:00',
+      minutes: 30,
+    });
+    expect(result.isError).toBe(true);
+    expect(text(result)).toContain('or make the same call again: a repeat changes nothing twice');
+    expect(text(result)).not.toContain('The answer will arrive in a host message.');
   });
 });
 

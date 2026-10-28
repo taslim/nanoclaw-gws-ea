@@ -28,6 +28,45 @@ type Review =
  * `src/modules`, its other fields sorted, a spread written `...name`.
  */
 const REVIEWED: Readonly<Record<string, Review>> = {
+  'gws-ea-meetings/booking.ts answerRequest: code': {
+    kind: 'host-only',
+    reason: 'the response frame keeps its transport error code; the rendered error message explains the refusal',
+  },
+  'gws-ea-meetings/booking.ts freeTime: windows, windows_not_listed': {
+    kind: 'rendered',
+    reason: 'the message lists the free windows, both time zones, preference fit and omitted window count',
+  },
+  'gws-ea-meetings/booking.ts changedOutcome: booking': {
+    kind: 'host-only',
+    reason: 'the booking id is the request input; the refusal gives the current time and the ask-main step',
+  },
+  'gws-ea-meetings/booking.ts removedOutcome: booking': {
+    kind: 'host-only',
+    reason: 'the host retains the event identity; the refusal explains removal and asks main before another time',
+  },
+  'gws-ea-meetings/booking.ts unknownOutcome: booking': {
+    kind: 'host-only',
+    reason: 'the host retains the event identity for main; the message tells the agent to wait for main',
+  },
+  'gws-ea-meetings/booking.ts absentOutcome: booking': {
+    kind: 'host-only',
+    reason: 'the host retains the event identity; the refusal says nothing was booked and main hears the same',
+  },
+  "gws-ea-meetings/booking.ts successOutcome: ...(row.action === 'cancel' ? {} : { start: iso(span.start), end: iso(span.end) }), booking":
+    {
+      kind: 'rendered',
+      reason:
+        'the message gives the resulting time and conference, supplies a new booking id on book, and confirms cancellation; other booking ids echo the request',
+    },
+  'gws-ea-meetings/booking.ts check: booking, end, start': {
+    kind: 'rendered',
+    reason: 'the no-change message gives the current time and conference; the booking id is the request input',
+  },
+  'gws-ea-meetings/booking.ts resumePending: code': {
+    kind: 'host-only',
+    reason: 'the response frame keeps its transport error code; the rendered error message explains the refusal',
+  },
+
   'gws-ea-artifacts/sharing.ts failure: code': {
     kind: 'host-only',
     reason:
@@ -83,22 +122,6 @@ const REVIEWED: Readonly<Record<string, Review>> = {
     kind: 'host-only',
     reason:
       "the time is the agent's input and the task id serves the host's move recovery; the message confirms the reminder",
-  },
-  'gws-ea-meetings/chat-calendar.ts book: booking, end, start': {
-    kind: 'rendered',
-    reason: 'the message gives the booked time, conference and booking id',
-  },
-  'gws-ea-meetings/chat-calendar.ts changedAnswer: booking, end, start': {
-    kind: 'rendered',
-    reason: "the message gives the resulting time and conference; the booking id is the agent's input",
-  },
-  'gws-ea-meetings/chat-calendar.ts changeBooking: booking, end, start': {
-    kind: 'rendered',
-    reason: "the no-change message gives the actual time; the booking id is the agent's input",
-  },
-  'gws-ea-meetings/chat-calendar.ts cancelBooking: booking': {
-    kind: 'host-only',
-    reason: "the booking id is the agent's input and the message confirms the cancellation",
   },
   'gws-ea-whatsapp/adapter.ts report: at': {
     kind: 'host-only',
@@ -222,22 +245,6 @@ const REVIEWED: Readonly<Record<string, Review>> = {
     kind: 'rendered',
     reason: "the message says the principal's answer as Google now shows it",
   },
-  'gws-ea-meetings/tools.ts freeTime: windows, windows_not_listed': {
-    kind: 'rendered',
-    reason: 'one line per window, then how many later ones are not listed',
-  },
-  'gws-ea-meetings/tools.ts book: booking, end, start': {
-    kind: 'rendered',
-    reason: 'the message gives the time and the booking id',
-  },
-  'gws-ea-meetings/tools.ts changeBooking: booking, end, start': {
-    kind: 'rendered',
-    reason: "the message gives the new time; the booking id is the agent's own input",
-  },
-  'gws-ea-meetings/tools.ts cancelBooking: booking': {
-    kind: 'host-only',
-    reason: "the booking id is the agent's own input",
-  },
   'gws-ea-privacy/index.ts requestRemovalCard: id, status': {
     kind: 'host-only',
     reason: "the value id is main's own input, and the message words the status",
@@ -334,8 +341,8 @@ describe('GWS-EA answers with a message and other fields', () => {
       'gws-ea-example/look-up.ts lookUp: extra',
     ]);
     const widened = `const freeTime = async () => ({ windows: [], windows_not_listed: 0, calendar: 'x', message: '' });`;
-    expect(unreviewed(answersIn('gws-ea-meetings/tools.ts', widened))).toEqual([
-      'gws-ea-meetings/tools.ts freeTime: calendar, windows, windows_not_listed',
+    expect(unreviewed(answersIn('gws-ea-meetings/booking.ts', widened))).toEqual([
+      'gws-ea-meetings/booking.ts freeTime: calendar, windows, windows_not_listed',
     ]);
   });
 });

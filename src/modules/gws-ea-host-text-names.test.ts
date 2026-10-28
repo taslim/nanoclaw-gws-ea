@@ -115,7 +115,6 @@ const POLICY: Policy = {
     'gws-ea-matters/tool-matter.ts': 'main',
     // The answers of main's calendar tools.
     'gws-ea-meetings/principal-events.ts': 'main',
-    'gws-ea-meetings/chat-calendar.ts': 'external-chat',
     'gws-ea-chats/context.ts': 'external-chat',
     'gws-ea-chat-agents/docs.ts': 'job',
     // `ncl people` and `ncl preferences` help, answers and guidance.

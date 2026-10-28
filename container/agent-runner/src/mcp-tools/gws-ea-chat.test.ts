@@ -81,14 +81,14 @@ it.each<[McpToolDefinition, Record<string, unknown>, string]>([
   [chatLeave, { chat: 'chat-trip' }, 'chat_leave'],
   [expectReply, { people: ['whatsapp:22'], until: '2026-10-19T12:00:00Z' }, 'expect_reply'],
   [remind, { at: '2026-10-19T12:00:00Z', note: 'Choose the venue.' }, 'remind'],
-  [chatFreeTime, { from: '2026-10-19T12:00:00Z', to: '2026-10-20T12:00:00Z', minutes: 30 }, 'chat_free_time'],
+  [chatFreeTime, { from: '2026-10-19T12:00:00Z', to: '2026-10-20T12:00:00Z', minutes: 30 }, 'free_time'],
   [
     chatBook,
     { start: '2026-10-19T12:00:00Z', minutes: 30, title: 'Venue visit', invitees: ['mira@example.com'] },
-    'chat_book',
+    'book',
   ],
-  [chatChangeBooking, { booking: 'booked-here', location: 'Venue' }, 'chat_change_booking'],
-  [chatCancelBooking, { booking: 'booked-here' }, 'chat_cancel_booking'],
+  [chatChangeBooking, { booking: 'booked-here', location: 'Venue' }, 'change_booking'],
+  [chatCancelBooking, { booking: 'booked-here' }, 'cancel_booking'],
   [
     chatTellMain,
     { account: 'Mira can meet Friday.', matter: 'm-123456abcdef', wake: true, cite: ['principal-friday'] },
@@ -133,4 +133,51 @@ it('exposes closed session-only scheduling schemas with required fields', () => 
   const validate = new Ajv().compile(chatBook.tool.inputSchema);
   expect(validate({ start: '2026-10-19T12:00:00Z', minutes: 30, title: 'Venue visit' })).toBe(true);
   expect(validate({ start: '2026-10-19T12:00:00Z', minutes: 1, title: 'Venue visit' })).toBe(false);
+});
+
+it.each<[string, McpToolDefinition, Record<string, unknown>]>([
+  ['book', chatBook, { start: '2026-10-19T12:00:00Z', minutes: 30, title: 'Venue visit' }],
+  ['change_booking', chatChangeBooking, { booking: 'booked-here', location: 'Venue' }],
+  ['cancel_booking', chatCancelBooking, { booking: 'booked-here' }],
+])('keeps a timed-out %s waiting for its host answer without inviting another write', async (name, tool, args) => {
+  const realNow = Date.now;
+  const start = realNow();
+  let calls = 0;
+  Date.now = () => start + calls++ * 120_000;
+  try {
+    const result = await tool.handler(args);
+    const [row] = getUndeliveredMessages();
+    expect(result.isError).toBe(true);
+    const response = result.content.find((content) => content.type === 'text');
+    const text = response?.type === 'text' ? response.text : undefined;
+    expect(text, name).toContain(`request ${row.id}`);
+    expect(text, name).toContain('The answer will arrive in a host message.');
+    expect(text, name).toContain('Do not send this request again.');
+    expect(text, name).not.toContain('make the same call again');
+  } finally {
+    Date.now = realNow;
+  }
+});
+
+it('allows another free_time call after its wait expires', async () => {
+  const realNow = Date.now;
+  const start = realNow();
+  let calls = 0;
+  Date.now = () => start + calls++ * 120_000;
+  try {
+    const result = await chatFreeTime.handler({
+      from: '2026-10-19T12:00:00Z',
+      to: '2026-10-20T12:00:00Z',
+      minutes: 30,
+    });
+    const [row] = getUndeliveredMessages();
+    const response = result.content.find((content) => content.type === 'text');
+    const text = response?.type === 'text' ? response.text : undefined;
+    expect(result.isError).toBe(true);
+    expect(text).toContain(`request ${row.id}`);
+    expect(text).toContain('or make the same call again: a repeat changes nothing twice');
+    expect(text).not.toContain('The answer will arrive in a host message.');
+  } finally {
+    Date.now = realNow;
+  }
 });

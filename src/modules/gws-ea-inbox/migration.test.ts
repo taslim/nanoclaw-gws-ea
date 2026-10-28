@@ -16,7 +16,9 @@ import { sqliteRaw } from '../../db/drivers/sqlite.js';
 import { closeDb, createMessagingGroup, initSqliteTestDb } from '../../db/index.js';
 import { getRegisteredMigrations, runMigrations, type Migration } from '../../db/migrations/index.js';
 import '../index.js';
-import { getThreadBooking, recordThreadBooking, setThreadBookingCalendar } from '../gws-ea-meetings/thread-calendar.js';
+import { getBooking } from '../gws-ea-meetings/bookings-db.js';
+import { bookingsMigration } from '../gws-ea-meetings/bookings-migration.js';
+import { setThreadBookingCalendar } from '../gws-ea-meetings/thread-calendar.js';
 import { countSenderMessage, replacePrincipalCalendars, settleMessage, updateInboxState } from './db.js';
 import { recordPollSuccess } from './health.js';
 import { INBOX_PLATFORM_ID, PRINCIPAL_PLATFORM_ID } from './runtime.js';
@@ -50,7 +52,6 @@ const INBOX_TABLES = [
   'gws_ea_inbox_sender_counts',
   'gws_ea_inbox_state',
   'gws_ea_thread_addresses',
-  'gws_ea_thread_bookings',
   'gws_ea_thread_files',
   'gws_ea_thread_messages',
   'gws_ea_thread_sends',
@@ -84,6 +85,7 @@ afterEach(async () => {
 /** An install that applied the earlier chain: every other migration as today, the earlier chain for the inbox's. */
 function earlierRelease(): Migration[] {
   return getRegisteredMigrations().flatMap((migration) => {
+    if (migration.name === bookingsMigration.name) return [];
     if (migration.name === CREATE_INBOX) return [...EARLIER_INBOX_CHAIN];
     return migration.name.startsWith('module:gws-ea-inbox:') ? [] : [migration];
   });
@@ -150,7 +152,7 @@ function rowsOf(db: DbDriver): Record<string, unknown[]> {
 }
 
 /** Work the earlier release wrote, through today's code: a row in every `INBOX_TABLES` table. */
-async function writeSlice4Work(): Promise<void> {
+async function writeSlice4Work(db: DbDriver): Promise<void> {
   for (const [id, platformId] of [
     ['mg-inbox', INBOX_PLATFORM_ID],
     ['mg-principal', PRINCIPAL_PLATFORM_ID],
@@ -194,7 +196,13 @@ async function writeSlice4Work(): Promise<void> {
   );
   await insertPendingSend({ id: 'send-2', scope: OUTSIDE, contentHash: 'hash-2', rfcMessageId: '<s2@n.example>' }, AT);
   await setThreadBookingCalendar(THREAD, CALENDAR);
-  await recordThreadBooking({ threadKey: THREAD, calendarId: CALENDAR, eventId: 'evt-review', bookedAt: AT });
+  await db.run(
+    'INSERT INTO gws_ea_thread_bookings(thread_key,calendar_id,event_id,booked_at) VALUES(?,?,?,?)',
+    THREAD,
+    CALENDAR,
+    'evt-review',
+    AT,
+  );
 }
 
 describe('the inbox migrations', () => {
@@ -216,7 +224,11 @@ describe('the inbox migrations', () => {
       getRegisteredMigrations()
         .map((migration) => migration.name)
         .filter((name) => name.startsWith('module:gws-ea-meetings:')),
-    ).toEqual(['module:gws-ea-meetings:chat-booking-requests', 'module:gws-ea-meetings:chat-booking-reports']);
+    ).toEqual([
+      'module:gws-ea-meetings:chat-booking-requests',
+      'module:gws-ea-meetings:chat-booking-reports',
+      bookingsMigration.name,
+    ]);
   });
 
   it('are portable: async, and free of every banned construct', () => {
@@ -245,7 +257,7 @@ describe('squashed migrations', () => {
   it('update an install on the earlier chain by dropping the holds, keeping every inbox row, each thread with no account yet and handed over', async () => {
     const db = await initSqliteTestDb();
     await runMigrations(db, earlierRelease());
-    await writeSlice4Work();
+    await writeSlice4Work(db);
     const before = rowsOf(db);
     const earlier = await appliedNames(db);
 
@@ -258,6 +270,7 @@ describe('squashed migrations', () => {
       CALENDAR_ACCESS,
       THREAD_ACCOUNTS,
       THREAD_PLACEMENT,
+      bookingsMigration.name,
     ]);
     for (const table of INBOX_TABLES) expect(before[table], table).not.toEqual([]);
     expect(rowsOf(db)).toEqual({
@@ -273,7 +286,7 @@ describe('squashed migrations', () => {
     });
     // A retry still finds its send in flight, and the thread still owns its booking.
     expect(await findSend(OUTSIDE, 'hash-2')).toMatchObject({ id: 'send-2', state: 'pending' });
-    expect(await getThreadBooking(THREAD, 'evt-review')).toMatchObject({ calendarId: CALENDAR });
+    expect(await getBooking({ kind: 'thread', key: THREAD }, 'evt-review')).toMatchObject({ calendarId: CALENDAR });
   });
 });
 

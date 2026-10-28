@@ -69,6 +69,7 @@ import '../gws-ea-matters/index.js';
 import { mainConversation } from '../gws-ea-matters/looks.js';
 import { renderMatter } from '../gws-ea-matters/render.js';
 import { mainSession, seedMain } from '../gws-ea-matters/testing/main-conversation.js';
+import '../gws-ea-meetings/index.js';
 import { FakeCalendar } from '../gws-ea-meetings/testing/fake-calendar.js';
 import { addPerson } from '../gws-ea-people/db.js';
 import '../gws-ea-people/index.js';
