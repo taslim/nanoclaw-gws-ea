@@ -170,6 +170,32 @@ describe('the Calendar client', () => {
     });
   });
 
+  it('reads the event version and sends it with changes so a newer event is not overwritten', async () => {
+    const { api, requests } = stubGoogle((request) =>
+      request.method === 'GET'
+        ? { status: 200, body: { id: 'evt-1', etag: '"version-1"' } }
+        : { status: 412, body: { error: { message: 'Event changed' } } },
+    );
+    const event = await api.getEvent('pat@principal.example', 'evt-1');
+    expect(event?.etag).toBe('"version-1"');
+    expect(requests[0].url.searchParams.get('fields')?.split(',')).toContain('etag');
+    await expect(
+      api.patchEvent('pat@principal.example', 'evt-1', { summary: 'Updated' }, 'all', event?.etag),
+    ).rejects.toMatchObject({ status: 412 });
+    expect(requests[1].headers['if-match']).toBe('"version-1"');
+  });
+
+  it('conditions cancellation on the version read so a newer event is not deleted', async () => {
+    const { api, requests } = stubGoogle(() => ({
+      status: 412,
+      body: { error: { message: 'Event changed' } },
+    }));
+    await expect(api.deleteEvent('pat@principal.example', 'evt-1', 'all', '"version-1"')).rejects.toMatchObject({
+      status: 412,
+    });
+    expect(requests[0].headers['if-match']).toBe('"version-1"');
+  });
+
   it('deletes an event, and reads one already gone as gone', async () => {
     const statuses = [204, 404, 410];
     const { api, requests } = stubGoogle(() => {

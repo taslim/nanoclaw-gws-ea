@@ -267,13 +267,15 @@ export class FakeCalendar implements MeetingsCalendarApi {
     return 'created' as const;
   }
 
-  async patchEvent(calendarId: string, eventId: string, event: EventWrite, sendUpdates: SendUpdates) {
+  async patchEvent(calendarId: string, eventId: string, event: EventWrite, sendUpdates: SendUpdates, etag?: string) {
     this.call();
     const failure = this.injectedFor('patch');
     if (failure && !failure.afterApplying) throw failure.error;
     const index = this.find(calendarId, eventId);
     if (index < 0)
       throw new GoogleApiError(404, `Google refused /calendars/${calendarId}/events/${eventId}: Not Found`);
+    if (etag !== undefined && etag !== this.events[index].etag)
+      throw new GoogleApiError(412, 'The event changed since it was read.');
     this.events.splice(index, 1, this.revised(apply(this.events[index], event, this.meetCreation)));
     this.writes.push({ op: 'patch', calendarId, eventId, sendUpdates, fields: event });
     if (failure) throw failure.error;
@@ -347,7 +349,7 @@ export class FakeCalendar implements MeetingsCalendarApi {
     });
   }
 
-  async deleteEvent(calendarId: string, eventId: string, sendUpdates: SendUpdates) {
+  async deleteEvent(calendarId: string, eventId: string, sendUpdates: SendUpdates, etag?: string) {
     this.call();
     const failure = this.injectedFor('delete');
     if (failure && !failure.afterApplying) throw failure.error;
@@ -356,6 +358,8 @@ export class FakeCalendar implements MeetingsCalendarApi {
       if (failure) throw failure.error;
       return 'gone' as const;
     }
+    if (etag !== undefined && etag !== this.events[index].etag)
+      throw new GoogleApiError(412, 'The event changed since it was read.');
     this.events.splice(index, 1, this.revised({ ...this.events[index], status: 'cancelled' }));
     this.writes.push({ op: 'delete', calendarId, eventId, sendUpdates });
     if (failure) throw failure.error;
@@ -373,13 +377,14 @@ export function delegatingCalendarApi(current: () => MeetingsCalendarApi): Meeti
     listEventDetails: (calendarId, timeMin, timeMax) => current().listEventDetails(calendarId, timeMin, timeMax),
     insertEvent: (calendarId, eventId, event, sendUpdates) =>
       current().insertEvent(calendarId, eventId, event, sendUpdates),
-    patchEvent: (calendarId, eventId, event, sendUpdates) =>
-      current().patchEvent(calendarId, eventId, event, sendUpdates),
+    patchEvent: (calendarId, eventId, event, sendUpdates, etag) =>
+      current().patchEvent(calendarId, eventId, event, sendUpdates, etag),
     getGuests: (calendarId, eventId) => current().getGuests(calendarId, eventId),
     setGuests: (calendarId, eventId, guests, sendUpdates, etag) =>
       current().setGuests(calendarId, eventId, guests, sendUpdates, etag),
     setOwnEntry: (calendarId, eventId, entry, sendUpdates, etag) =>
       current().setOwnEntry(calendarId, eventId, entry, sendUpdates, etag),
-    deleteEvent: (calendarId, eventId, sendUpdates) => current().deleteEvent(calendarId, eventId, sendUpdates),
+    deleteEvent: (calendarId, eventId, sendUpdates, etag) =>
+      current().deleteEvent(calendarId, eventId, sendUpdates, etag),
   };
 }
