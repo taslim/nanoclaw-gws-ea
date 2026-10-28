@@ -32,6 +32,10 @@ const REVIEWED: Readonly<Record<string, Review>> = {
     kind: 'host-only',
     reason: 'the response frame keeps its transport error code; the rendered error message explains the refusal',
   },
+  'gws-ea-meetings/booking.ts unreadableFrame: code': {
+    kind: 'host-only',
+    reason: 'the refusal message explains the unconfirmed outcome and next step; the code classifies it for the host',
+  },
   'gws-ea-meetings/booking.ts frame: code': {
     kind: 'host-only',
     reason: 'the response frame keeps its transport error code; the rendered error message explains the refusal',

@@ -92,6 +92,28 @@ const MINUTE = 60_000;
 const DAY = 24 * 60 * MINUTE;
 const TOOL_WAIT_MS = 120_000;
 
+class UnreadableBookingStateError extends Error {}
+
+function savedBookingJson(json: string): unknown {
+  try {
+    return JSON.parse(json);
+  } catch (error) {
+    if (!(error instanceof SyntaxError)) throw error;
+    throw new UnreadableBookingStateError('The saved booking JSON is unreadable.', { cause: error });
+  }
+}
+
+function isPermanentGoogleFailure(error: unknown): error is GoogleApiError {
+  return (
+    error instanceof GoogleApiError &&
+    !error.retryable &&
+    !(
+      error.status === 403 &&
+      ['rateLimitExceeded', 'userRateLimitExceeded', 'quotaExceeded', 'dailyLimitExceeded'].includes(error.reason ?? '')
+    )
+  );
+}
+
 interface Principal {
   readonly timezone: string;
   readonly rules: SchedulingRules;
@@ -215,10 +237,11 @@ export function createBookingTools(deps: BookingToolsDeps) {
   }
 
   function terminalFrame(row: BookingAnswerRequest): ResponseFrame {
-    const stored: unknown = JSON.parse(row.answerJson);
+    const stored = savedBookingJson(row.answerJson);
     if (!isRecord(stored) || stored.id !== row.requestId)
-      throw new Error('The saved terminal booking answer is unreadable.');
-    if (stored.ok === true && isRecord(stored.data)) return { id: row.requestId, ok: true, data: stored.data };
+      throw new UnreadableBookingStateError('The saved terminal booking answer is unreadable.');
+    if (stored.ok === true && isRecord(stored.data) && typeof stored.data.message === 'string')
+      return { id: row.requestId, ok: true, data: stored.data };
     if (
       stored.ok === false &&
       isRecord(stored.error) &&
@@ -226,15 +249,52 @@ export function createBookingTools(deps: BookingToolsDeps) {
       typeof stored.error.message === 'string'
     )
       return { id: row.requestId, ok: false, error: { code: stored.error.code, message: stored.error.message } };
-    throw new Error('The saved terminal booking answer has no outcome.');
+    throw new UnreadableBookingStateError('The saved terminal booking answer has no outcome.');
   }
 
-  function terminalResult(row: BookingAnswerRequest): Record<string, unknown> {
-    const frame = terminalFrame(row);
+  async function unreadableFrame(row: PendingBookingRequest): Promise<Extract<ResponseFrame, { ok: false }>> {
+    const surface = bookingSurfaceFor(row.owner);
+    const event = row.state === 'write' ? `; event ${row.eventId} on calendar ${row.calendarId}` : '';
+    const reported = await writeNoteForMain({
+      id: `gws-ea-booking-unreadable-${eventIdFor(row.sessionId, row.requestId)}`,
+      timestamp: new Date().toISOString(),
+      wake: true,
+      text: `The saved booking state is unreadable for request ${row.requestId} to ${row.action} (${row.owner.kind} ${row.owner.key}${event}). It may or may not have gone through in Google. Check the calendar before acting again; the host will not replay this request.`,
+      pieces: [
+        ...(row.owner.kind === 'thread' ? [{ kind: 'thread' as const, reference: row.owner.key }] : []),
+        ...(row.state === 'write' ? [{ kind: 'event' as const, reference: `${row.calendarId}/${row.eventId}` }] : []),
+      ],
+    });
+    if (reported === 'no-main' || reported === 'no-principal')
+      log.warn('Nobody to tell of unreadable booking state', { owner: row.owner, requestId: row.requestId, reported });
+    return {
+      id: row.requestId,
+      ok: false,
+      error: {
+        code: 'forbidden',
+        message: `The saved booking state is unreadable, so its outcome cannot be confirmed. Main hears the same. ${surface.words.waitForMain} before acting on it again.`,
+      },
+    };
+  }
+
+  async function terminalAnswer(row: BookingAnswerRequest): Promise<ResponseFrame> {
+    try {
+      return terminalFrame(row);
+    } catch (error) {
+      if (!(error instanceof UnreadableBookingStateError)) throw error;
+      return unreadableFrame(row);
+    }
+  }
+
+  function resultOf(frame: ResponseFrame): Record<string, unknown> {
     if (frame.ok && isRecord(frame.data)) return frame.data;
     if (!frame.ok && (frame.error.code === 'forbidden' || frame.error.code === 'invalid-args'))
       throw new ActionRefusal(frame.error.code, frame.error.message);
     throw new Error('The saved terminal booking answer has no outcome.');
+  }
+
+  async function terminalResult(row: BookingAnswerRequest): Promise<Record<string, unknown>> {
+    return resultOf(await terminalAnswer(row));
   }
 
   async function viewOf(session: Session, startedAt = new Date().toISOString()): Promise<BookingView> {
@@ -258,9 +318,10 @@ export function createBookingTools(deps: BookingToolsDeps) {
             throw forbidden('This booking request ID was already used for different work.');
           if (!(await bookingSurfaceFor(existing.owner).stillServing(session)))
             throw forbidden('This session no longer serves this booking’s owner.');
+          const frame = await terminalAnswer(existing);
           if (Date.now() - Date.parse(existing.createdAt) >= TOOL_WAIT_MS)
-            await deliverAnswer(session, requestId, existing.createdAt, terminalFrame(existing));
-          return terminalResult(existing);
+            await deliverAnswer(session, requestId, existing.createdAt, frame);
+          return resultOf(frame);
         }
         const view = await viewOf(session, startedAt);
         let preparationRefusal: ActionRefusal | undefined;
@@ -304,7 +365,7 @@ export function createBookingTools(deps: BookingToolsDeps) {
                 createdAt: view.startedAt,
                 answerJson: JSON.stringify(response),
               }));
-            return saved.state === 'answer' ? terminalFrame(saved) : response;
+            return saved.state === 'answer' ? terminalAnswer(saved) : response;
           }),
         );
         if (frame === ANSWER_LATER) return frame;
@@ -475,16 +536,16 @@ export function createBookingTools(deps: BookingToolsDeps) {
   const spanOf = (row: BookingRequest): Span => ({ start: Date.parse(row.startAt), end: Date.parse(row.endAt) });
 
   function contentOf(row: BookingRequest): Record<string, unknown> {
-    const stored: unknown = JSON.parse(row.requestJson);
-    if (!isRecord(stored)) throw new Error('The saved booking request is unreadable.');
+    const stored = savedBookingJson(row.requestJson);
+    if (!isRecord(stored)) throw new UnreadableBookingStateError('The saved booking request is unreadable.');
     if (row.carriedOver) return stored;
-    if (!isRecord(stored.content)) throw new Error('The saved booking content is unreadable.');
+    if (!isRecord(stored.content)) throw new UnreadableBookingStateError('The saved booking content is unreadable.');
     return stored.content;
   }
 
   function preparedOf(row: BookingRequest): PreparedRequest {
     const content = contentOf(row);
-    const stored: unknown = JSON.parse(row.requestJson);
+    const stored = savedBookingJson(row.requestJson);
     if (row.carriedOver) return { content, invitees: [], previous: spanOf(row), video: false, fresh: [] };
     if (
       !isRecord(stored) ||
@@ -498,7 +559,7 @@ export function createBookingTools(deps: BookingToolsDeps) {
       !stored.fresh.every((v: unknown) => typeof v === 'string') ||
       (stored.title !== undefined && typeof stored.title !== 'string')
     )
-      throw new Error('The saved booking details are unreadable.');
+      throw new UnreadableBookingStateError('The saved booking details are unreadable.');
     return {
       content,
       invitees: stored.invitees,
@@ -510,8 +571,8 @@ export function createBookingTools(deps: BookingToolsDeps) {
   }
 
   function outcomeOf(row: BookingRequest): BookingOutcome {
-    const stored: unknown = row.resultJson === null ? undefined : JSON.parse(row.resultJson);
-    if (!isRecord(stored)) throw new Error('The saved booking result is unreadable.');
+    const stored = row.resultJson === null ? undefined : savedBookingJson(row.resultJson);
+    if (!isRecord(stored)) throw new UnreadableBookingStateError('The saved booking result is unreadable.');
     if (row.carriedOver && !isRecord(stored.result)) return { kind: 'success', result: stored, span: spanOf(row) };
     if (
       !['success', 'removed', 'changed', 'unknown', 'absent', 'refused'].includes(String(stored.kind)) ||
@@ -521,7 +582,7 @@ export function createBookingTools(deps: BookingToolsDeps) {
       typeof stored.span.end !== 'number' ||
       (stored.refusal !== undefined && typeof stored.refusal !== 'string')
     )
-      throw new Error('The saved booking outcome is unreadable.');
+      throw new UnreadableBookingStateError('The saved booking outcome is unreadable.');
     const kind = stored.kind as BookingOutcome['kind'];
     const conference =
       isRecord(stored.conference) && ['success', 'pending', 'failure'].includes(String(stored.conference.status))
@@ -902,13 +963,7 @@ export function createBookingTools(deps: BookingToolsDeps) {
     if (recovering && isGoogleConnectionDown(error)) throw error;
     if (isGoogleConnectionDown(error))
       return retainAndRefuse(row, forbidden(`${GOOGLE_CONNECTION_DOWN} ${view.surface.words.connectionStep}`));
-    const rateLimited =
-      error instanceof GoogleApiError &&
-      error.status === 403 &&
-      ['rateLimitExceeded', 'userRateLimitExceeded', 'quotaExceeded', 'dailyLimitExceeded'].includes(
-        error.reason ?? '',
-      );
-    if (error instanceof GoogleApiError && !error.retryable && !rateLimited)
+    if (isPermanentGoogleFailure(error))
       return retainAndRefuse(row, forbidden(`Google refused this booking request: ${error.message}`));
     log.warn('Booking write awaits Google confirmation', { requestId: row.requestId, owner: row.owner, error });
     return ANSWER_LATER;
@@ -977,6 +1032,7 @@ export function createBookingTools(deps: BookingToolsDeps) {
     replayAllowed: boolean,
     recovering = false,
   ): ReturnType<DeferredActionAnswer> {
+    preparedOf(row);
     if (row.applied) return finishRequest(row, view, outcomeOf(row));
     const event = await calendar().getEvent(row.calendarId, row.eventId);
     if (!event) {
@@ -1032,7 +1088,7 @@ export function createBookingTools(deps: BookingToolsDeps) {
     try {
       if (row) {
         view.startedAt = row.createdAt;
-        return row.state === 'answer' ? terminalResult(row) : await settleRequest(row, view, true);
+        return row.state === 'answer' ? await terminalResult(row) : await settleRequest(row, view, true);
       }
       let prepared: PreparedRequest;
       let event: CalendarEvent | undefined;
@@ -1114,7 +1170,12 @@ export function createBookingTools(deps: BookingToolsDeps) {
       if (!row) {
         if (isGoogleConnectionDown(error))
           throw forbidden(`${GOOGLE_CONNECTION_DOWN} ${view.surface.words.connectionStep}`);
+        if (isPermanentGoogleFailure(error)) throw forbidden(`Google refused this booking request: ${error.message}`);
         throw error;
+      }
+      if (error instanceof UnreadableBookingStateError) {
+        const frame = await unreadableFrame(row);
+        throw forbidden(frame.error.message);
       }
       let current: PendingBookingRequest | undefined;
       try {
@@ -1181,19 +1242,24 @@ export function createBookingTools(deps: BookingToolsDeps) {
             let frame: ResponseFrame;
             try {
               const result =
-                row.state === 'answer' ? terminalResult(row) : await settleRequest(row, view, replayAllowed, true);
+                row.state === 'answer'
+                  ? await terminalResult(row)
+                  : await settleRequest(row, view, replayAllowed, true);
               if (result === ANSWER_LATER) return;
               frame = { id: row.requestId, ok: true, data: result };
             } catch (error) {
-              if (!(error instanceof ActionRefusal)) throw error;
-              const current = await getBookingRequest(row.sessionId, row.requestId);
-              if (
-                current &&
-                current.state !== 'answer' &&
-                !(current.applied && current.reported && outcomeOf(current).refusal === error.message)
-              )
-                throw error;
-              frame = { id: row.requestId, ok: false, error: { code: error.code, message: error.message } };
+              if (error instanceof UnreadableBookingStateError) frame = await unreadableFrame(row);
+              else {
+                if (!(error instanceof ActionRefusal)) throw error;
+                const current = await getBookingRequest(row.sessionId, row.requestId);
+                if (
+                  current &&
+                  current.state !== 'answer' &&
+                  !(current.applied && current.reported && outcomeOf(current).refusal === error.message)
+                )
+                  throw error;
+                frame = { id: row.requestId, ok: false, error: { code: error.code, message: error.message } };
+              }
             }
             if (session) {
               if (!answered) await deliverAnswer(session, row.requestId, row.createdAt, frame);

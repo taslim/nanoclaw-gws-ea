@@ -842,6 +842,213 @@ it.each(['lookup', 'rolled-back-intent'] as const)(
   },
 );
 
+it.each([400, 403, 404])('answers a permanent Google %s refusal before recording an intent', async (status) => {
+  const action = `permanent-google-${status}`;
+  registerBookingDelivery(action, reads.book);
+  enqueueBooking(emailSession, action, action, BOOK);
+  vi.spyOn(calendar, 'getCalendar').mockRejectedValue(new GoogleApiError(status, 'Calendar request refused'));
+  await deliverSessionMessages(emailSession);
+  expect(responseIn(emailSession, action)).toMatchObject({
+    ok: false,
+    error: { code: 'forbidden', message: expect.stringContaining('Google refused this booking request') },
+  });
+  expect(await wasDelivered(emailSession, action)).toBe(true);
+  expect(calendar.writes).toEqual([]);
+  await reads.resumePending();
+  expect(await getBookingRequest(emailSession.id, action)).toBeUndefined();
+});
+
+it.each([
+  new GoogleApiError(0, 'Connection interrupted'),
+  new GoogleApiError(429, 'Too many requests'),
+  new GoogleApiError(503, 'Service unavailable'),
+  ...['rateLimitExceeded', 'userRateLimitExceeded', 'quotaExceeded', 'dailyLimitExceeded'].map(
+    (reason) => new GoogleApiError(403, 'Quota exhausted', { reason }),
+  ),
+])('keeps a transient pre-intent Google failure retryable: %s', async (error) => {
+  const action = 'transient-google';
+  registerBookingDelivery(action, reads.book);
+  enqueueBooking(emailSession, action, action, BOOK);
+  const get = vi.spyOn(calendar, 'getCalendar').mockRejectedValue(error);
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    await deliverSessionMessages(emailSession);
+    expect(responseIn(emailSession, action)).toBeUndefined();
+    expect(await wasDelivered(emailSession, action)).toBe(false);
+    expect(await getDeliveryAttempt(action)).toBeUndefined();
+  }
+  get.mockRestore();
+  await deliverSessionMessages(emailSession);
+  expect(responseIn(emailSession, action)).toMatchObject({ ok: true });
+  expect(calendar.writes.map((write) => write.op)).toEqual(['insert']);
+});
+
+it('keeps the certain pre-intent Google refusal through failed late response publication', async () => {
+  await mainSession();
+  const action = 'permanent-google-publication';
+  registerBookingDelivery(action, reads.book);
+  enqueueBooking(emailSession, action, action, BOOK);
+  vi.setSystemTime(Date.now() + 120_001);
+  vi.spyOn(calendar, 'getCalendar').mockRejectedValueOnce(new GoogleApiError(400, 'Calendar request refused'));
+  const write = sessionMessages.writeSessionMessage;
+  vi.spyOn(sessionMessages, 'writeSessionMessage')
+    .mockRejectedValueOnce(new Error('Response publication interrupted'))
+    .mockImplementation(write);
+  await deliverSessionMessages(emailSession);
+  expect(await wasDelivered(emailSession, action)).toBe(false);
+  expect(responseIn(emailSession, action)).toBeUndefined();
+  await deliverSessionMessages(emailSession);
+  expect(responseIn(emailSession, action)).toMatchObject({
+    ok: false,
+    error: { code: 'forbidden', message: expect.stringContaining('Google refused this booking request') },
+  });
+  expect(wakeMessages(emailSession)).toHaveLength(1);
+  expect(calendar.writes).toEqual([]);
+});
+
+it.each([
+  ['request syntax', false, 'request_json', '{'],
+  ['request shape', false, 'request_json', '{}'],
+  ['landed request syntax', true, 'request_json', '{'],
+  ['applied result syntax', true, 'result_json', '{'],
+  ['applied result shape', true, 'result_json', '{}'],
+] as const)(
+  'reports unreadable %s to main and answers without another calendar write',
+  async (_, landed, column, json) => {
+    const main = await mainSession();
+    const row = await pendingBook(emailSession, 'unreadable-write', landed);
+    if (column === 'result_json')
+      await getDb().run(
+        'UPDATE gws_ea_booking_requests SET applied=1 WHERE session_id=? AND request_id=?',
+        row.sessionId,
+        row.requestId,
+      );
+    await getDb().run(
+      `UPDATE gws_ea_booking_requests SET ${column}=? WHERE session_id=? AND request_id=?`,
+      json,
+      row.sessionId,
+      row.requestId,
+    );
+    vi.setSystemTime(Date.now() + 120_001);
+    const writesBefore = [...calendar.writes];
+    await reads.resumePending();
+    expect(notesIn(main)).toHaveLength(1);
+    expect(notesIn(main)[0]).toContain('may or may not have gone through in Google');
+    expect(notesIn(main)[0]).toContain(row.eventId);
+    expect(notesIn(main)[0]).toContain(row.owner.key);
+    expect(responseIn(emailSession, row.requestId)).toMatchObject({
+      ok: false,
+      error: { code: 'forbidden', message: expect.stringContaining('saved booking state is unreadable') },
+    });
+    expect(wakeMessages(emailSession)).toHaveLength(1);
+    expect(calendar.writes).toEqual(writesBefore);
+    expect(await getBookingRequest(row.sessionId, row.requestId)).toBeUndefined();
+  },
+);
+
+it('answers a live replay of unreadable pending intent after warning main without replaying its mutation', async () => {
+  const main = await mainSession();
+  const action = 'unreadable-live-intent';
+  registerBookingDelivery(action, reads.book);
+  calendar.failNext({ op: 'insert', error: new Error('Google answer lost') });
+  expect(await reads.book({ ...BOOK, action, requestId: action }, emailSession, action)).toBe(ANSWER_LATER);
+  const row = await getBookingRequest(emailSession.id, action);
+  if (!row || row.state !== 'write') throw new Error('No durable booking request');
+  await getDb().run(
+    'UPDATE gws_ea_booking_requests SET request_json=? WHERE session_id=? AND request_id=?',
+    '{',
+    row.sessionId,
+    row.requestId,
+  );
+  enqueueBooking(emailSession, action, action, BOOK);
+  await deliverSessionMessages(emailSession);
+  expect(notesIn(main)).toHaveLength(1);
+  expect(notesIn(main)[0]).toContain(row.eventId);
+  expect(responseIn(emailSession, action)).toMatchObject({ ok: false, error: { code: 'forbidden' } });
+  expect(await wasDelivered(emailSession, action)).toBe(true);
+  expect(calendar.writes).toEqual([]);
+  await reads.resumePending();
+  expect(await getBookingRequest(row.sessionId, row.requestId)).toBeUndefined();
+  expect(notesIn(main)).toHaveLength(1);
+});
+
+it.each([
+  ['live', '{'],
+  ['live', '{}'],
+  ['live', '{"id":"unreadable-answer","ok":true,"data":{}}'],
+  ['recovery', '{'],
+] as const)('settles an unreadable terminal answer during %s: %s', async (mode, json) => {
+  const main = await mainSession();
+  const action = 'unreadable-answer';
+  registerBookingDelivery(action, reads.book);
+  enqueueBooking(emailSession, action, action, BOOK);
+  await getDb().run('UPDATE gws_ea_threads SET booking_calendar_id=NULL WHERE thread_key=?', thread);
+  await expect(reads.book({ ...BOOK, action, requestId: action }, emailSession, action)).rejects.toMatchObject({
+    code: 'forbidden',
+  });
+  await getDb().run(
+    'UPDATE gws_ea_booking_requests SET result_json=? WHERE session_id=? AND request_id=?',
+    json,
+    emailSession.id,
+    action,
+  );
+  await setThreadBookingCalendar(thread, TEAM);
+  vi.setSystemTime(Date.now() + 120_001);
+  if (mode === 'live') await deliverSessionMessages(emailSession);
+  else await reads.resumePending();
+  expect(notesIn(main)).toHaveLength(1);
+  expect(notesIn(main)[0]).toContain('may or may not have gone through in Google');
+  expect(notesIn(main)[0]).toContain(thread);
+  expect(responseIn(emailSession, action)).toMatchObject({
+    ok: false,
+    error: { code: 'forbidden', message: expect.stringContaining('saved booking state is unreadable') },
+  });
+  await reads.resumePending();
+  expect(await getBookingRequest(emailSession.id, action)).toBeUndefined();
+  expect(notesIn(main)).toHaveLength(1);
+  expect(wakeMessages(emailSession)).toHaveLength(1);
+  expect(calendar.writes).toEqual([]);
+});
+
+it.each(['report', 'response'] as const)(
+  'retains unreadable intent and its identity through failed %s publication',
+  async (failure) => {
+    const main = await mainSession();
+    const row = await pendingBook(emailSession, 'unreadable-publication', true);
+    await getDb().run(
+      'UPDATE gws_ea_booking_requests SET request_json=? WHERE session_id=? AND request_id=?',
+      '{',
+      row.sessionId,
+      row.requestId,
+    );
+    if (failure === 'report') {
+      const write = mainNotesModule.writeNoteForMain;
+      vi.spyOn(mainNotesModule, 'writeNoteForMain')
+        .mockRejectedValueOnce(new Error('Main report interrupted'))
+        .mockImplementation(write);
+    } else {
+      const write = sessionMessages.writeSessionMessage;
+      vi.spyOn(sessionMessages, 'writeSessionMessage').mockImplementation(async (...args) => {
+        if (args[2].id === `action-resp-${row.requestId}`) throw new Error('Response interrupted');
+        return write(...args);
+      });
+    }
+    await reads.resumePending();
+    expect(responseIn(emailSession, row.requestId)).toBeUndefined();
+    expect(await getBookingRequest(row.sessionId, row.requestId)).toMatchObject({
+      owner: row.owner,
+      calendarId: row.calendarId,
+      eventId: row.eventId,
+      requestJson: '{',
+    });
+    vi.restoreAllMocks();
+    await reads.resumePending();
+    expect(notesIn(main)).toHaveLength(1);
+    expect(responseIn(emailSession, row.requestId)).toMatchObject({ ok: false, error: { code: 'forbidden' } });
+    expect(await getBookingRequest(row.sessionId, row.requestId)).toBeUndefined();
+    expect(calendar.writes.map((write) => write.op)).toEqual(['insert']);
+  },
+);
+
 it.each(['response', 'wake'] as const)(
   'keeps a recovered terminal refusal until its %s publishes without retrying Google',
   async (failure) => {
