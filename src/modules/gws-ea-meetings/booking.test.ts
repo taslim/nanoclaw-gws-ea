@@ -841,3 +841,37 @@ it('gives a no-change answer with its current video link without sending an upda
   expect(calendar.writes.map((entry) => entry.op)).toEqual(['insert']);
   expect(await getBookingRequest(chatSession.id, 'unchanged')).toBeUndefined();
 });
+
+it('keeps a same-time change quiet when the booking already stands at the requested time', async () => {
+  const main = await mainSession();
+  const booked = await reads.book(BOOK, emailSession, 'quiet-original');
+  if (booked === ANSWER_LATER) throw new Error('Expected the initial booking to finish');
+  const writes = calendar.writes.length;
+  const notes = notesIn(main).length;
+  const result = await reads.changeBooking(
+    { booking: booked.booking, start: BOOK.start },
+    emailSession,
+    'quiet-change',
+  );
+  expect(result).toMatchObject({ message: expect.stringContaining('nothing changed') });
+  expect(calendar.writes).toHaveLength(writes);
+  expect(notesIn(main)).toHaveLength(notes);
+});
+
+it('changes only text without rescheduling when an existing booking now overlaps another event', async () => {
+  const booked = await reads.book(BOOK, emailSession, 'text-original');
+  if (booked === ANSWER_LATER) throw new Error('Expected the initial booking to finish');
+  calendar.put({
+    calendarId: TEAM,
+    id: 'new-overlap',
+    start: { dateTime: BOOK.start },
+    end: { dateTime: '2026-10-20T13:00:00Z' },
+  });
+  await expect(
+    reads.changeBooking({ booking: booked.booking, title: 'New venue title' }, emailSession, 'text-only-change'),
+  ).resolves.not.toBe(ANSWER_LATER);
+  expect(calendar.event(TEAM, String(booked.booking))).toMatchObject({
+    summary: 'New venue title',
+    start: { dateTime: BOOK.start.replace('Z', '.000Z') },
+  });
+});

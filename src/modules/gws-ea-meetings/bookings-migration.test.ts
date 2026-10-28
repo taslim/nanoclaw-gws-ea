@@ -6,6 +6,7 @@ import { getRegisteredMigrations, runMigrations } from '../../db/migrations/inde
 import '../index.js';
 import { bookingOwner, getBooking, getBookingRequest, listPendingBookingRequests } from './bookings-db.js';
 import { bookingsMigration } from './bookings-migration.js';
+import { chatBookingReportsMigration } from './chat-booking-report-migration.js';
 
 const AT = '2026-10-18T12:00:00.000Z';
 const CALENDAR = 'Juno.Hale@example.com';
@@ -195,4 +196,48 @@ it('migrates a fresh database through the full chain and safely skips a repeated
   expect(await db.get('SELECT name FROM schema_version WHERE name=?', 'module:gws-ea-meetings:bookings')).toEqual({
     name: 'module:gws-ea-meetings:bookings',
   });
+});
+
+it('keeps the original mutation ledger and pending index when adding initial bookings, then carries every unanswered request into the shared ledger', async () => {
+  const db = await initSqliteTestDb();
+  await runMigrations(
+    db,
+    getRegisteredMigrations().filter(
+      (migration) => migration.name !== bookingsMigration.name && migration.name !== chatBookingReportsMigration.name,
+    ),
+  );
+  await seedChat(db);
+  await oldRequest(db, 'change-venue', 'change', 1, '{"booking":"event-mira"}', 0, 0);
+  const before = await db.all('SELECT * FROM gws_ea_chat_booking_requests');
+
+  await runMigrations(db, [chatBookingReportsMigration]);
+  await runMigrations(db, [chatBookingReportsMigration]);
+
+  expect(await db.all('SELECT * FROM gws_ea_chat_booking_requests')).toEqual(before);
+  await oldRequest(db, 'book-venue', 'book', 0, null, 0, 0);
+  expect(
+    await db.get("SELECT sql FROM sqlite_master WHERE type='index' AND name='gws_ea_chat_booking_requests_pending'"),
+  ).toEqual({
+    sql: 'CREATE INDEX gws_ea_chat_booking_requests_pending ON gws_ea_chat_booking_requests(answered,created_at)',
+  });
+
+  await migrate(db);
+
+  expect(await listPendingBookingRequests()).toMatchObject([
+    { requestId: 'book-venue', action: 'book', applied: false, carriedOver: true },
+    {
+      requestId: 'change-venue',
+      action: 'change',
+      applied: true,
+      resultJson: '{"booking":"event-mira"}',
+      carriedOver: true,
+    },
+  ]);
+  expect(
+    await db.get("SELECT sql FROM sqlite_master WHERE type='index' AND name='gws_ea_booking_requests_pending'"),
+  ).toEqual({
+    sql: 'CREATE INDEX gws_ea_booking_requests_pending ON gws_ea_booking_requests(created_at,session_id,request_id)',
+  });
+  await expectOldTablesGone(db);
+  expect(await db.all('PRAGMA foreign_key_check')).toEqual([]);
 });

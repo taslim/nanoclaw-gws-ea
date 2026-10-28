@@ -21,7 +21,7 @@ import type { SenderVerdict } from '../gws-ea-inbox/authentication.js';
 import { domainOf, normalizeAddress } from '../gws-ea-inbox/mime.js';
 import { assistantAddresses } from '../gws-ea-inbox/runtime.js';
 import { threadsWithMessageIds } from '../gws-ea-inbox/thread-map.js';
-import { bookingThread } from '../gws-ea-meetings/thread-calendar.js';
+import { bookingOwner } from '../gws-ea-meetings/bookings-db.js';
 import { getPerson } from '../gws-ea-people/db.js';
 import { loadPrincipalRecognizer } from '../gws-ea-profile/db.js';
 import { getMatter, listOpenMatterLinks, type Matter, type OpenMatterLink, type PieceKind } from './db.js';
@@ -172,12 +172,12 @@ export async function candidatesFor(piece: NewPiece, reads?: CandidateReads): Pr
   const answered = new Set(await threadsWithMessageIds(piece.answers ?? []));
   const slash = piece.reference.indexOf('/');
   const booker =
-    piece.kind === 'event'
-      ? await bookingThread(piece.reference.slice(0, slash), piece.reference.slice(slash + 1))
+    piece.kind === 'event' && slash >= 0
+      ? await bookingOwner(piece.reference.slice(0, slash), piece.reference.slice(slash + 1))
       : undefined;
-  for (const link of links.filter((held) => held.kind === 'thread')) {
-    if (answered.has(link.reference)) suggest(link.matter_id, 'reply chain');
-    if (link.reference === booker) suggest(link.matter_id, 'booking');
+  for (const link of links.filter((held) => held.kind === 'thread' || held.kind === 'chat')) {
+    if (link.kind === 'thread' && answered.has(link.reference)) suggest(link.matter_id, 'reply chain');
+    if (booker && link.kind === booker.kind && link.reference === booker.key) suggest(link.matter_id, 'booking');
   }
 
   const matters = await Promise.all(

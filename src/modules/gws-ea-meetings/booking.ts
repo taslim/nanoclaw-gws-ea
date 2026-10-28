@@ -373,6 +373,7 @@ export function createBookingTools(deps: BookingToolsDeps) {
   }
 
   const list = new Intl.ListFormat('en', { style: 'long', type: 'conjunction' });
+  /** to: external-email, external-chat, job */
   const privateAdvice = 'Write it without that detail, or ask main with tell_main.';
   const tagRequest = 'gwsEaRequest';
   const ownerTag = (view: BookingView): string => (view.surface.owner.kind === 'thread' ? 'gwsEaThread' : 'gwsEaChat');
@@ -595,6 +596,7 @@ export function createBookingTools(deps: BookingToolsDeps) {
     );
   }
 
+  /** to: external-email, external-chat, job */
   async function ownBooking(content: Record<string, unknown>, view: BookingView) {
     const eventId = content.booking;
     if (typeof eventId !== 'string' || !/^[0-9a-f]{64}$/u.test(eventId))
@@ -625,6 +627,7 @@ export function createBookingTools(deps: BookingToolsDeps) {
     return { booking, event, span, invitees: inviteesOn(event, view) };
   }
 
+  /** to: external-email, external-chat, job */
   async function checkShareable(
     view: BookingView,
     entry: CalendarEntry | undefined,
@@ -673,6 +676,7 @@ export function createBookingTools(deps: BookingToolsDeps) {
     };
   }
 
+  /** to: external-email, external-chat, job */
   async function checkedBook(
     content: Record<string, unknown>,
     view: BookingView,
@@ -693,6 +697,7 @@ export function createBookingTools(deps: BookingToolsDeps) {
     return { entry, fields, span, invitees };
   }
 
+  /** to: external-email, external-chat, job */
   async function checkedChange(
     content: Record<string, unknown>,
     view: BookingView,
@@ -725,8 +730,7 @@ export function createBookingTools(deps: BookingToolsDeps) {
       ...(retimed ? { start: iso(span.start), end: iso(span.end) } : {}),
       ...(linking ? { conference: { requestId: eventIdFor('meet', event.id, requestId) } } : {}),
     };
-    // Replay must check the live time even when only text changes.
-    await assertAvailable(view, calendarId, [span], new Set([event.id]));
+    if (retimed) await assertAvailable(view, calendarId, [span], new Set([event.id]));
     const entry = await calendar().getCalendar(calendarId);
     if (!entry || !isBookableCalendar(entry, view.principal.addresses))
       throw forbidden('The booking calendar is no longer bookable. Ask main with tell_main.');
@@ -869,9 +873,16 @@ export function createBookingTools(deps: BookingToolsDeps) {
       return finishRequest(row, view, successOutcome(row, view, event));
     if (row.eventEtag === null) return finishRequest(row, view, unknownOutcome(row, view));
     if (event.etag !== row.eventEtag) return finishRequest(row, view, changedOutcome(row, event, view));
-    return replayAllowed && !row.carriedOver
-      ? applyRequest(row, view, event, recovering)
-      : finishRequest(row, view, unknownOutcome(row, view));
+    if (!replayAllowed || row.carriedOver) return finishRequest(row, view, unknownOutcome(row, view));
+    if (row.action === 'change') {
+      try {
+        await assertAvailable(view, row.calendarId, [spanOf(row)], new Set([row.eventId]));
+      } catch (error) {
+        if (error instanceof ActionRefusal) return dropAndRefuse(row, error);
+        throw error;
+      }
+    }
+    return applyRequest(row, view, event, recovering);
   }
 
   async function request(
