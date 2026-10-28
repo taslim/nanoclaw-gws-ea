@@ -28,7 +28,11 @@ type Review =
  * `src/modules`, its other fields sorted, a spread written `...name`.
  */
 const REVIEWED: Readonly<Record<string, Review>> = {
-  'gws-ea-meetings/booking.ts bound: code': {
+  'gws-ea-meetings/booking.ts terminalFrame: code': {
+    kind: 'host-only',
+    reason: 'the response frame keeps its transport error code; the rendered error message explains the refusal',
+  },
+  'gws-ea-meetings/booking.ts frame: code': {
     kind: 'host-only',
     reason: 'the response frame keeps its transport error code; the rendered error message explains the refusal',
   },
