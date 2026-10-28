@@ -185,7 +185,6 @@ const changes = {
 export const chatFreeTime = requestTool({
   ...common,
   name: 'free_time',
-  action: 'chat_free_time',
   repeatable: true,
   description:
     'Find free windows for this chat on the principal’s calendars. Returns times and fit only. Main must have set this chat’s booking calendar. Give the meeting’s length; pick any start that finishes in a window.',
@@ -200,7 +199,7 @@ export const chatFreeTime = requestTool({
 export const chatBook = requestTool({
   ...common,
   name: 'book',
-  action: 'chat_book',
+  lateAnswer: true,
   description:
     'Book an agreed time on the calendar main set for this chat. Invite only current roster members with known email addresses. Omit invitees for every such member except the principal and assistant. Google sends invitations and main hears.',
   properties: {
@@ -218,18 +217,16 @@ export const chatBook = requestTool({
 export const chatChangeBooking = requestTool({
   ...common,
   name: 'change_booking',
-  action: 'chat_change_booking',
-  repeatable: true,
+  lateAnswer: true,
   description:
-    'Change only a booking made in this chat, including after this chat becomes a dedicated job. Give the id and changed fields. Guests must still be current members. Google sends updates and main hears.',
+    'Change only a booking made in this chat, including after this chat becomes a dedicated job. Give the id and changed fields. Google sends updates and main hears.',
   properties: { booking, ...changes },
   required: ['booking'],
 });
 export const chatCancelBooking = requestTool({
   ...common,
   name: 'cancel_booking',
-  action: 'chat_cancel_booking',
-  repeatable: true,
+  lateAnswer: true,
   description: 'Cancel only a booking made in this chat. Google sends cancellation and main hears.',
   properties: { booking, timezone },
   required: ['booking'],

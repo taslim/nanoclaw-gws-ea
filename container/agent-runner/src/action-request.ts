@@ -238,6 +238,8 @@ export interface RequestToolSpec {
   readonly oneOf?: readonly object[];
   /** Whether making the same call again is safe: a repeat changes nothing twice. */
   readonly repeatable: boolean;
+  /** The host delivers a late answer in a message that wakes the session. */
+  readonly lateAnswer?: true;
   readonly timeoutMs: number;
   /**
    * The action sends a message when the host answers it ok, so its success
@@ -252,7 +254,13 @@ export interface RequestToolSpec {
   readonly prepare?: (fields: Record<string, unknown>, requestId: string) => Record<string, unknown> | string;
 }
 
-function timeoutText(requestId: string, repeatable: boolean): string {
+function timeoutText(requestId: string, repeatable: boolean, lateAnswer = false): string {
+  if (lateAnswer) {
+    return (
+      `The host has not answered request ${requestId} yet, and it may still go through. ` +
+      'The answer will arrive in a host message. Do not send this request again.'
+    );
+  }
   return (
     `The host has not answered request ${requestId} yet, and it may still go through. ` +
     (repeatable
@@ -312,7 +320,7 @@ export function requestTool(spec: RequestToolSpec): McpToolDefinition {
         case 'cancelled':
           return errorResult('The request was cancelled before the host answered.');
         case 'timeout':
-          return errorResult(timeoutText(result.requestId, spec.repeatable));
+          return errorResult(timeoutText(result.requestId, spec.repeatable, spec.lateAnswer));
         case 'answered':
           return answerResult(result.frame);
         default: {
