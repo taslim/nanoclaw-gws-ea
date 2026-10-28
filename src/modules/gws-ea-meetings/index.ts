@@ -1,6 +1,8 @@
 import { answeredGuard, answeringAction, forbidden, type ActionAnswer } from '../../cli/delivery-action.js';
 import { registerDeliveryAction } from '../../delivery.js';
 import { log } from '../../log.js';
+import { onHostStart, onHostShutdown } from '../../host-lifecycle.js';
+import { createBookingTools } from './booking.js';
 import { GOOGLE_CONNECTION_DOWN, isGoogleConnectionDown } from '../gws-ea-google/agent-boundary.js';
 import { registerMigration } from '../../db/migrations/index.js';
 import { registerChatLifecycleTask } from '../gws-ea-chats/lifecycle-tasks.js';
@@ -18,6 +20,33 @@ let calendar: MeetingsCalendarApi | undefined;
 // Built on first use: only a GWS-EA host with the assistant's Google sign-in reads a calendar.
 const calendarApi = (): MeetingsCalendarApi =>
   (calendar ??= createMeetingsCalendarApi({ token: () => hostGoogleAccessToken('calendar-host') }));
+
+const booking = createBookingTools({ calendar: calendarApi });
+let bookingTimer: NodeJS.Timeout | undefined;
+let bookingStopped = true;
+let bookingSweep: Promise<void> = Promise.resolve();
+function scheduleBookingSweep(): void {
+  if (bookingStopped) return;
+  bookingTimer = setTimeout(runBookingSweep, 60_000);
+  bookingTimer.unref();
+}
+function runBookingSweep(): void {
+  bookingSweep = booking
+    .resumePending()
+    .catch((error: unknown) => {
+      log.error('Booking recovery sweep failed', { error });
+    })
+    .finally(scheduleBookingSweep);
+}
+onHostStart(() => {
+  bookingStopped = false;
+  runBookingSweep();
+});
+onHostShutdown(async () => {
+  bookingStopped = true;
+  clearTimeout(bookingTimer);
+  await bookingSweep;
+});
 
 /**
  * With the Google connection down, which only the operator can restore, the
