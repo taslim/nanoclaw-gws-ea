@@ -195,11 +195,12 @@ export async function listPendingBookingRequests(): Promise<BookingRequest[]> {
   return rows.map(requestOf);
 }
 
-export async function hasPendingBookingRequest(calendarId: string, eventId: string): Promise<boolean> {
+export async function hasPendingBookingRequest(owner: BookingOwner, eventId: string): Promise<boolean> {
   return (
     (await getDb().get(
-      'SELECT 1 FROM gws_ea_booking_requests WHERE calendar_id=? AND event_id=? AND reported=0 LIMIT 1',
-      calendarId,
+      'SELECT 1 FROM gws_ea_booking_requests WHERE owner_kind=? AND owner_key=? AND event_id=? AND reported=0 LIMIT 1',
+      owner.kind,
+      owner.key,
       eventId,
     )) !== undefined
   );

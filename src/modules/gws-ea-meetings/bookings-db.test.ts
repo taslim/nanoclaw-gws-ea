@@ -87,8 +87,9 @@ it('keeps the first request for a matching fingerprint and refuses different wor
 
 it('keeps the first applied result, holds a booking only until reported, and retains reported work for mailbox cleanup', async () => {
   await recordBookingRequest(request());
-  expect(await hasPendingBookingRequest(CALENDAR, 'event-venue')).toBe(true);
-  expect(await hasPendingBookingRequest(CALENDAR, 'another-event')).toBe(false);
+  expect(await hasPendingBookingRequest(THREAD, 'event-venue')).toBe(true);
+  expect(await hasPendingBookingRequest(THREAD, 'another-event')).toBe(false);
+  expect(await hasPendingBookingRequest(CHAT, 'event-venue')).toBe(false);
 
   await markBookingRequestApplied('session-juno', 'change-venue', '{"booking":"event-venue","outcome":"changed"}');
   await markBookingRequestApplied('session-juno', 'change-venue', '{"outcome":"different"}');
@@ -97,11 +98,11 @@ it('keeps the first applied result, holds a booking only until reported, and ret
     resultJson: '{"booking":"event-venue","outcome":"changed"}',
     reported: false,
   });
-  expect(await hasPendingBookingRequest(CALENDAR, 'event-venue')).toBe(true);
+  expect(await hasPendingBookingRequest(THREAD, 'event-venue')).toBe(true);
 
   await markBookingRequestReported('session-juno', 'change-venue');
   await markBookingRequestReported('session-juno', 'change-venue');
-  expect(await hasPendingBookingRequest(CALENDAR, 'event-venue')).toBe(false);
+  expect(await hasPendingBookingRequest(THREAD, 'event-venue')).toBe(false);
   expect(await listPendingBookingRequests()).toMatchObject([{ requestId: 'change-venue', reported: true }]);
   await deleteBookingRequest('session-juno', 'change-venue');
   expect(await getBookingRequest('session-juno', 'change-venue')).toBeUndefined();

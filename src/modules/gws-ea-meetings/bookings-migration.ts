@@ -36,7 +36,7 @@ export const bookingsMigration: ModuleMigration = {
         PRIMARY KEY(session_id,request_id)
       );
       CREATE INDEX gws_ea_booking_requests_pending ON gws_ea_booking_requests(created_at,session_id,request_id);
-      CREATE INDEX gws_ea_booking_requests_booking ON gws_ea_booking_requests(calendar_id,event_id,reported);
+      CREATE INDEX gws_ea_booking_requests_booking ON gws_ea_booking_requests(owner_kind,owner_key,event_id,reported);
       INSERT INTO gws_ea_bookings(owner_kind,owner_key,calendar_id,event_id,booked_at)
         SELECT 'thread',thread_key,calendar_id,event_id,booked_at FROM gws_ea_thread_bookings;
       INSERT INTO gws_ea_bookings(owner_kind,owner_key,calendar_id,event_id,booked_at)
