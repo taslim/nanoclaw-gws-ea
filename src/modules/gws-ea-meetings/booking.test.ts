@@ -875,3 +875,39 @@ it('changes only text without rescheduling when an existing booking now overlaps
     start: { dateTime: BOOK.start.replace('Z', '.000Z') },
   });
 });
+
+it.each(['book', 'change'] as const)(
+  'reports an unreadable calendar after a confirmed %s without claiming the meeting was removed',
+  async (action) => {
+    const loseAccess = () => {
+      calendar.calendars.delete(TEAM);
+      vi.spyOn(calendar, 'getEvent').mockResolvedValueOnce(undefined);
+    };
+    let result: Awaited<ReturnType<typeof reads.book>>;
+    if (action === 'book') {
+      const insert = calendar.insertEvent.bind(calendar);
+      vi.spyOn(calendar, 'insertEvent').mockImplementationOnce(async (...args) => {
+        const written = await insert(...args);
+        loseAccess();
+        return written;
+      });
+      result = await reads.book(BOOK, emailSession, 'write-then-unreadable');
+    } else {
+      const booked = await reads.book(BOOK, emailSession, 'before-unreadable');
+      if (booked === ANSWER_LATER) throw new Error('Expected the initial booking to finish');
+      const patch = calendar.patchEvent.bind(calendar);
+      vi.spyOn(calendar, 'patchEvent').mockImplementationOnce(async (...args) => {
+        await patch(...args);
+        loseAccess();
+      });
+      result = await reads.changeBooking(
+        { booking: booked.booking, title: 'Updated venue title' },
+        emailSession,
+        'write-then-unreadable',
+      );
+    }
+    expect(result).toMatchObject({ message: expect.stringContaining('may or may not have gone through') });
+    expect(calendar.live()).toHaveLength(1);
+    expect(await getBookingRequest(emailSession.id, 'write-then-unreadable')).toMatchObject({ reported: true });
+  },
+);

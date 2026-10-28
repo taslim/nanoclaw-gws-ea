@@ -843,8 +843,15 @@ export function createBookingTools(deps: BookingToolsDeps) {
       }
     }
     const observed = row.action === 'cancel' ? undefined : await calendar().getEvent(row.calendarId, row.eventId);
-    if (row.action !== 'cancel' && (!observed || observed.status === 'cancelled'))
-      return finishRequest(row, view, removedOutcome(row, view));
+    if (row.action !== 'cancel' && !observed) {
+      const entry = await calendar().getCalendar(row.calendarId);
+      return finishRequest(
+        row,
+        view,
+        entry && isReadable(entry) ? removedOutcome(row, view) : unknownOutcome(row, view),
+      );
+    }
+    if (observed?.status === 'cancelled') return finishRequest(row, view, removedOutcome(row, view));
     return finishRequest(row, view, successOutcome(row, view, observed));
   }
 
