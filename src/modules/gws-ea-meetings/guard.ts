@@ -10,7 +10,6 @@ import { ALLOW, DENY, defineGuardedAction } from '../../guard/index.js';
 import { AGENT_GOOGLE_SERVICES } from '../gws-ea-google/grant.js';
 import { resolveBookingSurface } from './booking-surface.js';
 
-/** The stored session fixes the conversation; no request field chooses an owner. */
 export const bookingAction = defineGuardedAction({
   action: 'gws_ea_meetings.booking',
   decide: async ({ actor }) => {

@@ -1,4 +1,3 @@
-// The shared booking migration consumes both surfaces' released tables.
 import '../gws-ea-inbox/index.js';
 import '../gws-ea-chats/index.js';
 

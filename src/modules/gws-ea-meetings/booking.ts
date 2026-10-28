@@ -186,16 +186,14 @@ export function createBookingTools(deps: BookingToolsDeps) {
     return { ...(await resolveBookingSurface(session)), principal: await principalView(), startedAt };
   }
 
-  function bound(answer: BookingAnswer, fields: readonly string[], writing = false): DeferredActionAnswer {
+  function bound(answer: BookingAnswer, fields: readonly string[]): DeferredActionAnswer {
     return async (content, session, requestId) => {
       const startedAt = new Date().toISOString();
       const key = requestKey(session.id, requestId);
-      if (writing) inFlight.set(key, (inFlight.get(key) ?? 0) + 1);
+      inFlight.set(key, (inFlight.get(key) ?? 0) + 1);
       try {
         assertChatToolFields(content, fields);
         const view = await viewOf(session, startedAt);
-        if (!writing) return answer(content, session, requestId, view);
-        // The roster refresh takes the same conversation tail as the write wrapper.
         await view.surface.beforeWrite();
         let frame: ResponseFrame;
         let result: Awaited<ReturnType<BookingAnswer>> = ANSWER_LATER;
@@ -225,11 +223,9 @@ export function createBookingTools(deps: BookingToolsDeps) {
         if (refusal) throw refusal;
         return result;
       } finally {
-        if (writing) {
-          const remaining = (inFlight.get(key) ?? 1) - 1;
-          if (remaining === 0) inFlight.delete(key);
-          else inFlight.set(key, remaining);
-        }
+        const remaining = (inFlight.get(key) ?? 1) - 1;
+        if (remaining === 0) inFlight.delete(key);
+        else inFlight.set(key, remaining);
       }
     };
   }
@@ -759,6 +755,19 @@ export function createBookingTools(deps: BookingToolsDeps) {
     throw error;
   }
 
+  async function checkFailure(
+    row: BookingRequest,
+    view: BookingView,
+    error: unknown,
+    recovering: boolean,
+  ): Promise<never> {
+    if (error instanceof ActionRefusal) return dropAndRefuse(row, error);
+    if (recovering && isGoogleConnectionDown(error)) throw error;
+    if (isGoogleConnectionDown(error))
+      return dropAndRefuse(row, forbidden(`${GOOGLE_CONNECTION_DOWN} ${view.surface.words.connectionStep}`));
+    throw error;
+  }
+
   async function writeFailure(
     row: BookingRequest,
     view: BookingView,
@@ -796,13 +805,7 @@ export function createBookingTools(deps: BookingToolsDeps) {
     const content = contentOf(row);
     if (row.action === 'book') {
       const { fields } = await checkedBook(content, view, row.eventId, row.calendarId, preparedOf(row).invitees).catch(
-        async (error: unknown) => {
-          if (error instanceof ActionRefusal) return dropAndRefuse(row, error);
-          if (recovering && isGoogleConnectionDown(error)) throw error;
-          if (isGoogleConnectionDown(error))
-            return dropAndRefuse(row, forbidden(`${GOOGLE_CONNECTION_DOWN} ${view.surface.words.connectionStep}`));
-          throw error;
-        },
+        (error: unknown) => checkFailure(row, view, error, recovering),
       );
       try {
         const result = await calendar().insertEvent(row.calendarId, row.eventId, fields, 'all');
@@ -813,13 +816,7 @@ export function createBookingTools(deps: BookingToolsDeps) {
     } else if (row.action === 'change') {
       if (!event || row.eventEtag === null) return finishRequest(row, view, unknownOutcome(row, view));
       const checked = await checkedChange(content, view, event, row.calendarId, row.requestId, spanOf(row)).catch(
-        async (error: unknown) => {
-          if (error instanceof ActionRefusal) return dropAndRefuse(row, error);
-          if (recovering && isGoogleConnectionDown(error)) throw error;
-          if (isGoogleConnectionDown(error))
-            return dropAndRefuse(row, forbidden(`${GOOGLE_CONNECTION_DOWN} ${view.surface.words.connectionStep}`));
-          throw error;
-        },
+        (error: unknown) => checkFailure(row, view, error, recovering),
       );
       try {
         await calendar().patchEvent(
@@ -912,7 +909,6 @@ export function createBookingTools(deps: BookingToolsDeps) {
       throw forbidden('This booking request ID was already used for different work.');
     if (row && (row.owner.kind !== view.surface.owner.kind || row.owner.key !== view.surface.owner.key))
       throw forbidden('This booking request belongs to another conversation.');
-    // After intent is durable, a local failure can no longer become a permanent tool answer.
     try {
       if (row) {
         view.startedAt = row.createdAt;
@@ -1091,17 +1087,14 @@ export function createBookingTools(deps: BookingToolsDeps) {
     book: bound(
       (content, session, requestId, view) => request('book', content, session, requestId, view),
       ['start', 'minutes', 'title', 'notes', 'location', 'video_call', 'invitees', 'timezone'],
-      true,
     ),
     changeBooking: bound(
       (content, session, requestId, view) => request('change', content, session, requestId, view),
       ['booking', 'start', 'minutes', 'title', 'notes', 'location', 'video_call', 'timezone'],
-      true,
     ),
     cancelBooking: bound(
       (content, session, requestId, view) => request('cancel', content, session, requestId, view),
       ['booking', 'timezone'],
-      true,
     ),
   };
 }
