@@ -42,6 +42,8 @@ export interface FixtureState {
   mail: SyntheticMail[];
 }
 export function initialFixture(scenario: ScenarioCase): FixtureState {
+  if (scenario.id === 'external-email-identity-read' || scenario.id === 'external-chat-identity-read')
+    return { scenario, attempt: 1, effects: [], tasks: [], outbound: [], events: [], mail: [] };
   if (scenario.id !== 'search-before-asking') throw new Error(`No concrete native fixture for ${scenario.id}`);
   const summary = 'Dinner with Juno';
   const location = 'Harbor House, 800 Fiction Lane, San Francisco';

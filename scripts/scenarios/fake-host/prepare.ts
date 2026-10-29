@@ -1,13 +1,14 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { SYNTHETIC_IDENTITY } from './state.js';
+import { SYNTHETIC_IDENTITY, readState } from './state.js';
+import type { ScenarioComposition } from '../types.js';
 
 // Import only after cwd points at this run's new synthetic install. Host constants
 // resolve from cwd; importing before this would touch the operator's install.
 const [tree, output, audience] = process.argv.slice(2);
-if (!tree || !output || !['main', 'external-email'].includes(audience ?? ''))
-  throw new Error('prepare <tree> <output> <main|external-email>');
+if (!tree || !output || !['main', 'external-email', 'external-chat'].includes(audience ?? ''))
+  throw new Error('prepare <tree> <output> <main|external-email|external-chat>');
 const host = path.join(output, 'host');
 fs.mkdirSync(host, { recursive: true });
 for (const name of ['src', 'container', 'templates']) fs.symlinkSync(path.join(tree, name), path.join(host, name));
@@ -63,7 +64,13 @@ try {
   await updateContainerConfigJson(main.id, 'skills', MAIN_SHARED_SKILLS);
   await updateContainerConfigScalars(main.id, { cli_scope: 'global' });
   const outward = await ensureExternalEmailGroup();
-  const group = audience === 'main' ? main : await getAgentGroup(outward);
+  const { ensureExternalChatGroup } = (await import(
+    source('src/modules/gws-ea-chat-agents/external-chat.ts')
+  )) as typeof import('../../../src/modules/gws-ea-chat-agents/external-chat.js');
+  const group =
+    audience === 'main'
+      ? main
+      : await getAgentGroup(audience === 'external-chat' ? await ensureExternalChatGroup() : outward);
   if (!group) throw new Error('Synthetic group was not created.');
   const { createMessagingGroup } = (await import(
     source('src/db/messaging-groups.ts')
@@ -98,37 +105,107 @@ try {
     messaging_group_id: 'synthetic-morgan-dm',
     resolved_at: now,
   });
-  const { session } = await resolveSession(group.id, 'synthetic-morgan-dm', null, 'agent-shared');
+  let messagingGroupId = 'synthetic-morgan-dm';
+  let threadId: string | null = null;
+  let context: string | undefined;
+  if (audience !== 'main') {
+    messagingGroupId = audience === 'external-chat' ? 'synthetic-juno-chat' : 'synthetic-email-inbox';
+    await createMessagingGroup({
+      id: messagingGroupId,
+      channel_type: audience === 'external-chat' ? 'whatsapp' : 'email',
+      platform_id: messagingGroupId,
+      name: audience === 'external-chat' ? 'Juno Hale' : 'Synthetic assistant inbox',
+      is_group: 0,
+      unknown_sender_policy: 'strict',
+      created_at: now,
+    });
+    if (audience === 'external-chat') {
+      await db.run(
+        `INSERT INTO gws_ea_chats
+        (messaging_group_id,state,serving_agent_group_id,principal_present,connected_at,created_at,updated_at)
+        VALUES (?,'connected',?,0,?,?,?)`,
+        messagingGroupId,
+        group.id,
+        now,
+        now,
+        now,
+      );
+      const { refreshChatRoster } = (await import(
+        source('src/modules/gws-ea-chats/roster.ts')
+      )) as typeof import('../../../src/modules/gws-ea-chats/roster.js');
+      await refreshChatRoster(messagingGroupId, [
+        { key: 'whatsapp:synthetic-juno', name: 'Juno Hale', isPrincipal: false },
+      ]);
+      const { renderChatContext } = (await import(
+        source('src/modules/gws-ea-chats/context.ts')
+      )) as typeof import('../../../src/modules/gws-ea-chats/context.js');
+      context = await renderChatContext(messagingGroupId);
+    } else {
+      const { createThread, placeThread } = (await import(
+        source('src/modules/gws-ea-inbox/thread-map.ts')
+      )) as typeof import('../../../src/modules/gws-ea-inbox/thread-map.js');
+      threadId = (await createThread(null, now, 'mail-synthetic-identity')).threadKey;
+      await placeThread(threadId, 'nowhere');
+    }
+  }
+  const { session } = await resolveSession(
+    group.id,
+    messagingGroupId,
+    threadId,
+    audience === 'main' ? 'agent-shared' : 'per-thread',
+  );
   const agent = path.join(output, 'agent');
   fs.mkdirSync(agent, { recursive: true });
   await composeGroupProjectDoc(group, agent, { fileName: 'CLAUDE.md' });
   const row = await getContainerConfig(group.id);
   if (!row) throw new Error('Synthetic group lacks a native config.');
-  fs.writeFileSync(
-    path.join(output, 'composition.json'),
-    JSON.stringify(
-      {
-        audience,
-        group,
-        capabilities: JSON.parse(row.capabilities ?? '[]'),
-        skills: JSON.parse(row.skills ?? '[]'),
-        db: db.dialect,
-      },
-      null,
-      2,
+  const { materializeContainerJson } = (await import(
+    source('src/container-config.ts')
+  )) as typeof import('../../../src/container-config.js');
+  const { parseStoredCapabilities } = (await import(
+    source('src/capabilities.ts')
+  )) as typeof import('../../../src/capabilities.js');
+  const { composeContainerEnv } = (await import(
+    source('src/container-env.ts')
+  )) as typeof import('../../../src/container-env.js');
+  // This is the spawn's reading, including module grantedTo overlays.
+  const config = await materializeContainerJson(group.id);
+  if (config.skills === 'all') throw new Error('Synthetic role must name its release skills explicitly.');
+  // Native sqlite mailbox supplies no env. HOME/TZ are core-owned; these
+  // fixture gateway keys occupy the native provider/gateway contribution lane.
+  const reservedEnvironmentKeys = ['HOME', 'TZ', 'ANTHROPIC_BASE_URL'];
+  const composition: ScenarioComposition = {
+    audience: audience as ScenarioComposition['audience'],
+    group,
+    storedCapabilities: parseStoredCapabilities(row.capabilities, group.name),
+    capabilities: config.capabilities,
+    skills: config.skills,
+    moduleEnvironment: composeContainerEnv(
+      { agentGroupId: group.id, capabilities: new Set(config.capabilities) },
+      new Set(reservedEnvironmentKeys),
     ),
-  );
+    reservedEnvironmentKeys,
+    session: { id: session.id, messagingGroupId: session.messaging_group_id },
+    ...(context ? { context } : {}),
+    db: db.dialect,
+  };
+  fs.writeFileSync(path.join(output, 'composition.json'), JSON.stringify(composition, null, 2));
+  if (readState(path.join(output, 'fixture.json')).scenario.observationOnly)
+    fs.writeFileSync(
+      path.join(agent, 'role-brief.md'),
+      '# Conversation brief\n\nReference: JUNO-CEDAR-27. Juno Hale agreed to arrive Tuesday November 3, 2026 at 18:45 America/Los_Angeles. This brief belongs only to this synthetic conversation.\n',
+    );
   // Expose release-authored skills, never an operator skill or a live group tree.
   const skills = path.join(agent, '.claude', 'skills');
   fs.mkdirSync(skills, { recursive: true });
-  for (const name of MAIN_SHARED_SKILLS) {
+  for (const name of composition.skills) {
     const target = path.join(tree, 'container', 'skills', name);
     if (fs.existsSync(target)) fs.symlinkSync(target, path.join(skills, name));
   }
   const { replacePrincipalCalendars, recordCalendarAccess } = (await import(
     source('src/modules/gws-ea-inbox/db.ts')
   )) as typeof import('../../../src/modules/gws-ea-inbox/db.js');
-  await replacePrincipalCalendars(['morgan.ellery@example.test'], new Date().toISOString());
+  await replacePrincipalCalendars([SYNTHETIC_IDENTITY.principalEmail], new Date().toISOString());
   const checkedAt = new Date().toISOString();
   await recordCalendarAccess({
     address: SYNTHETIC_IDENTITY.principalEmail,

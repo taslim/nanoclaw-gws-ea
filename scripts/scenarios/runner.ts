@@ -14,7 +14,8 @@ import { SYNTHETIC_IDENTITY, readState, recordEffect } from './fake-host/state.j
 import { startRequestRecorder, rawUsage } from './fake-host/relay.js';
 import { prepareSyntheticShell, syntheticShellCommand } from './fake-host/sandbox.js';
 import type { ProviderEvent } from '../../container/agent-runner/src/providers/types.js';
-import type { ScenarioCase } from './types.js';
+import type { ScenarioCase, ScenarioComposition } from './types.js';
+import { scenarioRuntime } from './runtime.js';
 
 const [directory, kind, model, reservation, cli, phase, resume] = process.argv.slice(2);
 if (!directory || !model || !reservation || !cli || !['agent', 'judge'].includes(kind ?? ''))
@@ -25,10 +26,9 @@ const scenario = (JSON.parse(fs.readFileSync(file, 'utf8')) as { scenario: Scena
 const evidence = path.join(directory, phase || kind);
 fs.mkdirSync(evidence, { recursive: true });
 const agent = path.join(directory, 'agent');
-const composition = JSON.parse(fs.readFileSync(path.join(directory, 'composition.json'), 'utf8')) as {
-  capabilities: string[];
-  skills: string[];
-};
+const composition = JSON.parse(
+  fs.readFileSync(path.join(directory, 'composition.json'), 'utf8'),
+) as ScenarioComposition;
 const capabilities = new Set(composition.capabilities);
 const recorder = await startRequestRecorder(path.join(evidence, 'raw'));
 const { resetAgentMailboxForTesting, registerAgentMailbox } =
@@ -39,7 +39,8 @@ const { buildSystemPromptAddendum } = await import('../../container/agent-runner
 const { setCurrentReplyRoute, clearCurrentReplyRoute } =
   await import('../../container/agent-runner/src/db/session-state.js');
 const { processQuery } = await import('../../container/agent-runner/src/poll-loop.js');
-const { resolveClaudeExecutionPolicy } = await import('../../container/agent-runner/src/providers/claude-config.js');
+const { sessionsSealed, prepareSessionMemory } = await import('../../container/agent-runner/src/memory/sealed.js');
+const memoryRegistration = prepareSessionMemory(kind === 'judge' || sessionsSealed(capabilities), agent);
 const { memoryContextForSessionStart, recordMemoryDelivered } =
   await import('../../container/agent-runner/src/memory/session-hook.js');
 resetAgentMailboxForTesting();
@@ -58,13 +59,22 @@ const messages = [
     series_id: null,
     tries: 0,
     trigger: 1,
-    platform_id: scenario.audience === 'main' ? 'synthetic-morgan-dm' : 'synthetic-juno-thread',
-    channel_type: scenario.audience === 'main' ? 'gchat' : 'email',
+    platform_id:
+      scenario.audience === 'main'
+        ? 'synthetic-morgan-dm'
+        : scenario.audience === 'external-chat'
+          ? 'synthetic-juno-chat'
+          : 'synthetic-email-inbox',
+    channel_type: scenario.audience === 'main' ? 'gchat' : scenario.audience === 'external-chat' ? 'whatsapp' : 'email',
     thread_id: null,
     content: JSON.stringify({
-      sender: scenario.audience === 'main' ? 'Morgan Ellery' : 'Juno Hale',
-      senderId: 'synthetic-morgan',
-      text: scenario.input,
+      sender: scenario.observationOnly ? 'system' : scenario.audience === 'main' ? 'Morgan Ellery' : 'Juno Hale',
+      senderId: scenario.observationOnly
+        ? 'synthetic-host'
+        : scenario.audience === 'main'
+          ? 'synthetic-morgan'
+          : 'synthetic-juno',
+      text: [composition.context, scenario.input].filter(Boolean).join('\n\n'),
       principalMessage: scenario.audience === 'main',
       inConversation: true,
     }),
@@ -73,9 +83,17 @@ const messages = [
   },
 ];
 const routing = extractRouting(messages);
-const addendum = buildSystemPromptAddendum(SYNTHETIC_IDENTITY.assistantName.firstName, { kind: 'chat' }, capabilities);
+const addendum = buildSystemPromptAddendum(
+  SYNTHETIC_IDENTITY.assistantName.firstName,
+  scenario.task ? { kind: 'task', taskId: 'synthetic-input' } : { kind: 'chat' },
+  capabilities,
+);
 const formatted = formatMessages(messages);
-const compact = buildCompactInstructions(['principal', 'outward', 'external-email'], null, capabilities);
+const compact = buildCompactInstructions(
+  mailbox.getDestinations().map((destination) => destination.name),
+  null,
+  capabilities,
+);
 fs.writeFileSync(path.join(evidence, 'formatted.md'), formatted);
 fs.writeFileSync(path.join(evidence, 'append.md'), addendum);
 fs.writeFileSync(path.join(evidence, 'compact.md'), compact);
@@ -107,7 +125,11 @@ const toolHook: HookCallback = async (input) => {
     typeof input.tool_input === 'object' && input.tool_input !== null
       ? (input.tool_input as Record<string, unknown>)
       : {};
-  let allowed = input.tool_name.startsWith('mcp__nanoclaw__');
+  let allowed =
+    input.tool_name.startsWith('mcp__nanoclaw__') ||
+    ['TaskStop', 'TaskCreate', 'TaskGet', 'TaskList', 'TaskUpdate', 'TodoWrite', 'ToolSearch'].includes(
+      input.tool_name,
+    );
   if (input.tool_name === 'Skill') allowed = typeof args.skill === 'string' && composition.skills.includes(args.skill);
   let updatedInput: Record<string, unknown> | undefined;
   if (input.tool_name === 'Bash') {
@@ -121,10 +143,14 @@ const toolHook: HookCallback = async (input) => {
     if (relocatedPath(target) !== target)
       updatedInput = { ...args, [args.file_path !== undefined ? 'file_path' : 'path']: relocatedPath(target) };
   }
-  if (['Write', 'Edit'].includes(input.tool_name)) {
-    const target = String(args.file_path ?? '');
+  if (['Write', 'Edit', 'NotebookEdit'].includes(input.tool_name)) {
+    const target = String(args.file_path ?? args.notebook_path ?? '');
     allowed = within(target, agent);
-    if (relocatedPath(target) !== target) updatedInput = { ...args, file_path: relocatedPath(target) };
+    if (relocatedPath(target) !== target)
+      updatedInput = {
+        ...args,
+        [input.tool_name === 'NotebookEdit' ? 'notebook_path' : 'file_path']: relocatedPath(target),
+      };
   }
   if (kind === 'judge') allowed = false;
   if (input.agent_id)
@@ -154,7 +180,12 @@ const toolHook: HookCallback = async (input) => {
   };
 };
 const sessionHook: HookCallback = async (input) => {
-  if (input.hook_event_name !== 'SessionStart' || input.source === 'fork' || !capabilities.has('memory')) return {};
+  if (
+    input.hook_event_name !== 'SessionStart' ||
+    input.source === 'fork' ||
+    !memoryRegistration.sources.includes(input.source)
+  )
+    return {};
   const session = { id: input.session_id, stateDir: path.join(directory, 'memory-delivered') };
   const section = memoryContextForSessionStart(input.source, agent, session);
   if (!section) return {};
@@ -163,7 +194,25 @@ const sessionHook: HookCallback = async (input) => {
   return { hookSpecificOutput: { hookEventName: 'SessionStart', additionalContext: section } };
 };
 const bin = shell.bin;
-const policy = resolveClaudeExecutionPolicy();
+const runtime = scenarioRuntime(
+  composition,
+  {
+    nanoclaw: {
+      command: process.execPath,
+      args: [path.join(tree, 'scripts/scenarios/fake-host/mcp.ts'), file, JSON.stringify([...capabilities])],
+    },
+  },
+  process.env,
+  {
+    ANTHROPIC_BASE_URL: recorder.url,
+    PATH: `${bin}:${process.env.PATH ?? ''}`,
+    CLAUDE_CODE_DISABLE_AUTO_MEMORY: '1',
+    ENABLE_CLAUDEAI_MCP_SERVERS: 'false',
+    CLAUDE_CODE_MAX_OUTPUT_TOKENS: '1600',
+    TZ: 'America/Los_Angeles',
+  },
+);
+const policy = runtime.execution;
 const options: Options = {
   cwd: kind === 'judge' ? evidence : agent,
   ...(resume ? { resume } : {}),
@@ -177,25 +226,20 @@ const options: Options = {
     kind === 'judge'
       ? 'You are a careful independent evaluator of an executive assistant. Return only the required JSON verdict.'
       : { type: 'preset', preset: 'claude_code', append: addendum, snapshot: false },
-  tools: kind === 'judge' ? [] : ['Read', 'Write', 'Edit', 'Glob', 'Grep', 'Bash', 'Skill'],
-  allowedTools: kind === 'judge' ? [] : ['Read', 'Write', 'Edit', 'Glob', 'Grep', 'Bash', 'Skill', 'mcp__nanoclaw__*'],
-  disallowedTools: [
-    ...policy.disallowedTools,
-    'WebSearch',
-    'WebFetch',
-    'ListAgents',
-    'Agent',
-    'Task',
-    'TeamCreate',
-    'TeamDelete',
-    'Workflow',
-  ],
-  permissionMode: 'bypassPermissions',
-  allowDangerouslySkipPermissions: true,
-  strictMcpConfig: true,
+  ...(kind === 'judge'
+    ? {
+        tools: [],
+        allowedTools: [],
+        disallowedTools: runtime.applied.disallowedTools,
+        mcpServers: {},
+        strictMcpConfig: true,
+      }
+    : runtime.applied),
+  permissionMode: policy.permissionMode,
+  allowDangerouslySkipPermissions: policy.allowDangerouslySkipPermissions,
   settings: {
     ...policy.settings,
-    ...(kind === 'agent'
+    ...(kind === 'agent' && !sessionsSealed(capabilities)
       ? {
           hooks: {
             PreCompact: [
@@ -212,27 +256,13 @@ const options: Options = {
         }
       : {}),
   },
-  mcpServers:
+  env:
     kind === 'judge'
-      ? {}
-      : {
-          nanoclaw: {
-            command: process.execPath,
-            args: [path.join(tree, 'scripts/scenarios/fake-host/mcp.ts'), file, JSON.stringify([...capabilities])],
-          },
-        },
-  env: {
-    ...process.env,
-    ANTHROPIC_BASE_URL: recorder.url,
-    PATH: `${bin}:${process.env.PATH ?? ''}`,
-    CLAUDE_CODE_DISABLE_AUTO_MEMORY: '1',
-    ENABLE_CLAUDEAI_MCP_SERVERS: 'false',
-    CLAUDE_CODE_MAX_OUTPUT_TOKENS: '1600',
-    TZ: 'America/Los_Angeles',
-  },
+      ? { ...process.env, ANTHROPIC_BASE_URL: recorder.url, ENABLE_CLAUDEAI_MCP_SERVERS: 'false' }
+      : runtime.env,
   hooks: {
     PreToolUse: [{ hooks: [toolHook] }],
-    ...(kind === 'agent' ? { SessionStart: [{ hooks: [sessionHook] }] } : {}),
+    ...(kind === 'agent' && memoryRegistration.sources.length > 0 ? { SessionStart: [{ hooks: [sessionHook] }] } : {}),
   },
   stderr: (line) => {
     fs.appendFileSync(path.join(evidence, 'stderr.log'), line);
@@ -243,6 +273,10 @@ fs.writeFileSync(
   JSON.stringify(
     {
       ...options,
+      productionTools: runtime.production,
+      fixtureWithheldTools: runtime.fixtureWithheld,
+      fixtureExternalMcpWithheld: runtime.fixtureExternalMcpWithheld,
+      moduleEnvironment: kind === 'agent' ? composition.moduleEnvironment : {},
       env: { keys: Object.keys(options.env ?? {}).sort() },
       hooks: Object.keys(options.hooks ?? {}),
       stderr: undefined,

@@ -17,6 +17,7 @@
     "score.ts",
     "ledger.ts",
     "types.ts",
+    "runtime.ts",
     "fake-host/prepare.ts",
     "fake-host/cli.ts",
     "fake-host/state.ts",

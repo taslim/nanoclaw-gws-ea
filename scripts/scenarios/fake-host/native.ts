@@ -7,6 +7,7 @@ import type { Session } from '../../../src/types.js';
 import type { FakeCalendar, StoredEvent } from '../../../src/modules/gws-ea-meetings/testing/fake-calendar.js';
 import type { GmailMessage } from '../../../src/modules/gws-ea-inbox/gmail-api.js';
 import { SYNTHETIC_IDENTITY, type FixtureState } from './state.js';
+import { syntheticGateway } from './gateway.js';
 
 const PRINCIPAL = SYNTHETIC_IDENTITY.principalEmail;
 const ASSISTANT = SYNTHETIC_IDENTITY.assistantEmail;
@@ -54,8 +55,10 @@ export async function installSyntheticGoogle(root: string): Promise<{ calendar: 
     { mode: 0o600 },
   );
   process.env[GOOGLE_GRANT_FILE_ENV] = grant;
+  const gateway = syntheticGateway();
   globalThis.fetch = async (input, init) => {
     const url = new URL(typeof input === 'string' || input instanceof URL ? input : input.url);
+    if (url.hostname === 'synthetic-onecli.invalid') return gateway(url, init);
     if (url.hostname === 'oauth2.googleapis.com' && url.pathname === '/token') {
       const body = new URLSearchParams(String(init?.body));
       return json({ access_token: 'synthetic-only', expires_in: 3600, scope: body.get('scope') ?? '' });
@@ -90,6 +93,8 @@ export async function installSyntheticGoogle(root: string): Promise<{ calendar: 
       const events = min && max ? await calendar.listEvents(id, min, max) : calendar.live(id);
       return json({ items: events.map((event) => googleEvent(event as StoredEvent)) });
     }
+    if (init?.method && init.method !== 'GET')
+      throw new Error('This native fixture has no Gmail send/write transport. No email was sent.');
     const messages = parts.indexOf('messages');
     const threads = parts.indexOf('threads');
     if (messages >= 0) {
@@ -137,6 +142,10 @@ export async function serveNativeHost(
     calendars: [...calendar.calendars.values()],
     events: calendar.events,
     mail,
+    session,
+    chat: session.messaging_group_id
+      ? await getDb().get('SELECT * FROM gws_ea_chats WHERE messaging_group_id = ?', session.messaging_group_id)
+      : undefined,
     principalAddresses: await getDb().all('SELECT * FROM gws_ea_principal_addresses'),
     matters: await getDb().all('SELECT * FROM gws_ea_matters'),
   });

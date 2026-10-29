@@ -92,7 +92,16 @@ const manifest = {
   sourceHashes: Object.fromEntries(
     [
       'src/project-doc-compose.ts',
+      'src/capabilities.ts',
+      'src/container-config.ts',
+      'src/container-env.ts',
+      'src/modules/gws-ea-main/index.ts',
+      'src/modules/gws-ea-external-email/group.ts',
+      'src/modules/gws-ea-chat-agents/shape.ts',
+      'scripts/scenarios/runtime.ts',
       'container/agent-runner/src/memory/session-hook.ts',
+      'container/agent-runner/src/memory/sealed.ts',
+      'container/agent-runner/src/memory/templates/index.md',
       'container/agent-runner/src/memory/context.ts',
       'container/agent-runner/src/compact-instructions.ts',
       'container/agent-runner/src/formatter.ts',
@@ -147,11 +156,13 @@ async function prepare(scenario: ScenarioCase, directory: string): Promise<() =>
   };
   try {
     const agent = path.join(directory, 'agent');
-    fs.mkdirSync(path.join(agent, 'memory'), { recursive: true });
-    fs.writeFileSync(
-      path.join(agent, 'memory', 'index.md'),
-      '# Core Memory\n\nInvented principal Morgan Ellery lives in San Francisco and works in Mountain View on Tuesdays and Thursdays.\n',
-    );
+    if (scenario.audience === 'main') {
+      fs.mkdirSync(path.join(agent, 'memory'), { recursive: true });
+      fs.copyFileSync(
+        path.join(tree, 'container/agent-runner/src/memory/templates/index.md'),
+        path.join(agent, 'memory', 'index.md'),
+      );
+    }
     const checks = await child(
       'bun',
       [path.join(scripts, 'fake-host', 'check.ts'), path.join(directory, 'fixture.json'), agent, tree],
@@ -281,7 +292,19 @@ for (const scenario of selected) {
       scores.push(pass);
       fs.writeFileSync(
         path.join(directory, 'score.json'),
-        JSON.stringify({ pass, mechanical, verdict, invalid }, null, 2),
+        JSON.stringify(
+          {
+            pass,
+            scope: scenario.observationOnly
+              ? 'internal identity/read report; no outward delivery verified'
+              : 'native scenario',
+            mechanical,
+            verdict,
+            invalid,
+          },
+          null,
+          2,
+        ),
       );
       console.log(`${scenario.id} attempt ${attempt}: ${pass ? 'PASS' : 'FAIL'}`);
       if (attempt === 1 && pass) break;

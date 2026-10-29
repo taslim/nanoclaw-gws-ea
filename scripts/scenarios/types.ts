@@ -3,7 +3,9 @@ export interface ScenarioCase {
   readonly available: boolean;
   readonly requirement: string;
   readonly unit: string;
-  readonly audience: 'main' | 'external-email';
+  readonly audience: 'main' | 'external-email' | 'external-chat';
+  /** Internal task report only; no outward send is asserted by this case. */
+  readonly observationOnly?: boolean;
   readonly input: string;
   readonly facts: readonly string[];
   readonly validOutcomes: readonly string[];
@@ -18,7 +20,7 @@ export interface Effect {
   readonly operation: string;
   readonly target: string;
   readonly payload: Readonly<Record<string, unknown>>;
-  readonly actor: 'main' | 'external-email' | 'look-back' | 'look-ahead' | 'unattributed-planner';
+  readonly actor: 'main' | 'external-email' | 'external-chat' | 'look-back' | 'look-ahead' | 'unattributed-planner';
   readonly attempt: number;
 }
 
@@ -39,4 +41,18 @@ export interface PlannerPolicy {
   readonly runFile: string;
   readonly memoryDirectory?: string;
   readonly allowedNclPairs: readonly string[];
+}
+
+/** Only synthetic identity/configuration and module-authored nonsecret contributions are saved. */
+export interface ScenarioComposition {
+  readonly audience: ScenarioCase['audience'];
+  readonly group: { readonly id: string; readonly name: string; readonly folder: string };
+  readonly capabilities: string[];
+  readonly storedCapabilities: readonly string[] | 'all';
+  readonly skills: string[];
+  readonly moduleEnvironment: Readonly<Record<string, string>>;
+  readonly reservedEnvironmentKeys: readonly string[];
+  readonly session: { readonly id: string; readonly messagingGroupId: string | null };
+  readonly context?: string;
+  readonly db: string;
 }

@@ -3,6 +3,12 @@
   "compilerOptions": {
     "types": ["node", "bun"]
   },
-  "include": ["runner.ts", "fake-host/mcp.ts", "fake-host/compact-hook.ts", "fake-host/route-check.ts"],
+  "include": [
+    "runner.ts",
+    "fake-host/mcp.ts",
+    "fake-host/compact-hook.ts",
+    "fake-host/route-check.ts",
+    "fake-host/report-check.ts"
+  ],
   "exclude": []
 }

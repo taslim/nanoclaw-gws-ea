@@ -48,7 +48,19 @@ export class FixtureMailbox implements AgentMailbox, MailboxOperations {
       agentGroupId: 'synthetic-external-email',
     },
   ];
-  constructor(private readonly file: string) {}
+  constructor(private readonly file: string) {
+    const audience = readState(file).scenario.audience;
+    if (audience !== 'main') {
+      this.destinations.splice(0, this.destinations.length, {
+        name: 'outward',
+        displayName: 'Juno Hale',
+        type: 'channel',
+        channelType: audience === 'external-chat' ? 'whatsapp' : 'email',
+        platformId: audience === 'external-chat' ? 'synthetic-juno-chat' : 'synthetic-email-inbox',
+        agentGroupId: null,
+      });
+    }
+  }
   async start(_key: MailboxSessionKey | null): Promise<void> {}
   async stop(): Promise<void> {}
   async run<T>(action: () => T | Promise<T>): Promise<T> {
@@ -115,7 +127,12 @@ export class FixtureMailbox implements AgentMailbox, MailboxOperations {
           seq + 1,
         ),
       );
+    } else if (message.kind === 'task_log') {
+      // Native task output is an internal report, never an email/chat delivery.
+      return seq;
     } else if (message.kind === 'chat') {
+      if (fixture.scenario.observationOnly)
+        throw new Error('Unsupported fixture outward delivery: this case observes an internal report only.');
       const dest = this.findDestinationByRouting(message.channelType ?? null, message.platformId ?? null);
       await recordEffect(this.file, {
         kind: 'message',
@@ -162,10 +179,15 @@ export class FixtureMailbox implements AgentMailbox, MailboxOperations {
     fs.writeFileSync(path.join(path.dirname(this.file), 'mailbox-state.json'), JSON.stringify(state));
   }
   getSessionRouting(): SessionRouting {
-    const outward = readState(this.file).scenario.audience === 'external-email';
+    const audience = readState(this.file).scenario.audience;
     return {
-      channelType: outward ? 'email' : 'gchat',
-      platformId: outward ? 'synthetic-juno-thread' : 'synthetic-morgan-dm',
+      channelType: audience === 'main' ? 'gchat' : audience === 'external-chat' ? 'whatsapp' : 'email',
+      platformId:
+        audience === 'main'
+          ? 'synthetic-morgan-dm'
+          : audience === 'external-chat'
+            ? 'synthetic-juno-chat'
+            : 'synthetic-email-inbox',
       threadId: null,
     };
   }
