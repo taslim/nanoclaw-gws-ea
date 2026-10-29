@@ -104,14 +104,13 @@ async function createClose(main: Session, moment: LocalMoment, timeline: Timelin
   const { session } = await resolveSystemSession(main.agent_group_id, `system:gws-ea-close:${id}`);
   const at = new Date(moment.at).toISOString();
   await getDb().run(
-    `INSERT INTO gws_ea_close_runs (id,session_id,scheduled_at,zone,timeline_version,weekly_day,state)
-    VALUES (?,?,?,?,?,?,'pending')`,
+    `INSERT INTO gws_ea_close_runs (id,session_id,scheduled_at,zone,timeline_version,state)
+    VALUES (?,?,?,?,?,'pending')`,
     id,
     session.id,
     at,
     moment.zone,
     timeline.version,
-    await weeklyDay(moment.at, moment.zone),
   );
   await ensureCloseTask({ id, session_id: session.id, scheduled_at: at, zone: moment.zone });
   return at;
@@ -192,11 +191,10 @@ export async function keepClose(main: Session): Promise<string> {
       return createClose(main, moment, timeline);
     }
     await getDb().run(
-      'UPDATE gws_ea_close_runs SET scheduled_at=?,zone=?,timeline_version=?,weekly_day=? WHERE id=?',
+      'UPDATE gws_ea_close_runs SET scheduled_at=?,zone=?,timeline_version=? WHERE id=?',
       at,
       moment.zone,
       timeline.version,
-      await weeklyDay(moment.at, moment.zone),
       run.id,
     );
     return at;

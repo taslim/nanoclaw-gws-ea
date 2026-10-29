@@ -236,7 +236,6 @@ export async function readDayLedger(ctx: CallerContext): Promise<DayLedger> {
       const run = await getOpenCloseRun(ctx.sessionId);
       if (run)
         await recordCloseLedger(run.id, ctx.sessionId, {
-          from,
           through,
           writes: writes.entries.flatMap((entry) => {
             const held = shown.get(entry);

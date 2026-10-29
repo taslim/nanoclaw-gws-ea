@@ -2,7 +2,8 @@
  * The host's guarantees for matters: a pass every minute, without the model,
  * that keeps time for main.
  *
- * 1. The evening close exists, at its time (`sync.ts`).
+ * 1. The evening close exists, at its time (`sync.ts`), and a finished
+ *    close's session closes once its container has stopped.
  * 2. Every open matter has a look still to come. One left without, because
  *    its look ran and no new one was set, or was cancelled, paused or lost,
  *    gets one at the next close, named as handed back.
@@ -46,6 +47,7 @@ import { keepMorning, morningLookIds } from './morning.js';
 import { TIMEZONE } from '../../config.js';
 import { loadTimeline, zoneAt, type Timeline } from '../gws-ea-whereabouts/timeline.js';
 import { anchorPendingTasks, rememberHostRetry } from './anchors.js';
+import { closeFinishedCloseSessions } from './close-runs.js';
 
 const PASS_MS = 60_000;
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -184,6 +186,7 @@ export function keepMattersOnTime(): Promise<void> {
     await isolated('close', async () => {
       closeAt = await keepClose(conversation);
     });
+    await isolated('finished closes', closeFinishedCloseSessions);
     const idle = (await mainConversations()).every((session) => !isContainerRunning(session.id));
     if (idle && closeAt !== undefined) {
       const at = closeAt;

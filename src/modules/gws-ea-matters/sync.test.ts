@@ -111,7 +111,7 @@ async function closeRow(): Promise<TaskRow> {
   return rows[0];
 }
 async function capture(id: string, sessionId: string): Promise<void> {
-  await recordCloseLedger(id, sessionId, { from: null, through: new Date().toISOString(), writes: [], inbound: {} });
+  await recordCloseLedger(id, sessionId, { through: new Date().toISOString(), writes: [], inbound: {} });
 }
 
 let gmail: FakeGmailThreads;
@@ -362,6 +362,27 @@ describe('the evening close', () => {
     await keepMattersOnTime();
     expect(await getOpenCloseRun(session.id)).toBeUndefined();
     expect((await closeVerdict(nextSession.id, next.id)).wakeAgent).toBe(true);
+    // Its session stays active, where core's idle ceiling still reaches the container, until that container stops.
+    expect(await getSession(session.id)).toMatchObject({ status: 'active' });
+    vi.mocked(isContainerRunning).mockReturnValue(false);
+    await keepMattersOnTime();
+    expect(await getSession(session.id)).toMatchObject({ status: 'closed' });
+  });
+
+  it('closes a completed close’s session only once its container has stopped', async () => {
+    await keepMattersOnTime();
+    const session = await closeSession();
+    const row = await closeRow();
+    vi.setSystemTime(new Date(row.process_after));
+    await closeVerdict(session.id, row.id);
+    await capture(row.id, session.id);
+    vi.mocked(isContainerRunning).mockImplementation((id) => id === session.id);
+    await finishClose(session.id, row.id, 'Quiet close.');
+    await keepMattersOnTime();
+    expect(await getSession(session.id)).toMatchObject({ status: 'active' });
+    vi.mocked(isContainerRunning).mockReturnValue(false);
+    await keepMattersOnTime();
+    expect(await getSession(session.id)).toMatchObject({ status: 'closed' });
   });
 
   it('never recreates or opens the mailbox of a completed close', async () => {
