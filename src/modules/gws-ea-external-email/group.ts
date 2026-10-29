@@ -10,6 +10,7 @@ import path from 'node:path';
 import { parseStoredCapabilities, registerCapability, resolveCapabilities } from '../../capabilities.js';
 import { GROUPS_DIR } from '../../config.js';
 import { parseSkillSelection } from '../../container-config.js';
+import { registerContainerEnv } from '../../container-env.js';
 import { getAgentGroup } from '../../db/agent-groups.js';
 import { getDb } from '../../db/connection.js';
 import {
@@ -49,6 +50,12 @@ registerCapability(EXTERNAL_EMAIL_TOOLS_CAPABILITY, {
   default: 'off',
   instructions: [EXTERNAL_EMAIL_TOOLS_CAPABILITY],
 });
+// Main's shorter system prompt, for the same character.
+registerContainerEnv(
+  'gws-ea-external-email:system-prompt',
+  ({ capabilities }): Record<string, string> =>
+    capabilities.has(EXTERNAL_EMAIL_TOOLS_CAPABILITY) ? { CLAUDE_CODE_SIMPLE_SYSTEM_PROMPT: '1' } : {},
+);
 
 /** The release template the host stamps the group from, and the plugin that stamp leaves in its folder. */
 export const EXTERNAL_EMAIL_TEMPLATE = 'gws-ea/external-email';

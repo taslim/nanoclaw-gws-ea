@@ -106,6 +106,22 @@ export const BASE_BUILTIN_TOOLS: readonly string[] = [
   'ToolSearch',
 ];
 
+/**
+ * Built-ins GWS-EA's canonical main is not offered although its keys grant
+ * them. It works as an assistant: notebook cells, scripted multi-agent
+ * workflows and agent teams are coding machinery that only costs it context,
+ * Agent already starts the work it delegates, and ListAgents would show it the
+ * machine's other Claude sessions. The outward agents hold neither
+ * `files-write` nor `subagents`, so none of these reaches them either.
+ */
+const MAIN_UNUSED_BUILTIN_TOOLS: readonly string[] = [
+  'NotebookEdit',
+  'Workflow',
+  'ListAgents',
+  'TeamCreate',
+  'TeamDelete',
+];
+
 /** Grants MCP servers other than NanoClaw's own: configured, plugin, and claude.ai connectors. */
 export const MCP_SERVERS_CAPABILITY = 'mcp-servers';
 
@@ -119,7 +135,7 @@ export const NANOCLAW_MCP_SERVER = 'nanoclaw';
  */
 export interface ClaudeCapabilityPolicy {
   tools?: readonly string[];
-  /** Built-ins of keys the group does not hold, disallowed outright. */
+  /** Built-ins of keys the group does not hold, and main's unused ones, disallowed outright. */
   withheldTools: readonly string[];
   /** Whether MCP servers other than NanoClaw's own are reachable. */
   externalMcpServers: boolean;
@@ -134,11 +150,14 @@ export function resolveClaudeCapabilityPolicy(grants: ReadonlySet<string>): Clau
       if (grants.has(key)) granted.add(tool);
     }
   }
+  // Decided before main's trim: main keeps the SDK's default set, less those built-ins.
+  const everyKeyHeld = granted.size === named.size;
+  if (grants.has('gws-ea-main-context')) for (const tool of MAIN_UNUSED_BUILTIN_TOOLS) granted.delete(tool);
   const withheldTools = [...named].filter((tool) => !granted.has(tool));
   // An agent that holds no key at all (a missing or corrupt list) is offered nothing.
   const base = grants.size === 0 ? [] : BASE_BUILTIN_TOOLS;
   return {
-    tools: withheldTools.length === 0 ? undefined : [...base, ...granted],
+    tools: everyKeyHeld ? undefined : [...base, ...granted],
     withheldTools,
     externalMcpServers: grants.has(MCP_SERVERS_CAPABILITY),
   };
