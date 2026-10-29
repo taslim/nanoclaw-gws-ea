@@ -62,6 +62,7 @@ describe('the tool set', () => {
 describe('time_now', () => {
   it("reports the current time in the principal's timezone", async () => {
     expect(await ok('Africa/Lagos', 'time_now')).toEqual({
+      clock_source: 'home zone',
       iso: '2026-10-05T10:00:00+01:00',
       formatted: 'Mon, Oct 5 2026 10:00 AM GMT+1',
       day: 'Monday',
@@ -420,5 +421,144 @@ describe('time_diff', () => {
     const text = await failure('America/New_York', 'time_diff', { from: '2026-10-01', to: '2026-11-01T01:30' });
     expect(text).toContain('to: 1:30 AM on Sun, Nov 1 2026 happens twice');
     expect(text).toContain('2026-11-01T01:30:00-04:00 or 2026-11-01T01:30:00-05:00');
+  });
+});
+
+describe('the serialized whereabouts clock', () => {
+  it('resolves a future Brussels date on its clock and returns to the home clock after the stay', async () => {
+    const fs = await import('node:fs');
+    const os = await import('node:os');
+    const path = await import('node:path');
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'time-view-'));
+    const view = path.join(root, 'week-view.json');
+    fs.writeFileSync(
+      view,
+      JSON.stringify({
+        timeline: {
+          homeZone: 'America/Los_Angeles',
+          base: { home_place_id: null },
+          places: [],
+          rhythm: [],
+          legs: [],
+          stays: [
+            {
+              ids: ['brussels'],
+              locality: 'Brussels',
+              zone: 'Europe/Brussels',
+              start: Date.parse('2026-11-10T00:00Z'),
+              end: Date.parse('2026-11-15T00:00Z'),
+              certainty: 'certain',
+            },
+          ],
+        },
+      }),
+    );
+    try {
+      const tools = createTimeTools('America/Los_Angeles', () => Date.parse('2026-11-08T20:00Z'), view);
+      const resolve = tools.find((t) => t.tool.name === 'time_resolve')!;
+      const during = await resolve.handler({ expression: 'Nov 12 9am' });
+      const first = during.content[0];
+      expect(first?.type).toBe('text');
+      const duringText = first?.type === 'text' ? first.text : '';
+      expect(JSON.parse(duringText)).toMatchObject({
+        resolved: { iso: '2026-11-12T09:00:00+01:00', zone: 'Europe/Brussels' },
+        clock_source: 'zone in effect',
+      });
+      const after = (await resolve.handler({ expression: 'Nov 16 9am' })).content[0];
+      expect(JSON.parse(after?.type === 'text' ? after.text : '')).toMatchObject({
+        resolved: { iso: '2026-11-16T09:00:00-08:00' },
+        clock_source: 'zone in effect',
+      });
+      const convert = tools.find((t) => t.tool.name === 'time_convert')!;
+      const conversion = (await convert.handler({ time: '2026-11-12T09:00', from: 'America/Los_Angeles' })).content[0];
+      expect(JSON.parse(conversion?.type === 'text' ? conversion.text : '')).toMatchObject({
+        conversions: { 'Europe/Brussels': { iso: '2026-11-12T18:00:00+01:00' } },
+      });
+      const diff = tools.find((t) => t.tool.name === 'time_diff')!;
+      const difference = (await diff.handler({ from: 'Nov 12 9am', to: 'Nov 12 10am' })).content[0];
+      expect(JSON.parse(difference?.type === 'text' ? difference.text : '')).toMatchObject({
+        from: { iso: '2026-11-12T09:00:00+01:00' },
+        to: { iso: '2026-11-12T10:00:00+01:00' },
+      });
+      const acrossClocks = (await diff.handler({ from: 'Nov 9 10:30pm', to: 'Nov 10 8:30am' })).content[0];
+      expect(JSON.parse(acrossClocks?.type === 'text' ? acrossClocks.text : '')).toMatchObject({
+        from: { iso: '2026-11-09T22:30:00-08:00' },
+        to: { iso: '2026-11-10T08:30:00+01:00' },
+        calendar_days: 1,
+        business_days: 1,
+        human: '1 hour',
+      });
+      const range = (await resolve.handler({ expression: 'Nov 9 9am to Nov 12 10am' })).content[0];
+      expect(JSON.parse(range?.type === 'text' ? range.text : '')).toMatchObject({
+        resolved: { iso: '2026-11-09T09:00:00-08:00' },
+        end: { iso: '2026-11-12T10:00:00+01:00' },
+      });
+      const saved = fs.readFileSync(view, 'utf8');
+      fs.writeFileSync(view, saved.replace('"Europe/Brussels"', 'null'));
+      const unknown = (await resolve.handler({ expression: 'Nov 12 9am' })).content[0];
+      expect(JSON.parse(unknown?.type === 'text' ? unknown.text : '')).toMatchObject({
+        resolved: { iso: '2026-11-12T09:00:00-08:00' },
+        clock_source: 'home zone',
+      });
+      fs.writeFileSync(view, saved);
+      fs.writeFileSync(view, '{corrupt');
+      const fallback = (await resolve.handler({ expression: 'Nov 12 9am' })).content[0];
+      expect(JSON.parse(fallback?.type === 'text' ? fallback.text : '')).toMatchObject({
+        resolved: { iso: '2026-11-12T09:00:00-08:00' },
+        clock_source: 'home zone',
+      });
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('rereads a newly recorded stay on the next tool call and keeps explicit offsets fixed', async () => {
+    const fs = await import('node:fs');
+    const os = await import('node:os');
+    const path = await import('node:path');
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'time-view-live-'));
+    const view = path.join(root, 'week-view.json');
+    const tools = createTimeTools('America/Los_Angeles', () => Date.parse('2026-11-12T20:00Z'), view);
+    const now = tools.find((t) => t.tool.name === 'time_now')!;
+    try {
+      const initial = (await now.handler({})).content[0];
+      expect(JSON.parse(initial?.type === 'text' ? initial.text : '')).toMatchObject({
+        zone: 'America/Los_Angeles',
+        clock_source: 'home zone',
+      });
+      fs.writeFileSync(
+        view,
+        JSON.stringify({
+          timeline: {
+            homeZone: 'America/Los_Angeles',
+            base: { home_place_id: null },
+            places: [],
+            rhythm: [],
+            legs: [],
+            stays: [
+              {
+                ids: ['brussels'],
+                locality: 'Brussels',
+                zone: 'Europe/Brussels',
+                start: Date.parse('2026-11-10T00:00Z'),
+                end: Date.parse('2026-11-15T00:00Z'),
+                certainty: 'certain',
+              },
+            ],
+          },
+        }),
+      );
+      const current = (await now.handler({})).content[0];
+      expect(JSON.parse(current?.type === 'text' ? current.text : '')).toMatchObject({
+        zone: 'Europe/Brussels',
+        clock_source: 'zone in effect',
+      });
+      const resolve = tools.find((t) => t.tool.name === 'time_resolve')!;
+      const explicit = (await resolve.handler({ expression: '2026-11-12T09:00:00-08:00' })).content[0];
+      const result = JSON.parse(explicit?.type === 'text' ? explicit.text : '') as TimeResolveResult;
+      expect(Date.parse(result.resolved!.iso)).toBe(Date.parse('2026-11-12T17:00Z'));
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
   });
 });

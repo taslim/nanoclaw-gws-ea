@@ -2,8 +2,8 @@
  * Models get dates, weekdays, and offsets wrong when they work them out
  * themselves; these tools make that work deterministic. The tool names, inputs
  * and `{ iso, formatted, day, zone }` shape are a proven interface, adopted
- * unchanged. Everything is computed in the container's timezone, which is the
- * principal's, unless time_convert names others.
+ * unchanged. Each moment uses the current view's clock, with the container's
+ * home timezone as an explicit fallback.
  *
  * A local wall-clock time becomes an instant explicitly. One that does not
  * exist (the clocks go forward over it) is an error, and one that happens twice
@@ -20,6 +20,14 @@ import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import * as chrono from 'chrono-node';
 import { DateTime, type DateTimeMaybeValid, type Duration } from 'luxon';
 
+import {
+  readClockTimeline,
+  timelineZoneAt,
+  timelineZoneForDay,
+  WEEK_VIEW_FILE,
+  type ClockSource,
+  type ClockTimeline,
+} from '../week-view/clock.js';
 import { TIMEZONE, isValidTimezone } from '../timezone.js';
 import { registerTools } from './server.js';
 import type { McpToolDefinition } from './types.js';
@@ -59,11 +67,13 @@ export interface FormattedDt {
 }
 
 export interface TimeNowResult extends FormattedDt {
+  clock_source: ClockSource;
   unix: number;
 }
 
 /** A local time that happens twice has no `resolved`; `candidates` holds both instants, earlier first. */
 export interface TimeResolveResult {
+  clock_source: ClockSource;
   expression: string;
   reference: FormattedDt;
   resolved?: FormattedDt;
@@ -81,6 +91,7 @@ export interface TimeConversion {
 
 /** An exact input carries one conversion inline; a local time that happens twice carries both as `candidates`. */
 export interface TimeConvertResult extends Partial<TimeConversion> {
+  clock_source: ClockSource;
   input: string;
   ambiguous?: true;
   candidates?: TimeConversion[];
@@ -88,6 +99,7 @@ export interface TimeConvertResult extends Partial<TimeConversion> {
 }
 
 export interface TimeDiffResult {
+  clock_source: ClockSource;
   from: FormattedDt;
   to: FormattedDt;
   direction: 'past' | 'future';
@@ -114,6 +126,7 @@ type Moment =
 
 interface Reading {
   moment: Moment;
+  fixed: boolean;
   /** In the zone it was read in. */
   wall: WallClock;
   /** False when a day was given without a time of day. */
@@ -281,7 +294,14 @@ function readIso(text: string, zone: string): Reading | null {
       second: 0,
       millisecond: 0,
     });
-    return { moment: { kind: 'exact', at: startOfDay(wall, zone) }, wall, timeStated: false, read: text, notes: [] };
+    return {
+      fixed: false,
+      moment: { kind: 'exact', at: startOfDay(wall, zone) },
+      wall,
+      timeStated: false,
+      read: text,
+      notes: [],
+    };
   }
 
   const dateTime = ISO_DATE_TIME.exec(text);
@@ -291,12 +311,19 @@ function readIso(text: string, zone: string): Reading | null {
     const parsed = DateTime.fromISO(normalized, { setZone: true });
     if (!parsed.isValid) fail(notUnderstood(text));
     const at = valid(parsed.setZone(zone));
-    return { moment: { kind: 'exact', at }, wall: wallClockOf(at), timeStated: true, read: text, notes: [] };
+    return {
+      fixed: true,
+      moment: { kind: 'exact', at },
+      wall: wallClockOf(at),
+      timeStated: true,
+      read: text,
+      notes: [],
+    };
   }
   const parsed = DateTime.fromISO(normalized, { zone: 'utc' });
   if (!parsed.isValid) fail(notUnderstood(text));
   const wall = wallClockOf(parsed);
-  return { moment: momentAt(wall, zone), wall, timeStated: true, read: text, notes: [] };
+  return { fixed: false, moment: momentAt(wall, zone), wall, timeStated: true, read: text, notes: [] };
 }
 
 /**
@@ -458,6 +485,7 @@ function readNatural(text: string, zone: string, reference: ValidDateTime): Read
     : undefined;
 
   return {
+    fixed: start.isCertain('timezoneOffset') || start.tags().has(RELATIVE_TIME_TAG) || start.tags().has(NOW_TAG),
     moment,
     wall: moment.kind === 'exact' ? wallClockOf(moment.at) : wall,
     timeStated,
@@ -476,6 +504,43 @@ function readInput(input: string, zone: string, reference: ValidDateTime): Readi
     reading.notes.push(`${twiceMessage(reading.wall, zone, moment.earlier, moment.later)} Ask which one is meant.`);
   }
   return reading;
+}
+
+function readWithClock(
+  expression: string,
+  zone: string,
+  reference: ValidDateTime,
+  timeline: ClockTimeline | null,
+  homeZone: string,
+): Reading {
+  const initial = readInput(expression, zone, reference);
+  if (timeline === null) return initial;
+  if (initial.fixed) {
+    const inZone = (moment: Moment): Moment =>
+      moment.kind === 'exact'
+        ? { kind: 'exact', at: valid(moment.at.setZone(timelineZoneAt(timeline, moment.at.toMillis()) ?? homeZone)) }
+        : moment;
+    return { ...initial, moment: inZone(initial.moment), ...(initial.end ? { end: inZone(initial.end) } : {}) };
+  }
+  const target = timelineZoneForDay(timeline, floating(initial.wall).toISODate()!) ?? homeZone;
+  const reading =
+    target === zone
+      ? initial
+      : readInput(expression, target, valid(reference.setZone(target, { keepLocalTime: true })));
+  if (!reading.end) return reading;
+  const endAt = reading.end.kind === 'exact' ? reading.end.at : reading.end.earlier;
+  const endWall = wallClockOf(endAt);
+  const endZone = timelineZoneForDay(timeline, floating(endWall).toISODate()!) ?? homeZone;
+  return endZone === target ? reading : { ...reading, end: momentAt(endWall, endZone) };
+}
+
+function clockSource(timeline: ClockTimeline | null, ...moments: Moment[]): ClockSource {
+  return timeline !== null &&
+    moments.every(
+      (moment) => timelineZoneAt(timeline, (moment.kind === 'exact' ? moment.at : moment.earlier).toMillis()) !== null,
+    )
+    ? 'zone in effect'
+    : 'home zone';
 }
 
 function nowIn(zone: string, now: () => number): ValidDateTime {
@@ -560,19 +625,35 @@ function prefixed(label: string, notes: string[]): string[] {
 }
 
 /** The container registers them for its own timezone; tests build them for any zone and a fixed clock. */
-export function createTimeTools(zone: string, now: () => number = Date.now): McpToolDefinition[] {
-  if (!isValidTimezone(zone)) throw new Error(`Time tools need an IANA timezone, got "${zone}"`);
+export function createTimeTools(
+  homeZone: string,
+  now: () => number = Date.now,
+  viewFile = WEEK_VIEW_FILE,
+): McpToolDefinition[] {
+  if (!isValidTimezone(homeZone)) throw new Error(`Time tools need an IANA timezone, got "${homeZone}"`);
+  const clock = () => {
+    const at = now();
+    const timeline = readClockTimeline(viewFile);
+    const effective = timeline === null ? null : timelineZoneAt(timeline, at);
+    return {
+      at,
+      timeline,
+      zone: effective ?? homeZone,
+      source: (effective === null ? 'home zone' : 'zone in effect') as ClockSource,
+    };
+  };
 
   const timeNow: McpToolDefinition = {
     tool: {
       name: 'time_now',
-      description: `Get the current date, time, and day of the week in the principal's timezone (${zone}).`,
+      description: `Get the current date, time, and day of the week in the zone in effect from the current view (home fallback: ${homeZone}).`,
       inputSchema: { type: 'object' as const, properties: {} },
     },
     async handler() {
       return run((): TimeNowResult => {
-        const dt = nowIn(zone, now);
-        return { ...formatDt(dt), unix: Math.floor(dt.toSeconds()) };
+        const current = clock();
+        const dt = nowIn(current.zone, () => current.at);
+        return { ...formatDt(dt), unix: Math.floor(dt.toSeconds()), clock_source: current.source };
       });
     },
   };
@@ -580,14 +661,14 @@ export function createTimeTools(zone: string, now: () => number = Date.now): Mcp
   const timeResolve: McpToolDefinition = {
     tool: {
       name: 'time_resolve',
-      description: `Turn a date/time expression into an exact date in the principal's timezone (${zone}). Examples: "next Thursday 2pm", "March 15", "in 3 weeks", "2026-03-15T14:00". The result says what was read and assumed, and any other reading the words could have; a local time that does not exist on a clock-change day is an error, and one that happens twice returns both candidates instead of one.`,
+      description: `Turn a date/time expression into an exact date in the zone in effect from the current view (home fallback: ${homeZone}). Examples: "next Thursday 2pm", "March 15", "in 3 weeks", "2026-03-15T14:00". The result says what was read and assumed, and any other reading the words could have; a local time that does not exist on a clock-change day is an error, and one that happens twice returns both candidates instead of one.`,
       inputSchema: {
         type: 'object' as const,
         properties: {
           expression: { type: 'string', description: 'Natural-language or ISO date/time expression' },
           reference_date: {
             type: 'string',
-            description: `ISO date or date-time to resolve relative to, such as "2026-10-05T10:00" (read in ${zone} unless it carries an offset). Defaults to now.`,
+            description: `ISO date or date-time to resolve relative to, such as "2026-10-05T10:00" (read in the zone in effect unless it carries an offset). Defaults to now.`,
           },
         },
         required: ['expression'],
@@ -595,9 +676,11 @@ export function createTimeTools(zone: string, now: () => number = Date.now): Mcp
     },
     async handler(args) {
       return run((): TimeResolveResult => {
+        const snapshot = clock();
+        const { zone } = snapshot;
         const expression = requiredString(args, 'expression');
-        const reference = readReference(optionalString(args, 'reference_date'), zone, now);
-        const reading = readInput(expression, zone, reference);
+        const reference = readReference(optionalString(args, 'reference_date'), zone, () => snapshot.at);
+        const reading = readWithClock(expression, zone, reference, snapshot.timeline, homeZone);
         const both = (moment: Extract<Moment, { kind: 'ambiguous' }>) => [
           formatDt(moment.earlier),
           formatDt(moment.later),
@@ -605,6 +688,7 @@ export function createTimeTools(zone: string, now: () => number = Date.now): Mcp
         const { moment, end } = reading;
         return {
           expression,
+          clock_source: clockSource(snapshot.timeline, moment, ...(end ? [end] : [])),
           reference: formatDt(valid(reference.setZone(zone))),
           ...(moment.kind === 'exact' ? { resolved: formatDt(moment.at) } : { candidates: both(moment) }),
           ...(end === undefined
@@ -622,7 +706,7 @@ export function createTimeTools(zone: string, now: () => number = Date.now): Mcp
   const timeConvert: McpToolDefinition = {
     tool: {
       name: 'time_convert',
-      description: `Convert a time between timezones. \`from\` and \`to\` default to the principal's timezone (${zone}).`,
+      description: `Convert a time between timezones. \`from\` and \`to\` default to the zone in effect for the date (home fallback: ${homeZone}).`,
       inputSchema: {
         type: 'object' as const,
         properties: {
@@ -646,26 +730,54 @@ export function createTimeTools(zone: string, now: () => number = Date.now): Mcp
     },
     async handler(args) {
       return run((): TimeConvertResult => {
+        const snapshot = clock();
+        const { zone } = snapshot;
         const time = requiredString(args, 'time');
         const fromZone = optionalString(args, 'from') ?? zone;
-        const targets = optionalZones(args, 'to') ?? [zone];
+        const targets = optionalZones(args, 'to');
         if (!isValidTimezone(fromZone)) {
           fail(`Invalid source timezone "${fromZone}". Use an IANA name like "America/New_York".`);
         }
-        const invalid = targets.find((target) => !isValidTimezone(target));
+        const invalid = targets?.find((target) => !isValidTimezone(target));
         if (invalid !== undefined) {
           fail(`Invalid target timezone "${invalid}". Use an IANA name like "America/New_York".`);
         }
 
-        const reading = readInput(time, fromZone, nowIn(fromZone, now));
+        const reading =
+          optionalString(args, 'from') === undefined
+            ? readWithClock(
+                time,
+                fromZone,
+                nowIn(fromZone, () => snapshot.at),
+                snapshot.timeline,
+                homeZone,
+              )
+            : readInput(
+                time,
+                fromZone,
+                nowIn(fromZone, () => snapshot.at),
+              );
         const convert = (at: ValidDateTime): TimeConversion => ({
           source: formatDt(at),
-          conversions: Object.fromEntries(targets.map((target) => [target, formatDt(valid(at.setZone(target)))])),
+          conversions: Object.fromEntries(
+            (
+              targets ?? [
+                snapshot.timeline === null ? zone : (timelineZoneAt(snapshot.timeline, at.toMillis()) ?? homeZone),
+              ]
+            ).map((target) => [target, formatDt(valid(at.setZone(target)))]),
+          ),
         });
         const notes = reading.notes.length > 0 ? { notes: reading.notes } : {};
         const { moment } = reading;
-        if (moment.kind === 'exact') return { input: time, ...convert(moment.at), ...notes };
-        return { input: time, ambiguous: true, candidates: [convert(moment.earlier), convert(moment.later)], ...notes };
+        if (moment.kind === 'exact')
+          return { input: time, clock_source: clockSource(snapshot.timeline, moment), ...convert(moment.at), ...notes };
+        return {
+          input: time,
+          clock_source: clockSource(snapshot.timeline, moment),
+          ambiguous: true,
+          candidates: [convert(moment.earlier), convert(moment.later)],
+          ...notes,
+        };
       });
     },
   };
@@ -673,7 +785,7 @@ export function createTimeTools(zone: string, now: () => number = Date.now): Mcp
   const timeDiff: McpToolDefinition = {
     tool: {
       name: 'time_diff',
-      description: `Calculate the gap between two dates in the principal's timezone (${zone}): calendar days between the local dates, business days (weekdays after the start day up to and including the end day; public holidays are not known), and the elapsed time. \`from\` defaults to now.`,
+      description: `Calculate the gap between two dates in the zone in effect from the current view (home fallback: ${homeZone}): calendar days between the local dates, business days (weekdays after the start day up to and including the end day; public holidays are not known), and the elapsed time. \`from\` defaults to now.`,
       inputSchema: {
         type: 'object' as const,
         properties: {
@@ -685,18 +797,22 @@ export function createTimeTools(zone: string, now: () => number = Date.now): Mcp
     },
     async handler(args) {
       return run((): TimeDiffResult => {
+        const snapshot = clock();
+        const { zone } = snapshot;
         const toInput = requiredString(args, 'to');
         const fromInput = optionalString(args, 'from');
-        const current = nowIn(zone, now);
-        const fromReading = fromInput === undefined ? null : readInput(fromInput, zone, current);
-        const toReading = readInput(toInput, zone, current);
+        const current = nowIn(zone, () => snapshot.at);
+        const fromReading =
+          fromInput === undefined ? null : readWithClock(fromInput, zone, current, snapshot.timeline, homeZone);
+        const toReading = readWithClock(toInput, zone, current, snapshot.timeline, homeZone);
         const fromAt = fromReading === null ? current : exactly(fromReading, 'from', zone);
         const toAt = exactly(toReading, 'to', zone);
 
         const [earlier, later] = fromAt <= toAt ? [fromAt, toAt] : [toAt, fromAt];
-        const earlierWall = wallClockOf(valid(earlier.setZone(zone)));
-        const laterWall = wallClockOf(valid(later.setZone(zone)));
-        const duration = valid(later.setZone(zone)).diff(valid(earlier.setZone(zone)), [
+        const earlierWall = wallClockOf(earlier);
+        const laterWall = wallClockOf(later);
+        const durationZone = earlier.zoneName === later.zoneName ? earlier.zoneName : 'UTC';
+        const duration = valid(later.setZone(durationZone)).diff(valid(earlier.setZone(durationZone)), [
           'years',
           'months',
           'weeks',
@@ -707,8 +823,9 @@ export function createTimeTools(zone: string, now: () => number = Date.now): Mcp
         const notes = [...prefixed('from', fromReading?.notes ?? []), ...prefixed('to', toReading.notes)];
 
         return {
-          from: formatDt(valid(fromAt.setZone(zone))),
-          to: formatDt(valid(toAt.setZone(zone))),
+          clock_source: clockSource(snapshot.timeline, { kind: 'exact', at: fromAt }, { kind: 'exact', at: toAt }),
+          from: formatDt(fromAt),
+          to: formatDt(toAt),
           direction: toAt < fromAt ? 'past' : 'future',
           calendar_days: dayNumber(laterWall) - dayNumber(earlierWall),
           business_days: businessDaysBetween(earlierWall, laterWall),
