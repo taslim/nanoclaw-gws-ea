@@ -1,6 +1,7 @@
 import { AnchoredDir } from '../../../anchored-dir.js';
-import { findConversationSessions } from '../../../db/sessions.js';
+import { findConversationSessions, getActiveSessions } from '../../../db/sessions.js';
 import { sessionDir } from '../../../session-manager.js';
+import { getOpenCloseRun } from '../../gws-ea-matters/close-runs.js';
 import { getMainAgentGroupId } from '../../gws-ea-profile/db.js';
 import type { Timeline } from '../../gws-ea-whereabouts/timeline.js';
 import { checkWeek, presentFinding } from './checker.js';
@@ -8,7 +9,6 @@ import { digest, presentWeek, type Week } from './model.js';
 
 export const WEEK_VIEW_NAME = 'week-view.json';
 const VIEW_CHARACTERS = 8_000;
-const VIEW_MAX_BYTES = 1_048_576;
 export interface ViewEntry {
   readonly id: string;
   readonly text: string;
@@ -28,7 +28,8 @@ export interface WeekView {
   readonly days: readonly ViewDay[];
   /** The Manual's current sections; the hook prints only those its session does not already hold. */
   readonly manual: readonly string[];
-  readonly timeline: Timeline;
+  /** Only what the session's clock reads. */
+  readonly timeline: Pick<Timeline, 'homeZone' | 'base' | 'places' | 'rhythm' | 'stays' | 'legs'>;
 }
 
 const WRAPPER_ID = /(<<<(?:END_)?EXTERNAL_UNTRUSTED_CONTENT) id="[0-9a-f]+">>>/gu;
@@ -81,75 +82,39 @@ export function renderWeekView(week: Week, asOf: string, manual: readonly string
         allowance -= entry.text.length + 1;
       }
     }
-  const text = allDays
-    .map((day, index) =>
-      [
-        day.header,
-        ...shownEntries[index].map((entry) => entry.text),
-        ...(day.entries.length > shownEntries[index].length
-          ? [`+${day.entries.length - shownEntries[index].length} more; use days`]
-          : []),
-      ].join('\n'),
-    )
-    .join('\n\n');
-  const timeline = week.timeline;
-  const envelope = (days: readonly ViewDay[], version: string): WeekView => ({
+  const days = allDays.map((day, index): ViewDay => {
+    const more = day.entries.length - shownEntries[index].length;
+    return { ...day, entries: [...shownEntries[index], ...(more ? [entry('more', `+${more} more; use days`)] : [])] };
+  });
+  const { homeZone, base, places, rhythm, stays, legs } = week.timeline;
+  return {
     schema: 1,
     asOf,
-    version,
-    text,
-    days,
-    manual,
-    timeline,
-  });
-  const empty = allDays.map((day) => ({ ...day, entries: [] }));
-  const bytes = (value: unknown) => Buffer.byteLength(JSON.stringify(value));
-  const footer = (count: number, version: string): ViewEntry => ({ id: 'more', text: `+${count} more`, version });
-  const reserved = allDays.reduce((total, day) => total + bytes(footer(day.entries.length, '0'.repeat(64))) + 1, 1);
-  let remaining = VIEW_MAX_BYTES - bytes(envelope(empty, '0'.repeat(64))) - reserved;
-  if (remaining < 0) throw new Error('The coming-days clock timeline exceeds the bounded view file');
-  const selected = allDays.map(() => new Set<number>());
-  for (let index = 0; allDays.some((day) => index < day.entries.length); index++)
-    for (let day = 0; day < allDays.length; day++) {
-      const entry = allDays[day].entries[index];
-      if (!entry) continue;
-      const size = bytes(entry) + 1;
-      if (size <= remaining) {
-        selected[day].add(index);
-        remaining -= size;
-      }
-    }
-  const days = allDays.map((day, index): ViewDay => {
-    const retained = day.entries.filter((_, entry) => selected[index].has(entry));
-    const omitted = day.entries.filter((_, entry) => !selected[index].has(entry));
-    return {
-      ...day,
-      entries: [
-        ...retained,
-        ...(omitted.length ? [footer(omitted.length, digest(omitted.map((entry) => entry.version)))] : []),
-      ],
-    };
-  });
-  return envelope(
-    days,
-    digest([
+    version: digest([
       asOf,
       days.map((day) => [day.date, day.version, day.entries.map((entry) => [entry.id, entry.version])]),
       manual,
       week.timeline.version,
     ]),
-  );
+    text: days.map((day) => [day.header, ...day.entries.map((entry) => entry.text)].join('\n')).join('\n\n'),
+    days,
+    manual,
+    timeline: { homeZone, base, places, rhythm, stays, legs },
+  };
 }
 
 /**
- * Publish every conversation before the matching change note can wake any of them. A view whose version is
- * unchanged goes only to sessions that have none yet.
+ * Publish every conversation, and the evening close while it runs, before the matching change note can wake any
+ * of them. A view whose version is unchanged goes only to sessions that have none yet.
  */
 export async function writeWeekView(view: WeekView, unchanged = false): Promise<void> {
   const main = await getMainAgentGroupId();
   if (!main) return;
   const bytes = JSON.stringify(view) + '\n';
-  for (const session of await findConversationSessions(main)) {
+  const sessions = await findConversationSessions(main);
+  for (const session of await getActiveSessions())
+    if (session.agent_group_id === main && (await getOpenCloseRun(session.id))) sessions.push(session);
+  for (const session of sessions) {
     const dir = AnchoredDir.open(sessionDir(main, session.id), [], true);
     if (!dir) throw new Error('The conversation directory is unavailable');
     try {

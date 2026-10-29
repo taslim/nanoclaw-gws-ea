@@ -142,11 +142,13 @@ describe('the native week hooks', () => {
     const printed = text.split('\n').filter((line) => /^2026-10-05:/u.test(line)).length;
     expect(text).toEndWith(`+${31 - printed} more\n`);
   });
-  it('reports a changed overflow even when its omitted count is unchanged', () => {
-    fs.writeFileSync(file, JSON.stringify(view('first', [entry('more', '+3000 more', 'old')])));
+  it('says an entry that left the view is no longer shown, since a busy day can push it past the budget', () => {
+    fs.writeFileSync(file, JSON.stringify(view()));
     run('SessionStart', 'startup');
-    fs.writeFileSync(file, JSON.stringify(view('second', [entry('more', '+3000 more', 'new')])));
-    expect(run('UserPromptSubmit').stdout).toContain('2026-10-05: +3000 more');
+    fs.writeFileSync(file, JSON.stringify(view('second', [entry('more', '+1 more; use days')])));
+    const text = run('UserPromptSubmit').stdout;
+    expect(text).toContain('2026-10-05: no longer shown: Remy Vance at 09:00');
+    expect(text).toContain('2026-10-05: +1 more; use days');
   });
   it.each([600, 6_000])('delivers a complete %i-character Manual update even during a calendar burst', (length) => {
     fs.writeFileSync(file, JSON.stringify(view()));
