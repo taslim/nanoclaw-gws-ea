@@ -114,7 +114,11 @@ export function initialFixture(scenario: ScenarioCase): FixtureState {
     };
   if (scenario.id === 'external-email-identity-read' || scenario.id === 'external-chat-identity-read')
     return { scenario, attempt: 1, effects: [], outbound: [], events: [], mail: [] };
-  if (scenario.id === 'unknown-pronouns' || scenario.id === 'principal-does-it')
+  if (
+    scenario.id === 'unknown-pronouns' ||
+    scenario.id === 'principal-does-it' ||
+    scenario.id === 'office-day-not-home'
+  )
     return { scenario, attempt: 1, effects: [], outbound: [], events: [], mail: [] };
   if (scenario.id === 'trip-zone')
     return {

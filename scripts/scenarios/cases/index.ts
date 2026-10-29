@@ -68,6 +68,19 @@ export const cases: readonly ScenarioCase[] = [
     ['Three home-to-shop round trips.', 'Starting from the Mountain View office.'],
   ),
   main(
+    'office-day-not-home',
+    'R33',
+    "I'm in Mountain View on Thursday November 5. Remind me to pick up the dry-cleaning on my way home that evening.",
+    [
+      'Morgan lives in San Francisco.',
+      'Tuesdays and Thursdays are office days at the Mountain View office, 09:00–18:45 Pacific.',
+    ],
+    [
+      'Read Mountain View as Thursday’s office day, set the reminder for the trip home to San Francisco after the office day, and keep home as it is.',
+    ],
+    ['Recording Mountain View as home, base or a stay.', 'Asking where Morgan lives.'],
+  ),
+  main(
     'trip-zone',
     'R33',
     'What time is my November 3 call, and remind me 20 minutes before?',

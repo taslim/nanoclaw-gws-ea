@@ -29,6 +29,7 @@ const STORED: Readonly<Record<string, readonly (readonly [Store, string])[]>> = 
     ['whereabouts', 'Neighborhood Pharmacy'],
     ['manual', 'home–pharmacy–dry-cleaning–groceries–home loop'],
   ],
+  'office-day-not-home': [['whereabouts', 'Mountain View']],
   'trip-zone': [
     ['events', 'London project call'],
     ['whereabouts', 'Europe/London'],
