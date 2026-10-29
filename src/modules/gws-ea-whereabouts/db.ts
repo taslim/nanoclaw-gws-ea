@@ -20,7 +20,7 @@ import {
   type StaySource,
   type WorkingHours,
 } from './records.js';
-import { loadTimeline, resolveStay, zoneAt, type TimelineStay } from './timeline.js';
+import { loadTimeline } from './timeline.js';
 
 export { getWhereabouts, WEEKDAYS } from './records.js';
 export type {
@@ -251,39 +251,6 @@ export interface AddStayInput {
   readonly sourceVersion?: string;
 }
 
-function conflicts(a: TimelineStay, b: TimelineStay): boolean {
-  const aEnd = a.end ?? Number.POSITIVE_INFINITY;
-  const bEnd = b.end ?? Number.POSITIVE_INFINITY;
-  if (
-    a.certainty !== 'certain' ||
-    b.certainty !== 'certain' ||
-    (a.locality !== null && b.locality !== null && a.locality.toLocaleLowerCase() === b.locality.toLocaleLowerCase()) ||
-    !a.zone ||
-    !b.zone ||
-    a.zone === b.zone ||
-    a.start >= bEnd ||
-    b.start >= aEnd
-  )
-    return false;
-  const aInside = a.start >= b.start && aEnd <= bEnd && (a.start > b.start || aEnd < bEnd);
-  const bInside = b.start >= a.start && bEnd <= aEnd && (b.start > a.start || bEnd < aEnd);
-  return !aInside && !bInside;
-}
-
-const stayName = (stay: TimelineStay): string => stay.locality ?? stay.zone ?? 'an unknown zone';
-
-/** Refuses the stay main is recording when it leaves the zone ambiguous; precedence settles every other overlap. */
-async function assertCertainStay(id: string): Promise<void> {
-  const timeline = await loadTimeline();
-  // Resolve the original records: merging same-locality spans must not hide a shorter nested stay.
-  const stays = (await getWhereabouts()).stays.map((stay) => resolveStay(stay, timeline.places, timeline.homeZone));
-  const recorded = stays.find((stay) => stay.ids.includes(id));
-  const other = recorded && stays.find((stay) => stay !== recorded && conflicts(recorded, stay));
-  if (recorded && other)
-    throw new Error(
-      `Certain stays in ${stayName(recorded)} and ${stayName(other)} overlap; record their dates so one is contained in the other`,
-    );
-}
 async function writeStay(record: Stay): Promise<void> {
   await getDb().run(
     `INSERT INTO gws_ea_stays (id, place_id, locality, zone, start, end, source, certainty, working_hours, source_event_id, source_version, derived, departure_at, departure_zone, updated_at)
@@ -314,10 +281,16 @@ export async function addStay(input: AddStayInput): Promise<Stay> {
     const timeline = await loadTimeline();
     const place = input.placeId ? timeline.places.find((p) => p.id === input.placeId) : undefined;
     if (input.placeId && !place) throw new Error(`Place ${JSON.stringify(input.placeId)} is not set`);
-    const ownZone = place ? place.zone : zone(input.zone);
-    const end = input.end ?? dateString(wallClock(Date.now(), ownZone ?? zoneAt(timeline, Date.now()) ?? 'UTC'));
-    const startInstant = boundary(input.start, ownZone ?? timeline.homeZone ?? 'UTC', 'start');
-    const endInstant = boundary(end, ownZone ?? timeline.homeZone ?? 'UTC', 'end');
+    const ownZone = place ? place.zone : input.zone === undefined ? null : zone(input.zone);
+    if (ownZone === null)
+      throw new Error(
+        place
+          ? `Saved place ${place.id} has no zone; record its IANA zone before a stay there`
+          : 'A stay somewhere new needs --zone, the IANA zone of its locality',
+      );
+    const end = input.end ?? dateString(wallClock(Date.now(), ownZone));
+    const startInstant = boundary(input.start, ownZone, 'start');
+    const endInstant = boundary(end, ownZone, 'end');
     if (endInstant <= startInstant) throw new Error('Stay end must follow its start; without an end a stay ends today');
     const sourceEventId = input.sourceEventId === undefined ? null : line(input.sourceEventId, 'Source event id');
     const existing = sourceEventId
@@ -336,12 +309,12 @@ export async function addStay(input: AddStayInput): Promise<Stay> {
       source_event_id: sourceEventId,
       source_version: input.sourceVersion ?? null,
       derived: 0,
-      departure_at: null,
-      departure_zone: null,
+      // Main's record of a flight keeps the flight's departure, which still ends the stay before it.
+      departure_at: existing?.departure_at ?? null,
+      departure_zone: existing?.departure_zone ?? null,
       updated_at: now(),
     };
     await writeStay(record);
-    await assertCertainStay(record.id);
     if (sourceEventId)
       await getDb().run('DELETE FROM gws_ea_dismissed_travel_events WHERE source_event_id = ?', sourceEventId);
     return record;
@@ -387,12 +360,14 @@ export interface DerivationWindow {
   readonly start: number;
   readonly end: number;
 }
+/** Each derived stay ends at the next flight's departure, a flight main recorded included. */
 async function linkDerivedEnds(): Promise<boolean> {
   const rows = await getDb().all<Stay>(
-    'SELECT * FROM gws_ea_stays WHERE derived = 1 ORDER BY departure_at, source_event_id',
+    'SELECT * FROM gws_ea_stays WHERE departure_at IS NOT NULL ORDER BY departure_at, source_event_id',
   );
   let changed = false;
   for (let i = 0; i < rows.length; i++) {
+    if (!rows[i].derived) continue;
     // A stay ended at its own arrival landed home, and stays ended through a later home-zone change.
     const end = rows[i].end === rows[i].start ? rows[i].end : (rows[i + 1]?.departure_at ?? null);
     if (rows[i].end !== end) {

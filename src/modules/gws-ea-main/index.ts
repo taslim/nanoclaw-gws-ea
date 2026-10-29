@@ -34,11 +34,6 @@ registerCapability(MAIN_CONTEXT_CAPABILITY, {
   default: 'off',
   grantedTo: async (agentGroupId) => agentGroupId === (await mainAgentGroupId()),
 });
-registerContainerEnv(
-  'gws-ea-main:planning',
-  ({ capabilities }): Record<string, string> =>
-    capabilities.has(MAIN_CONTEXT_CAPABILITY) ? { GWS_EA_PLANNING_AGENTS: '1' } : {},
-);
 // Pinned because Claude Code otherwise picks its prompt by model: on any model
 // the shorter one keeps the agent loop and leaves out the software-engineering
 // framing, so the character leads.

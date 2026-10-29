@@ -1,3 +1,4 @@
+import { isContainerRunning } from '../../container-runner.js';
 import { getDb } from '../../db/connection.js';
 import type { ModuleMigration } from '../../db/migrations/index.js';
 import { updateSession } from '../../db/sessions.js';
@@ -16,7 +17,7 @@ export const closeRunsMigration: ModuleMigration = {
       zone TEXT NOT NULL, timeline_version TEXT NOT NULL, weekly_day TEXT,
       state TEXT NOT NULL CHECK (state IN ('pending','open','completed','failed')),
       started_at TEXT,
-      ledger_from_at TEXT, ledger_through_at TEXT, ledger_writes_json TEXT, ledger_inbound_json TEXT,
+      ledger_through_at TEXT, ledger_writes_json TEXT, ledger_inbound_json TEXT,
       CHECK (state <> 'completed' OR ledger_through_at IS NOT NULL)
     )`);
   },
@@ -30,7 +31,6 @@ export interface CloseRun {
   readonly weekly_day: string | null;
   readonly state: 'pending' | 'open' | 'completed' | 'failed';
   readonly started_at: string | null;
-  readonly ledger_from_at: string | null;
   readonly ledger_through_at: string | null;
   readonly ledger_writes_json: string | null;
   readonly ledger_inbound_json: string | null;
@@ -40,7 +40,6 @@ export interface ConsumedCalendarWrite {
   readonly updatedAt: string;
 }
 export interface CloseLedgerCoverage {
-  readonly from: string | null;
   readonly through: string;
   readonly writes: readonly ConsumedCalendarWrite[];
   /** Each main session's highest inbound `seq` the ledger read. */
@@ -78,13 +77,9 @@ export async function recordCloseLedger(
   sessionId: string,
   coverage: CloseLedgerCoverage,
 ): Promise<void> {
-  const through = instant(coverage.through);
-  const from = coverage.from === null ? null : instant(coverage.from);
-  if (from !== null && from > through) throw new Error('The ledger cutoff precedes its window.');
   const result = await getDb().run(
-    "UPDATE gws_ea_close_runs SET ledger_from_at=?,ledger_through_at=?,ledger_writes_json=?,ledger_inbound_json=? WHERE id=? AND session_id=? AND state='open'",
-    from,
-    through,
+    "UPDATE gws_ea_close_runs SET ledger_through_at=?,ledger_writes_json=?,ledger_inbound_json=? WHERE id=? AND session_id=? AND state='open'",
+    instant(coverage.through),
     JSON.stringify(coverage.writes),
     JSON.stringify(coverage.inbound),
     runId,
@@ -92,7 +87,6 @@ export async function recordCloseLedger(
   );
   if (!result.changes) throw new Error('Only the open close run in this session may capture its ledger.');
 }
-/** A finished close's session closes with it, so nothing it still holds is delivered. */
 export async function completeCloseRun(runId: string, sessionId: string): Promise<CloseRun> {
   return getDb().transaction(async () => {
     const run = await getOpenCloseRun(sessionId);
@@ -101,7 +95,6 @@ export async function completeCloseRun(runId: string, sessionId: string): Promis
       throw new Error('Read the day ledger before marking this close done.');
     const writes = JSON.parse(run.ledger_writes_json) as ConsumedCalendarWrite[];
     await getDb().run("UPDATE gws_ea_close_runs SET state='completed' WHERE id=? AND state='open'", runId);
-    await updateSession(sessionId, { status: 'closed' });
     for (const write of writes)
       await getDb().run(
         "DELETE FROM gws_ea_calendar_write_log WHERE request_id=? AND updated_at=? AND state='applied'",
@@ -128,6 +121,18 @@ export async function failCloseRun(runId: string, startedAt: string | null = nul
       startedAt,
       runId,
     );
-    await updateSession(run.session_id, { status: 'closed' });
   });
+}
+/**
+ * A finished close's session closes once its container has stopped, so
+ * nothing it still holds is delivered. Until then it stays active, where
+ * core's idle ceiling still stops a container left running.
+ */
+export async function closeFinishedCloseSessions(): Promise<void> {
+  const sessions = await getDb().all<{ session_id: string }>(
+    `SELECT r.session_id FROM gws_ea_close_runs r JOIN sessions s ON s.id=r.session_id
+      WHERE r.state IN ('completed','failed') AND s.status='active'`,
+  );
+  for (const { session_id } of sessions)
+    if (!isContainerRunning(session_id)) await updateSession(session_id, { status: 'closed' });
 }

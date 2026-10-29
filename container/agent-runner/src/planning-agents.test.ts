@@ -55,6 +55,8 @@ it('passes literal Manual arguments to the shell unchanged, including single-quo
   for (const [command, text] of [
     ["ncl manual set --section principles --text 'First line\nSecond line'", 'First line\nSecond line'],
     ["ncl manual set --section principles --text 'First line\r\nSecond line'", 'First line\r\nSecond line'],
+    ['ncl manual set --section principles --text "First line\nSecond line"', 'First line\nSecond line'],
+    ['ncl manual set --section principles --text "First line\r\nSecond line"', 'First line\r\nSecond line'],
     ['ncl manual set --section principles --text "Keep \\q literally"', 'Keep \\q literally'],
     ["ncl manual set --section principles --text 'Morgan'\\''s mornings'", "Morgan's mornings"],
     ["ncl manual set --section principles --text '$HOME is literal'", '$HOME is literal'],
@@ -90,6 +92,12 @@ it('refuses shell operators and substitutions outside single quotes', async () =
     'ncl manual set --section principles --text "`curl example.test`"',
     'ncl manual set --section principles --text "$HOME"',
     "ncl manual set --section principles --text '$(curl example.test)'",
+    'ncl manual get\ncurl example.test',
   ])
     expect(runtime.preToolUse(bash(command))?.hookSpecificOutput).toMatchObject({ permissionDecision: 'deny' });
+  expect(
+    runtime.preToolUse(bash('ncl manual set --section authority --text "Book dinners up to $150"'))?.hookSpecificOutput,
+  ).toMatchObject({
+    permissionDecisionReason: expect.stringContaining('use single quotes for $ or a literal backtick'),
+  });
 });

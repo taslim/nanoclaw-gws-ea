@@ -39,7 +39,6 @@ it('advances only on the exact open run marker and only to its captured coverage
   expect(await getOpenCloseRun('close-session')).toMatchObject({ id: 'close-one', state: 'open' });
   await expect(completeCloseRun('close-one', 'close-session')).rejects.toThrow(/ledger/u);
   await recordCloseLedger('close-one', 'close-session', {
-    from: null,
     through: '2026-10-27T21:00:00.000Z',
     writes: [{ requestId: 'used', updatedAt: version }],
     inbound: {},
@@ -59,7 +58,6 @@ it('retains failed, unread and subsequently changed write evidence', async () =>
   await write('unread');
   await openClose('failed', 'session');
   await recordCloseLedger('failed', 'session', {
-    from: null,
     through: '2026-10-27T21:00:00.000Z',
     writes: [{ requestId: 'changed', updatedAt: version }],
     inbound: {},
@@ -69,7 +67,6 @@ it('retains failed, unread and subsequently changed write evidence', async () =>
   expect(await getDb().all('SELECT request_id FROM gws_ea_calendar_write_log')).toHaveLength(2);
   await openClose('next', 'next-session');
   await recordCloseLedger('next', 'next-session', {
-    from: null,
     through: '2026-10-28T21:00:00.000Z',
     writes: [{ requestId: 'changed', updatedAt: version }],
     inbound: {},

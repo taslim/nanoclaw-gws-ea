@@ -31,12 +31,9 @@ const { createProvider } = await import('./factory.js');
 const { MEMORY_SESSION_HOOK } = await import('../memory/session-hook.js');
 
 let directory: string;
-let previousEnable: string | undefined;
 beforeEach(() => {
   directory = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-planning-'));
   fs.mkdirSync(path.join(directory, 'memory'));
-  previousEnable = process.env.GWS_EA_PLANNING_AGENTS;
-  process.env.GWS_EA_PLANNING_AGENTS = '1';
   grants = new Set(['gws-ea-main-context', 'files-read', 'files-write', 'shell', 'web', 'subagents']);
   options = undefined;
   sdkMessages.length = 0;
@@ -44,8 +41,6 @@ beforeEach(() => {
 });
 afterEach(() => {
   closeSessionDb();
-  if (previousEnable === undefined) delete process.env.GWS_EA_PLANNING_AGENTS;
-  else process.env.GWS_EA_PLANNING_AGENTS = previousEnable;
   fs.rmSync(directory, { recursive: true, force: true });
 });
 async function query(): Promise<Options> {
@@ -105,12 +100,9 @@ it('keeps native child text out of main output while preserving parent text and 
   expect(events.filter((event) => event.type === 'activity')).toHaveLength(3);
 });
 
-it('enables both native planning definitions only with main’s capability and its host flag', async () => {
+it('enables both native planning definitions only with main’s capability', async () => {
   expect(Object.keys((await query()).agents ?? {})).toEqual(['look-back', 'look-ahead']);
   grants = new Set(['reply']);
-  expect((await query()).agents).toBeUndefined();
-  grants = new Set(['gws-ea-main-context']);
-  delete process.env.GWS_EA_PLANNING_AGENTS;
   expect((await query()).agents).toBeUndefined();
 });
 
