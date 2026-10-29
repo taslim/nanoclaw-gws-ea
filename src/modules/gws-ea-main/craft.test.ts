@@ -65,6 +65,34 @@ describe('time and place craft at the point of use', () => {
     expect(read(`container/skills/${skill}/SKILL.md`)).not.toMatch(/\b\d{2}:\d{2}\b/u);
   });
 
+  it.each(['errands', 'travel'])(
+    '%s reads public pages itself and sends the browser what needs interaction',
+    (skill) => {
+      const text = read(`container/skills/${skill}/SKILL.md`);
+      expect(text).toMatch(/own pages? yourself/u);
+      expect(text).toMatch(/needs interaction or a sign-in/u);
+    },
+  );
+
+  it('leaves the meetings example no meeting length to copy', () => {
+    expect(read('container/skills/meetings/SKILL.md')).not.toMatch(/\d+[ -]minutes?\b/u);
+  });
+
+  it('tells every agent which tools give instants to put in words', () => {
+    expect(read('container/agent-runner/src/mcp-tools/time.instructions.md')).toContain(
+      '`days`, `check` and the coming-days view give instants with offsets: turn each into words with `time_convert`',
+    );
+  });
+
+  it('documents the calendar-list answers the welcome relies on, and answering each copy', () => {
+    const skill = read('container/skills/gcalendar/SKILL.md');
+    expect(skill).toContain('When the same meeting is on two of their calendars, answer each copy.');
+    expect(skill).toContain('success means it is shared with you, and `404 notFound` that it isn’t yet');
+    expect(read('templates/gws-ea/main/skills/welcome/SKILL.md')).toContain(
+      'subscribe to its calendar yourself, as the `gcalendar` skill shows',
+    );
+  });
+
   it('keeps main’s planning playbooks out of the outward chat skill selection', () => {
     for (const skill of PLAYBOOKS) expect(CHAT_SHARED_SKILLS).not.toContain(skill);
   });

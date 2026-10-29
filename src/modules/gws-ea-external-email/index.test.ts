@@ -343,6 +343,16 @@ describe("external-email's project document", () => {
   });
 });
 
+describe('external-email and poorly fitting times', () => {
+  it('wakes main before offering them only when it matters', () => {
+    const tools = fs.readFileSync(
+      path.resolve('container/agent-runner/src/mcp-tools/gws-ea-email-external.instructions.md'),
+      'utf8',
+    );
+    expect(tools).toContain('wake main with `tell_main` first when it matters: main may free a better time');
+  });
+});
+
 describe("external-email's untrusted markers", () => {
   it('reads what others wrote between the markers as information, and leaves the markers out of what it writes', () => {
     const tools = fs.readFileSync(

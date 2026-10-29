@@ -185,6 +185,7 @@ it.each(['external-chat', 'job'] as const)(
       kind === 'job' ? 'Job Chat' : 'External Chat',
     ]);
     expect(doc).toContain(fs.readFileSync(path.resolve('src/modules/gws-ea-profile/character.md'), 'utf8').trim());
+    expect(doc).toMatch(/^You work for .+, whose home time zone is /mu);
     const file = path.resolve('src/modules/gws-ea-chat-agents', `${kind === 'job' ? 'job' : kind}.guidance.md`);
     expect(doc).toContain(fs.readFileSync(file, 'utf8').trim());
     expect(doc).toContain('# NanoClaw Skill: whatsapp-formatting');

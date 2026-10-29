@@ -236,6 +236,10 @@ describe("GWS-EA's guidance for main", () => {
     expect(GUIDANCE).not.toContain('Move, reschedule or cancel their own meetings by judgment and tell them');
   });
 
+  it('reads errands for one errand or a closing time, as well as a day of stops', () => {
+    expect(GUIDANCE).toContain('errands for an errand, a closing time or stops in a day');
+  });
+
   it('keeps its knowledge and granted working agreement distinct from guesses about the principal', () => {
     expect(GUIDANCE).toContain('Memory is your knowledge of the principal, written from your side');
     expect(GUIDANCE).toContain('working agreement');
