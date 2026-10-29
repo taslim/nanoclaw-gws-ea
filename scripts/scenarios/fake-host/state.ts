@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import type { Effect, ScenarioCase } from '../types.js';
+import { concreteFixture } from './datasets.js';
 
 export const SYNTHETIC_IDENTITY = {
   assistantName: { firstName: 'Aster', lastName: null },
@@ -15,8 +16,8 @@ export interface SyntheticEvent {
   readonly summary?: string;
   readonly location?: string;
   readonly description?: string;
-  readonly start?: { readonly dateTime?: string; readonly date?: string };
-  readonly end?: { readonly dateTime?: string; readonly date?: string };
+  readonly start?: { readonly dateTime?: string; readonly date?: string; readonly timeZone?: string };
+  readonly end?: { readonly dateTime?: string; readonly date?: string; readonly timeZone?: string };
   readonly organizer?: { readonly email?: string };
   readonly attendees?: readonly {
     readonly email?: string;
@@ -24,6 +25,7 @@ export interface SyntheticEvent {
     readonly self?: boolean;
   }[];
   readonly etag?: string;
+  readonly guestsCanModify?: boolean;
 }
 export interface SyntheticMail {
   readonly id: string;
@@ -39,18 +41,29 @@ export interface SyntheticMail {
 }
 export interface FixtureState {
   readonly scenario: ScenarioCase;
+  readonly referenceAt?: string;
   attempt: number;
   effects: Effect[];
   outbound: Record<string, unknown>[];
   events: SyntheticEvent[];
   mail: SyntheticMail[];
+  readonly calendars?: readonly {
+    readonly id: string;
+    readonly summary: string;
+    readonly dataOwner?: string;
+    readonly accessRole: string;
+  }[];
   readonly thread?: {
     readonly key: string;
     readonly namedPeople: readonly string[];
     readonly bookingCalendar?: string;
+    readonly brief?: string;
   };
 }
 export function initialFixture(scenario: ScenarioCase): FixtureState {
+  const concrete = concreteFixture(scenario);
+  if (concrete)
+    return { scenario, referenceAt: new Date().toISOString(), attempt: 1, effects: [], outbound: [], ...concrete };
   if (scenario.id === 'location-field')
     return {
       scenario,
@@ -231,7 +244,7 @@ export function initialFixture(scenario: ScenarioCase): FixtureState {
     ],
   };
 }
-function syntheticMail(id: string, subject: string, from: string, to: string, text: string): SyntheticMail {
+export function syntheticMail(id: string, subject: string, from: string, to: string, text: string): SyntheticMail {
   return {
     id,
     threadId: `${id}-thread`,
@@ -245,6 +258,7 @@ function syntheticMail(id: string, subject: string, from: string, to: string, te
         { name: 'To', value: to },
         { name: 'Subject', value: subject },
         { name: 'Date', value: 'Sun, 1 Nov 2026 12:00:00 +0000' },
+        { name: 'Message-ID', value: `<${id}@example.test>` },
       ],
       body: { data: Buffer.from(text).toString('base64url') },
     },

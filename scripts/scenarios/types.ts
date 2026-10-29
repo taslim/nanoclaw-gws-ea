@@ -1,6 +1,8 @@
 export interface ScenarioCase {
   readonly id: string;
   readonly available: boolean;
+  /** Native data can be prepared while an independently required model path is pending. */
+  readonly datasetReady?: boolean;
   readonly requirement: string;
   readonly unit: string;
   readonly audience: 'main' | 'external-email' | 'external-chat';
@@ -54,5 +56,7 @@ export interface ScenarioComposition {
   readonly reservedEnvironmentKeys: readonly string[];
   readonly session: { readonly id: string; readonly messagingGroupId: string | null };
   readonly context?: string;
+  readonly handoff?: { readonly id: string; readonly timestamp: string; readonly content: string };
+  readonly weekViewFile?: string;
   readonly db: string;
 }

@@ -9,7 +9,8 @@
     "fake-host/compact-hook.ts",
     "fake-host/route-check.ts",
     "fake-host/report-check.ts",
-    "fake-host/time-check.ts"
+    "fake-host/time-check.ts",
+    "fake-host/week-check.ts"
   ],
   "exclude": []
 }

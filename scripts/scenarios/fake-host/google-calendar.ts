@@ -141,6 +141,16 @@ export async function calendarTransport(calendar: FakeCalendar, url: URL, init?:
       );
       if (result === 'exists') return googleError(409, 'The requested identifier already exists');
     } else if (method === 'PATCH' && eventId) {
+      const current = calendar.event(calendarId, eventId) as
+        | (StoredEvent & { readonly guestsCanModify?: boolean })
+        | undefined;
+      if (
+        current?.organizer?.email &&
+        current.organizer.email !== calendarId &&
+        current.guestsCanModify !== true &&
+        body.attendeesOmitted !== true
+      )
+        return googleError(403, 'Forbidden: guests cannot modify this event');
       if (body.attendeesOmitted === true) {
         const entry = body.attendees?.[0];
         if (!entry || body.attendees?.length !== 1) return googleError(400, 'An own-entry write needs one guest');

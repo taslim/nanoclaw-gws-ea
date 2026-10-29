@@ -10,13 +10,15 @@ checks cover only retry duplicates, scoped privacy markers and declared planner
 role/path/verb limits.
 
 The invented principal is Morgan Ellery, the assistant Aster, and contacts Juno
-Hale and Remy Vance. Ten cases are available: `search-before-asking`,
-`trip-zone`, `unknown-pronouns`, `principal-does-it`, `missing-remy`,
-`assistant-missing-invite`, `location-field`, `move-with-guest`, and the two external identity/read probes. The role probes read a conversation-only brief and produce an
+Hale and Remy Vance. Twenty-four cases are available, including travel chains,
+deadlines, weekend preferences, impossible transfers, commitments, all three
+booking kinds, relationship-based lengths, invitation authority and outward
+privacy. Ten cases remain pending. The two role probes read a conversation-only brief and produce an
 internal native task log; their scores cannot establish email or chat delivery.
 The role probes and the people/reminder-only cases have empty Calendar/Gmail stores. The remaining incident classes are catalog entries explicitly
 marked `fixture-pending`; the driver refuses to run them against unrelated
-records. [Case readiness](cases/readiness.md) lists every remaining case's exact
+records. `prepare` also admits the three location datasets while their web paths
+remain pending; `run` refuses them. [Case readiness](cases/readiness.md) lists every remaining case's exact
 fixture/transport dependency and the path to testing real public web reads with
 synthetic task data.
 
@@ -50,6 +52,36 @@ run; `preflight-canonical-snapshot.json` preserves the clean initial state. Nati
 people, whereabouts, Manual, memory and task records also reach the judge's
 canonical snapshot; no parallel empty task array claims to represent native
 writes. Snapshot memory traversal refuses symlinks, including the memory root.
+
+The newer concrete cases use native home, rhythm, dated stays, learned travel,
+scheduling preferences, people and matters. Their Calendar/Gmail datasets carry
+the actual purpose, attendance agreement, length, organizer and conversation.
+Native `email_handoff` creates main's brief in the real email session; its saved
+message reaches the real formatter separately from the correspondent's message.
+An organizer request may end with an actual queued delegation, explicitly
+pending; that does not establish counterpart contact or delivery. The native
+unowned-event proof refuses a conversation booking change, records its report
+to main, and proves main's version-conditioned patch without making it an owned
+booking. Calendar's wire fixture refuses guest edits with HTTP 403 while allowing
+the guest's own response. The native handler's refused-change message is kept.
+
+`preflight-case-proof.json` retains actual native writes and their readback.
+The isolated proof rolls back its native central transaction and restores the
+invented Google records and mailbox rows before measurement; it checks the
+restored records against the snapshot taken immediately before mutation. It
+does not replace any tool result. Fixed-date requests name their dates; the
+"today" exception instead uses captured real `referenceAt` in the install zone,
+including that day's regular workplace and one-day stay. Evidence includes both
+reference and actual host timestamps. There is no altered runtime clock.
+
+Main's real `createWeekRefresher` publishes its view using those same stores and
+the native HTTP Calendar client. The runner registers the actual Bun
+`week-view/hook.ts` command for SessionStart and UserPromptSubmit with its
+synthetic view path and receipt directory as the CLI's two arguments.
+`preflight-week-hook.json` proves full startup injection, quiet identical resume
+and a real current-time prompt submission through that exact CLI. The host
+timeline and runner clock parser remain separate. Outward roles receive neither
+the coming-days hook nor group memory. The hook is not simulated in PreToolUse.
 
 The two write cases have their own venue, length, organizer, guest and agreed-time
 facts. Their preparation reads those facts and checks the destination interval
@@ -122,10 +154,9 @@ transports are available. Google operations outside the implemented fixture
 boundary fail closed, including arbitrary Gmail search queries, attachments,
 history polling and calendar subscriptions. Gmail supports the production
 send-reconciliation queries and SENT label reads; gog's existing read views use
-the same messages. Booking and outward-privacy catalog cases still need their
-specific native conversations, consent and privacy facts. The catalog also names
-other-assistant-owned invitations, booking-link handoff and moving a
-conversation-unowned event; these remain fixture-pending.
+the same messages. Booking and privacy cases have their specific conversations,
+consent and private facts. Public web, browser delegation, actual planning agents
+and the close path remain outside this checkpoint's fixture boundary.
 
 `--claude` selects an existing authenticated native CLI (default
 `~/.local/bin/claude`); no auth files are inspected or copied. The default models

@@ -168,6 +168,10 @@ const route = spawnSync('bun', [path.join(tree, 'scripts/scenarios/fake-host/rou
 });
 assert.equal(route.status, 0, route.stderr);
 if (scenario.audience === 'main') {
+  const week = spawnSync('bun', [path.join(tree, 'scripts/scenarios/fake-host/week-check.ts'), directory, tree], {
+    encoding: 'utf8',
+  });
+  assert.equal(week.status, 0, week.stderr);
   const shell = prepareSyntheticShell(path.dirname(file), tree);
   const execute = (command: string) =>
     spawnSync('/usr/bin/sandbox-exec', ['-f', shell.profile, '/bin/bash', '--noprofile', '--norc', '-c', command], {

@@ -110,15 +110,20 @@ try {
   let context: string | undefined;
   if (audience !== 'main') {
     messagingGroupId = audience === 'external-chat' ? 'synthetic-juno-chat' : 'synthetic-email-inbox';
-    await createMessagingGroup({
-      id: messagingGroupId,
-      channel_type: audience === 'external-chat' ? 'whatsapp' : 'email',
-      platform_id: audience === 'external-email' ? 'email:inbox' : messagingGroupId,
-      name: audience === 'external-chat' ? 'Juno Hale' : 'Synthetic assistant inbox',
-      is_group: 0,
-      unknown_sender_policy: 'strict',
-      created_at: now,
-    });
+    if (audience === 'external-chat')
+      await createMessagingGroup({
+        id: messagingGroupId,
+        channel_type: 'whatsapp',
+        platform_id: messagingGroupId,
+        name: 'Juno Hale',
+        is_group: 0,
+        unknown_sender_policy: 'strict',
+        created_at: now,
+      });
+    else {
+      const { ensureInbox } = await import('../../../src/modules/gws-ea-inbox/wiring-policy.js');
+      messagingGroupId = await ensureInbox(outward);
+    }
     if (audience === 'external-chat') {
       await db.run(
         `INSERT INTO gws_ea_chats
@@ -141,14 +146,26 @@ try {
       )) as typeof import('../../../src/modules/gws-ea-chats/context.js');
       context = await renderChatContext(messagingGroupId);
     } else {
-      const { createThread, placeThread, recordThreadAddresses } = (await import(
+      const { createThread, placeThread, recordThreadAddresses, recordThreadMessage } = (await import(
         source('src/modules/gws-ea-inbox/thread-map.ts')
       )) as typeof import('../../../src/modules/gws-ea-inbox/thread-map.js');
       const thread = readState(path.join(output, 'fixture.json')).thread;
-      threadId = (await createThread(null, now, thread?.key ?? 'mail-synthetic-identity')).threadKey;
+      const messages = readState(path.join(output, 'fixture.json')).mail;
+      threadId = (await createThread(messages[0]?.threadId ?? null, now, thread?.key ?? 'mail-synthetic-identity'))
+        .threadKey;
       await placeThread(threadId, 'nowhere');
       if (thread) {
         await recordThreadAddresses(threadId, thread.namedPeople, 'main', now);
+        for (const message of messages)
+          await recordThreadMessage(
+            {
+              threadKey: threadId,
+              side: 'outside',
+              gmailMessageId: message.id,
+              rfcMessageId: `<${message.id}@example.test>`,
+            },
+            now,
+          );
         if (thread.bookingCalendar) {
           const { setThreadBookingCalendar } = await import('../../../src/modules/gws-ea-meetings/thread-calendar.js');
           await setThreadBookingCalendar(threadId, thread.bookingCalendar);
@@ -156,16 +173,39 @@ try {
       }
     }
   }
+  const placedThread = readState(path.join(output, 'fixture.json'));
+  if (audience === 'main' && placedThread.thread) {
+    const { ensureInbox } = await import('../../../src/modules/gws-ea-inbox/wiring-policy.js');
+    await ensureInbox(outward);
+    const { createThread, placeThread, recordThreadAddresses, recordThreadMessage } =
+      await import('../../../src/modules/gws-ea-inbox/thread-map.js');
+    await createThread(placedThread.mail[0]?.threadId ?? null, now, placedThread.thread.key);
+    await placeThread(placedThread.thread.key, 'nowhere');
+    await recordThreadAddresses(placedThread.thread.key, placedThread.thread.namedPeople, 'main', now);
+    for (const message of placedThread.mail)
+      await recordThreadMessage(
+        {
+          threadKey: placedThread.thread.key,
+          side: 'outside',
+          gmailMessageId: message.id,
+          rfcMessageId: `<${message.id}@example.test>`,
+        },
+        now,
+      );
+  }
   const { session } = await resolveSession(
     group.id,
     messagingGroupId,
     threadId,
     audience === 'main' ? 'agent-shared' : 'per-thread',
   );
+  const { session: mainSession } =
+    audience === 'main' ? { session } : await resolveSession(main.id, 'synthetic-morgan-dm', null, 'agent-shared');
   const agent = path.join(output, 'agent');
   fs.mkdirSync(agent, { recursive: true });
   const { seedScenarioStores } = await import('./seed.js');
-  await seedScenarioStores(readState(path.join(output, 'fixture.json')).scenario, agent);
+  const fixture = readState(path.join(output, 'fixture.json'));
+  await seedScenarioStores(fixture.scenario, agent, fixture.referenceAt);
   await composeGroupProjectDoc(group, agent, { fileName: 'CLAUDE.md' });
   const row = await getContainerConfig(group.id);
   if (!row) throw new Error('Synthetic group lacks a native config.');
@@ -184,6 +224,7 @@ try {
   // Native sqlite mailbox supplies no env. HOME/TZ are core-owned; these
   // fixture gateway keys occupy the native provider/gateway contribution lane.
   const reservedEnvironmentKeys = ['HOME', 'TZ', 'ANTHROPIC_BASE_URL'];
+  const { sessionDir } = await import('../../../src/session-manager.js');
   const composition: ScenarioComposition = {
     audience: audience as ScenarioComposition['audience'],
     group,
@@ -197,9 +238,9 @@ try {
     reservedEnvironmentKeys,
     session: { id: session.id, messagingGroupId: session.messaging_group_id },
     ...(context ? { context } : {}),
+    ...(audience === 'main' ? { weekViewFile: path.join(sessionDir(main.id, mainSession.id), 'week-view.json') } : {}),
     db: db.dialect,
   };
-  fs.writeFileSync(path.join(output, 'composition.json'), JSON.stringify(composition, null, 2));
   if (readState(path.join(output, 'fixture.json')).scenario.observationOnly)
     fs.writeFileSync(
       path.join(agent, 'role-brief.md'),
@@ -215,7 +256,15 @@ try {
   const { replacePrincipalCalendars, recordCalendarAccess } = (await import(
     source('src/modules/gws-ea-inbox/db.ts')
   )) as typeof import('../../../src/modules/gws-ea-inbox/db.js');
-  await replacePrincipalCalendars([SYNTHETIC_IDENTITY.principalEmail], new Date().toISOString());
+  const { isPrincipalCalendar } = await import('../../../src/modules/gws-ea-inbox/calendar-notifications.js');
+  const { principalRecognizer } = await import('../../../src/modules/gws-ea-profile/db.js');
+  const principal = principalRecognizer([SYNTHETIC_IDENTITY.principalEmail]);
+  await replacePrincipalCalendars(
+    [...google.calendar.calendars.values()]
+      .filter((entry) => isPrincipalCalendar(entry, principal))
+      .map((entry) => entry.id),
+    new Date().toISOString(),
+  );
   const checkedAt = new Date().toISOString();
   await recordCalendarAccess({
     address: SYNTHETIC_IDENTITY.principalEmail,
@@ -226,11 +275,60 @@ try {
     changedAt: checkedAt,
     toldAccess: 'bookable',
   });
+  const { createWeekRefresher } = await import('../../../src/modules/gws-ea-meetings/week/refresh.js');
+  const { createMeetingsCalendarApi } = await import('../../../src/modules/gws-ea-meetings/calendar-api.js');
+  const { hostGoogleAccessToken } = await import('../../../src/modules/gws-ea-google/index.js');
+  const nativeCalendar = createMeetingsCalendarApi({ token: () => hostGoogleAccessToken('calendar-host') });
+  const refresher = createWeekRefresher({ calendar: () => nativeCalendar });
+  await refresher.refresh({ full: true });
+  const thread = readState(path.join(output, 'fixture.json')).thread;
+  let handoff: ScenarioComposition['handoff'];
+  if (audience === 'external-email' && thread?.brief && threadId) {
+    const { getDeliveryAction } = await import('../../../src/delivery.js');
+    const handler = getDeliveryAction('email_handoff');
+    if (!handler) throw new Error('Native email handoff is unavailable');
+    await handler(
+      {
+        action: 'email_handoff',
+        requestId: 'synthetic-fixture-handoff',
+        thread_key: threadId,
+        message: thread.brief,
+        calendar: thread.bookingCalendar,
+      },
+      mainSession,
+    );
+    const { inboundDbPath } = await import('../../../src/mailbox/sqlite/paths.js');
+    const Database = (await import('better-sqlite3')).default;
+    const inbox = new Database(inboundDbPath(group.id, session.id), { readonly: true });
+    try {
+      const answer = new Database(inboundDbPath(main.id, mainSession.id), { readonly: true });
+      try {
+        const row = answer
+          .prepare('SELECT content FROM messages_in WHERE id=?')
+          .get('action-resp-synthetic-fixture-handoff') as { content: string } | undefined;
+        const frame = row ? (JSON.parse(row.content) as { frame?: { ok: boolean } }) : undefined;
+        if (!frame?.frame?.ok) throw new Error(`Native fixture handoff failed: ${row?.content ?? 'no answer'}`);
+      } finally {
+        answer.close();
+      }
+      handoff = inbox
+        .prepare('SELECT id,timestamp,content FROM messages_in WHERE id=?')
+        .get('handoff-synthetic-fixture-handoff') as ScenarioComposition['handoff'];
+      if (!handoff) throw new Error('Native handoff did not reach its actual conversation');
+    } finally {
+      inbox.close();
+    }
+  }
+  fs.writeFileSync(
+    path.join(output, 'composition.json'),
+    JSON.stringify({ ...composition, ...(handoff ? { handoff } : {}) }, null, 2),
+  );
   const { startSyntheticDelivery } = await import('./delivery.js');
   const stopDelivery = await startSyntheticDelivery();
   try {
-    await serveNativeHost(output, session, google);
+    await serveNativeHost(output, session, google, () => refresher.refresh({ full: true }));
   } finally {
+    await refresher.stop();
     await stopDelivery();
   }
 } finally {

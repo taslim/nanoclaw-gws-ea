@@ -39,6 +39,7 @@ export async function installSyntheticGoogle(
     conferenceTypes: ['hangoutsMeet'],
   });
   const fixture = JSON.parse(fs.readFileSync(path.join(root, 'fixture.json'), 'utf8')) as FixtureState;
+  for (const entry of fixture.calendars ?? []) calendar.calendars.set(entry.id, entry);
   for (const event of fixture.events) calendar.put(event);
   const mail = fixture.mail;
   const gmail = new SyntheticGmailTransport(mail);
@@ -155,6 +156,7 @@ export async function serveNativeHost(
   root: string,
   session: Session,
   google: Awaited<ReturnType<typeof installSyntheticGoogle>>,
+  refreshView: () => Promise<void>,
 ): Promise<void> {
   const { calendar, mail } = google;
   const { dispatch } = await import('../../../src/cli/dispatch.js');
@@ -187,6 +189,21 @@ export async function serveNativeHost(
           : formatResponse(frame, parsed.json ? 'json' : 'human'),
     };
   };
+  const nativeAction = async (args: Record<string, unknown>, acting: Session = session): Promise<unknown> => {
+    const action = String(args.action);
+    const handler = getDeliveryAction(action);
+    if (!handler) throw new Error(`No native delivery action: ${action}`);
+    await handler(args, acting);
+    const inbox = new Database(inboundDbPath(acting.agent_group_id, acting.id), { readonly: true });
+    try {
+      const answer = inbox
+        .prepare('SELECT content FROM messages_in WHERE id=?')
+        .get(`action-resp-${String(args.requestId)}`) as { content: string } | undefined;
+      return answer ? (JSON.parse(answer.content) as unknown) : { pending: true };
+    } finally {
+      inbox.close();
+    }
+  };
   const memory = (): Readonly<Record<string, string>> => {
     const files: Record<string, string> = {};
     const visit = (directory: string): void => {
@@ -203,7 +220,27 @@ export async function serveNativeHost(
   };
   const { listPeople, getPerson } = await import('../../../src/modules/gws-ea-people/db.js');
   const { getWhereabouts } = await import('../../../src/modules/gws-ea-whereabouts/db.js');
+  const { loadTimeline } = await import('../../../src/modules/gws-ea-whereabouts/timeline.js');
   const { getManualSections } = await import('../../../src/modules/gws-ea-manual/db.js');
+  const { getSchedulingPreferences } = await import('../../../src/modules/gws-ea-preferences/db.js');
+  const { listPrivateValues } = await import('../../../src/modules/gws-ea-privacy/db.js');
+  const queuedHandoffs = async () =>
+    (await getDb().all<{ id: string; agent_group_id: string }>('SELECT id,agent_group_id FROM sessions')).map(
+      (entry) => {
+        const inbox = new Database(inboundDbPath(entry.agent_group_id, entry.id), { readonly: true });
+        try {
+          return {
+            sessionId: entry.id,
+            agentGroupId: entry.agent_group_id,
+            messages: inbox
+              .prepare("SELECT id,timestamp,content,status FROM messages_in WHERE id LIKE 'handoff-%'")
+              .all(),
+          };
+        } finally {
+          inbox.close();
+        }
+      },
+    );
   const snapshot = async (): Promise<unknown> => ({
     observedAt: new Date().toISOString(),
     calendars: [...calendar.calendars.values()],
@@ -212,6 +249,8 @@ export async function serveNativeHost(
     calendarWriteLog: await getDb().all('SELECT * FROM gws_ea_calendar_write_log'),
     mail,
     session,
+    sessions: await getDb().all('SELECT * FROM sessions'),
+    queuedHandoffs: await queuedHandoffs(),
     chat: session.messaging_group_id
       ? await getDb().get('SELECT * FROM gws_ea_chats WHERE messaging_group_id = ?', session.messaging_group_id)
       : undefined,
@@ -221,9 +260,14 @@ export async function serveNativeHost(
     bookingRequests: await getDb().all('SELECT * FROM gws_ea_booking_requests'),
     threadSends: await getDb().all('SELECT * FROM gws_ea_thread_sends'),
     threadMessages: await getDb().all('SELECT * FROM gws_ea_thread_messages'),
+    threadAddresses: await getDb().all('SELECT * FROM gws_ea_thread_addresses'),
+    threads: await getDb().all('SELECT * FROM gws_ea_threads'),
     people: await Promise.all((await listPeople()).map((person) => getPerson(person.id))),
     whereabouts: await getWhereabouts(),
+    whereaboutsTimeline: await loadTimeline(),
     manual: await getManualSections(),
+    preferences: await getSchedulingPreferences(),
+    privateValues: await listPrivateValues(),
     memory: memory(),
     tasks: await nativeCli(['tasks', 'list', '--json']),
   });
@@ -246,7 +290,83 @@ export async function serveNativeHost(
     let value: unknown;
     try {
       if (body.method === 'snapshot') value = await snapshot();
-      else if (body.method === 'ncl') {
+      else if (body.method === 'refresh-view') {
+        await refreshView();
+        value = { refreshed: true };
+      } else if (body.method === 'probe') {
+        // Native writes run on this host; only their invented remote records and DB transaction are restored.
+        const events = structuredClone(calendar.events);
+        const writes = structuredClone(calendar.writes);
+        const messages = structuredClone(mail);
+        const fixture = fs.readFileSync(fixtureFile, 'utf8');
+        const inboxes = await Promise.all(
+          (await getDb().all<{ id: string; agent_group_id: string }>('SELECT id,agent_group_id FROM sessions')).map(
+            async (entry) => {
+              const file = inboundDbPath(entry.agent_group_id, entry.id);
+              const inbox = new Database(file);
+              try {
+                return { file, rows: inbox.prepare('SELECT * FROM messages_in').all() as Record<string, unknown>[] };
+              } finally {
+                inbox.close();
+              }
+            },
+          ),
+        );
+        const rollback = new Error('Rollback isolated native scenario proof');
+        const steps = body.args.steps as readonly {
+          method: 'ncl' | 'action' | 'main-action';
+          args: Record<string, unknown>;
+        }[];
+        const results: { answer: unknown; snapshot: unknown }[] = [];
+        try {
+          await getDb().transaction(async () => {
+            for (const step of steps) {
+              let answer: unknown;
+              if (step.method === 'main-action') {
+                const { getMainAgentGroupId } = await import('../../../src/modules/gws-ea-profile/db.js');
+                const { getSession } = await import('../../../src/db/sessions.js');
+                const row = await getDb().get<{ id: string }>(
+                  'SELECT id FROM sessions WHERE agent_group_id=? AND thread_id IS NULL',
+                  await getMainAgentGroupId(),
+                );
+                const main = row ? await getSession(row.id) : undefined;
+                if (!main) throw new Error('Native main conversation is unavailable for this isolated proof');
+                answer = await nativeAction(step.args, main);
+              } else
+                answer =
+                  step.method === 'action'
+                    ? await nativeAction(step.args)
+                    : await nativeCli(step.args.argv as string[]);
+              results.push({ answer, snapshot: structuredClone(await snapshot()) });
+            }
+            throw rollback;
+          });
+        } catch (error) {
+          if (error !== rollback) throw error;
+        } finally {
+          calendar.events.splice(0, calendar.events.length, ...events);
+          calendar.writes.splice(0, calendar.writes.length, ...writes);
+          mail.splice(0, mail.length, ...messages);
+          for (const saved of inboxes) {
+            const inbox = new Database(saved.file);
+            try {
+              inbox.transaction(() => {
+                inbox.prepare('DELETE FROM messages_in').run();
+                for (const row of saved.rows) {
+                  const names = Object.keys(row);
+                  inbox
+                    .prepare(`INSERT INTO messages_in (${names.join(',')}) VALUES (${names.map(() => '?').join(',')})`)
+                    .run(...names.map((name) => row[name]));
+                }
+              })();
+            } finally {
+              inbox.close();
+            }
+          }
+          fs.writeFileSync(fixtureFile, fixture);
+        }
+        value = { results, restored: await snapshot() };
+      } else if (body.method === 'ncl') {
         const argv = body.args.argv;
         if (!Array.isArray(argv) || !argv.every((entry): entry is string => typeof entry === 'string'))
           throw new Error('Invalid ncl argv');
@@ -273,19 +393,7 @@ export async function serveNativeHost(
           };
         } else throw new Error(`Unimplemented synthetic gog service: ${service}`);
       } else if (body.method === 'action') {
-        const action = String(body.args.action);
-        const handler = getDeliveryAction(action);
-        if (!handler) throw new Error(`No native delivery action: ${action}`);
-        await handler(body.args, session);
-        const db = new Database(inboundDbPath(session.agent_group_id, session.id), { readonly: true });
-        try {
-          const answer = db
-            .prepare('SELECT content FROM messages_in WHERE id=?')
-            .get(`action-resp-${String(body.args.requestId)}`) as { content: string } | undefined;
-          value = answer ? JSON.parse(answer.content) : { pending: true };
-        } finally {
-          db.close();
-        }
+        value = await nativeAction(body.args);
       } else if (body.method === 'deliver') {
         const route = session.messaging_group_id ? await getMessagingGroup(session.messaging_group_id) : undefined;
         if (route?.channel_type !== 'email' || session.thread_id === null || typeof body.args.messageId !== 'string')

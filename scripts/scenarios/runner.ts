@@ -48,6 +48,28 @@ const mailbox = new FixtureMailbox(file);
 registerAgentMailbox(() => mailbox);
 
 const messages = [
+  ...(composition.handoff
+    ? [
+        {
+          id: composition.handoff.id,
+          seq: 0,
+          kind: 'chat' as const,
+          timestamp: composition.handoff.timestamp,
+          status: 'pending',
+          process_after: null,
+          recurrence: null,
+          series_id: null,
+          tries: 0,
+          trigger: 1,
+          platform_id: 'email:inbox',
+          channel_type: 'email',
+          thread_id: readState(file).thread?.key ?? 'mail-synthetic-identity',
+          content: composition.handoff.content,
+          source_session_id: null,
+          on_wake: 0,
+        },
+      ]
+    : []),
   {
     id: 'synthetic-input',
     seq: 2,
@@ -64,11 +86,18 @@ const messages = [
         ? 'synthetic-morgan-dm'
         : scenario.audience === 'external-chat'
           ? 'synthetic-juno-chat'
-          : 'synthetic-email-inbox',
+          : 'email:inbox',
     channel_type: scenario.audience === 'main' ? 'gchat' : scenario.audience === 'external-chat' ? 'whatsapp' : 'email',
-    thread_id: null,
+    thread_id:
+      scenario.audience === 'external-email' ? (readState(file).thread?.key ?? 'mail-synthetic-identity') : null,
     content: JSON.stringify({
-      sender: scenario.observationOnly ? 'system' : scenario.audience === 'main' ? 'Morgan Ellery' : 'Juno Hale',
+      sender: scenario.observationOnly
+        ? 'system'
+        : scenario.audience === 'main'
+          ? 'Morgan Ellery'
+          : scenario.id === 'friend-dinner-length'
+            ? 'Remy Vance'
+            : 'Juno Hale',
       senderId: scenario.observationOnly
         ? 'synthetic-host'
         : scenario.audience === 'main'
@@ -242,6 +271,23 @@ const options: Options = {
     ...(kind === 'agent' && !sessionsSealed(capabilities)
       ? {
           hooks: {
+            ...(composition.weekViewFile
+              ? Object.fromEntries(
+                  ['SessionStart', 'UserPromptSubmit'].map((event) => [
+                    event,
+                    [
+                      {
+                        hooks: [
+                          {
+                            type: 'command',
+                            command: `bun '${path.join(tree, 'container/agent-runner/src/week-view/hook.ts')}' '${composition.weekViewFile}' '${path.join(directory, 'week-delivered')}'`,
+                          },
+                        ],
+                      },
+                    ],
+                  ]),
+                )
+              : {}),
             PreCompact: [
               {
                 hooks: [

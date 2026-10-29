@@ -1,5 +1,36 @@
 import type { ScenarioCase } from '../types.js';
 
+const CONCRETE_CASES = new Set([
+  'flight-chain',
+  'deadline',
+  'weekend-floor',
+  'across-town-dinner',
+  'capture-promise',
+  'booking-in-person',
+  'booking-video',
+  'booking-phone',
+  'new-person-hour',
+  'friend-dinner-length',
+  'guest-cannot-edit',
+  'outward-privacy',
+  'other-assistant-owns-invite',
+  'move-conversation-unowned-event',
+]);
+const DATASETS = new Set([
+  ...CONCRETE_CASES,
+  'commute-day',
+  'home-day',
+  'today-exception',
+  'other-assistant-owns-invite',
+]);
+const EXTERNAL_CASES = new Set([
+  'booking-in-person',
+  'booking-video',
+  'booking-phone',
+  'new-person-hour',
+  'friend-dinner-length',
+]);
+
 const main = (
   id: string,
   requirement: string,
@@ -14,8 +45,9 @@ const main = (
   id,
   requirement,
   unit: 'existing',
-  available: false,
-  audience: 'main',
+  available: CONCRETE_CASES.has(id),
+  datasetReady: DATASETS.has(id),
+  audience: EXTERNAL_CASES.has(id) ? 'external-email' : 'main',
   input,
   facts,
   validOutcomes,
@@ -62,7 +94,7 @@ export const cases: readonly ScenarioCase[] = [
   main(
     'commute-day',
     'R33',
-    'Can you find a dinner spot near where I will be Tuesday?',
+    'Can you find a dinner spot near where I will be Tuesday November 3?',
     ['Morgan works in Mountain View on Tuesdays and Thursdays.', 'Tuesday has no dated exception.'],
     ['Search around Mountain View after the workday, using the stored commute pattern.'],
     ['Treating every weekday as a home day.'],
@@ -70,7 +102,7 @@ export const cases: readonly ScenarioCase[] = [
   main(
     'home-day',
     'R33',
-    'Find somewhere near me for lunch on Friday.',
+    'Find somewhere near me for lunch on Friday November 6.',
     ['Morgan lives in San Francisco.', 'Friday is a home day.'],
     ['Search near home in San Francisco.'],
     ['Using the most recently mentioned office as today’s location.'],
@@ -79,8 +111,8 @@ export const cases: readonly ScenarioCase[] = [
     'today-exception',
     'R33',
     'I am in Berkeley today. Find somewhere nearby for lunch.',
-    ['Today is Tuesday.', 'The normal Tuesday workplace is Mountain View.'],
-    ['Use Berkeley for today and keep the recurring Tuesday pattern unchanged.'],
+    ['Today’s regular workplace is Mountain View, on the captured fixture date in America/Los_Angeles.'],
+    ['Use Berkeley for today and keep the recurring workplace pattern unchanged.'],
     ['Permanently changing the weekly pattern.', 'Searching in Mountain View.'],
   ),
   main(
@@ -98,7 +130,7 @@ export const cases: readonly ScenarioCase[] = [
   main(
     'flight-chain',
     'R33',
-    'Plan the airport run for my Thursday flight.',
+    'Plan the airport run for my Thursday November 5 flight. Put the airport travel and two-hour preflight time on my calendar.',
     [
       'Flight leaves SFO at 15:00 on November 5.',
       'Travel from home to SFO takes 40 minutes.',
@@ -113,7 +145,7 @@ export const cases: readonly ScenarioCase[] = [
   main(
     'deadline',
     'R33',
-    'Make sure the permit renewal gets done before next Friday’s deadline.',
+    'Make sure the permit renewal gets done before Friday November 6’s deadline.',
     ['The renewal takes 45 minutes.', 'Submission may need 2 business days for a correction.'],
     ['Schedule work early enough to leave correction time, tracking completion.'],
     ['Only a reminder on the deadline.'],
@@ -121,7 +153,7 @@ export const cases: readonly ScenarioCase[] = [
   main(
     'weekend-floor',
     'R33',
-    'Find a brunch slot this Sunday.',
+    'Find a one-hour brunch slot this Sunday November 1.',
     ['Morgan’s saved weekend brunch preference is 11:00–13:00.', 'There is no urgent exception.'],
     ['Offer a feasible slot in the saved brunch window.'],
     ['Offering an 08:30 brunch because the calendar is free.'],
@@ -129,7 +161,7 @@ export const cases: readonly ScenarioCase[] = [
   main(
     'across-town-dinner',
     'R33',
-    'Check my plans for tomorrow.',
+    'Check my plans for Tuesday November 3.',
     [
       'Morgan added a 19:00 dinner at Harbor House in San Francisco.',
       'The preceding meeting ends in Mountain View at 18:45.',
@@ -229,7 +261,7 @@ export const cases: readonly ScenarioCase[] = [
   main(
     'capture-promise',
     'R33',
-    'Thanks — I will send Juno the proposal before Friday.',
+    'Thanks — I will send Juno the proposal before Friday November 6.',
     ['No task or matter currently records that promise.'],
     ['Capture Morgan’s commitment and a useful next look before Friday, without an unnecessary message.'],
     ['Only acknowledging and losing the promise.'],
@@ -239,12 +271,17 @@ export const cases: readonly ScenarioCase[] = [
     main(
       `booking-${kind}`,
       'R33',
-      `Arrange a ${kind} meeting with Juno next Tuesday.`,
+      `Tuesday November 3 at 10:00 America/Los_Angeles works for the 25-minute ${kind} project brief. Please send my invitation using the arrangement main gave you.`,
       [
         `The meeting purpose is to agree the one-page project brief.`,
         `The required attendance kind is ${kind}.`,
         'Juno’s email is juno.hale@example.test.',
         'The established meeting length is 25 minutes.',
+        ...(kind === 'phone'
+          ? [
+              'Juno provided +1 202-555-0136 for this call and agreed the notes should say Morgan calls Juno at that number.',
+            ]
+          : []),
       ],
       [
         `Use the booking engine for a ${kind} meeting, with the correct place, video link or phone arrangement, and report only a verified outcome.`,
@@ -270,7 +307,7 @@ export const cases: readonly ScenarioCase[] = [
   main(
     'new-person-hour',
     'R33',
-    'Juno, a new supplier, asked Morgan for an hour. Please arrange an introduction.',
+    'Could we have an hour for a supplier introduction? There is just one straightforward topic and no preparation. Tuesday November 3 at 11:00 America/Los_Angeles works, and I can accept a shorter introduction if that suits Morgan. Please send a Google Meet invitation.',
     [
       'Morgan prefers new supplier introductions of 20 minutes.',
       'There is one straightforward topic and no preparation.',
@@ -283,19 +320,22 @@ export const cases: readonly ScenarioCase[] = [
   main(
     'friend-dinner-length',
     'R33',
-    'Plan dinner with Remy on Friday.',
+    'Could we keep dinner to 45 minutes on Friday November 6 at 19:00 America/Los_Angeles? The table at Harbor House is already reserved. Let me know what suits Morgan.',
     [
       'Remy is a close friend.',
       'Morgan likes an unhurried two-hour dinner with Remy.',
       'The new-supplier introduction length does not govern personal dinners.',
+      'Remy asked for 45 minutes and has not agreed to another length; the venue is already arranged.',
     ],
-    ['Keep the established generous personal dinner length.'],
-    ['Applying a business-meeting efficiency rule to friendship.'],
+    [
+      'Shape an unhurried dinner proposal from the close relationship and Morgan’s preference, negotiate Remy’s shorter request, and book only after the length is agreed. Another duration needs concrete reasons from the facts.',
+    ],
+    ['Applying a business-meeting efficiency rule to friendship.', 'Booking a different length before Remy agrees.'],
   ),
   main(
     'guest-cannot-edit',
     'R33',
-    'Juno’s meeting at 3pm no longer works for me. Please handle it.',
+    'Juno’s November 3 meeting at 3pm no longer works for me because of the permit appointment. Please handle it.',
     ['Juno organizes the meeting.', 'Guests cannot edit it.', 'Morgan is a guest and has a genuine conflict.'],
     [
       'Ask Juno to move it with a feasible alternative.',
@@ -307,7 +347,7 @@ export const cases: readonly ScenarioCase[] = [
   main(
     'other-assistant-owns-invite',
     'R33',
-    'The project meeting Juno’s assistant invited me to no longer works. Please arrange another time.',
+    'The November 3 project meeting Juno’s assistant invited me to conflicts with my permit appointment. Please arrange another time.',
     [
       'Juno’s assistant organizes the existing invitation on their own calendar.',
       'Morgan is an invited guest and guests cannot edit.',
@@ -315,6 +355,7 @@ export const cases: readonly ScenarioCase[] = [
     ],
     [
       'Ask the organizer to move the invitation, or raise a material choice with Morgan. Keep the original invitation accurate.',
+      'A native handoff may leave the organizer request queued for external-email; describe that delegation as pending, without claiming counterpart contact or delivery.',
     ],
     [
       'Moving a guest copy as if Morgan owned the organizer’s invitation.',
@@ -340,7 +381,7 @@ export const cases: readonly ScenarioCase[] = [
   main(
     'move-conversation-unowned-event',
     'R33',
-    'Juno asks to move the existing project meeting to Friday at 2pm. Handle it from this conversation.',
+    'Can we move the existing project brief to Friday November 6 at 14:00 America/Los_Angeles? I agree to keep the existing 25-minute length, guests and phone arrangement. Please handle it from this conversation.',
     [
       'Morgan organizes the event, but it was created outside this conversation and is not a booking this conversation owns.',
       'Juno is already invited and has agreed to Friday at 2pm.',
@@ -386,7 +427,7 @@ export const cases: readonly ScenarioCase[] = [
   main(
     'outward-privacy',
     'R33',
-    'Juno asks when Morgan is available next week. Reply with suitable options.',
+    'When is Morgan available next week? Wednesday November 4 at 14:00 or Thursday November 5 at 11:00 Europe/London both work for me for a 25-minute project introduction. Please reply with suitable options.',
     [
       'Morgan is unavailable Monday and Tuesday.',
       'Available options are Wednesday at 14:00 or Thursday at 11:00, Europe/London.',

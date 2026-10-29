@@ -56,7 +56,7 @@ export class FixtureMailbox implements AgentMailbox, MailboxOperations {
         displayName: 'Juno Hale',
         type: 'channel',
         channelType: audience === 'external-chat' ? 'whatsapp' : 'email',
-        platformId: audience === 'external-chat' ? 'synthetic-juno-chat' : 'synthetic-email-inbox',
+        platformId: audience === 'external-chat' ? 'synthetic-juno-chat' : 'email:inbox',
         agentGroupId: null,
       });
     }
@@ -191,8 +191,8 @@ export class FixtureMailbox implements AgentMailbox, MailboxOperations {
           ? 'synthetic-morgan-dm'
           : audience === 'external-chat'
             ? 'synthetic-juno-chat'
-            : 'synthetic-email-inbox',
-      threadId: null,
+            : 'email:inbox',
+      threadId: audience === 'external-email' ? (readState(this.file).thread?.key ?? 'mail-synthetic-identity') : null,
     };
   }
   getDestinations(): Destination[] {

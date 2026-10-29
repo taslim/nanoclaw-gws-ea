@@ -43,7 +43,7 @@ if (!['prepare', 'run'].includes(command ?? ''))
   throw new Error('Use list, prepare, or run. See scripts/scenarios/README.md.');
 const selected = selectCases((flags.get('--cases') ?? '').split(',').filter(Boolean));
 for (const scenario of selected)
-  if (!scenario.available)
+  if (!scenario.available && !(command === 'prepare' && scenario.datasetReady))
     throw new Error(`Scenario ${scenario.id} is unavailable until its concrete native fixture lands. See list.`);
 const output = path.resolve(
   flags.get('--out') ?? path.join(os.tmpdir(), `gws-ea-scenarios-${new Date().toISOString().replace(/[:.]/g, '-')}`),
@@ -99,6 +99,15 @@ const manifest = {
       'src/modules/gws-ea-external-email/group.ts',
       'src/modules/gws-ea-chat-agents/shape.ts',
       'scripts/scenarios/runtime.ts',
+      'scripts/scenarios/runner.ts',
+      'scripts/scenarios/cases/index.ts',
+      'scripts/scenarios/fake-host/datasets.ts',
+      'scripts/scenarios/fake-host/seed.ts',
+      'scripts/scenarios/fake-host/native.ts',
+      'scripts/scenarios/fake-host/google-calendar.ts',
+      'src/modules/gws-ea-meetings/week/refresh.ts',
+      'container/agent-runner/src/week-view/hook.ts',
+      'container/agent-runner/src/week-view/clock.ts',
       'container/agent-runner/src/memory/session-hook.ts',
       'container/agent-runner/src/memory/sealed.ts',
       'container/agent-runner/src/memory/templates/index.md',
