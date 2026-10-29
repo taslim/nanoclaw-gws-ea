@@ -1958,6 +1958,35 @@ it('lets the agent’s repeat of a split, after its tool stopped waiting, find t
   expect(inserts[0].fields?.recurrence).toEqual(['RRULE:FREQ=WEEKLY;COUNT=3']);
 });
 
+it('answers what Google holds when the following series’ id is taken by an event deleted since or by another split', async () => {
+  const request = followingRequest('takensplit');
+  data(await send(main, 'change_event', request, 'act-first-split'));
+  const followingId = calendar.writes.find((write) => write.op === 'insert')?.eventId ?? '';
+  const made = calendar.event(PRINCIPAL, followingId);
+  if (!made) throw new Error('The first split made no following series');
+
+  // Another request moves the same occurrence and all following to a different time.
+  const other = refusal(
+    await send(
+      main,
+      'change_event',
+      { ...request, start: '2026-10-16T11:00:00-07:00', end: '2026-10-16T11:30:00-07:00' },
+      'act-other-split',
+    ),
+  );
+  expect(other).toContain('the original series now ends before');
+  expect(other).toContain(`following series, event ${followingId}, was not created`);
+  expect(other).toContain(
+    'Google already holds an event under that id that differs from this change: it starts 2026-10-16T17:00:00.000Z',
+  );
+
+  calendar.put({ ...made, status: 'cancelled' });
+  const again = refusal(await send(main, 'change_event', request, 'act-split-after-delete'));
+  expect(again).toContain(`following series, event ${followingId}, was not created`);
+  expect(again).toContain('an event under that id was deleted earlier');
+  expect(calendar.writes.filter((write) => write.op === 'insert')).toHaveLength(1);
+});
+
 it('changes the whole series in place when this and following starts at its first occurrence', async () => {
   const master = {
     ...teamSync([PRINCIPAL_GUEST, { email: REMY, responseStatus: 'accepted' }]),

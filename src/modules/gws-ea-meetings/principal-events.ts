@@ -385,8 +385,8 @@ function isRefusal(error: unknown): error is Error {
 
 const errorText = (error: unknown): string => (error instanceof Error ? error.message : String(error));
 
-/** What Google holds when a split's second half fails: main decides what to do with it. */
-function unfinishedSplit(split: CalendarSplitPlan, following: NewEvent, occurrence: DetailedEvent, error: unknown) {
+/** What Google holds when a split's second half is not made as asked: main decides what to do with it. */
+function unfinishedSplit(split: CalendarSplitPlan, following: NewEvent, occurrence: DetailedEvent, reason: string) {
   const cutoff = occurrence.originalStartTime ?? occurrence.start;
   const ends = cutoff?.date
     ? dayLabel(dateOf(cutoff.date, 'original start'), 'UTC')
@@ -394,7 +394,7 @@ function unfinishedSplit(split: CalendarSplitPlan, following: NewEvent, occurren
   return [
     `Only the first half of this change was made: the original series now ends before ${ends}.`,
     `Its following series, event ${split.followingId}, was not created. It would start ${following.start} and end ${following.end}${following.timeZone === undefined ? '' : ` (${following.timeZone})`}, repeat ${(following.recurrence ?? []).join(' ')}, and invite ${(following.attendees ?? []).map((guest) => calendarText(guest.email)).join(' ')}.`,
-    isGoogleConnectionDown(error) ? GOOGLE_CONNECTION_DOWN : `Google's last answer: ${errorText(error)}`,
+    reason,
   ].join(' ');
 }
 
@@ -1287,18 +1287,33 @@ export function createPrincipalEventTools(deps: PrincipalEventToolsDeps) {
     };
   }
 
-  /** The insert is idempotent by id, so a retry after a lost reply finds the series it made. */
+  /**
+   * The insert is idempotent by id, so a retry after a lost reply finds the series it made. Answers why the
+   * following series is not this request's, or nothing once it is.
+   */
   async function insertFollowing(
     calendarId: string,
     split: CalendarSplitPlan,
     following: NewEvent,
+    patch: EventWrite,
     sendUpdates: SendUpdates,
     owner: CalendarOwner,
-  ): Promise<unknown> {
+  ): Promise<string | undefined> {
     let failure: unknown;
     for (let attempt = 0; attempt < WRITE_ATTEMPTS; attempt += 1) {
       try {
         const made = await calendar().insertEvent(calendarId, split.followingId, following, sendUpdates);
+        if (made === 'exists') {
+          // Google answers the same for an id deleted earlier and for one another split took.
+          const held = await calendar().getEventDetail(calendarId, split.followingId);
+          if (!held || held.status === 'cancelled')
+            return 'Google refused it: an event under that id was deleted earlier.';
+          if (!appliedPatch(held, patch)) {
+            const zone = held.start?.timeZone === undefined ? '' : ` (${held.start.timeZone})`;
+            const guests = (held.attendees ?? []).flatMap((guest) => (guest.email ? [calendarText(guest.email)] : []));
+            return `Google already holds an event under that id that differs from this change: it starts ${held.start?.dateTime ?? held.start?.date} and ends ${held.end?.dateTime ?? held.end?.date}${zone}, repeats ${calendarText((held.recurrence ?? []).join(' '))}, and invites ${guests.join(' ')}.`;
+          }
+        }
         // One already there at the first attempt was made, and recorded, by an earlier request.
         if (made === 'created' || attempt > 0) recordOwnChange(owner, calendarId, split.followingId);
         return undefined;
@@ -1308,7 +1323,12 @@ export function createPrincipalEventTools(deps: PrincipalEventToolsDeps) {
         if (!(error instanceof GoogleApiError) || !error.retryable) break;
       }
     }
-    return failure;
+    log.warn('A series split stopped after shortening the original', {
+      calendarId,
+      eventId: split.followingId,
+      error: failure,
+    });
+    return isGoogleConnectionDown(failure) ? GOOGLE_CONNECTION_DOWN : `Google's last answer: ${errorText(failure)}`;
   }
 
   const writeChange =
@@ -1417,10 +1437,9 @@ export function createPrincipalEventTools(deps: PrincipalEventToolsDeps) {
         if (split) recordOwnChange(owner, calendarId, eventId);
       }
       if (split?.following) {
-        const failure = await insertFollowing(calendarId, split, split.following, sendUpdates, owner);
-        if (failure !== undefined) {
-          log.warn('A series split stopped after shortening the original', { requestId, error: failure });
-          const message = unfinishedSplit(split, split.following, before, failure);
+        const reason = await insertFollowing(calendarId, split, split.following, patch, sendUpdates, owner);
+        if (reason !== undefined) {
+          const message = unfinishedSplit(split, split.following, before, reason);
           await markCalendarWriteApplied(requestId, message);
           throw forbidden(message);
         }
