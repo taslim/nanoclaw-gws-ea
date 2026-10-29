@@ -121,7 +121,7 @@ export interface OpenMatterInput {
   readonly parentId?: string;
   readonly links: readonly LinkRef[];
   readonly dueAt?: string | null;
-  readonly needsMinutes?: number | null;
+  readonly needsMinutes?: number;
   readonly place?: string | null;
 }
 
@@ -138,7 +138,7 @@ export interface UpdateMatterInput {
   readonly reopen?: boolean;
   readonly unlink?: readonly LinkRef[];
   readonly dueAt?: string | null;
-  readonly needsMinutes?: number | null;
+  readonly needsMinutes?: number;
   readonly place?: string | null;
 }
 
@@ -597,8 +597,8 @@ async function assertReopenable(matterId: string): Promise<void> {
   }
 }
 
-function planningMinutes(value: number | null | undefined): number | null {
-  if (value === undefined || value === null) return null;
+function planningMinutes(value: number | undefined): number | null {
+  if (value === undefined) return null;
   if (!Number.isSafeInteger(value) || value < 0)
     throw new Error('Principal time needed must be a nonnegative whole number of minutes');
   return value;
