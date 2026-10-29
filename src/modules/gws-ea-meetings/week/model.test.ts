@@ -6,7 +6,7 @@ import { buildWeek, presentWeek } from './model.js';
 import { event, input, timeline } from './testing/fixture.js';
 
 describe('the coming days', () => {
-  it('is deterministic and folds real copies plus ignored sync copies', () => {
+  it('is deterministic, folds real copies and leaves out ignored sync copies', () => {
     const original = event('meeting', '2026-10-05T16:00:00Z', '2026-10-05T17:00:00Z', { iCalUID: 'same' });
     const copy = { ...original, calendarId: 'other' };
     const ignored = event('csdnshold-1', '2026-10-05T16:00:00Z', '2026-10-05T17:00:00Z');
@@ -19,7 +19,7 @@ describe('the coming days', () => {
     const model = buildWeek(args);
     expect(buildWeek(args)).toEqual(model);
     expect(model.events).toHaveLength(1);
-    expect(model.events[0].copies).toHaveLength(3);
+    expect(model.events[0].copies).toEqual([original, copy]);
   });
   it('keeps recurring occurrences distinct and folds equivalent original-start clocks', () => {
     const first = event('first', '2026-10-05T09:00:00-07:00', '2026-10-05T10:00:00-07:00', {
@@ -158,7 +158,7 @@ describe('the coming days', () => {
   });
 });
 
-it('shows working hours, kept time and recorded meeting lengths in the model-facing days', () => {
+it('shows working hours and kept time in the model-facing days', () => {
   const provenance = { source: 'principal' as const, updated_at: 'fixed' };
   const week = buildWeek(
     input([], {
@@ -166,12 +166,10 @@ it('shows working hours, kept time and recorded meeting lengths in the model-fac
         ...input().preferences,
         working_hours: [{ weekday: 'mon', off: false, start: '10:00', end: '16:00', ...provenance }],
         protected_windows: [{ id: 'family', weekdays: ['mon'], start: '15:00', end: '16:00', ...provenance }],
-        meeting_lengths: [{ meeting_kind: 'one-on-one', minutes: 25, ...provenance }],
       },
     }),
   );
   const shown = presentWeek(week);
-  expect(shown.meetingLengths).toMatchObject([{ meeting_kind: 'one-on-one', minutes: 25 }]);
   expect(shown.days[0]).toMatchObject({
     date: '2026-10-05',
     workingHours: { start: '10:00', end: '16:00' },
@@ -187,18 +185,15 @@ it('distinguishes absent history from a verified no-meetings window for someone 
     hasPeopleRecord: false,
     level: 'unknown',
     meetings: null,
-    metInSixMonths: null,
   });
   expect(buildWeek(input([commitment], { history: [] })).events[0].involvement.guests[0]).toMatchObject({
     meetings: null,
-    metInSixMonths: null,
   });
   const counted = [{ identity: 'email:remy@vance.example', meetings: 0, last_meeting: null }];
   expect(buildWeek(input([commitment], { history: counted })).events[0].involvement.guests[0]).toMatchObject({
     hasPeopleRecord: false,
     level: 'unknown',
     meetings: 0,
-    metInSixMonths: false,
   });
 });
 
@@ -258,7 +253,7 @@ it('counts no one on a principal secondary calendar that organizes its own event
     calendarId: 'c_0f1e2d3c@group.calendar.google.com',
   };
   const week = buildWeek(input([family]));
-  expect(week.events[0].involvement).toMatchObject({ onlyPrincipal: true, guests: [] });
+  expect(week.events[0].involvement).toMatchObject({ guests: [], named: [] });
   expect(checkWeek(week).map((f) => f.kind)).not.toContain('attendance-missing');
   expect(affectedPeople(week.events[0], week)).toMatch(/^No one else is affected/u);
 });

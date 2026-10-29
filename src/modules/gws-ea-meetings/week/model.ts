@@ -18,7 +18,7 @@ import {
 } from '../../gws-ea-whereabouts/clock.js';
 import { whereaboutsAt, zoneAt, zoneForDay, type Timeline } from '../../gws-ea-whereabouts/timeline.js';
 import type { DetailedEvent } from '../calendar-api.js';
-import { blocksTime, eventSpan, isPrincipalAttendee, principalAnswer, schedulingRules, type Span } from '../slots.js';
+import { blocksTime, eventSpan, isPrincipalAttendee, schedulingRules, type Span } from '../slots.js';
 import { resolvePlace, travelBetween, type ResolvedPlace, type TravelFact } from './places.js';
 
 /** Exact private-property names shared by readers and calendar writers. */
@@ -65,13 +65,10 @@ export interface InvolvedPerson {
   readonly hasPeopleRecord: boolean;
   readonly level: PersonLevel | 'unknown';
   readonly meetings: number | null;
-  readonly metInSixMonths: boolean | null;
   readonly lastMeeting: string | null;
   readonly response: string | null;
-  readonly organizer: boolean;
 }
 export interface Involvement {
-  readonly onlyPrincipal: boolean;
   readonly guests: readonly InvolvedPerson[];
   readonly named: readonly InvolvedPerson[];
   readonly linked: readonly InvolvedPerson[];
@@ -81,7 +78,6 @@ export interface WeekEvent extends Span {
   readonly key: string;
   readonly id: string;
   readonly calendarId: string;
-  readonly version: string;
   readonly event: DetailedEvent;
   readonly copies: readonly EventCopy[];
   readonly copiesDisagree: boolean;
@@ -129,7 +125,6 @@ export interface Week {
   readonly preferences: SchedulingPreferenceValues;
   readonly events: readonly WeekEvent[];
   readonly matters: readonly WeekMatter[];
-  readonly undatedMatters: readonly WeekMatter[];
   readonly days: readonly WeekDay[];
   readonly homeUnknown: boolean;
   readonly principalAddresses: readonly string[];
@@ -174,7 +169,6 @@ function personFact(
   name: string | null,
   input: WeekInput,
   response: string | null = null,
-  organizer = false,
 ): InvolvedPerson {
   const person = input.people.find(
     (p) => p.id === identity || p.identities.some((i) => normalized(i) === normalized(identity)),
@@ -188,10 +182,8 @@ function personFact(
     hasPeopleRecord: person !== undefined,
     level: person?.level ?? 'unknown',
     meetings: stats?.meetings ?? null,
-    metInSixMonths: stats === undefined ? null : stats.meetings > 0,
     lastMeeting: stats?.last_meeting ?? null,
     response,
-    organizer,
   };
 }
 function involvement(event: DetailedEvent, input: WeekInput): Involvement {
@@ -200,22 +192,14 @@ function involvement(event: DetailedEvent, input: WeekInput): Involvement {
       (a) =>
         !a.resource && !a.email?.endsWith('@resource.calendar.google.com') && !isPrincipalAttendee(a, input.principal),
     )
-    .map((a) =>
-      personFact(
-        `email:${a.email ?? ''}`,
-        a.displayName ?? null,
-        input,
-        a.responseStatus ?? null,
-        a.organizer === true || a.email === event.organizer?.email,
-      ),
-    );
+    .map((a) => personFact(`email:${a.email ?? ''}`, a.displayName ?? null, input, a.responseStatus ?? null));
   if (
     event.organizer?.email &&
     event.organizer.self !== true &&
     !input.principal.has(event.organizer.email) &&
     !guests.some((g) => g.identity === `email:${event.organizer?.email}`)
   )
-    guests.push(personFact(`email:${event.organizer.email}`, null, input, null, true));
+    guests.push(personFact(`email:${event.organizer.email}`, null, input));
   const text = normalized(`${event.summary ?? ''}\n${event.description ?? ''}`);
   const named = input.people
     .filter(
@@ -244,21 +228,7 @@ function involvement(event: DetailedEvent, input: WeekInput): Involvement {
         }),
     )
     .map((p) => personFact(p.identities[0] ?? p.id, p.name, input));
-  return { onlyPrincipal: guests.length + named.length === 0, guests, named, linked: [] };
-}
-function factVersion(event: DetailedEvent, principal: PrincipalRecognizer): string {
-  return digest([
-    event.start,
-    event.end,
-    event.summary,
-    event.location,
-    event.description,
-    event.organizer,
-    event.creator,
-    event.tags,
-    event.attendees?.map((a) => [a.email, a.resource]).sort((a, b) => String(a[0]).localeCompare(String(b[0]))),
-    principalAnswer(event, principal),
-  ]);
+  return { guests, named, linked: [] };
 }
 function comparable(copy: EventCopy): string {
   const e = copy.event;
@@ -272,9 +242,7 @@ function comparable(copy: EventCopy): string {
   ]);
 }
 function eventFrom(copies: readonly EventCopy[], input: WeekInput): WeekEvent | undefined {
-  const prefixes = input.preferences.ignored_events.map((p) => p.prefix);
-  const active = copies.filter((c) => !prefixes.some((p) => c.event.id?.startsWith(p)));
-  const copy = [...active].sort(
+  const copy = [...copies].sort(
     (a, b) =>
       Number(b.owner === 'principal') - Number(a.owner === 'principal') ||
       a.calendarId.localeCompare(b.calendarId) ||
@@ -304,10 +272,9 @@ function eventFrom(copies: readonly EventCopy[], input: WeekInput): WeekEvent | 
     key: `${copy.calendarId}/${id}`,
     id,
     calendarId: copy.calendarId,
-    version: factVersion(event, input.principal),
     event,
     copies,
-    copiesDisagree: new Set(active.map(comparable)).size > 1,
+    copiesDisagree: new Set(copies.map(comparable)).size > 1,
     day,
     lastDay,
     zone,
@@ -421,24 +388,11 @@ export function buildWeek(input: WeekInput): Week {
     cursor = nextDate(cursor);
   }
   const groups = new Map<string, EventCopy[]>();
-  const ignored: EventCopy[] = [];
   const prefixes = input.preferences.ignored_events.map((p) => p.prefix);
   for (const copy of input.events) {
-    if (copy.event.status === 'cancelled') continue;
-    if (prefixes.some((p) => copy.event.id?.startsWith(p))) {
-      ignored.push(copy);
-      continue;
-    }
+    if (copy.event.status === 'cancelled' || prefixes.some((p) => copy.event.id?.startsWith(p))) continue;
     const key = originalKey(copy);
     groups.set(key, [...(groups.get(key) ?? []), copy]);
-  }
-  for (const copy of ignored) {
-    const matches = [...groups.values()].filter(
-      (copies) =>
-        timeKey(copies[0].event.start) === timeKey(copy.event.start) &&
-        timeKey(copies[0].event.end) === timeKey(copy.event.end),
-    );
-    if (matches.length === 1) matches[0].push(copy);
   }
   const windows = dates.map((date) => {
     const zone = zoneForDay(input.timeline, date) ?? 'UTC';
@@ -477,7 +431,7 @@ export function buildWeek(input: WeekInput): Week {
         due,
         day,
         checkIn,
-        involvement: { onlyPrincipal: linked.length === 0, guests: [], named: [], linked },
+        involvement: { guests: [], named: [], linked },
       };
     });
   const days = dates.map((date) => {
@@ -514,7 +468,6 @@ export function buildWeek(input: WeekInput): Week {
     preferences: input.preferences,
     events,
     matters: matters.filter((m) => days.some((d) => d.matters.includes(m))),
-    undatedMatters: matters.filter((m) => m.day === null && m.matter.needs_minutes !== null),
     days,
     homeUnknown: input.timeline.base.home_place_id === null,
   };
@@ -530,39 +483,17 @@ export function placeText(text: string, timeline: Timeline): string {
     timeline.legs.some((l) => l.departureZone === text);
   return recorded ? text : calendarText(text);
 }
-function presentedPerson(person: InvolvedPerson) {
-  return {
-    ...person,
-    identity: calendarText(person.identity),
-    name: person.name === null ? null : calendarText(person.name),
-  };
-}
 function presentedEvent(e: WeekEvent) {
   const event = e.event;
   return {
     key: e.key,
     id: e.id,
     calendarId: e.calendarId,
-    day: e.day,
-    lastDay: e.lastDay,
-    zone: e.zone,
     start: e.zone ? zonedIso(e.start, e.zone) : new Date(e.start).toISOString(),
     end: e.zone ? zonedIso(e.end, e.zone) : new Date(e.end).toISOString(),
-    allDay: e.allDay,
-    busy: e.busy,
     title: calendarText(event.summary ?? '(untitled)'),
     description: event.description ? calendarText(event.description, 2000) : null,
     location: event.location ? calendarText(event.location) : null,
-    conference: event.conference
-      ? {
-          status: event.conference.status,
-          entryPoints: event.conference.entryPoints.map((point) => ({
-            type: point.entryPointType,
-            uri: calendarText(point.uri),
-            label: point.label ? calendarText(point.label) : null,
-          })),
-        }
-      : null,
     creator: event.creator
       ? {
           email: event.creator.email ? calendarText(event.creator.email) : null,
@@ -570,13 +501,6 @@ function presentedEvent(e: WeekEvent) {
         }
       : null,
     organizer: event.organizer?.email ? calendarText(event.organizer.email) : null,
-    principalRole: e.principalRole,
-    ownerOrganizes: e.ownerOrganizes,
-    involvement: {
-      onlyPrincipal: e.involvement.onlyPrincipal,
-      guests: e.involvement.guests.map(presentedPerson),
-      named: e.involvement.named.map(presentedPerson),
-    },
   };
 }
 /** The only model-facing serialization of a Week; never spread its host-only event/copy objects. */
@@ -584,13 +508,8 @@ export function presentWeek(week: Week) {
   const matter = (m: WeekMatter) => ({
     id: m.id,
     title: m.matter.title,
-    openLoop: m.matter.open_loop,
     due: m.matter.due_at,
     needsMinutes: m.matter.needs_minutes,
-    place: m.matter.place,
-    checkIn: m.checkIn,
-    deferrals: m.matter.deferrals,
-    involvement: m.involvement.linked.map(presentedPerson),
   });
   const rules = schedulingRules(week.preferences);
   const clockRange = (weekday: Weekday) => {
@@ -600,7 +519,6 @@ export function presentWeek(week: Week) {
   const minuteClock = (value: number) =>
     `${String(Math.floor(value / 60)).padStart(2, '0')}:${String(value % 60).padStart(2, '0')}`;
   return {
-    meetingLengths: week.preferences.meeting_lengths,
     days: week.days.map((d) => ({
       date: d.date,
       zone: d.zone,
@@ -629,7 +547,5 @@ export function presentWeek(week: Week) {
         },
       })),
     })),
-    undatedMatters: week.undatedMatters.map(matter),
-    homeUnknown: week.homeUnknown,
   };
 }
