@@ -106,6 +106,8 @@ function run(): void {
 if (import.meta.main) {
   try {
     run();
-  } catch {}
+  } catch {
+    // Context availability must never block a turn.
+  }
   process.exitCode = 0;
 }
