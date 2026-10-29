@@ -7,7 +7,7 @@ import {
 import type { McpServerConfig } from '../../container/agent-runner/src/providers/types.js';
 import type { ScenarioComposition } from './types.js';
 
-/** Network and peer execution have no synthetic transport in these initial fixtures. */
+/** Only individually prepared native transports are admitted by the fixture. */
 const FIXTURE_WITHHELD_TOOLS = [
   'WebSearch',
   'WebFetch',
@@ -33,14 +33,19 @@ export function scenarioRuntime(
     resolveClaudeMcpServers(mcpServers, inherited),
     execution.disallowedTools,
   );
-  const fixtureWithheld = FIXTURE_WITHHELD_TOOLS.filter(
+  const withheldTools = FIXTURE_WITHHELD_TOOLS.filter(
+    (tool) =>
+      !(composition.fixturePublicWeb && (tool === 'WebSearch' || tool === 'WebFetch')) &&
+      !(composition.fixturePlanning && (tool === 'Agent' || tool === 'Task')),
+  );
+  const fixtureWithheld = withheldTools.filter(
     (tool) => !production.disallowedTools.includes(tool) && (production.tools?.includes(tool) ?? true),
   );
-  const withheld = new Set<string>(FIXTURE_WITHHELD_TOOLS);
+  const withheld = new Set<string>(withheldTools);
   const applied = {
     ...(production.tools ? { tools: production.tools.filter((tool) => !withheld.has(tool)) } : {}),
     allowedTools: production.allowedTools.filter((tool) => !withheld.has(tool)),
-    disallowedTools: [...new Set([...production.disallowedTools, ...FIXTURE_WITHHELD_TOOLS])],
+    disallowedTools: [...new Set([...production.disallowedTools, ...withheldTools])],
     mcpServers: production.mcpServers,
     // The synthetic server is the only configured server, even when production allows more.
     strictMcpConfig: true as const,

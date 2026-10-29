@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { SYNTHETIC_IDENTITY, readState } from './state.js';
+import { PUBLIC_WEB_CASES } from './web-egress.js';
 import type { ScenarioComposition } from '../types.js';
 
 // Import only after cwd points at this run's new synthetic install. Host constants
@@ -239,6 +240,8 @@ try {
     session: { id: session.id, messagingGroupId: session.messaging_group_id },
     ...(context ? { context } : {}),
     ...(audience === 'main' ? { weekViewFile: path.join(sessionDir(main.id, mainSession.id), 'week-view.json') } : {}),
+    fixturePublicWeb: PUBLIC_WEB_CASES.has(fixture.scenario.id),
+    fixturePlanning: fixture.scenario.id === 'planner-limits',
     db: db.dialect,
   };
   if (readState(path.join(output, 'fixture.json')).scenario.observationOnly)

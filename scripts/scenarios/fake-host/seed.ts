@@ -60,6 +60,28 @@ export async function seedScenarioStores(scenario: ScenarioCase, agent: string, 
         source: 'said',
         certainty: 'certain',
       });
+    if (scenario.id === 'errand-loop') {
+      const stops = [
+        ['synthetic-pharmacy', 'Neighborhood Pharmacy'],
+        ['synthetic-cleaner', 'Neighborhood Dry-cleaning'],
+        ['synthetic-grocer', 'Neighborhood Groceries'],
+      ] as const;
+      for (const [id, label] of stops)
+        await addPlace({ id, label, locality: 'San Francisco', zone: 'America/Los_Angeles' });
+      const route = ['synthetic-home', ...stops.map(([id]) => id), 'synthetic-home'];
+      for (let index = 1; index < route.length; index++)
+        await setPlacePair({
+          fromPlaceId: route[index - 1]!,
+          toPlaceId: route[index]!,
+          mode: 'walk',
+          minutes: 8,
+          source: 'learned',
+        });
+      await setManualSection(
+        'preferences',
+        'Friday November 6: coordinate one home–pharmacy–dry-cleaning–groceries–home loop with the Neighborhood Errand Desk. All shops open 13:00–17:00 Pacific. Stop times: pharmacy 10 minutes, dry-cleaning 10, groceries 15. Each of the four walk legs takes 8 minutes. Pharmacy and groceries are prepaid; no new purchase. The Desk requires an arrival range before confirming the stops.',
+      );
+    }
     if (scenario.id === 'flight-chain') {
       await addPlace({ id: 'synthetic-sfo', label: SFO, locality: 'San Francisco', zone: 'America/Los_Angeles' });
       await setPlacePair({

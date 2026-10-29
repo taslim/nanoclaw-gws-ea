@@ -43,7 +43,22 @@ export function concreteFixture(scenario: ScenarioCase): Dataset | undefined {
   const principal = SYNTHETIC_IDENTITY.principalEmail;
   const assistant = SYNTHETIC_IDENTITY.assistantEmail;
   const id = scenario.id;
-  if (['commute-day', 'home-day', 'today-exception', 'capture-promise'].includes(id)) return { events: [], mail: [] };
+  if (['commute-day', 'home-day', 'today-exception', 'capture-promise', 'planner-limits'].includes(id))
+    return { events: [], mail: [] };
+  if (id === 'errand-loop')
+    return {
+      events: [],
+      mail: [
+        syntheticMail(
+          'synthetic-errand-desk',
+          'Friday November 6 errand loop',
+          'errands.desk@example.test',
+          principal,
+          'Neighborhood Errand Desk coordinates the three adjacent shops in San Francisco for Morgan Ellery. Friday November 6, 2026 all three are open 13:00–17:00 America/Los_Angeles. Pharmacy pickup is prepaid and takes 10 minutes; the dry-cleaning drop-off takes 10 minutes; groceries are prepaid for pickup and take 15 minutes. Home to the pharmacy takes 8 minutes, pharmacy to dry-cleaning 8 minutes, dry-cleaning to groceries 8 minutes, and groceries back home 8 minutes. Please reply with one arrival range for the loop so we can confirm the three stops together. No arrival range is confirmed yet. Do not place or pay for a new order.',
+        ),
+      ],
+      thread: { key: 'mail-synthetic-errand-loop', namedPeople: ['errands.desk@example.test'] },
+    };
   if (id === 'flight-chain')
     return {
       events: [

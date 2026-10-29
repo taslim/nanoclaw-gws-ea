@@ -25,7 +25,10 @@ export function mechanicalScore(
       }
     }
     if (effect.actor === 'look-back' || effect.actor === 'look-ahead' || effect.actor === 'unattributed-planner') {
-      const policy = plannerPolicies.find((entry) => entry.role === effect.actor);
+      const policy = plannerPolicies.find(
+        (entry) =>
+          entry.role === effect.actor && (entry.agentId === undefined || entry.agentId === effect.payload.agentId),
+      );
       let allowed = false;
       if (policy && effect.kind === 'tool') {
         if (['Read', 'Grep', 'Glob', 'WebSearch', 'days', 'check'].includes(effect.operation)) allowed = true;

@@ -5,6 +5,8 @@
   },
   "include": [
     "runner.ts",
+    "fake-host/native-hooks.ts",
+    "fake-host/native-path-check.ts",
     "fake-host/mcp.ts",
     "fake-host/compact-hook.ts",
     "fake-host/route-check.ts",

@@ -39,6 +39,7 @@ export interface JudgeVerdict {
 }
 
 export interface PlannerPolicy {
+  readonly agentId?: string;
   readonly role: 'look-back' | 'look-ahead';
   readonly runFile: string;
   readonly memoryDirectory?: string;
@@ -58,5 +59,7 @@ export interface ScenarioComposition {
   readonly context?: string;
   readonly handoff?: { readonly id: string; readonly timestamp: string; readonly content: string };
   readonly weekViewFile?: string;
+  readonly fixturePublicWeb?: boolean;
+  readonly fixturePlanning?: boolean;
   readonly db: string;
 }

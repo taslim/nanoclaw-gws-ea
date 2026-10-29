@@ -10,10 +10,10 @@ checks cover only retry duplicates, scoped privacy markers and declared planner
 role/path/verb limits.
 
 The invented principal is Morgan Ellery, the assistant Aster, and contacts Juno
-Hale and Remy Vance. Twenty-four cases are available, including travel chains,
+Hale and Remy Vance. Twenty-six cases are available, including travel chains,
 deadlines, weekend preferences, impossible transfers, commitments, all three
 booking kinds, relationship-based lengths, invitation authority and outward
-privacy. Ten cases remain pending. The two role probes read a conversation-only brief and produce an
+privacy. Eight cases remain pending. The two role probes read a conversation-only brief and produce an
 internal native task log; their scores cannot establish email or chat delivery.
 The role probes and the people/reminder-only cases have empty Calendar/Gmail stores. The remaining incident classes are catalog entries explicitly
 marked `fixture-pending`; the driver refuses to run them against unrelated
@@ -145,18 +145,24 @@ loopback RPC port; its environment is cleared before the shell starts. Container
 `/workspace/agent` paths are relocated into the synthetic workspace. File tools
 resolve symlinks before allowing reads/writes. No handwritten shell interpreter
 or unsandboxed fallback exists. Production-disallowed tools remain disallowed.
-Web tools, peer-session listing, subagent tools and external MCP servers are
-additionally withheld by this initial fixture boundary; these restrictions are
-recorded separately from production tool policy. Future U8 scenarios require the real
-planning definitions/gate and suitable fixtures; this initial smoke does not
-prove them. Google Calendar create/patch/delete/free-busy and Gmail send/read
+Peer-session listing, teams and external MCP servers remain fixture-withheld.
+Only planner-limits admits native Agent/Task, with the actual U8 definitions,
+SubagentStart hook and production capability/planning gate. Native container
+file paths are mapped at the invented mount before that gate; the gate's literal
+ncl decision precedes actual Bash sandbox wrapping. Planner results and native
+SDK agent IDs are saved, and child assistant frames are filtered under the same
+planning-only condition as the production provider. Only the three pending
+location cases admit native public WebSearch/WebFetch, guarded against email and
+private-context egress. These per-case boundaries are recorded separately from
+production policy. Google Calendar create/patch/delete/free-busy and Gmail send/read
 transports are available. Google operations outside the implemented fixture
 boundary fail closed, including arbitrary Gmail search queries, attachments,
 history polling and calendar subscriptions. Gmail supports the production
 send-reconciliation queries and SENT label reads; gog's existing read views use
 the same messages. Booking and privacy cases have their specific conversations,
-consent and private facts. Public web, browser delegation, actual planning agents
-and the close path remain outside this checkpoint's fixture boundary.
+consent and private facts. Successful public venue reads, browser delegation and the close path remain
+pending. The partial native browser response-stage investigation has no model
+runner integration and retains its failed private-address subproof.
 
 `--claude` selects an existing authenticated native CLI (default
 `~/.local/bin/claude`); no auth files are inspected or copied. The default models
@@ -194,3 +200,19 @@ request. This is an account-metadata isolation limitation, also present in the
 prior replay evidence. Keep raw evidence local; sanitized summaries must not
 reproduce the account address. Small cases register compaction hooks but do not
 force compaction; a saved hook body is not evidence that the model compacted.
+
+The native-path-check.ts development command takes a prepared directory whose
+synthetic host is still live, the repository root and an existing Claude CLI.
+It runs the real SDK against a scripted loopback API; it never forwards a request
+to an inference provider. For planner-limits it proves native start attribution,
+a sandboxed native ncl read, role-owned write, three refused worker operations
+and mechanical scoring of actual effects. It also drives the actual scenario
+runner and unchanged processQuery, retaining native background workers through
+their SDK completion notification and checking that child message blocks never
+become principal delivery. For a location dataset it proves
+native WebSearch/WebFetch rejection of invented account-email inputs. SDK token
+usage in this scripted proof is fabricated transport input and its list-price
+estimate is not a paid inference charge or behavioral result. Evidence stays in
+native-path-proof alongside the ordinary preparation evidence. The ordinary
+prepare command still stops its host before returning, so this development probe
+must run while that fixture host is deliberately kept live.

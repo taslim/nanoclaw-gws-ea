@@ -105,7 +105,69 @@ export async function checkConcreteCase(file: string): Promise<void> {
     return JSON.stringify(read.frame.data);
   };
   try {
-    if (['commute-day', 'home-day', 'today-exception'].includes(id)) {
+    if (id === 'errand-loop') {
+      assert.deepEqual(before.events, []);
+      const where = await ncl(['whereabouts', 'get']);
+      evidence.whereabouts = where;
+      assert.equal(
+        whereaboutsAt(before.whereaboutsTimeline, Date.parse('2026-11-06T22:00:00Z')).locality,
+        'San Francisco',
+      );
+      const route = ['synthetic-home', 'synthetic-pharmacy', 'synthetic-cleaner', 'synthetic-grocer', 'synthetic-home'];
+      for (let index = 1; index < route.length; index++)
+        assert.ok(
+          before.whereabouts.pairs.some(
+            (pair) =>
+              pair.from_place_id === route[index - 1] && pair.to_place_id === route[index] && pair.minutes === 8,
+          ),
+        );
+      const mail = (await callHost(file, 'gog', {
+        argv: ['gmail', 'get', 'synthetic-errand-desk'],
+        phase: 'preflight',
+      })) as { body: string };
+      assert.ok(mail.body.includes('No arrival range is confirmed yet'));
+      assert.ok(mail.body.includes('13:00–17:00'));
+      evidence.vendorTerms = mail;
+      const result = await probe([
+        write('email_handoff', {
+          thread_key: 'mail-synthetic-errand-loop',
+          message:
+            'Ask the Neighborhood Errand Desk to confirm Friday November 6 arrival between 14:00 and 15:00 America/Los_Angeles for the one pharmacy–dry-cleaning–groceries loop. No new order or spending; merchant confirmation remains pending until the Desk replies.',
+        }),
+        write('create_event', {
+          calendar: principal,
+          title: 'Provisional neighborhood errand loop — merchant confirmation pending',
+          location: 'Neighborhood Pharmacy; Neighborhood Dry-cleaning; Neighborhood Groceries, San Francisco',
+          start: '2026-11-06T13:52:00-08:00',
+          end: '2026-11-06T14:59:00-08:00',
+          description:
+            'Home 13:52 → pharmacy 14:00–14:10 → dry-cleaning 14:18–14:28 → groceries 14:36–14:51 → home 14:59. Merchant arrival confirmation pending. No new purchase.',
+        }),
+      ]);
+      assert.ok(
+        result.results.every((entry) => entry.answer.frame.ok),
+        JSON.stringify(result),
+      );
+      assert.ok(
+        result.results[0]?.snapshot.queuedHandoffs.some((entry) =>
+          entry.messages.some((message) => message.content.includes('Neighborhood Errand Desk')),
+        ),
+      );
+      assert.equal(
+        result.results[0]?.snapshot.mail.length,
+        before.mail.length,
+        'Queued delegation is not vendor contact.',
+      );
+      assert.equal(result.results[1]?.snapshot.events.length, 1);
+      evidence.vendorContactProven = false;
+      evidence.nativeQueuedCoordinationProven = true;
+    } else if (id === 'planner-limits') {
+      assert.deepEqual(before.events, []);
+      assert.deepEqual(before.mail, []);
+      const where = await ncl(['whereabouts', 'get']);
+      assert.ok(where.stdout?.includes('Mountain View'));
+      evidence.whereabouts = where;
+    } else if (['commute-day', 'home-day', 'today-exception'].includes(id)) {
       const read = await ncl(['whereabouts', 'get']);
       evidence.whereabouts = read;
       assert.equal(before.whereabouts.base.rhythm_known, 1);

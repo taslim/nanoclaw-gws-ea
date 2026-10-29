@@ -40,8 +40,14 @@ for (const [key, value] of Object.entries(composition.moduleEnvironment)) assert
 for (const tool of runtime.production.disallowedTools) assert.ok(runtime.applied.disallowedTools.includes(tool), tool);
 assert.ok(runtime.applied.strictMcpConfig);
 assert.deepEqual(Object.keys(runtime.applied.mcpServers), ['nanoclaw']);
-assert.ok(!runtime.applied.allowedTools.includes('WebSearch'));
-assert.ok(!runtime.applied.allowedTools.includes('Agent'));
+assert.equal(
+  runtime.fixtureWithheld.includes('WebSearch'),
+  !composition.fixturePublicWeb && !runtime.production.disallowedTools.includes('WebSearch'),
+);
+assert.equal(
+  runtime.fixtureWithheld.includes('Agent'),
+  !composition.fixturePlanning && !runtime.production.disallowedTools.includes('Agent'),
+);
 if (scenario.audience !== 'main') {
   for (const tool of ['Bash', 'Write', 'Edit', 'NotebookEdit', 'Agent']) {
     assert.ok(
