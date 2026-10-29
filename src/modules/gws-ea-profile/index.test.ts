@@ -828,7 +828,7 @@ describe('character and audience-specific identity', () => {
     expect(CHARACTER).not.toMatch(
       /\b(?:ncl|tools?|agent groups?|matters record|Core Memory|runtime|provider|host)\b|memory\//iu,
     );
-    // Its size cap lives with every other guidance file's, in src/gws-ea/guidance-caps.test.ts.
+    // Its size counts toward each agent's always-on budget, in src/gws-ea/guidance-budget.test.ts.
   });
 
   it('leaves the browser without character while retaining the addresses it may recognize', async () => {
