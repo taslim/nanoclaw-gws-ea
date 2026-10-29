@@ -2033,6 +2033,29 @@ it('settles a write Google refuses with its refusal, and logs no write for an ev
   expect(await getCalendarWrite('act-unversioned')).toBeUndefined();
 });
 
+it('settles a write Google failed before it landed with Google’s error, so no ledger lists it as pending', async () => {
+  const { getCalendarWrite } = await import('./week/write-log.js');
+  calendar.failNext({ op: 'insert', error: new GoogleApiError(503, 'Backend Error') });
+  expect(refusal(await send(main, 'create_event', FOCUS, 'act-failed-create'))).toContain('Backend Error');
+  expect(calendar.live()).toEqual([]);
+
+  calendar.put(teamSync([PRINCIPAL_GUEST]));
+  calendar.failNext({ op: 'patch', error: new GoogleApiError(503, 'Backend Error') });
+  const change = { calendar: PRINCIPAL, event: 'teamsync01', title: 'Moved', send_updates: 'none' };
+  expect(refusal(await send(main, 'change_event', change, 'act-failed-change'))).toContain('Backend Error');
+  expect(calendar.event(PRINCIPAL, 'teamsync01')?.summary).toBe('Team sync');
+
+  calendar.failNext({ op: 'guests', error: new GoogleApiError(0, 'Google could not be reached') });
+  const guests = { calendar: PRINCIPAL, event: 'teamsync01', add: [REMY] };
+  expect(refusal(await send(main, 'change_guests', guests, 'act-failed-guests'))).toContain('could not be reached');
+
+  for (const requestId of ['act-failed-create', 'act-failed-change', 'act-failed-guests'])
+    expect(await getCalendarWrite(requestId)).toMatchObject({
+      state: 'applied',
+      outcome: expect.stringMatching(/Backend Error|could not be reached/u),
+    });
+});
+
 it('changes an event whose who-it-affects read fails, and says it could not be read', async () => {
   await setSchedulingPreference({
     kind: 'ignored-events',

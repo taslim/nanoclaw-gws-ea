@@ -383,6 +383,8 @@ function isRefusal(error: unknown): error is Error {
   );
 }
 
+const errorText = (error: unknown): string => (error instanceof Error ? error.message : String(error));
+
 /** What Google holds when a split's second half fails: main decides what to do with it. */
 function unfinishedSplit(split: CalendarSplitPlan, following: NewEvent, occurrence: DetailedEvent, error: unknown) {
   const cutoff = occurrence.originalStartTime ?? occurrence.start;
@@ -392,9 +394,7 @@ function unfinishedSplit(split: CalendarSplitPlan, following: NewEvent, occurren
   return [
     `Only the first half of this change was made: the original series now ends before ${ends}.`,
     `Its following series, event ${split.followingId}, was not created. It would start ${following.start} and end ${following.end}${following.timeZone === undefined ? '' : ` (${following.timeZone})`}, repeat ${(following.recurrence ?? []).join(' ')}, and invite ${(following.attendees ?? []).map((guest) => calendarText(guest.email)).join(' ')}.`,
-    isGoogleConnectionDown(error)
-      ? GOOGLE_CONNECTION_DOWN
-      : `Google's last answer: ${error instanceof Error ? error.message : String(error)}`,
+    isGoogleConnectionDown(error) ? GOOGLE_CONNECTION_DOWN : `Google's last answer: ${errorText(error)}`,
   ].join(' ');
 }
 
@@ -727,7 +727,10 @@ export function createPrincipalEventTools(deps: PrincipalEventToolsDeps) {
       log.warn('Calendar insert returned no result; checking its live event', { requestId, error });
       // The id is this request's own, so the event existing is the insert having landed.
       const made = await calendar().getEvent(entry.id, eventId);
-      if (!made || made.status === 'cancelled') throw error;
+      if (!made || made.status === 'cancelled') {
+        await markCalendarWriteApplied(requestId, errorText(error));
+        throw error;
+      }
       inserted = 'created';
     }
     if (inserted === 'exists') {
@@ -1051,7 +1054,8 @@ export function createPrincipalEventTools(deps: PrincipalEventToolsDeps) {
       try {
         result = await raw(content, session, requestId);
       } catch (error) {
-        if (isRefusal(error)) await markCalendarWriteApplied(requestId, error.message);
+        // The ledger keeps the answer the tool gave, Google's error included: only a crash leaves a write pending.
+        await markCalendarWriteApplied(requestId, errorText(error));
         throw error;
       }
       const outcome = String(result.message);
@@ -1403,7 +1407,7 @@ export function createPrincipalEventTools(deps: PrincipalEventToolsDeps) {
             await markCalendarWriteApplied(requestId, message);
             return { message };
           }
-          if (isRefusal(error)) await markCalendarWriteApplied(requestId, error.message);
+          await markCalendarWriteApplied(requestId, errorText(error));
           throw error;
         }
         wrote = true;
