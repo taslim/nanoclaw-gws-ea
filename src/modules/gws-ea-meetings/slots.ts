@@ -158,9 +158,12 @@ export function strongestAnswer(answers: readonly (string | undefined)[]): strin
 
 /** The one rule every read of the principal's busy time uses. */
 export function blocksTime(
-  event: Pick<ListedEvent, 'status' | 'transparency' | 'attendees'>,
+  event: Pick<ListedEvent, 'id' | 'status' | 'transparency' | 'attendees'>,
   principal: PrincipalRecognizer,
+  ignoredPrefixes: readonly string[] = [],
 ): boolean {
+  if (event.id !== undefined && ignoredPrefixes.some((prefix) => prefix.length > 0 && event.id?.startsWith(prefix)))
+    return false;
   if (event.status === 'cancelled' || event.transparency === 'transparent') return false;
   return principalAnswer(event, principal) !== 'declined';
 }

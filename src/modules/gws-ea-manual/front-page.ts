@@ -73,6 +73,17 @@ function preferenceLines(values: SchedulingPreferenceValues): string[] {
       (value) =>
         `${value.meeting_kind}: prefer ${value.weekdays.join(',')} ${value.start}-${value.end}${source(value)}`,
     ),
+    ...(values.meal_windows ?? []).map(
+      (value) =>
+        `${value.meal}: ${value.weekdays.join(',')} ${value.start}-${value.end}; ${value.minutes} minutes free${source(value)}`,
+    ),
+    ...(values.back_to_back ?? []).map(
+      (value) =>
+        `Back-to-back: ${value.minutes} minutes, breaks at least ${value.break_minutes} minutes${source(value)}`,
+    ),
+    ...(values.ignored_events ?? []).map(
+      (value) => `Ignore calendar copies with ID prefix ${value.prefix}${source(value)}`,
+    ),
   ];
 }
 

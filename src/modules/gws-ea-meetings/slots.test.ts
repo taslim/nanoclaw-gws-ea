@@ -323,3 +323,9 @@ describe('which events block time', () => {
     });
   });
 });
+
+it('ignores configured sync-copy ID prefixes without ignoring an ordinary event', () => {
+  expect(blocksTime({ id: 'csdnshold123' }, PRINCIPAL, ['csdnshold'])).toBe(false);
+  expect(blocksTime({ id: 'meeting123' }, PRINCIPAL, ['csdnshold'])).toBe(true);
+  expect(blocksTime({ id: 'csdnshold123' }, PRINCIPAL)).toBe(true);
+});

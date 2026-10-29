@@ -1,3 +1,4 @@
+import { weekAcknowledgementsMigration } from './week/acks-migration.js';
 import '../gws-ea-inbox/index.js';
 import '../gws-ea-chats/index.js';
 
@@ -79,6 +80,7 @@ const MAIN_STEP = "Tell the principal in a line what you can't do, and carry on 
 registerMigration(chatBookingRequestsMigration);
 registerMigration(chatBookingReportsMigration);
 registerMigration(bookingsMigration);
+registerMigration(weekAcknowledgementsMigration);
 
 for (const [action, answer] of [
   ['free_time', booking.freeTime],

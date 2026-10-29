@@ -128,3 +128,24 @@ describe('Manual front page', () => {
     expect((await loadManualFrontPage()).length).toBeLessThanOrEqual(MANUAL_FRONT_PAGE_BUDGET_CHARS);
   });
 });
+
+it('includes planning preferences from their native store instead of claiming none are recorded', async () => {
+  const basis = { source: 'principal' as const, basis: 'Recorded correction.' };
+  await setSchedulingPreference({
+    kind: 'meal-window',
+    meal: 'lunch',
+    weekdays: ['mon'],
+    start: '14:00',
+    end: '15:00',
+    minutes: 30,
+    ...basis,
+  });
+  await setSchedulingPreference({ kind: 'back-to-back', minutes: 120, breakMinutes: 10, ...basis });
+  await setSchedulingPreference({ kind: 'ignored-events', prefix: 'csdnshold', ...basis });
+  const page = await loadManualFrontPage();
+  expect(page).toContain('lunch');
+  expect(page).toContain('14:00-15:00');
+  expect(page).toContain('120 minutes');
+  expect(page).toContain('csdnshold');
+  expect(page).not.toContain('None recorded. Read `ncl preferences get`');
+});

@@ -20,9 +20,10 @@ import {
   type Weekday,
 } from './db.js';
 import { assertMainCaller, projectDocAudience } from '../gws-ea-profile/db.js';
-import { gwsEaPreferencesMigration } from './migration.js';
+import { gwsEaPlanningPreferencesMigration, gwsEaPreferencesMigration } from './migration.js';
 
 registerMigration(gwsEaPreferencesMigration);
+registerMigration(gwsEaPlanningPreferencesMigration);
 
 // ---------------------------------------------------------------------------
 // Project-document summary: values only, never a basis or a reason.
@@ -46,6 +47,23 @@ function summarizeSchedulingPreferences(values: SchedulingPreferenceValues): str
   const source = (value: { readonly source: PreferenceSource }) => `(${SOURCE_LABELS[value.source]})`;
   const blocks = (
     [
+      [
+        'Meal windows',
+        (values.meal_windows ?? []).map(
+          (value) =>
+            `- ${value.meal}: ${days(value.weekdays)} ${value.start}-${value.end}, ${minutes(value.minutes)} free ${source(value)}`,
+        ),
+      ],
+      [
+        'Back-to-back limit',
+        (values.back_to_back ?? []).map(
+          (value) => `- ${minutes(value.minutes)}, with ${minutes(value.break_minutes)} breaks ${source(value)}`,
+        ),
+      ],
+      [
+        'Ignored calendar copies',
+        (values.ignored_events ?? []).map((value) => `- Event IDs beginning ${value.prefix} ${source(value)}`),
+      ],
       [
         'Working hours',
         values.working_hours.map(
@@ -109,6 +127,9 @@ registerRequiredProjectDocSection('gws-ea-preferences:summary', preferencesSecti
 const SHARED_FLAGS = new Set(['kind', 'source', 'basis', 'agent_group_id', 'group']);
 
 const SET_FIELDS: Readonly<Record<PreferenceKind, readonly string[]>> = {
+  'meal-window': ['meal', 'weekdays', 'start', 'end', 'minutes'],
+  'back-to-back': ['minutes', 'break_minutes'],
+  'ignored-events': ['prefix'],
   'working-hours': ['weekday', 'start', 'end', 'off'],
   'protected-window': ['id', 'weekdays', 'start', 'end', 'reason'],
   'meeting-length': ['meeting_kind', 'minutes'],
@@ -117,6 +138,9 @@ const SET_FIELDS: Readonly<Record<PreferenceKind, readonly string[]>> = {
 };
 
 const REMOVE_FIELD: Readonly<Record<PreferenceKind, string>> = {
+  'meal-window': 'meal',
+  'back-to-back': '',
+  'ignored-events': 'prefix',
   'working-hours': 'weekday',
   'protected-window': 'id',
   'meeting-length': 'meeting_kind',
@@ -169,6 +193,25 @@ function setInput(args: Record<string, unknown>): SetPreferenceInput {
   onlyFields(args, kind, SET_FIELDS[kind]);
   const provenance = { source: requiredString(args, 'source', kind), basis: requiredString(args, 'basis', kind) };
   switch (kind) {
+    case 'meal-window':
+      return {
+        kind,
+        meal: requiredString(args, 'meal', kind),
+        weekdays: weekdayList(args),
+        start: requiredString(args, 'start', kind),
+        end: requiredString(args, 'end', kind),
+        minutes: requiredNumber(args, 'minutes', kind),
+        ...provenance,
+      };
+    case 'back-to-back':
+      return {
+        kind,
+        minutes: requiredNumber(args, 'minutes', kind),
+        ...(typeof args.break_minutes === 'number' ? { breakMinutes: args.break_minutes } : {}),
+        ...provenance,
+      };
+    case 'ignored-events':
+      return { kind, prefix: requiredString(args, 'prefix', kind), ...provenance };
     case 'working-hours': {
       const weekday = requiredString(args, 'weekday', kind);
       if (args.off === true) {
@@ -218,9 +261,15 @@ function removeTarget(args: Record<string, unknown>): PreferenceTarget {
   const kind = parseKind(args.kind);
   const field = REMOVE_FIELD[kind];
   onlyFields(args, kind, [field, 'source']);
-  const value = requiredString(args, field, kind);
+  const value = field === '' ? '' : requiredString(args, field, kind);
   const source = requiredString(args, 'source', kind);
   switch (kind) {
+    case 'meal-window':
+      return { kind, meal: value, source };
+    case 'back-to-back':
+      return { kind, source };
+    case 'ignored-events':
+      return { kind, prefix: value, source };
     case 'working-hours':
       return { kind, weekday: value, source };
     case 'protected-window':
@@ -305,8 +354,18 @@ registerResource({
         '  protected-window  --start and --end, optional --weekdays (every day when omitted) and --reason; --id changes an existing window\n' +
         '  meeting-length    --meeting-kind and --minutes (1 or more)\n' +
         '  buffer            --meeting-kind and --minutes kept free before and after (0 or more)\n' +
-        '  preferred-time    --meeting-kind, --start and --end, optional --weekdays (every day when omitted)',
+        '  preferred-time    --meeting-kind, --start and --end, optional --weekdays (every day when omitted)\n' +
+        '  meal-window       --meal lunch|dinner, --start, --end, --minutes, optional --weekdays\n' +
+        '  back-to-back      --minutes, optional --break-minutes (5 when omitted)\n' +
+        '  ignored-events    --prefix (one sync-tool event ID prefix)',
       args: [
+        { name: 'meal', type: 'string', description: 'meal-window: lunch or dinner.', enum: ['lunch', 'dinner'] },
+        { name: 'prefix', type: 'string', description: 'ignored-events: a sync tool event ID prefix.' },
+        {
+          name: 'break_minutes',
+          type: 'number',
+          description: 'back-to-back: break that ends a run; 5 minutes when unset.',
+        },
         KIND_ARG,
         SOURCE_ARG,
         { name: 'basis', type: 'string', description: 'Where the value came from, in one short line.', required: true },
@@ -344,7 +403,15 @@ registerResource({
       description:
         'Forget one preference, returning it to unset: --weekday for working-hours, --id for protected-window, --meeting-kind otherwise.\n\n' +
         'Use --source principal when the principal asks you to forget it, and --source learned when you drop a value on your own inference.',
-      args: [KIND_ARG, SOURCE_ARG, WEEKDAY_ARG, ID_ARG, MEETING_KIND_ARG],
+      args: [
+        KIND_ARG,
+        SOURCE_ARG,
+        WEEKDAY_ARG,
+        ID_ARG,
+        MEETING_KIND_ARG,
+        { name: 'meal', type: 'string', description: 'meal-window: lunch or dinner.' },
+        { name: 'prefix', type: 'string', description: 'ignored-events: the event ID prefix to forget.' },
+      ],
       examples: [
         'ncl preferences remove --kind working-hours --weekday mon --source principal',
         'ncl preferences remove --kind protected-window --id w-1a2b3c4d --source principal',

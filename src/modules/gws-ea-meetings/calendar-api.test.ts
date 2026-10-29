@@ -444,3 +444,59 @@ describe('the Calendar client', () => {
     expect(await api.getGuests('pat@principal.example', 'deleted')).toBeUndefined();
   });
 });
+
+it('reads planning detail fields only on the main detail route', async () => {
+  const raw = {
+    id: 'e',
+    etag: 'v1',
+    summary: 'Lunch',
+    description: 'Menu',
+    location: 'Mission restaurant',
+    creator: { email: 'Juno@Hale.example', displayName: 'Juno Hale' },
+    start: { dateTime: '2026-10-06T09:00:00+02:00', timeZone: 'Europe/Brussels' },
+    end: { dateTime: '2026-10-06T10:00:00+02:00', timeZone: 'Europe/Brussels' },
+    eventType: 'default',
+    extendedProperties: { private: { gws_ea_parent_event: 'p' } },
+    conferenceData: { entryPoints: [{ entryPointType: 'video', uri: 'https://meet.google.com/abc' }] },
+  };
+  const { api, requests } = stubGoogle(() => ({ status: 200, body: { items: [raw] } }));
+  expect((await api.listEventDetails('c', '2026-10-06T00:00Z', '2026-10-07T00:00Z'))[0]).toMatchObject({
+    etag: 'v1',
+    description: 'Menu',
+    location: 'Mission restaurant',
+    creator: { email: 'juno@hale.example', displayName: 'Juno Hale' },
+    start: { timeZone: 'Europe/Brussels' },
+    end: { timeZone: 'Europe/Brussels' },
+    eventType: 'default',
+    tags: { gws_ea_parent_event: 'p' },
+    conference: { uri: 'https://meet.google.com/abc' },
+  });
+  const outside = (await api.listEvents('c', '2026-10-06T00:00Z', '2026-10-07T00:00Z'))[0];
+  expect(outside).not.toHaveProperty('summary');
+  expect(outside).not.toHaveProperty('location');
+  expect(requests[1].url.searchParams.get('fields')).not.toContain('description');
+});
+
+it('keeps telephone conference entry points on the detail route', async () => {
+  const { api } = stubGoogle(() => ({
+    status: 200,
+    body: {
+      items: [
+        {
+          id: 'e',
+          conferenceData: {
+            conferenceId: 'call',
+            entryPoints: [{ entryPointType: 'phone', uri: 'tel:+14155550100', label: 'US dial-in' }],
+          },
+        },
+      ],
+    },
+  }));
+  expect((await api.listEventDetails('c', '2026-10-06T00:00Z', '2026-10-07T00:00Z'))[0]).toMatchObject({
+    conference: {
+      status: 'success',
+      conferenceId: 'call',
+      entryPoints: [{ entryPointType: 'phone', uri: 'tel:+14155550100', label: 'US dial-in' }],
+    },
+  });
+});
