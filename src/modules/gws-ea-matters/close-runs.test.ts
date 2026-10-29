@@ -43,6 +43,7 @@ it('advances only on the exact open run marker and only to its captured coverage
     from: null,
     through: '2026-10-27T21:00:00.000Z',
     writes: [{ requestId: 'used', updatedAt: version }],
+    inbound: {},
   });
   await expect(completeCloseRun('close-one', 'other')).rejects.toThrow(/open/u);
   expect(await lastCompletedClose()).toBeUndefined();
@@ -62,6 +63,7 @@ it('retains failed, unread and subsequently changed write evidence', async () =>
     from: null,
     through: '2026-10-27T21:00:00.000Z',
     writes: [{ requestId: 'changed', updatedAt: version }],
+    inbound: {},
   });
   await failCloseRun('failed');
   expect(await lastCompletedClose()).toBeUndefined();
@@ -71,6 +73,7 @@ it('retains failed, unread and subsequently changed write evidence', async () =>
     from: null,
     through: '2026-10-28T21:00:00.000Z',
     writes: [{ requestId: 'changed', updatedAt: version }],
+    inbound: {},
   });
   await getDb().run(
     "UPDATE gws_ea_calendar_write_log SET updated_at='2026-10-28T21:01:00Z' WHERE request_id='changed'",

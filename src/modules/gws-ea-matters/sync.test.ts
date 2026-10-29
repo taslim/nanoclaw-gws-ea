@@ -110,7 +110,7 @@ async function closeRow(): Promise<TaskRow> {
   return rows[0];
 }
 async function capture(id: string, sessionId: string): Promise<void> {
-  await recordCloseLedger(id, sessionId, { from: null, through: new Date().toISOString(), writes: [] });
+  await recordCloseLedger(id, sessionId, { from: null, through: new Date().toISOString(), writes: [], inbound: {} });
 }
 
 let gmail: FakeGmailThreads;

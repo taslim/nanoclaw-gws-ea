@@ -16,7 +16,7 @@ export const closeRunsMigration: ModuleMigration = {
       zone TEXT NOT NULL, timeline_version TEXT NOT NULL, weekly_day TEXT,
       state TEXT NOT NULL CHECK (state IN ('pending','open','completed','failed')),
       started_at TEXT,
-      ledger_from_at TEXT, ledger_through_at TEXT, ledger_writes_json TEXT,
+      ledger_from_at TEXT, ledger_through_at TEXT, ledger_writes_json TEXT, ledger_inbound_json TEXT,
       CHECK (state <> 'completed' OR ledger_through_at IS NOT NULL)
     )`);
   },
@@ -33,6 +33,7 @@ export interface CloseRun {
   readonly ledger_from_at: string | null;
   readonly ledger_through_at: string | null;
   readonly ledger_writes_json: string | null;
+  readonly ledger_inbound_json: string | null;
 }
 export interface ConsumedCalendarWrite {
   readonly requestId: string;
@@ -42,6 +43,8 @@ export interface CloseLedgerCoverage {
   readonly from: string | null;
   readonly through: string;
   readonly writes: readonly ConsumedCalendarWrite[];
+  /** Each main session's highest inbound `seq` the ledger read. */
+  readonly inbound: Readonly<Record<string, number>>;
 }
 function instant(value: string): string {
   if (!Number.isFinite(Date.parse(value))) throw new Error('Close evidence needs a valid instant.');
@@ -79,10 +82,11 @@ export async function recordCloseLedger(
   const from = coverage.from === null ? null : instant(coverage.from);
   if (from !== null && from > through) throw new Error('The ledger cutoff precedes its window.');
   const result = await getDb().run(
-    "UPDATE gws_ea_close_runs SET ledger_from_at=?,ledger_through_at=?,ledger_writes_json=? WHERE id=? AND session_id=? AND state='open'",
+    "UPDATE gws_ea_close_runs SET ledger_from_at=?,ledger_through_at=?,ledger_writes_json=?,ledger_inbound_json=? WHERE id=? AND session_id=? AND state='open'",
     from,
     through,
     JSON.stringify(coverage.writes),
+    JSON.stringify(coverage.inbound),
     runId,
     sessionId,
   );

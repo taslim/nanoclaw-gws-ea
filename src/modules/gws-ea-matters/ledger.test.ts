@@ -30,7 +30,11 @@ import { FakeCalendar } from '../gws-ea-meetings/testing/fake-calendar.js';
 import { calendarWriteLogMigration } from '../gws-ea-meetings/week/write-log-migration.js';
 import { calendarSplitRecoveryMigration } from '../gws-ea-meetings/week/split-recovery-migration.js';
 import { weekAcknowledgementsMigration } from '../gws-ea-meetings/week/acks-migration.js';
-import { beginCalendarWrite, markCalendarWriteApplied } from '../gws-ea-meetings/week/write-log.js';
+import {
+  beginCalendarWrite,
+  completeCalendarWriteFindings,
+  markCalendarWriteApplied,
+} from '../gws-ea-meetings/week/write-log.js';
 import {
   gwsEaMattersMigration,
   gwsEaMatterJobsMigration,
@@ -198,8 +202,9 @@ it('rechecks write findings against the native calendar and prunes only after th
   await markCalendarWriteApplied('write', 'Changed.');
   await openClose('close', session.id);
   const result = await readDayLedger(ctx);
-  expect(JSON.stringify(section(result, 'writes'))).toContain('Findings for 2026-10-28:');
+  expect(JSON.stringify(section(result, 'findings'))).toMatch(/Findings for [^:]*2026-10-28:/u);
   const entry = section(result, 'writes').entries[0];
+  expect(entry).toContain('Its findings were not checked after the write; the findings below cover its time.');
   expect(entry.indexOf('External event wording')).toBeGreaterThan(entry.indexOf('<<<EXTERNAL_UNTRUSTED_CONTENT'));
   expect(entry.indexOf('External event wording')).toBeLessThan(entry.indexOf('<<<END_EXTERNAL_UNTRUSTED_CONTENT'));
   expect(google.calendar?.calls).toBeGreaterThan(0);
@@ -241,18 +246,21 @@ it('retains a failed findings gap, then rechecks it on the next read', async () 
   const calendar = google.calendar;
   if (!calendar) throw new Error('Calendar fixture missing');
   calendar.failure = new Error('private provider error');
-  expect(JSON.stringify(section(await readDayLedger(ctx), 'writes'))).toContain('Findings gap: recheck unavailable.');
+  const failed = await readDayLedger(ctx);
+  expect(section(failed, 'findings')).toMatchObject({ entries: [], unavailable: true });
+  expect(JSON.stringify(section(failed, 'writes'))).toContain('Its findings were not checked after the write');
+  expect(JSON.stringify(failed)).not.toContain('private provider error');
   expect(await getDb().get('SELECT findings_checked FROM gws_ea_calendar_write_log WHERE request_id=?', 'gap')).toEqual(
     { findings_checked: 0 },
   );
   calendar.failure = undefined;
-  expect(JSON.stringify(section(await readDayLedger(ctx), 'writes'))).toContain('Findings for 2026-10-28:');
+  expect(JSON.stringify(section(await readDayLedger(ctx), 'findings'))).toMatch(/Findings for [^:]*2026-10-28:/u);
   expect(await getDb().get('SELECT findings_checked FROM gws_ea_calendar_write_log WHERE request_id=?', 'gap')).toEqual(
     { findings_checked: 1 },
   );
 });
 
-it('includes pending calendar notices with fresh findings without settling them', async () => {
+it('includes pending calendar notices, with fresh findings over their events, without settling them', async () => {
   await getDb().run(
     'INSERT INTO gws_ea_pending_calendar_changes VALUES (?,?,?,?,?)',
     'notice',
@@ -265,10 +273,82 @@ it('includes pending calendar notices with fresh findings without settling them'
   const notes = JSON.stringify(section(result, 'notes'));
   expect(notes).toContain('pending calendar notice');
   expect(notes).toContain('EXTERNAL_UNTRUSTED_CONTENT');
-  expect(notes).toContain('Findings for');
+  expect(JSON.stringify(section(result, 'findings'))).toContain('Findings for');
   expect(await getDb().all('SELECT message_id FROM gws_ea_pending_calendar_changes')).toEqual([
     { message_id: 'notice' },
   ]);
+});
+
+it('lists checked writes by their stored outcome, and reads the calendar once for every gap and notice', async () => {
+  const calendar = google.calendar;
+  if (!calendar) throw new Error('Calendar fixture missing');
+  await getDb().run(
+    'INSERT INTO gws_ea_pending_calendar_changes VALUES (?,?,?,?,?)',
+    'notice',
+    'morgan@example.test',
+    'event',
+    'changed',
+    '2026-10-28T16:00:00.000Z',
+  );
+  let before = calendar.calls;
+  await readDayLedger(ctx);
+  const noticeOnly = calendar.calls - before;
+  for (const [index, day] of ['2026-10-26', '2026-10-27', '2026-10-28', '2026-10-30'].entries()) {
+    await beginCalendarWrite({
+      requestId: `gap-${index}`,
+      calendarId: 'morgan@example.test',
+      eventId: `event-${index}`,
+      action: 'change_event',
+      request: {},
+      before: null,
+      affectedStart: `${day}T12:00:00Z`,
+      affectedEnd: `${day}T13:00:00Z`,
+    });
+    await markCalendarWriteApplied(`gap-${index}`, 'Changed.');
+  }
+  await beginCalendarWrite({
+    requestId: 'checked',
+    calendarId: 'morgan@example.test',
+    eventId: 'event-checked',
+    action: 'change_event',
+    request: {},
+    before: null,
+    affectedStart: '2026-10-29T12:00:00Z',
+    affectedEnd: '2026-10-29T13:00:00Z',
+  });
+  await markCalendarWriteApplied('checked', 'Moved to Thursday.');
+  await completeCalendarWriteFindings('checked');
+  before = calendar.calls;
+  const result = await readDayLedger(ctx);
+  expect(calendar.calls - before).toBe(noticeOnly);
+  const checked = section(result, 'writes').entries.find((entry) => entry.startsWith('checked:'));
+  expect(checked).toContain('Moved to Thursday.');
+  expect(checked).not.toContain('findings');
+  expect(JSON.stringify(section(result, 'findings'))).toContain('2026-10-26');
+  expect(JSON.stringify(section(result, 'findings'))).toContain('2026-10-30');
+  expect(
+    await getDb().all('SELECT request_id FROM gws_ea_calendar_write_log WHERE findings_checked=0 ORDER BY request_id'),
+  ).toEqual([]);
+});
+
+it('carries a message that arrives after a close’s read into the next ledger, whatever its platform time', async () => {
+  const prior: CallerContext = {
+    caller: 'agent',
+    agentGroupId: 'ag-main',
+    sessionId: 'prior-close-session',
+    messagingGroupId: 'mg-dm',
+  };
+  vi.setSystemTime('2026-10-27T21:00:00Z');
+  await openClose('yesterday', 'prior-close-session');
+  await readDayLedger(prior);
+  // Sent before the read, but processed after it.
+  await principal('slow', '2026-10-27T20:59:50Z', 'Hold Friday afternoon for the kids.');
+  await completeCloseRun('yesterday', 'prior-close-session');
+  vi.setSystemTime(NOW);
+  await openClose('today', session.id);
+  const result = await readDayLedger(ctx);
+  expect(result.from).toBe('2026-10-27T21:00:00.000Z');
+  expect(JSON.stringify(section(result, 'principal'))).toContain('Hold Friday afternoon for the kids.');
 });
 
 it('does not prune a write that bounded output did not show', async () => {
