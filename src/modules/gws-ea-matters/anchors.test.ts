@@ -168,6 +168,24 @@ describe('local task anchors through the native matters loop and core recurrence
     },
   );
 
+  it('keeps the later first run main gave a daily series, without a re-time', async () => {
+    const session = await mainSession();
+    await createScheduledTask(
+      MAIN,
+      prepareScheduledTask({
+        name: 'daily from later',
+        prompt: 'Morgan’s reminder.',
+        processAfter: '2032-11-20T09:00-08:00',
+        recurrence: '0 9 * * *',
+        timezone: HOME,
+      }),
+      { id: 'daily-from-later', session },
+    );
+    await keepMattersOnTime();
+    expect(await at('daily-from-later')).toBe('2032-11-20T17:00:00.000Z');
+    expect(await retimeNotes('daily-from-later')).toEqual([]);
+  });
+
   it('keeps a time written in UTC at its instant, read on the clock in effect then', async () => {
     const id = await task('utc-reminder', '2032-11-05T17:00:00Z');
     await keepMattersOnTime();
@@ -475,7 +493,7 @@ describe('local task anchors through the native matters loop and core recurrence
     expect(await at(id)).toBe('2032-11-02T08:00:00.000Z');
   });
 
-  it('forgets an anchor once its series has nothing left to run or report, and not while a re-arm is due', async () => {
+  it('forgets an anchor once its series has nothing left to run, and not while a re-arm is due', async () => {
     const session = await mainSession();
     const once = await task('one-off-done', '2032-11-03T09:00');
     const daily = await repeating('daily-kept', '0 9 * * *');

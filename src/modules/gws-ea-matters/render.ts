@@ -14,8 +14,7 @@ import { withExistingMailboxSession } from '../../session-manager.js';
 import { formatLocalTime } from '../../timezone.js';
 import { getMainAgentGroupId } from '../gws-ea-profile/db.js';
 import { loadTimeline, zoneAt, type Timeline } from '../gws-ea-whereabouts/timeline.js';
-import { dateString, wallClock } from '../gws-ea-whereabouts/clock.js';
-import { getTimeAnchor, retimeAnchor } from './anchors.js';
+import { afterRun, getTimeAnchor, retimeAnchor } from './anchors.js';
 import { matterPlanningLines } from './planning.js';
 import { getMatter, type Matter, type OpenMatterSummary } from './db.js';
 import { hostSources, loadLens, readLinks, type Lens, type LiveSources } from './live.js';
@@ -46,12 +45,8 @@ export async function readNextLook(taskId: string, timeline: Timeline): Promise<
     if (task.recurrence === null) return undefined;
     const timezone = zoneAt(timeline, Date.now()) ?? TIMEZONE;
     const anchor = await getTimeAnchor(session.id, task.seriesId ?? task.id);
-    const runWall = anchor ? wallClock(Date.parse(task.processAfter), anchor.appliedZone) : null;
-    const lastLocalRun = runWall
-      ? `${dateString(runWall)}T${String(runWall.hour).padStart(2, '0')}:${String(runWall.minute).padStart(2, '0')}:${String(runWall.second).padStart(2, '0')}`
-      : null;
     const next = anchor
-      ? retimeAnchor({ ...anchor, lastRun: task.processAfter, lastLocalRun }, timeline, Date.now())?.at
+      ? retimeAnchor(afterRun(anchor, task.processAfter), timeline, Date.now())?.at
       : CronExpressionParser.parse(task.recurrence, { tz: timezone }).next().toISOString();
     return next == null ? undefined : { at: next, repeats: task.recurrence, paused };
   }
