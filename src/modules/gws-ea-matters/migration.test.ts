@@ -65,11 +65,14 @@ function schemaOf(db: DbDriver): SchemaEntry[] {
 }
 
 describe('the matters migrations', () => {
-  it('create matters and extend their native links with browser jobs and chats', () => {
+  it('create matters and extend links and planning facts', () => {
     expect(mattersMigrations().map((migration) => migration.name)).toEqual([
       CREATE_MATTERS,
       'module:gws-ea-matters:browser-jobs',
       'module:gws-ea-matters:chat-links',
+      'module:gws-ea-matters:planning-facts',
+      'module:gws-ea-matters:time-anchors',
+      'module:gws-ea-matters:close-and-morning',
     ]);
   });
 
@@ -82,9 +85,13 @@ describe('the matters migrations', () => {
     for (const banned of BANNED_PORTABLE_SQL) expect(source, String(banned)).not.toMatch(banned);
   });
 
-  it('leave the two tables and the indexes that keep them, and nothing else', async () => {
+  it('leave the matter and clock tables and the indexes that keep them', async () => {
     const declared = schemaOf(await freshInstall()).filter(
-      (entry) => entry.tbl_name.startsWith('gws_ea_matter') && entry.sql !== null,
+      (entry) =>
+        (entry.tbl_name.startsWith('gws_ea_matter') ||
+          entry.tbl_name.startsWith('gws_ea_morning_') ||
+          entry.tbl_name === 'gws_ea_time_anchors') &&
+        entry.sql !== null,
     );
     expect(declared.map((entry) => `${entry.type} ${entry.name}`)).toEqual([
       'index idx_gws_ea_matter_links_one_open_matter',
@@ -92,6 +99,9 @@ describe('the matters migrations', () => {
       'index idx_gws_ea_matters_parent',
       'table gws_ea_matter_links',
       'table gws_ea_matters',
+      'table gws_ea_morning_decisions',
+      'table gws_ea_morning_looks',
+      'table gws_ea_time_anchors',
     ]);
   });
 

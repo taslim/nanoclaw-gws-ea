@@ -89,7 +89,8 @@ export async function mattersToRewrite(person: PersonToForget): Promise<string[]
     readonly title: string;
     readonly open_loop: string;
     readonly outcome: string | null;
-  }>('SELECT id, title, open_loop, outcome FROM gws_ea_matters ORDER BY created_at, id');
+    readonly place: string | null;
+  }>('SELECT id, title, open_loop, outcome, place FROM gws_ea_matters ORDER BY created_at, id');
 
   const named = new Set<string>();
   for (const link of links) {
@@ -100,7 +101,11 @@ export async function mattersToRewrite(person: PersonToForget): Promise<string[]
     if (theirs) named.add(link.matter_id);
   }
   for (const matter of matters) {
-    if ([matter.title, matter.open_loop, matter.outcome].some((text) => text !== null && mayNamePerson(person, text))) {
+    if (
+      [matter.title, matter.open_loop, matter.outcome, matter.place].some(
+        (text) => text !== null && mayNamePerson(person, text),
+      )
+    ) {
       named.add(matter.id);
     }
   }

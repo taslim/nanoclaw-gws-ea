@@ -663,7 +663,7 @@ it('skips only the site whose principal timezone read failed mid-tick, and check
   await arm('a', 'same');
   await arm('b', 'same', 4, 1, 'opentable.com');
   const armedAt = new Date().toISOString();
-  const read = vi.spyOn(profile, 'principalNameAndTimezone');
+  const read = vi.spyOn(profile, 'getGwsEaProfile');
   read.mockRejectedValueOnce(new Error('Profile unavailable'));
   const { scheduler, checks } = countingScheduler();
   await expect(scheduler.tick()).rejects.toThrow('Profile unavailable');

@@ -10,6 +10,8 @@ import fs from 'fs';
 import path from 'path';
 import Database from 'better-sqlite3';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import '../gws-ea-whereabouts/index.js';
+import { addStay } from '../gws-ea-whereabouts/db.js';
 
 const TEST_DIR = '/tmp/nanoclaw-test-gws-ea-outbound';
 /** Beside the data directory, never in it. */
@@ -69,12 +71,14 @@ import {
   teardownChannelAdapters,
 } from '../../channels/channel-registry.js';
 import type { ResponseFrame } from '../../cli/frame.js';
+import { TIMEZONE } from '../../config.js';
 import { getDb } from '../../db/connection.js';
 import { closeDb, createAgentGroup, createMessagingGroup, initTestDb, runMigrations } from '../../db/index.js';
 import { findSessionForAgent } from '../../db/sessions.js';
 import { deliverSessionMessages, getDeliveryAction, setDeliveryAdapter } from '../../delivery.js';
 import { inboundDbPath, outboundDbPath } from '../../mailbox/sqlite/paths.js';
 import { routeInbound } from '../../router.js';
+import { formatLocalTime } from '../../timezone.js';
 import { resolveSession, sessionDir } from '../../session-manager.js';
 import type { Session } from '../../types.js';
 import '../permissions/index.js';
@@ -367,7 +371,6 @@ async function startInbox(): Promise<void> {
       subscribe: async () => undefined,
       unsubscribe: async () => undefined,
     },
-    events: { getEvent: async () => undefined },
     drive,
     sleep: async () => undefined,
   });
@@ -606,6 +609,30 @@ afterEach(async () => {
 // ---------------------------------------------------------------------------
 
 describe("external-email's reply", () => {
+  it('dates the quoted message on the install clock, whatever stay the principal is on', async () => {
+    const trip = TIMEZONE === 'Asia/Tokyo' ? 'Pacific/Auckland' : 'Asia/Tokyo';
+    await addStay({
+      locality: 'Away',
+      zone: trip,
+      start: '2026-01-01',
+      end: '2036-01-01',
+      source: 'said',
+      certainty: 'certain',
+    });
+    const id = gmail.receive({
+      threadId: 'g-trip',
+      from: `Sam <${SAM}>`,
+      messageId: '<s-trip@acme.example>',
+      body: 'Can Pat meet next week?',
+    });
+    await inbox.tick();
+    const key = await threadOf('g-trip');
+    await reply(await threadSession(key), key, 'Thursday at 10 works for Pat.');
+    const sentAt = new Date(Number(gmail.messages.get(id)?.internalDate)).toISOString();
+    expect(formatLocalTime(sentAt, trip)).not.toBe(formatLocalTime(sentAt, TIMEZONE));
+    expect(gmail.sent[0]?.text).toContain(`On ${formatLocalTime(sentAt, TIMEZONE)}, Sam <${SAM}> wrote:`);
+  });
+
   it('goes to everyone the latest message placed, quoting it, and never touches a principal-only note', async () => {
     const { key, session } = await arrives({
       threadId: 'g-coffee',

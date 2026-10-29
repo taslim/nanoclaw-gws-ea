@@ -10,8 +10,7 @@
  * (src/modules/gws-ea-meetings/principal-events.ts). Whether a time is
  * free and who the principal meets are counted by the host from every page
  * of their calendars (src/modules/gws-ea-meetings/calendar-facts.ts), so no
- * model copies events to count them. Everything else on the calendar stays
- * with gog, as the gcalendar skill teaches.
+ * model copies events to count them. Calendar reads and changes stay on the host.
  */
 import { requestTool } from '../action-request.js';
 import { registerTools } from './server.js';
@@ -28,7 +27,7 @@ const CALENDAR = {
 } as const;
 const EVENT = {
   type: 'string',
-  description: "The event's id, as gog calendar events gives it: an occurrence's own id changes that one alone.",
+  description: "The event's id, as days gives it: an occurrence's own id changes that one alone.",
 } as const;
 const ADDRESSES = { type: 'array', items: { type: 'string' } } as const;
 const DATE_TIME = 'a date and time with its UTC offset, as time_resolve gives it, such as 2026-10-12T09:00:00-07:00';
@@ -47,7 +46,11 @@ export const createEvent = requestTool({
     start: { type: 'string', description: `When it starts: ${DATE_TIME}. For an all-day event, its first day.` },
     end: { type: 'string', description: `When it ends: ${DATE_TIME}. For an all-day event, its last day.` },
     all_day: { type: 'boolean', description: 'true for an all-day event, with start and end as dates (2026-10-12).' },
-    timezone: { type: 'string', description: "The IANA zone its times show in; the principal's when left out." },
+    timezone: {
+      type: 'string',
+      description:
+        'The IANA zone its times show in; when left out, the local clock where the principal will be that day.',
+    },
     notes: { type: 'string', description: 'Its description.' },
     location: { type: 'string', description: 'Where it is: an address, a phone number, or a link.' },
     guests: { ...ADDRESSES, description: 'Email addresses of other people to invite (up to 50).' },
@@ -58,6 +61,17 @@ export const createEvent = requestTool({
       description: 'How it repeats, as RRULE lines, such as RRULE:FREQ=WEEKLY;BYDAY=MO.',
     },
     video_call: { type: 'boolean', description: 'true to add a Google Meet link.' },
+    kind: {
+      type: 'string',
+      description: 'The meeting kind you choose; its recorded length is returned without inferring one.',
+    },
+    parent_event: EVENT,
+    parent_calendar: CALENDAR,
+    parent_start: {
+      type: 'string',
+      description: 'The parent event’s observed start, for detecting linked blocks left behind after a move.',
+    },
+    block_kind: { type: 'string', description: 'Kind of linked block, such as prep, travel, preflight, work or hold.' },
     matter: MATTER,
   },
   required: ['calendar', 'title', 'start', 'end'],
@@ -103,23 +117,6 @@ export const respondToEvent = requestTool({
   timeoutMs: CALENDAR_REQUEST_TIMEOUT_MS,
 });
 
-export const findConflicts = requestTool({
-  name: 'find_conflicts',
-  description:
-    "Every meeting or busy block on the principal's calendars that overlaps a time, read from all their calendars by the host: overlaps on one calendar too, all-day events and free/busy-only or hidden blocks included; cancelled and free events and ones they declined left out. Every block listed takes the principal's time from its start to its end, one their calendar shows with no details as much as a titled meeting. Pass candidate_ical_uid to leave out the invitation or event being checked. Each comes with a label ready to write; titles come wrapped as untrusted text.",
-  properties: {
-    start: { type: 'string', description: `The time's start: ${DATE_TIME}.` },
-    end: { type: 'string', description: `Its end: ${DATE_TIME}. At most 14 days after start.` },
-    candidate_ical_uid: {
-      type: 'string',
-      description: 'The iCalUID of the invitation or event being checked, when it is already on a calendar.',
-    },
-  },
-  required: ['start', 'end'],
-  repeatable: true,
-  timeoutMs: CALENDAR_REQUEST_TIMEOUT_MS,
-});
-
 export const peopleStats = requestTool({
   name: 'people_stats',
   description:
@@ -132,4 +129,105 @@ export const peopleStats = requestTool({
   timeoutMs: CALENDAR_REQUEST_TIMEOUT_MS,
 });
 
-registerTools([createEvent, changeGuests, respondToEvent, findConflicts, peopleStats], CALENDAR_CAPABILITY);
+export const days = requestTool({
+  name: 'days',
+  description:
+    'Read the principal’s days on the clock in effect at each event, with places, creators, organizer and guest responses. Copies across calendars are folded and all-day ends are inclusive. Read one event with calendar and event; filter by text. Export writes bounded text fields to this session’s inbox and returns its path and event count.',
+  properties: {
+    start: { type: 'string', description: 'First local date (YYYY-MM-DD) or instant with offset; today when omitted.' },
+    end: {
+      type: 'string',
+      description: 'Last local date, included, or exclusive instant with offset; eight local days when omitted.',
+    },
+    calendar: CALENDAR,
+    event: EVENT,
+    filter: { type: 'string', description: 'Text to match in title, notes or location.' },
+    export: { type: 'boolean', description: 'Write the complete range as a text file in your session inbox.' },
+  },
+  required: [],
+  repeatable: true,
+  timeoutMs: CALENDAR_REQUEST_TIMEOUT_MS,
+});
+export const check = requestTool({
+  name: 'check',
+  description:
+    'Check a proposed time or move without booking or changing anything. Leads with who it affects, organizer, guest responses and people named without invitations, then the principal’s relationship/history and recorded meeting lengths, and findings for the touched days. Pass calendars to read colleagues’ busy windows without event details.',
+  properties: {
+    start: { type: 'string', description: DATE_TIME },
+    end: { type: 'string', description: DATE_TIME },
+    calendar: CALENDAR,
+    event: EVENT,
+    title: { type: 'string', description: 'The proposed meeting’s title.' },
+    location: { type: 'string', description: 'Proposed place, phone number or link.' },
+    guests: { ...ADDRESSES, description: 'The proposed guests’ email addresses.' },
+    calendars: {
+      ...ADDRESSES,
+      description: 'Colleague calendar IDs whose busy windows to read instead of checking principal event details.',
+    },
+    kind: { type: 'string', description: 'The meeting kind you choose; never inferred by the host.' },
+  },
+  required: ['start', 'end'],
+  repeatable: true,
+  timeoutMs: CALENDAR_REQUEST_TIMEOUT_MS,
+});
+const SEND_UPDATES = {
+  type: 'string',
+  enum: ['all', 'none'],
+  description:
+    'Your choice: all asks Google to notify guests; none sends no Google updates. The answer states who was notified.',
+} as const;
+const SCOPE = {
+  type: 'string',
+  enum: ['event', 'following'],
+  description:
+    'event changes the supplied event or single occurrence; following changes that occurrence and all after it by splitting the series.',
+} as const;
+export const changeEvent = requestTool({
+  name: 'change_event',
+  description:
+    'Move or edit an event on a principal calendar or your own, conditioned on the version read. Fields omitted stay unchanged. Reports who it affects, who organizes it, Google’s outcome and your guest-update choice, then best-effort findings for both old and new days. People named without invitations are reported as information; the host sends no separate contact.',
+  properties: {
+    calendar: CALENDAR,
+    event: EVENT,
+    send_updates: SEND_UPDATES,
+    scope: SCOPE,
+    title: { type: 'string', description: 'New title.' },
+    start: { type: 'string', description: `New start: ${DATE_TIME}; for all-day events, first date.` },
+    end: { type: 'string', description: `New end: ${DATE_TIME}; for all-day events, last date, included.` },
+    all_day: { type: 'boolean' },
+    timezone: { type: 'string' },
+    notes: { type: 'string', description: 'New notes; empty clears.' },
+    location: { type: 'string', description: 'New location; empty clears.' },
+    guests: {
+      ...ADDRESSES,
+      description: 'The full guest list to keep, with the calendar owner retained and existing responses preserved.',
+    },
+    free: { type: 'boolean' },
+    private: { type: 'boolean' },
+    recurrence: ADDRESSES,
+    video_call: { type: 'boolean' },
+    reminders: { type: 'string', enum: ['default', 'none'] },
+    kind: { type: 'string' },
+    matter: MATTER,
+    parent_event: EVENT,
+    parent_calendar: CALENDAR,
+    parent_start: { type: 'string' },
+    block_kind: { type: 'string' },
+  },
+  required: ['calendar', 'event', 'send_updates'],
+  repeatable: true,
+  timeoutMs: CALENDAR_REQUEST_TIMEOUT_MS,
+});
+export const cancelEvent = requestTool({
+  name: 'cancel_event',
+  description:
+    'Cancel an event or one occurrence and optionally all following, over the version read, choosing whether Google notifies guests. For another organizer’s event, reports the effect on the principal’s copy and that respond_to_event declines it and tells the organizer. Returns its outcome followed by findings; no separate contact is sent.',
+  properties: { calendar: CALENDAR, event: EVENT, send_updates: SEND_UPDATES, scope: SCOPE },
+  required: ['calendar', 'event', 'send_updates'],
+  repeatable: true,
+  timeoutMs: CALENDAR_REQUEST_TIMEOUT_MS,
+});
+registerTools(
+  [createEvent, changeGuests, respondToEvent, days, check, changeEvent, cancelEvent, peopleStats],
+  CALENDAR_CAPABILITY,
+);

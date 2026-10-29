@@ -44,6 +44,41 @@ const WRITE = {
 };
 
 describe('the Calendar client', () => {
+  it('reads every page of locations on the host without requesting or retaining titles, descriptions or names', async () => {
+    const { api, requests } = stubGoogle((request) => ({
+      status: 200,
+      body: {
+        items: [
+          {
+            id: request.url.searchParams.has('pageToken') ? 'second' : 'first',
+            location: 'Remy’s office',
+            summary: 'Private title',
+            description: 'Private notes',
+            attendees: [{ email: 'juno.hale@outside.example', displayName: 'Private record name' }],
+            start: { dateTime: '2026-11-12T18:00:00Z' },
+            end: { dateTime: '2026-11-12T19:00:00Z' },
+          },
+        ],
+        ...(request.url.searchParams.has('pageToken') ? {} : { nextPageToken: 'next' }),
+      },
+    }));
+    const listed = await api.listLocatedEvents(
+      'morgan@principal.example',
+      '2026-11-12T00:00:00Z',
+      '2026-11-13T00:00:00Z',
+    );
+    expect(listed.map((event) => ({ id: event.id, location: event.location }))).toEqual([
+      { id: 'first', location: 'Remy’s office' },
+      { id: 'second', location: 'Remy’s office' },
+    ]);
+    expect(JSON.stringify(listed)).not.toMatch(/Private title|Private notes|Private record name/u);
+    for (const request of requests) {
+      const fields = request.url.searchParams.get('fields');
+      expect(fields).toContain('location');
+      expect(fields).not.toMatch(/summary|description|displayName/u);
+    }
+  });
+
   it('creates an event with its own id, its tags, and its guests with the answers given, asking for nothing back but the id', async () => {
     const { api, requests } = stubGoogle(() => ({ status: 200, body: { id: 'abc123' } }));
     expect(await api.insertEvent('pat@principal.example', 'abc123', WRITE, 'all')).toBe('created');
@@ -443,4 +478,191 @@ describe('the Calendar client', () => {
     expect(await api.getGuests('pat@principal.example', 'missing')).toBeUndefined();
     expect(await api.getGuests('pat@principal.example', 'deleted')).toBeUndefined();
   });
+});
+
+it('reads planning detail fields only on the main detail route', async () => {
+  const raw = {
+    id: 'e',
+    etag: 'v1',
+    summary: 'Lunch',
+    description: 'Menu',
+    location: 'Mission restaurant',
+    creator: { email: 'Juno@Hale.example', displayName: 'Juno Hale' },
+    start: { dateTime: '2026-10-06T09:00:00+02:00', timeZone: 'Europe/Brussels' },
+    end: { dateTime: '2026-10-06T10:00:00+02:00', timeZone: 'Europe/Brussels' },
+    eventType: 'default',
+    extendedProperties: { private: { gws_ea_parent_event: 'p' } },
+    conferenceData: { entryPoints: [{ entryPointType: 'video', uri: 'https://meet.google.com/abc' }] },
+  };
+  const { api, requests } = stubGoogle(() => ({ status: 200, body: { items: [raw] } }));
+  expect((await api.listEventDetails('c', '2026-10-06T00:00Z', '2026-10-07T00:00Z'))[0]).toMatchObject({
+    etag: 'v1',
+    description: 'Menu',
+    location: 'Mission restaurant',
+    creator: { email: 'juno@hale.example', displayName: 'Juno Hale' },
+    start: { timeZone: 'Europe/Brussels' },
+    end: { timeZone: 'Europe/Brussels' },
+    eventType: 'default',
+    tags: { gws_ea_parent_event: 'p' },
+    conference: { uri: 'https://meet.google.com/abc' },
+  });
+  const outside = (await api.listEvents('c', '2026-10-06T00:00Z', '2026-10-07T00:00Z'))[0];
+  expect(outside).not.toHaveProperty('summary');
+  expect(outside).not.toHaveProperty('location');
+  expect(requests[1].url.searchParams.get('fields')).not.toContain('description');
+});
+
+it('keeps telephone conference entry points on the detail route', async () => {
+  const { api } = stubGoogle(() => ({
+    status: 200,
+    body: {
+      items: [
+        {
+          id: 'e',
+          conferenceData: {
+            conferenceId: 'call',
+            entryPoints: [{ entryPointType: 'phone', uri: 'tel:+14155550100', label: 'US dial-in' }],
+          },
+        },
+      ],
+    },
+  }));
+  expect((await api.listEventDetails('c', '2026-10-06T00:00Z', '2026-10-07T00:00Z'))[0]).toMatchObject({
+    conference: {
+      status: 'success',
+      entryPoints: [{ entryPointType: 'phone', uri: 'tel:+14155550100', label: 'US dial-in' }],
+    },
+  });
+});
+
+it('round-trips existing conference data, custom reminders and restricted guest controls through the Calendar wire', async () => {
+  const conferenceData = {
+    conferenceId: 'existing-meet',
+    conferenceSolution: { key: { type: 'hangoutsMeet' }, name: 'Google Meet' },
+    entryPoints: [
+      { entryPointType: 'video', uri: 'https://meet.google.com/existing-meet' },
+      { entryPointType: 'phone', uri: 'tel:+14155550100', pin: '123456' },
+    ],
+    signature: 'existing-signature',
+    notes: 'Existing dial-in details',
+  };
+  const reminders = {
+    useDefault: false,
+    overrides: [
+      { method: 'popup', minutes: 17 },
+      { method: 'email', minutes: 90 },
+    ],
+  };
+  const raw = {
+    id: 'original',
+    visibility: 'private',
+    transparency: 'transparent',
+    guestsCanModify: false,
+    guestsCanInviteOthers: false,
+    guestsCanSeeOtherGuests: false,
+    reminders,
+    conferenceData: {
+      ...conferenceData,
+      createRequest: { requestId: 'original-request', status: { statusCode: 'success' } },
+    },
+    colorId: '7',
+    source: { title: 'Source invitation', url: 'https://example.test/meeting' },
+    extendedProperties: { private: { own: 'kept' }, shared: { conference: 'kept' } },
+  };
+  const { api, requests } = stubGoogle((request) => ({
+    status: 200,
+    body: request.method === 'GET' ? raw : { id: 'following' },
+  }));
+  const original = await api.getEventDetail('morgan@ellery.example', 'original');
+  if (!original) throw new Error('Original event missing');
+  await api.insertEvent(
+    'morgan@ellery.example',
+    'following',
+    {
+      start: '2026-10-16T17:00:00Z',
+      end: '2026-10-16T17:30:00Z',
+      visibility: 'private',
+      transparency: 'transparent',
+      guestsCanModify: original.guestsCanModify,
+      guestsCanInviteOthers: original.guestsCanInviteOthers,
+      guestsCanSeeOtherGuests: original.guestsCanSeeOtherGuests,
+      reminders: original.reminders,
+      reminderOverrides: original.reminderOverrides,
+      conferenceData: original.conferenceData,
+      colorId: original.colorId,
+      source: original.source,
+      tags: original.tags,
+      sharedTags: original.sharedTags,
+    },
+    'none',
+  );
+  expect(requests[0].url.searchParams.get('fields')).toContain('conferenceData');
+  expect(requests[1].url.searchParams.get('conferenceDataVersion')).toBe('1');
+  expect(requests[1].body).toEqual({
+    id: 'following',
+    start: { dateTime: '2026-10-16T17:00:00Z' },
+    end: { dateTime: '2026-10-16T17:30:00Z' },
+    visibility: 'private',
+    transparency: 'transparent',
+    guestsCanModify: false,
+    guestsCanInviteOthers: false,
+    guestsCanSeeOtherGuests: false,
+    reminders,
+    conferenceData,
+    colorId: '7',
+    source: raw.source,
+    extendedProperties: raw.extendedProperties,
+  });
+  expect(await api.getEvent('morgan@ellery.example', 'original')).not.toHaveProperty('conferenceData');
+  expect(await api.getEvent('morgan@ellery.example', 'original')).not.toHaveProperty('reminderOverrides');
+});
+
+it('reads one main-only detail with its creator and recurrence, keeping the outward getter title-free', async () => {
+  const { api, requests } = stubGoogle(() => ({
+    status: 200,
+    body: {
+      id: 'abc123',
+      summary: 'Call with Remy',
+      creator: { email: 'juno@ellery.example', displayName: 'Juno Hale' },
+      recurrence: ['RRULE:FREQ=WEEKLY;COUNT=10'],
+      start: { dateTime: '2026-10-05T16:00:00Z' },
+      end: { dateTime: '2026-10-05T16:30:00Z' },
+    },
+  }));
+  expect(await api.getEventDetail('morgan@ellery.example', 'abc123')).toMatchObject({
+    summary: 'Call with Remy',
+    creator: { displayName: 'Juno Hale' },
+    recurrence: ['RRULE:FREQ=WEEKLY;COUNT=10'],
+  });
+  expect(await api.getEvent('morgan@ellery.example', 'abc123')).not.toHaveProperty('summary');
+  expect(requests[0].url.searchParams.get('fields')).toContain('creator');
+  expect(requests[1].url.searchParams.get('fields')).not.toContain('summary');
+});
+
+it('reads colleague busy windows and fails an incomplete freebusy answer rather than reporting free time', async () => {
+  const { api, requests } = stubGoogle(() => ({
+    status: 200,
+    body: {
+      calendars: {
+        'remy@ellery.example': { busy: [{ start: '2026-10-05T16:00:00Z', end: '2026-10-05T17:00:00Z' }] },
+      },
+    },
+  }));
+  expect(await api.freeBusy(['remy@ellery.example'], '2026-10-05T00:00:00Z', '2026-10-06T00:00:00Z')).toEqual({
+    'remy@ellery.example': [{ start: '2026-10-05T16:00:00Z', end: '2026-10-05T17:00:00Z' }],
+  });
+  expect(requests[0]).toMatchObject({ method: 'POST', body: { items: [{ id: 'remy@ellery.example' }] } });
+  await expect(
+    api.freeBusy(['unknown@ellery.example'], '2026-10-05T00:00:00Z', '2026-10-06T00:00:00Z'),
+  ).rejects.toThrow(/busy/i);
+});
+
+it('does not report availability when Google gives a busy interval with an unreadable end', async () => {
+  const { api } = stubGoogle(() => ({
+    status: 200,
+    body: { calendars: { 'remy@ellery.example': { busy: [{ start: '2026-10-05T16:00:00Z', end: 'not-a-time' }] } } },
+  }));
+  await expect(api.freeBusy(['remy@ellery.example'], '2026-10-05T00:00:00Z', '2026-10-06T00:00:00Z')).rejects.toThrow(
+    /unreadable busy-time window/,
+  );
 });

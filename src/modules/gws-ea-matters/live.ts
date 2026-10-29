@@ -26,6 +26,8 @@
  * neither name nor address. What someone else wrote, another agent's account
  * included, reaches `main` framed as untrusted.
  */
+import { TIMEZONE } from '../../config.js';
+import { zoneAt, type Timeline } from '../gws-ea-whereabouts/timeline.js';
 import { log } from '../../log.js';
 import { formatLocalTime } from '../../timezone.js';
 import { GOOGLE_CONNECTION_DOWN_TEXT, isGoogleConnectionDown } from '../gws-ea-google/agent-boundary.js';
@@ -103,21 +105,27 @@ export function hostSources(): LiveSources {
 /** Read once for a render. */
 export interface Lens {
   readonly timezone: string;
+  readonly timeline: Timeline;
   readonly principalName: string;
   readonly principal: PrincipalRecognizer;
   readonly assistant: ReadonlySet<string>;
   readonly isForgotten: (handle: string) => boolean;
 }
 
-export async function loadLens(timezone: string): Promise<Lens> {
+export async function loadLens(timeline: Timeline): Promise<Lens> {
   const profile = await getGwsEaProfile();
   return {
-    timezone,
+    timeline,
+    timezone: zoneAt(timeline, Date.now()) ?? TIMEZONE,
     principalName: profile.principal_display_name ?? 'the principal',
     principal: principalRecognizer(profile.principal_emails),
     assistant: assistantAddressesOf(profile),
     isForgotten: await loadForgottenMatcher(),
   };
+}
+
+export function lensZoneAt(lens: Lens, at: string): string {
+  return zoneAt(lens.timeline, Date.parse(at)) ?? lens.timezone;
 }
 
 /** Someone, by an address Google gave, in the host's own words. */
@@ -181,7 +189,9 @@ async function threadState(threadKey: string, gmail: LiveSources['gmail'], lens:
 
   const mail = parseGmailMessage(latest);
   const at = mail.receivedAt ?? new Date(headerValues(mail.headers, 'Date')[0] ?? '');
-  const when = Number.isNaN(at.getTime()) ? 'latest' : `latest ${formatLocalTime(at.toISOString(), lens.timezone)}`;
+  const when = Number.isNaN(at.getTime())
+    ? 'latest'
+    : `latest ${formatLocalTime(at.toISOString(), lensZoneAt(lens, at.toISOString()))}`;
   const fromAsWritten = oneLine(decodeEncodedWords(headerValues(mail.headers, 'From').join(', ')));
   const written = parseAddressList(fromAsWritten) ?? [];
   if (written.some(({ address }) => lens.isForgotten(`email:${address}`))) {
@@ -217,12 +227,15 @@ function day(date: string): string {
 }
 
 /** In the principal's zone: an end on the same day by its time alone; an all-day event by its days. */
-function eventTime(start: EventTime | undefined, end: EventTime | undefined, timezone: string): string | undefined {
+function eventTime(start: EventTime | undefined, end: EventTime | undefined, lens: Lens): string | undefined {
   if (start?.dateTime !== undefined) {
+    const timezone = lensZoneAt(lens, start.dateTime);
     const from = formatLocalTime(start.dateTime, timezone);
     if (end?.dateTime === undefined) return from;
     // "Oct 14, 2026, 4:00 PM": the day, then after its last comma the time.
-    const to = formatLocalTime(end.dateTime, timezone);
+    const endZone = lensZoneAt(lens, end.dateTime);
+    const to = formatLocalTime(end.dateTime, endZone);
+    if (endZone !== timezone) return `${from} (${timezone}) to ${to} (${endZone})`;
     const cut = to.lastIndexOf(', ');
     const sameDay = from.slice(0, from.lastIndexOf(', ')) === to.slice(0, cut);
     return `${from} to ${sameDay ? to.slice(cut + 2) : to}`;
@@ -264,7 +277,7 @@ async function eventState(reference: string, calendar: LiveSources['calendar'], 
   const slash = reference.indexOf('/');
   const event = await calendar.getEvent(reference.slice(0, slash), reference.slice(slash + 1));
   if (event === undefined) return { line: 'not on the calendar' };
-  const time = eventTime(event.start, event.end, lens.timezone);
+  const time = eventTime(event.start, event.end, lens);
   const parts = time === undefined ? [] : [time];
   if (event.status === 'cancelled') return { line: [...parts, 'cancelled'].join('; ') };
   if (event.status === 'confirmed' || event.status === 'tentative') parts.push(event.status);
@@ -300,7 +313,7 @@ function forAssistant(comments: readonly DriveComment[], assistant: ReadonlySet<
 
 async function changed(file: DriveFile, lens: Lens): Promise<string[]> {
   if (file.modifiedTime === undefined) return [];
-  const at = formatLocalTime(file.modifiedTime, lens.timezone);
+  const at = formatLocalTime(file.modifiedTime, lensZoneAt(lens, file.modifiedTime));
   const by = file.lastModifyingUser?.emailAddress;
   return [by === undefined ? `changed ${at}` : `changed ${at} by ${await who(by, lens)}`];
 }
@@ -324,7 +337,7 @@ async function fileState(fileId: string, drive: LiveSources['drive'], lens: Lens
       open.length === 0
         ? 'no open comments for the assistant'
         : `${open.length} open comment${open.length === 1 ? '' : 's'} for the assistant` +
-            (latest === undefined ? '' : `, the latest ${formatLocalTime(latest, lens.timezone)}`),
+            (latest === undefined ? '' : `, the latest ${formatLocalTime(latest, lensZoneAt(lens, latest))}`),
     );
   }
   const said = [
@@ -389,7 +402,7 @@ async function linkState(link: MatterLink, sources: LiveSources, lens: Lens): Pr
           line: `${view.state}${held}${signIn}${card}${unconfirmed}`,
           ...(view.last_report
             ? {
-                framed: `  Last report ${formatLocalTime(view.last_report.at, lens.timezone)}:\n${untrusted(view.last_report.text, FRAME_LIMIT, 'browser')}`,
+                framed: `  Last report ${formatLocalTime(view.last_report.at, lensZoneAt(lens, view.last_report.at))}:\n${untrusted(view.last_report.text, FRAME_LIMIT, 'browser')}`,
               }
             : {}),
         };
@@ -419,7 +432,7 @@ async function handlerLines(link: MatterLink, sources: LiveSources, lens: Lens):
     return link.account === undefined
       ? [handled]
       : [
-          `${handled}; its account, ${formatLocalTime(link.account.at, lens.timezone)}:`,
+          `${handled}; its account, ${formatLocalTime(link.account.at, lensZoneAt(lens, link.account.at))}:`,
           untrusted(link.account.text, CHAT_ACCOUNT_MAX, link.handler),
         ];
   }
@@ -429,7 +442,7 @@ async function handlerLines(link: MatterLink, sources: LiveSources, lens: Lens):
   if (!account.ok) return [`${handled}; its account: ${UNREAD}`];
   if (account.value === undefined) return [handled];
   return [
-    `${handled}; its account, ${formatLocalTime(account.value.at, lens.timezone)}:`,
+    `${handled}; its account, ${formatLocalTime(account.value.at, lensZoneAt(lens, account.value.at))}:`,
     untrusted(account.value.text, THREAD_ACCOUNT_MAX, link.handler),
   ];
 }

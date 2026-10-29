@@ -81,7 +81,7 @@ import { type BrowserQueue, registerBrowserActionDelivery } from './queue.js';
 import type { BrowserExecutionContext, BrowserQueuedAction } from './actions.js';
 import { evidenceMatchesAttempt, reconcilePurchaseAttempt } from './reconciliation.js';
 import { deriveReservationGuaranteeAuthority } from './reservation-guarantee.js';
-import { principalClock } from './watch-policy.js';
+import { principalClock, loadPrincipalClock, type PrincipalClock } from './watch-policy.js';
 import { assistantWebAddress } from './web-address.js';
 
 export const PURCHASE_APPROVAL = 'browser_purchase';
@@ -228,21 +228,22 @@ export function validatePurchaseRequest(content: Record<string, unknown>): Recor
   };
 }
 /** A date-only needed-by is the end of that day on the principal's clock. */
-export function purchaseBounds(payload: Record<string, unknown>, principalTimeZone: string): PurchaseBounds {
-  return {
+export function purchaseBounds(payload: Record<string, unknown>, clock: PrincipalClock): PurchaseBounds {
+  const bounds: PurchaseBounds = {
     ...(isRecord(payload.delivery_window)
       ? { deliveryWindow: payload.delivery_window as { start: string; end: string } }
       : {}),
-    ...(typeof payload.needed_by === 'string'
-      ? {
-          neededBy: new Date(
-            payload.needed_by.length === 10
-              ? zonedInstant(`${payload.needed_by}T23:59:59.999`, principalTimeZone)
-              : Date.parse(payload.needed_by),
-          ).toISOString(),
-          principalTimeZone,
-        }
-      : {}),
+  };
+  if (typeof payload.needed_by !== 'string') return bounds;
+  const principalTimeZone = clock(payload.needed_by);
+  return {
+    ...bounds,
+    neededBy: new Date(
+      payload.needed_by.length === 10
+        ? zonedInstant(`${payload.needed_by}T23:59:59.999`, principalTimeZone)
+        : Date.parse(payload.needed_by),
+    ).toISOString(),
+    principalTimeZone,
   };
 }
 
@@ -356,7 +357,7 @@ async function requestPurchaseCard(
   await context.wakeWaiters(detached.waitingJobs, `superseded-${id}`);
   await finishPurchaseCardWithdrawals(detached.cards, purchaseCardWithdrawal());
   const earlier = { unresolved: exceptions.length, recordedNotPlaced: detached.recorded };
-  const question = renderPurchaseCard(facts, bounds, earlier, await principalClock(), change, {
+  const question = renderPurchaseCard(facts, bounds, earlier, await loadPrincipalClock(), change, {
     alias: await assistantWebAddress(),
   });
   const approvalId = await requestApproval({
@@ -1071,7 +1072,7 @@ export async function executeBrowserPurchase(
         // Another purchase on the merchant waits until the earlier one's outcome is recorded.
         if (await store.waitOnEarlier(context.job.id, facts.site))
           return { status: 'waiting_on_earlier', site: facts.site, repeat_safe: true };
-        const bounds = purchaseBounds(payload, await principalClock());
+        const bounds = purchaseBounds(payload, await loadPrincipalClock());
         const child = await deriveReservationGuaranteeAuthority(
           context.job.id,
           context.request.id,
@@ -1133,7 +1134,7 @@ async function deliverPurchaseCommitAnswer(request: BrowserRequest, frame: Respo
   const notice = await purchaseCommitNotice(stopped, authority, data, {
     incident,
     now: new Date().toISOString(),
-    principalClock,
+    principalClock: (at) => principalClock(Date.parse(at)),
   });
   try {
     await writeBrowserNotice(

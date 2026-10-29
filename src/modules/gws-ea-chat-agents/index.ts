@@ -123,7 +123,7 @@ registerRequiredProjectDocSection('gws-ea-chat-agents:principal', async (group) 
     profile.principal_display_name === null ? 'the principal' : escapeMarkdownInline(profile.principal_display_name);
   return {
     name: 'Principal',
-    body: `You work for ${principal}, whose time zone is ${resolveTimezone(profile.principal_timezone ?? TIMEZONE)}.`,
+    body: `You work for ${principal}, whose home time zone is ${resolveTimezone(profile.principal_timezone ?? TIMEZONE)}.`,
   };
 });
 for (const [type, file] of [

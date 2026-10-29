@@ -538,6 +538,8 @@ export function parseCalendarNotification(mail: ParsedMail): CalendarNotice | un
 const OWN_CHANGE_WINDOW_MS = 30 * 60_000;
 
 const ownChanges = new Map<string, number[]>();
+type OwnChangeListener = (calendarId: string, eventId: string) => void;
+const ownChangeListeners = new Set<OwnChangeListener>();
 
 function ownKey(calendarId: string, eventId: string): string {
   return `${expandCalendarRef(calendarId)}\u0000${eventId}`;
@@ -557,6 +559,15 @@ export function recordOwnCalendarChange(calendarId: string, eventId: string, at:
   }
   const key = ownKey(calendarId, eventId);
   ownChanges.set(key, [...(ownChanges.get(key) ?? []), at.getTime()]);
+  for (const listener of ownChangeListeners) listener(calendarId, eventId);
+}
+
+/** The coming-days refresher hears of each own change here, since the notice it suppresses no longer will. */
+export function onOwnCalendarChange(listener: OwnChangeListener): () => void {
+  ownChangeListeners.add(listener);
+  return () => {
+    ownChangeListeners.delete(listener);
+  };
 }
 
 /** Whether this notification is about the assistant's own recent change; consumes the record if so. */

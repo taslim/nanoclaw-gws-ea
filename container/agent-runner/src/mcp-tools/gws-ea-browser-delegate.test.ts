@@ -366,7 +366,7 @@ it('keeps shared browser judgment brief and moves outcome meanings to the tools 
     new URL('../../../../src/modules/gws-ea-browser/main-guidance.md', import.meta.url),
     'utf8',
   );
-  // Its size cap lives with every other guidance file's, in src/gws-ea/guidance-caps.test.ts.
+  // Its size counts toward each agent's always-on budget, in src/gws-ea/guidance-budget.test.ts.
   for (const mechanic of [
     'card_needed',
     'facts_incomplete',

@@ -72,7 +72,16 @@ const EXTERNAL_CHAT_TOOLS = [
 ];
 const JOB_DOCUMENT_TOOLS = ['doc_create', 'doc_edit', 'doc_read', 'doc_share'];
 /** main's calendar tools through the host, which Google Calendar's key grants with gog's calendar commands. */
-const CALENDAR_TOOLS = ['change_guests', 'create_event', 'find_conflicts', 'people_stats', 'respond_to_event'];
+const CALENDAR_TOOLS = [
+  'cancel_event',
+  'change_event',
+  'change_guests',
+  'check',
+  'create_event',
+  'days',
+  'people_stats',
+  'respond_to_event',
+];
 const BROWSER_TOOLS = [
   'browser',
   'cancel_watch',

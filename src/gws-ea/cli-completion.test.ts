@@ -18,6 +18,7 @@ beforeEach(async () => {
 afterEach(async () => rm(root, { recursive: true, force: true }));
 
 const scenarios = [
+  { words: ['gws-ea', 'lessons', ''], includes: '--id', excludes: '--follow' },
   {
     words: ['gws-ea', 'create', '--assistant-first-name', 'capabilities', ''],
     includes: '--track',

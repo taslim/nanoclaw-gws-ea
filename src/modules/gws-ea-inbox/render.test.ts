@@ -3,12 +3,7 @@
  * sign-off included, as minimal HTML and as the text it wrote, with a reply's
  * quote.
  */
-import { describe, expect, it, vi } from 'vitest';
-
-vi.mock('../../config.js', async (importOriginal) => ({
-  ...(await importOriginal<typeof import('../../config.js')>()),
-  TIMEZONE: 'America/New_York',
-}));
+import { describe, expect, it } from 'vitest';
 
 import { renderEmail } from './render.js';
 
@@ -155,10 +150,11 @@ describe('a reply', () => {
   const quote = {
     from: { address: 'sam@acme.example', displayName: 'Sam\nLee' },
     sentAt: new Date('2026-10-07T14:00:00.000Z'),
+    timezone: 'America/New_York',
     text: 'Can we meet <next> week?\r\nTea & cake on me.\u0007\n\n> Earlier words',
   };
 
-  it("quotes only the anchor's sanitized text, under an On <date>, <name> wrote: line in the install timezone", () => {
+  it("quotes only the anchor's sanitized text, under an On <date>, <name> wrote: line in the supplied timezone", () => {
     const email = renderEmail({ markdown: 'Tuesday works.\n\nBest,', quote });
 
     const attribution = /On Oct 7, 2026, 10:00\sAM, Sam Lee <sam@acme\.example> wrote:/u;
@@ -191,7 +187,12 @@ describe('the sign-off', () => {
   it('is what the agent wrote: a signature under its closing is one paragraph, before the quote', () => {
     const email = renderEmail({
       markdown: 'Tuesday works.\n\nBest,\nJuno Hale | EA to Morgan Ellery',
-      quote: { from: { address: 'sam@acme.example' }, sentAt: new Date('2026-10-07T14:00:00.000Z'), text: 'Hi' },
+      quote: {
+        from: { address: 'sam@acme.example' },
+        sentAt: new Date('2026-10-07T14:00:00.000Z'),
+        timezone: 'America/New_York',
+        text: 'Hi',
+      },
     });
     expect(email.text).toMatch(
       /^Tuesday works\.\n\nBest,\nJuno Hale \| EA to Morgan Ellery\n\nOn [^\n]+ wrote:\n\n> Hi$/u,
@@ -209,4 +210,17 @@ describe('the sign-off', () => {
       html: '<div dir="ltr">\n<p>Done: your 3pm is now Thursday.</p>\n</div>',
     });
   });
+});
+
+it('writes the quote attribution on the supplied moment clock', () => {
+  const mail = renderEmail({
+    markdown: 'Confirmed.',
+    quote: {
+      from: { address: 'juno@example.test' },
+      sentAt: new Date('2026-10-07T14:00:00Z'),
+      text: 'See you there.',
+      timezone: 'Europe/Brussels',
+    },
+  });
+  expect(mail.text).toContain('On Oct 7, 2026, 4:00 PM, juno@example.test wrote:');
 });

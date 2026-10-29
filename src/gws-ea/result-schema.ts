@@ -711,3 +711,10 @@ export function managedResultSchema(data: ResultSchema): ResultSchema {
     diagnostics: object({ run_log: text, step_log: text }, []),
   });
 }
+
+export const LESSONS_DATA_SCHEMA = object({
+  instance_id: text,
+  lessons: array(
+    object({ id: text, text, status: choices('queued', 'accepted', 'folded', 'declined'), created_at: time }),
+  ),
+});

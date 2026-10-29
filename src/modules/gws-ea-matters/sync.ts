@@ -1,168 +1,291 @@
-/**
- * The daily sync: one recurring task in `main`'s conversation, kept by the
- * host (`loop.ts`), that wakes main seven days a week to look ahead and read
- * whatever has waited for it. It is the host's bookkeeping, never a message to
- * the principal: whether they hear about their day, and when, is main's
- * judgment, and a standing morning rundown is a task they ask for.
- *
- * - Its time is an hour before the earliest working-hours start in the
- *   principal's preferences, or 07:00 while they have none, in main's time
- *   zone, and it follows their working hours when those change. Nothing else
- *   sets it.
- * - Its pre-task script, `ncl matters sync`, always wakes main, carrying
- *   unread notes, threads still waiting to be placed, later looks and a
- *   morning rundown's time. Monday's month view follows the occurrence's
- *   scheduled day in the principal's zone.
- * - A matter left without a look gets a look of its own at its time, and a
- *   repeating look whose run failed is brought forward to it (`loop.ts`).
- *
- * `ncl matters today` prints the day as matters hold it, as the script of a
- * morning rundown the principal asks for: today's looks, the matters handed
- * back, and the threads waiting to be placed. It reads nothing live.
- */
+import { randomUUID } from 'node:crypto';
+import fs from 'node:fs/promises';
+import path from 'node:path';
 import { CronExpressionParser } from 'cron-parser';
 
-import { resolveGroupTimezone } from '../../container-config.js';
+import { TIMEZONE, GROUPS_DIR } from '../../config.js';
 import { isContainerRunning } from '../../container-runner.js';
-import { withExistingMailboxSession } from '../../session-manager.js';
-import { formatLocalTime } from '../../timezone.js';
+import { getDb } from '../../db/connection.js';
+import { getSession } from '../../db/sessions.js';
+import { getAgentGroup } from '../../db/agent-groups.js';
+import { resolveSystemSession, withExistingMailboxSession } from '../../session-manager.js';
+import { formatLocalTime, formatLocalTimeWithZone } from '../../timezone.js';
 import type { Session } from '../../types.js';
 import { ECHO_CHANNEL_TYPE } from '../cross-session-context/config.js';
 import { listUnplacedThreads, type UnplacedThread } from '../gws-ea-inbox/thread-map.js';
-import { getSchedulingPreferenceValues } from '../gws-ea-preferences/db.js';
-import { createScheduledTask, prepareScheduledTask, taskNameSlug } from '../scheduling/create.js';
-import { parseTaskContent } from '../scheduling/task-content.js';
+import { getMainAgentGroupId } from '../gws-ea-profile/db.js';
+import { writeNoteForMain } from '../gws-ea-profile/main-note.js';
+import { createScheduledTask, prepareScheduledTask } from '../scheduling/create.js';
+import { loadTimeline, zoneAt, type Timeline } from '../gws-ea-whereabouts/timeline.js';
 import {
-  cancelTaskSeries,
+  beginCloseRun,
+  completeCloseRun,
+  failCloseRun,
+  getCloseRun,
+  lastCompletedClose,
+  type CloseRun,
+} from './close-runs.js';
+import {
   listHeldLookSlots,
   lookSeries,
   mainConversations,
+  oneAtATime,
   seriesKey,
   type HeldTask,
   type ScriptVerdict,
 } from './looks.js';
-import { principalTimezone } from './render.js';
+import type { Matter } from './db.js';
+import { matterPlanningLines } from './planning.js';
+import { nextLocalMoment, sundayOnOrBefore, type LocalMoment } from './moments.js';
 
-const SYNC_TASK_NAME = 'gws-ea daily sync';
-const SYNC_SLUG = taskNameSlug(SYNC_TASK_NAME);
-const DEFAULT_SYNC_MINUTE = 7 * 60;
-const BEFORE_WORK_MINUTES = 60;
-const SYNC_SCRIPT = 'ncl matters sync';
-const SYNC_PROMPT = `Your daily sync. Read what has waited for you, then look closely at the next few days across work and personal life: preparation, timing, transitions and confirmations. Check open matters before raising anything, handle what you can, and set a matter look for anything that can wait.
+const HALF_DAY = 12 * 60 * 60 * 1000;
+export const CLOSE_PROMPT = `The evening close. Run ncl matters evening for this run's facts. Use days and check for the live calendar; an unavailable ambient week view does not replace those tools.
+Start look-back as a background Agent call; when it returns, start look-ahead as a background Agent call. Include this close-run id and its ledger/date scope in each delegation, and require the same header in the result. Look-back reads ncl day in this session, which records the day this close covers; --done needs that read. Retain the returned agentId for each role: their exact files are /workspace/agent/planning-runs/<agentId>-look-back.md and /workspace/agent/planning-runs/<agentId>-look-ahead.md. Read only those exact files once both agents return; ignore stale files and mismatched close-run/scope headers. Wait for both before acting. Record the close step and both returned ids so compaction can resume it.
+Look back catches still-open promises without matters; create the matters they need. Look ahead checks slipped check-ins and proposes tomorrow's moments: set any that matter as ordinary looks. Act on proposals yourself; planning agents make no external writes.
+When the verdict says weekly pass, look at the week and month ahead, refresh or close stale open matters after reading their links fresh, and consolidate memory. Before launching look-back for that consolidation, replace /workspace/agent/sunday-memory-latest with a copy of /workspace/agent/memory; keep only this latest snapshot.
+Judge the verdict's lateness: what still belongs tonight, and what waits for morning. Keep a quiet close quiet. Main talks with the principal; this session reaches main through its report. After acting on both results, use ncl matters evening --done <run> --report '<your report>': the report reaches main as a note, which waits for main's next wake unless you add --notify, which wakes main now. --done records one report per run; a repeat keeps the first. Only --done completes the close; a task acknowledgment does not.`;
 
-When the script says this sync starts the week, also look at the month ahead through a subagent. Brief it with Core Memory's current priorities; a subagent does not receive your memory section. Ask for one line per candidate: what, when, and what may be owed. Decide what to act on yourself. Keep current priorities in Core Memory as short dated facts, with any evidence in a linked file. Record a priority the month reveals as inferred, apart from those the principal stated, and update or retire one when evidence shows it changed; a quiet calendar alone never retires a priority they stated. When a decision now rests on a priority you're unsure of, confirm it in one line with your recommendation, inside the morning's one message.
-
-Stay silent unless something needs the principal. On days off, raise work only if it would otherwise be missed. Merge anything for them with a morning rundown or later look already due, so they receive one message timed for their morning. If the rundown is still to come, put what it needs in a matter for that time; if the morning's message already went, send another only for something that cannot wait. Keep your look-ahead and memory housekeeping to yourself.`;
-
-function localDay(iso: string, timezone: string): string {
-  return new Intl.DateTimeFormat('en-CA', {
-    timeZone: timezone,
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit',
-  }).format(new Date(iso));
-}
-
-function minuteOfDay(time: string): number {
-  const [hours, minutes] = time.split(':').map(Number);
-  return hours * 60 + minutes;
-}
-
-function daily(minute: number): string {
-  return `${minute % 60} ${Math.floor(minute / 60)} * * *`;
+export function nextClosePlacement(timeline: Timeline, notBefore: number, previous: number | null = null): LocalMoment {
+  return nextLocalMoment(
+    timeline,
+    Math.max(notBefore, previous === null ? notBefore : previous + HALF_DAY),
+    () => 21 * 60,
+  );
 }
 
 function nextRun(recurrence: string, timezone: string): string {
   return CronExpressionParser.parse(recurrence, { tz: timezone }).next().toDate().toISOString();
 }
 
-async function syncRecurrence(): Promise<string> {
-  const starts = (await getSchedulingPreferenceValues()).working_hours.flatMap((day) =>
-    day.off ? [] : [minuteOfDay(day.start)],
+async function heldClose(run: CloseRun): Promise<HeldTask | undefined> {
+  const session = await getSession(run.session_id);
+  if (!session) return undefined;
+  const task = await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) =>
+    mailbox.getTask(run.id),
   );
-  return daily(starts.length === 0 ? DEFAULT_SYNC_MINUTE : Math.max(0, Math.min(...starts) - BEFORE_WORK_MINUTES));
+  return task === undefined ? undefined : { session, task };
 }
 
-/** A live sync first, else the latest row in the newest of main's conversations that holds one. */
-async function findSync(): Promise<HeldTask | undefined> {
-  let latest: HeldTask | undefined;
-  for (const session of await mainConversations()) {
-    const task = await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) =>
-      mailbox.findTaskBySeriesSlug(SYNC_SLUG),
-    );
-    if (task === undefined) continue;
-    if (task.status === 'pending' || task.status === 'paused') return { session, task };
-    latest ??= { session, task };
-  }
-  return latest;
+async function occurrenceState(held: HeldTask): Promise<{ readonly claimed: boolean; readonly acked: boolean }> {
+  const evidence = await withExistingMailboxSession(held.session.agent_group_id, held.session.id, (mailbox) => ({
+    claimed: mailbox.getProcessingClaims().some((claim) => claim.messageId === held.task.id),
+    acked: mailbox.getTerminalProcessingAcks().some((ack) => ack.messageId === held.task.id),
+  }));
+  return {
+    claimed:
+      evidence?.claimed === true ||
+      evidence?.acked === true ||
+      held.task.status === 'completed' ||
+      held.task.status === 'failed' ||
+      isContainerRunning(held.session.id),
+    acked: evidence?.acked === true || held.task.status === 'completed' || held.task.status === 'failed',
+  };
 }
 
-async function createSync(
-  conversation: Session,
-  recurrence: string,
-  timezone: string,
-  processAfter?: string,
-): Promise<string> {
-  const prepared = prepareScheduledTask({
-    name: SYNC_TASK_NAME,
-    prompt: SYNC_PROMPT,
-    script: SYNC_SCRIPT,
-    recurrence,
-    timezone,
-    ...(processAfter === undefined ? {} : { processAfter }),
-  });
-  await createScheduledTask(conversation.agent_group_id, prepared, { session: conversation });
-  return prepared.processAfter;
+/** The evening close replaced the daily sync: its series ends, with no successor. */
+export async function cancelDailySync(): Promise<void> {
+  for (const session of await mainConversations())
+    await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) => {
+      const task = mailbox.findTaskBySeriesSlug('gws-ea-daily-sync');
+      if (task) mailbox.cancelTask(seriesKey(task));
+    });
 }
 
-/** Whether the runner has claimed or finished this occurrence before the host applied its ack. */
-async function occurrenceTaken({ session, task }: HeldTask): Promise<boolean> {
-  // The runner may have read the due row before posting its processing claim.
-  if (isContainerRunning(session.id)) return true;
-  const taken = await withExistingMailboxSession(
-    session.agent_group_id,
+async function weeklyDay(at: number, zone: string): Promise<string | null> {
+  const sunday = sundayOnOrBefore(at, zone);
+  const last = await getDb().get<{ weekly_day: string | null }>(
+    "SELECT MAX(weekly_day) AS weekly_day FROM gws_ea_close_runs WHERE state='completed'",
+  );
+  return last?.weekly_day !== null && last?.weekly_day !== undefined && last.weekly_day >= sunday ? null : sunday;
+}
+
+async function createClose(main: Session, moment: LocalMoment, timeline: Timeline): Promise<string> {
+  const id = `gws-ea-close-${randomUUID().replaceAll('-', '')}`;
+  const { session } = await resolveSystemSession(main.agent_group_id, `system:gws-ea-close:${id}`);
+  const at = new Date(moment.at).toISOString();
+  await getDb().run(
+    `INSERT INTO gws_ea_close_runs (id,session_id,scheduled_at,zone,timeline_version,state)
+    VALUES (?,?,?,?,?,'pending')`,
+    id,
     session.id,
-    (mailbox) =>
-      mailbox.getTerminalProcessingAcks().some((ack) => ack.messageId === task.id) ||
-      mailbox.getProcessingClaims().some((claim) => claim.messageId === task.id),
+    at,
+    moment.zone,
+    timeline.version,
   );
-  return taken ?? false;
+  await ensureCloseTask({ id, session_id: session.id, scheduled_at: at, zone: moment.zone });
+  return at;
 }
 
-/**
- * Keep the release's sync prompt, script and time on each host pass. An
- * identical task is left unchanged. A completed or failed row is the sweep's
- * to re-arm within a minute, as upstream's restamp leaves it; the next pass
- * replaces that successor. A due occurrence the runner has claimed or
- * finished runs its course, and is replaced the same way once re-armed. Any
- * other pending occurrence that is overdue or due today keeps its time when
- * the release or the principal's working hours change. The caller holds
- * `oneAtATime`.
- */
-export async function keepSync(conversation: Session): Promise<string> {
-  const timezone = await resolveGroupTimezone(conversation.agent_group_id);
-  const recurrence = await syncRecurrence();
-  const held = await findSync();
-  if (held === undefined) return createSync(conversation, recurrence, timezone);
-  const { task } = held;
-  if (task.recurrence !== null && (task.status === 'completed' || task.status === 'failed')) {
-    return nextRun(task.recurrence, timezone);
+async function ensureCloseTask(run: Pick<CloseRun, 'id' | 'session_id' | 'scheduled_at' | 'zone'>): Promise<void> {
+  const session = await getSession(run.session_id);
+  if (!session) throw new Error('The close session is unavailable.');
+  const prepared = prepareScheduledTask({
+    name: 'gws-ea close',
+    prompt: `${CLOSE_PROMPT}\nClose-run: ${run.id}.`,
+    script: `ncl matters evening --run ${run.id}`,
+    processAfter: run.scheduled_at,
+    timezone: run.zone,
+  });
+  await createScheduledTask(session.agent_group_id, prepared, { session, id: run.id });
+}
+
+/** A close that never ran gives way to another. */
+async function replaceClose(run: CloseRun, held: HeldTask): Promise<void> {
+  await withExistingMailboxSession(held.session.agent_group_id, held.session.id, (mailbox) =>
+    mailbox.cancelTask(run.id),
+  );
+  await failCloseRun(run.id);
+}
+
+/** The caller serializes this clock with slot edits. Acknowledgments never advance ledger coverage. */
+export async function keepClose(main: Session): Promise<string> {
+  const timeline = await loadTimeline();
+  const attempted = await getDb().get<{ started_at: string | null }>(
+    'SELECT MAX(started_at) AS started_at FROM gws_ea_close_runs',
+  );
+  let previous = attempted?.started_at ? Date.parse(attempted.started_at) : null;
+  for (const run of await getDb().all<CloseRun>(
+    "SELECT * FROM gws_ea_close_runs WHERE state IN ('pending','open') ORDER BY scheduled_at,id",
+  )) {
+    await ensureCloseTask(run);
+    const held = await heldClose(run);
+    if (!held) continue;
+    const state = await occurrenceState(held);
+    if (run.state === 'open' || state.claimed) {
+      const started = Date.parse(run.started_at ?? run.scheduled_at);
+      previous = Math.max(previous ?? started, started);
+      const ended = state.acked && !isContainerRunning(held.session.id);
+      // A close still open when the next one is due has failed, so a container kept busy never skips a close.
+      const overdue =
+        run.state === 'open' && nextClosePlacement(timeline, started + HALF_DAY, started).at <= Date.now();
+      if (ended || overdue) await failCloseRun(run.id, run.scheduled_at);
+      continue;
+    }
+    if (held.task.status !== 'pending') {
+      await replaceClose(run, held);
+      continue;
+    }
+    if (run.timeline_version === timeline.version) return run.scheduled_at;
+    const moment = nextClosePlacement(timeline, Math.min(Date.now(), Date.parse(run.scheduled_at)), previous);
+    const at = new Date(moment.at).toISOString();
+    if (at === run.scheduled_at) {
+      await getDb().run(
+        'UPDATE gws_ea_close_runs SET timeline_version=?,zone=? WHERE id=?',
+        timeline.version,
+        moment.zone,
+        run.id,
+      );
+      return at;
+    }
+    const touched = await withExistingMailboxSession(main.agent_group_id, held.session.id, (mailbox) => {
+      if (
+        mailbox.getProcessingClaims().some((claim) => claim.messageId === run.id) ||
+        mailbox.getTerminalProcessingAcks().some((ack) => ack.messageId === run.id)
+      )
+        return 'claimed' as const;
+      return mailbox.updateTask(run.id, { processAfter: at }) ? ('updated' as const) : ('immutable' as const);
+    });
+    if (touched === 'claimed' || isContainerRunning(held.session.id)) return run.scheduled_at;
+    if (touched !== 'updated') {
+      await replaceClose(run, held);
+      return createClose(main, moment, timeline);
+    }
+    await getDb().run(
+      'UPDATE gws_ea_close_runs SET scheduled_at=?,zone=?,timeline_version=? WHERE id=?',
+      at,
+      moment.zone,
+      timeline.version,
+      run.id,
+    );
+    return at;
   }
-  const content = parseTaskContent(task.content);
-  const sameContent = content.prompt === SYNC_PROMPT && content.script === SYNC_SCRIPT;
-  const sameSchedule = task.recurrence === recurrence;
-  const due = task.processAfter !== null && Date.parse(task.processAfter) <= Date.now();
-  if (task.status === 'pending' && task.processAfter !== null) {
-    if (sameContent && sameSchedule) return task.processAfter;
-    if (due && (await occurrenceTaken(held))) return task.processAfter;
-  }
-  // A changed prompt, script or schedule takes over from the next run; today's run keeps its time.
-  const keepTime =
-    task.status === 'pending' &&
-    task.processAfter !== null &&
-    (due || localDay(task.processAfter, timezone) === localDay(new Date().toISOString(), timezone));
-  await cancelTaskSeries(seriesKey(task));
-  return createSync(conversation, recurrence, timezone, keepTime ? (task.processAfter ?? undefined) : undefined);
+  return createClose(
+    main,
+    nextClosePlacement(timeline, previous === null ? Date.now() : previous + HALF_DAY, previous),
+    timeline,
+  );
+}
+
+function localInstant(at: string, timeline: Timeline): string {
+  const zone = zoneAt(timeline, Date.parse(at));
+  return zone === null ? `${at} (zone unknown)` : formatLocalTimeWithZone(at, zone);
+}
+
+export function closeVerdict(sessionId: string, runId?: string): Promise<ScriptVerdict> {
+  return oneAtATime(async () => {
+    const run =
+      runId === undefined
+        ? await getDb().get<CloseRun>('SELECT * FROM gws_ea_close_runs WHERE session_id=?', sessionId)
+        : await getCloseRun(runId, sessionId);
+    if (!run) throw new Error('This session has no evening close.');
+    if (run.state === 'completed' || run.state === 'failed')
+      return { wakeAgent: false, data: [`Close ${run.id} is ${run.state}.`] };
+    if (Date.parse(run.scheduled_at) > Date.now()) return { wakeAgent: false, data: [] };
+    const started = Date.parse((await beginCloseRun(run.id, sessionId)).started_at ?? run.scheduled_at);
+    const timeline = await loadTimeline();
+    const weekly = await weeklyDay(started, zoneAt(timeline, started) ?? run.zone);
+    await getDb().run('UPDATE gws_ea_close_runs SET weekly_day=? WHERE id=?', weekly, run.id);
+    const [notes, threads, covered] = await Promise.all([unreadNotes(), listUnplacedThreads(), lastCompletedClose()]);
+    const late = Math.max(0, Math.floor((Date.now() - Date.parse(run.scheduled_at)) / 60_000));
+    const hours = Math.floor(late / 60);
+    const remaining = late % 60;
+    const duration =
+      hours === 0
+        ? `${late} ${late === 1 ? 'minute' : 'minutes'}`
+        : `${hours} ${hours === 1 ? 'hour' : 'hours'}${remaining === 0 ? '' : ` ${remaining} ${remaining === 1 ? 'minute' : 'minutes'}`}`;
+    const ledgerFrom = covered?.ledger_through_at ?? null;
+    return {
+      wakeAgent: true,
+      data: [
+        `Close-run: ${run.id}; scheduled ${localInstant(run.scheduled_at, timeline)}; ${duration} late.`,
+        ledgerFrom === null
+          ? 'Day ledger: everything so far; no close has completed yet.'
+          : `Day ledger since ${localInstant(ledgerFrom, timeline)}, when the last completed close read it.`,
+        ...(notes === 0 ? [] : [`${notes} unread notes in main's conversations; the day ledger carries them.`]),
+        ...sectionLines(unplacedSection(threads, timeline)),
+        ...(weekly === null
+          ? []
+          : [
+              `Weekly pass for Sunday ${weekly}: the week and month ahead, stale open matters and consolidation. Snapshot memory before consolidation.`,
+            ]),
+      ],
+    };
+  });
+}
+
+/** The note's id makes the report one per run: a retry after it was written adds nothing, and its first text stands. */
+export function finishClose(sessionId: string, runId: string, report?: string, notify = false): Promise<CloseRun> {
+  return oneAtATime(async () => {
+    const run = await getCloseRun(runId, sessionId);
+    if (run?.state === 'completed') return run;
+    if (run?.state !== 'open' || run.ledger_through_at === null)
+      throw new Error(
+        'Only this session’s open close may be marked done, after ncl day has been read in this session.',
+      );
+    if (report === undefined || report.trim() === '')
+      throw new Error(
+        '--report is required: leave main the result of your close, including your decision to stay quiet.',
+      );
+    const written = await writeNoteForMain({
+      id: `close-report-${runId}`,
+      timestamp: new Date().toISOString(),
+      text: report,
+      wake: notify,
+      ...(notify ? {} : { noteKind: 'host-receipt' as const }),
+    });
+    if (written !== 'written' && written !== 'already-written')
+      throw new Error('The close report has no main conversation yet.');
+    return completeCloseRun(runId, sessionId);
+  });
+}
+
+/** Forgetting deletes the latest memory snapshot and the planning results by path; the host never reads either. */
+export async function forgetSundaySnapshot(): Promise<void> {
+  const main = await getMainAgentGroupId();
+  const group = main === null ? undefined : await getAgentGroup(main);
+  if (!group) return;
+  for (const copy of ['sunday-memory-latest', 'planning-runs'])
+    await fs.rm(path.join(GROUPS_DIR, group.folder, copy), { recursive: true, force: true });
 }
 
 interface ScriptSection {
@@ -175,7 +298,8 @@ function sectionLines(section: ScriptSection): string[] {
 }
 
 /** The one line main reads for a thread waiting to be placed, wherever it is shown one. */
-export function unplacedThreadLine(thread: UnplacedThread, timezone: string): string {
+export function unplacedThreadLine(thread: UnplacedThread, timeline: Timeline): string {
+  const timezone = zoneAt(timeline, Date.parse(thread.latestAt)) ?? TIMEZONE;
   return [
     `- ${thread.threadKey}: ${thread.people.join(', ')}`,
     `latest mail ${formatLocalTime(thread.latestAt, timezone)}`,
@@ -183,15 +307,15 @@ export function unplacedThreadLine(thread: UnplacedThread, timezone: string): st
   ].join('; ');
 }
 
-function unplacedSection(threads: readonly UnplacedThread[], timezone: string): ScriptSection {
+function unplacedSection(threads: readonly UnplacedThread[], timeline: Timeline): ScriptSection {
   return {
     heading: 'Threads waiting to be placed',
-    lines: threads.map((thread) => unplacedThreadLine(thread, timezone)),
+    lines: threads.map((thread) => unplacedThreadLine(thread, timeline)),
   };
 }
 
 /** How many notes main has not read, across its conversations: each rides along with its next turn. */
-async function unreadNotes(): Promise<number> {
+export async function unreadNotes(): Promise<number> {
   let count = 0;
   for (const session of await mainConversations()) {
     count +=
@@ -200,75 +324,6 @@ async function unreadNotes(): Promise<number> {
       )) ?? 0;
   }
   return count;
-}
-
-async function morningRundowns(timezone: string): Promise<string[]> {
-  const today = localDay(new Date().toISOString(), timezone);
-  const times: string[] = [];
-  for (const session of await mainConversations()) {
-    const tasks = await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) =>
-      mailbox.listLiveTasks('pending'),
-    );
-    for (const task of tasks ?? []) {
-      const at = task.processAfter;
-      if (
-        at === null ||
-        localDay(at, timezone) !== today ||
-        parseTaskContent(task.content).script?.trim() !== 'ncl matters today'
-      )
-        continue;
-      const hour = Number(
-        new Intl.DateTimeFormat('en-US', { timeZone: timezone, hour: 'numeric', hourCycle: 'h23' }).format(
-          new Date(at),
-        ),
-      );
-      if (hour < 12) times.push(at);
-    }
-  }
-  return times.sort().map((at) => `Morning rundown: ${formatLocalTime(at, timezone)}.`);
-}
-
-export async function syncVerdict(): Promise<ScriptVerdict> {
-  const timezone = await principalTimezone();
-  const [notes, unplaced, sync, looks, rundowns] = await Promise.all([
-    unreadNotes(),
-    listUnplacedThreads(),
-    findSync(),
-    looksBefore(nextRun('0 0 * * *', timezone)),
-    morningRundowns(timezone),
-  ]);
-  // The occurrence running now is still pending and due; a call at any other
-  // time reads tomorrow's row, which starts nothing yet.
-  const at = sync?.task.processAfter;
-  const startsWeek =
-    at !== undefined &&
-    at !== null &&
-    Date.parse(at) <= Date.now() &&
-    new Intl.DateTimeFormat('en-US', { timeZone: timezone, weekday: 'long' }).format(new Date(at)) === 'Monday';
-  const later = looks.filter((look) => Date.parse(look.at) > Date.now());
-  const unread =
-    notes === 0
-      ? []
-      : [
-          notes === 1
-            ? 'A note you have not read comes with this.'
-            : `${notes} notes you have not read come with this.`,
-        ];
-  return {
-    wakeAgent: true,
-    data: [
-      ...unread,
-      ...(unplaced.length === 0 ? [] : sectionLines(unplacedSection(unplaced, timezone))),
-      ...(startsWeek ? [`This sync starts the week: Monday in ${timezone}.`] : []),
-      ...(later.length === 0
-        ? []
-        : sectionLines({
-            heading: 'Later looks today',
-            lines: later.map((look) => `- ${look.matterId}, ${formatLocalTime(look.at, timezone)}: ${look.title}`),
-          })),
-      ...rundowns,
-    ],
-  };
 }
 
 /** A look due before the day ends. */
@@ -301,20 +356,37 @@ async function looksBefore(before: string): Promise<DueLook[]> {
  * for, main's own list to fold into a rundown built from their calendar.
  */
 export async function todayVerdict(): Promise<ScriptVerdict> {
-  const timezone = await principalTimezone();
+  const timeline = await loadTimeline();
+  const timezone = zoneAt(timeline, Date.now()) ?? TIMEZONE;
   const looks = await looksBefore(nextRun('0 0 * * *', timezone));
+  const matters =
+    looks.length === 0
+      ? []
+      : await getDb().all<Pick<Matter, 'id' | 'due_at' | 'needs_minutes' | 'place' | 'deferrals'>>(
+          `SELECT id, due_at, needs_minutes, place, deferrals FROM gws_ea_matters WHERE id IN (${looks.map(() => '?').join(', ')})`,
+          ...looks.map((look) => look.matterId),
+        );
+  const facts = new Map(
+    matters.map((matter) => [matter.id, matterPlanningLines(matter, timeline, timezone).join(' ')] as const),
+  );
+  const suffix = (id: string): string => (facts.get(id) ? `; ${facts.get(id)}` : '');
   const sections: ScriptSection[] = [
     {
       heading: 'Looks today',
       lines: looks
         .filter((look) => !look.handedBack)
-        .map((look) => `- ${look.matterId}, ${formatLocalTime(look.at, timezone)}: ${look.title}`),
+        .map(
+          (look) =>
+            `- ${look.matterId}, ${formatLocalTime(look.at, zoneAt(timeline, Date.parse(look.at)) ?? timezone)}: ${look.title}${suffix(look.matterId)}`,
+        ),
     },
     {
       heading: 'Handed back without a next look',
-      lines: looks.filter((look) => look.handedBack).map((look) => `- ${look.matterId}: ${look.title}`),
+      lines: looks
+        .filter((look) => look.handedBack)
+        .map((look) => `- ${look.matterId}: ${look.title}${suffix(look.matterId)}`),
     },
-    unplacedSection(await listUnplacedThreads(), timezone),
+    unplacedSection(await listUnplacedThreads(), timeline),
   ];
   return { wakeAgent: true, data: sections.flatMap(sectionLines) };
 }

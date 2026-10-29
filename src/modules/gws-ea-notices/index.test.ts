@@ -15,12 +15,16 @@ import fs from 'fs';
 import Database from 'better-sqlite3';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+const fixture = vi.hoisted(() => ({
+  root: `/tmp/gws-ea-u9-notices-${process.pid}-${Math.random().toString(36).slice(2)}`,
+}));
+
 vi.mock('../../config.js', async () => {
   const actual = await vi.importActual<typeof import('../../config.js')>('../../config.js');
   return {
     ...actual,
-    DATA_DIR: '/tmp/nanoclaw-test-gws-ea-notices',
-    GROUPS_DIR: '/tmp/nanoclaw-test-gws-ea-notices/groups',
+    DATA_DIR: fixture.root,
+    GROUPS_DIR: `${fixture.root}/groups`,
   };
 });
 
@@ -38,6 +42,7 @@ import { isContainerRunning, killContainer } from '../../container-runner.js';
 import { getDb } from '../../db/connection.js';
 import { recordDeliveryAttempt } from '../../db/coordination.js';
 import { closeDb, createAgentGroup, createMessagingGroup, initTestDb, runMigrations } from '../../db/index.js';
+import { getSession } from '../../db/sessions.js';
 import { setMessagingGroupDetachedAt } from '../../db/messaging-groups.js';
 import { deliverSessionMessages, registerDeliveryAction, setDeliveryAdapter } from '../../delivery.js';
 import { unguarded } from '../../guard/index.js';
@@ -52,8 +57,15 @@ import { createThread } from '../gws-ea-inbox/thread-map.js';
 import { getMatter, openMatter } from '../gws-ea-matters/db.js';
 import '../gws-ea-matters/index.js';
 import { lookSeries, openMatterWithLook } from '../gws-ea-matters/looks.js';
+import { closeVerdict } from '../gws-ea-matters/sync.js';
 import { keepMattersOnTime } from '../gws-ea-matters/loop.js';
-import { liveTaskRows, mainSession, runOccurrence, seedMain } from '../gws-ea-matters/testing/main-conversation.js';
+import {
+  closeRuns,
+  liveTaskRows,
+  mainSession,
+  runOccurrence,
+  seedMain,
+} from '../gws-ea-matters/testing/main-conversation.js';
 import '../gws-ea-people/index.js';
 import '../gws-ea-preferences/index.js';
 import { recordExternalEmailAgentGroupId } from '../gws-ea-profile/db.js';
@@ -61,7 +73,7 @@ import '../gws-ea-profile/index.js';
 import { noteNames, writeNoteForMain, type NotePiece } from '../gws-ea-profile/main-note.js';
 import './index.js';
 
-const TEST_DIR = '/tmp/nanoclaw-test-gws-ea-notices';
+const TEST_DIR = fixture.root;
 const ZONE = 'America/New_York';
 const NOTICE = "Something went wrong on my side and I couldn't finish that. Please send it again.";
 const OUTAGE =
@@ -755,34 +767,46 @@ describe('a failed turn the runner reports', () => {
     expect(sent).toEqual([]);
   });
 
-  it('of the daily sync, tells Morgan nothing, and the look it was serving comes back at the next sync', async () => {
-    const { matter } = await openMatterWithLook(
-      { title: 'Acme renewal', openLoop: 'Morgan wants it signed this quarter.', links: [] },
-      { kind: 'once', at: new Date(Date.now() + 60_000).toISOString() },
-    );
-    await keepMattersOnTime();
-    const rows = liveTaskRows(main);
-    const sync = rows.find((row) => row.series_id.startsWith('gws-ea-daily-sync-'));
-    const look = rows.find((row) => row.series_id === matter.look_task_id);
-    if (sync === undefined || look === undefined) throw new Error('No sync or no look');
-    // The runner answered both in one turn, which failed.
-    await runOccurrence(main, sync.id, 'completed');
-    await runOccurrence(main, look.id, 'completed');
-    turnFailed(main, { batch: [sync.id, look.id], error: 'API Error: 529 overloaded' });
-
-    await drain(main, 1);
-    await keepMattersOnTime();
-
-    expect(sent).toEqual([]);
-    const handedBack = (await getMatter(matter.id))?.look_task_id ?? '';
-    expect(lookSeries(handedBack)).toEqual({ matterId: matter.id, handedBack: true });
-    const nextSync = liveTaskRows(main).find((row) => row.series_id === sync.series_id)?.process_after;
-    expect(nextSync).toBeDefined();
-    expect(liveTaskRows(main).find((row) => row.series_id === handedBack)?.process_after).toBe(nextSync);
-    expect(onlyFact().text).toBe('Your turn failed before it finished, so what it was handling may be left undone.');
+  it('of the evening close, tells Morgan nothing, and a failed matter look comes back at the next close', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    try {
+      vi.setSystemTime(new Date('2032-10-12T10:00Z'));
+      const { matter } = await openMatterWithLook(
+        { title: 'Acme renewal', openLoop: 'Morgan wants it signed this quarter.', links: [] },
+        { kind: 'once', at: new Date(Date.now() + 60_000).toISOString() },
+      );
+      await keepMattersOnTime();
+      const close = (await closeRuns()).at(-1);
+      const look = liveTaskRows(main).find((row) => row.series_id === matter.look_task_id);
+      if (!close || !look) throw new Error('No close or no matter look');
+      const session = await getSession(close.session_id);
+      if (!session) throw new Error('The close session is missing');
+      vi.setSystemTime(new Date(close.scheduled_at));
+      await closeVerdict(session.id, close.id);
+      // Each route reports its own failed turn; the close has no principal delivery route.
+      await runOccurrence(session, close.id, 'completed');
+      turnFailed(session, { batch: [close.id], error: 'API Error: 529 overloaded' });
+      await drain(session, 1);
+      await runOccurrence(main, look.id, 'completed');
+      turnFailed(main, { batch: [look.id], error: 'API Error: 529 overloaded' });
+      await drain(main, 1);
+      await keepMattersOnTime();
+      expect(sent).toEqual([]);
+      const handedBack = (await getMatter(matter.id))?.look_task_id ?? '';
+      expect(lookSeries(handedBack)).toEqual({ matterId: matter.id, handedBack: true });
+      const next = (await closeRuns()).at(-1);
+      expect(next?.id).not.toBe(close.id);
+      expect(liveTaskRows(main).find((row) => row.series_id === handedBack)?.process_after).toBe(next?.scheduled_at);
+      expect(await getDb().get('SELECT state FROM gws_ea_close_runs WHERE id=?', close.id)).toEqual({
+        state: 'failed',
+      });
+      expect(onlyFact().text).toBe('Your turn failed before it finished, so what it was handling may be left undone.');
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
-  it("of a repeating look, brings it back at the next sync and keeps next year's date", async () => {
+  it("of a repeating look, brings it back at the next close and keeps next year's date", async () => {
     const yearly = '0 9 14 3 *';
     const { matter } = await openMatterWithLook(
       { title: "Juno Hale's birthday", openLoop: 'Remind Morgan a few days ahead.', links: [] },
@@ -798,7 +822,7 @@ describe('a failed turn the runner reports', () => {
     await drain(main, 1);
     await keepMattersOnTime();
 
-    const sync = liveTaskRows(main).find((row) => row.series_id.startsWith('gws-ea-daily-sync-'))?.process_after;
+    const sync = (await closeRuns()).at(-1)?.scheduled_at;
     expect(sync).toBeDefined();
     const retry = liveTaskRows(main).find((row) => row.series_id === matter.look_task_id);
     expect(retry).toMatchObject({ recurrence: yearly, process_after: sync });
@@ -810,7 +834,7 @@ describe('a failed turn the runner reports', () => {
     expect(liveTaskRows(main).find((row) => row.series_id === matter.look_task_id)?.process_after).not.toBe(sync);
   });
 
-  it("of a repeating look, brings it back at the next sync even when main's fact cannot be written", async () => {
+  it("of a repeating look, brings it back at the next close even when main's fact cannot be written", async () => {
     const yearly = '0 9 14 3 *';
     const { matter } = await openMatterWithLook(
       { title: "Juno Hale's birthday", openLoop: 'Remind Morgan a few days ahead.', links: [] },
@@ -833,7 +857,7 @@ describe('a failed turn the runner reports', () => {
     await keepMattersOnTime();
 
     expect(facts()).toEqual([]);
-    const sync = liveTaskRows(main).find((row) => row.series_id.startsWith('gws-ea-daily-sync-'))?.process_after;
+    const sync = (await closeRuns()).at(-1)?.scheduled_at;
     expect(sync).toBeDefined();
     expect(liveTaskRows(main).find((row) => row.series_id === matter.look_task_id)).toMatchObject({
       recurrence: yearly,

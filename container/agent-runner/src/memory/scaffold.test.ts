@@ -33,7 +33,8 @@ describe('ensureMemoryScaffold', () => {
       const index = fs.readFileSync(path.join(base, 'memory', 'index.md'), 'utf-8');
 
       expect(index).toContain(`](${RELEASE_MEMORY_DEFINITION.path})`);
-      expect(index.indexOf('## Core Memory')).toBeLessThan(index.indexOf('## Map'));
+      expect(index).toContain('## Map');
+      expect(index).not.toContain('Core Memory');
     } finally {
       fs.rmSync(base, { recursive: true, force: true });
     }

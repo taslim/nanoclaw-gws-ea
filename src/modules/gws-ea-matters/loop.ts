@@ -2,11 +2,12 @@
  * The host's guarantees for matters: a pass every minute, without the model,
  * that keeps time for main.
  *
- * 1. The daily sync exists, at its time (`sync.ts`).
+ * 1. The evening close exists, at its time (`sync.ts`), and a finished
+ *    close's session closes once its container has stopped.
  * 2. Every open matter has a look still to come. One left without, because
  *    its look ran and no new one was set, or was cancelled, paused or lost,
- *    gets one at the next sync, named as handed back.
- * 3. A repeating look whose latest run failed comes back at the next sync
+ *    gets one at the next close, named as handed back.
+ * 3. A repeating look whose latest run failed comes back at the next close
  *    instead of at its next date, which its cron keeps: a failed birthday
  *    look comes back the next day, not next year. Its next occurrence is
  *    brought forward, so the series still has one occurrence to come, which
@@ -41,21 +42,31 @@ import {
   stillToCome,
   type HeldSlot,
 } from './looks.js';
-import { keepSync, unplacedThreadLine } from './sync.js';
-import { principalTimezone } from './render.js';
+import { keepClose, unplacedThreadLine } from './sync.js';
+import { keepMorning, morningLookIds } from './morning.js';
+import { TIMEZONE } from '../../config.js';
+import { loadTimeline, zoneAt, type Timeline } from '../gws-ea-whereabouts/timeline.js';
+import { anchorPendingTasks, rememberHostRetry } from './anchors.js';
+import { closeFinishedCloseSessions } from './close-runs.js';
 
 const PASS_MS = 60_000;
 const DAY_MS = 24 * 60 * 60 * 1000;
 
-/** Step 2: a look at the next sync for every open matter whose look will not come back. */
+/** Step 2: a look at the next close for every open matter whose look will not come back. */
 async function handBackMattersWithoutALook(
   conversation: Session,
-  sync: string,
+  closeAt: string,
   slots: readonly HeldSlot[],
+  timeline: Timeline,
 ): Promise<void> {
+  const morning = await morningLookIds();
   for (const { slot, held } of slots) {
+    if (morning.has(slot.id)) continue;
     if (stillToCome(held?.task)) continue;
-    await setLook(conversation, slot.id, slot.look_task_id, { kind: 'once', at: sync }, true);
+    await setLook(conversation, slot.id, slot.look_task_id, { kind: 'once', at: closeAt }, true, {
+      timeline,
+      zone: zoneAt(timeline, Date.parse(closeAt)) ?? TIMEZONE,
+    });
   }
 }
 
@@ -68,12 +79,12 @@ interface Repeat {
 
 /**
  * Step 3: a repeating look whose latest run failed, and whose next
- * occurrence is more than a day after the next sync, comes at the sync.
+ * occurrence is more than a day after the next close, comes at the close.
  * A failed script shows in the series' runs; a failed turn, which the runner
  * settles as done, shows in the mark the notices module sets on the matter.
  * Once it runs, the sweep arms the next occurrence from its cron again.
  */
-async function bringFailedRepeatsForward(sync: string, slots: readonly HeldSlot[]): Promise<void> {
+async function bringFailedRepeatsForward(closeAt: string, slots: readonly HeldSlot[]): Promise<void> {
   // The repeating looks still to come, by the conversation that holds each, so its mailbox opens once.
   const conversations = new Map<string, { readonly session: Session; readonly repeats: Repeat[] }>();
   for (const { slot, held } of slots) {
@@ -90,14 +101,15 @@ async function bringFailedRepeatsForward(sync: string, slots: readonly HeldSlot[
       (await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) =>
         repeats.filter(({ slot, key, processAfter }) => {
           const failed = slot.look_failed_at !== null || mailbox.trailingFailedRuns(key) > 0;
-          if (failed && Date.parse(processAfter) - Date.parse(sync) > DAY_MS) {
-            mailbox.updateTask(key, { processAfter: sync });
+          if (failed && Date.parse(processAfter) - Date.parse(closeAt) > DAY_MS) {
+            mailbox.updateTask(key, { processAfter: closeAt });
           }
           return failed;
         }),
       )) ??
       // A conversation whose mailbox is gone has no runs to read and no look to move: only the marks count.
       repeats.filter(({ slot }) => slot.look_failed_at !== null);
+    for (const { key } of failed) await rememberHostRetry(session, key);
     // Each mark is cleared once its look has come forward.
     for (const { slot } of failed) if (slot.look_failed_at !== null) await markLookFailed(slot.id, null);
   }
@@ -123,7 +135,7 @@ async function cancelStrayLooks(): Promise<void> {
  * be read in `conversation`. Its id comes from the threads and the notes
  * before it, so a pass that wrote it and failed to record it writes no other.
  */
-async function remindOfUnplacedThreads(conversation: Session): Promise<void> {
+async function remindOfUnplacedThreads(conversation: Session, timeline: Timeline): Promise<void> {
   const threads = await listUnplacedThreads();
   if (threads.length === 0) return;
   const asked = threads.flatMap((thread) => (thread.placementNote === null ? [] : [thread.placementNote]));
@@ -137,14 +149,14 @@ async function remindOfUnplacedThreads(conversation: Session): Promise<void> {
     .update(threads.map((thread) => `${thread.threadKey}\u0000${thread.placementNote ?? ''}`).join('\u0000'))
     .digest('hex')
     .slice(0, 24)}`;
-  const timezone = await principalTimezone();
   const written = await writeNoteForMain({
     id,
     timestamp: new Date().toISOString(),
+    noteKind: 'unplaced-thread',
     wake: false,
     text: [
       'Email threads you have not placed are waiting on you, and external-email reads none of their mail until you place each one and hand it over:',
-      ...threads.map((thread) => unplacedThreadLine(thread, timezone)),
+      ...threads.map((thread) => unplacedThreadLine(thread, timeline)),
     ].join('\n'),
   });
   if (written === 'written' || written === 'already-written') {
@@ -155,21 +167,37 @@ async function remindOfUnplacedThreads(conversation: Session): Promise<void> {
   }
 }
 
+async function isolated(step: string, work: () => Promise<void>): Promise<void> {
+  try {
+    await work();
+    // eslint-disable-next-line no-catch-all/no-catch-all -- a durable step resumes next pass without starving the other guarantees.
+  } catch (error) {
+    log.warn('Matters step failed; it will resume next pass', { step, err: error });
+  }
+}
+
 /** Nothing to keep until main and the principal's conversation exist. */
 export function keepMattersOnTime(): Promise<void> {
   return oneAtATime(async () => {
     const conversation = await mainConversation();
     if (conversation === undefined) return;
-    const sync = await keepSync(conversation);
+    await isolated('anchors', async () => anchorPendingTasks(await loadTimeline()));
+    let closeAt: string | undefined;
+    await isolated('close', async () => {
+      closeAt = await keepClose(conversation);
+    });
+    await isolated('finished closes', closeFinishedCloseSessions);
     const idle = (await mainConversations()).every((session) => !isContainerRunning(session.id));
-    if (idle) {
-      // Step 2 acts on looks that will not come back, step 3 on ones still to come: one read serves both.
-      const slots = await listHeldLookSlots();
-      await handBackMattersWithoutALook(conversation, sync, slots);
-      await bringFailedRepeatsForward(sync, slots);
+    if (idle && closeAt !== undefined) {
+      const at = closeAt;
+      await isolated('missing looks', async () =>
+        handBackMattersWithoutALook(conversation, at, await listHeldLookSlots(), await loadTimeline()),
+      );
+      await isolated('failed repeats', async () => bringFailedRepeatsForward(at, await listHeldLookSlots()));
     }
-    await cancelStrayLooks();
-    await remindOfUnplacedThreads(conversation);
+    await isolated('morning', async () => keepMorning(conversation));
+    await isolated('stray looks', cancelStrayLooks);
+    await isolated('unplaced threads', async () => remindOfUnplacedThreads(conversation, await loadTimeline()));
   });
 }
 

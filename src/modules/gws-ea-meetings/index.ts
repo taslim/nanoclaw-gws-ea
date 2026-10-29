@@ -1,5 +1,9 @@
+import { calendarWriteLogMigration } from './week/write-log-migration.js';
+import { pendingCalendarChangesMigration } from './week/pending-changes-migration.js';
 import '../gws-ea-inbox/index.js';
 import '../gws-ea-chats/index.js';
+import '../gws-ea-whereabouts/index.js';
+import '../gws-ea-preferences/index.js';
 
 import { answeredGuard, answeringAction, forbidden, type DeferredActionAnswer } from '../../cli/delivery-action.js';
 import { registerDeliveryAction } from '../../delivery.js';
@@ -17,12 +21,22 @@ import { bookingAction, principalEventAction } from './guard.js';
 import { resolveBookingSurface } from './booking-surface.js';
 import { bookingsMigration } from './bookings-migration.js';
 import type { Session } from '../../types.js';
+import { createDaysTools } from './days.js';
 import { createPrincipalEventTools } from './principal-events.js';
+import { createWeekRefresher } from './week/refresh.js';
 
 let calendar: MeetingsCalendarApi | undefined;
 // Built on first use: only a GWS-EA host with the assistant's Google sign-in reads a calendar.
 const calendarApi = (): MeetingsCalendarApi =>
   (calendar ??= createMeetingsCalendarApi({ token: () => hostGoogleAccessToken('calendar-host') }));
+
+const weekRefresher = createWeekRefresher({ calendar: calendarApi });
+onHostStart(() => {
+  void weekRefresher
+    .start()
+    .catch((error: unknown) => log.warn('The initial coming-days view is unavailable', { error }));
+});
+onHostShutdown(() => weekRefresher.stop());
 
 const booking = createBookingTools({ calendar: calendarApi });
 let bookingTimer: NodeJS.Timeout | undefined;
@@ -79,6 +93,8 @@ const MAIN_STEP = "Tell the principal in a line what you can't do, and carry on 
 registerMigration(chatBookingRequestsMigration);
 registerMigration(chatBookingReportsMigration);
 registerMigration(bookingsMigration);
+registerMigration(calendarWriteLogMigration);
+registerMigration(pendingCalendarChangesMigration);
 
 for (const [action, answer] of [
   ['free_time', booking.freeTime],
@@ -102,12 +118,16 @@ for (const [action, answer] of [
 
 const principalEvents = createPrincipalEventTools({ calendar: calendarApi });
 const facts = createCalendarFactTools({ calendar: calendarApi });
+const days = createDaysTools({ calendar: calendarApi });
 
 for (const [action, answer] of [
   ['create_event', principalEvents.createEvent],
   ['change_guests', principalEvents.changeGuests],
   ['respond_to_event', principalEvents.respondToEvent],
-  ['find_conflicts', facts.findConflicts],
+  ['days', days.days],
+  ['check', days.check],
+  ['change_event', principalEvents.changeEvent],
+  ['cancel_event', principalEvents.cancelEvent],
   ['people_stats', facts.peopleStats],
 ] as const) {
   registerDeliveryAction(

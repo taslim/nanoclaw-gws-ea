@@ -19,9 +19,11 @@ import { reconcileSession } from '../../../reconcile-session.js';
 import { resolveSession, withExistingMailboxSession } from '../../../session-manager.js';
 import type { Session } from '../../../types.js';
 import { bindVerifiedPrincipalUser } from '../../gws-ea-profile/db.js';
+import { gwsEaWhereaboutsMigration } from '../../gws-ea-whereabouts/migration.js';
 import { gwsEaPrincipalDmRoutingMigration } from '../../gws-ea-profile/migration.js';
 import { upsertUserDm } from '../../permissions/db/user-dms.js';
 import { upsertUser } from '../../permissions/db/users.js';
+import { beginCloseRun, type CloseRun } from '../close-runs.js';
 
 export const MAIN = 'ag-main';
 const PRINCIPAL = 'gchat:users/morgan';
@@ -29,13 +31,14 @@ const DIRECT_MESSAGE = 'mg-dm';
 
 /** Main in `timezone`, named by the profile, and the principal's direct message: what a look comes back to. */
 export async function seedMain(timezone: string): Promise<void> {
-  await runMigrations(getDb(), [gwsEaPrincipalDmRoutingMigration]);
+  await runMigrations(getDb(), [gwsEaPrincipalDmRoutingMigration, gwsEaWhereaboutsMigration]);
   const now = new Date().toISOString();
   await createAgentGroup({ id: MAIN, name: 'main', folder: MAIN, agent_provider: null, created_at: now });
   await ensureContainerConfig(MAIN);
   await updateContainerConfigScalars(MAIN, { cli_scope: 'global', timezone });
   await getDb().run(
-    `UPDATE gws_ea_profile SET assistant_first_name=COALESCE(assistant_first_name,'Juno'),principal_first_name=COALESCE(principal_first_name,'Morgan'),main_agent_group_id = ? WHERE singleton = 1`,
+    `UPDATE gws_ea_profile SET assistant_first_name=COALESCE(assistant_first_name,'Juno'),principal_first_name=COALESCE(principal_first_name,'Morgan'),principal_timezone = ?,main_agent_group_id = ? WHERE singleton = 1`,
+    timezone,
     MAIN,
   );
   await createMessagingGroup({
@@ -60,6 +63,22 @@ export async function seedMain(timezone: string): Promise<void> {
 /** Main's one shared conversation, as `writeNoteForMain` resolves it. */
 export async function mainSession(): Promise<Session> {
   return (await resolveSession(MAIN, DIRECT_MESSAGE, null, 'agent-shared')).session;
+}
+
+/** Every evening close the host has armed, earliest first. */
+export async function closeRuns(): Promise<CloseRun[]> {
+  return getDb().all<CloseRun>('SELECT * FROM gws_ea_close_runs ORDER BY scheduled_at,id');
+}
+
+/** A close opened in `sessionId` as its verdict opens one, without the loop that arms it. */
+export async function openClose(id: string, sessionId: string): Promise<CloseRun> {
+  await getDb().run(
+    "INSERT INTO gws_ea_close_runs (id,session_id,scheduled_at,zone,timeline_version,state) VALUES (?,?,?,'UTC','test','pending')",
+    id,
+    sessionId,
+    new Date().toISOString(),
+  );
+  return beginCloseRun(id, sessionId);
 }
 
 /** A task occurrence as the session's inbound mailbox holds it. */

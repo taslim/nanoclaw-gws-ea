@@ -7,6 +7,7 @@ import { ActionRefusal } from '../../cli/delivery-action.js';
 import { getGroupCapabilities } from '../../capabilities.js';
 import { getSession } from '../../db/sessions.js';
 import { ALLOW, DENY, defineGuardedAction } from '../../guard/index.js';
+import { getMainAgentGroupId } from '../gws-ea-profile/db.js';
 import { AGENT_GOOGLE_SERVICES } from '../gws-ea-google/grant.js';
 import { resolveBookingSurface } from './booking-surface.js';
 
@@ -41,6 +42,8 @@ export const principalEventAction = defineGuardedAction({
     ) {
       return DENY("The principal's calendar needs Google Calendar, which this group does not hold.");
     }
-    return ALLOW('a group holding Google Calendar');
+    if (actor.agentGroupId !== (await getMainAgentGroupId()))
+      return DENY('Only main reads and changes the principal’s calendar through these tools.');
+    return ALLOW('main holding Google Calendar');
   },
 });

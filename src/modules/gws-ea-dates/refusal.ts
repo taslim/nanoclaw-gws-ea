@@ -4,16 +4,14 @@
  * check an invitation's text the same way the outbound guard checks a message.
  */
 import { TIMEZONE } from '../../config.js';
-import { getDb } from '../../db/connection.js';
-import { getGwsEaProfile } from '../gws-ea-profile/db.js';
+import { loadTimeline, zoneAt } from '../gws-ea-whereabouts/timeline.js';
 import { findWeekdayMismatch, type CalendarDate } from './weekday-check.js';
 
 const LIST = new Intl.ListFormat('en', { style: 'long', type: 'conjunction' });
 
 async function today(): Promise<CalendarDate> {
-  const timezone = (await getDb().hasTable('gws_ea_profile'))
-    ? ((await getGwsEaProfile()).principal_timezone ?? TIMEZONE)
-    : TIMEZONE;
+  const timeline = await loadTimeline();
+  const timezone = zoneAt(timeline, Date.now()) ?? TIMEZONE;
   const parts = Object.fromEntries(
     new Intl.DateTimeFormat('en-US', { timeZone: timezone, year: 'numeric', month: 'numeric', day: 'numeric' })
       .formatToParts(new Date())

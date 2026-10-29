@@ -22,13 +22,13 @@ import { compile, parse, postprocess, preprocess } from 'micromark';
 import { gfm, gfmHtml } from 'micromark-extension-gfm';
 import { normalizeUri } from 'micromark-util-sanitize-uri';
 
-import { TIMEZONE } from '../../config.js';
 import { formatLocalTime } from '../../timezone.js';
 import { oneLine, type Mailbox } from './mime.js';
 
 export interface QuotedMessage {
   readonly from: Mailbox;
   readonly sentAt: Date;
+  readonly timezone: string;
   /** Its readable text, its own quotes included. */
   readonly text: string;
 }
@@ -231,7 +231,7 @@ function quotedLines(text: string): string[] {
 export function quotedBy(quote: QuotedMessage): string {
   const name = quote.from.displayName === undefined ? '' : oneLine(quote.from.displayName);
   const writer = name === '' ? quote.from.address : `${name} <${quote.from.address}>`;
-  return `On ${formatLocalTime(quote.sentAt.toISOString(), TIMEZONE)}, ${writer} wrote:`;
+  return `On ${formatLocalTime(quote.sentAt.toISOString(), quote.timezone)}, ${writer} wrote:`;
 }
 
 export function renderEmail(content: EmailContent): RenderedEmail {

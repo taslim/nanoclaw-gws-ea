@@ -110,8 +110,10 @@ it('reports an already-applied request after a crash without reading Google and 
     reported: false,
   });
   calendar.failure = new Error('Google unavailable');
+  const readsBeforeRecovery = calendar.calls;
   vi.setSystemTime(Date.now() + 120_001);
   await reads.resumePending();
+  expect(calendar.calls).toBe(readsBeforeRecovery);
   expect(responseIn(emailSession, 'applied-before-crash')).toMatchObject({ ok: true });
   expect(notesIn(main)[0]).toContain('Booked a meeting with mira@example.com');
   expect(await getBookingRequest(emailSession.id, 'applied-before-crash')).toBeUndefined();
@@ -219,7 +221,7 @@ it.each([new Error('Read connection interrupted'), new GoogleNotSignedInError('S
 it('retains a replay when its availability read finds the Google connection down', async () => {
   await mainSession();
   await pendingBook(emailSession, 'read-during-recheck', false);
-  vi.spyOn(calendar, 'listEvents').mockRejectedValueOnce(new GoogleNotSignedInError('Sign-in stopped'));
+  vi.spyOn(calendar, 'listLocatedEvents').mockRejectedValueOnce(new GoogleNotSignedInError('Sign-in stopped'));
   await reads.resumePending();
   expect(await getBookingRequest(emailSession.id, 'read-during-recheck')).toMatchObject({ applied: false });
   expect(responseIn(emailSession, 'read-during-recheck')).toBeUndefined();
@@ -262,7 +264,9 @@ it('reports a carried-over applied book without reading Google or replaying it',
     'legacy-book',
   );
   calendar.failure = new Error('Google down');
+  const readsBeforeRecovery = calendar.calls;
   await reads.resumePending();
+  expect(calendar.calls).toBe(readsBeforeRecovery);
   expect(responseIn(chatSession, 'legacy-book')).toMatchObject({ ok: true, data: result });
   expect(notesIn(main)).toHaveLength(1);
   expect(await getBookingRequest(chatSession.id, 'legacy-book')).toBeUndefined();
@@ -745,20 +749,26 @@ it('starts recovery without blocking host startup, serializes 60-second sweeps a
   const beforeStart = getHostStartCallbacks().length;
   const beforeStop = getHostShutdownCallbacks().length;
   await import('./index.js');
-  const start = getHostStartCallbacks()[beforeStart];
-  const stop = getHostShutdownCallbacks()[beforeStop];
-  if (!start || !stop) throw new Error('No meetings lifecycle callbacks');
+  const starts = getHostStartCallbacks().slice(beforeStart);
+  const stops = getHostShutdownCallbacks().slice(beforeStop);
+  if (starts.length === 0 || stops.length === 0) throw new Error('No meetings lifecycle callbacks');
+  const stop = async (): Promise<void> => {
+    for (const callback of stops) await callback();
+  };
   vi.useFakeTimers();
   try {
     await expect(
-      Promise.resolve(
-        start({
-          db: getDb(),
-          signal: new AbortController().signal,
-          deliveryAdapter: { deliver: async () => undefined },
-        }),
+      Promise.all(
+        starts.map(
+          async (start) =>
+            await start({
+              db: getDb(),
+              signal: new AbortController().signal,
+              deliveryAdapter: { deliver: async () => undefined },
+            }),
+        ),
       ),
-    ).resolves.toBeUndefined();
+    ).resolves.toHaveLength(starts.length);
     await entered.promise;
     await vi.advanceTimersByTimeAsync(180_000);
     expect(getEvent).toHaveBeenCalledTimes(1);

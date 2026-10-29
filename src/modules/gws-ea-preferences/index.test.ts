@@ -444,3 +444,30 @@ describe('GWS-EA preferences project-doc section', () => {
     expect(document).not.toContain('Therapy');
   });
 });
+
+it('main can set, read and remove the native meal, run and ignored-copy preferences', async () => {
+  const caller = agent(main.id);
+  const basis = { source: 'principal', basis: 'Morgan confirmed the pattern.' };
+  for (const shape of [
+    { kind: 'meal-window', meal: 'lunch', weekdays: 'mon,fri', start: '14:00', end: '15:00', minutes: 30 },
+    { kind: 'back-to-back', minutes: 120, break_minutes: 10 },
+    { kind: 'ignored-events', prefix: 'csdnshold' },
+  ]) {
+    expect(await run('preferences-set', { ...shape, ...basis }, caller)).toMatchObject({ ok: true });
+  }
+  expect(await run('preferences-get', {}, caller)).toMatchObject({
+    ok: true,
+    data: {
+      meal_windows: [{ meal: 'lunch', minutes: 30 }],
+      back_to_back: [{ minutes: 120, break_minutes: 10 }],
+      ignored_events: [{ prefix: 'csdnshold' }],
+    },
+  });
+  for (const shape of [
+    { kind: 'meal-window', meal: 'lunch' },
+    { kind: 'back-to-back' },
+    { kind: 'ignored-events', prefix: 'csdnshold' },
+  ]) {
+    expect(await run('preferences-remove', { ...shape, source: 'principal' }, caller)).toMatchObject({ ok: true });
+  }
+});

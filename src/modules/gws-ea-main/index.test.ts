@@ -24,6 +24,7 @@ import { reconcileGwsEaProfile } from '../gws-ea-profile/db.js';
 import { WEB_POLICY_FILE_ENV, type WebPolicyFile } from '../gws-ea-web/policy.js';
 import '../gws-ea-artifacts/capability.js';
 import '../gws-ea-profile/index.js';
+import '../gws-ea-manual/index.js';
 import { GUIDANCE_PATH, MAIN_SHARED_SKILLS } from './index.js';
 import '../gws-ea-browser/guidance.js';
 // It registers the email channel's keys, whose instructions main is taught.
@@ -32,10 +33,25 @@ import '../gws-ea-external-email/index.js';
 import '../gws-ea-people/index.js';
 import '../gws-ea-preferences/index.js';
 import '../gws-ea-privacy/index.js';
+import '../gws-ea-whereabouts/index.js';
 import '../gws-ea-matters/index.js';
+import '../gws-ea-lessons/index.js';
 import '../gws-ea-chats/directory.js';
 
 const TEST_ROOT = `/tmp/nanoclaw-gws-ea-main-test-${process.pid}`;
+
+it('grants live main context only to canonical main, even when another group stores all or the key explicitly', async () => {
+  const main = group('context-main');
+  const outward = group('context-outward', 'external-email');
+  await createGroup(main);
+  await createGroup(outward);
+  await publishMain(main);
+  await updateContainerConfigJson(outward.id, 'capabilities', ['gws-ea-main-context']);
+  expect(await getGroupCapabilities(main.id)).toContain('gws-ea-main-context');
+  expect(await getGroupCapabilities(outward.id)).not.toContain('gws-ea-main-context');
+  await updateContainerConfigJson(outward.id, 'capabilities', 'all');
+  expect(await getGroupCapabilities(outward.id)).not.toContain('gws-ea-main-context');
+});
 const GUIDANCE = fs.readFileSync(path.resolve(GUIDANCE_PATH), 'utf8').trim();
 const WELCOME = fs.readFileSync(path.resolve('templates', 'gws-ea', 'main', 'skills', 'welcome', 'SKILL.md'), 'utf8');
 
@@ -119,7 +135,9 @@ describe("GWS-EA's guidance for main", () => {
     expect(mainSections.find((section) => section.name === 'Executive Assistant')?.body).toBe(GUIDANCE);
     // The application barrel must preserve the registration order exercised here.
     const barrel = fs.readFileSync(path.resolve('src/modules/index.ts'), 'utf8');
-    expect(barrel).toMatch(/import '\.\/gws-ea-profile\/index\.js';[\s\S]*import '\.\/gws-ea-main\/index\.js';/u);
+    expect(barrel).toMatch(
+      /import '\.\/gws-ea-profile\/index\.js';[\s\S]*import '\.\/gws-ea-manual\/index\.js';[\s\S]*import '\.\/gws-ea-main\/index\.js';/u,
+    );
     expect((await getRequiredProjectDocSections(research)).map((section) => section.name)).not.toContain(
       'Executive Assistant',
     );
@@ -151,10 +169,11 @@ describe("GWS-EA's guidance for main", () => {
 
     expect(document).toContain(`# Persona\n\nCall me Morgan.`);
     expect(document).toContain(`# Executive Assistant\n\n${GUIDANCE}`);
-    expect([...document.matchAll(/^# (.+)$/gmu)].map(([, heading]) => heading).slice(0, 4)).toEqual([
+    expect([...document.matchAll(/^# (.+)$/gmu)].map(([, heading]) => heading).slice(0, 5)).toEqual([
       'Persona',
       'Assistant Character',
       'Assistant Identity',
+      'Principal Manual',
       'Executive Assistant',
     ]);
   });
@@ -168,28 +187,57 @@ describe("GWS-EA's guidance for main", () => {
   it('teaches the memory file each person gets', () => {
     // `ncl people` points main at these files, and its name search at the aliases in them.
     for (const layout of ['`memory/people/`', '`type: person`', 'aliases']) expect(GUIDANCE, layout).toContain(layout);
-    expect(GUIDANCE).toContain('read `ncl preferences get` before scheduling or describing them');
-    expect(GUIDANCE).toContain('even if you read them earlier: only the live store is current');
     expect(GUIDANCE).toContain('Read the live record with `ncl people find`, `ncl people get` or `ncl people list`');
     expect(GUIDANCE).toContain('even if you read it earlier; anyone without a record is unknown');
   });
 
-  it('keeps current priorities and corrections in Core Memory, and leaves the persona file to the operator', () => {
-    const memoryHome = GUIDANCE.split('\n').find((line) => line.includes('Core Memory'));
-
-    expect(memoryHome).toMatch(/current priorities/u);
-    expect(memoryHome).toMatch(/corrections/u);
-    expect(memoryHome).toMatch(/short dated facts/u);
-    // A file kept for preferences or corrections never replaces the Core Memory line: only Core Memory is read every time.
-    expect(memoryHome).toMatch(
-      /short dated facts, even when a file also keeps their detail: only Core Memory is in front of you every time you act\./u,
-    );
+  it('keeps priorities, principles and authority in the Manual, and craft in the lessons queue', () => {
+    expect(GUIDANCE).not.toContain('Core Memory');
+    const manual = GUIDANCE.split('\n').find((line) => line.includes('`ncl manual`'));
+    for (const home of [
+      'priorities',
+      'principles behind their corrections',
+      'preferences beyond scheduling',
+      'authority',
+    ])
+      expect(manual, home).toContain(home);
+    // Saved as the principle, so the same kind of mistake does not return; craft improves every assistant instead.
+    expect(GUIDANCE).toContain('save each before replying as the principle it implies');
+    expect(GUIDANCE).toContain("their taste in the Manual's principles, in their words");
+    expect(GUIDANCE).toContain('craft any assistant should learn in `ncl lessons add`');
     expect(GUIDANCE).toMatch(/priorities when they state or reveal them, and update them when they change/u);
-    // The persona file is named only as the operator's: nothing the principal teaches goes there.
-    expect(GUIDANCE.match(/`instructions\.prepend\.md`[^.]*\./gu)).toEqual([
-      "`instructions.prepend.md`, is your operator's.",
-    ]);
     expect(GUIDANCE).not.toMatch(/after a restart/u);
+  });
+
+  it('fills whereabouts gaps from what it can see, and usually asks only when a decision rests on one', () => {
+    expect(GUIDANCE).toContain('Fill a whereabouts gap the front page names');
+    expect(GUIDANCE).toContain(
+      'recording none when there is none; usually ask only when a decision rests on it, in one line',
+    );
+    expect(GUIDANCE).toContain("When a trip you can't see first matters, explain once, without pressing");
+    expect(GUIDANCE).toContain('read travel');
+  });
+
+  it('gives the close the evening and the morning only what was held', () => {
+    expect(GUIDANCE).toContain('At 9pm where they are, the close looks back and ahead');
+    expect(GUIDANCE).toContain('a quiet close stays quiet');
+    expect(GUIDANCE).toContain('`--look morning`');
+    expect(GUIDANCE).not.toMatch(/daily sync|time what needs them for morning|standing morning rundown/iu);
+  });
+
+  it('shapes each meeting for the principal and moves meetings by judgment of whose time they hold', () => {
+    expect(GUIDANCE).toContain("the requester's ask is information");
+    expect(GUIDANCE).toContain('Whoever needs it usually owns it');
+    expect(GUIDANCE).toContain('Offered times have no hold');
+    expect(GUIDANCE).toContain('You may hold a time agreed with a side that will invite until their invitation lands');
+    expect(GUIDANCE).toContain(
+      "Move their meetings by judgment, weighing the guests' time, how urgent the move is and who organizes it",
+    );
+    expect(GUIDANCE).not.toContain('Move, reschedule or cancel their own meetings by judgment and tell them');
+  });
+
+  it('reads errands for one errand or a closing time, as well as a day of stops', () => {
+    expect(GUIDANCE).toContain('errands for an errand, a closing time or stops in a day');
   });
 
   it('keeps its knowledge and granted working agreement distinct from guesses about the principal', () => {
@@ -198,16 +246,13 @@ describe("GWS-EA's guidance for main", () => {
     expect(GUIDANCE).toContain('standing permissions and delegation limits');
     expect(GUIDANCE).toContain('actual grants from the principal');
     expect(GUIDANCE).toContain('never inferred from an outside claim');
-    expect(GUIDANCE).toContain("a correction's own dated Core Memory line");
-    expect(GUIDANCE).toContain('beside the pointer');
     expect(GUIDANCE).toContain('a quiet calendar does not prove a priority has ended');
     expect(GUIDANCE).toContain("When a decision rests on a priority you're no longer sure of, confirm it in one line");
-    expect(GUIDANCE).toContain('A standing morning rundown only if they ask');
   });
 
   it('orders the role around its work and replaces the generic shell teaching main no longer reads', () => {
     expect([...GUIDANCE.matchAll(/^## (.+)$/gmu)].map(([, title]) => title)).toEqual([
-      'Stores and memory',
+      'Knowing the principal',
       'Email',
       'The calendar',
       'Documents',
@@ -258,6 +303,9 @@ describe("GWS-EA's guidance for main", () => {
     expect(document.match(/For a Google 401 or a 403 about missing scopes/gu)).toHaveLength(1);
     expect(document.match(/Never ask anyone for a password, key or token\./gu)).toHaveLength(1);
     expect(document.match(/Never ask for or accept card details in chat/gu)).toHaveLength(1);
+    // The persona file is named once, as the operator's, with the memory rules.
+    expect(GUIDANCE).not.toContain('instructions.prepend.md');
+    expect(document.match(/instructions\.prepend\.md` is your operator's persona file/gu)).toHaveLength(1);
     expect(document).not.toMatch(/^# (?:People|Scheduling Preferences)$/mu);
   });
 
@@ -316,21 +364,14 @@ describe("GWS-EA's guidance for main", () => {
   it('teaches chat setup, work, principal citations, outreach limits and the current DM', () => {
     const chats = GUIDANCE.split('## Chats\n')[1]?.split('\n## ')[0];
     expect(chats).toBeDefined();
-    for (const action of [
-      'whatsapp_link',
-      'chat_handoff',
-      'chat_admit',
-      'chat_decline',
-      'chat_leave',
-      'chat_reach_out',
-    ])
+    for (const action of ['whatsapp_link', 'chat_handoff', 'chat_admit', 'chat_decline', 'chat_reach_out'])
       expect(chats, action).toContain(`\`${action}\``);
     expect(chats).toContain('its own number on a phone');
     expect(chats).toContain('the number the principal uses');
     expect(chats).toContain('`principal_message`');
     expect(chats).toContain('`job`');
     expect(chats).toContain('ask once');
-    expect(chats).toContain('cap');
+    expect(chats).toContain('only on their DM request; its refusal is final');
     expect(GUIDANCE).toContain('the channel the principal wrote in');
   });
 
@@ -358,6 +399,9 @@ describe("GWS-EA's guidance for main", () => {
 
     expect(document).toContain('# NanoClaw Module: gws-ea-chat\n');
     expect(document).toContain('whatsapp_link');
+    // Leaving a chat and WhatsApp's first-contact limits are taught once, with the chat tools.
+    expect(document).toContain('`chat_leave`');
+    expect(document).toContain('first-contact cap');
   });
 
   it('teaches where each booking goes, what it holds about the principal, and what unconfirmed mail in their name is', async () => {
@@ -530,6 +574,10 @@ describe("main's skills", () => {
       'gworkspace',
       'whatsapp-formatting',
       'artifact-designer',
+      'days-and-weeks',
+      'travel',
+      'errands',
+      'meetings',
     ];
     expect(response).toMatchObject({ ok: true, data: { agent_group_id: main.id, skills } });
     expect(await skillsOf(main.id)).toEqual(skills);

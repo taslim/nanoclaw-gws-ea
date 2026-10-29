@@ -39,7 +39,7 @@ export function renderMemorySection(
     'loaded at startup, on resume when memory has changed, after clear, and after',
     'compaction:',
     '',
-    `- \`${MEMORY_INDEX_PATH}\` - your memory index, Core Memory first`,
+    `- \`${MEMORY_INDEX_PATH}\` - your memory index and retrieval map`,
     `- \`${definition.path}\` - how your memory works; it comes with this release and is read-only`,
     '',
     'That definition is the one in force: copies under `memory/system/` are not',

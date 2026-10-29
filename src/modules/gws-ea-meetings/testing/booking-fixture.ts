@@ -8,10 +8,12 @@ import { vi } from 'vitest';
 
 import '../../gws-ea-inbox/index.js';
 import '../../gws-ea-preferences/index.js';
+import '../../gws-ea-whereabouts/index.js';
 import { DATA_DIR } from '../../../config.js';
 import { ANSWER_LATER } from '../../../cli/delivery-action.js';
 import type { ResponseFrame } from '../../../cli/frame.js';
 import { getDb } from '../../../db/connection.js';
+import { runMigrations } from '../../../db/migrations/index.js';
 import { createAgentGroup } from '../../../db/agent-groups.js';
 import { ensureContainerConfig, updateContainerConfigScalars } from '../../../db/container-configs.js';
 import { createMessagingGroup } from '../../../db/messaging-groups.js';
@@ -30,6 +32,8 @@ import { chatBookingRequestsMigration } from '../chat-booking-migration.js';
 import { chatBookingReportsMigration } from '../chat-booking-report-migration.js';
 import { setThreadBookingCalendar } from '../thread-calendar.js';
 import { FakeCalendar } from './fake-calendar.js';
+import { calendarWriteLogMigration } from '../week/write-log-migration.js';
+import { pendingCalendarChangesMigration } from '../week/pending-changes-migration.js';
 
 export const PRINCIPAL = 'juno@example.com';
 export const ASSISTANT = 'avery@example.com';
@@ -58,6 +62,7 @@ export async function seedBookingFixture(): Promise<BookingFixture> {
     if (migration.sqliteOnly) throw new Error('Expected portable migration');
     await migration.up(getDb());
   }
+  await runMigrations(getDb(), [calendarWriteLogMigration, pendingCalendarChangesMigration]);
   const chatSession = seeded.session;
   const chat = chatSession.messaging_group_id ?? '';
   await createAgentGroup({

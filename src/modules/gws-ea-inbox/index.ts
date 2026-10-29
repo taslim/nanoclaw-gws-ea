@@ -37,7 +37,6 @@ import { getInboxHealth } from './health.js';
 import { hostGoogleAccessToken } from '../gws-ea-google/index.js';
 import { GOOGLE_GRANT_FILE_ENV } from '../gws-ea-google/grant.js';
 import { identityMatchKey } from '../../gws-ea/validation.js';
-import { createMeetingsCalendarApi } from '../gws-ea-meetings/calendar-api.js';
 import { registerPersonForgetHook } from '../gws-ea-people/index.js';
 import { registerRecipientResolver } from '../gws-ea-privacy/index.js';
 import { getMainAgentGroupId, syncPrincipalMembers } from '../gws-ea-profile/db.js';
@@ -70,6 +69,8 @@ import {
   type SendScope,
 } from './thread-map.js';
 import { ensureInbox, ensurePrincipalConversation } from './wiring-policy.js';
+import { threadAuthenticationMigration } from './thread-authentication-migration.js';
+import '../gws-ea-whereabouts/index.js';
 
 registerMigration(gwsEaInboxMigration);
 registerMigration(gwsEaInboxEmailChannelMigration);
@@ -79,6 +80,7 @@ registerMigration(gwsEaInboxUnsignedNoticesMigration);
 registerMigration(gwsEaInboxCalendarAccessMigration);
 registerMigration(gwsEaInboxThreadAccountsMigration);
 registerMigration(gwsEaInboxThreadPlacementMigration);
+registerMigration(threadAuthenticationMigration);
 
 let live: Inbox | undefined;
 
@@ -93,7 +95,6 @@ registerChannelAdapter(EMAIL_CHANNEL_TYPE, {
     live = createInbox({
       gmail: createGmailApi({ token: () => hostGoogleAccessToken('gmail') }),
       calendar: createCalendarListApi({ token: () => hostGoogleAccessToken('calendar-host') }),
-      events: createMeetingsCalendarApi({ token: () => hostGoogleAccessToken('calendar-host') }),
       drive: createDriveApi({ token: () => hostGoogleAccessToken('drive-host') }),
     });
     return live.adapter;

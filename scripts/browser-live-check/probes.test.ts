@@ -1,4 +1,5 @@
 import { execFile } from 'node:child_process';
+import { once } from 'node:events';
 import { stat } from 'node:fs/promises';
 import { connect } from 'node:net';
 import { promisify } from 'node:util';
@@ -43,6 +44,24 @@ describe.skipIf(!chromePath)('native live-check harness', () => {
       const listeners = records.filter((record) => record.startsWith('n'));
       expect(listeners.length).toBeGreaterThan(0);
       expect(listeners.every((record) => record === `n127.0.0.1:${debuggerPort}`)).toBe(true);
+
+      // Chrome may reset a refused CONNECT before the proxy finishes closing its socket.
+      const proxyArgument = probe.child.spawnargs.find((argument) => argument.startsWith('--proxy-server='));
+      if (proxyArgument === undefined) throw new Error('Owned Chrome has no proxy');
+      const proxyUrl = new URL(proxyArgument.slice('--proxy-server='.length));
+      const client = connect({ host: proxyUrl.hostname, port: Number(proxyUrl.port) });
+      try {
+        await once(client, 'connect');
+        client.write('CONNECT reset.invalid:443 HTTP/1.1\r\nHost: reset.invalid:443\r\n\r\n');
+        const [response]: unknown[] = await once(client, 'data');
+        expect(Buffer.isBuffer(response) && response.toString('utf8')).toMatch(/^HTTP\/1\.1 403 Forbidden\r\n/);
+        const closed = once(client, 'close');
+        client.resetAndDestroy();
+        await closed;
+      } finally {
+        client.destroy();
+      }
+
       const page = await probe.newPage();
       await page.goto(
         "data:text/html,<h1>Before</h1><button onclick=\"document.querySelector('h1').textContent='After'\">Run</button>",

@@ -1,3 +1,5 @@
+import { recordPendingCalendarChange } from '../gws-ea-meetings/week/pending-changes.js';
+import { loadTimeline, zoneAt, type Timeline } from '../gws-ea-whereabouts/timeline.js';
 /**
  * Where each message goes: to the part allowed to write to everyone who can
  * read it, decided per message from who Gmail says sent it and who it shows
@@ -57,7 +59,6 @@ import type { Session } from '../../types.js';
 import { verifiedSender } from '../gws-ea-matters/candidates.js';
 import { listOpenMatters } from '../gws-ea-matters/db.js';
 import { renderOpenList } from '../gws-ea-matters/render.js';
-import type { MeetingsCalendarApi } from '../gws-ea-meetings/calendar-api.js';
 import { findPeople, getPersonLevel, type PersonLevel } from '../gws-ea-people/db.js';
 import { getGwsEaProfile, principalRecognizer } from '../gws-ea-profile/db.js';
 import { isDuplicateNote, writeNoteForMain, type NoteForMain, type NotePiece } from '../gws-ea-profile/main-note.js';
@@ -105,6 +106,7 @@ import {
   placementAsked,
   recordPlacementNote,
   recordThreadAddresses,
+  recordAuthenticatedThreadSender,
   recordThreadMessage,
   threadPlacement,
   unplaceThread,
@@ -128,7 +130,8 @@ export interface RoutingContext {
   readonly auth: AuthContext;
   /** The principal's calendars in the assistant's calendar list, lowercased as notices name them. */
   readonly principalCalendars: ReadonlySet<string>;
-  readonly principal: { readonly name: string | null; readonly timezone: string };
+  readonly principal: { readonly name: string | null };
+  readonly timeline: Timeline;
   readonly at: Date;
 }
 
@@ -140,8 +143,8 @@ export async function loadRoutingContext(assistant: ReadonlySet<string>, at: Dat
     principalCalendars: new Set(await listPrincipalCalendars()),
     principal: {
       name: profile?.principal_display_name ?? null,
-      timezone: profile?.principal_timezone ?? TIMEZONE,
     },
+    timeline: await loadTimeline(),
     at,
   };
 }
@@ -224,7 +227,12 @@ function writtenAddresses(mail: ParsedMail): string[] {
 }
 
 /** Safe to repeat. Returns the thread key, a new thread's when the message belongs to none. */
-async function recordInThread(mail: ParsedMail, side: ThreadSide, context: RoutingContext): Promise<string> {
+async function recordInThread(
+  mail: ParsedMail,
+  side: ThreadSide,
+  verdict: Sender,
+  context: RoutingContext,
+): Promise<string> {
   const at = context.at.toISOString();
   const ours = (address: string): boolean => context.assistant.has(address);
   const carried = [...(mail.from ? [mail.from] : []), ...mail.to, ...mail.cc]
@@ -248,6 +256,7 @@ async function recordInThread(mail: ParsedMail, side: ThreadSide, context: Routi
       at,
     );
     await recordThreadAddresses(thread.threadKey, carried, 'message', at);
+    if (verdict.kind === 'authenticated') await recordAuthenticatedThreadSender(thread.threadKey, verdict.address, at);
     if (written.length > 0) await recordThreadAddresses(thread.threadKey, written, 'written', at);
     return thread.threadKey;
   });
@@ -343,7 +352,7 @@ async function senderRecord(
 }
 
 /** The relationship a level stands for, never the level's own name. */
-function levelClause(level: PersonLevel, principal: string): string {
+export function levelClause(level: PersonLevel, principal: string): string {
   switch (level) {
     case 'inner-circle':
       return `who is one of the people closest to ${principal}`;
@@ -506,7 +515,7 @@ async function toMain(
   if ((await emailMessagingGroupIds()).principal === null) {
     throw new Error("The principal's email conversation does not exist yet");
   }
-  const threadKey = await recordInThread(mail, 'principal', context);
+  const threadKey = await recordInThread(mail, 'principal', verdict, context);
   const files = await fetchFiles(runtime.gmail, mail);
   // main names the thread by its key when it answers, so the key comes last, after what it is about.
   const text =
@@ -550,11 +559,12 @@ async function noticeUnsigned(
 ): Promise<void> {
   if (!(await recordUnsignedNotice(refused.address, refused.reason, context.at.toISOString()))) return;
   const receivedAt = mail.receivedAt ?? context.at;
-  const { timezone } = context.principal;
+  const timezone = zoneAt(context.timeline, receivedAt.getTime()) ?? TIMEZONE;
   const told = await noticeUnsignedMail({ ...refused, receivedAt, timezone });
   const principal = principalName(context);
   const result = await writeNoteForMain({
     id: `inbox-unsigned-${mail.id}`,
+    ...(told ? { noteKind: 'host-receipt' as const } : {}),
     timestamp: context.at.toISOString(),
     wake: false,
     text:
@@ -677,7 +687,7 @@ async function toThread(
   context: RoutingContext,
 ): Promise<Routed> {
   if ((await emailMessagingGroupIds()).inbox === null) throw new Error('The inbox does not exist yet');
-  const threadKey = await recordInThread(mail, 'outside', context);
+  const threadKey = await recordInThread(mail, 'outside', verdict, context);
   const awaiting = await awaitedBy(threadKey);
   const files = await fetchFiles(runtime.gmail, mail);
 
@@ -926,75 +936,9 @@ export async function writeHeldNote(
 // Calendar notifications
 // ---------------------------------------------------------------------------
 
-const CHANGE_WORDS: Readonly<Record<CalendarNotice['change'], string>> = {
-  created: 'A new event',
-  changed: 'An event changed',
-  cancelled: 'An event was cancelled',
-  response: 'Someone answered an invitation',
-  unknown: 'Something changed on an event',
-};
-
-/** For the open matters a new event may belong to; undefined when Calendar cannot show it just now. */
-async function organizerOf(
-  events: Pick<MeetingsCalendarApi, 'getEvent'>,
-  notice: CalendarNotice,
-): Promise<string | undefined> {
-  /* eslint-disable no-catch-all/no-catch-all -- an organizer Calendar cannot show costs the note its suggestions, never the note */
-  try {
-    return (await events.getEvent(notice.calendarId, notice.eventId))?.organizer?.email;
-  } catch (error) {
-    log.warn("Could not read a new event's organizer from Calendar", {
-      calendarId: notice.calendarId,
-      eventId: notice.eventId,
-      error: error instanceof Error ? error.message : String(error),
-    });
-    return undefined;
-  }
-  /* eslint-enable no-catch-all/no-catch-all */
-}
-
-/**
- * No text from the emails reaches main. Each event's open matter comes with
- * it, and a new event in none brings the open matters its organizer, as
- * Calendar names them, may tie it to.
- */
 export async function writeCalendarNote(
   notices: readonly { readonly gmailMessageId: string; readonly notice: CalendarNotice }[],
-  events: Pick<MeetingsCalendarApi, 'getEvent'>,
   at: Date,
 ): Promise<void> {
-  // Each change once, however many emails reported it.
-  const lines = [
-    ...new Set(
-      notices.map(
-        ({ notice }) => `- ${CHANGE_WORDS[notice.change]} (event ${notice.eventId} on calendar ${notice.calendarId})`,
-      ),
-    ),
-  ];
-  const batch = batchKey(notices.map((entry) => entry.gmailMessageId));
-  // Each event once, new when any of its notifications says so.
-  const byEvent = new Map<string, CalendarNotice>();
-  for (const { notice } of notices) {
-    const reference = `${notice.calendarId}/${notice.eventId}`;
-    if (!byEvent.has(reference) || notice.change === 'created') byEvent.set(reference, notice);
-  }
-  const pieces = await Promise.all(
-    [...byEvent].map(
-      async ([reference, notice]): Promise<NotePiece> =>
-        notice.change === 'created'
-          ? { kind: 'event', reference, arrival: { from: await organizerOf(events, notice) } }
-          : { kind: 'event', reference },
-    ),
-  );
-  await writeMainNote(
-    {
-      id: `inbox-calendar-${batch}`,
-      wake: true,
-      text:
-        `Google Calendar reports ${lines.length === 1 ? 'a change' : `${lines.length} changes`}:\n` +
-        `${lines.join('\n')}\nRead each event from the calendar before you act on it.`,
-      pieces,
-    },
-    at,
-  );
+  for (const { gmailMessageId, notice } of notices) await recordPendingCalendarChange(gmailMessageId, notice, at);
 }

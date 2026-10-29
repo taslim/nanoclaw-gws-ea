@@ -1,10 +1,11 @@
 import { query as sdkQuery, type HookCallback, type PreCompactHookInput } from '@anthropic-ai/claude-agent-sdk';
 
 import { acknowledgmentReminder } from '../acknowledge.js';
-import { runnerCapabilities } from '../config.js';
+import { planningAgentsEnabled, runnerCapabilities } from '../config.js';
 import { clearContainerToolInFlight, setContainerToolInFlight } from '../db/container-state.js';
 import { sessionsSealed } from '../memory/sealed.js';
 import type { MemorySessionHookRegistration } from '../memory/session-hook.js';
+import { createPlanningRuntime, PLANNING_AGENTS, type PlanningRuntime } from '../planning-agents.js';
 import type { ResolvedRuntimeConfiguration } from '../provider-contracts/registry.js';
 // The execution-policy, inference, MCP, and memory derivations live in
 // claude-config.ts. The runtime contract (provider-contracts/claude.ts)
@@ -148,8 +149,15 @@ const SUBAGENT_DENIED_TOOLS: ReadonlySet<string> = new Set(
  * Anything allowed is recorded as in flight, with its declared timeout, so
  * the host sweep can widen its stuck tolerance while Bash runs a long script.
  */
-export function createPreToolUseHook(policy: ClaudeCapabilityPolicy): HookCallback {
+export function createPreToolUseHook(policy: ClaudeCapabilityPolicy, planning?: PlanningRuntime): HookCallback {
   return async (input) => {
+    if (input.hook_event_name !== 'PreToolUse') return { continue: true };
+    const planningDecision = planning?.preToolUse(input);
+    if (
+      planningDecision?.hookSpecificOutput?.hookEventName === 'PreToolUse' &&
+      planningDecision.hookSpecificOutput.permissionDecision === 'deny'
+    )
+      return planningDecision;
     const i = input as { tool_name?: string; tool_input?: Record<string, unknown>; agent_id?: string };
     const toolName = i.tool_name ?? '';
     if (SDK_DISALLOWED_TOOLS.includes(toolName)) {
@@ -192,7 +200,7 @@ export function createPreToolUseHook(policy: ClaudeCapabilityPolicy): HookCallba
     } catch (err) {
       log(`PreToolUse: failed to record container_state: ${err instanceof Error ? err.message : String(err)}`);
     }
-    return { continue: true };
+    return planningDecision ?? { continue: true };
   };
 }
 
@@ -356,6 +364,7 @@ export class ClaudeProvider implements AgentProvider {
 
     const instructions = input.systemContext?.instructions;
     const toolOptions = resolveClaudeToolOptions(this.capabilities, this.mcp, this.executionPolicy.disallowedTools);
+    const planning = planningAgentsEnabled(runnerCapabilities()) ? createPlanningRuntime(input.cwd) : undefined;
 
     const sdkResult = sdkQuery({
       prompt: stream,
@@ -393,9 +402,11 @@ export class ClaudeProvider implements AgentProvider {
         // than query options, which is why they ride `settings`.
         settings: { ...this.inference.settings, ...this.executionPolicy.settings },
         mcpServers: toolOptions.mcpServers,
+        ...(planning ? { agents: PLANNING_AGENTS } : {}),
         ...(toolOptions.strictMcpConfig ? { strictMcpConfig: true } : {}),
         hooks: {
-          PreToolUse: [{ hooks: [this.preToolUseHook] }],
+          PreToolUse: [{ hooks: [planning ? createPreToolUseHook(this.capabilities, planning) : this.preToolUseHook] }],
+          ...(planning ? { SubagentStart: [{ hooks: [planning.start] }] } : {}),
           PostToolUse: [{ hooks: [postToolUseHook] }],
           PostToolUseFailure: [{ hooks: [postToolUseHook] }],
           PostToolBatch: [{ hooks: [acknowledgeHook] }],
@@ -429,6 +440,8 @@ export class ClaudeProvider implements AgentProvider {
         if (message.type === 'system' && message.subtype === 'init') {
           yield { type: 'init', continuation: message.session_id };
         } else if (message.type === 'assistant') {
+          // The SDK also streams child text; only main may turn a planning result into a delivered message.
+          if (planning && typeof message.parent_tool_use_id === 'string') continue;
           // Surface each assistant message's text as it streams in. The final
           // `result` event only carries the LAST assistant text — a wrapped
           // <message> block composed between tool calls would otherwise be

@@ -75,7 +75,7 @@ afterEach(async () => {
 });
 
 describe('the matters schema', () => {
-  it('holds exactly the fields R2 names: no status, stage, priority, due date, owner or log', async () => {
+  it('holds planning facts separately from state, ownership and history', async () => {
     const columns = async (table: string) =>
       (await getDb().all<{ readonly name: string }>(`PRAGMA table_info(${table})`)).map((column) => column.name);
 
@@ -91,6 +91,10 @@ describe('the matters schema', () => {
       'created_at',
       'updated_at',
       'closed_at',
+      'due_at',
+      'needs_minutes',
+      'place',
+      'deferrals',
     ]);
     expect(await columns('gws_ea_matter_links')).toEqual([
       'matter_id',
@@ -182,6 +186,10 @@ describe('opening and placing', () => {
       open: true,
       outcome: null,
       look_task_id: null,
+      due_at: null,
+      needs_minutes: null,
+      place: null,
+      deferrals: 0,
       links: [
         { kind: 'thread', reference: THREAD_A, handler: null, linked_at: NOW },
         { kind: 'event', reference: EVENT, handler: null, linked_at: NOW },

@@ -10,6 +10,7 @@
  * 412; one on an event that is not there is `gone`.
  */
 import { GoogleApiError } from '../../gws-ea-inbox/gmail-api.js';
+import { isRecord } from '../../../gws-ea/validation.js';
 import type {
   CalendarEntry,
   CalendarEvent,
@@ -23,6 +24,7 @@ import type {
   GuestRecord,
   GuestWriteResult,
   MeetingsCalendarApi,
+  LocatedEvent,
   NewEvent,
   SendUpdates,
 } from '../calendar-api.js';
@@ -35,11 +37,24 @@ export interface StoredEvent extends Omit<CalendarEvent, 'organizer' | 'attendee
   readonly attendeesOmitted?: boolean;
   readonly recurringEventId?: string;
   readonly originalStartTime?: EventTime;
+  readonly creator?: DetailedEvent['creator'];
   readonly summary?: string;
   readonly description?: string;
   readonly location?: string;
   readonly visibility?: string;
-  readonly reminders?: 'default' | 'none';
+  readonly reminders?: DetailedEvent['reminders'];
+  readonly reminderOverrides?: DetailedEvent['reminderOverrides'];
+  readonly conferenceData?: Readonly<Record<string, unknown>>;
+  readonly guestsCanModify?: boolean;
+  readonly guestsCanInviteOthers?: boolean;
+  readonly guestsCanSeeOtherGuests?: boolean;
+  readonly attachments?: readonly unknown[];
+  readonly privateCopy?: boolean;
+  readonly endTimeUnspecified?: boolean;
+  readonly anyoneCanAddSelf?: boolean;
+  readonly colorId?: string;
+  readonly source?: DetailedEvent['source'];
+  readonly sharedTags?: DetailedEvent['sharedTags'];
   readonly recurrence?: readonly string[];
   /** Each guest whole, as Google holds them, once a test or a guest-list write sets more than `attendees` keeps. */
   readonly guests?: readonly GuestRecord[];
@@ -111,13 +126,20 @@ function apply(written: StoredEvent, fields: EventWrite, meet: EventConference['
           written,
           fields.attendees.map((guest) => ({ ...guest })),
         );
-  const conference: EventConference | undefined =
-    event.conference ??
-    (fields.conference === undefined
-      ? undefined
-      : meet === 'success'
-        ? { status: 'success', uri: `https://meet.google.com/${fields.conference.requestId.slice(0, 10)}` }
-        : { status: meet });
+  const copiedVideo = Array.isArray(fields.conferenceData?.entryPoints)
+    ? fields.conferenceData.entryPoints.find(
+        (entry: unknown): entry is Record<string, unknown> =>
+          isRecord(entry) && entry.entryPointType === 'video' && typeof entry.uri === 'string',
+      )
+    : undefined;
+  const conference: EventConference | undefined = fields.conferenceData
+    ? { status: 'success', ...(typeof copiedVideo?.uri === 'string' ? { uri: copiedVideo.uri } : {}) }
+    : (event.conference ??
+      (fields.conference === undefined
+        ? undefined
+        : meet === 'success'
+          ? { status: 'success', uri: `https://meet.google.com/${fields.conference.requestId.slice(0, 10)}` }
+          : { status: meet }));
   return {
     ...event,
     ...(fields.status === undefined ? {} : { status: fields.status }),
@@ -125,16 +147,36 @@ function apply(written: StoredEvent, fields: EventWrite, meet: EventConference['
     ...(fields.description === undefined ? {} : { description: fields.description }),
     ...(fields.location === undefined ? {} : { location: fields.location }),
     ...(conference === undefined ? {} : { conference }),
+    ...(fields.conferenceData === undefined ? {} : { conferenceData: structuredClone(fields.conferenceData) }),
     ...(fields.start === undefined
       ? {}
-      : { start: fields.allDay === true ? { date: fields.start } : { dateTime: fields.start } }),
+      : {
+          start:
+            fields.allDay === true
+              ? { date: fields.start }
+              : { dateTime: fields.start, ...(fields.timeZone === undefined ? {} : { timeZone: fields.timeZone }) },
+        }),
     ...(fields.end === undefined
       ? {}
-      : { end: fields.allDay === true ? { date: fields.end } : { dateTime: fields.end } }),
+      : {
+          end:
+            fields.allDay === true
+              ? { date: fields.end }
+              : { dateTime: fields.end, ...(fields.timeZone === undefined ? {} : { timeZone: fields.timeZone }) },
+        }),
     ...(fields.recurrence === undefined ? {} : { recurrence: [...fields.recurrence] }),
     ...(fields.visibility === undefined ? {} : { visibility: fields.visibility }),
     ...(fields.transparency === undefined ? {} : { transparency: fields.transparency }),
     ...(fields.reminders === undefined ? {} : { reminders: fields.reminders }),
+    ...(fields.reminderOverrides === undefined ? {} : { reminderOverrides: [...fields.reminderOverrides] }),
+    ...(fields.guestsCanModify === undefined ? {} : { guestsCanModify: fields.guestsCanModify }),
+    ...(fields.guestsCanInviteOthers === undefined ? {} : { guestsCanInviteOthers: fields.guestsCanInviteOthers }),
+    ...(fields.guestsCanSeeOtherGuests === undefined
+      ? {}
+      : { guestsCanSeeOtherGuests: fields.guestsCanSeeOtherGuests }),
+    ...(fields.colorId === undefined ? {} : { colorId: fields.colorId }),
+    ...(fields.source === undefined ? {} : { source: fields.source }),
+    ...(fields.sharedTags === undefined ? {} : { sharedTags: fields.sharedTags }),
     ...(fields.tags === undefined ? {} : { tags: { ...fields.tags } }),
   };
 }
@@ -208,6 +250,32 @@ export class FakeCalendar implements MeetingsCalendarApi {
     if (index >= 0) this.events.splice(index, 1);
   }
 
+  async getEventDetail(calendarId: string, eventId: string): Promise<DetailedEvent | undefined> {
+    this.call();
+    const value = this.event(calendarId, eventId);
+    if (!value) return undefined;
+    const conference = value.conference
+      ? {
+          ...value.conference,
+          entryPoints: value.conference.uri ? [{ entryPointType: 'video', uri: value.conference.uri }] : [],
+        }
+      : undefined;
+    return { ...value, ...(conference ? { conference } : { conference: undefined }) };
+  }
+  async freeBusy(ids: readonly string[], start: string, end: string) {
+    this.call();
+    return Object.fromEntries(
+      ids.map((id) => [
+        id,
+        this.live(id)
+          .filter((e) => overlapsInterval(e, Date.parse(start), Date.parse(end)))
+          .flatMap((e) =>
+            e.start?.dateTime && e.end?.dateTime ? [{ start: e.start.dateTime, end: e.end.dateTime }] : [],
+          ),
+      ]),
+    );
+  }
+
   async getCalendar(calendarId: string) {
     this.call();
     return this.calendars.get(calendarId.toLowerCase());
@@ -230,12 +298,41 @@ export class FakeCalendar implements MeetingsCalendarApi {
     return this.live(calendarId).filter((e) => overlapsInterval(e, min, max));
   }
 
+  async listLocatedEvents(calendarId: string, timeMin: string, timeMax: string): Promise<LocatedEvent[]> {
+    this.call();
+    return this.live(calendarId)
+      .filter((event) => overlapsInterval(event, Date.parse(timeMin), Date.parse(timeMax)))
+      .map((event) => ({
+        id: event.id,
+        etag: event.etag,
+        iCalUID: event.iCalUID,
+        status: event.status,
+        transparency: event.transparency,
+        organizer: event.organizer ? { email: event.organizer.email } : undefined,
+        attendees: event.attendees?.map(({ email, responseStatus, resource, organizer, self }) => ({
+          email,
+          responseStatus,
+          resource,
+          organizer,
+          self,
+        })),
+        start: event.start,
+        end: event.end,
+        tags: event.tags,
+        conference: event.conference,
+        location: event.location,
+      }));
+  }
+
   /** As Google lists them with titles and names: everything stored but the assistant's tags and the calendar. */
   async listEventDetails(calendarId: string, timeMin: string, timeMax: string): Promise<DetailedEvent[]> {
     const listed = await this.listEvents(calendarId, timeMin, timeMax);
-    return listed.map(
-      ({ calendarId: _calendar, tags: _tags, conference: _conference, guests: _guests, etag: _etag, ...event }) =>
-        event,
+    return Promise.all(
+      listed.map(async (event) => {
+        const detail = await this.getEventDetail(calendarId, event.id);
+        if (!detail) throw new Error('Listed calendar event disappeared');
+        return detail;
+      }),
     );
   }
 
@@ -373,7 +470,10 @@ export function delegatingCalendarApi(current: () => MeetingsCalendarApi): Meeti
     getCalendar: (calendarId) => current().getCalendar(calendarId),
     listCalendars: () => current().listCalendars(),
     getEvent: (calendarId, eventId) => current().getEvent(calendarId, eventId),
+    getEventDetail: (calendarId, eventId) => current().getEventDetail(calendarId, eventId),
+    freeBusy: (ids, start, end) => current().freeBusy(ids, start, end),
     listEvents: (calendarId, timeMin, timeMax) => current().listEvents(calendarId, timeMin, timeMax),
+    listLocatedEvents: (calendarId, timeMin, timeMax) => current().listLocatedEvents(calendarId, timeMin, timeMax),
     listEventDetails: (calendarId, timeMin, timeMax) => current().listEventDetails(calendarId, timeMin, timeMax),
     insertEvent: (calendarId, eventId, event, sendUpdates) =>
       current().insertEvent(calendarId, eventId, event, sendUpdates),

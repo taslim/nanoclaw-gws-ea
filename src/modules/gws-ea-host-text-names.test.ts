@@ -602,9 +602,12 @@ describe('the host-text names check', () => {
     expect(problems('gws-ea-fixture/main-notes.ts', `const NOTE = 'Answer it with gog calendar respond.';`)).toEqual([
       'gws-ea-fixture/main-notes.ts:1 gog calendar respond: not a command gog is given',
     ]);
-    expect(problems('gws-ea-fixture/main-notes.ts', `const NOTE = 'Read it with gog calendar event first.';`)).toEqual(
-      [],
-    );
+    expect(
+      problems(
+        'gws-ea-fixture/main-notes.ts',
+        `const NOTE = 'Read the calendar list with gog calendar calendars first.';`,
+      ),
+    ).toEqual([]);
   });
 
   it.each(['calender events', 'contacts list'])('fails on a gog service that is not given: %s', (command) => {

@@ -15,6 +15,9 @@ const NOW = '2026-09-30T16:00:00.000Z';
 const LATER = '2026-10-01T09:30:00.000Z';
 
 const EMPTY = {
+  meal_windows: [],
+  back_to_back: [],
+  ignored_events: [],
   working_hours: [],
   protected_windows: [],
   meeting_lengths: [],
@@ -531,6 +534,9 @@ describe('GWS-EA scheduling preferences store', () => {
     const values = await getSchedulingPreferenceValues();
 
     expect(values).toEqual({
+      meal_windows: [],
+      back_to_back: [],
+      ignored_events: [],
       working_hours: [
         { weekday: 'mon', off: false, start: '09:00', end: '17:00', source: 'principal', updated_at: NOW },
       ],
@@ -634,5 +640,33 @@ describe('GWS-EA scheduling preferences store', () => {
       ),
     ).rejects.toThrow();
     expect(await getSchedulingPreferences()).toEqual(EMPTY);
+  });
+});
+
+it('stores accepted meal, back-to-back and ignored-copy patterns through native preferences', async () => {
+  const basis = { source: 'principal', basis: 'Morgan confirmed the pattern.' };
+  await setSchedulingPreference({
+    kind: 'meal-window',
+    meal: 'lunch',
+    weekdays: ['mon', 'fri'],
+    start: '14:00',
+    end: '15:00',
+    minutes: 30,
+    ...basis,
+  });
+  await setSchedulingPreference({ kind: 'back-to-back', minutes: 120, breakMinutes: 10, ...basis });
+  await setSchedulingPreference({ kind: 'ignored-events', prefix: 'csdnshold', ...basis });
+  expect(await getSchedulingPreferenceValues()).toMatchObject({
+    meal_windows: [{ meal: 'lunch', weekdays: ['mon', 'fri'], start: '14:00', end: '15:00', minutes: 30 }],
+    back_to_back: [{ minutes: 120, break_minutes: 10 }],
+    ignored_events: [{ prefix: 'csdnshold' }],
+  });
+  await removeSchedulingPreference({ kind: 'meal-window', meal: 'lunch', source: 'principal' });
+  await removeSchedulingPreference({ kind: 'back-to-back', source: 'principal' });
+  await removeSchedulingPreference({ kind: 'ignored-events', prefix: 'csdnshold', source: 'principal' });
+  expect(await getSchedulingPreferenceValues()).toMatchObject({
+    meal_windows: [],
+    back_to_back: [],
+    ignored_events: [],
   });
 });

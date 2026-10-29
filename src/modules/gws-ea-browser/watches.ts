@@ -41,7 +41,7 @@ import { executeRecipe } from './recipes.js';
 import { loadRecipe, recipeCheckKey, type BrowserRecipe } from './recipe-store.js';
 import { type StructuredBrowserLocator } from './locators.js';
 import type { BrowserExecutionContext, BrowserQueuedAction } from './actions.js';
-import { principalClock, watchSitePolicy, watchStartAt, type WatchReleaseRule } from './watch-policy.js';
+import { loadPrincipalClock, watchSitePolicy, watchStartAt, type WatchReleaseRule } from './watch-policy.js';
 import {
   renderWatchCard,
   termsOverBounds,
@@ -456,8 +456,12 @@ export async function createBrowserWatch(
     await db.run("UPDATE gws_ea_browser_watches SET status = 'cancelled' WHERE id = ?", id);
     return { status: 'refused', reason: 'principal_unavailable' };
   }
-  const principalTimeZone = await principalClock();
-  const question = renderWatchCard(watch, prepared.venueTimeZone ?? principalTimeZone, principalTimeZone);
+  const clock = await loadPrincipalClock();
+  const question = renderWatchCard(
+    watch,
+    prepared.venueTimeZone ?? clock(bounds.windows[0]?.start ?? bounds.until),
+    clock,
+  );
   const approvalId = await requestApproval({
     session: context.session,
     agentName: 'browser',
@@ -648,7 +652,7 @@ export const listWatchesAction: BrowserQueuedAction = {
       'SELECT * FROM gws_ea_browser_watches WHERE job_id = ? ORDER BY created_at,id',
       context.job.id,
     );
-    const principalTimeZone = await principalClock();
+    const clock = await loadPrincipalClock();
     const now = Date.now();
     const listed: Array<Record<string, unknown>> = [];
     for (const watch of watches)
@@ -665,7 +669,7 @@ export const listWatchesAction: BrowserQueuedAction = {
                   watchSitePolicy(watch.site),
                   Math.max(Date.parse(watch.next_check_at), now),
                   watchReleases(watch),
-                  principalTimeZone,
+                  clock,
                 ),
               ).toISOString()
             : watch.next_check_at,

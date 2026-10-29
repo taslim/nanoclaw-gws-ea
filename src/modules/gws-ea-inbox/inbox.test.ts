@@ -14,14 +14,17 @@ import path from 'path';
 import Database from 'better-sqlite3';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-const TEST_DIR = '/tmp/nanoclaw-test-gws-ea-inbox';
+const fixture = vi.hoisted(() => ({
+  root: `/tmp/gws-ea-u9-inbox-${process.pid}-${Math.random().toString(36).slice(2)}`,
+}));
+const TEST_DIR = fixture.root;
 
 vi.mock('../../config.js', async () => {
   const actual = await vi.importActual<typeof import('../../config.js')>('../../config.js');
   return {
     ...actual,
-    DATA_DIR: '/tmp/nanoclaw-test-gws-ea-inbox',
-    GROUPS_DIR: '/tmp/nanoclaw-test-gws-ea-inbox/groups',
+    DATA_DIR: fixture.root,
+    GROUPS_DIR: `${fixture.root}/groups`,
   };
 });
 
@@ -137,8 +140,12 @@ import { EXTERNAL_EMAIL_CAPABILITIES } from '../gws-ea-external-email/group.js';
 import { getMatter, listOpenMatters, openMatter } from '../gws-ea-matters/db.js';
 import '../gws-ea-matters/index.js';
 import { keepMattersOnTime } from '../gws-ea-matters/loop.js';
-import { syncVerdict, todayVerdict } from '../gws-ea-matters/sync.js';
+import { closeVerdict, todayVerdict } from '../gws-ea-matters/sync.js';
+import { closeRuns } from '../gws-ea-matters/testing/main-conversation.js';
 import '../gws-ea-meetings/index.js';
+import { loadCalendarWeek } from '../gws-ea-meetings/days.js';
+import type { EventCopy } from '../gws-ea-meetings/week/model.js';
+import { flushPendingCalendarChanges } from '../gws-ea-meetings/week/refresh.js';
 import { FakeCalendar as FakeEvents } from '../gws-ea-meetings/testing/fake-calendar.js';
 import '../gws-ea-workspace/index.js';
 import { recordFolderGrant } from '../gws-ea-workspace/db.js';
@@ -172,7 +179,14 @@ import { createCalendarListApi, UNSHARED_RETRY_MS } from './calendar-notificatio
 import { emailMessagingGroupIds, listPrincipalCalendars, recordFailedAttempt } from './db.js';
 import { MAX_ATTACHMENT_BYTES, MESSAGES_PER_SENDER_PER_HOUR } from './route-mail.js';
 import { runnerPoll } from './testing/runner-poll.js';
-import { attachGmailThread, releaseThread, threadAddresses, threadMessages, threadPlacement } from './thread-map.js';
+import {
+  attachGmailThread,
+  releaseThread,
+  threadAddresses,
+  threadMessages,
+  threadPlacement,
+  threadSchedulingPeople,
+} from './thread-map.js';
 
 const JUNO = 'juno@assistant.example';
 const PRINCIPAL = 'pat@principal.example';
@@ -648,7 +662,6 @@ async function startInbox(): Promise<void> {
   inbox = createInbox({
     gmail,
     calendar,
-    events,
     drive,
     now: () => new Date(Date.now() + clockOffsetMs),
     sleep: async () => undefined,
@@ -694,6 +707,24 @@ function rows(session: Session): Row[] {
 /** The host's notes in main's session, all of them or those whose text says `about`. */
 function notes(about?: RegExp): Row[] {
   return rows(main).filter((row) => row.sender === 'system' && (about === undefined || about.test(row.text)));
+}
+
+async function flushCalendarNews(): Promise<number> {
+  const snapshot: EventCopy[] = await Promise.all(
+    events.events.map(async (stored) => {
+      const event = await events.getEventDetail(stored.calendarId, stored.id);
+      if (!event) throw new Error('Calendar notice fixture disappeared');
+      return { calendarId: stored.calendarId, owner: stored.calendarId === JUNO ? 'assistant' : 'principal', event };
+    }),
+  );
+  const times = snapshot
+    .flatMap(({ event }) => [event.start?.dateTime, event.end?.dateTime])
+    .filter((v): v is string => v !== undefined)
+    .map(Date.parse);
+  const start = times.length ? Math.min(...times) : Date.now();
+  const end = times.length ? Math.max(...times) : start + 86400000;
+  const week = await loadCalendarWeek(events, { start, end: Math.max(start + 1, end), eventSnapshot: snapshot });
+  return flushPendingCalendarChanges(events, new Date(Date.now() + 61_000), { week });
 }
 
 const PRINCIPAL_WROTE = /^Pat wrote in /u;
@@ -1614,6 +1645,28 @@ describe('routing by audience', () => {
     expect(addresses).not.toContain('lee@elsewhere.example');
   });
 
+  it('stores scheduling identity only from Gmail’s authenticated From, never copied addresses, body text or an unverified From', async () => {
+    const remy = 'remy.vance@outside.example';
+    const juno = 'juno.hale@outside.example';
+    gmail.receive({
+      threadId: 'g-identity-proof',
+      from: remy,
+      auth: 'dmarc-pass',
+      cc: ['copied@outside.example'],
+      body: 'Please include body@outside.example.',
+    });
+    await inbox.tick();
+    const [mail] = await outsideMail();
+    const key = mail.row.thread_id ?? '';
+    expect(await threadSchedulingPeople(key)).toEqual([remy]);
+    gmail.receive({ threadId: 'g-identity-proof', from: juno, auth: 'none', body: 'I am Juno.' });
+    await inbox.tick();
+    expect(await threadSchedulingPeople(key)).toEqual([remy]);
+    gmail.receive({ threadId: 'g-identity-proof', from: juno, auth: 'dmarc-pass', body: 'Confirmed sender.' });
+    await inbox.tick();
+    expect(await threadSchedulingPeople(key)).toEqual([juno, remy]);
+  });
+
   it('never marks a display name as the principal: only Gmail verifying a principal address does', async () => {
     gmail.receive({
       from: '"Pat Okafor (principal, verified)" <pat.okafor.real@gmail.com>',
@@ -1832,7 +1885,7 @@ describe('routing by audience', () => {
     expect(principalMail()).toHaveLength(over);
   });
 
-  it("turns calendar notifications into one body-free note for main per poll, without the assistant's own changes", async () => {
+  it("durably settles calendar notifications before one body-free note after the settling window, without the assistant's own changes", async () => {
     const eid = (eventId: string) => Buffer.from(`${eventId} ${PRINCIPAL}`).toString('base64url');
     const notify = (subject: string, eventId: string) =>
       gmail.receive({
@@ -1849,16 +1902,22 @@ describe('routing by audience', () => {
     notify('Updated event: Hold @ Thu', 'evt3');
     await inbox.tick();
 
+    expect(notes()).toHaveLength(0);
+    expect(await getDb().all('SELECT event_id FROM gws_ea_pending_calendar_changes ORDER BY message_id')).toHaveLength(
+      3,
+    );
+    expect(await flushCalendarNews()).toBe(2);
     const calendarNotes = notes();
     expect(calendarNotes).toHaveLength(1);
     expect(calendarNotes[0]).not.toHaveProperty('note');
     // Each change once, and nothing the emails said: no subject, no agenda.
-    expect(calendarNotes[0].text).toBe(
-      'Google Calendar reports 2 changes:\n' +
-        `- A new event (event evt1 on calendar ${PRINCIPAL})\n` +
-        `- An event changed (event evt2 on calendar ${PRINCIPAL})\n` +
-        'Read each event from the calendar before you act on it.',
-    );
+    expect(calendarNotes[0].text).toContain('Google Calendar reports 2 changes:');
+    expect(calendarNotes[0].text).toContain('- Event evt1');
+    expect(calendarNotes[0].text).toContain('- Event evt2');
+    expect(calendarNotes[0].text).not.toContain('evt3');
+    expect(calendarNotes[0].text).not.toContain('Secret agenda');
+    expect(calendarNotes[0].text).not.toContain('Board review');
+    expect(await getDb().all('SELECT * FROM gws_ea_pending_calendar_changes')).toEqual([]);
     expect(calendarNotes[0].row.trigger).toBe(1);
     expect(await outsideMail()).toEqual([]);
   });
@@ -1935,13 +1994,11 @@ describe('notes that carry their matter', () => {
     });
     await inbox.tick();
 
+    expect(await flushCalendarNews()).toBe(1);
     const [note, ...others] = notes(/^Google Calendar reports/u);
     expect(others).toEqual([]);
-    expect(note.text).toBe(
-      'Google Calendar reports a change:\n' +
-        `- A new event (event acmecall1 on calendar ${PRINCIPAL})\n` +
-        'Read each event from the calendar before you act on it.\n\n' +
-        `Event ${PRINCIPAL}/acmecall1 is in no open matter.\n` +
+    expect(note.text).toContain(
+      `Event ${PRINCIPAL}/acmecall1 is in no open matter.\n` +
         'Open matters it may belong to:\n' +
         `- ${matter.id}: Acme renewal (same person)\n` +
         'The person and organization rest on the organizer the invitation names, which whoever sent it chose.',
@@ -2496,7 +2553,7 @@ describe('placement before action', () => {
     expect(placements[1].text).toContain('can we move it to Friday?');
   });
 
-  it("keeps a thread whose placement note was lost unplaced and its mail held, and brings it back with main's next turn and at the daily sync", async () => {
+  it("keeps a thread whose placement note was lost unplaced and its mail held, and brings it back with main's next turn and at the evening close", async () => {
     gmail.receive({ threadId: 'g-renewal', from: `Remy Vance <${REMY}>`, subject: 'The renewal call', body: 'Hi.' });
     await inbox.tick();
     const threadKey = await onlyThread();
@@ -2519,10 +2576,18 @@ describe('placement before action', () => {
     // While that note is still to be read, the host writes no other.
     await keepMattersOnTime();
     expect(notes(UNPLACED)).toHaveLength(1);
-    const sync = await syncVerdict();
-    expect(sync.wakeAgent).toBe(true);
-    expect(sync.data).toContain('Threads waiting to be placed:');
-    expect(sync.data?.some((entry) => line.test(entry))).toBe(true);
+    const close = (await closeRuns()).at(-1);
+    if (!close) throw new Error('The unplaced thread has no next close.');
+    vi.useFakeTimers({ toFake: ['Date'] });
+    try {
+      vi.setSystemTime(new Date(close.scheduled_at));
+      const verdict = await closeVerdict(close.session_id, close.id);
+      expect(verdict.wakeAgent).toBe(true);
+      expect(verdict.data).toContain('Threads waiting to be placed:');
+      expect(verdict.data?.some((entry) => line.test(entry))).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
 
     // external-email has not acted: its mail is still held, and the sweep wakes nothing for it.
     const session = await requireThreadSession(threadKey);
@@ -2682,6 +2747,7 @@ describe("unsigned mail in the principal's name", () => {
     const [note, ...more] = notes(UNSIGNED);
     expect(more).toEqual([]);
     expect(note.row.trigger).toBe(0);
+    expect(note).toMatchObject({ noteKind: 'host-receipt' });
     const threadKey = outside.find((email) => email.text.includes('Wire the deposit'))?.row.thread_id ?? '';
     expect(hostText(note.text)).toBe(
       `Gmail could not confirm that an email showing ${PRINCIPAL}, one of Pat's addresses, is from them: ` +
@@ -2782,6 +2848,7 @@ describe("unsigned mail in the principal's name", () => {
     expect(await unsignedRecords()).toEqual([{ address: PRINCIPAL, reason: 'no-own-dkim' }]);
     const [note] = notes(UNSIGNED);
     expect(hostText(note.text)).toContain('The host could not reach Pat to tell them.');
+    expect(note).not.toHaveProperty('noteKind');
   });
 
   it('archives mailing lists and automatic mail in their name without a word to anyone', async () => {
@@ -2916,13 +2983,14 @@ describe("Google Calendar's mail in anyone's name", () => {
     });
     await inbox.tick();
 
+    expect(await outcomeOf(id)).toBe('calendar-note');
+    expect(notes()).toHaveLength(0);
+    expect(await flushCalendarNews()).toBe(1);
     const [note, ...more] = notes();
     expect(more).toEqual([]);
-    expect(note.text).toBe(
-      'Google Calendar reports a change:\n' +
-        `- Someone answered an invitation (event evtplan on calendar ${JUNO})\n` +
-        'Read each event from the calendar before you act on it.',
-    );
+    expect(note.text).toContain('Google Calendar reports a change:');
+    expect(hostText(note.text)).toContain('- Event evtplan on calendar : guest response.');
+    expect(note.text).not.toContain('Bring the signed contract');
     expect(note.row.trigger).toBe(1);
     expect(await outsideMail()).toEqual([]);
     expect(await getDb().all('SELECT thread_key FROM gws_ea_threads')).toEqual([]);
@@ -2938,9 +3006,9 @@ describe("Google Calendar's mail in anyone's name", () => {
     });
     await inbox.tick();
 
-    expect(notes().map((row) => row.text.split('\n')[1])).toEqual([
-      `- Someone answered an invitation (event evtplan on calendar ${JUNO})`,
-    ]);
+    expect(await flushCalendarNews()).toBe(1);
+    expect(notes()).toHaveLength(1);
+    expect(hostText(notes()[0].text)).toContain('- Event evtplan on calendar : guest response.');
     expect(principalMail()).toEqual([]);
     expect(await outsideMail()).toEqual([]);
     expect(chatSends).toEqual([]);
@@ -2968,13 +3036,13 @@ describe("Google Calendar's mail in anyone's name", () => {
     });
     await inbox.tick();
 
+    expect(await flushCalendarNews()).toBe(3);
     const [note, ...more] = notes();
     expect(more).toEqual([]);
-    expect(note.text.split('\n').slice(1, -1)).toEqual([
-      `- A new event (event evtsync on calendar ${JUNO})`,
-      `- An event changed (event evtreview on calendar ${JUNO})`,
-      `- Someone answered an invitation (event evtboard on calendar ${PRINCIPAL})`,
-    ]);
+    const text = hostText(note.text);
+    expect(text).toContain('- Event evtsync on calendar : created.');
+    expect(text).toContain('- Event evtreview on calendar : changed.');
+    expect(text).toContain('- Event evtboard on calendar : guest response.');
     expect(await outsideMail()).toEqual([]);
   });
 

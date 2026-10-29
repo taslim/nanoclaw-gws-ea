@@ -128,6 +128,8 @@ describe('the email tools', () => {
           to: '2026-10-16T17:00:00-07:00',
           minutes: 30,
           timezone: 'Europe/Berlin',
+          kind: 'intro',
+          place: 'Remy’s office',
         },
       ],
       [

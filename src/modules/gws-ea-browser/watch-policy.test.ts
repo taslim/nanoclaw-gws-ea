@@ -12,7 +12,7 @@ import {
 
 const policy = watchSitePolicy('resy.com');
 const quietUntil = (at: string, timeZone: string): string =>
-  new Date(watchQuietUntil(policy, Date.parse(at), timeZone)).toISOString();
+  new Date(watchQuietUntil(policy, Date.parse(at), () => timeZone)).toISOString();
 
 it("pauses for the principal's local night and keeps checking through their evening", () => {
   // 20:30 in Los Angeles is 03:30 UTC: prime time for a dinner table, never quiet.
@@ -131,7 +131,7 @@ it("lets a release burst start inside the principal's night and holds ordinary c
   const release = Date.parse('2026-10-25T01:00:00Z');
   // 01:00 UTC is 05:00 in Dubai, inside the principal's night.
   const startAt = (at: string, releases: readonly number[]): string =>
-    iso(watchStartAt(policy, Date.parse(at), releases, 'Asia/Dubai'));
+    iso(watchStartAt(policy, Date.parse(at), releases, () => 'Asia/Dubai'));
   expect(startAt('2026-10-25T00:30:00Z', [release])).toBe('2026-10-25T01:00:05.000Z');
   expect(startAt('2026-10-25T01:04:00Z', [release])).toBe('2026-10-25T01:04:00.000Z');
   expect(startAt('2026-10-25T01:30:00Z', [release])).toBe('2026-10-25T02:00:00.000Z');
@@ -159,4 +159,46 @@ it('slows a watch whose changes keep matching nothing, to at most an hour, but n
   // A release is the moment the watch exists for: its burst keeps the floor, and a slowed check gives way to it.
   expect(plan('2026-10-25T01:00:05Z', 5, [release]).interval).toBe(policy.floorMs);
   expect(iso(plan('2026-10-25T00:30:00Z', 5, [release]).at)).toBe('2026-10-25T01:00:05.000Z');
+});
+
+it('uses the covering stay for a watch moment while retaining the home zone after the stay', async () => {
+  const { initTestDb, runMigrations, closeDb } = await import('../../db/index.js');
+  await import('../gws-ea-profile/index.js');
+  await import('../gws-ea-whereabouts/index.js');
+  const { addStay, dismissStay } = await import('../gws-ea-whereabouts/db.js');
+  const { principalClock, loadPrincipalClock } = await import('./watch-policy.js');
+  const db = await initTestDb();
+  try {
+    await runMigrations(db);
+    await db.run("UPDATE gws_ea_profile SET principal_timezone='America/Los_Angeles'");
+    const stay = await addStay({
+      locality: 'Brussels',
+      zone: 'Europe/Brussels',
+      source: 'said',
+      certainty: 'certain',
+      start: '2026-11-10T00:00:00Z',
+      end: '2026-11-15T00:00:00Z',
+    });
+    expect(await principalClock(Date.parse('2026-11-12T20:00Z'))).toBe('Europe/Brussels');
+    expect(await principalClock(Date.parse('2026-11-16T20:00Z'))).toBe('America/Los_Angeles');
+    const clock = await loadPrincipalClock();
+    expect(clock('2026-11-12')).toBe('Europe/Brussels');
+    const { purchaseBounds } = await import('./purchase.js');
+    expect(purchaseBounds({ needed_by: '2026-11-12' }, clock)).toEqual({
+      neededBy: '2026-11-12T22:59:59.999Z',
+      principalTimeZone: 'Europe/Brussels',
+    });
+    await dismissStay({ id: stay.id, reason: 'The trip was cancelled.' });
+    expect(clock('2026-11-12T08:00:00Z')).toBe('Europe/Brussels');
+    expect((await loadPrincipalClock())('2026-11-12T08:00:00Z')).toBe('America/Los_Angeles');
+  } finally {
+    await closeDb();
+  }
+});
+
+it('ends quiet hours on the next local clock when a flight arrives during the wait', () => {
+  const arrival = Date.parse('2026-11-10T03:30:00Z');
+  const clock = (at: string | number) =>
+    (typeof at === 'number' ? at : Date.parse(at)) < arrival ? 'UTC' : 'Asia/Tokyo';
+  expect(watchQuietUntil(watchSitePolicy('resy.com'), Date.parse('2026-11-10T03:15:00Z'), clock)).toBe(arrival);
 });

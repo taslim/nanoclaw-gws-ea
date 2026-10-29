@@ -239,7 +239,7 @@ describe("external-email's project document", () => {
         '\n\nYour email signature:\n\nAya | EA to Morgan',
     );
     // Said once here, so no email it reads repeats it.
-    expect(composed.get('# Principal')).toBe('You work for Morgan, whose time zone is America/Los_Angeles.');
+    expect(composed.get('# Principal')).toBe('You work for Morgan, whose home time zone is America/Los_Angeles.');
     expect(composed.get('# External Email')).toBe(fs.readFileSync(path.resolve(GUIDANCE_PATH), 'utf8').trim());
     expect([...doc.matchAll(/^## Host sign-in task$/gmu)]).toHaveLength(1);
     expect([...doc.matchAll(/`sign_in_reply`/gu)]).toHaveLength(1);
@@ -280,7 +280,7 @@ describe("external-email's project document", () => {
     const composed = sections(fs.readFileSync(path.join(groupDir, DEFAULT_PROJECT_DOC.fileName), 'utf8'));
 
     const escaped = 'Juno \\*Hale\\* \\[Jr\\] \\#1\\_';
-    expect(composed.get('# Principal')).toBe(`You work for ${escaped}, whose time zone is Europe/London.`);
+    expect(composed.get('# Principal')).toBe(`You work for ${escaped}, whose home time zone is Europe/London.`);
     expect(composed.get('# Assistant Identity')).toContain(`${escaped} is the principal.`);
   });
 
@@ -340,6 +340,16 @@ describe("external-email's project document", () => {
       "- When the principal's own email in this thread also asks for something beyond it, do this thread's part, " +
         "and wake main with `tell_main`, giving the rest of their ask: that part is main's to act on.",
     );
+  });
+});
+
+describe('external-email and poorly fitting times', () => {
+  it('wakes main before offering them only when it matters', () => {
+    const tools = fs.readFileSync(
+      path.resolve('container/agent-runner/src/mcp-tools/gws-ea-email-external.instructions.md'),
+      'utf8',
+    );
+    expect(tools).toContain('wake main with `tell_main` first when it matters: main may free a better time');
   });
 });
 

@@ -5,16 +5,16 @@
  * call rather than counting as empty, and nothing an agent saved or says it
  * fetched decides the answer.
  *
- * Only the message reaches the agent; `find_conflicts`'s other fields also
- * serve host callers. Titles and names other people wrote come back capped
- * and wrapped as untrusted text, and nothing here reaches external-email.
+ * The conflict read serves host callers. The `people_stats` tool gives main
+ * only its message; host callers take its counts. Titles and names other
+ * people wrote come back capped and wrapped as untrusted text.
  */
-import { TIMEZONE } from '../../config.js';
-import { forbidden, invalidArgs, type ActionAnswer } from '../../cli/delivery-action.js';
+import { forbidden, invalidArgs } from '../../cli/delivery-action.js';
 import { EMAIL_PATTERN, identityMatchKey } from '../../gws-ea/validation.js';
 import { isPrincipalCalendar } from '../gws-ea-inbox/calendar-notifications.js';
 import { assistantAddresses } from '../gws-ea-inbox/runtime.js';
 import { untrustedLine } from '../gws-ea-inbox/untrusted.js';
+import { loadTimeline, zoneAt, zoneForDay, type Timeline } from '../gws-ea-whereabouts/timeline.js';
 import { getGwsEaProfile, principalRecognizer, type PrincipalRecognizer } from '../gws-ea-profile/db.js';
 import {
   createMeetingsCalendarApi,
@@ -46,7 +46,7 @@ const HISTORY_DAYS = 183;
 /** A meeting with more people than this says little about any one of them. */
 const MAX_MEETING_SIZE = 8;
 const MAX_LISTED_PEOPLE = 100;
-const MAX_PEOPLE_ASKED = 100;
+export const MAX_PEOPLE_ASKED = 100;
 const MAX_NAME_CHARS = 64;
 const MAX_TITLE_CHARS = 100;
 const MAX_ICAL_UID = 1_024;
@@ -111,6 +111,7 @@ export interface PeopleCounts {
 }
 
 export interface CalendarFactsDeps {
+  readonly timeline?: Timeline;
   readonly calendar: () => MeetingsCalendarApi;
 }
 
@@ -120,7 +121,7 @@ export interface CalendarConflictResult extends Record<string, unknown> {
   message: string;
 }
 
-/** The complete read `find_conflicts` makes, for host callers. */
+/** The complete conflict read, for host callers such as the browser scheduler. */
 export function findPrincipalCalendarConflicts(
   start: string,
   end: string,
@@ -139,6 +140,7 @@ interface Copy {
 }
 
 interface FactsView {
+  readonly timeline: Timeline;
   readonly timezone: string;
   readonly addresses: PrincipalRecognizer;
   readonly calendars: readonly string[];
@@ -240,8 +242,12 @@ function personLine(person: PersonStats, view: FactsView): string {
 export function createCalendarFactTools(deps: CalendarFactsDeps) {
   const calendar = () => deps.calendar();
 
-  async function viewOf(): Promise<FactsView> {
-    const [profile, listed] = await Promise.all([getGwsEaProfile(), calendar().listCalendars()]);
+  async function viewOf(at = Date.now()): Promise<FactsView> {
+    const [profile, listed, timeline] = await Promise.all([
+      getGwsEaProfile(),
+      calendar().listCalendars(),
+      deps.timeline ?? loadTimeline(),
+    ]);
     const addresses = principalRecognizer(profile.principal_emails);
     const principal = listed.filter((entry) => isPrincipalCalendar(entry, addresses));
     const calendars = principal.map((entry) => entry.id);
@@ -251,7 +257,8 @@ export function createCalendarFactTools(deps: CalendarFactsDeps) {
       );
     }
     return {
-      timezone: profile.principal_timezone ?? TIMEZONE,
+      timeline,
+      timezone: zoneAt(timeline, at) ?? 'UTC',
       addresses,
       calendars,
       names: calendarNames(principal, addresses),
@@ -275,10 +282,14 @@ export function createCalendarFactTools(deps: CalendarFactsDeps) {
     );
     return listings.flatMap(({ calendarId, events }) =>
       events.map((event, index): Copy => {
-        const copySpan = eventSpan(event, view.timezone);
-        if (copySpan === undefined) {
+        const timedSpan = eventSpan(event, view.timezone);
+        if (timedSpan === undefined) {
           throw new Error(`Google returned an event on ${calendarId} without a readable time (${event.id ?? index})`);
         }
+        const copySpan =
+          event.start?.date === undefined
+            ? timedSpan
+            : (eventSpan(event, zoneForDay(view.timeline, event.start.date) ?? 'UTC') ?? timedSpan);
         const meeting = `${event.iCalUID ?? event.id ?? `${calendarId}#${index}`}|${timeKey(event.originalStartTime ?? event.start)}`;
         return { calendarId, event, span: copySpan, meeting };
       }),
@@ -300,7 +311,7 @@ export function createCalendarFactTools(deps: CalendarFactsDeps) {
       throw invalidArgs(`The window is longer than ${MAX_WINDOW_DAYS} days: check one candidate time at a time.`);
     }
     const candidate = lineOf(content.candidate_ical_uid, 'candidate_ical_uid', MAX_ICAL_UID);
-    const view = await viewOf();
+    const view = await viewOf(start);
     const candidateSpan = { start, end };
 
     const meetings = new Map<string, Copy[]>();
@@ -313,6 +324,7 @@ export function createCalendarFactTools(deps: CalendarFactsDeps) {
     const conflicts = [...meetings.values()]
       .map((copies): Conflict => {
         const [first] = copies;
+        const zone = zoneAt(view.timeline, first.span.start) ?? 'UTC';
         const titled = copies.find((copy) => copy.event.summary !== undefined)?.event.summary;
         const answers = copies.map((copy) => principalAnswer(copy.event, view.addresses));
         return {
@@ -320,9 +332,11 @@ export function createCalendarFactTools(deps: CalendarFactsDeps) {
           event_id: first.event.id ?? null,
           ical_uid: first.event.iCalUID ?? null,
           title: titled === undefined ? null : untrustedLine(titled, MAX_TITLE_CHARS, CALENDAR_SOURCE),
-          start: zonedIso(first.span.start, view.timezone),
-          end: zonedIso(first.span.end, view.timezone),
-          when: whenOf(first, view.timezone),
+          start: zonedIso(first.span.start, zone),
+          end: zonedIso(first.span.end, zoneAt(view.timeline, first.span.end - 1) ?? 'UTC'),
+          when:
+            whenOf(first, zone) +
+            (zoneAt(view.timeline, first.span.start) === null ? ' (local zone unknown; UTC shown)' : ''),
           all_day: first.event.start?.date !== undefined,
           overlap_minutes: Math.round(overlap(first.span, candidateSpan) / MINUTE),
           principal_response: strongestAnswer(answers) ?? null,
@@ -331,7 +345,9 @@ export function createCalendarFactTools(deps: CalendarFactsDeps) {
       })
       .sort((a, b) => Date.parse(a.start) - Date.parse(b.start) || Date.parse(a.end) - Date.parse(b.end));
     const listed = conflicts.slice(0, MAX_LISTED_CONFLICTS);
-    const checked = spanLabel(candidateSpan, view.timezone);
+    const checked =
+      spanLabel(candidateSpan, view.timezone) +
+      (zoneAt(view.timeline, start) === null ? ' (local zone unknown; UTC shown)' : '');
     return {
       conflicts: listed,
       conflicts_not_listed: conflicts.length - listed.length,
@@ -346,7 +362,7 @@ export function createCalendarFactTools(deps: CalendarFactsDeps) {
     };
   };
 
-  const peopleStats: ActionAnswer = async (content) => {
+  const peopleStats = async (content: Record<string, unknown>) => {
     const asked = addressesOf(content.people, 'people', MAX_PEOPLE_ASKED);
     const view = await viewOf();
     const assistant = new Set([...(await assistantAddresses())].map(mailbox));
@@ -465,13 +481,14 @@ export function createCalendarFactTools(deps: CalendarFactsDeps) {
           ),
           one_on_ones: tally?.oneOnOnes ?? 0,
           recurring_series: tally?.series.size ?? 0,
-          first_meeting: tally === undefined ? null : dayLabel(tally.first, view.timezone),
-          last_meeting: tally === undefined ? null : dayLabel(tally.last, view.timezone),
+          first_meeting:
+            tally === undefined ? null : dayLabel(tally.first, zoneAt(view.timeline, tally.first) ?? 'UTC'),
+          last_meeting: tally === undefined ? null : dayLabel(tally.last, zoneAt(view.timeline, tally.last) ?? 'UTC'),
         };
       })
       .sort((a, b) => b.meetings - a.meetings || a.identity.localeCompare(b.identity));
     const listed = people.slice(0, MAX_LISTED_PEOPLE);
-    const since = dayLabel(history.start, view.timezone);
+    const since = dayLabel(history.start, zoneAt(view.timeline, history.start) ?? 'UTC');
     return {
       since,
       people: listed,

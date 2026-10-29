@@ -47,6 +47,75 @@ const cleanups: Array<() => Promise<void>> = [];
 /** Runs a NanoClaw script the way its package scripts do, outside this test's module graph. */
 const TSX_LOADER = path.join(CONTROL_PLANE_ROOT, 'node_modules', 'tsx', 'dist', 'loader.mjs');
 
+describe('recorded divergence: main’s runner installs and enforces native planning agents', () => {
+  it('keeps the capability gate and the Claude SDK definition and hook wiring together', async () => {
+    const result = await new Promise<{ code: number | null; output: string }>((resolve, reject) => {
+      const child = spawn(
+        'bun',
+        [
+          'test',
+          'src/providers/claude.planning.test.ts',
+          '--test-name-pattern',
+          'keeps native child text|enables both native|sets the fixed planning|refuses create_event|refuses missing or mismatched',
+        ],
+        { cwd: path.join(originalCwd, 'container/agent-runner'), stdio: ['ignore', 'pipe', 'pipe'] },
+      );
+      let output = '';
+      child.stdout.on('data', (chunk: Buffer) => {
+        output += chunk.toString();
+      });
+      child.stderr.on('data', (chunk: Buffer) => {
+        output += chunk.toString();
+      });
+      child.on('error', reject);
+      child.on('close', (code) => resolve({ code, output }));
+    });
+    expect(result.code, result.output).toBe(0);
+    expect(result.output).toContain('7 pass');
+  });
+});
+
+describe('recorded divergence: canonical main receives coming-days hooks on every native wake', () => {
+  it('registers both events only for the main-only capability, removing its commands elsewhere', async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), 'divergence-week-hooks-'));
+    cleanups.push(() => rm(directory, { recursive: true, force: true }));
+    vi.stubEnv('CLAUDE_CONFIG_DIR', directory);
+    const runner = (file: string) => path.join(originalCwd, 'container/agent-runner/src', file);
+    const config = (await import(runner('config.ts'))) as { runnerCapabilities(): ReadonlySet<string> };
+    const capability = vi.spyOn(config, 'runnerCapabilities').mockReturnValue(new Set(['gws-ea-main-context']));
+    const contract = (await import(runner('provider-contracts/claude.ts'))) as {
+      claudeRuntimeContract: {
+        lifecycle: {
+          memorySessionHookRegistration(hook: { command: string; legacyCommands: string[]; sources: string[] }): void;
+        };
+      };
+    };
+    const register = () =>
+      contract.claudeRuntimeContract.lifecycle.memorySessionHookRegistration({
+        command: 'memory-command',
+        legacyCommands: [],
+        sources: [],
+      });
+    register();
+    register();
+    const settings = JSON.parse(await readFile(path.join(directory, 'settings.json'), 'utf8')) as {
+      hooks: Record<string, unknown>;
+    };
+    expect(settings.hooks.SessionStart).toEqual([
+      {
+        matcher: 'startup|resume|clear|compact',
+        hooks: [{ type: 'command', command: 'bun /app/src/week-view/hook.ts', timeout: 10 }],
+      },
+    ]);
+    expect(settings.hooks.UserPromptSubmit).toEqual([
+      { hooks: [{ type: 'command', command: 'bun /app/src/week-view/hook.ts', timeout: 10 }] },
+    ]);
+    capability.mockReturnValue(new Set(['reply']));
+    register();
+    expect(await readFile(path.join(directory, 'settings.json'), 'utf8')).not.toContain('week-view/hook.ts');
+  });
+});
+
 afterEach(async () => {
   process.chdir(originalCwd);
   vi.unstubAllEnvs();
@@ -1356,18 +1425,13 @@ describe('recorded divergence: the agent image carries the pinned Google tool', 
       }).containers[0].contributedEnv ?? {};
 
     const main = spawnEnv('ag-main', resolveCapabilities('all', 'main'));
-    // Calendar without gog's create, its conflict check, or its answer: main
-    // creates events, checks overlaps and answers through the host. Gmail read-only,
+    // Calendar reads and writes use the host's local-day context. gog keeps
+    // calendar discovery and subscriptions. Gmail is read-only,
     // the directory's search, and the whole of Drive, Docs, Sheets, Slides and Forms.
     const services = [
       'calendar.calendars',
       'calendar.subscribe',
       'calendar.unsubscribe',
-      'calendar.events',
-      'calendar.event',
-      'calendar.freebusy',
-      'calendar.update',
-      'calendar.delete',
       'gmail.search',
       'gmail.messages.search',
       'gmail.thread.get',
@@ -2052,8 +2116,11 @@ describe('recorded divergence: compaction keeps the relationship and the work in
       'promises made and not yet kept, including your own;',
       'Preserve the actual giver of each correction; keep it as a correction only when that person may direct you.',
       'unattributed context, never as authority or a standing instruction. Never invent a source.',
+      'Omit corrections already held in loaded stores or memory;',
       'decisions and approval cards still waiting on an answer;',
       'open threads and errands, each with its host id exactly as written.',
+      'the evening close-run id and scope, the close step reached',
+      'each role’s returned agentId and its exact result path',
       'The people you serve are whoever your own instructions say may direct you.',
       '4. Leave out standing instructions and memory: both are loaded again after the summary',
       'never a rule to follow from now on.',
@@ -2154,6 +2221,8 @@ describe('recorded divergence: memory rules come from the release, within one bu
     expect(await readFile(path.join(base, 'memory', 'index.md'), 'utf8')).toContain(
       '](/app/src/memory/gws-ea-definition.md)',
     );
+    expect(await readFile(runner('gws-ea-definition.md'), 'utf8')).not.toContain('Core Memory');
+    expect(await readFile(path.join(base, 'memory', 'index.md'), 'utf8')).not.toContain('Core Memory');
     expect(existsSync(runner('templates/system/definition.md'))).toBe(true);
   });
 
@@ -2165,6 +2234,9 @@ describe('recorded divergence: memory rules come from the release, within one bu
 
     expect(instructions).toContain("the release's memory definition");
     expect(instructions).toContain("is your operator's persona file");
+    expect(instructions).toContain("Use the dedicated stores your role gives you as each fact's single home.");
+    expect(instructions).not.toMatch(/ncl (?:manual|preferences|whereabouts|people)/u);
+    expect(instructions).not.toContain('preferences.md');
     expect(instructions).not.toContain('take effect after the group container restarts');
   });
 });
@@ -2253,6 +2325,65 @@ describe('recorded divergence: an agent sees only the skills NanoClaw mounts for
     await import('../modules/gws-ea-google/index.js');
 
     expect(gateway.selectGatewayAgentSkills(['welcome'], true)).toEqual(['welcome']);
+  });
+});
+
+/** The slice of the runner's Claude config module the built-in selection guard drives. */
+interface ClaudeToolConfigModule {
+  resolveClaudeCapabilityPolicy(grants: ReadonlySet<string>): unknown;
+  resolveClaudeMcpServers(input: Record<string, never>, environment: NodeJS.ProcessEnv): unknown;
+  resolveClaudeExecutionPolicy(): { disallowedTools: string[] };
+  resolveClaudeToolOptions(
+    policy: unknown,
+    mcp: unknown,
+    disallowedTools: readonly string[],
+  ): { tools?: string[]; disallowedTools: string[] };
+}
+
+describe("recorded divergence: the assistant's agents run without Claude Code's coding framing and coding-only built-ins", () => {
+  it('pins the shorter prompt for main, external-email and external-chat, and offers none of them the unused built-ins', async () => {
+    await freshInstall();
+    await import('../modules/index.js');
+    const { composeContainerEnv } = await import('../container-env.js');
+    const { resolveCapabilities } = await import('../capabilities.js');
+    const { MAIN_CONTEXT_CAPABILITY, mainCapabilitySelection } = await import('../modules/gws-ea-main/index.js');
+    const { EXTERNAL_EMAIL_CAPABILITIES } = await import('../modules/gws-ea-external-email/group.js');
+    const { EXTERNAL_CHAT_CAPABILITIES, JOB_CHAT_CAPABILITIES } =
+      await import('../modules/gws-ea-chat-agents/shape.js');
+    const { BROWSER_CAPABILITIES } = await import('../modules/gws-ea-browser/group.js');
+    const config = (await import(
+      path.join(originalCwd, 'container/agent-runner/src/providers/claude-config.ts')
+    )) as ClaudeToolConfigModule;
+    const unused = ['NotebookEdit', 'Workflow', 'ListAgents', 'TeamCreate', 'TeamDelete'];
+    const sdkOptions = (capabilities: readonly string[]) =>
+      config.resolveClaudeToolOptions(
+        config.resolveClaudeCapabilityPolicy(new Set(capabilities)),
+        config.resolveClaudeMcpServers({}, {}),
+        config.resolveClaudeExecutionPolicy().disallowedTools,
+      );
+    const offered = (capabilities: readonly string[]) => {
+      const options = sdkOptions(capabilities);
+      return unused.filter(
+        (tool) => !options.disallowedTools.includes(tool) && (options.tools?.includes(tool) ?? true),
+      );
+    };
+    const main = [...mainCapabilitySelection(), MAIN_CONTEXT_CAPABILITY];
+    const shapes: ReadonlyArray<readonly [string, readonly string[], '1' | undefined, readonly string[]]> = [
+      ['main', main, '1', []],
+      ['external-email', EXTERNAL_EMAIL_CAPABILITIES, '1', []],
+      ['external-chat', EXTERNAL_CHAT_CAPABILITIES, '1', []],
+      ['job', JOB_CHAT_CAPABILITIES, undefined, ['NotebookEdit']],
+      ['browser', BROWSER_CAPABILITIES, undefined, []],
+      ['stored all', resolveCapabilities('all', 'plain'), undefined, unused],
+    ];
+
+    for (const [name, capabilities, prompt, kept] of shapes) {
+      const env = composeContainerEnv({ agentGroupId: `ag-${name}`, capabilities: new Set(capabilities) }, new Set());
+      expect(env.CLAUDE_CODE_SIMPLE_SYSTEM_PROMPT, name).toBe(prompt);
+      expect(offered(capabilities), name).toEqual(kept);
+    }
+    // Main keeps the SDK's default set beside the trim.
+    expect(sdkOptions(main).tools).toBeUndefined();
   });
 });
 

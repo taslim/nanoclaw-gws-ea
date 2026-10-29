@@ -15,6 +15,16 @@ export default [
       },
     },
   },
+  {
+    files: ['scripts/scenarios/**/*.ts'],
+    languageOptions: {
+      parserOptions: {
+        // The hand-run harness has separate Node and Bun entry points.
+        projectService: false,
+        project: ['scripts/scenarios/tsconfig.json', 'scripts/scenarios/tsconfig.runner.json'],
+      },
+    },
+  },
   pluginJs.configs.recommended,
   ...tseslint.configs.recommended,
   {

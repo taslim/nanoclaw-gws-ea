@@ -4,8 +4,8 @@
  * container or an argument list.
  *
  * `getEvent`, `listEvents` and every write fetch no title, description or
- * location, so what they return can serve external-email. Only
- * `listEventDetails` and `getGuests` read an event's words.
+ * location, so what they return can serve external-email. The host-only
+ * `listLocatedEvents` adds location for availability; detail reads also carry titles and names.
  */
 import { isRecord } from '../../gws-ea/validation.js';
 import type { CalendarListEntry } from '../gws-ea-inbox/calendar-notifications.js';
@@ -16,6 +16,7 @@ export interface EventTime {
   readonly dateTime?: string;
   /** An all-day event's date, `YYYY-MM-DD`. */
   readonly date?: string;
+  readonly timeZone?: string;
 }
 
 export interface EventAttendee {
@@ -57,12 +58,53 @@ export interface CalendarEvent {
  */
 export type ListedEvent = Omit<CalendarEvent, 'id'> & { readonly id?: string };
 
+/** Host-only availability input: location may be private and never reaches an outward result. */
+export interface LocatedEvent extends ListedEvent {
+  readonly location?: string;
+}
+
+export interface DetailedConference extends EventConference {
+  readonly entryPoints: readonly { readonly entryPointType: string; readonly uri: string; readonly label?: string }[];
+}
+
 export interface DetailedAttendee extends EventAttendee {
   readonly displayName?: string;
 }
 
-/** Carries titles and names, so it is never read for external-email. */
+export interface ReminderOverride {
+  readonly method: 'email' | 'popup';
+  readonly minutes: number;
+}
+
+export interface EventSource {
+  readonly title?: string;
+  readonly url?: string;
+}
+
+/** Host-only detail: titles and names never reach an outward reader. */
 export interface DetailedEvent {
+  readonly visibility?: string;
+  readonly reminders?: 'default' | 'none' | 'custom';
+  readonly reminderOverrides?: readonly ReminderOverride[];
+  readonly guestsCanModify?: boolean;
+  readonly guestsCanInviteOthers?: boolean;
+  readonly guestsCanSeeOtherGuests?: boolean;
+  readonly attachments?: readonly unknown[];
+  readonly privateCopy?: boolean;
+  readonly endTimeUnspecified?: boolean;
+  readonly anyoneCanAddSelf?: boolean;
+  readonly colorId?: string;
+  readonly source?: EventSource;
+  readonly sharedTags?: Readonly<Record<string, string>>;
+  readonly etag?: string;
+  readonly description?: string;
+  readonly location?: string;
+  readonly creator?: { readonly email?: string; readonly displayName?: string; readonly self?: boolean };
+  readonly eventType?: string;
+  readonly tags?: Readonly<Record<string, string>>;
+  readonly conference?: DetailedConference;
+  /** The writable conference payload for preserving an existing link on a series split. */
+  readonly conferenceData?: Readonly<Record<string, unknown>>;
   readonly id?: string;
   readonly iCalUID?: string;
   readonly status?: string;
@@ -73,6 +115,7 @@ export interface DetailedEvent {
   /** Google left some guests out of `attendees`. */
   readonly attendeesOmitted?: boolean;
   readonly recurringEventId?: string;
+  readonly recurrence?: readonly string[];
   /** An occurrence's start before it moved, the same on every copy of it. */
   readonly originalStartTime?: EventTime;
   readonly start?: EventTime;
@@ -89,7 +132,7 @@ export interface CalendarEntry extends CalendarListEntry {
 /** Google starts a guest it is given no answer for at `needsAction`, the calendar's own owner included. */
 export interface GuestWrite {
   readonly email: string;
-  readonly responseStatus?: 'accepted';
+  readonly responseStatus?: string;
 }
 
 /**
@@ -127,6 +170,8 @@ export interface EventWrite {
   readonly location?: string;
   /** Ask Google to create a Meet link, under a request id it ignores when repeated. */
   readonly conference?: { readonly requestId: string };
+  /** An existing conference read by the host, without its createRequest. */
+  readonly conferenceData?: Readonly<Record<string, unknown>>;
   readonly start?: string;
   readonly end?: string;
   /** The zone the event's times display in. */
@@ -137,10 +182,17 @@ export interface EventWrite {
   readonly recurrence?: readonly string[];
   /** A write with them replaces the whole guest list, the calendar's owner included. */
   readonly attendees?: readonly GuestWrite[];
-  readonly visibility?: 'default' | 'private';
+  readonly visibility?: 'default' | 'private' | 'public' | 'confidential';
   readonly transparency?: 'opaque' | 'transparent';
   /** `none` turns every reminder off; `default` keeps the calendar's own. */
-  readonly reminders?: 'default' | 'none';
+  readonly reminders?: 'default' | 'none' | 'custom';
+  readonly reminderOverrides?: readonly ReminderOverride[];
+  readonly guestsCanModify?: boolean;
+  readonly guestsCanInviteOthers?: boolean;
+  readonly guestsCanSeeOtherGuests?: boolean;
+  readonly colorId?: string;
+  readonly source?: EventSource;
+  readonly sharedTags?: Readonly<Record<string, string>>;
   /** Private extended properties. */
   readonly tags?: Readonly<Record<string, string>>;
   /** Restores an event deleted earlier under the same id. */
@@ -161,9 +213,17 @@ export interface MeetingsCalendarApi {
   listCalendars(): Promise<CalendarEntry[]>;
   /** Undefined when the event does not exist; a deleted event reads as `cancelled`. */
   getEvent(calendarId: string, eventId: string): Promise<CalendarEvent | undefined>;
+  /** Main-only detail; the outward getter above remains title-free. */
+  getEventDetail(calendarId: string, eventId: string): Promise<DetailedEvent | undefined>;
+  freeBusy(
+    calendarIds: readonly string[],
+    timeMin: string,
+    timeMax: string,
+  ): Promise<Readonly<Record<string, readonly { readonly start: string; readonly end: string }[]>>>;
   /** Every live event that overlaps the interval, recurring events expanded. */
   listEvents(calendarId: string, timeMin: string, timeMax: string): Promise<ListedEvent[]>;
-  /** As `listEvents`, with titles, names and series: never for external-email. */
+  listLocatedEvents(calendarId: string, timeMin: string, timeMax: string): Promise<LocatedEvent[]>;
+  /** Host-only titles, names and series; outward answers project only permitted facts. */
   listEventDetails(calendarId: string, timeMin: string, timeMax: string): Promise<DetailedEvent[]>;
   /** `exists` when Google already holds that id, deleted or not. */
   insertEvent(
@@ -213,9 +273,10 @@ export interface MeetingsCalendarApi {
 const CALENDAR_API = 'https://www.googleapis.com/calendar/v3';
 const EVENT_FIELDS =
   'id,etag,iCalUID,status,transparency,organizer(email),attendees(email,responseStatus,resource,organizer,self),start(dateTime,date),end(dateTime,date),extendedProperties(private),conferenceData(createRequest(status(statusCode)),entryPoints(entryPointType,uri))';
+const LOCATED_FIELDS = `${EVENT_FIELDS},location`;
 /** Includes titles and names, so nothing read with it may reach external-email. */
 const DETAIL_FIELDS =
-  'id,iCalUID,status,transparency,summary,organizer(email,self),attendees(email,displayName,responseStatus,resource,self),attendeesOmitted,recurringEventId,originalStartTime(dateTime,date),start(dateTime,date),end(dateTime,date)';
+  'id,etag,iCalUID,status,transparency,visibility,reminders(useDefault,overrides(method,minutes)),guestsCanModify,guestsCanInviteOthers,guestsCanSeeOtherGuests,attachments,privateCopy,endTimeUnspecified,anyoneCanAddSelf,colorId,source,summary,description,location,creator(email,displayName,self),organizer(email,self),attendees(email,displayName,responseStatus,resource,organizer,self),attendeesOmitted,recurringEventId,recurrence,originalStartTime(dateTime,date,timeZone),start(dateTime,date,timeZone),end(dateTime,date,timeZone),eventType,extendedProperties(private,shared),conferenceData';
 /** Google Meet's conference type, in a calendar's allowed types and in a create request. */
 const GOOGLE_MEET = 'hangoutsMeet';
 const MAX_PAGES = 10;
@@ -224,13 +285,14 @@ function optionalString(value: unknown): string | undefined {
   return typeof value === 'string' ? value : undefined;
 }
 
-function toTime(value: unknown): EventTime | undefined {
+function toTime(value: unknown, detail = false): EventTime | undefined {
   if (!isRecord(value)) return undefined;
   const dateTime = optionalString(value.dateTime);
   const date = optionalString(value.date);
   return {
     ...(dateTime === undefined ? {} : { dateTime }),
     ...(date === undefined ? {} : { date }),
+    ...(detail && typeof value.timeZone === 'string' ? { timeZone: value.timeZone } : {}),
   };
 }
 
@@ -250,7 +312,20 @@ function toAttendee(value: unknown): EventAttendee | undefined {
 function toDetailedEvent(value: unknown): DetailedEvent {
   if (!isRecord(value)) throw new GoogleApiError(502, 'Google Calendar returned an unreadable event');
   const fields: Record<string, unknown> = {};
-  for (const key of ['id', 'iCalUID', 'status', 'transparency', 'summary', 'recurringEventId'] as const) {
+  for (const key of [
+    'id',
+    'etag',
+    'iCalUID',
+    'status',
+    'transparency',
+    'visibility',
+    'summary',
+    'description',
+    'location',
+    'eventType',
+    'recurringEventId',
+    'colorId',
+  ] as const) {
     const text = optionalString(value[key]);
     if (text !== undefined) fields[key] = text;
   }
@@ -270,17 +345,78 @@ function toDetailedEvent(value: unknown): DetailedEvent {
     });
   }
   if (value.attendeesOmitted === true) fields.attendeesOmitted = true;
+  for (const key of [
+    'guestsCanModify',
+    'guestsCanInviteOthers',
+    'guestsCanSeeOtherGuests',
+    'privateCopy',
+    'endTimeUnspecified',
+    'anyoneCanAddSelf',
+  ] as const)
+    if (typeof value[key] === 'boolean') fields[key] = value[key];
+  if (Array.isArray(value.attachments)) fields.attachments = value.attachments;
+  if (isRecord(value.source))
+    fields.source = {
+      ...(typeof value.source.title === 'string' ? { title: value.source.title } : {}),
+      ...(typeof value.source.url === 'string' ? { url: value.source.url } : {}),
+    };
+  if (isRecord(value.reminders)) {
+    fields.reminders =
+      value.reminders.useDefault === true
+        ? 'default'
+        : Array.isArray(value.reminders.overrides) && value.reminders.overrides.length
+          ? 'custom'
+          : 'none';
+    if (
+      Array.isArray(value.reminders.overrides) &&
+      value.reminders.overrides.every(
+        (override: unknown) =>
+          isRecord(override) &&
+          (override.method === 'email' || override.method === 'popup') &&
+          typeof override.minutes === 'number' &&
+          Number.isInteger(override.minutes) &&
+          override.minutes >= 0 &&
+          override.minutes <= 40_320,
+      )
+    )
+      fields.reminderOverrides = value.reminders.overrides;
+  }
+  if (Array.isArray(value.recurrence))
+    fields.recurrence = value.recurrence.filter((line): line is string => typeof line === 'string');
   for (const key of ['start', 'end', 'originalStartTime'] as const) {
-    const time = toTime(value[key]);
+    const time = toTime(value[key], true);
     if (time !== undefined) fields[key] = time;
+  }
+  if (isRecord(value.creator)) {
+    const email = optionalString(value.creator.email);
+    const displayName = optionalString(value.creator.displayName);
+    fields.creator = {
+      ...(email === undefined ? {} : { email: email.toLowerCase() }),
+      ...(displayName === undefined ? {} : { displayName }),
+      ...(value.creator.self === true ? { self: true } : {}),
+    };
+  }
+  const tags = toTags(value.extendedProperties);
+  const conference = toDetailedConference(value.conferenceData);
+  if (tags) fields.tags = tags;
+  const sharedTags = isRecord(value.extendedProperties) ? stringProperties(value.extendedProperties.shared) : undefined;
+  if (sharedTags) fields.sharedTags = sharedTags;
+  if (conference) fields.conference = conference;
+  if (isRecord(value.conferenceData)) {
+    const copy = Object.fromEntries(Object.entries(value.conferenceData).filter(([key]) => key !== 'createRequest'));
+    if (Object.keys(copy).length) fields.conferenceData = copy;
   }
   return fields as DetailedEvent;
 }
 
 function toTags(value: unknown): Record<string, string> | undefined {
   if (!isRecord(value) || !isRecord(value.private)) return undefined;
+  return stringProperties(value.private);
+}
+function stringProperties(value: unknown): Record<string, string> | undefined {
+  if (!isRecord(value)) return undefined;
   const tags = Object.fromEntries(
-    Object.entries(value.private).filter((entry): entry is [string, string] => typeof entry[1] === 'string'),
+    Object.entries(value).filter((entry): entry is [string, string] => typeof entry[1] === 'string'),
   );
   return Object.keys(tags).length === 0 ? undefined : tags;
 }
@@ -300,6 +436,25 @@ function toConference(value: unknown): EventConference | undefined {
   if (status === 'pending' || status === 'failure') return { status };
   if (status === 'success' || uri !== undefined) return { status: 'success', ...(uri === undefined ? {} : { uri }) };
   return undefined;
+}
+
+function toDetailedConference(value: unknown): DetailedConference | undefined {
+  if (!isRecord(value)) return undefined;
+  const entryPoints = Array.isArray(value.entryPoints)
+    ? value.entryPoints.flatMap((entry) => {
+        if (!isRecord(entry) || typeof entry.entryPointType !== 'string' || typeof entry.uri !== 'string') return [];
+        return [
+          {
+            entryPointType: entry.entryPointType,
+            uri: entry.uri,
+            ...(typeof entry.label === 'string' ? { label: entry.label } : {}),
+          },
+        ];
+      })
+    : [];
+  const conference = toConference(value) ?? (entryPoints.length ? { status: 'success' as const } : undefined);
+  if (!conference) return undefined;
+  return { ...conference, entryPoints };
 }
 
 function toListedEvent(value: unknown): ListedEvent {
@@ -337,11 +492,19 @@ function toEvent(value: unknown): CalendarEvent {
   return { ...event, id: event.id };
 }
 
+function toLocatedEvent(value: unknown): LocatedEvent {
+  const event = toListedEvent(value);
+  const location = isRecord(value) ? optionalString(value.location) : undefined;
+  return { ...event, ...(location === undefined ? {} : { location }) };
+}
+
 function eventTime(at: string, timeZone: string | undefined, allDay: boolean | undefined): Record<string, string> {
   return { ...(allDay === true ? { date: at } : { dateTime: at }), ...(timeZone === undefined ? {} : { timeZone }) };
 }
 
 function eventBody(event: EventWrite, id?: string): Record<string, unknown> {
+  if (event.reminders === 'custom' && event.reminderOverrides === undefined)
+    throw new Error('Custom reminders need their complete overrides before an event can be written');
   return {
     ...(id === undefined ? {} : { id }),
     ...(event.status === undefined ? {} : { status: event.status }),
@@ -349,7 +512,9 @@ function eventBody(event: EventWrite, id?: string): Record<string, unknown> {
     ...(event.description === undefined ? {} : { description: event.description }),
     ...(event.location === undefined ? {} : { location: event.location }),
     ...(event.conference === undefined
-      ? {}
+      ? event.conferenceData === undefined
+        ? {}
+        : { conferenceData: event.conferenceData }
       : {
           conferenceData: {
             createRequest: { requestId: event.conference.requestId, conferenceSolutionKey: { type: GOOGLE_MEET } },
@@ -361,17 +526,33 @@ function eventBody(event: EventWrite, id?: string): Record<string, unknown> {
     ...(event.attendees === undefined
       ? {}
       : {
-          attendees: event.attendees.map((guest) => ({
-            email: guest.email,
-            ...(guest.responseStatus === undefined ? {} : { responseStatus: guest.responseStatus }),
-          })),
+          attendees: event.attendees.map((guest) => ({ ...guest })),
         }),
     ...(event.visibility === undefined ? {} : { visibility: event.visibility }),
     ...(event.transparency === undefined ? {} : { transparency: event.transparency }),
+    ...(event.guestsCanModify === undefined ? {} : { guestsCanModify: event.guestsCanModify }),
+    ...(event.guestsCanInviteOthers === undefined ? {} : { guestsCanInviteOthers: event.guestsCanInviteOthers }),
+    ...(event.guestsCanSeeOtherGuests === undefined ? {} : { guestsCanSeeOtherGuests: event.guestsCanSeeOtherGuests }),
+    ...(event.colorId === undefined ? {} : { colorId: event.colorId }),
+    ...(event.source === undefined ? {} : { source: event.source }),
     ...(event.reminders === undefined
       ? {}
-      : { reminders: event.reminders === 'none' ? { useDefault: false, overrides: [] } : { useDefault: true } }),
-    ...(event.tags === undefined ? {} : { extendedProperties: { private: { ...event.tags } } }),
+      : {
+          reminders:
+            event.reminders === 'custom'
+              ? { useDefault: false, overrides: event.reminderOverrides }
+              : event.reminders === 'none'
+                ? { useDefault: false, overrides: [] }
+                : { useDefault: true },
+        }),
+    ...(event.tags === undefined && event.sharedTags === undefined
+      ? {}
+      : {
+          extendedProperties: {
+            ...(event.tags === undefined ? {} : { private: { ...event.tags } }),
+            ...(event.sharedTags === undefined ? {} : { shared: { ...event.sharedTags } }),
+          },
+        }),
   };
 }
 
@@ -416,7 +597,7 @@ function writeParams(event: EventWrite, sendUpdates: SendUpdates): URLSearchPara
   return new URLSearchParams({
     sendUpdates,
     fields: 'id',
-    ...(event.conference === undefined ? {} : { conferenceDataVersion: '1' }),
+    ...(event.conference === undefined && event.conferenceData === undefined ? {} : { conferenceDataVersion: '1' }),
   });
 }
 
@@ -500,9 +681,53 @@ export function createMeetingsCalendarApi(options: GoogleClientOptions): Meeting
       return payload === undefined ? undefined : toEvent(payload);
     },
 
+    async getEventDetail(calendarId, eventId) {
+      const params = new URLSearchParams({ fields: DETAIL_FIELDS });
+      try {
+        const payload = await googleJson(options, `${eventUrl(calendarId, eventId)}?${params.toString()}`, {
+          allowNotFound: true,
+        });
+        return payload === undefined ? undefined : toDetailedEvent(payload);
+      } catch (error) {
+        if (isGone(error)) return undefined;
+        throw error;
+      }
+    },
+
+    async freeBusy(calendarIds, timeMin, timeMax) {
+      const payload = await googleJson(options, `${CALENDAR_API}/freeBusy`, {
+        method: 'POST',
+        body: { timeMin, timeMax, items: calendarIds.map((id) => ({ id })) },
+      });
+      if (!isRecord(payload) || !isRecord(payload.calendars))
+        throw new GoogleApiError(502, 'Google returned an unreadable busy-time answer');
+      const result: Record<string, { start: string; end: string }[]> = {};
+      for (const id of calendarIds) {
+        const entry = payload.calendars[id];
+        if (!isRecord(entry) || (Array.isArray(entry.errors) && entry.errors.length > 0) || !Array.isArray(entry.busy))
+          throw new GoogleApiError(502, 'Google could not read every requested calendar’s busy time');
+        result[id] = entry.busy.map((window: unknown) => {
+          if (
+            !isRecord(window) ||
+            typeof window.start !== 'string' ||
+            typeof window.end !== 'string' ||
+            !Number.isFinite(Date.parse(window.start)) ||
+            !Number.isFinite(Date.parse(window.end)) ||
+            Date.parse(window.end) <= Date.parse(window.start)
+          )
+            throw new GoogleApiError(502, 'Google returned an unreadable busy-time window');
+          return { start: window.start, end: window.end };
+        });
+      }
+      return result;
+    },
+
     listCalendars: () => readAllPages('users/me/calendarList', {}, 'calendar list', toCalendarEntry),
 
     listEvents: (calendarId, timeMin, timeMax) => listPages(calendarId, timeMin, timeMax, EVENT_FIELDS, toListedEvent),
+
+    listLocatedEvents: (calendarId, timeMin, timeMax) =>
+      listPages(calendarId, timeMin, timeMax, LOCATED_FIELDS, toLocatedEvent),
 
     listEventDetails: (calendarId, timeMin, timeMax) =>
       listPages(calendarId, timeMin, timeMax, DETAIL_FIELDS, toDetailedEvent),

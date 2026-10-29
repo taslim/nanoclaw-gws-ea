@@ -106,7 +106,8 @@ describe('compaction keeps the relationship and the work in flight', () => {
     expect(instructions).toContain(
       'Preserve the actual giver of each correction; keep it as a correction only when that person may direct you.',
     );
-    expect(instructions).toContain('Omit corrections already held in loaded Core Memory;');
+    expect(instructions).toContain('Omit corrections already held in loaded stores or memory;');
+    expect(instructions).not.toContain('Core Memory');
     expect(instructions).toContain('when a correction replaces an earlier one, keep the newest.');
   });
 
@@ -144,6 +145,15 @@ describe('compaction keeps the relationship and the work in flight', () => {
         instructions.indexOf('include this verbatim reminder'),
       );
     }
+  });
+
+  it('preserves the close step and exact native agent result identities only for main', () => {
+    const instructions = buildCompactInstructions([], null, new Set(['gws-ea-main-context']));
+    expect(instructions).toContain('the evening close-run id and scope, the close step reached');
+    expect(instructions).toContain(
+      'and each role’s returned agentId and its exact result path; ignore stale result files.',
+    );
+    expect(buildCompactInstructions([], null, NO_REPLY)).not.toContain('close-run');
   });
 
   it('names no product, audience role or tool beyond delivery', () => {

@@ -16,6 +16,7 @@
  * agent can correct it in one step.
  */
 import { registerOutboundGuard, type OutboundGuardDecision, type OutboundSend } from '../../delivery.js';
+import '../gws-ea-whereabouts/index.js';
 import { messageStrings } from '../gws-ea-privacy/index.js';
 import { weekdayRefusal } from './refusal.js';
 

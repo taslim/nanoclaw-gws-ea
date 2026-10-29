@@ -67,3 +67,33 @@ export const gwsEaPreferencesMigration: ModuleMigration = {
     `);
   },
 };
+
+export const gwsEaPlanningPreferencesMigration: ModuleMigration = {
+  version: 2,
+  name: 'module:gws-ea-preferences:planning-patterns',
+  async up(db) {
+    await db.exec(`
+      CREATE TABLE gws_ea_pref_meal_windows (
+        meal TEXT PRIMARY KEY CHECK(meal IN ('lunch','dinner')),
+        weekdays TEXT NOT NULL CHECK(weekdays<>''),
+        start_minute INTEGER NOT NULL CHECK(start_minute>=0 AND start_minute<1440),
+        end_minute INTEGER NOT NULL CHECK(end_minute>start_minute AND end_minute<=1440),
+        minutes INTEGER NOT NULL CHECK(minutes>0 AND minutes<=end_minute-start_minute),
+        source TEXT NOT NULL CHECK(source IN ('principal','learned')),
+        basis TEXT NOT NULL CHECK(basis<>''), updated_at TEXT NOT NULL
+      );
+      CREATE TABLE gws_ea_pref_back_to_back (
+        singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+        minutes INTEGER NOT NULL CHECK(minutes>0 AND minutes<=1440),
+        break_minutes INTEGER NOT NULL CHECK(break_minutes>0 AND break_minutes<=1440),
+        source TEXT NOT NULL CHECK(source IN ('principal','learned')),
+        basis TEXT NOT NULL CHECK(basis<>''), updated_at TEXT NOT NULL
+      );
+      CREATE TABLE gws_ea_pref_ignored_events (
+        prefix TEXT PRIMARY KEY CHECK(prefix<>''),
+        source TEXT NOT NULL CHECK(source IN ('principal','learned')),
+        basis TEXT NOT NULL CHECK(basis<>''), updated_at TEXT NOT NULL
+      );
+    `);
+  },
+};

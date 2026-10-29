@@ -13,14 +13,8 @@ retrieve better.
 `memory/index.md` and this definition load together, within one fixed budget,
 at startup, on resume when memory has changed, after clear, and after
 compaction. When the index runs over, its end is cut, so keep it lean:
-headlines and pointers there, detail in linked files. Core Memory comes first
-in the index, before the Map, so it always loads whole. It holds the durable
-facts relevant in nearly every conversation, current priorities among them,
-each as a short dated fact. A correction that governs every conversation gets
-its own short dated line in Core Memory. An existing Core Memory line pointing
-to a preferences or corrections file never replaces that correction's own line;
-add it beside the pointer. A linked file may keep detail, but only Core Memory
-is in front of you every time you act.
+headlines and pointers there, detail in linked files. The index is a map for
+retrieval.
 
 ## Open Knowledge Format
 
@@ -47,16 +41,15 @@ with useful links; conversational facts need no synthetic citation.
 
 Store relevant information the principal and the people you work with for them
 share, and recall it when relevant. Distill files or large chunks of information,
-such as call transcripts, into concepts worth recalling. Add specific facts or
-preferences from conversation to existing concepts, or create new ones as needed.
-Conversation history is compacted, so store anything you need to survive it in
-memory.
+such as call transcripts, into concepts worth recalling. Put specific facts
+from conversation in their dedicated store when one exists, otherwise in the
+relevant concept. Conversation history is compacted, so save what must survive it.
 
 Remember the approach, not the instance. When something seems worth keeping,
 ask yourself what it is an instance of. If the principal disliked the wording of one
 post, the durable fact is probably a style preference, not that post; when it
-matters and you are unsure, ask the principal which it is. Store the specific only
-when the fact itself is specific ("the principal's name is Morgan").
+matters and you are unsure, ask the principal which it is. Store a specific
+fact only when the fact itself is specific, in its native store.
 
 Think in entities. People, projects, teams, places, decisions: things that
 recur deserve their own concept, with relationships recorded ("Juno
@@ -74,7 +67,7 @@ update all affected indexes.
 Where your instructions name a dedicated store for something, the store keeps
 its contents and memory points to it rather than copying them.
 
-Beyond Core Memory, write to the smallest useful file for the entity the fact
+Write to the smallest useful file for the entity the fact
 is about. Update that entity's existing file rather than creating duplicates,
 and don't default to whichever file was most recently discussed. Be concise and
 source-aware; include dates when timing matters.
@@ -83,7 +76,7 @@ source-aware; include dates when timing matters.
 
 When a fact is corrected, update the memory and keep only useful history. Prune
 what stopped mattering. When a priority changes or a correction replaces an
-earlier one, rewrite its Core Memory line and date rather than adding beside it.
+earlier one, update its dedicated store rather than keeping a competing copy.
 
 Big life events (a new job, a new partner, a move) reshape what matters.
 Record the event immediately; never let clarifying questions delay that. Then

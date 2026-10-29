@@ -321,3 +321,13 @@ printf 'child-candidates:%s\\n' "\${#COMPREPLY[@]}"
     expect(stdout.trim().split('\n')).toEqual(['--source-remote', '--model=small', 'child-candidates:0']);
   });
 });
+
+it('discovers lessons as a local read-only assistant observation', async () => {
+  const io = capture();
+  expect(await runCli(['schema', 'lessons', '--json'], io.runtime)).toBe(0);
+  const schema = JSON.parse(io.stdout.join('\n')) as { commands: { path: string[]; effects: string[] }[] };
+  expect(schema.commands).toHaveLength(1);
+  expect(schema.commands[0].path).toEqual(['lessons']);
+  expect(schema.commands[0].effects.join(' ')).toMatch(/read.only/iu);
+  expect(io.runtime.checkPrerequisites).not.toHaveBeenCalled();
+});

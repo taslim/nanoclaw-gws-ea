@@ -48,6 +48,9 @@ import {
   type Matter,
 } from './db.js';
 import './index.js';
+import '../gws-ea-privacy/index.js';
+import '../gws-ea-whereabouts/index.js';
+import { addStay } from '../gws-ea-whereabouts/db.js';
 import type { LiveSources } from './live.js';
 import { renderMatter, renderOpenList } from './render.js';
 
@@ -125,9 +128,10 @@ beforeEach(async () => {
   await updateContainerConfigScalars(MAIN, { timezone: ZONE });
   await getDb().run(
     `UPDATE gws_ea_profile SET assistant_first_name=COALESCE(assistant_first_name,'Juno'),principal_first_name=COALESCE(principal_first_name,'Morgan'),main_agent_group_id = ?, principal_first_name = 'Morgan', principal_last_name = 'Ellery',
-       assistant_workspace_email = ? WHERE singleton = 1`,
+       assistant_workspace_email = ?, principal_timezone=? WHERE singleton = 1`,
     MAIN,
     ASSISTANT,
+    ZONE,
   );
   await addPrincipalAddress(MORGAN);
   juno = (
@@ -256,6 +260,53 @@ describe('a matter as main reads it', () => {
     expect(after).toContain('Excerpt: Juno, could you send the revised quote?');
     expect(gmail.reads).toEqual(['g-juno', 'g-juno']);
     expect(await stored()).toEqual(before);
+  });
+
+  it('uses one timeline for future event time and planning facts when a stay changes during a live read', async () => {
+    const { calendar, sources } = world();
+    const trip = await addStay({
+      locality: 'Brussels',
+      zone: 'Europe/Brussels',
+      start: '2026-10-14',
+      end: '2026-10-16',
+      source: 'said',
+      certainty: 'certain',
+    });
+    calendar.put({
+      calendarId: MORGAN,
+      id: 'kickoff1',
+      status: 'confirmed',
+      start: { dateTime: '2026-10-14T09:00:00+02:00' },
+      end: { dateTime: '2026-10-14T10:00:00+02:00' },
+    });
+    const matter = (
+      await openMatter({
+        title: 'Brussels meeting',
+        openLoop: 'Prepare Morgan’s briefing.',
+        dueAt: '2026-10-14',
+        links: [{ kind: 'event', reference: KICKOFF }],
+      })
+    ).matter;
+    const rendered = await view(matter, {
+      ...sources,
+      calendar: {
+        getEvent: async (calendarId, eventId) => {
+          await addStay({
+            id: trip.id,
+            locality: 'Tokyo',
+            zone: 'Asia/Tokyo',
+            start: '2026-10-14',
+            end: '2026-10-16',
+            source: 'said',
+            certainty: 'certain',
+          });
+          return calendar.getEvent(calendarId, eventId);
+        },
+      },
+    });
+    expect(rendered).toContain(READ_AT);
+    expect(rendered).toContain('Due: 2026-10-14 (end of local day; Europe/Brussels).');
+    expect(rendered).toContain(`- event ${KICKOFF}: Oct 14, 2026, 9:00 AM to 10:00 AM; confirmed`);
   });
 
   it("shows an event's time, whether it stands, and each guest's answer, by name where the principal keeps one", async () => {

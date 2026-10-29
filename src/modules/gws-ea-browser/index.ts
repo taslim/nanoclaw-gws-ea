@@ -1,4 +1,5 @@
 import { configureBrowserSiteInfo } from './observe.js';
+import '../gws-ea-whereabouts/index.js';
 import { readRecipeSiteInfo } from './recipe-store.js';
 /** Optional, host-owned Chrome runtime. Importing only registers; Chrome launches on first use, not at host start. */
 

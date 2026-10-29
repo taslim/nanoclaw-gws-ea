@@ -63,6 +63,7 @@
     "parse5": "8.0.1",
     "pino": "9.6.0",
     "playwright-core": "1.64.0",
+    "rrule": "2.8.1",
     "tldts": "7.4.18",
     "undici": "7.30.1",
     "yaml": "^2.9.0"

@@ -13,6 +13,7 @@ import {
   type BrowserJobCancellation,
 } from '../gws-ea-browser/cancel.js';
 import { readChatLink } from './chat-links.js';
+import { parseMatterDueAt } from './planning.js';
 
 /** In the order a matter lists them. */
 export const LINK_KINDS = ['thread', 'event', 'file', 'person', 'memory', 'job', 'chat'] as const;
@@ -48,8 +49,8 @@ export interface StrandSummary {
 }
 
 /**
- * Everything the host keeps for a matter: no status, stage, priority, due
- * date, owner or log. What a link's source records is read from the source,
+ * Everything the host keeps for a matter, including planning facts but no
+ * status, stage, priority, owner or log. What a link's source records is read from the source,
  * never stored here.
  */
 export interface Matter {
@@ -65,6 +66,10 @@ export interface Matter {
   readonly outcome: string | null;
   /** The scheduled task that is its next look, or null while none is recorded. */
   readonly look_task_id: string | null;
+  readonly due_at: string | null;
+  readonly needs_minutes: number | null;
+  readonly place: string | null;
+  readonly deferrals: number;
   readonly links: readonly MatterLink[];
   /** A project's strands, open and closed, oldest first. */
   readonly strands: readonly StrandSummary[];
@@ -115,6 +120,9 @@ export interface OpenMatterInput {
   /** The project to open it as a strand of. */
   readonly parentId?: string;
   readonly links: readonly LinkRef[];
+  readonly dueAt?: string | null;
+  readonly needsMinutes?: number;
+  readonly place?: string | null;
 }
 
 /** Unvalidated caller input. */
@@ -129,6 +137,9 @@ export interface UpdateMatterInput {
   /** A next look is being set: a closed matter reopens, and an open one stays as it is. */
   readonly reopen?: boolean;
   readonly unlink?: readonly LinkRef[];
+  readonly dueAt?: string | null;
+  readonly needsMinutes?: number;
+  readonly place?: string | null;
 }
 
 export interface CloseMatterInput {
@@ -287,12 +298,17 @@ interface MatterRow {
   readonly parent_id: string | null;
   readonly outcome: string | null;
   readonly look_task_id: string | null;
+  readonly due_at: string | null;
+  readonly needs_minutes: number | null;
+  readonly place: string | null;
+  readonly deferrals: number;
   readonly created_at: string;
   readonly updated_at: string;
   readonly closed_at: string | null;
 }
 
-const MATTER_COLUMNS = 'id, title, open_loop, parent_id, outcome, look_task_id, created_at, updated_at, closed_at';
+const MATTER_COLUMNS =
+  'id, title, open_loop, parent_id, outcome, look_task_id, due_at, needs_minutes, place, deferrals, created_at, updated_at, closed_at';
 
 async function matterRow(id: string): Promise<MatterRow | undefined> {
   return getDb().get<MatterRow>(`SELECT ${MATTER_COLUMNS} FROM gws_ea_matters WHERE id = ?`, id);
@@ -335,6 +351,10 @@ export async function getMatter(id: string): Promise<Matter | undefined> {
     open: row.closed_at === null,
     outcome: row.outcome,
     look_task_id: row.look_task_id,
+    due_at: row.due_at,
+    needs_minutes: row.needs_minutes,
+    place: row.place,
+    deferrals: row.deferrals,
     // By kind, and within a kind in the order they were placed.
     links: [...links].sort(byKind),
     strands: strands.map((strand) => ({ id: strand.id, title: strand.title, open: strand.closed_at === null })),
@@ -577,25 +597,42 @@ async function assertReopenable(matterId: string): Promise<void> {
   }
 }
 
+function planningMinutes(value: number | undefined): number | null {
+  if (value === undefined) return null;
+  if (!Number.isSafeInteger(value) || value < 0)
+    throw new Error('Principal time needed must be a nonnegative whole number of minutes');
+  return value;
+}
+
+function planningPlace(value: string | null | undefined): string | null {
+  return value === undefined || value === null || value.trim() === '' ? null : parseLine(value, 'Place', 280);
+}
+
 export async function openMatter(input: OpenMatterInput): Promise<Placed> {
   const title = parseTitle(input.title);
   const openLoop = parseOpenLoop(input.openLoop);
   const parentId = input.parentId?.trim();
   const links = parseLinks(input.links);
+  const dueAt = parseMatterDueAt(input.dueAt ?? null);
+  const needsMinutes = planningMinutes(input.needsMinutes);
+  const place = planningPlace(input.place);
   const id = newMatterId();
   const now = new Date().toISOString();
   const db = getDb();
   const moved = await db.transaction(async () => {
     if (parentId !== undefined) await assertProject(parentId, id);
     await db.run(
-      `INSERT INTO gws_ea_matters (id, title, open_loop, parent_id, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO gws_ea_matters (id, title, open_loop, parent_id, created_at, updated_at, due_at, needs_minutes, place)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       id,
       title,
       openLoop,
       parentId ?? null,
       now,
       now,
+      dueAt,
+      needsMinutes,
+      place,
     );
     return (await linkInto(id, links, now)).moved;
   });
@@ -662,15 +699,23 @@ export async function updateMatter(input: UpdateMatterInput): Promise<Matter> {
   const parentId = input.parentId === undefined || input.parentId === null ? input.parentId : input.parentId.trim();
   const unlink = parseLinks(input.unlink ?? []);
   const reopen = input.reopen === true;
+  const dueAt = input.dueAt === undefined ? undefined : parseMatterDueAt(input.dueAt);
+  const needsMinutes = input.needsMinutes === undefined ? undefined : planningMinutes(input.needsMinutes);
+  const place = input.place === undefined ? undefined : planningPlace(input.place);
   if (
     title === undefined &&
     openLoop === undefined &&
     outcome === undefined &&
     parentId === undefined &&
     unlink.length === 0 &&
+    dueAt === undefined &&
+    needsMinutes === undefined &&
+    place === undefined &&
     !reopen
   ) {
-    throw new Error('Nothing to change: give a title, open loop, outcome, project, links to unlink, or a next look');
+    throw new Error(
+      'Nothing to change: give a title, open loop, outcome, planning facts, project, links to unlink, or a next look',
+    );
   }
 
   const now = new Date().toISOString();
@@ -683,7 +728,7 @@ export async function updateMatter(input: UpdateMatterInput): Promise<Matter> {
       throw new Error(`${id} is open, and an open matter has no outcome: it gets one when it closes`);
     }
     if (!open && (parentId !== undefined || unlink.length > 0)) {
-      throw new Error(`${id} is closed: only its title, open loop and outcome change until a next look reopens it`);
+      throw new Error(`${id} is closed: only its words and planning facts change until a next look reopens it`);
     }
 
     let changed = reopening;
@@ -716,10 +761,16 @@ export async function updateMatter(input: UpdateMatterInput): Promise<Matter> {
       await db.run('UPDATE gws_ea_matter_links SET matter_open = 1 WHERE matter_id = ?', id);
       for (const threadKey of await threadsOf(id)) await placeThread(threadKey, 'matter');
     }
+    if (openLoop !== undefined && openLoop !== row.open_loop) {
+      await db.run('UPDATE gws_ea_matters SET deferrals = 0 WHERE id = ?', id);
+    }
     for (const [column, value] of [
       ['title', title],
       ['open_loop', openLoop],
       ['outcome', outcome],
+      ['due_at', dueAt],
+      ['needs_minutes', needsMinutes],
+      ['place', place],
     ] as const) {
       if (value === undefined) continue;
       await db.run(`UPDATE gws_ea_matters SET ${column} = ? WHERE id = ?`, value, id);
@@ -843,4 +894,13 @@ export async function recordLookTask(id: string, taskId: string | null): Promise
     matterId,
   );
   if (result.changes === 0) throw noMatter(matterId);
+}
+
+/** Called only after the new check-in was recorded successfully. */
+export async function recordMatterDeferral(id: string): Promise<void> {
+  await getDb().run(
+    'UPDATE gws_ea_matters SET deferrals = deferrals + 1, updated_at = ? WHERE id = ?',
+    new Date().toISOString(),
+    id,
+  );
 }

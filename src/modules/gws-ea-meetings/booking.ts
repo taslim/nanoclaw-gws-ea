@@ -8,7 +8,6 @@ import {
   type ActionAnswer,
   type DeferredActionAnswer,
 } from '../../cli/delivery-action.js';
-import { resolveGroupTimezone } from '../../container-config.js';
 import { getDb } from '../../db/connection.js';
 import { getMessagingGroup } from '../../db/messaging-groups.js';
 import { isUniqueViolation } from '../../db/errors.js';
@@ -25,16 +24,16 @@ import { isBookableCalendar, isReadable, recordOwnCalendarChange } from '../gws-
 import { listPrincipalCalendars } from '../gws-ea-inbox/db.js';
 import { assistantAddresses } from '../gws-ea-inbox/runtime.js';
 import { GoogleApiError } from '../gws-ea-inbox/gmail-api.js';
+import { levelClause } from '../gws-ea-inbox/route-mail.js';
 import { untrustedLine } from '../gws-ea-inbox/untrusted.js';
 import { placeInMatter } from '../gws-ea-matters/db.js';
 import { writeNoteForMain } from '../gws-ea-profile/main-note.js';
-import { getSchedulingPreferenceValues } from '../gws-ea-preferences/db.js';
-import {
-  getGwsEaProfile,
-  getMainAgentGroupId,
-  principalRecognizer,
-  type PrincipalRecognizer,
-} from '../gws-ea-profile/db.js';
+import { getSchedulingPreferenceValues, type SchedulingPreferenceValues } from '../gws-ea-preferences/db.js';
+import { getPersonLevel } from '../gws-ea-people/db.js';
+import { listPrivateValues } from '../gws-ea-privacy/db.js';
+import { dateString, wallClock } from '../gws-ea-whereabouts/clock.js';
+import { loadTimeline, whereaboutsAt, zoneAt, type Timeline } from '../gws-ea-whereabouts/timeline.js';
+import { getGwsEaProfile, principalRecognizer, type PrincipalRecognizer } from '../gws-ea-profile/db.js';
 import {
   allowsMeet,
   type CalendarEntry,
@@ -68,15 +67,18 @@ import {
 } from './bookings-db.js';
 import { bookingSurfaceFor, resolveBookingSurface, type BookingSurface } from './booking-surface.js';
 import { addressesOf, flagOf, instantOf, lineOf, notesOf, timezoneOf } from './fields.js';
+import { createCalendarFactTools } from './calendar-facts.js';
+import { affectedPeople, calendarFindings, loadCalendarWeek } from './days.js';
+import { buildWeek, spanOf as weekSpan, type Week } from './week/model.js';
+import { resolvePlace, travelBetween, type ResolvedPlace } from './week/places.js';
 import {
-  blocksTime,
-  eventSpan,
   freeWindows,
   isClear,
   iso,
   READ_MARGIN_MS,
   schedulingRules,
   type SchedulingRules,
+  type FreeWindow,
   type Span,
   zonedIso,
 } from './slots.js';
@@ -113,7 +115,9 @@ function pastToolWait(since: string, at = Date.now()): boolean {
 }
 
 interface Principal {
-  readonly timezone: string;
+  readonly timeline: Timeline;
+  readonly preferences: SchedulingPreferenceValues;
+  readonly privateValues: Readonly<Record<string, string>>;
   readonly rules: SchedulingRules;
   readonly addresses: PrincipalRecognizer;
 }
@@ -130,12 +134,48 @@ function minutesOf(value: unknown): number {
 }
 
 async function principalView(): Promise<Principal> {
-  const profile = await getGwsEaProfile();
+  const [profile, timeline, preferences, privateValues] = await Promise.all([
+    getGwsEaProfile(),
+    loadTimeline(),
+    getSchedulingPreferenceValues(),
+    listPrivateValues(),
+  ]);
   return {
-    timezone: profile.principal_timezone ?? TIMEZONE,
-    rules: schedulingRules(await getSchedulingPreferenceValues()),
+    timeline,
+    preferences,
+    privateValues: Object.fromEntries(privateValues.map((value) => [value.id, value.value])),
+    rules: schedulingRules(preferences),
     addresses: principalRecognizer(profile.principal_emails),
   };
+}
+
+function principalZone(principal: Principal, at: number): string {
+  return zoneAt(principal.timeline, at) ?? TIMEZONE;
+}
+
+function eventSpanOn(principal: Principal, { start, end }: CalendarEvent): Span | undefined {
+  return weekSpan({ start, end }, principal.timeline);
+}
+
+/** A city named alone is somewhere in that city, never whichever saved place lies there. */
+function venueOf(text: string, principal: Principal): ResolvedPlace {
+  const place = resolvePlace(text, principal.timeline, principal.privateValues);
+  const city = principal.timeline.places.find((known) => known.locality.toLowerCase() === text.toLowerCase());
+  return place.kind === 'unknown' && city !== undefined ? { ...place, locality: city.locality } : place;
+}
+
+/** The saved venue's zone, or the one zone every saved place in the named city shares. */
+function venueZone(place: ResolvedPlace, timeline: Timeline): string | null {
+  const zones = new Set(
+    timeline.places
+      .filter((known) =>
+        place.id === null
+          ? place.locality !== null && known.locality.toLowerCase() === place.locality.toLowerCase()
+          : known.id === place.id,
+      )
+      .flatMap((known) => known.zone ?? []),
+  );
+  return zones.size === 1 ? [...zones][0] : null;
 }
 
 let schedulingTurn: Promise<unknown> = Promise.resolve();
@@ -301,27 +341,72 @@ export function createBookingTools(deps: BookingToolsDeps) {
     );
   }
 
-  async function busyIn(
+  async function calendarPicture(
     view: BookingView,
     span: Span,
     ignore: ReadonlySet<string>,
     bookingCalendarId: string,
-  ): Promise<Span[]> {
+  ): Promise<Week> {
     const { principal } = view;
     const margin = principal.rules.bufferMinutes * MINUTE + READ_MARGIN_MS;
     const ids = new Map<string, string>();
     for (const id of [...(await listPrincipalCalendars()), bookingCalendarId])
       if (!ids.has(id.toLowerCase())) ids.set(id.toLowerCase(), id);
     const listings = await Promise.all(
-      [...ids.values()].map((id) => calendar().listEvents(id, iso(span.start - margin), iso(span.end + margin))),
+      [...ids.values()].map(async (id) => ({
+        calendarId: id,
+        events: await calendar().listLocatedEvents(id, iso(span.start - margin), iso(span.end + margin)),
+      })),
     );
-    return listings
-      .flat()
-      .flatMap((event) =>
-        (event.id !== undefined && ignore.has(event.id)) || !blocksTime(event, principal.addresses)
-          ? []
-          : (eventSpan(event, principal.timezone) ?? []),
-      );
+    return buildWeek({
+      now: span.start - margin,
+      dayCount: Math.ceil((span.end - span.start + margin * 2) / DAY) + 2,
+      timeline: principal.timeline,
+      events: listings.flatMap(({ calendarId, events }) =>
+        events.flatMap((event) =>
+          event.id !== undefined && ignore.has(event.id)
+            ? []
+            : [
+                {
+                  calendarId,
+                  event: {
+                    ...event,
+                    conference: event.conference
+                      ? {
+                          ...event.conference,
+                          entryPoints: event.conference.uri
+                            ? [{ entryPointType: 'video', uri: event.conference.uri }]
+                            : [],
+                        }
+                      : undefined,
+                  },
+                  owner: 'principal' as const,
+                },
+              ],
+        ),
+      ),
+      principal: principal.addresses,
+      principalNames: [],
+      preferences: principal.preferences,
+      privateValues: principal.privateValues,
+      matters: [],
+      people: [],
+    });
+  }
+
+  function busyFrom(picture: Week): Span[] {
+    return [
+      ...picture.events.filter((event) => event.busy),
+      ...picture.days.flatMap((day) =>
+        day.moves.flatMap((move) => {
+          const event = picture.events.find((entry) => entry.key === move.eventKey);
+          return event !== undefined && move.minutes !== null
+            ? [{ start: event.start - move.minutes * MINUTE, end: event.start }]
+            : [];
+        }),
+      ),
+      ...picture.timeline.legs.map((leg) => ({ start: leg.departure, end: leg.arrival })),
+    ];
   }
 
   /** to: external-email, external-chat, job */
@@ -331,14 +416,15 @@ export function createBookingTools(deps: BookingToolsDeps) {
     spans: readonly Span[],
     ignore: ReadonlySet<string>,
   ): Promise<void> {
-    const label = (span: Span): string => slotLabel(span, view.principal.timezone);
+    const label = (span: Span): string => slotLabel(span, principalZone(view.principal, span.start));
     const passed = spans.filter((span) => span.start <= Date.now());
     if (passed.length > 0) throw forbidden(`${passed.map(label).join('; ')}: that time has passed.`);
     const covering = {
       start: Math.min(...spans.map((span) => span.start)),
       end: Math.max(...spans.map((span) => span.end)),
     };
-    const busy = await busyIn(view, covering, ignore, calendarId);
+    // Only a clash refuses a booking: travel counts as busy when offering times, not when booking one.
+    const busy = (await calendarPicture(view, covering, ignore, calendarId)).events.filter((event) => event.busy);
     const taken = spans.filter((span) => !isClear(span, busy));
     if (taken.length > 0)
       throw forbidden(`${taken.map(label).join('; ')}: no longer free. Call free_time for times to offer instead.`);
@@ -358,37 +444,191 @@ export function createBookingTools(deps: BookingToolsDeps) {
     return invitees;
   }
 
+  async function shapingFacts(view: BookingView, priorCounts?: Readonly<Record<string, number | null>> | null) {
+    const assistant = await assistantAddresses();
+    const emails = [...new Set((await view.surface.schedulingPeople()).map((email) => email.toLowerCase()))]
+      .filter((email) => !view.principal.addresses.has(email) && !assistant.has(email))
+      .sort();
+    let meetings: ReadonlyMap<string, number | null> | null =
+      priorCounts === null
+        ? null
+        : new Map(Object.entries(priorCounts ?? {}).map(([email, count]) => [`email:${email}`, count]));
+    if (priorCounts === undefined && emails.length > 0) {
+      /* eslint-disable no-catch-all/no-catch-all -- an optional history read cannot turn valid availability into a refusal or an invented zero */
+      try {
+        const stats = await createCalendarFactTools({ calendar, timeline: view.principal.timeline }).peopleStats({
+          people: emails,
+        });
+        meetings = new Map(stats.people.map((person) => [person.identity, person.meetings]));
+      } catch (error) {
+        log.warn('Outward meeting history unavailable', { owner: view.surface.owner, error });
+        meetings = null;
+      }
+      /* eslint-enable no-catch-all/no-catch-all */
+    }
+    const people = await Promise.all(
+      emails.map(async (email) => {
+        const level = await getPersonLevel(`email:${email}`);
+        const count = meetings?.get(`email:${email}`) ?? null;
+        return {
+          email,
+          relationship: level === 'unknown' ? null : levelClause(level, 'the principal'),
+          has_people_record: level !== 'unknown',
+          meetings: count,
+          met_in_six_months: count === null ? null : count > 0,
+        };
+      }),
+    );
+    const meeting_lengths = view.principal.preferences.meeting_lengths.map((length) => ({
+      kind: length.meeting_kind,
+      minutes: length.minutes,
+    }));
+    const message = [
+      ...people.map(
+        (person) =>
+          `${person.email}, ${person.relationship ?? 'with no people record'}; ${person.meetings === null ? 'meeting history unavailable' : `${person.meetings} meetings in six months; ${person.met_in_six_months ? 'met' : 'not met'} on the principal’s calendars in that time`}.`,
+      ),
+      ...(meeting_lengths.length === 0
+        ? []
+        : [
+            `Recorded meeting lengths: ${meeting_lengths.map((length) => `${length.kind}: ${length.minutes} minutes`).join('; ')}.`,
+          ]),
+    ].join('\n');
+    return { people, meeting_lengths, message };
+  }
+
+  interface LocatedWindow extends FreeWindow {
+    readonly zone: string;
+    readonly locality: string | null;
+    readonly fitNotes: readonly string[];
+  }
+
+  function offeredWindows(
+    view: BookingView,
+    picture: Week,
+    window: Span,
+    minutes: number,
+    theirs: string | undefined,
+    rules: SchedulingRules,
+    place: ResolvedPlace | undefined,
+  ): LocatedWindow[] {
+    const { principal } = view;
+    const busy = busyFrom(picture);
+    const events = picture.events.filter(
+      (event) => event.busy && !event.allDay && (event.place.kind === 'known' || event.place.kind === 'unknown'),
+    );
+    if (place !== undefined) {
+      for (const event of events) {
+        const before = travelBetween(place, event.place, event.id, principal.timeline).minutes;
+        const after = travelBetween(event.place, place, '', principal.timeline).minutes;
+        if (before !== null) busy.push({ start: event.start - before * MINUTE, end: event.start });
+        if (after !== null) busy.push({ start: event.end, end: event.end + after * MINUTE });
+      }
+    }
+    const venue = place === undefined ? null : venueZone(place, principal.timeline);
+    const result: LocatedWindow[] = [];
+    const transitions = [
+      window.start,
+      window.end,
+      ...principal.timeline.stays.flatMap((stay) => [stay.start, ...(stay.end === null ? [] : [stay.end])]),
+      ...principal.timeline.legs.flatMap((leg) => [leg.departure, leg.arrival]),
+    ];
+    const cuts = [
+      ...new Set(
+        transitions.filter((instant) => {
+          if (instant < window.start || instant > window.end) return false;
+          if (instant === window.start || instant === window.end || place !== undefined) return true;
+          const before = whereaboutsAt(principal.timeline, instant - 1);
+          const after = whereaboutsAt(principal.timeline, instant);
+          return before.zone !== after.zone || before.workingHoursZone !== after.workingHoursZone;
+        }),
+      ),
+    ].sort((a, b) => a - b);
+    for (let index = 1; index < cuts.length; index++) {
+      const part = { start: cuts[index - 1], end: cuts[index] };
+      const where = whereaboutsAt(principal.timeline, part.start);
+      const zone = where.zone ?? TIMEZONE;
+      // A venue in another zone than a certain stay is out of reach; anything less certain is the agent's to weigh.
+      if (
+        venue !== null &&
+        where.stay?.certainty === 'certain' &&
+        where.stay.zone !== null &&
+        where.stay.zone !== venue
+      )
+        continue;
+      const found = freeWindows({
+        timezone: zone,
+        rulesTimezone: where.workingHoursZone ?? zone,
+        counterpartTimezone: theirs,
+        lengthMinutes: minutes,
+        window: part,
+        busy,
+        rules,
+      });
+      for (const free of found) {
+        const locations = [free.start, ...transitions.filter((at) => free.start < at && at < free.end)].map((at) =>
+          whereaboutsAt(principal.timeline, at),
+        );
+        const notes: string[] = locations.some((at) => at.certainty === 'tentative') ? ['tentative stay'] : [];
+        if (place !== undefined) {
+          const day = dateString(wallClock(free.start, zone));
+          const previous = events
+            .filter((event) => event.day === day && event.end <= free.start)
+            .sort((a, b) => b.end - a.end)[0];
+          const at = whereaboutsAt(principal.timeline, free.start);
+          const from =
+            previous?.place ??
+            resolvePlace(at.placeId ?? at.locality ?? '', principal.timeline, principal.privateValues);
+          if (travelBetween(from, place, '', principal.timeline).minutes === null)
+            notes.push('travel from the previous place unknown');
+        }
+        const localities = new Set(locations.map((at) => at.locality));
+        result.push({ ...free, zone, locality: localities.size === 1 ? [...localities][0] : null, fitNotes: notes });
+      }
+    }
+    return result.sort((a, b) => a.start - b.start);
+  }
+
   /** to: external-email, external-chat, job */
   const freeTime: ActionAnswer = async (content, session) => {
-    assertChatToolFields(content, ['from', 'to', 'minutes', 'timezone']);
+    assertChatToolFields(content, ['from', 'to', 'minutes', 'timezone', 'kind', 'place']);
     const from = instantOf(content.from, 'from');
     const to = instantOf(content.to, 'to');
     const minutes = minutesOf(content.minutes);
     const theirs = timezoneOf(content.timezone);
+    const kind = lineOf(content.kind, 'kind', 80)?.toLowerCase();
+    const inPerson = lineOf(content.place, 'place', 500);
     if (to <= from) throw invalidArgs('to must come after from');
     if (to - from > MAX_RANGE_DAYS * DAY) throw invalidArgs(`The range may span at most ${MAX_RANGE_DAYS} days`);
     if (to <= Date.now()) throw invalidArgs('That range has already passed: ask for one in the future.');
     const view = await viewOf(session);
+    await view.surface.beforeWrite();
     const entry = await bookingCalendarOf(view, true);
-    const { timezone, rules } = view.principal;
+    const { principal } = view;
+    const rules = schedulingRules(principal.preferences, kind);
+    const place = inPerson === undefined ? undefined : venueOf(inPerson, principal);
     const window = { start: Math.max(from, Date.now()), end: to };
-    const busy = window.start < window.end ? await busyIn(view, window, new Set(), entry.id) : [];
-    const found = freeWindows({ timezone, counterpartTimezone: theirs, lengthMinutes: minutes, window, busy, rules });
+    const picture = await calendarPicture(view, window, new Set(), entry.id);
+    const found = offeredWindows(view, picture, window, minutes, theirs, rules, place);
     const windows = found.slice(0, MAX_WINDOWS).map((free) => ({
       start: iso(free.start),
       end: iso(free.end),
-      principal_time: slotLabel(free, timezone),
+      principal_time: slotLabel(free, free.zone),
+      zone: free.zone,
+      ...(free.locality === null ? {} : { locality: untrustedLine(free.locality, 100, 'whereabouts') }),
       ...(theirs === undefined ? {} : { their_time: slotLabel(free, theirs) }),
       fit: free.fit,
+      ...(free.fitNotes.length === 0 ? {} : { fit_notes: free.fitNotes }),
     }));
     const unlisted = found.length - windows.length;
     const lines = found
       .slice(0, MAX_WINDOWS)
       .map(
         (free, index) =>
-          `- ${zonedIso(free.start, timezone)} to ${zonedIso(free.end, timezone)}: ${windows[index].principal_time}` +
+          `- ${zonedIso(free.start, free.zone)} to ${zonedIso(free.end, free.zone)}: ${windows[index].principal_time}` +
+          (free.locality === null ? '' : `; locality ${windows[index].locality}`) +
           (theirs === undefined ? '' : `; for them, ${windows[index].their_time}`) +
-          ` (${free.fit})`,
+          ` (${[free.fit, ...free.fitNotes].join('; ')})`,
       );
     const answer =
       windows.length === 0
@@ -400,7 +640,14 @@ export function createBookingTools(deps: BookingToolsDeps) {
             ...lines,
             ...(unlisted > 0 ? [`${unlisted} later windows are not listed: ask from the last one on for more.`] : []),
           ];
-    return { windows, windows_not_listed: unlisted, message: answer.join('\n') };
+    const facts = await shapingFacts(view);
+    return {
+      windows,
+      windows_not_listed: unlisted,
+      people: facts.people,
+      meeting_lengths: facts.meeting_lengths,
+      message: [...answer, facts.message].filter(Boolean).join('\n'),
+    };
   };
 
   interface PreparedRequest {
@@ -417,6 +664,8 @@ export function createBookingTools(deps: BookingToolsDeps) {
     readonly span: Span;
     readonly conference?: EventConference;
     readonly refusal?: string;
+    readonly mainFindings?: string;
+    readonly meetingCounts?: Readonly<Record<string, number | null>>;
   }
   /** One Google write; a change or cancellation carries the version its checks read. */
   type Write =
@@ -485,7 +734,13 @@ export function createBookingTools(deps: BookingToolsDeps) {
       !isRecord(stored.span) ||
       typeof stored.span.start !== 'number' ||
       typeof stored.span.end !== 'number' ||
-      (stored.refusal !== undefined && typeof stored.refusal !== 'string')
+      (stored.refusal !== undefined && typeof stored.refusal !== 'string') ||
+      (stored.mainFindings !== undefined && typeof stored.mainFindings !== 'string') ||
+      (stored.meetingCounts !== undefined &&
+        (!isRecord(stored.meetingCounts) ||
+          !Object.values(stored.meetingCounts).every(
+            (count) => count === null || (typeof count === 'number' && Number.isInteger(count) && count >= 0),
+          )))
     )
       throw new Error('The saved booking outcome is unreadable.');
     const kind = stored.kind as BookingOutcome['kind'];
@@ -502,13 +757,21 @@ export function createBookingTools(deps: BookingToolsDeps) {
       span: { start: stored.span.start, end: stored.span.end },
       ...(conference === undefined ? {} : { conference }),
       ...(stored.refusal === undefined ? {} : { refusal: stored.refusal }),
+      ...(stored.mainFindings === undefined ? {} : { mainFindings: stored.mainFindings }),
+      ...(stored.meetingCounts === undefined
+        ? {}
+        : { meetingCounts: stored.meetingCounts as Readonly<Record<string, number | null>> }),
     };
   }
 
   /** to: external-email, external-chat, job */
   function changedOutcome(row: BookingRequest, event: CalendarEvent, view: BookingView): BookingOutcome {
-    const span = eventSpan(event, view.principal.timezone) ?? spanOf(row);
-    const when = bothZones(span, view.principal.timezone, timezoneOf(preparedOf(row).content.timezone));
+    const span = eventSpanOn(view.principal, event) ?? spanOf(row);
+    const when = bothZones(
+      span,
+      principalZone(view.principal, span.start),
+      timezoneOf(preparedOf(row).content.timezone),
+    );
     const message = `The principal or main changed the meeting since it was checked. It now stands at ${when}. Ask main with tell_main before acting on it again.`;
     return { kind: 'changed', span, result: { booking: row.eventId, message }, refusal: message };
   }
@@ -535,10 +798,10 @@ export function createBookingTools(deps: BookingToolsDeps) {
 
   /** to: external-email, external-chat, job */
   function successOutcome(row: BookingRequest, view: BookingView, event?: CalendarEvent): BookingOutcome {
-    const span = (event === undefined ? undefined : eventSpan(event, view.principal.timezone)) ?? spanOf(row);
+    const span = (event === undefined ? undefined : eventSpanOn(view.principal, event)) ?? spanOf(row);
     const prepared = preparedOf(row);
     const conference = event?.conference ?? (prepared.video ? { status: 'pending' as const } : undefined);
-    const when = bothZones(span, view.principal.timezone, timezoneOf(prepared.content.timezone));
+    const when = bothZones(span, principalZone(view.principal, span.start), timezoneOf(prepared.content.timezone));
     const message =
       row.action === 'cancel'
         ? `Cancelled: ${when}. Google sends the cancellation; main hears.`
@@ -559,9 +822,7 @@ export function createBookingTools(deps: BookingToolsDeps) {
 
   async function reportRequest(row: BookingRequest, view: BookingView, outcome: BookingOutcome): Promise<void> {
     const prepared = preparedOf(row);
-    const main = await getMainAgentGroupId();
-    const timezone = main === null ? view.principal.timezone : await resolveGroupTimezone(main);
-    const when = (span: Span): string => slotLabel(span, timezone);
+    const when = (span: Span): string => slotLabel(span, principalZone(view.principal, span.start));
     const lasting = `${when(outcome.span)} (${Math.round((outcome.span.end - outcome.span.start) / MINUTE)} minutes)`;
     const withWhom = prepared.invitees.length === 0 ? '' : ` with ${list.format(prepared.invitees)}`;
     const ids = `(${row.owner.kind} ${row.owner.key}; event ${row.eventId} on calendar ${row.calendarId})`;
@@ -592,6 +853,7 @@ export function createBookingTools(deps: BookingToolsDeps) {
     }
     if (prepared.title !== undefined)
       text += `\nIts ${row.action === 'change' ? 'new ' : ''}title, as written in the ${row.owner.kind}, is untrusted:\n${untrustedLine(prepared.title, 120, row.owner.kind === 'chat' ? 'chat' : 'gmail')}`;
+    if (outcome.kind === 'success') text += `\n${outcome.mainFindings ?? 'findings unavailable'}`;
     const matters = await view.surface.openMatters();
     if (outcome.kind === 'success' && matters.length === 1 && matters[0].conversations.length > 0)
       text += `\nIts matter's other conversations, to brief: ${list.format(matters[0].conversations.map((owner) => `${owner.kind} ${owner.key}`))}.`;
@@ -616,6 +878,52 @@ export function createBookingTools(deps: BookingToolsDeps) {
     view: BookingView,
     outcome: BookingOutcome,
   ): Promise<Record<string, unknown>> {
+    let completed = outcome;
+    if (outcome.kind === 'success' && row.action !== 'cancel' && !(row.applied && row.carriedOver)) {
+      const facts = await shapingFacts(view, row.applied ? (outcome.meetingCounts ?? null) : undefined);
+      completed = {
+        ...outcome,
+        meetingCounts: Object.fromEntries(facts.people.map((person) => [person.email, person.meetings])),
+        result: {
+          ...outcome.result,
+          people: facts.people,
+          meeting_lengths: facts.meeting_lengths,
+          organizer: 'the principal',
+          ...(row.action === 'change' ? { move: 'change' } : {}),
+          message: [
+            outcome.result.message,
+            facts.message,
+            row.action === 'change'
+              ? 'The principal organizes this booking; the move changes it.'
+              : 'The principal organizes this booking.',
+          ]
+            .filter(Boolean)
+            .join('\n'),
+        },
+      };
+    }
+    if (!row.applied && outcome.kind === 'success') {
+      const prepared = preparedOf(row);
+      let mainFindings = 'findings unavailable';
+      /* eslint-disable no-catch-all/no-catch-all -- the committed booking still needs its durable main note when a finding read fails */
+      try {
+        const week = await loadCalendarWeek(calendar(), {
+          start: Math.min(prepared.previous.start, outcome.span.start),
+          end: Math.max(prepared.previous.end, outcome.span.end),
+          timeline: view.principal.timeline,
+          shaping: row.action !== 'cancel',
+        });
+        const event = week.events.find((entry) => entry.calendarId === row.calendarId && entry.id === row.eventId);
+        mainFindings = [
+          ...(event && row.action !== 'cancel' ? [affectedPeople(event, week)] : []),
+          await calendarFindings(week),
+        ].join('\n');
+      } catch (error) {
+        log.warn('Booking stands without findings', { requestId: row.requestId, error });
+      }
+      /* eslint-enable no-catch-all/no-catch-all */
+      completed = { ...completed, mainFindings };
+    }
     const key = requestKey(row.sessionId, row.requestId);
     if (!ownChanges.has(key) && (outcome.kind === 'success' || (outcome.kind === 'removed' && row.action === 'book'))) {
       recordOwnCalendarChange(row.calendarId, row.eventId);
@@ -634,14 +942,18 @@ export function createBookingTools(deps: BookingToolsDeps) {
           if (matters.length === 1)
             await placeInMatter(matters[0].id, [{ kind: 'event', reference: `${row.calendarId}/${row.eventId}` }]);
         }
-        await markBookingRequestApplied(row.sessionId, row.requestId, JSON.stringify(outcome));
+        await markBookingRequestApplied(
+          row.sessionId,
+          row.requestId,
+          JSON.stringify({ ...completed, result: outcome.result }),
+        );
       }
       if ((row.action === 'cancel' && outcome.kind === 'success') || outcome.kind === 'removed')
         await deleteBooking(row.calendarId, row.eventId);
     });
-    if (!row.reported) await reportRequest(row, view, outcome);
-    if (outcome.refusal !== undefined) throw forbidden(outcome.refusal);
-    return outcome.result;
+    if (!row.reported) await reportRequest(row, view, completed);
+    if (completed.refusal !== undefined) throw forbidden(completed.refusal);
+    return completed.result;
   }
 
   function owns(event: CalendarEvent, view: BookingView): boolean {
@@ -680,7 +992,7 @@ export function createBookingTools(deps: BookingToolsDeps) {
     }
     if (!owns(event, view))
       throw forbidden(`That event no longer belongs to ${view.surface.words.ownerLabel}. Ask main with tell_main.`);
-    const span = eventSpan(event, view.principal.timezone);
+    const span = eventSpanOn(view.principal, event);
     if (!span) throw forbidden('The booking has no readable time. Ask main with tell_main.');
     const { etag } = event;
     if (etag === undefined) throw forbidden("This booking can't be changed safely right now. Ask main with tell_main.");
@@ -730,7 +1042,7 @@ export function createBookingTools(deps: BookingToolsDeps) {
       ...(video ? { conference: { requestId: eventIdFor('meet', eventId) } } : {}),
       start: iso(span.start),
       end: iso(span.end),
-      timeZone: view.principal.timezone,
+      timeZone: principalZone(view.principal, span.start),
       attendees: guestsOn(calendarId, invitees),
       reminders: 'default',
       tags: { [TAG_ROLE]: 'booking', [ownerTag(view)]: view.surface.owner.key },
@@ -765,7 +1077,7 @@ export function createBookingTools(deps: BookingToolsDeps) {
     calendarId: string,
     requestId: string,
   ) {
-    const previous = eventSpan(event, view.principal.timezone);
+    const previous = eventSpanOn(view.principal, event);
     if (!previous) throw forbidden('The booking has no readable time. Ask main with tell_main.');
     const start = content.start === undefined ? previous.start : instantOf(content.start, 'start');
     const span = {
@@ -786,7 +1098,9 @@ export function createBookingTools(deps: BookingToolsDeps) {
       ...(title === undefined ? {} : { summary: title }),
       ...(notes === undefined ? {} : { description: notes }),
       ...(location === undefined ? {} : { location }),
-      ...(retimed ? { start: iso(span.start), end: iso(span.end) } : {}),
+      ...(retimed
+        ? { start: iso(span.start), end: iso(span.end), timeZone: principalZone(view.principal, span.start) }
+        : {}),
       ...(linking ? { conference: { requestId: eventIdFor('meet', event.id, requestId) } } : {}),
     };
     if (retimed) await assertAvailable(view, calendarId, [span], new Set([event.id]));
@@ -1025,7 +1339,7 @@ export function createBookingTools(deps: BookingToolsDeps) {
           booking: eventId,
           start: iso(changed.span.start),
           end: iso(changed.span.end),
-          message: `The booking already stands at ${bothZones(changed.span, view.principal.timezone, timezoneOf(content.timezone))}${conferenceWords(owned.event.conference)}: nothing changed.`,
+          message: `The booking already stands at ${bothZones(changed.span, principalZone(view.principal, changed.span.start), timezoneOf(content.timezone))}${conferenceWords(owned.event.conference)}: nothing changed.`,
         },
       };
     return {

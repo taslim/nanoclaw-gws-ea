@@ -1,10 +1,6 @@
 /**
- * The daily sync: one recurring task in main's conversation, before
- * the principal's day starts, whose pre-task script wakes main every day to look
- * ahead and read what has waited for it; and `ncl matters today`, the script of a morning rundown
- * the principal asks for. Driven through `ncl matters` and the host's pass
- * against main's real session mailbox, on a fixed Monday in New York; Google
- * is in memory and must never be read.
+ * The close and its dedicated native session, driven through real task,
+ * ledger, delivery and note boundaries. Google stays in memory.
  */
 import fs from 'node:fs';
 import os from 'node:os';
@@ -41,14 +37,17 @@ vi.mock('../gws-ea-inbox/gmail-api.js', async (importOriginal) => ({
 import { dispatch } from '../../cli/dispatch.js';
 import { isContainerRunning } from '../../container-runner.js';
 import type { CallerContext, ResponseFrame } from '../../cli/frame.js';
-import { closeDb, initTestDb, runMigrations } from '../../db/index.js';
-import { reconcileSession } from '../../reconcile-session.js';
-import { withExistingMailboxSession, writeSessionMessage } from '../../session-manager.js';
+import { closeDb, getDb, initTestDb, runMigrations } from '../../db/index.js';
+import { getSession } from '../../db/sessions.js';
+import { requestWake } from '../../request-wake.js';
+import { recordCloseLedger, getOpenCloseRun, lastCompletedClose } from './close-runs.js';
+import { cancelDailySync, keepClose, closeVerdict, finishClose, forgetSundaySnapshot } from './sync.js';
+import { addStay, setEventTravel } from '../gws-ea-whereabouts/db.js';
+import { sessionDir, withExistingMailboxSession, writeSessionMessage } from '../../session-manager.js';
 import '../gws-ea-inbox/index.js';
 import { FakeGmailThreads } from '../gws-ea-inbox/testing/fake-gmail-threads.js';
-import { createThread, recordThreadAddresses, recordThreadMessage } from '../gws-ea-inbox/thread-map.js';
+import { createThread } from '../gws-ea-inbox/thread-map.js';
 import '../gws-ea-people/index.js';
-import { setSchedulingPreference } from '../gws-ea-preferences/db.js';
 import '../gws-ea-preferences/index.js';
 import '../gws-ea-profile/index.js';
 import { writeNoteForMain } from '../gws-ea-profile/main-note.js';
@@ -58,6 +57,7 @@ import './index.js';
 import { keepMattersOnTime } from './loop.js';
 import {
   answerOccurrence,
+  closeRuns,
   liveTaskRows,
   MAIN,
   mainSession,
@@ -98,18 +98,20 @@ async function open(title: string, look: Record<string, string>, links: Record<s
     .matter;
 }
 
-/** The live occurrences of the sync series. */
-async function syncs(): Promise<TaskRow[]> {
-  return liveTaskRows(await mainSession()).filter((row) => row.series_id.startsWith('gws-ea-daily-sync-'));
+async function closeSession(): Promise<import('../../types.js').Session> {
+  const schedule = (await closeRuns()).at(-1);
+  if (!schedule) throw new Error('No close run');
+  const session = await getSession(schedule.session_id);
+  if (!session) throw new Error('No close session');
+  return session;
 }
-
-function localClock(iso: string): string {
-  return new Date(iso).toLocaleTimeString('en-US', { timeZone: ZONE, hour: 'numeric', minute: '2-digit' });
+async function closeRow(): Promise<TaskRow> {
+  const rows = liveTaskRows(await closeSession());
+  if (!rows[0]) throw new Error('No close task');
+  return rows[0];
 }
-
-/** A note for main that wakes nothing, as the host writes one. */
-async function note(id: string, text: string): Promise<void> {
-  expect(await writeNoteForMain({ id, timestamp: new Date().toISOString(), text, wake: false })).toBe('written');
+async function capture(id: string, sessionId: string): Promise<void> {
+  await recordCloseLedger(id, sessionId, { through: new Date().toISOString(), writes: [], inbound: {} });
 }
 
 let gmail: FakeGmailThreads;
@@ -137,300 +139,407 @@ afterEach(async () => {
   fs.rmSync(scratch, { recursive: true, force: true });
 });
 
-describe('the daily sync', () => {
-  it("comes at 07:00 in main's time zone while the principal has no working hours, its gate as its script", async () => {
-    await keepMattersOnTime();
-
-    const [sync] = await syncs();
-    expect(await syncs()).toHaveLength(1);
-    expect(sync).toMatchObject({ status: 'pending', recurrence: '0 7 * * *' });
-    expect(localClock(sync.process_after)).toBe('7:00 AM');
-    expect(taskContent(sync).script).toBe('ncl matters sync');
-    // What needs the principal reaches them as one message for their morning.
-    expect(taskContent(sync).prompt).toContain('one message');
-    // The next pass keeps the same series.
-    await keepMattersOnTime();
-    expect(await syncs()).toEqual([sync]);
-  });
-
-  it('comes an hour before the earliest working-hours start, and follows the working hours when they change', async () => {
-    const basis = 'Said so.';
-    const workingHours = (weekday: 'mon' | 'tue', start: string) =>
-      setSchedulingPreference({
-        kind: 'working-hours',
-        weekday,
-        hours: { start, end: '17:00' },
-        source: 'principal',
-        basis,
-      });
-    await workingHours('mon', '09:00');
-    await workingHours('tue', '08:15');
-    await setSchedulingPreference({ kind: 'working-hours', weekday: 'sat', hours: 'off', source: 'principal', basis });
-
-    await keepMattersOnTime();
-    const [before] = await syncs();
-    expect(before).toMatchObject({ recurrence: '15 7 * * *' });
-    expect(localClock(before.process_after)).toBe('7:15 AM');
-
-    await workingHours('tue', '06:30');
-    await keepMattersOnTime();
-    const [after] = await syncs();
-    expect(await syncs()).toHaveLength(1);
-    expect(after).toMatchObject({ recurrence: '30 5 * * *' });
-    // Today's run keeps its time; the new hours take over from tomorrow.
-    expect(after.process_after).toBe(before.process_after);
-    expect(after.series_id).not.toBe(before.series_id);
-    expect(taskRows(await mainSession()).find((row) => row.id === before.id)?.status).toBe('cancelled');
-  });
-
-  it('wakes main on a quiet day without inventing an unread note', async () => {
-    const quiet = await run('matters-sync', {});
-    expect(quiet).toMatchObject({ ok: true, data: { wakeAgent: true, data: [] } });
-    expect(await runnerReads(printed(quiet), scratch)).toEqual({ wakeAgent: true, data: [] });
-  });
-
-  it.each([
-    { scheduledFrom: MONDAY_6AM, runAt: '2026-10-12T11:00:00.000Z', startsWeek: true },
-    // Already Monday in UTC, but the occurrence was due Sunday in New York.
-    { scheduledFrom: '2026-10-11T10:00:00.000Z', runAt: '2026-10-12T03:30:00.000Z', startsWeek: false },
-    // Monday's occurrence remains Monday's, even when the host runs it after midnight.
-    { scheduledFrom: MONDAY_6AM, runAt: '2026-10-13T04:30:00.000Z', startsWeek: true },
-    // Sunday afternoon: Monday's occurrence is pending but not due, so a call now starts nothing.
-    { scheduledFrom: '2026-10-11T18:00:00.000Z', runAt: '2026-10-11T18:00:00.000Z', startsWeek: false },
-  ])(
-    'uses the occurrence in the principal zone for the week cue: $runAt',
-    async ({ scheduledFrom, runAt, startsWeek }) => {
-      vi.setSystemTime(new Date(scheduledFrom));
-      await keepMattersOnTime();
-      vi.setSystemTime(new Date(runAt));
-      const verdict = await data<{ wakeAgent: boolean; data: string[] }>(run('matters-sync', {}));
-      expect(verdict.wakeAgent).toBe(true);
-      expect(verdict.data.some((line) => line.includes('starts the week'))).toBe(startsWeek);
-      expect(verdict.data.some((line) => line.includes('note'))).toBe(false);
-    },
-  );
-
-  it('lists later looks and a morning rundown so main can combine what needs the principal', async () => {
-    vi.setSystemTime(new Date('2026-10-12T08:00:00.000Z'));
-    const alreadyDue = await open('Earlier look', { look: '2026-10-12T05:00' });
-    vi.setSystemTime(new Date(MONDAY_6AM));
-    const later = await open('Prepare for the Acme review', { look: '2026-10-12T14:00' });
-    await open('Tomorrow lunch', { look: '2026-10-13T12:00' });
-    await createScheduledTask(
-      MAIN,
-      prepareScheduledTask({
-        name: 'morning rundown',
-        prompt: 'Their requested morning rundown.',
-        script: 'ncl matters today',
-        processAfter: '2026-10-12T07:30',
-        timezone: ZONE,
-      }),
-      { session: await mainSession() },
-    );
-    const verdict = await data<{ wakeAgent: boolean; data: string[] }>(run('matters-sync', {}));
-    expect(verdict.data).toContain('Later looks today:');
-    expect(verdict.data).toContain(`- ${later.id}, Oct 12, 2026, 2:00 PM: Prepare for the Acme review`);
-    expect(verdict.data.join('\n')).not.toContain(alreadyDue.id);
-    expect(verdict.data.join('\n')).not.toContain('Tomorrow lunch');
-    expect(verdict.data).toContain('Morning rundown: Oct 12, 2026, 7:30 AM.');
-    expect(gmail.reads).toEqual([]);
-  });
-
-  it.each([
-    { changed: 'prompt', runAt: MONDAY_6AM },
-    { changed: 'prompt', runAt: '2026-10-12T15:00:00.000Z' },
-    { changed: 'script', runAt: MONDAY_6AM },
-    // The host was down across midnight: yesterday's occurrence never ran, and still runs now.
-    { changed: 'prompt', runAt: '2026-10-13T12:30:00.000Z' },
-  ])('replaces a changed $changed on one pass at $runAt without losing its run', async ({ changed, runAt }) => {
-    await keepMattersOnTime();
-    const [release] = await syncs();
-    const content = taskContent(release);
+describe('the evening close', () => {
+  it('uses one native conversational system session, leaving the principal conversation independent', async () => {
     const main = await mainSession();
-    // Store a task from an older release, rather than mutate a due occurrence through the task API.
-    await withExistingMailboxSession(MAIN, main.id, (mailbox) => mailbox.cancelTask(release.series_id));
-    const old = await createScheduledTask(
+    await keepMattersOnTime();
+    const close = await closeSession();
+    const row = await closeRow();
+    expect(close).toMatchObject({ messaging_group_id: null, thread_id: `system:gws-ea-close:${row.id}` });
+    expect(JSON.parse(row.content)).toMatchObject({ inConversation: true });
+    expect(row).toMatchObject({ recurrence: null, process_after: '2026-10-13T01:00:00.000Z' });
+    expect(liveTaskRows(main).filter((item) => item.series_id.startsWith('gws-ea-close-'))).toEqual([]);
+    const isolated = await createScheduledTask(
       MAIN,
-      prepareScheduledTask({
-        name: 'gws-ea daily sync',
-        prompt: changed === 'prompt' ? 'An older release prompt.' : content.prompt,
-        script: changed === 'script' ? 'ncl matters today' : content.script,
-        recurrence: '0 7 * * *',
-        processAfter: release.process_after,
-        timezone: ZONE,
-      }),
-      { session: main },
+      prepareScheduledTask({ prompt: 'A native isolated task.', processAfter: '2026-10-13T01:00Z' }),
     );
-    vi.setSystemTime(new Date(runAt));
+    expect(JSON.parse(isolated.row.content).inConversation).toBeUndefined();
     await keepMattersOnTime();
-    const [replacement] = await syncs();
-    expect(await syncs()).toHaveLength(1);
-    expect(replacement.series_id).not.toBe(old.row.seriesId);
-    expect(replacement.process_after).toBe(release.process_after);
-    expect(taskContent(replacement)).toEqual(content);
-    await keepMattersOnTime();
-    expect(await syncs()).toEqual([replacement]);
-  });
-
-  it.each(['completed', 'script-skip:error'] as const)(
-    'leaves an old release answered %s to the sweep, then upgrades its next occurrence without running today again',
-    async (answer) => {
-      const main = await mainSession();
-      const old = await createScheduledTask(
-        MAIN,
-        prepareScheduledTask({
-          name: 'gws-ea daily sync',
-          prompt: 'An older release prompt.',
-          script: 'ncl matters sync',
-          recurrence: '0 7 * * *',
-          processAfter: '2026-10-12T07:00',
-          timezone: ZONE,
-        }),
-        { session: main },
-      );
-      vi.setSystemTime(new Date('2026-10-12T12:00:00.000Z'));
-      // The runner answered, but the host has not read the answer yet, as just after a restart.
-      postAnswer(main, old.row.id, answer);
-      await keepMattersOnTime();
-      expect((await syncs()).map((row) => row.id)).toEqual([old.row.id]);
-      // Once read, the row is the sweep's to re-arm; the pass leaves it.
+    expect(await closeRuns()).toHaveLength(1);
+    // A principal message keeps the normal conversation route while this close awaits background results.
+    await writeSessionMessage(MAIN, main.id, {
+      id: 'principal-during-close',
+      kind: 'chat',
+      timestamp: MONDAY_6AM,
+      content: JSON.stringify({ text: 'Move lunch to noon.', sender: 'Morgan', senderId: 'morgan' }),
+      trigger: true,
+    });
+    expect(
       await withExistingMailboxSession(MAIN, main.id, (mailbox) =>
-        mailbox.applyProcessingAcks(mailbox.getTerminalProcessingAcks()),
-      );
-      await keepMattersOnTime();
-      expect(await syncs()).toEqual([]);
-      // The sweep re-arms the old release's clock, and the next pass replaces that successor.
-      await reconcileSession(main.id);
-      expect(taskRows(main).find((row) => row.id === old.row.id)).toMatchObject({
-        status: answer === 'completed' ? 'completed' : 'failed',
-        recurrence: null,
-      });
-      await keepMattersOnTime();
-      const [replacement] = await syncs();
-      expect(await syncs()).toHaveLength(1);
-      expect(taskContent(replacement).prompt).not.toBe('An older release prompt.');
-      expect(replacement.process_after).toBe('2026-10-13T11:00:00.000Z');
-      expect(taskRows(main).filter((row) => row.recurrence !== null)).toEqual([replacement]);
-      await reconcileSession(main.id);
-      await keepMattersOnTime();
-      expect(await syncs()).toEqual([replacement]);
-    },
-  );
+        mailbox.getInboundRecords({ status: 'pending' }).map((item) => item.id),
+      ),
+    ).toContain('principal-during-close');
+    expect(
+      await withExistingMailboxSession(MAIN, close.id, (mailbox) => mailbox.getInboundRecords().map((item) => item.id)),
+    ).not.toContain('principal-during-close');
+  });
 
-  it('lets a due sync already running finish once before upgrading its next occurrence', async () => {
-    const main = await mainSession();
-    const old = await createScheduledTask(
-      MAIN,
-      prepareScheduledTask({
-        name: 'gws-ea daily sync',
-        prompt: 'An older release prompt.',
-        script: 'ncl matters sync',
-        recurrence: '0 7 * * *',
-        processAfter: '2026-10-12T07:00',
-        timezone: ZONE,
-      }),
-      { session: main },
-    );
-    vi.setSystemTime(new Date('2026-10-12T11:01:00.000Z'));
-    vi.mocked(isContainerRunning).mockReturnValue(true);
+  it('arms its task with the evening script, which the runner runs before the turn', async () => {
     await keepMattersOnTime();
-    expect((await syncs()).map((row) => row.id)).toEqual([old.row.id]);
-    expect(taskContent((await syncs())[0]).prompt).toBe('An older release prompt.');
-    postAnswer(main, old.row.id, 'completed');
+    const row = await closeRow();
+    expect(taskContent(row)).toMatchObject({
+      script: `ncl matters evening --run ${row.id}`,
+      prompt: expect.stringContaining(`Close-run: ${row.id}.`),
+    });
+  });
+
+  it('answers a close that is not due yet with no wake, and leaves it pending', async () => {
+    await keepMattersOnTime();
+    const session = await closeSession();
+    const row = await closeRow();
+    expect(Date.parse(row.process_after)).toBeGreaterThan(Date.now());
+    expect(await closeVerdict(session.id, row.id)).toEqual({ wakeAgent: false, data: [] });
+    expect((await closeRuns()).at(-1)).toMatchObject({ id: row.id, state: 'pending', started_at: null });
+    expect(await getOpenCloseRun(session.id)).toBeUndefined();
+  });
+
+  it('leaves main a quiet report as a host receipt that wakes nothing', async () => {
+    await keepMattersOnTime();
+    const session = await closeSession();
+    const row = await closeRow();
+    vi.setSystemTime(new Date(row.process_after));
+    await closeVerdict(session.id, row.id);
+    await capture(row.id, session.id);
+    vi.mocked(requestWake).mockClear();
+    await finishClose(session.id, row.id, 'Quiet close; nothing needs Morgan tonight.');
+    expect(requestWake).not.toHaveBeenCalled();
+    const [report] =
+      (await withExistingMailboxSession(MAIN, (await mainSession()).id, (mailbox) =>
+        mailbox.getInboundRecords().filter((item) => item.id === `close-report-${row.id}`),
+      )) ?? [];
+    expect(report).toMatchObject({ trigger: false });
+    expect(JSON.parse(report.content)).toMatchObject({
+      text: 'Quiet close; nothing needs Morgan tonight.',
+      noteKind: 'host-receipt',
+    });
+  });
+
+  it('reports eleven hours of lateness after the host misses the evening', async () => {
+    await keepMattersOnTime();
+    const session = await closeSession();
+    const row = await closeRow();
+    vi.setSystemTime(new Date('2026-10-13T12:00:00Z'));
+    const response = await dispatch(
+      { id: 'evening', command: 'matters-evening', args: { run: row.id } },
+      { ...MAIN_CALLER, sessionId: session.id },
+    );
+    expect(response).toMatchObject({
+      ok: true,
+      data: { wakeAgent: true, data: expect.arrayContaining([expect.stringContaining('11 hours late')]) },
+    });
+    expect(await runnerReads(printed(response), scratch)).toMatchObject({ wakeAgent: true });
+    expect(printed(response)).toContain('scheduled Oct 12, 2026, 9:00 PM New York time');
+    expect(printed(response)).toContain('Day ledger: everything so far; no close has completed yet.');
+    expect(printed(response)).not.toContain(row.process_after);
+  });
+
+  it('leaves hand-backs to main’s own looks at the close, listing none in the close verdict', async () => {
+    const lease = await open('Lease', { look: '2026-10-12T06:10' });
+    const main = await mainSession();
+    await runOccurrence(main, liveTaskRows(main).find((row) => row.series_id === lease.look_task_id)!.id, 'completed');
+    await keepMattersOnTime();
+    const session = await closeSession();
+    const row = await closeRow();
+    vi.setSystemTime(new Date(row.process_after));
+    const verdict = await closeVerdict(session.id, row.id);
+    expect(verdict.wakeAgent).toBe(true);
+    expect(JSON.stringify(verdict.data)).not.toContain(lease.id);
+  });
+
+  it('re-times an unclaimed close after a new stay, but leaves a claimed close in place', async () => {
+    vi.setSystemTime(new Date('2032-10-12T10:00:00Z'));
+    await keepMattersOnTime();
+    const first = await closeRow();
+    await addStay({
+      locality: 'Tokyo',
+      zone: 'Asia/Tokyo',
+      start: '2032-10-12T12:00Z',
+      end: '2032-10-12',
+      source: 'said',
+      certainty: 'certain',
+    });
+    await keepMattersOnTime();
+    const moved = await closeRow();
+    expect(moved.id).toBe(first.id);
+    expect(moved.process_after).toBe('2032-10-12T12:00:00.000Z');
+    vi.setSystemTime(new Date(moved.process_after));
+    const session = await closeSession();
+    await closeVerdict(session.id, moved.id);
+    vi.mocked(isContainerRunning).mockImplementation((id) => id === session.id);
+    await addStay({
+      locality: 'Sydney',
+      zone: 'Australia/Sydney',
+      start: '2032-10-12T12:01Z',
+      end: '2032-10-12T14:00Z',
+      source: 'said',
+      certainty: 'certain',
+    });
+    await keepMattersOnTime();
+    expect(taskRows(session).find((item) => item.id === first.id)?.process_after).toBe(moved.process_after);
+    expect(await getOpenCloseRun(session.id)).toMatchObject({ id: first.id, state: 'open' });
+  });
+
+  it('accepts done after the first acknowledgment while background agents still run, then sends one chosen report on retry', async () => {
+    await keepMattersOnTime();
+    const session = await closeSession();
+    const row = await closeRow();
+    vi.setSystemTime(new Date(row.process_after));
+    await closeVerdict(session.id, row.id);
+    await capture(row.id, session.id);
+    postAnswer(session, row.id, 'completed');
+    vi.mocked(isContainerRunning).mockImplementation((id) => id === session.id);
+    await keepMattersOnTime();
+    expect(await getOpenCloseRun(session.id)).toMatchObject({ id: row.id });
+    const wake = vi.mocked(requestWake);
+    wake.mockClear();
+    expect(await finishClose(session.id, row.id, 'Morgan needs to choose the departure.', true)).toMatchObject({
+      state: 'completed',
+    });
+    expect(await finishClose(session.id, row.id, 'A changed retry must not send again.', true)).toMatchObject({
+      state: 'completed',
+    });
+    const reports = await withExistingMailboxSession(MAIN, (await mainSession()).id, (mailbox) =>
+      mailbox.getInboundRecords().filter((item) => item.id === `close-report-${row.id}`),
+    );
+    expect(reports).toHaveLength(1);
+    expect(JSON.parse(reports![0].content)).toMatchObject({ text: 'Morgan needs to choose the departure.' });
+    expect(wake).toHaveBeenCalledTimes(1);
+    expect(await lastCompletedClose()).toMatchObject({ id: row.id, ledger_through_at: new Date().toISOString() });
+  });
+
+  it('keeps a quiet report written before an interruption, without a second note or a wake', async () => {
+    await keepMattersOnTime();
+    const session = await closeSession();
+    const row = await closeRow();
+    vi.setSystemTime(new Date(row.process_after));
+    await closeVerdict(session.id, row.id);
+    await capture(row.id, session.id);
+    // The note already crossed the native boundary before completion was recorded.
+    await writeNoteForMain({
+      id: `close-report-${row.id}`,
+      timestamp: new Date().toISOString(),
+      text: 'Quiet close.',
+      wake: false,
+      noteKind: 'host-receipt',
+    });
+    vi.mocked(requestWake).mockClear();
+    expect(await finishClose(session.id, row.id, 'A changed retry.', true)).toMatchObject({ state: 'completed' });
+    expect(requestWake).not.toHaveBeenCalled();
+    const reports = await withExistingMailboxSession(MAIN, (await mainSession()).id, (mailbox) =>
+      mailbox.getInboundRecords().filter((item) => item.id === `close-report-${row.id}`),
+    );
+    expect(reports?.map((item) => (JSON.parse(item.content) as { text: string }).text)).toEqual(['Quiet close.']);
+  });
+
+  it('fails an acked close only after its container exits, and keeps the ledger window', async () => {
+    await keepMattersOnTime();
+    const session = await closeSession();
+    const row = await closeRow();
+    vi.setSystemTime(new Date(row.process_after));
+    await closeVerdict(session.id, row.id);
+    await capture(row.id, session.id);
+    postAnswer(session, row.id, 'completed');
+    await keepMattersOnTime();
+    expect(await getOpenCloseRun(session.id)).toBeUndefined();
+    expect(await getDb().get('SELECT state FROM gws_ea_close_runs WHERE id=?', row.id)).toEqual({ state: 'failed' });
+    expect(await lastCompletedClose()).toBeUndefined();
+    expect((await closeRuns()).at(-1)?.scheduled_at).toBe('2026-10-14T01:00:00.000Z');
+    expect(await getSession(session.id)).toMatchObject({ status: 'closed' });
+  });
+
+  it('does not let an old live container starve the next due close', async () => {
+    await keepMattersOnTime();
+    const session = await closeSession();
+    const row = await closeRow();
+    vi.setSystemTime(new Date(row.process_after));
+    await closeVerdict(session.id, row.id);
+    postAnswer(session, row.id, 'completed');
+    vi.mocked(isContainerRunning).mockImplementation((id) => id === session.id);
+    await keepMattersOnTime();
+    const next = await closeRow();
+    const nextSession = await closeSession();
+    vi.setSystemTime(new Date(next.process_after));
+    await keepMattersOnTime();
+    expect(await getOpenCloseRun(session.id)).toBeUndefined();
+    expect((await closeVerdict(nextSession.id, next.id)).wakeAgent).toBe(true);
+    // Its session stays active, where core's idle ceiling still reaches the container, until that container stops.
+    expect(await getSession(session.id)).toMatchObject({ status: 'active' });
     vi.mocked(isContainerRunning).mockReturnValue(false);
     await keepMattersOnTime();
-    expect((await syncs()).map((row) => row.id)).toEqual([old.row.id]);
-    await reconcileSession(main.id);
+    expect(await getSession(session.id)).toMatchObject({ status: 'closed' });
+  });
+
+  it('closes a completed close’s session only once its container has stopped', async () => {
     await keepMattersOnTime();
-    const [next] = await syncs();
-    expect(await syncs()).toHaveLength(1);
-    expect(next.process_after).toBe('2026-10-13T11:00:00.000Z');
-    expect(taskContent(next).prompt).not.toBe('An older release prompt.');
-    await reconcileSession(main.id);
-    expect(await syncs()).toEqual([next]);
+    const session = await closeSession();
+    const row = await closeRow();
+    vi.setSystemTime(new Date(row.process_after));
+    await closeVerdict(session.id, row.id);
+    await capture(row.id, session.id);
+    vi.mocked(isContainerRunning).mockImplementation((id) => id === session.id);
+    await finishClose(session.id, row.id, 'Quiet close.');
+    await keepMattersOnTime();
+    expect(await getSession(session.id)).toMatchObject({ status: 'active' });
+    vi.mocked(isContainerRunning).mockReturnValue(false);
+    await keepMattersOnTime();
+    expect(await getSession(session.id)).toMatchObject({ status: 'closed' });
   });
 
-  it('reads no note from a pending tool reply, but reports a readable note alongside it', async () => {
+  it('never recreates or opens the mailbox of a completed close', async () => {
+    await keepMattersOnTime();
+    const previous = await closeSession();
+    const row = await closeRow();
+    vi.setSystemTime(new Date(row.process_after));
+    await closeVerdict(previous.id, row.id);
+    await capture(row.id, previous.id);
+    await finishClose(previous.id, row.id, 'Quiet close.');
+    await keepMattersOnTime();
+    expect(await getSession(previous.id)).toMatchObject({ status: 'closed' });
+    const history = await lastCompletedClose();
+    const next = await closeRow();
+    fs.rmSync(sessionDir(MAIN, previous.id), { force: true, recursive: true });
+    await keepMattersOnTime();
+    expect(fs.existsSync(sessionDir(MAIN, previous.id))).toBe(false);
+    expect((await closeRow()).id).toBe(next.id);
+    expect(await lastCompletedClose()).toEqual(history);
+  });
+
+  it('re-times an unclaimed overdue New York close to tonight’s Los Angeles clock', async () => {
+    vi.setSystemTime(new Date('2026-10-11T23:00Z'));
+    await keepMattersOnTime();
+    const previous = await closeSession();
+    const row = await closeRow();
+    expect(row.process_after).toBe('2026-10-12T01:00:00.000Z');
+    vi.setSystemTime(new Date('2026-10-12T01:01Z'));
+    await addStay({
+      locality: 'Los Angeles',
+      zone: 'America/Los_Angeles',
+      start: '2026-10-12T00:00Z',
+      end: '2026-10-13',
+      source: 'said',
+      certainty: 'certain',
+    });
+    await keepMattersOnTime();
+    expect((await closeRow()).process_after).toBe('2026-10-12T04:00:00.000Z');
+    expect(taskRows(previous).find((item) => item.id === row.id)?.status).toBe('cancelled');
+    expect(await getOpenCloseRun(previous.id)).toBeUndefined();
+  });
+
+  it('keeps an overdue close’s original moment when an unrelated travel estimate changes', async () => {
+    await keepMattersOnTime();
+    const row = await closeRow();
+    vi.setSystemTime(new Date('2026-10-13T12:00Z'));
+    await setEventTravel({ eventId: 'work-review', mode: 'walk', minutes: 20, source: 'learned' });
+    await keepMattersOnTime();
+    expect((await closeRow()).id).toBe(row.id);
+    expect((await closeRow()).process_after).toBe(row.process_after);
+  });
+
+  it('requires the ledger and matching open run before completing', async () => {
+    await keepMattersOnTime();
+    const session = await closeSession();
+    const row = await closeRow();
+    vi.setSystemTime(new Date(row.process_after));
+    await closeVerdict(session.id, row.id);
+    await expect(finishClose(session.id, row.id)).rejects.toThrow('after ncl day has been read');
+    await expect(finishClose((await mainSession()).id, row.id)).rejects.toThrow('after ncl day has been read');
+  });
+
+  it('cancels the retired daily-sync series, whatever its occurrence is doing', async () => {
     const main = await mainSession();
-    const reply = JSON.stringify({ action: 'cli_response', requestId: 'old-request', ok: true, data: [] });
-    await writeSessionMessage(main.agent_group_id, main.id, {
-      id: 'stale-tool-reply',
-      kind: 'system',
-      timestamp: MONDAY_6AM,
-      platformId: null,
-      channelType: null,
-      threadId: null,
-      content: reply,
-      processAfter: null,
-      recurrence: null,
-      trigger: false,
-    });
-
-    expect(await data(run('matters-sync', {}))).toEqual({ wakeAgent: true, data: [] });
-    await note('readable-note', 'Calendar access needs attention.');
-    expect(await data(run('matters-sync', {}))).toEqual({
-      wakeAgent: true,
-      data: ['A note you have not read comes with this.'],
-    });
-    await answerOccurrence(main, 'readable-note', 'completed');
-    expect(await data(run('matters-sync', {}))).toEqual({ wakeAgent: true, data: [] });
-    expect(
-      await withExistingMailboxSession(main.agent_group_id, main.id, (mailbox) =>
-        mailbox.getInboundRecords({ status: 'pending' }),
-      ),
-    ).toMatchObject([{ id: 'stale-tool-reply', kind: 'system', content: reply }]);
+    const old = await createScheduledTask(
+      MAIN,
+      prepareScheduledTask({
+        name: 'gws-ea daily sync',
+        prompt: 'Old sync',
+        recurrence: '0 7 * * *',
+        processAfter: MONDAY_6AM,
+      }),
+      { session: main },
+    );
+    vi.mocked(isContainerRunning).mockImplementation((id) => id === main.id);
+    await cancelDailySync();
+    expect(liveTaskRows(main).filter((item) => item.series_id === old.row.seriesId)).toEqual([]);
   });
 
-  it('reports unread notes while they wait, then still wakes main without a note line', async () => {
-    await note('note-calendar', 'Calendar access to the work calendar dropped to free/busy only.');
-    expect(await data(run('matters-sync', {}))).toEqual({
-      wakeAgent: true,
-      data: ['A note you have not read comes with this.'],
-    });
-    await note('note-unsigned', 'Gmail could not confirm an email in their name came from them.');
-    const waking = await run('matters-sync', {});
-    expect(waking).toMatchObject({
-      ok: true,
-      data: { wakeAgent: true, data: ['2 notes you have not read come with this.'] },
-    });
-    expect(await runnerReads(printed(waking), scratch)).toEqual({
-      wakeAgent: true,
-      data: ['2 notes you have not read come with this.'],
-    });
+  it.each([
+    { name: 'SFO to NRT', from: 'America/Los_Angeles', to: 'Asia/Tokyo', arrival: '2026-11-01T07:00Z' },
+    { name: 'NRT to SFO', from: 'Asia/Tokyo', to: 'America/Los_Angeles', arrival: '2026-11-01T18:00Z' },
+    { name: 'SFO to SYD', from: 'America/Los_Angeles', to: 'Australia/Sydney', arrival: '2026-11-01T09:00Z' },
+    { name: 'SYD to SFO', from: 'Australia/Sydney', to: 'America/Los_Angeles', arrival: '2026-11-01T14:00Z' },
+  ])(
+    '$name never loses the Sunday weekly pass, including when twelve-hour spacing skips Sunday evening',
+    async ({ from, to, arrival }) => {
+      vi.setSystemTime(new Date('2026-10-30T00:00Z'));
+      await getDb().run('UPDATE gws_ea_profile SET principal_timezone=? WHERE singleton=1', from);
+      await addStay({
+        locality: to,
+        zone: to,
+        start: arrival,
+        end: '2026-11-10',
+        source: 'calendar',
+        certainty: 'certain',
+      });
+      const passes: string[] = [];
+      let previous: number | undefined;
+      for (let index = 0; index < 6; index++) {
+        await keepClose(await mainSession());
+        const row = await closeRow();
+        const session = await closeSession();
+        const at = Date.parse(row.process_after);
+        if (previous !== undefined) expect(at - previous).toBeGreaterThanOrEqual(12 * 60 * 60 * 1000);
+        previous = at;
+        vi.setSystemTime(new Date(at));
+        const verdict = await closeVerdict(session.id, row.id);
+        passes.push(...(verdict.data ?? []).filter((line) => line.startsWith('Weekly pass for Sunday 2026-11-01:')));
+        await capture(row.id, session.id);
+        await finishClose(session.id, row.id, 'Quiet close; no principal message needed.');
+        await answerOccurrence(session, row.id, 'completed');
+      }
+      expect(passes).toHaveLength(1);
+    },
+  );
 
-    // main's next turn reads both.
-    const main = await mainSession();
-    await answerOccurrence(main, 'note-calendar', 'completed');
-    await answerOccurrence(main, 'note-unsigned', 'completed');
-    expect(await data(run('matters-sync', {}))).toEqual({ wakeAgent: true, data: [] });
+  it('takes the Sunday pass at a late Saturday close that actually runs on Sunday', async () => {
+    vi.setSystemTime(new Date('2026-10-10T10:00Z'));
+    await keepMattersOnTime();
+    const session = await closeSession();
+    const row = await closeRow();
+    vi.setSystemTime(new Date('2026-10-11T12:00Z'));
+    expect((await closeVerdict(session.id, row.id)).data).toContain(
+      'Weekly pass for Sunday 2026-10-11: the week and month ahead, stale open matters and consolidation. Snapshot memory before consolidation.',
+    );
   });
 
-  it('wakes main for each thread waiting to be placed: who its mail carried, when the latest came, and its Gmail thread', async () => {
-    await recordThreadMessage(
-      { threadKey: THREAD, side: 'outside', gmailMessageId: 'g-1' },
-      '2026-10-12T08:15:00.000Z',
+  it('does not repeat Sunday work in a successor armed while Sunday’s close was still open', async () => {
+    vi.setSystemTime(new Date('2026-10-11T10:00Z'));
+    await keepMattersOnTime();
+    const session = await closeSession();
+    const row = await closeRow();
+    vi.setSystemTime(new Date(row.process_after));
+    await closeVerdict(session.id, row.id);
+    await capture(row.id, session.id);
+    vi.mocked(isContainerRunning).mockImplementation((id) => id === session.id);
+    await keepMattersOnTime();
+    const next = await closeRow();
+    const nextSession = await closeSession();
+    await finishClose(session.id, row.id, 'Sunday complete; nothing needs Morgan now.');
+    vi.setSystemTime(new Date(next.process_after));
+    expect((await closeVerdict(nextSession.id, next.id)).data?.some((line) => line.startsWith('Weekly pass'))).toBe(
+      false,
     );
-    await recordThreadMessage(
-      { threadKey: THREAD, side: 'outside', gmailMessageId: 'g-2' },
-      '2026-10-12T09:30:00.000Z',
-    );
-    await recordThreadAddresses(THREAD, ['remy@acme.example', 'noel@acme.example'], 'message', MONDAY_6AM);
-    await recordThreadAddresses(THREAD, ['jane@partner.example'], 'written', MONDAY_6AM);
-    // A thread only the principal and the assistant are on waits for no placement.
-    await createThread('gmail-thread-b', MONDAY_6AM, 'mail-principal-only');
-    await recordThreadMessage(
-      { threadKey: 'mail-principal-only', side: 'principal', gmailMessageId: 'p-1' },
-      MONDAY_6AM,
-    );
+  });
 
-    expect(await data(run('matters-sync', {}))).toEqual({
-      wakeAgent: true,
-      data: [
-        'Threads waiting to be placed:',
-        `- ${THREAD}: noel@acme.example, remy@acme.example; latest mail Oct 12, 2026, 5:30 AM; Gmail thread gmail-thread-a`,
-      ],
-    });
-    expect(gmail.reads).toEqual([]);
+  it('forgets the latest Sunday snapshot and the planning results without reading them', async () => {
+    const snapshot = path.join(DATA_DIR, 'groups', MAIN, 'sunday-memory-latest');
+    const runs = path.join(DATA_DIR, 'groups', MAIN, 'planning-runs');
+    fs.mkdirSync(snapshot, { recursive: true });
+    fs.writeFileSync(path.join(snapshot, 'juno.md'), 'Juno facts');
+    fs.mkdirSync(runs, { recursive: true });
+    fs.writeFileSync(path.join(runs, 'agent-1-look-back.md'), 'Close run: close-1\nJuno Hale asked for Friday.');
+    await forgetSundaySnapshot();
+    expect(fs.existsSync(snapshot)).toBe(false);
+    expect(fs.existsSync(runs)).toBe(false);
   });
 });
 

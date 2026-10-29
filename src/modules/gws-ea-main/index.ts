@@ -17,6 +17,7 @@ import {
 } from '../../capabilities.js';
 import { register } from '../../cli/registry.js';
 import { parseSkillSelection } from '../../container-config.js';
+import { registerContainerEnv } from '../../container-env.js';
 import { getDb } from '../../db/connection.js';
 import { getContainerConfig, updateContainerConfigJson } from '../../db/container-configs.js';
 import { EXPOSED_GOOGLE_SKILLS } from '../gws-ea-google/grant.js';
@@ -27,6 +28,20 @@ import { registerGuidance } from '../gws-ea-profile/guidance.js';
 export const GUIDANCE_PATH = path.join('src', 'modules', 'gws-ea-main', 'guidance.md');
 
 export const MAIN_CHAT_CAPABILITY = 'gws-ea-chat';
+export const MAIN_CONTEXT_CAPABILITY = 'gws-ea-main-context';
+registerCapability(MAIN_CONTEXT_CAPABILITY, {
+  description: 'live coming-days context and planning runtime for canonical main',
+  default: 'off',
+  grantedTo: async (agentGroupId) => agentGroupId === (await mainAgentGroupId()),
+});
+// Pinned because Claude Code otherwise picks its prompt by model: on any model
+// the shorter one keeps the agent loop and leaves out the software-engineering
+// framing, so the character leads.
+registerContainerEnv(
+  'gws-ea-main:system-prompt',
+  ({ capabilities }): Record<string, string> =>
+    capabilities.has(MAIN_CONTEXT_CAPABILITY) ? { CLAUDE_CODE_SIMPLE_SYSTEM_PROMPT: '1' } : {},
+);
 registerCapability(MAIN_CHAT_CAPABILITY, {
   description: 'whatsapp_link and chat-addressed host actions for canonical main',
   default: 'off',
@@ -45,6 +60,10 @@ export const MAIN_SHARED_SKILLS: readonly string[] = [
   ...EXPOSED_GOOGLE_SKILLS,
   'whatsapp-formatting',
   'artifact-designer',
+  'days-and-weeks',
+  'travel',
+  'errands',
+  'meetings',
 ];
 
 async function mainAgentGroupId(): Promise<string | null> {

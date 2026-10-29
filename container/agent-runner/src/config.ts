@@ -87,6 +87,11 @@ export function runnerCapabilities(): ReadonlySet<string> {
   return _config?.capabilities ?? NO_CAPABILITIES;
 }
 
+/** The host grants this capability to canonical main alone. */
+export function planningAgentsEnabled(capabilities: ReadonlySet<string>): boolean {
+  return capabilities.has('gws-ea-main-context');
+}
+
 /**
  * `speed` wins when present; the host already validated it against the
  * provider's declared tiers, so any non-empty name passes through. A host from

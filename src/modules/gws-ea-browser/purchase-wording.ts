@@ -93,7 +93,7 @@ export async function purchaseCommitNotice(
     readonly incident: { kind: IncidentKind; site: string } | undefined;
     readonly now: string;
     /** Read only for the two answers that state the approval's expiry, so the others never depend on it. */
-    readonly principalClock: () => Promise<string>;
+    readonly principalClock: (at: string) => Promise<string>;
   },
 ): Promise<PurchaseCommitNotice> {
   const none = 'No purchase was attempted';
@@ -118,7 +118,7 @@ export async function purchaseCommitNotice(
       `${none}: the principal's approval expired before the checkout could go through. Report it to the agent that sent this errand.`,
     );
   const holds = async (): Promise<string> =>
-    `The principal's approval holds until it expires, ${formatLocalTimeWithZone(authority.expires_at, await facts.principalClock())}.`;
+    `The principal's approval holds until it expires, ${formatLocalTimeWithZone(authority.expires_at, await facts.principalClock(authority.expires_at))}.`;
   if (
     unspent &&
     (data.status === 'checkout_lapsed' ||

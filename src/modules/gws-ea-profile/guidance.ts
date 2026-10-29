@@ -7,7 +7,7 @@
  *
  * A missing or empty file is tolerated but never silent, like a missing base
  * document (src/project-doc-compose.ts): throwing would fail every spawn.
- * `guidance-caps.test.ts` fails when a registered file is missing.
+ * `guidance-budget.test.ts` fails when a registered file is missing.
  */
 import fs from 'node:fs';
 import path from 'node:path';

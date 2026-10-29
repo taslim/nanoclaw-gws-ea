@@ -22,6 +22,9 @@ export const PREFERENCE_KINDS = [
   'meeting-length',
   'buffer',
   'preferred-time',
+  'meal-window',
+  'back-to-back',
+  'ignored-events',
 ] as const;
 export type PreferenceKind = (typeof PREFERENCE_KINDS)[number];
 
@@ -78,7 +81,25 @@ export interface PreferredTimePreference extends Provenance {
   readonly end: string;
 }
 
+export interface MealWindowPreference extends Provenance {
+  readonly meal: 'lunch' | 'dinner';
+  readonly weekdays: readonly Weekday[];
+  readonly start: string;
+  readonly end: string;
+  readonly minutes: number;
+}
+export interface BackToBackPreference extends Provenance {
+  readonly minutes: number;
+  readonly break_minutes: number;
+}
+export interface IgnoredEventsPreference extends Provenance {
+  readonly prefix: string;
+}
+
 export interface SchedulingPreferences {
+  readonly meal_windows: readonly MealWindowPreference[];
+  readonly back_to_back: readonly BackToBackPreference[];
+  readonly ignored_events: readonly IgnoredEventsPreference[];
   readonly working_hours: readonly WorkingHoursPreference[];
   readonly protected_windows: readonly ProtectedWindowPreference[];
   readonly meeting_lengths: readonly MeetingLengthPreference[];
@@ -92,6 +113,9 @@ export interface PreferenceByKind {
   readonly 'meeting-length': MeetingLengthPreference;
   readonly buffer: BufferPreference;
   readonly 'preferred-time': PreferredTimePreference;
+  readonly 'meal-window': MealWindowPreference;
+  readonly 'back-to-back': BackToBackPreference;
+  readonly 'ignored-events': IgnoredEventsPreference;
 }
 
 export type SchedulingPreference = PreferenceByKind[PreferenceKind];
@@ -125,6 +149,14 @@ export type SetPreferenceInput = {
       readonly weekdays?: readonly string[];
       readonly reason?: string;
     } & ClockRangeInput)
+  | ({
+      readonly kind: 'meal-window';
+      readonly meal: string;
+      readonly weekdays?: readonly string[];
+      readonly minutes: number;
+    } & ClockRangeInput)
+  | { readonly kind: 'back-to-back'; readonly minutes: number; readonly breakMinutes?: number }
+  | { readonly kind: 'ignored-events'; readonly prefix: string }
   | { readonly kind: 'meeting-length' | 'buffer'; readonly meetingKind: string; readonly minutes: number }
   | ({
       readonly kind: 'preferred-time';
@@ -136,12 +168,18 @@ export type SetPreferenceInput = {
 
 /** `source`: the principal, or the assistant on its own inference. */
 export type PreferenceTarget = { readonly source: string } & (
+  | { readonly kind: 'meal-window'; readonly meal: string }
+  | { readonly kind: 'back-to-back' }
+  | { readonly kind: 'ignored-events'; readonly prefix: string }
   | { readonly kind: 'working-hours'; readonly weekday: string }
   | { readonly kind: 'protected-window'; readonly id: string }
   | { readonly kind: 'meeting-length' | 'buffer' | 'preferred-time'; readonly meetingKind: string }
 );
 
 export type RemovedPreference =
+  | { readonly kind: 'meal-window'; readonly meal: 'lunch' | 'dinner' }
+  | { readonly kind: 'back-to-back' }
+  | { readonly kind: 'ignored-events'; readonly prefix: string }
   | { readonly kind: 'working-hours'; readonly weekday: Weekday }
   | { readonly kind: 'protected-window'; readonly id: string }
   | { readonly kind: 'meeting-length' | 'buffer' | 'preferred-time'; readonly meeting_kind: string };
@@ -295,7 +333,10 @@ const READS = {
     columns: 'meeting_kind, weekdays, start_minute, end_minute',
     order: 'meeting_kind',
   },
-} as const satisfies Record<keyof SchedulingPreferences, { table: string; columns: string; order: string }>;
+} as const satisfies Record<
+  Exclude<keyof SchedulingPreferences, 'meal_windows' | 'back_to_back' | 'ignored_events'>,
+  { table: string; columns: string; order: string }
+>;
 
 function selectSql(read: (typeof READS)[keyof typeof READS], mainOnly: readonly MainOnlyPreferenceField[]): string {
   const columns = [read.columns, 'source', 'updated_at', ...mainOnly].join(', ');
@@ -340,6 +381,7 @@ export async function getSchedulingPreferences(): Promise<SchedulingPreferences>
   const db = getDb();
   const withBasis = <T extends object>(value: T, row: BasisRow) => ({ ...value, basis: row.basis });
   return {
+    ...(await readPlanningPreferences(true)),
     working_hours: byWeekday(
       (await db.all<WorkingHoursRow & BasisRow>(selectSql(READS.working_hours, ['basis']))).map((row) =>
         withBasis(workingHoursValue(row), row),
@@ -364,6 +406,7 @@ export async function getSchedulingPreferences(): Promise<SchedulingPreferences>
 export async function getSchedulingPreferenceValues(): Promise<SchedulingPreferenceValues> {
   const db = getDb();
   return {
+    ...(await readPlanningPreferences(false)),
     working_hours: byWeekday(
       (await db.all<WorkingHoursRow>(selectSql(READS.working_hours, []))).map(workingHoursValue),
     ),
@@ -371,6 +414,59 @@ export async function getSchedulingPreferenceValues(): Promise<SchedulingPrefere
     meeting_lengths: (await db.all<MinutesRow>(selectSql(READS.meeting_lengths, []))).map(minutesValue),
     buffers: (await db.all<MinutesRow>(selectSql(READS.buffers, []))).map(minutesValue),
     preferred_times: (await db.all<PreferredTimeRow>(selectSql(READS.preferred_times, []))).map(preferredTimeValue),
+  };
+}
+
+function parseMeal(value: string): 'lunch' | 'dinner' {
+  if (value !== 'lunch' && value !== 'dinner') throw new Error('Meal must be lunch or dinner');
+  return value;
+}
+function parsePrefix(value: string): string {
+  const prefix = parseLine(value, 'Event ID prefix', 128);
+  if (!/^[a-zA-Z0-9_-]+$/u.test(prefix))
+    throw new Error('Event ID prefix must contain letters, numbers, underscores or hyphens');
+  return prefix;
+}
+interface MealRow extends WeeklyRangeRow {
+  readonly meal: 'lunch' | 'dinner';
+  readonly minutes: number;
+}
+interface BackRow extends ValueRow {
+  readonly minutes: number;
+  readonly break_minutes: number;
+}
+interface IgnoredRow extends ValueRow {
+  readonly prefix: string;
+}
+function readPlanningPreferences(
+  main: true,
+): Promise<Pick<SchedulingPreferences, 'meal_windows' | 'back_to_back' | 'ignored_events'>>;
+function readPlanningPreferences(
+  main: false,
+): Promise<Pick<SchedulingPreferenceValues, 'meal_windows' | 'back_to_back' | 'ignored_events'>>;
+async function readPlanningPreferences(
+  main: boolean,
+): Promise<Pick<SchedulingPreferenceValues, 'meal_windows' | 'back_to_back' | 'ignored_events'>> {
+  const db = getDb();
+  const provenance = main ? 'source, updated_at, basis' : 'source, updated_at';
+  const meal = await db.all<MealRow & BasisRow>(
+    `SELECT meal, weekdays, start_minute, end_minute, minutes, ${provenance} FROM gws_ea_pref_meal_windows ORDER BY meal`,
+  );
+  const back = await db.all<BackRow & BasisRow>(
+    `SELECT minutes, break_minutes, ${provenance} FROM gws_ea_pref_back_to_back ORDER BY singleton`,
+  );
+  const ignored = await db.all<IgnoredRow & BasisRow>(
+    `SELECT prefix, ${provenance} FROM gws_ea_pref_ignored_events ORDER BY prefix`,
+  );
+  return {
+    meal_windows: meal.map((row) => ({
+      ...weeklyRange(row),
+      meal: row.meal,
+      minutes: row.minutes,
+      ...(main ? { basis: row.basis } : {}),
+    })),
+    back_to_back: back.map((row) => ({ ...row, ...(main ? { basis: row.basis } : {}) })),
+    ignored_events: ignored.map((row) => ({ ...row, ...(main ? { basis: row.basis } : {}) })),
   };
 }
 
@@ -391,6 +487,52 @@ export async function setSchedulingPreference(input: SetPreferenceInput): Promis
   const db = getDb();
 
   switch (input.kind) {
+    case 'meal-window': {
+      const meal = parseMeal(input.meal);
+      const weekdays = parseWeekdays(input.weekdays);
+      const range = parseRange(input);
+      const minutes = parseMinutes(input.minutes, 1, 'Meal');
+      if (minutes > range.end - range.start) throw new Error('Meal minutes must fit within the meal window');
+      await db.run(
+        `INSERT INTO gws_ea_pref_meal_windows (meal, weekdays, start_minute, end_minute, minutes, source, basis, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (meal) DO UPDATE SET weekdays=excluded.weekdays, start_minute=excluded.start_minute, end_minute=excluded.end_minute, minutes=excluded.minutes, source=excluded.source, basis=excluded.basis, updated_at=excluded.updated_at`,
+        meal,
+        weekdays.join(','),
+        range.start,
+        range.end,
+        minutes,
+        source,
+        basis,
+        provenance.updated_at,
+      );
+      return { meal, weekdays, start: formatClock(range.start), end: formatClock(range.end), minutes, ...provenance };
+    }
+    case 'back-to-back': {
+      const minutes = parseMinutes(input.minutes, 1, 'Back-to-back');
+      const breakMinutes = parseMinutes(input.breakMinutes ?? 5, 1, 'Break');
+      await db.run(
+        `INSERT INTO gws_ea_pref_back_to_back (singleton, minutes, break_minutes, source, basis, updated_at)
+        VALUES (1, ?, ?, ?, ?, ?) ON CONFLICT (singleton) DO UPDATE SET minutes=excluded.minutes, break_minutes=excluded.break_minutes, source=excluded.source, basis=excluded.basis, updated_at=excluded.updated_at`,
+        minutes,
+        breakMinutes,
+        source,
+        basis,
+        provenance.updated_at,
+      );
+      return { minutes, break_minutes: breakMinutes, ...provenance };
+    }
+    case 'ignored-events': {
+      const prefix = parsePrefix(input.prefix);
+      await db.run(
+        `INSERT INTO gws_ea_pref_ignored_events (prefix, source, basis, updated_at) VALUES (?, ?, ?, ?)
+        ON CONFLICT (prefix) DO UPDATE SET source=excluded.source, basis=excluded.basis, updated_at=excluded.updated_at`,
+        prefix,
+        source,
+        basis,
+        provenance.updated_at,
+      );
+      return { prefix, ...provenance };
+    }
     case 'working-hours': {
       const weekday = parseWeekday(input.weekday);
       const range = input.hours === 'off' ? null : parseRange(input.hours);
@@ -551,6 +693,19 @@ export async function removeSchedulingPreference(target: PreferenceTarget): Prom
     });
   };
   switch (target.kind) {
+    case 'meal-window': {
+      const meal = parseMeal(target.meal);
+      await removeRow('gws_ea_pref_meal_windows', 'meal', meal, `No meal window is set for ${meal}`);
+      return { kind: target.kind, meal };
+    }
+    case 'back-to-back':
+      await removeRow('gws_ea_pref_back_to_back', 'singleton', 1, 'No back-to-back limit is set');
+      return { kind: target.kind };
+    case 'ignored-events': {
+      const prefix = parsePrefix(target.prefix);
+      await removeRow('gws_ea_pref_ignored_events', 'prefix', prefix, `No ignored-events rule is set for ${prefix}`);
+      return { kind: target.kind, prefix };
+    }
     case 'working-hours': {
       const weekday = parseWeekday(target.weekday);
       const day = WEEKDAY_NAMES[weekday];

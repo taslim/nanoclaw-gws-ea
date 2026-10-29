@@ -1,0 +1,8 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "types": ["node", "bun"]
+  },
+  "include": ["runner.ts", "fake-host/native-hooks.ts", "fake-host/mcp.ts", "fake-host/compact-hook.ts"],
+  "exclude": []
+}

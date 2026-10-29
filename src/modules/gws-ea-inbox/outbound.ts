@@ -1,3 +1,4 @@
+import { TIMEZONE } from '../../config.js';
 /**
  * Email to anyone but the principal, and `email_send` for both agents.
  *
@@ -238,10 +239,11 @@ async function carriedOver(
   placed: Recipients,
   runtime: InboxRuntime,
 ): Promise<QuotedMessage | undefined> {
+  // The install's own clock: a quote header in the zone in effect would tell other people where the principal is.
   const quote: QuotedMessage | undefined =
     anchor.from === undefined
       ? undefined
-      : { from: anchor.from, sentAt: anchor.receivedAt ?? runtime.now(), text: anchor.text };
+      : { from: anchor.from, sentAt: anchor.receivedAt ?? runtime.now(), timezone: TIMEZONE, text: anchor.text };
   const readers = new Set(
     [...(anchor.from === undefined ? [] : [anchor.from]), ...anchor.to, ...anchor.cc].flatMap(
       ({ address }) => normalizeAddress(address) ?? [],

@@ -8,7 +8,7 @@
  * source (`render.ts`).
  *
  * A matter's next look is one scheduled task in main's conversation
- * (`looks.ts`), the daily sync wakes main every day to look ahead and read
+ * (`looks.ts`), the evening close gives main time to look back, look ahead and read
  * what waited for it (`sync.ts`), and the host keeps both on time without the
  * model (`loop.ts`). Forgetting a person takes them off every matter
  * (`forget.ts`).
@@ -33,23 +33,52 @@ import {
 import { forgetFromMatters, mattersToRewrite } from './forget.js';
 import { closeMatterAndLook, lookVerdict, openMatterWithLook, updateMatterAndLook } from './looks.js';
 import { runMattersLoop } from './loop.js';
-import { gwsEaMattersMigration, gwsEaMatterJobsMigration, gwsEaMatterChatsMigration } from './migration.js';
+import {
+  gwsEaMattersMigration,
+  gwsEaMatterJobsMigration,
+  gwsEaMatterChatsMigration,
+  gwsEaMatterPlanningMigration,
+  gwsEaTimeAnchorsMigration,
+  gwsEaCloseClockMigration,
+} from './migration.js';
 import { parseNextLook, type NextLook } from './next-look.js';
-import { principalTimezone, renderMatter } from './render.js';
-import { syncVerdict, todayVerdict } from './sync.js';
+import { renderMatter } from './render.js';
+import { TIMEZONE } from '../../config.js';
+import { loadTimeline, zoneAt, zoneForDay, type Timeline } from '../gws-ea-whereabouts/timeline.js';
+import { onWhereaboutsChange, registerPendingClockReader } from '../gws-ea-whereabouts/changes.js';
+import { pendingLocalItems, setTaskClock } from './anchors.js';
+import { log } from '../../log.js';
+import { mainConversation, oneAtATime } from './looks.js';
+import { cancelDailySync, keepClose, closeVerdict, finishClose, forgetSundaySnapshot, todayVerdict } from './sync.js';
+import { morningVerdict } from './morning.js';
+import { closeRunsMigration } from './close-runs.js';
+import './ledger.js';
 
+registerMigration(closeRunsMigration);
 registerMigration(gwsEaMattersMigration);
 registerMigration(gwsEaMatterJobsMigration);
 registerMigration(gwsEaMatterChatsMigration);
+registerMigration(gwsEaMatterPlanningMigration);
+registerMigration(gwsEaTimeAnchorsMigration);
+registerMigration(gwsEaCloseClockMigration);
+registerPendingClockReader(pendingLocalItems);
+onWhereaboutsChange(async () => {
+  await oneAtATime(async () => {
+    const conversation = await mainConversation();
+    if (conversation) await keepClose(conversation);
+  }).catch((error: unknown) => log.warn('Close clock waits for the next loop pass', { err: error }));
+});
 
 onHostStart(async ({ signal }) => {
   await cancelClosedMatterJobs();
+  await cancelDailySync();
   // Started, not awaited: host startup never waits on a pass.
   void runMattersLoop(signal);
 });
 
 registerPersonForgetReview('gws-ea-matters:forget', mattersToRewrite);
 registerPersonForgetHook('gws-ea-matters:forget', forgetFromMatters);
+registerPersonForgetHook('gws-ea-matters:sunday-snapshot', forgetSundaySnapshot);
 
 // ---------------------------------------------------------------------------
 // `ncl matters …` — main's read and write path.
@@ -112,11 +141,17 @@ function parentFrom(args: Record<string, unknown>): string | null | undefined {
 }
 
 /** Checked before anything is written. */
-async function nextLookFrom(args: Record<string, unknown>): Promise<NextLook | undefined> {
-  return parseNextLook(
-    { at: optionalString(args.look), cron: optionalString(args.look_cron) },
-    await principalTimezone(),
-  );
+function nextLookFrom(args: Record<string, unknown>, timeline: Timeline): { look: NextLook | undefined; zone: string } {
+  const at = optionalString(args.look);
+  const cron = optionalString(args.look_cron);
+  if (args.fixed === true && at === undefined && cron === undefined)
+    throw new Error('--fixed accompanies --look or --look-cron');
+  if (at === undefined && cron === undefined) return { look: undefined, zone: TIMEZONE };
+  const date = at?.trim().slice(0, 10);
+  const zone = date && /^\d{4}-\d{2}-\d{2}$/u.test(date) ? zoneForDay(timeline, date) : zoneAt(timeline, Date.now());
+  if (zone === null)
+    throw new Error('The zone in effect for this look is unknown; record the stay’s zone before setting the look');
+  return { look: parseNextLook({ at, cron }, zone), zone };
 }
 
 const ID_ARG: ColumnDef = {
@@ -142,19 +177,43 @@ const PARENT_ARG: ColumnDef = {
     'The project this is a strand of, by id. Strands go one level deep: a strand cannot be a project, and a project cannot be a strand.',
 };
 const LOOK_ARGS: ColumnDef[] = [
+  { name: 'fixed', type: 'boolean', description: 'Keep this look on its original zone clock through travel.' },
   {
     name: 'look',
     type: 'string',
     description:
-      "The next look, once: a date and time in the principal's time zone (2026-10-14T09:00), or with its UTC offset.",
+      'The next look, once: morning or a date and time on the local clock where the principal will be that day (2026-10-14T09:00), or with its UTC offset.',
   },
   {
     name: 'look_cron',
     type: 'string',
     description:
-      "The next look, repeating: a five-field cron expression in the principal's time zone, at most four times a day. For a date that comes back every year (0 9 14 3 *) or a project's step-back (0 9 * * 1).",
+      "The next look, repeating: a five-field cron expression on the local clock where the principal will be that day, at most four times a day. For a date that comes back every year (0 9 14 3 *) or a project's step-back (0 9 * * 1).",
   },
 ];
+const PLANNING_ARGS: ColumnDef[] = [
+  {
+    name: 'due',
+    type: 'string',
+    description:
+      'Due local date (YYYY-MM-DD), or a fixed instant with its UTC offset. Empty clears it; separate from the next look.',
+  },
+  {
+    name: 'needs_minutes',
+    type: 'number',
+    description: "Minutes of the principal's time needed; 0 means no principal time needed.",
+  },
+  { name: 'place', type: 'string', description: 'Saved whereabouts place id, or a place in words. Empty clears it.' },
+];
+
+function planningFrom(args: Record<string, unknown>) {
+  return {
+    dueAt: optionalString(args.due),
+    needsMinutes: typeof args.needs_minutes === 'number' ? args.needs_minutes : undefined,
+    place: optionalString(args.place),
+  };
+}
+
 const LINK_ARGS: ColumnDef[] = [
   {
     name: 'chat',
@@ -213,6 +272,10 @@ registerResource({
     { name: 'parent_id', type: 'string', description: 'The project it is a strand of.' },
     { name: 'outcome', type: 'string', description: 'How it ended, once closed.' },
     { name: 'look_task_id', type: 'string', description: 'The scheduled task that is its next look.' },
+    { name: 'due_at', type: 'string', description: 'Due local date or fixed instant, separate from the next look.' },
+    { name: 'needs_minutes', type: 'number', description: 'Minutes of the principal’s time needed.' },
+    { name: 'place', type: 'string', description: 'Saved place id or place in words.' },
+    { name: 'deferrals', type: 'number', description: 'Check-ins moved without an open-loop change.', generated: true },
     { name: 'updated_at', type: 'string', description: 'When it last changed.', generated: true },
   ],
   operations: {},
@@ -226,6 +289,7 @@ registerResource({
         { ...TITLE_ARG, required: true },
         { ...OPEN_LOOP_ARG, required: true },
         ...LOOK_ARGS,
+        ...PLANNING_ARGS,
         PARENT_ARG,
         ...LINK_ARGS,
       ],
@@ -235,7 +299,8 @@ registerResource({
       ],
       handler: async (args, ctx) =>
         asMain(ctx, async () => {
-          const look = await nextLookFrom(args);
+          const timeline = await loadTimeline();
+          const { look, zone } = nextLookFrom(args, timeline);
           if (look === undefined) throw new Error('A matter opens with its next look: give --look or --look-cron');
           return openMatterWithLook(
             {
@@ -243,8 +308,10 @@ registerResource({
               openLoop: requiredString(args, 'open_loop'),
               parentId: parentFrom(args) ?? undefined,
               links: linksFrom(args),
+              ...planningFrom(args),
             },
             look,
+            { timeline, zone, fixed: args.fixed === true },
           );
         }),
     },
@@ -294,6 +361,7 @@ registerResource({
         { name: 'outcome', type: 'string', description: "A closed matter's outcome, reworded: one line." },
         { ...PARENT_ARG, description: `${PARENT_ARG.description} "" makes it a matter of its own.` },
         ...LOOK_ARGS,
+        ...PLANNING_ARGS,
         {
           name: 'unlink',
           type: 'string',
@@ -307,7 +375,8 @@ registerResource({
       ],
       handler: async (args, ctx) =>
         asMain(ctx, async () => {
-          const look = await nextLookFrom(args);
+          const timeline = await loadTimeline();
+          const { look, zone } = nextLookFrom(args, timeline);
           return updateMatterAndLook(
             {
               id: requiredString(args, 'id'),
@@ -316,8 +385,10 @@ registerResource({
               outcome: optionalString(args.outcome),
               parentId: parentFrom(args),
               unlink: unlinksFrom(args),
+              ...planningFrom(args),
             },
             look,
+            { timeline, zone, fixed: args.fixed === true },
           );
         }),
     },
@@ -360,24 +431,45 @@ registerResource({
       formatHuman: (verdict) => JSON.stringify(verdict),
       handler: async (args, ctx) => asMain(ctx, () => lookVerdict(requiredString(args, 'id'))),
     },
-    sync: {
+    evening: {
       access: 'open',
       description:
-        "The daily sync's pre-task script, which runs on its own once a day before the principal's day starts: it wakes you every day to look ahead, carrying unread notes, threads to place, later looks and any morning rundown's time. It marks a Monday occurrence for the month ahead. The host keeps the sync and its time; you never set it.",
-      args: [],
-      examples: ['ncl matters sync'],
-      // The runner reads the last line of a script's output as its verdict: one line of JSON.
+        'The host-kept evening close. Read its run facts; after both planning results, once ncl day has been read in this session, mark the open run done and leave main your report. --notify is your decision that main should take a turn now.',
+      args: [
+        { name: 'run', type: 'string', description: 'Close-run id supplied by the host task.' },
+        { name: 'done', type: 'string', description: 'Open close-run id to complete in this session.' },
+        { name: 'report', type: 'string', description: 'Your report for main; a repeat for this run keeps the first.' },
+        { name: 'notify', type: 'boolean', description: 'Wake main now for what you judge needs the principal.' },
+      ],
+      examples: [
+        'ncl matters evening',
+        'ncl matters evening --done gws-ea-close-123 --report "Nothing needs Morgan now."',
+      ],
       formatHuman: (verdict) => JSON.stringify(verdict),
-      handler: async (_args, ctx) => asMain(ctx, syncVerdict),
+      handler: async (args, ctx) =>
+        asMain(ctx, async () => {
+          if (ctx.caller !== 'agent') throw new Error('An evening close belongs to its calling session.');
+          const done = optionalString(args.done);
+          return done === undefined
+            ? closeVerdict(ctx.sessionId, optionalString(args.run))
+            : finishClose(ctx.sessionId, done, optionalString(args.report), args.notify === true);
+        }),
+    },
+    morning: {
+      access: 'open',
+      description: 'The morning gate’s facts and looks held for its local date.',
+      args: [{ name: 'date', type: 'string', required: true, description: 'Local date supplied by the host.' }],
+      formatHuman: (verdict) => JSON.stringify(verdict),
+      handler: async (args, ctx) => asMain(ctx, () => morningVerdict(requiredString(args, 'date'))),
     },
     today: {
       access: 'open',
       description:
-        "Your own list for today: today's looks, the matters handed back without one, and the threads waiting to be placed. Read it alongside their calendar when they ask for a morning rundown. Fold in anything the daily sync prepared and send one morning message. Tell them what needs their attention, in their words; keep this list to yourself.",
+        "Your own list for today: today's looks, the matters handed back without one, and the threads waiting to be placed. Read it alongside their calendar when they ask for a morning rundown, and send one morning message. Tell them what needs their attention, in their words; keep this list to yourself.",
       args: [],
       examples: [
         'ncl matters today',
-        'ncl tasks create --in-conversation --name "morning rundown" --recurrence "30 7 * * 1-5" --script "ncl matters today" --prompt "Their morning rundown: their day from the calendar, and what on your list needs them"',
+        'ncl tasks create --in-conversation --name "morning rundown" --recurrence "30 7 * * *" --script "ncl matters today" --prompt "Their morning rundown: their day from the calendar, and what on your list needs them"',
       ],
       formatHuman: (verdict) => JSON.stringify(verdict),
       handler: async (_args, ctx) => asMain(ctx, todayVerdict),
@@ -394,4 +486,32 @@ registerResource({
         asMain(ctx, async () => (args.closed === true ? listClosedMatters() : listOpenMatters())),
     },
   },
+});
+
+registerResource({
+  name: 'clock',
+  plural: 'clock',
+  table: 'gws_ea_time_anchors',
+  idColumn: 'series_id',
+  description:
+    "Main's reminder and look clocks: local follows the principal; fixed keeps the moment in its original zone.",
+  columns: [],
+  operations: {},
+  customOperations: Object.fromEntries(
+    (['fixed', 'local'] as const).map((mode) => [
+      mode,
+      {
+        access: 'open' as const,
+        description:
+          mode === 'fixed'
+            ? 'Restore and keep the instant the original zone clock names.'
+            : 'Follow the local clock through stays.',
+        args: [{ name: 'task', type: 'string' as const, required: true, description: 'Task series id.' }],
+        handler: async (args: Record<string, unknown>, ctx: CallerContext) =>
+          asMain(ctx, () =>
+            oneAtATime(async () => setTaskClock(requiredString(args, 'task'), mode === 'fixed', await loadTimeline())),
+          ),
+      },
+    ]),
+  ),
 });

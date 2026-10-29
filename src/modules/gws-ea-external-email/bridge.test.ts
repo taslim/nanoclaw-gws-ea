@@ -112,7 +112,7 @@ import { MAX_ATTACHMENT_BYTES } from '../gws-ea-inbox/route-mail.js';
 import { closeMatter, getMatter, openMatter, placeInMatter, placeNowhere } from '../gws-ea-matters/db.js';
 import '../gws-ea-matters/index.js';
 import { hostSources } from '../gws-ea-matters/live.js';
-import { principalTimezone, renderMatter } from '../gws-ea-matters/render.js';
+import { principalLens, renderMatter } from '../gws-ea-matters/render.js';
 import { FakeCalendar } from '../gws-ea-meetings/testing/fake-calendar.js';
 import { getThreadBookingCalendar } from '../gws-ea-meetings/thread-calendar.js';
 import { GoogleApiError } from '../gws-ea-inbox/gmail-api.js';
@@ -1019,7 +1019,7 @@ describe("tell_main: external-email's account of its thread", () => {
       ' id="…"',
     );
 
-    const zone = await principalTimezone();
+    const zone = (await principalLens()).timezone;
     const at = (await threadAccount(key))?.at ?? '';
     expect(rendered).toContain(
       [

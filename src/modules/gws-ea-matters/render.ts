@@ -9,19 +9,15 @@
 import { CronExpressionParser } from 'cron-parser';
 
 import { TIMEZONE } from '../../config.js';
-import { resolveGroupTimezone } from '../../container-config.js';
 import { findConversationSessions } from '../../db/sessions.js';
 import { withExistingMailboxSession } from '../../session-manager.js';
 import { formatLocalTime } from '../../timezone.js';
 import { getMainAgentGroupId } from '../gws-ea-profile/db.js';
+import { loadTimeline, zoneAt, type Timeline } from '../gws-ea-whereabouts/timeline.js';
+import { afterRun, getTimeAnchor, retimeAnchor } from './anchors.js';
+import { matterPlanningLines } from './planning.js';
 import { getMatter, type Matter, type OpenMatterSummary } from './db.js';
 import { hostSources, loadLens, readLinks, type Lens, type LiveSources } from './live.js';
-
-/** The time zone `main` lives in, which its matters are read and written in. */
-export async function principalTimezone(): Promise<string> {
-  const mainAgentGroupId = await getMainAgentGroupId();
-  return mainAgentGroupId === null ? TIMEZONE : resolveGroupTimezone(mainAgentGroupId);
-}
 
 export interface NextLookView {
   /** When it next comes, ISO. */
@@ -32,7 +28,7 @@ export interface NextLookView {
 }
 
 /** Undefined when none of `main`'s conversations holds the task still to come. */
-export async function readNextLook(taskId: string): Promise<NextLookView | undefined> {
+export async function readNextLook(taskId: string, timeline: Timeline): Promise<NextLookView | undefined> {
   const mainAgentGroupId = await getMainAgentGroupId();
   if (mainAgentGroupId === null) return undefined;
   for (const session of await findConversationSessions(mainAgentGroupId)) {
@@ -47,9 +43,12 @@ export async function readNextLook(taskId: string): Promise<NextLookView | undef
       return { at: task.processAfter, repeats: task.recurrence, paused };
     }
     if (task.recurrence === null) return undefined;
-    const timezone = await resolveGroupTimezone(mainAgentGroupId);
-    const next = CronExpressionParser.parse(task.recurrence, { tz: timezone }).next().toISOString();
-    return next === null ? undefined : { at: next, repeats: task.recurrence, paused };
+    const timezone = zoneAt(timeline, Date.now()) ?? TIMEZONE;
+    const anchor = await getTimeAnchor(session.id, task.seriesId ?? task.id);
+    const next = anchor
+      ? retimeAnchor(afterRun(anchor, task.processAfter), timeline, Date.now())?.at
+      : CronExpressionParser.parse(task.recurrence, { tz: timezone }).next().toISOString();
+    return next == null ? undefined : { at: next, repeats: task.recurrence, paused };
   }
   return undefined;
 }
@@ -76,7 +75,7 @@ function projectLines(matter: Matter, project: Matter | undefined): string[] {
 }
 
 export async function principalLens(): Promise<Lens> {
-  return loadLens(await principalTimezone());
+  return loadLens(await loadTimeline());
 }
 
 /** `given` is the lens a caller rendering several matters reads once for all of them. */
@@ -90,16 +89,22 @@ export async function renderMatter(
   const { timezone } = lens;
   const [links, look, project] = await Promise.all([
     readLinks(matter.links, sources, lens),
-    matter.open && matter.look_task_id !== null ? readNextLook(matter.look_task_id) : undefined,
+    matter.open && matter.look_task_id !== null ? readNextLook(matter.look_task_id, lens.timeline) : undefined,
     matter.parent_id === null ? undefined : getMatter(matter.parent_id),
   ]);
-  const state = matter.open ? 'open' : `closed ${formatLocalTime(matter.closed_at ?? matter.updated_at, timezone)}`;
+  const planning = matterPlanningLines(matter, lens.timeline, timezone);
+  const state = matter.open
+    ? 'open'
+    : `closed ${formatLocalTime(matter.closed_at ?? matter.updated_at, zoneAt(lens.timeline, Date.parse(matter.closed_at ?? matter.updated_at)) ?? timezone)}`;
   return [
     `Matter ${matter.id}, ${state}: ${matter.title}`,
     `Links read ${formatLocalTime(readAt, timezone)}.`,
     'Open loop:',
     matter.open_loop,
-    matter.open ? nextLookLine(look, timezone) : `Outcome: ${matter.outcome ?? ''}`,
+    ...planning,
+    matter.open
+      ? nextLookLine(look, look ? (zoneAt(lens.timeline, Date.parse(look.at)) ?? timezone) : timezone)
+      : `Outcome: ${matter.outcome ?? ''}`,
     ...projectLines(matter, project),
     ...(matter.strands.length === 0 ? [] : ['Strands:', ...matter.strands.map(strandLine)]),
     ...(links.length === 0 ? ['Links: none.'] : ['Links:', ...links]),

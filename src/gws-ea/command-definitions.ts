@@ -8,6 +8,7 @@ import {
   CONNECTOR_LIST_SCHEMA,
   CONNECTOR_OPERATION_SCHEMA,
   ALIAS_OPERATION_SCHEMA,
+  LESSONS_DATA_SCHEMA,
 } from './result-schema.js';
 export type AttemptCommand =
   | 'create'
@@ -23,7 +24,7 @@ export type AttemptCommand =
 
 export type CommandHandler =
   | { readonly kind: 'attempt'; readonly command: AttemptCommand }
-  | { readonly kind: 'observation'; readonly command: 'list' | 'status' | 'logs' }
+  | { readonly kind: 'observation'; readonly command: 'list' | 'status' | 'logs' | 'lessons' }
   | { readonly kind: 'native'; readonly command: 'ncl' }
   | { readonly kind: 'whatsapp'; readonly command: 'link' | 'unlink' | 'status' }
   | { readonly kind: 'connector'; readonly command: 'list' }
@@ -400,6 +401,20 @@ export const COMMAND_DEFINITIONS: readonly CommandDefinition[] = [
     examples: ['gws-ea remove --id <instance_id> --yes', 'gws-ea remove --id <instance_id> --delete-vault'],
     outputModes: managedModes,
     resultSchema: managedResultSchema(operationDataSchema('remove')),
+  },
+  {
+    path: ['lessons'],
+    group: 'Assistants',
+    handler: { kind: 'observation', command: 'lessons' },
+    summary: 'Read the assistant’s craft lessons and their review status.',
+    scope: 'assistant',
+    options: [id],
+    effects: ['Read-only local observation; works while the host is stopped and never repairs state.'],
+    prerequisites: observationPrerequisites,
+    recovery: ['Update the assistant if it has no lessons store yet.'],
+    examples: ['gws-ea lessons --id <instance_id> --json'],
+    outputModes: managedModes,
+    resultSchema: managedResultSchema(LESSONS_DATA_SCHEMA),
   },
   {
     path: ['logs'],

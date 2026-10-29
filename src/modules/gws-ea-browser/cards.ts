@@ -9,6 +9,7 @@ import type { PendingApproval } from '../../types.js';
 import { identityMatchKey } from '../../gws-ea/validation.js';
 import { bookedReservation, formatMoney, type PurchaseBounds, type PurchaseFacts } from './fingerprint.js';
 import { quoted } from '../approvals/request-text.js';
+import type { PrincipalClock } from './watch-policy.js';
 
 export interface PurchaseCard {
   id: string;
@@ -31,28 +32,29 @@ export interface PurchaseCard {
 export const ERRAND_ORIGIN_LINE = "From a website errand I'm working on for you.";
 /** The longest seller-controlled string a card quotes without a bound of its own; each is quoted (`quoted`). */
 export const SELLER_TEXT_LIMIT = 360;
-function cardSpan(start: string, end: string, timeZone: string): string {
-  const from = formatLocalTime(start, timeZone),
-    to = formatLocalTime(end, timeZone);
+function cardSpan(start: string, end: string, startZone: string, endZone: string): string {
+  if (startZone !== endZone)
+    return `${formatLocalTimeWithZone(start, startZone)} through ${formatLocalTimeWithZone(end, endZone)}`;
+  const from = formatLocalTime(start, startZone),
+    to = formatLocalTime(end, endZone);
   const day = from.slice(0, from.lastIndexOf(', ') + 2);
-  return `${from} through ${to.startsWith(day) ? to.slice(day.length) : to} ${timeZoneLabel(timeZone, start)}`;
+  return `${from} through ${to.startsWith(day) ? to.slice(day.length) : to} ${timeZoneLabel(startZone, start)}`;
 }
 /**
  * An event's span on the venue's clock, where it happens, with the principal's equivalent
  * alongside when their clocks read differently: a 7 PM dinner in Tokyo never reads as 3 AM.
  */
-export function cardEventSpan(start: string, end: string, venueTimeZone: string, principalTimeZone: string): string {
-  const venue = cardSpan(start, end, venueTimeZone);
-  const sameClock = [start, end].every(
-    (at) => formatLocalTime(at, venueTimeZone) === formatLocalTime(at, principalTimeZone),
-  );
-  return sameClock ? venue : `${venue} (${cardSpan(start, end, principalTimeZone)})`;
+export function cardEventSpan(start: string, end: string, venueTimeZone: string, clock: PrincipalClock): string {
+  const venue = cardSpan(start, end, venueTimeZone, venueTimeZone);
+  const sameClock = [start, end].every((at) => formatLocalTime(at, venueTimeZone) === formatLocalTime(at, clock(at)));
+  return sameClock ? venue : `${venue} (${cardSpan(start, end, clock(start), clock(end))})`;
 }
 /**
  * A moment on the venue's clock, where it happens, with the principal's equivalent alongside when their clocks
  * read differently.
  */
-export function cardEventTime(at: string, venueTimeZone: string, principalTimeZone: string): string {
+export function cardEventTime(at: string, venueTimeZone: string, clock: PrincipalClock): string {
+  const principalTimeZone = clock(at);
   const venue = formatLocalTimeWithZone(at, venueTimeZone);
   return formatLocalTime(at, venueTimeZone) === formatLocalTime(at, principalTimeZone)
     ? venue
@@ -73,10 +75,10 @@ export interface EarlierPurchases {
   readonly recordedNotPlaced: readonly RecordedNotPlaced[];
 }
 export const NO_EARLIER_PURCHASES: EarlierPurchases = { unresolved: 0, recordedNotPlaced: [] };
-function earlierLines(earlier: EarlierPurchases, principalTimeZone: string): string[] {
+function earlierLines(earlier: EarlierPurchases, clock: PrincipalClock): string[] {
   const lines = earlier.recordedNotPlaced.map(
     (recorded) =>
-      `Earlier purchase here, tried ${formatLocalTimeWithZone(recorded.attemptedAt, principalTimeZone)}: I recorded it as not placed, from ${recorded.source === 'email' ? "the merchant's email" : 'what you told me'}.`,
+      `Earlier purchase here, tried ${formatLocalTimeWithZone(recorded.attemptedAt, clock(recorded.attemptedAt))}: I recorded it as not placed, from ${recorded.source === 'email' ? "the merchant's email" : 'what you told me'}.`,
   );
   if (!earlier.unresolved) return lines;
   const count =
@@ -101,7 +103,7 @@ function termLines(
   facts: PurchaseFacts,
   partySize: number | undefined,
   money: (amount: number) => string,
-  principalTimeZone: string,
+  clock: PrincipalClock,
 ): string[] {
   const lines: string[] = [];
   for (const term of facts.commitments) {
@@ -112,10 +114,12 @@ function termLines(
       );
     if (term.trigger) lines.push(`Trigger: ${quoted(term.trigger, SELLER_TEXT_LIMIT)}`);
     if (term.cancellationDeadline)
-      lines.push(`Cancellation deadline: ${formatLocalTimeWithZone(term.cancellationDeadline, principalTimeZone)}`);
+      lines.push(
+        `Cancellation deadline: ${formatLocalTimeWithZone(term.cancellationDeadline, clock(term.cancellationDeadline))}`,
+      );
     if (term.cancellationTerms) lines.push(`Cancellation terms: ${quoted(term.cancellationTerms, 700)}`);
     if (term.conversionAt)
-      lines.push(`Trial conversion: ${formatLocalTimeWithZone(term.conversionAt, principalTimeZone)}`);
+      lines.push(`Trial conversion: ${formatLocalTimeWithZone(term.conversionAt, clock(term.conversionAt))}`);
     if (term.frequency) lines.push(`Recurring frequency: ${quoted(term.frequency, SELLER_TEXT_LIMIT)}`);
   }
   return lines;
@@ -133,7 +137,7 @@ function choiceLines(facts: PurchaseFacts): string[] {
 function renderGenericCard(
   facts: PurchaseFacts,
   earlier: EarlierPurchases,
-  principalTimeZone: string,
+  clock: PrincipalClock,
   change: string | undefined,
   identity: CardIdentity,
 ): string {
@@ -145,7 +149,7 @@ function renderGenericCard(
   const lines = [
     "I'd like to place this purchase using the facts I read from the checkout.",
     ...(change ? [change] : []),
-    ...earlierLines(earlier, principalTimeZone),
+    ...earlierLines(earlier, clock),
     `Site: ${facts.site}`,
     ...(generic.platform ? [`Checkout on: ${generic.platform} (for ${facts.site})`] : []),
     `Account: ${generic.guest ? 'guest checkout' : assistant(facts.account) ? "your assistant's account" : quoted(facts.account, SELLER_TEXT_LIMIT)}`,
@@ -158,12 +162,12 @@ function renderGenericCard(
     ...(booking?.venue ? [`Venue: ${quoted(booking.venue, SELLER_TEXT_LIMIT)}`] : []),
     ...(booking?.partySize !== undefined ? [`Party size: ${booking.partySize}`] : []),
     ...(booking?.at && booking.timeZone
-      ? [`Time: ${cardEventTime(booking.at, booking.timeZone, principalTimeZone)}`]
+      ? [`Time: ${cardEventTime(booking.at, booking.timeZone, clock)}`]
       : booking?.timeText
         ? [`Time as the page shows it: ${quoted(booking.timeText, SELLER_TEXT_LIMIT)}`]
         : []),
     ...choiceLines(facts),
-    ...termLines(facts, bookedReservation(facts)?.partySize ?? booking?.partySize, money, principalTimeZone),
+    ...termLines(facts, bookedReservation(facts)?.partySize ?? booking?.partySize, money, clock),
   ];
   if (!facts.commitments.length)
     lines.push('Due later: none shown. The checkout states no hold, deposit, fee, trial or subscription.');
@@ -174,16 +178,16 @@ export function renderPurchaseCard(
   facts: PurchaseFacts,
   bounds: PurchaseBounds,
   earlier: EarlierPurchases,
-  principalTimeZone: string,
+  clock: PrincipalClock,
   change?: string,
   identity: CardIdentity = {},
 ): string {
-  if (facts.generic) return renderGenericCard(facts, earlier, principalTimeZone, change, identity);
+  if (facts.generic) return renderGenericCard(facts, earlier, clock, change, identity);
   const money = (amount: number): string => formatMoney(amount, facts.currency);
   const lines = [
     "I'd like to place this purchase using the facts I read from the merchant's review page.",
     ...(change ? [change] : []),
-    ...earlierLines(earlier, principalTimeZone),
+    ...earlierLines(earlier, clock),
     `Site: ${quoted(facts.origin, SELLER_TEXT_LIMIT)}`,
     `Account: ${isAssistantAddress(facts.account, identity) ? "your assistant's account" : quoted(facts.account, SELLER_TEXT_LIMIT)}`,
     `Button I'll press: ${quoted(facts.control.label, SELLER_TEXT_LIMIT)}`,
@@ -194,7 +198,7 @@ export function renderPurchaseCard(
       ? [
           `Venue: ${quoted(facts.reservation.venueName, SELLER_TEXT_LIMIT)}`,
           `Party size: ${facts.reservation.partySize}`,
-          `Reservation time: ${cardEventSpan(facts.reservation.at, facts.reservation.endAt, facts.reservation.timeZone, principalTimeZone)}`,
+          `Reservation time: ${cardEventSpan(facts.reservation.at, facts.reservation.endAt, facts.reservation.timeZone, clock)}`,
         ]
       : []),
     facts.cardEnding === null ? 'Payment card: not required' : `Card ending: ${facts.cardEnding}`,
@@ -205,9 +209,9 @@ export function renderPurchaseCard(
           `Approved delivery window: ${quoted(bounds.deliveryWindow.start, SELLER_TEXT_LIMIT)} through ${quoted(bounds.deliveryWindow.end, SELLER_TEXT_LIMIT)}`,
         ]
       : []),
-    ...(bounds.neededBy ? [`Needed by: ${formatLocalTimeWithZone(bounds.neededBy, principalTimeZone)}`] : []),
+    ...(bounds.neededBy ? [`Needed by: ${formatLocalTimeWithZone(bounds.neededBy, clock(bounds.neededBy))}`] : []),
     ...choiceLines(facts),
-    ...termLines(facts, facts.reservation?.partySize, money, principalTimeZone),
+    ...termLines(facts, facts.reservation?.partySize, money, clock),
   ];
   if (facts.noCommitmentTerms) lines.push(`No financial commitment: ${quoted(facts.noCommitmentTerms, 1200)}`);
   if (facts.commitments.length && facts.commitments.every((term) => term.kind === 'retail'))
