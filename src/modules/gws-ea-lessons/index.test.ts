@@ -52,7 +52,7 @@ it.each([
   ['M&#111;rgan prefers a pause.', 'principal’s name', 'M&#111;'],
   ['Ask remy%40example.test first.', 'email address', 'remy%40'],
   ['Brookhaven needs more travel time.', 'whereabouts place', 'Brookhaven'],
-  ['Juno prefers a pause.', 'person’s name', 'Juno'],
+  ['Juno Hale prefers a pause.', 'person’s name', 'Juno'],
   ['Ask remy@example.test first.', 'email address', 'remy@'],
   ['Call +1 (415) 555-0123 first.', 'phone number', '555'],
 ])('refuses private craft without repeating its value: %s', async (text, kind, secret) => {
@@ -61,10 +61,18 @@ it.each([
   expect(JSON.stringify(response)).not.toContain(secret);
   expect(await getDb().all('SELECT * FROM gws_ea_lessons')).toEqual([]);
 });
-it('accepts craft that uses a place label as an ordinary word', async () => {
+it('accepts craft that uses a place label or a word of a person’s name as an ordinary word', async () => {
+  await addPerson({
+    name: 'Will Vance',
+    level: 'inner-circle',
+    source: 'principal',
+    basis: 'Neighbor.',
+    identity: 'email:will@example.test',
+  });
   for (const text of [
     'A one-way flight leaves the return home unknown.',
     'Check the office commute before an early start.',
+    'Ask who will join before booking a table.',
   ])
     expect(await run('lessons-add', { text })).toMatchObject({ ok: true, data: { added: true } });
 });

@@ -30,7 +30,6 @@ async function checkLesson(text: string): Promise<void> {
   const [profile, people, whereabouts] = await Promise.all([getGwsEaProfile(), listPeople(), getWhereabouts()]);
   const rendered = micromark(text, { extensions: [gfm()], htmlExtensions: [gfmHtml()] });
   const readings = [streamOf([text]), ...htmlReadings(rendered)];
-  const names = (name: string): string[] => [name, ...name.split(/\s+/u)].filter(Boolean);
   const contains = (values: readonly (string | null)[]): boolean =>
     values.some(
       (value) =>
@@ -43,7 +42,7 @@ async function checkLesson(text: string): Promise<void> {
   // A label is often an ordinary word ("Home", "Office"); the locality is the private detail.
   if (contains([...whereabouts.places, ...whereabouts.stays].map((record) => record.locality)))
     refuse('a whereabouts place');
-  if (contains(people.flatMap((person) => names(person.name)))) refuse('a person’s name');
+  if (contains(people.map((person) => person.name))) refuse('a person’s name');
   const address = /[\p{L}\p{N}._%+-]+\s*@\s*[\p{L}\p{N}.-]+/u;
   for (const source of [text, rendered]) {
     let visible = source.normalize('NFKC').replace(/\p{Default_Ignorable_Code_Point}/gu, '');
