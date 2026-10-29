@@ -17,6 +17,7 @@ import {
 } from '../../capabilities.js';
 import { register } from '../../cli/registry.js';
 import { parseSkillSelection } from '../../container-config.js';
+import { registerContainerEnv } from '../../container-env.js';
 import { getDb } from '../../db/connection.js';
 import { getContainerConfig, updateContainerConfigJson } from '../../db/container-configs.js';
 import { EXPOSED_GOOGLE_SKILLS } from '../gws-ea-google/grant.js';
@@ -33,6 +34,9 @@ registerCapability(MAIN_CONTEXT_CAPABILITY, {
   default: 'off',
   grantedTo: async (agentGroupId) => agentGroupId === (await mainAgentGroupId()),
 });
+registerContainerEnv('gws-ea-main:planning', ({ capabilities }): Record<string, string> =>
+  capabilities.has(MAIN_CONTEXT_CAPABILITY) ? { GWS_EA_PLANNING_AGENTS: '1' } : {},
+);
 registerCapability(MAIN_CHAT_CAPABILITY, {
   description: 'whatsapp_link and chat-addressed host actions for canonical main',
   default: 'off',

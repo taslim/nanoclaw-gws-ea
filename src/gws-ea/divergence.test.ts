@@ -47,6 +47,34 @@ const cleanups: Array<() => Promise<void>> = [];
 /** Runs a NanoClaw script the way its package scripts do, outside this test's module graph. */
 const TSX_LOADER = path.join(CONTROL_PLANE_ROOT, 'node_modules', 'tsx', 'dist', 'loader.mjs');
 
+describe('recorded divergence: main’s runner installs and enforces native planning agents', () => {
+  it('keeps the config opt-in and the Claude SDK definition and hook wiring together', async () => {
+    const result = await new Promise<{ code: number | null; output: string }>((resolve, reject) => {
+      const child = spawn(
+        'bun',
+        [
+          'test',
+          'src/providers/claude.planning.test.ts',
+          '--test-name-pattern',
+          'enables both native|sets the fixed planning|refuses create_event|refuses missing or mismatched',
+        ],
+        { cwd: path.join(originalCwd, 'container/agent-runner'), stdio: ['ignore', 'pipe', 'pipe'] },
+      );
+      let output = '';
+      child.stdout.on('data', (chunk: Buffer) => {
+        output += chunk.toString();
+      });
+      child.stderr.on('data', (chunk: Buffer) => {
+        output += chunk.toString();
+      });
+      child.on('error', reject);
+      child.on('close', (code) => resolve({ code, output }));
+    });
+    expect(result.code, result.output).toBe(0);
+    expect(result.output).toContain('6 pass');
+  });
+});
+
 describe('recorded divergence: canonical main receives coming-days hooks on every native wake', () => {
   it('registers both events only for the main-only capability, removing its commands elsewhere', async () => {
     const directory = await mkdtemp(path.join(os.tmpdir(), 'divergence-week-hooks-'));
