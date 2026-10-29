@@ -246,6 +246,10 @@ what is retained. Repeat `remove` to continue its teardown journal. External
 resource abandonment needs the command's explicit `--abandon` selection.
 Busy results name the blocked command and offer read-only inspection.
 
+For the daily-sync replacement, see the
+[evening-close migration](gws-ea-evening-close-migration.md) for detection,
+managed rollout, verification and rollback.
+
 `create` and `update` automatically clean a stray NanoClaw install from this
 authoring checkout under the existing ownership rules. This cleanup can happen
 before a later step pauses or is cancelled. Its scope, removed resources, and
