@@ -5,7 +5,7 @@ it('runs the shipped tools, model and effort, and keeps the fixture isolation la
   const runtime = scenarioRuntime(
     {
       capabilities: ['files-read', 'files-write', 'shell', 'web', 'subagents', 'mcp-servers'],
-      moduleEnvironment: { GWS_EA_PLANNING_AGENTS: '1' },
+      moduleEnvironment: { CLAUDE_CODE_SIMPLE_SYSTEM_PROMPT: '1' },
       inference: { model: 'claude-opus-5-5', effort: 'high' },
     },
     { nanoclaw: { command: 'node', args: ['mcp.ts'] } },
@@ -19,7 +19,7 @@ it('runs the shipped tools, model and effort, and keeps the fixture isolation la
   expect(runtime.inference).toEqual({ model: 'claude-opus-5-5', effort: 'high' });
   expect(runtime.env).toMatchObject({
     INHERITED: 'kept',
-    GWS_EA_PLANNING_AGENTS: '1',
+    CLAUDE_CODE_SIMPLE_SYSTEM_PROMPT: '1',
     ANTHROPIC_BASE_URL: 'http://127.0.0.1:1',
   });
 });
