@@ -6,17 +6,15 @@ import { randomUUID } from 'node:crypto';
 import type { Session } from '../../../src/types.js';
 import type { FakeCalendar } from '../../../src/modules/gws-ea-meetings/testing/fake-calendar.js';
 import type { GmailMessage } from '../../../src/modules/gws-ea-inbox/gmail-api.js';
-import { SYNTHETIC_IDENTITY, type FixtureState } from './state.js';
+import { SYNTHETIC_IDENTITY, readState, writeState, type FixtureState } from './state.js';
 import { syntheticGateway } from './gateway.js';
 import { gogMail } from './gog-mail.js';
-import { calendarTransport } from './google-calendar.js';
+import { calendarTransport, googleJson } from './google-calendar.js';
 import { SyntheticGmailTransport } from './google-mail.js';
 import { parseGmailMessage } from '../../../src/modules/gws-ea-inbox/mime.js';
 
 const PRINCIPAL = SYNTHETIC_IDENTITY.principalEmail;
 const ASSISTANT = SYNTHETIC_IDENTITY.assistantEmail;
-const json = (value: unknown, status = 200): Response =>
-  new Response(JSON.stringify(value), { status, headers: { 'content-type': 'application/json' } });
 
 /** All Google HTTP requests stop here; the native token and API clients still run. */
 export async function installSyntheticGoogle(
@@ -38,7 +36,7 @@ export async function installSyntheticGoogle(
     accessRole: 'owner',
     conferenceTypes: ['hangoutsMeet'],
   });
-  const fixture = JSON.parse(fs.readFileSync(path.join(root, 'fixture.json'), 'utf8')) as FixtureState;
+  const fixture = readState(path.join(root, 'fixture.json'));
   for (const entry of fixture.calendars ?? []) calendar.calendars.set(entry.id, entry);
   for (const event of fixture.events) calendar.put(event);
   const mail = fixture.mail;
@@ -69,7 +67,7 @@ export async function installSyntheticGoogle(
     if (url.hostname === 'synthetic-onecli.invalid') return gateway(url, init);
     if (url.hostname === 'oauth2.googleapis.com' && url.pathname === '/token') {
       const body = new URLSearchParams(String(init?.body));
-      return json({ access_token: 'synthetic-only', expires_in: 3600, scope: body.get('scope') ?? '' });
+      return googleJson({ access_token: 'synthetic-only', expires_in: 3600, scope: body.get('scope') ?? '' });
     }
     if (url.hostname !== 'www.googleapis.com' && url.hostname !== 'gmail.googleapis.com')
       throw new Error(`Synthetic host refused external network: ${url.hostname}`);
@@ -107,7 +105,7 @@ export async function installSyntheticGoogle(
       );
       throw error;
     } finally {
-      const state = JSON.parse(fs.readFileSync(path.join(root, 'fixture.json'), 'utf8')) as FixtureState;
+      const state = readState(path.join(root, 'fixture.json'));
       if (state.scenario) {
         for (const write of calendar.writes.slice(before.writes)) {
           const { tags: _tags, conference, ...fields } = write.fields ?? {};
@@ -145,7 +143,7 @@ export async function installSyntheticGoogle(
         }
         state.events = [...calendar.events];
         state.mail = mail;
-        fs.writeFileSync(path.join(root, 'fixture.json'), JSON.stringify(state, null, 2));
+        writeState(path.join(root, 'fixture.json'), state);
       }
     }
   };
@@ -291,10 +289,10 @@ export async function serveNativeHost(
     tasks: await nativeCli(['tasks', 'list', '--json']),
   });
   const save = (): void => {
-    const state = JSON.parse(fs.readFileSync(fixtureFile, 'utf8')) as FixtureState;
+    const state = readState(fixtureFile);
     state.events = [...calendar.events];
     state.mail = mail;
-    fs.writeFileSync(fixtureFile, JSON.stringify(state, null, 2));
+    writeState(fixtureFile, state);
   };
   const handle = async (request: http.IncomingMessage, response: http.ServerResponse): Promise<void> => {
     const chunks: Buffer[] = [];
@@ -466,16 +464,16 @@ export async function serveNativeHost(
         } else throw new Error('Unknown synthetic transport fault');
         value = { armed: true };
       } else if (body.method === 'outbound') {
-        const state = JSON.parse(fs.readFileSync(fixtureFile, 'utf8')) as FixtureState;
+        const state = readState(fixtureFile);
         const sequence = state.outbound.length * 2 + 1;
         const row = createOutboundRecord(parseOutboundWrite(body.args.draft), sequence, new Date().toISOString());
         state.outbound.push({ ...row });
-        fs.writeFileSync(fixtureFile, JSON.stringify(state, null, 2));
+        writeState(fixtureFile, state);
         value = row;
       } else if (body.method === 'effect') {
-        const state = JSON.parse(fs.readFileSync(fixtureFile, 'utf8')) as FixtureState;
+        const state = readState(fixtureFile);
         state.effects.push({ ...(body.args as unknown as FixtureState['effects'][number]), attempt: state.attempt });
-        fs.writeFileSync(fixtureFile, JSON.stringify(state, null, 2));
+        writeState(fixtureFile, state);
         value = { recorded: true };
       } else if (body.method === 'stop') {
         response.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ ok: true }));

@@ -15,7 +15,7 @@ import { startRequestRecorder, rawUsage } from './fake-host/relay.js';
 import { prepareSyntheticShell } from './fake-host/sandbox.js';
 import type { MessageInRow } from '../../container/agent-runner/src/db/messages-in.js';
 import type { ProviderEvent } from '../../container/agent-runner/src/providers/types.js';
-import type { ScenarioCase, ScenarioComposition } from './types.js';
+import type { ScenarioComposition } from './types.js';
 import { scenarioRuntime } from './runtime.js';
 import { nativeScenarioHooks } from './fake-host/native-hooks.js';
 
@@ -24,7 +24,7 @@ if (!directory || !model || !reservation || !cli || !['agent', 'judge'].includes
   throw new Error('runner <directory> <agent|judge> <model> <budget> <claude>');
 const tree = path.resolve(import.meta.dir, '../..');
 const file = path.join(directory, 'fixture.json');
-const scenario = (JSON.parse(fs.readFileSync(file, 'utf8')) as { scenario: ScenarioCase }).scenario;
+const scenario = readState(file).scenario;
 const evidence = path.join(directory, phase || kind);
 fs.mkdirSync(evidence, { recursive: true });
 const agent = path.join(directory, 'agent');

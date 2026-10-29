@@ -117,7 +117,7 @@ export function rawUsage(directory: string): readonly unknown[] {
         const response = JSON.parse(raw) as { usage?: unknown };
         if (response.usage) usages.push({ file: name, usage: response.usage });
       } catch {
-        /* a transport error is retained, never a pass */
+        continue;
       }
       continue;
     }
@@ -128,7 +128,7 @@ export function rawUsage(directory: string): readonly unknown[] {
         const usage = event.usage ?? event.message?.usage;
         if (usage) usages.push({ file: name, event: event.type, usage });
       } catch {
-        /* incomplete raw data remains visible in the evidence */
+        continue;
       }
     }
   }

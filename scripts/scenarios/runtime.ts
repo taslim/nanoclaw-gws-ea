@@ -47,7 +47,6 @@ export function scenarioRuntime(
     allowedTools: production.allowedTools.filter((tool) => !withheld.has(tool)),
     disallowedTools: [...new Set([...production.disallowedTools, ...withheldTools])],
     mcpServers: production.mcpServers,
-    // The synthetic server is the only configured server, even when production allows more.
     strictMcpConfig: true as const,
   };
   return {

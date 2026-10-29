@@ -89,6 +89,5 @@ export function parseJudge(value: unknown): JudgeVerdict {
 }
 
 export function batchPass(scores: readonly boolean[]): boolean {
-  // A first-pass succeeds. A failure requires both remaining attempts to pass.
   return scores.length === 1 ? scores[0] === true : scores.length === 3 && scores[1] === true && scores[2] === true;
 }

@@ -228,11 +228,8 @@ try {
   const { composeContainerEnv } = (await import(
     source('src/container-env.ts')
   )) as typeof import('../../../src/container-env.js');
-  // This is the spawn's reading, including module grantedTo overlays.
   const config = await materializeContainerJson(group.id);
   if (config.skills === 'all') throw new Error('Synthetic role must name its release skills explicitly.');
-  // Native sqlite mailbox supplies no env. HOME/TZ are core-owned; these
-  // fixture gateway keys occupy the native provider/gateway contribution lane.
   const reservedEnvironmentKeys = ['HOME', 'TZ', 'ANTHROPIC_BASE_URL'];
   const { sessionDir } = await import('../../../src/session-manager.js');
   const composition: ScenarioComposition = {
