@@ -82,9 +82,13 @@ export function resolveStay(stay: Stay, places: readonly Place[], homeZone: stri
 
 const endOf = (stay: TimelineStay): number => stay.end ?? Number.POSITIVE_INFINITY;
 
-/** A stay known only by its zone agrees with any locality in that zone. */
-function sameLocality(a: string | null, b: string | null): boolean {
-  return a === null || b === null || a.toLocaleLowerCase() === b.toLocaleLowerCase();
+/** A stay known only by its zone takes the locality of a located stay only when it lies within that stay. */
+function sameLocality(a: TimelineStay, b: TimelineStay): boolean {
+  if (a.locality !== null && b.locality !== null)
+    return a.locality.toLocaleLowerCase() === b.locality.toLocaleLowerCase();
+  if (a.locality === null && b.locality === null) return true;
+  const [zoneOnly, located] = a.locality === null ? [a, b] : [b, a];
+  return located.start <= zoneOnly.start && endOf(zoneOnly) <= endOf(located);
 }
 
 function mergeStays(values: readonly TimelineStay[]): TimelineStay[] {
@@ -92,7 +96,7 @@ function mergeStays(values: readonly TimelineStay[]): TimelineStay[] {
   for (const value of [...values].sort((a, b) => a.start - b.start || endOf(a) - endOf(b))) {
     const index = result.findIndex(
       (s) =>
-        sameLocality(s.locality, value.locality) &&
+        sameLocality(s, value) &&
         s.zone === value.zone &&
         s.certainty === value.certainty &&
         s.workingHours === value.workingHours &&
@@ -137,7 +141,7 @@ export async function loadTimeline(): Promise<Timeline> {
     const resolved = raw.stays.map((stay) => resolveStay(stay, places, homeZone));
     const legs = raw.stays
       .flatMap((stay) => {
-        if (!stay.derived || !stay.source_event_id || !stay.departure_at || !stay.departure_zone) return [];
+        if (!stay.source_event_id || !stay.departure_at || !stay.departure_zone) return [];
         const destination = resolved.find((s) => s.ids.includes(stay.id));
         if (!destination) return [];
         return [

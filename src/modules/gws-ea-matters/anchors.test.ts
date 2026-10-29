@@ -451,7 +451,7 @@ describe('local task anchors through the native matters loop and core recurrence
   });
 
   it('refuses a look, local or fixed, while the zone in effect for it is unknown', async () => {
-    await stay('unknown');
+    await getDb().run('UPDATE gws_ea_profile SET principal_timezone=NULL WHERE singleton=1');
     const input = { title: 'Juno’s booking', 'open-loop': 'Check the confirmation.', look: '2032-11-03T09:00' };
     for (const args of [input, { ...input, look: '2032-11-03T09:00+01:00', fixed: true }])
       expect(await dispatch({ id: 'unknown-look', command: 'matters-open', args }, { caller: 'host' })).toMatchObject({

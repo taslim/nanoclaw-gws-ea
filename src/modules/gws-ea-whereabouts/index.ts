@@ -167,7 +167,7 @@ registerResource({
         arg('id', 'Stay id to update.'),
         placeArg,
         arg('locality', 'Locality for a place not saved.'),
-        arg('zone', 'IANA zone for a place not saved; unknown is explicit.'),
+        arg('zone', 'IANA zone for a place not saved.'),
         startArg,
         endArg,
         sourceArg,

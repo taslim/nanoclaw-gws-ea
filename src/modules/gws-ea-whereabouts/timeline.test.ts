@@ -85,25 +85,32 @@ describe('whereabouts timeline', () => {
     expect(zoneAt(timeline, at('2026-11-08T12:00:00Z'))).toBe(BRUSSELS);
   });
 
-  it('refuses an ambiguous certain overlap and names both places', async () => {
+  it('takes a certain stay overlapping calendar stays in either order, the shorter one winning', async () => {
+    const legs = deriveLegs([
+      {
+        id: 'out',
+        start: { dateTime: '2026-11-01T21:00:00-08:00', timeZone: PACIFIC },
+        end: { dateTime: '2026-11-02T17:00:00+01:00', timeZone: BRUSSELS },
+      },
+      {
+        id: 'onward',
+        start: { dateTime: '2026-11-06T17:00:00+01:00', timeZone: BRUSSELS },
+        end: { dateTime: '2026-11-06T17:15:00+00:00', timeZone: 'Europe/London' },
+      },
+    ]);
+    const window = { start: at('2026-10-31T00:00:00Z'), end: at('2026-11-10T00:00:00Z') };
+    await syncDerivedStays(legs, window);
     await addStay({
       locality: 'Brussels',
       zone: BRUSSELS,
-      start: '2026-11-01',
-      end: '2026-11-04',
+      start: '2026-11-02',
+      end: '2026-11-06',
       source: 'mail',
       certainty: 'certain',
     });
-    await expect(
-      addStay({
-        locality: 'London',
-        zone: 'Europe/London',
-        start: '2026-11-03',
-        end: '2026-11-06',
-        source: 'mail',
-        certainty: 'certain',
-      }),
-    ).rejects.toThrow(/Brussels.*London|London.*Brussels/u);
+    const timeline = await loadTimeline();
+    expect(whereaboutsAt(timeline, at('2026-11-06T20:00:00Z'))).toMatchObject({ locality: 'Brussels', zone: BRUSSELS });
+    expect(zoneAt(timeline, at('2026-11-08T12:00:00Z'))).toBe('Europe/London');
   });
 
   it('reads home and saved-place zones live without storing the home zone, and retains home working hours', async () => {
@@ -192,21 +199,30 @@ describe('whereabouts timeline', () => {
     expect(whereaboutsAt(serialized, at('2026-12-01T12:00:00Z')).placeId).toBeNull();
   });
 
-  it('reports an unknown stay zone for its day instead of substituting home', async () => {
+  it('refuses a stay without its zone, and reports a saved place’s lost zone instead of substituting home', async () => {
     await home();
-    await addStay({
-      locality: 'Place not yet identified',
-      zone: 'unknown',
+    const lisbon = {
+      locality: 'Lisbon',
       start: '2026-11-03',
       end: '2026-11-03',
       source: 'said',
       certainty: 'tentative',
-    });
+    };
+    for (const zone of [undefined, 'unknown'])
+      await expect(addStay({ ...lisbon, zone })).rejects.toThrow('A stay somewhere new needs --zone');
+    await addPlace({ id: 'studio', label: 'Studio', locality: 'Lisbon' });
+    await expect(addStay({ ...lisbon, locality: undefined, placeId: 'studio' })).rejects.toThrow(
+      'Saved place studio has no zone',
+    );
+    expect((await getWhereabouts()).stays).toEqual([]);
+    await addPlace({ id: 'studio', label: 'Studio', locality: 'Lisbon', zone: 'Europe/Lisbon' });
+    await addStay({ ...lisbon, locality: undefined, placeId: 'studio' });
+    await addPlace({ id: 'studio', label: 'Studio', locality: 'Lisbon', zone: 'unknown' });
     const timeline = await loadTimeline();
     expect(whereaboutsAt(timeline, at('2026-11-03T18:00:00Z'))).toMatchObject({
       zone: null,
       zoneLabel: 'zone unknown',
-      placeId: null,
+      placeId: 'studio',
     });
     expect(zoneForDay(timeline, '2026-11-03')).toBeNull();
   });
@@ -298,6 +314,48 @@ describe('whereabouts timeline', () => {
       const timeline = await loadTimeline();
       expect(zoneAt(timeline, at('2026-11-17T12:00:00Z'))).toBe(PACIFIC);
       expect(gaps(timeline).filter((gap) => gap.kind === 'return')).toEqual([]);
+    });
+
+    it('ends the stay before a flight main recorded at that flight’s departure', async () => {
+      const onward = {
+        id: 'ba-389',
+        start: { dateTime: '2026-11-14T17:00:00+01:00', timeZone: BRUSSELS },
+        end: { dateTime: '2026-11-14T17:15:00+00:00', timeZone: 'Europe/London' },
+      };
+      await syncDerivedStays(deriveLegs([outbound, onward]), window);
+      await addStay({
+        locality: 'London',
+        zone: 'Europe/London',
+        start: '2026-11-14T17:15:00+00:00',
+        end: '2026-11-16',
+        source: 'mail',
+        certainty: 'certain',
+        sourceEventId: 'ba-389',
+      });
+      await syncDerivedStays(deriveLegs([outbound, onward]), window);
+      const timeline = await loadTimeline();
+      expect(timeline.legs.map((leg) => leg.sourceEventId)).toEqual(['ua-900', 'ba-389']);
+      expect(zoneAt(timeline, at('2026-11-15T12:00:00Z'))).toBe('Europe/London');
+      expect(zoneAt(timeline, at('2026-11-18T12:00:00Z'))).toBe(PACIFIC);
+    });
+
+    it('lends a calendar stay the locality of a stay main recorded only where it lies within it', async () => {
+      await syncDerivedStays(deriveLegs([outbound, inbound]), window);
+      await addStay({
+        locality: 'Antwerp',
+        zone: BRUSSELS,
+        start: '2026-11-11',
+        end: '2026-11-12',
+        source: 'mail',
+        certainty: 'certain',
+      });
+      const timeline = await loadTimeline();
+      expect(whereaboutsAt(timeline, at('2026-11-10T20:00:00Z'))).toMatchObject({ locality: null, zone: BRUSSELS });
+      expect(whereaboutsAt(timeline, at('2026-11-12T12:00:00Z'))).toMatchObject({
+        locality: 'Antwerp',
+        zone: BRUSSELS,
+      });
+      expect(whereaboutsAt(timeline, at('2026-11-13T12:00:00Z'))).toMatchObject({ locality: null, zone: BRUSSELS });
     });
 
     it('stores only the destination zone of a calendar leg, never its event text', async () => {
