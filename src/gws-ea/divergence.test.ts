@@ -2328,6 +2328,65 @@ describe('recorded divergence: an agent sees only the skills NanoClaw mounts for
   });
 });
 
+/** The slice of the runner's Claude config module the built-in selection guard drives. */
+interface ClaudeToolConfigModule {
+  resolveClaudeCapabilityPolicy(grants: ReadonlySet<string>): unknown;
+  resolveClaudeMcpServers(input: Record<string, never>, environment: NodeJS.ProcessEnv): unknown;
+  resolveClaudeExecutionPolicy(): { disallowedTools: string[] };
+  resolveClaudeToolOptions(
+    policy: unknown,
+    mcp: unknown,
+    disallowedTools: readonly string[],
+  ): { tools?: string[]; disallowedTools: string[] };
+}
+
+describe("recorded divergence: the assistant's agents run without Claude Code's coding framing and coding-only built-ins", () => {
+  it('pins the shorter prompt for main, external-email and external-chat, and offers none of them the unused built-ins', async () => {
+    await freshInstall();
+    await import('../modules/index.js');
+    const { composeContainerEnv } = await import('../container-env.js');
+    const { resolveCapabilities } = await import('../capabilities.js');
+    const { MAIN_CONTEXT_CAPABILITY, mainCapabilitySelection } = await import('../modules/gws-ea-main/index.js');
+    const { EXTERNAL_EMAIL_CAPABILITIES } = await import('../modules/gws-ea-external-email/group.js');
+    const { EXTERNAL_CHAT_CAPABILITIES, JOB_CHAT_CAPABILITIES } =
+      await import('../modules/gws-ea-chat-agents/shape.js');
+    const { BROWSER_CAPABILITIES } = await import('../modules/gws-ea-browser/group.js');
+    const config = (await import(
+      path.join(originalCwd, 'container/agent-runner/src/providers/claude-config.ts')
+    )) as ClaudeToolConfigModule;
+    const unused = ['NotebookEdit', 'Workflow', 'ListAgents', 'TeamCreate', 'TeamDelete'];
+    const sdkOptions = (capabilities: readonly string[]) =>
+      config.resolveClaudeToolOptions(
+        config.resolveClaudeCapabilityPolicy(new Set(capabilities)),
+        config.resolveClaudeMcpServers({}, {}),
+        config.resolveClaudeExecutionPolicy().disallowedTools,
+      );
+    const offered = (capabilities: readonly string[]) => {
+      const options = sdkOptions(capabilities);
+      return unused.filter(
+        (tool) => !options.disallowedTools.includes(tool) && (options.tools?.includes(tool) ?? true),
+      );
+    };
+    const main = [...mainCapabilitySelection(), MAIN_CONTEXT_CAPABILITY];
+    const shapes: ReadonlyArray<readonly [string, readonly string[], '1' | undefined, readonly string[]]> = [
+      ['main', main, '1', []],
+      ['external-email', EXTERNAL_EMAIL_CAPABILITIES, '1', []],
+      ['external-chat', EXTERNAL_CHAT_CAPABILITIES, '1', []],
+      ['job', JOB_CHAT_CAPABILITIES, undefined, ['NotebookEdit']],
+      ['browser', BROWSER_CAPABILITIES, undefined, []],
+      ['stored all', resolveCapabilities('all', 'plain'), undefined, unused],
+    ];
+
+    for (const [name, capabilities, prompt, kept] of shapes) {
+      const env = composeContainerEnv({ agentGroupId: `ag-${name}`, capabilities: new Set(capabilities) }, new Set());
+      expect(env.CLAUDE_CODE_SIMPLE_SYSTEM_PROMPT, name).toBe(prompt);
+      expect(offered(capabilities), name).toEqual(kept);
+    }
+    // Main keeps the SDK's default set beside the trim.
+    expect(sdkOptions(main).tools).toBeUndefined();
+  });
+});
+
 describe('recorded divergence: the PreCompact hook composes the mailbox it reads', () => {
   it('imports the mailbox composition slot and starts the mailbox from the session context before reading', async () => {
     const compaction = await readFile(
