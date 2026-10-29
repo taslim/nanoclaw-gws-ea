@@ -8,7 +8,7 @@
  * source (`render.ts`).
  *
  * A matter's next look is one scheduled task in main's conversation
- * (`looks.ts`), the daily sync wakes main every day to look ahead and read
+ * (`looks.ts`), the evening close gives main time to look back, look ahead and read
  * what waited for it (`sync.ts`), and the host keeps both on time without the
  * model (`loop.ts`). Forgetting a person takes them off every matter
  * (`forget.ts`).
@@ -39,15 +39,18 @@ import {
   gwsEaMatterChatsMigration,
   gwsEaMatterPlanningMigration,
   gwsEaTimeAnchorsMigration,
+  gwsEaCloseClockMigration,
 } from './migration.js';
 import { parseNextLook, type NextLook } from './next-look.js';
 import { renderMatter } from './render.js';
 import { TIMEZONE } from '../../config.js';
 import { loadTimeline, zoneAt, zoneForDay, type Timeline } from '../gws-ea-whereabouts/timeline.js';
-import { registerPendingClockReader } from '../gws-ea-whereabouts/changes.js';
+import { onWhereaboutsChange, registerPendingClockReader } from '../gws-ea-whereabouts/changes.js';
 import { pendingLocalItems, setTaskClock } from './anchors.js';
-import { oneAtATime } from './looks.js';
-import { syncVerdict, todayVerdict } from './sync.js';
+import { log } from '../../log.js';
+import { mainConversation, oneAtATime } from './looks.js';
+import { keepClose, closeVerdict, finishClose, forgetSundaySnapshot, todayVerdict } from './sync.js';
+import { morningVerdict } from './morning.js';
 import { closeRunsMigration } from './close-runs.js';
 import './ledger.js';
 
@@ -57,7 +60,14 @@ registerMigration(gwsEaMatterJobsMigration);
 registerMigration(gwsEaMatterChatsMigration);
 registerMigration(gwsEaMatterPlanningMigration);
 registerMigration(gwsEaTimeAnchorsMigration);
+registerMigration(gwsEaCloseClockMigration);
 registerPendingClockReader(pendingLocalItems);
+onWhereaboutsChange(async () => {
+  await oneAtATime(async () => {
+    const conversation = await mainConversation();
+    if (conversation) await keepClose(conversation);
+  }).catch((error: unknown) => log.warn('Close clock waits for the next loop pass', { err: error }));
+});
 
 onHostStart(async ({ signal }) => {
   await cancelClosedMatterJobs();
@@ -67,6 +77,7 @@ onHostStart(async ({ signal }) => {
 
 registerPersonForgetReview('gws-ea-matters:forget', mattersToRewrite);
 registerPersonForgetHook('gws-ea-matters:forget', forgetFromMatters);
+registerPersonForgetHook('gws-ea-matters:sunday-snapshot', forgetSundaySnapshot);
 
 // ---------------------------------------------------------------------------
 // `ncl matters …` — main's read and write path.
@@ -181,7 +192,7 @@ const LOOK_ARGS: ColumnDef[] = [
     name: 'look',
     type: 'string',
     description:
-      "The next look, once: a date and time in the principal's time zone (2026-10-14T09:00), or with its UTC offset.",
+      "The next look, once: morning or a date and time in the principal's time zone (2026-10-14T09:00), or with its UTC offset.",
   },
   {
     name: 'look_cron',
@@ -430,20 +441,41 @@ registerResource({
       formatHuman: (verdict) => JSON.stringify(verdict),
       handler: async (args, ctx) => asMain(ctx, () => lookVerdict(requiredString(args, 'id'))),
     },
-    sync: {
+    evening: {
       access: 'open',
       description:
-        "The daily sync's pre-task script, which runs on its own once a day before the principal's day starts: it wakes you every day to look ahead, carrying unread notes, threads to place, later looks and any morning rundown's time. It marks a Monday occurrence for the month ahead. The host keeps the sync and its time; you never set it.",
-      args: [],
-      examples: ['ncl matters sync'],
-      // The runner reads the last line of a script's output as its verdict: one line of JSON.
+        'The host-kept evening close. Read its run facts; after both planning results and the day ledger, mark the open run done and leave main your report. --notify is your decision that main should take a turn now.',
+      args: [
+        { name: 'run', type: 'string', description: 'Close-run id supplied by the host task.' },
+        { name: 'done', type: 'string', description: 'Open close-run id to complete in this session.' },
+        { name: 'report', type: 'string', description: 'Your report for main, stored once for this run.' },
+        { name: 'notify', type: 'boolean', description: 'Wake main now for what you judge needs the principal.' },
+      ],
+      examples: [
+        'ncl matters evening',
+        'ncl matters evening --done gws-ea-close-123 --report "Nothing needs Morgan now."',
+      ],
       formatHuman: (verdict) => JSON.stringify(verdict),
-      handler: async (_args, ctx) => asMain(ctx, syncVerdict),
+      handler: async (args, ctx) =>
+        asMain(ctx, async () => {
+          if (ctx.caller !== 'agent') throw new Error('An evening close belongs to its calling session.');
+          const done = optionalString(args.done);
+          return done === undefined
+            ? closeVerdict(ctx.sessionId, optionalString(args.run))
+            : finishClose(ctx.sessionId, done, optionalString(args.report), args.notify === true);
+        }),
+    },
+    morning: {
+      access: 'open',
+      description: 'The morning gate’s facts and looks held for its local date.',
+      args: [{ name: 'date', type: 'string', required: true, description: 'Local date supplied by the host.' }],
+      formatHuman: (verdict) => JSON.stringify(verdict),
+      handler: async (args, ctx) => asMain(ctx, () => morningVerdict(requiredString(args, 'date'))),
     },
     today: {
       access: 'open',
       description:
-        "Your own list for today: today's looks, the matters handed back without one, and the threads waiting to be placed. Read it alongside their calendar when they ask for a morning rundown. Fold in anything the daily sync prepared and send one morning message. Tell them what needs their attention, in their words; keep this list to yourself.",
+        "Your own list for today: today's looks, the matters handed back without one, and the threads waiting to be placed. Read it alongside their calendar when they ask for a morning rundown. Fold in anything the close prepared and send one morning message. Tell them what needs their attention, in their words; keep this list to yourself.",
       args: [],
       examples: [
         'ncl matters today',

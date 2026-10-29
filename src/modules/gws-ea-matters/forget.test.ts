@@ -257,8 +257,12 @@ describe('forgetting a person across matters', () => {
     const acme = await open('Acme renewal', { person: `${juno},${remy}`, thread: THREAD_REMY });
     expect(await liveLooks()).toHaveLength(3);
 
+    const snapshot = path.join(DATA_DIR, 'groups', MAIN, 'sunday-memory-latest');
+    fs.mkdirSync(snapshot, { recursive: true });
+    fs.writeFileSync(path.join(snapshot, 'juno.md'), 'Juno facts');
     const answer = await forget(juno);
 
+    expect(fs.existsSync(snapshot)).toBe(false);
     expect(await getMatter(birthday.id)).toBeUndefined();
     expect(await getMatter(callBack.id)).toBeUndefined();
     expect(await liveLooks()).toEqual([acme.look_task_id]);

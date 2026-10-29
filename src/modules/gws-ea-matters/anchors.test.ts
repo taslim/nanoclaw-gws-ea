@@ -29,6 +29,7 @@ import { createScheduledTask, prepareScheduledTask } from '../scheduling/create.
 import './index.js';
 import '../../cli/resources/tasks.js';
 import { getTimeAnchor } from './anchors.js';
+import { closeSchedules } from './sync.js';
 import { keepMattersOnTime } from './loop.js';
 import { MAIN, mainSession, seedMain, liveTaskRows } from './testing/main-conversation.js';
 
@@ -295,7 +296,7 @@ describe('local task anchors through the native matters loop and core recurrence
       mailbox.updateTask('broken-cron', { recurrence: 'broken' }),
     );
     await keepMattersOnTime();
-    expect(liveTaskRows(session).filter((row) => row.series_id.startsWith('gws-ea-daily-sync-'))).toHaveLength(1);
+    expect(await closeSchedules()).toHaveLength(1);
   });
   it('creates and updates fixed looks natively, and interprets a local look on its future trip day', async () => {
     const create = await dispatch(

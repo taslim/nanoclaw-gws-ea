@@ -22,6 +22,7 @@
  * Every change to a slot, and each pass of the host's loop, runs one at a
  * time, so a pass never reads a slot halfway through a change.
  */
+import { getDb } from '../../db/connection.js';
 import { loadTimeline, zoneAt, type Timeline } from '../gws-ea-whereabouts/timeline.js';
 import { anchorTask } from './anchors.js';
 import { findConversationSessions } from '../../db/sessions.js';
@@ -122,6 +123,9 @@ export async function listHeldLookSlots(): Promise<HeldSlot[]> {
 
 /** Cancel a task series wherever in `main`'s conversations it is; a spent one stays as it is. */
 export async function cancelTaskSeries(taskId: string): Promise<void> {
+  // Morning looks share one native task; releasing one matter must keep the others' wake.
+  if (await getDb().get('SELECT id FROM gws_ea_matters WHERE look_task_id=? AND closed_at IS NULL LIMIT 1', taskId))
+    return;
   for (const session of await mainConversations()) {
     await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) => mailbox.cancelTask(taskId));
   }
@@ -156,7 +160,7 @@ const LOOK_SERIES = /^(look|back)-(m-[0-9a-f]{12})-[0-9a-f]{4}$/u;
 
 export interface LookSeries {
   readonly matterId: string;
-  /** The host set it, at the daily sync, for a matter left without a look. */
+  /** The host set it, at the next close, for a matter left without a look. */
   readonly handedBack: boolean;
 }
 
@@ -176,6 +180,7 @@ async function createLook(
   handedBack: boolean,
   clock: LookClock,
 ): Promise<string> {
+  if (look.kind === 'morning') throw new Error('A held morning look has no task until the morning gate fires.');
   const prepared = prepareScheduledTask({
     name: `${handedBack ? 'back' : 'look'} ${matterId}`,
     prompt: lookPrompt(matterId),
@@ -211,7 +216,18 @@ export async function setLook(
   handedBack = false,
   clock?: LookClock,
 ): Promise<void> {
+  if (look.kind === 'morning') {
+    await getDb().run(
+      'INSERT INTO gws_ea_morning_looks (matter_id,held_at) VALUES (?,?) ON CONFLICT(matter_id) DO UPDATE SET held_at=excluded.held_at',
+      matterId,
+      new Date().toISOString(),
+    );
+    await recordLookTask(matterId, null);
+    if (previous !== null) await cancelTaskSeries(previous);
+    return;
+  }
   const taskId = await createLook(conversation, matterId, look, handedBack, clock ?? (await currentClock()));
+  await getDb().run('DELETE FROM gws_ea_morning_looks WHERE matter_id=?', matterId);
   await recordLookTask(matterId, taskId);
   if (previous !== null) await cancelTaskSeries(previous);
 }
@@ -235,7 +251,7 @@ export function updateMatterAndLook(
   if (look === undefined) return updateMatter(input);
   return oneAtATime(async () => {
     const current = await requireMatter(input.id);
-    if (look.kind === 'once' && current.open && current.look_task_id !== null) {
+    if (look.kind !== 'repeat' && current.open && current.look_task_id !== null) {
       const task = (await findTasks([current.look_task_id])).get(current.look_task_id)?.task;
       if (task !== undefined && stillToCome(task) && task.recurrence !== null) {
         throw new Error(
@@ -254,6 +270,7 @@ export function updateMatterAndLook(
 export function closeMatterAndLook(input: CloseMatterInput): Promise<Matter> {
   return oneAtATime(async () => {
     const closed = await closeMatter(input);
+    await getDb().run('DELETE FROM gws_ea_morning_looks WHERE matter_id=?', closed.id);
     if (closed.look_task_id === null) return closed;
     await cancelTaskSeries(closed.look_task_id);
     await recordLookTask(closed.id, null);

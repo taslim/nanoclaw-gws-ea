@@ -147,6 +147,14 @@ describe('compaction keeps the relationship and the work in flight', () => {
     }
   });
 
+  it('preserves the close step and exact native agent result identities only for main', () => {
+    const instructions = buildCompactInstructions([], null, new Set(['gws-ea-main-context']));
+    expect(instructions).toContain('the evening close-run id and scope, the close step reached');
+    expect(instructions).toContain('each role’s returned agentId and its exact result path');
+    expect(instructions).toContain('which report decision was already recorded; ignore stale result files.');
+    expect(buildCompactInstructions([], null, NO_REPLY)).not.toContain('close-run');
+  });
+
   it('names no product, audience role or tool beyond delivery', () => {
     const instructions = buildCompactInstructions(['family'], null, NO_REPLY);
 

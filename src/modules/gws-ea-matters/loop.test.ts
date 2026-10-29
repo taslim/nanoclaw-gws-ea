@@ -1,8 +1,8 @@
 /**
  * The host's guarantees for matters: every
  * open matter has exactly one look still to come, a closed one none, the
- * daily sync always exists, and a failed repeating look comes back at the
- * next sync. Driven through `ncl` and the real sweep against main's real
+ * evening close always exists, and a failed repeating look comes back at the
+ * next close. Driven through `ncl` and the real sweep against main's real
  * session mailbox, on the real clock, as SQLite's `now` decides what is due.
  */
 import { CronExpressionParser } from 'cron-parser';
@@ -10,10 +10,14 @@ import fs from 'node:fs';
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+const fixture = vi.hoisted(() => ({
+  root: `/tmp/gws-ea-u9-loop-${process.pid}-${Math.random().toString(36).slice(2)}`,
+}));
+
 vi.mock('../../config.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../config.js')>()),
-  DATA_DIR: '/tmp/nanoclaw-test-gws-ea-matters-loop',
-  GROUPS_DIR: '/tmp/nanoclaw-test-gws-ea-matters-loop/groups',
+  DATA_DIR: fixture.root,
+  GROUPS_DIR: `${fixture.root}/groups`,
 }));
 
 vi.mock('../../container-runner.js', async (importOriginal) => ({
@@ -28,6 +32,9 @@ import type { CallerContext, ResponseFrame } from '../../cli/frame.js';
 import '../../cli/resources/tasks.js';
 import { isContainerRunning } from '../../container-runner.js';
 import { closeDb, initTestDb, runMigrations } from '../../db/index.js';
+import { getSession } from '../../db/sessions.js';
+import { withExistingMailboxSession } from '../../session-manager.js';
+import { closeSchedules } from './sync.js';
 import { reconcileSession } from '../../reconcile-session.js';
 import '../gws-ea-inbox/index.js';
 import '../gws-ea-people/index.js';
@@ -37,7 +44,7 @@ import { createScheduledTask, prepareScheduledTask } from '../scheduling/create.
 import { getMatter, markLookFailed, type Matter, type Placed } from './db.js';
 import './index.js';
 import { lookSeries } from './looks.js';
-import { keepMattersOnTime, runMattersLoop } from './loop.js';
+import { keepMattersOnTime } from './loop.js';
 import {
   answerOccurrence,
   liveTaskRows,
@@ -49,7 +56,7 @@ import {
   type TaskRow,
 } from './testing/main-conversation.js';
 
-const DATA_DIR = '/tmp/nanoclaw-test-gws-ea-matters-loop';
+const DATA_DIR = fixture.root;
 const ZONE = 'America/New_York';
 const DAY = 24 * 60 * 60 * 1000;
 const YEARLY = '0 9 14 3 *';
@@ -102,11 +109,16 @@ async function looksByMatter(): Promise<Map<string, string[]>> {
 }
 
 async function syncs(): Promise<TaskRow[]> {
-  return liveTaskRows(await mainSession()).filter((row) => row.series_id.startsWith('gws-ea-daily-sync-'));
+  const rows: TaskRow[] = [];
+  for (const schedule of await closeSchedules()) {
+    const session = await getSession(schedule.session_id);
+    if (session) rows.push(...liveTaskRows(session));
+  }
+  return rows;
 }
 
-/** When the daily sync next comes, as its series holds it. */
-async function nextSync(): Promise<string> {
+/** When the evening close next comes, as its series holds it. */
+async function nextClose(): Promise<string> {
   const [sync] = await syncs();
   return sync.process_after;
 }
@@ -125,7 +137,7 @@ afterEach(async () => {
 });
 
 describe("the host's guarantees for matters", () => {
-  it("gives a matter whose look ran with no new one a look at the next sync, once main's container is idle", async () => {
+  it("gives a matter whose look ran with no new one a look at the next close, once main's container is idle", async () => {
     const acme = await open('Acme renewal', { look: inDays(3) });
     const main = await mainSession();
     await runOccurrence(main, (await liveRow(acme.look_task_id)).id, 'completed');
@@ -140,7 +152,7 @@ describe("the host's guarantees for matters", () => {
     const handedBack = (await fresh(acme)).look_task_id;
     expect(await looksByMatter()).toEqual(new Map([[acme.id, [handedBack]]]));
     expect(lookSeries(handedBack ?? '')).toEqual({ matterId: acme.id, handedBack: true });
-    expect(Date.parse((await liveRow(handedBack)).process_after)).toBe(Date.parse(await nextSync()));
+    expect(Date.parse((await liveRow(handedBack)).process_after)).toBe(Date.parse(await nextClose()));
   });
 
   it('replaces a look cancelled or paused through ncl tasks, cancelling the paused one', async () => {
@@ -173,25 +185,19 @@ describe("the host's guarantees for matters", () => {
     expect(next.process_after).toBe(CronExpressionParser.parse(YEARLY, { tz: ZONE }).next().toISOString());
   });
 
-  it('keeps the daily sync and a yearly look as they are through a pass between their run and the sweep arming the next', async () => {
+  it('leaves a yearly look to core re-arming while the completed close gets one next evening', async () => {
     const birthday = await open("Juno Hale's birthday", { 'look-cron': YEARLY });
     await keepMattersOnTime();
-    const [sync] = await syncs();
-    const main = await mainSession();
-
-    // The sweep has read the runner's answers, and waits on waking main for other mail before it arms what repeats.
-    await answerOccurrence(main, (await liveRow(birthday.look_task_id)).id, 'completed');
-    await answerOccurrence(main, sync.id, 'completed');
+    const [close] = await syncs();
+    await answerOccurrence(await mainSession(), (await liveRow(birthday.look_task_id)).id, 'completed');
     await keepMattersOnTime();
-    await reconcileSession(main.id);
+    await reconcileSession((await mainSession()).id);
     await keepMattersOnTime();
-
     expect(await looksByMatter()).toEqual(new Map([[birthday.id, [birthday.look_task_id]]]));
-    expect(await fresh(birthday)).toMatchObject({ look_task_id: birthday.look_task_id });
-    expect((await syncs()).map((row) => row.series_id)).toEqual([sync.series_id]);
+    expect((await syncs()).map((row) => row.id)).toEqual([close.id]);
   });
 
-  it('brings a failed yearly look back at the next sync, and its date for next year stays', async () => {
+  it('brings a failed yearly look back at the next close, and its date for next year stays', async () => {
     const birthday = await open("Juno Hale's birthday", { 'look-cron': YEARLY });
     const main = await mainSession();
     await runOccurrence(main, (await liveRow(birthday.look_task_id)).id, 'script-skip:error');
@@ -207,7 +213,7 @@ describe("the host's guarantees for matters", () => {
     await keepMattersOnTime();
     const retry = await liveRow(birthday.look_task_id);
     expect(retry).toMatchObject({ recurrence: YEARLY });
-    expect(Date.parse(retry.process_after)).toBe(Date.parse(await nextSync()));
+    expect(Date.parse(retry.process_after)).toBe(Date.parse(await nextClose()));
     // One extra run: another pass leaves it as it is.
     await keepMattersOnTime();
     expect(liveTaskRows(main).filter((row) => row.series_id === birthday.look_task_id)).toEqual([retry]);
@@ -287,33 +293,21 @@ describe("the host's guarantees for matters", () => {
     expect([...looks.keys()].sort()).toEqual([acme.id, birthday.id, lunch.id].sort());
   });
 
-  it('creates the daily sync when the host starts, and again at its time after it is cancelled or the sweep pauses it', async () => {
-    const controller = new AbortController();
-    const loop = runMattersLoop(controller.signal);
-    await vi.waitFor(async () => expect(await syncs()).toHaveLength(1));
-    controller.abort();
-    await loop;
-    const [first] = await syncs();
-    expect(first).toMatchObject({ recurrence: '0 7 * * *' });
-
-    await data(run('tasks-cancel', { id: first.series_id }));
-    await keepMattersOnTime();
-    const [second] = await syncs();
-    expect(await syncs()).toHaveLength(1);
-    expect(second).toMatchObject({ recurrence: '0 7 * * *' });
-    expect(second.series_id).not.toBe(first.series_id);
-
-    // Eight failed runs in a row, and the sweep pauses the series.
-    const main = await mainSession();
-    for (let failures = 0; failures < 8; failures++) {
-      await runOccurrence(main, (await liveRow(second.series_id)).id, 'script-skip:error');
-    }
-    expect(await liveRow(second.series_id)).toMatchObject({ status: 'paused' });
-
-    await keepMattersOnTime();
-    const [third] = (await syncs()).filter((row) => row.status === 'pending');
-    expect(await syncs()).toEqual([third]);
-    expect(third).toMatchObject({ recurrence: '0 7 * * *' });
-    expect(third.series_id).not.toBe(second.series_id);
-  });
+  it.each(['cancel', 'pause'] as const)(
+    'keeps one pending evening close after %s without modifying core recurrence',
+    async (change) => {
+      await keepMattersOnTime();
+      const [first] = await syncs();
+      expect(first.recurrence).toBeNull();
+      const schedule = (await closeSchedules()).find((row) => row.id === first.id)!;
+      const session = (await getSession(schedule.session_id))!;
+      await withExistingMailboxSession(MAIN, session.id, (mailbox) =>
+        change === 'cancel' ? mailbox.cancelTask(first.id) : mailbox.pauseTask(first.id),
+      );
+      await keepMattersOnTime();
+      expect(await syncs()).toHaveLength(1);
+      expect((await syncs())[0].id).not.toBe(first.id);
+      expect((await syncs())[0].process_after).toBe(first.process_after);
+    },
+  );
 });

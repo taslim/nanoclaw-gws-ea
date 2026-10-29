@@ -13,10 +13,14 @@ import fs from 'node:fs';
 import Database from 'better-sqlite3';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+const fixture = vi.hoisted(() => ({
+  root: `/tmp/gws-ea-u9-main-note-${process.pid}-${Math.random().toString(36).slice(2)}`,
+}));
+
 vi.mock('../../config.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../config.js')>()),
-  DATA_DIR: '/tmp/nanoclaw-test-gws-ea-main-note',
-  GROUPS_DIR: '/tmp/nanoclaw-test-gws-ea-main-note/groups',
+  DATA_DIR: fixture.root,
+  GROUPS_DIR: `${fixture.root}/groups`,
 }));
 
 vi.mock('../../request-wake.js', () => ({ requestWake: vi.fn().mockResolvedValue(true) }));
@@ -61,6 +65,9 @@ import { closeDb, getDb, initTestDb, runMigrations } from '../../db/index.js';
 import { inboundDbPath } from '../../mailbox/sqlite/paths.js';
 import { formatLocalTime } from '../../timezone.js';
 import '../gws-ea-inbox/index.js';
+import { flushPendingCalendarChanges } from '../gws-ea-inbox/calendar-notifications.js';
+import { CALENDAR_SETTLE_MS } from '../gws-ea-meetings/week/pending-changes.js';
+import '../gws-ea-preferences/index.js';
 import { writeCalendarNote } from '../gws-ea-inbox/route-mail.js';
 import { FakeGmailThreads } from '../gws-ea-inbox/testing/fake-gmail-threads.js';
 import { createThread } from '../gws-ea-inbox/thread-map.js';
@@ -77,9 +84,15 @@ import { writeWorkspaceNote, type WorkspaceNotice } from '../gws-ea-workspace/no
 import { FakeDrive } from '../gws-ea-workspace/testing/fake-drive.js';
 import { addPrincipalAddress } from './db.js';
 import './index.js';
-import { noteNames, resolveMainConversation, writeNoteForMain, type NotePiece } from './main-note.js';
+import {
+  noteCarriesNewFact,
+  noteNames,
+  resolveMainConversation,
+  writeNoteForMain,
+  type NotePiece,
+} from './main-note.js';
 
-const DATA_DIR = '/tmp/nanoclaw-test-gws-ea-main-note';
+const DATA_DIR = fixture.root;
 const ZONE = 'America/New_York';
 const NOW = '2026-10-10T17:00:00.000Z';
 const MORGAN = 'morgan@ellery.example';
@@ -92,7 +105,12 @@ const THREAD_REMY = 'mail-0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d';
 const RENEWAL_CALL = 'renewalcall1';
 const INVITATION = 'acmeinvite1';
 const DINNER = 'dinner1';
-const CALENDAR_CLOSING = 'Read each event from the calendar before you act on it.';
+function calendarSource(value: string): string {
+  return `<<<EXTERNAL_UNTRUSTED_CONTENT id="…">>>\nSource: google_calendar\n---\n${value}\n<<<END_EXTERNAL_UNTRUSTED_CONTENT id="…">>>`;
+}
+function calendarNoticeLine(eventId: string, change: 'created' | 'changed'): string {
+  return `- Event ${eventId} on calendar ${calendarSource(MORGAN)}: ${change}.`;
+}
 
 let gmail: FakeGmailThreads;
 let calendar: FakeCalendar;
@@ -142,6 +160,13 @@ async function onlyNote(): Promise<string> {
   return note;
 }
 
+async function settleCalendarNotes(expected: number): Promise<void> {
+  expect(await notes()).toEqual([]);
+  expect(await flushPendingCalendarChanges(new Date(NOW))).toBe(0);
+  vi.setSystemTime(new Date(Date.parse(NOW) + CALENDAR_SETTLE_MS));
+  expect(await flushPendingCalendarChanges(new Date())).toBe(expected);
+}
+
 function times(text: string, part: string): number {
   return text.split(part).length - 1;
 }
@@ -163,6 +188,7 @@ beforeEach(async () => {
   fs.mkdirSync(DATA_DIR, { recursive: true });
   gmail = new FakeGmailThreads();
   calendar = new FakeCalendar();
+  calendar.calendars.set(MORGAN, { id: MORGAN, accessRole: 'writer', dataOwner: MORGAN, primary: true });
   drive = new FakeDrive(ASSISTANT);
   for (const account of [MORGAN, JUNO, REMY]) drive.addAccount(account);
   google.gmail = gmail;
@@ -223,12 +249,17 @@ describe('a note about a piece of an open matter', () => {
       new Date(NOW),
     );
 
+    await settleCalendarNotes(1);
     const text = await onlyNote();
-    expect(text).toBe(
-      `Google Calendar reports a change:\n- An event changed (event ${RENEWAL_CALL} on calendar ${MORGAN})\n${CALENDAR_CLOSING}\n\n` +
-        (await rendered(acme)),
+    expect(text.split('\nCalendar facts:\n')[0]).toBe(
+      `Google Calendar reports a change:\n${calendarNoticeLine(RENEWAL_CALL, 'changed')}`,
     );
-    expect(text).toContain(`Matter ${acme.id}, open: Acme renewal\nLinks read ${formatLocalTime(NOW, ZONE)}.`);
+    expect(text).toContain('Calendar facts:\nFindings for 2026-10-14:');
+    expect(text).toContain(`event ${RENEWAL_CALL} on calendar ${MORGAN}\n${calendarSource('Acme renewal call')}`);
+    expect(text.endsWith(`\n\n${await rendered(acme)}`)).toBe(true);
+    expect(text).toContain(
+      `Matter ${acme.id}, open: Acme renewal\nLinks read ${formatLocalTime(new Date().toISOString(), ZONE)}.`,
+    );
     // Read live: the event's time and Juno's answer as Calendar holds them now.
     expect(text).toMatch(new RegExp(`- event ${MORGAN}/${RENEWAL_CALL}: [^\\n]*accepted: [^\\n]*Juno Hale`, 'u'));
   });
@@ -307,13 +338,21 @@ describe('a note about pieces in no open matter', () => {
       new Date(NOW),
     );
 
-    expect(await onlyNote()).toBe(
-      `Google Calendar reports a change:\n- A new event (event ${INVITATION} on calendar ${MORGAN})\n${CALENDAR_CLOSING}\n\n` +
-        `Event ${MORGAN}/${INVITATION} is in no open matter.\n` +
-        'Open matters it may belong to:\n' +
-        `- ${acme.id}: Acme renewal (same person)\n` +
-        'The person and organization rest on the organizer the invitation names, which whoever sent it chose.',
+    await settleCalendarNotes(1);
+    const text = await onlyNote();
+    expect(text.split('\nCalendar facts:\n')[0]).toBe(
+      `Google Calendar reports a change:\n${calendarNoticeLine(INVITATION, 'created')}`,
     );
+    expect(text).toContain('Calendar facts:\nFindings for 2026-10-15:');
+    expect(text).toContain(`Organizer: ${calendarSource(JUNO)}`);
+    expect(
+      text.endsWith(
+        `Event ${MORGAN}/${INVITATION} is in no open matter.\n` +
+          'Open matters it may belong to:\n' +
+          `- ${acme.id}: Acme renewal (same person)\n` +
+          'The person and organization rest on the organizer the invitation names, which whoever sent it chose.',
+      ),
+    ).toBe(true);
   });
 
   it('suggests nothing for an event that only changed, or a new one Calendar names no organizer of', async () => {
@@ -329,11 +368,18 @@ describe('a note about pieces in no open matter', () => {
       new Date(NOW),
     );
 
-    expect(await onlyNote()).toBe(
+    await settleCalendarNotes(2);
+    const text = await onlyNote();
+    expect(text.split('\nCalendar facts:\n')[0]).toBe(
       'Google Calendar reports 2 changes:\n' +
-        `- An event changed (event ${RENEWAL_CALL} on calendar ${MORGAN})\n` +
-        `- A new event (event ${INVITATION} on calendar ${MORGAN})\n${CALENDAR_CLOSING}`,
+        calendarNoticeLine(RENEWAL_CALL, 'changed') +
+        '\n' +
+        calendarNoticeLine(INVITATION, 'created'),
     );
+    expect(text).toContain('Calendar facts:\nFindings for 2026-10-14:');
+    expect(text).toContain(`Organizer: ${calendarSource(JUNO)}`);
+    expect(text).not.toContain('Open matters it may belong to:');
+    expect(text).not.toContain('same person');
   });
 
   it('is written without suggestions while Calendar cannot name the organizer', async () => {
@@ -346,9 +392,13 @@ describe('a note about pieces in no open matter', () => {
       new Date(NOW),
     );
 
+    await settleCalendarNotes(1);
     expect(await onlyNote()).toBe(
-      `Google Calendar reports a change:\n- A new event (event ${INVITATION} on calendar ${MORGAN})\n${CALENDAR_CLOSING}`,
+      `Google Calendar reports a change:\n${calendarNoticeLine(INVITATION, 'created')}\nfindings unavailable`,
     );
+    expect(await getDb().all('SELECT message_id FROM gws_ea_pending_calendar_changes')).toEqual([]);
+    expect(await flushPendingCalendarChanges(new Date())).toBe(0);
+    expect(await notes()).toHaveLength(1);
   });
 });
 
@@ -431,6 +481,27 @@ describe('a matter a note names by id, and what a note records for the host', ()
     const row = db.prepare("SELECT content FROM messages_in WHERE id = 'note-named'").get() as { content: string };
     db.close();
     expect(noteNames(row.content)).toEqual({ pieces: [thread(THREAD_JUNO)], matters: [lunch.id, acme.id] });
+  });
+
+  it('keeps fixed receipt kinds beside the words for the morning gate, without changing note rendering', async () => {
+    await writeNoteForMain({
+      id: 'fixed-receipt-kind',
+      timestamp: NOW,
+      text: 'The host receipt.',
+      wake: false,
+      noteKind: 'host-receipt',
+    });
+    expect(await onlyNote()).toBe('The host receipt.');
+    const session = await mainSession();
+    const db = new Database(inboundDbPath(session.agent_group_id, session.id), { readonly: true });
+    const row = db.prepare("SELECT content FROM messages_in WHERE id='fixed-receipt-kind'").get() as {
+      content: string;
+    };
+    db.close();
+    expect(JSON.parse(row.content)).toMatchObject({ text: 'The host receipt.', noteKind: 'host-receipt' });
+    expect(noteCarriesNewFact(row.content)).toBe(false);
+    expect(noteNames(row.content)).toEqual({ pieces: [], matters: [] });
+    expect(noteCarriesNewFact(JSON.stringify({ text: 'The host receipt.' }))).toBe(true);
   });
 
   it('reads a new piece back with who Google verified it came from', () => {

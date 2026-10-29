@@ -72,6 +72,7 @@ describe('the matters migrations', () => {
       'module:gws-ea-matters:chat-links',
       'module:gws-ea-matters:planning-facts',
       'module:gws-ea-matters:time-anchors',
+      'module:gws-ea-matters:close-and-morning',
     ]);
   });
 
@@ -87,14 +88,22 @@ describe('the matters migrations', () => {
   it('leave the matter and clock tables and the indexes that keep them', async () => {
     const declared = schemaOf(await freshInstall()).filter(
       (entry) =>
-        (entry.tbl_name.startsWith('gws_ea_matter') || entry.tbl_name === 'gws_ea_time_anchors') && entry.sql !== null,
+        (entry.tbl_name.startsWith('gws_ea_matter') ||
+          entry.tbl_name.startsWith('gws_ea_morning_') ||
+          entry.tbl_name === 'gws_ea_close_schedule' ||
+          entry.tbl_name === 'gws_ea_time_anchors') &&
+        entry.sql !== null,
     );
     expect(declared.map((entry) => `${entry.type} ${entry.name}`)).toEqual([
+      'index gws_ea_close_unretired',
       'index idx_gws_ea_matter_links_one_open_matter',
       'index idx_gws_ea_matter_links_reference',
       'index idx_gws_ea_matters_parent',
+      'table gws_ea_close_schedule',
       'table gws_ea_matter_links',
       'table gws_ea_matters',
+      'table gws_ea_morning_decisions',
+      'table gws_ea_morning_looks',
       'table gws_ea_time_anchors',
     ]);
   });

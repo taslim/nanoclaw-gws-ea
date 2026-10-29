@@ -11,6 +11,7 @@ import { MAX_DAILY_FIRES } from '../scheduling/create.js';
  * clock, so the matter stores the task's id and never the time.
  */
 export type NextLook =
+  | { readonly kind: 'morning' }
   | { readonly kind: 'once'; /** UTC, ISO 8601. */ readonly at: string }
   | { readonly kind: 'repeat'; /** Five fields, single-spaced. */ readonly cron: string };
 
@@ -124,6 +125,7 @@ export function parseNextLook(input: NextLookInput, timezone: string, now: Date 
   if (input.at !== undefined && input.cron !== undefined) {
     throw new Error('Give either --look or --look-cron: a matter has one next look');
   }
+  if (input.at?.trim() === 'morning') return { kind: 'morning' };
   if (input.at !== undefined) return once(input.at, timezone, now);
   if (input.cron !== undefined) return repeating(input.cron, timezone, now);
   return undefined;

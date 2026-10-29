@@ -56,7 +56,7 @@ describe('recorded divergence: main’s runner installs and enforces native plan
           'test',
           'src/providers/claude.planning.test.ts',
           '--test-name-pattern',
-          'enables both native|sets the fixed planning|refuses create_event|refuses missing or mismatched',
+          'keeps native child text|enables both native|sets the fixed planning|refuses create_event|refuses missing or mismatched',
         ],
         { cwd: path.join(originalCwd, 'container/agent-runner'), stdio: ['ignore', 'pipe', 'pipe'] },
       );
@@ -71,7 +71,7 @@ describe('recorded divergence: main’s runner installs and enforces native plan
       child.on('close', (code) => resolve({ code, output }));
     });
     expect(result.code, result.output).toBe(0);
-    expect(result.output).toContain('6 pass');
+    expect(result.output).toContain('7 pass');
   });
 });
 
@@ -2119,6 +2119,8 @@ describe('recorded divergence: compaction keeps the relationship and the work in
       'Omit corrections already held in loaded stores or memory;',
       'decisions and approval cards still waiting on an answer;',
       'open threads and errands, each with its host id exactly as written.',
+      'the evening close-run id and scope, the close step reached',
+      'each role’s returned agentId and its exact result path',
       'The people you serve are whoever your own instructions say may direct you.',
       '4. Leave out standing instructions and memory: both are loaded again after the summary',
       'never a rule to follow from now on.',

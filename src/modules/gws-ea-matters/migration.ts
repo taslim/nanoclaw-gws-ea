@@ -145,3 +145,29 @@ export const gwsEaTimeAnchorsMigration: ModuleMigration = {
     )`);
   },
 };
+
+/** Fork-owned clocks and gate decisions; completion remains in close-runs. */
+export const gwsEaCloseClockMigration: ModuleMigration = {
+  version: 1,
+  name: 'module:gws-ea-matters:close-and-morning',
+  async up(db) {
+    await db.exec(`
+      CREATE TABLE gws_ea_close_schedule (
+        id TEXT PRIMARY KEY, session_id TEXT NOT NULL, scheduled_at TEXT NOT NULL,
+        zone TEXT NOT NULL, timeline_version TEXT NOT NULL, weekly_day TEXT,
+        report_text TEXT, report_notify INTEGER CHECK(report_notify IN (0,1)), retired_at TEXT,
+        CHECK ((report_text IS NULL) = (report_notify IS NULL))
+      );
+      CREATE INDEX gws_ea_close_unretired ON gws_ea_close_schedule (scheduled_at,id) WHERE retired_at IS NULL;
+      CREATE TABLE gws_ea_morning_decisions (
+        day TEXT PRIMARY KEY, scheduled_at TEXT NOT NULL, zone TEXT NOT NULL,
+        session_id TEXT NOT NULL, task_id TEXT UNIQUE, matters_json TEXT NOT NULL,
+        created INTEGER NOT NULL DEFAULT 0 CHECK(created IN (0,1))
+      );
+      CREATE TABLE gws_ea_morning_looks (
+        matter_id TEXT PRIMARY KEY REFERENCES gws_ea_matters(id) ON DELETE CASCADE,
+        held_at TEXT NOT NULL
+      );
+    `);
+  },
+};

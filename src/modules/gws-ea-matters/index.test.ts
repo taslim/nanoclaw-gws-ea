@@ -2,10 +2,14 @@ import fs from 'node:fs';
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+const fixture = vi.hoisted(() => ({
+  root: `/tmp/gws-ea-u9-matters-index-${process.pid}-${Math.random().toString(36).slice(2)}`,
+}));
+
 vi.mock('../../config.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../config.js')>()),
-  DATA_DIR: '/tmp/nanoclaw-test-gws-ea-matters-index',
-  GROUPS_DIR: '/tmp/nanoclaw-test-gws-ea-matters-index/groups',
+  DATA_DIR: fixture.root,
+  GROUPS_DIR: `${fixture.root}/groups`,
 }));
 
 /** Google as the host's own clients reach it, in memory: each test gets its own. */
@@ -46,8 +50,8 @@ import { getMatter, listOpenMatters, type Matter, type Placed } from './db.js';
 import './index.js';
 import { seedMain } from './testing/main-conversation.js';
 
-const VERBS = ['open', 'place', 'update', 'close', 'get', 'look', 'sync', 'today', 'list'] as const;
-const DATA_DIR = '/tmp/nanoclaw-test-gws-ea-matters-index';
+const VERBS = ['open', 'place', 'update', 'close', 'get', 'look', 'evening', 'morning', 'today', 'list'] as const;
+const DATA_DIR = fixture.root;
 
 const NOW = '2026-10-10T12:00:00.000Z';
 const THREAD_A = 'mail-8d1f2c34-5b6a-4e7f-9a01-23456789abcd';
@@ -454,7 +458,8 @@ describe('GWS-EA matters ncl resource', () => {
       ['close', { id, outcome: 'Done.' }],
       ['get', { id }],
       ['look', { id }],
-      ['sync', {}],
+      ['evening', {}],
+      ['morning', { date: '2026-10-10' }],
       ['today', {}],
       ['list', {}],
     ];

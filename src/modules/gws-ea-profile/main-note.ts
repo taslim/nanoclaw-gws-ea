@@ -66,12 +66,28 @@ export interface NoteForMain {
   readonly text: string;
   /** Whether main takes a turn now; otherwise the note waits for its next one. */
   readonly wake: boolean;
+  /** Host-only receipt classification, assigned by the writer, never inferred from words. */
+  readonly noteKind?: NoteKind;
   /** Files that come with it, saved in main's inbox beside it, each recorded there by its SHA-256. */
   readonly files?: readonly OutboundFile[];
   /** The pieces it is about, whose open matters come with it. */
   readonly pieces?: readonly NotePiece[];
   /** Matters it is about by id, each rendered with it as a piece's matter is. */
   readonly matters?: readonly string[];
+}
+
+export type NoteKind = 'host-receipt' | 'clock-retimed' | 'unplaced-thread';
+const RECEIPT_KINDS: ReadonlySet<string> = new Set(['host-receipt', 'clock-retimed', 'unplaced-thread']);
+
+export function noteCarriesNewFact(content: string): boolean {
+  let value: unknown;
+  try {
+    value = JSON.parse(content);
+  } catch (error) {
+    if (error instanceof SyntaxError) return true;
+    throw error;
+  }
+  return !isRecord(value) || typeof value.noteKind !== 'string' || !RECEIPT_KINDS.has(value.noteKind);
 }
 
 export interface NoteNames {
@@ -261,6 +277,7 @@ export async function writeNoteForMain(note: NoteForMain): Promise<NoteForMainRe
       content: JSON.stringify({
         text,
         sender: 'system',
+        ...(note.noteKind === undefined ? {} : { noteKind: note.noteKind }),
         senderId: 'system',
         ...(names.pieces.length === 0 ? {} : { pieces: names.pieces }),
         ...(names.matters.length === 0 ? {} : { matters: names.matters }),

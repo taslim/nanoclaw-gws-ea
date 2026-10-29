@@ -184,6 +184,7 @@ async function notify(anchor: TimeAnchor): Promise<TimeAnchor> {
     const result = await writeNoteForMain({
       id,
       timestamp: iso(Date.now()),
+      noteKind: 'clock-retimed',
       wake: false,
       text: `Local clock re-timed task ${anchor.seriesId}: ${formatLocalTime(oldAt, oldZone)} (${oldZone}) → ${formatLocalTime(newAt, newZone)} (${newZone}).`,
     });

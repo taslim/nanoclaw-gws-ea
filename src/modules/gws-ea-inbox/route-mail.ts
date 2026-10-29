@@ -565,6 +565,7 @@ async function noticeUnsigned(
   const principal = principalName(context);
   const result = await writeNoteForMain({
     id: `inbox-unsigned-${mail.id}`,
+    ...(told ? { noteKind: 'host-receipt' as const } : {}),
     timestamp: context.at.toISOString(),
     wake: false,
     text:

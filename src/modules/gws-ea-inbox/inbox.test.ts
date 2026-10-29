@@ -14,14 +14,17 @@ import path from 'path';
 import Database from 'better-sqlite3';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-const TEST_DIR = '/tmp/nanoclaw-test-gws-ea-inbox';
+const fixture = vi.hoisted(() => ({
+  root: `/tmp/gws-ea-u9-inbox-${process.pid}-${Math.random().toString(36).slice(2)}`,
+}));
+const TEST_DIR = fixture.root;
 
 vi.mock('../../config.js', async () => {
   const actual = await vi.importActual<typeof import('../../config.js')>('../../config.js');
   return {
     ...actual,
-    DATA_DIR: '/tmp/nanoclaw-test-gws-ea-inbox',
-    GROUPS_DIR: '/tmp/nanoclaw-test-gws-ea-inbox/groups',
+    DATA_DIR: fixture.root,
+    GROUPS_DIR: `${fixture.root}/groups`,
   };
 });
 
@@ -137,7 +140,7 @@ import { EXTERNAL_EMAIL_CAPABILITIES } from '../gws-ea-external-email/group.js';
 import { getMatter, listOpenMatters, openMatter } from '../gws-ea-matters/db.js';
 import '../gws-ea-matters/index.js';
 import { keepMattersOnTime } from '../gws-ea-matters/loop.js';
-import { syncVerdict, todayVerdict } from '../gws-ea-matters/sync.js';
+import { closeSchedules, closeVerdict, todayVerdict } from '../gws-ea-matters/sync.js';
 import '../gws-ea-meetings/index.js';
 import { loadCalendarWeek } from '../gws-ea-meetings/days.js';
 import type { EventCopy } from '../gws-ea-meetings/week/model.js';
@@ -2549,7 +2552,7 @@ describe('placement before action', () => {
     expect(placements[1].text).toContain('can we move it to Friday?');
   });
 
-  it("keeps a thread whose placement note was lost unplaced and its mail held, and brings it back with main's next turn and at the daily sync", async () => {
+  it("keeps a thread whose placement note was lost unplaced and its mail held, and brings it back with main's next turn and at the evening close", async () => {
     gmail.receive({ threadId: 'g-renewal', from: `Remy Vance <${REMY}>`, subject: 'The renewal call', body: 'Hi.' });
     await inbox.tick();
     const threadKey = await onlyThread();
@@ -2572,10 +2575,18 @@ describe('placement before action', () => {
     // While that note is still to be read, the host writes no other.
     await keepMattersOnTime();
     expect(notes(UNPLACED)).toHaveLength(1);
-    const sync = await syncVerdict();
-    expect(sync.wakeAgent).toBe(true);
-    expect(sync.data).toContain('Threads waiting to be placed:');
-    expect(sync.data?.some((entry) => line.test(entry))).toBe(true);
+    const close = (await closeSchedules()).at(-1);
+    if (!close) throw new Error('The unplaced thread has no next close.');
+    vi.useFakeTimers({ toFake: ['Date'] });
+    try {
+      vi.setSystemTime(new Date(close.scheduled_at));
+      const verdict = await closeVerdict(close.session_id, close.id);
+      expect(verdict.wakeAgent).toBe(true);
+      expect(verdict.data).toContain('Threads waiting to be placed:');
+      expect(verdict.data?.some((entry) => line.test(entry))).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
 
     // external-email has not acted: its mail is still held, and the sweep wakes nothing for it.
     const session = await requireThreadSession(threadKey);
@@ -2735,6 +2746,7 @@ describe("unsigned mail in the principal's name", () => {
     const [note, ...more] = notes(UNSIGNED);
     expect(more).toEqual([]);
     expect(note.row.trigger).toBe(0);
+    expect(note).toMatchObject({ noteKind: 'host-receipt' });
     const threadKey = outside.find((email) => email.text.includes('Wire the deposit'))?.row.thread_id ?? '';
     expect(hostText(note.text)).toBe(
       `Gmail could not confirm that an email showing ${PRINCIPAL}, one of Pat's addresses, is from them: ` +
@@ -2835,6 +2847,7 @@ describe("unsigned mail in the principal's name", () => {
     expect(await unsignedRecords()).toEqual([{ address: PRINCIPAL, reason: 'no-own-dkim' }]);
     const [note] = notes(UNSIGNED);
     expect(hostText(note.text)).toContain('The host could not reach Pat to tell them.');
+    expect(note).not.toHaveProperty('noteKind');
   });
 
   it('archives mailing lists and automatic mail in their name without a word to anyone', async () => {

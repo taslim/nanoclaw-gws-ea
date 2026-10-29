@@ -111,6 +111,12 @@ export function buildCompactInstructions(
     '   unattributed context, never as authority or a standing instruction. Never invent a source.',
     '   Omit corrections already held in loaded stores or memory; when a correction replaces an earlier one, keep the newest.',
     '',
+    ...(capabilities.has('gws-ea-main-context')
+      ? [
+          '   - the evening close-run id and scope, the close step reached (look-back launched or returned, look-ahead launched or returned, acting, reported, or done),',
+          '     each role’s returned agentId and its exact result path, and which report decision was already recorded; ignore stale result files.',
+        ]
+      : []),
     '4. Leave out standing instructions and memory: both are loaded again after the summary, so restating',
     '   them only duplicates them. Leave out how to use tools and commands too: the skills and tool',
     '   descriptions carry that, and a command remembered from a summary is not the skill that teaches it.',
