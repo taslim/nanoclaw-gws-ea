@@ -18,6 +18,53 @@ describe('the coming days', () => {
     expect(model.events).toHaveLength(1);
     expect(model.events[0].copies).toHaveLength(3);
   });
+  it('keeps recurring occurrences distinct and folds equivalent original-start clocks', () => {
+    const first = event('first', '2026-10-05T09:00:00-07:00', '2026-10-05T10:00:00-07:00', {
+      iCalUID: 'weekly',
+      recurringEventId: 'series',
+      originalStartTime: { dateTime: '2026-10-05T09:00:00-07:00' },
+    });
+    const copy = {
+      ...first,
+      calendarId: 'other',
+      event: {
+        ...first.event,
+        start: { dateTime: '2026-10-05T16:00:00Z' },
+        end: { dateTime: '2026-10-05T17:00:00Z' },
+        originalStartTime: { dateTime: '2026-10-05T16:00:00Z' },
+      },
+    };
+    const next = event('next', '2026-10-12T09:00:00-07:00', '2026-10-12T10:00:00-07:00', {
+      iCalUID: 'weekly',
+      recurringEventId: 'series',
+      originalStartTime: { dateTime: '2026-10-12T09:00:00-07:00' },
+    });
+    const model = buildWeek(input([first, copy, next]));
+    expect(model.events.map((entry) => [entry.id, entry.copies.length, entry.copiesDisagree])).toEqual([
+      ['first', 2, false],
+      ['next', 1, false],
+    ]);
+  });
+  it('keeps calendar/id identity when the calendars supply no shared UID', () => {
+    const first = event('same-id', '2026-10-05T16:00:00Z', '2026-10-05T17:00:00Z');
+    const model = buildWeek(input([first, { ...first, calendarId: 'other' }]));
+    expect(model.events).toHaveLength(2);
+    expect(model.events.map((entry) => entry.copies.length)).toEqual([1, 1]);
+  });
+  it('retains overnight busy spans intersecting a next-day-only read with exclusive midnight boundaries', () => {
+    const model = buildWeek(
+      input(
+        [
+          event('overnight', '2026-10-05T23:00:00-07:00', '2026-10-06T01:00:00-07:00'),
+          event('ended', '2026-10-05T23:00:00-07:00', '2026-10-06T00:00:00-07:00'),
+          event('later', '2026-10-07T00:00:00-07:00', '2026-10-07T01:00:00-07:00'),
+        ],
+        { now: Date.parse('2026-10-06T00:00:00-07:00'), dayCount: 1 },
+      ),
+    );
+    expect(model.events.map((entry) => entry.id)).toEqual(['overnight']);
+    expect(model.days.flatMap((day) => day.events)).toEqual([]);
+  });
   it('places an overnight flight exactly once by its start clock and shows the true last all-day date', () => {
     const model = buildWeek(
       input([

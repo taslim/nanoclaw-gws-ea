@@ -218,6 +218,67 @@ describe('factual week findings', () => {
       ]),
     ).toContain('orphaned-block');
   });
+  it('reports one time disagreement for nonrecurring copies with the same UID', () => {
+    const original = meeting('e', '09:00', '10:00', { iCalUID: 'same-meeting' });
+    const moved = {
+      ...meeting('e', '10:00', '11:00', { iCalUID: 'same-meeting' }),
+      calendarId: 'other',
+    };
+    const model = buildWeek(input([original, moved]));
+    expect(model.events).toHaveLength(1);
+    expect(model.events[0].copies).toHaveLength(2);
+    expect(checkWeek(model).filter((finding) => finding.kind === 'copy-disagreement')).toMatchObject([
+      { day: '2026-10-05', eventKeys: ['morgan@ellery.example/e'] },
+    ]);
+  });
+  it.each([
+    ['the following day alone', '2026-10-06T00:00:00-07:00', 1],
+    ['both calendar days', '2026-10-05T00:00:00-07:00', 2],
+  ])('finds a cross-midnight overlap when reading %s', (_label, now, dayCount) => {
+    const overnight = event('overnight', '2026-10-05T23:30:00-07:00', '2026-10-06T01:00:00-07:00');
+    const later = event('later', '2026-10-06T00:30:00-07:00', '2026-10-06T01:30:00-07:00');
+    const args = { now: Date.parse(now), dayCount };
+    expect(
+      checkWeek(buildWeek(input([overnight, later], args))).filter((finding) => finding.kind === 'overlap'),
+    ).toMatchObject([
+      {
+        day: '2026-10-06',
+        eventKeys: ['morgan@ellery.example/later', 'morgan@ellery.example/overnight'],
+        facts: { minutes: 30 },
+      },
+    ]);
+    const adjacent = event('later', '2026-10-06T01:00:00-07:00', '2026-10-06T01:30:00-07:00');
+    expect(kinds([overnight, adjacent], args)).not.toContain('overlap');
+  });
+  it('keeps each side of a midnight overlap factual and independently identifiable', () => {
+    const events = [
+      event('first', '2026-10-05T23:00:00-07:00', '2026-10-06T03:00:00-07:00'),
+      event('second', '2026-10-05T23:30:00-07:00', '2026-10-06T01:00:00-07:00'),
+    ];
+    const overlaps = checkWeek(buildWeek(input(events, { dayCount: 2 }))).filter(
+      (finding) => finding.kind === 'overlap',
+    );
+    expect(overlaps.map((finding) => [finding.day, finding.facts.minutes])).toEqual([
+      ['2026-10-05', 30],
+      ['2026-10-06', 60],
+    ]);
+    expect(new Set(overlaps.map((finding) => finding.key)).size).toBe(2);
+    const nextDay = checkWeek(
+      buildWeek(input(events, { now: Date.parse('2026-10-06T00:00:00-07:00'), dayCount: 1 })),
+    ).filter((finding) => finding.kind === 'overlap');
+    expect(nextDay).toEqual([overlaps[1]]);
+    const singleDay = checkWeek(buildWeek(input([meeting('a', '09:00', '10:00'), meeting('b', '09:30', '10:30')])));
+    expect(singleDay.find((finding) => finding.kind === 'overlap')?.key).toBe(
+      'overlap:morgan@ellery.example/a|morgan@ellery.example/b',
+    );
+  });
+  it('counts a continuing overnight commitment against the following lunch window', () => {
+    const overnight = event('overnight', '2026-10-05T23:00:00-07:00', '2026-10-06T14:00:00-07:00');
+    const model = buildWeek(input([overnight], { now: Date.parse('2026-10-06T00:00:00-07:00'), dayCount: 1 }));
+    expect(checkWeek(model).filter((finding) => finding.kind === 'meal')).toMatchObject([
+      { day: '2026-10-06', facts: { meal: 'lunch', longest_gap_minutes: 0 } },
+    ]);
+  });
   it('finds home events while away and uses home working hours on a Lagos stay', () => {
     const away = {
       ...timeline,

@@ -165,13 +165,25 @@ export function checkWeek(week: Week, acks: readonly FindingAcknowledgement[] = 
   if (week.homeUnknown)
     add('whereabouts-gap', null, [], 'travel unknown: home not set', { timeline: week.timeline.version }, 'home');
   for (const day of week.days) {
-    const busy = day.events.filter((e) => e.busy && !e.allDay);
+    const window = onDay(day.date, '00:00', '24:00', day.zone ?? 'UTC');
+    const busy = week.events.filter((e) => e.busy && !e.allDay && overlap(e, window) > 0);
     for (let i = 0; i < busy.length; i++)
       for (let j = i + 1; j < busy.length; j++) {
         const a = busy[i],
           b = busy[j];
-        const minutes = overlap(a, b) / MINUTE;
-        if (minutes > 0) add('overlap', day.date, [a, b], `${minutes} minutes overlap.`, { minutes });
+        const shared = { start: Math.max(a.start, b.start), end: Math.min(a.end, b.end) };
+        const minutes = overlap(shared, window) / MINUTE;
+        if (minutes > 0)
+          add(
+            'overlap',
+            day.date,
+            [a, b],
+            `${minutes} minutes overlap.`,
+            { minutes },
+            shared.start < window.start || shared.end > window.end
+              ? `${day.date}/${[a.key, b.key].sort().join('|')}`
+              : undefined,
+          );
       }
     for (const move of day.moves) {
       if (week.homeUnknown && (move.from.home || move.to.home)) continue;

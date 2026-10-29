@@ -6,7 +6,15 @@ import { resolveMatterDueAt } from '../../gws-ea-matters/planning.js';
 import type { PersonSummary, PersonLevel } from '../../gws-ea-people/db.js';
 import type { SchedulingPreferenceValues, Weekday } from '../../gws-ea-preferences/db.js';
 import type { PrincipalRecognizer } from '../../gws-ea-profile/db.js';
-import { dateString, nextDate, parseDate, wallClock, zonedInstant, zonedIso } from '../../gws-ea-whereabouts/clock.js';
+import {
+  boundary,
+  dateString,
+  nextDate,
+  parseDate,
+  wallClock,
+  zonedInstant,
+  zonedIso,
+} from '../../gws-ea-whereabouts/clock.js';
 import { whereaboutsAt, zoneAt, zoneForDay, type Timeline } from '../../gws-ea-whereabouts/timeline.js';
 import type { DetailedEvent } from '../calendar-api.js';
 import { blocksTime, eventSpan, isPrincipalAttendee, principalAnswer, schedulingRules, type Span } from '../slots.js';
@@ -143,8 +151,12 @@ export function digest(value: unknown): string {
 }
 const timeKey = (time: DetailedEvent['start']): string =>
   time?.date ?? String(time?.dateTime ? Date.parse(time.dateTime) : '');
-const originalKey = (copy: EventCopy): string =>
-  `${copy.event.iCalUID ?? `${copy.calendarId}/${copy.event.id ?? digest(copy.event)}`}|${timeKey(copy.event.originalStartTime ?? copy.event.start)}`;
+const originalKey = (copy: EventCopy): string => {
+  const event = copy.event;
+  const identity = event.iCalUID ?? `${copy.calendarId}/${event.id ?? digest(event)}`;
+  const occurrence = event.originalStartTime ?? (event.recurringEventId ? event.start : undefined);
+  return occurrence ? `${identity}|${timeKey(occurrence)}` : identity;
+};
 const weekdays: readonly Weekday[] = ['sun', 'mon', 'tue', 'wed', 'thu', 'fri', 'sat'];
 export const weekdayOf = (date: string): Weekday => weekdays[new Date(`${date}T00:00:00Z`).getUTCDay()];
 export const calendarText = (text: string, limit = 200): string => untrustedLine(text, limit, 'google_calendar');
@@ -241,7 +253,14 @@ function factVersion(event: DetailedEvent, principal: PrincipalRecognizer): stri
 }
 function comparable(copy: EventCopy): string {
   const e = copy.event;
-  return digest([e.start, e.end, e.summary, e.location, e.description, (e.attendees ?? []).map((a) => a.email).sort()]);
+  return digest([
+    timeKey(e.start),
+    timeKey(e.end),
+    e.summary,
+    e.location,
+    e.description,
+    (e.attendees ?? []).map((a) => a.email).sort(),
+  ]);
 }
 function eventFrom(copies: readonly EventCopy[], input: WeekInput): WeekEvent {
   const prefixes = input.preferences.ignored_events?.map((p) => p.prefix) ?? [];
@@ -409,9 +428,17 @@ export function buildWeek(input: WeekInput): Week {
     );
     if (matches.length === 1) matches[0].push(copy);
   }
+  const windows = dates.map((date) => {
+    const zone = zoneForDay(input.timeline, date) ?? 'UTC';
+    return { start: boundary(date, zone, 'start'), end: boundary(date, zone, 'end') };
+  });
   const events = [...groups.values()]
     .map((c) => eventFrom(c, input))
-    .filter((e) => (e.allDay ? e.day <= dates[dates.length - 1] && e.lastDay >= dates[0] : dates.includes(e.day)))
+    .filter((e) =>
+      e.allDay
+        ? e.day <= dates[dates.length - 1] && e.lastDay >= dates[0]
+        : windows.some((window) => e.start < window.end && e.end > window.start),
+    )
     .sort((a, b) => a.start - b.start || a.key.localeCompare(b.key));
   const matters: WeekMatter[] = input.matters
     .filter((m) => m.matter.open)
