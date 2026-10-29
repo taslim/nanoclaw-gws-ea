@@ -182,13 +182,13 @@ const LOOK_ARGS: ColumnDef[] = [
     name: 'look',
     type: 'string',
     description:
-      "The next look, once: morning or a date and time in the principal's time zone (2026-10-14T09:00), or with its UTC offset.",
+      'The next look, once: morning or a date and time on the local clock where the principal will be that day (2026-10-14T09:00), or with its UTC offset.',
   },
   {
     name: 'look_cron',
     type: 'string',
     description:
-      "The next look, repeating: a five-field cron expression in the principal's time zone, at most four times a day. For a date that comes back every year (0 9 14 3 *) or a project's step-back (0 9 * * 1).",
+      "The next look, repeating: a five-field cron expression on the local clock where the principal will be that day, at most four times a day. For a date that comes back every year (0 9 14 3 *) or a project's step-back (0 9 * * 1).",
   },
 ];
 const PLANNING_ARGS: ColumnDef[] = [
@@ -465,11 +465,11 @@ registerResource({
     today: {
       access: 'open',
       description:
-        "Your own list for today: today's looks, the matters handed back without one, and the threads waiting to be placed. Read it alongside their calendar when they ask for a morning rundown. Fold in anything the close prepared and send one morning message. Tell them what needs their attention, in their words; keep this list to yourself.",
+        "Your own list for today: today's looks, the matters handed back without one, and the threads waiting to be placed. Read it alongside their calendar when they ask for a morning rundown, and send one morning message. Tell them what needs their attention, in their words; keep this list to yourself.",
       args: [],
       examples: [
         'ncl matters today',
-        'ncl tasks create --in-conversation --name "morning rundown" --recurrence "30 7 * * 1-5" --script "ncl matters today" --prompt "Their morning rundown: their day from the calendar, and what on your list needs them"',
+        'ncl tasks create --in-conversation --name "morning rundown" --recurrence "30 7 * * *" --script "ncl matters today" --prompt "Their morning rundown: their day from the calendar, and what on your list needs them"',
       ],
       formatHuman: (verdict) => JSON.stringify(verdict),
       handler: async (_args, ctx) => asMain(ctx, todayVerdict),
