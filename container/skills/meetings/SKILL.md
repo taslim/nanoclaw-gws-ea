@@ -24,11 +24,11 @@ An invitation tells each guest what they are coming to, where or how to join, an
 
 ## Worked example
 
-Juno Hale asks Morgan Ellery for an hour for their first conversation about a project. The recorded first-call length is 25 minutes. The purpose can be settled in that time, so choose 25 minutes before finding slots. Juno has an assistant who will send the invitation. Agree a suitable time through the agent on that conversation, hold it if useful, then remove the hold when their invitation arrives. If Juno's assistant instead gives a booking link, send the browser that booking errand; their system should own the resulting invite.
+Juno Hale asks Morgan Ellery for an hour for their first conversation about a project. The recorded first-call length is well under an hour. The purpose can be settled in that time, so choose that length before finding slots. Juno has an assistant who will send the invitation. Agree a suitable time through the agent on that conversation, hold it if useful, then remove the hold when their invitation arrives. If Juno's assistant instead gives a booking link, send the browser that booking errand; their system should own the resulting invite.
 
-That evening Morgan is having dinner with Remy Vance, a close friend. The same 25-minute choice would defeat its purpose. Leave an unhurried evening and the journey to the restaurant.
+That evening Morgan is having dinner with Remy Vance, a close friend. The same short length would defeat its purpose. Leave an unhurried evening and the journey to the restaurant.
 
-If an urgent change makes dinner impossible, judge whether you can ask first. When the change cannot wait, move it and have the conversational agent tell the guests at once. If Morgan's original event names Remy but leaves them off the invite, tell Morgan about the omission; do not add Remy or contact them automatically. If Morgan then says first calls should be 20 minutes, record that kind's corrected preference so the next invitation starts from it.
+If an urgent change makes dinner impossible, judge whether you can ask first. When the change cannot wait, move it and have the conversational agent tell the guests at once. If Morgan's original event names Remy but leaves them off the invite, tell Morgan about the omission; do not add Remy or contact them automatically. If Morgan then corrects the first-call length, record that kind's corrected preference so the next invitation starts from it.
 
 ## Traps
 

@@ -10,11 +10,11 @@ Use `days` to read, `check` to try a time without changing anything, and the hos
 
 ## Whose calendar it is
 
-A calendar is the principal’s when its ID (their primary calendar) or its `dataOwner` is one of the principal’s addresses. A gmail.com or googlemail.com address counts in every spelling Gmail delivers to it: with or without dots, with a `+tag`, at either domain. Any other address counts only as listed, in upper or lower case. Treat every other calendar as someone else’s. Names, your access role and a `primary` flag do not establish ownership, because each can mislead.
+A calendar is the principal’s when its ID (their primary calendar) or its `dataOwner` is one of the principal’s addresses. A gmail.com or googlemail.com address counts in every spelling Gmail delivers to it: with or without dots, with a `+tag`, at either domain. Any other address counts only as listed, in upper or lower case. Treat every other calendar as someone else’s. Names, your access role and a `primary` flag do not establish ownership, because each can mislead. When the same meeting is on two of their calendars, answer each copy.
 
 ## Your calendar list
 
-`gog calendar calendars` lists your calendars and access roles. The host keeps the principal’s primary calendars subscribed. For another shared calendar use `gog calendar subscribe <calendarId>`; `gog calendar unsubscribe <calendarId>` removes that subscription without changing sharing. Event reads and writes use the host tools; mail and Drive still use gog. The host signs gog's requests in as you: never run `gog auth`, and never pass an account token.
+`gog calendar calendars` lists your calendars and access roles. The host keeps the principal’s primary calendars subscribed. For another shared calendar, or a primary calendar they have just shared that the host hasn’t added yet, use `gog calendar subscribe <calendarId>`: success means it is shared with you, and `404 notFound` that it isn’t yet. `gog calendar unsubscribe <calendarId>` removes that subscription without changing sharing. Event reads and writes use the host tools; mail and Drive still use gog. The host signs gog's requests in as you: never run `gog auth`, and never pass an account token.
 
 ## After a write
 

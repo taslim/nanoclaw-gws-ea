@@ -11,7 +11,7 @@ Your name and your own Google Workspace address are in the Assistant Identity se
 
 ## Step 1: Check what you can already see
 
-`ncl principal-addresses list` gives each of the principal's addresses with what you can do with its calendar. The host adds each one's calendar to your list itself, and looks again every 15 minutes at one it can't see. An address whose access is still `unchecked` hasn't been looked at yet: read its calendar yourself, as the `gcalendar` skill shows, before you say you can't see it. Find any other calendars of theirs the same way. If you can already read one, they shared before you asked: skip Step 2 and go to Step 3.
+`ncl principal-addresses list` gives each of the principal's addresses with what you can do with its calendar. The host adds each one's calendar to your list itself, and looks again every 15 minutes at one it can't see. An address whose access is still `unchecked` hasn't been looked at yet: subscribe to its calendar yourself, as the `gcalendar` skill shows, before you say you can't see it. Find any other calendars of theirs the same way. If you can already read one, they shared before you asked: skip Step 2 and go to Step 3.
 
 ## Step 2: Ask for their calendars
 
