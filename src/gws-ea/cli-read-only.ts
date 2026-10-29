@@ -17,6 +17,8 @@ import { runListCommand, runStatusCommand, type ReadOnlyCommandRuntime } from '.
 import type { CommandOptions } from './command-parser.js';
 import { detectStrayInstall, strayNote, type ToolCheckout } from './stray-install.js';
 import { GwsEaError } from './types.js';
+import { inspectLessons } from './lessons-inspection.js';
+import { managedResult, resultJson } from './result.js';
 
 type LineWriter = (line: string) => void;
 
@@ -115,6 +117,24 @@ export const READ_ONLY_COMMANDS: ReadonlyMap<string, ReadOnlyCommand> = new Map(
             details: options.details === 'true',
           }),
         );
+      },
+    },
+  ],
+  [
+    'lessons',
+    {
+      async run(context, options) {
+        const data = await inspectLessons(context.paths, targetInstance(options));
+        if (options.json === 'true')
+          context.output(resultJson(managedResult('lessons', { outcome: 'succeeded', changed: false, data })));
+        else {
+          context.output(
+            data.lessons.length
+              ? data.lessons.map((lesson) => `${lesson.id} [${lesson.status}] ${lesson.text}`).join('\n')
+              : 'No lessons queued.',
+          );
+        }
+        return { exitCode: 0 };
       },
     },
   ],

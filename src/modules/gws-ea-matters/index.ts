@@ -48,7 +48,10 @@ import { registerPendingClockReader } from '../gws-ea-whereabouts/changes.js';
 import { pendingLocalItems, setTaskClock } from './anchors.js';
 import { oneAtATime } from './looks.js';
 import { syncVerdict, todayVerdict } from './sync.js';
+import { closeRunsMigration } from './close-runs.js';
+import './ledger.js';
 
+registerMigration(closeRunsMigration);
 registerMigration(gwsEaMattersMigration);
 registerMigration(gwsEaMatterJobsMigration);
 registerMigration(gwsEaMatterChatsMigration);
