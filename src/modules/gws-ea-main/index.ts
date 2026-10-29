@@ -34,8 +34,10 @@ registerCapability(MAIN_CONTEXT_CAPABILITY, {
   default: 'off',
   grantedTo: async (agentGroupId) => agentGroupId === (await mainAgentGroupId()),
 });
-registerContainerEnv('gws-ea-main:planning', ({ capabilities }): Record<string, string> =>
-  capabilities.has(MAIN_CONTEXT_CAPABILITY) ? { GWS_EA_PLANNING_AGENTS: '1' } : {},
+registerContainerEnv(
+  'gws-ea-main:planning',
+  ({ capabilities }): Record<string, string> =>
+    capabilities.has(MAIN_CONTEXT_CAPABILITY) ? { GWS_EA_PLANNING_AGENTS: '1' } : {},
 );
 registerCapability(MAIN_CHAT_CAPABILITY, {
   description: 'whatsapp_link and chat-addressed host actions for canonical main',
@@ -55,6 +57,10 @@ export const MAIN_SHARED_SKILLS: readonly string[] = [
   ...EXPOSED_GOOGLE_SKILLS,
   'whatsapp-formatting',
   'artifact-designer',
+  'days-and-weeks',
+  'travel',
+  'errands',
+  'meetings',
 ];
 
 async function mainAgentGroupId(): Promise<string | null> {

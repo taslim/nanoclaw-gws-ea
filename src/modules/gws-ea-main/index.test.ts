@@ -548,6 +548,10 @@ describe("main's skills", () => {
       'gworkspace',
       'whatsapp-formatting',
       'artifact-designer',
+      'days-and-weeks',
+      'travel',
+      'errands',
+      'meetings',
     ];
     expect(response).toMatchObject({ ok: true, data: { agent_group_id: main.id, skills } });
     expect(await skillsOf(main.id)).toEqual(skills);
