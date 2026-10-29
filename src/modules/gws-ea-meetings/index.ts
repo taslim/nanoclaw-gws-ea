@@ -1,8 +1,6 @@
 import { calendarWriteLogMigration } from './week/write-log-migration.js';
 import { calendarSplitRecoveryMigration } from './week/split-recovery-migration.js';
-import { bookingWriteWindowsMigration } from './week/booking-writes-migration.js';
 import { pendingCalendarChangesMigration } from './week/pending-changes-migration.js';
-import { weekAcknowledgementsMigration } from './week/acks-migration.js';
 import '../gws-ea-inbox/index.js';
 import '../gws-ea-chats/index.js';
 import '../gws-ea-whereabouts/index.js';
@@ -25,7 +23,11 @@ import { resolveBookingSurface } from './booking-surface.js';
 import { bookingsMigration } from './bookings-migration.js';
 import type { Session } from '../../types.js';
 import { registerCalendarChangeRenderer } from '../gws-ea-inbox/calendar-notifications.js';
-import { createDaysTools, loadCalendarWeek, calendarFindings, renderDays, boundedCalendarMessage } from './days.js';
+import { createDaysTools, loadCalendarWeek, renderDays, boundedCalendarMessage } from './days.js';
+import { boundary } from '../gws-ea-whereabouts/clock.js';
+import { loadTimeline } from '../gws-ea-whereabouts/timeline.js';
+import { checkWeek, presentFinding } from './week/checker.js';
+import { inWindow, spanOf } from './week/model.js';
 import { createPrincipalEventTools } from './principal-events.js';
 import { createWeekRefresher } from './week/refresh.js';
 
@@ -100,11 +102,9 @@ const MAIN_STEP = "Tell the principal in a line what you can't do, and carry on 
 registerMigration(chatBookingRequestsMigration);
 registerMigration(chatBookingReportsMigration);
 registerMigration(bookingsMigration);
-registerMigration(weekAcknowledgementsMigration);
 registerMigration(calendarWriteLogMigration);
 registerMigration(pendingCalendarChangesMigration);
 registerMigration(calendarSplitRecoveryMigration);
-registerMigration(bookingWriteWindowsMigration);
 
 for (const [action, answer] of [
   ['free_time', booking.freeTime],
@@ -150,41 +150,57 @@ for (const [action, answer] of [
 export { createMeetingsCalendarApi, type CalendarEvent, type MeetingsCalendarApi } from './calendar-api.js';
 
 registerCalendarChangeRenderer(async (changes, at, context) => {
-  const details = await Promise.all(
-    changes.map(async ({ notice }) => ({
-      notice,
-      event: context.week
-        ? context.week.events.find((e) => e.calendarId === notice.calendarId && e.id === notice.eventId)?.event
-        : await calendarApi().getEventDetail(notice.calendarId, notice.eventId),
-    })),
+  const changed = (calendarId: string, eventId: string | undefined) =>
+    changes.some(({ notice }) => notice.calendarId === calendarId && notice.eventId === eventId);
+  const timeline = context.timeline ?? (await loadTimeline());
+  const left = (context.previous ?? []).flatMap((copy) =>
+    changed(copy.calendarId, copy.event.id) ? (spanOf(copy.event, timeline) ?? []) : [],
   );
-  const moments = details
-    .flatMap(({ event }) => [
-      event?.start?.dateTime,
-      event?.end?.dateTime,
-      event?.start?.date ? `${event.start.date}T00:00:00Z` : undefined,
-      event?.end?.date ? `${event.end.date}T00:00:00Z` : undefined,
-    ])
-    .filter((v): v is string => v !== undefined)
-    .map(Date.parse);
-  const start = moments.length ? Math.min(...moments) : at.getTime();
-  const end = moments.length ? Math.max(...moments) : start + 86400000;
-  const week =
-    context.week ??
-    (await loadCalendarWeek(calendarApi(), { start, end: Math.max(start + 1, end), timeline: context.timeline }));
-  const affected = week.events.filter((e) =>
-    changes.some(({ notice }) => notice.calendarId === e.calendarId && notice.eventId === e.id),
-  );
+  let week = context.week;
+  if (!week) {
+    const details = await Promise.all(
+      changes.map(({ notice }) => calendarApi().getEventDetail(notice.calendarId, notice.eventId)),
+    );
+    const spans = [...left, ...details.flatMap((event) => (event && spanOf(event, timeline)) ?? [])];
+    const start = spans.length ? Math.min(...spans.map((span) => span.start)) : at.getTime();
+    const end = spans.length ? Math.max(...spans.map((span) => span.end)) : start + 86_400_000;
+    week = await loadCalendarWeek(calendarApi(), { start, end: Math.max(start + 1, end), timeline });
+  }
+  const affected = week.events.filter((e) => changed(e.calendarId, e.id));
+  // The days the change left and the days it now holds.
+  const touched = week.days
+    .filter((day) => {
+      const zone = day.zone ?? 'UTC';
+      const window = { start: boundary(day.date, zone, 'start'), end: boundary(day.date, zone, 'end') };
+      return [...left, ...affected].some((span) => inWindow(span, window));
+    })
+    .map((day) => day.date);
+  const findings = checkWeek(week).filter((f) => f.day !== null && touched.includes(f.day));
   return {
     text: boundedCalendarMessage(
       'Calendar facts:',
-      [await calendarFindings(week), ...affected.map((e) => renderDays({ ...week, events: [e] }))],
+      [
+        ...affected.map((e) => renderDays({ ...week, events: [e] })),
+        ...(touched.length
+          ? [
+              `Findings for ${touched.join(', ')}:`,
+              ...(findings.length ? findings.map((f) => presentFinding(f, week)) : ['No findings.']),
+            ]
+          : []),
+      ],
       10_000,
     ),
-    pieces: details.map(({ notice, event }) => ({
+    pieces: changes.map(({ notice }) => ({
       kind: 'event' as const,
       reference: `${notice.calendarId}/${notice.eventId}`,
-      ...(notice.change === 'created' ? { arrival: { from: event?.organizer?.email } } : {}),
+      ...(notice.change === 'created'
+        ? {
+            arrival: {
+              from: affected.find((e) => e.calendarId === notice.calendarId && e.id === notice.eventId)?.event.organizer
+                ?.email,
+            },
+          }
+        : {}),
     })),
   };
 });

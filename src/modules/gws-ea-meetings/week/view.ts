@@ -3,7 +3,7 @@ import { findConversationSessions } from '../../../db/sessions.js';
 import { sessionDir } from '../../../session-manager.js';
 import { getMainAgentGroupId } from '../../gws-ea-profile/db.js';
 import type { Timeline } from '../../gws-ea-whereabouts/timeline.js';
-import { checkWeek, presentFinding, type FindingAcknowledgement } from './checker.js';
+import { checkWeek, presentFinding } from './checker.js';
 import { calendarText, digest, presentWeek, type Week } from './model.js';
 
 export const WEEK_VIEW_NAME = 'week-view.json';
@@ -12,11 +12,12 @@ const VIEW_MAX_BYTES = 1_048_576;
 export interface ViewEntry {
   readonly id: string;
   readonly text: string;
-  readonly version?: string;
+  readonly version: string;
 }
 export interface ViewDay {
   readonly date: string;
   readonly header: string;
+  readonly version: string;
   readonly entries: readonly ViewEntry[];
 }
 export interface WeekView {
@@ -25,9 +26,14 @@ export interface WeekView {
   readonly asOf: string;
   readonly text: string;
   readonly days: readonly ViewDay[];
-  readonly manual: string;
+  /** The Manual's current sections; the hook prints only those its session does not already hold. */
+  readonly manual: readonly string[];
   readonly timeline: Timeline;
 }
+
+const WRAPPER_ID = /(<<<(?:END_)?EXTERNAL_UNTRUSTED_CONTENT) id="[0-9a-f]+">>>/gu;
+/** Every render wraps untrusted text under fresh random ids, so a version digests the text without them. */
+const versionOf = (text: string): string => digest(text.replace(WRAPPER_ID, '$1>>>'));
 
 function presentedTimeline(timeline: Timeline): Timeline {
   return {
@@ -40,48 +46,41 @@ function presentedTimeline(timeline: Timeline): Timeline {
   };
 }
 
-export function renderWeekView(
-  week: Week,
-  acknowledgements: readonly FindingAcknowledgement[],
-  asOf: string,
-  manual: string,
-): WeekView {
+export function renderWeekView(week: Week, asOf: string, manual: readonly string[]): WeekView {
   const shown = presentWeek(week);
-  const findings = checkWeek(week, acknowledgements);
-  const allDays = shown.days.slice(0, 8).map(
-    (day): ViewDay => ({
+  const findings = checkWeek(week);
+  const entry = (id: string, text: string): ViewEntry => ({ id, text, version: versionOf(text) });
+  const allDays = shown.days.slice(0, 8).map((day): ViewDay => {
+    const header = `${day.date} — ${day.locality ?? 'place unknown'} (${day.zone ?? 'zone unknown'})\nWorking hours: ${day.workingHours ? `${day.workingHours.start}-${day.workingHours.end}` : 'not working'} (${day.workingHoursZone ?? 'zone unknown'})${day.workingHoursDefault ? '; default hours' : ''}\nKept time: ${day.keptTime.length ? day.keptTime.map((time) => `${time.start}-${time.end}`).join(', ') : 'none recorded'}`;
+    return {
       date: day.date,
-      header: `${day.date} — ${day.locality ?? 'place unknown'} (${day.zone ?? 'zone unknown'})\nWorking hours: ${day.workingHours ? `${day.workingHours.start}-${day.workingHours.end}` : 'not working'} (${day.workingHoursZone ?? 'zone unknown'})${day.workingHoursDefault ? '; default hours' : ''}\nKept time: ${day.keptTime.length ? day.keptTime.map((time) => `${time.start}-${time.end}`).join(', ') : 'none recorded'}`,
+      header,
+      version: versionOf(header),
       entries: [
-        ...day.events.map(
-          (event): ViewEntry => ({
-            id: `event:${event.key}`,
-            text: `${event.start} to ${event.end}: ${event.title}${event.location ? `; place: ${event.location}` : ''}; event ${event.id} on calendar ${event.calendarId}`,
-          }),
+        ...day.events.map((event) =>
+          entry(
+            `event:${event.key}`,
+            `${event.start} to ${event.end}: ${event.title}${event.location ? `; place: ${event.location}` : ''}; event ${event.id} on calendar ${event.calendarId}`,
+          ),
         ),
-        ...day.moves.map(
-          (move): ViewEntry => ({
-            id: `move:${move.previousEventKey ?? 'start'}:${move.eventKey}`,
-            text: `Move: ${move.from.label} to ${move.to.label}; ${move.minutes ?? 'unknown'} minutes${move.reserved ? '; time reserved' : '; no reserved time'}`,
-          }),
+        ...day.moves.map((move) =>
+          entry(
+            `move:${move.previousEventKey ?? 'start'}:${move.eventKey}`,
+            `Move: ${move.from.label} to ${move.to.label}; ${move.minutes ?? 'unknown'} minutes${move.reserved ? '; time reserved' : '; no reserved time'}`,
+          ),
         ),
-        ...day.matters.map(
-          (matter): ViewEntry => ({
-            id: `matter:${matter.id}`,
-            text: `Matter ${matter.id}: ${matter.title}${matter.due ? `; due ${matter.due}` : ''}${matter.needsMinutes ? `; needs ${matter.needsMinutes} minutes` : ''}`,
-          }),
+        ...day.matters.map((matter) =>
+          entry(
+            `matter:${matter.id}`,
+            `Matter ${matter.id}: ${matter.title}${matter.due ? `; due ${matter.due}` : ''}${matter.needsMinutes ? `; needs ${matter.needsMinutes} minutes` : ''}`,
+          ),
         ),
         ...findings
           .filter((finding) => finding.day === day.date || (finding.day === null && day === shown.days[0]))
-          .map(
-            (finding): ViewEntry => ({
-              id: `finding:${finding.key}`,
-              text: `Finding: ${presentFinding(finding, week)}`,
-            }),
-          ),
+          .map((finding) => entry(`finding:${finding.key}`, `Finding: ${presentFinding(finding, week)}`)),
       ],
-    }),
-  );
+    };
+  });
   const headers = allDays.map((day) => day.header).join('\n\n');
   let allowance = Math.max(0, VIEW_CHARACTERS - headers.length - 300);
   const shownEntries = allDays.map((): ViewEntry[] => []);
@@ -134,13 +133,30 @@ export function renderWeekView(
   const days = allDays.map((day, index): ViewDay => {
     const retained = day.entries.filter((_, entry) => selected[index].has(entry));
     const omitted = day.entries.filter((_, entry) => !selected[index].has(entry));
-    return { ...day, entries: [...retained, ...(omitted.length ? [footer(omitted.length, digest(omitted))] : [])] };
+    return {
+      ...day,
+      entries: [
+        ...retained,
+        ...(omitted.length ? [footer(omitted.length, digest(omitted.map((entry) => entry.version)))] : []),
+      ],
+    };
   });
-  return envelope(days, digest([days, manual, timeline]));
+  return envelope(
+    days,
+    digest([
+      asOf,
+      days.map((day) => [day.date, day.version, day.entries.map((entry) => [entry.id, entry.version])]),
+      manual,
+      week.timeline.version,
+    ]),
+  );
 }
 
-/** Publish every conversation before the matching change note can wake any of them. */
-export async function writeWeekView(view: WeekView): Promise<void> {
+/**
+ * Publish every conversation before the matching change note can wake any of them. A view whose version is
+ * unchanged goes only to sessions that have none yet.
+ */
+export async function writeWeekView(view: WeekView, unchanged = false): Promise<void> {
   const main = await getMainAgentGroupId();
   if (!main) return;
   const bytes = JSON.stringify(view) + '\n';
@@ -148,7 +164,7 @@ export async function writeWeekView(view: WeekView): Promise<void> {
     const dir = AnchoredDir.open(sessionDir(main, session.id), [], true);
     if (!dir) throw new Error('The conversation directory is unavailable');
     try {
-      dir.replaceFile(WEEK_VIEW_NAME, bytes);
+      if (!unchanged || !dir.entries().includes(WEEK_VIEW_NAME)) dir.replaceFile(WEEK_VIEW_NAME, bytes);
     } finally {
       dir.close();
     }

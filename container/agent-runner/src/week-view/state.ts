@@ -7,17 +7,19 @@ export const WEEK_VIEW_STATE_DIR = '/workspace/.week-view-delivered';
 export interface ViewEntry {
   readonly id: string;
   readonly text: string;
-  readonly version?: string;
+  readonly version: string;
 }
 export interface ViewDay {
   readonly date: string;
   readonly header: string;
+  readonly version: string;
   readonly entries: readonly ViewEntry[];
 }
 export interface DeliveredView {
   readonly fingerprint: string;
   readonly days: readonly ViewDay[];
-  readonly manual: string;
+  /** The Manual sections this session holds, from its project document or from this hook. */
+  readonly manual: readonly string[];
 }
 export const fingerprint = (value: unknown): string => createHash('sha256').update(JSON.stringify(value)).digest('hex');
 const file = (id: string, dir: string) => path.join(dir, fingerprint(id));
@@ -27,7 +29,7 @@ export function readDelivered(id: string, dir = WEEK_VIEW_STATE_DIR): DeliveredV
     if (
       !isRecord(value) ||
       typeof value.fingerprint !== 'string' ||
-      typeof value.manual !== 'string' ||
+      !validSections(value.manual) ||
       !validDays(value.days)
     )
       return undefined;
@@ -52,6 +54,9 @@ export function recordDelivered(id: string, snapshot: DeliveredView, dir = WEEK_
 export function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
+export function validSections(value: unknown): value is string[] {
+  return Array.isArray(value) && value.every((section) => typeof section === 'string');
+}
 export function validDays(value: unknown): value is ViewDay[] {
   return (
     Array.isArray(value) &&
@@ -61,13 +66,14 @@ export function validDays(value: unknown): value is ViewDay[] {
         isRecord(day) &&
         typeof day.date === 'string' &&
         typeof day.header === 'string' &&
+        typeof day.version === 'string' &&
         Array.isArray(day.entries) &&
         day.entries.every(
           (entry: unknown) =>
             isRecord(entry) &&
             typeof entry.id === 'string' &&
             typeof entry.text === 'string' &&
-            (entry.version === undefined || typeof entry.version === 'string'),
+            typeof entry.version === 'string',
         ),
     )
   );

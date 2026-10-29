@@ -1,4 +1,7 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
+import { log } from '../../../log.js';
+import { affectedPeople } from '../days.js';
+import { checkWeek } from './checker.js';
 import { buildWeek, presentWeek } from './model.js';
 import { event, input, timeline } from './testing/fixture.js';
 
@@ -51,7 +54,7 @@ describe('the coming days', () => {
     expect(model.events).toHaveLength(2);
     expect(model.events.map((entry) => entry.copies.length)).toEqual([1, 1]);
   });
-  it('retains overnight busy spans intersecting a next-day-only read with exclusive midnight boundaries', () => {
+  it('places an overnight span still running at the range start on that first day, with exclusive midnight boundaries', () => {
     const model = buildWeek(
       input(
         [
@@ -63,7 +66,8 @@ describe('the coming days', () => {
       ),
     );
     expect(model.events.map((entry) => entry.id)).toEqual(['overnight']);
-    expect(model.days.flatMap((day) => day.events)).toEqual([]);
+    expect(model.days.flatMap((day) => day.events).map((entry) => entry.id)).toEqual(['overnight']);
+    expect(model.days[0].moves).toEqual([]);
   });
   it('places an overnight flight exactly once by its start clock and shows the true last all-day date', () => {
     const model = buildWeek(
@@ -186,6 +190,11 @@ it('distinguishes absent history from a verified no-meetings window for someone 
     metInSixMonths: null,
   });
   expect(buildWeek(input([commitment], { history: [] })).events[0].involvement.guests[0]).toMatchObject({
+    meetings: null,
+    metInSixMonths: null,
+  });
+  const counted = [{ identity: 'email:remy@vance.example', meetings: 0, last_meeting: null }];
+  expect(buildWeek(input([commitment], { history: counted })).events[0].involvement.guests[0]).toMatchObject({
     hasPeopleRecord: false,
     level: 'unknown',
     meetings: 0,
@@ -204,15 +213,80 @@ it('keeps an overlapping all-day span visible through its real last day, includi
   ]);
 });
 
-it('accepts cancelled tombstones without losing live data, and rejects malformed live detail', () => {
+it('accepts cancelled tombstones and leaves out, with a log line, only a span it cannot read', () => {
+  const warn = vi.spyOn(log, 'warn').mockImplementation(() => undefined);
   const valid = event('valid', '2026-10-05T16:00:00Z', '2026-10-05T17:00:00Z');
   const gone = {
     calendarId: 'morgan@ellery.example',
     owner: 'principal' as const,
     event: { id: 'gone', status: 'cancelled' },
   };
-  expect(buildWeek(input([valid, gone])).events.map((e) => e.id)).toEqual(['valid']);
-  expect(() => buildWeek(input([{ ...gone, event: { id: 'broken', status: 'confirmed' } }]))).toThrow(/readable/u);
+  const backwards = event('backwards', '2026-10-05T18:00:00Z', '2026-10-05T17:00:00Z');
+  const broken = { ...gone, event: { id: 'broken', status: 'confirmed' } };
+  expect(buildWeek(input([valid, gone, broken, backwards])).events.map((e) => e.id)).toEqual(['valid']);
+  expect(warn.mock.calls.map(([, fields]) => fields)).toEqual([
+    { calendarId: 'morgan@ellery.example', eventId: 'broken' },
+    { calendarId: 'morgan@ellery.example', eventId: 'backwards' },
+  ]);
+  warn.mockRestore();
+});
+
+it('keeps an event whose end equals its start as an instant that shows but holds no time', () => {
+  const deadline = event('deadline', '2026-10-05T19:00:00Z', '2026-10-05T19:00:00Z', { summary: 'Filing deadline' });
+  const lunch = event('lunch', '2026-10-05T18:30:00Z', '2026-10-05T20:00:00Z');
+  const week = buildWeek(input([deadline, lunch]));
+  expect(week.days[0].events.map((e) => [e.id, e.busy])).toEqual([
+    ['lunch', true],
+    ['deadline', false],
+  ]);
+  expect(checkWeek(week).filter((f) => f.eventKeys.includes('morgan@ellery.example/deadline'))).toEqual([]);
+  const midnight = event('midnight', '2026-10-06T07:00:00Z', '2026-10-06T07:00:00Z');
+  expect(
+    buildWeek(input([midnight]))
+      .days.filter((day) => day.events.length)
+      .map((day) => day.date),
+  ).toEqual(['2026-10-06']);
+});
+
+it('counts no one on a principal secondary calendar that organizes its own event', () => {
+  const family = {
+    ...event('swim', '2026-10-05T23:00:00Z', '2026-10-06T00:00:00Z', {
+      summary: 'Swim lesson',
+      organizer: { email: 'c_0f1e2d3c@group.calendar.google.com', self: true },
+      creator: { email: 'morgan@ellery.example' },
+    }),
+    calendarId: 'c_0f1e2d3c@group.calendar.google.com',
+  };
+  const week = buildWeek(input([family]));
+  expect(week.events[0].involvement).toMatchObject({ onlyPrincipal: true, guests: [] });
+  expect(checkWeek(week).map((f) => f.kind)).not.toContain('attendance-missing');
+  expect(affectedPeople(week.events[0], week)).toMatch(/^No one else is affected/u);
+});
+
+it('leaves saved place labels and main-recorded localities plain', () => {
+  const brussels = {
+    ...timeline,
+    stays: [
+      {
+        ids: ['said'],
+        sourceEventIds: [],
+        placeId: null,
+        locality: 'Brussels',
+        zone: 'Europe/Brussels',
+        start: Date.parse('2026-10-04T00:00Z'),
+        end: Date.parse('2026-10-08T00:00Z'),
+        certainty: 'certain' as const,
+        workingHours: 'local' as const,
+        derived: false,
+      },
+    ],
+  };
+  const office = presentWeek(
+    buildWeek(input([event('e', '2026-10-05T16:00Z', '2026-10-05T17:00Z', { location: 'Office' })])),
+  );
+  expect(office.days[0].locality).toBe('San Francisco');
+  expect(office.days[0].moves[0]).toMatchObject({ from: { label: 'Home' }, to: { label: 'Office' } });
+  expect(presentWeek(buildWeek(input([], { timeline: brussels }))).days[0].locality).toBe('Brussels');
 });
 
 it('neutralizes calendar-derived locality text in both the day and its move origin', () => {

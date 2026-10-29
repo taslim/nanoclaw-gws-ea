@@ -10,21 +10,22 @@ import { getSchedulingPreferenceValues } from '../gws-ea-preferences/db.js';
 import { getGwsEaProfile, principalRecognizer } from '../gws-ea-profile/db.js';
 import { assistantAddresses } from '../gws-ea-inbox/runtime.js';
 import { isPrincipalCalendar } from '../gws-ea-inbox/calendar-notifications.js';
+import { normalizeAddress } from '../gws-ea-inbox/mime.js';
 import { boundary, dateString, isDate, nextDate, parseDate, wallClock, zonedIso } from '../gws-ea-whereabouts/clock.js';
 import { loadTimeline, zoneAt, zoneForDay, type Timeline } from '../gws-ea-whereabouts/timeline.js';
 import type { DetailedEvent, MeetingsCalendarApi } from './calendar-api.js';
+import { createCalendarFactTools, MAX_PEOPLE_ASKED } from './calendar-facts.js';
 import { addressesOf, flagOf, instantOf, lineOf } from './fields.js';
-import { isPrincipalAttendee, principalAnswer } from './slots.js';
-import { loadAcknowledgements } from './week/acks.js';
 import { checkWeek, presentFinding } from './week/checker.js';
 import {
   buildWeek,
   calendarText,
   presentWeek,
   type EventCopy,
-  type MeetingHistory,
+  type InvolvedPerson,
   type Week,
   type WeekEvent,
+  type WeekInput,
 } from './week/model.js';
 
 const DAY = 86_400_000;
@@ -86,68 +87,9 @@ export async function loadCalendarWeek(calendar: MeetingsCalendarApi, options: C
   const matterIds = summaries.flatMap((m) => [m.id, ...m.strands.map((s) => s.id)]);
   const matters = (await Promise.all(matterIds.map(getMatter))).filter((m) => m !== undefined);
   const tasks = await findTasks(matters.flatMap((m) => (m.look_task_id ? [m.look_task_id] : [])));
-  let history: MeetingHistory[] | undefined;
-  if (options.shaping) {
-    /* eslint-disable no-catch-all/no-catch-all -- an unavailable history is unknown, never zero meetings or a failed write */
-    try {
-      const historyCalendars = options.eventSnapshot
-        ? (await calendar.listCalendars()).filter((entry) => isPrincipalCalendar(entry, principal))
-        : calendars;
-      if (historyCalendars.length === 0)
-        throw new Error('No principal calendars were available to verify meeting history');
-      const now = Date.now();
-      const since = now - 183 * DAY;
-      const assistant = await assistantAddresses();
-      const seen = new Set<string>();
-      const tally = new Map<string, { meetings: number; last: number }>();
-      for (const entry of historyCalendars)
-        for (const e of await calendar.listEventDetails(
-          entry.id,
-          new Date(since).toISOString(),
-          new Date(now).toISOString(),
-        )) {
-          const at = Date.parse(e.start?.dateTime ?? `${e.start?.date ?? ''}T00:00:00Z`);
-          const original = e.originalStartTime ?? e.start;
-          const key = `${e.iCalUID ?? `${entry.id}/${e.id}`}|${original?.date ?? (original?.dateTime ? Date.parse(original.dateTime) : '')}`;
-          if (
-            at < since ||
-            at >= now ||
-            !Number.isFinite(at) ||
-            seen.has(key) ||
-            e.status === 'cancelled' ||
-            e.attendeesOmitted ||
-            (e.attendees ?? []).filter((a) => !a.resource).length > 8
-          )
-            continue;
-          if (
-            !principal.has(e.organizer?.email) &&
-            e.organizer?.self !== true &&
-            principalAnswer(e, principal) !== 'accepted'
-          )
-            continue;
-          seen.add(key);
-          for (const email of new Set(
-            (e.attendees ?? [])
-              .filter((a) => !a.resource && !isPrincipalAttendee(a, principal) && a.email && !assistant.has(a.email))
-              .flatMap((a) => a.email ?? []),
-          )) {
-            const held = tally.get(email) ?? { meetings: 0, last: 0 };
-            tally.set(email, { meetings: held.meetings + 1, last: Math.max(at, held.last) });
-          }
-        }
-      history = [...tally].map(([email, value]) => ({
-        identity: `email:${email}`,
-        meetings: value.meetings,
-        last_meeting: dateString(wallClock(value.last, zoneAt(timeline, value.last) ?? 'UTC')),
-      }));
-    } catch (error) {
-      log.warn('Calendar shaping history unavailable', { error });
-    }
-    /* eslint-enable no-catch-all/no-catch-all */
-  }
   const first = dateString(wallClock(options.start, zoneAt(timeline, options.start) ?? 'UTC'));
   const last = dateString(wallClock(options.end - 1, zoneAt(timeline, options.end - 1) ?? 'UTC'));
-  return buildWeek({
+  const input: WeekInput = {
     now: options.start,
     timeline,
     principal,
@@ -172,16 +114,41 @@ export async function loadCalendarWeek(calendar: MeetingsCalendarApi, options: C
       checkInAt: matter.look_task_id ? (tasks.get(matter.look_task_id)?.task.processAfter ?? null) : null,
     })),
     privateValues: Object.fromEntries(privateValues.map((v) => [v.id, v.value])),
-    ...(history === undefined ? {} : { history }),
     dayCount: Math.max(1, Math.round((Date.parse(last) - Date.parse(first)) / DAY) + 1),
-  });
+  };
+  const week = buildWeek(input);
+  if (!options.shaping) return week;
+  // The week names who each commitment involves; people_stats then counts exactly those people.
+  const involved = [
+    ...week.events.flatMap((e) => [...e.involvement.guests, ...e.involvement.named]),
+    ...week.matters.flatMap((m) => m.involvement.linked),
+  ];
+  const emails = [
+    ...new Set(
+      involved
+        .flatMap((p) => [p.identity, ...(people.find((record) => record.id === p.personId)?.identities ?? [])])
+        .flatMap((identity) => (identity.startsWith('email:') ? (normalizeAddress(identity.slice(6)) ?? []) : [])),
+    ),
+  ].slice(0, MAX_PEOPLE_ASKED);
+  if (emails.length === 0) return week;
+  /* eslint-disable no-catch-all/no-catch-all -- an unavailable history is unknown, never zero meetings or a failed write */
+  try {
+    const stats = await createCalendarFactTools({ calendar: () => calendar, timeline }).peopleStats({ people: emails });
+    return buildWeek({
+      ...input,
+      history: stats.people.map((p) => ({ identity: p.identity, meetings: p.meetings, last_meeting: p.last_meeting })),
+    });
+  } catch (error) {
+    log.warn('Calendar shaping history unavailable', { error });
+    return week;
+  }
+  /* eslint-enable no-catch-all/no-catch-all */
 }
 const responseWords = (status: string | null | undefined): string =>
   status && ['accepted', 'tentative', 'declined', 'needsAction'].includes(status) ? status : 'not recorded';
-function personWords(person: WeekEvent['involvement']['guests'][number]): string {
+const who = (person: InvolvedPerson): string => calendarText(person.name ?? person.identity);
+function personFacts(person: InvolvedPerson): string {
   return [
-    calendarText(person.name ?? person.identity),
-    `response: ${responseWords(person.response)}`,
     `people record: ${person.hasPeopleRecord ? 'yes' : 'no'}`,
     `relationship: ${person.level}`,
     person.meetings === null
@@ -200,10 +167,23 @@ export function affectedPeople(event: WeekEvent, week: Week): string {
         : event.event.organizer?.email
           ? `Organizer: ${calendarText(event.event.organizer.email)}.`
           : 'Organizer not shown.';
+  const matters = week.matters.filter((m) =>
+    m.matter.links.some((l) => l.kind === 'event' && l.reference === event.key),
+  );
+  const people = [
+    ...event.involvement.guests.map(
+      (p) => `Guest: ${who(p)}; response: ${responseWords(p.response)}; ${personFacts(p)}.`,
+    ),
+    ...event.involvement.named.map(
+      (p) =>
+        `Names ${who(p)}; not on the invite${principalCreated ? ' of an event the principal created' : creator?.email ? `; creator: ${calendarText(creator.email)}` : '; creator not shown'}; ${personFacts(p)}.`,
+    ),
+    ...matters.flatMap((m) =>
+      m.involvement.linked.map((p) => `${who(p)}: linked to matter ${m.matter.title}; ${personFacts(p)}.`),
+    ),
+  ];
   return boundedCalendarMessage(
-    event.involvement.onlyPrincipal
-      ? 'No one else is affected; only the principal is involved.'
-      : 'People this affects:',
+    people.length === 0 ? 'No one else is affected; only the principal is involved.' : 'People this affects:',
     [
       organizer,
       ...(event.principalRole === 'guest'
@@ -213,14 +193,8 @@ export function affectedPeople(event: WeekEvent, week: Week): string {
               : 'The principal is a guest; a move is a request to the organizer unless Google permits the edit.',
           ]
         : []),
-      ...event.involvement.guests.map((p) => `Guest: ${personWords(p)}.`),
-      ...event.involvement.named.map(
-        (p) =>
-          `${personWords(p)}; named but not on the invite${principalCreated ? ' of an event the principal created' : creator?.email ? `; creator: ${calendarText(creator.email)}` : '; creator not shown'}.`,
-      ),
-      ...week.matters
-        .filter((m) => m.matter.links.some((l) => l.kind === 'event' && l.reference === event.key))
-        .flatMap((m) => m.involvement.linked.map((p) => `Matter commitment with: ${personWords(p)}.`)),
+      ...matters.filter((m) => m.involvement.linked.length === 0).map((m) => `Linked to matter ${m.matter.title}.`),
+      ...people,
     ],
     8_000,
   );
@@ -234,35 +208,38 @@ function filterEvents(events: readonly WeekEvent[], filter?: string): WeekEvent[
         .includes(filter.toLowerCase()),
   );
 }
+/** Renders the week's events, each once, in the order and on the day the presented days place it. */
 export function renderDays(week: Week, filter?: string): string {
   const shown = presentWeek(week);
-  const selected = filterEvents(week.events, filter);
-  const presentations = new Map<string, (typeof shown.days)[number]['events'][number]>();
-  for (const day of shown.days)
-    for (const event of day.events) if (!presentations.has(event.key)) presentations.set(event.key, event);
-  const lines = selected.map((e) => {
-    const p = presentations.get(e.key);
-    if (!p) throw new Error('Calendar event missing from presentation');
-    return [
-      e.allDay
-        ? `${e.day}${e.day === e.lastDay ? '' : ` to ${e.lastDay}`}, all day`
-        : `${p.start} to ${p.end} (${e.zone ?? 'zone unknown'})`,
-      `event ${e.id} on calendar ${e.calendarId}`,
-      p.title,
-      ...(p.location ? [`Place: ${p.location}`] : []),
-      ...(p.description ? [`Notes: ${p.description}`] : []),
-      ...(p.creator ? [`Creator: ${p.creator.name ?? ''} ${p.creator.email ?? ''}`] : []),
-      `Organizer: ${p.organizer ?? 'not shown'}`,
-      ...(e.event.attendees ?? []).map(
-        (a) =>
-          `Attendee: ${calendarText(a.displayName ?? a.email ?? 'unknown')}${a.displayName && a.email ? ` ${calendarText(a.email)}` : ''}; ${responseWords(a.responseStatus)}${a.self ? ' (this calendar’s own response)' : ''}`,
-      ),
-    ].join('\n');
-  });
-  return boundedCalendarMessage(`${selected.length} events across ${week.days.length} local days.`, lines);
+  const selected = new Set(filterEvents(week.events, filter).map((e) => e.key));
+  const lines = week.days.flatMap((day, index) =>
+    day.events.flatMap((e, position) => {
+      if (!selected.delete(e.key)) return [];
+      const p = shown.days[index].events[position];
+      return [
+        [
+          e.allDay
+            ? `${e.day}${e.day === e.lastDay ? '' : ` to ${e.lastDay}`}, all day`
+            : `${p.start} to ${p.end} (${e.zone ?? 'zone unknown'})`,
+          `event ${e.id} on calendar ${e.calendarId}`,
+          p.title,
+          ...(p.location ? [`Place: ${p.location}`] : []),
+          ...(p.description ? [`Notes: ${p.description}`] : []),
+          ...(p.creator ? [`Creator: ${p.creator.name ?? ''} ${p.creator.email ?? ''}`] : []),
+          `Organizer: ${p.organizer ?? 'not shown'}`,
+          ...(e.event.attendees ?? []).map(
+            (a) =>
+              `Attendee: ${calendarText(a.displayName ?? a.email ?? 'unknown')}${a.displayName && a.email ? ` ${calendarText(a.email)}` : ''}; ${responseWords(a.responseStatus)}${a.self ? ' (this calendar’s own response)' : ''}`,
+          ),
+        ].join('\n'),
+      ];
+    }),
+  );
+  return boundedCalendarMessage(`${lines.length} events across ${week.days.length} local days.`, lines);
 }
+// Async for its callers, which await it beside reads.
 export async function calendarFindings(week: Week): Promise<string> {
-  const findings = checkWeek(week, await loadAcknowledgements());
+  const findings = checkWeek(week);
   return boundedCalendarMessage(
     `Findings for ${week.days.map((d) => d.date).join(', ')}:`,
     findings.length ? findings.map((f) => presentFinding(f, week)) : ['No findings.'],

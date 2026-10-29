@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 
+import { log } from '../../../log.js';
 import { untrustedLine } from '../../gws-ea-inbox/untrusted.js';
 import type { Matter } from '../../gws-ea-matters/db.js';
 import { resolveMatterDueAt } from '../../gws-ea-matters/planning.js';
@@ -27,9 +28,6 @@ export const WEEK_TAGS = {
   parentStart: 'gws_ea_parent_start',
   blockKind: 'gws_ea_block_kind',
   matter: 'gws_ea_matter_id',
-  flight: 'gws_ea_flight',
-  previousFlight: 'gws_ea_previous_flight',
-  connectionMinutes: 'gws_ea_connection_minutes',
   assistantWritten: 'gws_ea_assistant_written',
   meetingKind: 'gws_ea_meeting_kind',
 } as const;
@@ -37,7 +35,6 @@ export interface EventCopy {
   readonly calendarId: string;
   readonly event: DetailedEvent;
   readonly owner: 'principal' | 'assistant';
-  readonly assistantWritten?: boolean;
 }
 export interface MatterInput {
   readonly matter: Matter;
@@ -48,14 +45,7 @@ export interface MeetingHistory {
   readonly meetings: number;
   readonly last_meeting: string | null;
 }
-export interface DeletedBlock {
-  readonly parentEventId: string;
-  readonly parentCalendarId?: string;
-  readonly kind: 'travel' | 'prep' | 'preflight';
-  readonly actor: 'principal' | 'unknown';
-}
 export interface WeekInput {
-  readonly deletedBlocks?: readonly DeletedBlock[];
   readonly now: number;
   readonly timeline: Timeline;
   readonly events: readonly EventCopy[];
@@ -64,7 +54,7 @@ export interface WeekInput {
   readonly preferences: SchedulingPreferenceValues;
   readonly matters: readonly MatterInput[];
   readonly people: readonly PersonSummary[];
-  /** Loaded only for a shaping answer, never by the view refresher. Absence is unknown, not zero meetings. */
+  /** Loaded only for a shaping answer, never by the view refresher. A person absent from it is unknown, not zero meetings. */
   readonly history?: readonly MeetingHistory[];
   readonly privateValues?: Readonly<Record<string, string>>;
   readonly dayCount?: number;
@@ -135,7 +125,6 @@ export interface WeekDay {
 }
 export interface Week {
   readonly cancelledEventKeys: readonly string[];
-  readonly deletedBlocks: readonly DeletedBlock[];
   readonly now: number;
   readonly timeline: Timeline;
   readonly preferences: SchedulingPreferenceValues;
@@ -161,6 +150,25 @@ const weekdays: readonly Weekday[] = ['sun', 'mon', 'tue', 'wed', 'thu', 'fri', 
 export const weekdayOf = (date: string): Weekday => weekdays[new Date(`${date}T00:00:00Z`).getUTCDay()];
 export const calendarText = (text: string, limit = 200): string => untrustedLine(text, limit, 'google_calendar');
 const normalized = (text: string): string => text.normalize('NFKC').toLowerCase();
+const HOME_NOT_SET = 'home not set';
+
+/** The event's span on the timeline's clock, or undefined when Google gave no readable time. An instant ends at its start. */
+export function spanOf(event: DetailedEvent, timeline: Timeline): Span | undefined {
+  const start = Date.parse(event.start?.dateTime ?? '');
+  const zone = event.start?.date
+    ? zoneForDay(timeline, event.start.date)
+    : Number.isFinite(start)
+      ? zoneAt(timeline, start)
+      : null;
+  const span = eventSpan(event, zone ?? event.start?.timeZone ?? 'UTC');
+  return span && Number.isFinite(span.start) && Number.isFinite(span.end) && span.end >= span.start ? span : undefined;
+}
+/** Whether the span holds any of the window; an instant belongs to the window holding its start. */
+export function inWindow(span: Span, window: Span): boolean {
+  return (
+    span.start < window.end && (span.end > window.start || (span.end === span.start && span.start >= window.start))
+  );
+}
 
 function personFact(
   identity: string,
@@ -172,15 +180,16 @@ function personFact(
   const person = input.people.find(
     (p) => p.id === identity || p.identities.some((i) => normalized(i) === normalized(identity)),
   );
-  const stats = input.history?.find((s) => normalized(s.identity) === normalized(identity));
+  const keys = new Set([identity, ...(person?.identities ?? [])].map(normalized));
+  const stats = input.history?.find((s) => keys.has(normalized(s.identity)));
   return {
     identity,
     name: name ?? person?.name ?? null,
     personId: person?.id ?? null,
     hasPeopleRecord: person !== undefined,
     level: person?.level ?? 'unknown',
-    meetings: input.history === undefined ? null : (stats?.meetings ?? 0),
-    metInSixMonths: input.history === undefined ? null : (stats?.meetings ?? 0) > 0,
+    meetings: stats?.meetings ?? null,
+    metInSixMonths: stats === undefined ? null : stats.meetings > 0,
     lastMeeting: stats?.last_meeting ?? null,
     response,
     organizer,
@@ -203,6 +212,7 @@ function involvement(event: DetailedEvent, input: WeekInput): Involvement {
     );
   if (
     event.organizer?.email &&
+    event.organizer.self !== true &&
     !input.principal.has(event.organizer.email) &&
     !guests.some((g) => g.identity === `email:${event.organizer?.email}`)
   )
@@ -262,7 +272,7 @@ function comparable(copy: EventCopy): string {
     (e.attendees ?? []).map((a) => a.email).sort(),
   ]);
 }
-function eventFrom(copies: readonly EventCopy[], input: WeekInput): WeekEvent {
+function eventFrom(copies: readonly EventCopy[], input: WeekInput): WeekEvent | undefined {
   const prefixes = input.preferences.ignored_events?.map((p) => p.prefix) ?? [];
   const active = copies.filter((c) => !prefixes.some((p) => c.event.id?.startsWith(p)));
   const copy = [...active].sort(
@@ -272,19 +282,21 @@ function eventFrom(copies: readonly EventCopy[], input: WeekInput): WeekEvent {
       (a.event.id ?? '').localeCompare(b.event.id ?? ''),
   )[0];
   const event = copy.event;
-  const startInstant = Date.parse(event.start?.dateTime ?? '');
-  if (event.start?.date === undefined && !Number.isFinite(startInstant))
-    throw new Error('A calendar detail event has no readable time span');
-  const initialZone = event.start?.date
-    ? zoneForDay(input.timeline, event.start.date)
-    : zoneAt(input.timeline, startInstant);
-  const span = eventSpan(event, initialZone ?? event.start?.timeZone ?? 'UTC');
-  if (!span || !Number.isFinite(span.start) || span.end <= span.start)
-    throw new Error('A calendar detail event has no readable positive time span');
+  const span = spanOf(event, input.timeline);
+  if (!span) {
+    log.warn('Calendar event left out: Google gave no readable time', {
+      calendarId: copy.calendarId,
+      eventId: event.id,
+    });
+    return undefined;
+  }
   const where = whereaboutsAt(input.timeline, span.start);
   const zone = where.zone;
   const day = event.start?.date ?? dateString(wallClock(span.start, zone ?? 'UTC'));
-  const lastDay = event.start?.date ? dateString(wallClock(span.end - 1, initialZone ?? 'UTC')) : day;
+  const lastDay =
+    event.start?.date && event.end?.date && event.end.date > event.start.date
+      ? dateString(wallClock(Date.parse(`${event.end.date}T00:00:00Z`) - 1, 'UTC'))
+      : day;
   const id = event.id ?? digest([copy.calendarId, event]);
   const principalOrganizes =
     input.principal.has(event.organizer?.email) || (copy.owner === 'principal' && event.organizer?.self === true);
@@ -303,13 +315,13 @@ function eventFrom(copies: readonly EventCopy[], input: WeekInput): WeekEvent {
     workingHoursZone: where.workingHoursZone,
     allDay: event.start?.date !== undefined,
     busy:
+      span.end > span.start &&
       (copy.owner === 'principal' ||
         principalOrganizes ||
         (event.attendees ?? []).some((a) => isPrincipalAttendee(a, input.principal))) &&
       blocksTime(event, input.principal),
     place: resolvePlace(event.location, input.timeline, input.privateValues),
     assistantWritten:
-      copy.assistantWritten === true ||
       (copy.owner === 'assistant' && event.creator?.self === true) ||
       event.tags?.[WEEK_TAGS.assistantWritten] === 'true',
     principalRole: principalOrganizes
@@ -336,7 +348,8 @@ export function linkedBlocks(events: readonly WeekEvent[], parent: WeekEvent, ki
     (e) => linked(e, parent) && (kind === undefined || e.event.tags?.[WEEK_TAGS.blockKind] === kind) && e.busy,
   );
 }
-function movesFor(events: readonly WeekEvent[], input: WeekInput): Move[] {
+/** An event already under way when the range starts gives an origin for the next move, never a move of its own. */
+function movesFor(events: readonly WeekEvent[], firstDate: string, input: WeekInput): Move[] {
   const result: Move[] = [];
   let previous: WeekEvent | undefined;
   for (const event of events.filter(
@@ -370,11 +383,11 @@ function movesFor(events: readonly WeekEvent[], input: WeekInput): Move[] {
           : {
               kind: 'unknown' as const,
               id: null,
-              label: where.locality ?? 'home not set',
+              label: where.locality ?? HOME_NOT_SET,
               locality: where.locality,
               home: where.stay === null,
             };
-    if (from.id === null || from.id !== event.place.id) {
+    if (event.day >= firstDate && (from.id === null || from.id !== event.place.id)) {
       const travel = travelBetween(from, event.place, event.id, input.timeline);
       const lower = previous?.end ?? rhythmEnd ?? Number.NEGATIVE_INFINITY;
       const minutes = travel.minutes;
@@ -432,12 +445,12 @@ export function buildWeek(input: WeekInput): Week {
     const zone = zoneForDay(input.timeline, date) ?? 'UTC';
     return { start: boundary(date, zone, 'start'), end: boundary(date, zone, 'end') };
   });
+  const firstDate = dates[0];
+  const lastDate = dates[dates.length - 1];
   const events = [...groups.values()]
-    .map((c) => eventFrom(c, input))
+    .flatMap((c) => eventFrom(c, input) ?? [])
     .filter((e) =>
-      e.allDay
-        ? e.day <= dates[dates.length - 1] && e.lastDay >= dates[0]
-        : windows.some((window) => e.start < window.end && e.end > window.start),
+      e.allDay ? e.day <= lastDate && e.lastDay >= firstDate : windows.some((window) => inWindow(e, window)),
     )
     .sort((a, b) => a.start - b.start || a.key.localeCompare(b.key));
   const matters: WeekMatter[] = input.matters
@@ -472,7 +485,12 @@ export function buildWeek(input: WeekInput): Week {
     const zone = zoneForDay(input.timeline, date);
     const start = zonedInstant(parseDate(date), 0, zone ?? 'UTC');
     const where = whereaboutsAt(input.timeline, start);
-    const onDay = events.filter((e) => (e.allDay ? e.day <= date && date <= e.lastDay : e.day === date));
+    // A timed event already running when the range starts sits on its first day, so it shows exactly once.
+    const onDay = events.filter((e) =>
+      e.allDay
+        ? e.day <= date && date <= e.lastDay
+        : (e.day < firstDate ? firstDate : e.day > lastDate ? lastDate : e.day) === date,
+    );
     return {
       date,
       weekday: weekdayOf(date),
@@ -484,14 +502,13 @@ export function buildWeek(input: WeekInput): Week {
           m.day === date ||
           (m.checkIn !== null && dateString(wallClock(m.checkIn, zoneAt(input.timeline, m.checkIn) ?? 'UTC')) === date),
       ),
-      moves: movesFor(onDay, input),
+      moves: movesFor(onDay, firstDate, input),
     };
   });
   return {
     cancelledEventKeys: input.events
       .filter((copy) => copy.event.status === 'cancelled' && copy.event.id !== undefined)
       .map((copy) => `${copy.calendarId}/${copy.event.id}`),
-    deletedBlocks: input.deletedBlocks ?? [],
     principalAddresses: input.principal.listed,
     now: input.now,
     timeline: input.timeline,
@@ -504,6 +521,16 @@ export function buildWeek(input: WeekInput): Week {
   };
 }
 
+/** Text the host recorded (saved places, stays main recorded, zones) reads plainly; any other place text came from a calendar. */
+export function placeText(text: string, timeline: Timeline): string {
+  const recorded =
+    text === HOME_NOT_SET ||
+    text === timeline.homeZone ||
+    timeline.places.some((p) => p.label === text || p.locality === text) ||
+    timeline.stays.some((s) => s.sourceEventIds.length === 0 && s.locality === text) ||
+    timeline.legs.some((l) => l.departureZone === text);
+  return recorded ? text : calendarText(text);
+}
 function presentedPerson(person: InvolvedPerson) {
   return {
     ...person,
@@ -578,7 +605,7 @@ export function presentWeek(week: Week) {
     days: week.days.map((d) => ({
       date: d.date,
       zone: d.zone,
-      locality: d.locality === null ? null : calendarText(d.locality),
+      locality: d.locality === null ? null : placeText(d.locality, week.timeline),
       workingHoursZone: d.zone
         ? whereaboutsAt(week.timeline, zonedInstant(parseDate(d.date), 0, d.zone)).workingHoursZone
         : null,
@@ -593,13 +620,13 @@ export function presentWeek(week: Week) {
         ...m,
         from: {
           ...m.from,
-          label: calendarText(m.from.label),
-          locality: m.from.locality === null ? null : calendarText(m.from.locality),
+          label: placeText(m.from.label, week.timeline),
+          locality: m.from.locality === null ? null : placeText(m.from.locality, week.timeline),
         },
         to: {
           ...m.to,
-          label: calendarText(m.to.label),
-          locality: m.to.locality === null ? null : calendarText(m.to.locality),
+          label: placeText(m.to.label, week.timeline),
+          locality: m.to.locality === null ? null : placeText(m.to.locality, week.timeline),
         },
       })),
     })),

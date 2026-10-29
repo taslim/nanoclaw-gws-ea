@@ -5,6 +5,7 @@ import {
   calendarText,
   digest,
   linkedBlocks,
+  placeText,
   WEEK_TAGS,
   weekdayOf,
   type Week,
@@ -18,10 +19,8 @@ export const FINDING_KINDS = [
   'travel',
   'travel-unknown',
   'flight-chain',
-  'connection',
   'working-hours',
   'protected-time',
-  'preference',
   'meal',
   'back-to-back',
   'missing-prep',
@@ -45,10 +44,6 @@ export interface Finding {
   readonly message: string;
   readonly facts: Readonly<Record<string, string | number | boolean | null>>;
 }
-export interface FindingAcknowledgement {
-  readonly key: string;
-  readonly version: string;
-}
 const MINUTE = 60000;
 const overlap = (a: Span, b: Span): number => Math.max(0, Math.min(a.end, b.end) - Math.max(a.start, b.start));
 const clock = (text: string): number => {
@@ -69,18 +64,7 @@ function longestGap(window: Span, busy: readonly Span[]): number {
   }
   return Math.max(gap, window.end - edge) / MINUTE;
 }
-const flight = (event: WeekEvent, week: Week): boolean =>
-  event.event.tags?.[WEEK_TAGS.flight] === 'true' || week.timeline.legs.some((l) => l.sourceEventId === event.id);
-
-function deletionFact(week: Week, event: WeekEvent, kind: 'travel' | 'prep'): Finding['facts'] {
-  const evidence = week.deletedBlocks.find(
-    (block) =>
-      block.parentEventId === event.id &&
-      (!block.parentCalendarId || block.parentCalendarId === event.calendarId) &&
-      block.kind === kind,
-  );
-  return evidence ? { deleted_actor: evidence.actor, deleted_kind: evidence.kind } : {};
-}
+const flight = (event: WeekEvent, week: Week): boolean => week.timeline.legs.some((l) => l.sourceEventId === event.id);
 function findingVersion(kind: FindingKind, event: WeekEvent): unknown {
   const time = [event.start, event.end, event.zone, event.workingHoursZone, event.busy];
   switch (kind) {
@@ -89,9 +73,7 @@ function findingVersion(kind: FindingKind, event: WeekEvent): unknown {
     case 'back-to-back':
     case 'working-hours':
     case 'protected-time':
-    case 'preference':
     case 'flight-chain':
-    case 'connection':
       return time;
     case 'travel':
     case 'travel-unknown':
@@ -105,7 +87,6 @@ function findingVersion(kind: FindingKind, event: WeekEvent): unknown {
         event.event.conference,
         event.event.description,
         event.involvement.guests.map((g) => g.identity),
-        event.involvement.named.map((g) => g.identity),
       ];
     case 'copy-disagreement':
       return event.copies.map((copy) => [
@@ -133,8 +114,8 @@ function findingVersion(kind: FindingKind, event: WeekEvent): unknown {
   }
 }
 
-/** Findings report facts; neither this checker nor an acknowledgement authorizes any action. */
-export function checkWeek(week: Week, acks: readonly FindingAcknowledgement[] = []): Finding[] {
+/** Findings report facts; none authorizes any action. */
+export function checkWeek(week: Week): Finding[] {
   const findings: Finding[] = [];
   const add = (
     kind: FindingKind,
@@ -191,11 +172,7 @@ export function checkWeek(week: Week, acks: readonly FindingAcknowledgement[] = 
       if (move.to.home && whereaboutsAt(week.timeline, event.start).stay) continue;
       if (move.reserved || move.minutes === 0) continue;
       if (move.minutes === null) {
-        add('travel-unknown', day.date, [event], 'travel unknown', {
-          place: move.to.label,
-          origin: move.from.label,
-          ...deletionFact(week, event, 'travel'),
-        });
+        add('travel-unknown', day.date, [event], 'travel unknown', { place: move.to.label, origin: move.from.label });
       } else {
         const available = move.availableMinutes;
         const fits = available === null || available >= move.minutes;
@@ -210,7 +187,6 @@ export function checkWeek(week: Week, acks: readonly FindingAcknowledgement[] = 
             source: move.source,
             from: move.from.label,
             to: move.to.label,
-            ...deletionFact(week, event, 'travel'),
           },
         );
       }
@@ -241,16 +217,6 @@ export function checkWeek(week: Week, acks: readonly FindingAcknowledgement[] = 
             `Outside ${week.preferences.working_hours.length ? 'recorded' : 'default window for'} working hours.`,
             { zone: windowZone, default_window: week.preferences.working_hours.length === 0 },
           );
-        const kind = tags?.[WEEK_TAGS.meetingKind] ?? 'default';
-        const preferred = week.preferences.preferred_times.find((p) => p.meeting_kind === kind);
-        if (preferred) {
-          const span = onDay(localDate, preferred.start, preferred.end, windowZone);
-          if (!preferred.weekdays.includes(weekdayOf(localDate)) || e.start < span.start || e.end > span.end)
-            add('preference', day.date, [e], 'Outside the recorded preferred meeting window.', {
-              start: preferred.start,
-              end: preferred.end,
-            });
-        }
       }
       const outside = e.involvement.guests.filter(
         (g) =>
@@ -262,27 +228,16 @@ export function checkWeek(week: Week, acks: readonly FindingAcknowledgement[] = 
         !e.event.description?.trim() &&
         !blocks.some((b) => b.event.tags?.[WEEK_TAGS.blockKind] === 'prep' && b.end <= e.start)
       )
-        add(
-          'missing-prep',
-          day.date,
-          [e],
-          'Meeting has outside guests, no notes and no prep block.',
-          deletionFact(week, e, 'prep'),
-        );
+        add('missing-prep', day.date, [e], 'Meeting has outside guests, no notes and no prep block.');
       if (
         !e.allDay &&
-        e.involvement.guests.length + e.involvement.named.length > 0 &&
+        e.involvement.guests.length > 0 &&
         !e.event.location?.trim() &&
         !e.event.conference?.uri &&
         !e.event.conference?.entryPoints.length &&
         !/(?:https?:\/\/|\+?\d[\d\s().-]{6,})/iu.test(e.event.description ?? '')
       )
-        add(
-          'attendance-missing',
-          day.date,
-          [e],
-          'Commitment with other people gives no place, meeting link or phone number.',
-        );
+        add('attendance-missing', day.date, [e], 'Event with guests gives no place, meeting link or phone number.');
       if (e.assistantWritten) {
         if (e.allDay && e.involvement.guests.length === 0)
           add('all-day-task', day.date, [e], 'Assistant-created all-day event has no guests; it holds no sized time.');
@@ -336,16 +291,6 @@ export function checkWeek(week: Week, acks: readonly FindingAcknowledgement[] = 
           .sort((a, b) => a.start - b.start);
         if (chain.some((b, i) => i > 0 && chain[i - 1].end !== b.start))
           add('flight-chain', day.date, [e, ...chain], 'Flight preparation blocks are not contiguous.');
-        const previous = week.events.find((p) => p.id === tags?.[WEEK_TAGS.previousFlight]);
-        const minimum = Number(tags?.[WEEK_TAGS.connectionMinutes]);
-        if (previous && Number.isFinite(minimum) && minimum > 0 && e.start - previous.end < minimum * MINUTE)
-          add(
-            'connection',
-            day.date,
-            [previous, e],
-            `${(e.start - previous.end) / MINUTE} minutes between flights; ${minimum} minutes recorded as needed.`,
-            { available_minutes: (e.start - previous.end) / MINUTE, minimum_minutes: minimum },
-          );
       }
     }
     mealFindings(day, busy, week, add);
@@ -425,10 +370,9 @@ export function checkWeek(week: Week, acks: readonly FindingAcknowledgement[] = 
         m.id,
       );
   }
-  const known = new Set(acks.map((a) => `${a.key}\0${a.version}`));
-  return [...new Map(findings.map((f) => [`${f.key}\0${f.version}`, f])).values()]
-    .filter((f) => !known.has(`${f.key}\0${f.version}`))
-    .sort((a, b) => (a.day ?? '').localeCompare(b.day ?? '') || a.key.localeCompare(b.key));
+  return [...new Map(findings.map((f) => [`${f.key}\0${f.version}`, f])).values()].sort(
+    (a, b) => (a.day ?? '').localeCompare(b.day ?? '') || a.key.localeCompare(b.key),
+  );
 }
 function mealFindings(
   day: WeekDay,
@@ -478,14 +422,9 @@ export function presentFinding(finding: Finding, week: Week): string {
     const e = week.events.find((e) => e.key === key);
     return e ? [calendarText(e.event.summary ?? '(untitled)')] : [];
   });
-  const places = ['place', 'origin', 'from', 'to'].flatMap((key) =>
-    typeof finding.facts[key] === 'string' ? [`${key}: ${calendarText(String(finding.facts[key]))}`] : [],
-  );
-  const deleted =
-    finding.facts.deleted_actor === 'principal'
-      ? ` The principal deleted a linked ${String(finding.facts.deleted_kind)} block.`
-      : finding.facts.deleted_actor === 'unknown'
-        ? ` Linked ${String(finding.facts.deleted_kind)} block deleted; actor unavailable.`
-        : '';
-  return [finding.message + deleted, ...subjects, ...places].join('\n');
+  const places = ['place', 'origin', 'from', 'to'].flatMap((key) => {
+    const value = finding.facts[key];
+    return typeof value === 'string' ? [`${key}: ${placeText(value, week.timeline)}`] : [];
+  });
+  return [finding.message, ...subjects, ...places].join('\n');
 }

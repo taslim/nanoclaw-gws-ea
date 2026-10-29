@@ -30,7 +30,13 @@ export function resolvePlace(
     ),
   );
   return place
-    ? { kind: 'known', id: place.id, label: place.label, locality: place.locality, home: place.is_home === 1 }
+    ? {
+        kind: 'known',
+        id: place.id,
+        label: place.label,
+        locality: place.locality,
+        home: place.id === timeline.base.home_place_id,
+      }
     : { kind: 'unknown', ...empty };
 }
 export interface TravelFact {

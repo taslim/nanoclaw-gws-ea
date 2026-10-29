@@ -5,9 +5,9 @@
  * call rather than counting as empty, and nothing an agent saved or says it
  * fetched decides the answer.
  *
- * Only the message reaches the agent; `find_conflicts`'s other fields also
- * serve host callers. Titles and names other people wrote come back capped
- * and wrapped as untrusted text, and nothing here reaches external-email.
+ * The conflict read serves host callers. The `people_stats` tool gives main
+ * only its message; host callers take its counts. Titles and names other
+ * people wrote come back capped and wrapped as untrusted text.
  */
 import { forbidden, invalidArgs } from '../../cli/delivery-action.js';
 import { EMAIL_PATTERN, identityMatchKey } from '../../gws-ea/validation.js';
@@ -46,7 +46,7 @@ const HISTORY_DAYS = 183;
 /** A meeting with more people than this says little about any one of them. */
 const MAX_MEETING_SIZE = 8;
 const MAX_LISTED_PEOPLE = 100;
-const MAX_PEOPLE_ASKED = 100;
+export const MAX_PEOPLE_ASKED = 100;
 const MAX_NAME_CHARS = 64;
 const MAX_TITLE_CHARS = 100;
 const MAX_ICAL_UID = 1_024;
@@ -121,7 +121,7 @@ export interface CalendarConflictResult extends Record<string, unknown> {
   message: string;
 }
 
-/** The complete read `find_conflicts` makes, for host callers. */
+/** The complete conflict read, for host callers such as the browser scheduler. */
 export function findPrincipalCalendarConflicts(
   start: string,
   end: string,

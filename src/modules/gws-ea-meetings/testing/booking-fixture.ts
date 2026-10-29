@@ -32,11 +32,9 @@ import { chatBookingRequestsMigration } from '../chat-booking-migration.js';
 import { chatBookingReportsMigration } from '../chat-booking-report-migration.js';
 import { setThreadBookingCalendar } from '../thread-calendar.js';
 import { FakeCalendar } from './fake-calendar.js';
-import { weekAcknowledgementsMigration } from '../week/acks-migration.js';
 import { calendarWriteLogMigration } from '../week/write-log-migration.js';
 import { pendingCalendarChangesMigration } from '../week/pending-changes-migration.js';
 import { calendarSplitRecoveryMigration } from '../week/split-recovery-migration.js';
-import { bookingWriteWindowsMigration } from '../week/booking-writes-migration.js';
 
 export const PRINCIPAL = 'juno@example.com';
 export const ASSISTANT = 'avery@example.com';
@@ -66,11 +64,9 @@ export async function seedBookingFixture(): Promise<BookingFixture> {
     await migration.up(getDb());
   }
   await runMigrations(getDb(), [
-    weekAcknowledgementsMigration,
     calendarWriteLogMigration,
     pendingCalendarChangesMigration,
     calendarSplitRecoveryMigration,
-    bookingWriteWindowsMigration,
   ]);
   const chatSession = seeded.session;
   const chat = chatSession.messaging_group_id ?? '';

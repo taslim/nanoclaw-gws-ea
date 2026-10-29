@@ -124,60 +124,41 @@ describe('factual week findings', () => {
       ).not.toContain('travel-unknown');
     },
   );
-  it.each(['flight-chain', 'connection'] as const)('%s has a positive and a negative measured case', (kind) => {
-    const flight = meeting('flight', '08:15', '11:00', {
-      tags: { gws_ea_flight: 'true', gws_ea_connection_minutes: '60', gws_ea_previous_flight: 'previous' },
-    });
-    const previous = meeting('previous', '04:00', '07:30', { tags: { gws_ea_flight: 'true' } });
+  it('flight-chain has a positive and a negative measured case', () => {
+    const flight = meeting('flight', '08:15', '11:00');
+    const legs = [
+      {
+        sourceEventId: 'flight',
+        departure: Date.parse(at('08:15')),
+        arrival: Date.parse(at('11:00')),
+        departureZone: 'America/Los_Angeles',
+        destinationZone: 'America/Los_Angeles',
+        locality: 'Seattle',
+        returnUnknown: false,
+      },
+    ];
     const travel = meeting('travel', '05:45', '06:30', {
       tags: { gws_ea_parent_event: 'flight', gws_ea_block_kind: 'travel' },
     });
     const prep = meeting('prep', '07:00', '07:45', {
       tags: { gws_ea_parent_event: 'flight', gws_ea_block_kind: 'preflight' },
     });
-    expect(kinds([flight, previous, travel, prep])).toContain(kind);
+    const timelineWithLeg = { ...timeline, legs };
+    expect(kinds([flight, travel, prep], { timeline: timelineWithLeg })).toContain('flight-chain');
     expect(
-      kinds([
-        { ...flight, event: { ...flight.event, start: { dateTime: at('08:45') } } },
-        previous,
-        { ...travel, event: { ...travel.event, end: { dateTime: at('07:00') } } },
-        prep,
-      ]),
-    ).not.toContain(kind);
+      kinds([flight, { ...travel, event: { ...travel.event, end: { dateTime: at('07:00') } } }, prep], {
+        timeline: timelineWithLeg,
+      }),
+    ).not.toContain('flight-chain');
   });
-  it.each(['protected-time', 'preference'] as const)(
-    '%s has a positive and a negative recorded-window case',
-    (kind) => {
-      const provenance = { source: 'principal' as const, updated_at: 'fixed' };
-      const preferences = {
-        ...input().preferences,
-        protected_windows: [{ id: 'p', weekdays: ['mon' as const], start: '09:00', end: '10:00', ...provenance }],
-        preferred_times: [
-          { meeting_kind: 'default', weekdays: ['mon' as const], start: '14:00', end: '16:00', ...provenance },
-        ],
-      };
-      expect(kinds([meeting('e', '09:00', '10:00')], { preferences })).toContain(kind);
-      expect(kinds([meeting('e', '14:00', '15:00')], { preferences })).not.toContain(kind);
-    },
-  );
-  it('acknowledges only the measured event version, unaffected by a guest response', () => {
-    const original = meeting('e', '11:30', '14:00', {
-      attendees: [{ email: 'remy@vance.example', responseStatus: 'needsAction' }],
-    });
-    const model = buildWeek(input([original]));
-    const finding = checkWeek(model).find((f) => f.kind === 'meal')!;
-    expect(checkWeek(model, [finding]).map((f) => f.kind)).not.toContain('meal');
-    const guestReply = {
-      ...original,
-      event: {
-        ...original.event,
-        etag: 'new',
-        attendees: [{ email: 'remy@vance.example', responseStatus: 'accepted' }],
-      },
+  it('protected-time has a positive and a negative recorded-window case', () => {
+    const provenance = { source: 'principal' as const, updated_at: 'fixed' };
+    const preferences = {
+      ...input().preferences,
+      protected_windows: [{ id: 'p', weekdays: ['mon' as const], start: '09:00', end: '10:00', ...provenance }],
     };
-    expect(checkWeek(buildWeek(input([guestReply])), [finding]).map((f) => f.kind)).not.toContain('meal');
-    const moved = { ...original, event: { ...original.event, end: { dateTime: at('14:15') } } };
-    expect(checkWeek(buildWeek(input([moved])), [finding]).map((f) => f.kind)).toContain('meal');
+    expect(kinds([meeting('e', '09:00', '10:00')], { preferences })).toContain('protected-time');
+    expect(kinds([meeting('e', '14:00', '15:00')], { preferences })).not.toContain('protected-time');
   });
   it('a recorded late lunch window clears the default-window finding', () => {
     const preferences = {
@@ -202,10 +183,11 @@ describe('factual week findings', () => {
     expect(kinds([original, copy])).toContain('copy-disagreement');
     expect(kinds([original, { ...copy, event: original.event }])).not.toContain('copy-disagreement');
     const allDay = event('task', '', '', { start: { date: '2026-10-05' }, end: { date: '2026-10-06' } });
-    expect(kinds([{ ...allDay, assistantWritten: true }])).toContain('all-day-task');
+    const written = { gws_ea_assistant_written: 'true' };
+    expect(kinds([{ ...allDay, event: { ...allDay.event, tags: written } }])).toContain('all-day-task');
     expect(kinds([allDay])).not.toContain('all-day-task');
     const address = meeting('address', '09:00', '10:00', { summary: 'Pick up at 42 Cedar Lane' });
-    expect(kinds([{ ...address, assistantWritten: true }])).toContain('address-in-title');
+    expect(kinds([{ ...address, event: { ...address.event, tags: written } }])).toContain('address-in-title');
     expect(kinds([address])).not.toContain('address-in-title');
     const block = meeting('b', '08:00', '09:00', {
       tags: { gws_ea_parent_event: 'e', gws_ea_block_kind: 'travel', gws_ea_parent_start: at('09:00') },
@@ -336,14 +318,13 @@ describe('factual week findings', () => {
     expect(buildWeek(input([], { matters: [undated] })).undatedMatters.map((m) => m.id)).toEqual(['m-1']);
     expect(kinds([], { matters: [undated] })).toEqual([]);
   });
-  it('mentions a deleted linked block and wraps unknown venue names in findings', () => {
-    const e = meeting('e', '09:00', '10:00', { location: 'New venue', tags: { gws_ea_deleted_block: 'travel' } });
-    const model = buildWeek(
-      input([e], { deletedBlocks: [{ parentEventId: 'e', kind: 'travel', actor: 'principal' }] }),
-    );
+  it('wraps unknown venue names in findings and leaves saved place labels plain', () => {
+    const e = meeting('e', '09:00', '10:00', { location: 'New venue' });
+    const model = buildWeek(input([e]));
     const finding = checkWeek(model).find((f) => f.kind === 'travel-unknown')!;
-    expect(presentFinding(finding, model)).toContain('Source: google_calendar');
-    expect(presentFinding(finding, model)).toContain('principal deleted');
+    const text = presentFinding(finding, model);
+    expect(text).toMatch(/place: <<<EXTERNAL_UNTRUSTED_CONTENT[^\n]*\nSource: google_calendar\n---\nNew venue/u);
+    expect(text).toContain('origin: Home');
   });
 });
 
@@ -406,26 +387,6 @@ it('keeps known venue-to-venue travel visible while home is unknown', () => {
       .filter((f) => ['travel', 'travel-unknown', 'whereabouts-gap'].includes(f.kind))
       .map((f) => f.kind),
   ).toEqual(['whereabouts-gap', 'travel']);
-});
-
-it('uses deletion evidence without inventing who deleted a linked block', () => {
-  const dinner = meeting('dinner', '18:30', '19:30', { location: 'Mission restaurant' });
-  for (const actor of ['principal', 'unknown'] as const) {
-    const model = buildWeek(input([dinner], { deletedBlocks: [{ parentEventId: 'dinner', kind: 'travel', actor }] }));
-    const finding = checkWeek(model).find((f) => f.kind === 'travel-unknown')!;
-    expect(presentFinding(finding, model)).toContain(
-      actor === 'principal'
-        ? 'The principal deleted a linked travel block.'
-        : 'Linked travel block deleted; actor unavailable.',
-    );
-  }
-});
-
-it('keeps a meal acknowledgement cleared when unrelated event words change', () => {
-  const original = meeting('e', '11:30', '14:00', { summary: 'Work' });
-  const finding = checkWeek(buildWeek(input([original]))).find((f) => f.kind === 'meal')!;
-  const renamed = { ...original, event: { ...original.event, summary: 'Revised work', description: 'New notes' } };
-  expect(checkWeek(buildWeek(input([renamed])), [finding]).some((f) => f.kind === 'meal')).toBe(false);
 });
 
 it('reports the calendar days remaining to a date deadline, independently of its end-of-day boundary', () => {

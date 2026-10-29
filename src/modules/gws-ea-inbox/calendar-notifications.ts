@@ -538,6 +538,8 @@ export function parseCalendarNotification(mail: ParsedMail): CalendarNotice | un
 const OWN_CHANGE_WINDOW_MS = 30 * 60_000;
 
 const ownChanges = new Map<string, number[]>();
+type OwnChangeListener = (calendarId: string, eventId: string) => void;
+let ownChangeListener: OwnChangeListener | undefined;
 
 function ownKey(calendarId: string, eventId: string): string {
   return `${expandCalendarRef(calendarId)}\u0000${eventId}`;
@@ -557,6 +559,16 @@ export function recordOwnCalendarChange(calendarId: string, eventId: string, at:
   }
   const key = ownKey(calendarId, eventId);
   ownChanges.set(key, [...(ownChanges.get(key) ?? []), at.getTime()]);
+  ownChangeListener?.(calendarId, eventId);
+}
+
+/** The coming-days refresher hears of each own change here, since the notice it suppresses no longer will. */
+export function onOwnCalendarChange(listener: OwnChangeListener): () => void {
+  if (ownChangeListener) throw new Error('An own calendar change listener is already registered');
+  ownChangeListener = listener;
+  return () => {
+    if (ownChangeListener === listener) ownChangeListener = undefined;
+  };
 }
 
 /** Whether this notification is about the assistant's own recent change; consumes the record if so. */
@@ -572,6 +584,8 @@ export function consumeOwnCalendarChange(calendarId: string, eventId: string, at
 export interface CalendarChangeRenderContext {
   readonly week?: import('../gws-ea-meetings/week/model.js').Week;
   readonly timeline?: import('../gws-ea-whereabouts/timeline.js').Timeline;
+  /** The copies held before the change, which place the days it left. */
+  readonly previous?: readonly import('../gws-ea-meetings/week/model.js').EventCopy[];
 }
 export interface RenderedCalendarChanges {
   readonly text: string;

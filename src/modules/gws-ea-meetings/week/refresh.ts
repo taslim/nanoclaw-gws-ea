@@ -4,6 +4,8 @@ import {
   flushPendingCalendarChanges,
   isPrincipalCalendar,
   isReadable,
+  onOwnCalendarChange,
+  type CalendarChangeRenderContext,
 } from '../../gws-ea-inbox/calendar-notifications.js';
 import { onManualChange } from '../../gws-ea-manual/changes.js';
 import { loadManualFrontPage } from '../../gws-ea-manual/front-page.js';
@@ -12,18 +14,17 @@ import { boundary, dateString, nextDate, parseDate, wallClock } from '../../gws-
 import { syncDerivedStays, type DerivationWindow } from '../../gws-ea-whereabouts/db.js';
 import { deriveLegs } from '../../gws-ea-whereabouts/derive.js';
 import { loadTimeline, zoneAt, zoneForDay, type Timeline } from '../../gws-ea-whereabouts/timeline.js';
-import type { CalendarEntry, DetailedEvent, MeetingsCalendarApi } from '../calendar-api.js';
+import type { CalendarEntry, MeetingsCalendarApi } from '../calendar-api.js';
 import { loadCalendarWeek } from '../days.js';
-import { eventSpan } from '../slots.js';
-import { loadAcknowledgements } from './acks.js';
-import { digest, type EventCopy } from './model.js';
+import { digest, inWindow, spanOf, type EventCopy } from './model.js';
 import { settledCalendarChanges } from './pending-changes.js';
 import { appliedCalendarWrites, calendarWriteVersion } from './write-log.js';
-import { completeBookingWriteWindows, pendingBookingWriteWindows } from './booking-writes.js';
 import { renderWeekView, writeWeekView } from './view.js';
 
 const DAY = 86_400_000;
 const INTERVAL = 5_000;
+/** After a failed cycle, as long as the booking sweep waits between its runs. */
+const RETRY_INTERVAL = 60_000;
 const BUSY_REFRESH = 15 * 60_000;
 function dayAfter(day: string, count: number): string {
   let date = parseDate(day);
@@ -37,19 +38,6 @@ function windowFor(day: string, count: number, timeline: Timeline): DerivationWi
     end: boundary(last, zoneForDay(timeline, last) ?? 'UTC', 'end'),
   };
 }
-function span(event: DetailedEvent, timeline: Timeline): DerivationWindow | null {
-  const instant = Date.parse(event.start?.dateTime ?? '');
-  const zone = event.start?.date
-    ? zoneForDay(timeline, event.start.date)
-    : Number.isFinite(instant)
-      ? zoneAt(timeline, instant)
-      : null;
-  const bounds = eventSpan(event, zone ?? 'UTC');
-  return bounds && Number.isFinite(bounds.start) && Number.isFinite(bounds.end) && bounds.end > bounds.start
-    ? bounds
-    : null;
-}
-const overlaps = (a: DerivationWindow, b: DerivationWindow) => a.start < b.end && a.end > b.start;
 function coalesced(windows: readonly DerivationWindow[]): DerivationWindow[] {
   const result: DerivationWindow[] = [];
   for (const window of [...windows].sort((a, b) => a.start - b.start)) {
@@ -76,7 +64,10 @@ export function createWeekRefresher(deps: { readonly calendar: () => MeetingsCal
   let lastReadAt: string | undefined;
   let lastFullAt = 0;
   let writeVersion: string | undefined;
+  let publishedVersion: string | undefined;
   const knownWrites = new Set<string>();
+  // The assistant's own writes, whose notices no longer arrive. A cycle that fails rereads every day anyway.
+  const ownChanges = new Map<string, { readonly calendarId: string; readonly eventId: string }>();
   const unsubscribe: (() => void)[] = [];
   const now = deps.now ?? (() => new Date());
 
@@ -87,8 +78,11 @@ export function createWeekRefresher(deps: { readonly calendar: () => MeetingsCal
       timeline,
       eventSnapshot: events,
     });
-    const manual = await loadManualFrontPage(timeline);
-    await writeWeekView(renderWeekView(week, await loadAcknowledgements(), asOf, manual));
+    // The front page separates its sections with a blank line; a section holding one of its own arrives as several.
+    const manual = (await loadManualFrontPage(timeline)).split('\n\n');
+    const view = renderWeekView(week, asOf, manual);
+    await writeWeekView(view, view.version === publishedVersion);
+    publishedVersion = view.version;
     return week;
   }
 
@@ -126,8 +120,22 @@ export function createWeekRefresher(deps: { readonly calendar: () => MeetingsCal
 
   async function cycle(): Promise<void> {
     if (!(await getMainAgentGroupId())) return;
-    let timeline = await loadTimeline();
     const at = now();
+    const previous = copies;
+    let current: CalendarChangeRenderContext = {};
+    try {
+      current = await read(at);
+    } catch (error) {
+      // The settled notices are told below even so, and only a full read still sees the days they touched.
+      forceFull = true;
+      throw error;
+    } finally {
+      await flushPendingCalendarChanges(at, { ...current, previous });
+    }
+  }
+
+  async function read(at: Date): Promise<CalendarChangeRenderContext> {
+    let timeline = await loadTimeline();
     const today = dateString(wallClock(at.getTime(), zoneAt(timeline, at.getTime()) ?? 'UTC'));
     const full =
       forceFull ||
@@ -140,13 +148,15 @@ export function createWeekRefresher(deps: { readonly calendar: () => MeetingsCal
     const changes = await settledCalendarChanges(at);
     const version = await calendarWriteVersion();
     const writes = version !== writeVersion ? await appliedCalendarWrites() : [];
-    const bookingWrites = await pendingBookingWriteWindows();
+    const own = [...ownChanges.values()];
+    ownChanges.clear();
     const windows: DerivationWindow[] = [];
-    const affected = (bounds: DerivationWindow | null) => {
-      if (!bounds || !Number.isFinite(bounds.start) || !Number.isFinite(bounds.end) || bounds.end <= bounds.start)
+    const affected = (bounds: DerivationWindow | undefined) => {
+      if (!bounds || !Number.isFinite(bounds.start) || !Number.isFinite(bounds.end) || bounds.end < bounds.start)
         return;
+      const lastInstant = Math.max(bounds.start, bounds.end - 1);
       const first = dateString(wallClock(bounds.start, zoneAt(timeline, bounds.start) ?? 'UTC'));
-      const last = dateString(wallClock(bounds.end - 1, zoneAt(timeline, bounds.end - 1) ?? 'UTC'));
+      const last = dateString(wallClock(lastInstant, zoneAt(timeline, lastInstant) ?? 'UTC'));
       windows.push(windowFor(first, Math.round((Date.parse(last) - Date.parse(first)) / DAY) + 1, timeline));
     };
     if (full) {
@@ -158,43 +168,36 @@ export function createWeekRefresher(deps: { readonly calendar: () => MeetingsCal
       if (!calendars.length) throw new Error('No principal calendars are available to refresh');
       windows.push(windowFor(today, 60, timeline));
     } else {
-      for (const { notice } of changes) {
-        const calendar = calendars.find((entry) => entry.id === notice.calendarId);
+      for (const { calendarId, eventId } of [...changes.map(({ notice }) => notice), ...own]) {
+        const calendar = calendars.find((entry) => entry.id === calendarId);
         if (!calendar || !isReadable(calendar)) continue;
-        const held = copies?.find(
-          (copy) => copy.calendarId === notice.calendarId && copy.event.id === notice.eventId,
-        )?.event;
-        affected(held ? span(held, timeline) : null);
-        for (const leg of timeline.legs.filter((leg) => leg.sourceEventId === notice.eventId))
+        const held = copies?.find((copy) => copy.calendarId === calendarId && copy.event.id === eventId)?.event;
+        affected(held && spanOf(held, timeline));
+        for (const leg of timeline.legs.filter((leg) => leg.sourceEventId === eventId))
           affected({ start: leg.departure, end: leg.arrival });
-        const current = await deps.calendar().getEventDetail(notice.calendarId, notice.eventId);
-        affected(current ? span(current, timeline) : null);
+        const current = await deps.calendar().getEventDetail(calendarId, eventId);
+        affected(current && spanOf(current, timeline));
       }
       for (const write of writes)
         if (!knownWrites.has(write.requestId)) {
           if (write.refreshScope === 'series') windows.push(windowFor(today, 60, timeline));
-          affected(write.before ? span(write.before, timeline) : null);
+          affected(write.before ? spanOf(write.before, timeline) : undefined);
           affected({ start: Date.parse(write.affectedStart), end: Date.parse(write.affectedEnd) });
           if (calendars.some((calendar) => calendar.id === write.calendarId && isReadable(calendar))) {
             const current = await deps.calendar().getEventDetail(write.calendarId, write.eventId);
-            affected(current ? span(current, timeline) : null);
+            affected(current && spanOf(current, timeline));
           }
         }
       if (placementChanged) windows.push(windowFor(today, 8, timeline));
     }
-    for (const write of bookingWrites)
-      if (calendars.some((calendar) => calendar.id === write.calendarId)) {
-        affected(write.previous);
-        affected(write.current);
-      }
     let updated = [...(copies ?? [])];
     const reads = coalesced(windows);
     for (const window of reads) {
       const events = await readWindow(window);
       updated = [
         ...updated.filter((copy) => {
-          const bounds = span(copy.event, timeline);
-          return bounds !== null && !overlaps(bounds, window);
+          const bounds = spanOf(copy.event, timeline);
+          return bounds !== undefined && !inWindow(bounds, window);
         }),
         ...events,
       ];
@@ -202,8 +205,8 @@ export function createWeekRefresher(deps: { readonly calendar: () => MeetingsCal
     placementChanged = false;
     if (full)
       updated = updated.filter((copy) => {
-        const bounds = span(copy.event, timeline);
-        return bounds !== null && overlaps(bounds, windows[0]);
+        const bounds = spanOf(copy.event, timeline);
+        return bounds !== undefined && inWindow(bounds, windows[0]);
       });
     if (reads.length) {
       const principal = principalRecognizer((await getGwsEaProfile()).principal_emails);
@@ -241,7 +244,6 @@ export function createWeekRefresher(deps: { readonly calendar: () => MeetingsCal
     }
     for (const write of writes) knownWrites.add(write.requestId);
     writeVersion = version;
-    await completeBookingWriteWindows(bookingWrites);
     const noteWeek = reads.length
       ? await loadCalendarWeek(deps.calendar(), {
           start: Math.min(week.now, ...reads.map((window) => window.start)),
@@ -250,7 +252,7 @@ export function createWeekRefresher(deps: { readonly calendar: () => MeetingsCal
           eventSnapshot: updated,
         })
       : week;
-    await flushPendingCalendarChanges(at, { week: noteWeek, timeline });
+    return { week: noteWeek, timeline };
   }
 
   function refresh(
@@ -273,13 +275,17 @@ export function createWeekRefresher(deps: { readonly calendar: () => MeetingsCal
     });
     return flight;
   }
-  function schedule(): void {
+  function schedule(delay = INTERVAL): void {
     if (!running) return;
     timer = setTimeout(() => {
-      void refresh()
-        .catch((error: unknown) => log.warn('Coming-days refresh failed; the previous view remains', { error }))
-        .finally(schedule);
-    }, INTERVAL);
+      void refresh().then(
+        () => schedule(),
+        (error: unknown) => {
+          log.warn('Coming-days refresh failed; the previous view remains', { error });
+          schedule(RETRY_INTERVAL);
+        },
+      );
+    }, delay);
     timer.unref();
   }
   return {
@@ -288,11 +294,15 @@ export function createWeekRefresher(deps: { readonly calendar: () => MeetingsCal
       if (running) return;
       running = true;
       unsubscribe.push(
-        onManualChange(() =>
-          refresh({ render: true }).catch((error: unknown) =>
+        onOwnCalendarChange((calendarId, eventId) => {
+          ownChanges.set(`${calendarId}\0${eventId}`, { calendarId, eventId });
+        }),
+        // A saved Manual edit answers at once; its view follows on its own.
+        onManualChange(() => {
+          void refresh({ render: true }).catch((error: unknown) =>
             log.warn('The Manual was saved; its calendar reread is unavailable', { error }),
-          ),
-        ),
+          );
+        }),
         onWhereaboutsChange(async (change) => {
           if (change.kind !== 'derived')
             await refresh({
@@ -308,11 +318,13 @@ export function createWeekRefresher(deps: { readonly calendar: () => MeetingsCal
             );
         }),
       );
-      try {
-        await refresh();
-      } finally {
-        schedule();
-      }
+      await refresh().then(
+        () => schedule(),
+        (error: unknown) => {
+          schedule(RETRY_INTERVAL);
+          throw error;
+        },
+      );
     },
     async stop(): Promise<void> {
       running = false;
