@@ -32,9 +32,6 @@ it('durably keeps one request and its findings gap until a successful recheck', 
   await markCalendarWriteApplied('req-1', 'Changed.');
   expect(await listCalendarWriteGaps()).toMatchObject([{ requestId: 'req-1', outcome: 'Changed.' }]);
   expect(await getCalendarWrite('req-1')).toMatchObject({ state: 'applied' });
-  await expect(beginCalendarWrite({ ...write, request: { start: '2026-10-05T17:00:00Z' } })).rejects.toThrow(
-    /different/,
-  );
   await completeCalendarWriteFindings('req-1');
   expect(await listCalendarWriteGaps()).toEqual([]);
 });

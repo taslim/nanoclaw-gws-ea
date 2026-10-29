@@ -1,5 +1,4 @@
 import { calendarWriteLogMigration } from './week/write-log-migration.js';
-import { calendarSplitRecoveryMigration } from './week/split-recovery-migration.js';
 import { bookingWriteWindowsMigration } from './week/booking-writes-migration.js';
 import { pendingCalendarChangesMigration } from './week/pending-changes-migration.js';
 import { weekAcknowledgementsMigration } from './week/acks-migration.js';
@@ -52,13 +51,10 @@ function scheduleBookingSweep(): void {
   bookingTimer.unref();
 }
 function runBookingSweep(): void {
-  bookingSweep = Promise.allSettled([booking.resumePending(), principalEvents.resumePending()])
-    .then((results) => {
-      for (const [index, result] of results.entries())
-        if (result.status === 'rejected')
-          log.error(index === 0 ? 'Booking recovery sweep failed' : 'Recurring-series recovery sweep failed', {
-            error: result.reason,
-          });
+  bookingSweep = booking
+    .resumePending()
+    .catch((error: unknown) => {
+      log.error('Booking recovery sweep failed', { error });
     })
     .finally(scheduleBookingSweep);
 }
@@ -103,7 +99,6 @@ registerMigration(bookingsMigration);
 registerMigration(weekAcknowledgementsMigration);
 registerMigration(calendarWriteLogMigration);
 registerMigration(pendingCalendarChangesMigration);
-registerMigration(calendarSplitRecoveryMigration);
 registerMigration(bookingWriteWindowsMigration);
 
 for (const [action, answer] of [
