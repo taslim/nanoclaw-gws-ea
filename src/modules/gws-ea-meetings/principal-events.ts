@@ -1126,11 +1126,7 @@ export function createPrincipalEventTools(deps: PrincipalEventToolsDeps) {
       ...(recurrence === undefined ? {} : { recurrence }),
       ...(content.reminders === undefined ? {} : { reminders: content.reminders as 'default' | 'none' }),
       ...(content.video_call === true ? { conference: { requestId: eventIdFor('meet', String(content.event)) } } : {}),
-      tags: {
-        ...before.tags,
-        ...linkedTags(content),
-        [WEEK_TAGS.assistantWritten]: 'true',
-      },
+      tags: { ...before.tags, ...linkedTags(content) },
     };
   }
   function appliedPatch(detail: DetailedEvent, patch: EventWrite): boolean {

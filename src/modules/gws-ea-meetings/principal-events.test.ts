@@ -2439,6 +2439,23 @@ it.each([
   expect(changed.message).toContain('all following occurrences');
 });
 
+it('marks an event the assistant creates as its own, and leaves one it only changes as it was', async () => {
+  const created = data(await send(main, 'create_event', FOCUS));
+  expect(calendar.event(PRINCIPAL, String(created.event))?.tags).toMatchObject({ gws_ea_assistant_written: 'true' });
+  calendar.put(teamSync([PRINCIPAL_GUEST]));
+  data(
+    await send(main, 'change_event', {
+      calendar: PRINCIPAL,
+      event: 'teamsync01',
+      start: '2026-10-09T10:00:00-07:00',
+      end: '2026-10-09T10:30:00-07:00',
+      send_updates: 'none',
+    }),
+  );
+  expect(calendar.event(PRINCIPAL, 'teamsync01')?.start?.dateTime).toBe('2026-10-09T17:00:00.000Z');
+  expect(calendar.event(PRINCIPAL, 'teamsync01')?.tags?.gws_ea_assistant_written).toBeUndefined();
+});
+
 it('does not swallow a later principal notice after an unchanged edit', async () => {
   calendar.put({ ...teamSync([PRINCIPAL_GUEST]), id: 'unchangededit', tags: { gws_ea_assistant_written: 'true' } });
   const result = data(
