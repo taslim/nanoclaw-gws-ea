@@ -661,7 +661,6 @@ async function startInbox(): Promise<void> {
   inbox = createInbox({
     gmail,
     calendar,
-    events,
     drive,
     now: () => new Date(Date.now() + clockOffsetMs),
     sleep: async () => undefined,

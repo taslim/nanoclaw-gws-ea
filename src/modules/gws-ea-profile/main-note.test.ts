@@ -245,7 +245,6 @@ describe('a note about a piece of an open matter', () => {
 
     await writeCalendarNote(
       [{ gmailMessageId: 'n-1', notice: { calendarId: MORGAN, eventId: RENEWAL_CALL, change: 'changed' } }],
-      calendar,
       new Date(NOW),
     );
 
@@ -334,7 +333,6 @@ describe('a note about pieces in no open matter', () => {
 
     await writeCalendarNote(
       [{ gmailMessageId: 'n-1', notice: { calendarId: MORGAN, eventId: INVITATION, change: 'created' } }],
-      calendar,
       new Date(NOW),
     );
 
@@ -364,7 +362,6 @@ describe('a note about pieces in no open matter', () => {
         // Gone from Calendar by the time the note is written.
         { gmailMessageId: 'n-2', notice: { calendarId: MORGAN, eventId: INVITATION, change: 'created' } },
       ],
-      calendar,
       new Date(NOW),
     );
 
@@ -388,7 +385,6 @@ describe('a note about pieces in no open matter', () => {
 
     await writeCalendarNote(
       [{ gmailMessageId: 'n-1', notice: { calendarId: MORGAN, eventId: INVITATION, change: 'created' } }],
-      calendar,
       new Date(NOW),
     );
 

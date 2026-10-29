@@ -1,7 +1,6 @@
 import { afterEach, beforeEach, expect, it } from 'vitest';
 import { closeDb, getDb, initTestDb, runMigrations } from '../../db/index.js';
 import { calendarWriteLogMigration } from '../gws-ea-meetings/week/write-log-migration.js';
-import { calendarSplitRecoveryMigration } from '../gws-ea-meetings/week/split-recovery-migration.js';
 import { beginCalendarWrite, markCalendarWriteApplied } from '../gws-ea-meetings/week/write-log.js';
 import {
   closeRunsMigration,
@@ -14,7 +13,7 @@ import {
 import { openClose } from './testing/main-conversation.js';
 beforeEach(async () => {
   await runMigrations(await initTestDb());
-  await runMigrations(getDb(), [calendarWriteLogMigration, calendarSplitRecoveryMigration, closeRunsMigration]);
+  await runMigrations(getDb(), [calendarWriteLogMigration, closeRunsMigration]);
 });
 afterEach(closeDb);
 async function write(id: string) {

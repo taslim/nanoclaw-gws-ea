@@ -26,7 +26,6 @@
  */
 import type { ChannelAdapter, ChannelContextDefaults, ChannelDefaults, ChannelSetup } from '../../channels/adapter.js';
 import { log } from '../../log.js';
-import type { MeetingsCalendarApi } from '../gws-ea-meetings/calendar-api.js';
 import type { DriveApi } from '../gws-ea-workspace/drive-api.js';
 import { writeWorkspaceNote, type WorkspaceNotice } from '../gws-ea-workspace/notices.js';
 import { syncCalendarList, type CalendarListApi, type CalendarNotice } from './calendar-notifications.js';
@@ -97,8 +96,6 @@ export const EMAIL_CHANNEL_DEFAULTS: ChannelDefaults = { dm: EMAIL_CONTEXT, grou
 export interface InboxDeps {
   readonly gmail: GmailApi;
   readonly calendar: CalendarListApi;
-  /** Read with the host's own Calendar token, for who organized a new event. */
-  readonly events: Pick<MeetingsCalendarApi, 'getEvent'>;
   /** Read with the host's own Drive token, for the details of Docs and Drive activity. */
   readonly drive: DriveApi;
   readonly now?: () => Date;

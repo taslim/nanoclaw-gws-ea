@@ -371,7 +371,6 @@ async function startInbox(): Promise<void> {
       subscribe: async () => undefined,
       unsubscribe: async () => undefined,
     },
-    events: { getEvent: async () => undefined },
     drive,
     sleep: async () => undefined,
   });
