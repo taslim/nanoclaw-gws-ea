@@ -44,6 +44,7 @@ const UNSIGNED_NOTICES = 'module:gws-ea-inbox:unsigned-notices';
 const CALENDAR_ACCESS = 'module:gws-ea-inbox:calendar-access';
 const THREAD_ACCOUNTS = 'module:gws-ea-inbox:thread-accounts';
 const THREAD_PLACEMENT = 'module:gws-ea-inbox:thread-placement';
+const THREAD_AUTHENTICATION = 'module:gws-ea-inbox:thread-sender-authentication';
 
 /** The inbox's tables and its thread map's after the squash, with none of the scheduling tables the earlier chain dropped. */
 const INBOX_TABLES = [
@@ -206,7 +207,7 @@ async function writeSlice4Work(db: DbDriver): Promise<void> {
 }
 
 describe('the inbox migrations', () => {
-  it("keeps the inbox's eight in order and registers chat booking recovery separately", () => {
+  it("keeps the inbox's migrations in order and registers chat booking recovery separately", () => {
     const names = getRegisteredMigrations()
       .map((migration) => migration.name)
       .filter((name) => name.startsWith('module:gws-ea-inbox:'));
@@ -219,6 +220,7 @@ describe('the inbox migrations', () => {
       CALENDAR_ACCESS,
       THREAD_ACCOUNTS,
       THREAD_PLACEMENT,
+      THREAD_AUTHENTICATION,
     ]);
     expect(
       getRegisteredMigrations()
@@ -228,6 +230,9 @@ describe('the inbox migrations', () => {
       'module:gws-ea-meetings:chat-booking-requests',
       'module:gws-ea-meetings:chat-booking-reports',
       bookingsMigration.name,
+      'module:gws-ea-meetings:week-acknowledgements',
+      'module:gws-ea-meetings:calendar-write-log',
+      'module:gws-ea-meetings:pending-calendar-changes',
     ]);
   });
 
@@ -270,11 +275,16 @@ describe('squashed migrations', () => {
       CALENDAR_ACCESS,
       THREAD_ACCOUNTS,
       THREAD_PLACEMENT,
+      THREAD_AUTHENTICATION,
       bookingsMigration.name,
     ]);
     for (const table of INBOX_TABLES) expect(before[table], table).not.toEqual([]);
     expect(rowsOf(db)).toEqual({
       ...before,
+      gws_ea_thread_addresses: before.gws_ea_thread_addresses.map((address) => ({
+        ...(address as object),
+        sender_authenticated: 0,
+      })),
       gws_ea_threads: before.gws_ea_threads.map((thread) => ({
         ...(thread as object),
         account: null,

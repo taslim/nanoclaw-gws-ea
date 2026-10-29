@@ -13,7 +13,7 @@ import { createAgentGroup } from '../../db/agent-groups.js';
 import { resolveSession } from '../../session-manager.js';
 import type { Session } from '../../types.js';
 import { replacePrincipalCalendars } from '../gws-ea-inbox/db.js';
-import { recordThreadAddresses } from '../gws-ea-inbox/thread-map.js';
+import { recordThreadAddresses, recordAuthenticatedThreadSender } from '../gws-ea-inbox/thread-map.js';
 import { platformMembers } from '../gws-ea-chats/testing/chat-delivery-fixture.js';
 import { setChatCalendar } from '../gws-ea-chats/handoffs.js';
 import { placeInMatter, openMatter } from '../gws-ea-matters/db.js';
@@ -28,6 +28,7 @@ import {
   notesIn,
   PRINCIPAL,
   seedBookingFixture,
+  responseIn,
   TEAM,
   type BookingTools,
 } from './testing/booking-fixture.js';
@@ -41,6 +42,10 @@ import { GoogleNotSignedInError } from '../gws-ea-google/tokens.js';
 import { log } from '../../log.js';
 import { ANSWER_LATER } from '../../cli/delivery-action.js';
 import { bookingSurfaceFor, resolveBookingSurface } from './booking-surface.js';
+import '../gws-ea-whereabouts/index.js';
+import { addPlace, addStay, setBase, setPlacePair, setRhythm } from '../gws-ea-whereabouts/db.js';
+import { addPerson } from '../gws-ea-people/db.js';
+import { setSchedulingPreference } from '../gws-ea-preferences/db.js';
 
 const RANGE = { from: '2026-10-20T09:00:00Z', to: '2026-10-20T17:00:00Z', minutes: 30, timezone: 'Europe/Paris' };
 let calendar: FakeCalendar;
@@ -56,7 +61,312 @@ beforeEach(async () => {
 });
 afterEach(cleanBookingFixture);
 
+describe('outward availability in the principal’s days', () => {
+  const november = { from: '2026-11-12T07:00:00Z', to: '2026-11-12T21:00:00Z', minutes: 30 };
+  async function home() {
+    await getDb().run("UPDATE gws_ea_profile SET principal_timezone='America/Los_Angeles' WHERE singleton=1");
+    const place = await addPlace({ label: 'Home', locality: 'San Francisco', home: true });
+    await setBase({ placeId: place.id });
+    return place;
+  }
+
+  it('offers Brussels time on both surfaces, without revealing the stay when an in-person San Francisco offer cannot fit', async () => {
+    await home();
+    await addStay({
+      locality: 'Brussels',
+      zone: 'Europe/Brussels',
+      start: '2026-11-10',
+      end: '2026-11-15',
+      source: 'said',
+      certainty: 'certain',
+    });
+    const sf = await addPlace({ label: 'Remy’s office', locality: 'San Francisco', zone: 'America/Los_Angeles' });
+    for (const session of [emailSession, chatSession]) {
+      const remote = await reads.freeTime(november, session, 'brussels');
+      expect(remote.windows).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ principal_time: expect.stringContaining('CET'), zone: 'Europe/Brussels' }),
+        ]),
+      );
+      const local = await reads.freeTime({ ...november, place: sf.id }, session, 'san-francisco');
+      expect(local.windows).toEqual([]);
+      expect(JSON.stringify(local)).not.toMatch(/Brussels|Nov 10|Nov 15|stay|trip/iu);
+    }
+  });
+
+  it('keeps tentative stays as window notes, and fits a Lagos stay on Pacific hours', async () => {
+    await home();
+    await addStay({
+      locality: 'New York',
+      zone: 'America/New_York',
+      start: '2026-11-10',
+      end: '2026-11-15',
+      source: 'said',
+      certainty: 'tentative',
+    });
+    const tentative = await reads.freeTime(november, emailSession, 'tentative');
+    expect(tentative.windows).toEqual(
+      expect.arrayContaining([expect.objectContaining({ fit_notes: ['tentative stay'] })]),
+    );
+    await addStay({
+      locality: 'Lagos',
+      zone: 'Africa/Lagos',
+      start: '2026-11-12',
+      end: '2026-11-12',
+      source: 'said',
+      certainty: 'certain',
+      workingHours: 'home',
+    });
+    const lagos = await reads.freeTime(november, emailSession, 'home-hours');
+    expect(lagos.windows).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ start: '2026-11-12T17:00:00.000Z', fit: 'acceptable', zone: 'Africa/Lagos' }),
+      ]),
+    );
+    expect(lagos.message).toContain('outside usual hours');
+  });
+
+  it('offers each instant once across a stay’s zone boundary, using the clock in effect at that instant', async () => {
+    await home();
+    await addStay({
+      locality: 'Brussels',
+      zone: 'Europe/Brussels',
+      start: '2026-11-12',
+      end: '2026-11-12',
+      source: 'said',
+      certainty: 'certain',
+    });
+    const answer = await reads.freeTime(
+      { from: '2026-11-11T20:00:00Z', to: '2026-11-12T10:00:00Z', minutes: 30 },
+      emailSession,
+      'zone-boundary',
+    );
+    expect(answer.windows).toEqual([
+      expect.objectContaining({
+        start: '2026-11-11T20:00:00.000Z',
+        end: '2026-11-11T23:00:00.000Z',
+        zone: 'America/Los_Angeles',
+      }),
+      expect.objectContaining({
+        start: '2026-11-12T06:00:00.000Z',
+        end: '2026-11-12T08:00:00.000Z',
+        zone: 'Europe/Brussels',
+      }),
+      expect.objectContaining({
+        start: '2026-11-12T08:00:00.000Z',
+        end: '2026-11-12T10:00:00.000Z',
+        zone: 'Europe/Brussels',
+      }),
+    ]);
+  });
+
+  it('counts known driving after a Mountain View meeting as busy and leaves an unknown pair visible with a note', async () => {
+    await home();
+    const mv = await addPlace({
+      label: 'Mountain View office',
+      locality: 'Mountain View',
+      zone: 'America/Los_Angeles',
+    });
+    const sf = await addPlace({ label: 'Remy’s office', locality: 'San Francisco', zone: 'America/Los_Angeles' });
+    await setRhythm({ weekdays: ['thu'], placeId: mv.id, start: '09:00', end: '17:00' });
+    await setPlacePair({ fromPlaceId: mv.id, toPlaceId: sf.id, mode: 'drive', minutes: 60, source: 'learned' });
+    calendar.put({
+      calendarId: PRINCIPAL,
+      id: 'private-meeting',
+      summary: 'Secret project',
+      location: mv.label,
+      start: { dateTime: '2026-11-12T18:00:00Z' },
+      end: { dateTime: '2026-11-12T19:00:00Z' },
+    });
+    const range = { from: '2026-11-12T18:00:00Z', to: '2026-11-12T22:00:00Z', minutes: 30 };
+    const known = await reads.freeTime({ ...range, place: sf.id }, emailSession, 'drive');
+    expect(known.windows).toEqual([
+      expect.objectContaining({ start: '2026-11-12T20:00:00.000Z', end: '2026-11-12T22:00:00.000Z' }),
+    ]);
+    const unknown = await reads.freeTime({ ...range, place: 'An unfamiliar cafe' }, emailSession, 'unknown-drive');
+    expect(unknown.windows).toEqual([
+      expect.objectContaining({
+        start: '2026-11-12T19:00:00.000Z',
+        fit_notes: ['travel from the previous place unknown'],
+      }),
+    ]);
+    expect(JSON.stringify(known)).not.toMatch(/Secret project|private-meeting|Mountain View office/u);
+  });
+
+  it('shares deciding facts only for authenticated senders, main-named people and current chat members', async () => {
+    const juno = 'juno.hale@outside.example';
+    const remy = 'remy.vance@outside.example';
+    await addPerson({
+      name: 'Private record name',
+      level: 'close',
+      source: 'principal',
+      basis: 'Private relationship basis',
+      identity: `email:${juno}`,
+    });
+    await recordThreadAddresses(thread, [juno, remy, 'copied@outside.example'], 'message', new Date().toISOString());
+    await recordAuthenticatedThreadSender(thread, juno, new Date().toISOString());
+    await recordThreadAddresses(thread, [remy], 'main', new Date().toISOString());
+    await recordThreadAddresses(thread, ['body@outside.example'], 'written', new Date().toISOString());
+    await setSchedulingPreference({
+      kind: 'meeting-length',
+      meetingKind: 'intro',
+      minutes: 20,
+      source: 'principal',
+      basis: 'Principal’s recorded introduction length',
+    });
+    calendar.put({
+      calendarId: PRINCIPAL,
+      id: 'old-private-meeting',
+      summary: 'Private invitation',
+      organizer: { email: PRINCIPAL },
+      attendees: [{ email: juno }],
+      start: { dateTime: '2026-09-01T12:00:00Z' },
+      end: { dateTime: '2026-09-01T12:20:00Z' },
+    });
+    const answer = await reads.freeTime({ ...RANGE, minutes: 20 }, emailSession, 'facts');
+    expect(answer.people).toEqual([
+      {
+        email: juno,
+        relationship: 'close to the principal',
+        has_people_record: true,
+        meetings: 1,
+        met_in_six_months: true,
+      },
+      { email: remy, relationship: null, has_people_record: false, meetings: 0, met_in_six_months: false },
+    ]);
+    expect(answer.meeting_lengths).toEqual([{ kind: 'intro', minutes: 20 }]);
+    expect(JSON.stringify(answer)).not.toMatch(
+      /Private record name|Private relationship basis|Private invitation|2026-09-01|old-private-meeting|copied@|body@/u,
+    );
+    const booked = answerData(await reads.book({ ...BOOK, title: 'Morgan and Juno' }, emailSession, 'facts-book'));
+    expect(booked.people).toEqual(answer.people);
+    expect(booked.meeting_lengths).toEqual(answer.meeting_lengths);
+    const moved = answerData(
+      await reads.changeBooking({ booking: booked.booking, start: LATER }, emailSession, 'facts-move'),
+    );
+    expect(moved.people).toEqual(answer.people);
+    expect(moved).toMatchObject({ organizer: 'the principal', move: 'change' });
+    expect(JSON.stringify(moved)).not.toMatch(/Private record name|Private invitation|2026-09-01|copied@|body@/u);
+    const chatAnswer = await reads.freeTime(RANGE, chatSession, 'chat-facts');
+    expect(chatAnswer.people).toEqual([expect.objectContaining({ email: MIRA })]);
+  });
+
+  it('uses the chosen kind on both surfaces while booking keeps its clash-only check', async () => {
+    for (const [meetingKind, minutes] of [
+      ['default', 15],
+      ['intro', 60],
+    ] as const)
+      await setSchedulingPreference({
+        kind: 'buffer',
+        meetingKind,
+        minutes,
+        source: 'principal',
+        basis: 'Morgan’s preference',
+      });
+    await setSchedulingPreference({
+      kind: 'preferred-time',
+      meetingKind: 'intro',
+      start: '12:00',
+      end: '13:00',
+      source: 'principal',
+      basis: 'Morgan’s preference',
+    });
+    calendar.put({
+      calendarId: PRINCIPAL,
+      id: 'busy',
+      start: { dateTime: '2026-10-20T10:00:00Z' },
+      end: { dateTime: '2026-10-20T11:00:00Z' },
+    });
+    const range = { from: '2026-10-20T09:00:00Z', to: '2026-10-20T13:00:00Z', minutes: 30 };
+    for (const session of [emailSession, chatSession]) {
+      const chosen = await reads.freeTime({ ...range, kind: 'intro' }, session, 'intro');
+      expect(chosen.windows).toEqual([
+        expect.objectContaining({
+          start: '2026-10-20T12:00:00.000Z',
+          end: '2026-10-20T13:00:00.000Z',
+          fit: 'preferred',
+        }),
+      ]);
+      const fallback = await reads.freeTime({ ...range, kind: 'unrecorded' }, session, 'fallback');
+      expect(fallback.windows).toEqual((await reads.freeTime(range, session, 'default')).windows);
+      expect(fallback.windows).toEqual(
+        expect.arrayContaining([expect.objectContaining({ start: '2026-10-20T11:15:00.000Z' })]),
+      );
+    }
+    const booked = answerData(
+      await reads.book(
+        { ...BOOK, start: '2026-10-20T11:00:00Z', title: 'Morgan and Remy' },
+        emailSession,
+        'clash-only',
+      ),
+    );
+    expect(booked.start).toBe('2026-10-20T11:00:00.000Z');
+  });
+
+  it('retains valid windows when the history read is unavailable, with unknown counts rather than invented zeros', async () => {
+    await recordAuthenticatedThreadSender(thread, 'juno.hale@outside.example', new Date().toISOString());
+    vi.spyOn(calendar, 'listEventDetails').mockRejectedValue(new Error('History cannot be read'));
+    const answer = await reads.freeTime(RANGE, emailSession, 'history-unavailable');
+    expect(answer.windows).not.toEqual([]);
+    expect(answer.people).toEqual([
+      {
+        email: 'juno.hale@outside.example',
+        relationship: null,
+        has_people_record: false,
+        meetings: null,
+        met_in_six_months: null,
+      },
+    ]);
+    expect(answer.message).toContain('meeting history unavailable');
+    expect(answer.message).not.toContain('0 meetings');
+  });
+
+  it('keeps a remote meeting across a commute-rhythm boundary when its clock and availability do not change', async () => {
+    await home();
+    const mv = await addPlace({
+      label: 'Mountain View office',
+      locality: 'Mountain View',
+      zone: 'America/Los_Angeles',
+    });
+    await setRhythm({ weekdays: ['thu'], placeId: mv.id, start: '09:00', end: '17:00' });
+    const answer = await reads.freeTime(
+      { from: '2026-11-12T16:45:00Z', to: '2026-11-12T17:15:00Z', minutes: 30 },
+      emailSession,
+      'remote-rhythm',
+    );
+    expect(answer.windows).toEqual([
+      expect.objectContaining({ start: '2026-11-12T16:45:00.000Z', end: '2026-11-12T17:15:00.000Z' }),
+    ]);
+  });
+
+  it.each(['tool retry', 'resume sweep'] as const)(
+    'rechecks current chat identities before returning a recovered booking’s people facts (%s)',
+    async (mode) => {
+      await mainSession();
+      vi.spyOn(mainNotesModule, 'writeNoteForMain').mockRejectedValueOnce(new Error('Main note interrupted'));
+      expect(await reads.book(BOOK, chatSession, 'recover-people')).toBe(ANSWER_LATER);
+      expect(await getBookingRequest(chatSession.id, 'recover-people')).toMatchObject({
+        applied: true,
+        reported: false,
+      });
+      platformMembers([{ key: 'whatsapp:11', name: 'Morgan', isPrincipal: true }]);
+      let answer: unknown;
+      if (mode === 'tool retry') answer = answerData(await reads.book(BOOK, chatSession, 'recover-people'));
+      else {
+        await reads.resumePending();
+        const frame = responseIn(chatSession, 'recover-people');
+        expect(frame?.ok).toBe(true);
+        answer = frame?.ok ? frame.data : undefined;
+      }
+      expect(answer).toMatchObject({ people: [] });
+      expect(JSON.stringify(answer)).not.toContain(MIRA);
+      expect(calendar.writes.map((write) => write.op)).toEqual(['insert']);
+    },
+  );
+});
+
 it('offers the same windows in text with both-zone labels from either real surface, including the booking calendar', async () => {
+  await recordAuthenticatedThreadSender(thread, MIRA, new Date().toISOString());
   calendar.put({
     calendarId: PRINCIPAL,
     id: 'private-principal',
@@ -80,6 +390,7 @@ it('offers the same windows in text with both-zone labels from either real surfa
       start: '2026-10-20T09:00:00.000Z',
       end: '2026-10-20T12:00:00.000Z',
       principal_time: 'Tuesday, Oct 20, 9:00 AM–12:00 PM UTC',
+      zone: 'UTC',
       their_time: 'Tuesday, Oct 20, 11:00 AM–2:00 PM CEST',
       fit: 'acceptable',
     },
@@ -87,6 +398,7 @@ it('offers the same windows in text with both-zone labels from either real surfa
       start: '2026-10-20T13:00:00.000Z',
       end: '2026-10-20T14:00:00.000Z',
       principal_time: 'Tuesday, Oct 20, 1:00–2:00 PM UTC',
+      zone: 'UTC',
       their_time: 'Tuesday, Oct 20, 3:00–4:00 PM CEST',
       fit: 'acceptable',
     },
@@ -94,6 +406,7 @@ it('offers the same windows in text with both-zone labels from either real surfa
       start: '2026-10-20T15:00:00.000Z',
       end: '2026-10-20T17:00:00.000Z',
       principal_time: 'Tuesday, Oct 20, 3:00–5:00 PM UTC',
+      zone: 'UTC',
       their_time: 'Tuesday, Oct 20, 5:00–7:00 PM CEST',
       fit: 'acceptable',
     },
@@ -103,7 +416,7 @@ it('offers the same windows in text with both-zone labels from either real surfa
   expect(JSON.stringify(email)).not.toMatch(
     /Private therapy|Private review|private-principal|private-booking-calendar/,
   );
-  expect(details).not.toHaveBeenCalled();
+  expect(details).toHaveBeenCalled();
 });
 
 it('refuses a missing booking calendar on both surfaces before making any Calendar call', async () => {
@@ -118,7 +431,7 @@ it('refuses a missing booking calendar on both surfaces before making any Calend
 
 it('refuses a booking calendar that is no longer bookable separately from an unset calendar', async () => {
   calendar.calendars.set(TEAM, { id: TEAM, dataOwner: PRINCIPAL, accessRole: 'reader' });
-  const listing = vi.spyOn(calendar, 'listEvents');
+  const listing = vi.spyOn(calendar, 'listLocatedEvents');
   for (const session of [emailSession, chatSession])
     await expect(reads.freeTime(RANGE, session, 'unbookable')).rejects.toThrow(
       'no longer one the assistant can book on',
@@ -130,7 +443,7 @@ it('reads a principal calendar and the same booking calendar in another case onl
   await replacePrincipalCalendars([PRINCIPAL.toUpperCase()], new Date().toISOString());
   await setThreadBookingCalendar(thread, PRINCIPAL);
   await setChatCalendar(chat, PRINCIPAL);
-  const listing = vi.spyOn(calendar, 'listEvents');
+  const listing = vi.spyOn(calendar, 'listLocatedEvents');
   for (const session of [emailSession, chatSession]) {
     listing.mockClear();
     await reads.freeTime(RANGE, session, 'dedupe');
@@ -284,6 +597,20 @@ async function booked(session = chatSession): Promise<string> {
   return String(answerData(await reads.book(BOOK, session, 'initial')).booking);
 }
 
+it.each([undefined, { dateTime: 'not an instant' }, { date: 'not a date' }])(
+  'refuses an owned event with an unreadable start through the booking contract (%j)',
+  async (start) => {
+    const id = await booked(emailSession);
+    const stored = calendar.event(TEAM, id);
+    if (!stored) throw new Error('The booked event is absent');
+    calendar.put({ ...stored, start });
+    await expect(
+      reads.changeBooking({ booking: id, title: 'Morgan and Remy' }, emailSession, 'unreadable-start'),
+    ).rejects.toThrow('The booking has no readable time. Ask main with tell_main.');
+    expect(calendar.writes.map((write) => write.op)).toEqual(['insert']);
+  },
+);
+
 it.each(['thread', 'chat'] as const)(
   'books a %s meeting with its owner label, durable ownership and a full main note before success',
   async (kind) => {
@@ -304,10 +631,11 @@ it.each(['thread', 'chat'] as const)(
     expect(await getBookingRequest(session.id, 'book-note')).toMatchObject({ applied: true, reported: true });
     expect(notesIn(main)).toHaveLength(1);
     expect(notesIn(main)[0]).toContain(
-      'Booked a meeting with mira@example.com for Tuesday, Oct 20, 2:00–2:30 PM CEST (30 minutes), by video call',
+      'Booked a meeting with mira@example.com for Tuesday, Oct 20, 12:00–12:30 PM UTC (30 minutes), by video call',
     );
     expect(notesIn(main)[0]).toContain('untrusted');
     expect(notesIn(main)[0]).toContain('Venue visit');
+    expect(notesIn(main)[0]).toContain('Findings for 2026-10-20:');
     expect(
       await getDb().get(
         "SELECT matter_id FROM gws_ea_matter_links WHERE kind='event' AND reference=?",
@@ -430,7 +758,7 @@ it('reports the current time when a marked change landed and the principal subse
   calendar.put({ ...event, start: { dateTime: '2026-10-22T13:00:00Z' }, end: { dateTime: '2026-10-22T13:30:00Z' } });
   const result = answerData(await reads.changeBooking(content, chatSession, 'marked-change'));
   expect(result.start).toBe('2026-10-22T13:00:00.000Z');
-  expect(notesIn(main)[1]).toContain('Thursday, Oct 22, 3:00–3:30 PM CEST');
+  expect(notesIn(main)[1]).toContain('Thursday, Oct 22, 1:00–1:30 PM UTC');
   expect(calendar.writes.filter((entry) => entry.op === 'patch')).toHaveLength(1);
 });
 
@@ -822,7 +1150,7 @@ it.each(['book', 'change'] as const)(
 
 it.each(['book', 'change'] as const)('checks a live %s once, then writes what it checked', async (action) => {
   const id = action === 'change' ? await booked(emailSession) : undefined;
-  const listing = vi.spyOn(calendar, 'listEvents');
+  const listing = vi.spyOn(calendar, 'listLocatedEvents');
   const calendars = vi.spyOn(calendar, 'getCalendar');
   answerData(
     id === undefined

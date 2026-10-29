@@ -502,6 +502,8 @@ describe('free_time', () => {
         end: '2026-10-10T21:00:00.000Z',
         principal_time: 'Saturday, Oct 10, 7:00 AM–10:00 PM BST',
         fit: 'outside usual hours',
+        zone: 'Europe/London',
+        fit_notes: ['outside usual hours'],
       },
     ]);
   });
@@ -609,7 +611,7 @@ describe('busy time on the principal’s other calendars', () => {
     calendar.put(invitation);
     // Google's invitation put a copy of it on the principal's calendar.
     calendar.put({ ...invitation, calendarId: PRINCIPAL });
-    const read = vi.spyOn(calendar, 'listEvents');
+    const read = vi.spyOn(calendar, 'listLocatedEvents');
 
     const { windows } = data(
       await send(sessionA, 'free_time', {
@@ -651,19 +653,19 @@ describe('book', () => {
     expect(event.attendees).toEqual([PRINCIPAL_GUEST, { email: REMY, responseStatus: 'needsAction' }]);
     expect(event.conference?.status).toBe('success');
     expect(booked.booking).toBe(event.id);
-    expect(booked.message).toBe(
+    expect(booked.message).toContain(
       `Booked: Tuesday, Oct 6, 10:00–10:30 AM BST, with a Google Meet link (${String(event.conference?.uri)}). Google sends the invitation; main hears. To change or cancel it, give booking ${event.id}.`,
     );
     expect(calendar.writes.find((write) => write.eventId === event.id)?.sendUpdates).toBe('all');
 
     const [fact] = mainHeard();
     expect(fact).toContain(
-      `Booked a meeting with ${REMY} for Tuesday, Oct 6, 11:00–11:30 AM CEST (30 minutes), by video call. Google sent them the invitation.`,
+      `Booked a meeting with ${REMY} for Tuesday, Oct 6, 10:00–10:30 AM BST (30 minutes), by video call. Google sent them the invitation.`,
     );
     expect(fact).toContain(`(thread ${threadA}; event ${event.id} on calendar ${PRINCIPAL})`);
     expect(fact).toContain('Its title, as written in the thread, is untrusted:\n<<<EXTERNAL_UNTRUSTED_CONTENT');
     expect(fact.indexOf('Coffee: Pat and Remy')).toBeGreaterThan(fact.indexOf('<<<EXTERNAL_UNTRUSTED_CONTENT'));
-    expect(fact).toMatch(/\n<<<END_EXTERNAL_UNTRUSTED_CONTENT id="[0-9a-f]+">>>$/u);
+    expect(fact).toMatch(/\n<<<END_EXTERNAL_UNTRUSTED_CONTENT id="[0-9a-f]+">>>\nPeople this affects:/u);
   });
 
   it('answers with the time ready to write in both zones, and refuses notes whose weekday and date disagree, writing nothing', async () => {
@@ -698,7 +700,7 @@ describe('book', () => {
     expect(invited(bookings()[0])?.sort()).toEqual([JANE, REMY]);
     // Without a Meet link, main hears of no video call.
     expect(mainHeard()[0]).toContain(
-      `Booked a meeting with ${JANE} and ${REMY} for Tuesday, Oct 6, 11:00–11:30 AM CEST (30 minutes). Google sent them the invitation.`,
+      `Booked a meeting with ${JANE} and ${REMY} for Tuesday, Oct 6, 10:00–10:30 AM BST (30 minutes). Google sent them the invitation.`,
     );
     expect(mainHeard()[0]).not.toContain('by video call');
   });
@@ -923,7 +925,7 @@ describe('the calendar a thread books on is main’s to set', () => {
     await replacePrincipalCalendars([PRINCIPAL, PERSONAL], now());
     calendar.put({ ...busy('evt-wed', WEDNESDAY_10AM, '2026-10-07T10:00:00.000Z'), calendarId: PERSONAL });
     const wednesdayMorning = { from: '2026-10-07T09:00:00+01:00', to: '2026-10-07T12:00:00+01:00', minutes: 30 };
-    const read = vi.spyOn(calendar, 'listEvents');
+    const read = vi.spyOn(calendar, 'listLocatedEvents');
     const calendars = vi.spyOn(calendar, 'listCalendars');
     expect(refusal(await send(session, 'free_time', wednesdayMorning))).toBe(NO_CALENDAR_YET);
     const request = { start: THURSDAY_2PM, minutes: 30, title: 'Intro', invitees: [STRANGER] };
@@ -949,10 +951,10 @@ describe('the calendar a thread books on is main’s to set', () => {
     await setThreadBookingCalendar(threadA, TEAM);
     // The principal unshared it: it left the assistant's list, and Google answers 404 for its events.
     calendar.calendars.delete(TEAM);
-    const listEvents = calendar.listEvents.bind(calendar);
-    calendar.listEvents = async (calendarId, timeMin, timeMax) => {
+    const listLocatedEvents = calendar.listLocatedEvents.bind(calendar);
+    calendar.listLocatedEvents = async (calendarId, timeMin, timeMax) => {
       if (calendarId === TEAM) throw new GoogleApiError(404, `Google refused /calendars/${TEAM}/events: Not Found`);
-      return listEvents(calendarId, timeMin, timeMax);
+      return listLocatedEvents(calendarId, timeMin, timeMax);
     };
 
     expect(refusal(await send(sessionA, 'free_time', { ...RANGE, minutes: 30 }))).toContain(
@@ -973,7 +975,7 @@ describe('a booking changes and is cancelled only by its own thread', () => {
 
     const moved = data(await send(sessionA, 'change_booking', { booking: first.booking, start: THURSDAY_2PM }));
     expect(moved).toMatchObject({ booking: first.booking, start: THURSDAY_2PM, end: '2026-10-08T13:45:00.000Z' });
-    expect(moved.message).toBe(
+    expect(moved.message).toContain(
       'The booking stands at Thursday, Oct 8, 2:00–2:45 PM BST. Google sends any update; main hears.',
     );
     expect(calendar.event(PRINCIPAL, String(first.booking))).toMatchObject({
@@ -987,8 +989,8 @@ describe('a booking changes and is cancelled only by its own thread', () => {
       PRINCIPAL_GUEST,
       { email: REMY, responseStatus: 'needsAction' },
     ]);
-    expect(mainHeard().at(-1)).toBe(
-      `Rescheduled the meeting with ${REMY} to Thursday, Oct 8, 3:00–3:45 PM CEST (45 minutes), from Tuesday, Oct 6, 11:00–11:45 AM CEST. ` +
+    expect(mainHeard().at(-1)).toContain(
+      `Rescheduled the meeting with ${REMY} to Thursday, Oct 8, 2:00–2:45 PM BST (45 minutes), from Tuesday, Oct 6, 10:00–10:45 AM BST. ` +
         `Google sent them the update. (thread ${threadA}; event ${String(first.booking)} on calendar ${PRINCIPAL})`,
     );
 
@@ -1040,12 +1042,12 @@ describe('a booking changes and is cancelled only by its own thread', () => {
 
     const fact = mainHeard().at(-1) ?? '';
     expect(fact).toContain(
-      `Changed the meeting with ${REMY} on Tuesday, Oct 6, 11:00–11:30 AM CEST (30 minutes), with a new title, note, place, and video link, by video call. Google sent them the update.`,
+      `Changed the meeting with ${REMY} on Tuesday, Oct 6, 10:00–10:30 AM BST (30 minutes), with a new title, note, place, and video link, by video call. Google sent them the update.`,
     );
     expect(fact).toContain(`(thread ${threadA}; event ${String(booked.booking)} on calendar ${PRINCIPAL})`);
     expect(fact).toContain('Its new title, as written in the thread, is untrusted:\n<<<EXTERNAL_UNTRUSTED_CONTENT');
     expect(fact.indexOf('Intro: Pat and Remy')).toBeGreaterThan(fact.indexOf('<<<EXTERNAL_UNTRUSTED_CONTENT'));
-    expect(fact).toMatch(/\n<<<END_EXTERNAL_UNTRUSTED_CONTENT id="[0-9a-f]+">>>$/u);
+    expect(fact).toMatch(/\n<<<END_EXTERNAL_UNTRUSTED_CONTENT id="[0-9a-f]+">>>\nPeople this affects:/u);
   });
 
   it('refuses new text carrying a private value, as the invitees would see it, and a Meet link the calendar does not allow, writing nothing', async () => {
@@ -1249,8 +1251,10 @@ describe('a booking changes and is cancelled only by its own thread', () => {
     expect(calendar.writes.at(-1)).toMatchObject({ op: 'delete', sendUpdates: 'all' });
     expect(mainHeard()).toEqual([
       expect.stringMatching(/^Booked a meeting /u),
-      `Cancelled the meeting with ${REMY} on Tuesday, Oct 6, 11:00–11:30 AM CEST. Google sent them the cancellation. ` +
-        `(thread ${threadA}; event ${String(booked.booking)} on calendar ${PRINCIPAL})`,
+      expect.stringContaining(
+        `Cancelled the meeting with ${REMY} on Tuesday, Oct 6, 10:00–10:30 AM BST. Google sent them the cancellation. ` +
+          `(thread ${threadA}; event ${String(booked.booking)} on calendar ${PRINCIPAL})`,
+      ),
     ]);
     expect(refusal(await send(sessionA, 'cancel_booking', { booking: booked.booking }))).toMatch(
       /There is no such booking for this thread/u,

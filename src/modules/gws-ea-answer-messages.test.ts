@@ -54,10 +54,22 @@ const REVIEWED: Readonly<Record<string, Review>> = {
     kind: 'host-only',
     reason: 'the response frame keeps its transport error code; the rendered error message explains the refusal',
   },
-  'gws-ea-meetings/booking.ts freeTime: windows, windows_not_listed': {
+  'gws-ea-meetings/booking.ts shapingFacts: meeting_lengths, people': {
     kind: 'rendered',
-    reason: 'the message lists the free windows, both time zones, preference fit and omitted window count',
+    reason:
+      'the message states every permitted participant relationship, record flag, history count or unknown result, and recorded meeting length',
   },
+  'gws-ea-meetings/booking.ts freeTime: meeting_lengths, people, windows, windows_not_listed': {
+    kind: 'rendered',
+    reason:
+      'the message lists the free windows, local zones and locality, fit notes, omitted window count and permitted participant/length facts',
+  },
+  "gws-ea-meetings/booking.ts finishRequest: ...(row.action === 'change' ? { move: 'change' } : {}), ...outcome.result, meeting_lengths, organizer, people":
+    {
+      kind: 'rendered',
+      reason:
+        'the resulting booking message includes current permitted participant and length facts, principal organizer ownership and whether the move changes the booking; base outcome fields are reviewed separately',
+    },
   'gws-ea-meetings/booking.ts changedOutcome: booking': {
     kind: 'host-only',
     reason: 'the booking id is the request input; the refusal gives the current time and the ask-main step',

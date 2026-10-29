@@ -174,7 +174,14 @@ import { flushPendingCalendarChanges, createCalendarListApi, UNSHARED_RETRY_MS }
 import { emailMessagingGroupIds, listPrincipalCalendars, recordFailedAttempt } from './db.js';
 import { MAX_ATTACHMENT_BYTES, MESSAGES_PER_SENDER_PER_HOUR } from './route-mail.js';
 import { runnerPoll } from './testing/runner-poll.js';
-import { attachGmailThread, releaseThread, threadAddresses, threadMessages, threadPlacement } from './thread-map.js';
+import {
+  attachGmailThread,
+  releaseThread,
+  threadAddresses,
+  threadMessages,
+  threadPlacement,
+  threadSchedulingPeople,
+} from './thread-map.js';
 
 const JUNO = 'juno@assistant.example';
 const PRINCIPAL = 'pat@principal.example';
@@ -1632,6 +1639,28 @@ describe('routing by audience', () => {
     ]);
     expect(addresses).not.toContain('mallory@elsewhere.example');
     expect(addresses).not.toContain('lee@elsewhere.example');
+  });
+
+  it('stores scheduling identity only from Gmail’s authenticated From, never copied addresses, body text or an unverified From', async () => {
+    const remy = 'remy.vance@outside.example';
+    const juno = 'juno.hale@outside.example';
+    gmail.receive({
+      threadId: 'g-identity-proof',
+      from: remy,
+      auth: 'dmarc-pass',
+      cc: ['copied@outside.example'],
+      body: 'Please include body@outside.example.',
+    });
+    await inbox.tick();
+    const [mail] = await outsideMail();
+    const key = mail.row.thread_id ?? '';
+    expect(await threadSchedulingPeople(key)).toEqual([remy]);
+    gmail.receive({ threadId: 'g-identity-proof', from: juno, auth: 'none', body: 'I am Juno.' });
+    await inbox.tick();
+    expect(await threadSchedulingPeople(key)).toEqual([remy]);
+    gmail.receive({ threadId: 'g-identity-proof', from: juno, auth: 'dmarc-pass', body: 'Confirmed sender.' });
+    await inbox.tick();
+    expect(await threadSchedulingPeople(key)).toEqual([juno, remy]);
   });
 
   it('never marks a display name as the principal: only Gmail verifying a principal address does', async () => {

@@ -264,6 +264,30 @@ export async function threadAddresses(threadKey: string): Promise<ThreadAddress[
   );
 }
 
+/** Only Gmail's authenticated From verdict establishes sender identity; carrying an address does not. */
+export async function recordAuthenticatedThreadSender(threadKey: string, value: string, at: string): Promise<void> {
+  const address = normalizeAddress(value);
+  if (address === undefined) throw new Error(`Not an email address: ${JSON.stringify(value)}`);
+  await getDb().run(
+    `INSERT INTO gws_ea_thread_addresses (thread_key, address, source, recorded_at, sender_authenticated)
+      VALUES (?, ?, 'message', ?, 1)
+      ON CONFLICT (thread_key, address, source) DO UPDATE SET sender_authenticated = 1`,
+    threadKey,
+    address,
+    at,
+  );
+}
+
+/** Identities this reader already knows, rather than every address someone copied or mentioned. */
+export async function threadSchedulingPeople(threadKey: string): Promise<string[]> {
+  const rows = await getDb().all<{ address: string }>(
+    `SELECT DISTINCT address FROM gws_ea_thread_addresses
+      WHERE thread_key = ? AND (source = 'main' OR sender_authenticated = 1) ORDER BY address`,
+    threadKey,
+  );
+  return rows.map((row) => row.address);
+}
+
 export async function threadsWithAddresses(
   matches: (address: string) => boolean,
 ): Promise<{ readonly threadKeys: readonly string[]; readonly addresses: readonly string[] }> {

@@ -4,8 +4,8 @@
  * container or an argument list.
  *
  * `getEvent`, `listEvents` and every write fetch no title, description or
- * location, so what they return can serve external-email. Only
- * `listEventDetails` and `getGuests` read an event's words.
+ * location, so what they return can serve external-email. The host-only
+ * `listLocatedEvents` adds location for availability; detail reads also carry titles and names.
  */
 import { isRecord } from '../../gws-ea/validation.js';
 import type { CalendarListEntry } from '../gws-ea-inbox/calendar-notifications.js';
@@ -58,6 +58,11 @@ export interface CalendarEvent {
  */
 export type ListedEvent = Omit<CalendarEvent, 'id'> & { readonly id?: string };
 
+/** Host-only availability input: location may be private and never reaches an outward result. */
+export interface LocatedEvent extends ListedEvent {
+  readonly location?: string;
+}
+
 export interface DetailedConference extends EventConference {
   readonly conferenceId?: string;
   readonly entryPoints: readonly { readonly entryPointType: string; readonly uri: string; readonly label?: string }[];
@@ -67,7 +72,7 @@ export interface DetailedAttendee extends EventAttendee {
   readonly displayName?: string;
 }
 
-/** Carries titles and names, so it is never read for external-email. */
+/** Host-only detail: titles and names never reach an outward reader. */
 export interface DetailedEvent {
   readonly visibility?: string;
   readonly reminders?: 'default' | 'none' | 'custom';
@@ -187,7 +192,8 @@ export interface MeetingsCalendarApi {
   ): Promise<Readonly<Record<string, readonly { readonly start: string; readonly end: string }[]>>>;
   /** Every live event that overlaps the interval, recurring events expanded. */
   listEvents(calendarId: string, timeMin: string, timeMax: string): Promise<ListedEvent[]>;
-  /** As `listEvents`, with titles, names and series: never for external-email. */
+  listLocatedEvents(calendarId: string, timeMin: string, timeMax: string): Promise<LocatedEvent[]>;
+  /** Host-only titles, names and series; outward answers project only permitted facts. */
   listEventDetails(calendarId: string, timeMin: string, timeMax: string): Promise<DetailedEvent[]>;
   /** `exists` when Google already holds that id, deleted or not. */
   insertEvent(
@@ -237,6 +243,7 @@ export interface MeetingsCalendarApi {
 const CALENDAR_API = 'https://www.googleapis.com/calendar/v3';
 const EVENT_FIELDS =
   'id,etag,iCalUID,status,transparency,organizer(email),attendees(email,responseStatus,resource,organizer,self),start(dateTime,date),end(dateTime,date),extendedProperties(private),conferenceData(createRequest(status(statusCode)),entryPoints(entryPointType,uri))';
+const LOCATED_FIELDS = `${EVENT_FIELDS},location`;
 /** Includes titles and names, so nothing read with it may reach external-email. */
 const DETAIL_FIELDS =
   'id,etag,iCalUID,status,transparency,visibility,reminders(useDefault,overrides(method,minutes)),guestsCanModify,summary,description,location,creator(email,displayName,self),organizer(email,self),attendees(email,displayName,responseStatus,resource,organizer,self),attendeesOmitted,recurringEventId,recurrence,originalStartTime(dateTime,date,timeZone),start(dateTime,date,timeZone),end(dateTime,date,timeZone),eventType,extendedProperties(private),conferenceData(conferenceId,createRequest(status(statusCode)),entryPoints(entryPointType,uri,label))';
@@ -418,6 +425,12 @@ function toEvent(value: unknown): CalendarEvent {
   const event = toListedEvent(value);
   if (event.id === undefined) throw new GoogleApiError(502, 'Google Calendar returned an event without an id');
   return { ...event, id: event.id };
+}
+
+function toLocatedEvent(value: unknown): LocatedEvent {
+  const event = toListedEvent(value);
+  const location = isRecord(value) ? optionalString(value.location) : undefined;
+  return { ...event, ...(location === undefined ? {} : { location }) };
 }
 
 function eventTime(at: string, timeZone: string | undefined, allDay: boolean | undefined): Record<string, string> {
@@ -624,6 +637,9 @@ export function createMeetingsCalendarApi(options: GoogleClientOptions): Meeting
     listCalendars: () => readAllPages('users/me/calendarList', {}, 'calendar list', toCalendarEntry),
 
     listEvents: (calendarId, timeMin, timeMax) => listPages(calendarId, timeMin, timeMax, EVENT_FIELDS, toListedEvent),
+
+    listLocatedEvents: (calendarId, timeMin, timeMax) =>
+      listPages(calendarId, timeMin, timeMax, LOCATED_FIELDS, toLocatedEvent),
 
     listEventDetails: (calendarId, timeMin, timeMax) =>
       listPages(calendarId, timeMin, timeMax, DETAIL_FIELDS, toDetailedEvent),

@@ -70,6 +70,8 @@ import {
   type SendScope,
 } from './thread-map.js';
 import { ensureInbox, ensurePrincipalConversation } from './wiring-policy.js';
+import { threadAuthenticationMigration } from './thread-authentication-migration.js';
+import '../gws-ea-whereabouts/index.js';
 
 registerMigration(gwsEaInboxMigration);
 registerMigration(gwsEaInboxEmailChannelMigration);
@@ -79,6 +81,7 @@ registerMigration(gwsEaInboxUnsignedNoticesMigration);
 registerMigration(gwsEaInboxCalendarAccessMigration);
 registerMigration(gwsEaInboxThreadAccountsMigration);
 registerMigration(gwsEaInboxThreadPlacementMigration);
+registerMigration(threadAuthenticationMigration);
 
 let live: Inbox | undefined;
 

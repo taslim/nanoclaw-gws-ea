@@ -44,6 +44,41 @@ const WRITE = {
 };
 
 describe('the Calendar client', () => {
+  it('reads every page of locations on the host without requesting or retaining titles, descriptions or names', async () => {
+    const { api, requests } = stubGoogle((request) => ({
+      status: 200,
+      body: {
+        items: [
+          {
+            id: request.url.searchParams.has('pageToken') ? 'second' : 'first',
+            location: 'Remy’s office',
+            summary: 'Private title',
+            description: 'Private notes',
+            attendees: [{ email: 'juno.hale@outside.example', displayName: 'Private record name' }],
+            start: { dateTime: '2026-11-12T18:00:00Z' },
+            end: { dateTime: '2026-11-12T19:00:00Z' },
+          },
+        ],
+        ...(request.url.searchParams.has('pageToken') ? {} : { nextPageToken: 'next' }),
+      },
+    }));
+    const listed = await api.listLocatedEvents(
+      'morgan@principal.example',
+      '2026-11-12T00:00:00Z',
+      '2026-11-13T00:00:00Z',
+    );
+    expect(listed.map((event) => ({ id: event.id, location: event.location }))).toEqual([
+      { id: 'first', location: 'Remy’s office' },
+      { id: 'second', location: 'Remy’s office' },
+    ]);
+    expect(JSON.stringify(listed)).not.toMatch(/Private title|Private notes|Private record name/u);
+    for (const request of requests) {
+      const fields = request.url.searchParams.get('fields');
+      expect(fields).toContain('location');
+      expect(fields).not.toMatch(/summary|description|displayName/u);
+    }
+  });
+
   it('creates an event with its own id, its tags, and its guests with the answers given, asking for nothing back but the id', async () => {
     const { api, requests } = stubGoogle(() => ({ status: 200, body: { id: 'abc123' } }));
     expect(await api.insertEvent('pat@principal.example', 'abc123', WRITE, 'all')).toBe('created');

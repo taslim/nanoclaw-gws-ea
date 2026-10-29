@@ -219,12 +219,21 @@ export const freeTime = requestTool({
   ...common,
   name: 'free_time',
   description:
-    "The principal's free windows between from and to for a meeting of minutes, in date order: any start that ends by a window's end is free. Each shows the principal's time, the other side's when you give timezone (their night left out), and how it fits the principal's preferences. You pick the times. Main must have set this thread's booking calendar before you offer times.",
+    "Free windows on each day's local clock, with fit notes and deciding facts about people already known on this thread. Choose the length for the principal and optionally the meeting kind and in-person place. Give timezone for the other side's clock and waking day. Main must have set this thread's booking calendar before you offer times. Return no calendar or trip details to anyone.",
   properties: {
     from: { type: 'string', description: `The earliest start. ${DATE_TIME}` },
     to: { type: 'string', description: `When the meeting must be over. ${DATE_TIME}` },
     minutes: MINUTES,
     timezone: THEIR_ZONE,
+    kind: {
+      type: 'string',
+      description:
+        'The meeting kind you choose; its recorded buffer and preferred times apply, falling back to default.',
+    },
+    place: {
+      type: 'string',
+      description: 'The saved place or venue for an in-person meeting; omit for a remote meeting.',
+    },
   },
   required: ['from', 'to', 'minutes'],
   repeatable: true,

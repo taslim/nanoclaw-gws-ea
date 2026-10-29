@@ -113,6 +113,41 @@ describe('wall-clock times', () => {
 });
 
 describe('free time', () => {
+  it('uses an explicitly chosen kind, falling back to default separately for each preference', () => {
+    const values = {
+      ...NONE,
+      working_hours: workingDays('09:00', '17:00'),
+      buffers: [
+        { ...PROVENANCE, meeting_kind: 'default', minutes: 15 },
+        { ...PROVENANCE, meeting_kind: 'coffee', minutes: 45 },
+      ],
+      preferred_times: [
+        { ...PROVENANCE, meeting_kind: 'default', weekdays: ['tue' as const], start: '10:00', end: '11:00' },
+        { ...PROVENANCE, meeting_kind: 'lunch', weekdays: ['tue' as const], start: '12:00', end: '13:00' },
+      ],
+    };
+    expect(schedulingRules(values, 'coffee').bufferMinutes).toBe(45);
+    expect(schedulingRules(values, 'coffee').preferredTimes).toEqual(schedulingRules(values).preferredTimes);
+    const lunch = schedulingRules(values, 'lunch');
+    expect(lunch.bufferMinutes).toBe(15);
+    expect(fitOf(span('2026-10-06T11:00:00Z', '2026-10-06T12:00:00Z'), lunch, LONDON)).toBe('preferred');
+    expect(schedulingRules(values, 'unrecorded')).toEqual(schedulingRules(values));
+  });
+
+  it('keeps the local waking day visible while fitting a stay kept on home hours', () => {
+    const windows = freeWindows(
+      query({
+        timezone: 'Africa/Lagos',
+        rulesTimezone: LOS_ANGELES,
+        window: span('2026-11-12T06:00:00Z', '2026-11-12T21:00:00Z'),
+      }),
+    );
+    expect(shown(windows, 'Africa/Lagos')).toEqual([
+      'Thu 07:00–18:00 outside usual hours',
+      'Thu 18:00–22:00 acceptable',
+    ]);
+  });
+
   it("lists the principal's waking day on the same local hours on both sides of a clock change, split where the fit changes", () => {
     const windows = freeWindows(query({ window: span('2026-10-22T23:00:00Z', '2026-10-27T00:00:00Z') }));
     expect(on('Fri', windows)).toEqual([

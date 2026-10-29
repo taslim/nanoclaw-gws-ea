@@ -187,12 +187,21 @@ export const chatFreeTime = requestTool({
   name: 'free_time',
   repeatable: true,
   description:
-    'Find free windows for this chat on the principal’s calendars. Returns times and fit only. Main must have set this chat’s booking calendar. Give the meeting’s length; pick any start that finishes in a window.',
+    'Find free windows on each day’s local clock, with fit notes and deciding facts for current members with known emails. Choose the length for the principal and optionally the meeting kind and in-person place. Main must have set this chat’s booking calendar. Return no calendar or trip details to members.',
   properties: {
     from: start,
     to: { type: 'string', description: 'Latest finish, with UTC offset.' },
     minutes,
     timezone,
+    kind: {
+      type: 'string',
+      description:
+        'The meeting kind you choose; its recorded buffer and preferred times apply, falling back to default.',
+    },
+    place: {
+      type: 'string',
+      description: 'The saved place or venue for an in-person meeting; omit for a remote meeting.',
+    },
   },
   required: ['from', 'to', 'minutes'],
 });

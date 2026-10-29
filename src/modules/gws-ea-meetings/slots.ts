@@ -187,21 +187,25 @@ function weekly(value: {
   return range && { ...range, weekdays: new Set(value.weekdays) };
 }
 
-export function schedulingRules(values: SchedulingPreferenceValues): SchedulingRules {
+export function schedulingRules(values: SchedulingPreferenceValues, kind = DEFAULT_MEETING_KIND): SchedulingRules {
   const workingHours = new Map<Weekday, ClockRange>();
   for (const day of values.working_hours) {
     if (day.off) continue;
     const range = clockRange(day.start, day.end);
     if (range) workingHours.set(day.weekday, range);
   }
-  const preferred: readonly PreferenceValue<PreferredTimePreference>[] = values.preferred_times.filter(
-    (value) => value.meeting_kind === DEFAULT_MEETING_KIND,
-  );
+  const chosen = values.preferred_times.filter((value) => value.meeting_kind === kind);
+  const preferred: readonly PreferenceValue<PreferredTimePreference>[] =
+    chosen.length > 0 ? chosen : values.preferred_times.filter((value) => value.meeting_kind === DEFAULT_MEETING_KIND);
   return {
     workingHours: values.working_hours.length === 0 ? DEFAULT_WORKING_HOURS : workingHours,
     protectedWindows: values.protected_windows.flatMap((value) => weekly(value) ?? []),
     preferredTimes: preferred.flatMap((value) => weekly(value) ?? []),
-    bufferMinutes: values.buffers.find((value) => value.meeting_kind === DEFAULT_MEETING_KIND)?.minutes ?? 0,
+    bufferMinutes:
+      (
+        values.buffers.find((value) => value.meeting_kind === kind) ??
+        values.buffers.find((value) => value.meeting_kind === DEFAULT_MEETING_KIND)
+      )?.minutes ?? 0,
   };
 }
 
@@ -271,6 +275,8 @@ export function fitOf(span: Span, rules: SchedulingRules, timezone: string): Fit
 
 export interface FreeTimeQuery {
   readonly timezone: string;
+  /** A stay kept on home hours still offers the waking day on its local clock. */
+  readonly rulesTimezone?: string;
   /** The counterpart's zone, when known: every window falls inside their waking day too. */
   readonly counterpartTimezone?: string;
   readonly lengthMinutes: number;
@@ -341,18 +347,21 @@ function onQuarterHours(span: Span): Span {
  * window is labeled with the fit of the window as a whole, which every
  * meeting inside it meets.
  */
-function byFit(run: Span, date: LocalDate, rules: SchedulingRules, timezone: string, length: number): FreeWindow[] {
-  const weekday = weekdayOf(date);
-  const hours = rules.workingHours.get(weekday);
-  const ranges: ClockRange[] = [
-    ...(hours === undefined ? [] : [hours]),
-    ...rules.preferredTimes.filter((window) => window.weekdays.has(weekday)),
-    ...rules.protectedWindows.filter((window) => window.weekdays.has(weekday)),
-  ];
+function byFit(run: Span, rules: SchedulingRules, timezone: string, length: number): FreeWindow[] {
   const cuts = new Set<number>();
-  for (const range of ranges) {
-    const { start, end } = onDay(date, range, timezone);
-    for (const cut of [start, end]) if (cut > run.start && cut < run.end) cuts.add(cut);
+  const lastDate = localTime(run.end - 1, timezone);
+  for (let date: LocalDate = localTime(run.start, timezone); compareDates(date, lastDate) <= 0; date = nextDate(date)) {
+    const weekday = weekdayOf(date);
+    const hours = rules.workingHours.get(weekday);
+    const ranges: ClockRange[] = [
+      ...(hours === undefined ? [] : [hours]),
+      ...rules.preferredTimes.filter((window) => window.weekdays.has(weekday)),
+      ...rules.protectedWindows.filter((window) => window.weekdays.has(weekday)),
+    ];
+    for (const range of ranges) {
+      const { start, end } = onDay(date, range, timezone);
+      for (const cut of [start, end]) if (cut > run.start && cut < run.end) cuts.add(cut);
+    }
   }
   const points = [run.start, ...[...cuts].sort((a, b) => a - b), run.end];
   const fitted = (span: Span): FreeWindow => ({ ...span, fit: fitOf(span, rules, timezone) });
@@ -404,7 +413,7 @@ export function freeWindows(query: FreeTimeQuery): FreeWindow[] {
       open = open.flatMap((span) => within([span], wakingDays(span, counterpartTimezone)));
     }
     for (const run of without(open, taken).map(onQuarterHours)) {
-      if (run.end - run.start >= length) windows.push(...byFit(run, date, rules, timezone, length));
+      if (run.end - run.start >= length) windows.push(...byFit(run, rules, query.rulesTimezone ?? timezone, length));
     }
   }
   return windows.sort((a, b) => a.start - b.start);

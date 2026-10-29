@@ -107,6 +107,7 @@ import {
   placementAsked,
   recordPlacementNote,
   recordThreadAddresses,
+  recordAuthenticatedThreadSender,
   recordThreadMessage,
   threadPlacement,
   unplaceThread,
@@ -227,7 +228,12 @@ function writtenAddresses(mail: ParsedMail): string[] {
 }
 
 /** Safe to repeat. Returns the thread key, a new thread's when the message belongs to none. */
-async function recordInThread(mail: ParsedMail, side: ThreadSide, context: RoutingContext): Promise<string> {
+async function recordInThread(
+  mail: ParsedMail,
+  side: ThreadSide,
+  verdict: Sender,
+  context: RoutingContext,
+): Promise<string> {
   const at = context.at.toISOString();
   const ours = (address: string): boolean => context.assistant.has(address);
   const carried = [...(mail.from ? [mail.from] : []), ...mail.to, ...mail.cc]
@@ -251,6 +257,7 @@ async function recordInThread(mail: ParsedMail, side: ThreadSide, context: Routi
       at,
     );
     await recordThreadAddresses(thread.threadKey, carried, 'message', at);
+    if (verdict.kind === 'authenticated') await recordAuthenticatedThreadSender(thread.threadKey, verdict.address, at);
     if (written.length > 0) await recordThreadAddresses(thread.threadKey, written, 'written', at);
     return thread.threadKey;
   });
@@ -509,7 +516,7 @@ async function toMain(
   if ((await emailMessagingGroupIds()).principal === null) {
     throw new Error("The principal's email conversation does not exist yet");
   }
-  const threadKey = await recordInThread(mail, 'principal', context);
+  const threadKey = await recordInThread(mail, 'principal', verdict, context);
   const files = await fetchFiles(runtime.gmail, mail);
   // main names the thread by its key when it answers, so the key comes last, after what it is about.
   const text =
@@ -680,7 +687,7 @@ async function toThread(
   context: RoutingContext,
 ): Promise<Routed> {
   if ((await emailMessagingGroupIds()).inbox === null) throw new Error('The inbox does not exist yet');
-  const threadKey = await recordInThread(mail, 'outside', context);
+  const threadKey = await recordInThread(mail, 'outside', verdict, context);
   const awaiting = await awaitedBy(threadKey);
   const files = await fetchFiles(runtime.gmail, mail);
 

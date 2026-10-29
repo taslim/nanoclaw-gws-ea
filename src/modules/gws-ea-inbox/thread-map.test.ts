@@ -19,6 +19,8 @@ import {
   insertPendingSend,
   recordSent,
   recordThreadAddresses,
+  recordAuthenticatedThreadSender,
+  threadSchedulingPeople,
   recordThreadMessage,
   setThreadAccount,
   threadAccount,
@@ -223,6 +225,25 @@ describe("each side's messages", () => {
 });
 
 describe("a thread's addresses", () => {
+  it('offers scheduling facts only for Gmail-authenticated senders and people main named', async () => {
+    const { threadKey } = await createThread('g-remy', AT);
+    await recordThreadAddresses(
+      threadKey,
+      ['juno@outside.example', 'copied@outside.example', 'forged@outside.example'],
+      'message',
+      AT,
+    );
+    await recordThreadAddresses(threadKey, ['body@outside.example'], 'written', AT);
+    await recordThreadAddresses(threadKey, ['remy@outside.example'], 'main', AT);
+    expect(await threadSchedulingPeople(threadKey)).toEqual(['remy@outside.example']);
+    await recordAuthenticatedThreadSender(threadKey, 'Juno@outside.example', LATER);
+    await recordThreadAddresses(threadKey, ['juno@outside.example'], 'message', LATER);
+    expect(await threadSchedulingPeople(threadKey)).toEqual(['juno@outside.example', 'remy@outside.example']);
+    expect((await threadAddresses(threadKey)).filter((entry) => entry.address === 'juno@outside.example')).toEqual([
+      { address: 'juno@outside.example', source: 'message' },
+    ]);
+  });
+
   it('include every address its messages carried, plus those main named, each with how it came', async () => {
     const { threadKey } = await createThread('g-acme', AT);
 

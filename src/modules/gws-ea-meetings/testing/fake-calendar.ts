@@ -23,6 +23,7 @@ import type {
   GuestRecord,
   GuestWriteResult,
   MeetingsCalendarApi,
+  LocatedEvent,
   NewEvent,
   SendUpdates,
 } from '../calendar-api.js';
@@ -257,6 +258,32 @@ export class FakeCalendar implements MeetingsCalendarApi {
     return this.live(calendarId).filter((e) => overlapsInterval(e, min, max));
   }
 
+  async listLocatedEvents(calendarId: string, timeMin: string, timeMax: string): Promise<LocatedEvent[]> {
+    this.call();
+    return this.live(calendarId)
+      .filter((event) => overlapsInterval(event, Date.parse(timeMin), Date.parse(timeMax)))
+      .map((event) => ({
+        id: event.id,
+        etag: event.etag,
+        iCalUID: event.iCalUID,
+        status: event.status,
+        transparency: event.transparency,
+        organizer: event.organizer ? { email: event.organizer.email } : undefined,
+        attendees: event.attendees?.map(({ email, responseStatus, resource, organizer, self }) => ({
+          email,
+          responseStatus,
+          resource,
+          organizer,
+          self,
+        })),
+        start: event.start,
+        end: event.end,
+        tags: event.tags,
+        conference: event.conference,
+        location: event.location,
+      }));
+  }
+
   /** As Google lists them with titles and names: everything stored but the assistant's tags and the calendar. */
   async listEventDetails(calendarId: string, timeMin: string, timeMax: string): Promise<DetailedEvent[]> {
     const listed = await this.listEvents(calendarId, timeMin, timeMax);
@@ -406,6 +433,7 @@ export function delegatingCalendarApi(current: () => MeetingsCalendarApi): Meeti
     getEventDetail: (calendarId, eventId) => current().getEventDetail(calendarId, eventId),
     freeBusy: (ids, start, end) => current().freeBusy(ids, start, end),
     listEvents: (calendarId, timeMin, timeMax) => current().listEvents(calendarId, timeMin, timeMax),
+    listLocatedEvents: (calendarId, timeMin, timeMax) => current().listLocatedEvents(calendarId, timeMin, timeMax),
     listEventDetails: (calendarId, timeMin, timeMax) => current().listEventDetails(calendarId, timeMin, timeMax),
     insertEvent: (calendarId, eventId, event, sendUpdates) =>
       current().insertEvent(calendarId, eventId, event, sendUpdates),
