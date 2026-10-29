@@ -1,5 +1,7 @@
 import fs from 'fs';
 import path from 'path';
+import { runnerCapabilities } from '../config.js';
+import { WEEK_VIEW_HOOK_COMMAND } from '../week-view/hook.js';
 
 import {
   resolveClaudeExecutionPolicy,
@@ -76,7 +78,7 @@ function writeMemorySessionHook(hook: RuntimeMemoryHookInput): void {
 
   const memoryCommands = new Set([hook.command, ...hook.legacyCommands]);
   const nextSessionStart = sessionStart
-    .map((entry) => removeMemoryCommands(entry, memoryCommands))
+    .map((entry) => removeMemoryCommands(entry, new Set([...memoryCommands, WEEK_VIEW_HOOK_COMMAND])))
     .filter((entry) => entry !== undefined);
   // A registration with no sources keeps memory off: the hook is only removed.
   if (hook.sources.length > 0) {
@@ -85,6 +87,21 @@ function writeMemorySessionHook(hook: RuntimeMemoryHookInput): void {
       hooks: [{ type: 'command', command: hook.command, timeout: 10 }],
     });
   }
+
+  // GWS-EA divergence: the host grants this key only to canonical main.
+  const mainContext = runnerCapabilities().has('gws-ea-main-context');
+  const promptSubmit = hooks.UserPromptSubmit ?? [];
+  if (!Array.isArray(promptSubmit)) throw new Error(`${filePath} hooks.UserPromptSubmit must be an array`);
+  const nextPromptSubmit = promptSubmit
+    .map((entry) => removeMemoryCommands(entry, new Set([WEEK_VIEW_HOOK_COMMAND])))
+    .filter((entry) => entry !== undefined);
+  if (mainContext) {
+    const command = { type: 'command', command: WEEK_VIEW_HOOK_COMMAND, timeout: 10 };
+    nextSessionStart.push({ matcher: 'startup|resume|clear|compact', hooks: [command] });
+    nextPromptSubmit.push({ hooks: [command] });
+  }
+  if (nextPromptSubmit.length) hooks.UserPromptSubmit = nextPromptSubmit;
+  else delete hooks.UserPromptSubmit;
 
   if (nextSessionStart.length > 0) hooks.SessionStart = nextSessionStart;
   else delete hooks.SessionStart;

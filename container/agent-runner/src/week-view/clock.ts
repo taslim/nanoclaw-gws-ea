@@ -49,7 +49,7 @@ function list<T>(value: unknown, parse: (entry: unknown) => T | null): T[] | nul
   }
   return values;
 }
-function parseTimeline(value: unknown): ClockTimeline | null {
+export function parseClockTimeline(value: unknown): ClockTimeline | null {
   if (
     !record(value) ||
     !nullableZone(value.homeZone) ||
@@ -98,23 +98,27 @@ function parseTimeline(value: unknown): ClockTimeline | null {
 }
 
 /** Read one bounded snapshot per operation; malformed or unavailable views use the home clock. */
-export function readClockTimeline(file = WEEK_VIEW_FILE): ClockTimeline | null {
+export function readWeekViewFile(file = WEEK_VIEW_FILE): Record<string, unknown> | null {
   let descriptor: number | undefined;
   try {
-    descriptor = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+    descriptor = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
     const stat = fs.fstatSync(descriptor);
     if (!stat.isFile() || stat.size > WEEK_VIEW_MAX_BYTES) return null;
     const bytes = Buffer.alloc(stat.size + 1);
     const read = fs.readSync(descriptor, bytes, 0, bytes.length, 0);
     if (read > stat.size) return null;
     const value: unknown = JSON.parse(bytes.subarray(0, read).toString('utf8'));
-    return record(value) ? parseTimeline(value.timeline) : null;
+    return record(value) ? value : null;
   } catch (error) {
     if (error instanceof SyntaxError || (error instanceof Error && 'code' in error)) return null;
     throw error;
   } finally {
     if (descriptor !== undefined) fs.closeSync(descriptor);
   }
+}
+export function readClockTimeline(file = WEEK_VIEW_FILE): ClockTimeline | null {
+  const value = readWeekViewFile(file);
+  return value ? parseClockTimeline(value.timeline) : null;
 }
 const end = (s: ClockStay) => s.end ?? Number.POSITIVE_INFINITY;
 function covering(timeline: ClockTimeline, at: number): ClockStay | undefined {

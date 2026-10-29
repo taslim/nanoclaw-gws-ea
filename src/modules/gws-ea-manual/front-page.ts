@@ -1,6 +1,7 @@
 import { getDb } from '../../db/connection.js';
 import { TIMEZONE } from '../../config.js';
 import { formatLocalTime } from '../../timezone.js';
+import { untrustedLine } from '../gws-ea-inbox/untrusted.js';
 import { listPeople, type PersonSummary } from '../gws-ea-people/db.js';
 import { getSchedulingPreferenceValues, type SchedulingPreferenceValues } from '../gws-ea-preferences/db.js';
 import { getGwsEaProfile, type GwsEaProfile } from '../gws-ea-profile/db.js';
@@ -32,12 +33,12 @@ export interface ManualSnapshot {
   readonly withheld: readonly WithheldVersion[];
 }
 
-export function loadManualSnapshot(): Promise<ManualSnapshot> {
+export function loadManualSnapshot(timelineSnapshot?: Timeline): Promise<ManualSnapshot> {
   return getDb().transaction(async () => {
     const [profile, whereabouts, timeline, preferences, innerCircle, sections, withheld] = await Promise.all([
       getGwsEaProfile(),
       getWhereabouts(),
-      loadTimeline(),
+      timelineSnapshot ?? loadTimeline(),
       getSchedulingPreferenceValues(),
       listPeople('inner-circle'),
       getManualSections(),
@@ -130,7 +131,11 @@ export function renderManualFrontPage(snapshot: ManualSnapshot): string {
   );
   const missing = gaps(safeTimeline).filter((gap) => gap.kind !== 'trip-source' || !manualTripSource);
   const message = (gap: (typeof missing)[number]) =>
-    gap.kind === 'trip-source' ? 'Trips: no source yet' : gap.message;
+    gap.kind === 'trip-source'
+      ? 'Trips: no source yet'
+      : gap.kind === 'return'
+        ? untrustedLine(gap.message, 200, 'google_calendar')
+        : gap.message;
   let gapLine = missing.length === 0 ? undefined : `Whereabouts gaps: ${missing.map(message).join('; ')}.`;
   if (gapLine !== undefined && gapLine.length > 200) {
     const durable = missing
@@ -223,6 +228,6 @@ export function renderManualFrontPage(snapshot: ManualSnapshot): string {
   ].join('\n\n');
 }
 
-export async function loadManualFrontPage(): Promise<string> {
-  return renderManualFrontPage(await loadManualSnapshot());
+export async function loadManualFrontPage(timeline?: Timeline): Promise<string> {
+  return renderManualFrontPage(await loadManualSnapshot(timeline));
 }

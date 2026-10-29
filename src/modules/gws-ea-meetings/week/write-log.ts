@@ -133,3 +133,11 @@ export async function calendarWriteVersion(): Promise<string> {
     ),
   );
 }
+
+export async function appliedCalendarWrites(): Promise<CalendarWrite[]> {
+  return (
+    await getDb().all<Row>(
+      "SELECT * FROM gws_ea_calendar_write_log WHERE state='applied' ORDER BY updated_at,request_id",
+    )
+  ).map(parsed);
+}

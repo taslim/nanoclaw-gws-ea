@@ -27,6 +27,12 @@ import { registerGuidance } from '../gws-ea-profile/guidance.js';
 export const GUIDANCE_PATH = path.join('src', 'modules', 'gws-ea-main', 'guidance.md');
 
 export const MAIN_CHAT_CAPABILITY = 'gws-ea-chat';
+export const MAIN_CONTEXT_CAPABILITY = 'gws-ea-main-context';
+registerCapability(MAIN_CONTEXT_CAPABILITY, {
+  description: 'live coming-days context and planning runtime for canonical main',
+  default: 'off',
+  grantedTo: async (agentGroupId) => agentGroupId === (await mainAgentGroupId()),
+});
 registerCapability(MAIN_CHAT_CAPABILITY, {
   description: 'whatsapp_link and chat-addressed host actions for canonical main',
   default: 'off',

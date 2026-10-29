@@ -47,6 +47,47 @@ const cleanups: Array<() => Promise<void>> = [];
 /** Runs a NanoClaw script the way its package scripts do, outside this test's module graph. */
 const TSX_LOADER = path.join(CONTROL_PLANE_ROOT, 'node_modules', 'tsx', 'dist', 'loader.mjs');
 
+describe('recorded divergence: canonical main receives coming-days hooks on every native wake', () => {
+  it('registers both events only for the main-only capability, removing its commands elsewhere', async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), 'divergence-week-hooks-'));
+    cleanups.push(() => rm(directory, { recursive: true, force: true }));
+    vi.stubEnv('CLAUDE_CONFIG_DIR', directory);
+    const runner = (file: string) => path.join(originalCwd, 'container/agent-runner/src', file);
+    const config = (await import(runner('config.ts'))) as { runnerCapabilities(): ReadonlySet<string> };
+    const capability = vi.spyOn(config, 'runnerCapabilities').mockReturnValue(new Set(['gws-ea-main-context']));
+    const contract = (await import(runner('provider-contracts/claude.ts'))) as {
+      claudeRuntimeContract: {
+        lifecycle: {
+          memorySessionHookRegistration(hook: { command: string; legacyCommands: string[]; sources: string[] }): void;
+        };
+      };
+    };
+    const register = () =>
+      contract.claudeRuntimeContract.lifecycle.memorySessionHookRegistration({
+        command: 'memory-command',
+        legacyCommands: [],
+        sources: [],
+      });
+    register();
+    register();
+    const settings = JSON.parse(await readFile(path.join(directory, 'settings.json'), 'utf8')) as {
+      hooks: Record<string, unknown>;
+    };
+    expect(settings.hooks.SessionStart).toEqual([
+      {
+        matcher: 'startup|resume|clear|compact',
+        hooks: [{ type: 'command', command: 'bun /app/src/week-view/hook.ts', timeout: 10 }],
+      },
+    ]);
+    expect(settings.hooks.UserPromptSubmit).toEqual([
+      { hooks: [{ type: 'command', command: 'bun /app/src/week-view/hook.ts', timeout: 10 }] },
+    ]);
+    capability.mockReturnValue(new Set(['reply']));
+    register();
+    expect(await readFile(path.join(directory, 'settings.json'), 'utf8')).not.toContain('week-view/hook.ts');
+  });
+});
+
 afterEach(async () => {
   process.chdir(originalCwd);
   vi.unstubAllEnvs();
@@ -1356,18 +1397,13 @@ describe('recorded divergence: the agent image carries the pinned Google tool', 
       }).containers[0].contributedEnv ?? {};
 
     const main = spawnEnv('ag-main', resolveCapabilities('all', 'main'));
-    // Calendar without gog's create, its conflict check, or its answer: main
-    // creates events, checks overlaps and answers through the host. Gmail read-only,
+    // Calendar reads and writes use the host's local-day context. gog keeps
+    // calendar discovery and subscriptions. Gmail is read-only,
     // the directory's search, and the whole of Drive, Docs, Sheets, Slides and Forms.
     const services = [
       'calendar.calendars',
       'calendar.subscribe',
       'calendar.unsubscribe',
-      'calendar.events',
-      'calendar.event',
-      'calendar.freebusy',
-      'calendar.update',
-      'calendar.delete',
       'gmail.search',
       'gmail.messages.search',
       'gmail.thread.get',

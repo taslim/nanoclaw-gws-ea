@@ -25,11 +25,20 @@ import type { Session } from '../../types.js';
 import { registerCalendarChangeRenderer } from '../gws-ea-inbox/calendar-notifications.js';
 import { createDaysTools, loadCalendarWeek, calendarFindings, renderDays, boundedCalendarMessage } from './days.js';
 import { createPrincipalEventTools } from './principal-events.js';
+import { createWeekRefresher } from './week/refresh.js';
 
 let calendar: MeetingsCalendarApi | undefined;
 // Built on first use: only a GWS-EA host with the assistant's Google sign-in reads a calendar.
 const calendarApi = (): MeetingsCalendarApi =>
   (calendar ??= createMeetingsCalendarApi({ token: () => hostGoogleAccessToken('calendar-host') }));
+
+const weekRefresher = createWeekRefresher({ calendar: calendarApi });
+onHostStart(() => {
+  void weekRefresher
+    .start()
+    .catch((error: unknown) => log.warn('The initial coming-days view is unavailable', { error }));
+});
+onHostShutdown(() => weekRefresher.stop());
 
 const booking = createBookingTools({ calendar: calendarApi });
 let bookingTimer: NodeJS.Timeout | undefined;
@@ -137,9 +146,9 @@ registerCalendarChangeRenderer(async (changes, at, context) => {
   const details = await Promise.all(
     changes.map(async ({ notice }) => ({
       notice,
-      event:
-        context.week?.events.find((e) => e.calendarId === notice.calendarId && e.id === notice.eventId)?.event ??
-        (await calendarApi().getEventDetail(notice.calendarId, notice.eventId)),
+      event: context.week
+        ? context.week.events.find((e) => e.calendarId === notice.calendarId && e.id === notice.eventId)?.event
+        : await calendarApi().getEventDetail(notice.calendarId, notice.eventId),
     })),
   );
   const moments = details

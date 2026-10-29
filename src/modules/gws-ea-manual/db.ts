@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 
 import { getDb } from '../../db/connection.js';
+import { signalManualChange } from './changes.js';
 
 export const MANUAL_KEYS = [
   'priorities',
@@ -111,7 +112,7 @@ export async function setManualSection(
 }> {
   manualKey(key);
   if (typeof text !== 'string') throw new Error('Manual text must be text');
-  return getDb().transaction(async () => {
+  const result = await getDb().transaction(async () => {
     const previous = await getManualSection(key);
     const versions = await getWithheldVersions();
     const keep = previous !== undefined && !isWithheld(versions, 'section', key, previous.text);
@@ -134,4 +135,6 @@ export async function setManualSection(
       over_front_page_budget: text.length > MANUAL_SECTION_BUDGET_CHARS,
     };
   });
+  await signalManualChange();
+  return result;
 }

@@ -38,6 +38,19 @@ import '../gws-ea-matters/index.js';
 import '../gws-ea-chats/directory.js';
 
 const TEST_ROOT = `/tmp/nanoclaw-gws-ea-main-test-${process.pid}`;
+
+it('grants live main context only to canonical main, even when another group stores all or the key explicitly', async () => {
+  const main = group('context-main');
+  const outward = group('context-outward', 'external-email');
+  await createGroup(main);
+  await createGroup(outward);
+  await publishMain(main);
+  await updateContainerConfigJson(outward.id, 'capabilities', ['gws-ea-main-context']);
+  expect(await getGroupCapabilities(main.id)).toContain('gws-ea-main-context');
+  expect(await getGroupCapabilities(outward.id)).not.toContain('gws-ea-main-context');
+  await updateContainerConfigJson(outward.id, 'capabilities', 'all');
+  expect(await getGroupCapabilities(outward.id)).not.toContain('gws-ea-main-context');
+});
 const GUIDANCE = fs.readFileSync(path.resolve(GUIDANCE_PATH), 'utf8').trim();
 const WELCOME = fs.readFileSync(path.resolve('templates', 'gws-ea', 'main', 'skills', 'welcome', 'SKILL.md'), 'utf8');
 
