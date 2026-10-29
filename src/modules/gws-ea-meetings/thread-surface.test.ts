@@ -103,6 +103,7 @@ import { FakeCalendar, type StoredEvent } from './testing/fake-calendar.js';
 import { FakeDrive } from '../gws-ea-workspace/testing/fake-drive.js';
 import { setThreadBookingCalendar } from './thread-calendar.js';
 import { createBookingTools } from './booking.js';
+import { eventIdFor } from './calendar-actions.js';
 import { getBooking, getBookingRequest } from './bookings-db.js';
 
 const JUNO = 'juno@northwind.example';
@@ -503,7 +504,6 @@ describe('free_time', () => {
         principal_time: 'Saturday, Oct 10, 7:00 AM–10:00 PM BST',
         fit: 'outside usual hours',
         zone: 'Europe/London',
-        fit_notes: ['outside usual hours'],
       },
     ]);
   });
@@ -693,6 +693,24 @@ describe('book', () => {
       'The booking was not made: it says "Friday 8 October", but 8 October 2026 is a Thursday. Work the day out with the time tools and write it again; give the year when you mean another one, and put words you quote from someone else in quotation marks.',
     );
     expect(bookings()).toHaveLength(1);
+  });
+
+  it('writes the agreed place on the invitation of an in-person meeting', async () => {
+    data(
+      await send(sessionA, 'book', {
+        start: TUESDAY_10AM,
+        minutes: 45,
+        title: 'Lunch: Pat and Remy',
+        location: 'Harbour Kitchen, 4 Quay Street',
+        invitees: [REMY],
+      }),
+    );
+    const [event] = bookings();
+    expect(event).toMatchObject({ summary: 'Lunch: Pat and Remy', location: 'Harbour Kitchen, 4 Quay Street' });
+    expect(event.conference).toBeUndefined();
+    expect(calendar.writes.find((write) => write.op === 'insert')?.fields).toMatchObject({
+      location: 'Harbour Kitchen, 4 Quay Street',
+    });
   });
 
   it('invites everyone on the thread but the principal and the assistant when it names nobody', async () => {
@@ -1116,6 +1134,30 @@ describe('a booking changes and is cancelled only by its own thread', () => {
         .filter((event) => event.start?.dateTime === THURSDAY_2PM)
         .map((event) => event.id),
     ).toEqual(moved);
+  });
+
+  it('refuses to move a principal event that no booking made, leaving it and its guests for main', async () => {
+    const guests = [PRINCIPAL_GUEST, { email: REMY, responseStatus: 'accepted' }];
+    // One id as Google makes them, one shaped like a booking's, as main's own events are.
+    const google = { ...busy('board-review', TUESDAY_10AM, '2026-10-06T09:30:00.000Z'), attendees: guests };
+    const mains = {
+      ...busy(eventIdFor('main-event', 'board-review'), WEDNESDAY_10AM, '2026-10-07T09:30:00.000Z'),
+      attendees: guests,
+    };
+    calendar.put(google);
+    calendar.put(mains);
+
+    expect(refusal(await send(sessionA, 'change_booking', { booking: google.id, start: THURSDAY_2PM }))).toBe(
+      'booking must be the id book gave you in this thread.',
+    );
+    expect(refusal(await send(sessionA, 'change_booking', { booking: mains.id, start: THURSDAY_2PM }))).toBe(
+      'There is no such booking for this thread. Use the id book gave you here.',
+    );
+    expect(calendar.writes).toEqual([]);
+    for (const event of [google, mains])
+      expect(calendar.event(PRINCIPAL, event.id)).toMatchObject({ start: event.start, attendees: guests });
+    expect(await getDb().get('SELECT 1 FROM gws_ea_booking_requests')).toBeUndefined();
+    expect(mainHeard()).toEqual([]);
   });
 
   it('refuses another thread’s booking, for a change and for a cancellation', async () => {

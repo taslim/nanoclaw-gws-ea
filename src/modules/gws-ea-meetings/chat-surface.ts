@@ -7,8 +7,12 @@ import { bookingMatters, type BookingSurface } from './booking-surface.js';
 
 export function chatSurface(chatId: string, writer: 'external-chat' | 'job'): BookingSurface {
   const owner = { kind: 'chat', key: chatId } as const;
-  const knownEmails = async (): Promise<string[]> =>
-    (await listChatMembers(chatId)).flatMap((member) => (member.email === null ? [] : [member.email.toLowerCase()]));
+  const knownEmails = async (source?: 'main'): Promise<string[]> =>
+    (await listChatMembers(chatId)).flatMap((member) =>
+      member.email === null || (source !== undefined && member.email_source !== source)
+        ? []
+        : [member.email.toLowerCase()],
+    );
   return {
     owner,
     writer,
@@ -29,6 +33,8 @@ export function chatSurface(chatId: string, writer: 'external-chat' | 'job'): Bo
         empty: 'No current chat member has an email address to invite. Ask main or the members for their addresses.',
       };
     },
+    // A member can type any address as their own, so only main's word ties an address to a person.
+    schedulingPeople: () => knownEmails('main'),
     async privacyFor(recipients) {
       const known = new Set(await knownEmails());
       return recipients.every((address) => known.has(address.toLowerCase())) ? { chatId } : {};

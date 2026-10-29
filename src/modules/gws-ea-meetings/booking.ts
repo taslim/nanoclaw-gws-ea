@@ -20,20 +20,26 @@ import { log } from '../../log.js';
 import { GOOGLE_CONNECTION_DOWN, isGoogleConnectionDown } from '../gws-ea-google/agent-boundary.js';
 import type { Session } from '../../types.js';
 import { assertChatToolFields } from '../gws-ea-chats/expect.js';
-import { listChatMembers } from '../gws-ea-chats/roster.js';
 import { isBookableCalendar, isReadable, recordOwnCalendarChange } from '../gws-ea-inbox/calendar-notifications.js';
 import { listPrincipalCalendars } from '../gws-ea-inbox/db.js';
-import { threadSchedulingPeople } from '../gws-ea-inbox/thread-map.js';
 import { assistantAddresses } from '../gws-ea-inbox/runtime.js';
 import { GoogleApiError } from '../gws-ea-inbox/gmail-api.js';
+import { levelClause } from '../gws-ea-inbox/route-mail.js';
 import { untrustedLine } from '../gws-ea-inbox/untrusted.js';
 import { placeInMatter } from '../gws-ea-matters/db.js';
 import { writeNoteForMain } from '../gws-ea-profile/main-note.js';
 import { getSchedulingPreferenceValues, type SchedulingPreferenceValues } from '../gws-ea-preferences/db.js';
-import { getPersonLevel, type PersonLevel } from '../gws-ea-people/db.js';
+import { getPersonLevel } from '../gws-ea-people/db.js';
 import { listPrivateValues } from '../gws-ea-privacy/db.js';
-import { dateString, isDate, nextDate, parseDate, wallClock, zonedInstant } from '../gws-ea-whereabouts/clock.js';
-import { loadTimeline, whereaboutsAt, zoneAt, zoneForDay, type Timeline } from '../gws-ea-whereabouts/timeline.js';
+import { dateString, isDate, wallClock } from '../gws-ea-whereabouts/clock.js';
+import {
+  loadTimeline,
+  whereaboutsAt,
+  zoneAt,
+  zoneForDay,
+  type Timeline,
+  type WhereaboutsAt,
+} from '../gws-ea-whereabouts/timeline.js';
 import { getGwsEaProfile, principalRecognizer, type PrincipalRecognizer } from '../gws-ea-profile/db.js';
 import {
   allowsMeet,
@@ -161,6 +167,32 @@ function eventZone(principal: Principal, event: Pick<CalendarEvent, 'start'>): s
     return isDate(event.start.date) ? (zoneForDay(principal.timeline, event.start.date) ?? TIMEZONE) : TIMEZONE;
   const at = Date.parse(event.start?.dateTime ?? '');
   return Number.isFinite(at) ? principalZone(principal, at) : TIMEZONE;
+}
+
+/** Outward answers carry a locality main or the principal recorded, never text copied from a calendar event. */
+function recordedLocality(at: WhereaboutsAt): string | null {
+  return at.stay?.derived === true && at.stay.placeId === null ? null : at.locality;
+}
+
+/** A city named alone is somewhere in that city, never whichever saved place lies there. */
+function venueOf(text: string, principal: Principal): ResolvedPlace {
+  const place = resolvePlace(text, principal.timeline, principal.privateValues);
+  const city = principal.timeline.places.find((known) => known.locality.toLowerCase() === text.toLowerCase());
+  return place.kind === 'unknown' && city !== undefined ? { ...place, locality: city.locality } : place;
+}
+
+/** The saved venue's zone, or the one zone every saved place in the named city shares. */
+function venueZone(place: ResolvedPlace, timeline: Timeline): string | null {
+  const zones = new Set(
+    timeline.places
+      .filter((known) =>
+        place.id === null
+          ? place.locality !== null && known.locality.toLowerCase() === place.locality.toLowerCase()
+          : known.id === place.id,
+      )
+      .map((known) => known.zone),
+  );
+  return zones.size === 1 ? [...zones][0] : null;
 }
 
 let schedulingTurn: Promise<unknown> = Promise.resolve();
@@ -438,14 +470,8 @@ export function createBookingTools(deps: BookingToolsDeps) {
   }
 
   async function shapingFacts(view: BookingView, priorCounts?: Readonly<Record<string, number | null>> | null) {
-    const known =
-      view.surface.owner.kind === 'thread'
-        ? await threadSchedulingPeople(view.surface.owner.key)
-        : (await listChatMembers(view.surface.owner.key)).flatMap((member) =>
-            member.email === null ? [] : [member.email],
-          );
     const assistant = await assistantAddresses();
-    const emails = [...new Set(known.map((email) => email.toLowerCase()))]
+    const emails = [...new Set((await view.surface.schedulingPeople()).map((email) => email.toLowerCase()))]
       .filter((email) => !view.principal.addresses.has(email) && !assistant.has(email))
       .sort();
     let meetings: ReadonlyMap<string, number | null> | null =
@@ -465,21 +491,13 @@ export function createBookingTools(deps: BookingToolsDeps) {
       }
       /* eslint-enable no-catch-all/no-catch-all */
     }
-    const words: Readonly<Record<PersonLevel, string>> = {
-      'inner-circle': 'one of the people closest to the principal',
-      close: 'close to the principal',
-      active: 'someone the principal deals with regularly',
-      known: 'someone the principal knows',
-    };
     const people = await Promise.all(
       emails.map(async (email) => {
         const level = await getPersonLevel(`email:${email}`);
-        const count =
-          meetings?.get(`email:${email}`) ?? (meetings === null || priorCounts !== undefined ? null : undefined);
-        if (count === undefined) throw new Error('The host did not count every known participant.');
+        const count = meetings?.get(`email:${email}`) ?? null;
         return {
           email,
-          relationship: level === 'unknown' ? null : words[level],
+          relationship: level === 'unknown' ? null : levelClause(level, 'the principal'),
           has_people_record: level !== 'unknown',
           meetings: count,
           met_in_six_months: count === null ? null : count > 0,
@@ -493,7 +511,7 @@ export function createBookingTools(deps: BookingToolsDeps) {
     const message = [
       ...people.map(
         (person) =>
-          `${person.email}: ${person.relationship ?? 'no people record'}; ${person.meetings === null ? 'meeting history unavailable' : `${person.meetings} meetings in six months; ${person.met_in_six_months ? 'met' : 'not met'} on the principal’s calendars in that time`}; people record ${person.has_people_record ? 'yes' : 'no'}.`,
+          `${person.email}, ${person.relationship ?? 'with no people record'}; ${person.meetings === null ? 'meeting history unavailable' : `${person.meetings} meetings in six months; ${person.met_in_six_months ? 'met' : 'not met'} on the principal’s calendars in that time`}.`,
       ),
       ...(meeting_lengths.length === 0
         ? []
@@ -532,6 +550,7 @@ export function createBookingTools(deps: BookingToolsDeps) {
         if (after !== null) busy.push({ start: event.end, end: event.end + after * MINUTE });
       }
     }
+    const venue = place === undefined ? null : venueZone(place, principal.timeline);
     const result: LocatedWindow[] = [];
     const transitions = [
       window.start,
@@ -539,20 +558,6 @@ export function createBookingTools(deps: BookingToolsDeps) {
       ...principal.timeline.stays.flatMap((stay) => [stay.start, ...(stay.end === null ? [] : [stay.end])]),
       ...principal.timeline.legs.flatMap((leg) => [leg.departure, leg.arrival]),
     ];
-    const first = parseDate(dateString(wallClock(window.start - DAY, 'UTC')));
-    const last = dateString(wallClock(window.end + DAY, 'UTC'));
-    if (principal.timeline.homeZone) {
-      for (let date = first; dateString(date) <= last; date = nextDate(date)) {
-        const weekday = (['sun', 'mon', 'tue', 'wed', 'thu', 'fri', 'sat'] as const)[
-          new Date(Date.UTC(date.year, date.month - 1, date.day)).getUTCDay()
-        ];
-        for (const rhythm of principal.timeline.rhythm.filter((entry) => entry.weekday === weekday))
-          transitions.push(
-            zonedInstant(date, rhythm.start_minute, principal.timeline.homeZone),
-            zonedInstant(date, rhythm.end_minute, principal.timeline.homeZone),
-          );
-      }
-    }
     const cuts = [
       ...new Set(
         transitions.filter((instant) => {
@@ -568,12 +573,12 @@ export function createBookingTools(deps: BookingToolsDeps) {
       const part = { start: cuts[index - 1], end: cuts[index] };
       const where = whereaboutsAt(principal.timeline, part.start);
       const zone = where.zone ?? TIMEZONE;
+      // A venue in another zone than a certain stay is out of reach; anything less certain is the agent's to weigh.
       if (
-        place?.locality !== null &&
-        place?.locality !== undefined &&
+        venue !== null &&
         where.stay?.certainty === 'certain' &&
-        where.locality !== null &&
-        place.locality.toLowerCase() !== where.locality.toLowerCase()
+        where.stay.zone !== null &&
+        where.stay.zone !== venue
       )
         continue;
       const found = freeWindows({
@@ -602,9 +607,8 @@ export function createBookingTools(deps: BookingToolsDeps) {
           if (travelBetween(from, place, '', principal.timeline).minutes === null)
             notes.push('travel from the previous place unknown');
         }
-        if (free.fit === 'outside usual hours') notes.push('outside usual hours');
-        const localities = new Set(locations.map((at) => at.locality));
-        result.push({ ...free, zone, locality: localities.size === 1 ? locations[0].locality : null, fitNotes: notes });
+        const localities = new Set(locations.map(recordedLocality));
+        result.push({ ...free, zone, locality: localities.size === 1 ? [...localities][0] : null, fitNotes: notes });
       }
     }
     return result.sort((a, b) => a.start - b.start);
@@ -617,7 +621,7 @@ export function createBookingTools(deps: BookingToolsDeps) {
     const to = instantOf(content.to, 'to');
     const minutes = minutesOf(content.minutes);
     const theirs = timezoneOf(content.timezone);
-    const kind = lineOf(content.kind, 'kind', 80);
+    const kind = lineOf(content.kind, 'kind', 80)?.toLowerCase();
     const inPerson = lineOf(content.place, 'place', 500);
     if (to <= from) throw invalidArgs('to must come after from');
     if (to - from > MAX_RANGE_DAYS * DAY) throw invalidArgs(`The range may span at most ${MAX_RANGE_DAYS} days`);
@@ -627,15 +631,7 @@ export function createBookingTools(deps: BookingToolsDeps) {
     const entry = await bookingCalendarOf(view, true);
     const { principal } = view;
     const rules = schedulingRules(principal.preferences, kind);
-    const place =
-      inPerson === undefined
-        ? undefined
-        : resolvePlace(
-            principal.timeline.places.find((known) => known.locality.toLowerCase() === inPerson.toLowerCase())?.id ??
-              inPerson,
-            principal.timeline,
-            principal.privateValues,
-          );
+    const place = inPerson === undefined ? undefined : venueOf(inPerson, principal);
     const window = { start: Math.max(from, Date.now()), end: to };
     const picture = await calendarPicture(view, window, new Set(), entry.id);
     const found = offeredWindows(view, picture, window, minutes, theirs, rules, place);
@@ -657,7 +653,7 @@ export function createBookingTools(deps: BookingToolsDeps) {
           `- ${zonedIso(free.start, free.zone)} to ${zonedIso(free.end, free.zone)}: ${windows[index].principal_time}` +
           (free.locality === null ? '' : `; locality ${windows[index].locality}`) +
           (theirs === undefined ? '' : `; for them, ${windows[index].their_time}`) +
-          ` (${[free.fit, ...free.fitNotes.filter((note) => note !== free.fit)].join('; ')})`,
+          ` (${[free.fit, ...free.fitNotes].join('; ')})`,
       );
     const answer =
       windows.length === 0
@@ -1448,8 +1444,14 @@ export function createBookingTools(deps: BookingToolsDeps) {
       try {
         const candidate = await getSession(pending.sessionId);
         const surface = await bookingSurfaceFor(pending.owner, candidate);
-        // A settled write's fact reply still belongs only to the chat's current members.
-        if (candidate && (await surface.stillServing(candidate))) await surface.beforeWrite();
+        if (
+          !pending.applied &&
+          candidate &&
+          !pending.carriedOver &&
+          !(await answeredMessage(candidate, pending.requestId, pending.createdAt)) &&
+          (await surface.stillServing(candidate))
+        )
+          await surface.beforeWrite();
         await surface.inWrite(() =>
           inSchedulingTurn(async () => {
             if (inFlight.has(key)) return;

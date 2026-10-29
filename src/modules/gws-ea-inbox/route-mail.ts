@@ -353,7 +353,7 @@ async function senderRecord(
 }
 
 /** The relationship a level stands for, never the level's own name. */
-function levelClause(level: PersonLevel, principal: string): string {
+export function levelClause(level: PersonLevel, principal: string): string {
   switch (level) {
     case 'inner-circle':
       return `who is one of the people closest to ${principal}`;

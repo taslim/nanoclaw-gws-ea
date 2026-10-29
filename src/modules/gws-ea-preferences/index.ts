@@ -49,20 +49,20 @@ export function summarizeSchedulingPreferences(values: SchedulingPreferenceValue
     [
       [
         'Meal windows',
-        (values.meal_windows ?? []).map(
+        values.meal_windows.map(
           (value) =>
             `- ${value.meal}: ${days(value.weekdays)} ${value.start}-${value.end}, ${minutes(value.minutes)} free ${source(value)}`,
         ),
       ],
       [
         'Back-to-back limit',
-        (values.back_to_back ?? []).map(
+        values.back_to_back.map(
           (value) => `- ${minutes(value.minutes)}, with ${minutes(value.break_minutes)} breaks ${source(value)}`,
         ),
       ],
       [
         'Ignored calendar copies',
-        (values.ignored_events ?? []).map((value) => `- Event IDs beginning ${value.prefix} ${source(value)}`),
+        values.ignored_events.map((value) => `- Event IDs beginning ${value.prefix} ${source(value)}`),
       ],
       [
         'Working hours',
@@ -103,11 +103,12 @@ export function summarizeSchedulingPreferences(values: SchedulingPreferenceValue
 
 /**
  * Main's role directs it to the live store it changes. `external-email` gets
- * none: it learns the principal's time only as free slots from the host.
- * The browser gets none either: it sees only its errand, and the brief that
- * sends one carries whatever bounds the errand needs. Other groups cannot
- * read the store, so they get the values as of their container's start,
- * never a basis or a reason.
+ * none: the host's free-time answers carry what it needs, windows fitted to
+ * the kind it names and the recorded meeting lengths. The browser gets none
+ * either: it sees only its errand, and the brief that sends one carries
+ * whatever bounds the errand needs. Other groups cannot read the store, so
+ * they get the values as of their container's start, never a basis or a
+ * reason.
  */
 async function preferencesSection(group: AgentGroup): Promise<RequiredProjectDocSection | undefined> {
   if (!(await getDb().hasTable('gws_ea_pref_working_hours'))) return undefined;
