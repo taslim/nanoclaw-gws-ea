@@ -32,6 +32,7 @@ export interface TimeAnchor {
   readonly sourceClock: TaskClock;
   readonly originalAt: string;
   readonly originalZone: string;
+  readonly createdAt: string;
   readonly wall: WallClock;
   readonly recurrence: string | null;
   readonly fixed: boolean;
@@ -109,7 +110,7 @@ export function retimeAnchor(anchor: TimeAnchor, timeline: Timeline, now: number
   for (const { start, end, zone } of zoneIntervals(timeline, earliest)) {
     const interval = CronExpressionParser.parse(anchor.recurrence, {
       tz: zone,
-      currentDate: Math.max(start - 1, last ?? instant(anchor.wall, zone, 0) - 1),
+      currentDate: Math.max(start - 1, last ?? instant(anchor.wall, zone, 0) - 1, Date.parse(anchor.createdAt)),
     });
     for (let next = interval.next().getTime(); next < end; next = interval.next().getTime()) {
       const key = localKey(wallClock(next, zone));
@@ -148,6 +149,7 @@ export async function anchorTask(
   timeline: Timeline,
   clock: TaskClock,
   fixed = false,
+  createdAt: string = task.timestamp,
 ): Promise<TimeAnchor> {
   if (task.processAfter === null) throw new Error('A clock anchor requires a scheduled moment');
   const previous = await getTimeAnchor(session.id, seriesKey(task));
@@ -157,6 +159,7 @@ export async function anchorTask(
     sourceClock: clock,
     originalAt: clock.instant,
     originalZone: clock.zone,
+    createdAt,
     wall: wallClock(Date.parse(clock.instant), clock.zone),
     recurrence: task.recurrence,
     fixed,
@@ -308,7 +311,7 @@ async function observeAnchor(
     (clock.instant !== anchor.sourceClock.instant ||
       clock.zone !== anchor.sourceClock.zone ||
       task.recurrence !== anchor.recurrence);
-  if (mainEdited && clock) anchor = await anchorTask(session, task, timeline, clock, anchor.fixed);
+  if (mainEdited && clock) anchor = await anchorTask(session, task, timeline, clock, anchor.fixed, iso(Date.now()));
   anchor = afterRun(anchor, lastRun);
   anchor = { ...anchor, rowId: task.id, content: task.content, ...(newRow ? { hostRetryRowId: null } : {}) };
   await save(anchor);

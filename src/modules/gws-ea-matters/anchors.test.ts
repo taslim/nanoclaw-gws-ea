@@ -85,6 +85,47 @@ afterEach(async () => {
 });
 
 describe('local task anchors through the native matters loop and core recurrence', () => {
+  it('starts a newly created local cron after creation when today’s local clock has already passed', async () => {
+    vi.setSystemTime(new Date('2032-11-02T01:00:00Z'));
+    await stay('Asia/Tokyo');
+    const session = await mainSession();
+    await createScheduledTask(
+      MAIN,
+      prepareScheduledTask({
+        name: 'new daily reminder',
+        prompt: 'Morgan’s reminder.',
+        recurrence: '0 9 * * *',
+        timezone: HOME,
+      }),
+      { id: 'new-local-cron', session },
+    );
+    await keepMattersOnTime();
+    expect(await at('new-local-cron')).toBe('2032-11-03T00:00:00.000Z');
+  });
+  it('starts an edited local cron after the edit instead of reviving this morning’s occurrence', async () => {
+    vi.setSystemTime(new Date('2032-11-01T21:00:00Z'));
+    await stay('Asia/Tokyo');
+    const session = await mainSession();
+    await createScheduledTask(
+      MAIN,
+      prepareScheduledTask({
+        name: 'evening reminder',
+        prompt: 'Morgan’s reminder.',
+        recurrence: '0 18 * * *',
+        timezone: HOME,
+      }),
+      { id: 'edited-local-cron', session },
+    );
+    await keepMattersOnTime();
+    vi.setSystemTime(new Date('2032-11-02T01:00:00Z'));
+    const changed = await dispatch(
+      { id: 'edit-local-cron', command: 'tasks-update', args: { id: 'edited-local-cron', recurrence: '0 9 * * *' } },
+      { caller: 'agent', agentGroupId: MAIN, sessionId: session.id, messagingGroupId: 'mg-dm' },
+    );
+    expect(changed.ok).toBe(true);
+    await keepMattersOnTime();
+    expect(await at('edited-local-cron')).toBe('2032-11-03T00:00:00.000Z');
+  });
   it.each([
     ['Europe/Brussels', '2032-11-02T08:00:00.000Z', '2032-11-03T08:00:00.000Z'],
     ['Asia/Tokyo', '2032-11-02T00:00:00.000Z', '2032-11-03T00:00:00.000Z'],
