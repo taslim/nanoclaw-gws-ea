@@ -37,7 +37,7 @@ const REVIEWED: Readonly<Record<string, Review>> = {
     reason:
       'the calendar and event ids and input dates are receipt identifiers; the outcome and findings are fully rendered in message',
   },
-  'gws-ea-meetings/week/checker.ts add: day, eventKeys, facts, key, kind, version': {
+  'gws-ea-meetings/week/checker.ts add: day, eventKeys, facts, key, kind': {
     kind: 'host-only',
     reason: 'raw checker facts stay on the host and must pass through presentFinding before reaching a model',
   },
