@@ -244,7 +244,7 @@ export function createInbox(deps: InboxDeps): Inbox {
       /* eslint-enable no-catch-all/no-catch-all */
     };
     await writeBatch(held, () => writeHeldNote(held, context.at), 'outside');
-    await writeBatch(calendar, () => writeCalendarNote(calendar, deps.events, context.at), 'calendar-note');
+    await writeBatch(calendar, () => writeCalendarNote(calendar, context.at), 'calendar-note');
     await writeBatch(workspace, () => writeWorkspaceNote(workspace, deps.drive, context.at), 'workspace-note');
     if (setAside.length > 0) await noticeSetAside(setAside);
     return complete;

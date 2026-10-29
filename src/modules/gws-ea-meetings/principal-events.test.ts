@@ -65,11 +65,10 @@ vi.mock('../gws-ea-workspace/probe.js', async (importOriginal) => ({
 
 import type { ResponseFrame } from '../../cli/frame.js';
 import { getDb } from '../../db/connection.js';
-import * as capabilityStorage from '../../capabilities.js';
 import { ensureContainerConfig, updateContainerConfigJson } from '../../db/container-configs.js';
 import { closeDb, createAgentGroup, createMessagingGroup, initTestDb, runMigrations } from '../../db/index.js';
 import { getDeliveryAction } from '../../delivery.js';
-import { inboundDbPath, outboundDbPath, sessionMailboxDir } from '../../mailbox/sqlite/paths.js';
+import { inboundDbPath, sessionMailboxDir } from '../../mailbox/sqlite/paths.js';
 import { resolveSession } from '../../session-manager.js';
 import type { Session } from '../../types.js';
 import '../gws-ea-profile/index.js';
@@ -289,8 +288,17 @@ afterEach(async () => {
 });
 
 describe('create_event', () => {
-  it('confirms an applied insert after a lost reply before caching its first action answer', async () => {
+  it('confirms an applied insert after a lost reply by its id alone, though Google omits default fields', async () => {
     calendar.failNext({ op: 'insert', afterApplying: true, error: new Error('The insert reply was lost.') });
+    // Google leaves out an opaque event's transparency, its default, when it reads the event back.
+    const getEvent = calendar.getEvent.bind(calendar);
+    const getEventDetail = calendar.getEventDetail.bind(calendar);
+    const asGoogleReads = <T extends { readonly transparency?: string }>(event: T | undefined) =>
+      event?.transparency === 'opaque' ? { ...event, transparency: undefined } : event;
+    vi.spyOn(calendar, 'getEvent').mockImplementation(async (...args) => asGoogleReads(await getEvent(...args)));
+    vi.spyOn(calendar, 'getEventDetail').mockImplementation(async (...args) =>
+      asGoogleReads(await getEventDetail(...args)),
+    );
     const request = { ...FOCUS, guests: [REMY] };
     const first = data(await send(main, 'create_event', request, 'create-lost-reply'));
     const second = data(await send(main, 'create_event', request, 'create-lost-reply'));
@@ -298,28 +306,6 @@ describe('create_event', () => {
     expect(second).toEqual(first);
     expect(calendar.writes).toEqual([expect.objectContaining({ op: 'insert', sendUpdates: 'all' })]);
     expect(calendar.event(PRINCIPAL, String(first.event))?.status).toBe('confirmed');
-  });
-  it('confirms guest and response writes after lost replies without issuing either write twice', async () => {
-    calendar.put(teamSync([PRINCIPAL_GUEST]));
-    calendar.failNext({ op: 'guests', afterApplying: true, error: new Error('The guest reply was lost.') });
-    const guests = { calendar: PRINCIPAL, event: 'teamsync01', add: [REMY] };
-    const first = data(await send(main, 'change_guests', guests, 'guest-lost-reply'));
-    expect(data(await send(main, 'change_guests', guests, 'guest-lost-reply'))).toEqual(first);
-    expect(first.guests).toEqual([REMY]);
-    calendar.put({
-      ...teamSync([
-        { email: PRINCIPAL, self: true, responseStatus: 'needsAction' },
-        { email: REMY, organizer: true, responseStatus: 'accepted' },
-      ]),
-      id: 'foreigninvite',
-      organizer: { email: REMY },
-    });
-    calendar.failNext({ op: 'own', afterApplying: true, error: new Error('The response reply was lost.') });
-    const answer = { calendar: PRINCIPAL, event: 'foreigninvite', response: 'declined' };
-    const response = data(await send(main, 'respond_to_event', answer, 'response-lost-reply'));
-    expect(data(await send(main, 'respond_to_event', answer, 'response-lost-reply'))).toEqual(response);
-    expect(response.response).toBe('declined');
-    expect(calendar.writes.map((write) => write.op)).toEqual(['guests', 'own']);
   });
   it('creates a future event on its covering stay clock without changing the home profile', async () => {
     await addStay({
@@ -928,14 +914,28 @@ describe('change_guests', () => {
     ]);
   });
 
-  it('refuses an event someone else organizes, the principal’s own removal, and an event that is not there', async () => {
-    calendar.put({ ...teamSync([{ email: REMY, responseStatus: 'accepted' }]), organizer: { email: REMY } });
+  it('asks Google on an event someone else organizes, and answers its refusal with who organizes it', async () => {
+    calendar.put({
+      ...teamSync([
+        { email: PRINCIPAL, self: true, responseStatus: 'accepted' },
+        { email: REMY, organizer: true, responseStatus: 'accepted' },
+      ]),
+      organizer: { email: REMY },
+    });
+    calendar.failNext({ op: 'guests', error: new GoogleApiError(403, 'Forbidden') });
     const organizerRefusal = refusal(
       await send(main, 'change_guests', { calendar: PRINCIPAL, event: 'teamsync01', add: [NOEL] }),
     );
+    expect(organizerRefusal).toContain('Google refused the change');
     expect(organizerRefusal).toContain(`Source: google_calendar\n---\n${REMY}`);
-    expect(organizerRefusal).toContain('organizes that event: only they change who it invites');
+    expect(calendar.writes).toEqual([]);
 
+    // Where Google lets guests change the list, the change goes through.
+    data(await send(main, 'change_guests', { calendar: PRINCIPAL, event: 'teamsync01', add: [NOEL] }));
+    expect(calendar.event(PRINCIPAL, 'teamsync01')?.attendees?.map((guest) => guest.email)).toContain(NOEL);
+  });
+
+  it('refuses the principal’s own removal and an event that is not there', async () => {
     calendar.put(teamSync([{ email: PRINCIPAL, responseStatus: 'accepted', organizer: true }]));
     expect(
       refusal(await send(main, 'change_guests', { calendar: PRINCIPAL, event: 'teamsync01', remove: [PRINCIPAL] })),
@@ -1615,6 +1615,130 @@ describe('calendar outcomes and findings', () => {
   });
 });
 
+describe('change_event and cancel_event over the version read', () => {
+  /** Someone else edits the event right after the host reads it. */
+  function renameAfterRead(): void {
+    const read = calendar.getEventDetail.bind(calendar);
+    vi.spyOn(calendar, 'getEventDetail').mockImplementationOnce(async (calendarId, eventId) => {
+      const event = await read(calendarId, eventId);
+      const stored = calendar.event(calendarId, eventId);
+      if (stored) calendar.put({ ...stored, summary: 'Renamed by Remy' });
+      return event;
+    });
+  }
+
+  it('writes over the etag it read, and overwrites nothing that changed since', async () => {
+    calendar.put(teamSync([PRINCIPAL_GUEST, { email: REMY, responseStatus: 'accepted' }]));
+    const read = calendar.event(PRINCIPAL, 'teamsync01')?.etag;
+    const patch = vi.spyOn(calendar, 'patchEvent');
+    data(
+      await send(main, 'change_event', {
+        calendar: PRINCIPAL,
+        event: 'teamsync01',
+        location: 'Video meeting',
+        send_updates: 'none',
+      }),
+    );
+    expect(patch).toHaveBeenCalledWith(PRINCIPAL, 'teamsync01', expect.anything(), 'none', read);
+
+    for (const [action, fields] of [
+      ['change_event', { location: 'Room 4' }],
+      ['cancel_event', {}],
+    ] as const) {
+      renameAfterRead();
+      const stale = data(
+        await send(main, action, { calendar: PRINCIPAL, event: 'teamsync01', send_updates: 'all', ...fields }),
+      );
+      expect(stale.message).toContain(
+        'The event changed after it was read. Nothing was overwritten; read it again before deciding.',
+      );
+      expect(calendar.event(PRINCIPAL, 'teamsync01')).toMatchObject({
+        status: 'confirmed',
+        summary: 'Renamed by Remy',
+        location: 'Video meeting',
+      });
+    }
+    expect(calendar.writes.map((write) => write.op)).toEqual(['patch']);
+  });
+
+  it('answers Google’s refusal on an event the principal is a guest on as a fact, naming its organizer', async () => {
+    calendar.put({
+      ...teamSync([
+        { email: PRINCIPAL, self: true, responseStatus: 'accepted' },
+        { email: REMY, organizer: true, responseStatus: 'accepted' },
+      ]),
+      organizer: { email: REMY },
+    });
+    calendar.failNext({ op: 'patch', error: new GoogleApiError(403, 'forbiddenForNonOrganizer') });
+    const frame = await send(main, 'change_event', {
+      calendar: PRINCIPAL,
+      event: 'teamsync01',
+      start: '2026-10-09T10:00:00-07:00',
+      end: '2026-10-09T10:30:00-07:00',
+      send_updates: 'all',
+    });
+    expect(frame.ok).toBe(true);
+    expect(data(frame).message).toContain(`Organizer: <<<EXTERNAL_UNTRUSTED_CONTENT`);
+    expect(data(frame).message).toContain(
+      'Google refused the change. The principal is a guest; the organizer controls this event.',
+    );
+    expect(calendar.writes).toEqual([]);
+  });
+
+  it('confirms a move or cancellation whose reply was lost, and a replay writes it no second time', async () => {
+    calendar.put(teamSync([PRINCIPAL_GUEST]));
+    calendar.put({ ...teamSync([PRINCIPAL_GUEST]), id: 'standup01' });
+    const lost = () => new GoogleApiError(0, 'Google could not be reached');
+    const move = {
+      calendar: PRINCIPAL,
+      event: 'teamsync01',
+      start: '2026-10-09T10:00:00-07:00',
+      end: '2026-10-09T10:30:00-07:00',
+      send_updates: 'none',
+    };
+    const cancel = { calendar: PRINCIPAL, event: 'standup01', send_updates: 'none' };
+    calendar.failNext({ op: 'patch', afterApplying: true, error: lost() });
+    calendar.failNext({ op: 'delete', afterApplying: true, error: lost() });
+    const moved = data(await send(main, 'change_event', move, 'act-lost-move'));
+    const cancelled = data(await send(main, 'cancel_event', cancel, 'act-lost-cancel'));
+    expect(moved.message).toContain('Changed the event.');
+    expect(cancelled.message).toContain('Cancelled the event.');
+
+    // The answers never reached the agent: delivery runs both requests again.
+    const inbound = new Database(inboundDbPath(main.agent_group_id, main.id));
+    inbound
+      .prepare('DELETE FROM messages_in WHERE id IN (?, ?)')
+      .run('action-resp-act-lost-move', 'action-resp-act-lost-cancel');
+    inbound.close();
+    expect(data(await send(main, 'change_event', move, 'act-lost-move')).message).toContain('Changed the event.');
+    expect(data(await send(main, 'cancel_event', cancel, 'act-lost-cancel')).message).toContain('Cancelled the event.');
+    expect(calendar.writes.map((write) => write.op)).toEqual(['patch', 'delete']);
+    expect(calendar.event(PRINCIPAL, 'teamsync01')?.start?.dateTime).toBe('2026-10-09T17:00:00.000Z');
+    expect(calendar.event(PRINCIPAL, 'standup01')?.status).toBe('cancelled');
+  });
+
+  it('keeps every stored guest, with their answers and notes, when it only moves the event', async () => {
+    const guests = [
+      PRINCIPAL_GUEST,
+      { email: REMY, responseStatus: 'tentative', comment: 'May run late' },
+      { email: NOEL, responseStatus: 'declined' },
+    ];
+    calendar.put(teamSync(guests));
+    data(
+      await send(main, 'change_event', {
+        calendar: PRINCIPAL,
+        event: 'teamsync01',
+        start: '2026-10-09T10:00:00-07:00',
+        end: '2026-10-09T10:30:00-07:00',
+        send_updates: 'all',
+      }),
+    );
+    expect(calendar.writes).toHaveLength(1);
+    expect(calendar.writes[0].fields).not.toHaveProperty('attendees');
+    expect(calendar.event(PRINCIPAL, 'teamsync01')?.guests).toEqual(guests);
+  });
+});
+
 it('moves one occurrence and all following by splitting the series, retaining its finite count and logging before both writes', async () => {
   const master = {
     ...teamSync([PRINCIPAL_GUEST, { email: REMY, responseStatus: 'accepted' }]),
@@ -1721,251 +1845,6 @@ it('preserves privacy, availability, reminders and the existing conference in a 
   });
 });
 
-it('defers a failed replacement insert and finishes the persisted split after a recovery restart', async () => {
-  calendar.put({
-    ...teamSync([PRINCIPAL_GUEST]),
-    id: 'weeklydeferred',
-    recurrence: ['RRULE:FREQ=WEEKLY;COUNT=5'],
-    start: { dateTime: '2026-10-02T16:00:00Z', timeZone: PACIFIC },
-    end: { dateTime: '2026-10-02T16:30:00Z', timeZone: PACIFIC },
-  });
-  calendar.put({
-    ...teamSync([PRINCIPAL_GUEST]),
-    id: 'weeklydeferred_2',
-    recurringEventId: 'weeklydeferred',
-    originalStartTime: { dateTime: '2026-10-16T16:00:00Z' },
-    start: { dateTime: '2026-10-16T16:00:00Z', timeZone: PACIFIC },
-    end: { dateTime: '2026-10-16T16:30:00Z', timeZone: PACIFIC },
-  });
-  const requestId = 'act-split-deferred';
-  const handler = getDeliveryAction('change_event');
-  if (!handler) throw new Error('change_event is not registered');
-  const startedAt = new Date(Date.now() - 31_000).toISOString();
-  const outbox = new Database(outboundDbPath(main.agent_group_id, main.id));
-  try {
-    outbox
-      .prepare('INSERT INTO messages_out(id,timestamp,kind,content) VALUES(?,?,?,?)')
-      .run(requestId, startedAt, 'system', JSON.stringify({ action: 'change_event', requestId }));
-  } finally {
-    outbox.close();
-  }
-  calendar.failNext({ op: 'insert', error: new Error('connection closed before insertion') });
-  await handler(
-    {
-      action: 'change_event',
-      requestId,
-      calendar: PRINCIPAL,
-      event: 'weeklydeferred_2',
-      start: '2026-10-16T10:00:00-07:00',
-      end: '2026-10-16T10:30:00-07:00',
-      scope: 'following',
-      send_updates: 'all',
-    },
-    main,
-  );
-  const response = () => {
-    const inbound = new Database(inboundDbPath(main.agent_group_id, main.id), { readonly: true });
-    try {
-      const row = inbound.prepare('SELECT content FROM messages_in WHERE id=?').get(`action-resp-${requestId}`) as
-        | { content: string }
-        | undefined;
-      return row ? (JSON.parse(row.content) as { frame: ResponseFrame }).frame : undefined;
-    } finally {
-      inbound.close();
-    }
-  };
-  expect(response()).toBeUndefined();
-  const { getCalendarSplitRecovery } = await import('./week/write-log.js');
-  expect((await getCalendarSplitRecovery(requestId))?.createdAt).toBe(startedAt);
-  expect(calendar.event(PRINCIPAL, 'weeklydeferred')?.recurrence).toEqual(['RRULE:FREQ=WEEKLY;UNTIL=20261016T155959Z']);
-  expect(calendar.writes.filter((write) => write.op === 'insert')).toEqual([]);
-  const { createPrincipalEventTools } = await import('./principal-events.js');
-  vi.useFakeTimers({ toFake: ['Date'] });
-  const recoveryAt = Date.now() + 60_001;
-  vi.setSystemTime(recoveryAt);
-  try {
-    await createPrincipalEventTools({ calendar: () => calendar }).resumePending();
-    expect(
-      data(response() ?? { id: requestId, ok: false, error: { code: 'handler-error', message: 'no answer' } }).message,
-    ).toContain('Changed this occurrence and all following occurrences');
-    await createPrincipalEventTools({ calendar: () => calendar }).resumePending();
-  } finally {
-    vi.useRealTimers();
-  }
-  expect(calendar.writes.filter((write) => write.op === 'patch')).toHaveLength(1);
-  expect(calendar.writes.filter((write) => write.op === 'insert')).toHaveLength(1);
-  expect(consumeOwnCalendarChange(PRINCIPAL, 'weeklydeferred', new Date())).toBe(true);
-  expect(consumeOwnCalendarChange(PRINCIPAL, 'weeklydeferred', new Date())).toBe(false);
-});
-
-it('resumes a following split with its saved guest plan after the original occurrence disappears', async () => {
-  const request = { ...followingRequest('missingguestoccurrence'), guests: [REMY] };
-  const requestId = 'act-split-saved-guests';
-  const handler = getDeliveryAction('change_event');
-  if (!handler) throw new Error('change_event is not registered');
-  calendar.failNext({ op: 'insert', error: new Error('replacement temporarily unavailable') });
-  await handler({ ...request, action: 'change_event', requestId }, main);
-  expect(responseFor(main, requestId)).toBeUndefined();
-  calendar.remove(PRINCIPAL, 'missingguestoccurrence_2');
-  const { createPrincipalEventTools } = await import('./principal-events.js');
-  vi.useFakeTimers({ toFake: ['Date'] });
-  vi.setSystemTime(Date.now() + 60_001);
-  try {
-    await createPrincipalEventTools({ calendar: () => calendar }).resumePending();
-  } finally {
-    vi.useRealTimers();
-  }
-  const frame = responseFor(main, requestId);
-  expect(frame).toMatchObject({ ok: true });
-  const following = calendar.writes.find((write) => write.op === 'insert');
-  expect(
-    calendar
-      .event(PRINCIPAL, following?.eventId ?? '')
-      ?.attendees?.map((guest) => guest.email)
-      .sort(),
-  ).toEqual([PRINCIPAL, REMY].sort());
-  expect(calendar.writes.filter((write) => write.op === 'patch')).toHaveLength(1);
-  expect(calendar.writes.filter((write) => write.op === 'insert')).toHaveLength(1);
-});
-
-it('rejects a changed same-id retry without poisoning the pending split or its original answer', async () => {
-  const request = { ...followingRequest('immutablesplit'), guests: [REMY] };
-  const requestId = 'act-immutable-split';
-  const handler = getDeliveryAction('change_event');
-  if (!handler) throw new Error('change_event is not registered');
-  calendar.failNext({ op: 'insert', error: new Error('replacement temporarily unavailable') });
-  await handler({ ...request, action: 'change_event', requestId }, main);
-  const { getCalendarWrite, getCalendarSplitRecovery } = await import('./week/write-log.js');
-  const originalWrite = await getCalendarWrite(requestId);
-  const originalRecovery = await getCalendarSplitRecovery(requestId);
-  expect(originalWrite?.state).toBe('pending');
-  vi.useFakeTimers({ toFake: ['Date'] });
-  vi.setSystemTime(Date.now() + 60_001);
-  try {
-    await handler({ ...request, guests: [NOEL], action: 'change_event', requestId }, main);
-    expect(responseFor(main, requestId)).toBeUndefined();
-    expect(await getCalendarWrite(requestId)).toEqual(originalWrite);
-    expect(await getCalendarSplitRecovery(requestId)).toEqual(originalRecovery);
-    const { createPrincipalEventTools } = await import('./principal-events.js');
-    await createPrincipalEventTools({ calendar: () => calendar }).resumePending();
-    expect(responseFor(main, requestId)).toMatchObject({ ok: true });
-  } finally {
-    vi.useRealTimers();
-  }
-  const following = calendar.writes.find((write) => write.op === 'insert');
-  const guests = calendar.event(PRINCIPAL, following?.eventId ?? '')?.attendees?.map((guest) => guest.email);
-  expect(guests).toContain(REMY);
-  expect(guests).not.toContain(NOEL);
-  expect(calendar.writes.filter((write) => write.op === 'patch')).toHaveLength(1);
-  expect(calendar.writes.filter((write) => write.op === 'insert')).toHaveLength(1);
-});
-
-it('refuses a different session claiming a pending split without changing the original work or answer', async () => {
-  const request = followingRequest('crosssessionsplit');
-  const requestId = 'act-cross-session-split';
-  const handler = getDeliveryAction('change_event');
-  if (!handler) throw new Error('change_event is not registered');
-  calendar.failNext({ op: 'insert', error: new Error('replacement temporarily unavailable') });
-  await handler({ ...request, action: 'change_event', requestId }, main);
-  const { getCalendarWrite, getCalendarSplitRecovery } = await import('./week/write-log.js');
-  const originalWrite = await getCalendarWrite(requestId);
-  const originalRecovery = await getCalendarSplitRecovery(requestId);
-  const other = (await resolveSession(main.agent_group_id, main.messaging_group_id, 'other-thread', 'per-thread'))
-    .session;
-  const refused = await send(other, 'change_event', request, requestId);
-  expect(refused).toMatchObject({ ok: false, error: { code: 'invalid-args' } });
-  expect(responseFor(main, requestId)).toBeUndefined();
-  expect(await getCalendarWrite(requestId)).toEqual(originalWrite);
-  expect(await getCalendarSplitRecovery(requestId)).toEqual(originalRecovery);
-  const { createPrincipalEventTools } = await import('./principal-events.js');
-  vi.useFakeTimers({ toFake: ['Date'] });
-  vi.setSystemTime(Date.now() + 60_001);
-  try {
-    await createPrincipalEventTools({ calendar: () => calendar }).resumePending();
-  } finally {
-    vi.useRealTimers();
-  }
-  expect(responseFor(main, requestId)).toMatchObject({ ok: true });
-  expect(responseFor(other, requestId)).toEqual(refused);
-  expect(calendar.writes.filter((write) => write.op === 'patch')).toHaveLength(1);
-  expect(calendar.writes.filter((write) => write.op === 'insert')).toHaveLength(1);
-});
-
-it.each(['initial', 'recovery'] as const)(
-  'rechecks authority after a %s split waits for the native calendar turn',
-  async (kind) => {
-    const request = followingRequest(`queued${kind}`);
-    const requestId = `act-queued-${kind}`;
-    const handler = getDeliveryAction('change_event');
-    if (!handler) throw new Error('change_event is not registered');
-    if (kind === 'recovery') {
-      calendar.failNext({ op: 'insert', error: new Error('replacement temporarily unavailable') });
-      await handler({ ...request, action: 'change_event', requestId }, main);
-      expect(responseFor(main, requestId)).toBeUndefined();
-    }
-    calendar.put({ ...teamSync([PRINCIPAL_GUEST]), id: 'blockingrequest' });
-    const entered = deferredSignal();
-    const release = deferredSignal();
-    const admitted = deferredSignal();
-    const patch = calendar.patchEvent.bind(calendar);
-    const patchSpy = vi.spyOn(calendar, 'patchEvent').mockImplementation(async (...args) => {
-      if (args[1] === 'blockingrequest') {
-        entered.resolve();
-        await release.promise;
-      }
-      return patch(...args);
-    });
-    const blocking = handler(
-      {
-        action: 'change_event',
-        requestId: 'act-blocking',
-        calendar: PRINCIPAL,
-        event: 'blockingrequest',
-        title: 'Already issued calendar write',
-        send_updates: 'none',
-      },
-      main,
-    );
-    await entered.promise;
-    const capabilities = capabilityStorage.getGroupCapabilities;
-    const capabilitySpy = vi.spyOn(capabilityStorage, 'getGroupCapabilities').mockImplementationOnce(async (id) => {
-      const value = await capabilities(id);
-      admitted.resolve();
-      return value;
-    });
-    const { createPrincipalEventTools } = await import('./principal-events.js');
-    vi.useFakeTimers({ toFake: ['Date'] });
-    vi.setSystemTime(Date.now() + 60_001);
-    const queued =
-      kind === 'recovery'
-        ? createPrincipalEventTools({ calendar: () => calendar }).resumePending()
-        : handler({ ...request, action: 'change_event', requestId }, main);
-    try {
-      await admitted.promise;
-      await updateContainerConfigJson(main.agent_group_id, 'capabilities', []);
-      expect(calendar.writes.filter((write) => write.op === 'insert')).toEqual([]);
-      release.resolve();
-      await Promise.all([blocking, queued]);
-      expect(calendar.writes.filter((write) => write.op === 'insert')).toEqual([]);
-      if (kind === 'initial')
-        expect(responseFor(main, requestId)).toMatchObject({ ok: false, error: { code: 'forbidden' } });
-      else {
-        const { getCalendarSplitRecovery } = await import('./week/write-log.js');
-        expect((await getCalendarSplitRecovery(requestId))?.terminalError).toContain(
-          'no longer has calendar authority',
-        );
-        expect(responseFor(main, requestId)).toBeUndefined();
-      }
-    } finally {
-      release.resolve();
-      await Promise.allSettled([blocking, queued]);
-      patchSpy.mockRestore();
-      capabilitySpy.mockRestore();
-      vi.useRealTimers();
-    }
-  },
-);
-
 it.each([
   { attachments: [{ fileId: 'file-1', fileUrl: 'https://drive.google.com/file/d/file-1' }] },
   { privateCopy: true },
@@ -1979,25 +1858,8 @@ it.each([
   expect(calendar.writes).toEqual([]);
 });
 
-it('reports a permanent partial split failure instead of success or another destructive retry', async () => {
-  const request = followingRequest('permanentpartial');
-  const requestId = 'act-split-permanent';
-  calendar.failNext({ op: 'insert', error: new GoogleApiError(400, 'Invalid replacement') });
-  const message = refusal(await send(main, 'change_event', request, requestId));
-  expect(message).toContain('only partly changed');
-  expect(message).toContain('original series was shortened');
-  expect(message).toContain('will not be retried automatically');
-  const { createPrincipalEventTools } = await import('./principal-events.js');
-  await createPrincipalEventTools({ calendar: () => calendar }).resumePending();
-  expect(refusal(await send(main, 'change_event', request, requestId))).toBe(message);
-  expect(calendar.writes.filter((write) => write.op === 'patch')).toHaveLength(1);
-  expect(calendar.writes.filter((write) => write.op === 'insert')).toEqual([]);
-  const { getCalendarSplitRecovery } = await import('./week/write-log.js');
-  expect(await getCalendarSplitRecovery(requestId)).toMatchObject({ terminalError: message, reported: true });
-});
-
 it.each(['default', 'none'] as const)(
-  'replaces custom reminders with %s without carrying stale overrides into recovery',
+  'replaces custom reminders with %s without carrying stale overrides into the following series',
   async (reminders) => {
     const request = followingRequest('replacedreminders', {
       reminders: 'custom',
@@ -2029,119 +1891,182 @@ it('retains custom reminder overrides when the following split changes only time
   });
 });
 
-it.each(['closed', 'foreign-agent', 'capability-removed'] as const)(
-  'makes no new calendar write when a deferred split loses %s session authority',
-  async (kind) => {
-    const request = followingRequest('obsoletepartial');
-    const requestId = 'act-split-obsolete';
-    const handler = getDeliveryAction('change_event');
-    if (!handler) throw new Error('change_event is not registered');
-    calendar.failNext({ op: 'insert', error: new Error('temporary transport failure') });
-    await handler({ ...request, action: 'change_event', requestId }, main);
-    expect(responseFor(main, requestId)).toBeUndefined();
-    if (kind === 'closed') await getDb().run("UPDATE sessions SET status='closed' WHERE id=?", main.id);
-    else if (kind === 'foreign-agent')
-      await getDb().run("UPDATE sessions SET agent_group_id='ag-external' WHERE id=?", main.id);
-    else await updateContainerConfigJson(main.agent_group_id, 'capabilities', []);
-    const { createPrincipalEventTools } = await import('./principal-events.js');
-    vi.useFakeTimers({ toFake: ['Date'] });
-    vi.setSystemTime(Date.now() + 60_001);
-    try {
-      await createPrincipalEventTools({ calendar: () => calendar }).resumePending();
-    } finally {
-      vi.useRealTimers();
-    }
-    expect(calendar.writes.filter((write) => write.op === 'patch')).toHaveLength(1);
-    expect(calendar.writes.filter((write) => write.op === 'insert')).toEqual([]);
-    const { getCalendarSplitRecovery } = await import('./week/write-log.js');
-    expect((await getCalendarSplitRecovery(requestId))?.terminalError).toContain('no longer has calendar authority');
-    expect(responseFor(main, requestId)).toBeUndefined();
-  },
-);
-
-it('bounds transient split recovery attempts and reports the unresolved partial change', async () => {
-  const request = followingRequest('boundedpartial');
-  const requestId = 'act-split-bounded';
+it('finishes a split on replay after the host stopped between its two writes', async () => {
+  const request = followingRequest('crashsplit');
+  const requestId = 'act-crash-split';
   const handler = getDeliveryAction('change_event');
   if (!handler) throw new Error('change_event is not registered');
-  for (let attempt = 0; attempt < 8; attempt++)
-    calendar.failNext({ op: 'insert', error: new Error('still unavailable') });
-  await handler({ ...request, action: 'change_event', requestId }, main);
+  // The host stops once the original is shortened, before the following series' insert reaches Google.
+  const stopped = deferredSignal();
+  const insert = vi.spyOn(calendar, 'insertEvent').mockImplementationOnce(() => {
+    stopped.resolve();
+    return new Promise<'created'>(() => undefined);
+  });
+  void handler({ ...request, action: 'change_event', requestId }, main);
+  await stopped.promise;
+  insert.mockRestore();
+  expect(calendar.writes).toMatchObject([{ op: 'patch', eventId: 'crashsplit' }]);
   expect(responseFor(main, requestId)).toBeUndefined();
-  const { createPrincipalEventTools } = await import('./principal-events.js');
-  const { getCalendarSplitRecovery } = await import('./week/write-log.js');
-  vi.useFakeTimers({ toFake: ['Date'] });
-  try {
-    for (let attempt = 1; attempt < 8; attempt++) {
-      vi.setSystemTime(Date.now() + 60_001);
-      await createPrincipalEventTools({ calendar: () => calendar }).resumePending();
-    }
-  } finally {
-    vi.useRealTimers();
-  }
-  const frame = responseFor(main, requestId);
-  if (!frame) throw new Error('Bounded recovery did not answer');
-  expect(refusal(frame)).toContain('only partly changed');
-  expect(refusal(frame)).toContain('bounded recovery attempts');
-  expect((await getCalendarSplitRecovery(requestId))?.terminalError).toBe(refusal(frame));
-  expect((await getCalendarSplitRecovery(requestId))?.attempts).toBe(8);
+
+  // After the restart, delivery replays the request it never answered.
+  const replayed = data(await send(main, 'change_event', request, requestId));
+  expect(replayed.message).toContain('Changed this occurrence and all following occurrences');
   expect(calendar.writes.filter((write) => write.op === 'patch')).toHaveLength(1);
-  expect(calendar.writes.filter((write) => write.op === 'insert')).toEqual([]);
+  const inserts = calendar.writes.filter((write) => write.op === 'insert');
+  expect(inserts).toHaveLength(1);
+  expect(inserts[0].fields?.recurrence).toEqual(['RRULE:FREQ=WEEKLY;COUNT=3']);
 });
 
-it('recovers a pending split ahead of twenty-one completed reports waiting for a principal route', async () => {
-  const { beginCalendarWrite, markCalendarWriteApplied } = await import('./week/write-log.js');
-  for (let index = 0; index < 21; index++) {
-    const requestId = `act-blocked-report-${index}`;
-    await beginCalendarWrite(
-      {
-        requestId,
-        calendarId: PRINCIPAL,
-        eventId: `oldseries_${index}`,
-        action: 'change_event',
-        request: {},
-        before: null,
-        plan: {
-          patch: {},
-          split: {
-            masterId: 'oldseries',
-            master: { id: 'oldseries' },
-            trim: [],
-            deleteMaster: false,
-            followingId: `oldfollowing${index}`,
-            following: null,
-          },
-        },
-        affectedStart: '2026-10-05T16:00:00Z',
-        affectedEnd: '2026-10-05T17:00:00Z',
-      },
-      `missing-session-${index}`,
-    );
-    await markCalendarWriteApplied(requestId, 'An earlier split completed.');
-  }
-  const requestId = 'act-behind-blocked-reports';
-  const request = followingRequest('waitingforrecovery');
-  const handler = getDeliveryAction('change_event');
-  if (!handler) throw new Error('change_event is not registered');
-  calendar.failNext({ op: 'insert', error: new Error('temporary transport failure') });
-  await handler({ ...request, action: 'change_event', requestId }, main);
-  expect(responseFor(main, requestId)).toBeUndefined();
-  const { createPrincipalEventTools } = await import('./principal-events.js');
-  vi.useFakeTimers({ toFake: ['Date'] });
-  const recoveryAt = Date.now() + 60_001;
-  vi.setSystemTime(recoveryAt);
-  try {
-    await createPrincipalEventTools({ calendar: () => calendar }).resumePending();
-  } finally {
-    vi.useRealTimers();
-  }
-  expect(responseFor(main, requestId)).toMatchObject({ ok: true });
-  const { getCalendarSplitRecovery } = await import('./week/write-log.js');
-  const blocked = await getCalendarSplitRecovery('act-blocked-report-0');
-  expect(blocked).toMatchObject({ reported: false, attempts: 0 });
-  expect(Date.parse(blocked?.nextAttemptAt ?? '')).toBeGreaterThan(recoveryAt);
+it('creates the following series when a retry of its insert gets through', async () => {
+  const request = followingRequest('retriedsplit');
+  for (let attempt = 0; attempt < 2; attempt++)
+    calendar.failNext({ op: 'insert', error: new GoogleApiError(503, 'Backend Error') });
+  const result = data(await send(main, 'change_event', request));
+  expect(result.message).toContain('Changed this occurrence and all following occurrences');
   expect(calendar.writes.filter((write) => write.op === 'patch')).toHaveLength(1);
   expect(calendar.writes.filter((write) => write.op === 'insert')).toHaveLength(1);
+});
+
+it('answers what Google holds when the following series cannot be created, and writes nothing more', async () => {
+  const request = { ...followingRequest('partialsplit'), guests: [REMY] };
+  const requestId = 'act-partial-split';
+  for (let attempt = 0; attempt < 3; attempt++)
+    calendar.failNext({ op: 'insert', error: new GoogleApiError(503, 'Backend Error') });
+  const message = refusal(await send(main, 'change_event', request, requestId));
+  expect(message).toContain('the original series now ends before');
+  expect(message).toMatch(/following series, event [0-9a-f]{64}, was not created/u);
+  expect(message).toContain('2026-10-16T17:00:00.000Z');
+  expect(message).toContain('RRULE:FREQ=WEEKLY;COUNT=3');
+  expect(message).toContain(`Source: google_calendar\n---\n${REMY}`);
+  expect(message).toContain('Backend Error');
+  expect(calendar.writes.filter((write) => write.op === 'patch')).toHaveLength(1);
+  expect(calendar.writes.filter((write) => write.op === 'insert')).toEqual([]);
+  const { getCalendarWrite } = await import('./week/write-log.js');
+  expect(await getCalendarWrite(requestId)).toMatchObject({ state: 'applied', outcome: message });
+});
+
+it('lets the agent’s repeat of a split, after its tool stopped waiting, find the following series the original made', async () => {
+  const request = followingRequest('repeatedsplit');
+  // The original retries its insert past the tool's wait, so the agent makes the same call again.
+  calendar.failNext({ op: 'insert', error: new GoogleApiError(503, 'Backend Error') });
+  data(await send(main, 'change_event', request, 'act-original-split'));
+  // Delivery answers a session's requests one at a time, so the repeat runs once the original is done.
+  const repeated = data(await send(main, 'change_event', request, 'act-repeated-split'));
+  expect(repeated.message).toContain('all following occurrences');
+  const inserts = calendar.writes.filter((write) => write.op === 'insert');
+  expect(inserts).toHaveLength(1);
+  expect(inserts[0].fields?.recurrence).toEqual(['RRULE:FREQ=WEEKLY;COUNT=3']);
+});
+
+it('changes the whole series in place when this and following starts at its first occurrence', async () => {
+  const master = {
+    ...teamSync([PRINCIPAL_GUEST, { email: REMY, responseStatus: 'accepted' }]),
+    id: 'firstoccurrence',
+    recurrence: ['RRULE:FREQ=WEEKLY;COUNT=5'],
+    start: { dateTime: '2026-10-02T16:00:00Z', timeZone: PACIFIC },
+    end: { dateTime: '2026-10-02T16:30:00Z', timeZone: PACIFIC },
+  };
+  calendar.put(master);
+  calendar.put({
+    ...master,
+    id: 'firstoccurrence_1',
+    recurrence: undefined,
+    recurringEventId: master.id,
+    originalStartTime: { dateTime: '2026-10-02T16:00:00Z' },
+  });
+  const result = data(
+    await send(main, 'change_event', {
+      calendar: PRINCIPAL,
+      event: 'firstoccurrence_1',
+      start: '2026-10-02T10:00:00-07:00',
+      end: '2026-10-02T10:30:00-07:00',
+      scope: 'following',
+      send_updates: 'all',
+    }),
+  );
+  expect(result.message).toContain('Changed the event.');
+  expect(calendar.writes).toMatchObject([{ op: 'patch', eventId: master.id }]);
+  expect(calendar.event(PRINCIPAL, master.id)).toMatchObject({
+    status: 'confirmed',
+    start: { dateTime: '2026-10-02T17:00:00.000Z' },
+    recurrence: ['RRULE:FREQ=WEEKLY;COUNT=5'],
+  });
+});
+
+it('settles a write Google refuses with its refusal, and logs no write for an event without a version', async () => {
+  const { getCalendarWrite } = await import('./week/write-log.js');
+  calendar.put(teamSync([PRINCIPAL_GUEST]));
+  calendar.failNext({ op: 'patch', error: new GoogleApiError(412, 'conditionNotMet') });
+  const stale = data(
+    await send(
+      main,
+      'change_event',
+      { calendar: PRINCIPAL, event: 'teamsync01', title: 'Moved', send_updates: 'none' },
+      'act-stale-change',
+    ),
+  );
+  expect(stale.message).toContain('The event changed after it was read');
+  expect(await getCalendarWrite('act-stale-change')).toMatchObject({ state: 'applied', outcome: stale.message });
+
+  calendar.failNext({ op: 'insert', error: new GoogleApiError(400, 'Invalid recurrence') });
+  expect(refusal(await send(main, 'create_event', FOCUS, 'act-refused-create'))).toContain('Invalid recurrence');
+  expect(await getCalendarWrite('act-refused-create')).toMatchObject({
+    state: 'applied',
+    outcome: expect.stringContaining('Invalid recurrence'),
+  });
+
+  const read = calendar.getEventDetail.bind(calendar);
+  vi.spyOn(calendar, 'getEventDetail').mockImplementation(async (calendarId, eventId) => {
+    const event = await read(calendarId, eventId);
+    return event && { ...event, etag: undefined };
+  });
+  expect(
+    refusal(
+      await send(
+        main,
+        'change_event',
+        { calendar: PRINCIPAL, event: 'teamsync01', title: 'Moved', send_updates: 'none' },
+        'act-unversioned',
+      ),
+    ),
+  ).toContain('did not supply this event’s version');
+  expect(await getCalendarWrite('act-unversioned')).toBeUndefined();
+});
+
+it('changes an event whose who-it-affects read fails, and says it could not be read', async () => {
+  await setSchedulingPreference({
+    kind: 'ignored-events',
+    prefix: 'syncx',
+    source: 'principal',
+    basis: 'Morgan said these sync copies are noise.',
+  });
+  calendar.put({ ...teamSync([PRINCIPAL_GUEST]), id: 'syncx0001' });
+  const cancelled = data(
+    await send(main, 'cancel_event', { calendar: PRINCIPAL, event: 'syncx0001', send_updates: 'none' }),
+  );
+  expect(cancelled.message).toContain('Who this change affects could not be read.');
+  expect(cancelled.message).toContain('Cancelled the event.');
+  expect(calendar.event(PRINCIPAL, 'syncx0001')?.status).toBe('cancelled');
+});
+
+it('says Google was asked to tell the organizer when the principal is a guest, and names no guest as notified', async () => {
+  calendar.put({
+    ...teamSync([
+      { email: PRINCIPAL, self: true, responseStatus: 'accepted' },
+      { email: REMY, organizer: true, responseStatus: 'accepted' },
+    ]),
+    organizer: { email: REMY },
+  });
+  const changed = data(
+    await send(main, 'change_event', {
+      calendar: PRINCIPAL,
+      event: 'teamsync01',
+      location: 'Video meeting',
+      send_updates: 'all',
+    }),
+  );
+  expect(changed.message).toContain('Google was asked to send its update to the organizer.');
+  expect(changed.message).not.toContain('Google notified these guests');
 });
 
 it('changes an event even when the calendar scan used only for findings cannot be read', async () => {
@@ -2362,7 +2287,7 @@ it('preserves a finite recurrence count across an excluded date when splitting a
   ]);
 });
 
-it('resumes a split after the insert reply is lost without trimming or inviting twice', async () => {
+it('retries a split’s insert after its reply is lost, finding the series it made, without trimming or inviting twice', async () => {
   calendar.put({
     ...teamSync([PRINCIPAL_GUEST]),
     id: 'weeklyretry',
@@ -2386,7 +2311,7 @@ it('resumes a split after the insert reply is lost without trimming or inviting 
     scope: 'following',
     send_updates: 'all',
   };
-  calendar.failNext({ op: 'insert', error: new Error('reply lost'), afterApplying: true });
+  calendar.failNext({ op: 'insert', error: new GoogleApiError(0, 'Google could not be reached'), afterApplying: true });
   const first = data(await send(main, 'change_event', request, 'act-split-retry'));
   expect(first.message).toContain('Changed this occurrence and all following occurrences');
   const inbound = new Database(inboundDbPath(main.agent_group_id, main.id));

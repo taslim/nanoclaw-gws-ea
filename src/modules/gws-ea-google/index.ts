@@ -38,11 +38,10 @@ const CAPABILITY_DESCRIPTIONS: Readonly<Record<GoogleCapability, string>> = {
 /**
  * gog v0.43.0's exact command paths (`GOG_ENABLE_COMMANDS_EXACT`, where a
  * parent does not enable its children); each key's skill teaches only these.
- * Overlaps go through the host's `find_conflicts`, so `calendar.conflicts` is
- * off. gog cannot list the principal as an accepted guest, so events are
- * created through the host's `create_event` and `calendar.create` is off. gog
- * refuses to answer an event the principal organizes, so every answer goes
- * through the host's `respond_to_event` and `calendar.respond` is off.
+ * Events are read and written only through main's host calendar tools, which
+ * keep the principal on their own events, check invitations for private
+ * details, log each write and add the day's findings, so gog keeps just the
+ * calendar list and its subscriptions.
  */
 export const GOG_COMMANDS: Readonly<Record<GoogleCapability, readonly string[]>> = {
   'google-calendar': ['calendar.calendars', 'calendar.subscribe', 'calendar.unsubscribe'],

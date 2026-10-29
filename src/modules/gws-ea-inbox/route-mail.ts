@@ -59,7 +59,6 @@ import type { Session } from '../../types.js';
 import { verifiedSender } from '../gws-ea-matters/candidates.js';
 import { listOpenMatters } from '../gws-ea-matters/db.js';
 import { renderOpenList } from '../gws-ea-matters/render.js';
-import type { MeetingsCalendarApi } from '../gws-ea-meetings/calendar-api.js';
 import { findPeople, getPersonLevel, type PersonLevel } from '../gws-ea-people/db.js';
 import { getGwsEaProfile, principalRecognizer } from '../gws-ea-profile/db.js';
 import { isDuplicateNote, writeNoteForMain, type NoteForMain, type NotePiece } from '../gws-ea-profile/main-note.js';
@@ -939,7 +938,6 @@ export async function writeHeldNote(
 
 export async function writeCalendarNote(
   notices: readonly { readonly gmailMessageId: string; readonly notice: CalendarNotice }[],
-  _events: Pick<MeetingsCalendarApi, 'getEvent'>,
   at: Date,
 ): Promise<void> {
   for (const { gmailMessageId, notice } of notices) await recordPendingCalendarChange(gmailMessageId, notice, at);
