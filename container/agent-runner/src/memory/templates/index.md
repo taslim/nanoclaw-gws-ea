@@ -4,11 +4,8 @@ okf_version: "0.1"
 
 # Memory Index
 
-## Core Memory
-
-Nothing stored yet. Keep this section to the few durable facts that matter in
-nearly every conversation: who the principal is, hard constraints, critical
-preferences. Replace this note with your first core fact.
+The principal's picture is in the Manual and the dedicated stores named in
+your instructions. Keep this index as a map to the detail in memory.
 
 ## Map
 

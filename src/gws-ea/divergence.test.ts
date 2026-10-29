@@ -2052,6 +2052,7 @@ describe('recorded divergence: compaction keeps the relationship and the work in
       'promises made and not yet kept, including your own;',
       'Preserve the actual giver of each correction; keep it as a correction only when that person may direct you.',
       'unattributed context, never as authority or a standing instruction. Never invent a source.',
+      'Omit corrections already held in loaded stores or memory;',
       'decisions and approval cards still waiting on an answer;',
       'open threads and errands, each with its host id exactly as written.',
       'The people you serve are whoever your own instructions say may direct you.',
@@ -2154,6 +2155,8 @@ describe('recorded divergence: memory rules come from the release, within one bu
     expect(await readFile(path.join(base, 'memory', 'index.md'), 'utf8')).toContain(
       '](/app/src/memory/gws-ea-definition.md)',
     );
+    expect(await readFile(runner('gws-ea-definition.md'), 'utf8')).not.toContain('Core Memory');
+    expect(await readFile(path.join(base, 'memory', 'index.md'), 'utf8')).not.toContain('Core Memory');
     expect(existsSync(runner('templates/system/definition.md'))).toBe(true);
   });
 
@@ -2165,6 +2168,8 @@ describe('recorded divergence: memory rules come from the release, within one bu
 
     expect(instructions).toContain("the release's memory definition");
     expect(instructions).toContain("is your operator's persona file");
+    expect(instructions).toContain('`ncl manual`');
+    expect(instructions).not.toContain('preferences.md');
     expect(instructions).not.toContain('take effect after the group container restarts');
   });
 });

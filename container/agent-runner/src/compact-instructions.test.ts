@@ -106,7 +106,8 @@ describe('compaction keeps the relationship and the work in flight', () => {
     expect(instructions).toContain(
       'Preserve the actual giver of each correction; keep it as a correction only when that person may direct you.',
     );
-    expect(instructions).toContain('Omit corrections already held in loaded Core Memory;');
+    expect(instructions).toContain('Omit corrections already held in loaded stores or memory;');
+    expect(instructions).not.toContain('Core Memory');
     expect(instructions).toContain('when a correction replaces an earlier one, keep the newest.');
   });
 

@@ -103,16 +103,14 @@ describe('renderMemorySection', () => {
     expect(MEMORY_SECTION_BUDGET_CHARS - renderMemorySectionWithIndex('').length).toBeGreaterThanOrEqual(3_500);
   });
 
-  it('gives a correction its own dated Core Memory line beside an existing pointer to a corrections file', () => {
+  it('keeps the index as a map and dedicated stores as the single home for their facts', () => {
     const definition = RELEASE_DEFINITION.replace(/\s+/gu, ' ');
 
-    expect(definition).toContain(
-      'A correction that governs every conversation gets its own short dated line in Core Memory.',
-    );
-    expect(definition).toContain(
-      "An existing Core Memory line pointing to a preferences or corrections file never replaces that correction's own line; add it beside the pointer.",
-    );
-    expect(definition).toContain('Beyond Core Memory, write to the smallest useful file');
+    expect(definition).not.toContain('Core Memory');
+    expect(definition).toContain('the Manual');
+    expect(definition).toContain('scheduling preferences');
+    expect(definition).toContain('memory points to it rather than copying');
+    expect(definition).toContain('the smallest useful file');
   });
 
   it('remembers the principal and the people served for them, within the portable file contract', () => {
@@ -132,7 +130,9 @@ describe('renderMemorySection', () => {
   it('seeds new indexes in terms of the principal', () => {
     const template = fs.readFileSync(path.join(import.meta.dir, 'templates', 'index.md'), 'utf-8');
 
-    expect(template).toContain('who the principal is');
+    expect(template).toMatch(/the principal/iu);
+    expect(template).toContain('## Map');
+    expect(template).not.toContain('Core Memory');
     expect(template).not.toContain('who the user is');
   });
 

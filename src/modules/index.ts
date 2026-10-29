@@ -30,6 +30,7 @@ import './gws-ea-chat/index.js';
 import './gws-ea-whatsapp/index.js';
 import './gws-ea-voice/index.js';
 import './gws-ea-profile/index.js';
+import './gws-ea-manual/index.js';
 import './gws-ea-main/index.js';
 import './gws-ea-preferences/index.js';
 import './gws-ea-people/index.js';

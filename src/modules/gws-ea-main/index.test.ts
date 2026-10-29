@@ -24,6 +24,7 @@ import { reconcileGwsEaProfile } from '../gws-ea-profile/db.js';
 import { WEB_POLICY_FILE_ENV, type WebPolicyFile } from '../gws-ea-web/policy.js';
 import '../gws-ea-artifacts/capability.js';
 import '../gws-ea-profile/index.js';
+import '../gws-ea-manual/index.js';
 import { GUIDANCE_PATH, MAIN_SHARED_SKILLS } from './index.js';
 import '../gws-ea-browser/guidance.js';
 // It registers the email channel's keys, whose instructions main is taught.
@@ -32,6 +33,7 @@ import '../gws-ea-external-email/index.js';
 import '../gws-ea-people/index.js';
 import '../gws-ea-preferences/index.js';
 import '../gws-ea-privacy/index.js';
+import '../gws-ea-whereabouts/index.js';
 import '../gws-ea-matters/index.js';
 import '../gws-ea-chats/directory.js';
 
@@ -119,7 +121,9 @@ describe("GWS-EA's guidance for main", () => {
     expect(mainSections.find((section) => section.name === 'Executive Assistant')?.body).toBe(GUIDANCE);
     // The application barrel must preserve the registration order exercised here.
     const barrel = fs.readFileSync(path.resolve('src/modules/index.ts'), 'utf8');
-    expect(barrel).toMatch(/import '\.\/gws-ea-profile\/index\.js';[\s\S]*import '\.\/gws-ea-main\/index\.js';/u);
+    expect(barrel).toMatch(
+      /import '\.\/gws-ea-profile\/index\.js';[\s\S]*import '\.\/gws-ea-manual\/index\.js';[\s\S]*import '\.\/gws-ea-main\/index\.js';/u,
+    );
     expect((await getRequiredProjectDocSections(research)).map((section) => section.name)).not.toContain(
       'Executive Assistant',
     );
@@ -151,10 +155,11 @@ describe("GWS-EA's guidance for main", () => {
 
     expect(document).toContain(`# Persona\n\nCall me Morgan.`);
     expect(document).toContain(`# Executive Assistant\n\n${GUIDANCE}`);
-    expect([...document.matchAll(/^# (.+)$/gmu)].map(([, heading]) => heading).slice(0, 4)).toEqual([
+    expect([...document.matchAll(/^# (.+)$/gmu)].map(([, heading]) => heading).slice(0, 5)).toEqual([
       'Persona',
       'Assistant Character',
       'Assistant Identity',
+      'Principal Manual',
       'Executive Assistant',
     ]);
   });
