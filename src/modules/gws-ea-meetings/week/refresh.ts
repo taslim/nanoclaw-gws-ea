@@ -19,6 +19,7 @@ import { loadAcknowledgements } from './acks.js';
 import { digest, type EventCopy } from './model.js';
 import { settledCalendarChanges } from './pending-changes.js';
 import { appliedCalendarWrites, calendarWriteVersion } from './write-log.js';
+import { completeBookingWriteWindows, pendingBookingWriteWindows } from './booking-writes.js';
 import { renderWeekView, writeWeekView } from './view.js';
 
 const DAY = 86_400_000;
@@ -139,7 +140,15 @@ export function createWeekRefresher(deps: { readonly calendar: () => MeetingsCal
     const changes = await settledCalendarChanges(at);
     const version = await calendarWriteVersion();
     const writes = version !== writeVersion ? await appliedCalendarWrites() : [];
+    const bookingWrites = await pendingBookingWriteWindows();
     const windows: DerivationWindow[] = [];
+    const affected = (bounds: DerivationWindow | null) => {
+      if (!bounds || !Number.isFinite(bounds.start) || !Number.isFinite(bounds.end) || bounds.end <= bounds.start)
+        return;
+      const first = dateString(wallClock(bounds.start, zoneAt(timeline, bounds.start) ?? 'UTC'));
+      const last = dateString(wallClock(bounds.end - 1, zoneAt(timeline, bounds.end - 1) ?? 'UTC'));
+      windows.push(windowFor(first, Math.round((Date.parse(last) - Date.parse(first)) / DAY) + 1, timeline));
+    };
     if (full) {
       const profile = await getGwsEaProfile();
       const principal = principalRecognizer(profile.principal_emails);
@@ -149,36 +158,35 @@ export function createWeekRefresher(deps: { readonly calendar: () => MeetingsCal
       if (!calendars.length) throw new Error('No principal calendars are available to refresh');
       windows.push(windowFor(today, 60, timeline));
     } else {
-      const affected = (event: DetailedEvent | undefined) => {
-        const bounds = event ? span(event, timeline) : null;
-        if (!bounds) return;
-        const first = dateString(wallClock(bounds.start, zoneAt(timeline, bounds.start) ?? 'UTC'));
-        const last = dateString(wallClock(bounds.end - 1, zoneAt(timeline, bounds.end - 1) ?? 'UTC'));
-        windows.push(windowFor(first, Math.round((Date.parse(last) - Date.parse(first)) / DAY) + 1, timeline));
-      };
       for (const { notice } of changes) {
         const calendar = calendars.find((entry) => entry.id === notice.calendarId);
         if (!calendar || !isReadable(calendar)) continue;
-        affected(
-          copies?.find((copy) => copy.calendarId === notice.calendarId && copy.event.id === notice.eventId)?.event,
-        );
+        const held = copies?.find(
+          (copy) => copy.calendarId === notice.calendarId && copy.event.id === notice.eventId,
+        )?.event;
+        affected(held ? span(held, timeline) : null);
         for (const leg of timeline.legs.filter((leg) => leg.sourceEventId === notice.eventId))
-          affected({
-            start: { dateTime: new Date(leg.departure).toISOString() },
-            end: { dateTime: new Date(leg.arrival).toISOString() },
-          });
-        affected(await deps.calendar().getEventDetail(notice.calendarId, notice.eventId));
+          affected({ start: leg.departure, end: leg.arrival });
+        const current = await deps.calendar().getEventDetail(notice.calendarId, notice.eventId);
+        affected(current ? span(current, timeline) : null);
       }
       for (const write of writes)
         if (!knownWrites.has(write.requestId)) {
-          affected(write.before ?? undefined);
-          const bounds = { start: { dateTime: write.affectedStart }, end: { dateTime: write.affectedEnd } };
-          affected(bounds);
-          if (calendars.some((calendar) => calendar.id === write.calendarId && isReadable(calendar)))
-            affected(await deps.calendar().getEventDetail(write.calendarId, write.eventId));
+          if (write.refreshScope === 'series') windows.push(windowFor(today, 60, timeline));
+          affected(write.before ? span(write.before, timeline) : null);
+          affected({ start: Date.parse(write.affectedStart), end: Date.parse(write.affectedEnd) });
+          if (calendars.some((calendar) => calendar.id === write.calendarId && isReadable(calendar))) {
+            const current = await deps.calendar().getEventDetail(write.calendarId, write.eventId);
+            affected(current ? span(current, timeline) : null);
+          }
         }
       if (placementChanged) windows.push(windowFor(today, 8, timeline));
     }
+    for (const write of bookingWrites)
+      if (calendars.some((calendar) => calendar.id === write.calendarId)) {
+        affected(write.previous);
+        affected(write.current);
+      }
     let updated = [...(copies ?? [])];
     const reads = coalesced(windows);
     for (const window of reads) {
@@ -233,6 +241,7 @@ export function createWeekRefresher(deps: { readonly calendar: () => MeetingsCal
     }
     for (const write of writes) knownWrites.add(write.requestId);
     writeVersion = version;
+    await completeBookingWriteWindows(bookingWrites);
     const noteWeek = reads.length
       ? await loadCalendarWeek(deps.calendar(), {
           start: Math.min(week.now, ...reads.map((window) => window.start)),

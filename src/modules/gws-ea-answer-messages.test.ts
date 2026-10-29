@@ -37,6 +37,11 @@ const REVIEWED: Readonly<Record<string, Review>> = {
     reason:
       'the calendar and event ids and input dates are receipt identifiers; the outcome and findings are fully rendered in message',
   },
+  'gws-ea-meetings/principal-events.ts frame: code': {
+    kind: 'host-only',
+    reason:
+      'the recovered native ResponseFrame retains its transport error code; the complete error message explains the interrupted split and its outcome',
+  },
   'gws-ea-meetings/week/checker.ts add: day, eventKeys, facts, key, kind, version': {
     kind: 'host-only',
     reason: 'raw checker facts stay on the host and must pass through presentFinding before reaching a model',

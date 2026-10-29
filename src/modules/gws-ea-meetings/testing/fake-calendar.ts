@@ -10,6 +10,7 @@
  * 412; one on an event that is not there is `gone`.
  */
 import { GoogleApiError } from '../../gws-ea-inbox/gmail-api.js';
+import { isRecord } from '../../../gws-ea/validation.js';
 import type {
   CalendarEntry,
   CalendarEvent,
@@ -41,7 +42,19 @@ export interface StoredEvent extends Omit<CalendarEvent, 'organizer' | 'attendee
   readonly description?: string;
   readonly location?: string;
   readonly visibility?: string;
-  readonly reminders?: 'default' | 'none';
+  readonly reminders?: DetailedEvent['reminders'];
+  readonly reminderOverrides?: DetailedEvent['reminderOverrides'];
+  readonly conferenceData?: Readonly<Record<string, unknown>>;
+  readonly guestsCanModify?: boolean;
+  readonly guestsCanInviteOthers?: boolean;
+  readonly guestsCanSeeOtherGuests?: boolean;
+  readonly attachments?: readonly unknown[];
+  readonly privateCopy?: boolean;
+  readonly endTimeUnspecified?: boolean;
+  readonly anyoneCanAddSelf?: boolean;
+  readonly colorId?: string;
+  readonly source?: DetailedEvent['source'];
+  readonly sharedTags?: DetailedEvent['sharedTags'];
   readonly recurrence?: readonly string[];
   /** Each guest whole, as Google holds them, once a test or a guest-list write sets more than `attendees` keeps. */
   readonly guests?: readonly GuestRecord[];
@@ -113,13 +126,20 @@ function apply(written: StoredEvent, fields: EventWrite, meet: EventConference['
           written,
           fields.attendees.map((guest) => ({ ...guest })),
         );
-  const conference: EventConference | undefined =
-    event.conference ??
-    (fields.conference === undefined
-      ? undefined
-      : meet === 'success'
-        ? { status: 'success', uri: `https://meet.google.com/${fields.conference.requestId.slice(0, 10)}` }
-        : { status: meet });
+  const copiedVideo = Array.isArray(fields.conferenceData?.entryPoints)
+    ? fields.conferenceData.entryPoints.find(
+        (entry: unknown): entry is Record<string, unknown> =>
+          isRecord(entry) && entry.entryPointType === 'video' && typeof entry.uri === 'string',
+      )
+    : undefined;
+  const conference: EventConference | undefined = fields.conferenceData
+    ? { status: 'success', ...(typeof copiedVideo?.uri === 'string' ? { uri: copiedVideo.uri } : {}) }
+    : (event.conference ??
+      (fields.conference === undefined
+        ? undefined
+        : meet === 'success'
+          ? { status: 'success', uri: `https://meet.google.com/${fields.conference.requestId.slice(0, 10)}` }
+          : { status: meet }));
   return {
     ...event,
     ...(fields.status === undefined ? {} : { status: fields.status }),
@@ -127,6 +147,7 @@ function apply(written: StoredEvent, fields: EventWrite, meet: EventConference['
     ...(fields.description === undefined ? {} : { description: fields.description }),
     ...(fields.location === undefined ? {} : { location: fields.location }),
     ...(conference === undefined ? {} : { conference }),
+    ...(fields.conferenceData === undefined ? {} : { conferenceData: structuredClone(fields.conferenceData) }),
     ...(fields.start === undefined
       ? {}
       : {
@@ -147,6 +168,15 @@ function apply(written: StoredEvent, fields: EventWrite, meet: EventConference['
     ...(fields.visibility === undefined ? {} : { visibility: fields.visibility }),
     ...(fields.transparency === undefined ? {} : { transparency: fields.transparency }),
     ...(fields.reminders === undefined ? {} : { reminders: fields.reminders }),
+    ...(fields.reminderOverrides === undefined ? {} : { reminderOverrides: [...fields.reminderOverrides] }),
+    ...(fields.guestsCanModify === undefined ? {} : { guestsCanModify: fields.guestsCanModify }),
+    ...(fields.guestsCanInviteOthers === undefined ? {} : { guestsCanInviteOthers: fields.guestsCanInviteOthers }),
+    ...(fields.guestsCanSeeOtherGuests === undefined
+      ? {}
+      : { guestsCanSeeOtherGuests: fields.guestsCanSeeOtherGuests }),
+    ...(fields.colorId === undefined ? {} : { colorId: fields.colorId }),
+    ...(fields.source === undefined ? {} : { source: fields.source }),
+    ...(fields.sharedTags === undefined ? {} : { sharedTags: fields.sharedTags }),
     ...(fields.tags === undefined ? {} : { tags: { ...fields.tags } }),
   };
 }

@@ -22,8 +22,10 @@ export interface CalendarWriteInput {
   readonly plan?: { readonly patch: EventWrite; readonly split?: CalendarSplitPlan };
   readonly affectedStart: string;
   readonly affectedEnd: string;
+  readonly refreshScope?: 'event' | 'series';
 }
 export interface CalendarWrite extends CalendarWriteInput {
+  readonly refreshScope: 'event' | 'series';
   readonly state: 'pending' | 'applied';
   readonly outcome: string | null;
   readonly findingsChecked: boolean;
@@ -42,6 +44,7 @@ interface Row {
   state: CalendarWrite['state'];
   outcome: string | null;
   findings_checked: number;
+  refresh_scope: CalendarWrite['refreshScope'];
 }
 function parsed(row: Row): CalendarWrite {
   return {
@@ -54,6 +57,7 @@ function parsed(row: Row): CalendarWrite {
     before: row.before_json === null ? null : (JSON.parse(row.before_json) as DetailedEvent),
     affectedStart: row.affected_start,
     affectedEnd: row.affected_end,
+    refreshScope: row.refresh_scope,
     state: row.state,
     outcome: row.outcome,
     findingsChecked: row.findings_checked === 1,
@@ -63,28 +67,135 @@ export async function getCalendarWrite(requestId: string): Promise<CalendarWrite
   const row = await getDb().get<Row>('SELECT * FROM gws_ea_calendar_write_log WHERE request_id = ?', requestId);
   return row ? parsed(row) : undefined;
 }
-export async function beginCalendarWrite(input: CalendarWriteInput): Promise<CalendarWrite> {
-  const fingerprint = digest([input.action, input.calendarId, input.eventId, input.request]);
-  await getDb().run(
-    `INSERT INTO gws_ea_calendar_write_log
-    (request_id,calendar_id,event_id,action,fingerprint,request_json,before_json,plan_json,affected_start,affected_end,state,updated_at)
-    VALUES (?,?,?,?,?,?,?,?,?,?,'pending',?) ON CONFLICT(request_id) DO NOTHING`,
-    input.requestId,
-    input.calendarId,
-    input.eventId,
-    input.action,
-    fingerprint,
-    JSON.stringify(input.request),
-    input.before === null ? null : JSON.stringify(input.before),
-    input.plan ? JSON.stringify(input.plan) : null,
-    input.affectedStart,
-    input.affectedEnd,
-    new Date().toISOString(),
+export async function beginCalendarWrite(
+  input: CalendarWriteInput,
+  splitSessionId?: string,
+  splitStartedAt?: string,
+): Promise<CalendarWrite> {
+  return getDb().transaction(async () => {
+    const fingerprint = digest([input.action, input.calendarId, input.eventId, input.request]);
+    await getDb().run(
+      `INSERT INTO gws_ea_calendar_write_log
+    (request_id,calendar_id,event_id,action,fingerprint,request_json,before_json,plan_json,affected_start,affected_end,refresh_scope,state,updated_at)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,'pending',?) ON CONFLICT(request_id) DO NOTHING`,
+      input.requestId,
+      input.calendarId,
+      input.eventId,
+      input.action,
+      fingerprint,
+      JSON.stringify(input.request),
+      input.before === null ? null : JSON.stringify(input.before),
+      input.plan ? JSON.stringify(input.plan) : null,
+      input.affectedStart,
+      input.affectedEnd,
+      input.refreshScope ?? 'event',
+      new Date().toISOString(),
+    );
+    const row = await getDb().get<Row>('SELECT * FROM gws_ea_calendar_write_log WHERE request_id = ?', input.requestId);
+    if (!row) throw new Error('Calendar write receipt was not recorded');
+    if (row.fingerprint !== fingerprint)
+      throw invalidArgs('This calendar request id already names a different change.');
+    if (input.plan?.split && splitSessionId) {
+      const at = new Date().toISOString();
+      await getDb().run(
+        `INSERT INTO gws_ea_calendar_split_recovery(request_id,session_id,created_at,next_attempt_at)
+       VALUES(?,?,?,?) ON CONFLICT(request_id) DO NOTHING`,
+        input.requestId,
+        splitSessionId,
+        splitStartedAt ?? at,
+        at,
+      );
+      const recovery = await getCalendarSplitRecovery(input.requestId);
+      if (recovery?.sessionId !== splitSessionId)
+        throw invalidArgs('This recurring-series request belongs to a different session.');
+    }
+    return parsed(row);
+  });
+}
+
+export interface CalendarSplitRecovery {
+  readonly requestId: string;
+  readonly sessionId: string;
+  readonly createdAt: string;
+  readonly nextAttemptAt: string;
+  readonly attempts: number;
+  readonly masterChanged: boolean;
+  readonly terminalError: string | null;
+  readonly reported: boolean;
+}
+interface SplitRecoveryRow {
+  request_id: string;
+  session_id: string;
+  created_at: string;
+  next_attempt_at: string;
+  attempts: number;
+  master_changed: number;
+  terminal_error: string | null;
+  reported: number;
+}
+function recoveryOf(row: SplitRecoveryRow): CalendarSplitRecovery {
+  return {
+    requestId: row.request_id,
+    sessionId: row.session_id,
+    createdAt: row.created_at,
+    nextAttemptAt: row.next_attempt_at,
+    attempts: row.attempts,
+    masterChanged: row.master_changed === 1,
+    terminalError: row.terminal_error,
+    reported: row.reported === 1,
+  };
+}
+export async function getCalendarSplitRecovery(requestId: string): Promise<CalendarSplitRecovery | undefined> {
+  const row = await getDb().get<SplitRecoveryRow>(
+    'SELECT * FROM gws_ea_calendar_split_recovery WHERE request_id=?',
+    requestId,
   );
-  const row = await getDb().get<Row>('SELECT * FROM gws_ea_calendar_write_log WHERE request_id = ?', input.requestId);
-  if (!row) throw new Error('Calendar write receipt was not recorded');
-  if (row.fingerprint !== fingerprint) throw invalidArgs('This calendar request id already names a different change.');
-  return parsed(row);
+  return row ? recoveryOf(row) : undefined;
+}
+export async function pendingCalendarSplitRecoveries(at = new Date()): Promise<CalendarSplitRecovery[]> {
+  return (
+    await getDb().all<SplitRecoveryRow>(
+      `SELECT recovery.* FROM gws_ea_calendar_split_recovery recovery
+       JOIN gws_ea_calendar_write_log receipt ON receipt.request_id=recovery.request_id
+       WHERE recovery.reported=0 AND recovery.next_attempt_at<=?
+       ORDER BY CASE WHEN receipt.state='pending' THEN 0 ELSE 1 END,recovery.next_attempt_at,recovery.request_id LIMIT 20`,
+      at.toISOString(),
+    )
+  ).map(recoveryOf);
+}
+export async function markCalendarSplitMasterChanged(requestId: string): Promise<void> {
+  await getDb().run('UPDATE gws_ea_calendar_split_recovery SET master_changed=1 WHERE request_id=?', requestId);
+}
+export async function deferCalendarSplitRecovery(requestId: string, attempts: number): Promise<void> {
+  const retryAt = new Date(Date.now() + Math.min(60_000, 1_000 * 2 ** (attempts - 1))).toISOString();
+  await getDb().run(
+    'UPDATE gws_ea_calendar_split_recovery SET attempts=?,next_attempt_at=? WHERE request_id=?',
+    attempts,
+    retryAt,
+    requestId,
+  );
+}
+export async function deferCalendarSplitReport(requestId: string): Promise<void> {
+  await getDb().run(
+    'UPDATE gws_ea_calendar_split_recovery SET next_attempt_at=? WHERE request_id=?',
+    new Date(Date.now() + 60_000).toISOString(),
+    requestId,
+  );
+}
+export async function failCalendarSplitRecovery(requestId: string, message: string, attempts?: number): Promise<void> {
+  await getDb().transaction(async () => {
+    await getDb().run(
+      'UPDATE gws_ea_calendar_split_recovery SET terminal_error=?,next_attempt_at=?,attempts=COALESCE(?,attempts) WHERE request_id=?',
+      message,
+      new Date().toISOString(),
+      attempts ?? null,
+      requestId,
+    );
+    await markCalendarWriteApplied(requestId, message);
+  });
+}
+export async function markCalendarSplitReported(requestId: string): Promise<void> {
+  await getDb().run('UPDATE gws_ea_calendar_split_recovery SET reported=1 WHERE request_id=?', requestId);
 }
 export async function markCalendarWriteApplied(requestId: string, outcome: string): Promise<void> {
   await getDb().run(

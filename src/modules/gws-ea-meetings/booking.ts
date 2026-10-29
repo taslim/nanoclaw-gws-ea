@@ -72,6 +72,7 @@ import { createCalendarFactTools } from './calendar-facts.js';
 import { affectedPeople, calendarFindings, loadCalendarWeek } from './days.js';
 import { buildWeek, type Week } from './week/model.js';
 import { resolvePlace, travelBetween, type ResolvedPlace } from './week/places.js';
+import { recordBookingWriteWindow } from './week/booking-writes.js';
 import {
   eventSpan,
   freeWindows,
@@ -959,6 +960,15 @@ export function createBookingTools(deps: BookingToolsDeps) {
     }
     await getDb().transaction(async () => {
       if (!row.applied) {
+        if (outcome.kind === 'success' || outcome.kind === 'removed')
+          await recordBookingWriteWindow({
+            sessionId: row.sessionId,
+            requestId: row.requestId,
+            calendarId: row.calendarId,
+            eventId: row.eventId,
+            previous: preparedOf(row).previous,
+            current: outcome.span,
+          });
         if (outcome.kind === 'success' && row.action === 'book') {
           await recordBooking({
             owner: row.owner,

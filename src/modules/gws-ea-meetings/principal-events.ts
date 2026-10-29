@@ -1,5 +1,6 @@
 import recurrenceRules from 'rrule';
 import type { Options } from 'rrule';
+import { isDeepStrictEqual } from 'node:util';
 /**
  * The event writes `gog` cannot make: it sets no answer for the principal on
  * the guest list, refuses to answer an event they organize, and runs no
@@ -29,13 +30,35 @@ import {
   getCalendarWrite,
   markCalendarWriteApplied,
   completeCalendarWriteFindings,
+  getCalendarSplitRecovery,
+  pendingCalendarSplitRecoveries,
+  markCalendarSplitMasterChanged,
+  deferCalendarSplitRecovery,
+  deferCalendarSplitReport,
+  failCalendarSplitRecovery,
+  markCalendarSplitReported,
   type CalendarWrite,
   type CalendarSplitPlan,
+  type CalendarSplitRecovery,
 } from './week/write-log.js';
 import { WEEK_TAGS, calendarText, type EventCopy } from './week/model.js';
 import { TIMEZONE } from '../../config.js';
 import type { Session } from '../../types.js';
-import { forbidden, invalidArgs, type ActionAnswer } from '../../cli/delivery-action.js';
+import {
+  ANSWER_LATER,
+  ActionRefusal,
+  forbidden,
+  invalidArgs,
+  writeActionResponse,
+  type ActionAnswer,
+  type DeferredActionAnswer,
+} from '../../cli/delivery-action.js';
+import { getSession } from '../../db/sessions.js';
+import { getGroupCapabilities } from '../../capabilities.js';
+import { clearOutbox, withExistingMailboxSession } from '../../session-manager.js';
+import type { ResponseFrame } from '../../cli/frame.js';
+import { AGENT_GOOGLE_SERVICES } from '../gws-ea-google/grant.js';
+import { writeNoteForMain } from '../gws-ea-profile/main-note.js';
 import { EMAIL_PATTERN, hasControlCharacters } from '../../gws-ea/validation.js';
 import { log } from '../../log.js';
 import {
@@ -48,7 +71,7 @@ import {
 import { GoogleApiError } from '../gws-ea-inbox/gmail-api.js';
 import { assistantAddresses } from '../gws-ea-inbox/runtime.js';
 import { joinRequestedMatter, requestedMatter } from '../gws-ea-matters/tool-matter.js';
-import { loadPrincipalRecognizer, type PrincipalRecognizer } from '../gws-ea-profile/db.js';
+import { getMainAgentGroupId, loadPrincipalRecognizer, type PrincipalRecognizer } from '../gws-ea-profile/db.js';
 import {
   allowsMeet,
   type CalendarEntry,
@@ -85,6 +108,19 @@ const MAX_EVENT_DAYS = 366;
 const CALENDAR_ID_MAX = 254;
 const GUEST_WRITE_ATTEMPTS = 3;
 const DAY = 24 * 60 * 60 * 1000;
+const MAX_SPLIT_ATTEMPTS = 8;
+const TOOL_WAIT_MS = 120_000;
+const activeCalendarChanges = new Set<string>();
+const splitOwnChanges = new Map<string, Set<string>>();
+let calendarChangeTurn: Promise<unknown> = Promise.resolve();
+function inCalendarChangeTurn<T>(work: () => Promise<T>): Promise<T> {
+  const done = calendarChangeTurn.then(work);
+  calendarChangeTurn = done.then(
+    () => undefined,
+    () => undefined,
+  );
+  return done;
+}
 
 const DATE = /^\d{4}-\d{2}-\d{2}$/u;
 const RECURRENCE_LINE = /^(?:RRULE|EXRULE|RDATE|EXDATE)[:;]\S+$/u;
@@ -188,6 +224,70 @@ function answerWords(status: unknown): string {
 function scopeWords(guests: EventGuests): string {
   if (guests.recurringEventId !== undefined) return ' on this occurrence only';
   return guests.recurrence === undefined ? '' : ' on every occurrence';
+}
+
+/** A new series has no old values for Google to retain on our behalf. */
+function preservedSeriesProperties(before: DetailedEvent, patch: EventWrite): EventWrite {
+  if (before.eventType !== undefined && before.eventType !== 'default')
+    throw forbidden(
+      'This event has a specialized calendar type that cannot be preserved in a series split. Nothing was written.',
+    );
+  if (before.attachments?.length || before.privateCopy || before.endTimeUnspecified || before.anyoneCanAddSelf)
+    throw forbidden(
+      'This event has calendar metadata that cannot be preserved in a series split. Nothing was written.',
+    );
+  if (before.attendeesOmitted) throw forbidden(`${INCOMPLETE_LIST} Nothing was written.`);
+  const visibility = before.visibility;
+  if (
+    visibility !== undefined &&
+    visibility !== 'default' &&
+    visibility !== 'private' &&
+    visibility !== 'public' &&
+    visibility !== 'confidential'
+  )
+    throw forbidden('The event’s visibility could not be preserved in a series split. Nothing was written.');
+  const transparency = before.transparency;
+  if (transparency !== undefined && transparency !== 'opaque' && transparency !== 'transparent')
+    throw forbidden('The event’s availability could not be preserved in a series split. Nothing was written.');
+  if (patch.reminders === undefined && before.reminders === 'custom' && before.reminderOverrides === undefined)
+    throw forbidden(
+      'The event’s complete reminder overrides could not be read for the series split. Nothing was written.',
+    );
+  if (
+    patch.conference === undefined &&
+    before.conference !== undefined &&
+    (before.conference.status !== 'success' || before.conferenceData === undefined)
+  )
+    throw forbidden('The existing conference could not be preserved in the series split. Nothing was written.');
+  return {
+    ...(visibility === undefined ? {} : { visibility }),
+    ...(transparency === undefined ? {} : { transparency }),
+    ...(before.reminders === undefined ? {} : { reminders: before.reminders }),
+    ...(patch.reminders !== undefined || before.reminders !== 'custom' || before.reminderOverrides === undefined
+      ? {}
+      : { reminderOverrides: before.reminderOverrides }),
+    ...(before.guestsCanModify === undefined ? {} : { guestsCanModify: before.guestsCanModify }),
+    ...(before.guestsCanInviteOthers === undefined ? {} : { guestsCanInviteOthers: before.guestsCanInviteOthers }),
+    ...(before.guestsCanSeeOtherGuests === undefined
+      ? {}
+      : { guestsCanSeeOtherGuests: before.guestsCanSeeOtherGuests }),
+    ...(before.colorId === undefined ? {} : { colorId: before.colorId }),
+    ...(before.source === undefined ? {} : { source: before.source }),
+    ...(before.sharedTags === undefined ? {} : { sharedTags: before.sharedTags }),
+    ...(patch.conference === undefined && before.conferenceData !== undefined
+      ? { conferenceData: before.conferenceData }
+      : {}),
+  };
+}
+
+function sameTrimmedMaster(current: DetailedEvent | undefined, split: CalendarSplitPlan): boolean {
+  if (split.deleteMaster) return current === undefined || current.status === 'cancelled';
+  if (!current || !isDeepStrictEqual(current.recurrence, split.trim)) return false;
+  const retainedFields = (event: DetailedEvent) =>
+    Object.fromEntries(
+      Object.entries(event).filter(([key, value]) => key !== 'etag' && key !== 'recurrence' && value !== undefined),
+    );
+  return isDeepStrictEqual(retainedFields(current), retainedFields(split.master));
 }
 
 const PRINCIPAL_WORDS: Readonly<Record<Answer, string>> = {
@@ -315,6 +415,15 @@ function ownerOf(
  */
 function recordOwnChange(owner: CalendarOwner, calendarId: string, eventId: string): void {
   if (owner === 'principal') recordOwnCalendarChange(calendarId, eventId);
+}
+
+function recordSplitOwnChange(requestId: string, owner: CalendarOwner, calendarId: string, eventId: string): void {
+  if (owner !== 'principal') return;
+  const changes = splitOwnChanges.get(requestId) ?? new Set<string>();
+  if (changes.has(eventId)) return;
+  recordOwnChange(owner, calendarId, eventId);
+  changes.add(eventId);
+  splitOwnChanges.set(requestId, changes);
 }
 
 const { RRule } = recurrenceRules;
@@ -622,6 +731,7 @@ export function createPrincipalEventTools(deps: PrincipalEventToolsDeps) {
       request: content,
       before: null,
       plan: { patch: preparedEvent },
+      refreshScope: recurrence?.length ? 'series' : 'event',
       affectedStart: allDay ? `${start}T00:00:00Z` : start,
       affectedEnd: allDay ? `${end}T00:00:00Z` : end,
     });
@@ -1014,6 +1124,7 @@ export function createPrincipalEventTools(deps: PrincipalEventToolsDeps) {
         action,
         request: content,
         before: before ?? null,
+        refreshScope: before?.recurrence?.length ? 'series' : 'event',
         affectedStart: start,
         affectedEnd: end,
       });
@@ -1116,7 +1227,7 @@ export function createPrincipalEventTools(deps: PrincipalEventToolsDeps) {
           )
         );
       if (key === 'conference') return detail.conference !== undefined;
-      return JSON.stringify(detail[key as keyof DetailedEvent]) === JSON.stringify(value);
+      return isDeepStrictEqual(detail[key as keyof DetailedEvent], value);
     });
   }
   async function affect(
@@ -1157,7 +1268,7 @@ export function createPrincipalEventTools(deps: PrincipalEventToolsDeps) {
         await beginCalendarWrite({ ...receipt, request: content });
         return finishWrite(receipt, receipt.outcome ?? (cancel ? 'Cancelled.' : 'Changed.'));
       }
-      const fresh = await calendar().getEventDetail(calendarId, eventId);
+      const fresh = receipt?.plan?.split ? undefined : await calendar().getEventDetail(calendarId, eventId);
       const before = receipt?.before ?? fresh;
       if (!before || before.status === 'cancelled') throw forbidden('That event is no longer on this calendar.');
       const affected = await affect(before, calendarId, owner, timeline);
@@ -1165,7 +1276,7 @@ export function createPrincipalEventTools(deps: PrincipalEventToolsDeps) {
       let patch = receipt?.plan?.patch ?? (cancel ? {} : patchOf(content, before));
       if (matterId && !cancel) patch = { ...patch, tags: { ...patch.tags, [WEEK_TAGS.matter]: matterId } };
       const askedGuests = addressesOf(content.guests, 'guests', MAX_GUESTS);
-      if (askedGuests) {
+      if (askedGuests && receipt?.plan === undefined) {
         const whole = await calendar().getGuests(calendarId, eventId);
         if (!whole || whole.attendeesOmitted) throw forbidden(INCOMPLETE_LIST);
         const guests = guestsOn(calendarId, askedGuests).map((g) => {
@@ -1215,10 +1326,16 @@ export function createPrincipalEventTools(deps: PrincipalEventToolsDeps) {
         const nextZone = patch.timeZone ?? zone;
         const recurrence = splitRecurrence(master, before, patch, zone, nextZone, !cancel);
         const followingId = eventIdFor('following', requestId);
-        const baseGuests =
-          before.attendees?.flatMap((a) =>
-            a.email ? [{ email: a.email, ...(a.responseStatus ? { responseStatus: a.responseStatus } : {}) }] : [],
-          ) ?? [];
+        const whole = cancel ? undefined : await calendar().getGuests(calendarId, eventId);
+        if (!cancel && (!whole || whole.attendeesOmitted || whole.etag !== before.etag))
+          throw forbidden(
+            'The event’s complete guest list at this version could not be read for the series split. Nothing was written.',
+          );
+        const baseGuests = (whole?.guests ?? []).map((guest) => {
+          if (typeof guest.email !== 'string')
+            throw forbidden('A guest could not be preserved in the series split. Nothing was written.');
+          return { ...guest, email: guest.email };
+        });
         split = {
           masterId: before.recurringEventId,
           master,
@@ -1228,6 +1345,7 @@ export function createPrincipalEventTools(deps: PrincipalEventToolsDeps) {
           following: cancel
             ? null
             : {
+                ...preservedSeriesProperties(before, patch),
                 summary: before.summary,
                 description: before.description,
                 location: before.location,
@@ -1243,17 +1361,29 @@ export function createPrincipalEventTools(deps: PrincipalEventToolsDeps) {
       }
       const plan = receipt?.plan ?? { patch, ...(split ? { split } : {}) };
       patch = plan.patch;
-      receipt = await beginCalendarWrite({
-        requestId,
-        calendarId,
-        eventId,
-        action: cancel ? 'cancel_event' : 'change_event',
-        request: content,
-        before,
-        plan,
-        affectedStart: new Date(Math.min(Date.parse(start), Date.parse(nextStart))).toISOString(),
-        affectedEnd: new Date(Math.max(Date.parse(end), Date.parse(nextEnd))).toISOString(),
-      });
+      const splitStartedAt = split
+        ? await withExistingMailboxSession(
+            session.agent_group_id,
+            session.id,
+            (mailbox) => mailbox.getOutboundMessage(requestId)?.timestamp,
+          )
+        : undefined;
+      receipt = await beginCalendarWrite(
+        {
+          requestId,
+          calendarId,
+          eventId,
+          action: cancel ? 'cancel_event' : 'change_event',
+          request: content,
+          before,
+          plan,
+          refreshScope: split || before.recurrence?.length || patch.recurrence?.length ? 'series' : 'event',
+          affectedStart: new Date(Math.min(Date.parse(start), Date.parse(nextStart))).toISOString(),
+          affectedEnd: new Date(Math.max(Date.parse(end), Date.parse(nextEnd))).toISOString(),
+        },
+        split ? session.id : undefined,
+        splitStartedAt,
+      );
       if (!before.etag)
         throw forbidden('Google did not supply this event’s version; read it again before changing it.');
       const splitOutcome = split
@@ -1272,6 +1402,13 @@ export function createPrincipalEventTools(deps: PrincipalEventToolsDeps) {
       try {
         if (split) {
           const currentMaster = await calendar().getEventDetail(calendarId, split.masterId);
+          const alreadyTrimmed = split.deleteMaster
+            ? currentMaster === undefined || currentMaster.status === 'cancelled'
+            : isDeepStrictEqual(currentMaster?.recurrence, split.trim);
+          if (alreadyTrimmed && !sameTrimmedMaster(currentMaster, split))
+            throw forbidden(
+              'The original series changed while the split was interrupted; its following series was not written over that edit.',
+            );
           if (split.deleteMaster) {
             if (currentMaster && currentMaster.status !== 'cancelled')
               await calendar().deleteEvent(calendarId, split.masterId, sendUpdates, split.master.etag);
@@ -1284,10 +1421,20 @@ export function createPrincipalEventTools(deps: PrincipalEventToolsDeps) {
               split.master.etag,
             );
           }
-          recordOwnChange(owner, calendarId, split.masterId);
+          await markCalendarSplitMasterChanged(requestId);
+          recordSplitOwnChange(requestId, owner, calendarId, split.masterId);
           if (split.following) {
-            await calendar().insertEvent(calendarId, split.followingId, split.following, sendUpdates);
-            recordOwnChange(owner, calendarId, split.followingId);
+            const existingFollowing = await calendar().getEventDetail(calendarId, split.followingId);
+            if (
+              existingFollowing &&
+              (existingFollowing.status === 'cancelled' || !appliedPatch(existingFollowing, split.following))
+            )
+              throw forbidden(
+                'The following series changed while this split was interrupted; it was not overwritten or restored.',
+              );
+            if (!existingFollowing)
+              await calendar().insertEvent(calendarId, split.followingId, split.following, sendUpdates);
+            recordSplitOwnChange(requestId, owner, calendarId, split.followingId);
           }
           wrote = true;
         } else if (cancel) {
@@ -1312,13 +1459,23 @@ export function createPrincipalEventTools(deps: PrincipalEventToolsDeps) {
           const trimmed = split.deleteMaster
             ? !masterNow || masterNow.status === 'cancelled'
             : JSON.stringify(masterNow?.recurrence) === JSON.stringify(split.trim);
-          if (trimmed && (!split.following || (followingNow && followingNow.status !== 'cancelled'))) {
+          if (trimmed) {
+            await markCalendarSplitMasterChanged(requestId);
+            recordSplitOwnChange(requestId, owner, calendarId, split.masterId);
+          }
+          if (
+            trimmed &&
+            (!split.following ||
+              (followingNow && followingNow.status !== 'cancelled' && appliedPatch(followingNow, split.following)))
+          ) {
             outcome = splitOutcome ?? 'The recurring event changed.';
             wrote = true;
-            if (split.following) recordOwnChange(owner, calendarId, split.followingId);
+            if (split.following) recordSplitOwnChange(requestId, owner, calendarId, split.followingId);
           } else if (error instanceof GoogleApiError && error.status === 403 && masterNow?.etag === split.master.etag) {
+            const message = boundedCalendarMessage(affected, [permissionRefusal]);
+            await markCalendarWriteApplied(requestId, message);
             return {
-              message: boundedCalendarMessage(affected, [permissionRefusal]),
+              message,
             };
           } else throw error;
         } else {
@@ -1339,7 +1496,10 @@ export function createPrincipalEventTools(deps: PrincipalEventToolsDeps) {
           else throw error;
         }
       }
-      if (wrote) recordOwnChange(owner, calendarId, eventId);
+      if (wrote) {
+        if (split) recordSplitOwnChange(requestId, owner, calendarId, eventId);
+        else recordOwnChange(owner, calendarId, eventId);
+      }
       const told =
         wrote && sendUpdates === 'all' && outside.length
           ? `Google notified these guests: ${outside.map((email) => calendarText(email)).join(' ')}.`
@@ -1354,8 +1514,186 @@ export function createPrincipalEventTools(deps: PrincipalEventToolsDeps) {
       await markCalendarWriteApplied(requestId, message);
       return finishWrite(receipt, message, timeline);
     };
-  const changeEvent = writeChange(false);
-  const cancelEvent = writeChange(true);
+  function interruptedSplitMessage(recovery: CalendarSplitRecovery, receipt: CalendarWrite, reason: string): string {
+    const split = receipt.plan?.split;
+    return [
+      recovery.masterChanged
+        ? 'The recurring series was only partly changed: its original series was shortened, but the following part could not be confirmed.'
+        : 'The recurring-series change could not be confirmed.',
+      reason,
+      'It will not be retried automatically. Do not repeat the request; read the original and following series and reconcile future occurrences before making another change.',
+      ...(split
+        ? [
+            `Original event ${calendarText(split.masterId)}; following event ${calendarText(split.followingId)} on ${calendarText(receipt.calendarId)}.`,
+          ]
+        : []),
+    ].join(' ');
+  }
 
-  return { createEvent, changeGuests, respondToEvent, changeEvent, cancelEvent };
+  function boundChange(raw: ActionAnswer): DeferredActionAnswer {
+    return async (content, session, requestId) => {
+      if (activeCalendarChanges.has(requestId)) return ANSWER_LATER;
+      activeCalendarChanges.add(requestId);
+      try {
+        return await inCalendarChangeTurn(async () => {
+          const existing = await getCalendarSplitRecovery(requestId);
+          if (existing?.sessionId !== undefined && existing.sessionId !== session.id)
+            throw invalidArgs('This recurring-series request belongs to a different session.');
+          if (existing) {
+            const receipt = await getCalendarWrite(requestId);
+            if (!receipt) throw new Error('The deferred calendar split has no write receipt');
+            try {
+              await beginCalendarWrite({ ...receipt, request: content });
+            } catch (error) {
+              if (!(error instanceof ActionRefusal) || error.code !== 'invalid-args') throw error;
+              log.warn('Rejected a recurring-series retry with a different request under the same id', {
+                requestId,
+                sessionId: session.id,
+              });
+              return ANSWER_LATER;
+            }
+          }
+          if (existing?.terminalError) throw forbidden(existing.terminalError);
+          if (existing && Date.parse(existing.nextAttemptAt) > Date.now()) return ANSWER_LATER;
+          try {
+            const serving = await servingCalendarSession(session.id, session.agent_group_id);
+            if (!serving)
+              throw forbidden(
+                'The calling session no longer has calendar authority, so no further calendar write was made.',
+              );
+            return await raw(content, serving, requestId);
+          } catch (error) {
+            const recovery = await getCalendarSplitRecovery(requestId);
+            const receipt = recovery ? await getCalendarWrite(requestId) : undefined;
+            if (!recovery || !receipt?.plan?.split || receipt.state === 'applied') throw error;
+            const attempts = recovery.attempts + 1;
+            const permanent =
+              error instanceof GoogleApiError &&
+              !error.retryable &&
+              !(
+                error.status === 403 &&
+                ['rateLimitExceeded', 'userRateLimitExceeded', 'quotaExceeded', 'dailyLimitExceeded'].includes(
+                  error.reason ?? '',
+                )
+              );
+            if (error instanceof ActionRefusal || permanent || attempts >= MAX_SPLIT_ATTEMPTS) {
+              const reason =
+                error instanceof ActionRefusal
+                  ? error.message
+                  : permanent
+                    ? 'Google refused the remaining write.'
+                    : 'The calendar stayed unavailable through the bounded recovery attempts.';
+              const message = interruptedSplitMessage(recovery, receipt, reason);
+              await failCalendarSplitRecovery(requestId, message, attempts);
+              throw forbidden(message);
+            }
+            await deferCalendarSplitRecovery(requestId, attempts);
+            log.warn('Recurring-series split awaits recovery', { requestId, sessionId: session.id, attempts, error });
+            return ANSWER_LATER;
+          }
+        });
+      } finally {
+        activeCalendarChanges.delete(requestId);
+      }
+    };
+  }
+  const changeEvent = boundChange(writeChange(false));
+  const cancelEvent = boundChange(writeChange(true));
+
+  async function servingCalendarSession(sessionId: string, expectedGroupId?: string): Promise<Session | undefined> {
+    const current = await getSession(sessionId);
+    if (
+      !current ||
+      current.status !== 'active' ||
+      (expectedGroupId !== undefined && current.agent_group_id !== expectedGroupId)
+    )
+      return undefined;
+    if (current.agent_group_id !== (await getMainAgentGroupId())) return undefined;
+    return (await getGroupCapabilities(current.agent_group_id)).has(AGENT_GOOGLE_SERVICES.calendar.capability)
+      ? current
+      : undefined;
+  }
+
+  async function reportRecoveredSplit(recovery: CalendarSplitRecovery, receipt: CalendarWrite, session?: Session) {
+    const answered = session
+      ? await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) =>
+          mailbox
+            .getInboundRecords({ since: recovery.createdAt })
+            .find((message) => message.id === `action-resp-${recovery.requestId}`),
+        )
+      : undefined;
+    if (!answered && session?.status === 'active') {
+      const frame: ResponseFrame = recovery.terminalError
+        ? { id: recovery.requestId, ok: false, error: { code: 'forbidden', message: recovery.terminalError } }
+        : {
+            id: recovery.requestId,
+            ok: true,
+            data: await finishWrite(receipt, receipt.outcome ?? 'The recurring series changed.'),
+          };
+      await writeActionResponse(session, recovery.requestId, frame);
+      clearOutbox(session.agent_group_id, session.id, recovery.requestId);
+    }
+    const late =
+      Date.parse(answered?.timestamp ?? new Date().toISOString()) - Date.parse(recovery.createdAt) >= TOOL_WAIT_MS;
+    if (!session || session.status !== 'active' || late) {
+      const result = await writeNoteForMain({
+        id: `calendar-split-${eventIdFor('report', recovery.requestId)}`,
+        timestamp: new Date().toISOString(),
+        text: `Calendar request ${calendarText(recovery.requestId)}: ${receipt.outcome ?? 'The interrupted recurring-series change needs a calendar read to establish its outcome.'}`,
+        wake: true,
+        noteKind: 'host-receipt',
+        pieces: [
+          { kind: 'event', reference: `${receipt.calendarId}/${receipt.plan?.split?.masterId ?? receipt.eventId}` },
+        ],
+      });
+      if (result === 'no-main' || result === 'no-principal') {
+        await deferCalendarSplitReport(recovery.requestId);
+        return;
+      }
+    }
+    await markCalendarSplitReported(recovery.requestId);
+    splitOwnChanges.delete(recovery.requestId);
+  }
+
+  /* eslint-disable no-catch-all/no-catch-all -- each durable split is retried independently; one read failure never stops the other recoveries */
+  async function resumePending(): Promise<void> {
+    for (const recovery of await pendingCalendarSplitRecoveries()) {
+      if (activeCalendarChanges.has(recovery.requestId)) continue;
+      try {
+        let receipt = await getCalendarWrite(recovery.requestId);
+        if (!receipt) throw new Error('The deferred calendar split has no write receipt');
+        const candidate = await servingCalendarSession(recovery.sessionId);
+        if (receipt.state === 'pending') {
+          if (!candidate) {
+            await failCalendarSplitRecovery(
+              recovery.requestId,
+              interruptedSplitMessage(
+                recovery,
+                receipt,
+                'The calling session no longer has calendar authority, so no further calendar write was made.',
+              ),
+            );
+          } else {
+            const answer = receipt.action === 'cancel_event' ? cancelEvent : changeEvent;
+            try {
+              if ((await answer({ ...receipt.request }, candidate, recovery.requestId)) === ANSWER_LATER) continue;
+            } catch (error) {
+              const stopped = await getCalendarSplitRecovery(recovery.requestId);
+              if (!stopped?.terminalError) throw error;
+            }
+          }
+          receipt = await getCalendarWrite(recovery.requestId);
+          if (!receipt || receipt.state !== 'applied') continue;
+        }
+        const current = await getCalendarSplitRecovery(recovery.requestId);
+        if (!current) throw new Error('The deferred calendar split lost its recovery record');
+        await reportRecoveredSplit(current, receipt, await servingCalendarSession(recovery.sessionId));
+      } catch (error) {
+        log.warn('Recurring-series recovery could not finish this sweep', { requestId: recovery.requestId, error });
+      }
+    }
+  }
+  /* eslint-enable no-catch-all/no-catch-all */
+
+  return { createEvent, changeGuests, respondToEvent, changeEvent, cancelEvent, resumePending };
 }

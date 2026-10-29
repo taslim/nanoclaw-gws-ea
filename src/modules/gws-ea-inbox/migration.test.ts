@@ -233,6 +233,8 @@ describe('the inbox migrations', () => {
       'module:gws-ea-meetings:week-acknowledgements',
       'module:gws-ea-meetings:calendar-write-log',
       'module:gws-ea-meetings:pending-calendar-changes',
+      'module:gws-ea-meetings:calendar-split-recovery',
+      'module:gws-ea-meetings:booking-write-windows',
     ]);
   });
 

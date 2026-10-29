@@ -65,10 +65,11 @@ vi.mock('../gws-ea-workspace/probe.js', async (importOriginal) => ({
 
 import type { ResponseFrame } from '../../cli/frame.js';
 import { getDb } from '../../db/connection.js';
+import * as capabilityStorage from '../../capabilities.js';
 import { ensureContainerConfig, updateContainerConfigJson } from '../../db/container-configs.js';
 import { closeDb, createAgentGroup, createMessagingGroup, initTestDb, runMigrations } from '../../db/index.js';
 import { getDeliveryAction } from '../../delivery.js';
-import { inboundDbPath, sessionMailboxDir } from '../../mailbox/sqlite/paths.js';
+import { inboundDbPath, outboundDbPath, sessionMailboxDir } from '../../mailbox/sqlite/paths.js';
 import { resolveSession } from '../../session-manager.js';
 import type { Session } from '../../types.js';
 import '../gws-ea-profile/index.js';
@@ -180,6 +181,55 @@ function teamSync(
       ...(guest.organizer === true ? { organizer: true } : {}),
     })),
   };
+}
+
+function followingRequest(id: string, properties: Partial<StoredEvent> = {}): Record<string, unknown> {
+  const master = {
+    ...teamSync([PRINCIPAL_GUEST]),
+    ...properties,
+    id,
+    recurrence: ['RRULE:FREQ=WEEKLY;COUNT=5'],
+    start: { dateTime: '2026-10-02T16:00:00Z', timeZone: PACIFIC },
+    end: { dateTime: '2026-10-02T16:30:00Z', timeZone: PACIFIC },
+  };
+  calendar.put(master);
+  calendar.put({
+    ...master,
+    id: `${id}_2`,
+    recurrence: undefined,
+    recurringEventId: id,
+    originalStartTime: { dateTime: '2026-10-16T16:00:00Z' },
+    start: { dateTime: '2026-10-16T16:00:00Z', timeZone: PACIFIC },
+    end: { dateTime: '2026-10-16T16:30:00Z', timeZone: PACIFIC },
+  });
+  return {
+    calendar: PRINCIPAL,
+    event: `${id}_2`,
+    start: '2026-10-16T10:00:00-07:00',
+    end: '2026-10-16T10:30:00-07:00',
+    scope: 'following',
+    send_updates: 'all',
+  };
+}
+
+function responseFor(session: Session, requestId: string): ResponseFrame | undefined {
+  const inbound = new Database(inboundDbPath(session.agent_group_id, session.id), { readonly: true });
+  try {
+    const row = inbound.prepare('SELECT content FROM messages_in WHERE id=?').get(`action-resp-${requestId}`) as
+      | { content: string }
+      | undefined;
+    return row ? (JSON.parse(row.content) as { frame: ResponseFrame }).frame : undefined;
+  } finally {
+    inbound.close();
+  }
+}
+
+function deferredSignal() {
+  let complete: () => void;
+  const promise = new Promise<void>((resolve) => {
+    complete = resolve;
+  });
+  return { promise, resolve: () => complete() };
 }
 
 beforeEach(async () => {
@@ -1606,6 +1656,492 @@ it('moves one occurrence and all following by splitting the series, retaining it
   expect(result.message).toContain('following');
   const { getCalendarWrite } = await import('./week/write-log.js');
   expect(await getCalendarWrite('act-following')).toMatchObject({ state: 'applied' });
+});
+
+it('preserves privacy, availability, reminders and the existing conference in a time-only following split', async () => {
+  const conferenceData = {
+    conferenceId: 'existing-meet',
+    conferenceSolution: { key: { type: 'hangoutsMeet' }, name: 'Google Meet' },
+    entryPoints: [{ entryPointType: 'video', uri: 'https://meet.google.com/existing-meet' }],
+    signature: 'existing-conference-signature',
+  };
+  const master = {
+    ...teamSync([PRINCIPAL_GUEST]),
+    id: 'privateweekly',
+    recurrence: ['RRULE:FREQ=WEEKLY;COUNT=5'],
+    start: { dateTime: '2026-10-02T16:00:00Z', timeZone: PACIFIC },
+    end: { dateTime: '2026-10-02T16:30:00Z', timeZone: PACIFIC },
+    visibility: 'private',
+    transparency: 'transparent',
+    reminders: 'none' as const,
+    guestsCanModify: false,
+    guestsCanInviteOthers: false,
+    guestsCanSeeOtherGuests: false,
+    conference: { status: 'success' as const, uri: 'https://meet.google.com/existing-meet' },
+    conferenceData,
+  };
+  calendar.put(master);
+  calendar.put({
+    ...master,
+    id: 'privateweekly_2',
+    recurrence: undefined,
+    recurringEventId: master.id,
+    originalStartTime: { dateTime: '2026-10-16T16:00:00Z' },
+    start: { dateTime: '2026-10-16T16:00:00Z', timeZone: PACIFIC },
+    end: { dateTime: '2026-10-16T16:30:00Z', timeZone: PACIFIC },
+  });
+  data(
+    await send(main, 'change_event', {
+      calendar: PRINCIPAL,
+      event: 'privateweekly_2',
+      start: '2026-10-16T10:00:00-07:00',
+      end: '2026-10-16T10:30:00-07:00',
+      scope: 'following',
+      send_updates: 'none',
+    }),
+  );
+  const following = calendar.writes.find((write) => write.op === 'insert');
+  expect(following?.fields).toMatchObject({
+    visibility: 'private',
+    transparency: 'transparent',
+    reminders: 'none',
+    guestsCanModify: false,
+    guestsCanInviteOthers: false,
+    guestsCanSeeOtherGuests: false,
+    conferenceData,
+  });
+  expect(calendar.event(PRINCIPAL, following?.eventId ?? '')).toMatchObject({
+    visibility: 'private',
+    transparency: 'transparent',
+    reminders: 'none',
+    guestsCanModify: false,
+    guestsCanInviteOthers: false,
+    guestsCanSeeOtherGuests: false,
+    conference: { uri: 'https://meet.google.com/existing-meet' },
+  });
+});
+
+it('defers a failed replacement insert and finishes the persisted split after a recovery restart', async () => {
+  calendar.put({
+    ...teamSync([PRINCIPAL_GUEST]),
+    id: 'weeklydeferred',
+    recurrence: ['RRULE:FREQ=WEEKLY;COUNT=5'],
+    start: { dateTime: '2026-10-02T16:00:00Z', timeZone: PACIFIC },
+    end: { dateTime: '2026-10-02T16:30:00Z', timeZone: PACIFIC },
+  });
+  calendar.put({
+    ...teamSync([PRINCIPAL_GUEST]),
+    id: 'weeklydeferred_2',
+    recurringEventId: 'weeklydeferred',
+    originalStartTime: { dateTime: '2026-10-16T16:00:00Z' },
+    start: { dateTime: '2026-10-16T16:00:00Z', timeZone: PACIFIC },
+    end: { dateTime: '2026-10-16T16:30:00Z', timeZone: PACIFIC },
+  });
+  const requestId = 'act-split-deferred';
+  const handler = getDeliveryAction('change_event');
+  if (!handler) throw new Error('change_event is not registered');
+  const startedAt = new Date(Date.now() - 31_000).toISOString();
+  const outbox = new Database(outboundDbPath(main.agent_group_id, main.id));
+  try {
+    outbox
+      .prepare('INSERT INTO messages_out(id,timestamp,kind,content) VALUES(?,?,?,?)')
+      .run(requestId, startedAt, 'system', JSON.stringify({ action: 'change_event', requestId }));
+  } finally {
+    outbox.close();
+  }
+  calendar.failNext({ op: 'insert', error: new Error('connection closed before insertion') });
+  await handler(
+    {
+      action: 'change_event',
+      requestId,
+      calendar: PRINCIPAL,
+      event: 'weeklydeferred_2',
+      start: '2026-10-16T10:00:00-07:00',
+      end: '2026-10-16T10:30:00-07:00',
+      scope: 'following',
+      send_updates: 'all',
+    },
+    main,
+  );
+  const response = () => {
+    const inbound = new Database(inboundDbPath(main.agent_group_id, main.id), { readonly: true });
+    try {
+      const row = inbound.prepare('SELECT content FROM messages_in WHERE id=?').get(`action-resp-${requestId}`) as
+        | { content: string }
+        | undefined;
+      return row ? (JSON.parse(row.content) as { frame: ResponseFrame }).frame : undefined;
+    } finally {
+      inbound.close();
+    }
+  };
+  expect(response()).toBeUndefined();
+  const { getCalendarSplitRecovery } = await import('./week/write-log.js');
+  expect((await getCalendarSplitRecovery(requestId))?.createdAt).toBe(startedAt);
+  expect(calendar.event(PRINCIPAL, 'weeklydeferred')?.recurrence).toEqual(['RRULE:FREQ=WEEKLY;UNTIL=20261016T155959Z']);
+  expect(calendar.writes.filter((write) => write.op === 'insert')).toEqual([]);
+  const { createPrincipalEventTools } = await import('./principal-events.js');
+  vi.useFakeTimers({ toFake: ['Date'] });
+  const recoveryAt = Date.now() + 60_001;
+  vi.setSystemTime(recoveryAt);
+  try {
+    await createPrincipalEventTools({ calendar: () => calendar }).resumePending();
+    expect(
+      data(response() ?? { id: requestId, ok: false, error: { code: 'handler-error', message: 'no answer' } }).message,
+    ).toContain('Changed this occurrence and all following occurrences');
+    await createPrincipalEventTools({ calendar: () => calendar }).resumePending();
+  } finally {
+    vi.useRealTimers();
+  }
+  expect(calendar.writes.filter((write) => write.op === 'patch')).toHaveLength(1);
+  expect(calendar.writes.filter((write) => write.op === 'insert')).toHaveLength(1);
+  expect(consumeOwnCalendarChange(PRINCIPAL, 'weeklydeferred', new Date())).toBe(true);
+  expect(consumeOwnCalendarChange(PRINCIPAL, 'weeklydeferred', new Date())).toBe(false);
+});
+
+it('resumes a following split with its saved guest plan after the original occurrence disappears', async () => {
+  const request = { ...followingRequest('missingguestoccurrence'), guests: [REMY] };
+  const requestId = 'act-split-saved-guests';
+  const handler = getDeliveryAction('change_event');
+  if (!handler) throw new Error('change_event is not registered');
+  calendar.failNext({ op: 'insert', error: new Error('replacement temporarily unavailable') });
+  await handler({ ...request, action: 'change_event', requestId }, main);
+  expect(responseFor(main, requestId)).toBeUndefined();
+  calendar.remove(PRINCIPAL, 'missingguestoccurrence_2');
+  const { createPrincipalEventTools } = await import('./principal-events.js');
+  vi.useFakeTimers({ toFake: ['Date'] });
+  vi.setSystemTime(Date.now() + 60_001);
+  try {
+    await createPrincipalEventTools({ calendar: () => calendar }).resumePending();
+  } finally {
+    vi.useRealTimers();
+  }
+  const frame = responseFor(main, requestId);
+  expect(frame).toMatchObject({ ok: true });
+  const following = calendar.writes.find((write) => write.op === 'insert');
+  expect(
+    calendar
+      .event(PRINCIPAL, following?.eventId ?? '')
+      ?.attendees?.map((guest) => guest.email)
+      .sort(),
+  ).toEqual([PRINCIPAL, REMY].sort());
+  expect(calendar.writes.filter((write) => write.op === 'patch')).toHaveLength(1);
+  expect(calendar.writes.filter((write) => write.op === 'insert')).toHaveLength(1);
+});
+
+it('rejects a changed same-id retry without poisoning the pending split or its original answer', async () => {
+  const request = { ...followingRequest('immutablesplit'), guests: [REMY] };
+  const requestId = 'act-immutable-split';
+  const handler = getDeliveryAction('change_event');
+  if (!handler) throw new Error('change_event is not registered');
+  calendar.failNext({ op: 'insert', error: new Error('replacement temporarily unavailable') });
+  await handler({ ...request, action: 'change_event', requestId }, main);
+  const { getCalendarWrite, getCalendarSplitRecovery } = await import('./week/write-log.js');
+  const originalWrite = await getCalendarWrite(requestId);
+  const originalRecovery = await getCalendarSplitRecovery(requestId);
+  expect(originalWrite?.state).toBe('pending');
+  vi.useFakeTimers({ toFake: ['Date'] });
+  vi.setSystemTime(Date.now() + 60_001);
+  try {
+    await handler({ ...request, guests: [NOEL], action: 'change_event', requestId }, main);
+    expect(responseFor(main, requestId)).toBeUndefined();
+    expect(await getCalendarWrite(requestId)).toEqual(originalWrite);
+    expect(await getCalendarSplitRecovery(requestId)).toEqual(originalRecovery);
+    const { createPrincipalEventTools } = await import('./principal-events.js');
+    await createPrincipalEventTools({ calendar: () => calendar }).resumePending();
+    expect(responseFor(main, requestId)).toMatchObject({ ok: true });
+  } finally {
+    vi.useRealTimers();
+  }
+  const following = calendar.writes.find((write) => write.op === 'insert');
+  const guests = calendar.event(PRINCIPAL, following?.eventId ?? '')?.attendees?.map((guest) => guest.email);
+  expect(guests).toContain(REMY);
+  expect(guests).not.toContain(NOEL);
+  expect(calendar.writes.filter((write) => write.op === 'patch')).toHaveLength(1);
+  expect(calendar.writes.filter((write) => write.op === 'insert')).toHaveLength(1);
+});
+
+it('refuses a different session claiming a pending split without changing the original work or answer', async () => {
+  const request = followingRequest('crosssessionsplit');
+  const requestId = 'act-cross-session-split';
+  const handler = getDeliveryAction('change_event');
+  if (!handler) throw new Error('change_event is not registered');
+  calendar.failNext({ op: 'insert', error: new Error('replacement temporarily unavailable') });
+  await handler({ ...request, action: 'change_event', requestId }, main);
+  const { getCalendarWrite, getCalendarSplitRecovery } = await import('./week/write-log.js');
+  const originalWrite = await getCalendarWrite(requestId);
+  const originalRecovery = await getCalendarSplitRecovery(requestId);
+  const other = (await resolveSession(main.agent_group_id, main.messaging_group_id, 'other-thread', 'per-thread'))
+    .session;
+  const refused = await send(other, 'change_event', request, requestId);
+  expect(refused).toMatchObject({ ok: false, error: { code: 'invalid-args' } });
+  expect(responseFor(main, requestId)).toBeUndefined();
+  expect(await getCalendarWrite(requestId)).toEqual(originalWrite);
+  expect(await getCalendarSplitRecovery(requestId)).toEqual(originalRecovery);
+  const { createPrincipalEventTools } = await import('./principal-events.js');
+  vi.useFakeTimers({ toFake: ['Date'] });
+  vi.setSystemTime(Date.now() + 60_001);
+  try {
+    await createPrincipalEventTools({ calendar: () => calendar }).resumePending();
+  } finally {
+    vi.useRealTimers();
+  }
+  expect(responseFor(main, requestId)).toMatchObject({ ok: true });
+  expect(responseFor(other, requestId)).toEqual(refused);
+  expect(calendar.writes.filter((write) => write.op === 'patch')).toHaveLength(1);
+  expect(calendar.writes.filter((write) => write.op === 'insert')).toHaveLength(1);
+});
+
+it.each(['initial', 'recovery'] as const)(
+  'rechecks authority after a %s split waits for the native calendar turn',
+  async (kind) => {
+    const request = followingRequest(`queued${kind}`);
+    const requestId = `act-queued-${kind}`;
+    const handler = getDeliveryAction('change_event');
+    if (!handler) throw new Error('change_event is not registered');
+    if (kind === 'recovery') {
+      calendar.failNext({ op: 'insert', error: new Error('replacement temporarily unavailable') });
+      await handler({ ...request, action: 'change_event', requestId }, main);
+      expect(responseFor(main, requestId)).toBeUndefined();
+    }
+    calendar.put({ ...teamSync([PRINCIPAL_GUEST]), id: 'blockingrequest' });
+    const entered = deferredSignal();
+    const release = deferredSignal();
+    const admitted = deferredSignal();
+    const patch = calendar.patchEvent.bind(calendar);
+    const patchSpy = vi.spyOn(calendar, 'patchEvent').mockImplementation(async (...args) => {
+      if (args[1] === 'blockingrequest') {
+        entered.resolve();
+        await release.promise;
+      }
+      return patch(...args);
+    });
+    const blocking = handler(
+      {
+        action: 'change_event',
+        requestId: 'act-blocking',
+        calendar: PRINCIPAL,
+        event: 'blockingrequest',
+        title: 'Already issued calendar write',
+        send_updates: 'none',
+      },
+      main,
+    );
+    await entered.promise;
+    const capabilities = capabilityStorage.getGroupCapabilities;
+    const capabilitySpy = vi.spyOn(capabilityStorage, 'getGroupCapabilities').mockImplementationOnce(async (id) => {
+      const value = await capabilities(id);
+      admitted.resolve();
+      return value;
+    });
+    const { createPrincipalEventTools } = await import('./principal-events.js');
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(Date.now() + 60_001);
+    const queued =
+      kind === 'recovery'
+        ? createPrincipalEventTools({ calendar: () => calendar }).resumePending()
+        : handler({ ...request, action: 'change_event', requestId }, main);
+    try {
+      await admitted.promise;
+      await updateContainerConfigJson(main.agent_group_id, 'capabilities', []);
+      expect(calendar.writes.filter((write) => write.op === 'insert')).toEqual([]);
+      release.resolve();
+      await Promise.all([blocking, queued]);
+      expect(calendar.writes.filter((write) => write.op === 'insert')).toEqual([]);
+      if (kind === 'initial')
+        expect(responseFor(main, requestId)).toMatchObject({ ok: false, error: { code: 'forbidden' } });
+      else {
+        const { getCalendarSplitRecovery } = await import('./week/write-log.js');
+        expect((await getCalendarSplitRecovery(requestId))?.terminalError).toContain(
+          'no longer has calendar authority',
+        );
+        expect(responseFor(main, requestId)).toBeUndefined();
+      }
+    } finally {
+      release.resolve();
+      await Promise.allSettled([blocking, queued]);
+      patchSpy.mockRestore();
+      capabilitySpy.mockRestore();
+      vi.useRealTimers();
+    }
+  },
+);
+
+it.each([
+  { attachments: [{ fileId: 'file-1', fileUrl: 'https://drive.google.com/file/d/file-1' }] },
+  { privateCopy: true },
+  { endTimeUnspecified: true },
+  { anyoneCanAddSelf: true },
+])('refuses a split before trimming when unsupported metadata cannot be preserved (%j)', async (properties) => {
+  const request = followingRequest('unsupportedmetadata', properties);
+  const message = refusal(await send(main, 'change_event', request));
+  expect(message).toContain('cannot be preserved');
+  expect(message).toContain('Nothing was written');
+  expect(calendar.writes).toEqual([]);
+});
+
+it('reports a permanent partial split failure instead of success or another destructive retry', async () => {
+  const request = followingRequest('permanentpartial');
+  const requestId = 'act-split-permanent';
+  calendar.failNext({ op: 'insert', error: new GoogleApiError(400, 'Invalid replacement') });
+  const message = refusal(await send(main, 'change_event', request, requestId));
+  expect(message).toContain('only partly changed');
+  expect(message).toContain('original series was shortened');
+  expect(message).toContain('will not be retried automatically');
+  const { createPrincipalEventTools } = await import('./principal-events.js');
+  await createPrincipalEventTools({ calendar: () => calendar }).resumePending();
+  expect(refusal(await send(main, 'change_event', request, requestId))).toBe(message);
+  expect(calendar.writes.filter((write) => write.op === 'patch')).toHaveLength(1);
+  expect(calendar.writes.filter((write) => write.op === 'insert')).toEqual([]);
+  const { getCalendarSplitRecovery } = await import('./week/write-log.js');
+  expect(await getCalendarSplitRecovery(requestId)).toMatchObject({ terminalError: message, reported: true });
+});
+
+it.each(['default', 'none'] as const)(
+  'replaces custom reminders with %s without carrying stale overrides into recovery',
+  async (reminders) => {
+    const request = followingRequest('replacedreminders', {
+      reminders: 'custom',
+      reminderOverrides: [{ method: 'popup', minutes: 17 }],
+    });
+    const result = data(await send(main, 'change_event', { ...request, reminders }, `act-reminders-${reminders}`));
+    expect(result.message).toContain('all following occurrences');
+    const following = calendar.writes.find((write) => write.op === 'insert');
+    expect(following?.fields?.reminders).toBe(reminders);
+    expect(following?.fields).not.toHaveProperty('reminderOverrides');
+  },
+);
+
+it('retains custom reminder overrides when the following split changes only time', async () => {
+  const request = followingRequest('keptcustomreminders', {
+    reminders: 'custom',
+    reminderOverrides: [
+      { method: 'popup', minutes: 17 },
+      { method: 'email', minutes: 90 },
+    ],
+  });
+  data(await send(main, 'change_event', request));
+  expect(calendar.writes.find((write) => write.op === 'insert')?.fields).toMatchObject({
+    reminders: 'custom',
+    reminderOverrides: [
+      { method: 'popup', minutes: 17 },
+      { method: 'email', minutes: 90 },
+    ],
+  });
+});
+
+it.each(['closed', 'foreign-agent', 'capability-removed'] as const)(
+  'makes no new calendar write when a deferred split loses %s session authority',
+  async (kind) => {
+    const request = followingRequest('obsoletepartial');
+    const requestId = 'act-split-obsolete';
+    const handler = getDeliveryAction('change_event');
+    if (!handler) throw new Error('change_event is not registered');
+    calendar.failNext({ op: 'insert', error: new Error('temporary transport failure') });
+    await handler({ ...request, action: 'change_event', requestId }, main);
+    expect(responseFor(main, requestId)).toBeUndefined();
+    if (kind === 'closed') await getDb().run("UPDATE sessions SET status='closed' WHERE id=?", main.id);
+    else if (kind === 'foreign-agent')
+      await getDb().run("UPDATE sessions SET agent_group_id='ag-external' WHERE id=?", main.id);
+    else await updateContainerConfigJson(main.agent_group_id, 'capabilities', []);
+    const { createPrincipalEventTools } = await import('./principal-events.js');
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(Date.now() + 60_001);
+    try {
+      await createPrincipalEventTools({ calendar: () => calendar }).resumePending();
+    } finally {
+      vi.useRealTimers();
+    }
+    expect(calendar.writes.filter((write) => write.op === 'patch')).toHaveLength(1);
+    expect(calendar.writes.filter((write) => write.op === 'insert')).toEqual([]);
+    const { getCalendarSplitRecovery } = await import('./week/write-log.js');
+    expect((await getCalendarSplitRecovery(requestId))?.terminalError).toContain('no longer has calendar authority');
+    expect(responseFor(main, requestId)).toBeUndefined();
+  },
+);
+
+it('bounds transient split recovery attempts and reports the unresolved partial change', async () => {
+  const request = followingRequest('boundedpartial');
+  const requestId = 'act-split-bounded';
+  const handler = getDeliveryAction('change_event');
+  if (!handler) throw new Error('change_event is not registered');
+  for (let attempt = 0; attempt < 8; attempt++)
+    calendar.failNext({ op: 'insert', error: new Error('still unavailable') });
+  await handler({ ...request, action: 'change_event', requestId }, main);
+  expect(responseFor(main, requestId)).toBeUndefined();
+  const { createPrincipalEventTools } = await import('./principal-events.js');
+  const { getCalendarSplitRecovery } = await import('./week/write-log.js');
+  vi.useFakeTimers({ toFake: ['Date'] });
+  try {
+    for (let attempt = 1; attempt < 8; attempt++) {
+      vi.setSystemTime(Date.now() + 60_001);
+      await createPrincipalEventTools({ calendar: () => calendar }).resumePending();
+    }
+  } finally {
+    vi.useRealTimers();
+  }
+  const frame = responseFor(main, requestId);
+  if (!frame) throw new Error('Bounded recovery did not answer');
+  expect(refusal(frame)).toContain('only partly changed');
+  expect(refusal(frame)).toContain('bounded recovery attempts');
+  expect((await getCalendarSplitRecovery(requestId))?.terminalError).toBe(refusal(frame));
+  expect((await getCalendarSplitRecovery(requestId))?.attempts).toBe(8);
+  expect(calendar.writes.filter((write) => write.op === 'patch')).toHaveLength(1);
+  expect(calendar.writes.filter((write) => write.op === 'insert')).toEqual([]);
+});
+
+it('recovers a pending split ahead of twenty-one completed reports waiting for a principal route', async () => {
+  const { beginCalendarWrite, markCalendarWriteApplied } = await import('./week/write-log.js');
+  for (let index = 0; index < 21; index++) {
+    const requestId = `act-blocked-report-${index}`;
+    await beginCalendarWrite(
+      {
+        requestId,
+        calendarId: PRINCIPAL,
+        eventId: `oldseries_${index}`,
+        action: 'change_event',
+        request: {},
+        before: null,
+        plan: {
+          patch: {},
+          split: {
+            masterId: 'oldseries',
+            master: { id: 'oldseries' },
+            trim: [],
+            deleteMaster: false,
+            followingId: `oldfollowing${index}`,
+            following: null,
+          },
+        },
+        affectedStart: '2026-10-05T16:00:00Z',
+        affectedEnd: '2026-10-05T17:00:00Z',
+      },
+      `missing-session-${index}`,
+    );
+    await markCalendarWriteApplied(requestId, 'An earlier split completed.');
+  }
+  const requestId = 'act-behind-blocked-reports';
+  const request = followingRequest('waitingforrecovery');
+  const handler = getDeliveryAction('change_event');
+  if (!handler) throw new Error('change_event is not registered');
+  calendar.failNext({ op: 'insert', error: new Error('temporary transport failure') });
+  await handler({ ...request, action: 'change_event', requestId }, main);
+  expect(responseFor(main, requestId)).toBeUndefined();
+  const { createPrincipalEventTools } = await import('./principal-events.js');
+  vi.useFakeTimers({ toFake: ['Date'] });
+  const recoveryAt = Date.now() + 60_001;
+  vi.setSystemTime(recoveryAt);
+  try {
+    await createPrincipalEventTools({ calendar: () => calendar }).resumePending();
+  } finally {
+    vi.useRealTimers();
+  }
+  expect(responseFor(main, requestId)).toMatchObject({ ok: true });
+  const { getCalendarSplitRecovery } = await import('./week/write-log.js');
+  const blocked = await getCalendarSplitRecovery('act-blocked-report-0');
+  expect(blocked).toMatchObject({ reported: false, attempts: 0 });
+  expect(Date.parse(blocked?.nextAttemptAt ?? '')).toBeGreaterThan(recoveryAt);
+  expect(calendar.writes.filter((write) => write.op === 'patch')).toHaveLength(1);
+  expect(calendar.writes.filter((write) => write.op === 'insert')).toHaveLength(1);
 });
 
 it('changes an event even when the calendar scan used only for findings cannot be read', async () => {

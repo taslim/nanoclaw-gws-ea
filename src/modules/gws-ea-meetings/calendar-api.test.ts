@@ -536,6 +536,88 @@ it('keeps telephone conference entry points on the detail route', async () => {
   });
 });
 
+it('round-trips existing conference data, custom reminders and restricted guest controls through the Calendar wire', async () => {
+  const conferenceData = {
+    conferenceId: 'existing-meet',
+    conferenceSolution: { key: { type: 'hangoutsMeet' }, name: 'Google Meet' },
+    entryPoints: [
+      { entryPointType: 'video', uri: 'https://meet.google.com/existing-meet' },
+      { entryPointType: 'phone', uri: 'tel:+14155550100', pin: '123456' },
+    ],
+    signature: 'existing-signature',
+    notes: 'Existing dial-in details',
+  };
+  const reminders = {
+    useDefault: false,
+    overrides: [
+      { method: 'popup', minutes: 17 },
+      { method: 'email', minutes: 90 },
+    ],
+  };
+  const raw = {
+    id: 'original',
+    visibility: 'private',
+    transparency: 'transparent',
+    guestsCanModify: false,
+    guestsCanInviteOthers: false,
+    guestsCanSeeOtherGuests: false,
+    reminders,
+    conferenceData: {
+      ...conferenceData,
+      createRequest: { requestId: 'original-request', status: { statusCode: 'success' } },
+    },
+    colorId: '7',
+    source: { title: 'Source invitation', url: 'https://example.test/meeting' },
+    extendedProperties: { private: { own: 'kept' }, shared: { conference: 'kept' } },
+  };
+  const { api, requests } = stubGoogle((request) => ({
+    status: 200,
+    body: request.method === 'GET' ? raw : { id: 'following' },
+  }));
+  const original = await api.getEventDetail('morgan@ellery.example', 'original');
+  if (!original) throw new Error('Original event missing');
+  await api.insertEvent(
+    'morgan@ellery.example',
+    'following',
+    {
+      start: '2026-10-16T17:00:00Z',
+      end: '2026-10-16T17:30:00Z',
+      visibility: 'private',
+      transparency: 'transparent',
+      guestsCanModify: original.guestsCanModify,
+      guestsCanInviteOthers: original.guestsCanInviteOthers,
+      guestsCanSeeOtherGuests: original.guestsCanSeeOtherGuests,
+      reminders: original.reminders,
+      reminderOverrides: original.reminderOverrides,
+      conferenceData: original.conferenceData,
+      colorId: original.colorId,
+      source: original.source,
+      tags: original.tags,
+      sharedTags: original.sharedTags,
+    },
+    'none',
+  );
+  expect(requests[0].url.searchParams.get('fields')).toContain('conferenceData');
+  expect(requests[1].url.searchParams.get('conferenceDataVersion')).toBe('1');
+  expect(requests[1].body).toEqual({
+    id: 'following',
+    start: { dateTime: '2026-10-16T17:00:00Z' },
+    end: { dateTime: '2026-10-16T17:30:00Z' },
+    visibility: 'private',
+    transparency: 'transparent',
+    guestsCanModify: false,
+    guestsCanInviteOthers: false,
+    guestsCanSeeOtherGuests: false,
+    reminders,
+    conferenceData,
+    colorId: '7',
+    source: raw.source,
+    extendedProperties: raw.extendedProperties,
+  });
+  expect(await api.getEvent('morgan@ellery.example', 'original')).not.toHaveProperty('conferenceData');
+  expect(await api.getEvent('morgan@ellery.example', 'original')).not.toHaveProperty('reminderOverrides');
+});
+
 it('reads one main-only detail with its creator and recurrence, keeping the outward getter title-free', async () => {
   const { api, requests } = stubGoogle(() => ({
     status: 200,
