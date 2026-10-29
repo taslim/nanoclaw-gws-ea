@@ -468,12 +468,16 @@ describe('the evening close', () => {
     );
   });
 
-  it('forgets the latest Sunday snapshot without reading memory contents', async () => {
-    const directory = path.join(DATA_DIR, 'groups', MAIN, 'sunday-memory-latest');
-    fs.mkdirSync(directory, { recursive: true });
-    fs.writeFileSync(path.join(directory, 'juno.md'), 'Juno facts');
+  it('forgets the latest Sunday snapshot and the planning results without reading them', async () => {
+    const snapshot = path.join(DATA_DIR, 'groups', MAIN, 'sunday-memory-latest');
+    const runs = path.join(DATA_DIR, 'groups', MAIN, 'planning-runs');
+    fs.mkdirSync(snapshot, { recursive: true });
+    fs.writeFileSync(path.join(snapshot, 'juno.md'), 'Juno facts');
+    fs.mkdirSync(runs, { recursive: true });
+    fs.writeFileSync(path.join(runs, 'agent-1-look-back.md'), 'Close run: close-1\nJuno Hale asked for Friday.');
     await forgetSundaySnapshot();
-    expect(fs.existsSync(directory)).toBe(false);
+    expect(fs.existsSync(snapshot)).toBe(false);
+    expect(fs.existsSync(runs)).toBe(false);
   });
 });
 

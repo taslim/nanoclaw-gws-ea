@@ -281,11 +281,13 @@ export function finishClose(sessionId: string, runId: string, report?: string, n
   });
 }
 
-/** Forgetting deletes the latest snapshot by path; the host never reads memory contents. */
+/** Forgetting deletes the latest memory snapshot and the planning results by path; the host never reads either. */
 export async function forgetSundaySnapshot(): Promise<void> {
   const main = await getMainAgentGroupId();
   const group = main === null ? undefined : await getAgentGroup(main);
-  if (group) await fs.rm(path.join(GROUPS_DIR, group.folder, 'sunday-memory-latest'), { recursive: true, force: true });
+  if (!group) return;
+  for (const copy of ['sunday-memory-latest', 'planning-runs'])
+    await fs.rm(path.join(GROUPS_DIR, group.folder, copy), { recursive: true, force: true });
 }
 
 interface ScriptSection {
