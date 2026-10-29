@@ -15,61 +15,23 @@ import {
   createInboundRecord,
   parseOutboundRecord,
   parseIsoTimestamp,
+  parseDestinationRecord,
+  parseSessionRoutingRecord,
 } from '../../../container/agent-runner/src/mailbox/model.generated.js';
 import type { Destination } from '../../../container/agent-runner/src/mailbox/types.js';
-import { callHost, readState, recordEffect } from './state.js';
+import { callHost, readState } from './state.js';
 
 export class FixtureMailbox implements AgentMailbox, MailboxOperations {
   readonly operations = this;
   private readonly inbound = new Map<string, InboundMessage>();
-  private readonly destinations: Destination[] = [
-    {
-      name: 'principal',
-      displayName: 'Morgan Ellery',
-      type: 'channel',
-      channelType: 'gchat',
-      platformId: 'synthetic-morgan-dm',
-      agentGroupId: null,
-    },
-    {
-      name: 'outward',
-      displayName: 'Juno Hale',
-      type: 'channel',
-      channelType: 'email',
-      platformId: 'synthetic-juno-thread',
-      agentGroupId: null,
-    },
-    {
-      name: 'external-email',
-      displayName: 'external-email',
-      type: 'agent',
-      channelType: null,
-      platformId: null,
-      agentGroupId: 'synthetic-external-email',
-    },
-  ];
+  private readonly destinations: Destination[];
+  private readonly routing: SessionRouting;
   constructor(private readonly file: string) {
-    const audience = readState(file).scenario.audience;
-    const compositionPath = path.join(path.dirname(file), 'composition.json');
-    if (fs.existsSync(compositionPath)) {
-      const composition = JSON.parse(
-        fs.readFileSync(compositionPath, 'utf8'),
-      ) as import('../types.js').ScenarioComposition;
-      if (composition.close) {
-        this.destinations.splice(0, this.destinations.length, ...composition.close.destinations);
-        return;
-      }
-    }
-    if (audience !== 'main') {
-      this.destinations.splice(0, this.destinations.length, {
-        name: 'outward',
-        displayName: 'Juno Hale',
-        type: 'channel',
-        channelType: audience === 'external-chat' ? 'whatsapp' : 'email',
-        platformId: audience === 'external-chat' ? 'synthetic-juno-chat' : 'email:inbox',
-        agentGroupId: null,
-      });
-    }
+    const composition = JSON.parse(
+      fs.readFileSync(path.join(path.dirname(file), 'composition.json'), 'utf8'),
+    ) as import('../types.js').ScenarioComposition;
+    this.destinations = composition.destinations.map(parseDestinationRecord);
+    this.routing = parseSessionRoutingRecord(composition.routing);
   }
   async start(_key: MailboxSessionKey | null): Promise<void> {}
   async stop(): Promise<void> {}
@@ -104,11 +66,20 @@ export class FixtureMailbox implements AgentMailbox, MailboxOperations {
     return this.inbound.get(`cli-resp-${id}`);
   }
   async writeMessageOut(message: OutboundMessageDraft): Promise<number> {
+    const fixture = readState(this.file);
+    if (message.kind === 'chat') {
+      if (fixture.scenario.observationOnly)
+        throw new Error('Unsupported fixture outward delivery: this case observes an internal report only.');
+      const destination =
+        message.channelType === 'agent'
+          ? this.destinations.find((entry) => entry.type === 'agent' && entry.agentGroupId === message.platformId)
+          : this.findDestinationByRouting(message.channelType ?? null, message.platformId ?? null);
+      if (!destination) throw new Error('Unsupported or ungranted fixture destination.');
+    }
     const row = parseOutboundRecord(await callHost(this.file, 'outbound', { draft: message }));
     const seq = row.sequence;
     if (seq === null) throw new Error('Native synthetic outbox has no sequence');
     const content = JSON.parse(message.content) as Record<string, unknown>;
-    const fixture = readState(this.file);
     if (message.kind === 'system' && typeof content.action === 'string' && typeof content.requestId === 'string') {
       let frame: unknown;
       try {
@@ -141,20 +112,7 @@ export class FixtureMailbox implements AgentMailbox, MailboxOperations {
       // Native task output is an internal report, never an email/chat delivery.
       return seq;
     } else if (message.kind === 'chat') {
-      if (fixture.scenario.observationOnly)
-        throw new Error('Unsupported fixture outward delivery: this case observes an internal report only.');
-      if (fixture.scenario.audience === 'external-email') {
-        await callHost(this.file, 'deliver', { content, messageId: row.id });
-        return seq;
-      }
-      const dest = this.findDestinationByRouting(message.channelType ?? null, message.platformId ?? null);
-      await recordEffect(this.file, {
-        kind: 'message',
-        operation: 'send',
-        target: dest?.name ?? String(message.platformId),
-        payload: content,
-        actor: fixture.scenario.audience,
-      });
+      await callHost(this.file, 'deliver', { messageId: row.id });
     } else throw new Error(`Unsupported fixture outbound kind: ${message.kind}`);
     return seq;
   }
@@ -168,8 +126,8 @@ export class FixtureMailbox implements AgentMailbox, MailboxOperations {
     channelType: string,
     platformId: string,
   ): { threadId: string | null; inReplyTo: string } | null {
-    return this.findDestinationByRouting(channelType, platformId)
-      ? { threadId: null, inReplyTo: 'synthetic-input' }
+    return this.routing.channelType === channelType && this.routing.platformId === platformId
+      ? { threadId: this.routing.threadId, inReplyTo: 'synthetic-input' }
       : null;
   }
   getUndeliveredMessages(): OutboundMessage[] {
@@ -193,21 +151,7 @@ export class FixtureMailbox implements AgentMailbox, MailboxOperations {
     fs.writeFileSync(path.join(path.dirname(this.file), 'mailbox-state.json'), JSON.stringify(state));
   }
   getSessionRouting(): SessionRouting {
-    const composition = JSON.parse(
-      fs.readFileSync(path.join(path.dirname(this.file), 'composition.json'), 'utf8'),
-    ) as import('../types.js').ScenarioComposition;
-    if (composition.close) return { channelType: null, platformId: null, threadId: null };
-    const audience = readState(this.file).scenario.audience;
-    return {
-      channelType: audience === 'main' ? 'gchat' : audience === 'external-chat' ? 'whatsapp' : 'email',
-      platformId:
-        audience === 'main'
-          ? 'synthetic-morgan-dm'
-          : audience === 'external-chat'
-            ? 'synthetic-juno-chat'
-            : 'email:inbox',
-      threadId: audience === 'external-email' ? (readState(this.file).thread?.key ?? 'mail-synthetic-identity') : null,
-    };
+    return this.routing;
   }
   getDestinations(): Destination[] {
     return this.destinations;
@@ -216,7 +160,9 @@ export class FixtureMailbox implements AgentMailbox, MailboxOperations {
     return this.destinations.find((entry) => entry.name === name);
   }
   findDestinationByRouting(channelType: string | null, platformId: string | null): Destination | undefined {
-    return this.destinations.find((entry) => entry.channelType === channelType && entry.platformId === platformId);
+    return this.destinations.find(
+      (entry) => entry.type === 'channel' && entry.channelType === channelType && entry.platformId === platformId,
+    );
   }
   setContainerToolInFlight(_tool: string, _declaredTimeoutMs: number | null): void {}
   clearContainerToolInFlight(): void {}

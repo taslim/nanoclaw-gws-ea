@@ -232,7 +232,10 @@ try {
   if (config.skills === 'all') throw new Error('Synthetic role must name its release skills explicitly.');
   const reservedEnvironmentKeys = ['HOME', 'TZ', 'ANTHROPIC_BASE_URL'];
   const { sessionDir } = await import('../../../src/session-manager.js');
+  const { projectSessionRoutes } = await import('./routes.js');
+  const routes = await projectSessionRoutes(session);
   const composition: ScenarioComposition = {
+    ...routes,
     ...(close ? { close } : {}),
     audience: audience as ScenarioComposition['audience'],
     group,
@@ -336,7 +339,7 @@ try {
     JSON.stringify({ ...composition, ...(handoff ? { handoff } : {}) }, null, 2),
   );
   const { startSyntheticDelivery } = await import('./delivery.js');
-  const stopDelivery = await startSyntheticDelivery();
+  const stopDelivery = await startSyntheticDelivery(output);
   try {
     await serveNativeHost(output, session, google, () => refresher.refresh({ full: true }));
   } finally {

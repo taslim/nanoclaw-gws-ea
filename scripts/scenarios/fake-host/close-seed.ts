@@ -135,29 +135,11 @@ export async function seedCloseScenario(
       { kind: 'once', at: new Date(reference + 30 * 86_400_000).toISOString() },
     );
   }
-  const { writeDestinations } = await import('../../../src/modules/agent-to-agent/write-destinations.js');
-  await writeDestinations(main.agent_group_id, session.id);
-  const Database = (await import('better-sqlite3')).default;
-  const { inboundDbPath } = await import('../../../src/mailbox/sqlite/paths.js');
-  const { parseDestinationRecord } = await import('../../../src/mailbox/model.js');
-  const inbox = new Database(inboundDbPath(main.agent_group_id, session.id), { readonly: true });
-  let destinations: ReturnType<typeof parseDestinationRecord>[];
-  try {
-    destinations = inbox
-      .prepare(
-        'SELECT name,display_name AS displayName,type,channel_type AS channelType,platform_id AS platformId,agent_group_id AS agentGroupId,session_mode AS sessionMode FROM destinations',
-      )
-      .all()
-      .map(parseDestinationRecord);
-  } finally {
-    inbox.close();
-  }
   return {
     session,
     close: {
       runId: id,
       task: task.row,
-      destinations: destinations ?? [],
       scheduledAt,
       scope: {
         referenceAt,

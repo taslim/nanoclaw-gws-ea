@@ -23,6 +23,8 @@
     "fake-host/state.ts",
     "fake-host/relay.ts",
     "fake-host/mailbox.ts",
+    "fake-host/mailbox.test.ts",
+    "fake-host/transport-check.ts",
     "fake-host/check.ts",
     "fake-host/sandbox.ts",
     "score.test.ts"

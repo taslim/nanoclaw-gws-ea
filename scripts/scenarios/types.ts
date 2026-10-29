@@ -1,4 +1,4 @@
-import type { Destination } from '../../src/mailbox/types.js';
+import type { Destination, SessionRouting } from '../../src/mailbox/types.js';
 import type { TaskRecord } from '../../src/mailbox/model.js';
 export interface ScenarioCase {
   readonly id: string;
@@ -58,10 +58,11 @@ export interface ScenarioComposition {
   readonly moduleEnvironment: Readonly<Record<string, string>>;
   readonly reservedEnvironmentKeys: readonly string[];
   readonly session: { readonly id: string; readonly messagingGroupId: string | null };
+  readonly destinations: readonly Destination[];
+  readonly routing: SessionRouting;
   readonly close?: {
     readonly runId: string;
     readonly task: TaskRecord;
-    readonly destinations: readonly Destination[];
     readonly scheduledAt: string;
     readonly scope: {
       readonly referenceAt: string;

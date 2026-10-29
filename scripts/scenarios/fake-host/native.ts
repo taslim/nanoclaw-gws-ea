@@ -161,10 +161,10 @@ export async function serveNativeHost(
   const { parseArgv } = await import('../../../src/cli/parse-argv.js');
   const { formatResponse } = await import('../../../src/cli/format.js');
   const { getDeliveryAction, deliverSessionMessages } = await import('../../../src/delivery.js');
-  const { getMessagingGroup } = await import('../../../src/db/messaging-groups.js');
   const { inboundDbPath, outboundDbPath } = await import('../../../src/mailbox/sqlite/paths.js');
   const { getDb } = await import('../../../src/db/connection.js');
-  const { createOutboundRecord, parseOutboundWrite } = await import('../../../src/mailbox/model.js');
+  const { createOutboundRecord, parseOutboundWrite, parseOutboundRecord } =
+    await import('../../../src/mailbox/model.js');
   const Database = (await import('better-sqlite3')).default;
   const fixtureFile = path.join(root, 'fixture.json');
   const observations = path.join(root, 'tool-results.jsonl');
@@ -411,23 +411,29 @@ export async function serveNativeHost(
         } else throw new Error(`Unimplemented synthetic gog service: ${service}`);
       } else if (body.method === 'action') {
         value = await nativeAction(body.args);
+      } else if (body.method === 'route-projection') {
+        const { readSessionRoutes } = await import('./routes.js');
+        value = await readSessionRoutes(session);
       } else if (body.method === 'deliver') {
-        const route = session.messaging_group_id ? await getMessagingGroup(session.messaging_group_id) : undefined;
-        if (route?.channel_type !== 'email' || session.thread_id === null || typeof body.args.messageId !== 'string')
-          throw new Error('Only the native email session can use this synthetic delivery transport');
+        if (typeof body.args.messageId !== 'string') throw new Error('A synthetic outbound message id is required');
+        const saved = readState(fixtureFile).outbound.find((entry) => entry.id === body.args.messageId);
+        const message = saved ? parseOutboundRecord(saved) : undefined;
+        if (!message || message.kind !== 'chat') throw new Error('No native synthetic chat draft exists');
         const outbox = new Database(outboundDbPath(session.agent_group_id, session.id));
         try {
           outbox
             .prepare(
-              `INSERT OR IGNORE INTO messages_out (id,timestamp,kind,platform_id,channel_type,thread_id,content)
-            VALUES (?,?,'chat',?,'email',?,?)`,
+              `INSERT OR IGNORE INTO messages_out (id,timestamp,kind,platform_id,channel_type,thread_id,content,in_reply_to)
+            VALUES (?,?,'chat',?,?,?,?,?)`,
             )
             .run(
-              body.args.messageId,
-              new Date().toISOString(),
-              route.platform_id,
-              session.thread_id,
-              JSON.stringify(body.args.content),
+              message.id,
+              message.timestamp,
+              message.platformId,
+              message.channelType,
+              message.threadId,
+              message.content,
+              message.inReplyTo,
             );
         } finally {
           outbox.close();
@@ -439,7 +445,7 @@ export async function serveNativeHost(
             | { status: string }
             | undefined;
           if (receipt?.status !== 'delivered')
-            throw new Error(`Native email delivery is ${receipt?.status ?? 'pending'}`);
+            throw new Error(`Native synthetic delivery is ${receipt?.status ?? 'pending'}`);
           value = { receipt };
         } finally {
           inbox.close();

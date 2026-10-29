@@ -6,9 +6,10 @@ import { fileURLToPath } from 'node:url';
 import type { StoredEvent, CalendarWriteRecord } from '../../../src/modules/gws-ea-meetings/testing/fake-calendar.js';
 import type { GmailMessage } from '../../../src/modules/gws-ea-inbox/gmail-api.js';
 import { parseGmailMessage } from '../../../src/modules/gws-ea-inbox/mime.js';
-import { callHost, SYNTHETIC_IDENTITY, writeState } from './state.js';
+import { callHost, SYNTHETIC_IDENTITY, readState, writeState } from './state.js';
+import { FixtureMailbox } from './mailbox.js';
 import type { SyntheticEvent } from './state.js';
-import type { ScenarioCase } from '../types.js';
+import type { ScenarioCase, ScenarioComposition } from '../types.js';
 
 const tree = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..');
 const output = process.argv[2];
@@ -27,7 +28,7 @@ interface Snapshot {
   readonly threadSends: { state: string }[];
 }
 async function host(
-  audience: 'main' | 'external-email',
+  audience: ScenarioCase['audience'],
   check: (file: string) => Promise<void>,
   name: string = audience,
   events: SyntheticEvent[] = [],
@@ -304,12 +305,21 @@ await host('external-email', async (file) => {
   assert.equal(state.threadSends.length, 2);
   assert.ok(state.threadSends.every((send) => send.state === 'sent'));
   const finalContent = { text: 'I will send the one-page brief before the meeting.' };
+  const mailbox = new FixtureMailbox(file);
+  const route = mailbox.getSessionRouting();
+  await mailbox.writeMessageOut({
+    id: 'native-final-delivery',
+    kind: 'chat',
+    channelType: route.channelType,
+    platformId: route.platformId,
+    threadId: route.threadId,
+    content: JSON.stringify(finalContent),
+  });
   const delivered = (await callHost(file, 'deliver', {
-    content: finalContent,
     messageId: 'native-final-delivery',
   })) as { receipt: { status: string } };
   assert.equal(delivered.receipt.status, 'delivered');
-  await callHost(file, 'deliver', { content: finalContent, messageId: 'native-final-delivery' });
+  await callHost(file, 'deliver', { messageId: 'native-final-delivery' });
   state = await snapshot(file);
   assert.equal(state.mail.length, 3);
   assert.deepEqual(
@@ -365,6 +375,81 @@ await host('external-email', async (file) => {
   assert.equal(state.events[0]?.status, 'cancelled');
   assert.equal(state.calendarWrites.filter((write) => write.op === 'delete').length, 1);
 });
+for (const audience of ['main', 'external-email', 'external-chat'] as const) {
+  await host(
+    audience,
+    async (file) => {
+      const directory = path.dirname(file);
+      const mailbox = new FixtureMailbox(file);
+      const projected = (await callHost(file, 'route-projection')) as Pick<
+        ScenarioComposition,
+        'destinations' | 'routing'
+      >;
+      assert.deepEqual(mailbox.getDestinations(), projected.destinations);
+      assert.deepEqual(mailbox.getSessionRouting(), projected.routing);
+      const route = projected.routing;
+      const origin = mailbox.findDestinationByRouting(route.channelType, route.platformId);
+      assert.ok(origin, 'The native conversation must project its own reply destination');
+      if (audience === 'external-email')
+        await action(file, 'email_send', 'native-route-first-mail', {
+          subject: 'Synthetic route proof',
+          text: 'Juno, this is an invented native transport proof.',
+        });
+      const priorMessages = readState(file).effects.filter((effect) => effect.kind === 'message').length;
+      const draft = {
+        id: `native-route-${audience}`,
+        kind: 'chat',
+        channelType: route.channelType,
+        platformId: route.platformId,
+        threadId: route.threadId,
+        content: JSON.stringify({ text: 'Synthetic native route proof only.' }),
+      };
+      await mailbox.writeMessageOut(draft);
+      const delivered = (await callHost(file, 'deliver', { messageId: draft.id })) as { receipt: { status: string } };
+      assert.equal(delivered.receipt.status, 'delivered');
+      const beforeDenied = readState(file);
+      assert.equal(beforeDenied.effects.filter((effect) => effect.kind === 'message').length, priorMessages + 1);
+      await assert.rejects(
+        mailbox.writeMessageOut({
+          ...draft,
+          id: 'phantom-route',
+          channelType: 'email',
+          platformId: 'synthetic-juno-thread',
+        }),
+        /destination/u,
+      );
+      assert.deepEqual(readState(file).effects, beforeDenied.effects);
+      assert.deepEqual(readState(file).outbound, beforeDenied.outbound);
+      // A raw fixture-RPC attempt still passes the actual host's native ACL.
+      const denied = {
+        ...draft,
+        id: 'raw-ungranted-route',
+        channelType: audience === 'main' ? 'email' : 'gchat',
+        platformId: audience === 'main' ? 'synthetic-juno-thread' : 'synthetic-morgan-dm',
+        threadId: null,
+      };
+      await callHost(file, 'outbound', { draft: denied });
+      await assert.rejects(callHost(file, 'deliver', { messageId: denied.id }), /delivery is (pending|failed)/u);
+      assert.deepEqual(readState(file).effects, beforeDenied.effects);
+      fs.writeFileSync(
+        path.join(directory, 'native-route-delivery-proof.json'),
+        JSON.stringify(
+          {
+            modelCalls: 0,
+            projected,
+            delivered,
+            retryDuplicates: 0,
+            phantomRouteRefused: true,
+            nativeAclRefused: true,
+          },
+          null,
+          2,
+        ),
+      );
+    },
+    `routes-${audience}`,
+  );
+}
 fs.writeFileSync(
   path.join(output, 'result.json'),
   JSON.stringify(

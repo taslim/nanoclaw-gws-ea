@@ -66,6 +66,17 @@ booking. Calendar's wire fixture refuses guest edits with HTTP 403 while allowin
 the guest's own response. The native handler's refused-change message is kept.
 
 `preflight-case-proof.json` retains actual native writes and their readback.
+Every prepared session uses the host's actual `writeDestinations` and
+`writeSessionRouting` projections. The runner's destination addendum and
+compaction text therefore name exactly the session's native routes, including
+`this-chat`; there are no synthetic outward or agent grants. Preparation compares
+the runner projection to its native inbound database and proves that an ungranted
+send creates neither an outbox draft nor message credit. Chat sends pass through
+`deliverSessionMessages` before the closed synthetic Google Chat/WhatsApp wires;
+the transport check verifies allowed origins, native delivery receipts, retry
+deduplication and host ACL refusal for all three roles. Email retains its native
+Gmail transport. These are transport checks, not proof of real recipient contact.
+
 The isolated proof rolls back its native central transaction and restores the
 invented Google records and mailbox rows before measurement; it checks the
 restored records against the snapshot taken immediately before mutation. It
