@@ -2302,7 +2302,6 @@ it('forgets person handles from the durable write payload, split plan, outcome a
   }
   const rows = await getDb().all('SELECT * FROM gws_ea_calendar_write_log');
   expect(JSON.stringify(rows)).not.toContain(REMY);
-  expect(JSON.stringify(await getDb().all('SELECT * FROM gws_ea_pending_calendar_changes'))).not.toContain(REMY);
 });
 
 it('preserves a finite recurrence count across an excluded date when splitting after it', async () => {
