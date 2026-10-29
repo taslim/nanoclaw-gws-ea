@@ -79,31 +79,7 @@ export async function installSyntheticGoogle(
           ? await gmail.request(url, init)
           : undefined;
       if (!response) throw new Error(`Unimplemented synthetic Google operation: ${url.pathname}`);
-      fs.appendFileSync(
-        path.join(root, 'google-http.jsonl'),
-        JSON.stringify({
-          method: init?.method ?? 'GET',
-          path: url.pathname,
-          query: url.search,
-          ifMatch: new Headers(init?.headers).get('if-match'),
-          status: response.status,
-        }) + '\n',
-      );
       return response;
-    } catch (error) {
-      fs.appendFileSync(
-        path.join(root, 'google-http.jsonl'),
-        JSON.stringify({
-          method: init?.method ?? 'GET',
-          path: url.pathname,
-          query: url.search,
-          ifMatch: new Headers(init?.headers).get('if-match'),
-          transportFailure: String(error),
-          appliedCalendarWrites: calendar.writes.length - before.writes,
-          storedMail: mail.length - before.mail,
-        }) + '\n',
-      );
-      throw error;
     } finally {
       const state = readState(path.join(root, 'fixture.json'));
       if (state.scenario) {
@@ -158,7 +134,6 @@ export async function serveNativeHost(
   root: string,
   session: Session,
   google: Awaited<ReturnType<typeof installSyntheticGoogle>>,
-  refreshView: () => Promise<void>,
 ): Promise<void> {
   const { calendar, mail } = google;
   const { dispatch } = await import('../../../src/cli/dispatch.js');
@@ -280,10 +255,7 @@ export async function serveNativeHost(
     let value: unknown;
     try {
       if (body.method === 'snapshot') value = await snapshot();
-      else if (body.method === 'refresh-view') {
-        await refreshView();
-        value = { refreshed: true };
-      } else if (body.method === 'ncl') {
+      else if (body.method === 'ncl') {
         const argv = body.args.argv;
         if (!Array.isArray(argv) || !argv.every((entry): entry is string => typeof entry === 'string'))
           throw new Error('Invalid ncl argv');

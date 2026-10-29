@@ -25,8 +25,7 @@ pnpm exec tsx scripts/scenarios/driver.ts run --cases search-before-asking,close
 - To measure another model or effort, set it the way an install does, for example with
   `NANOCLAW_DEFAULT_MODEL`.
 - Each attempt keeps its prompts, options, raw inference requests with cache usage, effects,
-  snapshot, judge prompt and `score.json`. `manifest.json` records the commit and a hash of
-  uncommitted changes.
+  snapshot, judge prompt and `score.json`. `manifest.json` records the commit.
 
 ## Scoring
 
@@ -45,7 +44,7 @@ outcomes and unacceptable outcomes. A run with an execution failure cannot pass.
 
 1. Add it to `cases/index.ts` with its input, facts, valid outcomes and unacceptable outcomes.
    Mark `task`, `retry` or `privateMarkers` if they apply.
-2. Give it its calendar and mail in `fake-host/datasets.ts` (or `fake-host/state.ts`), and its
-   native records (places, preferences, people, matters) in `fake-host/seed.ts`.
+2. Give it its calendar and mail in `fake-host/datasets.ts`, and its native records (places,
+   preferences, people, matters) in `fake-host/seed.ts`.
 3. List the literals its stated facts leave in the stores in `fake-host/check.ts`, then run
    `prepare` for it.

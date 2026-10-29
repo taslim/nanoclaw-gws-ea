@@ -40,7 +40,7 @@ function event(
 }
 
 /** Each case has its own correspondence; no unrelated calendar/mail fallback can make it runnable. */
-export function concreteFixture(scenario: ScenarioCase, referenceAt = new Date().toISOString()): Dataset | undefined {
+export function concreteFixture(scenario: ScenarioCase, referenceAt: string): Dataset {
   const principal = SYNTHETIC_IDENTITY.principalEmail;
   const assistant = SYNTHETIC_IDENTITY.assistantEmail;
   const id = scenario.id;
@@ -113,7 +113,18 @@ export function concreteFixture(scenario: ScenarioCase, referenceAt = new Date()
       thread: { key: 'mail-synthetic-stale-proposal', namedPeople: [JUNO] },
     };
   }
-  if (id === 'capture-promise' || id === 'planner-limits') return { events: [], mail: [] };
+  if (
+    [
+      'capture-promise',
+      'planner-limits',
+      'external-email-identity-read',
+      'external-chat-identity-read',
+      'unknown-pronouns',
+      'principal-does-it',
+      'office-day-not-home',
+    ].includes(id)
+  )
+    return { events: [], mail: [] };
   if (id === 'errand-loop')
     return {
       events: [],
@@ -373,5 +384,147 @@ export function concreteFixture(scenario: ScenarioCase, referenceAt = new Date()
           'Arrange a 25-minute project introduction with Juno. The conversation uses Europe/London. Main set Morgan’s calendar; share suitable availability only.',
       },
     };
-  return undefined;
+  if (id === 'location-field')
+    return {
+      events: [],
+      mail: [
+        syntheticMail(
+          'synthetic-lunch-agreement',
+          'Lunch on November 6',
+          REMY,
+          principal,
+          'Morgan and Remy agreed to lunch Friday November 6, 2026 at 12:00 America/Los_Angeles for 60 minutes. Harbor House is at 800 Fiction Lane, San Francisco. Please put the lunch on Morgan’s calendar.',
+        ),
+      ],
+    };
+  if (id === 'move-with-guest')
+    return {
+      events: [
+        {
+          calendarId: principal,
+          id: 'synthetic-project-brief',
+          summary: 'Project brief with Juno',
+          location: 'Morgan calls Juno',
+          start: { dateTime: '2026-11-03T10:00:00-08:00' },
+          end: { dateTime: '2026-11-03T10:25:00-08:00' },
+          organizer: { email: principal },
+          attendees: [
+            { email: principal, responseStatus: 'accepted' },
+            { email: JUNO, responseStatus: 'accepted' },
+          ],
+        },
+      ],
+      mail: [
+        syntheticMail(
+          'synthetic-juno-move-agreement',
+          'Move our project brief meeting',
+          JUNO,
+          principal,
+          'I can move our November 3 project brief meeting to Friday November 6 at 14:00 America/Los_Angeles. Please retain its 25-minute length and send the update to my existing invitation. The phone arrangement stays: Morgan calls Juno.',
+        ),
+      ],
+    };
+  if (id === 'trip-zone')
+    return {
+      mail: [],
+      events: [
+        {
+          calendarId: principal,
+          id: 'synthetic-london-call',
+          summary: 'London project call',
+          start: { dateTime: '2026-11-03T17:00:00+00:00' },
+          end: { dateTime: '2026-11-03T17:30:00+00:00' },
+          organizer: { email: principal },
+          attendees: [{ email: principal, responseStatus: 'accepted' }],
+        },
+      ],
+    };
+  if (id === 'missing-remy')
+    return {
+      events: [
+        {
+          calendarId: principal,
+          id: 'synthetic-remy-call',
+          summary: 'Call with Remy',
+          location: 'Morgan will phone Remy directly',
+          start: { dateTime: '2026-11-03T17:00:00-08:00' },
+          end: { dateTime: '2026-11-03T17:30:00-08:00' },
+          organizer: { email: principal },
+          attendees: [{ email: principal, responseStatus: 'accepted' }],
+        },
+      ],
+      mail: [
+        syntheticMail(
+          'synthetic-remy-phone-mail',
+          'Phone catch-up on November 3',
+          REMY,
+          principal,
+          'Morgan will call Remy directly on the phone for their November 3 catch-up. Remy does not need a calendar invitation.',
+        ),
+      ],
+    };
+  if (id === 'assistant-missing-invite')
+    return {
+      events: [
+        {
+          calendarId: principal,
+          id: 'synthetic-juno-invitation',
+          summary: 'Project check-in with Juno',
+          location: 'Morgan calls Juno',
+          start: { dateTime: '2026-11-03T14:00:00-08:00' },
+          end: { dateTime: '2026-11-03T14:25:00-08:00' },
+          organizer: { email: JUNO },
+          attendees: [{ email: principal, responseStatus: 'accepted' }],
+        },
+      ],
+      mail: [
+        syntheticMail(
+          'synthetic-juno-invitation-mail',
+          'Invitation: Project check-in with Juno',
+          JUNO,
+          principal,
+          'Juno invited Morgan to the project check-in on November 3, 14:00–14:25 America/Los_Angeles. Join using the existing phone arrangement: Morgan calls Juno. No private agenda is shared with the assistant.',
+        ),
+      ],
+    };
+  if (id === 'search-before-asking') {
+    const text = `Dinner with Juno is at ${VENUE}.`;
+    return {
+      events: [
+        {
+          calendarId: principal,
+          id: 'synthetic-event-1',
+          summary: 'Dinner with Juno',
+          location: VENUE,
+          start: { dateTime: '2026-11-03T19:00:00-08:00' },
+          end: { dateTime: '2026-11-03T21:00:00-08:00' },
+          organizer: { email: principal },
+          attendees: [
+            { email: principal, responseStatus: 'accepted' },
+            { email: JUNO, responseStatus: 'accepted' },
+          ],
+        },
+      ],
+      mail: [
+        {
+          id: 'synthetic-mail-1',
+          threadId: 'synthetic-thread-1',
+          snippet: text,
+          internalDate: String(Date.parse('2026-11-01T12:00:00Z')),
+          labelIds: ['INBOX'],
+          payload: {
+            mimeType: 'text/plain',
+            headers: [
+              { name: 'From', value: JUNO },
+              { name: 'To', value: principal },
+              { name: 'Subject', value: 'Dinner with Juno' },
+              { name: 'Date', value: 'Sun, 1 Nov 2026 12:00:00 +0000' },
+            ],
+            body: { data: Buffer.from(text).toString('base64url') },
+          },
+        },
+      ],
+    };
+  }
+  throw new Error(`No concrete native fixture for ${id}`);
 }

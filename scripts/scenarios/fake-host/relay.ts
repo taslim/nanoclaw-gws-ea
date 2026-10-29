@@ -1,4 +1,4 @@
-/* eslint-disable no-catch-all/no-catch-all -- inference transport/parsing failures stay in raw evidence and never expose request headers */
+/* eslint-disable no-catch-all/no-catch-all -- an inference transport failure answers 502 and an unreadable response adds no usage, never exposing request headers */
 import fs from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
@@ -19,12 +19,8 @@ export async function startRequestRecorder(directory: string): Promise<{ url: st
     for await (const chunk of incoming) chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
     const body = Buffer.concat(chunks);
     fs.writeFileSync(`${prefix}.request.json`, body);
-    fs.writeFileSync(
-      `${prefix}.meta.json`,
-      JSON.stringify({ pathname, method: incoming.method, startedAt: new Date().toISOString() }),
-    );
-    // Header values exist only in memory for forwarding. Neither the saved request
-    // nor diagnostics includes Authorization, API keys, cookies or account headers.
+    // Header values exist only in memory for forwarding. The saved request never
+    // includes Authorization, API keys, cookies or account headers.
     const headers = new Headers();
     for (const [name, value] of Object.entries(incoming.headers)) {
       if (['host', 'connection', 'content-length', 'accept-encoding'].includes(name) || value === undefined) continue;
@@ -53,19 +49,7 @@ export async function startRequestRecorder(directory: string): Promise<{ url: st
         }
       capture.end();
       outgoing.end();
-      fs.writeFileSync(
-        `${prefix}.status.json`,
-        JSON.stringify({ status: upstream.status, completedAt: new Date().toISOString() }),
-      );
-    } catch (error) {
-      fs.writeFileSync(
-        `${prefix}.status.json`,
-        JSON.stringify({
-          status: 'transport-error',
-          error: error instanceof Error ? error.name : 'UnknownError',
-          completedAt: new Date().toISOString(),
-        }),
-      );
+    } catch {
       if (!outgoing.headersSent) outgoing.writeHead(502);
       outgoing.end('Inference recorder transport failed.');
     }

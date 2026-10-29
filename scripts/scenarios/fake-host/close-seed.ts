@@ -16,7 +16,7 @@ export async function seedCloseScenario(
   main: Session,
 ): Promise<{ session: Session; close: NonNullable<ScenarioComposition['close']> }> {
   const fixture = readState(file);
-  const referenceAt = fixture.referenceAt ?? new Date().toISOString();
+  const referenceAt = fixture.referenceAt;
   const reference = Date.parse(referenceAt);
   const dates = closeDates(referenceAt);
   const timeline = await loadTimeline();

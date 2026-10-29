@@ -39,7 +39,6 @@ const recorder = await startRequestRecorder(path.join(evidence, 'raw'));
 const { resetAgentMailboxForTesting, registerAgentMailbox } =
   await import('../../container/agent-runner/src/mailbox/index.js');
 const { formatMessages, extractRouting } = await import('../../container/agent-runner/src/formatter.js');
-const { buildCompactInstructions } = await import('../../container/agent-runner/src/compact-instructions.js');
 const { buildSystemPromptAddendum } = await import('../../container/agent-runner/src/destinations.js');
 const { setCurrentReplyRoute, clearCurrentReplyRoute } =
   await import('../../container/agent-runner/src/db/session-state.js');
@@ -168,14 +167,6 @@ const addendum = buildSystemPromptAddendum(
   capabilities,
 );
 const formatted = formatMessages(messages);
-const compact = buildCompactInstructions(
-  mailbox.getDestinations().map((destination) => destination.name),
-  null,
-  capabilities,
-);
-fs.writeFileSync(path.join(evidence, 'formatted.md'), formatted);
-fs.writeFileSync(path.join(evidence, 'append.md'), addendum);
-fs.writeFileSync(path.join(evidence, 'compact.md'), compact);
 
 const nativeHooks = nativeScenarioHooks(directory, tree, evidence, composition, shell.profile);
 const toolHook: HookCallback =
@@ -367,8 +358,7 @@ async function* events(): AsyncGenerator<ProviderEvent> {
         JSON.stringify(event.tool_use_result) + '\n',
       );
     }
-    if (event.type === 'system' && event.subtype === 'task_notification' && activePlanning.delete(event.task_id))
-      fs.appendFileSync(path.join(evidence, 'planning-terminals.jsonl'), JSON.stringify(event) + '\n');
+    if (event.type === 'system' && event.subtype === 'task_notification') activePlanning.delete(event.task_id);
     if (event.type === 'assistant' && (!nativeHooks.agents || event.parent_tool_use_id === null)) {
       const joined = event.message.content
         .filter((block) => block.type === 'text')

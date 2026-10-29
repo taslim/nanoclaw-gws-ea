@@ -42,7 +42,7 @@ export function mechanicalScore(
       );
       let allowed = false;
       if (policy && effect.kind === 'tool') {
-        if (['Read', 'Grep', 'Glob', 'WebSearch', 'days', 'check'].includes(effect.operation)) allowed = true;
+        if (['Read', 'Grep', 'Glob', 'days', 'check'].includes(effect.operation)) allowed = true;
         if (effect.operation === 'ncl') allowed = policy.allowedNclPairs.includes(String(effect.payload.command));
         if (['Write', 'Edit'].includes(effect.operation) && typeof effect.payload.resolvedPath === 'string') {
           const resolved = effect.payload.resolvedPath;

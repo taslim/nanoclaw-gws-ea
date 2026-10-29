@@ -72,7 +72,6 @@ function metadata(message: GmailMessage, url: URL): GmailMessage {
 
 /** One canonical Gmail store. Gmail itself does not deduplicate sends; native send recovery must do that. */
 export class SyntheticGmailTransport {
-  failAfterNextSend = false;
   constructor(readonly mail: GmailMessage[]) {}
 
   async request(url: URL, init?: RequestInit): Promise<Response> {
@@ -99,10 +98,6 @@ export class SyntheticGmailTransport {
       };
       const parsed = parseGmailMessage(message);
       this.mail.push({ ...message, snippet: parsed.text.slice(0, 200) });
-      if (this.failAfterNextSend) {
-        this.failAfterNextSend = false;
-        throw new Error('Synthetic transport lost Gmail send response after storing the message');
-      }
       return googleJson({ id, threadId: message.threadId, labelIds: ['SENT'] });
     }
     if (method !== 'GET') throw new Error(`Unsupported synthetic Gmail operation: ${method} ${url.pathname}`);

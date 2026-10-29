@@ -1,5 +1,4 @@
 import { execFileSync, spawn } from 'node:child_process';
-import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -70,7 +69,6 @@ const manifest = {
   maxAttempts: attempts,
   cases: selected.map((entry) => entry.id),
   commit: git('rev-parse', 'HEAD').trim(),
-  uncommittedDiffSha256: createHash('sha256').update(git('diff', 'HEAD')).digest('hex'),
 };
 fs.writeFileSync(path.join(output, 'manifest.json'), JSON.stringify(manifest, null, 2));
 const rubric = fs.readFileSync(path.join(scripts, 'rubric.md'), 'utf8');
@@ -224,18 +222,6 @@ for (const scenario of selected) {
         fs.readFileSync(path.join(directory, 'composition.json'), 'utf8'),
       ) as ScenarioComposition;
       const invalid = [
-        composition.close &&
-        ['look-back', 'look-ahead'].some(
-          (role) => !policies.some((policy) => policy.role === role && fs.existsSync(policy.runFile)),
-        )
-          ? 'Both close planning results were not observed'
-          : undefined,
-        scenario.id === 'planner-limits' &&
-        (nativeAgentOutputs.length === 0 ||
-          policies.length === 0 ||
-          !policies.some((policy) => fs.existsSync(policy.runFile)))
-          ? 'No native planning worker and role-owned result were observed'
-          : undefined,
         !ran || !retryRan ? 'SDK execution failed' : undefined,
         rawFiles.length === 0 ? 'No raw inference request recorded' : undefined,
         transcripts.includes('fixture-unsupported') ||

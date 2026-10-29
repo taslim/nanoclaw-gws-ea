@@ -99,7 +99,6 @@ export function nativeScenarioHooks(
       });
       fs.writeFileSync(path.join(evidence, 'planner-policies.json'), JSON.stringify(policies, null, 2));
     }
-    fs.appendFileSync(path.join(evidence, 'planning-starts.jsonl'), JSON.stringify({ input, answer }) + '\n');
     return answer;
   };
   const pre: HookCallback = async (original, id, options) => {

@@ -296,7 +296,7 @@ try {
   const { hostGoogleAccessToken } = await import('../../../src/modules/gws-ea-google/index.js');
   const nativeCalendar = createMeetingsCalendarApi({ token: () => hostGoogleAccessToken('calendar-host') });
   const refresher = createWeekRefresher({ calendar: () => nativeCalendar });
-  await refresher.refresh({ full: true });
+  await refresher.refresh();
   const thread = readState(path.join(output, 'fixture.json')).thread;
   let handoff: ScenarioComposition['handoff'];
   if (audience === 'external-email' && thread?.brief && threadId) {
@@ -342,7 +342,7 @@ try {
   const { startSyntheticDelivery } = await import('./delivery.js');
   const stopDelivery = await startSyntheticDelivery(output);
   try {
-    await serveNativeHost(output, session, google, () => refresher.refresh({ full: true }));
+    await serveNativeHost(output, session, google);
   } finally {
     await refresher.stop();
     await stopDelivery();
