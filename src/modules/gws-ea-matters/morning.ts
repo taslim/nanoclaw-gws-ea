@@ -57,7 +57,6 @@ async function ensureMorningTask(decision: MorningDecision): Promise<void> {
       'The morning holds work for you. Read the script facts and unread notes, act on the held looks, and set each next look or close its matter. Judge what needs the principal and combine it in one message when appropriate.',
     script: `ncl matters morning --date ${decision.day}`,
   });
-  prepared.clock = { instant: prepared.processAfter, zone: decision.zone };
   await createScheduledTask(session.agent_group_id, prepared, { session, id: decision.task_id });
   const ids = JSON.parse(decision.matters_json) as string[];
   await getDb().transaction(async () => {

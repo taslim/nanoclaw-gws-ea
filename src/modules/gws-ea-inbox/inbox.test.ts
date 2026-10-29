@@ -140,7 +140,8 @@ import { EXTERNAL_EMAIL_CAPABILITIES } from '../gws-ea-external-email/group.js';
 import { getMatter, listOpenMatters, openMatter } from '../gws-ea-matters/db.js';
 import '../gws-ea-matters/index.js';
 import { keepMattersOnTime } from '../gws-ea-matters/loop.js';
-import { closeSchedules, closeVerdict, todayVerdict } from '../gws-ea-matters/sync.js';
+import { closeVerdict, todayVerdict } from '../gws-ea-matters/sync.js';
+import { closeRuns } from '../gws-ea-matters/testing/main-conversation.js';
 import '../gws-ea-meetings/index.js';
 import { loadCalendarWeek } from '../gws-ea-meetings/days.js';
 import type { EventCopy } from '../gws-ea-meetings/week/model.js';
@@ -2575,7 +2576,7 @@ describe('placement before action', () => {
     // While that note is still to be read, the host writes no other.
     await keepMattersOnTime();
     expect(notes(UNPLACED)).toHaveLength(1);
-    const close = (await closeSchedules()).at(-1);
+    const close = (await closeRuns()).at(-1);
     if (!close) throw new Error('The unplaced thread has no next close.');
     vi.useFakeTimers({ toFake: ['Date'] });
     try {

@@ -38,8 +38,8 @@ import {
   gwsEaMatterPlanningMigration,
   gwsEaTimeAnchorsMigration,
 } from './migration.js';
-import { beginCloseRun, closeRunsMigration, completeCloseRun, failCloseRun } from './close-runs.js';
-import { seedMain, mainSession } from './testing/main-conversation.js';
+import { closeRunsMigration, completeCloseRun, failCloseRun } from './close-runs.js';
+import { seedMain, mainSession, openClose } from './testing/main-conversation.js';
 import { readDayLedger, type DayLedger } from './ledger.js';
 import '../../mailbox/compose.js';
 import '../../cli/commands/help.js';
@@ -135,13 +135,14 @@ it('reads every day since the completed marker, retaining 22:00 corrections and 
     messagingGroupId: 'mg-dm',
   };
   vi.setSystemTime('2026-10-27T21:00:00Z');
-  await beginCloseRun({ id: 'yesterday', sessionId: 'prior-close-session', taskId: 'old' });
+  await openClose('yesterday', 'prior-close-session');
   await readDayLedger(prior);
   await principal('during', '2026-10-27T21:02:00Z', 'Leave room between calls.');
-  await completeCloseRun('yesterday', 'prior-close-session', '2026-10-27T21:05:00Z');
+  vi.setSystemTime('2026-10-27T21:05:00Z');
+  await completeCloseRun('yesterday', 'prior-close-session');
   await principal('late', '2026-10-27T22:00:00Z', 'Keep dinner free.');
   vi.setSystemTime(NOW);
-  await beginCloseRun({ id: 'today', sessionId: session.id, taskId: 'today-task' });
+  await openClose('today', session.id);
   await getDb().exec('DELETE FROM gws_ea_principal_messages');
   const result = await readDayLedger(ctx);
   expect(result.from).toBe('2026-10-27T21:00:00.000Z');
@@ -195,7 +196,7 @@ it('rechecks write findings against the native calendar and prunes only after th
     affectedEnd: '2026-10-28T13:00:00Z',
   });
   await markCalendarWriteApplied('write', 'Changed.');
-  await beginCloseRun({ id: 'close', sessionId: session.id, taskId: 'task' });
+  await openClose('close', session.id);
   const result = await readDayLedger(ctx);
   expect(JSON.stringify(section(result, 'writes'))).toContain('Findings for 2026-10-28:');
   const entry = section(result, 'writes').entries[0];
@@ -282,7 +283,7 @@ it('does not prune a write that bounded output did not show', async () => {
     affectedEnd: '2026-10-28T13:00:00Z',
   });
   await markCalendarWriteApplied('trimmed', 'Changed.');
-  await beginCloseRun({ id: 'trimmed-close', sessionId: session.id, taskId: 'trimmed-task' });
+  await openClose('trimmed-close', session.id);
   const result = await readDayLedger(ctx);
   expect(section(result, 'writes')).toMatchObject({ entries: [], omitted: 1 });
   await completeCloseRun('trimmed-close', session.id);
@@ -300,7 +301,7 @@ it('shows an interrupted write as unconfirmed and retains it after a completed c
     affectedStart: '2026-10-28T12:00:00Z',
     affectedEnd: '2026-10-28T13:00:00Z',
   });
-  await beginCloseRun({ id: 'pending-close', sessionId: session.id, taskId: 'pending-task' });
+  await openClose('pending-close', session.id);
   expect(JSON.stringify(section(await readDayLedger(ctx), 'writes'))).toContain('Outcome not confirmed');
   await completeCloseRun('pending-close', session.id);
   expect(await getDb().all('SELECT request_id FROM gws_ea_calendar_write_log')).toEqual([{ request_id: 'pending' }]);

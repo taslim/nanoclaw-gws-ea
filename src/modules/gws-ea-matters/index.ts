@@ -49,7 +49,7 @@ import { onWhereaboutsChange, registerPendingClockReader } from '../gws-ea-where
 import { pendingLocalItems, setTaskClock } from './anchors.js';
 import { log } from '../../log.js';
 import { mainConversation, oneAtATime } from './looks.js';
-import { keepClose, closeVerdict, finishClose, forgetSundaySnapshot, todayVerdict } from './sync.js';
+import { cancelDailySync, keepClose, closeVerdict, finishClose, forgetSundaySnapshot, todayVerdict } from './sync.js';
 import { morningVerdict } from './morning.js';
 import { closeRunsMigration } from './close-runs.js';
 import './ledger.js';
@@ -71,6 +71,7 @@ onWhereaboutsChange(async () => {
 
 onHostStart(async ({ signal }) => {
   await cancelClosedMatterJobs();
+  await cancelDailySync();
   // Started, not awaited: host startup never waits on a pass.
   void runMattersLoop(signal);
 });
@@ -444,11 +445,11 @@ registerResource({
     evening: {
       access: 'open',
       description:
-        'The host-kept evening close. Read its run facts; after both planning results and the day ledger, mark the open run done and leave main your report. --notify is your decision that main should take a turn now.',
+        'The host-kept evening close. Read its run facts; after both planning results, once ncl day has been read in this session, mark the open run done and leave main your report. --notify is your decision that main should take a turn now.',
       args: [
         { name: 'run', type: 'string', description: 'Close-run id supplied by the host task.' },
         { name: 'done', type: 'string', description: 'Open close-run id to complete in this session.' },
-        { name: 'report', type: 'string', description: 'Your report for main, stored once for this run.' },
+        { name: 'report', type: 'string', description: 'Your report for main; a repeat for this run keeps the first.' },
         { name: 'notify', type: 'boolean', description: 'Wake main now for what you judge needs the principal.' },
       ],
       examples: [

@@ -113,8 +113,8 @@ export function buildCompactInstructions(
     '',
     ...(capabilities.has('gws-ea-main-context')
       ? [
-          '   - the evening close-run id and scope, the close step reached (look-back launched or returned, look-ahead launched or returned, acting, reported, or done),',
-          '     each role’s returned agentId and its exact result path, and which report decision was already recorded; ignore stale result files.',
+          '   - the evening close-run id and scope, the close step reached (look-back launched or returned, look-ahead launched or returned, acting, or done),',
+          '     and each role’s returned agentId and its exact result path; ignore stale result files.',
         ]
       : []),
     '4. Leave out standing instructions and memory: both are loaded again after the summary, so restating',

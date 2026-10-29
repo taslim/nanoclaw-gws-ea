@@ -1,32 +1,38 @@
 import { getDb } from '../../db/connection.js';
 import type { ModuleMigration } from '../../db/migrations/index.js';
+import { updateSession } from '../../db/sessions.js';
 
+/**
+ * One row per evening close, in a session of its own: pending until its
+ * verdict opens it, open until main marks it done or it fails. A completed
+ * close's ledger coverage is where the next day ledger starts.
+ */
 export const closeRunsMigration: ModuleMigration = {
   version: 1,
   name: 'module:gws-ea-close:completion-evidence',
   async up(db) {
     await db.exec(`CREATE TABLE gws_ea_close_runs (
-      id TEXT PRIMARY KEY, session_id TEXT NOT NULL, task_id TEXT NOT NULL UNIQUE, started_at TEXT NOT NULL,
-      state TEXT NOT NULL CHECK (state IN ('open','completed','failed')),
+      id TEXT PRIMARY KEY, session_id TEXT NOT NULL, scheduled_at TEXT NOT NULL,
+      zone TEXT NOT NULL, timeline_version TEXT NOT NULL, weekly_day TEXT,
+      state TEXT NOT NULL CHECK (state IN ('pending','open','completed','failed')),
+      started_at TEXT,
       ledger_from_at TEXT, ledger_through_at TEXT, ledger_writes_json TEXT,
-      done_at TEXT, failed_at TEXT,
-      CHECK ((state = 'completed') = (done_at IS NOT NULL)),
-      CHECK ((state = 'failed') = (failed_at IS NOT NULL)),
       CHECK (state <> 'completed' OR ledger_through_at IS NOT NULL)
-    ); CREATE UNIQUE INDEX gws_ea_close_one_open ON gws_ea_close_runs (session_id) WHERE state='open';`);
+    )`);
   },
 };
 export interface CloseRun {
   readonly id: string;
   readonly session_id: string;
-  readonly task_id: string;
-  readonly started_at: string;
-  readonly state: 'open' | 'completed' | 'failed';
+  readonly scheduled_at: string;
+  readonly zone: string;
+  readonly timeline_version: string;
+  readonly weekly_day: string | null;
+  readonly state: 'pending' | 'open' | 'completed' | 'failed';
+  readonly started_at: string | null;
   readonly ledger_from_at: string | null;
   readonly ledger_through_at: string | null;
   readonly ledger_writes_json: string | null;
-  readonly done_at: string | null;
-  readonly failed_at: string | null;
 }
 export interface ConsumedCalendarWrite {
   readonly requestId: string;
@@ -41,33 +47,27 @@ function instant(value: string): string {
   if (!Number.isFinite(Date.parse(value))) throw new Error('Close evidence needs a valid instant.');
   return new Date(value).toISOString();
 }
-export async function beginCloseRun(input: {
-  readonly id: string;
-  readonly sessionId: string;
-  readonly taskId: string;
-  readonly startedAt?: string;
-}): Promise<CloseRun> {
+export async function getCloseRun(id: string, sessionId: string): Promise<CloseRun | undefined> {
+  return getDb().get<CloseRun>('SELECT * FROM gws_ea_close_runs WHERE id=? AND session_id=?', id, sessionId);
+}
+/** A pending close opens once; opening it again leaves its start as it was. */
+export async function beginCloseRun(id: string, sessionId: string): Promise<CloseRun> {
   await getDb().run(
-    "INSERT INTO gws_ea_close_runs (id,session_id,task_id,started_at,state) VALUES (?,?,?,?,'open') ON CONFLICT(id) DO NOTHING",
-    input.id,
-    input.sessionId,
-    input.taskId,
-    instant(input.startedAt ?? new Date().toISOString()),
+    "UPDATE gws_ea_close_runs SET state='open',started_at=? WHERE id=? AND session_id=? AND state='pending'",
+    new Date().toISOString(),
+    id,
+    sessionId,
   );
-  const row = await getDb().get<CloseRun>('SELECT * FROM gws_ea_close_runs WHERE id=?', input.id);
-  if (!row || row.session_id !== input.sessionId || row.task_id !== input.taskId)
-    throw new Error('The close run belongs to another session or task.');
-  return row;
+  const run = await getCloseRun(id, sessionId);
+  if (!run) throw new Error('This session has no evening close.');
+  return run;
 }
 export async function getOpenCloseRun(sessionId: string): Promise<CloseRun | undefined> {
   return getDb().get<CloseRun>("SELECT * FROM gws_ea_close_runs WHERE session_id=? AND state='open'", sessionId);
 }
-export async function listOpenCloseRuns(): Promise<CloseRun[]> {
-  return getDb().all<CloseRun>("SELECT * FROM gws_ea_close_runs WHERE state='open' ORDER BY started_at,id");
-}
 export async function lastCompletedClose(): Promise<CloseRun | undefined> {
   return getDb().get<CloseRun>(
-    "SELECT * FROM gws_ea_close_runs WHERE state='completed' ORDER BY ledger_through_at DESC,done_at DESC,id DESC LIMIT 1",
+    "SELECT * FROM gws_ea_close_runs WHERE state='completed' ORDER BY ledger_through_at DESC,id DESC LIMIT 1",
   );
 }
 export async function recordCloseLedger(
@@ -88,36 +88,42 @@ export async function recordCloseLedger(
   );
   if (!result.changes) throw new Error('Only the open close run in this session may capture its ledger.');
 }
-export async function completeCloseRun(
-  runId: string,
-  sessionId: string,
-  doneAt = new Date().toISOString(),
-): Promise<CloseRun> {
+/** A finished close's session closes with it, so nothing it still holds is delivered. */
+export async function completeCloseRun(runId: string, sessionId: string): Promise<CloseRun> {
   return getDb().transaction(async () => {
     const run = await getOpenCloseRun(sessionId);
     if (!run || run.id !== runId) throw new Error('Only the open close run in this session may be marked done.');
     if (run.ledger_through_at === null || run.ledger_writes_json === null)
       throw new Error('Read the day ledger before marking this close done.');
     const writes = JSON.parse(run.ledger_writes_json) as ConsumedCalendarWrite[];
-    const done = instant(doneAt);
-    await getDb().run(
-      "UPDATE gws_ea_close_runs SET state='completed',done_at=? WHERE id=? AND state='open'",
-      done,
-      runId,
-    );
+    await getDb().run("UPDATE gws_ea_close_runs SET state='completed' WHERE id=? AND state='open'", runId);
+    await updateSession(sessionId, { status: 'closed' });
     for (const write of writes)
       await getDb().run(
         "DELETE FROM gws_ea_calendar_write_log WHERE request_id=? AND updated_at=? AND state='applied'",
         write.requestId,
         write.updatedAt,
       );
-    return { ...run, state: 'completed', done_at: done };
+    return { ...run, state: 'completed' };
   });
 }
-export async function failCloseRun(runId: string, failedAt = new Date().toISOString()): Promise<void> {
-  await getDb().run(
-    "UPDATE gws_ea_close_runs SET state='failed',failed_at=? WHERE id=? AND state='open'",
-    instant(failedAt),
-    runId,
-  );
+/**
+ * `startedAt` is when a close that never opened counts as having run: one
+ * claimed and lost still spaces the next close twelve hours on, while one
+ * replaced before it ran does not.
+ */
+export async function failCloseRun(runId: string, startedAt: string | null = null): Promise<void> {
+  await getDb().transaction(async () => {
+    const run = await getDb().get<CloseRun>(
+      "SELECT * FROM gws_ea_close_runs WHERE id=? AND state IN ('pending','open')",
+      runId,
+    );
+    if (!run) return;
+    await getDb().run(
+      "UPDATE gws_ea_close_runs SET state='failed',started_at=COALESCE(started_at,?) WHERE id=?",
+      startedAt,
+      runId,
+    );
+    await updateSession(run.session_id, { status: 'closed' });
+  });
 }

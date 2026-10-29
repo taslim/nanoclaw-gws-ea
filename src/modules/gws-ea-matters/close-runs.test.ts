@@ -5,19 +5,16 @@ import { calendarSplitRecoveryMigration } from '../gws-ea-meetings/week/split-re
 import { beginCalendarWrite, markCalendarWriteApplied } from '../gws-ea-meetings/week/write-log.js';
 import {
   closeRunsMigration,
-  beginCloseRun,
   recordCloseLedger,
   completeCloseRun,
   failCloseRun,
+  getOpenCloseRun,
   lastCompletedClose,
-  listOpenCloseRuns,
 } from './close-runs.js';
+import { openClose } from './testing/main-conversation.js';
 beforeEach(async () => {
-  await runMigrations(await initTestDb(), [
-    calendarWriteLogMigration,
-    calendarSplitRecoveryMigration,
-    closeRunsMigration,
-  ]);
+  await runMigrations(await initTestDb());
+  await runMigrations(getDb(), [calendarWriteLogMigration, calendarSplitRecoveryMigration, closeRunsMigration]);
 });
 afterEach(closeDb);
 async function write(id: string) {
@@ -39,10 +36,8 @@ async function write(id: string) {
 }
 it('advances only on the exact open run marker and only to its captured coverage', async () => {
   const version = await write('used');
-  await beginCloseRun({ id: 'close-one', sessionId: 'close-session', taskId: 'task-one' });
-  expect(await listOpenCloseRuns()).toMatchObject([
-    { id: 'close-one', task_id: 'task-one', session_id: 'close-session' },
-  ]);
+  await openClose('close-one', 'close-session');
+  expect(await getOpenCloseRun('close-session')).toMatchObject({ id: 'close-one', state: 'open' });
   await expect(completeCloseRun('close-one', 'close-session')).rejects.toThrow(/ledger/u);
   await recordCloseLedger('close-one', 'close-session', {
     from: null,
@@ -51,11 +46,10 @@ it('advances only on the exact open run marker and only to its captured coverage
   });
   await expect(completeCloseRun('close-one', 'other')).rejects.toThrow(/open/u);
   expect(await lastCompletedClose()).toBeUndefined();
-  await completeCloseRun('close-one', 'close-session', '2026-10-27T21:15:00.000Z');
+  await completeCloseRun('close-one', 'close-session');
   expect(await lastCompletedClose()).toMatchObject({
     state: 'completed',
     ledger_through_at: '2026-10-27T21:00:00.000Z',
-    done_at: '2026-10-27T21:15:00.000Z',
   });
   expect(await getDb().all('SELECT * FROM gws_ea_calendar_write_log')).toEqual([]);
   await expect(completeCloseRun('close-one', 'close-session')).rejects.toThrow(/open/u);
@@ -63,7 +57,7 @@ it('advances only on the exact open run marker and only to its captured coverage
 it('retains failed, unread and subsequently changed write evidence', async () => {
   const version = await write('changed');
   await write('unread');
-  await beginCloseRun({ id: 'failed', sessionId: 'session', taskId: 'task' });
+  await openClose('failed', 'session');
   await recordCloseLedger('failed', 'session', {
     from: null,
     through: '2026-10-27T21:00:00.000Z',
@@ -72,8 +66,8 @@ it('retains failed, unread and subsequently changed write evidence', async () =>
   await failCloseRun('failed');
   expect(await lastCompletedClose()).toBeUndefined();
   expect(await getDb().all('SELECT request_id FROM gws_ea_calendar_write_log')).toHaveLength(2);
-  await beginCloseRun({ id: 'next', sessionId: 'session', taskId: 'next-task' });
-  await recordCloseLedger('next', 'session', {
+  await openClose('next', 'next-session');
+  await recordCloseLedger('next', 'next-session', {
     from: null,
     through: '2026-10-28T21:00:00.000Z',
     writes: [{ requestId: 'changed', updatedAt: version }],
@@ -81,6 +75,6 @@ it('retains failed, unread and subsequently changed write evidence', async () =>
   await getDb().run(
     "UPDATE gws_ea_calendar_write_log SET updated_at='2026-10-28T21:01:00Z' WHERE request_id='changed'",
   );
-  await completeCloseRun('next', 'session');
+  await completeCloseRun('next', 'next-session');
   expect(await getDb().all('SELECT request_id FROM gws_ea_calendar_write_log')).toHaveLength(2);
 });
