@@ -93,9 +93,10 @@ async function principal(id: string, at: string, text: string) {
     session,
     messagingGroup: (await getMessagingGroup('mg-dm'))!,
   });
+  // Stored as the router stores a routed message: its platform id suffixed with the agent group.
   await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) =>
     mailbox.insertMessage({
-      id,
+      id: `${id}:${session.agent_group_id}`,
       kind: 'chat',
       timestamp: new Date(at).toISOString(),
       platformId: null,
@@ -148,6 +149,12 @@ it('reads every day since the completed marker, retaining 22:00 corrections and 
   expect(JSON.stringify(section(result, 'principal'))).toContain('Keep dinner free.');
   await failCloseRun('today');
   expect((await readDayLedger(ctx)).from).toBe(result.from);
+});
+it('files a routed principal message under principal messages, never as a framed note', async () => {
+  await principal('spaces/morgan/messages/abc', '2026-10-28T20:00:00Z', 'Never book me before ten.');
+  const result = await readDayLedger(ctx);
+  expect(section(result, 'principal').entries).toEqual([expect.stringContaining('Never book me before ten.')]);
+  expect(section(result, 'notes').entries).toEqual([]);
 });
 it('frames source text, survives an unreadable conversation, and trims principal messages last', async () => {
   await principal('word', '2026-10-28T15:00:00Z', 'Preserve the afternoon.');

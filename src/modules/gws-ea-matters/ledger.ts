@@ -61,13 +61,15 @@ async function collect(sections: readonly DaySection[], read: () => Promise<void
   /* eslint-enable no-catch-all/no-catch-all */
 }
 
-function hasHostPrincipalMessageMark(content: string, messageId: string): boolean {
+/** The router stores a routed message under `<platform id>:<agent group id>`; the mark keeps the platform id. */
+function hasHostPrincipalMessageMark(content: string, messageId: string, agentGroupId: string): boolean {
   try {
     const parsed: unknown = JSON.parse(content);
     return (
       isRecord(parsed) &&
       isRecord(parsed.principalMessage) &&
-      parsed.principalMessage.id === messageId &&
+      typeof parsed.principalMessage.id === 'string' &&
+      `${parsed.principalMessage.id}:${agentGroupId}` === messageId &&
       typeof parsed.principalMessage.messagingGroupId === 'string'
     );
   } catch (error) {
@@ -116,7 +118,7 @@ export async function readDayLedger(ctx: CallerContext): Promise<DayLedger> {
                 continue;
               const text = parseInboundContent(message.content).text;
               if (!text) continue;
-              if (hasHostPrincipalMessageMark(message.content, message.id))
+              if (hasHostPrincipalMessageMark(message.content, message.id, session.agent_group_id))
                 principal.entries.push(`${displayAt(message.timestamp)}; conversation ${session.id}\n${text}`);
               else
                 notes.entries.push(
