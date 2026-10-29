@@ -97,6 +97,25 @@ export async function seedScenarioStores(scenario: ScenarioCase, agent: string, 
         'For the November 5 SFO flight, leave from home and arrive at SFO departures two hours before departure. The learned home-to-SFO drive is 40 minutes.',
       );
     }
+    if (scenario.id === 'leave-by-look') {
+      await addPlace({
+        id: 'synthetic-harbor-house',
+        label: VENUE,
+        locality: 'San Francisco',
+        zone: 'America/Los_Angeles',
+      });
+      await setPlacePair({
+        fromPlaceId: 'synthetic-home',
+        toPlaceId: 'synthetic-harbor-house',
+        mode: 'car',
+        minutes: 45,
+        source: 'learned',
+      });
+      await setManualSection(
+        'travel-sources',
+        'For the coming dinner with Juno, the normal trip from Home to Harbor House is 45 minutes. Tomorrow’s reliable traffic estimate becomes available at 16:30; leave-by time remains uncertain.',
+      );
+    }
     if (scenario.id === 'across-town-dinner') {
       await addPlace({
         id: 'synthetic-harbor-house',

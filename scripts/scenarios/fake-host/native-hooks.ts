@@ -61,12 +61,12 @@ export function nativeScenarioHooks(
 ) {
   const agent = fs.realpathSync(path.join(directory, 'agent'));
   if (
-    scenario.id === 'planner-limits' &&
+    composition.fixturePlanning &&
     (composition.audience !== 'main' || composition.moduleEnvironment.GWS_EA_PLANNING_AGENTS !== '1')
   )
     throw new Error('The native main planning-agent configuration is required for planner-limits.');
   const fixture = path.join(directory, 'fixture.json');
-  const planning = scenario.id === 'planner-limits' ? createPlanningRuntime(agent) : undefined;
+  const planning = composition.fixturePlanning ? createPlanningRuntime(agent) : undefined;
   const production = createPreToolUseHook(resolveClaudeCapabilityPolicy(new Set(composition.capabilities)), planning);
   const policies: PlannerPolicy[] = [];
   const admitted = new Map<string, PreToolUseHookInput>();
@@ -75,6 +75,7 @@ export function nativeScenarioHooks(
   const relocated = (value: string): string =>
     value
       .replace(/^\/workspace\/agent(?=\/|$)/u, agent)
+      .replace(/^\/app\/skills(?=\/|$)/u, path.join(tree, 'container/skills'))
       .replace(/^\/workspace\/week-view\.json$/u, composition.weekViewFile ?? '/unavailable-week-view');
   const translated = (input: PreToolUseHookInput): PreToolUseHookInput => {
     if (typeof input.tool_input !== 'object' || input.tool_input === null) return input;
@@ -142,7 +143,7 @@ export function nativeScenarioHooks(
     } else if (input.tool_name === 'Bash') {
       updated = {
         ...updated,
-        command: syntheticShellCommand(shellProfile, typeof updated.command === 'string' ? updated.command : ''),
+        command: syntheticShellCommand(shellProfile, typeof updated.command === 'string' ? updated.command : '', tree),
       };
     } else if (['Read', 'Glob', 'Grep', 'Write', 'Edit', 'NotebookEdit'].includes(input.tool_name)) {
       const target = path.resolve(agent, String(args.file_path ?? args.notebook_path ?? args.path ?? '.'));
@@ -173,7 +174,14 @@ export function nativeScenarioHooks(
       ].includes(input.tool_name)
     )
       reason = 'Outside the synthetic fixture transport.';
-    if (!reason) admitted.set(callKey(input), input);
+    if (!reason)
+      admitted.set(callKey(input), {
+        ...input,
+        tool_input: {
+          ...args,
+          ...(typeof specific?.updatedInput?.command === 'string' ? { command: specific.updatedInput.command } : {}),
+        },
+      });
     fs.appendFileSync(
       path.join(evidence, 'tool-decisions.jsonl'),
       JSON.stringify({ input, native, allowed: !reason, ...(reason ? { reason } : {}) }) + '\n',
@@ -206,7 +214,10 @@ export function nativeScenarioHooks(
       );
     if (input.agent_id) {
       const role = input.agent_type;
-      const command = typeof args.command === 'string' ? args.command.match(/^ncl\s+(\S+)(?:\s+(\S+))?/u) : undefined;
+      const command =
+        typeof args.command === 'string'
+          ? (args.command.match(/^'ncl' '([^']+)'(?: '([^']+)')?/u) ?? args.command.match(/^ncl\s+(\S+)(?:\s+(\S+))?/u))
+          : undefined;
       await recordEffect(fixture, {
         kind: 'tool',
         operation: input.tool_name === 'Bash' ? 'ncl' : input.tool_name.replace(/^mcp__nanoclaw__/u, ''),

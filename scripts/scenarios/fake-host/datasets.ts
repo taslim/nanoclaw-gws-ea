@@ -1,3 +1,4 @@
+import { CLOSE_CASES, closeDates } from './close-dates.js';
 import type { ScenarioCase } from '../types.js';
 import { SYNTHETIC_IDENTITY, syntheticMail, type FixtureState, type SyntheticEvent } from './state.js';
 
@@ -39,10 +40,79 @@ function event(
 }
 
 /** Each case has its own correspondence; no unrelated calendar/mail fallback can make it runnable. */
-export function concreteFixture(scenario: ScenarioCase): Dataset | undefined {
+export function concreteFixture(scenario: ScenarioCase, referenceAt = new Date().toISOString()): Dataset | undefined {
   const principal = SYNTHETIC_IDENTITY.principalEmail;
   const assistant = SYNTHETIC_IDENTITY.assistantEmail;
   const id = scenario.id;
+  if (CLOSE_CASES.has(id)) {
+    const dates = closeDates(referenceAt);
+    if (id === 'close-quiet') return { events: [], mail: [] };
+    if (id === 'close-speaks')
+      return {
+        events: [
+          event(
+            'synthetic-permit-passport',
+            'Permit appointment',
+            dates.at(dates.tomorrow, 9),
+            dates.at(dates.tomorrow, 9, 25),
+            'Permit Centre, San Francisco',
+          ),
+        ],
+        mail: [
+          syntheticMail(
+            'synthetic-permit-requirements',
+            'Permit appointment requirements',
+            'permits@example.test',
+            principal,
+            `Your permit appointment is ${dates.tomorrow} at 09:00 America/Los_Angeles. Bring the original passport; a copy is not accepted. Morgan has not yet been told about the passport requirement.`,
+          ),
+        ],
+      };
+    if (id === 'leave-by-look')
+      return {
+        events: [
+          event(
+            'synthetic-close-dinner',
+            'Dinner with Juno',
+            dates.at(dates.tomorrow, 19),
+            dates.at(dates.tomorrow, 21),
+            VENUE,
+            principal,
+            [JUNO],
+          ),
+        ],
+        mail: [
+          syntheticMail(
+            'synthetic-close-dinner-mail',
+            'Dinner arrival and traffic',
+            JUNO,
+            principal,
+            `Our table is arranged at Harbor House in San Francisco for ${dates.tomorrow} at 19:00 America/Los_Angeles. Please arrive on time. The normal trip from Home takes 45 minutes, but tomorrow's reliable traffic estimate becomes available at 16:30. The leave-by time is not settled yet.`,
+          ),
+        ],
+      };
+    return {
+      events: [
+        event(
+          'synthetic-stale-proposal-review',
+          'Earlier provisional proposal review',
+          dates.at(dates.tomorrow, 19),
+          dates.at(dates.tomorrow, 19, 25),
+          HOME,
+        ),
+      ],
+      mail: [
+        syntheticMail(
+          'synthetic-proposal-fresh',
+          'Proposal due Wednesday',
+          JUNO,
+          principal,
+          `Current conversation update: the proposal is due Wednesday ${dates.due}. No owner has confirmed responsibility. Preparation needs 45 minutes; no preparation block is arranged. The old proposal summary is 14 days old. Please settle the owner and preparation, rather than carry the stale summary forward.`,
+        ),
+      ],
+      thread: { key: 'mail-synthetic-stale-proposal', namedPeople: [JUNO] },
+    };
+  }
   if (['commute-day', 'home-day', 'today-exception', 'capture-promise', 'planner-limits'].includes(id))
     return { events: [], mail: [] };
   if (id === 'errand-loop')

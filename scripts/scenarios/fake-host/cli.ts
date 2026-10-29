@@ -1,3 +1,5 @@
+import fs from 'node:fs';
+import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { callHost } from './state.js';
 
@@ -5,7 +7,19 @@ export async function runFixtureCommand(file: string, executable: string, args: 
   if (executable === 'gog')
     return JSON.stringify(await callHost(file, 'gog', { argv: args, phase: process.env.SCENARIO_PHASE ?? 'agent' }));
   if (executable !== 'ncl') throw new Error(`Unknown synthetic executable: ${executable}`);
-  const result = (await callHost(file, 'ncl', { argv: args, phase: process.env.SCENARIO_PHASE ?? 'agent' })) as {
+  const phase = process.env.SCENARIO_PHASE ?? 'agent';
+  const answer =
+    phase === 'close-script-proof'
+      ? await callHost(file, 'probe', { steps: [{ method: 'ncl', args: { argv: args } }], phase: 'preflight' })
+      : await callHost(file, 'ncl', { argv: args, phase });
+  if (phase === 'close-script-proof')
+    fs.writeFileSync(
+      path.join(path.dirname(file), 'preflight-close-script-native.json'),
+      JSON.stringify(answer, null, 2),
+    );
+  const result = (
+    phase === 'close-script-proof' ? (answer as { results: { answer: unknown }[] }).results[0]?.answer : answer
+  ) as {
     frame: { ok: boolean };
     stdout: string;
   };

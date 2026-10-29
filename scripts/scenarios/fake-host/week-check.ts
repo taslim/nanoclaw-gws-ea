@@ -11,6 +11,30 @@ const composition = JSON.parse(
   fs.readFileSync(path.join(directory, 'composition.json'), 'utf8'),
 ) as ScenarioComposition;
 assert.ok(composition.weekViewFile);
+if (composition.close && !fs.existsSync(composition.weekViewFile)) {
+  const outputs = ['SessionStart', 'UserPromptSubmit'].map((event) => {
+    const result = spawnSync(
+      'bun',
+      [
+        path.join(tree, 'container/agent-runner/src/week-view/hook.ts'),
+        composition.weekViewFile!,
+        path.join(directory, 'preflight-week-delivered'),
+      ],
+      {
+        input: JSON.stringify({ hook_event_name: event, source: 'startup', session_id: composition.session.id }),
+        encoding: 'utf8',
+      },
+    );
+    assert.equal(result.status, 0, result.stderr);
+    assert.ok(result.stdout.includes('unavailable; use days'));
+    return { event, output: result.stdout };
+  });
+  fs.writeFileSync(
+    path.join(directory, 'preflight-week-hook.json'),
+    JSON.stringify({ modelCalls: 0, actualCloseSessionViewUnavailable: true, outputs }, null, 2),
+  );
+  process.exit(0);
+}
 const view = JSON.parse(fs.readFileSync(composition.weekViewFile, 'utf8')) as {
   schema: number;
   asOf: string;

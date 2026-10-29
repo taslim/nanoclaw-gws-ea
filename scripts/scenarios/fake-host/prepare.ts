@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { SYNTHETIC_IDENTITY, readState } from './state.js';
+import { CLOSE_CASES } from './close-dates.js';
 import { PUBLIC_WEB_CASES } from './web-egress.js';
 import type { ScenarioComposition } from '../types.js';
 
@@ -194,12 +195,13 @@ try {
         now,
       );
   }
-  const { session } = await resolveSession(
+  const { session: originalSession } = await resolveSession(
     group.id,
     messagingGroupId,
     threadId,
     audience === 'main' ? 'agent-shared' : 'per-thread',
   );
+  let session = originalSession;
   const { session: mainSession } =
     audience === 'main' ? { session } : await resolveSession(main.id, 'synthetic-morgan-dm', null, 'agent-shared');
   const agent = path.join(output, 'agent');
@@ -207,6 +209,13 @@ try {
   const { seedScenarioStores } = await import('./seed.js');
   const fixture = readState(path.join(output, 'fixture.json'));
   await seedScenarioStores(fixture.scenario, agent, fixture.referenceAt);
+  let close: ScenarioComposition['close'];
+  if (CLOSE_CASES.has(fixture.scenario.id)) {
+    const { seedCloseScenario } = await import('./close-seed.js');
+    const seeded = await seedCloseScenario(path.join(output, 'fixture.json'), mainSession);
+    session = seeded.session;
+    close = seeded.close;
+  }
   await composeGroupProjectDoc(group, agent, { fileName: 'CLAUDE.md' });
   const row = await getContainerConfig(group.id);
   if (!row) throw new Error('Synthetic group lacks a native config.');
@@ -227,6 +236,7 @@ try {
   const reservedEnvironmentKeys = ['HOME', 'TZ', 'ANTHROPIC_BASE_URL'];
   const { sessionDir } = await import('../../../src/session-manager.js');
   const composition: ScenarioComposition = {
+    ...(close ? { close } : {}),
     audience: audience as ScenarioComposition['audience'],
     group,
     storedCapabilities: parseStoredCapabilities(row.capabilities, group.name),
@@ -239,9 +249,11 @@ try {
     reservedEnvironmentKeys,
     session: { id: session.id, messagingGroupId: session.messaging_group_id },
     ...(context ? { context } : {}),
-    ...(audience === 'main' ? { weekViewFile: path.join(sessionDir(main.id, mainSession.id), 'week-view.json') } : {}),
+    ...(audience === 'main'
+      ? { weekViewFile: path.join(sessionDir(main.id, close ? session.id : mainSession.id), 'week-view.json') }
+      : {}),
     fixturePublicWeb: PUBLIC_WEB_CASES.has(fixture.scenario.id),
-    fixturePlanning: fixture.scenario.id === 'planner-limits',
+    fixturePlanning: fixture.scenario.id === 'planner-limits' || CLOSE_CASES.has(fixture.scenario.id),
     db: db.dialect,
   };
   if (readState(path.join(output, 'fixture.json')).scenario.observationOnly)

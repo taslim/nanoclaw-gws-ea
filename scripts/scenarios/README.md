@@ -10,10 +10,10 @@ checks cover only retry duplicates, scoped privacy markers and declared planner
 role/path/verb limits.
 
 The invented principal is Morgan Ellery, the assistant Aster, and contacts Juno
-Hale and Remy Vance. Twenty-six cases are available, including travel chains,
+Hale and Remy Vance. Thirty cases are available, including travel chains,
 deadlines, weekend preferences, impossible transfers, commitments, all three
 booking kinds, relationship-based lengths, invitation authority and outward
-privacy. Eight cases remain pending. The two role probes read a conversation-only brief and produce an
+privacy. Four cases remain pending. The two role probes read a conversation-only brief and produce an
 internal native task log; their scores cannot establish email or chat delivery.
 The role probes and the people/reminder-only cases have empty Calendar/Gmail stores. The remaining incident classes are catalog entries explicitly
 marked `fixture-pending`; the driver refuses to run them against unrelated
@@ -146,7 +146,7 @@ loopback RPC port; its environment is cleared before the shell starts. Container
 resolve symlinks before allowing reads/writes. No handwritten shell interpreter
 or unsandboxed fallback exists. Production-disallowed tools remain disallowed.
 Peer-session listing, teams and external MCP servers remain fixture-withheld.
-Only planner-limits admits native Agent/Task, with the actual U8 definitions,
+Planner-limits and the four close cases admit native Agent/Task, with the actual U8 definitions,
 SubagentStart hook and production capability/planning gate. Native container
 file paths are mapped at the invented mount before that gate; the gate's literal
 ncl decision precedes actual Bash sandbox wrapping. Planner results and native
@@ -160,8 +160,7 @@ boundary fail closed, including arbitrary Gmail search queries, attachments,
 history polling and calendar subscriptions. Gmail supports the production
 send-reconciliation queries and SENT label reads; gog's existing read views use
 the same messages. Booking and privacy cases have their specific conversations,
-consent and private facts. Successful public venue reads, browser delegation and the close path remain
-pending. The partial native browser response-stage investigation has no model
+consent and private facts. Successful public venue reads and browser delegation remain pending. The partial native browser response-stage investigation has no model
 runner integration and retains its failed private-address subproof.
 
 `--claude` selects an existing authenticated native CLI (default
@@ -169,7 +168,12 @@ runner integration and retains its failed private-address subproof.
 are `claude-sonnet-5` and `claude-opus-5-5`. The default $4 ledger follows the prior
 synthetic harness's roughly $4.24 evidence. Each agent query reserves $0.75 and
 each judge $0.25 before starting. Interrupted queries keep their reservation.
-Use `--ledger` with the same path/cap across evidence folders. SDK costs are
+Use `--ledger` with the same path/cap across evidence folders. Each ledger
+operation takes an exclusive file claim and reloads the persisted entries before
+admitting or settling a call. Writes are flushed and atomically replaced; a
+contested or uncertain claim refuses budget and is never automatically reclaimed.
+Already-created drivers therefore share current reservations, including unknown
+interrupted costs. SDK costs are
 list-price estimates. Its `maxBudgetUsd` stops between model requests, so one
 in-flight request may exceed its reservation; the ledger preserves every raw
 request and reported actual cost, including failures.
@@ -216,3 +220,26 @@ estimate is not a paid inference charge or behavioral result. Evidence stays in
 native-path-proof alongside the ordinary preparation evidence. The ordinary
 prepare command still stops its host before returning, so this development probe
 must run while that fixture host is deliberately kept live.
+
+The four close cases use U9’s dedicated non-task system session, its actual
+conversational TaskRecord and CLOSE_PROMPT. Native moment placement chooses an
+already-due synthetic occurrence; the real pre-task script opens its run at the
+real current time. The Sunday fixture is a late weekly catch-up, never a fake
+Sunday clock. Historical completed and failed receipts precede the due moment.
+The runner applies actual applyPreTaskScripts before formatter/processQuery for
+agent runs only; a completed retry can gate before any inference. The actual
+system-session week-view path remains unavailable, and the real hook says to use
+days. It never receives main’s unrelated ambient view.
+
+preflight-close-native.json records real CLI ledger capture, refusal before that
+capture, --done completion, first-report persistence and stable close-report ID,
+quiet host-receipt versus notify trigger, fresh linked Gmail reads and exact
+write-log consumption. It also proves --look morning and a dinner’s 16:30 look
+through its native time anchor and ordinary main-conversation task. All central
+and mailbox mutations are restored. preflight-close-process.json and
+preflight-close-script-native.json exercise the actual Bash/ncl script,
+formatter and unchanged processQuery; the existing isolated probe transaction
+restores this script’s start effect as well. These are transport proofs, not
+agent judgment. A notify report queues main’s next turn; no principal contact is
+claimed. Both actual planning roles and run-file headers remain required before
+a measured close can pass. No close behavioral inference has run.

@@ -4,6 +4,8 @@ import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { cases } from './cases/index.js';
 import { CostLedger } from './ledger.js';
+import { spawn } from 'node:child_process';
+import { pathToFileURL } from 'node:url';
 import { batchPass, mechanicalScore, parseJudge } from './score.js';
 import type { Effect } from './types.js';
 
@@ -135,6 +137,117 @@ describe('hard-fact scoring', () => {
 });
 
 describe('inference cost ledger', () => {
+  it('reloads shared reservations and uncertain costs across already-created instances', () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'scenario-ledger-shared-'));
+    directories.push(directory);
+    const file = path.join(directory, 'ledger.json');
+    const first = new CostLedger(file, 1);
+    const second = new CostLedger(file, 1);
+    first.reserve('first', 'synthetic-no-inference', 0.75, 'first');
+    expect(() => second.reserve('overspend', 'synthetic-no-inference', 0.75, 'overspend')).toThrow('Cost cap');
+    first.settle('first');
+    second.reserve('second', 'synthetic-no-inference', 0.25, 'second');
+    first.settle('second', 0.1);
+    const persisted = JSON.parse(fs.readFileSync(file, 'utf8')) as {
+      entries: { id: string; status: string; actualUsd?: number }[];
+    };
+    expect(persisted.entries).toHaveLength(2);
+    expect(persisted.entries.find((entry) => entry.id === 'first')).toMatchObject({ status: 'uncertain' });
+    expect(persisted.entries.find((entry) => entry.id === 'first')?.actualUsd).toBeUndefined();
+    const bytes = fs.readFileSync(file, 'utf8');
+    new CostLedger(file, 1);
+    expect(fs.readFileSync(file, 'utf8')).toBe(bytes);
+  });
+
+  it('fails closed without deleting an uncertain file claim or changing the admitted budget', () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'scenario-ledger-locked-'));
+    directories.push(directory);
+    const file = path.join(directory, 'ledger.json');
+    const ledger = new CostLedger(file, 1);
+    ledger.reserve('interrupted', 'synthetic-no-inference', 0.75, 'interrupted');
+    const bytes = fs.readFileSync(file, 'utf8');
+    fs.writeFileSync(`${file}.lock`, 'Unknown prior owner; no automatic reclamation.');
+    expect(() => ledger.reserve('blocked', 'synthetic-no-inference', 0.1, 'blocked')).toThrow('locked');
+    expect(() => new CostLedger(file, 1)).toThrow('locked');
+    expect(fs.readFileSync(file, 'utf8')).toBe(bytes);
+    expect(fs.readFileSync(`${file}.lock`, 'utf8')).toBe('Unknown prior owner; no automatic reclamation.');
+  });
+
+  it('admits at most one parallel process reservation and retains its unsettled amount', async () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'scenario-ledger-parallel-'));
+    directories.push(directory);
+    const file = path.join(directory, 'ledger.json');
+    const gate = path.join(directory, 'start');
+    new CostLedger(file, 1);
+    const source = `import fs from 'node:fs';
+      import { setTimeout as pause } from 'node:timers/promises';
+      import { CostLedger } from ${JSON.stringify(pathToFileURL(path.resolve('scripts/scenarios/ledger.ts')).href)};
+      const [file,id,gate]=process.argv.slice(1);
+      const ledger=new CostLedger(file,1);
+      process.stdout.write('ready\\n');
+      while(!fs.existsSync(gate)) await pause(5);
+      try { ledger.reserve(id,'synthetic-no-inference',0.75,id); console.log(JSON.stringify({admitted:true})); }
+      catch(error) { console.log(JSON.stringify({admitted:false,reason:error.message})); }`;
+    const launch = (id: string) => {
+      const child = spawn(process.execPath, ['--import', 'tsx', '--input-type=module', '-e', source, file, id, gate], {
+        cwd: process.cwd(),
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      let stdout = '';
+      let stderr = '';
+      let announced = false;
+      let ready!: () => void;
+      let fail!: (error: Error) => void;
+      const started = new Promise<void>((resolve, reject) => {
+        ready = resolve;
+        fail = reject;
+      });
+      child.stdout.on('data', (bytes: Buffer) => {
+        stdout += bytes.toString();
+        if (!announced && stdout.includes('ready\n')) {
+          announced = true;
+          ready();
+        }
+      });
+      child.stderr.on('data', (bytes: Buffer) => {
+        stderr += bytes.toString();
+      });
+      child.once('error', fail);
+      const completed = new Promise<{ code: number | null; stdout: string; stderr: string }>((resolve) =>
+        child.once('close', (code) => {
+          if (!announced) fail(new Error(stderr));
+          resolve({ code, stdout, stderr });
+        }),
+      );
+      return { child, started, completed };
+    };
+    const first = launch('parallel-first');
+    await first.started;
+    const second = launch('parallel-second');
+    try {
+      await second.started;
+      fs.writeFileSync(gate, 'start');
+      const outcomes = await Promise.all([first.completed, second.completed]);
+      expect(outcomes.map((entry) => entry.code)).toEqual([0, 0]);
+      const reservations = outcomes.map(
+        (entry) => JSON.parse(entry.stdout.trim().split('\n').at(-1)!) as { admitted: boolean; reason?: string },
+      );
+      expect(reservations.filter((entry) => entry.admitted)).toHaveLength(1);
+      expect(reservations.find((entry) => !entry.admitted)?.reason).toMatch(/Cost cap|locked/);
+      const persisted = JSON.parse(fs.readFileSync(file, 'utf8')) as {
+        entries: { reservedUsd: number; status: string }[];
+      };
+      expect(persisted.entries).toHaveLength(1);
+      expect(persisted.entries[0]).toMatchObject({ reservedUsd: 0.75, status: 'reserved' });
+      expect(() => new CostLedger(file, 1).reserve('later', 'synthetic-no-inference', 0.3, 'later')).toThrow(
+        'Cost cap',
+      );
+    } finally {
+      first.child.kill();
+      second.child.kill();
+    }
+  });
+
   it('refuses a call before spending beyond the cap, including an interrupted reservation after restart', () => {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'scenario-ledger-'));
     directories.push(directory);

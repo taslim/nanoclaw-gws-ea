@@ -50,6 +50,16 @@ export class FixtureMailbox implements AgentMailbox, MailboxOperations {
   ];
   constructor(private readonly file: string) {
     const audience = readState(file).scenario.audience;
+    const compositionPath = path.join(path.dirname(file), 'composition.json');
+    if (fs.existsSync(compositionPath)) {
+      const composition = JSON.parse(
+        fs.readFileSync(compositionPath, 'utf8'),
+      ) as import('../types.js').ScenarioComposition;
+      if (composition.close) {
+        this.destinations.splice(0, this.destinations.length, ...composition.close.destinations);
+        return;
+      }
+    }
     if (audience !== 'main') {
       this.destinations.splice(0, this.destinations.length, {
         name: 'outward',
@@ -183,6 +193,10 @@ export class FixtureMailbox implements AgentMailbox, MailboxOperations {
     fs.writeFileSync(path.join(path.dirname(this.file), 'mailbox-state.json'), JSON.stringify(state));
   }
   getSessionRouting(): SessionRouting {
+    const composition = JSON.parse(
+      fs.readFileSync(path.join(path.dirname(this.file), 'composition.json'), 'utf8'),
+    ) as import('../types.js').ScenarioComposition;
+    if (composition.close) return { channelType: null, platformId: null, threadId: null };
     const audience = readState(this.file).scenario.audience;
     return {
       channelType: audience === 'main' ? 'gchat' : audience === 'external-chat' ? 'whatsapp' : 'email',

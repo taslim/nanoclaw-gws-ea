@@ -1,6 +1,6 @@
 # Remaining case fixtures
 
-Twenty-six available cases have deterministic native preparation, not a model
+Thirty available cases have deterministic native preparation, not a model
 pass. The initial paid smoke remains the only behavioral model evidence. The
 errand case now has actual vendor-email terms, native learned travel, a queued
 email coordination request and a provisional calendar loop. That queued request
@@ -16,6 +16,8 @@ independent. Fixed-date requests name their dates. The today dataset captures
 the real date in America/Los_Angeles, its regular workplace and its one-day
 Berkeley exception, and verifies that the recurring pattern stays unchanged.
 
+The four close fixtures now exercise the native dedicated session/task/script, captured day ledger, stable completion report and quiet/notify note distinction. Native preparation restores all mutations and establishes no behavioral pass.
+
 Every row below remains fixture-pending. Prepare can verify the three location
 datasets while run still refuses them. Calendar/Gmail preparation and local SDK
 probes are not behavioral passes. Recovery-proof failures remain product blockers.
@@ -25,10 +27,6 @@ probes are not behavioral passes. Recovery-proof failures remain product blocker
 | commute-day          | Native home/rhythm and November 3 location resolve correctly. Native public-read tools and email/private-input rejection are wired; successful public venue search remains unproved under the current local-only verification constraint. |
 | home-day             | Native home/rhythm and November 6 location resolve correctly. The native SDK refused email-bearing WebSearch and encoded-email WebFetch in a zero-cost loopback probe. Successful public venue reads remain pending.                      |
 | today-exception      | Captured real-date Berkeley stay and unchanged rhythm are prepared. Successful native venue search remains pending; a store lookup does not replace it.                                                                                   |
-| close-speaks         | U9 real close path, passport appointment and follow-through facts, judged from actual close output.                                                                                                                                       |
-| close-quiet          | U9 real close path, settled tasks/matters, actual silence and retry execution.                                                                                                                                                            |
-| sunday-stale-matter  | U9 Sunday close, stale matter/deadline/no-owner history and actual follow-through.                                                                                                                                                        |
-| leave-by-look        | U9 close, event/travel uncertainty and actual next-look task path.                                                                                                                                                                        |
 | booking-link-handoff | Actual main-to-browser actor execution and complete native booking-link fixture remain pending. The partial response-stage probe below is not integrated into the model runner.                                                           |
 
 ## Public web reads

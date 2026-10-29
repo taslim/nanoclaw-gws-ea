@@ -44,6 +44,11 @@ export function prepareSyntheticShell(directory: string, tree: string): { profil
     endpointFile,
     path.join(tree, 'package.json'),
     path.join(tree, 'tsconfig.json'),
+    path.join(tree, 'src'),
+    path.join(tree, 'src/modules'),
+    path.join(tree, 'src/modules/gws-ea-whereabouts'),
+    path.join(tree, 'src/modules/gws-ea-whereabouts/clock.ts'),
+    path.join(tree, 'src/modules/gws-ea-whereabouts/clock.js'),
     '/private/etc/localtime',
     '/private/etc/hosts',
     '/private/etc/resolv.conf',
@@ -64,11 +69,13 @@ export function prepareSyntheticShell(directory: string, tree: string): { profil
   );
   return { profile, bin, bun };
 }
-export function syntheticShellCommand(profile: string, command: string): string {
+export function syntheticShellCommand(profile: string, command: string, tree: string): string {
   const directory = path.dirname(profile);
   const agent = path.join(directory, 'agent');
   const bin = path.join(directory, 'bin');
   fs.mkdirSync(path.join(agent, '.tmp'), { recursive: true });
-  const relocated = command.replaceAll('/workspace/agent', agent);
+  const relocated = command
+    .replaceAll('/workspace/agent', agent)
+    .replaceAll('/app/skills', path.join(tree, 'container/skills'));
   return `/usr/bin/env -i PATH=${shellQuote(`${bin}:/usr/bin:/bin:/opt/homebrew/bin`)} HOME=${shellQuote(agent)} TMPDIR=${shellQuote(path.join(agent, '.tmp'))} TZ=America/Los_Angeles /usr/bin/sandbox-exec -f ${shellQuote(profile)} /bin/bash --noprofile --norc -c ${shellQuote(relocated)}`;
 }

@@ -163,6 +163,12 @@ if (scenario.id === 'search-before-asking') {
     assert.ok(composition.context?.includes('Juno Hale'));
   }
 } else await checkStoreCases(file, snapshot);
+if (composition.close) {
+  const close = spawnSync('bun', [path.join(tree, 'scripts/scenarios/fake-host/close-process-check.ts'), file, tree], {
+    encoding: 'utf8',
+  });
+  assert.equal(close.status, 0, close.stderr);
+}
 if (scenario.observationOnly) {
   const report = spawnSync('bun', [path.join(tree, 'scripts/scenarios/fake-host/report-check.ts'), file], {
     encoding: 'utf8',

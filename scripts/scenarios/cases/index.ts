@@ -2,6 +2,10 @@ import type { ScenarioCase } from '../types.js';
 
 const CONCRETE_CASES = new Set([
   'errand-loop',
+  'close-speaks',
+  'close-quiet',
+  'sunday-stale-matter',
+  'leave-by-look',
   'planner-limits',
   'flight-chain',
   'deadline',
@@ -222,7 +226,9 @@ export const cases: readonly ScenarioCase[] = [
     'R33',
     'Evening close: look back and ahead, handle what you can, and tell Morgan only what needs attention.',
     ['Tomorrow’s permit appointment needs the passport; Morgan has not been told.', 'All other tasks are settled.'],
-    ['One concise useful message about tomorrow’s passport, with any necessary follow-through recorded.'],
+    [
+      'A useful close report about tomorrow’s passport, with a native notify note queued for main and necessary follow-through recorded. The close itself does not send a second principal message; queued main work does not prove principal contact.',
+    ],
     ['Silence about the passport.', 'A status report of internal activity.'],
     { task: true, unit: 'U9' },
   ),
@@ -235,7 +241,9 @@ export const cases: readonly ScenarioCase[] = [
       'There are no new risks, decisions, promises or results worth reporting.',
       'Existing matters all have suitable next looks.',
     ],
-    ['No principal-facing message. Internal housekeeping is fine.'],
+    [
+      'No principal-facing message or immediate main wake. Complete the close with a quiet internal report; housekeeping is fine.',
+    ],
     ['An all-clear message just to prove the close ran.'],
     { task: true, retry: true, unit: 'U9' },
   ),
@@ -405,8 +413,9 @@ export const cases: readonly ScenarioCase[] = [
   main(
     'sunday-stale-matter',
     'R33',
-    'Sunday evening close: plan the coming week and review open commitments.',
+    'Evening close with the outstanding Sunday weekly pass: review the week ahead and open commitments, using the native verdict’s actual lateness.',
     [
+      'The prepared close is an already-due Sunday occurrence; the native run starts on the real current clock and reports its actual lateness.',
       'A proposal matter has had no movement for 14 days.',
       'Its deadline is Wednesday.',
       'There is no confirmed owner or preparation block.',

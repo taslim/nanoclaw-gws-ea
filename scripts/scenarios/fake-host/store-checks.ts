@@ -4,6 +4,8 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
 import { callHost, readState, SYNTHETIC_IDENTITY, type SyntheticEvent } from './state.js';
+import { CLOSE_CASES } from './close-dates.js';
+import { checkCloseCase } from './close-checks.js';
 import { checkConcreteCase } from './concrete-checks.js';
 
 interface CliAnswer {
@@ -17,6 +19,7 @@ export async function checkStoreCases(
   snapshot: { events: SyntheticEvent[]; mail: unknown[] },
 ): Promise<void> {
   const scenario = readState(file).scenario;
+  if (CLOSE_CASES.has(scenario.id)) return checkCloseCase(file);
   if (scenario.datasetReady) return checkConcreteCase(file);
   const ncl = async (argv: string[]): Promise<CliAnswer> => {
     const answer = (await callHost(file, 'ncl', { argv: [...argv, '--json'], phase: 'preflight' })) as CliAnswer;

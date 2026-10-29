@@ -13,6 +13,7 @@ import { FixtureMailbox } from './fake-host/mailbox.js';
 import { SYNTHETIC_IDENTITY, readState } from './fake-host/state.js';
 import { startRequestRecorder, rawUsage } from './fake-host/relay.js';
 import { prepareSyntheticShell } from './fake-host/sandbox.js';
+import type { MessageInRow } from '../../container/agent-runner/src/db/messages-in.js';
 import type { ProviderEvent } from '../../container/agent-runner/src/providers/types.js';
 import type { ScenarioCase, ScenarioComposition } from './types.js';
 import { scenarioRuntime } from './runtime.js';
@@ -51,7 +52,7 @@ resetAgentMailboxForTesting();
 const mailbox = new FixtureMailbox(file);
 registerAgentMailbox(() => mailbox);
 
-const messages = [
+let messages: MessageInRow[] = [
   ...(composition.handoff
     ? [
         {
@@ -115,10 +116,56 @@ const messages = [
     on_wake: 0,
   },
 ];
+const shell = prepareSyntheticShell(directory, tree);
+if (kind === 'agent' && composition.close) {
+  const task = composition.close.task;
+  messages = [
+    {
+      ...messages[0]!,
+      id: task.id,
+      seq: task.sequence,
+      kind: 'task',
+      status: task.status,
+      timestamp: task.timestamp,
+      content: task.content,
+      process_after: task.processAfter,
+      recurrence: task.recurrence,
+      series_id: task.seriesId,
+      tries: task.tries,
+      platform_id: null,
+      channel_type: null,
+      thread_id: null,
+    },
+  ];
+  const { applyPreTaskScripts } = await import('../../container/agent-runner/src/scheduling/task-script.js');
+  const priorPath = process.env.PATH;
+  process.env.PATH = `${shell.bin}:${priorPath ?? ''}`;
+  try {
+    const applied = await applyPreTaskScripts(messages);
+    fs.writeFileSync(path.join(evidence, 'close-script.json'), JSON.stringify(applied, null, 2));
+    messages = applied.keep;
+    if (messages.length === 0) {
+      fs.writeFileSync(
+        path.join(evidence, 'usage.json'),
+        JSON.stringify({ gated: true, actualModelCalls: 0, result: { total_cost_usd: 0 } }),
+      );
+      fs.writeFileSync(path.join(evidence, 'text.md'), '');
+      fs.writeFileSync(
+        path.join(evidence, 'dispatch.json'),
+        JSON.stringify({ gatedByNativeScript: true, skipped: applied.skipped }),
+      );
+      await recorder.close();
+      process.exit(0);
+    }
+  } finally {
+    if (priorPath === undefined) delete process.env.PATH;
+    else process.env.PATH = priorPath;
+  }
+}
 const routing = extractRouting(messages);
 const addendum = buildSystemPromptAddendum(
   SYNTHETIC_IDENTITY.assistantName.firstName,
-  scenario.task ? { kind: 'task', taskId: 'synthetic-input' } : { kind: 'chat' },
+  routing.taskRun ? { kind: 'task', taskId: messages[0]!.id } : { kind: 'chat' },
   capabilities,
 );
 const formatted = formatMessages(messages);
@@ -131,7 +178,6 @@ fs.writeFileSync(path.join(evidence, 'formatted.md'), formatted);
 fs.writeFileSync(path.join(evidence, 'append.md'), addendum);
 fs.writeFileSync(path.join(evidence, 'compact.md'), compact);
 
-const shell = prepareSyntheticShell(directory, tree);
 const nativeHooks = nativeScenarioHooks(directory, tree, evidence, scenario, composition, shell.profile);
 const toolHook: HookCallback =
   kind === 'judge'
@@ -292,11 +338,11 @@ async function* inputs(): AsyncGenerator<SDKUserMessage> {
 }
 if (kind === 'agent') {
   setCurrentReplyRoute({
-    inReplyTo: routing.inReplyTo ?? 'synthetic-input',
+    inReplyTo: routing.inReplyTo ?? messages[0]!.id,
     channelType: routing.channelType,
     platformId: routing.platformId,
     threadId: routing.threadId,
-    batch: ['synthetic-input'],
+    batch: messages.map((message) => message.id),
   });
   push(prompt);
 }
@@ -368,7 +414,7 @@ try {
         },
       },
       routing,
-      ['synthetic-input'],
+      messages.map((message) => message.id),
       'claude',
       undefined,
       prompt,

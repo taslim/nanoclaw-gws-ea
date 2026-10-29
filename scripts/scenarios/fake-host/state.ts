@@ -61,9 +61,9 @@ export interface FixtureState {
   };
 }
 export function initialFixture(scenario: ScenarioCase): FixtureState {
-  const concrete = concreteFixture(scenario);
-  if (concrete)
-    return { scenario, referenceAt: new Date().toISOString(), attempt: 1, effects: [], outbound: [], ...concrete };
+  const referenceAt = new Date().toISOString();
+  const concrete = concreteFixture(scenario, referenceAt);
+  if (concrete) return { scenario, referenceAt, attempt: 1, effects: [], outbound: [], ...concrete };
   if (scenario.id === 'location-field')
     return {
       scenario,

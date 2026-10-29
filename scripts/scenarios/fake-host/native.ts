@@ -243,6 +243,25 @@ export async function serveNativeHost(
     );
   const snapshot = async (): Promise<unknown> => ({
     observedAt: new Date().toISOString(),
+    closeRuns: await getDb().all('SELECT * FROM gws_ea_close_runs'),
+    closeSchedules: await getDb().all('SELECT * FROM gws_ea_close_schedule'),
+    timeAnchors: await getDb().all('SELECT * FROM gws_ea_time_anchors'),
+    morningLooks: await getDb().all('SELECT * FROM gws_ea_morning_looks'),
+    mailboxes: (
+      await getDb().all<{ id: string; agent_group_id: string }>('SELECT id,agent_group_id FROM sessions')
+    ).map((entry) => {
+      const inbox = new Database(inboundDbPath(entry.agent_group_id, entry.id), { readonly: true });
+      try {
+        return {
+          sessionId: entry.id,
+          rows: inbox
+            .prepare('SELECT id,kind,status,timestamp,content,trigger,process_after,series_id FROM messages_in')
+            .all(),
+        };
+      } finally {
+        inbox.close();
+      }
+    }),
     calendars: [...calendar.calendars.values()],
     events: calendar.events,
     calendarWrites: calendar.writes,
