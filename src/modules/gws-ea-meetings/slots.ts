@@ -15,18 +15,13 @@ import {
 } from '../gws-ea-preferences/db.js';
 import type { PrincipalRecognizer } from '../gws-ea-profile/db.js';
 import type { EventAttendee, ListedEvent } from './calendar-api.js';
+import { wallClock, zonedInstant, type LocalDate } from '../gws-ea-whereabouts/clock.js';
+export { iso, zonedInstant, zonedIso, type LocalDate } from '../gws-ea-whereabouts/clock.js';
 
 /** An interval of instants, in milliseconds since the epoch; `end` is exclusive. */
 export interface Span {
   readonly start: number;
   readonly end: number;
-}
-
-/** `month` runs 1 to 12. */
-export interface LocalDate {
-  readonly year: number;
-  readonly month: number;
-  readonly day: number;
 }
 
 /** Minutes since local midnight; `end` may be 1440, the next midnight. */
@@ -64,92 +59,6 @@ const SUNDAY_FIRST: readonly Weekday[] = ['sun', 'mon', 'tue', 'wed', 'thu', 'fr
 // ---------------------------------------------------------------------------
 // Time zones
 // ---------------------------------------------------------------------------
-
-export function iso(instant: number): string {
-  return new Date(instant).toISOString();
-}
-
-const formatters = new Map<string, Intl.DateTimeFormat>();
-
-function formatter(timezone: string): Intl.DateTimeFormat {
-  let format = formatters.get(timezone);
-  if (!format) {
-    format = new Intl.DateTimeFormat('en-US', {
-      timeZone: timezone,
-      hourCycle: 'h23',
-      year: 'numeric',
-      month: 'numeric',
-      day: 'numeric',
-      hour: 'numeric',
-      minute: 'numeric',
-      second: 'numeric',
-    });
-    formatters.set(timezone, format);
-  }
-  return format;
-}
-
-interface WallClock extends LocalDate {
-  readonly hour: number;
-  readonly minute: number;
-  readonly second: number;
-}
-
-function wallClock(instant: number, timezone: string): WallClock {
-  const parts: Record<string, number> = {};
-  for (const part of formatter(timezone).formatToParts(new Date(instant))) {
-    if (part.type !== 'literal') parts[part.type] = Number(part.value);
-  }
-  return {
-    year: parts.year,
-    month: parts.month,
-    day: parts.day,
-    hour: parts.hour,
-    minute: parts.minute,
-    second: parts.second,
-  };
-}
-
-/** Milliseconds the zone's clock runs ahead of UTC at `instant`. */
-function zoneOffset(instant: number, timezone: string): number {
-  const wall = wallClock(instant, timezone);
-  const asUtc = Date.UTC(wall.year, wall.month - 1, wall.day, wall.hour, wall.minute, wall.second);
-  return asUtc - Math.floor(instant / 1000) * 1000;
-}
-
-const pad = (value: number, width = 2): string => String(value).padStart(width, '0');
-
-/**
- * Such as 2026-10-06T07:00-04:00: how an agent reads a time and gives it back
- * to a tool. Seconds appear only when the instant has them.
- */
-export function zonedIso(instant: number, timezone: string): string {
-  const wall = wallClock(instant, timezone);
-  const offset = Math.round(zoneOffset(instant, timezone) / MINUTE);
-  const milliseconds = ((instant % 1000) + 1000) % 1000;
-  const seconds =
-    wall.second === 0 && milliseconds === 0
-      ? ''
-      : `:${pad(wall.second)}${milliseconds === 0 ? '' : `.${pad(milliseconds, 3)}`}`;
-  const sign = offset < 0 ? '-' : '+';
-  return (
-    `${pad(wall.year, 4)}-${pad(wall.month)}-${pad(wall.day)}T${pad(wall.hour)}:${pad(wall.minute)}${seconds}` +
-    `${sign}${pad(Math.floor(Math.abs(offset) / 60))}:${pad(Math.abs(offset) % 60)}`
-  );
-}
-
-/** A time the clocks repeat takes its later occurrence; a time they skip lands just after the change. */
-export function zonedInstant(date: LocalDate, minuteOfDay: number, timezone: string): number {
-  const wall = Date.UTC(date.year, date.month - 1, date.day, 0, minuteOfDay);
-  const first = zoneOffset(wall, timezone);
-  const guess = wall - first;
-  const second = zoneOffset(guess, timezone);
-  if (first === second) return guess;
-  const adjusted = wall - second;
-  const third = zoneOffset(adjusted, timezone);
-  if (second === third) return adjusted;
-  return wall - Math.min(second, third);
-}
 
 function localTime(
   instant: number,
