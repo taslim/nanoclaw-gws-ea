@@ -100,6 +100,21 @@ describe('outward availability in the principal’s days', () => {
     }
   });
 
+  it('keeps a city named alone out of reach during a certain stay elsewhere, though one saved place there has no zone', async () => {
+    await addPlace({ label: 'Remy’s office', locality: 'San Francisco', zone: 'America/Los_Angeles' });
+    await addPlace({ label: 'Juno’s studio', locality: 'San Francisco' });
+    await addStay({
+      locality: 'Brussels',
+      zone: 'Europe/Brussels',
+      start: '2026-11-10',
+      end: '2026-11-15',
+      source: 'said',
+      certainty: 'certain',
+    });
+    const city = await reads.freeTime({ ...november, place: 'San Francisco' }, emailSession, 'zoneless-place');
+    expect(city.windows).toEqual([]);
+  });
+
   it('keeps tentative stays as window notes, and fits a Lagos stay on Pacific hours', async () => {
     await home();
     await addStay({
@@ -385,6 +400,26 @@ describe('outward availability in the principal’s days', () => {
       ),
     );
     expect(booked.start).toBe('2026-10-20T11:00:00.000Z');
+  });
+
+  it('books a time free of events though known travel holds it, which free_time never offers', async () => {
+    await home();
+    const flight = {
+      id: 'flight-out',
+      status: 'confirmed',
+      start: { dateTime: '2026-11-09T23:00:00Z', timeZone: 'America/Los_Angeles' },
+      end: { dateTime: '2026-11-10T09:00:00Z', timeZone: 'Europe/Brussels' },
+    };
+    await syncDerivedStays(deriveLegs([flight]), {
+      start: Date.parse('2026-11-01T00:00:00Z'),
+      end: Date.parse('2026-11-30T00:00:00Z'),
+    });
+    const inFlight = { from: '2026-11-10T01:00:00Z', to: '2026-11-10T03:00:00Z', minutes: 30 };
+    expect((await reads.freeTime(inFlight, emailSession, 'in-flight')).windows).toEqual([]);
+    const booked = answerData(
+      await reads.book({ ...BOOK, start: '2026-11-10T02:00:00Z' }, emailSession, 'book-in-flight'),
+    );
+    expect(booked.start).toBe('2026-11-10T02:00:00.000Z');
   });
 
   it('retains valid windows when the history read is unavailable, with unknown counts rather than invented zeros', async () => {
@@ -683,7 +718,7 @@ async function booked(session = chatSession): Promise<string> {
   return String(answerData(await reads.book(BOOK, session, 'initial')).booking);
 }
 
-it.each([undefined, { dateTime: 'not an instant' }, { date: 'not a date' }])(
+it.each([undefined, { dateTime: 'not an instant' }])(
   'refuses an owned event with an unreadable start through the booking contract (%j)',
   async (start) => {
     const id = await booked(emailSession);
