@@ -74,6 +74,12 @@ For ad-hoc central queries from skills or scripts, use the in-tree wrapper rathe
 | `src/modules/approvals/primitive.ts` | `pickApprover`, `pickApprovalDelivery`, `requestApproval` (returns approval id), approval-handler registry with opt-in restart-safe handlers |
 | `src/modules/approvals/lifecycle.ts` | Approval withdrawal and expiry: DB-only detach, then card edit/notification after commit |
 | `src/modules/agent-to-agent/` | Native destination ACLs and routing, including per-thread tool-agent sessions and untrusted inbound framing |
+| `src/modules/gws-ea-whereabouts/` | Native places, rhythm, stays and learned travel; dated timelines and principal-local clock placement |
+| `src/modules/gws-ea-manual/` | Manual sections and bounded front page composed from native profile, preferences, people and whereabouts stores |
+| `src/modules/gws-ea-lessons/` | Privacy-checked general craft principles queued for operator review and incorporation into playbooks |
+| `src/modules/gws-ea-meetings/week/` | Calendar-copy model, day findings, write journal, pending change notes and independent coming-days refresher |
+| `src/modules/gws-ea-matters/{sync,morning,loop,ledger}.ts` | Principal-local evening close, captured day-ledger coverage, durable completion/reporting, held morning gate and timed looks |
+| `container/agent-runner/src/planning-agents.ts` + `week-view/` | Native planning-worker attribution and permissions; main-only week/Manual context hooks and moment-local clock reads |
 | `src/modules/gws-ea-browser/` | Built-in host Playwright runtime, owned loopback Chrome CDP connection, public-only proxy, job queue, sign-in, the open-rule classifier, consent engine, reviewed and generic purchase readers, purchase authority, recipes and wake-on-change watches |
 | `src/gws-ea/onepassword*.ts` + `src/modules/gws-ea-browser/{onepassword*,credential-*,vault-access}.ts` | 1Password: operator provisioning and resumable uninstall/removal cleanup; the sanitized `op` CLI boundary and host vault client; durable credential attempts for signups and owned password changes; main's vault sharing with the principal |
 | `src/command-gate.ts` | Router-side admin command gate — queries `user_roles` directly (no env var, no container-side check) |
@@ -356,6 +362,25 @@ never page ownership. Navigation completion and the resulting page condition are
 separate: a denial returns `challenge` even when navigation completed. Request
 evidence records observed responses, transport failures and host refusals with
 correlation and runtime versions, without raw URLs or secret-bearing payloads.
+
+## GWS-EA day planning
+
+The Manual front page is composed from native stores; scheduling preferences,
+places and dated stays keep their own authority. `ncl manual get` reads the Manual,
+and `ncl day` captures the ledger since the last completed close. The meetings
+refresher publishes a bounded coming-days view and serialized zone timeline for
+main's conversation sessions. Native SessionStart and UserPromptSubmit hooks
+read that file; a principal turn does not start a Google read.
+
+The host keeps one close at 21:00 in the principal's zone. It runs in a dedicated
+main system session, with native look-back and look-ahead workers constrained to
+their read commands and owned result files. Task acknowledgment never completes
+the close: `ncl matters evening --done` requires captured ledger coverage and an
+idempotent report. The report becomes a note for main; the agent chooses whether
+to wake main for it. A quiet morning creates no task or container, while held
+morning looks share a native task. Reminders and looks retain their local clock
+placement unless explicitly fixed. Contact remains an agent decision through
+the existing delivery tools and guards.
 
 ## Rebuild Workflow (Temporary)
 
