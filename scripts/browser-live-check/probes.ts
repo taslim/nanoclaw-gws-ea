@@ -39,6 +39,7 @@ async function denyAllProxy(): Promise<{ server: Server; url: string }> {
     response.end('Network disabled for local browser probes');
   });
   server.on('connect', (_request, socket) => {
+    socket.once('error', () => socket.destroy());
     socket.end('HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n');
   });
   server.listen(0, '127.0.0.1');
