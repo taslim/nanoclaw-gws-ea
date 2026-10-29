@@ -10,9 +10,9 @@ checks cover only retry duplicates, scoped privacy markers and declared planner
 role/path/verb limits.
 
 The invented principal is Morgan Ellery, the assistant Aster, and contacts Juno
-Hale and Remy Vance. Eight cases are available: `search-before-asking`,
+Hale and Remy Vance. Ten cases are available: `search-before-asking`,
 `trip-zone`, `unknown-pronouns`, `principal-does-it`, `missing-remy`,
-`assistant-missing-invite`, and the two external identity/read probes. The role probes read a conversation-only brief and produce an
+`assistant-missing-invite`, `location-field`, `move-with-guest`, and the two external identity/read probes. The role probes read a conversation-only brief and produce an
 internal native task log; their scores cannot establish email or chat delivery.
 The role probes and the people/reminder-only cases have empty Calendar/Gmail stores. The remaining incident classes are catalog entries explicitly
 marked `fixture-pending`; the driver refuses to run them against unrelated
@@ -28,6 +28,8 @@ pnpm exec tsx scripts/scenarios/driver.ts list
 pnpm exec tsx scripts/scenarios/driver.ts prepare --cases search-before-asking,external-email-identity-read,external-chat-identity-read --out /tmp/ea-scenario-prepare
 pnpm exec tsx scripts/scenarios/driver.ts run --cases search-before-asking --out /tmp/ea-scenario-baseline --cap-usd 4 --attempts 1
 pnpm exec vitest run scripts/scenarios/score.test.ts
+pnpm exec vitest run scripts/scenarios/fake-host/google-transport.test.ts
+pnpm exec node --import tsx scripts/scenarios/fake-host/transport-check.ts /tmp/ea-native-google-proof
 pnpm exec tsc -p scripts/scenarios/tsconfig.json --noEmit
 pnpm exec tsc -p scripts/scenarios/tsconfig.runner.json --noEmit
 ```
@@ -48,6 +50,28 @@ run; `preflight-canonical-snapshot.json` preserves the clean initial state. Nati
 people, whereabouts, Manual, memory and task records also reach the judge's
 canonical snapshot; no parallel empty task array claims to represent native
 writes. Snapshot memory traversal refuses symlinks, including the memory root.
+
+The two write cases have their own venue, length, organizer, guest and agreed-time
+facts. Their preparation reads those facts and checks the destination interval
+without consuming the model's write. `transport-check.ts` separately drives real
+guarded `create_event`, `change_event`, `cancel_event`, `change_guests`,
+`respond_to_event`, `book`, `change_booking`, `cancel_booking` and `email_send`.
+Ordinary email replies use the native outbound SQLite database,
+`deliverSessionMessages`, registered inbox adapter, delivery receipts and
+post-delivery hooks. Calendar writes, invitation updates and MIME email sends
+reach the single canonical stores at the HTTP boundary. Snapshot evidence includes
+native booking requests, calendar write journals, send ledgers and thread messages;
+`google-http.jsonl` records methods, paths, versions and outcomes without tokens.
+
+The transport proof checks version-conditioned writes, stale rejection, retained
+guests, native IDs, cancellation tombstones, all three booking kinds, Meet
+request/status/readback, reply audiences/headers and retry duplicates. It loses
+selected HTTP responses after storing the write to exercise native recovery.
+Each product recovery proof saves its actual first/replayed mailbox answer,
+confirmed event and journal; any failing proof makes the command exit nonzero
+after the independent booking/Gmail checks finish. Such a failure is a product
+defect to repair in the native handler, never a fixture success. These checks
+cost no inference and do not establish a behavioral model pass.
 
 Preparation uses native `materializeContainerJson`, including
 `grantCapabilities` overlays, rather than treating stored keys as spawn grants.
@@ -93,7 +117,15 @@ Web tools, peer-session listing, subagent tools and external MCP servers are
 additionally withheld by this initial fixture boundary; these restrictions are
 recorded separately from production tool policy. Future U8 scenarios require the real
 planning definitions/gate and suitable fixtures; this initial smoke does not
-prove them. Google write transport and outbound mail fixtures remain unavailable.
+prove them. Google Calendar create/patch/delete/free-busy and Gmail send/read
+transports are available. Google operations outside the implemented fixture
+boundary fail closed, including arbitrary Gmail search queries, attachments,
+history polling and calendar subscriptions. Gmail supports the production
+send-reconciliation queries and SENT label reads; gog's existing read views use
+the same messages. Booking and outward-privacy catalog cases still need their
+specific native conversations, consent and privacy facts. The catalog also names
+other-assistant-owned invitations, booking-link handoff and moving a
+conversation-unowned event; these remain fixture-pending.
 
 `--claude` selects an existing authenticated native CLI (default
 `~/.local/bin/claude`); no auth files are inspected or copied. The default models

@@ -10,7 +10,7 @@ interface CliAnswer {
   readonly stdout: string;
 }
 
-/** Native-store checks for cases that require neither web nor Google writes. */
+/** Read each case's actual native facts without consuming its model-facing mutation. */
 export async function checkStoreCases(
   file: string,
   snapshot: { events: SyntheticEvent[]; mail: unknown[] },
@@ -21,7 +21,41 @@ export async function checkStoreCases(
     assert.equal(answer.frame.ok, true, answer.stdout);
     return answer;
   };
-  if (scenario.id === 'unknown-pronouns') {
+  if (scenario.id === 'location-field' || scenario.id === 'move-with-guest') {
+    const found = (await callHost(file, 'gog', {
+      argv: ['gmail', 'messages', 'search', scenario.id === 'location-field' ? 'Remy lunch' : 'Juno move'],
+      phase: 'preflight',
+    })) as { messages: { body: string }[] };
+    assert.equal(found.messages.length, 1);
+    if (scenario.id === 'location-field') {
+      assert.deepEqual(snapshot.events, []);
+      assert.ok(found.messages[0]?.body.includes('60 minutes'));
+      assert.ok(found.messages[0]?.body.includes('800 Fiction Lane, San Francisco'));
+      assert.ok((await ncl(['people', 'find', '--query', 'Remy'])).stdout.includes('remy.vance@example.test'));
+    } else {
+      assert.equal(snapshot.events.length, 1);
+      assert.equal(snapshot.events[0]?.organizer?.email, SYNTHETIC_IDENTITY.principalEmail);
+      assert.ok(snapshot.events[0]?.attendees?.some((guest) => guest.email === 'juno.hale@example.test'));
+      assert.ok(found.messages[0]?.body.includes('Friday November 6 at 14:00'));
+      const days = await callHost(file, 'action', {
+        action: 'days',
+        requestId: 'preflight-move-days',
+        start: '2026-11-03',
+        end: '2026-11-03',
+        phase: 'preflight',
+      });
+      assert.ok(JSON.stringify(days).includes('synthetic-project-brief'));
+    }
+    const free = (await callHost(file, 'action', {
+      action: 'check',
+      requestId: 'preflight-write-free',
+      start: scenario.id === 'location-field' ? '2026-11-06T12:00:00-08:00' : '2026-11-06T14:00:00-08:00',
+      end: scenario.id === 'location-field' ? '2026-11-06T13:00:00-08:00' : '2026-11-06T14:25:00-08:00',
+      phase: 'preflight',
+    })) as { frame?: { ok: boolean } };
+    assert.equal(free.frame?.ok, true);
+    assert.ok(!JSON.stringify(free).includes('minutes overlap'));
+  } else if (scenario.id === 'unknown-pronouns') {
     assert.deepEqual(snapshot.events, []);
     assert.deepEqual(snapshot.mail, []);
     const found = await ncl(['people', 'find', '--query', 'Juno']);

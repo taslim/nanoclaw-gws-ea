@@ -133,6 +133,10 @@ export class FixtureMailbox implements AgentMailbox, MailboxOperations {
     } else if (message.kind === 'chat') {
       if (fixture.scenario.observationOnly)
         throw new Error('Unsupported fixture outward delivery: this case observes an internal report only.');
+      if (fixture.scenario.audience === 'external-email') {
+        await callHost(this.file, 'deliver', { content, messageId: row.id });
+        return seq;
+      }
       const dest = this.findDestinationByRouting(message.channelType ?? null, message.platformId ?? null);
       await recordEffect(this.file, {
         kind: 'message',

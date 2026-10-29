@@ -29,7 +29,7 @@ export async function seedScenarioStores(scenario: ScenarioCase, agent: string):
             note: 'Juno Hale is the new project coordinator. No pronouns have been supplied or observed.',
           },
         ]
-      : scenario.id === 'principal-does-it' || scenario.id === 'missing-remy'
+      : scenario.id === 'principal-does-it' || scenario.id === 'missing-remy' || scenario.id === 'location-field'
         ? [
             {
               name: 'Remy Vance',

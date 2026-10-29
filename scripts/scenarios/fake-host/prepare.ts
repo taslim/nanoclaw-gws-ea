@@ -113,7 +113,7 @@ try {
     await createMessagingGroup({
       id: messagingGroupId,
       channel_type: audience === 'external-chat' ? 'whatsapp' : 'email',
-      platform_id: messagingGroupId,
+      platform_id: audience === 'external-email' ? 'email:inbox' : messagingGroupId,
       name: audience === 'external-chat' ? 'Juno Hale' : 'Synthetic assistant inbox',
       is_group: 0,
       unknown_sender_policy: 'strict',
@@ -141,11 +141,19 @@ try {
       )) as typeof import('../../../src/modules/gws-ea-chats/context.js');
       context = await renderChatContext(messagingGroupId);
     } else {
-      const { createThread, placeThread } = (await import(
+      const { createThread, placeThread, recordThreadAddresses } = (await import(
         source('src/modules/gws-ea-inbox/thread-map.ts')
       )) as typeof import('../../../src/modules/gws-ea-inbox/thread-map.js');
-      threadId = (await createThread(null, now, 'mail-synthetic-identity')).threadKey;
+      const thread = readState(path.join(output, 'fixture.json')).thread;
+      threadId = (await createThread(null, now, thread?.key ?? 'mail-synthetic-identity')).threadKey;
       await placeThread(threadId, 'nowhere');
+      if (thread) {
+        await recordThreadAddresses(threadId, thread.namedPeople, 'main', now);
+        if (thread.bookingCalendar) {
+          const { setThreadBookingCalendar } = await import('../../../src/modules/gws-ea-meetings/thread-calendar.js');
+          await setThreadBookingCalendar(threadId, thread.bookingCalendar);
+        }
+      }
     }
   }
   const { session } = await resolveSession(
@@ -218,7 +226,13 @@ try {
     changedAt: checkedAt,
     toldAccess: 'bookable',
   });
-  await serveNativeHost(output, session, google.calendar, google.mail);
+  const { startSyntheticDelivery } = await import('./delivery.js');
+  const stopDelivery = await startSyntheticDelivery();
+  try {
+    await serveNativeHost(output, session, google);
+  } finally {
+    await stopDelivery();
+  }
 } finally {
   await closeDb();
 }

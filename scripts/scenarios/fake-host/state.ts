@@ -18,7 +18,11 @@ export interface SyntheticEvent {
   readonly start?: { readonly dateTime?: string; readonly date?: string };
   readonly end?: { readonly dateTime?: string; readonly date?: string };
   readonly organizer?: { readonly email?: string };
-  readonly attendees?: readonly { readonly email?: string; readonly responseStatus?: string }[];
+  readonly attendees?: readonly {
+    readonly email?: string;
+    readonly responseStatus?: string;
+    readonly self?: boolean;
+  }[];
   readonly etag?: string;
 }
 export interface SyntheticMail {
@@ -40,8 +44,61 @@ export interface FixtureState {
   outbound: Record<string, unknown>[];
   events: SyntheticEvent[];
   mail: SyntheticMail[];
+  readonly thread?: {
+    readonly key: string;
+    readonly namedPeople: readonly string[];
+    readonly bookingCalendar?: string;
+  };
 }
 export function initialFixture(scenario: ScenarioCase): FixtureState {
+  if (scenario.id === 'location-field')
+    return {
+      scenario,
+      attempt: 1,
+      effects: [],
+      outbound: [],
+      events: [],
+      mail: [
+        syntheticMail(
+          'synthetic-lunch-agreement',
+          'Lunch on November 6',
+          'remy.vance@example.test',
+          SYNTHETIC_IDENTITY.principalEmail,
+          'Morgan and Remy agreed to lunch Friday November 6, 2026 at 12:00 America/Los_Angeles for 60 minutes. Harbor House is at 800 Fiction Lane, San Francisco. Please put the lunch on Morgan’s calendar.',
+        ),
+      ],
+    };
+  if (scenario.id === 'move-with-guest')
+    return {
+      scenario,
+      attempt: 1,
+      effects: [],
+      outbound: [],
+      events: [
+        {
+          calendarId: SYNTHETIC_IDENTITY.principalEmail,
+          id: 'synthetic-project-brief',
+          summary: 'Project brief with Juno',
+          location: 'Morgan calls Juno',
+          start: { dateTime: '2026-11-03T10:00:00-08:00' },
+          end: { dateTime: '2026-11-03T10:25:00-08:00' },
+          organizer: { email: SYNTHETIC_IDENTITY.principalEmail },
+          attendees: [
+            { email: SYNTHETIC_IDENTITY.principalEmail, responseStatus: 'accepted' },
+            { email: 'juno.hale@example.test', responseStatus: 'accepted' },
+          ],
+        },
+      ],
+      mail: [
+        syntheticMail(
+          'synthetic-juno-move-agreement',
+          'Move our project brief meeting',
+          'juno.hale@example.test',
+          SYNTHETIC_IDENTITY.principalEmail,
+          'I can move our November 3 project brief meeting to Friday November 6 at 14:00 America/Los_Angeles. Please retain its 25-minute length and send the update to my existing invitation. The phone arrangement stays: Morgan calls Juno.',
+        ),
+      ],
+    };
   if (scenario.id === 'external-email-identity-read' || scenario.id === 'external-chat-identity-read')
     return { scenario, attempt: 1, effects: [], outbound: [], events: [], mail: [] };
   if (scenario.id === 'unknown-pronouns' || scenario.id === 'principal-does-it')

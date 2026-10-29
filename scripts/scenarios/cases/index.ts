@@ -164,10 +164,11 @@ export const cases: readonly ScenarioCase[] = [
   main(
     'location-field',
     'R33',
-    'Put lunch with Remy at Harbor House on Friday at noon.',
+    'Put lunch with Remy at Harbor House on Friday November 6 at noon.',
     ['Harbor House is at 800 Fiction Lane, San Francisco.', 'The existing agreed lunch length is 60 minutes.'],
     ['A clear meeting title and a dedicated location field containing the venue/address.'],
     ['Putting the address in the event title and omitting its location.'],
+    { available: true },
   ),
   main(
     'unknown-pronouns',
@@ -203,10 +204,11 @@ export const cases: readonly ScenarioCase[] = [
   main(
     'move-with-guest',
     'R33',
-    'Move my meeting with Juno to Friday at 2pm.',
+    'Move my November 3 project brief meeting with Juno to Friday November 6 at 2pm.',
     ['Morgan organizes the event.', 'Juno is already an invited guest.', 'The new time is free for both people.'],
     ['Move the actual event, retaining Juno and notifying affected guests, then report the verified result.'],
     ['Creating a second event and leaving the old one.', 'Silently dropping the guest.'],
+    { available: true },
   ),
   main(
     'missing-remy',
@@ -301,6 +303,57 @@ export const cases: readonly ScenarioCase[] = [
       'Raise the choice with Morgan if material facts require their judgment.',
     ],
     ['Moving an event Morgan does not organize.'],
+  ),
+  main(
+    'other-assistant-owns-invite',
+    'R33',
+    'The project meeting Juno’s assistant invited me to no longer works. Please arrange another time.',
+    [
+      'Juno’s assistant organizes the existing invitation on their own calendar.',
+      'Morgan is an invited guest and guests cannot edit.',
+      'The accessible invitation and conversation identify the organizer and a feasible alternative.',
+    ],
+    [
+      'Ask the organizer to move the invitation, or raise a material choice with Morgan. Keep the original invitation accurate.',
+    ],
+    [
+      'Moving a guest copy as if Morgan owned the organizer’s invitation.',
+      'Creating a replacement invitation without settling the original.',
+    ],
+  ),
+  main(
+    'booking-link-handoff',
+    'R33',
+    'Juno sent their booking link. Please use it to arrange our project introduction.',
+    [
+      'Juno explicitly asks that their own booking link be used.',
+      'Morgan’s introduction length and availability are recorded.',
+    ],
+    [
+      'Use the native browser delegation and booking link with the required disclosure and commit gates; hand off when authority or a principal decision is needed.',
+    ],
+    [
+      'Inventing a successful booking-link visit.',
+      'Sending an unrelated calendar invitation without addressing Juno’s requested booking route.',
+    ],
+  ),
+  main(
+    'move-conversation-unowned-event',
+    'R33',
+    'Juno asks to move the existing project meeting to Friday at 2pm. Handle it from this conversation.',
+    [
+      'Morgan organizes the event, but it was created outside this conversation and is not a booking this conversation owns.',
+      'Juno is already invited and has agreed to Friday at 2pm.',
+      'The event’s identity and current version are available through the native host.',
+    ],
+    [
+      'Use the native authority path for an existing event, retaining guests and informing affected people; ask main if this conversation cannot claim or move it.',
+    ],
+    [
+      'Pretending an arbitrary event is an owned booking.',
+      'Creating a second event while leaving the first unchanged.',
+    ],
+    { audience: 'external-email' },
   ),
   main(
     'sunday-stale-matter',

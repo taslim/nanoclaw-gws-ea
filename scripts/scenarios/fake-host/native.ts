@@ -4,11 +4,14 @@ import http from 'node:http';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import type { Session } from '../../../src/types.js';
-import type { FakeCalendar, StoredEvent } from '../../../src/modules/gws-ea-meetings/testing/fake-calendar.js';
+import type { FakeCalendar } from '../../../src/modules/gws-ea-meetings/testing/fake-calendar.js';
 import type { GmailMessage } from '../../../src/modules/gws-ea-inbox/gmail-api.js';
 import { SYNTHETIC_IDENTITY, type FixtureState } from './state.js';
 import { syntheticGateway } from './gateway.js';
 import { gogMail } from './gog-mail.js';
+import { calendarTransport } from './google-calendar.js';
+import { SyntheticGmailTransport } from './google-mail.js';
+import { parseGmailMessage } from '../../../src/modules/gws-ea-inbox/mime.js';
 
 const PRINCIPAL = SYNTHETIC_IDENTITY.principalEmail;
 const ASSISTANT = SYNTHETIC_IDENTITY.assistantEmail;
@@ -16,7 +19,9 @@ const json = (value: unknown, status = 200): Response =>
   new Response(JSON.stringify(value), { status, headers: { 'content-type': 'application/json' } });
 
 /** All Google HTTP requests stop here; the native token and API clients still run. */
-export async function installSyntheticGoogle(root: string): Promise<{ calendar: FakeCalendar; mail: GmailMessage[] }> {
+export async function installSyntheticGoogle(
+  root: string,
+): Promise<{ calendar: FakeCalendar; mail: GmailMessage[]; gmail: SyntheticGmailTransport }> {
   const { FakeCalendar: Calendar } = await import('../../../src/modules/gws-ea-meetings/testing/fake-calendar.js');
   const { GOOGLE_SERVICES, GOOGLE_GRANT_FILE_ENV } = await import('../../../src/modules/gws-ea-google/grant.js');
   const calendar = new Calendar();
@@ -36,6 +41,7 @@ export async function installSyntheticGoogle(root: string): Promise<{ calendar: 
   const fixture = JSON.parse(fs.readFileSync(path.join(root, 'fixture.json'), 'utf8')) as FixtureState;
   for (const event of fixture.events) calendar.put(event);
   const mail = fixture.mail;
+  const gmail = new SyntheticGmailTransport(mail);
   const grant = path.join(root, 'synthetic-google-grant.json');
   fs.writeFileSync(
     grant,
@@ -66,87 +72,97 @@ export async function installSyntheticGoogle(root: string): Promise<{ calendar: 
     }
     if (url.hostname !== 'www.googleapis.com' && url.hostname !== 'gmail.googleapis.com')
       throw new Error(`Synthetic host refused external network: ${url.hostname}`);
-    const parts = url.pathname.split('/').filter(Boolean).map(decodeURIComponent);
-    if (url.pathname.endsWith('/calendarList'))
-      return json({
-        items: [...calendar.calendars.values()].map((entry) => ({
-          ...entry,
-          conferenceProperties: { allowedConferenceSolutionTypes: entry.conferenceTypes },
-        })),
-      });
-    const calendarListIndex = parts.indexOf('calendarList');
-    if (calendarListIndex >= 0) {
-      const entry = calendar.calendars.get(parts[calendarListIndex + 1] ?? '');
-      return json(
-        entry
-          ? {
-              ...entry,
-              conferenceProperties: { allowedConferenceSolutionTypes: entry.conferenceTypes },
-            }
-          : { error: 'Calendar not found' },
-        entry ? 200 : 404,
+    const before = { writes: calendar.writes.length, mail: mail.length };
+    try {
+      const response = url.pathname.startsWith('/calendar/v3/')
+        ? await calendarTransport(calendar, url, init)
+        : url.pathname.startsWith('/gmail/v1/users/me/')
+          ? await gmail.request(url, init)
+          : undefined;
+      if (!response) throw new Error(`Unimplemented synthetic Google operation: ${url.pathname}`);
+      fs.appendFileSync(
+        path.join(root, 'google-http.jsonl'),
+        JSON.stringify({
+          method: init?.method ?? 'GET',
+          path: url.pathname,
+          query: url.search,
+          ifMatch: new Headers(init?.headers).get('if-match'),
+          status: response.status,
+        }) + '\n',
       );
-    }
-    const calendarIndex = parts.indexOf('calendars');
-    if (calendarIndex >= 0) {
-      const id = parts[calendarIndex + 1] ?? '';
-      if (parts[calendarIndex + 2] !== 'events')
-        return json(
-          calendar.calendars.get(id) ?? { error: 'Calendar not found' },
-          calendar.calendars.has(id) ? 200 : 404,
-        );
-      const eventId = parts[calendarIndex + 3];
-      if (init?.method && init.method !== 'GET')
-        throw new Error('This initial native transport has no Google write fixture. No write was made.');
-      if (eventId) {
-        const event = calendar.event(id, eventId);
-        return json(event ? googleEvent(event) : { error: 'Event not found' }, event ? 200 : 404);
+      return response;
+    } catch (error) {
+      fs.appendFileSync(
+        path.join(root, 'google-http.jsonl'),
+        JSON.stringify({
+          method: init?.method ?? 'GET',
+          path: url.pathname,
+          query: url.search,
+          ifMatch: new Headers(init?.headers).get('if-match'),
+          transportFailure: String(error),
+          appliedCalendarWrites: calendar.writes.length - before.writes,
+          storedMail: mail.length - before.mail,
+        }) + '\n',
+      );
+      throw error;
+    } finally {
+      const state = JSON.parse(fs.readFileSync(path.join(root, 'fixture.json'), 'utf8')) as FixtureState;
+      if (state.scenario) {
+        for (const write of calendar.writes.slice(before.writes)) {
+          const { tags: _tags, conference, ...fields } = write.fields ?? {};
+          state.effects.push({
+            kind: 'event',
+            operation: write.op,
+            target: write.op === 'insert' ? write.calendarId : `${write.calendarId}/${write.eventId}`,
+            payload: {
+              sendUpdates: write.sendUpdates,
+              ...fields,
+              ...(conference ? { videoCall: true } : {}),
+              ...(write.guests ? { guests: write.guests } : {}),
+            },
+            actor: state.scenario.audience,
+            attempt: state.attempt,
+          });
+        }
+        for (const message of mail.slice(before.mail)) {
+          const parsed = parseGmailMessage(message);
+          state.effects.push({
+            kind: 'message',
+            operation: 'send',
+            target: [...parsed.to, ...parsed.cc].every((entry) => entry.address === PRINCIPAL)
+              ? 'principal'
+              : 'outward',
+            payload: {
+              to: parsed.to.map((entry) => entry.address),
+              cc: parsed.cc.map((entry) => entry.address),
+              subject: parsed.subject,
+              text: parsed.text,
+            },
+            actor: state.scenario.audience,
+            attempt: state.attempt,
+          });
+        }
+        state.events = [...calendar.events];
+        state.mail = mail;
+        fs.writeFileSync(path.join(root, 'fixture.json'), JSON.stringify(state, null, 2));
       }
-      const min = url.searchParams.get('timeMin');
-      const max = url.searchParams.get('timeMax');
-      const events = min && max ? await calendar.listEvents(id, min, max) : calendar.live(id);
-      return json({ items: events.map((event) => googleEvent(event as StoredEvent)) });
     }
-    if (init?.method && init.method !== 'GET')
-      throw new Error('This native fixture has no Gmail send/write transport. No email was sent.');
-    const messages = parts.indexOf('messages');
-    const threads = parts.indexOf('threads');
-    if (messages >= 0) {
-      const id = parts[messages + 1];
-      if (id) {
-        const message = mail.find((entry) => entry.id === id);
-        return json(message ?? { error: 'Message not found' }, message ? 200 : 404);
-      }
-      return json({ messages: mail.map(({ id, threadId }) => ({ id, threadId })), resultSizeEstimate: mail.length });
-    }
-    if (threads >= 0) {
-      const id = parts[threads + 1];
-      return json({ id, messages: mail.filter((message) => message.threadId === id) });
-    }
-    throw new Error(`Unimplemented synthetic Google read: ${url.pathname}`);
   };
-  return { calendar, mail };
-}
-function googleEvent(event: StoredEvent): Readonly<Record<string, unknown>> {
-  const { calendarId: _calendar, tags, conference, ...fields } = event;
-  return {
-    ...fields,
-    ...(tags ? { extendedProperties: { private: tags } } : {}),
-    ...(conference?.uri ? { conferenceData: { entryPoints: [{ entryPointType: 'video', uri: conference.uri }] } } : {}),
-  };
+  return { calendar, mail, gmail };
 }
 
 export async function serveNativeHost(
   root: string,
   session: Session,
-  calendar: FakeCalendar,
-  mail: GmailMessage[],
+  google: Awaited<ReturnType<typeof installSyntheticGoogle>>,
 ): Promise<void> {
+  const { calendar, mail } = google;
   const { dispatch } = await import('../../../src/cli/dispatch.js');
   const { parseArgv } = await import('../../../src/cli/parse-argv.js');
   const { formatResponse } = await import('../../../src/cli/format.js');
-  const { getDeliveryAction } = await import('../../../src/delivery.js');
-  const { inboundDbPath } = await import('../../../src/mailbox/sqlite/paths.js');
+  const { getDeliveryAction, deliverSessionMessages } = await import('../../../src/delivery.js');
+  const { getMessagingGroup } = await import('../../../src/db/messaging-groups.js');
+  const { inboundDbPath, outboundDbPath } = await import('../../../src/mailbox/sqlite/paths.js');
   const { getDb } = await import('../../../src/db/connection.js');
   const { createOutboundRecord, parseOutboundWrite } = await import('../../../src/mailbox/model.js');
   const Database = (await import('better-sqlite3')).default;
@@ -192,6 +208,8 @@ export async function serveNativeHost(
     observedAt: new Date().toISOString(),
     calendars: [...calendar.calendars.values()],
     events: calendar.events,
+    calendarWrites: calendar.writes,
+    calendarWriteLog: await getDb().all('SELECT * FROM gws_ea_calendar_write_log'),
     mail,
     session,
     chat: session.messaging_group_id
@@ -199,6 +217,10 @@ export async function serveNativeHost(
       : undefined,
     principalAddresses: await getDb().all('SELECT * FROM gws_ea_principal_addresses'),
     matters: await getDb().all('SELECT * FROM gws_ea_matters'),
+    bookings: await getDb().all('SELECT * FROM gws_ea_bookings'),
+    bookingRequests: await getDb().all('SELECT * FROM gws_ea_booking_requests'),
+    threadSends: await getDb().all('SELECT * FROM gws_ea_thread_sends'),
+    threadMessages: await getDb().all('SELECT * FROM gws_ea_thread_messages'),
     people: await Promise.all((await listPeople()).map((person) => getPerson(person.id))),
     whereabouts: await getWhereabouts(),
     manual: await getManualSections(),
@@ -264,6 +286,58 @@ export async function serveNativeHost(
         } finally {
           db.close();
         }
+      } else if (body.method === 'deliver') {
+        const route = session.messaging_group_id ? await getMessagingGroup(session.messaging_group_id) : undefined;
+        if (route?.channel_type !== 'email' || session.thread_id === null || typeof body.args.messageId !== 'string')
+          throw new Error('Only the native email session can use this synthetic delivery transport');
+        const outbox = new Database(outboundDbPath(session.agent_group_id, session.id));
+        try {
+          outbox
+            .prepare(
+              `INSERT OR IGNORE INTO messages_out (id,timestamp,kind,platform_id,channel_type,thread_id,content)
+            VALUES (?,?,'chat',?,'email',?,?)`,
+            )
+            .run(
+              body.args.messageId,
+              new Date().toISOString(),
+              route.platform_id,
+              session.thread_id,
+              JSON.stringify(body.args.content),
+            );
+        } finally {
+          outbox.close();
+        }
+        await deliverSessionMessages(session);
+        const inbox = new Database(inboundDbPath(session.agent_group_id, session.id), { readonly: true });
+        try {
+          const receipt = inbox.prepare('SELECT * FROM delivered WHERE message_out_id=?').get(body.args.messageId) as
+            | { status: string }
+            | undefined;
+          if (receipt?.status !== 'delivered')
+            throw new Error(`Native email delivery is ${receipt?.status ?? 'pending'}`);
+          value = { receipt };
+        } finally {
+          inbox.close();
+        }
+      } else if (body.method === 'transport-fault') {
+        if (body.args.op === 'mail-after-send') google.gmail.failAfterNextSend = true;
+        else if (body.args.op === 'insert-after-write')
+          calendar.failNext({
+            op: 'insert',
+            afterApplying: true,
+            error: new Error('Synthetic Calendar insert response lost after storing'),
+          });
+        else if (body.args.op === 'calendar-after-write') {
+          const op = body.args.write;
+          if (op !== 'patch' && op !== 'delete' && op !== 'guests' && op !== 'own')
+            throw new Error('Unknown synthetic Calendar write fault');
+          calendar.failNext({
+            op,
+            afterApplying: true,
+            error: new Error(`Synthetic Calendar ${op} response lost after storing`),
+          });
+        } else throw new Error('Unknown synthetic transport fault');
+        value = { armed: true };
       } else if (body.method === 'outbound') {
         const state = JSON.parse(fs.readFileSync(fixtureFile, 'utf8')) as FixtureState;
         const sequence = state.outbound.length * 2 + 1;
@@ -285,6 +359,7 @@ export async function serveNativeHost(
       fs.appendFileSync(observations, JSON.stringify({ method: body.method, input: body.args, result: value }) + '\n');
       response.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ ok: true, value }));
     } catch (error) {
+      save();
       fs.appendFileSync(
         observations,
         JSON.stringify({ method: body.method, input: body.args, error: String(error) }) + '\n',
