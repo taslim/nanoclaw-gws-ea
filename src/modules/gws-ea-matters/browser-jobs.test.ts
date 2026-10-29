@@ -12,6 +12,8 @@ vi.mock('../../config.js', async (original) => ({
 import { closeDb, createAgentGroup, getDb, initTestDb, runMigrations } from '../../db/index.js';
 import { resolveSystemSession, withExistingMailboxSession } from '../../session-manager.js';
 import '../gws-ea-profile/index.js';
+import '../gws-ea-privacy/index.js';
+import '../gws-ea-whereabouts/index.js';
 import { createBrowserQueue, getBrowserRuntime, recoverAndStartBrowserQueue } from '../gws-ea-browser/index.js';
 import { BrowserStore, browserRequestId } from '../gws-ea-browser/db.js';
 import { readBrowserJob } from '../gws-ea-browser/cancel.js';

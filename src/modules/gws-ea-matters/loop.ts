@@ -42,7 +42,9 @@ import {
   type HeldSlot,
 } from './looks.js';
 import { keepSync, unplacedThreadLine } from './sync.js';
-import { principalTimezone } from './render.js';
+import { TIMEZONE } from '../../config.js';
+import { loadTimeline, zoneAt, type Timeline } from '../gws-ea-whereabouts/timeline.js';
+import { anchorPendingTasks, rememberHostRetry } from './anchors.js';
 
 const PASS_MS = 60_000;
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -52,10 +54,14 @@ async function handBackMattersWithoutALook(
   conversation: Session,
   sync: string,
   slots: readonly HeldSlot[],
+  timeline: Timeline,
 ): Promise<void> {
   for (const { slot, held } of slots) {
     if (stillToCome(held?.task)) continue;
-    await setLook(conversation, slot.id, slot.look_task_id, { kind: 'once', at: sync }, true);
+    await setLook(conversation, slot.id, slot.look_task_id, { kind: 'once', at: sync }, true, {
+      timeline,
+      zone: zoneAt(timeline, Date.parse(sync)) ?? TIMEZONE,
+    });
   }
 }
 
@@ -98,6 +104,7 @@ async function bringFailedRepeatsForward(sync: string, slots: readonly HeldSlot[
       )) ??
       // A conversation whose mailbox is gone has no runs to read and no look to move: only the marks count.
       repeats.filter(({ slot }) => slot.look_failed_at !== null);
+    for (const { key } of failed) await rememberHostRetry(session, key);
     // Each mark is cleared once its look has come forward.
     for (const { slot } of failed) if (slot.look_failed_at !== null) await markLookFailed(slot.id, null);
   }
@@ -123,7 +130,7 @@ async function cancelStrayLooks(): Promise<void> {
  * be read in `conversation`. Its id comes from the threads and the notes
  * before it, so a pass that wrote it and failed to record it writes no other.
  */
-async function remindOfUnplacedThreads(conversation: Session): Promise<void> {
+async function remindOfUnplacedThreads(conversation: Session, timeline: Timeline): Promise<void> {
   const threads = await listUnplacedThreads();
   if (threads.length === 0) return;
   const asked = threads.flatMap((thread) => (thread.placementNote === null ? [] : [thread.placementNote]));
@@ -137,14 +144,13 @@ async function remindOfUnplacedThreads(conversation: Session): Promise<void> {
     .update(threads.map((thread) => `${thread.threadKey}\u0000${thread.placementNote ?? ''}`).join('\u0000'))
     .digest('hex')
     .slice(0, 24)}`;
-  const timezone = await principalTimezone();
   const written = await writeNoteForMain({
     id,
     timestamp: new Date().toISOString(),
     wake: false,
     text: [
       'Email threads you have not placed are waiting on you, and external-email reads none of their mail until you place each one and hand it over:',
-      ...threads.map((thread) => unplacedThreadLine(thread, timezone)),
+      ...threads.map((thread) => unplacedThreadLine(thread, timeline)),
     ].join('\n'),
   });
   if (written === 'written' || written === 'already-written') {
@@ -155,21 +161,35 @@ async function remindOfUnplacedThreads(conversation: Session): Promise<void> {
   }
 }
 
+async function isolated(step: string, work: () => Promise<void>): Promise<void> {
+  try {
+    await work();
+    // eslint-disable-next-line no-catch-all/no-catch-all -- a durable step resumes next pass without starving the other guarantees.
+  } catch (error) {
+    log.warn('Matters step failed; it will resume next pass', { step, err: error });
+  }
+}
+
 /** Nothing to keep until main and the principal's conversation exist. */
 export function keepMattersOnTime(): Promise<void> {
   return oneAtATime(async () => {
     const conversation = await mainConversation();
     if (conversation === undefined) return;
-    const sync = await keepSync(conversation);
+    await isolated('anchors', async () => anchorPendingTasks(await loadTimeline()));
+    let sync: string | undefined;
+    await isolated('sync', async () => {
+      sync = await keepSync(conversation);
+    });
     const idle = (await mainConversations()).every((session) => !isContainerRunning(session.id));
-    if (idle) {
-      // Step 2 acts on looks that will not come back, step 3 on ones still to come: one read serves both.
-      const slots = await listHeldLookSlots();
-      await handBackMattersWithoutALook(conversation, sync, slots);
-      await bringFailedRepeatsForward(sync, slots);
+    if (idle && sync !== undefined) {
+      const at = sync;
+      await isolated('missing looks', async () =>
+        handBackMattersWithoutALook(conversation, at, await listHeldLookSlots(), await loadTimeline()),
+      );
+      await isolated('failed repeats', async () => bringFailedRepeatsForward(at, await listHeldLookSlots()));
     }
-    await cancelStrayLooks();
-    await remindOfUnplacedThreads(conversation);
+    await isolated('stray looks', cancelStrayLooks);
+    await isolated('unplaced threads', async () => remindOfUnplacedThreads(conversation, await loadTimeline()));
   });
 }
 

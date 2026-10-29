@@ -132,3 +132,16 @@ export const gwsEaMatterPlanningMigration: ModuleMigration = {
     `);
   },
 };
+
+export const gwsEaTimeAnchorsMigration: ModuleMigration = {
+  version: 1,
+  name: 'module:gws-ea-matters:time-anchors',
+  async up(db) {
+    await db.exec(`CREATE TABLE gws_ea_time_anchors (
+      session_id TEXT NOT NULL,
+      series_id TEXT NOT NULL,
+      anchor TEXT NOT NULL,
+      PRIMARY KEY (session_id,series_id)
+    )`);
+  },
+};

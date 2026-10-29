@@ -38,15 +38,23 @@ import {
   gwsEaMatterJobsMigration,
   gwsEaMatterChatsMigration,
   gwsEaMatterPlanningMigration,
+  gwsEaTimeAnchorsMigration,
 } from './migration.js';
 import { parseNextLook, type NextLook } from './next-look.js';
-import { principalTimezone, renderMatter } from './render.js';
+import { renderMatter } from './render.js';
+import { TIMEZONE } from '../../config.js';
+import { loadTimeline, zoneAt, zoneForDay, type Timeline } from '../gws-ea-whereabouts/timeline.js';
+import { registerPendingClockReader } from '../gws-ea-whereabouts/changes.js';
+import { pendingLocalItems, setTaskClock } from './anchors.js';
+import { oneAtATime } from './looks.js';
 import { syncVerdict, todayVerdict } from './sync.js';
 
 registerMigration(gwsEaMattersMigration);
 registerMigration(gwsEaMatterJobsMigration);
 registerMigration(gwsEaMatterChatsMigration);
 registerMigration(gwsEaMatterPlanningMigration);
+registerMigration(gwsEaTimeAnchorsMigration);
+registerPendingClockReader(pendingLocalItems);
 
 onHostStart(async ({ signal }) => {
   await cancelClosedMatterJobs();
@@ -118,11 +126,28 @@ function parentFrom(args: Record<string, unknown>): string | null | undefined {
 }
 
 /** Checked before anything is written. */
-async function nextLookFrom(args: Record<string, unknown>): Promise<NextLook | undefined> {
-  return parseNextLook(
-    { at: optionalString(args.look), cron: optionalString(args.look_cron) },
-    await principalTimezone(),
-  );
+function nextLookFrom(args: Record<string, unknown>, timeline: Timeline): { look: NextLook | undefined; zone: string } {
+  const at = optionalString(args.look);
+  const cron = optionalString(args.look_cron);
+  if (args.fixed === true && at === undefined && cron === undefined)
+    throw new Error('--fixed accompanies --look or --look-cron');
+  if (at === undefined && cron === undefined) return { look: undefined, zone: TIMEZONE };
+  const date = at?.trim().slice(0, 10);
+  const localZone =
+    date && /^\d{4}-\d{2}-\d{2}$/u.test(date) ? zoneForDay(timeline, date) : zoneAt(timeline, Date.now());
+  const offset = at === undefined ? undefined : /(Z|[+-]\d{2}:?\d{2})$/u.exec(at.trim())?.[1];
+  const explicitZone =
+    offset === undefined
+      ? undefined
+      : offset === 'Z'
+        ? 'UTC'
+        : offset.length === 5
+          ? `${offset.slice(0, 3)}:${offset.slice(3)}`
+          : offset;
+  if (localZone === null && !(args.fixed === true && explicitZone !== undefined))
+    throw new Error('The zone in effect for this look is unknown; record the stay’s zone before setting a local look');
+  const zone = explicitZone ?? localZone ?? 'UTC';
+  return { look: parseNextLook({ at, cron }, zone), zone };
 }
 
 const ID_ARG: ColumnDef = {
@@ -148,6 +173,7 @@ const PARENT_ARG: ColumnDef = {
     'The project this is a strand of, by id. Strands go one level deep: a strand cannot be a project, and a project cannot be a strand.',
 };
 const LOOK_ARGS: ColumnDef[] = [
+  { name: 'fixed', type: 'boolean', description: 'Keep this look on its original zone clock through travel.' },
   {
     name: 'look',
     type: 'string',
@@ -269,7 +295,8 @@ registerResource({
       ],
       handler: async (args, ctx) =>
         asMain(ctx, async () => {
-          const look = await nextLookFrom(args);
+          const timeline = await loadTimeline();
+          const { look, zone } = nextLookFrom(args, timeline);
           if (look === undefined) throw new Error('A matter opens with its next look: give --look or --look-cron');
           return openMatterWithLook(
             {
@@ -280,6 +307,7 @@ registerResource({
               ...planningFrom(args),
             },
             look,
+            { timeline, zone, fixed: args.fixed === true },
           );
         }),
     },
@@ -343,7 +371,8 @@ registerResource({
       ],
       handler: async (args, ctx) =>
         asMain(ctx, async () => {
-          const look = await nextLookFrom(args);
+          const timeline = await loadTimeline();
+          const { look, zone } = nextLookFrom(args, timeline);
           return updateMatterAndLook(
             {
               id: requiredString(args, 'id'),
@@ -355,6 +384,7 @@ registerResource({
               ...planningFrom(args),
             },
             look,
+            { timeline, zone, fixed: args.fixed === true },
           );
         }),
     },
@@ -431,4 +461,32 @@ registerResource({
         asMain(ctx, async () => (args.closed === true ? listClosedMatters() : listOpenMatters())),
     },
   },
+});
+
+registerResource({
+  name: 'clock',
+  plural: 'clock',
+  table: 'gws_ea_time_anchors',
+  idColumn: 'series_id',
+  description:
+    "Main's reminder and look clocks: local follows the principal; fixed keeps the moment in its original zone.",
+  columns: [],
+  operations: {},
+  customOperations: Object.fromEntries(
+    (['fixed', 'local'] as const).map((mode) => [
+      mode,
+      {
+        access: 'open' as const,
+        description:
+          mode === 'fixed'
+            ? 'Restore and keep the instant the original zone clock names.'
+            : 'Follow the local clock through stays.',
+        args: [{ name: 'task', type: 'string' as const, required: true, description: 'Task series id.' }],
+        handler: async (args: Record<string, unknown>, ctx: CallerContext) =>
+          asMain(ctx, () =>
+            oneAtATime(async () => setTaskClock(requiredString(args, 'task'), mode === 'fixed', await loadTimeline())),
+          ),
+      },
+    ]),
+  ),
 });

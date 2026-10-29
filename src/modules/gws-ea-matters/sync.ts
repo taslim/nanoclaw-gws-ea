@@ -42,10 +42,10 @@ import {
   type HeldTask,
   type ScriptVerdict,
 } from './looks.js';
-import { principalTimezone } from './render.js';
 import type { Matter } from './db.js';
-import { loadTimeline } from '../gws-ea-whereabouts/timeline.js';
-import { matterNeedsTimeline, matterPlanningLines } from './planning.js';
+import { TIMEZONE } from '../../config.js';
+import { loadTimeline, zoneAt, type Timeline } from '../gws-ea-whereabouts/timeline.js';
+import { matterPlanningLines } from './planning.js';
 
 const SYNC_TASK_NAME = 'gws-ea daily sync';
 const SYNC_SLUG = taskNameSlug(SYNC_TASK_NAME);
@@ -115,6 +115,7 @@ async function createSync(
     timezone,
     ...(processAfter === undefined ? {} : { processAfter }),
   });
+  prepared.clock = { instant: prepared.processAfter, zone: timezone };
   await createScheduledTask(conversation.agent_group_id, prepared, { session: conversation });
   return prepared.processAfter;
 }
@@ -179,7 +180,8 @@ function sectionLines(section: ScriptSection): string[] {
 }
 
 /** The one line main reads for a thread waiting to be placed, wherever it is shown one. */
-export function unplacedThreadLine(thread: UnplacedThread, timezone: string): string {
+export function unplacedThreadLine(thread: UnplacedThread, timeline: Timeline): string {
+  const timezone = zoneAt(timeline, Date.parse(thread.latestAt)) ?? TIMEZONE;
   return [
     `- ${thread.threadKey}: ${thread.people.join(', ')}`,
     `latest mail ${formatLocalTime(thread.latestAt, timezone)}`,
@@ -187,10 +189,10 @@ export function unplacedThreadLine(thread: UnplacedThread, timezone: string): st
   ].join('; ');
 }
 
-function unplacedSection(threads: readonly UnplacedThread[], timezone: string): ScriptSection {
+function unplacedSection(threads: readonly UnplacedThread[], timeline: Timeline): ScriptSection {
   return {
     heading: 'Threads waiting to be placed',
-    lines: threads.map((thread) => unplacedThreadLine(thread, timezone)),
+    lines: threads.map((thread) => unplacedThreadLine(thread, timeline)),
   };
 }
 
@@ -206,7 +208,8 @@ async function unreadNotes(): Promise<number> {
   return count;
 }
 
-async function morningRundowns(timezone: string): Promise<string[]> {
+async function morningRundowns(timeline: Timeline): Promise<string[]> {
+  const timezone = zoneAt(timeline, Date.now()) ?? TIMEZONE;
   const today = localDay(new Date().toISOString(), timezone);
   const times: string[] = [];
   for (const session of await mainConversations()) {
@@ -217,29 +220,34 @@ async function morningRundowns(timezone: string): Promise<string[]> {
       const at = task.processAfter;
       if (
         at === null ||
-        localDay(at, timezone) !== today ||
+        localDay(at, zoneAt(timeline, Date.parse(at)) ?? timezone) !== today ||
         parseTaskContent(task.content).script?.trim() !== 'ncl matters today'
       )
         continue;
       const hour = Number(
-        new Intl.DateTimeFormat('en-US', { timeZone: timezone, hour: 'numeric', hourCycle: 'h23' }).format(
-          new Date(at),
-        ),
+        new Intl.DateTimeFormat('en-US', {
+          timeZone: zoneAt(timeline, Date.parse(at)) ?? timezone,
+          hour: 'numeric',
+          hourCycle: 'h23',
+        }).format(new Date(at)),
       );
       if (hour < 12) times.push(at);
     }
   }
-  return times.sort().map((at) => `Morning rundown: ${formatLocalTime(at, timezone)}.`);
+  return times
+    .sort()
+    .map((at) => `Morning rundown: ${formatLocalTime(at, zoneAt(timeline, Date.parse(at)) ?? timezone)}.`);
 }
 
 export async function syncVerdict(): Promise<ScriptVerdict> {
-  const timezone = await principalTimezone();
+  const timeline = await loadTimeline();
+  const timezone = zoneAt(timeline, Date.now()) ?? TIMEZONE;
   const [notes, unplaced, sync, looks, rundowns] = await Promise.all([
     unreadNotes(),
     listUnplacedThreads(),
     findSync(),
     looksBefore(nextRun('0 0 * * *', timezone)),
-    morningRundowns(timezone),
+    morningRundowns(timeline),
   ]);
   // The occurrence running now is still pending and due; a call at any other
   // time reads tomorrow's row, which starts nothing yet.
@@ -248,7 +256,10 @@ export async function syncVerdict(): Promise<ScriptVerdict> {
     at !== undefined &&
     at !== null &&
     Date.parse(at) <= Date.now() &&
-    new Intl.DateTimeFormat('en-US', { timeZone: timezone, weekday: 'long' }).format(new Date(at)) === 'Monday';
+    new Intl.DateTimeFormat('en-US', {
+      timeZone: zoneAt(timeline, Date.parse(at)) ?? timezone,
+      weekday: 'long',
+    }).format(new Date(at)) === 'Monday';
   const later = looks.filter((look) => Date.parse(look.at) > Date.now());
   const unread =
     notes === 0
@@ -262,13 +273,16 @@ export async function syncVerdict(): Promise<ScriptVerdict> {
     wakeAgent: true,
     data: [
       ...unread,
-      ...(unplaced.length === 0 ? [] : sectionLines(unplacedSection(unplaced, timezone))),
+      ...(unplaced.length === 0 ? [] : sectionLines(unplacedSection(unplaced, timeline))),
       ...(startsWeek ? [`This sync starts the week: Monday in ${timezone}.`] : []),
       ...(later.length === 0
         ? []
         : sectionLines({
             heading: 'Later looks today',
-            lines: later.map((look) => `- ${look.matterId}, ${formatLocalTime(look.at, timezone)}: ${look.title}`),
+            lines: later.map(
+              (look) =>
+                `- ${look.matterId}, ${formatLocalTime(look.at, zoneAt(timeline, Date.parse(look.at)) ?? timezone)}: ${look.title}`,
+            ),
           })),
       ...rundowns,
     ],
@@ -305,7 +319,8 @@ async function looksBefore(before: string): Promise<DueLook[]> {
  * for, main's own list to fold into a rundown built from their calendar.
  */
 export async function todayVerdict(): Promise<ScriptVerdict> {
-  const timezone = await principalTimezone();
+  const timeline = await loadTimeline();
+  const timezone = zoneAt(timeline, Date.now()) ?? TIMEZONE;
   const looks = await looksBefore(nextRun('0 0 * * *', timezone));
   const matters =
     looks.length === 0
@@ -314,7 +329,6 @@ export async function todayVerdict(): Promise<ScriptVerdict> {
           `SELECT id, due_at, needs_minutes, place, deferrals FROM gws_ea_matters WHERE id IN (${looks.map(() => '?').join(', ')})`,
           ...looks.map((look) => look.matterId),
         );
-  const timeline = matters.some(matterNeedsTimeline) ? await loadTimeline() : null;
   const facts = new Map(
     matters.map((matter) => [matter.id, matterPlanningLines(matter, timeline, timezone).join(' ')] as const),
   );
@@ -325,7 +339,8 @@ export async function todayVerdict(): Promise<ScriptVerdict> {
       lines: looks
         .filter((look) => !look.handedBack)
         .map(
-          (look) => `- ${look.matterId}, ${formatLocalTime(look.at, timezone)}: ${look.title}${suffix(look.matterId)}`,
+          (look) =>
+            `- ${look.matterId}, ${formatLocalTime(look.at, zoneAt(timeline, Date.parse(look.at)) ?? timezone)}: ${look.title}${suffix(look.matterId)}`,
         ),
     },
     {
@@ -334,7 +349,7 @@ export async function todayVerdict(): Promise<ScriptVerdict> {
         .filter((look) => look.handedBack)
         .map((look) => `- ${look.matterId}: ${look.title}${suffix(look.matterId)}`),
     },
-    unplacedSection(await listUnplacedThreads(), timezone),
+    unplacedSection(await listUnplacedThreads(), timeline),
   ];
   return { wakeAgent: true, data: sections.flatMap(sectionLines) };
 }

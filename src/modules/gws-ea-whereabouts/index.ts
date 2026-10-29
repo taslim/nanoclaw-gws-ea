@@ -1,6 +1,9 @@
 import { registerResource, type ColumnDef } from '../../cli/crud.js';
 import { getDb } from '../../db/connection.js';
 import { registerMigration } from '../../db/migrations/index.js';
+import { pendingClockItems } from './changes.js';
+// Formatting only: this helper reads no inbox data and starts no domain lifecycle.
+import { untrusted } from '../gws-ea-inbox/untrusted.js';
 import { assertMainCaller } from '../gws-ea-profile/db.js';
 import {
   addPlace,
@@ -64,6 +67,19 @@ registerResource({
       access: 'open',
       description: 'Read stored whereabouts, one timeline snapshot and missing durable facts.',
       args: [],
+      formatHuman: (value) => {
+        return JSON.stringify(value, function (this: Record<string, unknown>, key: string, field: unknown): unknown {
+          const calendar =
+            this.source === 'calendar' ||
+            this.derived === true ||
+            this.derived === 1 ||
+            typeof this.sourceEventId === 'string' ||
+            (Array.isArray(this.sourceEventIds) && this.sourceEventIds.length > 0);
+          return key === 'locality' && typeof field === 'string' && calendar
+            ? untrusted(field, field.length, 'calendar locality')
+            : field;
+        });
+      },
       handler: async (_args, ctx) => {
         await assertMainCaller(ctx, 'whereabouts');
         return getDb().transaction(async () => {
@@ -178,7 +194,7 @@ registerResource({
       ],
       handler: async (args, ctx) => {
         await assertMainCaller(ctx, 'whereabouts');
-        return addStay({
+        const stay = await addStay({
           id: optional(args, 'id'),
           placeId: optional(args, 'place'),
           locality: optional(args, 'locality'),
@@ -191,6 +207,7 @@ registerResource({
           sourceEventId: optional(args, 'event'),
           sourceVersion: optional(args, 'source_version'),
         });
+        return { ...stay, pending_local_items: await pendingClockItems(await loadTimeline()) };
       },
     },
     'stay dismiss': {

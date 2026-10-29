@@ -19,6 +19,7 @@ import { reconcileSession } from '../../../reconcile-session.js';
 import { resolveSession, withExistingMailboxSession } from '../../../session-manager.js';
 import type { Session } from '../../../types.js';
 import { bindVerifiedPrincipalUser } from '../../gws-ea-profile/db.js';
+import { gwsEaWhereaboutsMigration } from '../../gws-ea-whereabouts/migration.js';
 import { gwsEaPrincipalDmRoutingMigration } from '../../gws-ea-profile/migration.js';
 import { upsertUserDm } from '../../permissions/db/user-dms.js';
 import { upsertUser } from '../../permissions/db/users.js';
@@ -29,13 +30,14 @@ const DIRECT_MESSAGE = 'mg-dm';
 
 /** Main in `timezone`, named by the profile, and the principal's direct message: what a look comes back to. */
 export async function seedMain(timezone: string): Promise<void> {
-  await runMigrations(getDb(), [gwsEaPrincipalDmRoutingMigration]);
+  await runMigrations(getDb(), [gwsEaPrincipalDmRoutingMigration, gwsEaWhereaboutsMigration]);
   const now = new Date().toISOString();
   await createAgentGroup({ id: MAIN, name: 'main', folder: MAIN, agent_provider: null, created_at: now });
   await ensureContainerConfig(MAIN);
   await updateContainerConfigScalars(MAIN, { cli_scope: 'global', timezone });
   await getDb().run(
-    `UPDATE gws_ea_profile SET assistant_first_name=COALESCE(assistant_first_name,'Juno'),principal_first_name=COALESCE(principal_first_name,'Morgan'),main_agent_group_id = ? WHERE singleton = 1`,
+    `UPDATE gws_ea_profile SET assistant_first_name=COALESCE(assistant_first_name,'Juno'),principal_first_name=COALESCE(principal_first_name,'Morgan'),principal_timezone = ?,main_agent_group_id = ? WHERE singleton = 1`,
+    timezone,
     MAIN,
   );
   await createMessagingGroup({
