@@ -21,7 +21,8 @@ export interface TimelineStay {
   readonly ids: readonly string[];
   readonly sourceEventIds: readonly string[];
   readonly placeId: string | null;
-  readonly locality: string;
+  /** Null for a stay known only by its zone, such as one derived from a flight. */
+  readonly locality: string | null;
   readonly zone: string | null;
   readonly start: number;
   readonly end: number | null;
@@ -35,7 +36,6 @@ export interface TimelineLeg {
   readonly arrival: number;
   readonly departureZone: string;
   readonly destinationZone: string | null;
-  readonly locality: string;
   readonly returnUnknown: boolean;
 }
 export interface Timeline {
@@ -61,16 +61,16 @@ export interface WhereaboutsAt {
   readonly leg: TimelineLeg | null;
 }
 
-/** Store bounds resolve against the saved place's current zone, including home's live profile zone. */
+/** Store bounds resolve against `places` as `loadTimeline` resolves them, with home on the live profile zone. */
 export function resolveStay(stay: Stay, places: readonly Place[], homeZone: string | null): TimelineStay {
   const place = places.find((p) => p.id === stay.place_id);
-  const zone = place ? (place.is_home ? homeZone : place.zone) : stay.zone;
+  const zone = place ? place.zone : stay.zone;
   const boundaryZone = zone ?? homeZone ?? 'UTC';
   return {
     ids: [stay.id],
     sourceEventIds: stay.source_event_id ? [stay.source_event_id] : [],
     placeId: stay.place_id,
-    locality: place?.locality ?? stay.locality ?? 'place unknown',
+    locality: place?.locality ?? stay.locality,
     zone,
     start: boundary(stay.start, boundaryZone, 'start'),
     end: stay.end === null ? null : boundary(stay.end, boundaryZone, 'end'),
@@ -82,12 +82,17 @@ export function resolveStay(stay: Stay, places: readonly Place[], homeZone: stri
 
 const endOf = (stay: TimelineStay): number => stay.end ?? Number.POSITIVE_INFINITY;
 
+/** A stay known only by its zone agrees with any locality in that zone. */
+function sameLocality(a: string | null, b: string | null): boolean {
+  return a === null || b === null || a.toLocaleLowerCase() === b.toLocaleLowerCase();
+}
+
 function mergeStays(values: readonly TimelineStay[]): TimelineStay[] {
   const result: TimelineStay[] = [];
   for (const value of [...values].sort((a, b) => a.start - b.start || endOf(a) - endOf(b))) {
     const index = result.findIndex(
       (s) =>
-        s.locality.toLocaleLowerCase() === value.locality.toLocaleLowerCase() &&
+        sameLocality(s.locality, value.locality) &&
         s.zone === value.zone &&
         s.certainty === value.certainty &&
         s.workingHours === value.workingHours &&
@@ -101,6 +106,7 @@ function mergeStays(values: readonly TimelineStay[]): TimelineStay[] {
     const held = result[index];
     result[index] = {
       ...held,
+      locality: held.locality ?? value.locality,
       ids: [...held.ids, ...value.ids],
       sourceEventIds: [...held.sourceEventIds, ...value.sourceEventIds],
       start: Math.min(held.start, value.start),
@@ -124,7 +130,10 @@ export async function loadTimeline(): Promise<Timeline> {
   return getDb().transaction(async () => {
     const raw = await getWhereabouts();
     const homeZone = (await getGwsEaProfile()).principal_timezone;
-    const places = raw.places.map((place) => ({ ...place, zone: place.is_home ? homeZone : place.zone }));
+    const places = raw.places.map((place) => ({
+      ...place,
+      zone: place.id === raw.base.home_place_id ? homeZone : place.zone,
+    }));
     const resolved = raw.stays.map((stay) => resolveStay(stay, places, homeZone));
     const legs = raw.stays
       .flatMap((stay) => {
@@ -138,9 +147,7 @@ export async function loadTimeline(): Promise<Timeline> {
             arrival: destination.start,
             departureZone: stay.departure_zone,
             destinationZone: destination.zone,
-            locality: destination.locality,
-            returnUnknown:
-              stay.end === null && (raw.base.home_place_id === null || destination.placeId !== raw.base.home_place_id),
+            returnUnknown: destination.end === null,
           },
         ];
       })
@@ -189,7 +196,7 @@ export function whereaboutsAt(timeline: Timeline, instant: number): WhereaboutsA
   }
   const zone = leg ? leg.departureZone : stay ? stay.zone : (place?.zone ?? timeline.homeZone);
   return {
-    locality: leg ? leg.departureZone : (stay?.locality ?? place?.locality ?? null),
+    locality: leg ? leg.departureZone : stay ? stay.locality : (place?.locality ?? null),
     placeId: leg ? null : stay ? stay.placeId : (place?.id ?? null),
     zone,
     zoneLabel: zone ?? 'zone unknown',
@@ -202,6 +209,30 @@ export function whereaboutsAt(timeline: Timeline, instant: number): WhereaboutsA
 
 export function zoneAt(timeline: Timeline, instant: number): string | null {
   return whereaboutsAt(timeline, instant).zone;
+}
+
+export interface ZoneSegment {
+  readonly start: number;
+  readonly end: number;
+  readonly zone: string | null;
+}
+
+/** Spans from `from` between stay and leg boundaries, each with the zone in effect at its start. */
+export function zoneSegments(timeline: Timeline, from: number): ZoneSegment[] {
+  const points = [
+    ...new Set([
+      from,
+      ...timeline.stays.flatMap((stay) => (stay.end === null ? [stay.start] : [stay.start, stay.end])),
+      ...timeline.legs.flatMap((leg) => [leg.departure, leg.arrival]),
+    ]),
+  ]
+    .filter((point) => point >= from)
+    .sort((a, b) => a - b);
+  return points.map((start, i) => ({
+    start,
+    end: points[i + 1] ?? Number.POSITIVE_INFINITY,
+    zone: zoneAt(timeline, start),
+  }));
 }
 
 /** A travel day starts on its departure clock, even if a westward arrival repeats its date. */

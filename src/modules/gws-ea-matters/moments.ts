@@ -1,6 +1,6 @@
 import { dateString, nextDate, wallClock, zonedInstant, type LocalDate } from '../gws-ea-whereabouts/clock.js';
 import { WEEKDAYS } from '../gws-ea-whereabouts/records.js';
-import { whereaboutsAt, zoneAt, type Timeline } from '../gws-ea-whereabouts/timeline.js';
+import { zoneAt, zoneSegments, type Timeline } from '../gws-ea-whereabouts/timeline.js';
 
 export interface LocalMoment {
   readonly at: number;
@@ -20,19 +20,8 @@ export function nextLocalMoment(
     ...timeline.stays.map((stay) => stay.zone),
     ...timeline.legs.map((leg) => leg.departureZone),
   ]);
-  const boundaries = [
-    ...new Set([
-      notBefore,
-      ...timeline.stays.flatMap((stay) => [stay.start, ...(stay.end === null ? [] : [stay.end])]),
-      ...timeline.legs.flatMap((leg) => [leg.departure, leg.arrival]),
-    ]),
-  ]
-    .filter((at) => at >= notBefore)
-    .sort((left, right) => left - right);
-  for (const [index, start] of boundaries.entries()) {
-    const end = boundaries[index + 1] ?? Number.POSITIVE_INFINITY;
-    const current = whereaboutsAt(timeline, start);
-    if ((current.stay || current.leg) && current.zone === null) continue;
+  for (const { start, end, zone: inEffect } of zoneSegments(timeline, notBefore)) {
+    if (inEffect === null) continue;
     let best: LocalMoment | undefined;
     for (const zone of zones) {
       if (zone === null) continue;

@@ -3,7 +3,7 @@ import { CronExpressionParser } from 'cron-parser';
 
 import { TIMEZONE } from '../../config.js';
 import { isTaskThread } from '../../db/sessions.js';
-import type { TaskClock, TaskRecord } from '../../mailbox/index.js';
+import type { TaskRecord } from '../../mailbox/index.js';
 import { resolveTaskSession, withMailboxSession } from '../../session-manager.js';
 import { parseZonedToUtc } from '../../timezone.js';
 import type { Session } from '../../types.js';
@@ -25,7 +25,6 @@ const RECURRENCE_LIMIT_WARNING =
   'this situation, you can override this with --dangerously-override-recurrence-limit';
 
 export interface PreparedScheduledTask {
-  clock: TaskClock;
   name?: string;
   prompt: string;
   recurrence: string | null;
@@ -65,12 +64,6 @@ export function parseProcessAfter(value: unknown, tz: string = TIMEZONE): string
   const date = parseZonedToUtc(value, tz);
   if (Number.isNaN(date.getTime())) throw new Error(`invalid --process-after: ${value}`);
   return date.toISOString();
-}
-
-export function scheduledTaskClock(value: unknown, timezone: string, instant: string): TaskClock {
-  const offset = typeof value === 'string' ? /(?:Z|([+-])(\d{2}):?(\d{2}))$/iu.exec(value.trim()) : null;
-  const zone = offset === null ? timezone : offset[1] === undefined ? 'UTC' : `${offset[1]}${offset[2]}:${offset[3]}`;
-  return { instant, zone };
 }
 
 export function validateRecurrence(value: string | null | undefined, tz: string = TIMEZONE): void {
@@ -134,14 +127,7 @@ export function prepareScheduledTask(input: {
     processAfter = parseProcessAfter(input.processAfter, tz);
   }
 
-  return {
-    name: input.name,
-    prompt: input.prompt,
-    recurrence,
-    script,
-    processAfter,
-    clock: scheduledTaskClock(input.processAfter, tz, processAfter),
-  };
+  return { name: input.name, prompt: input.prompt, recurrence, script, processAfter };
 }
 
 function conversationFor(agentGroupId: string, session: Session): Session {
@@ -181,7 +167,6 @@ export async function createScheduledTask(
       content: JSON.stringify({
         prompt: task.prompt,
         script: task.script,
-        clock: task.clock,
         originSessionId: options?.originSessionId ?? null,
         // The runner answers a task as a turn only when it carries this, not
         // by the session it sits in: a task ported from v1 shares a

@@ -11,7 +11,6 @@ import { deliverSessionMessages } from '../../delivery.js';
 import { outboundDbPath } from '../../mailbox/sqlite/paths.js';
 import { inboundDbPath } from '../../mailbox/sqlite/paths.js';
 import { reconcileSession } from '../../reconcile-session.js';
-import '../gws-ea-whereabouts/index.js';
 import {
   cleanChatDelivery,
   chatData,
@@ -24,22 +23,6 @@ afterEach(async () => {
   vi.useRealTimers();
   vi.mocked(requestWake).mockClear();
   await cleanChatDelivery(ROOT);
-});
-it('retains the stated offset as the reminder clock instead of normalizing its intent to UTC', async () => {
-  vi.useFakeTimers({ toFake: ['Date'] });
-  vi.setSystemTime(new Date('2026-11-08T12:00Z'));
-  const { session } = await seedChatDelivery();
-  const at = '2026-11-12T09:00:00+01:00';
-  await sendChatRequest(session, 'remind', { at, note: 'Choose the venue.' }, 'brussels-clock');
-  const db = new Database(inboundDbPath(session.agent_group_id, session.id));
-  try {
-    const task = db.prepare("SELECT content FROM messages_in WHERE kind='task'").get() as { content: string };
-    expect(JSON.parse(task.content)).toMatchObject({
-      clock: { instant: '2026-11-12T08:00:00.000Z', zone: '+01:00' },
-    });
-  } finally {
-    db.close();
-  }
 });
 it('stores a real in-conversation reminder in the calling chat and wakes that session only when it becomes due', async () => {
   const { session } = await seedChatDelivery();

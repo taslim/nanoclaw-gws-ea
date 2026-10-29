@@ -81,7 +81,6 @@ export async function addPlace(input: {
   readonly locality: string;
   readonly zone?: string;
   readonly privateValueId?: string;
-  readonly home?: boolean;
 }): Promise<Place> {
   const id = input.id === undefined ? `place-${randomUUID()}` : line(input.id, 'Place id');
   const label = line(input.label, 'Place label');
@@ -91,30 +90,27 @@ export async function addPlace(input: {
     const privateId = input.privateValueId ?? previous?.private_value_id ?? null;
     if (privateId) {
       const value = await getPrivateValue(privateId);
-      if (!value || value.kind !== 'address') throw new Error('Home must link to a stored private address');
+      if (!value || value.kind !== 'address') throw new Error('A place links only to a stored private address');
     }
-    const isHome = input.home || privateId !== null || previous?.is_home === 1;
+    const home = (await getWhereabouts()).base.home_place_id === id;
     const record: Place = {
       id,
       label,
       locality,
-      zone: isHome ? null : zone(input.zone),
+      zone: home ? null : zone(input.zone),
       private_value_id: privateId,
-      is_home: isHome ? 1 : 0,
       updated_at: now(),
     };
     await getDb().run(
-      `INSERT INTO gws_ea_places (id, label, locality, zone, private_value_id, is_home, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)
-      ON CONFLICT(id) DO UPDATE SET label=excluded.label, locality=excluded.locality, zone=excluded.zone, private_value_id=excluded.private_value_id, is_home=excluded.is_home, updated_at=excluded.updated_at`,
+      `INSERT INTO gws_ea_places (id, label, locality, zone, private_value_id, updated_at) VALUES (?, ?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET label=excluded.label, locality=excluded.locality, zone=excluded.zone, private_value_id=excluded.private_value_id, updated_at=excluded.updated_at`,
       record.id,
       record.label,
       record.locality,
       record.zone,
       record.private_value_id,
-      record.is_home,
       record.updated_at,
     );
-    await assertCertainStays();
     return record;
   });
   await signalWhereaboutsChange('place');
@@ -127,12 +123,7 @@ export async function setBase(input: { readonly placeId?: string; readonly tripS
   const result = await getDb().transaction(async () => {
     const previous = (await getWhereabouts()).base;
     const place = input.placeId === undefined ? undefined : await placeById(input.placeId);
-    if (place)
-      await getDb().run(
-        'UPDATE gws_ea_places SET is_home = 1, zone = NULL, updated_at = ? WHERE id = ?',
-        now(),
-        place.id,
-      );
+    if (place) await getDb().run('UPDATE gws_ea_places SET zone = NULL, updated_at = ? WHERE id = ?', now(), place.id);
     const record: Base = {
       ...previous,
       home_place_id: place?.id ?? previous.home_place_id,
@@ -146,7 +137,6 @@ export async function setBase(input: { readonly placeId?: string; readonly tripS
       record.trip_source,
       record.updated_at,
     );
-    await assertCertainStays();
     return record;
   });
   await signalWhereaboutsChange('base');
@@ -267,7 +257,7 @@ function conflicts(a: TimelineStay, b: TimelineStay): boolean {
   if (
     a.certainty !== 'certain' ||
     b.certainty !== 'certain' ||
-    a.locality.toLocaleLowerCase() === b.locality.toLocaleLowerCase() ||
+    (a.locality !== null && b.locality !== null && a.locality.toLocaleLowerCase() === b.locality.toLocaleLowerCase()) ||
     !a.zone ||
     !b.zone ||
     a.zone === b.zone ||
@@ -280,18 +270,19 @@ function conflicts(a: TimelineStay, b: TimelineStay): boolean {
   return !aInside && !bInside;
 }
 
-async function assertCertainStays(): Promise<void> {
+const stayName = (stay: TimelineStay): string => stay.locality ?? stay.zone ?? 'an unknown zone';
+
+/** Refuses the stay main is recording when it leaves the zone ambiguous; precedence settles every other overlap. */
+async function assertCertainStay(id: string): Promise<void> {
   const timeline = await loadTimeline();
   // Resolve the original records: merging same-locality spans must not hide a shorter nested stay.
-  const raw = await getWhereabouts();
-  const stays = raw.stays.map((stay) => resolveStay(stay, timeline.places, timeline.homeZone));
-  for (let i = 0; i < stays.length; i++)
-    for (let j = i + 1; j < stays.length; j++) {
-      if (conflicts(stays[i], stays[j]))
-        throw new Error(
-          `Certain stays in ${stays[i].locality} and ${stays[j].locality} overlap; record their dates so one is contained in the other`,
-        );
-    }
+  const stays = (await getWhereabouts()).stays.map((stay) => resolveStay(stay, timeline.places, timeline.homeZone));
+  const recorded = stays.find((stay) => stay.ids.includes(id));
+  const other = recorded && stays.find((stay) => stay !== recorded && conflicts(recorded, stay));
+  if (recorded && other)
+    throw new Error(
+      `Certain stays in ${stayName(recorded)} and ${stayName(other)} overlap; record their dates so one is contained in the other`,
+    );
 }
 async function writeStay(record: Stay): Promise<void> {
   await getDb().run(
@@ -320,9 +311,10 @@ export async function addStay(input: AddStayInput): Promise<Stay> {
   const result = await getDb().transaction(async () => {
     if (input.placeId && (input.locality !== undefined || input.zone !== undefined))
       throw new Error('A stay at a saved place takes its locality and zone from that place');
-    const place = input.placeId ? await placeById(input.placeId) : undefined;
     const timeline = await loadTimeline();
-    const ownZone = place?.is_home ? timeline.homeZone : (place?.zone ?? zone(input.zone));
+    const place = input.placeId ? timeline.places.find((p) => p.id === input.placeId) : undefined;
+    if (input.placeId && !place) throw new Error(`Place ${JSON.stringify(input.placeId)} is not set`);
+    const ownZone = place ? place.zone : zone(input.zone);
     const end = input.end ?? dateString(wallClock(Date.now(), ownZone ?? zoneAt(timeline, Date.now()) ?? 'UTC'));
     const startInstant = boundary(input.start, ownZone ?? timeline.homeZone ?? 'UTC', 'start');
     const endInstant = boundary(end, ownZone ?? timeline.homeZone ?? 'UTC', 'end');
@@ -349,7 +341,7 @@ export async function addStay(input: AddStayInput): Promise<Stay> {
       updated_at: now(),
     };
     await writeStay(record);
-    await assertCertainStays();
+    await assertCertainStay(record.id);
     if (sourceEventId)
       await getDb().run('DELETE FROM gws_ea_dismissed_travel_events WHERE source_event_id = ?', sourceEventId);
     return record;
@@ -401,7 +393,8 @@ async function linkDerivedEnds(): Promise<boolean> {
   );
   let changed = false;
   for (let i = 0; i < rows.length; i++) {
-    const end = rows[i + 1]?.departure_at ?? null;
+    // A stay ended at its own arrival landed home, and stays ended through a later home-zone change.
+    const end = rows[i].end === rows[i].start ? rows[i].end : (rows[i + 1]?.departure_at ?? null);
     if (rows[i].end !== end) {
       await getDb().run('UPDATE gws_ea_stays SET end = ?, updated_at = ? WHERE id = ?', end, now(), rows[i].id);
       changed = true;
@@ -417,6 +410,7 @@ export async function syncDerivedStays(
     throw new Error('A derivation window must have ordered instant bounds');
   const changed = await getDb().transaction(async () => {
     const raw = await getWhereabouts();
+    const { homeZone } = await loadTimeline();
     const dismissed = new Set(raw.dismissed_events.map((event) => event.source_event_id));
     const supplied = new Set(legs.map((leg) => leg.sourceEventId));
     let edited = false;
@@ -432,16 +426,18 @@ export async function syncDerivedStays(
         edited = true;
       }
     for (const leg of legs) {
-      if (dismissed.has(leg.sourceEventId)) continue;
       const held = raw.stays.find((stay) => stay.source_event_id === leg.sourceEventId);
-      const place = raw.places.find((p) => p.locality.toLocaleLowerCase() === leg.locality.toLocaleLowerCase());
+      // Main's own record of this flight, like a dismissal, outranks the calendar.
+      if (dismissed.has(leg.sourceEventId) || (held && !held.derived)) continue;
+      const destination = zone(leg.destinationZone);
       const record: Stay = {
         id: held?.id ?? `stay-${randomUUID()}`,
-        place_id: place?.id ?? null,
-        locality: place ? null : leg.locality,
-        zone: place ? null : zone(leg.destinationZone),
+        place_id: null,
+        locality: null,
+        zone: destination,
         start: iso(leg.arrival),
-        end: held?.derived ? held.end : null,
+        // Landing home covers nothing, so base, rhythm and the live home zone resume.
+        end: destination === homeZone ? iso(leg.arrival) : (held?.end ?? null),
         source: 'calendar',
         certainty: 'certain',
         working_hours: held?.working_hours ?? 'local',
@@ -460,7 +456,6 @@ export async function syncDerivedStays(
       }
     }
     if (await linkDerivedEnds()) edited = true;
-    await assertCertainStays();
     return edited;
   });
   if (changed) await signalWhereaboutsChange('derived');

@@ -148,20 +148,9 @@ function nextLookFrom(args: Record<string, unknown>, timeline: Timeline): { look
     throw new Error('--fixed accompanies --look or --look-cron');
   if (at === undefined && cron === undefined) return { look: undefined, zone: TIMEZONE };
   const date = at?.trim().slice(0, 10);
-  const localZone =
-    date && /^\d{4}-\d{2}-\d{2}$/u.test(date) ? zoneForDay(timeline, date) : zoneAt(timeline, Date.now());
-  const offset = at === undefined ? undefined : /(Z|[+-]\d{2}:?\d{2})$/u.exec(at.trim())?.[1];
-  const explicitZone =
-    offset === undefined
-      ? undefined
-      : offset === 'Z'
-        ? 'UTC'
-        : offset.length === 5
-          ? `${offset.slice(0, 3)}:${offset.slice(3)}`
-          : offset;
-  if (localZone === null && !(args.fixed === true && explicitZone !== undefined))
-    throw new Error('The zone in effect for this look is unknown; record the stay’s zone before setting a local look');
-  const zone = explicitZone ?? localZone ?? 'UTC';
+  const zone = date && /^\d{4}-\d{2}-\d{2}$/u.test(date) ? zoneForDay(timeline, date) : zoneAt(timeline, Date.now());
+  if (zone === null)
+    throw new Error('The zone in effect for this look is unknown; record the stay’s zone before setting the look');
   return { look: parseNextLook({ at, cron }, zone), zone };
 }
 

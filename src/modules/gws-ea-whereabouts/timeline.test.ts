@@ -152,7 +152,6 @@ describe('whereabouts timeline', () => {
         id: 'outbound',
         start: { dateTime: '2026-11-01T21:00:00-08:00', timeZone: PACIFIC },
         end: { dateTime: '2026-11-02T17:00:00+01:00', timeZone: BRUSSELS },
-        location: 'Brussels',
       },
     ]);
     await syncDerivedStays(legs, { start: at('2026-11-01T00:00:00Z'), end: at('2026-11-10T00:00:00Z') });
@@ -160,7 +159,11 @@ describe('whereabouts timeline', () => {
     expect(zoneAt(timeline, at('2026-11-02T15:59:59Z'))).toBe(PACIFIC);
     expect(zoneAt(timeline, at('2026-11-02T16:00:00Z'))).toBe(BRUSSELS);
     expect(zoneAt(timeline, at('2026-12-01T12:00:00Z'))).toBe(BRUSSELS);
-    expect(gaps(timeline)).toContainEqual(expect.objectContaining({ kind: 'return', sourceEventId: 'outbound' }));
+    expect(gaps(timeline)).toContainEqual({
+      kind: 'return',
+      sourceEventId: 'outbound',
+      message: 'return from Europe/Brussels unknown',
+    });
   });
 
   it('uses the departure zone at the start of a westward flight date', async () => {
@@ -169,7 +172,6 @@ describe('whereabouts timeline', () => {
         id: 'west',
         start: { dateTime: '2026-11-02T00:30:00+01:00', timeZone: BRUSSELS },
         end: { dateTime: '2026-11-02T03:00:00-08:00', timeZone: PACIFIC },
-        location: 'Berkeley',
       },
     ]);
     await syncDerivedStays(legs, { start: at('2026-11-01T00:00:00Z'), end: at('2026-11-10T00:00:00Z') });
@@ -182,7 +184,6 @@ describe('whereabouts timeline', () => {
         id: 'one-way',
         start: { dateTime: '2026-11-01T21:00:00-08:00', timeZone: PACIFIC },
         end: { dateTime: '2026-11-02T17:00:00+01:00', timeZone: BRUSSELS },
-        location: 'Brussels',
       },
     ]);
     await syncDerivedStays(legs, { start: at('2026-11-01'), end: at('2026-11-10') });
@@ -208,5 +209,130 @@ describe('whereabouts timeline', () => {
       placeId: null,
     });
     expect(zoneForDay(timeline, '2026-11-03')).toBeNull();
+  });
+
+  describe('a trip on the calendar beside what main recorded', () => {
+    // Pacific is on standard time and Brussels on winter time throughout.
+    const outbound = {
+      id: 'ua-900',
+      start: { dateTime: '2026-11-09T18:00:00-08:00', timeZone: PACIFIC },
+      end: { dateTime: '2026-11-10T13:30:00+01:00', timeZone: BRUSSELS },
+      location: 'UA 900 SFO to BRU, confirmation K7Q2XZ, seat 14C',
+    };
+    const inbound = {
+      id: 'ua-901',
+      start: { dateTime: '2026-11-14T11:00:00+01:00', timeZone: BRUSSELS },
+      end: { dateTime: '2026-11-14T13:30:00-08:00', timeZone: PACIFIC },
+      location: 'UA 901 BRU to SFO, confirmation K7Q2XZ, seat 14C',
+    };
+    const window = { start: at('2026-11-01T00:00:00Z'), end: at('2026-11-30T00:00:00Z') };
+    async function mailStay(start: string, end: string) {
+      return addStay({ locality: 'Brussels', zone: BRUSSELS, start, end, source: 'mail', certainty: 'certain' });
+    }
+
+    it('syncs the doc walkthrough, a mailed Brussels stay plus both flights, and resolves by precedence', async () => {
+      await home();
+      await mailStay('2026-11-10', '2026-11-14');
+      await expect(syncDerivedStays(deriveLegs([outbound, inbound]), window)).resolves.toEqual({ changed: true });
+      const timeline = await loadTimeline();
+      expect(whereaboutsAt(timeline, at('2026-11-12T12:00:00Z'))).toMatchObject({
+        zone: BRUSSELS,
+        locality: 'Brussels',
+      });
+      expect(zoneAt(timeline, at('2026-11-14T12:00:00Z'))).toBe(BRUSSELS);
+      // Landed at 21:30Z; the mailed stay runs to the end of the 14th, Brussels time.
+      expect(zoneAt(timeline, at('2026-11-14T22:00:00Z'))).toBe(BRUSSELS);
+      expect(whereaboutsAt(timeline, at('2026-11-15T01:00:00Z'))).toMatchObject({ zone: PACIFIC, placeId: 'home' });
+      expect(gaps(timeline)).toEqual([
+        expect.objectContaining({ kind: 'rhythm' }),
+        expect.objectContaining({ kind: 'trip-source' }),
+      ]);
+    });
+
+    it('syncs a calendar leg that partly overlaps a certain stay main recorded', async () => {
+      await mailStay('2026-11-10', '2026-11-14');
+      const onward = {
+        id: 'ba-389',
+        start: { dateTime: '2026-11-14T17:00:00+01:00', timeZone: BRUSSELS },
+        end: { dateTime: '2026-11-14T17:15:00+00:00', timeZone: 'Europe/London' },
+      };
+      await expect(syncDerivedStays(deriveLegs([outbound, onward]), window)).resolves.toEqual({ changed: true });
+      const timeline = await loadTimeline();
+      // The shorter certain stay wins while both cover the evening of the 14th.
+      expect(zoneAt(timeline, at('2026-11-14T20:00:00Z'))).toBe(BRUSSELS);
+      expect(zoneAt(timeline, at('2026-11-15T12:00:00Z'))).toBe('Europe/London');
+    });
+
+    it('hands the clock back to home, its base and rhythm, when a flight lands in the home zone', async () => {
+      await home();
+      await addPlace({ id: 'office', label: 'Office', locality: 'Oakland', zone: PACIFIC });
+      await setRhythm({ weekdays: ['mon'], placeId: 'office', start: '09:00', end: '17:00' });
+      await syncDerivedStays(deriveLegs([outbound, inbound]), window);
+      let timeline = await loadTimeline();
+      expect(zoneAt(timeline, at('2026-11-14T21:29:00Z'))).toBe(BRUSSELS);
+      // Monday the 16th, 10:00 Pacific.
+      expect(whereaboutsAt(timeline, at('2026-11-16T18:00:00Z'))).toMatchObject({ placeId: 'office', stay: null });
+      expect(gaps(timeline).filter((gap) => gap.kind === 'return')).toEqual([]);
+      await getDb().run('UPDATE gws_ea_profile SET principal_timezone = ? WHERE singleton = 1', 'America/New_York');
+      timeline = await loadTimeline();
+      expect(zoneAt(timeline, at('2026-11-15T12:00:00Z'))).toBe('America/New_York');
+    });
+
+    it('keeps the stay main recorded for a flight through the next calendar refresh', async () => {
+      await syncDerivedStays(deriveLegs([outbound]), window);
+      const derived = (await getWhereabouts()).stays[0];
+      await addStay({
+        id: derived.id,
+        locality: 'Brussels',
+        zone: BRUSSELS,
+        start: '2026-11-10',
+        end: '2026-11-16',
+        source: 'mail',
+        certainty: 'certain',
+        sourceEventId: 'ua-900',
+      });
+      expect(await syncDerivedStays(deriveLegs([outbound]), window)).toEqual({ changed: false });
+      expect((await getWhereabouts()).stays).toEqual([
+        expect.objectContaining({ id: derived.id, end: '2026-11-16', derived: 0, source: 'mail' }),
+      ]);
+      const timeline = await loadTimeline();
+      expect(zoneAt(timeline, at('2026-11-17T12:00:00Z'))).toBe(PACIFIC);
+      expect(gaps(timeline).filter((gap) => gap.kind === 'return')).toEqual([]);
+    });
+
+    it('stores only the destination zone of a calendar leg, never its event text', async () => {
+      await syncDerivedStays(deriveLegs([outbound]), window);
+      const [stay] = (await getWhereabouts()).stays;
+      expect(stay).toMatchObject({ place_id: null, locality: null, zone: BRUSSELS, derived: 1 });
+      const timeline = await loadTimeline();
+      expect(JSON.stringify(timeline)).not.toContain('K7Q2XZ');
+      expect(whereaboutsAt(timeline, at('2026-11-12T12:00:00Z'))).toMatchObject({ zone: BRUSSELS, locality: null });
+    });
+  });
+
+  it('reads the zone of a place that is no longer home from the place itself', async () => {
+    await getDb().run('UPDATE gws_ea_profile SET principal_timezone = ? WHERE singleton = 1', 'America/New_York');
+    await addPlace({ id: 'brooklyn', label: 'Brooklyn flat', locality: 'New York' });
+    await setBase({ placeId: 'brooklyn' });
+    await getDb().run('UPDATE gws_ea_profile SET principal_timezone = ? WHERE singleton = 1', PACIFIC);
+    await home();
+    const edited = await addPlace({
+      id: 'brooklyn',
+      label: 'Brooklyn flat',
+      locality: 'New York',
+      zone: 'America/New_York',
+    });
+    expect(edited.zone).toBe('America/New_York');
+    await addStay({
+      placeId: 'brooklyn',
+      start: '2026-12-01',
+      end: '2026-12-05',
+      source: 'said',
+      certainty: 'certain',
+    });
+    const timeline = await loadTimeline();
+    expect(zoneAt(timeline, at('2026-12-02T17:00:00Z'))).toBe('America/New_York');
+    expect(zoneAt(timeline, at('2026-12-10T17:00:00Z'))).toBe(PACIFIC);
+    expect(timeline.places.find((place) => place.id === 'home')?.zone).toBe(PACIFIC);
   });
 });

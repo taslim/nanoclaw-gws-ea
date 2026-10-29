@@ -11,10 +11,9 @@ export interface Place {
   readonly id: string;
   readonly label: string;
   readonly locality: string;
-  /** Null for home: its zone belongs only to the profile. */
+  /** Null while the place is home: its zone belongs only to the profile. */
   readonly zone: string | null;
   readonly private_value_id: string | null;
-  readonly is_home: number;
   readonly updated_at: string;
 }
 export interface Base {

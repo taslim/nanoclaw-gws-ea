@@ -11,9 +11,7 @@ export const gwsEaWhereaboutsMigration: ModuleMigration = {
         locality TEXT NOT NULL CHECK (locality <> ''),
         zone TEXT,
         private_value_id TEXT REFERENCES gws_ea_private_values(id) ON DELETE SET NULL,
-        is_home INTEGER NOT NULL DEFAULT 0 CHECK (is_home IN (0, 1)),
-        updated_at TEXT NOT NULL,
-        CHECK (is_home = 0 OR zone IS NULL)
+        updated_at TEXT NOT NULL
       );
       CREATE TABLE gws_ea_whereabouts_base (
         singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
@@ -62,8 +60,8 @@ export const gwsEaWhereaboutsMigration: ModuleMigration = {
         departure_at TEXT,
         departure_zone TEXT,
         updated_at TEXT NOT NULL,
-        CHECK ((place_id IS NOT NULL AND locality IS NULL AND zone IS NULL) OR (place_id IS NULL AND locality IS NOT NULL)),
-        CHECK (derived = 0 OR (source_event_id IS NOT NULL AND source_version IS NOT NULL AND departure_at IS NOT NULL AND departure_zone IS NOT NULL))
+        CHECK ((place_id IS NOT NULL AND locality IS NULL AND zone IS NULL) OR (place_id IS NULL AND locality IS NOT NULL) OR derived = 1),
+        CHECK (derived = 0 OR (place_id IS NULL AND locality IS NULL AND zone IS NOT NULL AND source_event_id IS NOT NULL AND source_version IS NOT NULL AND departure_at IS NOT NULL AND departure_zone IS NOT NULL))
       );
       CREATE TABLE gws_ea_dismissed_travel_events (
         source_event_id TEXT PRIMARY KEY CHECK (source_event_id <> ''),

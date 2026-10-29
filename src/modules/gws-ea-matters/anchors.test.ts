@@ -34,16 +34,32 @@ import { MAIN, closeRuns, mainSession, seedMain, liveTaskRows } from './testing/
 
 const DATA = '/tmp/nanoclaw-test-gws-ea-anchors';
 const HOME = 'America/Los_Angeles';
-const NOW = '2032-11-01T08:00:00.000Z';
+// Nov 1, 13:00 Pacific (daylight time until Nov 7); Brussels is on winter time.
+const NOW = '2032-11-01T20:00:00.000Z';
 
-async function task(id: string, at: string, recurrence: string | null = null) {
+async function task(id: string, at: string) {
   const session = await mainSession();
   await createScheduledTask(
     MAIN,
-    prepareScheduledTask({ name: id, prompt: 'Morgan’s reminder.', processAfter: at, recurrence, timezone: HOME }),
+    prepareScheduledTask({ name: id, prompt: 'Morgan’s reminder.', processAfter: at, timezone: HOME }),
     { id, session },
   );
   return id;
+}
+/** As main sets a repeating reminder: the cron alone, its first run derived on the home clock. */
+async function repeating(id: string, recurrence: string) {
+  const session = await mainSession();
+  await createScheduledTask(
+    MAIN,
+    prepareScheduledTask({ name: id, prompt: 'Morgan’s reminder.', recurrence, timezone: HOME }),
+    { id, session },
+  );
+  return id;
+}
+async function retimeNotes(id: string) {
+  return withExistingMailboxSession(MAIN, (await mainSession()).id, (mailbox) =>
+    mailbox.getInboundRecords().filter((row) => row.kind === 'chat' && row.content.includes(`task ${id}:`)),
+  );
 }
 async function at(id: string): Promise<string | undefined> {
   return liveTaskRows(await mainSession()).find((row) => row.series_id === id)?.process_after;
@@ -133,7 +149,7 @@ describe('local task anchors through the native matters loop and core recurrence
   ])(
     'keeps daily 09:00 exactly once on each local day in %s and restores home on return',
     async (zone, first, second) => {
-      const id = await task('daily-reminder', '2032-11-02T09:00', '0 9 * * *');
+      const id = await repeating('daily-reminder', '0 9 * * *');
       await keepMattersOnTime();
       await stay(zone);
       await keepMattersOnTime();
@@ -152,19 +168,25 @@ describe('local task anchors through the native matters loop and core recurrence
     },
   );
 
-  it.each([
-    ['Europe/Brussels', '2032-11-03T08:00:00.000Z'],
-    ['Asia/Tokyo', '2032-11-03T00:00:00.000Z'],
-    ['Pacific/Honolulu', '2032-11-03T19:00:00.000Z'],
-  ])('retains the set home wall clock when %s is entered before the first anchor pass', async (zone, expected) => {
-    const id = await task('before-first-pass', '2032-11-03T09:00');
-    await stay(zone);
+  it('keeps a time written in UTC at its instant, read on the clock in effect then', async () => {
+    const id = await task('utc-reminder', '2032-11-05T17:00:00Z');
     await keepMattersOnTime();
-    expect(await at(id)).toBe(expected);
+    await keepMattersOnTime();
+    expect(await at(id)).toBe('2032-11-05T17:00:00.000Z');
+    expect(await getTimeAnchor((await mainSession()).id, id)).toMatchObject({ originalZone: HOME });
+  });
+
+  it('starts a cron set on a Brussels morning at that morning’s local time', async () => {
+    await stay('Europe/Brussels', '2032-11-01', '2032-11-05');
+    vi.setSystemTime(new Date('2032-11-02T06:00:00Z'));
+    const id = await repeating('brussels-morning', '0 9 * * *');
+    expect(await at(id)).toBe('2032-11-02T16:00:00.000Z');
+    await keepMattersOnTime();
+    expect(await at(id)).toBe('2032-11-02T08:00:00.000Z');
   });
 
   it('does not run the same local date twice when travelling west after Pacific 09:00', async () => {
-    const id = await task('westward', '2032-11-02T09:00', '0 9 * * *');
+    const id = await repeating('westward', '0 9 * * *');
     await keepMattersOnTime();
     await complete(id);
     await stay('Pacific/Honolulu', '2032-11-02T17:00:00Z', '2032-11-06');
@@ -264,11 +286,13 @@ describe('local task anchors through the native matters loop and core recurrence
     expect(notes?.[0]?.content).toContain('9:00 AM');
     expect(notes?.[0]?.content).toContain('Europe/Brussels');
   });
-  it('lists each pending local task on stay add, excluding fixed and host-owned moments', async () => {
+  it('lists each pending local task inside the new stay, excluding fixed and host-owned moments', async () => {
     const local = await task('preview-local', '2032-11-03T09:00');
     const fixed = await task('preview-fixed', '2032-11-03T09:00');
+    await task('preview-after', '2032-11-09T09:00');
     await clock('fixed', fixed);
     await task('gws-ea-close-aaaa', '2032-11-03T09:00');
+    await keepMattersOnTime();
     const response = await dispatch(
       {
         id: 'trip',
@@ -284,7 +308,11 @@ describe('local task anchors through the native matters loop and core recurrence
       },
       { caller: 'host' },
     );
-    expect(response).toMatchObject({ ok: true, data: { pending_local_items: [{ task: local }] } });
+    expect(response).toMatchObject({ ok: true });
+    if (!response.ok) throw new Error('stay add failed');
+    expect((response.data as { pending_local_items: unknown }).pending_local_items).toEqual([
+      { task: local, at: '2032-11-03T16:00:00.000Z', zone: HOME },
+    ]);
     expect(await at(local)).toBe('2032-11-03T16:00:00.000Z');
   });
 
@@ -294,8 +322,10 @@ describe('local task anchors through the native matters loop and core recurrence
     await withExistingMailboxSession(MAIN, session.id, (mailbox) =>
       mailbox.updateTask('broken-cron', { recurrence: 'broken' }),
     );
+    const stray = await task('look-m-0123456789ab-abcd', '2032-11-03T09:00');
     await keepMattersOnTime();
     expect(await closeRuns()).toHaveLength(1);
+    expect(await at(stray)).toBeUndefined();
   });
   it('creates and updates fixed looks natively, and interprets a local look on its future trip day', async () => {
     const create = await dispatch(
@@ -325,7 +355,7 @@ describe('local task anchors through the native matters loop and core recurrence
     expect(await at(matter.look_task_id)).toBe('2032-11-04T08:00:00.000Z');
   });
   it('keeps the original moment through a prompt-only edit and fixes the next cron after its last run', async () => {
-    const id = await task('prompt-edit', '2032-11-02T09:00', '0 9 * * *');
+    const id = await repeating('prompt-edit', '0 9 * * *');
     await keepMattersOnTime();
     await stay('Europe/Brussels');
     await keepMattersOnTime();
@@ -355,7 +385,7 @@ describe('local task anchors through the native matters loop and core recurrence
     expect(new Set(notes?.map((row) => row.id)).size).toBe(3);
   });
   it('keeps the cron calendar date when a monthly local reminder re-arms across a trip', async () => {
-    const id = await task('monthly-local', '2032-11-03T09:00', '0 9 3 * *');
+    const id = await repeating('monthly-local', '0 9 3 * *');
     await keepMattersOnTime();
     await stay('Asia/Tokyo');
     await keepMattersOnTime();
@@ -365,78 +395,100 @@ describe('local task anchors through the native matters loop and core recurrence
     expect(await at(id)).toBe('2032-12-03T17:00:00.000Z');
     expect(liveTaskRows(await mainSession()).find((row) => row.series_id === id)?.recurrence).toBe('0 9 3 * *');
   });
-  it('refuses local looks in an unknown stay zone and allows an explicit-offset fixed one-off', async () => {
-    await stay('unknown');
-    const input = { title: 'Juno’s booking', 'open-loop': 'Check the confirmation.', look: '2032-11-03T09:00' };
-    const response = await dispatch({ id: 'unknown-look', command: 'matters-open', args: input }, { caller: 'host' });
-    expect(response).toMatchObject({
-      ok: false,
-      error: { message: expect.stringContaining('zone in effect for this look is unknown') },
-    });
-    const fixed = await dispatch(
-      { id: 'fixed-look', command: 'matters-open', args: { ...input, look: '2032-11-03T09:00+01:00', fixed: true } },
+  it('opens a matter on an event with a local look, anchoring its wall time and a Z time in the zone in effect', async () => {
+    const trip = await stay('Europe/Brussels');
+    const event = 'morgan@example.test/7k3q9v1m2n4p6r8s0t2u4v6a8b';
+    const open = async (look: string, title: string) => {
+      const response = await dispatch(
+        { id: title, command: 'matters-open', args: { title, 'open-loop': 'Confirm the table.', look, event } },
+        { caller: 'host' },
+      );
+      if (!response.ok) throw new Error(JSON.stringify(response.error));
+      const { matter } = response.data as import('./db.js').Placed;
+      if (matter.look_task_id === null) throw new Error('Look was not placed');
+      return { matter, look: matter.look_task_id };
+    };
+    const local = await open('2032-11-03T09:00', 'Dinner with Juno');
+    const utc = await open('2032-11-04T08:00:00Z', 'Lunch with Remy');
+    expect(await at(local.look)).toBe('2032-11-03T08:00:00.000Z');
+    expect(await at(utc.look)).toBe('2032-11-04T08:00:00.000Z');
+    const session = await mainSession();
+    for (const id of [local.look, utc.look])
+      expect(await getTimeAnchor(session.id, id)).toMatchObject({
+        originalZone: 'Europe/Brussels',
+        wall: { hour: 9, minute: 0 },
+        fixed: false,
+      });
+    const linked = await dispatch(
+      { id: 'get', command: 'matters-get', args: { id: utc.matter.id } },
       { caller: 'host' },
     );
-    if (!fixed.ok) throw new Error(JSON.stringify(fixed.error));
-    const placed = fixed.data as import('./db.js').Placed;
-    if (placed.matter.look_task_id === null) throw new Error('Fixed look not created');
-    expect(await at(placed.matter.look_task_id)).toBe('2032-11-03T08:00:00.000Z');
-  });
-  it('leaves legacy tasks without source-clock metadata unknown instead of guessing or backfilling', async () => {
-    const session = await mainSession();
-    await withExistingMailboxSession(MAIN, session.id, (mailbox) =>
-      mailbox.insertTask({
-        id: 'legacy-clock',
-        seriesId: 'legacy-clock',
-        processAfter: '2032-11-03T16:00:00.000Z',
-        recurrence: null,
-        content: JSON.stringify({ prompt: 'An older reminder.', script: null, inConversation: true }),
-      }),
-    );
-    await stay('Asia/Tokyo');
+    expect(JSON.stringify(linked)).toContain('7k3q9v1m2n4p6r8s0t2u4v6a8b');
     await keepMattersOnTime();
-    expect(await at('legacy-clock')).toBe('2032-11-03T16:00:00.000Z');
-    expect(
-      await getDb().get('SELECT series_id FROM gws_ea_time_anchors WHERE series_id=?', 'legacy-clock'),
-    ).toBeUndefined();
-    expect(await clock('fixed', 'legacy-clock')).toMatchObject({
-      ok: false,
-      error: { message: expect.stringContaining('clock is unknown') },
-    });
-  });
-  it('recovers a re-time fact if a one-off runs between the mailbox write and its anchor receipt', async () => {
-    const id = await task('receipt-window', '2032-11-03T09:00');
+    expect(await at(local.look)).toBe('2032-11-03T08:00:00.000Z');
+    await dismissStay({ id: trip.id, reason: 'Morgan stayed home.' });
     await keepMattersOnTime();
-    const session = await mainSession();
-    const held = await getTimeAnchor(session.id, id);
-    if (!held) throw new Error('No initial anchor');
+    expect(await at(local.look)).toBe('2032-11-03T16:00:00.000Z');
+    expect(await at(utc.look)).toBe('2032-11-04T16:00:00.000Z');
+  });
+
+  it('refuses a look, local or fixed, while the zone in effect for it is unknown', async () => {
+    await stay('unknown');
+    const input = { title: 'Juno’s booking', 'open-loop': 'Check the confirmation.', look: '2032-11-03T09:00' };
+    for (const args of [input, { ...input, look: '2032-11-03T09:00+01:00', fixed: true }])
+      expect(await dispatch({ id: 'unknown-look', command: 'matters-open', args }, { caller: 'host' })).toMatchObject({
+        ok: false,
+        error: { message: expect.stringContaining('zone in effect for this look is unknown') },
+      });
+  });
+
+  it('corrects each core re-arm during a trip silently, reporting only the move of a time main saw', async () => {
+    const id = await repeating('trip-daily', '0 9 * * *');
+    await keepMattersOnTime();
     await stay('Europe/Brussels');
-    await getDb().run(
-      'UPDATE gws_ea_time_anchors SET anchor=? WHERE session_id=? AND series_id=?',
-      JSON.stringify({
-        ...held,
-        change: {
-          id: 'clock-receipt-window',
-          oldAt: '2032-11-03T16:00:00.000Z',
-          newAt: '2032-11-03T08:00:00.000Z',
-          oldZone: HOME,
-          newZone: 'Europe/Brussels',
-        },
-      }),
-      session.id,
-      id,
-    );
-    await withExistingMailboxSession(MAIN, session.id, (mailbox) =>
-      mailbox.updateTask(id, { processAfter: '2032-11-03T08:00:00.000Z' }),
-    );
-    await complete(id);
     await keepMattersOnTime();
-    await keepMattersOnTime();
-    const notes = await withExistingMailboxSession(MAIN, session.id, (mailbox) =>
-      mailbox.getInboundRecords().filter((row) => row.id === 'clock-receipt-window'),
-    );
+    expect(await at(id)).toBe('2032-11-02T08:00:00.000Z');
+    for (const expected of ['2032-11-03T08:00:00.000Z', '2032-11-04T08:00:00.000Z', '2032-11-05T08:00:00.000Z']) {
+      await complete(id);
+      await keepMattersOnTime();
+      expect(await at(id)).toBe(expected);
+    }
+    const notes = await retimeNotes(id);
     expect(notes).toHaveLength(1);
     expect(notes?.[0]?.content).toContain('Europe/Brussels');
-    expect(await at(id)).toBeUndefined();
+  });
+
+  it('keeps a daily reminder made a one-off during a trip at its local time there', async () => {
+    const id = await repeating('one-off-now', '0 9 * * *');
+    await keepMattersOnTime();
+    await stay('Europe/Brussels');
+    await keepMattersOnTime();
+    expect(await at(id)).toBe('2032-11-02T08:00:00.000Z');
+    vi.setSystemTime(new Date('2032-11-01T23:30:00Z'));
+    const changed = await dispatch(
+      { id: 'one-shot', command: 'tasks-update', args: { id, recurrence: 'none' } },
+      { caller: 'host' },
+    );
+    expect(changed).toMatchObject({ ok: true });
+    await keepMattersOnTime();
+    await keepMattersOnTime();
+    expect(await at(id)).toBe('2032-11-02T08:00:00.000Z');
+  });
+
+  it('forgets an anchor once its series has nothing left to run or report, and not while a re-arm is due', async () => {
+    const session = await mainSession();
+    const once = await task('one-off-done', '2032-11-03T09:00');
+    const daily = await repeating('daily-kept', '0 9 * * *');
+    expect(await clock('fixed', daily)).toMatchObject({ ok: true });
+    await keepMattersOnTime();
+    const db = new Database(inboundDbPath(MAIN, session.id));
+    try {
+      db.prepare("UPDATE messages_in SET status='completed' WHERE series_id IN (?, ?)").run(once, daily);
+    } finally {
+      db.close();
+    }
+    await keepMattersOnTime();
+    expect(await getTimeAnchor(session.id, once)).toBeUndefined();
+    expect(await getTimeAnchor(session.id, daily)).toMatchObject({ fixed: true });
   });
 });
