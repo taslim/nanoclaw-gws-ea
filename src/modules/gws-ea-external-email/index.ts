@@ -74,7 +74,7 @@ registerRequiredProjectDocSection('gws-ea-external-email:principal', async (grou
   const timezone = resolveTimezone(profile.principal_timezone ?? TIMEZONE);
   const principal =
     profile.principal_display_name === null ? 'the principal' : escapeMarkdownInline(profile.principal_display_name);
-  return { name: 'Principal', body: `You work for ${principal}, whose time zone is ${timezone}.` };
+  return { name: 'Principal', body: `You work for ${principal}, whose home time zone is ${timezone}.` };
 });
 
 /** Relative to the checkout the host runs from, as NanoClaw reads its other instruction files. */

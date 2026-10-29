@@ -239,7 +239,7 @@ describe("external-email's project document", () => {
         '\n\nYour email signature:\n\nAya | EA to Morgan',
     );
     // Said once here, so no email it reads repeats it.
-    expect(composed.get('# Principal')).toBe('You work for Morgan, whose time zone is America/Los_Angeles.');
+    expect(composed.get('# Principal')).toBe('You work for Morgan, whose home time zone is America/Los_Angeles.');
     expect(composed.get('# External Email')).toBe(fs.readFileSync(path.resolve(GUIDANCE_PATH), 'utf8').trim());
     expect([...doc.matchAll(/^## Host sign-in task$/gmu)]).toHaveLength(1);
     expect([...doc.matchAll(/`sign_in_reply`/gu)]).toHaveLength(1);
@@ -280,7 +280,7 @@ describe("external-email's project document", () => {
     const composed = sections(fs.readFileSync(path.join(groupDir, DEFAULT_PROJECT_DOC.fileName), 'utf8'));
 
     const escaped = 'Juno \\*Hale\\* \\[Jr\\] \\#1\\_';
-    expect(composed.get('# Principal')).toBe(`You work for ${escaped}, whose time zone is Europe/London.`);
+    expect(composed.get('# Principal')).toBe(`You work for ${escaped}, whose home time zone is Europe/London.`);
     expect(composed.get('# Assistant Identity')).toContain(`${escaped} is the principal.`);
   });
 

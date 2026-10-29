@@ -209,9 +209,11 @@ describe("GWS-EA's guidance for main", () => {
     expect(GUIDANCE).not.toMatch(/after a restart/u);
   });
 
-  it('fills whereabouts gaps from what it can see, and asks only when a decision rests on one', () => {
+  it('fills whereabouts gaps from what it can see, and usually asks only when a decision rests on one', () => {
     expect(GUIDANCE).toContain('Fill a whereabouts gap the front page names');
-    expect(GUIDANCE).toContain('recording none when there is none; ask only when a decision rests on it, in one line');
+    expect(GUIDANCE).toContain(
+      'recording none when there is none; usually ask only when a decision rests on it, in one line',
+    );
     expect(GUIDANCE).toContain("When a trip you can't see first matters, explain once, without pressing");
     expect(GUIDANCE).toContain('read travel');
   });
@@ -227,7 +229,7 @@ describe("GWS-EA's guidance for main", () => {
     expect(GUIDANCE).toContain("the requester's ask is information");
     expect(GUIDANCE).toContain('Whoever needs it usually owns it');
     expect(GUIDANCE).toContain('Offered times have no hold');
-    expect(GUIDANCE).toContain('hold a time agreed with a side that will invite until their invitation lands');
+    expect(GUIDANCE).toContain('You may hold a time agreed with a side that will invite until their invitation lands');
     expect(GUIDANCE).toContain(
       "Move their meetings by judgment, weighing the guests' time, how urgent the move is and who organizes it",
     );
