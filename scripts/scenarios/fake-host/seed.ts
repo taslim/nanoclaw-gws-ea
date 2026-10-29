@@ -67,7 +67,7 @@ export async function seedScenarioStores(scenario: ScenarioCase, agent: string):
     });
     await setEventTravel({ eventId: 'synthetic-sfo-jfk', mode: 'car', minutes: 40, source: 'learned' });
     await setManualSection(
-      'travel-sources',
+      'preferences',
       'For the November 5 SFO flight, leave from home and arrive at SFO departures two hours before departure. The learned home-to-SFO drive is 40 minutes.',
     );
   }
@@ -86,7 +86,7 @@ export async function seedScenarioStores(scenario: ScenarioCase, agent: string):
       source: 'learned',
     });
     await setManualSection(
-      'travel-sources',
+      'narrative',
       'For the coming dinner with Juno, the normal trip from Home to Harbor House is 45 minutes. Tomorrow’s reliable traffic estimate becomes available at 16:30; leave-by time remains uncertain.',
     );
   }
