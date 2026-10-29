@@ -1,7 +1,6 @@
 import { getDb } from '../../db/connection.js';
 import { TIMEZONE } from '../../config.js';
 import { formatLocalTime } from '../../timezone.js';
-import { untrustedLine } from '../gws-ea-inbox/untrusted.js';
 import { listPeople, type PersonSummary } from '../gws-ea-people/db.js';
 import { getSchedulingPreferenceValues, type SchedulingPreferenceValues } from '../gws-ea-preferences/db.js';
 import { summarizeSchedulingPreferences } from '../gws-ea-preferences/index.js';
@@ -54,7 +53,7 @@ function block(title: string, lines: readonly string[], budget: number, pointer:
 }
 
 /** to: main */
-function renderManualFrontPage(snapshot: ManualSnapshot): string {
+function renderManualSections(snapshot: ManualSnapshot): string[] {
   const { profile, whereabouts, sections } = snapshot;
   const places = new Map(whereabouts.places.map((place) => [place.id, place]));
   const home = whereabouts.base.home_place_id === null ? undefined : places.get(whereabouts.base.home_place_id);
@@ -62,15 +61,11 @@ function renderManualFrontPage(snapshot: ManualSnapshot): string {
   const rhythm = WEEKDAYS.flatMap((day) => whereabouts.rhythm.filter((entry) => entry.weekday === day));
   const placeLabel = (id: string): string => places.get(id)?.label ?? id;
   const namedPlace = (place: Place): string =>
-    `${place.label}: ${place.locality} (${place.is_home ? (profile.principal_timezone ?? 'zone unknown') : (place.zone ?? 'zone unknown')})`;
+    `${place.label}: ${place.locality} (${place.id === whereabouts.base.home_place_id ? (profile.principal_timezone ?? 'zone unknown') : (place.zone ?? 'zone unknown')})`;
   const preferences = summarizeSchedulingPreferences(snapshot.preferences);
   const missing = gaps(snapshot.timeline);
   const message = (gap: (typeof missing)[number]) =>
-    gap.kind === 'trip-source'
-      ? 'Trips: no source yet'
-      : gap.kind === 'return'
-        ? untrustedLine(gap.message, 200, 'google_calendar')
-        : gap.message;
+    gap.kind === 'trip-source' ? 'Trips: no source yet' : gap.message;
   let gapLine = missing.length === 0 ? undefined : `Whereabouts gaps: ${missing.map(message).join('; ')}.`;
   if (gapLine !== undefined && gapLine.length > 200) {
     const durable = missing
@@ -152,9 +147,13 @@ function renderManualFrontPage(snapshot: ManualSnapshot): string {
       return `${label} (${formatLocalTime(section.updated_at, TIMEZONE)})\n${section.text}`;
     }),
     ...(gapLine === undefined ? [] : [gapLine]),
-  ].join('\n\n');
+  ];
+}
+
+export async function loadManualSections(timeline?: Timeline): Promise<string[]> {
+  return renderManualSections(await loadManualSnapshot(timeline));
 }
 
 export async function loadManualFrontPage(timeline?: Timeline): Promise<string> {
-  return renderManualFrontPage(await loadManualSnapshot(timeline));
+  return (await loadManualSections(timeline)).join('\n\n');
 }

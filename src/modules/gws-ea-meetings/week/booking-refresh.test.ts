@@ -26,7 +26,7 @@ import {
   TEAM,
   type BookingFixture,
 } from '../testing/booking-fixture.js';
-import { hasPendingCalendarChanges } from './pending-changes.js';
+import { settledCalendarChanges } from './pending-changes.js';
 import { createWeekRefresher } from './refresh.js';
 import type { WeekView } from './view.js';
 
@@ -63,7 +63,7 @@ it('refreshes a primed readable-only view after outward book, move and cancel de
   const calendarLists = vi.spyOn(calendar, 'listCalendars');
   const id = String(answerData(await tools.book(BOOK, emailSession, 'book-refresh')).booking);
   expect(consumeOwnCalendarChange(TEAM, id, new Date())).toBe(true);
-  expect(await hasPendingCalendarChanges()).toBe(false);
+  expect(await settledCalendarChanges(new Date('2100-01-01'))).toEqual([]);
   expect(eventDates(id)).toEqual([]);
   reads.mockClear();
   calendarLists.mockClear();

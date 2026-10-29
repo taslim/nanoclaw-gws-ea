@@ -4,7 +4,7 @@ vi.mock('../gws-ea-profile/main-note.js', () => ({ writeNoteForMain: note }));
 import { closeDb, initTestDb, runMigrations } from '../../db/index.js';
 import { registerMigration } from '../../db/migrations/index.js';
 import { pendingCalendarChangesMigration } from '../gws-ea-meetings/week/pending-changes-migration.js';
-import { recordPendingCalendarChange, hasPendingCalendarChanges } from '../gws-ea-meetings/week/pending-changes.js';
+import { recordPendingCalendarChange, settledCalendarChanges } from '../gws-ea-meetings/week/pending-changes.js';
 import { flushPendingCalendarChanges, registerCalendarChangeRenderer } from './calendar-notifications.js';
 registerMigration(pendingCalendarChangesMigration);
 const renderer = vi.fn().mockResolvedValue({ text: 'Findings: a linked travel block no longer reaches dinner.' });
@@ -34,15 +34,15 @@ it('delivers two edits as one settled note and retains a later edit that arrives
     wake: true,
     text: expect.stringContaining('Findings: linked travel block.'),
   });
-  expect(await hasPendingCalendarChanges()).toBe(true);
+  expect(await settledCalendarChanges(new Date('2100-01-01'))).not.toEqual([]);
   expect(await flushPendingCalendarChanges(new Date('2026-10-05T16:04:00Z'))).toBe(1);
-  expect(await hasPendingCalendarChanges()).toBe(false);
+  expect(await settledCalendarChanges(new Date('2100-01-01'))).toEqual([]);
 });
 it('settles and delivers a note when findings rendering fails, with one retry-safe message id', async () => {
   await recordPendingCalendarChange('gmail-1', notice, new Date('2026-10-05T16:00:00Z'));
   renderer.mockRejectedValueOnce(new Error('checker unavailable'));
   expect(await flushPendingCalendarChanges(new Date('2026-10-05T16:02:00Z'))).toBe(1);
   expect(note.mock.calls[0][0].text).toContain('findings unavailable');
-  expect(await hasPendingCalendarChanges()).toBe(false);
+  expect(await settledCalendarChanges(new Date('2100-01-01'))).toEqual([]);
   expect(await flushPendingCalendarChanges(new Date('2026-10-05T16:03:00Z'))).toBe(0);
 });

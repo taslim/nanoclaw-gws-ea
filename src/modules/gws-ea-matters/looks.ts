@@ -188,9 +188,8 @@ async function createLook(
     ...(look.kind === 'once' ? { processAfter: look.at } : { recurrence: look.cron }),
     timezone: clock.zone,
   });
-  prepared.clock = { instant: prepared.processAfter, zone: clock.zone };
   const { row } = await createScheduledTask(conversation.agent_group_id, prepared, { session: conversation });
-  await anchorTask(conversation, row, clock.timeline, prepared.clock, clock.fixed);
+  await anchorTask(conversation, row, clock.timeline, clock.fixed);
   return row.id;
 }
 

@@ -69,7 +69,7 @@ describe('outward availability in the principal’s days', () => {
   const november = { from: '2026-11-12T07:00:00Z', to: '2026-11-12T21:00:00Z', minutes: 30 };
   async function home() {
     await getDb().run("UPDATE gws_ea_profile SET principal_timezone='America/Los_Angeles' WHERE singleton=1");
-    const place = await addPlace({ label: 'Home', locality: 'San Francisco', home: true });
+    const place = await addPlace({ label: 'Home', locality: 'San Francisco' });
     await setBase({ placeId: place.id });
     return place;
   }
@@ -169,15 +169,14 @@ describe('outward availability in the principal’s days', () => {
   it('offers in-person Brussels windows during a trip read from a calendar flight, without the flight’s text', async () => {
     await home();
     const office = await addPlace({ label: 'Juno’s office', locality: 'Brussels', zone: 'Europe/Brussels' });
-    const legs = deriveLegs([
-      {
-        id: 'flight-out',
-        status: 'confirmed',
-        location: 'UA 900 SFO to BRU, confirmation K7Q2XZ, seat 14C',
-        start: { dateTime: '2026-11-09T23:00:00Z', timeZone: 'America/Los_Angeles' },
-        end: { dateTime: '2026-11-10T09:00:00Z', timeZone: 'Europe/Brussels' },
-      },
-    ]);
+    const flight = {
+      id: 'flight-out',
+      status: 'confirmed',
+      location: 'UA 900 SFO to BRU, confirmation K7Q2XZ, seat 14C',
+      start: { dateTime: '2026-11-09T23:00:00Z', timeZone: 'America/Los_Angeles' },
+      end: { dateTime: '2026-11-10T09:00:00Z', timeZone: 'Europe/Brussels' },
+    };
+    const legs = deriveLegs([flight]);
     await syncDerivedStays(legs, {
       start: Date.parse('2026-11-01T00:00:00Z'),
       end: Date.parse('2026-11-30T00:00:00Z'),

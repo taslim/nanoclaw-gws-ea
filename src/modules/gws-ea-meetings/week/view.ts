@@ -4,7 +4,7 @@ import { sessionDir } from '../../../session-manager.js';
 import { getMainAgentGroupId } from '../../gws-ea-profile/db.js';
 import type { Timeline } from '../../gws-ea-whereabouts/timeline.js';
 import { checkWeek, presentFinding } from './checker.js';
-import { calendarText, digest, presentWeek, type Week } from './model.js';
+import { digest, presentWeek, type Week } from './model.js';
 
 export const WEEK_VIEW_NAME = 'week-view.json';
 const VIEW_CHARACTERS = 8_000;
@@ -34,17 +34,6 @@ export interface WeekView {
 const WRAPPER_ID = /(<<<(?:END_)?EXTERNAL_UNTRUSTED_CONTENT) id="[0-9a-f]+">>>/gu;
 /** Every render wraps untrusted text under fresh random ids, so a version digests the text without them. */
 const versionOf = (text: string): string => digest(text.replace(WRAPPER_ID, '$1>>>'));
-
-function presentedTimeline(timeline: Timeline): Timeline {
-  return {
-    ...timeline,
-    stays: timeline.stays.map((stay) => ({
-      ...stay,
-      locality: stay.sourceEventIds.length ? calendarText(stay.locality) : stay.locality,
-    })),
-    legs: timeline.legs.map((leg) => ({ ...leg, locality: calendarText(leg.locality) })),
-  };
-}
 
 export function renderWeekView(week: Week, asOf: string, manual: readonly string[]): WeekView {
   const shown = presentWeek(week);
@@ -103,7 +92,7 @@ export function renderWeekView(week: Week, asOf: string, manual: readonly string
       ].join('\n'),
     )
     .join('\n\n');
-  const timeline = presentedTimeline(week.timeline);
+  const timeline = week.timeline;
   const envelope = (days: readonly ViewDay[], version: string): WeekView => ({
     schema: 1,
     asOf,

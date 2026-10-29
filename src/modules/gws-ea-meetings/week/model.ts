@@ -29,7 +29,6 @@ export const WEEK_TAGS = {
   blockKind: 'gws_ea_block_kind',
   matter: 'gws_ea_matter_id',
   assistantWritten: 'gws_ea_assistant_written',
-  meetingKind: 'gws_ea_meeting_kind',
 } as const;
 export interface EventCopy {
   readonly calendarId: string;
@@ -273,7 +272,7 @@ function comparable(copy: EventCopy): string {
   ]);
 }
 function eventFrom(copies: readonly EventCopy[], input: WeekInput): WeekEvent | undefined {
-  const prefixes = input.preferences.ignored_events?.map((p) => p.prefix) ?? [];
+  const prefixes = input.preferences.ignored_events.map((p) => p.prefix);
   const active = copies.filter((c) => !prefixes.some((p) => c.event.id?.startsWith(p)));
   const copy = [...active].sort(
     (a, b) =>
@@ -383,7 +382,7 @@ function movesFor(events: readonly WeekEvent[], firstDate: string, input: WeekIn
           : {
               kind: 'unknown' as const,
               id: null,
-              label: where.locality ?? HOME_NOT_SET,
+              label: where.locality ?? (where.stay ? where.zoneLabel : HOME_NOT_SET),
               locality: where.locality,
               home: where.stay === null,
             };
@@ -423,7 +422,7 @@ export function buildWeek(input: WeekInput): Week {
   }
   const groups = new Map<string, EventCopy[]>();
   const ignored: EventCopy[] = [];
-  const prefixes = input.preferences.ignored_events?.map((p) => p.prefix) ?? [];
+  const prefixes = input.preferences.ignored_events.map((p) => p.prefix);
   for (const copy of input.events) {
     if (copy.event.status === 'cancelled') continue;
     if (prefixes.some((p) => copy.event.id?.startsWith(p))) {

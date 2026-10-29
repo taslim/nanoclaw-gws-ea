@@ -257,7 +257,7 @@ export function checkWeek(week: Week): Finding[] {
       const where = whereaboutsAt(week.timeline, e.start);
       if (e.place.home && where.stay && where.stay.placeId !== week.timeline.base.home_place_id)
         add('home-while-away', day.date, [e], 'In-person home event while staying elsewhere.', {
-          stay: where.stay.locality,
+          stay: where.stay.locality ?? where.stay.zone,
         });
       if (tags?.[WEEK_TAGS.parentEvent]) {
         const parent = week.events.find(
@@ -294,7 +294,7 @@ export function checkWeek(week: Week): Finding[] {
       }
     }
     mealFindings(day, busy, week, add);
-    const setting = week.preferences.back_to_back?.[0];
+    const setting = week.preferences.back_to_back[0];
     const limit = setting?.minutes ?? 180;
     const breakMinutes = setting?.break_minutes ?? 5;
     let run: WeekEvent[] = [];
@@ -389,7 +389,7 @@ function mealFindings(
 ) {
   if (!day.zone) return;
   for (const meal of ['lunch', 'dinner'] as const) {
-    const preference = week.preferences.meal_windows?.find((p) => p.meal === meal);
+    const preference = week.preferences.meal_windows.find((p) => p.meal === meal);
     const days = preference?.weekdays ?? ['mon', 'tue', 'wed', 'thu', 'fri'];
     if (!days.includes(day.weekday)) continue;
     const start = preference?.start ?? (meal === 'lunch' ? '11:30' : '18:00');

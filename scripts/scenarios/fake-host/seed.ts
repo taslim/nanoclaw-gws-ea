@@ -29,7 +29,6 @@ export async function seedScenarioStores(scenario: ScenarioCase, agent: string):
     label: HOME,
     locality: 'San Francisco',
     privateValueId: home.id,
-    home: true,
   });
   await addPlace({ id: 'synthetic-office', label: OFFICE, locality: 'Mountain View', zone: 'America/Los_Angeles' });
   await setBase({ placeId: 'synthetic-home' });

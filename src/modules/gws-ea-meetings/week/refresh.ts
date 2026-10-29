@@ -8,7 +8,7 @@ import {
   type CalendarChangeRenderContext,
 } from '../../gws-ea-inbox/calendar-notifications.js';
 import { onManualChange } from '../../gws-ea-manual/changes.js';
-import { loadManualFrontPage } from '../../gws-ea-manual/front-page.js';
+import { loadManualSections } from '../../gws-ea-manual/front-page.js';
 import { onWhereaboutsChange } from '../../gws-ea-whereabouts/changes.js';
 import { boundary, dateString, nextDate, parseDate, wallClock } from '../../gws-ea-whereabouts/clock.js';
 import { syncDerivedStays, type DerivationWindow } from '../../gws-ea-whereabouts/db.js';
@@ -78,8 +78,7 @@ export function createWeekRefresher(deps: { readonly calendar: () => MeetingsCal
       timeline,
       eventSnapshot: events,
     });
-    // The front page separates its sections with a blank line; a section holding one of its own arrives as several.
-    const manual = (await loadManualFrontPage(timeline)).split('\n\n');
+    const manual = await loadManualSections(timeline);
     const view = renderWeekView(week, asOf, manual);
     await writeWeekView(view, view.version === publishedVersion);
     publishedVersion = view.version;

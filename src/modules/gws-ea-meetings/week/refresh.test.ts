@@ -29,7 +29,7 @@ import { loadTimeline, zoneAt } from '../../gws-ea-whereabouts/timeline.js';
 import { setManualSection } from '../../gws-ea-manual/db.js';
 import { FakeCalendar } from '../testing/fake-calendar.js';
 import { createWeekRefresher } from './refresh.js';
-import { hasPendingCalendarChanges, recordPendingCalendarChange } from './pending-changes.js';
+import { settledCalendarChanges, recordPendingCalendarChange } from './pending-changes.js';
 import { beginCalendarWrite, markCalendarWriteApplied } from './write-log.js';
 import type { WeekView } from './view.js';
 
@@ -295,7 +295,7 @@ describe('the independent week refresher', () => {
     await refresher.refresh();
     expect(note).toHaveBeenCalledOnce();
     expect(note.mock.calls[0][0].text).toContain('Dinner with Remy Vance');
-    expect(await hasPendingCalendarChanges()).toBe(false);
+    expect(await settledCalendarChanges(new Date('2100-01-01'))).toEqual([]);
   });
   it('leads a change note with the event, then the findings of the days it left and joined', async () => {
     for (let day = 5; day <= 12; day++)
@@ -435,7 +435,7 @@ describe('the independent week refresher', () => {
     expect(note).toHaveBeenCalledOnce();
     expect(note.mock.calls[0][0].text).toContain('Event moved on calendar');
     expect(note.mock.calls[0][0].text).toContain('findings unavailable');
-    expect(await hasPendingCalendarChanges()).toBe(false);
+    expect(await settledCalendarChanges(new Date('2100-01-01'))).toEqual([]);
     const failed = reads.mock.calls.length;
     await vi.advanceTimersByTimeAsync(55_000);
     expect(reads.mock.calls.length).toBe(failed);

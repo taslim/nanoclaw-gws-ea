@@ -69,7 +69,7 @@ describe('Manual front page', () => {
     expect(empty).toContain('home base not set');
     expect(empty).toContain('commute days not set');
     expect(empty).toContain('Trips: no source yet');
-    await addPlace({ id: 'home', label: 'Home', locality: 'Berkeley', home: true });
+    await addPlace({ id: 'home', label: 'Home', locality: 'Berkeley' });
     await setBase({ placeId: 'home', tripSource: 'none' });
     await setRhythm({ weekdays: [] });
     expect(await loadManualFrontPage()).not.toContain('Whereabouts gaps:');
@@ -77,7 +77,7 @@ describe('Manual front page', () => {
   });
 
   it('reads each fact from its native store and bounds the result with 100 saved places', async () => {
-    await addPlace({ id: 'home', label: 'Home', locality: 'Berkeley', home: true });
+    await addPlace({ id: 'home', label: 'Home', locality: 'Berkeley' });
     await addPlace({ id: 'office', label: 'Office', locality: 'Oakland', zone: 'America/Los_Angeles' });
     await setBase({ placeId: 'home', tripSource: 'forwarded confirmations' });
     await setRhythm({ weekdays: ['mon', 'wed'], placeId: 'office', start: '09:00', end: '17:00' });

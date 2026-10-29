@@ -30,7 +30,7 @@ export async function seedCloseScenario(
   const { session } = await resolveSystemSession(main.agent_group_id, `system:gws-ea-close:${id}`);
   const scheduledAt = new Date(moment.at).toISOString();
   await getDb().run(
-    'INSERT INTO gws_ea_close_schedule(id,session_id,scheduled_at,zone,timeline_version,weekly_day) VALUES(?,?,?,?,?,?)',
+    "INSERT INTO gws_ea_close_runs(id,session_id,scheduled_at,zone,timeline_version,weekly_day,state) VALUES(?,?,?,?,?,?,'pending')",
     id,
     session.id,
     scheduledAt,
