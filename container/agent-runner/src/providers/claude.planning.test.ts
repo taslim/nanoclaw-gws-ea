@@ -12,10 +12,12 @@ interface Options {
   hooks?: Partial<Record<'PreToolUse' | 'SubagentStart', Array<{ hooks: Hook[] }>>>;
 }
 let options: Options | undefined;
+const sdkMessages: unknown[] = [];
 mock.module('@anthropic-ai/claude-agent-sdk', () => ({
   query: (input: { options: Options }) => {
     options = input.options;
     return (async function* () {
+      for (const message of sdkMessages) yield message;
       yield { type: 'result', subtype: 'success', result: '' };
     })();
   },
@@ -37,6 +39,7 @@ beforeEach(() => {
   process.env.GWS_EA_PLANNING_AGENTS = '1';
   grants = new Set(['gws-ea-main-context', 'files-read', 'files-write', 'shell', 'web', 'subagents']);
   options = undefined;
+  sdkMessages.length = 0;
   initTestSessionDb();
 });
 afterEach(() => {
@@ -78,6 +81,29 @@ async function hooks(role = 'look-back'): Promise<{ pre: Hook; start: Record<str
   return { pre, start: start ? await start({ ...input('', role), hook_event_name: 'SubagentStart' }) : {} };
 }
 const denied = { hookSpecificOutput: { permissionDecision: 'deny' } };
+
+it('keeps native child text out of main output while preserving parent text and activity', async () => {
+  sdkMessages.push(
+    {
+      type: 'assistant',
+      parent_tool_use_id: 'native-planner-launch',
+      message: { content: [{ type: 'text', text: '<message to="principal">PLANNER_MUST_NOT_SEND</message>' }] },
+    },
+    {
+      type: 'assistant',
+      parent_tool_use_id: null,
+      message: { content: [{ type: 'text', text: '<internal>Parent is reviewing the proposal.</internal>' }] },
+    },
+  );
+  const provider = createProvider('claude');
+  provider.registerMemorySessionHook(MEMORY_SESSION_HOOK);
+  const events = [];
+  for await (const event of provider.query({ prompt: 'Plan the days.', cwd: directory }).events) events.push(event);
+  expect(events.filter((event) => event.type === 'text').map((event) => event.text)).toEqual([
+    '<internal>Parent is reviewing the proposal.</internal>',
+  ]);
+  expect(events.filter((event) => event.type === 'activity')).toHaveLength(3);
+});
 
 it('enables both native planning definitions only with main’s capability and its host flag', async () => {
   expect(Object.keys((await query()).agents ?? {})).toEqual(['look-back', 'look-ahead']);

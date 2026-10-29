@@ -440,6 +440,8 @@ export class ClaudeProvider implements AgentProvider {
         if (message.type === 'system' && message.subtype === 'init') {
           yield { type: 'init', continuation: message.session_id };
         } else if (message.type === 'assistant') {
+          // The SDK also streams child text; only main may turn a planning result into a delivered message.
+          if (planning && typeof message.parent_tool_use_id === 'string') continue;
           // Surface each assistant message's text as it streams in. The final
           // `result` event only carries the LAST assistant text — a wrapped
           // <message> block composed between tool calls would otherwise be
