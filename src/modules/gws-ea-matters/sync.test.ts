@@ -66,6 +66,7 @@ import {
   runnerReads,
   runOccurrence,
   seedMain,
+  taskContent,
   taskRows,
   type TaskRow,
 } from './testing/main-conversation.js';
@@ -171,6 +172,46 @@ describe('the evening close', () => {
     expect(
       await withExistingMailboxSession(MAIN, close.id, (mailbox) => mailbox.getInboundRecords().map((item) => item.id)),
     ).not.toContain('principal-during-close');
+  });
+
+  it('arms its task with the evening script, which the runner runs before the turn', async () => {
+    await keepMattersOnTime();
+    const row = await closeRow();
+    expect(taskContent(row)).toMatchObject({
+      script: `ncl matters evening --run ${row.id}`,
+      prompt: expect.stringContaining(`Close-run: ${row.id}.`),
+    });
+  });
+
+  it('answers a close that is not due yet with no wake, and leaves it pending', async () => {
+    await keepMattersOnTime();
+    const session = await closeSession();
+    const row = await closeRow();
+    expect(Date.parse(row.process_after)).toBeGreaterThan(Date.now());
+    expect(await closeVerdict(session.id, row.id)).toEqual({ wakeAgent: false, data: [] });
+    expect((await closeRuns()).at(-1)).toMatchObject({ id: row.id, state: 'pending', started_at: null });
+    expect(await getOpenCloseRun(session.id)).toBeUndefined();
+  });
+
+  it('leaves main a quiet report as a host receipt that wakes nothing', async () => {
+    await keepMattersOnTime();
+    const session = await closeSession();
+    const row = await closeRow();
+    vi.setSystemTime(new Date(row.process_after));
+    await closeVerdict(session.id, row.id);
+    await capture(row.id, session.id);
+    vi.mocked(requestWake).mockClear();
+    await finishClose(session.id, row.id, 'Quiet close; nothing needs Morgan tonight.');
+    expect(requestWake).not.toHaveBeenCalled();
+    const [report] =
+      (await withExistingMailboxSession(MAIN, (await mainSession()).id, (mailbox) =>
+        mailbox.getInboundRecords().filter((item) => item.id === `close-report-${row.id}`),
+      )) ?? [];
+    expect(report).toMatchObject({ trigger: false });
+    expect(JSON.parse(report.content)).toMatchObject({
+      text: 'Quiet close; nothing needs Morgan tonight.',
+      noteKind: 'host-receipt',
+    });
   });
 
   it('reports eleven hours of lateness after the host misses the evening', async () => {
