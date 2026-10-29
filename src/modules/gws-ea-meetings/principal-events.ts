@@ -54,7 +54,9 @@ import {
   type CalendarEntry,
   type EventGuests,
   type GuestRecord,
+  type GuestWriteResult,
   type MeetingsCalendarApi,
+  type NewEvent,
   type SendUpdates,
   type DetailedEvent,
   type EventWrite,
@@ -592,6 +594,26 @@ export function createPrincipalEventTools(deps: PrincipalEventToolsDeps) {
       throw forbidden('That calendar does not allow Google Meet links: give the place in location instead.');
     }
     const eventId = eventIdFor('event', requestId);
+    const preparedEvent: NewEvent = {
+      summary: title,
+      ...(notes === undefined ? {} : { description: notes }),
+      ...(location === undefined ? {} : { location }),
+      ...(videoCall ? { conference: { requestId: eventIdFor('meet', eventId) } } : {}),
+      start,
+      end,
+      ...(allDay ? { allDay: true } : { timeZone: timezone }),
+      ...(recurrence === undefined ? {} : { recurrence }),
+      attendees,
+      transparency: free ? 'transparent' : 'opaque',
+      ...(hidden ? { visibility: 'private' as const } : {}),
+      reminders: 'default',
+      tags: {
+        ...linkedTags(content),
+        ...(matterId ? { [WEEK_TAGS.matter]: matterId } : {}),
+        [WEEK_TAGS.assistantWritten]: 'true',
+        ...(typeof content.kind === 'string' ? { [WEEK_TAGS.meetingKind]: content.kind } : {}),
+      },
+    };
     await beginCalendarWrite({
       requestId,
       calendarId: entry.id,
@@ -599,34 +621,20 @@ export function createPrincipalEventTools(deps: PrincipalEventToolsDeps) {
       action: 'create_event',
       request: content,
       before: null,
+      plan: { patch: preparedEvent },
       affectedStart: allDay ? `${start}T00:00:00Z` : start,
       affectedEnd: allDay ? `${end}T00:00:00Z` : end,
     });
-    const inserted = await calendar().insertEvent(
-      entry.id,
-      eventId,
-      {
-        summary: title,
-        ...(notes === undefined ? {} : { description: notes }),
-        ...(location === undefined ? {} : { location }),
-        ...(videoCall ? { conference: { requestId: eventIdFor('meet', eventId) } } : {}),
-        start,
-        end,
-        ...(allDay ? { allDay: true } : { timeZone: timezone }),
-        ...(recurrence === undefined ? {} : { recurrence }),
-        attendees,
-        transparency: free ? 'transparent' : 'opaque',
-        ...(hidden ? { visibility: 'private' as const } : {}),
-        reminders: 'default',
-        tags: {
-          ...linkedTags(content),
-          ...(matterId ? { [WEEK_TAGS.matter]: matterId } : {}),
-          [WEEK_TAGS.assistantWritten]: 'true',
-          ...(typeof content.kind === 'string' ? { [WEEK_TAGS.meetingKind]: content.kind } : {}),
-        },
-      },
-      tellsGuests ? 'all' : 'none',
-    );
+    let inserted: 'created' | 'exists';
+    try {
+      inserted = await calendar().insertEvent(entry.id, eventId, preparedEvent, tellsGuests ? 'all' : 'none');
+    } catch (error) {
+      if (error instanceof GoogleApiError && error.status > 0 && error.status < 500) throw error;
+      log.warn('Calendar insert returned no result; checking its live event', { requestId, error });
+      const made = await calendar().getEventDetail(entry.id, eventId);
+      if (!made || made.status === 'cancelled' || !appliedPatch(made, preparedEvent)) throw error;
+      inserted = 'created';
+    }
     if (inserted === 'exists') {
       // A replay: this request made the event before, and its guests heard of it then. It stands
       // as it is now, unless someone has deleted it since, and an event deleted is not put back.
@@ -754,7 +762,27 @@ export function createPrincipalEventTools(deps: PrincipalEventToolsDeps) {
       }
       const tellsGuests = googleTells(owner, principal, [...added, ...removed]);
       const sendUpdates = tellsGuests ? 'all' : 'none';
-      const written = await calendar().setGuests(entry.id, eventId, next, sendUpdates, current.etag);
+      let written: GuestWriteResult;
+      try {
+        written = await calendar().setGuests(entry.id, eventId, next, sendUpdates, current.etag);
+      } catch (error) {
+        if (error instanceof GoogleApiError && error.status > 0 && error.status < 500) throw error;
+        log.warn('Calendar guest write returned no result; checking its live guests', {
+          calendarId: entry.id,
+          eventId,
+          error,
+        });
+        const after = await calendar().getGuests(entry.id, eventId);
+        if (
+          !after ||
+          after.status === 'cancelled' ||
+          after.organizer !== organizer ||
+          after.attendeesOmitted ||
+          guestChange(entry.id, after.guests, add, remove).next !== undefined
+        )
+          throw error;
+        written = 'set';
+      }
       if (written === 'gone') throw forbidden(`No event ${eventId} on that calendar.`);
       if (written === 'set') {
         recordOwnChange(owner, entry.id, eventId);
@@ -824,22 +852,40 @@ export function createPrincipalEventTools(deps: PrincipalEventToolsDeps) {
       const organizes = own.organizer === true;
       if (organizes && current.attendeesOmitted === true) throw forbidden(INCOMPLETE_LIST);
       const sendUpdates: SendUpdates = organizes || principal.has(current.organizer) ? 'none' : 'all';
-      const written = organizes
-        ? await calendar().setGuests(
-            entry.id,
-            eventId,
-            current.guests.map((guest) => (guest === own ? next : guest)),
-            sendUpdates,
-            current.etag,
-          )
-        : await calendar().setOwnEntry(entry.id, eventId, next, sendUpdates, current.etag);
+      let written: GuestWriteResult;
+      let after: EventGuests | undefined;
+      try {
+        written = organizes
+          ? await calendar().setGuests(
+              entry.id,
+              eventId,
+              current.guests.map((guest) => (guest === own ? next : guest)),
+              sendUpdates,
+              current.etag,
+            )
+          : await calendar().setOwnEntry(entry.id, eventId, next, sendUpdates, current.etag);
+      } catch (error) {
+        if (error instanceof GoogleApiError && error.status > 0 && error.status < 500) throw error;
+        log.warn('Calendar response write returned no result; checking its live response', {
+          calendarId: entry.id,
+          eventId,
+          error,
+        });
+        after = await calendar().getGuests(entry.id, eventId);
+        if (
+          !after ||
+          after.status === 'cancelled' ||
+          after.guests.find((guest) => guest.self === true)?.responseStatus !== response
+        )
+          throw error;
+        written = 'set';
+      }
       if (written === 'gone') throw forbidden(noEvent);
       if (written === 'changed') continue;
 
       const notice = sendUpdates === 'all' ? 'Google was asked to tell the organizer.' : 'Google emailed no one.';
-      let after: EventGuests | undefined;
       try {
-        after = await calendar().getGuests(entry.id, eventId);
+        after ??= await calendar().getGuests(entry.id, eventId);
       } catch (error) {
         // Google took the write; only reading it back failed, so the answer is unconfirmed, not refused.
         if (!(error instanceof GoogleApiError)) throw error;

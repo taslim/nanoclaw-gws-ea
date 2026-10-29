@@ -239,6 +239,38 @@ afterEach(async () => {
 });
 
 describe('create_event', () => {
+  it('confirms an applied insert after a lost reply before caching its first action answer', async () => {
+    calendar.failNext({ op: 'insert', afterApplying: true, error: new Error('The insert reply was lost.') });
+    const request = { ...FOCUS, guests: [REMY] };
+    const first = data(await send(main, 'create_event', request, 'create-lost-reply'));
+    const second = data(await send(main, 'create_event', request, 'create-lost-reply'));
+    expect(first.message).toContain('Added');
+    expect(second).toEqual(first);
+    expect(calendar.writes).toEqual([expect.objectContaining({ op: 'insert', sendUpdates: 'all' })]);
+    expect(calendar.event(PRINCIPAL, String(first.event))?.status).toBe('confirmed');
+  });
+  it('confirms guest and response writes after lost replies without issuing either write twice', async () => {
+    calendar.put(teamSync([PRINCIPAL_GUEST]));
+    calendar.failNext({ op: 'guests', afterApplying: true, error: new Error('The guest reply was lost.') });
+    const guests = { calendar: PRINCIPAL, event: 'teamsync01', add: [REMY] };
+    const first = data(await send(main, 'change_guests', guests, 'guest-lost-reply'));
+    expect(data(await send(main, 'change_guests', guests, 'guest-lost-reply'))).toEqual(first);
+    expect(first.guests).toEqual([REMY]);
+    calendar.put({
+      ...teamSync([
+        { email: PRINCIPAL, self: true, responseStatus: 'needsAction' },
+        { email: REMY, organizer: true, responseStatus: 'accepted' },
+      ]),
+      id: 'foreigninvite',
+      organizer: { email: REMY },
+    });
+    calendar.failNext({ op: 'own', afterApplying: true, error: new Error('The response reply was lost.') });
+    const answer = { calendar: PRINCIPAL, event: 'foreigninvite', response: 'declined' };
+    const response = data(await send(main, 'respond_to_event', answer, 'response-lost-reply'));
+    expect(data(await send(main, 'respond_to_event', answer, 'response-lost-reply'))).toEqual(response);
+    expect(response.response).toBe('declined');
+    expect(calendar.writes.map((write) => write.op)).toEqual(['guests', 'own']);
+  });
   it('creates a future event on its covering stay clock without changing the home profile', async () => {
     await addStay({
       locality: 'Brussels',

@@ -129,10 +129,20 @@ function apply(written: StoredEvent, fields: EventWrite, meet: EventConference['
     ...(conference === undefined ? {} : { conference }),
     ...(fields.start === undefined
       ? {}
-      : { start: fields.allDay === true ? { date: fields.start } : { dateTime: fields.start } }),
+      : {
+          start:
+            fields.allDay === true
+              ? { date: fields.start }
+              : { dateTime: fields.start, ...(fields.timeZone === undefined ? {} : { timeZone: fields.timeZone }) },
+        }),
     ...(fields.end === undefined
       ? {}
-      : { end: fields.allDay === true ? { date: fields.end } : { dateTime: fields.end } }),
+      : {
+          end:
+            fields.allDay === true
+              ? { date: fields.end }
+              : { dateTime: fields.end, ...(fields.timeZone === undefined ? {} : { timeZone: fields.timeZone }) },
+        }),
     ...(fields.recurrence === undefined ? {} : { recurrence: [...fields.recurrence] }),
     ...(fields.visibility === undefined ? {} : { visibility: fields.visibility }),
     ...(fields.transparency === undefined ? {} : { transparency: fields.transparency }),
