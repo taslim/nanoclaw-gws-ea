@@ -49,20 +49,20 @@ function summarizeSchedulingPreferences(values: SchedulingPreferenceValues): str
     [
       [
         'Meal windows',
-        (values.meal_windows ?? []).map(
+        values.meal_windows.map(
           (value) =>
             `- ${value.meal}: ${days(value.weekdays)} ${value.start}-${value.end}, ${minutes(value.minutes)} free ${source(value)}`,
         ),
       ],
       [
         'Back-to-back limit',
-        (values.back_to_back ?? []).map(
+        values.back_to_back.map(
           (value) => `- ${minutes(value.minutes)}, with ${minutes(value.break_minutes)} breaks ${source(value)}`,
         ),
       ],
       [
         'Ignored calendar copies',
-        (values.ignored_events ?? []).map((value) => `- Event IDs beginning ${value.prefix} ${source(value)}`),
+        values.ignored_events.map((value) => `- Event IDs beginning ${value.prefix} ${source(value)}`),
       ],
       [
         'Working hours',

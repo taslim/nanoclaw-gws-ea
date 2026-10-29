@@ -97,9 +97,9 @@ export interface IgnoredEventsPreference extends Provenance {
 }
 
 export interface SchedulingPreferences {
-  readonly meal_windows?: readonly MealWindowPreference[];
-  readonly back_to_back?: readonly BackToBackPreference[];
-  readonly ignored_events?: readonly IgnoredEventsPreference[];
+  readonly meal_windows: readonly MealWindowPreference[];
+  readonly back_to_back: readonly BackToBackPreference[];
+  readonly ignored_events: readonly IgnoredEventsPreference[];
   readonly working_hours: readonly WorkingHoursPreference[];
   readonly protected_windows: readonly ProtectedWindowPreference[];
   readonly meeting_lengths: readonly MeetingLengthPreference[];
@@ -124,9 +124,7 @@ export type SchedulingPreference = PreferenceByKind[PreferenceKind];
 export type PreferenceValue<T> = T extends unknown ? Omit<T, MainOnlyPreferenceField> : never;
 
 export type SchedulingPreferenceValues = {
-  readonly [K in keyof SchedulingPreferences]: readonly PreferenceValue<
-    NonNullable<SchedulingPreferences[K]>[number]
-  >[];
+  readonly [K in keyof SchedulingPreferences]: readonly PreferenceValue<SchedulingPreferences[K][number]>[];
 };
 
 interface ClockRangeInput {
@@ -442,13 +440,13 @@ interface IgnoredRow extends ValueRow {
 }
 function readPlanningPreferences(
   main: true,
-): Promise<Pick<Required<SchedulingPreferences>, 'meal_windows' | 'back_to_back' | 'ignored_events'>>;
+): Promise<Pick<SchedulingPreferences, 'meal_windows' | 'back_to_back' | 'ignored_events'>>;
 function readPlanningPreferences(
   main: false,
-): Promise<Pick<Required<SchedulingPreferenceValues>, 'meal_windows' | 'back_to_back' | 'ignored_events'>>;
+): Promise<Pick<SchedulingPreferenceValues, 'meal_windows' | 'back_to_back' | 'ignored_events'>>;
 async function readPlanningPreferences(
   main: boolean,
-): Promise<Pick<Required<SchedulingPreferenceValues>, 'meal_windows' | 'back_to_back' | 'ignored_events'>> {
+): Promise<Pick<SchedulingPreferenceValues, 'meal_windows' | 'back_to_back' | 'ignored_events'>> {
   const db = getDb();
   const provenance = main ? 'source, updated_at, basis' : 'source, updated_at';
   const meal = await db.all<MealRow & BasisRow>(
