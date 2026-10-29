@@ -103,11 +103,12 @@ function summarizeSchedulingPreferences(values: SchedulingPreferenceValues): str
 
 /**
  * Main's role directs it to the live store it changes. `external-email` gets
- * none: it learns the principal's time only as free slots from the host.
- * The browser gets none either: it sees only its errand, and the brief that
- * sends one carries whatever bounds the errand needs. Other groups cannot
- * read the store, so they get the values as of their container's start,
- * never a basis or a reason.
+ * none: the host's free-time answers carry what it needs, windows fitted to
+ * the kind it names and the recorded meeting lengths. The browser gets none
+ * either: it sees only its errand, and the brief that sends one carries
+ * whatever bounds the errand needs. Other groups cannot read the store, so
+ * they get the values as of their container's start, never a basis or a
+ * reason.
  */
 async function preferencesSection(group: AgentGroup): Promise<RequiredProjectDocSection | undefined> {
   if (!(await getDb().hasTable('gws_ea_pref_working_hours'))) return undefined;
