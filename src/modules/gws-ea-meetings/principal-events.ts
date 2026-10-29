@@ -356,7 +356,7 @@ function guestChange(
 }
 
 /** The assistant's when one of its own addresses names it, which can never be one of the principal's. */
-function ownerOf(
+export function ownerOf(
   entry: CalendarEntry,
   principal: PrincipalRecognizer,
   assistant: ReadonlySet<string>,

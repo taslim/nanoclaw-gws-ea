@@ -172,6 +172,15 @@ describe('calendar answers', () => {
     ]);
     expect(events(1)).toEqual([]);
   });
+  it('names each copy of an event on another principal calendar', () => {
+    const meeting = event('review', '2026-10-05T16:00:00Z', '2026-10-05T17:00:00Z', { iCalUID: 'review-uid' });
+    const team = { ...meeting, calendarId: 'team@ellery.example', event: { ...meeting.event, id: 'review-copy' } };
+    const text = renderDays(buildWeek(input([meeting, team])));
+    expect(text).toMatch(/^1 events across/u);
+    expect(text).toContain(
+      'event review on calendar morgan@ellery.example\nCopy: event review-copy on calendar team@ellery.example',
+    );
+  });
   it('bounds complete framed entries and says how many remain', () => {
     const text = boundedCalendarMessage(
       'Calendar',
