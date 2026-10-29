@@ -160,3 +160,28 @@ it('slows a watch whose changes keep matching nothing, to at most an hour, but n
   expect(plan('2026-10-25T01:00:05Z', 5, [release]).interval).toBe(policy.floorMs);
   expect(iso(plan('2026-10-25T00:30:00Z', 5, [release]).at)).toBe('2026-10-25T01:00:05.000Z');
 });
+
+it('uses the covering stay for a watch moment while retaining the home zone after the stay', async () => {
+  const { initTestDb, runMigrations, closeDb } = await import('../../db/index.js');
+  await import('../gws-ea-profile/index.js');
+  await import('../gws-ea-whereabouts/index.js');
+  const { addStay } = await import('../gws-ea-whereabouts/db.js');
+  const { principalClock } = await import('./watch-policy.js');
+  const db = await initTestDb();
+  try {
+    await runMigrations(db);
+    await db.run("UPDATE gws_ea_profile SET principal_timezone='America/Los_Angeles'");
+    await addStay({
+      locality: 'Brussels',
+      zone: 'Europe/Brussels',
+      source: 'said',
+      certainty: 'certain',
+      start: '2026-11-10T00:00:00Z',
+      end: '2026-11-15T00:00:00Z',
+    });
+    expect(await principalClock(Date.parse('2026-11-12T20:00Z'))).toBe('Europe/Brussels');
+    expect(await principalClock(Date.parse('2026-11-16T20:00Z'))).toBe('America/Los_Angeles');
+  } finally {
+    await closeDb();
+  }
+});

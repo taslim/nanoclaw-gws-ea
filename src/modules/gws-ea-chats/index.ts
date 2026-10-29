@@ -1,4 +1,5 @@
 import { log } from '../../log.js';
+import '../gws-ea-whereabouts/index.js';
 import { setMembershipHandler } from '../../channels/chat-sdk-bridge.js';
 import { getDb } from '../../db/connection.js';
 import { registerMigration } from '../../db/migrations/index.js';

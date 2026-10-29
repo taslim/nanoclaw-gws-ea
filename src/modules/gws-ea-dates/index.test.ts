@@ -14,6 +14,7 @@ import {
   type OutboundSend,
 } from '../../delivery.js';
 import '../gws-ea-profile/index.js';
+import '../gws-ea-whereabouts/index.js';
 import { judgeDates, WEEKDAY_GUARD_ID, weekdayRefusal } from './index.js';
 
 /** Wednesday 7 October 2026, 23:30 in Los Angeles: already Thursday 8 October in Tokyo. */
@@ -88,5 +89,23 @@ describe('the outgoing date check', () => {
     await expect(refused).rejects.toMatchObject({ guardId: WEEKDAY_GUARD_ID });
     await guarded.deliver('gchat', 'spaces/dm', null, 'chat', JSON.stringify({ text: 'Wed 14 Oct works.' }));
     expect(sent).toEqual([JSON.stringify({ text: 'Wed 14 Oct works.' })]);
+  });
+});
+
+it('reads an unqualified date from the covering stay without changing the home profile', async () => {
+  await import('../gws-ea-whereabouts/index.js');
+  await runMigrations(getDb());
+  const { addStay } = await import('../gws-ea-whereabouts/db.js');
+  await addStay({
+    locality: 'Tokyo',
+    zone: 'Asia/Tokyo',
+    source: 'said',
+    certainty: 'certain',
+    start: '2026-10-08T00:00:00Z',
+    end: '2026-10-09T00:00:00Z',
+  });
+  expect(await weekdayRefusal(['Tuesday 9 June'])).toMatch(/but 9 June 2027 is a Wednesday\./u);
+  expect(await getDb().get('SELECT principal_timezone FROM gws_ea_profile')).toMatchObject({
+    principal_timezone: 'America/Los_Angeles',
   });
 });

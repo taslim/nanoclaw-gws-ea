@@ -1,5 +1,5 @@
 import { TIMEZONE } from '../../config.js';
-import { principalNameAndTimezone } from '../gws-ea-profile/db.js';
+import { loadTimeline, zoneAt } from '../gws-ea-whereabouts/timeline.js';
 import { zonedDate, zonedInstant } from './iso-time.js';
 
 /**
@@ -38,9 +38,9 @@ function clockHour(at: number, timeZone: string): number {
   const parts = new Intl.DateTimeFormat('en-US', { timeZone, hour: '2-digit', hourCycle: 'h23' }).formatToParts(at);
   return Number(parts.find((part) => part.type === 'hour')?.value);
 }
-/** Read from the profile on each call, so a timezone change holds at once; the install timezone until one is set. */
-export async function principalClock(): Promise<string> {
-  return (await principalNameAndTimezone()).timezone ?? TIMEZONE;
+/** One current whereabouts snapshot for the moment this browser operation concerns. */
+export async function principalClock(at = Date.now()): Promise<string> {
+  return zoneAt(await loadTimeline(), at) ?? TIMEZONE;
 }
 export function watchQuietUntil(policy: WatchSitePolicy, at: number, principalTimeZone: string): number {
   let next = at;

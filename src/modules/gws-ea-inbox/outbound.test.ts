@@ -10,6 +10,7 @@ import fs from 'fs';
 import path from 'path';
 import Database from 'better-sqlite3';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import '../gws-ea-whereabouts/index.js';
 
 const TEST_DIR = '/tmp/nanoclaw-test-gws-ea-outbound';
 /** Beside the data directory, never in it. */

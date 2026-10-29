@@ -1,3 +1,5 @@
+import { TIMEZONE } from '../../config.js';
+import { loadTimeline, zoneAt } from '../gws-ea-whereabouts/timeline.js';
 /**
  * `main`'s email to the principal: its reply in a thread only the principal
  * and the assistant can read, which ordinary delivery hands the adapter for
@@ -98,9 +100,16 @@ export async function sendToPrincipal(
         `there is no email from ${principal} in that thread for you to answer. (thread ${threadKey})`,
       );
     }
+    const timeline = await loadTimeline();
+    const sentAt = anchor.mail.receivedAt ?? runtime.now();
     const body = renderEmail({
       markdown: words.text,
-      quote: { from: anchor.from, sentAt: anchor.mail.receivedAt ?? runtime.now(), text: anchor.mail.text },
+      quote: {
+        from: anchor.from,
+        sentAt,
+        timezone: zoneAt(timeline, sentAt.getTime()) ?? TIMEZONE,
+        text: anchor.mail.text,
+      },
     });
     const from = await assistantMailbox(runtime);
     const visible = await visibleMessageIds(threadKey, 'principal');
