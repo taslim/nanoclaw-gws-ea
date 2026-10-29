@@ -5,7 +5,6 @@ export interface TravelEvent {
   readonly id: string;
   readonly status?: string;
   readonly etag?: string;
-  readonly location?: string;
   readonly principalDeclined?: boolean;
   readonly attendees?: readonly {
     readonly self?: boolean;
@@ -15,6 +14,7 @@ export interface TravelEvent {
   readonly start?: { readonly dateTime?: string; readonly timeZone?: string };
   readonly end?: { readonly dateTime?: string; readonly timeZone?: string };
 }
+/** A leg carries zones and instants only: event text, such as a flight's location, stays on the calendar. */
 export interface DerivedLeg {
   readonly sourceEventId: string;
   readonly sourceVersion: string;
@@ -22,9 +22,6 @@ export interface DerivedLeg {
   readonly arrival: number;
   readonly departureZone: string;
   readonly destinationZone: string;
-  readonly locality: string;
-  /** Destination is held until the next departure; the final leg stays open. */
-  readonly end: number | null;
 }
 
 /** Pure derivation; guest answers and etags are deliberately absent from the digest. */
@@ -50,29 +47,10 @@ export function deriveLegs(events: readonly TravelEvent[]): DerivedLeg[] {
       arrival <= departure
     )
       continue;
-    const locality = event.location?.trim() || destinationZone;
     const sourceVersion = createHash('sha256')
-      .update(
-        JSON.stringify([
-          event.start?.dateTime,
-          event.end?.dateTime,
-          departureZone,
-          destinationZone,
-          event.location ?? null,
-        ]),
-      )
+      .update(JSON.stringify([event.start?.dateTime, event.end?.dateTime, departureZone, destinationZone]))
       .digest('hex');
-    legs.push({
-      sourceEventId: event.id,
-      sourceVersion,
-      departure,
-      arrival,
-      departureZone,
-      destinationZone,
-      locality,
-      end: null,
-    });
+    legs.push({ sourceEventId: event.id, sourceVersion, departure, arrival, departureZone, destinationZone });
   }
-  legs.sort((a, b) => a.departure - b.departure || a.sourceEventId.localeCompare(b.sourceEventId));
-  return legs.map((leg, index) => ({ ...leg, end: legs[index + 1]?.departure ?? null }));
+  return legs.sort((a, b) => a.departure - b.departure || a.sourceEventId.localeCompare(b.sourceEventId));
 }

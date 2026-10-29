@@ -15,11 +15,10 @@ export function gaps(timeline: Timeline): WhereaboutsGap[] {
     result.push({ kind: 'trip-source', message: 'trip source not set (record none if there is none)' });
   for (const leg of timeline.legs)
     if (leg.returnUnknown)
-      result.push({ kind: 'return', sourceEventId: leg.sourceEventId, message: `return from ${leg.locality} unknown` });
+      result.push({
+        kind: 'return',
+        sourceEventId: leg.sourceEventId,
+        message: `return from ${leg.destinationZone ?? 'an unknown zone'} unknown`,
+      });
   return result;
-}
-
-export function gapLine(timeline: Timeline): string | undefined {
-  const missing = gaps(timeline);
-  return missing.length ? `Whereabouts gaps: ${missing.map((gap) => gap.message).join('; ')}.` : undefined;
 }
