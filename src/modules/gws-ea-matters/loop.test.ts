@@ -34,7 +34,6 @@ import { isContainerRunning } from '../../container-runner.js';
 import { closeDb, initTestDb, runMigrations } from '../../db/index.js';
 import { getSession } from '../../db/sessions.js';
 import { withExistingMailboxSession } from '../../session-manager.js';
-import { closeSchedules } from './sync.js';
 import { reconcileSession } from '../../reconcile-session.js';
 import '../gws-ea-inbox/index.js';
 import '../gws-ea-people/index.js';
@@ -47,6 +46,7 @@ import { lookSeries } from './looks.js';
 import { keepMattersOnTime } from './loop.js';
 import {
   answerOccurrence,
+  closeRuns,
   liveTaskRows,
   MAIN,
   mainSession,
@@ -110,7 +110,7 @@ async function looksByMatter(): Promise<Map<string, string[]>> {
 
 async function syncs(): Promise<TaskRow[]> {
   const rows: TaskRow[] = [];
-  for (const schedule of await closeSchedules()) {
+  for (const schedule of await closeRuns()) {
     const session = await getSession(schedule.session_id);
     if (session) rows.push(...liveTaskRows(session));
   }
@@ -299,7 +299,7 @@ describe("the host's guarantees for matters", () => {
       await keepMattersOnTime();
       const [first] = await syncs();
       expect(first.recurrence).toBeNull();
-      const schedule = (await closeSchedules()).find((row) => row.id === first.id)!;
+      const schedule = (await closeRuns()).find((row) => row.id === first.id)!;
       const session = (await getSession(schedule.session_id))!;
       await withExistingMailboxSession(MAIN, session.id, (mailbox) =>
         change === 'cancel' ? mailbox.cancelTask(first.id) : mailbox.pauseTask(first.id),

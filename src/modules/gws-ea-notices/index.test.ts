@@ -57,9 +57,15 @@ import { createThread } from '../gws-ea-inbox/thread-map.js';
 import { getMatter, openMatter } from '../gws-ea-matters/db.js';
 import '../gws-ea-matters/index.js';
 import { lookSeries, openMatterWithLook } from '../gws-ea-matters/looks.js';
-import { closeSchedules, closeVerdict } from '../gws-ea-matters/sync.js';
+import { closeVerdict } from '../gws-ea-matters/sync.js';
 import { keepMattersOnTime } from '../gws-ea-matters/loop.js';
-import { liveTaskRows, mainSession, runOccurrence, seedMain } from '../gws-ea-matters/testing/main-conversation.js';
+import {
+  closeRuns,
+  liveTaskRows,
+  mainSession,
+  runOccurrence,
+  seedMain,
+} from '../gws-ea-matters/testing/main-conversation.js';
 import '../gws-ea-people/index.js';
 import '../gws-ea-preferences/index.js';
 import { recordExternalEmailAgentGroupId } from '../gws-ea-profile/db.js';
@@ -770,7 +776,7 @@ describe('a failed turn the runner reports', () => {
         { kind: 'once', at: new Date(Date.now() + 60_000).toISOString() },
       );
       await keepMattersOnTime();
-      const close = (await closeSchedules()).at(-1);
+      const close = (await closeRuns()).at(-1);
       const look = liveTaskRows(main).find((row) => row.series_id === matter.look_task_id);
       if (!close || !look) throw new Error('No close or no matter look');
       const session = await getSession(close.session_id);
@@ -788,7 +794,7 @@ describe('a failed turn the runner reports', () => {
       expect(sent).toEqual([]);
       const handedBack = (await getMatter(matter.id))?.look_task_id ?? '';
       expect(lookSeries(handedBack)).toEqual({ matterId: matter.id, handedBack: true });
-      const next = (await closeSchedules()).at(-1);
+      const next = (await closeRuns()).at(-1);
       expect(next?.id).not.toBe(close.id);
       expect(liveTaskRows(main).find((row) => row.series_id === handedBack)?.process_after).toBe(next?.scheduled_at);
       expect(await getDb().get('SELECT state FROM gws_ea_close_runs WHERE id=?', close.id)).toEqual({
@@ -816,7 +822,7 @@ describe('a failed turn the runner reports', () => {
     await drain(main, 1);
     await keepMattersOnTime();
 
-    const sync = (await closeSchedules()).at(-1)?.scheduled_at;
+    const sync = (await closeRuns()).at(-1)?.scheduled_at;
     expect(sync).toBeDefined();
     const retry = liveTaskRows(main).find((row) => row.series_id === matter.look_task_id);
     expect(retry).toMatchObject({ recurrence: yearly, process_after: sync });
@@ -851,7 +857,7 @@ describe('a failed turn the runner reports', () => {
     await keepMattersOnTime();
 
     expect(facts()).toEqual([]);
-    const sync = (await closeSchedules()).at(-1)?.scheduled_at;
+    const sync = (await closeRuns()).at(-1)?.scheduled_at;
     expect(sync).toBeDefined();
     expect(liveTaskRows(main).find((row) => row.series_id === matter.look_task_id)).toMatchObject({
       recurrence: yearly,

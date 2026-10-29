@@ -3,7 +3,6 @@
  * ledger, delivery and note boundaries. Google stays in memory.
  */
 import fs from 'node:fs';
-import Database from 'better-sqlite3';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -22,7 +21,6 @@ vi.mock('../../config.js', async (importOriginal) => ({
 vi.mock('../../container-runner.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../container-runner.js')>()),
   isContainerRunning: vi.fn(() => false),
-  killContainer: vi.fn((_id: string, _reason: string, onExit?: () => void) => onExit?.()),
 }));
 
 vi.mock('../../request-wake.js', () => ({ requestWake: vi.fn().mockResolvedValue(true) }));
@@ -37,15 +35,13 @@ vi.mock('../gws-ea-inbox/gmail-api.js', async (importOriginal) => ({
 }));
 
 import { dispatch } from '../../cli/dispatch.js';
-import { deliverSessionMessages, setDeliveryAdapter } from '../../delivery.js';
-import { outboundDbPath } from '../../mailbox/sqlite/paths.js';
-import { isContainerRunning, killContainer } from '../../container-runner.js';
+import { isContainerRunning } from '../../container-runner.js';
 import type { CallerContext, ResponseFrame } from '../../cli/frame.js';
 import { closeDb, getDb, initTestDb, runMigrations } from '../../db/index.js';
-import { getSession, getSessionsByAgentGroup } from '../../db/sessions.js';
+import { getSession } from '../../db/sessions.js';
 import { requestWake } from '../../request-wake.js';
 import { recordCloseLedger, getOpenCloseRun, lastCompletedClose } from './close-runs.js';
-import { keepClose, closeSchedules, closeVerdict, finishClose, forgetSundaySnapshot } from './sync.js';
+import { cancelDailySync, keepClose, closeVerdict, finishClose, forgetSundaySnapshot } from './sync.js';
 import { addStay, setEventTravel } from '../gws-ea-whereabouts/db.js';
 import { sessionDir, withExistingMailboxSession, writeSessionMessage } from '../../session-manager.js';
 import '../gws-ea-inbox/index.js';
@@ -55,13 +51,13 @@ import '../gws-ea-people/index.js';
 import '../gws-ea-preferences/index.js';
 import '../gws-ea-profile/index.js';
 import { writeNoteForMain } from '../gws-ea-profile/main-note.js';
-import * as mainNotes from '../gws-ea-profile/main-note.js';
 import { createScheduledTask, prepareScheduledTask } from '../scheduling/create.js';
 import type { Matter, Placed } from './db.js';
 import './index.js';
 import { keepMattersOnTime } from './loop.js';
 import {
   answerOccurrence,
+  closeRuns,
   liveTaskRows,
   MAIN,
   mainSession,
@@ -70,6 +66,7 @@ import {
   runnerReads,
   runOccurrence,
   seedMain,
+  taskContent,
   taskRows,
   type TaskRow,
 } from './testing/main-conversation.js';
@@ -102,8 +99,8 @@ async function open(title: string, look: Record<string, string>, links: Record<s
 }
 
 async function closeSession(): Promise<import('../../types.js').Session> {
-  const schedule = (await closeSchedules()).at(-1);
-  if (!schedule) throw new Error('No close schedule');
+  const schedule = (await closeRuns()).at(-1);
+  if (!schedule) throw new Error('No close run');
   const session = await getSession(schedule.session_id);
   if (!session) throw new Error('No close session');
   return session;
@@ -114,22 +111,7 @@ async function closeRow(): Promise<TaskRow> {
   return rows[0];
 }
 async function capture(id: string, sessionId: string): Promise<void> {
-  await recordCloseLedger(id, sessionId, { from: null, through: new Date().toISOString(), writes: [] });
-}
-
-function queueCloseWrite(session: import('../../types.js').Session, requestId: string, title: string): void {
-  const db = new Database(outboundDbPath(MAIN, session.id));
-  db.prepare("INSERT INTO messages_out (id,timestamp,kind,content) VALUES (?,?,'system',?)").run(
-    requestId,
-    new Date().toISOString(),
-    JSON.stringify({
-      action: 'cli_request',
-      requestId,
-      command: 'matters-open',
-      args: { title, open_loop: 'Prepare the brief.', look: '2032-10-12T12:00' },
-    }),
-  );
-  db.close();
+  await recordCloseLedger(id, sessionId, { from: null, through: new Date().toISOString(), writes: [], inbound: {} });
 }
 
 let gmail: FakeGmailThreads;
@@ -139,9 +121,6 @@ beforeEach(async () => {
   vi.useFakeTimers({ toFake: ['Date'] });
   vi.setSystemTime(new Date(MONDAY_6AM));
   vi.mocked(isContainerRunning).mockReturnValue(false);
-  vi.mocked(killContainer)
-    .mockReset()
-    .mockImplementation((_id, _reason, onExit) => onExit?.());
   fs.rmSync(DATA_DIR, { recursive: true, force: true });
   fs.mkdirSync(DATA_DIR, { recursive: true });
   scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'gws-ea-matters-sync-'));
@@ -176,7 +155,7 @@ describe('the evening close', () => {
     );
     expect(JSON.parse(isolated.row.content).inConversation).toBeUndefined();
     await keepMattersOnTime();
-    expect(await closeSchedules()).toHaveLength(1);
+    expect(await closeRuns()).toHaveLength(1);
     // A principal message keeps the normal conversation route while this close awaits background results.
     await writeSessionMessage(MAIN, main.id, {
       id: 'principal-during-close',
@@ -195,6 +174,46 @@ describe('the evening close', () => {
     ).not.toContain('principal-during-close');
   });
 
+  it('arms its task with the evening script, which the runner runs before the turn', async () => {
+    await keepMattersOnTime();
+    const row = await closeRow();
+    expect(taskContent(row)).toMatchObject({
+      script: `ncl matters evening --run ${row.id}`,
+      prompt: expect.stringContaining(`Close-run: ${row.id}.`),
+    });
+  });
+
+  it('answers a close that is not due yet with no wake, and leaves it pending', async () => {
+    await keepMattersOnTime();
+    const session = await closeSession();
+    const row = await closeRow();
+    expect(Date.parse(row.process_after)).toBeGreaterThan(Date.now());
+    expect(await closeVerdict(session.id, row.id)).toEqual({ wakeAgent: false, data: [] });
+    expect((await closeRuns()).at(-1)).toMatchObject({ id: row.id, state: 'pending', started_at: null });
+    expect(await getOpenCloseRun(session.id)).toBeUndefined();
+  });
+
+  it('leaves main a quiet report as a host receipt that wakes nothing', async () => {
+    await keepMattersOnTime();
+    const session = await closeSession();
+    const row = await closeRow();
+    vi.setSystemTime(new Date(row.process_after));
+    await closeVerdict(session.id, row.id);
+    await capture(row.id, session.id);
+    vi.mocked(requestWake).mockClear();
+    await finishClose(session.id, row.id, 'Quiet close; nothing needs Morgan tonight.');
+    expect(requestWake).not.toHaveBeenCalled();
+    const [report] =
+      (await withExistingMailboxSession(MAIN, (await mainSession()).id, (mailbox) =>
+        mailbox.getInboundRecords().filter((item) => item.id === `close-report-${row.id}`),
+      )) ?? [];
+    expect(report).toMatchObject({ trigger: false });
+    expect(JSON.parse(report.content)).toMatchObject({
+      text: 'Quiet close; nothing needs Morgan tonight.',
+      noteKind: 'host-receipt',
+    });
+  });
+
   it('reports eleven hours of lateness after the host misses the evening', async () => {
     await keepMattersOnTime();
     const session = await closeSession();
@@ -210,7 +229,21 @@ describe('the evening close', () => {
     });
     expect(await runnerReads(printed(response), scratch)).toMatchObject({ wakeAgent: true });
     expect(printed(response)).toContain('scheduled Oct 12, 2026, 9:00 PM New York time');
+    expect(printed(response)).toContain('Day ledger: everything so far; no close has completed yet.');
     expect(printed(response)).not.toContain(row.process_after);
+  });
+
+  it('leaves hand-backs to main’s own looks at the close, listing none in the close verdict', async () => {
+    const lease = await open('Lease', { look: '2026-10-12T06:10' });
+    const main = await mainSession();
+    await runOccurrence(main, liveTaskRows(main).find((row) => row.series_id === lease.look_task_id)!.id, 'completed');
+    await keepMattersOnTime();
+    const session = await closeSession();
+    const row = await closeRow();
+    vi.setSystemTime(new Date(row.process_after));
+    const verdict = await closeVerdict(session.id, row.id);
+    expect(verdict.wakeAgent).toBe(true);
+    expect(JSON.stringify(verdict.data)).not.toContain(lease.id);
   });
 
   it('re-times an unclaimed close after a new stay, but leaves a claimed close in place', async () => {
@@ -274,7 +307,7 @@ describe('the evening close', () => {
     expect(await lastCompletedClose()).toMatchObject({ id: row.id, ledger_through_at: new Date().toISOString() });
   });
 
-  it('retains a quiet report after a note-write interruption without making it a second wake', async () => {
+  it('keeps a quiet report written before an interruption, without a second note or a wake', async () => {
     await keepMattersOnTime();
     const session = await closeSession();
     const row = await closeRow();
@@ -282,11 +315,6 @@ describe('the evening close', () => {
     await closeVerdict(session.id, row.id);
     await capture(row.id, session.id);
     // The note already crossed the native boundary before completion was recorded.
-    await getDb().run(
-      'UPDATE gws_ea_close_schedule SET report_text=?,report_notify=0 WHERE id=?',
-      'Quiet close.',
-      row.id,
-    );
     await writeNoteForMain({
       id: `close-report-${row.id}`,
       timestamp: new Date().toISOString(),
@@ -295,9 +323,12 @@ describe('the evening close', () => {
       noteKind: 'host-receipt',
     });
     vi.mocked(requestWake).mockClear();
-    await finishClose(session.id, row.id, 'Do not replace the recorded decision.', true);
+    expect(await finishClose(session.id, row.id, 'A changed retry.', true)).toMatchObject({ state: 'completed' });
     expect(requestWake).not.toHaveBeenCalled();
-    expect((await closeSchedules())[0]).toMatchObject({ report_text: 'Quiet close.', report_notify: 0 });
+    const reports = await withExistingMailboxSession(MAIN, (await mainSession()).id, (mailbox) =>
+      mailbox.getInboundRecords().filter((item) => item.id === `close-report-${row.id}`),
+    );
+    expect(reports?.map((item) => (JSON.parse(item.content) as { text: string }).text)).toEqual(['Quiet close.']);
   });
 
   it('fails an acked close only after its container exits, and keeps the ledger window', async () => {
@@ -312,7 +343,8 @@ describe('the evening close', () => {
     expect(await getOpenCloseRun(session.id)).toBeUndefined();
     expect(await getDb().get('SELECT state FROM gws_ea_close_runs WHERE id=?', row.id)).toEqual({ state: 'failed' });
     expect(await lastCompletedClose()).toBeUndefined();
-    expect((await closeSchedules()).at(-1)?.scheduled_at).toBe('2026-10-14T01:00:00.000Z');
+    expect((await closeRuns()).at(-1)?.scheduled_at).toBe('2026-10-14T01:00:00.000Z');
+    expect(await getSession(session.id)).toMatchObject({ status: 'closed' });
   });
 
   it('does not let an old live container starve the next due close', async () => {
@@ -332,113 +364,7 @@ describe('the evening close', () => {
     expect((await closeVerdict(nextSession.id, next.id)).wakeAgent).toBe(true);
   });
 
-  it('closes and stops only the expired close before a successor starts, refusing its stale outbound writes', async () => {
-    const send = vi.fn().mockResolvedValue(undefined);
-    setDeliveryAdapter({ deliver: send });
-    const main = await mainSession();
-    await keepMattersOnTime();
-    const previous = await closeSession();
-    const row = await closeRow();
-    vi.setSystemTime(new Date(row.process_after));
-    await closeVerdict(previous.id, row.id);
-    queueCloseWrite(previous, 'valid-close-write', 'Current close write');
-    await deliverSessionMessages(previous);
-    expect(await getDb().get('SELECT id FROM gws_ea_matters WHERE title=?', 'Current close write')).toBeDefined();
-    vi.mocked(isContainerRunning).mockImplementation((id) => id === previous.id || id === main.id);
-    await keepMattersOnTime();
-    const next = await closeRow();
-    const nextSession = await closeSession();
-    vi.setSystemTime(new Date(next.process_after));
-    let stopped: (() => void) | undefined;
-    vi.mocked(killContainer).mockImplementation((_id, _reason, onExit) => {
-      stopped = onExit;
-    });
-    const starting = closeVerdict(nextSession.id, next.id);
-    await vi.waitFor(() =>
-      expect(killContainer).toHaveBeenCalledWith(previous.id, 'gws-ea-close-retired', expect.any(Function)),
-    );
-    expect(await getSession(previous.id)).toMatchObject({ status: 'closed' });
-    expect(await getOpenCloseRun(previous.id)).toBeUndefined();
-    expect(await getOpenCloseRun(nextSession.id)).toBeUndefined();
-    queueCloseWrite(previous, 'stale-close-write', 'Stale close write');
-    await deliverSessionMessages(previous);
-    expect(await getDb().get('SELECT id FROM gws_ea_matters WHERE title=?', 'Stale close write')).toBeUndefined();
-    expect(await getSession(main.id)).toMatchObject({ status: 'active' });
-    stopped?.();
-    expect((await starting).wakeAgent).toBe(true);
-    expect(await getOpenCloseRun(nextSession.id)).toMatchObject({ id: next.id });
-    expect(vi.mocked(killContainer).mock.calls.map(([id]) => id)).toEqual([previous.id]);
-    expect(send).not.toHaveBeenCalled();
-  });
-
-  it('keeps an expired session fenced and the successor unstarted if its stop fails, then resumes cleanup', async () => {
-    await keepMattersOnTime();
-    const previous = await closeSession();
-    const row = await closeRow();
-    vi.setSystemTime(new Date(row.process_after));
-    await closeVerdict(previous.id, row.id);
-    vi.mocked(isContainerRunning).mockImplementation((id) => id === previous.id);
-    await keepMattersOnTime();
-    const next = await closeRow();
-    const nextSession = await closeSession();
-    vi.setSystemTime(new Date(next.process_after));
-    vi.mocked(killContainer).mockImplementation(() => {
-      throw new Error('Native stop unavailable');
-    });
-    await expect(closeVerdict(nextSession.id, next.id)).rejects.toThrow('Native stop unavailable');
-    expect(await getSession(previous.id)).toMatchObject({ status: 'closed' });
-    expect(await getOpenCloseRun(nextSession.id)).toBeUndefined();
-    vi.mocked(killContainer).mockImplementation((_id, _reason, onExit) => onExit?.());
-    expect((await closeVerdict(nextSession.id, next.id)).wakeAgent).toBe(true);
-  });
-
-  it('finishes an admitted report before retiring its session and opening the successor', async () => {
-    await keepMattersOnTime();
-    const previous = await closeSession();
-    const row = await closeRow();
-    vi.setSystemTime(new Date(row.process_after));
-    await closeVerdict(previous.id, row.id);
-    await capture(row.id, previous.id);
-    vi.mocked(isContainerRunning).mockImplementation((id) => id === previous.id);
-    await keepMattersOnTime();
-    const next = await closeRow();
-    const nextSession = await closeSession();
-    vi.setSystemTime(new Date(next.process_after));
-    let entered!: () => void;
-    const writing = new Promise<void>((resolve) => {
-      entered = resolve;
-    });
-    let release!: () => void;
-    const proceed = new Promise<void>((resolve) => {
-      release = resolve;
-    });
-    const events: string[] = [];
-    const nativeWrite = mainNotes.writeNoteForMain;
-    vi.spyOn(mainNotes, 'writeNoteForMain').mockImplementation(async (note) => {
-      if (note.id === `close-report-${row.id}`) {
-        entered();
-        await proceed;
-      }
-      const written = await nativeWrite(note);
-      events.push('report');
-      return written;
-    });
-    const finishing = finishClose(previous.id, row.id, 'The first close’s report.');
-    await writing;
-    const starting = closeVerdict(nextSession.id, next.id).then((value) => {
-      events.push('successor');
-      return value;
-    });
-    await new Promise<void>((resolve) => setImmediate(resolve));
-    release();
-    const settled = await Promise.allSettled([finishing, starting]);
-    expect(settled.map((result) => result.status)).toEqual(['fulfilled', 'fulfilled']);
-    expect(events).toEqual(['report', 'successor']);
-    expect(await getSession(previous.id)).toMatchObject({ status: 'closed' });
-    expect(await getOpenCloseRun(nextSession.id)).toMatchObject({ id: next.id });
-  });
-
-  it('never recreates or opens the mailbox of a retired historical close', async () => {
+  it('never recreates or opens the mailbox of a completed close', async () => {
     await keepMattersOnTime();
     const previous = await closeSession();
     const row = await closeRow();
@@ -494,11 +420,11 @@ describe('the evening close', () => {
     const row = await closeRow();
     vi.setSystemTime(new Date(row.process_after));
     await closeVerdict(session.id, row.id);
-    await expect(finishClose(session.id, row.id)).rejects.toThrow('captured day ledger');
-    await expect(finishClose((await mainSession()).id, row.id)).rejects.toThrow('captured day ledger');
+    await expect(finishClose(session.id, row.id)).rejects.toThrow('after ncl day has been read');
+    await expect(finishClose((await mainSession()).id, row.id)).rejects.toThrow('after ncl day has been read');
   });
 
-  it('retires an unclaimed daily sync, but lets a claimed old run finish first', async () => {
+  it('cancels the retired daily-sync series, whatever its occurrence is doing', async () => {
     const main = await mainSession();
     const old = await createScheduledTask(
       MAIN,
@@ -511,15 +437,8 @@ describe('the evening close', () => {
       { session: main },
     );
     vi.mocked(isContainerRunning).mockImplementation((id) => id === main.id);
-    await keepMattersOnTime();
-    expect(liveTaskRows(main).find((item) => item.id === old.row.id)?.status).toBe('pending');
-    postAnswer(main, old.row.id, 'completed');
-    vi.mocked(isContainerRunning).mockReturnValue(false);
-    await keepMattersOnTime();
-    expect(liveTaskRows(main).filter((item) => item.series_id.startsWith('gws-ea-daily-sync'))).toEqual([]);
-    expect(
-      (await getSessionsByAgentGroup(MAIN)).filter((item) => item.thread_id?.startsWith('system:gws-ea-close:')),
-    ).toHaveLength(1);
+    await cancelDailySync();
+    expect(liveTaskRows(main).filter((item) => item.series_id === old.row.seriesId)).toEqual([]);
   });
 
   it.each([
@@ -590,12 +509,16 @@ describe('the evening close', () => {
     );
   });
 
-  it('forgets the latest Sunday snapshot without reading memory contents', async () => {
-    const directory = path.join(DATA_DIR, 'groups', MAIN, 'sunday-memory-latest');
-    fs.mkdirSync(directory, { recursive: true });
-    fs.writeFileSync(path.join(directory, 'juno.md'), 'Juno facts');
+  it('forgets the latest Sunday snapshot and the planning results without reading them', async () => {
+    const snapshot = path.join(DATA_DIR, 'groups', MAIN, 'sunday-memory-latest');
+    const runs = path.join(DATA_DIR, 'groups', MAIN, 'planning-runs');
+    fs.mkdirSync(snapshot, { recursive: true });
+    fs.writeFileSync(path.join(snapshot, 'juno.md'), 'Juno facts');
+    fs.mkdirSync(runs, { recursive: true });
+    fs.writeFileSync(path.join(runs, 'agent-1-look-back.md'), 'Close run: close-1\nJuno Hale asked for Friday.');
     await forgetSundaySnapshot();
-    expect(fs.existsSync(directory)).toBe(false);
+    expect(fs.existsSync(snapshot)).toBe(false);
+    expect(fs.existsSync(runs)).toBe(false);
   });
 });
 

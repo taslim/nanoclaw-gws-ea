@@ -78,7 +78,7 @@ function deny(reason: string): SyncHookJSONOutput {
 }
 
 function commandArguments(command: string): string[] | undefined {
-  if (/[;&|`<>\0]/u.test(command) || command.includes('$(')) return undefined;
+  if (command.includes('\0') || command.includes('$(')) return undefined;
   const args: string[] = [];
   let word = '';
   let started = false;
@@ -96,7 +96,7 @@ function commandArguments(command: string): string[] | undefined {
       started = true;
     } else if (quote === '"') {
       if (character === '"') quote = undefined;
-      else if (character === '$') return undefined;
+      else if (character === '$' || character === '`') return undefined;
       else word += character;
     } else if (character === "'" || character === '"') {
       quote = character;
@@ -106,7 +106,7 @@ function commandArguments(command: string): string[] | undefined {
       word = '';
       started = false;
     } else {
-      if (/[$*?()[\]{}~!#]/u.test(character)) return undefined;
+      if (/[$*?()[\]{}~!#;&|<>`]/u.test(character)) return undefined;
       word += character;
       started = true;
     }
@@ -204,12 +204,7 @@ export function createPlanningRuntime(agentDirectory: string): PlanningRuntime {
         const args = typeof value.command === 'string' ? commandArguments(value.command) : undefined;
         if (!args || args[0] !== 'ncl') return deny('Planning Bash permits one literal ncl command only.');
         const pair = args.slice(1, 3).join(' ');
-        if (
-          !(
-            READ_COMMANDS.has(pair) ||
-            (kind === 'look-back' && (BACK_COMMANDS.has(pair) || (args.length === 2 && args[1] === 'day')))
-          )
-        )
+        if (!(READ_COMMANDS.has(pair) || (kind === 'look-back' && BACK_COMMANDS.has(pair))))
           return deny(`The ${kind} ncl command is outside its allowlist.`);
         return {
           hookSpecificOutput: {

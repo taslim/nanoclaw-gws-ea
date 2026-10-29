@@ -32,10 +32,6 @@ export function resolveMatterDueAt(dueAt: string, timeline: Timeline): ResolvedM
   return { instant, zone: zoneAt(timeline, instant), dateOnly: false };
 }
 
-export function matterNeedsTimeline(matter: Pick<Matter, 'due_at' | 'place'>): boolean {
-  return matter.due_at !== null || matter.place !== null;
-}
-
 /** Planning facts stay observations; no deadline or deferral forbids an agent's choice. */
 export function matterPlanningLines(
   matter: Pick<Matter, 'due_at' | 'needs_minutes' | 'place' | 'deferrals'>,

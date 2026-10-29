@@ -121,6 +121,7 @@ gws-ea list
 gws-ea status --id 01234567-89ab-4def-8123-456789abcdef
 gws-ea status --id 01234567-89ab-4def-8123-456789abcdef --details
 gws-ea logs --id 01234567-89ab-4def-8123-456789abcdef --errors
+gws-ea lessons --id 01234567-89ab-4def-8123-456789abcdef
 ```
 
 Copy the full ID from `list`; IDs are never selected implicitly or abbreviated.
@@ -245,10 +246,6 @@ follow-ups. Rollback keeps post-update data unless changed schemas or an explici
 what is retained. Repeat `remove` to continue its teardown journal. External
 resource abandonment needs the command's explicit `--abandon` selection.
 Busy results name the blocked command and offer read-only inspection.
-
-For the daily-sync replacement, see the
-[evening-close migration](gws-ea-evening-close-migration.md) for detection,
-managed rollout, verification and rollback.
 
 `create` and `update` automatically clean a stray NanoClaw install from this
 authoring checkout under the existing ownership rules. This cleanup can happen

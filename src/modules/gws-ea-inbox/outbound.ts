@@ -1,5 +1,4 @@
 import { TIMEZONE } from '../../config.js';
-import { loadTimeline, zoneAt } from '../gws-ea-whereabouts/timeline.js';
 /**
  * Email to anyone but the principal, and `email_send` for both agents.
  *
@@ -240,12 +239,11 @@ async function carriedOver(
   placed: Recipients,
   runtime: InboxRuntime,
 ): Promise<QuotedMessage | undefined> {
-  const timeline = await loadTimeline();
-  const sentAt = anchor.receivedAt ?? runtime.now();
+  // The install's own clock: a quote header in the zone in effect would tell other people where the principal is.
   const quote: QuotedMessage | undefined =
     anchor.from === undefined
       ? undefined
-      : { from: anchor.from, sentAt, timezone: zoneAt(timeline, sentAt.getTime()) ?? TIMEZONE, text: anchor.text };
+      : { from: anchor.from, sentAt: anchor.receivedAt ?? runtime.now(), timezone: TIMEZONE, text: anchor.text };
   const readers = new Set(
     [...(anchor.from === undefined ? [] : [anchor.from]), ...anchor.to, ...anchor.cc].flatMap(
       ({ address }) => normalizeAddress(address) ?? [],

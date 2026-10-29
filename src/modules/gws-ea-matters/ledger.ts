@@ -12,14 +12,16 @@ import { hostGoogleAccessToken } from '../gws-ea-google/index.js';
 import { createMeetingsCalendarApi } from '../gws-ea-meetings/calendar-api.js';
 import { calendarFindings, loadCalendarWeek } from '../gws-ea-meetings/days.js';
 import { eventSpan } from '../gws-ea-meetings/slots.js';
-import {
-  completeCalendarWriteFindings,
-  getCalendarWrite,
-  listCalendarWriteGaps,
-} from '../gws-ea-meetings/week/write-log.js';
+import { completeCalendarWriteFindings, getCalendarWrite } from '../gws-ea-meetings/week/write-log.js';
 import { getMainAgentGroupId } from '../gws-ea-profile/db.js';
 import { loadTimeline, zoneAt } from '../gws-ea-whereabouts/timeline.js';
-import { getOpenCloseRun, lastCompletedClose, recordCloseLedger, type ConsumedCalendarWrite } from './close-runs.js';
+import {
+  getOpenCloseRun,
+  lastCompletedClose,
+  recordCloseLedger,
+  type CloseRun,
+  type ConsumedCalendarWrite,
+} from './close-runs.js';
 
 export interface DaySection {
   readonly key: 'principal' | 'sends' | 'writes' | 'notes' | 'findings';
@@ -61,13 +63,15 @@ async function collect(sections: readonly DaySection[], read: () => Promise<void
   /* eslint-enable no-catch-all/no-catch-all */
 }
 
-function hasHostPrincipalMessageMark(content: string, messageId: string): boolean {
+/** The router stores a routed message under `<platform id>:<agent group id>`; the mark keeps the platform id. */
+function hasHostPrincipalMessageMark(content: string, messageId: string, agentGroupId: string): boolean {
   try {
     const parsed: unknown = JSON.parse(content);
     return (
       isRecord(parsed) &&
       isRecord(parsed.principalMessage) &&
-      parsed.principalMessage.id === messageId &&
+      typeof parsed.principalMessage.id === 'string' &&
+      `${parsed.principalMessage.id}:${agentGroupId}` === messageId &&
       typeof parsed.principalMessage.messagingGroupId === 'string'
     );
   } catch (error) {
@@ -76,19 +80,28 @@ function hasHostPrincipalMessageMark(content: string, messageId: string): boolea
   }
 }
 
-/** Reads facts only. It neither settles notices nor acknowledges findings. */
+/**
+ * Read in an open close's session, it records what that close covers. Its one
+ * findings read covers the day and every write still missing findings, whose
+ * gaps it then closes; pending notices stay pending.
+ */
 export async function readDayLedger(ctx: CallerContext): Promise<DayLedger> {
   const through = new Date().toISOString();
   let main: string | null;
-  let from: string | null;
+  let last: CloseRun | undefined;
   try {
     main = await getMainAgentGroupId();
-    from = (await lastCompletedClose())?.ledger_through_at ?? null;
+    last = await lastCompletedClose();
   } catch (error) {
     throw new Error('The day ledger’s host records are unavailable just now.', { cause: error });
   }
   if (ctx.caller === 'agent' && (main === null || ctx.agentGroupId !== main))
     throw new Error('Only main may read the day ledger.');
+  const from = last?.ledger_through_at ?? null;
+  // Inbound coverage follows arrival order: a message can arrive after a read with a platform time before it.
+  const inbound: Record<string, number> = last?.ledger_inbound_json
+    ? (JSON.parse(last.ledger_inbound_json) as Record<string, number>)
+    : {};
   const timeline = await loadTimeline().catch((_error: unknown) => undefined);
   const displayAt = (at: string): string => {
     const zone = ctx.caller === 'host' ? TIMEZONE : timeline && zoneAt(timeline, Date.parse(at));
@@ -101,22 +114,21 @@ export async function readDayLedger(ctx: CallerContext): Promise<DayLedger> {
   const notes = section('notes');
   const findings = section('findings');
   const result: DayLedger = { from, through, sections: [principal, sends, writes, notes, findings] };
-  const consumed = new Map<string, ConsumedCalendarWrite>();
   await collect([principal, notes, sends], async () => {
     for (const session of main === null ? [] : await getSessionsByAgentGroup(main)) {
       if (session.messaging_group_id === null && session.thread_id?.startsWith('system:')) continue;
       await collect([principal, notes, sends], async () => {
         const read = await withExistingMailboxSession(session.agent_group_id, session.id, async (mailbox) => {
           await collect([principal, notes], async () => {
-            for (const message of mailbox.getInboundRecords(from === null ? {} : { since: from })) {
-              if (
-                !inWindow(message.timestamp, from, through) ||
-                (message.kind !== 'chat' && message.kind !== 'chat-sdk' && message.kind !== 'webhook')
-              )
-                continue;
+            const covered = inbound[session.id] ?? -1;
+            for (const message of mailbox.getInboundRecords()) {
+              const sequence = message.sequence ?? 0;
+              if (sequence <= covered) continue;
+              inbound[session.id] = sequence;
+              if (message.kind !== 'chat' && message.kind !== 'chat-sdk' && message.kind !== 'webhook') continue;
               const text = parseInboundContent(message.content).text;
               if (!text) continue;
-              if (hasHostPrincipalMessageMark(message.content, message.id))
+              if (hasHostPrincipalMessageMark(message.content, message.id, session.agent_group_id))
                 principal.entries.push(`${displayAt(message.timestamp)}; conversation ${session.id}\n${text}`);
               else
                 notes.entries.push(
@@ -145,78 +157,67 @@ export async function readDayLedger(ctx: CallerContext): Promise<DayLedger> {
     }
   });
   const calendar = createMeetingsCalendarApi({ token: () => hostGoogleAccessToken('calendar-host') });
+  const spans = [{ start: from === null ? Date.parse(through) - DAY : Date.parse(from), end: Date.parse(through) }];
+  const shown = new Map<string, ConsumedCalendarWrite>();
+  const gaps = new Map<string, string>();
   await collect([writes], async () => {
-    const gaps = new Set((await listCalendarWriteGaps()).map((write) => write.requestId));
-    const rows = await getDb().all<LoggedWrite>(
+    for (const row of await getDb().all<LoggedWrite>(
       'SELECT request_id,updated_at FROM gws_ea_calendar_write_log WHERE updated_at<=? ORDER BY updated_at,request_id',
       through,
-    );
-    for (const row of rows) {
+    )) {
       const write = await getCalendarWrite(row.request_id);
       if (!write) continue;
-      let checked: string;
-      if (write.state === 'pending') checked = 'Outcome not confirmed; this write is pending. Findings not checked.';
-      else
-        try {
-          if (!timeline) throw new Error('The local clock is unavailable.');
-          checked = await calendarFindings(
-            await loadCalendarWeek(calendar, {
-              start: Date.parse(write.affectedStart),
-              end: Date.parse(write.affectedEnd),
-              timeline,
-            }),
-          );
-          if (gaps.has(write.requestId)) await completeCalendarWriteFindings(write.requestId);
-          // eslint-disable-next-line no-catch-all/no-catch-all -- A failed recheck leaves the durable gap open.
-        } catch {
-          checked = gaps.has(write.requestId) ? 'Findings gap: recheck unavailable.' : 'Findings unavailable.';
-        }
-      const current = await getDb().get<LoggedWrite>(
-        'SELECT request_id,updated_at FROM gws_ea_calendar_write_log WHERE request_id=?',
-        write.requestId,
-      );
-      const entry = `${write.requestId}: ${write.action}; ${displayAt(write.affectedStart)} to ${displayAt(write.affectedEnd)}\n${framed(JSON.stringify({ calendar: write.calendarId, event: write.eventId, request: write.request, outcome: write.outcome }), 'calendar_write')}\n${checked}`;
+      const gap = write.state === 'applied' && !write.findingsChecked;
+      const status =
+        write.state === 'pending'
+          ? '\nOutcome not confirmed; this write is pending.'
+          : gap
+            ? '\nIts findings were not checked after the write; the findings below cover its time.'
+            : '';
+      const entry = `${write.requestId}: ${write.action}; ${displayAt(write.affectedStart)} to ${displayAt(write.affectedEnd)}\n${framed(JSON.stringify({ calendar: write.calendarId, event: write.eventId, request: write.request, outcome: write.outcome }), 'calendar_write')}${status}`;
       writes.entries.push(entry);
-      if (current && write.state === 'applied')
-        consumed.set(entry, { requestId: write.requestId, updatedAt: current.updated_at });
+      if (gap) {
+        gaps.set(write.requestId, entry);
+        spans.push({ start: Date.parse(write.affectedStart), end: Date.parse(write.affectedEnd) });
+      } else if (write.state === 'applied') shown.set(entry, { requestId: write.requestId, updatedAt: row.updated_at });
     }
   });
+  const notices: PendingNotice[] = [];
   await collect([notes], async () => {
     for (const notice of await getDb().all<PendingNotice>(
       'SELECT * FROM gws_ea_pending_calendar_changes WHERE received_at<=? ORDER BY received_at,message_id',
       through,
     )) {
-      let checked: string;
-      try {
-        if (!timeline) throw new Error('The local clock is unavailable.');
-        const event = await calendar.getEvent(notice.calendar_id, notice.event_id);
-        const span = event && eventSpan(event, zoneAt(timeline, Date.parse(notice.received_at)) ?? 'UTC');
-        checked = await calendarFindings(
-          await loadCalendarWeek(calendar, {
-            ...(span ?? { start: Date.parse(notice.received_at) - DAY, end: Date.parse(notice.received_at) + DAY }),
-            timeline,
-          }),
-        );
-        // eslint-disable-next-line no-catch-all/no-catch-all -- Pending notices remain pending even when their fresh findings are unavailable.
-      } catch {
-        checked = 'Findings unavailable.';
-      }
+      notices.push(notice);
       notes.entries.push(
-        `${displayAt(notice.received_at)}; pending calendar notice\n${framed(JSON.stringify({ calendar: notice.calendar_id, event: notice.event_id, change: notice.change_kind }), 'calendar_notice')}\n${checked}`,
+        `${displayAt(notice.received_at)}; pending calendar notice\n${framed(JSON.stringify({ calendar: notice.calendar_id, event: notice.event_id, change: notice.change_kind }), 'calendar_notice')}`,
       );
     }
   });
   await collect([findings], async () => {
     if (!timeline) throw new Error('The local clock is unavailable.');
+    for (const notice of notices) {
+      const event = await calendar.getEvent(notice.calendar_id, notice.event_id);
+      const span = event && eventSpan(event, zoneAt(timeline, Date.parse(notice.received_at)) ?? 'UTC');
+      spans.push(span ?? { start: Date.parse(notice.received_at) - DAY, end: Date.parse(notice.received_at) + DAY });
+    }
     findings.entries.push(
       await calendarFindings(
         await loadCalendarWeek(calendar, {
-          start: from === null ? Date.parse(through) - DAY : Date.parse(from),
-          end: Date.parse(through),
+          start: Math.min(...spans.map((span) => span.start)),
+          end: Math.max(...spans.map((span) => span.end)),
           timeline,
         }),
       ),
     );
+    for (const [requestId, entry] of gaps) {
+      await completeCalendarWriteFindings(requestId);
+      const current = await getDb().get<LoggedWrite>(
+        "SELECT request_id,updated_at FROM gws_ea_calendar_write_log WHERE request_id=? AND state='applied'",
+        requestId,
+      );
+      if (current) shown.set(entry, { requestId, updatedAt: current.updated_at });
+    }
   });
   let serializedLength = JSON.stringify(result).length;
   for (const current of [sends, notes, writes, findings, principal]) {
@@ -238,9 +239,10 @@ export async function readDayLedger(ctx: CallerContext): Promise<DayLedger> {
           from,
           through,
           writes: writes.entries.flatMap((entry) => {
-            const held = consumed.get(entry);
+            const held = shown.get(entry);
             return held ? [held] : [];
           }),
+          inbound,
         });
     } catch (error) {
       throw new Error(
