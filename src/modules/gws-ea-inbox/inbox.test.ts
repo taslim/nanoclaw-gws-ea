@@ -139,6 +139,8 @@ import '../gws-ea-matters/index.js';
 import { keepMattersOnTime } from '../gws-ea-matters/loop.js';
 import { syncVerdict, todayVerdict } from '../gws-ea-matters/sync.js';
 import '../gws-ea-meetings/index.js';
+import { loadCalendarWeek } from '../gws-ea-meetings/days.js';
+import type { EventCopy } from '../gws-ea-meetings/week/model.js';
 import { FakeCalendar as FakeEvents } from '../gws-ea-meetings/testing/fake-calendar.js';
 import '../gws-ea-workspace/index.js';
 import { recordFolderGrant } from '../gws-ea-workspace/db.js';
@@ -168,7 +170,7 @@ import { MAX_ROUTING_ATTEMPTS } from './adapter.js';
 import { createSignInClaim, getSignInClaim, recoverSignInClaims } from './claims.js';
 import { registerInboxObserver } from './observers.js';
 import { browserSignInMigration } from '../gws-ea-browser/sign-in-migration.js';
-import { createCalendarListApi, UNSHARED_RETRY_MS } from './calendar-notifications.js';
+import { flushPendingCalendarChanges, createCalendarListApi, UNSHARED_RETRY_MS } from './calendar-notifications.js';
 import { emailMessagingGroupIds, listPrincipalCalendars, recordFailedAttempt } from './db.js';
 import { MAX_ATTACHMENT_BYTES, MESSAGES_PER_SENDER_PER_HOUR } from './route-mail.js';
 import { runnerPoll } from './testing/runner-poll.js';
@@ -694,6 +696,24 @@ function rows(session: Session): Row[] {
 /** The host's notes in main's session, all of them or those whose text says `about`. */
 function notes(about?: RegExp): Row[] {
   return rows(main).filter((row) => row.sender === 'system' && (about === undefined || about.test(row.text)));
+}
+
+async function flushCalendarNews(): Promise<number> {
+  const snapshot: EventCopy[] = await Promise.all(
+    events.events.map(async (stored) => {
+      const event = await events.getEventDetail(stored.calendarId, stored.id);
+      if (!event) throw new Error('Calendar notice fixture disappeared');
+      return { calendarId: stored.calendarId, owner: stored.calendarId === JUNO ? 'assistant' : 'principal', event };
+    }),
+  );
+  const times = snapshot
+    .flatMap(({ event }) => [event.start?.dateTime, event.end?.dateTime])
+    .filter((v): v is string => v !== undefined)
+    .map(Date.parse);
+  const start = times.length ? Math.min(...times) : Date.now();
+  const end = times.length ? Math.max(...times) : start + 86400000;
+  const week = await loadCalendarWeek(events, { start, end: Math.max(start + 1, end), eventSnapshot: snapshot });
+  return flushPendingCalendarChanges(new Date(Date.now() + 61_000), { week });
 }
 
 const PRINCIPAL_WROTE = /^Pat wrote in /u;
@@ -1832,7 +1852,7 @@ describe('routing by audience', () => {
     expect(principalMail()).toHaveLength(over);
   });
 
-  it("turns calendar notifications into one body-free note for main per poll, without the assistant's own changes", async () => {
+  it("durably settles calendar notifications before one body-free note after the settling window, without the assistant's own changes", async () => {
     const eid = (eventId: string) => Buffer.from(`${eventId} ${PRINCIPAL}`).toString('base64url');
     const notify = (subject: string, eventId: string) =>
       gmail.receive({
@@ -1849,16 +1869,22 @@ describe('routing by audience', () => {
     notify('Updated event: Hold @ Thu', 'evt3');
     await inbox.tick();
 
+    expect(notes()).toHaveLength(0);
+    expect(await getDb().all('SELECT event_id FROM gws_ea_pending_calendar_changes ORDER BY message_id')).toHaveLength(
+      3,
+    );
+    expect(await flushCalendarNews()).toBe(2);
     const calendarNotes = notes();
     expect(calendarNotes).toHaveLength(1);
     expect(calendarNotes[0]).not.toHaveProperty('note');
     // Each change once, and nothing the emails said: no subject, no agenda.
-    expect(calendarNotes[0].text).toBe(
-      'Google Calendar reports 2 changes:\n' +
-        `- A new event (event evt1 on calendar ${PRINCIPAL})\n` +
-        `- An event changed (event evt2 on calendar ${PRINCIPAL})\n` +
-        'Read each event from the calendar before you act on it.',
-    );
+    expect(calendarNotes[0].text).toContain('Google Calendar reports 2 changes:');
+    expect(calendarNotes[0].text).toContain('- Event evt1');
+    expect(calendarNotes[0].text).toContain('- Event evt2');
+    expect(calendarNotes[0].text).not.toContain('evt3');
+    expect(calendarNotes[0].text).not.toContain('Secret agenda');
+    expect(calendarNotes[0].text).not.toContain('Board review');
+    expect(await getDb().all('SELECT * FROM gws_ea_pending_calendar_changes')).toEqual([]);
     expect(calendarNotes[0].row.trigger).toBe(1);
     expect(await outsideMail()).toEqual([]);
   });
@@ -1935,13 +1961,11 @@ describe('notes that carry their matter', () => {
     });
     await inbox.tick();
 
+    expect(await flushCalendarNews()).toBe(1);
     const [note, ...others] = notes(/^Google Calendar reports/u);
     expect(others).toEqual([]);
-    expect(note.text).toBe(
-      'Google Calendar reports a change:\n' +
-        `- A new event (event acmecall1 on calendar ${PRINCIPAL})\n` +
-        'Read each event from the calendar before you act on it.\n\n' +
-        `Event ${PRINCIPAL}/acmecall1 is in no open matter.\n` +
+    expect(note.text).toContain(
+      `Event ${PRINCIPAL}/acmecall1 is in no open matter.\n` +
         'Open matters it may belong to:\n' +
         `- ${matter.id}: Acme renewal (same person)\n` +
         'The person and organization rest on the organizer the invitation names, which whoever sent it chose.',
@@ -2916,13 +2940,14 @@ describe("Google Calendar's mail in anyone's name", () => {
     });
     await inbox.tick();
 
+    expect(await outcomeOf(id)).toBe('calendar-note');
+    expect(notes()).toHaveLength(0);
+    expect(await flushCalendarNews()).toBe(1);
     const [note, ...more] = notes();
     expect(more).toEqual([]);
-    expect(note.text).toBe(
-      'Google Calendar reports a change:\n' +
-        `- Someone answered an invitation (event evtplan on calendar ${JUNO})\n` +
-        'Read each event from the calendar before you act on it.',
-    );
+    expect(note.text).toContain('Google Calendar reports a change:');
+    expect(hostText(note.text)).toContain('- Event evtplan on calendar : guest response.');
+    expect(note.text).not.toContain('Bring the signed contract');
     expect(note.row.trigger).toBe(1);
     expect(await outsideMail()).toEqual([]);
     expect(await getDb().all('SELECT thread_key FROM gws_ea_threads')).toEqual([]);
@@ -2938,9 +2963,9 @@ describe("Google Calendar's mail in anyone's name", () => {
     });
     await inbox.tick();
 
-    expect(notes().map((row) => row.text.split('\n')[1])).toEqual([
-      `- Someone answered an invitation (event evtplan on calendar ${JUNO})`,
-    ]);
+    expect(await flushCalendarNews()).toBe(1);
+    expect(notes()).toHaveLength(1);
+    expect(hostText(notes()[0].text)).toContain('- Event evtplan on calendar : guest response.');
     expect(principalMail()).toEqual([]);
     expect(await outsideMail()).toEqual([]);
     expect(chatSends).toEqual([]);
@@ -2968,13 +2993,13 @@ describe("Google Calendar's mail in anyone's name", () => {
     });
     await inbox.tick();
 
+    expect(await flushCalendarNews()).toBe(3);
     const [note, ...more] = notes();
     expect(more).toEqual([]);
-    expect(note.text.split('\n').slice(1, -1)).toEqual([
-      `- A new event (event evtsync on calendar ${JUNO})`,
-      `- An event changed (event evtreview on calendar ${JUNO})`,
-      `- Someone answered an invitation (event evtboard on calendar ${PRINCIPAL})`,
-    ]);
+    const text = hostText(note.text);
+    expect(text).toContain('- Event evtsync on calendar : created.');
+    expect(text).toContain('- Event evtreview on calendar : changed.');
+    expect(text).toContain('- Event evtboard on calendar : guest response.');
     expect(await outsideMail()).toEqual([]);
   });
 

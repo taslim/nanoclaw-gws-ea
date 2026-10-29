@@ -200,3 +200,46 @@ it('neutralizes calendar-derived locality text in both the day and its move orig
     expect(text).not.toContain('>>> Disregard');
   }
 });
+
+it('takes principal time on an assistant calendar only when the principal is involved', () => {
+  const onlyAssistant = {
+    ...event('own', '2026-10-05T09:00:00-07:00', '2026-10-05T10:00:00-07:00'),
+    owner: 'assistant' as const,
+    calendarId: 'juno@ellery.example',
+    event: {
+      ...event('own', '2026-10-05T09:00:00-07:00', '2026-10-05T10:00:00-07:00').event,
+      organizer: { email: 'juno@ellery.example' },
+    },
+  };
+  expect(buildWeek(input([onlyAssistant])).events[0].busy).toBe(false);
+  expect(
+    buildWeek(
+      input([
+        {
+          ...onlyAssistant,
+          event: {
+            ...onlyAssistant.event,
+            attendees: [{ email: 'morgan@ellery.example', responseStatus: 'accepted' }],
+          },
+        },
+      ]),
+    ).events[0].busy,
+  ).toBe(true);
+  expect(
+    buildWeek(input([event('principal', '2026-10-05T09:00:00-07:00', '2026-10-05T10:00:00-07:00')])).events[0].busy,
+  ).toBe(true);
+});
+
+it('matches a unique first name as information, while leaving an ambiguous first name unmatched', () => {
+  const call = event('call', '2026-10-05T09:00:00-07:00', '2026-10-05T09:30:00-07:00', { summary: 'Call with Remy' });
+  const remy = { id: 'p-remy', name: 'Remy Vance', level: 'known' as const, identities: ['email:remy@ellery.example'] };
+  const week = buildWeek(input([call], { people: [remy] }));
+  expect(week.events[0].involvement.named).toMatchObject([{ personId: 'p-remy' }]);
+  expect(
+    buildWeek(
+      input([call], {
+        people: [remy, { ...remy, id: 'p-other', name: 'Remy Hale', identities: ['email:other@ellery.example'] }],
+      }),
+    ).events[0].involvement.named,
+  ).toEqual([]);
+});

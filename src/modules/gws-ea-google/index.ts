@@ -28,7 +28,7 @@ const TICK_MS = 60_000;
 
 const CAPABILITY_DESCRIPTIONS: Readonly<Record<GoogleCapability, string>> = {
   'google-calendar':
-    "Google Calendar as the assistant: the gcalendar skill, the assistant's Calendar token, create_event, change_guests and respond_to_event, and the host's find_conflicts and people_stats",
+    "Google Calendar as the assistant: the gcalendar skill, the assistant's Calendar token, days, check, create_event, change_event, cancel_event, change_guests, respond_to_event and people_stats through main’s host tools",
   'google-mail-read': "the assistant's Gmail, read-only: the gmail skill and a gmail.readonly token",
   'google-directory': 'the Workspace directory, read-only: the gpeople skill and a directory.readonly token',
   'google-workspace':
@@ -45,16 +45,7 @@ const CAPABILITY_DESCRIPTIONS: Readonly<Record<GoogleCapability, string>> = {
  * through the host's `respond_to_event` and `calendar.respond` is off.
  */
 export const GOG_COMMANDS: Readonly<Record<GoogleCapability, readonly string[]>> = {
-  'google-calendar': [
-    'calendar.calendars',
-    'calendar.subscribe',
-    'calendar.unsubscribe',
-    'calendar.events',
-    'calendar.event',
-    'calendar.freebusy',
-    'calendar.update',
-    'calendar.delete',
-  ],
+  'google-calendar': ['calendar.calendars', 'calendar.subscribe', 'calendar.unsubscribe'],
   'google-mail-read': ['gmail.search', 'gmail.messages.search', 'gmail.thread.get', 'gmail.get'],
   'google-directory': ['people.search'],
   'google-workspace': WORKSPACE_GOG_COMMANDS,

@@ -202,7 +202,15 @@ function involvement(event: DetailedEvent, input: WeekInput): Involvement {
         !input.principalNames.some((n) => normalized(n) === normalized(person.name)) &&
         !person.identities.some((i) => i.startsWith('email:') && input.principal.has(i.slice(6))) &&
         !guests.some((g) => g.personId === person.id) &&
-        [person.name, ...person.identities.map((i) => i.slice(i.indexOf(':') + 1))].some((n) => {
+        [
+          person.name,
+          ...(input.people.filter(
+            (p) => normalized(p.name.split(/\s+/u)[0]) === normalized(person.name.split(/\s+/u)[0]),
+          ).length === 1
+            ? [person.name.split(/\s+/u)[0]]
+            : []),
+          ...person.identities.map((i) => i.slice(i.indexOf(':') + 1)),
+        ].some((n) => {
           const key = normalized(n);
           let at = text.indexOf(key);
           while (at >= 0) {
@@ -275,7 +283,11 @@ function eventFrom(copies: readonly EventCopy[], input: WeekInput): WeekEvent {
     zone,
     workingHoursZone: where.workingHoursZone,
     allDay: event.start?.date !== undefined,
-    busy: blocksTime(event, input.principal),
+    busy:
+      (copy.owner === 'principal' ||
+        principalOrganizes ||
+        (event.attendees ?? []).some((a) => isPrincipalAttendee(a, input.principal))) &&
+      blocksTime(event, input.principal),
     place: resolvePlace(event.location, input.timeline, input.privateValues),
     assistantWritten:
       copy.assistantWritten === true ||

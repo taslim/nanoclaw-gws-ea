@@ -1,6 +1,10 @@
+import { calendarWriteLogMigration } from './week/write-log-migration.js';
+import { pendingCalendarChangesMigration } from './week/pending-changes-migration.js';
 import { weekAcknowledgementsMigration } from './week/acks-migration.js';
 import '../gws-ea-inbox/index.js';
 import '../gws-ea-chats/index.js';
+import '../gws-ea-whereabouts/index.js';
+import '../gws-ea-preferences/index.js';
 
 import { answeredGuard, answeringAction, forbidden, type DeferredActionAnswer } from '../../cli/delivery-action.js';
 import { registerDeliveryAction } from '../../delivery.js';
@@ -18,6 +22,8 @@ import { bookingAction, principalEventAction } from './guard.js';
 import { resolveBookingSurface } from './booking-surface.js';
 import { bookingsMigration } from './bookings-migration.js';
 import type { Session } from '../../types.js';
+import { registerCalendarChangeRenderer } from '../gws-ea-inbox/calendar-notifications.js';
+import { createDaysTools, loadCalendarWeek, calendarFindings, renderDays, boundedCalendarMessage } from './days.js';
 import { createPrincipalEventTools } from './principal-events.js';
 
 let calendar: MeetingsCalendarApi | undefined;
@@ -81,6 +87,8 @@ registerMigration(chatBookingRequestsMigration);
 registerMigration(chatBookingReportsMigration);
 registerMigration(bookingsMigration);
 registerMigration(weekAcknowledgementsMigration);
+registerMigration(calendarWriteLogMigration);
+registerMigration(pendingCalendarChangesMigration);
 
 for (const [action, answer] of [
   ['free_time', booking.freeTime],
@@ -104,12 +112,16 @@ for (const [action, answer] of [
 
 const principalEvents = createPrincipalEventTools({ calendar: calendarApi });
 const facts = createCalendarFactTools({ calendar: calendarApi });
+const days = createDaysTools({ calendar: calendarApi });
 
 for (const [action, answer] of [
   ['create_event', principalEvents.createEvent],
   ['change_guests', principalEvents.changeGuests],
   ['respond_to_event', principalEvents.respondToEvent],
-  ['find_conflicts', facts.findConflicts],
+  ['days', days.days],
+  ['check', days.check],
+  ['change_event', principalEvents.changeEvent],
+  ['cancel_event', principalEvents.cancelEvent],
   ['people_stats', facts.peopleStats],
 ] as const) {
   registerDeliveryAction(
@@ -120,3 +132,43 @@ for (const [action, answer] of [
 }
 
 export { createMeetingsCalendarApi, type CalendarEvent, type MeetingsCalendarApi } from './calendar-api.js';
+
+registerCalendarChangeRenderer(async (changes, at, context) => {
+  const details = await Promise.all(
+    changes.map(async ({ notice }) => ({
+      notice,
+      event:
+        context.week?.events.find((e) => e.calendarId === notice.calendarId && e.id === notice.eventId)?.event ??
+        (await calendarApi().getEventDetail(notice.calendarId, notice.eventId)),
+    })),
+  );
+  const moments = details
+    .flatMap(({ event }) => [
+      event?.start?.dateTime,
+      event?.end?.dateTime,
+      event?.start?.date ? `${event.start.date}T00:00:00Z` : undefined,
+      event?.end?.date ? `${event.end.date}T00:00:00Z` : undefined,
+    ])
+    .filter((v): v is string => v !== undefined)
+    .map(Date.parse);
+  const start = moments.length ? Math.min(...moments) : at.getTime();
+  const end = moments.length ? Math.max(...moments) : start + 86400000;
+  const week =
+    context.week ??
+    (await loadCalendarWeek(calendarApi(), { start, end: Math.max(start + 1, end), timeline: context.timeline }));
+  const affected = week.events.filter((e) =>
+    changes.some(({ notice }) => notice.calendarId === e.calendarId && notice.eventId === e.id),
+  );
+  return {
+    text: boundedCalendarMessage(
+      'Calendar facts:',
+      [await calendarFindings(week), ...affected.map((e) => renderDays({ ...week, events: [e] }))],
+      10_000,
+    ),
+    pieces: details.map(({ notice, event }) => ({
+      kind: 'event' as const,
+      reference: `${notice.calendarId}/${notice.eventId}`,
+      ...(notice.change === 'created' ? { arrival: { from: event?.organizer?.email } } : {}),
+    })),
+  };
+});

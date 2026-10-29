@@ -28,6 +28,28 @@ type Review =
  * `src/modules`, its other fields sorted, a spread written `...name`.
  */
 const REVIEWED: Readonly<Record<string, Review>> = {
+  'gws-ea-meetings/days.ts days: count, path': {
+    kind: 'rendered',
+    reason: 'the export message gives its session inbox path and folded event count',
+  },
+  'gws-ea-meetings/principal-events.ts finishWrite: ...base': {
+    kind: 'host-only',
+    reason:
+      'the calendar and event ids and input dates are receipt identifiers; the outcome and findings are fully rendered in message',
+  },
+  'gws-ea-meetings/week/checker.ts add: day, eventKeys, facts, key, kind, version': {
+    kind: 'host-only',
+    reason: 'raw checker facts stay on the host and must pass through presentFinding before reaching a model',
+  },
+  'gws-ea-whereabouts/gaps.ts gaps: kind': {
+    kind: 'host-only',
+    reason: 'the gap kind serves host matching; message states the complete whereabouts gap',
+  },
+  'gws-ea-whereabouts/gaps.ts gaps: kind, sourceEventId': {
+    kind: 'host-only',
+    reason: 'the source event id ties the gap to host evidence; message states the complete gap',
+  },
+
   'gws-ea-meetings/booking.ts answerRequest: code': {
     kind: 'host-only',
     reason: 'the response frame keeps its transport error code; the rendered error message explains the refusal',
@@ -232,7 +254,7 @@ const REVIEWED: Readonly<Record<string, Review>> = {
     kind: 'rendered',
     reason: 'the summary line, then one line per person, then how many more are not listed',
   },
-  'gws-ea-meetings/principal-events.ts createEvent: calendar, end, event, start': {
+  'gws-ea-meetings/principal-events.ts createEventRaw: calendar, end, event, start': {
     kind: 'rendered',
     reason:
       "the message names the calendar in words, the time and the event id main changes it by; the calendar id is main's own input",

@@ -166,3 +166,37 @@ describe("main's calendar writes", () => {
     ).toMatch(/a repeat changes nothing twice/);
   });
 });
+
+describe('the host calendar surface', () => {
+  it.each([
+    ['days', { start: '2026-10-05', end: '2026-10-12', export: true }],
+    ['check', { start: '2026-10-09T14:30:00-07:00', end: '2026-10-09T15:00:00-07:00' }],
+    [
+      'change_event',
+      {
+        calendar: 'morgan@ellery.example',
+        event: 'dinner',
+        start: '2026-10-09T19:00:00-07:00',
+        end: '2026-10-09T20:00:00-07:00',
+        send_updates: 'none',
+      },
+    ],
+    ['cancel_event', { calendar: 'morgan@ellery.example', event: 'dinner', send_updates: 'all' }],
+  ])('sends %s through the mailbox and exposes only the rendered message', async (name, args) => {
+    const definitions = await import('./calendar-write.js');
+    const available = [definitions.days, definitions.check, definitions.changeEvent, definitions.cancelEvent];
+    const tool = available.find((definition) => definition.tool.name === name);
+    expect(tool).toBeDefined();
+    if (!tool) throw new Error('Calendar tool missing');
+    const [result, request] = await Promise.all([
+      tool.handler(args),
+      answerNext({
+        message: 'Calendar outcome and findings.',
+        raw_private_events: ['secret'],
+        path: 'inbox/private.txt',
+      }),
+    ]);
+    expect(request).toMatchObject({ action: name, ...args });
+    expect(text(result)).toBe('Calendar outcome and findings.');
+  });
+});

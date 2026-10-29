@@ -35,6 +35,7 @@ export interface StoredEvent extends Omit<CalendarEvent, 'organizer' | 'attendee
   readonly attendeesOmitted?: boolean;
   readonly recurringEventId?: string;
   readonly originalStartTime?: EventTime;
+  readonly creator?: DetailedEvent['creator'];
   readonly summary?: string;
   readonly description?: string;
   readonly location?: string;
@@ -208,6 +209,32 @@ export class FakeCalendar implements MeetingsCalendarApi {
     if (index >= 0) this.events.splice(index, 1);
   }
 
+  async getEventDetail(calendarId: string, eventId: string): Promise<DetailedEvent | undefined> {
+    this.call();
+    const value = this.event(calendarId, eventId);
+    if (!value) return undefined;
+    const conference = value.conference
+      ? {
+          ...value.conference,
+          entryPoints: value.conference.uri ? [{ entryPointType: 'video', uri: value.conference.uri }] : [],
+        }
+      : undefined;
+    return { ...value, ...(conference ? { conference } : { conference: undefined }) };
+  }
+  async freeBusy(ids: readonly string[], start: string, end: string) {
+    this.call();
+    return Object.fromEntries(
+      ids.map((id) => [
+        id,
+        this.live(id)
+          .filter((e) => overlapsInterval(e, Date.parse(start), Date.parse(end)))
+          .flatMap((e) =>
+            e.start?.dateTime && e.end?.dateTime ? [{ start: e.start.dateTime, end: e.end.dateTime }] : [],
+          ),
+      ]),
+    );
+  }
+
   async getCalendar(calendarId: string) {
     this.call();
     return this.calendars.get(calendarId.toLowerCase());
@@ -233,9 +260,12 @@ export class FakeCalendar implements MeetingsCalendarApi {
   /** As Google lists them with titles and names: everything stored but the assistant's tags and the calendar. */
   async listEventDetails(calendarId: string, timeMin: string, timeMax: string): Promise<DetailedEvent[]> {
     const listed = await this.listEvents(calendarId, timeMin, timeMax);
-    return listed.map(
-      ({ calendarId: _calendar, tags: _tags, conference: _conference, guests: _guests, etag: _etag, ...event }) =>
-        event,
+    return Promise.all(
+      listed.map(async (event) => {
+        const detail = await this.getEventDetail(calendarId, event.id);
+        if (!detail) throw new Error('Listed calendar event disappeared');
+        return detail;
+      }),
     );
   }
 
@@ -373,6 +403,8 @@ export function delegatingCalendarApi(current: () => MeetingsCalendarApi): Meeti
     getCalendar: (calendarId) => current().getCalendar(calendarId),
     listCalendars: () => current().listCalendars(),
     getEvent: (calendarId, eventId) => current().getEvent(calendarId, eventId),
+    getEventDetail: (calendarId, eventId) => current().getEventDetail(calendarId, eventId),
+    freeBusy: (ids, start, end) => current().freeBusy(ids, start, end),
     listEvents: (calendarId, timeMin, timeMax) => current().listEvents(calendarId, timeMin, timeMax),
     listEventDetails: (calendarId, timeMin, timeMax) => current().listEventDetails(calendarId, timeMin, timeMax),
     insertEvent: (calendarId, eventId, event, sendUpdates) =>

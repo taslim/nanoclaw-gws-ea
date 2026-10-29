@@ -568,3 +568,82 @@ export function consumeOwnCalendarChange(calendarId: string, eventId: string, at
   else ownChanges.delete(key);
   return live.length > 0;
 }
+
+export interface CalendarChangeRenderContext {
+  readonly week?: import('../gws-ea-meetings/week/model.js').Week;
+  readonly timeline?: import('../gws-ea-whereabouts/timeline.js').Timeline;
+}
+export interface RenderedCalendarChanges {
+  readonly text: string;
+  readonly pieces?: readonly import('../gws-ea-profile/main-note.js').NotePiece[];
+}
+/** Meetings registers its host renderer; the inbox never imports its entry point. */
+export type CalendarChangeRenderer = (
+  changes: readonly import('../gws-ea-meetings/week/pending-changes.js').PendingCalendarChange[],
+  at: Date,
+  context: CalendarChangeRenderContext,
+) => Promise<RenderedCalendarChanges>;
+let changeRenderer: CalendarChangeRenderer | undefined;
+export function registerCalendarChangeRenderer(renderer: CalendarChangeRenderer): void {
+  if (changeRenderer) throw new Error('A calendar change renderer is already registered');
+  changeRenderer = renderer;
+}
+/** The week refresher supplies its snapshot when it has one; this function owns no timer. */
+export async function flushPendingCalendarChanges(
+  at: Date = new Date(),
+  context: CalendarChangeRenderContext = {},
+): Promise<number> {
+  const { settledCalendarChanges, settleCalendarChanges } = await import('../gws-ea-meetings/week/pending-changes.js');
+  const changes = await settledCalendarChanges(at);
+  if (!changes.length) return 0;
+  const words: Readonly<Record<CalendarChange, string>> = {
+    created: 'created',
+    changed: 'changed',
+    cancelled: 'cancelled',
+    response: 'guest response',
+    unknown: 'changed',
+  };
+  const { untrustedLine } = await import('./untrusted.js');
+  const lines = changes.map(
+    ({ notice }) =>
+      `- Event ${notice.eventId} on calendar ${untrustedLine(notice.calendarId, 254, 'google_calendar')}: ${words[notice.change]}.`,
+  );
+  let rendered: RenderedCalendarChanges = { text: 'findings unavailable' };
+  /* eslint-disable no-catch-all/no-catch-all -- durable notices deliver even when their findings cannot render */
+  try {
+    if (changeRenderer) rendered = await changeRenderer(changes, at, context);
+  } catch (error) {
+    log.warn('Calendar notice delivered without findings', { error });
+  }
+  /* eslint-enable no-catch-all/no-catch-all */
+  const head = `Google Calendar reports ${changes.length === 1 ? 'a change' : `${changes.length} changes`}:`;
+  const body = [head];
+  let length = head.length;
+  const entries = [...lines, rendered.text];
+  for (const line of entries) {
+    if (length + line.length + 42 > 12_000) break;
+    body.push(line);
+    length += 1 + line.length;
+  }
+  if (body.length - 1 < entries.length) body.push(`${entries.length - body.length + 1} more.`);
+  const key = createHash('sha256')
+    .update(
+      changes
+        .flatMap((c) => c.messageIds)
+        .sort()
+        .join('\n'),
+    )
+    .digest('hex');
+  const result = await writeNoteForMain({
+    id: `inbox-calendar-${key}`,
+    timestamp: at.toISOString(),
+    wake: true,
+    text: body.join('\n'),
+    pieces:
+      rendered.pieces ??
+      changes.map(({ notice }) => ({ kind: 'event', reference: `${notice.calendarId}/${notice.eventId}` })),
+  });
+  if (result === 'no-main' || result === 'no-principal') return 0;
+  await settleCalendarChanges(changes);
+  return changes.length;
+}

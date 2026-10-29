@@ -69,6 +69,9 @@ export interface DetailedAttendee extends EventAttendee {
 
 /** Carries titles and names, so it is never read for external-email. */
 export interface DetailedEvent {
+  readonly visibility?: string;
+  readonly reminders?: 'default' | 'none' | 'custom';
+  readonly guestsCanModify?: boolean;
   readonly etag?: string;
   readonly description?: string;
   readonly location?: string;
@@ -86,6 +89,7 @@ export interface DetailedEvent {
   /** Google left some guests out of `attendees`. */
   readonly attendeesOmitted?: boolean;
   readonly recurringEventId?: string;
+  readonly recurrence?: readonly string[];
   /** An occurrence's start before it moved, the same on every copy of it. */
   readonly originalStartTime?: EventTime;
   readonly start?: EventTime;
@@ -102,7 +106,7 @@ export interface CalendarEntry extends CalendarListEntry {
 /** Google starts a guest it is given no answer for at `needsAction`, the calendar's own owner included. */
 export interface GuestWrite {
   readonly email: string;
-  readonly responseStatus?: 'accepted';
+  readonly responseStatus?: string;
 }
 
 /**
@@ -174,6 +178,13 @@ export interface MeetingsCalendarApi {
   listCalendars(): Promise<CalendarEntry[]>;
   /** Undefined when the event does not exist; a deleted event reads as `cancelled`. */
   getEvent(calendarId: string, eventId: string): Promise<CalendarEvent | undefined>;
+  /** Main-only detail; the outward getter above remains title-free. */
+  getEventDetail(calendarId: string, eventId: string): Promise<DetailedEvent | undefined>;
+  freeBusy(
+    calendarIds: readonly string[],
+    timeMin: string,
+    timeMax: string,
+  ): Promise<Readonly<Record<string, readonly { readonly start: string; readonly end: string }[]>>>;
   /** Every live event that overlaps the interval, recurring events expanded. */
   listEvents(calendarId: string, timeMin: string, timeMax: string): Promise<ListedEvent[]>;
   /** As `listEvents`, with titles, names and series: never for external-email. */
@@ -228,7 +239,7 @@ const EVENT_FIELDS =
   'id,etag,iCalUID,status,transparency,organizer(email),attendees(email,responseStatus,resource,organizer,self),start(dateTime,date),end(dateTime,date),extendedProperties(private),conferenceData(createRequest(status(statusCode)),entryPoints(entryPointType,uri))';
 /** Includes titles and names, so nothing read with it may reach external-email. */
 const DETAIL_FIELDS =
-  'id,etag,iCalUID,status,transparency,summary,description,location,creator(email,displayName,self),organizer(email,self),attendees(email,displayName,responseStatus,resource,organizer,self),attendeesOmitted,recurringEventId,originalStartTime(dateTime,date,timeZone),start(dateTime,date,timeZone),end(dateTime,date,timeZone),eventType,extendedProperties(private),conferenceData(conferenceId,createRequest(status(statusCode)),entryPoints(entryPointType,uri,label))';
+  'id,etag,iCalUID,status,transparency,visibility,reminders(useDefault,overrides(method,minutes)),guestsCanModify,summary,description,location,creator(email,displayName,self),organizer(email,self),attendees(email,displayName,responseStatus,resource,organizer,self),attendeesOmitted,recurringEventId,recurrence,originalStartTime(dateTime,date,timeZone),start(dateTime,date,timeZone),end(dateTime,date,timeZone),eventType,extendedProperties(private),conferenceData(conferenceId,createRequest(status(statusCode)),entryPoints(entryPointType,uri,label))';
 /** Google Meet's conference type, in a calendar's allowed types and in a create request. */
 const GOOGLE_MEET = 'hangoutsMeet';
 const MAX_PAGES = 10;
@@ -270,6 +281,7 @@ function toDetailedEvent(value: unknown): DetailedEvent {
     'iCalUID',
     'status',
     'transparency',
+    'visibility',
     'summary',
     'description',
     'location',
@@ -295,6 +307,16 @@ function toDetailedEvent(value: unknown): DetailedEvent {
     });
   }
   if (value.attendeesOmitted === true) fields.attendeesOmitted = true;
+  if (typeof value.guestsCanModify === 'boolean') fields.guestsCanModify = value.guestsCanModify;
+  if (isRecord(value.reminders))
+    fields.reminders =
+      value.reminders.useDefault === true
+        ? 'default'
+        : Array.isArray(value.reminders.overrides) && value.reminders.overrides.length
+          ? 'custom'
+          : 'none';
+  if (Array.isArray(value.recurrence))
+    fields.recurrence = value.recurrence.filter((line): line is string => typeof line === 'string');
   for (const key of ['start', 'end', 'originalStartTime'] as const) {
     const time = toTime(value[key], true);
     if (time !== undefined) fields[key] = time;
@@ -422,10 +444,7 @@ function eventBody(event: EventWrite, id?: string): Record<string, unknown> {
     ...(event.attendees === undefined
       ? {}
       : {
-          attendees: event.attendees.map((guest) => ({
-            email: guest.email,
-            ...(guest.responseStatus === undefined ? {} : { responseStatus: guest.responseStatus }),
-          })),
+          attendees: event.attendees.map((guest) => ({ ...guest })),
         }),
     ...(event.visibility === undefined ? {} : { visibility: event.visibility }),
     ...(event.transparency === undefined ? {} : { transparency: event.transparency }),
@@ -559,6 +578,47 @@ export function createMeetingsCalendarApi(options: GoogleClientOptions): Meeting
         { allowNotFound: true },
       );
       return payload === undefined ? undefined : toEvent(payload);
+    },
+
+    async getEventDetail(calendarId, eventId) {
+      const params = new URLSearchParams({ fields: DETAIL_FIELDS });
+      try {
+        const payload = await googleJson(options, `${eventUrl(calendarId, eventId)}?${params.toString()}`, {
+          allowNotFound: true,
+        });
+        return payload === undefined ? undefined : toDetailedEvent(payload);
+      } catch (error) {
+        if (isGone(error)) return undefined;
+        throw error;
+      }
+    },
+
+    async freeBusy(calendarIds, timeMin, timeMax) {
+      const payload = await googleJson(options, `${CALENDAR_API}/freeBusy`, {
+        method: 'POST',
+        body: { timeMin, timeMax, items: calendarIds.map((id) => ({ id })) },
+      });
+      if (!isRecord(payload) || !isRecord(payload.calendars))
+        throw new GoogleApiError(502, 'Google returned an unreadable busy-time answer');
+      const result: Record<string, { start: string; end: string }[]> = {};
+      for (const id of calendarIds) {
+        const entry = payload.calendars[id];
+        if (!isRecord(entry) || (Array.isArray(entry.errors) && entry.errors.length > 0) || !Array.isArray(entry.busy))
+          throw new GoogleApiError(502, 'Google could not read every requested calendar’s busy time');
+        result[id] = entry.busy.map((window: unknown) => {
+          if (
+            !isRecord(window) ||
+            typeof window.start !== 'string' ||
+            typeof window.end !== 'string' ||
+            !Number.isFinite(Date.parse(window.start)) ||
+            !Number.isFinite(Date.parse(window.end)) ||
+            Date.parse(window.end) <= Date.parse(window.start)
+          )
+            throw new GoogleApiError(502, 'Google returned an unreadable busy-time window');
+          return { start: window.start, end: window.end };
+        });
+      }
+      return result;
     },
 
     listCalendars: () => readAllPages('users/me/calendarList', {}, 'calendar list', toCalendarEntry),

@@ -68,7 +68,7 @@ import { getDb } from '../../db/connection.js';
 import { ensureContainerConfig, updateContainerConfigJson } from '../../db/container-configs.js';
 import { closeDb, createAgentGroup, createMessagingGroup, initTestDb, runMigrations } from '../../db/index.js';
 import { getDeliveryAction } from '../../delivery.js';
-import { inboundDbPath } from '../../mailbox/sqlite/paths.js';
+import { inboundDbPath, sessionMailboxDir } from '../../mailbox/sqlite/paths.js';
 import { resolveSession } from '../../session-manager.js';
 import type { Session } from '../../types.js';
 import '../gws-ea-profile/index.js';
@@ -77,6 +77,10 @@ import { addPrivateValue } from '../gws-ea-privacy/db.js';
 import { EXTERNAL_EMAIL_CAPABILITIES } from '../gws-ea-external-email/group.js';
 import '../gws-ea-inbox/index.js';
 import { consumeOwnCalendarChange } from '../gws-ea-inbox/calendar-notifications.js';
+import { addPerson, forgetPerson } from '../gws-ea-people/db.js';
+import { GOOGLE_GRANT_FILE_ENV } from '../gws-ea-google/grant.js';
+import { setSchedulingPreference } from '../gws-ea-preferences/db.js';
+import { addStay } from '../gws-ea-whereabouts/db.js';
 import { GoogleApiError } from '../gws-ea-inbox/gmail-api.js';
 import { closeMatter, getMatter, openMatter } from '../gws-ea-matters/db.js';
 import '../gws-ea-matters/index.js';
@@ -235,6 +239,28 @@ afterEach(async () => {
 });
 
 describe('create_event', () => {
+  it('creates a future event on its covering stay clock without changing the home profile', async () => {
+    await addStay({
+      locality: 'Brussels',
+      zone: 'Europe/Brussels',
+      start: '2032-11-10',
+      end: '2032-11-15',
+      source: 'said',
+      certainty: 'certain',
+    });
+    data(
+      await send(main, 'create_event', {
+        calendar: PRINCIPAL,
+        title: 'Call with Juno',
+        start: '2032-11-12T09:00:00+01:00',
+        end: '2032-11-12T09:30:00+01:00',
+      }),
+    );
+    expect(calendar.writes[0].fields?.timeZone).toBe('Europe/Brussels');
+    expect(await getDb().get('SELECT principal_timezone FROM gws_ea_profile')).toMatchObject({
+      principal_timezone: PACIFIC,
+    });
+  });
   it('uses the same spoken calendar names as conflict answers, without an address', async () => {
     calendar.calendars.set(READ_ONLY, { id: READ_ONLY, accessRole: 'reader', summary: 'Family calendar' });
     const listed = vi.spyOn(calendar, 'listCalendars');
@@ -242,7 +268,7 @@ describe('create_event', () => {
 
     expect(created.message).toContain("to the principal's calendar at northwind.example:");
     expect(created.message).not.toContain(PRINCIPAL);
-    expect(listed).toHaveBeenCalledTimes(1);
+    expect(listed).toHaveBeenCalledTimes(2);
   });
 
   it('marks a calendar name supplied by Google as untrusted', async () => {
@@ -578,7 +604,7 @@ describe('change_guests', () => {
       }),
     ]);
     expect(changed.guests).toEqual([REMY, NOEL]);
-    expect(changed.message).toBe(
+    expect(changed.message).toContain(
       `Its guests now: ${REMY} and ${NOEL}, and the principal, accepted. Google sent the guests the update.`,
     );
   });
@@ -615,7 +641,7 @@ describe('change_guests', () => {
           guests: [principal, { email: REMY, responseStatus: 'accepted' }, { email: NOEL }],
         }),
       ]);
-      expect(changed.message, answer).toBe(
+      expect(changed.message, answer).toContain(
         `Its guests now: ${REMY} and ${NOEL}, and the principal, ${words}. Google sent the guests the update.`,
       );
 
@@ -625,7 +651,7 @@ describe('change_guests', () => {
         await send(main, 'change_guests', { calendar: PRINCIPAL, event: 'teamsync01', add: [REMY] }),
       );
       expect(calendar.writes, answer).toEqual([]);
-      expect(unchanged.message, answer).toBe(
+      expect(unchanged.message, answer).toContain(
         `Nothing changed: ${REMY} is already invited; the principal is already on it.`,
       );
     }
@@ -649,7 +675,7 @@ describe('change_guests', () => {
       }),
     ]);
     expect(changed.guests).toEqual([NOEL]);
-    expect(changed.message).toBe(
+    expect(changed.message).toContain(
       `Its guests now: ${NOEL}, and the principal, accepted. Google sent the guests the update.`,
     );
   });
@@ -665,7 +691,7 @@ describe('change_guests', () => {
       }),
     );
     expect(calendar.writes).toEqual([]);
-    expect(unchanged.message).toBe(`Nothing changed: ${NOEL} is not invited; the principal is already on it.`);
+    expect(unchanged.message).toContain(`Nothing changed: ${NOEL} is not invited; the principal is already on it.`);
 
     // Named in another Gmail spelling on their calendar of that address, the principal is still already on it.
     await addPrincipalAddress('morgan.ellery@gmail.com');
@@ -683,7 +709,7 @@ describe('change_guests', () => {
       }),
     );
     expect(calendar.writes).toEqual([]);
-    expect(respelled.message).toBe('Nothing changed: the principal is already on it.');
+    expect(respelled.message).toContain('Nothing changed: the principal is already on it.');
   });
 
   it('tells the guests only of a change to who it invites, never of the principal alone', async () => {
@@ -708,7 +734,7 @@ describe('change_guests', () => {
       await send(main, 'change_guests', { calendar: PRINCIPAL, event: 'teamsync01', add: [PRINCIPAL] }),
     );
     expect(calendar.writes).toEqual([expect.objectContaining({ op: 'guests', sendUpdates: 'none' })]);
-    expect(answered.message).toBe(`Its guests now: ${REMY}, and the principal, accepted. Google emailed no one.`);
+    expect(answered.message).toContain(`Its guests now: ${REMY}, and the principal, accepted. Google emailed no one.`);
   });
 
   it.each([
@@ -822,9 +848,11 @@ describe('change_guests', () => {
 
   it('refuses an event someone else organizes, the principal’s own removal, and an event that is not there', async () => {
     calendar.put({ ...teamSync([{ email: REMY, responseStatus: 'accepted' }]), organizer: { email: REMY } });
-    expect(
-      refusal(await send(main, 'change_guests', { calendar: PRINCIPAL, event: 'teamsync01', add: [NOEL] })),
-    ).toMatch(new RegExp(`${REMY} organizes that event: only they change who it invites`, 'u'));
+    const organizerRefusal = refusal(
+      await send(main, 'change_guests', { calendar: PRINCIPAL, event: 'teamsync01', add: [NOEL] }),
+    );
+    expect(organizerRefusal).toContain(`Source: google_calendar\n---\n${REMY}`);
+    expect(organizerRefusal).toContain('organizes that event: only they change who it invites');
 
     calendar.put(teamSync([{ email: PRINCIPAL, responseStatus: 'accepted', organizer: true }]));
     expect(
@@ -953,7 +981,7 @@ describe('respond_to_event', () => {
       calendar: PRINCIPAL,
       event: 'teamsync01',
       response: 'accepted',
-      message: 'Google now shows the principal as going (accepted). Google emailed no one.',
+      message: expect.stringContaining('Google now shows the principal as going (accepted). Google emailed no one.'),
     });
   });
 
@@ -985,7 +1013,7 @@ describe('respond_to_event', () => {
       self('declined'),
       NOEL_DECLINED,
     ]);
-    expect(answered.message).toBe(
+    expect(answered.message).toContain(
       'Google now shows the principal as not going (declined). Google was asked to tell the organizer.',
     );
   });
@@ -1000,7 +1028,9 @@ describe('respond_to_event', () => {
     const answered = data(await answer('remyinvite1', 'tentative'));
 
     expect(calendar.writes).toEqual([expect.objectContaining({ op: 'own', sendUpdates: 'none' })]);
-    expect(answered.message).toBe('Google now shows the principal as maybe going (tentative). Google emailed no one.');
+    expect(answered.message).toContain(
+      'Google now shows the principal as maybe going (tentative). Google emailed no one.',
+    );
   });
 
   it('sends their entry back as Google holds it, under the address it names, and drops a note left with an earlier answer', async () => {
@@ -1021,10 +1051,10 @@ describe('respond_to_event', () => {
     calendar.put(ownMeeting('accepted'));
     calendar.put(invitation(self('declined')));
 
-    expect(data(await answer('teamsync01', 'accepted')).message).toBe(
+    expect(data(await answer('teamsync01', 'accepted')).message).toContain(
       'Nothing changed: Google already shows the principal as going (accepted).',
     );
-    expect(data(await answer('remyinvite1', 'declined')).message).toBe(
+    expect(data(await answer('remyinvite1', 'declined')).message).toContain(
       'Nothing changed: Google already shows the principal as not going (declined).',
     );
     expect(calendar.writes).toEqual([]);
@@ -1034,10 +1064,10 @@ describe('respond_to_event', () => {
     calendar.put(invitation(self('needsAction'), { id: 'weekly1_20261012T160000Z', recurringEventId: 'weekly1' }));
     calendar.put(invitation(self('needsAction'), { id: 'weekly1', recurrence: ['RRULE:FREQ=WEEKLY;BYDAY=MO'] }));
 
-    expect(data(await answer('weekly1_20261012T160000Z', 'accepted')).message).toBe(
+    expect(data(await answer('weekly1_20261012T160000Z', 'accepted')).message).toContain(
       'Google now shows the principal as going (accepted) on this occurrence only. Google was asked to tell the organizer.',
     );
-    expect(data(await answer('weekly1', 'accepted')).message).toBe(
+    expect(data(await answer('weekly1', 'accepted')).message).toContain(
       'Google now shows the principal as going (accepted) on every occurrence. Google was asked to tell the organizer.',
     );
   });
@@ -1125,7 +1155,7 @@ describe('respond_to_event', () => {
     // Their own answer, landing first, is the one asked for: nothing more to write.
     calendar.put(invitation());
     calendar.changeAfterNextGuestRead(() => calendar.put(invitation(self('declined'))));
-    expect(data(await answer('remyinvite1', 'declined')).message).toBe(
+    expect(data(await answer('remyinvite1', 'declined')).message).toContain(
       'Nothing changed: Google already shows the principal as not going (declined).',
     );
     expect(calendar.writes).toEqual([]);
@@ -1161,8 +1191,8 @@ describe('respond_to_event', () => {
     const answered = data(await answer('remyinvite1', 'accepted'));
 
     expect(calendar.writes).toEqual([expect.objectContaining({ op: 'own' })]);
-    expect(answered.message).toBe(
-      'Google took the answer but could not show it back just now, so check it with gog calendar event before you tell the principal. Google was asked to tell the organizer.',
+    expect(answered.message).toContain(
+      'Google took the answer but could not show it back just now, so check it with days before you tell the principal. Google was asked to tell the organizer.',
     );
   });
 
@@ -1199,10 +1229,10 @@ describe('respond_to_event', () => {
     calendar.put(ownMeeting('accepted'));
 
     expect(data(await answer('remyinvite1', 'accepted', { matter: matter.id })).message).toMatch(
-      new RegExp(` It joins matter ${matter.id}\\.$`, 'u'),
+      new RegExp(` It joins matter ${matter.id}\\.`, 'u'),
     );
     expect(data(await answer('teamsync01', 'accepted', { matter: matter.id })).message).toMatch(
-      new RegExp(` It joins matter ${matter.id}\\.$`, 'u'),
+      new RegExp(` It joins matter ${matter.id}\\.`, 'u'),
     );
     expect(((await getMatter(matter.id))?.links ?? []).map((link) => link.reference)).toEqual([
       `${PRINCIPAL}/remyinvite1`,
@@ -1243,8 +1273,8 @@ describe('the assistant’s own calendar', () => {
       expect.objectContaining({ op: 'insert', calendarId: ASSISTANT, sendUpdates: 'none' }),
     ]);
     expect(created).toMatchObject({ calendar: ASSISTANT, start: FOCUS.start, end: FOCUS.end });
-    expect(created.message).toBe(
-      `Added "Focus: board deck" to your own calendar: Thursday, Oct 8, 9:00–11:00 AM PDT. ${OWN_CALENDAR_VISIBILITY} Change who it invites with change_guests, event ${String(created.event)}; anything else with gog calendar update.`,
+    expect(created.message).toContain(
+      `Added "Focus: board deck" to your own calendar: Thursday, Oct 8, 9:00–11:00 AM PDT. ${OWN_CALENDAR_VISIBILITY} Change who it invites with change_guests, event ${String(created.event)}; anything else with change_event.`,
     );
   });
 
@@ -1273,9 +1303,11 @@ describe('the assistant’s own calendar', () => {
     // Google's invitation puts a copy of the event on the principal's calendar.
     calendar.put({ ...made, calendarId: PRINCIPAL });
     const read = vi.spyOn(calendar, 'listEventDetails');
-    const facts = data(
-      await send(main, 'find_conflicts', { start: '2026-10-08T09:00:00-07:00', end: '2026-10-08T12:00:00-07:00' }),
-    );
+    const { createCalendarFactTools } = await import('./calendar-facts.js');
+    const facts = await createCalendarFactTools({ calendar: () => calendar }).findConflicts({
+      start: '2026-10-08T09:00:00-07:00',
+      end: '2026-10-08T12:00:00-07:00',
+    });
     expect(facts.conflicts).toEqual([expect.objectContaining({ calendars: [PRINCIPAL], ical_uid: made.iCalUID })]);
     expect(read.mock.calls.map(([calendarId]) => calendarId)).not.toContain(ASSISTANT);
   });
@@ -1295,15 +1327,15 @@ describe('the assistant’s own calendar', () => {
       }),
     ]);
     expect(changed.guests).toEqual([REMY, PRINCIPAL]);
-    expect(changed.message).toBe(`Its guests now: ${REMY} and ${PRINCIPAL}. Google sent the guests the update.`);
+    expect(changed.message).toContain(`Its guests now: ${REMY} and ${PRINCIPAL}. Google sent the guests the update.`);
 
     calendar.writes.length = 0;
     const without = data(await send(main, 'change_guests', { calendar: ASSISTANT, event, remove: [PRINCIPAL] }));
     expect(calendar.writes).toEqual([expect.objectContaining({ op: 'guests', sendUpdates: 'all' })]);
-    expect(without.message).toBe(`Its guests now: ${REMY}. Google sent the guests the update.`);
+    expect(without.message).toContain(`Its guests now: ${REMY}. Google sent the guests the update.`);
 
     calendar.writes.length = 0;
-    expect(data(await send(main, 'change_guests', { calendar: ASSISTANT, event, add: [REMY] })).message).toBe(
+    expect(data(await send(main, 'change_guests', { calendar: ASSISTANT, event, add: [REMY] })).message).toContain(
       `Nothing changed: ${REMY} is already invited; you are already on it.`,
     );
     expect(refusal(await send(main, 'change_guests', { calendar: ASSISTANT, event, remove: [ASSISTANT] }))).toBe(
@@ -1377,8 +1409,8 @@ describe('an open matter main names', () => {
       `event ${PRINCIPAL}/${String(created.event)}`,
       `event ${PRINCIPAL}/teamsync01`,
     ]);
-    expect(created.message).toMatch(new RegExp(` It joins matter ${matterId}\\.$`, 'u'));
-    expect(changed.message).toMatch(new RegExp(` It joins matter ${matterId}\\.$`, 'u'));
+    expect(created.message).toMatch(new RegExp(` It joins matter ${matterId}\\.`, 'u'));
+    expect(changed.message).toMatch(new RegExp(` It joins matter ${matterId}\\.`, 'u'));
   });
 
   it('is refused, writing nothing, when it is no matter id, names no matter, or names a closed one', async () => {
@@ -1414,7 +1446,7 @@ describe('an open matter main names', () => {
 
     const created = data(await send(main, 'create_event', { ...FOCUS, matter: matterId }));
 
-    expect(created.message).toMatch(new RegExp(` It did not join matter ${matterId}: .+\\.$`, 'u'));
+    expect(created.message).toMatch(new RegExp(` It did not join matter ${matterId}: .+\\.`, 'u'));
     expect(calendar.writes).toEqual([expect.objectContaining({ op: 'insert', eventId: created.event })]);
     expect(calendar.event(PRINCIPAL, String(created.event))).toMatchObject({ summary: FOCUS.title });
     expect(await linked(matterId)).toEqual([]);
@@ -1427,7 +1459,7 @@ describe('an open matter main names', () => {
     const matterId = await boardDeck();
 
     expect(refusal(await send(other, 'create_event', { ...FOCUS, matter: matterId }))).toBe(
-      'Only main keeps matters, so only main names one.',
+      'Only main reads and changes the principal’s calendar through these tools.',
     );
     expect(calendar.writes).toEqual([]);
     expect(await linked(matterId)).toEqual([]);
@@ -1448,4 +1480,441 @@ describe("main's calendar tools", () => {
     ).toMatch(/needs Google Calendar/u);
     expect(calendar.writes).toEqual([]);
   });
+});
+
+describe('calendar outcomes and findings', () => {
+  it('keeps a created event successful when findings fail, and a replay never writes twice', async () => {
+    const failed = vi.spyOn(calendar, 'listEventDetails').mockRejectedValue(new Error('checker read unavailable'));
+    const first = data(await send(main, 'create_event', FOCUS, 'act-gap'));
+    expect(first.message).toContain('Added');
+    expect(first.message).toContain('findings unavailable');
+    const { listCalendarWriteGaps } = await import('./week/write-log.js');
+    expect(await listCalendarWriteGaps()).toMatchObject([{ requestId: 'act-gap', eventId: first.event }]);
+    const inbound = new Database(inboundDbPath(main.agent_group_id, main.id));
+    inbound.prepare('DELETE FROM messages_in WHERE id = ?').run('action-resp-act-gap');
+    inbound.close();
+    const replay = data(await send(main, 'create_event', FOCUS, 'act-gap'));
+    expect(replay.event).toBe(first.event);
+    expect(calendar.writes.filter((w) => w.op === 'insert')).toHaveLength(1);
+    failed.mockRestore();
+  });
+  it('moves a guest meeting over the observed version, reports guest response and Google notification choice, then checks both days', async () => {
+    calendar.put(teamSync([PRINCIPAL_GUEST, { email: REMY, responseStatus: 'tentative' }]));
+    const result = data(
+      await send(main, 'change_event', {
+        calendar: PRINCIPAL,
+        event: 'teamsync01',
+        start: '2026-10-10T09:00:00-07:00',
+        end: '2026-10-10T09:30:00-07:00',
+        send_updates: 'all',
+      }),
+    );
+    expect(result.message).toMatch(/^People this affects:/);
+    expect(result.message).toContain('tentative');
+    expect(result.message).toContain('Google notified');
+    expect(result.message).toContain('2026-10-09');
+    expect(result.message).toContain('2026-10-10');
+    expect(calendar.event(PRINCIPAL, 'teamsync01')?.start?.dateTime).toBe('2026-10-10T16:00:00.000Z');
+    expect(calendar.writes).toMatchObject([{ op: 'patch', sendUpdates: 'all' }]);
+    expect(consumeOwnCalendarChange(PRINCIPAL, 'teamsync01', new Date())).toBe(true);
+  });
+  it('cancels only the principal’s copy of another organizer’s event and explains declining', async () => {
+    calendar.put({
+      ...teamSync([PRINCIPAL_GUEST, { email: REMY, responseStatus: 'accepted' }]),
+      organizer: { email: REMY },
+    });
+    const result = data(
+      await send(main, 'cancel_event', { calendar: PRINCIPAL, event: 'teamsync01', send_updates: 'none' }),
+    );
+    expect(result.message).toContain('Organizer:');
+    expect(result.message).toContain('principal’s copy');
+    expect(result.message).toContain('respond_to_event');
+    expect(calendar.event(PRINCIPAL, 'teamsync01')?.status).toBe('cancelled');
+  });
+});
+
+it('moves one occurrence and all following by splitting the series, retaining its finite count and logging before both writes', async () => {
+  const master = {
+    ...teamSync([PRINCIPAL_GUEST, { email: REMY, responseStatus: 'accepted' }]),
+    id: 'weekly01',
+    start: { dateTime: '2026-10-02T16:00:00Z' },
+    end: { dateTime: '2026-10-02T16:30:00Z' },
+    recurrence: ['RRULE:FREQ=WEEKLY;COUNT=5'],
+  };
+  calendar.put(master);
+  for (let i = 0; i < 3; i++)
+    calendar.put({
+      ...master,
+      id: `weekly01_${i}`,
+      recurrence: undefined,
+      recurringEventId: 'weekly01',
+      originalStartTime: { dateTime: new Date(Date.parse('2026-10-02T16:00:00Z') + i * 7 * 86400000).toISOString() },
+      start: { dateTime: new Date(Date.parse('2026-10-02T16:00:00Z') + i * 7 * 86400000).toISOString() },
+      end: { dateTime: new Date(Date.parse('2026-10-02T16:30:00Z') + i * 7 * 86400000).toISOString() },
+    });
+  const result = data(
+    await send(
+      main,
+      'change_event',
+      {
+        calendar: PRINCIPAL,
+        event: 'weekly01_2',
+        start: '2026-10-16T10:00:00-07:00',
+        end: '2026-10-16T10:30:00-07:00',
+        scope: 'following',
+        send_updates: 'all',
+      },
+      'act-following',
+    ),
+  );
+  const inserts = calendar.writes.filter((w) => w.op === 'insert');
+  expect(inserts).toHaveLength(1);
+  expect(inserts[0].fields?.recurrence).toEqual(['RRULE:FREQ=WEEKLY;COUNT=3']);
+  expect(calendar.event(PRINCIPAL, 'weekly01')?.recurrence).toEqual(['RRULE:FREQ=WEEKLY;UNTIL=20261016T155959Z']);
+  expect(result.message).toContain('following');
+  const { getCalendarWrite } = await import('./week/write-log.js');
+  expect(await getCalendarWrite('act-following')).toMatchObject({ state: 'applied' });
+});
+
+it('changes an event even when the calendar scan used only for findings cannot be read', async () => {
+  calendar.put(teamSync([PRINCIPAL_GUEST, { email: REMY, responseStatus: 'accepted' }]));
+  vi.spyOn(calendar, 'listEventDetails').mockRejectedValue(new Error('calendar scan unavailable'));
+  const changed = data(
+    await send(
+      main,
+      'change_event',
+      { calendar: PRINCIPAL, event: 'teamsync01', location: 'Video meeting', send_updates: 'none' },
+      'act-change-gap',
+    ),
+  );
+  expect(changed.message).toContain('Changed');
+  expect(changed.message).toContain('findings unavailable');
+  expect(calendar.event(PRINCIPAL, 'teamsync01')?.location).toBe('Video meeting');
+});
+it('logs a guest write and its findings gap without turning the successful invitation into failure', async () => {
+  calendar.put(teamSync([PRINCIPAL_GUEST]));
+  vi.spyOn(calendar, 'listEventDetails').mockRejectedValue(new Error('calendar scan unavailable'));
+  const changed = data(
+    await send(main, 'change_guests', { calendar: PRINCIPAL, event: 'teamsync01', add: [REMY] }, 'act-guests-gap'),
+  );
+  expect(changed.message).toContain('findings unavailable');
+  const { listCalendarWriteGaps } = await import('./week/write-log.js');
+  expect(await listCalendarWriteGaps()).toMatchObject([{ action: 'change_guests', requestId: 'act-guests-gap' }]);
+  expect(calendar.event(PRINCIPAL, 'teamsync01')?.attendees).toEqual(
+    expect.arrayContaining([{ email: REMY, responseStatus: 'needsAction' }]),
+  );
+});
+
+it('exports nine weeks to a session inbox file with a count, and filters the ordinary days answer', async () => {
+  for (let i = 0; i < 9; i++)
+    calendar.put({
+      ...teamSync([PRINCIPAL_GUEST]),
+      id: `weekly${i}`,
+      summary: i % 2 ? 'Planning' : 'Call with Remy',
+      start: { dateTime: new Date(Date.parse('2026-10-05T16:00:00Z') + i * 7 * 86400000).toISOString() },
+      end: { dateTime: new Date(Date.parse('2026-10-05T16:30:00Z') + i * 7 * 86400000).toISOString() },
+    });
+  const exported = data(await send(main, 'days', { start: '2026-10-05', end: '2026-12-06', export: true }));
+  expect(exported.count).toBe(9);
+  expect(exported.message).toContain('Exported 9 events to inbox/');
+  expect(exported.message).not.toContain('summary');
+  const file = fs.readFileSync(
+    `${sessionMailboxDir({ agentGroupId: main.agent_group_id, sessionId: main.id })}/${String(exported.path)}`,
+    'utf8',
+  );
+  expect(file).toContain('Call with Remy');
+  expect(file).toContain('Planning');
+  expect(file).toContain('Source: google_calendar');
+  const filtered = data(await send(main, 'days', { start: '2026-10-05', end: '2026-12-06', filter: 'Remy' }));
+  expect(filtered.message).toContain('5 events');
+  expect(filtered.message).not.toContain('Planning');
+});
+
+it('checks a proposed pickup and a colleague’s busy windows, with known-zero history and recorded lengths, without writing', async () => {
+  await setSchedulingPreference({
+    kind: 'meeting-length',
+    meetingKind: 'intro',
+    minutes: 25,
+    source: 'principal',
+    basis: 'Morgan prefers short introductions.',
+  });
+  const checked = data(
+    await send(main, 'check', {
+      title: 'Pickup',
+      start: '2026-10-09T14:30:00-07:00',
+      end: '2026-10-09T15:00:00-07:00',
+      guests: [REMY],
+      kind: 'intro',
+    }),
+  );
+  expect(checked.message).toContain('Nothing booked or changed');
+  expect(checked.message).toContain('people record: no');
+  expect(checked.message).toContain('0 meetings together in six months');
+  expect(checked.message).toContain('25 minutes');
+  calendar.put({ ...teamSync([]), calendarId: COLLEAGUE_CALENDAR, id: 'colleague' });
+  const busy = data(
+    await send(main, 'check', {
+      start: '2026-10-09T08:00:00-07:00',
+      end: '2026-10-09T17:00:00-07:00',
+      calendars: [COLLEAGUE_CALENDAR],
+    }),
+  );
+  expect(busy.message).toContain('Busy windows only');
+  expect(busy.message).toContain('09:00');
+  expect(busy.message).not.toContain('Team sync');
+  expect(calendar.writes).toEqual([]);
+});
+
+it('counts one historical meeting across calendar copies with equivalent offset representations', async () => {
+  const start = new Date(Date.now() - 86_400_000).toISOString();
+  const end = new Date(Date.parse(start) + 30 * 60_000).toISOString();
+  const meeting: StoredEvent = {
+    ...teamSync([PRINCIPAL_GUEST, { email: REMY, responseStatus: 'accepted' }]),
+    id: 'past-main',
+    iCalUID: 'shared-past-meeting',
+    start: { dateTime: start },
+    end: { dateTime: end },
+  };
+  calendar.put(meeting);
+  calendar.put({
+    ...meeting,
+    calendarId: READ_ONLY,
+    id: 'past-copy',
+    start: { dateTime: start.replace('Z', '+00:00') },
+  });
+  const checked = data(
+    await send(main, 'check', {
+      title: 'Next call with Remy',
+      start: '2026-11-12T09:00:00-08:00',
+      end: '2026-11-12T09:30:00-08:00',
+      guests: [REMY],
+    }),
+  );
+  expect(checked.message).toContain('1 meetings together in six months');
+  expect(checked.message).not.toContain('2 meetings together in six months');
+  expect(calendar.writes).toEqual([]);
+});
+
+it('reports a named person omitted by the principal without notifying or inviting them', async () => {
+  await addPerson({
+    name: 'Remy Vance',
+    level: 'known',
+    source: 'principal',
+    basis: 'Morgan knows Remy.',
+    identity: `email:${REMY}`,
+  });
+  calendar.put({ ...teamSync([PRINCIPAL_GUEST]), summary: 'Call with Remy', creator: { email: PRINCIPAL } });
+  const changed = data(
+    await send(main, 'change_event', {
+      calendar: PRINCIPAL,
+      event: 'teamsync01',
+      start: '2026-10-09T10:00:00-07:00',
+      end: '2026-10-09T10:30:00-07:00',
+      send_updates: 'none',
+    }),
+  );
+  expect(changed.message).toContain('named but not on the invite of an event the principal created');
+  expect(changed.message).toContain('Google notified no guests');
+  expect(calendar.event(PRINCIPAL, 'teamsync01')?.attendees).toEqual([PRINCIPAL_GUEST]);
+});
+
+it('leaves a linked prep block flagged as orphaned after its parent is cancelled', async () => {
+  calendar.put(teamSync([PRINCIPAL_GUEST]));
+  const block = data(
+    await send(main, 'create_event', {
+      calendar: PRINCIPAL,
+      title: 'Prep',
+      start: '2026-10-09T08:30:00-07:00',
+      end: '2026-10-09T09:00:00-07:00',
+      parent_event: 'teamsync01',
+      parent_calendar: PRINCIPAL,
+      parent_start: '2026-10-09T16:00:00Z',
+      block_kind: 'prep',
+    }),
+  );
+  const cancelled = data(
+    await send(main, 'cancel_event', { calendar: PRINCIPAL, event: 'teamsync01', send_updates: 'none' }),
+  );
+  expect(cancelled.message).toContain('Linked event was cancelled');
+  expect(calendar.event(PRINCIPAL, String(block.event))?.status).toBe('confirmed');
+});
+
+it('forgets person handles from the durable write payload, split plan, outcome and pending notices', async () => {
+  const person = await addPerson({
+    name: 'Remy Vance',
+    level: 'known',
+    source: 'principal',
+    basis: 'Morgan knows Remy.',
+    identity: `email:${REMY}`,
+  });
+  await send(main, 'create_event', { ...FOCUS, title: 'Call with Remy', guests: [REMY] }, 'act-forget');
+  fs.mkdirSync(`${TEST_DIR}/secrets`, { mode: 0o700 });
+  vi.stubEnv(GOOGLE_GRANT_FILE_ENV, `${TEST_DIR}/secrets/google-grant.json`);
+  try {
+    await forgetPerson({ id: person.id });
+  } finally {
+    vi.unstubAllEnvs();
+  }
+  const rows = await getDb().all('SELECT * FROM gws_ea_calendar_write_log');
+  expect(JSON.stringify(rows)).not.toContain(REMY);
+  expect(JSON.stringify(await getDb().all('SELECT * FROM gws_ea_pending_calendar_changes'))).not.toContain(REMY);
+});
+
+it('preserves a finite recurrence count across an excluded date when splitting after it', async () => {
+  calendar.put({
+    ...teamSync([PRINCIPAL_GUEST]),
+    id: 'weeklyex',
+    recurrence: ['RRULE:FREQ=WEEKLY;COUNT=5', 'EXDATE:20261009T160000Z'],
+    start: { dateTime: '2026-10-02T16:00:00Z', timeZone: PACIFIC },
+    end: { dateTime: '2026-10-02T16:30:00Z', timeZone: PACIFIC },
+  });
+  calendar.put({
+    ...teamSync([PRINCIPAL_GUEST]),
+    id: 'weeklyex_2',
+    recurringEventId: 'weeklyex',
+    originalStartTime: { dateTime: '2026-10-16T16:00:00Z' },
+    start: { dateTime: '2026-10-16T16:00:00Z' },
+    end: { dateTime: '2026-10-16T16:30:00Z' },
+  });
+  data(
+    await send(main, 'change_event', {
+      calendar: PRINCIPAL,
+      event: 'weeklyex_2',
+      start: '2026-10-16T10:00:00-07:00',
+      end: '2026-10-16T10:30:00-07:00',
+      scope: 'following',
+      send_updates: 'none',
+    }),
+  );
+  const following = calendar.writes.find((w) => w.op === 'insert');
+  expect(following?.fields?.recurrence).toEqual(['RRULE:FREQ=WEEKLY;COUNT=3']);
+  expect(calendar.event(PRINCIPAL, 'weeklyex')?.recurrence).toEqual([
+    'RRULE:FREQ=WEEKLY;UNTIL=20261016T155959Z',
+    'EXDATE:20261009T160000Z',
+  ]);
+});
+
+it('resumes a split after the insert reply is lost without trimming or inviting twice', async () => {
+  calendar.put({
+    ...teamSync([PRINCIPAL_GUEST]),
+    id: 'weeklyretry',
+    recurrence: ['RRULE:FREQ=WEEKLY;COUNT=5'],
+    start: { dateTime: '2026-10-02T16:00:00Z', timeZone: PACIFIC },
+    end: { dateTime: '2026-10-02T16:30:00Z', timeZone: PACIFIC },
+  });
+  calendar.put({
+    ...teamSync([PRINCIPAL_GUEST]),
+    id: 'weeklyretry_2',
+    recurringEventId: 'weeklyretry',
+    originalStartTime: { dateTime: '2026-10-16T16:00:00Z' },
+    start: { dateTime: '2026-10-16T16:00:00Z' },
+    end: { dateTime: '2026-10-16T16:30:00Z' },
+  });
+  const request = {
+    calendar: PRINCIPAL,
+    event: 'weeklyretry_2',
+    start: '2026-10-16T10:00:00-07:00',
+    end: '2026-10-16T10:30:00-07:00',
+    scope: 'following',
+    send_updates: 'all',
+  };
+  calendar.failNext({ op: 'insert', error: new Error('reply lost'), afterApplying: true });
+  const first = data(await send(main, 'change_event', request, 'act-split-retry'));
+  expect(first.message).toContain('Changed this occurrence and all following occurrences');
+  const inbound = new Database(inboundDbPath(main.agent_group_id, main.id));
+  inbound.prepare('DELETE FROM messages_in WHERE id = ?').run('action-resp-act-split-retry');
+  inbound.close();
+  const retried = data(await send(main, 'change_event', request, 'act-split-retry'));
+  expect(retried.message).toContain('all following occurrences');
+  expect(calendar.writes.filter((w) => w.op === 'patch')).toHaveLength(1);
+  expect(calendar.writes.filter((w) => w.op === 'insert')).toHaveLength(1);
+});
+
+it('cancels this and following occurrences by truncating the master without deleting earlier occurrences', async () => {
+  calendar.put({
+    ...teamSync([PRINCIPAL_GUEST]),
+    id: 'weeklycancel',
+    recurrence: ['RRULE:FREQ=WEEKLY;COUNT=5'],
+    start: { dateTime: '2026-10-02T16:00:00Z', timeZone: PACIFIC },
+    end: { dateTime: '2026-10-02T16:30:00Z', timeZone: PACIFIC },
+  });
+  calendar.put({
+    ...teamSync([PRINCIPAL_GUEST]),
+    id: 'weeklycancel_2',
+    recurringEventId: 'weeklycancel',
+    originalStartTime: { dateTime: '2026-10-16T16:00:00Z' },
+    start: { dateTime: '2026-10-16T16:00:00Z' },
+    end: { dateTime: '2026-10-16T16:30:00Z' },
+  });
+  const result = data(
+    await send(main, 'cancel_event', {
+      calendar: PRINCIPAL,
+      event: 'weeklycancel_2',
+      scope: 'following',
+      send_updates: 'none',
+    }),
+  );
+  expect(result.message).toContain('Cancelled this occurrence and all following occurrences');
+  expect(calendar.event(PRINCIPAL, 'weeklycancel')?.recurrence).toEqual(['RRULE:FREQ=WEEKLY;UNTIL=20261016T155959Z']);
+  expect(calendar.writes).toMatchObject([{ op: 'patch', eventId: 'weeklycancel' }]);
+});
+
+it.each([
+  ['an off-cadence RDATE', ['RRULE:FREQ=WEEKLY;INTERVAL=2;BYDAY=FR', 'RDATE:20261009T160000Z']],
+  ['an EXRULE with a different phase', ['RRULE:FREQ=WEEKLY;BYDAY=FR', 'EXRULE:FREQ=WEEKLY;INTERVAL=3;BYDAY=FR']],
+])('refuses a split of %s before writing rather than silently moving later occurrences', async (_label, recurrence) => {
+  calendar.put({
+    ...teamSync([PRINCIPAL_GUEST]),
+    id: 'phased',
+    recurrence,
+    start: { dateTime: '2026-10-02T16:00:00Z', timeZone: PACIFIC },
+    end: { dateTime: '2026-10-02T16:30:00Z', timeZone: PACIFIC },
+  });
+  calendar.put({
+    ...teamSync([PRINCIPAL_GUEST]),
+    id: 'phased_1',
+    recurringEventId: 'phased',
+    originalStartTime: { dateTime: '2026-10-09T16:00:00Z' },
+    start: { dateTime: '2026-10-09T16:00:00Z' },
+    end: { dateTime: '2026-10-09T16:30:00Z' },
+  });
+  const request = {
+    calendar: PRINCIPAL,
+    event: 'phased_1',
+    start: '2026-10-09T10:00:00-07:00',
+    end: '2026-10-09T10:30:00-07:00',
+    scope: 'following',
+    send_updates: 'none',
+  };
+  const refused = refusal(await send(main, 'change_event', request));
+  expect(refused).toContain('cannot preserve the existing recurrence');
+  expect(refused).toContain('explicit replacement recurrence');
+  expect(calendar.writes).toEqual([]);
+  const changed = data(await send(main, 'change_event', { ...request, recurrence: ['RRULE:FREQ=WEEKLY;COUNT=3'] }));
+  expect(changed.message).toContain('all following occurrences');
+});
+
+it('does not swallow a later principal notice after an unchanged edit', async () => {
+  calendar.put({ ...teamSync([PRINCIPAL_GUEST]), id: 'unchangededit', tags: { gws_ea_assistant_written: 'true' } });
+  const result = data(
+    await send(main, 'change_event', {
+      calendar: PRINCIPAL,
+      event: 'unchangededit',
+      title: 'Team sync',
+      send_updates: 'none',
+    }),
+  );
+  expect(calendar.writes).toEqual([]);
+  expect(consumeOwnCalendarChange(PRINCIPAL, 'unchangededit', new Date())).toBe(false);
+  expect(result.message).toContain('Nothing changed');
+});
+
+it('defaults days to exactly eight local dates when the clock changes during the range', async () => {
+  const clock = vi.spyOn(Date, 'now').mockReturnValue(Date.parse('2026-10-28T20:00:00Z'));
+  try {
+    const result = data(await send(main, 'days', {}));
+    expect(result.message).toContain('across 8 local days');
+  } finally {
+    clock.mockRestore();
+  }
 });

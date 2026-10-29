@@ -500,3 +500,53 @@ it('keeps telephone conference entry points on the detail route', async () => {
     },
   });
 });
+
+it('reads one main-only detail with its creator and recurrence, keeping the outward getter title-free', async () => {
+  const { api, requests } = stubGoogle(() => ({
+    status: 200,
+    body: {
+      id: 'abc123',
+      summary: 'Call with Remy',
+      creator: { email: 'juno@ellery.example', displayName: 'Juno Hale' },
+      recurrence: ['RRULE:FREQ=WEEKLY;COUNT=10'],
+      start: { dateTime: '2026-10-05T16:00:00Z' },
+      end: { dateTime: '2026-10-05T16:30:00Z' },
+    },
+  }));
+  expect(await api.getEventDetail('morgan@ellery.example', 'abc123')).toMatchObject({
+    summary: 'Call with Remy',
+    creator: { displayName: 'Juno Hale' },
+    recurrence: ['RRULE:FREQ=WEEKLY;COUNT=10'],
+  });
+  expect(await api.getEvent('morgan@ellery.example', 'abc123')).not.toHaveProperty('summary');
+  expect(requests[0].url.searchParams.get('fields')).toContain('creator');
+  expect(requests[1].url.searchParams.get('fields')).not.toContain('summary');
+});
+
+it('reads colleague busy windows and fails an incomplete freebusy answer rather than reporting free time', async () => {
+  const { api, requests } = stubGoogle(() => ({
+    status: 200,
+    body: {
+      calendars: {
+        'remy@ellery.example': { busy: [{ start: '2026-10-05T16:00:00Z', end: '2026-10-05T17:00:00Z' }] },
+      },
+    },
+  }));
+  expect(await api.freeBusy(['remy@ellery.example'], '2026-10-05T00:00:00Z', '2026-10-06T00:00:00Z')).toEqual({
+    'remy@ellery.example': [{ start: '2026-10-05T16:00:00Z', end: '2026-10-05T17:00:00Z' }],
+  });
+  expect(requests[0]).toMatchObject({ method: 'POST', body: { items: [{ id: 'remy@ellery.example' }] } });
+  await expect(
+    api.freeBusy(['unknown@ellery.example'], '2026-10-05T00:00:00Z', '2026-10-06T00:00:00Z'),
+  ).rejects.toThrow(/busy/i);
+});
+
+it('does not report availability when Google gives a busy interval with an unreadable end', async () => {
+  const { api } = stubGoogle(() => ({
+    status: 200,
+    body: { calendars: { 'remy@ellery.example': { busy: [{ start: '2026-10-05T16:00:00Z', end: 'not-a-time' }] } } },
+  }));
+  await expect(api.freeBusy(['remy@ellery.example'], '2026-10-05T00:00:00Z', '2026-10-06T00:00:00Z')).rejects.toThrow(
+    /unreadable busy-time window/,
+  );
+});
