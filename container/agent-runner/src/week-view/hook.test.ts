@@ -106,6 +106,27 @@ describe('the native week hooks', () => {
     fs.writeFileSync(file, JSON.stringify(view('second', [{ id: 'more', text: '+3000 more', version: 'new' }])));
     expect(run('UserPromptSubmit').stdout).toContain('2026-10-05: +3000 more');
   });
+  it.each([600, 6_000])('delivers a complete %i-character Manual update even during a calendar burst', (length) => {
+    fs.writeFileSync(file, JSON.stringify(view()));
+    run('SessionStart', 'startup');
+    const manual = `New priorities: ${'m'.repeat(length)}\nThe final principle is present.`;
+    fs.writeFileSync(
+      file,
+      JSON.stringify({
+        ...view(
+          'changed',
+          Array.from({ length: 30 }, (_, n) => ({ id: String(n), text: `${n}: ${'x'.repeat(250)}` })),
+        ),
+        manual,
+      }),
+    );
+    const answer = run('UserPromptSubmit');
+    expect(answer.status).toBe(0);
+    expect(answer.stdout).toContain(`Current Principal Manual\n${manual}`);
+    expect(answer.stdout.length).toBeLessThan(12_200);
+    expect(run('UserPromptSubmit').stdout).not.toContain('New priorities:');
+    expect(run('SessionStart', 'resume').stdout).toBe('');
+  });
   it.each(['missing', 'corrupt', 'stale'])('fails open in one line for a %s view', (kind) => {
     if (kind === 'corrupt') fs.writeFileSync(file, '{');
     if (kind === 'stale') fs.writeFileSync(file, JSON.stringify({ ...view(), asOf: '2026-10-01T00:00:00Z' }));

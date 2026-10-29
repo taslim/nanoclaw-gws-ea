@@ -28,7 +28,6 @@ function differences(previous: DeliveredView | undefined, days: readonly ViewDay
     for (const old of held?.entries ?? [])
       if (!currentIds.has(old.id)) changes.push(`${day.date}: removed ${old.text}`);
   }
-  if (manual !== previous?.manual) changes.push(`Current Principal Manual\n${manual}`);
   const lines: string[] = [];
   let size = 0;
   for (const change of changes) {
@@ -37,7 +36,9 @@ function differences(previous: DeliveredView | undefined, days: readonly ViewDay
     size += change.length + 1;
   }
   if (lines.length < changes.length) lines.push(`+${changes.length - lines.length} more`);
-  return lines.join('\n');
+  return [manual !== previous?.manual ? `Current Principal Manual\n${manual}` : '', lines.join('\n')]
+    .filter(Boolean)
+    .join('\n\n');
 }
 
 function write(text: string): void {
