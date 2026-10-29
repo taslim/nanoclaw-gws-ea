@@ -23,6 +23,7 @@ import '../gws-ea-privacy/index.js';
 import '../gws-ea-people/index.js';
 import '../gws-ea-preferences/index.js';
 import '../gws-ea-whereabouts/index.js';
+import { addStay } from '../gws-ea-whereabouts/db.js';
 import { preparePrincipalMessageContent } from '../gws-ea-profile/marks.js';
 import { pendingCalendarChangesMigration } from '../gws-ea-meetings/week/pending-changes-migration.js';
 import { FakeCalendar } from '../gws-ea-meetings/testing/fake-calendar.js';
@@ -301,5 +302,34 @@ it('discovers the bare day command through native ncl help', async () => {
   expect(response).toMatchObject({
     ok: true,
     data: expect.stringMatching(/day +Read the day since the last completed close/u),
+  });
+});
+
+it('shows each ledger message on its own local clock while keeping the coverage cutoff canonical', async () => {
+  await principal('home-clock', '2026-10-28T15:00:00Z', 'A home-day correction.');
+  await addStay({
+    locality: 'Brussels',
+    zone: 'Europe/Brussels',
+    start: '2026-10-29',
+    end: '2026-11-06',
+    source: 'said',
+    certainty: 'certain',
+  });
+  await principal('trip-clock', '2026-11-03T15:00:00Z', 'A trip-day correction.');
+  vi.setSystemTime('2026-11-04T18:00:00Z');
+  const result = await readDayLedger(ctx);
+  const entries = section(result, 'principal').entries;
+  expect(entries.find((entry) => entry.includes('home-day correction'))).toContain(
+    'Oct 28, 2026, 11:00 AM New York time',
+  );
+  expect(entries.find((entry) => entry.includes('trip-day correction'))).toContain(
+    'Nov 3, 2026, 4:00 PM Brussels time',
+  );
+  expect(result.through).toBe('2026-11-04T18:00:00.000Z');
+  const frame = await dispatch({ id: 'local-ledger', command: 'day', args: {} }, ctx);
+  expect(frame).toMatchObject({
+    ok: true,
+    data: { through: '2026-11-04T18:00:00.000Z' },
+    human: expect.stringContaining('Nov 3, 2026, 4:00 PM Brussels time'),
   });
 });

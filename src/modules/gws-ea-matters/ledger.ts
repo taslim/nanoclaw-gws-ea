@@ -2,6 +2,8 @@ import { parseInboundContent } from '../../channels/inbound-content.js';
 import { register } from '../../cli/registry.js';
 import type { CallerContext } from '../../cli/frame.js';
 import { getDb } from '../../db/connection.js';
+import { TIMEZONE } from '../../config.js';
+import { formatLocalTimeWithZone } from '../../timezone.js';
 import { getSessionsByAgentGroup } from '../../db/sessions.js';
 import { isRecord } from '../../gws-ea/validation.js';
 import { withExistingMailboxSession } from '../../session-manager.js';
@@ -87,6 +89,11 @@ export async function readDayLedger(ctx: CallerContext): Promise<DayLedger> {
   }
   if (ctx.caller === 'agent' && (main === null || ctx.agentGroupId !== main))
     throw new Error('Only main may read the day ledger.');
+  const timeline = await loadTimeline().catch((_error: unknown) => undefined);
+  const displayAt = (at: string): string => {
+    const zone = ctx.caller === 'host' ? TIMEZONE : timeline && zoneAt(timeline, Date.parse(at));
+    return zone ? formatLocalTimeWithZone(at, zone) : `${at} (local zone unavailable)`;
+  };
   const section = (key: DaySection['key']): DaySection => ({ key, entries: [], unavailable: false, omitted: 0 });
   const principal = section('principal');
   const sends = section('sends');
@@ -110,10 +117,10 @@ export async function readDayLedger(ctx: CallerContext): Promise<DayLedger> {
               const text = parseInboundContent(message.content).text;
               if (!text) continue;
               if (hasHostPrincipalMessageMark(message.content, message.id))
-                principal.entries.push(`${message.timestamp}; conversation ${session.id}\n${text}`);
+                principal.entries.push(`${displayAt(message.timestamp)}; conversation ${session.id}\n${text}`);
               else
                 notes.entries.push(
-                  `${message.timestamp}; conversation ${session.id}\n${framed(text, 'conversation_note')}`,
+                  `${displayAt(message.timestamp)}; conversation ${session.id}\n${framed(text, 'conversation_note')}`,
                 );
             }
           });
@@ -124,7 +131,7 @@ export async function readDayLedger(ctx: CallerContext): Promise<DayLedger> {
                 !['system', 'task_log', 'cli_request'].includes(message.kind)
               )
                 sends.entries.push(
-                  `${message.timestamp}; conversation ${session.id}\n${framed(message.content, 'main_send')}`,
+                  `${displayAt(message.timestamp)}; conversation ${session.id}\n${framed(message.content, 'main_send')}`,
                 );
           });
           return true;
@@ -151,10 +158,12 @@ export async function readDayLedger(ctx: CallerContext): Promise<DayLedger> {
       if (write.state === 'pending') checked = 'Outcome not confirmed; this write is pending. Findings not checked.';
       else
         try {
+          if (!timeline) throw new Error('The local clock is unavailable.');
           checked = await calendarFindings(
             await loadCalendarWeek(calendar, {
               start: Date.parse(write.affectedStart),
               end: Date.parse(write.affectedEnd),
+              timeline,
             }),
           );
           if (gaps.has(write.requestId)) await completeCalendarWriteFindings(write.requestId);
@@ -166,43 +175,45 @@ export async function readDayLedger(ctx: CallerContext): Promise<DayLedger> {
         'SELECT request_id,updated_at FROM gws_ea_calendar_write_log WHERE request_id=?',
         write.requestId,
       );
-      const entry = `${write.requestId}: ${write.action}; ${write.affectedStart} to ${write.affectedEnd}\n${framed(JSON.stringify({ calendar: write.calendarId, event: write.eventId, request: write.request, outcome: write.outcome }), 'calendar_write')}\n${checked}`;
+      const entry = `${write.requestId}: ${write.action}; ${displayAt(write.affectedStart)} to ${displayAt(write.affectedEnd)}\n${framed(JSON.stringify({ calendar: write.calendarId, event: write.eventId, request: write.request, outcome: write.outcome }), 'calendar_write')}\n${checked}`;
       writes.entries.push(entry);
       if (current && write.state === 'applied')
         consumed.set(entry, { requestId: write.requestId, updatedAt: current.updated_at });
     }
   });
   await collect([notes], async () => {
-    const timeline = await loadTimeline();
     for (const notice of await getDb().all<PendingNotice>(
       'SELECT * FROM gws_ea_pending_calendar_changes WHERE received_at<=? ORDER BY received_at,message_id',
       through,
     )) {
       let checked: string;
       try {
+        if (!timeline) throw new Error('The local clock is unavailable.');
         const event = await calendar.getEvent(notice.calendar_id, notice.event_id);
         const span = event && eventSpan(event, zoneAt(timeline, Date.parse(notice.received_at)) ?? 'UTC');
         checked = await calendarFindings(
-          await loadCalendarWeek(
-            calendar,
-            span ?? { start: Date.parse(notice.received_at) - DAY, end: Date.parse(notice.received_at) + DAY },
-          ),
+          await loadCalendarWeek(calendar, {
+            ...(span ?? { start: Date.parse(notice.received_at) - DAY, end: Date.parse(notice.received_at) + DAY }),
+            timeline,
+          }),
         );
         // eslint-disable-next-line no-catch-all/no-catch-all -- Pending notices remain pending even when their fresh findings are unavailable.
       } catch {
         checked = 'Findings unavailable.';
       }
       notes.entries.push(
-        `${notice.received_at}; pending calendar notice\n${framed(JSON.stringify({ calendar: notice.calendar_id, event: notice.event_id, change: notice.change_kind }), 'calendar_notice')}\n${checked}`,
+        `${displayAt(notice.received_at)}; pending calendar notice\n${framed(JSON.stringify({ calendar: notice.calendar_id, event: notice.event_id, change: notice.change_kind }), 'calendar_notice')}\n${checked}`,
       );
     }
   });
   await collect([findings], async () => {
+    if (!timeline) throw new Error('The local clock is unavailable.');
     findings.entries.push(
       await calendarFindings(
         await loadCalendarWeek(calendar, {
           start: from === null ? Date.parse(through) - DAY : Date.parse(from),
           end: Date.parse(through),
+          timeline,
         }),
       ),
     );
@@ -241,6 +252,7 @@ export async function readDayLedger(ctx: CallerContext): Promise<DayLedger> {
   return result;
 }
 
+/** to: main */
 register({
   name: 'day',
   access: 'open',
@@ -251,4 +263,16 @@ register({
     return raw;
   },
   handler: (_args, ctx) => readDayLedger(ctx),
+  formatHuman: (data) =>
+    [
+      'Day ledger since the last completed close',
+      ...data.sections.map((section) =>
+        [
+          section.key,
+          ...(section.unavailable ? ['Some evidence is unavailable.'] : []),
+          ...section.entries,
+          ...(section.omitted ? [`${section.omitted} earlier entries omitted.`] : []),
+        ].join('\n'),
+      ),
+    ].join('\n\n'),
 });
