@@ -119,6 +119,7 @@ interface WallClock {
   second: number;
   millisecond: number;
 }
+type WallZone = (wall: WallClock) => string;
 
 type Moment =
   | { kind: 'exact'; at: ValidDateTime }
@@ -282,7 +283,7 @@ function notUnderstood(text: string): string {
 }
 
 /** ISO 8601 input: a date, a local date-time, or a date-time with its UTC offset. */
-function readIso(text: string, zone: string): Reading | null {
+function readIso(text: string, zone: string, wallZone?: WallZone): Reading | null {
   const date = ISO_DATE.exec(text);
   if (date) {
     const wall = dateOnly({
@@ -296,7 +297,7 @@ function readIso(text: string, zone: string): Reading | null {
     });
     return {
       fixed: false,
-      moment: { kind: 'exact', at: startOfDay(wall, zone) },
+      moment: { kind: 'exact', at: startOfDay(wall, wallZone?.(wall) ?? zone) },
       wall,
       timeStated: false,
       read: text,
@@ -323,7 +324,14 @@ function readIso(text: string, zone: string): Reading | null {
   const parsed = DateTime.fromISO(normalized, { zone: 'utc' });
   if (!parsed.isValid) fail(notUnderstood(text));
   const wall = wallClockOf(parsed);
-  return { fixed: false, moment: momentAt(wall, zone), wall, timeStated: true, read: text, notes: [] };
+  return {
+    fixed: false,
+    moment: momentAt(wall, wallZone?.(wall) ?? zone),
+    wall,
+    timeStated: true,
+    read: text,
+    notes: [],
+  };
 }
 
 /**
@@ -411,7 +419,7 @@ function luxonWeekday(chronoWeekday: number): number {
   return chronoWeekday === 0 ? 7 : chronoWeekday;
 }
 
-function readNatural(text: string, zone: string, reference: ValidDateTime): Reading {
+function readNatural(text: string, zone: string, reference: ValidDateTime, wallZone?: WallZone): Reading {
   const refWall = wallClockOf(valid(reference.setZone(zone)));
   const refDate = localDate(refWall);
   if (!refDate) {
@@ -478,11 +486,13 @@ function readNatural(text: string, zone: string, reference: ValidDateTime): Read
 
   const moment: Moment = start.tags().has(RELATIVE_TIME_TAG)
     ? { kind: 'exact', at: relativeInstant(chosen, refWall, reference, text) }
-    : momentOf(start, wall, zone, timeStated, notes, reference);
+    : momentOf(start, wall, wallZone?.(wall) ?? zone, timeStated, notes, reference);
   // chrono leaves `end` null, not undefined, on results it has copied.
-  const end = chosen.end
-    ? momentOf(chosen.end, wallOf(chosen.end, text), zone, chosen.end.isCertain('hour'), notes, reference)
-    : undefined;
+  const endWall = chosen.end ? wallOf(chosen.end, text) : undefined;
+  const end =
+    chosen.end && endWall
+      ? momentOf(chosen.end, endWall, wallZone?.(endWall) ?? zone, chosen.end.isCertain('hour'), notes, reference)
+      : undefined;
 
   return {
     fixed: start.isCertain('timezoneOffset') || start.tags().has(RELATIVE_TIME_TAG) || start.tags().has(NOW_TAG),
@@ -496,12 +506,14 @@ function readNatural(text: string, zone: string, reference: ValidDateTime): Read
 }
 
 /** ISO is tried first: it is exact and cheap. */
-function readInput(input: string, zone: string, reference: ValidDateTime): Reading {
+function readInput(input: string, zone: string, reference: ValidDateTime, wallZone?: WallZone): Reading {
   const text = input.trim();
-  const reading = readIso(text, zone) ?? readNatural(text, zone, reference);
+  const reading = readIso(text, zone, wallZone) ?? readNatural(text, zone, reference, wallZone);
   const { moment } = reading;
   if (moment.kind === 'ambiguous') {
-    reading.notes.push(`${twiceMessage(reading.wall, zone, moment.earlier, moment.later)} Ask which one is meant.`);
+    reading.notes.push(
+      `${twiceMessage(reading.wall, moment.earlier.zoneName, moment.earlier, moment.later)} Ask which one is meant.`,
+    );
   }
   return reading;
 }
@@ -513,7 +525,12 @@ function readWithClock(
   timeline: ClockTimeline | null,
   homeZone: string,
 ): Reading {
-  const initial = readInput(expression, zone, reference);
+  const initial = readInput(
+    expression,
+    zone,
+    reference,
+    timeline === null ? undefined : (wall) => timelineZoneForDay(timeline, floating(wall).toISODate()!) ?? homeZone,
+  );
   if (timeline === null) return initial;
   if (initial.fixed) {
     const inZone = (moment: Moment): Moment =>
@@ -522,16 +539,7 @@ function readWithClock(
         : moment;
     return { ...initial, moment: inZone(initial.moment), ...(initial.end ? { end: inZone(initial.end) } : {}) };
   }
-  const target = timelineZoneForDay(timeline, floating(initial.wall).toISODate()!) ?? homeZone;
-  const reading =
-    target === zone
-      ? initial
-      : readInput(expression, target, valid(reference.setZone(target, { keepLocalTime: true })));
-  if (!reading.end) return reading;
-  const endAt = reading.end.kind === 'exact' ? reading.end.at : reading.end.earlier;
-  const endWall = wallClockOf(endAt);
-  const endZone = timelineZoneForDay(timeline, floating(endWall).toISODate()!) ?? homeZone;
-  return endZone === target ? reading : { ...reading, end: momentAt(endWall, endZone) };
+  return initial;
 }
 
 function clockSource(timeline: ClockTimeline | null, ...moments: Moment[]): ClockSource {
@@ -547,13 +555,24 @@ function nowIn(zone: string, now: () => number): ValidDateTime {
   return valid(DateTime.fromMillis(now(), { zone }));
 }
 
-function readReference(input: string | undefined, zone: string, now: () => number): ValidDateTime {
+function readReference(
+  input: string | undefined,
+  zone: string,
+  now: () => number,
+  timeline: ClockTimeline | null,
+  homeZone: string,
+): ValidDateTime {
   if (input === undefined) return nowIn(zone, now);
-  const reading = readIso(input.trim(), zone);
-  if (reading === null) {
+  const text = input.trim();
+  if (!ISO_DATE.test(text) && !ISO_DATE_TIME.test(text)) {
     fail(`reference_date must be an ISO date or date-time, such as 2026-10-05 or 2026-10-05T10:00; got "${input}".`);
   }
-  return exactly(reading, 'reference_date', zone);
+  const reading = readWithClock(text, zone, nowIn(zone, now), timeline, homeZone);
+  return exactly(
+    reading,
+    'reference_date',
+    reading.moment.kind === 'exact' ? reading.moment.at.zoneName : reading.moment.earlier.zoneName,
+  );
 }
 
 function optionalString(args: Record<string, unknown>, key: string): string | undefined {
@@ -679,8 +698,14 @@ export function createTimeTools(
         const snapshot = clock();
         const { zone } = snapshot;
         const expression = requiredString(args, 'expression');
-        const reference = readReference(optionalString(args, 'reference_date'), zone, () => snapshot.at);
-        const reading = readWithClock(expression, zone, reference, snapshot.timeline, homeZone);
+        const reference = readReference(
+          optionalString(args, 'reference_date'),
+          zone,
+          () => snapshot.at,
+          snapshot.timeline,
+          homeZone,
+        );
+        const reading = readWithClock(expression, reference.zoneName, reference, snapshot.timeline, homeZone);
         const both = (moment: Extract<Moment, { kind: 'ambiguous' }>) => [
           formatDt(moment.earlier),
           formatDt(moment.later),
@@ -689,7 +714,7 @@ export function createTimeTools(
         return {
           expression,
           clock_source: clockSource(snapshot.timeline, moment, ...(end ? [end] : [])),
-          reference: formatDt(valid(reference.setZone(zone))),
+          reference: formatDt(reference),
           ...(moment.kind === 'exact' ? { resolved: formatDt(moment.at) } : { candidates: both(moment) }),
           ...(end === undefined
             ? {}

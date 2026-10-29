@@ -58,7 +58,7 @@ it('uses each currency exponent and refuses hidden precision instead of rounding
 
 it('shows the exact reservation and explicit no-commitment terms on its approval card', async () => {
   const { renderPurchaseCard, NO_EARLIER_PURCHASES } = await import('./cards.js');
-  const card = renderPurchaseCard(free, {}, NO_EARLIER_PURCHASES, 'UTC');
+  const card = renderPurchaseCard(free, {}, NO_EARLIER_PURCHASES, () => 'UTC');
   expect(card).toContain('Bistro');
   expect(card).toContain('Party size: 2');
   expect(card).toContain('Reservation time: Oct 20, 2026, 7:00 PM through 8:30 PM UTC\n');
@@ -96,13 +96,13 @@ it("shows a Tokyo dinner on the venue's clock with the principal's alongside, an
       timeZone: 'Asia/Tokyo',
     },
   };
-  const card = renderPurchaseCard(dinner, {}, NO_EARLIER_PURCHASES, 'America/Los_Angeles');
+  const card = renderPurchaseCard(dinner, {}, NO_EARLIER_PURCHASES, () => 'America/Los_Angeles');
   expect(card).toContain(
     'Reservation time: Oct 20, 2026, 7:00 PM through 8:30 PM Tokyo time (Oct 20, 2026, 3:00 AM through 4:30 AM Los Angeles time)',
   );
   expect(card).toContain('Cancellation deadline: Oct 19, 2026, 3:00 AM Los Angeles time');
   // A principal on the venue's clock reads it once.
-  expect(renderPurchaseCard(dinner, {}, NO_EARLIER_PURCHASES, 'Asia/Tokyo')).toContain(
+  expect(renderPurchaseCard(dinner, {}, NO_EARLIER_PURCHASES, () => 'Asia/Tokyo')).toContain(
     'Reservation time: Oct 20, 2026, 7:00 PM through 8:30 PM Tokyo time\n',
   );
 });
@@ -129,10 +129,47 @@ it('shows a needed-by deadline and a trial conversion on the principal’s clock
     trial,
     { neededBy: '2026-10-21T06:59:59.999Z', principalTimeZone: 'America/Los_Angeles' },
     NO_EARLIER_PURCHASES,
-    'America/Los_Angeles',
+    () => 'America/Los_Angeles',
   );
   expect(card).toContain('Needed by: Oct 20, 2026, 11:59 PM Los Angeles time');
   expect(card).toContain('Trial conversion: Nov 15, 2026, 12:00 AM Los Angeles time');
+});
+
+it('renders each card moment on its own clock across a trip and return', async () => {
+  const { renderPurchaseCard, NO_EARLIER_PURCHASES } = await import('./cards.js');
+  const clock = (at: string | number): string => {
+    const instant = typeof at === 'number' ? at : Date.parse(at);
+    return Date.parse('2026-11-10T00:00Z') <= instant && instant < Date.parse('2026-11-15T00:00Z')
+      ? 'Europe/Brussels'
+      : 'America/Los_Angeles';
+  };
+  const card = renderPurchaseCard(
+    {
+      ...free,
+      noCommitmentTerms: undefined,
+      commitments: [
+        {
+          kind: 'trial',
+          terms: 'A trial',
+          amountMinor: 999,
+          frequency: 'monthly',
+          conversionAt: '2026-11-16T08:00:00Z',
+          cancellationDeadline: '2026-11-12T08:00:00Z',
+        },
+      ],
+      reservation: undefined,
+    },
+    { neededBy: '2026-11-12T09:00:00Z' },
+    {
+      ...NO_EARLIER_PURCHASES,
+      recordedNotPlaced: [{ attemptedAt: '2026-11-09T20:00:00Z', source: 'principal' }],
+    },
+    clock,
+  );
+  expect(card).toContain('Earlier purchase here, tried Nov 9, 2026, 12:00 PM Los Angeles time');
+  expect(card).toContain('Needed by: Nov 12, 2026, 10:00 AM Brussels time');
+  expect(card).toContain('Cancellation deadline: Nov 12, 2026, 9:00 AM Brussels time');
+  expect(card).toContain('Trial conversion: Nov 16, 2026, 12:00 AM Los Angeles time');
 });
 
 /** An unreviewed venue's own booking with a no-show fee, as the generic signature reads it. */
@@ -191,7 +228,7 @@ it("shows an unreviewed booking's account, quoted items, note and time, naming t
     booking,
     {},
     { unresolved: 1, recordedNotPlaced: [] },
-    'America/New_York',
+    () => 'America/New_York',
     undefined,
     {
       alias: 'Aya.Web@example.test',
@@ -219,7 +256,7 @@ it("shows an unreviewed booking's account, quoted items, note and time, naming t
     { ...booking, account: 'aya.web+tables@example.test', generic: { ...booking.generic!, guest: false } },
     {},
     NO_EARLIER_PURCHASES,
-    'America/New_York',
+    () => 'America/New_York',
     undefined,
     { alias: 'aya.web@example.test' },
   );
@@ -229,7 +266,7 @@ it("shows an unreviewed booking's account, quoted items, note and time, naming t
       { ...booking, account: 'Morgan Ellery', generic: { ...booking.generic!, guest: false } },
       {},
       NO_EARLIER_PURCHASES,
-      'America/New_York',
+      () => 'America/New_York',
     ),
   ).toContain('Account: "Morgan Ellery"');
 });
@@ -246,7 +283,7 @@ it("names earlier purchases on a reviewed card by count and time, never by id, a
         { attemptedAt: '2026-10-16T17:30:00.000Z', source: 'email' },
       ],
     },
-    'America/Los_Angeles',
+    () => 'America/Los_Angeles',
   );
   for (const line of [
     'Earlier purchase here, tried Oct 17, 2026, 3:04 PM Los Angeles time: I recorded it as not placed, from what you told me.',
@@ -255,12 +292,14 @@ it("names earlier purchases on a reviewed card by count and time, never by id, a
   ])
     expect(card).toContain(line);
   expect(card).not.toMatch(/attempt-|authority-/u);
-  expect(renderPurchaseCard(free, {}, NO_EARLIER_PURCHASES, 'UTC')).not.toMatch(/Earlier purchase|Possible duplicate/u);
+  expect(renderPurchaseCard(free, {}, NO_EARLIER_PURCHASES, () => 'UTC')).not.toMatch(
+    /Earlier purchase|Possible duplicate/u,
+  );
   const own = renderPurchaseCard(
     { ...free, account: 'Aya.Web@example.test' },
     {},
     NO_EARLIER_PURCHASES,
-    'UTC',
+    () => 'UTC',
     undefined,
     {
       alias: 'aya.web@example.test',

@@ -5,6 +5,7 @@ import { untrusted } from '../gws-ea-inbox/untrusted.js';
 import { boundsOf, type WatchRow } from './watch-state.js';
 import { formatMoney } from './fingerprint.js';
 import type { ReservationPolicy } from './merchant-contract.js';
+import type { PrincipalClock } from './watch-policy.js';
 
 /** to: browser */
 const watchMessages = {
@@ -38,7 +39,7 @@ export function watchMessage(kind: keyof typeof watchMessages): string {
  * Arrival windows read on the venue's clock; conversions and the deadline on the principal's.
  * to: principal
  */
-export function renderWatchCard(watch: WatchRow, venueTimeZone: string, principalTimeZone: string): string {
+export function renderWatchCard(watch: WatchRow, venueTimeZone: string, clock: PrincipalClock): string {
   const bounds = boundsOf(watch),
     financial = bounds.financial;
   const lines = [
@@ -47,7 +48,7 @@ export function renderWatchCard(watch: WatchRow, venueTimeZone: string, principa
     `Venue: ${quoted(bounds.venue.name, SELLER_TEXT_LIMIT)}`,
     `Party size: ${bounds.partySize}`,
     ...bounds.windows.map(
-      (window) => `Arrival window: ${cardEventSpan(window.start, window.end, venueTimeZone, principalTimeZone)}`,
+      (window) => `Arrival window: ${cardEventSpan(window.start, window.end, venueTimeZone, clock)}`,
     ),
     `Maximum total exposure, all guests and fees: ${formatMoney(financial.maxTotalMinor, financial.currency)} (${financial.currency})`,
   ];
@@ -60,10 +61,10 @@ export function renderWatchCard(watch: WatchRow, venueTimeZone: string, principa
       `Maximum due now: ${formatMoney(financial.maxDueNowMinor, financial.currency)}`,
       ...financial.policy!.commitments.map(
         (term) =>
-          `Merchant financial terms: ${quoted(term.terms, 1200)}; ${term.kind}; amount ${term.amountMinor === undefined ? 'unreadable' : formatMoney(term.amountMinor, financial.currency)}${term.perPerson ? ` per guest × ${bounds.partySize}` : ' total'}; trigger ${quoted(term.trigger ?? '', SELLER_TEXT_LIMIT)}; cancellation ${quoted(term.cancellationTerms ?? '', SELLER_TEXT_LIMIT)}${term.cancellationBeforeMs === undefined ? '' : `; cutoff ${term.cancellationBeforeMs / 60_000} minutes before arrival`}${term.frequency ? `; frequency ${quoted(term.frequency, SELLER_TEXT_LIMIT)}` : ''}${term.conversionAt ? `; converts ${formatLocalTimeWithZone(term.conversionAt, principalTimeZone)}` : ''}`,
+          `Merchant financial terms: ${quoted(term.terms, 1200)}; ${term.kind}; amount ${term.amountMinor === undefined ? 'unreadable' : formatMoney(term.amountMinor, financial.currency)}${term.perPerson ? ` per guest × ${bounds.partySize}` : ' total'}; trigger ${quoted(term.trigger ?? '', SELLER_TEXT_LIMIT)}; cancellation ${quoted(term.cancellationTerms ?? '', SELLER_TEXT_LIMIT)}${term.cancellationBeforeMs === undefined ? '' : `; cutoff ${term.cancellationBeforeMs / 60_000} minutes before arrival`}${term.frequency ? `; frequency ${quoted(term.frequency, SELLER_TEXT_LIMIT)}` : ''}${term.conversionAt ? `; converts ${formatLocalTimeWithZone(term.conversionAt, clock(term.conversionAt))}` : ''}`,
       ),
     );
-  lines.push(`Watch deadline: ${formatLocalTimeWithZone(bounds.until, principalTimeZone)}`);
+  lines.push(`Watch deadline: ${formatLocalTimeWithZone(bounds.until, clock(bounds.until))}`);
   return lines.join('\n');
 }
 

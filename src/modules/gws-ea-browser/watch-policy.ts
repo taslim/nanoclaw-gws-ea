@@ -1,5 +1,6 @@
 import { TIMEZONE } from '../../config.js';
-import { loadTimeline, zoneAt } from '../gws-ea-whereabouts/timeline.js';
+import { isDate } from '../gws-ea-whereabouts/clock.js';
+import { loadTimeline, zoneAt, zoneForDay } from '../gws-ea-whereabouts/timeline.js';
 import { zonedDate, zonedInstant } from './iso-time.js';
 
 /**
@@ -39,12 +40,20 @@ function clockHour(at: number, timeZone: string): number {
   return Number(parts.find((part) => part.type === 'hour')?.value);
 }
 export async function principalClock(at = Date.now()): Promise<string> {
-  return zoneAt(await loadTimeline(), at) ?? TIMEZONE;
+  return (await loadPrincipalClock())(at);
 }
-export function watchQuietUntil(policy: WatchSitePolicy, at: number, principalTimeZone: string): number {
+export type PrincipalClock = (at: string | number) => string;
+export async function loadPrincipalClock(): Promise<PrincipalClock> {
+  const timeline = await loadTimeline();
+  return (at) =>
+    (typeof at === 'string' && isDate(at)
+      ? zoneForDay(timeline, at)
+      : zoneAt(timeline, typeof at === 'number' ? at : Date.parse(at))) ?? TIMEZONE;
+}
+export function watchQuietUntil(policy: WatchSitePolicy, at: number, clock: PrincipalClock): number {
   let next = at;
   for (let count = 0; count < 24 * 60; count++) {
-    const hour = clockHour(next, principalTimeZone);
+    const hour = clockHour(next, clock(next));
     if (
       !policy.principalQuietHours.some((quiet) =>
         quiet.start <= quiet.end ? hour >= quiet.start && hour < quiet.end : hour >= quiet.start || hour < quiet.end,
@@ -132,9 +141,9 @@ export function watchStartAt(
   policy: WatchSitePolicy,
   due: number,
   releases: readonly number[],
-  principalTimeZone: string,
+  clock: PrincipalClock,
 ): number {
-  return Math.min(watchQuietUntil(policy, due, principalTimeZone), releaseBurstFrom(releases, due) ?? Infinity);
+  return Math.min(watchQuietUntil(policy, due, clock), releaseBurstFrom(releases, due) ?? Infinity);
 }
 /**
  * How often a watch with no reader may wake the browser agent in any hour: every change it reports and every request

@@ -291,19 +291,19 @@ it('accepts delivery bounds with UTC offsets, keeping window dates as written an
 });
 
 it('reads a date-only needed-by as the end of that day on the principal’s clock', () => {
-  expect(purchaseBounds({ needed_by: '2026-10-20' }, 'America/Los_Angeles')).toEqual({
+  expect(purchaseBounds({ needed_by: '2026-10-20' }, () => 'America/Los_Angeles')).toEqual({
     neededBy: '2026-10-21T06:59:59.999Z',
     principalTimeZone: 'America/Los_Angeles',
   });
-  expect(purchaseBounds({ needed_by: '2026-10-20' }, 'Asia/Tokyo')).toEqual({
+  expect(purchaseBounds({ needed_by: '2026-10-20' }, () => 'Asia/Tokyo')).toEqual({
     neededBy: '2026-10-20T14:59:59.999Z',
     principalTimeZone: 'Asia/Tokyo',
   });
-  expect(purchaseBounds({ needed_by: '2026-10-14T17:00:00.000Z' }, 'Asia/Tokyo')).toEqual({
+  expect(purchaseBounds({ needed_by: '2026-10-14T17:00:00.000Z' }, () => 'Asia/Tokyo')).toEqual({
     neededBy: '2026-10-14T17:00:00.000Z',
     principalTimeZone: 'Asia/Tokyo',
   });
-  expect(purchaseBounds({ delivery_window: { start: '2026-10-12', end: '2026-10-14' } }, 'Asia/Tokyo')).toEqual({
+  expect(purchaseBounds({ delivery_window: { start: '2026-10-12', end: '2026-10-14' } }, () => 'Asia/Tokyo')).toEqual({
     deliveryWindow: { start: '2026-10-12', end: '2026-10-14' },
   });
 });

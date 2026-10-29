@@ -24,7 +24,13 @@ import { browserAvailability, browserConfigured } from './availability.js';
 import type { BrowserQueue } from './queue.js';
 import type { StructuredBrowserLocator } from './locators.js';
 
-import { nextWatchCheck, principalClock, watchSitePolicy, watchStartAt, type WatchSitePolicy } from './watch-policy.js';
+import {
+  nextWatchCheck,
+  loadPrincipalClock,
+  watchSitePolicy,
+  watchStartAt,
+  type WatchSitePolicy,
+} from './watch-policy.js';
 
 export interface BrowserWatchCheckInput {
   id: string;
@@ -200,7 +206,7 @@ export class BrowserWatchScheduler {
       const releases = watches.flatMap(watchReleases);
       // A due check waits out the principal's night on their clock as it is now, so a timezone change holds at
       // once; a release burst does not wait.
-      if (watchStartAt(policy, now, releases, await principalClock()) > now) continue;
+      if (watchStartAt(policy, now, releases, await loadPrincipalClock()) > now) continue;
       const state = await this.reserveCheck(db, watches, policy, Boolean(notify));
       if (!state) continue;
       const id = `watch-check-${randomUUID()}`;

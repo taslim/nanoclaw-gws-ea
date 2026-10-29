@@ -1051,7 +1051,7 @@ describe('venue release schedules and card times', () => {
         },
       }),
     } as WatchRow;
-    const card = renderWatchCard(watch, 'UTC', 'America/Los_Angeles');
+    const card = renderWatchCard(watch, 'UTC', () => 'America/Los_Angeles');
     expect(card).toContain('converts Nov 15, 2026, 12:00 AM Los Angeles time');
     expect(card).not.toContain('2026-11-15T08:00:00');
   });
@@ -1313,7 +1313,7 @@ describe('watches on sites with no reader', () => {
     const card = renderWatchCard(
       { id: 'larder', site: 'larder.example', bounds_json: JSON.stringify(regionBounds) } as WatchRow,
       'America/Los_Angeles',
-      'America/Los_Angeles',
+      () => 'America/Los_Angeles',
     );
     expect(card).toContain('Venue: "The Larder"');
     expect(card).toContain('Maximum total exposure, all guests and fees: $50.00 (USD)');

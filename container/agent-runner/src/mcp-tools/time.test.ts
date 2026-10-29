@@ -494,6 +494,12 @@ describe('the serialized whereabouts clock', () => {
         end: { iso: '2026-11-12T10:00:00+01:00' },
       });
       const saved = fs.readFileSync(view, 'utf8');
+      const basedDuringTrip = (await resolve.handler({ expression: 'in 3 hours', reference_date: '2026-11-12T09:00' }))
+        .content[0];
+      expect(JSON.parse(basedDuringTrip?.type === 'text' ? basedDuringTrip.text : '')).toMatchObject({
+        reference: { iso: '2026-11-12T09:00:00+01:00' },
+        resolved: { iso: '2026-11-12T12:00:00+01:00' },
+      });
       fs.writeFileSync(view, saved.replace('"Europe/Brussels"', 'null'));
       const unknown = (await resolve.handler({ expression: 'Nov 12 9am' })).content[0];
       expect(JSON.parse(unknown?.type === 'text' ? unknown.text : '')).toMatchObject({
@@ -557,6 +563,50 @@ describe('the serialized whereabouts clock', () => {
       const explicit = (await resolve.handler({ expression: '2026-11-12T09:00:00-08:00' })).content[0];
       const result = JSON.parse(explicit?.type === 'text' ? explicit.text : '') as TimeResolveResult;
       expect(Date.parse(result.resolved!.iso)).toBe(Date.parse('2026-11-12T17:00Z'));
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('validates a future local time on its destination clock before checking daylight-saving gaps', async () => {
+    const fs = await import('node:fs');
+    const os = await import('node:os');
+    const path = await import('node:path');
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'time-view-gap-'));
+    const view = path.join(root, 'week-view.json');
+    fs.writeFileSync(
+      view,
+      JSON.stringify({
+        timeline: {
+          homeZone: 'America/Los_Angeles',
+          base: { home_place_id: null },
+          places: [],
+          rhythm: [],
+          legs: [],
+          stays: [
+            {
+              ids: ['brussels'],
+              zone: 'Europe/Brussels',
+              start: Date.parse('2026-03-06T00:00Z'),
+              end: Date.parse('2026-03-15T00:00Z'),
+              certainty: 'certain',
+            },
+          ],
+        },
+      }),
+    );
+    try {
+      const resolve = createTimeTools('America/Los_Angeles', () => Date.parse('2026-03-01T20:00Z'), view).find(
+        (tool) => tool.tool.name === 'time_resolve',
+      )!;
+      for (const expression of ['2026-03-08T02:30', 'March 8 2:30am']) {
+        const response = await resolve.handler({ expression });
+        expect(response.isError).not.toBe(true);
+        const first = response.content[0];
+        expect(JSON.parse(first?.type === 'text' ? first.text : '')).toMatchObject({
+          resolved: { iso: '2026-03-08T02:30:00+01:00' },
+        });
+      }
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }

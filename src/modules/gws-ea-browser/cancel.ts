@@ -20,7 +20,7 @@ import { heldCredentialSites, SiteLeaseStore } from './leases.js';
 import { PurchaseAuthorityStore } from './authority.js';
 import { detachPurchaseCards, finishPurchaseCardWithdrawals } from './cards.js';
 import { formatMoney, type PurchaseFacts } from './fingerprint.js';
-import { principalClock } from './watch-policy.js';
+import { loadPrincipalClock } from './watch-policy.js';
 
 import type { BrowserQueue } from './queue.js';
 
@@ -65,7 +65,7 @@ async function purchaseState(
   );
   const attempts = await new PurchaseAuthorityStore(store.db).unconfirmedOf(jobId);
   if (!card && !attempts.length) return {};
-  const zone = await principalClock();
+  const clock = await loadPrincipalClock();
   const facts = card ? (JSON.parse(card.facts_json) as PurchaseFacts) : undefined;
   return {
     ...(card && facts
@@ -74,7 +74,7 @@ async function purchaseState(
             site: facts.site,
             total: formatMoney(facts.totalMinor, facts.currency),
             due_now: formatMoney(facts.dueNowMinor, facts.currency),
-            expires: formatLocalTimeWithZone(card.expires_at, zone),
+            expires: formatLocalTimeWithZone(card.expires_at, clock(card.expires_at)),
           },
         }
       : {}),
@@ -86,7 +86,7 @@ async function purchaseState(
               attempt_id: attempt.id,
               what,
               ...(total ? { total } : {}),
-              pressed: formatLocalTimeWithZone(attempt.attempted_at, zone),
+              pressed: formatLocalTimeWithZone(attempt.attempted_at, clock(attempt.attempted_at)),
             };
           }),
         }
