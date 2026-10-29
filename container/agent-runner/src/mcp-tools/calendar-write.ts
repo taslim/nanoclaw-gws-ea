@@ -46,7 +46,11 @@ export const createEvent = requestTool({
     start: { type: 'string', description: `When it starts: ${DATE_TIME}. For an all-day event, its first day.` },
     end: { type: 'string', description: `When it ends: ${DATE_TIME}. For an all-day event, its last day.` },
     all_day: { type: 'boolean', description: 'true for an all-day event, with start and end as dates (2026-10-12).' },
-    timezone: { type: 'string', description: "The IANA zone its times show in; the principal's when left out." },
+    timezone: {
+      type: 'string',
+      description:
+        'The IANA zone its times show in; when left out, the local clock where the principal will be that day.',
+    },
     notes: { type: 'string', description: 'Its description.' },
     location: { type: 'string', description: 'Where it is: an address, a phone number, or a link.' },
     guests: { ...ADDRESSES, description: 'Email addresses of other people to invite (up to 50).' },

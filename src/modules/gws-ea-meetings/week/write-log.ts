@@ -102,13 +102,6 @@ export async function completeCalendarWriteFindings(requestId: string): Promise<
     requestId,
   );
 }
-export async function listCalendarWriteGaps(): Promise<CalendarWrite[]> {
-  return (
-    await getDb().all<Row>(
-      "SELECT * FROM gws_ea_calendar_write_log WHERE state='applied' AND findings_checked=0 ORDER BY updated_at,request_id",
-    )
-  ).map(parsed);
-}
 registerPersonForgetHook('gws-ea-meetings:calendar-write-log', async ({ id, handles }) => {
   const db = getDb();
   if (!(await db.hasTable('gws_ea_calendar_write_log'))) return;

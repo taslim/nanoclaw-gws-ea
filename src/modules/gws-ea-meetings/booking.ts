@@ -31,15 +31,8 @@ import { writeNoteForMain } from '../gws-ea-profile/main-note.js';
 import { getSchedulingPreferenceValues, type SchedulingPreferenceValues } from '../gws-ea-preferences/db.js';
 import { getPersonLevel } from '../gws-ea-people/db.js';
 import { listPrivateValues } from '../gws-ea-privacy/db.js';
-import { dateString, isDate, wallClock } from '../gws-ea-whereabouts/clock.js';
-import {
-  loadTimeline,
-  whereaboutsAt,
-  zoneAt,
-  zoneForDay,
-  type Timeline,
-  type WhereaboutsAt,
-} from '../gws-ea-whereabouts/timeline.js';
+import { dateString, wallClock } from '../gws-ea-whereabouts/clock.js';
+import { loadTimeline, whereaboutsAt, zoneAt, type Timeline } from '../gws-ea-whereabouts/timeline.js';
 import { getGwsEaProfile, principalRecognizer, type PrincipalRecognizer } from '../gws-ea-profile/db.js';
 import {
   allowsMeet,
@@ -76,10 +69,9 @@ import { bookingSurfaceFor, resolveBookingSurface, type BookingSurface } from '.
 import { addressesOf, flagOf, instantOf, lineOf, notesOf, timezoneOf } from './fields.js';
 import { createCalendarFactTools } from './calendar-facts.js';
 import { affectedPeople, calendarFindings, loadCalendarWeek } from './days.js';
-import { buildWeek, type Week } from './week/model.js';
+import { buildWeek, spanOf as weekSpan, type Week } from './week/model.js';
 import { resolvePlace, travelBetween, type ResolvedPlace } from './week/places.js';
 import {
-  eventSpan,
   freeWindows,
   isClear,
   iso,
@@ -161,16 +153,8 @@ function principalZone(principal: Principal, at: number): string {
   return zoneAt(principal.timeline, at) ?? TIMEZONE;
 }
 
-function eventZone(principal: Principal, event: Pick<CalendarEvent, 'start'>): string {
-  if (event.start?.date !== undefined)
-    return isDate(event.start.date) ? (zoneForDay(principal.timeline, event.start.date) ?? TIMEZONE) : TIMEZONE;
-  const at = Date.parse(event.start?.dateTime ?? '');
-  return Number.isFinite(at) ? principalZone(principal, at) : TIMEZONE;
-}
-
-/** Outward answers carry a locality main or the principal recorded, never text copied from a calendar event. */
-function recordedLocality(at: WhereaboutsAt): string | null {
-  return at.stay?.derived === true && at.stay.placeId === null ? null : at.locality;
+function eventSpanOn(principal: Principal, { start, end }: CalendarEvent): Span | undefined {
+  return weekSpan({ start, end }, principal.timeline);
 }
 
 /** A city named alone is somewhere in that city, never whichever saved place lies there. */
@@ -189,7 +173,7 @@ function venueZone(place: ResolvedPlace, timeline: Timeline): string | null {
           ? place.locality !== null && known.locality.toLowerCase() === place.locality.toLowerCase()
           : known.id === place.id,
       )
-      .map((known) => known.zone),
+      .flatMap((known) => known.zone ?? []),
   );
   return zones.size === 1 ? [...zones][0] : null;
 }
@@ -425,15 +409,6 @@ export function createBookingTools(deps: BookingToolsDeps) {
     ];
   }
 
-  async function busyIn(
-    view: BookingView,
-    span: Span,
-    ignore: ReadonlySet<string>,
-    calendarId: string,
-  ): Promise<Span[]> {
-    return busyFrom(await calendarPicture(view, span, ignore, calendarId));
-  }
-
   /** to: external-email, external-chat, job */
   async function assertAvailable(
     view: BookingView,
@@ -448,7 +423,8 @@ export function createBookingTools(deps: BookingToolsDeps) {
       start: Math.min(...spans.map((span) => span.start)),
       end: Math.max(...spans.map((span) => span.end)),
     };
-    const busy = await busyIn(view, covering, ignore, calendarId);
+    // Only a clash refuses a booking: travel counts as busy when offering times, not when booking one.
+    const busy = (await calendarPicture(view, covering, ignore, calendarId)).events.filter((event) => event.busy);
     const taken = spans.filter((span) => !isClear(span, busy));
     if (taken.length > 0)
       throw forbidden(`${taken.map(label).join('; ')}: no longer free. Call free_time for times to offer instead.`);
@@ -606,7 +582,7 @@ export function createBookingTools(deps: BookingToolsDeps) {
           if (travelBetween(from, place, '', principal.timeline).minutes === null)
             notes.push('travel from the previous place unknown');
         }
-        const localities = new Set(locations.map(recordedLocality));
+        const localities = new Set(locations.map((at) => at.locality));
         result.push({ ...free, zone, locality: localities.size === 1 ? [...localities][0] : null, fitNotes: notes });
       }
     }
@@ -790,7 +766,7 @@ export function createBookingTools(deps: BookingToolsDeps) {
 
   /** to: external-email, external-chat, job */
   function changedOutcome(row: BookingRequest, event: CalendarEvent, view: BookingView): BookingOutcome {
-    const span = eventSpan(event, eventZone(view.principal, event)) ?? spanOf(row);
+    const span = eventSpanOn(view.principal, event) ?? spanOf(row);
     const when = bothZones(
       span,
       principalZone(view.principal, span.start),
@@ -822,7 +798,7 @@ export function createBookingTools(deps: BookingToolsDeps) {
 
   /** to: external-email, external-chat, job */
   function successOutcome(row: BookingRequest, view: BookingView, event?: CalendarEvent): BookingOutcome {
-    const span = (event === undefined ? undefined : eventSpan(event, eventZone(view.principal, event))) ?? spanOf(row);
+    const span = (event === undefined ? undefined : eventSpanOn(view.principal, event)) ?? spanOf(row);
     const prepared = preparedOf(row);
     const conference = event?.conference ?? (prepared.video ? { status: 'pending' as const } : undefined);
     const when = bothZones(span, principalZone(view.principal, span.start), timezoneOf(prepared.content.timezone));
@@ -1016,7 +992,7 @@ export function createBookingTools(deps: BookingToolsDeps) {
     }
     if (!owns(event, view))
       throw forbidden(`That event no longer belongs to ${view.surface.words.ownerLabel}. Ask main with tell_main.`);
-    const span = eventSpan(event, eventZone(view.principal, event));
+    const span = eventSpanOn(view.principal, event);
     if (!span) throw forbidden('The booking has no readable time. Ask main with tell_main.');
     const { etag } = event;
     if (etag === undefined) throw forbidden("This booking can't be changed safely right now. Ask main with tell_main.");
@@ -1101,7 +1077,7 @@ export function createBookingTools(deps: BookingToolsDeps) {
     calendarId: string,
     requestId: string,
   ) {
-    const previous = eventSpan(event, eventZone(view.principal, event));
+    const previous = eventSpanOn(view.principal, event);
     if (!previous) throw forbidden('The booking has no readable time. Ask main with tell_main.');
     const start = content.start === undefined ? previous.start : instantOf(content.start, 'start');
     const span = {

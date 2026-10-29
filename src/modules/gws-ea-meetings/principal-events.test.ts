@@ -1570,8 +1570,8 @@ describe('calendar outcomes and findings', () => {
     const first = data(await send(main, 'create_event', FOCUS, 'act-gap'));
     expect(first.message).toContain('Added');
     expect(first.message).toContain('findings unavailable');
-    const { listCalendarWriteGaps } = await import('./week/write-log.js');
-    expect(await listCalendarWriteGaps()).toMatchObject([{ requestId: 'act-gap', eventId: first.event }]);
+    const { getCalendarWrite } = await import('./week/write-log.js');
+    expect(await getCalendarWrite('act-gap')).toMatchObject({ eventId: first.event, findingsChecked: false });
     const inbound = new Database(inboundDbPath(main.agent_group_id, main.id));
     inbound.prepare('DELETE FROM messages_in WHERE id = ?').run('action-resp-act-gap');
     inbound.close();
@@ -1958,6 +1958,35 @@ it('lets the agent’s repeat of a split, after its tool stopped waiting, find t
   expect(inserts[0].fields?.recurrence).toEqual(['RRULE:FREQ=WEEKLY;COUNT=3']);
 });
 
+it('answers what Google holds when the following series’ id is taken by an event deleted since or by another split', async () => {
+  const request = followingRequest('takensplit');
+  data(await send(main, 'change_event', request, 'act-first-split'));
+  const followingId = calendar.writes.find((write) => write.op === 'insert')?.eventId ?? '';
+  const made = calendar.event(PRINCIPAL, followingId);
+  if (!made) throw new Error('The first split made no following series');
+
+  // Another request moves the same occurrence and all following to a different time.
+  const other = refusal(
+    await send(
+      main,
+      'change_event',
+      { ...request, start: '2026-10-16T11:00:00-07:00', end: '2026-10-16T11:30:00-07:00' },
+      'act-other-split',
+    ),
+  );
+  expect(other).toContain('the original series now ends before');
+  expect(other).toContain(`following series, event ${followingId}, was not created`);
+  expect(other).toContain(
+    'Google already holds an event under that id that differs from this change: it starts 2026-10-16T17:00:00.000Z',
+  );
+
+  calendar.put({ ...made, status: 'cancelled' });
+  const again = refusal(await send(main, 'change_event', request, 'act-split-after-delete'));
+  expect(again).toContain(`following series, event ${followingId}, was not created`);
+  expect(again).toContain('an event under that id was deleted earlier');
+  expect(calendar.writes.filter((write) => write.op === 'insert')).toHaveLength(1);
+});
+
 it('changes the whole series in place when this and following starts at its first occurrence', async () => {
   const master = {
     ...teamSync([PRINCIPAL_GUEST, { email: REMY, responseStatus: 'accepted' }]),
@@ -2033,6 +2062,29 @@ it('settles a write Google refuses with its refusal, and logs no write for an ev
   expect(await getCalendarWrite('act-unversioned')).toBeUndefined();
 });
 
+it('settles a write Google failed before it landed with Google’s error, so no ledger lists it as pending', async () => {
+  const { getCalendarWrite } = await import('./week/write-log.js');
+  calendar.failNext({ op: 'insert', error: new GoogleApiError(503, 'Backend Error') });
+  expect(refusal(await send(main, 'create_event', FOCUS, 'act-failed-create'))).toContain('Backend Error');
+  expect(calendar.live()).toEqual([]);
+
+  calendar.put(teamSync([PRINCIPAL_GUEST]));
+  calendar.failNext({ op: 'patch', error: new GoogleApiError(503, 'Backend Error') });
+  const change = { calendar: PRINCIPAL, event: 'teamsync01', title: 'Moved', send_updates: 'none' };
+  expect(refusal(await send(main, 'change_event', change, 'act-failed-change'))).toContain('Backend Error');
+  expect(calendar.event(PRINCIPAL, 'teamsync01')?.summary).toBe('Team sync');
+
+  calendar.failNext({ op: 'guests', error: new GoogleApiError(0, 'Google could not be reached') });
+  const guests = { calendar: PRINCIPAL, event: 'teamsync01', add: [REMY] };
+  expect(refusal(await send(main, 'change_guests', guests, 'act-failed-guests'))).toContain('could not be reached');
+
+  for (const requestId of ['act-failed-create', 'act-failed-change', 'act-failed-guests'])
+    expect(await getCalendarWrite(requestId)).toMatchObject({
+      state: 'applied',
+      outcome: expect.stringMatching(/Backend Error|could not be reached/u),
+    });
+});
+
 it('changes an event whose who-it-affects read fails, and says it could not be read', async () => {
   await setSchedulingPreference({
     kind: 'ignored-events',
@@ -2091,8 +2143,8 @@ it('logs a guest write and its findings gap without turning the successful invit
     await send(main, 'change_guests', { calendar: PRINCIPAL, event: 'teamsync01', add: [REMY] }, 'act-guests-gap'),
   );
   expect(changed.message).toContain('findings unavailable');
-  const { listCalendarWriteGaps } = await import('./week/write-log.js');
-  expect(await listCalendarWriteGaps()).toMatchObject([{ action: 'change_guests', requestId: 'act-guests-gap' }]);
+  const { getCalendarWrite } = await import('./week/write-log.js');
+  expect(await getCalendarWrite('act-guests-gap')).toMatchObject({ action: 'change_guests', findingsChecked: false });
   expect(calendar.event(PRINCIPAL, 'teamsync01')?.attendees).toEqual(
     expect.arrayContaining([{ email: REMY, responseStatus: 'needsAction' }]),
   );
@@ -2385,6 +2437,23 @@ it.each([
   expect(calendar.writes).toEqual([]);
   const changed = data(await send(main, 'change_event', { ...request, recurrence: ['RRULE:FREQ=WEEKLY;COUNT=3'] }));
   expect(changed.message).toContain('all following occurrences');
+});
+
+it('marks an event the assistant creates as its own, and leaves one it only changes as it was', async () => {
+  const created = data(await send(main, 'create_event', FOCUS));
+  expect(calendar.event(PRINCIPAL, String(created.event))?.tags).toMatchObject({ gws_ea_assistant_written: 'true' });
+  calendar.put(teamSync([PRINCIPAL_GUEST]));
+  data(
+    await send(main, 'change_event', {
+      calendar: PRINCIPAL,
+      event: 'teamsync01',
+      start: '2026-10-09T10:00:00-07:00',
+      end: '2026-10-09T10:30:00-07:00',
+      send_updates: 'none',
+    }),
+  );
+  expect(calendar.event(PRINCIPAL, 'teamsync01')?.start?.dateTime).toBe('2026-10-09T17:00:00.000Z');
+  expect(calendar.event(PRINCIPAL, 'teamsync01')?.tags?.gws_ea_assistant_written).toBeUndefined();
 });
 
 it('does not swallow a later principal notice after an unchanged edit', async () => {
