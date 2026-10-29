@@ -1,5 +1,5 @@
 import { getSession } from '../../db/sessions.js';
-import { getThread, threadAddresses } from '../gws-ea-inbox/thread-map.js';
+import { getThread, threadAddresses, threadSchedulingPeople } from '../gws-ea-inbox/thread-map.js';
 import { openMatterOfThread } from '../gws-ea-matters/db.js';
 import { getExternalEmailAgentGroupId } from '../gws-ea-profile/db.js';
 import { bookingMatters, type BookingSurface } from './booking-surface.js';
@@ -28,6 +28,7 @@ export function threadSurface(threadKey: string): BookingSurface {
         empty: 'Name someone on the thread to invite: the booking invites nobody else.',
       };
     },
+    schedulingPeople: () => threadSchedulingPeople(threadKey),
     async privacyFor() {
       return {};
     },

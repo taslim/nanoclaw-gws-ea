@@ -15,6 +15,9 @@ import type { Session } from '../../types.js';
 import { replacePrincipalCalendars } from '../gws-ea-inbox/db.js';
 import { recordThreadAddresses, recordAuthenticatedThreadSender } from '../gws-ea-inbox/thread-map.js';
 import { platformMembers } from '../gws-ea-chats/testing/chat-delivery-fixture.js';
+import { refreshChatMembership } from '../gws-ea-chats/join.js';
+import { setChatMemberEmail } from '../gws-ea-chats/roster.js';
+import { stopChannelAdapter } from '../../channels/channel-registry.js';
 import { setChatCalendar } from '../gws-ea-chats/handoffs.js';
 import { placeInMatter, openMatter } from '../gws-ea-matters/db.js';
 import type { FakeCalendar } from './testing/fake-calendar.js';
@@ -43,7 +46,8 @@ import { log } from '../../log.js';
 import { ANSWER_LATER } from '../../cli/delivery-action.js';
 import { bookingSurfaceFor, resolveBookingSurface } from './booking-surface.js';
 import '../gws-ea-whereabouts/index.js';
-import { addPlace, addStay, setBase, setPlacePair, setRhythm } from '../gws-ea-whereabouts/db.js';
+import { addPlace, addStay, setBase, setPlacePair, setRhythm, syncDerivedStays } from '../gws-ea-whereabouts/db.js';
+import { deriveLegs } from '../gws-ea-whereabouts/derive.js';
 import { addPerson } from '../gws-ea-people/db.js';
 import { setSchedulingPreference } from '../gws-ea-preferences/db.js';
 
@@ -91,6 +95,8 @@ describe('outward availability in the principal’s days', () => {
       const local = await reads.freeTime({ ...november, place: sf.id }, session, 'san-francisco');
       expect(local.windows).toEqual([]);
       expect(JSON.stringify(local)).not.toMatch(/Brussels|Nov 10|Nov 15|stay|trip/iu);
+      const city = await reads.freeTime({ ...november, place: 'San Francisco' }, session, 'city');
+      expect(city.windows).toEqual([]);
     }
   });
 
@@ -156,6 +162,59 @@ describe('outward availability in the principal’s days', () => {
         start: '2026-11-12T08:00:00.000Z',
         end: '2026-11-12T10:00:00.000Z',
         zone: 'Europe/Brussels',
+      }),
+    ]);
+  });
+
+  it('offers in-person Brussels windows during a trip read from a calendar flight, without the flight’s text', async () => {
+    await home();
+    const office = await addPlace({ label: 'Juno’s office', locality: 'Brussels', zone: 'Europe/Brussels' });
+    const legs = deriveLegs([
+      {
+        id: 'flight-out',
+        status: 'confirmed',
+        location: 'UA 900 SFO to BRU, confirmation K7Q2XZ, seat 14C',
+        start: { dateTime: '2026-11-09T23:00:00Z', timeZone: 'America/Los_Angeles' },
+        end: { dateTime: '2026-11-10T09:00:00Z', timeZone: 'Europe/Brussels' },
+      },
+    ]);
+    await syncDerivedStays(legs, {
+      start: Date.parse('2026-11-01T00:00:00Z'),
+      end: Date.parse('2026-11-30T00:00:00Z'),
+    });
+    for (const session of [emailSession, chatSession]) {
+      const remote = await reads.freeTime(november, session, 'trip-remote');
+      const local = await reads.freeTime({ ...november, place: office.id }, session, 'trip-in-person');
+      expect(local.windows).toEqual(
+        expect.arrayContaining([expect.objectContaining({ zone: 'Europe/Brussels', fit: 'acceptable' })]),
+      );
+      expect(JSON.stringify([remote, local])).not.toMatch(/UA 900|SFO|K7Q2XZ|14C/u);
+    }
+  });
+
+  it('reads a city named alone as somewhere in that city, not the first saved place there', async () => {
+    const office = await addPlace({ label: 'Remy’s office', locality: 'San Francisco', zone: 'America/Los_Angeles' });
+    const mv = await addPlace({
+      label: 'Mountain View office',
+      locality: 'Mountain View',
+      zone: 'America/Los_Angeles',
+    });
+    await setPlacePair({ fromPlaceId: mv.id, toPlaceId: office.id, mode: 'drive', minutes: 60, source: 'learned' });
+    calendar.put({
+      calendarId: PRINCIPAL,
+      id: 'office-meeting',
+      location: mv.label,
+      start: { dateTime: '2026-11-12T18:00:00Z' },
+      end: { dateTime: '2026-11-12T19:00:00Z' },
+    });
+    const range = { from: '2026-11-12T18:00:00Z', to: '2026-11-12T22:00:00Z', minutes: 30 };
+    const saved = await reads.freeTime({ ...range, place: office.id }, emailSession, 'saved-place');
+    expect(saved.windows).toEqual([expect.objectContaining({ start: '2026-11-12T20:00:00.000Z' })]);
+    const city = await reads.freeTime({ ...range, place: 'san francisco' }, emailSession, 'city-alone');
+    expect(city.windows).toEqual([
+      expect.objectContaining({
+        start: '2026-11-12T19:00:00.000Z',
+        fit_notes: ['travel from the previous place unknown'],
       }),
     ]);
   });
@@ -227,13 +286,17 @@ describe('outward availability in the principal’s days', () => {
     expect(answer.people).toEqual([
       {
         email: juno,
-        relationship: 'close to the principal',
+        relationship: 'who is close to the principal',
         has_people_record: true,
         meetings: 1,
         met_in_six_months: true,
       },
       { email: remy, relationship: null, has_people_record: false, meetings: 0, met_in_six_months: false },
     ]);
+    expect(answer.message).toContain(
+      `${juno}, who is close to the principal; 1 meetings in six months; met on the principal’s calendars in that time.\n` +
+        `${remy}, with no people record; 0 meetings in six months; not met on the principal’s calendars in that time.`,
+    );
     expect(answer.meeting_lengths).toEqual([{ kind: 'intro', minutes: 20 }]);
     expect(JSON.stringify(answer)).not.toMatch(
       /Private record name|Private relationship basis|Private invitation|2026-09-01|old-private-meeting|copied@|body@/u,
@@ -249,6 +312,28 @@ describe('outward availability in the principal’s days', () => {
     expect(JSON.stringify(moved)).not.toMatch(/Private record name|Private invitation|2026-09-01|copied@|body@/u);
     const chatAnswer = await reads.freeTime(RANGE, chatSession, 'chat-facts');
     expect(chatAnswer.people).toEqual([expect.objectContaining({ email: MIRA })]);
+  });
+
+  it('states no relationship or history for an address a chat member typed as their own', async () => {
+    const remy = 'remy.vance@outside.example';
+    await addPerson({
+      name: 'Remy Vance',
+      level: 'inner-circle',
+      source: 'principal',
+      basis: 'Principal said so',
+      identity: `email:${remy}`,
+    });
+    platformMembers([
+      { key: 'whatsapp:22', name: 'Mira', isPrincipal: false },
+      { key: 'whatsapp:11', name: 'Juno', isPrincipal: true },
+      { key: 'whatsapp:33', name: 'Casey', isPrincipal: false },
+    ]);
+    await refreshChatMembership(chat);
+    // What engagement records when a member writes "my email is …".
+    await setChatMemberEmail(chat, 'whatsapp:33', remy, 'member');
+    const answer = await reads.freeTime(RANGE, chatSession, 'claimed-email');
+    expect(answer.people).toEqual([expect.objectContaining({ email: MIRA })]);
+    expect(JSON.stringify(answer)).not.toMatch(/remy\.vance|closest/u);
   });
 
   it('uses the chosen kind on both surfaces while booking keeps its clash-only check', async () => {
@@ -279,7 +364,7 @@ describe('outward availability in the principal’s days', () => {
     });
     const range = { from: '2026-10-20T09:00:00Z', to: '2026-10-20T13:00:00Z', minutes: 30 };
     for (const session of [emailSession, chatSession]) {
-      const chosen = await reads.freeTime({ ...range, kind: 'intro' }, session, 'intro');
+      const chosen = await reads.freeTime({ ...range, kind: ' Intro ' }, session, 'intro');
       expect(chosen.windows).toEqual([
         expect.objectContaining({
           start: '2026-10-20T12:00:00.000Z',
@@ -321,48 +406,50 @@ describe('outward availability in the principal’s days', () => {
     expect(answer.message).not.toContain('0 meetings');
   });
 
-  it('keeps a remote meeting across a commute-rhythm boundary when its clock and availability do not change', async () => {
+  it('keeps a meeting across a commute-rhythm boundary, remote or in person, when its clock and availability do not change', async () => {
     await home();
     const mv = await addPlace({
       label: 'Mountain View office',
       locality: 'Mountain View',
       zone: 'America/Los_Angeles',
     });
+    const sf = await addPlace({ label: 'Remy’s office', locality: 'San Francisco', zone: 'America/Los_Angeles' });
     await setRhythm({ weekdays: ['thu'], placeId: mv.id, start: '09:00', end: '17:00' });
-    const answer = await reads.freeTime(
-      { from: '2026-11-12T16:45:00Z', to: '2026-11-12T17:15:00Z', minutes: 30 },
-      emailSession,
-      'remote-rhythm',
-    );
-    expect(answer.windows).toEqual([
-      expect.objectContaining({ start: '2026-11-12T16:45:00.000Z', end: '2026-11-12T17:15:00.000Z' }),
-    ]);
+    const range = { from: '2026-11-12T16:45:00Z', to: '2026-11-12T17:15:00Z', minutes: 30 };
+    for (const answer of [
+      await reads.freeTime(range, emailSession, 'remote-rhythm'),
+      await reads.freeTime({ ...range, place: sf.id }, emailSession, 'in-person-rhythm'),
+    ])
+      expect(answer.windows).toEqual([
+        expect.objectContaining({ start: '2026-11-12T16:45:00.000Z', end: '2026-11-12T17:15:00.000Z' }),
+      ]);
   });
 
-  it.each(['tool retry', 'resume sweep'] as const)(
-    'rechecks current chat identities before returning a recovered booking’s people facts (%s)',
-    async (mode) => {
-      await mainSession();
-      vi.spyOn(mainNotesModule, 'writeNoteForMain').mockRejectedValueOnce(new Error('Main note interrupted'));
-      expect(await reads.book(BOOK, chatSession, 'recover-people')).toBe(ANSWER_LATER);
-      expect(await getBookingRequest(chatSession.id, 'recover-people')).toMatchObject({
-        applied: true,
-        reported: false,
-      });
-      platformMembers([{ key: 'whatsapp:11', name: 'Morgan', isPrincipal: true }]);
-      let answer: unknown;
-      if (mode === 'tool retry') answer = answerData(await reads.book(BOOK, chatSession, 'recover-people'));
-      else {
-        await reads.resumePending();
-        const frame = responseIn(chatSession, 'recover-people');
-        expect(frame?.ok).toBe(true);
-        answer = frame?.ok ? frame.data : undefined;
-      }
-      expect(answer).toMatchObject({ people: [] });
-      expect(JSON.stringify(answer)).not.toContain(MIRA);
-      expect(calendar.writes.map((write) => write.op)).toEqual(['insert']);
-    },
-  );
+  it('reports an applied chat booking to main while the chat platform cannot list its members', async () => {
+    const main = await mainSession();
+    vi.spyOn(mainNotesModule, 'writeNoteForMain').mockRejectedValueOnce(new Error('Main note interrupted'));
+    expect(await reads.book(BOOK, chatSession, 'platform-down')).toBe(ANSWER_LATER);
+    await stopChannelAdapter('whatsapp');
+    await reads.resumePending();
+    expect(notesIn(main)).toHaveLength(1);
+    expect(responseIn(chatSession, 'platform-down')?.ok).toBe(true);
+    expect(await getBookingRequest(chatSession.id, 'platform-down')).toBeUndefined();
+  });
+
+  it('rechecks current chat identities before a retried tool returns a recovered booking’s people facts', async () => {
+    await mainSession();
+    vi.spyOn(mainNotesModule, 'writeNoteForMain').mockRejectedValueOnce(new Error('Main note interrupted'));
+    expect(await reads.book(BOOK, chatSession, 'recover-people')).toBe(ANSWER_LATER);
+    expect(await getBookingRequest(chatSession.id, 'recover-people')).toMatchObject({
+      applied: true,
+      reported: false,
+    });
+    platformMembers([{ key: 'whatsapp:11', name: 'Morgan', isPrincipal: true }]);
+    const answer = answerData(await reads.book(BOOK, chatSession, 'recover-people'));
+    expect(answer).toMatchObject({ people: [] });
+    expect(JSON.stringify(answer)).not.toContain(MIRA);
+    expect(calendar.writes.map((write) => write.op)).toEqual(['insert']);
+  });
 });
 
 it('offers the same windows in text with both-zone labels from either real surface, including the booking calendar', async () => {

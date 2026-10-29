@@ -503,7 +503,6 @@ describe('free_time', () => {
         principal_time: 'Saturday, Oct 10, 7:00 AM–10:00 PM BST',
         fit: 'outside usual hours',
         zone: 'Europe/London',
-        fit_notes: ['outside usual hours'],
       },
     ]);
   });

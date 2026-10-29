@@ -35,6 +35,8 @@ export interface BookingSurface {
   };
   calendarId(): Promise<string | null>;
   invitationPeople(): Promise<InvitationPeople>;
+  /** Addresses whose relationship and history outward answers may state: people main named, and a thread's senders Gmail authenticated. */
+  schedulingPeople(): Promise<string[]>;
   /** A chat's clearances apply only while every recipient is a current member with a known email. */
   privacyFor(recipients: readonly string[]): Promise<BookingPrivacy>;
   beforeWrite(): Promise<void>;
