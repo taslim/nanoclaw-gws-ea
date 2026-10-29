@@ -48,7 +48,7 @@ const cleanups: Array<() => Promise<void>> = [];
 const TSX_LOADER = path.join(CONTROL_PLANE_ROOT, 'node_modules', 'tsx', 'dist', 'loader.mjs');
 
 describe('recorded divergence: main’s runner installs and enforces native planning agents', () => {
-  it('keeps the config opt-in and the Claude SDK definition and hook wiring together', async () => {
+  it('keeps the capability gate and the Claude SDK definition and hook wiring together', async () => {
     const result = await new Promise<{ code: number | null; output: string }>((resolve, reject) => {
       const child = spawn(
         'bun',

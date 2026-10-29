@@ -87,9 +87,9 @@ export function runnerCapabilities(): ReadonlySet<string> {
   return _config?.capabilities ?? NO_CAPABILITIES;
 }
 
-/** Main's module owns this opt-in; another group cannot enable it through its own environment alone. */
+/** The host grants this capability to canonical main alone. */
 export function planningAgentsEnabled(capabilities: ReadonlySet<string>): boolean {
-  return process.env.GWS_EA_PLANNING_AGENTS === '1' && capabilities.has('gws-ea-main-context');
+  return capabilities.has('gws-ea-main-context');
 }
 
 /**
