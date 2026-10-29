@@ -11,12 +11,10 @@ vi.mock('../../../request-wake.js', () => ({ requestWake: vi.fn(async () => true
 
 import '../../gws-ea-manual/index.js';
 import { ANSWER_LATER } from '../../../cli/delivery-action.js';
-import { getDb } from '../../../db/connection.js';
 import { sessionDir } from '../../../session-manager.js';
 import type { Session } from '../../../types.js';
 import { consumeOwnCalendarChange } from '../../gws-ea-inbox/calendar-notifications.js';
 import { createBookingTools } from '../booking.js';
-import * as bookingStorage from '../bookings-db.js';
 import { getBookingRequest } from '../bookings-db.js';
 import {
   answerData,
@@ -28,7 +26,6 @@ import {
   TEAM,
   type BookingFixture,
 } from '../testing/booking-fixture.js';
-import { pendingBookingWriteWindows } from './booking-writes.js';
 import { hasPendingCalendarChanges } from './pending-changes.js';
 import { createWeekRefresher } from './refresh.js';
 import type { WeekView } from './view.js';
@@ -52,7 +49,7 @@ beforeEach(async () => {
   fixture = await seedBookingFixture();
   main = await mainSession();
   refresher = createWeekRefresher({ calendar: () => fixture.calendar });
-  await refresher.refresh();
+  await refresher.start();
 });
 afterEach(async () => {
   await refresher.stop();
@@ -92,43 +89,23 @@ it('refreshes a primed readable-only view after outward book, move and cancel de
   await refresher.refresh();
   expect(eventDates(id)).toEqual([]);
   expect(calendarLists).not.toHaveBeenCalled();
-  expect(await pendingBookingWriteWindows()).toEqual([]);
   expect(calendar.writes.map((write) => write.op)).toEqual(['insert', 'patch', 'delete']);
   reads.mockClear();
   await refresher.refresh();
   expect(reads).not.toHaveBeenCalled();
 });
 
-it('keeps the durable window pending until the refreshed view is published', async () => {
+it('shows a booking after a refresh that failed once', async () => {
   const { calendar, tools, emailSession } = fixture;
   const id = String(answerData(await tools.book(BOOK, emailSession, 'failed-refresh')).booking);
-  const original = calendar.listEventDetails.bind(calendar);
-  const reads = vi.spyOn(calendar, 'listEventDetails').mockRejectedValueOnce(new Error('Calendar unavailable'));
+  vi.spyOn(calendar, 'listEventDetails').mockRejectedValueOnce(new Error('Calendar unavailable'));
   await expect(refresher.refresh()).rejects.toThrow('Calendar unavailable');
   expect(eventDates(id)).toEqual([]);
-  expect(await pendingBookingWriteWindows()).toHaveLength(1);
-  reads.mockImplementation(original);
   await refresher.refresh();
   expect(eventDates(id)).toEqual(['2026-10-20']);
-  expect(await pendingBookingWriteWindows()).toEqual([]);
 });
 
-it('commits the refresh window atomically with the booking receipt before recovery removes the request', async () => {
-  const { calendar, tools, emailSession } = fixture;
-  vi.spyOn(bookingStorage, 'markBookingRequestApplied').mockRejectedValueOnce(new Error('Receipt interrupted'));
-  expect(await tools.book(BOOK, emailSession, 'atomic-refresh')).toBe(ANSWER_LATER);
-  expect(await getBookingRequest(emailSession.id, 'atomic-refresh')).toMatchObject({ applied: false });
-  expect(await pendingBookingWriteWindows()).toEqual([]);
-  await tools.resumePending();
-  const id = calendar.live(TEAM)[0].id;
-  expect(await getBookingRequest(emailSession.id, 'atomic-refresh')).toBeUndefined();
-  expect(await pendingBookingWriteWindows()).toHaveLength(1);
-  await refresher.refresh();
-  expect(eventDates(id)).toEqual(['2026-10-20']);
-  expect(calendar.writes.map((write) => write.op)).toEqual(['insert']);
-});
-
-it('preserves one durable window through lost-response recovery and request cleanup without another Google write', async () => {
+it('shows a booking completed by lost-response recovery without another Google write', async () => {
   const { calendar, tools, emailSession } = fixture;
   calendar.failNext({ op: 'insert', error: new Error('Insert reply lost'), afterApplying: true });
   expect(await tools.book(BOOK, emailSession, 'lost-refresh')).toBe(ANSWER_LATER);
@@ -137,14 +114,9 @@ it('preserves one durable window through lost-response recovery and request clea
   const id = calendar.live(TEAM)[0].id;
   expect(await getBookingRequest(emailSession.id, 'lost-refresh')).toBeUndefined();
   expect(consumeOwnCalendarChange(TEAM, id, new Date())).toBe(true);
-  expect(await pendingBookingWriteWindows()).toMatchObject([
-    { sessionId: emailSession.id, requestId: 'lost-refresh', calendarId: TEAM, eventId: id },
-  ]);
+  const calendarLists = vi.spyOn(calendar, 'listCalendars');
   await refresher.refresh();
   expect(eventDates(id)).toEqual(['2026-10-20']);
-  await restarted.resumePending();
-  await refresher.refresh();
+  expect(calendarLists).not.toHaveBeenCalled();
   expect(calendar.writes.map((write) => write.op)).toEqual(['insert']);
-  expect(await getDb().get<{ n: number }>('SELECT COUNT(*) AS n FROM gws_ea_booking_write_windows')).toEqual({ n: 1 });
-  expect(await pendingBookingWriteWindows()).toEqual([]);
 });

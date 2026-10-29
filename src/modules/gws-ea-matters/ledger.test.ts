@@ -28,7 +28,6 @@ import { preparePrincipalMessageContent } from '../gws-ea-profile/marks.js';
 import { pendingCalendarChangesMigration } from '../gws-ea-meetings/week/pending-changes-migration.js';
 import { FakeCalendar } from '../gws-ea-meetings/testing/fake-calendar.js';
 import { calendarWriteLogMigration } from '../gws-ea-meetings/week/write-log-migration.js';
-import { weekAcknowledgementsMigration } from '../gws-ea-meetings/week/acks-migration.js';
 import {
   beginCalendarWrite,
   completeCalendarWriteFindings,
@@ -59,7 +58,6 @@ beforeEach(async () => {
     gwsEaMatterPlanningMigration,
     gwsEaTimeAnchorsMigration,
     calendarWriteLogMigration,
-    weekAcknowledgementsMigration,
     pendingCalendarChangesMigration,
     closeRunsMigration,
   ]);
