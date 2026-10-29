@@ -3,7 +3,7 @@ import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { SYNTHETIC_IDENTITY, readState } from './state.js';
 import { CLOSE_CASES } from './close-dates.js';
-import { PUBLIC_WEB_CASES } from './web-egress.js';
+import { runnerConfigFromRaw } from '../../../container/agent-runner/src/config.js';
 import type { ScenarioComposition } from '../types.js';
 
 // Import only after cwd points at this run's new synthetic install. Host constants
@@ -208,7 +208,7 @@ try {
   fs.mkdirSync(agent, { recursive: true });
   const { seedScenarioStores } = await import('./seed.js');
   const fixture = readState(path.join(output, 'fixture.json'));
-  await seedScenarioStores(fixture.scenario, agent, fixture.referenceAt);
+  await seedScenarioStores(fixture.scenario, agent);
   let close: ScenarioComposition['close'];
   if (CLOSE_CASES.has(fixture.scenario.id)) {
     const { seedCloseScenario } = await import('./close-seed.js');
@@ -230,6 +230,8 @@ try {
   )) as typeof import('../../../src/container-env.js');
   const config = await materializeContainerJson(group.id);
   if (config.skills === 'all') throw new Error('Synthetic role must name its release skills explicitly.');
+  // The runner reads the same container.json the host writes for a spawn.
+  const { model, effort, speed } = runnerConfigFromRaw(JSON.parse(JSON.stringify(config)) as Record<string, unknown>);
   const reservedEnvironmentKeys = ['HOME', 'TZ', 'ANTHROPIC_BASE_URL'];
   const { sessionDir } = await import('../../../src/session-manager.js');
   const { projectSessionRoutes } = await import('./routes.js');
@@ -252,11 +254,10 @@ try {
     ...(audience === 'main'
       ? { weekViewFile: path.join(sessionDir(main.id, close ? session.id : mainSession.id), 'week-view.json') }
       : {}),
-    fixturePublicWeb: PUBLIC_WEB_CASES.has(fixture.scenario.id),
-    fixturePlanning: fixture.scenario.id === 'planner-limits' || CLOSE_CASES.has(fixture.scenario.id),
+    inference: { model, effort, speed },
     db: db.dialect,
   };
-  if (readState(path.join(output, 'fixture.json')).scenario.observationOnly)
+  if (fixture.scenario.id.endsWith('-identity-read'))
     fs.writeFileSync(
       path.join(agent, 'role-brief.md'),
       '# Conversation brief\n\nReference: JUNO-CEDAR-27. Juno Hale agreed to arrive Tuesday November 3, 2026 at 18:45 America/Los_Angeles. This brief belongs only to this synthetic conversation.\n',

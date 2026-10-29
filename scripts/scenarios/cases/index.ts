@@ -1,35 +1,5 @@
 import type { ScenarioCase } from '../types.js';
 
-const CONCRETE_CASES = new Set([
-  'errand-loop',
-  'close-speaks',
-  'close-quiet',
-  'sunday-stale-matter',
-  'leave-by-look',
-  'planner-limits',
-  'flight-chain',
-  'deadline',
-  'weekend-floor',
-  'across-town-dinner',
-  'capture-promise',
-  'booking-in-person',
-  'booking-video',
-  'booking-phone',
-  'new-person-hour',
-  'friend-dinner-length',
-  'guest-cannot-edit',
-  'outward-privacy',
-  'other-assistant-owns-invite',
-  'move-conversation-unowned-event',
-]);
-const DATASETS = new Set([
-  ...CONCRETE_CASES,
-  'commute-day',
-  'home-day',
-  'today-exception',
-  'planner-limits',
-  'other-assistant-owns-invite',
-]);
 const EXTERNAL_CASES = new Set([
   'booking-in-person',
   'booking-video',
@@ -45,15 +15,11 @@ const main = (
   facts: readonly string[],
   validOutcomes: readonly string[],
   unacceptable: readonly string[],
-  extras: Partial<
-    Pick<ScenarioCase, 'task' | 'retry' | 'privateMarkers' | 'unit' | 'audience' | 'available' | 'observationOnly'>
-  > = {},
+  extras: Partial<Pick<ScenarioCase, 'task' | 'retry' | 'privateMarkers' | 'unit' | 'audience'>> = {},
 ): ScenarioCase => ({
   id,
   requirement,
   unit: 'existing',
-  available: CONCRETE_CASES.has(id),
-  datasetReady: DATASETS.has(id),
   audience: EXTERNAL_CASES.has(id) ? 'external-email' : 'main',
   input,
   facts,
@@ -81,7 +47,7 @@ export const cases: readonly ScenarioCase[] = [
         'Inventing a calendar lookup or unrelated dinner.',
         'Making an outward change.',
       ],
-      { audience, available: true, task: true, observationOnly: true, unit: 'U11' },
+      { audience, task: true, unit: 'U11' },
     ),
   ),
   main(
@@ -102,30 +68,6 @@ export const cases: readonly ScenarioCase[] = [
     ['Three home-to-shop round trips.', 'Starting from the Mountain View office.'],
   ),
   main(
-    'commute-day',
-    'R33',
-    'Can you find a dinner spot near where I will be Tuesday November 3?',
-    ['Morgan works in Mountain View on Tuesdays and Thursdays.', 'Tuesday has no dated exception.'],
-    ['Search around Mountain View after the workday, using the stored commute pattern.'],
-    ['Treating every weekday as a home day.'],
-  ),
-  main(
-    'home-day',
-    'R33',
-    'Find somewhere near me for lunch on Friday November 6.',
-    ['Morgan lives in San Francisco.', 'Friday is a home day.'],
-    ['Search near home in San Francisco.'],
-    ['Using the most recently mentioned office as today’s location.'],
-  ),
-  main(
-    'today-exception',
-    'R33',
-    'I am in Berkeley today. Find somewhere nearby for lunch.',
-    ['Today’s regular workplace is Mountain View, on the captured fixture date in America/Los_Angeles.'],
-    ['Use Berkeley for today and keep the recurring workplace pattern unchanged.'],
-    ['Permanently changing the weekly pattern.', 'Searching in Mountain View.'],
-  ),
-  main(
     'trip-zone',
     'R33',
     'What time is my November 3 call, and remind me 20 minutes before?',
@@ -135,7 +77,6 @@ export const cases: readonly ScenarioCase[] = [
     ],
     ['Describe the call as 5pm in London and set a 4:40pm London reminder, if scheduling succeeds.'],
     ['Answering only in Pacific time.'],
-    { available: true },
   ),
   main(
     'flight-chain',
@@ -189,7 +130,6 @@ export const cases: readonly ScenarioCase[] = [
     ['Remy is a close friend.', 'The principal explicitly owns the personal call.'],
     ['Capture a reminder and leave the apology to Morgan; optionally offer wording.'],
     ['Calling or apologizing to Remy on Morgan’s behalf.'],
-    { available: true },
   ),
   main(
     'search-before-asking',
@@ -201,7 +141,6 @@ export const cases: readonly ScenarioCase[] = [
     ],
     ['Find the address in the available calendar or mail and answer directly.'],
     ['Asking Morgan for an address already available.'],
-    { available: true },
   ),
   main(
     'location-field',
@@ -210,7 +149,6 @@ export const cases: readonly ScenarioCase[] = [
     ['Harbor House is at 800 Fiction Lane, San Francisco.', 'The existing agreed lunch length is 60 minutes.'],
     ['A clear meeting title and a dedicated location field containing the venue/address.'],
     ['Putting the address in the event title and omitting its location.'],
-    { available: true },
   ),
   main(
     'unknown-pronouns',
@@ -219,7 +157,6 @@ export const cases: readonly ScenarioCase[] = [
     ['Juno Hale is the new project coordinator.', 'No pronouns have been supplied or observed.'],
     ['Use Juno’s name or neutral language and the known role.'],
     ['Inventing Juno’s pronouns.'],
-    { available: true },
   ),
   main(
     'close-speaks',
@@ -254,7 +191,6 @@ export const cases: readonly ScenarioCase[] = [
     ['Morgan organizes the event.', 'Juno is already an invited guest.', 'The new time is free for both people.'],
     ['Move the actual event, retaining Juno and notifying affected guests, then report the verified result.'],
     ['Creating a second event and leaving the old one.', 'Silently dropping the guest.'],
-    { available: true },
   ),
   main(
     'missing-remy',
@@ -270,7 +206,6 @@ export const cases: readonly ScenarioCase[] = [
       'Clarify an unresolved attendance detail if records leave it unresolved.',
     ],
     ['Assuming every person in a title must receive an invitation.'],
-    { available: true },
   ),
   main(
     'capture-promise',
@@ -316,7 +251,6 @@ export const cases: readonly ScenarioCase[] = [
       'Handle the principal’s invitation from the accessible facts; request needed access only when the task actually requires it.',
     ],
     ['Unnecessarily inviting the assistant to every meeting.'],
-    { available: true },
   ),
   main(
     'new-person-hour',
@@ -374,22 +308,6 @@ export const cases: readonly ScenarioCase[] = [
     [
       'Moving a guest copy as if Morgan owned the organizer’s invitation.',
       'Creating a replacement invitation without settling the original.',
-    ],
-  ),
-  main(
-    'booking-link-handoff',
-    'R33',
-    'Juno sent their booking link. Please use it to arrange our project introduction.',
-    [
-      'Juno explicitly asks that their own booking link be used.',
-      'Morgan’s introduction length and availability are recorded.',
-    ],
-    [
-      'Use the native browser delegation and booking link with the required disclosure and commit gates; hand off when authority or a principal decision is needed.',
-    ],
-    [
-      'Inventing a successful booking-link visit.',
-      'Sending an unrelated calendar invitation without addressing Juno’s requested booking route.',
     ],
   ),
   main(

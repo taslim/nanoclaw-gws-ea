@@ -66,10 +66,7 @@ export class FixtureMailbox implements AgentMailbox, MailboxOperations {
     return this.inbound.get(`cli-resp-${id}`);
   }
   async writeMessageOut(message: OutboundMessageDraft): Promise<number> {
-    const fixture = readState(this.file);
     if (message.kind === 'chat') {
-      if (fixture.scenario.observationOnly)
-        throw new Error('Unsupported fixture outward delivery: this case observes an internal report only.');
       const destination =
         message.channelType === 'agent'
           ? this.destinations.find((entry) => entry.type === 'agent' && entry.agentGroupId === message.platformId)

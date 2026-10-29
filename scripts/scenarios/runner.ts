@@ -19,9 +19,10 @@ import type { ScenarioComposition } from './types.js';
 import { scenarioRuntime } from './runtime.js';
 import { nativeScenarioHooks } from './fake-host/native-hooks.js';
 
-const [directory, kind, model, reservation, cli, phase, resume] = process.argv.slice(2);
-if (!directory || !model || !reservation || !cli || !['agent', 'judge'].includes(kind ?? ''))
-  throw new Error('runner <directory> <agent|judge> <model> <budget> <claude>');
+const JUDGE_MODEL = 'claude-opus-5-5';
+const [directory, kind, cli, phase, resume] = process.argv.slice(2);
+if (!directory || !cli || !['agent', 'judge'].includes(kind ?? ''))
+  throw new Error('runner <directory> <agent|judge> <claude> [phase] [resume]');
 const tree = path.resolve(import.meta.dir, '../..');
 const file = path.join(directory, 'fixture.json');
 const scenario = readState(file).scenario;
@@ -32,10 +33,9 @@ const composition = JSON.parse(
   fs.readFileSync(path.join(directory, 'composition.json'), 'utf8'),
 ) as ScenarioComposition;
 const capabilities = new Set(composition.capabilities);
-const scriptedApi = process.env.SCENARIO_SCRIPTED_API;
-if (scriptedApi && phase !== 'native-runner-proof')
-  throw new Error('Scripted APIs are reserved for the explicitly labeled no-inference native runner proof.');
-const recorder = await startRequestRecorder(path.join(evidence, 'raw'), scriptedApi);
+// The container's environment carries each module's contribution, which the runner's own predicates read.
+if (kind === 'agent') Object.assign(process.env, composition.moduleEnvironment);
+const recorder = await startRequestRecorder(path.join(evidence, 'raw'));
 const { resetAgentMailboxForTesting, registerAgentMailbox } =
   await import('../../container/agent-runner/src/mailbox/index.js');
 const { formatMessages, extractRouting } = await import('../../container/agent-runner/src/formatter.js');
@@ -95,23 +95,22 @@ let messages: MessageInRow[] = [
     channel_type: scenario.audience === 'main' ? 'gchat' : scenario.audience === 'external-chat' ? 'whatsapp' : 'email',
     thread_id:
       scenario.audience === 'external-email' ? (readState(file).thread?.key ?? 'mail-synthetic-identity') : null,
-    content: JSON.stringify({
-      sender: scenario.observationOnly
-        ? 'system'
-        : scenario.audience === 'main'
-          ? 'Morgan Ellery'
-          : scenario.id === 'friend-dinner-length'
-            ? 'Remy Vance'
-            : 'Juno Hale',
-      senderId: scenario.observationOnly
-        ? 'synthetic-host'
-        : scenario.audience === 'main'
-          ? 'synthetic-morgan'
-          : 'synthetic-juno',
-      text: [composition.context, scenario.input].filter(Boolean).join('\n\n'),
-      principalMessage: scenario.audience === 'main',
-      inConversation: true,
-    }),
+    content: JSON.stringify(
+      scenario.task
+        ? { prompt: scenario.input }
+        : {
+            sender:
+              scenario.audience === 'main'
+                ? 'Morgan Ellery'
+                : scenario.id === 'friend-dinner-length'
+                  ? 'Remy Vance'
+                  : 'Juno Hale',
+            senderId: scenario.audience === 'main' ? 'synthetic-morgan' : 'synthetic-juno',
+            text: [composition.context, scenario.input].filter(Boolean).join('\n\n'),
+            principalMessage: scenario.audience === 'main',
+            inConversation: true,
+          },
+    ),
     source_session_id: null,
     on_wake: 0,
   },
@@ -178,7 +177,7 @@ fs.writeFileSync(path.join(evidence, 'formatted.md'), formatted);
 fs.writeFileSync(path.join(evidence, 'append.md'), addendum);
 fs.writeFileSync(path.join(evidence, 'compact.md'), compact);
 
-const nativeHooks = nativeScenarioHooks(directory, tree, evidence, scenario, composition, shell.profile);
+const nativeHooks = nativeScenarioHooks(directory, tree, evidence, composition, shell.profile);
 const toolHook: HookCallback =
   kind === 'judge'
     ? async () => ({ hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'deny' } })
@@ -212,7 +211,6 @@ const runtime = scenarioRuntime(
     PATH: `${bin}:${process.env.PATH ?? ''}`,
     CLAUDE_CODE_DISABLE_AUTO_MEMORY: '1',
     ENABLE_CLAUDEAI_MCP_SERVERS: 'false',
-    CLAUDE_CODE_MAX_OUTPUT_TOKENS: '1600',
     TZ: 'America/Los_Angeles',
   },
 );
@@ -221,10 +219,9 @@ const options: Options = {
   cwd: kind === 'judge' ? evidence : agent,
   ...(resume ? { resume } : {}),
   pathToClaudeCodeExecutable: cli,
-  model,
-  effort: 'low',
-  maxTurns: kind === 'judge' ? 1 : 8,
-  maxBudgetUsd: Number(reservation),
+  ...(kind === 'judge'
+    ? { model: JUDGE_MODEL }
+    : { model: runtime.inference.model, effort: runtime.inference.effort as Options['effort'] }),
   settingSources: ['project'],
   systemPrompt:
     kind === 'judge'
@@ -234,14 +231,15 @@ const options: Options = {
     ? {
         tools: [],
         allowedTools: [],
-        disallowedTools: runtime.applied.disallowedTools,
+        disallowedTools: runtime.tools.disallowedTools,
         mcpServers: {},
         strictMcpConfig: true,
       }
-    : runtime.applied),
+    : runtime.tools),
   permissionMode: policy.permissionMode,
   allowDangerouslySkipPermissions: policy.allowDangerouslySkipPermissions,
   settings: {
+    ...(kind === 'agent' ? runtime.inference.settings : {}),
     ...policy.settings,
     ...(kind === 'agent' && !sessionsSealed(capabilities)
       ? {
@@ -297,9 +295,6 @@ fs.writeFileSync(
   JSON.stringify(
     {
       ...options,
-      productionTools: runtime.production,
-      fixtureWithheldTools: runtime.fixtureWithheld,
-      fixtureExternalMcpWithheld: runtime.fixtureExternalMcpWithheld,
       moduleEnvironment: kind === 'agent' ? composition.moduleEnvironment : {},
       env: { keys: Object.keys(options.env ?? {}).sort() },
       hooks: Object.keys(options.hooks ?? {}),
@@ -432,11 +427,7 @@ try {
   fs.writeFileSync(path.join(evidence, 'text.md'), text);
   fs.writeFileSync(
     path.join(evidence, 'usage.json'),
-    JSON.stringify(
-      { result, raw: rawUsage(path.join(evidence, 'raw')), scriptedLoopbackApi: Boolean(scriptedApi) },
-      null,
-      2,
-    ),
+    JSON.stringify({ result, raw: rawUsage(path.join(evidence, 'raw')) }, null, 2),
   );
   await recorder.close();
 }

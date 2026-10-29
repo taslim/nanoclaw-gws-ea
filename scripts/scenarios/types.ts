@@ -1,15 +1,11 @@
 import type { Destination, SessionRouting } from '../../src/mailbox/types.js';
 import type { TaskRecord } from '../../src/mailbox/model.js';
+import type { RuntimeInferenceInput } from '../../container/agent-runner/src/provider-contracts/registry.js';
 export interface ScenarioCase {
   readonly id: string;
-  readonly available: boolean;
-  /** Native data can be prepared while an independently required model path is pending. */
-  readonly datasetReady?: boolean;
   readonly requirement: string;
   readonly unit: string;
   readonly audience: 'main' | 'external-email' | 'external-chat';
-  /** Internal task report only; no outward send is asserted by this case. */
-  readonly observationOnly?: boolean;
   readonly input: string;
   readonly facts: readonly string[];
   readonly validOutcomes: readonly string[];
@@ -24,7 +20,7 @@ export interface Effect {
   readonly operation: string;
   readonly target: string;
   readonly payload: Readonly<Record<string, unknown>>;
-  readonly actor: 'main' | 'external-email' | 'external-chat' | 'look-back' | 'look-ahead' | 'unattributed-planner';
+  readonly actor: 'main' | 'external-email' | 'external-chat' | 'look-back' | 'look-ahead';
   readonly attempt: number;
 }
 
@@ -69,14 +65,13 @@ export interface ScenarioComposition {
       readonly today: string;
       readonly tomorrow: string;
       readonly due: string;
-      readonly completedThrough: string;
       readonly matterId?: string;
     };
   };
   readonly context?: string;
   readonly handoff?: { readonly id: string; readonly timestamp: string; readonly content: string };
   readonly weekViewFile?: string;
-  readonly fixturePublicWeb?: boolean;
-  readonly fixturePlanning?: boolean;
+  /** The model, effort and speed the materialized container.json gives the runner. */
+  readonly inference: RuntimeInferenceInput;
   readonly db: string;
 }

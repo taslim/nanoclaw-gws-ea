@@ -113,8 +113,7 @@ export function concreteFixture(scenario: ScenarioCase, referenceAt = new Date()
       thread: { key: 'mail-synthetic-stale-proposal', namedPeople: [JUNO] },
     };
   }
-  if (['commute-day', 'home-day', 'today-exception', 'capture-promise', 'planner-limits'].includes(id))
-    return { events: [], mail: [] };
+  if (id === 'capture-promise' || id === 'planner-limits') return { events: [], mail: [] };
   if (id === 'errand-loop')
     return {
       events: [],
