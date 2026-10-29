@@ -37,11 +37,6 @@ const REVIEWED: Readonly<Record<string, Review>> = {
     reason:
       'the calendar and event ids and input dates are receipt identifiers; the outcome and findings are fully rendered in message',
   },
-  'gws-ea-meetings/principal-events.ts frame: code': {
-    kind: 'host-only',
-    reason:
-      'the recovered native ResponseFrame retains its transport error code; the complete error message explains the interrupted split and its outcome',
-  },
   'gws-ea-meetings/week/checker.ts add: day, eventKeys, facts, key, kind, version': {
     kind: 'host-only',
     reason: 'raw checker facts stay on the host and must pass through presentFinding before reaching a model',
@@ -270,11 +265,6 @@ const REVIEWED: Readonly<Record<string, Review>> = {
   'gws-ea-meetings/calendar-facts.ts peopleStats: events, people, people_not_listed, since': {
     kind: 'rendered',
     reason: 'the summary line, then one line per person, then how many more are not listed',
-  },
-  'gws-ea-meetings/principal-events.ts createEventRaw: calendar, end, event, start': {
-    kind: 'rendered',
-    reason:
-      "the message names the calendar in words, the time and the event id main changes it by; the calendar id is main's own input",
   },
   'gws-ea-meetings/principal-events.ts answered: calendar, event, guests': {
     kind: 'rendered',

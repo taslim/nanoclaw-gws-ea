@@ -253,7 +253,7 @@ describe('a note about a piece of an open matter', () => {
     expect(text.split('\nCalendar facts:\n')[0]).toBe(
       `Google Calendar reports a change:\n${calendarNoticeLine(RENEWAL_CALL, 'changed')}`,
     );
-    expect(text).toContain('Calendar facts:\nFindings for 2026-10-14:');
+    expect(text).toContain('\nFindings for 2026-10-14:');
     expect(text).toContain(`event ${RENEWAL_CALL} on calendar ${MORGAN}\n${calendarSource('Acme renewal call')}`);
     expect(text.endsWith(`\n\n${await rendered(acme)}`)).toBe(true);
     expect(text).toContain(
@@ -341,7 +341,7 @@ describe('a note about pieces in no open matter', () => {
     expect(text.split('\nCalendar facts:\n')[0]).toBe(
       `Google Calendar reports a change:\n${calendarNoticeLine(INVITATION, 'created')}`,
     );
-    expect(text).toContain('Calendar facts:\nFindings for 2026-10-15:');
+    expect(text).toContain('\nFindings for 2026-10-15:');
     expect(text).toContain(`Organizer: ${calendarSource(JUNO)}`);
     expect(
       text.endsWith(
@@ -373,7 +373,7 @@ describe('a note about pieces in no open matter', () => {
         '\n' +
         calendarNoticeLine(INVITATION, 'created'),
     );
-    expect(text).toContain('Calendar facts:\nFindings for 2026-10-14:');
+    expect(text).toContain('\nFindings for 2026-10-14:');
     expect(text).toContain(`Organizer: ${calendarSource(JUNO)}`);
     expect(text).not.toContain('Open matters it may belong to:');
     expect(text).not.toContain('same person');

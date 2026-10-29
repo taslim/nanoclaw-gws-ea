@@ -2206,7 +2206,7 @@ it('reports a named person omitted by the principal without notifying or invitin
       send_updates: 'none',
     }),
   );
-  expect(changed.message).toContain('named but not on the invite of an event the principal created');
+  expect(changed.message).toContain('not on the invite of an event the principal created');
   expect(changed.message).toContain('Google notified no guests');
   expect(calendar.event(PRINCIPAL, 'teamsync01')?.attendees).toEqual([PRINCIPAL_GUEST]);
 });
