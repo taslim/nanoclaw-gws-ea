@@ -156,6 +156,8 @@ try {
   );
   const agent = path.join(output, 'agent');
   fs.mkdirSync(agent, { recursive: true });
+  const { seedScenarioStores } = await import('./seed.js');
+  await seedScenarioStores(readState(path.join(output, 'fixture.json')).scenario, agent);
   await composeGroupProjectDoc(group, agent, { fileName: 'CLAUDE.md' });
   const row = await getContainerConfig(group.id);
   if (!row) throw new Error('Synthetic group lacks a native config.');

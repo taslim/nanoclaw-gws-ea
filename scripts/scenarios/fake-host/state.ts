@@ -14,6 +14,7 @@ export interface SyntheticEvent {
   readonly id: string;
   readonly summary?: string;
   readonly location?: string;
+  readonly description?: string;
   readonly start?: { readonly dateTime?: string; readonly date?: string };
   readonly end?: { readonly dateTime?: string; readonly date?: string };
   readonly organizer?: { readonly email?: string };
@@ -36,14 +37,96 @@ export interface FixtureState {
   readonly scenario: ScenarioCase;
   attempt: number;
   effects: Effect[];
-  tasks: Record<string, unknown>[];
   outbound: Record<string, unknown>[];
   events: SyntheticEvent[];
   mail: SyntheticMail[];
 }
 export function initialFixture(scenario: ScenarioCase): FixtureState {
   if (scenario.id === 'external-email-identity-read' || scenario.id === 'external-chat-identity-read')
-    return { scenario, attempt: 1, effects: [], tasks: [], outbound: [], events: [], mail: [] };
+    return { scenario, attempt: 1, effects: [], outbound: [], events: [], mail: [] };
+  if (scenario.id === 'unknown-pronouns' || scenario.id === 'principal-does-it')
+    return { scenario, attempt: 1, effects: [], outbound: [], events: [], mail: [] };
+  if (scenario.id === 'trip-zone')
+    return {
+      scenario,
+      attempt: 1,
+      effects: [],
+      outbound: [],
+      mail: [],
+      events: [
+        {
+          calendarId: SYNTHETIC_IDENTITY.principalEmail,
+          id: 'synthetic-london-call',
+          summary: 'London project call',
+          start: { dateTime: '2026-11-03T17:00:00+00:00' },
+          end: { dateTime: '2026-11-03T17:30:00+00:00' },
+          organizer: { email: SYNTHETIC_IDENTITY.principalEmail },
+          attendees: [{ email: SYNTHETIC_IDENTITY.principalEmail, responseStatus: 'accepted' }],
+        },
+      ],
+    };
+  if (scenario.id === 'missing-remy') {
+    const text =
+      'Morgan will call Remy directly on the phone for their November 3 catch-up. Remy does not need a calendar invitation.';
+    return {
+      scenario,
+      attempt: 1,
+      effects: [],
+      outbound: [],
+      events: [
+        {
+          calendarId: SYNTHETIC_IDENTITY.principalEmail,
+          id: 'synthetic-remy-call',
+          summary: 'Call with Remy',
+          location: 'Morgan will phone Remy directly',
+          start: { dateTime: '2026-11-03T17:00:00-08:00' },
+          end: { dateTime: '2026-11-03T17:30:00-08:00' },
+          organizer: { email: SYNTHETIC_IDENTITY.principalEmail },
+          attendees: [{ email: SYNTHETIC_IDENTITY.principalEmail, responseStatus: 'accepted' }],
+        },
+      ],
+      mail: [
+        syntheticMail(
+          'synthetic-remy-phone-mail',
+          'Phone catch-up on November 3',
+          'remy.vance@example.test',
+          SYNTHETIC_IDENTITY.principalEmail,
+          text,
+        ),
+      ],
+    };
+  }
+  if (scenario.id === 'assistant-missing-invite') {
+    const text =
+      'Juno invited Morgan to the project check-in on November 3, 14:00–14:25 America/Los_Angeles. Join using the existing phone arrangement: Morgan calls Juno. No private agenda is shared with the assistant.';
+    return {
+      scenario,
+      attempt: 1,
+      effects: [],
+      outbound: [],
+      events: [
+        {
+          calendarId: SYNTHETIC_IDENTITY.principalEmail,
+          id: 'synthetic-juno-invitation',
+          summary: 'Project check-in with Juno',
+          location: 'Morgan calls Juno',
+          start: { dateTime: '2026-11-03T14:00:00-08:00' },
+          end: { dateTime: '2026-11-03T14:25:00-08:00' },
+          organizer: { email: 'juno.hale@example.test' },
+          attendees: [{ email: SYNTHETIC_IDENTITY.principalEmail, responseStatus: 'accepted' }],
+        },
+      ],
+      mail: [
+        syntheticMail(
+          'synthetic-juno-invitation-mail',
+          'Invitation: Project check-in with Juno',
+          'juno.hale@example.test',
+          SYNTHETIC_IDENTITY.principalEmail,
+          text,
+        ),
+      ],
+    };
+  }
   if (scenario.id !== 'search-before-asking') throw new Error(`No concrete native fixture for ${scenario.id}`);
   const summary = 'Dinner with Juno';
   const location = 'Harbor House, 800 Fiction Lane, San Francisco';
@@ -52,7 +135,6 @@ export function initialFixture(scenario: ScenarioCase): FixtureState {
     scenario,
     attempt: 1,
     effects: [],
-    tasks: [],
     outbound: [],
     events: [
       {
@@ -90,6 +172,25 @@ export function initialFixture(scenario: ScenarioCase): FixtureState {
         },
       },
     ],
+  };
+}
+function syntheticMail(id: string, subject: string, from: string, to: string, text: string): SyntheticMail {
+  return {
+    id,
+    threadId: `${id}-thread`,
+    snippet: text,
+    internalDate: String(Date.parse('2026-11-01T12:00:00Z')),
+    labelIds: ['INBOX'],
+    payload: {
+      mimeType: 'text/plain',
+      headers: [
+        { name: 'From', value: from },
+        { name: 'To', value: to },
+        { name: 'Subject', value: subject },
+        { name: 'Date', value: 'Sun, 1 Nov 2026 12:00:00 +0000' },
+      ],
+      body: { data: Buffer.from(text).toString('base64url') },
+    },
   };
 }
 export function readState(file: string): FixtureState {

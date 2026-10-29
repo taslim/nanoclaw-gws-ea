@@ -10,13 +10,15 @@ checks cover only retry duplicates, scoped privacy markers and declared planner
 role/path/verb limits.
 
 The invented principal is Morgan Ellery, the assistant Aster, and contacts Juno
-Hale and Remy Vance. The concrete `search-before-asking` dataset and two small
-`external-email-identity-read` / `external-chat-identity-read` role probes are
-available. The role probes read a conversation-only brief and produce an
+Hale and Remy Vance. Eight cases are available: `search-before-asking`,
+`trip-zone`, `unknown-pronouns`, `principal-does-it`, `missing-remy`,
+`assistant-missing-invite`, and the two external identity/read probes. The role probes read a conversation-only brief and produce an
 internal native task log; their scores cannot establish email or chat delivery.
-Their Calendar/Gmail stores are empty. The remaining incident classes are catalog entries explicitly
+The role probes and the people/reminder-only cases have empty Calendar/Gmail stores. The remaining incident classes are catalog entries explicitly
 marked `fixture-pending`; the driver refuses to run them against unrelated
-records. Their owning product units add concrete fixtures as they land.
+records. [Case readiness](cases/readiness.md) lists every remaining case's exact
+fixture/transport dependency and the path to testing real public web reads with
+synthetic task data.
 
 Run from the repository root with installed host/runner dependencies, Bun, an
 authenticated native Claude CLI and macOS `sandbox-exec`:
@@ -38,7 +40,14 @@ write, refusal to read an invented outside-agent sentinel, and the initial
 reply stamp's visibility in a separate MCP process. These checks run before
 every paid attempt. The role probes also prove native CLI refusal, their own
 release skill selection, and an internal `task_log` from real `processQuery`
-with no outward effect.
+with no outward effect. The newer native-store cases prove person lookup and
+linked conversation memory, normal Gmail search/thread/message reads, exact
+invitation/guest facts, a native London stay and time conversion, and actual
+reminder creation/readback/deletion. Preflight removes its task before any model
+run; `preflight-canonical-snapshot.json` preserves the clean initial state. Native
+people, whereabouts, Manual, memory and task records also reach the judge's
+canonical snapshot; no parallel empty task array claims to represent native
+writes. Snapshot memory traversal refuses symlinks, including the memory root.
 
 Preparation uses native `materializeContainerJson`, including
 `grantCapabilities` overlays, rather than treating stored keys as spawn grants.

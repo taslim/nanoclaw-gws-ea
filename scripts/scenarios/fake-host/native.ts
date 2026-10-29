@@ -8,6 +8,7 @@ import type { FakeCalendar, StoredEvent } from '../../../src/modules/gws-ea-meet
 import type { GmailMessage } from '../../../src/modules/gws-ea-inbox/gmail-api.js';
 import { SYNTHETIC_IDENTITY, type FixtureState } from './state.js';
 import { syntheticGateway } from './gateway.js';
+import { gogMail } from './gog-mail.js';
 
 const PRINCIPAL = SYNTHETIC_IDENTITY.principalEmail;
 const ASSISTANT = SYNTHETIC_IDENTITY.assistantEmail;
@@ -73,6 +74,19 @@ export async function installSyntheticGoogle(root: string): Promise<{ calendar: 
           conferenceProperties: { allowedConferenceSolutionTypes: entry.conferenceTypes },
         })),
       });
+    const calendarListIndex = parts.indexOf('calendarList');
+    if (calendarListIndex >= 0) {
+      const entry = calendar.calendars.get(parts[calendarListIndex + 1] ?? '');
+      return json(
+        entry
+          ? {
+              ...entry,
+              conferenceProperties: { allowedConferenceSolutionTypes: entry.conferenceTypes },
+            }
+          : { error: 'Calendar not found' },
+        entry ? 200 : 404,
+      );
+    }
     const calendarIndex = parts.indexOf('calendars');
     if (calendarIndex >= 0) {
       const id = parts[calendarIndex + 1] ?? '';
@@ -138,7 +152,44 @@ export async function serveNativeHost(
   const Database = (await import('better-sqlite3')).default;
   const fixtureFile = path.join(root, 'fixture.json');
   const observations = path.join(root, 'tool-results.jsonl');
+  const nativeCli = async (argv: string[]) => {
+    const parsed = parseArgv(argv);
+    const frame = await dispatch(
+      { id: randomUUID(), command: parsed.command, args: parsed.args },
+      {
+        caller: 'agent',
+        agentGroupId: session.agent_group_id,
+        sessionId: session.id,
+        messagingGroupId: session.messaging_group_id ?? '',
+      },
+    );
+    return {
+      frame,
+      stdout:
+        !parsed.json && frame.ok && frame.human !== undefined
+          ? frame.human
+          : formatResponse(frame, parsed.json ? 'json' : 'human'),
+    };
+  };
+  const memory = (): Readonly<Record<string, string>> => {
+    const files: Record<string, string> = {};
+    const visit = (directory: string): void => {
+      if (!fs.lstatSync(directory, { throwIfNoEntry: false })?.isDirectory()) return;
+      for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+        const file = path.join(directory, entry.name);
+        if (entry.isDirectory()) visit(file);
+        else if (entry.isFile() && entry.name.endsWith('.md'))
+          files[path.relative(path.join(root, 'agent'), file)] = fs.readFileSync(file, 'utf8');
+      }
+    };
+    visit(path.join(root, 'agent', 'memory'));
+    return files;
+  };
+  const { listPeople, getPerson } = await import('../../../src/modules/gws-ea-people/db.js');
+  const { getWhereabouts } = await import('../../../src/modules/gws-ea-whereabouts/db.js');
+  const { getManualSections } = await import('../../../src/modules/gws-ea-manual/db.js');
   const snapshot = async (): Promise<unknown> => ({
+    observedAt: new Date().toISOString(),
     calendars: [...calendar.calendars.values()],
     events: calendar.events,
     mail,
@@ -148,6 +199,11 @@ export async function serveNativeHost(
       : undefined,
     principalAddresses: await getDb().all('SELECT * FROM gws_ea_principal_addresses'),
     matters: await getDb().all('SELECT * FROM gws_ea_matters'),
+    people: await Promise.all((await listPeople()).map((person) => getPerson(person.id))),
+    whereabouts: await getWhereabouts(),
+    manual: await getManualSections(),
+    memory: memory(),
+    tasks: await nativeCli(['tasks', 'list', '--json']),
   });
   const save = (): void => {
     const state = JSON.parse(fs.readFileSync(fixtureFile, 'utf8')) as FixtureState;
@@ -172,46 +228,27 @@ export async function serveNativeHost(
         const argv = body.args.argv;
         if (!Array.isArray(argv) || !argv.every((entry): entry is string => typeof entry === 'string'))
           throw new Error('Invalid ncl argv');
-        const parsed = parseArgv(argv);
-        const frame = await dispatch(
-          { id: randomUUID(), command: parsed.command, args: parsed.args },
-          {
-            caller: 'agent',
-            agentGroupId: session.agent_group_id,
-            sessionId: session.id,
-            messagingGroupId: session.messaging_group_id ?? '',
-          },
-        );
-        value = {
-          frame,
-          stdout:
-            !parsed.json && frame.ok && frame.human !== undefined
-              ? frame.human
-              : formatResponse(frame, parsed.json ? 'json' : 'human'),
-        };
+        value = await nativeCli(argv);
       } else if (body.method === 'gog') {
         const argv = body.args.argv;
         if (!Array.isArray(argv) || !argv.every((entry): entry is string => typeof entry === 'string'))
           throw new Error('Invalid gog argv');
         const [service, verb] = argv;
         if (service === 'calendar' && verb === 'calendars') value = { calendars: [...calendar.calendars.values()] };
-        else if (service === 'calendar' && ['events', 'event', 'get'].includes(verb ?? '')) {
-          const flagIndex = argv.indexOf('--calendar');
-          const calendarId =
-            flagIndex >= 0 ? argv[flagIndex + 1] : argv[2] && !argv[2].startsWith('--') ? argv[2] : PRINCIPAL;
-          const eventId = verb === 'event' || verb === 'get' ? argv[3] : undefined;
-          value = eventId
-            ? googleEvent(
-                calendar.event(calendarId ?? PRINCIPAL, eventId) ??
-                  (() => {
-                    throw new Error('No such fixture event');
-                  })(),
-              )
-            : { events: calendar.live(calendarId).map(googleEvent), nextPageToken: null };
-        } else if (service === 'gmail') {
-          if (verb === 'get') value = mail.find((entry) => entry.id === argv[2]) ?? null;
-          else if (verb === 'thread') value = { messages: mail.filter((entry) => entry.threadId === argv.at(-1)) };
-          else value = { messages: mail };
+        else if (service === 'gmail') value = gogMail(argv, mail);
+        else if (service === 'people' && verb === 'search') {
+          const query = (argv[2] ?? '').toLocaleLowerCase('en');
+          const people = await Promise.all((await listPeople()).map((person) => getPerson(person.id)));
+          value = {
+            people: people
+              .filter((person) => person?.name.toLocaleLowerCase('en').includes(query))
+              .flatMap(
+                (person) =>
+                  person?.identities
+                    .filter((identity) => identity.handle.startsWith('email:'))
+                    .map((identity) => ({ name: person.name, email: identity.handle.slice(6) })) ?? [],
+              ),
+          };
         } else throw new Error(`Unimplemented synthetic gog service: ${service}`);
       } else if (body.method === 'action') {
         const action = String(body.args.action);

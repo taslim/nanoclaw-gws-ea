@@ -158,10 +158,9 @@ async function prepare(scenario: ScenarioCase, directory: string): Promise<() =>
     const agent = path.join(directory, 'agent');
     if (scenario.audience === 'main') {
       fs.mkdirSync(path.join(agent, 'memory'), { recursive: true });
-      fs.copyFileSync(
-        path.join(tree, 'container/agent-runner/src/memory/templates/index.md'),
-        path.join(agent, 'memory', 'index.md'),
-      );
+      const index = path.join(agent, 'memory', 'index.md');
+      if (!fs.existsSync(index))
+        fs.copyFileSync(path.join(tree, 'container/agent-runner/src/memory/templates/index.md'), index);
     }
     const checks = await child(
       'bun',

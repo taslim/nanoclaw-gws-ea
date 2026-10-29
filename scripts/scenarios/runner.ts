@@ -52,7 +52,7 @@ const messages = [
     id: 'synthetic-input',
     seq: 2,
     kind: scenario.task ? ('task' as const) : ('chat' as const),
-    timestamp: '2026-11-02T20:00:00.000Z',
+    timestamp: new Date().toISOString(),
     status: 'pending',
     process_after: null,
     recurrence: null,
