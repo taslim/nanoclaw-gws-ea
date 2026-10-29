@@ -2232,7 +2232,8 @@ describe('recorded divergence: memory rules come from the release, within one bu
 
     expect(instructions).toContain("the release's memory definition");
     expect(instructions).toContain("is your operator's persona file");
-    expect(instructions).toContain('`ncl manual`');
+    expect(instructions).toContain("Use the dedicated stores your role gives you as each fact's single home.");
+    expect(instructions).not.toMatch(/ncl (?:manual|preferences|whereabouts|people)/u);
     expect(instructions).not.toContain('preferences.md');
     expect(instructions).not.toContain('take effect after the group container restarts');
   });
