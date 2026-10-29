@@ -1,0 +1,30 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "noEmit": true,
+    "typeRoots": ["../../node_modules/@types", "../../container/agent-runner/node_modules/@types"],
+    "types": ["node"],
+    "resolveJsonModule": true,
+    "lib": ["ES2022"]
+  },
+  "include": [
+    "driver.ts",
+    "score.ts",
+    "ledger.ts",
+    "types.ts",
+    "fake-host/prepare.ts",
+    "fake-host/cli.ts",
+    "fake-host/state.ts",
+    "fake-host/relay.ts",
+    "fake-host/mailbox.ts",
+    "fake-host/check.ts",
+    "fake-host/sandbox.ts",
+    "score.test.ts"
+  ],
+  "exclude": []
+}
