@@ -14,7 +14,7 @@ import '../gws-ea-preferences/index.js';
 import '../gws-ea-people/index.js';
 import '../gws-ea-privacy/index.js';
 import '../gws-ea-whereabouts/index.js';
-import { addPlace, addStay } from '../gws-ea-whereabouts/db.js';
+import { addPlace, addStay, getWhereaboutsHistory, setBase } from '../gws-ea-whereabouts/db.js';
 import { getManualHistory, getManualSections, setManualSection } from './db.js';
 import { loadManualFrontPage, MANUAL_SECTION_BUDGET_CHARS } from './front-page.js';
 import './index.js';
@@ -94,7 +94,32 @@ describe('Manual commands', () => {
     expect(await getManualSections()).toEqual([]);
   });
 
-  it('reviews authored mentions, withholds forgotten prose, purges old values, and lets main rewrite the withheld version', async () => {
+  it('answers get without --section with the Manual sections alone, not the other stores', async () => {
+    await setManualSection('priorities', 'Protect the launch.');
+    await addPlace({ id: 'office', label: 'Office', locality: 'Oakland', zone: 'America/Los_Angeles' });
+    const response = await run('get');
+    expect(response).toMatchObject({ ok: true, data: await getManualSections() });
+    expect(JSON.stringify(response)).not.toContain('Oakland');
+  });
+
+  it('keeps the real previous value when the same text is saved again', async () => {
+    await run('set', { section: 'priorities', text: 'Protect the launch.' });
+    await run('set', { section: 'priorities', text: 'Finish the launch.' });
+    expect(await run('set', { section: 'priorities', text: 'Finish the launch.' })).toMatchObject({ ok: true });
+    expect(await getManualHistory('priorities')).toEqual([expect.objectContaining({ text: 'Protect the launch.' })]);
+  });
+
+  it('keeps the trip source only in whereabouts, which the front page renders', async () => {
+    expect(await run('set', { section: 'travel-sources', text: 'Forwarded confirmations.' })).toMatchObject({
+      ok: false,
+    });
+    await setBase({ tripSource: 'Forwarded confirmations.' });
+    const page = await loadManualFrontPage();
+    expect(page).toContain('Trips: Forwarded confirmations.');
+    expect(page).not.toContain('Trips: no source yet');
+  });
+
+  it('puts what may name a forgotten person to main and clears the kept previous values that name them', async () => {
     const person = await addPerson({
       name: 'Remy Vance',
       level: 'inner-circle',
@@ -103,9 +128,12 @@ describe('Manual commands', () => {
       identity: 'email:remy@example.test',
     });
     await setManualSection('principles', 'Make room for Remy Vance.');
-    await setManualSection('principles', 'Keep Remy’s evenings clear.');
+    await setManualSection('principles', 'Keep evenings clear.');
     await setManualSection('priorities', 'Call Remy Vance.');
-    await setManualSection('priorities', 'Finish the launch.');
+    await setManualSection('narrative', 'Morgan builds products.');
+    await setManualSection('narrative', 'Morgan builds tools.');
+    await setBase({ tripSource: 'Forwarded confirmations.' });
+    await setBase({ tripSource: 'Remy forwards their own tickets.' });
     await addPlace({ id: 'studio', label: 'Remy studio', locality: 'Berkeley', zone: 'America/Los_Angeles' });
     const stay = await addStay({
       locality: 'Remy Vance house',
@@ -115,21 +143,34 @@ describe('Manual commands', () => {
       source: 'said',
       certainty: 'certain',
     });
+
     const answer = await forgetPerson({ id: person.id });
-    expect(answer.rewrite).toEqual(
-      expect.arrayContaining(['Manual principles', 'whereabouts place studio', `whereabouts stay ${stay.id}`]),
+
+    expect([...answer.rewrite].sort()).toEqual(
+      [
+        'Manual priorities',
+        'whereabouts trip source',
+        'whereabouts place studio',
+        `whereabouts stay ${stay.id}`,
+      ].sort(),
     );
-    expect(await loadManualFrontPage()).not.toMatch(/Remy|Vance|remy@example/u);
-    expect(JSON.stringify(await getManualHistory())).not.toMatch(/Remy|Vance|remy@example/u);
-    expect((await getManualSections()).find((section) => section.key === 'principles')?.text).toBe(
-      'Keep Remy’s evenings clear.',
-    );
-    await setManualSection('principles', 'Keep Remy’s evenings clear.');
-    expect(await loadManualFrontPage()).not.toContain('Remy');
-    await addPlace({ id: 'studio', label: 'Remy studio', locality: 'Berkeley', zone: 'America/Los_Angeles' });
-    expect(await loadManualFrontPage()).not.toContain('Remy');
-    await setManualSection('principles', 'Keep evenings clear.');
-    expect(await loadManualFrontPage()).toContain('Keep evenings clear.');
-    expect(JSON.stringify(await getManualHistory())).not.toContain('Remy');
+    expect(await getManualHistory()).toEqual([
+      expect.objectContaining({ key: 'narrative', text: 'Morgan builds products.' }),
+    ]);
+    expect(await getWhereaboutsHistory()).toEqual([
+      expect.objectContaining({
+        kind: 'base',
+        value: expect.objectContaining({ trip_source: 'Forwarded confirmations.' }),
+      }),
+    ]);
+  });
+
+  it('leaves a section that only shares a word with a forgotten name on the front page', async () => {
+    const person = await addPerson({ name: 'Juno Park', level: 'close', source: 'principal', basis: 'Neighbor.' });
+    await setManualSection('preferences', 'Sunday walks in Park Slope.');
+
+    expect((await forgetPerson({ id: person.id })).rewrite).toContain('Manual preferences');
+
+    expect(await loadManualFrontPage()).toContain('Sunday walks in Park Slope.');
   });
 });

@@ -490,3 +490,13 @@ export async function getWhereaboutsHistory(): Promise<WhereaboutsHistory[]> {
     changed_at: row.changed_at,
   }));
 }
+
+/** Deletes each base change whose trip source, before or after, `names` matches. */
+export async function clearTripSourceHistory(names: (tripSource: string) => boolean): Promise<void> {
+  for (const entry of await getWhereaboutsHistory()) {
+    if (entry.kind !== 'base') continue;
+    const sources = [entry.previous, entry.value].map((base) => (base as Base).trip_source);
+    if (sources.some((source) => source !== null && names(source)))
+      await getDb().run('DELETE FROM gws_ea_whereabouts_history WHERE id = ?', entry.id);
+  }
+}

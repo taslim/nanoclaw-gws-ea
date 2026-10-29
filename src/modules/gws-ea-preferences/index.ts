@@ -43,7 +43,7 @@ function minutes(count: number): string {
 }
 
 /** Renders from the values type, so a main-only field cannot reach a project document. */
-function summarizeSchedulingPreferences(values: SchedulingPreferenceValues): string | undefined {
+export function summarizeSchedulingPreferences(values: SchedulingPreferenceValues): string | undefined {
   const source = (value: { readonly source: PreferenceSource }) => `(${SOURCE_LABELS[value.source]})`;
   const blocks = (
     [

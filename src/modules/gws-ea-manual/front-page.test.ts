@@ -76,16 +76,6 @@ describe('Manual front page', () => {
     expect(await loadManualFrontPage()).toContain('Commute days: none');
   });
 
-  it('clears the trip-source gap when the Manual records a source, including none', async () => {
-    for (const text of ['Forward confirmations to the assistant.', 'none']) {
-      await setManualSection('travel-sources', text);
-      const rendered = await loadManualFrontPage();
-      expect(rendered).not.toContain('Trips: no source yet');
-      expect(rendered).toContain(text);
-      expect(rendered).toContain('home base not set');
-    }
-  });
-
   it('reads each fact from its native store and bounds the result with 100 saved places', async () => {
     await addPlace({ id: 'home', label: 'Home', locality: 'Berkeley', home: true });
     await addPlace({ id: 'office', label: 'Office', locality: 'Oakland', zone: 'America/Los_Angeles' });
