@@ -15,8 +15,7 @@ import type { PendingClockItem } from '../gws-ea-whereabouts/changes.js';
 import { zoneAt, type Timeline } from '../gws-ea-whereabouts/timeline.js';
 import { mainConversations, seriesKey } from './looks.js';
 
-// Two loop passes let a trip correction settle before it makes a future occurrence due now.
-const SETTLE_MS = 2 * 60_000;
+const TRIP_CORRECTION_SETTLE_MS = 2 * 60_000;
 
 export interface Retime {
   readonly id: string;
@@ -62,7 +61,6 @@ function instant(wall: WallClock, zone: string, milliseconds: number): number {
   return zonedInstant(wall, wall.hour * 60 + wall.minute, zone) + wall.second * 1000 + milliseconds;
 }
 
-/** Every boundary can change the effective zone; precedence is resolved by the snapshot itself. */
 function zoneIntervals(timeline: Timeline, from: number): { start: number; end: number; zone: string }[] {
   const boundaries = new Set([
     from,
@@ -291,6 +289,7 @@ async function observeAnchor(
     if (!clock) return undefined;
     anchor = await anchorTask(session, task, timeline, clock);
   }
+  let persisted = anchor;
   if (anchor.change !== null && task.processAfter === anchor.change.newAt) {
     anchor = {
       ...anchor,
@@ -301,6 +300,7 @@ async function observeAnchor(
     };
     await save(anchor);
     anchor = await notify(anchor);
+    persisted = anchor;
   }
   if (anchor.timelineVersion !== timeline.version) {
     anchor = { ...anchor, timelineVersion: timeline.version, timelineChangedAt: iso(Date.now()) };
@@ -311,10 +311,14 @@ async function observeAnchor(
     (clock.instant !== anchor.sourceClock.instant ||
       clock.zone !== anchor.sourceClock.zone ||
       task.recurrence !== anchor.recurrence);
-  if (mainEdited && clock) anchor = await anchorTask(session, task, timeline, clock, anchor.fixed, iso(Date.now()));
+  if (mainEdited && clock) {
+    anchor = await anchorTask(session, task, timeline, clock, anchor.fixed, iso(Date.now()));
+    persisted = anchor;
+  }
   anchor = afterRun(anchor, lastRun);
-  anchor = { ...anchor, rowId: task.id, content: task.content, ...(newRow ? { hostRetryRowId: null } : {}) };
-  await save(anchor);
+  if (anchor.rowId !== task.id || anchor.content !== task.content || (newRow && anchor.hostRetryRowId !== null))
+    anchor = { ...anchor, rowId: task.id, content: task.content, ...(newRow ? { hostRetryRowId: null } : {}) };
+  if (anchor !== persisted) await save(anchor);
   anchor = await notify(anchor);
   return anchor;
 }
@@ -326,10 +330,15 @@ async function upkeep(session: Session, task: TaskRecord, timeline: Timeline, ev
   if (!anchor) return;
   if (anchor.hostRetryRowId === task.id || Date.parse(task.processAfter) <= Date.now()) return;
   const moment = retimeAnchor(anchor, timeline, Date.now());
-  if (!moment || (Date.parse(moment.at) <= Date.now() && Date.now() - Date.parse(anchor.timelineChangedAt) < SETTLE_MS))
+  if (
+    !moment ||
+    (Date.parse(moment.at) <= Date.now() &&
+      Date.now() - Date.parse(anchor.timelineChangedAt) < TRIP_CORRECTION_SETTLE_MS)
+  )
     return;
   if (moment.at === task.processAfter) {
-    await save({ ...anchor, appliedAt: task.processAfter, appliedZone: moment.zone });
+    if (anchor.appliedAt !== task.processAfter || anchor.appliedZone !== moment.zone)
+      await save({ ...anchor, appliedAt: task.processAfter, appliedZone: moment.zone });
     return;
   }
   await apply(session, task, anchor, moment);

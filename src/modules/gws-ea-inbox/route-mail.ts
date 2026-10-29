@@ -936,10 +936,6 @@ export async function writeHeldNote(
 // Calendar notifications
 // ---------------------------------------------------------------------------
 
-/**
- * Recording the notice settles its Gmail message before the week refresher
- * renders one note for the settled set, with live findings and matter suggestions.
- */
 export async function writeCalendarNote(
   notices: readonly { readonly gmailMessageId: string; readonly notice: CalendarNotice }[],
   _events: Pick<MeetingsCalendarApi, 'getEvent'>,

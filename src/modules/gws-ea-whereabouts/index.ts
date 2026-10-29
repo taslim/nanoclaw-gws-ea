@@ -2,7 +2,6 @@ import { registerResource, type ColumnDef } from '../../cli/crud.js';
 import { getDb } from '../../db/connection.js';
 import { registerMigration } from '../../db/migrations/index.js';
 import { pendingClockItems } from './changes.js';
-// Formatting only: this helper reads no inbox data and starts no domain lifecycle.
 import { untrusted } from '../gws-ea-inbox/untrusted.js';
 import { assertMainCaller } from '../gws-ea-profile/db.js';
 import {

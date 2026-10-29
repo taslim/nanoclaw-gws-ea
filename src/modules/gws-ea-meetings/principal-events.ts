@@ -1217,10 +1217,12 @@ export function createPrincipalEventTools(deps: PrincipalEventToolsDeps) {
         : undefined;
       let outcome: string;
       let wrote = false;
-      const permissionRefusal =
-        before.organizer?.email && !principal.has(before.organizer.email) && owner === 'principal'
-          ? 'Google refused the change. The principal is a guest; the organizer controls this event.'
-          : 'Google refused permission to change this event.';
+      const principalIsGuest = Boolean(
+        before.organizer?.email && !principal.has(before.organizer.email) && owner === 'principal',
+      );
+      const permissionRefusal = principalIsGuest
+        ? 'Google refused the change. The principal is a guest; the organizer controls this event.'
+        : 'Google refused permission to change this event.';
       try {
         if (split) {
           const currentMaster = await calendar().getEventDetail(calendarId, split.masterId);
@@ -1248,15 +1250,13 @@ export function createPrincipalEventTools(deps: PrincipalEventToolsDeps) {
           await calendar().patchEvent(calendarId, eventId, patch, sendUpdates, before.etag);
           wrote = true;
         }
-        outcome =
-          splitOutcome ??
-          (cancel
-            ? before.organizer?.email && !principal.has(before.organizer.email) && owner === 'principal'
-              ? 'Removed the event from the principal’s copy. respond_to_event declines it and tells the organizer.'
-              : 'Cancelled the event.'
-            : wrote
-              ? 'Changed the event.'
-              : 'Nothing changed: the event already has those values.');
+        if (splitOutcome !== undefined) outcome = splitOutcome;
+        else if (cancel && principalIsGuest)
+          outcome =
+            'Removed the event from the principal’s copy. respond_to_event declines it and tells the organizer.';
+        else if (cancel) outcome = 'Cancelled the event.';
+        else if (wrote) outcome = 'Changed the event.';
+        else outcome = 'Nothing changed: the event already has those values.';
       } catch (error) {
         if (split) {
           const [masterNow, followingNow] = await Promise.all([

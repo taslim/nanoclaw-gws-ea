@@ -67,7 +67,6 @@ export function parseProcessAfter(value: unknown, tz: string = TIMEZONE): string
   return date.toISOString();
 }
 
-/** Preserve the written clock before UTC normalization erases its offset. */
 export function scheduledTaskClock(value: unknown, timezone: string, instant: string): TaskClock {
   const offset = typeof value === 'string' ? /(?:Z|([+-])(\d{2}):?(\d{2}))$/iu.exec(value.trim()) : null;
   const zone = offset === null ? timezone : offset[1] === undefined ? 'UTC' : `${offset[1]}${offset[2]}:${offset[3]}`;

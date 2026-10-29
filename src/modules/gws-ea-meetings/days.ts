@@ -54,7 +54,6 @@ export interface CalendarWeekOptions {
   readonly additionalEvents?: readonly EventCopy[];
   readonly replaceEvent?: { readonly calendarId: string; readonly eventId: string };
 }
-/** One operation owns one timeline; the refresher may supply its already-read snapshot. */
 export async function loadCalendarWeek(calendar: MeetingsCalendarApi, options: CalendarWeekOptions): Promise<Week> {
   const [timeline, profile, listed, preferences, people, summaries, privateValues] = await Promise.all([
     options.timeline ?? loadTimeline(),
@@ -226,17 +225,23 @@ export function affectedPeople(event: WeekEvent, week: Week): string {
     8_000,
   );
 }
-export function renderDays(week: Week, filter?: string): string {
-  const shown = presentWeek(week);
-  const selected = week.events.filter(
+function filterEvents(events: readonly WeekEvent[], filter?: string): WeekEvent[] {
+  return events.filter(
     (e) =>
       !filter ||
       `${e.event.summary ?? ''}\n${e.event.description ?? ''}\n${e.event.location ?? ''}`
         .toLowerCase()
         .includes(filter.toLowerCase()),
   );
+}
+export function renderDays(week: Week, filter?: string): string {
+  const shown = presentWeek(week);
+  const selected = filterEvents(week.events, filter);
+  const presentations = new Map<string, (typeof shown.days)[number]['events'][number]>();
+  for (const day of shown.days)
+    for (const event of day.events) if (!presentations.has(event.key)) presentations.set(event.key, event);
   const lines = selected.map((e) => {
-    const p = shown.days.flatMap((d) => d.events).find((p) => p.key === e.key);
+    const p = presentations.get(e.key);
     if (!p) throw new Error('Calendar event missing from presentation');
     return [
       e.allDay
@@ -294,7 +299,6 @@ export function createDaysTools(deps: { readonly calendar: () => MeetingsCalenda
         : dayBoundary(content.end, 'end', timeline, true);
     if (end <= start) throw invalidArgs('end must come after start');
     const eventId = lineOf(content.event, 'event', 1024);
-    let additionalEvents: EventCopy[] = [];
     if (eventId) {
       const calendarId = lineOf(content.calendar, 'calendar', 254);
       if (!calendarId) throw invalidArgs('calendar is required with event');
@@ -312,7 +316,6 @@ export function createDaysTools(deps: { readonly calendar: () => MeetingsCalenda
             : undefined;
       if (!entry || !owner) throw forbidden('Read an event on a principal calendar or your own calendar.');
       if (!detail || detail.status === 'cancelled') return { message: 'That event is no longer on this calendar.' };
-      additionalEvents = [{ calendarId, event: detail, owner }];
       const detailStart = dayBoundary(detail.start?.date ?? detail.start?.dateTime, 'event start', timeline, false);
       const detailEnd = detail.end?.date
         ? boundary(detail.end.date, zoneForDay(timeline, detail.end.date) ?? 'UTC', 'start')
@@ -321,7 +324,7 @@ export function createDaysTools(deps: { readonly calendar: () => MeetingsCalenda
         start: detailStart,
         end: detailEnd,
         timeline,
-        additionalEvents,
+        additionalEvents: [{ calendarId, event: detail, owner }],
         replaceEvent: { calendarId, eventId },
       });
       return {
@@ -334,13 +337,7 @@ export function createDaysTools(deps: { readonly calendar: () => MeetingsCalenda
     const week = await loadCalendarWeek(deps.calendar(), { start, end, timeline });
     const filter = lineOf(content.filter, 'filter', 200);
     if (flagOf(content.export, 'export')) {
-      const selected = week.events.filter(
-        (e) =>
-          !filter ||
-          `${e.event.summary ?? ''}\n${e.event.description ?? ''}\n${e.event.location ?? ''}`
-            .toLowerCase()
-            .includes(filter.toLowerCase()),
-      );
+      const selected = filterEvents(week.events, filter);
       const rendered = selected.map((e) => renderDays({ ...week, events: [e] })).join('\n\n');
       const key = createHash('sha256').update(requestId).digest('hex').slice(0, 24);
       const path = stageInboxFile(

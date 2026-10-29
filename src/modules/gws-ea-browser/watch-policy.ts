@@ -38,7 +38,6 @@ function clockHour(at: number, timeZone: string): number {
   const parts = new Intl.DateTimeFormat('en-US', { timeZone, hour: '2-digit', hourCycle: 'h23' }).formatToParts(at);
   return Number(parts.find((part) => part.type === 'hour')?.value);
 }
-/** One current whereabouts snapshot for the moment this browser operation concerns. */
 export async function principalClock(at = Date.now()): Promise<string> {
   return zoneAt(await loadTimeline(), at) ?? TIMEZONE;
 }

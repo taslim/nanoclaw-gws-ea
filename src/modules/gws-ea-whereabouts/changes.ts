@@ -29,7 +29,6 @@ export interface PendingClockItem {
 type PendingClockReader = (timeline: Timeline) => Promise<readonly PendingClockItem[]>;
 let pendingClockReader: PendingClockReader | undefined;
 
-/** Matters supplies its own clock data; whereabouts remains a leaf of the domain. */
 export function registerPendingClockReader(reader: PendingClockReader): void {
   pendingClockReader = reader;
 }

@@ -126,7 +126,6 @@ registerPersonForgetHook('gws-ea-meetings:calendar-write-log', async ({ id, hand
   }
 });
 
-/** The refresher compares this durable signal; checking findings never changes it. */
 export async function calendarWriteVersion(): Promise<string> {
   return digest(
     await getDb().all<{ request_id: string; calendar_id: string; event_id: string }>(

@@ -577,7 +577,6 @@ export interface RenderedCalendarChanges {
   readonly text: string;
   readonly pieces?: readonly import('../gws-ea-profile/main-note.js').NotePiece[];
 }
-/** Meetings registers its host renderer; the inbox never imports its entry point. */
 export type CalendarChangeRenderer = (
   changes: readonly import('../gws-ea-meetings/week/pending-changes.js').PendingCalendarChange[],
   at: Date,
@@ -588,7 +587,6 @@ export function registerCalendarChangeRenderer(renderer: CalendarChangeRenderer)
   if (changeRenderer) throw new Error('A calendar change renderer is already registered');
   changeRenderer = renderer;
 }
-/** The week refresher supplies its snapshot when it has one; this function owns no timer. */
 export async function flushPendingCalendarChanges(
   at: Date = new Date(),
   context: CalendarChangeRenderContext = {},
