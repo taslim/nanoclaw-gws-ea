@@ -120,15 +120,8 @@ describe('tasks CLI resource', () => {
     expect(content).toMatchObject({ originSessionId: 'chat-1' });
     expect(content.prompt).toBe('send a briefing');
     expect(content.prompt).not.toContain('Task delivery contract');
-    // The isolated envelope keeps clock intent and carries no in-conversation marker.
-    expect(row.content).toBe(
-      JSON.stringify({
-        prompt: 'send a briefing',
-        script: null,
-        clock: { instant: '2026-01-15T09:00:00.000Z', zone: 'UTC' },
-        originSessionId: 'chat-1',
-      }),
-    );
+    // Byte for byte what an isolated task always stored: no in-conversation marker.
+    expect(row.content).toBe(JSON.stringify({ prompt: 'send a briefing', script: null, originSessionId: 'chat-1' }));
     systemDb.close();
   });
 
@@ -752,7 +745,6 @@ describe('tasks CLI resource', () => {
       expect(JSON.parse(conversationTaskRows()[0].content)).toEqual({
         prompt: 'Ask Juno Hale whether the venue confirmed',
         script: null,
-        clock: { instant: '2999-01-01T09:00:00.000Z', zone: 'UTC' },
         originSessionId: 'chat-1',
         inConversation: true,
       });
@@ -954,47 +946,6 @@ describe('tasks CLI resource', () => {
       });
       expect((await getSessionsByAgentGroup('ag-1')).map((s) => s.id)).toEqual(['chat-1']);
     });
-  });
-  it('keeps clock intent through native creation, edits and a host retime', async () => {
-    const response = await dispatch(
-      {
-        id: 'clock-create',
-        command: 'tasks-create',
-        args: {
-          prompt: 'Remind Morgan',
-          process_after: '2999-01-01T09:00:00+01:00',
-        },
-      },
-      agentCtx(),
-    );
-    if (!response.ok) throw new Error(response.error.message);
-    const row = response.data as { series_id: string; session_id: string };
-    const content = async () =>
-      withMailboxSession(
-        'ag-1',
-        row.session_id,
-        (mailbox) => JSON.parse(mailbox.getTask(row.series_id)?.content ?? '{}') as Record<string, unknown>,
-      );
-    expect(await content()).toMatchObject({ clock: { instant: '2999-01-01T08:00:00.000Z', zone: '+01:00' } });
-    const update = await dispatch(
-      {
-        id: 'clock-edit',
-        command: 'tasks-update',
-        args: {
-          id: row.series_id,
-          process_after: '2999-01-02T09:00:00-08:00',
-        },
-      },
-      agentCtx(),
-    );
-    expect(update.ok).toBe(true);
-    const edited = await content();
-    expect(edited).toMatchObject({ clock: { instant: '2999-01-02T17:00:00.000Z', zone: '-08:00' } });
-    await withMailboxSession('ag-1', row.session_id, (mailbox) => {
-      mailbox.updateTask(row.series_id, { processAfter: '2999-01-02T08:00:00Z' });
-      mailbox.updateTask(row.series_id, { prompt: 'New reminder wording' });
-    });
-    expect(await content()).toMatchObject({ clock: edited.clock, prompt: 'New reminder wording' });
   });
 });
 

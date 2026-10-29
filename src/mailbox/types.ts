@@ -87,13 +87,7 @@ export type ContainerState = Omit<ContainerRecord, 'updatedAt'>;
 export type OutboundMessage = OutboundDelivery;
 export type Task = TaskWrite;
 
-export interface TaskClock {
-  readonly instant: string;
-  readonly zone: string;
-}
-
 export interface TaskUpdate {
-  clock?: TaskClock;
   prompt?: string;
   script?: string | null;
   recurrence?: string | null;

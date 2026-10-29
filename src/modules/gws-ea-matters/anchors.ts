@@ -4,18 +4,19 @@ import { CronExpressionParser } from 'cron-parser';
 import { getDb } from '../../db/connection.js';
 import type { TaskRecord } from '../../mailbox/index.js';
 import type { InboundRecord } from '../../mailbox/model.js';
-import type { TaskClock } from '../../mailbox/types.js';
-import { parseTaskContent } from '../scheduling/task-content.js';
 import { withExistingMailboxSession } from '../../session-manager.js';
 import { formatLocalTime } from '../../timezone.js';
 import type { Session } from '../../types.js';
 import { writeNoteForMain } from '../gws-ea-profile/main-note.js';
 import { dateString, iso, wallClock, zonedInstant, type WallClock } from '../gws-ea-whereabouts/clock.js';
-import type { PendingClockItem } from '../gws-ea-whereabouts/changes.js';
-import { zoneAt, type Timeline } from '../gws-ea-whereabouts/timeline.js';
+import type { ClockSpan, PendingClockItem } from '../gws-ea-whereabouts/changes.js';
+import { zoneAt, zoneSegments, type Timeline } from '../gws-ea-whereabouts/timeline.js';
 import { mainConversations, seriesKey } from './looks.js';
 
 const TRIP_CORRECTION_SETTLE_MS = 2 * 60_000;
+const DAY_MS = 86_400_000;
+// The close and morning gate time these series themselves.
+const HOST_TIMED_SERIES = /^(?:gws-ea-close-|gws-ea-morning-)/u;
 
 export interface Retime {
   readonly id: string;
@@ -28,15 +29,14 @@ export interface Retime {
 export interface TimeAnchor {
   readonly sessionId: string;
   readonly seriesId: string;
-  readonly sourceClock: TaskClock;
   readonly originalAt: string;
   readonly originalZone: string;
   readonly createdAt: string;
-  readonly wall: WallClock;
+  /** The local time main set; null while a repeating series is armed by its cron alone. */
+  readonly wall: WallClock | null;
   readonly recurrence: string | null;
   readonly fixed: boolean;
   readonly rowId: string;
-  readonly content: string;
   readonly appliedAt: string;
   readonly appliedZone: string;
   readonly timelineVersion: string;
@@ -44,13 +44,7 @@ export interface TimeAnchor {
   readonly lastRun: string | null;
   readonly lastLocalRun: string | null;
   readonly hostRetryRowId: string | null;
-  readonly change: Retime | null;
   readonly notices: readonly Retime[];
-}
-
-/** The close and morning gate own these series, including their generic-loop exclusion. */
-export function isHostTimedSeries(id: string): boolean {
-  return /^(?:gws-ea-close-|gws-ea-morning-|gws-ea-daily-sync-)/u.test(id);
 }
 
 function localKey(wall: WallClock): string {
@@ -61,17 +55,8 @@ function instant(wall: WallClock, zone: string, milliseconds: number): number {
   return zonedInstant(wall, wall.hour * 60 + wall.minute, zone) + wall.second * 1000 + milliseconds;
 }
 
-function zoneIntervals(timeline: Timeline, from: number): { start: number; end: number; zone: string }[] {
-  const boundaries = new Set([
-    from,
-    ...timeline.stays.flatMap((stay) => (stay.end === null ? [stay.start] : [stay.start, stay.end])),
-    ...timeline.legs.flatMap((leg) => [leg.departure, leg.arrival]),
-  ]);
-  const points = [...boundaries].filter((point) => point >= from).sort((a, b) => a - b);
-  return points.flatMap((start, i) => {
-    const zone = zoneAt(timeline, start);
-    return zone === null ? [] : [{ start, end: points[i + 1] ?? Number.POSITIVE_INFINITY, zone }];
-  });
+function knownSegments(timeline: Timeline, from: number): { start: number; end: number; zone: string }[] {
+  return zoneSegments(timeline, from).flatMap(({ start, end, zone }) => (zone === null ? [] : [{ start, end, zone }]));
 }
 
 export interface AnchorMoment {
@@ -82,37 +67,36 @@ export interface AnchorMoment {
 /** Local occurrence identity survives westward travel as well as the strict instant-after-last-run rule. */
 export function retimeAnchor(anchor: TimeAnchor, timeline: Timeline, now: number): AnchorMoment | null {
   const original = Date.parse(anchor.originalAt);
-  if (anchor.recurrence === null) {
+  const last = anchor.lastRun === null ? null : Date.parse(anchor.lastRun);
+  const { wall } = anchor;
+  // A time main set holds for its own occurrence; after it runs, the cron arms the series again.
+  if (anchor.recurrence === null || (wall !== null && (last === null || last < Date.parse(anchor.appliedAt)))) {
     if (anchor.fixed) return { at: anchor.originalAt, zone: anchor.originalZone };
+    const local = wall ?? wallClock(original, anchor.originalZone);
     const milliseconds = ((original % 1000) + 1000) % 1000;
-    const candidates = zoneIntervals(timeline, original - 2 * 86_400_000).flatMap(({ start, end, zone }) => {
-      const at = instant(anchor.wall, zone, milliseconds);
+    const candidates = knownSegments(timeline, original - 2 * DAY_MS).flatMap(({ start, end, zone }) => {
+      const at = instant(local, zone, milliseconds);
       return start <= at && at < end ? [{ at, zone }] : [];
     });
     const chosen = candidates.sort((a, b) => a.at - b.at)[0];
     return chosen ? { at: iso(Math.max(chosen.at, now)), zone: chosen.zone } : null;
   }
-  const last = anchor.lastRun === null ? null : Date.parse(anchor.lastRun);
+  // Before its first run, a cron-armed series starts after it was set.
+  const after = Math.max(last ?? Number.NEGATIVE_INFINITY, Date.parse(anchor.createdAt));
   if (anchor.fixed) {
-    const next = CronExpressionParser.parse(anchor.recurrence, {
-      tz: anchor.originalZone,
-      currentDate: last ?? original - 1,
-    })
+    const next = CronExpressionParser.parse(anchor.recurrence, { tz: anchor.originalZone, currentDate: after })
       .next()
       .getTime();
     return { at: iso(Math.max(next, now)), zone: anchor.originalZone };
   }
-  const earliest = last ?? original - 2 * 86_400_000;
-  const firstLocal = localKey(anchor.wall);
   const found: { at: number; zone: string }[] = [];
-  for (const { start, end, zone } of zoneIntervals(timeline, earliest)) {
+  for (const { start, end, zone } of knownSegments(timeline, after)) {
     const interval = CronExpressionParser.parse(anchor.recurrence, {
       tz: zone,
-      currentDate: Math.max(start - 1, last ?? instant(anchor.wall, zone, 0) - 1, Date.parse(anchor.createdAt)),
+      currentDate: Math.max(start - 1, after),
     });
     for (let next = interval.next().getTime(); next < end; next = interval.next().getTime()) {
-      const key = localKey(wallClock(next, zone));
-      if ((last === null && key < firstLocal) || (anchor.lastLocalRun !== null && key <= anchor.lastLocalRun)) continue;
+      if (anchor.lastLocalRun !== null && localKey(wallClock(next, zone)) <= anchor.lastLocalRun) continue;
       found.push({ at: next, zone });
       break;
     }
@@ -140,41 +124,55 @@ async function save(anchor: TimeAnchor): Promise<void> {
   );
 }
 
-/** UTC alone cannot recover the interpretation zone after a stay is entered. */
-export async function anchorTask(
+/**
+ * A moment's local clock is the wall time its instant shows in the zone in
+ * effect then, read when the anchor first sees it. Undefined while that zone
+ * is unknown.
+ */
+function sight(
   session: Session,
   task: TaskRecord,
   timeline: Timeline,
-  clock: TaskClock,
-  fixed = false,
-  createdAt: string = task.timestamp,
-): Promise<TimeAnchor> {
-  if (task.processAfter === null) throw new Error('A clock anchor requires a scheduled moment');
-  const previous = await getTimeAnchor(session.id, seriesKey(task));
-  const anchor: TimeAnchor = {
+  options: {
+    readonly fixed: boolean;
+    readonly createdAt: string;
+    readonly armedByCron: boolean;
+    readonly previous?: TimeAnchor;
+  },
+): TimeAnchor | undefined {
+  if (task.processAfter === null) return undefined;
+  const at = Date.parse(task.processAfter);
+  const zone = zoneAt(timeline, at);
+  if (zone === null) return undefined;
+  return {
     sessionId: session.id,
     seriesId: seriesKey(task),
-    sourceClock: clock,
-    originalAt: clock.instant,
-    originalZone: clock.zone,
-    createdAt,
-    wall: wallClock(Date.parse(clock.instant), clock.zone),
+    originalAt: task.processAfter,
+    originalZone: zone,
+    createdAt: options.createdAt,
+    wall: options.armedByCron ? null : wallClock(at, zone),
     recurrence: task.recurrence,
-    fixed,
+    fixed: options.fixed,
     rowId: task.id,
-    content: task.content,
     appliedAt: task.processAfter,
-    appliedZone: clock.zone,
+    appliedZone: zone,
     timelineVersion: timeline.version,
     timelineChangedAt: iso(Date.now()),
-    lastRun: previous?.lastRun ?? null,
-    lastLocalRun: previous?.lastLocalRun ?? null,
+    lastRun: options.previous?.lastRun ?? null,
+    lastLocalRun: options.previous?.lastLocalRun ?? null,
     hostRetryRowId: null,
-    change: null,
-    notices: previous?.notices ?? [],
+    notices: options.previous?.notices ?? [],
   };
-  await save(anchor);
-  return anchor;
+}
+
+/** Anchors a moment main has just set; the matters loop anchors every other task when it first sees it. */
+export async function anchorTask(session: Session, task: TaskRecord, timeline: Timeline, fixed = false): Promise<void> {
+  const anchor = sight(session, task, timeline, {
+    fixed,
+    createdAt: task.timestamp,
+    armedByCron: task.recurrence !== null,
+  });
+  if (anchor) await save(anchor);
 }
 
 async function notify(anchor: TimeAnchor): Promise<TimeAnchor> {
@@ -195,25 +193,14 @@ async function notify(anchor: TimeAnchor): Promise<TimeAnchor> {
   return current;
 }
 
+/** `report` is false for a time core's cron armed, which main never set or saw. */
 async function apply(
   session: Session,
   task: TaskRecord,
   anchor: TimeAnchor,
   moment: AnchorMoment,
+  report: boolean,
 ): Promise<TimeAnchor> {
-  if (task.processAfter === moment.at) return notify(anchor);
-  const change =
-    anchor.change?.newAt === moment.at
-      ? anchor.change
-      : {
-          id: `clock-${randomUUID()}`,
-          oldAt: task.processAfter ?? anchor.appliedAt,
-          newAt: moment.at,
-          oldZone: anchor.appliedZone,
-          newZone: moment.zone,
-        };
-  const planned = { ...anchor, change };
-  await save(planned);
   const touched = await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) => {
     if (
       mailbox.getProcessingClaims().some((claim) => claim.messageId === task.id) ||
@@ -225,25 +212,30 @@ async function apply(
       !current ||
       current.id !== task.id ||
       current.processAfter !== task.processAfter ||
-      current.recurrence !== task.recurrence ||
-      current.content !== task.content
+      current.recurrence !== task.recurrence
     )
       return 0;
     return mailbox.updateTask(task.id, { processAfter: moment.at });
   });
-  if (!touched) return planned;
+  if (!touched || task.processAfter === null) return anchor;
+  const retime: Retime = {
+    id: `clock-${randomUUID()}`,
+    oldAt: task.processAfter,
+    newAt: moment.at,
+    oldZone: anchor.appliedZone,
+    newZone: moment.zone,
+  };
   const moved = {
-    ...planned,
+    ...anchor,
     appliedAt: moment.at,
     appliedZone: moment.zone,
-    change: null,
-    notices: [...planned.notices, change],
+    notices: report ? [...anchor.notices, retime] : anchor.notices,
   };
   await save(moved);
   return notify(moved);
 }
 
-/** A host retry keeps its cron and local anchor while this occurrence waits at the close/sync. */
+/** A host retry keeps its cron and local anchor while this occurrence waits at the close. */
 export async function rememberHostRetry(session: Session, seriesId: string): Promise<void> {
   const anchor = await getTimeAnchor(session.id, seriesId);
   if (!anchor) return;
@@ -277,6 +269,11 @@ function afterRun(anchor: TimeAnchor, lastRun: string | null): TimeAnchor {
     : anchor;
 }
 
+/**
+ * Main's edit shows as the anchored row carrying a time the anchor did not
+ * apply, or a changed recurrence; it is re-anchored, never reverted. A new row
+ * in the series is core's re-arm. Undefined while the moment's zone is unknown.
+ */
 async function observeAnchor(
   session: Session,
   task: TaskRecord,
@@ -284,52 +281,42 @@ async function observeAnchor(
   lastRun: string | null,
 ): Promise<TimeAnchor | undefined> {
   if (task.processAfter === null) return undefined;
-  const clock = parseTaskContent(task.content).clock;
-  let anchor = await getTimeAnchor(session.id, seriesKey(task));
-  if (!anchor) {
-    if (!clock) return undefined;
-    anchor = await anchorTask(session, task, timeline, clock);
-  }
-  let persisted = anchor;
-  if (anchor.change !== null && task.processAfter === anchor.change.newAt) {
-    anchor = {
-      ...anchor,
-      appliedAt: task.processAfter,
-      appliedZone: anchor.change.newZone,
-      notices: [...anchor.notices, anchor.change],
-      change: null,
-    };
-    await save(anchor);
-    anchor = await notify(anchor);
-    persisted = anchor;
-  }
-  if (anchor.timelineVersion !== timeline.version) {
+  const held = await getTimeAnchor(session.id, seriesKey(task));
+  let anchor =
+    held ??
+    sight(session, task, timeline, { fixed: false, createdAt: task.timestamp, armedByCron: task.recurrence !== null });
+  if (!anchor) return undefined;
+  if (anchor.timelineVersion !== timeline.version)
     anchor = { ...anchor, timelineVersion: timeline.version, timelineChangedAt: iso(Date.now()) };
-  }
-  const newRow = anchor.rowId !== task.id;
-  const mainEdited =
-    clock !== undefined &&
-    (clock.instant !== anchor.sourceClock.instant ||
-      clock.zone !== anchor.sourceClock.zone ||
-      task.recurrence !== anchor.recurrence);
-  if (mainEdited && clock) {
-    anchor = await anchorTask(session, task, timeline, clock, anchor.fixed, iso(Date.now()));
-    persisted = anchor;
-  }
   anchor = afterRun(anchor, lastRun);
-  if (anchor.rowId !== task.id || anchor.content !== task.content || (newRow && anchor.hostRetryRowId !== null))
-    anchor = { ...anchor, rowId: task.id, content: task.content, ...(newRow ? { hostRetryRowId: null } : {}) };
-  if (anchor !== persisted) await save(anchor);
-  anchor = await notify(anchor);
+  const sameRow = anchor.rowId === task.id;
+  const retimedByMain = sameRow && anchor.hostRetryRowId !== task.id && task.processAfter !== anchor.appliedAt;
+  if (retimedByMain || task.recurrence !== anchor.recurrence) {
+    const edited = sight(session, task, timeline, {
+      fixed: anchor.fixed,
+      createdAt: iso(Date.now()),
+      armedByCron: task.recurrence !== null && !retimedByMain,
+      previous: anchor,
+    });
+    if (!edited) return undefined;
+    anchor = edited;
+  } else if (!sameRow) {
+    anchor = { ...anchor, rowId: task.id, hostRetryRowId: null, wall: anchor.recurrence === null ? anchor.wall : null };
+  }
+  if (anchor !== held) await save(anchor);
   return anchor;
 }
 
 async function upkeep(session: Session, task: TaskRecord, timeline: Timeline, evidence: RunEvidence): Promise<void> {
-  if (task.status !== 'pending' || task.processAfter === null || isHostTimedSeries(seriesKey(task)) || evidence.claimed)
+  if (
+    task.status !== 'pending' ||
+    task.processAfter === null ||
+    HOST_TIMED_SERIES.test(seriesKey(task)) ||
+    evidence.claimed
+  )
     return;
   const anchor = await observeAnchor(session, task, timeline, evidence.lastRun);
-  if (!anchor) return;
-  if (anchor.hostRetryRowId === task.id || Date.parse(task.processAfter) <= Date.now()) return;
+  if (!anchor || anchor.hostRetryRowId === task.id || Date.parse(task.processAfter) <= Date.now()) return;
   const moment = retimeAnchor(anchor, timeline, Date.now());
   if (
     !moment ||
@@ -342,72 +329,69 @@ async function upkeep(session: Session, task: TaskRecord, timeline: Timeline, ev
       await save({ ...anchor, appliedAt: task.processAfter, appliedZone: moment.zone });
     return;
   }
-  await apply(session, task, anchor, moment);
+  await apply(session, task, anchor, moment, anchor.appliedAt === task.processAfter);
 }
 
-async function recoverReceipts(session: Session, records: readonly InboundRecord[]): Promise<void> {
-  const rows = new Map(records.map((row) => [row.id, row]));
+/** Retries unsent notices, and forgets an anchor once its series has nothing left to run or report. */
+async function settleAnchors(session: Session, records: readonly InboundRecord[]): Promise<void> {
+  const live = new Set(
+    records
+      .filter(
+        (row) =>
+          row.kind === 'task' && (row.status === 'pending' || row.status === 'paused' || row.recurrence !== null),
+      )
+      .map((row) => row.seriesId ?? row.id),
+  );
   const saved = await getDb().all<{ anchor: string }>(
     'SELECT anchor FROM gws_ea_time_anchors WHERE session_id=?',
     session.id,
   );
   for (const entry of saved) {
-    let anchor = JSON.parse(entry.anchor) as TimeAnchor;
-    if (anchor.change !== null && rows.get(anchor.rowId)?.processAfter === anchor.change.newAt) {
-      anchor = {
-        ...anchor,
-        appliedAt: anchor.change.newAt,
-        appliedZone: anchor.change.newZone,
-        notices: [...anchor.notices, anchor.change],
-        change: null,
-      };
-      await save(anchor);
-    }
-    if (anchor.notices.length > 0) await notify(anchor);
+    const anchor = await notify(JSON.parse(entry.anchor) as TimeAnchor);
+    if (anchor.notices.length === 0 && !live.has(anchor.seriesId))
+      await getDb().run(
+        'DELETE FROM gws_ea_time_anchors WHERE session_id=? AND series_id=?',
+        session.id,
+        anchor.seriesId,
+      );
   }
 }
 
 /** The caller serializes this isolated loop step with matter slot writes. */
 export async function anchorPendingTasks(timeline: Timeline): Promise<void> {
   for (const session of await mainConversations()) {
-    const snapshot = await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) => {
-      const records = mailbox.getInboundRecords();
-      return {
-        records,
-        tasks: mailbox.listLiveTasks(),
-        claimed: new Set(
-          [...mailbox.getProcessingClaims(), ...mailbox.getTerminalProcessingAcks()].map((ack) => ack.messageId),
-        ),
-        runs: latestRuns(records),
-      };
-    });
+    const snapshot = await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) => ({
+      records: mailbox.getInboundRecords(),
+      tasks: mailbox.listLiveTasks(),
+      claimed: new Set(
+        [...mailbox.getProcessingClaims(), ...mailbox.getTerminalProcessingAcks()].map((ack) => ack.messageId),
+      ),
+    }));
     if (!snapshot) continue;
-    await recoverReceipts(session, snapshot.records);
+    const runs = latestRuns(snapshot.records);
     for (const task of snapshot.tasks)
       await upkeep(session, task, timeline, {
         claimed: snapshot.claimed.has(task.id),
-        lastRun: snapshot.runs.get(seriesKey(task)) ?? null,
+        lastRun: runs.get(seriesKey(task)) ?? null,
       });
+    await settleAnchors(session, snapshot.records);
   }
 }
 
 /** Preview only: a whereabouts command never moves a task or wakes a model. */
-export async function pendingLocalItems(_timeline: Timeline): Promise<PendingClockItem[]> {
+export async function pendingLocalItems(span: ClockSpan): Promise<PendingClockItem[]> {
   const result: PendingClockItem[] = [];
   for (const session of await mainConversations()) {
     const tasks = await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) =>
       mailbox.listLiveTasks(),
     );
     for (const task of tasks ?? []) {
-      if (task.status !== 'pending' || !task.processAfter || isHostTimedSeries(seriesKey(task))) continue;
+      if (task.status !== 'pending' || !task.processAfter || HOST_TIMED_SERIES.test(seriesKey(task))) continue;
+      const at = Date.parse(task.processAfter);
+      if (at < span.start || (span.end !== null && at >= span.end)) continue;
       const anchor = await getTimeAnchor(session.id, seriesKey(task));
-      const clock = parseTaskContent(task.content).clock;
-      if (anchor?.fixed || (!anchor && !clock)) continue;
-      result.push({
-        task: seriesKey(task),
-        at: task.processAfter,
-        zone: anchor?.appliedZone ?? clock?.zone ?? 'zone unknown',
-      });
+      if (!anchor || anchor.fixed) continue;
+      result.push({ task: seriesKey(task), at: task.processAfter, zone: anchor.appliedZone });
     }
   }
   return result;
@@ -421,19 +405,18 @@ export async function setTaskClock(
   for (const session of await mainConversations()) {
     const task = await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) => mailbox.getTask(id));
     if (!task?.processAfter || (task.status !== 'pending' && task.status !== 'paused')) continue;
-    if (isHostTimedSeries(seriesKey(task))) throw new Error('The host keeps the close and morning clock');
+    if (HOST_TIMED_SERIES.test(seriesKey(task))) throw new Error('The host keeps the close and morning clock');
     const lastRun = await withExistingMailboxSession(
       session.agent_group_id,
       session.id,
       (mailbox) => latestRuns(mailbox.getInboundRecords()).get(seriesKey(task)) ?? null,
     );
     const observed = await observeAnchor(session, task, timeline, lastRun ?? null);
-    if (!observed)
-      throw new Error('This task’s clock is unknown; update its scheduled moment before choosing local or fixed');
+    if (!observed) throw new Error('The zone in effect at this task’s time is unknown; record the stay’s zone first');
     let anchor = { ...observed, fixed };
     await save(anchor);
     const moment = retimeAnchor(anchor, timeline, Date.now());
-    if (moment) anchor = await apply(session, task, anchor, moment);
+    if (moment && moment.at !== task.processAfter) anchor = await apply(session, task, anchor, moment, true);
     return { task: seriesKey(task), fixed, at: anchor.appliedAt };
   }
   throw new Error(`No pending task ${JSON.stringify(id)} in main's conversations`);

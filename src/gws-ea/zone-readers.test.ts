@@ -35,10 +35,6 @@ function allowed(file: string, node: ts.Node, name: string): boolean {
   if (file === 'gws-ea-manual/front-page.ts') return name === 'principal_timezone';
   if (file === 'gws-ea-external-email/index.ts') return inSpawnSection(node, 'gws-ea-external-email:principal');
   if (file === 'gws-ea-chat-agents/index.ts') return inSpawnSection(node, 'gws-ea-chat-agents:principal');
-  if (file === 'gws-ea-matters/sync.ts' && name === 'resolveGroupTimezone') {
-    for (let parent: ts.Node | undefined = node.parent; parent; parent = parent.parent)
-      if (ts.isFunctionDeclaration(parent) && parent.name?.text === 'keepSync') return true;
-  }
   return false;
 }
 
@@ -63,12 +59,17 @@ it('keeps dated fork readers off the durable home clock', () => {
         name = node.argumentExpression.text;
       if (ts.isBindingElement(node) && (node.propertyName ?? node.name).getText(source) === 'principal_timezone')
         name = 'principal_timezone';
-      if (
-        ts.isCallExpression(node) &&
-        ts.isIdentifier(node.expression) &&
-        ['resolveGroupTimezone', 'principalTimezone', 'principalNameAndTimezone'].includes(node.expression.text)
-      )
-        name = node.expression.text;
+      if (ts.isCallExpression(node) && ts.isIdentifier(node.expression)) {
+        const callee = node.expression.text;
+        // Another group, such as a chat's, keeps its own configured zone.
+        const mainGroup = /main/iu.test(node.arguments[0]?.getText(source) ?? '');
+        if (
+          callee === 'principalTimezone' ||
+          callee === 'principalNameAndTimezone' ||
+          (callee === 'resolveGroupTimezone' && mainGroup)
+        )
+          name = callee;
+      }
       if (name && !allowed(relative, node, name)) {
         const { line } = source.getLineAndCharacterOfPosition(node.getStart(source));
         violations.push(`${relative}:${line + 1}: ${name}`);

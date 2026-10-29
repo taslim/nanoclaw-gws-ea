@@ -806,13 +806,13 @@ describe('recorded divergence: request-addressed conversation reminders', () => 
     });
     const manager = await import('../session-manager.js');
     const { session } = await manager.resolveSession('reminder-agent', 'reminder-chat', null, 'shared');
-    const { createScheduledTask, prepareScheduledTask } = await import('../modules/scheduling/create.js');
-    const task = prepareScheduledTask({
+    const { createScheduledTask } = await import('../modules/scheduling/create.js');
+    const task = {
       prompt: 'Remind the group to choose a cabin.',
       recurrence: null,
       script: null,
       processAfter: new Date(Date.now() + 60_000).toISOString(),
-    });
+    };
     const first = await createScheduledTask('reminder-agent', task, { session, id: 'chat-reminder-request-1' });
     const replay = await createScheduledTask('reminder-agent', task, { session, id: 'chat-reminder-request-1' });
     expect(first.row.id).toBe('chat-reminder-request-1');
@@ -2339,35 +2339,5 @@ describe('recorded divergence: the PreCompact hook composes the mailbox it reads
     expect(compaction).toContain('await mailbox.start(await readMailboxContext());');
     expect(compaction).toContain('await mailbox.run(() => ({');
     expect(compaction).toContain('await mailbox.stop();');
-  });
-});
-
-describe('recorded divergence: native tasks retain the clock their moment was written on', () => {
-  it('persists written offsets and keeps their intent when the host retimes an occurrence', async () => {
-    const { db } = await migratedInstall();
-    await import('../mailbox/compose.js');
-    const group = agentGroup('ag-clock-intent');
-    await db.createAgentGroup(group);
-    const { ensureContainerConfig } = await import('../db/container-configs.js');
-    await ensureContainerConfig(group.id);
-    const { createScheduledTask, prepareScheduledTask } = await import('../modules/scheduling/create.js');
-    const { parseTaskContent } = await import('../modules/scheduling/task-content.js');
-    const { withExistingMailboxSession } = await import('../session-manager.js');
-    const prepared = prepareScheduledTask({
-      prompt: 'Synthetic check-in',
-      processAfter: '2999-01-01T09:00:00+01:00',
-      timezone: 'America/Los_Angeles',
-    });
-    const { session, row } = await createScheduledTask(group.id, prepared);
-    expect(parseTaskContent(row.content).clock).toEqual({ instant: '2999-01-01T08:00:00.000Z', zone: '+01:00' });
-    const changed = await withExistingMailboxSession(group.id, session.id, (mailbox) => {
-      mailbox.updateTask(row.id, { processAfter: '2999-01-01T17:00:00Z' });
-      return mailbox.getTask(row.id);
-    });
-    expect(changed?.processAfter).toBe('2999-01-01T17:00:00.000Z');
-    expect(parseTaskContent(changed?.content ?? '').clock).toEqual({
-      instant: '2999-01-01T08:00:00.000Z',
-      zone: '+01:00',
-    });
   });
 });
