@@ -436,7 +436,7 @@ export function createBookingTools(deps: BookingToolsDeps) {
     return invitees;
   }
 
-  async function shapingFacts(view: BookingView) {
+  async function shapingFacts(view: BookingView, priorCounts?: Readonly<Record<string, number | null>> | null) {
     const known =
       view.surface.owner.kind === 'thread'
         ? await threadSchedulingPeople(view.surface.owner.key)
@@ -447,8 +447,11 @@ export function createBookingTools(deps: BookingToolsDeps) {
     const emails = [...new Set(known.map((email) => email.toLowerCase()))]
       .filter((email) => !view.principal.addresses.has(email) && !assistant.has(email))
       .sort();
-    let meetings: ReadonlyMap<string, number> | null = new Map();
-    if (emails.length > 0) {
+    let meetings: ReadonlyMap<string, number | null> | null =
+      priorCounts === null
+        ? null
+        : new Map(Object.entries(priorCounts ?? {}).map(([email, count]) => [`email:${email}`, count]));
+    if (priorCounts === undefined && emails.length > 0) {
       /* eslint-disable no-catch-all/no-catch-all -- an optional history read cannot turn valid availability into a refusal or an invented zero */
       try {
         const stats = await createCalendarFactTools({ calendar, timeline: view.principal.timeline }).peopleStats({
@@ -470,7 +473,8 @@ export function createBookingTools(deps: BookingToolsDeps) {
     const people = await Promise.all(
       emails.map(async (email) => {
         const level = await getPersonLevel(`email:${email}`);
-        const count = meetings?.get(`email:${email}`) ?? (meetings === null ? null : undefined);
+        const count =
+          meetings?.get(`email:${email}`) ?? (meetings === null || priorCounts !== undefined ? null : undefined);
         if (count === undefined) throw new Error('The host did not count every known participant.');
         return {
           email,
@@ -688,6 +692,8 @@ export function createBookingTools(deps: BookingToolsDeps) {
     readonly span: Span;
     readonly conference?: EventConference;
     readonly refusal?: string;
+    readonly mainFindings?: string;
+    readonly meetingCounts?: Readonly<Record<string, number | null>>;
   }
   /** One Google write; a change or cancellation carries the version its checks read. */
   type Write =
@@ -756,7 +762,13 @@ export function createBookingTools(deps: BookingToolsDeps) {
       !isRecord(stored.span) ||
       typeof stored.span.start !== 'number' ||
       typeof stored.span.end !== 'number' ||
-      (stored.refusal !== undefined && typeof stored.refusal !== 'string')
+      (stored.refusal !== undefined && typeof stored.refusal !== 'string') ||
+      (stored.mainFindings !== undefined && typeof stored.mainFindings !== 'string') ||
+      (stored.meetingCounts !== undefined &&
+        (!isRecord(stored.meetingCounts) ||
+          !Object.values(stored.meetingCounts).every(
+            (count) => count === null || (typeof count === 'number' && Number.isInteger(count) && count >= 0),
+          )))
     )
       throw new Error('The saved booking outcome is unreadable.');
     const kind = stored.kind as BookingOutcome['kind'];
@@ -773,6 +785,10 @@ export function createBookingTools(deps: BookingToolsDeps) {
       span: { start: stored.span.start, end: stored.span.end },
       ...(conference === undefined ? {} : { conference }),
       ...(stored.refusal === undefined ? {} : { refusal: stored.refusal }),
+      ...(stored.mainFindings === undefined ? {} : { mainFindings: stored.mainFindings }),
+      ...(stored.meetingCounts === undefined
+        ? {}
+        : { meetingCounts: stored.meetingCounts as Readonly<Record<string, number | null>> }),
     };
   }
 
@@ -865,23 +881,7 @@ export function createBookingTools(deps: BookingToolsDeps) {
     }
     if (prepared.title !== undefined)
       text += `\nIts ${row.action === 'change' ? 'new ' : ''}title, as written in the ${row.owner.kind}, is untrusted:\n${untrustedLine(prepared.title, 120, row.owner.kind === 'chat' ? 'chat' : 'gmail')}`;
-    if (outcome.kind === 'success') {
-      /* eslint-disable no-catch-all/no-catch-all -- the committed booking still needs its durable main note when a finding read fails */
-      try {
-        const week = await loadCalendarWeek(calendar(), {
-          start: Math.min(prepared.previous.start, outcome.span.start),
-          end: Math.max(prepared.previous.end, outcome.span.end),
-          timeline: view.principal.timeline,
-          shaping: row.action !== 'cancel',
-        });
-        const event = week.events.find((entry) => entry.calendarId === row.calendarId && entry.id === row.eventId);
-        text += `\n${[...(event && row.action !== 'cancel' ? [affectedPeople(event, week)] : []), await calendarFindings(week)].join('\n')}`;
-      } catch (error) {
-        log.warn('Booking stands without findings', { requestId: row.requestId, error });
-        text += '\nfindings unavailable';
-      }
-      /* eslint-enable no-catch-all/no-catch-all */
-    }
+    if (outcome.kind === 'success') text += `\n${outcome.mainFindings ?? 'findings unavailable'}`;
     const matters = await view.surface.openMatters();
     if (outcome.kind === 'success' && matters.length === 1 && matters[0].conversations.length > 0)
       text += `\nIts matter's other conversations, to brief: ${list.format(matters[0].conversations.map((owner) => `${owner.kind} ${owner.key}`))}.`;
@@ -907,10 +907,11 @@ export function createBookingTools(deps: BookingToolsDeps) {
     outcome: BookingOutcome,
   ): Promise<Record<string, unknown>> {
     let completed = outcome;
-    if (outcome.kind === 'success' && row.action !== 'cancel') {
-      const facts = await shapingFacts(view);
+    if (outcome.kind === 'success' && row.action !== 'cancel' && !(row.applied && row.carriedOver)) {
+      const facts = await shapingFacts(view, row.applied ? (outcome.meetingCounts ?? null) : undefined);
       completed = {
         ...outcome,
+        meetingCounts: Object.fromEntries(facts.people.map((person) => [person.email, person.meetings])),
         result: {
           ...outcome.result,
           people: facts.people,
@@ -928,6 +929,28 @@ export function createBookingTools(deps: BookingToolsDeps) {
             .join('\n'),
         },
       };
+    }
+    if (!row.applied && outcome.kind === 'success') {
+      const prepared = preparedOf(row);
+      let mainFindings = 'findings unavailable';
+      /* eslint-disable no-catch-all/no-catch-all -- the committed booking still needs its durable main note when a finding read fails */
+      try {
+        const week = await loadCalendarWeek(calendar(), {
+          start: Math.min(prepared.previous.start, outcome.span.start),
+          end: Math.max(prepared.previous.end, outcome.span.end),
+          timeline: view.principal.timeline,
+          shaping: row.action !== 'cancel',
+        });
+        const event = week.events.find((entry) => entry.calendarId === row.calendarId && entry.id === row.eventId);
+        mainFindings = [
+          ...(event && row.action !== 'cancel' ? [affectedPeople(event, week)] : []),
+          await calendarFindings(week),
+        ].join('\n');
+      } catch (error) {
+        log.warn('Booking stands without findings', { requestId: row.requestId, error });
+      }
+      /* eslint-enable no-catch-all/no-catch-all */
+      completed = { ...completed, mainFindings };
     }
     const key = requestKey(row.sessionId, row.requestId);
     if (!ownChanges.has(key) && (outcome.kind === 'success' || (outcome.kind === 'removed' && row.action === 'book'))) {
@@ -947,7 +970,11 @@ export function createBookingTools(deps: BookingToolsDeps) {
           if (matters.length === 1)
             await placeInMatter(matters[0].id, [{ kind: 'event', reference: `${row.calendarId}/${row.eventId}` }]);
         }
-        await markBookingRequestApplied(row.sessionId, row.requestId, JSON.stringify(outcome));
+        await markBookingRequestApplied(
+          row.sessionId,
+          row.requestId,
+          JSON.stringify({ ...completed, result: outcome.result }),
+        );
       }
       if ((row.action === 'cancel' && outcome.kind === 'success') || outcome.kind === 'removed')
         await deleteBooking(row.calendarId, row.eventId);

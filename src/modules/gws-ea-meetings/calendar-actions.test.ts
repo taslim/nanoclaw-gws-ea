@@ -26,6 +26,7 @@ vi.mock('../gws-ea-workspace/probe.js', async (importOriginal) => ({
 
 import { closeDb, initTestDb, runMigrations } from '../../db/index.js';
 import '../gws-ea-profile/index.js';
+import '../gws-ea-whereabouts/index.js';
 import { addPrincipalAddress } from '../gws-ea-profile/db.js';
 import '../gws-ea-privacy/index.js';
 import { findWeekdayMismatch } from '../gws-ea-dates/weekday-check.js';
