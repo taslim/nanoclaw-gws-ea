@@ -65,8 +65,8 @@ import { closeDb, getDb, initTestDb, runMigrations } from '../../db/index.js';
 import { inboundDbPath } from '../../mailbox/sqlite/paths.js';
 import { formatLocalTime } from '../../timezone.js';
 import '../gws-ea-inbox/index.js';
-import { flushPendingCalendarChanges } from '../gws-ea-inbox/calendar-notifications.js';
 import { CALENDAR_SETTLE_MS } from '../gws-ea-meetings/week/pending-changes.js';
+import { flushPendingCalendarChanges } from '../gws-ea-meetings/week/refresh.js';
 import '../gws-ea-preferences/index.js';
 import { writeCalendarNote } from '../gws-ea-inbox/route-mail.js';
 import { FakeGmailThreads } from '../gws-ea-inbox/testing/fake-gmail-threads.js';
@@ -162,9 +162,9 @@ async function onlyNote(): Promise<string> {
 
 async function settleCalendarNotes(expected: number): Promise<void> {
   expect(await notes()).toEqual([]);
-  expect(await flushPendingCalendarChanges(new Date(NOW))).toBe(0);
+  expect(await flushPendingCalendarChanges(calendar, new Date(NOW))).toBe(0);
   vi.setSystemTime(new Date(Date.parse(NOW) + CALENDAR_SETTLE_MS));
-  expect(await flushPendingCalendarChanges(new Date())).toBe(expected);
+  expect(await flushPendingCalendarChanges(calendar, new Date())).toBe(expected);
 }
 
 function times(text: string, part: string): number {
@@ -393,7 +393,7 @@ describe('a note about pieces in no open matter', () => {
       `Google Calendar reports a change:\n${calendarNoticeLine(INVITATION, 'created')}\nfindings unavailable`,
     );
     expect(await getDb().all('SELECT message_id FROM gws_ea_pending_calendar_changes')).toEqual([]);
-    expect(await flushPendingCalendarChanges(new Date())).toBe(0);
+    expect(await flushPendingCalendarChanges(calendar, new Date())).toBe(0);
     expect(await notes()).toHaveLength(1);
   });
 });
