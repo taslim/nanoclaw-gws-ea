@@ -20,6 +20,7 @@ import {
   makeTaskId,
   MAX_DAILY_FIRES,
   parseProcessAfter,
+  scheduledTaskClock,
   prepareScheduledTask,
   type ScheduledTaskRow,
   validateRecurrence,
@@ -364,19 +365,26 @@ async function updateTaskCommand(args: Record<string, unknown>, ctx: CallerConte
   // recurrence-limit check.
   let ownerGroup: string | undefined;
   let currentScript: string | null = null;
+  let currentAt: string | null = null;
   if (args.process_after !== undefined || recurrence !== undefined) {
     for (const session of await selectedSessions(args, ctx)) {
       const row = await withInbound(session, (db) => selectTask(db, id));
       if (row) {
         ownerGroup = session.agent_group_id;
         currentScript = parseTaskContent(row.content).script;
+        currentAt = row.processAfter;
         break;
       }
     }
   }
   const tz = ownerGroup ? await resolveGroupTimezone(ownerGroup) : TIMEZONE;
 
-  if (args.process_after !== undefined) update.processAfter = parseProcessAfter(args.process_after, tz);
+  if (args.process_after !== undefined) {
+    update.processAfter = parseProcessAfter(args.process_after, tz);
+    update.clock = scheduledTaskClock(args.process_after, tz, update.processAfter);
+  } else if (recurrence !== undefined && currentAt !== null) {
+    update.clock = scheduledTaskClock(undefined, tz, currentAt);
+  }
   if (recurrence !== undefined) {
     validateRecurrence(recurrence, tz);
     // Effective script AFTER this update: the new value when provided

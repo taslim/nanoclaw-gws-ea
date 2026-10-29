@@ -15,6 +15,7 @@ import type Database from 'better-sqlite3';
 import { nextEvenSeq } from './session-db.js';
 import { createTaskInboundRecord } from '../model.js';
 import type { TaskWrite } from '../model.js';
+import type { TaskUpdate } from '../types.js';
 
 /**
  * Insert one pending task occurrence. `seriesId` is the series join key — equal
@@ -78,13 +79,6 @@ export function deleteTask(db: Database.Database, taskId: string): number {
     .changes;
 }
 
-export interface TaskUpdate {
-  prompt?: string;
-  script?: string | null;
-  recurrence?: string | null;
-  processAfter?: string;
-}
-
 // Merges content JSON in-place so callers can update prompt/script without
 // clobbering other fields. Matches by id OR series_id so the live next
 // occurrence of a recurring task is updated, not just the completed row the
@@ -105,13 +99,14 @@ export function updateTask(db: Database.Database, taskId: string, update: TaskUp
 
   const setProcessAfter = update.processAfter !== undefined;
   const setRecurrence = update.recurrence !== undefined;
-  const mergeContent = update.prompt !== undefined || update.script !== undefined;
+  const mergeContent = update.prompt !== undefined || update.script !== undefined || update.clock !== undefined;
 
   const tx = db.transaction(() => {
     for (const row of rows) {
       let content = row.content;
       if (mergeContent) {
         const parsed = JSON.parse(row.content) as Record<string, unknown>;
+        if (update.clock !== undefined) parsed.clock = update.clock;
         if (update.prompt !== undefined) parsed.prompt = update.prompt;
         if (update.script !== undefined) parsed.script = update.script;
         content = JSON.stringify(parsed);

@@ -40,6 +40,7 @@ export type {
   SessionRouting,
   Task,
   TaskRecord,
+  TaskClock,
   TaskStats,
   TaskUpdate,
   WaitingMessage,
