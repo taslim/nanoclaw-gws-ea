@@ -5,13 +5,13 @@ import type {
   PreToolUseHookInput,
   SyncHookJSONOutput,
 } from '../../../container/agent-runner/node_modules/@anthropic-ai/claude-agent-sdk/sdk.js';
+import { planningAgentsEnabled } from '../../../container/agent-runner/src/config.js';
 import { createPlanningRuntime, PLANNING_AGENTS } from '../../../container/agent-runner/src/planning-agents.js';
 import { createPreToolUseHook } from '../../../container/agent-runner/src/providers/claude.js';
 import { resolveClaudeCapabilityPolicy } from '../../../container/agent-runner/src/providers/claude-config.js';
 import { recordEffect } from './state.js';
 import { syntheticShellCommand } from './sandbox.js';
-import { webEgressRefusal } from './web-egress.js';
-import type { PlannerPolicy, ScenarioCase, ScenarioComposition } from '../types.js';
+import type { PlannerPolicy, ScenarioComposition } from '../types.js';
 
 const READ_PAIRS = [
   'whereabouts get',
@@ -55,18 +55,12 @@ export function nativeScenarioHooks(
   directory: string,
   tree: string,
   evidence: string,
-  scenario: ScenarioCase,
   composition: ScenarioComposition,
   shellProfile: string,
 ) {
   const agent = fs.realpathSync(path.join(directory, 'agent'));
-  if (
-    composition.fixturePlanning &&
-    (composition.audience !== 'main' || composition.moduleEnvironment.GWS_EA_PLANNING_AGENTS !== '1')
-  )
-    throw new Error('The native main planning-agent configuration is required for planner-limits.');
   const fixture = path.join(directory, 'fixture.json');
-  const planning = composition.fixturePlanning ? createPlanningRuntime(agent) : undefined;
+  const planning = planningAgentsEnabled(new Set(composition.capabilities)) ? createPlanningRuntime(agent) : undefined;
   const production = createPreToolUseHook(resolveClaudeCapabilityPolicy(new Set(composition.capabilities)), planning);
   const policies: PlannerPolicy[] = [];
   const admitted = new Map<string, PreToolUseHookInput>();
@@ -128,19 +122,7 @@ export function nativeScenarioHooks(
       );
       return native;
     }
-    if (['WebSearch', 'WebFetch'].includes(input.tool_name)) {
-      reason = webEgressRefusal(scenario, input.tool_name, args);
-      fs.appendFileSync(
-        path.join(evidence, 'web-reads.jsonl'),
-        JSON.stringify({
-          stage: 'request',
-          tool: input.tool_name,
-          args,
-          allowed: !reason,
-          at: new Date().toISOString(),
-        }) + '\n',
-      );
-    } else if (input.tool_name === 'Bash') {
+    if (input.tool_name === 'Bash') {
       updated = {
         ...updated,
         command: syntheticShellCommand(shellProfile, typeof updated.command === 'string' ? updated.command : '', tree),
@@ -157,9 +139,7 @@ export function nativeScenarioHooks(
     } else if (input.tool_name === 'Skill') {
       if (typeof args.skill !== 'string' || !composition.skills.includes(args.skill))
         reason = 'Outside the release skill mount.';
-    } else if (['Agent', 'Task'].includes(input.tool_name) && !planning)
-      reason = 'Native planning is unavailable in this scenario.';
-    else if (
+    } else if (
       !input.tool_name.startsWith('mcp__nanoclaw__') &&
       ![
         'Agent',
@@ -201,19 +181,9 @@ export function nativeScenarioHooks(
     const input = admitted.get(callKey(original)) ?? translated({ ...original, hook_event_name: 'PreToolUse' });
     admitted.delete(callKey(original));
     const args = input.tool_input as Record<string, unknown>;
-    if (['WebSearch', 'WebFetch'].includes(input.tool_name))
-      fs.appendFileSync(
-        path.join(evidence, 'web-reads.jsonl'),
-        JSON.stringify({
-          stage: 'result',
-          tool: input.tool_name,
-          args,
-          result: original.tool_response,
-          at: new Date().toISOString(),
-        }) + '\n',
-      );
-    if (input.agent_id) {
-      const role = input.agent_type;
+    const role = input.agent_type;
+    // Other subagents work with main's own tools; only the planning roles have limits to score.
+    if (input.agent_id && (role === 'look-back' || role === 'look-ahead')) {
       const command =
         typeof args.command === 'string'
           ? (args.command.match(/^'ncl' '([^']+)'(?: '([^']+)')?/u) ?? args.command.match(/^ncl\s+(\S+)(?:\s+(\S+))?/u))
@@ -230,7 +200,7 @@ export function nativeScenarioHooks(
             : {}),
           agentId: input.agent_id,
         },
-        actor: role === 'look-back' || role === 'look-ahead' ? role : 'unattributed-planner',
+        actor: role,
       });
     }
     return {};

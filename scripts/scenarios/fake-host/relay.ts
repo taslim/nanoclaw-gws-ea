@@ -4,23 +4,7 @@ import http from 'node:http';
 import path from 'node:path';
 
 /** Records synthetic inference bodies and raw response events, never credentials. */
-export async function startRequestRecorder(
-  directory: string,
-  scriptedEndpoint?: string,
-): Promise<{ url: string; close: () => Promise<void> }> {
-  const upstreamRoot = scriptedEndpoint ? new URL(scriptedEndpoint) : new URL('https://api.anthropic.com');
-  if (
-    scriptedEndpoint &&
-    (upstreamRoot.protocol !== 'http:' ||
-      upstreamRoot.hostname !== '127.0.0.1' ||
-      !upstreamRoot.port ||
-      upstreamRoot.pathname !== '/' ||
-      upstreamRoot.username ||
-      upstreamRoot.password ||
-      upstreamRoot.search ||
-      upstreamRoot.hash)
-  )
-    throw new Error('A scripted scenario API must be an exact loopback HTTP origin.');
+export async function startRequestRecorder(directory: string): Promise<{ url: string; close: () => Promise<void> }> {
   fs.mkdirSync(directory, { recursive: true });
   let sequence = 0;
   const handle = async (incoming: http.IncomingMessage, outgoing: http.ServerResponse): Promise<void> => {
@@ -52,12 +36,11 @@ export async function startRequestRecorder(
       if (!outgoing.writableEnded) controller.abort();
     });
     try {
-      const upstream = await fetch(`${upstreamRoot.origin}${incoming.url}`, {
+      const upstream = await fetch(`https://api.anthropic.com${incoming.url}`, {
         method: incoming.method,
         headers,
         body,
         signal: controller.signal,
-        ...(scriptedEndpoint ? { redirect: 'error' as const } : {}),
       });
       outgoing.writeHead(upstream.status, {
         'content-type': upstream.headers.get('content-type') ?? 'application/json',

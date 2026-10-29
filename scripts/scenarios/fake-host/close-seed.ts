@@ -2,22 +2,15 @@ import { getDb } from '../../../src/db/connection.js';
 import { resolveSystemSession } from '../../../src/session-manager.js';
 import { createScheduledTask, prepareScheduledTask } from '../../../src/modules/scheduling/create.js';
 import { CLOSE_PROMPT, nextClosePlacement } from '../../../src/modules/gws-ea-matters/sync.js';
-import {
-  beginCloseRun,
-  recordCloseLedger,
-  completeCloseRun,
-  failCloseRun,
-} from '../../../src/modules/gws-ea-matters/close-runs.js';
 import { loadTimeline } from '../../../src/modules/gws-ea-whereabouts/timeline.js';
 import { sundayOnOrBefore } from '../../../src/modules/gws-ea-matters/moments.js';
 import { openMatterWithLook } from '../../../src/modules/gws-ea-matters/looks.js';
-import { beginCalendarWrite, markCalendarWriteApplied } from '../../../src/modules/gws-ea-meetings/week/write-log.js';
 import type { Session } from '../../../src/types.js';
 import type { ScenarioComposition } from '../types.js';
-import { readState, SYNTHETIC_IDENTITY } from './state.js';
+import { readState } from './state.js';
 import { closeDates, CLOSE_ZONE } from './close-dates.js';
 
-/** Due occurrences and historical receipts are invented persisted facts; the runtime clock stays real. */
+/** The due occurrence is an invented persisted fact; the runtime clock stays real. */
 export async function seedCloseScenario(
   file: string,
   main: Session,
@@ -36,56 +29,6 @@ export async function seedCloseScenario(
   const id = `gws-ea-close-synthetic-${fixture.scenario.id}`;
   const { session } = await resolveSystemSession(main.agent_group_id, `system:gws-ea-close:${id}`);
   const scheduledAt = new Date(moment.at).toISOString();
-  const completedId = `synthetic-completed-${fixture.scenario.id}`;
-  const completedThrough = new Date(moment.at - 2 * 86_400_000).toISOString();
-  await beginCloseRun({
-    id: completedId,
-    sessionId: 'synthetic-history-completed',
-    taskId: completedId,
-    startedAt: completedThrough,
-  });
-  await recordCloseLedger(completedId, 'synthetic-history-completed', {
-    from: null,
-    through: completedThrough,
-    writes: [],
-  });
-  await completeCloseRun(completedId, 'synthetic-history-completed', completedThrough);
-  const historicalWriteAt = new Date(moment.at - 86_400_000 - 60_000).toISOString();
-  if (fixture.scenario.id === 'sunday-stale-matter') {
-    const start = dates.at(dates.tomorrow, 19);
-    await beginCalendarWrite({
-      requestId: 'synthetic-close-applied-write',
-      calendarId: SYNTHETIC_IDENTITY.principalEmail,
-      eventId: 'synthetic-stale-proposal-review',
-      action: 'create_event',
-      request: { title: 'Earlier provisional proposal review' },
-      before: null,
-      affectedStart: start,
-      affectedEnd: dates.at(dates.tomorrow, 19, 25),
-    });
-    await markCalendarWriteApplied('synthetic-close-applied-write', 'The earlier provisional review was created.');
-    await getDb().run(
-      'UPDATE gws_ea_calendar_write_log SET updated_at=? WHERE request_id=?',
-      historicalWriteAt,
-      'synthetic-close-applied-write',
-    );
-  }
-  const failedId = `synthetic-failed-${fixture.scenario.id}`;
-  await beginCloseRun({
-    id: failedId,
-    sessionId: 'synthetic-history-failed',
-    taskId: failedId,
-    startedAt: new Date(moment.at - 86_400_000).toISOString(),
-  });
-  await recordCloseLedger(failedId, 'synthetic-history-failed', {
-    from: completedThrough,
-    through: new Date(moment.at - 43_200_000).toISOString(),
-    writes:
-      fixture.scenario.id === 'sunday-stale-matter'
-        ? [{ requestId: 'synthetic-close-applied-write', updatedAt: historicalWriteAt }]
-        : [],
-  });
-  await failCloseRun(failedId, new Date(moment.at - 43_200_000 + 60_000).toISOString());
   await getDb().run(
     'INSERT INTO gws_ea_close_schedule(id,session_id,scheduled_at,zone,timeline_version,weekly_day) VALUES(?,?,?,?,?,?)',
     id,
@@ -102,7 +45,6 @@ export async function seedCloseScenario(
     processAfter: scheduledAt,
     timezone: moment.zone,
   });
-  prepared.clock = { instant: scheduledAt, zone: moment.zone };
   const task = await createScheduledTask(main.agent_group_id, prepared, { session, id });
   let matterId: string | undefined;
   if (fixture.scenario.id === 'sunday-stale-matter') {
@@ -146,7 +88,6 @@ export async function seedCloseScenario(
         today: dates.today,
         tomorrow: dates.tomorrow,
         due: dates.due,
-        completedThrough,
         ...(matterId ? { matterId } : {}),
       },
     },

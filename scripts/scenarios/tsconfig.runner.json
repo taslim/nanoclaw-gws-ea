@@ -3,17 +3,6 @@
   "compilerOptions": {
     "types": ["node", "bun"]
   },
-  "include": [
-    "runner.ts",
-    "fake-host/native-hooks.ts",
-    "fake-host/native-path-check.ts",
-    "fake-host/mcp.ts",
-    "fake-host/compact-hook.ts",
-    "fake-host/close-process-check.ts",
-    "fake-host/route-check.ts",
-    "fake-host/report-check.ts",
-    "fake-host/time-check.ts",
-    "fake-host/week-check.ts"
-  ],
+  "include": ["runner.ts", "fake-host/native-hooks.ts", "fake-host/mcp.ts", "fake-host/compact-hook.ts"],
   "exclude": []
 }
