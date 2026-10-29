@@ -107,8 +107,9 @@ describe('renderMemorySection', () => {
     const definition = RELEASE_DEFINITION.replace(/\s+/gu, ' ');
 
     expect(definition).not.toContain('Core Memory');
-    expect(definition).toContain('the Manual');
-    expect(definition).toContain('scheduling preferences');
+    expect(definition).toContain('The index is a map for retrieval.');
+    // Every memory-keeping agent loads this definition; only main has the Manual and the lessons queue.
+    expect(definition).not.toMatch(/Manual|lessons/u);
     expect(definition).toContain('memory points to it rather than copying');
     expect(definition).toContain('the smallest useful file');
   });
@@ -127,10 +128,11 @@ describe('renderMemorySection', () => {
     expect(definition).toContain('Missing or malformed frontmatter never makes a memory unusable.');
   });
 
-  it('seeds new indexes in terms of the principal', () => {
+  it('seeds new indexes as a map, naming no store only main has', () => {
     const template = fs.readFileSync(path.join(import.meta.dir, 'templates', 'index.md'), 'utf-8');
 
-    expect(template).toMatch(/the principal/iu);
+    expect(template).toContain('Keep this index as a map to the detail in memory.');
+    expect(template).not.toContain('Manual');
     expect(template).toContain('## Map');
     expect(template).not.toContain('Core Memory');
     expect(template).not.toContain('who the user is');

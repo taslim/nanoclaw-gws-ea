@@ -14,13 +14,7 @@ retrieve better.
 at startup, on resume when memory has changed, after clear, and after
 compaction. When the index runs over, its end is cut, so keep it lean:
 headlines and pointers there, detail in linked files. The index is a map for
-retrieval. The principal's picture is in the Manual, composed from the stores
-in your project instructions. Use the stores your role gives you: priorities,
-principles and preferences beyond scheduling belong in the Manual; scheduling
-preferences belong only in their dedicated store. A taste correction becomes
-a Manual principle; an improvement to the assistant's craft goes to the lessons
-queue. Share only the part of the Manual a delegated job needs, under the
-existing disclosure rules.
+retrieval.
 
 ## Open Knowledge Format
 
