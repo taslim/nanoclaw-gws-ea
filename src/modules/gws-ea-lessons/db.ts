@@ -40,16 +40,10 @@ async function checkLesson(text: string): Promise<void> {
     );
   if (contains([profile.principal_first_name, profile.principal_last_name, profile.principal_display_name]))
     refuse('the principal’s name');
-  if (
-    contains(
-      whereabouts.places
-        .flatMap((place) => [place.label, place.locality])
-        .concat(whereabouts.stays.flatMap((stay) => stay.locality ?? [])),
-    )
-  )
+  // A label is often an ordinary word ("Home", "Office"); the locality is the private detail.
+  if (contains([...whereabouts.places, ...whereabouts.stays].map((record) => record.locality)))
     refuse('a whereabouts place');
   if (contains(people.flatMap((person) => names(person.name)))) refuse('a person’s name');
-  if (contains(people.flatMap((person) => person.identities))) refuse('a person’s contact detail');
   const address = /[\p{L}\p{N}._%+-]+\s*@\s*[\p{L}\p{N}.-]+/u;
   for (const source of [text, rendered]) {
     let visible = source.normalize('NFKC').replace(/\p{Default_Ignorable_Code_Point}/gu, '');
