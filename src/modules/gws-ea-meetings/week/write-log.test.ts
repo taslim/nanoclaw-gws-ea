@@ -5,7 +5,6 @@ import {
   beginCalendarWrite,
   markCalendarWriteApplied,
   completeCalendarWriteFindings,
-  listCalendarWriteGaps,
   getCalendarWrite,
 } from './write-log.js';
 import { recordPendingCalendarChange, settledCalendarChanges, settleCalendarChanges } from './pending-changes.js';
@@ -30,10 +29,13 @@ it('durably keeps one request and its findings gap until a successful recheck', 
   await beginCalendarWrite(write);
   await beginCalendarWrite(write);
   await markCalendarWriteApplied('req-1', 'Changed.');
-  expect(await listCalendarWriteGaps()).toMatchObject([{ requestId: 'req-1', outcome: 'Changed.' }]);
-  expect(await getCalendarWrite('req-1')).toMatchObject({ state: 'applied' });
+  expect(await getCalendarWrite('req-1')).toMatchObject({
+    state: 'applied',
+    outcome: 'Changed.',
+    findingsChecked: false,
+  });
   await completeCalendarWriteFindings('req-1');
-  expect(await listCalendarWriteGaps()).toEqual([]);
+  expect(await getCalendarWrite('req-1')).toMatchObject({ findingsChecked: true });
 });
 it('coalesces an event until its last change settles and acknowledges only the flushed version', async () => {
   const notice = { calendarId: 'morgan@ellery.example', eventId: 'dinner', change: 'changed' as const };

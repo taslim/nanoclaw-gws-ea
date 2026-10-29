@@ -1570,8 +1570,8 @@ describe('calendar outcomes and findings', () => {
     const first = data(await send(main, 'create_event', FOCUS, 'act-gap'));
     expect(first.message).toContain('Added');
     expect(first.message).toContain('findings unavailable');
-    const { listCalendarWriteGaps } = await import('./week/write-log.js');
-    expect(await listCalendarWriteGaps()).toMatchObject([{ requestId: 'act-gap', eventId: first.event }]);
+    const { getCalendarWrite } = await import('./week/write-log.js');
+    expect(await getCalendarWrite('act-gap')).toMatchObject({ eventId: first.event, findingsChecked: false });
     const inbound = new Database(inboundDbPath(main.agent_group_id, main.id));
     inbound.prepare('DELETE FROM messages_in WHERE id = ?').run('action-resp-act-gap');
     inbound.close();
@@ -2143,8 +2143,8 @@ it('logs a guest write and its findings gap without turning the successful invit
     await send(main, 'change_guests', { calendar: PRINCIPAL, event: 'teamsync01', add: [REMY] }, 'act-guests-gap'),
   );
   expect(changed.message).toContain('findings unavailable');
-  const { listCalendarWriteGaps } = await import('./week/write-log.js');
-  expect(await listCalendarWriteGaps()).toMatchObject([{ action: 'change_guests', requestId: 'act-guests-gap' }]);
+  const { getCalendarWrite } = await import('./week/write-log.js');
+  expect(await getCalendarWrite('act-guests-gap')).toMatchObject({ action: 'change_guests', findingsChecked: false });
   expect(calendar.event(PRINCIPAL, 'teamsync01')?.attendees).toEqual(
     expect.arrayContaining([{ email: REMY, responseStatus: 'needsAction' }]),
   );

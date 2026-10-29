@@ -64,7 +64,6 @@ export interface LocatedEvent extends ListedEvent {
 }
 
 export interface DetailedConference extends EventConference {
-  readonly conferenceId?: string;
   readonly entryPoints: readonly { readonly entryPointType: string; readonly uri: string; readonly label?: string }[];
 }
 
@@ -455,11 +454,7 @@ function toDetailedConference(value: unknown): DetailedConference | undefined {
     : [];
   const conference = toConference(value) ?? (entryPoints.length ? { status: 'success' as const } : undefined);
   if (!conference) return undefined;
-  return {
-    ...conference,
-    entryPoints,
-    ...(typeof value.conferenceId === 'string' ? { conferenceId: value.conferenceId } : {}),
-  };
+  return { ...conference, entryPoints };
 }
 
 function toListedEvent(value: unknown): ListedEvent {

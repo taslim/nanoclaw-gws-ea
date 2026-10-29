@@ -530,7 +530,6 @@ it('keeps telephone conference entry points on the detail route', async () => {
   expect((await api.listEventDetails('c', '2026-10-06T00:00Z', '2026-10-07T00:00Z'))[0]).toMatchObject({
     conference: {
       status: 'success',
-      conferenceId: 'call',
       entryPoints: [{ entryPointType: 'phone', uri: 'tel:+14155550100', label: 'US dial-in' }],
     },
   });
