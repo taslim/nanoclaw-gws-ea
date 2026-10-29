@@ -34,6 +34,8 @@ import { ensureContainerConfig, updateContainerConfigScalars } from '../../db/co
 import { closeDb, createAgentGroup, createMessagingGroup, getDb, initTestDb, runMigrations } from '../../db/index.js';
 import type { AgentGroup } from '../../types.js';
 import '../gws-ea-profile/index.js';
+import '../gws-ea-privacy/index.js';
+import '../gws-ea-whereabouts/index.js';
 import '../gws-ea-people/index.js';
 import { addPerson } from '../gws-ea-people/db.js';
 import '../gws-ea-inbox/index.js';
@@ -480,5 +482,65 @@ describe('GWS-EA matters ncl resource', () => {
       run('matters-open', { title: 'Acme', 'open-loop': 'Renew.', look: '2026-10-14T09:00' }, HOST),
     );
     expect(await data<Matter[]>(run('matters-list', {}, HOST))).toMatchObject([{ id: opened.matter.id }]);
+  });
+});
+
+describe('matter planning facts', () => {
+  it('keeps planning facts separate from the next check-in and shows them in get and today', async () => {
+    const opened = await data<Placed>(
+      run('matters-open', {
+        title: 'Renew passport',
+        'open-loop': 'Morgan will sign the form.',
+        look: '2026-10-10T18:00:00+01:00',
+        due: '2026-12-31',
+        'needs-minutes': 15,
+        place: 'Berkeley office',
+      }),
+    );
+    expect(opened.matter).toMatchObject({
+      due_at: '2026-12-31',
+      needs_minutes: 15,
+      place: 'Berkeley office',
+      deferrals: 0,
+    });
+    expect(await getMatter(opened.matter.id)).toMatchObject({
+      due_at: '2026-12-31',
+      needs_minutes: 15,
+      place: 'Berkeley office',
+    });
+    const read = await data<string>(run('matters-get', { id: opened.matter.id }));
+    expect(read).toContain('15 minutes');
+    expect(read).toContain('Berkeley office');
+    expect(read).toContain('2026-12-31');
+    const today = await data<{ data: string[] }>(run('matters-today', {}));
+    expect(today.data.join('\n')).toContain('15 minutes');
+    expect(today.data.join('\n')).toContain('Berkeley office');
+    const changed = await data<Matter>(
+      run('matters-update', { id: opened.matter.id, due: '', place: '', 'needs-minutes': 0 }),
+    );
+    expect(changed).toMatchObject({ due_at: null, place: null, needs_minutes: 0 });
+  });
+
+  it('counts repeated check-ins without progress and resets only when the open loop changes', async () => {
+    const opened = await data<Placed>(
+      run('matters-open', {
+        title: 'Registration',
+        'open-loop': 'Waiting for Morgan to choose.',
+        look: '2026-10-14T09:00:00+01:00',
+      }),
+    );
+    for (const day of [15, 16, 17])
+      await data(run('matters-update', { id: opened.matter.id, look: `2026-10-${day}T09:00:00+01:00` }));
+    expect(await getMatter(opened.matter.id)).toMatchObject({ deferrals: 3 });
+    await data(run('matters-update', { id: opened.matter.id, 'open-loop': 'Waiting for Morgan to choose.' }));
+    expect(await getMatter(opened.matter.id)).toMatchObject({ deferrals: 3 });
+    await data(
+      run('matters-update', {
+        id: opened.matter.id,
+        'open-loop': 'Morgan chose the course; submit the form.',
+        look: '2026-10-18T09:00:00+01:00',
+      }),
+    );
+    expect(await getMatter(opened.matter.id)).toMatchObject({ deferrals: 0 });
   });
 });

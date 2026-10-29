@@ -36,6 +36,7 @@ import {
   listOpenLookSlots,
   openMatter,
   recordLookTask,
+  recordMatterDeferral,
   requireMatter,
   updateMatter,
   type CloseMatterInput,
@@ -223,6 +224,7 @@ export function updateMatterAndLook(input: UpdateMatterInput, look: NextLook | u
     const conversation = await requireMainConversation();
     const matter = await updateMatter({ ...input, reopen: true });
     await setLook(conversation, matter.id, matter.look_task_id, look);
+    if (matter.open_loop === current.open_loop) await recordMatterDeferral(matter.id);
     return requireMatter(matter.id);
   });
 }

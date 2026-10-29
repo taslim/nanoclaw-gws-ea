@@ -33,7 +33,12 @@ import {
 import { forgetFromMatters, mattersToRewrite } from './forget.js';
 import { closeMatterAndLook, lookVerdict, openMatterWithLook, updateMatterAndLook } from './looks.js';
 import { runMattersLoop } from './loop.js';
-import { gwsEaMattersMigration, gwsEaMatterJobsMigration, gwsEaMatterChatsMigration } from './migration.js';
+import {
+  gwsEaMattersMigration,
+  gwsEaMatterJobsMigration,
+  gwsEaMatterChatsMigration,
+  gwsEaMatterPlanningMigration,
+} from './migration.js';
 import { parseNextLook, type NextLook } from './next-look.js';
 import { principalTimezone, renderMatter } from './render.js';
 import { syncVerdict, todayVerdict } from './sync.js';
@@ -41,6 +46,7 @@ import { syncVerdict, todayVerdict } from './sync.js';
 registerMigration(gwsEaMattersMigration);
 registerMigration(gwsEaMatterJobsMigration);
 registerMigration(gwsEaMatterChatsMigration);
+registerMigration(gwsEaMatterPlanningMigration);
 
 onHostStart(async ({ signal }) => {
   await cancelClosedMatterJobs();
@@ -155,6 +161,29 @@ const LOOK_ARGS: ColumnDef[] = [
       "The next look, repeating: a five-field cron expression in the principal's time zone, at most four times a day. For a date that comes back every year (0 9 14 3 *) or a project's step-back (0 9 * * 1).",
   },
 ];
+const PLANNING_ARGS: ColumnDef[] = [
+  {
+    name: 'due',
+    type: 'string',
+    description:
+      'Due local date (YYYY-MM-DD), or a fixed instant with its UTC offset. Empty clears it; separate from the next look.',
+  },
+  {
+    name: 'needs_minutes',
+    type: 'number',
+    description: "Minutes of the principal's time needed; 0 means no principal time needed.",
+  },
+  { name: 'place', type: 'string', description: 'Saved whereabouts place id, or a place in words. Empty clears it.' },
+];
+
+function planningFrom(args: Record<string, unknown>) {
+  return {
+    dueAt: optionalString(args.due),
+    needsMinutes: typeof args.needs_minutes === 'number' ? args.needs_minutes : undefined,
+    place: optionalString(args.place),
+  };
+}
+
 const LINK_ARGS: ColumnDef[] = [
   {
     name: 'chat',
@@ -213,6 +242,10 @@ registerResource({
     { name: 'parent_id', type: 'string', description: 'The project it is a strand of.' },
     { name: 'outcome', type: 'string', description: 'How it ended, once closed.' },
     { name: 'look_task_id', type: 'string', description: 'The scheduled task that is its next look.' },
+    { name: 'due_at', type: 'string', description: 'Due local date or fixed instant, separate from the next look.' },
+    { name: 'needs_minutes', type: 'number', description: 'Minutes of the principal’s time needed.' },
+    { name: 'place', type: 'string', description: 'Saved place id or place in words.' },
+    { name: 'deferrals', type: 'number', description: 'Check-ins moved without an open-loop change.', generated: true },
     { name: 'updated_at', type: 'string', description: 'When it last changed.', generated: true },
   ],
   operations: {},
@@ -226,6 +259,7 @@ registerResource({
         { ...TITLE_ARG, required: true },
         { ...OPEN_LOOP_ARG, required: true },
         ...LOOK_ARGS,
+        ...PLANNING_ARGS,
         PARENT_ARG,
         ...LINK_ARGS,
       ],
@@ -243,6 +277,7 @@ registerResource({
               openLoop: requiredString(args, 'open_loop'),
               parentId: parentFrom(args) ?? undefined,
               links: linksFrom(args),
+              ...planningFrom(args),
             },
             look,
           );
@@ -294,6 +329,7 @@ registerResource({
         { name: 'outcome', type: 'string', description: "A closed matter's outcome, reworded: one line." },
         { ...PARENT_ARG, description: `${PARENT_ARG.description} "" makes it a matter of its own.` },
         ...LOOK_ARGS,
+        ...PLANNING_ARGS,
         {
           name: 'unlink',
           type: 'string',
@@ -316,6 +352,7 @@ registerResource({
               outcome: optionalString(args.outcome),
               parentId: parentFrom(args),
               unlink: unlinksFrom(args),
+              ...planningFrom(args),
             },
             look,
           );

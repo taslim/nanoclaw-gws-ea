@@ -14,6 +14,8 @@ import { findConversationSessions } from '../../db/sessions.js';
 import { withExistingMailboxSession } from '../../session-manager.js';
 import { formatLocalTime } from '../../timezone.js';
 import { getMainAgentGroupId } from '../gws-ea-profile/db.js';
+import { loadTimeline } from '../gws-ea-whereabouts/timeline.js';
+import { matterNeedsTimeline, matterPlanningLines } from './planning.js';
 import { getMatter, type Matter, type OpenMatterSummary } from './db.js';
 import { hostSources, loadLens, readLinks, type Lens, type LiveSources } from './live.js';
 
@@ -93,12 +95,14 @@ export async function renderMatter(
     matter.open && matter.look_task_id !== null ? readNextLook(matter.look_task_id) : undefined,
     matter.parent_id === null ? undefined : getMatter(matter.parent_id),
   ]);
+  const planning = matterPlanningLines(matter, matterNeedsTimeline(matter) ? await loadTimeline() : null, timezone);
   const state = matter.open ? 'open' : `closed ${formatLocalTime(matter.closed_at ?? matter.updated_at, timezone)}`;
   return [
     `Matter ${matter.id}, ${state}: ${matter.title}`,
     `Links read ${formatLocalTime(readAt, timezone)}.`,
     'Open loop:',
     matter.open_loop,
+    ...planning,
     matter.open ? nextLookLine(look, timezone) : `Outcome: ${matter.outcome ?? ''}`,
     ...projectLines(matter, project),
     ...(matter.strands.length === 0 ? [] : ['Strands:', ...matter.strands.map(strandLine)]),

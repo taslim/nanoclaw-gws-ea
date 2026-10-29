@@ -42,6 +42,9 @@ import {
   type ScriptVerdict,
 } from './looks.js';
 import { principalTimezone } from './render.js';
+import { getMatter } from './db.js';
+import { loadTimeline } from '../gws-ea-whereabouts/timeline.js';
+import { matterNeedsTimeline, matterPlanningLines } from './planning.js';
 
 const SYNC_TASK_NAME = 'gws-ea daily sync';
 const SYNC_SLUG = taskNameSlug(SYNC_TASK_NAME);
@@ -303,16 +306,30 @@ async function looksBefore(before: string): Promise<DueLook[]> {
 export async function todayVerdict(): Promise<ScriptVerdict> {
   const timezone = await principalTimezone();
   const looks = await looksBefore(nextRun('0 0 * * *', timezone));
+  const matters = await Promise.all(looks.map((look) => getMatter(look.matterId)));
+  const timeline = matters.some((matter) => matter !== undefined && matterNeedsTimeline(matter))
+    ? await loadTimeline()
+    : null;
+  const facts = new Map(
+    matters.flatMap((matter) =>
+      matter === undefined ? [] : [[matter.id, matterPlanningLines(matter, timeline, timezone).join(' ')] as const],
+    ),
+  );
+  const suffix = (id: string): string => (facts.get(id) ? `; ${facts.get(id)}` : '');
   const sections: ScriptSection[] = [
     {
       heading: 'Looks today',
       lines: looks
         .filter((look) => !look.handedBack)
-        .map((look) => `- ${look.matterId}, ${formatLocalTime(look.at, timezone)}: ${look.title}`),
+        .map(
+          (look) => `- ${look.matterId}, ${formatLocalTime(look.at, timezone)}: ${look.title}${suffix(look.matterId)}`,
+        ),
     },
     {
       heading: 'Handed back without a next look',
-      lines: looks.filter((look) => look.handedBack).map((look) => `- ${look.matterId}: ${look.title}`),
+      lines: looks
+        .filter((look) => look.handedBack)
+        .map((look) => `- ${look.matterId}: ${look.title}${suffix(look.matterId)}`),
     },
     unplacedSection(await listUnplacedThreads(), timezone),
   ];

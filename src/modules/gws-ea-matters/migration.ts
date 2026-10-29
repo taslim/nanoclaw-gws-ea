@@ -8,7 +8,7 @@ import type { ModuleMigration } from '../../db/migrations/index.js';
  * - a matter has a title, an open loop, an optional parent (a strand of that
  *   project), and the task that is its next look; it is open until it closes
  *   with an outcome, so an open matter never has one and a closed one always
- *   does. There is no status, stage, priority, due date, owner or log;
+ *   does. There is no status, stage, priority, owner or log;
  * - `look_failed_at` marks a failed look. The runner settles a failed turn's
  *   rows as done, so a repeating look's next occurrence is armed on its next
  *   date as if it had run; the host marks the matter when it hears of the
@@ -116,6 +116,19 @@ export const gwsEaMatterChatsMigration: ModuleMigration = {
       CREATE UNIQUE INDEX idx_gws_ea_matter_links_one_open_matter
         ON gws_ea_matter_links (kind, reference)
         WHERE matter_open = 1 AND kind IN ('thread', 'event', 'file', 'job');
+    `);
+  },
+};
+
+export const gwsEaMatterPlanningMigration: ModuleMigration = {
+  version: 1,
+  name: 'module:gws-ea-matters:planning-facts',
+  async up(db) {
+    await db.exec(`
+      ALTER TABLE gws_ea_matters ADD COLUMN due_at TEXT;
+      ALTER TABLE gws_ea_matters ADD COLUMN needs_minutes INTEGER CHECK (needs_minutes IS NULL OR needs_minutes >= 0);
+      ALTER TABLE gws_ea_matters ADD COLUMN place TEXT;
+      ALTER TABLE gws_ea_matters ADD COLUMN deferrals INTEGER NOT NULL DEFAULT 0 CHECK (deferrals >= 0);
     `);
   },
 };

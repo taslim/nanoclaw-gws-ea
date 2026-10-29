@@ -410,3 +410,9 @@ describe('forgetting a person across matters', () => {
     expect(fs.existsSync(handoff)).toBe(false);
   });
 });
+
+it('lists a matter whose place names the person for main to rewrite', async () => {
+  const visit = await open('Site visit', {}, { place: "Juno Hale's office" });
+  const answer = await forget(juno);
+  expect(answer.rewrite).toContain(`matter ${visit.id}`);
+});

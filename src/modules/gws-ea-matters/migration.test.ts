@@ -65,11 +65,12 @@ function schemaOf(db: DbDriver): SchemaEntry[] {
 }
 
 describe('the matters migrations', () => {
-  it('create matters and extend their native links with browser jobs and chats', () => {
+  it('create matters and extend links and planning facts', () => {
     expect(mattersMigrations().map((migration) => migration.name)).toEqual([
       CREATE_MATTERS,
       'module:gws-ea-matters:browser-jobs',
       'module:gws-ea-matters:chat-links',
+      'module:gws-ea-matters:planning-facts',
     ]);
   });
 
