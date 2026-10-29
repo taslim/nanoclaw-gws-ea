@@ -55,18 +55,19 @@ const BUDGETS: Readonly<Record<Agent, { readonly tokens: number; readonly reason
       "main's whole document before the guidance rewrite: 38,754 characters, with the front page as an empty install renders it. Its guidance and calendar craft fit inside that size; the front page grows only within its own budget.",
   },
   'external-email': {
-    tokens: 3_900,
-    reason:
-      '3,827 tokens: the character, the email examples, sealed-thread authority and its scheduling tools; rounded up.',
-  },
-  'external-chat': {
-    tokens: 3_700,
-    reason: '3,624 tokens: the character, chat role and privacy, chat scheduling and WhatsApp formatting; rounded up.',
-  },
-  job: {
     tokens: 4_300,
     reason:
-      "4,203 tokens: external-chat's scheduling and formatting, plus job memory, documents and authority; rounded up.",
+      '4,234 tokens: the character, the email examples, sealed-thread authority, and the calendar craft and meeting shaping it holds resident because it reads no calendar skill; rounded up.',
+  },
+  'external-chat': {
+    tokens: 4_100,
+    reason:
+      '4,013 tokens: the character, chat role and privacy, chat scheduling with the resident calendar craft and meeting shaping, and WhatsApp formatting; rounded up.',
+  },
+  job: {
+    tokens: 4_600,
+    reason:
+      "4,593 tokens: external-chat's scheduling with the resident calendar craft and its formatting, plus job memory, documents and authority; rounded up.",
   },
   browser: {
     tokens: 4_700,
