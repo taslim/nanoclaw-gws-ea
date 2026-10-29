@@ -16,6 +16,7 @@ import { loadTimeline, zoneAt, zoneForDay, type Timeline } from '../gws-ea-where
 import type { DetailedEvent, MeetingsCalendarApi } from './calendar-api.js';
 import { createCalendarFactTools, MAX_PEOPLE_ASKED } from './calendar-facts.js';
 import { addressesOf, flagOf, instantOf, lineOf } from './fields.js';
+import { ownerOf } from './principal-events.js';
 import { checkWeek, presentFinding } from './week/checker.js';
 import {
   buildWeek,
@@ -222,6 +223,11 @@ export function renderDays(week: Week, filter?: string): string {
             ? `${e.day}${e.day === e.lastDay ? '' : ` to ${e.lastDay}`}, all day`
             : `${p.start} to ${p.end} (${e.zone ?? 'zone unknown'})`,
           `event ${e.id} on calendar ${e.calendarId}`,
+          ...e.copies.flatMap((copy) =>
+            copy.owner === 'principal' && copy.calendarId !== e.calendarId && copy.event.id
+              ? [`Copy: event ${copy.event.id} on calendar ${copy.calendarId}`]
+              : [],
+          ),
           p.title,
           ...(p.location ? [`Place: ${p.location}`] : []),
           ...(p.description ? [`Notes: ${p.description}`] : []),
@@ -285,12 +291,7 @@ export function createDaysTools(deps: { readonly calendar: () => MeetingsCalenda
         assistantAddresses(),
         deps.calendar().getEventDetail(calendarId, eventId),
       ]);
-      const owner =
-        entry && isPrincipalCalendar(entry, principalRecognizer(profile.principal_emails))
-          ? 'principal'
-          : assistant.has(calendarId)
-            ? 'assistant'
-            : undefined;
+      const owner = entry && ownerOf(entry, principalRecognizer(profile.principal_emails), assistant);
       if (!entry || !owner) throw forbidden('Read an event on a principal calendar or your own calendar.');
       if (!detail || detail.status === 'cancelled') return { message: 'That event is no longer on this calendar.' };
       const detailStart = dayBoundary(detail.start?.date ?? detail.start?.dateTime, 'event start', timeline, false);
@@ -353,12 +354,7 @@ export function createDaysTools(deps: { readonly calendar: () => MeetingsCalenda
     const calendarId = lineOf(content.calendar, 'calendar', 254) ?? profile.principal_emails[0];
     if (!calendarId) throw forbidden('No principal calendar is known.');
     const [entry, assistant] = await Promise.all([deps.calendar().getCalendar(calendarId), assistantAddresses()]);
-    const owner =
-      entry && isPrincipalCalendar(entry, principalRecognizer(profile.principal_emails))
-        ? 'principal'
-        : assistant.has(calendarId)
-          ? 'assistant'
-          : undefined;
+    const owner = entry && ownerOf(entry, principalRecognizer(profile.principal_emails), assistant);
     if (!entry || !owner)
       throw forbidden(
         'Event details are available on principal calendars and your own; use calendars for colleagues’ busy windows.',

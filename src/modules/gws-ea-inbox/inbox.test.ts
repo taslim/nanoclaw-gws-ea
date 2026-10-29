@@ -145,6 +145,7 @@ import { closeRuns } from '../gws-ea-matters/testing/main-conversation.js';
 import '../gws-ea-meetings/index.js';
 import { loadCalendarWeek } from '../gws-ea-meetings/days.js';
 import type { EventCopy } from '../gws-ea-meetings/week/model.js';
+import { flushPendingCalendarChanges } from '../gws-ea-meetings/week/refresh.js';
 import { FakeCalendar as FakeEvents } from '../gws-ea-meetings/testing/fake-calendar.js';
 import '../gws-ea-workspace/index.js';
 import { recordFolderGrant } from '../gws-ea-workspace/db.js';
@@ -174,7 +175,7 @@ import { MAX_ROUTING_ATTEMPTS } from './adapter.js';
 import { createSignInClaim, getSignInClaim, recoverSignInClaims } from './claims.js';
 import { registerInboxObserver } from './observers.js';
 import { browserSignInMigration } from '../gws-ea-browser/sign-in-migration.js';
-import { flushPendingCalendarChanges, createCalendarListApi, UNSHARED_RETRY_MS } from './calendar-notifications.js';
+import { createCalendarListApi, UNSHARED_RETRY_MS } from './calendar-notifications.js';
 import { emailMessagingGroupIds, listPrincipalCalendars, recordFailedAttempt } from './db.js';
 import { MAX_ATTACHMENT_BYTES, MESSAGES_PER_SENDER_PER_HOUR } from './route-mail.js';
 import { runnerPoll } from './testing/runner-poll.js';
@@ -723,7 +724,7 @@ async function flushCalendarNews(): Promise<number> {
   const start = times.length ? Math.min(...times) : Date.now();
   const end = times.length ? Math.max(...times) : start + 86400000;
   const week = await loadCalendarWeek(events, { start, end: Math.max(start + 1, end), eventSnapshot: snapshot });
-  return flushPendingCalendarChanges(new Date(Date.now() + 61_000), { week });
+  return flushPendingCalendarChanges(events, new Date(Date.now() + 61_000), { week });
 }
 
 const PRINCIPAL_WROTE = /^Pat wrote in /u;

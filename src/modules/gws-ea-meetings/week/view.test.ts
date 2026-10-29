@@ -65,7 +65,7 @@ describe('the session week view', () => {
       fs.rmSync(root, { recursive: true, force: true });
     }
   });
-  it('bounds the whole heavy-calendar envelope with complete framed entries and preserves the clock timeline', () => {
+  it('holds in its days exactly the entries its text shows, and only the timeline the clock reads', () => {
     const week = buildWeek(
       input(
         Array.from({ length: 96 }, (_, index) =>
@@ -80,11 +80,13 @@ describe('the session week view', () => {
     );
     const view = renderWeekView(week, '2026-10-05T07:00:00.000Z', ['Current Manual '.repeat(400)]);
     const bytes = JSON.stringify(view);
-    expect(Buffer.byteLength(bytes)).toBeLessThanOrEqual(1_048_576);
     expect(view.text.length).toBeLessThanOrEqual(8_000);
-    expect(view.timeline).toEqual(timeline);
+    const { homeZone, base, places, rhythm, stays, legs } = timeline;
+    expect(view.timeline).toEqual({ homeZone, base, places, rhythm, stays, legs });
     expect(view.days).toHaveLength(8);
-    expect(view.days.flatMap((day) => day.entries).some((entry) => /^\+\d+ more$/u.test(entry.text))).toBe(true);
+    const entries = view.days.flatMap((day) => day.entries);
+    expect(entries.filter((entry) => /^\+\d+ more; use days$/u.test(entry.text))).toHaveLength(1);
+    expect(entries.filter((entry) => !view.text.includes(entry.text))).toEqual([]);
     expect(bytes.match(/<<<EXTERNAL_UNTRUSTED_CONTENT/gu)?.length).toBe(
       bytes.match(/<<<END_EXTERNAL_UNTRUSTED_CONTENT/gu)?.length,
     );

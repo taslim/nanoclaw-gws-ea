@@ -1,5 +1,4 @@
 import { getDb } from '../../../db/connection.js';
-import { registerPersonForgetHook } from '../../gws-ea-people/db.js';
 import type { CalendarNotice } from '../../gws-ea-inbox/calendar-notifications.js';
 
 export const CALENDAR_SETTLE_MS = 60_000;
@@ -58,13 +57,3 @@ export async function settleCalendarChanges(changes: readonly PendingCalendarCha
         await getDb().run('DELETE FROM gws_ea_pending_calendar_changes WHERE message_id=?', id);
   });
 }
-registerPersonForgetHook('gws-ea-meetings:pending-calendar-changes', async ({ id, handles }) => {
-  const db = getDb();
-  if (!(await db.hasTable('gws_ea_pending_calendar_changes'))) return;
-  const tokens = [id, ...handles, ...handles.filter((h) => h.startsWith('email:')).map((h) => h.slice(6))].map((h) =>
-    h.toLowerCase(),
-  );
-  for (const row of await db.all<Row>('SELECT * FROM gws_ea_pending_calendar_changes'))
-    if (tokens.some((token) => `${row.calendar_id}/${row.event_id}`.toLowerCase().includes(token)))
-      await db.run('DELETE FROM gws_ea_pending_calendar_changes WHERE message_id=?', row.message_id);
-});

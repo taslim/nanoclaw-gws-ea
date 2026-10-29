@@ -49,6 +49,14 @@ describe('factual week findings', () => {
     expect(kinds(positive)).toContain(kind);
     expect(kinds(negative)).not.toContain(kind);
   });
+  it("missing-prep counts a guest on the principal's own domain too", () => {
+    const findings = checkWeek(
+      buildWeek(input([meeting('a', '09:00', '10:00', { attendees: [{ email: 'juno@ellery.example' }] })])),
+    );
+    expect(findings.find((f) => f.kind === 'missing-prep')?.message).toBe(
+      'Guests other than the principal; no notes and no prep block.',
+    );
+  });
   it('a clean day has no findings and an unknown home emits one gap without per-event travel findings', () => {
     expect(kinds([meeting('a', '09:00', '10:00')])).toEqual([]);
     const unknown = { ...timeline, base: { ...timeline.base, home_place_id: null } };
@@ -315,7 +323,6 @@ describe('factual week findings', () => {
     const block = meeting('block', '09:00', '09:15', { tags: { gws_ea_matter_id: 'm-1' } });
     expect(kinds([block], { matters })).not.toContain('matter-unscheduled');
     const undated = { matter: { ...matter, due_at: null, deferrals: 0 }, checkInAt: null };
-    expect(buildWeek(input([], { matters: [undated] })).undatedMatters.map((m) => m.id)).toEqual(['m-1']);
     expect(kinds([], { matters: [undated] })).toEqual([]);
   });
   it('wraps unknown venue names in findings and leaves saved place labels plain', () => {

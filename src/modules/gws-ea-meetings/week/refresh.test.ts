@@ -28,7 +28,7 @@ import { addStay } from '../../gws-ea-whereabouts/db.js';
 import { loadTimeline, zoneAt } from '../../gws-ea-whereabouts/timeline.js';
 import { setManualSection } from '../../gws-ea-manual/db.js';
 import { FakeCalendar } from '../testing/fake-calendar.js';
-import { createWeekRefresher } from './refresh.js';
+import { createWeekRefresher, flushPendingCalendarChanges } from './refresh.js';
 import { settledCalendarChanges, recordPendingCalendarChange } from './pending-changes.js';
 import { beginCalendarWrite, markCalendarWriteApplied } from './write-log.js';
 import type { WeekView } from './view.js';
@@ -90,6 +90,16 @@ describe('the independent week refresher', () => {
     expect(fs.existsSync(file('close-system'))).toBe(false);
     expect(zoneAt(await loadTimeline(), Date.parse('2026-11-15T15:00:00Z'))).toBe('Europe/Brussels');
   });
+  it('writes the view into the evening close session while its run is open', async () => {
+    await getDb().run(
+      `INSERT INTO gws_ea_close_runs (id,session_id,scheduled_at,zone,timeline_version,state,started_at)
+       VALUES ('close-1','close-system',?,'America/Los_Angeles','fixed','open',?)`,
+      stamp,
+      stamp,
+    );
+    await refresher.refresh();
+    expect(fs.readFileSync(file('close-system'), 'utf8')).toBe(fs.readFileSync(file(), 'utf8'));
+  });
   it('leaves an unchanged view in place and still writes a conversation that has none', async () => {
     calendar.put({
       calendarId: principal,
@@ -122,7 +132,8 @@ describe('the independent week refresher', () => {
     await refresher.refresh();
     const before = fs.readFileSync(file(), 'utf8');
     vi.spyOn(calendar, 'listEventDetails').mockRejectedValue(new Error('Google unavailable'));
-    await expect(refresher.refresh({ full: true })).rejects.toThrow('Google unavailable');
+    refresher = createWeekRefresher({ calendar: () => calendar, now: () => new Date(stamp) });
+    await expect(refresher.refresh()).rejects.toThrow('Google unavailable');
     expect(fs.readFileSync(file(), 'utf8')).toBe(before);
   });
   it('rerenders a seconds-old stay and current Manual without reading Google on a principal turn', async () => {
@@ -136,6 +147,7 @@ describe('the independent week refresher', () => {
       source: 'said',
       certainty: 'certain',
     });
+    await refresher.refresh();
     reads.mockClear();
     await setManualSection('priorities', 'Leave time for Remy Vance');
     await refresher.refresh();
@@ -224,7 +236,37 @@ describe('the independent week refresher', () => {
         certainty: 'certain',
       }),
     ).resolves.toMatchObject({ zone: 'Europe/Brussels' });
-    expect(readView().timeline.stays[0].zone).toBe('Europe/Brussels');
+    await vi.waitFor(() => expect(readView().timeline.stays[0]?.zone).toBe('Europe/Brussels'));
+  });
+  it('saves a whereabouts edit without waiting for the calendar read in flight', async () => {
+    await refresher.start();
+    await recordPendingCalendarChange(
+      'pending-mail',
+      { calendarId: principal, eventId: 'pending', change: 'created' },
+      new Date('2026-10-05T06:58:00Z'),
+    );
+    let release: (() => void) | undefined;
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const detail = calendar.getEventDetail.bind(calendar);
+    vi.spyOn(calendar, 'getEventDetail').mockImplementation(async (...args) => {
+      await held;
+      return detail(...args);
+    });
+    const saved = addStay({
+      locality: 'Brussels',
+      zone: 'Europe/Brussels',
+      start: '2026-10-05T06:59:58Z',
+      end: '2026-10-06T00:00:00Z',
+      source: 'said',
+      certainty: 'certain',
+    });
+    const answer = await Promise.race([saved, new Promise((resolve) => setTimeout(resolve, 1_000, 'waiting'))]);
+    release?.();
+    expect(answer).toMatchObject({ zone: 'Europe/Brussels' });
+    await vi.waitFor(() => expect(readView().timeline.stays[0]?.zone).toBe('Europe/Brussels'));
+    await refresher.refresh();
   });
   it('prepares an authenticated principal message without any Google read', async () => {
     await refresher.start();
@@ -296,6 +338,37 @@ describe('the independent week refresher', () => {
     expect(note).toHaveBeenCalledOnce();
     expect(note.mock.calls[0][0].text).toContain('Dinner with Remy Vance');
     expect(await settledCalendarChanges(new Date('2100-01-01'))).toEqual([]);
+  });
+  it('keeps a notice that arrives while the note renders for the next note', async () => {
+    const note = vi.spyOn(mainNotes, 'writeNoteForMain').mockResolvedValue('written');
+    const notice = { calendarId: principal, eventId: 'dinner', change: 'changed' as const };
+    await recordPendingCalendarChange('gmail-1', notice, new Date('2026-10-05T16:00:00Z'));
+    await recordPendingCalendarChange('gmail-2', notice, new Date('2026-10-05T16:00:20Z'));
+    expect(await flushPendingCalendarChanges(calendar, new Date('2026-10-05T16:00:40Z'))).toBe(0);
+    const detail = calendar.getEventDetail.bind(calendar);
+    vi.spyOn(calendar, 'getEventDetail').mockImplementationOnce(async (...args) => {
+      await recordPendingCalendarChange('gmail-3', notice, new Date('2026-10-05T16:02:01Z'));
+      return detail(...args);
+    });
+    expect(await flushPendingCalendarChanges(calendar, new Date('2026-10-05T16:02:00Z'))).toBe(1);
+    expect(note).toHaveBeenCalledOnce();
+    expect(note.mock.calls[0][0]).toMatchObject({ wake: true, text: expect.stringContaining('Event dinner') });
+    expect((await settledCalendarChanges(new Date('2100-01-01'))).flatMap((c) => c.messageIds)).toEqual(['gmail-3']);
+    expect(await flushPendingCalendarChanges(calendar, new Date('2026-10-05T16:04:00Z'))).toBe(1);
+    expect(await settledCalendarChanges(new Date('2100-01-01'))).toEqual([]);
+  });
+  it('delivers and settles a notice whose findings cannot be read, once', async () => {
+    const note = vi.spyOn(mainNotes, 'writeNoteForMain').mockResolvedValue('written');
+    await recordPendingCalendarChange(
+      'gmail-1',
+      { calendarId: principal, eventId: 'dinner', change: 'changed' },
+      new Date('2026-10-05T16:00:00Z'),
+    );
+    vi.spyOn(calendar, 'getEventDetail').mockRejectedValueOnce(new Error('Google unavailable'));
+    expect(await flushPendingCalendarChanges(calendar, new Date('2026-10-05T16:02:00Z'))).toBe(1);
+    expect(note.mock.calls[0][0].text).toContain('findings unavailable');
+    expect(await settledCalendarChanges(new Date('2100-01-01'))).toEqual([]);
+    expect(await flushPendingCalendarChanges(calendar, new Date('2026-10-05T16:03:00Z'))).toBe(0);
   });
   it('leads a change note with the event, then the findings of the days it left and joined', async () => {
     for (let day = 5; day <= 12; day++)

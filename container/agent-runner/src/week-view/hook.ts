@@ -30,7 +30,7 @@ function dayChanges(previous: DeliveredView | undefined, days: readonly ViewDay[
     for (const entry of day.entries)
       if (heldVersions.get(entry.id) !== entry.version) changes.push(`${day.date}: ${entry.text}`);
     for (const old of held?.entries ?? [])
-      if (!currentIds.has(old.id)) changes.push(`${day.date}: removed ${old.text}`);
+      if (!currentIds.has(old.id)) changes.push(`${day.date}: no longer shown: ${old.text}`);
   }
   const lines: string[] = [];
   let size = 0;

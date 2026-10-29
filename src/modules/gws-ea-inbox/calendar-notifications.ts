@@ -539,7 +539,7 @@ const OWN_CHANGE_WINDOW_MS = 30 * 60_000;
 
 const ownChanges = new Map<string, number[]>();
 type OwnChangeListener = (calendarId: string, eventId: string) => void;
-let ownChangeListener: OwnChangeListener | undefined;
+const ownChangeListeners = new Set<OwnChangeListener>();
 
 function ownKey(calendarId: string, eventId: string): string {
   return `${expandCalendarRef(calendarId)}\u0000${eventId}`;
@@ -559,15 +559,14 @@ export function recordOwnCalendarChange(calendarId: string, eventId: string, at:
   }
   const key = ownKey(calendarId, eventId);
   ownChanges.set(key, [...(ownChanges.get(key) ?? []), at.getTime()]);
-  ownChangeListener?.(calendarId, eventId);
+  for (const listener of ownChangeListeners) listener(calendarId, eventId);
 }
 
 /** The coming-days refresher hears of each own change here, since the notice it suppresses no longer will. */
 export function onOwnCalendarChange(listener: OwnChangeListener): () => void {
-  if (ownChangeListener) throw new Error('An own calendar change listener is already registered');
-  ownChangeListener = listener;
+  ownChangeListeners.add(listener);
   return () => {
-    if (ownChangeListener === listener) ownChangeListener = undefined;
+    ownChangeListeners.delete(listener);
   };
 }
 
@@ -579,83 +578,4 @@ export function consumeOwnCalendarChange(calendarId: string, eventId: string, at
   if (rest.length > 0) ownChanges.set(key, rest);
   else ownChanges.delete(key);
   return live.length > 0;
-}
-
-export interface CalendarChangeRenderContext {
-  readonly week?: import('../gws-ea-meetings/week/model.js').Week;
-  readonly timeline?: import('../gws-ea-whereabouts/timeline.js').Timeline;
-  /** The copies held before the change, which place the days it left. */
-  readonly previous?: readonly import('../gws-ea-meetings/week/model.js').EventCopy[];
-}
-export interface RenderedCalendarChanges {
-  readonly text: string;
-  readonly pieces?: readonly import('../gws-ea-profile/main-note.js').NotePiece[];
-}
-export type CalendarChangeRenderer = (
-  changes: readonly import('../gws-ea-meetings/week/pending-changes.js').PendingCalendarChange[],
-  at: Date,
-  context: CalendarChangeRenderContext,
-) => Promise<RenderedCalendarChanges>;
-let changeRenderer: CalendarChangeRenderer | undefined;
-export function registerCalendarChangeRenderer(renderer: CalendarChangeRenderer): void {
-  if (changeRenderer) throw new Error('A calendar change renderer is already registered');
-  changeRenderer = renderer;
-}
-export async function flushPendingCalendarChanges(
-  at: Date = new Date(),
-  context: CalendarChangeRenderContext = {},
-): Promise<number> {
-  const { settledCalendarChanges, settleCalendarChanges } = await import('../gws-ea-meetings/week/pending-changes.js');
-  const changes = await settledCalendarChanges(at);
-  if (!changes.length) return 0;
-  const words: Readonly<Record<CalendarChange, string>> = {
-    created: 'created',
-    changed: 'changed',
-    cancelled: 'cancelled',
-    response: 'guest response',
-    unknown: 'changed',
-  };
-  const { untrustedLine } = await import('./untrusted.js');
-  const lines = changes.map(
-    ({ notice }) =>
-      `- Event ${notice.eventId} on calendar ${untrustedLine(notice.calendarId, 254, 'google_calendar')}: ${words[notice.change]}.`,
-  );
-  let rendered: RenderedCalendarChanges = { text: 'findings unavailable' };
-  /* eslint-disable no-catch-all/no-catch-all -- durable notices deliver even when their findings cannot render */
-  try {
-    if (changeRenderer) rendered = await changeRenderer(changes, at, context);
-  } catch (error) {
-    log.warn('Calendar notice delivered without findings', { error });
-  }
-  /* eslint-enable no-catch-all/no-catch-all */
-  const head = `Google Calendar reports ${changes.length === 1 ? 'a change' : `${changes.length} changes`}:`;
-  const body = [head];
-  let length = head.length;
-  const entries = [...lines, rendered.text];
-  for (const line of entries) {
-    if (length + line.length + 42 > 12_000) break;
-    body.push(line);
-    length += 1 + line.length;
-  }
-  if (body.length - 1 < entries.length) body.push(`${entries.length - body.length + 1} more.`);
-  const key = createHash('sha256')
-    .update(
-      changes
-        .flatMap((c) => c.messageIds)
-        .sort()
-        .join('\n'),
-    )
-    .digest('hex');
-  const result = await writeNoteForMain({
-    id: `inbox-calendar-${key}`,
-    timestamp: at.toISOString(),
-    wake: true,
-    text: body.join('\n'),
-    pieces:
-      rendered.pieces ??
-      changes.map(({ notice }) => ({ kind: 'event', reference: `${notice.calendarId}/${notice.eventId}` })),
-  });
-  if (result === 'no-main' || result === 'no-principal') return 0;
-  await settleCalendarChanges(changes);
-  return changes.length;
 }

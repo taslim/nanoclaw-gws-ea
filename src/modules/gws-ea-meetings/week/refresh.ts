@@ -1,12 +1,15 @@
+import { createHash } from 'node:crypto';
+
 import { log } from '../../../log.js';
 import { getMainAgentGroupId, getGwsEaProfile, principalRecognizer } from '../../gws-ea-profile/db.js';
+import { writeNoteForMain, type NotePiece } from '../../gws-ea-profile/main-note.js';
 import {
-  flushPendingCalendarChanges,
   isPrincipalCalendar,
   isReadable,
   onOwnCalendarChange,
-  type CalendarChangeRenderContext,
+  type CalendarChange,
 } from '../../gws-ea-inbox/calendar-notifications.js';
+import { untrustedLine } from '../../gws-ea-inbox/untrusted.js';
 import { onManualChange } from '../../gws-ea-manual/changes.js';
 import { loadManualSections } from '../../gws-ea-manual/front-page.js';
 import { onWhereaboutsChange } from '../../gws-ea-whereabouts/changes.js';
@@ -15,9 +18,10 @@ import { syncDerivedStays, type DerivationWindow } from '../../gws-ea-whereabout
 import { deriveLegs } from '../../gws-ea-whereabouts/derive.js';
 import { loadTimeline, zoneAt, zoneForDay, type Timeline } from '../../gws-ea-whereabouts/timeline.js';
 import type { CalendarEntry, MeetingsCalendarApi } from '../calendar-api.js';
-import { loadCalendarWeek } from '../days.js';
-import { digest, inWindow, spanOf, type EventCopy } from './model.js';
-import { settledCalendarChanges } from './pending-changes.js';
+import { boundedCalendarMessage, loadCalendarWeek, renderDays } from '../days.js';
+import { checkWeek, presentFinding } from './checker.js';
+import { digest, inWindow, spanOf, type EventCopy, type Week } from './model.js';
+import { settleCalendarChanges, settledCalendarChanges, type PendingCalendarChange } from './pending-changes.js';
 import { appliedCalendarWrites, calendarWriteVersion } from './write-log.js';
 import { renderWeekView, writeWeekView } from './view.js';
 
@@ -47,6 +51,132 @@ function coalesced(windows: readonly DerivationWindow[]): DerivationWindow[] {
     else result.push(window);
   }
   return result;
+}
+
+export interface CalendarChangeContext {
+  readonly week?: Week;
+  readonly timeline?: Timeline;
+  /** The copies held before the change, which place the days it left. */
+  readonly previous?: readonly EventCopy[];
+}
+
+async function changeFacts(
+  calendar: MeetingsCalendarApi,
+  changes: readonly PendingCalendarChange[],
+  at: Date,
+  context: CalendarChangeContext,
+): Promise<{ readonly text: string; readonly pieces: readonly NotePiece[] }> {
+  const changed = (calendarId: string, eventId: string | undefined) =>
+    changes.some(({ notice }) => notice.calendarId === calendarId && notice.eventId === eventId);
+  const timeline = context.timeline ?? (await loadTimeline());
+  const left = (context.previous ?? []).flatMap((copy) =>
+    changed(copy.calendarId, copy.event.id) ? (spanOf(copy.event, timeline) ?? []) : [],
+  );
+  let week = context.week;
+  if (!week) {
+    const details = await Promise.all(
+      changes.map(({ notice }) => calendar.getEventDetail(notice.calendarId, notice.eventId)),
+    );
+    const spans = [...left, ...details.flatMap((event) => (event && spanOf(event, timeline)) ?? [])];
+    const start = spans.length ? Math.min(...spans.map((span) => span.start)) : at.getTime();
+    const end = spans.length ? Math.max(...spans.map((span) => span.end)) : start + DAY;
+    week = await loadCalendarWeek(calendar, { start, end: Math.max(start + 1, end), timeline });
+  }
+  const affected = week.events.filter((e) => changed(e.calendarId, e.id));
+  // The days the change left and the days it now holds.
+  const touched = week.days
+    .filter((day) => {
+      const zone = day.zone ?? 'UTC';
+      const window = { start: boundary(day.date, zone, 'start'), end: boundary(day.date, zone, 'end') };
+      return [...left, ...affected].some((span) => inWindow(span, window));
+    })
+    .map((day) => day.date);
+  const findings = checkWeek(week).filter((f) => f.day !== null && touched.includes(f.day));
+  return {
+    text: boundedCalendarMessage(
+      'Calendar facts:',
+      [
+        ...affected.map((e) => renderDays({ ...week, events: [e] })),
+        ...(touched.length
+          ? [
+              `Findings for ${touched.join(', ')}:`,
+              ...(findings.length ? findings.map((f) => presentFinding(f, week)) : ['No findings.']),
+            ]
+          : []),
+      ],
+      10_000,
+    ),
+    pieces: changes.map(({ notice }) => ({
+      kind: 'event' as const,
+      reference: `${notice.calendarId}/${notice.eventId}`,
+      ...(notice.change === 'created'
+        ? {
+            arrival: {
+              from: affected.find((e) => e.calendarId === notice.calendarId && e.id === notice.eventId)?.event.organizer
+                ?.email,
+            },
+          }
+        : {}),
+    })),
+  };
+}
+
+export async function flushPendingCalendarChanges(
+  calendar: MeetingsCalendarApi,
+  at: Date = new Date(),
+  context: CalendarChangeContext = {},
+): Promise<number> {
+  const changes = await settledCalendarChanges(at);
+  if (!changes.length) return 0;
+  const words: Readonly<Record<CalendarChange, string>> = {
+    created: 'created',
+    changed: 'changed',
+    cancelled: 'cancelled',
+    response: 'guest response',
+    unknown: 'changed',
+  };
+  const lines = changes.map(
+    ({ notice }) =>
+      `- Event ${notice.eventId} on calendar ${untrustedLine(notice.calendarId, 254, 'google_calendar')}: ${words[notice.change]}.`,
+  );
+  let facts: { readonly text: string; readonly pieces?: readonly NotePiece[] } = { text: 'findings unavailable' };
+  /* eslint-disable no-catch-all/no-catch-all -- durable notices deliver even when their findings cannot render */
+  try {
+    facts = await changeFacts(calendar, changes, at, context);
+  } catch (error) {
+    log.warn('Calendar notice delivered without findings', { error });
+  }
+  /* eslint-enable no-catch-all/no-catch-all */
+  const head = `Google Calendar reports ${changes.length === 1 ? 'a change' : `${changes.length} changes`}:`;
+  const body = [head];
+  let length = head.length;
+  const entries = [...lines, facts.text];
+  for (const line of entries) {
+    if (length + line.length + 42 > 12_000) break;
+    body.push(line);
+    length += 1 + line.length;
+  }
+  if (body.length - 1 < entries.length) body.push(`${entries.length - body.length + 1} more.`);
+  const key = createHash('sha256')
+    .update(
+      changes
+        .flatMap((c) => c.messageIds)
+        .sort()
+        .join('\n'),
+    )
+    .digest('hex');
+  const result = await writeNoteForMain({
+    id: `inbox-calendar-${key}`,
+    timestamp: at.toISOString(),
+    wake: true,
+    text: body.join('\n'),
+    pieces:
+      facts.pieces ??
+      changes.map(({ notice }) => ({ kind: 'event', reference: `${notice.calendarId}/${notice.eventId}` })),
+  });
+  if (result === 'no-main' || result === 'no-principal') return 0;
+  await settleCalendarChanges(changes);
+  return changes.length;
 }
 
 /** Its own timer and single flight keep a slow Google read outside the matters loop and every message path. */
@@ -121,7 +251,7 @@ export function createWeekRefresher(deps: { readonly calendar: () => MeetingsCal
     if (!(await getMainAgentGroupId())) return;
     const at = now();
     const previous = copies;
-    let current: CalendarChangeRenderContext = {};
+    let current: CalendarChangeContext = {};
     try {
       current = await read(at);
     } catch (error) {
@@ -129,11 +259,11 @@ export function createWeekRefresher(deps: { readonly calendar: () => MeetingsCal
       forceFull = true;
       throw error;
     } finally {
-      await flushPendingCalendarChanges(at, { ...current, previous });
+      await flushPendingCalendarChanges(deps.calendar(), at, { ...current, previous });
     }
   }
 
-  async function read(at: Date): Promise<CalendarChangeRenderContext> {
+  async function read(at: Date): Promise<CalendarChangeContext> {
     let timeline = await loadTimeline();
     const today = dateString(wallClock(at.getTime(), zoneAt(timeline, at.getTime()) ?? 'UTC'));
     const full =
@@ -254,14 +384,11 @@ export function createWeekRefresher(deps: { readonly calendar: () => MeetingsCal
     return { week: noteWeek, timeline };
   }
 
-  function refresh(
-    options: { readonly full?: boolean; readonly placementChanged?: boolean; readonly render?: boolean } = {},
-  ): Promise<void> {
-    forceFull ||= options.full === true;
+  function refresh(options: { readonly placementChanged?: boolean; readonly render?: boolean } = {}): Promise<void> {
     placementChanged ||= options.placementChanged === true;
     renderChanged ||= options.render === true;
     if (flight) {
-      if (options.full || options.placementChanged || options.render) again = true;
+      if (options.placementChanged || options.render) again = true;
       return flight;
     }
     flight = (async () => {
@@ -296,15 +423,15 @@ export function createWeekRefresher(deps: { readonly calendar: () => MeetingsCal
         onOwnCalendarChange((calendarId, eventId) => {
           ownChanges.set(`${calendarId}\0${eventId}`, { calendarId, eventId });
         }),
-        // A saved Manual edit answers at once; its view follows on its own.
+        // A saved Manual or whereabouts edit answers at once; its view follows on its own.
         onManualChange(() => {
           void refresh({ render: true }).catch((error: unknown) =>
             log.warn('The Manual was saved; its calendar reread is unavailable', { error }),
           );
         }),
-        onWhereaboutsChange(async (change) => {
+        onWhereaboutsChange((change) => {
           if (change.kind !== 'derived')
-            await refresh({
+            void refresh({
               render: true,
               placementChanged:
                 change.kind === 'stay' ||

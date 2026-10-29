@@ -3,7 +3,6 @@ import { whereaboutsAt } from '../../gws-ea-whereabouts/timeline.js';
 import { schedulingRules, fitOf, type Span } from '../slots.js';
 import {
   calendarText,
-  digest,
   linkedBlocks,
   placeText,
   WEEK_TAGS,
@@ -38,7 +37,6 @@ export type FindingKind = (typeof FINDING_KINDS)[number];
 export interface Finding {
   readonly key: string;
   readonly kind: FindingKind;
-  readonly version: string;
   readonly day: string | null;
   readonly eventKeys: readonly string[];
   readonly message: string;
@@ -65,55 +63,6 @@ function longestGap(window: Span, busy: readonly Span[]): number {
   return Math.max(gap, window.end - edge) / MINUTE;
 }
 const flight = (event: WeekEvent, week: Week): boolean => week.timeline.legs.some((l) => l.sourceEventId === event.id);
-function findingVersion(kind: FindingKind, event: WeekEvent): unknown {
-  const time = [event.start, event.end, event.zone, event.workingHoursZone, event.busy];
-  switch (kind) {
-    case 'meal':
-    case 'overlap':
-    case 'back-to-back':
-    case 'working-hours':
-    case 'protected-time':
-    case 'flight-chain':
-      return time;
-    case 'travel':
-    case 'travel-unknown':
-      return [time, event.place];
-    case 'missing-prep':
-      return [time, event.event.description, event.involvement.guests.map((g) => g.identity)];
-    case 'attendance-missing':
-      return [
-        time,
-        event.event.location,
-        event.event.conference,
-        event.event.description,
-        event.involvement.guests.map((g) => g.identity),
-      ];
-    case 'copy-disagreement':
-      return event.copies.map((copy) => [
-        copy.calendarId,
-        copy.event.start,
-        copy.event.end,
-        copy.event.summary,
-        copy.event.location,
-        copy.event.description,
-        copy.event.attendees?.map((a) => a.email).sort(),
-      ]);
-    case 'all-day-task':
-      return [time, event.involvement.guests.map((g) => g.identity)];
-    case 'address-in-title':
-      return [event.event.summary, event.event.location];
-    case 'orphaned-block':
-      return [time, event.event.tags];
-    case 'home-while-away':
-      return [time, event.place];
-    case 'whereabouts-gap':
-    case 'matter-unscheduled':
-    case 'matter-overdue-check-in':
-    case 'matter-deferred':
-      return time;
-  }
-}
-
 /** Findings report facts; none authorizes any action. */
 export function checkWeek(week: Week): Finding[] {
   const findings: Finding[] = [];
@@ -127,24 +76,10 @@ export function checkWeek(week: Week): Finding[] {
   ) => {
     const eventKeys = events.map((e) => e.key).sort();
     const key = `${kind}:${anchor ?? (eventKeys.length ? eventKeys.join('|') : (day ?? 'week'))}`;
-    findings.push({
-      key,
-      kind,
-      version: digest([
-        events
-          .map((e): readonly [string, unknown] => [e.key, findingVersion(kind, e)])
-          .sort(([a], [b]) => a.localeCompare(b)),
-        facts,
-      ]),
-      day,
-      eventKeys,
-      message,
-      facts,
-    });
+    findings.push({ key, kind, day, eventKeys, message, facts });
   };
   const rules = schedulingRules(week.preferences);
-  if (week.homeUnknown)
-    add('whereabouts-gap', null, [], 'travel unknown: home not set', { timeline: week.timeline.version }, 'home');
+  if (week.homeUnknown) add('whereabouts-gap', null, [], 'travel unknown: home not set', {}, 'home');
   for (const day of week.days) {
     const window = onDay(day.date, '00:00', '24:00', day.zone ?? 'UTC');
     const busy = week.events.filter((e) => e.busy && !e.allDay && overlap(e, window) > 0);
@@ -218,17 +153,12 @@ export function checkWeek(week: Week): Finding[] {
             { zone: windowZone, default_window: week.preferences.working_hours.length === 0 },
           );
       }
-      const outside = e.involvement.guests.filter(
-        (g) =>
-          g.identity.startsWith('email:') &&
-          !week.principalAddresses.some((address) => address.split('@')[1] === g.identity.split('@')[1]),
-      );
       if (
-        outside.length > 0 &&
+        e.involvement.guests.length > 0 &&
         !e.event.description?.trim() &&
         !blocks.some((b) => b.event.tags?.[WEEK_TAGS.blockKind] === 'prep' && b.end <= e.start)
       )
-        add('missing-prep', day.date, [e], 'Meeting has outside guests, no notes and no prep block.');
+        add('missing-prep', day.date, [e], 'Guests other than the principal; no notes and no prep block.');
       if (
         !e.allDay &&
         e.involvement.guests.length > 0 &&
@@ -370,7 +300,7 @@ export function checkWeek(week: Week): Finding[] {
         m.id,
       );
   }
-  return [...new Map(findings.map((f) => [`${f.key}\0${f.version}`, f])).values()].sort(
+  return [...new Map(findings.map((f) => [f.key, f])).values()].sort(
     (a, b) => (a.day ?? '').localeCompare(b.day ?? '') || a.key.localeCompare(b.key),
   );
 }
