@@ -1,6 +1,6 @@
-import { spawnSync } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, onTestFinished } from 'vitest';
 import type { Timeline } from '../gws-ea-whereabouts/timeline.js';
 import { wallClock } from '../gws-ea-whereabouts/clock.js';
 import { nextClosePlacement } from './sync.js';
@@ -44,18 +44,55 @@ function route(homeZone: string, destination: string, departure: string, arrival
 }
 
 describe('R34 close route grid', () => {
-  it('reports an open-ended unknown-zone stay promptly instead of holding the matters loop forever', () => {
+  it('reports an open-ended unknown-zone stay promptly instead of holding the matters loop forever', async () => {
     const initial = route('America/Los_Angeles', 'Asia/Tokyo', '2026-10-11T00:00Z', '2026-10-12T00:00Z');
     const timeline: Timeline = { ...initial, legs: [], stays: initial.stays.map((stay) => ({ ...stay, zone: null })) };
-    const source = `import { nextClosePlacement } from ${JSON.stringify(fileURLToPath(new URL('./sync.ts', import.meta.url)))}; nextClosePlacement(JSON.parse(process.argv[1]), Date.parse('2026-10-12T17:00Z'));`;
-    const result = spawnSync(
+    const source = `import { nextClosePlacement } from ${JSON.stringify(fileURLToPath(new URL('./sync.ts', import.meta.url)))};
+process.send('ready');
+process.once('message', () => {
+  nextClosePlacement(JSON.parse(process.argv[1]), Date.parse('2026-10-12T17:00Z'));
+  process.disconnect();
+});`;
+    const child = spawn(
       process.execPath,
       ['--import', 'tsx', '--input-type=module', '-e', source, JSON.stringify(timeline)],
-      { encoding: 'utf8', timeout: 2000 },
+      { stdio: ['ignore', 'ignore', 'pipe', 'ipc'] },
     );
-    expect(result.error).toBeUndefined();
-    expect(result.status).toBe(1);
-    expect(result.stderr).toContain('zone in effect is unknown');
+    let ready = false;
+    let timedOut = false;
+    let stderr = '';
+    let watchdog: NodeJS.Timeout | undefined;
+    onTestFinished(() => {
+      clearTimeout(watchdog);
+      if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+    });
+    child.stderr?.setEncoding('utf8');
+    child.stderr?.on('data', (text: string) => {
+      stderr += text;
+    });
+    const status = await new Promise<number | null>((resolve, reject) => {
+      child.once('error', reject);
+      child.once('close', (code) => {
+        clearTimeout(watchdog);
+        resolve(code);
+      });
+      child.once('message', (message: unknown) => {
+        if (message !== 'ready') {
+          reject(new Error('The close-placement child sent an unexpected readiness message'));
+          return;
+        }
+        ready = true;
+        watchdog = setTimeout(() => {
+          timedOut = true;
+          child.kill('SIGKILL');
+        }, 2000);
+        child.send('run');
+      });
+    });
+    expect(ready).toBe(true);
+    expect(timedOut).toBe(false);
+    expect(status).toBe(1);
+    expect(stderr).toContain('zone in effect is unknown');
   });
 
   it('jumps over a years-long unknown stay to the next known zone boundary', () => {
