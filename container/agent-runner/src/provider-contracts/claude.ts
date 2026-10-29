@@ -88,7 +88,6 @@ function writeMemorySessionHook(hook: RuntimeMemoryHookInput): void {
     });
   }
 
-  // GWS-EA divergence: the host grants this key only to canonical main.
   const mainContext = runnerCapabilities().has('gws-ea-main-context');
   const promptSubmit = hooks.UserPromptSubmit ?? [];
   if (!Array.isArray(promptSubmit)) throw new Error(`${filePath} hooks.UserPromptSubmit must be an array`);

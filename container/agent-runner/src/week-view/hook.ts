@@ -20,11 +20,13 @@ function differences(previous: DeliveredView | undefined, days: readonly ViewDay
   for (const day of days) {
     const held = previous?.days.find((entry) => entry.date === day.date);
     if (!held || held.header !== day.header) changes.push(day.header);
+    const heldEntries = new Set(held?.entries.map((entry) => JSON.stringify([entry.id, entry.text, entry.version])));
+    const currentIds = new Set(day.entries.map((entry) => entry.id));
     for (const entry of day.entries)
-      if (!held?.entries.some((old) => old.id === entry.id && old.text === entry.text && old.version === entry.version))
+      if (!heldEntries.has(JSON.stringify([entry.id, entry.text, entry.version])))
         changes.push(`${day.date}: ${entry.text}`);
     for (const old of held?.entries ?? [])
-      if (!day.entries.some((entry) => entry.id === old.id)) changes.push(`${day.date}: removed ${old.text}`);
+      if (!currentIds.has(old.id)) changes.push(`${day.date}: removed ${old.text}`);
   }
   if (manual !== previous?.manual) changes.push(`Current Principal Manual\n${manual}`);
   const lines: string[] = [];
@@ -43,7 +45,6 @@ function write(text: string): void {
   for (let offset = 0; offset < bytes.length; ) offset += fs.writeSync(1, bytes, offset);
 }
 
-/** This command never holds up the conversation when a snapshot or its receipt is unavailable. */
 function run(): void {
   const raw: unknown = JSON.parse(fs.readFileSync(0, 'utf8'));
   if (!isRecord(raw) || (raw.hook_event_name !== 'SessionStart' && raw.hook_event_name !== 'UserPromptSubmit')) return;
@@ -104,8 +105,6 @@ function run(): void {
 if (import.meta.main) {
   try {
     run();
-  } catch {
-    /* Hook failure must never prevent a turn. */
-  }
+  } catch {}
   process.exitCode = 0;
 }

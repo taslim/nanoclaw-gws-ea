@@ -29,7 +29,6 @@ export interface WeekView {
   readonly timeline: Timeline;
 }
 
-/** Calendar localities remain source text even after a leg becomes a durable stay. */
 function presentedTimeline(timeline: Timeline): Timeline {
   return {
     ...timeline,
@@ -83,7 +82,6 @@ export function renderWeekView(
       ],
     }),
   );
-  // Headers keep all eight dates visible; the file retains full entries for precise bounded diffs.
   const headers = allDays.map((day) => day.header).join('\n\n');
   let allowance = Math.max(0, VIEW_CHARACTERS - headers.length - 300);
   const shownEntries = allDays.map((): ViewEntry[] => []);

@@ -7,7 +7,6 @@ import { SYNTHETIC_IDENTITY } from './state.js';
 const header = (headers: readonly GmailHeader[], name: string): string | undefined =>
   headers.find((entry) => entry.name.toLowerCase() === name.toLowerCase())?.value;
 
-/** Decode the MIME production actually sends into Gmail's full-message wire shape. */
 function mimePart(raw: string): GmailMessagePart {
   const separator = raw.indexOf('\r\n\r\n');
   if (separator < 0) throw new Error('Synthetic Gmail received MIME without a header/body separator');

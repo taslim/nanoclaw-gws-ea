@@ -46,9 +46,7 @@ export function recordDelivered(id: string, snapshot: DeliveredView, dir = WEEK_
   } catch {
     try {
       fs.rmSync(temporary, { force: true });
-    } catch {
-      /* A missing receipt only repeats delivery. */
-    }
+    } catch {}
   }
 }
 export function isRecord(value: unknown): value is Record<string, unknown> {

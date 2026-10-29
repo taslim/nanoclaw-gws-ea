@@ -59,8 +59,7 @@ async function collect(sections: readonly DaySection[], read: () => Promise<void
   /* eslint-enable no-catch-all/no-catch-all */
 }
 
-/** The host strips caller-supplied marks before admission; this survives the short-lived authorization cache. */
-function principalMarked(content: string, messageId: string): boolean {
+function hasHostPrincipalMessageMark(content: string, messageId: string): boolean {
   try {
     const parsed: unknown = JSON.parse(content);
     return (
@@ -96,7 +95,6 @@ export async function readDayLedger(ctx: CallerContext): Promise<DayLedger> {
   const findings = section('findings');
   const result: DayLedger = { from, through, sections: [principal, sends, writes, notes, findings] };
   const consumed = new Map<string, ConsumedCalendarWrite>();
-  const writeEntries = new Map<string, string>();
   await collect([principal, notes, sends], async () => {
     for (const session of main === null ? [] : await getSessionsByAgentGroup(main)) {
       if (session.messaging_group_id === null && session.thread_id?.startsWith('system:')) continue;
@@ -111,7 +109,7 @@ export async function readDayLedger(ctx: CallerContext): Promise<DayLedger> {
                 continue;
               const text = parseInboundContent(message.content).text;
               if (!text) continue;
-              if (principalMarked(message.content, message.id))
+              if (hasHostPrincipalMessageMark(message.content, message.id))
                 principal.entries.push(`${message.timestamp}; conversation ${session.id}\n${text}`);
               else
                 notes.entries.push(
@@ -170,9 +168,8 @@ export async function readDayLedger(ctx: CallerContext): Promise<DayLedger> {
       );
       const entry = `${write.requestId}: ${write.action}; ${write.affectedStart} to ${write.affectedEnd}\n${framed(JSON.stringify({ calendar: write.calendarId, event: write.eventId, request: write.request, outcome: write.outcome }), 'calendar_write')}\n${checked}`;
       writes.entries.push(entry);
-      writeEntries.set(entry, write.requestId);
       if (current && write.state === 'applied')
-        consumed.set(write.requestId, { requestId: write.requestId, updatedAt: current.updated_at });
+        consumed.set(entry, { requestId: write.requestId, updatedAt: current.updated_at });
     }
   });
   await collect([notes], async () => {
@@ -210,12 +207,18 @@ export async function readDayLedger(ctx: CallerContext): Promise<DayLedger> {
       ),
     );
   });
-  // Remove whole entries, preserving every retained principal message in full.
-  for (const current of [sends, notes, writes, findings, principal])
-    while (JSON.stringify(result).length > LIMIT && current.entries.length) {
-      current.entries.shift();
+  let serializedLength = JSON.stringify(result).length;
+  for (const current of [sends, notes, writes, findings, principal]) {
+    let removed = 0;
+    while (serializedLength > LIMIT && removed < current.entries.length) {
+      serializedLength -= JSON.stringify(current.entries[removed]).length;
+      if (current.entries.length - removed > 1) serializedLength -= 1;
+      serializedLength += String(current.omitted + 1).length - String(current.omitted).length;
+      removed += 1;
       current.omitted += 1;
     }
+    if (removed) current.entries = current.entries.slice(removed);
+  }
   if (ctx.caller === 'agent') {
     try {
       const run = await getOpenCloseRun(ctx.sessionId);
@@ -224,8 +227,7 @@ export async function readDayLedger(ctx: CallerContext): Promise<DayLedger> {
           from,
           through,
           writes: writes.entries.flatMap((entry) => {
-            const id = writeEntries.get(entry);
-            const held = id === undefined ? undefined : consumed.get(id);
+            const held = consumed.get(entry);
             return held ? [held] : [];
           }),
         });

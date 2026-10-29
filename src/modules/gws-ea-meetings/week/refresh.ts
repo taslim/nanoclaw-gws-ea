@@ -134,7 +134,6 @@ export function createWeekRefresher(deps: { readonly calendar: () => MeetingsCal
       fullDay !== today ||
       (calendars.some((calendar) => calendar.accessRole === 'freeBusyReader') &&
         at.getTime() - lastFullAt >= BUSY_REFRESH);
-    // A newly recorded stay reaches the local clocks before any placement read can wait on Google.
     if ((placementChanged || renderChanged) && copies && lastReadAt) await publish(copies, timeline, at, lastReadAt);
     renderChanged = false;
     const changes = await settledCalendarChanges(at);
