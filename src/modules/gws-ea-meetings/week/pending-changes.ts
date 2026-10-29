@@ -26,9 +26,6 @@ export async function recordPendingCalendarChange(messageId: string, notice: Cal
     at.toISOString(),
   );
 }
-export async function hasPendingCalendarChanges(): Promise<boolean> {
-  return (await getDb().get<{ n: number }>('SELECT COUNT(*) AS n FROM gws_ea_pending_calendar_changes'))?.n !== 0;
-}
 export async function settledCalendarChanges(at: Date): Promise<PendingCalendarChange[]> {
   const groups = new Map<string, Row[]>();
   for (const row of await getDb().all<Row>(
