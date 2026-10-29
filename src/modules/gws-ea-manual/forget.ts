@@ -3,7 +3,6 @@ import { getPerson, mayNamePerson, type ForgottenPerson, type PersonToForget } f
 import { getWhereabouts } from '../gws-ea-whereabouts/records.js';
 import { getManualSections, withholdVersion } from './db.js';
 
-/** Reviews read authored words; hooks withhold that version until main rewrites it. */
 export async function manualToRewrite(person: PersonToForget): Promise<string[]> {
   const [sections, whereabouts] = await Promise.all([getManualSections(), getWhereabouts()]);
   return [

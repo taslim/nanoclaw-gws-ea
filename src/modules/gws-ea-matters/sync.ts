@@ -1,3 +1,4 @@
+import { getDb } from '../../db/connection.js';
 /**
  * The daily sync: one recurring task in `main`'s conversation, kept by the
  * host (`loop.ts`), that wakes main seven days a week to look ahead and read
@@ -42,7 +43,7 @@ import {
   type ScriptVerdict,
 } from './looks.js';
 import { principalTimezone } from './render.js';
-import { getMatter } from './db.js';
+import type { Matter } from './db.js';
 import { loadTimeline } from '../gws-ea-whereabouts/timeline.js';
 import { matterNeedsTimeline, matterPlanningLines } from './planning.js';
 
@@ -306,14 +307,16 @@ async function looksBefore(before: string): Promise<DueLook[]> {
 export async function todayVerdict(): Promise<ScriptVerdict> {
   const timezone = await principalTimezone();
   const looks = await looksBefore(nextRun('0 0 * * *', timezone));
-  const matters = await Promise.all(looks.map((look) => getMatter(look.matterId)));
-  const timeline = matters.some((matter) => matter !== undefined && matterNeedsTimeline(matter))
-    ? await loadTimeline()
-    : null;
+  const matters =
+    looks.length === 0
+      ? []
+      : await getDb().all<Pick<Matter, 'id' | 'due_at' | 'needs_minutes' | 'place' | 'deferrals'>>(
+          `SELECT id, due_at, needs_minutes, place, deferrals FROM gws_ea_matters WHERE id IN (${looks.map(() => '?').join(', ')})`,
+          ...looks.map((look) => look.matterId),
+        );
+  const timeline = matters.some(matterNeedsTimeline) ? await loadTimeline() : null;
   const facts = new Map(
-    matters.flatMap((matter) =>
-      matter === undefined ? [] : [[matter.id, matterPlanningLines(matter, timeline, timezone).join(' ')] as const],
-    ),
+    matters.map((matter) => [matter.id, matterPlanningLines(matter, timeline, timezone).join(' ')] as const),
   );
   const suffix = (id: string): string => (facts.get(id) ? `; ${facts.get(id)}` : '');
   const sections: ScriptSection[] = [

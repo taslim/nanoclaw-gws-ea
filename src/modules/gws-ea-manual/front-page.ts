@@ -51,7 +51,6 @@ function clock(minute: number): string {
   return `${String(Math.floor(minute / 60)).padStart(2, '0')}:${String(minute % 60).padStart(2, '0')}`;
 }
 
-/** Whole blocks either fit or point at their full store; a stored fact is never sliced. */
 function block(title: string, lines: readonly string[], budget: number, pointer: string): string {
   const full = `${title}\n${lines.join('\n')}`;
   return full.length <= budget ? full : `${title}: read \`${pointer}\` for the complete section.`;
@@ -213,7 +212,6 @@ export function renderManualFrontPage(snapshot: ManualSnapshot): string {
   ].join('\n\n');
 }
 
-/** Current front page for spawn composition and the live meetings view. */
 export async function loadManualFrontPage(): Promise<string> {
   return renderManualFrontPage(await loadManualSnapshot());
 }
