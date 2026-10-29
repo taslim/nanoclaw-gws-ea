@@ -18,7 +18,6 @@ function morningMinute(day: string, preferences: SchedulingPreferenceValues): nu
   const hours = preferences.working_hours.find((row) => row.weekday === weekday);
   if (!hours?.off) return hours ? Math.max(0, minutes(hours.start) - 60) : 7 * 60;
   let minute = 9 * 60;
-  // A protected span containing this moment moves it to the first permitted minute.
   for (const window of [...preferences.protected_windows]
     .filter((row) => row.weekdays.includes(weekday))
     .sort((a, b) => minutes(a.start) - minutes(b.start))) {
@@ -136,13 +135,14 @@ export async function morningVerdict(day: string): Promise<ScriptVerdict> {
   const decision = await getDb().get<MorningDecision>('SELECT * FROM gws_ea_morning_decisions WHERE day=?', day);
   if (!decision?.task_id) return { wakeAgent: false, data: [] };
   const ids = JSON.parse(decision.matters_json) as string[];
+  const rows = await getDb().all<{ id: string; title: string }>(
+    'SELECT id,title FROM gws_ea_matters WHERE closed_at IS NULL AND look_task_id=?',
+    decision.task_id,
+  );
+  const byId = new Map(rows.map((row) => [row.id, row]));
   const matters: string[] = [];
   for (const id of ids) {
-    const row = await getDb().get<{ title: string }>(
-      'SELECT title FROM gws_ea_matters WHERE id=? AND closed_at IS NULL AND look_task_id=?',
-      id,
-      decision.task_id,
-    );
+    const row = byId.get(id);
     if (row) matters.push(`- ${id}: ${row.title}`);
   }
   return { wakeAgent: true, data: [`Morning ${day} in ${decision.zone}.`, ...matters] };

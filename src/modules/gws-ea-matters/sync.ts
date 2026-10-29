@@ -133,16 +133,13 @@ async function createClose(main: Session, moment: LocalMoment, timeline: Timelin
     session_id: session.id,
     scheduled_at: at,
     zone: moment.zone,
-    timeline_version: timeline.version,
-    weekly_day: null,
-    report_text: null,
-    report_notify: null,
-    retired_at: null,
   });
   return at;
 }
 
-async function ensureCloseTask(schedule: CloseSchedule): Promise<void> {
+async function ensureCloseTask(
+  schedule: Pick<CloseSchedule, 'id' | 'session_id' | 'scheduled_at' | 'zone'>,
+): Promise<void> {
   const session = await getSession(schedule.session_id);
   if (!session) throw new Error('The close session is unavailable.');
   const prepared = prepareScheduledTask({
@@ -162,7 +159,6 @@ async function activeCloseSchedules(): Promise<CloseSchedule[]> {
   );
 }
 
-/** Closure revokes native outbound authority before waiting on the runtime's stop receipt. */
 async function retireClose(schedule: CloseSchedule, failed: boolean): Promise<void> {
   await getDb().transaction(async () => {
     if (failed) await failCloseRun(schedule.id);
@@ -266,7 +262,6 @@ export async function keepClose(main: Session): Promise<string> {
       });
       if (touched === 'claimed' || isContainerRunning(held.session.id)) return schedule.scheduled_at;
       if (touched !== 'updated') {
-        // Native due rows are immutable. Retire this unclaimed occurrence before arming its new clock.
         await retireClose(schedule, false);
         return createClose(main, moment, timeline);
       }

@@ -77,7 +77,6 @@ function deny(reason: string): SyncHookJSONOutput {
   };
 }
 
-/** Parse arguments ourselves; the allowed command is re-quoted so the shell cannot reinterpret them. */
 function commandArguments(command: string): string[] | undefined {
   if (/[;&|`<>\0]/u.test(command) || command.includes('$(')) return undefined;
   const args: string[] = [];
@@ -118,8 +117,7 @@ function commandArguments(command: string): string[] | undefined {
 }
 const shellQuote = (value: string): string => `'${value.replaceAll("'", "'\\''")}'`;
 
-/** Resolve existing ancestors too: a not-yet-written file may sit behind a symlink. */
-function resolvedWritePath(file: string): string | undefined {
+function resolvePathThroughExistingAncestor(file: string): string | undefined {
   const suffix: string[] = [];
   let candidate = file;
   while (true) {
@@ -224,7 +222,9 @@ export function createPlanningRuntime(agentDirectory: string): PlanningRuntime {
       if (tool === 'Write' || tool === 'Edit') {
         const value = record(input.tool_input) ? input.tool_input : {};
         const file =
-          typeof value.file_path === 'string' ? resolvedWritePath(path.resolve(directory, value.file_path)) : undefined;
+          typeof value.file_path === 'string'
+            ? resolvePathThroughExistingAncestor(path.resolve(directory, value.file_path))
+            : undefined;
         const own = resultFile(id, kind);
         if (file === own)
           return boundedResult(tool, value, file)

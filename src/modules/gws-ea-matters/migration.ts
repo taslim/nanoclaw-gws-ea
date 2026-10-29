@@ -146,7 +146,6 @@ export const gwsEaTimeAnchorsMigration: ModuleMigration = {
   },
 };
 
-/** Fork-owned clocks and gate decisions; completion remains in close-runs. */
 export const gwsEaCloseClockMigration: ModuleMigration = {
   version: 1,
   name: 'module:gws-ea-matters:close-and-morning',

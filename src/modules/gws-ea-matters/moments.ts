@@ -37,9 +37,7 @@ export function nextLocalMoment(
     for (const zone of zones) {
       if (zone === null) continue;
       let date: LocalDate = wallClock(start, zone);
-      // Within a stay/leg segment, only the declared weekday rhythm can change the zone.
-      // Include the starting weekday again, since today's wall moment may already have passed.
-      for (let weekday = 0; weekday <= WEEKDAYS.length; weekday++) {
+      for (let daysAhead = 0; daysAhead <= WEEKDAYS.length; daysAhead++) {
         const day = dateString(date);
         const at = zonedInstant(date, minute(day, zone), zone);
         if (at >= start && at < end && zoneAt(timeline, at) === zone && (best === undefined || at < best.at)) {
