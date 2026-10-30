@@ -49,6 +49,7 @@ import { createAgentGroup, initTestDb, runMigrations } from '../../db/index.js';
 import { registerMigration } from '../../db/migrations/index.js';
 import { createSession, getSessionsByAgentGroup } from '../../db/sessions.js';
 import '../gws-ea-profile/index.js';
+import { recordWebAlias } from '../gws-ea-profile/testing/web-alias.js';
 import { routeSignInMail } from '../gws-ea-inbox/route-mail.js';
 import { parseGmailMessage } from '../gws-ea-inbox/mime.js';
 import { gwsEaInboxMigration } from '../gws-ea-inbox/migration.js';
@@ -414,6 +415,7 @@ describe.skipIf(!chromePath)('native authorized signup and password change', { t
   beforeEach(async () => {
     const db = await initTestDb();
     await runMigrations(db);
+    await recordWebAlias(USERNAME);
     const createdAt = new Date().toISOString();
     for (const id of ['main', 'browser'])
       await createAgentGroup({ id, name: id, folder: id, agent_provider: null, created_at: createdAt });
@@ -649,7 +651,12 @@ describe.skipIf(!chromePath)('native authorized signup and password change', { t
       return { itemId, handle: found.itemHandle };
     }
     async function changeAuthority(handle: string): Promise<CredentialAttempt> {
-      const prepared = await attempts.prepareRotation({ jobId: JOB, origin: SITE, itemHandle: handle });
+      const prepared = await attempts.prepareRotation({
+        jobId: JOB,
+        origin: SITE,
+        username: USERNAME,
+        itemHandle: handle,
+      });
       if (prepared.status !== 'prepared') throw new Error(prepared.status);
       return prepared.attempt;
     }
@@ -703,7 +710,7 @@ describe.skipIf(!chromePath)('native authorized signup and password change', { t
       expect(accountPassword).toBe(fake.value(itemId, 'password'));
     }, 30_000);
 
-    it('covers AE7 at the page: a Login edited after delegation is refused before any insertion', async () => {
+    it('at the page: a Login edited after delegation is refused before any insertion', async () => {
       const { itemId, handle } = await ownedAccount();
       const authority = await changeAuthority(handle);
       fake.edit(itemId, (item) => ({

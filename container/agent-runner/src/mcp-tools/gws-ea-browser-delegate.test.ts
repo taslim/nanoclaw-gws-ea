@@ -187,7 +187,7 @@ it('records signup or password-change authority through the native host request,
   const { request, id } = await call(
     credentialAuthority,
     { ...fields, password: 'chosen-by-main' },
-    { status: 'not_owned', reason: 'no_record' },
+    { status: 'not_owned' },
   );
   expect(request).toEqual({ action: 'credential_authority', requestId: id, ...fields });
   for (const outcome of ['recorded', 'authority', 'not_owned', 'busy', 'vault_unavailable', 'rate_limited'])

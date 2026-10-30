@@ -102,7 +102,12 @@ export class FakeOnePassword {
   edit(id: string, change: (item: Item) => Item): void {
     const current = this.items.get(id);
     if (!current) throw new Error('no such item');
-    this.items.set(id, { ...change(structuredClone(current)), id, version: current.version + 1 });
+    this.items.set(id, {
+      ...change(structuredClone(current)),
+      id,
+      version: current.version + 1,
+      updatedAt: new Date(Math.max(Date.now(), current.updatedAt.getTime() + 1)),
+    });
   }
 
   value(id: string, fieldId: string): string | undefined {

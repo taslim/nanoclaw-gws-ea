@@ -18,18 +18,19 @@
  * Passwords live only in 1Password and this process's memory: rows, errors
  * and logs carry identifiers and constant reasons. Each operation issues at
  * most one create, tagged with its own marker; a lost response is reconciled
- * by that marker, never by creating again. A finalized row is the ownership
- * record a password change requires. Provider calls never run inside a DB
- * transaction, and every phase moves by compare-and-set.
+ * by that marker, never by creating again. A finalized signup identifies an
+ * assistant account with a non-email username. Provider calls never run inside
+ * a DB transaction, and every phase moves by compare-and-set.
  */
 import { randomUUID } from 'node:crypto';
 
 import { getDb } from '../../db/connection.js';
 import type { DbDriver } from '../../db/driver.js';
 import { isUniqueViolation } from '../../db/errors.js';
-import { hasControlCharacters, isRecord } from '../../gws-ea/validation.js';
+import { EMAIL_PATTERN, hasControlCharacters, isRecord } from '../../gws-ea/validation.js';
 import { log } from '../../log.js';
 import { httpsOrigin } from './authentication-signatures.js';
+import { isAssistantAccount } from './web-address.js';
 import {
   active,
   browserVault,
@@ -92,7 +93,7 @@ export interface CredentialAttempt {
   readonly vault_id: string;
   /** The exact HTTPS origin the operation was delegated for. */
   readonly origin: string;
-  /** Its registrable domain: the site the account, and any ownership record, belong to. */
+  /** Its registrable domain: the site the account belongs to. */
   readonly site: string;
   readonly username: string;
   /** A password change's original Login, and its version when the candidate was saved. */
@@ -107,7 +108,7 @@ export interface CredentialAttempt {
   /** A confirmed change's decided outcome; its `kept` reason is `conflict_reason`. */
   readonly settlement: CredentialSettlement | null;
   readonly evidence_json: string | null;
-  /** Set on finalizing: the Login the host saved, owned while its username and site still match this row. */
+  /** Set on finalizing: the Login this operation saved or updated. */
   readonly owned_item_id: string | null;
   readonly created_at: string;
   readonly updated_at: string;
@@ -162,7 +163,7 @@ export type CredentialReleaseResult =
   | { readonly status: 'settled'; readonly result: Settled };
 export type CredentialOwnership =
   | { readonly status: 'owned' }
-  | { readonly status: 'not_owned'; readonly reason: 'no_record' | 'changed' }
+  | { readonly status: 'not_owned' }
   | { readonly status: BrowserVaultReason };
 
 export class CredentialAttemptError extends Error {
@@ -203,10 +204,6 @@ export function line(value: unknown, max: number): value is string {
     value.trim() === value &&
     !hasControlCharacters(value)
   );
-}
-
-function ownershipHolds(record: Pick<CredentialAttempt, 'username' | 'site'>, read: VaultItemRead): boolean {
-  return read.category === 'login' && read.username === record.username && read.domains.includes(record.site);
 }
 
 /**
@@ -306,14 +303,44 @@ export class CredentialAttempts {
     }
   }
 
-  /** An item's ownership record: the latest finalized attempt that saved it. Edits in 1Password never touch it. */
-  private record(vaultId: string, itemId: string): Promise<CredentialAttempt | undefined> {
-    return this.db.get<CredentialAttempt>(
-      `SELECT * FROM ${TABLE} WHERE vault_id = ? AND owned_item_id = ? AND phase = 'finalized'
-       ORDER BY finalized_at DESC, id DESC LIMIT 1`,
-      vaultId,
-      itemId,
+  /** Username decides ownership; only a finalized signup establishes a non-email account. */
+  private async assistantAccount(
+    login: Pick<VaultItemRead, 'category' | 'username' | 'domains'>,
+    site: string,
+  ): Promise<boolean> {
+    const { username } = login;
+    if (login.category !== 'login' || username === undefined || !login.domains.includes(site)) return false;
+    if (await isAssistantAccount(username)) return true;
+    if (EMAIL_PATTERN.test(username)) return false;
+    return (
+      (await this.db.get<{ id: string }>(
+        `SELECT id FROM ${TABLE} WHERE kind = 'signup' AND phase = 'finalized' AND site = ? AND username = ? LIMIT 1`,
+        site,
+        username,
+      )) !== undefined
     );
+  }
+
+  /** A cached classification for a listing; writes always use a fresh item read instead. */
+  async account(
+    itemHandle: string,
+    origin: string,
+    assertActive = active,
+  ): Promise<{ readonly status: 'classified'; readonly account: 'assistant' | 'principal' } | VaultFailure> {
+    const login = await provider(this.vault.loginForHandle(itemHandle, origin, assertActive));
+    if (!('value' in login)) return login;
+    const site = registrableDomain(origin);
+    const owned =
+      site !== undefined &&
+      (await this.assistantAccount(
+        {
+          category: 'login',
+          username: login.value.username,
+          domains: login.value.websites.flatMap((website) => registrableDomain(website.url) ?? []),
+        },
+        site,
+      ));
+    return { status: 'classified', account: owned ? 'assistant' : 'principal' };
   }
 
   private async listedItem(
@@ -330,25 +357,22 @@ export class CredentialAttempts {
   }
 
   /**
-   * Whether the Login behind a listed handle is one this host saved, and still
-   * has the username and site it saved for this origin's site. Without a
-   * record it spends no request beyond the cached listing; with one, a single
-   * fresh read.
+   * Whether the Login behind a listed handle is the assistant's account for
+   * this site, checked against its current username and websites.
    */
   async ownership(itemHandle: string, origin: string, assertActive = active): Promise<CredentialOwnership> {
     const item = await this.listedItem(itemHandle, origin, assertActive);
     if ('status' in item) return item;
-    const record = await this.record(item.vaultId, item.itemId);
-    if (!record || record.site !== registrableDomain(origin)) return { status: 'not_owned', reason: 'no_record' };
+    const site = registrableDomain(origin);
+    if (!site) return { status: 'not_owned' };
     const read = await provider(this.vault.readItem(item.vaultId, item.itemId, assertActive));
     if (!('value' in read)) return read;
-    return ownershipHolds(record, read.value) ? { status: 'owned' } : { status: 'not_owned', reason: 'changed' };
+    return (await this.assistantAccount(read.value, site)) ? { status: 'owned' } : { status: 'not_owned' };
   }
 
   /**
-   * A delegation names an account, not a handle: the listed Login this host
-   * saved for the origin's site under that username, found from the listing
-   * and local records alone. `ownership` then checks it fresh.
+   * A delegation names an account, not a handle: find the assistant's Login
+   * for that exact username and site, checking every candidate fresh.
    */
   async ownedHandle(
     origin: string,
@@ -364,8 +388,10 @@ export class CredentialAttempts {
     for (const { item_handle: itemHandle } of listed.value) {
       const item = await this.listedItem(itemHandle, origin, assertActive);
       if ('status' in item) continue;
-      const record = await this.record(item.vaultId, item.itemId);
-      if (record?.site === site && record.username === username) return { status: 'found', itemHandle };
+      const read = await provider(this.vault.readItem(item.vaultId, item.itemId, assertActive));
+      if (!('value' in read)) return read;
+      if (read.value.username === username && (await this.assistantAccount(read.value, site)))
+        return { status: 'found', itemHandle };
     }
     return { status: 'not_owned' };
   }
@@ -423,14 +449,14 @@ export class CredentialAttempts {
   }
 
   /**
-   * Needs an ownership record for this origin's site. One change per Login is
-   * open at a time: another job's change that disclosed nothing gives way and
+   * Needs the assistant's own account for this origin's site. One change per
+   * Login is open at a time: another job's change that disclosed nothing gives way and
    * its candidate is retired, while one that may have reached the site keeps
    * the Login busy. The Login's current state is checked fresh when the
    * candidate is saved and again right before disclosure.
    */
   async prepareRotation(
-    input: { readonly jobId: string; readonly origin: string; readonly itemHandle: string },
+    input: { readonly jobId: string; readonly origin: string; readonly username: string; readonly itemHandle: string },
     assertActive = active,
   ): Promise<CredentialPrepareResult> {
     const target = this.target(input.jobId, input.origin);
@@ -439,8 +465,15 @@ export class CredentialAttempts {
     const item = await this.listedItem(input.itemHandle, target.origin, assertActive);
     if ('status' in item) return item;
     if (item.vaultId !== availability.binding.vaultId) return { status: 'vault_unavailable' };
-    const record = await this.record(item.vaultId, item.itemId);
-    if (!record || record.site !== target.site) return { status: 'not_owned' };
+    const read = await provider(this.vault.readItem(item.vaultId, item.itemId, assertActive));
+    if (!('value' in read)) return read;
+    const { username } = read.value;
+    if (
+      username === undefined ||
+      username !== input.username ||
+      !(await this.assistantAccount(read.value, target.site))
+    )
+      return { status: 'not_owned' };
     const open = await this.db.get<CredentialAttempt>(
       `SELECT * FROM ${TABLE} WHERE vault_id = ? AND source_item_id = ? AND phase NOT IN ('rejected','finalized')`,
       item.vaultId,
@@ -459,7 +492,7 @@ export class CredentialAttempts {
     try {
       return {
         status: 'prepared',
-        attempt: await this.insert('rotation', input.jobId, availability.binding, target, record.username, item.itemId),
+        attempt: await this.insert('rotation', input.jobId, availability.binding, target, username, item.itemId),
       };
     } catch (error) {
       if (isUniqueViolation(error)) return { status: 'busy' };
@@ -508,12 +541,12 @@ export class CredentialAttempts {
     | VaultFailure
   > {
     if (attempt.source_item_id === null) return { status: 'not_owned' };
-    const record = await this.record(attempt.vault_id, attempt.source_item_id);
-    if (!record || record.username !== attempt.username || record.site !== attempt.site) return { status: 'not_owned' };
     const read = await this.fresh(attempt.vault_id, attempt.source_item_id, assertActive);
     if (!('value' in read)) return read;
     const { password } = read.value;
-    return ownershipHolds(record, read.value) && password !== undefined
+    return read.value.username === attempt.username &&
+      (await this.assistantAccount(read.value, attempt.site)) &&
+      password !== undefined
       ? { status: 'owned', read: read.value, password }
       : { status: 'not_owned' };
   }
@@ -677,7 +710,7 @@ export class CredentialAttempts {
    * disclosure (`exposed`) before returning anything, so the caller may insert
    * the value only after this resolves. A change also returns the original
    * Login's current password, read fresh and refused if it no longer matches
-   * its ownership record or the password the candidate replaces. While the
+   * its account ownership or the password the candidate replaces. While the
    * operator has 1Password disabled nothing is disclosed: the attempt stays
    * saved, its candidate kept for when it is enabled again.
    */
@@ -896,7 +929,7 @@ export class CredentialAttempts {
 
   /**
    * Publishes a confirmed signup's Login, or writes a confirmed change into the
-   * original Login, and records ownership. Everything is read fresh; a
+   * original Login, and records the completed operation. Everything is read fresh; a
    * vault failure leaves the attempt confirmed, and the next finalize resumes
    * from its recorded settlement. A settled attempt answers how it settled.
    */
@@ -942,7 +975,7 @@ export class CredentialAttempts {
 
   /**
    * Writes the new password into the original Login, read fresh immediately
-   * before each write and re-checked against its ownership record and its
+   * before each write and re-checked against its account ownership and its
    * active state. Only its password changes, on the version just read, so
    * every other edit the principal made stays. A write proves nothing until a
    * read shows the new password: a failed or odd answer is followed by a

@@ -2,7 +2,8 @@
  * The host's path into the assistant's own 1Password vault. It uses only what provisioning recorded for this
  * assistant: the host policy names the account, this instance's resource record names the one vault it may use, and
  * the runtime token beside it is scoped to that vault. Login metadata is listed once per binding and kept until an
- * explicit refresh or a write that changes what is listed; a secret is resolved only at fill time. The host-private
+ * explicit refresh or a write that changes what is listed; usernames are read lazily without retaining passwords.
+ * A selected secret is resolved only at fill time. The host-private
  * writes behind credential attempts read and save whole items here, in host memory only, and delete a candidate
  * once its operation no longer needs it. Item IDs, vault IDs, tokens and values stay on the host: agents see opaque
  * handles, titles and constant reasons.
@@ -41,6 +42,12 @@ export function vaultFailureStatus(error: BrowserVaultError): 'rate_limited' | '
 export interface BrowserVaultItem {
   title: string;
   item_handle: string;
+}
+
+/** Host-only metadata, with no password or other credential values. */
+export interface BrowserVaultLogin {
+  readonly username: string | undefined;
+  readonly websites: readonly Website[];
 }
 
 /** Each defaults to its host locator, re-read for every use. */
@@ -295,14 +302,16 @@ async function candidateParams(spec: VaultCandidateSpec): Promise<ItemCreatePara
 }
 
 /**
- * Lists overviews and resolves a selected field for fills; fresh item reads
- * and writes serve credential attempts alone, and their values stay here.
+ * Lists overviews, caches Login metadata and resolves a selected field for
+ * fills. Fresh item reads and writes serve credential attempts, and their
+ * values stay here.
  */
 export class BrowserVault {
   private client: Promise<Client> | undefined;
   private token: string | undefined;
   private vaultId: string | undefined;
   private handles = new Map<string, ItemOverview>();
+  private usernames = new Map<string, { readonly updatedAt: number; readonly login: BrowserVaultLogin }>();
   private loaded = false;
   /** Advances whenever the binding resets, so a listing begun under another binding is never kept. */
   private epoch = 0;
@@ -322,6 +331,7 @@ export class BrowserVault {
     this.token = undefined;
     this.vaultId = undefined;
     this.handles.clear();
+    this.usernames.clear();
     this.loaded = false;
     this.loading = undefined;
     this.clearHold();
@@ -435,6 +445,7 @@ export class BrowserVault {
   private invalidate(): void {
     this.generation += 1;
     this.loaded = false;
+    this.usernames.clear();
   }
 
   private async load(client: Client, assertActive: () => Promise<void>): Promise<void> {
@@ -461,6 +472,8 @@ export class BrowserVault {
           !pendingCandidate(item.tags),
       );
       const byId = new Map(overviews.map((item) => [item.id, item]));
+      for (const [id, cached] of this.usernames)
+        if (byId.get(id)?.updatedAt.getTime() !== cached.updatedAt) this.usernames.delete(id);
       for (const [handle, previous] of this.handles) {
         const current = byId.get(previous.id);
         if (current) this.handles.set(handle, current);
@@ -531,6 +544,34 @@ export class BrowserVault {
   ): Promise<{ readonly vaultId: string; readonly itemId: string }> {
     const { item } = await this.listed(handle, origin, assertActive);
     return { vaultId: item.vaultId, itemId: item.id };
+  }
+
+  /**
+   * Read a Login's username only when needed, then retain just its username
+   * and websites until the listing reports another updatedAt. Full items,
+   * including their passwords, are never held in this cache.
+   */
+  async loginForHandle(handle: string, origin: string, assertActive = active): Promise<BrowserVaultLogin> {
+    const { client, item: overview } = await this.listed(handle, origin, assertActive);
+    const cached = this.usernames.get(overview.id);
+    if (cached?.updatedAt === overview.updatedAt.getTime()) return cached.login;
+    try {
+      const item = await client.items.get(overview.vaultId, overview.id);
+      await assertActive();
+      if (item.id !== overview.id || item.vaultId !== overview.vaultId || item.category !== 'Login')
+        throw new BrowserVaultError('no_item_for_site');
+      const login: BrowserVaultLogin = {
+        username: fieldValue(item, 'username', undefined, false),
+        websites: item.websites.map((site) => ({ ...site })),
+      };
+      // A read racing with an edit can answer this call, but cannot bless the
+      // old overview with the new version's metadata.
+      if (item.updatedAt.getTime() === overview.updatedAt.getTime())
+        this.usernames.set(item.id, { updatedAt: item.updatedAt.getTime(), login });
+      return login;
+    } catch (error) {
+      throw await this.error(error);
+    }
   }
 
   /** One fresh read of an item in the bound vault: one request, never cached. */
