@@ -17,7 +17,7 @@ import { instanceMarkerFile } from '../../gws-ea/paths.js';
 import { readInstanceMarkerFile } from '../../gws-ea/registry.js';
 import { instanceLayout } from '../../gws-ea/release-layout.js';
 import { GwsEaError } from '../../gws-ea/types.js';
-import { httpsOrigin, type BrowserSecretField } from './authentication-signatures.js';
+import { httpsOrigin, onePasswordWebsiteOrigin, type BrowserSecretField } from './authentication-signatures.js';
 import {
   isNormalizedAbsolute,
   ONEPASSWORD_POLICY_FILE_ENV,
@@ -28,15 +28,22 @@ import {
 } from './onepassword-policy.js';
 import { browserRoot } from './availability.js';
 
-export type BrowserVaultReason = 'vault_unavailable' | 'rate_limited' | 'no_item_for_site' | 'origin_mismatch';
+export type BrowserVaultReason =
+  | 'vault_not_set_up'
+  | 'vault_unavailable'
+  | 'rate_limited'
+  | 'no_item_for_site'
+  | 'origin_mismatch';
 export class BrowserVaultError extends Error {
   constructor(readonly reason: BrowserVaultReason) {
     super(reason);
   }
 }
 
-export function vaultFailureStatus(error: BrowserVaultError): 'rate_limited' | 'vault_unavailable' {
-  return error.reason === 'rate_limited' ? 'rate_limited' : 'vault_unavailable';
+export function vaultFailureStatus(
+  error: BrowserVaultError,
+): 'rate_limited' | 'vault_not_set_up' | 'vault_unavailable' {
+  return error.reason === 'rate_limited' || error.reason === 'vault_not_set_up' ? error.reason : 'vault_unavailable';
 }
 
 export interface BrowserVaultItem {
@@ -141,7 +148,7 @@ export function websitePermitsOrigin(
   raw: string,
 ): boolean {
   const target = httpsOrigin(raw);
-  const source = httpsOrigin(website.url);
+  const source = onePasswordWebsiteOrigin(website.url);
   if (!target || !source) return false;
   switch (website.autofillBehavior) {
     case 'ExactDomain':
@@ -157,6 +164,12 @@ export function websitePermitsOrigin(
 
 export function registrableDomain(raw: string): string | undefined {
   const url = httpsOrigin(raw);
+  return (url && getDomain(url.hostname, { allowPrivateDomains: true })) || undefined;
+}
+
+/** A saved website field accepts a missing scheme; callers' page origins remain strict HTTPS. */
+export function websiteDomain(raw: string): string | undefined {
+  const url = onePasswordWebsiteOrigin(raw);
   return (url && getDomain(url.hostname, { allowPrivateDomains: true })) || undefined;
 }
 
@@ -230,7 +243,7 @@ function remember(item: Item): VaultItemRead {
       : fieldValue(item, 'account', CHANGE_SECTION, false),
     password: fieldValue(item, 'password', undefined, true),
     previousPassword: login ? undefined : fieldValue(item, 'previous-password', CHANGE_SECTION, true),
-    domains: [...new Set(item.websites.flatMap((site) => registrableDomain(site.url) ?? []))],
+    domains: [...new Set(item.websites.flatMap((site) => websiteDomain(site.url) ?? []))],
   };
   readItems.set(read, item);
   return read;
@@ -390,7 +403,7 @@ export class BrowserVault {
     const access = await readRuntimeAccess(this.locators);
     if (access.status !== 'available') {
       this.reset();
-      throw new BrowserVaultError('vault_unavailable');
+      throw new BrowserVaultError('vault_not_set_up');
     }
     const { token } = access;
     const { vaultId } = access.binding;
@@ -721,7 +734,7 @@ export class BrowserVault {
     const access = await readRuntimeAccess(this.locators);
     if (access.status === 'available' && access.token === this.token && access.binding.vaultId === vaultId) return;
     this.reset();
-    throw new BrowserVaultError('vault_unavailable');
+    throw new BrowserVaultError(access.status === 'unavailable' ? 'vault_not_set_up' : 'vault_unavailable');
   }
 }
 

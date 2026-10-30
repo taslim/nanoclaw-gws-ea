@@ -190,7 +190,15 @@ it('records signup or password-change authority through the native host request,
     { status: 'not_owned' },
   );
   expect(request).toEqual({ action: 'credential_authority', requestId: id, ...fields });
-  for (const outcome of ['recorded', 'authority', 'not_owned', 'busy', 'vault_unavailable', 'rate_limited'])
+  for (const outcome of [
+    'recorded',
+    'authority',
+    'not_owned',
+    'busy',
+    'vault_not_set_up',
+    'vault_unavailable',
+    'rate_limited',
+  ])
     expect(credentialAuthority.tool.description).toContain(outcome);
 });
 
@@ -426,6 +434,7 @@ it('explains credential outcomes where the job calls the tool', () => {
     ['inconclusive', 'could not establish'],
     ['ambiguous', 'could not identify'],
     ['not_owned', 'changed or removed'],
+    ['vault_not_set_up', 'ask their operator'],
     ['vault_unavailable', 'cannot be used right now'],
     ['rate_limited', 'daily request limit'],
   ]) {

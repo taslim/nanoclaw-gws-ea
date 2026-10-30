@@ -175,7 +175,7 @@ function recorded(attempt: CredentialAttempt, thread: string): Outcome {
 
 /** The delegator hears only whether the vault can be used now; the host keeps its reasons. */
 function vaultOutcome(reason: BrowserVaultReason): Outcome {
-  if (reason === 'rate_limited') return { status: 'rate_limited' };
+  if (reason === 'rate_limited' || reason === 'vault_not_set_up') return { status: reason };
   return reason === 'no_item_for_site' ? { status: 'not_owned' } : { status: 'vault_unavailable' };
 }
 
@@ -468,7 +468,12 @@ export async function settleConfirmedAttempts(
     }
     if (result.status === 'finalized' || result.status === 'conflict')
       await freeSite(queue, attempt, `credential-settled-${attempt.id}`);
-    else if (result.status === 'vault_unavailable' || result.status === 'rate_limited') return;
+    else if (
+      result.status === 'vault_not_set_up' ||
+      result.status === 'vault_unavailable' ||
+      result.status === 'rate_limited'
+    )
+      return;
   }
 }
 
@@ -1187,6 +1192,8 @@ async function ensureSaved(
       return { outcome: { status: 'not_owned' } };
     case 'rate_limited':
       return { outcome: { status: 'rate_limited' } };
+    case 'vault_not_set_up':
+      return { outcome: { status: 'vault_not_set_up' } };
     case 'absent':
       // The one create this attempt could send left nothing: the authority ends, and nothing reached a page.
       await attempts.abandon(attempt.id, assertActive);
@@ -1334,9 +1341,10 @@ async function disclosingStep(
     assertBrowserSecretDiagnosticsSafe();
     const values = valuesFor(group, credential);
     // A disable the operator published since the disclosure stops the insertion: nothing has reached the page yet.
-    if (!(await attempts.usable(saved))) {
+    const usability = await attempts.usable(saved);
+    if (usability.status !== 'usable') {
       await rejectExposed(attempts, saved.id, evidence('none', 'not_inserted', 'none'));
-      return { status: 'vault_unavailable' };
+      return { status: usability.status };
     }
     // A page's input/change handlers can submit without navigating. Install this before any value reaches
     // them, and retain it through a consent hold (and secret cleanup), not just this call's stack.

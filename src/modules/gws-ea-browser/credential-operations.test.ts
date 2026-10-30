@@ -175,6 +175,19 @@ function context(): { context: BrowserExecutionContext; page: ReturnType<typeof 
 }
 
 describe("main's credential authority", () => {
+  it.each(['policy', 'runtime account'] as const)(
+    'reports missing %s setup before creating credential authority',
+    async (missing) => {
+      await rm(missing === 'policy' ? files.onePasswordPolicyFile : files.tokenFile);
+      expect(await ask({ operation: 'signup', site: ORIGIN, username: USERNAME })).toEqual({
+        status: 'vault_not_set_up',
+      });
+      expect(await ask({ operation: 'change_password', site: ORIGIN, username: USERNAME })).toEqual({
+        status: 'vault_not_set_up',
+      });
+      expect(fake.calls).toEqual([]);
+    },
+  );
   it('obtains the exact web address for a fresh guest form and signup before any vault login exists', async () => {
     await getDb().run('UPDATE gws_ea_profile SET assistant_alias = NULL WHERE singleton = 1');
     const email = 'onuj@web.example';
@@ -1094,7 +1107,7 @@ describe("the principal's release of an attempt the host cannot settle", () => {
   it('settles a stuck confirmed change at browser start without its job, and frees its site', async () => {
     const { id, itemId } = await confirmedChange();
     await rm(files.tokenFile);
-    expect(await attempts.finalize(id)).toEqual({ status: 'vault_unavailable' });
+    expect(await attempts.finalize(id)).toEqual({ status: 'vault_not_set_up' });
     await holdSite();
     // Still out of reach at the next start: the pass spends nothing more and leaves it held.
     await settleConfirmedAttempts(queue, undefined, attempts);
@@ -1279,7 +1292,7 @@ describe("the principal's release of an attempt the host cannot settle", () => {
   it('settles the confirmed change holding a site another job was refused', async () => {
     const { id } = await confirmedChange();
     await rm(files.tokenFile);
-    expect(await attempts.finalize(id)).toEqual({ status: 'vault_unavailable' });
+    expect(await attempts.finalize(id)).toEqual({ status: 'vault_not_set_up' });
     await writePrivateFile(files.tokenFile, FIXTURE_TOKEN);
     await holdSite();
     const other = (await resolveSystemSession('browser', 'system:a2a:main:other-errand')).session;

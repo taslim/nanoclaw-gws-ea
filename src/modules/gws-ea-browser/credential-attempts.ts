@@ -38,6 +38,7 @@ import {
   credentialCandidateTag,
   generateCandidatePassword,
   registrableDomain,
+  websiteDomain,
   type BrowserVault,
   type BrowserVaultBinding,
   type BrowserVaultReason,
@@ -127,7 +128,7 @@ export interface CandidateCredential {
   readonly currentPassword?: string;
 }
 
-type VaultFailure = { readonly status: 'vault_unavailable' } | { readonly status: 'rate_limited' };
+type VaultFailure = { readonly status: ReturnType<typeof vaultFailureStatus> };
 type FreshRead = { readonly value: VaultItemRead } | { readonly status: 'removed' } | VaultFailure;
 type Refused<Reason extends string> = { readonly status: 'refused'; readonly reason: Reason };
 type Saved = { readonly status: 'saved'; readonly attempt: CredentialAttempt };
@@ -336,7 +337,7 @@ export class CredentialAttempts {
         {
           category: 'login',
           username: login.value.username,
-          domains: login.value.websites.flatMap((website) => registrableDomain(website.url) ?? []),
+          domains: login.value.websites.flatMap((website) => websiteDomain(website.url) ?? []),
         },
         site,
       ));
@@ -441,7 +442,7 @@ export class CredentialAttempts {
     const target = this.target(input.jobId, input.origin);
     if (!line(input.username, MAX_USERNAME)) throw new CredentialAttemptError('invalid_request');
     const availability = await this.vault.availability();
-    if (availability.status !== 'available') return { status: 'vault_unavailable' };
+    if (availability.status !== 'available') return { status: 'vault_not_set_up' };
     return {
       status: 'prepared',
       attempt: await this.insert('signup', input.jobId, availability.binding, target, input.username, null),
@@ -461,7 +462,7 @@ export class CredentialAttempts {
   ): Promise<CredentialPrepareResult> {
     const target = this.target(input.jobId, input.origin);
     const availability = await this.vault.availability();
-    if (availability.status !== 'available') return { status: 'vault_unavailable' };
+    if (availability.status !== 'available') return { status: 'vault_not_set_up' };
     const item = await this.listedItem(input.itemHandle, target.origin, assertActive);
     if ('status' in item) return item;
     if (item.vaultId !== availability.binding.vaultId) return { status: 'vault_unavailable' };
@@ -696,13 +697,17 @@ export class CredentialAttempts {
    * vault, from local records alone: no provider request is spent. The caller
    * asks again right before a disclosed value reaches a page.
    */
-  async usable(attempt: Pick<CredentialAttempt, 'vault_id' | 'account_id'>): Promise<boolean> {
+  async usable(
+    attempt: Pick<CredentialAttempt, 'vault_id' | 'account_id'>,
+  ): Promise<{ readonly status: 'usable' } | VaultFailure> {
     const availability = await this.vault.availability();
-    return (
-      availability.status === 'available' &&
-      availability.binding.vaultId === attempt.vault_id &&
-      availability.binding.accountId === attempt.account_id
-    );
+    if (availability.status !== 'available') return { status: 'vault_not_set_up' };
+    return {
+      status:
+        availability.binding.vaultId === attempt.vault_id && availability.binding.accountId === attempt.account_id
+          ? 'usable'
+          : 'vault_unavailable',
+    };
   }
 
   /**
@@ -734,7 +739,8 @@ export class CredentialAttempts {
       currentPassword = owned.password;
     }
     // A remembered value needs no provider request, so only the operator's published disable can stop it here.
-    if (!(await this.usable(attempt))) return { status: 'vault_unavailable' };
+    const usability = await this.usable(attempt);
+    if (usability.status !== 'usable') return usability;
     await assertActive();
     const at = now();
     const changed = await this.db.run(

@@ -109,6 +109,7 @@ type ShareOutcome =
       readonly operator_message: string;
     }
   | { readonly status: 'rate_limited' }
+  | { readonly status: 'vault_not_set_up' }
   | { readonly status: 'vault_unavailable' };
 
 async function cliSharingProvider(policy: OnePasswordHostPolicy): Promise<VaultSharingProvider | undefined> {
@@ -264,13 +265,13 @@ function endings(facts: Omit<MessageFacts, 'guest'>): {
  */
 async function shareVault(email: string, dependencies: VaultAccessDependencies): Promise<ShareOutcome> {
   const availability = await dependencies.vault.availability();
-  if (availability.status !== 'available') return { status: 'vault_unavailable' };
+  if (availability.status !== 'available') return { status: 'vault_not_set_up' };
   const { accountId, vaultId } = availability.binding;
   const policyFile = dependencies.onePasswordPolicyFile();
   const host = policyFile === undefined ? undefined : await readOnePasswordHostPolicy(policyFile);
   // While the operator has 1Password disabled, its management account is theirs alone: no agent request reaches it.
   if (host?.status !== 'ready' || !host.policy.enabled || host.policy.accountId !== accountId)
-    return { status: 'vault_unavailable' };
+    return { status: 'vault_not_set_up' };
   const known = { email, accountId, link: onePasswordAccountLink(host.policy), vaultId };
   const unnamed = endings({ ...known, vaultName: undefined });
 
@@ -411,6 +412,8 @@ function confirmedNote(email: string, outcome: ShareOutcome): string {
         : `${confirmed} The vault could not be shared with it. ${again} Give the principal this message to forward to their operator, exactly as written:\n\n${outcome.operator_message}`;
     case 'rate_limited':
       return `${confirmed} 1Password's request limit is spent for now, so nothing was shared and nothing was retried. ${plainly}`;
+    case 'vault_not_set_up':
+      return `${confirmed} The assistant's vault is not set up, so nothing was shared. Tell the principal to ask their operator to finish setup. ${plainly}`;
     case 'vault_unavailable':
       return `${confirmed} The assistant's vault cannot be used right now, so nothing was shared. ${plainly}`;
   }

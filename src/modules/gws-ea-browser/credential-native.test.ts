@@ -915,7 +915,7 @@ describe.skipIf(!chromePath)('native authorized signup and password change', { t
         });
         return disclosed;
       });
-      expect(await fill(authority, await refs(SIGNUP))).toEqual({ status: 'vault_unavailable' });
+      expect(await fill(authority, await refs(SIGNUP))).toEqual({ status: 'vault_not_set_up' });
       expect(posts).toEqual([]);
       expect(await attempts.get(authority.id)).toMatchObject({ phase: 'rejected', exposed_at: expect.any(String) });
       expect(await page.locator('input[name=password]').inputValue()).toBe('');

@@ -638,6 +638,7 @@ export const watchAction: BrowserQueuedAction = {
       ? {
           ...result,
           observation: await observePage(await context.page(), context.assertActive, {
+            jobId: context.job.id,
             remaining: context.remaining,
             signal: context.signal,
           }),

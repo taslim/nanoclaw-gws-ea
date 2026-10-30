@@ -6,6 +6,7 @@ import {
   BrowserOriginMismatchError,
   discoverAuthenticationCodeField,
   fillBoundBrowserSecret,
+  executeFillSecret,
   validateFillSecret,
 } from './fill.js';
 import type { BrowserExecutionContext } from './actions.js';
@@ -15,6 +16,8 @@ import { pageHasSecret } from './page-privacy.js';
 import * as nativeAuthentication from './authentication-submit.js';
 import * as isolatedFacts from './control-facts.js';
 import * as consentEngine from './consent.js';
+import * as navigationPolicy from './commit-classifier.js';
+import { credentialAttempts } from './credential-attempts.js';
 import { browserVault, BrowserVaultError, websitePermitsOrigin } from './onepassword.js';
 
 const SECRET = 'fixture-secret-must-stay-host-only';
@@ -83,6 +86,7 @@ function fixture(origin = 'https://www.shop.example') {
     mainFrame: () => frame,
     isClosed: () => false,
     locator: () => ({ innerText: async () => '', ariaSnapshotJSON: async () => [{ role: 'alert', text: SECRET }] }),
+    getByRef: (ref: string) => ({ elementHandle: async () => handle(ref === 'e1' ? field : button) }),
     keyboard: {
       insertText: vi.fn(),
     },
@@ -109,6 +113,7 @@ function fixture(origin = 'https://www.shop.example') {
     }),
   } as unknown as Page;
   const context = {
+    page: async () => page,
     assertActive: vi.fn(async () => undefined),
     remaining: () => 10_000,
     runtime: { closeJob: vi.fn(async () => undefined) },
@@ -293,7 +298,13 @@ it('sanitizes browser and resolver failures and accepts no raw values or referen
 it('returns a vault refusal as its own bounded outcome before anything reaches the page', async () => {
   const f = fixture();
   const binding = await bindBrowserSecretField(f.page, f.target, f.submit, 'password');
-  for (const reason of ['rate_limited', 'vault_unavailable', 'no_item_for_site', 'origin_mismatch'] as const)
+  for (const reason of [
+    'rate_limited',
+    'vault_not_set_up',
+    'vault_unavailable',
+    'no_item_for_site',
+    'origin_mismatch',
+  ] as const)
     expect(
       await fillBoundBrowserSecret(f.context, binding, async () => {
         throw new BrowserVaultError(reason);
@@ -341,10 +352,11 @@ it('offers ExactDomain vault handles after redirecting to a different HTTPS orig
   vi.spyOn(browserVault, 'itemsForOrigin').mockImplementation(async (origin) =>
     websitePermitsOrigin(website, origin) ? [{ item_handle: 'vault_exact-login', title: 'Site login' }] : [],
   );
+  vi.spyOn(credentialAttempts, 'account').mockResolvedValue({ status: 'classified', account: 'principal' });
   expect((await observePage(f.page)).site?.vault_items).toEqual([]);
   f.setUrl('https://login.shop.example/login');
   expect((await observePage(f.page)).site?.vault_items).toEqual([
-    { item_handle: 'vault_exact-login', title: 'Site login' },
+    { item_handle: 'vault_exact-login', title: 'Site login', account: 'principal' },
   ]);
   expect((await observePage(f.page)).site).toBeUndefined();
 });
@@ -354,13 +366,89 @@ it('offers a newly attached login iframe origin without repeatedly refreshing an
   vi.spyOn(browserVault, 'itemsForOrigin').mockImplementation(async (origin) =>
     origin === 'https://identity.example' ? [{ item_handle: 'vault_frame-login', title: 'Identity login' }] : [],
   );
+  vi.spyOn(credentialAttempts, 'account').mockResolvedValue({ status: 'classified', account: 'principal' });
   expect((await observePage(f.page)).site?.vault_items).toEqual([]);
   const child = { url: () => 'https://identity.example/login', evaluate: async () => [] };
   f.page.frames = () => [f.frame, child] as unknown as ReturnType<Page['frames']>;
   expect((await observePage(f.page)).site?.vault_items).toEqual([
-    { item_handle: 'vault_frame-login', title: 'Identity login' },
+    { item_handle: 'vault_frame-login', title: 'Identity login', account: 'principal' },
   ]);
   expect((await observePage(f.page)).site).toBeUndefined();
+});
+
+it('labels each site login with its account owner without exposing credential values', async () => {
+  const f = fixture();
+  vi.spyOn(browserVault, 'itemsForOrigin').mockResolvedValue([
+    { item_handle: 'vault_assistant', title: 'Assistant login' },
+    { item_handle: 'vault_principal', title: 'Principal login' },
+  ]);
+  vi.spyOn(credentialAttempts, 'account').mockImplementation(async (handle) => ({
+    status: 'classified',
+    account: handle === 'vault_assistant' ? 'assistant' : 'principal',
+  }));
+  const observation = await observePage(f.page);
+  expect(observation.site?.vault_items).toEqual([
+    { item_handle: 'vault_assistant', title: 'Assistant login', account: 'assistant' },
+    { item_handle: 'vault_principal', title: 'Principal login', account: 'principal' },
+  ]);
+  expect(JSON.stringify(observation.site)).not.toMatch(/username|password/u);
+});
+
+it('refreshes an origin miss once per job even when another origin has a login, finding a newly added login', async () => {
+  const merchant = { item_handle: 'vault_merchant', title: 'Merchant login' };
+  const choices = [{ item_handle: 'vault_added', title: 'New login' }];
+  const list = vi
+    .spyOn(browserVault, 'itemsForOrigin')
+    .mockImplementation(async (origin) => (origin === 'https://shop.example' ? [merchant] : []));
+  const refresh = vi.spyOn(browserVault, 'refresh').mockImplementation(async () => {
+    list.mockImplementation(async (origin) => (origin === 'https://shop.example' ? [merchant] : choices));
+  });
+  vi.spyOn(credentialAttempts, 'account').mockResolvedValue({ status: 'classified', account: 'principal' });
+  expect(
+    await readVaultSiteInfo(
+      ['https://shop.example', 'https://identity.example'],
+      async () => undefined,
+      'added-login-job',
+    ),
+  ).toEqual({
+    vault_items: [
+      { ...merchant, account: 'principal' },
+      { ...choices[0], account: 'principal' },
+    ],
+  });
+  expect(refresh).toHaveBeenCalledTimes(1);
+  list.mockResolvedValue([]);
+  expect(await readVaultSiteInfo(['https://library.example'], async () => undefined, 'added-login-job')).toEqual({
+    vault_items: [],
+  });
+  expect(refresh).toHaveBeenCalledTimes(1);
+  await readVaultSiteInfo(['https://library.example'], async () => undefined, 'another-login-job');
+  expect(refresh).toHaveBeenCalledTimes(2);
+});
+
+it('shares the job refresh budget between observation misses and secret-fill misses', async () => {
+  const f = fixture();
+  Object.assign(f.context.job, { id: 'observation-then-fill-job' });
+  vi.spyOn(navigationPolicy, 'withBrowserJobNavigation').mockImplementation(async (_context, _page, work) => work());
+  vi.spyOn(browserVault, 'itemsForOrigin').mockResolvedValue([]);
+  const refresh = vi.spyOn(browserVault, 'refresh').mockResolvedValue();
+  const resolve = vi.spyOn(browserVault, 'resolve').mockRejectedValue(new BrowserVaultError('no_item_for_site'));
+  const observation = await observePage(f.page, f.context.assertActive, { jobId: f.context.job.id });
+  expect(refresh).toHaveBeenCalledTimes(1);
+  const payload = {
+    item_handle: 'vault_missing',
+    field: 'password',
+    target: { ref: 'e1', generation: observation.generation },
+    submit: { ref: 'e2', generation: observation.generation },
+  };
+  expect(await executeFillSecret(f.context, payload)).toEqual({ status: 'no_item_for_site' });
+  expect(resolve).toHaveBeenCalledTimes(1);
+  expect(refresh).toHaveBeenCalledTimes(1);
+  Object.assign(f.context.job, { id: 'fill-only-job' });
+  expect(await executeFillSecret(f.context, payload)).toEqual({ status: 'no_item_for_site' });
+  expect(refresh).toHaveBeenCalledTimes(2);
+  expect(resolve).toHaveBeenCalledTimes(3);
+  expect(f.nativeFill).not.toHaveBeenCalled();
 });
 
 // These fake pages have no native DOM; Chrome suites exercise collection. Keep actual taint and redaction.

@@ -16,6 +16,11 @@ export function httpsOrigin(raw: string): URL | undefined {
   }
 }
 
+/** Only a 1Password website field may omit its HTTPS scheme; page origins never may. */
+export function onePasswordWebsiteOrigin(raw: string): URL | undefined {
+  return httpsOrigin(raw.includes('://') ? raw : `https://${raw}`);
+}
+
 /** Playwright protocol logging can contain cookies, field reads and native keyboard payloads. */
 export function browserDiagnosticsUnsafe(
   environment: Readonly<Record<string, string | undefined>> = process.env,

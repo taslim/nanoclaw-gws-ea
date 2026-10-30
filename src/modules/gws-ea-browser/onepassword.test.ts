@@ -135,6 +135,21 @@ it('matches HTTPS, private registrable domains and exact effective ports, ignori
   );
 });
 
+it('recognizes a scheme-less website for matching and item domains while refusing an HTTP page', async () => {
+  const login = { ...item, websites: [website('AnywhereOnWebsite', 'netflix.com')] };
+  sdk.list.mockResolvedValue([login]);
+  sdk.get.mockResolvedValue({ ...login, fields: [], sections: [], version: 1 });
+  const subject = vault();
+  const [choice] = await subject.itemsForOrigin('https://www.netflix.com');
+  expect(choice).toEqual({ title: 'Shop login', item_handle: expect.stringMatching(/^vault_/u) });
+  expect((await subject.readItem(VAULT_ID, 'item1')).domains).toEqual(['netflix.com']);
+  expect(await subject.itemsForOrigin('http://netflix.com')).toEqual([]);
+  await expect(subject.resolve(choice.item_handle, 'password', 'http://netflix.com')).rejects.toMatchObject({
+    reason: 'origin_mismatch',
+  });
+  expect(sdk.resolve).not.toHaveBeenCalled();
+});
+
 it('refuses an ineligible frame before resolving, and serves misses from the cache until an explicit refresh', async () => {
   vi.useFakeTimers();
   const subject = vault();
@@ -194,7 +209,7 @@ describe('availability from the provisioned resources', () => {
       reason: 'not_enabled',
     });
     await expect(vault().itemsForOrigin('https://shop.example')).rejects.toMatchObject({
-      reason: 'vault_unavailable',
+      reason: 'vault_not_set_up',
     });
     expect(sdk.create).not.toHaveBeenCalled();
   });
@@ -212,7 +227,7 @@ describe('availability from the provisioned resources', () => {
       () => subject.resolve(choice.item_handle, 'password', 'https://shop.example'),
       () => subject.readItem(VAULT_ID, 'item1'),
     ])
-      await expect(use()).rejects.toMatchObject({ reason: 'vault_unavailable' });
+      await expect(use()).rejects.toMatchObject({ reason: 'vault_not_set_up' });
     expect(requests()).toBe(before);
 
     // Re-enabled with its records and token in place, the same vault serves again.
@@ -231,7 +246,7 @@ describe('availability from the provisioned resources', () => {
     const refused = await subject
       .resolve(choice.item_handle, 'password', 'https://shop.example')
       .catch((error: unknown) => error);
-    expect(refused).toMatchObject({ reason: 'vault_unavailable' });
+    expect(refused).toMatchObject({ reason: 'vault_not_set_up' });
     expect(String(refused)).not.toContain(SECRET);
   });
 
@@ -254,7 +269,7 @@ describe('availability from the provisioned resources', () => {
       });
     await expect(
       new BrowserVault({ browserRoot: '', onePasswordPolicyFile }).itemsForOrigin('https://shop.example'),
-    ).rejects.toMatchObject({ reason: 'vault_unavailable' });
+    ).rejects.toMatchObject({ reason: 'vault_not_set_up' });
     expect(sdk.create).not.toHaveBeenCalled();
     expect(await vault().availability()).toMatchObject({ status: 'available' });
   });
@@ -444,7 +459,7 @@ describe('holding off while the vault cannot be reached', () => {
     expect(await subject.itemsForOrigin('https://shop.example')).toHaveLength(1);
     // The runtime token is briefly missing on the host.
     await rm(tokenFile);
-    await expect(subject.itemsForOrigin('https://shop.example')).rejects.toMatchObject(unavailable);
+    await expect(subject.itemsForOrigin('https://shop.example')).rejects.toMatchObject({ reason: 'vault_not_set_up' });
     await writePrivateFile(tokenFile, TOKEN);
     expect(await subject.itemsForOrigin('https://shop.example')).toHaveLength(1);
   });
@@ -453,7 +468,7 @@ describe('holding off while the vault cannot be reached', () => {
 it('rejects unsafe token files before SDK initialization and ignores Never items', async () => {
   await chmod(tokenFile, 0o644);
   await expect(vault().itemsForOrigin('https://shop.example')).rejects.toMatchObject({
-    reason: 'vault_unavailable',
+    reason: 'vault_not_set_up',
   });
   expect(await vault().availability()).toEqual({ status: 'unavailable', reason: 'invalid_state' });
   expect(sdk.create).not.toHaveBeenCalled();
@@ -483,6 +498,6 @@ it('reads and writes only items in the recorded vault, under the read path’s b
   sdk.get.mockResolvedValue({ ...item, id: 'item1', vaultId: OTHER_VAULT_ID, fields: [], sections: [], version: 3 });
   await expect(subject.readItem(VAULT_ID, 'item1')).rejects.toMatchObject({ reason: 'vault_unavailable' });
   await rm(tokenFile);
-  await expect(subject.readItem(VAULT_ID, 'item1')).rejects.toMatchObject({ reason: 'vault_unavailable' });
+  await expect(subject.readItem(VAULT_ID, 'item1')).rejects.toMatchObject({ reason: 'vault_not_set_up' });
   expect(sdk.get).toHaveBeenCalledTimes(1);
 });

@@ -277,7 +277,7 @@ describe('saving before disclosure', () => {
     const subject = service();
     const disabled = expectPrepared(await subject.prepareSignup({ jobId: JOB, origin: ORIGIN, username: USERNAME }));
     await rm(tokenFile);
-    expect(await subject.save(disabled.id)).toEqual({ status: 'vault_unavailable' });
+    expect(await subject.save(disabled.id)).toEqual({ status: 'vault_not_set_up' });
     expect(await subject.disclose(disabled.id, { jobId: JOB, origin: ORIGIN })).toMatchObject({ status: 'refused' });
     expect(await subject.reconcileSave(disabled.id)).toEqual({ status: 'absent' });
     expect(fake.calls).toEqual([]);
@@ -321,7 +321,7 @@ describe('saving before disclosure', () => {
     // The candidate's value is in this process's memory: nothing but the published intent can stop its disclosure.
     await writeHostPolicy(false);
     expect(await subject.disclose(attempt.id, { jobId: JOB, origin: ORIGIN })).toEqual({
-      status: 'vault_unavailable',
+      status: 'vault_not_set_up',
     });
     expect(fake.calls).toHaveLength(calls);
     expect(await subject.get(attempt.id)).toMatchObject({
@@ -407,6 +407,12 @@ describe('suggestions and ownership', () => {
     const subject = service();
     const { itemId, attempt } = await ownedLogin(subject, 'juno_eats');
     const handle = await handleFor(itemId);
+    fake.edit(itemId, (item) => ({
+      ...item,
+      websites: [{ url: 'accounts.shop.example', label: '', autofillBehavior: AutofillBehavior.AnywhereOnWebsite }],
+    }));
+    await vault.refresh();
+    expect(await subject.account(handle, ORIGIN)).toEqual({ status: 'classified', account: 'assistant' });
     expect(await subject.ownership(handle, ORIGIN)).toEqual({ status: 'owned' });
     const copy = fake.duplicate(itemId, 'Other site');
     fake.edit(copy.id, (item) => ({
@@ -485,7 +491,7 @@ describe('naming the account to change', () => {
     expect(await subject.ownedHandle(ORIGIN, 'remy.vance@example.com')).toEqual({ status: 'not_owned' });
     expect(await subject.ownedHandle('https://shop.example.net', USERNAME)).toEqual({ status: 'not_owned' });
     await rm(tokenFile);
-    expect(await service({ vault: newVault() }).ownedHandle(ORIGIN, USERNAME)).toEqual({ status: 'vault_unavailable' });
+    expect(await service({ vault: newVault() }).ownedHandle(ORIGIN, USERNAME)).toEqual({ status: 'vault_not_set_up' });
   });
 });
 

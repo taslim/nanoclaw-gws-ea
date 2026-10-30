@@ -453,16 +453,16 @@ describe('sharing with the principal', () => {
     expect(onePassword.calls.map((call) => call.operation)).toEqual(['getVault', 'getUser']);
   });
 
-  it('reports the vault unavailable, spending no request, until the assistant is provisioned', async () => {
+  it('reports missing vault setup, spending no request, until the assistant is provisioned', async () => {
     fs.rmSync(resourceFile);
-    expect(answer(await ask({ operation: 'share' }))).toEqual({ status: 'vault_unavailable' });
+    expect(answer(await ask({ operation: 'share' }))).toEqual({ status: 'vault_not_set_up' });
     expect(providerOpened).toBe(false);
   });
 
   it('shares nothing and lists nothing while the operator has disabled 1Password, though its management account remains', async () => {
     await writeHostPolicy(MANAGEMENT_ID, false);
-    expect(answer(await ask({ operation: 'share' }))).toEqual({ status: 'vault_unavailable' });
-    expect(answer(await ask({ operation: 'refresh' }))).toEqual({ status: 'vault_unavailable' });
+    expect(answer(await ask({ operation: 'share' }))).toEqual({ status: 'vault_not_set_up' });
+    expect(answer(await ask({ operation: 'refresh' }))).toEqual({ status: 'vault_not_set_up' });
     expect(providerOpened).toBe(false);
     expect(onePassword.calls).toEqual([]);
     expect(sdk.create).not.toHaveBeenCalled();
@@ -709,7 +709,7 @@ describe('who may ask, and for whom', () => {
 
   it.each([
     ['rate_limited', () => onePassword.fail('getUser', 'rate_limited'), /request limit is spent/u],
-    ['vault_unavailable', () => writeHostPolicy(MANAGEMENT_ID, false), /vault cannot be used right now/u],
+    ['vault_not_set_up', () => writeHostPolicy(MANAGEMENT_ID, false), /ask their operator/u],
   ] as const)(
     'tells main plainly that nothing was shared after %s on a confirmed alternate email, and never to ask again',
     async (_status, failNext, fact) => {
@@ -766,6 +766,6 @@ describe("the principal's retry after adding a login", () => {
     sdk.list.mockRejectedValueOnce(new RateLimitExceededError('limited'));
     expect(answer(await ask({ operation: 'refresh' }))).toEqual({ status: 'rate_limited' });
     fs.rmSync(resourceFile);
-    expect(answer(await ask({ operation: 'refresh' }))).toEqual({ status: 'vault_unavailable' });
+    expect(answer(await ask({ operation: 'refresh' }))).toEqual({ status: 'vault_not_set_up' });
   });
 });

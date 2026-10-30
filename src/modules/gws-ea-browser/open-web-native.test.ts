@@ -81,6 +81,7 @@ import {
   type OpenWebRequest,
 } from './open-web-native-fixture.js';
 import { browserVault } from './onepassword.js';
+import { credentialAttempts } from './credential-attempts.js';
 import { observePage, type BrowserObservation } from './observe.js';
 import { registerBrowserPurchaseDelivery, resumeBrowserPurchaseCommits } from './purchase.js';
 import { recordPurchaseOutcome } from './purchase-outcome.js';
@@ -1387,6 +1388,34 @@ describe.skipIf(!chromePath)('ordinary presses that buy, in native Chrome', { ti
       'SELECT kind, site, job_id FROM gws_ea_browser_incidents',
     );
 
+  it('refreshes a missed job inventory once and presents the account owner of each saved login', async () => {
+    const list = vi.spyOn(browserVault, 'itemsForOrigin').mockResolvedValue([]);
+    const refresh = vi.spyOn(browserVault, 'refresh').mockImplementation(async () => {
+      list.mockResolvedValue([
+        { item_handle: 'vault_assistant', title: 'Assistant login' },
+        { item_handle: 'vault_principal', title: 'Principal login' },
+      ]);
+    });
+    const account = vi.spyOn(credentialAttempts, 'account').mockImplementation(async (handle) => ({
+      status: 'classified',
+      account: handle === 'vault_assistant' ? 'assistant' : 'principal',
+    }));
+    try {
+      const opened = await run('inventory-labels', [{ kind: 'navigate', url: OPEN_WEB.faq }]);
+      expect((opened.observation as BrowserObservation).site?.vault_items).toEqual([
+        { item_handle: 'vault_assistant', title: 'Assistant login', account: 'assistant' },
+        { item_handle: 'vault_principal', title: 'Principal login', account: 'principal' },
+      ]);
+      list.mockResolvedValue([]);
+      await run('later-inventory-miss', [{ kind: 'navigate', url: OPEN_WEB.product }]);
+      expect(refresh).toHaveBeenCalledTimes(1);
+    } finally {
+      list.mockRestore();
+      refresh.mockRestore();
+      account.mockRestore();
+    }
+  });
+
   it.each(['catalog', 'vault'] as const)(
     'keeps completed navigation and the next action usable when %s metadata does not answer',
     async (source) => {
@@ -1405,6 +1434,9 @@ describe.skipIf(!chromePath)('ordinary presses that buy, in native Chrome', { ti
         else await new Promise<void>((resolve) => setTimeout(resolve, 500));
         return [{ item_handle: 'vault_after-retry', title: 'Fixture login' }];
       });
+      const account = vi
+        .spyOn(credentialAttempts, 'account')
+        .mockResolvedValue({ status: 'classified', account: 'principal' });
       // Release even on the old implementation, whose queue must settle its timed-out operation before answering.
       const timer = setTimeout(release, 5_000);
       try {
@@ -1432,6 +1464,7 @@ describe.skipIf(!chromePath)('ordinary presses that buy, in native Chrome', { ti
         clearTimeout(timer);
         catalog.mockRestore();
         vault.mockRestore();
+        account.mockRestore();
       }
     },
   );

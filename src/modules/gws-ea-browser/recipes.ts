@@ -322,6 +322,7 @@ export async function executeRecipe(
     ...(!page.isClosed()
       ? {
           observation: await observePage(page, context.assertActive, {
+            jobId: context.job.id,
             remaining: context.remaining,
             signal: context.signal,
           }),
@@ -366,7 +367,11 @@ export async function executeRecipe(
     if (result.repeat_safe === false) repeatSafe = false;
     const observation =
       result.observation ??
-      (await observePage(page, context.assertActive, { remaining: context.remaining, signal: context.signal }));
+      (await observePage(page, context.assertActive, {
+        jobId: context.job.id,
+        remaining: context.remaining,
+        signal: context.signal,
+      }));
     if (result.reason === 'purchase_control') {
       const commit = targets[action.kind === 'form_input' ? targets.length - 1 : 0];
       if (!commit) return failed(index, { commit: 'recorded control' }, { commit: 'unavailable' });
@@ -448,6 +453,7 @@ export async function executeRecipe(
     status: 'completed',
     ...coverage(),
     observation: await observePage(page, context.assertActive, {
+      jobId: context.job.id,
       remaining: context.remaining,
       signal: context.signal,
     }),
