@@ -30,7 +30,7 @@ import { ArtifactSharing } from './sharing.js';
 import { createArtifactViewHandler } from './server.js';
 import { createArtifactViewResolver } from './access.js';
 import { createWebIdentity, createWebIdentityVerifier } from '../gws-ea-web/access.js';
-import { createWebHandler } from '../gws-ea-web/server.js';
+import { createWebHandler, unavailableWebHandler } from '../gws-ea-web/server.js';
 import type { WebPolicyFile } from '../gws-ea-web/policy.js';
 
 let origin: Server | undefined;
@@ -129,13 +129,13 @@ it.skipIf(!process.env.GWS_EA_ARTIFACT_NATIVE_IMAGE)(
           .sign(keys.privateKey),
       );
     origin = createServer(
-      createWebHandler(
-        config.hostname,
-        createArtifactViewHandler({
+      createWebHandler(config.hostname, {
+        artifacts: createArtifactViewHandler({
           hostname: config.hostname,
           resolve: createArtifactViewResolver(config, createWebIdentity(config, verifier)),
         }),
-      ),
+        logins: unavailableWebHandler,
+      }),
     );
     await new Promise<void>((resolve) => origin!.listen(0, '127.0.0.1', resolve));
     const address = origin.address();

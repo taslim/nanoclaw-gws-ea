@@ -1,8 +1,7 @@
 import type { IncomingMessage } from 'node:http';
 import { getDb } from '../../db/connection.js';
-import { listPrincipalAddresses } from '../gws-ea-profile/db.js';
 import { readWebPolicy, webPolicyDigest, type WebPolicyFile } from '../gws-ea-web/policy.js';
-import { createWebIdentity, type WebIdentity } from '../gws-ea-web/access.js';
+import { createWebIdentity, isPrincipalWebIdentity, type WebIdentity } from '../gws-ea-web/access.js';
 import type { ArtifactViewRoute, AuthorizedArtifactView } from './server.js';
 
 export function createArtifactViewResolver(
@@ -17,7 +16,7 @@ export function createArtifactViewResolver(
     if (route.audience !== 'public') {
       email = await identity(request);
       if (!email) return undefined;
-      principal = (await listPrincipalAddresses()).some((address) => address.email === email);
+      principal = await isPrincipalWebIdentity(email);
       if (route.audience === 'private' && !principal) return undefined;
       const fresh = await readWebPolicy();
       if (fresh.status !== 'enabled' || webPolicyDigest(fresh.config) !== webPolicyDigest(config)) return undefined;

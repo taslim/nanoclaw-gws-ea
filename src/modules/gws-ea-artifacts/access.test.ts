@@ -17,7 +17,7 @@ vi.mock('../../config.js', async (original) => ({
 vi.mock('../../log.js', () => ({ log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() } }));
 import '../index.js';
 import { closeDb, createAgentGroup, createSession, getDb, initTestDb, runMigrations } from '../../db/index.js';
-import { createWebIdentity, createWebIdentityVerifier } from '../gws-ea-web/access.js';
+import { createWebIdentity, createWebIdentityVerifier, isPrincipalWebIdentity } from '../gws-ea-web/access.js';
 import type { WebPolicyFile } from '../gws-ea-web/policy.js';
 import { createArtifactViewResolver } from './access.js';
 import { prepareArtifactSource, saveArtifact } from './db.js';
@@ -129,6 +129,27 @@ it('checks the exact artifact audience after a real Access JWT, including a peer
   expect(await view(other, 'share', 'remy@example.com')).toBeUndefined();
   expect(await view(artifactId, 'private', 'principal@example.com', 'juno-aud')).toBeUndefined();
   expect(await view(artifactId, 'private', 'principal@example.com')).toBeDefined();
+});
+it('distinguishes a verified named-share reader from the current principal for shared web features', async () => {
+  const request = new IncomingMessage(new Socket());
+  const identity = createWebIdentity(config, createWebIdentityVerifier(config.accessIssuer, config.accessAud, keys));
+  for (const [email, principal] of [
+    ['remy@example.com', false],
+    ['principal@example.com', true],
+  ] as const) {
+    request.headers['cf-access-jwt-assertion'] = await new SignJWT({ email })
+      .setProtectedHeader({ alg: 'RS256', kid: 'current' })
+      .setIssuer(config.accessIssuer)
+      .setAudience(config.accessAud)
+      .setExpirationTime('1h')
+      .sign(key.privateKey);
+    const verified = await identity(request);
+    expect(verified).toBe(email);
+    expect(await isPrincipalWebIdentity(verified)).toBe(principal);
+  }
+  await getDb().run("DELETE FROM gws_ea_principal_addresses WHERE email='principal@example.com'");
+  expect(await isPrincipalWebIdentity(await identity(request))).toBe(false);
+  expect(await isPrincipalWebIdentity(undefined)).toBe(false);
 });
 it('serves a live public publication without identity verification and denies revocation or policy disable immediately', async () => {
   expect(await view(published, 'public')).toMatchObject({ html: '<p>Exact selected report</p>' });

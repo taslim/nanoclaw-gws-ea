@@ -581,7 +581,7 @@ export async function setWebIngress(
   const expected = webIngress(claim);
   const retained: Record<string, unknown>[] = [];
   for (const route of ingress) {
-    if (route.hostname === claim.hostname && route.path === expected.path) {
+    if (route.hostname === claim.hostname && route.path === undefined) {
       if (route.service !== expected.service)
         throw new GwsEaError('web_tunnel_conflict', 'The claimed tunnel route points to an unowned service.');
       continue;
@@ -602,7 +602,7 @@ export async function setWebIngress(
       overlappingHost &&
       !Object.values(config.assistants).some((assistant) => {
         const owned = webIngress(assistant.claim);
-        return owned.hostname === route.hostname && owned.path === route.path && owned.service === route.service;
+        return owned.hostname === route.hostname && route.path === undefined && owned.service === route.service;
       })
     )
       throw new GwsEaError('web_tunnel_conflict', 'An unowned tunnel route overlaps this assistant hostname.');
@@ -1297,9 +1297,7 @@ export async function inspectWebCapability(
       const origin =
         isRecord(configuration) && isRecord(configuration.config) ? configuration.config.originRequest : undefined;
       const expectedRoutes = Array.isArray(ingress)
-        ? ingress.filter(
-            (route: unknown) => isRecord(route) && route.hostname === expected.hostname && route.path === expected.path,
-          )
+        ? ingress.filter((route: unknown) => isRecord(route) && route.hostname === expected.hostname)
         : [];
       if (
         !Array.isArray(ingress) ||
@@ -1309,6 +1307,7 @@ export async function inspectWebCapability(
         (policy.enabled
           ? expectedRoutes.length !== 1 ||
             !isRecord(expectedRoutes[0]) ||
+            expectedRoutes[0].path !== undefined ||
             expectedRoutes[0].service !== expected.service ||
             (isRecord(expectedRoutes[0].originRequest) &&
               isRecord(expectedRoutes[0].originRequest.access) &&

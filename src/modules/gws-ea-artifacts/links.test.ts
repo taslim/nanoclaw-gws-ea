@@ -102,6 +102,20 @@ it('checks exact applied named/public/private audiences locally and refuses unkn
   expect((await check(`${base}/share/${shareId}`, ['other@example.com'])).allowed).toBe(false);
   expect((await check(`${base}/public/${publicId}`, ['unknown-person'])).allowed).toBe(true);
 });
+it('allows the exact logins link only toward the principal while web policy is enabled', async () => {
+  const url = 'https://aya.example.com/logins';
+  expect((await check(url, ['principal@example.com'])).allowed).toBe(true);
+  expect((await check(url)).allowed).toBe(false);
+  expect((await check(url, [])).allowed).toBe(false);
+  for (const audience of [{ unknownRecipients: true }, { nonPrincipalChatMembers: true }])
+    expect(
+      (await checkArtifactLinksOpenable({ texts: [url], recipients: ['principal@example.com'], ...audience })).allowed,
+    ).toBe(false);
+  for (const suffix of ['/', '?next=other', '#password'])
+    expect((await check(`${url}${suffix}`, ['principal@example.com'])).allowed).toBe(false);
+  policy(false);
+  expect((await check(url, ['principal@example.com'])).allowed).toBe(false);
+});
 it('denies stale hash, pending/revoked state, expiry, disable and deleted content even for the principal', async () => {
   const url = `${base}/share/${shareId}`;
   await getDb().run('UPDATE gws_ea_artifact_shares SET source_hash=? WHERE share_id=?', 'f'.repeat(64), shareId);

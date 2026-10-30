@@ -1,6 +1,7 @@
 import type { IncomingMessage } from 'node:http';
 import { createRemoteJWKSet, customFetch, jwtVerify } from 'jose';
 import { normalizePrincipalEmail } from '../../gws-ea/validation.js';
+import { listPrincipalAddresses } from '../gws-ea-profile/db.js';
 import { readWebPolicy, webPolicyDigest, type WebPolicyFile } from './policy.js';
 
 export type WebIdentityVerifier = (token: string | undefined) => Promise<string | undefined>;
@@ -33,6 +34,12 @@ export function createWebIdentityVerifier(
 }
 
 export type WebIdentity = (request: IncomingMessage) => Promise<string | undefined>;
+
+/** A verified identity belongs to the principal while its exact email remains recorded. */
+export async function isPrincipalWebIdentity(email: string | undefined): Promise<boolean> {
+  return email !== undefined && (await listPrincipalAddresses()).some((address) => address.email === email);
+}
+
 /** Identity alone grants no feature access. Policy must still match on both sides of verification. */
 export function createWebIdentity(
   config: WebPolicyFile,

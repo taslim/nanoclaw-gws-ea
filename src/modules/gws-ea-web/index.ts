@@ -1,15 +1,21 @@
-import type { RequestListener } from 'node:http';
 import { register } from '../../cli/registry.js';
 import { onHostStart, onHostShutdown } from '../../host-lifecycle.js';
-import type { WebIdentity } from './access.js';
 import type { WebPolicyFile } from './policy.js';
-import { WebRuntime, type WebReadiness } from './runtime.js';
+import { WebRuntime, type WebFeatureFactories, type WebReadiness } from './runtime.js';
+
+let origin: WebRuntime | undefined;
+
+/** Host features share the origin's verified publication state. */
+export async function webPublicationReady(config: WebPolicyFile): Promise<boolean> {
+  return origin ? origin.publicationReady(config) : false;
+}
 
 export function startWebOrigin(
-  artifacts: (config: WebPolicyFile, identity: WebIdentity) => RequestListener,
+  features: WebFeatureFactories,
   admissionEmails: () => Promise<readonly string[]>,
 ): WebReadiness {
-  const runtime = new WebRuntime(artifacts, admissionEmails);
+  const runtime = new WebRuntime(features, admissionEmails);
+  origin = runtime;
   onHostStart(({ signal }) => runtime.start(signal));
   onHostShutdown(() => runtime.stop());
   for (const name of ['gws-ea-web-health', 'gws-ea-web-admission-emails'] as const) {

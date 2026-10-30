@@ -11,6 +11,7 @@ import { artifactAdmissionEmails } from './sharing.js';
 import { getAllAgentGroups } from '../../db/agent-groups.js';
 import { hasArtifactsAccess } from './policy.js';
 import { startWebOrigin } from '../gws-ea-web/index.js';
+import { unavailableWebHandler } from '../gws-ea-web/server.js';
 import { createArtifactViewHandler } from './server.js';
 import { createArtifactViewResolver } from './access.js';
 
@@ -19,8 +20,11 @@ registerOutboundGuard('gws-ea-artifacts:link-access', judgeArtifactSend);
 for (const [action, handler, guard] of ARTIFACT_ACTIONS) registerDeliveryAction(action, handler, guard);
 
 const web = startWebOrigin(
-  (config, identity) =>
-    createArtifactViewHandler({ hostname: config.hostname, resolve: createArtifactViewResolver(config, identity) }),
+  {
+    artifacts: (config, identity) =>
+      createArtifactViewHandler({ hostname: config.hostname, resolve: createArtifactViewResolver(config, identity) }),
+    logins: () => unavailableWebHandler,
+  },
   artifactAdmissionEmails,
 );
 const runtime = new ArtifactsRuntime(web);

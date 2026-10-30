@@ -60,7 +60,7 @@ export async function artifactAudienceForMembers(
     nonPrincipalChatMembers: members.some((member) => member.is_principal !== 1),
   };
 }
-/** Checks only URLs on the configured artifact host, locally: no network, Access token or source read. */
+/** Checks URLs on the configured assistant host locally, without network or identity-token reads. */
 export async function checkArtifactLinksOpenable(request: ArtifactLinkCheckRequest): Promise<ArtifactLinkCheck> {
   const policy = await readWebPolicy();
   if (!('config' in policy) || !policy.config) return { allowed: true };
@@ -73,6 +73,11 @@ export async function checkArtifactLinksOpenable(request: ArtifactLinkCheckReque
       : [],
   );
   const recipients = request.recipients.map((address) => normalizePrincipalEmail(address));
+  const principalOnly =
+    request.nonPrincipalChatMembers !== true &&
+    request.unknownRecipients !== true &&
+    recipients.length > 0 &&
+    recipients.every((email) => email !== undefined && principals.has(email));
   const refuse = (url: string): ArtifactLinkCheck => ({
     allowed: false,
     reason: `The current artifact access does not let every recipient open ${url}. Use its applied private, named or public link for these exact recipients, or send without it.`,
@@ -80,10 +85,19 @@ export async function checkArtifactLinksOpenable(request: ArtifactLinkCheckReque
   for (const written of urls) {
     const url = URL.parse(written);
     if (!url || url.hostname.replace(/\.$/u, '') !== config.hostname) continue;
-    if (policy.status !== 'enabled' || !(await getDb().hasTable('gws_ea_artifacts'))) return refuse(written);
+    if (policy.status !== 'enabled') return refuse(written);
     if (url.origin !== `https://${config.hostname}` || url.username || url.password || url.search || url.hash)
       return refuse(written);
-    if (!url.pathname.startsWith('/artifacts/')) return refuse(written);
+    if (url.pathname === '/logins') {
+      if (!principalOnly || written !== `https://${config.hostname}/logins`)
+        return {
+          allowed: false,
+          reason: `The logins page ${written} can be sent only to the principal. Send it directly to the principal or send without it.`,
+        };
+      continue;
+    }
+    if (!url.pathname.startsWith('/artifacts/') || !(await getDb().hasTable('gws_ea_artifacts')))
+      return refuse(written);
     const suffix = url.pathname.slice('/artifacts'.length);
     const match = new RegExp(`^/(?:((?:share|public))/)?(${UUID})$`, 'u').exec(suffix);
     if (!match || written !== `https://${config.hostname}${url.pathname}`) return refuse(written);
@@ -94,14 +108,7 @@ export async function checkArtifactLinksOpenable(request: ArtifactLinkCheckReque
         match[2],
         now,
       );
-      if (
-        !live ||
-        request.nonPrincipalChatMembers === true ||
-        request.unknownRecipients === true ||
-        recipients.length === 0 ||
-        recipients.some((email) => email === undefined || !principals.has(email))
-      )
-        return refuse(written);
+      if (!live || !principalOnly) return refuse(written);
     } else {
       const share = await getDb().get<{ share_id: string }>(
         `SELECT s.share_id FROM gws_ea_artifact_shares s JOIN gws_ea_artifacts a ON a.artifact_id=s.artifact_id JOIN gws_ea_artifact_revisions r ON r.artifact_id=s.artifact_id AND r.revision=s.revision AND r.source_hash=s.source_hash WHERE s.share_id=? AND s.kind=? AND s.state='active' AND a.deleted_at IS NULL AND (a.expires_at IS NULL OR a.expires_at>?) AND (s.expires_at IS NULL OR s.expires_at>?)`,
