@@ -27,7 +27,6 @@ const TOLD_BY_THEIR_MODULE = [
 const WORDED = [
   'browser_credential_release',
   'browser_reservation_guarantee',
-  'browser_vault_email',
   'principal_address_add',
   'private_value_remove',
 ];

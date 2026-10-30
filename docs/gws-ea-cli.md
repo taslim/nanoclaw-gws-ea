@@ -28,7 +28,7 @@ gws-ea connectors check <name> [--id <instance_id>]
 Installation and configuration belong to the operator host. Voice shares
 immutable programs and models; 1Password and web keep separate resources
 for each assistant in the operator's selected account. Access remains a
-separate decision: agent permissions, the principal's vault membership, and
+separate decision: agent permissions, the principal's confirmed addresses, and
 artifact reader grants retain their own boundaries. Installing a connector
 makes its supported functionality available without a second switch.
 
@@ -55,9 +55,23 @@ is optional assistant identity.
 ## Assistant web
 
 The `web` connector gives each assistant a stable address such as
-`aya.example.com`. Artifacts is its first feature, at `/artifacts`; the root and
-all other paths return 404. There is one connector install and no separate
-artifacts switch.
+`aya.example.com`. HTML artifacts live at `/artifacts` and the principal’s saved
+logins page at `/logins`; there is no home page. There is one connector install
+and no separate feature switch. Cloudflare Access covers the whole hostname;
+public artifacts retain their explicit public route.
+
+For an existing web install, uninstall web using the **current checkout before
+updating to this release**. Then pull the release, run `bash gws-ea.sh`, run
+`gws-ea update --all`, and run `gws-ea connectors install web` with its setup
+options. The old artifacts-only Cloudflare route is deliberately refused; it
+cannot protect the logins page. Uninstall keeps saved HTML and logins, while
+issued artifact links stop until their serving resources are installed again.
+
+After reinstalling, run `gws-ea connectors check web --id <instance_id>` and
+open the assistant's `/logins` link as the principal. A retained artifacts-only
+route leaves web not ready. To roll back, uninstall web with the currently
+installed new checkout **before** returning to the older release, then reinstall
+web using that older version and run its same readiness check.
 
 The operator needs an active Cloudflare DNS zone, an Access team, an
 account-scoped management token with the required Tunnel, DNS, Access
@@ -295,24 +309,31 @@ its usage and the assistants sharing it. A spent limit returns a rate-limited
 outcome, and nothing retries it automatically; a larger plan is the operator's
 choice.
 
-An assistant saves there the passwords it generates for new accounts and for
-password changes, which it makes only on logins it saved itself, with their
-username and site unchanged. A confirmed change replaces the password in that
-login and deletes the separate item that held the new one, so no item the
-assistant keeps holds the old password (1Password's item history and Recently
-Deleted keep earlier versions, as for any edit). If someone changes or removes
-the login in 1Password during the change, the assistant leaves it as they made
-it and keeps the new password in its own item. Principals manage the saved
-logins through their assistant, which shares its vault, view and edit, with the
-principal's confirmed 1Password user, and gives them the account's sign-in
-address and the vault's name. When it cannot (no confirmed member or guest has
-that email, a guest already uses another vault, an Individual account cannot
-share, or the host cannot share), the principal gets a message to forward naming
-the assistant, the account's sign-in address and ID, the vault's name when known
-and ID, and the email. Share the vault on 1Password.com, or add and confirm the
-person; the principal then asks the assistant to check again. After adding a
-login in 1Password, the principal asks the assistant to retry, which lists the
-vault again.
+The assistant saves generated passwords there before submitting a signup or
+password change. An account belongs to the assistant when its username is any
+spelling of its web alias, or a non-email username from a completed signup on
+that site. Who added or edited the login does not decide ownership. Other logins
+belong to the principal. The assistant changes only its own accounts' passwords;
+the principal changes their own password on the site, then updates the saved
+login. Shared or third-party accounts are handled through the principal's
+direction and the agents' judgment, not a separate ownership class.
+
+A confirmed change replaces the password in the freshly checked login and
+deletes the separate candidate. If someone edits or removes that login during
+the change, the host leaves it as edited and keeps the new password in its own
+item. The persistent browser profile keeps every sign-in, including the
+principal's accounts. Agents judge whether the current task calls for that
+account; the host adds no account-use restriction by delegating group.
+
+Main sends the principal their private `https://<assistant-host>/logins` link
+when a login is missing or they ask. Only the principal's currently confirmed
+addresses can open it through Cloudflare Access. They can add or remove logins
+and change saved passwords for either account owner; no saved password is ever
+revealed. The page reads all active ordinary Login items fresh, so a saved
+change is ready for the next errand. The principal need not join the operator's
+1Password account. When web or vault setup is missing, main tells them to ask
+their operator; when installed web is temporarily unavailable, to try again
+later. Passwords are entered on the page, never sent through chat.
 
 Uninstall previews every recorded vault, its observed item count and active
 credential attempts. It requires a terminal confirmation or `--delete-vaults`;

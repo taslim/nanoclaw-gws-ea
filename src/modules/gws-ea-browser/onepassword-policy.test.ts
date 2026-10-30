@@ -8,7 +8,6 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { REDACTED, redact } from '../../gws-ea/redact.js';
 import {
   isOnePasswordId,
-  onePasswordAccountLink,
   onePasswordHostPaths,
   onePasswordInstancePaths,
   onePasswordManagementIdentity,
@@ -125,7 +124,6 @@ describe('the account sign-in address', () => {
       'a.b.c.1password.com',
     ])
       expect(onePasswordSignInAddress(other)).toBeUndefined();
-    expect(onePasswordAccountLink({ signInAddress: 'hale.1password.com' })).toBe('https://hale.1password.com/');
   });
 });
 

@@ -96,7 +96,7 @@ it('keeps main guidance stable while browser availability changes', async () => 
   const guidance = sections.find((section) => section.name === 'Browser delegation')?.body;
   expect(guidance).toBe(initialGuidance);
   expect(guidance).toContain('principal approvals');
-  expect(guidance).toContain('In a group other than main, take outcomes needing the principal to main');
+  expect(guidance).toContain('Outside main, take outcomes needing the principal to main');
   expect(guidance).toContain('Never ask for or accept card details in chat');
   expect(guidance).toContain('there is no way to use card details sent to you');
   expect(guidance).toContain('adds one on the site or finishes checkout themselves');

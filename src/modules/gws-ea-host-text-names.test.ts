@@ -446,7 +446,6 @@ describe('the names in GWS-EA host text', () => {
       'gws-ea-privacy/index.ts',
       'gws-ea-profile/index.ts',
       'gws-ea-browser/watches.ts',
-      'gws-ea-browser/vault-access.ts',
       'gws-ea-browser/consent-approval.ts',
       'gws-ea-browser/purchase.ts',
       'gws-ea-browser/credential-operations.ts',

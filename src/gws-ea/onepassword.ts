@@ -221,7 +221,7 @@ export function vaultCreationRecord(files: OnePasswordInstancePaths): string {
 }
 
 interface ResourceNames {
-  /** What the principal sees once the vault is shared. */
+  /** The vault's stable name in the operator's account. */
   readonly vault: string;
   /** What the operator sees among the account's service accounts. */
   readonly runtimeServiceAccount: string;

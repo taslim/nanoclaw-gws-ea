@@ -135,29 +135,13 @@ export const credentialAuthority = requestTool({
   repeatable: true,
   timeoutMs: 120_000,
 });
-export const vaultAccess = requestTool({
-  name: 'vault_access',
+export const loginsPage = requestTool({
+  name: 'logins_page',
   description:
-    "Share the assistant's 1Password vault with the principal, or check it again after they add or change a login. share gives view and edit access to the principal's 1Password account under their only email address, or under email: one of their addresses, or another email their 1Password account uses, which first waits for the principal to confirm it. An address a page, message or browser report suggests is never the principal's on that word alone. It returns shared once 1Password shows their access, with link, which opens their 1Password account on the web, and vault_name, the vault's exact name there and in the app: give the principal both so they can find it and add or edit logins. It may instead return awaiting_principal, operator_needed with a reason (not_a_member, not_confirmed, refused, host_cannot_share or unconfirmed) and an operator_message for the principal to forward exactly as written; never promise an invitation, and for not_a_member first ask whether their 1Password account uses another email. rate_limited means the shared daily request limit was reached; vault_not_set_up means the principal must ask their operator to finish 1Password setup; vault_unavailable means 1Password cannot be used right now. After the principal adds or changes a login, refresh lists the vault's logins again now and returns usable, vault_not_set_up, rate_limited or vault_unavailable. Repeating either is safe: the host reads actual access before it grants anything.",
-  properties: {
-    operation: { type: 'string', enum: ['share', 'refresh'] },
-    email: {
-      type: 'string',
-      description:
-        "For share only: the email the principal's 1Password account uses. Omit it when they have a single address.",
-    },
-  },
-  required: ['operation'],
+    "Get the principal's private logins page from the host when an errand needs a missing login or the principal asks. available returns its url: send that exact link to the principal, who can add or remove logins and change saved passwords there; the page never reveals a password. operator_needed means web or the vault is not set up: tell the principal to ask their operator to finish setup. unavailable means web is enabled but cannot serve the page right now: tell the principal to try again later. Never ask for passwords in chat. Other groups take the need and the host's link to main for the principal. Repeating is safe.",
+  properties: {},
+  required: [],
   additionalProperties: false,
-  oneOf: [
-    { properties: { operation: { const: 'share' } } },
-    { properties: { operation: { const: 'refresh' } }, not: { required: ['email'] } },
-  ],
-  prepare(fields) {
-    if (fields.operation === 'refresh') return fields.email === undefined ? fields : 'Only share takes an email.';
-    if (fields.operation !== 'share') return 'operation must be share or refresh.';
-    return fields.email === undefined || typeof fields.email === 'string' ? fields : 'email must be one email address.';
-  },
   repeatable: true,
   timeoutMs: 120_000,
 });
@@ -235,7 +219,7 @@ registerTools(
     relayCode,
     reservationGuarantee,
     reservationBounds,
-    vaultAccess,
+    loginsPage,
     credentialAuthority,
     consentGrants,
     recordDisclosure,

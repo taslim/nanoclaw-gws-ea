@@ -303,7 +303,7 @@ describe('bounded 1Password outcomes', () => {
     const management = await managementIdentity();
 
     const read = await cli.whoami(management);
-    const write = await cli.revokeVaultAccess(management, { vaultId: VAULT_ID, userId: PRINCIPAL_USER_ID });
+    const write = await cli.deleteVault(management, VAULT_ID);
 
     expect(read).toEqual({ status: 'failed', reason: 'failed' });
     expect(write).toEqual({ status: 'failed', reason: 'outcome_unknown' });
@@ -392,10 +392,9 @@ describe('1Password actions', () => {
     });
   });
 
-  it('grants and revokes exactly one user on exactly one vault', async () => {
+  it('grants the provisioning user exactly the required permissions on one vault', async () => {
     const management = await managementIdentity();
     const { cli, calls } = await openCli(succeed);
-
     expect(
       await cli.grantVaultAccess(management, {
         vaultId: VAULT_ID,
@@ -403,45 +402,17 @@ describe('1Password actions', () => {
         permissions: ['allow_viewing', 'allow_editing', 'allow_managing'],
       }),
     ).toEqual({ status: 'ok' });
-    expect(
-      await cli.revokeVaultAccess(OPERATOR, {
-        vaultId: VAULT_ID,
-        userId: PRINCIPAL_USER_ID,
-        permissions: ['manage_vault'],
-      }),
-    ).toEqual({ status: 'ok' });
-    expect(await cli.revokeVaultAccess(management, { vaultId: VAULT_ID, userId: PRINCIPAL_USER_ID })).toEqual({
-      status: 'ok',
-    });
-
-    expect(calls.map((call) => call.args)).toEqual([
-      [
-        'vault',
-        'user',
-        'grant',
-        '--no-input',
-        '--vault',
-        VAULT_ID,
-        '--user',
-        OPERATOR_USER_ID,
-        '--permissions',
-        'allow_viewing,allow_editing,allow_managing',
-      ],
-      [
-        'vault',
-        'user',
-        'revoke',
-        '--no-input',
-        '--vault',
-        VAULT_ID,
-        '--user',
-        PRINCIPAL_USER_ID,
-        '--permissions',
-        'manage_vault',
-        '--account',
-        ACCOUNT_ID,
-      ],
-      ['vault', 'user', 'revoke', '--no-input', '--vault', VAULT_ID, '--user', PRINCIPAL_USER_ID],
+    expect(calls[0].args).toEqual([
+      'vault',
+      'user',
+      'grant',
+      '--no-input',
+      '--vault',
+      VAULT_ID,
+      '--user',
+      OPERATOR_USER_ID,
+      '--permissions',
+      'allow_viewing,allow_editing,allow_managing',
     ]);
   });
 
@@ -454,72 +425,6 @@ describe('1Password actions', () => {
       vaultId: VAULT_ID,
     });
     expect(calls[0].args).toEqual(['vault', 'create', 'Assistant aya+ea@example.test', '--format', 'json']);
-  });
-
-  it('reads one user by exact lowercase email, mapping their type and confirmation', async () => {
-    const { cli, calls } = await openCli(() => ({
-      stdout: JSON.stringify({
-        id: PRINCIPAL_USER_ID,
-        email: 'juno.hale@example.test',
-        type: 'GUEST',
-        state: 'ACTIVE',
-      }),
-    }));
-    const management = await managementIdentity();
-    expect(await cli.getUser(management, 'juno.hale@example.test')).toEqual({
-      status: 'ok',
-      user: { userId: PRINCIPAL_USER_ID, email: 'juno.hale@example.test', type: 'guest', active: true },
-    });
-    expect(calls[0].args).toEqual(['user', 'get', 'juno.hale@example.test', '--format', 'json']);
-    for (const email of ['Juno.Hale@example.test', '-juno@example.test', 'juno', `${'a'.repeat(250)}@example.test`])
-      await expect(cli.getUser(management, email)).rejects.toMatchObject({ code: 'invalid_onepassword_request' });
-    expect(calls).toHaveLength(1);
-  });
-
-  it('treats an unrecognized user shape as unexpected and an unknown type as other', async () => {
-    const replies = [
-      {
-        stdout: JSON.stringify({
-          id: PRINCIPAL_USER_ID,
-          email: 'juno.hale@example.test',
-          type: 'OWNER',
-          state: 'SUSPENDED',
-        }),
-      },
-      { stdout: JSON.stringify({ id: 'short', email: 'juno.hale@example.test', type: 'MEMBER', state: 'ACTIVE' }) },
-      { exitCode: 1, stderr: `[ERROR] "juno.hale@example.test" isn't a user in this account` },
-    ];
-    const { cli } = await openCli(() => replies.shift() ?? {});
-    const management = await managementIdentity();
-    expect(await cli.getUser(management, 'juno.hale@example.test')).toMatchObject({
-      status: 'ok',
-      user: { type: 'other', active: false },
-    });
-    expect(await cli.getUser(management, 'juno.hale@example.test')).toEqual({
-      status: 'failed',
-      reason: 'unexpected_output',
-    });
-    expect(await cli.getUser(management, 'juno.hale@example.test')).toEqual({ status: 'failed', reason: 'not_found' });
-  });
-
-  it('lists the users with direct access to exactly one vault', async () => {
-    const replies = [
-      { stdout: JSON.stringify([{ id: PRINCIPAL_USER_ID }, { id: OPERATOR_USER_ID }]) },
-      { stdout: JSON.stringify([]) },
-      { stdout: JSON.stringify([{ id: PRINCIPAL_USER_ID }, { name: 'no id' }]) },
-    ];
-    const { cli, calls } = await openCli(() => replies.shift() ?? {});
-    const management = await managementIdentity();
-    expect(await cli.listVaultUsers(management, VAULT_ID)).toEqual({
-      status: 'ok',
-      userIds: [PRINCIPAL_USER_ID, OPERATOR_USER_ID],
-    });
-    expect(calls[0].args).toEqual(['user', 'list', '--vault', VAULT_ID, '--format', 'json']);
-    expect(await cli.listVaultUsers(management, VAULT_ID)).toEqual({ status: 'ok', userIds: [] });
-    expect(await cli.listVaultUsers(management, VAULT_ID)).toEqual({ status: 'failed', reason: 'unexpected_output' });
-    await expect(cli.listVaultUsers(management, 'not-a-vault')).rejects.toMatchObject({
-      code: 'invalid_onepassword_request',
-    });
   });
 
   it('deletes exactly one vault by its ID', async () => {

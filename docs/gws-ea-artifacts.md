@@ -20,8 +20,22 @@ Install the optional `web` connector host-wide through the
 [operator CLI](gws-ea-cli.md#assistant-web). It verifies and records one Cloudflare
 account, Access team and active zone, then provisions a shared Named Cloudflare
 Tunnel and a separate DNS record and Access application for each compatible
-running assistant with a complete profile. Artifacts is the first feature on
-that address; there is no artifacts connector or second activation step.
+running assistant with a complete profile. The address also serves the
+principal-only `/logins` page for adding and removing saved logins and changing
+saved passwords; it never reveals a password. There is no artifacts connector
+or second activation step.
+
+Before updating an existing web install to this release, run
+`gws-ea connectors uninstall web` using the **current checkout**. Then pull the
+release, run `bash gws-ea.sh`, run `gws-ea update --all`, and install web again
+with `gws-ea connectors install web` and its setup options. The previous
+artifacts-only Cloudflare route is intentionally refused because it leaves
+`/logins` outside Access. Local saved HTML and logins survive the uninstall.
+
+Verify with `gws-ea connectors check web --id <instance_id>` and open `/logins`
+as the principal. To roll back to the older route contract, first uninstall web
+using the currently installed new checkout, then return to the older version,
+reinstall web there and run its readiness check.
 
 An assistant named Aya claims `aya.example.com` on zone `example.com`. Its first
 name uses the shared ASCII reduction, capped at 63 characters, with no suffix or
@@ -33,8 +47,11 @@ prerequisites remain pending; create, resume, update, start and restart retry
 installed web setup. A repeated install verifies a ready assistant without
 restarting its authors.
 
-Only canonical `/artifacts` routes reach the feature. Root, other paths, encoded
-aliases, another Host and methods other than GET and HEAD serve no content.
+Only canonical `/artifacts` routes reach the artifact feature, using GET and
+HEAD. The host separately handles `/logins` for the current principal alone.
+Root, unknown paths, encoded aliases and another Host serve no content.
+Cloudflare Access protects the whole hostname; public artifact snapshots keep
+their explicit public route.
 
 Cloudflare credentials and connector tokens are host-only, separate files.
 Management permissions cover the selected account/zones and the required Tunnel,
