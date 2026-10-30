@@ -11,7 +11,7 @@ import { artifactAdmissionEmails } from './sharing.js';
 import { getAllAgentGroups } from '../../db/agent-groups.js';
 import { hasArtifactsAccess } from './policy.js';
 import { startWebOrigin } from '../gws-ea-web/index.js';
-import { unavailableWebHandler } from '../gws-ea-web/server.js';
+import { createLoginsPageHandler } from '../gws-ea-browser/logins-page.js';
 import { createArtifactViewHandler } from './server.js';
 import { createArtifactViewResolver } from './access.js';
 
@@ -23,7 +23,7 @@ const web = startWebOrigin(
   {
     artifacts: (config, identity) =>
       createArtifactViewHandler({ hostname: config.hostname, resolve: createArtifactViewResolver(config, identity) }),
-    logins: () => unavailableWebHandler,
+    logins: (config, identity) => createLoginsPageHandler({ hostname: config.hostname, identity }),
   },
   artifactAdmissionEmails,
 );

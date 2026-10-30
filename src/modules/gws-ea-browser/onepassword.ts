@@ -57,6 +57,34 @@ export interface BrowserVaultLogin {
   readonly websites: readonly Website[];
 }
 
+export interface BrowserVaultListedLogin extends BrowserVaultLogin, BrowserVaultItem {}
+
+export class BrowserLoginError extends Error {
+  constructor(readonly reason: 'invalid_site' | 'duplicate_login') {
+    super(reason);
+  }
+}
+
+/** A typed site becomes only its HTTPS hostname; paths and queries are never retained. */
+function loginWebsite(site: string): URL {
+  try {
+    const value = site.trim();
+    const url = new URL(value.includes('://') ? value : `https://${value}`);
+    if (
+      !value ||
+      /[\s\\]/u.test(value) ||
+      url.protocol !== 'https:' ||
+      url.username ||
+      url.password ||
+      !getDomain(url.hostname, { allowPrivateDomains: true })
+    )
+      throw new BrowserLoginError('invalid_site');
+    return new URL(`https://${url.hostname}`);
+  } catch (_error) {
+    throw new BrowserLoginError('invalid_site');
+  }
+}
+
 /** Each defaults to its host locator, re-read for every use. */
 export interface BrowserVaultLocators {
   /** This assistant's browser policy, always `<instance root>/browser`; it locates the instance root. */
@@ -335,6 +363,8 @@ export class BrowserVault {
   private failures = 0;
   private unavailableUntil = 0;
   private loading: Promise<void> | undefined;
+  /** Duplicate checking and a principal's create share one host-only critical section. */
+  private creating: Promise<void> = Promise.resolve();
 
   constructor(private readonly locators: BrowserVaultLocators = {}) {}
 
@@ -506,6 +536,8 @@ export class BrowserVault {
     } finally {
       if (this.loading === loading) this.loading = undefined;
     }
+    // A concurrent write may have completed while this shared listing was in flight.
+    if (!this.loaded) await this.load(await this.ready(assertActive), assertActive);
   }
 
   /** Listings come from the cache until a reset, `invalidate` or `refresh` has the vault listed again. */
@@ -565,6 +597,26 @@ export class BrowserVault {
    */
   async loginForHandle(handle: string, origin: string, assertActive = active): Promise<BrowserVaultLogin> {
     const { client, item: overview } = await this.listed(handle, origin, assertActive);
+    return this.loginMetadata(client, overview, assertActive);
+  }
+
+  /** All ordinary active Logins, including items without an autofill website. */
+  async allLogins(assertActive = active): Promise<BrowserVaultListedLogin[]> {
+    const client = await this.ready(assertActive);
+    if (!this.loaded) await this.load(client, assertActive);
+    const logins: BrowserVaultListedLogin[] = [];
+    for (const [item_handle, overview] of this.handles) {
+      const login = await this.loginMetadata(client, overview, assertActive);
+      logins.push({ ...login, item_handle, title: overview.title.replace(/\p{Cc}/gu, ' ').slice(0, 200) });
+    }
+    return logins;
+  }
+
+  private async loginMetadata(
+    client: Client,
+    overview: ItemOverview,
+    assertActive: () => Promise<void>,
+  ): Promise<BrowserVaultLogin> {
     const cached = this.usernames.get(overview.id);
     if (cached?.updatedAt === overview.updatedAt.getTime()) return cached.login;
     try {
@@ -584,6 +636,82 @@ export class BrowserVault {
     } catch (error) {
       throw await this.error(error);
     }
+  }
+
+  /** The principal creates an ordinary Login directly, regardless of its username's ownership. */
+  async createLogin(site: string, username: string, password: string): Promise<void> {
+    const website = loginWebsite(site);
+    const previous = this.creating;
+    let release = (): void => undefined;
+    this.creating = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    await previous;
+    try {
+      await this.refresh();
+      const existing = await this.allLogins();
+      if (
+        existing.some(
+          (login) =>
+            login.username === username &&
+            login.websites.some((saved) => onePasswordWebsiteOrigin(saved.url)?.hostname === website.hostname),
+        )
+      )
+        throw new BrowserLoginError('duplicate_login');
+      const client = await this.ready(active);
+      const vaultId = this.vaultId;
+      if (!vaultId) throw new BrowserVaultError('vault_unavailable');
+      const { ItemCategory, ItemFieldType, AutofillBehavior } = await sdk();
+      await this.stillBound(vaultId);
+      try {
+        await client.items.create({
+          category: ItemCategory.Login,
+          vaultId,
+          title: website.hostname,
+          fields: [
+            { id: 'username', title: 'username', fieldType: ItemFieldType.Text, value: username },
+            { id: 'password', title: 'password', fieldType: ItemFieldType.Concealed, value: password },
+          ],
+          websites: [{ url: website.origin, label: 'website', autofillBehavior: AutofillBehavior.AnywhereOnWebsite }],
+        });
+      } catch (error) {
+        throw await this.error(error);
+      } finally {
+        this.invalidate();
+      }
+    } finally {
+      release();
+    }
+  }
+
+  /** A current active Login, read fresh under its listed handle, for the principal's own edit. */
+  private async editableLogin(handle: string): Promise<Item> {
+    await this.refresh();
+    const overview = this.handles.get(handle);
+    if (!overview) throw new BrowserVaultError('no_item_for_site');
+    const read = await this.readItem(overview.vaultId, overview.id);
+    const item = readItems.get(read);
+    if (!item || read.category !== 'login' || read.pending) throw new BrowserVaultError('no_item_for_site');
+    return item;
+  }
+
+  /** Fresh whole-item read and optimistic version preserve the principal's other fields. */
+  async setLoginPassword(handle: string, password: string): Promise<void> {
+    const item = await this.editableLogin(handle);
+    const { ItemFieldType } = await sdk();
+    const fields = item.fields.map((field) =>
+      field.id === 'password' && !field.sectionId
+        ? { ...field, fieldType: ItemFieldType.Concealed, value: password }
+        : field,
+    );
+    if (!fields.some((field) => field.id === 'password' && !field.sectionId))
+      fields.push({ id: 'password', title: 'password', fieldType: ItemFieldType.Concealed, value: password });
+    await this.put({ ...item, fields }, active);
+  }
+
+  async removeLogin(handle: string): Promise<void> {
+    const item = await this.editableLogin(handle);
+    await this.deleteItem(item.vaultId, item.id);
   }
 
   /** One fresh read of an item in the bound vault: one request, never cached. */
@@ -668,12 +796,7 @@ export class BrowserVault {
   async publishCandidate(read: VaultItemRead, assertActive = active): Promise<VaultItemRead> {
     const item = readItems.get(read);
     if (!item) throw new BrowserVaultError('vault_unavailable');
-    try {
-      return await this.put({ ...item, tags: (item.tags ?? []).filter((tag) => !isCandidateTag(tag)) }, assertActive);
-    } finally {
-      // Even a failed request may have published it.
-      this.invalidate();
-    }
+    return this.put({ ...item, tags: (item.tags ?? []).filter((tag) => !isCandidateTag(tag)) }, assertActive);
   }
 
   /**
@@ -697,6 +820,9 @@ export class BrowserVault {
       await client.items.delete(vaultId, itemId);
     } catch (error) {
       throw await this.error(error);
+    } finally {
+      this.usernames.delete(itemId);
+      this.invalidate();
     }
   }
 
@@ -708,6 +834,9 @@ export class BrowserVault {
       return remember(saved);
     } catch (error) {
       throw await this.error(error);
+    } finally {
+      this.usernames.delete(next.id);
+      this.invalidate();
     }
   }
 

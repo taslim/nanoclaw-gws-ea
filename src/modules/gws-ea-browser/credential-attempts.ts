@@ -41,6 +41,7 @@ import {
   websiteDomain,
   type BrowserVault,
   type BrowserVaultBinding,
+  type BrowserVaultLogin,
   type BrowserVaultReason,
   type VaultCandidateSpec,
   type VaultItemRead,
@@ -307,19 +308,37 @@ export class CredentialAttempts {
   /** Username decides ownership; only a finalized signup establishes a non-email account. */
   private async assistantAccount(
     login: Pick<VaultItemRead, 'category' | 'username' | 'domains'>,
-    site: string,
+    site?: string,
   ): Promise<boolean> {
     const { username } = login;
-    if (login.category !== 'login' || username === undefined || !login.domains.includes(site)) return false;
+    if (login.category !== 'login' || username === undefined || (site !== undefined && !login.domains.includes(site)))
+      return false;
     if (await isAssistantAccount(username)) return true;
     if (EMAIL_PATTERN.test(username)) return false;
-    return (
-      (await this.db.get<{ id: string }>(
-        `SELECT id FROM ${TABLE} WHERE kind = 'signup' AND phase = 'finalized' AND site = ? AND username = ? LIMIT 1`,
-        site,
-        username,
-      )) !== undefined
+    for (const domain of site === undefined ? login.domains : [site]) {
+      if (
+        await this.db.get<{ id: string }>(
+          `SELECT id FROM ${TABLE} WHERE kind = 'signup' AND phase = 'finalized' AND site = ? AND username = ? LIMIT 1`,
+          domain,
+          username,
+        )
+      )
+        return true;
+    }
+    return false;
+  }
+
+  /** One ownership predicate for site-bound suggestions and the principal's whole-vault page. */
+  async accountForLogin(login: BrowserVaultLogin, site?: string): Promise<'assistant' | 'principal'> {
+    const owned = await this.assistantAccount(
+      {
+        category: 'login',
+        username: login.username,
+        domains: login.websites.flatMap((website) => websiteDomain(website.url) ?? []),
+      },
+      site,
     );
+    return owned ? 'assistant' : 'principal';
   }
 
   /** A cached classification for a listing; writes always use a fresh item read instead. */
@@ -331,17 +350,8 @@ export class CredentialAttempts {
     const login = await provider(this.vault.loginForHandle(itemHandle, origin, assertActive));
     if (!('value' in login)) return login;
     const site = registrableDomain(origin);
-    const owned =
-      site !== undefined &&
-      (await this.assistantAccount(
-        {
-          category: 'login',
-          username: login.value.username,
-          domains: login.value.websites.flatMap((website) => websiteDomain(website.url) ?? []),
-        },
-        site,
-      ));
-    return { status: 'classified', account: owned ? 'assistant' : 'principal' };
+    const account = site === undefined ? 'principal' : await this.accountForLogin(login.value, site);
+    return { status: 'classified', account };
   }
 
   private async listedItem(

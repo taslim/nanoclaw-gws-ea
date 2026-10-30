@@ -414,6 +414,9 @@ describe('suggestions and ownership', () => {
     await vault.refresh();
     expect(await subject.account(handle, ORIGIN)).toEqual({ status: 'classified', account: 'assistant' });
     expect(await subject.ownership(handle, ORIGIN)).toEqual({ status: 'owned' });
+    const [listed] = await vault.allLogins();
+    expect(await subject.accountForLogin(listed)).toBe('assistant');
+    expect(await subject.accountForLogin({ ...listed, websites: [] })).toBe('principal');
     const copy = fake.duplicate(itemId, 'Other site');
     fake.edit(copy.id, (item) => ({
       ...item,
