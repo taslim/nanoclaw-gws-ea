@@ -69,6 +69,7 @@ export function nativeScenarioHooks(
   const relocated = (value: string): string =>
     value
       .replace(/^\/workspace\/agent(?=\/|$)/u, agent)
+      .replace(/^\/workspace\/inbox(?=\/|$)/u, composition.inboxDirectory)
       .replace(/^\/app\/skills(?=\/|$)/u, path.join(tree, 'container/skills'))
       .replace(/^\/workspace\/week-view\.json$/u, composition.weekViewFile ?? '/unavailable-week-view');
   const translated = (input: PreToolUseHookInput): PreToolUseHookInput => {
@@ -124,7 +125,12 @@ export function nativeScenarioHooks(
     if (input.tool_name === 'Bash') {
       updated = {
         ...updated,
-        command: syntheticShellCommand(shellProfile, typeof updated.command === 'string' ? updated.command : '', tree),
+        command: syntheticShellCommand(
+          shellProfile,
+          typeof updated.command === 'string' ? updated.command : '',
+          tree,
+          composition.inboxDirectory,
+        ),
       };
     } else if (['Read', 'Glob', 'Grep', 'Write', 'Edit', 'NotebookEdit'].includes(input.tool_name)) {
       const target = path.resolve(agent, String(args.file_path ?? args.notebook_path ?? args.path ?? '.'));
@@ -132,7 +138,12 @@ export function nativeScenarioHooks(
       const view = composition.weekViewFile;
       if (
         !within(target, agent) &&
-        !(reading && (within(target, path.join(tree, 'container/skills')) || target === view))
+        !(
+          reading &&
+          (within(target, path.join(tree, 'container/skills')) ||
+            within(target, composition.inboxDirectory) ||
+            target === view)
+        )
       )
         reason = 'Outside the synthetic agent file mount.';
     } else if (input.tool_name === 'Skill') {

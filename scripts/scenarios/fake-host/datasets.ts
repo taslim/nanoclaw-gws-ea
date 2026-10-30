@@ -139,6 +139,60 @@ export function concreteFixture(scenario: ScenarioCase, referenceAt: string): Da
       ],
       thread: { key: 'mail-synthetic-errand-loop', namedPeople: ['errands.desk@example.test'] },
     };
+  if (id === 'return-flight-live')
+    return {
+      events: [
+        ...Array.from({ length: 25 }, (_, n) => ({
+          ...event(
+            `synthetic-detailed-${n}`,
+            `Travel administration ${n}`,
+            new Date(Date.parse('2026-11-08T07:00:00-08:00') + n * 60_000).toISOString(),
+            new Date(Date.parse('2026-11-08T07:01:00-08:00') + n * 60_000).toISOString(),
+            'Austin',
+          ),
+          description: 'Travel paperwork, routing and preparation notes. '.repeat(40),
+        })),
+        {
+          ...event(
+            'synthetic-aus-sfo-return',
+            'Flight Austin to San Francisco',
+            '2026-11-08T18:10:00-06:00',
+            '2026-11-08T20:20:00-08:00',
+            'San Francisco',
+          ),
+          start: { dateTime: '2026-11-08T18:10:00-06:00', timeZone: 'America/Chicago' },
+          end: { dateTime: '2026-11-08T20:20:00-08:00', timeZone: 'America/Los_Angeles' },
+        },
+        event(
+          'synthetic-dentist',
+          'Dentist appointment',
+          '2026-11-09T16:30:00-08:00',
+          '2026-11-09T17:00:00-08:00',
+          'San Francisco',
+        ),
+        {
+          calendarId: principal,
+          id: 'synthetic-austin-hotel',
+          summary: 'Austin hotel stay',
+          start: { date: '2026-11-06' },
+          end: { date: '2026-11-09' },
+        },
+      ],
+      mail: [],
+    };
+  if (id === 'merchant-hours-live')
+    return {
+      events: [],
+      mail: [
+        syntheticMail(
+          'synthetic-prescription-ready',
+          'Your prescription is ready at the Geary pharmacy counter',
+          'pharmacy@example.test',
+          principal,
+          'Your prepaid prescription is ready at the Geary branch, 800 Fiction Lane, San Francisco. The pharmacy COUNTER is open Friday November 6 from 10:00 to 19:00 and Saturday November 7 from 09:00 to 18:00, closed daily 13:30–14:00 for lunch. The general store stays open later, but cannot release prescriptions when the counter is closed. Collect by Saturday November 7 at 18:00. No payment remains. Morgan works at home in San Francisco on Friday until 18:00, ten minutes from this pharmacy.',
+        ),
+      ],
+    };
   if (id === 'flight-chain')
     return {
       events: [

@@ -114,7 +114,7 @@ let messages: MessageInRow[] = [
     on_wake: 0,
   },
 ];
-const shell = prepareSyntheticShell(directory, tree);
+const shell = prepareSyntheticShell(directory, tree, composition.inboxDirectory);
 if (kind === 'agent' && composition.close) {
   const task = composition.close.task;
   messages = [

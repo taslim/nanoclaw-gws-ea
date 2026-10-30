@@ -235,6 +235,8 @@ export interface RequestToolSpec {
   readonly required: readonly string[];
   /** Close a tool's JSON schema when its host action accepts only the named fields. */
   readonly additionalProperties?: false;
+  /** Reject unknown arguments before filtering, rather than silently discarding them. */
+  readonly rejectUnknownArguments?: true;
   readonly oneOf?: readonly object[];
   /** Whether making the same call again is safe: a repeat changes nothing twice. */
   readonly repeatable: boolean;
@@ -270,23 +272,32 @@ function timeoutText(requestId: string, repeatable: boolean, lateAnswer = false)
 }
 
 /**
- * The host checks what each request means, so the tool checks only that the
- * required fields are there, and sends no field it does not take.
+ * The host checks what each request means. Tools can reject unknown fields
+ * before filtering, so a misspelled optional argument cannot silently become a default.
  */
 export function requestTool(spec: RequestToolSpec): McpToolDefinition {
-  return {
-    tool: {
-      name: spec.name,
-      description: spec.description,
-      inputSchema: {
-        type: 'object',
-        properties: { ...spec.properties },
-        required: [...spec.required],
-        ...(spec.additionalProperties === false ? { additionalProperties: false } : {}),
-        ...(spec.oneOf ? { oneOf: [...spec.oneOf] } : {}),
-      },
+  const tool: McpToolDefinition['tool'] = {
+    name: spec.name,
+    description: spec.description,
+    inputSchema: {
+      type: 'object',
+      properties: { ...spec.properties },
+      required: [...spec.required],
+      ...(spec.additionalProperties === false ? { additionalProperties: false } : {}),
+      ...(spec.oneOf ? { oneOf: [...spec.oneOf] } : {}),
     },
+  };
+  return {
+    tool,
     async handler(args, context) {
+      if (spec.rejectUnknownArguments) {
+        const properties = tool.inputSchema.properties ?? {};
+        const unknown = Object.keys(args).find((field) => !Object.hasOwn(properties, field));
+        if (unknown !== undefined)
+          return errorResult(
+            `Unknown argument ${JSON.stringify(unknown)}. Use: ${Object.keys(properties).join(', ')}.`,
+          );
+      }
       const missing = spec.required.find((field) => args[field] === undefined || args[field] === null);
       if (missing !== undefined) return errorResult(`${missing} is required`);
       const signal = context?.signal;

@@ -234,6 +234,8 @@ try {
   const { model, effort, speed } = runnerConfigFromRaw(JSON.parse(JSON.stringify(config)) as Record<string, unknown>);
   const reservedEnvironmentKeys = ['HOME', 'TZ', 'ANTHROPIC_BASE_URL'];
   const { sessionDir } = await import('../../../src/session-manager.js');
+  const inboxDirectory = path.join(sessionDir(group.id, session.id), 'inbox');
+  fs.mkdirSync(inboxDirectory, { recursive: true });
   const { projectSessionRoutes } = await import('./routes.js');
   const routes = await projectSessionRoutes(session);
   const composition: ScenarioComposition = {
@@ -250,6 +252,7 @@ try {
     ),
     reservedEnvironmentKeys,
     session: { id: session.id, messagingGroupId: session.messaging_group_id },
+    inboxDirectory,
     ...(context ? { context } : {}),
     ...(audience === 'main'
       ? { weekViewFile: path.join(sessionDir(main.id, close ? session.id : mainSession.id), 'week-view.json') }

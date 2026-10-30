@@ -132,19 +132,24 @@ export const peopleStats = requestTool({
 export const days = requestTool({
   name: 'days',
   description:
-    'Read the principal’s days on the clock in effect at each event, with places, creators, organizer and guest responses. Copies across calendars are folded and all-day ends are inclusive. Read one event with calendar and event; filter by text. Export writes bounded text fields to this session’s inbox and returns its path and event count.',
+    'Read live calendar facts for the principal on the clock in effect at each event. Answers state the exact date range and whether all matching events are inline. Copies across calendars are folded and all-day ends are inclusive. Use start/end for dates, calendar/event for one event, or filter for text. Export, also automatic when the answer is too large, saves all matching events with bounded text fields to this session’s inbox: read or search that file before answering from it.',
   properties: {
     start: { type: 'string', description: 'First local date (YYYY-MM-DD) or instant with offset; today when omitted.' },
     end: {
       type: 'string',
       description: 'Last local date, included, or exclusive instant with offset; eight local days when omitted.',
     },
-    calendar: CALENDAR,
+    calendar: {
+      type: 'string',
+      description: 'Optional principal calendar ID for the range; with event, a principal calendar or your own.',
+    },
     event: EVENT,
     filter: { type: 'string', description: 'Text to match in title, notes or location.' },
     export: { type: 'boolean', description: 'Write the complete range as a text file in your session inbox.' },
   },
   required: [],
+  additionalProperties: false,
+  rejectUnknownArguments: true,
   repeatable: true,
   timeoutMs: CALENDAR_REQUEST_TIMEOUT_MS,
 });

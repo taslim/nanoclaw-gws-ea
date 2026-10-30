@@ -20,27 +20,52 @@ const STALE_AFTER_MS = 26 * 60 * 60_000;
 const DIFF_CHARACTERS = 4_000;
 const MANUAL_CHARACTERS = 8_000;
 
-function dayChanges(previous: DeliveredView | undefined, days: readonly ViewDay[]): string {
-  const changes: string[] = [];
+function dayChanges(
+  previous: DeliveredView | undefined,
+  days: readonly ViewDay[],
+): { readonly text: string; readonly delivered: readonly ViewDay[] } {
+  const heldDays = new Map(previous?.days.map((day) => [day.date, day]));
+  const changes: { readonly text: string; readonly remember: () => void }[] = [];
+  const remember = (day: ViewDay, entries: ViewDay['entries']) => heldDays.set(day.date, { ...day, entries });
   for (const day of days) {
     const held = previous?.days.find((entry) => entry.date === day.date);
-    if (held?.version !== day.version) changes.push(day.header);
+    if (held?.version !== day.version)
+      changes.push({ text: day.header, remember: () => remember(day, heldDays.get(day.date)?.entries ?? []) });
     const heldVersions = new Map(held?.entries.map((entry) => [entry.id, entry.version]));
     const currentIds = new Set(day.entries.map((entry) => entry.id));
     for (const entry of day.entries)
-      if (heldVersions.get(entry.id) !== entry.version) changes.push(`${day.date}: ${entry.text}`);
+      if (heldVersions.get(entry.id) !== entry.version)
+        changes.push({
+          text: `${day.date}: ${entry.text}`,
+          remember: () =>
+            remember(day, [...(heldDays.get(day.date)?.entries ?? []).filter((e) => e.id !== entry.id), entry]),
+        });
     for (const old of held?.entries ?? [])
-      if (!currentIds.has(old.id)) changes.push(`${day.date}: no longer shown: ${old.text}`);
+      if (!currentIds.has(old.id))
+        changes.push({
+          text: `${day.date}: no longer shown: ${old.text}`,
+          remember: () =>
+            remember(
+              day,
+              (heldDays.get(day.date)?.entries ?? []).filter((e) => e.id !== old.id),
+            ),
+        });
   }
   const lines: string[] = [];
   let size = 0;
   for (const change of changes) {
-    if (size + change.length + 45 > DIFF_CHARACTERS) break;
-    lines.push(change);
-    size += change.length + 1;
+    // An indivisible framed entry may exceed the usual budget; deliver it alone instead of starving it.
+    if (lines.length && size + change.text.length + 45 > DIFF_CHARACTERS) break;
+    lines.push(change.text);
+    size += change.text.length + 1;
+    change.remember();
   }
-  if (lines.length < changes.length) lines.push(`+${changes.length - lines.length} more`);
-  return lines.join('\n');
+  const complete = lines.length === changes.length;
+  if (!complete) lines.push(`+${changes.length - lines.length} more`);
+  return {
+    text: lines.join('\n'),
+    delivered: complete ? days : days.flatMap((day) => heldDays.get(day.date) ?? []),
+  };
 }
 
 function projectDocument(file: string): string {
@@ -102,29 +127,33 @@ function run(): void {
   const id = typeof raw.session_id === 'string' && raw.session_id ? raw.session_id : undefined;
   const stateDir = process.argv[3];
   const previous = id ? readDelivered(id, stateDir) : undefined;
-  const snapshot: DeliveredView = {
+  const sections = value.manual;
+  const snapshot = (days: readonly ViewDay[]): DeliveredView => ({
     fingerprint: fingerprint([
-      value.days.map((day) => [day.date, day.version, day.entries.map((entry) => [entry.id, entry.version])]),
-      value.manual,
+      days.map((day) => [day.date, day.version, day.entries.map((entry) => [entry.id, entry.version])]),
+      sections,
       clock,
     ]),
-    days: value.days,
-    manual: value.manual,
-  };
+    days,
+    manual: sections,
+  });
   const start = raw.hook_event_name === 'SessionStart';
-  if (start && raw.source === 'resume' && snapshot.fingerprint === previous?.fingerprint) return;
+  if (start && raw.source === 'resume' && snapshot(value.days).fingerprint === previous?.fingerprint) return;
   // Startup, clear and compaction leave the session only its project document; a resume keeps its transcript.
   const fresh = start && raw.source !== 'resume';
   const zone = timelineZoneAt(clock, now) ?? process.env.TZ ?? 'UTC';
   const local = DateTime.fromMillis(now, { zone });
   const night = local.hour >= 22 || local.hour < 7;
   const nowText = `Now: ${local.toFormat('yyyy-MM-dd HH:mm')} (${zone}; ${night ? 'night' : 'day'}; default night 22:00–07:00)`;
-  const days = start
-    ? `Coming days (as of ${DateTime.fromISO(asOf).setZone(zone).toFormat('yyyy-MM-dd HH:mm')})\n${value.text}`
+  const changes = start
+    ? {
+        text: `Coming days (as of ${DateTime.fromISO(asOf).setZone(zone).toFormat('yyyy-MM-dd HH:mm')})\n${value.text}`,
+        delivered: value.days,
+      }
     : dayChanges(previous, value.days);
   const manual = manualChanges(value.manual, fresh ? undefined : previous?.manual, process.argv[4] ?? PROJECT_DOCUMENT);
-  write([nowText, [days, manual].filter(Boolean).join('\n\n')].filter(Boolean).join('\n'));
-  if (id) recordDelivered(id, snapshot, stateDir);
+  write([nowText, [changes.text, manual].filter(Boolean).join('\n\n')].filter(Boolean).join('\n'));
+  if (id) recordDelivered(id, snapshot(changes.delivered), stateDir);
 }
 
 if (import.meta.main) {

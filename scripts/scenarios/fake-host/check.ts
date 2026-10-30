@@ -58,6 +58,13 @@ const STORED: Readonly<Record<string, readonly (readonly [Store, string])[]>> = 
     ['events', '800 Fiction Lane'],
     ['mail', 'Dinner with Juno is at Harbor House'],
   ],
+  'return-flight-live': [
+    ['events', 'synthetic-aus-sfo-return'],
+    ['events', '2026-11-08T20:20:00-08:00'],
+    ['events', 'synthetic-detailed-24'],
+    ['events', 'synthetic-dentist'],
+  ],
+  'merchant-hours-live': [['mail', 'pharmacy COUNTER is open Friday November 6']],
   'location-field': [
     ['mail', 'for 60 minutes'],
     ['people', 'Remy Vance'],

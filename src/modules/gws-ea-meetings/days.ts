@@ -2,6 +2,8 @@ import { log } from '../../log.js';
 import { createHash } from 'node:crypto';
 import { forbidden, invalidArgs, type ActionAnswer } from '../../cli/delivery-action.js';
 import { stageInboxFile } from '../../session-manager.js';
+import type { Session } from '../../types.js';
+import { formatLocalTimeWithZone } from '../../timezone.js';
 import { getMatter, listOpenMatters } from '../gws-ea-matters/db.js';
 import { findTasks } from '../gws-ea-matters/looks.js';
 import { listPeople } from '../gws-ea-people/db.js';
@@ -22,6 +24,7 @@ import {
   buildWeek,
   calendarText,
   presentWeek,
+  inWindow,
   type EventCopy,
   type InvolvedPerson,
   type Week,
@@ -55,6 +58,7 @@ export interface CalendarWeekOptions {
   readonly eventSnapshot?: readonly EventCopy[];
   readonly additionalEvents?: readonly EventCopy[];
   readonly replaceEvent?: { readonly calendarId: string; readonly eventId: string };
+  readonly calendarId?: string;
 }
 export async function loadCalendarWeek(calendar: MeetingsCalendarApi, options: CalendarWeekOptions): Promise<Week> {
   const [timeline, profile, listed, preferences, people, summaries, privateValues] = await Promise.all([
@@ -67,9 +71,15 @@ export async function loadCalendarWeek(calendar: MeetingsCalendarApi, options: C
     listPrivateValues(),
   ]);
   const principal = principalRecognizer(profile.principal_emails);
-  const calendars = listed.filter((entry) => isPrincipalCalendar(entry, principal));
+  const calendars = listed.filter(
+    (entry) => isPrincipalCalendar(entry, principal) && (!options.calendarId || entry.id === options.calendarId),
+  );
   if (!options.eventSnapshot && !calendars.length)
-    throw forbidden("None of the principal's calendars is in your list yet.");
+    throw forbidden(
+      options.calendarId
+        ? 'That principal calendar is not available in your calendar list.'
+        : "None of the principal's calendars is in your list yet.",
+    );
   const copies =
     options.eventSnapshot ??
     (
@@ -210,10 +220,10 @@ function filterEvents(events: readonly WeekEvent[], filter?: string): WeekEvent[
   );
 }
 /** Renders the week's events, each once, in the order and on the day the presented days place it. */
-export function renderDays(week: Week, filter?: string): string {
+function dayEntries(week: Week, filter?: string): string[] {
   const shown = presentWeek(week);
   const selected = new Set(filterEvents(week.events, filter).map((e) => e.key));
-  const lines = week.days.flatMap((day, index) =>
+  return week.days.flatMap((day, index) =>
     day.events.flatMap((e, position) => {
       if (!selected.delete(e.key)) return [];
       const p = shown.days[index].events[position];
@@ -241,7 +251,50 @@ export function renderDays(week: Week, filter?: string): string {
       ];
     }),
   );
-  return boundedCalendarMessage(`${lines.length} events across ${week.days.length} local days.`, lines);
+}
+export function renderDays(week: Week, filter?: string): string {
+  const entries = dayEntries(week, filter);
+  return boundedCalendarMessage(`${entries.length} events across ${week.days.length} local days.`, entries);
+}
+
+function daysAnswer(
+  week: Week,
+  session: Session,
+  requestId: string,
+  range: { readonly start: number; readonly end: number; readonly calendarId?: string },
+  filter: string | undefined,
+  exportFile: boolean,
+): Record<string, unknown> {
+  const entries = dayEntries({ ...week, events: week.events.filter((event) => inWindow(event, range)) }, filter);
+  const readAt = new Date().toISOString();
+  const head = [
+    `${entries.length} events across ${week.days.length} local days.`,
+    `Read live at ${formatLocalTimeWithZone(readAt, zoneAt(week.timeline, Date.parse(readAt)) ?? 'UTC')}.`,
+    `Range: ${zonedIso(range.start, zoneAt(week.timeline, range.start) ?? 'UTC')} to ${zonedIso(range.end, zoneAt(week.timeline, range.end) ?? 'UTC')} (end exclusive).`,
+    `Calendar: ${range.calendarId ?? 'all visible principal calendars'}.`,
+    ...(filter ? [`Text filter: ${calendarText(filter)}.`] : []),
+  ].join('\n');
+  const inline = [head, 'Complete event list; text fields are bounded.', ...entries].join('\n');
+  if (exportFile || inline.length > CALENDAR_ANSWER_LIMIT) {
+    const text = [head, ...entries].join('\n');
+    const key = createHash('sha256').update(requestId).update(text).digest('hex').slice(0, 24);
+    const staged = stageInboxFile(session.agent_group_id, session.id, `calendar-${key}`, 'days.txt', Buffer.from(text));
+    const path = `/workspace/${staged}`;
+    return {
+      path,
+      count: entries.length,
+      complete: false,
+      message: [
+        head,
+        exportFile ? '' : 'Partial result: the events exceed the inline limit; none are shown here.',
+        `Exported ${entries.length} events to ${path}.`,
+        'Read or search the complete file before answering or concluding an event is absent.',
+      ]
+        .filter(Boolean)
+        .join('\n'),
+    };
+  }
+  return { count: entries.length, complete: true, message: inline };
 }
 // Async for its callers, which await it beside reads.
 export async function calendarFindings(week: Week): Promise<string> {
@@ -281,9 +334,11 @@ export function createDaysTools(deps: { readonly calendar: () => MeetingsCalenda
         ? boundary(lastDate, zoneForDay(timeline, lastDate) ?? 'UTC', 'end')
         : dayBoundary(content.end, 'end', timeline, true);
     if (end <= start) throw invalidArgs('end must come after start');
+    const calendarId = lineOf(content.calendar, 'calendar', 254);
+    const filter = lineOf(content.filter, 'filter', 200);
+    const exportFile = flagOf(content.export, 'export') === true;
     const eventId = lineOf(content.event, 'event', 1024);
     if (eventId) {
-      const calendarId = lineOf(content.calendar, 'calendar', 254);
       if (!calendarId) throw invalidArgs('calendar is required with event');
       const [entry, profile, assistant, detail] = await Promise.all([
         deps.calendar().getCalendar(calendarId),
@@ -305,29 +360,20 @@ export function createDaysTools(deps: { readonly calendar: () => MeetingsCalenda
         additionalEvents: [{ calendarId, event: detail, owner }],
         replaceEvent: { calendarId, eventId },
       });
-      return {
-        message: renderDays({
+      return daysAnswer(
+        {
           ...week,
           events: week.events.filter((e) => e.id === eventId && e.calendarId === calendarId),
-        }),
-      };
-    }
-    const week = await loadCalendarWeek(deps.calendar(), { start, end, timeline });
-    const filter = lineOf(content.filter, 'filter', 200);
-    if (flagOf(content.export, 'export')) {
-      const selected = filterEvents(week.events, filter);
-      const rendered = selected.map((e) => renderDays({ ...week, events: [e] })).join('\n\n');
-      const key = createHash('sha256').update(requestId).digest('hex').slice(0, 24);
-      const path = stageInboxFile(
-        session.agent_group_id,
-        session.id,
-        `calendar-${key}`,
-        'days.txt',
-        Buffer.from(rendered),
+        },
+        session,
+        requestId,
+        { start: detailStart, end: detailEnd, calendarId },
+        filter,
+        exportFile,
       );
-      return { path, count: selected.length, message: `Exported ${selected.length} events to ${path}.` };
     }
-    return { message: renderDays(week, filter) };
+    const week = await loadCalendarWeek(deps.calendar(), { start, end, timeline, calendarId });
+    return daysAnswer(week, session, requestId, { start, end, calendarId }, filter, exportFile);
   };
   const check: ActionAnswer = async (content) => {
     const timeline = await loadTimeline();

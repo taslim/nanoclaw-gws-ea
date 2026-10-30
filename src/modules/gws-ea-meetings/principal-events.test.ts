@@ -2161,10 +2161,10 @@ it('exports nine weeks to a session inbox file with a count, and filters the ord
     });
   const exported = data(await send(main, 'days', { start: '2026-10-05', end: '2026-12-06', export: true }));
   expect(exported.count).toBe(9);
-  expect(exported.message).toContain('Exported 9 events to inbox/');
+  expect(exported.message).toContain('Exported 9 events to /workspace/inbox/');
   expect(exported.message).not.toContain('summary');
   const file = fs.readFileSync(
-    `${sessionMailboxDir({ agentGroupId: main.agent_group_id, sessionId: main.id })}/${String(exported.path)}`,
+    `${sessionMailboxDir({ agentGroupId: main.agent_group_id, sessionId: main.id })}/${String(exported.path).replace(/^\/workspace\//u, '')}`,
     'utf8',
   );
   expect(file).toContain('Call with Remy');
@@ -2173,6 +2173,89 @@ it('exports nine weeks to a session inbox file with a count, and filters the ord
   const filtered = data(await send(main, 'days', { start: '2026-10-05', end: '2026-12-06', filter: 'Remy' }));
   expect(filtered.message).toContain('5 events');
   expect(filtered.message).not.toContain('Planning');
+});
+
+it('reads the requested calendar and dates live and reports complete coverage even when empty', async () => {
+  for (const calendarId of [PRINCIPAL, READ_ONLY])
+    calendar.put({
+      ...teamSync([PRINCIPAL_GUEST]),
+      calendarId,
+      id: `return-${calendarId}`,
+      summary: calendarId === PRINCIPAL ? 'Return flight to San Francisco' : 'Family appointment',
+      start: { dateTime: '2026-11-08T18:41:00-06:00' },
+      end: { dateTime: '2026-11-08T20:42:00-08:00' },
+    });
+  const result = data(await send(main, 'days', { start: '2026-11-08', end: '2026-11-09', calendar: PRINCIPAL }));
+  expect(result).toMatchObject({ count: 1, complete: true });
+  expect(result.message).toContain('Range: 2026-11-08T00:00-08:00 to 2026-11-10T00:00-08:00 (end exclusive)');
+  expect(result.message).toContain('Read live at');
+  expect(result.message).toContain('Return flight to San Francisco');
+  expect(result.message).not.toContain('Family appointment');
+  const empty = data(await send(main, 'days', { start: '2026-11-10', end: '2026-11-10' }));
+  expect(empty).toMatchObject({ count: 0, complete: true });
+  expect(empty.message).toContain('2026-11-10T00:00-08:00 to 2026-11-11T00:00-08:00');
+});
+
+it('automatically preserves every event in an export when the live answer overflows', async () => {
+  for (let i = 0; i < 25; i++)
+    calendar.put({
+      ...teamSync([PRINCIPAL_GUEST]),
+      id: `busy-day-${i}`,
+      summary: i === 24 ? 'Return flight to San Francisco' : `Meeting ${i}`,
+      description: 'Detailed notes. '.repeat(100),
+      start: { dateTime: new Date(Date.parse('2026-11-08T08:00:00-08:00') + i * 60_000).toISOString() },
+      end: { dateTime: new Date(Date.parse('2026-11-08T08:01:00-08:00') + i * 60_000).toISOString() },
+    });
+  const result = data(await send(main, 'days', { start: '2026-11-08', end: '2026-11-08' }));
+  expect(result).toMatchObject({ count: 25, complete: false, path: expect.stringMatching(/^\/workspace\/inbox\//u) });
+  expect(result.message).toContain('Partial result');
+  expect(result.message).toContain(String(result.path));
+  expect(result.message).toMatch(/before .*concluding an event is absent/u);
+  expect(String(result.message).length).toBeLessThanOrEqual(12_000);
+  const exported = fs.readFileSync(
+    `${sessionMailboxDir({ agentGroupId: main.agent_group_id, sessionId: main.id })}/${String(result.path).replace(/^\/workspace\//u, '')}`,
+    'utf8',
+  );
+  expect(exported).toContain('Range: 2026-11-08');
+  expect(exported).toContain('Return flight to San Francisco');
+  expect(exported.match(/^event busy-day-/gmu)).toHaveLength(25);
+});
+
+it('keeps an instant-bounded live read inside its reported range', async () => {
+  for (const hour of [8, 9, 10, 11])
+    calendar.put({
+      ...teamSync([PRINCIPAL_GUEST]),
+      id: `hour-${hour}`,
+      summary: `Appointment ${hour}`,
+      start: { dateTime: `2026-11-08T${String(hour).padStart(2, '0')}:00:00-08:00` },
+      end: { dateTime: `2026-11-08T${String(hour + 1).padStart(2, '0')}:00:00-08:00` },
+    });
+  const result = data(
+    await send(main, 'days', { start: '2026-11-08T09:00:00-08:00', end: '2026-11-08T11:00:00-08:00' }),
+  );
+  expect(result).toMatchObject({ count: 2, complete: true });
+  expect(result.message).toContain('Appointment 9');
+  expect(result.message).toContain('Appointment 10');
+  expect(result.message).not.toContain('Appointment 8');
+  expect(result.message).not.toContain('Appointment 11');
+});
+
+it('can reconstruct an exported read after its response was lost without overwriting the earlier file', async () => {
+  calendar.put(teamSync([PRINCIPAL_GUEST]));
+  const args = { start: '2026-10-09', end: '2026-10-09', export: true };
+  const first = data(await send(main, 'days', args, 'read-with-lost-response'));
+  const inbox = new Database(inboundDbPath(main.agent_group_id, main.id));
+  try {
+    inbox.prepare('DELETE FROM messages_in WHERE id=?').run('action-resp-read-with-lost-response');
+  } finally {
+    inbox.close();
+  }
+  const second = data(await send(main, 'days', args, 'read-with-lost-response'));
+  expect(second.path).not.toBe(first.path);
+  for (const result of [first, second]) {
+    const file = `${sessionMailboxDir({ agentGroupId: main.agent_group_id, sessionId: main.id })}/${String(result.path).replace(/^\/workspace\//u, '')}`;
+    expect(fs.readFileSync(file, 'utf8')).toContain('Team sync');
+  }
 });
 
 it('checks a proposed pickup and a colleague’s busy windows, with known-zero history and recorded lengths, without writing', async () => {
