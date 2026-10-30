@@ -445,7 +445,6 @@ export class BrowserVault {
   private invalidate(): void {
     this.generation += 1;
     this.loaded = false;
-    this.usernames.clear();
   }
 
   private async load(client: Client, assertActive: () => Promise<void>): Promise<void> {

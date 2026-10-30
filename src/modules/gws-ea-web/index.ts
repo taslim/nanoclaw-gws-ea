@@ -5,7 +5,6 @@ import { WebRuntime, type WebFeatureFactories, type WebReadiness } from './runti
 
 let origin: WebRuntime | undefined;
 
-/** Host features share the origin's verified publication state. */
 export async function webPublicationReady(config: WebPolicyFile): Promise<boolean> {
   return origin ? origin.publicationReady(config) : false;
 }
