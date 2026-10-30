@@ -619,9 +619,11 @@ export class BrowserVault {
   ): Promise<BrowserVaultLogin> {
     const cached = this.usernames.get(overview.id);
     if (cached?.updatedAt === overview.updatedAt.getTime()) return cached.login;
+    const { epoch } = this;
     try {
-      const item = await client.items.get(overview.vaultId, overview.id);
+      const item = await this.reach(epoch, () => client.items.get(overview.vaultId, overview.id));
       await assertActive();
+      if (epoch === this.epoch) this.clearHold();
       if (item.id !== overview.id || item.vaultId !== overview.vaultId || item.category !== 'Login')
         throw new BrowserVaultError('no_item_for_site');
       const login: BrowserVaultLogin = {

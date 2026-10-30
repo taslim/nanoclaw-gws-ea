@@ -86,6 +86,7 @@ beforeEach(async () => {
   await writeOnePasswordResources(resourceFile, resources());
   await writePrivateFile(tokenFile, TOKEN);
   vi.clearAllMocks();
+  sdk.get.mockReset();
   sdk.create.mockResolvedValue({
     vaults: { list: sdk.vaults },
     items: { list: sdk.list, get: sdk.get },
@@ -359,6 +360,35 @@ it('reads a fill’s metadata from the cache and spends one request on its secre
 
 describe('holding off while the vault cannot be reached', () => {
   const unavailable = { reason: 'vault_unavailable' };
+
+  it('backs off failed lazy metadata reads across observations without spending more requests', async () => {
+    vi.useFakeTimers();
+    sdk.list.mockResolvedValue([{ ...item, updatedAt: new Date() }]);
+    sdk.get.mockRejectedValue(new Error(SECRET));
+    const subject = vault();
+    const [choice] = await subject.itemsForOrigin('https://shop.example');
+    await expect(subject.loginForHandle(choice.item_handle, 'https://shop.example')).rejects.toMatchObject(unavailable);
+    let spent = requests();
+    let reads = sdk.get.mock.calls.length;
+    for (const minutes of [1, 2, 4]) {
+      vi.advanceTimersByTime(minutes * 60_000 - 1);
+      await expect(subject.itemsForOrigin('https://shop.example')).rejects.toMatchObject(unavailable);
+      await expect(subject.loginForHandle(choice.item_handle, 'https://shop.example')).rejects.toMatchObject(
+        unavailable,
+      );
+      expect(requests()).toBe(spent);
+      expect(sdk.get).toHaveBeenCalledTimes(reads);
+      vi.advanceTimersByTime(1);
+      expect(await subject.itemsForOrigin('https://shop.example')).toEqual([choice]);
+      await expect(subject.loginForHandle(choice.item_handle, 'https://shop.example')).rejects.toMatchObject(
+        unavailable,
+      );
+      expect(requests()).toBe(spent);
+      expect(sdk.get).toHaveBeenCalledTimes(reads + 1);
+      spent = requests();
+      reads += 1;
+    }
+  });
 
   it('refuses page observations without a request until the hold expires, doubling it up to an hour', async () => {
     vi.useFakeTimers();

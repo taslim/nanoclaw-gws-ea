@@ -7,7 +7,12 @@ import { closeDb, getDb, initTestDb, runMigrations } from '../../db/index.js';
 import { log } from '../../log.js';
 import '../gws-ea-profile/index.js';
 import { recordWebAlias } from '../gws-ea-profile/testing/web-alias.js';
-import { CredentialAttempts, type CredentialAttempt, type CredentialPrepareResult } from './credential-attempts.js';
+import {
+  credentialAttempts,
+  CredentialAttempts,
+  type CredentialAttempt,
+  type CredentialPrepareResult,
+} from './credential-attempts.js';
 import {
   onePasswordHostPaths,
   onePasswordInstancePaths,
@@ -16,9 +21,10 @@ import {
 } from './onepassword-policy.js';
 import { browserCredentialAttemptsMigration, browserQueueMigration } from './migration.js';
 import { heldCredentialSites } from './leases.js';
-import { BrowserVault } from './onepassword.js';
+import { browserVault, BrowserVault } from './onepassword.js';
 import { FakeOnePassword } from './onepassword-fixture.js';
 import { writePrivateFile } from './paths.js';
+import { readVaultSiteInfo } from './fill.js';
 
 const sdk = vi.hoisted(() => ({ create: vi.fn() }));
 vi.mock('@1password/sdk', async (importOriginal) => ({
@@ -466,6 +472,30 @@ describe('suggestions and ownership', () => {
     await vault.refresh();
     expect(await subject.account(handle, ORIGIN)).toEqual({ status: 'classified', account: 'principal' });
     expect(reads()).toBe(before + 2);
+  });
+
+  it('rebuilds site choices once when an unread cached login was deleted outside the host', async () => {
+    const survivor = principalLogin();
+    fake.edit(survivor.id, (item) => ({ ...item, title: 'Surviving login' }));
+    const deleted = principalLogin('other@example.com');
+    expect(await vault.itemsForOrigin('https://elsewhere.example')).toEqual([]);
+    expect(fake.calls.filter((call) => call === 'get')).toHaveLength(0);
+    const [survivingChoice] = await vault.itemsForOrigin(ORIGIN);
+    fake.items.delete(deleted.id);
+    const subject = service();
+    vi.spyOn(browserVault, 'itemsForOrigin').mockImplementation((...args) => vault.itemsForOrigin(...args));
+    const refresh = vi.spyOn(browserVault, 'refresh').mockImplementation((...args) => vault.refresh(...args));
+    vi.spyOn(credentialAttempts, 'account').mockImplementation((...args) => subject.account(...args));
+
+    const result = await readVaultSiteInfo([ORIGIN], async () => undefined, 'externally-deleted-login-job');
+    expect(result).toEqual({ vault_items: [{ ...survivingChoice, account: 'assistant' }] });
+    expect(refresh).toHaveBeenCalledTimes(1);
+    expect(fake.calls.filter((call) => call === 'list')).toHaveLength(2);
+    expect(fake.calls.filter((call) => call === 'get')).toHaveLength(2);
+    expect(JSON.stringify(result)).not.toContain(PRINCIPAL_PASSWORD);
+    expect(await readVaultSiteInfo([ORIGIN], async () => undefined, 'externally-deleted-login-job')).toEqual(result);
+    expect(refresh).toHaveBeenCalledTimes(1);
+    expect(fake.calls.filter((call) => call === 'get')).toHaveLength(2);
   });
 });
 

@@ -380,6 +380,10 @@ export async function readVaultSiteInfo(
         for (const item of choices) {
           if (items.has(item.item_handle)) continue;
           const classification = await credentialAttempts.account(item.item_handle, frameOrigin, assertActive);
+          if (classification.status === 'vault_unavailable' && (await refreshVaultForJob(jobId, assertActive))) {
+            items.clear();
+            return read();
+          }
           if (classification.status !== 'classified') throw new BrowserVaultError(classification.status);
           items.set(item.item_handle, { ...item, account: classification.account });
         }
