@@ -1,4 +1,3 @@
-/** A browser delegator obtains the principal's logins page from host-owned setup and live origin readiness. */
 import { answeredGuard, answeringAction, invalidArgs } from '../../cli/delivery-action.js';
 import { registerDeliveryAction } from '../../delivery.js';
 import { ALLOW, DENY, defineGuardedAction } from '../../guard/index.js';
