@@ -15,8 +15,6 @@ import {
   browserConsentMigration,
   browserConsentOutcomesMigration,
   browserCredentialAttemptsMigration,
-  browserCredentialConsentHoldMigration,
-  browserCredentialUncertaintyMigration,
   browserDisclosuresMigration,
   browserGenericCheckoutMigration,
   browserIncidentsMigration,
@@ -39,11 +37,7 @@ import { saveRecipeAction, runRecipeAction } from './recipes.js';
 
 import './capability.js';
 import { fillSecretAction, readVaultSiteInfo } from './fill.js';
-import {
-  credentialFormAction,
-  registerCredentialAuthorityDelivery,
-  settleRefusedSites,
-} from './credential-operations.js';
+import { credentialFormAction, registerCredentialAuthorityDelivery } from './credential-operations.js';
 import { browserAdmissionReady, setBrowserAdmissionReady } from './group.js';
 import './destination-policy.js';
 import './guidance.js';
@@ -98,9 +92,7 @@ registerMigration(browserDisclosuresMigration);
 registerMigration(browserGenericCheckoutMigration);
 registerMigration(browserWatchRegionMigration);
 registerMigration(browserPurchaseOutcomesMigration);
-registerMigration(browserCredentialConsentHoldMigration);
 registerMigration(browserConsentOutcomesMigration);
-registerMigration(browserCredentialUncertaintyMigration);
 
 const runtime = new BrowserRuntime(undefined, browserAdmissionReady, undefined, async (jobId) => {
   const store = new BrowserStore();
@@ -225,7 +217,6 @@ export const browserActions: BrowserActions = {
 
 export const browserQueueFollowUps = {
   finishRequestedCancellation,
-  settleRefusedSites,
   recordUnknownBrowserPurchaseRequest,
 };
 

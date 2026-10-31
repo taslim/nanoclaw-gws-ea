@@ -69,7 +69,6 @@ export function registerBrowserActionDelivery(name: BrowserActionName, queue: ()
 
 export interface BrowserQueueFollowUps {
   finishRequestedCancellation(jobId: string, queue: BrowserQueue): Promise<void>;
-  settleRefusedSites(queue: BrowserQueue, jobId: string): Promise<void>;
   recordUnknownBrowserPurchaseRequest(requestId: string): Promise<void>;
 }
 
@@ -381,24 +380,8 @@ export class BrowserQueue {
       for (const lease of leases)
         await this.wakeWaiters(await this.leases.release(jobId, lease.site), `${eventId}:${lease.site}`);
     } finally {
-      try {
-        await this.followUps.finishRequestedCancellation(jobId, this);
-      } finally {
-        this.settleRefusedSites(jobId);
-      }
+      await this.followUps.finishRequestedCancellation(jobId, this);
     }
-  }
-
-  /**
-   * A job refused a site waits on it. When another job holds that site only
-   * for a confirmed credential attempt, which waits on 1Password alone, it
-   * settles now without that job, so the site can go to its waiters. No
-   * provider call holds up this job's queue.
-   */
-  private settleRefusedSites(jobId: string): void {
-    void this.followUps
-      .settleRefusedSites(this, jobId)
-      .catch(() => log.warn('A held credential site could not be settled', { reason: 'settlement_failed' }));
   }
 
   /** The answer for a request its worker can no longer answer from its own result. */

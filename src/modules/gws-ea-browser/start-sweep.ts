@@ -1,22 +1,21 @@
 import { recoverBrowserWatchState } from './watch-state.js';
 import { recoverConsentOutcomes } from './consent-approval.js';
-import { log } from '../../log.js';
 import type { BrowserQueue } from './queue.js';
 import { recoverBrowserPurchases } from './purchase.js';
 
-import { recoverCredentialAttempts, settleConfirmedAttempts } from './credential-operations.js';
+import { recoverCredentialAttempts } from './credential-operations.js';
 
 /** Runs before workers: a marker is never interpreted as permission to repeat a press. */
 export async function sweepBrowserStartup(queue: BrowserQueue): Promise<void> {
   await recoverBrowserPurchases(queue);
   await recoverBrowserWatchState(queue);
   await recoverConsentOutcomes();
+  const credentials = await queue.store.db.hasTable('gws_ea_browser_credential_attempts');
+  if (credentials) await recoverCredentialAttempts();
   // Each interrupted request's action records its own durable outcome before the answer: a credential
   // attempt the request disclosed becomes unknown.
   for (const request of await queue.store.pending())
     await queue.finish(request, await queue.interruptedAnswer(request, !request.started_at));
-  const credentials = await queue.store.db.hasTable('gws_ea_browser_credential_attempts');
-  if (credentials) await recoverCredentialAttempts();
   for (const request of await queue.store.undelivered()) await queue.deliver(request);
   // Purchase leases are kept until the purchase module resolves their cards/authorities, and a
   // site held for an unresolved credential attempt stays with its job.
@@ -31,10 +30,4 @@ export async function sweepBrowserStartup(queue: BrowserQueue): Promise<void> {
     for (const site of sites)
       await queue.wakeWaiters(await queue.leases.release(job.job_id, site.site), `startup:${job.job_id}:${site.site}`);
   }
-  // A confirmed credential attempt waits only on 1Password: it settles without its job, and no provider call
-  // holds up the browser's admission.
-  if (credentials)
-    void settleConfirmedAttempts(queue).catch(() =>
-      log.warn('Credential attempts could not be settled at start', { reason: 'settlement_failed' }),
-    );
 }

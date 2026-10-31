@@ -277,7 +277,7 @@ export async function finishBrowserJobCancellation(
 ): Promise<void> {
   const cleanup = await Promise.allSettled([
     (async () => {
-      if (result.abandonedAttempts?.length) await credentialAttempts.retireCandidates(result.abandonedAttempts);
+      if (result.abandonedAttempts?.length) await credentialAttempts.retirePending(result.abandonedAttempts);
     })(),
     (async () => {
       if (!result.withdrawnCards) return;

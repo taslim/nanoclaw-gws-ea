@@ -1,9 +1,9 @@
+import * as loginStoreModule from './login-store.js';
 import { createBrowserQueue } from './index.js';
 import fs from 'node:fs';
 import { mkdtemp, realpath, rm } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { AutofillBehavior, ItemCategory, ItemFieldType, type Item } from '@1password/sdk';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const root = await vi.hoisted(async () => {
@@ -16,12 +16,6 @@ vi.mock('../../config.js', async (original) => ({
   DATA_DIR: root,
 }));
 vi.mock('../../request-wake.js', () => ({ requestWake: vi.fn().mockResolvedValue(true) }));
-const sdk = vi.hoisted(() => ({ create: vi.fn() }));
-vi.mock('@1password/sdk', async (importOriginal) => ({
-  ...(await importOriginal<typeof import('@1password/sdk')>()),
-  createClient: sdk.create,
-}));
-
 import Database from 'better-sqlite3';
 
 import {
@@ -54,22 +48,11 @@ import {
   executeCredentialForm,
   recoverCredentialAttempts,
   registerCredentialAuthorityDelivery,
-  settleConfirmedAttempts,
-  settleRefusedSites,
   validateCredentialForm,
 } from './credential-operations.js';
 import { BrowserStore } from './db.js';
-import { BrowserVault } from './onepassword.js';
-import {
-  FakeOnePassword,
-  FIXTURE_TOKEN,
-  FIXTURE_VAULT_ID,
-  FIXTURE_INSTANCE_ID,
-  writeVaultFixture,
-  type VaultFixtureFiles,
-} from './onepassword-fixture.js';
-import { writePrivateFile } from './paths.js';
-import { onePasswordInstancePaths, readOnePasswordResources, writeOnePasswordResources } from './onepassword-policy.js';
+import { testLoginStore } from './testing/login-store.js';
+import type { SavedLogin } from './login-store.js';
 import { BrowserQueue } from './queue.js';
 import type { BrowserExecutionContext } from './actions.js';
 import { openSignupVerification } from './sign-in-mail.js';
@@ -80,9 +63,7 @@ const USERNAME = 'morgan.ellery@example.com';
 const PRINCIPAL_USERNAME = 'remy.vance@example.com';
 
 let directory: string;
-let files: VaultFixtureFiles;
-let fake: FakeOnePassword;
-let vault: BrowserVault;
+let fixture: ReturnType<typeof testLoginStore>;
 let attempts: CredentialAttempts;
 let main: Session;
 let job: Session;
@@ -90,13 +71,10 @@ let job: Session;
 beforeEach(async () => {
   fs.rmSync(root, { recursive: true, force: true });
   directory = await realpath(await mkdtemp(path.join(os.tmpdir(), 'credential-operations-')));
-  files = await writeVaultFixture(directory);
-  fake = new FakeOnePassword();
-  sdk.create.mockReset();
-  sdk.create.mockImplementation(async () => fake.client());
-  vault = new BrowserVault(files);
+  fixture = testLoginStore(path.join(directory, 'browser'));
+  vi.spyOn(loginStoreModule, 'getLoginStore').mockResolvedValue(fixture.store);
   await runMigrations(await initTestDb());
-  attempts = new CredentialAttempts({ db: getDb(), vault });
+  attempts = new CredentialAttempts({ db: getDb(), store: fixture.store });
   for (const id of ['main', 'browser'])
     await createAgentGroup({ id, name: id, folder: id, agent_provider: null, created_at: new Date().toISOString() });
   await getDb().run(
@@ -124,39 +102,20 @@ const ask = (fields: Record<string, unknown>, caller: Session = main) =>
     { attempts },
   );
 
-/** A Login the principal saved in the assistant's vault themselves. */
-function principalLogin(username = USERNAME): Item {
-  return fake.store({
-    category: ItemCategory.Login,
-    vaultId: FIXTURE_VAULT_ID,
-    title: 'Shop',
-    fields: [
-      { id: 'username', title: 'username', fieldType: ItemFieldType.Text, value: username },
-      { id: 'password', title: 'password', fieldType: ItemFieldType.Concealed, value: 'principal-chosen-password' },
-    ],
-    websites: [{ url: ORIGIN, label: 'website', autofillBehavior: AutofillBehavior.AnywhereOnWebsite }],
-  });
+async function principalLogin(username = USERNAME): Promise<SavedLogin> {
+  return fixture.store.create({ site: ORIGIN, username, title: 'Shop', password: 'principal-chosen-password' });
 }
 
 /** The assistant's account after a completed signup. */
 async function assistantLogin(): Promise<string> {
   const recorded = await ask({ operation: 'signup', site: `${ORIGIN}/join`, username: USERNAME });
   const id = String(recorded.authority);
-  expect(await attempts.save(id)).toMatchObject({ status: 'saved' });
   expect(await attempts.disclose(id, { jobId: job.thread_id!, origin: ORIGIN })).toMatchObject({ status: 'disclosed' });
   await attempts.markAwaitingVerification(id);
-  await attempts.markConfirmed(id, { signal: 'success_text' });
-  const finalized = await attempts.finalize(id);
-  if (finalized.status !== 'finalized' || !finalized.attempt.owned_item_id) throw new Error('not finalized');
-  await vault.refresh();
-  return finalized.attempt.owned_item_id;
+  const finalized = await attempts.confirm(id, { signal: 'success_text' });
+  if (finalized.status !== 'finalized' || !finalized.attempt.owned_login_id) throw new Error('not finalized');
+  return finalized.attempt.owned_login_id;
 }
-
-const editField = (id: string, value: string) => (item: Item) => ({
-  ...item,
-  fields: item.fields.map((field) => (field.id === id ? { ...field, value } : field)),
-});
-const editUsername = (value: string) => editField('username', value);
 
 /** A job context for steps that must never touch the page. */
 function context(): { context: BrowserExecutionContext; page: ReturnType<typeof vi.fn> } {
@@ -175,24 +134,11 @@ function context(): { context: BrowserExecutionContext; page: ReturnType<typeof 
 }
 
 describe("main's credential authority", () => {
-  it.each(['policy', 'runtime account'] as const)(
-    'reports missing %s setup before creating credential authority',
-    async (missing) => {
-      await rm(missing === 'policy' ? files.onePasswordPolicyFile : files.tokenFile);
-      expect(await ask({ operation: 'signup', site: ORIGIN, username: USERNAME })).toEqual({
-        status: 'vault_not_set_up',
-      });
-      expect(await ask({ operation: 'change_password', site: ORIGIN, username: USERNAME })).toEqual({
-        status: 'vault_not_set_up',
-      });
-      expect(fake.calls).toEqual([]);
-    },
-  );
-  it('obtains the exact web address for a fresh guest form and signup before any vault login exists', async () => {
+  it('obtains the exact web address for a fresh guest form and signup before any saved login exists', async () => {
     await getDb().run('UPDATE gws_ea_profile SET assistant_alias = NULL WHERE singleton = 1');
     const email = 'onuj@web.example';
     await recordWebAlias(email);
-    expect(fake.items.size).toBe(0);
+    expect(await fixture.store.all()).toEqual([]);
     const websiteEmail = async (id: string): Promise<string> => {
       const group = await getAgentGroup(id);
       if (!group) throw new Error('Missing browser identity fixture group');
@@ -212,11 +158,10 @@ describe("main's credential authority", () => {
       status: 'recorded',
       username: email,
     });
-    expect(fake.items.size).toBe(0);
-    expect(fake.calls).toEqual([]);
+    expect(await fixture.store.all()).toEqual([]);
   });
 
-  it('records a signup for one job, site and account, repeats safely, and spends no provider request', async () => {
+  it('records a signup for one job, site and account, repeats safely, with its pending password saved', async () => {
     const recorded = await ask({ operation: 'signup', site: `${ORIGIN}/join?ref=home`, username: USERNAME });
     expect(recorded).toEqual({
       status: 'recorded',
@@ -227,12 +172,11 @@ describe("main's credential authority", () => {
       username: USERNAME,
     });
     expect(await ask({ operation: 'signup', site: ORIGIN, username: USERNAME })).toEqual(recorded);
-    expect(fake.calls).toEqual([]);
     expect(await attempts.get(String(recorded.authority))).toMatchObject({
       kind: 'signup',
       job_id: job.thread_id,
       origin: ORIGIN,
-      phase: 'preparing',
+      phase: 'saved',
     });
     const other = await ask({ operation: 'signup', site: ORIGIN, username: 'juno_eats' });
     expect(other.authority).not.toBe(recorded.authority);
@@ -242,21 +186,18 @@ describe("main's credential authority", () => {
     await getDb().run('UPDATE gws_ea_profile SET assistant_alias = NULL WHERE singleton = 1');
     await recordWebAlias('onuj@corp.example');
     const username = 'Onuj+Shop@corp.example';
-    const login = principalLogin(username);
-    const [choice] = await vault.itemsForOrigin(ORIGIN);
-    expect(await attempts.account(choice!.item_handle, ORIGIN)).toEqual({ status: 'classified', account: 'assistant' });
-    const reads = fake.calls.filter((call) => call === 'get').length;
+    const login = await principalLogin(username);
+    const [choice] = await fixture.store.forOrigin(ORIGIN);
+    expect(await attempts.account(choice!.id, ORIGIN)).toEqual({ status: 'classified', account: 'assistant' });
 
     const recorded = await ask({ operation: 'change_password', site: ORIGIN, username });
 
     expect(recorded).toMatchObject({ status: 'recorded', operation: 'change_password', username });
-    expect(fake.calls.filter((call) => call === 'get')).toHaveLength(reads + 1);
     expect(await attempts.get(String(recorded.authority))).toMatchObject({
       kind: 'rotation',
-      source_item_id: login.id,
+      source_login_id: login.id,
       username,
     });
-    expect(await attempts.save(String(recorded.authority))).toMatchObject({ status: 'saved' });
     expect(
       await attempts.disclose(String(recorded.authority), { jobId: job.thread_id!, origin: ORIGIN }),
     ).toMatchObject({
@@ -270,26 +211,29 @@ describe("main's credential authority", () => {
     expect(await ask({ operation: 'change_password', site: ORIGIN, username: USERNAME })).toEqual({
       status: 'not_owned',
     });
-    principalLogin(PRINCIPAL_USERNAME);
-    await vault.refresh();
+    const principal = await principalLogin(PRINCIPAL_USERNAME);
     expect(await ask({ operation: 'change_password', site: ORIGIN, username: USERNAME })).toEqual({
       status: 'not_owned',
     });
     expect(await getDb().all('SELECT * FROM gws_ea_browser_credential_attempts')).toEqual(before);
 
+    await fixture.store.remove(principal.id, principal.version);
     const itemId = await assistantLogin();
-    fake.edit(itemId, editUsername(PRINCIPAL_USERNAME));
+    await fixture.store.update(itemId, (await fixture.store.get(itemId)).version, {
+      username: PRINCIPAL_USERNAME,
+      password: '',
+    });
     expect(await ask({ operation: 'change_password', site: ORIGIN, username: USERNAME })).toEqual({
       status: 'not_owned',
     });
     expect(await ask({ operation: 'change_password', site: ORIGIN, username: PRINCIPAL_USERNAME })).toEqual({
       status: 'not_owned',
     });
-    fake.edit(itemId, (item) => ({
-      ...editUsername(USERNAME)(item),
-      websites: [{ url: 'https://shop.example.net', label: 'website', autofillBehavior: AutofillBehavior.ExactDomain }],
-    }));
-    await vault.refresh();
+    await fixture.store.update(itemId, (await fixture.store.get(itemId)).version, {
+      username: USERNAME,
+      site: 'https://shop.example.net',
+      password: '',
+    });
     expect(await ask({ operation: 'change_password', site: ORIGIN, username: USERNAME })).toEqual({
       status: 'not_owned',
     });
@@ -302,7 +246,6 @@ describe("main's credential authority", () => {
 
   it('never records a second signup for an account whose first may have reached the site', async () => {
     const first = String((await ask({ operation: 'signup', site: ORIGIN, username: USERNAME })).authority);
-    expect(await attempts.save(first)).toMatchObject({ status: 'saved' });
     await attempts.disclose(first, { jobId: job.thread_id!, origin: ORIGIN });
     await attempts.markUnknown(first, { signal: 'interrupted' });
     expect(await ask({ operation: 'signup', site: ORIGIN, username: USERNAME })).toEqual({ status: 'busy' });
@@ -335,8 +278,8 @@ describe("main's credential authority", () => {
     expect(recorded).toMatchObject({ status: 'recorded', operation: 'change_password', username: USERNAME });
     expect(await attempts.get(String(recorded.authority))).toMatchObject({
       kind: 'rotation',
-      source_item_id: itemId,
-      phase: 'preparing',
+      source_login_id: itemId,
+      phase: 'saved',
     });
     expect(await ask({ operation: 'change_password', site: ORIGIN, username: USERNAME })).toEqual(recorded);
     // One change per Login is open at a time: a later errand takes over one that disclosed nothing,
@@ -461,14 +404,13 @@ describe('the browser credential request', () => {
       code: 'invalid-args',
     });
 
-    expect(await attempts.save(id)).toMatchObject({ status: 'saved' });
     await attempts.disclose(id, { jobId: job.thread_id!, origin: ORIGIN });
     const phases: Array<[() => Promise<unknown>, Record<string, unknown>]> = [
       [async () => undefined, { status: 'outcome_unknown' }],
       [() => attempts.markAwaitingVerification(id), { status: 'verification_requested' }],
       [() => attempts.markUnknown(id), { status: 'outcome_unknown' }],
-      [() => attempts.markConfirmed(id, { signal: 'success_text' }), { status: 'account_created', vault: 'saved' }],
-      [async () => undefined, { status: 'account_created', vault: 'saved' }],
+      [() => attempts.confirm(id, { signal: 'success_text' }), { status: 'account_created' }],
+      [async () => undefined, { status: 'account_created' }],
     ];
     for (const [move, expected] of phases) {
       await move();
@@ -483,29 +425,26 @@ describe('the browser credential request', () => {
     expect(await run(String(second.authority)).result).toEqual({ status: 'refused', reason: 'no_authority' });
   });
 
-  it('reports a confirmed change written into the original login, its candidate gone', async () => {
+  it('reports a confirmed change written into the original login, its password gone', async () => {
     const itemId = await assistantLogin();
     const recorded = await ask({ operation: 'change_password', site: ORIGIN, username: USERNAME });
     const id = String(recorded.authority);
     for (const fields of [{ username: ref(1) }, { username: ref(1), new_password: ref(2) }])
       await expect(run(id, fields).result).rejects.toMatchObject({ code: 'invalid-args' });
-    expect(await attempts.save(id)).toMatchObject({ status: 'saved' });
     const disclosed = await attempts.disclose(id, { jobId: job.thread_id!, origin: ORIGIN });
     if (disclosed.status !== 'disclosed') throw new Error(disclosed.status);
-    const candidateId = (await attempts.get(id))?.candidate_item_id;
     await attempts.markAwaitingVerification(id);
-    await attempts.markConfirmed(id, { signal: 'success_text' });
+    await attempts.confirm(id, { signal: 'success_text' });
     const { page, result } = run(id);
-    expect(await result).toEqual({ status: 'password_changed', vault: 'updated' });
+    expect(await result).toEqual({ status: 'password_changed' });
     expect(page).not.toHaveBeenCalled();
-    expect(await attempts.get(id)).toMatchObject({ phase: 'finalized', owned_item_id: itemId });
-    expect(fake.value(itemId, 'password')).toBe(disclosed.credential.password);
-    expect(fake.items.has(candidateId ?? '')).toBe(false);
+    expect(await attempts.get(id)).toMatchObject({ phase: 'finalized', owned_login_id: itemId });
+    expect(await fixture.store.secret(itemId, 'password', ORIGIN)).toBe(disclosed.credential.password);
+    expect(await fixture.store.hasPending(id)).toBe(false);
   });
 
   it("answers not_watched from verify when the signup's email has no wait, and leaves it for the principal's release", async () => {
     const id = String((await ask({ operation: 'signup', site: ORIGIN, username: USERNAME })).authority);
-    await attempts.save(id);
     // No inbox here, so the wait the submission opens before disclosure could not be opened.
     expect(
       await openSignupVerification({
@@ -535,105 +474,16 @@ describe('the browser credential request', () => {
       };
     };
 
-    it('reports a change whose login was edited in 1Password meanwhile as left as edited, and writes nothing more', async () => {
-      const itemId = await assistantLogin();
-      const recorded = await ask({ operation: 'change_password', site: ORIGIN, username: USERNAME });
-      const id = String(recorded.authority);
-      await attempts.save(id);
-      await attempts.disclose(id, { jobId: job.thread_id!, origin: ORIGIN });
-      await attempts.markAwaitingVerification(id);
-      await attempts.markConfirmed(id, { signal: 'success_text' });
-      fake.edit(itemId, editUsername(PRINCIPAL_USERNAME));
-      const first = reconcile(id);
-      expect(await first.result).toEqual({ status: 'password_changed', vault: 'left_as_edited' });
-      const attempt = await attempts.get(id);
-      expect(attempt).toMatchObject({ phase: 'conflict', conflict_reason: 'ownership_mismatch' });
-      const next = fake.value(attempt!.candidate_item_id!, 'password')!;
-      const writes = fake.calls.length;
-      const second = reconcile(id);
-      expect(await second.result).toEqual({ status: 'password_changed', vault: 'left_as_edited' });
-      expect(fake.calls).toHaveLength(writes);
-      for (const { page, result } of [first, second]) {
-        expect(page).not.toHaveBeenCalled();
-        expect(JSON.stringify(await result)).not.toContain(next);
-      }
-    });
-
-    it.each<[string, (itemId: string) => void]>([
-      ['username', (itemId) => fake.edit(itemId, editUsername(PRINCIPAL_USERNAME))],
-      [
-        'site',
-        (itemId) =>
-          fake.edit(itemId, (item) => ({
-            ...item,
-            websites: [
-              { url: 'https://shop.example.net', label: 'website', autofillBehavior: AutofillBehavior.ExactDomain },
-            ],
-          })),
-      ],
-      ['password', (itemId) => fake.edit(itemId, editField('password', 'principal-chosen-password-1'))],
-      ['deletion', (itemId) => void fake.items.delete(itemId)],
-    ])("leaves the Login as edited when a %s edit lands between the host's read and its write", async (_edit, edit) => {
-      const itemId = await assistantLogin();
-      const id = String((await ask({ operation: 'change_password', site: ORIGIN, username: USERNAME })).authority);
-      await attempts.save(id);
-      await attempts.disclose(id, { jobId: job.thread_id!, origin: ORIGIN });
-      await attempts.markAwaitingVerification(id);
-      await attempts.markConfirmed(id, { signal: 'success_text' });
-      const candidateId = (await attempts.get(id))?.candidate_item_id ?? '';
-      const next = fake.value(candidateId, 'password');
-      let edited: Item | undefined;
-      fake.beforePut = () => {
-        edit(itemId);
-        edited = structuredClone(fake.items.get(itemId));
-      };
-      // The stale write proves nothing: the fresh read after it finds the edit, and the host writes no more.
-      expect(await reconcile(id).result).toEqual({ status: 'password_changed', vault: 'left_as_edited' });
-      expect(fake.items.get(itemId)).toEqual(edited);
-      expect(fake.value(itemId, 'password')).not.toBe(next);
-      expect(fake.value(candidateId, 'password')).toBe(next);
-      expect(fake.value(candidateId, 'previous-password')).toBeUndefined();
-    });
-
-    it('finishes a confirmed change whose vault update was cut short', async () => {
-      const itemId = await assistantLogin();
-      const id = String((await ask({ operation: 'change_password', site: ORIGIN, username: USERNAME })).authority);
-      await attempts.save(id);
-      await attempts.disclose(id, { jobId: job.thread_id!, origin: ORIGIN });
-      await attempts.markAwaitingVerification(id);
-      await attempts.markConfirmed(id, { signal: 'success_text' });
-      fake.failNext('put', new Error('network'));
-      expect(await attempts.finalize(id)).toEqual({ status: 'vault_unavailable' });
-      const { page, result } = reconcile(id);
-      expect(await result).toEqual({ status: 'password_changed', vault: 'updated' });
-      expect(page).not.toHaveBeenCalled();
-      expect(await attempts.get(id)).toMatchObject({ phase: 'finalized', owned_item_id: itemId });
-    });
-
-    it('finalizes a confirmed attempt whose vault update was cut short', async () => {
-      const recorded = await ask({ operation: 'signup', site: ORIGIN, username: USERNAME });
-      const id = String(recorded.authority);
-      await attempts.save(id);
-      await attempts.disclose(id, { jobId: job.thread_id!, origin: ORIGIN });
-      await attempts.markAwaitingVerification(id);
-      await attempts.markConfirmed(id, { signal: 'success_text' });
-      const { page, result } = reconcile(id);
-      expect(await result).toEqual({ status: 'account_created', vault: 'saved' });
-      expect(page).not.toHaveBeenCalled();
-    });
-
     it('stays inconclusive from unknown without host evidence, never deciding from the page alone after a restart', async () => {
       const recorded = await ask({ operation: 'signup', site: ORIGIN, username: USERNAME });
       const id = String(recorded.authority);
-      await attempts.save(id);
       await attempts.disclose(id, { jobId: job.thread_id!, origin: ORIGIN });
       await attempts.markUnknown(id, { signal: 'interrupted' });
-      const restarted = new CredentialAttempts({ db: getDb(), vault });
+      const restarted = new CredentialAttempts({ db: getDb(), store: fixture.store });
       const { page, result } = reconcile(id, restarted);
       expect(await result).toEqual({ status: 'inconclusive' });
       expect(page).not.toHaveBeenCalled();
       expect(await attempts.get(id)).toMatchObject({ phase: 'unknown' });
-      expect(fake.calls.filter((call) => call === 'create')).toHaveLength(1);
     });
 
     it('reports an attempt nothing was disclosed for as having nothing to reconcile', async () => {
@@ -648,10 +498,8 @@ describe('the browser credential request', () => {
 describe('restart recovery', () => {
   it('makes an attempt a stopped host left exposed unknown, with no request left to settle it', async () => {
     const exposed = String((await ask({ operation: 'signup', site: ORIGIN, username: USERNAME })).authority);
-    await attempts.save(exposed);
     await attempts.disclose(exposed, { jobId: job.thread_id!, origin: ORIGIN });
     const waiting = String((await ask({ operation: 'signup', site: ORIGIN, username: 'juno_eats' })).authority);
-    await attempts.save(waiting);
     await attempts.disclose(waiting, { jobId: job.thread_id!, origin: ORIGIN });
     await attempts.markAwaitingVerification(waiting);
     expect(await getDb().all('SELECT id FROM gws_ea_browser_requests')).toEqual([]);
@@ -752,26 +600,9 @@ describe("the principal's release of an attempt the host cannot settle", () => {
     getDb().run("INSERT INTO gws_ea_browser_site_leases VALUES ('shop.example', ?, 'active', ?)", job.thread_id, at);
   const lease = () =>
     getDb().get<{ job_id: string }>("SELECT job_id FROM gws_ea_browser_site_leases WHERE site = 'shop.example'");
-  async function replaceVaultBinding(): Promise<void> {
-    const resourcesFile = onePasswordInstancePaths(path.dirname(files.browserRoot)).resourceFile;
-    const binding = await readOnePasswordResources(resourcesFile, { instanceId: FIXTURE_INSTANCE_ID });
-    if (binding.status !== 'ready') throw new Error('Missing vault fixture binding');
-    const replacement = 'replacementvault0000000001';
-    await writeOnePasswordResources(resourcesFile, {
-      ...binding.resources,
-      vault: { id: replacement, createdBy: { kind: 'operator' } },
-    });
-    fake = new FakeOnePassword(replacement);
-    vault = new BrowserVault(files);
-    attempts = new CredentialAttempts({ db: getDb(), vault });
-  }
-  /** 1Password as the principal sees it: every item, version and field, and nothing archived. */
-  const vaultState = () => JSON.stringify([[...fake.items.entries()], [...fake.archived]]);
-
   /** A signup the website may or may not have taken. */
   async function disclosedSignup(username = USERNAME): Promise<string> {
     const id = String((await ask({ operation: 'signup', site: ORIGIN, username })).authority);
-    expect(await attempts.save(id)).toMatchObject({ status: 'saved' });
     await attempts.disclose(id, { jobId: job.thread_id!, origin: ORIGIN });
     return id;
   }
@@ -779,7 +610,6 @@ describe("the principal's release of an attempt the host cannot settle", () => {
   async function disclosedChange(): Promise<{ id: string; itemId: string }> {
     const itemId = await assistantLogin();
     const id = String((await ask({ operation: 'change_password', site: ORIGIN, username: USERNAME })).authority);
-    expect(await attempts.save(id)).toMatchObject({ status: 'saved' });
     await attempts.disclose(id, { jobId: job.thread_id!, origin: ORIGIN });
     return { id, itemId };
   }
@@ -787,15 +617,13 @@ describe("the principal's release of an attempt the host cannot settle", () => {
   it('refuses attempts that are settled or never reached the site, other jobs, and every caller but main', async () => {
     const preparing = String((await ask({ operation: 'signup', site: ORIGIN, username: USERNAME })).authority);
     expect(await release(preparing)).toEqual({ status: 'not_releasable' });
-    await attempts.save(preparing);
     expect(await release(preparing)).toEqual({ status: 'not_releasable' });
     await attempts.disclose(preparing, { jobId: job.thread_id!, origin: ORIGIN });
     // Exposed is still in flight: its own step settles it.
     expect(await release(preparing)).toEqual({ status: 'not_releasable' });
     await attempts.markAwaitingVerification(preparing);
-    await attempts.markConfirmed(preparing, { signal: 'success_text' });
-    // A confirmed attempt 1Password can still finish is settled, never released.
-    expect(await release(preparing)).toEqual({ status: 'account_created', vault: 'saved' });
+    await attempts.confirm(preparing, { signal: 'success_text' });
+    expect(await release(preparing)).toEqual({ status: 'not_releasable' });
     expect(await attempts.get(preparing)).toMatchObject({ phase: 'finalized' });
     expect(await release(preparing)).toEqual({ status: 'not_releasable' });
     const other = await attempts.prepareSignup({ jobId: 'system:a2a:main:other', origin: ORIGIN, username: USERNAME });
@@ -824,8 +652,9 @@ describe("the principal's release of an attempt the host cannot settle", () => {
     expect(await pending()).toHaveLength(1);
     expect(cards).toHaveLength(1);
     const card = JSON.parse(cards[0]) as { question: string };
-    expect(card.question).toContain("I can't tell whether the password changed");
-    expect(card.question).toContain('Both the original and the new password are kept in my 1Password vault');
+    expect(card.question).toContain("I can't tell whether the site accepted it");
+    expect(card.question).toContain('discard the generated password');
+    expect(card.question).toContain('reset the password through my email');
     await click('reject');
     const declined = notes().at(-1) ?? '';
     expect(declined).toContain(`The principal chose to keep waiting on the password change for "${USERNAME}"`);
@@ -900,9 +729,9 @@ describe("the principal's release of an attempt the host cannot settle", () => {
       // Even an old held marker cannot prove that an input callback never submitted.
       const question = (JSON.parse(cards.at(-1) ?? '{}') as { question?: string }).question ?? '';
       expect(question).toContain(
-        `I tried to create the account "${USERNAME}" on shop.example, but I can't tell whether the account was created.`,
+        `I tried to create the account "${USERNAME}" on shop.example, but I can't tell whether the site accepted it.`,
       );
-      expect(question).toContain('Trying again could create a second account.');
+      expect(question).toContain('discard the generated password');
       expect(question).not.toContain('never submitted');
       await click('approve');
       expect(await attempts.get(id)).toMatchObject({ phase: 'rejected' });
@@ -938,17 +767,17 @@ describe("the principal's release of an attempt the host cannot settle", () => {
     expect(await release(id)).toEqual({ status: 'awaiting_principal' });
   });
 
-  it('does not redisclose a candidate after a consent grant, and warns that a new attempt may duplicate it', async () => {
+  it('does not redisclose a password after a consent grant, and warns that a new attempt may duplicate it', async () => {
     const { id } = await uncertainAfterConsent();
-    const candidate = (await attempts.get(id))?.candidate_item_id;
+    const password = await fixture.store.disclosePending(id);
     expect(await attempts.disclose(id, { jobId: job.thread_id!, origin: ORIGIN })).toEqual({
       status: 'refused',
       reason: 'not_saved',
     });
-    expect((await attempts.get(id))?.candidate_item_id).toBe(candidate);
+    expect(await fixture.store.disclosePending(id)).toBe(password);
     expect(await release(id)).toEqual({ status: 'awaiting_principal' });
     const question = (JSON.parse(cards.at(-1) ?? '{}') as { question?: string }).question ?? '';
-    expect(question).toContain('Trying again could create a second account.');
+    expect(question).toContain('discard the generated password');
   });
 
   it('keeps an uncertain signup and its site when its job is cancelled, until an informed release', async () => {
@@ -959,7 +788,7 @@ describe("the principal's release of an attempt the host cannot settle", () => {
     expect(await lease()).toEqual({ job_id: job.thread_id });
   });
 
-  it('on approval ends the attempt as the principal released it, lifts its site, completes the cancellation and frees the account, leaving 1Password untouched', async () => {
+  it('on approval ends the attempt as the principal released it, lifts its site, completes the cancellation and frees the account, discarding the generated password', async () => {
     const id = await disclosedSignup();
     await attempts.markAwaitingVerification(id);
     await holdSite();
@@ -968,31 +797,22 @@ describe("the principal's release of an attempt the host cannot settle", () => {
     expect(await cancelBrowserJob(job.thread_id!)).toMatchObject({ status: 'in_progress' });
     expect(await release(id)).toEqual({ status: 'awaiting_principal' });
     expect((JSON.parse(cards[0]) as { question: string }).question).toContain(
-      "I can't tell whether the account was created",
+      "I can't tell whether the site accepted it",
     );
     // Asking changes nothing: only the principal's decision does.
     expect(await attempts.get(id)).toMatchObject({ phase: 'awaiting_verification' });
     expect(await lease()).toEqual({ job_id: job.thread_id });
-    const before = vaultState();
-    const calls = fake.calls.length;
     await click('approve');
     const released = await attempts.get(id);
-    expect(released).toMatchObject({ phase: 'rejected', owned_item_id: null, finalized_at: null });
+    expect(released).toMatchObject({ phase: 'rejected', owned_login_id: null, finalized_at: null });
     expect(JSON.parse(released!.evidence_json!)).toMatchObject({ release: 'principal' });
     expect(await lease()).toBeUndefined();
     expect(await getDb().get('SELECT cancelled FROM gws_ea_browser_jobs WHERE id = ?', job.thread_id)).toEqual({
       cancelled: 1,
     });
     expect(closed).toContain(job.thread_id);
-    // Nothing in 1Password was read, archived, published or changed: the candidate stays where the principal can see it.
-    expect(fake.calls).toHaveLength(calls);
-    expect(vaultState()).toBe(before);
-    expect(fake.items.get(released!.candidate_item_id!)?.tags).toContain(`gws-ea-pending/${id}`);
-    expect(notes().at(-1)).toContain('released');
-    // The candidate is the login named for the site, so main can tell the principal where the password is.
-    expect(notes().at(-1)).toContain(
-      'Its password stays in the assistant\'s 1Password vault, in the login "shop.example", which the host has not finished saving.',
-    );
+    expect(await fixture.store.hasPending(id)).toBe(false);
+    expect(notes().at(-1)).toContain('generated password was discarded');
     // The account is no longer busy: a new errand may sign up for it.
     const next = (await resolveSystemSession('browser', 'system:a2a:main:next-errand')).session;
     expect(
@@ -1004,360 +824,14 @@ describe("the principal's release of an attempt the host cannot settle", () => {
     ).toMatchObject({ status: 'recorded' });
   });
 
-  it('releases a change whose login the principal edited meanwhile, so the login can be changed again', async () => {
-    const { id, itemId } = await disclosedChange();
-    await attempts.markAwaitingVerification(id);
-    await attempts.markConfirmed(id, { signal: 'success_text' });
-    fake.edit(itemId, editField('password', 'principal-chosen-password-1'));
-    expect(await attempts.finalize(id)).toMatchObject({ status: 'conflict', reason: 'password_changed' });
-    const candidateId = (await attempts.get(id))?.candidate_item_id ?? '';
-    const next = fake.value(candidateId, 'password');
-    expect(await release(id)).toEqual({ status: 'awaiting_principal' });
-    const card = JSON.parse(cards[0]) as { question: string };
-    expect(card.question).toContain('was changed or removed while I was changing it');
-    expect(card.question).toContain('"New password for shop.example"');
-    expect(card.question).not.toContain('Both the original and the new password');
-    await click('approve');
-    expect(await attempts.get(id)).toMatchObject({ phase: 'rejected', owned_item_id: null });
-    expect(fake.value(itemId, 'password')).toBe('principal-chosen-password-1');
-    expect(fake.value(candidateId, 'password')).toBe(next);
-    expect(notes().at(-1)).toContain(
-      'as its own item, "New password for shop.example"; the login was changed or removed in 1Password meanwhile, and the host left it as it is.',
-    );
-    expect(await ask({ operation: 'change_password', site: ORIGIN, username: USERNAME })).toMatchObject({
-      status: 'recorded',
-    });
-  });
-
-  /** A change the website confirmed on the assistant's own Login, whose vault update has not run. */
-  async function confirmedChange(): Promise<{ id: string; itemId: string; candidateId: string }> {
-    const { id, itemId } = await disclosedChange();
-    await attempts.markAwaitingVerification(id);
-    await attempts.markConfirmed(id, { signal: 'success_text' });
-    return { id, itemId, candidateId: (await attempts.get(id))?.candidate_item_id ?? '' };
-  }
-  const releaseWithQueue = (authority: string) =>
-    credentialAuthorityRequest(
-      { action: 'credential_authority', requestId: 'release', thread: job.thread_id, operation: 'release', authority },
-      main,
-      { attempts, queue: () => queue },
-    );
-
-  it('settles a confirmed change instead of asking, while 1Password can finish it, and frees its site', async () => {
-    const { id, itemId, candidateId } = await confirmedChange();
-    await holdSite();
-    expect(await releaseWithQueue(id)).toEqual({ status: 'password_changed', vault: 'updated' });
-    expect(await pending()).toEqual([]);
-    expect(cards).toEqual([]);
-    expect(await attempts.get(id)).toMatchObject({ phase: 'finalized', owned_item_id: itemId });
-    expect(fake.items.has(candidateId)).toBe(false);
-    expect(await lease()).toBeUndefined();
-  });
-
-  it("releases a confirmed change 1Password can't be reached to finish, saying what the vault still holds", async () => {
-    const { id, itemId, candidateId } = await confirmedChange();
-    const old = fake.value(itemId, 'password');
-    const next = fake.value(candidateId, 'password');
-    await holdSite();
-    await rm(files.tokenFile);
-    expect(await release(id)).toEqual({ status: 'awaiting_principal' });
-    const card = JSON.parse(cards[0]) as { question: string };
-    expect(card.question).toContain("I can't reach 1Password to put it into the login");
-    expect(card.question).toContain('"New password for shop.example", and the login may still have the old one');
-    expect(card.question).not.toContain('Trying again');
-    expect(await lease()).toEqual({ job_id: job.thread_id });
-    await click('approve');
-    const released = await attempts.get(id);
-    expect(released).toMatchObject({ phase: 'rejected', owned_item_id: null, settlement: null });
-    expect(JSON.parse(released!.evidence_json!)).toMatchObject({ release: 'principal', released_from: 'confirmed' });
-    expect(await lease()).toBeUndefined();
-    expect(notes().at(-1)).toContain(
-      'The new password stays in the assistant\'s 1Password vault as its own item, "New password for shop.example"; the login may still have the old one.',
-    );
-    // Releasing touched nothing in 1Password.
-    expect(fake.value(itemId, 'password')).toBe(old);
-    expect(fake.value(candidateId, 'password')).toBe(next);
-  });
-
-  it('finishes a confirmed change at approval when 1Password is back, instead of releasing it', async () => {
-    const { id, itemId } = await confirmedChange();
-    await holdSite();
-    await rm(files.tokenFile);
-    expect(await release(id)).toEqual({ status: 'awaiting_principal' });
-    await writePrivateFile(files.tokenFile, FIXTURE_TOKEN);
-    await click('approve');
-    expect(await attempts.get(id)).toMatchObject({ phase: 'finalized', owned_item_id: itemId });
-    expect(await lease()).toBeUndefined();
-    expect(notes().at(-1)).toContain('was not released: 1Password could be reached again');
-    expect(notes().at(-1)).toContain(
-      "the host finished it: the site took the new password, and the login in the assistant's 1Password vault now holds it.",
-    );
-    expect(notes().at(-1)).not.toMatch(/password_changed|vault updated|\(/u);
-  });
-
-  it('describes a promoted change it cannot finish by what is left: the login has it, the separate item may too', async () => {
-    const { id } = await confirmedChange();
-    fake.failNext('delete', new Error('network'));
-    fake.beforePut = () => fake.failNext('list', new Error('network'));
-    expect(await attempts.finalize(id)).toEqual({ status: 'vault_unavailable' });
-    await rm(files.tokenFile);
-    expect(await release(id)).toEqual({ status: 'awaiting_principal' });
-    const card = JSON.parse(cards[0]) as { question: string };
-    expect(card.question).toContain('and the login in my 1Password vault has it');
-    expect(card.question).toContain(
-      '"New password for shop.example" may still hold a copy of it and of the old password',
-    );
-  });
-
-  it('settles a stuck confirmed change at browser start without its job, and frees its site', async () => {
-    const { id, itemId } = await confirmedChange();
-    await rm(files.tokenFile);
-    expect(await attempts.finalize(id)).toEqual({ status: 'vault_not_set_up' });
-    await holdSite();
-    // Still out of reach at the next start: the pass spends nothing more and leaves it held.
-    await settleConfirmedAttempts(queue, undefined, attempts);
-    expect(await attempts.get(id)).toMatchObject({ phase: 'confirmed' });
-    expect(await lease()).toEqual({ job_id: job.thread_id });
-    await writePrivateFile(files.tokenFile, FIXTURE_TOKEN);
-    await settleConfirmedAttempts(queue, undefined, attempts);
-    expect(await attempts.get(id)).toMatchObject({ phase: 'finalized', owned_item_id: itemId });
-    expect(await lease()).toBeUndefined();
-  });
-
-  it.each(['unknown', 'awaiting_verification', 'confirmed', 'conflict'] as const)(
-    'frees the site of an old-vault %s attempt and finishes a later current-vault attempt',
-    async (phase) => {
-      const { id } = await confirmedChange();
-      await holdSite('2026-01-01T00:00:00.000Z');
-      await getDb().run(
-        'UPDATE gws_ea_browser_credential_attempts SET phase=?,created_at=? WHERE id=?',
-        phase,
-        '2026-01-01T00:00:00.000Z',
-        id,
-      );
-      const other = (await resolveSystemSession('browser', 'system:a2a:main:waiting-for-old-vault')).session;
-      await queue.store.jobForSession(other);
-      expect(await queue.leases.acquire(other.thread_id!, ORIGIN)).toMatchObject({ acquired: false });
-      await replaceVaultBinding();
-      const nextOrigin = 'https://accounts.next-shop.example';
-      const prepared = await attempts.prepareSignup({ jobId: job.thread_id!, origin: nextOrigin, username: USERNAME });
-      if (prepared.status !== 'prepared') throw new Error(prepared.status);
-      const next = prepared.attempt;
-      await attempts.save(next.id);
-      await attempts.disclose(next.id, { jobId: job.thread_id!, origin: nextOrigin });
-      await attempts.markAwaitingVerification(next.id);
-      await attempts.markConfirmed(next.id, { account_page: 'verified' });
-      const wake = vi.spyOn(queue, 'wakeWaiters');
-
-      await settleConfirmedAttempts(queue, undefined, attempts);
-
-      expect(await attempts.get(next.id)).toMatchObject({ phase: 'finalized' });
-      expect(await attempts.get(id)).toMatchObject({ phase: 'rejected' });
-      expect(await lease()).toBeUndefined();
-      expect(wake.mock.calls.flatMap(([jobs]) => jobs)).toContain(other.thread_id);
-      expect(await queue.leases.acquire(other.thread_id!, ORIGIN)).toMatchObject({ acquired: true });
-    },
-  );
-
-  it('records the in-flight website outcome before settling a removed-vault attempt', async () => {
-    const id = await disclosedSignup();
-    await holdSite('2026-01-01T00:00:00.000Z');
-    const owner = await queue.store.jobForSession(job);
-    if (!owner) throw new Error('Missing browser job');
-    await queue.store.accept(owner, job, 'active-credential-press', 'credential_form', { authority: id }, 60_000);
-    const request = await queue.store.nextPending(owner.id);
-    if (!request) throw new Error('Missing browser request');
-    await queue.store.start(request.id);
-    await replaceVaultBinding();
-
-    await attempts.markAwaitingVerification(id);
-    expect(await attempts.markConfirmed(id, { account_page: 'verified', signal: 'success_text' })).toMatchObject({
-      phase: 'confirmed',
-    });
-    expect(await attempts.unresolved()).toEqual([expect.objectContaining({ id, phase: 'confirmed' })]);
-    expect(await lease()).toEqual({ job_id: job.thread_id });
-    await getDb().run(
-      'UPDATE gws_ea_browser_requests SET answered_at=? WHERE id=?',
-      new Date().toISOString(),
-      request.id,
-    );
-
-    await settleConfirmedAttempts(queue, undefined, attempts);
-
-    const settled = await attempts.get(id);
-    expect(settled).toMatchObject({ phase: 'rejected', exposed_at: expect.any(String) });
-    expect(JSON.parse(settled!.evidence_json!)).toEqual({
-      account_page: 'verified',
-      signal: 'success_text',
-      reason: 'vault_removed',
-      prior_phase: 'confirmed',
-    });
-    expect(await lease()).toBeUndefined();
-  });
-
-  it('wakes a site waiter when an earlier observation already settled a removed-vault attempt', async () => {
-    const id = await disclosedSignup();
-    await attempts.markUnknown(id, { signal: 'interrupted' });
-    await holdSite('2026-01-01T00:00:00.000Z');
-    await replaceVaultBinding();
-    expect(await attempts.unresolved()).toEqual([]);
-    const other = (await resolveSystemSession('browser', 'system:a2a:main:waiting-for-retired-vault')).session;
-    await queue.store.jobForSession(other);
-    expect(await queue.leases.acquire(other.thread_id!, ORIGIN)).toMatchObject({ acquired: false });
-    const wake = vi.spyOn(queue, 'wakeWaiters').mockResolvedValue(undefined);
-
-    await settleRefusedSites(queue, other.thread_id!, attempts);
-
-    expect(await lease()).toBeUndefined();
-    expect(wake.mock.calls.flatMap(([jobs]) => jobs)).toContain(other.thread_id);
-    expect(fake.calls).toEqual([]);
-  });
-
-  it.each([0, 1])(
-    'keeps a same-job site lease reacquired %i ms after vault retirement on later sweeps',
-    async (elapsed) => {
-      const id = await disclosedSignup();
-      await attempts.markUnknown(id, { signal: 'interrupted' });
-      await holdSite('2026-01-01T00:00:00.000Z');
-      await replaceVaultBinding();
-      expect(await attempts.unresolved()).toEqual([]);
-      const retired = await attempts.get(id);
-      if (!retired) throw new Error('Missing retired attempt');
-      expect(retired.phase).toBe('rejected');
-      await queue.leases.release(job.thread_id!, 'shop.example');
-      vi.useFakeTimers({ toFake: ['Date'] });
-      vi.setSystemTime(new Date(Date.parse(retired.updated_at) + elapsed));
-      expect(await queue.leases.acquire(job.thread_id!, ORIGIN)).toMatchObject({ acquired: true });
-      const other = (await resolveSystemSession('browser', 'system:a2a:main:waiting-for-new-work')).session;
-      await queue.store.jobForSession(other);
-      expect(await queue.leases.acquire(other.thread_id!, ORIGIN)).toMatchObject({ acquired: false });
-      const wake = vi.spyOn(queue, 'wakeWaiters').mockResolvedValue(undefined);
-
-      await settleConfirmedAttempts(queue, undefined, attempts);
-      await settleRefusedSites(queue, other.thread_id!, attempts);
-
-      expect(await lease()).toEqual({ job_id: job.thread_id });
-      expect(wake.mock.calls.flatMap(([jobs]) => jobs)).not.toContain(other.thread_id);
-      expect(await queue.leases.acquire(other.thread_id!, ORIGIN)).toMatchObject({ acquired: false });
-      expect(fake.calls).toEqual([]);
-
-      await queue.leases.markIdle(job.thread_id!, 'shop.example');
-      await queue.start();
-      try {
-        await queue.accept('list_watches', {}, job, 'finished-new-work');
-        await queue.idle();
-        expect(await lease()).toBeUndefined();
-        expect(wake.mock.calls.flatMap(([jobs]) => jobs)).toContain(other.thread_id);
-      } finally {
-        await queue.stop();
-      }
-    },
-  );
-
-  it('keeps a same-job site lease reacquired between retirement selection and release', async () => {
-    const id = await disclosedSignup();
-    await attempts.markUnknown(id, { signal: 'interrupted' });
-    await holdSite('2026-01-01T00:00:00.000Z');
-    await replaceVaultBinding();
-    expect(await attempts.unresolved()).toEqual([]);
-    const retired = await attempts.get(id);
-    if (!retired) throw new Error('Missing retired attempt');
-    const other = (await resolveSystemSession('browser', 'system:a2a:main:waiting-for-raced-work')).session;
-    await queue.store.jobForSession(other);
-    expect(await queue.leases.acquire(other.thread_id!, ORIGIN)).toMatchObject({ acquired: false });
-    const releaseLease = queue.leases.release.bind(queue.leases);
-    const release = vi.spyOn(queue.leases, 'release').mockImplementationOnce(async (...args) => {
-      vi.useFakeTimers({ toFake: ['Date'] });
-      vi.setSystemTime(new Date(Date.parse(retired.updated_at) + 1));
-      expect(await queue.leases.acquire(job.thread_id!, ORIGIN)).toMatchObject({ acquired: true });
-      return releaseLease(...args);
-    });
-    const wake = vi.spyOn(queue, 'wakeWaiters').mockResolvedValue(undefined);
-
-    await settleConfirmedAttempts(queue, undefined, attempts);
-
-    expect(release).toHaveBeenCalledOnce();
-    expect(await lease()).toEqual({ job_id: job.thread_id });
-    expect(wake.mock.calls.flatMap(([jobs]) => jobs)).not.toContain(other.thread_id);
-    expect(await queue.leases.acquire(other.thread_id!, ORIGIN)).toMatchObject({ acquired: false });
-  });
-
-  it('keeps a purchase lease when settling a removed-vault credential attempt', async () => {
-    const { id } = await confirmedChange();
-    await holdSite();
-    await getDb().run("UPDATE gws_ea_browser_site_leases SET state='purchase' WHERE site='shop.example'");
-    await replaceVaultBinding();
-
-    await settleConfirmedAttempts(queue, undefined, attempts);
-
-    expect(await attempts.get(id)).toMatchObject({ phase: 'rejected' });
-    expect(await lease()).toEqual({ job_id: job.thread_id });
-  });
-
-  it('settles the confirmed change holding a site another job was refused', async () => {
-    const { id } = await confirmedChange();
-    await rm(files.tokenFile);
-    expect(await attempts.finalize(id)).toEqual({ status: 'vault_not_set_up' });
-    await writePrivateFile(files.tokenFile, FIXTURE_TOKEN);
-    await holdSite();
-    const other = (await resolveSystemSession('browser', 'system:a2a:main:other-errand')).session;
-    // A job waiting on another site spends nothing on this one.
-    await getDb().run(
-      "INSERT INTO gws_ea_browser_site_waiters (site, job_id, requested_at) VALUES ('other.example', ?, ?)",
-      other.thread_id,
-      new Date().toISOString(),
-    );
-    const calls = fake.calls.length;
-    await settleRefusedSites(queue, other.thread_id!, attempts);
-    expect(fake.calls).toHaveLength(calls);
-    expect(await attempts.get(id)).toMatchObject({ phase: 'confirmed' });
-    await getDb().run(
-      "INSERT INTO gws_ea_browser_site_waiters (site, job_id, requested_at) VALUES ('shop.example', ?, ?)",
-      other.thread_id,
-      new Date().toISOString(),
-    );
-    await settleRefusedSites(queue, other.thread_id!, attempts);
-    expect(await attempts.get(id)).toMatchObject({ phase: 'finalized' });
-    expect(await lease()).toBeUndefined();
-  });
-
   it('tells the principal a signup whose emailed confirmation the host used is unknown, not unconfirmed', async () => {
     const id = await disclosedSignup();
     await attempts.markAwaitingVerification(id);
     await attempts.markUnknown(id, { signal: 'none', activation: 'activated', via: 'code' });
     expect(await release(id)).toEqual({ status: 'awaiting_principal' });
     const card = JSON.parse(cards[0]) as { question: string };
-    expect(card.question).toContain(
-      `The site asked to confirm the account "${USERNAME}" on shop.example by email, and I used the code it sent, but I can't tell whether the site accepted it.`,
-    );
+    expect(card.question).toContain("I can't tell whether the site accepted it");
     expect(card.question).not.toContain('never completed');
-  });
-
-  it('reports, asks and releases a signup whose login was edited before the host finished saving it', async () => {
-    const id = await disclosedSignup();
-    await attempts.markAwaitingVerification(id);
-    await attempts.markConfirmed(id, { signal: 'success_text' });
-    const candidateId = (await attempts.get(id))?.candidate_item_id ?? '';
-    fake.edit(candidateId, editUsername(PRINCIPAL_USERNAME));
-    const { context: execution, page } = context();
-    expect(await executeCredentialForm(execution, { authority: id, operation: 'reconcile' }, { attempts })).toEqual({
-      status: 'account_created',
-      vault: 'left_as_edited',
-    });
-    expect(page).not.toHaveBeenCalled();
-    expect(await attempts.get(id)).toMatchObject({ phase: 'conflict', conflict_reason: 'ownership_mismatch' });
-    expect(await release(id)).toEqual({ status: 'awaiting_principal' });
-    const card = JSON.parse(cards[0]) as { question: string };
-    expect(card.question).toContain(
-      'its login in my 1Password vault was changed or removed before I finished saving it, so I left it as it is',
-    );
-    expect(card.question).not.toContain('Trying again');
-    await click('approve');
-    expect(await attempts.get(id)).toMatchObject({ phase: 'rejected', owned_item_id: null });
-    expect(notes().at(-1)).toContain(
-      'Its login was changed or removed in 1Password before the host finished saving it, and the host left it as it is.',
-    );
-    expect(fake.value(candidateId, 'username')).toBe(PRINCIPAL_USERNAME);
   });
 });
 

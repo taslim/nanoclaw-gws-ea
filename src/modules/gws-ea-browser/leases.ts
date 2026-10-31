@@ -16,7 +16,7 @@ export function browserSite(url: string): string {
  * may settle it. Another errand can neither submit there again nor take the site meanwhile; every other site stays
  * free.
  */
-export const HELD_CREDENTIAL_PHASES = ['exposed', 'awaiting_verification', 'unknown', 'confirmed'] as const;
+export const HELD_CREDENTIAL_PHASES = ['exposed', 'awaiting_verification', 'unknown'] as const;
 
 export async function heldCredentialSites(db: DbDriver, jobId: string): Promise<Set<string>> {
   if (!(await db.hasTable('gws_ea_browser_credential_attempts'))) return new Set();

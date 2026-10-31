@@ -135,8 +135,8 @@ describe('persistent browser site leases', () => {
     const attempt = async (id: string, jobId: string, site: string, phase: string): Promise<void> => {
       const at = new Date().toISOString();
       await db.run(
-        `INSERT INTO gws_ea_browser_credential_attempts(id,kind,job_id,instance_id,account_id,vault_id,origin,site,username,phase,created_at,updated_at,exposed_at)
-         VALUES(?,'signup',?,'instance','account','vault',?,?,'morgan.ellery@example.com',?,?,?,?)`,
+        `INSERT INTO gws_ea_browser_credential_attempts(id,kind,job_id,origin,site,username,phase,created_at,updated_at,exposed_at)
+         VALUES(?,'signup',?,?,?,'morgan.ellery@example.com',?,?,?,?)`,
         id,
         jobId,
         `https://accounts.${site}`,
@@ -153,7 +153,7 @@ describe('persistent browser site leases', () => {
       await browserCredentialAttemptsMigration.up(db);
     });
 
-    it.each(['exposed', 'awaiting_verification', 'unknown', 'confirmed'])(
+    it.each(['exposed', 'awaiting_verification', 'unknown'])(
       'keeps that site held by its job (%s) while every other site is released and reusable',
       async (phase) => {
         await leases.acquire('first', 'https://accounts.shop.example/');
@@ -175,16 +175,13 @@ describe('persistent browser site leases', () => {
       },
     );
 
-    it.each(['preparing', 'saved', 'rejected', 'finalized', 'conflict'])(
-      'holds nothing for an attempt that is %s',
-      async (phase) => {
-        await leases.acquire('first', 'https://accounts.shop.example/');
-        await attempt('settled', 'first', 'shop.example', phase);
-        expect(await heldCredentialSites(db, 'first')).toEqual(new Set());
-        expect(await leases.release('first')).toEqual([]);
-        expect(await db.all('SELECT * FROM gws_ea_browser_site_leases')).toEqual([]);
-      },
-    );
+    it.each(['saved', 'rejected', 'finalized'])('holds nothing for an attempt that is %s', async (phase) => {
+      await leases.acquire('first', 'https://accounts.shop.example/');
+      await attempt('settled', 'first', 'shop.example', phase);
+      expect(await heldCredentialSites(db, 'first')).toEqual(new Set());
+      expect(await leases.release('first')).toEqual([]);
+      expect(await db.all('SELECT * FROM gws_ea_browser_site_leases')).toEqual([]);
+    });
 
     it('releases the site to its waiters once the attempt settles', async () => {
       await leases.acquire('first', 'https://accounts.shop.example/');

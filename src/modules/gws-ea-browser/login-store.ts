@@ -4,6 +4,11 @@ import { open } from 'node:fs/promises';
 import path from 'node:path';
 import Database from 'better-sqlite3';
 import { getDomain } from 'tldts';
+import { instanceMarkerFile } from '../../gws-ea/paths.js';
+import { readInstanceMarkerFile } from '../../gws-ea/registry.js';
+import { instanceLayout } from '../../gws-ea/release-layout.js';
+import { GwsEaError } from '../../gws-ea/types.js';
+import { browserRoot } from './availability.js';
 import type { SanitizedCommandOutcomeRunner } from '../../gws-ea/process.js';
 import { LoginKey } from './login-key.js';
 import { browserPaths, ensurePrivateDirectory } from './paths.js';
@@ -453,4 +458,18 @@ export class LoginStore {
 
 export async function loginStoreAvailability(store: LoginStore): Promise<LoginStoreAvailability> {
   return store.availability();
+}
+
+/** Bind from the running assistant's own marker; no policy or provider setup is needed. */
+export async function getLoginStore(): Promise<LoginStore> {
+  const root = browserRoot();
+  if (!root || !path.isAbsolute(root) || path.resolve(root) !== root || path.basename(root) !== 'browser')
+    throw new LoginStoreError('vault_unavailable');
+  try {
+    const marker = await readInstanceMarkerFile(instanceMarkerFile(instanceLayout(path.dirname(root)).state));
+    return new LoginStore({ browserRoot: root, instanceId: marker.instance_id });
+  } catch (error) {
+    if (!(error instanceof GwsEaError)) throw error;
+    throw new LoginStoreError('vault_unavailable');
+  }
 }

@@ -1,3 +1,5 @@
+import { testLoginStore } from './testing/login-store.js';
+import * as loginStoreModule from './login-store.js';
 import { configureBrowserAccess } from './testing/browser-access.js';
 import { useAvailableBrowser } from './testing/browser-runtime.js';
 import { createBrowserQueue } from './index.js';
@@ -38,6 +40,7 @@ import { browserAvailability } from './availability.js';
 
 let session: Session;
 beforeEach(async () => {
+  vi.spyOn(loginStoreModule, 'getLoginStore').mockResolvedValue(testLoginStore(`${root}/browser`).store);
   useAvailableBrowser();
   await runMigrations(await initTestDb());
   for (const id of ['main', 'browser'])
@@ -200,8 +203,8 @@ describe('cancelling a job with credential attempts', () => {
   const insert = async (id: string, jobId: string, phase: string, exposedAt: string | null): Promise<void> => {
     const at = new Date().toISOString();
     await getDb().run(
-      `INSERT INTO gws_ea_browser_credential_attempts(id,kind,job_id,instance_id,account_id,vault_id,origin,site,username,phase,created_at,updated_at,exposed_at)
-       VALUES(?,'signup',?,'instance','account','vault','https://accounts.shop.example','shop.example',?,?,?,?,?)`,
+      `INSERT INTO gws_ea_browser_credential_attempts(id,kind,job_id,origin,site,username,phase,created_at,updated_at,exposed_at)
+       VALUES(?,'signup',?,'https://accounts.shop.example','shop.example',?,?,?,?,?)`,
       id,
       jobId,
       `${id}@example.com`,
@@ -237,14 +240,13 @@ describe('cancelling a job with credential attempts', () => {
 
   it('abandons every attempt nothing was disclosed for, and cancels at once', async () => {
     const job = (await readBrowserJob(session.thread_id!))!.job;
-    await insert('preparing', job.id, 'preparing', null);
     await insert('saved', job.id, 'saved', null);
     await insert('finished', job.id, 'finalized', new Date().toISOString());
     expect(await cancelBrowserJob(job.thread_id)).toMatchObject({ status: 'cancelled' });
-    expect(await phases()).toEqual({ finished: 'finalized', preparing: 'rejected', saved: 'rejected' });
+    expect(await phases()).toEqual({ finished: 'finalized', saved: 'rejected' });
   });
 
-  it.each(['exposed', 'awaiting_verification', 'unknown', 'confirmed'])(
+  it.each(['exposed', 'awaiting_verification', 'unknown'])(
     'answers in_progress while a disclosed attempt is %s, keeps its site, and finishes once it settles',
     async (phase) => {
       const job = (await readBrowserJob(session.thread_id!))!.job;
@@ -277,7 +279,7 @@ describe('cancelling a job with credential attempts', () => {
     },
   );
 
-  it('interrupts pending work and closes its page even when candidate cleanup fails', async () => {
+  it('interrupts pending work and closes its page even when pending cleanup fails', async () => {
     const job = (await readBrowserJob(session.thread_id!))!.job;
     await insert('unused-cleanup', job.id, 'saved', null);
     const activeQueue = queue();
@@ -285,7 +287,7 @@ describe('cancelling a job with credential attempts', () => {
     const result = await activeQueue.store.db.transaction(() =>
       cancelBrowserJobInTransaction(job.thread_id, activeQueue.store),
     );
-    const retire = vi.spyOn(credentialAttempts, 'retireCandidates').mockRejectedValue(new Error('Vault unavailable'));
+    const retire = vi.spyOn(credentialAttempts, 'retirePending').mockRejectedValue(new Error('Vault unavailable'));
     try {
       await expect(finishBrowserJobCancellation(result, activeQueue)).rejects.toThrow('Vault unavailable');
       expect(await activeQueue.store.pending(job.id)).toEqual([]);

@@ -1,3 +1,5 @@
+import { testLoginStore } from './testing/login-store.js';
+import * as loginStoreModule from './login-store.js';
 import { useAvailableBrowser } from './testing/browser-runtime.js';
 import { repairBrowserWatchChecks } from './scheduler.js';
 import fs from 'node:fs';
@@ -40,6 +42,7 @@ import * as recipes from './recipes.js';
 import { runBrowserWatchCheck } from './watch-runtime.js';
 import type { ChromeConnection } from './connection.js';
 
+let loginFixture: ReturnType<typeof testLoginStore>;
 let store: BrowserStore;
 let session: Session;
 let actions: BrowserActions;
@@ -47,6 +50,8 @@ beforeEach(async () => {
   useAvailableBrowser();
   actions = browserActions;
   fs.rmSync(root, { recursive: true, force: true });
+  loginFixture = testLoginStore(`${root}/browser`);
+  vi.spyOn(loginStoreModule, 'getLoginStore').mockResolvedValue(loginFixture.store);
   await runMigrations(await initTestDb());
   for (const id of ['main-q', 'browser-q', 'external-q'])
     await createAgentGroup({ id, name: id, folder: id, agent_provider: null, created_at: new Date().toISOString() });
@@ -61,6 +66,7 @@ beforeEach(async () => {
 afterEach(async () => {
   setBrowserAdmissionReady(false);
   vi.unstubAllEnvs();
+  vi.restoreAllMocks();
   await closeDb();
   fs.rmSync(root, { recursive: true, force: true });
 });
@@ -1219,22 +1225,22 @@ describe('an authorized credential operation cut off after disclosure', () => {
 
   async function attempt(job: BrowserJob, phase: string, exposedAt: string | null): Promise<void> {
     const at = new Date(Date.now() - 60_000).toISOString();
+    await loginFixture.store.savePending(AUTHORITY, 'pending-fixture-password');
     await store.db.run(
       `INSERT INTO gws_ea_browser_credential_attempts
-       (id,kind,job_id,instance_id,account_id,vault_id,origin,site,username,candidate_item_id,candidate_version,phase,save_started_at,created_at,updated_at,exposed_at)
-       VALUES(?,'signup',?,'instance','account','vault','https://accounts.shop.example','shop.example','morgan.ellery@example.com','candidate-1',1,?,?,?,?,?)`,
+       (id,kind,job_id,origin,site,username,phase,created_at,updated_at,exposed_at)
+       VALUES(?,'signup',?,'https://accounts.shop.example','shop.example','morgan.ellery@example.com',?,?,?,?)`,
       AUTHORITY,
       job.id,
       phase,
-      at,
       at,
       at,
       exposedAt,
     );
   }
   const read = () =>
-    store.db.get<{ phase: string; candidate_item_id: string; exposed_at: string }>(
-      'SELECT phase, candidate_item_id, exposed_at FROM gws_ea_browser_credential_attempts WHERE id = ?',
+    store.db.get<{ phase: string; exposed_at: string }>(
+      'SELECT phase, exposed_at FROM gws_ea_browser_credential_attempts WHERE id = ?',
       AUTHORITY,
     );
   const answer = (requestId: string) =>
@@ -1278,7 +1284,7 @@ describe('an authorized credential operation cut off after disclosure', () => {
       unavailableChecks.mockRestore();
     }
     expect(answer('credential-crash')).toMatchObject({ status: 'outcome_unknown' });
-    expect(await read()).toMatchObject({ phase: 'unknown', candidate_item_id: 'candidate-1' });
+    expect(await read()).toMatchObject({ phase: 'unknown' });
     await noPurchaseRecords();
 
     // A retry, by the browser or after another restart, reports the recorded outcome without touching the page.
@@ -1288,7 +1294,7 @@ describe('an authorized credential operation cut off after disclosure', () => {
     await queue.stop();
     const restarted = createQueue(runtime);
     await recoverAndStartBrowserQueue(restarted);
-    expect(await read()).toMatchObject({ phase: 'unknown', candidate_item_id: 'candidate-1' });
+    expect(await read()).toMatchObject({ phase: 'unknown' });
     await noPurchaseRecords();
 
     // The site stays held by this job; every other site is free for other errands.
@@ -1320,7 +1326,7 @@ describe('an authorized credential operation cut off after disclosure', () => {
             AUTHORITY,
           );
           await held;
-          return { status: 'account_created', vault: 'saved' };
+          return { status: 'account_created' };
         },
         recover: recoverCredentialRequest,
       },
@@ -1356,7 +1362,7 @@ describe('an authorized credential operation cut off after disclosure', () => {
             AUTHORITY,
           );
           await held;
-          return { status: 'account_created', vault: 'saved' };
+          return { status: 'account_created' };
         },
         recover: recoverCredentialRequest,
       },
