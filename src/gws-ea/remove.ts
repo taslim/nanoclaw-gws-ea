@@ -788,7 +788,7 @@ async function removeLocked(
     // The host keeps the subscription from its start, with the assistant's sign-in.
     'chat-subscription': started('start_nanoclaw'),
     'gcp-project': started('provision_gcp'),
-    'login-key': true,
+    'login-key': platform === 'macos',
     onecli: started('start_onecli'),
     'instance-files': true,
   };

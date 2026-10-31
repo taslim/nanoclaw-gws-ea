@@ -659,7 +659,7 @@ describe('removal from any partial state', () => {
     expect(interaction.signInToGoogleCloud).not.toHaveBeenCalled();
     expect(dependencies.uninstallNanoclaw).not.toHaveBeenCalled();
     expect(dependencies.removeOnecli).not.toHaveBeenCalled();
-    expect(outcome).toEqual({ removed: ['login-key', 'instance-files'], abandoned: [], login_key: 'removed' });
+    expect(outcome).toEqual({ removed: ['instance-files'], abandoned: [] });
   });
 
   it('deletes a created project when the checkout is gone, skipping everything that never started', async () => {
@@ -686,7 +686,7 @@ describe('removal from any partial state', () => {
       `projects describe ${projectId} --format=json`,
     ]);
     expect(dependencies.resolveDocker).not.toHaveBeenCalled();
-    expect(outcome.removed).toEqual(['login-key', 'gcp-project', 'instance-files']);
+    expect(outcome.removed).toEqual(['gcp-project', 'instance-files']);
     await expectGone(paths, input);
   });
 
@@ -878,9 +878,8 @@ describe("removal of the assistant's Google Chat subscription", () => {
     expect(calls[0]!.url.searchParams.get('filter')).toContain('target_resource="//chat.googleapis.com/spaces/-"');
     expect(new Set(calls.map((request) => request.authorization))).toEqual(new Set([`Bearer ${ASSISTANT_TOKEN}`]));
     expect(outcome).toEqual({
-      removed: ['nanoclaw', 'chat-subscription', 'login-key', 'gcp-project', 'onecli', 'instance-files'],
+      removed: ['nanoclaw', 'chat-subscription', 'gcp-project', 'onecli', 'instance-files'],
       abandoned: [],
-      login_key: 'removed',
     });
     await expectGone(paths, input);
     for (const file of browserFiles) expect(await exists(file)).toBe(false);
@@ -896,7 +895,7 @@ describe("removal of the assistant's Google Chat subscription", () => {
     const outcome = await removeAssistant(paths, input.instance_id, removal.dependencies);
 
     expect(removal.google.events.requests).toEqual([]);
-    expect(outcome.removed).toEqual(['nanoclaw', 'chat-subscription', 'login-key', 'instance-files']);
+    expect(outcome.removed).toEqual(['nanoclaw', 'chat-subscription', 'instance-files']);
   });
 
   it("pauses before any change when Google refuses the assistant's sign-in, then completes, leaving the subscription behind on request", async () => {
@@ -1007,9 +1006,8 @@ describe("removal of the assistant's Google Chat subscription", () => {
 
     expect(removal.google.events.subscriptions.size).toBe(0);
     expect(outcome).toEqual({
-      removed: ['nanoclaw', 'chat-subscription', 'login-key', 'gcp-project', 'onecli', 'instance-files'],
+      removed: ['nanoclaw', 'chat-subscription', 'gcp-project', 'onecli', 'instance-files'],
       abandoned: [],
-      login_key: 'removed',
     });
     await expectGone(paths, input);
   });
@@ -1113,7 +1111,7 @@ describe('removal after an update or rollback', () => {
 
     const outcome = await removeAssistant(paths, input.instance_id, dependencies);
 
-    expect(outcome.removed).toEqual(['nanoclaw', 'chat-subscription', 'login-key', 'onecli', 'instance-files']);
+    expect(outcome.removed).toEqual(['nanoclaw', 'chat-subscription', 'onecli', 'instance-files']);
     // The recorded Docker endpoint is found in the assistant's state, live link or none.
     expect(dependencies.resolveDocker).toHaveBeenCalledWith(RECORDED_DOCKER);
     expect(dependencies.uninstallNanoclaw).toHaveBeenCalledWith(reservation, expect.anything());
@@ -1140,7 +1138,7 @@ describe('removal after an update or rollback', () => {
       serviceHelpers: nanoclawService([], { mode: 'none', active: false }),
     });
 
-    expect(outcome.removed).toEqual(['nanoclaw', 'chat-subscription', 'login-key', 'instance-files']);
+    expect(outcome.removed).toEqual(['nanoclaw', 'chat-subscription', 'instance-files']);
     expect(dependencies.resolveDocker).toHaveBeenCalledWith(RECORDED_DOCKER);
     expect([...docker.images.keys()]).toEqual([]);
     await expectGone(paths, reservation);
@@ -1346,7 +1344,7 @@ describe('removal in any phase', () => {
       serviceHelpers: nanoclawService([], { mode: 'none', active: false }),
     });
 
-    expect(outcome.removed).toEqual(['nanoclaw', 'chat-subscription', 'login-key', 'instance-files']);
+    expect(outcome.removed).toEqual(['nanoclaw', 'chat-subscription', 'instance-files']);
     expect(processes).toEqual(new Set([peerHost]));
     await expectGone(paths, input);
     expect(await exists(paths.markerFile(peer.instance_id))).toBe(true);
@@ -2040,7 +2038,7 @@ describe('WhatsApp removal', () => {
     const receipt = JSON.parse(await readFile(paths.removalFile(input.instance_id), 'utf8')) as {
       completed: Record<string, string>;
     };
-    expect(Object.keys(receipt.completed)).toEqual(['nanoclaw', 'whatsapp', 'chat-subscription', 'login-key']);
+    expect(Object.keys(receipt.completed)).toEqual(['nanoclaw', 'whatsapp', 'chat-subscription']);
     expect(await exists(directory)).toBe(true);
     await removeAssistant(paths, input.instance_id, dependencies);
     expect(ncl).toHaveBeenCalledTimes(1);
@@ -2091,6 +2089,23 @@ describe('WhatsApp removal', () => {
 });
 
 describe('saved-login key removal', () => {
+  it('skips Keychain cleanup on Linux without reporting a key left behind', async () => {
+    const paths = await testPaths();
+    const input = await reserve(paths, reservationInput());
+    const scene = world(input);
+    const runCommand = vi.fn(
+      async (): Promise<SanitizedCommandOutcome> => ({ exitCode: 36, stdout: '', stderr: 'unavailable' }),
+    );
+    const outcome = await removeAssistant(paths, input.instance_id, {
+      ...scene.dependencies,
+      platform: 'linux',
+      runCommand,
+    });
+    expect(runCommand).not.toHaveBeenCalled();
+    expect(outcome).toEqual({ removed: ['instance-files'], abandoned: [] });
+    await expectGone(paths, input);
+  });
+
   it.each([0, 44])('deletes the key after the host stops, treating exit %s as gone', async (exitCode) => {
     const paths = await testPaths();
     const input = await reserve(paths, reservationInput(), { started: ['start_nanoclaw'] });
@@ -2101,7 +2116,11 @@ describe('saved-login key removal', () => {
       expect(request.args).toEqual(['delete-generic-password', '-s', 'gws-ea.saved-logins', '-a', input.instance_id]);
       return { exitCode, stdout: '', stderr: '' };
     });
-    const outcome = await removeAssistant(paths, input.instance_id, { ...scene.dependencies, runCommand });
+    const outcome = await removeAssistant(paths, input.instance_id, {
+      ...scene.dependencies,
+      platform: 'macos',
+      runCommand,
+    });
     expect(runCommand).toHaveBeenCalledOnce();
     expect(outcome.removed).toContain('login-key');
     expect(outcome).toMatchObject({ login_key: 'removed' });
@@ -2114,7 +2133,11 @@ describe('saved-login key removal', () => {
     const runCommand = vi.fn(
       async (): Promise<SanitizedCommandOutcome> => ({ exitCode: 36, stdout: '', stderr: 'locked' }),
     );
-    const outcome = await removeAssistant(paths, input.instance_id, { ...scene.dependencies, runCommand });
+    const outcome = await removeAssistant(paths, input.instance_id, {
+      ...scene.dependencies,
+      platform: 'macos',
+      runCommand,
+    });
     expect(runCommand).toHaveBeenCalledOnce();
     expect(outcome.removed).not.toContain('login-key');
     expect(outcome).toMatchObject({ login_key: 'left_behind' });
@@ -2129,7 +2152,7 @@ it('preserves a key left behind when a later removal step must resume', async ()
   const scene = world(input);
   const runCommand = vi.fn(async (): Promise<SanitizedCommandOutcome> => ({ exitCode: 36, stdout: '', stderr: '' }));
   const removeOnecli = vi.fn(async () => undefined).mockRejectedValueOnce(new Error('Teardown interrupted'));
-  const dependencies = { ...scene.dependencies, runCommand, removeOnecli };
+  const dependencies = { ...scene.dependencies, platform: 'macos' as const, runCommand, removeOnecli };
   await expect(removeAssistant(paths, input.instance_id, dependencies)).rejects.toThrow('Teardown interrupted');
   expect(await removeAssistant(paths, input.instance_id, dependencies)).toMatchObject({ login_key: 'left_behind' });
   expect(runCommand).toHaveBeenCalledOnce();
@@ -2143,6 +2166,7 @@ it('keeps an invalid key outcome in a removal receipt explicit before further te
   await expect(
     removeAssistant(paths, input.instance_id, {
       ...scene.dependencies,
+      platform: 'macos',
       removeOnecli: async () => {
         throw new Error('Teardown interrupted');
       },
@@ -2150,7 +2174,9 @@ it('keeps an invalid key outcome in a removal receipt explicit before further te
   ).rejects.toThrow('Teardown interrupted');
   const receipt = JSON.parse(await readFile(paths.removalFile(input.instance_id), 'utf8'));
   await writePrivate(paths.removalFile(input.instance_id), { ...receipt, login_key: 'invalid' });
-  await expect(removeAssistant(paths, input.instance_id, scene.dependencies)).rejects.toMatchObject({
+  await expect(
+    removeAssistant(paths, input.instance_id, { ...scene.dependencies, platform: 'macos' }),
+  ).rejects.toMatchObject({
     code: 'removal_receipt_unreadable',
   });
   expect(scene.dependencies.removeOnecli).not.toHaveBeenCalled();
@@ -2170,6 +2196,7 @@ it.each([false, true])('names an unreachable key after successful removal in tex
         removeAssistant(removalPaths, id, {
           ...scene.dependencies,
           ...options,
+          platform: 'macos',
           runCommand: async () => ({ exitCode: 36, stdout: '', stderr: '' }),
         }),
     }),
