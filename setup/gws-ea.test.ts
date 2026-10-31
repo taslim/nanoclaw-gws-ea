@@ -47,7 +47,10 @@ const fixture = vi.hoisted(() => {
     spinner,
     log: { info: vi.fn(), success: vi.fn(), warn: vi.fn(), error: vi.fn(), message: vi.fn(), step: vi.fn() },
     note: vi.fn(),
-    password: vi.fn(async (): Promise<string | symbol> => 'hidden-management-fixture'),
+    password: vi.fn(
+      async (_options: Parameters<typeof import('@clack/prompts').password>[0]): Promise<string | symbol> =>
+        'hidden-management-fixture',
+    ),
     confirm: vi.fn(async (): Promise<boolean | symbol> => true),
     /** What clack's prompts return when the operator presses Ctrl-C or Esc. */
     cancel: Symbol('clack:cancel'),
@@ -158,6 +161,15 @@ describe('launcher interaction modes', () => {
     fixture.password.mockResolvedValueOnce(fixture.cancel);
     await expect(runtime.readWebManagementToken()).rejects.toMatchObject({ code: 'cancelled' });
   });
+  it('validates an untouched token prompt submission as empty input', async () => {
+    await main(['connectors', 'install', 'web'], { interactive: true });
+    const reader = runtimeOf().readWebManagementToken;
+    if (!reader) throw new Error('Missing terminal token reader');
+    await reader();
+    const prompt = fixture.password.mock.calls[0]?.[0];
+    if (!prompt?.validate) throw new Error('Missing token validator');
+    expect(Reflect.apply(prompt.validate, undefined, [undefined])).toBe('Paste the API token only.');
+  });
   it.each([
     { label: 'all streams attached', stdin: true, stdout: true, stderr: true, override: undefined, expected: true },
     {
@@ -176,6 +188,24 @@ describe('launcher interaction modes', () => {
       stderr: true,
       override: true,
       ci: 'true',
+      expected: true,
+    },
+    {
+      label: 'Jenkins pseudo-terminal without CI',
+      stdin: true,
+      stdout: true,
+      stderr: true,
+      override: undefined,
+      jenkinsUrl: 'https://jenkins.example.test',
+      expected: false,
+    },
+    {
+      label: 'explicit interaction in Jenkins',
+      stdin: true,
+      stdout: true,
+      stderr: true,
+      override: true,
+      jenkinsUrl: 'https://jenkins.example.test',
       expected: true,
     },
     { label: 'stdout redirected', stdin: true, stdout: false, stderr: true, override: undefined, expected: true },
@@ -197,8 +227,10 @@ describe('launcher interaction modes', () => {
       override: true,
       expected: true,
     },
-  ])('uses the input and prompt streams with $label', async ({ stdin, stdout, stderr, override, ci, expected }) => {
+  ])('uses the input and prompt streams with $label', async (scenario) => {
+    const { stdin, stdout, stderr, override, ci, jenkinsUrl, expected } = scenario;
     vi.stubEnv('CI', ci);
+    vi.stubEnv('JENKINS_URL', jenkinsUrl);
     const streams = [process.stdin, process.stdout, process.stderr];
     const descriptors = streams.map((stream) => Object.getOwnPropertyDescriptor(stream, 'isTTY'));
     const ttyValues = [stdin, stdout, stderr];

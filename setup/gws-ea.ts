@@ -256,7 +256,8 @@ export async function main(argv: readonly string[], options: { readonly interact
   const interactive =
     invocation.options.json !== 'true' &&
     invocation.options['no-input'] !== 'true' &&
-    (options.interactive ?? Boolean(!process.env.CI && process.stdin.isTTY && process.stderr.isTTY));
+    (options.interactive ??
+      Boolean(!process.env.CI && !process.env.JENKINS_URL && process.stdin.isTTY && process.stderr.isTTY));
   const providers = listSetupProviders();
   const collectCreateInputs: CliRuntime['collectCreateInputs'] = (context) =>
     collectGwsEaCreateInput(context, { providers, interactive });
@@ -285,7 +286,7 @@ export async function main(argv: readonly string[], options: { readonly interact
     readWebManagementToken: async () => {
       const token = await p.password({
         message: 'Cloudflare management API token',
-        validate: (value) => (!value.trim() || /\s/u.test(value.trim()) ? 'Paste the API token only.' : undefined),
+        validate: (value) => (!value?.trim() || /\s/u.test(value.trim()) ? 'Paste the API token only.' : undefined),
         output: process.stderr,
       });
       if (p.isCancel(token)) throw new GwsEaError('cancelled', 'Web installation cancelled.');
