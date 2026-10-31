@@ -93,6 +93,7 @@ const runtime: ConstructorParameters<typeof BrowserQueue>[1] = {
     throw new Error('No browser in an outcome test');
   },
   async closeJob() {},
+  withActivity: <T>(operation: () => Promise<T>): Promise<T> => operation(),
   onDisconnected: () => () => undefined,
 };
 

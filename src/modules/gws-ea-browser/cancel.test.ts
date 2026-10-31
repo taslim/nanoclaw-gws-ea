@@ -56,6 +56,7 @@ beforeEach(async () => {
       throw new Error('Cancellation must not launch Chrome');
     },
     closeJob: async () => undefined,
+    withActivity: <T>(operation: () => Promise<T>): Promise<T> => operation(),
     onDisconnected: () => () => undefined,
   });
   registerBrowserCancellationDelivery(() => queue);
@@ -230,6 +231,7 @@ describe('cancelling a job with credential attempts', () => {
       closeJob: async (jobId: string) => {
         closed.push(jobId);
       },
+      withActivity: <T>(operation: () => Promise<T>): Promise<T> => operation(),
       onDisconnected: () => () => undefined,
     });
 

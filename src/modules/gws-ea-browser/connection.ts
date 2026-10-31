@@ -5,7 +5,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 
 import { chromium, type Browser, type BrowserContext, type CDPSession, type Page } from 'playwright-core';
 
-import { stopChrome, type OwnedChrome } from './chrome.js';
+import { prepareChromeRetirement, stopChrome, type OwnedChrome } from './chrome.js';
 import { prepareMerchantPage } from './merchant-read.js';
 import { prepareAuthenticationIsolation } from './authentication-submit.js';
 import { documentGate } from './document-gate.js';
@@ -174,27 +174,37 @@ export async function connectChrome(
         debuggerPort,
         close() {
           closing ??= (async () => {
-            const exited =
-              child.exitCode !== null || child.signalCode !== null
-                ? Promise.resolve()
-                : once(child, 'exit').then(() => undefined);
-            // Profile flushing is independent of the protocol reply, which Chrome may never send.
-            void session.send('Browser.close').catch(() => undefined);
-            let timer: NodeJS.Timeout | undefined;
             try {
-              await Promise.race([
-                exited,
-                new Promise<void>((resolve) => {
-                  timer = setTimeout(resolve, 2_000);
-                  timer.unref();
-                }),
-              ]);
+              try {
+                await prepareChromeRetirement(child);
+              } finally {
+                // Profile flushing is independent of the protocol reply, which Chrome may never send.
+                void session.send('Browser.close').catch(() => undefined);
+              }
+              const exited =
+                child.exitCode !== null || child.signalCode !== null
+                  ? Promise.resolve()
+                  : once(child, 'exit').then(() => undefined);
+              let timer: NodeJS.Timeout | undefined;
+              try {
+                await Promise.race([
+                  exited,
+                  new Promise<void>((resolve) => {
+                    timer = setTimeout(resolve, 2_000);
+                    timer.unref();
+                  }),
+                ]);
+              } finally {
+                if (timer) clearTimeout(timer);
+              }
             } finally {
-              if (timer) clearTimeout(timer);
+              try {
+                await stopChrome(child);
+              } finally {
+                // Process retirement must remain reachable even if the client never finishes disposal.
+                void attached.close().catch(() => undefined);
+              }
             }
-            await stopChrome(child);
-            // Process retirement must remain reachable even if the client never finishes disposal.
-            void attached.close().catch(() => undefined);
           })();
           return closing;
         },

@@ -229,6 +229,7 @@ async function startErrandHost(thread: string): Promise<ErrandHost> {
       closeJob: async () => {
         host.closed++;
       },
+      withActivity: <T>(operation: () => Promise<T>): Promise<T> => operation(),
       onDisconnected: () => () => undefined,
     }),
   };

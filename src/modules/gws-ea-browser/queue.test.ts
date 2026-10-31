@@ -24,7 +24,12 @@ import type { Session } from '../../types.js';
 import { forbidden } from '../../cli/delivery-action.js';
 import { guard } from '../../guard/index.js';
 import '../gws-ea-profile/index.js';
-import { browserActions, browserQueueFollowUps, recoverAndStartBrowserQueue } from './index.js';
+import { browserActions, browserQueueFollowUps, getBrowserRuntime, recoverAndStartBrowserQueue } from './index.js';
+import * as containerRunner from '../../container-runner.js';
+import { notifyContainerStopped } from '../../host-lifecycle.js';
+import { createPendingApproval } from '../../db/sessions.js';
+import * as availability from './availability.js';
+import { browserPaths, ensureBrowserPaths } from './paths.js';
 import type { BrowserActions } from './actions.js';
 import { BrowserStore, browserRequestId, markBrowserRequestCommitStarted, type BrowserJob } from './db.js';
 import { BrowserQueue, browserRequestGuard } from './queue.js';
@@ -89,6 +94,7 @@ const runtime = {
     throw new Error('This test must not launch Chrome');
   },
   async closeJob(): Promise<void> {},
+  withActivity: <T>(operation: () => Promise<T>): Promise<T> => operation(),
   onDisconnected(): () => void {
     return () => undefined;
   },
@@ -107,6 +113,196 @@ function responses(): unknown[] {
     db.close();
   }
 }
+
+it('holds a checkout page after its worker exits until its card and authorized continuation are settled', async () => {
+  const job = await store.jobForSession(session);
+  if (!job) throw new Error('Missing native job');
+  const at = new Date().toISOString();
+  expect(await store.hasCheckoutPageHold(job.id)).toBe(false);
+  await getDb().run(
+    `INSERT INTO gws_ea_browser_purchase_cards(id,job_id,request_id,status,facts_json,bounds_json,exception_ids_json,expires_at,created_at)
+     VALUES('page-card',?,'page-request','open','{}','{}','[]',?,?)`,
+    job.id,
+    at,
+    at,
+  );
+  // A passed deadline still holds the page until the approval lifecycle settles its card.
+  expect(await store.hasCheckoutPageHold(job.id)).toBe(true);
+  await getDb().run("UPDATE gws_ea_browser_purchase_cards SET status = 'approved' WHERE id = 'page-card'");
+  await getDb().run(
+    `INSERT INTO gws_ea_browser_authorities(id,job_id,card_id,kind,state,facts_json,bounds_json,exception_ids_json,attempt_id,expires_at,created_at)
+     VALUES('page-authority',?,'page-card','checkout','live','{}','{}','[]','page-attempt',?,?)`,
+    job.id,
+    at,
+    at,
+  );
+  expect(await store.hasCheckoutPageHold(job.id)).toBe(true);
+  await getDb().run("UPDATE gws_ea_browser_authorities SET state = 'committing' WHERE id = 'page-authority'");
+  expect(await store.hasCheckoutPageHold(job.id)).toBe(true);
+  await getDb().run("UPDATE gws_ea_browser_authorities SET state = 'unknown' WHERE id = 'page-authority'");
+  expect(await store.hasCheckoutPageHold(job.id)).toBe(false);
+  await getDb().run("UPDATE gws_ea_browser_authorities SET state = 'live',kind = 'watch' WHERE id = 'page-authority'");
+  expect(await store.hasCheckoutPageHold(job.id)).toBe(false);
+});
+
+it.skipIf(!process.env.GWS_EA_BROWSER_TEST_CHROME)(
+  'finishes queue work when Chrome stops answering page close while preserving another worker',
+  async () => {
+    const file = `${root}/stalled-close-browser`;
+    const chromePath = process.env.GWS_EA_BROWSER_TEST_CHROME;
+    if (!chromePath) throw new Error('Native Chrome unavailable');
+    await ensureBrowserPaths(browserPaths(file));
+    vi.stubEnv('GWS_EA_BROWSER_ROOT', file);
+    vi.spyOn(availability, 'browserAvailability').mockResolvedValue({
+      available: true,
+      paths: browserPaths(file),
+      chromePath,
+    });
+    const other = (await resolveSystemSession('browser-q', 'system:a2a:main-q:stalled-other')).session;
+    const job = await store.jobForSession(session);
+    const otherJob = await store.jobForSession(other);
+    if (!job || !otherJob) throw new Error('Missing native jobs');
+    const live = new Set([session.id, other.id]);
+    vi.spyOn(containerRunner, 'isContainerRunning').mockImplementation((id) => live.has(id));
+    const host = getBrowserRuntime();
+    let pid: number | undefined;
+    let page: Page | undefined;
+    let timeout: NodeJS.Timeout | undefined;
+    const resume = (): void => {
+      if (pid === undefined) return;
+      try {
+        process.kill(pid, 'SIGCONT');
+      } catch (error) {
+        if (!(error instanceof Error && 'code' in error && error.code === 'ESRCH')) throw error;
+      }
+    };
+    actions = {
+      ...actions,
+      browser: {
+        validate: () => ({}),
+        async execute(context) {
+          page = await context.page();
+          vi.spyOn(page, 'close');
+          pid = (await host.connection()).child.pid;
+          if (pid === undefined) throw new Error('Owned Chrome unavailable');
+          process.kill(pid, 'SIGSTOP');
+          live.delete(session.id);
+          return { status: 'completed' };
+        },
+      },
+    };
+    const queue = createQueue(host);
+    try {
+      const otherPage = await host.pageForJob(otherJob.id);
+      await recoverAndStartBrowserQueue(queue);
+      await queue.accept('browser', {}, session, 'stalled-close');
+      const idle = queue.idle();
+      await vi.waitFor(() => expect(page?.close).toHaveBeenCalled(), { timeout: 3_000 });
+      await Promise.race([
+        idle,
+        new Promise<never>((_resolve, reject) => {
+          timeout = setTimeout(() => reject(new Error('Page disposal blocked the queue')), 6_500);
+        }),
+      ]);
+      expect(responses()).toEqual([
+        expect.objectContaining({ requestId: 'stalled-close', frame: expect.objectContaining({ ok: true }) }),
+      ]);
+      expect(await queue.tryWithJobLocks([job.id], async () => true)).toEqual({ acquired: true, value: true });
+      expect(otherPage.isClosed()).toBe(false);
+      expect(host.state().chrome.state).toBe('running');
+    } finally {
+      if (timeout) clearTimeout(timeout);
+      resume();
+      await Promise.all([queue.stop(), host.stop()]);
+      vi.restoreAllMocks();
+    }
+  },
+  30_000,
+);
+
+it.skipIf(!process.env.GWS_EA_BROWSER_TEST_CHROME)(
+  'releases pages through the production worker-exit and native-store wiring',
+  async () => {
+    const file = `${root}/retention-browser`;
+    const chromePath = process.env.GWS_EA_BROWSER_TEST_CHROME;
+    if (!chromePath) throw new Error('Native Chrome unavailable');
+    await ensureBrowserPaths(browserPaths(file));
+    vi.stubEnv('GWS_EA_BROWSER_ROOT', file);
+    vi.spyOn(availability, 'browserAvailability').mockResolvedValue({
+      available: true,
+      paths: browserPaths(file),
+      chromePath,
+    });
+    const [operation, worker, checkout, ordinary] = await Promise.all(
+      ['operation', 'worker', 'checkout', 'ordinary'].map(async (name) => {
+        const owner = (await resolveSystemSession('browser-q', `system:a2a:main-q:retention-${name}`)).session;
+        const job = await store.jobForSession(owner);
+        if (!job) throw new Error('Missing native job');
+        return { session: owner, job };
+      }),
+    );
+    const live = new Set([operation.session.id, worker.session.id, checkout.session.id, ordinary.session.id]);
+    vi.spyOn(containerRunner, 'isContainerRunning').mockImplementation((id) => live.has(id));
+    const at = new Date().toISOString();
+    await store.accept(operation.job, operation.session, 'host-work', 'browser', {}, 5_000);
+    await getDb().run(
+      `INSERT INTO gws_ea_browser_purchase_cards(id,job_id,request_id,status,facts_json,bounds_json,exception_ids_json,expires_at,created_at)
+     VALUES('retention-card',?,'retention-card-request','open','{}','{}','[]',?,?)`,
+      checkout.job.id,
+      at,
+      at,
+    );
+    await createPendingApproval({
+      approval_id: 'ordinary-approval',
+      session_id: ordinary.session.id,
+      request_id: 'ordinary-approval',
+      action: 'ordinary-action',
+      payload: '{}',
+      created_at: at,
+      title: 'Ordinary approval',
+      options_json: '[]',
+    });
+    const host = getBrowserRuntime();
+    try {
+      const pages = await host.withActivity(async () =>
+        Promise.all([operation, worker, checkout, ordinary].map(({ job }) => host.pageForJob(job.id))),
+      );
+      const [operationPage, workerPage, checkoutPage, ordinaryPage] = pages;
+      live.clear();
+      live.add(worker.session.id);
+      await notifyContainerStopped(operation.session.id);
+      expect(operationPage.isClosed()).toBe(false);
+      expect(workerPage.isClosed()).toBe(false);
+      expect(checkoutPage.isClosed()).toBe(false);
+      expect(ordinaryPage.isClosed()).toBe(true);
+      await getDb().run('UPDATE gws_ea_browser_requests SET answered_at = ? WHERE job_id = ?', at, operation.job.id);
+      await notifyContainerStopped(operation.session.id);
+      expect(operationPage.isClosed()).toBe(true);
+      await getDb().run("UPDATE gws_ea_browser_purchase_cards SET status = 'approved' WHERE id = 'retention-card'");
+      await getDb().run(
+        `INSERT INTO gws_ea_browser_authorities(id,job_id,card_id,kind,state,facts_json,bounds_json,exception_ids_json,attempt_id,expires_at,created_at)
+       VALUES('retention-authority',?,'retention-card','checkout','live','{}','{}','[]','retention-attempt',?,?)`,
+        checkout.job.id,
+        at,
+        at,
+      );
+      await notifyContainerStopped(checkout.session.id);
+      expect(checkoutPage.isClosed()).toBe(false);
+      await getDb().run("UPDATE gws_ea_browser_authorities SET state = 'committing' WHERE id = 'retention-authority'");
+      await notifyContainerStopped(checkout.session.id);
+      expect(checkoutPage.isClosed()).toBe(false);
+      await getDb().run("UPDATE gws_ea_browser_authorities SET state = 'unknown' WHERE id = 'retention-authority'");
+      live.clear();
+      await notifyContainerStopped(worker.session.id);
+      expect(checkoutPage.isClosed()).toBe(true);
+      expect(workerPage.isClosed()).toBe(true);
+    } finally {
+      await host.stop();
+      vi.restoreAllMocks();
+    }
+  },
+  30_000,
+);
 
 it('persists observed HTTP response evidence with the exact request answer without network payloads', async () => {
   const events = new EventEmitter();

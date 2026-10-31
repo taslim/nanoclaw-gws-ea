@@ -91,6 +91,7 @@ it('delivers purchase, card, watch and site notices to cold and active browser t
       throw new Error('No browser operation expected');
     },
     async closeJob() {},
+    withActivity: <T>(operation: () => Promise<T>): Promise<T> => operation(),
     onDisconnected: () => () => undefined,
   });
   await notifyPurchaseOutcome('notice-authority');

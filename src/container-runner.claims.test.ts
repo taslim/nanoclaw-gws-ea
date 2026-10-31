@@ -36,6 +36,9 @@ const reapOrphans = vi.fn(async () => {});
 import { getSessionClaim } from './db/coordination.js';
 import { initTestDb, closeDb, runMigrations, createAgentGroup, createSession } from './db/index.js';
 import { createPendingQuestion, getPendingQuestion } from './db/sessions.js';
+import { onContainerStopped } from './host-lifecycle.js';
+const stopped = vi.fn(async (_sessionId: string): Promise<void> => undefined);
+onContainerStopped(stopped);
 
 function now(): string {
   return new Date().toISOString();
@@ -61,6 +64,7 @@ function fakeHandle(sessionId: string, name: string): SupervisedHandle {
 
 beforeEach(async () => {
   snapshots.length = 0;
+  stopped.mockClear();
   release.mockClear();
   ensure.mockClear();
   reapOrphans.mockClear();
@@ -122,6 +126,8 @@ describe('session claim lifecycle', () => {
       expect(released?.incarnation).toBe(1);
     });
     await vi.waitFor(() => expect(release).toHaveBeenCalledWith({ kind: 'session-ended', reason: 'test-stop' }));
+    await vi.waitFor(() => expect(stopped).toHaveBeenCalledExactlyOnceWith('sess-1'));
+    expect(isContainerRunning('sess-1')).toBe(false);
   });
 
   it('a re-adopted session bumps the incarnation via CAS', async () => {
@@ -150,6 +156,7 @@ describe('session claim lifecycle', () => {
     killContainer('sess-1', 'test-stop');
     await vi.waitFor(() => expect(failedStop).toHaveBeenCalled());
     expect(release).not.toHaveBeenCalled();
+    expect(stopped).not.toHaveBeenCalled();
     expect((await getSessionClaim('sess-1'))?.claimed_by).not.toBeNull();
     handle.stop = stop;
     await vi.waitFor(() => expect(release).toHaveBeenCalledWith({ kind: 'session-ended', reason: 'test-stop' }));
@@ -166,6 +173,28 @@ describe('session claim lifecycle', () => {
 });
 
 describe('session exit', () => {
+  it('runs exit callbacks without waiting for optional module cleanup', async () => {
+    let releaseCleanup: (() => void) | undefined;
+    stopped.mockImplementationOnce(
+      () =>
+        new Promise<void>((resolve) => {
+          releaseCleanup = resolve;
+        }),
+    );
+    snapshots.push({ handle: fakeHandle('sess-1', 'container-a'), phase: 'running' } as SupervisedSnapshot);
+    await adoptRunningSessions();
+    const exited = vi.fn();
+    try {
+      killContainer('sess-1', 'test-stop', exited);
+      await vi.waitFor(() => expect(stopped).toHaveBeenCalledExactlyOnceWith('sess-1'));
+      await vi.waitFor(() => expect(exited).toHaveBeenCalledOnce());
+      expect((await getSessionClaim('sess-1'))?.claimed_by).toBeNull();
+      expect(isContainerRunning('sess-1')).toBe(false);
+    } finally {
+      releaseCleanup?.();
+    }
+  });
+
   it("drops the session's open questions once its container exits, and leaves other sessions'", async () => {
     await createSession({
       id: 'sess-2',

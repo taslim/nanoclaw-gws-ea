@@ -59,6 +59,18 @@ export class BrowserStore {
     return this.db.get<BrowserJob>('SELECT * FROM gws_ea_browser_jobs WHERE id = ?', id);
   }
 
+  async hasCheckoutPageHold(jobId: string): Promise<boolean> {
+    return Boolean(
+      await this.db.get<{ present: number }>(
+        `SELECT 1 AS present FROM gws_ea_browser_purchase_cards WHERE job_id = ? AND status = 'open'
+       UNION ALL SELECT 1 AS present FROM gws_ea_browser_authorities
+       WHERE job_id = ? AND kind = 'checkout' AND state IN ('live','committing') LIMIT 1`,
+        jobId,
+        jobId,
+      ),
+    );
+  }
+
   /** The delegator's recorded reservation scope; it grants no financial authority. */
   async reservationBounds(jobId: string): Promise<PurchaseBounds['reservation']> {
     const row = await this.db.get<{ bounds_json: string }>(

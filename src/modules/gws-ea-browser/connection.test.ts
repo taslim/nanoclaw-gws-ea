@@ -342,3 +342,14 @@ it('forces an unresponsive child to exit even when close reply and client dispos
   await connection.close();
   expect(child.kill).toHaveBeenCalledOnce();
 });
+
+it('bounds forced retirement when the owned child never reports exit', async () => {
+  const { child } = childFixture();
+  child.kill.mockReturnValue(true);
+  vi.useFakeTimers();
+  const closing = stopChrome(child as unknown as ChildProcess);
+  const rejected = expect(closing).rejects.toThrow('Chrome process did not stop');
+  await vi.advanceTimersByTimeAsync(5_000);
+  await rejected;
+  expect(child.kill.mock.calls).toEqual([['SIGTERM'], ['SIGKILL']]);
+});

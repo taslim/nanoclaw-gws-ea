@@ -11,7 +11,7 @@ interface BrowserContext {
   readonly signal: AbortSignal;
   readonly deadline: number;
   readonly store: BrowserStore;
-  readonly runtime: Pick<BrowserRuntime, 'pageForJob' | 'connection' | 'closeJob' | 'onDisconnected'>;
+  readonly runtime: Pick<BrowserRuntime, 'pageForJob' | 'connection' | 'closeJob' | 'onDisconnected' | 'withActivity'>;
   page(): Promise<Page>;
   /** Queued executors already own the exclusive job lock. Check again after any external wait. */
   assertActive(): Promise<void>;

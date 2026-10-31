@@ -527,6 +527,7 @@ describe.skipIf(!chromePath)('reviewed merchant purchases through native host de
         throw new Error('Not used');
       },
       closeJob: async () => undefined,
+      withActivity: <T>(operation: () => Promise<T>): Promise<T> => operation(),
       onDisconnected: () => () => undefined,
     });
     registerBrowserPurchaseDelivery(() => queue);

@@ -218,6 +218,7 @@ describe.skipIf(!chromePath)('wake-on-change watches in native Chrome', { timeou
       // The signed-out check page is the fixture's own (see the mock above); no host Chrome is reached.
       connection: async () => ({}) as ChromeConnection,
       closeJob: async () => undefined,
+      withActivity: <T>(operation: () => Promise<T>): Promise<T> => operation(),
       onDisconnected: () => () => undefined,
     });
     configureBrowserCancellation(queue);
@@ -612,6 +613,7 @@ describe.skipIf(!chromePath)('a reader watch beside region watches in native Chr
       pageForJob: async () => resy.page,
       connection: async () => ({}) as ChromeConnection,
       closeJob: async () => undefined,
+      withActivity: <T>(operation: () => Promise<T>): Promise<T> => operation(),
       onDisconnected: () => () => undefined,
     });
     await recoverAndStartBrowserQueue(queue);

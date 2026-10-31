@@ -19,7 +19,7 @@ import { getSessionDriver } from './drivers/index.js';
 import { startActiveDeliveryPoll, startSweepDeliveryPoll, setDeliveryAdapter, stopDeliveryPolls } from './delivery.js';
 import { startHostInstanceLease, stopHostInstanceLease } from './host-instance.js';
 import { startHostSweep, stopHostSweep } from './host-sweep.js';
-import { startHostModules, stopHostModules } from './host-lifecycle.js';
+import { runHostCleanup, startHostModules, stopHostModules } from './host-lifecycle.js';
 import { startGatewayApprovalCoordinator, stopGatewayApprovalCoordinator } from './gateway-approval-coordinator.js';
 import { startGatewayAvailabilityMonitor } from './gateway-availability.js';
 import { getGatewayProvider } from './gateway-providers/index.js';
@@ -233,34 +233,40 @@ async function main(): Promise<void> {
 }
 
 /** Graceful shutdown. */
-async function shutdown(signal: string): Promise<void> {
-  log.info('Shutdown signal received', { signal });
-  hostAbortController.abort();
-  stopGatewayAvailabilityMonitor?.();
-  await stopGatewayApprovalCoordinator();
-  await abortGatewaySessionObservers();
-  await stopHostModules();
-  // Stamp the durable stop before the DB closes below.
-  await stopHostInstanceLease();
-  await stopDeliveryPolls();
-  await stopHostSweep();
-  await stopCliServer();
-  try {
-    await teardownChannelAdapters();
-  } finally {
-    await closeDb();
-    // Always reset on graceful shutdown — even if teardown threw, we got here
-    // via SIGTERM/SIGINT, not a crash, so the next start shouldn't be counted
-    // as one.
-    resetCircuitBreaker();
-    process.exit(0);
-  }
+let shuttingDown: Promise<void> | undefined;
+function shutdown(signal: string, exitCode = 0): Promise<void> {
+  shuttingDown ??= (async () => {
+    log.info('Shutdown signal received', { signal });
+    hostAbortController.abort();
+    try {
+      await runHostCleanup([
+        () => stopGatewayAvailabilityMonitor?.(),
+        stopGatewayApprovalCoordinator,
+        abortGatewaySessionObservers,
+        stopHostModules,
+        // Stamp the durable stop before closing the DB.
+        stopHostInstanceLease,
+        stopDeliveryPolls,
+        stopHostSweep,
+        stopCliServer,
+        teardownChannelAdapters,
+        closeDb,
+      ]);
+      // eslint-disable-next-line no-catch-all/no-catch-all -- every cleanup stage has run; report failure through the exit status
+    } catch (err) {
+      log.error('Host shutdown incomplete', { err });
+      exitCode = 1;
+    }
+    if (exitCode === 0) resetCircuitBreaker();
+    process.exit(exitCode);
+  })();
+  return shuttingDown;
 }
 
 process.on('SIGTERM', () => void shutdown('SIGTERM'));
 process.on('SIGINT', () => void shutdown('SIGINT'));
 
-main().catch((err) => {
+main().catch(async (err) => {
   log.fatal('Startup failed', { err });
-  process.exit(1);
+  await shutdown('startup-failure', 1);
 });

@@ -101,6 +101,7 @@ describe.skipIf(!chromePath)('native reservation through the common purchase exe
       closeJob: async () => {
         await fixture.page.close();
       },
+      withActivity: <T>(operation: () => Promise<T>): Promise<T> => operation(),
       onDisconnected: () => () => undefined,
     });
     await recoverAndStartBrowserQueue(queue);

@@ -20,6 +20,23 @@ export type HostShutdownCallback = () => void | Promise<void>;
 
 const startCallbacks: HostStartCallback[] = [];
 const shutdownCallbacks: HostShutdownCallback[] = [];
+const containerStoppedCallbacks: Array<(sessionId: string) => void | Promise<void>> = [];
+
+export function onContainerStopped(callback: (sessionId: string) => void | Promise<void>): void {
+  containerStoppedCallbacks.push(callback);
+}
+
+/** Called after fenced teardown releases the session's runtime. */
+export async function notifyContainerStopped(sessionId: string): Promise<void> {
+  for (const callback of containerStoppedCallbacks) {
+    try {
+      await callback(sessionId);
+      // eslint-disable-next-line no-catch-all/no-catch-all -- optional cleanup must not prevent session finalization or other modules
+    } catch (err) {
+      log.error('Container cleanup callback threw', { sessionId, err });
+    }
+  }
+}
 
 export function onHostStart(cb: HostStartCallback): void {
   startCallbacks.push(cb);
@@ -49,16 +66,19 @@ export async function startHostModules(ctx: HostStartContext): Promise<void> {
   }
 }
 
-async function runShutdownCallbacks(callbacks: readonly HostShutdownCallback[]): Promise<void> {
+export async function runHostCleanup(callbacks: readonly HostShutdownCallback[]): Promise<void> {
+  const errors: unknown[] = [];
   for (const cb of callbacks) {
     /* eslint-disable no-catch-all/no-catch-all -- graceful shutdown must continue through every registered cleanup */
     try {
       await cb();
     } catch (err) {
+      errors.push(err);
       log.error('Shutdown callback threw', { err });
     }
     /* eslint-enable no-catch-all/no-catch-all */
   }
+  if (errors.length) throw new AggregateError(errors, 'Host cleanup failed');
 }
 
 /**
@@ -66,5 +86,5 @@ async function runShutdownCallbacks(callbacks: readonly HostShutdownCallback[]):
  * cleanup must not prevent later callbacks or host cleanup.
  */
 export async function stopHostModules(): Promise<void> {
-  await runShutdownCallbacks([...shutdownCallbacks].reverse());
+  await runHostCleanup([...shutdownCallbacks].reverse());
 }

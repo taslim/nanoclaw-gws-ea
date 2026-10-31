@@ -1326,6 +1326,7 @@ describe.skipIf(!chromePath)('native authorized signup and password change', { t
         pageForJob: async () => page,
         connection: async () => connection,
         closeJob: async () => page.close(),
+        withActivity: <T>(operation: () => Promise<T>): Promise<T> => operation(),
         onDisconnected: () => () => undefined,
       });
       const waiter = 'waiting-for-current-work';

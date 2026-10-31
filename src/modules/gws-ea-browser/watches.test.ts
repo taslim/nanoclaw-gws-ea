@@ -133,6 +133,7 @@ async function executionContext(name: string) {
       throw new Error('Unexpected browser');
     },
     async closeJob() {},
+    withActivity: <T>(operation: () => Promise<T>): Promise<T> => operation(),
     onDisconnected: () => () => undefined,
   });
 }
@@ -282,6 +283,7 @@ describe('native watch bounds and one booking claim', () => {
         throw new Error('No DOM in authority test');
       },
       async closeJob() {},
+      withActivity: <T>(operation: () => Promise<T>): Promise<T> => operation(),
       onDisconnected: () => () => undefined,
     });
     const authorityStore = new PurchaseAuthorityStore();
