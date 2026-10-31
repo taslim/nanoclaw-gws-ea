@@ -275,8 +275,10 @@ password in its own item.
 
 Main obtains the host's `/logins` link through `logins_page` when a missing login
 is needed or the principal asks. Only the principal's currently confirmed
-addresses can open it. They can add or remove any ordinary Login and change a
-saved password, whichever account owner it has; the page never reveals one.
+addresses can open it. They can add or remove any ordinary Login and edit its
+label, website, username or saved password, whichever account owner it has;
+the page never reveals a password. A blank replacement keeps the current password,
+and an older edit form cannot overwrite newer saved details.
 It refreshes saved logins for the next errand. No membership in the operator's
 1Password account is needed. Missing web or vault setup means the principal
 asks their operator; installed web that cannot serve now means try again later.

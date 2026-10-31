@@ -328,8 +328,12 @@ account; the host adds no account-use restriction by delegating group.
 Main sends the principal their private `https://<assistant-host>/logins` link
 when a login is missing or they ask. Only the principal's currently confirmed
 addresses can open it through Cloudflare Access. They can add or remove logins
-and change saved passwords for either account owner; no saved password is ever
-revealed. The page reads all active ordinary Login items fresh, so a saved
+and edit the account label, website, username or saved password for either account
+owner; no saved password is ever revealed. Logins are grouped by website and can
+be searched by site, label or username. Each login has a details view and an edit
+form; a blank replacement password keeps the current one. An older form cannot
+overwrite newer saved details. Editing this page changes the saved login, not
+the account on the website. The page reads all active ordinary Login items fresh, so a saved
 change is ready for the next errand. The principal need not join the operator's
 1Password account. When web or vault setup is missing, main tells them to ask
 their operator; when installed web is temporarily unavailable, to try again

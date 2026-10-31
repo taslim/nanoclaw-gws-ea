@@ -57,12 +57,43 @@ export interface BrowserVaultLogin {
   readonly websites: readonly Website[];
 }
 
-export interface BrowserVaultListedLogin extends BrowserVaultLogin, BrowserVaultItem {}
+interface LoginMetadata extends BrowserVaultLogin {
+  readonly version: number;
+  readonly title: string;
+}
+export interface BrowserVaultListedLogin extends LoginMetadata {
+  readonly item_handle: string;
+}
+
+export interface BrowserLoginDetails {
+  readonly site: string;
+  readonly username: string;
+  readonly title: string;
+  /** Empty on an edit means keep the saved password. */
+  readonly password: string;
+}
+
+export type BrowserLoginChanges = Pick<BrowserLoginDetails, 'password'> &
+  Partial<Omit<BrowserLoginDetails, 'password'>>;
 
 export class BrowserLoginError extends Error {
-  constructor(readonly reason: 'invalid_site' | 'duplicate_login') {
+  constructor(readonly reason: 'invalid_site' | 'invalid_details' | 'duplicate_login' | 'login_changed') {
     super(reason);
   }
+}
+
+function loginUsername(username: string): void {
+  if (!username.trim() || username.length > 320 || /\p{Cc}/u.test(username))
+    throw new BrowserLoginError('invalid_details');
+}
+function loginTitle(title: string, defaultTitle: string): string {
+  if (title.length > 200 || /\p{Cc}/u.test(title)) throw new BrowserLoginError('invalid_details');
+  return title.trim() || defaultTitle;
+}
+function loginDetails(details: BrowserLoginDetails): { readonly website: URL; readonly title: string } {
+  const website = loginWebsite(details.site);
+  loginUsername(details.username);
+  return { website, title: loginTitle(details.title, website.hostname) };
 }
 
 /** A typed site becomes only its HTTPS hostname; paths and queries are never retained. */
@@ -352,7 +383,7 @@ export class BrowserVault {
   private token: string | undefined;
   private vaultId: string | undefined;
   private handles = new Map<string, ItemOverview>();
-  private usernames = new Map<string, { readonly updatedAt: number; readonly login: BrowserVaultLogin }>();
+  private usernames = new Map<string, { readonly updatedAt: number; readonly login: LoginMetadata }>();
   private loaded = false;
   /** Advances whenever the binding resets, so a listing begun under another binding is never kept. */
   private epoch = 0;
@@ -364,7 +395,7 @@ export class BrowserVault {
   private unavailableUntil = 0;
   private loading: Promise<void> | undefined;
   /** Duplicate checking and a principal's create share one host-only critical section. */
-  private creating: Promise<void> = Promise.resolve();
+  private editing: Promise<void> = Promise.resolve();
 
   constructor(private readonly locators: BrowserVaultLocators = {}) {}
 
@@ -597,7 +628,8 @@ export class BrowserVault {
    */
   async loginForHandle(handle: string, origin: string, assertActive = active): Promise<BrowserVaultLogin> {
     const { client, item: overview } = await this.listed(handle, origin, assertActive);
-    return this.loginMetadata(client, overview, assertActive);
+    const { username, websites } = await this.loginMetadata(client, overview, assertActive);
+    return { username, websites };
   }
 
   /** All ordinary active Logins, including items without an autofill website. */
@@ -607,16 +639,25 @@ export class BrowserVault {
     const logins: BrowserVaultListedLogin[] = [];
     for (const [item_handle, overview] of this.handles) {
       const login = await this.loginMetadata(client, overview, assertActive);
-      logins.push({ ...login, item_handle, title: overview.title.replace(/\p{Cc}/gu, ' ').slice(0, 200) });
+      logins.push({ ...login, item_handle });
     }
     return logins;
+  }
+
+  /** One ordinary Login for the principal's detail or edit page, without reading other items. */
+  async savedLogin(handle: string, assertActive = active): Promise<BrowserVaultListedLogin> {
+    const client = await this.ready(assertActive);
+    if (!this.loaded) await this.load(client, assertActive);
+    const overview = this.handles.get(handle);
+    if (!overview) throw new BrowserVaultError('no_item_for_site');
+    return { ...(await this.loginMetadata(client, overview, assertActive)), item_handle: handle };
   }
 
   private async loginMetadata(
     client: Client,
     overview: ItemOverview,
     assertActive: () => Promise<void>,
-  ): Promise<BrowserVaultLogin> {
+  ): Promise<LoginMetadata> {
     const cached = this.usernames.get(overview.id);
     if (cached?.updatedAt === overview.updatedAt.getTime()) return cached.login;
     const { epoch } = this;
@@ -626,9 +667,11 @@ export class BrowserVault {
       if (epoch === this.epoch) this.clearHold();
       if (item.id !== overview.id || item.vaultId !== overview.vaultId || item.category !== 'Login')
         throw new BrowserVaultError('no_item_for_site');
-      const login: BrowserVaultLogin = {
+      const login: LoginMetadata = {
         username: fieldValue(item, 'username', undefined, false),
         websites: item.websites.map((site) => ({ ...site })),
+        version: item.version,
+        title: item.title,
       };
       // A read racing with an edit can answer this call, but cannot bless the
       // old overview with the new version's metadata.
@@ -640,26 +683,42 @@ export class BrowserVault {
     }
   }
 
-  /** The principal creates an ordinary Login directly, regardless of its username's ownership. */
-  async createLogin(site: string, username: string, password: string): Promise<void> {
-    const website = loginWebsite(site);
-    const previous = this.creating;
+  private async withSerializedLoginWrite(operation: () => Promise<void>): Promise<void> {
+    const previous = this.editing;
     let release = (): void => undefined;
-    this.creating = new Promise<void>((resolve) => {
+    this.editing = new Promise<void>((resolve) => {
       release = resolve;
     });
     await previous;
     try {
-      await this.refresh();
-      const existing = await this.allLogins();
-      if (
-        existing.some(
-          (login) =>
-            login.username === username &&
-            login.websites.some((saved) => onePasswordWebsiteOrigin(saved.url)?.hostname === website.hostname),
-        )
+      await operation();
+    } finally {
+      release();
+    }
+  }
+
+  private async assertDistinctLogin(websites: readonly URL[], username: string, exceptHandle?: string): Promise<void> {
+    const existing = await this.allLogins();
+    if (
+      existing.some(
+        (login) =>
+          login.item_handle !== exceptHandle &&
+          login.username === username &&
+          login.websites.some((saved) =>
+            websites.some((website) => onePasswordWebsiteOrigin(saved.url)?.hostname === website.hostname),
+          ),
       )
-        throw new BrowserLoginError('duplicate_login');
+    )
+      throw new BrowserLoginError('duplicate_login');
+  }
+
+  /** The principal creates an ordinary Login directly, regardless of its username's ownership. */
+  async createLogin(details: BrowserLoginDetails): Promise<void> {
+    const { website, title } = loginDetails(details);
+    if (!details.password) throw new BrowserLoginError('invalid_details');
+    await this.withSerializedLoginWrite(async () => {
+      await this.refresh();
+      await this.assertDistinctLogin([website], details.username);
       const client = await this.ready(active);
       const vaultId = this.vaultId;
       if (!vaultId) throw new BrowserVaultError('vault_unavailable');
@@ -669,10 +728,10 @@ export class BrowserVault {
         await client.items.create({
           category: ItemCategory.Login,
           vaultId,
-          title: website.hostname,
+          title,
           fields: [
-            { id: 'username', title: 'username', fieldType: ItemFieldType.Text, value: username },
-            { id: 'password', title: 'password', fieldType: ItemFieldType.Concealed, value: password },
+            { id: 'username', title: 'username', fieldType: ItemFieldType.Text, value: details.username },
+            { id: 'password', title: 'password', fieldType: ItemFieldType.Concealed, value: details.password },
           ],
           websites: [{ url: website.origin, label: 'website', autofillBehavior: AutofillBehavior.AnywhereOnWebsite }],
         });
@@ -681,9 +740,7 @@ export class BrowserVault {
       } finally {
         this.invalidate();
       }
-    } finally {
-      release();
-    }
+    });
   }
 
   /** A current active Login, read fresh under its listed handle, for the principal's own edit. */
@@ -697,22 +754,59 @@ export class BrowserVault {
     return item;
   }
 
-  /** Fresh whole-item read and optimistic version preserve the principal's other fields. */
-  async setLoginPassword(handle: string, password: string): Promise<void> {
-    const item = await this.editableLogin(handle);
-    const { ItemFieldType } = await sdk();
-    const fields = item.fields.map((field) =>
-      field.id === 'password' && !field.sectionId
-        ? { ...field, fieldType: ItemFieldType.Concealed, value: password }
-        : field,
-    );
-    if (!fields.some((field) => field.id === 'password' && !field.sectionId))
-      fields.push({ id: 'password', title: 'password', fieldType: ItemFieldType.Concealed, value: password });
-    await this.put({ ...item, fields }, active);
+  /** A versioned whole-item edit preserves every field the principal did not change here. */
+  async updateLogin(handle: string, version: number, changes: BrowserLoginChanges): Promise<void> {
+    await this.withSerializedLoginWrite(async () => {
+      const item = await this.editableLogin(handle);
+      if (item.version !== version) throw new BrowserLoginError('login_changed');
+      const { ItemFieldType, AutofillBehavior } = await sdk();
+      const fields = item.fields.map((field) => ({ ...field }));
+      const setField = (id: string, value: string, fieldType: ItemField['fieldType']): void => {
+        const selected = fields.find((field) => field.id === id && !field.sectionId);
+        if (selected) {
+          selected.value = value;
+          selected.fieldType = fieldType;
+        } else fields.push({ id, title: id, value, fieldType });
+      };
+      const previousUsername = fieldValue(item, 'username', undefined, false) ?? '';
+      const username = changes.username ?? previousUsername;
+      const usernameChanged = username !== previousUsername;
+      if (usernameChanged) {
+        loginUsername(username);
+        setField('username', username, ItemFieldType.Text);
+      }
+      const websites = item.websites.map((saved) => ({ ...saved }));
+      const primary = websites.findIndex((saved) => onePasswordWebsiteOrigin(saved.url));
+      const selected = websites[primary];
+      const previousWebsite = selected ? onePasswordWebsiteOrigin(selected.url) : undefined;
+      const websiteChanged = changes.site !== undefined && changes.site !== (previousWebsite?.hostname ?? '');
+      if (websiteChanged && changes.site !== undefined) {
+        const website = loginWebsite(changes.site);
+        const replacement = {
+          url: website.origin,
+          label: selected?.label ?? 'website',
+          autofillBehavior: selected?.autofillBehavior ?? AutofillBehavior.AnywhereOnWebsite,
+        };
+        if (primary === -1) websites.unshift(replacement);
+        else websites[primary] = replacement;
+      }
+      const sites = websites
+        .map((saved) => onePasswordWebsiteOrigin(saved.url))
+        .filter((website): website is URL => Boolean(website));
+      if (usernameChanged || websiteChanged) await this.assertDistinctLogin(sites, username, handle);
+      const title =
+        changes.title === undefined || changes.title === item.title
+          ? item.title
+          : loginTitle(changes.title, sites[0]?.hostname ?? 'Login');
+      if (changes.password) setField('password', changes.password, ItemFieldType.Concealed);
+      if (!usernameChanged && !websiteChanged && title === item.title && !changes.password) return;
+      await this.put({ ...item, title, fields, websites }, active);
+    });
   }
 
-  async removeLogin(handle: string): Promise<void> {
+  async removeLogin(handle: string, version: number): Promise<void> {
     const item = await this.editableLogin(handle);
+    if (item.version !== version) throw new BrowserLoginError('login_changed');
     await this.deleteItem(item.vaultId, item.id);
   }
 

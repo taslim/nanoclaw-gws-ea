@@ -21,8 +21,9 @@ Install the optional `web` connector host-wide through the
 account, Access team and active zone, then provisions a shared Named Cloudflare
 Tunnel and a separate DNS record and Access application for each compatible
 running assistant with a complete profile. The address also serves the
-principal-only `/logins` page for adding and removing saved logins and changing
-saved passwords; it never reveals a password. There is no artifacts connector
+principal-only `/logins` page for browsing logins by site, adding and removing
+them, and editing their labels, websites, usernames or saved passwords; it never
+reveals a password. There is no artifacts connector
 or second activation step.
 
 Before updating an existing web install to this release, run

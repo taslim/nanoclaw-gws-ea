@@ -237,11 +237,9 @@ it('lists every ordinary Login with its owner, escaping text and never rendering
     "connect-src 'self'; frame-ancestors 'none'; base-uri 'none'",
   );
   expect(response.body).toContain('name="viewport"');
-  expect(response.body).toContain('autocomplete="new-password"');
-  expect(response.body).toContain('method="post" action="/logins/add"');
-  expect(response.body).toContain('method="post" action="/logins/update"');
-  expect(response.body).toContain('method="post" action="/logins/remove"');
-  expect(response.body).toContain('does not change it on the website');
+  expect(response.body).toContain('href="/logins/new"');
+  expect(response.body).toContain('data-site-group');
+  expect(response.body).not.toContain('data-login-action="update"');
   expect((await request('/logins', 'HEAD')).body).toBe('');
 });
 
@@ -254,7 +252,7 @@ it.each([
     vi.spyOn(log, level).mockImplementation((message: string, data?: Record<string, unknown>) => {
       output.push(`${message} ${JSON.stringify(data ?? {})}`);
     });
-  const response = await post('/logins/add', { site, username: PRINCIPAL, password: SECRET });
+  const response = await post('/logins/add', { site, title: '', username: PRINCIPAL, password: SECRET });
   expect(response.status).toBe(200);
   expect(response.body).toContain('Login added.');
   expect(response.body).toContain(PRINCIPAL);
@@ -285,7 +283,7 @@ it('rejects unsafe sites, malformed JSON and an over-limit streamed body without
     'localhost',
     'https://com',
   ]) {
-    const response = await post('/logins/add', { site, username: PRINCIPAL, password: SECRET });
+    const response = await post('/logins/add', { site, title: '', username: PRINCIPAL, password: SECRET });
     expect(response.status, site).toBe(400);
     expect(response.body).not.toContain(SECRET);
   }
@@ -305,13 +303,16 @@ it('rejects unsafe sites, malformed JSON and an over-limit streamed body without
 
 it('checks duplicates and creates coherently across concurrent principal submissions', async () => {
   const responses = await Promise.all([
-    post('/logins/add', { site: 'netflix.com', username: PRINCIPAL, password: SECRET }),
-    post('/logins/add', { site: 'https://netflix.com/login', username: PRINCIPAL, password: 'second-password' }),
+    post('/logins/add', { site: 'netflix.com', title: '', username: PRINCIPAL, password: SECRET }),
+    post('/logins/add', {
+      site: 'https://netflix.com/login',
+      title: '',
+      username: PRINCIPAL,
+      password: 'second-password',
+    }),
   ]);
   expect(responses.map((response) => response.status).sort()).toEqual([200, 400]);
-  expect(responses.find((response) => response.status === 400)?.body).toContain(
-    'Update its saved password below instead.',
-  );
+  expect(responses.find((response) => response.status === 400)?.body).toContain('Open that login to update it.');
   expect(fake.items.size).toBe(1);
   expect(fake.calls.filter((call) => call === 'create')).toHaveLength(1);
 });
@@ -341,7 +342,7 @@ it('refreshes from the completed write when a concurrent GET had already capture
   };
   sdk.create.mockResolvedValue(client);
   const allLogins = vi.spyOn(vault, 'allLogins');
-  const write = post('/logins/add', { site: 'netflix.com', username: PRINCIPAL, password: SECRET });
+  const write = post('/logins/add', { site: 'netflix.com', title: '', username: PRINCIPAL, password: SECRET });
   await creating.promise;
   holdNextList = true;
   const read = request();
@@ -358,19 +359,137 @@ it('refreshes from the completed write when a concurrent GET had already capture
 it('lets the principal update a principal-owned saved password, preserves fresh unrelated edits and serves the next fill', async () => {
   const item = login(PRINCIPAL);
   const handle = await handleFor(item);
-  fake.edit(item.id, (saved) => ({ ...saved, title: 'Fresh title', notes: 'Keep my notes', tags: ['personal'] }));
-  const response = await post('/logins/update', { handle, password: 'replacement-password' });
+  fake.edit(item.id, (saved) => ({
+    ...saved,
+    title: 'Fresh title',
+    notes: 'Keep my notes',
+    tags: ['personal'],
+    websites: [
+      { url: 'https://netflix.com:8443/login', label: 'Primary', autofillBehavior: AutofillBehavior.ExactDomain },
+      { url: 'https://help.netflix.com', label: 'Support', autofillBehavior: AutofillBehavior.ExactDomain },
+    ],
+    fields: [
+      ...saved.fields,
+      { id: 'custom', title: 'Custom', fieldType: ItemFieldType.Concealed, value: 'keep-custom-value' },
+    ],
+  }));
+  const response = await post('/logins/update', {
+    handle,
+    version: '2',
+    title: 'Fresh title',
+    site: 'netflix.com',
+    username: PRINCIPAL,
+    password: 'replacement-password',
+  });
   expect(response.status).toBe(200);
-  expect(response.body).toContain('Saved password updated.');
+  expect(response.body).toContain('Login updated.');
   expect(response.body).not.toMatch(/replacement-password|page-only-secret/u);
   expect(fake.items.get(item.id)).toMatchObject({
     title: 'Fresh title',
     notes: 'Keep my notes',
     tags: ['personal'],
     version: 3,
+    websites: [
+      { url: 'https://netflix.com:8443/login', label: 'Primary', autofillBehavior: AutofillBehavior.ExactDomain },
+      { url: 'https://help.netflix.com', label: 'Support', autofillBehavior: AutofillBehavior.ExactDomain },
+    ],
   });
+  expect(fake.value(item.id, 'custom')).toBe('keep-custom-value');
   expect(fake.value(item.id, 'password')).toBe('replacement-password');
-  expect(await vault.resolve(handle, 'password', 'https://netflix.com')).toBe('replacement-password');
+  expect(await vault.resolve(handle, 'password', 'https://netflix.com:8443')).toBe('replacement-password');
+});
+
+it('opens separate list, add, detail and edit views and saves the label, site and username without replacing a blank password', async () => {
+  const item = login(PRINCIPAL);
+  const handle = await handleFor(item);
+  const detail = `/logins/item/${handle}`;
+  expect((await request('/logins/new')).body).toContain('name="title"');
+  expect((await request(detail)).body).toContain(`${detail}/edit`);
+  const edit = await request(`${detail}/edit`);
+  expect(edit.body).toContain('Leave blank to keep the saved password.');
+  expect(edit.body).not.toContain(SECRET);
+  const saved = await post('/logins/update', {
+    handle,
+    version: '1',
+    title: 'Business account',
+    site: 'https://accounts.example.com/login',
+    username: 'business@example.com',
+    password: '',
+  });
+  expect(saved.status).toBe(200);
+  expect(saved.body).toContain('Login updated.');
+  expect(fake.items.get(item.id)).toMatchObject({
+    title: 'Business account',
+    websites: [{ url: 'https://accounts.example.com' }],
+  });
+  expect(fake.value(item.id, 'username')).toBe('business@example.com');
+  expect(fake.value(item.id, 'password')).toBe(SECRET);
+  expect(await vault.itemsForOrigin('https://netflix.com')).toEqual([]);
+  const [choice] = await vault.itemsForOrigin('https://accounts.example.com');
+  expect(choice.title).toBe('Business account');
+  expect(await vault.resolve(choice.item_handle, 'password', 'https://accounts.example.com')).toBe(SECRET);
+});
+
+it('loads add and individual login pages without reading unrelated credentials', async () => {
+  login(PRINCIPAL);
+  login('other@example.com', ['https://linear.app'], 'Other site');
+  const [choice] = await vault.itemsForOrigin('https://netflix.com');
+  expect((await request('/logins/new')).status).toBe(200);
+  expect(fake.calls.filter((call) => call === 'get')).toHaveLength(0);
+  const detail = await request(`/logins/item/${choice.item_handle}`);
+  expect(detail.status).toBe(200);
+  expect(detail.body).toContain(PRINCIPAL);
+  expect(detail.body).not.toContain('other@example.com');
+  expect(fake.calls.filter((call) => call === 'get')).toHaveLength(1);
+});
+
+it('refuses a stale edit form rather than overwriting newer saved details', async () => {
+  const item = login();
+  const handle = await handleFor(item);
+  fake.edit(item.id, (saved) => ({ ...saved, title: 'Newer title' }));
+  const response = await post('/logins/update', {
+    handle,
+    version: '1',
+    title: 'Older title',
+    site: 'netflix.com',
+    username: PRINCIPAL,
+    password: '',
+  });
+  expect(response.status).toBe(409);
+  expect(response.body).toContain('This login changed');
+  expect(fake.items.get(item.id)?.title).toBe('Newer title');
+  expect(fake.calls).not.toContain('put');
+  expect((await post('/logins/remove', { handle, version: '1' })).status).toBe(409);
+  expect(fake.items.has(item.id)).toBe(true);
+});
+
+it('keeps account labels distinct for the assistant and refuses an edit that duplicates another site and username', async () => {
+  await post('/logins/add', { title: 'Personal', site: 'netflix.com', username: PRINCIPAL, password: SECRET });
+  await post('/logins/add', {
+    title: 'Business',
+    site: 'netflix.com',
+    username: 'business@example.com',
+    password: SECRET,
+  });
+  const choices = await vault.itemsForOrigin('https://netflix.com');
+  expect(choices.map((choice) => choice.title).sort()).toEqual(['Business', 'Personal']);
+  const business = choices.find((choice) => choice.title === 'Business')!;
+  const response = await post('/logins/update', {
+    handle: business.item_handle,
+    version: '1',
+    title: 'Overwrite',
+    site: 'netflix.com',
+    username: PRINCIPAL,
+    password: 'replacement',
+  });
+  expect(response.status).toBe(400);
+  expect(response.body).toContain('That site and username already have a login.');
+  expect((await vault.allLogins()).find((choice) => choice.item_handle === business.item_handle)).toMatchObject({
+    title: 'Business',
+    username: 'business@example.com',
+    version: 1,
+  });
+  expect(fake.calls).not.toContain('put');
 });
 
 it('retains only unchanged-version metadata across page refreshes and invalidates a changed login after a write', async () => {
@@ -388,10 +507,17 @@ it('retains only unchanged-version metadata across page refreshes and invalidate
   expect(refreshed.body).not.toContain(PRINCIPAL);
   expect(fake.calls.filter((call) => call === 'get')).toHaveLength(before + 1);
   const listed = await vault.allLogins();
-  expect(Object.keys(listed[0]).sort()).toEqual(['item_handle', 'title', 'username', 'websites']);
+  expect(Object.keys(listed[0]).sort()).toEqual(['item_handle', 'title', 'username', 'version', 'websites']);
   const selected = listed.find((row) => row.title === item.title)!;
   expect(selected.username).toBe(ALIAS);
-  await post('/logins/update', { handle: selected.item_handle, password: 'cache-test-password' });
+  await post('/logins/update', {
+    handle: selected.item_handle,
+    version: '2',
+    title: 'Netflix',
+    site: 'netflix.com',
+    username: ALIAS,
+    password: 'cache-test-password',
+  });
   // One fresh whole-item read for the edit and one fresh metadata read afterwards; the other Login stays cached.
   expect(fake.calls.filter((call) => call === 'get')).toHaveLength(before + 3);
   expect(JSON.stringify(await vault.allLogins())).not.toMatch(/cache-test-password|page-only-secret/u);
@@ -401,7 +527,14 @@ it('leaves an item untouched when an optimistic password save races a fresh edit
   const item = login();
   const handle = await handleFor(item);
   fake.beforePut = () => fake.edit(item.id, (saved) => ({ ...saved, notes: 'Concurrent edit' }));
-  const response = await post('/logins/update', { handle, password: 'replacement-password' });
+  const response = await post('/logins/update', {
+    handle,
+    version: '1',
+    title: 'Netflix',
+    site: 'netflix.com',
+    username: PRINCIPAL,
+    password: 'replacement-password',
+  });
   expect(response.status).toBe(503);
   expect(fake.value(item.id, 'password')).toBe(SECRET);
   expect(fake.items.get(item.id)?.notes).toBe('Concurrent edit');
@@ -416,7 +549,10 @@ it('refuses unlisted and stale handles on password updates and removals without 
     for (const action of ['update', 'remove']) {
       const response = await post(`/logins/${action}`, {
         handle: selected,
-        ...(action === 'update' ? { password: SECRET } : {}),
+        version: '1',
+        ...(action === 'update'
+          ? { title: 'Netflix', site: 'netflix.com', username: PRINCIPAL, password: SECRET }
+          : {}),
       });
       expect(response.status).toBe(503);
       expect(response.body).toContain('That login is no longer available.');
@@ -429,7 +565,7 @@ it('refuses unlisted and stale handles on password updates and removals without 
 it('removes a principal-owned login and invalidates both its display and future fills', async () => {
   const item = login();
   const handle = await handleFor(item);
-  const response = await post('/logins/remove', { handle });
+  const response = await post('/logins/remove', { handle, version: '1' });
   expect(response.status).toBe(200);
   expect(response.body).toContain('Saved login removed. The browser may still be signed in.');
   expect(response.body).not.toContain(PRINCIPAL);
@@ -447,9 +583,19 @@ it('lets the principal update and remove an ordinary Login with no website or bu
     title: 'Login without a website',
   });
   const handle = await handleFor(item);
-  expect((await post('/logins/update', { handle, password: SECRET })).status).toBe(200);
+  expect(
+    (
+      await post('/logins/update', {
+        handle,
+        version: '1',
+        password: SECRET,
+      })
+    ).status,
+  ).toBe(200);
   expect(fake.value(item.id, 'password')).toBe(SECRET);
-  expect((await post('/logins/remove', { handle })).status).toBe(200);
+  expect(fake.value(item.id, 'username')).toBeUndefined();
+  expect(fake.items.get(item.id)?.websites).toEqual([]);
+  expect((await post('/logins/remove', { handle, version: '2' })).status).toBe(200);
   expect(fake.items.has(item.id)).toBe(false);
 });
 
@@ -458,7 +604,7 @@ it('accepts an exact Origin fallback when Sec-Fetch-Site is absent and rejects u
     '/logins/add',
     'POST',
     { origin: `https://${HOST}`, 'content-type': 'application/json' },
-    JSON.stringify({ site: 'netflix.com', username: PRINCIPAL, password: SECRET }),
+    JSON.stringify({ site: 'netflix.com', title: '', username: PRINCIPAL, password: SECRET }),
   );
   expect(response.status).toBe(200);
   for (const [route, method] of [
@@ -487,8 +633,12 @@ it('shows setup, outage and rate-limit outcomes without leaking provider error m
     const response = await post(
       `/logins/${action}`,
       action === 'add'
-        ? { site: 'netflix.com', username: PRINCIPAL, password: SECRET }
-        : { handle: 'vault_unlisted', ...(action === 'update' ? { password: SECRET } : {}) },
+        ? { site: 'netflix.com', title: '', username: PRINCIPAL, password: SECRET }
+        : {
+            handle: 'vault_unlisted',
+            version: '1',
+            ...(action === 'update' ? { title: '', site: 'netflix.com', username: PRINCIPAL, password: SECRET } : {}),
+          },
     );
     expect(response.status).toBe(503);
     expect(response.body).toContain('Try again later.');
@@ -501,7 +651,7 @@ it('preserves a successful save outcome if refreshing the displayed list is rate
   fake.afterCreate = async () => {
     fake.failNext('list', new RateLimitExceededError(SECRET));
   };
-  const response = await post('/logins/add', { site: 'netflix.com', username: PRINCIPAL, password: SECRET });
+  const response = await post('/logins/add', { site: 'netflix.com', title: '', username: PRINCIPAL, password: SECRET });
   expect(response.status).toBe(503);
   expect(response.body).toContain('Login added. The login vault has reached its request limit. Try again later.');
   expect(fake.items.size).toBe(1);
@@ -509,17 +659,29 @@ it('preserves a successful save outcome if refreshing the displayed list is rate
 });
 
 const chromePath = process.env.GWS_EA_BROWSER_TEST_CHROME;
-it.skipIf(!chromePath)(
-  'submits JSON in native Chrome, confirms removal once and fits phone and desktop widths',
-  async () => {
+it.skipIf(!chromePath).each([320, 390, 1200])(
+  'submits JSON in native Chrome at %ipx, protects edits and confirms removal once',
+  async (initialWidth) => {
     const browser = await chromium.launch({ executablePath: chromePath, headless: true });
+    const saveStarted = latch();
+    const allowSave = latch();
+    let holdSave = false;
     try {
-      const context = await browser.newContext({ viewport: { width: 1200, height: 900 } });
+      const context = await browser.newContext({
+        viewport: { width: initialWidth, height: initialWidth < 600 ? 568 : 900 },
+        hasTouch: initialWidth < 600,
+        isMobile: initialWidth < 600,
+      });
       const actions: { path: string; contentType: string | undefined }[] = [];
       await context.route(`https://${HOST}/**`, async (route) => {
         const incoming = route.request();
         const pathname = new URL(incoming.url()).pathname;
         const incomingHeaders = await incoming.allHeaders();
+        if (incoming.method() === 'POST' && pathname === '/logins/update' && holdSave) {
+          holdSave = false;
+          saveStarted.release();
+          await allowSave.promise;
+        }
         if (incoming.method() === 'POST')
           actions.push({ path: pathname, contentType: incomingHeaders['content-type'] });
         const reply = await request(pathname, incoming.method(), incomingHeaders, incoming.postData() ?? undefined);
@@ -530,25 +692,77 @@ it.skipIf(!chromePath)(
         await route.fulfill({ status: reply.status, headers: outgoing, body: reply.body });
       });
       const page = await context.newPage();
+      page.setDefaultTimeout(7000);
+      const assertLayout = async (): Promise<void> => {
+        const layout = await page.evaluate<{ fits: boolean; smallTargets: string[] }>(`({
+          fits: document.documentElement.scrollWidth <= innerWidth,
+          smallTargets: [...document.querySelectorAll('a.button, button, input:not([type=hidden]), a.back-link, [data-login-row]')]
+            .filter(element => { const rect=element.getBoundingClientRect(); return rect.width > 0 && rect.height > 0 && (rect.width < 44 || rect.height < 44); })
+            .map(element => element.textContent || element.getAttribute('name') || element.tagName)
+        })`);
+        expect(layout.fits).toBe(true);
+        expect(layout.smallTargets).toEqual([]);
+      };
       await page.goto(`https://${HOST}/logins`);
+      await page.evaluate('document.fonts.ready');
+      expect(
+        await page.evaluate<boolean>(
+          "[...document.fonts].some(font => font.family === 'Geist' && font.status === 'loaded')",
+        ),
+      ).toBe(true);
+      await page.getByRole('link', { name: 'Add login', exact: true }).click();
+      await page.getByRole('textbox', { name: 'Account label', exact: true }).fill('Personal');
       await page.getByLabel('Website', { exact: true }).fill('netflix.com');
       await page.getByLabel('Username', { exact: true }).fill(PRINCIPAL);
       await page.getByLabel('Password', { exact: true }).fill(SECRET);
+      await assertLayout();
+      expect(await page.evaluate<boolean>('document.activeElement.getBoundingClientRect().bottom <= innerHeight')).toBe(
+        true,
+      );
       await page.getByRole('button', { name: 'Add login', exact: true }).click();
       await page.getByText('Login added.', { exact: true }).waitFor();
       expect(fake.items.size).toBe(1);
       expect(actions).toEqual([{ path: '/logins/add', contentType: 'application/json' }]);
-      expect(await page.getByLabel('Password', { exact: true }).inputValue()).toBe('');
+      expect(await page.locator('input[type=password]').count()).toBe(0);
+      await page.getByRole('searchbox', { name: 'Search logins' }).fill('missing site');
+      expect(await page.getByText('No matching logins', { exact: true }).isVisible()).toBe(true);
+      await page.getByRole('searchbox', { name: 'Search logins' }).fill('personal');
+      expect(await page.locator('[data-login-row]:visible').count()).toBe(1);
+      await page.locator('[data-login-row]').click();
+      await page.getByRole('link', { name: 'Edit details', exact: true }).click();
+      await page.getByRole('textbox', { name: 'Account label', exact: true }).fill('Unsaved change');
+      page.once('dialog', async (confirmation) => {
+        expect(confirmation.type()).toBe('beforeunload');
+        await confirmation.dismiss();
+      });
+      await page.getByRole('link', { name: 'Cancel', exact: true }).click();
+      expect(await page.getByRole('textbox', { name: 'Account label', exact: true }).inputValue()).toBe(
+        'Unsaved change',
+      );
+      await page.getByRole('textbox', { name: 'Account label', exact: true }).fill('Personal');
       expect(await page.evaluate<boolean>('document.documentElement.scrollWidth <= window.innerWidth')).toBe(true);
-      await page.screenshot({ path: '/tmp/u4-logins-desktop.png', fullPage: true });
-      await page.setViewportSize({ width: 390, height: 844 });
+      await page.locator('body').screenshot({ path: '/tmp/professional-logins-edit.png', animations: 'disabled' });
+      await page.setViewportSize({ width: Math.min(initialWidth, 390), height: 568 });
       await page.emulateMedia({ colorScheme: 'dark' });
       expect(await page.evaluate<boolean>('document.documentElement.scrollWidth <= window.innerWidth')).toBe(true);
-      await page.screenshot({ path: '/tmp/u4-logins-mobile.png', fullPage: true });
-      await page.getByText('Update saved password', { exact: true }).click();
+      await page.locator('body').screenshot({
+        path: '/tmp/professional-logins-edit-mobile.png',
+        animations: 'disabled',
+      });
+      await assertLayout();
       await page.getByLabel('New saved password', { exact: true }).fill('browser-replacement-password');
-      await page.getByRole('button', { name: 'Save password', exact: true }).click();
-      await page.getByText('Saved password updated.', { exact: true }).waitFor();
+      holdSave = true;
+      await page.getByRole('button', { name: 'Save changes', exact: true }).click();
+      await saveStarted.promise;
+      const savingPath = new URL(page.url()).pathname;
+      await page.getByRole('link', { name: 'Cancel', exact: true }).click({ force: true });
+      expect(new URL(page.url()).pathname).toBe(savingPath);
+      allowSave.release();
+      await page.getByText('Login updated.', { exact: true }).waitFor();
+      await page.locator('body').screenshot({
+        path: '/tmp/professional-logins-detail-mobile.png',
+        animations: 'disabled',
+      });
       const [item] = [...fake.items.values()];
       expect(fake.value(item.id, 'password')).toBe('browser-replacement-password');
       expect(actions[1]).toEqual({ path: '/logins/update', contentType: 'application/json' });
@@ -557,6 +771,7 @@ it.skipIf(!chromePath)(
       await page.getByRole('button', { name: 'Remove login', exact: true }).first().click();
       const dialog = page.getByRole('dialog');
       expect(await dialog.isVisible()).toBe(true);
+      await assertLayout();
       expect(await dialog.textContent()).toContain(`netflix.com (${PRINCIPAL})`);
       expect(await dialog.textContent()).toContain('The browser may still be signed in');
       expect(actions).toHaveLength(2);
@@ -577,8 +792,104 @@ it.skipIf(!chromePath)(
         local: 0,
         session: 0,
       });
+      login(PRINCIPAL, ['https://netflix.com'], 'Personal');
+      login(ALIAS, ['https://netflix.com'], 'Family');
+      login(ALIAS, ['https://linear.app'], 'Team workspace');
+      login(PRINCIPAL, ['https://notion.so'], 'Personal workspace');
+      login(PRINCIPAL, ['https://airbnb.com'], 'Travel');
+      await page.goto(`https://${HOST}/logins`);
+      expect(await page.locator('[data-site-group]').count()).toBe(4);
+      expect(await page.locator('[data-login-row]').count()).toBe(5);
+      await page.emulateMedia({ colorScheme: 'light' });
+      await page.setViewportSize({ width: 1200, height: 900 });
+      await page.locator('body').screenshot({ path: '/tmp/professional-logins-desktop.png', animations: 'disabled' });
+      for (const width of [320, 360, 375, 390, 414, 768, 1200]) {
+        await page.setViewportSize({ width, height: 844 });
+        expect(await page.evaluate<boolean>('document.documentElement.scrollWidth <= window.innerWidth')).toBe(true);
+      }
+      await page.setViewportSize({ width: 390, height: 844 });
+      await page.locator('body').screenshot({ path: '/tmp/professional-logins-mobile.png', animations: 'disabled' });
+      await page.emulateMedia({ colorScheme: 'dark' });
+      await page.locator('body').screenshot({ path: '/tmp/professional-logins-dark.png', animations: 'disabled' });
+      await page.locator('[data-login-row]').first().click();
+      await page.emulateMedia({ colorScheme: 'light' });
+      await page.setViewportSize({ width: 1200, height: 900 });
+      await page.locator('body').screenshot({ path: '/tmp/professional-logins-detail.png', animations: 'disabled' });
+      await page.getByRole('link', { name: 'All logins', exact: true }).click();
+      await page.getByRole('link', { name: 'Add login', exact: true }).click();
+      await page.locator('body').screenshot({ path: '/tmp/professional-logins-add.png', animations: 'disabled' });
+      const longLabel = 'Family\nTeam ' + 'A'.repeat(220);
+      const longUsername = 'long-account-name.'.repeat(8) + '@example.com';
+      const imported = login(longUsername, ['https://accounts.long-subdomain.example.com'], longLabel);
+      await page.goto(`https://${HOST}/logins`);
+      await page.setViewportSize({ width: 320, height: 568 });
+      await assertLayout();
+      const longRow = page.locator('[data-login-row]').filter({ hasText: longUsername });
+      expect((await longRow.boundingBox())!.height).toBeLessThanOrEqual(160);
+      await longRow.click();
+      await assertLayout();
+      expect((await page.getByRole('heading', { level: 1 }).boundingBox())!.height).toBeLessThanOrEqual(480);
+      await page
+        .locator('body')
+        .screenshot({ path: '/tmp/professional-logins-small-detail.png', animations: 'disabled' });
+      await page.getByRole('link', { name: 'Edit details', exact: true }).click();
+      await assertLayout();
+      await page.getByLabel('New saved password', { exact: true }).focus();
+      expect(await page.evaluate<boolean>('document.activeElement.getBoundingClientRect().bottom <= innerHeight')).toBe(
+        true,
+      );
+      await page
+        .locator('body')
+        .screenshot({ path: '/tmp/professional-logins-small-edit.png', animations: 'disabled' });
+      await page.getByLabel('New saved password', { exact: true }).fill('imported-login-replacement');
+      await page.getByRole('button', { name: 'Save changes', exact: true }).click();
+      await page.getByText('Login updated.', { exact: true }).waitFor();
+      expect(fake.items.get(imported.id)?.title).toBe(longLabel);
+      expect(fake.value(imported.id, 'password')).toBe('imported-login-replacement');
+      expect((await vault.itemsForOrigin('https://accounts.long-subdomain.example.com'))[0].title).toBe(
+        longLabel.replace(/\p{Cc}/gu, ' ').slice(0, 200),
+      );
+      await page.getByRole('button', { name: 'Remove login', exact: true }).click();
+      await assertLayout();
+      await page.screenshot({ path: '/tmp/professional-logins-small-dialog.png', animations: 'disabled' });
+      await page.setViewportSize({ width: 568, height: 320 });
+      const dialogBounds = await page.getByRole('dialog').boundingBox();
+      expect(dialogBounds).not.toBeNull();
+      expect(dialogBounds!.y).toBeGreaterThanOrEqual(0);
+      expect(dialogBounds!.y + dialogBounds!.height).toBeLessThanOrEqual(320);
+      await dialog.getByRole('button', { name: 'Cancel', exact: true }).click();
+      if (initialWidth === 320) {
+        await page.setViewportSize({ width: 320, height: 568 });
+        await page.getByRole('link', { name: 'Edit details', exact: true }).click();
+        fake.edit(imported.id, (saved) => ({ ...saved, notes: 'Concurrent edit' }));
+        await page.getByLabel('New saved password', { exact: true }).fill('stale-replacement');
+        await page.getByRole('button', { name: 'Save changes', exact: true }).click();
+        await page.getByText(/This login changed since you opened it/u).waitFor();
+        expect(await page.getByLabel('New saved password', { exact: true }).inputValue()).toBe('');
+        expect(await page.getByRole('button', { name: 'Save changes', exact: true }).isEnabled()).toBe(true);
+        await page.reload();
+        fake.failNext('put', new Error(SECRET), true);
+        await page.getByLabel('New saved password', { exact: true }).fill('saved-but-response-lost');
+        await page.getByRole('button', { name: 'Save changes', exact: true }).click();
+        await page.getByRole('link', { name: 'Reload page', exact: true }).waitFor();
+        expect(await page.getByRole('button', { name: 'Save changes', exact: true }).isDisabled()).toBe(true);
+        expect(await page.getByLabel('New saved password', { exact: true }).inputValue()).toBe('');
+        expect(fake.value(imported.id, 'password')).toBe('saved-but-response-lost');
+        await page.reload();
+        fake.beforePut = () => fake.failNext('get', new RateLimitExceededError(SECRET));
+        await page.getByLabel('New saved password', { exact: true }).fill('saved-before-refresh-limit');
+        await page.getByRole('button', { name: 'Save changes', exact: true }).click();
+        await page.getByRole('heading', { name: 'Logins unavailable', exact: true }).waitFor();
+        expect(await page.locator('#outcome').textContent()).toContain('Login updated.');
+        expect(await page.getByRole('button', { name: 'Save changes', exact: true }).count()).toBe(0);
+        expect(fake.value(imported.id, 'password')).toBe('saved-before-refresh-limit');
+        expect(await page.content()).not.toMatch(
+          /saved-but-response-lost|saved-before-refresh-limit|page-only-secret/u,
+        );
+      }
       await context.close();
     } finally {
+      allowSave.release();
       await browser.close();
     }
   },
