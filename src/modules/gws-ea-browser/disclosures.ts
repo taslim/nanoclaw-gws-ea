@@ -20,7 +20,7 @@
  * parameters, or written another way, is found. A stored value on a site the errand has no disclosure for, or
  * one of the principal's addresses on any site, stops the batch with `personal_data` before anything is typed
  * or opened. The principal's addresses reach a site only through the host's own sign-in to their own account
- * from their login in 1Password (`fill_secret`), which no batch carries.
+ * from their saved login (`fill_secret`), which no batch carries.
  */
 import path from 'node:path';
 

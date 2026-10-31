@@ -169,15 +169,7 @@ it('records signup or password-change authority through the native host request,
     { status: 'not_owned' },
   );
   expect(request).toEqual({ action: 'credential_authority', requestId: id, ...fields });
-  for (const outcome of [
-    'recorded',
-    'authority',
-    'not_owned',
-    'busy',
-    'vault_not_set_up',
-    'vault_unavailable',
-    'rate_limited',
-  ])
+  for (const outcome of ['recorded', 'authority', 'not_owned', 'busy', 'vault_unavailable'])
     expect(credentialAuthority.tool.description).toContain(outcome);
 });
 
@@ -370,7 +362,7 @@ it('keeps shared browser judgment brief and moves outcome meanings to the tools 
   for (const judgment of [
     'signed-in',
     'brief',
-    'shared signed-in profile and vault',
+    'shared signed-in profile',
     '`record_disclosure`',
     'principal approvals',
     'never mind',
@@ -415,9 +407,7 @@ it('explains credential outcomes where the job calls the tool', () => {
     ['inconclusive', 'could not establish'],
     ['ambiguous', 'could not identify'],
     ['not_owned', 'not the assistant’s account'],
-    ['vault_not_set_up', 'ask their operator'],
-    ['vault_unavailable', 'cannot be used right now'],
-    ['rate_limited', 'daily request limit'],
+    ['vault_unavailable', 'ask their operator'],
   ]) {
     expect(description).toContain(code);
     expect(description).toContain(meaning);

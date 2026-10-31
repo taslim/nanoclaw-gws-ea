@@ -81,7 +81,7 @@ For ad-hoc central queries from skills or scripts, use the in-tree wrapper rathe
 | `src/modules/gws-ea-matters/{sync,morning,loop,ledger}.ts` | Principal-local evening close, captured day-ledger coverage, durable completion/reporting, held morning gate and timed looks |
 | `container/agent-runner/src/planning-agents.ts` + `week-view/` | Native planning-worker attribution and permissions; main-only week/Manual context hooks and moment-local clock reads |
 | `src/modules/gws-ea-browser/` | Built-in host Playwright runtime, owned loopback Chrome CDP connection, public-only proxy, job queue, sign-in, the open-rule classifier, consent engine, reviewed and generic purchase readers, purchase authority, recipes and wake-on-change watches |
-| `src/gws-ea/onepassword*.ts` + `src/modules/gws-ea-browser/{onepassword*,credential-*,logins-*}.ts` | 1Password: operator provisioning and resumable uninstall/removal cleanup; the sanitized `op` CLI boundary and host vault client; durable credential attempts for signups and owned password changes; the principal-only saved-logins page and its host link tool |
+| `src/modules/gws-ea-browser/{login-key,login-store,credential-*,logins-*}.ts` | Built-in encrypted saved logins and per-assistant macOS Keychain keys; durable signup and password-change attempts; the principal-only saved-logins page and its host link tool |
 | `src/command-gate.ts` | Router-side admin command gate — queries `user_roles` directly (no env var, no container-side check) |
 | `src/modules/permissions/user-dm.ts` | Cold-DM resolution + `user_dms` cache |
 | `src/group-init.ts` | Per-agent-group filesystem scaffold (CLAUDE.md, skills) — agent-runner source is a shared read-only mount, not copied per group |
@@ -220,8 +220,7 @@ resume an approved row at host start; they must make re-entry idempotent.
 ### Operator connectors
 
 A connector is optional functionality where gws-ea manages setup beyond its base
-install: shared voice assets, assistant 1Password vaults, or Cloudflare web
-serving. The typed catalog in `src/gws-ea/connectors.ts` supplies `install`,
+install: shared voice assets or Cloudflare web serving. The typed catalog in `src/gws-ea/connectors.ts` supplies `install`,
 `uninstall`, `show` and `check` for each. Installation/configuration is host-wide;
 voice assets are shared and account resources are per assistant. Access remains
 in native agent capability grants and principal/reader permissions. Local
@@ -243,63 +242,61 @@ until connector uninstall, which closes all policies before remote cleanup.
 
 The built-in GWS-EA host browser has a separate sign-in boundary from API
 credential injection: its Chrome traffic uses a per-assistant public-only proxy,
-never the credential gateway. It signs in with logins from the assistant's own
-1Password vault and with emailed codes and magic links, including a code the
-principal relays through main; the existing isolated external-email agent
-interprets assistant-mail codes and links in a per-claim system session. The
-host alone reads, generates, saves and fills credentials into a validated HTTPS
-frame; agents see opaque item handles and outcomes only.
+never the credential gateway. It signs in with saved logins and with emailed
+codes and magic links, including a code the principal relays through main; the
+existing isolated external-email agent interprets assistant-mail codes and links
+in a per-claim system session. The host alone reads, generates, saves and fills
+credentials into a validated HTTPS frame; agents see opaque handles and outcomes
+only.
 
-The operator provisions 1Password host-wide (see
-[docs/gws-ea-cli.md](docs/gws-ea-cli.md)). In
-`gws-ea connectors install onepassword`, their desktop sign-in mints a host
-management service account that may only create vaults, and the host records
-the account's ID with its sign-in address as the app lists it. It creates one vault
-for each compatible assistant; create, update, start and restart reconcile pending
-setup through the same provisioning step. Existing vaults and credentials stay.
-When desktop approval is needed, an operator terminal is required; otherwise
-setup remains pending without calling `op`. The operator
-mints that assistant's runtime service account with read/write access to only
-its vault. A signup or password change saves the generated password in the
-vault before any site sees it. The
-[operator guide](docs/gws-ea-cli.md#1password-vaults) defines account ownership
-and password-change authority. Sign-in email, phone, two-factor and
-payment-method changes remain refused. A confirmed password change writes into
-the original login, read fresh and checked against the username rule, on the
-version just read (a racing edit is retried, bounded), then deletes the
-candidate. A login changed or removed meanwhile is left as edited, with the new
-password in its own item.
+Each assistant keeps its built-in store at `browser/logins.db` under its instance
+root, outside NanoClaw update snapshots and container mounts. Only passwords are
+encrypted, with AES-256-GCM under a random per-assistant macOS Keychain key;
+site, username and title stay readable in the owner-only file (0600, directory
+0700). Plaintext exists in host memory while passwords are generated, saved or
+filled. Any process running as the same macOS user can read the key with
+`/usr/bin/security`: encryption protects copies of the store file, not access
+by that user. NanoClaw provides no backup or export and stores no one-time codes.
+Updates and rollbacks preserve this file; releases that predate the built-in
+store cannot read it.
+
+A signup or password change durably saves the generated password before any site
+sees it. The [operator guide](docs/gws-ea-cli.md#saved-logins) defines account
+ownership and password-change authority. Sign-in email, phone, two-factor and
+payment-method changes remain refused. Confirming a change replaces the saved
+password and erases the old one from the store's contents, without erasing
+filesystem remnants in freed blocks. Releasing an unsettled attempt discards
+its generated password and preserves the previous login; if the site took it,
+the assistant can reset it through its own email.
 
 Main obtains the host's `/logins` link through `logins_page` when a missing login
 is needed or the principal asks. Only the principal's currently confirmed
-addresses can open it. They can add or remove any ordinary Login and edit its
-label, website, username or saved password, whichever account owner it has;
-the page never reveals a password. A blank replacement keeps the current password,
-and an older edit form cannot overwrite newer saved details.
-It refreshes saved logins for the next errand. No membership in the operator's
-1Password account is needed. Missing web or vault setup means the principal
-asks their operator; installed web that cannot serve now means try again later.
+addresses can open it. They can add or remove logins and edit the label, website,
+username or saved password, whichever account owner it has; the page never
+reveals a password. A blank replacement keeps the current password, and an older
+edit form cannot overwrite newer saved details. An unsent password change gives
+way to a page edit or removal; once its password may have reached the site,
+the page answers `login_busy` until the attempt settles or is released. A saved
+change is ready for the next errand. Missing web setup means the principal asks
+their operator; installed web that cannot serve now means try again later.
 The persistent browser keeps every sign-in, the principal's included.
+
+The key is read fresh at each use and never cached or automatically replaced
+while saved or pending passwords remain. Missing, different or unavailable keys
+answer `vault_unavailable`: ask the operator. Listing, removing and settling or
+releasing attempts remain available. The running host reports login-store
+availability in its health; `gws-ea status --details` shows the reason and operator
+action without reading the Keychain itself. A stopped assistant reports not
+checked. The principal can remove unreadable logins and add them again once no
+saved or pending passwords remain, allowing a new key to be created. Assistant
+removal deletes the key after stopping the host; an unreachable key is reported
+as left behind without failing removal.
 
 Before updating an existing web install, follow the
 [web reinstall instructions](docs/gws-ea-cli.md#assistant-web).
 
-`connectors uninstall onepassword` previews every vault and active credential
-attempt, then requires terminal confirmation or `--delete-vaults`. It stops all
-vault use before deleting verified owned vaults and local tokens, with the
-management token last. An interrupted cleanup resumes from the host receipt;
-unproven creations and every service-account ID remain for manual cleanup on
-1Password.com. `--abandon` closes that receipt after its operator actions.
-Per-assistant removal keeps its own `--delete-vault` choice and
-`--abandon onepassword` receipt. Nothing revokes service accounts automatically.
-Every service account in the 1Password account shares one daily request limit;
-`connectors check onepassword` reports its usage, and an exhausted limit returns
-`rate_limited` without retries. Tokens are owner-only host files (the management
-token under the
-control plane's config root, each runtime token in instance secrets), outside
-snapshots and container mounts. Profile and staging data live under
-`<instance root>/browser/`, outside routine snapshot roots. There is no
-Keychain credential store or takeover portal. Host Playwright attaches to the
+Profile and staging data live under `<instance root>/browser/`, outside routine
+snapshot roots. There is no takeover portal. Host Playwright attaches to the
 Chrome child it launched on an explicit nonzero `127.0.0.1` debugging port, after
 verifying the listener belongs to that live child. The endpoint and browser ID
 stay host-private; host health exposes only its integer port. Trusted host

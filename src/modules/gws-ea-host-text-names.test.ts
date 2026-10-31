@@ -179,8 +179,9 @@ interface HostText {
 /** A reader tag: `/** to: main *\/`, or a JSDoc block whose last line is `to: main`. */
 const TAG = /(?:^\/\*\*|\n\s*\*) to: ([a-z-]+(?:, [a-z-]+)*)(?: |\n\s*)\*\/$/u;
 const SQL = /\b(?:SELECT|INSERT|UPDATE|DELETE|CREATE|ALTER|DROP|PRAGMA|WHERE)\b/u;
-/** A column list, `id, title, created_at`: identifiers only. */
-const COLUMNS = /^\s*[a-z_]+(?:\s*,\s*[a-z_]+)*\s*$/u;
+/** SQL fragments are not sent to agents, including column aliases and pragma assignments. */
+const COLUMNS = /^\s*[a-z_]+(?:\s+AS\s+[A-Za-z]+)?(?:\s*,\s*[a-z_]+(?:\s+AS\s+[A-Za-z]+)?)*\s*$/u;
+const PRAGMA = /^[a-z_]+ = (?:[A-Z]+|\d+)$/u;
 
 function literalText(node: ts.Node): string | undefined {
   if (ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node)) return node.text;
@@ -191,7 +192,7 @@ function literalText(node: ts.Node): string | undefined {
 }
 
 function isProse(text: string): boolean {
-  return text.includes(' ') && /[A-Za-z]/u.test(text) && !SQL.test(text) && !COLUMNS.test(text);
+  return text.includes(' ') && /[A-Za-z]/u.test(text) && !SQL.test(text) && !COLUMNS.test(text) && !PRAGMA.test(text);
 }
 
 /** The prose literals of one source, operator logs left out. */
@@ -673,6 +674,15 @@ describe('the host-text names check', () => {
     expect(problems('gws-ea-fixture/mixed.ts', capability)).toEqual([]);
     expect(problems('gws-ea-fixture/mixed.ts', capability.replace('free_time', 'free_slots'))).toEqual([
       'gws-ea-fixture/mixed.ts:1 free_slots: no tool, tool field or operational code',
+    ]);
+  });
+
+  it('skips SQL aliases and pragma assignments while still checking the same words in prose', () => {
+    const source = `const COLUMNS = 'id, created_at AS createdAt, updated_at AS updatedAt';
+      db.pragma('secure_delete = ON');`;
+    expect(problems('gws-ea-fixture/mixed.ts', source)).toEqual([]);
+    expect(problems('gws-ea-fixture/mixed.ts', "const NOTE = 'Read secure_delete before continuing.';")).toEqual([
+      'gws-ea-fixture/mixed.ts:1 secure_delete: no tool, tool field or operational code',
     ]);
   });
 

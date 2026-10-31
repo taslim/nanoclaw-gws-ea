@@ -915,7 +915,7 @@ describe("a signup's account email", () => {
     await recordWebAlias('onuj@corp.example');
     await expect(
       ask({ operation: 'signup', site: ORIGIN, username: 'Morgan+shop@principal.example' }),
-    ).rejects.toMatchObject({ code: 'forbidden', message: expect.stringMatching(/1Password/u) });
+    ).rejects.toMatchObject({ code: 'forbidden', message: expect.stringMatching(/saved logins/u) });
     expect(await recordedAttempts()).toEqual([]);
   });
 });

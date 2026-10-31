@@ -124,8 +124,6 @@ const NOT_CODES = new Set([
   'image_index',
   // The observation’s report of what the host did about a cookie banner.
   'cookie_banner',
-  // credential_form’s vault state beside its status.
-  'left_as_edited',
 ]);
 /** Codes the host records that no browser tool names: the agent never meets them, or reads them for themselves. */
 const UNNAMED_CODES = new Set([
@@ -289,8 +287,6 @@ describe('the browser tools', () => {
       'continued',
       'account_created',
       'password_changed',
-      'left_as_edited',
-      'pending',
       'account_exists',
       'password_rejected',
       'current_password_rejected',
@@ -323,6 +319,14 @@ describe('the browser tools', () => {
     expect(requestConsent.tool.description).toContain(
       'If credentials already reached the page, reconcile that attempt before trying again',
     );
+  });
+
+  it('offers saved username and password fills while email codes keep their own tool', () => {
+    const validate = new Ajv().compile(fillSecret.tool.inputSchema);
+    const fields = { item_handle: 'login-1', target, submit: { ref: 'e2', generation: 1 } };
+    for (const field of ['username', 'password']) expect(validate({ ...fields, field })).toBe(true);
+    expect(validate({ ...fields, field: 'otp' })).toBe(false);
+    expect(signInCode.tool.inputSchema.properties).toHaveProperty('from');
   });
 
   it('takes a watch’s maximum as its only financial bound, and names a fee above it', () => {

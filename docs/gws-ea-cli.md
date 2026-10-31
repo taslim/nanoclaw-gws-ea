@@ -13,8 +13,8 @@ remain errors even with `--help`.
 ## Connectors and scopes
 
 A connector provides optional functionality that gws-ea sets up outside the
-base install: downloaded programs or models, or provisioned accounts, vaults
-and services. The catalog contains `voice`, `onepassword` and `web`.
+base install: downloaded programs or models, or provisioned accounts
+and services. The catalog contains `voice` and `web`.
 Each has four commands:
 
 ```sh
@@ -26,7 +26,7 @@ gws-ea connectors check <name> [--id <instance_id>]
 ```
 
 Installation and configuration belong to the operator host. Voice shares
-immutable programs and models; 1Password and web keep separate resources
+immutable programs and models; web keeps separate resources
 for each assistant in the operator's selected account. Access remains a
 separate decision: agent permissions, the principal's confirmed addresses, and
 artifact reader grants retain their own boundaries. Installing a connector
@@ -47,8 +47,7 @@ eligible assistants. Existing resources are retained. A missing prerequisite
 or operator approval becomes pending with the next action; optional setup never
 fails a committed update. Rollback does not provision connectors.
 
-See [voice](gws-ea-voice.md), [1Password vaults](#1password-vaults), and
-[HTML artifacts](gws-ea-artifacts.md) for their lifecycle details. The
+See [voice](gws-ea-voice.md) and [HTML artifacts](gws-ea-artifacts.md) for their lifecycle details. The
 [built-in browser](#browser-access) detects Chrome; the [web alias](#web-alias)
 is optional assistant identity.
 
@@ -275,93 +274,6 @@ incomplete cleanup remain visible, including under `--quiet`. `gws-ea cleanup`
 repeats that authoring-checkout cleanup. Managed assistant state remains governed
 by its own lifecycle and ownership rules.
 
-## 1Password vaults
-
-```sh
-gws-ea connectors install onepassword
-gws-ea connectors check onepassword
-gws-ea connectors uninstall onepassword --delete-vaults
-# After completing the receipt's manual revocation actions:
-gws-ea connectors uninstall onepassword --abandon
-```
-
-Install needs the 1Password CLI (`op`) 2.29 or later in an operator-owned location
-on this host's PATH (for example `brew install 1password-cli`), and the 1Password
-desktop app signed in to the account assistants use, with Settings > Developer >
-Integrate with 1Password CLI turned on. The operator must be an owner or
-administrator allowed to create service accounts. The first run selects the
-account (`--account <account_id>`, or a terminal choice), records its ID and
-sign-in address, and may ask for desktop approval. It creates a host management
-service account that may only create vaults, then one vault and one read/write
-runtime service account for each compatible assistant. Browser use does not
-start as part of installation.
-
-Create and resume provision new assistants; update provisions newly compatible
-ones, and start and restart retry pending setup. Existing vaults and credentials
-are never replaced. When desktop approval is needed without an operator
-terminal, no sign-in is attempted: setup stays pending. Create pauses for an
-actionable operator prerequisite with `resume`; a committed update remains
-ready and names `connectors install onepassword` as its next action. A partial
-install retains finished assistants, and rerunning continues the rest. For an
-unknown creation outcome, follow the reported cleanup on 1Password.com, then
-use `--discard-unproven <instance_id|management>` to acknowledge that exact
-attempt.
-
-`show` reads local records only. `check` spends service-account requests on
-identities, one vault read per assistant, and the account's usage. It never
-writes, so a recorded write grant is not a tested write. Every service account
-in the 1Password account, including another host's, shares one daily request
-limit set by the account's plan. `check` reports the account type, that limit,
-its usage and the assistants sharing it. A spent limit returns a rate-limited
-outcome, and nothing retries it automatically; a larger plan is the operator's
-choice.
-
-The assistant saves generated passwords there before submitting a signup or
-password change. An account belongs to the assistant when its username is any
-spelling of its web alias, or a non-email username from a completed signup on
-that site. Who added or edited the login does not decide ownership. Other logins
-belong to the principal. The assistant changes only its own accounts' passwords;
-the principal changes their own password on the site, then updates the saved
-login.
-
-A confirmed change replaces the password in the freshly checked login and
-deletes the separate candidate. If someone edits or removes that login during
-the change, the host leaves it as edited and keeps the new password in its own
-item. The persistent browser profile keeps every sign-in, including the
-principal's accounts.
-
-Main sends the principal their private `https://<assistant-host>/logins` link
-when a login is missing or they ask. Cloudflare Access admits the principal and
-invited artifact readers; the host permits `/logins` only for the principal's
-currently confirmed addresses. They can add or remove logins
-and edit the account label, website, username or saved password for either account
-owner; no saved password is ever revealed. Logins are grouped by website and can
-be searched by site, label or username. Each login has a details view and an edit
-form; a blank replacement password keeps the current one. An older form cannot
-overwrite newer saved details. Editing this page changes the saved login, not
-the account on the website. The page reads all active ordinary Login items fresh, so a saved
-change is ready for the next errand. The principal need not join the operator's
-1Password account. When web or vault setup is missing, main tells them to ask
-their operator; when installed web is temporarily unavailable, to try again
-later. Passwords are entered on the page, never sent through chat.
-
-Uninstall previews every recorded vault, its observed item count and active
-credential attempts. It requires a terminal confirmation or `--delete-vaults`;
-without either it pauses and changes nothing. It stops all vault use first,
-deletes only vaults proven to have been created by this host's management
-account, then removes local tokens and resource records, with the management
-account's local token last. Every owned vault's contents are included in the
-confirmation. A rate limit or interruption leaves a resumable host receipt;
-rerun uninstall to continue. Install refuses while resource cleanup is incomplete.
-
-Gws-ea cannot revoke a service account. The receipt retains every recorded ID,
-including retired accounts, and unproven creations for manual cleanup on
-1Password.com. `show` reports it until you finish those actions and close it
-with `connectors uninstall onepassword --abandon`. A receipt containing only
-manual revocations does not block a new install. Per-assistant `remove` keeps
-its separate preview and `--delete-vault` choice; its receipt is closed with
-`gws-ea remove --id <full-id> --yes --abandon onepassword`.
-
 ## Web alias
 
 ```sh
@@ -413,7 +325,7 @@ external-chat groups never do. Other groups, including active job agents, need
 `browser-delegate` explicitly selected in their stored agent capabilities;
 `all` does not grant it. Use the existing capability permission and approval
 flow. A permitted group shares the assistant's signed-in browser profile and
-vault logins; purchase, consent and watch approvals still go to the principal,
+saved logins; purchase, consent and watch approvals still go to the principal,
 and its errands, cards and notices stay its own. Revoking its permission
 cancels its errands.
 
@@ -421,6 +333,70 @@ Updating an existing assistant makes built-in browsing available when Chrome is
 present. Retired version-2 access lists no longer grant delegation: select
 `browser-delegate` for other groups that should retain access. Retired local
 policy records are left untouched for rollback.
+
+### Saved logins
+
+Saved logins are built in and need no setup or outside account. Each assistant
+keeps `browser/logins.db` under its instance root, outside NanoClaw update
+snapshots and container mounts. Passwords, including generated passwords for
+unsettled attempts, are encrypted with AES-256-GCM under a random per-assistant
+key in the macOS Keychain. The directory is owner-only (0700), and the file is
+owner-only (0600). Website, username and label remain readable so listing and
+removing logins work when the key cannot be read. Plaintext passwords exist in
+host memory when generated, saved or filled; agents receive only opaque handles
+and outcomes.
+
+Any process running as the same macOS user can read the key through
+`/usr/bin/security`. Encryption protects a copied store file; it does not protect
+passwords from another process running as that user. NanoClaw provides no backup
+or export of logins and stores no one-time codes. Email-code sign-in is unchanged.
+Updates and rollbacks preserve the store file. Releases that predate the built-in
+store cannot read it.
+
+The assistant saves generated passwords before submitting a signup or password
+change. An account belongs to the assistant when its username is any spelling of
+its web alias, or a non-email username from a completed signup on that site. Who
+added or edited the login does not decide ownership. Other logins belong to the
+principal. The assistant changes only its own accounts' passwords; the principal
+changes their own password on the site, then updates the saved login. Sign-in
+email, phone, two-factor and payment-method changes remain refused.
+
+A confirmed change replaces the saved password and erases the old password from
+the store's contents. Filesystem remnants in freed blocks are not erased. An
+unsettled attempt keeps its generated password until confirmed, rejected or
+released. Releasing it discards that password and preserves the previous saved
+login; if the site took it, the assistant can reset it through its own email.
+The persistent browser profile keeps every sign-in, including the principal's
+accounts.
+
+Main sends the principal their private `https://<assistant-host>/logins` link
+when a login is missing or they ask. Cloudflare Access admits the principal and
+invited artifact readers; the host permits `/logins` only for the principal's
+currently confirmed addresses. They can add or remove logins and edit the
+account label, website, username or saved password for either account owner; no
+saved password is ever revealed. Logins are grouped by website and can be
+searched by site, label or username. Each login has a details view and an edit
+form; a blank replacement password keeps the current one. An older form cannot
+overwrite newer saved details. Editing this page changes the saved login, not
+the account on the website. A saved change is ready for the next errand. Passwords
+are entered on the page, never sent through chat.
+
+An unsent password change gives way to a page edit or removal. Once its password
+may have reached the site, the page answers `login_busy` until the attempt is
+settled or released. When web setup is missing, main tells the principal to ask
+their operator; when installed web is temporarily unavailable, to try again later.
+
+The key is read fresh at each use and is never automatically replaced while any
+saved or pending password remains. When it is missing, different or unavailable,
+filling, generating and saving answer `vault_unavailable`: ask the operator.
+Listing and removing logins, and settling or releasing attempts, still work.
+`gws-ea status --details` reports the running host's login-store state:
+`key_missing`, `key_mismatch` or `keychain_unavailable`, with an operator action.
+It never reads the key from the CLI; a stopped assistant reports not checked.
+Log in at the Mac and unlock its keychain, or have the principal remove unreadable
+logins on the page. Once no saved or pending passwords remain, adding a login
+can create a key. Removing an assistant deletes its Keychain key after stopping
+the host; an unreachable key is reported as left behind without failing removal.
 
 ### Browser diagnosis and release acceptance
 
