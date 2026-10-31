@@ -60,10 +60,10 @@ describe('local CLI discovery and grammar', () => {
     expect(await runCli(['schema', 'connectors', '--json'], io.runtime)).toBe(0);
     const schema: { commands: { path: string[]; scope: string; options: { name: string; required: boolean }[] }[] } =
       JSON.parse(io.stdout.join('\n'));
-    expect(schema.commands).toHaveLength(13);
+    expect(schema.commands).toHaveLength(9);
     expect(schema.commands.some((command) => command.path.includes('browser'))).toBe(false);
     expect(schema.commands.some((command) => command.path.includes('artifacts'))).toBe(false);
-    for (const name of ['voice', 'onepassword', 'web']) {
+    for (const name of ['voice', 'web']) {
       const commands = schema.commands.filter((command) => command.path[2] === name);
       expect(commands.map((command) => command.path[1])).toEqual(['install', 'uninstall', 'show', 'check']);
       for (const command of commands) {
@@ -72,9 +72,9 @@ describe('local CLI discovery and grammar', () => {
       }
     }
     const help = capture();
-    expect(await runCli(['help', 'connectors', 'install', 'onepassword'], help.runtime)).toBe(0);
+    expect(await runCli(['help', 'connectors', 'install', 'web'], help.runtime)).toBe(0);
     expect(help.stdout.join('\n')).toContain('--account <account_id>');
-    expect(help.stdout.join('\n')).toContain('Integrate with 1Password CLI');
+    expect(help.stdout.join('\n')).toContain('Cloudflare Access');
     expect(help.runtime.checkPrerequisites).not.toHaveBeenCalled();
   });
   it.each([

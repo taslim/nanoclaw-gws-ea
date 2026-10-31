@@ -375,31 +375,20 @@ export const COMMAND_DEFINITIONS: readonly CommandDefinition[] = [
     options: [
       id,
       yes,
-      flag(
-        'delete-vault',
-        "Also delete the assistant's 1Password vault with every item it holds, when this host created it; an empty one is deleted without this flag.",
-      ),
       value(
         'abandon',
-        'gcp-project,chat-subscription,onepassword,web',
-        'Explicit owned external resources removal may leave behind when they cannot be observed; onepassword also closes the receipt naming service accounts you revoked. Web abandonment retains exact cleanup evidence.',
+        'gcp-project,chat-subscription,web',
+        'Explicit owned external resources removal may leave behind when they cannot be observed. Web abandonment retains exact cleanup evidence.',
       ),
     ],
     effects: [
       'Removes only recorded owned resources; external resource abandonment must be explicit.',
-      "Deletes the assistant's 1Password runtime token after its host stops; deletes its vault only when this host's management service account created it and it is empty or --delete-vault was confirmed, and never another vault.",
-      'Never revokes a service account: the receipt outside the instance keeps their IDs for you to revoke on 1Password.com.',
+      'Deletes the saved-login Keychain key after the host stops; an unreachable key is reported as left behind without failing removal.',
     ],
-    prerequisites: [
-      ...assistantPrerequisites,
-      '--delete-vault needs the 1Password CLI this host recorded and the management service account that created the vault; without them removal pauses before any change.',
-    ],
-    recovery: [
-      'Rerun removal to continue its retained journal after fixing the stated blocker.',
-      'After revoking the service accounts it names on 1Password.com, close the kept receipt with gws-ea remove --id <instance_id> --yes --abandon onepassword.',
-    ],
-    examples: ['gws-ea remove --id <instance_id> --yes', 'gws-ea remove --id <instance_id> --delete-vault'],
+    prerequisites: [...assistantPrerequisites],
+    recovery: ['Rerun removal to continue its retained journal after fixing the stated blocker.'],
     outputModes: managedModes,
+    examples: ['gws-ea remove --id <instance_id> --yes'],
     resultSchema: managedResultSchema(operationDataSchema('remove')),
   },
   {

@@ -1,6 +1,4 @@
 import type { ConnectorObservation } from './connector-inspection.js';
-import type { OnePasswordInstallData } from './onepassword.js';
-import type { OnePasswordUninstallData } from './onepassword-uninstall.js';
 import type { WebConnectorOperation, WebConnectorUninstallData } from './web-connector.js';
 import {
   COMMAND_DEFINITIONS,
@@ -69,8 +67,6 @@ export type CommandData =
   | VoiceOperationData
   | { readonly connectors: readonly ConnectorObservation[] }
   | ConnectorObservation
-  | OnePasswordInstallData
-  | OnePasswordUninstallData
   | WebConnectorOperation
   | WebConnectorUninstallData
   | AssistantListing

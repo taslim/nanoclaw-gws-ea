@@ -10,7 +10,6 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import * as connectorProvisioning from './connector-provisioning.js';
 import { connectorDefinition } from './connectors.js';
-import type { OnePasswordUninstallPreview } from './onepassword-uninstall.js';
 import * as productionProvisioning from './provision.js';
 import { runCli, type CliRuntime, type FailureReport } from './cli.js';
 import type { CreatePromptContext } from './create-input.js';
@@ -848,9 +847,7 @@ describe('gws-ea stop summaries and exit codes', () => {
       expect(production).toHaveBeenCalledWith(
         expect.anything(),
         expect.objectContaining({
-          onePassword: expect.objectContaining({
-            cli: expect.objectContaining({ searchPath: '/operator/custom/bin' }),
-          }),
+          web: undefined,
         }),
       );
     } finally {
@@ -1576,9 +1573,9 @@ describe('gws-ea release sources', () => {
     { kind: 'human-action', phase: 'sign_in_google', code: 'google_sign_in_required', message: 'Sign in.' },
     {
       kind: 'human-action',
-      phase: 'provision_onepassword',
-      code: 'operator_sign_in_needed',
-      message: 'Sign in to 1Password.',
+      phase: 'provision_web',
+      code: 'setup_pending',
+      message: 'Web setup is pending.',
     },
   ] satisfies readonly ProvisionHumanPause[])(
     'retains --skip-alias through create, an earlier $phase pause, and plain resume',
@@ -1594,8 +1591,7 @@ describe('gws-ea release sources', () => {
         ...output.runtime,
         ...createRuntime(),
         advanceProvision: async (operation, { runtime: reporter }) => {
-          if (!first)
-            return productionProvisioning.provisionAssistantResources(operation, reporter, {}, { ncl: aliasNcl });
+          if (!first) return productionProvisioning.provisionAssistantResources(operation, reporter, { ncl: aliasNcl });
           first = false;
           const reserved = await getInstanceReservation(paths, operation.instanceId);
           const home = path.join(paths.configRoot, 'home');
@@ -2434,8 +2430,8 @@ describe('gws-ea start, stop, and restart', () => {
       const { helpers } = nanoclawServices({ [a.install_id]: true });
       const io = lines();
       const provision = vi.spyOn(connectorProvisioning, 'provisionInstalledConnectors').mockResolvedValue({
-        pending: [{ name: 'onepassword', reason: 'operator_sign_in_needed', message: 'Operator sign-in is needed.' }],
-        next_actions: [{ kind: 'command', argv: ['gws-ea', 'connectors', 'install', 'onepassword'] }],
+        pending: [{ name: 'web', reason: 'profile_incomplete', message: 'Complete the web profile.' }],
+        next_actions: [{ kind: 'command', argv: ['gws-ea', 'connectors', 'install', 'web'] }],
       });
       try {
         expect(
@@ -2445,10 +2441,9 @@ describe('gws-ea start, stop, and restart', () => {
         expectResultContract(command, result);
         expect(result).toMatchObject({
           outcome: 'succeeded',
-          next_actions: [{ kind: 'command', argv: ['gws-ea', 'connectors', 'install', 'onepassword'] }],
+          next_actions: [{ kind: 'command', argv: ['gws-ea', 'connectors', 'install', 'web'] }],
         });
         expect(provision).toHaveBeenCalledOnce();
-        expect(provision.mock.calls[0][2]?.onePassword?.operatorTerminal).toBe(false);
       } finally {
         provision.mockRestore();
       }
@@ -3189,61 +3184,6 @@ describe('gws-ea WhatsApp operator commands', () => {
 });
 
 describe('connector uninstall operator output', () => {
-  it('shows each paused vault deletion decision and unknown counts in human output', async () => {
-    const paths = await testPaths();
-    const io = lines();
-    const preview: OnePasswordUninstallPreview = {
-      account_id: 'account',
-      management_service_account_id: 'management',
-      management_creation_unproven: false,
-      vaults: [
-        {
-          instance_id: '11111111-1111-4111-8111-111111111111',
-          account_id: 'account',
-          vault_id: 'vault-delete',
-          owned: true,
-          item_count: 7,
-          vault: 'delete',
-          reason: 'Its deletion was chosen for this owned vault.',
-          runtime_service_account_ids: [],
-          unproven: [],
-          credential_attempts: 3,
-        },
-        {
-          instance_id: '22222222-2222-4222-8222-222222222222',
-          account_id: 'account',
-          vault_id: 'vault-keep',
-          owned: false,
-          item_count: null,
-          vault: 'retain',
-          reason: 'This host management account did not create it.',
-          runtime_service_account_ids: [],
-          unproven: [],
-          credential_attempts: null,
-        },
-      ],
-    };
-    vi.spyOn(connectorDefinition('onepassword'), 'uninstall').mockResolvedValue({
-      name: 'onepassword',
-      scope: 'host',
-      outcome: 'paused',
-      changed: false,
-      preview,
-      assistants: [],
-      receipt_file: null,
-      revoke_service_account_ids: [],
-      reason: 'Confirm deletion of the owned vaults.',
-    });
-    expect(await runCli(['connectors', 'uninstall', 'onepassword', '--no-input'], { paths, ...io.runtime })).toBe(10);
-    const output = io.out.join('\n');
-    expect(output).toMatch(/DELETE.*11111111-1111-4111-8111-111111111111.*vault-delete.*items 7.*credential work 3/u);
-    expect(output).toMatch(
-      /KEEP.*22222222-2222-4222-8222-222222222222.*vault-keep.*items unknown.*credential work unknown/u,
-    );
-    expect(output).toContain('This host management account did not create it.');
-    expect(output).not.toContain('items 0');
-  });
-
   it.each([false, true])('retains web operator cleanup actions in human and JSON output (json=%s)', async (json) => {
     const paths = await testPaths();
     const io = lines();

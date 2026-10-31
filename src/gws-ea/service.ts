@@ -39,7 +39,6 @@ import { GCHAT_PROJECT_ID_ENV, GCHAT_SUBSCRIBER_KEY_FILE_ENV } from '../modules/
 import { GOOGLE_GRANT_FILE_ENV, GOOGLE_GRANT_FILE_NAME } from '../modules/gws-ea-google/grant.js';
 import { BROWSER_ROOT_ENV } from '../modules/gws-ea-browser/availability.js';
 import { WEB_POLICY_FILE_ENV } from '../modules/gws-ea-web/policy.js';
-import { ONEPASSWORD_POLICY_FILE_ENV, onePasswordHostPaths } from '../modules/gws-ea-browser/onepassword-policy.js';
 import { VOICE_POLICY_FILE_ENV } from '../modules/gws-ea-voice/config.js';
 import { GwsEaError, type AllocatedPorts, type InstanceReservation } from './types.js';
 import { parseJson, requireDockerEndpoint, requirePath, requireRecord, requireString } from './validation.js';
@@ -380,14 +379,10 @@ export async function persistInstanceRuntime(
   );
 }
 
-/**
- * Each names a policy file, never a value, and never the 1Password management
- * token beside its policy.
- */
+/** Each names a host policy file, never a secret. */
 export function hostPolicyLocators(configRoot: string): Readonly<Record<string, string>> {
   return {
     [VOICE_POLICY_FILE_ENV]: path.join(configRoot, 'voice.json'),
-    [ONEPASSWORD_POLICY_FILE_ENV]: onePasswordHostPaths(configRoot).policyFile,
   };
 }
 

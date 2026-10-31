@@ -3,44 +3,31 @@ import type { CommandOptions } from './command-parser.js';
 import type { ControlPlanePaths } from './paths.js';
 import type { ConnectorInspection, ConnectorObservation } from './connector-inspection.js';
 import type { VoiceOperatorDependencies } from './local-voice.js';
-import type { OnePasswordDependencies, OnePasswordInstallData } from './onepassword.js';
-import type {
-  OnePasswordUninstallData,
-  OnePasswordUninstallDependencies,
-  OnePasswordUninstallPreview,
-} from './onepassword-uninstall.js';
 import type { WebCapabilityDependencies, WebConnectorOperation, WebConnectorUninstallData } from './web-connector.js';
 import type { OptionDefinition } from './command-definitions.js';
 import { DEFAULT_VOICE_MODEL } from './install-voice.js';
 import { VOICE_MODEL_CATALOG } from './voice-assets.js';
 
-export const CONNECTOR_NAMES = ['voice', 'onepassword', 'web'] as const;
+export const CONNECTOR_NAMES = ['voice', 'web'] as const;
 export type ConnectorName = (typeof CONNECTOR_NAMES)[number];
 export const CONNECTOR_ACTIONS = ['install', 'uninstall', 'show', 'check'] as const;
 export type ConnectorAction = (typeof CONNECTOR_ACTIONS)[number];
 export type ConnectorOperation =
   | { readonly name: 'voice'; readonly scope: 'host'; readonly enabled: boolean; readonly installation_dir?: string }
-  | OnePasswordInstallData
-  | OnePasswordUninstallData
   | WebConnectorOperation
   | WebConnectorUninstallData;
 export interface ConnectorLifecycleContext {
   readonly paths: ControlPlanePaths;
   readonly options: CommandOptions;
   readonly voice: VoiceOperatorDependencies;
-  readonly onePassword: OnePasswordDependencies & OnePasswordUninstallDependencies;
   readonly web: WebCapabilityDependencies;
-  readonly deleteVaults?: boolean;
-  readonly confirmedPreview?: OnePasswordUninstallPreview;
 }
 interface ConnectorInstallResults {
   voice: Extract<ConnectorOperation, { name: 'voice' }>;
-  onepassword: OnePasswordInstallData;
   web: WebConnectorOperation;
 }
 interface ConnectorUninstallResults {
   voice: Extract<ConnectorOperation, { name: 'voice' }>;
-  onepassword: OnePasswordUninstallData;
   web: WebConnectorUninstallData;
 }
 export interface ConnectorDefinitionFor<Name extends ConnectorName> {
@@ -79,7 +66,6 @@ const id = value(
   'instance_id',
   'Inspect this full assistant ID; omitted, inspect the host and compatible assistants.',
 );
-const flag = (name: string, description: string): OptionDefinition => ({ name, type: 'boolean', description });
 const observation = ['Read-only local records; readiness is not checked.'];
 const check = ['Bounded read-only verification; never installs, provisions, restarts or repairs.'];
 export const CONNECTOR_CATALOG: readonly ConnectorDefinition[] = [
@@ -134,66 +120,6 @@ export const CONNECTOR_CATALOG: readonly ConnectorDefinition[] = [
       uninstall: ['Stops new recognition first, proves managed consumers drained, then removes recipe-owned assets.'],
       show: observation,
       check,
-    },
-  },
-  {
-    name: 'onepassword',
-    inspect: async (paths, options) =>
-      (await import('./connector-inspection.js')).inspectConnector(paths, 'onepassword', options),
-    install: async ({ paths, options, onePassword }) =>
-      (await import('./onepassword.js')).installOnePassword(
-        paths,
-        { accountId: options.account, discardUnproven: options['discard-unproven'] },
-        onePassword,
-      ),
-    uninstall: async ({ paths, options, deleteVaults, confirmedPreview, onePassword }) =>
-      (await import('./onepassword-uninstall.js')).uninstallOnePassword(
-        paths,
-        { deleteVaults, confirmedPreview, abandon: options.abandon === 'true' },
-        onePassword,
-      ),
-    summary: 'Provision a private saved-login vault for each compatible assistant.',
-    prerequisites: [
-      '1Password CLI (op) 2.29 or later.',
-      'The operator’s 1Password desktop sign-in with Integrate with 1Password CLI enabled.',
-      'Operator permission to create service accounts.',
-    ],
-    account:
-      'The operator’s selected 1Password account; principals manage saved logins on their assistant’s private web page.',
-    scope: {
-      installation: 'host',
-      configuration: 'host',
-      resources: 'assistant',
-      access: 'A separate vault and runtime service account for each assistant.',
-    },
-    options: {
-      install: [
-        value('account', 'account_id', 'Exact 1Password account, required before one is recorded.'),
-        value(
-          'discard-unproven',
-          'instance_id|management',
-          'Acknowledge an exact interrupted creation after cleaning it up in 1Password.',
-        ),
-      ],
-      uninstall: [
-        flag('delete-vaults', 'Confirm deletion of every owned assistant vault, including its items.'),
-        flag('abandon', 'Close the retained revocation receipt after completing its operator actions.'),
-      ],
-      show: [id],
-      check: [id],
-    },
-    effects: {
-      install: [
-        'Uses the operator’s desktop sign-in to provision compatible current assistants; create and update provision future eligible assistants. Existing vaults and credentials are kept.',
-      ],
-      uninstall: [
-        'Previews owned vaults before confirmation, stops vault use, deletes verified owned vaults and local tokens, and retains service-account IDs for operator revocation.',
-      ],
-      show: observation,
-      check: [
-        ...check,
-        'Authenticated requests count against the account’s shared request limit; no vault write is tested.',
-      ],
     },
   },
   {

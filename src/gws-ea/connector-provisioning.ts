@@ -1,5 +1,4 @@
 /** Optional setup follows operator lifecycle commands; it cannot undo a serving release. */
-import { provisionAssistantVault, type OnePasswordDependencies } from './onepassword.js';
 import { provisionAssistantWeb, type WebCapabilityDependencies } from './web-connector.js';
 import type { InstanceOperation } from './journal.js';
 import type { StepReporter } from './events.js';
@@ -8,7 +7,6 @@ import { safeErrorCode, safeErrorMessage } from './redact.js';
 import type { ConnectorName } from './connectors.js';
 
 export interface ConnectorProvisioningDependencies {
-  readonly onePassword?: Pick<OnePasswordDependencies, 'cli' | 'upsertEnvVars' | 'operatorTerminal' | 'rateLimitState'>;
   readonly web?: WebCapabilityDependencies;
 }
 export interface PendingConnector {
@@ -29,37 +27,21 @@ export async function provisionInstalledConnectors(
   const recordEffect = (changed: true | null): void => {
     reporter.emit?.({ type: 'domain-effect', step: 'provision_connectors', changed });
   };
-  const run = async (name: 'onepassword' | 'web'): Promise<void> => {
-    try {
-      const result =
-        name === 'onepassword'
-          ? await provisionAssistantVault(operation, { ...dependencies.onePassword, recordEffect })
-          : await provisionAssistantWeb(operation, { ...dependencies.web, recordEffect });
-      if (result?.outcome === 'pending')
-        pending.push({
-          name,
-          reason: result.reason ?? 'setup_pending',
-          message: result.message ?? `${name} setup is pending.`,
-        });
-    } catch (cause) {
-      pending.push({ name, reason: safeErrorCode(cause), message: safeErrorMessage(cause) });
-    }
-  };
-  await run('onepassword');
-  await run('web');
+  try {
+    const result = await provisionAssistantWeb(operation, { ...dependencies.web, recordEffect });
+    if (result?.outcome === 'pending')
+      pending.push({
+        name: 'web',
+        reason: result.reason ?? 'setup_pending',
+        message: result.message ?? 'Web setup is pending.',
+      });
+  } catch (cause) {
+    pending.push({ name: 'web', reason: safeErrorCode(cause), message: safeErrorMessage(cause) });
+  }
   return {
     pending,
-    next_actions: [
-      ...new Set(
-        pending
-          .filter(
-            (entry) => entry.name !== 'web' || !['web_name_unusable', 'web_hostname_claimed'].includes(entry.reason),
-          )
-          .map((entry) => entry.name),
-      ),
-    ].map((name) => ({
-      kind: 'command',
-      argv: ['gws-ea', 'connectors', 'install', name],
-    })),
+    next_actions: pending.some((entry) => !['web_name_unusable', 'web_hostname_claimed'].includes(entry.reason))
+      ? [{ kind: 'command', argv: ['gws-ea', 'connectors', 'install', 'web'] }]
+      : [],
   };
 }

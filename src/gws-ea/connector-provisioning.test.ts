@@ -4,7 +4,6 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import * as onepassword from './onepassword.js';
 import * as web from './web-connector.js';
 import { provisionInstalledConnectors } from './connector-provisioning.js';
 import { reserveInstance, withInstanceOperation } from './journal.js';
@@ -41,38 +40,21 @@ async function assistant() {
   return { paths, id };
 }
 describe('optional connector provisioning', () => {
-  it('does no provider work when neither connector is installed', async () => {
+  it('keeps a web provisioning failure as pending for a serving caller', async () => {
+    const { paths, id } = await assistant();
+    vi.spyOn(web, 'provisionAssistantWeb').mockRejectedValue(
+      new GwsEaError('web_unavailable', 'Web setup is unavailable.'),
+    );
+    const result = await withInstanceOperation(paths, id, (operation) => provisionInstalledConnectors(operation, {}));
+    expect(result).toEqual({
+      pending: [{ name: 'web', reason: 'web_unavailable', message: 'Web setup is unavailable.' }],
+      next_actions: [{ kind: 'command', argv: ['gws-ea', 'connectors', 'install', 'web'] }],
+    });
+  });
+  it('does no provider work when web is not installed', async () => {
     const { paths, id } = await assistant();
     const result = await withInstanceOperation(paths, id, (operation) => provisionInstalledConnectors(operation, {}));
     expect(result).toEqual({ pending: [], next_actions: [] });
-  });
-  it('continues from a vault failure to web, preserving ordered next actions for a serving caller', async () => {
-    const { paths, id } = await assistant();
-    const called: string[] = [];
-    vi.spyOn(onepassword, 'provisionAssistantVault').mockImplementation(async () => {
-      called.push('onepassword');
-      throw new GwsEaError('rate_limited', 'The vault request limit is exhausted.');
-    });
-    vi.spyOn(web, 'provisionAssistantWeb').mockImplementation(async () => {
-      called.push('web');
-      return {
-        instance_id: id,
-        outcome: 'pending',
-        reason: 'profile_incomplete',
-        message: 'Complete the assistant profile.',
-        changed: false,
-      };
-    });
-    const result = await withInstanceOperation(paths, id, (operation) => provisionInstalledConnectors(operation, {}));
-    expect(called).toEqual(['onepassword', 'web']);
-    expect(result?.pending).toEqual([
-      { name: 'onepassword', reason: 'rate_limited', message: 'The vault request limit is exhausted.' },
-      { name: 'web', reason: 'profile_incomplete', message: 'Complete the assistant profile.' },
-    ]);
-    expect(result?.next_actions).toEqual([
-      { kind: 'command', argv: ['gws-ea', 'connectors', 'install', 'onepassword'] },
-      { kind: 'command', argv: ['gws-ea', 'connectors', 'install', 'web'] },
-    ]);
   });
   it.each(['web_name_unusable', 'web_hostname_claimed', 'web_hostname_foreign'])(
     'offers web recovery only for a foreign hostname (%s)',
@@ -94,32 +76,4 @@ describe('optional connector provisioning', () => {
       );
     },
   );
-
-  it('shares the rate-limit fence across assistants while retaining their separate pending results', async () => {
-    const { paths, id } = await assistant();
-    const rateLimitState = { limited: false };
-    const vault = vi.spyOn(onepassword, 'provisionAssistantVault').mockImplementation(async (_operation, deps) => {
-      expect(deps?.rateLimitState).toBe(rateLimitState);
-      rateLimitState.limited = true;
-      return {
-        instance_id: id,
-        outcome: 'pending',
-        reason: 'rate_limited',
-        message: 'Retry after the account resets.',
-        changed: false,
-        vault_id: null,
-        runtime_service_account_id: null,
-        retired_service_account_ids: [],
-      };
-    });
-    vi.spyOn(web, 'provisionAssistantWeb').mockResolvedValue(undefined);
-    for (let turn = 0; turn < 2; turn++) {
-      const result = await withInstanceOperation(paths, id, (operation) =>
-        provisionInstalledConnectors(operation, {}, { onePassword: { rateLimitState } }),
-      );
-      expect(result?.pending[0]).toMatchObject({ name: 'onepassword', reason: 'rate_limited' });
-    }
-    expect(vault).toHaveBeenCalledTimes(2);
-    expect(rateLimitState.limited).toBe(true);
-  });
 });
