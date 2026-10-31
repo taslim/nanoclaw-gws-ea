@@ -10,6 +10,8 @@ import { instanceLayout } from '../../gws-ea/release-layout.js';
 import { GwsEaError } from '../../gws-ea/types.js';
 import { browserRoot } from './availability.js';
 import type { SanitizedCommandOutcomeRunner } from '../../gws-ea/process.js';
+import { hasControlCharacters } from '../../gws-ea/validation.js';
+import { httpsOrigin } from './authentication-signatures.js';
 import { LoginKey } from './login-key.js';
 import { browserPaths, ensurePrivateDirectory } from './paths.js';
 
@@ -67,27 +69,20 @@ CREATE TABLE IF NOT EXISTS pending (
 CREATE TABLE IF NOT EXISTS meta (
   id INTEGER PRIMARY KEY CHECK(id = 1), key_check BLOB NOT NULL
 ) STRICT;`;
-// Serialize the async Keychain read with writes across bindings to the same host-owned file.
-// These gates retain no keys, passwords, results or open database handles.
-const gates = new Map<string, Promise<void>>();
+const fileOperationGates = new Map<string, Promise<void>>();
 
-function httpsWebsite(raw: string): URL | undefined {
-  if (!URL.canParse(raw)) return undefined;
-  const url = new URL(raw);
-  return url.protocol === 'https:' && !url.username && !url.password ? url : undefined;
-}
 export function registrableDomain(origin: string): string | undefined {
-  const url = httpsWebsite(origin);
+  const url = httpsOrigin(origin);
   return (url && getDomain(url.hostname, { allowPrivateDomains: true })) || undefined;
 }
 function details(spec: Omit<LoginDetails, 'password'>): Pick<SavedLogin, 'hostname' | 'domain' | 'username' | 'title'> {
   const site = spec.site.trim();
-  const url = httpsWebsite(site.includes('://') ? site : `https://${site}`);
+  const url = httpsOrigin(site.includes('://') ? site : `https://${site}`);
   const domain = url && getDomain(url.hostname, { allowPrivateDomains: true });
   if (!site || /[\s\\]/u.test(site) || !url || !domain) throw new LoginDetailsError('invalid_site');
-  if (!spec.username.trim() || spec.username.length > 320 || /\p{Cc}/u.test(spec.username))
+  if (!spec.username.trim() || spec.username.length > 320 || hasControlCharacters(spec.username))
     throw new LoginDetailsError('invalid_details');
-  if (spec.title.length > 200 || /\p{Cc}/u.test(spec.title)) throw new LoginDetailsError('invalid_details');
+  if (spec.title.length > 200 || hasControlCharacters(spec.title)) throw new LoginDetailsError('invalid_details');
   return { hostname: url.hostname, domain, username: spec.username, title: spec.title.trim() || url.hostname };
 }
 function passwordValid(password: string): void {
@@ -97,7 +92,8 @@ function versionValid(version: number): void {
   if (!Number.isSafeInteger(version) || version < 1) throw new LoginDetailsError('login_changed');
 }
 function attemptValid(attemptId: string): void {
-  if (!attemptId || attemptId.length > 200 || /\p{Cc}/u.test(attemptId)) throw new LoginDetailsError('invalid_details');
+  if (!attemptId || attemptId.length > 200 || hasControlCharacters(attemptId))
+    throw new LoginDetailsError('invalid_details');
 }
 
 /** A direct, host-only file: only passwords are encrypted; every metadata read is independent of Keychain. */
@@ -136,12 +132,12 @@ export class LoginStore {
   }
 
   private async use<T>(operation: (db: Database.Database) => T | Promise<T>): Promise<T> {
-    const previous = gates.get(this.file);
+    const previous = fileOperationGates.get(this.file);
     let release = (): void => undefined;
     const gate = new Promise<void>((resolve) => {
       release = resolve;
     });
-    gates.set(this.file, gate);
+    fileOperationGates.set(this.file, gate);
     await previous;
     try {
       const db = await this.database();
@@ -155,7 +151,7 @@ export class LoginStore {
       throw new LoginStoreError('vault_unavailable');
     } finally {
       release();
-      if (gates.get(this.file) === gate) gates.delete(this.file);
+      if (fileOperationGates.get(this.file) === gate) fileOperationGates.delete(this.file);
     }
   }
 

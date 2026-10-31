@@ -88,7 +88,6 @@ export function line(value: unknown, max: number): value is string {
     !hasControlCharacters(value)
   );
 }
-// Evidence is host-authored identifiers and scalar facts, never prose or secret-bearing values.
 function evidenceJson(evidence: CredentialEvidence): string {
   if (
     !isRecord(evidence) ||

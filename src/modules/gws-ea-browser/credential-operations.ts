@@ -332,7 +332,7 @@ async function applyCredentialRelease(
     return;
   }
   let current = typeof payload.attemptId === 'string' ? await attempts.get(payload.attemptId) : undefined;
-  let from = current && releasedFrom(current, approval.approval_id);
+  const from = current && releasedFrom(current, approval.approval_id);
   if (!current || !from) {
     const decision = await guard(credentialReleaseGuard, { actor: agentActor(session), payload, grant: approval });
     if (decision.effect !== 'allow' || !current) {
@@ -348,7 +348,6 @@ async function applyCredentialRelease(
       return;
     }
     current = result.attempt;
-    from = result.from;
   }
   await attempts.retirePending([current]);
   watchedResponses.delete(current.id);

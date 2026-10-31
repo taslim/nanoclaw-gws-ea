@@ -147,7 +147,6 @@ export function createLoginsPageHandler(options: LoginsPageOptions): RequestList
       if (writing && !sameOriginJson(request, options.hostname)) return refuse(response);
       const store = options.store ?? (await getLoginStore());
       const giveWay = async (handle: string, version: number): Promise<void> => {
-        // A stale form cannot abandon a newer unsent password change.
         if ((await store.get(handle)).version !== version) throw new LoginDetailsError('login_changed');
         if ((await credentials.giveWayForLogin(handle)) !== 'ready') throw new LoginBusy();
       };
