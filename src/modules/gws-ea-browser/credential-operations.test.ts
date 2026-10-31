@@ -788,6 +788,29 @@ describe("the principal's release of an attempt the host cannot settle", () => {
     expect(await lease()).toEqual({ job_id: job.thread_id });
   });
 
+  it('finishes an already committed change on approval without reporting a discarded password or holding its site', async () => {
+    const { id, itemId } = await disclosedChange();
+    const password = await fixture.store.disclosePending(id);
+    await attempts.markUnknown(id, { signal: 'interrupted' });
+    await holdSite();
+    expect(await release(id)).toEqual({ status: 'awaiting_principal' });
+    const run = getDb().run.bind(getDb());
+    const interrupted = vi.spyOn(getDb(), 'run').mockImplementation(async (sql, ...parameters) => {
+      if (sql.includes("SET phase = 'finalized'")) throw new Error('Central write interrupted');
+      return run(sql, ...parameters);
+    });
+    await expect(attempts.confirm(id, { signal: 'late_response' })).rejects.toThrow('Central write interrupted');
+    interrupted.mockRestore();
+    fixture.setUnavailable(true);
+    await click('approve');
+    expect(await attempts.get(id)).toMatchObject({ phase: 'finalized', owned_login_id: itemId });
+    expect(await lease()).toBeUndefined();
+    expect(notes().at(-1)).toContain('was not released: another step settled it first');
+    expect(notes().at(-1)).not.toContain('discarded');
+    fixture.setUnavailable(false);
+    expect(await fixture.store.secret(itemId, 'password', ORIGIN)).toBe(password);
+  });
+
   it('on approval ends the attempt as the principal released it, lifts its site, completes the cancellation and frees the account, discarding the generated password', async () => {
     const id = await disclosedSignup();
     await attempts.markAwaitingVerification(id);

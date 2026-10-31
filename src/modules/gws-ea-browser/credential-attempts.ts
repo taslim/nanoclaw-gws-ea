@@ -52,11 +52,13 @@ export type CredentialDisclosure =
   | Refused<'not_saved' | 'wrong_job' | 'origin_mismatch' | 'not_owned' | 'source_changed'>
   | StoreFailure;
 export type CredentialConfirmResult = { readonly status: 'finalized'; readonly attempt: CredentialAttempt };
-export type CredentialReleaseResult = {
-  readonly status: 'released';
-  readonly from: CredentialAttemptPhase;
-  readonly attempt: CredentialAttempt;
-};
+export type CredentialReleaseResult =
+  | CredentialConfirmResult
+  | {
+      readonly status: 'released';
+      readonly from: CredentialAttemptPhase;
+      readonly attempt: CredentialAttempt;
+    };
 export class CredentialAttemptError extends Error {
   constructor(readonly reason: 'not_found' | 'invalid_phase' | 'invalid_request') {
     super(reason);
@@ -339,6 +341,9 @@ export class CredentialAttempts {
   release(id: string, approvalId: string): Promise<CredentialReleaseResult> {
     return this.exclusive(id, async () => {
       const current = await this.require(id);
+      const store = await this.store();
+      if (RELEASABLE_PHASES.includes(current.phase) && !(await store.hasPending(id)))
+        return this.finish(current, await this.resultingLogin(store, current));
       const recorded: unknown = current.evidence_json === null ? {} : JSON.parse(current.evidence_json);
       const attempt = await this.move(id, RELEASABLE_PHASES, 'rejected', {
         ...(isRecord(recorded) ? (recorded as CredentialEvidence) : {}),
@@ -346,7 +351,7 @@ export class CredentialAttempts {
         approval: approvalId,
         released_from: current.phase,
       });
-      await (await this.store()).deletePending(id);
+      await store.deletePending(id);
       return { status: 'released', from: current.phase, attempt };
     });
   }

@@ -353,7 +353,9 @@ async function applyCredentialRelease(
   watchedResponses.delete(current.id);
   await finishSignupVerification(current.id);
   await freeSite(queue, current, `credential-release-${current.id}`);
-  await notify(credentialReleased(current));
+  await notify(
+    current.phase === 'finalized' ? credentialAuthorityMessage('settledFirst') : credentialReleased(current),
+  );
 }
 
 export function registerCredentialAuthorityDelivery(

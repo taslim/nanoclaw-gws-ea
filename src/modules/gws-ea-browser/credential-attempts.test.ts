@@ -185,6 +185,37 @@ it.each(['release', 'confirm'] as const)(
   },
 );
 
+it.each(['signup', 'rotation'] as const)(
+  'does not release a %s already committed to the store after its central phase write failed',
+  async (kind) => {
+    const source = kind === 'rotation' ? await owned() : undefined;
+    const attempt = source ? await rotation(source.id) : await signup();
+    const password = await expose(attempt);
+    await attempts.markUnknown(attempt.id);
+    const run = getDb().run.bind(getDb());
+    const interrupted = vi.spyOn(getDb(), 'run').mockImplementation(async (sql, ...parameters) => {
+      if (sql.includes("SET phase = 'finalized'")) throw new Error('Central write interrupted');
+      return run(sql, ...parameters);
+    });
+    await expect(attempts.confirm(attempt.id, { signal: 'late_response' })).rejects.toThrow(
+      'Central write interrupted',
+    );
+    interrupted.mockRestore();
+    expect((await attempts.get(attempt.id))?.phase).toBe('unknown');
+    expect(await fixture.store.hasPending(attempt.id)).toBe(false);
+    fixture.setUnavailable(true);
+    const reads = fixture.keyReads();
+    expect(await attempts.release(attempt.id, 'principal-card')).toMatchObject({ status: 'finalized' });
+    const current = await attempts.get(attempt.id);
+    expect(current).toMatchObject({ phase: 'finalized', owned_login_id: expect.any(String) });
+    expect(fixture.keyReads()).toBe(reads);
+    fixture.setUnavailable(false);
+    expect(await fixture.store.secret(current!.owned_login_id!, 'password', ORIGIN)).toBe(password);
+    expect(await fixture.store.all()).toHaveLength(1);
+    expect(await fixture.store.pendingIds()).toEqual([]);
+  },
+);
+
 it('releases an unknown rotation without a key, deletes pending and preserves the previous login password', async () => {
   const login = await owned();
   const attempt = await rotation(login.id);
