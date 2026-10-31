@@ -1,7 +1,7 @@
 /** The result schemas command discovery publishes: the machine-readable wire contract. */
 import type { ResultSchema } from './command-definitions.js';
 import { VOICE_CAPABILITY } from './voice-inspection.js';
-import { CONNECTOR_ACTIONS } from './connectors.js';
+import { CONNECTOR_ACTIONS, CONNECTOR_NAMES } from './connectors.js';
 import { OPERATION_PHASES } from './operation.js';
 import { WEB_CAPABILITY } from './web-connector.js';
 
