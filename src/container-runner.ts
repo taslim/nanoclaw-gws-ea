@@ -787,7 +787,7 @@ async function finish(sessionId: string, runtime: ActiveSessionRuntime, failure?
   } catch (err) {
     log.error('Gateway session release failed', { sessionId, containerName, err });
   }
-  await notifyContainerStopped(sessionId);
+  void notifyContainerStopped(sessionId);
   for (const callback of runtime.exitCallbacks) {
     try {
       callback();

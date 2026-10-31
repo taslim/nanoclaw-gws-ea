@@ -6,6 +6,7 @@ import { describe, expect, it, vi } from 'vitest';
 
 import type { ChromeConnection } from './connection.js';
 import { JobWindows } from './windows.js';
+import { retainBrowserUpload } from './files.js';
 
 function fixture(injectPopup = false, failSetup = false) {
   const events = new EventEmitter();
@@ -44,6 +45,7 @@ function fixture(injectPopup = false, failSetup = false) {
       isClosed: () => closed,
       on: pageEvents.on.bind(pageEvents),
       once: pageEvents.once.bind(pageEvents),
+      off: pageEvents.off.bind(pageEvents),
       context: () => context,
       async close() {
         closed = true;
@@ -76,6 +78,45 @@ function fixture(injectPopup = false, failSetup = false) {
 }
 
 describe('quiet job windows', () => {
+  it('bounds a stalled page close while retaining its upload until the page actually closes', async () => {
+    const { windows } = fixture();
+    const first = await windows.pageForJob('first');
+    const other = await windows.pageForJob('other');
+    const remove = vi.fn(async () => undefined);
+    retainBrowserUpload(first, { path: '/synthetic-staging/upload', remove });
+    const originalClose = first.close.bind(first);
+    let release!: () => void;
+    const blocked = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const close = vi.spyOn(first, 'close').mockImplementationOnce(async () => {
+      await blocked;
+      await originalClose();
+    });
+    vi.useFakeTimers();
+    let complete = false;
+    const closing = windows.closeJob('first').then(() => {
+      complete = true;
+    });
+    try {
+      await vi.advanceTimersByTimeAsync(4_999);
+      expect(complete).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(complete).toBe(true);
+      expect(windows.jobs()).toEqual(['other']);
+      expect(other.isClosed()).toBe(false);
+      expect(remove).not.toHaveBeenCalled();
+      release();
+      await close.mock.results[0]?.value;
+      expect(remove).toHaveBeenCalledOnce();
+    } finally {
+      release();
+      await closing;
+      await windows.close();
+      vi.useRealTimers();
+    }
+  });
+
   it('creates simultaneous jobs in distinct background windows and reuses only their own page', async () => {
     const { windows, sends } = fixture();
     const [first, second] = await Promise.all([windows.pageForJob('first'), windows.pageForJob('second')]);

@@ -146,6 +146,81 @@ it('holds a checkout page after its worker exits until its card and authorized c
 });
 
 it.skipIf(!process.env.GWS_EA_BROWSER_TEST_CHROME)(
+  'finishes queue work when Chrome stops answering page close while preserving another worker',
+  async () => {
+    const file = `${root}/stalled-close-browser`;
+    const chromePath = process.env.GWS_EA_BROWSER_TEST_CHROME;
+    if (!chromePath) throw new Error('Native Chrome unavailable');
+    await ensureBrowserPaths(browserPaths(file));
+    vi.stubEnv('GWS_EA_BROWSER_ROOT', file);
+    vi.spyOn(availability, 'browserAvailability').mockResolvedValue({
+      available: true,
+      paths: browserPaths(file),
+      chromePath,
+    });
+    const other = (await resolveSystemSession('browser-q', 'system:a2a:main-q:stalled-other')).session;
+    const job = await store.jobForSession(session);
+    const otherJob = await store.jobForSession(other);
+    if (!job || !otherJob) throw new Error('Missing native jobs');
+    const live = new Set([session.id, other.id]);
+    vi.spyOn(containerRunner, 'isContainerRunning').mockImplementation((id) => live.has(id));
+    const host = getBrowserRuntime();
+    let pid: number | undefined;
+    let page: Page | undefined;
+    let timeout: NodeJS.Timeout | undefined;
+    const resume = (): void => {
+      if (pid === undefined) return;
+      try {
+        process.kill(pid, 'SIGCONT');
+      } catch (error) {
+        if (!(error instanceof Error && 'code' in error && error.code === 'ESRCH')) throw error;
+      }
+    };
+    actions = {
+      ...actions,
+      browser: {
+        validate: () => ({}),
+        async execute(context) {
+          page = await context.page();
+          vi.spyOn(page, 'close');
+          pid = (await host.connection()).child.pid;
+          if (pid === undefined) throw new Error('Owned Chrome unavailable');
+          process.kill(pid, 'SIGSTOP');
+          live.delete(session.id);
+          return { status: 'completed' };
+        },
+      },
+    };
+    const queue = createQueue(host);
+    try {
+      const otherPage = await host.pageForJob(otherJob.id);
+      await recoverAndStartBrowserQueue(queue);
+      await queue.accept('browser', {}, session, 'stalled-close');
+      const idle = queue.idle();
+      await vi.waitFor(() => expect(page?.close).toHaveBeenCalled(), { timeout: 3_000 });
+      await Promise.race([
+        idle,
+        new Promise<never>((_resolve, reject) => {
+          timeout = setTimeout(() => reject(new Error('Page disposal blocked the queue')), 6_500);
+        }),
+      ]);
+      expect(responses()).toEqual([
+        expect.objectContaining({ requestId: 'stalled-close', frame: expect.objectContaining({ ok: true }) }),
+      ]);
+      expect(await queue.tryWithJobLocks([job.id], async () => true)).toEqual({ acquired: true, value: true });
+      expect(otherPage.isClosed()).toBe(false);
+      expect(host.state().chrome.state).toBe('running');
+    } finally {
+      if (timeout) clearTimeout(timeout);
+      resume();
+      await Promise.all([queue.stop(), host.stop()]);
+      vi.restoreAllMocks();
+    }
+  },
+  30_000,
+);
+
+it.skipIf(!process.env.GWS_EA_BROWSER_TEST_CHROME)(
   'releases pages through the production worker-exit and native-store wiring',
   async () => {
     const file = `${root}/retention-browser`;

@@ -37,7 +37,7 @@ import { getSessionClaim } from './db/coordination.js';
 import { initTestDb, closeDb, runMigrations, createAgentGroup, createSession } from './db/index.js';
 import { createPendingQuestion, getPendingQuestion } from './db/sessions.js';
 import { onContainerStopped } from './host-lifecycle.js';
-const stopped = vi.fn(async (_sessionId: string) => undefined);
+const stopped = vi.fn(async (_sessionId: string): Promise<void> => undefined);
 onContainerStopped(stopped);
 
 function now(): string {
@@ -173,6 +173,28 @@ describe('session claim lifecycle', () => {
 });
 
 describe('session exit', () => {
+  it('runs exit callbacks without waiting for optional module cleanup', async () => {
+    let releaseCleanup: (() => void) | undefined;
+    stopped.mockImplementationOnce(
+      () =>
+        new Promise<void>((resolve) => {
+          releaseCleanup = resolve;
+        }),
+    );
+    snapshots.push({ handle: fakeHandle('sess-1', 'container-a'), phase: 'running' } as SupervisedSnapshot);
+    await adoptRunningSessions();
+    const exited = vi.fn();
+    try {
+      killContainer('sess-1', 'test-stop', exited);
+      await vi.waitFor(() => expect(stopped).toHaveBeenCalledExactlyOnceWith('sess-1'));
+      await vi.waitFor(() => expect(exited).toHaveBeenCalledOnce());
+      expect((await getSessionClaim('sess-1'))?.claimed_by).toBeNull();
+      expect(isContainerRunning('sess-1')).toBe(false);
+    } finally {
+      releaseCleanup?.();
+    }
+  });
+
   it("drops the session's open questions once its container exits, and leaves other sessions'", async () => {
     await createSession({
       id: 'sess-2',
