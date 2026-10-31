@@ -106,7 +106,7 @@ export interface OnePasswordCliOptions {
   readonly checkoutRoots?: readonly string[];
   readonly resolve?: typeof resolvePersistedExecutable;
   readonly runCommand?: SanitizedCommandOutcomeRunner;
-  /** Only operator calls inherit CLI session variables; all other 1Password variables are discarded. */
+  /** Operator discovery uses the CLI config directory; only selected-account calls inherit sessions. */
   readonly ambient?: NodeJS.ProcessEnv;
 }
 
@@ -167,6 +167,8 @@ interface Invocation {
   readonly runCommand: SanitizedCommandOutcomeRunner;
   readonly ambient: NodeJS.ProcessEnv;
 }
+
+type OperatorContext = 'discovery' | 'selected';
 
 type Ran =
   | { readonly kind: 'exited'; readonly exitCode: number; readonly stdout: string; readonly stderr: string }
@@ -233,14 +235,15 @@ function isFileSystemError(error: unknown): boolean {
 function cliEnvironment(
   ambient: NodeJS.ProcessEnv,
   token: string | undefined,
-  operator: boolean,
+  operator: OperatorContext | undefined,
 ): Record<string, string> {
   const inherited = Object.entries(buildToolEnvironment(ambient, { HOME: os.homedir() })).filter(
     ([key]) => !key.startsWith('OP_'),
   );
   const environment = Object.fromEntries(inherited);
   environment.OP_BIOMETRIC_UNLOCK_ENABLED = 'false';
-  if (operator) {
+  if (operator !== undefined && ambient.OP_CONFIG_DIR) environment.OP_CONFIG_DIR = ambient.OP_CONFIG_DIR;
+  if (operator === 'selected') {
     // `--account` selects the operator's exact account among their CLI sessions.
     for (const [key, value] of Object.entries(ambient)) {
       if ((key === 'OP_SESSION' || key.startsWith('OP_SESSION_')) && value) {
@@ -258,7 +261,7 @@ function cliCommand(
   args: readonly string[],
   token: string | undefined,
   timeoutMs: number,
-  operator = false,
+  operator?: OperatorContext,
 ): SanitizedCommand {
   return {
     command: invocation.executable,
@@ -428,11 +431,11 @@ export class OnePasswordCli {
 
   async #invoke(identity: OnePasswordIdentity | undefined, args: readonly string[]): Promise<Ran> {
     if (identity === undefined)
-      return run(this.#invocation, cliCommand(this.#invocation, args, undefined, OPERATOR_TIMEOUT_MS));
+      return run(this.#invocation, cliCommand(this.#invocation, args, undefined, OPERATOR_TIMEOUT_MS, 'discovery'));
     assertId(identity.accountId, 'The account');
     if (identity.kind === 'operator') {
       const selected = [...args, '--account', identity.accountId];
-      return run(this.#invocation, cliCommand(this.#invocation, selected, undefined, OPERATOR_TIMEOUT_MS, true));
+      return run(this.#invocation, cliCommand(this.#invocation, selected, undefined, OPERATOR_TIMEOUT_MS, 'selected'));
     }
     const token = await readOnePasswordToken(identity.tokenFile);
     if (token.status !== 'ready') return { kind: 'refused', failure: failed('token_unavailable') };

@@ -39,6 +39,7 @@ const AMBIENT: NodeJS.ProcessEnv = {
   OP_CONNECT_TOKEN: 'connect-token-inherited-value',
   OP_SESSION: 'operator-session-value',
   OP_SESSION_juno: 'session-inherited-value',
+  OP_CONFIG_DIR: '/tmp/gws-ea-operator-op-config',
   OP_BIOMETRIC_UNLOCK_ENABLED: 'true',
   OP_ACCOUNT: OTHER_ACCOUNT_ID,
   OP_FORMAT: 'human-readable',
@@ -184,7 +185,9 @@ describe('opening the 1Password CLI', () => {
 describe('1Password identities', () => {
   it('uses CLI sessions for the selected operator account without desktop, service-account or Connect authentication', async () => {
     const { cli, calls } = await openCli((command) =>
-      command.env?.OP_SESSION === AMBIENT.OP_SESSION ? whoami() : { exitCode: 1 },
+      command.env?.OP_SESSION === AMBIENT.OP_SESSION && command.env?.OP_CONFIG_DIR === AMBIENT.OP_CONFIG_DIR
+        ? whoami()
+        : { exitCode: 1 },
     );
     expect(await cli.whoami(OPERATOR)).toEqual({ status: 'ok', accountId: ACCOUNT_ID, userId: OPERATOR_USER_ID });
 
@@ -192,6 +195,7 @@ describe('1Password identities', () => {
     expect(opVariables(calls[0].env)).toEqual({
       OP_SESSION: AMBIENT.OP_SESSION,
       OP_SESSION_juno: AMBIENT.OP_SESSION_juno,
+      OP_CONFIG_DIR: AMBIENT.OP_CONFIG_DIR,
       OP_BIOMETRIC_UNLOCK_ENABLED: 'false',
     });
     expect(calls[0].env).toMatchObject({ PATH: '/usr/bin:/bin', HOME: os.homedir() });
@@ -247,6 +251,7 @@ describe('1Password identities', () => {
         OP_BIOMETRIC_UNLOCK_ENABLED: 'false',
         OP_SESSION: AMBIENT.OP_SESSION,
         OP_SESSION_juno: AMBIENT.OP_SESSION_juno,
+        OP_CONFIG_DIR: AMBIENT.OP_CONFIG_DIR,
       },
       { OP_BIOMETRIC_UNLOCK_ENABLED: 'false', OP_SERVICE_ACCOUNT_TOKEN: configured },
     ]);
@@ -367,16 +372,20 @@ describe('bounded 1Password outcomes', () => {
 
 describe('1Password actions', () => {
   it('lists the operator accounts by their exact IDs', async () => {
-    const { cli, calls } = await openCli(() => ({
-      stdout: JSON.stringify([
-        {
-          url: 'my.1password.com',
-          email: 'morgan.ellery@example.test',
-          user_uuid: OPERATOR_USER_ID,
-          account_uuid: ACCOUNT_ID,
-        },
-      ]),
-    }));
+    const { cli, calls } = await openCli((command) =>
+      command.env?.OP_CONFIG_DIR === AMBIENT.OP_CONFIG_DIR
+        ? {
+            stdout: JSON.stringify([
+              {
+                url: 'my.1password.com',
+                email: 'morgan.ellery@example.test',
+                user_uuid: OPERATOR_USER_ID,
+                account_uuid: ACCOUNT_ID,
+              },
+            ]),
+          }
+        : { exitCode: 1 },
+    );
     expect(await cli.listAccounts()).toEqual({
       status: 'ok',
       accounts: [
@@ -389,7 +398,10 @@ describe('1Password actions', () => {
       ],
     });
     expect(calls[0].args).toEqual(['account', 'list', '--format', 'json']);
-    expect(opVariables(calls[0].env)).toEqual({ OP_BIOMETRIC_UNLOCK_ENABLED: 'false' });
+    expect(opVariables(calls[0].env)).toEqual({
+      OP_BIOMETRIC_UNLOCK_ENABLED: 'false',
+      OP_CONFIG_DIR: AMBIENT.OP_CONFIG_DIR,
+    });
   });
 
   it('creates a vault and returns exactly the vault it created', async () => {
@@ -613,6 +625,7 @@ describe('minting a service account token', () => {
       OP_BIOMETRIC_UNLOCK_ENABLED: 'false',
       OP_SESSION: AMBIENT.OP_SESSION,
       OP_SESSION_juno: AMBIENT.OP_SESSION_juno,
+      OP_CONFIG_DIR: AMBIENT.OP_CONFIG_DIR,
     });
   });
 
