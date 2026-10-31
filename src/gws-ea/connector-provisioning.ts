@@ -8,7 +8,7 @@ import { safeErrorCode, safeErrorMessage } from './redact.js';
 import type { ConnectorName } from './connectors.js';
 
 export interface ConnectorProvisioningDependencies {
-  readonly onePassword?: Pick<OnePasswordDependencies, 'cli' | 'upsertEnvVars' | 'operatorTerminal' | 'rateLimitState'>;
+  readonly onePassword?: Pick<OnePasswordDependencies, 'cli' | 'upsertEnvVars' | 'rateLimitState'>;
   readonly web?: WebCapabilityDependencies;
 }
 export interface PendingConnector {

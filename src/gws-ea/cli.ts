@@ -812,7 +812,6 @@ class Cli {
       runtime: options.runtime,
       onePassword: {
         cli: onePasswordSeams(this.#runtime.environment ?? process.env, this.#runtime.onePassword),
-        operatorTerminal: Boolean(this.#runtime.prompts),
         rateLimitState: this.#connectorRateLimit,
       },
       web: this.#runtime.web,
@@ -1267,7 +1266,6 @@ class Cli {
       onePassword: {
         cli: onePasswordSeams(this.#runtime.environment ?? process.env, this.#runtime.onePassword),
         upsertEnvVars: this.#runtime.upsertEnvVars,
-        operatorTerminal: Boolean(this.#runtime.prompts),
         rateLimitState: this.#connectorRateLimit,
       },
       web: this.#runtime.web,
@@ -2633,7 +2631,6 @@ export async function runCli(args: readonly string[], runtime: CliRuntime = {}):
             cli: onePasswordSeams(environment, runtime.onePassword),
             upsertEnvVars: runtime.upsertEnvVars,
             chooseAccount: runtime.chooseOnePasswordAccount,
-            operatorTerminal: Boolean(runtime.prompts),
             progress: (line) => presenter.line(line),
             recordEffect,
             rateLimitState: { limited: false },

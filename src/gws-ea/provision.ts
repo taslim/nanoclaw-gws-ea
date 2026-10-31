@@ -1470,9 +1470,6 @@ export async function provisionAssistantResources(
         phase: actionable.name === 'onepassword' ? 'provision_onepassword' : 'provision_web',
         code: `${actionable.name}_${actionable.reason}`,
         message: `The assistant is ready; ${actionable.name} setup waits. ${actionable.message}`,
-        ...(actionable.reason === 'operator_sign_in_needed' && onePassword.operatorTerminal === false
-          ? { optional: true }
-          : {}),
         details: [
           ...connectors.next_actions.flatMap((action) => {
             if (action.kind !== 'command') return [action.instruction];

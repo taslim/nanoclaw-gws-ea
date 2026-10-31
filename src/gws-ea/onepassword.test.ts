@@ -201,24 +201,20 @@ describe('1Password marker validation', () => {
 });
 
 describe('installing 1Password for existing and future assistants', () => {
-  it('leaves a new vault pending without touching the operator sign-in when no terminal is present', async () => {
+  it('leaves a new vault pending when the operator CLI session is unavailable', async () => {
     await enable();
     const runtime = await assistant();
     provider.calls.length = 0;
     const result = await withInstanceOperation(paths, runtime.instance_id, (operation) =>
       provisionAssistantVault(operation, {
         ...dependencies(),
-        operatorTerminal: false,
         cli: {
           ...provider.cli(),
-          runCommand: async () => {
-            throw new Error('op must not run without an operator terminal');
-          },
+          ambient: { PATH: '/usr/bin:/bin' },
         },
       }),
     );
-    expect(result).toMatchObject({ outcome: 'pending', reason: 'operator_sign_in_needed' });
-    expect(provider.calls).toEqual([]);
+    expect(result).toMatchObject({ outcome: 'pending', reason: 'sign_in_required' });
     expect(provider.vaults.size).toBe(0);
   });
 
@@ -239,7 +235,7 @@ describe('installing 1Password for existing and future assistants', () => {
     }
   });
 
-  it('keeps existing ready bindings without an operator terminal and shares a rate limit across hooks', async () => {
+  it('keeps existing ready bindings without authenticating and shares a rate limit across hooks', async () => {
     const ready = await assistant();
     await enable();
     const record = await resourcesOf(ready);
@@ -250,7 +246,7 @@ describe('installing 1Password for existing and future assistants', () => {
       },
     };
     const alreadyReady = await withInstanceOperation(paths, ready.instance_id, (operation) =>
-      provisionAssistantVault(operation, { ...dependencies(), operatorTerminal: false, cli: neverOpens }),
+      provisionAssistantVault(operation, { ...dependencies(), cli: neverOpens }),
     );
     expect(alreadyReady).toMatchObject({ outcome: 'ready', vault_id: record?.vault.id, changed: false });
     const first = await assistant();
@@ -258,7 +254,7 @@ describe('installing 1Password for existing and future assistants', () => {
     const state = { limited: false };
     provider.before = () => ({ exitCode: 1, stderr: '[ERROR] (429) Too Many Requests' });
     const limited = await withInstanceOperation(paths, first.instance_id, (operation) =>
-      provisionAssistantVault(operation, { ...dependencies(), operatorTerminal: true, rateLimitState: state }),
+      provisionAssistantVault(operation, { ...dependencies(), rateLimitState: state }),
     );
     expect(limited).toMatchObject({ outcome: 'pending', reason: 'rate_limited' });
     expect(state.limited).toBe(true);
@@ -266,7 +262,6 @@ describe('installing 1Password for existing and future assistants', () => {
     const skipped = await withInstanceOperation(paths, second.instance_id, (operation) =>
       provisionAssistantVault(operation, {
         ...dependencies(),
-        operatorTerminal: true,
         rateLimitState: state,
         cli: neverOpens,
       }),
@@ -432,7 +427,7 @@ describe('installing 1Password for existing and future assistants', () => {
     const [first, second] = [await assistant(), await assistant()].sort((left, right) =>
       left.instance_id.localeCompare(right.instance_id),
     );
-    // The operator's desktop session ends right after the first runtime account is minted.
+    // The operator's CLI session ends right after the first runtime account is minted.
     provider.after = (args) => {
       if (args[0] === 'service-account' && args[1] === 'create' && args.includes('--vault')) provider.signedIn = false;
     };
@@ -794,7 +789,7 @@ describe('choosing the 1Password account', () => {
     });
   });
 
-  it('records the sign-in address the app lists for exactly that account, and refuses any other', async () => {
+  it('records the sign-in address the CLI lists for exactly that account, and refuses any other', async () => {
     await assistant();
     const hostPaths = onePasswordHostPaths(paths.configRoot);
     // An account the app does not hold, or one it lists without a 1Password sign-in address, creates nothing.
@@ -820,10 +815,13 @@ describe('choosing the 1Password account', () => {
     });
   });
 
-  it('pauses for the desktop sign-in before anything is created', async () => {
+  it('reports the CLI sign-in command before anything is created when the session is missing', async () => {
     await assistant();
     provider.signedIn = false;
-    await expect(enable()).rejects.toMatchObject({ code: 'onepassword_sign_in_required' });
+    await expect(enable()).rejects.toMatchObject({
+      code: 'onepassword_sign_in_required',
+      message: expect.stringContaining('op signin'),
+    });
     expect(provider.serviceAccounts.size).toBe(0);
     expect(await exists(onePasswordHostPaths(paths.configRoot).policyFile)).toBe(false);
   });
@@ -1069,7 +1067,7 @@ describe('the native 1Password connector commands', () => {
   beforeEach(async () => {
     ({ runCli } = await import('./cli.js'));
   });
-  async function run(args: readonly string[]) {
+  async function run(args: readonly string[], cli = dependencies().cli) {
     const stdout: string[] = [];
     const stderr: string[] = [];
     const code = await runCli(args, {
@@ -1077,7 +1075,7 @@ describe('the native 1Password connector commands', () => {
       environment: { PATH: '/usr/bin:/bin' },
       stdout: (line) => stdout.push(line),
       stderr: (line) => stderr.push(line),
-      onePassword: dependencies().cli,
+      onePassword: cli,
       prompts,
       upsertEnvVars,
     });
@@ -1121,10 +1119,12 @@ describe('the native 1Password connector commands', () => {
       .join('\n');
     const logs = await treeText(paths.logsRoot);
     expect(provider.tokens).toHaveLength(2);
-    for (const token of provider.tokens) {
+    for (const token of [...provider.tokens, 'fixture-operator-session']) {
       expect(everything).not.toContain(token);
       expect(logs).not.toContain(token);
     }
+    expect(await treeText(paths.configRoot)).not.toContain('fixture-operator-session');
+    expect(await treeText(paths.stateRoot)).not.toContain('fixture-operator-session');
   });
 
   it('pauses a partially provisioned terminal install with the command that continues it', async () => {
@@ -1139,8 +1139,45 @@ describe('the native 1Password connector commands', () => {
     expect(provider.vaults.size).toBe(2);
   });
 
-  it('pauses noninteractive install before calling op and preserves its structured continuation', async () => {
+  it('redacts generic and named operator sessions from unexpected diagnostics', async () => {
+    const sessions = { OP_SESSION: randomUUID(), OP_SESSION_operator: randomUUID() };
+    const result = await run(['connectors', 'install', 'onepassword', '--account', ACCOUNT_ID, '--json'], {
+      ...provider.cli(),
+      ambient: { PATH: '/usr/bin:/bin', ...sessions },
+      runCommand: async (command) => {
+        if (command.args[0] === 'whoami')
+          throw new GwsEaError('unexpected_operator_failure', Object.values(sessions).join(' '));
+        return provider.runCommand(command);
+      },
+    });
+    expect(result.code).toBe(1);
+    expect(result.stdout).toContain('[REDACTED]');
+    const logs = await treeText(paths.logsRoot);
+    for (const session of Object.values(sessions)) {
+      expect(result.stdout + result.stderr).not.toContain(session);
+      expect(logs).not.toContain(session);
+    }
+    expect(provider.serviceAccounts.size).toBe(0);
+  });
+
+  it.each(['--json', '--no-input'])('installs with a CLI session in %s mode without prompting', async (mode) => {
     await assistant();
+    const installed = await run(['connectors', 'install', 'onepassword', '--account', ACCOUNT_ID, mode]);
+    expect(installed.code).toBe(0);
+    if (mode === '--json') {
+      const result: unknown = JSON.parse(installed.stdout);
+      expectResultContract('connectors install onepassword', result);
+      expect(result).toMatchObject({ outcome: 'succeeded', changed: true });
+    }
+    expect(provider.serviceAccounts.size).toBe(2);
+    expect(provider.vaults.size).toBe(1);
+    const invalid = await run(['connectors', 'install', 'onepassword', '--account', 'hale.1password.com']);
+    expect(invalid.code).toBe(2);
+  });
+
+  it('preserves the structured sign-in continuation when a noninteractive CLI session expires', async () => {
+    await assistant();
+    provider.signedIn = false;
     const paused = await run(['connectors', 'install', 'onepassword', '--account', ACCOUNT_ID, '--json']);
     expect(paused.code).toBe(10);
     const result: unknown = JSON.parse(paused.stdout);
@@ -1148,14 +1185,13 @@ describe('the native 1Password connector commands', () => {
     expect(result).toMatchObject({
       outcome: 'paused',
       changed: false,
-      error: { code: 'onepassword_operator_sign_in_needed' },
+      error: { code: 'onepassword_sign_in_required', message: expect.stringContaining('op signin') },
       next_actions: expect.arrayContaining([
         { kind: 'command', argv: ['gws-ea', 'connectors', 'install', 'onepassword'] },
       ]),
     });
-    expect(provider.calls).toEqual([]);
-    const invalid = await run(['connectors', 'install', 'onepassword', '--account', 'hale.1password.com']);
-    expect(invalid.code).toBe(2);
+    expect(provider.serviceAccounts.size).toBe(0);
+    expect(provider.vaults.size).toBe(0);
   });
 
   it('reports a missing CLI before any domain state changes', async () => {

@@ -1,6 +1,6 @@
 /**
  * The one 1Password CLI boundary. Each action is a fixed argument list; no caller supplies an argument the CLI
- * parses as a flag. Operator calls authenticate through the operator's own desktop sign-in in exactly the selected
+ * parses as a flag. Operator calls authenticate through the operator's CLI session in exactly the selected
  * account and can never inherit a service-account or Connect credential; service-account calls authenticate with
  * exactly the token in their file. Provider output never reaches a log or a result: every failure is a constant
  * reason, a minted token is captured privately before anything else reads it, and nothing is retried here.
@@ -37,7 +37,7 @@ export const ONEPASSWORD_CLI_MINIMUM_VERSION = '2.29.0';
 const MINIMUM_VERSION = ONEPASSWORD_CLI_MINIMUM_VERSION.split('.').map(Number);
 const VERSION = /^(\d{1,6})\.(\d{1,6})\.(\d{1,6})(-[0-9A-Za-z.-]{1,64})?$/u;
 const VERSION_TIMEOUT_MS = 15_000;
-/** Long enough for the operator to approve the desktop app's prompt. */
+/** Operator provisioning requests can take longer than routine vault access. */
 const OPERATOR_TIMEOUT_MS = 120_000;
 const SERVICE_ACCOUNT_TIMEOUT_MS = 60_000;
 const OUTPUT_LIMIT_BYTES = 1024 * 1024;
@@ -47,7 +47,7 @@ const MAX_DISPLAY_CHARACTERS = 254;
 /** Runner failures that leave a provider call's effect unknown; anything else is this code's own fault. */
 const INTERRUPTIONS = new Set(['command_failed', 'command_timeout', 'command_output_limit']);
 
-/** The operator's own desktop sign-in, in exactly this account; never a service-account or Connect credential. */
+/** The operator's CLI session, in exactly this account; never a service-account or Connect credential. */
 export interface OperatorIdentity {
   readonly kind: 'operator';
   readonly accountId: string;
@@ -106,7 +106,7 @@ export interface OnePasswordCliOptions {
   readonly checkoutRoots?: readonly string[];
   readonly resolve?: typeof resolvePersistedExecutable;
   readonly runCommand?: SanitizedCommandOutcomeRunner;
-  /** Where the tool allowlist draws from; no 1Password variable in it is ever passed on. */
+  /** Operator discovery uses the CLI config directory; only selected-account calls inherit sessions. */
   readonly ambient?: NodeJS.ProcessEnv;
 }
 
@@ -168,6 +168,8 @@ interface Invocation {
   readonly ambient: NodeJS.ProcessEnv;
 }
 
+type OperatorContext = 'discovery' | 'selected';
+
 type Ran =
   | { readonly kind: 'exited'; readonly exitCode: number; readonly stdout: string; readonly stderr: string }
   | { readonly kind: 'interrupted' }
@@ -188,7 +190,7 @@ const REJECTIONS: ReadonlyArray<readonly [ProviderRejection, RegExp]> = [
   ['rate_limited', /\(429\)|too many requests|maximum number of this type of requests/iu],
   [
     'not_signed_in',
-    /\(401\)|\bunauthori[sz]ed\b|not currently signed in|account is not signed in|authorization prompt dismissed|session (?:has )?expired/iu,
+    /\(401\)|\bunauthori[sz]ed\b|not currently signed in|account is not signed in|could not find session token for account|authorization prompt dismissed|session (?:has )?expired/iu,
   ],
   ['forbidden', /\(403\)|\bforbidden\b|(?:do not|don't|does not|doesn't) have (?:the )?permission|permission denied/iu],
   ['not_found', /\(404\)|\bisn't an? (?:vault|user)\b|\bnot found\b|\bdoes(?: not|n't) exist\b/iu],
@@ -230,12 +232,28 @@ function isFileSystemError(error: unknown): boolean {
   return /^E[A-Z0-9]+$/u.test(errorCode(error, ''));
 }
 
-function cliEnvironment(ambient: NodeJS.ProcessEnv, token: string | undefined): Record<string, string> {
-  // The allowlist names no OP_ variable; filtering anyway keeps authentication exactly the identity's.
+function cliEnvironment(
+  ambient: NodeJS.ProcessEnv,
+  token: string | undefined,
+  operator: OperatorContext | undefined,
+): Record<string, string> {
   const inherited = Object.entries(buildToolEnvironment(ambient, { HOME: os.homedir() })).filter(
     ([key]) => !key.startsWith('OP_'),
   );
-  return Object.fromEntries(token === undefined ? inherited : [...inherited, ['OP_SERVICE_ACCOUNT_TOKEN', token]]);
+  const environment = Object.fromEntries(inherited);
+  environment.OP_BIOMETRIC_UNLOCK_ENABLED = 'false';
+  if (operator !== undefined && ambient.OP_CONFIG_DIR) environment.OP_CONFIG_DIR = ambient.OP_CONFIG_DIR;
+  if (operator === 'selected') {
+    // `--account` selects the operator's exact account among their CLI sessions.
+    for (const [key, value] of Object.entries(ambient)) {
+      if ((key === 'OP_SESSION' || key.startsWith('OP_SESSION_')) && value) {
+        registerSecret(value);
+        environment[key] = value;
+      }
+    }
+  }
+  if (token !== undefined) environment.OP_SERVICE_ACCOUNT_TOKEN = token;
+  return environment;
 }
 
 function cliCommand(
@@ -243,12 +261,13 @@ function cliCommand(
   args: readonly string[],
   token: string | undefined,
   timeoutMs: number,
+  operator?: OperatorContext,
 ): SanitizedCommand {
   return {
     command: invocation.executable,
     args,
     cwd: CONTROL_PLANE_ROOT,
-    env: cliEnvironment(invocation.ambient, token),
+    env: cliEnvironment(invocation.ambient, token, operator),
     timeoutMs,
     outputLimitBytes: OUTPUT_LIMIT_BYTES,
     privateOutput: true,
@@ -412,11 +431,11 @@ export class OnePasswordCli {
 
   async #invoke(identity: OnePasswordIdentity | undefined, args: readonly string[]): Promise<Ran> {
     if (identity === undefined)
-      return run(this.#invocation, cliCommand(this.#invocation, args, undefined, OPERATOR_TIMEOUT_MS));
+      return run(this.#invocation, cliCommand(this.#invocation, args, undefined, OPERATOR_TIMEOUT_MS, 'discovery'));
     assertId(identity.accountId, 'The account');
     if (identity.kind === 'operator') {
       const selected = [...args, '--account', identity.accountId];
-      return run(this.#invocation, cliCommand(this.#invocation, selected, undefined, OPERATOR_TIMEOUT_MS));
+      return run(this.#invocation, cliCommand(this.#invocation, selected, undefined, OPERATOR_TIMEOUT_MS, 'selected'));
     }
     const token = await readOnePasswordToken(identity.tokenFile);
     if (token.status !== 'ready') return { kind: 'refused', failure: failed('token_unavailable') };
@@ -451,7 +470,7 @@ export class OnePasswordCli {
     }
   }
 
-  /** The accounts the operator's desktop app holds, for selecting one by its exact ID. */
+  /** Locally configured CLI accounts, for selecting one by its exact ID. */
   async listAccounts(): Promise<OnePasswordResult<{ readonly accounts: readonly OnePasswordAccount[] }>> {
     const result = await this.#read(undefined, ['account', 'list', '--format', 'json']);
     if (result.status !== 'ok') return result;

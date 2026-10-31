@@ -65,7 +65,7 @@ describe('native capability driver', () => {
           command: 'connectors check voice',
           outcome: 'failed',
           changed: false,
-          data: { name: 'voice', setup:'not_installed',readiness:{status:'not_ready',checked:true} },
+          data: { name: 'voice', setup: 'not_installed', readiness: { status: 'not_ready', checked: true } },
         });
       } else {
         expect(output.join('')).toContain('voice (host)');
@@ -103,17 +103,17 @@ describe('native capability driver', () => {
         expect(checked).toMatchObject({
           outcome: 'failed',
           changed: false,
-          data: {setup:'not_installed'},
+          data: { setup: 'not_installed' },
         });
       } else expect(output.join('')).toContain('onepassword (host)');
       expect(await readdir(path.join(root, 'config'))).toEqual([]);
 
       output.length = 0;
-      expect(await main(['connectors', 'install', 'onepassword', mode], { interactive: true })).toBe(10);
+      expect(await main(['connectors', 'install', 'onepassword', mode], { interactive: true })).toBe(1);
       if (mode === '--json') {
         const enabled = JSON.parse(output.join('')) as unknown;
         expectResultContract('connectors install onepassword', enabled);
-        expect(enabled).toMatchObject({ outcome: 'paused', error: { code: 'onepassword_operator_sign_in_needed' } });
+        expect(enabled).toMatchObject({ outcome: 'failed', error: { code: 'onepassword_cli_missing' } });
       }
       const { confirm, spinner, note, select, text, password } = prompts;
       for (const prompt of [confirm, spinner, note, select, text, password]) expect(prompt).not.toHaveBeenCalled();

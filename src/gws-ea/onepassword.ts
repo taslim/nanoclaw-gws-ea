@@ -1,5 +1,5 @@
 /**
- * Operator-led 1Password provisioning. The operator's own desktop sign-in
+ * Operator-led 1Password provisioning. The operator's authenticated CLI session
  * selects one account and mints a host management service account that may
  * only create vaults. Per compatible assistant, that account creates one vault
  * and grants the operator management rights on it, so the operator can mint
@@ -69,7 +69,7 @@ export const ONEPASSWORD_CAPABILITY = {
   summary: 'Give each compatible assistant its own 1Password vault for the logins it fills and saves.',
   prerequisites: [
     'The 1Password CLI (op) 2.29 or later, installed in an operator-owned location on the operator PATH (for example brew install 1password-cli).',
-    'The 1Password desktop app on this host, signed in to the account assistants use, with Settings > Developer > Integrate with 1Password CLI turned on.',
+    'An authenticated 1Password CLI session for the account assistants use (op account add, then eval "$(OP_BIOMETRIC_UNLOCK_ENABLED=false op signin)").',
     'An operator allowed to create service accounts in that account (an owner or administrator).',
   ],
   readiness_limits: [
@@ -192,8 +192,6 @@ export interface OnePasswordDependencies {
   readonly chooseAccount?: (accounts: readonly OnePasswordAccount[]) => Promise<string | undefined>;
   readonly recordEffect?: (changed: true | null) => void;
   readonly progress?: (line: string) => void;
-  /** True only when the operator's terminal can handle desktop approval. */
-  readonly operatorTerminal?: boolean;
   /** Shared by a bulk operation so a rate limit prevents later provider work. */
   readonly rateLimitState?: { limited: boolean };
 }
@@ -262,7 +260,7 @@ function pendingMessage(
     case 'onepassword_busy':
       return 'Another 1Password operation holds the host; retry once it finishes.';
     case 'operator_sign_in_needed':
-      return 'Run gws-ea connectors install onepassword from an operator terminal to finish the vault, approving the 1Password app when it asks.';
+      return 'Sign in with eval "$(OP_BIOMETRIC_UNLOCK_ENABLED=false op signin)", then run gws-ea connectors install onepassword from the same shell to finish the vault.';
     case 'instance_busy':
       return 'Another operation holds this assistant; retry once it finishes.';
     case 'cli_unavailable':
@@ -270,7 +268,7 @@ function pendingMessage(
     case 'policy_invalid':
       return `The 1Password host policy cannot be used safely${facts.file ? ` (${facts.file})` : ''}. Inspect it before retrying.`;
     case 'sign_in_required':
-      return "Unlock the 1Password app, signed in to this host's account with Settings > Developer > Integrate with 1Password CLI turned on, approve gws-ea's request when it appears, then retry.";
+      return 'Sign in to the account assistants use with eval "$(OP_BIOMETRIC_UNLOCK_ENABLED=false op signin)", then retry from the same shell. If no CLI account is configured, run OP_BIOMETRIC_UNLOCK_ENABLED=false op account add first.';
     case 'management_unavailable':
       return "1Password refused the host management service account, or its token is missing. Inspect it on 1Password.com and in this host's configuration before retrying.";
     case 'rate_limited':
@@ -581,7 +579,7 @@ function hostProviderError(reason: OnePasswordFailureReason, identity: 'operator
       return identity === 'operator'
         ? new GwsEaError(
             'onepassword_account_unknown',
-            'The 1Password app holds no such account. Sign in to it in the app, or name one it holds.',
+            'The 1Password CLI has no such account. Run OP_BIOMETRIC_UNLOCK_ENABLED=false op account add, or choose an account from op account list.',
           )
         : new GwsEaError('onepassword_management_unavailable', pendingMessage('management_unavailable', {}));
     case 'unexpected_output':
@@ -613,7 +611,7 @@ export async function withOnePasswordHostLock<T>(paths: ControlPlanePaths, work:
 }
 
 /**
- * The one account every assistant on this host uses, as the 1Password app
+ * The one account every assistant on this host uses, as the 1Password CLI
  * lists it: the recorded one, or one the operator names or chooses. The
  * listing gives its sign-in address, which the host records beside its ID.
  */
@@ -634,7 +632,7 @@ async function selectAccount(
   if (!listed.accounts.length)
     throw new GwsEaError(
       'onepassword_sign_in_required',
-      'The 1Password app holds no account. Sign in to the account assistants should use, then retry.',
+      'The 1Password CLI has no account configured. Run OP_BIOMETRIC_UNLOCK_ENABLED=false op account add, then sign in with eval "$(OP_BIOMETRIC_UNLOCK_ENABLED=false op signin)" and retry from the same shell.',
     );
   const named = recorded?.accountId ?? requested;
   const chosen = named ?? (choose ? await choose(listed.accounts) : undefined);
@@ -651,7 +649,7 @@ async function selectAccount(
     );
   const account = listed.accounts.find((candidate) => candidate.accountId === chosen);
   if (!account) {
-    if (named === undefined) throw invalidArguments('The chosen 1Password account is not one the app holds.');
+    if (named === undefined) throw invalidArguments('The chosen 1Password account is not configured in the CLI.');
     throw hostProviderError('not_found', 'operator');
   }
   const signInAddress = onePasswordSignInAddress(account.url);
@@ -813,8 +811,6 @@ export async function installOnePassword(
     );
   };
   await assertUninstallComplete();
-  if (dependencies.operatorTerminal === false)
-    throw new GwsEaError('onepassword_operator_sign_in_needed', pendingMessage('operator_sign_in_needed', {}));
   // Nothing on disk changes until a trusted, current CLI is found.
   const cli = await openCli(dependencies.cli);
   return withOnePasswordHostLock(paths, async () => {
@@ -850,7 +846,7 @@ export async function installOnePassword(
       dependencies.chooseAccount,
     );
     const operator: OperatorIdentity = { kind: 'operator', accountId };
-    dependencies.progress?.('Approve the 1Password app’s request if it asks.');
+    dependencies.progress?.('Verifying the 1Password CLI session.');
     const operatorUserId = await verifyOperator(cli, operator);
     const management: ServiceAccountIdentity = {
       kind: 'service_account',
@@ -944,14 +940,11 @@ export async function onePasswordEnabled(paths: ControlPlanePaths): Promise<bool
  * Install's reconciliation for one assistant during its operator-led create or
  * resume, under the instance operation the caller holds. Undefined when
  * 1Password is not enabled on this host. An assistant already provisioned
- * costs no provider request and no desktop prompt.
+ * costs no provider request.
  */
 export async function provisionAssistantVault(
   operation: InstanceOperation,
-  dependencies: Pick<
-    OnePasswordDependencies,
-    'cli' | 'upsertEnvVars' | 'recordEffect' | 'operatorTerminal' | 'rateLimitState'
-  > = {},
+  dependencies: Pick<OnePasswordDependencies, 'cli' | 'upsertEnvVars' | 'recordEffect' | 'rateLimitState'> = {},
 ): Promise<OnePasswordAssistantProvisioning | undefined> {
   operation.assertActive();
   const { paths, instanceId } = operation;
@@ -978,7 +971,6 @@ export async function provisionAssistantVault(
       const policy = { ...read.policy, managementServiceAccountId };
       let connection: Promise<ConnectionResult> | undefined;
       const connect = async (): Promise<ConnectionResult> => {
-        if (dependencies.operatorTerminal === false) return { status: 'pending', reason: 'operator_sign_in_needed' };
         let cli: OnePasswordCli;
         try {
           cli = await openCli(dependencies.cli, policy.cliPath);
@@ -1250,7 +1242,7 @@ function runtimeAccess(
 
 /**
  * Local facts, plus service-account requests only for an explicit check:
- * never the operator's desktop sign-in, never a write, never a repair.
+ * never the operator's CLI session, never a write, never a repair.
  */
 export async function inspectOnePasswordCapability(
   paths: ControlPlanePaths,

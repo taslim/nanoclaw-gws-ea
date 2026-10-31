@@ -74,7 +74,7 @@ describe('local CLI discovery and grammar', () => {
     const help = capture();
     expect(await runCli(['help', 'connectors', 'install', 'onepassword'], help.runtime)).toBe(0);
     expect(help.stdout.join('\n')).toContain('--account <account_id>');
-    expect(help.stdout.join('\n')).toContain('Integrate with 1Password CLI');
+    expect(help.stdout.join('\n')).toContain('eval "$(OP_BIOMETRIC_UNLOCK_ENABLED=false op signin)"');
     expect(help.runtime.checkPrerequisites).not.toHaveBeenCalled();
   });
   it.each([

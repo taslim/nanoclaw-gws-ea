@@ -37,7 +37,10 @@ const AMBIENT: NodeJS.ProcessEnv = {
   OP_SERVICE_ACCOUNT_TOKEN: INHERITED_TOKEN,
   OP_CONNECT_HOST: 'http://connect.example.test',
   OP_CONNECT_TOKEN: 'connect-token-inherited-value',
+  OP_SESSION: 'operator-session-value',
   OP_SESSION_juno: 'session-inherited-value',
+  OP_CONFIG_DIR: '/tmp/gws-ea-operator-op-config',
+  OP_BIOMETRIC_UNLOCK_ENABLED: 'true',
   OP_ACCOUNT: OTHER_ACCOUNT_ID,
   OP_FORMAT: 'human-readable',
 };
@@ -175,17 +178,26 @@ describe('opening the 1Password CLI', () => {
     expect(opening.cli.version).toBe('2.29.0');
     expect(commands).toHaveLength(1);
     expect(commands[0]).toMatchObject({ command: FAKE_OP, args: ['--version'], privateOutput: true });
-    expect(opVariables(commands[0].env)).toEqual({});
+    expect(opVariables(commands[0].env)).toEqual({ OP_BIOMETRIC_UNLOCK_ENABLED: 'false' });
   });
 });
 
 describe('1Password identities', () => {
-  it('never lets an operator call inherit service-account or Connect authentication', async () => {
-    const { cli, calls } = await openCli(() => whoami());
+  it('uses CLI sessions for the selected operator account without desktop, service-account or Connect authentication', async () => {
+    const { cli, calls } = await openCli((command) =>
+      command.env?.OP_SESSION === AMBIENT.OP_SESSION && command.env?.OP_CONFIG_DIR === AMBIENT.OP_CONFIG_DIR
+        ? whoami()
+        : { exitCode: 1 },
+    );
     expect(await cli.whoami(OPERATOR)).toEqual({ status: 'ok', accountId: ACCOUNT_ID, userId: OPERATOR_USER_ID });
 
     expect(calls[0].args).toEqual(['whoami', '--format', 'json', '--account', ACCOUNT_ID]);
-    expect(opVariables(calls[0].env)).toEqual({});
+    expect(opVariables(calls[0].env)).toEqual({
+      OP_SESSION: AMBIENT.OP_SESSION,
+      OP_SESSION_juno: AMBIENT.OP_SESSION_juno,
+      OP_CONFIG_DIR: AMBIENT.OP_CONFIG_DIR,
+      OP_BIOMETRIC_UNLOCK_ENABLED: 'false',
+    });
     expect(calls[0].env).toMatchObject({ PATH: '/usr/bin:/bin', HOME: os.homedir() });
     expect(calls[0].privateOutput).toBe(true);
   });
@@ -201,7 +213,10 @@ describe('1Password identities', () => {
       userId: SERVICE_ACCOUNT_USER_ID,
     });
     expect(calls[0].args).toEqual(['whoami', '--format', 'json']);
-    expect(opVariables(calls[0].env)).toEqual({ OP_SERVICE_ACCOUNT_TOKEN: configured });
+    expect(opVariables(calls[0].env)).toEqual({
+      OP_SERVICE_ACCOUNT_TOKEN: configured,
+      OP_BIOMETRIC_UNLOCK_ENABLED: 'false',
+    });
   });
 
   it('runs the real child with exactly those environments', async () => {
@@ -230,7 +245,16 @@ describe('1Password identities', () => {
       .trim()
       .split('\n')
       .map((line) => JSON.parse(line) as Record<string, string>);
-    expect(environments.map(opVariables)).toEqual([{}, {}, { OP_SERVICE_ACCOUNT_TOKEN: configured }]);
+    expect(environments.map(opVariables)).toEqual([
+      { OP_BIOMETRIC_UNLOCK_ENABLED: 'false' },
+      {
+        OP_BIOMETRIC_UNLOCK_ENABLED: 'false',
+        OP_SESSION: AMBIENT.OP_SESSION,
+        OP_SESSION_juno: AMBIENT.OP_SESSION_juno,
+        OP_CONFIG_DIR: AMBIENT.OP_CONFIG_DIR,
+      },
+      { OP_BIOMETRIC_UNLOCK_ENABLED: 'false', OP_SERVICE_ACCOUNT_TOKEN: configured },
+    ]);
   });
 
   it('reports an authentication to another account, or as another kind of identity, as the wrong account', async () => {
@@ -285,6 +309,8 @@ describe('bounded 1Password outcomes', () => {
     ['not_signed_in', '[ERROR] 2026/10/16 07:00:00 You are not currently signed in. Please run `op signin --help`'],
     ['not_signed_in', '[ERROR] 2026/10/16 07:00:00 authorization prompt dismissed, please try again'],
     ['not_signed_in', '[ERROR] (401) Unauthorized: invalid service account token'],
+    ['not_signed_in', `[ERROR] could not find session token for account ${ACCOUNT_ID}`],
+    ['not_signed_in', '[ERROR] session has expired'],
     ['forbidden', "[ERROR] (403) Forbidden: You don't have permission to perform this action"],
     ['not_found', `[ERROR] "${VAULT_ID}" isn't a vault in this account. Specify the vault with its UUID or name.`],
   ])('maps a rejection to %s', async (reason, stderr) => {
@@ -346,16 +372,20 @@ describe('bounded 1Password outcomes', () => {
 
 describe('1Password actions', () => {
   it('lists the operator accounts by their exact IDs', async () => {
-    const { cli, calls } = await openCli(() => ({
-      stdout: JSON.stringify([
-        {
-          url: 'my.1password.com',
-          email: 'morgan.ellery@example.test',
-          user_uuid: OPERATOR_USER_ID,
-          account_uuid: ACCOUNT_ID,
-        },
-      ]),
-    }));
+    const { cli, calls } = await openCli((command) =>
+      command.env?.OP_CONFIG_DIR === AMBIENT.OP_CONFIG_DIR
+        ? {
+            stdout: JSON.stringify([
+              {
+                url: 'my.1password.com',
+                email: 'morgan.ellery@example.test',
+                user_uuid: OPERATOR_USER_ID,
+                account_uuid: ACCOUNT_ID,
+              },
+            ]),
+          }
+        : { exitCode: 1 },
+    );
     expect(await cli.listAccounts()).toEqual({
       status: 'ok',
       accounts: [
@@ -368,7 +398,10 @@ describe('1Password actions', () => {
       ],
     });
     expect(calls[0].args).toEqual(['account', 'list', '--format', 'json']);
-    expect(opVariables(calls[0].env)).toEqual({});
+    expect(opVariables(calls[0].env)).toEqual({
+      OP_BIOMETRIC_UNLOCK_ENABLED: 'false',
+      OP_CONFIG_DIR: AMBIENT.OP_CONFIG_DIR,
+    });
   });
 
   it('creates a vault and returns exactly the vault it created', async () => {
@@ -588,7 +621,12 @@ describe('minting a service account token', () => {
       '--account',
       ACCOUNT_ID,
     ]);
-    expect(opVariables(calls[0].env)).toEqual({});
+    expect(opVariables(calls[0].env)).toEqual({
+      OP_BIOMETRIC_UNLOCK_ENABLED: 'false',
+      OP_SESSION: AMBIENT.OP_SESSION,
+      OP_SESSION_juno: AMBIENT.OP_SESSION_juno,
+      OP_CONFIG_DIR: AMBIENT.OP_CONFIG_DIR,
+    });
   });
 
   it("mints an assistant's runtime account with read and write access to only its vault", async () => {

@@ -278,6 +278,8 @@ by its own lifecycle and ownership rules.
 ## 1Password vaults
 
 ```sh
+OP_BIOMETRIC_UNLOCK_ENABLED=false op account add
+eval "$(OP_BIOMETRIC_UNLOCK_ENABLED=false op signin)"
 gws-ea connectors install onepassword
 gws-ea connectors check onepassword
 gws-ea connectors uninstall onepassword --delete-vaults
@@ -286,20 +288,24 @@ gws-ea connectors uninstall onepassword --abandon
 ```
 
 Install needs the 1Password CLI (`op`) 2.29 or later in an operator-owned location
-on this host's PATH (for example `brew install 1password-cli`), and the 1Password
-desktop app signed in to the account assistants use, with Settings > Developer >
-Integrate with 1Password CLI turned on. The operator must be an owner or
-administrator allowed to create service accounts. The first run selects the
+on this host's PATH (for example `brew install 1password-cli`). Add the account
+with `op account add` once, then sign in and run installation from the same shell
+as shown above. No desktop app is needed; gws-ea disables desktop integration for
+its CLI calls. The operator must be an owner or administrator allowed to create
+service accounts. The first run selects the
 account (`--account <account_id>`, or a terminal choice), records its ID and
-sign-in address, and may ask for desktop approval. It creates a host management
+sign-in address. It creates a host management
 service account that may only create vaults, then one vault and one read/write
 runtime service account for each compatible assistant. Browser use does not
 start as part of installation.
 
 Create and resume provision new assistants; update provisions newly compatible
 ones, and start and restart retry pending setup. Existing vaults and credentials
-are never replaced. When desktop approval is needed without an operator
-terminal, no sign-in is attempted: setup stays pending. Create pauses for an
+are never replaced. Provisioning uses only the operator's existing CLI session;
+gws-ea never asks for or stores the operator's account password or session token.
+An authenticated shell can provision with `--account <account_id> --no-input` or
+`--json`. A missing or expired session leaves setup pending with the sign-in
+command to run before retrying. Create pauses for an
 actionable operator prerequisite with `resume`; a committed update remains
 ready and names `connectors install onepassword` as its next action. A partial
 install retains finished assistants, and rerunning continues the rest. For an
