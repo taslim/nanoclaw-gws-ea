@@ -1,4 +1,4 @@
-import { execFile, spawn } from 'node:child_process';
+import { execFile, spawn, type ChildProcess } from 'node:child_process';
 import { EventEmitter } from 'node:events';
 import net from 'node:net';
 import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, readlink, rm, symlink, writeFile } from 'node:fs/promises';
@@ -8,7 +8,8 @@ import { promisify } from 'node:util';
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { buildChromeLaunch, prepareChromeProfile, spawnChrome } from './chrome.js';
+import { buildChromeLaunch, prepareChromeProfile, spawnChrome, stopChrome } from './chrome.js';
+import * as processes from './chrome-processes.js';
 import { browserPaths, ensureBrowserPaths } from './paths.js';
 
 vi.mock('node:child_process', async (load) => {
@@ -108,6 +109,40 @@ describe('dedicated Chrome profile and launch', () => {
     } finally {
       reserve.mockRestore();
       spawnProcess.mockClear();
+    }
+  });
+
+  it('waits for the owned child exit event after its process group has retired', async () => {
+    const child = Object.assign(new EventEmitter(), {
+      pid: 12345,
+      exitCode: null as number | null,
+      signalCode: null as NodeJS.Signals | null,
+      kill: vi.fn(),
+    });
+    const claim = vi.spyOn(processes, 'claimChromeProfile').mockResolvedValue();
+    const capture = vi
+      .spyOn(processes, 'captureChromeGroup')
+      .mockResolvedValue({ id: child.pid, members: new Map<number, never>() });
+    const retire = vi.spyOn(processes, 'retireChromeGroup').mockImplementation(async () => {
+      setImmediate(() => {
+        child.exitCode = 0;
+        child.emit('exit', 0, null);
+      });
+    });
+    vi.mocked(spawn).mockReturnValueOnce(child as unknown as ChildProcess);
+    try {
+      const owned = await spawnChrome({
+        chromePath: '/fixture/chrome',
+        paths: browserPaths(path.join(root, 'browser')),
+        proxyUrl: 'http://127.0.0.1:45678',
+      });
+      await stopChrome(owned.child);
+      expect(child.exitCode).toBe(0);
+      expect(child.kill).not.toHaveBeenCalled();
+    } finally {
+      claim.mockRestore();
+      capture.mockRestore();
+      retire.mockRestore();
     }
   });
 
