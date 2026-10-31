@@ -2747,7 +2747,7 @@ describe('the vault a new assistant inherits from 1Password enablement', () => {
     const enabled = await installOnePassword(
       harness.paths,
       { accountId: ACCOUNT_ID },
-      { cli: provider.cli(), upsertEnvVars, operatorTerminal: true },
+      { cli: provider.cli(), upsertEnvVars },
     );
     expect(enabled.assistants).toMatchObject([
       { instance_id: harness.instanceId, outcome: 'skipped', reason: 'not_created' },
@@ -2771,7 +2771,7 @@ describe('the vault a new assistant inherits from 1Password enablement', () => {
       provisionAssistantResources(
         operation,
         { emit: (event) => events.push(event) },
-        { cli: provider.cli(), upsertEnvVars, operatorTerminal: true },
+        { cli: provider.cli(), upsertEnvVars },
         { skip: true },
       ),
     );
@@ -2807,7 +2807,7 @@ describe('the vault a new assistant inherits from 1Password enablement', () => {
 
     const calls = provider.calls.length;
     await expect(finish(harness, provider)).resolves.toMatchObject({ status: 'ready' });
-    // Already provisioned: no request and no desktop prompt.
+    // Already provisioned: no authentication or provider request.
     expect(provider.calls.length).toBe(calls);
     expect(provider.vaults.size).toBe(1);
   });
@@ -2823,7 +2823,7 @@ describe('the vault a new assistant inherits from 1Password enablement', () => {
       pause: { kind: 'human-action', phase: 'provision_onepassword', code: 'onepassword_sign_in_required' },
     });
     const pause = (paused as Extract<ProvisionResult, { status: 'paused' }>).pause;
-    expect(pause.message).toContain('Unlock the 1Password app');
+    expect(pause.message).toContain('OP_BIOMETRIC_UNLOCK_ENABLED=false op signin');
     expect(provider.vaults.size).toBe(0);
 
     provider.signedIn = true;
@@ -2847,26 +2847,14 @@ describe('the vault a new assistant inherits from 1Password enablement', () => {
     );
   });
 
-  it('reports operator-only vault setup as optional without calling op from a non-interactive create', async () => {
+  it('finishes vault setup with an authenticated CLI session without interaction', async () => {
     const { harness, provider } = await createdOnEnabledHost();
-    const calls = provider.calls.length;
     const result = await withInstanceOperation(harness.paths, harness.instanceId, (operation) =>
-      provisionAssistantResources(
-        operation,
-        {},
-        { cli: provider.cli(), upsertEnvVars, operatorTerminal: false },
-        { skip: true },
-      ),
+      provisionAssistantResources(operation, {}, { cli: provider.cli(), upsertEnvVars }, { skip: true }),
     );
-    expect(result).toMatchObject({
-      status: 'paused',
-      pause: {
-        code: 'onepassword_operator_sign_in_needed',
-        optional: true,
-        details: expect.arrayContaining(['Then: gws-ea connectors install onepassword']),
-      },
-    });
-    expect(provider.calls).toHaveLength(calls);
+    expect(result).toMatchObject({ status: 'ready' });
+    expect(provider.vaults.size).toBe(1);
+    expect(provider.serviceAccounts.size).toBe(2);
   });
 
   it.each(['web_name_unusable', 'web_hostname_claimed', 'web_hostname_foreign'])(

@@ -252,13 +252,14 @@ frame; agents see opaque item handles and outcomes only.
 
 The operator provisions 1Password host-wide (see
 [docs/gws-ea-cli.md](docs/gws-ea-cli.md)). In
-`gws-ea connectors install onepassword`, their desktop sign-in mints a host
+`gws-ea connectors install onepassword`, their authenticated CLI session mints a host
 management service account that may only create vaults, and the host records
-the account's ID with its sign-in address as the app lists it. It creates one vault
+the account's ID with its sign-in address as the CLI lists it. It creates one vault
 for each compatible assistant; create, update, start and restart reconcile pending
 setup through the same provisioning step. Existing vaults and credentials stay.
-When desktop approval is needed, an operator terminal is required; otherwise
-setup remains pending without calling `op`. The operator
+Provisioning reuses `op signin` session variables from the invoking shell;
+desktop integration is disabled and no desktop app is required. Missing or expired
+sessions leave setup pending with a CLI sign-in command. The operator
 mints that assistant's runtime service account with read/write access to only
 its vault. A signup or password change saves the generated password in the
 vault before any site sees it. The

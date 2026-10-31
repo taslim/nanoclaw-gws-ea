@@ -177,7 +177,7 @@ async function expectOnRelease(host: Machine, runtime: InstanceRuntimeConfig, co
 }
 
 describe('gws-ea update --all', GIT_HEAVY, () => {
-  it('finishes newly compatible updates without an operator terminal and deduplicates connector setup actions', async () => {
+  it('finishes newly compatible updates with an expired CLI session and deduplicates connector setup actions', async () => {
     const host = await machine();
     const first = await assistant(host, { port: 37001 });
     const second = await assistant(host, { port: 37101 });
@@ -185,14 +185,14 @@ describe('gws-ea update --all', GIT_HEAVY, () => {
     await installOnePassword(
       host.paths,
       { accountId: ACCOUNT_ID },
-      { cli: provider.cli(), upsertEnvVars: () => undefined, operatorTerminal: true },
+      { cli: provider.cli(), upsertEnvVars: () => undefined },
     );
     const next = await nextRelease(host, {
       'src/gws-ea/onepassword-compatibility.json': JSON.stringify({ schemaVersion: 1, contract: ONEPASSWORD_CONTRACT }),
     });
     const machineFleet = await fleet(host, next, [first, second]);
     const { run, out } = fleetCli(machineFleet, { onePassword: provider.cli() });
-    const calls = provider.calls.length;
+    provider.signedIn = false;
     expect(await run(['update', '--all', '--yes', '--no-input', '--json'])).toBe(0);
     const result = JSON.parse(out.join('\n'));
     expectResultContract('update', result);
@@ -208,7 +208,8 @@ describe('gws-ea update --all', GIT_HEAVY, () => {
     expect(result.next_actions).toEqual([
       { kind: 'command', argv: ['gws-ea', 'connectors', 'install', 'onepassword'] },
     ]);
-    expect(provider.calls.length).toBe(calls);
+    expect(provider.vaults.size).toBe(0);
+    expect(provider.serviceAccounts.size).toBe(1);
     expect((await getInstanceReservation(host.paths, first.instance_id)).deployed_commit).toBe(next.commit);
     expect((await getInstanceReservation(host.paths, second.instance_id)).deployed_commit).toBe(next.commit);
   });

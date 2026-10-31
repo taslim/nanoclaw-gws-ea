@@ -155,7 +155,7 @@ export const CONNECTOR_CATALOG: readonly ConnectorDefinition[] = [
     summary: 'Provision a private saved-login vault for each compatible assistant.',
     prerequisites: [
       '1Password CLI (op) 2.29 or later.',
-      'The operator’s 1Password desktop sign-in with Integrate with 1Password CLI enabled.',
+      'An operator CLI session: eval "$(OP_BIOMETRIC_UNLOCK_ENABLED=false op signin)".',
       'Operator permission to create service accounts.',
     ],
     account:
@@ -184,7 +184,7 @@ export const CONNECTOR_CATALOG: readonly ConnectorDefinition[] = [
     },
     effects: {
       install: [
-        'Uses the operator’s desktop sign-in to provision compatible current assistants; create and update provision future eligible assistants. Existing vaults and credentials are kept.',
+        'Uses the operator’s CLI session to provision compatible current assistants; create and update provision future eligible assistants. Existing vaults and credentials are kept.',
       ],
       uninstall: [
         'Previews owned vaults before confirmation, stops vault use, deletes verified owned vaults and local tokens, and retains service-account IDs for operator revocation.',

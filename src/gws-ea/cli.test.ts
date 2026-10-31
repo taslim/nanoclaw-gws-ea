@@ -2448,7 +2448,6 @@ describe('gws-ea start, stop, and restart', () => {
           next_actions: [{ kind: 'command', argv: ['gws-ea', 'connectors', 'install', 'onepassword'] }],
         });
         expect(provision).toHaveBeenCalledOnce();
-        expect(provision.mock.calls[0][2]?.onePassword?.operatorTerminal).toBe(false);
       } finally {
         provision.mockRestore();
       }

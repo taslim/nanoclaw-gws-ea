@@ -1,7 +1,7 @@
 /**
  * A 1Password account behind the `op` process boundary, for the tests of
  * 1Password provisioning: the real `OnePasswordCli` drives it. It keeps the
- * operator's desktop sign-in, service accounts and their tokens, vaults,
+ * operator's CLI sign-in, service accounts and their tokens, vaults,
  * grants, and the account's shared daily request count.
  */
 import { randomBytes } from 'node:crypto';
@@ -96,7 +96,8 @@ export class FakeOnePassword {
     }
     const selected = args.at(-2) === '--account' ? args.at(-1) : undefined;
     if (words === 'account list --format json') return { stdout: JSON.stringify(this.accounts) };
-    if (!this.signedIn) return { exitCode: 1, stderr: '[ERROR] account is not signed in' };
+    if (!this.signedIn || command.env?.OP_SESSION !== 'fixture-operator-session')
+      return { exitCode: 1, stderr: `[ERROR] could not find session token for account ${selected}` };
     if (selected !== ACCOUNT_ID) return { exitCode: 1, stderr: `[ERROR] no account found for filter ${selected}` };
     if (args[0] === 'whoami')
       return {
@@ -189,6 +190,10 @@ export class FakeOnePassword {
 
   /** The CLI seams that run every `op` call against this account. */
   cli(): OnePasswordCliSeams {
-    return { resolve: async () => OP, runCommand: this.runCommand, ambient: { PATH: '/usr/bin:/bin' } };
+    return {
+      resolve: async () => OP,
+      runCommand: this.runCommand,
+      ambient: { PATH: '/usr/bin:/bin', OP_SESSION: 'fixture-operator-session' },
+    };
   }
 }
