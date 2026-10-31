@@ -2615,7 +2615,10 @@ export async function runCli(args: readonly string[], runtime: CliRuntime = {}):
         }
         const name = handler.name;
         let paused = false;
-        const readWebManagementToken = runtime.readWebManagementToken;
+        const readWebManagementToken =
+          json || options['no-input'] === 'true'
+            ? undefined
+            : (runtime.readWebManagementToken ?? runtime.web?.readManagementToken);
         const lifecycleContext: ConnectorLifecycleContext = {
           paths,
           options,

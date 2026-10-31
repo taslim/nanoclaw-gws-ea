@@ -1,6 +1,6 @@
 /**
  * The gws-ea driver: terminal rendering, prompts, Google Cloud guidance, and the interactive failure loop
- * around the control-plane CLI. Without a TTY, or with `--json` or `--no-input`, it adds none of them, so
+ * around the control-plane CLI. Without a TTY, in CI, or with `--json` or `--no-input`, it adds none of them, so
  * every input comes from flags, the environment, or the secrets file, and every stop is a durable line.
  */
 import { realpathSync } from 'node:fs';
@@ -256,7 +256,7 @@ export async function main(argv: readonly string[], options: { readonly interact
   const interactive =
     invocation.options.json !== 'true' &&
     invocation.options['no-input'] !== 'true' &&
-    (options.interactive ?? Boolean(process.stdin.isTTY && process.stderr.isTTY));
+    (options.interactive ?? Boolean(!process.env.CI && process.stdin.isTTY && process.stderr.isTTY));
   const providers = listSetupProviders();
   const collectCreateInputs: CliRuntime['collectCreateInputs'] = (context) =>
     collectGwsEaCreateInput(context, { providers, interactive });

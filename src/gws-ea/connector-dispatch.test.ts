@@ -19,9 +19,18 @@ afterEach(async () => {
   for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true });
 });
 
-it.each(['terminal', 'credential-file', '--json', '--no-input', 'unattended'] as const)(
-  'accepts a web token only through an attended input hook (%s), without leaking it to output or logs',
-  async (mode) => {
+it.each([
+  { mode: 'terminal', hook: 'launcher' },
+  { mode: 'terminal', hook: 'web' },
+  { mode: 'credential-file', hook: 'launcher' },
+  { mode: '--json', hook: 'launcher' },
+  { mode: '--json', hook: 'web' },
+  { mode: '--no-input', hook: 'launcher' },
+  { mode: '--no-input', hook: 'web' },
+  { mode: 'unattended', hook: 'none' },
+] as const)(
+  'accepts a web token only through an attended input hook ($mode, $hook), without leaking it to output or logs',
+  async ({ mode, hook }) => {
     const root = await realpath(await mkdtemp(path.join(os.tmpdir(), 'web-token-dispatch-')));
     roots.push(root);
     const paths = resolveControlPlanePaths({
@@ -35,6 +44,7 @@ it.each(['terminal', 'credential-file', '--json', '--no-input', 'unattended'] as
       await writeFile(credentialFile, secret, { mode: 0o600 });
     }
     const readWebManagementToken = vi.fn(async () => secret);
+    const readDependencyToken = vi.fn(async () => secret);
     const output: string[] = [];
     const fetch: typeof globalThis.fetch = async (input) => {
       const resource = new URL(String(input)).pathname;
@@ -67,13 +77,14 @@ it.each(['terminal', 'credential-file', '--json', '--no-input', 'unattended'] as
         paths,
         stdout: (line) => output.push(line),
         stderr: (line) => output.push(line),
-        web: { fetch },
-        ...(mode === 'unattended' ? {} : { readWebManagementToken }),
+        web: { fetch, ...(hook === 'none' ? {} : { readManagementToken: readDependencyToken }) },
+        ...(hook === 'launcher' ? { readWebManagementToken } : {}),
       },
     );
     const installed = mode === 'terminal' || mode === 'credential-file';
     expect(code).toBe(installed ? 0 : 1);
-    expect(readWebManagementToken).toHaveBeenCalledTimes(mode === 'terminal' ? 1 : 0);
+    expect(readWebManagementToken).toHaveBeenCalledTimes(mode === 'terminal' && hook === 'launcher' ? 1 : 0);
+    expect(readDependencyToken).toHaveBeenCalledTimes(mode === 'terminal' && hook === 'web' ? 1 : 0);
     const config = await readWebOperatorConfig(webOperatorFiles(paths).configFile);
     if (installed) {
       if (!config) throw new Error('Missing web operator configuration');

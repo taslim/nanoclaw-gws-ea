@@ -145,7 +145,10 @@ function report(overrides: Partial<FailureReport> = {}): FailureReport {
 }
 
 describe('launcher interaction modes', () => {
-  afterEach(() => vi.clearAllMocks());
+  afterEach(() => {
+    vi.clearAllMocks();
+    vi.unstubAllEnvs();
+  });
   it('reads a web management token with the hidden-input prompt and handles cancellation', async () => {
     await main(['connectors', 'install', 'web'], { interactive: true });
     const runtime = runtimeOf();
@@ -157,6 +160,24 @@ describe('launcher interaction modes', () => {
   });
   it.each([
     { label: 'all streams attached', stdin: true, stdout: true, stderr: true, override: undefined, expected: true },
+    {
+      label: 'CI pseudo-terminal',
+      stdin: true,
+      stdout: true,
+      stderr: true,
+      override: undefined,
+      ci: 'true',
+      expected: false,
+    },
+    {
+      label: 'explicit interaction in CI',
+      stdin: true,
+      stdout: true,
+      stderr: true,
+      override: true,
+      ci: 'true',
+      expected: true,
+    },
     { label: 'stdout redirected', stdin: true, stdout: false, stderr: true, override: undefined, expected: true },
     { label: 'stdin redirected', stdin: false, stdout: true, stderr: true, override: undefined, expected: false },
     { label: 'stderr redirected', stdin: true, stdout: true, stderr: false, override: undefined, expected: false },
@@ -176,7 +197,8 @@ describe('launcher interaction modes', () => {
       override: true,
       expected: true,
     },
-  ])('uses the input and prompt streams with $label', async ({ stdin, stdout, stderr, override, expected }) => {
+  ])('uses the input and prompt streams with $label', async ({ stdin, stdout, stderr, override, ci, expected }) => {
+    vi.stubEnv('CI', ci);
     const streams = [process.stdin, process.stdout, process.stderr];
     const descriptors = streams.map((stream) => Object.getOwnPropertyDescriptor(stream, 'isTTY'));
     const ttyValues = [stdin, stdout, stderr];
@@ -187,6 +209,7 @@ describe('launcher interaction modes', () => {
       await main(['create', '--track', 'dogfood'], { interactive: override });
       const runtime = runtimeOf();
       expect(Boolean(runtime.prompts)).toBe(expected);
+      expect(Boolean(runtime.readWebManagementToken)).toBe(expected);
       expect(Boolean(runtime.presenter)).toBe(expected);
       expect(Boolean(runtime.onFailure)).toBe(expected);
       await runtime.collectCreateInputs!({ marker: 'context' } as never);
