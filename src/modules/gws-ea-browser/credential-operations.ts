@@ -1183,7 +1183,9 @@ async function disclosingStep(
     });
     // eslint-disable-next-line no-catch-all/no-catch-all -- after a disclosure nothing is safe to repeat, and no Playwright, or renderer prose crosses this boundary
   } catch (_error) {
-    return await interruptedOutcome(attempts, saved, evidence('interrupted', 'unknown', 'unknown'));
+    return await interruptedOutcome(attempts, saved, evidence('interrupted', 'unknown', 'unknown'), () =>
+      watchResponse(saved.id, context, page, group, { step: 'credentials', before }),
+    );
   } finally {
     page.off('framenavigated', navigation);
     await settleFilledSecrets(context, page, secrets);
@@ -1305,22 +1307,27 @@ async function reconcileResponse(
   if (page !== watched.page) return { status: 'inconclusive' };
   const result = lateResult(watched, await readSite(page, watched));
   if (result === 'none') return { status: 'inconclusive' };
-  watchedResponses.delete(attempt.id);
   const proof: CredentialEvidence = { signal: result, reconciled: true };
+  let outcome: Outcome;
   switch (result) {
     case 'account_exists':
     case 'current_password_rejected':
     case 'password_rejected':
       await attempts.markRejected(attempt.id, proof);
       await releaseCredentialSubmissions(attempt.id);
-      return { status: result };
+      outcome = { status: result };
+      break;
     case 'verification_requested':
       await attempts.markVerificationRequested(attempt.id, proof);
       await releaseCredentialSubmissions(attempt.id);
-      return { status: 'verification_requested' };
+      outcome = { status: 'verification_requested' };
+      break;
     case 'confirmed':
-      return await confirmedOutcome(attempt, attempts, proof);
+      outcome = await confirmedOutcome(attempt, attempts, proof);
+      break;
   }
+  watchedResponses.delete(attempt.id);
+  return outcome;
 }
 
 // ---------------------------------------------------------------- email verification

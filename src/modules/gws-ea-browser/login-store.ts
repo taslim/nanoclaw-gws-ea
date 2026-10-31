@@ -75,7 +75,9 @@ export function registrableDomain(origin: string): string | undefined {
   const url = httpsOrigin(origin);
   return (url && getDomain(url.hostname, { allowPrivateDomains: true })) || undefined;
 }
-function details(spec: Omit<LoginDetails, 'password'>): Pick<SavedLogin, 'hostname' | 'domain' | 'username' | 'title'> {
+export function loginMetadata(
+  spec: Omit<LoginDetails, 'password'>,
+): Pick<SavedLogin, 'hostname' | 'domain' | 'username' | 'title'> {
   const site = spec.site.trim();
   const url = httpsOrigin(site.includes('://') ? site : `https://${site}`);
   const domain = url && getDomain(url.hostname, { allowPrivateDomains: true });
@@ -280,7 +282,7 @@ export class LoginStore {
     if (db.prepare('SELECT 1 FROM logins WHERE domain = ? AND username = ? AND id != ?').get(domain, username, id))
       throw new LoginDetailsError('duplicate_login');
   }
-  private insert(db: Database.Database, metadata: ReturnType<typeof details>, password: Buffer): SavedLogin {
+  private insert(db: Database.Database, metadata: ReturnType<typeof loginMetadata>, password: Buffer): SavedLogin {
     this.assertDistinct(db, metadata.domain, metadata.username);
     const at = new Date().toISOString();
     const login: SavedLogin = { ...metadata, id: `vault_${randomUUID()}`, version: 1, createdAt: at, updatedAt: at };
@@ -300,7 +302,7 @@ export class LoginStore {
     return login;
   }
   async create(spec: LoginDetails): Promise<SavedLogin> {
-    const metadata = details(spec);
+    const metadata = loginMetadata(spec);
     passwordValid(spec.password);
     return this.use((db) =>
       this.withKey(db, (key) => {
@@ -320,7 +322,7 @@ export class LoginStore {
     return this.use(async (db) => {
       const before = this.login(db, id);
       if (before.version !== version) throw new LoginDetailsError('login_changed');
-      const metadata = details({
+      const metadata = loginMetadata({
         site: changes.site ?? before.hostname,
         username: changes.username ?? before.username,
         title: changes.title ?? before.title,
@@ -424,7 +426,7 @@ export class LoginStore {
   }
   /** No Keychain operation: the same assistant-bound ciphertext moves atomically into its login. */
   async confirmPending(attemptId: string, target: PendingConfirmation): Promise<SavedLogin | undefined> {
-    const metadata = target.kind === 'signup' ? details(target.details) : undefined;
+    const metadata = target.kind === 'signup' ? loginMetadata(target.details) : undefined;
     if (target.kind === 'rotation') versionValid(target.version);
     return this.use((db) =>
       db

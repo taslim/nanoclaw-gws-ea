@@ -367,6 +367,68 @@ it.each(['update', 'remove'])(
   },
 );
 
+it.each(['add', 'update'] as const)('refuses a page %s that would collide with an exposed signup', async (action) => {
+  const existing = action === 'update' ? await login(PRINCIPAL, 'https://notes.example') : undefined;
+  const prepared = await attempts.prepareSignup({ jobId: 'signup-job', origin: SITE, username: ALIAS });
+  if (prepared.status !== 'prepared') throw new Error(prepared.status);
+  const disclosed = await attempts.disclose(prepared.attempt.id, { jobId: 'signup-job', origin: SITE });
+  if (disclosed.status !== 'disclosed') throw new Error(disclosed.status);
+  const response = await post(`/logins/${action}`, {
+    ...(existing ? { handle: existing.id, version: '1' } : {}),
+    site: SITE,
+    username: ALIAS,
+    title: 'Stream',
+    password: 'page-replacement',
+  });
+  expect(response.status).toBe(409);
+  expect(response.body).toContain('The assistant is changing this password.');
+  expect(await fixture.store.forOrigin(SITE)).toEqual([]);
+  if (existing) expect(await fixture.store.get(existing.id)).toEqual(existing);
+  expect(await attempts.get(prepared.attempt.id)).toMatchObject({ phase: 'exposed' });
+  await attempts.confirm(prepared.attempt.id, { signal: 'success_text' });
+  const [created] = await fixture.store.forOrigin(SITE);
+  expect(created).toBeDefined();
+  expect(await fixture.store.secret(created!.id, 'password', SITE)).toBe(disclosed.credential.password);
+  expect(await fixture.store.hasPending(prepared.attempt.id)).toBe(false);
+});
+
+it.each(['add', 'update'] as const)('lets an undisclosed signup give way to a conflicting page %s', async (action) => {
+  const existing = action === 'update' ? await login(PRINCIPAL, 'https://notes.example') : undefined;
+  const prepared = await attempts.prepareSignup({ jobId: 'signup-job', origin: SITE, username: ALIAS });
+  if (prepared.status !== 'prepared') throw new Error(prepared.status);
+  const response = await post(`/logins/${action}`, {
+    ...(existing ? { handle: existing.id, version: '1' } : {}),
+    site: 'accounts.stream.example',
+    username: ALIAS,
+    title: 'Stream',
+    password: 'page-replacement',
+  });
+  expect(response.status).toBe(200);
+  expect(await attempts.get(prepared.attempt.id)).toMatchObject({
+    phase: 'rejected',
+    evidence_json: JSON.stringify({ reason: 'login_edited' }),
+  });
+  expect(await fixture.store.hasPending(prepared.attempt.id)).toBe(false);
+  const [saved] = await fixture.store.forOrigin(SITE);
+  expect(saved).toMatchObject({ hostname: 'accounts.stream.example', username: ALIAS });
+  expect(await fixture.store.secret(saved!.id, 'password', SITE)).toBe('page-replacement');
+});
+
+it('writes no new login when a conflicting signup wins disclosure during page give-way', async () => {
+  const prepared = await attempts.prepareSignup({ jobId: 'signup-job', origin: SITE, username: ALIAS });
+  if (prepared.status !== 'prepared') throw new Error(prepared.status);
+  const run = getDb().run.bind(getDb());
+  vi.spyOn(getDb(), 'run').mockImplementation(async (sql, ...parameters) => {
+    if (sql.includes('SET phase = ?') && parameters[0] === 'rejected')
+      await run("UPDATE gws_ea_browser_credential_attempts SET phase='exposed' WHERE id=?", prepared.attempt.id);
+    return run(sql, ...parameters);
+  });
+  const response = await post('/logins/add', { site: SITE, username: ALIAS, title: '', password: SECRET });
+  expect(response.status).toBe(409);
+  expect(await fixture.store.forOrigin(SITE)).toEqual([]);
+  expect(await fixture.store.hasPending(prepared.attempt.id)).toBe(true);
+});
+
 it('writes nothing when giving way loses the compare-and-set to disclosure', async () => {
   const { loginId, attempt } = await changing('saved');
   const run = getDb().run.bind(getDb());

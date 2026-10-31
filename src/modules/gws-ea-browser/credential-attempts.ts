@@ -379,16 +379,22 @@ export class CredentialAttempts {
     const store = await this.store();
     for (const attempt of abandoned) await store.deletePending(attempt.id);
   }
-  async giveWayForLogin(loginId: string): Promise<'ready' | 'login_busy'> {
-    const open = await this.db.get<CredentialAttempt>(
-      `SELECT * FROM ${TABLE} WHERE source_login_id = ? AND phase NOT IN ('rejected','finalized')`,
+  async giveWayForLogin(
+    loginId: string | null,
+    destination?: Pick<SavedLogin, 'domain' | 'username'>,
+  ): Promise<'ready' | 'login_busy'> {
+    const open = await this.db.all<CredentialAttempt>(
+      `SELECT * FROM ${TABLE} WHERE (source_login_id = ? OR (kind = 'signup' AND site = ? AND username = ?)) AND phase NOT IN ('rejected','finalized') ORDER BY created_at, id`,
       loginId,
+      destination?.domain ?? null,
+      destination?.username ?? null,
     );
-    if (!open) return 'ready';
-    if (open.phase !== 'saved') return 'login_busy';
-    const ended = await this.undisclosed(open.id, { reason: 'login_edited' });
-    if (!ended) return 'login_busy';
-    await (await this.store()).deletePending(open.id);
+    if (open.some((attempt) => attempt.phase !== 'saved')) return 'login_busy';
+    for (const attempt of open) {
+      const ended = await this.undisclosed(attempt.id, { reason: 'login_edited' });
+      if (!ended) return 'login_busy';
+      await (await this.store()).deletePending(attempt.id);
+    }
     return 'ready';
   }
   private async finish(

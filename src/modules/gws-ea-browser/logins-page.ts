@@ -5,6 +5,7 @@ import { isPrincipalWebIdentity, type WebIdentity } from '../gws-ea-web/access.j
 import { credentialAttempts, type CredentialAttempts } from './credential-attempts.js';
 import {
   getLoginStore,
+  loginMetadata,
   LoginDetailsError,
   LoginStoreError,
   type LoginStore,
@@ -146,9 +147,17 @@ export function createLoginsPageHandler(options: LoginsPageOptions): RequestList
       if (!(await isPrincipalWebIdentity(await options.identity(request)))) return refuse(response);
       if (writing && !sameOriginJson(request, options.hostname)) return refuse(response);
       const store = options.store ?? (await getLoginStore());
-      const giveWay = async (handle: string, version: number): Promise<void> => {
-        if ((await store.get(handle)).version !== version) throw new LoginDetailsError('login_changed');
-        if ((await credentials.giveWayForLogin(handle)) !== 'ready') throw new LoginBusy();
+      const giveWay = async (handle: string, version: number, changes?: LoginChanges): Promise<void> => {
+        const before = await store.get(handle);
+        if (before.version !== version) throw new LoginDetailsError('login_changed');
+        const destination =
+          changes &&
+          loginMetadata({
+            site: changes.site ?? before.hostname,
+            username: changes.username ?? before.username,
+            title: changes.title ?? before.title,
+          });
+        if ((await credentials.giveWayForLogin(handle, destination)) !== 'ready') throw new LoginBusy();
       };
       let outcome = '';
       let status = 200;
@@ -160,7 +169,9 @@ export function createLoginsPageHandler(options: LoginsPageOptions): RequestList
           if (route === '/logins/add') {
             view = { kind: 'add' };
             if (keys !== 'password,site,title,username') throw new InvalidSubmission();
-            await store.create(details(data));
+            const spec = details(data);
+            if ((await credentials.giveWayForLogin(null, loginMetadata(spec))) !== 'ready') throw new LoginBusy();
+            await store.create(spec);
             view = { kind: 'list' };
             outcome = 'Login added.';
           } else if (route === '/logins/update') {
@@ -174,7 +185,7 @@ export function createLoginsPageHandler(options: LoginsPageOptions): RequestList
             view = { kind: 'edit', handle };
             const version = versionField(data);
             const changes = changedDetails(data);
-            await giveWay(handle, version);
+            await giveWay(handle, version, changes);
             await store.update(handle, version, changes);
             view = { kind: 'detail', handle };
             outcome = 'Login updated.';

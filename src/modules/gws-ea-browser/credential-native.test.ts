@@ -61,6 +61,7 @@ import { executeBrowserBatch } from './executor.js';
 import './index.js';
 import { observePage, type BrowserRef } from './observe.js';
 import { testLoginStore } from './testing/login-store.js';
+import { LoginStoreError } from './login-store.js';
 import { browserPaths } from './paths.js';
 import type { BrowserExecutionContext } from './actions.js';
 import { answerSignInReply, recoverBrowserSignInMail } from './sign-in-mail.js';
@@ -1326,6 +1327,46 @@ describe.skipIf(!chromePath)('native authorized signup and password change', { t
   });
 
   describe('recovering a cut-off disclosure', () => {
+    it('reconciles a confirmed signup after a local save fails without submitting again', async () => {
+      vi.spyOn(fixture.store, 'confirmPending').mockRejectedValueOnce(new LoginStoreError('vault_unavailable'));
+      const { authority, result, password } = await signUp('/native-signup', SIGNUP);
+      expect(result).toEqual({ status: 'outcome_unknown' });
+      expect(await attempts.get(authority.id)).toMatchObject({ phase: 'unknown' });
+      expect(await fixture.store.hasPending(authority.id)).toBe(true);
+      expect(await fixture.store.all()).toEqual([]);
+      expect(
+        await executeCredentialForm(context(), { authority: authority.id, operation: 'reconcile' }, { attempts }),
+      ).toEqual({ status: 'account_created' });
+      const settled = await attempts.get(authority.id);
+      expect(settled).toMatchObject({ phase: 'finalized', owned_login_id: expect.any(String) });
+      if (!settled?.owned_login_id) throw new Error('Missing confirmed login');
+      expect(await fixture.store.secret(settled.owned_login_id, 'password', SITE)).toBe(password);
+      expect(await fixture.store.hasPending(authority.id)).toBe(false);
+      expect(posts).toHaveLength(1);
+    }, 30_000);
+
+    it('keeps a late response available when its first reconciliation cannot save the login', async () => {
+      responses.set('/api/slow-signup', '<h1>Account created</h1>');
+      remaining = 4_000;
+      const { authority, result, password } = await signUp('/slow-js-signup', SIGNUP);
+      expect(result).toEqual({ status: 'outcome_unknown' });
+      answerSlow();
+      await page.locator('#result > *').waitFor();
+      remaining = 20_000;
+      const reconcile = () =>
+        executeCredentialForm(context(), { authority: authority.id, operation: 'reconcile' }, { attempts });
+      vi.spyOn(fixture.store, 'confirmPending').mockRejectedValueOnce(new LoginStoreError('vault_unavailable'));
+      await expect(reconcile()).rejects.toThrow('vault_unavailable');
+      expect(await fixture.store.hasPending(authority.id)).toBe(true);
+      expect(await reconcile()).toEqual({ status: 'account_created' });
+      const settled = await attempts.get(authority.id);
+      expect(settled).toMatchObject({ phase: 'finalized', owned_login_id: expect.any(String) });
+      if (!settled?.owned_login_id) throw new Error('Missing confirmed login');
+      expect(await fixture.store.secret(settled.owned_login_id, 'password', SITE)).toBe(password);
+      expect(await fixture.store.hasPending(authority.id)).toBe(false);
+      expect(posts).toHaveLength(1);
+    }, 30_000);
+
     it('covers AE3: a crash in the first input callback leaves the same password unknown, and a retry after restart never submits', async () => {
       let crashed = false;
       await page.exposeFunction('credentialCallback', () => {
