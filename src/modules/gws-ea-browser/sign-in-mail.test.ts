@@ -1,4 +1,6 @@
 import { useAvailableBrowser } from './testing/browser-runtime.js';
+import * as loginStoreModule from './login-store.js';
+import { testLoginStore } from './testing/login-store.js';
 import { createBrowserQueue, recoverAndStartBrowserQueue } from './index.js';
 import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
@@ -81,6 +83,8 @@ let read: ReturnType<typeof vi.fn>;
 let list: ReturnType<typeof vi.fn>;
 beforeEach(async () => {
   useAvailableBrowser();
+  const logins = testLoginStore(`${root}/browser`);
+  vi.spyOn(loginStoreModule, 'getLoginStore').mockResolvedValue(logins.store);
   vi.stubEnv('GWS_EA_BROWSER_ROOT', `${root}/missing-${randomUUID()}.json`);
   await runMigrations(await initTestDb());
   await getDb().run(

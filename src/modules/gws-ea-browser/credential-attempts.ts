@@ -143,21 +143,6 @@ export class CredentialAttempts {
     );
     return signup ? 'assistant' : 'principal';
   }
-  async account(
-    itemHandle: string,
-    origin: string,
-    assertActive = active,
-  ): Promise<{ readonly status: 'classified'; readonly account: 'assistant' | 'principal' } | StoreFailure> {
-    try {
-      await assertActive();
-      const login = await (await this.store()).get(itemHandle);
-      const site = registrableDomain(origin);
-      return { status: 'classified', account: site ? await this.accountForLogin(login, site) : 'principal' };
-    } catch (error) {
-      if (!(error instanceof LoginStoreError)) throw error;
-      return { status: 'vault_unavailable' };
-    }
-  }
   async ownedHandle(
     origin: string,
     username: string,

@@ -188,7 +188,7 @@ describe("main's credential authority", () => {
     const username = 'Onuj+Shop@corp.example';
     const login = await principalLogin(username);
     const [choice] = await fixture.store.forOrigin(ORIGIN);
-    expect(await attempts.account(choice!.id, ORIGIN)).toEqual({ status: 'classified', account: 'assistant' });
+    expect(await attempts.accountForLogin(choice!)).toBe('assistant');
 
     const recorded = await ask({ operation: 'change_password', site: ORIGIN, username });
 

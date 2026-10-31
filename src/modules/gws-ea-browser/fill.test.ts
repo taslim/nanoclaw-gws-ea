@@ -16,15 +16,26 @@ import * as nativeAuthentication from './authentication-submit.js';
 import * as isolatedFacts from './control-facts.js';
 import * as consentEngine from './consent.js';
 import { credentialAttempts } from './credential-attempts.js';
-import { browserVault, BrowserVaultError, websitePermitsOrigin } from './onepassword.js';
+import { mkdtemp, rm } from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+import * as loginStoreModule from './login-store.js';
+import { LoginStoreError } from './login-store.js';
+import { testLoginStore } from './testing/login-store.js';
 
 const SECRET = 'fixture-secret-must-stay-host-only';
-beforeEach(() => {
+let directory: string;
+let storeFixture: ReturnType<typeof testLoginStore>;
+beforeEach(async () => {
+  directory = await mkdtemp(path.join(os.tmpdir(), 'fill-store-'));
+  storeFixture = testLoginStore(path.join(directory, 'browser'));
+  vi.spyOn(loginStoreModule, 'getLoginStore').mockResolvedValue(storeFixture.store);
   configureBrowserSiteInfo({ vault: readVaultSiteInfo });
   // A nonempty relative root is unavailable and cannot fall back to the operator's .env.
   vi.stubEnv('GWS_EA_BROWSER_ROOT', 'unconfigured-browser-root');
 });
-afterEach(() => {
+afterEach(async () => {
+  await rm(directory, { recursive: true, force: true });
   vi.unstubAllEnvs();
   vi.restoreAllMocks();
 });
@@ -296,16 +307,10 @@ it('sanitizes browser and resolver failures and accepts no raw values or referen
 it('returns a vault refusal as its own bounded outcome before anything reaches the page', async () => {
   const f = fixture();
   const binding = await bindBrowserSecretField(f.page, f.target, f.submit, 'password');
-  for (const reason of [
-    'rate_limited',
-    'vault_not_set_up',
-    'vault_unavailable',
-    'no_item_for_site',
-    'origin_mismatch',
-  ] as const)
+  for (const reason of ['vault_unavailable', 'no_item_for_site', 'origin_mismatch'] as const)
     expect(
       await fillBoundBrowserSecret(f.context, binding, async () => {
-        throw new BrowserVaultError(reason);
+        throw new LoginStoreError(reason);
       }),
     ).toEqual({ status: reason });
   expect(f.nativeFill).not.toHaveBeenCalled();
@@ -344,52 +349,81 @@ it('refuses secret resolution while Playwright protocol debugging could disclose
   expect(resolve).not.toHaveBeenCalled();
 });
 
-it('offers ExactDomain vault handles after redirecting to a different HTTPS origin on the same site', async () => {
-  const f = fixture();
-  const website = { url: 'https://login.shop.example', autofillBehavior: 'ExactDomain' };
-  vi.spyOn(browserVault, 'itemsForOrigin').mockImplementation(async (origin) =>
-    websitePermitsOrigin(website, origin) ? [{ item_handle: 'vault_exact-login', title: 'Site login' }] : [],
-  );
-  vi.spyOn(credentialAttempts, 'account').mockResolvedValue({ status: 'classified', account: 'principal' });
+it('rejects stored OTP fill while preserving email-code field classification', () => {
+  expect(() =>
+    validateFillSecret({
+      item_handle: 'vault_opaque',
+      field: 'otp',
+      target: { ref: 'e1', generation: 1 },
+      submit: { ref: 'e2', generation: 1 },
+    }),
+  ).toThrow();
+});
+
+it('offers site logins across HTTPS subdomains without reading the key', async () => {
+  const f = fixture('https://other.example');
+  const item = await storeFixture.store.create({
+    site: 'login.shop.example',
+    username: 'mira@example.com',
+    title: 'Site login',
+    password: SECRET,
+  });
+  vi.spyOn(credentialAttempts, 'accountForLogin').mockResolvedValue('principal');
+  storeFixture.setUnavailable(true);
+  const reads = storeFixture.keyReads();
   expect((await observePage(f.page)).site?.vault_items).toEqual([]);
-  f.setUrl('https://login.shop.example/login');
+  f.setUrl('https://shop.example/login');
   expect((await observePage(f.page)).site?.vault_items).toEqual([
-    { item_handle: 'vault_exact-login', title: 'Site login', account: 'principal' },
+    { item_handle: item.id, title: 'Site login', account: 'principal' },
   ]);
   expect((await observePage(f.page)).site).toBeUndefined();
+  expect(storeFixture.keyReads()).toBe(reads);
 });
 
 it('offers a newly attached login iframe origin without repeatedly refreshing an unchanged origin set', async () => {
   const f = fixture();
-  vi.spyOn(browserVault, 'itemsForOrigin').mockImplementation(async (origin) =>
-    origin === 'https://identity.example' ? [{ item_handle: 'vault_frame-login', title: 'Identity login' }] : [],
-  );
-  vi.spyOn(credentialAttempts, 'account').mockResolvedValue({ status: 'classified', account: 'principal' });
+  const item = await storeFixture.store.create({
+    site: 'identity.example',
+    username: 'mira@example.com',
+    title: 'Identity login',
+    password: SECRET,
+  });
+  vi.spyOn(credentialAttempts, 'accountForLogin').mockResolvedValue('principal');
   expect((await observePage(f.page)).site?.vault_items).toEqual([]);
   const child = { url: () => 'https://identity.example/login', evaluate: async () => [] };
   f.page.frames = () => [f.frame, child] as unknown as ReturnType<Page['frames']>;
   expect((await observePage(f.page)).site?.vault_items).toEqual([
-    { item_handle: 'vault_frame-login', title: 'Identity login', account: 'principal' },
+    { item_handle: item.id, title: 'Identity login', account: 'principal' },
   ]);
   expect((await observePage(f.page)).site).toBeUndefined();
 });
 
-it('labels each site login with its account owner without exposing credential values', async () => {
+it('labels each site login without exposing usernames or reading the key', async () => {
   const f = fixture();
-  vi.spyOn(browserVault, 'itemsForOrigin').mockResolvedValue([
-    { item_handle: 'vault_assistant', title: 'Assistant login' },
-    { item_handle: 'vault_principal', title: 'Principal login' },
-  ]);
-  vi.spyOn(credentialAttempts, 'account').mockImplementation(async (handle) => ({
-    status: 'classified',
-    account: handle === 'vault_assistant' ? 'assistant' : 'principal',
-  }));
+  const assistant = await storeFixture.store.create({
+    site: 'shop.example',
+    username: 'mira.web@example.com',
+    title: 'Assistant login',
+    password: SECRET,
+  });
+  const principal = await storeFixture.store.create({
+    site: 'shop.example',
+    username: 'rowan@example.com',
+    title: 'Principal login',
+    password: SECRET,
+  });
+  vi.spyOn(credentialAttempts, 'accountForLogin').mockImplementation(async (login) =>
+    login.id === assistant.id ? 'assistant' : 'principal',
+  );
+  storeFixture.setUnavailable(true);
+  const reads = storeFixture.keyReads();
   const observation = await observePage(f.page);
   expect(observation.site?.vault_items).toEqual([
-    { item_handle: 'vault_assistant', title: 'Assistant login', account: 'assistant' },
-    { item_handle: 'vault_principal', title: 'Principal login', account: 'principal' },
+    { item_handle: assistant.id, title: 'Assistant login', account: 'assistant' },
+    { item_handle: principal.id, title: 'Principal login', account: 'principal' },
   ]);
-  expect(JSON.stringify(observation.site)).not.toMatch(/username|password/u);
+  expect(JSON.stringify(observation.site)).not.toMatch(/username|password|rowan@|mira.web@/u);
+  expect(storeFixture.keyReads()).toBe(reads);
 });
 
 // These fake pages have no native DOM; Chrome suites exercise collection. Keep actual taint and redaction.
