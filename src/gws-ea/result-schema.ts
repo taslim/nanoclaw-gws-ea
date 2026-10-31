@@ -313,7 +313,7 @@ export const VOICE_OPERATION_SCHEMA = object(
   },
   ['name', 'scope'],
 );
-const connectorName = choices('voice', 'web');
+const connectorName = choices(...CONNECTOR_NAMES);
 const nextAction = {
   oneOf: [
     object({ kind: { const: 'command' }, argv: array(text) }),

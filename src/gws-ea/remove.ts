@@ -251,12 +251,6 @@ function entries<K extends string, V>(keys: readonly K[], value: unknown, parse:
   return parsed;
 }
 
-/**
- * The receipt of a removal already under way; unknown fields are ignored. One
- * that cannot be read safely, or that another schema wrote, is set aside and
- * its resources are observed again, except where that would lose IDs: a
- * receipt naming web that fails any check stops removal with `removal_receipt_unreadable`.
- */
 async function readReceipt(paths: ControlPlanePaths, instanceId: string): Promise<RemovalReceipt | undefined> {
   let webEvidence = false;
   try {
