@@ -118,7 +118,7 @@ describe('host module lifecycle registry', () => {
       order.push('last');
     });
 
-    await lifecycle.stopHostModules();
+    await expect(lifecycle.stopHostModules()).rejects.toThrow('Host cleanup failed');
 
     expect(order).toEqual(['last', 'failed', 'first-start', 'first-end']);
     expect(log.error).toHaveBeenCalledWith('Shutdown callback threw', {
@@ -156,22 +156,44 @@ describe('host lifecycle orchestration', () => {
   });
 
   it('stops approval and session observation without revoking surviving resources', () => {
-    const source = fs.readFileSync(path.join(process.cwd(), 'src', 'index.ts'), 'utf8');
-    const approvalsStop = source.indexOf('await stopGatewayApprovalCoordinator()');
-    const observationStop = source.indexOf('abortGatewaySessionObservers()');
+    const entry = fs.readFileSync(path.join(process.cwd(), 'src', 'index.ts'), 'utf8');
+    const source = entry.slice(entry.indexOf('await runHostCleanup(['));
+    const approvalsStop = source.indexOf('stopGatewayApprovalCoordinator,');
+    const observationStop = source.indexOf('abortGatewaySessionObservers,');
     expect(approvalsStop).toBeGreaterThan(-1);
     expect(observationStop).toBeGreaterThan(approvalsStop);
-    expect(observationStop).toBeLessThan(source.indexOf('await stopHostModules()'));
+    expect(observationStop).toBeLessThan(source.indexOf('stopHostModules,'));
   });
 
   it('aborts modules and awaits their LIFO shutdown before host cleanup', () => {
     const source = fs.readFileSync(path.join(process.cwd(), 'src', 'index.ts'), 'utf8');
     const abort = source.indexOf('hostAbortController.abort()');
-    const modulesStop = source.indexOf('await stopHostModules()');
-    const pollsStop = source.indexOf('stopDeliveryPolls()');
+    const cleanup = source.indexOf('await runHostCleanup([');
+    const modulesStop = source.indexOf('stopHostModules,', cleanup);
+    const pollsStop = source.indexOf('stopDeliveryPolls,', cleanup);
 
     expect(abort).toBeGreaterThan(-1);
     expect(modulesStop).toBeGreaterThan(abort);
     expect(pollsStop).toBeGreaterThan(modulesStop);
+  });
+
+  it('runs the remaining host cleanup stages after a module cleanup fails', async () => {
+    const { runHostCleanup } = await import('./host-lifecycle.js');
+    const stopped: string[] = [];
+    await expect(
+      runHostCleanup([
+        async () => {
+          stopped.push('modules');
+          throw new Error('Chrome still running');
+        },
+        async () => {
+          stopped.push('delivery');
+        },
+        async () => {
+          stopped.push('db');
+        },
+      ]),
+    ).rejects.toThrow('Host cleanup failed');
+    expect(stopped).toEqual(['modules', 'delivery', 'db']);
   });
 });

@@ -118,6 +118,7 @@ beforeEach(async () => {
       throw new Error('Not used');
     },
     closeJob: async () => undefined,
+    withActivity: <T>(operation: () => Promise<T>): Promise<T> => operation(),
     onDisconnected: () => () => undefined,
   });
   await recoverAndStartBrowserQueue(queue);

@@ -5,7 +5,7 @@ import type { Page } from 'playwright-core';
 import { describe, expect, it, vi } from 'vitest';
 
 import type { ChromeConnection } from './connection.js';
-import { BROWSER_WINDOW_IDLE_MS, JobWindows } from './windows.js';
+import { JobWindows } from './windows.js';
 
 function fixture(injectPopup = false, failSetup = false) {
   const events = new EventEmitter();
@@ -90,7 +90,8 @@ describe('quiet job windows', () => {
     await windows.closeJob('first');
     expect(first.isClosed()).toBe(true);
     expect(second.isClosed()).toBe(false);
-    await windows.closeIdle(Date.now() + BROWSER_WINDOW_IDLE_MS);
+    expect(windows.jobs()).toEqual(['second']);
+    await windows.close();
     expect(second.isClosed()).toBe(true);
     expect(windows.size).toBe(0);
   });

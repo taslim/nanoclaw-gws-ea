@@ -433,8 +433,23 @@ navigation onto an Access Denied page is still a challenge. A website denial is
 not proof of its cause or a completed booking. Main reports the practical
 limitation; operator evidence stays bounded and redacted.
 
-The implementation uses one persistent host Playwright runtime, with background
-pages owned by individual errands. Recipe recording and site metadata are optional;
+Chrome starts on demand for an errand or a due watch check. When a browser
+container stops, the host releases its pages after outstanding browser operations
+settle. A checkout awaiting approval or an authorized commit keeps its page until
+that work settles. Other running browser containers retain their own pages.
+Watches keep their schedules in the database and open temporary pages for each
+check; waiting for the next check keeps no browser process alive. Chrome closes
+30 seconds after its last page and operation are released, preserving the profile
+and saved sign-ins. A disconnect interrupts affected operations; the next request
+can launch Chrome again without replaying an interrupted action.
+
+Host shutdown refuses new browser work and retires Chrome and its owned helper
+processes before reporting success. Startup retires verified leftovers for this
+assistant's private profile, refusing processes owned by another live host. Failed
+cleanup reports an incomplete shutdown so a managed update still refuses an
+unsafe cutover.
+
+Recipe recording and site metadata are optional;
 an unavailable recording cannot block ordinary actions or a later permitted
 navigation. A successful watch region mark includes a fresh observation: use its
 refs for the next action. After an error, observe again before acting.

@@ -277,6 +277,10 @@ export class BrowserQueue {
   }
 
   private async execute(request: BrowserRequest): Promise<void> {
+    return this.runtime.withActivity(() => this.executeRequest(request));
+  }
+
+  private async executeRequest(request: BrowserRequest): Promise<void> {
     const started = await this.store.start(request.id);
     if (!started) {
       const current = await this.store.request(request.id);

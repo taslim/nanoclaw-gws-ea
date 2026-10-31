@@ -135,6 +135,7 @@ describe.skipIf(!chromePath)('native Chrome file transfers', { timeout: 30_000 }
         pageForJob: (jobId) => windows.pageForJob(jobId),
         connection: async () => connection,
         closeJob: (jobId) => windows.closeJob(jobId),
+        withActivity: <T>(operation: () => Promise<T>): Promise<T> => operation(),
         onDisconnected(listener) {
           connection.browser.on('disconnected', listener);
           return () => connection.browser.off('disconnected', listener);

@@ -54,7 +54,11 @@ vi.mock('./delivery.js', () => ({
   stopDeliveryPolls: vi.fn(),
 }));
 vi.mock('./host-sweep.js', () => ({ startHostSweep: vi.fn(), stopHostSweep: vi.fn() }));
-vi.mock('./host-lifecycle.js', () => ({ startHostModules: vi.fn(), stopHostModules: vi.fn() }));
+vi.mock('./host-lifecycle.js', async () => ({
+  ...(await vi.importActual<typeof import('./host-lifecycle.js')>('./host-lifecycle.js')),
+  startHostModules: vi.fn(),
+  stopHostModules: vi.fn(),
+}));
 vi.mock('./router.js', () => ({ routeInbound: state.routeInbound }));
 vi.mock('./response-registry.js', () => ({ getResponseHandlers: () => state.responseHandlers }));
 vi.mock('./channels/index.js', () => ({}));
@@ -80,7 +84,66 @@ afterEach(() => {
   state.ready.mockReset();
 });
 
+it.each(['startup-failure', 'shutdown-failure'] as const)(
+  'cleans up and exits unsuccessfully after %s',
+  async (failure) => {
+    vi.resetModules();
+    vi.clearAllMocks();
+    const lifecycle = await import('./host-lifecycle.js');
+    const circuit = await import('./circuit-breaker.js');
+    const db = await import('./db/connection.js');
+    const delivery = await import('./delivery.js');
+    const sweep = await import('./host-sweep.js');
+    const channels = await import('./channels/channel-registry.js');
+    let signal: AbortSignal | undefined;
+    vi.mocked(lifecycle.startHostModules)
+      .mockReset()
+      .mockImplementation(async (context) => {
+        signal = context.signal;
+      });
+    vi.mocked(lifecycle.stopHostModules).mockReset().mockResolvedValue();
+    const on = vi.spyOn(process, 'on').mockReturnValue(process);
+    const exit = vi.spyOn(process, 'exit').mockImplementation(() => undefined as never);
+    let failCleanup: ((reason: Error) => void) | undefined;
+    if (failure === 'startup-failure') state.ready.mockRejectedValue(new Error('CLI startup failed'));
+    else
+      vi.mocked(lifecycle.stopHostModules).mockImplementation(
+        () =>
+          new Promise((_resolve, reject) => {
+            failCleanup = reject;
+          }),
+      );
+    try {
+      await import('./index.js');
+      await vi.waitFor(() => expect(state.releaseAdoption).toBeDefined());
+      state.releaseAdoption?.();
+      if (failure === 'shutdown-failure') {
+        await vi.waitFor(() => expect(state.ready).toHaveBeenCalled());
+        const term = on.mock.calls.find(([event]) => event === 'SIGTERM')?.[1];
+        const interrupt = on.mock.calls.find(([event]) => event === 'SIGINT')?.[1];
+        if (!term || !interrupt) throw new Error('Shutdown signals were not registered');
+        term('SIGTERM');
+        interrupt('SIGINT');
+        await vi.waitFor(() => expect(failCleanup).toBeDefined());
+        failCleanup?.(new Error('Module cleanup failed'));
+      }
+      await vi.waitFor(() => expect(exit).toHaveBeenCalledExactlyOnceWith(1));
+      expect(signal?.aborted).toBe(true);
+      expect(lifecycle.stopHostModules).toHaveBeenCalledOnce();
+      expect(delivery.stopDeliveryPolls).toHaveBeenCalledOnce();
+      expect(sweep.stopHostSweep).toHaveBeenCalledOnce();
+      expect(channels.teardownChannelAdapters).toHaveBeenCalledOnce();
+      expect(db.closeDb).toHaveBeenCalledOnce();
+      expect(circuit.resetCircuitBreaker).not.toHaveBeenCalled();
+    } finally {
+      vi.mocked(lifecycle.startHostModules).mockReset();
+      vi.mocked(lifecycle.stopHostModules).mockReset();
+    }
+  },
+);
+
 it('finishes adoption before a channel can route its first inbound message', async () => {
+  vi.resetModules();
   vi.spyOn(process, 'on').mockReturnValue(process);
   state.routeInbound.mockImplementation(async () => {
     expect(state.adopted).toBe(true);

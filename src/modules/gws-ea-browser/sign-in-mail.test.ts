@@ -645,6 +645,7 @@ it.each(['fill', 'restart'] as const)(
         throw new Error('No Chrome in this fixture');
       },
       closeJob: async () => undefined,
+      withActivity: <T>(operation: () => Promise<T>): Promise<T> => operation(),
       onDisconnected: () => () => undefined,
     });
     if (mode === 'fill') await recoverAndStartBrowserQueue(queue);

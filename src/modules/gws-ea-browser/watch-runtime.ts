@@ -251,9 +251,8 @@ export async function runBrowserWatchCheck(
   const initial = await db.get<SiteLease>('SELECT * FROM gws_ea_browser_site_leases WHERE site = ?', input.site);
   if (initial && initial.job_id !== input.jobId && !(await pendingCheckout(queue, initial)))
     return { status: 'site_busy' };
-  const locked = await queue.tryWithJobLocks(
-    [input.jobId, ...(initial ? [initial.job_id] : [])],
-    async (): Promise<BrowserWatchCheckResult> => {
+  const locked = await queue.tryWithJobLocks([input.jobId, ...(initial ? [initial.job_id] : [])], () =>
+    queue.runtime.withActivity(async (): Promise<BrowserWatchCheckResult> => {
       const job = await queue.store.getJob(input.jobId);
       const session = job ? await getSession(job.browser_session_id) : undefined;
       if (!job || !session || session.status !== 'active') return { status: 'failed' };
@@ -344,7 +343,7 @@ export async function runBrowserWatchCheck(
         if (temporaryLease)
           await queue.wakeWaiters(await queue.leases.release(input.jobId, input.site), `watch-check-${input.id}`);
       }
-    },
+    }),
   );
   return locked.acquired ? locked.value : { status: 'site_busy' };
 }

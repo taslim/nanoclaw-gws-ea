@@ -4,7 +4,8 @@ import os from 'node:os';
 import path from 'node:path';
 import net from 'node:net';
 import { EventEmitter } from 'node:events';
-import type { ChildProcess } from 'node:child_process';
+import { execFile, type ChildProcess } from 'node:child_process';
+import { promisify } from 'node:util';
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Browser, Page } from 'playwright-core';
@@ -58,6 +59,243 @@ async function listening(port: number): Promise<boolean> {
   });
 }
 
+async function ownedRuntime(keepJob: (jobId: string) => Promise<boolean> = async () => false) {
+  runtime = new BrowserRuntime(file, undefined, process.execPath, keepJob);
+  const events = new EventEmitter();
+  const child = Object.assign(new EventEmitter(), { pid: 12345, exitCode: null as number | null, signalCode: null });
+  let connected = true;
+  const close = vi.fn(async () => {
+    connected = false;
+    child.exitCode = 0;
+    events.emit('disconnected');
+  });
+  const attached = {
+    child,
+    debuggerPort: 45679,
+    browser: Object.assign(events, { isConnected: () => connected, version: () => 'fixture' }),
+    close,
+  } as unknown as connection.ChromeConnection;
+  const spawn = vi
+    .spyOn(chrome, 'spawnChrome')
+    .mockResolvedValue({ child: child as ChildProcess, debuggerPort: 45679 });
+  vi.spyOn(chrome, 'retireChromeProfile').mockResolvedValue();
+  vi.spyOn(chrome, 'stopChrome').mockResolvedValue();
+  vi.spyOn(connection, 'connectChrome').mockResolvedValue(attached);
+  vi.spyOn(connection, 'verifyChromePolicy').mockResolvedValue();
+  vi.spyOn(connection, 'createBackgroundPage').mockImplementation(async () => {
+    const pageEvents = new EventEmitter();
+    let closed = false;
+    return Object.assign(pageEvents, {
+      isClosed: () => closed,
+      async close() {
+        closed = true;
+        pageEvents.emit('close');
+      },
+    }) as unknown as Page;
+  });
+  await ensureBrowserPaths(browserPaths(file));
+  return { close, spawn, events };
+}
+
+describe('Chrome follows browser work', () => {
+  it('retires a prior host browser during reconciliation without starting a new one', async () => {
+    const { spawn } = await ownedRuntime();
+    await runtime.reconcile();
+    expect(chrome.retireChromeProfile).toHaveBeenCalledExactlyOnceWith(browserPaths(file), process.execPath);
+    expect(spawn).not.toHaveBeenCalled();
+  });
+
+  it('closes an exited worker page, preserves another worker or checkout, then stops after the last release', async () => {
+    const held = new Set(['other-worker', 'checkout']);
+    const { close } = await ownedRuntime(async (jobId) => held.has(jobId));
+    const released = await runtime.pageForJob('exited-worker');
+    const other = await runtime.pageForJob('other-worker');
+    const checkout = await runtime.pageForJob('checkout');
+    vi.useFakeTimers();
+    await runtime.releaseUnusedPages();
+    expect(released.isClosed()).toBe(true);
+    expect(other.isClosed()).toBe(false);
+    expect(checkout.isClosed()).toBe(false);
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(close).not.toHaveBeenCalled();
+    held.clear();
+    await runtime.releaseUnusedPages();
+    expect(other.isClosed()).toBe(true);
+    expect(checkout.isClosed()).toBe(true);
+    await vi.advanceTimersByTimeAsync(29_999);
+    expect(close).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+    await vi.waitFor(() => expect(close).toHaveBeenCalledOnce());
+    expect(runtime.state()).toMatchObject({ chrome: { state: 'stopped' }, proxy: { state: 'listening' } });
+    vi.useRealTimers();
+  });
+
+  it('keeps a host operation alive without a worker and restarts the idle grace after new work', async () => {
+    const { close } = await ownedRuntime();
+    vi.useFakeTimers();
+    let release!: () => void;
+    const waiting = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const work = runtime.withActivity(async () => {
+      await runtime.connection();
+      await waiting;
+    });
+    await vi.waitFor(() => expect(runtime.state().chrome.state).toBe('running'));
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(close).not.toHaveBeenCalled();
+    release();
+    await work;
+    await vi.advanceTimersByTimeAsync(20_000);
+    await runtime.withActivity(async () => undefined);
+    await vi.advanceTimersByTimeAsync(29_999);
+    expect(close).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+    await vi.waitFor(() => expect(close).toHaveBeenCalledOnce());
+    vi.useRealTimers();
+  });
+
+  it('interrupts a disconnected browser without launching an unused replacement', async () => {
+    const { spawn, events } = await ownedRuntime();
+    const disconnected = vi.fn();
+    runtime.onDisconnected(disconnected);
+    await runtime.connection();
+    vi.useFakeTimers();
+    events.emit('disconnected');
+    await vi.advanceTimersByTimeAsync(5_000);
+    await runtime.reconcile();
+    expect(disconnected).toHaveBeenCalledOnce();
+    expect(spawn).toHaveBeenCalledOnce();
+    expect(runtime.state().chrome.state).toBe('stopped');
+    vi.useRealTimers();
+  });
+
+  it('rechecks process ownership on demand after a disconnected child could not initially be retired', async () => {
+    const { events, spawn } = await ownedRuntime();
+    await runtime.connection();
+    vi.mocked(chrome.stopChrome).mockRejectedValueOnce(new Error('Process inspection unavailable'));
+    events.emit('disconnected');
+    await expect(runtime.connection()).resolves.toBeDefined();
+    expect(spawn).toHaveBeenCalledTimes(2);
+  });
+
+  it('cancels an idle close already queued behind reconciliation when new work resets the grace period', async () => {
+    const { close } = await ownedRuntime();
+    vi.useFakeTimers();
+    await runtime.connection();
+    const policy = await availability.browserAvailability(file, process.execPath);
+    let reconcile!: (value: availability.BrowserAvailability) => void;
+    vi.spyOn(availability, 'browserAvailability').mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          reconcile = resolve;
+        }),
+    );
+    const reconciling = runtime.reconcile();
+    await vi.waitFor(() => expect(reconcile).toBeDefined());
+    await vi.advanceTimersByTimeAsync(30_000);
+    const next = runtime.withActivity(async () => undefined);
+    reconcile(policy);
+    await reconciling;
+    await next;
+    expect(close).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(30_000);
+    await vi.waitFor(() => expect(close).toHaveBeenCalledOnce());
+    vi.useRealTimers();
+  });
+
+  it('waits for a spawn racing cancellation to retire before completing host shutdown', async () => {
+    await ownedRuntime();
+    let spawned!: (owned: chrome.OwnedChrome) => void;
+    vi.mocked(chrome.spawnChrome).mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          spawned = resolve;
+        }),
+    );
+    const connecting = runtime.connection();
+    const refused = expect(connecting).rejects.toMatchObject({ code: 'browser_unavailable' });
+    await vi.waitFor(() => expect(chrome.spawnChrome).toHaveBeenCalledOnce());
+    let stopped = false;
+    const shutdown = runtime.shutdown().then(() => {
+      stopped = true;
+    });
+    await Promise.resolve();
+    expect(stopped).toBe(false);
+    const child = Object.assign(new EventEmitter(), { pid: 23456, exitCode: null, signalCode: null });
+    spawned({ child: child as ChildProcess, debuggerPort: 45679 });
+    await refused;
+    await shutdown;
+    expect(chrome.stopChrome).toHaveBeenCalledWith(child);
+    await expect(runtime.withActivity(async () => undefined)).rejects.toMatchObject({ code: 'browser_unavailable' });
+    expect(runtime.state().proxy.state).toBe('stopped');
+  });
+
+  it('waits for cancelled profile preparation to settle before releasing its owner', async () => {
+    await ownedRuntime();
+    const prepare = chrome.prepareChromeProfile;
+    let prepared!: () => void;
+    const entered = new Promise<void>((resolve) => {
+      prepared = resolve;
+    });
+    let finish!: () => void;
+    const pendingWrite = new Promise<void>((resolve) => {
+      finish = resolve;
+    });
+    vi.spyOn(chrome, 'prepareChromeProfile').mockImplementationOnce(async (paths) => {
+      await prepare(paths);
+      prepared();
+      await pendingWrite;
+    });
+    const connecting = runtime.connection();
+    const refused = expect(connecting).rejects.toMatchObject({ code: 'browser_unavailable' });
+    await entered;
+    const stopping = runtime.shutdown();
+    let timeout: NodeJS.Timeout | undefined;
+    try {
+      expect(
+        await Promise.race([
+          stopping.then(() => true),
+          new Promise<boolean>((resolve) => {
+            timeout = setTimeout(() => resolve(false), 50);
+          }),
+        ]),
+      ).toBe(false);
+    } finally {
+      if (timeout) clearTimeout(timeout);
+      finish();
+      await refused;
+      await stopping;
+    }
+    expect(chrome.spawnChrome).not.toHaveBeenCalled();
+  });
+
+  it('keeps a page used by new work when an earlier ownership read finishes late', async () => {
+    let keep = true;
+    let staleRead: ((value: boolean) => void) | undefined;
+    let block = false;
+    await ownedRuntime(async () => {
+      if (block) {
+        block = false;
+        return new Promise<boolean>((resolve) => {
+          staleRead = resolve;
+        });
+      }
+      return keep;
+    });
+    const page = await runtime.pageForJob('worker');
+    block = true;
+    const releasing = runtime.releaseUnusedPages();
+    await vi.waitFor(() => expect(staleRead).toBeDefined());
+    await runtime.withActivity(async () => {
+      keep = true;
+    });
+    staleRead?.(false);
+    await releasing;
+    expect(page.isClosed()).toBe(false);
+  });
+});
+
 describe('optional host browser lifecycle', () => {
   it('contains startup and sweep projection failures while durable maintenance continues and admission stays closed', async () => {
     const db = await initTestDb();
@@ -70,7 +308,8 @@ describe('optional host browser lifecycle', () => {
       .spyOn(reconciliation, 'reconcileBrowserGroup')
       .mockRejectedValue(new Error('EACCES: browser template'));
     vi.spyOn(getBrowserRuntime(), 'reconcile').mockResolvedValue();
-    const idle = vi.spyOn(getBrowserRuntime(), 'closeIdleWindows').mockResolvedValue();
+    vi.spyOn(getBrowserRuntime(), 'closeAdmission').mockImplementation(() => undefined);
+    const idle = vi.spyOn(getBrowserRuntime(), 'releaseUnusedPages').mockResolvedValue();
     const retry = vi.spyOn(BrowserQueue.prototype, 'retryAnswers').mockResolvedValue();
     const sweep = vi.spyOn(cancellation, 'sweepBrowserJobSessions').mockResolvedValue();
     const cleanup = vi.spyOn(signInMail, 'cleanupBrowserSignInMail').mockResolvedValue();
@@ -127,7 +366,8 @@ describe('optional host browser lifecycle', () => {
     const resume = vi.spyOn(purchases, 'resumeBrowserPurchaseCommits').mockResolvedValue();
     const reconcile = vi.spyOn(reconciliation, 'reconcileBrowserGroup').mockResolvedValue();
     vi.spyOn(getBrowserRuntime(), 'reconcile').mockResolvedValue();
-    vi.spyOn(getBrowserRuntime(), 'closeIdleWindows').mockResolvedValue();
+    vi.spyOn(getBrowserRuntime(), 'closeAdmission').mockImplementation(() => undefined);
+    vi.spyOn(getBrowserRuntime(), 'releaseUnusedPages').mockResolvedValue();
     vi.spyOn(BrowserQueue.prototype, 'retryAnswers').mockResolvedValue();
     vi.spyOn(cancellation, 'sweepBrowserJobSessions').mockResolvedValue();
     vi.spyOn(signInMail, 'cleanupBrowserSignInMail').mockResolvedValue();
@@ -174,7 +414,8 @@ describe('optional host browser lifecycle', () => {
       vi.spyOn(purchases, 'resumeBrowserPurchaseCommits').mockResolvedValue();
       vi.spyOn(reconciliation, 'reconcileBrowserGroup').mockResolvedValue();
       vi.spyOn(getBrowserRuntime(), 'reconcile').mockResolvedValue();
-      vi.spyOn(getBrowserRuntime(), 'closeIdleWindows').mockResolvedValue();
+      vi.spyOn(getBrowserRuntime(), 'closeAdmission').mockImplementation(() => undefined);
+      vi.spyOn(getBrowserRuntime(), 'releaseUnusedPages').mockResolvedValue();
       const retry = vi.spyOn(BrowserQueue.prototype, 'retryAnswers').mockResolvedValue();
       vi.spyOn(cancellation, 'sweepBrowserJobSessions').mockResolvedValue();
       vi.spyOn(signInMail, 'cleanupBrowserSignInMail').mockResolvedValue();
@@ -338,6 +579,84 @@ describe('optional host browser lifecycle', () => {
       reconcile.mockRestore();
     }
   });
+  it.skipIf(!process.env.GWS_EA_BROWSER_TEST_CHROME)(
+    'retires an unresponsive Chrome and every profile helper without waiting for page disposal',
+    async () => {
+      let keep = true;
+      runtime = new BrowserRuntime(file, undefined, process.env.GWS_EA_BROWSER_TEST_CHROME, async () => keep);
+      await ensureBrowserPaths(browserPaths(file));
+      const page = await runtime.pageForJob('paused');
+      const attached = await runtime.connection();
+      const pid = attached.child.pid;
+      if (pid === undefined) throw new Error('Owned Chrome unavailable');
+      const profileProcesses = async (): Promise<number[]> => {
+        const { stdout } = await promisify(execFile)('/bin/ps', ['-A', '-ww', '-o', 'pid=,args=']);
+        return stdout
+          .split('\n')
+          .filter((line) => line.includes(file))
+          .map((line) => Number(line.trim().split(/\s+/u)[0]));
+      };
+      expect(await profileProcesses()).toContain(pid);
+      const resume = (): void => {
+        try {
+          process.kill(pid, 'SIGCONT');
+        } catch (error) {
+          if (!(error instanceof Error && 'code' in error && error.code === 'ESRCH')) throw error;
+        }
+      };
+      process.kill(pid, 'SIGSTOP');
+      keep = false;
+      const pageClose = vi.spyOn(page, 'close');
+      const releasing = runtime.releaseUnusedPages();
+      await vi.waitFor(() => expect(pageClose).toHaveBeenCalled());
+      const stopping = runtime.shutdown();
+      let timeout: NodeJS.Timeout | undefined;
+      try {
+        await Promise.race([
+          Promise.all([stopping, releasing]),
+          new Promise<never>((_resolve, reject) => {
+            timeout = setTimeout(
+              () => reject(new Error('Chrome retirement did not reach its process fallback')),
+              8_000,
+            );
+          }),
+        ]);
+        expect(await profileProcesses()).toEqual([]);
+      } finally {
+        if (timeout) clearTimeout(timeout);
+        resume();
+        await Promise.all([stopping, releasing]);
+      }
+    },
+    30_000,
+  );
+  it.skipIf(!process.env.GWS_EA_BROWSER_TEST_CHROME)(
+    'preserves persistent sign-in cookies when Chrome stops and launches on demand again',
+    async () => {
+      await ensureBrowserPaths(browserPaths(file));
+      const first = await runtime.connection();
+      await first.context.addCookies([
+        {
+          name: 'fixture-session',
+          value: 'saved-sign-in',
+          url: 'https://fixture.example',
+          expires: Math.floor(Date.now() / 1_000) + 3_600,
+          secure: true,
+          httpOnly: true,
+        },
+      ]);
+      await runtime.stop();
+      expect(first.child.exitCode !== null || first.child.signalCode !== null).toBe(true);
+      const second = await runtime.connection();
+      expect(second.child.pid).not.toBe(first.child.pid);
+      expect(await second.context.cookies('https://fixture.example')).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ name: 'fixture-session', value: 'saved-sign-in', secure: true, httpOnly: true }),
+        ]),
+      );
+    },
+    30_000,
+  );
   it.skipIf(!process.env.GWS_EA_BROWSER_TEST_CHROME)(
     'starts under the service PATH and keeps the other native job page usable when one job closes',
     async () => {
@@ -565,7 +884,24 @@ describe('optional host browser lifecycle', () => {
         const state = owned.state();
         if (state.proxy.state !== 'listening') throw new Error('Expected an owned proxy');
         expect(await listening(state.proxy.port)).toBe(true);
-        await expect(getHostShutdownCallbacks().at(-1)!()).rejects.toThrow('Scheduler cleanup failed');
+        const disconnected = new Promise<void>((resolve) => attached.browser.once('disconnected', () => resolve()));
+        stopQueue.mockImplementation(() => disconnected);
+        const stopping = getHostShutdownCallbacks().at(-1)!();
+        let timeout: NodeJS.Timeout | undefined;
+        try {
+          await expect(
+            Promise.race([
+              stopping,
+              new Promise<never>((_resolve, reject) => {
+                timeout = setTimeout(() => reject(new Error('Queue drain blocked Chrome retirement')), 8_000);
+              }),
+            ]),
+          ).rejects.toThrow('Scheduler cleanup failed');
+        } finally {
+          if (timeout) clearTimeout(timeout);
+          await owned.shutdown();
+          await Promise.resolve(stopping).catch(() => undefined);
+        }
         expect(attached.browser.isConnected()).toBe(false);
         expect(attached.child.exitCode !== null || attached.child.signalCode !== null).toBe(true);
         expect(await listening(state.proxy.port)).toBe(false);

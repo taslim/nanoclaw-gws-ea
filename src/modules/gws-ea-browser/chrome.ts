@@ -5,6 +5,14 @@ import path from 'node:path';
 import net from 'node:net';
 
 import {
+  captureChromeGroup,
+  claimChromeProfile,
+  retireChromeGroup,
+  type ChromeProcessGroup,
+} from './chrome-processes.js';
+export { retireChromeProfile } from './chrome-processes.js';
+
+import {
   ensureBrowserPaths,
   clearBrowserUploadStaging,
   ensurePrivateDirectory,
@@ -77,6 +85,7 @@ function object(value: unknown): Record<string, unknown> {
 
 /** Only called while Chrome is stopped; retain cookies/site state and rewrite safety preferences. */
 export async function prepareChromeProfile(paths: BrowserPaths): Promise<void> {
+  await claimChromeProfile(paths);
   await ensureBrowserPaths(paths);
   await clearBrowserUploadStaging(paths);
   const defaultDir = path.join(paths.profileDir, 'Default');
@@ -156,13 +165,28 @@ export async function spawnChrome(input: ChromeLaunchInput, signal?: AbortSignal
   });
   signal?.throwIfAborted();
   const launch = buildChromeLaunch({ ...input, debuggerPort });
-  const child = spawn(launch.command, launch.args, { stdio: 'ignore' });
+  await claimChromeProfile(input.paths);
+  signal?.throwIfAborted();
+  const child = spawn(launch.command, launch.args, { stdio: 'ignore', detached: true });
   // The shell can fail before the connection owner installs its listeners.
   child.on('error', () => undefined);
+  try {
+    if (child.pid !== undefined) ownedGroups.set(child, await captureChromeGroup(child.pid));
+  } catch (error) {
+    await stopChrome(child);
+    throw error;
+  }
   return { child, debuggerPort };
 }
 
 const retirements = new WeakMap<ChildProcess, Promise<void>>();
+const ownedGroups = new WeakMap<ChildProcess, ChromeProcessGroup>();
+
+/** Capture helpers before the graceful close can orphan them. */
+export async function prepareChromeRetirement(child: ChildProcess): Promise<void> {
+  const group = ownedGroups.get(child);
+  if (group) ownedGroups.set(child, await captureChromeGroup(group.id, group));
+}
 
 export function stopChrome(child: ChildProcess): Promise<void> {
   let retirement = retirements.get(child);
@@ -174,6 +198,11 @@ export function stopChrome(child: ChildProcess): Promise<void> {
 }
 
 async function retireChrome(child: ChildProcess): Promise<void> {
+  const group = ownedGroups.get(child);
+  if (group) {
+    await retireChromeGroup(group);
+    return;
+  }
   if (child.exitCode !== null || child.signalCode !== null) return;
   // A failed spawn has no pid and never emits exit.
   if (child.pid === undefined) return;
@@ -192,6 +221,16 @@ async function retireChrome(child: ChildProcess): Promise<void> {
   }
   if (child.exitCode === null && child.signalCode === null) {
     child.kill('SIGKILL');
-    await exited;
+    let forced: NodeJS.Timeout | undefined;
+    try {
+      await Promise.race([
+        exited,
+        new Promise<never>((_resolve, reject) => {
+          forced = setTimeout(() => reject(new Error('Chrome process did not stop')), 2_000);
+        }),
+      ]);
+    } finally {
+      if (forced) clearTimeout(forced);
+    }
   }
 }

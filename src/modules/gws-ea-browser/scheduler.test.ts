@@ -59,6 +59,7 @@ beforeEach(async () => {
       throw new Error('Unexpected browser');
     },
     async closeJob() {},
+    withActivity: <T>(operation: () => Promise<T>): Promise<T> => operation(),
     onDisconnected: () => () => undefined,
   });
   const file = `${root}/browser`;

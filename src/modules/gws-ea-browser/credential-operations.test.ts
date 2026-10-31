@@ -708,6 +708,7 @@ describe("the principal's release of an attempt the host cannot settle", () => {
       closeJob: async (jobId: string) => {
         closed.push(jobId);
       },
+      withActivity: <T>(operation: () => Promise<T>): Promise<T> => operation(),
       onDisconnected: () => () => undefined,
     });
     registerCredentialAuthorityDelivery(() => queue, { attempts });

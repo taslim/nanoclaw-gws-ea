@@ -62,6 +62,7 @@ import { initGroupFilesystem } from './group-init.js';
 import { getAgentMailbox } from './mailbox/index.js';
 import { stopTypingRefresh } from './modules/typing/index.js';
 import { log } from './log.js';
+import { notifyContainerStopped } from './host-lifecycle.js';
 import { validateAdditionalMounts } from './modules/mount-security/index.js';
 // Provider contracts use a separate barrel so update-skills identity detection
 // remains tied to src/providers/index.ts.
@@ -786,6 +787,7 @@ async function finish(sessionId: string, runtime: ActiveSessionRuntime, failure?
   } catch (err) {
     log.error('Gateway session release failed', { sessionId, containerName, err });
   }
+  await notifyContainerStopped(sessionId);
   for (const callback of runtime.exitCallbacks) {
     try {
       callback();

@@ -5,7 +5,8 @@ import { readRecipeSiteInfo } from './recipe-store.js';
 
 import { register } from '../../cli/registry.js';
 import { registerMigration } from '../../db/migrations/index.js';
-import { onHostShutdown, onHostStart } from '../../host-lifecycle.js';
+import { onContainerStopped, onHostShutdown, onHostStart } from '../../host-lifecycle.js';
+import { isContainerRunning } from '../../container-runner.js';
 import { log } from '../../log.js';
 import { browserHealth } from './health.js';
 import { BrowserRuntime } from './runtime.js';
@@ -101,7 +102,16 @@ registerMigration(browserCredentialConsentHoldMigration);
 registerMigration(browserConsentOutcomesMigration);
 registerMigration(browserCredentialUncertaintyMigration);
 
-const runtime = new BrowserRuntime(undefined, browserAdmissionReady);
+const runtime = new BrowserRuntime(undefined, browserAdmissionReady, undefined, async (jobId) => {
+  const store = new BrowserStore();
+  const job = await store.getJob(jobId);
+  if (!job || job.cancelled) return false;
+  return (
+    isContainerRunning(job.browser_session_id) ||
+    (await store.hasPending(jobId)) ||
+    (await store.hasCheckoutPageHold(jobId))
+  );
+});
 export function getBrowserRuntime(): BrowserRuntime {
   return runtime;
 }
@@ -109,7 +119,13 @@ export function getBrowserRuntime(): BrowserRuntime {
 let watchScheduler: BrowserWatchScheduler | undefined;
 let reconcileTimer: NodeJS.Timeout | undefined;
 let reconciling = false;
+let detachHostAbort: (() => void) | undefined;
+onContainerStopped(() => runtime.releaseUnusedPages());
 onHostStart(async ({ signal }) => {
+  const closeAdmission = (): void => runtime.closeAdmission();
+  signal.addEventListener('abort', closeAdmission, { once: true });
+  detachHostAbort = () => signal.removeEventListener('abort', closeAdmission);
+  if (signal.aborted) closeAdmission();
   setBrowserAdmissionReady(false);
   const activeQueue = getBrowserQueue();
   configureBrowserCancellation(activeQueue);
@@ -159,13 +175,13 @@ onHostStart(async ({ signal }) => {
     // Failed mandatory recovery cannot be bypassed by expiry or session work.
     if (!recovered) return;
     for (const task of [
-      () => runtime.closeIdleWindows(),
       () => activeQueue.retryAnswers(),
       () => sweepBrowserJobSessions(),
       () => cleanupBrowserSignInMail(),
       () => recoverConsentOutcomes(),
       () => sweepBrowserPurchaseState(activeQueue),
       () => notifyPendingIncidents(),
+      () => runtime.releaseUnusedPages(),
     ])
       await optional(task);
   };
@@ -266,23 +282,23 @@ export {
 export { observePage, pinBrowserRefs, disposeBrowserRefs, type BrowserRef, type PinnedBrowserRef } from './observe.js';
 export { registerPageSecret, releasePageSecret, redactPageText, pageHasSecret } from './page-privacy.js';
 onHostShutdown(async () => {
+  runtime.closeAdmission();
+  detachHostAbort?.();
+  detachHostAbort = undefined;
   setBrowserAdmissionReady(false);
   if (reconcileTimer) clearInterval(reconcileTimer);
   reconcileTimer = undefined;
   const scheduler = watchScheduler;
   watchScheduler = undefined;
   try {
-    await scheduler?.stop();
+    const stopped = await Promise.allSettled([scheduler?.stop(), queue?.stop(), runtime.shutdown()]);
+    const failure = stopped.find((result) => result.status === 'rejected');
+    if (failure?.status === 'rejected') throw failure.reason;
   } finally {
     try {
-      await queue?.stop();
+      await recoverBrowserSignInMail();
     } finally {
-      try {
-        await recoverBrowserSignInMail();
-      } finally {
-        queue = undefined;
-        await runtime.shutdown();
-      }
+      queue = undefined;
     }
   }
 });
