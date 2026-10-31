@@ -1388,14 +1388,11 @@ describe.skipIf(!chromePath)('ordinary presses that buy, in native Chrome', { ti
       'SELECT kind, site, job_id FROM gws_ea_browser_incidents',
     );
 
-  it('refreshes a missed job inventory once and presents the account owner of each saved login', async () => {
-    const list = vi.spyOn(browserVault, 'itemsForOrigin').mockResolvedValue([]);
-    const refresh = vi.spyOn(browserVault, 'refresh').mockImplementation(async () => {
-      list.mockResolvedValue([
-        { item_handle: 'vault_assistant', title: 'Assistant login' },
-        { item_handle: 'vault_principal', title: 'Principal login' },
-      ]);
-    });
+  it('presents the account owner of each saved login', async () => {
+    const list = vi.spyOn(browserVault, 'itemsForOrigin').mockResolvedValue([
+      { item_handle: 'vault_assistant', title: 'Assistant login' },
+      { item_handle: 'vault_principal', title: 'Principal login' },
+    ]);
     const account = vi.spyOn(credentialAttempts, 'account').mockImplementation(async (handle) => ({
       status: 'classified',
       account: handle === 'vault_assistant' ? 'assistant' : 'principal',
@@ -1406,12 +1403,8 @@ describe.skipIf(!chromePath)('ordinary presses that buy, in native Chrome', { ti
         { item_handle: 'vault_assistant', title: 'Assistant login', account: 'assistant' },
         { item_handle: 'vault_principal', title: 'Principal login', account: 'principal' },
       ]);
-      list.mockResolvedValue([]);
-      await run('later-inventory-miss', [{ kind: 'navigate', url: OPEN_WEB.product }]);
-      expect(refresh).toHaveBeenCalledTimes(1);
     } finally {
       list.mockRestore();
-      refresh.mockRestore();
       account.mockRestore();
     }
   });

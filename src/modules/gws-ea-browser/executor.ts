@@ -756,7 +756,6 @@ async function executeBatch(
         remaining: context.remaining,
       });
       observation = await observePage(page, context.assertActive, {
-        jobId: context.job.id,
         cookieBanner,
         remaining: context.remaining,
         signal: context.signal,

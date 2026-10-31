@@ -330,19 +330,9 @@ export async function executeFillSecret(
         refs.get(payload.submit.ref)!,
         payload.field,
       );
-      return await fillBoundBrowserSecret(context, binding, async () => {
-        try {
-          return await browserVault.resolve(payload.item_handle, payload.field, binding.origin, context.assertActive);
-        } catch (error) {
-          if (
-            !(error instanceof BrowserVaultError) ||
-            error.reason !== 'no_item_for_site' ||
-            !(await refreshVaultForJob(context.job.id, context.assertActive))
-          )
-            throw error;
-          return browserVault.resolve(payload.item_handle, payload.field, binding.origin, context.assertActive);
-        }
-      });
+      return await fillBoundBrowserSecret(context, binding, () =>
+        browserVault.resolve(payload.item_handle, payload.field, binding.origin, context.assertActive),
+      );
     } catch (error) {
       if (error instanceof BrowserOriginMismatchError) return { status: 'origin_mismatch' };
       if (error instanceof BrowserVaultError) return { status: error.reason };
@@ -356,43 +346,20 @@ export async function executeFillSecret(
 
 export const fillSecretAction: BrowserQueuedAction = { validate: validateFillSecret, execute: executeFillSecret };
 
-/** An automatic retry belongs to the errand, shared by its observations and fills. */
-const refreshedVaultJobs = new Set<string>();
-async function refreshVaultForJob(jobId: string | undefined, assertActive: () => Promise<void>): Promise<boolean> {
-  if (jobId === undefined || refreshedVaultJobs.has(jobId)) return false;
-  refreshedVaultJobs.add(jobId);
-  await browserVault.refresh(assertActive);
-  return true;
-}
-
 export async function readVaultSiteInfo(
   origins: readonly string[],
   assertActive: () => Promise<void>,
-  jobId?: string,
 ): Promise<Record<string, unknown>> {
   try {
     const items = new Map<string, { item_handle: string; title: string; account: 'assistant' | 'principal' }>();
-    const read = async (): Promise<boolean> => {
-      let missed = false;
-      for (const frameOrigin of origins) {
-        const choices = await browserVault.itemsForOrigin(frameOrigin, assertActive);
-        if (!choices.length) missed = true;
-        for (const item of choices) {
-          if (items.has(item.item_handle)) continue;
-          const classification = await credentialAttempts.account(item.item_handle, frameOrigin, assertActive);
-          if (classification.status === 'vault_unavailable' && (await refreshVaultForJob(jobId, assertActive))) {
-            items.clear();
-            return read();
-          }
-          if (classification.status !== 'classified') throw new BrowserVaultError(classification.status);
-          items.set(item.item_handle, { ...item, account: classification.account });
-        }
+    for (const frameOrigin of origins) {
+      const choices = await browserVault.itemsForOrigin(frameOrigin, assertActive);
+      for (const item of choices) {
+        if (items.has(item.item_handle)) continue;
+        const classification = await credentialAttempts.account(item.item_handle, frameOrigin, assertActive);
+        if (classification.status !== 'classified') throw new BrowserVaultError(classification.status);
+        items.set(item.item_handle, { ...item, account: classification.account });
       }
-      return missed;
-    };
-    if ((await read()) && (await refreshVaultForJob(jobId, assertActive))) {
-      items.clear();
-      await read();
     }
     return { vault_items: [...items.values()] };
     // eslint-disable-next-line no-catch-all/no-catch-all -- optional vault metadata becomes a constant status, never a failed observation

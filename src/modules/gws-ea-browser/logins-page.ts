@@ -192,9 +192,10 @@ export function createLoginsPageHandler(options: LoginsPageOptions): RequestList
         } catch (error) {
           if (error instanceof InvalidSubmission) throw error;
           outcome = failureMessage(error);
-          status = error instanceof BrowserLoginError ? (error.reason === 'login_changed' ? 409 : 400) : 503;
-        } finally {
-          delete data.password;
+          if (error instanceof BrowserVaultError && error.reason === 'no_item_for_site') {
+            status = 409;
+            view = { kind: 'list' };
+          } else status = error instanceof BrowserLoginError ? (error.reason === 'login_changed' ? 409 : 400) : 503;
         }
       }
       let available = true;

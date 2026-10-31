@@ -150,7 +150,7 @@ export const browser = requestTool({
 export const fillSecret = requestTool({
   name: 'fill_secret',
   description:
-    'Ask the host to fill a 1Password login by handle and submit it. The host validates the complete HTTPS frame origin before resolving and again before insertion; no secret value reaches you. Outcomes: submitted or cleared_after_submit: observe again. no_item_for_site: no saved login exists; tell main so the principal can add it to the assistant’s 1Password vault if their account is needed. origin_mismatch: the origin does not match the login. vault_not_set_up: tell main the principal must ask their operator to finish 1Password setup. vault_unavailable: 1Password cannot be used now; rate_limited: its daily request limit was reached. Report these limits to main; never ask for a password. ' +
+    'Ask the host to fill a 1Password login by handle and submit it. The host validates the complete HTTPS frame origin before resolving and again before insertion; no secret value reaches you. Outcomes: submitted or cleared_after_submit: observe again. no_item_for_site: no saved login exists; tell main, which sends the principal their logins page. origin_mismatch: the origin does not match the login. vault_not_set_up: tell main the principal must ask their operator to finish 1Password setup. vault_unavailable: 1Password cannot be used now; rate_limited: its daily request limit was reached. Report these limits to main; never ask for a password. ' +
     NO_REPEAT,
   properties: {
     item_handle: { type: 'string', description: 'The opaque login handle the host listed for this site.' },

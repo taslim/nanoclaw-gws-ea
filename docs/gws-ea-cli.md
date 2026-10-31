@@ -69,9 +69,7 @@ issued artifact links stop until their serving resources are installed again.
 
 After reinstalling, run `gws-ea connectors check web --id <instance_id>` and
 open the assistant's `/logins` link as the principal. A retained artifacts-only
-route leaves web not ready. To roll back, uninstall web with the currently
-installed new checkout **before** returning to the older release, then reinstall
-web using that older version and run its same readiness check.
+route leaves web not ready.
 
 The operator needs an active Cloudflare DNS zone, an Access team, an
 account-scoped management token with the required Tunnel, DNS, Access
@@ -124,8 +122,6 @@ the operator to revoke the management token and remove the original credential
 file. Inspect an exact unproven creation and remove any resource it created before
 acknowledging it with `--discard-unproven <attempt>`.
 
-A rollback to a release without the web contract serves nothing. `check web`
-reports that assistant unsupported and offers `gws-ea update --id`.
 See the [artifact guide](gws-ea-artifacts.md) for retention, sharing and native tools.
 
 ## Find and inspect an assistant
@@ -315,19 +311,18 @@ spelling of its web alias, or a non-email username from a completed signup on
 that site. Who added or edited the login does not decide ownership. Other logins
 belong to the principal. The assistant changes only its own accounts' passwords;
 the principal changes their own password on the site, then updates the saved
-login. Shared or third-party accounts are handled through the principal's
-direction and the agents' judgment, not a separate ownership class.
+login.
 
 A confirmed change replaces the password in the freshly checked login and
 deletes the separate candidate. If someone edits or removes that login during
 the change, the host leaves it as edited and keeps the new password in its own
 item. The persistent browser profile keeps every sign-in, including the
-principal's accounts. Agents judge whether the current task calls for that
-account; the host adds no account-use restriction by delegating group.
+principal's accounts.
 
 Main sends the principal their private `https://<assistant-host>/logins` link
-when a login is missing or they ask. Only the principal's currently confirmed
-addresses can open it through Cloudflare Access. They can add or remove logins
+when a login is missing or they ask. Cloudflare Access admits the principal and
+invited artifact readers; the host permits `/logins` only for the principal's
+currently confirmed addresses. They can add or remove logins
 and edit the account label, website, username or saved password for either account
 owner; no saved password is ever revealed. Logins are grouped by website and can
 be searched by site, label or username. Each login has a details view and an edit

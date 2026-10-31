@@ -1,14 +1,14 @@
 import { answeredGuard, answeringAction, invalidArgs } from '../../cli/delivery-action.js';
 import { registerDeliveryAction } from '../../delivery.js';
 import { ALLOW, DENY, defineGuardedAction } from '../../guard/index.js';
-import { webPublicationReady } from '../gws-ea-web/index.js';
+import { webReadiness } from '../gws-ea-web/index.js';
 import { readWebPolicy } from '../gws-ea-web/policy.js';
 import { hasBrowserAccess } from './access.js';
 import { browserVault, type BrowserVault } from './onepassword.js';
 
 interface LoginsPageDependencies {
   readonly vault: Pick<BrowserVault, 'availability'>;
-  readonly publicationReady: typeof webPublicationReady;
+  readonly publicationReady: typeof webReadiness.publicationReady;
 }
 
 export const loginsPageGuard = defineGuardedAction({
@@ -21,7 +21,7 @@ export const loginsPageGuard = defineGuardedAction({
 });
 
 export function registerLoginsPageDelivery(
-  dependencies: LoginsPageDependencies = { vault: browserVault, publicationReady: webPublicationReady },
+  dependencies: LoginsPageDependencies = { vault: browserVault, publicationReady: webReadiness.publicationReady },
 ): void {
   registerDeliveryAction(
     'logins_page',

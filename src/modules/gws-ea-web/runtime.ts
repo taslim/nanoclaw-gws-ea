@@ -3,7 +3,7 @@ import { readWebOperatorConfig, reconcileWebAccessEmails } from '../../gws-ea/we
 import { log } from '../../log.js';
 import { createWebIdentity, type WebIdentity } from './access.js';
 import { WEB_POLICY_VERSIONS, readWebPolicy, webPolicyDigest, type WebPolicyFile } from './policy.js';
-import { createWebHandler, unavailableWebHandler } from './server.js';
+import { createWebHandler, unavailableWebHandler, type WebFeatures } from './server.js';
 
 export interface WebHealth {
   readonly policyVersions: readonly number[];
@@ -20,10 +20,6 @@ export interface WebReadiness {
   readonly publicationReady: (config: WebPolicyFile) => Promise<boolean>;
 }
 type WebFeatureFactory = (config: WebPolicyFile, identity: WebIdentity) => RequestListener;
-export interface WebFeatureFactories {
-  readonly artifacts: WebFeatureFactory;
-  readonly logins: WebFeatureFactory;
-}
 /** One optional origin and one non-overlapping admission reconciliation tick per host. */
 export class WebRuntime {
   private server: Server | undefined;
@@ -38,7 +34,7 @@ export class WebRuntime {
   private tick: Promise<void> | undefined;
   private timer: NodeJS.Timeout | undefined;
   constructor(
-    private readonly features: WebFeatureFactories,
+    private readonly features: WebFeatures<WebFeatureFactory>,
     private readonly admissionEmails: () => Promise<readonly string[]>,
     private readonly dependencies: WebRuntimeDependencies = {},
   ) {}

@@ -261,12 +261,9 @@ When desktop approval is needed, an operator terminal is required; otherwise
 setup remains pending without calling `op`. The operator
 mints that assistant's runtime service account with read/write access to only
 its vault. A signup or password change saves the generated password in the
-vault before any site sees it. An account belongs to the assistant when its
-username is any spelling of the assistant's web alias, or a non-email username
-from its completed signup on that site; who added or edited the login does not
-decide ownership. Other accounts belong to the principal. Passwords change only
-on the assistant's accounts. The principal changes their own password on the
-site and updates the saved login. Sign-in email, phone, two-factor and
+vault before any site sees it. The
+[operator guide](docs/gws-ea-cli.md#1password-vaults) defines account ownership
+and password-change authority. Sign-in email, phone, two-factor and
 payment-method changes remain refused. A confirmed password change writes into
 the original login, read fresh and checked against the username rule, on the
 version just read (a racing edit is retried, bounded), then deletes the
@@ -282,20 +279,10 @@ and an older edit form cannot overwrite newer saved details.
 It refreshes saved logins for the next errand. No membership in the operator's
 1Password account is needed. Missing web or vault setup means the principal
 asks their operator; installed web that cannot serve now means try again later.
-The persistent browser keeps every sign-in, the principal's included. Agents
-consider whose account the task calls for and who sees the result, with the
-principal's direction guiding shared or third-party account use. No host
-restriction on account use is keyed on the delegating group.
+The persistent browser keeps every sign-in, the principal's included.
 
-Before updating an existing web install to this release, uninstall web using the
-**current checkout**. Then pull, run `bash gws-ea.sh`, run `gws-ea update --all`,
-and run `gws-ea connectors install web` with its setup options. The old
-artifacts-only Cloudflare route is intentionally refused: Access must cover the
-whole hostname, including `/logins`. Verify with
-`gws-ea connectors check web --id <instance_id>` and open the page as the
-principal. For rollback, uninstall web using the currently installed new code
-before returning to the older route contract; reinstall using that version and
-check readiness. There is no password-reveal feature.
+Before updating an existing web install, follow the
+[web reinstall instructions](docs/gws-ea-cli.md#assistant-web).
 
 `connectors uninstall onepassword` previews every vault and active credential
 attempt, then requires terminal confirmation or `--delete-vaults`. It stops all

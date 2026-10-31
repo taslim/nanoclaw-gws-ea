@@ -26,17 +26,8 @@ them, and editing their labels, websites, usernames or saved passwords; it never
 reveals a password. There is no artifacts connector
 or second activation step.
 
-Before updating an existing web install to this release, run
-`gws-ea connectors uninstall web` using the **current checkout**. Then pull the
-release, run `bash gws-ea.sh`, run `gws-ea update --all`, and install web again
-with `gws-ea connectors install web` and its setup options. The previous
-artifacts-only Cloudflare route is intentionally refused because it leaves
-`/logins` outside Access. Local saved HTML and logins survive the uninstall.
-
-Verify with `gws-ea connectors check web --id <instance_id>` and open `/logins`
-as the principal. To roll back to the older route contract, first uninstall web
-using the currently installed new checkout, then return to the older version,
-reinstall web there and run its readiness check.
+Before updating an existing web install, follow the
+[web reinstall instructions](gws-ea-cli.md#assistant-web).
 
 An assistant named Aya claims `aya.example.com` on zone `example.com`. Its first
 name uses the shared ASCII reduction, capped at 63 characters, with no suffix or

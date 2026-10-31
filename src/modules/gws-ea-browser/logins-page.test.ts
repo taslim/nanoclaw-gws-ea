@@ -301,22 +301,6 @@ it('rejects unsafe sites, malformed JSON and an over-limit streamed body without
   expect(fake.items.size).toBe(0);
 });
 
-it('checks duplicates and creates coherently across concurrent principal submissions', async () => {
-  const responses = await Promise.all([
-    post('/logins/add', { site: 'netflix.com', title: '', username: PRINCIPAL, password: SECRET }),
-    post('/logins/add', {
-      site: 'https://netflix.com/login',
-      title: '',
-      username: PRINCIPAL,
-      password: 'second-password',
-    }),
-  ]);
-  expect(responses.map((response) => response.status).sort()).toEqual([200, 400]);
-  expect(responses.find((response) => response.status === 400)?.body).toContain('Open that login to update it.');
-  expect(fake.items.size).toBe(1);
-  expect(fake.calls.filter((call) => call === 'create')).toHaveLength(1);
-});
-
 it('refreshes from the completed write when a concurrent GET had already captured an older listing', async () => {
   const client = fake.client() as Client;
   const creating = latch();
@@ -541,10 +525,43 @@ it('leaves an item untouched when an optimistic password save races a fresh edit
   expect(response.body).not.toContain('replacement-password');
 });
 
-it('refuses unlisted and stale handles on password updates and removals without writing', async () => {
+it('queues removal behind an edit and checks its version after the edit finishes', async () => {
+  const item = login();
+  const client = fake.client() as Client;
+  const saving = latch();
+  const allowSave = latch();
+  const put = client.items.put.bind(client.items);
+  client.items.put = async (params) => {
+    saving.release();
+    await allowSave.promise;
+    return put(params);
+  };
+  sdk.create.mockResolvedValue(client);
+  const handle = await handleFor(item);
+  const read = vi.spyOn(vault, 'readItem');
+  const update = vault.updateLogin(handle, 1, { password: 'queued-replacement' });
+  await saving.promise;
+  const remove = vault.removeLogin(handle, 1);
+  const settled = Promise.allSettled([update, remove]);
+  try {
+    expect(read).toHaveBeenCalledTimes(1);
+  } finally {
+    allowSave.release();
+    await settled;
+  }
+  expect(await settled).toEqual([
+    { status: 'fulfilled', value: undefined },
+    { status: 'rejected', reason: expect.objectContaining({ reason: 'login_changed' }) },
+  ]);
+  expect(fake.items.has(item.id)).toBe(true);
+  expect(fake.value(item.id, 'password')).toBe('queued-replacement');
+  expect(fake.calls).not.toContain('delete');
+});
+
+it('refuses unlisted and deleted logins on password updates and removals without writing', async () => {
   const item = login();
   const handle = await handleFor(item);
-  fake.archived.add(item.id);
+  fake.items.delete(item.id);
   for (const selected of ['vault_unlisted', handle]) {
     for (const action of ['update', 'remove']) {
       const response = await post(`/logins/${action}`, {
@@ -554,8 +571,12 @@ it('refuses unlisted and stale handles on password updates and removals without 
           ? { title: 'Netflix', site: 'netflix.com', username: PRINCIPAL, password: SECRET }
           : {}),
       });
-      expect(response.status).toBe(503);
-      expect(response.body).toContain('That login is no longer available.');
+      expect(response.status).toBe(selected === 'vault_unlisted' ? 409 : 503);
+      expect(response.body).toMatch(/That login is no longer available\.|The login vault is unavailable\./u);
+      if (selected === 'vault_unlisted') {
+        expect(response.body.match(/That login is no longer available\./gu)).toHaveLength(1);
+        expect(response.body).not.toContain('Logins unavailable');
+      }
     }
   }
   expect(fake.calls).not.toContain('put');
@@ -625,9 +646,10 @@ it('shows setup, outage and rate-limit outcomes without leaking provider error m
   expect(unavailable.status).toBe(503);
   expect(unavailable.body).toContain('The login vault is unavailable.');
   expect(unavailable.body).not.toContain(SECRET);
+  vi.spyOn(Date, 'now').mockReturnValue(Date.now() + 60_001);
   fake.failNext('list', new RateLimitExceededError(SECRET));
   const limited = await request();
-  expect(limited.body).toContain('Try again later.');
+  expect(limited.body).toContain('The login vault has reached its request limit. Try again later.');
   const before = [...fake.calls];
   for (const action of ['add', 'update', 'remove']) {
     const response = await post(
@@ -865,7 +887,6 @@ it.skipIf(!chromePath).each([320, 390, 1200])(
         await page.getByLabel('New saved password', { exact: true }).fill('stale-replacement');
         await page.getByRole('button', { name: 'Save changes', exact: true }).click();
         await page.getByText(/This login changed since you opened it/u).waitFor();
-        expect(await page.getByLabel('New saved password', { exact: true }).inputValue()).toBe('');
         expect(await page.getByRole('button', { name: 'Save changes', exact: true }).isEnabled()).toBe(true);
         await page.reload();
         fake.failNext('put', new Error(SECRET), true);
@@ -873,7 +894,6 @@ it.skipIf(!chromePath).each([320, 390, 1200])(
         await page.getByRole('button', { name: 'Save changes', exact: true }).click();
         await page.getByRole('link', { name: 'Reload page', exact: true }).waitFor();
         expect(await page.getByRole('button', { name: 'Save changes', exact: true }).isDisabled()).toBe(true);
-        expect(await page.getByLabel('New saved password', { exact: true }).inputValue()).toBe('');
         expect(fake.value(imported.id, 'password')).toBe('saved-but-response-lost');
         await page.reload();
         fake.beforePut = () => fake.failNext('get', new RateLimitExceededError(SECRET));

@@ -7,27 +7,15 @@ import { judgeArtifactSend } from './links.js';
 import { register } from '../../cli/registry.js';
 import { onHostStart, onHostShutdown } from '../../host-lifecycle.js';
 import { ArtifactsRuntime } from './runtime.js';
-import { artifactAdmissionEmails } from './sharing.js';
 import { getAllAgentGroups } from '../../db/agent-groups.js';
 import { hasArtifactsAccess } from './policy.js';
-import { startWebOrigin } from '../gws-ea-web/index.js';
-import { createLoginsPageHandler } from '../gws-ea-browser/logins-page.js';
-import { createArtifactViewHandler } from './server.js';
-import { createArtifactViewResolver } from './access.js';
+import { webReadiness } from '../gws-ea-web/index.js';
 
 registerMigration(artifactsMigration);
 registerOutboundGuard('gws-ea-artifacts:link-access', judgeArtifactSend);
 for (const [action, handler, guard] of ARTIFACT_ACTIONS) registerDeliveryAction(action, handler, guard);
 
-const web = startWebOrigin(
-  {
-    artifacts: (config, identity) =>
-      createArtifactViewHandler({ hostname: config.hostname, resolve: createArtifactViewResolver(config, identity) }),
-    logins: (config, identity) => createLoginsPageHandler({ hostname: config.hostname, identity }),
-  },
-  artifactAdmissionEmails,
-);
-const runtime = new ArtifactsRuntime(web);
+const runtime = new ArtifactsRuntime(webReadiness);
 registerDeliveryAction('artifact_share', runtime.sharing.handler, runtime.sharing.deliveryGuard);
 runtime.sharing.registerApprovals();
 onHostStart(({ signal }) => runtime.start(signal));

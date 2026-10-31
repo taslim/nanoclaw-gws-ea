@@ -6,7 +6,6 @@ import {
   BrowserOriginMismatchError,
   discoverAuthenticationCodeField,
   fillBoundBrowserSecret,
-  executeFillSecret,
   validateFillSecret,
 } from './fill.js';
 import type { BrowserExecutionContext } from './actions.js';
@@ -16,7 +15,6 @@ import { pageHasSecret } from './page-privacy.js';
 import * as nativeAuthentication from './authentication-submit.js';
 import * as isolatedFacts from './control-facts.js';
 import * as consentEngine from './consent.js';
-import * as navigationPolicy from './commit-classifier.js';
 import { credentialAttempts } from './credential-attempts.js';
 import { browserVault, BrowserVaultError, websitePermitsOrigin } from './onepassword.js';
 
@@ -392,105 +390,6 @@ it('labels each site login with its account owner without exposing credential va
     { item_handle: 'vault_principal', title: 'Principal login', account: 'principal' },
   ]);
   expect(JSON.stringify(observation.site)).not.toMatch(/username|password/u);
-});
-
-it('refreshes an origin miss once per job even when another origin has a login, finding a newly added login', async () => {
-  const merchant = { item_handle: 'vault_merchant', title: 'Merchant login' };
-  const choices = [{ item_handle: 'vault_added', title: 'New login' }];
-  const list = vi
-    .spyOn(browserVault, 'itemsForOrigin')
-    .mockImplementation(async (origin) => (origin === 'https://shop.example' ? [merchant] : []));
-  const refresh = vi.spyOn(browserVault, 'refresh').mockImplementation(async () => {
-    list.mockImplementation(async (origin) => (origin === 'https://shop.example' ? [merchant] : choices));
-  });
-  vi.spyOn(credentialAttempts, 'account').mockResolvedValue({ status: 'classified', account: 'principal' });
-  expect(
-    await readVaultSiteInfo(
-      ['https://shop.example', 'https://identity.example'],
-      async () => undefined,
-      'added-login-job',
-    ),
-  ).toEqual({
-    vault_items: [
-      { ...merchant, account: 'principal' },
-      { ...choices[0], account: 'principal' },
-    ],
-  });
-  expect(refresh).toHaveBeenCalledTimes(1);
-  list.mockResolvedValue([]);
-  expect(await readVaultSiteInfo(['https://library.example'], async () => undefined, 'added-login-job')).toEqual({
-    vault_items: [],
-  });
-  expect(refresh).toHaveBeenCalledTimes(1);
-  await readVaultSiteInfo(['https://library.example'], async () => undefined, 'another-login-job');
-  expect(refresh).toHaveBeenCalledTimes(2);
-});
-
-it.each(['vault_not_set_up', 'rate_limited', 'vault_unavailable'] as const)(
-  'bounds automatic metadata recovery and preserves %s',
-  async (status) => {
-    vi.spyOn(browserVault, 'itemsForOrigin').mockResolvedValue([{ item_handle: 'vault_login', title: 'Login' }]);
-    vi.spyOn(credentialAttempts, 'account').mockResolvedValue({ status });
-    const refresh = vi.spyOn(browserVault, 'refresh').mockResolvedValue();
-    const jobId = `metadata-failure-${status}`;
-    for (let observation = 0; observation < 2; observation += 1)
-      expect(await readVaultSiteInfo(['https://shop.example'], async () => undefined, jobId)).toEqual({
-        vault_status: status,
-      });
-    expect(refresh).toHaveBeenCalledTimes(status === 'vault_unavailable' ? 1 : 0);
-  },
-);
-
-it('shares the job refresh budget between observation misses and secret-fill misses', async () => {
-  const f = fixture();
-  Object.assign(f.context.job, { id: 'observation-then-fill-job' });
-  vi.spyOn(navigationPolicy, 'withBrowserJobNavigation').mockImplementation(async (_context, _page, work) => work());
-  vi.spyOn(browserVault, 'itemsForOrigin').mockResolvedValue([]);
-  const refresh = vi.spyOn(browserVault, 'refresh').mockResolvedValue();
-  const resolve = vi.spyOn(browserVault, 'resolve').mockRejectedValue(new BrowserVaultError('no_item_for_site'));
-  const observation = await observePage(f.page, f.context.assertActive, { jobId: f.context.job.id });
-  expect(refresh).toHaveBeenCalledTimes(1);
-  const payload = {
-    item_handle: 'vault_missing',
-    field: 'password',
-    target: { ref: 'e1', generation: observation.generation },
-    submit: { ref: 'e2', generation: observation.generation },
-  };
-  expect(await executeFillSecret(f.context, payload)).toEqual({ status: 'no_item_for_site' });
-  expect(resolve).toHaveBeenCalledTimes(1);
-  expect(refresh).toHaveBeenCalledTimes(1);
-  Object.assign(f.context.job, { id: 'fill-only-job' });
-  expect(await executeFillSecret(f.context, payload)).toEqual({ status: 'no_item_for_site' });
-  expect(refresh).toHaveBeenCalledTimes(2);
-  expect(resolve).toHaveBeenCalledTimes(3);
-  expect(f.nativeFill).not.toHaveBeenCalled();
-});
-
-it('fills and submits once when a job refresh makes the selected secret available', async () => {
-  const f = fixture();
-  Object.assign(f.context.job, { id: 'successful-fill-refresh-job' });
-  vi.spyOn(navigationPolicy, 'withBrowserJobNavigation').mockImplementation(async (_context, _page, work) => work());
-  vi.spyOn(browserVault, 'itemsForOrigin').mockResolvedValue([{ item_handle: 'vault_added', title: 'Added login' }]);
-  vi.spyOn(credentialAttempts, 'account').mockResolvedValue({ status: 'classified', account: 'principal' });
-  const refresh = vi.spyOn(browserVault, 'refresh').mockResolvedValue();
-  const resolve = vi
-    .spyOn(browserVault, 'resolve')
-    .mockRejectedValueOnce(new BrowserVaultError('no_item_for_site'))
-    .mockResolvedValue(SECRET);
-  const observation = await observePage(f.page, f.context.assertActive, { jobId: f.context.job.id });
-  const result = await executeFillSecret(f.context, {
-    item_handle: 'vault_added',
-    field: 'password',
-    target: { ref: 'e1', generation: observation.generation },
-    submit: { ref: 'e2', generation: observation.generation },
-  });
-  expect(result).toEqual({ status: 'cleared_after_submit' });
-  expect(refresh).toHaveBeenCalledTimes(1);
-  expect(resolve).toHaveBeenCalledTimes(2);
-  expect(f.nativeFill).toHaveBeenCalledExactlyOnceWith(SECRET);
-  expect(f.nativeSubmit).toHaveBeenCalledTimes(1);
-  expect(f.field.value).toBe('');
-  expect(JSON.stringify(result)).not.toContain(SECRET);
 });
 
 // These fake pages have no native DOM; Chrome suites exercise collection. Keep actual taint and redaction.

@@ -322,7 +322,6 @@ export async function executeRecipe(
     ...(!page.isClosed()
       ? {
           observation: await observePage(page, context.assertActive, {
-            jobId: context.job.id,
             remaining: context.remaining,
             signal: context.signal,
           }),
@@ -368,7 +367,6 @@ export async function executeRecipe(
     const observation =
       result.observation ??
       (await observePage(page, context.assertActive, {
-        jobId: context.job.id,
         remaining: context.remaining,
         signal: context.signal,
       }));
@@ -453,7 +451,6 @@ export async function executeRecipe(
     status: 'completed',
     ...coverage(),
     observation: await observePage(page, context.assertActive, {
-      jobId: context.job.id,
       remaining: context.remaining,
       signal: context.signal,
     }),

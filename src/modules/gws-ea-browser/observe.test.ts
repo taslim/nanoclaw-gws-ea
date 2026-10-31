@@ -153,19 +153,6 @@ it('emits host site metadata for changed full origins and keeps titles untrusted
   expect(JSON.stringify(first)).not.toContain('private-fixture-value');
 });
 
-it('passes the native errand identity to the vault reader', async () => {
-  const page = {
-    url: () => 'https://shop.example/login',
-    on() {},
-    frames: () => [],
-    locator: () => ({ ariaSnapshotJSON: async () => [] }),
-  } as unknown as Page;
-  const vault = vi.fn(async () => ({ vault_items: [] }));
-  configureBrowserSiteInfo({ vault });
-  await observePage(page, undefined, { jobId: 'native-errand' });
-  expect(vault).toHaveBeenCalledWith(['https://shop.example'], expect.any(Function), 'native-errand');
-});
-
 // These fake pages have no native DOM; Chrome suites exercise collection. Keep actual taint and redaction.
 vi.mock('./control-facts.js', async (original) => ({
   ...(await original<typeof import('./control-facts.js')>()),

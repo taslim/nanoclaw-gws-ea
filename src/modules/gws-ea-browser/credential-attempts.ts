@@ -163,10 +163,6 @@ export type CredentialFinalizeResult = Settled | Refused<'not_confirmed' | 'cand
 export type CredentialReleaseResult =
   | { readonly status: 'released'; readonly from: CredentialAttemptPhase; readonly attempt: CredentialAttempt }
   | { readonly status: 'settled'; readonly result: Settled };
-export type CredentialOwnership =
-  | { readonly status: 'owned' }
-  | { readonly status: 'not_owned' }
-  | { readonly status: BrowserVaultReason };
 
 export class CredentialAttemptError extends Error {
   constructor(readonly reason: 'not_found' | 'invalid_phase' | 'invalid_request') {
@@ -368,22 +364,8 @@ export class CredentialAttempts {
   }
 
   /**
-   * Whether the Login behind a listed handle is the assistant's account for
-   * this site, checked against its current username and websites.
-   */
-  async ownership(itemHandle: string, origin: string, assertActive = active): Promise<CredentialOwnership> {
-    const item = await this.listedItem(itemHandle, origin, assertActive);
-    if ('status' in item) return item;
-    const site = registrableDomain(origin);
-    if (!site) return { status: 'not_owned' };
-    const read = await provider(this.vault.readItem(item.vaultId, item.itemId, assertActive));
-    if (!('value' in read)) return read;
-    return (await this.assistantAccount(read.value, site)) ? { status: 'owned' } : { status: 'not_owned' };
-  }
-
-  /**
    * A delegation names an account, not a handle: find the assistant's Login
-   * for that exact username and site, checking every candidate fresh.
+   * for that exact username and site from the listing's cached metadata.
    */
   async ownedHandle(
     origin: string,
@@ -397,11 +379,12 @@ export class CredentialAttempts {
     const listed = await provider(this.vault.itemsForOrigin(origin, assertActive));
     if (!('value' in listed)) return listed;
     for (const { item_handle: itemHandle } of listed.value) {
-      const item = await this.listedItem(itemHandle, origin, assertActive);
-      if ('status' in item) continue;
-      const read = await provider(this.vault.readItem(item.vaultId, item.itemId, assertActive));
-      if (!('value' in read)) return read;
-      if (read.value.username === username && (await this.assistantAccount(read.value, site)))
+      const login = await provider(this.vault.loginForHandle(itemHandle, origin, assertActive));
+      if (!('value' in login)) {
+        if (login.status === 'rate_limited') return login;
+        continue;
+      }
+      if (login.value.username === username && (await this.accountForLogin(login.value, site)) === 'assistant')
         return { status: 'found', itemHandle };
     }
     return { status: 'not_owned' };

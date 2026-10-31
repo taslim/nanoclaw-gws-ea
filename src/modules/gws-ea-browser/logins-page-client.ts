@@ -4,9 +4,6 @@ export const LOGINS_PAGE_SCRIPT = String.raw`(() => {
   let busy = false;
   let pending;
   const dialog = document.getElementById('remove-dialog');
-  function clearPasswords() {
-    document.querySelectorAll('input[type="password"]').forEach(input => { input.value = ''; });
-  }
   function changed() {
     return [...document.querySelectorAll('form[data-track-changes] input:not([type="hidden"])')]
       .some(input => input.type === 'password' ? input.value !== '' : input.value !== input.defaultValue.replace(/[\r\n]/g, ''));
@@ -35,9 +32,6 @@ export const LOGINS_PAGE_SCRIPT = String.raw`(() => {
         if (input instanceof HTMLInputElement && input.value === input.defaultValue.replace(/[\r\n]/g, '')) delete data[name];
       }
     }
-    clearPasswords();
-    let body = JSON.stringify(data);
-    delete data.password;
     const controls = [...document.querySelectorAll('button, input')].filter(control => !control.disabled);
     const submit = form.querySelector('button[type="submit"]');
     const label = submit.textContent;
@@ -48,12 +42,10 @@ export const LOGINS_PAGE_SCRIPT = String.raw`(() => {
     document.querySelector('main').setAttribute('aria-busy', 'true');
     let uncertain = false;
     try {
-      const operation = fetch(form.action, {
-        method: 'POST', headers: { 'Content-Type': 'application/json' }, body,
+      const response = await fetch(form.action, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data),
         credentials: 'same-origin', cache: 'no-store',
       });
-      body = '';
-      const response = await operation;
       if (response.status === 404) {
         uncertain = true;
         message('This request could not be accepted. Reload the page and try again.', true);
@@ -78,7 +70,6 @@ export const LOGINS_PAGE_SCRIPT = String.raw`(() => {
       uncertain = true;
       message('The request could not be confirmed. Reload the page before trying again.', true);
     } finally {
-      body = '';
       busy = false;
       submit.textContent = label;
       document.querySelector('main').removeAttribute('aria-busy');
@@ -130,6 +121,5 @@ export const LOGINS_PAGE_SCRIPT = String.raw`(() => {
     event.preventDefault();
     event.returnValue = '';
   });
-  window.addEventListener('pagehide', clearPasswords);
-  window.addEventListener('pageshow', event => { if (event.persisted) { clearPasswords(); location.reload(); } });
+  window.addEventListener('pageshow', event => { if (event.persisted) location.reload(); });
 })();`;

@@ -6,6 +6,7 @@ vi.mock('./runtime.js', () => ({ startPortalRuntime: runtime.start }));
 // and test their database-backed lifecycles separately.
 vi.mock('../gws-ea-browser/index.js', () => ({}));
 vi.mock('../gws-ea-artifacts/index.js', () => ({}));
+vi.mock('../gws-ea-web/index.js', () => ({}));
 vi.mock('../../log.js', () => ({
   log: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn(), fatal: vi.fn() },
 }));

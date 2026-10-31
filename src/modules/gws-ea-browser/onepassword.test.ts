@@ -358,36 +358,32 @@ it('reads a fill’s metadata from the cache and spends one request on its secre
   expect(requests()).toBe(spent);
 });
 
+it('reuses metadata read during an edit once the next listing reports that version', async () => {
+  sdk.list.mockResolvedValue([{ ...item, updatedAt: new Date(0) }]);
+  const updated = { ...item, updatedAt: new Date(1), title: 'Updated login', version: 2, fields: [] };
+  sdk.get.mockResolvedValue(updated);
+  const subject = vault();
+  const [login] = await subject.allLogins();
+  expect(login).toMatchObject({ title: updated.title, version: updated.version });
+  sdk.list.mockResolvedValue([updated]);
+  await subject.refresh();
+  expect(await subject.savedLogin(login.item_handle)).toEqual(login);
+  expect(sdk.get).toHaveBeenCalledTimes(1);
+});
+
 describe('holding off while the vault cannot be reached', () => {
   const unavailable = { reason: 'vault_unavailable' };
 
-  it('backs off failed lazy metadata reads across observations without spending more requests', async () => {
-    vi.useFakeTimers();
+  it('re-lists immediately after an unread Login disappears, without holding off the next observation', async () => {
     sdk.list.mockResolvedValue([{ ...item, updatedAt: new Date() }]);
     sdk.get.mockRejectedValue(new Error(SECRET));
     const subject = vault();
     const [choice] = await subject.itemsForOrigin('https://shop.example');
     await expect(subject.loginForHandle(choice.item_handle, 'https://shop.example')).rejects.toMatchObject(unavailable);
-    let spent = requests();
-    let reads = sdk.get.mock.calls.length;
-    for (const minutes of [1, 2, 4]) {
-      vi.advanceTimersByTime(minutes * 60_000 - 1);
-      await expect(subject.itemsForOrigin('https://shop.example')).rejects.toMatchObject(unavailable);
-      await expect(subject.loginForHandle(choice.item_handle, 'https://shop.example')).rejects.toMatchObject(
-        unavailable,
-      );
-      expect(requests()).toBe(spent);
-      expect(sdk.get).toHaveBeenCalledTimes(reads);
-      vi.advanceTimersByTime(1);
-      expect(await subject.itemsForOrigin('https://shop.example')).toEqual([choice]);
-      await expect(subject.loginForHandle(choice.item_handle, 'https://shop.example')).rejects.toMatchObject(
-        unavailable,
-      );
-      expect(requests()).toBe(spent);
-      expect(sdk.get).toHaveBeenCalledTimes(reads + 1);
-      spent = requests();
-      reads += 1;
-    }
+    sdk.list.mockResolvedValue([]);
+    expect(await subject.itemsForOrigin('https://shop.example')).toEqual([]);
+    expect(sdk.list).toHaveBeenCalledTimes(2);
+    expect(sdk.get).toHaveBeenCalledTimes(1);
   });
 
   it('refuses page observations without a request until the hold expires, doubling it up to an hour', async () => {
@@ -408,31 +404,17 @@ describe('holding off while the vault cannot be reached', () => {
     }
   });
 
-  it('tries again at once on the principal’s refresh or a new binding', async () => {
+  it('retains an outage hold on refresh and starts anew for a replaced binding', async () => {
     vi.useFakeTimers();
-    // The vault was unshared: the token authenticates, but no longer reaches it.
     sdk.vaults.mockResolvedValue([]);
     const subject = vault();
     await expect(subject.itemsForOrigin('https://shop.example')).rejects.toMatchObject(unavailable);
-    let spent = requests();
-    await expect(subject.itemsForOrigin('https://shop.example')).rejects.toMatchObject(unavailable);
-    expect(requests()).toBe(spent);
+    const spent = requests();
+    sdk.vaults.mockResolvedValue([{ id: VAULT_ID }]);
     await expect(subject.refresh()).rejects.toMatchObject(unavailable);
-    expect(requests()).toBe(spent + 2);
-    // Shared again, the next refresh lists it within the hold the failed one set.
-    sdk.vaults.mockResolvedValue([{ id: VAULT_ID }]);
-    await subject.refresh();
-    expect(await subject.itemsForOrigin('https://shop.example')).toHaveLength(1);
-    expect(sdk.list).toHaveBeenCalledTimes(1);
-
-    sdk.vaults.mockRejectedValue(new Error(SECRET));
-    const revoked = vault();
-    await expect(revoked.itemsForOrigin('https://shop.example')).rejects.toMatchObject(unavailable);
-    spent = requests();
-    // Provisioning replaces the revoked token: the new binding starts without a hold.
+    expect(requests()).toBe(spent);
     await writePrivateFile(tokenFile, `${TOKEN}-replacement`);
-    sdk.vaults.mockResolvedValue([{ id: VAULT_ID }]);
-    expect(await revoked.itemsForOrigin('https://shop.example')).toHaveLength(1);
+    expect(await subject.itemsForOrigin('https://shop.example')).toHaveLength(1);
     expect(requests()).toBe(spent + 3);
   });
 

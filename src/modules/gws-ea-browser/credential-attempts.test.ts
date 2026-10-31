@@ -7,12 +7,7 @@ import { closeDb, getDb, initTestDb, runMigrations } from '../../db/index.js';
 import { log } from '../../log.js';
 import '../gws-ea-profile/index.js';
 import { recordWebAlias } from '../gws-ea-profile/testing/web-alias.js';
-import {
-  credentialAttempts,
-  CredentialAttempts,
-  type CredentialAttempt,
-  type CredentialPrepareResult,
-} from './credential-attempts.js';
+import { CredentialAttempts, type CredentialAttempt, type CredentialPrepareResult } from './credential-attempts.js';
 import {
   onePasswordHostPaths,
   onePasswordInstancePaths,
@@ -21,10 +16,9 @@ import {
 } from './onepassword-policy.js';
 import { browserCredentialAttemptsMigration, browserQueueMigration } from './migration.js';
 import { heldCredentialSites } from './leases.js';
-import { browserVault, BrowserVault } from './onepassword.js';
+import { BrowserVault } from './onepassword.js';
 import { FakeOnePassword } from './onepassword-fixture.js';
 import { writePrivateFile } from './paths.js';
-import { readVaultSiteInfo } from './fill.js';
 
 const sdk = vi.hoisted(() => ({ create: vi.fn() }));
 vi.mock('@1password/sdk', async (importOriginal) => ({
@@ -375,7 +369,6 @@ describe('suggestions and ownership', () => {
     const subject = service();
     const principal = principalLogin('remy.vance@example.com');
     const principalHandle = await handleFor(principal.id);
-    expect(await subject.ownership(principalHandle, ORIGIN)).toEqual({ status: 'not_owned' });
     expect(await subject.account(principalHandle, ORIGIN)).toEqual({ status: 'classified', account: 'principal' });
     expect(
       await subject.prepareRotation({ jobId: JOB, origin: ORIGIN, username: USERNAME, itemHandle: principalHandle }),
@@ -386,27 +379,36 @@ describe('suggestions and ownership', () => {
     const { itemId } = await ownedLogin(subject);
     const handle = await handleFor(itemId);
     fake.edit(itemId, (item) => ({ ...item, title: 'An updated title' }));
-    expect(await subject.ownership(handle, ORIGIN)).toEqual({ status: 'owned' });
-    expect(await subject.ownership(handle, 'https://shop.example.net')).toEqual({ status: 'origin_mismatch' });
+    expect(
+      await subject.prepareRotation({
+        jobId: JOB,
+        origin: 'https://shop.example.net',
+        username: USERNAME,
+        itemHandle: handle,
+      }),
+    ).toEqual({ status: 'origin_mismatch' });
     const copy = fake.duplicate(itemId, 'Shop copy');
-    expect(await subject.ownership(await handleFor(copy.id), ORIGIN)).toEqual({ status: 'owned' });
+    expect(await subject.account(await handleFor(copy.id), ORIGIN)).toEqual({
+      status: 'classified',
+      account: 'assistant',
+    });
     expect(await subject.account(handle, ORIGIN)).toEqual({ status: 'classified', account: 'assistant' });
 
     fake.edit(itemId, setField('username', 'remy.vance@example.com'));
     // A cached listing cannot authorize a write after the username changes.
-    expect(await subject.ownership(handle, ORIGIN)).toEqual({ status: 'not_owned' });
     expect(
       await subject.prepareRotation({ jobId: JOB, origin: ORIGIN, username: USERNAME, itemHandle: handle }),
     ).toEqual({
       status: 'not_owned',
     });
     fake.edit(itemId, setField('username', USERNAME));
-    expect(await subject.ownership(handle, ORIGIN)).toEqual({ status: 'owned' });
     fake.edit(itemId, (item) => ({
       ...item,
       websites: [{ url: 'https://shop.example.net', label: 'website', autofillBehavior: AutofillBehavior.ExactDomain }],
     }));
-    expect(await subject.ownership(handle, ORIGIN)).toEqual({ status: 'not_owned' });
+    expect(
+      await subject.prepareRotation({ jobId: JOB, origin: ORIGIN, username: USERNAME, itemHandle: handle }),
+    ).toEqual({ status: 'not_owned' });
   });
 
   it('recognizes non-email accounts only from a finalized signup for the same site and username', async () => {
@@ -419,7 +421,6 @@ describe('suggestions and ownership', () => {
     }));
     await vault.refresh();
     expect(await subject.account(handle, ORIGIN)).toEqual({ status: 'classified', account: 'assistant' });
-    expect(await subject.ownership(handle, ORIGIN)).toEqual({ status: 'owned' });
     const [listed] = await vault.allLogins();
     expect(await subject.accountForLogin(listed)).toBe('assistant');
     expect(await subject.accountForLogin({ ...listed, websites: [] })).toBe('principal');
@@ -430,16 +431,19 @@ describe('suggestions and ownership', () => {
     }));
     await vault.refresh();
     const [other] = await vault.itemsForOrigin('https://shop.example.net');
-    expect(await subject.ownership(other.item_handle, 'https://shop.example.net')).toEqual({ status: 'not_owned' });
+    expect(await subject.account(other.item_handle, 'https://shop.example.net')).toEqual({
+      status: 'classified',
+      account: 'principal',
+    });
 
     const change = await changedPassword(subject, itemId);
     await subject.markAwaitingVerification(change.attempt.id);
     await subject.markConfirmed(change.attempt.id, { account_page: 'password_changed' });
     expect(await subject.finalize(change.attempt.id)).toMatchObject({ status: 'finalized' });
     await getDb().run('DELETE FROM gws_ea_browser_credential_attempts WHERE id = ?', attempt.id);
-    expect(await subject.ownership(handle, ORIGIN)).toEqual({ status: 'not_owned' });
+    expect(await subject.account(handle, ORIGIN)).toEqual({ status: 'classified', account: 'principal' });
     expect(
-      await subject.prepareRotation({ jobId: JOB, origin: ORIGIN, username: USERNAME, itemHandle: handle }),
+      await subject.prepareRotation({ jobId: JOB, origin: ORIGIN, username: 'juno_eats', itemHandle: handle }),
     ).toEqual({
       status: 'not_owned',
     });
@@ -449,7 +453,11 @@ describe('suggestions and ownership', () => {
     const subject = service();
     const { itemId } = await ownedLogin(subject);
     await getDb().run('UPDATE gws_ea_profile SET assistant_alias = NULL WHERE singleton = 1');
-    expect(await subject.ownership(await handleFor(itemId), ORIGIN)).toEqual({ status: 'not_owned' });
+    const handle = await handleFor(itemId);
+    expect(await subject.account(handle, ORIGIN)).toEqual({ status: 'classified', account: 'principal' });
+    expect(
+      await subject.prepareRotation({ jobId: JOB, origin: ORIGIN, username: USERNAME, itemHandle: handle }),
+    ).toEqual({ status: 'not_owned' });
   });
 
   it('caches classification metadata until the listed item updatedAt changes, keeping passwords out', async () => {
@@ -473,30 +481,6 @@ describe('suggestions and ownership', () => {
     expect(await subject.account(handle, ORIGIN)).toEqual({ status: 'classified', account: 'principal' });
     expect(reads()).toBe(before + 2);
   });
-
-  it('rebuilds site choices once when an unread cached login was deleted outside the host', async () => {
-    const survivor = principalLogin();
-    fake.edit(survivor.id, (item) => ({ ...item, title: 'Surviving login' }));
-    const deleted = principalLogin('other@example.com');
-    expect(await vault.itemsForOrigin('https://elsewhere.example')).toEqual([]);
-    expect(fake.calls.filter((call) => call === 'get')).toHaveLength(0);
-    const [survivingChoice] = await vault.itemsForOrigin(ORIGIN);
-    fake.items.delete(deleted.id);
-    const subject = service();
-    vi.spyOn(browserVault, 'itemsForOrigin').mockImplementation((...args) => vault.itemsForOrigin(...args));
-    const refresh = vi.spyOn(browserVault, 'refresh').mockImplementation((...args) => vault.refresh(...args));
-    vi.spyOn(credentialAttempts, 'account').mockImplementation((...args) => subject.account(...args));
-
-    const result = await readVaultSiteInfo([ORIGIN], async () => undefined, 'externally-deleted-login-job');
-    expect(result).toEqual({ vault_items: [{ ...survivingChoice, account: 'assistant' }] });
-    expect(refresh).toHaveBeenCalledTimes(1);
-    expect(fake.calls.filter((call) => call === 'list')).toHaveLength(2);
-    expect(fake.calls.filter((call) => call === 'get')).toHaveLength(2);
-    expect(JSON.stringify(result)).not.toContain(PRINCIPAL_PASSWORD);
-    expect(await readVaultSiteInfo([ORIGIN], async () => undefined, 'externally-deleted-login-job')).toEqual(result);
-    expect(refresh).toHaveBeenCalledTimes(1);
-    expect(fake.calls.filter((call) => call === 'get')).toHaveLength(2);
-  });
 });
 
 describe('naming the account to change', () => {
@@ -510,7 +494,7 @@ describe('naming the account to change', () => {
     ).toEqual({ status: 'not_owned' });
   });
 
-  it('finds an assistant account by its current site and exact username, whoever added it', async () => {
+  it('finds an assistant account by its listed site and exact username, whoever added it', async () => {
     const subject = service();
     expect(await subject.ownedHandle(ORIGIN, USERNAME)).toEqual({ status: 'not_owned' });
     const login = principalLogin(USERNAME);
@@ -519,12 +503,32 @@ describe('naming the account to change', () => {
     const reads = fake.calls.filter((call) => call === 'get').length;
     const found = await subject.ownedHandle(ORIGIN, USERNAME);
     expect(found).toEqual({ status: 'found', itemHandle: await handleFor(itemId) });
-    // Ownership and the exact account name come from the current item.
+    expect(await subject.ownedHandle(ORIGIN, USERNAME)).toEqual(found);
+    // Repeated account selection shares the listing's cached metadata.
     expect(fake.calls.filter((call) => call === 'get')).toHaveLength(reads + 1);
     expect(await subject.ownedHandle(ORIGIN, 'remy.vance@example.com')).toEqual({ status: 'not_owned' });
     expect(await subject.ownedHandle('https://shop.example.net', USERNAME)).toEqual({ status: 'not_owned' });
     await rm(tokenFile);
     expect(await service({ vault: newVault() }).ownedHandle(ORIGIN, USERNAME)).toEqual({ status: 'vault_not_set_up' });
+  });
+
+  it('skips an unreadable candidate when selecting an assistant account', async () => {
+    principalLogin('other@example.com');
+    const login = principalLogin(USERNAME);
+    fake.edit(login.id, (item) => ({ ...item, title: 'Assistant login' }));
+    const handle = await handleFor(login.id);
+    fake.failNext('get', new Error('item not found'));
+
+    expect(await service().ownedHandle(ORIGIN, USERNAME)).toEqual({ status: 'found', itemHandle: handle });
+  });
+
+  it('returns the vault rate limit instead of trying another candidate', async () => {
+    principalLogin('other@example.com');
+    principalLogin(USERNAME);
+    fake.failNext('get', new RateLimitExceededError('daily limit reached'));
+
+    expect(await service().ownedHandle(ORIGIN, USERNAME)).toEqual({ status: 'rate_limited' });
+    expect(fake.calls.filter((call) => call === 'get')).toHaveLength(1);
   });
 });
 
@@ -572,7 +576,10 @@ describe('password changes', () => {
     expect(holders(change.previous)).toEqual([]);
     expect(fake.items.has(change.candidateId)).toBe(false);
     expect(previousPasswordFields()).toBe(0);
-    expect(await subject.ownership(await handleFor(itemId), ORIGIN)).toEqual({ status: 'owned' });
+    expect(await subject.account(await handleFor(itemId), ORIGIN)).toEqual({
+      status: 'classified',
+      account: 'assistant',
+    });
     expect(await subject.unresolved()).toEqual([]);
   });
 
@@ -657,7 +664,10 @@ describe('password changes', () => {
       updatedAt: expect.any(Date),
     });
     expect(fake.items.has(change.candidateId)).toBe(false);
-    expect(await subject.ownership(await handleFor(itemId), ORIGIN)).toEqual({ status: 'owned' });
+    expect(await subject.account(await handleFor(itemId), ORIGIN)).toEqual({
+      status: 'classified',
+      account: 'assistant',
+    });
   });
 
   it.each<[string, (item: Item) => Item]>([

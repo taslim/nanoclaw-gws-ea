@@ -250,9 +250,6 @@ export async function credentialAuthorityRequest(
   const found = await attempts.ownedHandle(origin, username);
   if (found.status === 'not_owned') return { status: 'not_owned' };
   if (found.status !== 'found') return { status: found.status };
-  const owned = await attempts.ownership(found.itemHandle, origin);
-  if (owned.status === 'not_owned') return { status: 'not_owned' };
-  if (owned.status !== 'owned') return vaultOutcome(owned.status);
   const prepared = await attempts.prepareRotation({ jobId: job.id, origin, username, itemHandle: found.itemHandle });
   if (prepared.status === 'prepared') return recorded(prepared.attempt, job.thread_id);
   if (prepared.status === 'not_owned') return { status: 'not_owned' };

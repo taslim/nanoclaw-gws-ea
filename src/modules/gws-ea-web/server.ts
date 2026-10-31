@@ -1,8 +1,8 @@
 import type { RequestListener, ServerResponse } from 'node:http';
 
-export interface WebFeatures {
-  readonly artifacts: RequestListener;
-  readonly logins: RequestListener;
+export interface WebFeatures<T = RequestListener> {
+  readonly artifacts: T;
+  readonly logins: T;
 }
 
 function finish(response: ServerResponse, status: number): void {

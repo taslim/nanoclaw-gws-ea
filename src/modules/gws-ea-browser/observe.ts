@@ -122,11 +122,7 @@ function stateFor(page: Page): PageObservationState {
 
 interface BrowserSiteInfo {
   recipes?(origin: string): Promise<Record<string, unknown>>;
-  vault?(
-    origins: readonly string[],
-    assertActive: () => Promise<void>,
-    jobId?: string,
-  ): Promise<Record<string, unknown>>;
+  vault?(origins: readonly string[], assertActive: () => Promise<void>): Promise<Record<string, unknown>>;
 }
 let siteInfo: BrowserSiteInfo = {};
 /** Set by the composition; neither reader receives a Page or a native handle. */
@@ -135,8 +131,6 @@ export function configureBrowserSiteInfo(readers: BrowserSiteInfo): void {
 }
 
 export interface ObservePageOptions {
-  /** The native errand that owns this observation and its automatic vault retry. */
-  readonly jobId?: string;
   /** What the host did about a cookie banner just before this observation, for it to report. */
   readonly cookieBanner?: CookieBannerReport | undefined;
   readonly remaining?: () => number;
@@ -223,7 +217,7 @@ export async function observePage(
           : Promise.resolve<Record<string, unknown>>({}),
         readVault
           ? optionalSiteInfo(
-              (check) => readVault([...origins], check, options.jobId),
+              (check) => readVault([...origins], check),
               { vault_status: 'vault_unavailable' },
               assertActive,
               options,

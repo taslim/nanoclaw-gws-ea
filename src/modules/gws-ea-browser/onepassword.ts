@@ -394,7 +394,6 @@ export class BrowserVault {
   private failures = 0;
   private unavailableUntil = 0;
   private loading: Promise<void> | undefined;
-  /** Duplicate checking and a principal's create share one host-only critical section. */
   private editing: Promise<void> = Promise.resolve();
 
   constructor(private readonly locators: BrowserVaultLocators = {}) {}
@@ -411,7 +410,6 @@ export class BrowserVault {
     this.clearHold();
   }
 
-  /** The vault answered, the binding changed, or an explicit refresh retries: no failure holds the next attempt off. */
   private clearHold(): void {
     this.failures = 0;
     this.unavailableUntil = 0;
@@ -584,14 +582,8 @@ export class BrowserVault {
       }));
   }
 
-  /**
-   * An explicit retry: list the vault's logins again now, bypassing the cache, so a login the principal just added
-   * is usable. Handles of logins still listed stay valid. It skips the hold after a failure to reach the vault, so
-   * one the principal just shared again is tried at once; a rate-limit backoff still holds, because that limit is
-   * the provider's own.
-   */
+  /** Re-list the vault while respecting provider and outage holds; surviving handles stay valid. */
   async refresh(assertActive = active): Promise<void> {
-    this.clearHold();
     await this.load(await this.ready(assertActive), assertActive);
   }
 
@@ -660,11 +652,9 @@ export class BrowserVault {
   ): Promise<LoginMetadata> {
     const cached = this.usernames.get(overview.id);
     if (cached?.updatedAt === overview.updatedAt.getTime()) return cached.login;
-    const { epoch } = this;
     try {
-      const item = await this.reach(epoch, () => client.items.get(overview.vaultId, overview.id));
+      const item = await client.items.get(overview.vaultId, overview.id);
       await assertActive();
-      if (epoch === this.epoch) this.clearHold();
       if (item.id !== overview.id || item.vaultId !== overview.vaultId || item.category !== 'Login')
         throw new BrowserVaultError('no_item_for_site');
       const login: LoginMetadata = {
@@ -673,27 +663,12 @@ export class BrowserVault {
         version: item.version,
         title: item.title,
       };
-      // A read racing with an edit can answer this call, but cannot bless the
-      // old overview with the new version's metadata.
-      if (item.updatedAt.getTime() === overview.updatedAt.getTime())
-        this.usernames.set(item.id, { updatedAt: item.updatedAt.getTime(), login });
+      this.usernames.set(item.id, { updatedAt: item.updatedAt.getTime(), login });
       return login;
     } catch (error) {
-      throw await this.error(error);
-    }
-  }
-
-  private async withSerializedLoginWrite(operation: () => Promise<void>): Promise<void> {
-    const previous = this.editing;
-    let release = (): void => undefined;
-    this.editing = new Promise<void>((resolve) => {
-      release = resolve;
-    });
-    await previous;
-    try {
-      await operation();
-    } finally {
-      release();
+      const failure = await this.error(error);
+      if (failure.reason !== 'rate_limited') this.invalidate();
+      throw failure;
     }
   }
 
@@ -716,36 +691,33 @@ export class BrowserVault {
   async createLogin(details: BrowserLoginDetails): Promise<void> {
     const { website, title } = loginDetails(details);
     if (!details.password) throw new BrowserLoginError('invalid_details');
-    await this.withSerializedLoginWrite(async () => {
-      await this.refresh();
-      await this.assertDistinctLogin([website], details.username);
-      const client = await this.ready(active);
-      const vaultId = this.vaultId;
-      if (!vaultId) throw new BrowserVaultError('vault_unavailable');
-      const { ItemCategory, ItemFieldType, AutofillBehavior } = await sdk();
-      await this.stillBound(vaultId);
-      try {
-        await client.items.create({
-          category: ItemCategory.Login,
-          vaultId,
-          title,
-          fields: [
-            { id: 'username', title: 'username', fieldType: ItemFieldType.Text, value: details.username },
-            { id: 'password', title: 'password', fieldType: ItemFieldType.Concealed, value: details.password },
-          ],
-          websites: [{ url: website.origin, label: 'website', autofillBehavior: AutofillBehavior.AnywhereOnWebsite }],
-        });
-      } catch (error) {
-        throw await this.error(error);
-      } finally {
-        this.invalidate();
-      }
-    });
+    await this.refresh();
+    await this.assertDistinctLogin([website], details.username);
+    const client = await this.ready(active);
+    const vaultId = this.vaultId;
+    if (!vaultId) throw new BrowserVaultError('vault_unavailable');
+    const { ItemCategory, ItemFieldType, AutofillBehavior } = await sdk();
+    await this.stillBound(vaultId);
+    try {
+      await client.items.create({
+        category: ItemCategory.Login,
+        vaultId,
+        title,
+        fields: [
+          { id: 'username', title: 'username', fieldType: ItemFieldType.Text, value: details.username },
+          { id: 'password', title: 'password', fieldType: ItemFieldType.Concealed, value: details.password },
+        ],
+        websites: [{ url: website.origin, label: 'website', autofillBehavior: AutofillBehavior.AnywhereOnWebsite }],
+      });
+    } catch (error) {
+      throw await this.error(error);
+    } finally {
+      this.invalidate();
+    }
   }
 
   /** A current active Login, read fresh under its listed handle, for the principal's own edit. */
   private async editableLogin(handle: string): Promise<Item> {
-    await this.refresh();
     const overview = this.handles.get(handle);
     if (!overview) throw new BrowserVaultError('no_item_for_site');
     const read = await this.readItem(overview.vaultId, overview.id);
@@ -805,9 +777,25 @@ export class BrowserVault {
   }
 
   async removeLogin(handle: string, version: number): Promise<void> {
-    const item = await this.editableLogin(handle);
-    if (item.version !== version) throw new BrowserLoginError('login_changed');
-    await this.deleteItem(item.vaultId, item.id);
+    await this.withSerializedLoginWrite(async () => {
+      const item = await this.editableLogin(handle);
+      if (item.version !== version) throw new BrowserLoginError('login_changed');
+      await this.deleteItem(item.vaultId, item.id);
+    });
+  }
+
+  private async withSerializedLoginWrite(operation: () => Promise<void>): Promise<void> {
+    const previous = this.editing;
+    let release = (): void => undefined;
+    this.editing = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    await previous;
+    try {
+      await operation();
+    } finally {
+      release();
+    }
   }
 
   /** One fresh read of an item in the bound vault: one request, never cached. */

@@ -243,10 +243,14 @@ describe("main's credential authority", () => {
     await recordWebAlias('onuj@corp.example');
     const username = 'Onuj+Shop@corp.example';
     const login = principalLogin(username);
+    const [choice] = await vault.itemsForOrigin(ORIGIN);
+    expect(await attempts.account(choice!.item_handle, ORIGIN)).toEqual({ status: 'classified', account: 'assistant' });
+    const reads = fake.calls.filter((call) => call === 'get').length;
 
     const recorded = await ask({ operation: 'change_password', site: ORIGIN, username });
 
     expect(recorded).toMatchObject({ status: 'recorded', operation: 'change_password', username });
+    expect(fake.calls.filter((call) => call === 'get')).toHaveLength(reads + 1);
     expect(await attempts.get(String(recorded.authority))).toMatchObject({
       kind: 'rotation',
       source_item_id: login.id,
