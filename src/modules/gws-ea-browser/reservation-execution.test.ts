@@ -1,3 +1,5 @@
+import * as loginStoreModule from './login-store.js';
+import { testLoginStore } from './testing/login-store.js';
 import { useAvailableBrowser } from './testing/browser-runtime.js';
 import { createBrowserQueue, recoverAndStartBrowserQueue } from './index.js';
 /** Native Chrome + real queue/authority/claims. Only calendar service and container wake are fixture boundaries. */
@@ -66,6 +68,7 @@ describe.skipIf(!chromePath)('native reservation through the common purchase exe
     return (JSON.parse(request?.answer_json ?? '{}') as { data: Record<string, unknown> }).data;
   }
   beforeEach(async () => {
+    vi.spyOn(loginStoreModule, 'getLoginStore').mockResolvedValue(testLoginStore(`${root}/browser`).store);
     useAvailableBrowser();
     if (!chromePath) throw new Error('Chrome required');
     vi.useFakeTimers({ toFake: ['Date'] });
@@ -124,6 +127,7 @@ describe.skipIf(!chromePath)('native reservation through the common purchase exe
     await getDb().run("INSERT INTO gws_ea_browser_watch_job_claims(job_id,state) VALUES(?,'available')", jobId);
   });
   afterEach(async () => {
+    vi.mocked(loginStoreModule.getLoginStore).mockRestore();
     await queue?.stop();
     await fixture?.close();
     delete process.env.GWS_EA_BROWSER_ROOT;

@@ -1,3 +1,5 @@
+import * as loginStoreModule from './login-store.js';
+import { testLoginStore } from './testing/login-store.js';
 import { useAvailableBrowser } from './testing/browser-runtime.js';
 import { createBrowserQueue, recoverAndStartBrowserQueue } from './index.js';
 import { holdBrowserRequest, stopHeldBrowserRequests } from './testing/held-request.js';
@@ -453,6 +455,7 @@ describe.skipIf(!chromePath)('reviewed merchant purchases through native host de
     if (certificateRoot) fs.rmSync(certificateRoot, { recursive: true, force: true });
   });
   beforeEach(async () => {
+    vi.spyOn(loginStoreModule, 'getLoginStore').mockResolvedValue(testLoginStore(`${root}/browser`).store);
     useAvailableBrowser();
     fs.rmSync(root, { recursive: true, force: true });
     fs.mkdirSync(`${root}/browser`, { recursive: true });
@@ -536,6 +539,7 @@ describe.skipIf(!chromePath)('reviewed merchant purchases through native host de
     setBrowserAdmissionReady(true);
   });
   afterEach(async () => {
+    vi.mocked(loginStoreModule.getLoginStore).mockRestore();
     await stopHeldBrowserRequests();
     setBrowserAdmissionReady(false);
     await queue?.stop();
