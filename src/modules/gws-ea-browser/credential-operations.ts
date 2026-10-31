@@ -1,7 +1,7 @@
 /**
  * Authorized account creation and password changes in the host browser. The
  * delegating agent records the authority for one browser job, site and
- * account: a signup, or a change on a Login this host saved. That record is
+ * account: a signup, or a change on the assistant's own Login. That record is
  * the credential attempt itself, so the browser can neither create nor widen
  * it.
  *
@@ -175,18 +175,17 @@ function recorded(attempt: CredentialAttempt, thread: string): Outcome {
 
 /** The delegator hears only whether the vault can be used now; the host keeps its reasons. */
 function vaultOutcome(reason: BrowserVaultReason): Outcome {
-  if (reason === 'rate_limited') return { status: 'rate_limited' };
-  return reason === 'no_item_for_site' ? { status: 'not_owned', reason: 'no_record' } : { status: 'vault_unavailable' };
+  if (reason === 'rate_limited' || reason === 'vault_not_set_up') return { status: reason };
+  return reason === 'no_item_for_site' ? { status: 'not_owned' } : { status: 'vault_unavailable' };
 }
 
 /**
  * An agent with browser access records the principal's delegation of one
  * signup or one password change for an exact job of its own, site and
- * account. A change binds the Login this host saved for that site and
- * username, checked fresh against its ownership record; any other Login, an
- * edited one, or an account with no saved Login is refused here, before the
- * browser can act. Sign-in email, phone, two-factor and payment-method
- * changes have no operation.
+ * account. A change binds the assistant's own Login for that site and exact
+ * username, checking ownership fresh. A principal account or an account with
+ * no saved Login is refused before the browser can act. Sign-in email, phone,
+ * two-factor and payment-method changes have no operation.
  * to: main, delegator
  */
 export async function credentialAuthorityRequest(
@@ -249,14 +248,11 @@ export async function credentialAuthorityRequest(
     return prepared.status === 'prepared' ? recorded(prepared.attempt, job.thread_id) : { status: prepared.status };
   }
   const found = await attempts.ownedHandle(origin, username);
-  if (found.status === 'not_owned') return { status: 'not_owned', reason: 'no_record' };
+  if (found.status === 'not_owned') return { status: 'not_owned' };
   if (found.status !== 'found') return { status: found.status };
-  const owned = await attempts.ownership(found.itemHandle, origin);
-  if (owned.status === 'not_owned') return { status: 'not_owned', reason: owned.reason };
-  if (owned.status !== 'owned') return vaultOutcome(owned.status);
-  const prepared = await attempts.prepareRotation({ jobId: job.id, origin, itemHandle: found.itemHandle });
+  const prepared = await attempts.prepareRotation({ jobId: job.id, origin, username, itemHandle: found.itemHandle });
   if (prepared.status === 'prepared') return recorded(prepared.attempt, job.thread_id);
-  if (prepared.status === 'not_owned') return { status: 'not_owned', reason: 'no_record' };
+  if (prepared.status === 'not_owned') return { status: 'not_owned' };
   return prepared.status === 'busy' ? { status: 'busy' } : vaultOutcome(prepared.status);
 }
 
@@ -469,7 +465,12 @@ export async function settleConfirmedAttempts(
     }
     if (result.status === 'finalized' || result.status === 'conflict')
       await freeSite(queue, attempt, `credential-settled-${attempt.id}`);
-    else if (result.status === 'vault_unavailable' || result.status === 'rate_limited') return;
+    else if (
+      result.status === 'vault_not_set_up' ||
+      result.status === 'vault_unavailable' ||
+      result.status === 'rate_limited'
+    )
+      return;
   }
 }
 
@@ -1188,6 +1189,8 @@ async function ensureSaved(
       return { outcome: { status: 'not_owned' } };
     case 'rate_limited':
       return { outcome: { status: 'rate_limited' } };
+    case 'vault_not_set_up':
+      return { outcome: { status: 'vault_not_set_up' } };
     case 'absent':
       // The one create this attempt could send left nothing: the authority ends, and nothing reached a page.
       await attempts.abandon(attempt.id, assertActive);
@@ -1335,9 +1338,10 @@ async function disclosingStep(
     assertBrowserSecretDiagnosticsSafe();
     const values = valuesFor(group, credential);
     // A disable the operator published since the disclosure stops the insertion: nothing has reached the page yet.
-    if (!(await attempts.usable(saved))) {
+    const usability = await attempts.usable(saved);
+    if (usability.status !== 'usable') {
       await rejectExposed(attempts, saved.id, evidence('none', 'not_inserted', 'none'));
-      return { status: 'vault_unavailable' };
+      return { status: usability.status };
     }
     // A page's input/change handlers can submit without navigating. Install this before any value reaches
     // them, and retain it through a consent hold (and secret cleanup), not just this call's stack.

@@ -1,20 +1,34 @@
-import type { RequestListener } from 'node:http';
+import type { RequestListener, ServerResponse } from 'node:http';
 
-/** Closed origin boundary: only the artifacts mount reaches the supplied feature handler. */
-export function createWebHandler(hostname: string, artifacts: RequestListener): RequestListener {
+export interface WebFeatures<T = RequestListener> {
+  readonly artifacts: T;
+  readonly logins: T;
+}
+
+function finish(response: ServerResponse, status: number): void {
+  response.writeHead(status, {
+    'cache-control': 'no-store',
+    'content-type': 'text/plain; charset=utf-8',
+    'x-content-type-options': 'nosniff',
+    'content-security-policy': "default-src 'none'; frame-ancestors 'none'",
+  });
+  response.end();
+}
+
+export const unavailableWebHandler: RequestListener = (_request, response) => {
+  finish(response, 404);
+};
+
+/** The whole hostname serves exactly these two feature mounts. */
+export function createWebHandler(hostname: string, features: WebFeatures): RequestListener {
   return (request, response) => {
-    const finish = (status: number): void => {
-      response.writeHead(status, {
-        'cache-control': 'no-store',
-        'content-type': 'text/plain; charset=utf-8',
-        'x-content-type-options': 'nosniff',
-        'content-security-policy': "default-src 'none'; frame-ancestors 'none'",
-      });
-      response.end();
-    };
-    if (request.headers.host !== hostname || !request.url) return finish(404);
-    if (request.method !== 'GET' && request.method !== 'HEAD') return finish(405);
-    if (!request.url.startsWith('/artifacts/')) return finish(404);
-    artifacts(request, response);
+    if (request.headers.host !== hostname || !request.url) return finish(response, 404);
+    const pathname = request.url.split('?', 1)[0];
+    const logins = pathname === '/logins' || pathname?.startsWith('/logins/') === true;
+    const artifacts = pathname?.startsWith('/artifacts/') === true;
+    if (!logins && !artifacts) return finish(response, 404);
+    if (request.method !== 'GET' && request.method !== 'HEAD' && !(logins && request.method === 'POST'))
+      return finish(response, 405);
+    (logins ? features.logins : features.artifacts)(request, response);
   };
 }

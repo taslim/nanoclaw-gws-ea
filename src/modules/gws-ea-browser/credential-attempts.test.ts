@@ -5,6 +5,8 @@ import { AutofillBehavior, ItemCategory, ItemFieldType, RateLimitExceededError, 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { closeDb, getDb, initTestDb, runMigrations } from '../../db/index.js';
 import { log } from '../../log.js';
+import '../gws-ea-profile/index.js';
+import { recordWebAlias } from '../gws-ea-profile/testing/web-alias.js';
 import { CredentialAttempts, type CredentialAttempt, type CredentialPrepareResult } from './credential-attempts.js';
 import {
   onePasswordHostPaths,
@@ -34,6 +36,13 @@ const OTHER_JOB = 'system:a2a:main:later-credential-job';
 const ORIGIN = 'https://accounts.shop.example';
 const USERNAME = 'morgan.ellery@example.com';
 const PRINCIPAL_PASSWORD = 'principal-chosen-password-1';
+
+const setField =
+  (id: string, value: string) =>
+  (item: Item): Item => ({
+    ...item,
+    fields: item.fields.map((field) => (field.id === id ? { ...field, value } : field)),
+  });
 
 let directory: string;
 let tokenFile: string;
@@ -114,7 +123,12 @@ async function changedPassword(
   itemId: string,
 ): Promise<{ attempt: CredentialAttempt; candidateId: string; previous: string; next: string }> {
   const attempt = expectPrepared(
-    await subject.prepareRotation({ jobId: JOB, origin: ORIGIN, itemHandle: await handleFor(itemId) }),
+    await subject.prepareRotation({
+      jobId: JOB,
+      origin: ORIGIN,
+      username: fake.value(itemId, 'username')!,
+      itemHandle: await handleFor(itemId),
+    }),
   );
   expect(await subject.save(attempt.id)).toMatchObject({ status: 'saved' });
   const disclosed = await subject.disclose(attempt.id, { jobId: JOB, origin: ORIGIN });
@@ -161,6 +175,7 @@ beforeEach(async () => {
   await runMigrations(await initTestDb());
   await browserQueueMigration.up(getDb());
   await browserCredentialAttemptsMigration.up(getDb());
+  await recordWebAlias(USERNAME);
   output.length = 0;
   for (const level of ['debug', 'info', 'warn', 'error'] as const)
     vi.spyOn(log, level).mockImplementation((message: string, data?: Record<string, unknown>) => {
@@ -262,7 +277,7 @@ describe('saving before disclosure', () => {
     const subject = service();
     const disabled = expectPrepared(await subject.prepareSignup({ jobId: JOB, origin: ORIGIN, username: USERNAME }));
     await rm(tokenFile);
-    expect(await subject.save(disabled.id)).toEqual({ status: 'vault_unavailable' });
+    expect(await subject.save(disabled.id)).toEqual({ status: 'vault_not_set_up' });
     expect(await subject.disclose(disabled.id, { jobId: JOB, origin: ORIGIN })).toMatchObject({ status: 'refused' });
     expect(await subject.reconcileSave(disabled.id)).toEqual({ status: 'absent' });
     expect(fake.calls).toEqual([]);
@@ -306,7 +321,7 @@ describe('saving before disclosure', () => {
     // The candidate's value is in this process's memory: nothing but the published intent can stop its disclosure.
     await writeHostPolicy(false);
     expect(await subject.disclose(attempt.id, { jobId: JOB, origin: ORIGIN })).toEqual({
-      status: 'vault_unavailable',
+      status: 'vault_not_set_up',
     });
     expect(fake.calls).toHaveLength(calls);
     expect(await subject.get(attempt.id)).toMatchObject({
@@ -350,71 +365,170 @@ describe('suggestions and ownership', () => {
     expect(await titles()).toEqual(['Shop', 'shop.example']);
   });
 
-  it('records ownership only when the host finalizes a Login; edits in 1Password never create or move it', async () => {
+  it('classifies accounts by username and checks ownership fresh after edits', async () => {
     const subject = service();
     const principal = principalLogin('remy.vance@example.com');
     const principalHandle = await handleFor(principal.id);
-    expect(await subject.ownership(principalHandle, ORIGIN)).toEqual({ status: 'not_owned', reason: 'no_record' });
-    expect(await subject.prepareRotation({ jobId: JOB, origin: ORIGIN, itemHandle: principalHandle })).toEqual({
+    expect(await subject.account(principalHandle, ORIGIN)).toEqual({ status: 'classified', account: 'principal' });
+    expect(
+      await subject.prepareRotation({ jobId: JOB, origin: ORIGIN, username: USERNAME, itemHandle: principalHandle }),
+    ).toEqual({
       status: 'not_owned',
     });
 
-    const { itemId, attempt } = await ownedLogin(subject);
-    expect(attempt).toMatchObject({ owned_item_id: itemId, username: USERNAME, site: 'shop.example' });
+    const { itemId } = await ownedLogin(subject);
     const handle = await handleFor(itemId);
-    expect(await subject.ownership(handle, ORIGIN)).toEqual({ status: 'owned' });
-    expect(await subject.ownership(handle, 'https://shop.example.net')).toEqual({ status: 'origin_mismatch' });
-
-    // The principal points the Login at their own account: refused before anything reaches a page.
-    const username = (value: string) => (item: Item) => ({
-      ...item,
-      fields: item.fields.map((field) => (field.id === 'username' ? { ...field, value } : field)),
-    });
-    fake.edit(itemId, username('remy.vance@example.com'));
-    expect(await subject.ownership(handle, ORIGIN)).toEqual({ status: 'not_owned', reason: 'changed' });
-    const refused = expectPrepared(await subject.prepareRotation({ jobId: JOB, origin: ORIGIN, itemHandle: handle }));
-    const creates = fake.calls.filter((call) => call === 'create').length;
-    expect(await subject.save(refused.id)).toEqual({ status: 'not_owned' });
-    expect(fake.calls.filter((call) => call === 'create')).toHaveLength(creates);
-    expect(await subject.abandon(refused.id)).toMatchObject({ phase: 'rejected' });
-
-    // Changing it back restores the match: the record itself never moved.
-    fake.edit(itemId, username(USERNAME));
-    expect(await subject.ownership(handle, ORIGIN)).toEqual({ status: 'owned' });
-    // A copy made in the app has the same username and site, and no record.
+    fake.edit(itemId, (item) => ({ ...item, title: 'An updated title' }));
+    expect(
+      await subject.prepareRotation({
+        jobId: JOB,
+        origin: 'https://shop.example.net',
+        username: USERNAME,
+        itemHandle: handle,
+      }),
+    ).toEqual({ status: 'origin_mismatch' });
     const copy = fake.duplicate(itemId, 'Shop copy');
-    expect(await subject.ownership(await handleFor(copy.id), ORIGIN)).toEqual({
-      status: 'not_owned',
-      reason: 'no_record',
+    expect(await subject.account(await handleFor(copy.id), ORIGIN)).toEqual({
+      status: 'classified',
+      account: 'assistant',
     });
-    // Moving the Login to another site ends the match too.
+    expect(await subject.account(handle, ORIGIN)).toEqual({ status: 'classified', account: 'assistant' });
+
+    fake.edit(itemId, setField('username', 'remy.vance@example.com'));
+    // A cached listing cannot authorize a write after the username changes.
+    expect(
+      await subject.prepareRotation({ jobId: JOB, origin: ORIGIN, username: USERNAME, itemHandle: handle }),
+    ).toEqual({
+      status: 'not_owned',
+    });
+    fake.edit(itemId, setField('username', USERNAME));
     fake.edit(itemId, (item) => ({
       ...item,
       websites: [{ url: 'https://shop.example.net', label: 'website', autofillBehavior: AutofillBehavior.ExactDomain }],
     }));
-    expect(await subject.ownership(handle, ORIGIN)).toEqual({ status: 'not_owned', reason: 'changed' });
-    expect((await rows()).filter((row) => row.owned_item_id !== null)).toEqual([
-      expect.objectContaining({ id: attempt.id, owned_item_id: itemId }),
-    ]);
+    expect(
+      await subject.prepareRotation({ jobId: JOB, origin: ORIGIN, username: USERNAME, itemHandle: handle }),
+    ).toEqual({ status: 'not_owned' });
+  });
+
+  it('recognizes non-email accounts only from a finalized signup for the same site and username', async () => {
+    const subject = service();
+    const { itemId, attempt } = await ownedLogin(subject, 'juno_eats');
+    const handle = await handleFor(itemId);
+    fake.edit(itemId, (item) => ({
+      ...item,
+      websites: [{ url: 'accounts.shop.example', label: '', autofillBehavior: AutofillBehavior.AnywhereOnWebsite }],
+    }));
+    await vault.refresh();
+    expect(await subject.account(handle, ORIGIN)).toEqual({ status: 'classified', account: 'assistant' });
+    const [listed] = await vault.allLogins();
+    expect(await subject.accountForLogin(listed)).toBe('assistant');
+    expect(await subject.accountForLogin({ ...listed, websites: [] })).toBe('principal');
+    const copy = fake.duplicate(itemId, 'Other site');
+    fake.edit(copy.id, (item) => ({
+      ...item,
+      websites: [{ url: 'https://shop.example.net', label: '', autofillBehavior: AutofillBehavior.AnywhereOnWebsite }],
+    }));
+    await vault.refresh();
+    const [other] = await vault.itemsForOrigin('https://shop.example.net');
+    expect(await subject.account(other.item_handle, 'https://shop.example.net')).toEqual({
+      status: 'classified',
+      account: 'principal',
+    });
+
+    const change = await changedPassword(subject, itemId);
+    await subject.markAwaitingVerification(change.attempt.id);
+    await subject.markConfirmed(change.attempt.id, { account_page: 'password_changed' });
+    expect(await subject.finalize(change.attempt.id)).toMatchObject({ status: 'finalized' });
+    await getDb().run('DELETE FROM gws_ea_browser_credential_attempts WHERE id = ?', attempt.id);
+    expect(await subject.account(handle, ORIGIN)).toEqual({ status: 'classified', account: 'principal' });
+    expect(
+      await subject.prepareRotation({ jobId: JOB, origin: ORIGIN, username: 'juno_eats', itemHandle: handle }),
+    ).toEqual({
+      status: 'not_owned',
+    });
+  });
+
+  it('does not own email accounts without a recorded alias, even after a finalized signup', async () => {
+    const subject = service();
+    const { itemId } = await ownedLogin(subject);
+    await getDb().run('UPDATE gws_ea_profile SET assistant_alias = NULL WHERE singleton = 1');
+    const handle = await handleFor(itemId);
+    expect(await subject.account(handle, ORIGIN)).toEqual({ status: 'classified', account: 'principal' });
+    expect(
+      await subject.prepareRotation({ jobId: JOB, origin: ORIGIN, username: USERNAME, itemHandle: handle }),
+    ).toEqual({ status: 'not_owned' });
+  });
+
+  it('caches classification metadata until the listed item updatedAt changes, keeping passwords out', async () => {
+    const subject = service();
+    const login = principalLogin('Morgan.Ellery+shop@example.com');
+    const handle = await handleFor(login.id);
+    const reads = () => fake.calls.filter((call) => call === 'get').length;
+    const before = reads();
+    expect(await subject.account(handle, ORIGIN)).toEqual({ status: 'classified', account: 'assistant' });
+    expect(reads()).toBe(before + 1);
+    expect(await subject.account(handle, ORIGIN)).toEqual({ status: 'classified', account: 'assistant' });
+    await vault.refresh();
+    expect(await subject.account(handle, ORIGIN)).toEqual({ status: 'classified', account: 'assistant' });
+    expect(reads()).toBe(before + 1);
+    expect(await vault.loginForHandle(handle, ORIGIN)).toEqual({
+      username: 'Morgan.Ellery+shop@example.com',
+      websites: [{ url: ORIGIN, label: 'website', autofillBehavior: AutofillBehavior.AnywhereOnWebsite }],
+    });
+    fake.edit(login.id, setField('username', 'remy.vance@example.com'));
+    await vault.refresh();
+    expect(await subject.account(handle, ORIGIN)).toEqual({ status: 'classified', account: 'principal' });
+    expect(reads()).toBe(before + 2);
   });
 });
 
 describe('naming the account to change', () => {
-  it('finds the Login the host saved for a site and username from local records, never a principal-added one', async () => {
+  it('refuses a different alias spelling than the exact account the delegation named', async () => {
+    const subject = service();
+    const login = principalLogin(USERNAME);
+    const handle = await handleFor(login.id);
+    fake.edit(login.id, setField('username', 'morgan.ellery+new@example.com'));
+    expect(
+      await subject.prepareRotation({ jobId: JOB, origin: ORIGIN, username: USERNAME, itemHandle: handle }),
+    ).toEqual({ status: 'not_owned' });
+  });
+
+  it('finds an assistant account by its listed site and exact username, whoever added it', async () => {
     const subject = service();
     expect(await subject.ownedHandle(ORIGIN, USERNAME)).toEqual({ status: 'not_owned' });
-    principalLogin(USERNAME);
-    expect(await subject.ownedHandle(ORIGIN, USERNAME)).toEqual({ status: 'not_owned' });
-    const { itemId } = await ownedLogin(subject);
+    const login = principalLogin(USERNAME);
+    await vault.refresh();
+    const itemId = login.id;
     const reads = fake.calls.filter((call) => call === 'get').length;
     const found = await subject.ownedHandle(ORIGIN, USERNAME);
     expect(found).toEqual({ status: 'found', itemHandle: await handleFor(itemId) });
-    // The record names the account: no fresh read is spent finding it.
-    expect(fake.calls.filter((call) => call === 'get')).toHaveLength(reads);
+    expect(await subject.ownedHandle(ORIGIN, USERNAME)).toEqual(found);
+    // Repeated account selection shares the listing's cached metadata.
+    expect(fake.calls.filter((call) => call === 'get')).toHaveLength(reads + 1);
     expect(await subject.ownedHandle(ORIGIN, 'remy.vance@example.com')).toEqual({ status: 'not_owned' });
     expect(await subject.ownedHandle('https://shop.example.net', USERNAME)).toEqual({ status: 'not_owned' });
     await rm(tokenFile);
-    expect(await service({ vault: newVault() }).ownedHandle(ORIGIN, USERNAME)).toEqual({ status: 'vault_unavailable' });
+    expect(await service({ vault: newVault() }).ownedHandle(ORIGIN, USERNAME)).toEqual({ status: 'vault_not_set_up' });
+  });
+
+  it('skips an unreadable candidate when selecting an assistant account', async () => {
+    principalLogin('other@example.com');
+    const login = principalLogin(USERNAME);
+    fake.edit(login.id, (item) => ({ ...item, title: 'Assistant login' }));
+    const handle = await handleFor(login.id);
+    fake.failNext('get', new Error('item not found'));
+
+    expect(await service().ownedHandle(ORIGIN, USERNAME)).toEqual({ status: 'found', itemHandle: handle });
+  });
+
+  it('returns the vault rate limit instead of trying another candidate', async () => {
+    principalLogin('other@example.com');
+    principalLogin(USERNAME);
+    fake.failNext('get', new RateLimitExceededError('daily limit reached'));
+
+    expect(await service().ownedHandle(ORIGIN, USERNAME)).toEqual({ status: 'rate_limited' });
+    expect(fake.calls.filter((call) => call === 'get')).toHaveLength(1);
   });
 });
 
@@ -437,12 +551,6 @@ describe('password changes', () => {
   const previousPasswordFields = (): number =>
     [...fake.items.values()].flatMap((item) => item.fields).filter((field) => field.id === 'previous-password').length;
   const puts = (): number => fake.calls.filter((call) => call === 'put').length;
-  const setField =
-    (id: string, value: string) =>
-    (item: Item): Item => ({
-      ...item,
-      fields: item.fields.map((field) => (field.id === id ? { ...field, value } : field)),
-    });
   /** The principal saves the Login between the host's fresh read and its write, `times` writes in a row. */
   function racing(itemId: string, times: number): void {
     let left = times;
@@ -468,7 +576,10 @@ describe('password changes', () => {
     expect(holders(change.previous)).toEqual([]);
     expect(fake.items.has(change.candidateId)).toBe(false);
     expect(previousPasswordFields()).toBe(0);
-    expect(await subject.ownership(await handleFor(itemId), ORIGIN)).toEqual({ status: 'owned' });
+    expect(await subject.account(await handleFor(itemId), ORIGIN)).toEqual({
+      status: 'classified',
+      account: 'assistant',
+    });
     expect(await subject.unresolved()).toEqual([]);
   });
 
@@ -553,11 +664,15 @@ describe('password changes', () => {
       updatedAt: expect.any(Date),
     });
     expect(fake.items.has(change.candidateId)).toBe(false);
-    expect(await subject.ownership(await handleFor(itemId), ORIGIN)).toEqual({ status: 'owned' });
+    expect(await subject.account(await handleFor(itemId), ORIGIN)).toEqual({
+      status: 'classified',
+      account: 'assistant',
+    });
   });
 
   it.each<[string, (item: Item) => Item]>([
     ['username', setField('username', 'remy.vance@example.com')],
+    ['alias spelling', setField('username', 'morgan.ellery+new@example.com')],
     [
       'site',
       (item) => ({
@@ -630,7 +745,12 @@ describe('password changes', () => {
       expect(holders(change.previous)).toEqual(archived ? [itemId] : []);
       if (reason === 'password_changed')
         expect(
-          await subject.prepareRotation({ jobId: OTHER_JOB, origin: ORIGIN, itemHandle: await handleFor(itemId) }),
+          await subject.prepareRotation({
+            jobId: OTHER_JOB,
+            origin: ORIGIN,
+            username: fake.value(itemId, 'username')!,
+            itemHandle: await handleFor(itemId),
+          }),
         ).toEqual({ status: 'busy' });
     },
   );
@@ -816,7 +936,7 @@ describe('password changes', () => {
     const { itemId } = await ownedLogin(subject);
     const handle = await handleFor(itemId);
     const beforeSave = expectPrepared(
-      await subject.prepareRotation({ jobId: JOB, origin: ORIGIN, itemHandle: handle }),
+      await subject.prepareRotation({ jobId: JOB, origin: ORIGIN, username: USERNAME, itemHandle: handle }),
     );
     remove(itemId);
     const creates = fake.calls.filter((call) => call === 'create').length;
@@ -825,10 +945,15 @@ describe('password changes', () => {
     await subject.abandon(beforeSave.id);
 
     // Removed after its candidate was saved: nothing is disclosed.
-    const restored = await ownedLogin(subject, 'juno.hale@example.com');
+    const restored = await ownedLogin(subject, 'juno_eats');
     fake.edit(restored.itemId, (item) => ({ ...item, title: 'Shop (Juno)' }));
     const afterSave = expectPrepared(
-      await subject.prepareRotation({ jobId: JOB, origin: ORIGIN, itemHandle: await handleFor(restored.itemId) }),
+      await subject.prepareRotation({
+        jobId: JOB,
+        origin: ORIGIN,
+        username: 'juno_eats',
+        itemHandle: await handleFor(restored.itemId),
+      }),
     );
     expect(await subject.save(afterSave.id)).toMatchObject({ status: 'saved' });
     remove(restored.itemId);
@@ -863,7 +988,9 @@ describe('password changes', () => {
     const subject = service();
     const { itemId } = await ownedLogin(subject);
     const handle = await handleFor(itemId);
-    const idle = expectPrepared(await subject.prepareRotation({ jobId: JOB, origin: ORIGIN, itemHandle: handle }));
+    const idle = expectPrepared(
+      await subject.prepareRotation({ jobId: JOB, origin: ORIGIN, username: USERNAME, itemHandle: handle }),
+    );
     expect(await subject.save(idle.id)).toMatchObject({ status: 'saved' });
     const candidateId = (await subject.get(idle.id))?.candidate_item_id;
     if (!candidateId) throw new Error('no candidate');
@@ -872,7 +999,9 @@ describe('password changes', () => {
     const takeover: Promise<CredentialPrepareResult>[] = [];
     const racingPrepare = async (): Promise<void> => {
       if (takeover.length === 0)
-        takeover.push(subject.prepareRotation({ jobId: OTHER_JOB, origin: ORIGIN, itemHandle: handle }));
+        takeover.push(
+          subject.prepareRotation({ jobId: OTHER_JOB, origin: ORIGIN, username: USERNAME, itemHandle: handle }),
+        );
       await takeover[0];
     };
     expect(await subject.disclose(idle.id, { jobId: JOB, origin: ORIGIN }, racingPrepare)).toEqual({
@@ -892,7 +1021,12 @@ describe('password changes', () => {
     const { itemId } = await ownedLogin(subject);
     const change = await changedPassword(subject, itemId);
     const other = async (): Promise<CredentialPrepareResult> =>
-      subject.prepareRotation({ jobId: OTHER_JOB, origin: ORIGIN, itemHandle: await handleFor(itemId) });
+      subject.prepareRotation({
+        jobId: OTHER_JOB,
+        origin: ORIGIN,
+        username: fake.value(itemId, 'username')!,
+        itemHandle: await handleFor(itemId),
+      });
     expect(await other()).toEqual({ status: 'busy' });
     await subject.markAwaitingVerification(change.attempt.id);
     expect(await other()).toEqual({ status: 'busy' });

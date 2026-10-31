@@ -13,8 +13,8 @@ const ID = /^[a-zA-Z0-9_-]{1,256}$/u;
 const HOST = /^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/u;
 const MAX_RESPONSE_BYTES = 1024 * 1024;
 
-export function webIngress(claim: WebNamespaceClaim): Record<string, unknown> & { path: string } {
-  return { hostname: claim.hostname, path: '^/artifacts(/|$)', service: `http://127.0.0.1:${claim.listen_port}` };
+export function webIngress(claim: WebNamespaceClaim): { readonly hostname: string; readonly service: string } {
+  return { hostname: claim.hostname, service: `http://127.0.0.1:${claim.listen_port}` };
 }
 
 export interface WebCloudflareDependencies {
@@ -447,12 +447,12 @@ export function verifiedPolicyEmails(value: unknown): string[] {
 }
 export function webAccessApplication(claim: WebNamespaceClaim, pinId: string): Record<string, unknown> {
   return {
-    name: `Web ${claim.hostname}/artifacts`,
+    name: `Web ${claim.hostname}`,
     type: 'self_hosted',
     destinations: [
       {
         type: 'public',
-        uri: `${claim.hostname}/artifacts`,
+        uri: claim.hostname,
         overrides: [{ behavior: 'public', path_pattern: `/artifacts/public/*` }],
       },
     ],
@@ -483,7 +483,7 @@ export function assertWebApplication(value: unknown, assistant: WebRemoteAssista
     isRecord(value) &&
     (value.id !== assistant.applicationId ||
       value.aud !== assistant.aud ||
-      (isRecord(destination) && destination.uri !== `${assistant.claim.hostname}/artifacts`))
+      (isRecord(destination) && destination.uri !== assistant.claim.hostname))
   )
     throw new GwsEaError(
       'web_application_mismatch',
@@ -500,7 +500,7 @@ export function assertWebApplication(value: unknown, assistant: WebRemoteAssista
     value.aud !== assistant.aud ||
     !isRecord(destination) ||
     destination.type !== 'public' ||
-    destination.uri !== `${assistant.claim.hostname}/artifacts` ||
+    destination.uri !== assistant.claim.hostname ||
     !isRecord(overrides) ||
     overrides.behavior !== 'public' ||
     overrides.path_pattern !== `/artifacts/public/*` ||

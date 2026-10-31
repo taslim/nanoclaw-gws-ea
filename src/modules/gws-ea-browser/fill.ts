@@ -15,6 +15,7 @@ import {
   type NativeAuthenticationBinding,
 } from './authentication-submit.js';
 import { browserVault, BrowserVaultError } from './onepassword.js';
+import { credentialAttempts } from './credential-attempts.js';
 import {
   disposeBrowserRefs,
   pinBrowserRefs,
@@ -40,6 +41,7 @@ export type BrowserSecretFillResult = {
     | 'cleared_after_submit'
     | 'origin_mismatch'
     | 'no_item_for_site'
+    | 'vault_not_set_up'
     | 'vault_unavailable'
     | 'rate_limited';
 };
@@ -343,15 +345,22 @@ export async function executeFillSecret(
 }
 
 export const fillSecretAction: BrowserQueuedAction = { validate: validateFillSecret, execute: executeFillSecret };
+
 export async function readVaultSiteInfo(
   origins: readonly string[],
   assertActive: () => Promise<void>,
 ): Promise<Record<string, unknown>> {
   try {
-    const items = new Map<string, { item_handle: string; title: string }>();
-    for (const frameOrigin of origins)
-      for (const item of await browserVault.itemsForOrigin(frameOrigin, assertActive))
-        items.set(item.item_handle, item);
+    const items = new Map<string, { item_handle: string; title: string; account: 'assistant' | 'principal' }>();
+    for (const frameOrigin of origins) {
+      const choices = await browserVault.itemsForOrigin(frameOrigin, assertActive);
+      for (const item of choices) {
+        if (items.has(item.item_handle)) continue;
+        const classification = await credentialAttempts.account(item.item_handle, frameOrigin, assertActive);
+        if (classification.status !== 'classified') throw new BrowserVaultError(classification.status);
+        items.set(item.item_handle, { ...item, account: classification.account });
+      }
+    }
     return { vault_items: [...items.values()] };
     // eslint-disable-next-line no-catch-all/no-catch-all -- optional vault metadata becomes a constant status, never a failed observation
   } catch (error) {

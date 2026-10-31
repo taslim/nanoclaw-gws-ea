@@ -104,6 +104,7 @@ beforeEach(async () => {
     'main',
     'browser',
   );
+  await recordWebAlias(USERNAME);
   main = (await resolveSystemSession('main', 'system:task:principal')).session;
   job = (await resolveSystemSession('browser', 'system:a2a:main:credentials')).session;
 });
@@ -137,7 +138,7 @@ function principalLogin(username = USERNAME): Item {
   });
 }
 
-/** The Login a finished signup saved: the only kind of Login whose password the assistant may change. */
+/** The assistant's account after a completed signup. */
 async function assistantLogin(): Promise<string> {
   const recorded = await ask({ operation: 'signup', site: `${ORIGIN}/join`, username: USERNAME });
   const id = String(recorded.authority);
@@ -174,7 +175,21 @@ function context(): { context: BrowserExecutionContext; page: ReturnType<typeof 
 }
 
 describe("main's credential authority", () => {
+  it.each(['policy', 'runtime account'] as const)(
+    'reports missing %s setup before creating credential authority',
+    async (missing) => {
+      await rm(missing === 'policy' ? files.onePasswordPolicyFile : files.tokenFile);
+      expect(await ask({ operation: 'signup', site: ORIGIN, username: USERNAME })).toEqual({
+        status: 'vault_not_set_up',
+      });
+      expect(await ask({ operation: 'change_password', site: ORIGIN, username: USERNAME })).toEqual({
+        status: 'vault_not_set_up',
+      });
+      expect(fake.calls).toEqual([]);
+    },
+  );
   it('obtains the exact web address for a fresh guest form and signup before any vault login exists', async () => {
+    await getDb().run('UPDATE gws_ea_profile SET assistant_alias = NULL WHERE singleton = 1');
     const email = 'onuj@web.example';
     await recordWebAlias(email);
     expect(fake.items.size).toBe(0);
@@ -219,21 +234,46 @@ describe("main's credential authority", () => {
       origin: ORIGIN,
       phase: 'preparing',
     });
-    const other = await ask({ operation: 'signup', site: ORIGIN, username: 'juno.hale@example.com' });
+    const other = await ask({ operation: 'signup', site: ORIGIN, username: 'juno_eats' });
     expect(other.authority).not.toBe(recorded.authority);
   });
 
-  it('covers AE7: refuses a change on a principal-added, edited or missing Login before any page insertion', async () => {
+  it('records a password change for an assistant account the principal added under an alias spelling', async () => {
+    await getDb().run('UPDATE gws_ea_profile SET assistant_alias = NULL WHERE singleton = 1');
+    await recordWebAlias('onuj@corp.example');
+    const username = 'Onuj+Shop@corp.example';
+    const login = principalLogin(username);
+    const [choice] = await vault.itemsForOrigin(ORIGIN);
+    expect(await attempts.account(choice!.item_handle, ORIGIN)).toEqual({ status: 'classified', account: 'assistant' });
+    const reads = fake.calls.filter((call) => call === 'get').length;
+
+    const recorded = await ask({ operation: 'change_password', site: ORIGIN, username });
+
+    expect(recorded).toMatchObject({ status: 'recorded', operation: 'change_password', username });
+    expect(fake.calls.filter((call) => call === 'get')).toHaveLength(reads + 1);
+    expect(await attempts.get(String(recorded.authority))).toMatchObject({
+      kind: 'rotation',
+      source_item_id: login.id,
+      username,
+    });
+    expect(await attempts.save(String(recorded.authority))).toMatchObject({ status: 'saved' });
+    expect(
+      await attempts.disclose(String(recorded.authority), { jobId: job.thread_id!, origin: ORIGIN }),
+    ).toMatchObject({
+      status: 'disclosed',
+      credential: { username },
+    });
+  });
+
+  it('refuses a change on a principal, edited or missing Login before any page insertion', async () => {
     const before = await getDb().all<CredentialAttempt>('SELECT * FROM gws_ea_browser_credential_attempts');
     expect(await ask({ operation: 'change_password', site: ORIGIN, username: USERNAME })).toEqual({
       status: 'not_owned',
-      reason: 'no_record',
     });
-    principalLogin();
+    principalLogin(PRINCIPAL_USERNAME);
     await vault.refresh();
     expect(await ask({ operation: 'change_password', site: ORIGIN, username: USERNAME })).toEqual({
       status: 'not_owned',
-      reason: 'no_record',
     });
     expect(await getDb().all('SELECT * FROM gws_ea_browser_credential_attempts')).toEqual(before);
 
@@ -241,11 +281,9 @@ describe("main's credential authority", () => {
     fake.edit(itemId, editUsername(PRINCIPAL_USERNAME));
     expect(await ask({ operation: 'change_password', site: ORIGIN, username: USERNAME })).toEqual({
       status: 'not_owned',
-      reason: 'changed',
     });
     expect(await ask({ operation: 'change_password', site: ORIGIN, username: PRINCIPAL_USERNAME })).toEqual({
       status: 'not_owned',
-      reason: 'no_record',
     });
     fake.edit(itemId, (item) => ({
       ...editUsername(USERNAME)(item),
@@ -254,7 +292,6 @@ describe("main's credential authority", () => {
     await vault.refresh();
     expect(await ask({ operation: 'change_password', site: ORIGIN, username: USERNAME })).toEqual({
       status: 'not_owned',
-      reason: 'no_record',
     });
     expect(
       (await getDb().all<CredentialAttempt>('SELECT * FROM gws_ea_browser_credential_attempts')).filter(
@@ -277,7 +314,7 @@ describe("main's credential authority", () => {
         { attempts },
       ),
     ).toEqual({ status: 'busy' });
-    expect(await ask({ operation: 'signup', site: ORIGIN, username: 'juno.hale@example.com' })).toMatchObject({
+    expect(await ask({ operation: 'signup', site: ORIGIN, username: 'juno_eats' })).toMatchObject({
       status: 'recorded',
     });
     await attempts.markRejected(first, { signal: 'reconciled' });
@@ -287,7 +324,7 @@ describe("main's credential authority", () => {
   it('records no new authority on a job whose cancellation is waiting for an unresolved change', async () => {
     await ask({ operation: 'signup', site: ORIGIN, username: USERNAME });
     await getDb().run('UPDATE gws_ea_browser_jobs SET cancel_requested = 1 WHERE id = ?', job.thread_id);
-    await expect(ask({ operation: 'signup', site: ORIGIN, username: 'juno.hale@example.com' })).rejects.toMatchObject({
+    await expect(ask({ operation: 'signup', site: ORIGIN, username: 'juno_eats' })).rejects.toMatchObject({
       code: 'forbidden',
     });
   });
@@ -441,7 +478,7 @@ describe('the browser credential request', () => {
     }
     expect(await attempts.get(id)).toMatchObject({ phase: 'finalized' });
 
-    const second = await ask({ operation: 'signup', site: ORIGIN, username: 'juno.hale@example.com' });
+    const second = await ask({ operation: 'signup', site: ORIGIN, username: 'juno_eats' });
     await attempts.abandon(String(second.authority));
     expect(await run(String(second.authority)).result).toEqual({ status: 'refused', reason: 'no_authority' });
   });
@@ -613,9 +650,7 @@ describe('restart recovery', () => {
     const exposed = String((await ask({ operation: 'signup', site: ORIGIN, username: USERNAME })).authority);
     await attempts.save(exposed);
     await attempts.disclose(exposed, { jobId: job.thread_id!, origin: ORIGIN });
-    const waiting = String(
-      (await ask({ operation: 'signup', site: ORIGIN, username: 'juno.hale@example.com' })).authority,
-    );
+    const waiting = String((await ask({ operation: 'signup', site: ORIGIN, username: 'juno_eats' })).authority);
     await attempts.save(waiting);
     await attempts.disclose(waiting, { jobId: job.thread_id!, origin: ORIGIN });
     await attempts.markAwaitingVerification(waiting);
@@ -765,7 +800,7 @@ describe("the principal's release of an attempt the host cannot settle", () => {
     const other = await attempts.prepareSignup({ jobId: 'system:a2a:main:other', origin: ORIGIN, username: USERNAME });
     if (other.status !== 'prepared') throw new Error(other.status);
     expect(await release(other.attempt.id)).toEqual({ status: 'not_releasable' });
-    const unknown = await disclosedSignup('juno.hale@example.com');
+    const unknown = await disclosedSignup('juno_eats');
     await attempts.markUnknown(unknown, { signal: 'interrupted' });
     await expect(release(unknown, job)).rejects.toMatchObject({ code: 'forbidden' });
     await expect(
@@ -1076,7 +1111,7 @@ describe("the principal's release of an attempt the host cannot settle", () => {
   it('settles a stuck confirmed change at browser start without its job, and frees its site', async () => {
     const { id, itemId } = await confirmedChange();
     await rm(files.tokenFile);
-    expect(await attempts.finalize(id)).toEqual({ status: 'vault_unavailable' });
+    expect(await attempts.finalize(id)).toEqual({ status: 'vault_not_set_up' });
     await holdSite();
     // Still out of reach at the next start: the pass spends nothing more and leaves it held.
     await settleConfirmedAttempts(queue, undefined, attempts);
@@ -1261,7 +1296,7 @@ describe("the principal's release of an attempt the host cannot settle", () => {
   it('settles the confirmed change holding a site another job was refused', async () => {
     const { id } = await confirmedChange();
     await rm(files.tokenFile);
-    expect(await attempts.finalize(id)).toEqual({ status: 'vault_unavailable' });
+    expect(await attempts.finalize(id)).toEqual({ status: 'vault_not_set_up' });
     await writePrivateFile(files.tokenFile, FIXTURE_TOKEN);
     await holdSite();
     const other = (await resolveSystemSession('browser', 'system:a2a:main:other-errand')).session;
@@ -1330,7 +1365,7 @@ describe("a signup's account email", () => {
 
   beforeEach(async () => {
     await getDb().run(
-      `UPDATE gws_ea_profile SET assistant_first_name = ?, assistant_workspace_email = ? WHERE singleton = 1`,
+      `UPDATE gws_ea_profile SET assistant_alias = NULL, assistant_first_name = ?, assistant_workspace_email = ? WHERE singleton = 1`,
       'Juno',
       'juno@corp.example',
     );
@@ -1344,7 +1379,7 @@ describe("a signup's account email", () => {
     expect(await recordedAttempts()).toEqual([]);
     await recordWebAlias('onuj@corp.example');
     await expect(ask({ operation: 'signup', site: ORIGIN, username: 'juno@corp.example' })).rejects.toMatchObject({
-      code: 'invalid-args',
+      code: 'forbidden',
       message: expect.stringContaining('onuj@corp.example'),
     });
     expect(await recordedAttempts()).toEqual([]);
@@ -1353,6 +1388,29 @@ describe("a signup's account email", () => {
       username: 'onuj+shop@corp.example',
     });
   });
+
+  it('refuses third-party email signups and permits a non-email username', async () => {
+    await recordWebAlias('onuj@corp.example');
+    await expect(ask({ operation: 'signup', site: ORIGIN, username: 'someone@example.org' })).rejects.toMatchObject({
+      code: 'forbidden',
+    });
+    expect(await recordedAttempts()).toEqual([]);
+    expect(await ask({ operation: 'signup', site: ORIGIN, username: 'onuj_eats' })).toMatchObject({
+      status: 'recorded',
+      username: 'onuj_eats',
+    });
+  });
+
+  it.each(['Onuj+shop@gmail.com', 'O.n.u.j@gmail.com', 'O.N.U.J+SHOP@GMAIL.COM'])(
+    'accepts the alias spelling %s for signup',
+    async (username) => {
+      await recordWebAlias('onuj@gmail.com');
+      expect(await ask({ operation: 'signup', site: ORIGIN, username })).toMatchObject({
+        status: 'recorded',
+        username,
+      });
+    },
+  );
 
   it("refuses one under the principal's address in any spelling: the assistant never opens an account in their name", async () => {
     await addPrincipalAddress('morgan@principal.example');

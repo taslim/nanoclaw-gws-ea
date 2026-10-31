@@ -158,7 +158,8 @@ export const CONNECTOR_CATALOG: readonly ConnectorDefinition[] = [
       'The operator’s 1Password desktop sign-in with Integrate with 1Password CLI enabled.',
       'Operator permission to create service accounts.',
     ],
-    account: 'The operator’s selected 1Password account; principal sharing remains per assistant.',
+    account:
+      'The operator’s selected 1Password account; principals manage saved logins on their assistant’s private web page.',
     scope: {
       installation: 'host',
       configuration: 'host',
@@ -213,7 +214,8 @@ export const CONNECTOR_CATALOG: readonly ConnectorDefinition[] = [
         web,
       ),
     uninstall: async ({ paths, web }) => (await import('./web-connector.js')).uninstallWebConnector(paths, web),
-    summary: 'Serve private HTML views through owned Cloudflare Access and tunnel resources.',
+    summary:
+      'Serve HTML artifacts and a principal-only logins page through owned Cloudflare Access and tunnel resources.',
     prerequisites: [
       'An operator Cloudflare account, Access team, active DNS zone and management permissions.',
       'cloudflared 2025.4.0 or later; a compatible running assistant with a complete profile.',
@@ -223,7 +225,7 @@ export const CONNECTOR_CATALOG: readonly ConnectorDefinition[] = [
       installation: 'host',
       configuration: 'host',
       resources: 'assistant',
-      access: 'Canonical main and explicitly granted eligible authors; readers follow publication permissions.',
+      access: 'Eligible artifact authors and their permitted readers; only the principal manages saved logins.',
     },
     options: {
       install: [

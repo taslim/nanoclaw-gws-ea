@@ -323,12 +323,10 @@ describe('web operator capability', () => {
     const routes = f.api.ingress();
     expect(routes).toContainEqual({
       hostname: 'views.example.test',
-      path: '^/artifacts(/|$)',
       service: 'http://127.0.0.1:41000',
     });
     expect(routes).toContainEqual({
       hostname: 'milo.example.test',
-      path: '^/artifacts(/|$)',
       service: 'http://127.0.0.1:41001',
     });
     expect(routes).toContainEqual({ hostname: 'unrelated.example.test', service: 'http://127.0.0.1:9876' });
@@ -564,7 +562,7 @@ describe('web operator capability', () => {
       destinations: [
         {
           type: 'public',
-          uri: 'views.example.test/artifacts',
+          uri: 'views.example.test',
           overrides: [{ behavior: 'public', path_pattern: '/artifacts/public/*' }],
         },
       ],
@@ -578,7 +576,7 @@ describe('web operator capability', () => {
     ]);
     expect(f.api.ingress()).toEqual([
       { hostname: 'unrelated.example.test', service: 'http://127.0.0.1:9876' },
-      { hostname: 'views.example.test', path: '^/artifacts(/|$)', service: 'http://127.0.0.1:41000' },
+      { hostname: 'views.example.test', service: 'http://127.0.0.1:41000' },
       { service: 'http_status:404' },
     ]);
     const policy = await readWebPolicy(instanceWebPolicyFile(f.a.runtime));
@@ -1100,7 +1098,7 @@ it.each([
   expect(f.api.apps[0].destinations).toEqual([
     {
       type: 'public',
-      uri: `${label}.example.test/artifacts`,
+      uri: `${label}.example.test`,
       overrides: [{ behavior: 'public', path_pattern: '/artifacts/public/*' }],
     },
   ]);
@@ -1387,4 +1385,31 @@ it('repairs a missing owned ingress route without closing tools or recreating re
   expect((await readWebOperatorConfig(f.files.configFile))?.assistants).toEqual(config?.assistants);
   expect(f.restarts).toHaveLength(restarts);
   expect(f.api.requests.filter((request) => request.method === 'POST')).toHaveLength(creates);
+});
+
+it('refuses a former artifacts-only ingress route as unowned instead of upgrading it in place', async () => {
+  const f = await provisionFixture();
+  await provisionForAssistant(f.paths, f.a.instanceId, {}, f.dependencies);
+  const route = f.api.ingress().find((candidate) => candidate.hostname === 'views.example.test');
+  if (!route) throw new Error('Missing fixture route');
+  route.path = '^/artifacts(/|$)';
+  const before = structuredClone(f.api.ingress());
+  await expect(provisionForAssistant(f.paths, f.a.instanceId, {}, f.dependencies)).rejects.toMatchObject({
+    code: 'web_tunnel_conflict',
+  });
+  expect(f.api.ingress()).toEqual(before);
+});
+
+it('reports unavailable when an extra path-specific route precedes the owned whole-host route', async () => {
+  const f = await provisionFixture();
+  await provisionForAssistant(f.paths, f.a.instanceId, {}, f.dependencies);
+  f.api.ingress().unshift({
+    hostname: 'views.example.test',
+    path: '^/artifacts(/|$)',
+    service: 'http://127.0.0.1:9999',
+  });
+  expect(await inspectWebCapability(f.paths, f.a.instanceId, { ...f.dependencies, check: true })).toMatchObject({
+    remote: 'mismatch',
+    reason_code: 'web_tunnel_unverified',
+  });
 });

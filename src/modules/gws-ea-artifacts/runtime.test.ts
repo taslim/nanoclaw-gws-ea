@@ -44,6 +44,7 @@ import { getArtifactRevision, listArtifacts, prepareArtifactSource, saveArtifact
 import { artifactActor, hasArtifactsAccess } from './policy.js';
 import { ArtifactsRuntime } from './runtime.js';
 import { WebRuntime, type WebRuntimeDependencies } from '../gws-ea-web/runtime.js';
+import { unavailableWebHandler } from '../gws-ea-web/server.js';
 import { createArtifactViewHandler } from './server.js';
 import { createArtifactViewResolver } from './access.js';
 import { artifactAdmissionEmails } from './sharing.js';
@@ -51,8 +52,11 @@ import type { WebPolicyFile } from '../gws-ea-web/policy.js';
 import type { Session } from '../../types.js';
 function createRuntime(dependencies: WebRuntimeDependencies = {}) {
   const web = new WebRuntime(
-    (config, identity) =>
-      createArtifactViewHandler({ hostname: config.hostname, resolve: createArtifactViewResolver(config, identity) }),
+    {
+      artifacts: (config, identity) =>
+        createArtifactViewHandler({ hostname: config.hostname, resolve: createArtifactViewResolver(config, identity) }),
+      logins: () => unavailableWebHandler,
+    },
     artifactAdmissionEmails,
     dependencies,
   );

@@ -11,7 +11,7 @@
  */
 import { forbidden, invalidArgs } from '../../cli/delivery-action.js';
 import { getDb } from '../../db/connection.js';
-import { identityMatchKey } from '../../gws-ea/validation.js';
+import { EMAIL_PATTERN, identityMatchKey } from '../../gws-ea/validation.js';
 import { assistantAddressesOf } from '../gws-ea-inbox/runtime.js';
 import { getGwsEaProfile } from '../gws-ea-profile/db.js';
 
@@ -27,7 +27,6 @@ interface WebIdentity {
   readonly alias: string | null;
   /** Whether `address` reaches the assistant's mailbox other than through its alias: an address it converses from. */
   conversesFrom(address: string): boolean;
-  reachesPrincipal(address: string): boolean;
 }
 
 async function webIdentity(): Promise<WebIdentity> {
@@ -35,11 +34,9 @@ async function webIdentity(): Promise<WebIdentity> {
   const alias = profile?.assistant_alias ?? null;
   const own = new Set([...assistantAddressesOf(profile)].map(mailbox));
   if (alias !== null) own.delete(mailbox(alias));
-  const principal = new Set((profile?.principal_emails ?? []).map(mailbox));
   return {
     alias,
     conversesFrom: (address) => own.has(mailbox(address)),
-    reachesPrincipal: (address) => principal.has(mailbox(address)),
   };
 }
 
@@ -61,22 +58,26 @@ export async function givenAddressStop(texts: readonly string[]): Promise<'alias
 }
 
 /**
- * What a signup under `username` meets: a refusal under one of the
- * principal's addresses, in any spelling that reaches theirs; under an
- * address the assistant converses from, `alias_unavailable` while no alias is
- * recorded and a refusal naming the alias once one is. Any other username,
- * the alias in any spelling included, may open an account.
+ * An email username names the assistant's account only when it reaches the
+ * recorded web alias. Non-email usernames need the site's finalized signup
+ * record as well, which the credential-attempt store checks.
+ */
+export async function isAssistantAccount(username: string): Promise<boolean> {
+  const { alias } = await webIdentity();
+  return alias !== null && mailbox(username) === mailbox(alias);
+}
+
+/**
+ * Signups use only the web alias, in any spelling that reaches it, or a
+ * non-email username. Email signups wait for the operator to record an alias.
  */
 export async function signupAccountStop(username: string): Promise<'alias_unavailable' | undefined> {
   const identity = await webIdentity();
-  if (identity.reachesPrincipal(username))
-    throw forbidden(
-      "The assistant never opens an account in the principal's name: their own accounts come only from their logins in 1Password.",
-    );
-  if (!identity.conversesFrom(username)) return undefined;
+  if (!EMAIL_PATTERN.test(username)) return undefined;
   if (identity.alias === null) return 'alias_unavailable';
-  throw invalidArgs(
-    `The assistant's own accounts use its web address, ${identity.alias}: sign up with that, never an address it converses from.`,
+  if (mailbox(username) === mailbox(identity.alias)) return undefined;
+  throw forbidden(
+    `The assistant opens accounts only under its web address, ${identity.alias}, or a non-email username. The principal's own accounts come only from their logins in 1Password.`,
   );
 }
 

@@ -81,7 +81,7 @@ For ad-hoc central queries from skills or scripts, use the in-tree wrapper rathe
 | `src/modules/gws-ea-matters/{sync,morning,loop,ledger}.ts` | Principal-local evening close, captured day-ledger coverage, durable completion/reporting, held morning gate and timed looks |
 | `container/agent-runner/src/planning-agents.ts` + `week-view/` | Native planning-worker attribution and permissions; main-only week/Manual context hooks and moment-local clock reads |
 | `src/modules/gws-ea-browser/` | Built-in host Playwright runtime, owned loopback Chrome CDP connection, public-only proxy, job queue, sign-in, the open-rule classifier, consent engine, reviewed and generic purchase readers, purchase authority, recipes and wake-on-change watches |
-| `src/gws-ea/onepassword*.ts` + `src/modules/gws-ea-browser/{onepassword*,credential-*,vault-access}.ts` | 1Password: operator provisioning and resumable uninstall/removal cleanup; the sanitized `op` CLI boundary and host vault client; durable credential attempts for signups and owned password changes; main's vault sharing with the principal |
+| `src/gws-ea/onepassword*.ts` + `src/modules/gws-ea-browser/{onepassword*,credential-*,logins-*}.ts` | 1Password: operator provisioning and resumable uninstall/removal cleanup; the sanitized `op` CLI boundary and host vault client; durable credential attempts for signups and owned password changes; the principal-only saved-logins page and its host link tool |
 | `src/command-gate.ts` | Router-side admin command gate — queries `user_roles` directly (no env var, no container-side check) |
 | `src/modules/permissions/user-dm.ts` | Cold-DM resolution + `user_dms` cache |
 | `src/group-init.ts` | Per-agent-group filesystem scaffold (CLAUDE.md, skills) — agent-runner source is a shared read-only mount, not copied per group |
@@ -232,9 +232,10 @@ committed update/start/restart; optional provisioning cannot fail a committed
 release, and rollback never provisions.
 
 The `web` connector owns one claimed `<first-name>.<zone apex>` hostname and
-loopback port per assistant, stable across renames. It serves only artifacts at
-`/artifacts`; web owns policy, listener and identity, and artifacts owns object
-and sharing authority. Transient serving failures retain author tools. Removing
+loopback port per assistant, stable across renames. It serves artifacts at
+`/artifacts` and the principal-only saved-logins page at `/logins`, with no home page. Web owns policy, listener and identity; artifacts
+owns object and sharing authority, and browser owns saved-login authority.
+Transient serving failures retain author tools. Removing
 an assistant settles only its DNS, route and Access app; shared resources remain
 until connector uninstall, which closes all policies before remote cleanup.
 
@@ -260,19 +261,28 @@ When desktop approval is needed, an operator terminal is required; otherwise
 setup remains pending without calling `op`. The operator
 mints that assistant's runtime service account with read/write access to only
 its vault. A signup or password change saves the generated password in the
-vault before any site sees it. Passwords change only on logins the host saved
-itself whose username and site are unchanged; logins the principal added or
-edited, and sign-in email, phone, two-factor and payment-method changes on any
-account, are refused. A confirmed change writes the new password into the
-original login, read fresh and re-checked against its ownership record, on the
+vault before any site sees it. The
+[operator guide](docs/gws-ea-cli.md#1password-vaults) defines account ownership
+and password-change authority. Sign-in email, phone, two-factor and
+payment-method changes remain refused. A confirmed password change writes into
+the original login, read fresh and checked against the username rule, on the
 version just read (a racing edit is retried, bounded), then deletes the
-candidate, so the old password stays nowhere the host keeps. A login changed or
-removed in 1Password meanwhile is left as it is, with the new password in its
-own item. Main asks the host to share the vault, view and edit, with the
-principal's exact confirmed 1Password user through the management account; a
-share answers with the recorded sign-in address as a link and the vault's exact
-name (1Password documents no link to a vault itself). When it cannot, the
-principal gets a message to forward to their operator.
+candidate. A login changed or removed meanwhile is left as edited, with the new
+password in its own item.
+
+Main obtains the host's `/logins` link through `logins_page` when a missing login
+is needed or the principal asks. Only the principal's currently confirmed
+addresses can open it. They can add or remove any ordinary Login and edit its
+label, website, username or saved password, whichever account owner it has;
+the page never reveals a password. A blank replacement keeps the current password,
+and an older edit form cannot overwrite newer saved details.
+It refreshes saved logins for the next errand. No membership in the operator's
+1Password account is needed. Missing web or vault setup means the principal
+asks their operator; installed web that cannot serve now means try again later.
+The persistent browser keeps every sign-in, the principal's included.
+
+Before updating an existing web install, follow the
+[web reinstall instructions](docs/gws-ea-cli.md#assistant-web).
 
 `connectors uninstall onepassword` previews every vault and active credential
 attempt, then requires terminal confirmation or `--delete-vaults`. It stops all

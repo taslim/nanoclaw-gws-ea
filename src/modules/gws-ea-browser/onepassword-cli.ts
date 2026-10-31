@@ -110,16 +110,6 @@ export interface OnePasswordCliOptions {
   readonly ambient?: NodeJS.ProcessEnv;
 }
 
-/** A person 1Password holds in the account, as a service account reads them. */
-export interface OnePasswordUser {
-  readonly userId: string;
-  readonly email: string;
-  /** `MEMBER`, `GUEST` or `SERVICE_ACCOUNT` as 1Password reports it; anything else is `other`. */
-  readonly type: 'member' | 'guest' | 'service_account' | 'other';
-  /** `ACTIVE`: they accepted their invitation, were confirmed, and are not suspended. */
-  readonly active: boolean;
-}
-
 export interface OnePasswordAccount {
   readonly accountId: string;
   /** The operator's own user in that account. */
@@ -152,13 +142,6 @@ export interface VaultAccessRequest {
   /** The exact provider user: an ID, never an email or name the provider would resolve. */
   readonly userId: string;
   readonly permissions: readonly OnePasswordVaultPermission[];
-}
-
-export interface VaultAccessRevocation {
-  readonly vaultId: string;
-  readonly userId: string;
-  /** Omitted, every permission the user holds on the vault is revoked. */
-  readonly permissions?: readonly OnePasswordVaultPermission[];
 }
 
 export interface ServiceAccountRequest {
@@ -226,19 +209,6 @@ function invalidRequest(message: string): GwsEaError {
 function assertId(value: string, label: string): void {
   if (!isOnePasswordId(value)) throw invalidRequest(`${label} must be an exact 1Password ID`);
 }
-
-/** A lowercase address that can never be read as a flag; the caller normalizes before asking. */
-const EMAIL = /^[a-z0-9._%+-]+@[a-z0-9-]+(?:\.[a-z0-9-]+)+$/u;
-function assertEmail(email: string): void {
-  if (email.length > 254 || email.startsWith('-') || hasControlCharacters(email) || !EMAIL.test(email))
-    throw invalidRequest('An email must be one lowercase address');
-}
-
-const USER_TYPES: ReadonlyMap<string, OnePasswordUser['type']> = new Map([
-  ['MEMBER', 'member'],
-  ['GUEST', 'guest'],
-  ['SERVICE_ACCOUNT', 'service_account'],
-]);
 
 function assertName(name: string): void {
   if (!RESOURCE_NAME.test(name))
@@ -548,24 +518,6 @@ export class OnePasswordCli {
     return result.status === 'ok' ? { status: 'ok' } : result;
   }
 
-  async revokeVaultAccess(identity: OnePasswordIdentity, request: VaultAccessRevocation): Promise<OnePasswordResult> {
-    assertId(request.vaultId, 'The vault');
-    assertId(request.userId, 'The user');
-    const permissions = request.permissions === undefined ? [] : ['--permissions', permissionList(request.permissions)];
-    const result = await this.#write(identity, [
-      'vault',
-      'user',
-      'revoke',
-      '--no-input',
-      '--vault',
-      request.vaultId,
-      '--user',
-      request.userId,
-      ...permissions,
-    ]);
-    return result.status === 'ok' ? { status: 'ok' } : result;
-  }
-
   /** A service account may delete only a vault it created; the provider enforces it. */
   async deleteVault(identity: OnePasswordIdentity, vaultId: string): Promise<OnePasswordResult> {
     assertId(vaultId, 'The vault');
@@ -595,52 +547,6 @@ export class OnePasswordCli {
       name: isDisplayText(name) ? name : null,
       itemCount: typeof items === 'number' && Number.isSafeInteger(items) && items >= 0 ? items : null,
     };
-  }
-
-  /** The user 1Password holds under exactly this email; matching it to a request is the caller's. */
-  async getUser(
-    identity: OnePasswordIdentity,
-    email: string,
-  ): Promise<OnePasswordResult<{ readonly user: OnePasswordUser }>> {
-    assertEmail(email);
-    const result = await this.#read(identity, ['user', 'get', email, '--format', 'json']);
-    if (result.status !== 'ok') return result;
-    const value = parseText(result.stdout);
-    if (
-      !isRecord(value) ||
-      !isOnePasswordId(value.id) ||
-      !isDisplayText(value.email) ||
-      typeof value.type !== 'string' ||
-      typeof value.state !== 'string'
-    )
-      return failed('unexpected_output');
-    return {
-      status: 'ok',
-      user: {
-        userId: value.id,
-        email: value.email,
-        type: USER_TYPES.get(value.type.toUpperCase()) ?? 'other',
-        active: value.state.toUpperCase() === 'ACTIVE',
-      },
-    };
-  }
-
-  /** The users with direct access to the vault. */
-  async listVaultUsers(
-    identity: OnePasswordIdentity,
-    vaultId: string,
-  ): Promise<OnePasswordResult<{ readonly userIds: readonly string[] }>> {
-    assertId(vaultId, 'The vault');
-    const result = await this.#read(identity, ['user', 'list', '--vault', vaultId, '--format', 'json']);
-    if (result.status !== 'ok') return result;
-    const value = parseText(result.stdout);
-    if (!Array.isArray(value)) return failed('unexpected_output');
-    const userIds: string[] = [];
-    for (const entry of value) {
-      if (!isRecord(entry) || !isOnePasswordId(entry.id)) return failed('unexpected_output');
-      userIds.push(entry.id);
-    }
-    return { status: 'ok', userIds };
   }
 
   async accountType(

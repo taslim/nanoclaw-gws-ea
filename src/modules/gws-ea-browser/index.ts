@@ -73,7 +73,7 @@ import { registerPurchaseOutcomeDelivery } from './purchase-outcome.js';
 import { registerReservationGuaranteeDelivery } from './reservation-guarantee.js';
 import { recoverConsentOutcomes, registerConsentGrantsDelivery, requestConsentAction } from './consent-approval.js';
 import { registerDisclosureDelivery } from './disclosures.js';
-import { registerVaultAccessDelivery } from './vault-access.js';
+import { registerLoginsPageDelivery } from './logins-link.js';
 import { watchAction, listWatchesAction, cancelWatchAction, watchBookAction } from './watches.js';
 
 import type { BrowserActions, BrowserExecutionContext } from './actions.js';
@@ -245,7 +245,7 @@ registerPurchaseOutcomeDelivery(getBrowserQueue);
 registerReservationGuaranteeDelivery();
 registerConsentGrantsDelivery();
 registerDisclosureDelivery();
-registerVaultAccessDelivery();
+registerLoginsPageDelivery();
 registerCredentialAuthorityDelivery(getBrowserQueue);
 
 export {

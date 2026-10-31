@@ -32,7 +32,7 @@ import { getSession, updateSession } from '../../db/sessions.js';
 import { guard } from '../../guard/index.js';
 import { browserWatchesMigration } from './migration.js';
 import { deliverAction as send, refusal } from './testing/delivery-answer.js';
-import { vaultAccessGuard } from './vault-access.js';
+import { loginsPageGuard } from './logins-link.js';
 import { credentialAttempts } from './credential-attempts.js';
 import { browserAvailability } from './availability.js';
 
@@ -423,13 +423,13 @@ describe('an explicitly granted second agent group', () => {
     expect(await getDb().all('SELECT job_id FROM gws_ea_browser_reservation_bounds')).toEqual([]);
   });
 
-  it("shares the vault's logins with it: it may share the vault with the principal, as main may", async () => {
+  it("lets it obtain the principal's logins page, as main may", async () => {
     for (const [agentGroupId, effect] of [
       ['research', 'allow'],
       ['main', 'allow'],
       ['other', 'deny'],
     ] as const)
-      expect(await guard(vaultAccessGuard, { actor: { kind: 'agent', agentGroupId }, payload: {} })).toMatchObject({
+      expect(await guard(loginsPageGuard, { actor: { kind: 'agent', agentGroupId }, payload: {} })).toMatchObject({
         effect,
       });
   });

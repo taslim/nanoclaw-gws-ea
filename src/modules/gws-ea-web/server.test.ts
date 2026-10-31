@@ -10,12 +10,16 @@ async function fixture() {
   const feature = vi.fn<RequestListener>((_request, response) => {
     response.writeHead(200, { 'cache-control': 'no-store' }).end('artifact');
   });
-  server = createServer(createWebHandler('aya.example.com', feature));
+  const logins = vi.fn<RequestListener>((_request, response) => {
+    response.writeHead(200, { 'cache-control': 'no-store' }).end('logins');
+  });
+  server = createServer(createWebHandler('aya.example.com', { artifacts: feature, logins }));
   await new Promise<void>((resolve) => server!.listen(0, '127.0.0.1', resolve));
   const address = server.address();
   if (!address || typeof address === 'string') throw new Error('No fixture port');
   return {
     feature,
+    logins,
     request: (route: string, method = 'GET', host = 'aya.example.com') =>
       new Promise<{ status: number; headers: import('node:http').IncomingHttpHeaders; body: string }>(
         (resolve, reject) => {
@@ -37,7 +41,18 @@ async function fixture() {
 }
 it('keeps root, unrelated and encoded mounts outside the feature boundary with closed response headers', async () => {
   const { feature, request } = await fixture();
-  for (const route of ['/', '/artifact', '/artifacts', '/artifactsx', '/other', '/%61rtifacts/id', '//artifacts/id']) {
+  for (const route of [
+    '/',
+    '/artifact',
+    '/artifacts',
+    '/artifactsx',
+    '/other',
+    '/%61rtifacts/id',
+    '//artifacts/id',
+    '/loginsx',
+    '/%6cogins',
+    '//logins',
+  ]) {
     const response = await request(route);
     expect(response.status, route).toBe(404);
     expect(response.body).toBe('');
@@ -45,6 +60,16 @@ it('keeps root, unrelated and encoded mounts outside the feature boundary with c
     expect(response.headers['content-security-policy']).toBe("default-src 'none'; frame-ancestors 'none'");
   }
   expect(feature).not.toHaveBeenCalled();
+});
+it('dispatches GET, HEAD and POST only to the logins feature without admitting other methods', async () => {
+  const { feature, logins, request } = await fixture();
+  expect((await request('/logins')).body).toBe('logins');
+  expect((await request('/logins', 'HEAD')).status).toBe(200);
+  expect((await request('/logins/password', 'POST')).body).toBe('logins');
+  for (const method of ['PUT', 'DELETE', 'OPTIONS']) expect((await request('/logins', method)).status).toBe(405);
+  expect((await request('/unrelated', 'POST')).status).toBe(404);
+  expect(feature).not.toHaveBeenCalled();
+  expect(logins).toHaveBeenCalledTimes(3);
 });
 it('requires the exact Host and GET or HEAD before dispatching the fixed mount', async () => {
   const { feature, request } = await fixture();

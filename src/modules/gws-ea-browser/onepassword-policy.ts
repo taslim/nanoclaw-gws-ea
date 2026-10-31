@@ -51,10 +51,6 @@ export function onePasswordSignInAddress(value: string): string | undefined {
   return SIGN_IN_ADDRESS.test(address) ? address : undefined;
 }
 
-export function onePasswordAccountLink(policy: Pick<OnePasswordHostPolicy, 'signInAddress'>): string {
-  return new URL(`https://${policy.signInAddress}/`).href;
-}
-
 /**
  * Every vault permission the CLI documents: the first three on Teams and Families; on Business they group the
  * granular permissions that follow.
@@ -105,8 +101,8 @@ export interface OnePasswordHostPolicy {
   /** 2 added the disabled intent; a policy of any other version is refused. */
   readonly schemaVersion: 2;
   /**
-   * The operator's intent, re-read by the host before every vault use. False stops every fill, disclosure, write
-   * and share while the account, the management identity and every assistant's records are kept.
+   * The operator's intent, re-read by the host before every vault use. False stops every fill, disclosure and write
+   * while the account, the management identity and every assistant's records are kept.
    */
   readonly enabled: boolean;
   /** The one account every assistant on this host uses, by its exact ID: never a shorthand, URL or name. */

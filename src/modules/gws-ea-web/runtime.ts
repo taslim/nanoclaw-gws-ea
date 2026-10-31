@@ -3,7 +3,7 @@ import { readWebOperatorConfig, reconcileWebAccessEmails } from '../../gws-ea/we
 import { log } from '../../log.js';
 import { createWebIdentity, type WebIdentity } from './access.js';
 import { WEB_POLICY_VERSIONS, readWebPolicy, webPolicyDigest, type WebPolicyFile } from './policy.js';
-import { createWebHandler } from './server.js';
+import { createWebHandler, unavailableWebHandler, type WebFeatures } from './server.js';
 
 export interface WebHealth {
   readonly policyVersions: readonly number[];
@@ -19,6 +19,7 @@ export interface WebReadiness {
   readonly verifyAdmission: (config: WebPolicyFile) => Promise<void>;
   readonly publicationReady: (config: WebPolicyFile) => Promise<boolean>;
 }
+type WebFeatureFactory = (config: WebPolicyFile, identity: WebIdentity) => RequestListener;
 /** One optional origin and one non-overlapping admission reconciliation tick per host. */
 export class WebRuntime {
   private server: Server | undefined;
@@ -33,7 +34,7 @@ export class WebRuntime {
   private tick: Promise<void> | undefined;
   private timer: NodeJS.Timeout | undefined;
   constructor(
-    private readonly artifacts: (config: WebPolicyFile, identity: WebIdentity) => RequestListener,
+    private readonly features: WebFeatures<WebFeatureFactory>,
     private readonly admissionEmails: () => Promise<readonly string[]>,
     private readonly dependencies: WebRuntimeDependencies = {},
   ) {}
@@ -180,19 +181,15 @@ export class WebRuntime {
         return;
       }
       if (!this.server) {
-        const artifacts = this.artifacts(fresh.config, createWebIdentity(fresh.config));
-        const server = createServer(
-          createWebHandler(fresh.config.hostname, (request, response) => {
-            if (this.ready) artifacts(request, response);
-            else {
-              response.writeHead(404, {
-                'cache-control': 'no-store',
-                'content-security-policy': "default-src 'none'; frame-ancestors 'none'",
-              });
-              response.end();
-            }
-          }),
-        );
+        const identity = createWebIdentity(fresh.config);
+        const handler = createWebHandler(fresh.config.hostname, {
+          artifacts: this.features.artifacts(fresh.config, identity),
+          logins: this.features.logins(fresh.config, identity),
+        });
+        const server = createServer((request, response) => {
+          if (this.ready) handler(request, response);
+          else unavailableWebHandler(request, response);
+        });
         this.server = server;
         await new Promise<void>((resolveListening, reject) => {
           server.once('error', reject);

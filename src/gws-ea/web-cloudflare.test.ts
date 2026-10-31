@@ -1,6 +1,12 @@
 import { describe, expect, it } from 'vitest';
 
-import { webIngress, createWebCloudflareApi, parseWebOperatorConfig } from './web-cloudflare.js';
+import {
+  assertWebApplication,
+  webAccessApplication,
+  webIngress,
+  createWebCloudflareApi,
+  parseWebOperatorConfig,
+} from './web-cloudflare.js';
 
 const instanceId = '00000000-0000-4000-8000-000000000001';
 const attemptKey = '00000000-0000-4000-8000-000000000002';
@@ -155,12 +161,33 @@ describe('web Cloudflare boundary', () => {
       expect.objectContaining({ code: 'web_operator_invalid' }),
     );
   });
-  it('exposes only the fixed artifacts mount on the assistant hostname', () => {
+  it('routes the whole assistant hostname to the origin', () => {
     expect(webIngress({ hostname: 'aya.example.test', listen_port: 41234 })).toEqual({
       hostname: 'aya.example.test',
-      path: '^/artifacts(/|$)',
       service: 'http://127.0.0.1:41234',
     });
+  });
+
+  it('protects every path with only the public artifact override and refuses the old path-scoped application', () => {
+    const claim = { hostname: 'aya.example.test', listen_port: 41234 };
+    const application: Record<string, unknown> = { ...webAccessApplication(claim, 'pin'), id: 'app', aud: 'aud' };
+    const assistant = { claim, enabled: true, applicationId: 'app', aud: 'aud' };
+    const config = parseWebOperatorConfig({ ...operatorConfig(), pin: { id: 'pin', owned: true } });
+    expect(application.destinations).toEqual([
+      {
+        type: 'public',
+        uri: 'aya.example.test',
+        overrides: [{ behavior: 'public', path_pattern: '/artifacts/public/*' }],
+      },
+    ]);
+    expect(() => assertWebApplication(application, assistant, config)).not.toThrow();
+    expect(() =>
+      assertWebApplication(
+        { ...application, destinations: [{ type: 'public', uri: 'aya.example.test/artifacts' }] },
+        assistant,
+        config,
+      ),
+    ).toThrow(expect.objectContaining({ code: 'web_application_mismatch' }));
   });
 
   it('bounds rate-limit retries and never exposes Cloudflare response material', async () => {

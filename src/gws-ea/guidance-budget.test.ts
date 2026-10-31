@@ -50,9 +50,9 @@ type Agent = 'main' | 'external-email' | 'external-chat' | 'job' | 'browser';
 /** A raise needs its reason here; each reason records the size its budget was set from. */
 const BUDGETS: Readonly<Record<Agent, { readonly tokens: number; readonly reason: string }>> = {
   main: {
-    tokens: 9_689,
+    tokens: 9_800,
     reason:
-      "main's whole document before the guidance rewrite: 38,754 characters, with the front page as an empty install renders it. Its guidance and calendar craft fit inside that size; the front page grows only within its own budget.",
+      "9,791 tokens (39,163 characters): main's whole document with the original browser guidance restored and saved-login account intent and page access added; rounded up. The front page is rendered for an empty install and grows only within its own budget.",
   },
   'external-email': {
     tokens: 4_300,
@@ -70,8 +70,9 @@ const BUDGETS: Readonly<Record<Agent, { readonly tokens: number; readonly reason
       "4,593 tokens: external-chat's scheduling with the resident calendar craft and its formatting, plus job memory, documents and authority; rounded up.",
   },
   browser: {
-    tokens: 4_700,
-    reason: '4,651 tokens: the sealed errand, its safety boundaries and the host browser tool protocols; rounded up.',
+    tokens: 4_800,
+    reason:
+      '4,790 tokens (19,160 characters): the sealed errand, its safety boundaries and restored host browser tool protocols, with duplicated account guidance removed; rounded up.',
   },
 };
 

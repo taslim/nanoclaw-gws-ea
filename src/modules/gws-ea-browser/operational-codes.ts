@@ -72,6 +72,7 @@ export const OPERATIONAL_CODES: ReadonlySet<string> = new Set([
   'cleared_after_submit',
   'origin_mismatch',
   'no_item_for_site',
+  'vault_not_set_up',
   'vault_unavailable',
   'rate_limited',
   'awaiting_code',

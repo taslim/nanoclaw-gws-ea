@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { tmpdir } from 'node:os';
-import { createServer, type Server } from 'node:http';
+import { createServer, request as httpRequest, type Server } from 'node:http';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { writeWebOperatorConfig } from '../../gws-ea/web-cloudflare.js';
 import { WebRuntime } from './runtime.js';
@@ -61,7 +61,10 @@ beforeEach(async () => {
   vi.stubEnv('GWS_EA_WEB_POLICY_FILE', path.join(root, 'policy.json'));
   unavailable = false;
   runtime = new WebRuntime(
-    () => (_request, response) => response.end('artifact'),
+    {
+      artifacts: () => (_request, response) => response.end('artifact'),
+      logins: () => (_request, response) => response.end('logins'),
+    },
     async () => emails,
     {
       reconcileAccess: async () => {
@@ -70,6 +73,32 @@ beforeEach(async () => {
       },
     },
   );
+});
+it('serves both fixed features through the same ready origin and closes publication readiness on stop', async () => {
+  expect(await runtime.publicationReady(config)).toBe(false);
+  await runtime.reconcile();
+  expect(await runtime.publicationReady(config)).toBe(true);
+  async function request(route: string, method = 'GET'): Promise<{ status: number; body: string }> {
+    return new Promise((resolve, reject) => {
+      const req = httpRequest(
+        { hostname: '127.0.0.1', port: config.listenPort, path: route, method, headers: { host: config.hostname } },
+        (res) => {
+          let body = '';
+          res.on('data', (chunk: Buffer) => {
+            body += chunk.toString();
+          });
+          res.on('end', () => resolve({ status: res.statusCode ?? 0, body }));
+        },
+      );
+      req.on('error', reject);
+      req.end();
+    });
+  }
+  expect(await request('/artifacts/id')).toEqual({ status: 200, body: 'artifact' });
+  expect(await request('/artifacts/id', 'POST')).toEqual({ status: 405, body: '' });
+  expect(await request('/logins', 'POST')).toEqual({ status: 200, body: 'logins' });
+  await runtime.stop();
+  expect(await runtime.publicationReady(config)).toBe(false);
 });
 afterEach(async () => {
   await runtime?.stop();

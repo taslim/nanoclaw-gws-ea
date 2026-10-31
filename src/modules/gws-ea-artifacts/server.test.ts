@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { createServer, request as httpRequest, type Server } from 'node:http';
 import { afterEach, describe, expect, it } from 'vitest';
-import { createWebHandler } from '../gws-ea-web/server.js';
+import { createWebHandler, unavailableWebHandler } from '../gws-ea-web/server.js';
 import { createArtifactViewHandler, type ArtifactViewRoute } from './server.js';
 
 const id = '12345678-1234-4321-8321-123456789abc';
@@ -18,16 +18,16 @@ async function fixture(selectedHash = sourceHash) {
   let authorized = true;
   const routes: ArtifactViewRoute[] = [];
   server = createServer(
-    createWebHandler(
-      'artifact.test',
-      createArtifactViewHandler({
+    createWebHandler('artifact.test', {
+      artifacts: createArtifactViewHandler({
         hostname: 'artifact.test',
         resolve: async (_request, route) => {
           routes.push(route);
           return authorized ? { title: 'Revision title', html, sourceHash: selectedHash } : undefined;
         },
       }),
-    ),
+      logins: unavailableWebHandler,
+    }),
   );
   await new Promise<void>((resolve) => server!.listen(0, '127.0.0.1', resolve));
   const address = server.address();
@@ -70,11 +70,15 @@ describe('view-only artifact origin', () => {
       const wrapper = await request(route);
       expect(wrapper.status).toBe(200);
       expect(wrapper.headers.get('cache-control')).toBe('no-store');
-      expect(await wrapper.text()).toContain(`${route}/frame/${sourceHash}`);
+      const wrapperHtml = await wrapper.text();
+      expect(wrapperHtml).toContain(`${route}/frame/${sourceHash}`);
+      expect(wrapperHtml).toContain('sandbox="allow-popups allow-popups-to-escape-sandbox"');
+      expect(wrapperHtml).not.toContain('allow-same-origin');
       const child = await request(`${route}/frame/${sourceHash}`);
       expect(child.status).toBe(200);
       // A script-free revision runs no script at all, so no connection allowlist is needed (or sent).
       expect(child.headers.get('content-security-policy')).toContain("script-src 'none'");
+      expect(child.headers.get('content-security-policy')).not.toContain('allow-same-origin');
       expect(child.headers.get('connection-allowlist')).toBeNull();
       const head = await request(route, 'HEAD');
       expect(head.status).toBe(200);
