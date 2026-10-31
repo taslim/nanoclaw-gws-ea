@@ -3,6 +3,7 @@ import { mkdir, readFile } from 'node:fs/promises';
 import { createServer } from 'node:net';
 import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
+import { isDeepStrictEqual } from 'node:util';
 
 import { isErrno } from '../community-portal/errors.js';
 import { parseWebPolicyFile, readWebPolicy, type WebPolicyFile } from '../modules/gws-ea-web/policy.js';
@@ -609,9 +610,9 @@ export async function setWebIngress(
     retained.push(route);
   }
   const next = { ...current, ingress: [...retained, ...(enabled ? [expected] : []), { service: 'http_status:404' }] };
-  if (JSON.stringify(current) !== JSON.stringify(next)) await api.request('PUT', resource, { config: next });
+  if (!isDeepStrictEqual(current, next)) await api.request('PUT', resource, { config: next });
   const verified = await api.request('GET', resource);
-  if (!isRecord(verified) || !isRecord(verified.config) || JSON.stringify(verified.config) !== JSON.stringify(next))
+  if (!isRecord(verified) || !isRecord(verified.config) || !isDeepStrictEqual(verified.config, next))
     throw new GwsEaError('web_tunnel_unverified', 'Cloudflare tunnel ingress has not converged.');
 }
 

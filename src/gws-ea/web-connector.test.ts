@@ -174,7 +174,10 @@ function cloudflareFixture(zoneApex = 'example.test') {
           throw new Error('PUT response lost');
         }
       }
-      return reply({ config: { ingress } });
+      // Cloudflare can return the same routes with a different JSON field order.
+      return reply({
+        config: { ingress: ingress.map((route) => Object.fromEntries(Object.entries(route).reverse())) },
+      });
     }
     const record = /^\/zones\/([^/]+)\/dns_records(?:\/([^/]+))?$/u.exec(resource);
     if (record) {
