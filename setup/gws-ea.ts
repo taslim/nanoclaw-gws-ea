@@ -282,6 +282,15 @@ export async function main(argv: readonly string[], options: { readonly interact
     presenter: createTerminalPresenter(),
     prompts: terminalPrompts(providers),
     chooseOnePasswordAccount,
+    readWebManagementToken: async () => {
+      const token = await p.password({
+        message: 'Cloudflare management API token',
+        validate: (value) => (!value.trim() || /\s/u.test(value.trim()) ? 'Paste the API token only.' : undefined),
+        output: process.stderr,
+      });
+      if (p.isCancel(token)) throw new GwsEaError('cancelled', 'Web installation cancelled.');
+      return token;
+    },
     collectCreateInputs,
     checkPrerequisites: (request, interaction) => ensurePrerequisites(request, interaction),
     confirmOnePasswordUninstall: async (preview) => {

@@ -71,6 +71,8 @@ export interface WebCapabilityOptions {
   readonly discardUnproven?: string;
 }
 export interface WebCapabilityDependencies extends WebCloudflareDependencies {
+  /** The attended terminal driver supplies hidden token entry; never used for an existing install. */
+  readonly readManagementToken?: () => Promise<string>;
   readonly ncl?: typeof runInstanceNclJson;
   readonly runCommand?: SanitizedCommandOutcomeRunner;
   readonly recordEffect?: (changed: true | null) => void | Promise<unknown>;
@@ -221,7 +223,22 @@ export async function installWebConnector(
     }
     await dependencies.recordEffect?.(null);
     const previous = await readWebOperatorConfig(webOperatorFiles(paths).configFile);
-    const config = await configure(paths, options, dependencies);
+    let enteredToken: string | undefined;
+    if (
+      !previous &&
+      options.accountId &&
+      options.teamName &&
+      options.zoneId &&
+      !options.credentialFile &&
+      dependencies.readManagementToken
+    ) {
+      enteredToken = await dependencies.readManagementToken();
+      registerSecret(enteredToken);
+      enteredToken = enteredToken.trim();
+      if (!enteredToken || /\s/u.test(enteredToken))
+        throw new GwsEaError('web_credential_invalid', 'Enter only the Cloudflare management API token.');
+    }
+    const config = await configure(paths, options, dependencies, enteredToken);
     let changed =
       previous === undefined || options.credentialFile !== undefined || options.discardUnproven !== undefined;
     if (changed) await dependencies.recordEffect?.(true);
@@ -316,6 +333,7 @@ async function configure(
   paths: ControlPlanePaths,
   options: WebCapabilityOptions,
   dependencies: WebCapabilityDependencies,
+  enteredToken?: string,
 ): Promise<WebOperatorConfig> {
   const files = webOperatorFiles(paths);
   return withMachineLock(paths, async () => {
@@ -364,20 +382,28 @@ async function configure(
       }
       return existing;
     }
-    if (!options.accountId || !options.teamName || !options.zoneId || !options.credentialFile)
+    if (!options.accountId || !options.teamName || !options.zoneId)
       throw new GwsEaError(
         'web_operator_required',
-        'First install requires --account, --team, --zone and --credential-file under the operator config root.',
+        'First install requires --account, --team and --zone. Run gws-ea connectors install web --help for complete examples.',
       );
     const credentialFile = path.join(files.root, 'management-token');
-    const token = (
-      await readOperatorFile(
-        options.credentialFile,
-        paths.configRoot,
-        'Cloudflare management credential',
-        'web_credential_invalid',
-      )
-    ).trim();
+    let token: string;
+    if (enteredToken !== undefined) token = enteredToken;
+    else if (options.credentialFile)
+      token = (
+        await readOperatorFile(
+          options.credentialFile,
+          paths.configRoot,
+          'Cloudflare management credential',
+          'web_credential_invalid',
+        )
+      ).trim();
+    else
+      throw new GwsEaError(
+        'web_operator_required',
+        `Token entry requires an interactive terminal. Supply --credential-file with an owner-only API-token file under ${paths.configRoot}.`,
+      );
     registerSecret(token);
     const zoneApex = await verifyCoordinates(createWebCloudflareApi(token, dependencies), {
       accountId: options.accountId,

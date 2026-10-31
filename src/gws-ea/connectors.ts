@@ -232,7 +232,10 @@ export const CONNECTOR_CATALOG: readonly ConnectorDefinition[] = [
         value('account', 'account_id', 'Cloudflare account; required for first setup.'),
         value('team', 'team_name', 'Cloudflare Access team; required for first setup.'),
         value('zone', 'zone_id', 'Active Cloudflare DNS zone.'),
-        file('credential-file', 'Owner-only Cloudflare management credential under the operator config root.'),
+        file(
+          'credential-file',
+          'Owner-only Cloudflare management credential under the operator config root; omit on first install in a terminal to enter the token securely.',
+        ),
         file('cloudflared', 'Trusted absolute cloudflared executable.'),
         value('discard-unproven', 'attempt', 'Acknowledge the exact interrupted remote create after cleaning it up.'),
       ],

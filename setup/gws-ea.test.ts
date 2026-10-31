@@ -47,6 +47,7 @@ const fixture = vi.hoisted(() => {
     spinner,
     log: { info: vi.fn(), success: vi.fn(), warn: vi.fn(), error: vi.fn(), message: vi.fn(), step: vi.fn() },
     note: vi.fn(),
+    password: vi.fn(async (): Promise<string | symbol> => 'hidden-management-fixture'),
     confirm: vi.fn(async (): Promise<boolean | symbol> => true),
     /** What clack's prompts return when the operator presses Ctrl-C or Esc. */
     cancel: Symbol('clack:cancel'),
@@ -61,6 +62,7 @@ const fixture = vi.hoisted(() => {
 vi.mock('@clack/prompts', () => ({
   log: fixture.log,
   note: fixture.note,
+  password: fixture.password,
   confirm: fixture.confirm,
   spinner: () => fixture.spinner,
   isCancel: (value: unknown) => value === fixture.cancel,
@@ -144,6 +146,15 @@ function report(overrides: Partial<FailureReport> = {}): FailureReport {
 
 describe('launcher interaction modes', () => {
   afterEach(() => vi.clearAllMocks());
+  it('reads a web management token with the hidden-input prompt and handles cancellation', async () => {
+    await main(['connectors', 'install', 'web'], { interactive: true });
+    const runtime = runtimeOf();
+    if (!runtime.readWebManagementToken) throw new Error('Missing terminal token reader');
+    expect(await runtime.readWebManagementToken()).toBe('hidden-management-fixture');
+    expect(fixture.password).toHaveBeenCalledWith(expect.objectContaining({ output: process.stderr }));
+    fixture.password.mockResolvedValueOnce(fixture.cancel);
+    await expect(runtime.readWebManagementToken()).rejects.toMatchObject({ code: 'cancelled' });
+  });
   it.each([
     { label: 'all streams attached', stdin: true, stdout: true, stderr: true, override: undefined, expected: true },
     { label: 'stdout redirected', stdin: true, stdout: false, stderr: true, override: undefined, expected: true },
@@ -202,6 +213,7 @@ describe('launcher interaction modes', () => {
       expect(runtime.confirmUpdate).toBeUndefined();
       expect(runtime.confirmUpdateAll).toBeUndefined();
       expect(runtime.confirmRollback).toBeUndefined();
+      expect(runtime.readWebManagementToken).toBeUndefined();
       expect(runtime.onFailure).toBeUndefined();
       expect(runtime.presenter).toBeUndefined();
       expect(fixture.confirm).not.toHaveBeenCalled();

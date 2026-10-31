@@ -244,6 +244,8 @@ export interface CliRuntime {
   onePassword?: OnePasswordCliSeams;
   /** Picks among the operator's 1Password accounts; absent, enable needs --account until one is recorded. */
   chooseOnePasswordAccount?: OnePasswordDependencies['chooseAccount'];
+  /** Hidden token entry in an attended terminal; absent for unattended commands. */
+  readWebManagementToken?: WebCapabilityDependencies['readManagementToken'];
   paths?: ControlPlanePaths;
   stdout?: LineWriter;
   stderr?: LineWriter;
@@ -2356,6 +2358,7 @@ export async function runCli(args: readonly string[], runtime: CliRuntime = {}):
       confirmUpdateAll: _all,
       confirmRollback: _rollback,
       chooseOnePasswordAccount: _account,
+      readWebManagementToken: _webToken,
       presenter: _presenter,
       ...safe
     } = runtime;
@@ -2612,6 +2615,7 @@ export async function runCli(args: readonly string[], runtime: CliRuntime = {}):
         }
         const name = handler.name;
         let paused = false;
+        const readWebManagementToken = runtime.readWebManagementToken;
         const lifecycleContext: ConnectorLifecycleContext = {
           paths,
           options,
@@ -2631,7 +2635,20 @@ export async function runCli(args: readonly string[], runtime: CliRuntime = {}):
             recordEffect,
             rateLimitState: { limited: false },
           },
-          web: { ...runtime.web, recordEffect },
+          web: {
+            ...runtime.web,
+            readManagementToken: readWebManagementToken
+              ? async () => {
+                  presenter.suspend();
+                  try {
+                    return await readWebManagementToken();
+                  } finally {
+                    presenter.resume();
+                  }
+                }
+              : undefined,
+            recordEffect,
+          },
         };
         if (name === 'onepassword' && handler.command === 'uninstall') {
           const dependencies = lifecycleContext.onePassword;

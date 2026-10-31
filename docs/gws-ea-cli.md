@@ -74,11 +74,17 @@ route leaves web not ready.
 The operator needs an active Cloudflare DNS zone, an Access team, an
 account-scoped management token with the required Tunnel, DNS, Access
 application/policy and identity-provider permissions, and `cloudflared`
-2025.4.0 or later. Keep the token in an owner-only file inside the operator
-config root; the default root is `~/.config/gws-ea`, respecting
+2025.4.0 or later. Unattended first installs read the token from an owner-only
+file inside the operator config root; the default root is `~/.config/gws-ea`, respecting
 `XDG_CONFIG_HOME` and `GWS_EA_CONFIG_ROOT`.
 
 ```sh
+# First install in a terminal: replace ACCOUNT_ID, TEAM_NAME and ZONE_ID.
+# The token is entered securely when prompted; no credential file is needed.
+gws-ea connectors install web \
+  --account ACCOUNT_ID --team TEAM_NAME --zone ZONE_ID
+
+# Unattended first install uses an existing owner-only token file:
 gws-ea connectors install web \
   --account <cloudflare_account_id> --team <access_team_subdomain> \
   --zone <active_zone_id> \
@@ -87,6 +93,11 @@ gws-ea connectors show web
 gws-ea connectors check web --id <instance_id>
 gws-ea connectors uninstall web
 ```
+
+Terminal token entry is hidden. Install validates the token against the selected
+zone and Access team before saving its owner-only managed copy. `--json`,
+`--no-input`, and runs without a terminal require `--credential-file` on first
+install. Later installs reuse the recorded token without prompting.
 
 Install verifies the account, Access team and active zone before recording
 configuration. It uses the selected zone's apex: zone `example.com` gives Aya
