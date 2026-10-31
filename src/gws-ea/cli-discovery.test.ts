@@ -25,6 +25,15 @@ function capture() {
 }
 
 describe('local CLI discovery and grammar', () => {
+  it('shows complete web install examples for terminal token entry and an unattended credential file', async () => {
+    const io = capture();
+    expect(await runCli(['connectors', 'install', 'web', '--help'], io.runtime)).toBe(0);
+    const text = io.stdout.join('\n');
+    expect(text).toContain('gws-ea connectors install web --account ACCOUNT_ID --team TEAM_NAME --zone ZONE_ID');
+    expect(text).toContain('--credential-file ~/.config/gws-ea/cloudflare-api-token --no-input');
+    expect(io.runtime.checkPrerequisites).not.toHaveBeenCalled();
+  });
+
   it('describes WhatsApp namespace help as assistant link management', async () => {
     const io = capture();
     expect(await runCli(['help', 'whatsapp'], io.runtime)).toBe(0);

@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readdir, readFile, realpath, rm, stat, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, expect, it, vi } from 'vitest';
@@ -12,11 +12,95 @@ import { reserveInstance } from './journal.js';
 import { ONEPASSWORD_CONTRACT } from './onepassword.js';
 import { FakeOnePassword } from './testing/onepassword-fixture.js';
 import { persistTestRuntime } from './testing/runtime-fixture.js';
+import { readWebOperatorConfig, webOperatorFiles } from './web-cloudflare.js';
 const roots: string[] = [];
 afterEach(async () => {
   vi.restoreAllMocks();
   for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true });
 });
+
+it.each([
+  { mode: 'terminal', hook: 'launcher' },
+  { mode: 'terminal', hook: 'web' },
+  { mode: 'credential-file', hook: 'launcher' },
+  { mode: '--json', hook: 'launcher' },
+  { mode: '--json', hook: 'web' },
+  { mode: '--no-input', hook: 'launcher' },
+  { mode: '--no-input', hook: 'web' },
+  { mode: 'unattended', hook: 'none' },
+] as const)(
+  'accepts a web token only through an attended input hook ($mode, $hook), without leaking it to output or logs',
+  async ({ mode, hook }) => {
+    const root = await realpath(await mkdtemp(path.join(os.tmpdir(), 'web-token-dispatch-')));
+    roots.push(root);
+    const paths = resolveControlPlanePaths({
+      configRoot: path.join(root, 'config'),
+      stateRoot: path.join(root, 'state'),
+    });
+    const secret = 'terminal-only-management-fixture';
+    const credentialFile = path.join(paths.configRoot, 'source-token');
+    if (mode === 'credential-file') {
+      await mkdir(paths.configRoot, { recursive: true, mode: 0o700 });
+      await writeFile(credentialFile, secret, { mode: 0o600 });
+    }
+    const readWebManagementToken = vi.fn(async () => secret);
+    const readDependencyToken = vi.fn(async () => secret);
+    const output: string[] = [];
+    const fetch: typeof globalThis.fetch = async (input) => {
+      const resource = new URL(String(input)).pathname;
+      if (resource.endsWith('/zones/zone'))
+        return Response.json({
+          success: true,
+          result: { id: 'zone', name: 'example.test', status: 'active', account: { id: 'account' } },
+        });
+      if (resource.endsWith('/access/organizations'))
+        return Response.json({ success: true, result: { auth_domain: 'team.cloudflareaccess.com' } });
+      throw new Error('Unexpected Cloudflare operation');
+    };
+    const code = await runCli(
+      [
+        'connectors',
+        'install',
+        'web',
+        '--account',
+        'account',
+        '--team',
+        'team',
+        '--zone',
+        'zone',
+        '--cloudflared',
+        '/usr/bin/true',
+        ...(mode.startsWith('--') ? [mode] : []),
+        ...(mode === 'credential-file' ? ['--credential-file', credentialFile] : []),
+      ],
+      {
+        paths,
+        stdout: (line) => output.push(line),
+        stderr: (line) => output.push(line),
+        web: { fetch, ...(hook === 'none' ? {} : { readManagementToken: readDependencyToken }) },
+        ...(hook === 'launcher' ? { readWebManagementToken } : {}),
+      },
+    );
+    const installed = mode === 'terminal' || mode === 'credential-file';
+    expect(code).toBe(installed ? 0 : 1);
+    expect(readWebManagementToken).toHaveBeenCalledTimes(mode === 'terminal' && hook === 'launcher' ? 1 : 0);
+    expect(readDependencyToken).toHaveBeenCalledTimes(mode === 'terminal' && hook === 'web' ? 1 : 0);
+    const config = await readWebOperatorConfig(webOperatorFiles(paths).configFile);
+    if (installed) {
+      if (!config) throw new Error('Missing web operator configuration');
+      expect(await readFile(config.credentialFile, 'utf8')).toBe(secret);
+      expect((await stat(config.credentialFile)).mode & 0o777).toBe(0o600);
+    } else expect(config).toBeUndefined();
+    expect(output.join('\n')).not.toContain(secret);
+    for (const run of await readdir(path.join(paths.logsRoot, 'runs'))) {
+      const files = await readdir(path.join(paths.logsRoot, 'runs', run), { recursive: true });
+      for (const file of files) {
+        const full = path.join(paths.logsRoot, 'runs', run, file);
+        if ((await stat(full)).isFile()) expect(await readFile(full, 'utf8')).not.toContain(secret);
+      }
+    }
+  },
+);
 
 it.each(['list', 'show'] as const)(
   'keeps connectors %s available when one assistant runtime is malformed and 1Password was never installed',

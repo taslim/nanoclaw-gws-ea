@@ -499,7 +499,14 @@ export const COMMAND_DEFINITIONS: readonly CommandDefinition[] = [
         recovery: [
           `Inspect the reported reason; rerun gws-ea connectors ${command === 'uninstall' ? 'uninstall' : 'install'} ${connector.name} to continue setup or cleanup.`,
         ],
-        examples: [`gws-ea connectors ${command} ${connector.name}`],
+        examples:
+          connector.name === 'web' && command === 'install'
+            ? [
+                'gws-ea connectors install web --account ACCOUNT_ID --team TEAM_NAME --zone ZONE_ID',
+                'gws-ea connectors install web --account ACCOUNT_ID --team TEAM_NAME --zone ZONE_ID --credential-file ~/.config/gws-ea/cloudflare-api-token --no-input',
+                'gws-ea connectors install web',
+              ]
+            : [`gws-ea connectors ${command} ${connector.name}`],
         outputModes: managedModes,
         resultSchema: managedResultSchema(
           command === 'show' || command === 'check' ? CONNECTOR_OBSERVATION_SCHEMA : CONNECTOR_OPERATION_SCHEMA,

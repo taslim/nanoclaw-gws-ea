@@ -174,7 +174,10 @@ function cloudflareFixture(zoneApex = 'example.test') {
           throw new Error('PUT response lost');
         }
       }
-      return reply({ config: { ingress } });
+      // Cloudflare can return the same routes with a different JSON field order.
+      return reply({
+        config: { ingress: ingress.map((route) => Object.fromEntries(Object.entries(route).reverse())) },
+      });
     }
     const record = /^\/zones\/([^/]+)\/dns_records(?:\/([^/]+))?$/u.exec(resource);
     if (record) {
@@ -290,6 +293,88 @@ async function provisionFixture(zoneApex = 'example.test') {
 }
 
 describe('web operator capability', () => {
+  it('validates a terminal token before saving it in an owner-only managed file and reuses it on later installs', async () => {
+    const f = await fixture();
+    const api = cloudflareFixture();
+    const secret = 'terminal-management-fixture';
+    const readManagementToken = vi.fn(async () => ` ${secret}\n`);
+    const options = { accountId: 'account', teamName: 'team', zoneId: 'zone', cloudflaredPath: '/usr/bin/true' };
+    const dependencies = { fetch: api.transport, readManagementToken };
+    expect(await installWebConnector(f.paths, options, dependencies)).toMatchObject({ installed: true });
+    const config = await readWebOperatorConfig(webOperatorFiles(f.paths).configFile);
+    if (!config) throw new Error('Missing web operator configuration');
+    expect(await readFile(config.credentialFile, 'utf8')).toBe(secret);
+    expect((await stat(config.credentialFile)).mode & 0o777).toBe(0o600);
+    expect(JSON.stringify(config)).not.toContain(secret);
+    expect(readManagementToken).toHaveBeenCalledOnce();
+    await installWebConnector(f.paths, {}, dependencies);
+    expect(readManagementToken).toHaveBeenCalledOnce();
+  });
+
+  it.each(['', 'token with whitespace'])('does not save an invalid entered token (%j)', async (secret) => {
+    const f = await fixture();
+    const api = cloudflareFixture();
+    await expect(
+      installWebConnector(
+        f.paths,
+        { accountId: 'account', teamName: 'team', zoneId: 'zone' },
+        { fetch: api.transport, readManagementToken: async () => secret },
+      ),
+    ).rejects.toMatchObject({ code: 'web_credential_invalid' });
+    expect(api.requests).toEqual([]);
+    expect(await readWebOperatorConfig(webOperatorFiles(f.paths).configFile)).toBeUndefined();
+    await expect(readFile(path.join(webOperatorFiles(f.paths).root, 'management-token'))).rejects.toMatchObject({
+      code: 'ENOENT',
+    });
+  });
+
+  it('does not save a terminal token when Cloudflare rejects its coordinates', async () => {
+    const f = await fixture();
+    const api = cloudflareFixture();
+    await expect(
+      installWebConnector(
+        f.paths,
+        { accountId: 'account', teamName: 'wrong', zoneId: 'zone' },
+        { fetch: api.transport, readManagementToken: async () => 'terminal-rejected-fixture' },
+      ),
+    ).rejects.toMatchObject({ code: 'web_team_invalid' });
+    expect(await readWebOperatorConfig(webOperatorFiles(f.paths).configFile)).toBeUndefined();
+    await expect(readFile(path.join(webOperatorFiles(f.paths).root, 'management-token'))).rejects.toMatchObject({
+      code: 'ENOENT',
+    });
+  });
+
+  it('does not ask for a token before the required coordinates are supplied', async () => {
+    const f = await fixture();
+    const readManagementToken = vi.fn(async () => 'unrequested-management-fixture');
+    await expect(installWebConnector(f.paths, {}, { readManagementToken })).rejects.toMatchObject({
+      code: 'web_operator_required',
+    });
+    expect(readManagementToken).not.toHaveBeenCalled();
+  });
+
+  it('cancels token entry without contacting Cloudflare or saving a credential', async () => {
+    const f = await fixture();
+    const api = cloudflareFixture();
+    await expect(
+      installWebConnector(
+        f.paths,
+        { accountId: 'account', teamName: 'team', zoneId: 'zone' },
+        {
+          fetch: api.transport,
+          readManagementToken: async () => {
+            throw new GwsEaError('cancelled', 'Web installation cancelled.');
+          },
+        },
+      ),
+    ).rejects.toMatchObject({ code: 'cancelled' });
+    expect(api.requests).toEqual([]);
+    expect(await readWebOperatorConfig(webOperatorFiles(f.paths).configFile)).toBeUndefined();
+    await expect(readFile(path.join(webOperatorFiles(f.paths).root, 'management-token'))).rejects.toMatchObject({
+      code: 'ENOENT',
+    });
+  });
+
   it('reuses an explicitly typed operator PIN without claiming ownership', async () => {
     const f = await provisionFixture();
     f.api.idps.push({ id: 'operator-pin', type: 'onetimepin' });

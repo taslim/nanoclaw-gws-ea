@@ -326,7 +326,7 @@ export async function uninstallWebConnector(
         reason: null,
         receipt_file: null,
         operator_actions: [
-          `Revoke the Cloudflare management API token for account ${receipt.shared.ownership.accountId}, then delete the original operator credential file supplied with --credential-file. gws-ea removed its stored credential copy.`,
+          `Revoke the Cloudflare management API token for account ${receipt.shared.ownership.accountId}, then delete any original operator credential file supplied with --credential-file. gws-ea removed its stored credential copy.`,
         ],
       };
     });

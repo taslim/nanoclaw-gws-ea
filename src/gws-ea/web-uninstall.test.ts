@@ -125,7 +125,7 @@ async function fixture(assistantCount = 2, ownedPin = true) {
     ...Object.values(config.dns).map((dns): [string, unknown] => [`/zones/zone/dns_records/${dns.id}`, { id: dns.id }]),
     ['/accounts/account/access/identity_providers/pin', { id: 'pin', type: 'onetimepin' }],
   ]);
-  let ingress: { config: { ingress: readonly unknown[] } } = {
+  let ingress: { config: { ingress: readonly Record<string, unknown>[] } } = {
     config: {
       ingress: [...Object.values(assistants).map(({ claim }) => webIngress(claim)), { service: 'http_status:404' }],
     },
@@ -143,7 +143,15 @@ async function fixture(assistantCount = 2, ownedPin = true) {
     }
     if (resource.endsWith('/configurations')) {
       if (method === 'PUT') ingress = JSON.parse(String(options?.body)) as typeof ingress;
-      return Response.json({ success: true, result: ingress });
+      // Match Cloudflare's reserialization without changing route order or values.
+      return Response.json({
+        success: true,
+        result: {
+          config: {
+            ingress: ingress.config.ingress.map((route) => Object.fromEntries(Object.entries(route).reverse())),
+          },
+        },
+      });
     }
     if (method === 'DELETE') {
       if (resource === failDelete) return Response.json({ success: false }, { status: 403 });
