@@ -7,15 +7,22 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { SqliteDriver } from '../../db/drivers/sqlite.js';
 import { heldCredentialSites, SiteLeaseStore } from './leases.js';
-import { browserCredentialAttemptsMigration, browserSiteLeasesMigration } from './migration.js';
+import { browserSiteLeasesMigration } from './migration.js';
+import { CredentialAttempts } from './credential-attempts.js';
+import * as loginStores from './login-store.js';
+import { testLoginStore } from './testing/login-store.js';
 
 let root: string;
 let db: SqliteDriver;
 let leases: SiteLeaseStore;
+let attempts: CredentialAttempts;
 beforeEach(async () => {
   root = await mkdtemp(path.join(os.tmpdir(), 'browser-leases-'));
   db = new SqliteDriver(new Database(path.join(root, 'leases.db')));
   await browserSiteLeasesMigration.up(db);
+  const fixture = testLoginStore(path.join(root, 'browser'));
+  vi.spyOn(loginStores, 'getLoginStore').mockResolvedValue(fixture.store);
+  attempts = new CredentialAttempts({ store: fixture.store });
   leases = new SiteLeaseStore(db);
 });
 afterEach(async () => {
@@ -132,25 +139,50 @@ describe('persistent browser site leases', () => {
   );
 
   describe('while a credential change on a site is unresolved', () => {
-    const attempt = async (id: string, jobId: string, site: string, phase: string): Promise<void> => {
-      const at = new Date().toISOString();
-      await db.run(
-        `INSERT INTO gws_ea_browser_credential_attempts(id,kind,job_id,origin,site,username,phase,created_at,updated_at,exposed_at)
-         VALUES(?,'signup',?,?,?,'morgan.ellery@example.com',?,?,?,?)`,
-        id,
-        jobId,
-        `https://accounts.${site}`,
-        site,
-        phase,
-        at,
-        at,
-        at,
-      );
+    const ids = new Map<string, string>();
+    const attempt = async (label: string, jobId: string, site: string, phase: string): Promise<void> => {
+      const origin = `https://accounts.${site}`;
+      const result = await attempts.prepareSignup({ jobId, origin, username: `${label}@example.test` });
+      if (result.status !== 'prepared') throw new Error(result.status);
+      const id = result.attempt.id;
+      ids.set(label, id);
+      if (phase === 'rejected') await attempts.abandon(id);
+      else if (phase !== 'saved') {
+        await attempts.disclose(id, { jobId, origin });
+        if (phase === 'awaiting_verification') await attempts.markAwaitingVerification(id);
+        else if (phase === 'unknown') await attempts.markUnknown(id);
+        else if (phase === 'finalized') await attempts.confirm(id, { signal: 'account_page' });
+      }
     };
-    const move = (id: string, phase: string) =>
-      db.run('UPDATE gws_ea_browser_credential_attempts SET phase = ? WHERE id = ?', phase, id);
-    beforeEach(async () => {
-      await browserCredentialAttemptsMigration.up(db);
+    const move = async (label: string): Promise<void> => {
+      const id = ids.get(label);
+      if (!id) throw new Error('Missing attempt');
+      await attempts.markRejected(id);
+    };
+
+    it.each(['exposed', 'awaiting_verification', 'unknown'])(
+      'blocks a new errand after rollback removed the lease for a %s attempt',
+      async (phase) => {
+        await attempt('held', 'first', 'shop.example', phase);
+        expect(await leases.acquire('second', 'https://shop.example/')).toMatchObject({ acquired: false });
+        expect(await db.all('SELECT * FROM gws_ea_browser_site_leases')).toEqual([]);
+      },
+    );
+
+    it('blocks a conflicting restored lease until the local attempt settles', async () => {
+      await leases.acquire('second', 'https://shop.example/');
+      await attempt('held', 'first', 'shop.example', 'unknown');
+      expect(await leases.acquire('second', 'https://shop.example/')).toMatchObject({ acquired: false });
+      await move('held');
+      expect(await leases.acquire('second', 'https://shop.example/')).toMatchObject({ acquired: true });
+    });
+
+    it('wakes waiters when an orphan settles without a surviving lease', async () => {
+      await attempt('held', 'first', 'shop.example', 'unknown');
+      expect(await leases.acquire('second', 'https://shop.example/')).toMatchObject({ acquired: false });
+      await move('held');
+      expect(await leases.release('first', 'shop.example')).toEqual(['second']);
+      expect(await leases.acquire('second', 'https://shop.example/')).toMatchObject({ acquired: true });
     });
 
     it.each(['exposed', 'awaiting_verification', 'unknown'])(
@@ -166,7 +198,7 @@ describe('persistent browser site leases', () => {
         expect(await db.all('SELECT site, job_id FROM gws_ea_browser_site_leases')).toEqual([
           { site: 'shop.example', job_id: 'first' },
         ]);
-        expect(await heldCredentialSites(db, 'first')).toEqual(new Set(['shop.example']));
+        expect(await heldCredentialSites('first')).toEqual(new Set(['shop.example']));
         expect(await leases.acquire('second', 'https://news.example/')).toMatchObject({ acquired: true });
         // The holding job itself keeps using its own site.
         expect(await leases.acquire('first', 'https://accounts.shop.example/settings')).toMatchObject({
@@ -178,7 +210,7 @@ describe('persistent browser site leases', () => {
     it.each(['saved', 'rejected', 'finalized'])('holds nothing for an attempt that is %s', async (phase) => {
       await leases.acquire('first', 'https://accounts.shop.example/');
       await attempt('settled', 'first', 'shop.example', phase);
-      expect(await heldCredentialSites(db, 'first')).toEqual(new Set());
+      expect(await heldCredentialSites('first')).toEqual(new Set());
       expect(await leases.release('first')).toEqual([]);
       expect(await db.all('SELECT * FROM gws_ea_browser_site_leases')).toEqual([]);
     });
@@ -188,7 +220,7 @@ describe('persistent browser site leases', () => {
       await attempt('held', 'first', 'shop.example', 'unknown');
       expect(await leases.acquire('second', 'https://shop.example/')).toMatchObject({ acquired: false });
       expect(await leases.release('first', 'shop.example')).toEqual([]);
-      await move('held', 'rejected');
+      await move('held');
       expect(await leases.release('first', 'shop.example')).toEqual(['second']);
       expect(await leases.acquire('second', 'https://shop.example/')).toMatchObject({ acquired: true });
     });

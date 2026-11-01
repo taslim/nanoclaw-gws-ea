@@ -1,3 +1,9 @@
+import { closeDb, getDb, initSqliteTestDb } from '../../db/connection.js';
+import Database from 'better-sqlite3';
+import { SqliteDriver } from '../../db/drivers/sqlite.js';
+import { BrowserStore } from './db.js';
+import { browserSiteLeasesMigration } from './migration.js';
+import { SiteLeaseStore } from './leases.js';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import type { Page } from 'playwright-core';
 import {
@@ -27,6 +33,7 @@ const SECRET = 'fixture-secret-must-stay-host-only';
 let directory: string;
 let storeFixture: ReturnType<typeof testLoginStore>;
 beforeEach(async () => {
+  await browserSiteLeasesMigration.up(await initSqliteTestDb());
   directory = await mkdtemp(path.join(os.tmpdir(), 'fill-store-'));
   storeFixture = testLoginStore(path.join(directory, 'browser'));
   vi.spyOn(loginStoreModule, 'getLoginStore').mockResolvedValue(storeFixture.store);
@@ -35,6 +42,7 @@ beforeEach(async () => {
   vi.stubEnv('GWS_EA_BROWSER_ROOT', 'unconfigured-browser-root');
 });
 afterEach(async () => {
+  await closeDb();
   await rm(directory, { recursive: true, force: true });
   vi.unstubAllEnvs();
   vi.restoreAllMocks();
@@ -127,7 +135,10 @@ function fixture(origin = 'https://www.shop.example') {
     remaining: () => 10_000,
     runtime: { closeJob: vi.fn(async () => undefined) },
     job: { id: 'job' },
-    store: { db: {} },
+    kind: 'request',
+    request: { id: 'fixture-sign-in' },
+    wakeWaiters: vi.fn(async () => undefined),
+    store: new BrowserStore(getDb()),
   } as unknown as BrowserExecutionContext;
   // These tests double the external renderer boundary. Native node identity,
   // prototype isolation and submission are exercised in the real Chrome suite.
@@ -255,6 +266,25 @@ it('judges iframe origins and refuses HTTP and card targets before any resolver 
   await expect(bindBrowserSecretField(f.page, f.target, f.submit, 'password')).rejects.toMatchObject({
     code: 'forbidden',
   });
+});
+
+it('refuses a held iframe site before resolving any secret after its central lease disappeared', async () => {
+  const result = await credentialAttempts.prepareSignup({
+    jobId: 'another-job',
+    origin: 'https://identity.example',
+    username: 'soren_handle',
+  });
+  if (result.status !== 'prepared') throw new Error(result.status);
+  await credentialAttempts.disclose(result.attempt.id, { jobId: 'another-job', origin: 'https://identity.example' });
+  const f = fixture('https://identity.example');
+  f.page.url = () => 'https://shop.example/login';
+  const binding = await bindBrowserSecretField(f.page, f.target, f.submit, 'password');
+  const resolve = vi.fn(async () => SECRET);
+  const reads = storeFixture.keyReads();
+  expect(await fillBoundBrowserSecret(f.context, binding, resolve)).toEqual({ status: 'site_busy' });
+  expect(resolve).not.toHaveBeenCalled();
+  expect(f.nativeFill).not.toHaveBeenCalled();
+  expect(storeFixture.keyReads()).toBe(reads);
 });
 
 it('detects a changed target value and clears every field holding the value, including copied values', async () => {
@@ -431,3 +461,40 @@ vi.mock('./control-facts.js', async (original) => ({
   ...(await original<typeof import('./control-facts.js')>()),
   readPageSecretValues: vi.fn(async () => []),
 }));
+
+it('leases the iframe login site before resolving its secret so another errand waits', async () => {
+  const db = new SqliteDriver(new Database(':memory:'));
+  await browserSiteLeasesMigration.up(db);
+  try {
+    const f = fixture('https://identity.example');
+    f.page.url = () => 'https://shop.example/login';
+    const binding = await bindBrowserSecretField(f.page, f.target, f.submit, 'password');
+    const prepared = await credentialAttempts.prepareSignup({
+      jobId: 'another-job',
+      origin: binding.origin,
+      username: 'soren_handle',
+    });
+    if (prepared.status !== 'prepared') throw new Error(prepared.status);
+    let otherAcquired = false;
+    const context: BrowserExecutionContext = {
+      ...f.context,
+      kind: 'request',
+      request: { id: 'iframe-sign-in' },
+      store: new BrowserStore(db),
+      wakeWaiters: async () => undefined,
+    };
+    expect(
+      await fillBoundBrowserSecret(context, binding, async () => {
+        const lease = await new SiteLeaseStore(db).acquire('another-job', binding.origin);
+        otherAcquired = lease.acquired;
+        if (lease.acquired)
+          await credentialAttempts.disclose(prepared.attempt.id, { jobId: 'another-job', origin: binding.origin });
+        return SECRET;
+      }),
+    ).toEqual({ status: 'cleared_after_submit' });
+    expect(otherAcquired).toBe(false);
+    expect(await credentialAttempts.get(prepared.attempt.id)).toMatchObject({ phase: 'saved' });
+  } finally {
+    await db.close();
+  }
+});

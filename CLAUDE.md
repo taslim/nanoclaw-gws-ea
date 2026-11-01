@@ -257,8 +257,8 @@ site, username and title stay readable in the owner-only file (0600, directory
 filled. Any process running as the same macOS user can read the key with
 `/usr/bin/security`: encryption protects copies of the store file, not access
 by that user. NanoClaw provides no backup or export and stores no one-time codes.
-Updates and rollbacks preserve this file; releases that predate the built-in
-store cannot read it.
+Updates and rollbacks preserve logins, ownership and unsettled attempts together
+in this file; releases that predate the built-in store cannot read it.
 
 A signup or password change durably saves the generated password before any site
 sees it. The [operator guide](docs/gws-ea-cli.md#saved-logins) defines account

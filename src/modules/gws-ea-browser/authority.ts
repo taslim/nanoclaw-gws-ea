@@ -652,7 +652,7 @@ export class PurchaseAuthorityStore {
       jobId,
     );
     // An unresolved credential attempt keeps a requested cancellation waiting too.
-    if (!committing && (await heldCredentialSites(this.db, jobId)).size === 0)
+    if (!committing && (await heldCredentialSites(jobId)).size === 0)
       await this.db.run(
         'UPDATE gws_ea_browser_jobs SET cancelled = CASE WHEN cancel_requested = 1 THEN 1 ELSE cancelled END,updated_at = ? WHERE id = ?',
         at,

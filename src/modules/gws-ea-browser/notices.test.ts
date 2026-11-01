@@ -1,3 +1,5 @@
+import * as loginStores from './login-store.js';
+import { testLoginStore } from './testing/login-store.js';
 import { deliverWatchNotices } from './watch-state.js';
 import { createBrowserQueue } from './index.js';
 import fs from 'node:fs';
@@ -29,6 +31,7 @@ import { notifyPurchaseOutcome } from './authority.js';
 import { notifyPurchaseCard } from './cards.js';
 
 beforeEach(async () => {
+  vi.spyOn(loginStores, 'getLoginStore').mockResolvedValue(testLoginStore(`${root}/browser`).store);
   fs.rmSync(root, { recursive: true, force: true });
   await runMigrations(await initTestDb());
   for (const id of ['notice-main', 'notice-browser'])
@@ -40,6 +43,7 @@ beforeEach(async () => {
   );
 });
 afterEach(async () => {
+  vi.restoreAllMocks();
   await closeDb();
   fs.rmSync(root, { recursive: true, force: true });
 });

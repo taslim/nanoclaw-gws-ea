@@ -11,6 +11,7 @@ import type { ElementHandle, Frame, Page } from 'playwright-core';
 
 import { ActionRefusal, answeredGuard, answeringAction, forbidden, invalidArgs } from '../../cli/delivery-action.js';
 import { getDb } from '../../db/connection.js';
+import { getSession } from '../../db/sessions.js';
 import { registerDeliveryAction } from '../../delivery.js';
 import { isRecord } from '../../gws-ea/validation.js';
 import type { Session } from '../../types.js';
@@ -18,7 +19,7 @@ import { DENY, HOLD, defineGuardedAction, guard, type GuardActor } from '../../g
 import { registerApprovalHandler, requestApproval } from '../approvals/index.js';
 import type { ApprovalHandlerContext } from '../approvals/primitive.js';
 import { isVerifiedPrincipalUser, principalApproverUserId } from '../gws-ea-profile/db.js';
-import { hasBrowserAccess } from './access.js';
+import { errandSource, hasBrowserAccess, isMainAgentGroup } from './access.js';
 import {
   credentialFieldFits,
   httpsOrigin,
@@ -38,25 +39,33 @@ import {
   type NativeDocumentField,
   type NativeFieldFacts,
 } from './authentication-submit.js';
-import { browserDelegateGuard, finishRequestedCancellation, resolveBrowserJob } from './cancel.js';
+import {
+  browserDelegateGuard,
+  browserManagementGuard,
+  finishRequestedCancellation,
+  resolveBrowserJob,
+} from './cancel.js';
 import { BrowserSiteBusyError, ensureBrowserNavigationGuard, withBrowserJobNavigation } from './commit-classifier.js';
 import { consentStopsForAgent, runConsentPass } from './consent.js';
-import type { BrowserRequest } from './db.js';
+import { BrowserStore, type BrowserRequest } from './db.js';
 import {
-  CredentialAttemptError,
-  RELEASABLE_PHASES,
   credentialAttempts,
   line,
   MAX_USERNAME,
   type DisclosedCredential,
-  type CredentialAttempt,
-  type CredentialAttemptPhase,
   type CredentialAttempts,
-  type CredentialEvidence,
   type CredentialReleaseResult,
 } from './credential-attempts.js';
+import {
+  CredentialAttemptError,
+  RELEASABLE_PHASES,
+  HELD_CREDENTIAL_PHASES,
+  type CredentialAttempt,
+  type CredentialAttemptPhase,
+  type CredentialEvidence,
+} from './credential-types.js';
 import { assertBrowserSecretDiagnosticsSafe, settleFilledSecrets } from './fill.js';
-import { HELD_CREDENTIAL_PHASES, SiteLeaseStore } from './leases.js';
+import { SiteLeaseStore } from './leases.js';
 import {
   BrowserRefError,
   disposeBrowserRefs,
@@ -85,6 +94,7 @@ import {
   credentialReleaseRejected,
   releaseQuestion,
   parsedEvidence,
+  orphanCredentialNotice,
 } from './credential-wording.js';
 
 export interface CredentialOperationDependencies {
@@ -231,6 +241,25 @@ const agentActor = (session: Session): GuardActor => ({
  * decision, as an inconclusive purchase does: the delegator asks, and the
  * principal confirms on their own card, knowing what may have happened.
  */
+async function credentialJobAvailable(attempt: CredentialAttempt): Promise<boolean> {
+  const job = await new BrowserStore().getJob(attempt.job_id);
+  const session = job && (await getSession(job.browser_session_id));
+  const source = errandSource(attempt.job_id);
+  return Boolean(
+    job &&
+    !job.cancelled &&
+    session?.status === 'active' &&
+    session.thread_id === attempt.job_id &&
+    source &&
+    (await hasBrowserAccess(source)),
+  );
+}
+
+async function mayReleaseCredential(caller: string, attempt: CredentialAttempt): Promise<boolean> {
+  if (errandSource(attempt.job_id) === caller) return true;
+  return (await isMainAgentGroup(caller)) && !(await credentialJobAvailable(attempt));
+}
+
 export const credentialReleaseGuard = defineGuardedAction({
   action: 'gws_ea_browser.credential_release',
   grantActionName: CREDENTIAL_RELEASE_APPROVAL,
@@ -241,6 +270,8 @@ export const credentialReleaseGuard = defineGuardedAction({
     const attempt = typeof payload.attemptId === 'string' ? await credentialAttempts.get(payload.attemptId) : undefined;
     if (!attempt || attempt.job_id !== payload.jobId || !RELEASABLE_PHASES.includes(attempt.phase))
       return DENY(credentialAuthorityMessage('settled'));
+    if (!(await mayReleaseCredential(actor.agentGroupId, attempt)))
+      return DENY(credentialAuthorityMessage('jobRequired'));
     const principal = await principalApproverUserId();
     return principal
       ? HOLD(credentialAuthorityMessage('principalDecision'), principal)
@@ -263,14 +294,10 @@ async function credentialReleaseRequest(
     content.username !== undefined
   )
     throw invalidArgs(credentialAuthorityMessage('releaseFields'));
-  const job = await resolveBrowserJob(thread, undefined, session.agent_group_id);
-  if (!job) throw forbidden(credentialAuthorityMessage('jobRequired'));
-  const found = await attempts.get(authority);
-  if (!found || found.job_id !== job.id || !RELEASABLE_PHASES.includes(found.phase))
+  const attempt = await attempts.get(authority);
+  if (!attempt || attempt.job_id !== thread || !RELEASABLE_PHASES.includes(attempt.phase))
     return { status: 'not_releasable' };
-  const attempt = await attempts.get(found.id);
-  if (!attempt || !RELEASABLE_PHASES.includes(attempt.phase)) return { status: 'not_releasable' };
-  const payload = { attemptId: attempt.id, jobId: job.id };
+  const payload = { attemptId: attempt.id, jobId: attempt.job_id };
   const decision = await guard(credentialReleaseGuard, { actor: agentActor(session), payload });
   if (decision.effect !== 'hold') throw forbidden(decision.reason);
   const open = await getDb().get<{ present: number }>(
@@ -333,7 +360,8 @@ async function applyCredentialRelease(
   }
   let current = typeof payload.attemptId === 'string' ? await attempts.get(payload.attemptId) : undefined;
   const from = current && releasedFrom(current, approval.approval_id);
-  if (!current || !from) {
+  const finalized = current?.phase === 'finalized' && current.job_id === payload.jobId;
+  if (!finalized && (!current || !from)) {
     const decision = await guard(credentialReleaseGuard, { actor: agentActor(session), payload, grant: approval });
     if (decision.effect !== 'allow' || !current) {
       await notify(credentialReleaseRefused(decision.reason));
@@ -349,7 +377,7 @@ async function applyCredentialRelease(
     }
     current = result.attempt;
   }
-  await attempts.retirePending([current]);
+  if (!current) return;
   watchedResponses.delete(current.id);
   await finishSignupVerification(current.id);
   await freeSite(queue, current, `credential-release-${current.id}`);
@@ -357,6 +385,13 @@ async function applyCredentialRelease(
     current.phase === 'finalized' ? credentialAuthorityMessage('settledFirst') : credentialReleased(current),
   );
 }
+
+const credentialAuthorityGuard = defineGuardedAction({
+  action: 'gws_ea_browser.credential_authority',
+  decide(input) {
+    return guard(input.payload.operation === 'release' ? browserManagementGuard : browserDelegateGuard, input);
+  },
+});
 
 export function registerCredentialAuthorityDelivery(
   queue: () => BrowserQueue,
@@ -367,7 +402,7 @@ export function registerCredentialAuthorityDelivery(
     answeringAction('credential_authority', (content, session) =>
       credentialAuthorityRequest(content, session, { ...dependencies, queue }),
     ),
-    answeredGuard(browserDelegateGuard),
+    answeredGuard(credentialAuthorityGuard),
   );
   // Releasing is idempotent and re-checked live, so an approved row resumes safely after a restart.
   registerApprovalHandler(
@@ -1473,8 +1508,9 @@ export async function recoverCredentialRequest(
   const payload: unknown = JSON.parse(request.payload_json);
   const authority = isRecord(payload) && typeof payload.authority === 'string' ? payload.authority : undefined;
   const attempt = authority === undefined ? undefined : await attempts.get(authority);
-  if (!attempt || attempt.job_id !== request.job_id || attempt.exposed_at === null || request.started_at === null)
-    return undefined;
+  if (!attempt || attempt.job_id !== request.job_id) return undefined;
+  if (attempt.phase === 'finalized') return websiteOutcome(attempt.kind);
+  if (attempt.exposed_at === null || request.started_at === null) return undefined;
   // Only this request's own disclosure: an attempt another step disclosed keeps its state.
   if (attempt.exposed_at < request.started_at) return undefined;
   switch (attempt.phase) {
@@ -1484,8 +1520,6 @@ export async function recoverCredentialRequest(
       return { status: 'outcome_unknown' };
     case 'unknown':
       return { status: 'outcome_unknown' };
-    case 'finalized':
-      return websiteOutcome(attempt.kind);
     default:
       return undefined;
   }
@@ -1493,6 +1527,26 @@ export async function recoverCredentialRequest(
 
 export async function recoverCredentialAttempts(attempts: CredentialAttempts = credentialAttempts): Promise<void> {
   await attempts.recover();
+  for (const attempt of await attempts.unresolved()) {
+    if (attempt.phase === 'saved' && !(await credentialJobAvailable(attempt)))
+      await settle(() => attempts.abandon(attempt.id));
+  }
+  await notifyOrphanCredentialAttempts(attempts);
+}
+
+/** The current mailbox deduplicates notices; a rollback that lost one must receive it again. */
+export async function notifyOrphanCredentialAttempts(attempts: CredentialAttempts = credentialAttempts): Promise<void> {
+  for (const attempt of await attempts.unresolved()) {
+    if (!HELD_CREDENTIAL_PHASES.some((phase) => phase === attempt.phase) || (await credentialJobAvailable(attempt)))
+      continue;
+    const { writeNoteForMain } = await import('../gws-ea-profile/main-note.js');
+    await writeNoteForMain({
+      id: `browser-orphan-credential-${attempt.id}`,
+      timestamp: attempt.updated_at,
+      wake: true,
+      text: orphanCredentialNotice(attempt),
+    });
+  }
 }
 
 export const credentialFormAction: BrowserQueuedAction = {

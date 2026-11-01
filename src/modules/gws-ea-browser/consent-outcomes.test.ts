@@ -4,7 +4,7 @@ import { SqliteDriver } from '../../db/drivers/sqlite.js';
 import {
   browserConsentMigration,
   browserConsentOutcomesMigration,
-  browserCredentialAttemptsMigration,
+  browserRetiredCredentialsMigration,
 } from './migration.js';
 
 it('recovers consent notices alongside the native credential attempts schema', async () => {
@@ -14,7 +14,7 @@ it('recovers consent notices alongside the native credential attempts schema', a
       "CREATE TABLE gws_ea_browser_jobs (id TEXT PRIMARY KEY); INSERT INTO gws_ea_browser_jobs(id) VALUES('job')",
     );
     await browserConsentMigration.up(db);
-    await browserCredentialAttemptsMigration.up(db);
+    await browserRetiredCredentialsMigration.up(db);
     const at = '2026-10-20T12:00:00.000Z';
     for (const [id, status] of [
       ['prior', 'approved'],

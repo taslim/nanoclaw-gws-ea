@@ -14,15 +14,26 @@ import { hasControlCharacters } from '../../gws-ea/validation.js';
 import { httpsOrigin } from './authentication-signatures.js';
 import { LoginKey } from './login-key.js';
 import { browserPaths, ensurePrivateDirectory } from './paths.js';
+import {
+  CredentialAttemptError,
+  RELEASABLE_PHASES,
+  HELD_CREDENTIAL_PHASES,
+  credentialEvidenceJson,
+  type CredentialAttempt,
+  type CredentialAttemptPhase,
+  type CredentialEvidence,
+} from './credential-types.js';
 
-export type LoginStoreReason = 'vault_unavailable' | 'no_item_for_site' | 'origin_mismatch' | 'pending_missing';
+export type LoginStoreReason = 'vault_unavailable' | 'no_item_for_site' | 'origin_mismatch';
 export class LoginStoreError extends Error {
   constructor(readonly reason: LoginStoreReason) {
     super(reason);
   }
 }
 export class LoginDetailsError extends Error {
-  constructor(readonly reason: 'invalid_site' | 'invalid_details' | 'duplicate_login' | 'login_changed') {
+  constructor(
+    readonly reason: 'invalid_site' | 'invalid_details' | 'duplicate_login' | 'login_changed' | 'login_busy',
+  ) {
     super(reason);
   }
 }
@@ -43,9 +54,6 @@ export interface LoginDetails {
   readonly password: string;
 }
 export type LoginChanges = Partial<Omit<LoginDetails, 'password'>> & Pick<LoginDetails, 'password'>;
-export type PendingConfirmation =
-  | { readonly kind: 'signup'; readonly details: Omit<LoginDetails, 'password'> }
-  | { readonly kind: 'rotation'; readonly loginId: string; readonly version: number };
 export type LoginStoreAvailability =
   | { readonly available: true }
   | { readonly available: false; readonly reason: 'key_missing' | 'key_mismatch' | 'keychain_unavailable' };
@@ -57,15 +65,31 @@ export interface LoginStoreOptions {
 
 const CHECK = Buffer.from('gws-ea-logins-key-check:v1', 'utf8');
 const COLUMNS = 'id, hostname, domain, username, title, version, created_at AS createdAt, updated_at AS updatedAt';
+const ATTEMPT_COLUMNS =
+  'id, kind, job_id, origin, site, username, source_login_id, source_version, phase, evidence_json, owned_login_id, created_at, updated_at, exposed_at, finalized_at';
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS logins (
   id TEXT PRIMARY KEY, hostname TEXT NOT NULL, domain TEXT NOT NULL, username TEXT NOT NULL,
   title TEXT NOT NULL, password BLOB NOT NULL CHECK(length(password) >= 28), version INTEGER NOT NULL CHECK(version > 0),
   created_at TEXT NOT NULL, updated_at TEXT NOT NULL, UNIQUE(domain, username)
 ) STRICT;
-CREATE TABLE IF NOT EXISTS pending (
-  attempt_id TEXT PRIMARY KEY, password BLOB NOT NULL CHECK(length(password) >= 28)
+CREATE TABLE IF NOT EXISTS attempts (
+  id TEXT PRIMARY KEY, kind TEXT NOT NULL CHECK(kind IN ('signup','rotation')),
+  job_id TEXT NOT NULL, origin TEXT NOT NULL, site TEXT NOT NULL, username TEXT NOT NULL,
+  source_login_id TEXT, source_version INTEGER,
+  phase TEXT NOT NULL CHECK(phase IN ('saved','exposed','awaiting_verification','unknown','finalized','rejected')),
+  password BLOB, evidence_json TEXT, owned_login_id TEXT,
+  created_at TEXT NOT NULL, updated_at TEXT NOT NULL, exposed_at TEXT, finalized_at TEXT,
+  CHECK((kind = 'rotation') = (source_login_id IS NOT NULL)),
+  CHECK((source_login_id IS NULL) = (source_version IS NULL)),
+  CHECK(owned_login_id IS NULL OR phase = 'finalized'),
+  CHECK(CASE WHEN phase IN ('rejected','finalized') THEN password IS NULL
+    ELSE password IS NOT NULL AND length(password) >= 28 END)
 ) STRICT;
+CREATE UNIQUE INDEX IF NOT EXISTS open_rotation ON attempts(source_login_id)
+  WHERE source_login_id IS NOT NULL AND phase NOT IN ('rejected','finalized');
+CREATE INDEX IF NOT EXISTS signup_ownership ON attempts(site,username)
+  WHERE kind = 'signup' AND phase = 'finalized';
 CREATE TABLE IF NOT EXISTS meta (
   id INTEGER PRIMARY KEY CHECK(id = 1), key_check BLOB NOT NULL
 ) STRICT;`;
@@ -93,11 +117,6 @@ function passwordValid(password: string): void {
 function versionValid(version: number): void {
   if (!Number.isSafeInteger(version) || version < 1) throw new LoginDetailsError('login_changed');
 }
-function attemptValid(attemptId: string): void {
-  if (!attemptId || attemptId.length > 200 || hasControlCharacters(attemptId))
-    throw new LoginDetailsError('invalid_details');
-}
-
 /** A direct, host-only file: only passwords are encrypted; every metadata read is independent of Keychain. */
 export class LoginStore {
   private readonly file: string;
@@ -149,7 +168,12 @@ export class LoginStore {
         db.close();
       }
     } catch (error) {
-      if (error instanceof LoginStoreError || error instanceof LoginDetailsError) throw error;
+      if (
+        error instanceof LoginStoreError ||
+        error instanceof LoginDetailsError ||
+        error instanceof CredentialAttemptError
+      )
+        throw error;
       throw new LoginStoreError('vault_unavailable');
     } finally {
       release();
@@ -163,7 +187,7 @@ export class LoginStore {
         .prepare<
           [],
           { present: number }
-        >('SELECT EXISTS(SELECT 1 FROM logins UNION ALL SELECT 1 FROM pending) AS present')
+        >('SELECT EXISTS(SELECT 1 FROM logins UNION ALL SELECT 1 FROM attempts WHERE password IS NOT NULL) AS present')
         .get()?.present === 1
     );
   }
@@ -304,17 +328,23 @@ export class LoginStore {
   async create(spec: LoginDetails): Promise<SavedLogin> {
     const metadata = loginMetadata(spec);
     passwordValid(spec.password);
-    return this.use((db) =>
-      this.withKey(db, (key) => {
+    return this.use((db) => {
+      this.editableAttempts(db, null, metadata);
+      return this.withKey(db, (key) => {
         const plaintext = Buffer.from(spec.password, 'utf8');
         try {
           const sealed = this.seal(plaintext, key);
-          return db.transaction(() => this.insert(db, metadata, sealed)).immediate();
+          return db
+            .transaction(() => {
+              this.giveWay(db, null, metadata);
+              return this.insert(db, metadata, sealed);
+            })
+            .immediate();
         } finally {
           plaintext.fill(0);
         }
-      }),
-    );
+      });
+    });
   }
   async update(id: string, version: number, changes: LoginChanges): Promise<SavedLogin> {
     versionValid(version);
@@ -327,6 +357,7 @@ export class LoginStore {
         username: changes.username ?? before.username,
         title: changes.title ?? before.title,
       });
+      this.editableAttempts(db, id, metadata);
       return this.withKey(db, (key) => {
         let plaintext: Buffer | undefined;
         try {
@@ -335,6 +366,7 @@ export class LoginStore {
           return db
             .transaction(() => {
               this.assertDistinct(db, metadata.domain, metadata.username, id);
+              this.giveWay(db, id, metadata);
               const params = [
                 metadata.hostname,
                 metadata.domain,
@@ -365,92 +397,330 @@ export class LoginStore {
   }
   async remove(id: string, version: number): Promise<void> {
     versionValid(version);
-    await this.use((db) => {
-      const login = this.login(db, id);
-      if (login.version !== version) throw new LoginDetailsError('login_changed');
-      if (db.prepare('DELETE FROM logins WHERE id = ? AND version = ?').run(id, version).changes !== 1)
-        throw new LoginDetailsError('login_changed');
-    });
+    await this.use((db) =>
+      db
+        .transaction(() => {
+          const login = this.login(db, id);
+          if (login.version !== version) throw new LoginDetailsError('login_changed');
+          this.giveWay(db, id);
+          if (db.prepare('DELETE FROM logins WHERE id = ? AND version = ?').run(id, version).changes !== 1)
+            throw new LoginDetailsError('login_changed');
+        })
+        .immediate(),
+    );
   }
 
-  async savePending(attemptId: string, password: string): Promise<void> {
-    attemptValid(attemptId);
+  private attempt(db: Database.Database, id: string): CredentialAttempt {
+    const attempt = db
+      .prepare<[string], CredentialAttempt>(`SELECT ${ATTEMPT_COLUMNS} FROM attempts WHERE id = ?`)
+      .get(id);
+    if (!attempt) throw new CredentialAttemptError('not_found');
+    return attempt;
+  }
+  async getAttempt(id: string): Promise<CredentialAttempt | undefined> {
+    return this.use((db) =>
+      db.prepare<[string], CredentialAttempt>(`SELECT ${ATTEMPT_COLUMNS} FROM attempts WHERE id = ?`).get(id),
+    );
+  }
+  async unresolvedAttempts(): Promise<CredentialAttempt[]> {
+    return this.use((db) =>
+      db
+        .prepare<
+          [],
+          CredentialAttempt
+        >(`SELECT ${ATTEMPT_COLUMNS} FROM attempts WHERE phase NOT IN ('rejected','finalized') ORDER BY created_at, id`)
+        .all(),
+    );
+  }
+  async unresolvedAttemptCount(): Promise<number> {
+    return this.use(
+      (db) =>
+        db
+          .prepare<
+            [],
+            { count: number }
+          >("SELECT COUNT(*) AS count FROM attempts WHERE phase NOT IN ('rejected','finalized')")
+          .get()?.count ?? 0,
+    );
+  }
+  async heldSites(jobId: string): Promise<string[]> {
+    return this.use((db) =>
+      db
+        .prepare<string[], { site: string }>(
+          `SELECT site FROM attempts WHERE job_id = ? AND phase IN (${HELD_CREDENTIAL_PHASES.map(() => '?').join(',')}) ORDER BY created_at, id`,
+        )
+        .all(jobId, ...HELD_CREDENTIAL_PHASES)
+        .map(({ site }) => site),
+    );
+  }
+  async siteHeldByOther(jobId: string, site: string): Promise<boolean> {
+    return this.use((db) =>
+      Boolean(
+        db
+          .prepare(
+            `SELECT 1 FROM attempts WHERE job_id <> ? AND site = ? AND phase IN (${HELD_CREDENTIAL_PHASES.map(() => '?').join(',')}) LIMIT 1`,
+          )
+          .get(jobId, site, ...HELD_CREDENTIAL_PHASES),
+      ),
+    );
+  }
+  async hasOwnedSignup(site: string, username: string): Promise<boolean> {
+    return this.use((db) =>
+      Boolean(
+        db
+          .prepare(
+            "SELECT 1 FROM attempts WHERE kind = 'signup' AND phase = 'finalized' AND site = ? AND username = ? LIMIT 1",
+          )
+          .get(site, username),
+      ),
+    );
+  }
+  async saveAttempt(attempt: CredentialAttempt, password: string): Promise<'prepared' | 'busy'> {
     passwordValid(password);
-    await this.use((db) =>
+    return this.use((db) =>
       this.withKey(db, (key) => {
         const plaintext = Buffer.from(password, 'utf8');
         try {
-          if (db.prepare('SELECT 1 FROM pending WHERE attempt_id = ?').get(attemptId))
-            throw new LoginDetailsError('login_changed');
-          db.prepare('INSERT INTO pending (attempt_id, password) VALUES (?, ?)').run(
-            attemptId,
-            this.seal(plaintext, key),
-          );
+          const sealed = this.seal(plaintext, key);
+          return db
+            .transaction(() => {
+              if (attempt.kind === 'rotation') {
+                const login = this.login(db, attempt.source_login_id);
+                if (
+                  login.version !== attempt.source_version ||
+                  login.domain !== attempt.site ||
+                  login.username !== attempt.username
+                )
+                  throw new LoginDetailsError('login_changed');
+                const open = db
+                  .prepare<
+                    [string],
+                    CredentialAttempt
+                  >(`SELECT ${ATTEMPT_COLUMNS} FROM attempts WHERE source_login_id = ? AND phase NOT IN ('rejected','finalized')`)
+                  .get(login.id);
+                if (open) {
+                  if (open.job_id === attempt.job_id || open.phase !== 'saved') return 'busy';
+                  this.move(db, open.id, ['saved'], 'rejected');
+                }
+              }
+              db.prepare(
+                `INSERT INTO attempts (${ATTEMPT_COLUMNS}, password) VALUES (${Array.from({ length: 16 }, () => '?').join(',')})`,
+              ).run(
+                attempt.id,
+                attempt.kind,
+                attempt.job_id,
+                attempt.origin,
+                attempt.site,
+                attempt.username,
+                attempt.source_login_id,
+                attempt.source_version,
+                attempt.phase,
+                attempt.evidence_json,
+                attempt.owned_login_id,
+                attempt.created_at,
+                attempt.updated_at,
+                attempt.exposed_at,
+                attempt.finalized_at,
+                sealed,
+              );
+              return 'prepared';
+            })
+            .immediate();
         } finally {
           plaintext.fill(0);
         }
       }),
     );
   }
-  async pendingIds(): Promise<readonly string[]> {
-    return this.use((db) =>
-      db
-        .prepare<[], { attempt_id: string }>('SELECT attempt_id FROM pending ORDER BY attempt_id')
-        .all()
-        .map((row) => row.attempt_id),
-    );
-  }
-  async hasPending(attemptId: string): Promise<boolean> {
-    return this.use((db) => Boolean(db.prepare('SELECT 1 FROM pending WHERE attempt_id = ?').get(attemptId)));
-  }
-  async disclosePending(attemptId: string): Promise<string> {
-    return this.use((db) => {
-      const row = db
-        .prepare<[string], { password: Buffer }>('SELECT password FROM pending WHERE attempt_id = ?')
-        .get(attemptId);
-      if (!row) throw new LoginStoreError('pending_missing');
+  async exposeAttempt(
+    id: string,
+    assertActive: () => Promise<void>,
+  ): Promise<
+    { status: 'exposed'; password: string; currentPassword?: string } | { status: 'not_saved' | 'source_changed' }
+  > {
+    const credential = await this.use(async (db) => {
+      const attempt = this.attempt(db, id);
+      if (attempt.phase !== 'saved') return { status: 'not_saved' as const };
+      if (attempt.kind === 'rotation' && this.login(db, attempt.source_login_id).version !== attempt.source_version)
+        return { status: 'source_changed' as const };
       return this.withKey(db, (key) => {
-        const plaintext = this.unseal(row.password, key);
-        try {
-          return plaintext.toString('utf8');
-        } finally {
-          plaintext.fill(0);
-        }
+        const read = (table: 'attempts' | 'logins', rowId: string): string => {
+          const row = db
+            .prepare<[string], { password: Buffer }>(`SELECT password FROM ${table} WHERE id = ?`)
+            .get(rowId);
+          if (!row) throw new CredentialAttemptError('not_found');
+          const plaintext = this.unseal(row.password, key);
+          try {
+            return plaintext.toString('utf8');
+          } finally {
+            plaintext.fill(0);
+          }
+        };
+        return {
+          status: 'ready' as const,
+          password: read('attempts', id),
+          ...(attempt.kind === 'rotation' ? { currentPassword: read('logins', attempt.source_login_id) } : {}),
+        };
       });
     });
-  }
-  async deletePending(attemptId: string): Promise<void> {
-    await this.use((db) => {
-      db.prepare('DELETE FROM pending WHERE attempt_id = ?').run(attemptId);
-    });
-  }
-  /** No Keychain operation: the same assistant-bound ciphertext moves atomically into its login. */
-  async confirmPending(attemptId: string, target: PendingConfirmation): Promise<SavedLogin | undefined> {
-    const metadata = target.kind === 'signup' ? loginMetadata(target.details) : undefined;
-    if (target.kind === 'rotation') versionValid(target.version);
+    if (credential.status !== 'ready') return credential;
+    await assertActive();
     return this.use((db) =>
       db
         .transaction(() => {
-          const row = db
-            .prepare<[string], { password: Buffer }>('SELECT password FROM pending WHERE attempt_id = ?')
-            .get(attemptId);
-          if (!row) return undefined;
-          let login: SavedLogin;
-          if (target.kind === 'signup' && metadata) login = this.insert(db, metadata, row.password);
-          else if (target.kind === 'rotation') {
-            const result = db
-              .prepare(
-                'UPDATE logins SET password = ?, version = version + 1, updated_at = ? WHERE id = ? AND version = ?',
-              )
-              .run(row.password, new Date().toISOString(), target.loginId, target.version);
-            if (result.changes !== 1) throw new LoginDetailsError('login_changed');
-            login = this.login(db, target.loginId);
-          } else throw new LoginDetailsError('invalid_details');
-          db.prepare('DELETE FROM pending WHERE attempt_id = ?').run(attemptId);
-          return login;
+          const attempt = this.attempt(db, id);
+          if (attempt.phase !== 'saved') return { status: 'not_saved' as const };
+          if (attempt.kind === 'rotation' && this.login(db, attempt.source_login_id).version !== attempt.source_version)
+            return { status: 'source_changed' as const };
+          const at = new Date().toISOString();
+          const changed = db
+            .prepare(
+              "UPDATE attempts SET phase = 'exposed', exposed_at = ?, updated_at = ? WHERE id = ? AND phase = 'saved'",
+            )
+            .run(at, at, id);
+          return changed.changes
+            ? {
+                status: 'exposed' as const,
+                password: credential.password,
+                ...(credential.currentPassword === undefined ? {} : { currentPassword: credential.currentPassword }),
+              }
+            : { status: 'not_saved' as const };
         })
         .immediate(),
     );
+  }
+  private move(
+    db: Database.Database,
+    id: string,
+    from: readonly CredentialAttemptPhase[],
+    to: CredentialAttemptPhase,
+    evidence?: CredentialEvidence,
+  ): CredentialAttempt {
+    const json = evidence === undefined ? null : credentialEvidenceJson(evidence);
+    const changed = db
+      .prepare(
+        `UPDATE attempts SET phase = ?, evidence_json = COALESCE(?, evidence_json), updated_at = ?, password = CASE WHEN ? = 'rejected' THEN NULL ELSE password END WHERE id = ? AND phase IN (${from.map(() => '?').join(',')})`,
+      )
+      .run(to, json, new Date().toISOString(), to, id, ...from);
+    if (!changed.changes) {
+      this.attempt(db, id);
+      throw new CredentialAttemptError('invalid_phase');
+    }
+    return this.attempt(db, id);
+  }
+  async moveAttempt(
+    id: string,
+    from: readonly CredentialAttemptPhase[],
+    to: CredentialAttemptPhase,
+    evidence?: CredentialEvidence,
+  ): Promise<CredentialAttempt> {
+    return this.use((db) => this.move(db, id, from, to, evidence));
+  }
+  async releaseAttempt(
+    id: string,
+    approvalId: string,
+  ): Promise<
+    | { status: 'finalized'; attempt: CredentialAttempt }
+    | { status: 'released'; from: CredentialAttemptPhase; attempt: CredentialAttempt }
+  > {
+    return this.use((db) =>
+      db
+        .transaction(() => {
+          const current = this.attempt(db, id);
+          if (current.phase === 'finalized') return { status: 'finalized' as const, attempt: current };
+          const previous =
+            current.evidence_json === null ? {} : (JSON.parse(current.evidence_json) as CredentialEvidence);
+          const attempt = this.move(db, id, RELEASABLE_PHASES, 'rejected', {
+            ...previous,
+            release: 'principal',
+            approval: approvalId,
+            released_from: current.phase,
+          });
+          return { status: 'released' as const, from: current.phase, attempt };
+        })
+        .immediate(),
+    );
+  }
+  async abandonAttemptsForJob(jobId: string): Promise<CredentialAttempt[]> {
+    return this.use((db) =>
+      db
+        .transaction(() => {
+          const saved = db
+            .prepare<
+              [string],
+              CredentialAttempt
+            >(`SELECT ${ATTEMPT_COLUMNS} FROM attempts WHERE job_id = ? AND phase = 'saved' ORDER BY created_at, id`)
+            .all(jobId);
+          return saved.map((attempt) => this.move(db, attempt.id, ['saved'], 'rejected'));
+        })
+        .immediate(),
+    );
+  }
+  private editableAttempts(
+    db: Database.Database,
+    loginId: string | null,
+    destination?: Pick<SavedLogin, 'domain' | 'username'>,
+  ): CredentialAttempt[] {
+    const open = db
+      .prepare<
+        [string | null, string | null, string | null],
+        CredentialAttempt
+      >(`SELECT ${ATTEMPT_COLUMNS} FROM attempts WHERE (source_login_id = ? OR (kind = 'signup' AND site = ? AND username = ?)) AND phase NOT IN ('rejected','finalized')`)
+      .all(loginId, destination?.domain ?? null, destination?.username ?? null);
+    if (open.some((attempt) => attempt.phase !== 'saved')) throw new LoginDetailsError('login_busy');
+    return open;
+  }
+  private giveWay(
+    db: Database.Database,
+    loginId: string | null,
+    destination?: Pick<SavedLogin, 'domain' | 'username'>,
+  ): void {
+    for (const attempt of this.editableAttempts(db, loginId, destination))
+      this.move(db, attempt.id, ['saved'], 'rejected', { reason: 'login_edited' });
+  }
+  /** Ciphertext, final status and ownership change together without reading Keychain. */
+  async confirmAttempt(id: string, evidence: CredentialEvidence): Promise<CredentialAttempt> {
+    const json = credentialEvidenceJson(evidence);
+    return this.use((db) =>
+      db
+        .transaction(() => {
+          const attempt = this.attempt(db, id);
+          if (attempt.phase === 'finalized') return attempt;
+          if (!['exposed', 'awaiting_verification', 'unknown'].includes(attempt.phase))
+            throw new CredentialAttemptError('invalid_phase');
+          const row = db.prepare<[string], { password: Buffer }>('SELECT password FROM attempts WHERE id = ?').get(id);
+          if (!row) throw new CredentialAttemptError('not_found');
+          let login: SavedLogin;
+          if (attempt.kind === 'signup')
+            login = this.insert(
+              db,
+              loginMetadata({ site: attempt.origin, username: attempt.username, title: attempt.site }),
+              row.password,
+            );
+          else {
+            const changed = db
+              .prepare(
+                'UPDATE logins SET password = ?, version = version + 1, updated_at = ? WHERE id = ? AND version = ?',
+              )
+              .run(row.password, new Date().toISOString(), attempt.source_login_id, attempt.source_version);
+            if (changed.changes !== 1) throw new LoginDetailsError('login_changed');
+            login = this.login(db, attempt.source_login_id);
+          }
+          const at = new Date().toISOString();
+          db.prepare(
+            "UPDATE attempts SET phase = 'finalized', password = NULL, owned_login_id = ?, evidence_json = ?, finalized_at = ?, updated_at = ? WHERE id = ?",
+          ).run(login.id, json, at, at, id);
+          return this.attempt(db, id);
+        })
+        .immediate(),
+    );
+  }
+  async recoverAttempts(): Promise<void> {
+    await this.use((db) => {
+      db.prepare(
+        "UPDATE attempts SET phase = 'unknown', evidence_json = ?, updated_at = ? WHERE phase = 'exposed'",
+      ).run(credentialEvidenceJson({ signal: 'interrupted' }), new Date().toISOString());
+    });
   }
 }
 

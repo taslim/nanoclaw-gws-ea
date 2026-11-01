@@ -1,3 +1,5 @@
+import * as loginStores from '../gws-ea-browser/login-store.js';
+import { testLoginStore } from '../gws-ea-browser/testing/login-store.js';
 import fs from 'node:fs';
 import path from 'node:path';
 import Database from 'better-sqlite3';
@@ -75,6 +77,7 @@ let nextId = 0;
 const configureDelegation = async (ids: readonly string[]): Promise<void> => configureBrowserAccess(BROWSER_ROOT, ids);
 
 beforeEach(async () => {
+  vi.spyOn(loginStores, 'getLoginStore').mockResolvedValue(testLoginStore(BROWSER_ROOT).store);
   useAvailableBrowser();
   fs.rmSync(ROOT, { recursive: true, force: true });
   agents.clear();

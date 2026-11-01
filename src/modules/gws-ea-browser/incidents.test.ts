@@ -1,3 +1,5 @@
+import * as loginStores from './login-store.js';
+import { testLoginStore } from './testing/login-store.js';
 import { useAvailableBrowser } from './testing/browser-runtime.js';
 /** Incidents against a real central DB and real session DBs: recorded with their job's stop, told once. */
 import fs from 'node:fs';
@@ -54,6 +56,7 @@ const incidents = () =>
   );
 
 beforeEach(async () => {
+  vi.spyOn(loginStores, 'getLoginStore').mockResolvedValue(testLoginStore(`${root}/browser`).store);
   useAvailableBrowser();
   fs.rmSync(root, { recursive: true, force: true });
   await runMigrations(await initTestDb());

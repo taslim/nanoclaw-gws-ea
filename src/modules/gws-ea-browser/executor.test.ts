@@ -1,3 +1,8 @@
+import * as loginStores from './login-store.js';
+import { testLoginStore } from './testing/login-store.js';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Page } from 'playwright-core';
 import { closeDb, getDb, initTestDb, runMigrations } from '../../db/index.js';
@@ -7,6 +12,16 @@ import './index.js';
 import { executeBrowserBatch, validateBrowserBatch } from './executor.js';
 import type { BrowserExecutionContext } from './actions.js';
 import { registerPageSecret } from './page-privacy.js';
+
+let loginRoot: string;
+beforeEach(async () => {
+  loginRoot = await mkdtemp(join(tmpdir(), 'executor-logins-'));
+  vi.spyOn(loginStores, 'getLoginStore').mockResolvedValue(testLoginStore(join(loginRoot, 'browser')).store);
+});
+afterEach(async () => {
+  vi.restoreAllMocks();
+  await rm(loginRoot, { recursive: true, force: true });
+});
 
 it('rejects unknown actions and clipboard shortcuts without running a partial batch', () => {
   expect(() =>

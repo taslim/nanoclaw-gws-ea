@@ -1,3 +1,5 @@
+import * as loginStores from './login-store.js';
+import { testLoginStore } from './testing/login-store.js';
 import * as availability from './availability.js';
 import { BrowserStore } from './db.js';
 import { useAvailableBrowser } from './testing/browser-runtime.js';
@@ -39,6 +41,7 @@ import type { AgentGroup, Session } from '../../types.js';
 import { configureBrowserAccess } from './testing/browser-access.js';
 
 beforeEach(async () => {
+  vi.spyOn(loginStores, 'getLoginStore').mockResolvedValue(testLoginStore(`${ROOT}/browser`).store);
   useAvailableBrowser();
   vi.stubEnv('GWS_EA_BROWSER_ROOT', `${ROOT}/browser`);
   setBrowserAdmissionReady(true);

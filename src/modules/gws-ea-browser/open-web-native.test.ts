@@ -99,6 +99,7 @@ const chromePath = process.env.GWS_EA_BROWSER_TEST_CHROME;
 
 /** The one fixture every suite here drives: each test starts from its shared pages, with no request seen. */
 let fixture: OpenWebFixture;
+let defaultLogins: ReturnType<typeof testLoginStore>;
 beforeAll(async () => {
   if (chromePath) fixture = await openWebFixture(chromePath);
 }, 30_000);
@@ -107,7 +108,11 @@ afterAll(async () => {
 });
 beforeEach(() => {
   fixture?.reset();
+  fs.rmSync(`${root}/browser`, { recursive: true, force: true });
+  defaultLogins = testLoginStore(`${root}/browser`);
+  vi.spyOn(loginStoreModule, 'getLoginStore').mockResolvedValue(defaultLogins.store);
 });
+afterEach(() => vi.restoreAllMocks());
 
 /** A PNG's width and height, as its header states them. */
 function pngSize(data: Buffer): { width: number; height: number } {
@@ -1417,7 +1422,7 @@ describe.skipIf(!chromePath)('ordinary presses that buy, in native Chrome', { ti
       expect(logins.keyReads()).toBe(reads);
       expect(JSON.stringify(opened)).not.toMatch(/native-assistant-secret|native-principal-secret|morgan@/u);
     } finally {
-      store.mockRestore();
+      store.mockResolvedValue(defaultLogins.store);
     }
   });
 
@@ -1474,7 +1479,7 @@ describe.skipIf(!chromePath)('ordinary presses that buy, in native Chrome', { ti
         clearTimeout(timer);
         catalog.mockRestore();
         vault.mockRestore();
-        store.mockRestore();
+        store.mockResolvedValue(defaultLogins.store);
       }
     },
   );
@@ -1848,7 +1853,7 @@ describe.skipIf(!chromePath)('personal data in native Chrome', { timeout: 60_000
       ]);
       expect(await page.locator('h1').textContent()).toBe('Welcome back');
     } finally {
-      store.mockRestore();
+      store.mockResolvedValue(defaultLogins.store);
     }
     const newsletter = await open(PERSONAL_DATA.newsletter);
     for (const text of ['morgan@example.test', 'Morgan+offers@example.test'])

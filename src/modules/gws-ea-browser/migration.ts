@@ -196,38 +196,11 @@ export const browserSiteLeasesMigration: PortableMigration & { name: ModuleMigra
   },
 };
 
-/** Attempts outlive jobs because finalized signups establish non-email account ownership. */
-export const browserCredentialAttemptsMigration: PortableMigration & { name: ModuleMigrationName } = {
+export const browserRetiredCredentialsMigration: PortableMigration & { name: ModuleMigrationName } = {
   version: 1,
-  name: 'module:gws-ea-browser:local-credential-attempts',
+  name: 'module:gws-ea-browser:retired-credentials',
   async up(db) {
-    await db.exec(`
-      DROP TABLE IF EXISTS gws_ea_browser_credential_attempts;
-      CREATE TABLE gws_ea_browser_credential_attempts (
-        id TEXT PRIMARY KEY,
-        kind TEXT NOT NULL CHECK(kind IN ('signup','rotation')),
-        job_id TEXT NOT NULL,
-        origin TEXT NOT NULL,
-        site TEXT NOT NULL,
-        username TEXT NOT NULL,
-        source_login_id TEXT,
-        source_version INTEGER,
-        phase TEXT NOT NULL CHECK(phase IN ('saved','exposed','awaiting_verification','unknown','finalized','rejected')),
-        evidence_json TEXT,
-        owned_login_id TEXT,
-        created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL,
-        exposed_at TEXT,
-        finalized_at TEXT,
-        CHECK((kind = 'rotation') = (source_login_id IS NOT NULL)),
-        CHECK((source_login_id IS NULL) = (source_version IS NULL)),
-        CHECK(owned_login_id IS NULL OR phase = 'finalized')
-      );
-      CREATE UNIQUE INDEX gws_ea_browser_credential_open_rotation ON gws_ea_browser_credential_attempts(source_login_id)
-        WHERE source_login_id IS NOT NULL AND phase NOT IN ('rejected','finalized');
-      CREATE INDEX gws_ea_browser_credential_ownership ON gws_ea_browser_credential_attempts(site,username)
-        WHERE kind = 'signup' AND phase = 'finalized';
-    `);
+    await db.exec('DROP TABLE IF EXISTS gws_ea_browser_credential_attempts');
   },
 };
 
@@ -504,22 +477,5 @@ export const browserConsentOutcomesMigration: PortableMigration & { name: Module
       "UPDATE gws_ea_browser_consent_stops SET outcome_notified_at = ? WHERE requested_at IS NULL AND approval_id IS NULL AND status = 'approved'",
       new Date().toISOString(),
     );
-    for (const attempt of await db.all<{ evidence_json: string | null }>(
-      "SELECT evidence_json FROM gws_ea_browser_credential_attempts WHERE phase = 'awaiting_consent'",
-    )) {
-      const evidence: unknown = JSON.parse(attempt.evidence_json ?? '{}');
-      if (
-        typeof evidence !== 'object' ||
-        evidence === null ||
-        !('stops' in evidence) ||
-        typeof evidence.stops !== 'string'
-      )
-        continue;
-      for (const stopId of evidence.stops.split(' '))
-        await db.run(
-          "UPDATE gws_ea_browser_consent_stops SET outcome_notified_at = NULL WHERE id = ? AND status IN ('rejected','expired','withdrawn')",
-          stopId,
-        );
-    }
   },
 };

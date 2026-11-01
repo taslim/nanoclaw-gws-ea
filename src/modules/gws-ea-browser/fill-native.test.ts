@@ -1,3 +1,5 @@
+import * as loginStores from './login-store.js';
+import { testLoginStore } from './testing/login-store.js';
 import { useAvailableBrowser } from './testing/browser-runtime.js';
 /** Real owned Chrome, background windows and TLS origins; all traffic terminates in this fixture. */
 import { execFileSync } from 'node:child_process';
@@ -150,6 +152,7 @@ describe.skipIf(!chromePath)('native host secret fill', { timeout: 30_000 }, () 
   }, 30_000);
 
   beforeEach(async () => {
+    vi.spyOn(loginStores, 'getLoginStore').mockResolvedValue(testLoginStore(join(root, 'browser')).store);
     useAvailableBrowser();
     vi.stubEnv('GWS_EA_BROWSER_ROOT', join(root, 'browser'));
     await browserSiteLeasesMigration.up(await initSqliteTestDb());

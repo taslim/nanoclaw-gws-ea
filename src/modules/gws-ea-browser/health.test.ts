@@ -6,6 +6,7 @@ import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { closeDb, initTestDb } from '../../db/index.js';
 import type { SanitizedCommand } from '../../gws-ea/process.js';
 import { browserHealth } from './health.js';
+import { CredentialAttempts } from './credential-attempts.js';
 import * as loginStores from './login-store.js';
 import { BrowserRuntime } from './runtime.js';
 
@@ -69,4 +70,22 @@ it('checks the key without decrypting saved passwords or creating a missing key'
   });
   expect(commands).toHaveLength(1);
   expect(commands[0]?.args[0]).toBe('find-generic-password');
+});
+
+it('counts local attempts independently of central tables while the key is missing', async () => {
+  const attempts = new CredentialAttempts({ store });
+  const result = await attempts.prepareSignup({
+    jobId: 'system:a2a:main:cedar',
+    origin: 'https://cedar.example',
+    username: 'soren_handle',
+  });
+  if (result.status !== 'prepared') throw new Error(result.status);
+  key = undefined;
+  const state = new BrowserRuntime(path.join(directory, 'browser')).state();
+  expect(await browserHealth(state)).toMatchObject({
+    credentialAttempts: 1,
+    loginStore: { available: false, reason: 'key_missing' },
+  });
+  await attempts.abandon(result.attempt.id);
+  expect(await browserHealth(state)).toMatchObject({ credentialAttempts: 0, loginStore: { available: true } });
 });

@@ -17,6 +17,7 @@ import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import Database from 'better-sqlite3';
 import type { SanitizedCommand, SanitizedCommandOutcomeRunner } from '../../gws-ea/process.js';
 import { LoginStore, LoginStoreError, loginStoreAvailability } from './login-store.js';
+import { CredentialAttempts } from './credential-attempts.js';
 
 const INSTANCE = '38d6fb28-6c7f-4cc4-afaf-2919e8868cce';
 const PASSWORD = 'Crane!7-river-timber';
@@ -113,17 +114,20 @@ it('detects a different key without decrypting a login, and adopts it after the 
   expect(calls.filter((call) => call.args[0] === '-i')).toHaveLength(0);
 });
 
-it('never creates or adopts a key while only a pending secret exists', async () => {
-  await store.savePending('attempt-lark', PASSWORD);
+it('never creates or adopts a key while only a pending attempt secret exists', async () => {
+  const attempts = new CredentialAttempts({ store });
+  const input = { jobId: 'system:a2a:main:cedar', origin: 'https://cedar.example', username: 'alden' };
+  const first = await attempts.prepareSignup(input);
+  if (first.status !== 'prepared') throw new Error(first.status);
   key = undefined;
   calls = [];
   expect(await loginStoreAvailability(store)).toEqual({ available: false, reason: 'key_missing' });
-  await expect(store.savePending('attempt-finch', PASSWORD)).rejects.toMatchObject({ reason: 'vault_unavailable' });
+  expect(await attempts.prepareSignup({ ...input, username: 'briar' })).toEqual({ status: 'vault_unavailable' });
   key = 'f2'.repeat(32);
   expect(await loginStoreAvailability(store)).toEqual({ available: false, reason: 'key_mismatch' });
   await expect(store.create(DETAILS)).rejects.toMatchObject({ reason: 'vault_unavailable' });
   expect(calls.filter((call) => call.args[0] === '-i')).toHaveLength(0);
-  await store.deletePending('attempt-lark');
+  await attempts.abandon(first.attempt.id);
   const login = await store.create(DETAILS);
   expect(await store.secret(login.id, 'password', 'https://cedar.example')).toBe(PASSWORD);
 });
@@ -240,69 +244,6 @@ it('binds ciphertext to the assistant even if the same key is supplied', async (
   await expect(copied.secret(login.id, 'password', 'https://cedar.example')).rejects.toMatchObject({
     reason: 'vault_unavailable',
   });
-});
-
-it('copies and deletes a pending password in one key-free confirmation, including rotation version checks', async () => {
-  await store.savePending('attempt-lark', PASSWORD);
-  expect(await store.disclosePending('attempt-lark')).toBe(PASSWORD);
-  const pending = raw(
-    (db) =>
-      db
-        .prepare<[string], { password: Buffer }>('SELECT password FROM pending WHERE attempt_id = ?')
-        .get('attempt-lark')?.password,
-  );
-  unavailable = true;
-  calls = [];
-  expect(await store.pendingIds()).toEqual(['attempt-lark']);
-  const login = await store.confirmPending('attempt-lark', { kind: 'signup', details: DETAILS });
-  expect(login).toBeDefined();
-  if (!login) throw new Error('Fixture confirmation failed');
-  expect(blob(login.id).equals(pending ?? Buffer.alloc(0))).toBe(true);
-  expect(await store.hasPending('attempt-lark')).toBe(false);
-  expect(await store.confirmPending('attempt-lark', { kind: 'signup', details: DETAILS })).toBeUndefined();
-  expect(calls).toHaveLength(0);
-  unavailable = false;
-  const changedPassword = 'Finch!6-new-password';
-  await store.savePending('attempt-finch', changedPassword);
-  unavailable = true;
-  calls = [];
-  await expect(
-    store.confirmPending('attempt-finch', { kind: 'rotation', loginId: login.id, version: 2 }),
-  ).rejects.toMatchObject({ reason: 'login_changed' });
-  expect(await store.hasPending('attempt-finch')).toBe(true);
-  const updated = await store.confirmPending('attempt-finch', { kind: 'rotation', loginId: login.id, version: 1 });
-  expect(updated?.version).toBe(2);
-  expect(await store.hasPending('attempt-finch')).toBe(false);
-  expect(calls).toHaveLength(0);
-  unavailable = false;
-  expect(await store.secret(login.id, 'password', 'https://cedar.example')).toBe(changedPassword);
-  expect((await readFile(dbFile())).includes(pending ?? Buffer.alloc(0))).toBe(false);
-});
-
-it('deletes orphan and released pending rows without a key and leaves the login password intact', async () => {
-  const login = await store.create(DETAILS);
-  await store.savePending('attempt-lark', 'Wren$8-not-confirmed');
-  const pending = raw(
-    (db) =>
-      db
-        .prepare<[string], { password: Buffer }>('SELECT password FROM pending WHERE attempt_id = ?')
-        .get('attempt-lark')?.password,
-  );
-  unavailable = true;
-  calls = [];
-  await store.deletePending('attempt-lark');
-  await store.deletePending('attempt-lark');
-  expect(await store.pendingIds()).toEqual([]);
-  expect(calls).toHaveLength(0);
-  expect((await readFile(dbFile())).includes(pending ?? Buffer.alloc(0))).toBe(false);
-  unavailable = false;
-  expect(await store.secret(login.id, 'password', 'https://cedar.example')).toBe(PASSWORD);
-});
-
-it('does not overwrite an existing pending secret', async () => {
-  await store.savePending('attempt-lark', PASSWORD);
-  await expect(store.savePending('attempt-lark', 'Different!7')).rejects.toMatchObject({ reason: 'login_changed' });
-  expect(await store.disclosePending('attempt-lark')).toBe(PASSWORD);
 });
 
 it('serializes first-use key creation across store instances without losing either password', async () => {

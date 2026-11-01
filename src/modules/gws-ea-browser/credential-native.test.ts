@@ -53,7 +53,8 @@ import { prepareAuthenticationIsolation } from './authentication-submit.js';
 import { ensureBrowserNavigationGuard } from './commit-classifier.js';
 import { prepareChromeProfile, spawnChrome } from './chrome.js';
 import { connectChrome, type ChromeConnection } from './connection.js';
-import { CredentialAttempts, type CredentialAttempt } from './credential-attempts.js';
+import { CredentialAttempts } from './credential-attempts.js';
+import { type CredentialAttempt } from './credential-types.js';
 import { executeCredentialForm, recoverCredentialAttempts } from './credential-operations.js';
 import { recordConsentGrant } from './consent.js';
 import { executeBrowserBatch } from './executor.js';
@@ -62,6 +63,7 @@ import './index.js';
 import { observePage, type BrowserRef } from './observe.js';
 import { testLoginStore } from './testing/login-store.js';
 import { LoginStoreError } from './login-store.js';
+import * as loginStores from './login-store.js';
 import { browserPaths } from './paths.js';
 import type { BrowserExecutionContext } from './actions.js';
 import { answerSignInReply, recoverBrowserSignInMail } from './sign-in-mail.js';
@@ -420,7 +422,8 @@ describe.skipIf(!chromePath)('native authorized signup and password change', { t
     );
     const directory = await realpath(await mkdtemp(join(root, 'logins-')));
     fixture = testLoginStore(join(directory, 'browser'));
-    attempts = new CredentialAttempts({ db: getDb(), store: fixture.store });
+    vi.spyOn(loginStores, 'getLoginStore').mockResolvedValue(fixture.store);
+    attempts = new CredentialAttempts({ store: fixture.store });
     posts.length = 0;
     addresses.length = 0;
     responses.clear();
@@ -495,7 +498,7 @@ describe.skipIf(!chromePath)('native authorized signup and password change', { t
   async function generatedPassword(id: string): Promise<string> {
     const attempt = await attempts.get(id);
     if (attempt?.owned_login_id) return fixture.store.secret(attempt.owned_login_id, 'password', SITE);
-    return fixture.store.disclosePending(id);
+    return fixture.attemptPassword(id);
   }
 
   async function signUp(path: string, names: Record<string, string>) {
@@ -663,7 +666,7 @@ describe.skipIf(!chromePath)('native authorized signup and password change', { t
       expect(next).not.toBe(original);
       expect(await attempts.get(authority.id)).toMatchObject({ phase: 'finalized', owned_login_id: itemId });
       expect((await fixture.store.all()).map(({ id }) => id)).toEqual([itemId]);
-      expect(await fixture.store.pendingIds()).toEqual([]);
+      expect(fixture.pendingIds()).toEqual([]);
       for (const value of [original!, next]) expect(JSON.stringify(result)).not.toContain(value);
     }, 30_000);
 
@@ -684,14 +687,14 @@ describe.skipIf(!chromePath)('native authorized signup and password change', { t
         password: '',
       });
       await page.goto(`${SITE}/change`);
-      expect(await fill(authority, await refs(CHANGE))).toEqual({ status: 'not_owned' });
+      expect(await fill(authority, await refs(CHANGE))).toEqual({ status: 'refused', reason: 'no_authority' });
       expect(posts).toEqual([]);
       expect(await attempts.get(authority.id)).toMatchObject({ phase: 'rejected', exposed_at: null });
       expect(await page.locator('input[name=current_password]').inputValue()).toBe('');
     }, 30_000);
 
     for (const modification of ['password edit', 'removal'] as const)
-      it(`keeps an exposed change uncertain after source Login ${modification} without deleting its pending password`, async () => {
+      it(`refuses a source Login ${modification} while the exposed change is uncertain and never submits it again`, async () => {
         const { itemId, handle } = await ownedAccount();
         const authority = await changeAuthority(handle);
         await page.goto(`${SITE}/change`);
@@ -721,13 +724,17 @@ describe.skipIf(!chromePath)('native authorized signup and password change', { t
           principalUserId: 'gchat:users/principal',
         });
         const login = await fixture.store.get(itemId);
-        if (modification === 'removal') await fixture.store.remove(itemId, login.version);
-        else await fixture.store.update(itemId, login.version, { password: 'principal-new-password' });
+        await expect(
+          modification === 'removal'
+            ? fixture.store.remove(itemId, login.version)
+            : fixture.store.update(itemId, login.version, { password: 'principal-new-password' }),
+        ).rejects.toMatchObject({ reason: 'login_busy' });
+        expect(await fixture.store.get(itemId)).toEqual(login);
         expect(await fill(authority, await refs(CHANGE))).toEqual({ status: 'outcome_unknown' });
         expect(await attempts.get(authority.id)).toMatchObject({
           phase: 'unknown',
         });
-        expect(await fixture.store.hasPending(held.id)).toBe(true);
+        expect(fixture.hasPending(held.id)).toBe(true);
         expect(posts).toEqual([]);
       }, 30_000);
 
@@ -868,7 +875,7 @@ describe.skipIf(!chromePath)('native authorized signup and password change', { t
       expect(await fill(authority, chosen)).toEqual({ status: 'refused', reason: 'form_changed' });
       expect(posts).toEqual([]);
       expect(await attempts.get(authority.id)).toMatchObject({ phase: 'rejected', exposed_at: expect.any(String) });
-      expect(await fixture.store.hasPending(authority.id)).toBe(false);
+      expect(fixture.hasPending(authority.id)).toBe(false);
       expect(await page.locator('input[name=password]').inputValue()).toBe('');
     }, 30_000);
 
@@ -1155,7 +1162,7 @@ describe.skipIf(!chromePath)('native authorized signup and password change', { t
       await grant();
       expect(await fill(authority, controls)).toEqual({ status: 'outcome_unknown' });
       expect(posts.map((post) => post.path)).toEqual(['/socket-signup']);
-      expect(await fixture.store.hasPending(authority.id)).toBe(true);
+      expect(fixture.hasPending(authority.id)).toBe(true);
       // Queue history includes the consent card request and the refused no-op refill: neither interacted
       // with the page, so the response remains attributable to this attempt's one disclosure.
       for (const [id, action, payload] of [
@@ -1287,7 +1294,7 @@ describe.skipIf(!chromePath)('native authorized signup and password change', { t
       const authority = await signupAuthority();
       expect(await fill(authority, await refs(SIGNUP))).toMatchObject({ reason: 'consent_required' });
       // A fresh process knows only the durable record and the local store.
-      const restarted = new CredentialAttempts({ db: getDb(), store: fixture.store });
+      const restarted = new CredentialAttempts({ store: fixture.store });
       await recoverCredentialAttempts(restarted);
       expect(await restarted.get(authority.id)).toMatchObject({ phase: 'unknown' });
       await grant();
@@ -1328,11 +1335,11 @@ describe.skipIf(!chromePath)('native authorized signup and password change', { t
 
   describe('recovering a cut-off disclosure', () => {
     it('reconciles a confirmed signup after a local save fails without submitting again', async () => {
-      vi.spyOn(fixture.store, 'confirmPending').mockRejectedValueOnce(new LoginStoreError('vault_unavailable'));
+      vi.spyOn(fixture.store, 'confirmAttempt').mockRejectedValueOnce(new LoginStoreError('vault_unavailable'));
       const { authority, result, password } = await signUp('/native-signup', SIGNUP);
       expect(result).toEqual({ status: 'outcome_unknown' });
       expect(await attempts.get(authority.id)).toMatchObject({ phase: 'unknown' });
-      expect(await fixture.store.hasPending(authority.id)).toBe(true);
+      expect(fixture.hasPending(authority.id)).toBe(true);
       expect(await fixture.store.all()).toEqual([]);
       expect(
         await executeCredentialForm(context(), { authority: authority.id, operation: 'reconcile' }, { attempts }),
@@ -1341,7 +1348,7 @@ describe.skipIf(!chromePath)('native authorized signup and password change', { t
       expect(settled).toMatchObject({ phase: 'finalized', owned_login_id: expect.any(String) });
       if (!settled?.owned_login_id) throw new Error('Missing confirmed login');
       expect(await fixture.store.secret(settled.owned_login_id, 'password', SITE)).toBe(password);
-      expect(await fixture.store.hasPending(authority.id)).toBe(false);
+      expect(fixture.hasPending(authority.id)).toBe(false);
       expect(posts).toHaveLength(1);
     }, 30_000);
 
@@ -1355,15 +1362,15 @@ describe.skipIf(!chromePath)('native authorized signup and password change', { t
       remaining = 20_000;
       const reconcile = () =>
         executeCredentialForm(context(), { authority: authority.id, operation: 'reconcile' }, { attempts });
-      vi.spyOn(fixture.store, 'confirmPending').mockRejectedValueOnce(new LoginStoreError('vault_unavailable'));
+      vi.spyOn(fixture.store, 'confirmAttempt').mockRejectedValueOnce(new LoginStoreError('vault_unavailable'));
       await expect(reconcile()).rejects.toThrow('vault_unavailable');
-      expect(await fixture.store.hasPending(authority.id)).toBe(true);
+      expect(fixture.hasPending(authority.id)).toBe(true);
       expect(await reconcile()).toEqual({ status: 'account_created' });
       const settled = await attempts.get(authority.id);
       expect(settled).toMatchObject({ phase: 'finalized', owned_login_id: expect.any(String) });
       if (!settled?.owned_login_id) throw new Error('Missing confirmed login');
       expect(await fixture.store.secret(settled.owned_login_id, 'password', SITE)).toBe(password);
-      expect(await fixture.store.hasPending(authority.id)).toBe(false);
+      expect(fixture.hasPending(authority.id)).toBe(false);
       expect(posts).toHaveLength(1);
     }, 30_000);
 
@@ -1388,7 +1395,7 @@ describe.skipIf(!chromePath)('native authorized signup and password change', { t
       const password = await generatedPassword(authority.id);
 
       // A fresh process knows only the durable record and the local store.
-      const restarted = new CredentialAttempts({ db: getDb(), store: fixture.store });
+      const restarted = new CredentialAttempts({ store: fixture.store });
       expect(
         await executeCredentialForm(
           context(),
@@ -1429,7 +1436,7 @@ describe.skipIf(!chromePath)('native authorized signup and password change', { t
     let delivered = 0;
     beforeEach(async () => {
       await runMigrations(await initTestDb());
-      attempts = new CredentialAttempts({ db: getDb(), store: fixture.store });
+      attempts = new CredentialAttempts({ store: fixture.store });
       await createAgentGroup({
         id: 'external-email',
         name: 'external-email',

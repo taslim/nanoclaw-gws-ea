@@ -14,7 +14,7 @@ import { readBrowserEvidence } from './evidence.js';
 import {
   browserConsentMigration,
   browserConsentOutcomesMigration,
-  browserCredentialAttemptsMigration,
+  browserRetiredCredentialsMigration,
   browserDisclosuresMigration,
   browserGenericCheckoutMigration,
   browserIncidentsMigration,
@@ -73,6 +73,7 @@ import { watchAction, listWatchesAction, cancelWatchAction, watchBookAction } fr
 
 import type { BrowserActions, BrowserExecutionContext } from './actions.js';
 import { sweepBrowserStartup } from './start-sweep.js';
+import { notifyOrphanCredentialAttempts } from './credential-operations.js';
 import { createBrowserWatchScheduler, repairBrowserWatchChecks, type BrowserWatchScheduler } from './scheduler.js';
 
 configureBrowserSiteInfo({ recipes: readRecipeSiteInfo, vault: readVaultSiteInfo });
@@ -85,7 +86,7 @@ registerMigration(browserSignInMigration);
 registerMigration(browserRecipesMigration);
 registerMigration(browserWatchesMigration);
 registerMigration(browserWatchReleaseMigration);
-registerMigration(browserCredentialAttemptsMigration);
+registerMigration(browserRetiredCredentialsMigration);
 registerMigration(browserConsentMigration);
 registerMigration(browserIncidentsMigration);
 registerMigration(browserDisclosuresMigration);
@@ -171,6 +172,7 @@ onHostStart(async ({ signal }) => {
       () => sweepBrowserJobSessions(),
       () => cleanupBrowserSignInMail(),
       () => recoverConsentOutcomes(),
+      () => notifyOrphanCredentialAttempts(),
       () => sweepBrowserPurchaseState(activeQueue),
       () => notifyPendingIncidents(),
       () => runtime.releaseUnusedPages(),

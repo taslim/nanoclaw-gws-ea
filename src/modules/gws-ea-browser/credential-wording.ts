@@ -1,6 +1,6 @@
 import { quoted } from '../approvals/request-text.js';
 import type { CredentialKind } from './authentication-signatures.js';
-import type { CredentialAttempt } from './credential-attempts.js';
+import type { CredentialAttempt } from './credential-types.js';
 
 /** to: main, delegator */
 const credentialAuthorityMessages = {
@@ -74,4 +74,15 @@ export function credentialReleaseRejected(attempt: CredentialAttempt | undefined
     ? `the ${attempt.kind === 'signup' ? 'account signup' : 'password change'} for "${attempt.username}" on ${attempt.site}`
     : 'that signup or password change';
   return `The principal chose to keep waiting on ${errand}${reason ? `: "${reason}"` : ''}. It stays as it is.`;
+}
+
+/** to: main */
+export function orphanCredentialNotice(attempt: CredentialAttempt): string {
+  return (
+    `The browser errand for ${attempt.site}, account ${JSON.stringify(attempt.username)}, is unavailable. ` +
+    `Its ${attempt.kind === 'signup' ? 'signup' : 'password change'} may have reached the site and still holds it. ` +
+    `Ask the principal whether to keep waiting or release it. To request their release card, use credential_authority ` +
+    `with operation "release", authority ${attempt.id}, and thread ${attempt.job_id}. ` +
+    `Releasing discards the generated password; it does not undo a change the site may have accepted.`
+  );
 }

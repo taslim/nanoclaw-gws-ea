@@ -8,8 +8,9 @@ import { closeDb, getDb, initTestDb, runMigrations } from '../../db/index.js';
 import '../gws-ea-profile/index.js';
 import { recordWebAlias } from '../gws-ea-profile/testing/web-alias.js';
 import { log } from '../../log.js';
-import { CredentialAttempts, type CredentialAttempt, type CredentialAttemptPhase } from './credential-attempts.js';
-import { browserCredentialAttemptsMigration } from './migration.js';
+import { CredentialAttempts } from './credential-attempts.js';
+import { type CredentialAttempt, type CredentialAttemptPhase } from './credential-types.js';
+import { browserRetiredCredentialsMigration } from './migration.js';
 import { testLoginStore, TEST_INSTANCE_ID } from './testing/login-store.js';
 import * as loginStoreModule from './login-store.js';
 import { createLoginsPageHandler } from './logins-page.js';
@@ -94,14 +95,14 @@ beforeEach(async () => {
   fixture = testLoginStore(path.join(directory, 'browser'));
   vi.spyOn(loginStoreModule, 'getLoginStore').mockImplementation(async () => fixture.store);
   await runMigrations(await initTestDb());
-  await browserCredentialAttemptsMigration.up(getDb());
+  await browserRetiredCredentialsMigration.up(getDb());
   await recordWebAlias(ALIAS);
   await getDb().run(
     'INSERT INTO gws_ea_principal_addresses(email,added_at) VALUES(?,?)',
     PRINCIPAL,
     new Date().toISOString(),
   );
-  attempts = new CredentialAttempts({ db: getDb(), store: fixture.store });
+  attempts = new CredentialAttempts({ store: fixture.store });
   bodyReads = 0;
   const handler = createLoginsPageHandler({
     hostname: HOST,
@@ -298,8 +299,17 @@ it('loads add and individual pages without reading a key or unrelated login meta
 });
 
 it('refuses stale updates and removals without abandoning a current unsent password change', async () => {
-  const { loginId, attempt } = await changing('saved');
+  const saved = await login(ALIAS);
+  const loginId = saved.id;
   await fixture.store.update(loginId, 1, { title: 'Newer title', password: '' });
+  const prepared = await attempts.prepareRotation({
+    jobId: 'system:a2a:main:stream',
+    origin: SITE,
+    username: ALIAS,
+    itemHandle: loginId,
+  });
+  if (prepared.status !== 'prepared') throw new Error(prepared.status);
+  const attempt = prepared.attempt;
   for (const action of ['update', 'remove']) {
     const response = await post(`/logins/${action}`, {
       handle: loginId,
@@ -311,7 +321,7 @@ it('refuses stale updates and removals without abandoning a current unsent passw
   }
   expect(await fixture.store.get(loginId)).toMatchObject({ title: 'Newer title', version: 2 });
   expect((await attempts.get(attempt.id))?.phase).toBe('saved');
-  expect(await fixture.store.hasPending(attempt.id)).toBe(true);
+  expect(fixture.hasPending(attempt.id)).toBe(true);
 });
 
 it('refuses duplicate site and username edits without changing the existing login', async () => {
@@ -343,7 +353,7 @@ it.each(['exposed', 'awaiting_verification', 'unknown'] as const)(
     }
     expect((await fixture.store.get(loginId)).version).toBe(1);
     expect((await attempts.get(attempt.id))?.phase).toBe(phase);
-    expect(await fixture.store.hasPending(attempt.id)).toBe(true);
+    expect(fixture.hasPending(attempt.id)).toBe(true);
   },
 );
 
@@ -361,7 +371,7 @@ it.each(['update', 'remove'])(
       phase: 'rejected',
       evidence_json: JSON.stringify({ reason: 'login_edited' }),
     });
-    expect(await fixture.store.hasPending(attempt.id)).toBe(false);
+    expect(fixture.hasPending(attempt.id)).toBe(false);
     if (action === 'update') expect(await fixture.store.secret(loginId, 'password', SITE)).toBe('replacement');
     else expect(await fixture.store.all()).toEqual([]);
   },
@@ -389,7 +399,7 @@ it.each(['add', 'update'] as const)('refuses a page %s that would collide with a
   const [created] = await fixture.store.forOrigin(SITE);
   expect(created).toBeDefined();
   expect(await fixture.store.secret(created!.id, 'password', SITE)).toBe(disclosed.credential.password);
-  expect(await fixture.store.hasPending(prepared.attempt.id)).toBe(false);
+  expect(fixture.hasPending(prepared.attempt.id)).toBe(false);
 });
 
 it.each(['add', 'update'] as const)('lets an undisclosed signup give way to a conflicting page %s', async (action) => {
@@ -408,7 +418,7 @@ it.each(['add', 'update'] as const)('lets an undisclosed signup give way to a co
     phase: 'rejected',
     evidence_json: JSON.stringify({ reason: 'login_edited' }),
   });
-  expect(await fixture.store.hasPending(prepared.attempt.id)).toBe(false);
+  expect(fixture.hasPending(prepared.attempt.id)).toBe(false);
   const [saved] = await fixture.store.forOrigin(SITE);
   expect(saved).toMatchObject({ hostname: 'accounts.stream.example', username: ALIAS });
   expect(await fixture.store.secret(saved!.id, 'password', SITE)).toBe('page-replacement');
@@ -417,31 +427,29 @@ it.each(['add', 'update'] as const)('lets an undisclosed signup give way to a co
 it('writes no new login when a conflicting signup wins disclosure during page give-way', async () => {
   const prepared = await attempts.prepareSignup({ jobId: 'signup-job', origin: SITE, username: ALIAS });
   if (prepared.status !== 'prepared') throw new Error(prepared.status);
-  const run = getDb().run.bind(getDb());
-  vi.spyOn(getDb(), 'run').mockImplementation(async (sql, ...parameters) => {
-    if (sql.includes('SET phase = ?') && parameters[0] === 'rejected')
-      await run("UPDATE gws_ea_browser_credential_attempts SET phase='exposed' WHERE id=?", prepared.attempt.id);
-    return run(sql, ...parameters);
+  const create = fixture.store.create.bind(fixture.store);
+  vi.spyOn(fixture.store, 'create').mockImplementationOnce(async (spec) => {
+    await attempts.disclose(prepared.attempt.id, { jobId: 'signup-job', origin: SITE });
+    return create(spec);
   });
   const response = await post('/logins/add', { site: SITE, username: ALIAS, title: '', password: SECRET });
   expect(response.status).toBe(409);
   expect(await fixture.store.forOrigin(SITE)).toEqual([]);
-  expect(await fixture.store.hasPending(prepared.attempt.id)).toBe(true);
+  expect(fixture.hasPending(prepared.attempt.id)).toBe(true);
 });
 
 it('writes nothing when giving way loses the compare-and-set to disclosure', async () => {
   const { loginId, attempt } = await changing('saved');
-  const run = getDb().run.bind(getDb());
-  vi.spyOn(getDb(), 'run').mockImplementation(async (sql, ...parameters) => {
-    if (sql.includes('SET phase = ?') && parameters[0] === 'rejected')
-      await run("UPDATE gws_ea_browser_credential_attempts SET phase='exposed' WHERE id=?", attempt.id);
-    return run(sql, ...parameters);
+  const update = fixture.store.update.bind(fixture.store);
+  vi.spyOn(fixture.store, 'update').mockImplementationOnce(async (...args) => {
+    await attempts.disclose(attempt.id, { jobId: attempt.job_id, origin: SITE });
+    return update(...args);
   });
   const response = await post('/logins/update', { handle: loginId, version: '1', password: 'replacement' });
   expect(response.status).toBe(409);
   expect(response.body).toContain('The assistant is changing this password.');
   expect(await fixture.store.secret(loginId, 'password', SITE)).toBe(SECRET);
-  expect(await fixture.store.hasPending(attempt.id)).toBe(true);
+  expect(fixture.hasPending(attempt.id)).toBe(true);
 });
 
 it('lists and removes with a missing key while saving shows one operator message without secrets', async () => {
@@ -474,13 +482,13 @@ it('lists and removes with a missing key while saving shows one operator message
   expect(await fixture.store.all()).toEqual([]);
 });
 
-it('rejects missing handles and preserves the store version check if a login changes after give-way', async () => {
+it('rejects missing handles and preserves the store version check if a login changes before the write', async () => {
   expect((await post('/logins/remove', { handle: 'vault_unlisted', version: '1' })).status).toBe(409);
   const saved = await login();
   const update = fixture.store.update.bind(fixture.store);
-  vi.spyOn(attempts, 'giveWayForLogin').mockImplementation(async () => {
+  vi.spyOn(fixture.store, 'update').mockImplementationOnce(async (...args) => {
     await update(saved.id, 1, { title: 'Concurrent title', password: '' });
-    return 'ready';
+    return update(...args);
   });
   const response = await post('/logins/update', { handle: saved.id, version: '1', password: 'replacement' });
   expect(response.status).toBe(409);

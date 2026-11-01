@@ -1,4 +1,5 @@
 import { testLoginStore } from './testing/login-store.js';
+import { credentialAttempts } from './credential-attempts.js';
 import * as loginStoreModule from './login-store.js';
 import { useAvailableBrowser } from './testing/browser-runtime.js';
 import { repairBrowserWatchChecks } from './scheduler.js';
@@ -1165,6 +1166,42 @@ it('refuses ordinary site contention before creating a signed-out Chrome context
   });
 });
 
+it.each(['missing', 'conflicting'] as const)(
+  'refuses a signed-out check before Chrome when rollback left a %s lease for a held credential',
+  async (lease) => {
+    const connection = vi.fn(async () => {
+      throw new Error('A held site must not open Chrome');
+    });
+    const queue = createQueue({ ...runtime, connection });
+    const job = await store.jobForSession(session);
+    if (!job) throw new Error('Missing browser job');
+    if (lease === 'conflicting') await queue.leases.acquire(job.id, 'https://resy.com');
+    const held = await credentialAttempts.prepareSignup({
+      jobId: 'system:a2a:main-q:lost',
+      origin: 'https://resy.com',
+      username: 'soren_handle',
+    });
+    if (held.status !== 'prepared') throw new Error(held.status);
+    await credentialAttempts.disclose(held.attempt.id, { jobId: held.attempt.job_id, origin: 'https://resy.com' });
+    expect(
+      await runBrowserWatchCheck(
+        queue,
+        {
+          id: 'check',
+          jobId: job.id,
+          site: 'resy.com',
+          recipeId: 'recipe',
+          parameters: {},
+          venueId: 'venue',
+          partySize: 2,
+        },
+        new AbortController().signal,
+      ),
+    ).toEqual({ status: 'site_busy' });
+    expect(connection).not.toHaveBeenCalled();
+  },
+);
+
 it('keeps a pending checkout exclusive while its owning job is executing', async () => {
   const queue = createQueue(runtime);
   const job = await store.jobForSession(session);
@@ -1219,30 +1256,25 @@ it('keeps a pending checkout exclusive while its owning job is executing', async
 });
 
 describe('an authorized credential operation cut off after disclosure', () => {
-  const AUTHORITY = '6f1d2c3b-4a5e-4f60-8a7b-9c0d1e2f3a4b';
+  let authority: string;
   const ref = (n: number) => ({ ref: `e${n}`, generation: 2 });
-  const form = { authority: AUTHORITY, username: ref(1), new_password: ref(2), activate: ref(3) };
+  const form = () => ({ authority, username: ref(1), new_password: ref(2), activate: ref(3) });
 
-  async function attempt(job: BrowserJob, phase: string, exposedAt: string | null): Promise<void> {
-    const at = new Date(Date.now() - 60_000).toISOString();
-    await loginFixture.store.savePending(AUTHORITY, 'pending-fixture-password');
-    await store.db.run(
-      `INSERT INTO gws_ea_browser_credential_attempts
-       (id,kind,job_id,origin,site,username,phase,created_at,updated_at,exposed_at)
-       VALUES(?,'signup',?,'https://accounts.shop.example','shop.example','morgan.ellery@example.com',?,?,?,?)`,
-      AUTHORITY,
-      job.id,
-      phase,
-      at,
-      at,
-      exposedAt,
-    );
+  async function attempt(job: BrowserJob, phase: string): Promise<void> {
+    const origin = 'https://accounts.shop.example';
+    const result = await credentialAttempts.prepareSignup({
+      jobId: job.id,
+      origin,
+      username: 'morgan.ellery@example.com',
+    });
+    if (result.status !== 'prepared') throw new Error(result.status);
+    authority = result.attempt.id;
+    if (phase !== 'saved') {
+      await credentialAttempts.disclose(authority, { jobId: job.id, origin });
+      if (phase === 'awaiting_verification') await credentialAttempts.markAwaitingVerification(authority);
+    }
   }
-  const read = () =>
-    store.db.get<{ phase: string; exposed_at: string }>(
-      'SELECT phase, exposed_at FROM gws_ea_browser_credential_attempts WHERE id = ?',
-      AUTHORITY,
-    );
+  const read = () => credentialAttempts.get(authority);
   const answer = (requestId: string) =>
     (responses() as Array<{ requestId: string; frame: { data?: Record<string, unknown> } }>).find(
       (response) => response.requestId === requestId,
@@ -1257,6 +1289,48 @@ describe('an authorized credential operation cut off after disclosure', () => {
       expect(await store.db.all(`SELECT * FROM ${table}`)).toEqual([]);
   }
 
+  it.each(['signup', 'rotation'] as const)(
+    'reports the committed %s when rollback restores its request before start',
+    async (kind) => {
+      const job = await store.jobForSession(session);
+      if (!job) throw new Error('Missing browser job');
+      const origin = 'https://accounts.shop.example';
+      const username = 'soren_handle';
+      let loginId: string | undefined;
+      if (kind === 'rotation') {
+        const source = await credentialAttempts.prepareSignup({ jobId: job.id, origin, username });
+        if (source.status !== 'prepared') throw new Error(source.status);
+        await credentialAttempts.disclose(source.attempt.id, { jobId: job.id, origin });
+        const saved = await credentialAttempts.confirm(source.attempt.id, { signal: 'account_page' });
+        loginId = saved.attempt.owned_login_id ?? undefined;
+        if (!loginId) throw new Error('Missing owned login');
+      }
+      const prepared = loginId
+        ? await credentialAttempts.prepareRotation({ jobId: job.id, origin, username, itemHandle: loginId })
+        : await credentialAttempts.prepareSignup({ jobId: job.id, origin, username });
+      if (prepared.status !== 'prepared') throw new Error(prepared.status);
+      authority = prepared.attempt.id;
+      await store.accept(job, session, 'restored-before-start', 'credential_form', form(), 90_000);
+      await credentialAttempts.disclose(authority, { jobId: job.id, origin });
+      await credentialAttempts.confirm(authority, { signal: 'success_text' });
+      loginFixture.setUnavailable(true);
+      const reads = loginFixture.keyReads();
+      const queue = createQueue(runtime);
+      try {
+        await recoverAndStartBrowserQueue(queue);
+        expect(answer('restored-before-start')).toMatchObject({
+          status: kind === 'signup' ? 'account_created' : 'password_changed',
+        });
+        expect(answer('restored-before-start')).not.toHaveProperty('repeat_safe');
+        expect(await read()).toMatchObject({ phase: 'finalized' });
+        expect(loginFixture.hasPending(authority)).toBe(false);
+        expect(loginFixture.keyReads()).toBe(reads);
+      } finally {
+        await queue.stop();
+      }
+    },
+  );
+
   it('covers AE3: answers it outcome_unknown on restart, keeps the same candidate and site held, and never submits again', async () => {
     const job = await store.jobForSession(session);
     if (!job) throw new Error('Expected browser job');
@@ -1265,10 +1339,11 @@ describe('an authorized credential operation cut off after disclosure', () => {
       job.id,
       new Date().toISOString(),
     );
-    await store.accept(job, session, 'credential-crash', 'credential_form', form, 90_000);
+    await attempt(job, 'saved');
+    await store.accept(job, session, 'credential-crash', 'credential_form', form(), 90_000);
     await store.start(browserRequestId(session.id, 'credential-crash'));
     // The crash came during the first input callback: the attempt was recorded exposed, then nothing answered.
-    await attempt(job, 'exposed', new Date(Date.now() + 1_000).toISOString());
+    await credentialAttempts.disclose(authority, { jobId: job.id, origin: 'https://accounts.shop.example' });
 
     const queue = createQueue(runtime);
     const run = store.db.run.bind(store.db);
@@ -1288,7 +1363,7 @@ describe('an authorized credential operation cut off after disclosure', () => {
     await noPurchaseRecords();
 
     // A retry, by the browser or after another restart, reports the recorded outcome without touching the page.
-    await queue.accept('credential_form', form, session, 'credential-retry');
+    await queue.accept('credential_form', form(), session, 'credential-retry');
     await queue.idle();
     expect(answer('credential-retry')).toEqual(expect.objectContaining({ status: 'outcome_unknown' }));
     await queue.stop();
@@ -1320,11 +1395,10 @@ describe('an authorized credential operation cut off after disclosure', () => {
       browser: {
         validate: (content) => ({ authority: content.authority }),
         async execute() {
-          await store.db.run(
-            "UPDATE gws_ea_browser_credential_attempts SET phase = 'exposed', exposed_at = ? WHERE id = ?",
-            new Date().toISOString(),
-            AUTHORITY,
-          );
+          await credentialAttempts.disclose(authority, {
+            jobId: session.thread_id!,
+            origin: 'https://accounts.shop.example',
+          });
           await held;
           return { status: 'account_created' };
         },
@@ -1333,10 +1407,10 @@ describe('an authorized credential operation cut off after disclosure', () => {
     };
     const job = await store.jobForSession(session);
     if (!job) throw new Error('Expected browser job');
-    await attempt(job, 'saved', null);
+    await attempt(job, 'saved');
     const queue = createQueue(runtime);
     await recoverAndStartBrowserQueue(queue);
-    await queue.accept('browser', { authority: AUTHORITY, budget_ms: 50 }, session, 'timed-out');
+    await queue.accept('browser', { authority, budget_ms: 50 }, session, 'timed-out');
     await new Promise((resolve) => setTimeout(resolve, 150));
     expect(answer('timed-out')).toMatchObject({ status: 'outcome_unknown' });
     expect(await read()).toMatchObject({ phase: 'unknown' });
@@ -1356,11 +1430,10 @@ describe('an authorized credential operation cut off after disclosure', () => {
       browser: {
         validate: (content) => ({ authority: content.authority }),
         async execute() {
-          await store.db.run(
-            "UPDATE gws_ea_browser_credential_attempts SET phase = 'exposed', exposed_at = ? WHERE id = ?",
-            new Date().toISOString(),
-            AUTHORITY,
-          );
+          await credentialAttempts.disclose(authority, {
+            jobId: session.thread_id!,
+            origin: 'https://accounts.shop.example',
+          });
           await held;
           return { status: 'account_created' };
         },
@@ -1369,7 +1442,7 @@ describe('an authorized credential operation cut off after disclosure', () => {
     };
     const job = await store.jobForSession(session);
     if (!job) throw new Error('Expected browser job');
-    await attempt(job, 'saved', null);
+    await attempt(job, 'saved');
     // Closing the timed-out page ends the cut-off operation, which settles before the answer is recorded.
     const queue = createQueue({
       ...runtime,
@@ -1379,7 +1452,7 @@ describe('an authorized credential operation cut off after disclosure', () => {
       },
     });
     await recoverAndStartBrowserQueue(queue);
-    await queue.accept('browser', { authority: AUTHORITY, budget_ms: 20 }, session, 'late');
+    await queue.accept('browser', { authority, budget_ms: 20 }, session, 'late');
     await queue.idle();
     expect(answer('late')).toMatchObject({ status: 'outcome_unknown' });
     expect(await read()).toMatchObject({ phase: 'unknown' });
@@ -1390,14 +1463,22 @@ describe('an authorized credential operation cut off after disclosure', () => {
   it('leaves an attempt another request disclosed, such as one awaiting email verification, as it was', async () => {
     const job = await store.jobForSession(session);
     if (!job) throw new Error('Expected browser job');
-    await attempt(job, 'awaiting_verification', new Date(Date.now() - 30_000).toISOString());
-    await store.accept(job, session, 'later-step', 'credential_form', form, 90_000);
-    await store.start(browserRequestId(session.id, 'later-step'));
-    const queue = createQueue(runtime);
-    await recoverAndStartBrowserQueue(queue);
-    expect(answer('later-step')).toMatchObject({ status: 'stopped', reason: 'interrupted' });
-    expect(await read()).toMatchObject({ phase: 'awaiting_verification' });
-    await queue.stop();
+    const started = Date.now();
+    vi.useFakeTimers({ toFake: ['Date'] });
+    try {
+      vi.setSystemTime(started - 30_000);
+      await attempt(job, 'awaiting_verification');
+      vi.setSystemTime(started);
+      await store.accept(job, session, 'later-step', 'credential_form', form(), 90_000);
+      await store.start(browserRequestId(session.id, 'later-step'));
+      const queue = createQueue(runtime);
+      await recoverAndStartBrowserQueue(queue);
+      expect(answer('later-step')).toMatchObject({ status: 'stopped', reason: 'interrupted' });
+      expect(await read()).toMatchObject({ phase: 'awaiting_verification' });
+      await queue.stop();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 

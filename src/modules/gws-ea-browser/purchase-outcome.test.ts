@@ -1,3 +1,5 @@
+import * as loginStores from './login-store.js';
+import { testLoginStore } from './testing/login-store.js';
 import { useAvailableBrowser } from './testing/browser-runtime.js';
 import { claimRegionWatchCommit } from './watch-state.js';
 import { createBrowserQueue } from './index.js';
@@ -186,6 +188,7 @@ const authority = (attemptId: string) =>
 const blocks = () => getDb().all<{ site: string }>('SELECT site FROM gws_ea_browser_purchase_blocks ORDER BY site');
 
 beforeEach(async () => {
+  vi.spyOn(loginStores, 'getLoginStore').mockResolvedValue(testLoginStore(`${root}/browser`).store);
   useAvailableBrowser();
   fs.rmSync(root, { recursive: true, force: true });
   await runMigrations(await initTestDb());

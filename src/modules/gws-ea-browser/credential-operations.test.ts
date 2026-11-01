@@ -22,6 +22,7 @@ import {
   closeDb,
   createAgentGroup,
   createMessagingGroup,
+  createPendingApproval,
   getAgentGroup,
   getDb,
   initTestDb,
@@ -33,7 +34,10 @@ import { inboundDbPath } from '../../mailbox/sqlite/paths.js';
 import { resolveSystemSession } from '../../session-manager.js';
 import type { PendingApproval, Session } from '../../types.js';
 import { requestApproval, sweepExpiredApprovals } from '../approvals/index.js';
-import { handleApprovalsResponse } from '../approvals/response-handler.js';
+import { handleApprovalsResponse, resumeApprovedApprovals } from '../approvals/response-handler.js';
+import { resolveMainConversation } from '../gws-ea-profile/main-note.js';
+import * as availability from './availability.js';
+import { deliverAction } from './testing/delivery-answer.js';
 import { addPrincipalAddress, bindVerifiedPrincipalUser } from '../gws-ea-profile/db.js';
 import '../gws-ea-profile/index.js';
 import { recordWebAlias } from '../gws-ea-profile/testing/web-alias.js';
@@ -42,11 +46,12 @@ import { upsertUser } from '../permissions/db/users.js';
 import './index.js';
 import { CONSENT_APPROVAL } from './consent-approval.js';
 import { recordConsentStops } from './consent.js';
-import { CredentialAttempts, type CredentialAttempt } from './credential-attempts.js';
+import { CredentialAttempts } from './credential-attempts.js';
 import {
   credentialAuthorityRequest,
   executeCredentialForm,
   recoverCredentialAttempts,
+  notifyOrphanCredentialAttempts,
   registerCredentialAuthorityDelivery,
   validateCredentialForm,
 } from './credential-operations.js';
@@ -74,7 +79,7 @@ beforeEach(async () => {
   fixture = testLoginStore(path.join(directory, 'browser'));
   vi.spyOn(loginStoreModule, 'getLoginStore').mockResolvedValue(fixture.store);
   await runMigrations(await initTestDb());
-  attempts = new CredentialAttempts({ db: getDb(), store: fixture.store });
+  attempts = new CredentialAttempts({ store: fixture.store });
   for (const id of ['main', 'browser'])
     await createAgentGroup({ id, name: id, folder: id, agent_provider: null, created_at: new Date().toISOString() });
   await getDb().run(
@@ -207,7 +212,7 @@ describe("main's credential authority", () => {
   });
 
   it('refuses a change on a principal, edited or missing Login before any page insertion', async () => {
-    const before = await getDb().all<CredentialAttempt>('SELECT * FROM gws_ea_browser_credential_attempts');
+    const before = await attempts.unresolved();
     expect(await ask({ operation: 'change_password', site: ORIGIN, username: USERNAME })).toEqual({
       status: 'not_owned',
     });
@@ -215,7 +220,7 @@ describe("main's credential authority", () => {
     expect(await ask({ operation: 'change_password', site: ORIGIN, username: USERNAME })).toEqual({
       status: 'not_owned',
     });
-    expect(await getDb().all('SELECT * FROM gws_ea_browser_credential_attempts')).toEqual(before);
+    expect(await attempts.unresolved()).toEqual(before);
 
     await fixture.store.remove(principal.id, principal.version);
     const itemId = await assistantLogin();
@@ -237,11 +242,7 @@ describe("main's credential authority", () => {
     expect(await ask({ operation: 'change_password', site: ORIGIN, username: USERNAME })).toEqual({
       status: 'not_owned',
     });
-    expect(
-      (await getDb().all<CredentialAttempt>('SELECT * FROM gws_ea_browser_credential_attempts')).filter(
-        (attempt) => attempt.kind === 'rotation',
-      ),
-    ).toEqual([]);
+    expect((await attempts.unresolved()).filter((attempt) => attempt.kind === 'rotation')).toEqual([]);
   });
 
   it('never records a second signup for an account whose first may have reached the site', async () => {
@@ -292,10 +293,7 @@ describe("main's credential authority", () => {
     );
     expect(taken).toMatchObject({ status: 'recorded', operation: 'change_password', username: USERNAME });
     expect(await attempts.get(String(recorded.authority))).toMatchObject({ phase: 'rejected' });
-    await getDb().run(
-      `UPDATE gws_ea_browser_credential_attempts SET phase = 'exposed' WHERE id = ?`,
-      String(taken.authority),
-    );
+    await attempts.disclose(String(taken.authority), { jobId: other.thread_id!, origin: ORIGIN });
     expect(await ask({ operation: 'change_password', site: ORIGIN, username: USERNAME })).toEqual({ status: 'busy' });
   });
 
@@ -440,7 +438,7 @@ describe('the browser credential request', () => {
     expect(page).not.toHaveBeenCalled();
     expect(await attempts.get(id)).toMatchObject({ phase: 'finalized', owned_login_id: itemId });
     expect(await fixture.store.secret(itemId, 'password', ORIGIN)).toBe(disclosed.credential.password);
-    expect(await fixture.store.hasPending(id)).toBe(false);
+    expect(fixture.hasPending(id)).toBe(false);
   });
 
   it("answers not_watched from verify when the signup's email has no wait, and leaves it for the principal's release", async () => {
@@ -479,7 +477,7 @@ describe('the browser credential request', () => {
       const id = String(recorded.authority);
       await attempts.disclose(id, { jobId: job.thread_id!, origin: ORIGIN });
       await attempts.markUnknown(id, { signal: 'interrupted' });
-      const restarted = new CredentialAttempts({ db: getDb(), store: fixture.store });
+      const restarted = new CredentialAttempts({ store: fixture.store });
       const { page, result } = reconcile(id, restarted);
       expect(await result).toEqual({ status: 'inconclusive' });
       expect(page).not.toHaveBeenCalled();
@@ -613,6 +611,94 @@ describe("the principal's release of an attempt the host cannot settle", () => {
     await attempts.disclose(id, { jobId: job.thread_id!, origin: ORIGIN });
     return { id, itemId };
   }
+
+  it.each(['job', 'job_and_session'] as const)(
+    'releases a surviving attempt through current main after rollback removes its %s without recreating it',
+    async (lost) => {
+      const id = await disclosedSignup('soren_handle');
+      await attempts.markUnknown(id);
+      await getDb().run('DELETE FROM gws_ea_browser_jobs WHERE id = ?', job.thread_id);
+      if (lost === 'job_and_session') await getDb().run('DELETE FROM sessions WHERE id = ?', job.id);
+      fixture.setUnavailable(true);
+      const reads = fixture.keyReads();
+      expect(await release(id)).toEqual({ status: 'awaiting_principal' });
+      expect(await getDb().all('SELECT id FROM gws_ea_browser_jobs')).toEqual([]);
+      await click('approve');
+      expect(await attempts.get(id)).toMatchObject({ phase: 'rejected' });
+      expect(fixture.hasPending(id)).toBe(false);
+      expect(fixture.keyReads()).toBe(reads);
+      expect(await getDb().all('SELECT id FROM gws_ea_browser_jobs')).toEqual([]);
+    },
+  );
+
+  it('asks for release through native delivery while Chrome is unavailable', async () => {
+    const id = await disclosedSignup('soren_handle');
+    await attempts.markUnknown(id);
+    vi.spyOn(availability, 'browserAvailability').mockResolvedValue({ available: false, reason: 'chrome-missing' });
+    expect(
+      await deliverAction(main, 'credential_authority', {
+        thread: job.thread_id,
+        operation: 'release',
+        authority: id,
+      }),
+    ).toMatchObject({ ok: true, data: { status: 'awaiting_principal' } });
+    expect(await pending()).toHaveLength(1);
+  });
+
+  it('restores an orphan notice lost from the current main mailbox without recreating its errand', async () => {
+    const id = await disclosedSignup('soren_handle');
+    await attempts.markUnknown(id);
+    await getDb().run('DELETE FROM gws_ea_browser_jobs WHERE id = ?', job.thread_id);
+    await getDb().run('DELETE FROM sessions WHERE id = ?', job.id);
+    fixture.setUnavailable(true);
+    const reads = fixture.keyReads();
+    await notifyOrphanCredentialAttempts(attempts);
+    const conversation = await resolveMainConversation();
+    if (typeof conversation === 'string') throw new Error(conversation);
+    const mailbox = new Database(inboundDbPath('main', conversation.session.id));
+    try {
+      const noteId = `browser-orphan-credential-${id}`;
+      const note = () =>
+        mailbox.prepare<[string], { content: string }>('SELECT content FROM messages_in WHERE id = ?').all(noteId);
+      expect(note()).toHaveLength(1);
+      expect(note()[0].content).toContain(id);
+      expect(note()[0].content).toContain(job.thread_id);
+      await notifyOrphanCredentialAttempts(attempts);
+      expect(note()).toHaveLength(1);
+      mailbox.prepare('DELETE FROM messages_in WHERE id = ?').run(noteId);
+      await notifyOrphanCredentialAttempts(attempts);
+      expect(note()).toHaveLength(1);
+      expect(fixture.keyReads()).toBe(reads);
+      expect(await getDb().all('SELECT id FROM gws_ea_browser_jobs')).toEqual([]);
+    } finally {
+      mailbox.close();
+    }
+  });
+
+  it('replays a restored approved release without claiming a newly added principal login', async () => {
+    const id = await disclosedSignup('soren_handle');
+    await attempts.markUnknown(id);
+    await release(id);
+    const [approval] = await pending();
+    await click('approve');
+    const saved = await fixture.store.create({
+      site: ORIGIN,
+      username: 'soren_handle',
+      title: 'Principal login',
+      password: 'principal-chosen-password',
+    });
+    const released = await attempts.get(id);
+    expect(await createPendingApproval({ ...approval, status: 'approved' })).toBe(true);
+    fixture.setUnavailable(true);
+    const reads = fixture.keyReads();
+    await resumeApprovedApprovals();
+    expect(await attempts.get(id)).toEqual(released);
+    expect(await attempts.accountForLogin(saved)).toBe('principal');
+    expect(fixture.keyReads()).toBe(reads);
+    expect(await pending()).toEqual([]);
+    fixture.setUnavailable(false);
+    expect(await fixture.store.secret(saved.id, 'password', ORIGIN)).toBe('principal-chosen-password');
+  });
 
   it('refuses attempts that are settled or never reached the site, other jobs, and every caller but main', async () => {
     const preparing = String((await ask({ operation: 'signup', site: ORIGIN, username: USERNAME })).authority);
@@ -769,12 +855,12 @@ describe("the principal's release of an attempt the host cannot settle", () => {
 
   it('does not redisclose a password after a consent grant, and warns that a new attempt may duplicate it', async () => {
     const { id } = await uncertainAfterConsent();
-    const password = await fixture.store.disclosePending(id);
+    const password = fixture.attemptPassword(id);
     expect(await attempts.disclose(id, { jobId: job.thread_id!, origin: ORIGIN })).toEqual({
       status: 'refused',
       reason: 'not_saved',
     });
-    expect(await fixture.store.disclosePending(id)).toBe(password);
+    expect(fixture.attemptPassword(id)).toBe(password);
     expect(await release(id)).toEqual({ status: 'awaiting_principal' });
     const question = (JSON.parse(cards.at(-1) ?? '{}') as { question?: string }).question ?? '';
     expect(question).toContain('discard the generated password');
@@ -790,17 +876,11 @@ describe("the principal's release of an attempt the host cannot settle", () => {
 
   it('finishes an already committed change on approval without reporting a discarded password or holding its site', async () => {
     const { id, itemId } = await disclosedChange();
-    const password = await fixture.store.disclosePending(id);
+    const password = fixture.attemptPassword(id);
     await attempts.markUnknown(id, { signal: 'interrupted' });
     await holdSite();
     expect(await release(id)).toEqual({ status: 'awaiting_principal' });
-    const run = getDb().run.bind(getDb());
-    const interrupted = vi.spyOn(getDb(), 'run').mockImplementation(async (sql, ...parameters) => {
-      if (sql.includes("SET phase = 'finalized'")) throw new Error('Central write interrupted');
-      return run(sql, ...parameters);
-    });
-    await expect(attempts.confirm(id, { signal: 'late_response' })).rejects.toThrow('Central write interrupted');
-    interrupted.mockRestore();
+    await attempts.confirm(id, { signal: 'late_response' });
     fixture.setUnavailable(true);
     await click('approve');
     expect(await attempts.get(id)).toMatchObject({ phase: 'finalized', owned_login_id: itemId });
@@ -834,7 +914,7 @@ describe("the principal's release of an attempt the host cannot settle", () => {
       cancelled: 1,
     });
     expect(closed).toContain(job.thread_id);
-    expect(await fixture.store.hasPending(id)).toBe(false);
+    expect(fixture.hasPending(id)).toBe(false);
     expect(notes().at(-1)).toContain('generated password was discarded');
     // The account is no longer busy: a new errand may sign up for it.
     const next = (await resolveSystemSession('browser', 'system:a2a:main:next-errand')).session;
@@ -859,7 +939,7 @@ describe("the principal's release of an attempt the host cannot settle", () => {
 });
 
 describe("a signup's account email", () => {
-  const recordedAttempts = () => getDb().all<CredentialAttempt>('SELECT * FROM gws_ea_browser_credential_attempts');
+  const recordedAttempts = () => attempts.unresolved();
 
   beforeEach(async () => {
     await getDb().run(

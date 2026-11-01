@@ -16,6 +16,7 @@ import {
 } from './authentication-submit.js';
 import { getLoginStore, LoginStoreError } from './login-store.js';
 import { credentialAttempts } from './credential-attempts.js';
+import { SiteLeaseStore } from './leases.js';
 import {
   disposeBrowserRefs,
   pinBrowserRefs,
@@ -24,7 +25,7 @@ import {
   type PinnedBrowserRef,
 } from './observe.js';
 import { registerPageSecret, bindPageSecretDocuments, releasePageSecret } from './page-privacy.js';
-import type { BrowserExecutionContext, BrowserQueuedAction } from './actions.js';
+import { browserOperationId, type BrowserExecutionContext, type BrowserQueuedAction } from './actions.js';
 
 export interface BoundBrowserSecretField {
   readonly page: Page;
@@ -36,7 +37,13 @@ export interface BoundBrowserSecretField {
   readonly nativeField: NativeAuthenticationBinding;
 }
 export type BrowserSecretFillResult = {
-  status: 'submitted' | 'cleared_after_submit' | 'origin_mismatch' | 'no_item_for_site' | 'vault_unavailable';
+  status:
+    | 'submitted'
+    | 'cleared_after_submit'
+    | 'origin_mismatch'
+    | 'no_item_for_site'
+    | 'vault_unavailable'
+    | 'site_busy';
 };
 
 /** The field and its submit control are not in one frame on one HTTPS origin. */
@@ -184,6 +191,9 @@ export async function fillBoundBrowserSecret(
     )
       return { status: 'origin_mismatch' };
     await context.assertActive();
+    const lease = await new SiteLeaseStore(context.store.db).acquire(context.job.id, binding.origin);
+    await context.wakeWaiters(lease.waitingJobs, `${browserOperationId(context)}:sign-in-lease`);
+    if (!lease.acquired) return { status: 'site_busy' };
     assertBrowserSecretDiagnosticsSafe();
     value = await resolve();
     await context.assertActive();
@@ -228,8 +238,7 @@ export async function fillBoundBrowserSecret(
     return { status: navigated ? 'submitted' : 'cleared_after_submit' };
   } catch (error) {
     if (error instanceof BrowserOriginMismatchError) return { status: 'origin_mismatch' };
-    if (error instanceof LoginStoreError)
-      return { status: error.reason === 'pending_missing' ? 'vault_unavailable' : error.reason };
+    if (error instanceof LoginStoreError) return { status: error.reason };
     // Store and Playwright exceptions may carry values or page text; only constant host prose crosses this boundary.
     throw forbidden('The host could not safely complete this sign-in. Take a fresh observation.');
   } finally {
@@ -330,8 +339,7 @@ export async function executeFillSecret(
       });
     } catch (error) {
       if (error instanceof BrowserOriginMismatchError) return { status: 'origin_mismatch' };
-      if (error instanceof LoginStoreError)
-        return { status: error.reason === 'pending_missing' ? 'vault_unavailable' : error.reason };
+      if (error instanceof LoginStoreError) return { status: error.reason };
       if (error instanceof ActionRefusal) throw error;
       throw forbidden('Choose a supported sign-in field and submit control from a fresh observation.');
     } finally {

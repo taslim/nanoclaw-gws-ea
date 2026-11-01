@@ -350,8 +350,9 @@ Any process running as the same macOS user can read the key through
 `/usr/bin/security`. Encryption protects a copied store file; it does not protect
 passwords from another process running as that user. NanoClaw provides no backup
 or export of logins and stores no one-time codes. Email-code sign-in is unchanged.
-Updates and rollbacks preserve the store file. Releases that predate the built-in
-store cannot read it.
+Updates and rollbacks preserve saved logins, account ownership and unsettled
+attempts together in the store file. Releases that predate the built-in store
+cannot read it.
 
 The assistant saves generated passwords before submitting a signup or password
 change. An account belongs to the assistant when its username is any spelling of

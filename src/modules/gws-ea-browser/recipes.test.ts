@@ -1,3 +1,8 @@
+import * as loginStores from './login-store.js';
+import { testLoginStore } from './testing/login-store.js';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { readRecipeSiteInfo } from './recipe-store.js';
 import Database from 'better-sqlite3';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -155,6 +160,7 @@ it('pins immutable recipe versions and keys checks by every named value', async 
 const chromePath = process.env.GWS_EA_BROWSER_TEST_CHROME;
 // Each test launches a real Chrome, like the other native suites' 30-second budget.
 describe.skipIf(!chromePath)('recorded recipes in native Chrome', { timeout: 30_000 }, () => {
+  let loginRoot: string;
   let db: SqliteDriver;
   let browser: Browser;
   let server: Server;
@@ -165,6 +171,8 @@ describe.skipIf(!chromePath)('recorded recipes in native Chrome', { timeout: 30_
     <button onclick="window.commits=(window.commits||0)+1">Confirm reservation</button>
     <input type="password" aria-label="Password"></body>`;
   beforeEach(async () => {
+    loginRoot = await mkdtemp(join(tmpdir(), 'recipe-logins-'));
+    vi.spyOn(loginStores, 'getLoginStore').mockResolvedValue(testLoginStore(join(loginRoot, 'browser')).store);
     db = new SqliteDriver(new Database(':memory:'));
     await db.exec(
       "CREATE TABLE gws_ea_browser_jobs(id TEXT PRIMARY KEY); INSERT INTO gws_ea_browser_jobs VALUES('job-1');",
@@ -205,6 +213,8 @@ describe.skipIf(!chromePath)('recorded recipes in native Chrome', { timeout: 30_
     } as unknown as BrowserExecutionContext;
   }, 30_000);
   afterEach(async () => {
+    vi.restoreAllMocks();
+    await rm(loginRoot, { recursive: true, force: true });
     await browser?.close();
     await new Promise<void>((resolve) => server?.close(() => resolve()));
     await db?.close();

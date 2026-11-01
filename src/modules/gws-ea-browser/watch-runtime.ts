@@ -11,7 +11,7 @@ import {
   type BrowserRef,
 } from './observe.js';
 import { collectSecretFields, redactPageText } from './page-privacy.js';
-import { browserSite, type SiteLease } from './leases.js';
+import { credentialSiteHeldByOther, browserSite, type SiteLease } from './leases.js';
 import { merchantSignatureFor } from './merchant-read.js';
 import type { ReservationAvailability, ReservationPolicy } from './merchant-contract.js';
 import { browserAvailability } from './availability.js';
@@ -248,6 +248,7 @@ export async function runBrowserWatchCheck(
   signal: AbortSignal,
 ): Promise<BrowserWatchCheckResult> {
   const db = queue.store.db;
+  if (await credentialSiteHeldByOther(input.jobId, input.site)) return { status: 'site_busy' };
   const initial = await db.get<SiteLease>('SELECT * FROM gws_ea_browser_site_leases WHERE site = ?', input.site);
   if (initial && initial.job_id !== input.jobId && !(await pendingCheckout(queue, initial)))
     return { status: 'site_busy' };
@@ -286,6 +287,7 @@ export async function runBrowserWatchCheck(
         } catch {
           return 'blocked_address';
         }
+        if (await credentialSiteHeldByOther(input.jobId, input.site)) return 'site_busy';
         const lease = await db.get<SiteLease>('SELECT * FROM gws_ea_browser_site_leases WHERE site = ?', input.site);
         if (lease) {
           if (lease.job_id === input.jobId) return 'ordinary';

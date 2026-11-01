@@ -1,5 +1,6 @@
 import * as loginStoreModule from './login-store.js';
 import { testLoginStore } from './testing/login-store.js';
+import { credentialAttempts } from './credential-attempts.js';
 import { useAvailableBrowser } from './testing/browser-runtime.js';
 import { createBrowserQueue, recoverAndStartBrowserQueue } from './index.js';
 /** The principal's side of the consent engine: real approvals, delivery, central DB and mailbox. Only the container wake is mocked. */
@@ -207,24 +208,15 @@ async function notices(): Promise<Array<Record<string, unknown>>> {
 
 /** A password reached this form; its outcome remains uncertain independently of the consent decision. */
 async function uncertainCredential(stopId: string): Promise<string> {
-  const id = `credential-${stopId}`;
-  await (await loginStoreModule.getLoginStore()).savePending(id, 'consent-pending-password');
-  const at = new Date().toISOString();
-  await getDb().run(
-    `INSERT INTO gws_ea_browser_credential_attempts
-      (id,kind,job_id,origin,site,username,phase,evidence_json,created_at,updated_at)
-      VALUES(?,'signup',?,'https://join.example','join.example','aya@example.test','unknown',?,?,?)`,
-    id,
-    job.id,
-    JSON.stringify({ signal: 'consent', stops: stopId }),
-    at,
-    at,
-  );
+  const origin = 'https://join.example';
+  const result = await credentialAttempts.prepareSignup({ jobId: job.id, origin, username: 'aya@example.test' });
+  if (result.status !== 'prepared') throw new Error(result.status);
+  const id = result.attempt.id;
+  await credentialAttempts.disclose(id, { jobId: job.id, origin });
+  await credentialAttempts.markUnknown(id, { signal: 'consent', stops: stopId });
   return id;
 }
-const credentialPhase = async (id: string) =>
-  (await getDb().get<{ phase: string }>('SELECT phase FROM gws_ea_browser_credential_attempts WHERE id = ?', id))
-    ?.phase;
+const credentialPhase = async (id: string) => (await credentialAttempts.get(id))?.phase;
 
 /** Interrupt only a terminal consent write, after a real card claim and core decision can be recorded. */
 function failConsentSettlementOnce() {

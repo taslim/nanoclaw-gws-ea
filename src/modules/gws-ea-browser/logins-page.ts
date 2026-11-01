@@ -5,7 +5,6 @@ import { isPrincipalWebIdentity, type WebIdentity } from '../gws-ea-web/access.j
 import { credentialAttempts, type CredentialAttempts } from './credential-attempts.js';
 import {
   getLoginStore,
-  loginMetadata,
   LoginDetailsError,
   LoginStoreError,
   type LoginStore,
@@ -22,7 +21,6 @@ interface LoginsPageOptions {
 }
 const MAX_BODY_BYTES = 16 * 1024;
 class InvalidSubmission extends Error {}
-class LoginBusy extends Error {}
 function headers(nonce?: string): Readonly<Record<string, string>> {
   return {
     'cache-control': 'no-store',
@@ -114,10 +112,10 @@ function viewLocation(view: LoginsView): string {
   }
 }
 function failureMessage(error: unknown): string {
-  if (error instanceof LoginBusy)
-    return 'The assistant is changing this password. Try again after the change finishes.';
   if (error instanceof LoginDetailsError) {
     switch (error.reason) {
+      case 'login_busy':
+        return 'The assistant is changing this password. Try again after the change finishes.';
       case 'duplicate_login':
         return 'That site and username already have a login. Open that login to update it.';
       case 'invalid_site':
@@ -147,18 +145,6 @@ export function createLoginsPageHandler(options: LoginsPageOptions): RequestList
       if (!(await isPrincipalWebIdentity(await options.identity(request)))) return refuse(response);
       if (writing && !sameOriginJson(request, options.hostname)) return refuse(response);
       const store = options.store ?? (await getLoginStore());
-      const giveWay = async (handle: string, version: number, changes?: LoginChanges): Promise<void> => {
-        const before = await store.get(handle);
-        if (before.version !== version) throw new LoginDetailsError('login_changed');
-        const destination =
-          changes &&
-          loginMetadata({
-            site: changes.site ?? before.hostname,
-            username: changes.username ?? before.username,
-            title: changes.title ?? before.title,
-          });
-        if ((await credentials.giveWayForLogin(handle, destination)) !== 'ready') throw new LoginBusy();
-      };
       let outcome = '';
       let status = 200;
       let saved = false;
@@ -170,7 +156,6 @@ export function createLoginsPageHandler(options: LoginsPageOptions): RequestList
             view = { kind: 'add' };
             if (keys !== 'password,site,title,username') throw new InvalidSubmission();
             const spec = details(data);
-            if ((await credentials.giveWayForLogin(null, loginMetadata(spec))) !== 'ready') throw new LoginBusy();
             await store.create(spec);
             view = { kind: 'list' };
             outcome = 'Login added.';
@@ -185,7 +170,6 @@ export function createLoginsPageHandler(options: LoginsPageOptions): RequestList
             view = { kind: 'edit', handle };
             const version = versionField(data);
             const changes = changedDetails(data);
-            await giveWay(handle, version, changes);
             await store.update(handle, version, changes);
             view = { kind: 'detail', handle };
             outcome = 'Login updated.';
@@ -193,7 +177,6 @@ export function createLoginsPageHandler(options: LoginsPageOptions): RequestList
             if (keys !== 'handle,version') throw new InvalidSubmission();
             view = { kind: 'detail', handle: stringField(data, 'handle') };
             const version = versionField(data);
-            await giveWay(view.handle, version);
             await store.remove(view.handle, version);
             view = { kind: 'list' };
             outcome =
@@ -206,8 +189,13 @@ export function createLoginsPageHandler(options: LoginsPageOptions): RequestList
           if (error instanceof LoginStoreError && error.reason === 'no_item_for_site') {
             status = 409;
             view = { kind: 'list' };
-          } else if (error instanceof LoginBusy) status = 409;
-          else status = error instanceof LoginDetailsError ? (error.reason === 'login_changed' ? 409 : 400) : 503;
+          } else
+            status =
+              error instanceof LoginDetailsError
+                ? error.reason === 'login_changed' || error.reason === 'login_busy'
+                  ? 409
+                  : 400
+                : 503;
         }
       }
       let available = true;
