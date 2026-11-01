@@ -1,3 +1,5 @@
+import * as loginStoreModule from './login-store.js';
+import { testLoginStore } from './testing/login-store.js';
 import { configureBrowserAccess } from './testing/browser-access.js';
 import { useAvailableBrowser } from './testing/browser-runtime.js';
 import { recoverBrowserWatchState } from './watch-state.js';
@@ -89,6 +91,7 @@ function freeFacts(): PurchaseFacts {
 }
 let jobId: string;
 beforeEach(async () => {
+  vi.spyOn(loginStoreModule, 'getLoginStore').mockResolvedValue(testLoginStore(`${root}/browser`).store);
   useAvailableBrowser();
   vi.useFakeTimers({ toFake: ['Date'] });
   vi.setSystemTime(new Date('2026-10-15T12:00:00Z'));

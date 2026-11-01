@@ -2,22 +2,21 @@ import { randomBytes } from 'node:crypto';
 import type { IncomingMessage, RequestListener, ServerResponse } from 'node:http';
 import { isRecord } from '../../gws-ea/validation.js';
 import { isPrincipalWebIdentity, type WebIdentity } from '../gws-ea-web/access.js';
-import { onePasswordWebsiteOrigin } from './authentication-signatures.js';
 import { credentialAttempts, type CredentialAttempts } from './credential-attempts.js';
 import {
-  browserVault,
-  BrowserLoginError,
-  BrowserVaultError,
-  type BrowserVault,
-  type BrowserLoginDetails,
-  type BrowserLoginChanges,
-} from './onepassword.js';
+  getLoginStore,
+  LoginDetailsError,
+  LoginStoreError,
+  type LoginStore,
+  type LoginDetails,
+  type LoginChanges,
+} from './login-store.js';
 import { renderLoginsPage, type LoginRow, type LoginsView } from './logins-page-view.js';
 
 interface LoginsPageOptions {
   readonly hostname: string;
   readonly identity: WebIdentity;
-  readonly vault?: BrowserVault;
+  readonly store?: LoginStore;
   readonly credentials?: CredentialAttempts;
 }
 const MAX_BODY_BYTES = 16 * 1024;
@@ -73,13 +72,13 @@ function stringField(data: Record<string, unknown>, name: string): string {
   if (typeof value !== 'string' || value.length === 0) throw new InvalidSubmission();
   return value;
 }
-function details(data: Record<string, unknown>): BrowserLoginDetails {
+function details(data: Record<string, unknown>): LoginDetails {
   const title = data.title;
   const password = data.password;
   if (typeof title !== 'string' || typeof password !== 'string') throw new InvalidSubmission();
   return { title, password, site: stringField(data, 'site'), username: stringField(data, 'username') };
 }
-function changedDetails(data: Record<string, unknown>): BrowserLoginChanges {
+function changedDetails(data: Record<string, unknown>): LoginChanges {
   const optional = (name: string): string | undefined => {
     const value = data[name];
     if (value !== undefined && typeof value !== 'string') throw new InvalidSubmission();
@@ -113,8 +112,10 @@ function viewLocation(view: LoginsView): string {
   }
 }
 function failureMessage(error: unknown): string {
-  if (error instanceof BrowserLoginError) {
+  if (error instanceof LoginDetailsError) {
     switch (error.reason) {
+      case 'login_busy':
+        return 'The assistant is changing this password. Try again after the change finishes.';
       case 'duplicate_login':
         return 'That site and username already have a login. Open that login to update it.';
       case 'invalid_site':
@@ -125,47 +126,64 @@ function failureMessage(error: unknown): string {
         return 'This login changed since you opened it. Reload the page to see the latest details before saving again.';
     }
   }
-  if (error instanceof BrowserVaultError) {
-    switch (error.reason) {
-      case 'vault_not_set_up':
-        return 'Logins are not set up yet. Ask your operator to finish setting up logins.';
-      case 'rate_limited':
-        return 'The login vault has reached its request limit. Try again later.';
-      case 'no_item_for_site':
-        return 'That login is no longer available. Return to saved logins and try again.';
-      case 'origin_mismatch':
-      case 'vault_unavailable':
-        return 'The login vault is unavailable. Try again later.';
-    }
-  }
-  return 'The login vault is unavailable. Try again later.';
+  if (error instanceof LoginStoreError && error.reason === 'no_item_for_site')
+    return 'That login is no longer available. Return to saved logins and try again.';
+  return "Saved passwords can't be read right now. Ask your operator.";
+}
+
+function failureStatus(error: unknown): number {
+  if (error instanceof LoginStoreError && error.reason === 'no_item_for_site') return 409;
+  if (error instanceof LoginDetailsError)
+    return error.reason === 'login_changed' || error.reason === 'login_busy' ? 409 : 400;
+  return 503;
+}
+function json(response: ServerResponse, status: number, data: Readonly<Record<string, string>>): void {
+  response.writeHead(status, { ...headers(), 'content-type': 'application/json; charset=utf-8' });
+  response.end(JSON.stringify(data));
 }
 
 /** The Access-verified principal is checked afresh before every read or write. */
 export function createLoginsPageHandler(options: LoginsPageOptions): RequestListener {
-  const vault = options.vault ?? browserVault;
   const credentials = options.credentials ?? credentialAttempts;
   return (request, response) => {
     const serve = async (): Promise<void> => {
       const route = request.url;
       const reading = request.method === 'GET' || request.method === 'HEAD';
       const writing =
-        request.method === 'POST' && ['/logins/add', '/logins/update', '/logins/remove'].includes(route ?? '');
+        request.method === 'POST' &&
+        ['/logins/add', '/logins/update', '/logins/remove', '/logins/reveal'].includes(route ?? '');
       let view: LoginsView = (reading ? readView(route) : undefined) ?? { kind: 'list' };
       if (request.headers.host !== options.hostname || (reading ? !readView(route) : !writing)) return refuse(response);
       if (!(await isPrincipalWebIdentity(await options.identity(request)))) return refuse(response);
       if (writing && !sameOriginJson(request, options.hostname)) return refuse(response);
+      const store = options.store ?? (await getLoginStore());
       let outcome = '';
       let status = 200;
       let saved = false;
       if (writing) {
         const data = await submission(request);
         const keys = Object.keys(data).sort().join(',');
+        if (route === '/logins/reveal') {
+          if (keys !== 'handle,version') throw new InvalidSubmission();
+          const handle = stringField(data, 'handle');
+          const version = versionField(data);
+          /* eslint-disable no-catch-all/no-catch-all -- The reveal response reports only constant failures and never credential-bearing errors. */
+          try {
+            const password = await store.revealPassword(handle, version);
+            if (!(await isPrincipalWebIdentity(await options.identity(request)))) return refuse(response);
+            json(response, 200, { password });
+          } catch (error) {
+            json(response, failureStatus(error), { error: failureMessage(error) });
+          }
+          /* eslint-enable no-catch-all/no-catch-all */
+          return;
+        }
         try {
           if (route === '/logins/add') {
             view = { kind: 'add' };
             if (keys !== 'password,site,title,username') throw new InvalidSubmission();
-            await vault.createLogin(details(data));
+            const spec = details(data);
+            await store.create(spec);
             view = { kind: 'list' };
             outcome = 'Login added.';
           } else if (route === '/logins/update') {
@@ -177,13 +195,16 @@ export function createLoginsPageHandler(options: LoginsPageOptions): RequestList
               throw new InvalidSubmission();
             const handle = stringField(data, 'handle');
             view = { kind: 'edit', handle };
-            await vault.updateLogin(handle, versionField(data), changedDetails(data));
+            const version = versionField(data);
+            const changes = changedDetails(data);
+            await store.update(handle, version, changes);
             view = { kind: 'detail', handle };
             outcome = 'Login updated.';
           } else {
             if (keys !== 'handle,version') throw new InvalidSubmission();
             view = { kind: 'detail', handle: stringField(data, 'handle') };
-            await vault.removeLogin(view.handle, versionField(data));
+            const version = versionField(data);
+            await store.remove(view.handle, version);
             view = { kind: 'list' };
             outcome =
               'Saved login removed. The browser may still be signed in. You can ask your assistant to sign out.';
@@ -192,41 +213,31 @@ export function createLoginsPageHandler(options: LoginsPageOptions): RequestList
         } catch (error) {
           if (error instanceof InvalidSubmission) throw error;
           outcome = failureMessage(error);
-          if (error instanceof BrowserVaultError && error.reason === 'no_item_for_site') {
+          if (error instanceof LoginStoreError && error.reason === 'no_item_for_site') {
             status = 409;
             view = { kind: 'list' };
-          } else status = error instanceof BrowserLoginError ? (error.reason === 'login_changed' ? 409 : 400) : 503;
+          } else status = failureStatus(error);
         }
       }
       let available = true;
       const rows: LoginRow[] = [];
-      /* eslint-disable no-catch-all/no-catch-all -- This page reports only constant outcomes, never SDK errors or credential values. */
+      /* eslint-disable no-catch-all/no-catch-all -- This page reports only constant outcomes, never store errors or credential values. */
       try {
-        if (reading) await vault.refresh();
         const logins =
-          view.kind === 'list'
-            ? await vault.allLogins()
-            : view.kind === 'add'
-              ? []
-              : [await vault.savedLogin(view.handle)];
+          view.kind === 'list' ? await store.all() : view.kind === 'add' ? [] : [await store.get(view.handle)];
         for (const login of logins) {
-          const websites = login.websites
-            .map((website) => onePasswordWebsiteOrigin(website.url))
-            .filter((website): website is URL => Boolean(website));
           rows.push({
-            handle: login.item_handle,
-            site: websites[0]?.hostname ?? 'Other logins',
-            website: websites[0]?.hostname ?? '',
-            otherWebsites: websites.slice(1).map((website) => website.hostname),
+            handle: login.id,
+            site: login.hostname,
             title: login.title,
-            username: login.username ?? '',
+            username: login.username,
             version: login.version,
             account: await credentials.accountForLogin(login),
           });
         }
       } catch (error) {
         if (
-          error instanceof BrowserVaultError &&
+          error instanceof LoginStoreError &&
           error.reason === 'no_item_for_site' &&
           reading &&
           (view.kind === 'detail' || view.kind === 'edit')

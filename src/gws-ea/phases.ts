@@ -20,7 +20,7 @@ import { activeStep } from './run-log.js';
 import { GwsEaError, PROVISION_STEPS, type ProvisionStepId } from './types.js';
 
 /** The phases beyond the journaled steps are optional resources provisioned once every step is complete. */
-export type ProvisionPausePhase = ProvisionStepId | 'provision_onepassword' | 'provision_web' | 'provision_alias';
+export type ProvisionPausePhase = ProvisionStepId | 'provision_web' | 'provision_alias';
 
 export interface ProvisionHumanPause {
   readonly kind: 'human-action';

@@ -14,9 +14,7 @@ import { readBrowserEvidence } from './evidence.js';
 import {
   browserConsentMigration,
   browserConsentOutcomesMigration,
-  browserCredentialAttemptsMigration,
-  browserCredentialConsentHoldMigration,
-  browserCredentialUncertaintyMigration,
+  browserRetiredCredentialsMigration,
   browserDisclosuresMigration,
   browserGenericCheckoutMigration,
   browserIncidentsMigration,
@@ -39,11 +37,7 @@ import { saveRecipeAction, runRecipeAction } from './recipes.js';
 
 import './capability.js';
 import { fillSecretAction, readVaultSiteInfo } from './fill.js';
-import {
-  credentialFormAction,
-  registerCredentialAuthorityDelivery,
-  settleRefusedSites,
-} from './credential-operations.js';
+import { credentialFormAction, registerCredentialAuthorityDelivery } from './credential-operations.js';
 import { browserAdmissionReady, setBrowserAdmissionReady } from './group.js';
 import './destination-policy.js';
 import './guidance.js';
@@ -79,6 +73,7 @@ import { watchAction, listWatchesAction, cancelWatchAction, watchBookAction } fr
 
 import type { BrowserActions, BrowserExecutionContext } from './actions.js';
 import { sweepBrowserStartup } from './start-sweep.js';
+import { notifyOrphanCredentialAttempts } from './credential-operations.js';
 import { createBrowserWatchScheduler, repairBrowserWatchChecks, type BrowserWatchScheduler } from './scheduler.js';
 
 configureBrowserSiteInfo({ recipes: readRecipeSiteInfo, vault: readVaultSiteInfo });
@@ -91,16 +86,14 @@ registerMigration(browserSignInMigration);
 registerMigration(browserRecipesMigration);
 registerMigration(browserWatchesMigration);
 registerMigration(browserWatchReleaseMigration);
-registerMigration(browserCredentialAttemptsMigration);
+registerMigration(browserRetiredCredentialsMigration);
 registerMigration(browserConsentMigration);
 registerMigration(browserIncidentsMigration);
 registerMigration(browserDisclosuresMigration);
 registerMigration(browserGenericCheckoutMigration);
 registerMigration(browserWatchRegionMigration);
 registerMigration(browserPurchaseOutcomesMigration);
-registerMigration(browserCredentialConsentHoldMigration);
 registerMigration(browserConsentOutcomesMigration);
-registerMigration(browserCredentialUncertaintyMigration);
 
 const runtime = new BrowserRuntime(undefined, browserAdmissionReady, undefined, async (jobId) => {
   const store = new BrowserStore();
@@ -179,6 +172,7 @@ onHostStart(async ({ signal }) => {
       () => sweepBrowserJobSessions(),
       () => cleanupBrowserSignInMail(),
       () => recoverConsentOutcomes(),
+      () => notifyOrphanCredentialAttempts(),
       () => sweepBrowserPurchaseState(activeQueue),
       () => notifyPendingIncidents(),
       () => runtime.releaseUnusedPages(),
@@ -225,7 +219,6 @@ export const browserActions: BrowserActions = {
 
 export const browserQueueFollowUps = {
   finishRequestedCancellation,
-  settleRefusedSites,
   recordUnknownBrowserPurchaseRequest,
 };
 

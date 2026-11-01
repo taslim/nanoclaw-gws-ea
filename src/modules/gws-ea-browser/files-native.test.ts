@@ -1,3 +1,5 @@
+import * as loginStores from './login-store.js';
+import { testLoginStore } from './testing/login-store.js';
 import { useAvailableBrowser } from './testing/browser-runtime.js';
 /** Native Chrome file bytes, the production connection/window boundary and real durable job records. */
 import fs from 'node:fs';
@@ -102,6 +104,7 @@ describe.skipIf(!chromePath)('native Chrome file transfers', { timeout: 30_000 }
   }, 30_000);
 
   beforeEach(async () => {
+    vi.spyOn(loginStores, 'getLoginStore').mockResolvedValue(testLoginStore(paths.root).store);
     useAvailableBrowser();
     vi.stubEnv('GWS_EA_BROWSER_ROOT', paths.root);
     await runMigrations(await initTestDb());
@@ -155,6 +158,7 @@ describe.skipIf(!chromePath)('native Chrome file transfers', { timeout: 30_000 }
   });
 
   afterEach(async () => {
+    vi.restoreAllMocks();
     await windows?.close();
     await closeDb();
     vi.unstubAllEnvs();

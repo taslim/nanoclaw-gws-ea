@@ -199,28 +199,28 @@ export function stopChrome(child: ChildProcess): Promise<void> {
 
 async function retireChrome(child: ChildProcess): Promise<void> {
   const group = ownedGroups.get(child);
-  if (group) {
-    await retireChromeGroup(group);
-    return;
-  }
+  // Process inspection can finish before Node receives the owned child's exit event.
+  if (group) await retireChromeGroup(group);
   if (child.exitCode !== null || child.signalCode !== null) return;
   // A failed spawn has no pid and never emits exit.
   if (child.pid === undefined) return;
   const exited = once(child, 'exit').then(() => undefined);
-  child.kill('SIGTERM');
-  let timer: NodeJS.Timeout | undefined;
-  try {
-    await Promise.race([
-      exited,
-      new Promise<void>((resolve) => {
-        timer = setTimeout(resolve, 3_000);
-      }),
-    ]);
-  } finally {
-    if (timer) clearTimeout(timer);
+  if (!group) {
+    child.kill('SIGTERM');
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      await Promise.race([
+        exited,
+        new Promise<void>((resolve) => {
+          timer = setTimeout(resolve, 3_000);
+        }),
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
   }
   if (child.exitCode === null && child.signalCode === null) {
-    child.kill('SIGKILL');
+    if (!group) child.kill('SIGKILL');
     let forced: NodeJS.Timeout | undefined;
     try {
       await Promise.race([

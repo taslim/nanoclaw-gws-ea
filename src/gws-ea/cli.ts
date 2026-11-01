@@ -6,18 +6,6 @@ import { type WebCapabilityDependencies } from './web-connector.js';
 import { aliasDecision, runAliasStep, aliasNextActions, type AliasDecision } from './alias.js';
 import { withAssistantLock } from './assistant-lock.js';
 import { loadInstanceRuntimeConfig } from './service.js';
-import {
-  onePasswordInstallNextActions,
-  onePasswordErrorPauses,
-  onePasswordRecovery,
-  type OnePasswordCliSeams,
-  type OnePasswordDependencies,
-} from './onepassword.js';
-import {
-  onePasswordUninstallPreviewLines,
-  previewOnePasswordUninstall,
-  type OnePasswordUninstallPreview,
-} from './onepassword-uninstall.js';
 import os from 'node:os';
 import {
   combineEffects,
@@ -118,12 +106,6 @@ import {
   type RemovalOutcome,
   type RemovalPreview,
 } from './remove.js';
-import {
-  onePasswordOperatorActions,
-  type OnePasswordRemovalOutcome,
-  type OnePasswordRemovalPreview,
-  type OnePasswordUnprovenCreation,
-} from './onepassword-removal.js';
 import {
   localTimezone,
   rollBack,
@@ -241,9 +223,6 @@ export interface CliRuntime {
   aliasNcl?: import('./alias.js').AliasStepOptions['ncl'];
   browserInspection?: import('./browser-isolation.js').BrowserIsolationInspection;
   web?: WebCapabilityDependencies;
-  onePassword?: OnePasswordCliSeams;
-  /** Picks among the operator's 1Password accounts; absent, enable needs --account until one is recorded. */
-  chooseOnePasswordAccount?: OnePasswordDependencies['chooseAccount'];
   /** Hidden token entry in an attended terminal; absent for unattended commands. */
   readWebManagementToken?: WebCapabilityDependencies['readManagementToken'];
   paths?: ControlPlanePaths;
@@ -266,7 +245,6 @@ export interface CliRuntime {
   removeAssistant?: RemoveAssistantRunner;
   /** Absent means removal requires `--yes`. */
   confirmRemoval?: (preview: RemovalPreview) => Promise<boolean>;
-  confirmOnePasswordUninstall?: (preview: OnePasswordUninstallPreview) => Promise<boolean>;
   upsertEnvVars?: UpsertEnvVars;
   hostStatus?: HostStatusHelpers;
   serviceHelpers?: NanoclawServiceHelpers;
@@ -369,10 +347,7 @@ function parseBillingAccount(value: string | undefined): string | undefined {
 function isBusy(error: unknown): boolean {
   return (
     error instanceof GwsEaError &&
-    (error.code === 'instance_busy' ||
-      error.code === 'voice_busy' ||
-      error.code === 'registry_busy' ||
-      error.code === 'onepassword_busy')
+    (error.code === 'instance_busy' || error.code === 'voice_busy' || error.code === 'registry_busy')
   );
 }
 
@@ -514,7 +489,6 @@ class Cli {
   #rolloutTargets = new Map<string, UpdateTargetResult>();
   #rolloutCleanup: OperationData['cleanup'];
   #connectorNextActions: readonly NextAction[] = [];
-  readonly #connectorRateLimit = { limited: false };
 
   constructor(runtime: CliRuntime, presenter: Presenter, interruptedResult: (result: ManagedResult) => void) {
     this.#paths = runtime.paths ?? resolveControlPlanePaths();
@@ -659,7 +633,6 @@ class Cli {
         return join(
           `gws-ea remove --id ${state.instanceId}`,
           plan.options.yes ? '--yes' : undefined,
-          plan.options['delete-vault'] ? '--delete-vault' : undefined,
           abandon.length > 0 ? `--abandon ${abandon.join(',')}` : undefined,
         );
       }
@@ -731,7 +704,6 @@ class Cli {
             : [];
     for (const flag of retained) if (plan.options[flag]) base.push(`--${flag}`, plan.options[flag]);
     if (command === 'rollback' && plan.options.snapshot === 'true') base.push('--snapshot');
-    if (command === 'remove' && plan.options['delete-vault'] === 'true') base.push('--delete-vault');
     if (plan.options.yes === 'true') base.push('--yes');
     const actions: NextAction[] = [];
     if (pause?.actionUrl) actions.push({ kind: 'external', instruction: pause.message, url: pause.actionUrl });
@@ -763,7 +735,6 @@ class Cli {
           '--id',
           state.instanceId!,
           '--yes',
-          ...(plan.options['delete-vault'] === 'true' ? ['--delete-vault'] : []),
           '--abandon',
           [...new Set([...(plan.options.abandon?.split(',') ?? []), error.resource])].join(','),
         ],
@@ -810,11 +781,6 @@ class Cli {
       serviceHelpers,
       interaction: options.interaction,
       runtime: options.runtime,
-      onePassword: {
-        cli: onePasswordSeams(this.#runtime.environment ?? process.env, this.#runtime.onePassword),
-        operatorTerminal: Boolean(this.#runtime.prompts),
-        rateLimitState: this.#connectorRateLimit,
-      },
       web: this.#runtime.web,
     });
   }
@@ -999,11 +965,8 @@ class Cli {
     instanceId: string,
     abandon: ReadonlySet<AbandonableResource>,
   ): Promise<Outcome> {
-    const environment = this.#runtime.environment ?? process.env;
-    const onePassword = onePasswordSeams(environment, this.#runtime.onePassword);
-    const deleteVault = options['delete-vault'] === 'true';
     const preview = await runStep(reporter, { id: 'inspect' }, () =>
-      (this.#runtime.describeRemoval ?? describeRemoval)(this.#paths, instanceId, { deleteVault, onePassword }),
+      (this.#runtime.describeRemoval ?? describeRemoval)(this.#paths, instanceId),
     );
     state.data = { ...state.data, preview };
     this.#presenter.report(previewReport(removalPreviewLines(preview)));
@@ -1026,8 +989,6 @@ class Cli {
         abandon,
         reporter,
         serviceHelpers: this.#runtime.serviceHelpers,
-        deleteVault,
-        onePassword,
       }),
     );
     state.changed = combineEffects(
@@ -1035,22 +996,19 @@ class Cli {
       removed ? removed.removed.length > 0 || removed.abandoned.length > 0 : null,
     );
     state.data = { ...state.data, ...(removed ? { removal: removed } : {}) };
-    // Revoking a service account, or settling a creation never proven, is the operator's, on 1Password.com; then
-    // they close the receipt that names it.
-    const left = removed?.onepassword;
-    const owed = left?.receipt_file
-      ? onePasswordOperatorActions(instanceId, left.revoke_service_account_ids, left.unproven)
-      : [];
     return {
       status: 'ready',
       message: `Assistant ${instanceId} was removed.`,
       details: removalSummary(preview, removed),
-      actions: owed.length
-        ? [
-            ...owed,
-            { kind: 'command', argv: ['gws-ea', 'remove', '--id', instanceId, '--yes', '--abandon', 'onepassword'] },
-          ]
-        : [],
+      actions:
+        removed?.login_key === 'left_behind'
+          ? [
+              {
+                kind: 'external',
+                instruction: `Log in locally and unlock the keychain, then delete the gws-ea.saved-logins key for assistant ${instanceId} in Keychain Access.`,
+              },
+            ]
+          : [],
     };
   }
 
@@ -1264,12 +1222,6 @@ class Cli {
 
   async #provisionConnectors(operation: InstanceOperation, reporter: StepReporter): Promise<readonly NextAction[]> {
     const result = await provisionInstalledConnectors(operation, reporter, {
-      onePassword: {
-        cli: onePasswordSeams(this.#runtime.environment ?? process.env, this.#runtime.onePassword),
-        upsertEnvVars: this.#runtime.upsertEnvVars,
-        operatorTerminal: Boolean(this.#runtime.prompts),
-        rateLimitState: this.#connectorRateLimit,
-      },
       web: this.#runtime.web,
     });
     for (const pending of result.pending) this.#presenter.line(`${pending.name}: ${pending.message}`);
@@ -2169,107 +2121,15 @@ function previewReport(lines: readonly string[]): StopReport {
   return { outcome: 'ready', headline: lines[0] ?? 'Preview', details: lines.slice(1) };
 }
 
-function itemCount(count: number): string {
-  return `${count} item${count === 1 ? '' : 's'}`;
-}
-
-function serviceAccountLine(ids: readonly string[], prefix: string): string[] {
-  if (!ids.length) return [];
-  const one = ids.length === 1;
-  return [
-    `${prefix}service account${one ? '' : 's'} ${ids.join(', ')} still work${one ? 's' : ''} until you revoke ${one ? 'it' : 'them'} on 1Password.com (Developer > Directory); removal cannot revoke service accounts.`,
-  ];
-}
-
-/** An unproven creation has no recorded ID, so removal cannot find it; only the operator can settle it. */
-function unprovenLines(unproven: readonly OnePasswordUnprovenCreation[], prefix: string): string[] {
-  return unproven.map(({ kind, name }) =>
-    kind === 'vault'
-      ? `${prefix}vault "${name}" may exist; removal cannot find it, so delete it yourself on 1Password.com if it is listed.`
-      : `${prefix}runtime service account "${name}" may exist; removal cannot find it, so revoke it yourself on 1Password.com (Developer > Directory) if it is listed.`,
-  );
-}
-
-function onePasswordPreviewLines(preview: OnePasswordRemovalPreview): string[] {
-  const count = preview.item_count;
-  const effect = ((): string => {
-    switch (preview.vault) {
-      case 'delete':
-        return `Deleted with this removal${count === 0 ? '; it holds no items' : count === null ? '; its item count is unknown' : `, with its ${itemCount(count)}`}. ${preview.reason}`;
-      case 'retain':
-        return `Kept in 1Password${count === null ? '' : ` with its ${itemCount(count)}`}: ${preview.reason}${preview.owned ? ' Pass --delete-vault to delete it with everything it holds.' : ''}`;
-      case 'deleted':
-        return `Already deleted: ${preview.reason}`;
-      case 'retained':
-        return `Already kept: ${preview.reason}`;
-      case 'gone':
-        return `Already gone: ${preview.reason}`;
-      case 'unrecorded':
-        return preview.reason;
-    }
-  })();
-  return [
-    preview.vault_id === null
-      ? `1Password account ${preview.account_id}`
-      : `1Password vault ${preview.vault_id} in account ${preview.account_id}`,
-    `  ${effect}`,
-    '  Runtime token: deleted from this host with the assistant.',
-    ...serviceAccountLine(preview.runtime_service_account_ids, '  Not revoked by removal: '),
-    ...unprovenLines(preview.unproven, '  Never proven: '),
-  ];
-}
-
 function removalPreviewLines(preview: RemovalPreview): string[] {
   return [
     `Assistant: ${preview.instanceId}`,
     `NanoClaw: ${preview.checkout}`,
     `OneCLI: ${preview.onecliProject}`,
     `Google Cloud project: ${preview.gcpProject} (${preview.gcpAccount})`,
-    ...(preview.onepassword ? onePasswordPreviewLines(preview.onepassword) : []),
+    'Saved logins: removes the local store and deletes its Keychain key after the host stops; an unreachable key is listed as left behind.',
     'Permanently tears down this assistant’s recorded local resources and requests project deletion; its subscription and credentials are removed within their existing ownership rules.',
   ];
-}
-
-function onePasswordOutcomeLines(instanceId: string, outcome: OnePasswordRemovalOutcome): string[] {
-  const count = outcome.item_count;
-  const vault = ((): string => {
-    switch (outcome.vault) {
-      case 'deleted':
-        return `deleted from account ${outcome.account_id}${count === 0 ? '; it held no items' : count === null ? '' : `, with its ${itemCount(count)}`}.`;
-      case 'retained':
-        return `kept in account ${outcome.account_id}${count === null ? '' : ` with its ${itemCount(count)}`}. ${outcome.reason}`;
-      case 'gone':
-        return `already gone from account ${outcome.account_id}.`;
-      case 'left_behind':
-        return `left behind in account ${outcome.account_id}, unsettled; delete it yourself on 1Password.com if you no longer need it.`;
-      case 'unrecorded':
-        return `none recorded in account ${outcome.account_id}.`;
-    }
-  })();
-  return [
-    `1Password vault${outcome.vault_id === null ? '' : ` ${outcome.vault_id}`}: ${vault}`,
-    outcome.runtime_token === 'deleted'
-      ? 'Runtime token: deleted from this host.'
-      : 'Runtime token: none was on this host.',
-    ...serviceAccountLine(outcome.revoke_service_account_ids, 'Not revoked: '),
-    ...unprovenLines(outcome.unproven, 'Never proven: '),
-    ...(outcome.receipt_file
-      ? [
-          `They stay named in ${outcome.receipt_file} until you close it, after revoking or deleting them: gws-ea remove --id ${instanceId} --yes --abandon onepassword.`,
-        ]
-      : []),
-  ];
-}
-
-function onePasswordSeams(
-  environment: NodeJS.ProcessEnv,
-  overrides: OnePasswordCliSeams | undefined,
-): OnePasswordCliSeams {
-  return {
-    ...(environment.PATH ? { searchPath: environment.PATH } : {}),
-    ambient: environment,
-    ...overrides,
-  };
 }
 
 function removalSummary(preview: RemovalPreview, outcome: RemovalOutcome | undefined): string[] {
@@ -2281,17 +2141,21 @@ function removalSummary(preview: RemovalPreview, outcome: RemovalOutcome | undef
     'chat-subscription':
       "Left behind: the assistant's Google Chat subscription, which removal could not delete without a working " +
       'sign-in; with the project deleted it delivers nowhere, and Google deletes it within 7 days.',
-    onepassword:
-      "No longer tracked: the assistant's 1Password resources named below; settle any that remain yourself on 1Password.com.",
     web: 'Left behind: the exact web resources named below. Their ownership record, credentials and removal receipt remain for manual cleanup.',
   };
   return [
     ...(outcome?.removed.includes('gcp-project')
       ? [`${project}: deletion requested; it stays recoverable for 30 days, then Google Cloud deletes it.`]
       : []),
-    ...(outcome?.onepassword ? onePasswordOutcomeLines(preview.instanceId, outcome.onepassword) : []),
+    ...(outcome?.login_key
+      ? [
+          outcome.login_key === 'removed'
+            ? 'Saved-login Keychain key: deleted or already absent.'
+            : `Left behind: the saved-login Keychain key for assistant ${preview.instanceId}; log in locally and unlock the keychain, then delete it in Keychain Access.`,
+        ]
+      : []),
     ...(outcome?.abandoned.flatMap(({ resource, evidence }) =>
-      resource === 'onepassword' || resource === 'web'
+      resource === 'web'
         ? [leftBehind[resource], ...evidence.split('\n').map((line) => `  ${line}`)]
         : [leftBehind[resource]],
     ) ?? []),
@@ -2353,11 +2217,9 @@ export async function runCli(args: readonly string[], runtime: CliRuntime = {}):
       prompts: _prompts,
       onFailure: _failure,
       confirmRemoval: _remove,
-      confirmOnePasswordUninstall: _vaults,
       confirmUpdate: _update,
       confirmUpdateAll: _all,
       confirmRollback: _rollback,
-      chooseOnePasswordAccount: _account,
       readWebManagementToken: _webToken,
       presenter: _presenter,
       ...safe
@@ -2567,7 +2429,6 @@ export async function runCli(args: readonly string[], runtime: CliRuntime = {}):
       let run: RunLog | undefined;
       let stepLog: string | undefined;
       let actions: readonly NextAction[] = [];
-      let previewLines: readonly string[] = [];
       const stop = observeInterruption(() => ({ changed, data }));
       const recordEffect = (effect: true | null): void => {
         changed = combineEffects(changed, effect);
@@ -2579,7 +2440,6 @@ export async function runCli(args: readonly string[], runtime: CliRuntime = {}):
           const inspection = {
             check: checked,
             instanceId: options.id,
-            onePassword: onePasswordSeams(environment, runtime.onePassword),
             web: runtime.web,
             serviceHelpers: runtime.serviceHelpers,
             hostStatus: runtime.hostStatus,
@@ -2629,15 +2489,6 @@ export async function runCli(args: readonly string[], runtime: CliRuntime = {}):
             progress: (line) => presenter.line(line),
             recordEffect,
           },
-          onePassword: {
-            cli: onePasswordSeams(environment, runtime.onePassword),
-            upsertEnvVars: runtime.upsertEnvVars,
-            chooseAccount: runtime.chooseOnePasswordAccount,
-            operatorTerminal: Boolean(runtime.prompts),
-            progress: (line) => presenter.line(line),
-            recordEffect,
-            rateLimitState: { limited: false },
-          },
           web: {
             ...runtime.web,
             readManagementToken: readWebManagementToken
@@ -2653,86 +2504,45 @@ export async function runCli(args: readonly string[], runtime: CliRuntime = {}):
             recordEffect,
           },
         };
-        if (name === 'onepassword' && handler.command === 'uninstall') {
-          const dependencies = lifecycleContext.onePassword;
-          let confirmed = options['delete-vaults'] === 'true';
-          let confirmedPreview: OnePasswordUninstallPreview | undefined;
-          if (!confirmed && options.abandon !== 'true' && runtime.confirmOnePasswordUninstall) {
-            const preview = await previewOnePasswordUninstall(paths, dependencies);
-            confirmed = await runtime.confirmOnePasswordUninstall(preview);
-            if (confirmed) confirmedPreview = preview;
-          }
-          const result = await connectorDefinition('onepassword').uninstall({
-            ...lifecycleContext,
-            deleteVaults: confirmed,
-            confirmedPreview,
-          });
-          data = result;
-          paused = result.outcome === 'paused';
-          if (paused) previewLines = onePasswordUninstallPreviewLines(result.preview);
+        const lifecycle = handler.command;
+        run = await startRunLog({ paths, command: commandPath });
+        const result = await run.step(`${handler.command} ${name}`, async (step) => {
+          stepLog = step.rawLog;
+          return connectorDefinition(name)[lifecycle](lifecycleContext);
+        });
+        data = result;
+        if (result.name === 'web') {
+          paused =
+            'assistants' in result
+              ? result.assistants.some((assistant) => assistant.outcome === 'pending')
+              : result.outcome === 'pending';
+          const namingOnly =
+            'assistants' in result &&
+            paused &&
+            result.assistants
+              .filter((assistant) => assistant.outcome === 'pending')
+              .every((assistant) => ['web_name_unusable', 'web_hostname_claimed'].includes(assistant.reason ?? ''));
           actions = [
-            ...(paused
-              ? [
+            ...(namingOnly
+              ? []
+              : [
                   {
                     kind: 'command' as const,
-                    argv: ['gws-ea', 'connectors', 'uninstall', name, ...(confirmedPreview ? [] : ['--delete-vaults'])],
+                    argv: ['gws-ea', 'connectors', paused ? handler.command : 'show', name],
                   },
-                ]
-              : []),
-            ...(result.revoke_service_account_ids.length
-              ? [
-                  {
-                    kind: 'external' as const,
-                    instruction: `Revoke these service accounts on 1Password.com: ${result.revoke_service_account_ids.join(', ')}. Then close the receipt with gws-ea connectors uninstall onepassword --abandon.`,
-                  },
-                ]
+                ]),
+            ...('operator_actions' in result
+              ? result.operator_actions.map((instruction) => ({ kind: 'external' as const, instruction }))
               : []),
           ];
-        } else {
-          const lifecycle = handler.command;
-          run = await startRunLog({ paths, command: commandPath });
-          const result = await run.step(`${handler.command} ${name}`, async (step) => {
-            stepLog = step.rawLog;
-            return connectorDefinition(name)[lifecycle](lifecycleContext);
-          });
-          data = result;
-          if (result.name === 'onepassword' && 'enabled' in result) {
-            paused = result.assistants.some((assistant) => assistant.outcome === 'pending');
-            actions = onePasswordInstallNextActions(result);
-          } else if (result.name === 'web') {
-            paused =
-              'assistants' in result
-                ? result.assistants.some((assistant) => assistant.outcome === 'pending')
-                : result.outcome === 'pending';
-            const namingOnly =
-              'assistants' in result &&
-              paused &&
-              result.assistants
-                .filter((assistant) => assistant.outcome === 'pending')
-                .every((assistant) => ['web_name_unusable', 'web_hostname_claimed'].includes(assistant.reason ?? ''));
-            actions = [
-              ...(namingOnly
-                ? []
-                : [
-                    {
-                      kind: 'command' as const,
-                      argv: ['gws-ea', 'connectors', paused ? handler.command : 'show', name],
-                    },
-                  ]),
-              ...('operator_actions' in result
-                ? result.operator_actions.map((instruction) => ({ kind: 'external' as const, instruction }))
-                : []),
-            ];
-          } else
-            actions =
-              handler.command === 'install' ? [{ kind: 'command', argv: ['gws-ea', 'connectors', 'check', name] }] : [];
-          run.complete();
-        }
+        } else
+          actions =
+            handler.command === 'install' ? [{ kind: 'command', argv: ['gws-ea', 'connectors', 'check', name] }] : [];
+        run.complete();
         presenter.report({
           outcome: paused ? 'paused' : 'ready',
           headline: `${name}: ${handler.command}${paused ? ' has pending work' : ' completed'}.`,
           details: [
-            ...previewLines,
             ...(data && 'assistants' in data && Array.isArray(data.assistants)
               ? data.assistants.flatMap((assistant: unknown) =>
                   isRecord(assistant) && typeof assistant.message === 'string'
@@ -2776,7 +2586,6 @@ export async function runCli(args: readonly string[], runtime: CliRuntime = {}):
             `${error.message} Diagnostic log incomplete (${logFailure}); check available disk space and permissions before retrying.`,
             { cause: error, details: { ...error.details, logFailure } },
           );
-        const paused = name === 'onepassword' && onePasswordErrorPauses(error);
         actions =
           name === 'voice'
             ? voiceCapabilityRecovery(error, {
@@ -2784,14 +2593,12 @@ export async function runCli(args: readonly string[], runtime: CliRuntime = {}):
                 model: options.model,
                 cmake: options.cmake,
               })
-            : name === 'onepassword'
-              ? onePasswordRecovery(error, handler.command === 'uninstall' ? 'uninstall' : 'install')
-              : name
-                ? [{ kind: 'command', argv: ['gws-ea', 'connectors', 'show', name] }]
-                : [];
+            : name
+              ? [{ kind: 'command', argv: ['gws-ea', 'connectors', 'show', name] }]
+              : [];
         emitResult(
           managedResult(commandPath, {
-            outcome: paused ? 'paused' : isBusy(error) ? 'busy' : 'failed',
+            outcome: isBusy(error) ? 'busy' : 'failed',
             changed,
             data,
             error,
@@ -2799,10 +2606,6 @@ export async function runCli(args: readonly string[], runtime: CliRuntime = {}):
             diagnostics: { ...(run ? { run_log: run.progressLog } : {}), ...(stepLog ? { step_log: stepLog } : {}) },
           }),
         );
-        if (paused) {
-          presenter.report({ outcome: 'paused', headline: error.message, details: nextActionLines(actions) });
-          return EXIT_CODES.paused;
-        }
         return reportStop(
           presenter,
           error,
@@ -2834,7 +2637,6 @@ export async function runCli(args: readonly string[], runtime: CliRuntime = {}):
               toolCheckout: runtime.toolCheckout,
               browserInspection: runtime.browserInspection,
               connectorInspection: {
-                onePassword: onePasswordSeams(environment, runtime.onePassword),
                 web: runtime.web,
               },
             },

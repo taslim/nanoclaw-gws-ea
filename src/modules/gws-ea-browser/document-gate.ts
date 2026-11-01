@@ -1,5 +1,6 @@
 import type { Browser, Page } from 'playwright-core';
 
+import { blocksManagedLogins } from './management-url-policy.js';
 import {
   ensurePageTargets,
   pageTargetFrameHosts,
@@ -59,11 +60,11 @@ type Owner = { page: GuardedPage } | 'unguarded' | { refuse: GuardedPage[] };
 const gates = new WeakMap<Browser, Promise<DocumentGate>>();
 
 /**
- * One browser-level Fetch session per Chrome connection pauses every document from its first
- * request, in every target, including a cross-site frame that navigates itself while loading and a
- * window a page opens. Each document goes to the guard of the page it belongs to; a window decides
- * under its opener's guard. A page without a guard, opened by no guarded page, has its documents
- * continued; a document the gate cannot place with certainty is refused.
+ * One browser-level Fetch session per Chrome connection excludes private saved-login mounts from
+ * every request in every target. Each remaining document goes to the guard of the page it belongs to,
+ * including cross-site frames and windows; a window decides under its opener's guard. A page without
+ * a guard, opened by no guarded page, has its remaining documents continued; a document the gate
+ * cannot place with certainty is refused.
  */
 export function documentGate(browser: Browser): Promise<DocumentGate> {
   let gate = gates.get(browser);
@@ -202,37 +203,24 @@ async function openDocumentGate(browser: Browser): Promise<DocumentGate> {
     ).catch(() => undefined);
   };
   session.on('Fetch.requestPaused', (event) => {
-    if (event.resourceType !== 'Document') {
-      if (serviceWorkerScript(event.request.headers)) {
-        answer(event.requestId, { allow: false });
-        return;
-      }
-    }
     // Every guard's policy is taken as it stood at the pause, before placement can await.
     const captured = new Map<GuardedPage, CapturedPolicy>();
     for (const page of guarded()) captured.set(page, page.capture());
-    if (event.resourceType !== 'Document') {
-      // Workers cannot own secret-bearing traffic, and a new frame or popup must not outrun a page-target
-      // session. Decide HTTP requests here, on the browser session, using the hold captured at request time.
-      if (![...captured.values()].some((policy) => policy.submissionsHeld)) {
-        answer(event.requestId, { allow: true });
-        return;
-      }
-      const decideSubmission = async (): Promise<DocumentDecision> => {
+    // A page's target id is its main frame's id: only a document there is the page's own top-level document.
+    const topOf = pages.get(event.frameId);
+    const decide = async (): Promise<DocumentDecision> => {
+      // This browser-wide exclusion precedes every page, worker and subresource allowance.
+      if (await blocksManagedLogins(event.request.url)) return { allow: false };
+      if (event.resourceType !== 'Document') {
+        if (serviceWorkerScript(event.request.headers)) return { allow: false };
+        // Workers cannot own secret-bearing traffic, and a new frame or popup must not outrun a page-target
+        // session. Decide HTTP requests here, on the browser session, using the hold captured at request time.
+        if (![...captured.values()].some((policy) => policy.submissionsHeld)) return { allow: true };
         const owner = await ownerOf(event.frameId);
         if (owner === 'unguarded') return { allow: true };
         if ('refuse' in owner) return { allow: false };
         return { allow: !captured.get(owner.page)?.submissionsHeld };
-      };
-      void withinTime(decideSubmission(), DECISION_TIMEOUT_MS).then(
-        (decision) => answer(event.requestId, decision),
-        () => answer(event.requestId, { allow: false }),
-      );
-      return;
-    }
-    // A page's target id is its main frame's id: only a document there is the page's own top-level document.
-    const topOf = pages.get(event.frameId);
-    const decide = async (): Promise<DocumentDecision> => {
+      }
       const owner = await ownerOf(event.frameId);
       if (owner === 'unguarded') return { allow: true };
       if ('refuse' in owner) {

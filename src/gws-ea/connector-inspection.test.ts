@@ -11,12 +11,9 @@ import { connectorLines, inspectConnector } from './connector-inspection.js';
 import { deriveGcpClaims } from './gcp-identity.js';
 import { reserveInstance } from './journal.js';
 import { resolveControlPlanePaths, type ControlPlanePaths } from './paths.js';
-import { installOnePassword, ONEPASSWORD_CONTRACT } from './onepassword.js';
-import { onePasswordUninstallFile } from './onepassword-uninstall.js';
 import { claimInstanceWeb, readRegistry } from './registry.js';
 import { centralDatabaseFile } from './verify.js';
 import { webOperatorFiles, readWebOperatorConfig, writeWebOperatorConfig } from './web-cloudflare.js';
-import { ACCOUNT_ID, FakeOnePassword } from './testing/onepassword-fixture.js';
 import { voiceInstallationDirectory } from './install-voice.js';
 import { voicePolicyFile } from './local-voice.js';
 import * as voiceAssets from './voice-assets.js';
@@ -55,11 +52,6 @@ async function assistant(marker: 'compatible' | 'unsupported' | 'unknown' = 'com
   await mkdir(path.join(runtime.checkout_root, 'src/gws-ea'), { recursive: true });
   if (marker !== 'unsupported')
     await writeFile(
-      path.join(runtime.checkout_root, 'src/gws-ea/onepassword-compatibility.json'),
-      marker === 'unknown' ? '{' : JSON.stringify({ schemaVersion: 1, contract: ONEPASSWORD_CONTRACT }),
-    );
-  if (marker !== 'unsupported')
-    await writeFile(
       path.join(runtime.checkout_root, 'src/gws-ea/web-compatibility.json'),
       marker === 'unknown' ? '{' : JSON.stringify({ schemaVersion: 1, contract: 'gws-ea-web-1' }),
     );
@@ -85,11 +77,6 @@ function services(active: boolean): NanoclawServiceHelpers {
     drainContainers: async () => undefined,
     verifyServiceHealth: async () => active,
   };
-}
-async function installedOnePassword() {
-  const provider = new FakeOnePassword();
-  await installOnePassword(paths, { accountId: ACCOUNT_ID }, { cli: provider.cli(), upsertEnvVars: () => undefined });
-  return provider;
 }
 async function webConfig(zoneApex = 'example.test') {
   const files = webOperatorFiles(paths);
@@ -149,7 +136,7 @@ async function voiceInstallation(model: voiceAssets.VoiceModelId = 'base') {
 }
 
 describe('uniform connector observations', () => {
-  it.each(['voice', 'onepassword', 'web'] as const)(
+  it.each(['voice', 'web'] as const)(
     'reports absent %s locally and a failed check without creating setup',
     async (name) => {
       const local = await inspectConnector(paths, name);
@@ -170,73 +157,6 @@ describe('uniform connector observations', () => {
       );
     },
   );
-  it('excludes a stopped pending assistant from the host check, but requires a selected target ready', async () => {
-    const provider = await installedOnePassword();
-    const id = await assistant();
-    const options = { check: true, onePassword: provider.cli(), serviceHelpers: services(false) };
-    const observed = await inspectConnector(paths, 'onepassword', options);
-    expect(observed).toMatchObject({
-      readiness: { status: 'ready' },
-      assistants: [{ instance_id: id, setup: 'pending', readiness: { status: 'not_checked', checked: false } }],
-    });
-    expect(await inspectConnector(paths, 'onepassword', { ...options, instanceId: id })).toMatchObject({
-      readiness: { status: 'not_ready' },
-    });
-  });
-  it('reports an unreachable assistant as not checked without treating it as a failed host prerequisite', async () => {
-    const provider = await installedOnePassword();
-    await assistant();
-    const hostStatus = {
-      queryHost: async () => {
-        throw new Error('Host socket is unreachable');
-      },
-    };
-    expect(
-      await inspectConnector(paths, 'onepassword', {
-        check: true,
-        onePassword: provider.cli(),
-        serviceHelpers: services(true),
-        hostStatus,
-      }),
-    ).toMatchObject({
-      readiness: { status: 'ready' },
-      assistants: [{ readiness: { status: 'not_checked', checked: false } }],
-    });
-  });
-  it('fails an observed pending assistant and reports its setup fix', async () => {
-    const provider = await installedOnePassword();
-    await assistant();
-    const observed = await inspectConnector(paths, 'onepassword', {
-      check: true,
-      onePassword: provider.cli(),
-      serviceHelpers: services(true),
-    });
-    expect(observed.readiness.status).toBe('not_ready');
-    expect(observed.assistants[0]).toMatchObject({
-      setup: 'pending',
-      next_actions: [{ kind: 'command', argv: ['gws-ea', 'connectors', 'install', 'onepassword'] }],
-    });
-  });
-  it('excludes unsupported releases and reports update, while malformed markers stay unknown', async () => {
-    const provider = await installedOnePassword();
-    const id = await assistant('unsupported');
-    const options = { check: true, onePassword: provider.cli(), serviceHelpers: services(true) };
-    const observed = await inspectConnector(paths, 'onepassword', options);
-    expect(observed.readiness.status).toBe('ready');
-    expect(observed.assistants[0]).toMatchObject({
-      compatibility: 'unsupported',
-      next_actions: [{ kind: 'command', argv: ['gws-ea', 'update', '--id', id] }],
-    });
-    expect(await inspectConnector(paths, 'onepassword', { ...options, instanceId: id })).toMatchObject({
-      readiness: { status: 'not_ready' },
-    });
-    const marker = path.join(paths.checkoutRoot(id), 'src/gws-ea/onepassword-compatibility.json');
-    await writeFile(marker, '{');
-    expect(await inspectConnector(paths, 'onepassword', options)).toMatchObject({
-      readiness: { status: 'not_ready' },
-      assistants: [{ compatibility: 'unknown' }],
-    });
-  });
   it('reads an installed voice receipt without hashing any asset or querying a host', async () => {
     await voiceInstallation();
     const verify = vi.spyOn(voiceAssets, 'verifyVoiceInstallation');
@@ -315,35 +235,23 @@ describe('uniform connector observations', () => {
       argv: ['gws-ea', 'connectors', 'install', 'voice', '--model', 'small'],
     });
   });
-  it('keeps local onepassword and web reads free of provider requests', async () => {
-    const provider = await installedOnePassword();
+  it('keeps local web reads free of provider requests', async () => {
     await webConfig();
-    const calls = provider.calls.length;
     const send = vi.fn<typeof fetch>(() => {
       throw new Error('Local observation called provider');
     });
     const command = vi.fn(() => {
       throw new Error('Local observation ran process');
     });
-    for (const name of ['onepassword', 'web'] as const) {
+    for (const name of ['web'] as const) {
       expect(
         await inspectConnector(paths, name, {
-          onePassword: provider.cli(),
           web: { fetch: send, runCommand: command },
         }),
       ).toMatchObject({ setup: 'installed', readiness: { checked: false, status: 'not_checked' } });
     }
-    expect(provider.calls).toHaveLength(calls);
     expect(send).not.toHaveBeenCalled();
     expect(command).not.toHaveBeenCalled();
-  });
-  it('keeps account usage and untested writes in the human details', async () => {
-    const provider = await installedOnePassword();
-    const observation = await inspectConnector(paths, 'onepassword', { check: true, onePassword: provider.cli() });
-    const human = connectorLines(observation).join('\n');
-    expect(human).toContain('Account type: families');
-    expect(human).toContain('Daily requests:');
-    expect(human).toContain('a recorded write grant is not a tested write');
   });
   it('verifies artifact host prerequisites even when no assistant exists', async () => {
     await webConfig();
@@ -391,33 +299,6 @@ describe('uniform connector observations', () => {
       setup: 'unknown',
       readiness: { checked: false },
     });
-  });
-  it('shows incomplete uninstall and the rerun command without querying provider', async () => {
-    const provider = await installedOnePassword();
-    const file = onePasswordUninstallFile(paths);
-    await mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
-    await writeFile(
-      file,
-      JSON.stringify({
-        schema_version: 1,
-        account_id: ACCOUNT_ID,
-        management_service_account_id: null,
-        management_creation_unproven: false,
-        started_at: new Date().toISOString(),
-        assistants: {},
-        completed: false,
-        history: [],
-      }),
-      { mode: 0o600 },
-    );
-    const calls = provider.calls.length;
-    const observed = await inspectConnector(paths, 'onepassword', { check: true, onePassword: provider.cli() });
-    expect(observed).toMatchObject({
-      setup: 'uninstall_incomplete',
-      readiness: { status: 'not_ready' },
-      next_actions: [{ kind: 'command', argv: ['gws-ea', 'connectors', 'uninstall', 'onepassword'] }],
-    });
-    expect(provider.calls).toHaveLength(calls);
   });
 });
 

@@ -1,10 +1,9 @@
 /** The result schemas command discovery publishes: the machine-readable wire contract. */
 import type { ResultSchema } from './command-definitions.js';
 import { VOICE_CAPABILITY } from './voice-inspection.js';
-import { CONNECTOR_ACTIONS } from './connectors.js';
+import { CONNECTOR_ACTIONS, CONNECTOR_NAMES } from './connectors.js';
 import { OPERATION_PHASES } from './operation.js';
 import { WEB_CAPABILITY } from './web-connector.js';
-import { ONEPASSWORD_CAPABILITY, ONEPASSWORD_PENDING_REASONS, ONEPASSWORD_SKIP_REASONS } from './onepassword.js';
 
 const text = { type: 'string' } as const;
 // Distinct objects with the plain string shape: result.ts's redaction recognizes these protocol strings by identity.
@@ -129,6 +128,11 @@ const probes = object({
     address: nullable(text),
   }),
   browser: probe({
+    login_store: object({
+      status: choices('available', 'unavailable', 'not_checked'),
+      reason: nullable(choices('key_missing', 'key_mismatch', 'keychain_unavailable')),
+      operator_action: nullable(text),
+    }),
     chrome: choices('available', 'missing', 'unavailable', 'not_checked'),
     isolation: nullable(
       object({
@@ -262,12 +266,6 @@ const pause = object(
   },
   ['phase', 'code', 'message'],
 );
-const onePasswordMetadata = {
-  name: { const: 'onepassword' },
-  scope: { const: 'host' },
-  actions: array(choices(...ONEPASSWORD_CAPABILITY.actions)),
-  summary: text,
-};
 const webMetadata = {
   name: { const: 'web' },
   scope: { const: 'assistant' },
@@ -302,76 +300,6 @@ export const WEB_OPERATION_SCHEMA = object({
   changed: bool,
   hostname: nullable(text),
 });
-const onePasswordCheck = choices('not_checked', 'verified', 'failed');
-const onePasswordToken = choices('present', 'absent', 'invalid');
-export const ONEPASSWORD_CAPABILITY_SCHEMA = object({
-  ...onePasswordMetadata,
-  observed_at: time,
-  activation: object({ status: choices('enabled', 'disabled', 'unknown'), reason: nullable(text) }),
-  account_id: nullable(text),
-  cli: object({
-    path: nullable(text),
-    status: choices('not_checked', 'available', 'unavailable'),
-    version: nullable(text),
-    reason: nullable(text),
-  }),
-  management: object({
-    service_account_id: nullable(text),
-    token: onePasswordToken,
-    status: onePasswordCheck,
-    reason: nullable(text),
-  }),
-  quota: object({
-    status: choices('not_checked', 'observed', 'unknown'),
-    account_type: nullable(choices('individual', 'families', 'teams', 'business')),
-    sharing_assistant_ids: array(text),
-    daily: nullable(object({ limit: count, used: count, remaining: count })),
-    hourly_per_token: nullable(object({ read: nullable(count), write: nullable(count) })),
-    reason: nullable(text),
-  }),
-  assistants: array(
-    object({
-      instance_id: text,
-      compatibility: choices('compatible', 'unsupported', 'unknown'),
-      provisioning: choices('ready', 'incomplete', 'absent', 'invalid', 'not_applicable'),
-      vault_id: nullable(text),
-      runtime_service_account_id: nullable(text),
-      retired_service_account_ids: array(text),
-      recorded_grants: object({
-        operator: nullable(object({ user_id: text, permissions: array(text) })),
-        runtime: nullable(array(text)),
-      }),
-      runtime_token: onePasswordToken,
-      unproven_creation: nullable(choices('vault', 'service_account')),
-      access: object({ status: onePasswordCheck, reason: nullable(text) }),
-      write: { const: 'untested' },
-      reason: nullable(text),
-    }),
-  ),
-  prerequisites: array(text),
-  readiness_limits: array(text),
-  future_compatible_assistants: { const: true },
-});
-export const ONEPASSWORD_OPERATION_SCHEMA = object({
-  name: { const: 'onepassword' },
-  scope: { const: 'host' },
-  enabled: { const: true },
-  account_id: text,
-  management_service_account_id: text,
-  assistants: array(
-    object({
-      instance_id: text,
-      outcome: choices('ready', 'pending', 'skipped'),
-      reason: nullable(choices(...ONEPASSWORD_PENDING_REASONS, ...ONEPASSWORD_SKIP_REASONS)),
-      message: nullable(text),
-      changed: effect,
-      vault_id: nullable(text),
-      runtime_service_account_id: nullable(text),
-      retired_service_account_ids: array(text),
-    }),
-  ),
-  future_compatible_assistants: { const: true },
-});
 export const VOICE_OPERATION_SCHEMA = object(
   {
     name: { const: 'voice' },
@@ -385,7 +313,7 @@ export const VOICE_OPERATION_SCHEMA = object(
   },
   ['name', 'scope'],
 );
-const connectorName = choices('voice', 'onepassword', 'web');
+const connectorName = choices(...CONNECTOR_NAMES);
 const nextAction = {
   oneOf: [
     object({ kind: { const: 'command' }, argv: array(text) }),
@@ -428,7 +356,7 @@ export const CONNECTOR_OBSERVATION_SCHEMA = object({
   assistants: array(connectorAssistant),
   reasons: array(text),
   next_actions: array(nextAction),
-  details: { oneOf: [VOICE_CAPABILITY_SCHEMA, ONEPASSWORD_CAPABILITY_SCHEMA, array(WEB_CAPABILITY_SCHEMA)] },
+  details: { oneOf: [VOICE_CAPABILITY_SCHEMA, array(WEB_CAPABILITY_SCHEMA)] },
 });
 export const STATUS_DATA_SCHEMA = object({
   instance_id: text,
@@ -468,59 +396,9 @@ const webProvisioning = object({
   message: nullable(text),
   changed: bool,
 });
-const unprovenCreations = array(object({ kind: choices('vault', 'service_account'), name: text }));
-const onePasswordPreviewFields = {
-  account_id: text,
-  vault_id: nullable(text),
-  owned: bool,
-  item_count: nullable(count),
-  vault: choices('delete', 'retain', 'deleted', 'retained', 'gone', 'unrecorded'),
-  reason: text,
-  runtime_service_account_ids: array(text),
-  unproven: unprovenCreations,
-};
-const onePasswordOutcomeFields = {
-  account_id: text,
-  vault_id: nullable(text),
-  vault: choices('deleted', 'retained', 'gone', 'left_behind', 'unrecorded'),
-  item_count: nullable(count),
-  reason: text,
-  runtime_token: choices('deleted', 'absent'),
-  revoke_service_account_ids: array(text),
-  unproven: unprovenCreations,
-  receipt_file: nullable(text),
-};
 export const CONNECTOR_OPERATION_SCHEMA = {
   oneOf: [
     VOICE_OPERATION_SCHEMA,
-    ONEPASSWORD_OPERATION_SCHEMA,
-    object({
-      name: { const: 'onepassword' },
-      scope: { const: 'host' },
-      outcome: choices('paused', 'completed'),
-      changed: effect,
-      preview: object({
-        account_id: nullable(text),
-        management_service_account_id: nullable(text),
-        management_creation_unproven: bool,
-        vaults: array(
-          object({
-            instance_id: text,
-            credential_attempts: nullable(count),
-            ...onePasswordPreviewFields,
-          }),
-        ),
-      }),
-      assistants: array(
-        object({
-          instance_id: text,
-          ...onePasswordOutcomeFields,
-        }),
-      ),
-      receipt_file: nullable(text),
-      revoke_service_account_ids: array(text),
-      reason: nullable(text),
-    }),
     object({
       name: { const: 'web' },
       scope: { const: 'host' },
@@ -550,25 +428,25 @@ const removalPreview = object({
   gcpProject: text,
   gcpAccount: text,
   onecliProject: text,
-  onepassword: nullable(
-    object({
-      ...onePasswordPreviewFields,
-    }),
-  ),
 });
 const removal = object(
   {
     removed: array(
-      choices('whatsapp', 'nanoclaw', 'web', 'chat-subscription', 'gcp-project', 'onecli', 'instance-files'),
+      choices(
+        'whatsapp',
+        'nanoclaw',
+        'web',
+        'chat-subscription',
+        'login-key',
+        'gcp-project',
+        'onecli',
+        'instance-files',
+      ),
     ),
-    abandoned: array(
-      object({ resource: choices('gcp-project', 'chat-subscription', 'onepassword', 'web'), evidence: text }),
-    ),
+    abandoned: array(object({ resource: choices('gcp-project', 'chat-subscription', 'web'), evidence: text })),
     keyPolicyUnrestored: text,
     memberPolicyUnrestored: text,
-    onepassword: object({
-      ...onePasswordOutcomeFields,
-    }),
+    login_key: choices('removed', 'left_behind'),
   },
   ['removed', 'abandoned'],
 );

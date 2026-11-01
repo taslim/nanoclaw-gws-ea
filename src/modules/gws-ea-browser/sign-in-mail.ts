@@ -565,7 +565,7 @@ export async function executeSignInCode(
       if (kind === 'username' && email !== undefined) {
         if (!activeInbox()) throw forbidden('The assistant inbox is unavailable.');
         const sent = await fillBoundBrowserSecret(context, binding, async () => email);
-        if (sent.status === 'origin_mismatch') return sent;
+        if (sent.status === 'origin_mismatch' || sent.status === 'site_busy') return sent;
         if (sent.status !== 'submitted' && sent.status !== 'cleared_after_submit')
           throw forbidden('The host could not safely request this sign-in.');
       } else {
@@ -609,7 +609,7 @@ export async function executeSignInCode(
       discovered = await codeBinding(page, binding);
       if (!discovered || !sameOrigin(discovered)) return { status: 'origin_mismatch' };
       const filled = await fillBoundBrowserSecret(context, discovered, async () => secret.value);
-      if (filled.status === 'origin_mismatch') return filled;
+      if (filled.status === 'origin_mismatch' || filled.status === 'site_busy') return filled;
       if (filled.status !== 'submitted' && filled.status !== 'cleared_after_submit')
         throw forbidden('The host could not safely complete this sign-in.');
       return { status: 'code_filled' };
@@ -741,7 +741,7 @@ async function executeRelayCode(
       const filled = await fillBoundBrowserSecret(context, live.binding, async () => relayed.code);
       return {
         status:
-          filled.status === 'submitted' || filled.status === 'cleared_after_submit' ? 'code_filled' : 'origin_mismatch',
+          filled.status === 'submitted' || filled.status === 'cleared_after_submit' ? 'code_filled' : filled.status,
       };
     });
     return result;

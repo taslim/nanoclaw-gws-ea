@@ -31,6 +31,7 @@ import { parseIsoTimestamp } from '../mailbox/model.js';
 import { formatLocalTime } from '../timezone.js';
 import { parseInvocation } from './command-parser.js';
 import releaseTracks from './release-tracks.json' with { type: 'json' };
+import { LoginKey } from '../modules/gws-ea-browser/login-key.js';
 import * as browserAvailability from '../modules/gws-ea-browser/availability.js';
 import * as connectorInspection from './connector-inspection.js';
 import { useAvailableBrowser } from '../modules/gws-ea-browser/testing/browser-runtime.js';
@@ -649,22 +650,19 @@ describe('status', () => {
     const state = world(reservation);
     const inspect = connectorInspection.inspectConnector;
     vi.spyOn(connectorInspection, 'inspectConnector').mockImplementation((paths, name, options) => {
-      if (name === 'onepassword') throw new Error(SENTINEL);
+      if (name === 'web') throw new Error(SENTINEL);
       return inspect(paths, name, options);
     });
     const { status, output } = await statusJson(host, state, reservation.instance_id, healthyObservers(state));
     expect(status.connectors).toContainEqual(
       expect.objectContaining({
-        name: 'onepassword',
+        name: 'web',
         setup: 'unknown',
         readiness: { status: 'unknown', checked: false },
       }),
     );
     expect(status.connectors).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({ name: 'voice', setup: 'not_installed' }),
-        expect.objectContaining({ name: 'web', setup: 'not_installed' }),
-      ]),
+      expect.arrayContaining([expect.objectContaining({ name: 'voice', setup: 'not_installed' })]),
     );
     expect(status.probes.host.status).toBe('ok');
     expect(status.probes.chat.status).toBe('ok');
@@ -1120,7 +1118,12 @@ describe('status', () => {
         next_actions: readonly NextAction[];
       };
       expectResultContract('status', result);
-      expect(result.data.probes.browser).toMatchObject({ status: 'degraded', chrome: 'missing', isolation: null });
+      expect(result.data.probes.browser).toMatchObject({
+        status: 'degraded',
+        chrome: 'missing',
+        isolation: null,
+        login_store: { status: 'not_checked', reason: null, operator_action: null },
+      });
       expect(result.next_actions).toContainEqual({
         kind: 'external',
         instruction: expect.stringContaining('install Google Chrome'),
@@ -1213,7 +1216,6 @@ describe('status', () => {
     );
     expect(observed.status.connectors.map((entry) => [entry.name, entry.setup])).toEqual([
       ['voice', 'not_installed'],
-      ['onepassword', 'not_installed'],
       ['web', 'not_installed'],
     ]);
   });
@@ -2272,5 +2274,73 @@ describe('human observation presentation', () => {
     const { status } = await statusJson(host, world(reservation), reservation.instance_id);
 
     expect(Object.keys(status)).toEqual([...STATUS_FIELDS]);
+  });
+});
+
+it.each(['key_missing', 'key_mismatch', 'keychain_unavailable'] as const)(
+  'shows the running host’s login-key issue (%s) with an operator action',
+  async (reason) => {
+    const keyRead = vi
+      .spyOn(LoginKey.prototype, 'read')
+      .mockRejectedValue(new Error('Status must never read the Keychain'));
+    const host = await machine();
+    const reservation = await assistant(host, { label: 'alpha', port: 36001 });
+    const state = world(reservation);
+    const healthy = healthyObservers(state);
+    const invocation = command(host, state, {
+      ...healthy,
+      ncl: async (runtime, args) =>
+        args.join(' ') === 'gws-ea-browser-health'
+          ? {
+              schemaVersion: 1,
+              available: true,
+              loginStore: { available: false, reason },
+              proxy: { state: 'stopped' },
+              chrome: { state: 'stopped' },
+            }
+          : healthy.ncl(runtime, args),
+    });
+    expect(
+      await runStatusCommand(invocation.runtime, { instanceId: reservation.instance_id, json: true, details: true }),
+    ).toBe(0);
+    const result = JSON.parse(invocation.output.stdout.join('\n'));
+    expect(result.data.probes.browser.login_store).toMatchObject({
+      status: 'unavailable',
+      reason,
+      operator_action: expect.stringContaining(
+        reason === 'keychain_unavailable' ? 'unlock the keychain' : 'remove the unreadable logins',
+      ),
+    });
+    invocation.output.stdout.length = 0;
+    expect(
+      await runStatusCommand(invocation.runtime, { instanceId: reservation.instance_id, json: false, details: true }),
+    ).toBe(0);
+    expect(invocation.output.stdout.join('\n')).toContain(`Saved logins: unavailable; ${reason}`);
+    expect(invocation.output.stdout.join('\n')).toContain('unlock the keychain');
+    expect(keyRead).not.toHaveBeenCalled();
+  },
+);
+
+it('keeps locally missing Chrome visible when the running host cannot report browser health', async () => {
+  const host = await machine();
+  const reservation = await assistant(host, { label: 'alpha', port: 36001 });
+  const state = world(reservation);
+  const healthy = healthyObservers(state);
+  vi.mocked(browserAvailability.browserAvailability).mockResolvedValue({ available: false, reason: 'chrome-missing' });
+  const invocation = command(host, state, {
+    ...healthy,
+    ncl: async (runtime, args) => {
+      if (args.join(' ') === 'gws-ea-browser-health') throw new Error('Host health unavailable');
+      return healthy.ncl(runtime, args);
+    },
+  });
+  expect(
+    await runStatusCommand(invocation.runtime, { instanceId: reservation.instance_id, json: true, details: true }),
+  ).toBe(0);
+  const result = JSON.parse(invocation.output.stdout.join('\n'));
+  expect(result.data.probes.browser).toMatchObject({
+    status: 'degraded',
+    chrome: 'missing',
+    login_store: { status: 'not_checked', reason: null, operator_action: null },
   });
 });

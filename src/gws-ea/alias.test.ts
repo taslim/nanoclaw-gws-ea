@@ -356,7 +356,7 @@ describe('the web alias setup step', () => {
     await world.run();
     expect(await world.claimed()).toBe(ALIAS);
     const skip = await withInstanceOperation(world.paths, world.instanceId, (operation) =>
-      provisionAssistantResources(operation, {}, {}, { skip: true, ncl: async (_runtime, args) => hostNcl(args) }),
+      provisionAssistantResources(operation, {}, { skip: true, ncl: async (_runtime, args) => hostNcl(args) }),
     );
     expect(skip).toMatchObject({ status: 'ready' });
     expect(await getAliasSetup()).toEqual({ alias: null, candidate: null });
@@ -365,7 +365,6 @@ describe('the web alias setup step', () => {
     const resumed = await withInstanceOperation(world.paths, world.instanceId, (operation) =>
       provisionAssistantResources(
         operation,
-        {},
         {},
         {
           ncl: async () => {

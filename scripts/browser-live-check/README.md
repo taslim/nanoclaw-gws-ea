@@ -213,7 +213,7 @@ its reference. Preserve the receipt and associated private source artifacts.
 | `restart_before_commit`        | Mid-batch restart answers once with `interrupted`; a fresh safe request continues; no automatic replay.                                                                                                                                                                                                                                        |
 | `restart_after_commit`         | A restart after the commit marker answers `unconfirmed` and retries nothing. Browsing the site goes on; the next purchase there answers `waiting_on_earlier` until main records the outcome with `record_purchase_outcome`, from the merchant's order email or the principal's answer.                                                         |
 | `email_code_sign_in`           | Code/link sign-in uses an isolated external-email system task, with no ordinary email thread or wake to main.                                                                                                                                                                                                                                  |
-| `vault_secret_confinement`     | Dedicated-vault fill succeeds, wrong/full-frame origins are refused, filled documents cannot be screenshotted and no agent output contains the canary.                                                                                                                                                                                         |
+| `vault_secret_confinement`     | Saved-login fill succeeds, wrong/full-frame origins are refused, filled documents cannot be screenshotted and no agent output contains the canary.                                                                                                                                                                                             |
 | `purchase_card_revalidation`   | Complete terms; higher totals/material changes withdraw the old card; an unchanged lower total inside approved bounds may proceed once. Use owned fixtures or explicit real authority for commits.                                                                                                                                             |
 | `open_browsing_unreviewed`     | On a site with no reviewed reader, navigation, search, filters and form fills run without a refusal; only a commit-class control is refused, as `purchase_control`, `speaks_as_principal` or `account_security`.                                                                                                                               |
 | `unreviewed_checkout_card`     | One unreviewed checkout, through a payment platform's redirect, reaches a card with the site, the platform, the account or guest checkout, the quoted items, total, due now, payment method, contact email and any note, and a clipped picture of the total and the commit control. The card stays unapproved and no card details are entered. |
@@ -227,15 +227,6 @@ its reference. Preserve the receipt and associated private source artifacts.
 | `quiet_spaces`                 | Owner observes no unwanted Space switch throughout the active-desktop checks.                                                                                                                                                                                                                                                                  |
 | `public_only_egress`           | Loopback, link-local, LAN, rebinding, QUIC and non-proxied WebRTC attempts are refused; include live proxy probe evidence.                                                                                                                                                                                                                     |
 | `watch_soak`                   | At least 72 actual hours of native checks, no site block/account warning, and the watch stayed within the site's policy. See below.                                                                                                                                                                                                            |
-| `onepassword_provisioning`     | Install covers two assistants, one stopped, with distinct vaults and runtime service accounts (a management-created vault, an operator-minted account, recorded grants); a rerun creates none; a later `create` provisions a third; no browser or Chrome starts.                                                                               |
-| `onepassword_sharing`          | A confirmed member principal gets view and edit on only their assistant's vault, and its link opens their account, where the named vault is listed. A non-member or new guest gets the forwardable message, with no invitation promise, CLI terms or request to enable anything; a re-ask after the operator acts answers `shared`.            |
-| `onepassword_signup`           | An authorized signup saves the generated password before the site sees it. A host restart during its input callback recovers the same saved candidate: one account, one Login, no second submission.                                                                                                                                           |
-| `onepassword_owned_change`     | A change on an unedited assistant-created Login reaches the site once. Confirmed, the Login holds the new password with the principal's other edits, and no candidate or previous password remains; timed out, 1Password keeps both. No tool output or screenshot holds either.                                                                |
-| `onepassword_change_refused`   | A change on a Login the principal added, and on an assistant-created Login whose username the principal edited, is refused before any page insertion with a plain explanation.                                                                                                                                                                 |
-| `onepassword_fresh_login`      | A Login the principal adds in 1Password is used on their explicit retry, while the browser still cannot read its password.                                                                                                                                                                                                                     |
-| `onepassword_uninstall_reinstall` | Confirmed uninstall stops vault use and deletes verified owned vaults and tokens; the receipt names every account for manual revocation. A later install creates a new generation without losing earlier cleanup IDs.                                                                                 |
-| `onepassword_scoped_removal`   | Removing one assistant deletes its token and only its own previewed vault, leaves the peer and the management account working, and keeps a receipt naming each service account to revoke on 1Password.com.                                                                                                                                     |
-| `onepassword_pooled_quota`     | `check` shows the account type, daily limit, usage and every sharing assistant. With the limit nearly spent by the peer, a fill returns `rate_limited` without a retry burst. Record each operation's request cost.                                                                                                                            |
 
 ```sh
 pnpm exec tsx scripts/browser-live-check/acceptance.ts scenario \
@@ -248,22 +239,10 @@ operator assertion into an automated browser/system-of-record proof. Missing
 checks stay `not-run`; a receipt with differing expected/observed facts fails.
 Keep real fixtures or records for native assertions in the source artifacts.
 
-Record `vault_secret_confinement` and the `onepassword_*` scenarios on two
-disposable dogfood assistants, in a 1Password account the operator authorized
-for disposable resources; no principal account or Login is a test fixture. The
-operator runs `gws-ea connectors install|check|uninstall onepassword` and
-`gws-ea remove` themselves. Receipts cite resource IDs from
-`gws-ea connectors show onepassword --json` and the 1Password.com vault,
-access and service-account pages, never a password or token. A request cost is
-the account usage `check` reports before and after the operation, less the
-cost of a `check` itself.
-
 ## Secret canary scan
 
-Vault and long-lived credential canaries must stay absent from all agent contexts.
-For 1Password runs they include each password saved or generated in the test
-vaults and every service-account token; scan host DBs, logs and retained
-evidence as well as agent output, never the token files themselves.
+Saved-password and long-lived credential canaries must stay absent from all agent contexts.
+Scan host DBs, logs and retained evidence as well as agent output.
 Temporary email sign-in credentials intentionally enter the isolated external-email
 system task; scan for those only in main/browser output and operator logs.
 

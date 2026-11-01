@@ -38,15 +38,6 @@ export const acceptanceScenarios = [
   'quiet_spaces',
   'public_only_egress',
   'watch_soak',
-  'onepassword_provisioning',
-  'onepassword_sharing',
-  'onepassword_signup',
-  'onepassword_owned_change',
-  'onepassword_change_refused',
-  'onepassword_fresh_login',
-  'onepassword_uninstall_reinstall',
-  'onepassword_scoped_removal',
-  'onepassword_pooled_quota',
 ] as const;
 const errands = ['booking', 'form', 'invoice', 'compare-buy'] as const;
 type Errand = (typeof errands)[number];

@@ -1,3 +1,5 @@
+import * as loginStoreModule from '../gws-ea-browser/login-store.js';
+import { testLoginStore } from '../gws-ea-browser/testing/login-store.js';
 import fs from 'node:fs';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 const root = await vi.hoisted(async () => {
@@ -24,6 +26,7 @@ import { renderMatter } from './render.js';
 const THREAD = 'system:a2a:main:matter-job';
 let browserSession: string;
 beforeEach(async () => {
+  vi.spyOn(loginStoreModule, 'getLoginStore').mockResolvedValue(testLoginStore(`${root}/browser`).store);
   await runMigrations(await initTestDb());
   for (const id of ['main', 'browser'])
     await createAgentGroup({ id, name: id, folder: id, agent_provider: null, created_at: new Date().toISOString() });
@@ -35,6 +38,7 @@ beforeEach(async () => {
   browserSession = (await resolveSystemSession('browser', THREAD)).session.id;
 });
 afterEach(async () => {
+  vi.mocked(loginStoreModule.getLoginStore).mockRestore();
   await closeDb();
   fs.rmSync(root, { recursive: true, force: true });
 });

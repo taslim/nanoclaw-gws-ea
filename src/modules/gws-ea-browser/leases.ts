@@ -2,6 +2,7 @@ import { getDomain } from 'tldts';
 
 import type { DbDriver } from '../../db/driver.js';
 import type { PurchaseFacts } from './fingerprint.js';
+import { getLoginStore } from './login-store.js';
 
 export function browserSite(url: string): string {
   const parsed = new URL(url);
@@ -11,22 +12,12 @@ export function browserSite(url: string): string {
   return domain;
 }
 
-/**
- * Credential phases whose site stays held by their job: the website may have taken a credential, and only that job
- * may settle it. Another errand can neither submit there again nor take the site meanwhile; every other site stays
- * free.
- */
-export const HELD_CREDENTIAL_PHASES = ['exposed', 'awaiting_verification', 'unknown', 'confirmed'] as const;
+export async function heldCredentialSites(jobId: string): Promise<Set<string>> {
+  return new Set(await (await getLoginStore()).heldSites(jobId));
+}
 
-export async function heldCredentialSites(db: DbDriver, jobId: string): Promise<Set<string>> {
-  if (!(await db.hasTable('gws_ea_browser_credential_attempts'))) return new Set();
-  const rows = await db.all<{ site: string }>(
-    `SELECT DISTINCT site FROM gws_ea_browser_credential_attempts
-      WHERE job_id = ? AND phase IN (${HELD_CREDENTIAL_PHASES.map(() => '?').join(',')})`,
-    jobId,
-    ...HELD_CREDENTIAL_PHASES,
-  );
-  return new Set(rows.map((row) => row.site));
+export async function credentialSiteHeldByOther(jobId: string, site: string): Promise<boolean> {
+  return (await getLoginStore()).siteHeldByOther(jobId, site);
 }
 
 export interface SiteLease {
@@ -48,7 +39,8 @@ export class SiteLeaseStore {
     return this.db.transaction(async () => {
       const existing = await this.db.get<SiteLease>('SELECT * FROM gws_ea_browser_site_leases WHERE site = ?', site);
       const at = new Date().toISOString();
-      if (!existing || existing.job_id === jobId) {
+      const heldElsewhere = await credentialSiteHeldByOther(jobId, site);
+      if (!heldElsewhere && (!existing || existing.job_id === jobId)) {
         await this.db.run(
           `INSERT INTO gws_ea_browser_site_leases (site, job_id, state, updated_at) VALUES (?, ?, 'active', ?)
            ON CONFLICT (site) DO UPDATE SET state = CASE WHEN gws_ea_browser_site_leases.state = 'purchase' THEN 'purchase' ELSE 'active' END, updated_at = excluded.updated_at`,
@@ -65,7 +57,7 @@ export class SiteLeaseStore {
         jobId,
         at,
       );
-      const held = await heldCredentialSites(this.db, jobId);
+      const held = await heldCredentialSites(jobId);
       const idle = (
         await this.db.all<{ site: string }>(
           "SELECT site FROM gws_ea_browser_site_leases WHERE job_id = ? AND state = 'idle' ORDER BY site",
@@ -153,7 +145,7 @@ export class SiteLeaseStore {
    */
   async release(jobId: string, site?: string, updatedBefore?: string): Promise<string[]> {
     return this.db.transaction(async () => {
-      const credentials = await heldCredentialSites(this.db, jobId);
+      const credentials = await heldCredentialSites(jobId);
       const cutoff = updatedBefore ?? null;
       const held = (
         site === undefined
@@ -191,6 +183,19 @@ export class SiteLeaseStore {
         for (const waiter of waiters) waiting.add(waiter.job_id);
         if (updatedBefore !== undefined)
           await this.db.run('DELETE FROM gws_ea_browser_site_waiters WHERE job_id = ? AND site = ?', jobId, row.site);
+      }
+      if (
+        site !== undefined &&
+        updatedBefore === undefined &&
+        !credentials.has(site) &&
+        !(await credentialSiteHeldByOther(jobId, site)) &&
+        !(await this.db.get('SELECT 1 FROM gws_ea_browser_site_leases WHERE site = ?', site))
+      ) {
+        for (const waiter of await this.db.all<{ job_id: string }>(
+          'SELECT job_id FROM gws_ea_browser_site_waiters WHERE site = ? ORDER BY requested_at, job_id',
+          site,
+        ))
+          waiting.add(waiter.job_id);
       }
       if (updatedBefore === undefined) {
         if (site === undefined) await this.db.run('DELETE FROM gws_ea_browser_site_waiters WHERE job_id = ?', jobId);

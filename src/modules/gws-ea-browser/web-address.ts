@@ -4,7 +4,7 @@
  * and checkouts made for the principal. The addresses it converses from (its
  * Workspace email, and the one Gmail reports) never go onto a site, and no
  * signup opens an account under one of the principal's addresses: their own
- * accounts come only from their logins in 1Password. Until gws-ea records an
+ * accounts come only from their saved logins. Until gws-ea records an
  * alias, whatever would put the assistant's email on a site stops with
  * `alias_unavailable`, which tells the agent the assistant's setup is
  * incomplete.
@@ -77,7 +77,7 @@ export async function signupAccountStop(username: string): Promise<'alias_unavai
   if (identity.alias === null) return 'alias_unavailable';
   if (mailbox(username) === mailbox(identity.alias)) return undefined;
   throw forbidden(
-    `The assistant opens accounts only under its web address, ${identity.alias}, or a non-email username. The principal's own accounts come only from their logins in 1Password.`,
+    `The assistant opens accounts only under its web address, ${identity.alias}, or a non-email username. The principal's own accounts come only from their saved logins.`,
   );
 }
 

@@ -216,7 +216,33 @@ export interface WebAliasFacts {
   readonly address: string | null;
 }
 
+export interface LoginStoreStatus {
+  readonly status: 'available' | 'unavailable' | 'not_checked';
+  readonly reason: 'key_missing' | 'key_mismatch' | 'keychain_unavailable' | null;
+  readonly operator_action: string | null;
+}
+const LOGIN_STORE_NOT_CHECKED: LoginStoreStatus = { status: 'not_checked', reason: null, operator_action: null };
+function hostLoginStoreStatus(health: unknown): LoginStoreStatus {
+  if (!isRecord(health) || !isRecord(health.loginStore)) return LOGIN_STORE_NOT_CHECKED;
+  const store = health.loginStore;
+  if (store.available === true) return { status: 'available', reason: null, operator_action: null };
+  if (
+    store.available !== false ||
+    (store.reason !== 'key_missing' && store.reason !== 'key_mismatch' && store.reason !== 'keychain_unavailable')
+  )
+    return LOGIN_STORE_NOT_CHECKED;
+  const reason = store.reason;
+  return {
+    status: 'unavailable',
+    reason,
+    operator_action:
+      reason === 'keychain_unavailable'
+        ? 'Log in locally at the Mac and unlock the keychain, then check this assistant again.'
+        : 'Log in locally at the Mac and unlock the keychain; if the key remains missing or different, remove the unreadable logins on the principal’s saved-logins page before the next add can create a key.',
+  };
+}
 export interface BrowserStatus extends ProbeResult {
+  readonly login_store: LoginStoreStatus;
   readonly chrome: 'available' | 'missing' | 'unavailable' | 'not_checked';
   readonly isolation: BrowserIsolationObservation | null;
 }
@@ -965,6 +991,17 @@ async function webAliasProbe(subject: Subject): Promise<ProbeResult & WebAliasFa
 
 async function browserProbe(subject: Subject, active: boolean): Promise<BrowserStatus> {
   const availability = await browserAvailability(path.join(requireRuntime(subject.runtime).instance_root, 'browser'));
+  let health: unknown;
+  let healthFailure: unknown;
+  if (active) {
+    try {
+      health = unwrapData(await subject.observers.ncl(requireRuntime(subject.runtime), ['gws-ea-browser-health']));
+      // eslint-disable-next-line no-catch-all/no-catch-all -- A missing host report must not erase directly observed Chrome and isolation failures.
+    } catch (error) {
+      healthFailure = error;
+    }
+  }
+  const login_store = active && subject.context.details ? hostLoginStoreStatus(health) : LOGIN_STORE_NOT_CHECKED;
   const isolation =
     active && subject.context.details
       ? await inspectBrowserIsolation(subject.context.paths, subject.reservation.instance_id, {
@@ -975,6 +1012,7 @@ async function browserProbe(subject: Subject, active: boolean): Promise<BrowserS
       : null;
   if (!availability.available)
     return {
+      login_store,
       status: 'degraded',
       reason:
         availability.reason === 'chrome-missing'
@@ -992,19 +1030,21 @@ async function browserProbe(subject: Subject, active: boolean): Promise<BrowserS
     };
   if (!active)
     return {
+      login_store,
       status: 'unknown',
       reason: 'Assistant is stopped; browser readiness was not checked.',
       chrome: 'available',
       isolation: null,
     };
   if (isolation?.chrome.status === 'unavailable')
-    return { status: 'degraded', reason: isolation.chrome.reason, chrome: 'unavailable', isolation };
-  const health = unwrapData(await subject.observers.ncl(requireRuntime(subject.runtime), ['gws-ea-browser-health']));
+    return { status: 'degraded', reason: isolation.chrome.reason, chrome: 'unavailable', isolation, login_store };
+  if (healthFailure) throw healthFailure;
   const available = isRecord(health) ? (health.available === undefined ? health.enabled : health.available) : undefined;
   if (!isRecord(health) || typeof available !== 'boolean')
     throw new Unobservable('Browser readiness could not be observed.');
   if (!available || (isRecord(health.chrome) && health.chrome.state === 'unavailable'))
     return {
+      login_store,
       status: 'degraded',
       reason: 'The host browser cannot launch Chrome. Ask your operator to inspect its browser diagnostics.',
       chrome: 'available',
@@ -1012,12 +1052,13 @@ async function browserProbe(subject: Subject, active: boolean): Promise<BrowserS
     };
   if (isolation?.isolation.status === 'failed' || isolation?.isolation.status === 'unknown')
     return {
+      login_store,
       status: isolation.isolation.status === 'failed' ? 'degraded' : 'unknown',
       reason: isolation.isolation.reason,
       chrome: 'available',
       isolation,
     };
-  return { ...OK, chrome: 'available', isolation };
+  return { ...OK, chrome: 'available', isolation, login_store };
 }
 
 /**
@@ -1382,6 +1423,7 @@ export async function observeAssistantStatus(
     probe<Omit<BrowserStatus, 'status' | 'reason'>>(() => browserProbe(subject, active), {
       chrome: 'not_checked' as const,
       isolation: null,
+      login_store: LOGIN_STORE_NOT_CHECKED,
     }),
     probe<Omit<VoiceObservation, 'status' | 'reason'>>(
       async () => {
@@ -1765,6 +1807,10 @@ function renderStatusDetails(status: AssistantStatus, timezone: string): string[
         ? [probeDetail(name, status.probes, timezone), ...(result.reason ? [result.reason] : [])].join('; ')
         : (result.reason ?? probeDetail(name, status.probes, timezone));
     lines.push(probeLine(result.status, name, detail));
+    if (name === 'browser')
+      lines.push(
+        `    Saved logins: ${status.probes.browser.login_store.status.replaceAll('_', ' ')}${status.probes.browser.login_store.reason ? `; ${status.probes.browser.login_store.reason}` : ''}${status.probes.browser.login_store.operator_action ? `; ${status.probes.browser.login_store.operator_action}` : ''}`,
+      );
     if (name === 'job_agents') lines.push(...(status.probes.job_agents.jobs ?? []).map(jobAgentLine));
     if (name === 'inbox') lines.push(...calendarAccessLines(status.probes.inbox.calendar_access, timezone));
   }
@@ -1861,6 +1907,8 @@ function statusActions(status: AssistantStatus): NextAction[] {
       (action) => entry.setup !== 'not_installed' || action.kind === 'external' || action.argv.includes('--abandon'),
     ),
   );
+  if (status.probes.browser.login_store.operator_action)
+    actions.push({ kind: 'external', instruction: status.probes.browser.login_store.operator_action });
   if (status.probes.service.state === 'not_installed') actions.push(command('resume'));
   if (status.probes.chat.sign_in_needed === true || status.probes.workspace.status === 'degraded')
     actions.push(command('connect-google'));

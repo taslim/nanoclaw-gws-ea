@@ -1,3 +1,6 @@
+import * as loginStores from './login-store.js';
+import * as credentialOperations from './credential-operations.js';
+import { testLoginStore } from './testing/login-store.js';
 import * as availability from './availability.js';
 import { mkdtemp, rm } from 'node:fs/promises';
 import os from 'node:os';
@@ -36,6 +39,8 @@ let file: string;
 beforeEach(async () => {
   root = await mkdtemp(path.join(os.tmpdir(), 'browser-lifecycle-'));
   file = path.join(root, 'browser');
+  vi.spyOn(loginStores, 'getLoginStore').mockResolvedValue(testLoginStore(file).store);
+  vi.spyOn(credentialOperations, 'notifyOrphanCredentialAttempts').mockResolvedValue();
   runtime = new BrowserRuntime(file, undefined, process.env.GWS_EA_BROWSER_TEST_CHROME ?? process.execPath);
 });
 afterEach(async () => {
@@ -564,7 +569,7 @@ describe('optional host browser lifecycle', () => {
       for (let index = 0; index < 2; index++)
         expect(await health.handler(health.parseArgs({}), { caller: 'host' })).toMatchObject({
           schemaVersion: 1,
-
+          loginStore: { available: true },
           configured: false,
           available: false,
           proxy: { state: 'stopped' },

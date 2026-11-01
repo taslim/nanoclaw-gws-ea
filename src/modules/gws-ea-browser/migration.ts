@@ -196,48 +196,11 @@ export const browserSiteLeasesMigration: PortableMigration & { name: ModuleMigra
   },
 };
 
-/**
- * Host-generated credentials: each operation's binding, candidate and source references, phase and decided
- * settlement; never a value. A finalized row is the ownership record of the Login it names. Rows outlive jobs, so
- * `job_id` is deliberately not a foreign key.
- */
-export const browserCredentialAttemptsMigration: PortableMigration & { name: ModuleMigrationName } = {
+export const browserRetiredCredentialsMigration: PortableMigration & { name: ModuleMigrationName } = {
   version: 1,
-  name: 'module:gws-ea-browser:credential-attempts',
+  name: 'module:gws-ea-browser:retired-credentials',
   async up(db) {
-    await db.exec(`
-      CREATE TABLE gws_ea_browser_credential_attempts (
-        id TEXT PRIMARY KEY,
-        kind TEXT NOT NULL CHECK(kind IN ('signup','rotation')),
-        job_id TEXT NOT NULL,
-        instance_id TEXT NOT NULL,
-        account_id TEXT NOT NULL,
-        vault_id TEXT NOT NULL,
-        origin TEXT NOT NULL,
-        site TEXT NOT NULL,
-        username TEXT NOT NULL,
-        source_item_id TEXT,
-        source_version INTEGER,
-        candidate_item_id TEXT,
-        candidate_version INTEGER,
-        phase TEXT NOT NULL CHECK(phase IN ('preparing','saved','exposed','awaiting_verification','unknown','rejected','confirmed','finalized','conflict')),
-        save_started_at TEXT,
-        conflict_reason TEXT CHECK(conflict_reason IN ('ownership_mismatch','password_changed','login_removed')),
-        settlement TEXT CHECK(settlement IN ('promoted','kept')),
-        evidence_json TEXT,
-        owned_item_id TEXT,
-        created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL,
-        exposed_at TEXT,
-        finalized_at TEXT,
-        CHECK((kind = 'rotation') = (source_item_id IS NOT NULL)),
-        CHECK(owned_item_id IS NULL OR phase = 'finalized'),
-        CHECK(settlement IS NULL OR kind = 'rotation'),
-        CHECK(settlement IS NULL OR settlement = 'promoted' OR conflict_reason IS NOT NULL)
-      );
-      CREATE UNIQUE INDEX gws_ea_browser_credential_open_rotation ON gws_ea_browser_credential_attempts(vault_id,source_item_id) WHERE source_item_id IS NOT NULL AND phase NOT IN ('rejected','finalized');
-      CREATE INDEX gws_ea_browser_credential_owned ON gws_ea_browser_credential_attempts(vault_id,owned_item_id) WHERE owned_item_id IS NOT NULL;
-    `);
+    await db.exec('DROP TABLE IF EXISTS gws_ea_browser_credential_attempts');
   },
 };
 
@@ -499,60 +462,6 @@ export const browserPurchaseOutcomesMigration: PortableMigration & { name: Modul
   },
 };
 
-/**
- * Historical consent-wait phase. Its first-read and navigation checks could not observe existing socket
- * submissions. The later credential-uncertainty migration retires it; keep this schema step for upgrades.
- */
-export const browserCredentialConsentHoldMigration: PortableMigration & { name: ModuleMigrationName } = {
-  version: 1,
-  name: 'module:gws-ea-browser:credential-consent-hold',
-  async up(db) {
-    await db.exec(`
-      CREATE TABLE gws_ea_browser_credential_attempts_held (
-        id TEXT PRIMARY KEY,
-        kind TEXT NOT NULL CHECK(kind IN ('signup','rotation')),
-        job_id TEXT NOT NULL,
-        instance_id TEXT NOT NULL,
-        account_id TEXT NOT NULL,
-        vault_id TEXT NOT NULL,
-        origin TEXT NOT NULL,
-        site TEXT NOT NULL,
-        username TEXT NOT NULL,
-        source_item_id TEXT,
-        source_version INTEGER,
-        candidate_item_id TEXT,
-        candidate_version INTEGER,
-        phase TEXT NOT NULL CHECK(phase IN ('preparing','saved','exposed','awaiting_consent','awaiting_verification','unknown','rejected','confirmed','finalized','conflict')),
-        save_started_at TEXT,
-        conflict_reason TEXT CHECK(conflict_reason IN ('ownership_mismatch','password_changed','login_removed')),
-        settlement TEXT CHECK(settlement IN ('promoted','kept')),
-        evidence_json TEXT,
-        owned_item_id TEXT,
-        created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL,
-        exposed_at TEXT,
-        finalized_at TEXT,
-        CHECK((kind = 'rotation') = (source_item_id IS NOT NULL)),
-        CHECK(owned_item_id IS NULL OR phase = 'finalized'),
-        CHECK(settlement IS NULL OR kind = 'rotation'),
-        CHECK(settlement IS NULL OR settlement = 'promoted' OR conflict_reason IS NOT NULL)
-      );
-      INSERT INTO gws_ea_browser_credential_attempts_held
-        (id,kind,job_id,instance_id,account_id,vault_id,origin,site,username,source_item_id,source_version,
-         candidate_item_id,candidate_version,phase,save_started_at,conflict_reason,settlement,evidence_json,
-         owned_item_id,created_at,updated_at,exposed_at,finalized_at)
-        SELECT id,kind,job_id,instance_id,account_id,vault_id,origin,site,username,source_item_id,source_version,
-               candidate_item_id,candidate_version,phase,save_started_at,conflict_reason,settlement,evidence_json,
-               owned_item_id,created_at,updated_at,exposed_at,finalized_at
-          FROM gws_ea_browser_credential_attempts;
-      DROP TABLE gws_ea_browser_credential_attempts;
-      ALTER TABLE gws_ea_browser_credential_attempts_held RENAME TO gws_ea_browser_credential_attempts;
-      CREATE UNIQUE INDEX gws_ea_browser_credential_open_rotation ON gws_ea_browser_credential_attempts(vault_id,source_item_id) WHERE source_item_id IS NOT NULL AND phase NOT IN ('rejected','finalized');
-      CREATE INDEX gws_ea_browser_credential_owned ON gws_ea_browser_credential_attempts(vault_id,owned_item_id) WHERE owned_item_id IS NOT NULL;
-    `);
-  },
-};
-
 export const browserConsentOutcomesMigration: PortableMigration & { name: ModuleMigrationName } = {
   version: 1,
   name: 'module:gws-ea-browser:consent-outcomes',
@@ -568,77 +477,5 @@ export const browserConsentOutcomesMigration: PortableMigration & { name: Module
       "UPDATE gws_ea_browser_consent_stops SET outcome_notified_at = ? WHERE requested_at IS NULL AND approval_id IS NULL AND status = 'approved'",
       new Date().toISOString(),
     );
-    for (const attempt of await db.all<{ evidence_json: string | null }>(
-      "SELECT evidence_json FROM gws_ea_browser_credential_attempts WHERE phase = 'awaiting_consent'",
-    )) {
-      const evidence: unknown = JSON.parse(attempt.evidence_json ?? '{}');
-      if (
-        typeof evidence !== 'object' ||
-        evidence === null ||
-        !('stops' in evidence) ||
-        typeof evidence.stops !== 'string'
-      )
-        continue;
-      for (const stopId of evidence.stops.split(' '))
-        await db.run(
-          "UPDATE gws_ea_browser_consent_stops SET outcome_notified_at = NULL WHERE id = ? AND status IN ('rejected','expired','withdrawn')",
-          stopId,
-        );
-    }
-  },
-};
-
-/** Existing consent waits may already have submitted through a socket; preserve every candidate for reconciliation. */
-export const browserCredentialUncertaintyMigration: PortableMigration & { name: ModuleMigrationName } = {
-  version: 1,
-  name: 'module:gws-ea-browser:credential-uncertainty',
-  async up(db) {
-    await db.run(
-      "UPDATE gws_ea_browser_credential_attempts SET phase = 'unknown', updated_at = ? WHERE phase = 'awaiting_consent'",
-      new Date().toISOString(),
-    );
-    await db.exec(`
-      CREATE TABLE gws_ea_browser_credential_attempts_uncertain (
-        id TEXT PRIMARY KEY,
-        kind TEXT NOT NULL CHECK(kind IN ('signup','rotation')),
-        job_id TEXT NOT NULL,
-        instance_id TEXT NOT NULL,
-        account_id TEXT NOT NULL,
-        vault_id TEXT NOT NULL,
-        origin TEXT NOT NULL,
-        site TEXT NOT NULL,
-        username TEXT NOT NULL,
-        source_item_id TEXT,
-        source_version INTEGER,
-        candidate_item_id TEXT,
-        candidate_version INTEGER,
-        phase TEXT NOT NULL CHECK(phase IN ('preparing','saved','exposed','awaiting_verification','unknown','rejected','confirmed','finalized','conflict')),
-        save_started_at TEXT,
-        conflict_reason TEXT CHECK(conflict_reason IN ('ownership_mismatch','password_changed','login_removed')),
-        settlement TEXT CHECK(settlement IN ('promoted','kept')),
-        evidence_json TEXT,
-        owned_item_id TEXT,
-        created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL,
-        exposed_at TEXT,
-        finalized_at TEXT,
-        CHECK((kind = 'rotation') = (source_item_id IS NOT NULL)),
-        CHECK(owned_item_id IS NULL OR phase = 'finalized'),
-        CHECK(settlement IS NULL OR kind = 'rotation'),
-        CHECK(settlement IS NULL OR settlement = 'promoted' OR conflict_reason IS NOT NULL)
-      );
-      INSERT INTO gws_ea_browser_credential_attempts_uncertain
-        (id,kind,job_id,instance_id,account_id,vault_id,origin,site,username,source_item_id,source_version,
-         candidate_item_id,candidate_version,phase,save_started_at,conflict_reason,settlement,evidence_json,
-         owned_item_id,created_at,updated_at,exposed_at,finalized_at)
-        SELECT id,kind,job_id,instance_id,account_id,vault_id,origin,site,username,source_item_id,source_version,
-               candidate_item_id,candidate_version,phase,save_started_at,conflict_reason,settlement,evidence_json,
-               owned_item_id,created_at,updated_at,exposed_at,finalized_at
-          FROM gws_ea_browser_credential_attempts;
-      DROP TABLE gws_ea_browser_credential_attempts;
-      ALTER TABLE gws_ea_browser_credential_attempts_uncertain RENAME TO gws_ea_browser_credential_attempts;
-      CREATE UNIQUE INDEX gws_ea_browser_credential_open_rotation ON gws_ea_browser_credential_attempts(vault_id,source_item_id) WHERE source_item_id IS NOT NULL AND phase NOT IN ('rejected','finalized');
-      CREATE INDEX gws_ea_browser_credential_owned ON gws_ea_browser_credential_attempts(vault_id,owned_item_id) WHERE owned_item_id IS NOT NULL;
-    `);
   },
 };

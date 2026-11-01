@@ -11,7 +11,7 @@ describe('managed result redaction', () => {
     'publishes the same recovery action contract for %s connector follow-ups and its envelope',
     (command) => {
       const actions = [
-        { kind: 'command', argv: ['gws-ea', 'connectors', 'install', 'onepassword'] },
+        { kind: 'command', argv: ['gws-ea', 'connectors', 'install', 'web'] },
         { kind: 'external', instruction: 'Open the account console' },
         { kind: 'external', instruction: 'Open the account console', url: 'https://example.test/management' },
       ] as const;

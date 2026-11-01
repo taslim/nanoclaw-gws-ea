@@ -1,3 +1,5 @@
+import * as loginStores from '../gws-ea-browser/login-store.js';
+import { testLoginStore } from '../gws-ea-browser/testing/login-store.js';
 import fs from 'node:fs';
 import Database from 'better-sqlite3';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
@@ -33,6 +35,7 @@ import type { Session } from '../../types.js';
 let source: Session;
 let other: Session;
 beforeEach(async () => {
+  vi.spyOn(loginStores, 'getLoginStore').mockResolvedValue(testLoginStore(`${ROOT}/browser`).store);
   useAvailableBrowser();
   fs.rmSync(ROOT, { recursive: true, force: true });
   await runMigrations(await initTestDb());

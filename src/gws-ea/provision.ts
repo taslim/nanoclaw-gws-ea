@@ -123,7 +123,6 @@ export interface ProductionProvisionOptions {
   readonly serviceHelpers: NanoclawServiceHelpers;
   readonly interaction?: Interaction;
   readonly runtime?: ProvisionRuntime;
-  readonly onePassword?: ConnectorProvisioningDependencies['onePassword'];
   readonly web?: ConnectorProvisioningDependencies['web'];
 }
 
@@ -1434,7 +1433,6 @@ export async function runProductionProvision(
     ? provisionAssistantResources(
         operation,
         provisionRuntime,
-        { ...options.onePassword, upsertEnvVars: options.upsertEnvVars },
         { ...(alias ? { decision: alias } : {}), skip: interaction?.decisions.skipAlias },
         options.web,
       )
@@ -1445,45 +1443,28 @@ export async function runProductionProvision(
 export async function provisionAssistantResources(
   operation: InstanceOperation,
   reporter: StepReporter,
-  onePassword: ConnectorProvisioningDependencies['onePassword'] = {},
   alias: AliasStepOptions & { readonly skip?: boolean } = {},
   web: ConnectorProvisioningDependencies['web'] = {},
 ): Promise<ProvisionResult> {
-  const connectors = await provisionInstalledConnectors(operation, reporter, { onePassword, web });
+  const connectors = await provisionInstalledConnectors(operation, reporter, { web });
   const actionable = connectors.pending.find(
     (entry) =>
-      ![
-        'rate_limited',
-        'instance_busy',
-        'onepassword_busy',
-        'web_busy',
-        'web_name_unusable',
-        'web_hostname_claimed',
-        'web_hostname_foreign',
-      ].includes(entry.reason),
+      !['instance_busy', 'web_busy', 'web_name_unusable', 'web_hostname_claimed', 'web_hostname_foreign'].includes(
+        entry.reason,
+      ),
   );
   if (actionable)
     return {
       status: 'paused',
       pause: {
         kind: 'human-action',
-        phase: actionable.name === 'onepassword' ? 'provision_onepassword' : 'provision_web',
+        phase: 'provision_web',
         code: `${actionable.name}_${actionable.reason}`,
         message: `The assistant is ready; ${actionable.name} setup waits. ${actionable.message}`,
-        ...(actionable.reason === 'operator_sign_in_needed' && onePassword.operatorTerminal === false
-          ? { optional: true }
-          : {}),
         details: [
-          ...connectors.next_actions.flatMap((action) => {
-            if (action.kind !== 'command') return [action.instruction];
-            const discardUnproven =
-              actionable.name === 'onepassword' &&
-              ['vault_creation_unproven', 'service_account_creation_unproven'].includes(actionable.reason) &&
-              action.argv.slice(0, 4).join(' ') === 'gws-ea connectors install onepassword';
-            return [
-              `Then: ${action.argv.join(' ')}${discardUnproven ? ` --discard-unproven ${operation.instanceId}` : ''}`,
-            ];
-          }),
+          ...connectors.next_actions.map((action) =>
+            action.kind === 'command' ? `Then: ${action.argv.join(' ')}` : action.instruction,
+          ),
           `Continue with gws-ea resume --id ${operation.instanceId}.`,
         ],
       },

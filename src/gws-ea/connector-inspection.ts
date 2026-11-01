@@ -2,13 +2,6 @@
 import { existsSync } from 'node:fs';
 
 import { centralDatabaseFile, openWithoutSideFiles } from './verify.js';
-import type { OnePasswordCliSeams, OnePasswordCapabilityObservation } from './onepassword.js';
-import {
-  inspectOnePasswordCapability,
-  onePasswordCapabilityLines,
-  onePasswordCapabilityNextActions,
-} from './onepassword.js';
-import { inspectOnePasswordUninstall } from './onepassword-uninstall.js';
 import {
   inspectWebCapability,
   assertWebHostnameAvailable,
@@ -73,13 +66,12 @@ export interface ConnectorObservation {
   readonly assistants: readonly ConnectorAssistantObservation[];
   readonly reasons: readonly string[];
   readonly next_actions: readonly NextAction[];
-  readonly details: VoiceCapabilityObservation | OnePasswordCapabilityObservation | readonly WebCapabilityObservation[];
+  readonly details: VoiceCapabilityObservation | readonly WebCapabilityObservation[];
 }
 export interface ConnectorInspection {
   readonly check?: boolean;
   readonly instanceId?: string;
   readonly voice?: VoiceCapabilityInspection;
-  readonly onePassword?: OnePasswordCliSeams;
   readonly web?: WebCapabilityDependencies;
   readonly serviceHelpers?: NanoclawServiceHelpers;
   readonly hostStatus?: Pick<HostStatusHelpers, 'queryHost'>;
@@ -138,40 +130,6 @@ interface UninstallObservation {
 }
 async function observeUninstall(paths: ControlPlanePaths, name: ConnectorName): Promise<UninstallObservation> {
   try {
-    if (name === 'onepassword') {
-      const inspection = await inspectOnePasswordUninstall(paths);
-      const reasons: string[] = [];
-      const actions: NextAction[] = [];
-      if (inspection.incomplete) {
-        reasons.push(
-          `1Password uninstall is incomplete. Its ownership and recovery receipt is ${inspection.receipt_file}.`,
-        );
-        if (!inspection.receipt?.completed) actions.push(uninstall(name));
-      }
-      if (inspection.receipt) {
-        for (const generation of [...inspection.receipt.history, inspection.receipt]) {
-          if (generation.management_creation_unproven)
-            reasons.push(
-              'A management service account may have been created without a recorded ID. Inspect and revoke that unproven creation on 1Password.com.',
-            );
-          for (const [id, entry] of Object.entries(generation.assistants)) {
-            for (const creation of entry.cleanup.unproven)
-              reasons.push(
-                `Assistant ${id}: unproven ${creation.kind.replaceAll('_', ' ')} ${creation.name}. Inspect its possible remote creation before acknowledging this receipt.`,
-              );
-            if (entry.cleanup.operator_action) reasons.push(entry.cleanup.operator_action);
-          }
-        }
-      }
-      if (inspection.revoke_service_account_ids.length) {
-        const instruction = `Revoke these service accounts on 1Password.com: ${inspection.revoke_service_account_ids.join(', ')}. Keep the receipt until every recorded account has been revoked.`;
-        reasons.push(instruction);
-        actions.push({ kind: 'external', instruction });
-      }
-      if (inspection.receipt?.completed)
-        actions.push({ kind: 'command', argv: ['gws-ea', 'connectors', 'uninstall', name, '--abandon'] });
-      return { incomplete: inspection.incomplete, unknown: false, reasons, nextActions: actions };
-    }
     if (name === 'web') {
       const receipt = await inspectWebUninstall(paths);
       if (receipt)
@@ -368,73 +326,6 @@ export async function inspectConnector(
                   : [],
       });
     }
-  } else if (name === 'onepassword') {
-    const observation = await inspectOnePasswordCapability(paths, {
-      check: canCheck,
-      cli: options.onePassword,
-      instanceId: options.instanceId,
-      checkAssistantIds: ids.filter((id) => !unavailable.has(id)),
-    });
-    details = observation;
-    if (!removal.incomplete && !removal.unknown)
-      hostActions.push(...onePasswordCapabilityNextActions(observation, canCheck));
-    setup =
-      observation.activation.status === 'unknown'
-        ? 'unknown'
-        : observation.account_id === null
-          ? 'not_installed'
-          : observation.activation.status === 'enabled'
-            ? 'installed'
-            : 'pending';
-    hostReady =
-      observation.activation.status === 'enabled' &&
-      observation.cli.status === 'available' &&
-      observation.management.status === 'verified' &&
-      observation.quota.daily?.remaining !== 0 &&
-      observation.quota.reason?.includes('request limit is spent') !== true;
-    prerequisiteStates[0] =
-      observation.cli.status === 'available'
-        ? 'satisfied'
-        : observation.cli.status === 'unavailable'
-          ? 'missing'
-          : 'not_checked';
-    if (observation.quota.daily?.remaining === 0) reasons.push('The shared 1Password account request limit is spent.');
-    for (const reason of [observation.activation.reason, observation.management.reason, observation.cli.reason])
-      if (reason) reasons.push(reason);
-    for (const assistant of observation.assistants) {
-      const state: ConnectorSetup =
-        assistant.provisioning === 'ready'
-          ? 'installed'
-          : assistant.provisioning === 'invalid'
-            ? 'failed'
-            : observation.account_id === null
-              ? 'not_installed'
-              : 'pending';
-      const observed = canCheck && !unavailable.has(assistant.instance_id) && assistant.compatibility === 'compatible';
-      const ready = assistant.access.status === 'verified';
-      const why = [assistant.reason, assistant.access.reason].filter((reason): reason is string => reason !== null);
-      if (state === 'pending' && why.length === 0)
-        why.push('The assistant vault and runtime credentials have not been provisioned.');
-      if (unavailable.has(assistant.instance_id))
-        why.push('The assistant is stopped or unreachable; runtime access was not checked.');
-      assistants.push({
-        instance_id: assistant.instance_id,
-        compatibility: assistant.compatibility,
-        setup: state,
-        readiness: readiness(observed, ready),
-        reasons: why,
-        next_actions:
-          assistant.compatibility === 'unsupported'
-            ? [update(assistant.instance_id)]
-            : assistant.compatibility === 'unknown'
-              ? [status(assistant.instance_id)]
-              : unavailable.has(assistant.instance_id)
-                ? [start(assistant.instance_id)]
-                : state !== 'installed' || (observed && !ready)
-                  ? [repair(name)]
-                  : [],
-      });
-    }
   } else {
     let config: WebOperatorConfig | undefined;
     try {
@@ -604,10 +495,7 @@ export function connectorLines(
   const specific = !detailed
     ? []
     : 'name' in details
-      ? (details.name === 'voice'
-          ? capabilityLines(details, true, timezone)
-          : onePasswordCapabilityLines(details, true, timezone)
-        ).slice(1, -1)
+      ? capabilityLines(details, true, timezone).slice(1, -1)
       : details.flatMap((assistant) => [
           `  Assistant ${assistant.instance_id}: ${assistant.hostname ? `https://${assistant.hostname}` : 'address not provisioned'}`,
           `    Origin: ${assistant.activation}; remote: ${assistant.remote.replaceAll('_', ' ')}; listener: ${assistant.listener.replaceAll('_', ' ')}`,

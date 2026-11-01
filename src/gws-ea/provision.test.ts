@@ -21,8 +21,6 @@ import {
   type ProvisionSteps,
   type StepResource,
 } from './phases.js';
-import { onePasswordHostPaths, onePasswordInstancePaths } from '../modules/gws-ea-browser/onepassword-policy.js';
-import { installOnePassword, ONEPASSWORD_CONTRACT } from './onepassword.js';
 import type { AliasStepOptions } from './alias.js';
 import { getInstanceReservation } from './registry.js';
 import {
@@ -66,7 +64,6 @@ import {
   type UpsertEnvVars,
   type WaitForHostOptions,
 } from './service.js';
-import { ACCOUNT_ID, FakeOnePassword } from './testing/onepassword-fixture.js';
 import { KILLED_INSTALL_LEFTOVER, releaseRepository, stagingWorld } from './testing/release-fixture.js';
 import {
   GwsEaError,
@@ -2735,140 +2732,7 @@ describe('production step order and pause outcomes', () => {
   });
 });
 
-describe('the vault a new assistant inherits from 1Password enablement', () => {
-  /** A created assistant on a host where 1Password was enabled before its creation reached the end. */
-  async function createdOnEnabledHost(): Promise<{
-    readonly harness: ProductionHarness;
-    readonly provider: FakeOnePassword;
-  }> {
-    const harness = await productionHarness();
-    const provider = new FakeOnePassword();
-    // Enabled while this assistant was still being created: enable leaves it to its own create.
-    const enabled = await installOnePassword(
-      harness.paths,
-      { accountId: ACCOUNT_ID },
-      { cli: provider.cli(), upsertEnvVars, operatorTerminal: true },
-    );
-    expect(enabled.assistants).toMatchObject([
-      { instance_id: harness.instanceId, outcome: 'skipped', reason: 'not_created' },
-    ]);
-    harness.principal = 'bound';
-    await expect(harness.run()).resolves.toMatchObject({ status: 'ready' });
-    const runtime = harness.lastContext!.input.runtime;
-    // Its runtime predates the locator binding; the vault's reconciliation binds it.
-    await persistInstanceRuntime(runtime, upsertEnvVars);
-    const release = harness.paths.instanceLayout(harness.instanceId).release('aaaaaaaa');
-    await mkdir(path.join(release, 'src/gws-ea'), { recursive: true, mode: 0o700 });
-    await writeFile(
-      path.join(release, 'src/gws-ea/onepassword-compatibility.json'),
-      JSON.stringify({ schemaVersion: 1, contract: ONEPASSWORD_CONTRACT }),
-    );
-    return { harness, provider };
-  }
-
-  function finish(harness: ProductionHarness, provider: FakeOnePassword, events: RunEvent[] = []) {
-    return withInstanceOperation(harness.paths, harness.instanceId, (operation) =>
-      provisionAssistantResources(
-        operation,
-        { emit: (event) => events.push(event) },
-        { cli: provider.cli(), upsertEnvVars, operatorTerminal: true },
-        { skip: true },
-      ),
-    );
-  }
-
-  it('changes nothing and asks nothing on a host without 1Password', async () => {
-    const harness = await productionHarness();
-    harness.principal = 'bound';
-    await expect(harness.run()).resolves.toMatchObject({ status: 'ready' });
-    const provider = new FakeOnePassword();
-    const events: RunEvent[] = [];
-    await expect(finish(harness, provider, events)).resolves.toMatchObject({ status: 'ready' });
-    expect(provider.calls).toEqual([]);
-    expect(events).toEqual([]);
-  });
-
-  it('creates its own vault once every step is complete, and a resume creates nothing again', async () => {
-    const { harness, provider } = await createdOnEnabledHost();
-    const events: RunEvent[] = [];
-
-    await expect(finish(harness, provider, events)).resolves.toMatchObject({ status: 'ready' });
-
-    expect(provider.vaults.size).toBe(1);
-    expect([...provider.vaults.values()][0].name).toBe('Assistant assistant@example.com');
-    expect(events).toContainEqual({ type: 'domain-effect', step: 'provision_connectors', changed: true });
-    const runtime = harness.lastContext!.input.runtime;
-    expect((await readFile(onePasswordInstancePaths(runtime.instance_root).runtimeTokenFile, 'utf8')).trim()).toBe(
-      [...provider.serviceAccounts.values()].find((account) => account.access !== 'create_vaults')?.token,
-    );
-    expect(await readFile(path.join(runtime.state_root, '.env'), 'utf8')).toContain(
-      `GWS_EA_ONEPASSWORD_POLICY_FILE=${onePasswordHostPaths(harness.paths.configRoot).policyFile}`,
-    );
-
-    const calls = provider.calls.length;
-    await expect(finish(harness, provider)).resolves.toMatchObject({ status: 'ready' });
-    // Already provisioned: no request and no desktop prompt.
-    expect(provider.calls.length).toBe(calls);
-    expect(provider.vaults.size).toBe(1);
-  });
-
-  it('pauses with its cause when the operator is not signed in, and continues on resume', async () => {
-    const { harness, provider } = await createdOnEnabledHost();
-    provider.signedIn = false;
-
-    const paused = await finish(harness, provider);
-
-    expect(paused).toMatchObject({
-      status: 'paused',
-      pause: { kind: 'human-action', phase: 'provision_onepassword', code: 'onepassword_sign_in_required' },
-    });
-    const pause = (paused as Extract<ProvisionResult, { status: 'paused' }>).pause;
-    expect(pause.message).toContain('Unlock the 1Password app');
-    expect(provider.vaults.size).toBe(0);
-
-    provider.signedIn = true;
-    await expect(finish(harness, provider)).resolves.toMatchObject({ status: 'ready' });
-    expect(provider.vaults.size).toBe(1);
-  });
-
-  it('names the discard that clears an unproven creation in its pause', async () => {
-    const { harness, provider } = await createdOnEnabledHost();
-    provider.after = (args) => {
-      if (args[0] === 'vault' && args[1] === 'create') {
-        provider.after = undefined;
-        throw new GwsEaError('command_timeout', 'Command timed out after 60.0s');
-      }
-    };
-    const paused = (await finish(harness, provider)) as Extract<ProvisionResult, { status: 'paused' }>;
-    expect(paused.pause).toMatchObject({ code: 'onepassword_vault_creation_unproven' });
-    expect(paused.pause.message).toContain('without gws-ea recording it');
-    expect(paused.pause.details).toContain(
-      `Then: gws-ea connectors install onepassword --discard-unproven ${harness.instanceId}`,
-    );
-  });
-
-  it('reports operator-only vault setup as optional without calling op from a non-interactive create', async () => {
-    const { harness, provider } = await createdOnEnabledHost();
-    const calls = provider.calls.length;
-    const result = await withInstanceOperation(harness.paths, harness.instanceId, (operation) =>
-      provisionAssistantResources(
-        operation,
-        {},
-        { cli: provider.cli(), upsertEnvVars, operatorTerminal: false },
-        { skip: true },
-      ),
-    );
-    expect(result).toMatchObject({
-      status: 'paused',
-      pause: {
-        code: 'onepassword_operator_sign_in_needed',
-        optional: true,
-        details: expect.arrayContaining(['Then: gws-ea connectors install onepassword']),
-      },
-    });
-    expect(provider.calls).toHaveLength(calls);
-  });
-
+describe('optional web setup after creation', () => {
   it.each(['web_name_unusable', 'web_hostname_claimed', 'web_hostname_foreign'])(
     'continues through alias setup when web is pending for %s',
     async (reason) => {
@@ -2882,7 +2746,7 @@ describe('the vault a new assistant inherits from 1Password enablement', () => {
       });
       try {
         const result = await withInstanceOperation(harness.paths, harness.instanceId, (operation) =>
-          provisionAssistantResources(operation, {}, {}, { skip: true }),
+          provisionAssistantResources(operation, {}, { skip: true }),
         );
         expect(result).toMatchObject({ status: 'ready', pendingConnectors: [{ name: 'web', reason }] });
         expect(
@@ -2894,37 +2758,6 @@ describe('the vault a new assistant inherits from 1Password enablement', () => {
       }
     },
   );
-
-  it('keeps the 1Password discard target off the pending web install command', async () => {
-    const harness = await productionHarness();
-    const provisioning = vi.spyOn(connectorProvisioning, 'provisionInstalledConnectors').mockResolvedValue({
-      pending: [
-        { name: 'onepassword', reason: 'vault_creation_unproven', message: 'Vault creation is unproven.' },
-        { name: 'web', reason: 'setup_pending', message: 'Web setup is pending.' },
-      ],
-      next_actions: [
-        { kind: 'command', argv: ['gws-ea', 'connectors', 'install', 'onepassword'] },
-        { kind: 'command', argv: ['gws-ea', 'connectors', 'install', 'web'] },
-      ],
-    });
-    try {
-      const result = await withInstanceOperation(harness.paths, harness.instanceId, (operation) =>
-        provisionAssistantResources(operation, {}),
-      );
-      expect(result).toMatchObject({
-        status: 'paused',
-        pause: {
-          details: [
-            `Then: gws-ea connectors install onepassword --discard-unproven ${harness.instanceId}`,
-            'Then: gws-ea connectors install web',
-            `Continue with gws-ea resume --id ${harness.instanceId}.`,
-          ],
-        },
-      });
-    } finally {
-      provisioning.mockRestore();
-    }
-  });
 });
 
 describe('the web alias an assistant with the browser enabled gets', () => {
@@ -2962,7 +2795,7 @@ describe('the web alias an assistant with the browser enabled gets', () => {
 
   function finish(harness: ProductionHarness, alias: AliasStepOptions & { skip?: boolean }, events: RunEvent[] = []) {
     return withInstanceOperation(harness.paths, harness.instanceId, (operation) =>
-      provisionAssistantResources(operation, { emit: (event) => events.push(event) }, {}, alias),
+      provisionAssistantResources(operation, { emit: (event) => events.push(event) }, alias),
     );
   }
 

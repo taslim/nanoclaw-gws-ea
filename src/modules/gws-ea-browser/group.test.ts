@@ -89,7 +89,7 @@ it('keeps main guidance stable while browser availability changes', async () => 
   const original = await getRequiredProjectDocSections(main);
   const initialGuidance = original.find((section) => section.name === 'Browser delegation')?.body;
   expect(initialGuidance).toContain('Access can change during a conversation');
-  expect(initialGuidance).toContain('shared signed-in profile and vault');
+  expect(initialGuidance).toContain('shared signed-in profile');
   expect(initialGuidance).toContain('try each new errand');
 
   const sections = await getRequiredProjectDocSections(main);

@@ -13,6 +13,7 @@ import { mkdirSync, readlinkSync, writeFileSync } from 'node:fs';
 import { mkdir, readdir, readFile, readlink, rm, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 
+import { testLoginStore } from '../modules/gws-ea-browser/testing/login-store.js';
 import Database from 'better-sqlite3';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { WhatsAppAuthStore } from '../modules/gws-ea-whatsapp/auth-store.js';
@@ -212,10 +213,6 @@ describe('gws-ea rollback when no schema moved', GIT_HEAVY, () => {
     expect(await readFile(modelFile, 'utf8')).toBe('shared immutable model');
     expect(await readFile(path.join(runtime.state_root, '.env'), 'utf8')).toContain(
       `GWS_EA_VOICE_POLICY_FILE=${voicePolicy}`,
-    );
-    // The 1Password host policy is located through the same root: a locator, never a token.
-    expect(await readFile(path.join(runtime.state_root, '.env'), 'utf8')).toContain(
-      `GWS_EA_ONEPASSWORD_POLICY_FILE=${path.join(host.paths.configRoot, 'onepassword', 'policy.json')}`,
     );
     expect(await centralInode(runtime)).toBe(inode);
     expect(messages(runtime.state_root)).toEqual(['m1', 'm2']);
@@ -941,4 +938,25 @@ describe('what a snapshot restore discards', () => {
       `  Memory and group files changed since: 1 (${path.join('main', 'notes\\u001b[2K\\rNothing is lost.\\n.md')})`,
     );
   });
+});
+
+it('keeps the current saved password through update and a snapshot rollback', GIT_HEAVY, async () => {
+  const host = await machine();
+  const runtime = await assistant(host);
+  const { store } = testLoginStore(path.join(runtime.instance_root, 'browser'));
+  const saved = await store.create({
+    site: 'cedar.example',
+    username: 'mira',
+    title: 'Cedar',
+    password: 'Birch!before',
+  });
+  const next = await nextRelease(host, NEW_IMAGE);
+  const state = world(runtime);
+  const { run } = cli(host, state, next, runtime);
+  expect(await run(['update', '--id', runtime.instance_id, '--yes'])).toBe(0);
+  expect(await store.secret(saved.id, 'password', 'https://cedar.example')).toBe('Birch!before');
+  await store.update(saved.id, saved.version, { password: 'Cedar!after-snapshot' });
+  await migratedByNext(runtime);
+  expect(await run(['rollback', '--id', runtime.instance_id, '--snapshot', '--yes'])).toBe(0);
+  expect(await store.secret(saved.id, 'password', 'https://cedar.example')).toBe('Cedar!after-snapshot');
 });

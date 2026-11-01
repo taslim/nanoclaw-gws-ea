@@ -15,7 +15,7 @@ import type { DbDriver } from '../../db/driver.js';
 import { browserAvailability } from './availability.js';
 import { errandSource, hasBrowserAccess } from './access.js';
 import { BrowserStore, type BrowserJob } from './db.js';
-import { credentialAttempts, type CredentialAttempt } from './credential-attempts.js';
+import { credentialAttempts } from './credential-attempts.js';
 import { heldCredentialSites, SiteLeaseStore } from './leases.js';
 import { PurchaseAuthorityStore } from './authority.js';
 import { detachPurchaseCards, finishPurchaseCardWithdrawals } from './cards.js';
@@ -198,8 +198,6 @@ export interface BrowserJobCancellation {
   readonly job: BrowserJob;
   readonly waitingJobs: readonly string[];
   readonly withdrawnCards?: readonly PendingApproval[];
-  /** Credential attempts that disclosed nothing: their unused candidates are archived after commit. */
-  readonly abandonedAttempts?: readonly CredentialAttempt[];
 }
 
 /** A purchase commit or watch booking in progress, which finishes and reports before cancellation completes. */
@@ -219,7 +217,7 @@ async function committing(db: DbDriver, jobId: string): Promise<boolean> {
  * Each finishes or is reconciled through this still-live job.
  */
 async function unresolvedWork(db: DbDriver, jobId: string): Promise<boolean> {
-  return (await committing(db, jobId)) || (await heldCredentialSites(db, jobId)).size > 0;
+  return (await committing(db, jobId)) || (await heldCredentialSites(jobId)).size > 0;
 }
 
 /**
@@ -240,16 +238,15 @@ export async function cancelBrowserJobInTransaction(
   if (await store.db.hasTable('gws_ea_browser_watches'))
     withdrawnCards.push(...(await detachBrowserWatchCards(job.id, 'cancelled')));
   // No authority the job has not used survives it: nothing was disclosed for these.
-  const credentials = await store.db.hasTable('gws_ea_browser_credential_attempts');
-  const abandonedAttempts = credentials ? await credentialAttempts.abandonForJob(job.id) : [];
+  await credentialAttempts.abandonForJob(job.id);
   // Read after abandoning, so an attempt whose disclosure won the race keeps the job live.
-  if (inProgress || (await heldCredentialSites(store.db, job.id)).size > 0) {
+  if (inProgress || (await heldCredentialSites(job.id)).size > 0) {
     await store.db.run(
       'UPDATE gws_ea_browser_jobs SET cancel_requested = 1,updated_at = ? WHERE id = ?',
       new Date().toISOString(),
       job.id,
     );
-    return { status: 'in_progress', thread, job, waitingJobs: [], withdrawnCards, abandonedAttempts };
+    return { status: 'in_progress', thread, job, waitingJobs: [], withdrawnCards };
   }
   await store.db.run(
     'UPDATE gws_ea_browser_jobs SET cancelled = 1, updated_at = ? WHERE id = ?',
@@ -257,7 +254,7 @@ export async function cancelBrowserJobInTransaction(
     job.id,
   );
   const waitingJobs = await new SiteLeaseStore(store.db).release(job.id);
-  return { status: 'cancelled', thread, job, waitingJobs, withdrawnCards, abandonedAttempts };
+  return { status: 'cancelled', thread, job, waitingJobs, withdrawnCards };
 }
 
 let cancellationQueue: BrowserQueue | undefined;
@@ -276,9 +273,6 @@ export async function finishBrowserJobCancellation(
   running?: string,
 ): Promise<void> {
   const cleanup = await Promise.allSettled([
-    (async () => {
-      if (result.abandonedAttempts?.length) await credentialAttempts.retireCandidates(result.abandonedAttempts);
-    })(),
     (async () => {
       if (!result.withdrawnCards) return;
       await finishPurchaseCardWithdrawals(result.withdrawnCards, 'Withdrawn: this browser errand was cancelled.');
@@ -417,7 +411,7 @@ export async function sweepBrowserJobSessions(
           job.id,
         ));
       // An unresolved credential attempt can be settled only through this job.
-      const credential = (await heldCredentialSites(store.db, job.id)).size > 0;
+      const credential = (await heldCredentialSites(job.id)).size > 0;
       if (pending.length > 0 || lease || purchase || watch || credential) return;
       await updateSession(session.id, { status: 'closed' });
     });

@@ -1,3 +1,5 @@
+import * as loginStores from '../gws-ea-browser/login-store.js';
+import { testLoginStore } from '../gws-ea-browser/testing/login-store.js';
 import fs from 'node:fs';
 import path from 'node:path';
 import Database from 'better-sqlite3';
@@ -75,6 +77,7 @@ let nextId = 0;
 const configureDelegation = async (ids: readonly string[]): Promise<void> => configureBrowserAccess(BROWSER_ROOT, ids);
 
 beforeEach(async () => {
+  vi.spyOn(loginStores, 'getLoginStore').mockResolvedValue(testLoginStore(BROWSER_ROOT).store);
   useAvailableBrowser();
   fs.rmSync(ROOT, { recursive: true, force: true });
   agents.clear();
@@ -259,7 +262,7 @@ it('composes browser guidance only for an explicitly granted active job and remo
   expect(await documentFor(external)).not.toContain('# Browser delegation');
   const withoutBrowser = await documentFor(job.agent_group_id);
   expect(withoutBrowser).not.toContain('# Browser delegation');
-  expect(withoutBrowser).not.toContain('shared signed-in profile and vault');
+  expect(withoutBrowser).not.toContain('shared signed-in profile');
   expect(withoutBrowser).not.toContain('`record_disclosure`');
   expect(withoutBrowser).not.toContain('yreva@example.test');
   await configureDelegation([job.agent_group_id]);
@@ -276,7 +279,7 @@ it('composes browser guidance only for an explicitly granted active job and remo
     (section) => section.name === 'Assistant Identity',
   );
   expect(identity?.body).toContain("Avery's web address is `yreva@example.test`.");
-  expect(granted).toContain('shared signed-in profile and vault');
+  expect(granted).toContain('shared signed-in profile');
   expect(granted).toContain('`record_disclosure`');
   expect(granted).toContain('principal approvals');
   expect(granted).not.toContain('# Executive Assistant');
@@ -285,7 +288,7 @@ it('composes browser guidance only for an explicitly granted active job and remo
   await configureDelegation([]);
   const revoked = await documentFor(job.agent_group_id);
   expect(revoked).not.toContain('# Browser delegation');
-  expect(revoked).not.toContain('shared signed-in profile and vault');
+  expect(revoked).not.toContain('shared signed-in profile');
   expect(revoked).not.toContain('`record_disclosure`');
   expect(revoked).not.toContain('yreva@example.test');
 });

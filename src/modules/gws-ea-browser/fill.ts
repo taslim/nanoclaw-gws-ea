@@ -14,8 +14,9 @@ import {
   inspectNativeAuthenticationControl,
   type NativeAuthenticationBinding,
 } from './authentication-submit.js';
-import { browserVault, BrowserVaultError } from './onepassword.js';
+import { getLoginStore, LoginStoreError } from './login-store.js';
 import { credentialAttempts } from './credential-attempts.js';
+import { SiteLeaseStore } from './leases.js';
 import {
   disposeBrowserRefs,
   pinBrowserRefs,
@@ -24,7 +25,7 @@ import {
   type PinnedBrowserRef,
 } from './observe.js';
 import { registerPageSecret, bindPageSecretDocuments, releasePageSecret } from './page-privacy.js';
-import type { BrowserExecutionContext, BrowserQueuedAction } from './actions.js';
+import { browserOperationId, type BrowserExecutionContext, type BrowserQueuedAction } from './actions.js';
 
 export interface BoundBrowserSecretField {
   readonly page: Page;
@@ -41,9 +42,8 @@ export type BrowserSecretFillResult = {
     | 'cleared_after_submit'
     | 'origin_mismatch'
     | 'no_item_for_site'
-    | 'vault_not_set_up'
     | 'vault_unavailable'
-    | 'rate_limited';
+    | 'site_busy';
 };
 
 /** The field and its submit control are not in one frame on one HTTPS origin. */
@@ -191,6 +191,9 @@ export async function fillBoundBrowserSecret(
     )
       return { status: 'origin_mismatch' };
     await context.assertActive();
+    const lease = await new SiteLeaseStore(context.store.db).acquire(context.job.id, binding.origin);
+    await context.wakeWaiters(lease.waitingJobs, `${browserOperationId(context)}:sign-in-lease`);
+    if (!lease.acquired) return { status: 'site_busy' };
     assertBrowserSecretDiagnosticsSafe();
     value = await resolve();
     await context.assertActive();
@@ -235,8 +238,8 @@ export async function fillBoundBrowserSecret(
     return { status: navigated ? 'submitted' : 'cleared_after_submit' };
   } catch (error) {
     if (error instanceof BrowserOriginMismatchError) return { status: 'origin_mismatch' };
-    if (error instanceof BrowserVaultError) return { status: error.reason };
-    // SDK and Playwright exceptions may carry values or page text; only constant host prose crosses this boundary.
+    if (error instanceof LoginStoreError) return { status: error.reason };
+    // Store and Playwright exceptions may carry values or page text; only constant host prose crosses this boundary.
     throw forbidden('The host could not safely complete this sign-in. Take a fresh observation.');
   } finally {
     page.off('framenavigated', navigation);
@@ -284,12 +287,12 @@ export async function discoverAuthenticationCodeField(
   }
 }
 
-const SECRET_FIELDS: readonly BrowserSecretField[] = ['username', 'password', 'otp'];
-const isSecretField = (value: unknown): value is BrowserSecretField => SECRET_FIELDS.some((field) => field === value);
+type SavedSecretField = 'username' | 'password';
+const isSecretField = (value: unknown): value is SavedSecretField => value === 'username' || value === 'password';
 
 interface FillSecretPayload extends Record<string, unknown> {
   item_handle: string;
-  field: BrowserSecretField;
+  field: SavedSecretField;
   target: BrowserRef;
   submit: BrowserRef;
 }
@@ -303,7 +306,7 @@ export function validateFillSecret(content: Record<string, unknown>): FillSecret
     !/^vault_[a-z\d_-]{1,100}$/iu.test(handle) ||
     !isSecretField(field)
   )
-    throw invalidArgs('Choose a listed vault item and a username, password or one-time-code field.');
+    throw invalidArgs('Choose a listed saved login and a username or password field.');
   const message = 'Choose a field and submit control from a fresh observation.';
   return {
     item_handle: handle,
@@ -330,12 +333,13 @@ export async function executeFillSecret(
         refs.get(payload.submit.ref)!,
         payload.field,
       );
-      return await fillBoundBrowserSecret(context, binding, () =>
-        browserVault.resolve(payload.item_handle, payload.field, binding.origin, context.assertActive),
-      );
+      return await fillBoundBrowserSecret(context, binding, async () => {
+        await context.assertActive();
+        return (await getLoginStore()).secret(payload.item_handle, payload.field, binding.origin);
+      });
     } catch (error) {
       if (error instanceof BrowserOriginMismatchError) return { status: 'origin_mismatch' };
-      if (error instanceof BrowserVaultError) return { status: error.reason };
+      if (error instanceof LoginStoreError) return { status: error.reason };
       if (error instanceof ActionRefusal) throw error;
       throw forbidden('Choose a supported sign-in field and submit control from a fresh observation.');
     } finally {
@@ -352,18 +356,23 @@ export async function readVaultSiteInfo(
 ): Promise<Record<string, unknown>> {
   try {
     const items = new Map<string, { item_handle: string; title: string; account: 'assistant' | 'principal' }>();
+    const store = await getLoginStore();
     for (const frameOrigin of origins) {
-      const choices = await browserVault.itemsForOrigin(frameOrigin, assertActive);
+      await assertActive();
+      const choices = await store.forOrigin(frameOrigin);
       for (const item of choices) {
-        if (items.has(item.item_handle)) continue;
-        const classification = await credentialAttempts.account(item.item_handle, frameOrigin, assertActive);
-        if (classification.status !== 'classified') throw new BrowserVaultError(classification.status);
-        items.set(item.item_handle, { ...item, account: classification.account });
+        if (items.has(item.id)) continue;
+        await assertActive();
+        items.set(item.id, {
+          item_handle: item.id,
+          title: item.title,
+          account: await credentialAttempts.accountForLogin(item),
+        });
       }
     }
     return { vault_items: [...items.values()] };
-    // eslint-disable-next-line no-catch-all/no-catch-all -- optional vault metadata becomes a constant status, never a failed observation
-  } catch (error) {
-    return { vault_status: error instanceof BrowserVaultError ? error.reason : 'vault_unavailable' };
+    // eslint-disable-next-line no-catch-all/no-catch-all -- optional login metadata becomes a constant status, never a failed observation
+  } catch (_error) {
+    return { vault_status: 'vault_unavailable' };
   }
 }

@@ -1,4 +1,6 @@
 import { useAvailableBrowser } from './testing/browser-runtime.js';
+import * as loginStoreModule from './login-store.js';
+import { testLoginStore } from './testing/login-store.js';
 import * as structuredLocators from './locators.js';
 import { locateStructured } from './locators.js';
 import { createBrowserQueue, recoverAndStartBrowserQueue } from './index.js';
@@ -89,17 +91,23 @@ import type { StructuredBrowserLocator } from './locators.js';
 import * as nativeControlFacts from './control-facts.js';
 
 const chromePath = process.env.GWS_EA_BROWSER_TEST_CHROME;
+let restoreLoginStore: (() => void) | undefined;
 
 /** A fresh central DB and an enabled browser policy, with no wake requested yet. */
 async function freshBrowserState(): Promise<void> {
   vi.mocked(requestWake).mockClear();
   fs.rmSync(root, { recursive: true, force: true });
   fs.mkdirSync(`${root}/browser`, { recursive: true, mode: 0o700 });
+  const logins = testLoginStore(`${root}/browser`);
+  const binding = vi.spyOn(loginStoreModule, 'getLoginStore').mockResolvedValue(logins.store);
+  restoreLoginStore = () => binding.mockRestore();
 
   process.env.GWS_EA_BROWSER_ROOT = `${root}/browser`;
   await runMigrations(await initTestDb());
 }
 async function clearBrowserState(): Promise<void> {
+  restoreLoginStore?.();
+  restoreLoginStore = undefined;
   delete process.env.GWS_EA_BROWSER_ROOT;
   await closeDb();
   fs.rmSync(root, { recursive: true, force: true });

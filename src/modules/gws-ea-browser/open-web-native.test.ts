@@ -6,6 +6,7 @@ import { createBrowserQueue } from './index.js';
 /** The open rule against native Chrome: unreviewed sites, cross-site frames, dialogs and hostile page script. */
 import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
+import { createServer, request as httpRequest } from 'node:http';
 
 import Database from 'better-sqlite3';
 import type { ElementHandle, Locator, Page } from 'playwright-core';
@@ -80,8 +81,9 @@ import {
   type OpenWebFixture,
   type OpenWebRequest,
 } from './open-web-native-fixture.js';
-import { browserVault } from './onepassword.js';
-import { credentialAttempts } from './credential-attempts.js';
+import * as loginStoreModule from './login-store.js';
+import { createLoginsPageHandler } from './logins-page.js';
+import { testLoginStore } from './testing/login-store.js';
 import { observePage, type BrowserObservation } from './observe.js';
 import { registerBrowserPurchaseDelivery, resumeBrowserPurchaseCommits } from './purchase.js';
 import { recordPurchaseOutcome } from './purchase-outcome.js';
@@ -97,6 +99,7 @@ const chromePath = process.env.GWS_EA_BROWSER_TEST_CHROME;
 
 /** The one fixture every suite here drives: each test starts from its shared pages, with no request seen. */
 let fixture: OpenWebFixture;
+let defaultLogins: ReturnType<typeof testLoginStore>;
 beforeAll(async () => {
   if (chromePath) fixture = await openWebFixture(chromePath);
 }, 30_000);
@@ -104,8 +107,13 @@ afterAll(async () => {
   await fixture?.close();
 });
 beforeEach(() => {
+  useAvailableBrowser();
   fixture?.reset();
+  fs.rmSync(`${root}/browser`, { recursive: true, force: true });
+  defaultLogins = testLoginStore(`${root}/browser`);
+  vi.spyOn(loginStoreModule, 'getLoginStore').mockResolvedValue(defaultLogins.store);
 });
+afterEach(() => vi.restoreAllMocks());
 
 /** A PNG's width and height, as its header states them. */
 function pngSize(data: Buffer): { width: number; height: number } {
@@ -287,7 +295,6 @@ describe.skipIf(!chromePath)('open-web classification in native Chrome', { timeo
   let page: Page;
 
   beforeEach(async () => {
-    useAvailableBrowser();
     page = await fixture.newPage();
   });
   afterEach(async () => {
@@ -1389,24 +1396,33 @@ describe.skipIf(!chromePath)('ordinary presses that buy, in native Chrome', { ti
       'SELECT kind, site, job_id FROM gws_ea_browser_incidents',
     );
 
-  it('presents the account owner of each saved login', async () => {
-    const list = vi.spyOn(browserVault, 'itemsForOrigin').mockResolvedValue([
-      { item_handle: 'vault_assistant', title: 'Assistant login' },
-      { item_handle: 'vault_principal', title: 'Principal login' },
-    ]);
-    const account = vi.spyOn(credentialAttempts, 'account').mockImplementation(async (handle) => ({
-      status: 'classified',
-      account: handle === 'vault_assistant' ? 'assistant' : 'principal',
-    }));
+  it('presents each saved login account owner without reading the key', async () => {
+    const logins = testLoginStore(`${root}/browser`);
+    const assistant = await logins.store.create({
+      site: OPEN_WEB.faq,
+      username: ALIAS,
+      title: 'Assistant login',
+      password: 'native-assistant-secret',
+    });
+    const principal = await logins.store.create({
+      site: OPEN_WEB.faq,
+      username: 'morgan@example.test',
+      title: 'Principal login',
+      password: 'native-principal-secret',
+    });
+    logins.setUnavailable(true);
+    const reads = logins.keyReads();
+    const store = vi.spyOn(loginStoreModule, 'getLoginStore').mockResolvedValue(logins.store);
     try {
       const opened = await run('inventory-labels', [{ kind: 'navigate', url: OPEN_WEB.faq }]);
       expect((opened.observation as BrowserObservation).site?.vault_items).toEqual([
-        { item_handle: 'vault_assistant', title: 'Assistant login', account: 'assistant' },
-        { item_handle: 'vault_principal', title: 'Principal login', account: 'principal' },
+        { item_handle: assistant.id, title: 'Assistant login', account: 'assistant' },
+        { item_handle: principal.id, title: 'Principal login', account: 'principal' },
       ]);
+      expect(logins.keyReads()).toBe(reads);
+      expect(JSON.stringify(opened)).not.toMatch(/native-assistant-secret|native-principal-secret|morgan@/u);
     } finally {
-      list.mockRestore();
-      account.mockRestore();
+      store.mockResolvedValue(defaultLogins.store);
     }
   });
 
@@ -1422,15 +1438,20 @@ describe.skipIf(!chromePath)('ordinary presses that buy, in native Chrome', { ti
         if (source === 'catalog' && sql.includes('SELECT r.* FROM gws_ea_browser_recipes')) await held;
         return all(sql, ...parameters);
       });
-      const vault = vi.spyOn(browserVault, 'itemsForOrigin').mockImplementation(async () => {
+      const logins = testLoginStore(`${root}/browser`);
+      const item = await logins.store.create({
+        site: OPEN_WEB.faq,
+        username: 'morgan@example.test',
+        title: 'Fixture login',
+        password: 'native-metadata-secret',
+      });
+      const store = vi.spyOn(loginStoreModule, 'getLoginStore').mockResolvedValue(logins.store);
+      const vault = vi.spyOn(logins.store, 'forOrigin').mockImplementation(async () => {
         if (source === 'vault') await held;
         // A useful first inventory may take longer than the recorder's allowance.
         else await new Promise<void>((resolve) => setTimeout(resolve, 500));
-        return [{ item_handle: 'vault_after-retry', title: 'Fixture login' }];
+        return [item];
       });
-      const account = vi
-        .spyOn(credentialAttempts, 'account')
-        .mockResolvedValue({ status: 'classified', account: 'principal' });
       // Release even on the old implementation, whose queue must settle its timed-out operation before answering.
       const timer = setTimeout(release, 5_000);
       try {
@@ -1441,13 +1462,13 @@ describe.skipIf(!chromePath)('ordinary presses that buy, in native Chrome', { ti
         expect(result).toMatchObject({ reason: 'navigated', actions: [{ status: 'completed' }] });
         expect((result.observation as BrowserObservation).site).toMatchObject(
           source === 'catalog'
-            ? { recipes_status: 'unavailable', vault_items: [{ item_handle: 'vault_after-retry' }] }
+            ? { recipes_status: 'unavailable', vault_items: [{ item_handle: item.id }] }
             : { recipes: [], vault_status: 'vault_unavailable' },
         );
         release();
         catalog.mockRestore();
         const retried = await observePage(page);
-        expect(retried.site).toMatchObject({ recipes: [], vault_items: [{ item_handle: 'vault_after-retry' }] });
+        expect(retried.site).toMatchObject({ recipes: [], vault_items: [{ item_handle: item.id }] });
         expect(
           await run('after-held-catalog', [
             { kind: 'click', ...refIn(await observePage(page), 'Show delivery times') },
@@ -1458,7 +1479,7 @@ describe.skipIf(!chromePath)('ordinary presses that buy, in native Chrome', { ti
         clearTimeout(timer);
         catalog.mockRestore();
         vault.mockRestore();
-        account.mockRestore();
+        store.mockResolvedValue(defaultLogins.store);
       }
     },
   );
@@ -1765,31 +1786,74 @@ describe.skipIf(!chromePath)('personal data in native Chrome', { timeout: 60_000
     expect(page.url()).toBe(PERSONAL_DATA.booking);
   });
 
-  it('signs the principal in to their own account with their address from 1Password, and refuses that address in a newsletter field', async () => {
-    const resolve = vi.spyOn(browserVault, 'resolve').mockResolvedValue('morgan@example.test');
+  it('fills a login added on the page in the next errand and refuses its username in a newsletter field', async () => {
+    const logins = testLoginStore(`${root}/browser`);
+    const server = createServer(
+      createLoginsPageHandler({
+        hostname: 'aya.example.test',
+        identity: async () => 'morgan@example.test',
+        store: logins.store,
+      }),
+    );
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    try {
+      const address = server.address();
+      if (!address || typeof address === 'string') throw new Error('No page fixture port');
+      const added = await new Promise<{ status: number; body: string }>((resolve, reject) => {
+        const submission = httpRequest(
+          {
+            hostname: '127.0.0.1',
+            port: address.port,
+            path: '/logins/add',
+            method: 'POST',
+            headers: {
+              host: 'aya.example.test',
+              origin: 'https://aya.example.test',
+              'content-type': 'application/json',
+            },
+          },
+          (response) => {
+            let body = '';
+            response.on('data', (chunk: Buffer) => {
+              body += chunk.toString();
+            });
+            response.on('end', () => resolve({ status: response.statusCode ?? 0, body }));
+          },
+        );
+        submission.on('error', reject);
+        submission.end(
+          JSON.stringify({
+            site: PERSONAL_DATA.signIn,
+            username: 'morgan@example.test',
+            title: 'Osteria',
+            password: 'native-sign-in-secret',
+          }),
+        );
+      });
+      expect(added.status).toBe(200);
+      expect(added.body).toContain('Login added.');
+    } finally {
+      await new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
+    }
+    const [item] = await logins.store.all();
+    const store = vi.spyOn(loginStoreModule, 'getLoginStore').mockResolvedValue(logins.store);
     try {
       const signIn = await open(PERSONAL_DATA.signIn);
       expect(
         await request('sign-in', 'fill_secret', {
-          item_handle: 'vault_osteria',
+          item_handle: item.id,
           field: 'username',
           target: refIn(signIn, 'Email'),
           submit: refIn(signIn, 'Continue'),
         }),
       ).toMatchObject({ status: 'submitted' });
-      expect(resolve).toHaveBeenCalledWith(
-        'vault_osteria',
-        'username',
-        'https://osteria.example',
-        expect.any(Function),
-      );
       // The host's sign-in submission runs the consent pass first: the site's pre-ticked offers box goes unticked.
       expect(posts().map((sent) => [sent.url, Object.fromEntries(new URLSearchParams(sent.body))])).toEqual([
         [PERSONAL_DATA.signIn, { email: 'morgan@example.test' }],
       ]);
       expect(await page.locator('h1').textContent()).toBe('Welcome back');
     } finally {
-      resolve.mockRestore();
+      store.mockResolvedValue(defaultLogins.store);
     }
     const newsletter = await open(PERSONAL_DATA.newsletter);
     for (const text of ['morgan@example.test', 'Morgan+offers@example.test'])

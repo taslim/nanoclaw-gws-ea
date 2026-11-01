@@ -8,6 +8,7 @@
  * the release's scripts and migration registry, the hosts, OneCLI, and `ncl`
  * are faked at their boundaries.
  */
+import * as webConnector from './web-connector.js';
 import { randomUUID } from 'node:crypto';
 import { mkdir, readdir, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
@@ -55,8 +56,6 @@ import type { NanoclawServiceHelpers } from './service-control.js';
 import { releaseOf, type ReleaseCoordinates } from './types.js';
 import type { UpdatePreview } from './update.js';
 import { registeredReleaseMigrations, type UpdateAllPlan } from './update-all.js';
-import { installOnePassword, ONEPASSWORD_CONTRACT } from './onepassword.js';
-import { ACCOUNT_ID, FakeOnePassword } from './testing/onepassword-fixture.js';
 import { releaseName } from './release-layout.js';
 
 afterEach(async () => {
@@ -177,40 +176,40 @@ async function expectOnRelease(host: Machine, runtime: InstanceRuntimeConfig, co
 }
 
 describe('gws-ea update --all', GIT_HEAVY, () => {
-  it('finishes newly compatible updates without an operator terminal and deduplicates connector setup actions', async () => {
+  it('keeps serving updates complete and deduplicates pending web setup actions', async () => {
     const host = await machine();
     const first = await assistant(host, { port: 37001 });
     const second = await assistant(host, { port: 37101 });
-    const provider = new FakeOnePassword();
-    await installOnePassword(
-      host.paths,
-      { accountId: ACCOUNT_ID },
-      { cli: provider.cli(), upsertEnvVars: () => undefined, operatorTerminal: true },
-    );
-    const next = await nextRelease(host, {
-      'src/gws-ea/onepassword-compatibility.json': JSON.stringify({ schemaVersion: 1, contract: ONEPASSWORD_CONTRACT }),
-    });
+    const next = await nextRelease(host);
     const machineFleet = await fleet(host, next, [first, second]);
-    const { run, out } = fleetCli(machineFleet, { onePassword: provider.cli() });
-    const calls = provider.calls.length;
-    expect(await run(['update', '--all', '--yes', '--no-input', '--json'])).toBe(0);
-    const result = JSON.parse(out.join('\n'));
-    expectResultContract('update', result);
-    expect(result).toMatchObject({
-      outcome: 'succeeded',
-      data: {
-        targets: expect.arrayContaining([
-          { instance_id: first.instance_id, outcome: 'completed', update: expect.any(Object) },
-          { instance_id: second.instance_id, outcome: 'completed', update: expect.any(Object) },
-        ]),
-      },
-    });
-    expect(result.next_actions).toEqual([
-      { kind: 'command', argv: ['gws-ea', 'connectors', 'install', 'onepassword'] },
-    ]);
-    expect(provider.calls.length).toBe(calls);
-    expect((await getInstanceReservation(host.paths, first.instance_id)).deployed_commit).toBe(next.commit);
-    expect((await getInstanceReservation(host.paths, second.instance_id)).deployed_commit).toBe(next.commit);
+    const provision = vi.spyOn(webConnector, 'provisionAssistantWeb').mockImplementation(async (operation) => ({
+      instance_id: operation.instanceId,
+      outcome: 'pending',
+      reason: 'profile_incomplete',
+      message: 'Complete the web profile.',
+      changed: false,
+    }));
+    try {
+      const { run, out } = fleetCli(machineFleet);
+      expect(await run(['update', '--all', '--yes', '--no-input', '--json'])).toBe(0);
+      const result = JSON.parse(out.join('\n'));
+      expectResultContract('update', result);
+      expect(result).toMatchObject({
+        outcome: 'succeeded',
+        data: {
+          targets: expect.arrayContaining([
+            { instance_id: first.instance_id, outcome: 'completed', update: expect.any(Object) },
+            { instance_id: second.instance_id, outcome: 'completed', update: expect.any(Object) },
+          ]),
+        },
+      });
+      expect(result.next_actions).toEqual([{ kind: 'command', argv: ['gws-ea', 'connectors', 'install', 'web'] }]);
+      expect(provision).toHaveBeenCalledTimes(2);
+      await expectOnRelease(host, first, next.commit);
+      await expectOnRelease(host, second, next.commit);
+    } finally {
+      provision.mockRestore();
+    }
   });
 
   it('keeps the active assistant interruption handler authoritative and removes bulk handlers afterwards', async () => {

@@ -1,3 +1,5 @@
+import * as loginStores from './login-store.js';
+import { testLoginStore } from './testing/login-store.js';
 import { useAvailableBrowser } from './testing/browser-runtime.js';
 import { createBrowserQueue } from './index.js';
 import fs from 'node:fs';
@@ -34,6 +36,7 @@ import { setPrincipalNameAndTimezone } from '../gws-ea-profile/db.js';
 let queue: BrowserQueue;
 let jobId: string;
 beforeEach(async () => {
+  vi.spyOn(loginStores, 'getLoginStore').mockResolvedValue(testLoginStore(`${root}/browser`).store);
   useAvailableBrowser();
   vi.useFakeTimers({ toFake: ['Date'] });
   vi.setSystemTime(new Date('2026-10-15T12:00:00Z'));
@@ -68,6 +71,7 @@ beforeEach(async () => {
   process.env.GWS_EA_BROWSER_ROOT = file;
 });
 afterEach(async () => {
+  vi.restoreAllMocks();
   delete process.env.GWS_EA_BROWSER_ROOT;
   await closeDb();
   fs.rmSync(root, { recursive: true, force: true });

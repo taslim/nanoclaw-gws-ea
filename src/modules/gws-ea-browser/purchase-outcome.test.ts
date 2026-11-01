@@ -1,3 +1,5 @@
+import * as loginStores from './login-store.js';
+import { testLoginStore } from './testing/login-store.js';
 import { useAvailableBrowser } from './testing/browser-runtime.js';
 import { claimRegionWatchCommit } from './watch-state.js';
 import { createBrowserQueue } from './index.js';
@@ -42,7 +44,7 @@ import type { Session } from '../../types.js';
 import '../gws-ea-profile/index.js';
 import './index.js';
 import { PurchaseAuthorityError, PurchaseAuthorityStore } from './authority.js';
-import { readBrowserJob } from './cancel.js';
+import { finishRequestedCancellation, readBrowserJob } from './cancel.js';
 import { BrowserStore, type BrowserJob } from './db.js';
 import { GENERIC_FLOW_ID, type PurchaseFacts } from './fingerprint.js';
 import { SiteLeaseStore } from './leases.js';
@@ -186,6 +188,7 @@ const authority = (attemptId: string) =>
 const blocks = () => getDb().all<{ site: string }>('SELECT site FROM gws_ea_browser_purchase_blocks ORDER BY site');
 
 beforeEach(async () => {
+  vi.spyOn(loginStores, 'getLoginStore').mockResolvedValue(testLoginStore(`${root}/browser`).store);
   useAvailableBrowser();
   fs.rmSync(root, { recursive: true, force: true });
   await runMigrations(await initTestDb());
@@ -200,6 +203,68 @@ afterEach(async () => {
   vi.unstubAllEnvs();
   await closeDb();
   fs.rmSync(root, { recursive: true, force: true });
+});
+
+describe('purchase settlement while credential hold metadata is unavailable', () => {
+  it.each(['resolve', 'unconfirm'] as const)(
+    'records %s and keeps cancellation pending until the native store can be read',
+    async (operation) => {
+      const { job } = await errand('main-p', `cancellation-${operation}`);
+      const id = await press(job, `cancellation-${operation}`);
+      await getDb().run('UPDATE gws_ea_browser_jobs SET cancel_requested = 1 WHERE id = ?', job.id);
+      const localStore = await loginStores.getLoginStore();
+      const unavailable = vi
+        .spyOn(localStore, 'heldSites')
+        .mockRejectedValue(new loginStores.LoginStoreError('vault_unavailable'));
+      const store = new PurchaseAuthorityStore();
+      if (operation === 'resolve') {
+        expect(
+          await store.resolve(id, { placed: true, source: 'principal', evidence: { signal: 'recorded' } }),
+        ).toMatchObject({ status: 'resolved' });
+        expect(await attempt(id)).toMatchObject({ resolution: 'committed', resolution_source: 'principal' });
+        expect(await authority(id)).toMatchObject({ state: 'committed' });
+      } else {
+        expect(await store.unconfirm(id)).toEqual({ status: 'unconfirmed', attempt_id: id, repeat_safe: false });
+        expect(
+          await getDb().get('SELECT unconfirmed_at FROM gws_ea_browser_purchase_attempts WHERE id = ?', id),
+        ).toEqual({ unconfirmed_at: expect.any(String) });
+        expect(await authority(id)).toMatchObject({ state: 'unknown' });
+        expect(await blocks()).toEqual([{ site: SITE }]);
+      }
+      expect(
+        await getDb().get('SELECT cancelled,cancel_requested FROM gws_ea_browser_jobs WHERE id = ?', job.id),
+      ).toEqual({ cancelled: 0, cancel_requested: 1 });
+      unavailable.mockRestore();
+      await finishRequestedCancellation(job.id, createBrowserQueue(new BrowserStore(), runtime));
+      expect(await getDb().get('SELECT cancelled FROM gws_ea_browser_jobs WHERE id = ?', job.id)).toEqual({
+        cancelled: 1,
+      });
+      expect(await authority(id)).toMatchObject({ state: operation === 'resolve' ? 'committed' : 'unknown' });
+      expect(await attempt(id)).toMatchObject({ resolution: operation === 'resolve' ? 'committed' : null });
+    },
+  );
+
+  it.each([
+    ['unexpected error', new Error('Unexpected hold lookup failure')],
+    ['non-availability store error', new loginStores.LoginStoreError('origin_mismatch')],
+  ] as const)('propagates a %s without partially recording the purchase', async (_label, error) => {
+    const { job } = await errand('main-p', 'unexpected-cancellation');
+    const id = await press(job, 'unexpected-cancellation');
+    await getDb().run('UPDATE gws_ea_browser_jobs SET cancel_requested = 1 WHERE id = ?', job.id);
+    vi.spyOn(await loginStores.getLoginStore(), 'heldSites').mockRejectedValue(error);
+    await expect(
+      new PurchaseAuthorityStore().resolve(id, {
+        placed: true,
+        source: 'principal',
+        evidence: { signal: 'recorded' },
+      }),
+    ).rejects.toBe(error);
+    expect(await attempt(id)).toMatchObject({ resolution: null });
+    expect(await authority(id)).toMatchObject({ state: 'committing', outcome_json: null });
+    expect(
+      await getDb().get('SELECT cancelled,cancel_requested FROM gws_ea_browser_jobs WHERE id = ?', job.id),
+    ).toEqual({ cancelled: 0, cancel_requested: 1 });
+  });
 });
 
 describe('a purchase with no page proof', () => {

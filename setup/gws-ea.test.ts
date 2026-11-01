@@ -10,7 +10,6 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import * as nanoclawService from '../scripts/update/service.js';
 import type { CliRuntime, FailureReport } from '../src/gws-ea/cli.js';
 import type { Interaction } from '../src/gws-ea/events.js';
-import type { OnePasswordUninstallPreview } from '../src/gws-ea/onepassword-uninstall.js';
 import type { PrerequisiteRequest } from '../src/gws-ea/prerequisites.js';
 import {
   createServiceControl,
@@ -481,22 +480,6 @@ describe('GWS-EA driver', () => {
       output: process.stderr,
     });
   });
-
-  it('names a chosen vault deletion and its items in the same removal confirmation', async () => {
-    await main(['remove', '--id', '11111111-1111-4111-8111-111111111111'], { interactive: true });
-    fixture.confirm.mockResolvedValueOnce(false);
-    const preview = {
-      instanceId: 'x',
-      gcpProject: 'p',
-      onepassword: { vault_id: 'VAULT00000000000000000000A', vault: 'delete', item_count: 4 },
-    };
-    await expect(runtimeOf().confirmRemoval!(preview as never)).resolves.toBe(false);
-    expect(fixture.confirm).toHaveBeenCalledExactlyOnceWith({
-      message: expect.stringMatching(/GCP project p, and delete 1Password vault VAULT0+A with its 4 items\?$/u),
-      initialValue: false,
-      output: process.stderr,
-    });
-  });
 });
 
 describe('GWS-EA terminal presenter', () => {
@@ -810,53 +793,4 @@ describe('cold operator CLI startup', () => {
       await rm(cwd, { recursive: true, force: true });
     }
   }, 35_000);
-});
-
-describe('1Password uninstall terminal confirmation', () => {
-  afterEach(() => vi.clearAllMocks());
-  it('shows deletion versus retention, ownership reasons and unknown counts before confirmation', async () => {
-    await main(['connectors', 'uninstall', 'onepassword'], { interactive: true });
-    const confirm = runtimeOf().confirmOnePasswordUninstall;
-    if (!confirm) throw new Error('Terminal uninstall confirmation was not configured');
-    const preview: OnePasswordUninstallPreview = {
-      account_id: 'account',
-      management_service_account_id: 'management',
-      management_creation_unproven: false,
-      vaults: [
-        {
-          instance_id: '11111111-1111-4111-8111-111111111111',
-          account_id: 'account',
-          vault_id: 'vault-delete',
-          owned: true,
-          item_count: 7,
-          vault: 'delete',
-          reason: 'Its deletion was chosen for this owned vault.',
-          runtime_service_account_ids: [],
-          unproven: [],
-          credential_attempts: 3,
-        },
-        {
-          instance_id: '22222222-2222-4222-8222-222222222222',
-          account_id: 'account',
-          vault_id: 'vault-keep',
-          owned: false,
-          item_count: null,
-          vault: 'retain',
-          reason: 'This host management account did not create it.',
-          runtime_service_account_ids: [],
-          unproven: [],
-          credential_attempts: null,
-        },
-      ],
-    };
-    expect(await confirm(preview)).toBe(true);
-    const note = String(fixture.note.mock.calls.at(-1)?.[0]);
-    expect(note).toMatch(/DELETE.*11111111-1111-4111-8111-111111111111.*vault-delete.*items 7.*credential work 3/u);
-    expect(note).toMatch(
-      /KEEP.*22222222-2222-4222-8222-222222222222.*vault-keep.*items unknown.*credential work unknown/u,
-    );
-    expect(note).toContain('This host management account did not create it.');
-    expect(note).not.toContain('items 0');
-    expect(fixture.note.mock.invocationCallOrder.at(-1)).toBeLessThan(fixture.confirm.mock.invocationCallOrder.at(-1)!);
-  });
 });
