@@ -16,8 +16,10 @@ import path from 'node:path';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import Database from 'better-sqlite3';
 import type { SanitizedCommand, SanitizedCommandOutcomeRunner } from '../../gws-ea/process.js';
-import { LoginStore, LoginStoreError, loginStoreAvailability } from './login-store.js';
+import { LoginDetailsError, LoginStore, LoginStoreError, loginStoreAvailability } from './login-store.js';
 import { CredentialAttempts } from './credential-attempts.js';
+import { HELD_CREDENTIAL_PHASES, type CredentialAttempt } from './credential-types.js';
+import type { SavedLogin } from './login-store.js';
 
 const INSTANCE = '38d6fb28-6c7f-4cc4-afaf-2919e8868cce';
 const PASSWORD = 'Crane!7-river-timber';
@@ -43,6 +45,31 @@ const blob = (id: string): Buffer =>
     if (!result) throw new Error('Fixture login missing');
     return result.password;
   });
+const storedState = () =>
+  raw((db) => ({
+    logins: db.prepare('SELECT * FROM logins ORDER BY id').all(),
+    attempts: db.prepare('SELECT * FROM attempts ORDER BY id').all(),
+    meta: db.prepare('SELECT * FROM meta ORDER BY id').all(),
+  }));
+function rotation(login: SavedLogin): CredentialAttempt {
+  return {
+    id: 'pending-rotation',
+    kind: 'rotation',
+    job_id: 'system:a2a:main:cedar',
+    origin: 'https://cedar.example',
+    site: login.domain,
+    username: login.username,
+    source_login_id: login.id,
+    source_version: login.version,
+    phase: 'saved',
+    evidence_json: null,
+    owned_login_id: null,
+    created_at: login.createdAt,
+    updated_at: login.createdAt,
+    exposed_at: null,
+    finalized_at: null,
+  };
+}
 const runCommand: SanitizedCommandOutcomeRunner = async (command) => {
   calls.push(command);
   if (unavailable) return { exitCode: 36, stdout: '', stderr: '' };
@@ -79,6 +106,93 @@ it('creates on the first add and decrypts using a fresh key read', async () => {
   expect(await loginStoreAvailability(store)).toEqual({ available: true });
   expect(calls.filter((call) => call.args[0] === '-i')).toHaveLength(1);
 });
+
+it('reveals the saved password without changing an unsent password attempt', async () => {
+  const login = await store.create(DETAILS);
+  await store.saveAttempt(rotation(login), 'Pending!8-never-revealed');
+  const before = storedState();
+  calls = [];
+  expect(await store.revealPassword(login.id, login.version)).toBe(PASSWORD);
+  expect(storedState()).toEqual(before);
+  expect(calls.map((call) => call.args[0])).toEqual(['find-generic-password']);
+});
+
+it('requires the exact saved version and reports missing logins before reading the key', async () => {
+  const login = await store.create(DETAILS);
+  const password = 'Juniper$4-replacement';
+  const current = await store.update(login.id, login.version, { password });
+  calls = [];
+  for (const version of [
+    login.version,
+    0,
+    -1,
+    1.5,
+    Number.NaN,
+    Number.POSITIVE_INFINITY,
+    Number.MAX_SAFE_INTEGER + 1,
+  ]) {
+    const failure: unknown = await store.revealPassword(login.id, version).catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(LoginDetailsError);
+    expect(failure).toMatchObject({ reason: 'login_changed' });
+  }
+  const missing: unknown = await store.revealPassword('missing-login', 1).catch((error: unknown) => error);
+  expect(missing).toBeInstanceOf(LoginStoreError);
+  expect(missing).toMatchObject({ reason: 'no_item_for_site' });
+  expect(calls).toHaveLength(0);
+  expect(await store.revealPassword(login.id, current.version)).toBe(password);
+});
+
+it.each(HELD_CREDENTIAL_PHASES)('refuses a reveal during an %s password change without changing it', async (phase) => {
+  const login = await store.create(DETAILS);
+  const attempt = rotation(login);
+  await store.saveAttempt(attempt, 'Pending!8-never-revealed');
+  await store.moveAttempt(attempt.id, ['saved'], phase);
+  const before = storedState();
+  calls = [];
+  await expect(store.revealPassword(login.id, login.version)).rejects.toMatchObject({ reason: 'login_busy' });
+  expect(storedState()).toEqual(before);
+  expect(calls).toHaveLength(0);
+});
+
+it.each(['missing', 'mismatched', 'unavailable'] as const)(
+  'rereads the key and refuses a %s key for reveals',
+  async (state) => {
+    const login = await store.create(DETAILS);
+    expect(await store.revealPassword(login.id, login.version)).toBe(PASSWORD);
+    if (state === 'missing') key = undefined;
+    else if (state === 'mismatched') key = 'b4'.repeat(32);
+    else unavailable = true;
+    calls = [];
+    await expect(store.revealPassword(login.id, login.version)).rejects.toMatchObject({ reason: 'vault_unavailable' });
+    expect(calls.map((call) => call.args[0])).toEqual(['find-generic-password']);
+  },
+);
+
+it.each(['version', 'held attempt'] as const)(
+  'rechecks a changed %s after the asynchronous key read',
+  async (change) => {
+    const login = await store.create(DETAILS);
+    await store.saveAttempt(rotation(login), 'Pending!8-never-revealed');
+    let afterChange: ReturnType<typeof storedState> | undefined;
+    const reader = new LoginStore({
+      browserRoot,
+      instanceId: INSTANCE,
+      runCommand: async (command) => {
+        const result = await runCommand(command);
+        raw((db) => {
+          if (change === 'version') db.prepare('UPDATE logins SET version = version + 1 WHERE id = ?').run(login.id);
+          else db.prepare("UPDATE attempts SET phase = 'exposed' WHERE source_login_id = ?").run(login.id);
+        });
+        afterChange = storedState();
+        return result;
+      },
+    });
+    await expect(reader.revealPassword(login.id, login.version)).rejects.toMatchObject({
+      reason: change === 'version' ? 'login_changed' : 'login_busy',
+    });
+    expect(storedState()).toEqual(afterChange);
+  },
+);
 
 it('does not create a replacement key while a login exists, and metadata and removal still work', async () => {
   const login = await store.create(DETAILS);
@@ -211,24 +325,29 @@ it('requires a usable key for username fills and metadata-only saves, while reta
   expect((await store.get(login.id)).title).toBe('Cedar');
 });
 
-it('returns only a constant error after tampering, without plaintext, keys, causes or logging', async () => {
-  const login = await store.create(DETAILS);
-  const sealed = blob(login.id);
-  sealed[12] ^= 1;
-  raw((db) => {
-    db.prepare('UPDATE logins SET password = ? WHERE id = ?').run(sealed, login.id);
-  });
-  const logs = [vi.spyOn(console, 'log'), vi.spyOn(console, 'error'), vi.spyOn(console, 'warn')];
-  const failure: unknown = await store
-    .secret(login.id, 'password', 'https://cedar.example')
-    .catch((error: unknown) => error);
-  expect(failure).toBeInstanceOf(LoginStoreError);
-  expect(failure).toMatchObject({ reason: 'vault_unavailable', message: 'vault_unavailable' });
-  expect(JSON.stringify(failure, Object.getOwnPropertyNames(failure))).not.toContain(PASSWORD);
-  expect(JSON.stringify(failure, Object.getOwnPropertyNames(failure))).not.toContain(key);
-  expect(failure).not.toHaveProperty('cause');
-  for (const log of logs) expect(log).not.toHaveBeenCalled();
-});
+it.each(['fill', 'reveal'] as const)(
+  'returns only a constant error after tampering for %s, without secret details or logging',
+  async (access) => {
+    const login = await store.create(DETAILS);
+    const sealed = blob(login.id);
+    sealed[12] ^= 1;
+    raw((db) => {
+      db.prepare('UPDATE logins SET password = ? WHERE id = ?').run(sealed, login.id);
+    });
+    const logs = [vi.spyOn(console, 'log'), vi.spyOn(console, 'error'), vi.spyOn(console, 'warn')];
+    const password =
+      access === 'fill'
+        ? store.secret(login.id, 'password', 'https://cedar.example')
+        : store.revealPassword(login.id, login.version);
+    const failure: unknown = await password.catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(LoginStoreError);
+    expect(failure).toMatchObject({ reason: 'vault_unavailable', message: 'vault_unavailable' });
+    expect(JSON.stringify(failure, Object.getOwnPropertyNames(failure))).not.toContain(PASSWORD);
+    expect(JSON.stringify(failure, Object.getOwnPropertyNames(failure))).not.toContain(key);
+    expect(failure).not.toHaveProperty('cause');
+    for (const log of logs) expect(log).not.toHaveBeenCalled();
+  },
+);
 
 it('binds ciphertext to the assistant even if the same key is supplied', async () => {
   const login = await store.create(DETAILS);

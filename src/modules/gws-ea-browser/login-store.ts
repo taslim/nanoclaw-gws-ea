@@ -284,6 +284,35 @@ export class LoginStore {
   async get(id: string): Promise<SavedLogin> {
     return this.use((db) => this.login(db, id));
   }
+  async revealPassword(id: string, version: number): Promise<string> {
+    versionValid(version);
+    return this.use(async (db) => {
+      const login = this.login(db, id);
+      if (login.version !== version) throw new LoginDetailsError('login_changed');
+      this.editableAttempts(db, id, login);
+      return this.withKey(db, (key) =>
+        db
+          .transaction(() => {
+            const current = db
+              .prepare<
+                [string],
+                SavedLogin & { password: Buffer }
+              >(`SELECT ${COLUMNS}, password FROM logins WHERE id = ?`)
+              .get(id);
+            if (!current) throw new LoginStoreError('no_item_for_site');
+            if (current.version !== version) throw new LoginDetailsError('login_changed');
+            this.editableAttempts(db, id, current);
+            const plaintext = this.unseal(current.password, key);
+            try {
+              return plaintext.toString('utf8');
+            } finally {
+              plaintext.fill(0);
+            }
+          })
+          .deferred(),
+      );
+    });
+  }
   async secret(id: string, field: 'username' | 'password', origin: string): Promise<string> {
     return this.use(async (db) => {
       const login = this.login(db, id);
