@@ -265,7 +265,7 @@ function daysAnswer(
   filter: string | undefined,
   exportFile: boolean,
 ): Record<string, unknown> {
-  const entries = dayEntries({ ...week, events: week.events.filter((event) => inWindow(event, range)) }, filter);
+  const entries = dayEntries(week, filter);
   const readAt = new Date().toISOString();
   const head = [
     `${entries.length} events across ${week.days.length} local days.`,
@@ -373,7 +373,14 @@ export function createDaysTools(deps: { readonly calendar: () => MeetingsCalenda
       );
     }
     const week = await loadCalendarWeek(deps.calendar(), { start, end, timeline, calendarId });
-    return daysAnswer(week, session, requestId, { start, end, calendarId }, filter, exportFile);
+    return daysAnswer(
+      { ...week, events: week.events.filter((event) => inWindow(event, { start, end })) },
+      session,
+      requestId,
+      { start, end, calendarId },
+      filter,
+      exportFile,
+    );
   };
   const check: ActionAnswer = async (content) => {
     const timeline = await loadTimeline();

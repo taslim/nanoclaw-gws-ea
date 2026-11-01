@@ -2196,6 +2196,25 @@ it('reads the requested calendar and dates live and reports complete coverage ev
   expect(empty.message).toContain('2026-11-10T00:00-08:00 to 2026-11-11T00:00-08:00');
 });
 
+it.each(['00:00', '12:00'])('keeps an instant event in a direct lookup and export at %s', async (time) => {
+  const at = `2026-11-08T${time}:00-08:00`;
+  calendar.put({
+    ...teamSync([PRINCIPAL_GUEST]),
+    id: 'deadline',
+    summary: 'Filing deadline',
+    start: { dateTime: at },
+    end: { dateTime: at },
+  });
+  const args = { calendar: PRINCIPAL, event: 'deadline' };
+  const result = data(await send(main, 'days', args));
+  expect(result).toMatchObject({ count: 1, complete: true });
+  expect(result.message).toContain('Filing deadline');
+  const exported = data(await send(main, 'days', { ...args, export: true }));
+  expect(exported).toMatchObject({ count: 1, complete: false });
+  const file = `${sessionMailboxDir({ agentGroupId: main.agent_group_id, sessionId: main.id })}/${String(exported.path).replace(/^\/workspace\//u, '')}`;
+  expect(fs.readFileSync(file, 'utf8')).toContain('Filing deadline');
+});
+
 it('automatically preserves every event in an export when the live answer overflows', async () => {
   for (let i = 0; i < 25; i++)
     calendar.put({
