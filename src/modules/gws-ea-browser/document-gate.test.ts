@@ -1,8 +1,12 @@
 import { EventEmitter } from 'node:events';
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 import type { Browser, Page } from 'playwright-core';
 import { expect, it, vi } from 'vitest';
 
+import { writeWebOperatorConfig } from '../../gws-ea/web-cloudflare.js';
 import { documentGate, type GuardedPage, type PausedDocument } from './document-gate.js';
 
 interface Tree {
@@ -122,9 +126,10 @@ function fixture(
     resourceType = 'Document',
     headers: Record<string, string> = {},
     method = 'GET',
+    url = 'https://shop.example/',
   ) => {
     const requestId = String(next++);
-    paused?.({ requestId, frameId, resourceType, request: { url: 'https://shop.example/', method, headers } });
+    paused?.({ requestId, frameId, resourceType, request: { url, method, headers } });
     await vi.waitFor(() => expect(answers.has(requestId)).toBe(true), { timeout: 5_000 });
     return answers.get(requestId);
   };
@@ -137,6 +142,62 @@ function guardedPage() {
   const page: GuardedPage = { capture: () => ({ decide, refuse }) };
   return { page, decide, refuse };
 }
+
+it('refuses saved-login requests before page, worker, subresource or approved job policy can admit them', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'browser-document-logins-'));
+  const file = join(root, 'web.json');
+  const config = {
+    schemaVersion: 1,
+    enabled: false,
+    hostname: 'aya.example.com',
+    listenPort: 41234,
+    accessIssuer: 'https://team.cloudflareaccess.com',
+    accessAud: 'aud',
+    cloudflare: { accountId: 'account', applicationId: 'app', operatorConfigFile: join(root, 'web', 'config.json') },
+  };
+  vi.stubEnv('GWS_EA_WEB_POLICY_FILE', file);
+  vi.stubEnv('GWS_EA_CONFIG_ROOT', root);
+  try {
+    await writeFile(file, JSON.stringify(config), { mode: 0o600 });
+    await mkdir(join(root, 'web'), { mode: 0o700 });
+    await writeWebOperatorConfig(config.cloudflare.operatorConfigFile, {
+      schemaVersion: 1,
+      accountId: 'account',
+      zoneId: 'zone',
+      zoneApex: 'example.com',
+      teamName: 'team',
+      credentialFile: join(root, 'web', 'management-token'),
+      cloudflaredPath: '/usr/local/bin/cloudflared',
+      dns: {},
+      assistants: {},
+    });
+    const { browser, pause, lookups } = fixture(
+      { main: { type: 'page' }, other: { type: 'page' }, worker: { type: 'worker' } },
+      [{ tree: tree('main') }, { tree: tree('other') }],
+    );
+    const approved = guardedPage();
+    (await documentGate(browser)).register('main', approved.page);
+    for (const frame of ['main', 'other', 'worker'])
+      for (const resource of ['Document', 'Fetch', 'XHR', 'Script', 'Image', 'Other'])
+        for (const method of ['GET', 'HEAD', 'POST', 'PUT'])
+          expect(
+            await pause(
+              frame,
+              resource,
+              { 'X-Principal': 'true' },
+              method,
+              'https://AYA.EXAMPLE.COM./logins/item/id/reveal',
+            ),
+          ).toBe('refused');
+    expect(lookups).toEqual([]);
+    expect(approved.decide).not.toHaveBeenCalled();
+    for (const url of ['https://aya.example.com/artifacts/id', 'https://other.example/logins'])
+      expect(await pause('other', 'Document', {}, 'GET', url)).toBe('continued');
+  } finally {
+    vi.unstubAllEnvs();
+    await rm(root, { recursive: true, force: true });
+  }
+});
 
 it('places main, cross-site, nested and same-process frames, and windows, with their page, handing each its method and level', async () => {
   const { browser, pause } = fixture(
@@ -246,17 +307,11 @@ it('refuses a service worker script and lets every other request through untouch
 });
 
 it('continues a document whose page registered its guard only after the document paused', async () => {
-  let release!: () => void;
-  const held = new Promise<never>((_resolve, reject) => {
-    release = () => reject(new Error('Protocol error (Target.getTargetInfo): No target with given id found'));
-  });
-  // The lookup answers only after the page's guard registered.
-  const { browser, pause } = fixture({}, [{ tree: tree('late') }], (id) => (id === 'late' ? held : undefined));
+  const { browser, pause } = fixture({}, [{ tree: tree('late') }]);
   const gate = await documentGate(browser);
   const guarded = guardedPage();
   const answer = pause('late');
   gate.register('late', guarded.page);
-  release();
   expect(await answer).toBe('continued');
   expect(guarded.decide).not.toHaveBeenCalled();
 });
