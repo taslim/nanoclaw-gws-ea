@@ -88,6 +88,29 @@ it('durably saves an encrypted password with its attempt before disclosure and k
   expect(await getDb().hasTable('gws_ea_browser_credential_attempts')).toBe(false);
 });
 
+it('refuses a signup for an existing site and username before recording or exposing an attempt', async () => {
+  const username = 'maren_tide';
+  const principalLogin = await fixture.store.create({
+    site: 'https://signin.orchard.example',
+    username,
+    title: 'Orchard',
+    password: 'principal-kept-password',
+  });
+  expect(await attempts.prepareSignup({ jobId: JOB, origin: ORIGIN, username })).toEqual({ status: 'busy' });
+  expect(await attempts.unresolved()).toEqual([]);
+  expect(fixture.pendingIds()).toEqual([]);
+  expect(await fixture.store.heldSites(JOB)).toEqual([]);
+  expect(await fixture.store.secret(principalLogin.id, 'password', ORIGIN)).toBe('principal-kept-password');
+  expect(await attempts.accountForLogin(principalLogin)).toBe('principal');
+  expect(await attempts.ownedHandle(ORIGIN, username)).toEqual({ status: 'not_owned' });
+  expect(
+    await attempts.prepareRotation({ jobId: JOB, origin: ORIGIN, username, itemHandle: principalLogin.id }),
+  ).toEqual({ status: 'not_owned' });
+  expect(await attempts.prepareSignup({ jobId: JOB, origin: ORIGIN, username: 'rowan_hale' })).toMatchObject({
+    status: 'prepared',
+  });
+});
+
 it('does not record an attempt when its password cannot be saved', async () => {
   fixture.setUnavailable(true);
   expect(await attempts.prepareSignup({ jobId: JOB, origin: ORIGIN, username: USERNAME })).toEqual({

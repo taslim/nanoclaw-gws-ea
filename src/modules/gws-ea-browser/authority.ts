@@ -11,6 +11,7 @@ import type { RecordedNotPlaced } from './cards.js';
 import { agreementsGranted } from './consent.js';
 import { BrowserStore, markBrowserRequestCommitStarted } from './db.js';
 import { heldCredentialSites } from './leases.js';
+import { LoginStoreError } from './login-store.js';
 import {
   completePurchaseFacts,
   guaranteeCoversReservation,
@@ -651,13 +652,19 @@ export class PurchaseAuthorityStore {
       "SELECT 1 FROM gws_ea_browser_authorities WHERE job_id = ? AND state = 'committing' LIMIT 1",
       jobId,
     );
-    // An unresolved credential attempt keeps a requested cancellation waiting too.
-    if (!committing && (await heldCredentialSites(jobId)).size === 0)
-      await this.db.run(
-        'UPDATE gws_ea_browser_jobs SET cancelled = CASE WHEN cancel_requested = 1 THEN 1 ELSE cancelled END,updated_at = ? WHERE id = ?',
-        at,
-        jobId,
-      );
+    if (committing) return;
+    // Unknown credential holds delay cancellation without discarding a purchase outcome already observed.
+    try {
+      if ((await heldCredentialSites(jobId)).size > 0) return;
+    } catch (error) {
+      if (error instanceof LoginStoreError && error.reason === 'vault_unavailable') return;
+      throw error;
+    }
+    await this.db.run(
+      'UPDATE gws_ea_browser_jobs SET cancelled = CASE WHEN cancel_requested = 1 THEN 1 ELSE cancelled END,updated_at = ? WHERE id = ?',
+      at,
+      jobId,
+    );
   }
 }
 

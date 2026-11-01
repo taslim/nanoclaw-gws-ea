@@ -1537,8 +1537,7 @@ export async function recoverCredentialAttempts(attempts: CredentialAttempts = c
 /** The current mailbox deduplicates notices; a rollback that lost one must receive it again. */
 export async function notifyOrphanCredentialAttempts(attempts: CredentialAttempts = credentialAttempts): Promise<void> {
   for (const attempt of await attempts.unresolved()) {
-    if (!HELD_CREDENTIAL_PHASES.some((phase) => phase === attempt.phase) || (await credentialJobAvailable(attempt)))
-      continue;
+    if (!RELEASABLE_PHASES.includes(attempt.phase) || (await credentialJobAvailable(attempt))) continue;
     const { writeNoteForMain } = await import('../gws-ea-profile/main-note.js');
     await writeNoteForMain({
       id: `browser-orphan-credential-${attempt.id}`,

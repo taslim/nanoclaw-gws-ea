@@ -502,7 +502,12 @@ export class LoginStore {
                   if (open.job_id === attempt.job_id || open.phase !== 'saved') return 'busy';
                   this.move(db, open.id, ['saved'], 'rejected');
                 }
-              }
+              } else if (
+                db
+                  .prepare<[string, string], { id: string }>('SELECT id FROM logins WHERE domain = ? AND username = ?')
+                  .get(attempt.site, attempt.username)
+              )
+                return 'busy';
               db.prepare(
                 `INSERT INTO attempts (${ATTEMPT_COLUMNS}, password) VALUES (${Array.from({ length: 16 }, () => '?').join(',')})`,
               ).run(

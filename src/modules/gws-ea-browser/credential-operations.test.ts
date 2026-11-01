@@ -645,6 +645,38 @@ describe("the principal's release of an attempt the host cannot settle", () => {
     expect(await pending()).toHaveLength(1);
   });
 
+  it('waits for an orphan to become releasable before consuming its notice id', async () => {
+    const id = await disclosedSignup('soren_orphan');
+    await getDb().run('DELETE FROM gws_ea_browser_jobs WHERE id = ?', job.thread_id);
+    await getDb().run('DELETE FROM sessions WHERE id = ?', job.id);
+    const conversation = await resolveMainConversation();
+    if (typeof conversation === 'string') throw new Error(conversation);
+    const mailbox = new Database(inboundDbPath('main', conversation.session.id));
+    try {
+      const note = () =>
+        mailbox
+          .prepare<[string], { content: string }>('SELECT content FROM messages_in WHERE id = ?')
+          .all(`browser-orphan-credential-${id}`);
+      await notifyOrphanCredentialAttempts(attempts);
+      expect(await attempts.get(id)).toMatchObject({ phase: 'exposed' });
+      expect(note()).toEqual([]);
+      expect(await release(id)).toEqual({ status: 'not_releasable' });
+      await recoverCredentialAttempts(attempts);
+      expect(await attempts.get(id)).toMatchObject({ phase: 'unknown' });
+      expect(note()).toHaveLength(1);
+      expect(note()[0].content).toContain(id);
+      expect(note()[0].content).toContain(job.thread_id);
+      await notifyOrphanCredentialAttempts(attempts);
+      expect(note()).toHaveLength(1);
+      expect(await release(id)).toEqual({ status: 'awaiting_principal' });
+      await click('approve');
+      expect(await attempts.get(id)).toMatchObject({ phase: 'rejected' });
+      expect(fixture.hasPending(id)).toBe(false);
+    } finally {
+      mailbox.close();
+    }
+  });
+
   it('restores an orphan notice lost from the current main mailbox without recreating its errand', async () => {
     const id = await disclosedSignup('soren_handle');
     await attempts.markUnknown(id);
@@ -712,7 +744,11 @@ describe("the principal's release of an attempt the host cannot settle", () => {
     expect(await release(preparing)).toEqual({ status: 'not_releasable' });
     expect(await attempts.get(preparing)).toMatchObject({ phase: 'finalized' });
     expect(await release(preparing)).toEqual({ status: 'not_releasable' });
-    const other = await attempts.prepareSignup({ jobId: 'system:a2a:main:other', origin: ORIGIN, username: USERNAME });
+    const other = await attempts.prepareSignup({
+      jobId: 'system:a2a:main:other',
+      origin: ORIGIN,
+      username: 'maren_other',
+    });
     if (other.status !== 'prepared') throw new Error(other.status);
     expect(await release(other.attempt.id)).toEqual({ status: 'not_releasable' });
     const unknown = await disclosedSignup('juno_eats');
