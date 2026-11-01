@@ -189,7 +189,7 @@ export const LOGINS_PAGE_SCRIPT = String.raw`(() => {
     const reveal = event.target.closest('#show-password');
     if (reveal && !busy) { void revealPassword(reveal); return; }
     if (event.target.closest('a[data-navigation]')) hidePassword();
-    if (busy && event.target instanceof Element && event.target.closest('a[data-navigation]')) event.preventDefault();
+    if (busy && event.target.closest('a[data-navigation]')) event.preventDefault();
   });
   document.addEventListener('visibilitychange', () => { if (document.visibilityState !== 'visible') hidePassword(); });
   window.addEventListener('pagehide', hidePassword);
