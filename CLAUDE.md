@@ -253,8 +253,8 @@ Each assistant keeps its built-in store at `browser/logins.db` under its instanc
 root, outside NanoClaw update snapshots and container mounts. Only passwords are
 encrypted, with AES-256-GCM under a random per-assistant macOS Keychain key;
 site, username and title stay readable in the owner-only file (0600, directory
-0700). Plaintext exists in host memory while passwords are generated, saved or
-filled. Any process running as the same macOS user can read the key with
+0700). Plaintext exists in host memory while passwords are generated, saved,
+filled or revealed, and in the principal’s browser during a requested reveal. Any process running as the same macOS user can read the key with
 `/usr/bin/security`: encryption protects copies of the store file, not access
 by that user. NanoClaw provides no backup or export and stores no one-time codes.
 Updates and rollbacks preserve logins, ownership and unsettled attempts together
@@ -272,9 +272,13 @@ the assistant can reset it through its own email.
 Main obtains the host's `/logins` link through `logins_page` when a missing login
 is needed or the principal asks. Only the principal's currently confirmed
 addresses can open it. They can add or remove logins and edit the label, website,
-username or saved password, whichever account owner it has; the page never
-reveals a password. A blank replacement keeps the current password, and an older
-edit form cannot overwrite newer saved details. An unsent password change gives
+username or saved password, whichever account owner it has. On a login’s details
+page, Show password fetches its saved password using the current principal Access
+session. It hides after 30 seconds, when the tab is hidden, or on navigation;
+pending generated passwords are never revealed. The managed assistant browser
+cannot access any assistant’s saved-logins page or endpoints. A blank replacement
+keeps the current password, and an older edit form cannot overwrite newer saved
+details. An unsent password change gives
 way to a page edit or removal; once its password may have reached the site,
 the page answers `login_busy` until the attempt settles or is released. A saved
 change is ready for the next errand. Missing web setup means the principal asks

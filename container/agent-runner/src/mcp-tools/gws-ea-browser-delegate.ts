@@ -138,7 +138,7 @@ export const credentialAuthority = requestTool({
 export const loginsPage = requestTool({
   name: 'logins_page',
   description:
-    "Get the principal's private logins page from the host when an errand needs a missing login or the principal asks. available returns its url: send that exact link to the principal, who can add or remove logins and change saved passwords there; the page never reveals a password. operator_needed means web is not set up: tell the principal to ask their operator to finish setup. unavailable means web is enabled but cannot serve the page right now: tell the principal to try again later. Never ask for passwords in chat. Other groups take the need and the host's link to main for the principal. Repeating is safe.",
+    "Get the principal's private logins page from the host when an errand needs a missing login or the principal asks. available returns its url: send that exact link to the principal, who can add or remove logins and change saved passwords there; they can also reveal saved passwords there. operator_needed means web is not set up: tell the principal to ask their operator to finish setup. unavailable means web is enabled but cannot serve the page right now: tell the principal to try again later. Never ask for passwords in chat. Other groups take the need and the host's link to main for the principal. Repeating is safe.",
   properties: {},
   required: [],
   additionalProperties: false,

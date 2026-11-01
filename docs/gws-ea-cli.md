@@ -343,8 +343,9 @@ unsettled attempts, are encrypted with AES-256-GCM under a random per-assistant
 key in the macOS Keychain. The directory is owner-only (0700), and the file is
 owner-only (0600). Website, username and label remain readable so listing and
 removing logins work when the key cannot be read. Plaintext passwords exist in
-host memory when generated, saved or filled; agents receive only opaque handles
-and outcomes.
+host memory when generated, saved, filled or revealed, and in the principal’s
+browser during a requested reveal. Agents receive only opaque handles and
+outcomes.
 
 Any process running as the same macOS user can read the key through
 `/usr/bin/security`. Encryption protects a copied store file; it does not protect
@@ -374,11 +375,16 @@ Main sends the principal their private `https://<assistant-host>/logins` link
 when a login is missing or they ask. Cloudflare Access admits the principal and
 invited artifact readers; the host permits `/logins` only for the principal's
 currently confirmed addresses. They can add or remove logins and edit the
-account label, website, username or saved password for either account owner; no
-saved password is ever revealed. Logins are grouped by website and can be
-searched by site, label or username. Each login has a details view and an edit
-form; a blank replacement password keeps the current one. An older form cannot
-overwrite newer saved details. Editing this page changes the saved login, not
+account label, website, username or saved password for either account owner.
+Logins are grouped by website and can be searched by site, label or username.
+On a login’s details page, Show password fetches only its saved password after
+an explicit click, using the current principal Access session. Hide clears it
+from the page; it also hides after 30 seconds, when the tab is hidden, or on
+navigation. This does not erase browser developer tools or network history.
+Pending generated passwords are never revealed. The managed assistant browser
+is blocked from every assistant’s saved-logins page and endpoints, even if it
+has the principal’s cookies. Each login also has an edit form; a blank
+replacement password keeps the current one. An older form cannot overwrite newer saved details. Editing this page changes the saved login, not
 the account on the website. A saved change is ready for the next errand. Passwords
 are entered on the page, never sent through chat.
 
@@ -389,7 +395,7 @@ their operator; when installed web is temporarily unavailable, to try again late
 
 The key is read fresh at each use and is never automatically replaced while any
 saved or pending password remains. When it is missing, different or unavailable,
-filling, generating and saving answer `vault_unavailable`: ask the operator.
+filling, generating, saving and revealing answer `vault_unavailable`: ask the operator.
 Listing and removing logins, and settling or releasing attempts, still work.
 `gws-ea status --details` reports the running host's login-store state:
 `key_missing`, `key_mismatch` or `keychain_unavailable`, with an operator action.

@@ -140,7 +140,7 @@ it('gets the host logins page with no arguments or credential-bearing fields', a
     'ask their operator',
     'unavailable',
     'try again later',
-    'never reveals a password',
+    'reveal saved passwords there',
   ])
     expect(loginsPage.tool.description).toContain(meaning);
 });

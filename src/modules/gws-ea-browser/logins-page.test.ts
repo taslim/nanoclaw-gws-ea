@@ -140,7 +140,7 @@ it('closes wrong hosts and missing or non-principal identities before any store 
     { 'cf-access-jwt-assertion': 'reader@example.com' },
     { 'cf-access-jwt-assertion': 'principal+tag@example.com' },
   ];
-  for (const route of ['/logins/add', '/logins/update', '/logins/remove']) {
+  for (const route of ['/logins/add', '/logins/update', '/logins/remove', '/logins/reveal']) {
     for (const headers of refused) {
       const response = await request(
         route,
@@ -171,7 +171,7 @@ it('refuses cross-site, non-JSON and oversized submissions before reading their 
     { ...postHeaders, 'content-type': 'text/plain' },
     { ...postHeaders, 'content-length': '16385' },
   ];
-  for (const route of ['/logins/add', '/logins/update', '/logins/remove']) {
+  for (const route of ['/logins/add', '/logins/update', '/logins/remove', '/logins/reveal']) {
     for (const headers of refused) {
       const response = await request(route, 'POST', { 'content-length': '80', ...headers }, undefined, true);
       expect(response.status).toBe(404);
@@ -527,6 +527,67 @@ it('accepts an exact Origin fallback without Sec-Fetch-Site and closes unknown r
     expect((await request(route, method, postHeaders)).status).toBe(404);
 });
 
+it('reveals one saved password only on an explicit versioned POST, without preloading other views', async () => {
+  const { loginId, attempt } = await changing('saved');
+  const reads = fixture.keyReads();
+  for (const route of ['/logins', `/logins/item/${loginId}`, `/logins/item/${loginId}/edit`]) {
+    const page = await request(route);
+    expect(page.body).not.toContain(SECRET);
+    expect(page.body).not.toContain(fixture.attemptPassword(attempt.id));
+  }
+  expect(fixture.keyReads()).toBe(reads);
+  const response = await post('/logins/reveal', { handle: loginId, version: '1' });
+  expect(response.status).toBe(200);
+  expect(response.headers['cache-control']).toBe('no-store');
+  expect(response.headers['content-type']).toBe('application/json; charset=utf-8');
+  expect(response.headers['x-content-type-options']).toBe('nosniff');
+  expect(JSON.parse(response.body)).toEqual({ password: SECRET });
+  expect((await attempts.get(attempt.id))?.phase).toBe('saved');
+  expect(fixture.hasPending(attempt.id)).toBe(true);
+  expect((await fixture.store.get(loginId)).version).toBe(1);
+});
+
+it('refuses reveal GET, HEAD, query strings and invalid payloads without reading a password', async () => {
+  const saved = await login();
+  const reads = fixture.keyReads();
+  for (const method of ['GET', 'HEAD']) expect((await request('/logins/reveal', method)).status).toBe(404);
+  expect((await post('/logins/reveal?handle=' + saved.id, { handle: saved.id, version: '1' })).status).toBe(404);
+  for (const data of [
+    { handle: saved.id },
+    { handle: saved.id, version: 1 },
+    { handle: saved.id, version: '0' },
+    { handle: saved.id, version: '1', password: SECRET },
+    { handle: saved.id, version: '1', extra: true },
+  ]) {
+    const response = await post('/logins/reveal', data);
+    expect(response.status).toBe(404);
+    expect(response.body).toBe('');
+  }
+  expect(fixture.keyReads()).toBe(reads);
+});
+
+it('returns constant reveal errors for changed, busy, missing and unavailable logins', async () => {
+  const saved = await login();
+  await fixture.store.update(saved.id, 1, { password: '', title: 'New title' });
+  const stale = await post('/logins/reveal', { handle: saved.id, version: '1' });
+  expect(stale.status).toBe(409);
+  expect(JSON.parse(stale.body)).toEqual({ error: expect.stringContaining('This login changed') });
+  const missing = await post('/logins/reveal', { handle: 'vault_00000000-0000-0000-0000-000000000000', version: '1' });
+  expect(missing.status).toBe(409);
+  expect(JSON.parse(missing.body)).toEqual({ error: expect.stringContaining('no longer available') });
+  const { loginId } = await changing('exposed');
+  const held = await post('/logins/reveal', { handle: loginId, version: '1' });
+  expect(held.status).toBe(409);
+  expect(JSON.parse(held.body)).toEqual({ error: expect.stringContaining('The assistant is changing this password') });
+  fixture.setUnavailable(true);
+  const unavailable = await post('/logins/reveal', { handle: saved.id, version: '2' });
+  expect(unavailable.status).toBe(503);
+  expect(JSON.parse(unavailable.body)).toEqual({
+    error: "Saved passwords can't be read right now. Ask your operator.",
+  });
+  for (const response of [stale, missing, held, unavailable]) expect(response.body).not.toContain(SECRET);
+});
+
 const chromePath = process.env.GWS_EA_BROWSER_TEST_CHROME;
 it.skipIf(!chromePath).each([320, 390, 1200])(
   'keeps JSON submission, edit protection, removal confirmation and layout usable in Chrome at %ipx',
@@ -699,6 +760,137 @@ it.skipIf(!chromePath).each([320, 390, 1200])(
       await context.close();
     } finally {
       releaseSave();
+      await browser.close();
+    }
+  },
+  30_000,
+);
+
+it.skipIf(!chromePath).each([320, 390, 1200])(
+  'reveals on demand, hides and clears late replies without storing passwords in Chrome at %ipx',
+  async (width) => {
+    const password = '<script>window.passwordExecuted=true</script>' + 'long-password-'.repeat(25);
+    const saved = await fixture.store.create({ site: SITE, username: PRINCIPAL, title: 'Personal', password });
+    const browser = await chromium.launch({ executablePath: chromePath, headless: true });
+    let release = (): void => undefined;
+    try {
+      const context = await browser.newContext({
+        viewport: { width, height: 900 },
+        isMobile: width < 600,
+        hasTouch: width < 600,
+      });
+      let revealCount = 0;
+      let hold = false;
+      let entered = (): void => undefined;
+      let completed = (): void => undefined;
+      let held: Promise<void> = Promise.resolve();
+      await context.route(`https://${HOST}/**`, async (route) => {
+        const incoming = route.request();
+        const pathname = new URL(incoming.url()).pathname;
+        const reply = await request(
+          pathname,
+          incoming.method(),
+          await incoming.allHeaders(),
+          incoming.postData() ?? undefined,
+        );
+        if (pathname === '/logins/reveal') {
+          revealCount++;
+          if (hold) {
+            entered();
+            await held;
+            hold = false;
+          }
+        }
+        const headers: Record<string, string> = {};
+        for (const [key, value] of Object.entries(reply.headers))
+          if (typeof value === 'string' && !['connection', 'content-length', 'transfer-encoding'].includes(key))
+            headers[key] = value;
+        await route.fulfill({ status: reply.status, headers, body: reply.body });
+        if (pathname === '/logins/reveal') completed();
+      });
+      const page = await context.newPage();
+      page.setDefaultTimeout(7000);
+      await page.clock.install();
+      await page.goto(`https://${HOST}/logins/item/${saved.id}`);
+      expect(revealCount).toBe(0);
+      expect(await page.content()).not.toContain(password);
+      const show = () => page.getByRole('button', { name: 'Show password', exact: true }).click();
+      const hidden = async (): Promise<void> => {
+        await page.getByRole('button', { name: 'Show password', exact: true }).waitFor();
+        expect(await page.locator('#password-value').textContent()).toBe('');
+        expect(await page.content()).not.toContain(password);
+      };
+      await show();
+      await page.getByRole('button', { name: 'Hide password', exact: true }).waitFor();
+      await expect.poll(() => page.locator('#password-value').textContent(), { timeout: 7000 }).toBe(password);
+      expect(revealCount).toBe(1);
+      expect(await page.evaluate<boolean>('window.passwordExecuted === true')).toBe(false);
+      expect(await page.evaluate<boolean>('document.documentElement.scrollWidth <= innerWidth')).toBe(true);
+      const box = await page.getByRole('button', { name: 'Hide password', exact: true }).boundingBox();
+      expect(box?.width).toBeGreaterThanOrEqual(44);
+      expect(box?.height).toBeGreaterThanOrEqual(44);
+      await page.getByRole('button', { name: 'Hide password', exact: true }).click();
+      await hidden();
+      await show();
+      await expect.poll(() => page.locator('#password-value').textContent(), { timeout: 7000 }).toBe(password);
+      await page.clock.fastForward(30_000);
+      await hidden();
+      await show();
+      await expect.poll(() => page.locator('#password-value').textContent(), { timeout: 7000 }).toBe(password);
+      await page.evaluate<void>(`Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'hidden' });
+        document.dispatchEvent(new Event('visibilitychange'));`);
+      await hidden();
+      await page.evaluate<void>(
+        "Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'visible' });",
+      );
+      // Exercise late successful replies even if a browser ignores AbortController.
+      await page.evaluate<void>(`window.fetch = ((fetcher) => (input, init) =>
+        fetcher(input, { ...init, signal: undefined }))(window.fetch);`);
+      for (const clear of ['hide', 'background', 'pagehide', 'navigation'] as const) {
+        hold = true;
+        held = new Promise<void>((resolve) => {
+          release = resolve;
+        });
+        const started = new Promise<void>((resolve) => {
+          entered = resolve;
+        });
+        const finished = new Promise<void>((resolve) => {
+          completed = resolve;
+        });
+        await show();
+        await started;
+        if (clear === 'hide') await page.getByRole('button', { name: 'Hide password', exact: true }).click();
+        else if (clear === 'background')
+          await page.evaluate<void>(`Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'hidden' });
+            document.dispatchEvent(new Event('visibilitychange'));`);
+        else if (clear === 'pagehide')
+          await page.evaluate<void>("window.dispatchEvent(new PageTransitionEvent('pagehide'));");
+        else
+          // Cancel navigation after the page handler to inspect clearing on the current document.
+          await page.evaluate<void>(`document.addEventListener('click', event => event.preventDefault(), { once: true });
+            document.querySelector('a[data-navigation]')?.click();`);
+        release();
+        await finished;
+        await page.clock.runFor(50);
+        await hidden();
+        await page.evaluate<void>(
+          "Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'visible' });",
+        );
+      }
+      await show();
+      await expect.poll(() => page.locator('#password-value').textContent(), { timeout: 7000 }).toBe(password);
+      await page.getByRole('button', { name: 'Remove login', exact: true }).first().click();
+      await hidden();
+      await page.getByRole('dialog').getByRole('button', { name: 'Cancel', exact: true }).click();
+      const storage = await page.evaluate<{ local: number; session: number }>(
+        '({ local: localStorage.length, session: sessionStorage.length })',
+      );
+      expect(storage).toEqual({ local: 0, session: 0 });
+      await page.reload();
+      await hidden();
+      await context.close();
+    } finally {
+      release();
       await browser.close();
     }
   },

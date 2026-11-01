@@ -1,8 +1,77 @@
-/** No credential values are retained in browser storage, URLs, or the rendered page. */
+/** Passwords enter the page only after a principal reveal and are cleared on hiding or leaving. */
 export const LOGINS_PAGE_SCRIPT = String.raw`(() => {
   'use strict';
   let busy = false;
   let pending;
+  let revealGeneration = 0;
+  let revealRequest;
+  let revealTimer;
+  function hidePassword() {
+    revealGeneration += 1;
+    revealRequest?.abort();
+    revealRequest = undefined;
+    clearTimeout(revealTimer);
+    revealTimer = undefined;
+    const value = document.getElementById('password-value');
+    if (value) { value.textContent = ''; value.hidden = true; }
+    const concealed = document.getElementById('password-concealed');
+    if (concealed) { concealed.hidden = false; concealed.lastChild.textContent = 'Not shown'; }
+    const button = document.getElementById('show-password');
+    if (button) {
+      button.textContent = 'Show password';
+      button.setAttribute('aria-expanded', 'false');
+      button.removeAttribute('aria-busy');
+    }
+    const hint = document.getElementById('password-reveal-hint');
+    if (hint) hint.hidden = true;
+  }
+  async function revealPassword(button) {
+    const value = document.getElementById('password-value');
+    if (revealRequest || !value.hidden) { hidePassword(); return; }
+    hidePassword();
+    const generation = revealGeneration;
+    const controller = new AbortController();
+    revealRequest = controller;
+    button.textContent = 'Hide password';
+    button.setAttribute('aria-busy', 'true');
+    document.getElementById('password-concealed').lastChild.textContent = 'Loading…';
+    try {
+      const response = await fetch('/logins/reveal', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ handle: button.dataset.handle, version: button.dataset.version }),
+        credentials: 'same-origin', cache: 'no-store', signal: controller.signal,
+      });
+      if (generation !== revealGeneration) return;
+      if (response.status === 404) {
+        hidePassword();
+        message('This request could not be accepted. Reload the page and try again.', true);
+        return;
+      }
+      const data = await response.json();
+      if (generation !== revealGeneration || document.visibilityState !== 'visible') return;
+      if (!response.ok || typeof data.password !== 'string') {
+        hidePassword();
+        message(typeof data.error === 'string' ? data.error : 'The password could not be shown. Try again.', response.status === 409);
+        return;
+      }
+      value.textContent = data.password;
+      data.password = '';
+      value.hidden = false;
+      document.getElementById('password-concealed').hidden = true;
+      document.getElementById('password-reveal-hint').hidden = false;
+      button.setAttribute('aria-expanded', 'true');
+      revealTimer = setTimeout(hidePassword, 30_000);
+    } catch {
+      if (generation !== revealGeneration) return;
+      hidePassword();
+      message('The password could not be shown. Reload the page and try again.', true);
+    } finally {
+      if (generation === revealGeneration) {
+        revealRequest = undefined;
+        button.removeAttribute('aria-busy');
+      }
+    }
+  }
   const dialog = document.getElementById('remove-dialog');
   function changed() {
     return [...document.querySelectorAll('form[data-track-changes] input:not([type="hidden"])')]
@@ -24,6 +93,7 @@ export const LOGINS_PAGE_SCRIPT = String.raw`(() => {
   }
   async function send(form) {
     if (busy) return;
+    hidePassword();
     busy = true;
     const data = Object.fromEntries(new FormData(form));
     if (form.dataset.loginAction === 'update') {
@@ -82,6 +152,7 @@ export const LOGINS_PAGE_SCRIPT = String.raw`(() => {
     if (!(form instanceof HTMLFormElement) || !form.dataset.loginAction) return;
     event.preventDefault();
     if (busy) return;
+    hidePassword();
     if (form.dataset.loginAction === 'remove') {
       pending = form;
       document.getElementById('remove-description').textContent = 'Remove the saved login for ' +
@@ -114,9 +185,16 @@ export const LOGINS_PAGE_SCRIPT = String.raw`(() => {
     document.getElementById('search-count').textContent = needle ? count + (count === 1 ? ' login found' : ' logins found') : '';
   });
   document.addEventListener('click', event => {
+    if (!(event.target instanceof Element)) return;
+    const reveal = event.target.closest('#show-password');
+    if (reveal && !busy) { void revealPassword(reveal); return; }
+    if (event.target.closest('a[data-navigation]')) hidePassword();
     if (busy && event.target instanceof Element && event.target.closest('a[data-navigation]')) event.preventDefault();
   });
+  document.addEventListener('visibilitychange', () => { if (document.visibilityState !== 'visible') hidePassword(); });
+  window.addEventListener('pagehide', hidePassword);
   window.addEventListener('beforeunload', event => {
+    hidePassword();
     if (!busy && !changed()) return;
     event.preventDefault();
     event.returnValue = '';

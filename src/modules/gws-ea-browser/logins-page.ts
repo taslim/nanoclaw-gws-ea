@@ -131,6 +131,17 @@ function failureMessage(error: unknown): string {
   return "Saved passwords can't be read right now. Ask your operator.";
 }
 
+function failureStatus(error: unknown): number {
+  if (error instanceof LoginStoreError && error.reason === 'no_item_for_site') return 409;
+  if (error instanceof LoginDetailsError)
+    return error.reason === 'login_changed' || error.reason === 'login_busy' ? 409 : 400;
+  return 503;
+}
+function json(response: ServerResponse, status: number, data: Readonly<Record<string, string>>): void {
+  response.writeHead(status, { ...headers(), 'content-type': 'application/json; charset=utf-8' });
+  response.end(JSON.stringify(data));
+}
+
 /** The Access-verified principal is checked afresh before every read or write. */
 export function createLoginsPageHandler(options: LoginsPageOptions): RequestListener {
   const credentials = options.credentials ?? credentialAttempts;
@@ -139,7 +150,8 @@ export function createLoginsPageHandler(options: LoginsPageOptions): RequestList
       const route = request.url;
       const reading = request.method === 'GET' || request.method === 'HEAD';
       const writing =
-        request.method === 'POST' && ['/logins/add', '/logins/update', '/logins/remove'].includes(route ?? '');
+        request.method === 'POST' &&
+        ['/logins/add', '/logins/update', '/logins/remove', '/logins/reveal'].includes(route ?? '');
       let view: LoginsView = (reading ? readView(route) : undefined) ?? { kind: 'list' };
       if (request.headers.host !== options.hostname || (reading ? !readView(route) : !writing)) return refuse(response);
       if (!(await isPrincipalWebIdentity(await options.identity(request)))) return refuse(response);
@@ -151,6 +163,21 @@ export function createLoginsPageHandler(options: LoginsPageOptions): RequestList
       if (writing) {
         const data = await submission(request);
         const keys = Object.keys(data).sort().join(',');
+        if (route === '/logins/reveal') {
+          if (keys !== 'handle,version') throw new InvalidSubmission();
+          const handle = stringField(data, 'handle');
+          const version = versionField(data);
+          /* eslint-disable no-catch-all/no-catch-all -- The reveal response reports only constant failures and never credential-bearing errors. */
+          try {
+            const password = await store.revealPassword(handle, version);
+            if (!(await isPrincipalWebIdentity(await options.identity(request)))) return refuse(response);
+            json(response, 200, { password });
+          } catch (error) {
+            json(response, failureStatus(error), { error: failureMessage(error) });
+          }
+          /* eslint-enable no-catch-all/no-catch-all */
+          return;
+        }
         try {
           if (route === '/logins/add') {
             view = { kind: 'add' };
@@ -189,13 +216,7 @@ export function createLoginsPageHandler(options: LoginsPageOptions): RequestList
           if (error instanceof LoginStoreError && error.reason === 'no_item_for_site') {
             status = 409;
             view = { kind: 'list' };
-          } else
-            status =
-              error instanceof LoginDetailsError
-                ? error.reason === 'login_changed' || error.reason === 'login_busy'
-                  ? 409
-                  : 400
-                : 503;
+          } else status = failureStatus(error);
         }
       }
       let available = true;
