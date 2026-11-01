@@ -107,6 +107,7 @@ afterAll(async () => {
   await fixture?.close();
 });
 beforeEach(() => {
+  useAvailableBrowser();
   fixture?.reset();
   fs.rmSync(`${root}/browser`, { recursive: true, force: true });
   defaultLogins = testLoginStore(`${root}/browser`);
@@ -294,7 +295,6 @@ describe.skipIf(!chromePath)('open-web classification in native Chrome', { timeo
   let page: Page;
 
   beforeEach(async () => {
-    useAvailableBrowser();
     page = await fixture.newPage();
   });
   afterEach(async () => {
