@@ -410,9 +410,10 @@ forms and pages without a form element. When email and password appear together,
 the host fills both before activating the sign-in control. When they appear on
 separate pages, browser supplies fresh references for each step using the same
 saved-login handle. Sign-in does not depend on a catalog of website login URLs.
-The host keeps the values out of agent observations and refuses insecure or
-off-origin credential destinations, account changes, purchases, and credentials
-in a navigation address.
+The host keeps the values out of agent observations, checks the selected HTTPS
+frame and form destination, and reclassifies the control before activation.
+It cancels native GET submissions and guards navigation addresses while the
+sign-in action runs. The intended site's JavaScript receives the filled values.
 
 Email-code and magic-link sign-in uses the existing site-bound mailbox wait.
 Codes sent to the principal can be relayed through main; browser receives only

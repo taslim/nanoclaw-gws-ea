@@ -16,10 +16,12 @@ import { prepareAuthenticationIsolation } from './authentication-submit.js';
 import { prepareChromeProfile, spawnChrome } from './chrome.js';
 import { connectChrome, type ChromeConnection } from './connection.js';
 import { executeBrowserBatch } from './executor.js';
+import { classifyActivation } from './commit-classifier.js';
+import { readPageControlFacts } from './control-facts.js';
 
 import { bindBrowserSecretFields, executeFillSecret, fillBoundBrowserSecrets } from './fill.js';
 import './merchant-signatures.js';
-import { browserSiteLeasesMigration } from './migration.js';
+import { browserConsentMigration, browserSiteLeasesMigration } from './migration.js';
 import { browserSignInMigration } from './sign-in-migration.js';
 import { recoverBrowserSignInMail, executeSignInCode } from './sign-in-mail.js';
 import { getSignInClaim } from '../gws-ea-inbox/claims.js';
@@ -80,7 +82,7 @@ describe.skipIf(!chromePath)('native host secret fill', { timeout: 30_000 }, () 
               response
                 .writeHead(200, { 'content-type': 'text/html' })
                 .end(
-                  '<h1>Password step</h1><form method="post" action="/step/password"><label>Password<input name="password" type="password" autocomplete="current-password" required></label><button type="submit">Continue</button></form>',
+                  '<h1>Password step</h1><form method="post" action="/step/password"><input name="username" type="hidden" value="principal@example.test"><label>Password<input name="password" type="password" autocomplete="current-password" required></label><button type="submit">Continue</button></form>',
                 );
             else if (request.url === '/session' || request.url === '/send-code') response.writeHead(204).end();
             else response.writeHead(200, { 'content-type': 'text/html' }).end('<h1>Signed in</h1>');
@@ -92,6 +94,8 @@ describe.skipIf(!chromePath)('native host secret fill', { timeout: 30_000 }, () 
             .end(
               `<form method="post" action="/send-code"><label>Code<input name="code" type="text" autocomplete="one-time-code"></label><button id="send" type="${scripted ? 'button' : 'submit'}">Send code</button><button type="submit" formaction="/verify-code">Verify</button></form>${scripted ? '<script>document.getElementById("send").addEventListener("click", () => fetch("/send-code", {method:"POST"}));</script>' : ''}`,
             );
+        } else if (request.url === '/csrf') {
+          setTimeout(() => response.writeHead(200).end('fixture-token'), 1500);
         } else if (request.url === '/signed-in') {
           response.writeHead(200, { 'content-type': 'text/html' }).end('<h1>Signed in</h1>');
         } else if (request.url === '/u/login' || request.url === '/formless') {
@@ -207,6 +211,10 @@ describe.skipIf(!chromePath)('native host secret fill', { timeout: 30_000 }, () 
     vi.stubEnv('GWS_EA_BROWSER_ROOT', join(root, 'browser'));
     await browserSiteLeasesMigration.up(await initSqliteTestDb());
     await browserSignInMigration.up(getDb());
+    await getDb().exec(
+      "CREATE TABLE gws_ea_browser_jobs(id TEXT PRIMARY KEY); INSERT INTO gws_ea_browser_jobs VALUES('native-fill-job')",
+    );
+    await browserConsentMigration.up(getDb());
     posts.length = 0;
     parentDocuments.length = 0;
     const appeared = connection.context.waitForEvent('page');
@@ -303,7 +311,7 @@ describe.skipIf(!chromePath)('native host secret fill', { timeout: 30_000 }, () 
     expect(await savedFill(item.id, ['password'])).toMatchObject({ status: 'submitted' });
     expect(posts.map((post) => Object.fromEntries(new URLSearchParams(post.body)))).toEqual([
       { username: 'principal@example.test' },
-      { password: secret },
+      { username: 'principal@example.test', password: secret },
     ]);
     expect(await page.locator('h1').textContent()).toBe('Signed in');
   });
@@ -361,6 +369,166 @@ describe.skipIf(!chromePath)('native host secret fill', { timeout: 30_000 }, () 
     expect(posts).toEqual([]);
     expect(await page.locator('input[name=password]').inputValue()).toBe('');
   });
+
+  it('reclassifies after a consent callback changes the sign-in control', async () => {
+    const item = await logins.store.create({
+      site: 'auth.example',
+      title: 'Login',
+      username: 'principal@example.test',
+      password: secret,
+    });
+    await page.goto('https://auth.example/u/login');
+    await page.evaluate(`
+      document.querySelector('form').insertAdjacentHTML('beforeend', '<label><input id="terms" type="checkbox" required>I accept the Terms of Service</label>');
+      let choices = 0;
+      document.getElementById('terms').addEventListener('change', event => {
+        if (event.target.checked && ++choices === 2) document.getElementById('go').textContent = 'Pay now';
+      });
+      document.querySelector('input[name=password]').addEventListener('input', () => { document.getElementById('terms').checked = false; });
+    `);
+    await expect(savedFill(item.id, ['username', 'password'])).rejects.toMatchObject({ code: 'forbidden' });
+    expect(await page.locator('#go').textContent()).toBe('Pay now');
+    expect(posts).toEqual([]);
+    expect(await page.locator('input[name=password]').inputValue()).toBe('');
+  });
+
+  it('returns a recorded consent stop before reading saved credentials', async () => {
+    const item = await logins.store.create({
+      site: 'auth.example',
+      title: 'Login',
+      username: 'principal@example.test',
+      password: secret,
+    });
+    const read = vi.spyOn(logins.store, 'secret');
+    await page.goto('https://auth.example/u/login');
+    await page.evaluate(
+      `document.querySelector('form').insertAdjacentHTML('beforeend', '<label><input type="checkbox" required>I agree to binding arbitration</label>');`,
+    );
+    const result = await savedFill(item.id, ['username', 'password']);
+    expect(result).toMatchObject({
+      status: 'stopped',
+      reason: 'consent_required',
+      consent: [{ stop_id: expect.any(String), site: 'auth.example' }],
+    });
+    const stops = await getDb().all<{ id: string }>('SELECT id FROM gws_ea_browser_consent_stops');
+    expect(result.consent).toMatchObject([{ stop_id: stops[0]?.id }]);
+    expect(read).not.toHaveBeenCalled();
+    expect(posts).toEqual([]);
+    expect(JSON.stringify(result)).not.toContain(secret);
+  });
+
+  it('uses the submitter POST override while still cancelling an effective GET', async () => {
+    const item = await logins.store.create({
+      site: 'auth.example',
+      title: 'Login',
+      username: 'principal@example.test',
+      password: secret,
+    });
+    await page.goto('https://auth.example/native-get');
+    await page.locator('button').evaluate((node) => node.setAttribute('formmethod', 'post'));
+    await savedFill(item.id, ['password']);
+    expect(posts.map((post) => Object.fromEntries(new URLSearchParams(post.body)))).toEqual([{ password: secret }]);
+    await page.goto('https://auth.example/native-get');
+    await page.locator('form').evaluate((node) => node.setAttribute('method', 'post'));
+    await page.locator('button').evaluate((node) => node.setAttribute('formmethod', 'get'));
+    await savedFill(item.id, ['password']);
+    expect(posts).toHaveLength(1);
+    expect(page.url()).toBe('https://auth.example/native-get');
+  });
+
+  it('keeps an OTP binding usable while Send code is disabled for cooldown', async () => {
+    await page.goto('https://auth.example/otp-send-button');
+    const target = await page.locator('input').elementHandle();
+    const submit = await page.locator('button[type=submit]').elementHandle();
+    if (!target || !submit) throw new Error('Missing OTP controls');
+    const bound = await bindBrowserSecretFields(
+      page,
+      [{ field: 'otp', target: { element: target, frame: page.mainFrame() } as PinnedBrowserRef }],
+      { element: submit, frame: page.mainFrame() } as PinnedBrowserRef,
+    );
+    await page.locator('#send').evaluate((node) => {
+      (node as unknown as { disabled: boolean }).disabled = true;
+    });
+    expect(await fillBoundBrowserSecrets(context(), bound, async () => ['123456'])).toEqual({ status: 'submitted' });
+    expect(posts.map((post) => Object.fromEntries(new URLSearchParams(post.body)))).toEqual([{ code: '123456' }]);
+  });
+
+  it('lets a slow token callback read the filled form before cleanup', async () => {
+    const item = await logins.store.create({
+      site: 'auth.example',
+      title: 'Login',
+      username: 'principal@example.test',
+      password: secret,
+    });
+    await page.goto('https://auth.example/u/login');
+    await page.evaluate(`
+      const old = document.getElementById('go');
+      old.replaceWith(old.cloneNode(true));
+      document.getElementById('go').addEventListener('click', async event => {
+        event.preventDefault();
+        await fetch('/csrf');
+        await fetch('/sessions/create', {method:'POST', body:new URLSearchParams(new FormData(document.querySelector('form')))});
+        location.href = '/signed-in';
+      });
+    `);
+    await savedFill(item.id, ['username', 'password']);
+    await expect.poll(() => posts.length).toBe(1);
+    expect(Object.fromEntries(new URLSearchParams(posts[0].body))).toEqual({
+      username: 'principal@example.test',
+      password: secret,
+    });
+    await expect.poll(() => page.locator('h1').textContent()).toBe('Signed in');
+  });
+
+  it('allows a login beside a separate checkout and still refuses its purchase', async () => {
+    const item = await logins.store.create({
+      site: 'auth.example',
+      title: 'Login',
+      username: 'principal@example.test',
+      password: secret,
+    });
+    await page.goto('https://auth.example/u/login');
+    await page.evaluate(
+      `document.body.insertAdjacentHTML('beforeend', '<form id="checkout"><p>Total: $42.00</p><p>Visa ending in 4242</p><button type="submit">Place order</button></form>');`,
+    );
+    const login = await page.locator('#go').elementHandle();
+    const purchase = await page.locator('#checkout button').elementHandle();
+    if (!login || !purchase) throw new Error('Missing controls');
+    expect(await readPageControlFacts(page, login)).toMatchObject({
+      transaction: true,
+      region: { transaction: false },
+    });
+    expect(await classifyActivation(page, purchase)).toBe('purchase_control');
+    await savedFill(item.id, ['username', 'password']);
+    expect(posts).toHaveLength(1);
+    expect(Object.fromEntries(new URLSearchParams(posts[0].body))).toEqual({
+      username: 'principal@example.test',
+      password: secret,
+    });
+  });
+
+  for (const enabled of [true, false]) {
+    it(`handles a control that ${enabled ? 'enables after validation' : 'stays disabled'} without repeated submission`, async () => {
+      const item = await logins.store.create({
+        site: 'auth.example',
+        title: 'Login',
+        username: 'principal@example.test',
+        password: secret,
+      });
+      await page.goto('https://auth.example/u/login');
+      await page.evaluate(
+        `document.querySelector('input[name=password]').addEventListener('input', () => { document.getElementById('go').disabled = true; ${enabled ? "setTimeout(() => document.getElementById('go').disabled = false, 400);" : ''} });`,
+      );
+      if (enabled) {
+        await savedFill(item.id, ['username', 'password']);
+        expect(posts).toHaveLength(1);
+      } else {
+        await expect(savedFill(item.id, ['username', 'password'])).rejects.toMatchObject({ code: 'forbidden' });
+        expect(posts).toEqual([]);
+        expect(await page.locator('input[name=password]').inputValue()).toBe('');
+      }
+    });
+  }
 
   for (const path of ['/otp-send', '/otp-send-button']) {
     it(`opens the principal code wait after its ${path} control runs on a real code form`, async () => {

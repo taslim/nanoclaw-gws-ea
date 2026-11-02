@@ -301,7 +301,10 @@ export async function activateNativeCredentialControl(
           if (this.matches(':disabled') || this.getAttribute('aria-disabled') === 'true') return 'disabled';
           // A native GET submission would carry the values in its address; one no page handler took over is cancelled.
           const address = (event) => {
-            if (form && event.target === form && formProperty(form, 'method') === 'get') event.preventDefault();
+            if (!form || event.target !== form) return;
+            const method = event.submitter?.hasAttribute('formmethod')
+              ? event.submitter.formMethod : formProperty(form, 'method');
+            if (method === 'get') event.preventDefault();
           };
           addEventListener('submit', address);
           try {

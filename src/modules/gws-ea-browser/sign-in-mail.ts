@@ -1,4 +1,5 @@
 import { classifyNavigationUrl } from './control-policy.js';
+import { BrowserConsentStop, consentStopsForAgent } from './consent.js';
 import { createHash } from 'node:crypto';
 import type { Frame, Page } from 'playwright-core';
 import { getDomain } from 'tldts';
@@ -602,6 +603,8 @@ export async function executeSignInCode(
       return { status: 'code_filled' };
     } catch (error) {
       if (error instanceof BrowserOriginMismatchError) return { status: 'origin_mismatch' };
+      if (error instanceof BrowserConsentStop)
+        return { status: 'stopped', reason: error.reason, consent: consentStopsForAgent(error.stops) };
       if (error instanceof ActionRefusal) throw error;
       throw forbidden('The host could not safely complete this sign-in. Take a fresh observation.');
     } finally {
@@ -733,7 +736,9 @@ async function executeRelayCode(
     });
     return result;
     // eslint-disable-next-line no-catch-all/no-catch-all -- the relayed code and any native exception stay host-only; the fixed result is answered to both callers
-  } catch (_error) {
+  } catch (error) {
+    if (error instanceof BrowserConsentStop)
+      return { status: 'stopped', reason: error.reason, consent: consentStopsForAgent(error.stops) };
     return result;
   } finally {
     await finishSignInClaim(payload.claim_id);
@@ -772,7 +777,12 @@ async function deliverRelayAnswer(request: BrowserRequest, frame: ResponseFrame)
   const claim = await getSignInClaim(payload.claim_id);
   if (claim && claim.job_id !== job.id) throw forbidden('The principal relay belongs to another browser job.');
   const data = frame.ok && isRecord(frame.data) ? frame.data : undefined;
-  const status = data && (data.status === 'code_filled' || data.status === 'no_wait') ? data.status : 'origin_mismatch';
+  const status =
+    data && (data.status === 'code_filled' || data.status === 'no_wait')
+      ? data.status
+      : data?.status === 'stopped' && data.reason === 'consent_required'
+        ? 'consent_required'
+        : 'origin_mismatch';
   await writeActionResponse(source, payload.source_request_id, {
     id: payload.source_request_id,
     ok: true,

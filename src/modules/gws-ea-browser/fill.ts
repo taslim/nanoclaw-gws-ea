@@ -9,8 +9,7 @@ import {
 } from './authentication-signatures.js';
 import { classifyActivation, ensureBrowserNavigationGuard, withBrowserJobNavigation } from './commit-classifier.js';
 import { classifyNavigationUrl } from './control-policy.js';
-import { readPageControlFacts } from './control-facts.js';
-import { BrowserConsentStop, runConsentPass } from './consent.js';
+import { BrowserConsentStop, consentStopsForAgent, runConsentPass } from './consent.js';
 import {
   activateNativeCredentialControl,
   fillNativeCredentialGroup,
@@ -75,9 +74,16 @@ const otherSecret = (field: NativeFieldFacts): boolean =>
   ) || ['file', 'image'].includes(field.type);
 
 async function checkSignInControl(page: Page, submit: PinnedBrowserRef): Promise<void> {
-  const facts = await readPageControlFacts(page, submit.element);
-  if (facts.transaction || (await classifyActivation(page, submit.element)) !== 'ordinary') throw unsupported();
+  if ((await classifyActivation(page, submit.element)) !== 'ordinary') throw unsupported();
 }
+
+const sameSignInBinding = (left: NativeCredentialGroup, right: NativeCredentialGroup): boolean => {
+  const shape = (group: NativeCredentialGroup): string =>
+    JSON.stringify(group, (key: string, value: unknown) =>
+      key === 'readonly' || key === 'disabled' || key === 'required' ? undefined : value,
+    );
+  return shape(left) === shape(right);
+};
 
 async function signInConsent(context: BrowserExecutionContext, binding: BoundBrowserSecretFields): Promise<void> {
   const consent = await runConsentPass(binding.page, binding.submit.element, {
@@ -227,8 +233,8 @@ export async function activateBoundBrowserSignIn(
   const { page, submit } = binding;
   const until = Date.now() + Math.min(3000, Math.max(0, context.remaining() - 2000));
   for (;;) {
-    await checkSignInControl(page, submit);
     await signInConsent(context, binding);
+    await checkSignInControl(page, submit);
     assertBrowserSecretDiagnosticsSafe();
     const activated = await activateNativeCredentialControl(submit.frame, binding.native, values, context.assertActive);
     if (activated === 'activated' || activated === 'uncertain') return;
@@ -256,7 +262,7 @@ export async function fillBoundBrowserSecrets(
     await context.assertActive();
     if (!(await originMatches(binding, permitsOrigin))) return { status: 'origin_mismatch' };
     const rebound = await bindBrowserSecretFields(page, fields, submit);
-    if (JSON.stringify(rebound.native) !== JSON.stringify(binding.native)) return { status: 'origin_mismatch' };
+    if (!sameSignInBinding(rebound.native, binding.native)) return { status: 'origin_mismatch' };
     const lease = await new SiteLeaseStore(context.store.db).acquire(context.job.id, binding.origin);
     await context.wakeWaiters(lease.waitingJobs, `${browserOperationId(context)}:sign-in-lease`);
     if (!lease.acquired) return { status: 'site_busy' };
@@ -273,7 +279,7 @@ export async function fillBoundBrowserSecrets(
     } catch {
       return { status: 'origin_mismatch' };
     }
-    if (JSON.stringify(current.native) !== JSON.stringify(rebound.native)) return { status: 'origin_mismatch' };
+    if (!sameSignInBinding(current.native, rebound.native)) return { status: 'origin_mismatch' };
     for (const value of values) {
       registerPageSecret(page, value);
       await bindPageSecretDocuments(page, value);
@@ -294,12 +300,16 @@ export async function fillBoundBrowserSecrets(
         },
       },
       () =>
-        guard.duringAction(context.remaining(), async () => {
-          assertBrowserSecretDiagnosticsSafe();
-          const filled = await fillNativeCredentialGroup(submit.frame, current.native, values, context.assertActive);
-          if (filled !== 'filled') throw unsupported();
-          await activateBoundBrowserSignIn(context, current, values);
-        }),
+        guard.duringAction(
+          context.remaining(),
+          async () => {
+            assertBrowserSecretDiagnosticsSafe();
+            const filled = await fillNativeCredentialGroup(submit.frame, current.native, values, context.assertActive);
+            if (filled !== 'filled') throw unsupported();
+            await activateBoundBrowserSignIn(context, current, values);
+          },
+          { waitForRequests: true },
+        ),
     );
     await context.assertActive();
     return { status: navigated ? 'submitted' : 'cleared_after_submit' };
@@ -310,7 +320,11 @@ export async function fillBoundBrowserSecrets(
     throw forbidden('The host could not safely complete this sign-in. Take a fresh observation.');
   } finally {
     page.off('framenavigated', navigation);
-    if (values.length) await settleFilledSecrets(context, page, values);
+    // The next step may carry its account identifier in a hidden/read-only field. It stays redacted.
+    const secrets = values.filter((_value, index) => fields[index]?.field !== 'username');
+    if (secrets.length) await settleFilledSecrets(context, page, secrets);
+    for (const [index, value] of values.entries())
+      if (fields[index]?.field === 'username') releasePageSecret(page, value);
   }
 }
 
@@ -409,7 +423,9 @@ export async function executeFillSecret(
     } catch (error) {
       if (error instanceof BrowserOriginMismatchError) return { status: 'origin_mismatch' };
       if (error instanceof LoginStoreError) return { status: error.reason };
-      if (error instanceof ActionRefusal || error instanceof BrowserConsentStop) throw error;
+      if (error instanceof BrowserConsentStop)
+        return { status: 'stopped', reason: error.reason, consent: consentStopsForAgent(error.stops) };
+      if (error instanceof ActionRefusal) throw error;
       throw forbidden('Choose current sign-in fields and their submit control from a fresh observation.');
     } finally {
       await disposeBrowserRefs(refs);

@@ -65,6 +65,7 @@ import '../gws-ea-profile/index.js';
 import { addPrincipalAddress } from '../gws-ea-profile/db.js';
 import { recordWebAlias } from '../gws-ea-profile/testing/web-alias.js';
 import { configureBrowserAccess } from './testing/browser-access.js';
+import { BrowserConsentStop } from './consent.js';
 
 registerMigration(gwsEaInboxMigration);
 registerSignInMailDelivery(() => {
@@ -601,7 +602,7 @@ it('returns nothing_arrived within the remaining request budget', async () => {
   });
 });
 
-it.each(['fill', 'restart'] as const)(
+it.each(['fill', 'restart', 'consent'] as const)(
   'defers a principal relay immediately and retains only host references (%s)',
   async (mode) => {
     const f = fixture();
@@ -644,7 +645,13 @@ it.each(['fill', 'restart'] as const)(
       withActivity: <T>(operation: () => Promise<T>): Promise<T> => operation(),
       onDisconnected: () => () => undefined,
     });
-    if (mode === 'fill') await recoverAndStartBrowserQueue(queue);
+    if (mode !== 'restart') await recoverAndStartBrowserQueue(queue);
+    if (mode === 'consent')
+      vi.mocked(fillBoundBrowserSecrets).mockRejectedValueOnce(
+        new BrowserConsentStop([
+          { stop_id: 'consent-stop', site: 'shop.example', wording: 'I agree to binding arbitration' },
+        ]),
+      );
     let unlock!: () => void;
     const blocked = new Promise<void>((resolve) => {
       unlock = resolve;
@@ -679,8 +686,18 @@ it.each(['fill', 'restart'] as const)(
       const contents = mailbox.prepare('SELECT content FROM messages_in').all();
       mailbox.close();
       expect(JSON.stringify(contents)).toContain(
-        mode === 'fill' ? 'code_filled' : session === source ? 'origin_mismatch' : 'interrupted',
+        mode === 'fill'
+          ? 'code_filled'
+          : mode === 'consent'
+            ? 'consent_required'
+            : session === source
+              ? 'origin_mismatch'
+              : 'interrupted',
       );
+      if (mode === 'consent') {
+        if (session === browser) expect(JSON.stringify(contents)).toContain('consent-stop');
+        expect(JSON.stringify(contents)).not.toContain('handler-error');
+      }
       expect(JSON.stringify(contents)).not.toContain(code);
     }
     expect(await getSignInClaim('signin-request')).toMatchObject({ state: 'finished' });
