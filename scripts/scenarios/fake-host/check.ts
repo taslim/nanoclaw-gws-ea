@@ -1,6 +1,12 @@
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import type { ResponseFrame } from '../../../src/cli/frame.js';
+import type { WeekView } from '../../../src/modules/gws-ea-meetings/week/view.js';
+import type { ScenarioComposition } from '../types.js';
+import { scenarioWeekViewCommand } from '../runtime.js';
 import { callHost, readState } from './state.js';
 
 type Store =
@@ -141,4 +147,68 @@ const snapshot = (await callHost(file, 'snapshot', { phase: 'preflight' })) as R
 fs.writeFileSync(path.join(path.dirname(file), 'preflight-snapshot.json'), JSON.stringify(snapshot, null, 2));
 for (const [store, text] of STORED[scenario.id] ?? [])
   assert.ok(JSON.stringify(snapshot[store]).includes(text), `${scenario.id}: ${store} lacks ${JSON.stringify(text)}`);
+if (scenario.id === 'return-flight-live') {
+  const directory = path.dirname(file);
+  const tree = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..');
+  const composition = JSON.parse(
+    fs.readFileSync(path.join(directory, 'composition.json'), 'utf8'),
+  ) as ScenarioComposition;
+  assert.equal(composition.weekViewReferenceAt, '2026-10-31T19:00:00.000Z');
+  assert.ok(composition.weekViewFile, 'The native host must publish its preview.');
+  const view = JSON.parse(fs.readFileSync(composition.weekViewFile, 'utf8')) as WeekView;
+  assert.equal(view.asOf, composition.weekViewReferenceAt);
+  assert.deepEqual(
+    view.days.map((day) => day.date),
+    ['2026-10-31', '2026-11-01', '2026-11-02', '2026-11-03', '2026-11-04', '2026-11-05', '2026-11-06', '2026-11-07'],
+  );
+  for (const id of ['synthetic-aus-sfo-return', 'synthetic-dentist'])
+    assert.ok(!JSON.stringify(view.days).includes(id), `The preview must not reveal ${id}.`);
+  const hook = execFileSync('/bin/sh', ['-c', scenarioWeekViewCommand(directory, tree, composition)], {
+    input: JSON.stringify({ hook_event_name: 'SessionStart', source: 'startup', session_id: 'preflight' }),
+    encoding: 'utf8',
+    env: { ...process.env, TZ: 'America/Los_Angeles' },
+    timeout: 10_000,
+  });
+  assert.ok(hook.includes('Now: 2026-10-31 12:00 (America/Los_Angeles;'));
+  assert.ok(hook.includes('Coming days (as of 2026-10-31 12:00)'));
+  assert.ok(!hook.includes('unavailable; use days'), 'The native hook must accept the preview as fresh.');
+  fs.writeFileSync(path.join(directory, 'preflight-week-hook.txt'), hook);
+  const days = async (requestId: string, args: Readonly<Record<string, unknown>>) => {
+    const response = (await callHost(file, 'action', { action: 'days', requestId, ...args })) as {
+      frame?: ResponseFrame;
+    };
+    assert.ok(response.frame?.ok, `Native days failed: ${JSON.stringify(response)}`);
+    const data = response.frame.data as Record<string, unknown>;
+    assert.equal(typeof data.message, 'string');
+    return data;
+  };
+  const defaultDays = await days('preflight-default-days', {});
+  assert.ok(String(defaultDays.message).includes('Range: 2026-10-31T00:00-07:00'));
+  assert.ok(String(defaultDays.message).includes('to 2026-11-08T00:00-08:00'));
+  assert.ok(String(defaultDays.message).includes('(end exclusive)'));
+  assert.equal(defaultDays.complete, true);
+  for (const id of ['synthetic-aus-sfo-return', 'synthetic-dentist'])
+    assert.ok(!JSON.stringify(defaultDays).includes(id), `Default days must not reveal ${id}.`);
+  const liveDays = await days('preflight-explicit-days', { start: '2026-11-08', end: '2026-11-09' });
+  assert.equal(typeof liveDays.path, 'string', 'The detailed return day must still require its complete export.');
+  const livePath = liveDays.path as string;
+  assert.ok(livePath.startsWith('/workspace/inbox/'));
+  const staged = path.join(composition.inboxDirectory, livePath.slice('/workspace/inbox/'.length));
+  const liveText = fs.readFileSync(staged, 'utf8');
+  for (const text of [
+    'synthetic-aus-sfo-return',
+    'synthetic-dentist',
+    'synthetic-detailed-24',
+    'Flight Austin to San Francisco',
+    'Dentist appointment',
+  ])
+    assert.ok(liveText.includes(text), `Explicit days must retrieve ${text}.`);
+  fs.writeFileSync(
+    path.join(directory, 'preflight-calendar.json'),
+    JSON.stringify({ defaultDays, liveDays, liveText }, null, 2),
+  );
+  // Keep verification evidence outside the model's inbox; its own live read must create any export.
+  fs.unlinkSync(staged);
+  fs.rmdirSync(path.dirname(staged));
+}
 console.log('The synthetic host is up and holds the case facts; no model calls.');

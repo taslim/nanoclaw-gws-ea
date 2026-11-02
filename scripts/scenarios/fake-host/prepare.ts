@@ -11,6 +11,10 @@ import type { ScenarioComposition } from '../types.js';
 const [tree, output, audience] = process.argv.slice(2);
 if (!tree || !output || !['main', 'external-email', 'external-chat'].includes(audience ?? ''))
   throw new Error('prepare <tree> <output> <main|external-email|external-chat>');
+const fixture = readState(path.join(output, 'fixture.json'));
+const weekViewReferenceAt = fixture.scenario.id === 'return-flight-live' ? fixture.referenceAt : undefined;
+// Only this synthetic host's default days range uses fixture time; native timers keep running.
+if (weekViewReferenceAt) Date.now = () => Date.parse(weekViewReferenceAt);
 const host = path.join(output, 'host');
 fs.mkdirSync(host, { recursive: true });
 for (const name of ['src', 'container', 'templates']) fs.symlinkSync(path.join(tree, name), path.join(host, name));
@@ -207,7 +211,6 @@ try {
   const agent = path.join(output, 'agent');
   fs.mkdirSync(agent, { recursive: true });
   const { seedScenarioStores } = await import('./seed.js');
-  const fixture = readState(path.join(output, 'fixture.json'));
   await seedScenarioStores(fixture.scenario, agent);
   let close: ScenarioComposition['close'];
   if (CLOSE_CASES.has(fixture.scenario.id)) {
@@ -241,6 +244,7 @@ try {
   const composition: ScenarioComposition = {
     ...routes,
     ...(close ? { close } : {}),
+    ...(weekViewReferenceAt ? { weekViewReferenceAt } : {}),
     audience: audience as ScenarioComposition['audience'],
     group,
     storedCapabilities: parseStoredCapabilities(row.capabilities, group.name),
@@ -298,7 +302,10 @@ try {
   const { createMeetingsCalendarApi } = await import('../../../src/modules/gws-ea-meetings/calendar-api.js');
   const { hostGoogleAccessToken } = await import('../../../src/modules/gws-ea-google/index.js');
   const nativeCalendar = createMeetingsCalendarApi({ token: () => hostGoogleAccessToken('calendar-host') });
-  const refresher = createWeekRefresher({ calendar: () => nativeCalendar });
+  const refresher = createWeekRefresher({
+    calendar: () => nativeCalendar,
+    ...(weekViewReferenceAt ? { now: () => new Date(weekViewReferenceAt) } : {}),
+  });
   await refresher.refresh();
   const thread = readState(path.join(output, 'fixture.json')).thread;
   let handoff: ScenarioComposition['handoff'];
