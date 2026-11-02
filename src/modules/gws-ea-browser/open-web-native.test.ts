@@ -1842,8 +1842,7 @@ describe.skipIf(!chromePath)('personal data in native Chrome', { timeout: 60_000
       expect(
         await request('sign-in', 'fill_secret', {
           item_handle: item.id,
-          field: 'username',
-          target: refIn(signIn, 'Email'),
+          username: refIn(signIn, 'Email'),
           submit: refIn(signIn, 'Continue'),
         }),
       ).toMatchObject({ status: 'submitted' });

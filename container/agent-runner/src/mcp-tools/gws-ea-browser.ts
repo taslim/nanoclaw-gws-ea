@@ -150,19 +150,16 @@ export const browser = requestTool({
 export const fillSecret = requestTool({
   name: 'fill_secret',
   description:
-    'Ask the host to fill a login by handle and submit it. The host validates the complete HTTPS frame origin before resolving and again before insertion; no secret value reaches you. Outcomes: submitted or cleared_after_submit: observe again. no_item_for_site: no saved login exists; tell main, which sends the principal their logins page. origin_mismatch: the origin does not match the login. vault_unavailable: tell main the principal must ask their operator; never ask for a password. ' +
+    'Ask the host to fill the current sign-in step from a saved login and activate its control. Supply both username and password refs when both fields are editable on this page. For email-first flows, supply username alone, observe the next page, then supply its password ref with the same login handle. Native, JavaScript-controlled and formless pages use the same host fill; no secret value reaches you. The host validates the HTTPS frame and current controls before resolving and insertion. Outcomes: submitted or cleared_after_submit: observe again; neither proves sign-in succeeded. no_item_for_site: tell main, which sends the principal their logins page. origin_mismatch: the destination does not match the login. vault_unavailable: tell main the principal must ask their operator; never ask for a password. ' +
     NO_REPEAT,
   properties: {
     item_handle: { type: 'string', description: 'The opaque login handle the host listed for this site.' },
-    field: {
-      type: 'string',
-      enum: ['username', 'password'],
-      description: 'Which login field the host should resolve.',
-    },
-    target: REF,
+    username: { ...REF, description: 'The current editable username or email field, when present.' },
+    password: { ...REF, description: 'The current saved-password field, when present.' },
     submit: REF,
   },
-  required: ['item_handle', 'field', 'target', 'submit'],
+  required: ['item_handle', 'submit'],
+  oneOf: [{ required: ['username'], not: { required: ['password'] } }, { required: ['password'] }],
   additionalProperties: false,
   repeatable: false,
   timeoutMs: BROWSER_REQUEST_TIMEOUT_MS,
@@ -249,7 +246,7 @@ export const credentialForm = requestTool({
 export const signInCode = requestTool({
   name: 'sign_in_code',
   description:
-    'Register a site-bound sign-in wait before the host presses the send control. The target is the code field, or the starting email field of a host-reviewed passwordless flow; the host binds its new code field after the transition. For assistant mail, isolated external-email interprets one qualifying code or magic link; only the host inserts or opens it. from=principal records the wait for a code relayed through main; never supply a raw code here. Outcomes: code_filled, link_opened, nothing_arrived, ambiguous, origin_mismatch, awaiting_code or alias_unavailable (no web address is set up yet). Observe again after completion; tell main the recorded site when awaiting_code, and report ambiguity, origin mismatch or alias_unavailable. ' +
+    'Register a site-bound sign-in wait before the host presses the send control. The target is the code field, or the starting email field of a passwordless flow; the host binds its new code field after the transition. For assistant mail, isolated external-email interprets one qualifying code or magic link; only the host inserts or opens it. from=principal records the wait for a code relayed through main; never supply a raw code here. Outcomes: code_filled, link_opened, nothing_arrived, ambiguous, origin_mismatch, awaiting_code or alias_unavailable (no web address is set up yet). Observe again after completion; tell main the recorded site when awaiting_code, and report ambiguity, origin mismatch or alias_unavailable. ' +
     NO_REPEAT,
   properties: {
     from: {

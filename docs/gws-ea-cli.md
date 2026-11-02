@@ -405,6 +405,23 @@ logins on the page. Once no saved or pending passwords remain, adding a login
 can create a key. Removing an assistant deletes its Keychain key after stopping
 the host; an unreachable key is reported as left behind without failing removal.
 
+Saved-login sign-in follows the page's current controls, including JavaScript
+forms and pages without a form element. When email and password appear together,
+the host fills both before activating the sign-in control. When they appear on
+separate pages, browser supplies fresh references for each step using the same
+saved-login handle. Sign-in does not depend on a catalog of website login URLs.
+The host keeps the values out of agent observations, checks the selected HTTPS
+frame and form destination, and reclassifies the control before activation.
+It cancels native GET submissions and guards navigation addresses while the
+sign-in action runs. The intended site's JavaScript receives the filled values.
+
+Email-code and magic-link sign-in uses the existing site-bound mailbox wait.
+Codes sent to the principal can be relayed through main; browser receives only
+the outcome. Authenticator codes can use the same relay. Push approvals and
+security keys need the principal. CAPTCHA and access-denied pages are reported
+as `challenge`; there is no remote browser takeover page or automatic CAPTCHA
+solver. Completing a challenge in another browser does not sign this browser in.
+
 ### Browser diagnosis and release acceptance
 
 `gws-ea status --id <full-id> --details` checks the selected managed

@@ -52,7 +52,17 @@ async function call(tool: McpToolDefinition, args: Record<string, unknown>, data
 const target = { ref: 'e1', generation: 1 };
 const cases: ReadonlyArray<readonly [McpToolDefinition, Record<string, unknown>]> = [
   [browser, { actions: [{ kind: 'observe' }], budget_ms: 90_000 }],
-  [fillSecret, { item_handle: 'login-1', field: 'password', target, submit: { ref: 'e2', generation: 1 } }],
+  [fillSecret, { item_handle: 'login-1', password: target, submit: { ref: 'e2', generation: 1 } }],
+  [fillSecret, { item_handle: 'login-1', username: target, submit: { ref: 'e2', generation: 1 } }],
+  [
+    fillSecret,
+    {
+      item_handle: 'login-1',
+      username: target,
+      password: { ref: 'e2', generation: 1 },
+      submit: { ref: 'e3', generation: 1 },
+    },
+  ],
   [signInCode, { from: 'principal', target, send: { ref: 'e2', generation: 1 } }],
   [
     credentialForm,
@@ -280,7 +290,7 @@ describe('the browser tools', () => {
       expect(tool.tool.description).toMatch(/repeat/iu);
     }
     expect(purchase.tool.description).toContain('confirmed_not_placed');
-    expect(fillSecret.tool.inputSchema.properties).not.toHaveProperty('password');
+    for (const raw of ['value', 'text', 'code']) expect(fillSecret.tool.inputSchema.properties).not.toHaveProperty(raw);
     for (const value of ['password', 'value', 'text', 'item_handle', 'code'])
       expect(credentialForm.tool.inputSchema.properties).not.toHaveProperty(value);
     for (const outcome of [
@@ -323,9 +333,21 @@ describe('the browser tools', () => {
 
   it('offers saved username and password fills while email codes keep their own tool', () => {
     const validate = new Ajv().compile(fillSecret.tool.inputSchema);
-    const fields = { item_handle: 'login-1', target, submit: { ref: 'e2', generation: 1 } };
-    for (const field of ['username', 'password']) expect(validate({ ...fields, field })).toBe(true);
-    expect(validate({ ...fields, field: 'otp' })).toBe(false);
+    const fields = { item_handle: 'login-1', submit: { ref: 'e3', generation: 1 } };
+    for (const chosen of [
+      { username: target },
+      { password: target },
+      { username: target, password: { ref: 'e2', generation: 1 } },
+    ])
+      expect(validate({ ...fields, ...chosen })).toBe(true);
+    for (const chosen of [
+      {},
+      { password: 'raw-password' },
+      { username: 'raw-username' },
+      { otp: target },
+      { field: 'password', target },
+    ])
+      expect(validate({ ...fields, ...chosen })).toBe(false);
     expect(signInCode.tool.inputSchema.properties).toHaveProperty('from');
   });
 

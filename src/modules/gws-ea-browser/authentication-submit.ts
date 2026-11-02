@@ -46,22 +46,6 @@ export function isolationSelector(context: BrowserContext): Promise<string> | un
   return contextSelectors.get(context);
 }
 
-export interface NativeAuthenticationFacts {
-  origin: string;
-  action: string;
-  method: string;
-  target: string;
-  submit: boolean;
-  control: { tag: string; name: string; type: string; autocomplete: string };
-  fields: { name: string; type: string; autocomplete: string }[];
-}
-export interface NativeAuthenticationBinding {
-  frameId: string;
-  loaderId: string;
-  controlBackendNodeId: number;
-  formBackendNodeId: number;
-  facts: NativeAuthenticationFacts;
-}
 export interface NativeFieldFacts {
   name: string;
   type: string;
@@ -104,22 +88,6 @@ const readControlSource = `
     return prototype && Object.getOwnPropertyDescriptor(prototype, 'form').get.call(control);
   };
   const formProperty = (form, name) => Object.getOwnPropertyDescriptor(HTMLFormElement.prototype, name).get.call(form);
-  const readControl = (control) => {
-    const form = formFor(control);
-    if (!control.isConnected || !(form instanceof HTMLFormElement) || !form.isConnected) return null;
-    const target = formProperty(form, 'target');
-    return {
-      origin: location.origin,
-      action: formProperty(form, 'action'),
-      method: formProperty(form, 'method'),
-      target,
-      submit: !control.matches(':disabled') && control.type === 'submit' && (!target || target === '_self'),
-      control: { tag: control.tagName, name: control.name || '', type: control.type || '', autocomplete: control.getAttribute('autocomplete') || '' },
-      fields: Array.from(formProperty(form, 'elements'), field => ({
-        name: field.name || '', type: field.type || '', autocomplete: field.getAttribute('autocomplete') || ''
-      }))
-    };
-  };
   const readCredentialNode = (node) => {
     const form = formFor(node);
     if (!node.isConnected || (form && !(form instanceof HTMLFormElement && form.isConnected))) return null;
@@ -190,70 +158,9 @@ async function withBoundNodes<T>(
   }
 }
 
-/**
- * The value is a protocol argument, never executable source or a Playwright call-log argument. Node, document,
- * origin and form validation and the native setter run atomically in the isolated world. Ambient focus is
- * irrelevant: another frame cannot redirect this write.
- */
-export async function fillNativeAuthenticationField(
-  frame: Frame,
-  field: NativeAuthenticationBinding,
-  submit: NativeAuthenticationBinding,
-  value: string,
-  assertActive: () => Promise<void>,
-): Promise<boolean> {
-  if (
-    field.frameId !== submit.frameId ||
-    field.loaderId !== submit.loaderId ||
-    field.formBackendNodeId !== submit.formBackendNodeId ||
-    field.facts.origin !== submit.facts.origin
-  )
-    return false;
-  return withBoundNodes(
-    frame,
-    field,
-    [field.controlBackendNodeId, field.formBackendNodeId, submit.controlBackendNodeId],
-    false,
-    async (session, objects) => {
-      try {
-        await assertActive();
-        const result = await session.send('Runtime.callFunctionOn', {
-          objectId: objects[0],
-          returnByValue: true,
-          arguments: [
-            { objectId: objects[1] },
-            { objectId: objects[2] },
-            { value: field.facts },
-            { value: submit.facts },
-            { value },
-          ],
-          functionDeclaration: `function (form, submit, expectedField, expectedSubmit, value) {
-        ${readControlSource}
-        if (location.protocol !== 'https:' || location.origin !== expectedField.origin ||
-            !(this instanceof HTMLInputElement) || this.ownerDocument !== document ||
-            form.ownerDocument !== document || submit.ownerDocument !== document ||
-            !this.isConnected || this.matches(':disabled') || this.readOnly ||
-            formFor(this) !== form || formFor(submit) !== form ||
-            JSON.stringify(readControl(this)) !== JSON.stringify(expectedField) ||
-            JSON.stringify(readControl(submit)) !== JSON.stringify(expectedSubmit)) return false;
-        const descriptor = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value');
-        descriptor.set.call(this, value);
-        return descriptor.get.call(this) === value;
-      }`,
-        });
-        return !result.exceptionDetails && result.result.value === true;
-        // eslint-disable-next-line no-catch-all/no-catch-all -- Never expose renderer exceptions, which may contain a sign-in value.
-      } catch (_error) {
-        return false;
-      }
-    },
-  );
-}
-
 export type CredentialFillResult = 'filled' | 'not_inserted' | 'changed';
 export type CredentialActivationResult = 'activated' | 'disabled' | 'changed' | 'uncertain';
 
-/** The credential group the browser chose; `fields` are in the order of the values filled into them. */
 export interface NativeCredentialGroup {
   readonly fields: readonly NativeCredentialBinding[];
   readonly control: NativeCredentialBinding;
@@ -394,7 +301,10 @@ export async function activateNativeCredentialControl(
           if (this.matches(':disabled') || this.getAttribute('aria-disabled') === 'true') return 'disabled';
           // A native GET submission would carry the values in its address; one no page handler took over is cancelled.
           const address = (event) => {
-            if (form && event.target === form && formProperty(form, 'method') === 'get') event.preventDefault();
+            if (!form || event.target !== form) return;
+            const method = event.submitter?.hasAttribute('formmethod')
+              ? event.submitter.formMethod : formProperty(form, 'method');
+            if (method === 'get') event.preventDefault();
           };
           addEventListener('submit', address);
           try {
@@ -491,20 +401,8 @@ function chosenFrame(tree: NativeFrameTree, frame: Frame, owner: Frame): NativeF
   return candidates.length === 1 ? candidates[0] : undefined;
 }
 
-interface InspectedNode<Facts> {
-  frameId: string;
-  loaderId: string;
-  controlBackendNodeId: number;
-  formBackendNodeId: number | null;
-  facts: Facts;
-}
-
 /** Transfer exact DOM identity between public APIs without mutable DOM markers. */
-async function inspectNativeNode<Facts>(
-  element: ElementHandle,
-  frame: Frame,
-  reader: 'readControl' | 'readCredentialNode',
-): Promise<InspectedNode<Facts> | undefined> {
+async function inspectNativeNode(element: ElementHandle, frame: Frame): Promise<NativeCredentialBinding | undefined> {
   const registered = contextSelectors.get(frame.page().context());
   if (!registered) return undefined;
   const selectorName = await registered;
@@ -551,10 +449,10 @@ async function inspectNativeNode<Facts>(
       expression: `(() => {
         ${readControlSource}
         const slot = globalThis[${JSON.stringify(eventName)}];
-        return slot.count === 1 && slot.control ? ${reader}(slot.control) : null;
+        return slot.count === 1 && slot.control ? readCredentialNode(slot.control) : null;
       })()`,
     });
-    const facts = factsResult.result.value as Facts | null | undefined;
+    const facts = factsResult.result.value as NativeCredentialFacts | null | undefined;
     if (factsResult.exceptionDetails || !facts) return undefined;
     const ids: Array<number | null> = [];
     for (const name of ['control', 'form'] as const) {
@@ -564,7 +462,7 @@ async function inspectNativeNode<Facts>(
         expression: `globalThis[${JSON.stringify(eventName)}].${name}`,
       });
       // Only a credential node may stand outside any form.
-      if (name === 'form' && reader === 'readCredentialNode' && captured.result.subtype === 'null') {
+      if (name === 'form' && captured.result.subtype === 'null') {
         ids.push(null);
         continue;
       }
@@ -600,55 +498,10 @@ async function inspectNativeNode<Facts>(
   }
 }
 
-export async function inspectNativeAuthenticationControl(
-  element: ElementHandle,
-  frame: Frame,
-): Promise<NativeAuthenticationBinding | undefined> {
-  const inspected = await inspectNativeNode<NativeAuthenticationFacts>(element, frame, 'readControl');
-  if (!inspected || inspected.formBackendNodeId === null) return undefined;
-  return { ...inspected, formBackendNodeId: inspected.formBackendNodeId };
-}
-
 /** The same exact-node handoff for a credential field or control, which may stand outside any form. */
 export function inspectNativeCredentialControl(
   element: ElementHandle,
   frame: Frame,
 ): Promise<NativeCredentialBinding | undefined> {
-  return inspectNativeNode<NativeCredentialFacts>(element, frame, 'readCredentialNode');
-}
-
-/** Resolve native identities into an isolated world; revalidate and submit in one synchronous call. */
-export async function submitNativeAuthenticationForm(
-  frame: Frame,
-  binding: NativeAuthenticationBinding,
-  assertActive?: () => Promise<void>,
-): Promise<boolean> {
-  return withBoundNodes(
-    frame,
-    binding,
-    [binding.controlBackendNodeId, binding.formBackendNodeId],
-    false,
-    async (session, [controlObjectId, formObjectId]) => {
-      await assertActive?.();
-      try {
-        const result = await session.send('Runtime.callFunctionOn', {
-          objectId: controlObjectId,
-          returnByValue: true,
-          arguments: [{ objectId: formObjectId }, { value: binding.facts }],
-          functionDeclaration: `function (form, expected) {
-          ${readControlSource}
-          const facts = readControl(this);
-          if (!facts || !facts.submit || formFor(this) !== form ||
-              JSON.stringify(facts) !== JSON.stringify(expected)) return false;
-          HTMLFormElement.prototype.submit.call(form);
-          return true;
-        }`,
-        });
-        return !result.exceptionDetails && result.result.value === true;
-        // eslint-disable-next-line no-catch-all/no-catch-all -- Native submission errors are a refusal, never agent-visible page prose.
-      } catch (_error) {
-        return false;
-      }
-    },
-  );
+  return inspectNativeNode(element, frame);
 }

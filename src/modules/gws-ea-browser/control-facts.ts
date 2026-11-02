@@ -64,7 +64,6 @@ export interface ControlFacts {
   inputName?: string;
   formFieldNames?: readonly string[];
   secretEntry?: boolean;
-  authenticationForm?: boolean;
   role: string;
   tag: string;
   type: string;
@@ -689,11 +688,6 @@ const librarySource = String.raw`(sources) => {
       secretEntry: secretField(node),
       formMethod: form ? (own('formmethod') ? node.formMethod : formProperty(form, 'method')) : undefined,
       formAction: form ? (own('formaction') ? node.formAction : formProperty(form, 'action')) : undefined,
-      authenticationForm: Boolean(form && /^post$/iu.test(formProperty(form, 'method')) &&
-        /^https:\/\/[^/]+\/(?:login|signin|sign-in|auth|session|sessions|account\/login)(?:[/?#]|$)/iu.test(formProperty(form, 'action')) &&
-        fields.some((field) => field instanceof HTMLInputElement && (field.type === 'password' || field.type === 'email' ||
-          /(?:one-time-code|username)/iu.test(field.getAttribute('autocomplete') || ''))) &&
-        !fields.some((field) => /(?:^|\s)cc-/iu.test(field.getAttribute('autocomplete') || ''))),
       role: node.getAttribute('role') || '',
       tag: node.tagName.toLowerCase(),
       type: submitter || node instanceof HTMLSelectElement || node instanceof HTMLTextAreaElement ? node.type : node.getAttribute('type') || '',
@@ -1084,7 +1078,6 @@ function parseControl(value: unknown): Omit<ControlFacts, 'transaction'> | undef
     visibleLabel: text(facts.visibleLabel) ?? '',
     ...(formMethod !== undefined ? { formMethod } : {}),
     ...(formAction !== undefined ? { formAction } : {}),
-    authenticationForm: flag(facts.authenticationForm),
     role,
     tag,
     type,

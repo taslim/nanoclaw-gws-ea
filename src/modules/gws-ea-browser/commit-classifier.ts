@@ -6,11 +6,6 @@ import { SiteLeaseStore } from './leases.js';
 import { documentGate, type PausedDocument } from './document-gate.js';
 import { coverPageTargets, ensurePageTargets, onUncoveredPageTarget, pageTargetsReady } from './page-targets.js';
 import { browserOperationId, type BrowserOperationContext } from './actions.js';
-import {
-  inspectAuthenticationControl,
-  submitAuthenticationForm,
-  type AuthenticationFormSignature,
-} from './authentication-signatures.js';
 import { paymentProcessorHost, readPageControlFacts, type ControlFacts } from './control-facts.js';
 import {
   classifyControlFacts,
@@ -47,7 +42,6 @@ async function activationDispatch(
   classification: ActionClass;
   facts: ControlFacts;
   flow?: ReviewedMerchantFlow;
-  authentication?: AuthenticationFormSignature;
 }> {
   const facts = await readPageControlFacts(page, element);
   const generic = classifyControlFacts(facts, kind);
@@ -56,10 +50,6 @@ async function activationDispatch(
   if (generic !== 'ordinary') return { classification: generic, facts, flow };
   const reviewed = flow && (await flow.classifyControl(page, element, facts));
   if (reviewed) return { classification: reviewed, facts, flow };
-  if (!facts.transaction && facts.formMethod?.toLowerCase() === 'post' && facts.formAction) {
-    const authentication = await inspectAuthenticationControl(element);
-    if (authentication) return { classification: 'ordinary', facts, authentication };
-  }
   return { classification: 'ordinary', facts };
 }
 
@@ -221,22 +211,6 @@ export async function activateControl(
     recordRefusal('action', undefined, classification);
     throw new BrowserActivationError(classification);
   }
-  if (dispatch.authentication) {
-    const authentication = dispatch.authentication;
-    await consentBeforeSubmission(page, element, intent);
-    const guard = await ensureBrowserNavigationGuard(page);
-    // The open rule decides where the submission lands.
-    await guard.runWithPolicy({}, async () => {
-      const arrived = page
-        .waitForEvent('framenavigated', { predicate: (frame) => frame === authentication.frame, timeout: 2_000 })
-        .catch(() => undefined);
-      // The form changed between its reading and the submit, so nothing was sent: the control is not actionable.
-      if (!(await submitAuthenticationForm(authentication, intent.assertActive)))
-        throw new Error('The sign-in form changed before its submit');
-      await arrived;
-    });
-    return { ordinaryPress: true };
-  }
   const pressed = pressesControl(facts, intent.kind);
   if (submitsForm(facts, intent.kind) && facts.region?.secretFields === true)
     throw new BrowserActivationError('secret_field');
@@ -286,9 +260,14 @@ export interface BrowserNavigationGuard {
    * out-of-process frame's non-GET fetch, XHR and beacon requests to payment processors and purchase routes are
    * refused; outside it nothing is paused. The caller goes on once every navigation the action started has
    * committed and, unless the page's own document was replaced, its requests have gone quiet or the settle has
-   * ended; the rest of the window runs on in the background.
+   * ended; the rest of the window runs on in the background. `waitForRequests` lets credential callers wait
+   * for pending requests past that short settle, still bounded by the action deadline.
    */
-  duringAction<T>(budgetMs: number, action: () => Promise<T>): Promise<T>;
+  duringAction<T>(
+    budgetMs: number,
+    action: () => Promise<T>,
+    options?: { readonly waitForRequests?: boolean },
+  ): Promise<T>;
   /** Resolves once every ordinary action's script-request window on the page has closed. */
   actionsSettled(): Promise<void>;
 }
@@ -604,7 +583,7 @@ async function installNavigationGuard(page: Page): Promise<BrowserNavigationGuar
         if (outermost) ++generation;
       }
     },
-    async duringAction(budgetMs, action) {
+    async duringAction(budgetMs, action, options) {
       const deadline = Date.now() + budgetMs;
       await coverScripts();
       // The navigations the action starts, until each commits or ends.
@@ -652,17 +631,20 @@ async function installNavigationGuard(page: Page): Promise<BrowserNavigationGuar
         throw error;
       }
       const done = Date.now();
+      // Credential cleanup waits for a handler's pending token requests, bounded by this action's deadline.
+      const pending = (): boolean => options?.waitForRequests === true && !replaced && requests.size > 0;
       // The caller goes on once every navigation the action started has committed or ended, and the page's
       // document was replaced or the action's requests have stayed quiet for a moment, at most until the settle ends.
       const busy = (): boolean =>
         !replaced &&
-        Date.now() < done + ACTION_SETTLE_MS &&
-        (requests.size > 0 || Date.now() < Math.max(done, lastEnded) + NAVIGATION_START_MS);
+        (pending() ||
+          (Date.now() < done + ACTION_SETTLE_MS &&
+            (requests.size > 0 || Date.now() < Math.max(done, lastEnded) + NAVIGATION_START_MS)));
       await waitWhile(() => navigations.size > 0 || busy(), deadline);
       // The window itself stays open through the settle and until each navigation it saw commits or ends; an
       // action that starts meanwhile keeps the requests paused without a gap.
       const rest: Promise<void> = waitWhile(
-        () => navigations.size > 0 || Date.now() < done + ACTION_SETTLE_MS,
+        () => navigations.size > 0 || pending() || Date.now() < done + ACTION_SETTLE_MS,
         deadline,
       )
         .then(close)
