@@ -71,6 +71,10 @@ export interface ScenarioComposition {
   readonly context?: string;
   readonly handoff?: { readonly id: string; readonly timestamp: string; readonly content: string };
   readonly weekViewFile?: string;
+  /** Only date-fixed scenarios give the preview producer and native hook this synthetic time. */
+  readonly weekViewReferenceAt?: string;
+  /** The calling session's real inbox mount, including native calendar exports. */
+  readonly inboxDirectory: string;
   /** The model, effort and speed the materialized container.json gives the runner. */
   readonly inference: RuntimeInferenceInput;
   readonly db: string;

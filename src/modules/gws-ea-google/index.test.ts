@@ -407,12 +407,14 @@ describe("the Google services' skills", () => {
     expect(EXPOSED_GOOGLE_SKILLS).toEqual(['gcalendar', 'gmail', 'gpeople', 'gworkspace']);
     for (const skill of EXPOSED_GOOGLE_SKILLS) {
       const text = fs.readFileSync(path.join(SKILLS_DIR, skill, 'SKILL.md'), 'utf8');
-      expect(text, skill).toMatch(
-        new RegExp(
-          `^---\\nname: ${skill}\\ndescription: .+\\nallowed-tools: Bash\\(gog:\\*\\)(?: mcp__nanoclaw__[a-z_]+)*\\n---\\n`,
-          'u',
-        ),
-      );
+      const header = new RegExp(
+        `^---\\nname: ${skill}\\ndescription: .+\\nallowed-tools: ([^\\n]+)\\n---\\n`,
+        'u',
+      ).exec(text);
+      expect(header, skill).not.toBeNull();
+      const tools = (header?.[1] ?? '').split(' ');
+      expect(tools, skill).toContain('Bash(gog:*)');
+      for (const tool of tools) expect(tool).toMatch(/^(?:Bash\(gog:\*\)|Read|Grep|mcp__nanoclaw__[a-z_]+)$/u);
     }
   });
 

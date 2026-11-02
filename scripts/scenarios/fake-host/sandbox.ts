@@ -7,7 +7,11 @@ export function shellQuote(text: string): string {
 }
 
 /** A real shell with read/write/network access restricted to this invented host. */
-export function prepareSyntheticShell(directory: string, tree: string): { profile: string; bin: string; bun: string } {
+export function prepareSyntheticShell(
+  directory: string,
+  tree: string,
+  inboxDirectory: string,
+): { profile: string; bin: string; bun: string } {
   if (process.platform !== 'darwin' || !fs.existsSync('/usr/bin/sandbox-exec'))
     throw new Error(
       'This initial hand-run host requires macOS sandbox-exec. No unsandboxed shell fallback is allowed.',
@@ -35,6 +39,7 @@ export function prepareSyntheticShell(directory: string, tree: string): { profil
     '/opt/homebrew',
     '/dev',
     agent,
+    inboxDirectory,
     bin,
     path.join(tree, 'scripts/scenarios'),
     path.join(tree, 'container/skills'),
@@ -69,13 +74,14 @@ export function prepareSyntheticShell(directory: string, tree: string): { profil
   );
   return { profile, bin, bun };
 }
-export function syntheticShellCommand(profile: string, command: string, tree: string): string {
+export function syntheticShellCommand(profile: string, command: string, tree: string, inboxDirectory: string): string {
   const directory = path.dirname(profile);
   const agent = path.join(directory, 'agent');
   const bin = path.join(directory, 'bin');
   fs.mkdirSync(path.join(agent, '.tmp'), { recursive: true });
   const relocated = command
     .replaceAll('/workspace/agent', agent)
+    .replaceAll('/workspace/inbox', inboxDirectory)
     .replaceAll('/app/skills', path.join(tree, 'container/skills'));
   return `/usr/bin/env -i PATH=${shellQuote(`${bin}:/usr/bin:/bin:/opt/homebrew/bin`)} HOME=${shellQuote(agent)} TMPDIR=${shellQuote(path.join(agent, '.tmp'))} TZ=America/Los_Angeles /usr/bin/sandbox-exec -f ${shellQuote(profile)} /bin/bash --noprofile --norc -c ${shellQuote(relocated)}`;
 }

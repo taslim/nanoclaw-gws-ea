@@ -309,6 +309,22 @@ describe('the pinned SDK offers only granted built-in tools', () => {
     expect(await wireTools(await optionsFor(ALL))).toEqual(today);
     expect(today).toContain('Bash');
   }, 60_000);
+
+  it('offers canonical main its live retrieval tools and lets their calls through the permission hook', async () => {
+    const keys = [...ALL, 'gws-ea-main-context'];
+    const options = await optionsFor(keys);
+    const offered = await wireTools(options);
+    const hook = await hookFor(keys);
+
+    expect(options.permissionMode).toBe('bypassPermissions');
+    for (const tool of ['WebSearch', 'WebFetch', 'Bash', 'Read', 'Glob', 'Grep', 'Agent', 'Skill']) {
+      expect(offered, tool).toContain(tool);
+      expect(await hook(call(tool)), tool).toEqual({ continue: true });
+    }
+    for (const tool of ['NotebookEdit', 'Workflow', 'ListAgents', 'TeamCreate', 'TeamDelete']) {
+      expect(offered, tool).not.toContain(tool);
+    }
+  }, 60_000);
 });
 
 describe('the skills the pinned SDK lists', () => {

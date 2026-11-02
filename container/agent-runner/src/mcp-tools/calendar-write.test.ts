@@ -7,7 +7,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'bun:test';
 
 import { getUndeliveredMessages } from '../db/messages-out.js';
 import { closeSessionDb, getInboundDb, initTestSessionDb } from '../mailbox/sqlite/connection.js';
-import { CALENDAR_REQUEST_TIMEOUT_MS, changeGuests, createEvent, respondToEvent } from './calendar-write.js';
+import { CALENDAR_REQUEST_TIMEOUT_MS, changeGuests, createEvent, days, respondToEvent } from './calendar-write.js';
 import type { McpToolDefinition } from './types.js';
 
 beforeEach(() => initTestSessionDb());
@@ -168,6 +168,15 @@ describe("main's calendar writes", () => {
 });
 
 describe('the host calendar surface', () => {
+  it('rejects unsupported date arguments instead of silently reading the default week', async () => {
+    const result = await days.handler({ from: '2026-11-08', to: '2026-11-10' }, { signal: AbortSignal.timeout(50) });
+    expect(result.isError).toBe(true);
+    expect(text(result)).toContain('Unknown argument "from"');
+    expect(text(result)).toContain('start');
+    expect(text(result)).toContain('end');
+    expect(getUndeliveredMessages()).toHaveLength(0);
+  });
+
   it.each([
     ['days', { start: '2026-10-05', end: '2026-10-12', export: true }],
     ['check', { start: '2026-10-09T14:30:00-07:00', end: '2026-10-09T15:00:00-07:00' }],

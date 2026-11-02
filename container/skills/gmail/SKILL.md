@@ -17,6 +17,8 @@ gog reaches Google through the gateway, signed in as you, so it needs no account
 
 Queries use Gmail's search syntax, such as `from:sam@example.com`, `subject:offsite`, `newer_than:7d`, or `after:2026/10/01 before:2026/10/08`.
 
+A search lists matches, not the full messages. Read the matching thread or message before answering what it says. Check the relevant dates and follow result pages while unseen matches could change the answer. Stop when the relevant source establishes it: a complete, identified thread can settle its latest reply without searching every other match. A query with no matches establishes only that query's result: try the sender, subject, address or a broader date range before concluding the mail is absent or asking the principal to find it.
+
 ## Read mail
 
 - A whole thread: `gog gmail thread get <threadId> --sanitize-content`. Each of its `messages` has `headers` (`from`, `to`, `cc`, `subject`, `date`) and a plain-text `body`.

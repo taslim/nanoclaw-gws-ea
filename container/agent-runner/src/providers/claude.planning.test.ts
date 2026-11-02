@@ -122,6 +122,7 @@ it('sets the fixed planning model, effort, background execution and playbook pre
       'Write',
       'Edit',
       'WebSearch',
+      'WebFetch',
       'mcp__nanoclaw__days',
       'mcp__nanoclaw__check',
     ]);
@@ -133,6 +134,12 @@ it('sets the fixed planning model, effort, background execution and playbook pre
 });
 
 describe.each(['look-back', 'look-ahead'])('%s enforced tool limits', (role) => {
+  it('admits public-page retrieval for the preloaded travel and errands skills', async () => {
+    const { pre } = await hooks(role);
+    expect(
+      await pre(input('WebFetch', role, { url: 'https://example.test/hours', prompt: 'Read the opening hours.' })),
+    ).toEqual({ continue: true });
+  });
   it.each([
     'create_event',
     'change_event',
@@ -148,7 +155,7 @@ describe.each(['look-back', 'look-ahead'])('%s enforced tool limits', (role) => 
     const { pre } = await hooks(role);
     expect(await pre(input(`mcp__nanoclaw__${tool}`, role))).toMatchObject(denied);
   });
-  it.each(['WebFetch', 'Agent', 'Task', 'NotebookEdit', 'mcp__custom__days'])('refuses %s', async (tool) => {
+  it.each(['Agent', 'Task', 'NotebookEdit', 'mcp__custom__days'])('refuses %s', async (tool) => {
     const { pre } = await hooks(role);
     expect(await pre(input(tool, role))).toMatchObject(denied);
   });

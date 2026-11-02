@@ -156,6 +156,46 @@ export const cases: readonly ScenarioCase[] = [
     ['Asking Morgan for an address already available.'],
   ),
   main(
+    'return-flight-live',
+    'live-verification',
+    'Will I be back in San Francisco for my dentist appointment on Monday November 9?',
+    [
+      'The current personal calendar has a return flight from Austin on Sunday November 8, landing at SFO at 20:20 Pacific.',
+      'The dentist appointment is Monday November 9 at 16:30 Pacific in San Francisco.',
+      'The return day has 25 earlier detailed events; an unfiltered read needs the complete calendar export.',
+      'The default coming-days preview does not cover the return day. A hotel stay ends November 9, but does not establish the flight date.',
+    ],
+    [
+      'Read the relevant calendar dates live and answer that Morgan lands Sunday evening, in time for the Monday dentist appointment.',
+      'When the read returns a complete file, read or search it; filtering to the flight and dentist is also valid.',
+    ],
+    [
+      'Asking Morgan to supply a return flight that is already in the calendar.',
+      'Inferring a Monday return from the hotel stay.',
+      'Treating the default date range or an unread export as proof that the flight is absent.',
+      'Moving either event without being asked.',
+    ],
+  ),
+  main(
+    'merchant-hours-live',
+    'live-verification',
+    'Can I collect my prescription after work on Friday November 6, or would Saturday be better?',
+    [
+      'The pharmacy pickup confirmation in the mailbox names the Geary branch at 800 Fiction Lane, San Francisco.',
+      'The pharmacy counter closes at 19:00 Friday and 18:00 Saturday, with a daily 13:30–14:00 lunch closure. The general store stays open later.',
+      'Friday work ends at 18:00; Morgan is in San Francisco and the pharmacy is ten minutes away.',
+      'The order is prepaid and ready through Saturday November 7 at 18:00.',
+    ],
+    [
+      'Read the current pickup confirmation and recommend a feasible after-work collection, with the pharmacy counter hours.',
+    ],
+    [
+      'Asking Morgan to find or confirm hours already in the mailbox.',
+      'Guessing hours from another branch or the general store.',
+      'Scheduling a pickup during working hours or making an unrequested calendar change.',
+    ],
+  ),
+  main(
     'location-field',
     'R33',
     'Put lunch with Remy at Harbor House on Friday November 6 at noon.',

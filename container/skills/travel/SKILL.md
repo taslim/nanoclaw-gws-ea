@@ -1,7 +1,7 @@
 ---
 name: travel
 description: Plan around a trip, interpret a calendar flight or forwarded confirmation, record a dated stay, or repair whereabouts after the principal corrects a travel assumption. Use when place, local time, airport time or a trip source affects a decision.
-allowed-tools: Read Bash(ncl:*) mcp__nanoclaw__days mcp__nanoclaw__check mcp__nanoclaw__create_event mcp__nanoclaw__change_event mcp__nanoclaw__cancel_event mcp__nanoclaw__send_message
+allowed-tools: Read WebSearch WebFetch Bash(ncl:*) mcp__nanoclaw__days mcp__nanoclaw__check mcp__nanoclaw__create_event mcp__nanoclaw__change_event mcp__nanoclaw__cancel_event mcp__nanoclaw__send_message
 ---
 
 # Travel

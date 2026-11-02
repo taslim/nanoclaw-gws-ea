@@ -61,7 +61,7 @@ export interface FixtureState {
   };
 }
 export function initialFixture(scenario: ScenarioCase): FixtureState {
-  const referenceAt = new Date().toISOString();
+  const referenceAt = scenario.id === 'return-flight-live' ? '2026-10-31T19:00:00.000Z' : new Date().toISOString();
   return { scenario, referenceAt, attempt: 1, effects: [], outbound: [], ...concreteFixture(scenario, referenceAt) };
 }
 export function syntheticMail(id: string, subject: string, from: string, to: string, text: string): SyntheticMail {

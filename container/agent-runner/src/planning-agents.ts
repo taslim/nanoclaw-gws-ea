@@ -18,6 +18,7 @@ const TOOLS = [
   'Write',
   'Edit',
   'WebSearch',
+  'WebFetch',
   'mcp__nanoclaw__days',
   'mcp__nanoclaw__check',
 ];

@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from 'bun:test';
 import fs from 'node:fs';
+import { createHash } from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -77,6 +78,16 @@ describe('the native week hooks', () => {
     expect(startup).not.toContain('Finish the board deck');
     expect(run('SessionStart', 'resume').stdout).toBe('');
   });
+  it('refreshes a context recorded under the old delivery bookkeeping', () => {
+    fs.writeFileSync(file, JSON.stringify(view()));
+    run('SessionStart', 'startup');
+    const state = path.join(root, 'state');
+    const recorded = fs.readdirSync(state)[0];
+    if (!recorded) throw new Error('The startup should record its delivered view');
+    const oldName = createHash('sha256').update(JSON.stringify('provider-a')).digest('hex');
+    fs.renameSync(path.join(state, recorded), path.join(state, oldName));
+    expect(run('SessionStart', 'resume').stdout).toContain('Eight coming days');
+  });
   it('prints only Manual sections edited since composition, again after a compaction, and none twice in a turn', () => {
     const edited = 'Priorities (Oct 5)\nLook back edited these priorities';
     fs.writeFileSync(file, JSON.stringify(view('first', undefined, [PROFILE, edited])));
@@ -142,6 +153,41 @@ describe('the native week hooks', () => {
     const printed = text.split('\n').filter((line) => /^2026-10-05:/u.test(line)).length;
     expect(text).toEndWith(`+${31 - printed} more\n`);
   });
+  it('delivers omitted changes on subsequent prompts instead of marking the whole burst delivered', () => {
+    fs.writeFileSync(file, JSON.stringify(view()));
+    run('SessionStart', 'startup');
+    const entries = Array.from({ length: 30 }, (_, n) => entry(`event-${n}`, `Changed event ${n}: ${'x'.repeat(250)}`));
+    fs.writeFileSync(file, JSON.stringify(view('burst', entries)));
+    const outputs = Array.from({ length: 4 }, () => run('UserPromptSubmit').stdout).join('\n');
+    for (const changed of entries) expect(outputs.split(changed.text)).toHaveLength(2);
+    expect(run('UserPromptSubmit').stdout).not.toContain('Changed event');
+    expect(run('SessionStart', 'resume').stdout).toBe('');
+  });
+  it('uses the latest value for a pending update and never reports an unseen removal', () => {
+    fs.writeFileSync(file, JSON.stringify(view()));
+    run('SessionStart', 'startup');
+    const entries = Array.from({ length: 30 }, (_, n) =>
+      entry(`event-${n}`, `Original event ${n}: ${'x'.repeat(250)}`),
+    );
+    fs.writeFileSync(file, JSON.stringify(view('burst', entries)));
+    expect(run('UserPromptSubmit').stdout).not.toContain('Original event 29:');
+    fs.writeFileSync(
+      file,
+      JSON.stringify(view('newer', [...entries.slice(0, 28), entry('event-29', 'Flight now lands Sunday evening')])),
+    );
+    const outputs = Array.from({ length: 3 }, () => run('UserPromptSubmit').stdout).join('\n');
+    expect(outputs).toContain('Flight now lands Sunday evening');
+    expect(outputs).not.toContain('Original event 29:');
+    expect(outputs).not.toContain('Original event 28:');
+  });
+  it('delivers an entry larger than the diff budget without splitting its untrusted framing', () => {
+    fs.writeFileSync(file, JSON.stringify(view()));
+    run('SessionStart', 'startup');
+    const text = `<<<EXTERNAL_UNTRUSTED_CONTENT id="aaaa">>>\n${'x'.repeat(4_500)}\n<<<END_EXTERNAL_UNTRUSTED_CONTENT id="aaaa">>>`;
+    fs.writeFileSync(file, JSON.stringify(view('large', [entry('large', text)])));
+    expect(run('UserPromptSubmit').stdout).toContain(text);
+    expect(run('UserPromptSubmit').stdout).not.toContain(text);
+  });
   it('says an entry that left the view is no longer shown, since a busy day can push it past the budget', () => {
     fs.writeFileSync(file, JSON.stringify(view()));
     run('SessionStart', 'startup');
@@ -170,6 +216,7 @@ describe('the native week hooks', () => {
     expect(answer.stdout).not.toContain('Morgan Ellery');
     expect(answer.stdout.length).toBeLessThan(12_200);
     expect(run('UserPromptSubmit').stdout).not.toContain('New priorities:');
+    expect(run('SessionStart', 'resume').stdout).not.toContain('New priorities:');
     expect(run('SessionStart', 'resume').stdout).toBe('');
   });
   it.each(['missing', 'corrupt', 'stale'])('fails open in one line for a %s view', (kind) => {

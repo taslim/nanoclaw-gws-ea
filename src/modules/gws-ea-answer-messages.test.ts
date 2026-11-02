@@ -28,9 +28,13 @@ type Review =
  * `src/modules`, its other fields sorted, a spread written `...name`.
  */
 const REVIEWED: Readonly<Record<string, Review>> = {
-  'gws-ea-meetings/days.ts days: count, path': {
+  'gws-ea-meetings/days.ts daysAnswer: complete, count, path': {
     kind: 'rendered',
-    reason: 'the export message gives its session inbox path and folded event count',
+    reason: 'the export message states the count, complete file path and need to read it before answering',
+  },
+  'gws-ea-meetings/days.ts daysAnswer: complete, count': {
+    kind: 'rendered',
+    reason: 'the inline message states its count and complete coverage of the reported scope',
   },
   'gws-ea-meetings/principal-events.ts finishWrite: ...base': {
     kind: 'host-only',

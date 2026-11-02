@@ -16,7 +16,7 @@ import { prepareSyntheticShell } from './fake-host/sandbox.js';
 import type { MessageInRow } from '../../container/agent-runner/src/db/messages-in.js';
 import type { ProviderEvent } from '../../container/agent-runner/src/providers/types.js';
 import type { ScenarioComposition } from './types.js';
-import { scenarioRuntime } from './runtime.js';
+import { scenarioRuntime, scenarioWeekViewCommand } from './runtime.js';
 import { nativeScenarioHooks } from './fake-host/native-hooks.js';
 
 const JUDGE_MODEL = 'claude-opus-5-5';
@@ -114,7 +114,7 @@ let messages: MessageInRow[] = [
     on_wake: 0,
   },
 ];
-const shell = prepareSyntheticShell(directory, tree);
+const shell = prepareSyntheticShell(directory, tree, composition.inboxDirectory);
 if (kind === 'agent' && composition.close) {
   const task = composition.close.task;
   messages = [
@@ -244,7 +244,7 @@ const options: Options = {
                         hooks: [
                           {
                             type: 'command',
-                            command: `bun '${path.join(tree, 'container/agent-runner/src/week-view/hook.ts')}' '${composition.weekViewFile}' '${path.join(directory, 'week-delivered')}'`,
+                            command: scenarioWeekViewCommand(directory, tree, composition),
                           },
                         ],
                       },

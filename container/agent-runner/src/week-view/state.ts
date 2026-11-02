@@ -22,7 +22,7 @@ export interface DeliveredView {
   readonly manual: readonly string[];
 }
 export const fingerprint = (value: unknown): string => createHash('sha256').update(JSON.stringify(value)).digest('hex');
-const file = (id: string, dir: string) => path.join(dir, fingerprint(id));
+const file = (id: string, dir: string) => path.join(dir, `v2-${fingerprint(id)}`);
 export function readDelivered(id: string, dir = WEEK_VIEW_STATE_DIR): DeliveredView | undefined {
   try {
     const value = readWeekViewFile(file(id, dir));

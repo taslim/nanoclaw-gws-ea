@@ -1,7 +1,7 @@
 ---
 name: errands
 description: Fit errands, pickups and appointments into a day using their real places, merchant hours, task lengths and routes. Use when several stops compete for time, an errand has a closing time, or a dinner or appointment adds travel across town.
-allowed-tools: Read Bash(ncl:*) mcp__nanoclaw__days mcp__nanoclaw__check mcp__nanoclaw__create_event mcp__nanoclaw__change_event mcp__nanoclaw__cancel_event mcp__nanoclaw__send_message
+allowed-tools: Read WebSearch WebFetch Bash(ncl:*) mcp__nanoclaw__days mcp__nanoclaw__check mcp__nanoclaw__create_event mcp__nanoclaw__change_event mcp__nanoclaw__cancel_event mcp__nanoclaw__send_message
 ---
 
 # Errands
@@ -11,6 +11,8 @@ allowed-tools: Read Bash(ncl:*) mcp__nanoclaw__days mcp__nanoclaw__check mcp__na
 The principal can leave, finish the errand while the right place is open, and reach the next commitment. Several stops form a sensible route. The plan accounts for the work at each stop as well as the journey, so a pickup never consumes an hour that looked free on the calendar.
 
 Start from where the principal will actually be, the deadline or merchant's closing time, and the next fixed commitment. Check hours on the merchant's own page for that location and date. A search snippet, another branch's hours or the usual weekly pattern can be wrong when it matters.
+
+An inconclusive search is a reason to refine it with the branch's address or identifier, then fetch the matching page. Use the browser when that page needs interaction. Exhaust the useful reading routes before asking the principal to check hours you can find yourself.
 
 ## Method and why
 
