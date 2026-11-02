@@ -17,12 +17,9 @@ vi.mock('../../config.js', async (original) => ({
   DATA_DIR: root,
 }));
 vi.mock('../../request-wake.js', () => ({ requestWake: vi.fn(async () => true) }));
-vi.mock('./commit-classifier.js', async (original) => ({
-  ...(await original<typeof import('./commit-classifier.js')>()),
-  activateControl: vi.fn(async () => undefined),
-}));
 vi.mock('./fill.js', async (original) => ({
   ...(await original<typeof import('./fill.js')>()),
+  activateBoundBrowserSignIn: vi.fn(async () => undefined),
   bindBrowserSecretFields: vi.fn(),
   fillBoundBrowserSecrets: vi.fn(),
   discoverAuthenticationCodeField: vi.fn(),
@@ -188,7 +185,7 @@ function fixture(username = false, current = '') {
       autocomplete: username ? 'username' : 'one-time-code',
     }),
   } as unknown as ElementHandle;
-  const frame = { url: () => url, evaluate: async () => [] } as unknown as Frame;
+  const frame = { isDetached: () => false, url: () => url, evaluate: async () => [] } as unknown as Frame;
   const target: PinnedBrowserRef = { ref: 'e1', generation: 1, element: field, frame };
   const control = { ownerFrame: async () => frame, dispose: vi.fn(async () => undefined) } as unknown as ElementHandle;
   const submit: PinnedBrowserRef = { ref: 'e2', generation: 1, element: control, frame };
@@ -208,6 +205,7 @@ function fixture(username = false, current = '') {
   };
   // The page's own sessions: the guard pauses its other requests only while a sign-in scope strips Referer.
   const cdp = {
+    once: () => undefined,
     on: vi.fn((name: string, handler: (event: unknown) => void) => cdpEvents.set(name, handler)),
     detach: async () => undefined,
     send: vi.fn(async (method: string, params?: Record<string, unknown>) => {

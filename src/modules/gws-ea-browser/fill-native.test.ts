@@ -20,6 +20,9 @@ import { executeBrowserBatch } from './executor.js';
 import { bindBrowserSecretFields, executeFillSecret, fillBoundBrowserSecrets } from './fill.js';
 import './merchant-signatures.js';
 import { browserSiteLeasesMigration } from './migration.js';
+import { browserSignInMigration } from './sign-in-migration.js';
+import { recoverBrowserSignInMail, executeSignInCode } from './sign-in-mail.js';
+import { getSignInClaim } from '../gws-ea-inbox/claims.js';
 import type { BrowserSecretField } from './authentication-signatures.js';
 import { observePage, type BrowserRef, type PinnedBrowserRef } from './observe.js';
 import { browserPaths } from './paths.js';
@@ -79,9 +82,16 @@ describe.skipIf(!chromePath)('native host secret fill', { timeout: 30_000 }, () 
                 .end(
                   '<h1>Password step</h1><form method="post" action="/step/password"><label>Password<input name="password" type="password" autocomplete="current-password" required></label><button type="submit">Continue</button></form>',
                 );
-            else if (request.url === '/session') response.writeHead(204).end();
+            else if (request.url === '/session' || request.url === '/send-code') response.writeHead(204).end();
             else response.writeHead(200, { 'content-type': 'text/html' }).end('<h1>Signed in</h1>');
           });
+        } else if (request.url === '/otp-send' || request.url === '/otp-send-button') {
+          const scripted = request.url === '/otp-send-button';
+          response
+            .writeHead(200, { 'content-type': 'text/html' })
+            .end(
+              `<form method="post" action="/send-code"><label>Code<input name="code" type="text" autocomplete="one-time-code"></label><button id="send" type="${scripted ? 'button' : 'submit'}">Send code</button><button type="submit" formaction="/verify-code">Verify</button></form>${scripted ? '<script>document.getElementById("send").addEventListener("click", () => fetch("/send-code", {method:"POST"}));</script>' : ''}`,
+            );
         } else if (request.url === '/signed-in') {
           response.writeHead(200, { 'content-type': 'text/html' }).end('<h1>Signed in</h1>');
         } else if (request.url === '/u/login' || request.url === '/formless') {
@@ -196,6 +206,7 @@ describe.skipIf(!chromePath)('native host secret fill', { timeout: 30_000 }, () 
     useAvailableBrowser();
     vi.stubEnv('GWS_EA_BROWSER_ROOT', join(root, 'browser'));
     await browserSiteLeasesMigration.up(await initSqliteTestDb());
+    await browserSignInMigration.up(getDb());
     posts.length = 0;
     parentDocuments.length = 0;
     const appeared = connection.context.waitForEvent('page');
@@ -205,6 +216,7 @@ describe.skipIf(!chromePath)('native host secret fill', { timeout: 30_000 }, () 
     await certificateSession.send('Security.setIgnoreCertificateErrors', { ignore: true });
   });
   afterEach(async () => {
+    await recoverBrowserSignInMail();
     vi.restoreAllMocks();
     vi.unstubAllEnvs();
     await certificateSession?.detach();
@@ -349,6 +361,35 @@ describe.skipIf(!chromePath)('native host secret fill', { timeout: 30_000 }, () 
     expect(posts).toEqual([]);
     expect(await page.locator('input[name=password]').inputValue()).toBe('');
   });
+
+  for (const path of ['/otp-send', '/otp-send-button']) {
+    it(`opens the principal code wait after its ${path} control runs on a real code form`, async () => {
+      await page.goto(`https://auth.example${path}`);
+      const observation = await observePage(page);
+      const ref = (label: string): BrowserRef => {
+        const line = observation.snapshot.split('\n').find((line) => line.includes(`"${label}"`));
+        const found = line?.match(/\[ref=([^\]]+)\]/u)?.[1];
+        if (!found) throw new Error(`Missing ${label} reference`);
+        return { ref: found, generation: observation.generation };
+      };
+      expect(
+        await executeSignInCode(context(), {
+          from: 'principal',
+          target: ref('Code'),
+          send: ref('Send code'),
+          submit: ref('Verify'),
+        }),
+      ).toEqual({ status: 'awaiting_code', site: 'auth.example', origin: 'https://auth.example' });
+      expect(posts).toHaveLength(1);
+      expect(Object.fromEntries(new URLSearchParams(posts[0].body))).toEqual(path === '/otp-send' ? { code: '' } : {});
+      expect(await getSignInClaim('signin-native-fill-request')).toMatchObject({
+        source: 'principal',
+        state: 'waiting',
+        origin: 'https://auth.example',
+      });
+      expect(await page.locator('input[name=code]').inputValue()).toBe('');
+    });
+  }
   async function binding(frame: Frame, kind: BrowserSecretField = 'password') {
     const target = await frame.locator('#chosen input').elementHandle();
     const submit = await frame.locator('#chosen button').elementHandle();

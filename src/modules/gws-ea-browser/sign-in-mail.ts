@@ -34,14 +34,10 @@ import { errandSource, hasBrowserAccess } from './access.js';
 import { authenticationFieldKind } from './authentication-signatures.js';
 import { browserDelegateGuard } from './cancel.js';
 import type { BrowserJob, BrowserRequest } from './db.js';
-import {
-  activateControl,
-  ensureBrowserNavigationGuard,
-  framesUnreadyStop,
-  withBrowserJobNavigation,
-} from './commit-classifier.js';
+import { ensureBrowserNavigationGuard, framesUnreadyStop, withBrowserJobNavigation } from './commit-classifier.js';
 import {
   assertBrowserSecretDiagnosticsSafe,
+  activateBoundBrowserSignIn,
   bindBrowserSecretFields,
   discoverAuthenticationCodeField,
   fillBoundBrowserSecrets,
@@ -571,20 +567,9 @@ export async function executeSignInCode(
         if (sent.status !== 'submitted' && sent.status !== 'cleared_after_submit')
           throw forbidden('The host could not safely request this sign-in.');
       } else {
-        await activateControl(
-          page,
-          send.element,
-          async () => {
-            await send.element.click({ timeout: context.remaining() });
-          },
-          undefined,
-          {
-            kind: 'submit',
-            scope: { jobId: context.job.id, db: context.store.db },
-            assertActive: context.assertActive,
-            remaining: context.remaining,
-          },
-        );
+        const sending = await bindBrowserSecretFields(page, [{ field: 'otp', target }], send);
+        const guard = await ensureBrowserNavigationGuard(page);
+        await guard.duringAction(context.remaining(), () => activateBoundBrowserSignIn(context, sending, ['']));
       }
       await context.assertActive();
       if (!sameOrigin(binding)) return { status: 'origin_mismatch' };

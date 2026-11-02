@@ -218,6 +218,25 @@ export async function settleFilledSecrets(
   if (cleared || page.isClosed()) for (const value of values) releasePageSecret(page, value);
 }
 
+/** Activate only within the caller's guarded action window, with current policy and consent. */
+export async function activateBoundBrowserSignIn(
+  context: BrowserExecutionContext,
+  binding: BoundBrowserSecretFields,
+  values: readonly string[],
+): Promise<void> {
+  const { page, submit } = binding;
+  const until = Date.now() + Math.min(3000, Math.max(0, context.remaining() - 2000));
+  for (;;) {
+    await checkSignInControl(page, submit);
+    await signInConsent(context, binding);
+    assertBrowserSecretDiagnosticsSafe();
+    const activated = await activateNativeCredentialControl(submit.frame, binding.native, values, context.assertActive);
+    if (activated === 'activated' || activated === 'uncertain') return;
+    if (activated !== 'disabled' || Date.now() >= until) throw unsupported();
+    await sleep(100);
+  }
+}
+
 /** Resolve only after the destination, current controls, consent and site lease are checked. */
 export async function fillBoundBrowserSecrets(
   context: BrowserExecutionContext,
@@ -279,20 +298,7 @@ export async function fillBoundBrowserSecrets(
           assertBrowserSecretDiagnosticsSafe();
           const filled = await fillNativeCredentialGroup(submit.frame, current.native, values, context.assertActive);
           if (filled !== 'filled') throw unsupported();
-          const until = Date.now() + Math.min(3000, Math.max(0, context.remaining() - 2000));
-          for (;;) {
-            await checkSignInControl(page, submit);
-            await signInConsent(context, current);
-            const activated = await activateNativeCredentialControl(
-              submit.frame,
-              current.native,
-              values,
-              context.assertActive,
-            );
-            if (activated === 'activated' || activated === 'uncertain') break;
-            if (activated !== 'disabled' || Date.now() >= until) throw unsupported();
-            await sleep(100);
-          }
+          await activateBoundBrowserSignIn(context, current, values);
         }),
     );
     await context.assertActive();
