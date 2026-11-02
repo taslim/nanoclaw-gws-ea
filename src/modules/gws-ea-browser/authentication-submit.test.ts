@@ -5,8 +5,13 @@ import { join } from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import type { ElementHandle, Frame, Page } from 'playwright-core';
 
-import { inspectAuthenticationControl, submitAuthenticationForm } from './authentication-signatures.js';
-import { prepareAuthenticationIsolation } from './authentication-submit.js';
+import {
+  prepareAuthenticationIsolation,
+  inspectNativeCredentialControl,
+  fillNativeCredentialGroup,
+  activateNativeCredentialControl,
+  type NativeCredentialGroup,
+} from './authentication-submit.js';
 import { prepareChromeProfile, spawnChrome } from './chrome.js';
 import { connectChrome, type ChromeConnection } from './connection.js';
 import { browserPaths } from './paths.js';
@@ -99,37 +104,55 @@ describe.skipIf(!chromePath)('native authentication submission', { timeout: 30_0
     }
   }
 
+  async function group(frame: Frame, control: ElementHandle): Promise<NativeCredentialGroup | undefined> {
+    const submit = await inspectNativeCredentialControl(control, frame);
+    const username = await frame.locator('#chosen input[name=username]').elementHandle();
+    const password = await frame.locator('#chosen input[name=password]').elementHandle();
+    if (!submit || !username || !password) return undefined;
+    try {
+      const first = await inspectNativeCredentialControl(username, frame);
+      const second = await inspectNativeCredentialControl(password, frame);
+      return first && second ? { control: submit, fields: [first, second] } : undefined;
+    } finally {
+      await username.dispose();
+      await password.dispose();
+    }
+  }
+  const values = ['fixture-user', 'host-only-fixture-secret'];
+
   for (const location of ['top', 'same-origin-frame', 'cross-origin-frame', 'shadow'] as const) {
-    it(`submits the exact chosen form in ${location} without page prototype or submit callbacks`, async () => {
-      await withFixture(location, async ({ page, frame, control, callbacks, posts }) => {
+    it(`submits the exact chosen form in ${location} through isolated prototypes and the site’s own callbacks`, async () => {
+      await withFixture(location, async ({ frame, control, callbacks, posts }) => {
         if (location === 'cross-origin-frame') {
           // Assert the fixture exercises an out-of-process frame, rather than
           // silently covering only same-process iframe mapping twice.
           const session = await connection.context.newCDPSession(frame);
           await session.detach();
         }
-        const signature = await inspectAuthenticationControl(control);
+        const signature = await group(frame, control);
         if (!signature) throw new Error('The native authentication signature was refused.');
-        await frame.locator('#chosen input[name=password]').focus();
-        await page.keyboard.insertText('host-only-fixture-secret');
-        expect(await submitAuthenticationForm(signature)).toBe(true);
+        expect(await fillNativeCredentialGroup(frame, signature, values, async () => undefined)).toBe('filled');
+        expect(await activateNativeCredentialControl(frame, signature, values, async () => undefined)).toBe(
+          'activated',
+        );
         await expect.poll(() => posts.length, { timeout: 1_500 }).toBe(1);
         expect(posts).toEqual([
           {
             url: `${location === 'cross-origin-frame' ? 'https://frame.example' : 'https://auth.example'}/login`,
-            body: 'which=chosen&username=&password=host-only-fixture-secret',
+            body: 'which=chosen&username=fixture-user&password=host-only-fixture-secret',
           },
         ]);
-        expect(callbacks).toEqual([]);
+        expect(callbacks).toEqual(location === 'shadow' ? ['click'] : ['click', 'submit']);
       });
     });
   }
 
   for (const drift of ['action', 'fields', 'form'] as const) {
     it(`refuses ${drift} drift without substituting the other matching form`, async () => {
-      await withFixture('top', async ({ page, control, callbacks, posts }) => {
-        const signature = await inspectAuthenticationControl(control);
+      await withFixture('top', async ({ page, frame, control, callbacks, posts }) => {
+        const signature = await group(frame, control);
         if (!signature) throw new Error('The native authentication signature was refused.');
+        expect(await fillNativeCredentialGroup(frame, signature, values, async () => undefined)).toBe('filled');
         await page.evaluate(`(() => {
           const form = document.getElementById('chosen');
           if (${JSON.stringify(drift)} === 'action') form.action = '/checkout';
@@ -141,7 +164,7 @@ describe.skipIf(!chromePath)('native authentication submission', { timeout: 30_0
             form.replaceWith(replacement);
           }
         })()`);
-        expect(await submitAuthenticationForm(signature)).toBe(false);
+        expect(await activateNativeCredentialControl(frame, signature, values, async () => undefined)).toBe('changed');
         expect(posts).toEqual([]);
         expect(callbacks).toEqual([]);
       });
@@ -149,22 +172,23 @@ describe.skipIf(!chromePath)('native authentication submission', { timeout: 30_0
   }
 
   it('refuses a document replaced during the last asynchronous liveness check', async () => {
-    await withFixture('top', async ({ page, control, callbacks, posts }) => {
-      const signature = await inspectAuthenticationControl(control);
+    await withFixture('top', async ({ page, frame, control, callbacks, posts }) => {
+      const signature = await group(frame, control);
       if (!signature) throw new Error('The native authentication signature was refused.');
+      expect(await fillNativeCredentialGroup(frame, signature, values, async () => undefined)).toBe('filled');
       expect(
-        await submitAuthenticationForm(signature, async () => {
+        await activateNativeCredentialControl(frame, signature, values, async () => {
           await page.goto('https://other.example/login');
         }),
-      ).toBe(false);
+      ).toBe('uncertain');
       expect(posts).toEqual([]);
       expect(callbacks).toEqual([]);
     });
   });
 
   it('refuses ambiguous same-URL sibling frames before any submission', async () => {
-    await withFixture('ambiguous-frame', async ({ control, callbacks, posts }) => {
-      expect(await inspectAuthenticationControl(control)).toBeUndefined();
+    await withFixture('ambiguous-frame', async ({ frame, control, callbacks, posts }) => {
+      expect(await group(frame, control)).toBeUndefined();
       expect(posts).toEqual([]);
       expect(callbacks).toEqual([]);
     });

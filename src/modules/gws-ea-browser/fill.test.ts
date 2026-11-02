@@ -8,16 +8,17 @@ import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import type { Page } from 'playwright-core';
 import {
   readVaultSiteInfo,
-  bindBrowserSecretField,
+  bindBrowserSecretFields,
   BrowserOriginMismatchError,
   discoverAuthenticationCodeField,
-  fillBoundBrowserSecret,
+  fillBoundBrowserSecrets,
   validateFillSecret,
 } from './fill.js';
 import type { BrowserExecutionContext } from './actions.js';
 import type { PinnedBrowserRef } from './observe.js';
 import { observePage, configureBrowserSiteInfo } from './observe.js';
 import { pageHasSecret } from './page-privacy.js';
+import * as navigation from './commit-classifier.js';
 import * as nativeAuthentication from './authentication-submit.js';
 import * as isolatedFacts from './control-facts.js';
 import * as consentEngine from './consent.js';
@@ -140,6 +141,15 @@ function fixture(origin = 'https://www.shop.example') {
     wakeWaiters: vi.fn(async () => undefined),
     store: new BrowserStore(getDb()),
   } as unknown as BrowserExecutionContext;
+  vi.spyOn(navigation, 'ensureBrowserNavigationGuard').mockResolvedValue({
+    reason: () => undefined,
+    clearReason: () => undefined,
+    holdSubmissions: () => undefined,
+    allowSubmissions: () => undefined,
+    actionsSettled: async () => undefined,
+    runWithPolicy: async (_policy, operation) => operation(),
+    duringAction: async (_budget, operation) => operation(),
+  });
   // These tests double the external renderer boundary. Native node identity,
   // prototype isolation and submission are exercised in the real Chrome suite.
   vi.spyOn(isolatedFacts, 'readPageControlFacts').mockImplementation(async () => ({
@@ -153,46 +163,53 @@ function fixture(origin = 'https://www.shop.example') {
     formAction: form.action,
     transaction: false,
   }));
-  vi.spyOn(nativeAuthentication, 'inspectNativeAuthenticationControl').mockImplementation(async (element) => ({
-    frameId: 'fixture-frame',
-    loaderId: 'fixture-document',
-    controlBackendNodeId: 1,
-    formBackendNodeId: 2,
-    facts: {
-      origin: new URL(url).origin,
-      action: form.action,
-      method: form.method,
-      target: form.target,
-      submit: true,
-      control:
-        (element as unknown as { node: unknown }).node === field
-          ? { tag: 'INPUT', name: field.name, type: field.type, autocomplete: field.getAttribute('autocomplete') ?? '' }
-          : { tag: 'BUTTON', name: '', type: 'submit', autocomplete: '' },
-      fields: [field, button].map((node) => ({
+  vi.spyOn(nativeAuthentication, 'inspectNativeCredentialControl').mockImplementation(async (element) => {
+    const node = (element as unknown as { node: typeof field | typeof button }).node;
+    return {
+      frameId: 'fixture-frame',
+      loaderId: 'fixture-document',
+      controlBackendNodeId: node === field ? 1 : 3,
+      formBackendNodeId: 2,
+      facts: {
+        origin: new URL(url).origin,
+        tag: node.tagName,
+        id: '',
         name: node.name,
         type: node.type,
         autocomplete: node.getAttribute('autocomplete') ?? '',
-      })),
-    },
-  }));
+        required: false,
+        override: null,
+        form: {
+          ...form,
+          fields: [field, button].map((node) => ({
+            name: node.name,
+            type: node.type,
+            autocomplete: node.getAttribute('autocomplete') ?? '',
+            readonly: false,
+            disabled: false,
+          })),
+        },
+      },
+    };
+  });
   const nativeFill = vi.fn(async (value: string) => {
     field.value = value;
     return true;
   });
-  vi.spyOn(nativeAuthentication, 'fillNativeAuthenticationField').mockImplementation(
-    async (_frame, _field, _submit, value, assertActive) => {
+  vi.spyOn(nativeAuthentication, 'fillNativeCredentialGroup').mockImplementation(
+    async (_frame, _group, values, assertActive) => {
       await assertActive();
-      return nativeFill(value);
+      return (await nativeFill(values[0])) ? 'filled' : 'changed';
     },
   );
   const nativeSubmit = vi.fn(async () => undefined);
-  // The consent engine's isolated-world pass has its own native suite (open-web-native).
   vi.spyOn(consentEngine, 'runConsentPass').mockResolvedValue({ status: 'ready', agreements: [], addOns: [] });
-  vi.spyOn(nativeAuthentication, 'submitNativeAuthenticationForm').mockImplementation(
-    async (_frame, _binding, assertActive) => {
-      await assertActive?.();
+  vi.spyOn(nativeAuthentication, 'activateNativeCredentialControl').mockImplementation(
+    async (_frame, _group, values, assertActive) => {
+      await assertActive();
+      if (field.value !== values[0]) return 'changed';
       await nativeSubmit();
-      return true;
+      return 'activated';
     },
   );
   const target = { ref: 'e1', generation: 1, element: handle(field), frame } as unknown as PinnedBrowserRef;
@@ -219,13 +236,13 @@ function fixture(origin = 'https://www.shop.example') {
 
 it('blocks screenshots during target-bound insertion, clears same-page errors and redacts forever', async () => {
   const f = fixture();
-  const binding = await bindBrowserSecretField(f.page, f.target, f.submit, 'password');
+  const binding = await bindBrowserSecretFields(f.page, [{ field: 'password', target: f.target }], f.submit);
   const original = f.nativeFill.getMockImplementation()!;
   f.nativeFill.mockImplementation(async (value) => {
     expect(await pageHasSecret(f.page)).toBe(true);
     return original(value);
   });
-  const result = await fillBoundBrowserSecret(f.context, binding, async () => SECRET);
+  const result = await fillBoundBrowserSecrets(f.context, binding, async () => [SECRET]);
   expect(result).toEqual({ status: 'cleared_after_submit' });
   expect(f.field.value).toBe('');
   expect(JSON.stringify(await observePage(f.page))).not.toContain(SECRET);
@@ -237,18 +254,18 @@ it('returns submitted after navigation and rechecks complete frame origin before
   f.nativeSubmit.mockImplementation(async () => {
     f.navigate();
   });
-  const binding = await bindBrowserSecretField(f.page, f.target, f.submit, 'password');
-  expect(await fillBoundBrowserSecret(f.context, binding, async () => SECRET)).toEqual({ status: 'submitted' });
-  const resolve = vi.fn(async () => SECRET);
+  const binding = await bindBrowserSecretFields(f.page, [{ field: 'password', target: f.target }], f.submit);
+  expect(await fillBoundBrowserSecrets(f.context, binding, async () => [SECRET])).toEqual({ status: 'submitted' });
+  const resolve = vi.fn(async () => [SECRET]);
   f.setUrl('https://www.shop.example:8443/login');
-  expect(await fillBoundBrowserSecret(f.context, binding, resolve)).toEqual({ status: 'origin_mismatch' });
+  expect(await fillBoundBrowserSecrets(f.context, binding, resolve)).toEqual({ status: 'origin_mismatch' });
   expect(resolve).not.toHaveBeenCalled();
   f.setUrl('https://www.shop.example/login');
   resolve.mockImplementation(async () => {
     f.setUrl('http://www.shop.example/login');
-    return SECRET;
+    return [SECRET];
   });
-  expect(await fillBoundBrowserSecret(f.context, binding, resolve)).toEqual({ status: 'origin_mismatch' });
+  expect(await fillBoundBrowserSecrets(f.context, binding, resolve)).toEqual({ status: 'origin_mismatch' });
   expect(f.nativeFill).toHaveBeenCalledTimes(1);
   expect(f.page.keyboard.insertText).not.toHaveBeenCalled();
 });
@@ -256,14 +273,16 @@ it('returns submitted after navigation and rechecks complete frame origin before
 it('judges iframe origins and refuses HTTP and card targets before any resolver runs', async () => {
   const insecure = fixture('http://shop.example');
   await expect(
-    bindBrowserSecretField(insecure.page, insecure.target, insecure.submit, 'password'),
+    bindBrowserSecretFields(insecure.page, [{ field: 'password', target: insecure.target }], insecure.submit),
   ).rejects.toBeInstanceOf(BrowserOriginMismatchError);
   const f = fixture('https://identity.example');
   f.page.url = () => 'https://shop.example/login';
-  const binding = await bindBrowserSecretField(f.page, f.target, f.submit, 'password');
+  const binding = await bindBrowserSecretFields(f.page, [{ field: 'password', target: f.target }], f.submit);
   expect(binding.origin).toBe('https://identity.example');
   f.field.getAttribute = (name) => (name === 'autocomplete' ? 'cc-number' : null);
-  await expect(bindBrowserSecretField(f.page, f.target, f.submit, 'password')).rejects.toMatchObject({
+  await expect(
+    bindBrowserSecretFields(f.page, [{ field: 'password', target: f.target }], f.submit),
+  ).rejects.toMatchObject({
     code: 'forbidden',
   });
 });
@@ -278,10 +297,10 @@ it('refuses a held iframe site before resolving any secret after its central lea
   await credentialAttempts.disclose(result.attempt.id, { jobId: 'another-job', origin: 'https://identity.example' });
   const f = fixture('https://identity.example');
   f.page.url = () => 'https://shop.example/login';
-  const binding = await bindBrowserSecretField(f.page, f.target, f.submit, 'password');
-  const resolve = vi.fn(async () => SECRET);
+  const binding = await bindBrowserSecretFields(f.page, [{ field: 'password', target: f.target }], f.submit);
+  const resolve = vi.fn(async () => [SECRET]);
   const reads = storeFixture.keyReads();
-  expect(await fillBoundBrowserSecret(f.context, binding, resolve)).toEqual({ status: 'site_busy' });
+  expect(await fillBoundBrowserSecrets(f.context, binding, resolve)).toEqual({ status: 'site_busy' });
   expect(resolve).not.toHaveBeenCalled();
   expect(f.nativeFill).not.toHaveBeenCalled();
   expect(storeFixture.keyReads()).toBe(reads);
@@ -289,14 +308,14 @@ it('refuses a held iframe site before resolving any secret after its central lea
 
 it('detects a changed target value and clears every field holding the value, including copied values', async () => {
   const f = fixture();
-  const binding = await bindBrowserSecretField(f.page, f.target, f.submit, 'password');
+  const binding = await bindBrowserSecretFields(f.page, [{ field: 'password', target: f.target }], f.submit);
   const other = { ...f.field, value: '' };
   f.nodes.push(other);
   f.nativeFill.mockImplementation(async (value) => {
     other.value = value;
     return true;
   });
-  await expect(fillBoundBrowserSecret(f.context, binding, async () => SECRET)).rejects.toMatchObject({
+  await expect(fillBoundBrowserSecrets(f.context, binding, async () => [SECRET])).rejects.toMatchObject({
     code: 'forbidden',
   });
   expect(f.nodes.map((node) => node.value)).toEqual(['', '']);
@@ -304,8 +323,8 @@ it('detects a changed target value and clears every field holding the value, inc
 
 it('sanitizes browser and resolver failures and accepts no raw values or references', async () => {
   const f = fixture();
-  const binding = await bindBrowserSecretField(f.page, f.target, f.submit, 'password');
-  const error = await fillBoundBrowserSecret(f.context, binding, async () => {
+  const binding = await bindBrowserSecretFields(f.page, [{ field: 'password', target: f.target }], f.submit);
+  const error = await fillBoundBrowserSecrets(f.context, binding, async () => {
     throw new Error(SECRET);
   }).catch((value: unknown) => value);
   expect(error).toMatchObject({
@@ -336,10 +355,10 @@ it('sanitizes browser and resolver failures and accepts no raw values or referen
 
 it('returns a vault refusal as its own bounded outcome before anything reaches the page', async () => {
   const f = fixture();
-  const binding = await bindBrowserSecretField(f.page, f.target, f.submit, 'password');
+  const binding = await bindBrowserSecretFields(f.page, [{ field: 'password', target: f.target }], f.submit);
   for (const reason of ['vault_unavailable', 'no_item_for_site', 'origin_mismatch'] as const)
     expect(
-      await fillBoundBrowserSecret(f.context, binding, async () => {
+      await fillBoundBrowserSecrets(f.context, binding, async () => {
         throw new LoginStoreError(reason);
       }),
     ).toEqual({ status: reason });
@@ -349,7 +368,11 @@ it('returns a vault refusal as its own bounded outcome before anything reaches t
 
 it('discovers a native OTP transition after old handles detach, while retaining the exact frame origin', async () => {
   const previous = fixture();
-  const binding = await bindBrowserSecretField(previous.page, previous.target, previous.submit, 'password');
+  const binding = await bindBrowserSecretFields(
+    previous.page,
+    [{ field: 'password', target: previous.target }],
+    previous.submit,
+  );
   const next = fixture();
   next.field.getAttribute = (name) =>
     ({ autocomplete: 'one-time-code', type: 'text', name: 'code' })[name as 'autocomplete' | 'type' | 'name'] ?? null;
@@ -363,8 +386,8 @@ it('discovers a native OTP transition after old handles detach, while retaining 
     locator: () => ({ count: async () => 1, elementHandle: async () => next.target.element }),
   });
   const discovered = await discoverAuthenticationCodeField(previous.page, binding);
-  expect(discovered?.field).toBe('otp');
-  expect(discovered?.target.element).toBe(next.target.element);
+  expect(discovered?.fields[0].field).toBe('otp');
+  expect(discovered?.fields[0].target.element).toBe(next.target.element);
   expect(discovered?.origin).toBe('https://www.shop.example');
   previous.setUrl('https://www.shop.example:8443/verify');
   expect(await discoverAuthenticationCodeField(previous.page, binding)).toBeUndefined();
@@ -372,10 +395,10 @@ it('discovers a native OTP transition after old handles detach, while retaining 
 
 it('refuses secret resolution while Playwright protocol debugging could disclose native keyboard values', async () => {
   const f = fixture();
-  const binding = await bindBrowserSecretField(f.page, f.target, f.submit, 'password');
-  const resolve = vi.fn(async () => SECRET);
+  const binding = await bindBrowserSecretFields(f.page, [{ field: 'password', target: f.target }], f.submit);
+  const resolve = vi.fn(async () => [SECRET]);
   vi.stubEnv('DEBUG', 'pw:protocol');
-  await expect(fillBoundBrowserSecret(f.context, binding, resolve)).rejects.toMatchObject({ code: 'forbidden' });
+  await expect(fillBoundBrowserSecrets(f.context, binding, resolve)).rejects.toMatchObject({ code: 'forbidden' });
   expect(resolve).not.toHaveBeenCalled();
 });
 
@@ -468,7 +491,7 @@ it('leases the iframe login site before resolving its secret so another errand w
   try {
     const f = fixture('https://identity.example');
     f.page.url = () => 'https://shop.example/login';
-    const binding = await bindBrowserSecretField(f.page, f.target, f.submit, 'password');
+    const binding = await bindBrowserSecretFields(f.page, [{ field: 'password', target: f.target }], f.submit);
     const prepared = await credentialAttempts.prepareSignup({
       jobId: 'another-job',
       origin: binding.origin,
@@ -484,12 +507,12 @@ it('leases the iframe login site before resolving its secret so another errand w
       wakeWaiters: async () => undefined,
     };
     expect(
-      await fillBoundBrowserSecret(context, binding, async () => {
+      await fillBoundBrowserSecrets(context, binding, async () => {
         const lease = await new SiteLeaseStore(db).acquire('another-job', binding.origin);
         otherAcquired = lease.acquired;
         if (lease.acquired)
           await credentialAttempts.disclose(prepared.attempt.id, { jobId: 'another-job', origin: binding.origin });
-        return SECRET;
+        return [SECRET];
       }),
     ).toEqual({ status: 'cleared_after_submit' });
     expect(otherAcquired).toBe(false);

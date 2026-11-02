@@ -11,7 +11,7 @@ it('accepts document-prefixed native references on every host browser surface', 
   expect(validateBrowserBatch({ actions: [{ kind: 'click', ...target }] })).toEqual({
     actions: [{ kind: 'click', ...target }],
   });
-  expect(validateFillSecret({ item_handle: 'vault_opaque', field: 'password', target, submit: target }).target).toEqual(
+  expect(validateFillSecret({ item_handle: 'vault_opaque', password: target, submit: target }).password).toEqual(
     target,
   );
   expect(validateSignInCode({ target, send: target }).target).toEqual(target);
@@ -20,8 +20,7 @@ it('accepts document-prefixed native references on every host browser surface', 
     expect(() =>
       validateFillSecret({
         item_handle: 'vault_opaque',
-        field: 'password',
-        target: { ref, generation: 1 },
+        password: { ref, generation: 1 },
         submit: target,
       }),
     ).toThrow();

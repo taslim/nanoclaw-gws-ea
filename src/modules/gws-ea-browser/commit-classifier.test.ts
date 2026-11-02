@@ -10,7 +10,6 @@ import { EventEmitter } from 'node:events';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { ElementHandle, Page } from 'playwright-core';
 import { amazonRetailSignature, AMAZON_RETAIL } from './merchant-signatures.js';
-import * as nativeAuthentication from './authentication-submit.js';
 import * as isolatedFacts from './control-facts.js';
 import * as consentEngine from './consent.js';
 afterEach(() => vi.restoreAllMocks());
@@ -297,27 +296,11 @@ it('keeps reviewed Amazon authentication routes precise and leaves its other rou
   expect(classifyNavigationUrl('http://www.amazon.com/ap/signin')).toBe('ordinary');
 });
 
-it('submits positively identified native authentication forms without invoking arbitrary page callbacks', async () => {
-  const native = vi.fn();
-  const frame = { url: () => 'https://auth-dispatch.example/login' };
-  const form = { action: 'https://auth-dispatch.example/login', method: 'post' };
-  const element = { ownerFrame: async () => frame } as unknown as ElementHandle;
-  const page = {
-    url: () => frame.url(),
-    frames: () => [frame],
-    mainFrame: () => frame,
-    locator: () => ({ innerText: async () => '' }),
-    waitForEvent: async () => undefined,
-    on: () => undefined,
-    once: () => undefined,
-    context: () => ({
-      newCDPSession: async () => ({ on: () => undefined, send: async () => ({ targetInfo: { targetId: 'page' } }) }),
-      browser: () => ({
-        once: () => undefined,
-        newBrowserCDPSession: async () => ({ on: () => undefined, send: async () => undefined }),
-      }),
-    }),
-  } as unknown as Page;
+it('runs ordinary sign-in controls through the browser action and still refuses a purchase destination', async () => {
+  const url = 'https://auth-dispatch.example/login';
+  const form = { action: url, method: 'post' };
+  const { page } = guardedPageFixture(url, { frame: { id: 'fixture-page', url, loaderId: 'document' } });
+  const element = {} as ElementHandle;
   // This unit doubles the isolated-world reads and the native Chrome object binding. Both have real-renderer suites.
   vi.spyOn(isolatedFacts, 'readPageControlFacts').mockImplementation(async () => ({
     name: 'Sign in',
@@ -330,31 +313,13 @@ it('submits positively identified native authentication forms without invoking a
     formAction: form.action,
     transaction: false,
   }));
-  vi.spyOn(nativeAuthentication, 'inspectNativeAuthenticationControl').mockResolvedValue({
-    facts: {
-      control: { tag: 'BUTTON', name: '', type: 'submit', autocomplete: '' },
-      origin: 'https://auth-dispatch.example',
-      action: form.action,
-      method: 'post',
-      submit: true,
-      fields: [
-        { name: 'username', type: 'text', autocomplete: 'username' },
-        { name: 'password', type: 'password', autocomplete: 'current-password' },
-      ],
-    },
-  } as unknown as NonNullable<Awaited<ReturnType<typeof nativeAuthentication.inspectNativeAuthenticationControl>>>);
   vi.spyOn(consentEngine, 'runConsentPass').mockResolvedValue({ status: 'ready', agreements: [], addOns: [] });
-  vi.spyOn(nativeAuthentication, 'submitNativeAuthenticationForm').mockImplementation(async () => {
-    native();
-    return true;
-  });
   const arbitraryCallback = vi.fn(async () => undefined);
   await activateControl(page, element, arbitraryCallback);
-  expect(native).toHaveBeenCalledTimes(1);
-  expect(arbitraryCallback).not.toHaveBeenCalled();
+  expect(arbitraryCallback).toHaveBeenCalledTimes(1);
   form.action = 'https://auth-dispatch.example/place-order';
   await expect(activateControl(page, element, arbitraryCallback)).rejects.toMatchObject({ reason: 'purchase_control' });
-  expect(arbitraryCallback).not.toHaveBeenCalled();
+  expect(arbitraryCallback).toHaveBeenCalledTimes(1);
 });
 
 it('lets a reviewed flow decide only what the open rule leaves ordinary', async () => {

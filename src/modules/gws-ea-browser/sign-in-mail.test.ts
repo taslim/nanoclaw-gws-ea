@@ -23,8 +23,8 @@ vi.mock('./commit-classifier.js', async (original) => ({
 }));
 vi.mock('./fill.js', async (original) => ({
   ...(await original<typeof import('./fill.js')>()),
-  bindBrowserSecretField: vi.fn(),
-  fillBoundBrowserSecret: vi.fn(),
+  bindBrowserSecretFields: vi.fn(),
+  fillBoundBrowserSecrets: vi.fn(),
   discoverAuthenticationCodeField: vi.fn(),
 }));
 import { closeDb, createAgentGroup, getDb, initTestDb, runMigrations } from '../../db/index.js';
@@ -43,10 +43,10 @@ import {
   validateSignInCode,
 } from './sign-in-mail.js';
 import {
-  bindBrowserSecretField,
+  bindBrowserSecretFields,
   discoverAuthenticationCodeField,
-  fillBoundBrowserSecret,
-  type BoundBrowserSecretField,
+  fillBoundBrowserSecrets,
+  type BoundBrowserSecretFields,
 } from './fill.js';
 import { observePage, type PinnedBrowserRef } from './observe.js';
 import { pageHasSecret } from './page-privacy.js';
@@ -269,24 +269,18 @@ function fixture(username = false, current = '') {
   } as unknown as Page;
   const binding = {
     page,
-    target,
+    fields: [{ field: username ? 'username' : 'otp', target }],
     submit,
     origin: 'https://www.shop.example',
-    field: username ? 'username' : 'otp',
-    authentication: {
-      origin: 'https://www.shop.example',
-      action: 'https://www.shop.example/login',
-      frame,
-      element: control,
-    },
-  } as BoundBrowserSecretField;
+    native: {} as BoundBrowserSecretFields['native'],
+  } satisfies BoundBrowserSecretFields;
   const values: string[] = [];
-  vi.mocked(bindBrowserSecretField).mockImplementation(async (_page, _target, _submit, kind) => ({
+  vi.mocked(bindBrowserSecretFields).mockImplementation(async (_page, fields) => ({
     ...binding,
-    field: kind,
+    fields,
   }));
-  vi.mocked(fillBoundBrowserSecret).mockImplementation(async (_context, _binding, resolve) => {
-    values.push(await resolve());
+  vi.mocked(fillBoundBrowserSecrets).mockImplementation(async (_context, _binding, resolve) => {
+    values.push(...(await resolve()));
     if (username && values.length === 1) {
       receive('Your code is 642981', {
         spam: true,
@@ -296,7 +290,7 @@ function fixture(username = false, current = '') {
     }
     return { status: 'submitted' };
   });
-  vi.mocked(discoverAuthenticationCodeField).mockResolvedValue({ ...binding, field: 'otp' });
+  vi.mocked(discoverAuthenticationCodeField).mockResolvedValue({ ...binding, fields: [{ field: 'otp', target }] });
   const context = {
     job: { id: 'job', thread_id: 'system:a2a:main:job' },
     request: { id: 'request' },
@@ -338,8 +332,8 @@ it('defaults to the assistant and refuses raw codes, links and arbitrary frame a
 it('registers the wait before sending, routes raw HTML to external-email, and resumes only the browser', async () => {
   const f = fixture(true);
   await observePage(f.page);
-  const fill = vi.mocked(fillBoundBrowserSecret).getMockImplementation()!;
-  vi.mocked(fillBoundBrowserSecret).mockImplementation(async (...args) => {
+  const fill = vi.mocked(fillBoundBrowserSecrets).getMockImplementation()!;
+  vi.mocked(fillBoundBrowserSecrets).mockImplementation(async (...args) => {
     if (f.values.length === 0) expect(await getSignInClaim('signin-request')).toMatchObject({ gmail_message_id: null });
     return fill(...args);
   });
@@ -395,8 +389,8 @@ it.each(['session', 'job', 'expiry', 'cancellation', 'restart'] as const)(
   async (mode) => {
     const f = fixture(true);
     await observePage(f.page);
-    vi.mocked(fillBoundBrowserSecret).mockImplementationOnce(async (_context, _binding, resolve) => {
-      f.values.push(await resolve());
+    vi.mocked(fillBoundBrowserSecrets).mockImplementationOnce(async (_context, _binding, resolve) => {
+      f.values.push(...(await resolve()));
       receive('Code 642981');
       await routeSignInMail(parseGmailMessage(messages[0]), new Date());
       const [session] = await getSessionsByAgentGroup('external-email');
@@ -424,7 +418,7 @@ it.each(['session', 'job', 'expiry', 'cancellation', 'restart'] as const)(
 it('refuses a foreign group and invalid typed reply without echoing a credential', async () => {
   const f = fixture(true);
   await observePage(f.page);
-  vi.mocked(fillBoundBrowserSecret).mockImplementationOnce(async () => {
+  vi.mocked(fillBoundBrowserSecrets).mockImplementationOnce(async () => {
     receive('Code 642981');
     await routeSignInMail(parseGmailMessage(messages[0]), new Date());
     const [session] = await getSessionsByAgentGroup('external-email');
@@ -462,8 +456,8 @@ it.each(['https://www.shop.example:8443/login', 'http://www.shop.example/login',
   async (next) => {
     const f = fixture(true);
     await observePage(f.page);
-    const fill = vi.mocked(fillBoundBrowserSecret).getMockImplementation()!;
-    vi.mocked(fillBoundBrowserSecret).mockImplementationOnce(async (...args) => {
+    const fill = vi.mocked(fillBoundBrowserSecrets).getMockImplementation()!;
+    vi.mocked(fillBoundBrowserSecrets).mockImplementationOnce(async (...args) => {
       const result = await fill(...args);
       f.setUrl(next);
       return result;
@@ -476,7 +470,7 @@ it('taints bearer documents before traffic and returns only after fresh sanitize
   const f = fixture(true);
   await observePage(f.page);
   const secret = 'magic-bearer-7622';
-  vi.mocked(fillBoundBrowserSecret).mockImplementationOnce(async () => {
+  vi.mocked(fillBoundBrowserSecrets).mockImplementationOnce(async () => {
     receive('Follow the sign-in button.');
     await interpret({ kind: 'link', value: `https://www.shop.example/verify?token=${secret}` });
     return { status: 'submitted' };
@@ -505,7 +499,7 @@ it.each(['http://www.shop.example/verify?token=magic-bearer', 'https://elsewhere
     const f = fixture(true);
     await observePage(f.page);
     f.redirects.push(redirect);
-    vi.mocked(fillBoundBrowserSecret).mockImplementationOnce(async () => {
+    vi.mocked(fillBoundBrowserSecrets).mockImplementationOnce(async () => {
       receive('Follow the sign-in button.');
       await interpret({ kind: 'link', value: 'https://www.shop.example/verify?token=magic-bearer' });
       return { status: 'submitted' };
@@ -526,7 +520,7 @@ it.each(['http://www.shop.example/verify?token=magic-bearer', 'https://elsewhere
   async (link) => {
     const f = fixture(true);
     await observePage(f.page);
-    vi.mocked(fillBoundBrowserSecret).mockImplementationOnce(async () => {
+    vi.mocked(fillBoundBrowserSecrets).mockImplementationOnce(async () => {
       receive('Follow the sign-in button.');
       await interpret({ kind: 'link', value: link });
       return { status: 'submitted' };
@@ -559,8 +553,8 @@ it.each(['timer', 'abort', 'inactive'] as const)(
       const sent = new Promise<void>((resolve) => {
         ready = resolve;
       });
-      vi.mocked(fillBoundBrowserSecret).mockImplementationOnce(async (_context, _binding, resolve) => {
-        f.values.push(await resolve());
+      vi.mocked(fillBoundBrowserSecrets).mockImplementationOnce(async (_context, _binding, resolve) => {
+        f.values.push(...(await resolve()));
         receive('Code 642981');
         await routeSignInMail(parseGmailMessage(messages[0]), new Date());
         ready();
@@ -603,7 +597,7 @@ it.each(['timer', 'abort', 'inactive'] as const)(
 it('returns nothing_arrived within the remaining request budget', async () => {
   const f = fixture(true);
   await observePage(f.page);
-  vi.mocked(fillBoundBrowserSecret).mockImplementationOnce(async () => ({ status: 'submitted' }));
+  vi.mocked(fillBoundBrowserSecrets).mockImplementationOnce(async () => ({ status: 'submitted' }));
   expect(await executeSignInCode({ ...f.context, remaining: () => 500 }, payload)).toEqual({
     status: 'nothing_arrived',
   });

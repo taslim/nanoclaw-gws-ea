@@ -1,18 +1,23 @@
 import type { ElementHandle, Page } from 'playwright-core';
+import { setTimeout as sleep } from 'node:timers/promises';
 import { ActionRefusal, forbidden, invalidArgs } from '../../cli/delivery-action.js';
 import {
   authenticationFieldKind,
   browserDiagnosticsUnsafe,
   httpsOrigin,
-  inspectAuthenticationControl,
-  type AuthenticationFormSignature,
   type BrowserSecretField,
 } from './authentication-signatures.js';
-import { activateControl, classifyActivation, withBrowserJobNavigation } from './commit-classifier.js';
+import { classifyActivation, ensureBrowserNavigationGuard, withBrowserJobNavigation } from './commit-classifier.js';
+import { classifyNavigationUrl } from './control-policy.js';
+import { readPageControlFacts } from './control-facts.js';
+import { BrowserConsentStop, runConsentPass } from './consent.js';
 import {
-  fillNativeAuthenticationField,
-  inspectNativeAuthenticationControl,
-  type NativeAuthenticationBinding,
+  activateNativeCredentialControl,
+  fillNativeCredentialGroup,
+  inspectNativeCredentialControl,
+  readNativeDocumentFields,
+  type NativeCredentialGroup,
+  type NativeFieldFacts,
 } from './authentication-submit.js';
 import { getLoginStore, LoginStoreError } from './login-store.js';
 import { credentialAttempts } from './credential-attempts.js';
@@ -27,14 +32,16 @@ import {
 import { registerPageSecret, bindPageSecretDocuments, releasePageSecret } from './page-privacy.js';
 import { browserOperationId, type BrowserExecutionContext, type BrowserQueuedAction } from './actions.js';
 
-export interface BoundBrowserSecretField {
-  readonly page: Page;
+export interface BrowserSignInField {
+  readonly field: BrowserSecretField;
   readonly target: PinnedBrowserRef;
+}
+export interface BoundBrowserSecretFields {
+  readonly page: Page;
+  readonly fields: readonly BrowserSignInField[];
   readonly submit: PinnedBrowserRef;
   readonly origin: string;
-  readonly field: BrowserSecretField;
-  readonly authentication: AuthenticationFormSignature;
-  readonly nativeField: NativeAuthenticationBinding;
+  readonly native: NativeCredentialGroup;
 }
 export type BrowserSecretFillResult = {
   status:
@@ -46,7 +53,6 @@ export type BrowserSecretFillResult = {
     | 'site_busy';
 };
 
-/** The field and its submit control are not in one frame on one HTTPS origin. */
 export class BrowserOriginMismatchError extends Error {
   constructor() {
     super('origin_mismatch');
@@ -60,69 +66,116 @@ export function assertBrowserSecretDiagnosticsSafe(): void {
     );
 }
 
-async function fieldKind(element: ElementHandle): Promise<BrowserSecretField | undefined> {
-  const facts = await element.evaluate((node) => {
-    const e = node as unknown as { tagName: string; getAttribute(name: string): string | null };
-    return {
-      tag: e.tagName,
-      name: e.getAttribute('name') ?? '',
-      type: e.getAttribute('type') ?? 'text',
-      autocomplete: e.getAttribute('autocomplete') ?? '',
-    };
-  });
-  return facts.tag === 'INPUT' ? authenticationFieldKind(facts) : undefined;
+const unsupported = (): ActionRefusal =>
+  forbidden('The sign-in controls changed or include another action. Take a fresh observation.');
+const editable = (field: NativeFieldFacts): boolean => field.type !== 'hidden' && !field.readonly && !field.disabled;
+const otherSecret = (field: NativeFieldFacts): boolean =>
+  /(?:cc-|credit.?card|payment|checkout|order|new-password|security.?question)/iu.test(
+    `${field.name} ${field.autocomplete}`,
+  ) || ['file', 'image'].includes(field.type);
+
+async function checkSignInControl(page: Page, submit: PinnedBrowserRef): Promise<void> {
+  const facts = await readPageControlFacts(page, submit.element);
+  if (facts.transaction || (await classifyActivation(page, submit.element)) !== 'ordinary') throw unsupported();
 }
 
-/** The binding is host-only. Retain its pinned handles for a relay; never serialize it into a tool result. */
-export async function bindBrowserSecretField(
+async function signInConsent(context: BrowserExecutionContext, binding: BoundBrowserSecretFields): Promise<void> {
+  const consent = await runConsentPass(binding.page, binding.submit.element, {
+    scope: { jobId: context.job.id, db: context.store.db },
+    assertActive: context.assertActive,
+  });
+  if (consent.status === 'consent_required') throw new BrowserConsentStop(consent.stops);
+  if (consent.status !== 'ready') throw unsupported();
+}
+
+/** Bind the agent's current fields as one group, including JS-controlled and formless pages. */
+export async function bindBrowserSecretFields(
   page: Page,
-  target: PinnedBrowserRef,
+  fields: readonly BrowserSignInField[],
   submit: PinnedBrowserRef,
-  field: BrowserSecretField,
-): Promise<BoundBrowserSecretField> {
-  const origin = httpsOrigin(target.frame.url());
-  if (!origin || target.frame !== submit.frame || httpsOrigin(submit.frame.url())?.origin !== origin.origin)
+): Promise<BoundBrowserSecretFields> {
+  const origin = httpsOrigin(submit.frame.url());
+  if (
+    !origin ||
+    !fields.length ||
+    fields.some(
+      ({ target }) => target.frame !== submit.frame || httpsOrigin(target.frame.url())?.origin !== origin.origin,
+    )
+  )
     throw new BrowserOriginMismatchError();
   if (
-    (await target.element.ownerFrame()) !== target.frame ||
-    (await submit.element.ownerFrame()) !== target.frame ||
-    (await fieldKind(target.element)) !== field
+    new Set(fields.map(({ field }) => field)).size !== fields.length ||
+    new Set(fields.map(({ target }) => target.element)).size !== fields.length
   )
-    throw forbidden('Choose a current username, password or one-time-code field from a fresh observation.');
-  const sameForm = await target.element.evaluate((node, control) => {
-    const input = node as unknown as { form?: unknown; isConnected: boolean };
-    const submit = control as unknown as { form?: unknown; isConnected: boolean };
-    return input.isConnected && submit.isConnected && Boolean(input.form) && input.form === submit.form;
-  }, submit.element);
-  const authentication = sameForm && (await inspectAuthenticationControl(submit.element));
-  const nativeField = authentication && (await inspectNativeAuthenticationControl(target.element, target.frame));
+    throw unsupported();
+  const control = await inspectNativeCredentialControl(submit.element, submit.frame);
+  if (!control || (await submit.element.ownerFrame()) !== submit.frame) throw unsupported();
+  const bound = [];
+  for (const { field, target } of fields) {
+    if ((await target.element.ownerFrame()) !== submit.frame) throw new BrowserOriginMismatchError();
+    const node = await inspectNativeCredentialControl(target.element, target.frame);
+    if (
+      !node ||
+      node.facts.tag !== 'INPUT' ||
+      authenticationFieldKind(node.facts) !== field ||
+      node.frameId !== control.frameId ||
+      node.loaderId !== control.loaderId ||
+      node.facts.origin !== origin.origin
+    )
+      throw unsupported();
+    bound.push(node);
+  }
+  const form = bound[0].formBackendNodeId;
   if (
-    !authentication ||
-    !nativeField ||
-    nativeField.facts.control.tag !== 'INPUT' ||
-    authenticationFieldKind(nativeField.facts.control) !== field ||
-    nativeField.frameId !== authentication.native.frameId ||
-    nativeField.loaderId !== authentication.native.loaderId ||
-    nativeField.formBackendNodeId !== authentication.native.formBackendNodeId ||
-    (await classifyActivation(page, submit.element)) !== 'ordinary'
+    bound.some((node) => node.formBackendNodeId !== form) ||
+    (control.formBackendNodeId !== null && control.formBackendNodeId !== form)
   )
-    throw forbidden(
-      'This sign-in flow is unsupported. Take a fresh observation or use another supported sign-in method.',
-    );
-  return { page, target, submit, origin: origin.origin, field, authentication, nativeField };
+    throw unsupported();
+  for (const node of [control, ...bound]) {
+    for (const submission of [node.facts.form, node.facts.override]) {
+      if (!submission) continue;
+      if (httpsOrigin(submission.action)?.origin !== origin.origin) throw new BrowserOriginMismatchError();
+      if (
+        (submission.target && submission.target !== '_self') ||
+        classifyNavigationUrl(submission.action) !== 'ordinary'
+      )
+        throw unsupported();
+    }
+  }
+  const native = { control, fields: bound };
+  const members = bound[0].facts.form?.fields;
+  if (members) {
+    if (members.some(otherSecret)) throw unsupported();
+    const expected = members
+      .filter(editable)
+      .map(authenticationFieldKind)
+      .filter((kind) => kind !== undefined)
+      .sort();
+    if (JSON.stringify(expected) !== JSON.stringify(fields.map(({ field }) => field).sort())) throw unsupported();
+  } else {
+    const others = await readNativeDocumentFields(submit.frame, native, '');
+    if (!others || others.some((node) => otherSecret(node) || (editable(node) && authenticationFieldKind(node))))
+      throw unsupported();
+  }
+  await checkSignInControl(page, submit);
+  return { page, fields, submit, origin: origin.origin, native };
 }
 
 async function originMatches(
-  binding: BoundBrowserSecretField,
+  binding: BoundBrowserSecretFields,
   permitsOrigin?: (origin: URL) => boolean,
 ): Promise<boolean> {
-  const origin = httpsOrigin(binding.target.frame.url());
+  const origin = httpsOrigin(binding.submit.frame.url());
   return Boolean(
     origin &&
     origin.origin === binding.origin &&
     (!permitsOrigin || permitsOrigin(origin)) &&
-    (await binding.target.element.ownerFrame()) === binding.target.frame &&
-    (await binding.submit.element.ownerFrame()) === binding.target.frame,
+    (await binding.submit.element.ownerFrame()) === binding.submit.frame &&
+    (
+      await Promise.all(
+        binding.fields.map(async ({ target }) => (await target.element.ownerFrame()) === binding.submit.frame),
+      )
+    ).every(Boolean),
   );
 }
 
@@ -165,102 +218,105 @@ export async function settleFilledSecrets(
   if (cleared || page.isClosed()) for (const value of values) releasePageSecret(page, value);
 }
 
-/** Caller owns the queue's exclusive job lock; resolve remains lazy until the pinned HTTPS checks pass. */
-export async function fillBoundBrowserSecret(
+/** Resolve only after the destination, current controls, consent and site lease are checked. */
+export async function fillBoundBrowserSecrets(
   context: BrowserExecutionContext,
-  binding: BoundBrowserSecretField,
-  resolve: () => Promise<string>,
+  binding: BoundBrowserSecretFields,
+  resolve: () => Promise<readonly string[]>,
   permitsOrigin?: (origin: URL) => boolean,
 ): Promise<BrowserSecretFillResult> {
   assertBrowserSecretDiagnosticsSafe();
-  const { page, target, submit } = binding;
-  let value: string | undefined;
+  const { page, fields, submit } = binding;
+  let values: readonly string[] = [];
   let navigated = false;
   const navigation = (frame: ReturnType<Page['mainFrame']>): void => {
-    if (frame === target.frame) navigated = true;
+    if (frame === submit.frame) navigated = true;
   };
   page.on('framenavigated', navigation);
   try {
     await context.assertActive();
     if (!(await originMatches(binding, permitsOrigin))) return { status: 'origin_mismatch' };
-    // A previously bound field/control may have been replaced or changed during an email wait.
-    const rebound = await bindBrowserSecretField(page, target, submit, binding.field);
-    if (
-      JSON.stringify(rebound.nativeField) !== JSON.stringify(binding.nativeField) ||
-      JSON.stringify(rebound.authentication.native) !== JSON.stringify(binding.authentication.native)
-    )
-      return { status: 'origin_mismatch' };
-    await context.assertActive();
+    const rebound = await bindBrowserSecretFields(page, fields, submit);
+    if (JSON.stringify(rebound.native) !== JSON.stringify(binding.native)) return { status: 'origin_mismatch' };
     const lease = await new SiteLeaseStore(context.store.db).acquire(context.job.id, binding.origin);
     await context.wakeWaiters(lease.waitingJobs, `${browserOperationId(context)}:sign-in-lease`);
     if (!lease.acquired) return { status: 'site_busy' };
+    await signInConsent(context, binding);
     assertBrowserSecretDiagnosticsSafe();
-    value = await resolve();
+    values = await resolve();
     await context.assertActive();
-    if (!value) throw forbidden('No sign-in value is available.');
-    registerPageSecret(page, value);
-    await bindPageSecretDocuments(page, value);
+    if (values.length !== fields.length || values.some((value) => !value)) throw unsupported();
     if (!(await originMatches(binding, permitsOrigin))) return { status: 'origin_mismatch' };
-    assertBrowserSecretDiagnosticsSafe();
-    if (
-      !(await fillNativeAuthenticationField(
-        target.frame,
-        rebound.nativeField,
-        rebound.authentication.native,
-        value,
-        async () => {
-          await context.assertActive();
-          assertBrowserSecretDiagnosticsSafe();
-        },
-      ))
-    )
+    let current: BoundBrowserSecretFields;
+    try {
+      current = await bindBrowserSecretFields(page, fields, submit);
+      // eslint-disable-next-line no-catch-all/no-catch-all -- A changed or vanished renderer binding refuses without exposing page prose.
+    } catch {
       return { status: 'origin_mismatch' };
-    await context.assertActive();
-    if ((await target.element.inputValue()) !== value)
-      throw forbidden('The sign-in field changed. Take a fresh observation.');
-    if (!(await originMatches(binding, permitsOrigin))) return { status: 'origin_mismatch' };
-    await context.assertActive();
-    await activateControl(
-      page,
-      submit.element,
-      async () => {
-        throw forbidden('This sign-in flow requires native form submission.');
-      },
-      undefined,
+    }
+    if (JSON.stringify(current.native) !== JSON.stringify(rebound.native)) return { status: 'origin_mismatch' };
+    for (const value of values) {
+      registerPageSecret(page, value);
+      await bindPageSecretDocuments(page, value);
+    }
+    const guard = await ensureBrowserNavigationGuard(page);
+    await guard.runWithPolicy(
       {
-        kind: 'submit',
-        scope: { jobId: context.job.id, db: context.store.db },
-        assertActive: context.assertActive,
-        remaining: context.remaining,
+        classify(url) {
+          return !httpsOrigin(url.href) ||
+            values.some(
+              (value) =>
+                url.href.includes(value) ||
+                url.href.includes(encodeURIComponent(value)) ||
+                [...url.searchParams.values()].some((part) => part.includes(value)),
+            )
+            ? 'blocked_address'
+            : classifyNavigationUrl(url.href);
+        },
       },
+      () =>
+        guard.duringAction(context.remaining(), async () => {
+          assertBrowserSecretDiagnosticsSafe();
+          const filled = await fillNativeCredentialGroup(submit.frame, current.native, values, context.assertActive);
+          if (filled !== 'filled') throw unsupported();
+          const until = Date.now() + Math.min(3000, Math.max(0, context.remaining() - 2000));
+          for (;;) {
+            await checkSignInControl(page, submit);
+            await signInConsent(context, current);
+            const activated = await activateNativeCredentialControl(
+              submit.frame,
+              current.native,
+              values,
+              context.assertActive,
+            );
+            if (activated === 'activated' || activated === 'uncertain') break;
+            if (activated !== 'disabled' || Date.now() >= until) throw unsupported();
+            await sleep(100);
+          }
+        }),
     );
     await context.assertActive();
     return { status: navigated ? 'submitted' : 'cleared_after_submit' };
   } catch (error) {
     if (error instanceof BrowserOriginMismatchError) return { status: 'origin_mismatch' };
     if (error instanceof LoginStoreError) return { status: error.reason };
-    // Store and Playwright exceptions may carry values or page text; only constant host prose crosses this boundary.
+    if (error instanceof BrowserConsentStop) throw error;
     throw forbidden('The host could not safely complete this sign-in. Take a fresh observation.');
   } finally {
     page.off('framenavigated', navigation);
-    if (value) await settleFilledSecrets(context, page, [value]);
+    if (values.length) await settleFilledSecrets(context, page, values);
   }
 }
 
-/** Only a host-reviewed email->OTP form transition on the recorded origin can replace a waiting field. */
+/** A same-origin email-to-code transition can replace only the previous page's single field. */
 export async function discoverAuthenticationCodeField(
   page: Page,
-  previous: BoundBrowserSecretField,
-): Promise<BoundBrowserSecretField | undefined> {
-  // Email submission commonly replaces the entire document. The recorded frame and exact origin
-  // survive that navigation; the old element handles deliberately need not survive it.
-  if (
-    previous.page !== page ||
-    !page.frames().includes(previous.target.frame) ||
-    httpsOrigin(previous.target.frame.url())?.origin !== previous.origin
-  )
+  previous: BoundBrowserSecretFields,
+): Promise<BoundBrowserSecretFields | undefined> {
+  const frame = previous.submit.frame;
+  if (previous.page !== page || !page.frames().includes(frame) || httpsOrigin(frame.url())?.origin !== previous.origin)
     return undefined;
-  const fields = previous.target.frame.locator('input[autocomplete="one-time-code"]');
+  const fields = frame.locator('input[autocomplete="one-time-code"]');
   if ((await fields.count()) !== 1) return undefined;
   const element = await fields.elementHandle();
   if (!element) return undefined;
@@ -277,9 +333,10 @@ export async function discoverAuthenticationCodeField(
     return undefined;
   }
   try {
-    const target = { ...previous.target, element };
-    const bound = await bindBrowserSecretField(page, target, { ...previous.submit, element: submit }, 'otp');
-    return bound;
+    return await bindBrowserSecretFields(page, [{ field: 'otp', target: { ...previous.fields[0].target, element } }], {
+      ...previous.submit,
+      element: submit,
+    });
   } catch (_error) {
     await element.dispose();
     await control.dispose();
@@ -287,35 +344,31 @@ export async function discoverAuthenticationCodeField(
   }
 }
 
-type SavedSecretField = 'username' | 'password';
-const isSecretField = (value: unknown): value is SavedSecretField => value === 'username' || value === 'password';
-
 interface FillSecretPayload extends Record<string, unknown> {
   item_handle: string;
-  field: SavedSecretField;
-  target: BrowserRef;
+  username?: BrowserRef;
+  password?: BrowserRef;
   submit: BrowserRef;
 }
 export function validateFillSecret(content: Record<string, unknown>): FillSecretPayload {
-  const { item_handle: handle, field } = content;
+  const handle = content.item_handle;
   if (
     Object.keys(content).some(
-      (key) => !['action', 'requestId', 'budget_ms', 'item_handle', 'field', 'target', 'submit'].includes(key),
+      (key) => !['action', 'requestId', 'budget_ms', 'item_handle', 'username', 'password', 'submit'].includes(key),
     ) ||
     typeof handle !== 'string' ||
     !/^vault_[a-z\d_-]{1,100}$/iu.test(handle) ||
-    !isSecretField(field)
+    (content.username === undefined && content.password === undefined)
   )
-    throw invalidArgs('Choose a listed saved login and a username or password field.');
-  const message = 'Choose a field and submit control from a fresh observation.';
+    throw invalidArgs('Choose a listed saved login and its current username and/or password fields.');
+  const message = 'Choose the current sign-in fields and submit control from a fresh observation.';
   return {
     item_handle: handle,
-    field,
-    target: readBrowserRef(content.target, message),
+    ...(content.username === undefined ? {} : { username: readBrowserRef(content.username, message) }),
+    ...(content.password === undefined ? {} : { password: readBrowserRef(content.password, message) }),
     submit: readBrowserRef(content.submit, message),
   };
 }
-
 export async function executeFillSecret(
   context: BrowserExecutionContext,
   content: Record<string, unknown>,
@@ -326,28 +379,37 @@ export async function executeFillSecret(
     let refs = new Map<string, PinnedBrowserRef>();
     try {
       await context.assertActive();
-      refs = await pinBrowserRefs(page, [payload.target, payload.submit]);
-      const binding = await bindBrowserSecretField(
-        page,
-        refs.get(payload.target.ref)!,
-        refs.get(payload.submit.ref)!,
-        payload.field,
+      const chosen = (['username', 'password'] as const).flatMap((field) =>
+        payload[field] ? [{ field, ref: payload[field] }] : [],
       );
-      return await fillBoundBrowserSecret(context, binding, async () => {
-        await context.assertActive();
-        return (await getLoginStore()).secret(payload.item_handle, payload.field, binding.origin);
+      refs = await pinBrowserRefs(page, [...chosen.map(({ ref }) => ref), payload.submit]);
+      const binding = await bindBrowserSecretFields(
+        page,
+        chosen.map(({ field, ref }) => ({ field, target: refs.get(ref.ref)! })),
+        refs.get(payload.submit.ref)!,
+      );
+      return await fillBoundBrowserSecrets(context, binding, async () => {
+        const store = await getLoginStore();
+        const login = await store.get(payload.item_handle);
+        const values: string[] = [];
+        for (const { field } of chosen) {
+          await context.assertActive();
+          values.push(await store.secret(payload.item_handle, field, binding.origin));
+        }
+        if ((await store.get(payload.item_handle)).version !== login.version)
+          throw new LoginStoreError('origin_mismatch');
+        return values;
       });
     } catch (error) {
       if (error instanceof BrowserOriginMismatchError) return { status: 'origin_mismatch' };
       if (error instanceof LoginStoreError) return { status: error.reason };
-      if (error instanceof ActionRefusal) throw error;
-      throw forbidden('Choose a supported sign-in field and submit control from a fresh observation.');
+      if (error instanceof ActionRefusal || error instanceof BrowserConsentStop) throw error;
+      throw forbidden('Choose current sign-in fields and their submit control from a fresh observation.');
     } finally {
       await disposeBrowserRefs(refs);
     }
   });
 }
-
 export const fillSecretAction: BrowserQueuedAction = { validate: validateFillSecret, execute: executeFillSecret };
 
 export async function readVaultSiteInfo(

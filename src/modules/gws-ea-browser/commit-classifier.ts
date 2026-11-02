@@ -6,11 +6,6 @@ import { SiteLeaseStore } from './leases.js';
 import { documentGate, type PausedDocument } from './document-gate.js';
 import { coverPageTargets, ensurePageTargets, onUncoveredPageTarget, pageTargetsReady } from './page-targets.js';
 import { browserOperationId, type BrowserOperationContext } from './actions.js';
-import {
-  inspectAuthenticationControl,
-  submitAuthenticationForm,
-  type AuthenticationFormSignature,
-} from './authentication-signatures.js';
 import { paymentProcessorHost, readPageControlFacts, type ControlFacts } from './control-facts.js';
 import {
   classifyControlFacts,
@@ -47,7 +42,6 @@ async function activationDispatch(
   classification: ActionClass;
   facts: ControlFacts;
   flow?: ReviewedMerchantFlow;
-  authentication?: AuthenticationFormSignature;
 }> {
   const facts = await readPageControlFacts(page, element);
   const generic = classifyControlFacts(facts, kind);
@@ -56,10 +50,6 @@ async function activationDispatch(
   if (generic !== 'ordinary') return { classification: generic, facts, flow };
   const reviewed = flow && (await flow.classifyControl(page, element, facts));
   if (reviewed) return { classification: reviewed, facts, flow };
-  if (!facts.transaction && facts.formMethod?.toLowerCase() === 'post' && facts.formAction) {
-    const authentication = await inspectAuthenticationControl(element);
-    if (authentication) return { classification: 'ordinary', facts, authentication };
-  }
   return { classification: 'ordinary', facts };
 }
 
@@ -220,22 +210,6 @@ export async function activateControl(
   if (classification !== 'ordinary') {
     recordRefusal('action', undefined, classification);
     throw new BrowserActivationError(classification);
-  }
-  if (dispatch.authentication) {
-    const authentication = dispatch.authentication;
-    await consentBeforeSubmission(page, element, intent);
-    const guard = await ensureBrowserNavigationGuard(page);
-    // The open rule decides where the submission lands.
-    await guard.runWithPolicy({}, async () => {
-      const arrived = page
-        .waitForEvent('framenavigated', { predicate: (frame) => frame === authentication.frame, timeout: 2_000 })
-        .catch(() => undefined);
-      // The form changed between its reading and the submit, so nothing was sent: the control is not actionable.
-      if (!(await submitAuthenticationForm(authentication, intent.assertActive)))
-        throw new Error('The sign-in form changed before its submit');
-      await arrived;
-    });
-    return { ordinaryPress: true };
   }
   const pressed = pressesControl(facts, intent.kind);
   if (submitsForm(facts, intent.kind) && facts.region?.secretFields === true)

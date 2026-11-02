@@ -42,11 +42,11 @@ import {
 } from './commit-classifier.js';
 import {
   assertBrowserSecretDiagnosticsSafe,
-  bindBrowserSecretField,
+  bindBrowserSecretFields,
   discoverAuthenticationCodeField,
-  fillBoundBrowserSecret,
+  fillBoundBrowserSecrets,
   BrowserOriginMismatchError,
-  type BoundBrowserSecretField,
+  type BoundBrowserSecretFields,
 } from './fill.js';
 import { httpsOrigin } from './authentication-signatures.js';
 import {
@@ -87,22 +87,25 @@ export function validateSignInCode(content: Record<string, unknown>): SignInPayl
 }
 
 interface LiveClaim {
-  readonly binding: BoundBrowserSecretField;
+  readonly binding: BoundBrowserSecretFields;
   readonly refs: Map<string, PinnedBrowserRef>;
 }
 const bindings = new Map<string, LiveClaim>();
 
-function sameOrigin(binding: BoundBrowserSecretField): boolean {
-  return httpsOrigin(binding.target.frame.url())?.origin === binding.origin;
+function sameOrigin(binding: BoundBrowserSecretFields): boolean {
+  return httpsOrigin(binding.fields[0].target.frame.url())?.origin === binding.origin;
 }
 async function releaseBinding(id: string): Promise<void> {
   const live = bindings.get(id);
   bindings.delete(id);
   if (live) await disposeBrowserRefs(live.refs);
 }
-async function codeBinding(page: Page, binding: BoundBrowserSecretField): Promise<BoundBrowserSecretField | undefined> {
+async function codeBinding(
+  page: Page,
+  binding: BoundBrowserSecretFields,
+): Promise<BoundBrowserSecretFields | undefined> {
   if (!sameOrigin(binding)) return undefined;
-  return binding.field === 'otp' ? binding : discoverAuthenticationCodeField(page, binding);
+  return binding.fields[0].field === 'otp' ? binding : discoverAuthenticationCodeField(page, binding);
 }
 
 export type SignInReply = { readonly kind: 'code' | 'link'; readonly value: string } | { readonly kind: 'unavailable' };
@@ -352,14 +355,14 @@ const signInReplyGuard = defineGuardedAction({
 /** Bearer navigation has no observation boundary until a fresh root document and empty history exist. */
 async function consumeMagicLink(
   context: BrowserExecutionContext,
-  binding: BoundBrowserSecretField,
+  binding: BoundBrowserSecretFields,
   claim: SignInClaim,
   link: string,
 ): Promise<Record<string, unknown>> {
   if (!sameOrigin(binding)) return { status: 'origin_mismatch' };
   return openBearerLink(
     context,
-    { page: binding.page, frame: binding.target.frame, origin: binding.origin },
+    { page: binding.page, frame: binding.fields[0].target.frame, origin: binding.origin },
     claim,
     link,
     async () => ({ status: 'link_opened' }),
@@ -508,7 +511,7 @@ export async function executeSignInCode(
   const page = await context.page();
   return withBrowserJobNavigation(context, page, async () => {
     let refs = new Map<string, PinnedBrowserRef>();
-    let discovered: BoundBrowserSecretField | undefined;
+    let discovered: BoundBrowserSecretFields | undefined;
     let claim: SignInClaim | undefined;
     let retained = false;
     let assistantWait: ReturnType<typeof awaitAssistantReply> | undefined;
@@ -536,11 +539,10 @@ export async function executeSignInCode(
       // The assistant signs in with its web address, never one it converses from.
       const email = kind === 'username' ? await signInAddress(await target.element.inputValue()) : undefined;
       if (kind === 'username' && email === undefined) return { status: 'alias_unavailable' };
-      const binding = await bindBrowserSecretField(
+      const binding = await bindBrowserSecretFields(
         page,
-        target,
+        [{ field: kind, target }],
         kind === 'username' ? send : refs.get((payload.submit ?? payload.send).ref)!,
-        kind,
       );
       if (
         !sameOrigin(binding) ||
@@ -564,7 +566,7 @@ export async function executeSignInCode(
       await context.assertActive();
       if (kind === 'username' && email !== undefined) {
         if (!activeInbox()) throw forbidden('The assistant inbox is unavailable.');
-        const sent = await fillBoundBrowserSecret(context, binding, async () => email);
+        const sent = await fillBoundBrowserSecrets(context, binding, async () => [email]);
         if (sent.status === 'origin_mismatch' || sent.status === 'site_busy') return sent;
         if (sent.status !== 'submitted' && sent.status !== 'cleared_after_submit')
           throw forbidden('The host could not safely request this sign-in.');
@@ -573,7 +575,7 @@ export async function executeSignInCode(
           page,
           send.element,
           async () => {
-            throw forbidden('This sign-in flow requires native submission.');
+            await send.element.click({ timeout: context.remaining() });
           },
           undefined,
           {
@@ -608,7 +610,7 @@ export async function executeSignInCode(
       }
       discovered = await codeBinding(page, binding);
       if (!discovered || !sameOrigin(discovered)) return { status: 'origin_mismatch' };
-      const filled = await fillBoundBrowserSecret(context, discovered, async () => secret.value);
+      const filled = await fillBoundBrowserSecrets(context, discovered, async () => [secret.value]);
       if (filled.status === 'origin_mismatch' || filled.status === 'site_busy') return filled;
       if (filled.status !== 'submitted' && filled.status !== 'cleared_after_submit')
         throw forbidden('The host could not safely complete this sign-in.');
@@ -621,10 +623,10 @@ export async function executeSignInCode(
       assistantWait?.dispose();
       if (claim && !retained) await finishSignInClaim(claim.id);
       if (!retained) await disposeBrowserRefs(refs);
-      if (discovered && ![...refs.values()].some((ref) => ref.element === discovered!.target.element)) {
+      if (discovered && ![...refs.values()].some((ref) => ref.element === discovered!.fields[0].target.element)) {
         await disposeBrowserRefs(
           new Map([
-            ['field', discovered.target],
+            ['field', discovered.fields[0].target],
             ['submit', discovered.submit],
           ]),
         );
@@ -738,7 +740,7 @@ async function executeRelayCode(
     )
       return result;
     result = await withBrowserJobNavigation(context, live.binding.page, async () => {
-      const filled = await fillBoundBrowserSecret(context, live.binding, async () => relayed.code);
+      const filled = await fillBoundBrowserSecrets(context, live.binding, async () => [relayed.code]);
       return {
         status:
           filled.status === 'submitted' || filled.status === 'cleared_after_submit' ? 'code_filled' : filled.status,
