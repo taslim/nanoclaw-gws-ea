@@ -254,6 +254,8 @@ export async function fillBoundBrowserSecrets(
   const { page, fields, submit } = binding;
   let values: readonly string[] = [];
   let navigated = false;
+  let nativeFilled = false;
+  let activationCompleted = false;
   const navigation = (frame: ReturnType<Page['mainFrame']>): void => {
     if (frame === submit.frame) navigated = true;
   };
@@ -305,8 +307,10 @@ export async function fillBoundBrowserSecrets(
           async () => {
             assertBrowserSecretDiagnosticsSafe();
             const filled = await fillNativeCredentialGroup(submit.frame, current.native, values, context.assertActive);
+            nativeFilled = filled !== 'not_inserted';
             if (filled !== 'filled') throw unsupported();
             await activateBoundBrowserSignIn(context, current, values);
+            activationCompleted = true;
           },
           { waitForRequests: true },
         ),
@@ -320,11 +324,12 @@ export async function fillBoundBrowserSecrets(
     throw forbidden('The host could not safely complete this sign-in. Take a fresh observation.');
   } finally {
     page.off('framenavigated', navigation);
-    // The next step may carry its account identifier in a hidden/read-only field. It stays redacted.
-    const secrets = values.filter((_value, index) => fields[index]?.field !== 'username');
+    // Keep carried account identifiers after activation or navigation; a refused fill has no next step to preserve.
+    const clearUsername = nativeFilled && !activationCompleted && !navigated;
+    const secrets = values.filter((_value, index) => fields[index]?.field !== 'username' || clearUsername);
     if (secrets.length) await settleFilledSecrets(context, page, secrets);
     for (const [index, value] of values.entries())
-      if (fields[index]?.field === 'username') releasePageSecret(page, value);
+      if (fields[index]?.field === 'username' && !clearUsername) releasePageSecret(page, value);
   }
 }
 

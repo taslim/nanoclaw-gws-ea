@@ -298,23 +298,41 @@ describe.skipIf(!chromePath)('native host secret fill', { timeout: 30_000 }, () 
     });
   }
 
-  it('uses fresh references for email then password steps with the same saved login', async () => {
-    const item = await logins.store.create({
-      site: 'auth.example',
-      title: 'Saved login',
-      username: 'principal@example.test',
-      password: secret,
+  for (const transition of ['navigation', 'same-document'] as const) {
+    it(`uses fresh references for email then password steps after ${transition}`, async () => {
+      const item = await logins.store.create({
+        site: 'auth.example',
+        title: 'Saved login',
+        username: 'principal@example.test',
+        password: secret,
+      });
+      await page.goto('https://auth.example/step/email');
+      if (transition === 'same-document')
+        await page.evaluate(`
+        document.querySelector('form').addEventListener('submit', async event => {
+          event.preventDefault();
+          const response = await fetch('/step/email', {
+            method: 'POST', body: new URLSearchParams(new FormData(event.target))
+          });
+          document.body.innerHTML = await response.text();
+          const account = document.querySelector('input[name=username]');
+          account.type = 'email';
+          account.readOnly = true;
+        });
+      `);
+      expect(await savedFill(item.id, ['username'])).toMatchObject({
+        status: transition === 'navigation' ? 'submitted' : 'cleared_after_submit',
+      });
+      await expect.poll(() => page.locator('h1').textContent()).toBe('Password step');
+      expect(JSON.stringify(await observePage(page))).not.toContain('principal@example.test');
+      expect(await savedFill(item.id, ['password'])).toMatchObject({ status: 'submitted' });
+      expect(posts.map((post) => Object.fromEntries(new URLSearchParams(post.body)))).toEqual([
+        { username: 'principal@example.test' },
+        { username: 'principal@example.test', password: secret },
+      ]);
+      expect(await page.locator('h1').textContent()).toBe('Signed in');
     });
-    await page.goto('https://auth.example/step/email');
-    expect(await savedFill(item.id, ['username'])).toMatchObject({ status: 'submitted' });
-    await expect.poll(() => page.locator('h1').textContent()).toBe('Password step');
-    expect(await savedFill(item.id, ['password'])).toMatchObject({ status: 'submitted' });
-    expect(posts.map((post) => Object.fromEntries(new URLSearchParams(post.body)))).toEqual([
-      { username: 'principal@example.test' },
-      { username: 'principal@example.test', password: secret },
-    ]);
-    expect(await page.locator('h1').textContent()).toBe('Signed in');
-  });
+  }
 
   it('never submits a saved password in a native GET address', async () => {
     const item = await logins.store.create({
@@ -362,11 +380,49 @@ describe.skipIf(!chromePath)('native host secret fill', { timeout: 30_000 }, () 
       password: secret,
     });
     await page.goto('https://auth.example/u/login');
+    await page.evaluate(`
+      document.querySelector('input[name=password]').addEventListener('input', () => {
+        document.getElementById('go').textContent = 'Pay now';
+        const username = document.querySelector('input[name=username]').value;
+        const mirror = document.createElement('p');
+        mirror.textContent = username;
+        document.body.append(mirror);
+        const copy = document.createElement('input');
+        copy.type = 'hidden';
+        copy.name = 'copied-account';
+        copy.value = username;
+        document.body.append(copy);
+      });
+    `);
+    await expect(savedFill(item.id, ['username', 'password'])).rejects.toMatchObject({ code: 'forbidden' });
+    expect(posts).toEqual([]);
+    expect(await page.locator('input[name=username]').inputValue()).toBe('');
+    expect(await page.locator('input[name=copied-account]').inputValue()).toBe('');
+    expect(await page.locator('input[name=password]').inputValue()).toBe('');
+    expect(await page.locator('p').textContent()).toBe('principal@example.test');
+    expect(JSON.stringify(await observePage(page))).not.toContain('principal@example.test');
+    expect(
+      await executeBrowserBatch(context(), { actions: [{ kind: 'screenshot' }] }, { record: false }),
+    ).toMatchObject({
+      status: 'stopped',
+      reason: 'secret_field',
+    });
+  });
+
+  it('clears the account identifier when an input callback invalidates a filled credential group', async () => {
+    const item = await logins.store.create({
+      site: 'auth.example',
+      title: 'Saved login',
+      username: 'principal@example.test',
+      password: secret,
+    });
+    await page.goto('https://auth.example/u/login');
     await page.evaluate(
-      "document.querySelector('input[name=password]').addEventListener('input', () => { document.getElementById('go').textContent = 'Pay now'; });",
+      "document.querySelector('input[name=password]').addEventListener('input', event => { event.target.value = ''; });",
     );
     await expect(savedFill(item.id, ['username', 'password'])).rejects.toMatchObject({ code: 'forbidden' });
     expect(posts).toEqual([]);
+    expect(await page.locator('input[name=username]').inputValue()).toBe('');
     expect(await page.locator('input[name=password]').inputValue()).toBe('');
   });
 
@@ -525,6 +581,7 @@ describe.skipIf(!chromePath)('native host secret fill', { timeout: 30_000 }, () 
       } else {
         await expect(savedFill(item.id, ['username', 'password'])).rejects.toMatchObject({ code: 'forbidden' });
         expect(posts).toEqual([]);
+        expect(await page.locator('input[name=username]').inputValue()).toBe('');
         expect(await page.locator('input[name=password]').inputValue()).toBe('');
       }
     });
