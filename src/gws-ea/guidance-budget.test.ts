@@ -72,7 +72,7 @@ const BUDGETS: Readonly<Record<Agent, { readonly tokens: number; readonly reason
   browser: {
     tokens: 4_800,
     reason:
-      '4,790 tokens (19,160 characters): the sealed errand, its safety boundaries and restored host browser tool protocols, with duplicated account guidance removed; rounded up.',
+      '4,793 tokens (19,172 characters): the sealed errand, its safety boundaries and restored host browser tool protocols, including which typed codes a masked field takes, with duplicated account guidance removed; rounded up.',
   },
 };
 
