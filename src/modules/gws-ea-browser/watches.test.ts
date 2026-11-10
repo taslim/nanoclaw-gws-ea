@@ -1257,6 +1257,23 @@ describe('watches on sites with no reader', () => {
     expect(await getDb().all('SELECT id FROM gws_ea_browser_watches')).toEqual([]);
   });
 
+  it('refuses a reader watch whose page is not the address its checks would load, and stores no watch', async () => {
+    const { context } = await executionContext('reader-not-at-address');
+    vi.spyOn(watchRuntime, 'readBrowserWatchSetup').mockResolvedValue({ status: 'refused', reason: 'not_at_address' });
+    expect(await createBrowserWatch(context, free)).toEqual({ status: 'refused', reason: 'not_at_address' });
+    expect(await getDb().all('SELECT id FROM gws_ea_browser_watches')).toEqual([]);
+  });
+
+  it('refuses booking inputs a watch cannot use as invalid args', () => {
+    for (const raw of [
+      { ...regionRequest, parameters: { party: '2' }, region: { ref: 'e5', generation: 3 } },
+      { ...free, parameters: { party: 2 } },
+    ])
+      expect(() => validateWatchRequest(raw)).toThrow(
+        expect.objectContaining({ code: 'invalid-args', message: expect.stringContaining('parameters') as unknown }),
+      );
+  });
+
   it('reads a region and the watch to mark again, and keeps a queued release readable when it runs', async () => {
     expect(validateWatchRequest({ ...regionRequest, region: { ref: 'f1e7', generation: 3 } }).region).toEqual({
       ref: 'f1e7',
