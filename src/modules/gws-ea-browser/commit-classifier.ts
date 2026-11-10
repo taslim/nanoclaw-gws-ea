@@ -3,7 +3,7 @@ import type { CDPSession, ElementHandle, Frame, Page, Request } from 'playwright
 import { getDomain } from 'tldts';
 import { genericCheckoutSignature } from './generic-signature.js';
 import { SiteLeaseStore } from './leases.js';
-import { documentGate, type PausedDocument } from './document-gate.js';
+import { documentGate, type CapturedHold, type HeldRequest, type PausedDocument } from './document-gate.js';
 import { coverPageTargets, ensurePageTargets, onUncoveredPageTarget, pageTargetsReady } from './page-targets.js';
 import { browserOperationId, type BrowserOperationContext } from './actions.js';
 import { paymentProcessorHost, readPageControlFacts, type ControlFacts } from './control-facts.js';
@@ -393,14 +393,28 @@ export interface BrowserNavigationPolicy {
   /** Runs for each document the rules call ordinary, the page's own top-level one or a frame's. */
   beforeNavigate?(url: URL, document: NavigationDocument): Promise<'ordinary' | 'site_busy' | 'blocked_address'>;
 }
+/** Where a credential hold lets host-filled values go. */
+export interface SubmissionSite {
+  /** The registrable domain the filled values stay on. */
+  readonly site: string;
+  /** The values the host filled: a request to another site that carries one is refused. */
+  readonly values: readonly string[];
+  /**
+   * Hears each document the hold refused for leaving the site. A refused script request only records a diagnostic:
+   * a sign-in page's own telemetry beacons do not make its sign-in fail.
+   */
+  readonly departed?: () => void;
+}
 export interface BrowserNavigationGuard {
   reason(): NavigationRefusal | undefined;
   clearReason(): void;
   /**
-   * Refuses the page's HTTP requests, its frames' and windows' included, until this authority allows them, so a
-   * page's input handlers cannot submit a filled credential.
+   * Refuses the page's HTTP requests and documents, its frames' and windows' included, until this authority allows
+   * them, so a page's input handlers cannot submit a filled credential. With `onSite`, the hold refuses only a
+   * document that is not a GET and leaves that site, and any other request to another site whose address or body
+   * carries a filled value, so the site's own sign-in, its captcha, its reads and its telemetry go ahead.
    */
-  holdSubmissions(authority: string): void;
+  holdSubmissions(authority: string, onSite?: SubmissionSite): void;
   /** Lifts only this authority's hold; another authority's keeps refusing. */
   allowSubmissions(authority: string): void;
   runWithPolicy<T>(policy: BrowserNavigationPolicy, operation: () => Promise<T>): Promise<T>;
@@ -518,6 +532,51 @@ async function decideNavigation(
   return admitted;
 }
 
+function onHoldSite(hold: SubmissionSite, url: string): boolean {
+  return URL.canParse(url) && new URL(url).protocol === 'https:' && registrableSite(url) === hold.site;
+}
+
+function decoded(text: string): string {
+  try {
+    return decodeURIComponent(text.replace(/\+/gu, ' '));
+    // eslint-disable-next-line no-catch-all/no-catch-all -- text that is not percent-encoding is read as it is
+  } catch (_error) {
+    return text;
+  }
+}
+
+/** The forms a page script commonly sends a value in: as typed, URL- or form-encoded, JSON-escaped, or base64. */
+function sentForms(value: string): string[] {
+  const base64 = Buffer.from(value, 'utf8').toString('base64');
+  return [
+    value,
+    encodeURIComponent(value),
+    new URLSearchParams({ v: value }).toString().slice(2),
+    JSON.stringify(value).slice(1, -1),
+    base64,
+    base64.replace(/=+$/u, ''),
+    Buffer.from(value, 'utf8').toString('base64url'),
+  ].map((form) => form.toLowerCase());
+}
+
+/** Case-insensitive, since a host name in an address is lowercased on the way out. */
+function carriesHeldValue(texts: readonly string[], values: readonly string[]): boolean {
+  const read = texts.flatMap((text) => [text.toLowerCase(), decoded(text).toLowerCase()]);
+  return values.some((value) => sentForms(value).some((form) => read.some((text) => text.includes(form))));
+}
+
+/** A document leaves by being sent anywhere but the site as anything but a GET. */
+function holdRefusesDocument(hold: SubmissionSite | undefined, document: HeldRequest): boolean {
+  return !hold || (document.method.toUpperCase() !== 'GET' && !onHoldSite(hold, document.url));
+}
+
+/** Any other request leaves only by carrying a filled value to another site, or a body the gate could not read. */
+function holdRefusesRequest(hold: SubmissionSite | undefined, request: HeldRequest): boolean {
+  if (!hold) return true;
+  if (onHoldSite(hold, request.url)) return false;
+  return request.body === undefined || carriesHeldValue([request.url, request.body], hold.values);
+}
+
 /** What page script sends, a beacon (`Ping`) included. */
 const SCRIPT_REQUEST_TYPES = ['XHR', 'Fetch', 'Ping'] as const;
 /** How long an action's window stays open after it: enough for a handler that awaits one round trip, then posts. */
@@ -580,7 +639,7 @@ function withoutReferrer(headers: Record<string, string>): Array<{ name: string;
 async function installNavigationGuard(page: Page): Promise<BrowserNavigationGuard> {
   let blocked: NavigationRefusal | undefined;
   const policies: BrowserNavigationPolicy[] = [];
-  const submissionHolds = new Set<string>();
+  const submissionHolds = new Map<string, SubmissionSite | undefined>();
   // Each outermost operation, and each span between them, is its own generation. A decision is
   // reported only to the generation its request paused in; a late one is still enforced, not reported.
   let generation = 0;
@@ -611,7 +670,7 @@ async function installNavigationGuard(page: Page): Promise<BrowserNavigationGuar
     capture() {
       const recordRefusal = captureBrowserDiagnosticRefusal(page);
       const scopes = [...policies];
-      const held = submissionHolds.size > 0;
+      const holds = [...submissionHolds.values()];
       // Inside an operation, a free press's dialog admits its checkout origin's routes as the press did.
       const approved = approvedPresses.get(page) ?? (scopes.length ? currentFreeDialog(page)?.admission : undefined);
       const pausedIn = generation;
@@ -621,10 +680,34 @@ async function installNavigationGuard(page: Page): Promise<BrowserNavigationGuar
       const record = (classification: NavigationRefusal): void => {
         if (pausedIn === generation) blocked = classification;
       };
+      // A hold without a site refuses everything quietly; one with a site records what tried to leave it.
+      const sitedRefusing = (refuses: (held: SubmissionSite) => boolean): SubmissionSite[] =>
+        holds.filter((held): held is SubmissionSite => held !== undefined && refuses(held));
+      const hold: CapturedHold | undefined = holds.length
+        ? {
+            refuses: (request) => holds.some((held) => holdRefusesRequest(held, request)),
+            refused(request, resource) {
+              if (!sitedRefusing((held) => holdRefusesRequest(held, request)).length) return;
+              recordRefusal('action', { url: request.url, method: request.method, resource }, 'origin_mismatch');
+            },
+          }
+        : undefined;
       return {
-        submissionsHeld: held,
+        ...(hold ? { hold } : {}),
         async decide(document) {
-          if (held) return { allow: false };
+          if (holds.some((held) => holdRefusesDocument(held, document))) {
+            const sited = sitedRefusing((held) => holdRefusesDocument(held, document));
+            if (sited.length) {
+              for (const held of sited) held.departed?.();
+              record('blocked_address');
+              recordRefusal(
+                'document',
+                { url: document.url, method: document.method, resource: 'document' },
+                'origin_mismatch',
+              );
+            }
+            return { allow: false };
+          }
           let classification: ActionClass | 'site_busy' | 'read_only';
           try {
             classification = await decideNavigation(document.url, document, scopes, approved, () =>
@@ -712,8 +795,8 @@ async function installNavigationGuard(page: Page): Promise<BrowserNavigationGuar
     clearReason() {
       blocked = undefined;
     },
-    holdSubmissions(authority) {
-      submissionHolds.add(authority);
+    holdSubmissions(authority, onSite) {
+      submissionHolds.set(authority, onSite);
     },
     allowSubmissions(authority) {
       submissionHolds.delete(authority);
