@@ -1,32 +1,18 @@
 import { linkWatchBookingRecipe } from './watch-recipes.js';
-import { type BrowserRecipeParameter, type BrowserRecipe, loadRecipe } from './recipe-store.js';
+import { type BrowserRecipeParameter, loadRecipe } from './recipe-store.js';
 import { checkpoint as recordedCheckpoint, type BrowserRecipeStep, type RecipeCheckpoint } from './recording.js';
 import { browserKeyboardSubmitTarget } from './action-targets.js';
 import { type BrowserAction, type BrowserBatchOptions } from './actions.js';
-import {
-  ariaNodes,
-  flatten,
-  checkpointUrl,
-  captureLocator,
-  captureElementRole,
-  resolveLocator,
-  type StructuredBrowserLocator,
-} from './locators.js';
+import { checkpointUrl, captureElementRole, resolveLocator, type StructuredBrowserLocator } from './locators.js';
 import { randomUUID } from 'node:crypto';
 import type { Page } from 'playwright-core';
 import { invalidArgs } from '../../cli/delivery-action.js';
 import { isRecord } from '../../gws-ea/validation.js';
 import { classifyNavigationUrl } from './control-policy.js';
-import { readPageControlFacts } from './control-facts.js';
+import { readPageControlFacts, withheldField } from './control-facts.js';
 import { executeBrowserBatch } from './executor.js';
 import { browserSite } from './leases.js';
-import {
-  browserRefForElement,
-  observePage,
-  snapshotBrowserStructure,
-  type BrowserRef,
-  type PinnedBrowserRef,
-} from './observe.js';
+import { browserRefForElement, observePage, snapshotBrowserStructure, type BrowserRef } from './observe.js';
 import { redactPageData } from './page-privacy.js';
 import type { BrowserExecutionContext, BrowserOperationContext, BrowserQueuedAction } from './actions.js';
 
@@ -99,32 +85,6 @@ export function validateRunRecipe(raw: Record<string, unknown>): RunRecipeInput 
 function checkpoint(snapshot: Awaited<ReturnType<typeof snapshotBrowserStructure>>): RecipeCheckpoint {
   if (!snapshot.replayUrl) throw invalidArgs('This page has no safe replay checkpoint.');
   return recordedCheckpoint(snapshot);
-}
-/**
- * A watch's marked region: the element's structured locator, recorded as a recipe step's target is, when its page is
- * where `recipe` ends (the same address path and heading; inputs may change its query). `off_route` when it is
- * elsewhere, undefined when no accessible role and name find the element again. A watch replays the recipe, then finds
- * the region by `locateStructured`.
- */
-export async function captureRecipeRegion(
-  page: Page,
-  target: PinnedBrowserRef,
-  recipe: BrowserRecipe,
-): Promise<StructuredBrowserLocator | 'off_route' | undefined> {
-  const snapshot = await snapshotBrowserStructure(page);
-  const end = recipe.steps.at(-1)?.after;
-  const here = checkpoint(snapshot);
-  const route = (point: RecipeCheckpoint): string => {
-    const url = new URL(point.url);
-    return JSON.stringify([url.origin, url.pathname, point.heading ?? null]);
-  };
-  if (!end || route(end) !== route(here)) return 'off_route';
-  try {
-    return await captureLocator(target, flatten(ariaNodes(snapshot.tree)));
-  } catch (error) {
-    if (error instanceof Error) return undefined;
-    throw error;
-  }
 }
 function inputValue(action: BrowserAction): string | undefined {
   if (action.kind === 'type') return action.text;
@@ -433,7 +393,7 @@ export async function executeRecipe(
         for (const locator of targets.slice(0, expectedInputs.length)) {
           const element = await resolveLocator(page, locator, false);
           try {
-            if ((await readPageControlFacts(page, element)).secretEntry)
+            if (withheldField(await readPageControlFacts(page, element)))
               throw new Error('The recorded input became a secret field');
             actual.push(await element.inputValue());
           } finally {

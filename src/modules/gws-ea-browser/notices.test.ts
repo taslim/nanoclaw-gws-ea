@@ -74,8 +74,8 @@ it('delivers purchase, card, watch and site notices to cold and active browser t
   );
   await getDb().run(
     `INSERT INTO gws_ea_browser_watches
-     (id,job_id,site,check_recipe_id,check_recipe_version,parameters_json,check_key,bounds_json,status,created_at,updated_at,next_check_at)
-     VALUES('notice-watch',?,'resy.com','recipe',1,'{}','key','{}','armed',?,?,?)`,
+     (id,job_id,site,address,bounds_json,status,created_at,updated_at,next_check_at)
+     VALUES('notice-watch',?,'resy.com','https://resy.com/venue','{}','armed',?,?,?)`,
     job.id,
     at,
     at,

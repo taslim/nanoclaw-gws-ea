@@ -57,9 +57,8 @@ async function promoteWatchRecipe(
     return;
   if (!active()) return;
   await db.run(
-    `INSERT INTO gws_ea_browser_watch_recipe_links(check_recipe_id,check_recipe_version,booking_recipe_id,booking_recipe_version,source_watch_id,source_attempt_id,verified_at) VALUES(?,?,?,?,?,?,?) ON CONFLICT DO NOTHING`,
-    watch.check_recipe_id,
-    watch.check_recipe_version,
+    `INSERT INTO gws_ea_browser_watch_recipe_links(site,booking_recipe_id,booking_recipe_version,source_watch_id,source_attempt_id,verified_at) VALUES(?,?,?,?,?,?) ON CONFLICT DO NOTHING`,
+    watch.site,
     recipe.id,
     recipe.version,
     watch.id,
@@ -76,12 +75,13 @@ export async function linkWatchBookingRecipe(context: BrowserExecutionContext, r
   )
     return;
   const watches = await context.store.db.all<WatchRow>(
-    "SELECT * FROM gws_ea_browser_watches WHERE job_id = ? AND site = ? AND status IN ('armed','checking','preparing','booked')",
+    // A region watch never books by itself, so only a reader watch takes a booking recipe.
+    "SELECT * FROM gws_ea_browser_watches WHERE job_id = ? AND site = ? AND region_json IS NULL AND status IN ('armed','checking','preparing','booked')",
     context.job.id,
     recipe.site,
   );
   for (const watch of watches) {
-    const parameters = JSON.parse(watch.parameters_json) as Record<string, string>;
+    const parameters = JSON.parse(watch.booking_parameters_json) as Record<string, string>;
     if (
       JSON.stringify(Object.keys(parameters).sort()) !==
         JSON.stringify(recipe.parameters.map((entry) => entry.name).sort()) ||

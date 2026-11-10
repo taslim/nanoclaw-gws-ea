@@ -242,12 +242,14 @@ until connector uninstall, which closes all policies before remote cleanup.
 
 The built-in GWS-EA host browser has a separate sign-in boundary from API
 credential injection: its Chrome traffic uses a per-assistant public-only proxy,
-never the credential gateway. It signs in with saved logins and with emailed
-codes and magic links, including a code the principal relays through main; the
-existing isolated external-email agent interprets assistant-mail codes and links
-in a per-claim system session. The host alone reads, generates, saves and fills
-credentials into a validated HTTPS frame; agents see opaque handles and outcomes
-only.
+never the credential gateway. It signs in with saved logins, filled only on a
+frame of the login's registrable domain and a password only into a masked
+password field (a username alone stays for the agent to press Next), and with
+codes and magic links emailed to the assistant, which the existing isolated
+external-email agent interprets in a per-claim system session and the host holds
+and fills. A code sent to the principal reaches browser in main's message and
+is typed as ordinary text. The host alone reads, generates, saves and fills
+credentials; agents see opaque handles and outcomes only.
 
 Each assistant keeps its built-in store at `browser/logins.db` under its instance
 root, outside NanoClaw update snapshots and container mounts. Only passwords are
@@ -318,16 +320,19 @@ transaction page (a total or charge with a payment method in one form or
 dialog), else ordinary. Control facts are read in isolated worlds. Ordinary
 actions run as native Playwright actions with the hit-target check; during each
 one, non-GET script requests to payment processors and purchase routes are
-refused, and a document that loads between operations must be an ordinary GET
+refused (in a dialog a free press opened, the checkout's own purchase routes are
+admitted), and a document that loads between operations must be an ordinary GET
 on the job's leased site.
 
-A commit-class click answers `purchase_control`, and the agent calls
-`purchase`. A free booking is pressed by the host; a checkout with no saved
-payment method answers `card_needed` (there is no card entry); every paid
+A commit-class click on a free checkout is pressed by the host after its consent
+pass and records no attempt: the agent confirms it from the page or mail, and a
+repeat with the same facts answers `already_pressed`. Any other commit-class
+click answers `purchase_control`, and the agent calls `purchase`; a checkout
+with no saved payment method answers `card_needed` (there is no card entry); every paid
 checkout goes to the principal as a card with the host-read facts and a clipped
 picture of the checkout. Reviewed Amazon US and Resy readers keep exact facts;
 any other site uses `generic-signature.ts`. One resolve function settles every
-attempt: without page proof it is `unconfirmed`, only the next purchase on that
+paid attempt: without page proof it is `unconfirmed`, only the next purchase on that
 merchant waits, and main records the outcome from the order email or the
 principal with `record_purchase_outcome`. A paid confirmation after an
 ordinary click is an `unapproved_commit` incident.
@@ -350,8 +355,9 @@ do, and other groups, including active job agents, require an explicit stored
 available and retires earlier access lists; their records remain for rollback.
 `gws-ea status --details` observes the managed browser network's proxy and
 debugger isolation.
-Watches on a site without a reader record a recipe, a marked region and its
-baseline, and wake the agent only when the region changes; release checks
+Watches on a site without a reader record the page address, a marked region and
+its baseline read signed out, and wake the agent only when the region changes; a
+free press in the watch's job spends its one booking and ends it. Release checks
 follow the venue's stated schedule.
 
 The host has one concrete runtime (`runtime.ts`), composed by `index.ts` with the

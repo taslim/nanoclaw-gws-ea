@@ -95,6 +95,7 @@ describe('the matters schema', () => {
       'needs_minutes',
       'place',
       'deferrals',
+      'open_loop_changed_at',
     ]);
     expect(await columns('gws_ea_matter_links')).toEqual([
       'matter_id',
@@ -190,6 +191,7 @@ describe('opening and placing', () => {
       needs_minutes: null,
       place: null,
       deferrals: 0,
+      open_loop_changed_at: NOW,
       links: [
         { kind: 'thread', reference: THREAD_A, handler: null, linked_at: NOW },
         { kind: 'event', reference: EVENT, handler: null, linked_at: NOW },

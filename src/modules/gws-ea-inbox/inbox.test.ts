@@ -174,7 +174,7 @@ import {
 import { MAX_ROUTING_ATTEMPTS } from './adapter.js';
 import { createSignInClaim, getSignInClaim, recoverSignInClaims } from './claims.js';
 import { registerInboxObserver } from './observers.js';
-import { browserSignInMigration } from '../gws-ea-browser/sign-in-migration.js';
+import { browserSignInAssistantOnlyMigration, browserSignInMigration } from '../gws-ea-browser/sign-in-migration.js';
 import { createCalendarListApi, UNSHARED_RETRY_MS } from './calendar-notifications.js';
 import { emailMessagingGroupIds, listPrincipalCalendars, recordFailedAttempt } from './db.js';
 import { MAX_ATTACHMENT_BYTES, MESSAGES_PER_SENDER_PER_HOUR } from './route-mail.js';
@@ -867,10 +867,10 @@ afterEach(async () => {
 
 it('hands matching sign-in mail and HTML only to one isolated system session, once', async () => {
   await browserSignInMigration.up(getDb());
+  await browserSignInAssistantOnlyMigration.up(getDb());
   await createSignInClaim({
     id: 'browser-claim',
     jobId: 'browser-job',
-    source: 'assistant',
     origin: 'https://shop.example',
     binding: { frame: 0, field: 'e1' },
     at: new Date(now()),
@@ -933,10 +933,10 @@ it('refuses system sign-in sessions both typed email and ordinary automatic repl
 
 it('retries a reserved Spam message after transient dispatch failure without leaking unrelated Spam', async () => {
   await browserSignInMigration.up(getDb());
+  await browserSignInAssistantOnlyMigration.up(getDb());
   await createSignInClaim({
     id: 'spam-claim',
     jobId: 'job',
-    source: 'assistant',
     origin: 'https://shop.example',
     binding: {},
     at: new Date(now()),
@@ -964,10 +964,10 @@ it('retries a reserved Spam message after transient dispatch failure without lea
 
 it.each(['expiry', 'recovery'] as const)('keeps failed reserved credentials isolated after %s', async (mode) => {
   await browserSignInMigration.up(getDb());
+  await browserSignInAssistantOnlyMigration.up(getDb());
   await createSignInClaim({
     id: 'ended-claim',
     jobId: 'job',
-    source: 'assistant',
     origin: 'https://shop.example',
     binding: {},
     at: new Date(now()),
@@ -991,10 +991,10 @@ it.each(['expiry', 'recovery'] as const)('keeps failed reserved credentials isol
 
 it('exhausts sign-in dispatch retries quietly while ordinary principal mail progresses', async () => {
   await browserSignInMigration.up(getDb());
+  await browserSignInAssistantOnlyMigration.up(getDb());
   await createSignInClaim({
     id: 'failed-claim',
     jobId: 'job',
-    source: 'assistant',
     origin: 'https://shop.example',
     binding: {},
     at: new Date(now()),
@@ -1023,6 +1023,7 @@ it('exhausts sign-in dispatch retries quietly while ordinary principal mail prog
 
 it('retries reserved dispatch within one second in the real loop without extra calendar refresh', async () => {
   await browserSignInMigration.up(getDb());
+  await browserSignInAssistantOnlyMigration.up(getDb());
   vi.useFakeTimers();
   const controller = new AbortController();
   const calendarLists = vi.spyOn(calendar, 'list');
@@ -1032,7 +1033,6 @@ it('retries reserved dispatch within one second in the real loop without extra c
     await createSignInClaim({
       id: 'retry-claim',
       jobId: 'job',
-      source: 'assistant',
       origin: 'https://shop.example',
       binding: {},
       at: new Date(now()),
@@ -1054,10 +1054,10 @@ it('retries reserved dispatch within one second in the real loop without extra c
 
 it('keeps a principal-only message private when its domain matches a sign-in claim', async () => {
   await browserSignInMigration.up(getDb());
+  await browserSignInAssistantOnlyMigration.up(getDb());
   await createSignInClaim({
     id: 'principal-domain',
     jobId: 'job',
-    source: 'assistant',
     origin: 'https://portal.principal.example',
     binding: {},
     at: new Date(now()),
@@ -1075,10 +1075,10 @@ it('keeps a principal-only message private when its domain matches a sign-in cla
 
 it('preserves a complete HTML magic-link target after a large email template', async () => {
   await browserSignInMigration.up(getDb());
+  await browserSignInAssistantOnlyMigration.up(getDb());
   await createSignInClaim({
     id: 'template-claim',
     jobId: 'job',
-    source: 'assistant',
     origin: 'https://shop.example',
     binding: {},
     at: new Date(now()),
@@ -1110,11 +1110,11 @@ it('preserves a complete HTML magic-link target after a large email template', a
 
 it('stops fetching full messages once every pending sign-in has matched', async () => {
   await browserSignInMigration.up(getDb());
+  await browserSignInAssistantOnlyMigration.up(getDb());
   await inbox.tick();
   await createSignInClaim({
     id: 'bounded-claim',
     jobId: 'job',
-    source: 'assistant',
     origin: 'https://shop.example',
     binding: {},
     at: new Date(now()),
@@ -1133,6 +1133,7 @@ it('stops fetching full messages once every pending sign-in has matched', async 
 
 it('wakes one inbox loop promptly, polls pending mail quickly, and retains the calendar cadence', async () => {
   await browserSignInMigration.up(getDb());
+  await browserSignInAssistantOnlyMigration.up(getDb());
   vi.useFakeTimers();
   const controller = new AbortController();
   const calendarLists = vi.spyOn(calendar, 'list');
@@ -1144,7 +1145,6 @@ it('wakes one inbox loop promptly, polls pending mail quickly, and retains the c
     await createSignInClaim({
       id: 'fast-claim',
       jobId: 'job',
-      source: 'assistant',
       origin: 'https://shop.example',
       binding: {},
       at: new Date(now()),

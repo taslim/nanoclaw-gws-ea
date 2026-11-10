@@ -1,19 +1,40 @@
+import type { Page } from 'playwright-core';
 import { expect, it } from 'vitest';
+import { observePage } from './observe.js';
 import { normalizeWatchRegion, watchCheckFailure } from './watch-runtime.js';
 
-it('carries recipe stop reasons into site backoff instead of treating challenges as ordinary drift', () => {
-  expect(watchCheckFailure({ status: 'checkpoint_failed', found: { reason: 'challenge' } })).toEqual({
-    status: 'blocked',
-  });
-  expect(watchCheckFailure({ status: 'checkpoint_failed', found: { reason: 'site_busy' } })).toEqual({
-    status: 'site_busy',
-  });
-  expect(watchCheckFailure({ status: 'checkpoint_failed', observation: { snapshot: 'Verify you are human' } })).toEqual(
-    { status: 'blocked' },
-  );
-  expect(watchCheckFailure({ status: 'checkpoint_failed', found: { heading: 'A changed restaurant title' } })).toEqual({
-    status: 'failed',
-  });
+/** A page the host observed: sixty listings, more than one snapshot holds, then `ending` as its last line. */
+async function observedListings(ending: string): Promise<{ page: Page; snapshot: string }> {
+  const tree = [
+    ...Array.from({ length: 60 }, (_value, index) => ({
+      role: 'region',
+      name: `Listing ${index + 1}`,
+      ref: `e${10 + index}`,
+      text: 'Garden flat near the river with morning light. '.repeat(8),
+    })),
+    { role: 'paragraph', ref: 'e99', text: ending },
+  ];
+  const page = {
+    url: () => 'https://larder.example/tables',
+    on() {},
+    frames: () => [],
+    locator: () => ({ ariaSnapshotJSON: async () => tree }),
+  } as unknown as Page;
+  return { page, snapshot: (await observePage(page)).snapshot };
+}
+
+it('carries a check’s stop reasons into site backoff instead of treating challenges as ordinary drift', async () => {
+  const { page } = await observedListings('Book a table');
+  expect(watchCheckFailure({ reason: 'challenge' }, page)).toEqual({ status: 'blocked' });
+  expect(watchCheckFailure({ reason: 'sign_in_wall' }, page)).toEqual({ status: 'blocked' });
+  expect(watchCheckFailure({ reason: 'site_busy' }, page)).toEqual({ status: 'site_busy' });
+  expect(watchCheckFailure({ reason: 'navigation_failed' }, page)).toEqual({ status: 'failed' });
+});
+
+it('finds a challenge in the whole page read when the agent’s cut of it leaves the challenge out', async () => {
+  const { page, snapshot } = await observedListings('Please verify you are human to continue browsing.');
+  expect(snapshot).not.toContain('verify you are human');
+  expect(watchCheckFailure({ reason: 'timeout' }, page)).toEqual({ status: 'blocked' });
 });
 
 it('compares a region without its countdowns, viewers, clocks, relative times, tallies and link addresses', () => {

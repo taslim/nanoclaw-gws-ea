@@ -97,6 +97,7 @@ describe('calendar answers', () => {
       needs_minutes: null,
       place: null,
       deferrals: 0,
+      open_loop_changed_at: null,
       links,
       strands: [],
       created_at: 'fixed',

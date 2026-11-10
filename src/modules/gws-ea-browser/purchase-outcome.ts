@@ -33,8 +33,7 @@ const NO_SUCH_ATTEMPT =
 /** The host's sweep: every unconfirmed attempt whose delegating group has not heard of it yet. */
 export async function notifyPendingUnconfirmed(db: DbDriver = getDb()): Promise<void> {
   for (const { id } of await db.all<{ id: string }>(
-    `SELECT id FROM gws_ea_browser_purchase_attempts WHERE resolution IS NULL AND unconfirmed_at IS NOT NULL AND notified_at IS NULL
-     UNION ALL SELECT id FROM gws_ea_browser_free_attempts WHERE resolution IS NULL AND unconfirmed_at IS NOT NULL AND notified_at IS NULL`,
+    'SELECT id FROM gws_ea_browser_purchase_attempts WHERE resolution IS NULL AND unconfirmed_at IS NOT NULL AND notified_at IS NULL',
   )) {
     const attempt = await new PurchaseAuthorityStore(db).attempt(id);
     if (attempt) await notifyUnconfirmedPurchase(attempt, db);
@@ -132,7 +131,7 @@ export async function recordPurchaseOutcome(
       if (placed && recorded.outcome === 'not_placed') {
         const raised = await lateConfirmation(job, result.attempt, source, session, requestIdOf(content), queue());
         const { what, total } = attemptSummary(result.attempt);
-        const purchase = `The ${what}${total ? ` for ${total}` : ''}`;
+        const purchase = `The ${what} for ${total}`;
         return {
           status: 'possible_duplicate',
           thread: job.thread_id,

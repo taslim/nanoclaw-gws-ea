@@ -32,6 +32,10 @@ export const chatReachOut = requestTool({
       type: 'string',
       description: 'A name for a new group with the principal and these people. Omit for a DM to one person.',
     },
+    calendar: {
+      type: 'string',
+      description: 'The id of a principal calendar the assistant can write to, for this chat’s bookings.',
+    },
     principal_message: {
       type: 'string',
       description:

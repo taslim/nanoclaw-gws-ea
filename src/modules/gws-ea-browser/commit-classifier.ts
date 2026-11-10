@@ -1,16 +1,19 @@
 import { captureBrowserDiagnosticRefusal } from './diagnostics.js';
 import type { CDPSession, ElementHandle, Frame, Page, Request } from 'playwright-core';
 import { getDomain } from 'tldts';
-import { genericCheckoutSignature } from './generic-signature.js';
 import { SiteLeaseStore } from './leases.js';
-import { documentGate, type PausedDocument } from './document-gate.js';
+import { documentGate, type CapturedHold, type HeldRequest, type PausedDocument } from './document-gate.js';
 import { coverPageTargets, ensurePageTargets, onUncoveredPageTarget, pageTargetsReady } from './page-targets.js';
 import { browserOperationId, type BrowserOperationContext } from './actions.js';
 import {
-  inspectAuthenticationControl,
-  submitAuthenticationForm,
-  type AuthenticationFormSignature,
-} from './authentication-signatures.js';
+  approvedPress,
+  approvedPressOn,
+  BrowserActivationError,
+  consentBeforeSubmission,
+  DEFAULT_ACTION_BUDGET_MS,
+  withApprovedPress,
+  type ApprovedPress,
+} from './activation.js';
 import { paymentProcessorHost, readPageControlFacts, type ControlFacts } from './control-facts.js';
 import {
   classifyControlFacts,
@@ -21,13 +24,25 @@ import {
   type ActivationKind,
   type ReviewedMerchantFlow,
 } from './control-policy.js';
-import { BrowserConsentStop, runConsentPass, type ConsentScope } from './consent.js';
+import type { ConsentScope } from './consent.js';
+import {
+  closeFreeDialog,
+  currentFreeDialog,
+  pressFreeCheckout,
+  type FreePressAnswer,
+  type FreePressScope,
+} from './free-press.js';
+import { readFreeCheckout } from './merchant-read.js';
+import { pageFieldHoldsHostSecret } from './page-privacy.js';
+import {
+  holdRefusesDocument,
+  holdRefusesRequest,
+  readTexts,
+  sentForms,
+  type PlacedHold,
+  type SubmissionSite,
+} from './submission-hold.js';
 
-/**
- * `secret_field`: a submission of a form holding a password, code or payment field, which only the host's own
- * sign-in and credential paths make.
- */
-export type ActivationRefusal = Exclude<ActionClass, 'ordinary'> | 'secret_field';
 /** `site_busy`: another job holds the site; `read_only`: a read-only replay's non-GET document. */
 export type NavigationRefusal = Exclude<ActionClass, 'ordinary'> | 'site_busy' | 'read_only';
 /** The open rule for an action on this control, with any reviewed flow's exact reading of it. */
@@ -47,7 +62,6 @@ async function activationDispatch(
   classification: ActionClass;
   facts: ControlFacts;
   flow?: ReviewedMerchantFlow;
-  authentication?: AuthenticationFormSignature;
 }> {
   const facts = await readPageControlFacts(page, element);
   const generic = classifyControlFacts(facts, kind);
@@ -56,27 +70,7 @@ async function activationDispatch(
   if (generic !== 'ordinary') return { classification: generic, facts, flow };
   const reviewed = flow && (await flow.classifyControl(page, element, facts));
   if (reviewed) return { classification: reviewed, facts, flow };
-  if (!facts.transaction && facts.formMethod?.toLowerCase() === 'post' && facts.formAction) {
-    const authentication = await inspectAuthenticationControl(element);
-    if (authentication) return { classification: 'ordinary', facts, authentication };
-  }
   return { classification: 'ordinary', facts };
-}
-
-export class BrowserActivationError extends Error {
-  constructor(readonly reason: ActivationRefusal) {
-    super(reason);
-  }
-}
-
-/**
- * The consent engine's one check before a submission outside a purchase: every choice in the control's form
- * made, or a stop. An extra the press would still buy makes it a purchase.
- */
-async function consentBeforeSubmission(page: Page, element: ElementHandle, intent: ActivationIntent): Promise<void> {
-  const consent = await runConsentPass(page, element, { scope: intent.scope, assertActive: intent.assertActive });
-  if (consent.status === 'consent_required') throw new BrowserConsentStop(consent.stops);
-  if (consent.status === 'add_on') throw new BrowserActivationError('purchase_control');
 }
 
 /** The guard refused to start an operation: a page-target setting cannot reach a live frame, so nothing ran. */
@@ -93,16 +87,6 @@ export function framesUnreadyStop(error: unknown): import('./actions.js').Browse
     : undefined;
 }
 
-/** An approved purchase's own press: the documents it may load while it runs, beyond the open rule. */
-interface ApprovedPress {
-  /** The origin of the document the approved control commits from. */
-  readonly origin: string;
-  matches(url: URL): boolean;
-  /** The flow's reading of its own route; undefined for a route it does not know, which stays refused. */
-  classify(url: URL): ActionClass | undefined;
-}
-const approvedPresses = new WeakMap<Page, ApprovedPress>();
-
 export interface PurchaseAuthorityPress {
   /** Runs immediately before the press: the last re-read and the commit marker. */
   commitStarted(): Promise<void>;
@@ -111,41 +95,6 @@ export interface PurchaseAuthorityPress {
    * origin, and the press loads its own routes there.
    */
   readonly checkout?: { readonly origin: string };
-}
-
-/**
- * The press an approval admits: a reviewed flow's exact control on its page, or a generic checkout's control in
- * its checkout origin. A reviewed flow's page never takes the generic verifier: that flow fails closed.
- */
-async function approvedPress(
-  page: Page,
-  element: ElementHandle,
-  flow: ReviewedMerchantFlow | undefined,
-  authority: PurchaseAuthorityPress,
-): Promise<ApprovedPress | undefined> {
-  if (flow) {
-    if (!flow.verifyPurchaseControl || !(await flow.verifyPurchaseControl(page, element))) return undefined;
-    return {
-      origin: new URL(page.url()).origin,
-      matches: (url) => flow.matches(url),
-      classify: (url) => flow.classifyNavigation(url),
-    };
-  }
-  const checkout = authority.checkout;
-  const frame = await element.ownerFrame();
-  if (
-    !checkout ||
-    !frame ||
-    !URL.canParse(frame.url()) ||
-    new URL(frame.url()).origin !== checkout.origin ||
-    !(await genericCheckoutSignature.verifyPurchaseControl?.(page, element))
-  )
-    return undefined;
-  return {
-    origin: checkout.origin,
-    matches: (url) => url.origin === checkout.origin,
-    classify: (url) => classifyNavigationUrl(url.href),
-  };
 }
 
 export interface ActivationIntent {
@@ -158,30 +107,24 @@ export interface ActivationIntent {
   assertActive?: () => Promise<void>;
   /** Milliseconds left in the action's budget: its script-request window never outlasts it. */
   remaining?: () => number;
+  /** A job that may press a free checkout itself; without one, every commit-class press is refused. */
+  freePress?: FreePressScope;
 }
 
 export interface ActivationResult {
   /** An ordinary press ran, which may have bought something nobody approved. */
   readonly ordinaryPress: boolean;
-}
-
-const DEFAULT_ACTION_BUDGET_MS = 10_000;
-
-function submitsForm(facts: ControlFacts, kind: ActivationIntent['kind']): boolean {
-  if (facts.formAction === undefined) return false;
-  if (kind === 'submit') return true;
-  return (
-    (facts.tag === 'button' && facts.type === 'submit') ||
-    (facts.tag === 'input' && ['submit', 'image'].includes(facts.type))
-  );
+  /** The commit-class press was a free checkout's, or a repeat of the one this job already pressed. */
+  readonly freePress?: FreePressAnswer;
 }
 
 /**
  * The one boundary every activation passes. A fresh classification decides it: an approved purchase's press
- * runs only on a control its approval covers, anything commit-class is refused, and anything ordinary runs as
- * `operation`, the native action on the element, with Playwright's hit-target check kept. Before anything that
- * can submit a form, the consent pass makes every choice the consent engine owns; during an ordinary action,
- * the page's non-GET script requests to payment processors and purchase routes are refused.
+ * runs only on a control its approval covers, a commit-class press on a checkout that charges nothing is pressed as
+ * a free one, anything else commit-class is refused, and anything ordinary runs as `operation`, the native action
+ * on the element, with Playwright's hit-target check kept. Before anything that can submit a form, the consent pass
+ * makes every choice the consent engine owns; during an ordinary action, the page's non-GET script requests to
+ * payment processors and purchase routes are refused.
  */
 export async function activateControl(
   page: Page,
@@ -206,43 +149,43 @@ export async function activateControl(
     // cover, is refused before the commit marker, never pressed another way.
     if (classification !== 'purchase_control')
       throw new BrowserActivationError(classification === 'ordinary' ? 'purchase_control' : classification);
-    const approved = await approvedPress(page, element, dispatch.flow, authority);
+    const approved = await approvedPress(page, element, dispatch.flow, authority.checkout);
     if (!approved) throw new BrowserActivationError('purchase_control');
     await authority.commitStarted();
-    approvedPresses.set(page, approved);
-    try {
-      await operation();
-    } finally {
-      approvedPresses.delete(page);
-    }
+    // A press after an approved one is ordinary: no free dialog's admission carries past it.
+    closeFreeDialog(page);
+    await withApprovedPress(page, approved, operation);
     return { ordinaryPress: false };
+  }
+  const pressed = pressesControl(facts, intent.kind);
+  // A commit-class press on a checkout that charges nothing is the host's own ordinary press of it.
+  if (classification === 'purchase_control' && pressed && intent.freePress) {
+    const checkout = await readFreeCheckout(page, element);
+    if (checkout) {
+      const freePress = await pressFreeCheckout(
+        page,
+        await ensureBrowserNavigationGuard(page),
+        element,
+        operation,
+        checkout,
+        {
+          ...intent,
+          freePress: intent.freePress,
+        },
+      );
+      return { ordinaryPress: freePress.status === 'pressed', freePress };
+    }
   }
   if (classification !== 'ordinary') {
     recordRefusal('action', undefined, classification);
     throw new BrowserActivationError(classification);
   }
-  if (dispatch.authentication) {
-    const authentication = dispatch.authentication;
-    await consentBeforeSubmission(page, element, intent);
-    const guard = await ensureBrowserNavigationGuard(page);
-    // The open rule decides where the submission lands.
-    await guard.runWithPolicy({}, async () => {
-      const arrived = page
-        .waitForEvent('framenavigated', { predicate: (frame) => frame === authentication.frame, timeout: 2_000 })
-        .catch(() => undefined);
-      // The form changed between its reading and the submit, so nothing was sent: the control is not actionable.
-      if (!(await submitAuthenticationForm(authentication, intent.assertActive)))
-        throw new Error('The sign-in form changed before its submit');
-      await arrived;
-    });
-    return { ordinaryPress: true };
-  }
-  const pressed = pressesControl(facts, intent.kind);
-  if (submitsForm(facts, intent.kind) && facts.region?.secretFields === true)
-    throw new BrowserActivationError('secret_field');
   // Anything that can submit a form: a press, or a choice inside one, which page script may submit on change.
-  if (pressed || (facts.formAction !== undefined && (intent.kind === 'select' || facts.toggles !== undefined)))
+  if (pressed || (facts.formAction !== undefined && (intent.kind === 'select' || facts.toggles !== undefined))) {
+    // A script-driven group submits without a form, so a held value refuses every press, not only its own form's.
+    if (await pageFieldHoldsHostSecret(page)) throw new BrowserActivationError('secret_field');
     await consentBeforeSubmission(page, element, intent);
+  }
   const guard = await ensureBrowserNavigationGuard(page);
   await guard.duringAction(intent.remaining?.() ?? DEFAULT_ACTION_BUDGET_MS, operation);
   return { ordinaryPress: pressed };
@@ -273,10 +216,12 @@ export interface BrowserNavigationGuard {
   reason(): NavigationRefusal | undefined;
   clearReason(): void;
   /**
-   * Refuses the page's HTTP requests, its frames' and windows' included, until this authority allows them, so a
-   * page's input handlers cannot submit a filled credential.
+   * Refuses the page's HTTP requests and documents, its frames' and windows' included, until this authority allows
+   * them, so a page's input handlers cannot submit a filled credential. With `onSite`, the hold refuses only a
+   * document that is not a GET and leaves that site, and any other request to another site whose address or body
+   * carries a filled value, so the site's own sign-in, its captcha, its reads and its telemetry go ahead.
    */
-  holdSubmissions(authority: string): void;
+  holdSubmissions(authority: string, onSite?: SubmissionSite): void;
   /** Lifts only this authority's hold; another authority's keeps refusing. */
   allowSubmissions(authority: string): void;
   runWithPolicy<T>(policy: BrowserNavigationPolicy, operation: () => Promise<T>): Promise<T>;
@@ -286,9 +231,16 @@ export interface BrowserNavigationGuard {
    * out-of-process frame's non-GET fetch, XHR and beacon requests to payment processors and purchase routes are
    * refused; outside it nothing is paused. The caller goes on once every navigation the action started has
    * committed and, unless the page's own document was replaced, its requests have gone quiet or the settle has
-   * ended; the rest of the window runs on in the background.
+   * ended; the rest of the window runs on in the background. `waitForRequests` lets credential callers wait
+   * for pending requests past that short settle, still bounded by the action deadline. `purchaseAdmission` admits
+   * the purchase routes of its own checkout, as a free checkout's press and the dialog it opened do; a payment
+   * processor stays refused.
    */
-  duringAction<T>(budgetMs: number, action: () => Promise<T>): Promise<T>;
+  duringAction<T>(
+    budgetMs: number,
+    action: () => Promise<T>,
+    options?: { readonly waitForRequests?: boolean; readonly purchaseAdmission?: ApprovedPress },
+  ): Promise<T>;
   /** Resolves once every ordinary action's script-request window on the page has closed. */
   actionsSettled(): Promise<void>;
 }
@@ -387,6 +339,11 @@ async function decideNavigation(
   return admitted;
 }
 
+/** The site a held value may go to by this address: its registrable domain over HTTPS, else none. */
+function heldSiteOf(url: string): string | undefined {
+  return URL.canParse(url) && new URL(url).protocol === 'https:' ? registrableSite(url) : undefined;
+}
+
 /** What page script sends, a beacon (`Ping`) included. */
 const SCRIPT_REQUEST_TYPES = ['XHR', 'Fetch', 'Ping'] as const;
 /** How long an action's window stays open after it: enough for a handler that awaits one round trip, then posts. */
@@ -400,12 +357,20 @@ const ACTION_SETTLE_MS = 1_000;
 const NAVIGATION_START_MS = 250;
 const NAVIGATION_POLL_MS = 50;
 
-export function refusedScriptRequest(request: { method: string; url: string }): boolean {
+/** A payment processor is always refused; a purchase route only where no admission covers it as its own. */
+export function refusedScriptRequest(
+  request: { method: string; url: string },
+  admissions: Iterable<ApprovedPress> = [],
+): boolean {
   if (request.method.toUpperCase() === 'GET') return false;
   if (!URL.canParse(request.url)) return true;
   const url = new URL(request.url);
   const host = url.hostname.toLowerCase();
-  return paymentProcessorHost(host) || classifyNavigationUrl(url.href) === 'purchase_control';
+  if (paymentProcessorHost(host)) return true;
+  if (classifyNavigationUrl(url.href) !== 'purchase_control') return false;
+  for (const admission of admissions)
+    if (admission.matches(url) && admission.classify(url) === 'purchase_control') return false;
+  return true;
 }
 
 // Every request type but Document: documents are decided, and stripped, at the document gate. These are
@@ -441,7 +406,7 @@ function withoutReferrer(headers: Record<string, string>): Array<{ name: string;
 async function installNavigationGuard(page: Page): Promise<BrowserNavigationGuard> {
   let blocked: NavigationRefusal | undefined;
   const policies: BrowserNavigationPolicy[] = [];
-  const submissionHolds = new Set<string>();
+  const submissionHolds = new Map<string, PlacedHold | undefined>();
   // Each outermost operation, and each span between them, is its own generation. A decision is
   // reported only to the generation its request paused in; a late one is still enforced, not reported.
   let generation = 0;
@@ -472,8 +437,9 @@ async function installNavigationGuard(page: Page): Promise<BrowserNavigationGuar
     capture() {
       const recordRefusal = captureBrowserDiagnosticRefusal(page);
       const scopes = [...policies];
-      const held = submissionHolds.size > 0;
-      const approved = approvedPresses.get(page);
+      const holds = [...submissionHolds.values()];
+      // Inside an operation, a free press's dialog admits its checkout origin's routes as the press did.
+      const approved = approvedPressOn(page) ?? (scopes.length ? currentFreeDialog(page)?.admission : undefined);
       const pausedIn = generation;
       // A document between operations is judged by the page as it stood when the document paused.
       const pageUrl = page.url();
@@ -481,10 +447,48 @@ async function installNavigationGuard(page: Page): Promise<BrowserNavigationGuar
       const record = (classification: NavigationRefusal): void => {
         if (pausedIn === generation) blocked = classification;
       };
+      // A hold without a site refuses everything quietly; one with a site records what tried to leave it. The gate
+      // asks about one request more than once, so each request's verdict is reached once.
+      const verdicts = new WeakMap<HeldRequest, { readonly refused: boolean; readonly sited: boolean }>();
+      const verdict = (request: HeldRequest): { readonly refused: boolean; readonly sited: boolean } => {
+        let known = verdicts.get(request);
+        if (!known) {
+          const site = heldSiteOf(request.url);
+          let read: readonly string[] | undefined;
+          const texts = (): readonly string[] => (read ??= readTexts([request.url, request.body ?? '']));
+          const refusing = holds.filter((held) => holdRefusesRequest(held, request, site, texts));
+          known = { refused: refusing.length > 0, sited: refusing.some((held) => held !== undefined) };
+          verdicts.set(request, known);
+        }
+        return known;
+      };
+      const hold: CapturedHold | undefined = holds.length
+        ? {
+            refuses: (request) => verdict(request).refused,
+            refused(request, resource) {
+              if (!verdict(request).sited) return;
+              recordRefusal('action', { url: request.url, method: request.method, resource }, 'origin_mismatch');
+            },
+          }
+        : undefined;
       return {
-        submissionsHeld: held,
+        ...(hold ? { hold } : {}),
         async decide(document) {
-          if (held) return { allow: false };
+          const site = heldSiteOf(document.url);
+          const refusing = holds.filter((held) => holdRefusesDocument(held, document, site));
+          if (refusing.length) {
+            const sited = refusing.filter((held): held is PlacedHold => held !== undefined);
+            if (sited.length) {
+              for (const held of sited) held.onSite.departed?.();
+              record('blocked_address');
+              recordRefusal(
+                'document',
+                { url: document.url, method: document.method, resource: 'document' },
+                'origin_mismatch',
+              );
+            }
+            return { allow: false };
+          }
           let classification: ActionClass | 'site_busy' | 'read_only';
           try {
             classification = await decideNavigation(document.url, document, scopes, approved, () =>
@@ -522,6 +526,8 @@ async function installNavigationGuard(page: Page): Promise<BrowserNavigationGuar
   // pauses. Credential holds instead use the browser-level gate, which covers a new target's first request.
   const scriptSessions = new Set<CDPSession>();
   let actions = 0;
+  // The checkouts whose own purchase routes the open windows admit, each counted by the windows admitting it.
+  const admissions = new Map<ApprovedPress, number>();
   let covering: Promise<void> | undefined;
   // Each window that outlasts its action's return: the rest of its settle, then its cleanup.
   const settling = new Set<Promise<void>>();
@@ -537,7 +543,7 @@ async function installNavigationGuard(page: Page): Promise<BrowserNavigationGuar
   const coverScripts = (): Promise<void> => {
     covering ??= coverPageTargets(page, async (session) => {
       session.on('Fetch.requestPaused', (event) => {
-        const refused = refusedScriptRequest(event.request);
+        const refused = refusedScriptRequest(event.request, admissions.keys());
         if (refused)
           captureBrowserDiagnosticRefusal(page)(
             'action',
@@ -570,8 +576,8 @@ async function installNavigationGuard(page: Page): Promise<BrowserNavigationGuar
     clearReason() {
       blocked = undefined;
     },
-    holdSubmissions(authority) {
-      submissionHolds.add(authority);
+    holdSubmissions(authority, onSite) {
+      submissionHolds.set(authority, onSite && { onSite, forms: sentForms(onSite.values) });
     },
     allowSubmissions(authority) {
       submissionHolds.delete(authority);
@@ -604,9 +610,17 @@ async function installNavigationGuard(page: Page): Promise<BrowserNavigationGuar
         if (outermost) ++generation;
       }
     },
-    async duringAction(budgetMs, action) {
+    async duringAction(budgetMs, action, options) {
       const deadline = Date.now() + budgetMs;
       await coverScripts();
+      const admission = options?.purchaseAdmission ?? currentFreeDialog(page)?.admission;
+      if (admission) admissions.set(admission, (admissions.get(admission) ?? 0) + 1);
+      const unadmit = (): void => {
+        if (!admission) return;
+        const count = (admissions.get(admission) ?? 1) - 1;
+        if (count > 0) admissions.set(admission, count);
+        else admissions.delete(admission);
+      };
       // The navigations the action starts, until each commits or ends.
       const navigations = new Set<Request>();
       // Every request it sets off, a frame's included, until each finishes or fails; and when the last one did.
@@ -637,6 +651,7 @@ async function installNavigationGuard(page: Page): Promise<BrowserNavigationGuar
       if (actions++ === 0)
         await Promise.all([...scriptSessions].map((session) => pauseScripts(session).catch(() => undefined)));
       const close = async (): Promise<void> => {
+        unadmit();
         page.off('request', started);
         page.off('requestfailed', ended);
         page.off('requestfinished', ended);
@@ -652,17 +667,20 @@ async function installNavigationGuard(page: Page): Promise<BrowserNavigationGuar
         throw error;
       }
       const done = Date.now();
+      // Credential cleanup waits for a handler's pending token requests, bounded by this action's deadline.
+      const pending = (): boolean => options?.waitForRequests === true && !replaced && requests.size > 0;
       // The caller goes on once every navigation the action started has committed or ended, and the page's
       // document was replaced or the action's requests have stayed quiet for a moment, at most until the settle ends.
       const busy = (): boolean =>
         !replaced &&
-        Date.now() < done + ACTION_SETTLE_MS &&
-        (requests.size > 0 || Date.now() < Math.max(done, lastEnded) + NAVIGATION_START_MS);
+        (pending() ||
+          (Date.now() < done + ACTION_SETTLE_MS &&
+            (requests.size > 0 || Date.now() < Math.max(done, lastEnded) + NAVIGATION_START_MS)));
       await waitWhile(() => navigations.size > 0 || busy(), deadline);
       // The window itself stays open through the settle and until each navigation it saw commits or ends; an
       // action that starts meanwhile keeps the requests paused without a gap.
       const rest: Promise<void> = waitWhile(
-        () => navigations.size > 0 || Date.now() < done + ACTION_SETTLE_MS,
+        () => navigations.size > 0 || pending() || Date.now() < done + ACTION_SETTLE_MS,
         deadline,
       )
         .then(close)

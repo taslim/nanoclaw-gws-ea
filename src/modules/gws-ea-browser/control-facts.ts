@@ -6,7 +6,14 @@ import { randomUUID } from 'node:crypto';
 import type { CDPSession, ElementHandle, Frame, Page } from 'playwright-core';
 import { getDomain } from 'tldts';
 
-import { SECRET_AUTOCOMPLETE, SECRET_DESCRIPTION } from './authentication-signatures.js';
+import {
+  CODE_MAX_LENGTH,
+  CODE_SHAPED,
+  CREDENTIAL_AUTOCOMPLETE,
+  DIGIT_CODE,
+  NUMERIC_INPUT_MODE,
+  ONE_TIME_CODE_AUTOCOMPLETE,
+} from './authentication-signatures.js';
 import { isolationSelector } from './authentication-submit.js';
 import {
   bounded,
@@ -36,11 +43,6 @@ export interface ControlRegion {
   readonly commits: boolean;
   /** The region holds email, phone, password or payment fields. */
   readonly accountFields: boolean;
-  /**
-   * The control's form holds a field for a password, a code or payment details: only the host's own sign-in and
-   * credential paths submit such a form.
-   */
-  readonly secretFields: boolean;
 }
 
 /**
@@ -63,8 +65,16 @@ export interface ControlFacts {
   formAction?: string;
   inputName?: string;
   formFieldNames?: readonly string[];
-  secretEntry?: boolean;
-  authenticationForm?: boolean;
+  /** The control is a field marked `new-password` or `current-password`, which only the host fills. */
+  credentialEntry?: boolean;
+  /** The control is a masked input: `type=password` when read. */
+  masked?: boolean;
+  /** The control is marked `one-time-code`. */
+  oneTimeCode?: boolean;
+  /** The control's `inputmode`, as the element reflects it. */
+  inputMode?: string;
+  /** The control's `maxlength`; negative where it sets none. */
+  maxLength?: number;
   role: string;
   tag: string;
   type: string;
@@ -88,6 +98,14 @@ export interface ControlFacts {
    * autocomplete), or any field inside a processor's payment frame. Nothing is ever typed or chosen there.
    */
   cardEntry?: boolean;
+}
+
+/**
+ * A field whose value the host withholds from the agent, so no recipe keeps or reads it back: a credential, a
+ * masked field or payment details.
+ */
+export function withheldField(facts: ControlFacts): boolean {
+  return facts.credentialEntry === true || facts.masked === true || facts.cardEntry === true;
 }
 
 /** Prices, recurring charges, trials and billing, in a label or anywhere on a page. */
@@ -125,9 +143,12 @@ const PAGE_VOCABULARY = {
   /** A gift card's or voucher's code, which a checkout applies like a coupon: no card details. */
   giftCard: /gift|voucher/iu,
   noTextEntry: NO_TEXT_ENTRY,
-  /** What marks a field's value as a credential, code or payment secret (authentication-signatures owns these). */
-  secretAutocomplete: SECRET_AUTOCOMPLETE,
-  secretField: SECRET_DESCRIPTION,
+  /** A credential field's marking and a code's field and shape (authentication-signatures owns these). */
+  credentialAutocomplete: CREDENTIAL_AUTOCOMPLETE,
+  code: CODE_SHAPED,
+  digitCode: DIGIT_CODE,
+  oneTimeCode: ONE_TIME_CODE_AUTOCOMPLETE,
+  numericMode: NUMERIC_INPUT_MODE,
   /** An express-pay button. Pay Later messaging is text, never a button, so it is no payment method. */
   expressPay:
     /\b(?:apple|google|shop|amazon|samsung)\s?pay\b|\bg\s?pay\b|\bpaypal\b|\bvenmo\b|\bklarna\b|\bafterpay\b|\baffirm\b|\bpay\s+with\s+link\b/iu,
@@ -511,14 +532,21 @@ const librarySource = String.raw`(sources) => {
     const said = [describe(element), labelsOf(element)].join(' ');
     return textEntry(element) && re.cardEntry.test(said) && !re.giftCard.test(said);
   };
-  // The same shape isSensitiveField reads on the host: a password type, or a secret by its autocomplete, names or labels.
-  const secretField = (element) => textEntry(element) && (element.type === 'password' ||
-    re.secretAutocomplete.test(element.getAttribute('autocomplete') || '') ||
-    re.secretField.test([describe(element), labelsOf(element)].join(' ')));
-  // A field holding a secret: a password, a code or payment details, by its type, autocomplete, names or
-  // labels, so a show-password toggle that made it a text field still counts.
-  const secretValue = (element) => (secretField(element) || cardEntryField(element)) &&
-    typeof element.value === 'string' && element.value !== '';
+  // The fields entryRefusal reads on the host: a credential field by its marking, which survives a show-password
+  // toggle, a masked input by its type now, and the marks of a code's field.
+  const credentialField = (element) => element instanceof HTMLInputElement &&
+    re.credentialAutocomplete.test(element.getAttribute('autocomplete') || '');
+  const maskedField = (element) => element instanceof HTMLInputElement && element.type === 'password';
+  const oneTimeCodeField = (element) => re.oneTimeCode.test(element.getAttribute('autocomplete') || '');
+  // A masked value the agent may have typed, as entryRefusal decides it on the host: digits alone, or a letter
+  // code in a field that reads as a code's.
+  const maskedCode = (element) => re.digitCode.test(element.value) || (re.code.test(element.value) &&
+    (oneTimeCodeField(element) || re.numericMode.test(element.inputMode) ||
+      (element.maxLength > 0 && element.maxLength <= ${CODE_MAX_LENGTH})));
+  // A value the agent could not have typed: payment details, a credential, or a masked value that is no code. A
+  // code the agent typed is ordinary text.
+  const secretValue = (element) => typeof element.value === 'string' && element.value !== '' &&
+    (cardEntryField(element) || credentialField(element) || (maskedField(element) && !maskedCode(element)));
   const isDialog = (element) => element instanceof HTMLDialogElement || /^(?:alert)?dialog$/iu.test(element.getAttribute('role') || '');
   const openDialog = (element) => isDialog(element) && (!(element instanceof HTMLDialogElement) || element.open) && visible(element);
   const modal = (dialog) => (dialog instanceof HTMLDialogElement && dialog.matches(':modal')) || dialog.getAttribute('aria-modal') === 'true';
@@ -639,9 +667,13 @@ const librarySource = String.raw`(sources) => {
     re.search.test(describe(element));
   const editableRoot = (element) => element instanceof HTMLElement && element.isContentEditable &&
     !(parentOf(element) instanceof HTMLElement && parentOf(element).isContentEditable);
+  // A verification code the site sent is no message: a field marked for one, or a numeric field holding digits.
+  const codeField = (element) => element.autocomplete === 'one-time-code' ||
+    (element.inputMode === 'numeric' && /^\d{1,10}$/u.test(element.value.trim()));
   // Free text: a textarea, a contenteditable element, or a formless non-search text input.
   const freeTextField = (element) => element instanceof HTMLTextAreaElement || editableRoot(element) ||
-    (element instanceof HTMLInputElement && element.type === 'text' && !formOf(element) && !searchLike(element));
+    (element instanceof HTMLInputElement && element.type === 'text' && !formOf(element) && !searchLike(element) &&
+      !codeField(element));
   const holdsText = (element) => visible(element) && !element.disabled && !element.readOnly &&
     squash(element instanceof HTMLElement && element.isContentEditable ? element.innerText : element.value) !== '';
   const accountField = (element) => element instanceof HTMLInputElement &&
@@ -686,14 +718,13 @@ const librarySource = String.raw`(sources) => {
       visibleLabel: textOf(node),
       inputName: node.getAttribute('name') || '',
       formFieldNames: form ? fields.map((field) => field.getAttribute('name') || '').filter(Boolean) : [],
-      secretEntry: secretField(node),
+      credentialEntry: credentialField(node),
+      masked: maskedField(node),
+      oneTimeCode: oneTimeCodeField(node),
+      inputMode: node instanceof HTMLInputElement ? node.inputMode : '',
+      maxLength: node instanceof HTMLInputElement ? node.maxLength : -1,
       formMethod: form ? (own('formmethod') ? node.formMethod : formProperty(form, 'method')) : undefined,
       formAction: form ? (own('formaction') ? node.formAction : formProperty(form, 'action')) : undefined,
-      authenticationForm: Boolean(form && /^post$/iu.test(formProperty(form, 'method')) &&
-        /^https:\/\/[^/]+\/(?:login|signin|sign-in|auth|session|sessions|account\/login)(?:[/?#]|$)/iu.test(formProperty(form, 'action')) &&
-        fields.some((field) => field instanceof HTMLInputElement && (field.type === 'password' || field.type === 'email' ||
-          /(?:one-time-code|username)/iu.test(field.getAttribute('autocomplete') || ''))) &&
-        !fields.some((field) => /(?:^|\s)cc-/iu.test(field.getAttribute('autocomplete') || ''))),
       role: node.getAttribute('role') || '',
       tag: node.tagName.toLowerCase(),
       type: submitter || node instanceof HTMLSelectElement || node instanceof HTMLTextAreaElement ? node.type : node.getAttribute('type') || '',
@@ -709,7 +740,6 @@ const librarySource = String.raw`(sources) => {
         commits: transaction || members.some(bookingField) || re.commitName.test(nameOf(node)) ||
           members.some((element) => element.matches(BUTTON) && visible(element) && re.commitName.test(nameOf(element))),
         accountFields: members.some(accountField),
-        secretFields: fields.some(secretField),
       },
     };
   };
@@ -743,9 +773,10 @@ const librarySource = String.raw`(sources) => {
     if (element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement) return element.value;
     return squash(element.innerText);
   };
-  // A field as a checkout read reports it. A secret's or a card field's value is never read.
+  // A field as a checkout read reports it. A credential's, a masked field's or a card field's value is never read.
   const checkoutField = (element) => {
-    const withheld = secretField(element) || cardEntryField(element);
+    const secret = credentialField(element) || maskedField(element);
+    const withheld = secret || cardEntryField(element);
     const choice = element instanceof HTMLInputElement && /^(?:checkbox|radio)$/u.test(element.type);
     const typed = element instanceof HTMLInputElement || element instanceof HTMLSelectElement || element instanceof HTMLTextAreaElement;
     return {
@@ -756,7 +787,7 @@ const librarySource = String.raw`(sources) => {
       label: squash(labelsOf(element)) || squash(element.getAttribute('aria-label')) || squash(element.getAttribute('placeholder')),
       value: withheld ? null : shownValue(element),
       card: cardEntryField(element),
-      secret: secretField(element),
+      secret,
       checked: choice ? element.checked : null,
     };
   };
@@ -1079,12 +1110,15 @@ function parseControl(value: unknown): Omit<ControlFacts, 'transaction'> | undef
   return {
     inputName: text(facts.inputName),
     formFieldNames: texts(facts.formFieldNames),
-    secretEntry: flag(facts.secretEntry),
+    credentialEntry: flag(facts.credentialEntry),
+    masked: flag(facts.masked),
+    oneTimeCode: flag(facts.oneTimeCode),
+    inputMode: text(facts.inputMode) ?? '',
+    maxLength: typeof facts.maxLength === 'number' ? facts.maxLength : -1,
     name,
     visibleLabel: text(facts.visibleLabel) ?? '',
     ...(formMethod !== undefined ? { formMethod } : {}),
     ...(formAction !== undefined ? { formAction } : {}),
-    authenticationForm: flag(facts.authenticationForm),
     role,
     tag,
     type,
@@ -1099,7 +1133,6 @@ function parseControl(value: unknown): Omit<ControlFacts, 'transaction'> | undef
       freeText: flag(region.freeText),
       commits: flag(region.commits),
       accountFields: flag(region.accountFields),
-      secretFields: flag(region.secretFields),
     },
   };
 }

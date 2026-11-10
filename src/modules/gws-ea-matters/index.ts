@@ -40,6 +40,7 @@ import {
   gwsEaMatterPlanningMigration,
   gwsEaTimeAnchorsMigration,
   gwsEaCloseClockMigration,
+  gwsEaMatterOpenLoopChangedMigration,
 } from './migration.js';
 import { parseNextLook, type NextLook } from './next-look.js';
 import { renderMatter } from './render.js';
@@ -61,6 +62,7 @@ registerMigration(gwsEaMatterChatsMigration);
 registerMigration(gwsEaMatterPlanningMigration);
 registerMigration(gwsEaTimeAnchorsMigration);
 registerMigration(gwsEaCloseClockMigration);
+registerMigration(gwsEaMatterOpenLoopChangedMigration);
 registerPendingClockReader(pendingLocalItems);
 onWhereaboutsChange(async () => {
   await oneAtATime(async () => {

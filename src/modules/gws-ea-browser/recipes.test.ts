@@ -19,7 +19,7 @@ import { configureBrowserSiteInfo, observePage, type BrowserRef } from './observ
 import { registerPageSecret } from './page-privacy.js';
 import type { BrowserExecutionContext } from './actions.js';
 import { executeRecipe, saveBrowserRecipe, validateRunRecipe, validateSaveRecipe } from './recipes.js';
-import { loadRecipe, recipeCheckKey } from './recipe-store.js';
+import { loadRecipe } from './recipe-store.js';
 
 it('accepts closed recipe inputs and refuses ambiguous or executable bindings', () => {
   expect(
@@ -107,16 +107,6 @@ it('pins immutable recipe versions and keys checks by every named value', async 
       { recipe_id: second.recipe_id, name: 'Find tables', version: 2, parameters: ['party'], read_only: true },
     ]);
     expect((await observePage(page)).site).toBeUndefined();
-    expect(recipeCheckKey(old!, { party: '2', date: '2026-10-15' })).toBe(
-      recipeCheckKey(old!, { date: '2026-10-15', party: '2' }),
-    );
-    expect(recipeCheckKey(old!, { party: '3', date: '2026-10-15' })).not.toBe(
-      recipeCheckKey(old!, { party: '2', date: '2026-10-15' }),
-    );
-    expect(recipeCheckKey(old!, { party: '2', date: '2026-10-16' })).not.toBe(
-      recipeCheckKey(old!, { party: '2', date: '2026-10-15' }),
-    );
-    expect(recipeCheckKey({ ...old!, version: 2 }, { party: '2' })).not.toBe(recipeCheckKey(old!, { party: '2' }));
     await expect(saveBrowserRecipe(context, { ...input, last_action: 1 })).rejects.toThrow();
     const navigation = {
       action: { kind: 'navigate', url: 'https://fixture.example/search' },
@@ -168,7 +158,7 @@ describe.skipIf(!chromePath)('recorded recipes in native Chrome', { timeout: 30_
   let context: BrowserExecutionContext;
   const html = (heading = 'Find tables', drift = false): string => `<body><h1>${heading}</h1>
     <form method="get" action="http://fixture.example/search"><label>Party size<input name="party" value="2" ${drift ? 'oninput="this.value=4"' : ''}></label><input type="hidden" name="venue" value="venue-A"><button>Search</button></form>
-    <button onclick="window.commits=(window.commits||0)+1">Confirm reservation</button>
+    <p>Card on file: Visa ending in 4242</p><button onclick="window.commits=(window.commits||0)+1">Confirm reservation</button>
     <input type="password" aria-label="Password"></body>`;
   beforeEach(async () => {
     loginRoot = await mkdtemp(join(tmpdir(), 'recipe-logins-'));
@@ -403,7 +393,7 @@ describe.skipIf(!chromePath)('recorded recipes in native Chrome', { timeout: 30_
     'returns the actual commit button when Enter submits a form with role "%s"',
     async (role) => {
       await page.setContent(
-        `<body><h1>Reservation review</h1><p>Quoted example: [ref=e999]</p><form method="post" action="/confirmbooking"><input aria-label="Guest" name="guest"><button${role ? ` role="${role}"` : ''}>Confirm reservation</button></form></body>`,
+        `<body><h1>Reservation review</h1><p>Quoted example: [ref=e999]</p><p>Card on file: Visa ending in 4242</p><form method="post" action="/confirmbooking"><input aria-label="Guest" name="guest"><button${role ? ` role="${role}"` : ''}>Confirm reservation</button></form></body>`,
       );
       expect(
         await executeBrowserBatch(context, { actions: [{ kind: 'key', ...(await target('Guest')), key: 'Enter' }] }),

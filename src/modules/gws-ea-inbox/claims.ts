@@ -11,7 +11,6 @@ export const SIGN_IN_CLAIM_LIFETIME_MS = 180_000;
 export interface SignInClaim {
   readonly id: string;
   readonly job_id: string;
-  readonly source: 'assistant' | 'principal';
   readonly origin: string;
   readonly domain: string;
   readonly binding_json: string;
@@ -23,18 +22,6 @@ export interface SignInClaim {
 export async function getSignInClaim(id: string): Promise<SignInClaim | undefined> {
   return getDb().get<SignInClaim>('SELECT * FROM gws_ea_browser_sign_in_claims WHERE id = ?', id);
 }
-export async function waitingSignInClaim(
-  jobId: string,
-  source: SignInClaim['source'],
-): Promise<SignInClaim | undefined> {
-  return getDb().get<SignInClaim>(
-    'SELECT * FROM gws_ea_browser_sign_in_claims WHERE job_id = ? AND source = ? AND state = ? AND expires_at > ? ORDER BY since_at DESC LIMIT 1',
-    jobId,
-    source,
-    'waiting',
-    new Date().toISOString(),
-  );
-}
 /** A signup's verification claim is bound to its attempt, which alone ends it (`finishSignupVerification`). */
 function signupAttemptClaim(claim: SignInClaim): boolean {
   const binding: unknown = JSON.parse(claim.binding_json);
@@ -45,7 +32,6 @@ function signupAttemptClaim(claim: SignInClaim): boolean {
 export async function createSignInClaim(input: {
   id: string;
   jobId: string;
-  source: SignInClaim['source'];
   origin: string;
   binding: Readonly<Record<string, unknown>>;
   at?: Date;
@@ -65,11 +51,10 @@ export async function createSignInClaim(input: {
       await getDb().run('UPDATE gws_ea_browser_sign_in_claims SET state = ? WHERE id = ?', 'finished', claim.id);
     }
     await getDb().run(
-      `INSERT INTO gws_ea_browser_sign_in_claims(id,job_id,source,origin,domain,binding_json,since_at,expires_at,state)
-       VALUES(?,?,?,?,?,?,?,?,?)`,
+      `INSERT INTO gws_ea_browser_sign_in_claims(id,job_id,origin,domain,binding_json,since_at,expires_at,state)
+       VALUES(?,?,?,?,?,?,?,?)`,
       input.id,
       input.jobId,
-      input.source,
       origin.origin,
       domain,
       JSON.stringify(input.binding),
@@ -96,8 +81,7 @@ export async function claimSignInMail(mail: ParsedMail, at = new Date()): Promis
   if (!(await db.hasTable('gws_ea_browser_sign_in_claims')) || !mail.receivedAt) return undefined;
   return db.transaction(async () => {
     const claims = await db.all<SignInClaim>(
-      'SELECT * FROM gws_ea_browser_sign_in_claims WHERE source = ? AND expires_at > ? ORDER BY since_at,id',
-      'assistant',
+      'SELECT * FROM gws_ea_browser_sign_in_claims WHERE expires_at > ? ORDER BY since_at,id',
       at.toISOString(),
     );
     for (const claim of claims) {
@@ -147,8 +131,7 @@ export async function cleanupSignInClaims(at = new Date()): Promise<void> {
 export async function unmatchedSignInClaims(at = new Date()): Promise<SignInClaim[]> {
   if (!(await getDb().hasTable('gws_ea_browser_sign_in_claims'))) return [];
   return getDb().all<SignInClaim>(
-    'SELECT * FROM gws_ea_browser_sign_in_claims WHERE source = ? AND state = ? AND gmail_message_id IS NULL AND expires_at > ? ORDER BY since_at,id',
-    'assistant',
+    'SELECT * FROM gws_ea_browser_sign_in_claims WHERE state = ? AND gmail_message_id IS NULL AND expires_at > ? ORDER BY since_at,id',
     'waiting',
     at.toISOString(),
   );
@@ -160,20 +143,10 @@ export async function hasPendingSignInMail(at = new Date()): Promise<boolean> {
   const row = await getDb().get<{ present: number }>(
     `SELECT 1 AS present FROM gws_ea_browser_sign_in_claims c
        LEFT JOIN gws_ea_inbox_messages m ON m.gmail_message_id = c.gmail_message_id
-       WHERE c.source = ? AND c.state = ? AND c.expires_at > ?
+       WHERE c.state = ? AND c.expires_at > ?
          AND (c.gmail_message_id IS NULL OR m.settled_at IS NULL) LIMIT 1`,
-    'assistant',
     'waiting',
     at.toISOString(),
   );
   return row !== undefined;
-}
-
-/** The host-recorded site alone, so its reader names the site without seeing the waiting field or a credential. */
-export async function readPendingSignInSite(
-  jobId: string,
-): Promise<{ site: string; origin: string; expires_at: string } | undefined> {
-  if (!(await getDb().hasTable('gws_ea_browser_sign_in_claims'))) return undefined;
-  const claim = await waitingSignInClaim(jobId, 'principal');
-  return claim ? { site: claim.domain, origin: claim.origin, expires_at: claim.expires_at } : undefined;
 }

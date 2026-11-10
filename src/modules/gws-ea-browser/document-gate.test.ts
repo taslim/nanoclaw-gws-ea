@@ -127,9 +127,10 @@ function fixture(
     headers: Record<string, string> = {},
     method = 'GET',
     url = 'https://shop.example/',
+    body: Record<string, unknown> = {},
   ) => {
     const requestId = String(next++);
-    paused?.({ requestId, frameId, resourceType, request: { url, method, headers } });
+    paused?.({ requestId, frameId, resourceType, request: { url, method, headers, ...body } });
     await vi.waitFor(() => expect(answers.has(requestId)).toBe(true), { timeout: 5_000 });
     return answers.get(requestId);
   };
@@ -412,7 +413,10 @@ it('holds script submissions in newly created frames and windows from their firs
   let held = true;
   const guarded = guardedPage();
   (await documentGate(browser)).register('main', {
-    capture: () => ({ ...guarded.page.capture(), submissionsHeld: held }),
+    capture: () => {
+      const refusing = held;
+      return { ...guarded.page.capture(), hold: { refuses: () => refusing, refused: () => undefined } };
+    },
   });
   for (const frame of ['main', 'newFrame', 'popup'])
     for (const resource of ['XHR', 'Fetch', 'Ping']) expect(await pause(frame, resource, {}, 'POST')).toBe('refused');
@@ -421,4 +425,47 @@ it('holds script submissions in newly created frames and windows from their firs
   expect(await pause('other', 'Fetch', {}, 'POST')).toBe('continued');
   held = false;
   expect(await pause('newFrame', 'Fetch', {}, 'POST')).toBe('continued');
+});
+
+it("asks only the placed page's hold about each script request, with its body, and reports a refusal to it alone", async () => {
+  const { browser, pause, lookups } = fixture(
+    { main: { type: 'page' }, newFrame: { type: 'iframe', parentFrameId: 'main' }, other: { type: 'page' } },
+    [{ tree: tree('main') }, { tree: tree('other') }],
+  );
+  const refused = vi.fn();
+  // A hold that refuses what carries its value, or a body it cannot read.
+  const refuses = vi.fn(
+    (request: { url: string; body?: string }) =>
+      request.body === undefined || `${request.url} ${request.body}`.includes('held-value'),
+  );
+  const guarded = guardedPage();
+  (await documentGate(browser)).register('main', {
+    capture: () => ({ ...guarded.page.capture(), hold: { refuses, refused } }),
+  });
+  const before = lookups.length;
+  expect(await pause('newFrame', 'Fetch', {}, 'GET', 'https://cdn.example/app.js')).toBe('continued');
+  // A request no hold refuses continues without being placed.
+  expect(lookups.length).toBe(before);
+  expect(refuses).toHaveBeenLastCalledWith({ method: 'GET', url: 'https://cdn.example/app.js', body: '' });
+  const beacon = 'https://collector.example/beacon';
+  expect(await pause('newFrame', 'Ping', {}, 'POST', beacon, { hasPostData: true, postData: 'token' })).toBe(
+    'continued',
+  );
+  expect(await pause('newFrame', 'Ping', {}, 'POST', beacon, { hasPostData: true, postData: 'held-value' })).toBe(
+    'refused',
+  );
+  expect(refused).toHaveBeenCalledWith({ method: 'POST', url: beacon, body: 'held-value' }, 'ping');
+  const entries = [
+    { bytes: Buffer.from('a=held-').toString('base64') },
+    { bytes: Buffer.from('value').toString('base64') },
+  ];
+  expect(await pause('newFrame', 'Fetch', {}, 'POST', beacon, { hasPostData: true, postDataEntries: entries })).toBe(
+    'refused',
+  );
+  // A body Chrome left out cannot be shown not to carry the value.
+  expect(await pause('newFrame', 'XHR', {}, 'POST', beacon, { hasPostData: true })).toBe('refused');
+  expect(await pause('other', 'XHR', {}, 'POST', beacon, { hasPostData: true, postData: 'held-value' })).toBe(
+    'continued',
+  );
+  expect(refused).toHaveBeenCalledTimes(3);
 });

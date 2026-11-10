@@ -21,9 +21,10 @@ import type { ApprovalHandlerContext } from '../approvals/primitive.js';
 import { isVerifiedPrincipalUser, principalApproverUserId } from '../gws-ea-profile/db.js';
 import { errandSource, hasBrowserAccess, isMainAgentGroup } from './access.js';
 import {
+  ACCOUNT_INPUT_TYPES,
+  codeFieldFits,
   credentialFieldFits,
   httpsOrigin,
-  verificationCodeFits,
   type CredentialFormField,
   type CredentialKind,
 } from './authentication-signatures.js';
@@ -75,6 +76,7 @@ import {
   type PinnedBrowserRef,
 } from './observe.js';
 import { bindPageSecretDocuments, registerPageSecret } from './page-privacy.js';
+import { carriesSecret, holdOnSite } from './submission-hold.js';
 import { registrableDomain } from './login-store.js';
 import { type BrowserQueue } from './queue.js';
 import type { BrowserExecutionContext, BrowserQueuedAction } from './actions.js';
@@ -616,6 +618,15 @@ function destination(action: string, kind: CredentialKind, site: string): void {
   if (classification !== 'ordinary') throw stopFor(classification);
 }
 
+/** A field the site marks as an account's name: an email input, or one whose autocomplete names the account. */
+const accountField = (field: NativeFieldFacts): boolean =>
+  ACCOUNT_INPUT_TYPES.includes(field.type) &&
+  (field.type === 'email' ||
+    field.autocomplete
+      .toLowerCase()
+      .split(/\s+/u)
+      .some((token) => token === 'username' || token === 'email'));
+
 /** A field a fill or the browser could change; a read-only, disabled or hidden one only carries what the account is. */
 const editable = (field: NativeFieldFacts): boolean => field.type !== 'hidden' && !field.readonly && !field.disabled;
 
@@ -701,7 +712,6 @@ async function bindGroup(
     if (!binding) throw new StepStop('unsupported_form');
     fields.push({ ...field, binding });
   }
-  const currentBound = fields.some((field) => field.role === 'current_password');
   const form = fields[0].binding.formBackendNodeId;
   for (const { role, binding } of fields)
     if (
@@ -710,9 +720,7 @@ async function bindGroup(
       binding.facts.origin !== origin.origin ||
       binding.facts.tag !== 'INPUT' ||
       binding.formBackendNodeId !== form ||
-      !(role === 'code'
-        ? verificationCodeFits(binding.facts)
-        : credentialFieldFits(role, binding.facts, attempt.kind, currentBound))
+      !(role === 'code' ? codeFieldFits(binding.facts) : credentialFieldFits(role, binding.facts, attempt.kind))
     )
       throw new StepStop('unsupported_form');
   if (controlBinding.formBackendNodeId !== null && controlBinding.formBackendNodeId !== form)
@@ -730,8 +738,7 @@ async function bindGroup(
         )
       : undefined;
   if (scope.step === 'credentials') {
-    const namesAccount = (field: NativeFieldFacts): boolean =>
-      editable(field) && credentialFieldFits('username', { ...field, id: '' }, attempt.kind, currentBound);
+    const namesAccount = (field: NativeFieldFacts): boolean => editable(field) && accountField(field);
     // The Login is saved under the authority's username: a form that names the account must receive exactly that,
     if (!fields.some((field) => field.role === 'username') && fields[0].binding.facts.form?.fields.some(namesAccount))
       throw new StepStop('unsupported_form');
@@ -743,10 +750,6 @@ async function bindGroup(
     await readPageControlFacts(page, control.element),
     attempt.kind,
     attempt.site,
-    {
-      formControl: controlBinding.formBackendNodeId === form,
-      step: scope.step,
-    },
   );
   if (activation !== 'ordinary') throw stopFor(activation);
   return {
@@ -907,17 +910,6 @@ function verificationResult(before: SiteState, now: SiteState, sameDocument: boo
     : 'none';
 }
 
-/** A credential must never travel in an address: a GET submission or redirect carrying one is stopped in the browser. */
-function carriesSecret(url: URL, secrets: readonly string[]): boolean {
-  const values = [...url.searchParams.values(), url.hash];
-  return secrets.some(
-    (secret) =>
-      url.href.includes(secret) ||
-      url.href.includes(encodeURIComponent(secret)) ||
-      values.some((value) => value.includes(secret)),
-  );
-}
-
 // ---------------------------------------------------------------- one step
 
 /** Binding and lease refusals become the step's own outcome; other errors cross as constant host prose. */
@@ -999,6 +991,9 @@ async function activateWithin(
         carriesSecret(url, secrets)
           ? 'blocked_address'
           : classifyCredentialNavigation(url.href, group.kind, group.site),
+      // A filled password stays on its site: no non-GET document may carry the form elsewhere.
+      beforeNavigate: async (url, document) =>
+        document.method === 'GET' || registrableDomain(url.origin) === group.site ? 'ordinary' : 'blocked_address',
     },
     async () => {
       let activation: CredentialActivationResult = 'disabled';
@@ -1161,8 +1156,10 @@ async function disclosingStep(
     return { status: 'outcome_unknown' };
   };
   let uninserted = false;
+  let releaseOnSite: (() => void) | undefined;
   page.on('framenavigated', navigation);
   try {
+    releaseOnSite = holdOnSite(await ensureBrowserNavigationGuard(page), group.site, secrets);
     for (const secret of secrets) {
       registerPageSecret(page, secret);
       await bindPageSecretDocuments(page, secret);
@@ -1224,6 +1221,7 @@ async function disclosingStep(
   } finally {
     page.off('framenavigated', navigation);
     await settleFilledSecrets(context, page, secrets);
+    releaseOnSite?.();
     if (uninserted) await releaseCredentialSubmissions(saved.id);
     // The wait stays open while the site may still send its verification email: asked for, or unknown.
     if (verifying) {
@@ -1459,7 +1457,9 @@ async function enterCode(
       watchResponse(attempt.id, context, page, group, { step: 'verification', before }),
     );
   let inserted = false;
+  let releaseOnSite: (() => void) | undefined;
   try {
+    releaseOnSite = holdOnSite(await ensureBrowserNavigationGuard(page), group.site, [code]);
     await bindPageSecretDocuments(page, code);
     const filled = await fillNativeCredentialGroup(group.frame, group.native, [code], context.assertActive);
     // Nothing reached the page: the answer stays for the next verify.
@@ -1482,6 +1482,7 @@ async function enterCode(
     return await unknownAfterCode({ signal: 'interrupted', via: 'code' });
   } finally {
     await settleFilledSecrets(context, page, [code]);
+    releaseOnSite?.();
   }
 }
 

@@ -52,8 +52,20 @@ async function call(tool: McpToolDefinition, args: Record<string, unknown>, data
 const target = { ref: 'e1', generation: 1 };
 const cases: ReadonlyArray<readonly [McpToolDefinition, Record<string, unknown>]> = [
   [browser, { actions: [{ kind: 'observe' }], budget_ms: 90_000 }],
-  [fillSecret, { item_handle: 'login-1', field: 'password', target, submit: { ref: 'e2', generation: 1 } }],
-  [signInCode, { from: 'principal', target, send: { ref: 'e2', generation: 1 } }],
+  [fillSecret, { item_handle: 'login-1', password: target, submit: { ref: 'e2', generation: 1 } }],
+  [fillSecret, { item_handle: 'login-1', username: target, submit: { ref: 'e2', generation: 1 } }],
+  [
+    fillSecret,
+    {
+      item_handle: 'login-1',
+      username: target,
+      password: { ref: 'e2', generation: 1 },
+      submit: { ref: 'e3', generation: 1 },
+    },
+  ],
+  [fillSecret, { item_handle: 'login-1', username: target }],
+  [signInCode, { email_field: target }],
+  [signInCode, { code_field: target, submit: { ref: 'e2', generation: 1 } }],
   [
     credentialForm,
     {
@@ -86,7 +98,6 @@ const cases: ReadonlyArray<readonly [McpToolDefinition, Record<string, unknown>]
     watch,
     {
       site: 'https://restaurant.example/',
-      recipe_id: 'recipe-1',
       parameters: { party: '4' },
       venue: { id: 'bistro-123', name: 'Bistro' },
       party_size: 4,
@@ -280,7 +291,7 @@ describe('the browser tools', () => {
       expect(tool.tool.description).toMatch(/repeat/iu);
     }
     expect(purchase.tool.description).toContain('confirmed_not_placed');
-    expect(fillSecret.tool.inputSchema.properties).not.toHaveProperty('password');
+    for (const raw of ['value', 'text', 'code']) expect(fillSecret.tool.inputSchema.properties).not.toHaveProperty(raw);
     for (const value of ['password', 'value', 'text', 'item_handle', 'code'])
       expect(credentialForm.tool.inputSchema.properties).not.toHaveProperty(value);
     for (const outcome of [
@@ -321,12 +332,50 @@ describe('the browser tools', () => {
     );
   });
 
+  it('reads one part of a cut page within a ref of an observation', () => {
+    const validate = new Ajv({ formats: { uri: true } }).compile(browser.tool.inputSchema);
+    expect(validate({ actions: [{ kind: 'observe', within: { ref: 'f2e40', generation: 3 } }] })).toBe(true);
+    expect(validate({ actions: [{ kind: 'observe' }] })).toBe(true);
+    for (const within of [{ ref: 'e40' }, { ref: 'main', generation: 3 }, 'e40'])
+      expect(validate({ actions: [{ kind: 'observe', within }] })).toBe(false);
+  });
+
   it('offers saved username and password fills while email codes keep their own tool', () => {
     const validate = new Ajv().compile(fillSecret.tool.inputSchema);
-    const fields = { item_handle: 'login-1', target, submit: { ref: 'e2', generation: 1 } };
-    for (const field of ['username', 'password']) expect(validate({ ...fields, field })).toBe(true);
-    expect(validate({ ...fields, field: 'otp' })).toBe(false);
-    expect(signInCode.tool.inputSchema.properties).toHaveProperty('from');
+    const handle = { item_handle: 'login-1' };
+    const submit = { submit: { ref: 'e3', generation: 1 } };
+    for (const chosen of [
+      { username: target },
+      { username: target, ...submit },
+      { password: target, ...submit },
+      { username: target, password: { ref: 'e2', generation: 1 }, ...submit },
+    ])
+      expect(validate({ ...handle, ...chosen })).toBe(true);
+    for (const chosen of [
+      {},
+      submit,
+      // The host submits a password in the same call it fills it.
+      { password: target },
+      { username: target, password: { ref: 'e2', generation: 1 } },
+      { password: 'raw-password', ...submit },
+      { username: 'raw-username' },
+      { otp: target, ...submit },
+      { field: 'password', target, ...submit },
+    ])
+      expect(validate({ ...handle, ...chosen })).toBe(false);
+    // A code the principal sends reaches the browser in main's message: sign_in_code serves the assistant's own mail.
+    const signIn = new Ajv().compile(signInCode.tool.inputSchema);
+    const code = { code_field: target, submit: { ref: 'e2', generation: 1 } };
+    for (const fields of [{ email_field: target }, code, {}]) expect(signIn(fields)).toBe(true);
+    for (const fields of [
+      { email_field: target, ...code },
+      { code_field: target },
+      { submit: target },
+      { target, send: { ref: 'e2', generation: 1 } },
+      { email_field: target, from: 'principal' },
+    ])
+      expect(signIn(fields)).toBe(false);
+    expect(signInCode.tool.description).not.toMatch(/principal|awaiting_code/u);
   });
 
   it('takes a watch’s maximum as its only financial bound, and names a fee above it', () => {
@@ -338,6 +387,14 @@ describe('the browser tools', () => {
       false,
     );
     expect(watch.tool.description).toContain('terms_over_bounds');
+  });
+
+  it('sets a watch at the page the agent is on, never from a recipe its checks replay', () => {
+    const accepts = new Ajv({ formats: { uri: true, 'date-time': true } }).compile(watch.tool.inputSchema);
+    const [, fields] = cases.find(([tool]) => tool === watch)!;
+    const { parameters: _parameters, ...regionWatch } = fields;
+    expect(accepts({ ...regionWatch, region: { ref: 'e4', generation: 2 } })).toBe(true);
+    expect(accepts({ ...fields, recipe_id: 'recipe-1' })).toBe(false);
   });
 
   it('refuses a credential_form step the host would refuse, before sending anything', async () => {

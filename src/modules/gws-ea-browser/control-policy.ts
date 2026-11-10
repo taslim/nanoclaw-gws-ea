@@ -176,24 +176,6 @@ const credentialSecurity =
   /\b(?:change|update|add|remove|manage|edit|replace|reset|delete)\s+(?:(?:your|my|sign.?in|login)\s+)?(?:e-?mail(?:\s+address)?|phone(?:\s+number)?|mobile|two.?factor|2fa|mfa|totp|authenticator|passkeys?|security\s+(?:keys?|questions?)|payment(?:\s+methods?)?|billing|cards?)\b/iu;
 const credentialFinancial =
   /\b(?:checkout|cart|basket|billing|payments?|orders?|subscriptions?|subscribe|trials?|donate|donations?|purchase|upgrade|plans?|pricing)\b/iu;
-const signupActivation =
-  'sign\\s*up(?:\\s+with\\s+email)?|create\\s+(?:(?:an|your|my|new)\\s+)?account|register|join(?:\\s+now)?|get\\s+started|continue(?:\\s+with\\s+email)?|next|submit|done|finish|save|create';
-const credentialActivation: Record<CredentialKind, RegExp> = {
-  signup: new RegExp(`^(?:${signupActivation})$`, 'iu'),
-  rotation:
-    /^(?:(?:change|update|set|save)\s+(?:(?:your|my)\s+)?(?:new\s+)?password|save(?:\s+changes)?|submit|continue|next|done|confirm|update)$/iu,
-};
-const agreeingSignup = new RegExp(`^(?:i\\s+)?(?:agree|accept)\\s*(?:and|&)\\s*(?:${signupActivation})$`, 'iu');
-const verificationActivation =
-  /^(?:verify(?:\s+(?:my\s+)?(?:e-?mail|account|code))?|confirm(?:\s+(?:my\s+)?(?:e-?mail|account|code))?|submit(?:\s+code)?|activate(?:\s+(?:my\s+)?account)?|continue|next|done)$/iu;
-/** Where a credential operation's control sits: the bound form's own control, or the step it submits. */
-export interface CredentialControlScope {
-  /** The control belongs to the bound form, or both stand outside any form. */
-  readonly formControl?: boolean;
-  /** `verification` submits a signup's emailed code; otherwise the operation's own fields. */
-  readonly step?: 'credentials' | 'verification';
-}
-
 function credentialSecurityClass(evidence: string, kind: CredentialKind): ActionClass | undefined {
   const remaining = kind === 'rotation' ? evidence.replace(passwordChange, ' ') : evidence;
   if (
@@ -226,15 +208,14 @@ export function classifyCredentialNavigation(raw: string, kind: CredentialKind, 
 }
 
 /**
- * Whether an authorized signup or password change may activate this control. A transaction on the page,
- * purchase or subscription wording, unrelated security, speaking and links are refused; so is any name outside
- * the operation's own vocabulary, as ambiguous. The form's destination must stay on the site.
+ * Whether an authorized signup or password change may activate this control: its name is never matched to a
+ * vocabulary of its own, only refused for a transaction on the page, purchase or subscription wording, unrelated
+ * security, speaking or a link. The form's destination must stay on the site.
  */
 export function classifyCredentialControlFacts(
   facts: ControlFacts,
   kind: CredentialKind,
   site: string,
-  scope: CredentialControlScope = {},
 ): CredentialActivationClass {
   const evidence = `${facts.name} ${facts.visibleLabel ?? ''}`;
   const refused = credentialSecurityClass(evidence, kind);
@@ -245,11 +226,5 @@ export function classifyCredentialControlFacts(
     const destination = classifyCredentialNavigation(facts.formAction, kind, site);
     if (destination !== 'ordinary') return destination ?? 'unsupported_control';
   }
-  const fits = (name: string): boolean => {
-    if (scope.step === 'verification') return kind === 'signup' && verificationActivation.test(name);
-    if (credentialActivation[kind].test(name)) return true;
-    return kind === 'signup' && scope.formControl === true && !facts.moneyTerms && agreeingSignup.test(name);
-  };
-  const names = [facts.name.trim(), facts.visibleLabel?.trim() ?? ''].filter(Boolean);
-  return names.length > 0 && names.every(fits) ? 'ordinary' : 'unsupported_control';
+  return 'ordinary';
 }

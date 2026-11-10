@@ -10,7 +10,6 @@ import { EventEmitter } from 'node:events';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { ElementHandle, Page } from 'playwright-core';
 import { amazonRetailSignature, AMAZON_RETAIL } from './merchant-signatures.js';
-import * as nativeAuthentication from './authentication-submit.js';
 import * as isolatedFacts from './control-facts.js';
 import * as consentEngine from './consent.js';
 afterEach(() => vi.restoreAllMocks());
@@ -39,7 +38,6 @@ const region = (changes: Partial<ControlRegion> = {}): ControlRegion => ({
   freeText: false,
   commits: false,
   accountFields: false,
-  secretFields: false,
   ...changes,
 });
 
@@ -297,27 +295,11 @@ it('keeps reviewed Amazon authentication routes precise and leaves its other rou
   expect(classifyNavigationUrl('http://www.amazon.com/ap/signin')).toBe('ordinary');
 });
 
-it('submits positively identified native authentication forms without invoking arbitrary page callbacks', async () => {
-  const native = vi.fn();
-  const frame = { url: () => 'https://auth-dispatch.example/login' };
-  const form = { action: 'https://auth-dispatch.example/login', method: 'post' };
-  const element = { ownerFrame: async () => frame } as unknown as ElementHandle;
-  const page = {
-    url: () => frame.url(),
-    frames: () => [frame],
-    mainFrame: () => frame,
-    locator: () => ({ innerText: async () => '' }),
-    waitForEvent: async () => undefined,
-    on: () => undefined,
-    once: () => undefined,
-    context: () => ({
-      newCDPSession: async () => ({ on: () => undefined, send: async () => ({ targetInfo: { targetId: 'page' } }) }),
-      browser: () => ({
-        once: () => undefined,
-        newBrowserCDPSession: async () => ({ on: () => undefined, send: async () => undefined }),
-      }),
-    }),
-  } as unknown as Page;
+it('runs ordinary sign-in controls through the browser action and still refuses a purchase destination', async () => {
+  const url = 'https://auth-dispatch.example/login';
+  const form = { action: url, method: 'post' };
+  const { page } = guardedPageFixture(url, { frame: { id: 'fixture-page', url, loaderId: 'document' } });
+  const element = {} as ElementHandle;
   // This unit doubles the isolated-world reads and the native Chrome object binding. Both have real-renderer suites.
   vi.spyOn(isolatedFacts, 'readPageControlFacts').mockImplementation(async () => ({
     name: 'Sign in',
@@ -330,31 +312,13 @@ it('submits positively identified native authentication forms without invoking a
     formAction: form.action,
     transaction: false,
   }));
-  vi.spyOn(nativeAuthentication, 'inspectNativeAuthenticationControl').mockResolvedValue({
-    facts: {
-      control: { tag: 'BUTTON', name: '', type: 'submit', autocomplete: '' },
-      origin: 'https://auth-dispatch.example',
-      action: form.action,
-      method: 'post',
-      submit: true,
-      fields: [
-        { name: 'username', type: 'text', autocomplete: 'username' },
-        { name: 'password', type: 'password', autocomplete: 'current-password' },
-      ],
-    },
-  } as unknown as NonNullable<Awaited<ReturnType<typeof nativeAuthentication.inspectNativeAuthenticationControl>>>);
   vi.spyOn(consentEngine, 'runConsentPass').mockResolvedValue({ status: 'ready', agreements: [], addOns: [] });
-  vi.spyOn(nativeAuthentication, 'submitNativeAuthenticationForm').mockImplementation(async () => {
-    native();
-    return true;
-  });
   const arbitraryCallback = vi.fn(async () => undefined);
   await activateControl(page, element, arbitraryCallback);
-  expect(native).toHaveBeenCalledTimes(1);
-  expect(arbitraryCallback).not.toHaveBeenCalled();
+  expect(arbitraryCallback).toHaveBeenCalledTimes(1);
   form.action = 'https://auth-dispatch.example/place-order';
   await expect(activateControl(page, element, arbitraryCallback)).rejects.toMatchObject({ reason: 'purchase_control' });
-  expect(arbitraryCallback).not.toHaveBeenCalled();
+  expect(arbitraryCallback).toHaveBeenCalledTimes(1);
 });
 
 it('lets a reviewed flow decide only what the open rule leaves ordinary', async () => {
@@ -417,7 +381,7 @@ describe('the credential activation scope', () => {
     expect(classifyControlFacts(control('Change password'))).toBe('account_security');
   });
 
-  it('refuses financial, unrelated security, speaking, ambiguous and off-site activation even when authorized', () => {
+  it('refuses financial, unrelated security, speaking, link and off-site activation even when authorized', () => {
     const refusals: Array<[ControlFacts, string]> = [
       [control('Start free trial'), 'purchase_control'],
       [control('Subscribe'), 'purchase_control'],
@@ -427,7 +391,6 @@ describe('the credential activation scope', () => {
       [control('Manage two-factor'), 'account_security'],
       [control('Delete account'), 'account_security'],
       [control('Post review'), 'speaks_as_principal'],
-      [control('Do it'), 'unsupported_control'],
       [control('Create account', { visibleLabel: 'Buy now' }), 'purchase_control'],
       [control('Create account', { formAction: 'https://collector.example/signup' }), 'unsupported_control'],
       [control('Create account', { formAction: 'http://accounts.shop.example/signup' }), 'blocked_address'],
@@ -440,58 +403,17 @@ describe('the credential activation scope', () => {
       ).toBe(reason);
   });
 
-  it('takes a signup form’s own agree-and-create control as its activation, and refuses those words in every other credential scope', () => {
-    const agreeing = [
-      'Agree and create account',
-      'Accept and sign up',
-      'Agree & continue',
-      'I agree and continue',
-      'Agree & Join',
-    ];
-    for (const name of agreeing) {
-      expect(classifyCredentialControlFacts(control(name), 'signup', 'shop.example', { formControl: true })).toBe(
+  it('takes any control name a signup or its verification uses, refusing only commit and security wording', () => {
+    for (const name of ['Go', 'Agree and create account', 'Verify', 'Continue', 'Do it'])
+      expect(classifyCredentialControlFacts(control(name), 'signup', 'shop.example')).toBe('ordinary');
+    for (const name of ['Agree and subscribe', 'Agree and start free trial', 'Agree and pay'])
+      expect(classifyCredentialControlFacts(control(name), 'signup', 'shop.example')).toBe('purchase_control');
+    // A price elsewhere on the page commits nothing: money is gated where it is paid, at a transaction or card field.
+    for (const name of ['Agree and create account', 'Register'])
+      expect(classifyCredentialControlFacts(control(name, { moneyTerms: true }), 'signup', 'shop.example')).toBe(
         'ordinary',
       );
-      expect(classifyCredentialControlFacts(control(name), 'signup', 'shop.example')).toBe('unsupported_control');
-      expect(
-        classifyCredentialControlFacts(
-          control(name, { formAction: 'https://www.shop.example/account/change-password' }),
-          'rotation',
-          'shop.example',
-          { formControl: true },
-        ),
-      ).toBe('unsupported_control');
-      // Outside every credential scope the open rule decides: these words name no commit.
-      expect(classifyControlFacts(control(name))).toBe('ordinary');
-    }
-    const inForm = { formControl: true } as const;
-    expect(
-      classifyCredentialControlFacts(
-        control('Agree and create account', { moneyTerms: true }),
-        'signup',
-        'shop.example',
-        inForm,
-      ),
-    ).toBe('unsupported_control');
-    expect(classifyCredentialControlFacts(control('Agree and subscribe'), 'signup', 'shop.example', inForm)).toBe(
-      'purchase_control',
-    );
-    expect(
-      classifyCredentialControlFacts(control('Agree and start free trial'), 'signup', 'shop.example', inForm),
-    ).toBe('purchase_control');
-    expect(classifyCredentialControlFacts(control('Agree and pay'), 'signup', 'shop.example', inForm)).toBe(
-      'purchase_control',
-    );
-  });
-
-  it('activates a signup’s verification code only through a verification control', () => {
-    const verification = { step: 'verification' } as const;
-    for (const name of ['Verify', 'Verify email', 'Confirm', 'Submit code', 'Continue', 'Activate account'])
-      expect(classifyCredentialControlFacts(control(name), 'signup', 'shop.example', verification)).toBe('ordinary');
-    for (const name of ['Create account', 'Resend code', 'Change email', 'Subscribe'])
-      expect(classifyCredentialControlFacts(control(name), 'signup', 'shop.example', verification)).not.toBe(
-        'ordinary',
-      );
+    expect(classifyCredentialControlFacts(control('Change email'), 'signup', 'shop.example')).toBe('account_security');
   });
 
   it('lets a change navigate only to its own site’s password routes, never to other security or financial routes', () => {

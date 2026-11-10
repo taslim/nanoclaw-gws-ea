@@ -45,7 +45,7 @@ import { upsertUser } from '../permissions/db/users.js';
 import { upsertUserDm } from '../permissions/db/user-dms.js';
 import '../gws-ea-profile/index.js';
 import './index.js';
-import { configureBrowserCancellation } from './cancel.js';
+import { configureBrowserCancellation, readBrowserJob } from './cancel.js';
 import {
   activateControl,
   classifyActivation,
@@ -53,6 +53,7 @@ import {
   withBrowserJobNavigation,
   type ActivationIntent,
 } from './commit-classifier.js';
+import { freePressInProgress } from './free-press.js';
 import { recordConsentGrant, runConsentPass, type ConsentPassResult } from './consent.js';
 import { BrowserStore } from './db.js';
 import { BrowserDiagnosticAttempt } from './diagnostics.js';
@@ -67,12 +68,13 @@ import {
   CONSENT,
   COOKIE_BANNERS,
   GENERIC,
+  GUEST_BOOKING,
   OPEN_WEB,
   PERSONAL_DATA,
   PROCESSOR,
   checkoutPage,
   feeTablePage,
-  genericCheckoutPages,
+  guestBookingPage,
   htmlPage,
   openWebFixture,
   orderConfirmationPage,
@@ -84,9 +86,9 @@ import {
 import * as loginStoreModule from './login-store.js';
 import { createLoginsPageHandler } from './logins-page.js';
 import { testLoginStore } from './testing/login-store.js';
-import { observePage, type BrowserObservation } from './observe.js';
+import { observePage, type BrowserSnapshotObservation } from './observe.js';
+import { registerPageSecret, releasePageSecret } from './page-privacy.js';
 import { registerBrowserPurchaseDelivery, resumeBrowserPurchaseCommits } from './purchase.js';
-import { recordPurchaseOutcome } from './purchase-outcome.js';
 import { type BrowserQueue } from './queue.js';
 import type { BrowserExecutionContext, BrowserWatchExecutionContext } from './actions.js';
 import { executeRecipe, saveBrowserRecipe } from './recipes.js';
@@ -1041,6 +1043,60 @@ describe.skipIf(!chromePath)('ordinary actions in native Chrome', { timeout: 60_
     expect(await page.getByRole('textbox', { name: 'Search term' }).inputValue()).toBe('current');
   });
 
+  it('keeps refs through an ad frame’s navigation and a same-document route, and makes them stale when their own frame or the page’s document changes', async () => {
+    const url = 'https://news.example/frames';
+    const ad = 'https://ads.example/slot';
+    const login = 'https://accounts.example/embedded';
+    const page = htmlPage(
+      'Frames',
+      `<h1>Frames</h1><input aria-label="Search term"><iframe id="ad" title="Advertisement" src="${ad}"></iframe><iframe id="login" title="Sign in" src="${login}"></iframe>`,
+    );
+    fixture.serve(url, page);
+    fixture.serve(`${url}/results`, page);
+    fixture.serve(ad, htmlPage('Ad', '<button type="button">First offer</button>'));
+    fixture.serve(`${ad}-2`, htmlPage('Ad', '<button type="button">Second offer</button>'));
+    fixture.serve(login, htmlPage('Sign in', '<input aria-label="Account email">'));
+    fixture.serve(`${login}/next`, htmlPage('Sign in', '<input aria-label="Account email">'));
+    const tab = await open();
+    await go(tab, url);
+    const frame = tab.frameLocator('#login');
+    await frame.getByRole('textbox', { name: 'Account email' }).waitFor();
+    await tab.frameLocator('#ad').getByRole('button', { name: 'First offer' }).waitFor();
+    const search = tab.getByRole('textbox', { name: 'Search term' });
+
+    let observation = await observePage(tab);
+    await tab.evaluate(`document.getElementById('ad').src = '${ad}-2'`);
+    await tab.frameLocator('#ad').getByRole('button', { name: 'Second offer' }).waitFor();
+    expect(await batch(tab, [{ kind: 'type', ...refIn(observation, 'Search term'), text: 'tapas' }])).toMatchObject({
+      status: 'completed',
+    });
+    expect(await search.inputValue()).toBe('tapas');
+
+    observation = await observePage(tab);
+    await tab.evaluate(`history.pushState({}, '', '/frames/results')`);
+    expect(await batch(tab, [{ kind: 'type', ...refIn(observation, 'Search term'), text: 'mezze' }])).toMatchObject({
+      status: 'completed',
+    });
+    expect(await search.inputValue()).toBe('mezze');
+
+    observation = await observePage(tab);
+    const email = refIn(observation, 'Account email');
+    const frameOf = (ref: string): string => ref.replace(/e\d+$/u, '');
+    expect(frameOf(email.ref)).not.toBe(frameOf(refIn(observation, 'Search term').ref));
+    await tab.evaluate(`document.getElementById('login').src = '${login}/next'`);
+    await frame.getByRole('textbox', { name: 'Account email' }).waitFor();
+    await expect.poll(() => tab.frames().some((candidate) => candidate.url() === `${login}/next`)).toBe(true);
+    expect(await batch(tab, [{ kind: 'type', ...email, text: 'morgan' }])).toMatchObject({ reason: 'stale_ref' });
+    expect(await frame.getByRole('textbox', { name: 'Account email' }).inputValue()).toBe('');
+
+    observation = await observePage(tab);
+    const old = refIn(observation, 'Search term');
+    await tab.reload();
+    await search.waitFor();
+    expect(await batch(tab, [{ kind: 'type', ...old, text: 'stale' }])).toMatchObject({ reason: 'stale_ref' });
+    expect(await search.inputValue()).toBe('');
+  });
+
   it('does not turn an internal TypeError into an actionability refusal', async () => {
     const page = await open();
     await go(page, OPEN_WEB.faq);
@@ -1171,7 +1227,7 @@ describe.skipIf(!chromePath)('ordinary actions in native Chrome', { timeout: 60_
     await go(page, OPEN_WEB.typedPosts);
     const guard = await ensureBrowserNavigationGuard(page);
     /** Types as `actions` says, aimed from a fresh observation, once every earlier window has closed. */
-    const typed = async (actions: (observation: BrowserObservation) => BrowserAction[]): Promise<void> => {
+    const typed = async (actions: (observation: BrowserSnapshotObservation) => BrowserAction[]): Promise<void> => {
       await guard.actionsSettled();
       await page.evaluate(`document.getElementById('status').textContent = 'Ready'`);
       expect(await batch(page, actions(await observePage(page)))).toMatchObject({ status: 'completed' });
@@ -1252,19 +1308,17 @@ describe.skipIf(!chromePath)('ordinary actions in native Chrome', { timeout: 60_
     expect(posts()).toEqual(['https://bistro.example/availability/hold']);
   });
 
-  it.each([
-    { source: 'autocomplete', label: 'Display value', attributes: 'autocomplete="new-password"' },
-    { source: 'label', label: 'Password', attributes: '' },
-  ])(
-    'refuses ordinary typing and editing of a secret field even when page script hides its attributes ($source)',
-    async ({ label, attributes }) => {
+  it.each(['new-password', 'current-password'])(
+    'refuses ordinary typing and editing of a field marked %s even when page script hides its attributes',
+    async (autocomplete) => {
       const page = await open();
-      const url = 'https://shop.example/secret-entry';
+      const url = `https://shop.example/secret-entry-${autocomplete}`;
+      const label = 'Display value';
       fixture.serve(
         url,
         htmlPage(
           'Profile',
-          `<form method="post" action="${url}/submitted"><label>${label} <input id="entry" name="value" type="text" ${attributes}></label><button>Continue</button></form>`,
+          `<form method="post" action="${url}/submitted"><label>${label} <input id="entry" name="value" type="text" autocomplete="${autocomplete}"></label><button>Continue</button></form>`,
           `
       const read = HTMLInputElement.prototype.getAttribute;
       HTMLInputElement.prototype.getAttribute = function(name) {
@@ -1273,7 +1327,6 @@ describe.skipIf(!chromePath)('ordinary actions in native Chrome', { timeout: 60_
     `,
         ),
       );
-      fixture.serve(`${url}/submitted`, htmlPage('Submitted', 'Done'));
       await page.goto(url);
       const secret = 'Synthetic-"credential\\U3-42';
       await page.locator('#entry').fill(secret);
@@ -1285,9 +1338,10 @@ describe.skipIf(!chromePath)('ordinary actions in native Chrome', { timeout: 60_
       await page.locator('#entry').fill('');
       for (const kind of ['type', 'key', 'form_input'] as const) {
         const field = refIn(await observePage(page), label);
+        // A code-shaped value too: only the host fills a credential field.
         const action: BrowserAction =
           kind === 'type'
-            ? { kind, ...field, text: 'ordinary-text' }
+            ? { kind, ...field, text: '552913' }
             : kind === 'key'
               ? { kind, ...field, key: 'Backspace' }
               : { kind, fields: [{ ...field, value: 'ordinary-text' }] };
@@ -1295,12 +1349,171 @@ describe.skipIf(!chromePath)('ordinary actions in native Chrome', { timeout: 60_
         expect(result).toMatchObject({ status: 'stopped', reason: 'secret_field' });
         expect(await page.locator('#entry').inputValue()).toBe('');
       }
-      await page.locator('#entry').fill(secret);
-      const submitted = await batch(page, [{ kind: 'click', ...refIn(await observePage(page), 'Continue') }]);
-      expect.soft(submitted).toMatchObject({ status: 'stopped', reason: 'secret_field' });
-      expect(fixture.requests.some((request) => request.url === `${url}/submitted`)).toBe(false);
     },
   );
+
+  describe('codes the agent types', () => {
+    const CODE = '552913';
+    const verify = (url: string, fields: string): string =>
+      htmlPage(
+        'Verify',
+        `<h1>Enter the code we sent</h1><form method="post" action="${url}/verified">${fields}<button type="submit">Verify</button></form>`,
+      );
+    const serve = (name: string, fields: string): string => {
+      const url = `https://shop.example/verify-${name}`;
+      fixture.serve(url, verify(url, fields));
+      fixture.serve(`${url}/verified`, htmlPage('Verified', '<h1>You are signed in</h1>'));
+      return url;
+    };
+
+    it('types a code into a one-time-code field, shows it as typed, and leaves screenshots available', async () => {
+      const page = await open();
+      await page.goto(
+        serve(
+          'otp',
+          '<label>Verification code <input name="code" autocomplete="one-time-code" inputmode="numeric"></label>',
+        ),
+      );
+      const typed = await batch(page, [
+        { kind: 'type', ...refIn(await observePage(page), 'Verification code'), text: CODE },
+      ]);
+      expect(typed).toMatchObject({ status: 'completed' });
+      expect(await page.locator('[name=code]').inputValue()).toBe(CODE);
+      expect((await observePage(page)).snapshot).toContain(CODE);
+      expect(await batch(page, [{ kind: 'screenshot' }])).toMatchObject({
+        status: 'completed',
+        images: [{ mime_type: 'image/png' }],
+      });
+    });
+
+    it('types one digit into each of six single-digit boxes', async () => {
+      const page = await open();
+      const boxes = Array.from(
+        { length: 6 },
+        (_value, index) =>
+          `<input aria-label="Digit ${index + 1}" name="d${index + 1}" maxlength="1" inputmode="numeric"${index === 0 ? ' autocomplete="one-time-code"' : ''}>`,
+      ).join('');
+      await page.goto(serve('boxes', boxes));
+      const observation = await observePage(page);
+      const typed = await batch(page, [
+        {
+          kind: 'form_input',
+          fields: [...CODE].map((digit, index) => ({ ...refIn(observation, `Digit ${index + 1}`), value: digit })),
+        },
+      ]);
+      expect(typed).toMatchObject({ status: 'completed' });
+      expect(await Promise.all((await page.locator('input').all()).map((input) => input.inputValue()))).toEqual([
+        ...CODE,
+      ]);
+    });
+
+    it('types a code into a masked PIN field, then presses Verify, with screenshots still available', async () => {
+      const page = await open();
+      const url = serve('pin', '<label>PIN <input name="pin" type="password" inputmode="numeric"></label>');
+      await page.goto(url);
+      const typed = await batch(page, [{ kind: 'type', ...refIn(await observePage(page), 'PIN'), text: CODE }]);
+      expect(typed).toMatchObject({ status: 'completed' });
+      expect(await batch(page, [{ kind: 'screenshot' }])).toMatchObject({ status: 'completed' });
+      expect(await click(page, 'Verify')).toMatchObject({ status: 'stopped', reason: 'navigated' });
+      expect(page.url()).toBe(`${url}/verified`);
+      expect(posts()).toContain(`${url}/verified`);
+    });
+
+    it('keeps a code-shaped password out of an unmarked password field, while a masked code box takes a letter code', async () => {
+      const page = await open();
+      const signup = serve(
+        'unmarked-signup',
+        '<label>Email <input name="email" type="email"></label><label>Password <input name="password" type="password"></label>',
+      );
+      await page.goto(signup);
+      const typed: BrowserAction = { kind: 'type', ...refIn(await observePage(page), 'Password'), text: 'Summer2026' };
+      expect(await batch(page, [typed])).toMatchObject({ status: 'stopped', reason: 'secret_field' });
+      const observation = await observePage(page);
+      const filled = await batch(page, [
+        {
+          kind: 'form_input',
+          fields: [{ ...refIn(observation, 'Password'), value: 'Summer2026' }],
+          submit: refIn(observation, 'Verify'),
+        },
+      ]);
+      expect(filled).toMatchObject({ status: 'stopped', reason: 'secret_field' });
+      expect(await page.locator('[name=password]').inputValue()).toBe('');
+      expect(posts()).not.toContain(`${signup}/verified`);
+
+      const box = serve('masked-letters', '<label>Code <input name="code" type="password" maxlength="6"></label>');
+      await page.goto(box);
+      const code = await batch(page, [{ kind: 'type', ...refIn(await observePage(page), 'Code'), text: 'A7KX29' }]);
+      expect(code).toMatchObject({ status: 'completed' });
+      expect(await click(page, 'Verify')).toMatchObject({ status: 'stopped', reason: 'navigated' });
+      expect(posts()).toContain(`${box}/verified`);
+    });
+
+    it('refuses a password-shaped value in a masked field, and a model-chosen signup password never submits', async () => {
+      const page = await open();
+      const url = serve(
+        'signup',
+        '<label>Username <input name="username"></label><label>Password <input name="password" type="password"></label>',
+      );
+      await page.goto(url);
+      for (const text of ['Tr0ub4dor&3', 'longerthanten1', '5529 13']) {
+        const typed = await batch(page, [{ kind: 'type', ...refIn(await observePage(page), 'Password'), text }]);
+        expect(typed).toMatchObject({ status: 'stopped', reason: 'secret_field' });
+      }
+      const observation = await observePage(page);
+      const signup = await batch(page, [
+        {
+          kind: 'form_input',
+          fields: [
+            { ...refIn(observation, 'Username'), value: 'fixture-member' },
+            { ...refIn(observation, 'Password'), value: 'Model-chosen-passphrase-9' },
+          ],
+          submit: refIn(observation, 'Verify'),
+        },
+      ]);
+      expect(signup).toMatchObject({ status: 'stopped', reason: 'secret_field' });
+      expect(await page.locator('[name=password]').inputValue()).toBe('');
+      expect(posts()).not.toContain(`${url}/verified`);
+    });
+
+    it.each(['form', 'formless'] as const)(
+      'refuses an agent press while a %s group holds a value the host filled',
+      async (shape) => {
+        const page = await open();
+        const url = `https://shop.example/host-held-${shape}`;
+        const fields =
+          '<label>Email <input name="email" type="email"></label><label>Password <input id="pw" name="password" type="password" autocomplete="current-password"></label>';
+        fixture.serve(
+          url,
+          htmlPage(
+            'Sign in',
+            shape === 'form'
+              ? `<form method="post" action="${url}/session">${fields}<button type="submit">Sign in</button></form>`
+              : `<div>${fields}<div role="button" tabindex="0" id="go">Sign in</div></div>`,
+            shape === 'form'
+              ? ''
+              : `document.getElementById('go').addEventListener('click', () => fetch('${url}/session', { method: 'POST', body: document.getElementById('pw').value }));`,
+          ),
+        );
+        fixture.serve(`${url}/session`, htmlPage('Signed in', '<h1>Signed in</h1>'));
+        await page.goto(url);
+        // A host fill whose clearing failed leaves its value in the field; only the host submits it.
+        const held = 'host-held-fixture-7731';
+        await page.locator('#pw').fill(held);
+        registerPageSecret(page, held);
+        try {
+          expect(await click(page, 'Sign in')).toMatchObject({ status: 'stopped', reason: 'secret_field' });
+          const email = refIn(await observePage(page), 'Email');
+          expect(await batch(page, [{ kind: 'key', ...email, key: 'Enter' }])).toMatchObject({
+            status: 'stopped',
+            reason: 'secret_field',
+          });
+          expect(posts()).not.toContain(`${url}/session`);
+        } finally {
+          releasePageSecret(page, held);
+        }
+      },
+    );
+  });
 
   it('stops a watch batch at a download without running later actions', async () => {
     const page = await open();
@@ -1349,8 +1562,8 @@ describe.skipIf(!chromePath)('ordinary actions in native Chrome', { timeout: 60_
     expect(await typed('Card number')).toMatchObject({ status: 'stopped', reason: 'card_field' });
     expect(await typed('Expiry')).toMatchObject({ status: 'stopped', reason: 'card_field' });
     expect(await page.locator('input[name="cardnumber"]').inputValue()).toBe('');
-    // A gift card's number is no card entry: the secret rule keeps it out of ordinary typing.
-    expect(await typed('Gift card number')).toMatchObject({ status: 'stopped', reason: 'secret_field' });
+    // A gift card's number is no card entry: it is ordinary text, like a coupon.
+    expect(await typed('Gift card number')).toMatchObject({ status: 'completed' });
     await go(page, OPEN_WEB.hostedCard);
     await page.frameLocator('#card-frame').locator('input[name="cardnumber"]').waitFor();
     for (const name of ['Card number', 'CVC']) expect(await typed(name)).toMatchObject({ reason: 'card_field' });
@@ -1415,7 +1628,7 @@ describe.skipIf(!chromePath)('ordinary presses that buy, in native Chrome', { ti
     const store = vi.spyOn(loginStoreModule, 'getLoginStore').mockResolvedValue(logins.store);
     try {
       const opened = await run('inventory-labels', [{ kind: 'navigate', url: OPEN_WEB.faq }]);
-      expect((opened.observation as BrowserObservation).site?.vault_items).toEqual([
+      expect((opened.observation as BrowserSnapshotObservation).site?.vault_items).toEqual([
         { item_handle: assistant.id, title: 'Assistant login', account: 'assistant' },
         { item_handle: principal.id, title: 'Principal login', account: 'principal' },
       ]);
@@ -1460,7 +1673,7 @@ describe.skipIf(!chromePath)('ordinary presses that buy, in native Chrome', { ti
           budget_ms: 3_000,
         });
         expect(result).toMatchObject({ reason: 'navigated', actions: [{ status: 'completed' }] });
-        expect((result.observation as BrowserObservation).site).toMatchObject(
+        expect((result.observation as BrowserSnapshotObservation).site).toMatchObject(
           source === 'catalog'
             ? { recipes_status: 'unavailable', vault_items: [{ item_handle: item.id }] }
             : { recipes: [], vault_status: 'vault_unavailable' },
@@ -1592,9 +1805,9 @@ describe.skipIf(!chromePath)('cookie banners in native Chrome', { timeout: 30_00
   /** One batch through the executor, which settles cookie banners before the observation it returns. */
   async function batch(
     ...actions: BrowserAction[]
-  ): Promise<{ result: Record<string, unknown>; seen: BrowserObservation }> {
+  ): Promise<{ result: Record<string, unknown>; seen: BrowserSnapshotObservation }> {
     const result = await executeBrowserBatch(jobContext(db, page, JOB), { actions }, { record: false });
-    return { result, seen: result.observation as BrowserObservation };
+    return { result, seen: result.observation as BrowserSnapshotObservation };
   }
   const observe = () => batch({ kind: 'observe' });
   /** What the page's banner received: its choice, whether a real click made it, and how many presses it took. */
@@ -1704,10 +1917,10 @@ describe.skipIf(!chromePath)('personal data in native Chrome', { timeout: 60_000
     errandRequest(host, id, action, content);
   const run = (id: string, actions: BrowserAction[]) => request(id, 'browser', { actions });
   /** Opens `url` and answers with the observation the navigation returned. */
-  async function open(url: string): Promise<BrowserObservation> {
+  async function open(url: string): Promise<BrowserSnapshotObservation> {
     const opened = await run(`open-${randomUUID()}`, [{ kind: 'navigate', url }]);
     expect(opened).toMatchObject({ status: 'stopped', reason: 'navigated' });
-    return opened.observation as BrowserObservation;
+    return opened.observation as BrowserSnapshotObservation;
   }
   /** Main's disclosure of the mobile number to `site` for this errand, sent as its tool sends it; the host's answer. */
   async function disclose(site: string): Promise<unknown> {
@@ -1842,8 +2055,7 @@ describe.skipIf(!chromePath)('personal data in native Chrome', { timeout: 60_000
       expect(
         await request('sign-in', 'fill_secret', {
           item_handle: item.id,
-          field: 'username',
-          target: refIn(signIn, 'Email'),
+          username: refIn(signIn, 'Email'),
           submit: refIn(signIn, 'Continue'),
         }),
       ).toMatchObject({ status: 'submitted' });
@@ -2156,7 +2368,8 @@ document.getElementById('updated').addEventListener('click', () => location.assi
     for (const [index, [mode, field, value, pictured]] of (
       [
         ['open', password, 'fixture-pass-7731', false],
-        ['closed', code, '552913', false],
+        // A code is ordinary text: it never withholds the picture.
+        ['closed', code, '552913', true],
         ['open', password, '', true],
       ] as const
     ).entries()) {
@@ -2188,34 +2401,91 @@ document.getElementById('updated').addEventListener('click', () => location.assi
     expect(await approvals()).toHaveLength(1);
   });
 
-  it('presses a free table itself with no card, unticking the offers box, and records a money-less attempt', async () => {
+  it('presses a free table itself with no card, unticking the offers box, and records nothing for main to settle', async () => {
     fixture.serve('https://table.example/book/r-7/confirm', placedPage('T-7731', '$0.00'));
     await open(CONSENT.offers);
-    expect(await purchase('Reserve now')).toMatchObject({ status: 'booked', order_number: 'T-7731' });
+    expect(await purchase('Reserve now')).toMatchObject({
+      status: 'pressed',
+      site: 'table.example',
+      pressed_at: expect.stringMatching(/ Los Angeles time$/u),
+      repeat_safe: false,
+    });
     expect(await approvals()).toEqual([]);
     expect(sent).toEqual([]);
     const booking = fixture.requests.find((request) => request.method === 'POST');
     expect(new URLSearchParams(booking?.body)).toEqual(new URLSearchParams({ party: '2' }));
-    expect(await getDb().all('SELECT site,resolution,merchant_record_id FROM gws_ea_browser_free_attempts')).toEqual([
-      { site: 'table.example', resolution: 'committed', merchant_record_id: 'T-7731' },
-    ]);
     expect(await attempts()).toEqual([]);
-    expect(await getDb().all('SELECT * FROM gws_ea_browser_purchase_blocks')).toEqual([]);
+    expect(await blocks()).toEqual([]);
   });
 
-  it('stops the job with an incident when a free booking’s confirmation shows a charge', async () => {
-    fixture.serve(GENERIC.booked, placedPage('T-2210', '$25.00'));
-    await open(GENERIC.freeTable);
-    expect(await purchase('Reserve now')).toMatchObject({
-      status: 'stopped',
-      reason: 'unapproved_commit',
-      incident: { site: 'table.example', reference: 'T-2210', charged: '$25.00' },
-      repeat_safe: false,
+  it('keeps a free press the site answers only after the click’s wait, so a repeat on the same checkout presses nothing', async () => {
+    // Answered after the press's 10-second click window by showing the checkout again.
+    fixture.serve('https://table.example/book/r-7/confirm', () => ({
+      status: 303,
+      headers: { location: CONSENT.offers },
+      delayMs: 12_000,
+    }));
+    await open(CONSENT.offers);
+    const shownAgain = page.waitForEvent('framenavigated', {
+      predicate: (frame) => frame === page.mainFrame() && frame.url() === CONSENT.offers,
+      timeout: 30_000,
     });
-    expect(await getDb().all('SELECT kind,site,job_id FROM gws_ea_browser_incidents')).toEqual([
-      { kind: 'unapproved_commit', site: 'table.example', job_id: session.thread_id },
-    ]);
-  });
+    const first = await purchase('Reserve now');
+    expect(first).toMatchObject({ status: 'pressed', site: 'table.example', repeat_safe: false });
+    // The repeat comes on the checkout the site's late answer showed again.
+    await shownAgain;
+    expect(await purchase('Reserve now')).toMatchObject({
+      status: 'already_pressed',
+      pressed_at: first.pressed_at,
+      repeat_safe: true,
+    });
+    expect(posts()).toEqual(['https://table.example/book/r-7/confirm']);
+  }, 60_000);
+
+  it('answers already_pressed for a repeat of an earlier free booking after the errand pressed another', async () => {
+    fixture.serve('https://table.example/book/r-7/confirm', () => ({
+      status: 303,
+      headers: { location: CONSENT.offers },
+    }));
+    const party = async (size: string): Promise<void> => {
+      await open(CONSENT.offers);
+      expect(
+        await run(`party-${randomUUID()}`, [
+          { kind: 'select', ...refIn(await observePage(page), 'Party size'), value: size },
+        ]),
+      ).toMatchObject({ status: 'completed' });
+    };
+    await party('2');
+    const forTwo = await purchase('Reserve now');
+    expect(forTwo).toMatchObject({ status: 'pressed' });
+    await party('4');
+    expect(await purchase('Reserve now')).toMatchObject({ status: 'pressed' });
+    await party('2');
+    expect(await purchase('Reserve now')).toMatchObject({ status: 'already_pressed', pressed_at: forTwo.pressed_at });
+    expect(posts()).toHaveLength(2);
+  }, 60_000);
+
+  it.each(['purchase', 'click'] as const)(
+    'stops the job with an incident when a free booking’s confirmation shows a charge, pressed by %s',
+    async (pressedBy) => {
+      fixture.serve(GENERIC.booked, placedPage('T-2210', '$25.00'));
+      await open(GENERIC.freeTable);
+      const result =
+        pressedBy === 'purchase'
+          ? await purchase('Reserve now')
+          : await run('reserve', [{ kind: 'click', ...refIn(await observePage(page), 'Reserve now') }]);
+      expect(result).toMatchObject({
+        status: 'stopped',
+        reason: 'unapproved_commit',
+        incident: { site: 'table.example', reference: 'T-2210', charged: '$25.00' },
+        repeat_safe: false,
+      });
+      expect(posts()).toEqual([GENERIC.booked]);
+      expect(await getDb().all('SELECT kind,site,job_id FROM gws_ea_browser_incidents')).toEqual([
+        { kind: 'unapproved_commit', site: 'table.example', job_id: session.thread_id },
+      ]);
+    },
+  );
 
   it('keeps a booking free past "No credit card required" and a Gift cards link outside its form, but not beside Google Pay or a saved card', async () => {
     await open(GENERIC.freeTable);
@@ -2452,37 +2722,6 @@ document.getElementById('updated').addEventListener('click', () => location.assi
     expect(await unconfirmedNotes()).toEqual([]);
   });
 
-  it('leaves a free booking with no confirmation unconfirmed, and makes the next booking there wait until main records it', async () => {
-    fixture.serve(GENERIC.booked, '<!doctype html><title>Processing</title><p>Processing your request</p>');
-    await open(GENERIC.freeTable);
-    const pressed = await purchase('Reserve now');
-    expect(pressed).toMatchObject({ status: 'unconfirmed', attempt_id: expect.stringMatching(/^free-attempt-/u) });
-    const attemptId = String(pressed.attempt_id);
-    expect(await getDb().all('SELECT resolution FROM gws_ea_browser_free_attempts')).toEqual([{ resolution: null }]);
-    expect(await blocks()).toEqual([{ site: 'table.example' }]);
-    const told = await unconfirmedNotes();
-    expect(told).toHaveLength(1);
-    expect(told[0]).toContain(`free booking on table.example`);
-    expect(told[0]).toContain(attemptId);
-    // Browsing the site goes on; another booking there waits.
-    await open(GENERIC.freeTable);
-    expect(await purchase('Reserve now')).toMatchObject({ status: 'waiting_on_earlier', site: 'table.example' });
-    expect(posts()).toEqual([GENERIC.booked]);
-    fixture.serve(GENERIC.booked, genericCheckoutPages()[GENERIC.booked]);
-    expect(
-      await recordPurchaseOutcome(
-        { thread: session.thread_id!, attempt_id: attemptId, outcome: 'not_placed', source: 'principal' },
-        main,
-        () => queue,
-      ),
-    ).toMatchObject({ status: 'recorded', outcome: 'not_placed', source: 'principal' });
-    expect(await blocks()).toEqual([]);
-    expect((await texts(session)).filter((text) => text.includes('"site":"table.example"'))).toHaveLength(1);
-    await open(GENERIC.freeTable);
-    expect(await purchase('Reserve now')).toMatchObject({ status: 'booked', order_number: 'T-2210' });
-    expect(posts()).toEqual([GENERIC.booked, GENERIC.booked]);
-  });
-
   it('keeps the merchant’s lease and block through a payment platform’s own page, binding the platform origin', async () => {
     await open(GENERIC.toPlatform);
     expect(page.url()).toBe(GENERIC.platform);
@@ -2549,5 +2788,275 @@ document.getElementById('updated').addEventListener('click', () => location.assi
     expect(await attempts()).toMatchObject([
       { site: 'osteria.example', platform: 'tables.example', resolution: 'committed', merchant_record_id: 'OJ-818' },
     ]);
+  });
+
+  describe('a guest booking that verifies the guest after Complete reservation', () => {
+    const MOBILE = '+1 415 555 0134';
+    const presses = async (): Promise<string | null> => page.locator('body').getAttribute('data-presses');
+    const processorRequests = (): string[] =>
+      fixture.requests.filter((request) => new URL(request.url).hostname === 'api.stripe.com').map(({ url }) => url);
+    /** Main's disclosure of the principal's mobile number to the booking site, for this errand. */
+    async function discloseMobile(): Promise<void> {
+      const value = (await addPrivateValue({ label: 'Mobile', kind: 'phone', value: MOBILE })).id;
+      const frame = await deliverAction(main, 'record_disclosure', {
+        thread: session.thread_id,
+        site: 'tablehop.example',
+        value_id: value,
+      });
+      if (!frame.ok) throw new Error(frame.error.message);
+    }
+    /** The agent's click on the control named `name`, aimed from a fresh observation. */
+    const click = async (name: string, id = `click-${randomUUID()}`): Promise<Record<string, unknown>> =>
+      run(id, [{ kind: 'click', ...refIn(await observePage(page), name) }]);
+
+    it('presses Complete reservation as an ordinary press, verifies the texted code and books, leaving main nothing to record', async () => {
+      await discloseMobile();
+      await open(GUEST_BOOKING.details);
+      const pressed = await click('Complete reservation');
+      expect(pressed).toMatchObject({
+        status: 'stopped',
+        reason: 'pressed',
+        press: { site: 'tablehop.example', pressed_at: expect.stringMatching(/ Los Angeles time$/u) },
+        observation: { snapshot: expect.stringContaining('Verify your phone number') },
+        repeat_safe: false,
+      });
+      expect(await presses()).toBe('1');
+      const dialog = pressed.observation as BrowserSnapshotObservation;
+      expect(
+        await run('send-code', [
+          { kind: 'type', ...refIn(dialog, 'Phone number'), text: '(415) 555-0134' },
+          { kind: 'click', ...refIn(dialog, 'Send code') },
+        ]),
+      ).toMatchObject({ status: 'completed' });
+      const sentCode = await observePage(page);
+      expect(
+        await run('verify', [
+          { kind: 'type', ...refIn(sentCode, 'Verification code'), text: GUEST_BOOKING.code },
+          { kind: 'click', ...refIn(sentCode, 'Verify') },
+        ]),
+      ).toMatchObject({ status: 'stopped', reason: 'navigated' });
+      expect(page.url()).toBe(GUEST_BOOKING.confirmed);
+      // The site's own booking POST, on a purchase route, went through from inside the dialog the free press opened.
+      expect(posts()).toEqual([GUEST_BOOKING.sendCode, GUEST_BOOKING.verify, GUEST_BOOKING.book]);
+      expect(fixture.requests.find((request) => request.url === GUEST_BOOKING.sendCode)?.body).toBe('(415) 555-0134');
+      expect(await approvals()).toEqual([]);
+      expect(await attempts()).toEqual([]);
+      expect(await blocks()).toEqual([]);
+      expect(await unconfirmedNotes()).toEqual([]);
+      expect((await readBrowserJob(session.thread_id!))?.unconfirmed).toBeUndefined();
+    });
+
+    it('answers already_pressed for a repeat press of the same booking in the errand, without pressing it again', async () => {
+      await open(GUEST_BOOKING.details);
+      const first = await click('Complete reservation');
+      expect(first).toMatchObject({ status: 'stopped', reason: 'pressed' });
+      const { pressed_at } = first.press as { pressed_at: string };
+      expect(await click('Complete reservation')).toMatchObject({
+        status: 'stopped',
+        reason: 'already_pressed',
+        press: { site: 'tablehop.example', pressed_at },
+      });
+      expect(await presses()).toBe('1');
+    });
+
+    it('records no press and leaves a region watch unspent when a cover kept the free press from reaching the page', async () => {
+      await open(GUEST_BOOKING.details);
+      const at = new Date().toISOString();
+      // A watch for the very table the page offers, its venue as the generic reader takes it from the heading.
+      const bounds = {
+        kind: 'region',
+        site: 'tablehop.example',
+        venue: { id: 'tablehop', name: 'Complete your reservation' },
+        partySize: 2,
+        windows: [{ start: '2026-11-10T02:00:00.000Z', end: '2026-11-10T04:00:00.000Z' }],
+        financial: { freeOnly: true, currency: 'USD', maxTotalMinor: 0, maxDueNowMinor: 0 },
+        until: '2099-01-01T00:00:00.000Z',
+      };
+      await getDb().run(
+        `INSERT INTO gws_ea_browser_watches(id,job_id,site,address,bounds_json,region_json,region_baseline,region_marked_at,status,created_at,updated_at,next_check_at)
+         VALUES('hale-tables',?,'tablehop.example',?,?,'{}','No tables',?,'armed',?,?,?)`,
+        session.thread_id,
+        GUEST_BOOKING.details,
+        JSON.stringify(bounds),
+        at,
+        at,
+        at,
+        at,
+      );
+      await getDb().run(
+        "INSERT INTO gws_ea_browser_watch_job_claims(job_id,state) VALUES(?,'available')",
+        session.thread_id,
+      );
+      const watch = () =>
+        Promise.all([
+          getDb().get('SELECT status FROM gws_ea_browser_watches WHERE id = ?', 'hale-tables'),
+          getDb().get('SELECT state FROM gws_ea_browser_watch_job_claims WHERE job_id = ?', session.thread_id),
+        ]);
+      await page.evaluate(
+        `document.body.insertAdjacentHTML('beforeend', '<div id="cookie-cover" style="position:fixed;inset:0;z-index:9999;background:rgba(0,0,0,0.4)"></div>')`,
+      );
+      expect(await click('Complete reservation')).toMatchObject({ status: 'stopped', reason: 'not_actionable' });
+      expect(await presses()).toBe('0');
+      expect(await watch()).toEqual([{ status: 'armed' }, { state: 'available' }]);
+      await page.evaluate(`document.getElementById('cookie-cover').remove()`);
+      expect(await click('Complete reservation')).toMatchObject({ status: 'stopped', reason: 'pressed' });
+      expect(await presses()).toBe('1');
+      // The press that reached the page spends the job's one booking and ends the watch.
+      expect(await watch()).toEqual([{ status: 'outcome_unknown' }, { state: 'unknown' }]);
+    });
+
+    describe('the dialog a free press opened', () => {
+      /** The agent's verification inside the dialog: its code, then Verify, whose success books the table. */
+      async function verify(): Promise<Record<string, unknown>> {
+        const dialog = await observePage(page);
+        return run('verify', [
+          { kind: 'type', ...refIn(dialog, 'Verification code'), text: GUEST_BOOKING.code },
+          { kind: 'click', ...refIn(dialog, 'Verify') },
+        ]);
+      }
+      const inProgress = () => freePressInProgress(session.thread_id!);
+      /** The free press of Complete reservation, once its own window, which admits its routes, has closed. */
+      async function pressComplete(): Promise<void> {
+        await open(GUEST_BOOKING.details);
+        expect(await click('Complete reservation')).toMatchObject({ reason: 'pressed' });
+        await (await ensureBrowserNavigationGuard(page)).actionsSettled();
+      }
+
+      it('keeps admitting the checkout’s booking route across a same-document route change', async () => {
+        await pressComplete();
+        expect(inProgress()).toBe(true);
+        await page.evaluate(`history.pushState({}, '', '/booking/details/verify')`);
+        await verify();
+        expect(posts()).toEqual([GUEST_BOOKING.verify, GUEST_BOOKING.book]);
+        // The booking's confirmation is a new document, which ends the dialog.
+        await expect.poll(inProgress).toBe(false);
+      });
+
+      it('ends at a new main document, refusing the checkout’s booking route from there', async () => {
+        const hold = 'https://tablehop.example/booking/hold';
+        fixture.serve(
+          hold,
+          htmlPage(
+            'Hold your table',
+            '<button type="button" id="hold">Hold my table</button>',
+            `document.getElementById('hold').addEventListener('click', () =>
+  fetch('/api/confirmbooking', { method: 'POST', body: 'party=2' }).catch(() => undefined));`,
+          ),
+        );
+        await pressComplete();
+        await open(hold);
+        await expect.poll(inProgress).toBe(false);
+        expect(await click('Hold my table')).toMatchObject({ status: 'completed' });
+        expect(posts()).toEqual([]);
+      });
+
+      it('ends once its time has passed, refusing the booking route a verification inside it sends', async () => {
+        await pressComplete();
+        // Past the dialog's fifteen minutes, with the host's clock running on from there.
+        vi.useFakeTimers({ toFake: ['Date'], shouldAdvanceTime: true });
+        try {
+          vi.setSystemTime(Date.now() + 16 * 60_000);
+          expect(inProgress()).toBe(false);
+          expect(await verify()).toMatchObject({ status: 'completed' });
+        } finally {
+          vi.useRealTimers();
+        }
+        expect(posts()).toEqual([GUEST_BOOKING.verify]);
+      });
+    });
+
+    it('refuses a payment processor request from a press inside the dialog, while the site’s own requests go', async () => {
+      fixture.serve(GUEST_BOOKING.details, guestBookingPage({ sendAlsoPosts: PROCESSOR.confirm }));
+      await open(GUEST_BOOKING.details);
+      expect(await click('Complete reservation')).toMatchObject({ reason: 'pressed' });
+      expect(await click('Send code')).toMatchObject({ status: 'completed' });
+      expect(posts()).toEqual([GUEST_BOOKING.sendCode]);
+      expect(processorRequests()).toEqual([]);
+    });
+
+    it('stops with purchase_control at a dialog that saves a card for a no-show fee, sending nothing to the processor', async () => {
+      fixture.serve(GUEST_BOOKING.details, guestBookingPage({ dialog: 'card' }));
+      await open(GUEST_BOOKING.details);
+      expect(await click('Complete reservation')).toMatchObject({ reason: 'pressed' });
+      expect(await click('Confirm reservation')).toMatchObject({ status: 'stopped', reason: 'purchase_control' });
+      expect(processorRequests()).toEqual([]);
+      expect(posts()).toEqual([]);
+    });
+
+    it('stops a free booking at an agreement only the principal can grant, pressing nothing', async () => {
+      fixture.serve(
+        GUEST_BOOKING.details,
+        guestBookingPage({
+          inForm: '<label><input type="checkbox" name="marketing" required> I agree to receive marketing</label>',
+        }),
+      );
+      await open(GUEST_BOOKING.details);
+      expect(await click('Complete reservation')).toMatchObject({ status: 'stopped', reason: 'consent_required' });
+      expect(await presses()).toBe('0');
+    });
+
+    it('presses a free booking while an earlier paid attempt on the merchant is unresolved, and names that attempt', async () => {
+      await open(GUEST_BOOKING.details);
+      const at = new Date().toISOString();
+      const facts = JSON.stringify({ site: 'tablehop.example', totalMinor: 2000, dueNowMinor: 2000, currency: 'USD' });
+      await getDb().run(
+        `INSERT INTO gws_ea_browser_authorities (id,job_id,kind,state,facts_json,bounds_json,exception_ids_json,attempt_id,expires_at,created_at)
+         VALUES('authority-deposit',?,'checkout','unknown',?,'{}','[]','attempt-deposit',?,?)`,
+        session.thread_id,
+        facts,
+        at,
+        at,
+      );
+      await getDb().run(
+        `INSERT INTO gws_ea_browser_purchase_attempts(id,authority_id,job_id,site,facts_json,attempted_at,unconfirmed_at)
+         VALUES('attempt-deposit','authority-deposit',?,'tablehop.example',?,?,?)`,
+        session.thread_id,
+        facts,
+        at,
+        at,
+      );
+      await getDb().run(
+        'INSERT INTO gws_ea_browser_purchase_blocks(site,created_at) VALUES(?,?)',
+        'tablehop.example',
+        at,
+      );
+      expect(await click('Complete reservation')).toMatchObject({
+        status: 'stopped',
+        reason: 'pressed',
+        press: { site: 'tablehop.example', unresolved_attempts: ['attempt-deposit'] },
+      });
+      expect(await presses()).toBe('1');
+    });
+
+    it('still answers purchase_control for a commit on a checkout with a total and a saved payment method', async () => {
+      await open(GENERIC.review);
+      expect(await click('Place order')).toMatchObject({ status: 'stopped', reason: 'purchase_control' });
+      expect(posts()).toEqual([]);
+    });
+
+    it('runs a press after an approved paid press as an ordinary action, refusing the checkout’s purchase route', async () => {
+      const deposit = 'https://tablehop.example/booking/deposit';
+      fixture.serve(
+        deposit,
+        checkoutPage({
+          action: '/booking/deposit/paid',
+          commit: 'Pay deposit',
+          items: ['Gift card × 1'],
+          total: '$20.00',
+          payment: 'Visa ending in 4242',
+          email: ALIAS,
+          outside: `<div id="after" hidden><button type="button" id="hold-table">Hold my table</button></div><script>
+document.getElementById('checkout').addEventListener('submit', (event) => { event.preventDefault(); document.getElementById('after').hidden = false; });
+document.getElementById('hold-table').addEventListener('click', () => fetch('/api/confirmbooking', { method: 'POST', body: 'party=2' }).catch(() => undefined));
+</script>`,
+        }),
+      );
+      await open(deposit);
+      expect(await purchase('Pay deposit')).toMatchObject({ status: 'awaiting_principal' });
+      await approve((await approvals())[0]);
+      expect(page.url()).toBe(deposit);
+      expect(await click('Hold my table')).toMatchObject({ status: 'completed' });
+      expect(posts()).toEqual([]);
+    });
   });
 });

@@ -25,10 +25,10 @@ import { requirePrincipalDirectMessage } from '../gws-ea-profile/marks.js';
 import type { WhatsAppAdapter } from '../gws-ea-whatsapp/adapter.js';
 import type { WhatsAppOutreachRequest } from '../gws-ea-whatsapp/contacts.js';
 import type { WhatsAppPerson } from '../gws-ea-whatsapp/paths.js';
-import { flushChatHandoffs } from './bridge.js';
+import { bookableCalendar, flushChatHandoffs } from './bridge.js';
 import { reopenClosedChat } from './closed-admission.js';
 import { getChat } from './db.js';
-import { recordChatHandoff } from './handoffs.js';
+import { recordChatHandoff, setChatCalendar } from './handoffs.js';
 import type { ChatJoinFacts } from './join.js';
 import { personForMember, refreshChatRoster } from './roster.js';
 import { ensureChatWiring } from './wiring-policy.js';
@@ -102,7 +102,8 @@ async function assertOutreachConversation(platformId: string, external: string):
 }
 const reachOut: ActionAnswer = async (content, session, requestId) => {
   const unknown = Object.keys(content).find(
-    (key) => !['action', 'requestId', 'delivers', 'people', 'message', 'group', 'principal_message'].includes(key),
+    (key) =>
+      !['action', 'requestId', 'delivers', 'people', 'message', 'group', 'principal_message', 'calendar'].includes(key),
   );
   if (unknown) throw invalidArgs(`Unknown outreach field ${unknown}.`);
   const principal = await requirePrincipalDirectMessage(textOf(content.principal_message, 'principal_message', 512));
@@ -115,6 +116,7 @@ const reachOut: ActionAnswer = async (content, session, requestId) => {
   if (!check.allowed) throw forbidden(`Nothing was handed over: ${check.reason}`);
   const external = await getExternalChatAgentGroupId();
   if (!external) throw forbidden('The assistant cannot work in outside chats yet.');
+  const calendar = content.calendar === undefined ? undefined : await bookableCalendar(content.calendar);
   const adapter = getChannelAdapterExact('whatsapp') as WhatsAppAdapter | undefined;
   if (!adapter?.isConnected()) throw forbidden('WhatsApp is unavailable. Use email or tell the principal.');
   const resolved: { readonly input: OutreachPerson; readonly person: WhatsAppPerson }[] = [];
@@ -210,6 +212,7 @@ const reachOut: ActionAnswer = async (content, session, requestId) => {
         if (!chat) throw new Error('The outreach chat was not stored.');
         await ensureChatWiring(chat);
       }
+      if (calendar !== undefined) await setChatCalendar(group.id, calendar);
       await recordChatHandoff({ id, messaging_group_id: group.id, message, matter_id: null, created_at: now }, []);
     });
     await flushChatHandoffs(group.id);

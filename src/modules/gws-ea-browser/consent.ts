@@ -1177,8 +1177,10 @@ export interface ConsentGrant {
 }
 
 /**
- * Records one stop per wording for the job, reusing an open one for the same form: the id the browser agent
- * asks the principal with. With no job, nothing can be asked, and the stop carries no id.
+ * Records one stop per wording for the job: the id the browser agent asks the principal with. A wording this job
+ * already put to the principal on the same site and frame origin names that stop, whatever form it reappears in,
+ * so a retry waits on the card already out or hears the decline already given; otherwise an open stop for the same
+ * form is reused. With no job, nothing can be asked, and the stop carries no id.
  */
 export async function recordConsentStops(
   scope: ConsentScope | undefined,
@@ -1200,6 +1202,14 @@ export async function recordConsentStops(
       continue;
     }
     const id = await scope.db.transaction(async () => {
+      const asked = await scope.db.get<{ id: string }>(
+        `SELECT id FROM ${STOPS} WHERE job_id = ? AND site = ? AND origin = ? AND wording = ? AND status IN ('requested','rejected') ORDER BY created_at DESC,id DESC LIMIT 1`,
+        scope.jobId,
+        stop.site,
+        stop.origin,
+        item.wording,
+      );
+      if (asked) return asked.id;
       const open = await scope.db.get<{ id: string }>(
         `SELECT id FROM ${STOPS} WHERE job_id = ? AND site = ? AND origin = ? AND wording = ? AND form_fingerprint = ? AND status = 'open'`,
         scope.jobId,

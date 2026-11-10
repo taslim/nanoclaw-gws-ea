@@ -22,10 +22,24 @@ export interface PausedDocument {
 }
 /** A page's answer for one of its documents; `headers` replaces the request's headers when given. */
 export type DocumentDecision = { allow: true; headers?: Array<{ name: string; value: string }> } | { allow: false };
+/** A request as a credential hold judges it. */
+export interface HeldRequest {
+  readonly method: string;
+  readonly url: string;
+  /** What the request sends: empty for none, undefined when Chrome did not hand the body over whole. */
+  readonly body?: string;
+}
+/** A page's credential holds as they stood when one request paused. */
+export interface CapturedHold {
+  /** Whether the holds refuse this request; it reports nothing, so the gate can ask before placing the request. */
+  refuses(request: HeldRequest): boolean;
+  /** Reports a refusal to the holds that refused this request, once the gate placed it on their page. */
+  refused(request: HeldRequest, resource: string): void;
+}
 /** A page's policy as it stood when one request paused. */
 export interface CapturedPolicy {
   /** A credential fill holds submissions across every target from before its input callbacks run. */
-  readonly submissionsHeld?: boolean;
+  readonly hold?: CapturedHold;
   decide(document: PausedDocument): Promise<DocumentDecision>;
   /** The gate refused this request because it could not tell whether the document was the page's. */
   refuse(): void;
@@ -80,6 +94,19 @@ export function documentGate(browser: Browser): Promise<DocumentGate> {
     });
   }
   return gate;
+}
+
+/** A paused request's body as Chrome handed it over, or undefined when part of it was left out. */
+function requestBody(request: {
+  postData?: string;
+  hasPostData?: boolean;
+  postDataEntries?: Array<{ bytes?: string }>;
+}): string | undefined {
+  if (request.postData !== undefined) return request.postData;
+  const entries = request.postDataEntries ?? [];
+  if (entries.length && entries.every((entry) => entry.bytes !== undefined))
+    return entries.map((entry) => Buffer.from(entry.bytes ?? '', 'base64').toString('utf8')).join('');
+  return request.hasPostData ? undefined : '';
 }
 
 function serviceWorkerScript(headers: Record<string, string>): boolean {
@@ -215,11 +242,26 @@ async function openDocumentGate(browser: Browser): Promise<DocumentGate> {
         if (serviceWorkerScript(event.request.headers)) return { allow: false };
         // Workers cannot own secret-bearing traffic, and a new frame or popup must not outrun a page-target
         // session. Decide HTTP requests here, on the browser session, using the hold captured at request time.
-        if (![...captured.values()].some((policy) => policy.submissionsHeld)) return { allow: true };
+        const holds = [...captured.values()].flatMap((policy) => (policy.hold ? [policy.hold] : []));
+        if (!holds.length) return { allow: true };
+        // Only a hold that reads a request to another site needs its body, so it is decoded once, on first read.
+        let body: { readonly value: string | undefined } | undefined;
+        const request: HeldRequest = {
+          method: event.request.method,
+          url: event.request.url,
+          get body() {
+            body ??= { value: requestBody(event.request) };
+            return body.value;
+          },
+        };
+        if (!holds.some((hold) => hold.refuses(request))) return { allow: true };
         const owner = await ownerOf(event.frameId);
         if (owner === 'unguarded') return { allow: true };
         if ('refuse' in owner) return { allow: false };
-        return { allow: !captured.get(owner.page)?.submissionsHeld };
+        const hold = captured.get(owner.page)?.hold;
+        if (!hold?.refuses(request)) return { allow: true };
+        hold.refused(request, event.resourceType.toLowerCase());
+        return { allow: false };
       }
       const owner = await ownerOf(event.frameId);
       if (owner === 'unguarded') return { allow: true };

@@ -55,7 +55,6 @@ export const BROWSER_ACTION_NAMES = [
   'fill_secret',
   'credential_form',
   'sign_in_code',
-  'browser_relay_sign_in',
   'save_recipe',
   'run_recipe',
   'request_consent',
@@ -101,10 +100,13 @@ export type BrowserStopReason =
   | 'browser_unavailable'
   | 'alias_unavailable'
   | 'personal_data'
-  | 'interrupted';
+  | 'interrupted'
+  | 'pressed'
+  | 'already_pressed';
 export type BrowserAction =
   | { kind: 'navigate'; url: string }
-  | { kind: 'observe' | 'screenshot' }
+  | { kind: 'observe'; within?: BrowserRef }
+  | { kind: 'screenshot' }
   | ({ kind: 'click' | 'download' } & BrowserRef)
   | ({ kind: 'type'; text: string } & BrowserRef)
   | ({ kind: 'select'; value: string } & BrowserRef)
@@ -155,6 +157,8 @@ export type BrowserBatchResult = (
   images?: ReadonlyArray<{ mime_type: 'image/png'; data: string }>;
   observation?: import('./observe.js').BrowserObservation;
   incident?: { readonly site: string; readonly reference: string; readonly charged?: string };
+  /** A free booking's host press, or the earlier one a repeat would have repeated. */
+  press?: import('./free-press.js').FreePressFacts;
 };
 
 export function browserActionRefs(action: BrowserAction): BrowserRef[] {

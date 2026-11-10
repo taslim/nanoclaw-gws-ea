@@ -68,7 +68,7 @@ export async function reconcilePurchaseAttempt(
 ): Promise<Record<string, unknown>> {
   const inconclusive = { status: 'inconclusive', attempt_id: attemptId, purchase_blocked: true, repeat_safe: true };
   const attempt = await store.attempt(attemptId);
-  if (!attempt || attempt.kind !== 'paid') return inconclusive;
+  if (!attempt) return inconclusive;
   if (attempt.resolution) return recorded(attempt);
   const facts = JSON.parse(attempt.facts_json) as PurchaseFacts;
   const evidence = await readMerchantPurchaseEvidence(page, facts);

@@ -405,6 +405,30 @@ logins on the page. Once no saved or pending passwords remain, adding a login
 can create a key. Removing an assistant deletes its Keychain key after stopping
 the host; an unreachable key is reported as left behind without failing removal.
 
+Saved-login sign-in follows the page's current controls, including JavaScript
+forms and pages without a form element. The host fills only on the login's
+site or another host of the same registrable domain, such as the site's own
+sign-in subdomain: a username into an editable text, email or phone field, and a
+password only into a field that is masked when written. A username alone stays
+in its field, and browser presses the site's own Next; a password is filled,
+submitted and cleared in one host step. While a host-filled password is on the
+page, its submission, the page's non-GET requests and its navigations must stay
+on that domain, or the host answers `origin_mismatch`; it also cancels native
+GET submissions. Sign-in hosted on another registrable domain, such as an
+identity provider's own, is refused. Sign-in does not depend on a catalog of
+website login URLs or on form markup. The host keeps the values out of agent
+observations; the intended site's JavaScript receives them.
+
+For a code or magic link emailed to the assistant, the host fills the web alias,
+browser presses the site's own send control, and the host then fills the code
+from its site-bound mailbox wait and submits it, or opens the link; browser never
+sees the code. A code the site sends the principal, by text, email or an
+authenticator app, reaches browser in main's message, and browser types it as
+ordinary text, into a masked field too; only a password-like value is refused
+there. Push approvals and security keys need the principal. CAPTCHA and access-denied pages are reported
+as `challenge`; there is no remote browser takeover page or automatic CAPTCHA
+solver. Completing a challenge in another browser does not sign this browser in.
+
 ### Browser diagnosis and release acceptance
 
 `gws-ea status --id <full-id> --details` checks the selected managed

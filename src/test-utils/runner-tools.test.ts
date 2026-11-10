@@ -37,6 +37,8 @@ describe("the runner's tools, read from their sources", () => {
   it('keeps every capability for native tools and chat variants, including variants registered in a loop', () => {
     const keys = runnerToolCapabilities();
     expect([...runnerToolNames()].filter((tool) => !keys.has(tool))).toEqual([]);
+    // A code the principal sends reaches the browser in main's message; no tool relays it.
+    expect(runnerToolNames().has('relay_code')).toBe(false);
     expect({
       send_message: keys.get('send_message'),
       add_reaction: keys.get('add_reaction'),
@@ -47,7 +49,6 @@ describe("the runner's tools, read from their sources", () => {
       tell_main: keys.get('tell_main'),
       check: keys.get('check'),
       purchase: keys.get('purchase'),
-      relay_code: keys.get('relay_code'),
       record_purchase_outcome: keys.get('record_purchase_outcome'),
     }).toEqual({
       send_message: new Set(['reply']),
@@ -59,7 +60,6 @@ describe("the runner's tools, read from their sources", () => {
       tell_main: new Set(['gws-ea-chat-external', 'gws-ea-email-external']),
       check: new Set(['google-calendar']),
       purchase: new Set(['browser']),
-      relay_code: new Set(['browser-delegate']),
       record_purchase_outcome: new Set(['browser-purchase-outcome']),
     });
   });

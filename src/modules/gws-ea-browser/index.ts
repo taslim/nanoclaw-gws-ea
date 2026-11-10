@@ -16,6 +16,7 @@ import {
   browserConsentOutcomesMigration,
   browserRetiredCredentialsMigration,
   browserDisclosuresMigration,
+  browserFreeAttemptsRetiredMigration,
   browserGenericCheckoutMigration,
   browserIncidentsMigration,
   browserPurchaseMigration,
@@ -24,11 +25,13 @@ import {
   browserQueueMigration,
   browserRecipesMigration,
   browserWatchesMigration,
+  browserWatchAddressMigration,
   browserWatchRegionMigration,
   browserWatchReleaseMigration,
   browserSiteLeasesMigration,
 } from './migration.js';
 import { BrowserStore } from './db.js';
+import { freePressInProgress } from './free-press.js';
 import { notifyPendingIncidents } from './incidents.js';
 import { BrowserQueue, registerBrowserActionDelivery } from './queue.js';
 import { browserAction } from './executor.js';
@@ -48,13 +51,12 @@ import {
   sweepBrowserJobSessions,
 } from './cancel.js';
 import { reconcileBrowserGroup } from './reconcile.js';
-import { browserSignInMigration } from './sign-in-migration.js';
+import { browserSignInAssistantOnlyMigration, browserSignInMigration } from './sign-in-migration.js';
 import {
   cleanupBrowserSignInMail,
   recoverBrowserSignInMail,
   registerSignInMailDelivery,
   signInCodeAction,
-  relaySignInAction,
 } from './sign-in-mail.js';
 import {
   registerBrowserPurchaseDelivery,
@@ -94,6 +96,9 @@ registerMigration(browserGenericCheckoutMigration);
 registerMigration(browserWatchRegionMigration);
 registerMigration(browserPurchaseOutcomesMigration);
 registerMigration(browserConsentOutcomesMigration);
+registerMigration(browserSignInAssistantOnlyMigration);
+registerMigration(browserFreeAttemptsRetiredMigration);
+registerMigration(browserWatchAddressMigration);
 
 const runtime = new BrowserRuntime(undefined, browserAdmissionReady, undefined, async (jobId) => {
   const store = new BrowserStore();
@@ -102,7 +107,9 @@ const runtime = new BrowserRuntime(undefined, browserAdmissionReady, undefined, 
   return (
     isContainerRunning(job.browser_session_id) ||
     (await store.hasPending(jobId)) ||
-    (await store.hasCheckoutPageHold(jobId))
+    (await store.hasCheckoutPageHold(jobId)) ||
+    // A free booking's verification dialog waits on a code the site texted, within the site's hold on the table.
+    freePressInProgress(jobId)
   );
 });
 export function getBrowserRuntime(): BrowserRuntime {
@@ -205,7 +212,6 @@ export const browserActions: BrowserActions = {
   fill_secret: fillSecretAction,
   credential_form: credentialFormAction,
   sign_in_code: signInCodeAction,
-  browser_relay_sign_in: relaySignInAction,
   save_recipe: saveRecipeAction,
   run_recipe: runRecipeAction,
   request_consent: requestConsentAction,
@@ -248,7 +254,7 @@ registerBrowserActionDelivery('request_consent', getBrowserQueue);
 for (const name of ['watch', 'list_watches', 'cancel_watch'] as const)
   registerBrowserActionDelivery(name, getBrowserQueue);
 registerBrowserCancellationDelivery(getBrowserQueue);
-registerSignInMailDelivery(getBrowserQueue);
+registerSignInMailDelivery();
 registerBrowserPurchaseDelivery(getBrowserQueue);
 registerPurchaseOutcomeDelivery(getBrowserQueue);
 registerReservationGuaranteeDelivery();

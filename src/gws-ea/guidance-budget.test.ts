@@ -50,9 +50,9 @@ type Agent = 'main' | 'external-email' | 'external-chat' | 'job' | 'browser';
 /** A raise needs its reason here; each reason records the size its budget was set from. */
 const BUDGETS: Readonly<Record<Agent, { readonly tokens: number; readonly reason: string }>> = {
   main: {
-    tokens: 9_800,
+    tokens: 10_050,
     reason:
-      "9,791 tokens (39,163 characters): main's whole document with the original browser guidance restored and saved-login account intent and page access added; rounded up. The front page is rendered for an empty install and grows only within its own budget.",
+      "10,032 tokens (40,127 characters): main's whole document with the original browser guidance, saved-login account intent and page access, the distinction between host refusals and site-rejected credentials, and follow-through on deadlines (promised work starts in the turn, unsent words are unsaid, due times, near-deadline pace) with settled-only outside updates and booking calendars for meeting chats; rounded up. The front page is rendered for an empty install and grows only within its own budget.",
   },
   'external-email': {
     tokens: 4_300,
@@ -65,14 +65,14 @@ const BUDGETS: Readonly<Record<Agent, { readonly tokens: number; readonly reason
       '4,013 tokens: the character, chat role and privacy, chat scheduling with the resident calendar craft and meeting shaping, and WhatsApp formatting; rounded up.',
   },
   job: {
-    tokens: 4_600,
+    tokens: 4_650,
     reason:
-      "4,593 tokens: external-chat's scheduling with the resident calendar craft and its formatting, plus job memory, documents and authority; rounded up.",
+      "4,626 tokens: external-chat's scheduling with the resident calendar craft and its formatting, plus job memory, documents and authority, and the rule that members hear only settled plans, one question at a time and no corrections; rounded up.",
   },
   browser: {
     tokens: 4_800,
     reason:
-      '4,790 tokens (19,160 characters): the sealed errand, its safety boundaries and restored host browser tool protocols, with duplicated account guidance removed; rounded up.',
+      '4,793 tokens (19,172 characters): the sealed errand, its safety boundaries and restored host browser tool protocols, including which typed codes a masked field takes, with duplicated account guidance removed; rounded up.',
   },
 };
 

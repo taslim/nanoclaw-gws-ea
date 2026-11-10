@@ -36,8 +36,8 @@ export interface BrowserWatchCheckInput {
   id: string;
   jobId: string;
   site: string;
-  recipeId: string;
-  parameters: Record<string, string>;
+  /** The page address the check loads signed out and reads. */
+  address: string;
   venueId: string;
   partySize: number;
   /** Set for a region watch: the check reads this region's text instead of a reader's availability. */
@@ -68,9 +68,7 @@ const watchBounds = (watch: WatchRow): WatchBounds => JSON.parse(watch.bounds_js
 function groupKey(watch: WatchRow): string {
   const bounds = watchBounds(watch);
   return JSON.stringify([
-    watch.check_recipe_id,
-    watch.check_recipe_version,
-    watch.check_key,
+    watch.address,
     bounds.venue.id,
     bounds.partySize,
     bounds.windows.map((window) => [window.start.slice(0, 10), window.end.slice(0, 10)]),
@@ -214,12 +212,9 @@ export class BrowserWatchScheduler {
       const at = new Date().toISOString();
       await db.transaction(async () => {
         await db.run(
-          `INSERT INTO gws_ea_browser_watch_checks(id,site,check_recipe_id,check_recipe_version,parameter_hash,trigger,scheduled_at,started_at) VALUES(?,?,?,?,?,?,?,?)`,
+          'INSERT INTO gws_ea_browser_watch_checks(id,site,trigger,scheduled_at,started_at) VALUES(?,?,?,?,?)',
           id,
           first.site,
-          first.check_recipe_id,
-          first.check_recipe_version,
-          first.check_key,
           notify ? 'notify' : 'timer',
           first.next_check_at,
           at,
@@ -248,8 +243,7 @@ export class BrowserWatchScheduler {
             id,
             jobId: first.job_id,
             site: first.site,
-            recipeId: first.check_recipe_id,
-            parameters: JSON.parse(first.parameters_json) as Record<string, string>,
+            address: first.address,
             venueId: bounds.venue.id,
             partySize: bounds.partySize,
             ...(first.region_json ? { region: JSON.parse(first.region_json) as StructuredBrowserLocator } : {}),

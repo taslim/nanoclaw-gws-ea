@@ -73,6 +73,7 @@ describe('the matters migrations', () => {
       'module:gws-ea-matters:planning-facts',
       'module:gws-ea-matters:time-anchors',
       'module:gws-ea-matters:close-and-morning',
+      'module:gws-ea-matters:open-loop-changed',
     ]);
   });
 
@@ -108,6 +109,23 @@ describe('the matters migrations', () => {
   it('give an install from the release before the schema of a fresh install', async () => {
     const fresh = schemaOf(await freshInstall());
     expect(schemaOf(await updatedInstall())).toEqual(fresh);
+  });
+
+  it("dates an existing matter's open loop from its last update", async () => {
+    const db = await initSqliteTestDb();
+    await runMigrations(
+      db,
+      getRegisteredMigrations().filter((migration) => migration.name !== 'module:gws-ea-matters:open-loop-changed'),
+    );
+    await db.run(
+      "INSERT INTO gws_ea_matters (id, title, open_loop, created_at, updated_at) VALUES ('m-existing', 'Title', 'Loop', ?, ?)",
+      '2026-11-01T09:00:00.000Z',
+      '2026-11-08T15:30:00.000Z',
+    );
+    await runMigrations(db);
+    expect(await db.all('SELECT open_loop_changed_at FROM gws_ea_matters')).toEqual([
+      { open_loop_changed_at: '2026-11-08T15:30:00.000Z' },
+    ]);
   });
 
   it('preserves every existing link and the unique piece index when chat links are added', async () => {

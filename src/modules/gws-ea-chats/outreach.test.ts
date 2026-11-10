@@ -15,6 +15,16 @@ vi.mock('../gws-ea-chat-agents/gateway.js', () => ({
 vi.mock('../../log.js', () => ({
   log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn(), fatal: vi.fn() },
 }));
+const google = vi.hoisted(() => ({ calendar: undefined as unknown }));
+vi.mock('../gws-ea-meetings/calendar-api.js', async (original) => {
+  const actual = await original<typeof import('../gws-ea-meetings/calendar-api.js')>();
+  const { delegatingCalendarApi } = await import('../gws-ea-meetings/testing/fake-calendar.js');
+  return {
+    ...actual,
+    createMeetingsCalendarApi: () =>
+      delegatingCalendarApi(() => google.calendar as import('../gws-ea-meetings/calendar-api.js').MeetingsCalendarApi),
+  };
+});
 
 import '../permissions/index.js';
 import '../gws-ea-profile/index.js';
@@ -38,13 +48,16 @@ import { inboundDbPath } from '../../mailbox/sqlite/paths.js';
 import { resolveSession, writeOutboundDirect, writeSessionMessage } from '../../session-manager.js';
 import type { Session } from '../../types.js';
 import { retireChatGateway } from '../gws-ea-chat-agents/gateway.js';
+import { FakeCalendar } from '../gws-ea-meetings/testing/fake-calendar.js';
 import { addPerson, getPerson, getPersonLevel } from '../gws-ea-people/db.js';
 import { addPrivateValue } from '../gws-ea-privacy/db.js';
+import { addPrincipalAddress } from '../gws-ea-profile/db.js';
 import type { WhatsAppAdapter } from '../gws-ea-whatsapp/adapter.js';
 import { WHATSAPP_DIRECTORY_ENV } from '../gws-ea-whatsapp/paths.js';
 import { transportHarness, type TransportHarness } from '../gws-ea-whatsapp/testing/harness.js';
 import { getChat } from './db.js';
 import { decideChatEngagement } from './engage.js';
+import { getChatCalendar } from './handoffs.js';
 
 let h: TransportHarness;
 let adapter: WhatsAppAdapter;
@@ -345,6 +358,55 @@ it('binds the native resolved identity to Morgan’s existing record without low
   if (!session) throw new Error('No serving session');
   expect(JSON.stringify(inbox(session))).not.toContain('Private history');
   expect(JSON.stringify(inbox(session))).not.toContain('morgan@example.com');
+});
+
+it('gives a reach-out chat the principal’s writable calendar before its first message, so it can book the agreed time', async () => {
+  await mark('principal-outreach');
+  const calendar = new FakeCalendar();
+  google.calendar = calendar;
+  calendar.calendars.set('juno@example.com', { id: 'juno@example.com', accessRole: 'writer' });
+  await addPrincipalAddress('juno@example.com');
+  const result = accepted(await request({ ...fields, calendar: 'juno@example.com' }));
+  const chatId = String(result.chat);
+  expect(await getChatCalendar(chatId)).toBe('juno@example.com');
+  const session = await findSessionForAgent('external', chatId, null);
+  if (!session) throw new Error('No serving session');
+  const rows = inbox(session);
+  const context = rows.findIndex((row) => row.id.startsWith('chat-context-'));
+  const brief = rows.findIndex((row) => row.id.startsWith('chat-outreach-'));
+  expect(context).toBeGreaterThanOrEqual(0);
+  expect(context).toBeLessThan(brief);
+  expect(rows[context].content.text).toContain('Booking calendar: set.');
+  expect(rows[context].content.text).not.toContain('juno@example.com');
+});
+
+it('refuses a reach-out calendar the assistant cannot write, or that is not the principal’s, before any chat or message', async () => {
+  await mark('principal-outreach');
+  const calendar = new FakeCalendar();
+  google.calendar = calendar;
+  calendar.calendars.set('juno@example.com', { id: 'juno@example.com', accessRole: 'reader' });
+  calendar.calendars.set('remy@example.com', { id: 'remy@example.com', accessRole: 'writer' });
+  await addPrincipalAddress('juno@example.com');
+  for (const refused of ['juno@example.com', 'remy@example.com', 'missing@example.com'])
+    expect(await request({ ...fields, calendar: refused })).toMatchObject({
+      ok: false,
+      error: { message: expect.stringContaining('calendars the assistant can write to') },
+    });
+  expect(h.socket().numberQueries).toEqual([]);
+  expect(h.socket().sends).toEqual([]);
+  expect(await getDb().all('SELECT * FROM gws_ea_chats')).toEqual([]);
+});
+
+it('leaves a reach-out without a calendar with no booking calendar, as before', async () => {
+  await mark('principal-outreach');
+  const result = accepted(await request(fields));
+  const chatId = String(result.chat);
+  expect(await getChatCalendar(chatId)).toBeNull();
+  const session = await findSessionForAgent('external', chatId, null);
+  if (!session) throw new Error('No serving session');
+  expect(inbox(session).find((row) => row.id.startsWith('chat-context-'))?.content.text).toContain(
+    'Booking calendar: not set.',
+  );
 });
 
 it('does not turn the principal’s outreach citation into private-detail clearance for the new chat', async () => {

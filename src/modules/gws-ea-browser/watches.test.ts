@@ -38,7 +38,7 @@ import './index.js';
 import { BrowserStore } from './db.js';
 import { PurchaseAuthorityStore } from './authority.js';
 import { ERRAND_ORIGIN_LINE } from './cards.js';
-import { browserWatchesMigration } from './migration.js';
+import { browserWatchAddressMigration, browserWatchesMigration } from './migration.js';
 import { GENERIC_FLOW_ID, type GenericBookingFacts, type PurchaseFacts } from './fingerprint.js';
 import { createBrowserWatch, validateWatchRequest } from './watches.js';
 import { renderWatchCard } from './watch-wording.js';
@@ -56,6 +56,8 @@ import { saveBrowserRecipe } from './recipes.js';
 
 import { cancelBrowserJob } from './cancel.js';
 
+/** The venue's page on Resy, whose address carries its date and party. */
+const BISTRO_ADDRESS = 'https://resy.com/cities/new-york-ny/venues/bistro?date=2026-10-16&seats=4';
 const bounds: WatchBounds = {
   site: 'resy.com',
   venue: { id: 'bistro', name: 'Bistro' },
@@ -148,12 +150,12 @@ async function seedWatch(id: string, watched: string | WatchBounds = 'resy.com')
   const site = typeof watched === 'string' ? watched : watched.site;
   await getDb().run(
     `INSERT INTO gws_ea_browser_watches
-    (id,job_id,site,check_recipe_id,check_recipe_version,parameters_json,check_key,bounds_json,region_json,region_baseline,region_marked_at,status,created_at,updated_at,next_check_at)
-    VALUES(?,?,?,'recipe',1,'{}',?,?,?,?,?,'armed',?,?,?)`,
+    (id,job_id,site,address,bounds_json,region_json,region_baseline,region_marked_at,status,created_at,updated_at,next_check_at)
+    VALUES(?,?,?,?,?,?,?,?,'armed',?,?,?)`,
     id,
     jobId,
     site,
-    id,
+    `https://${site}/${id}`,
     JSON.stringify(region ?? { ...bounds, site }),
     region ? '{}' : null,
     region ? 'No tables' : null,
@@ -192,6 +194,37 @@ async function bindPrincipal(): Promise<string[]> {
   });
   return cards;
 }
+
+describe('the watch tables', () => {
+  it('rebuilds over earlier watches without carrying them, leaving the authorities that named one', async () => {
+    await seedWatch('earlier');
+    const at = new Date().toISOString();
+    await getDb().run(
+      "INSERT INTO gws_ea_browser_watch_checks(id,site,trigger,scheduled_at,started_at) VALUES('earlier-check','resy.com','timer',?,?)",
+      at,
+      at,
+    );
+    await getDb().run(
+      "INSERT INTO gws_ea_browser_watch_check_members(check_id,watch_id) VALUES('earlier-check','earlier')",
+    );
+    await getDb().run(
+      "INSERT INTO gws_ea_browser_authorities(id,job_id,kind,state,facts_json,bounds_json,exception_ids_json,attempt_id,expires_at,created_at,watch_id) VALUES('earlier-authority',?,'watch','committed','{}','{}','[]','earlier-attempt',?,?,'earlier')",
+      jobId,
+      bounds.until,
+      at,
+    );
+    await getDb().transaction(async () => {
+      await browserWatchAddressMigration.up(getDb());
+    });
+    expect(await getDb().all('SELECT id FROM gws_ea_browser_watches')).toEqual([]);
+    expect(await getDb().all('SELECT id FROM gws_ea_browser_watch_checks')).toEqual([]);
+    expect(await getDb().get('SELECT watch_id FROM gws_ea_browser_authorities')).toEqual({ watch_id: null });
+    // The rebuilt table is the one authorities name.
+    await seedWatch('later');
+    await getDb().run("UPDATE gws_ea_browser_authorities SET watch_id = 'later'");
+    await expect(getDb().run("UPDATE gws_ea_browser_authorities SET watch_id = 'missing'")).rejects.toThrow();
+  });
+});
 
 describe('native watch bounds and one booking claim', () => {
   it('requires exact venue, party, slot and explicit free merchant facts', () => {
@@ -513,11 +546,12 @@ describe('native watch bounds and one booking claim', () => {
     await queue.stop();
   });
   it('arms a financial watch only through its native principal card, with restart-safe replay and exact host policy', async () => {
-    const at = new Date().toISOString();
     const cards = await bindPrincipal();
     const { context } = await executionContext('setup');
     const terms = '$12.50 per guest for cancellation within 24 hours or no-show';
     vi.spyOn(watchRuntime, 'readBrowserWatchSetup').mockResolvedValue({
+      status: 'ready',
+      address: BISTRO_ADDRESS,
       availability: {
         status: 'ready',
         site: 'resy.com',
@@ -544,25 +578,8 @@ describe('native watch bounds and one booking claim', () => {
         ],
       },
     });
-    const result = await createBrowserWatch(context, {
-      site: 'https://resy.com/search',
-      recipe_id: 'check-recipe',
-      parameters: {},
-      venue: bounds.venue,
-      party_size: 4,
-      windows: bounds.windows,
-      financial: { currency: 'USD', max_total: '50.00' },
-      until: bounds.until,
-    });
-    expect(result).toMatchObject({ status: 'refused', reason: 'read_only_recipe_required' });
-    await getDb().run(
-      "INSERT INTO gws_ea_browser_recipes(id,site,name,version,source_job_id,first_action,last_action,parameters_json,steps_json,read_only,created_at) VALUES('check-recipe','resy.com','Availability',1,?,0,0,'[]','[]',1,?)",
-      jobId,
-      at,
-    );
     const pending = await createBrowserWatch(context, {
       site: 'https://resy.com/search',
-      recipe_id: 'check-recipe',
       parameters: {},
       venue: bounds.venue,
       party_size: 4,
@@ -571,6 +588,8 @@ describe('native watch bounds and one booking claim', () => {
       until: bounds.until,
     });
     expect(pending).toMatchObject({ status: 'awaiting_principal' });
+    // Its checks load the address the host read the venue at, signed out.
+    expect(await getDb().get('SELECT address FROM gws_ea_browser_watches')).toEqual({ address: BISTRO_ADDRESS });
     expect(cards).toHaveLength(1);
     expect(cards[0]).toContain('Bistro');
     expect(cards[0]).toContain('$50.00');
@@ -604,7 +623,6 @@ describe('native watch bounds and one booking claim', () => {
     expect(await getDb().all('SELECT * FROM gws_ea_browser_authorities')).toEqual([]);
     await createBrowserWatch(context, {
       site: 'https://resy.com/search',
-      recipe_id: 'check-recipe',
       parameters: {},
       venue: bounds.venue,
       party_size: 4,
@@ -795,10 +813,9 @@ describe('native watch bounds and one booking claim', () => {
   });
 });
 
-/** The agent's request for a free watch of the Bistro on Resy, checked with the `check-recipe` recipe. */
+/** The agent's request for a free watch of the Bistro on Resy, from the venue's page. */
 const free = {
   site: 'https://resy.com/search',
-  recipe_id: 'check-recipe',
   parameters: {},
   venue: bounds.venue,
   party_size: 4,
@@ -821,6 +838,8 @@ describe('a paid reader watch reads the venue’s terms itself', () => {
     const cards = await bindPrincipal();
     const { context } = await executionContext('paid-watch');
     vi.spyOn(watchRuntime, 'readBrowserWatchSetup').mockResolvedValue({
+      status: 'ready',
+      address: BISTRO_ADDRESS,
       availability: {
         status: 'ready',
         site: 'resy.com',
@@ -832,14 +851,8 @@ describe('a paid reader watch reads the venue’s terms itself', () => {
       },
       policy,
     });
-    await getDb().run(
-      "INSERT INTO gws_ea_browser_recipes(id,site,name,version,source_job_id,first_action,last_action,parameters_json,steps_json,read_only,created_at) VALUES('check-recipe','resy.com','Availability',1,?,0,0,'[]','[]',1,?)",
-      jobId,
-      new Date().toISOString(),
-    );
     const result = await createBrowserWatch(context, {
       site: 'https://resy.com/search',
-      recipe_id: 'check-recipe',
       parameters: {},
       venue: bounds.venue,
       party_size: 4,
@@ -942,13 +955,10 @@ describe('venue release schedules and card times', () => {
     );
     const cards = await bindPrincipal();
     const { context } = await executionContext('release-setup');
-    await getDb().run(
-      "INSERT INTO gws_ea_browser_recipes(id,site,name,version,source_job_id,first_action,last_action,parameters_json,steps_json,read_only,created_at) VALUES('check-recipe','resy.com','Availability',1,?,0,0,'[]','[]',1,?)",
-      jobId,
-      new Date().toISOString(),
-    );
     const terms = '¥5,000 per guest for cancellation within 24 hours or no-show';
     vi.spyOn(watchRuntime, 'readBrowserWatchSetup').mockResolvedValue({
+      status: 'ready',
+      address: BISTRO_ADDRESS,
       availability: {
         status: 'ready',
         site: 'resy.com',
@@ -1106,11 +1116,9 @@ describe('watches on sites with no reader', () => {
       },
     };
   }
-  /** The agent's request for a free watch of The Larder's tables, checked with the `larder-recipe` recipe. */
+  /** The agent's request for a free watch of The Larder's tables, from the page that lists them. */
   const regionRequest = {
     site: 'https://larder.example/tables',
-    recipe_id: 'larder-recipe',
-    parameters: {},
     venue: { id: 'the-larder', name: 'The Larder' },
     party_size: 2,
     windows: regionBounds.windows,
@@ -1165,7 +1173,7 @@ describe('watches on sites with no reader', () => {
       expect(compareWatchBounds(regionBounds, facts, at)).toEqual({ status: 'outside_bounds', reason });
   });
 
-  it('lets a free commit or a card on the watched site spend the job’s one booking, and its outcome end the watch', async () => {
+  it('lets a free press or a card on the watched site spend the job’s one booking, and its outcome end the watch', async () => {
     await seedWatch('larder', regionBounds);
     await seedWatch('elsewhere', { ...regionBounds, site: 'tables.example' });
     const at = new Date().toISOString();
@@ -1229,20 +1237,12 @@ describe('watches on sites with no reader', () => {
 
   it('asks for a region only where the host has no reader, and refuses one where it reads the venue itself', async () => {
     const { context } = await executionContext('region-setup');
-    await getDb().run(
-      "INSERT INTO gws_ea_browser_recipes(id,site,name,version,source_job_id,first_action,last_action,parameters_json,steps_json,read_only,created_at) VALUES('larder-recipe','larder.example','Tables',1,?,0,0,'[]','[]',1,?),('resy-recipe','resy.com','Availability',1,?,0,0,'[]','[]',1,?)",
-      jobId,
-      new Date().toISOString(),
-      jobId,
-      new Date().toISOString(),
-    );
     expect(await createBrowserWatch(context, regionRequest)).toEqual({ status: 'refused', reason: 'region_required' });
     const region = { ref: 'e5', generation: 1 };
     expect(
       await createBrowserWatch(context, {
         ...regionRequest,
         site: 'https://www.resy.com/',
-        recipe_id: 'resy-recipe',
         region,
       }),
     ).toEqual({ status: 'refused', reason: 'site_has_reader' });
@@ -1257,6 +1257,23 @@ describe('watches on sites with no reader', () => {
     expect(await getDb().all('SELECT id FROM gws_ea_browser_watches')).toEqual([]);
   });
 
+  it('refuses a reader watch whose page is not the address its checks would load, and stores no watch', async () => {
+    const { context } = await executionContext('reader-not-at-address');
+    vi.spyOn(watchRuntime, 'readBrowserWatchSetup').mockResolvedValue({ status: 'refused', reason: 'not_at_address' });
+    expect(await createBrowserWatch(context, free)).toEqual({ status: 'refused', reason: 'not_at_address' });
+    expect(await getDb().all('SELECT id FROM gws_ea_browser_watches')).toEqual([]);
+  });
+
+  it('refuses booking inputs a watch cannot use as invalid args', () => {
+    for (const raw of [
+      { ...regionRequest, parameters: { party: '2' }, region: { ref: 'e5', generation: 3 } },
+      { ...free, parameters: { party: 2 } },
+    ])
+      expect(() => validateWatchRequest(raw)).toThrow(
+        expect.objectContaining({ code: 'invalid-args', message: expect.stringContaining('parameters') as unknown }),
+      );
+  });
+
   it('reads a region and the watch to mark again, and keeps a queued release readable when it runs', async () => {
     expect(validateWatchRequest({ ...regionRequest, region: { ref: 'f1e7', generation: 3 } }).region).toEqual({
       ref: 'f1e7',
@@ -1266,17 +1283,20 @@ describe('watches on sites with no reader', () => {
       'region',
     );
     expect(() => validateWatchRequest({ ...regionRequest, watch_id: 'watch-1' })).toThrow('watch_id');
+    // A region watch never books by itself, so it takes no booking inputs.
+    expect(() =>
+      validateWatchRequest({ ...regionRequest, parameters: { party: '2' }, region: { ref: 'e5', generation: 3 } }),
+    ).toThrow('booking recipe');
+    // A watch takes its page's address, never a recipe for its checks to replay.
+    expect(() => validateWatchRequest({ ...regionRequest, recipe_id: 'recipe-1' })).toThrow('Unknown watch field');
     // The queue keeps the agent's own fields, so the run reads a release rule as the agent sent it.
     const { queue } = await executionContext('queued-release');
     await queue.stop();
     await recoverAndStartBrowserQueue(queue);
     try {
-      await getDb().run(
-        "INSERT INTO gws_ea_browser_recipes(id,site,name,version,source_job_id,first_action,last_action,parameters_json,steps_json,read_only,created_at) VALUES('check-recipe','resy.com','Availability',1,?,0,0,'[]','[]',1,?)",
-        jobId,
-        new Date().toISOString(),
-      );
       vi.spyOn(watchRuntime, 'readBrowserWatchSetup').mockResolvedValue({
+        status: 'ready',
+        address: BISTRO_ADDRESS,
         availability: {
           status: 'ready',
           site: 'resy.com',

@@ -22,6 +22,7 @@ import { resolveSystemSession } from '../../session-manager.js';
 import '../gws-ea-profile/index.js';
 import './index.js';
 import { BrowserStore } from './db.js';
+import * as freePress from './free-press.js';
 import { browserAvailability } from './availability.js';
 import { type BrowserQueue } from './queue.js';
 import { browserWatchesMigration } from './migration.js';
@@ -86,28 +87,24 @@ const bounds: WatchBounds = {
   until: '2026-10-16T18:00:00Z',
 };
 /**
- * An armed watch of the job. `watch` sets its bounds apart from the shared ones, its venue's release rule, and, for a
- * region watch, its marked region's baseline text.
+ * An armed watch of the job, on the page `key` names. `watch` sets its bounds apart from the shared ones, its venue's
+ * release rule, and, for a region watch, its marked region's baseline text.
  */
 async function arm(
   id: string,
   key: string,
   party = 4,
-  version = 1,
   site = bounds.site,
   watch: { bounds?: Partial<WatchBounds>; release?: WatchReleaseRule; baseline?: string } = {},
 ): Promise<void> {
   const at = new Date().toISOString();
   const region = watch.baseline !== undefined;
   await getDb().run(
-    `INSERT INTO gws_ea_browser_watches(id,job_id,site,check_recipe_id,check_recipe_version,parameters_json,check_key,bounds_json,release_json,region_json,region_baseline,region_marked_at,status,created_at,updated_at,next_check_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,'armed',?,?,?)`,
+    `INSERT INTO gws_ea_browser_watches(id,job_id,site,address,bounds_json,release_json,region_json,region_baseline,region_marked_at,status,created_at,updated_at,next_check_at) VALUES(?,?,?,?,?,?,?,?,?,'armed',?,?,?)`,
     id,
     jobId,
     site,
-    `recipe:${site}`,
-    version,
-    JSON.stringify({ party: String(party) }),
-    key,
+    `https://${site}/${key}?party=${party}`,
     JSON.stringify({ ...bounds, site, partySize: party, ...watch.bounds }),
     watch.release ? JSON.stringify(watch.release) : null,
     region
@@ -150,7 +147,7 @@ function availability(partySize = 4): Extract<ReservationAvailability, { status:
 const freeCalendar = async () => ({ conflicts: [], conflicts_not_listed: 0, message: 'Free' });
 
 it('expires watches and delivers pending notices without Chrome, without running checks', async () => {
-  await arm('expired-offline', 'expired', 4, 1, bounds.site, {
+  await arm('expired-offline', 'expired', 4, bounds.site, {
     bounds: { until: new Date(Date.now() - 1000).toISOString() },
   });
   await arm('notice-offline', 'waiting');
@@ -280,7 +277,7 @@ it('releases the host abort subscription when stopped and still honors host shut
 it('finishes another site while the first is pending and keeps checks within each site sequential', async () => {
   await arm('a', 'first');
   await arm('b', 'second');
-  await arm('c', 'first', 4, 1, 'opentable.com');
+  await arm('c', 'first', 4, 'opentable.com');
   let release: (() => void) | undefined;
   const pending = new Promise<void>((resolve) => {
     release = resolve;
@@ -339,7 +336,7 @@ it('finishes another site while the first is pending and keeps checks within eac
 
 it('limits concurrent site pipelines to four and starts the next site as soon as capacity frees', async () => {
   const sites = ['resy.com', 'opentable.com', 'exploretock.com', 'four.example', 'five.example'];
-  for (const site of sites) await arm(site, 'same', 4, 1, site);
+  for (const site of sites) await arm(site, 'same', 4, site);
   const releases = new Map<string, () => void>();
   let concurrent = 0;
   let maximum = 0;
@@ -374,17 +371,17 @@ it('limits concurrent site pipelines to four and starts the next site as soon as
   expect(await getDb().all("SELECT site FROM gws_ea_browser_watch_checks WHERE outcome='ready'")).toHaveLength(5);
 });
 
-it('shares exactly identical read-only checks, while different parties and versions consume the same site budget', async () => {
+it('shares exactly identical read-only checks, while different parties and pages consume the same site budget', async () => {
   await arm('a', 'same');
   await arm('b', 'same');
   await arm('c', 'different-party', 2);
-  await arm('d', 'different-version', 4, 2);
+  await arm('d', 'different-page');
   let checks = 0;
   const calendar = vi.fn(freeCalendar);
   const scheduler = createBrowserWatchScheduler(queue, {
     check: async (_queue, input) => {
       checks++;
-      return { status: 'ready', availability: availability(Number(input.parameters.party)) };
+      return { status: 'ready', availability: availability(input.partySize) };
     },
     calendar,
     random: () => 0.5,
@@ -529,7 +526,7 @@ it('deduplicates the same outside slot across ticks and reports expiry without a
   expect(await getDb().get('SELECT status FROM gws_ea_browser_watches WHERE id=?', 'a')).toEqual({ status: 'expired' });
 });
 
-it('keeps hourly and daily caps shared across parameters, and never repeats an interval or goes below the floor', async () => {
+it('keeps hourly and daily caps shared across pages, and never repeats an interval or goes below the floor', async () => {
   await arm('a', 'same');
   const now = Date.now();
   const policy = { ...watchSitePolicy('resy.com'), principalQuietHours: [], hourlyCap: 2, dailyCap: 3 };
@@ -538,8 +535,7 @@ it('keeps hourly and daily caps shared across parameters, and never repeats an i
     ['two', 15],
   ] as const)
     await getDb().run(
-      "INSERT INTO gws_ea_browser_watch_checks(id,site,check_recipe_id,check_recipe_version,parameter_hash,trigger,scheduled_at,started_at,finished_at,outcome) VALUES(?,'resy.com','recipe',1,?,'timer',?,?,?,'ready')",
-      id,
+      "INSERT INTO gws_ea_browser_watch_checks(id,site,trigger,scheduled_at,started_at,finished_at,outcome) VALUES(?,'resy.com','timer',?,?,?,'ready')",
       id,
       new Date(now - minutes * 60_000).toISOString(),
       new Date(now - minutes * 60_000).toISOString(),
@@ -666,7 +662,7 @@ it('skips only the site whose principal timezone read failed mid-tick, and check
   // 20:30 in Los Angeles: no quiet hours stand in the way.
   vi.setSystemTime(new Date('2026-10-16T03:30:00Z'));
   await arm('a', 'same');
-  await arm('b', 'same', 4, 1, 'opentable.com');
+  await arm('b', 'same', 4, 'opentable.com');
   const armedAt = new Date().toISOString();
   const read = vi.spyOn(profile, 'getGwsEaProfile');
   read.mockRejectedValueOnce(new Error('Profile unavailable'));
@@ -754,7 +750,7 @@ const tokyoRelease: WatchReleaseRule = {
   wording: 'Tables released 30 days ahead at 10:00',
 };
 const armTokyoDinner = (id: string, site: string, release?: WatchReleaseRule): Promise<void> =>
-  arm(id, id, 4, 1, site, {
+  arm(id, id, 4, site, {
     bounds: {
       windows: [{ start: '2026-11-24T10:00:00.000Z', end: '2026-11-24T12:00:00.000Z' }],
       until: '2026-11-24T00:00:00.000Z',
@@ -812,7 +808,7 @@ it("checks a few seconds after the venue's release, at the floor through its bur
 
 /** A region watch on an unreviewed site, its slot list marked with `baseline` as its text. */
 const armRegion = (id: string, baseline: string): Promise<void> =>
-  arm(id, id, 4, 1, 'larder.example', {
+  arm(id, id, 4, 'larder.example', {
     bounds: { kind: 'region', venue: { id: 'larder', name: 'The Larder' } },
     baseline,
   });
@@ -886,13 +882,12 @@ it('wakes the agent with each change and books nothing itself; a step toward a b
   // The host never books a region watch's change: no booking was queued, and the job's one claim is untouched.
   expect(await getDb().all("SELECT id FROM gws_ea_browser_requests WHERE action = 'browser_watch_book'")).toEqual([]);
   expect(await getDb().get('SELECT state FROM gws_ea_browser_watch_job_claims')).toEqual({ state: 'available' });
-  // The agent pursued the next change: a free commit's attempt is its match, and the cadence is back to four minutes.
+  // The agent pursued the next change: its free press of a table is its match, and the cadence is back to four minutes.
   text = '7:30 PM';
   await checkRegion(scheduler);
-  await getDb().run(
-    "INSERT INTO gws_ea_browser_free_attempts(id,job_id,request_id,site,facts_json,attempted_at) VALUES('free',?,'free-request','larder.example','{}',?)",
-    jobId,
-    new Date(Date.now() + 1).toISOString(),
+  const pressedAt = new Date(Date.now() + 1).toISOString();
+  vi.spyOn(freePress, 'lastFreePress').mockImplementation((job) =>
+    job === jobId ? { site: 'larder.example', at: pressedAt } : undefined,
   );
   await checkRegion(scheduler);
   expect(regionWakes()).toBe(3);

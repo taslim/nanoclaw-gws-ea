@@ -1,44 +1,12 @@
 import { readFile } from 'node:fs/promises';
 import { expect, it } from 'vitest';
 import {
-  authenticationEndpoint,
-  authenticationFieldKind,
   browserDiagnosticsUnsafe,
+  codeFieldFits,
   credentialFieldFits,
   httpsOrigin,
-  isSensitiveField,
+  entryRefusal,
 } from './authentication-signatures.js';
-
-it('recognizes credential fields without granting card, new-password or security fields authority', () => {
-  expect(authenticationFieldKind({ name: 'username', type: 'text', autocomplete: 'username' })).toBe('username');
-  expect(authenticationFieldKind({ name: 'password', type: 'password', autocomplete: 'current-password' })).toBe(
-    'password',
-  );
-  expect(authenticationFieldKind({ name: 'code', type: 'text', autocomplete: 'one-time-code' })).toBe('otp');
-  for (const autocomplete of ['cc-number', 'cc-csc', 'new-password'])
-    expect(authenticationFieldKind({ name: 'password', type: 'password', autocomplete })).toBeUndefined();
-  expect(authenticationFieldKind({ name: 'security_question', type: 'text', autocomplete: '' })).toBeUndefined();
-});
-
-it('uses positive native endpoints and refuses arbitrary JS-only, financial and insecure flows', () => {
-  for (const url of [
-    'https://shop.example/login',
-    'https://shop.example/auth/login',
-    'https://www.amazon.com/ap/signin',
-    'https://api.resy.com/3/auth/password',
-    'https://www.exploretock.com/auth/verify',
-    'https://www.opentable.com/profile/signin',
-  ])
-    expect(authenticationEndpoint(new URL(url))).toBe(true);
-  for (const url of [
-    'http://shop.example/login',
-    'https://shop.example/checkout',
-    'https://shop.example/update-password',
-    'https://shop.example/signin?operation=buy',
-    'https://shop.example/unreviewed-action',
-  ])
-    expect(authenticationEndpoint(new URL(url))).toBe(false);
-});
 
 it('keeps unsupported Playwright internals and page-world submission out of authentication', async () => {
   const source = await readFile(new URL('./authentication-submit.ts', import.meta.url), 'utf8');
@@ -59,63 +27,67 @@ it('treats Playwright protocol logging as unsafe for sign-in', () => {
     expect(browserDiagnosticsUnsafe(environment)).toBe(true);
 });
 
-it('treats every password-bearing field as secret, including a show-password toggle that made it text', () => {
-  const field = (facts: Partial<Parameters<typeof isSensitiveField>[0]>) => ({
-    type: 'text',
-    autocomplete: '',
-    name: '',
+it('lets the agent type a code into any field, never card details, credentials or a password into a masked one', () => {
+  const field = (facts: Partial<Parameters<typeof entryRefusal>[0]>) => ({
+    card: false,
+    credential: false,
+    masked: false,
+    oneTimeCode: false,
+    inputMode: '',
+    maxLength: -1,
     ...facts,
   });
-  for (const facts of [
-    field({ type: 'password', name: 'pin' }),
-    field({ autocomplete: 'new-password' }),
-    field({ autocomplete: 'current-password' }),
-    field({ name: 'confirm_password' }),
-    field({ name: 'passwordConfirmation' }),
-    field({ id: 'new-pwd' }),
-    field({ id: 'currentPassword' }),
-    field({ label: 'Repeat password' }),
-    field({ label: 'Repeat passphrase' }),
-    field({ autocomplete: 'one-time-code' }),
-    field({ autocomplete: 'cc-number' }),
-    field({ name: 'cvv' }),
-  ])
-    expect(isSensitiveField(facts)).toBe(true);
-  for (const facts of [
-    field({ name: 'email', type: 'email', autocomplete: 'email' }),
-    field({ name: 'passenger_name' }),
-    field({ name: 'compass_heading' }),
-    field({ name: 'first_name', autocomplete: 'given-name' }),
-  ])
-    expect(isSensitiveField(facts)).toBe(false);
+  for (const code of ['552913', '5', 'A7KX29', 'abcdefghij']) expect(entryRefusal(field({}), code)).toBeUndefined();
+  expect(entryRefusal(field({}), 'Tr0ub4dor&3 is long')).toBeUndefined();
+  // An unmarked masked field takes digits alone: a letter code there could be a password the agent chose.
+  for (const code of ['5529', '552913', '5529130041'])
+    expect(entryRefusal(field({ masked: true }), code)).toBeUndefined();
+  for (const value of ['Summer2026', 'A7KX29', '552', 'Tr0ub4dor&3', '55291300417'])
+    expect(entryRefusal(field({ masked: true }), value)).toBe('secret_field');
+  // A masked field that reads as a code's takes a letter code too, never a longer value or one with a space.
+  for (const marks of [{ oneTimeCode: true }, { inputMode: 'numeric' }, { maxLength: 6 }, { maxLength: 1 }]) {
+    const codeBox = field({ masked: true, ...marks });
+    expect(entryRefusal(codeBox, 'A7KX29')).toBeUndefined();
+    for (const value of ['abcdefghijk', '5529 13', 'pass-word'])
+      expect(entryRefusal(codeBox, value)).toBe('secret_field');
+  }
+  expect(entryRefusal(field({ masked: true, maxLength: 11 }), 'A7KX29')).toBe('secret_field');
+  // A key types no text: Enter and Backspace act on a masked field, never on a credential or card field.
+  expect(entryRefusal(field({ masked: true }))).toBeUndefined();
+  expect(entryRefusal(field({ credential: true }))).toBe('secret_field');
+  expect(entryRefusal(field({ credential: true, oneTimeCode: true }), '552913')).toBe('secret_field');
+  expect(entryRefusal(field({ card: true, masked: true, maxLength: 4 }), '4242')).toBe('card_field');
 });
 
-it('fits credential roles only to fields whose structure supports them, never current and new interchangeably', () => {
-  const facts = (name: string, type = 'password', autocomplete = '', id = '') => ({ name, type, autocomplete, id });
-  expect(credentialFieldFits('username', facts('email', 'email', 'email'), 'signup', false)).toBe(true);
-  expect(credentialFieldFits('username', facts('user[email]', 'text'), 'signup', false)).toBe(true);
-  expect(credentialFieldFits('username', facts('first_name', 'text', 'given-name'), 'signup', false)).toBe(false);
-  // A signup's single unmarked password field is the new password; a toggled one stays a password field.
-  expect(credentialFieldFits('new_password', facts('password'), 'signup', false)).toBe(true);
-  expect(credentialFieldFits('new_password', facts('password', 'text', 'new-password'), 'signup', false)).toBe(true);
-  expect(credentialFieldFits('confirmation', facts('password_confirmation'), 'signup', false)).toBe(true);
-  expect(credentialFieldFits('new_password', facts('nickname', 'text'), 'signup', false)).toBe(false);
-  // A change binds the current password only to a current field, and the new one only to a new or confirming field.
-  expect(credentialFieldFits('current_password', facts('old_password'), 'rotation', false)).toBe(true);
-  expect(credentialFieldFits('current_password', facts('pw', 'password', 'current-password'), 'rotation', false)).toBe(
-    true,
-  );
-  expect(credentialFieldFits('new_password', facts('new_password1'), 'rotation', true)).toBe(true);
-  expect(credentialFieldFits('confirmation', facts('new_password2'), 'rotation', true)).toBe(true);
-  expect(credentialFieldFits('new_password', facts('current_password'), 'rotation', true)).toBe(false);
-  expect(credentialFieldFits('current_password', facts('new_password'), 'rotation', false)).toBe(false);
-  expect(credentialFieldFits('current_password', facts('old_password'), 'signup', false)).toBe(false);
-  // An unmarked field in a change form is new only beside a bound current field.
-  expect(credentialFieldFits('new_password', facts('password'), 'rotation', false)).toBe(false);
-  expect(credentialFieldFits('new_password', facts('password'), 'rotation', true)).toBe(true);
-  for (const role of ['new_password', 'confirmation', 'current_password'] as const) {
-    expect(credentialFieldFits(role, facts('password', 'password', 'cc-number'), 'rotation', true)).toBe(false);
-    expect(credentialFieldFits(role, facts('code', 'text', 'one-time-code'), 'rotation', true)).toBe(false);
-    expect(credentialFieldFits(role, facts('security_question_answer'), 'rotation', true)).toBe(false);
+it('fits each credential role to its input type: passwords only to masked fields, never current and new crossed', () => {
+  const facts = (type: string, autocomplete = '') => ({ type, autocomplete });
+  for (const type of ['email', 'text', 'tel'])
+    expect(credentialFieldFits('username', facts(type), 'signup')).toBe(true);
+  expect(credentialFieldFits('username', facts('password'), 'signup')).toBe(false);
+  for (const role of ['new_password', 'confirmation'] as const) {
+    expect(credentialFieldFits(role, facts('password'), 'signup')).toBe(true);
+    expect(credentialFieldFits(role, facts('password', 'new-password'), 'rotation')).toBe(true);
+    // A show-password toggle or an unmasked field would put the generated password on screen.
+    expect(credentialFieldFits(role, facts('text', 'new-password'), 'signup')).toBe(false);
+    expect(credentialFieldFits(role, facts('password', 'current-password'), 'rotation')).toBe(false);
   }
+  expect(credentialFieldFits('current_password', facts('password'), 'rotation')).toBe(true);
+  expect(credentialFieldFits('current_password', facts('password', 'current-password'), 'rotation')).toBe(true);
+  expect(credentialFieldFits('current_password', facts('text', 'current-password'), 'rotation')).toBe(false);
+  expect(credentialFieldFits('current_password', facts('password', 'new-password'), 'rotation')).toBe(false);
+  expect(credentialFieldFits('current_password', facts('password'), 'signup')).toBe(false);
+  for (const role of ['username', 'new_password', 'confirmation', 'current_password'] as const)
+    expect(credentialFieldFits(role, facts(role === 'username' ? 'text' : 'password', 'cc-csc'), 'rotation')).toBe(
+      false,
+    );
+});
+
+it('lets the host enter an emailed code into any text field, never a card or credential field', () => {
+  const facts = (type: string, autocomplete = '') => ({ type, autocomplete });
+  for (const type of ['text', 'tel', 'number', 'password', 'email', 'search'])
+    expect(codeFieldFits(facts(type))).toBe(true);
+  expect(codeFieldFits(facts('text', 'one-time-code'))).toBe(true);
+  for (const type of ['hidden', 'checkbox', 'file', 'submit']) expect(codeFieldFits(facts(type))).toBe(false);
+  for (const autocomplete of ['cc-number', 'new-password', 'current-password'])
+    expect(codeFieldFits(facts('text', autocomplete))).toBe(false);
 });
