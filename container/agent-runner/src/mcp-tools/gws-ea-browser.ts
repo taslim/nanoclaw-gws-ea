@@ -158,16 +158,16 @@ export const browser = requestTool({
 export const fillSecret = requestTool({
   name: 'fill_secret',
   description:
-    'Ask the host to fill the current sign-in step from a saved login and activate its control. Supply both username and password refs when both fields are editable on this page. For email-first flows, supply username alone, observe the next page, then supply its password ref with the same login handle. Native, JavaScript-controlled and formless pages use the same host fill; no secret value reaches you. The host validates the HTTPS frame and current controls before resolving and insertion. Outcomes: submitted or cleared_after_submit: observe again; neither proves sign-in succeeded. no_item_for_site: tell main, which sends the principal their logins page. origin_mismatch: the destination does not match the login. vault_unavailable: tell main the principal must ask their operator; never ask for a password. ' +
+    'Ask the host to fill the current sign-in step from a saved login. The host fills only on the login’s own site, a sign-in host of the same domain included, and a password only into a masked password field; no secret value reaches you. With both fields editable on this page, supply username, password and submit. For an email-first flow, supply username alone: the host fills it and answers filled, so press the site’s own Next yourself, observe the password page, then supply its password and submit with the same login handle. A password is always filled, submitted and cleared in one call, so it needs submit. Native, JavaScript-controlled and formless pages use the same host fill. Outcomes: filled: press the site’s Next. submitted or cleared_after_submit: observe again; neither proves sign-in succeeded. no_item_for_site: tell main, which sends the principal their logins page. origin_mismatch: the page is not on the login’s site, or the page tried to send the password elsewhere; report its reason to main. vault_unavailable: tell main the principal must ask their operator; never ask for a password. ' +
     NO_REPEAT,
   properties: {
     item_handle: { type: 'string', description: 'The opaque login handle the host listed for this site.' },
     username: { ...REF, description: 'The current editable username or email field, when present.' },
-    password: { ...REF, description: 'The current saved-password field, when present.' },
-    submit: REF,
+    password: { ...REF, description: 'The current masked password field, when present.' },
+    submit: { ...REF, description: 'The control that submits these fields; optional for a username alone.' },
   },
-  required: ['item_handle', 'submit'],
-  oneOf: [{ required: ['username'], not: { required: ['password'] } }, { required: ['password'] }],
+  required: ['item_handle'],
+  oneOf: [{ required: ['username'], not: { required: ['password'] } }, { required: ['password', 'submit'] }],
   additionalProperties: false,
   repeatable: false,
   timeoutMs: BROWSER_REQUEST_TIMEOUT_MS,
@@ -180,7 +180,7 @@ const has = (fields: Record<string, unknown>, ...names: readonly string[]): bool
 export const credentialForm = requestTool({
   name: 'credential_form',
   description:
-    'Fill and submit a signup or password-change form with a password the host generates and saves first, under the credential authority main recorded for this job. Give fresh refs for the fields the form has (a signup’s username, new_password and confirmation; a change’s current_password, new_password and confirmation) and the control that submits them. A multi-step signup sends username alone first, then the password step. The host makes the form’s checkbox choices itself: it accepts the site’s own terms and opts out of marketing, and stops with consent_required and a stop_id for request_consent when the form needs any other agreement. The host refuses before revealing anything when the frame, origin, form or control is unexpected, financial or another security change; no value reaches you. ' +
+    'Fill and submit a signup or password-change form with a password the host generates and saves first, under the credential authority main recorded for this job. Give fresh refs for the fields the form has (a signup’s username, new_password and confirmation; a change’s current_password, new_password and confirmation) and the control that submits them. A multi-step signup sends username alone first, then the password step. The host makes the form’s checkbox choices itself: it accepts the site’s own terms and opts out of marketing, and stops with consent_required and a stop_id for request_consent when the form needs any other agreement. Every password field must be masked: the host refuses before revealing anything when one shows text, or when the frame, origin, form or control is unexpected, financial or another security change; no value reaches you. ' +
     'Outcomes: continued: observe the next signup step. account_created or password_changed: the site confirmed it. account_exists: the site already has an account for that username. password_rejected: the site rejected the new password. current_password_rejected: it rejected the saved current password. not_owned: this is not the assistant’s account, so its password cannot be changed. vault_unavailable: tell main the principal must ask their operator. The authority covers one disclosure. For refused with consent_required before disclosure, call request_consent and retry from a fresh observation after approval. For outcome_unknown with reason consent_required after disclosure, the site may already have submitted: reconcile before trying anything else. A grant never permits refilling an exposed attempt. ' +
     'verification_requested: the account still needs email confirmation. Use verify: the host waits for its email and opens the link or, given code_field and activate, fills the code. nothing_arrived: no email yet, so verify later. not_watched: the host cannot watch that inbox or its wait ended. ambiguous: it could not identify one suitable email. refused with code_field_needed: name the code field and its control. outcome_unknown: the change may or may not have happened. Use reconcile next, with no intervening action except an observation: it only reads the late response. inconclusive: the host could not establish what happened, so the site stays reserved. Report every outcome but continued in plain words to main, with the host’s facts and what is unknown. Only the principal can release an unresolved attempt; never obtain another authority to try again. ' +
     NO_REPEAT,
@@ -254,14 +254,19 @@ export const credentialForm = requestTool({
 export const signInCode = requestTool({
   name: 'sign_in_code',
   description:
-    'Register a site-bound sign-in wait before the host presses the send control. The target is the code field, or the starting email field of a passwordless flow; the host binds its new code field after the transition. For assistant mail, isolated external-email interprets one qualifying code or magic link; only the host inserts or opens it. Outcomes: code_filled, link_opened, nothing_arrived, ambiguous, origin_mismatch or alias_unavailable (no web address is set up yet). Observe again after completion, and report ambiguity, origin mismatch or alias_unavailable. ' +
+    'Sign in with a code or link the site emails to the assistant’s web address, in two steps. First give email_field: the host fills the web address there and starts watching the assistant’s mail; it answers filled, so press the site’s own Send code or Continue yourself. Then, once the page asks for the code, give code_field and submit: the host waits for the email, fills its code and submits it in one call, or opens its magic link. Isolated external-email reads the email; only the host fills or opens what it carries, never you. Outcomes: filled; code_filled or link_opened: observe again, neither proves sign-in succeeded; code_field_needed: the email held a code, so name its field and control; nothing_arrived: no email yet, so try the second step again shortly; ambiguous: no single code or link was found; not_watched: no wait is open, so start again from the email field; origin_mismatch: the code field is not on the site the email came from; alias_unavailable: no web address is set up yet. Report ambiguity, origin mismatch or alias_unavailable to main. ' +
     NO_REPEAT,
   properties: {
-    target: REF,
-    send: REF,
-    submit: REF,
+    email_field: { ...REF, description: 'First step: the field for the account’s email.' },
+    code_field: { ...REF, description: 'Second step: the field for the emailed code.' },
+    submit: { ...REF, description: 'Second step: the control that submits the code.' },
   },
-  required: ['target', 'send'],
+  required: [],
+  oneOf: [
+    { required: ['email_field'], not: { anyOf: [{ required: ['code_field'] }, { required: ['submit'] }] } },
+    { required: ['code_field', 'submit'], not: { required: ['email_field'] } },
+    { not: { anyOf: [{ required: ['email_field'] }, { required: ['code_field'] }, { required: ['submit'] }] } },
+  ],
   additionalProperties: false,
   repeatable: false,
   timeoutMs: BROWSER_REQUEST_TIMEOUT_MS,

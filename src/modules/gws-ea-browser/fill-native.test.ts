@@ -1,3 +1,14 @@
+import { vi } from 'vitest';
+const dataRoot = await vi.hoisted(async () => {
+  const { tmpdir: temporary } = await import('node:os');
+  const { join: joined } = await import('node:path');
+  return joined(temporary(), 'browser-fill-native-data');
+});
+vi.mock('../../config.js', async (original) => ({
+  ...(await original<typeof import('../../config.js')>()),
+  DATA_DIR: dataRoot,
+}));
+vi.mock('../../request-wake.js', () => ({ requestWake: vi.fn(async () => true) }));
 import * as loginStores from './login-store.js';
 import { testLoginStore } from './testing/login-store.js';
 import { useAvailableBrowser } from './testing/browser-runtime.js';
@@ -10,7 +21,7 @@ import { connect, type Socket } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { CDPSession, Frame, Page } from 'playwright-core';
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { closeDb, getDb, initSqliteTestDb } from '../../db/connection.js';
 import { prepareAuthenticationIsolation } from './authentication-submit.js';
 import { prepareChromeProfile, spawnChrome } from './chrome.js';
@@ -23,13 +34,27 @@ import { bindBrowserSecretFields, executeFillSecret, fillBoundBrowserSecrets } f
 import './merchant-signatures.js';
 import { browserConsentMigration, browserSiteLeasesMigration } from './migration.js';
 import { browserSignInMigration } from './sign-in-migration.js';
-import { recoverBrowserSignInMail } from './sign-in-mail.js';
+import { answerSignInReply, executeSignInCode, recoverBrowserSignInMail } from './sign-in-mail.js';
+import { createAgentGroup, initTestDb, runMigrations } from '../../db/index.js';
+import { registerMigration } from '../../db/migrations/index.js';
+import { getSessionsByAgentGroup } from '../../db/sessions.js';
+import '../gws-ea-profile/index.js';
+import { recordWebAlias } from '../gws-ea-profile/testing/web-alias.js';
+import { routeSignInMail } from '../gws-ea-inbox/route-mail.js';
+import { parseGmailMessage } from '../gws-ea-inbox/mime.js';
+import { gwsEaInboxMigration } from '../gws-ea-inbox/migration.js';
+import { setActiveInbox, type InboxRuntime } from '../gws-ea-inbox/runtime.js';
+import './index.js';
 import type { BrowserSecretField } from './authentication-signatures.js';
 import { observePage, type BrowserRef, type PinnedBrowserRef } from './observe.js';
 import { browserPaths } from './paths.js';
 import type { BrowserExecutionContext } from './actions.js';
 
+registerMigration(gwsEaInboxMigration);
+
 const chromePath = process.env.GWS_EA_BROWSER_TEST_CHROME;
+/** The assistant's web alias: its email on every site. */
+const ALIAS = 'tnatsissa@example.test';
 const secret = 'host-only-cross-origin-fixture-value';
 describe.skipIf(!chromePath)('native host secret fill', { timeout: 30_000 }, () => {
   let root: string;
@@ -84,6 +109,19 @@ describe.skipIf(!chromePath)('native host secret fill', { timeout: 30_000 }, () 
                   '<h1>Password step</h1><form method="post" action="/step/password"><input name="username" type="hidden" value="principal@example.test"><label>Password<input name="password" type="password" autocomplete="current-password" required></label><button type="submit">Continue</button></form>',
                 );
             else if (request.url === '/session' || request.url === '/send-code') response.writeHead(204).end();
+            else if (request.url === '/u/login/identifier') {
+              const account = new URLSearchParams(body).get('username') ?? '';
+              response
+                .writeHead(200, { 'content-type': 'text/html' })
+                .end(
+                  `<h1>Enter your password</h1><form method="post" action="/u/login/password"><input type="hidden" name="username" value="${account}"><label>Password<input name="password" type="password" autocomplete="current-password"></label><button type="submit">Continue</button></form>`,
+                );
+            } else if (request.url === '/code/send')
+              response
+                .writeHead(200, { 'content-type': 'text/html' })
+                .end(
+                  '<h1>Check your email</h1><form method="post" action="/code/verify"><label>Code<input name="code" inputmode="numeric"></label><button type="submit">Verify</button></form>',
+                );
             else response.writeHead(200, { 'content-type': 'text/html' }).end('<h1>Signed in</h1>');
           });
         } else if (request.url === '/otp-send' || request.url === '/otp-send-button') {
@@ -114,6 +152,49 @@ describe.skipIf(!chromePath)('native host secret fill', { timeout: 30_000 }, () 
               });
             </script>`,
           );
+        } else if (request.url === '/react-login') {
+          // A React-style controlled page with no form: its state changes only through input events.
+          response.writeHead(200, { 'content-type': 'text/html' }).end(
+            `<div><label>Email<input name="username" type="email"></label><label>Password<input name="password" type="password"></label><div role="button" tabindex="0" id="go">Log in</div></div><script>
+              const state = {};
+              const native = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value');
+              for (const input of document.querySelectorAll('input')) {
+                let tracked = '';
+                Object.defineProperty(input, 'value', { configurable: true,
+                  get() { return native.get.call(this); }, set(value) { tracked = value; native.set.call(this, value); } });
+                input.addEventListener('input', () => {
+                  const current = native.get.call(input);
+                  if (current === tracked) return;
+                  tracked = current;
+                  state[input.name] = current;
+                });
+              }
+              document.getElementById('go').addEventListener('click', async () => {
+                if (!state.username || !state.password) return;
+                await fetch('/sessions/create', { method: 'POST', body: new URLSearchParams(state) });
+                location.href = '/signed-in';
+              });
+            </script>`,
+          );
+        } else if (request.url === '/u/login/identifier') {
+          response
+            .writeHead(200, { 'content-type': 'text/html' })
+            .end(
+              '<h1>Welcome</h1><form method="post" action="/u/login/identifier"><label>Email address<input name="username" type="text" autocomplete="username" inputmode="email"></label><button type="submit">Continue</button></form>',
+            );
+        } else if (request.url === '/offsite-login' || request.url === '/text-password') {
+          const offsite = request.url === '/offsite-login';
+          response
+            .writeHead(200, { 'content-type': 'text/html' })
+            .end(
+              `<form method="post" action="${offsite ? 'https://collector.example/login' : '/login'}"><label>Password<input name="password" type="${offsite ? 'password' : 'text'}"></label><button type="submit">Log in</button></form>`,
+            );
+        } else if (request.url === '/code-login') {
+          response
+            .writeHead(200, { 'content-type': 'text/html' })
+            .end(
+              '<h1>Sign in</h1><form method="post" action="/code/send"><label>Email<input name="email" type="email"></label><button type="submit">Send code</button></form>',
+            );
         } else if (request.url === '/step/email') {
           response
             .writeHead(200, { 'content-type': 'text/html' })
@@ -174,7 +255,15 @@ describe.skipIf(!chromePath)('native host secret fill', { timeout: 30_000 }, () 
       socket.once('close', () => sockets.delete(socket));
     });
     proxy.on('connect', (request, socket, head) => {
-      if (!['auth.example:443', 'parent.example:443', 'www.amazon.com:443'].includes(request.url ?? '')) {
+      if (
+        ![
+          'auth.example:443',
+          'login.auth.example:443',
+          'parent.example:443',
+          'collector.example:443',
+          'www.amazon.com:443',
+        ].includes(request.url ?? '')
+      ) {
         socket.destroy();
         return;
       }
@@ -275,6 +364,133 @@ describe.skipIf(!chromePath)('native host secret fill', { timeout: 30_000 }, () 
       ),
     });
   }
+
+  /** The current refs for these accessible names, as the browser agent reads them. */
+  async function refsFor(names: Record<string, string>): Promise<Record<string, BrowserRef>> {
+    const observation = await observePage(page);
+    return Object.fromEntries(
+      Object.entries(names).map(([key, label]) => {
+        const line = observation.snapshot.split('\n').find((candidate) => candidate.includes(`"${label}"`));
+        const ref = line?.match(/\[ref=([^\]]+)\]/u)?.[1];
+        if (!ref) throw new Error(`Missing ${label} reference`);
+        return [key, { ref, generation: observation.generation }];
+      }),
+    );
+  }
+  async function saved(site: string) {
+    return logins.store.create({ site, title: 'Saved login', username: 'principal@example.test', password: secret });
+  }
+
+  for (const path of ['/formless', '/react-login'])
+    it(`fills a saved login into ${path} on a sign-in host of the login's own site`, async () => {
+      const item = await saved('auth.example');
+      await page.goto(`https://login.auth.example${path}`);
+      const result = await executeFillSecret(context(), {
+        item_handle: item.id,
+        ...(await refsFor({ username: 'Email', password: 'Password', submit: 'Log in' })),
+      });
+      await expect.poll(() => posts.length).toBe(1);
+      expect(posts[0].host).toBe('login.auth.example');
+      expect(Object.fromEntries(new URLSearchParams(posts[0].body))).toEqual({
+        username: 'principal@example.test',
+        password: secret,
+      });
+      await expect.poll(() => page.locator('h1').textContent()).toBe('Signed in');
+      expect(['submitted', 'cleared_after_submit']).toContain(result.status);
+      expect(JSON.stringify({ result, observation: await observePage(page) })).not.toContain(secret);
+    });
+
+  it('fills the username alone for the agent to press Continue, then fills and submits the password page', async () => {
+    const item = await saved('auth.example');
+    await page.goto('https://login.auth.example/u/login/identifier');
+    expect(
+      await executeFillSecret(context(), {
+        item_handle: item.id,
+        ...(await refsFor({ username: 'Email address' })),
+      }),
+    ).toEqual({ status: 'filled' });
+    expect(posts).toEqual([]);
+    expect(await page.locator('input[name=username]').inputValue()).toBe('principal@example.test');
+    expect(JSON.stringify(await observePage(page))).not.toContain('principal@example.test');
+    // The account is no host secret: the agent's own press goes ahead.
+    const { next } = await refsFor({ next: 'Continue' });
+    expect(
+      await executeBrowserBatch(context(), { actions: [{ kind: 'click', ...next }] }, { record: false }),
+    ).toMatchObject({ status: 'stopped', reason: 'navigated' });
+    await expect.poll(() => page.locator('h1').textContent()).toBe('Enter your password');
+    expect(
+      await executeFillSecret(context(), {
+        item_handle: item.id,
+        ...(await refsFor({ password: 'Password', submit: 'Continue' })),
+      }),
+    ).toMatchObject({ status: 'submitted' });
+    expect(posts.map((post) => Object.fromEntries(new URLSearchParams(post.body)))).toEqual([
+      { username: 'principal@example.test' },
+      { username: 'principal@example.test', password: secret },
+    ]);
+    expect(await page.locator('h1').textContent()).toBe('Signed in');
+  });
+
+  it('never puts a saved password into a field that shows text', async () => {
+    const item = await saved('auth.example');
+    const read = vi.spyOn(logins.store, 'secret');
+    await page.goto('https://auth.example/text-password');
+    await expect(
+      executeFillSecret(context(), {
+        item_handle: item.id,
+        ...(await refsFor({ password: 'Password', submit: 'Log in' })),
+      }),
+    ).rejects.toMatchObject({ code: 'forbidden' });
+    expect(read).not.toHaveBeenCalled();
+    expect(await page.locator('input').inputValue()).toBe('');
+    expect(posts).toEqual([]);
+  });
+
+  it('refuses a password field that turns to text before the write, without resolving into it', async () => {
+    const item = await saved('auth.example');
+    await page.goto('https://auth.example/native-get');
+    await page.locator('form').evaluate((node) => node.setAttribute('method', 'post'));
+    const chosen = await refsFor({ password: 'Password', submit: 'Log in' });
+    const read = logins.store.secret.bind(logins.store);
+    vi.spyOn(logins.store, 'secret').mockImplementation(async (...args) => {
+      await page.evaluate("document.querySelector('input').type = 'text'");
+      return read(...args);
+    });
+    expect(await executeFillSecret(context(), { item_handle: item.id, ...chosen })).toEqual({
+      status: 'origin_mismatch',
+    });
+    expect(await page.locator('input').inputValue()).toBe('');
+    expect(posts).toEqual([]);
+  });
+
+  it("keeps a filled password on the login's site when its form posts to another", async () => {
+    const item = await saved('auth.example');
+    await page.goto('https://auth.example/offsite-login');
+    expect(
+      await executeFillSecret(context(), {
+        item_handle: item.id,
+        ...(await refsFor({ password: 'Password', submit: 'Log in' })),
+      }),
+    ).toEqual({ status: 'origin_mismatch' });
+    await page.waitForTimeout(500);
+    expect(posts).toEqual([]);
+    expect(page.url()).not.toContain('collector.example');
+    expect(await page.content()).not.toContain(secret);
+  });
+
+  it('refuses a login saved for another site, saying which', async () => {
+    const item = await saved('parent.example');
+    const read = vi.spyOn(logins.store, 'secret');
+    await page.goto('https://auth.example/u/login');
+    const result = await executeFillSecret(context(), {
+      item_handle: item.id,
+      ...(await refsFor({ username: 'Email', password: 'Password', submit: 'Log in' })),
+    });
+    expect(result).toEqual({ status: 'origin_mismatch', reason: expect.stringContaining('parent.example') });
+    expect(result.reason).toContain('auth.example');
+    expect(read).not.toHaveBeenCalled();
+    expect(posts).toEqual([]);
+  });
 
   for (const path of ['/u/login', '/formless']) {
     it(`signs in through a controlled ${path} page with both saved fields and its own callbacks`, async () => {
@@ -491,15 +707,16 @@ describe.skipIf(!chromePath)('native host secret fill', { timeout: 30_000 }, () 
     expect(page.url()).toBe('https://auth.example/native-get');
   });
 
-  it('keeps an OTP binding usable while Send code is disabled for cooldown', async () => {
+  it('keeps a code binding usable while Send code is disabled for cooldown', async () => {
     await page.goto('https://auth.example/otp-send-button');
     const target = await page.locator('input').elementHandle();
     const submit = await page.locator('button[type=submit]').elementHandle();
-    if (!target || !submit) throw new Error('Missing OTP controls');
+    if (!target || !submit) throw new Error('Missing code controls');
     const bound = await bindBrowserSecretFields(
       page,
-      [{ field: 'otp', target: { element: target, frame: page.mainFrame() } as PinnedBrowserRef }],
+      [{ field: 'code', target: { element: target, frame: page.mainFrame() } as PinnedBrowserRef }],
       { element: submit, frame: page.mainFrame() } as PinnedBrowserRef,
+      'auth.example',
     );
     await page.locator('#send').evaluate((node) => {
       (node as unknown as { disabled: boolean }).disabled = true;
@@ -594,6 +811,7 @@ describe.skipIf(!chromePath)('native host secret fill', { timeout: 30_000 }, () 
       page,
       [{ field: kind, target: { ref: 'e1', generation: 1, element: target, frame } as PinnedBrowserRef }],
       { ref: 'e2', generation: 1, element: submit, frame } as PinnedBrowserRef,
+      new URL(frame.url()).hostname.split('.').slice(-2).join('.'),
     );
   }
 
@@ -618,11 +836,11 @@ describe.skipIf(!chromePath)('native host secret fill', { timeout: 30_000 }, () 
     expect(posts).toEqual([{ host: 'auth.example', body: `password=${secret}` }]);
   });
 
-  for (const kind of ['username', 'otp'] as const) {
-    it(`fills and submits a positively identified ${kind} field through the same native boundary`, async () => {
+  for (const kind of ['username', 'code'] as const) {
+    it(`fills and submits a ${kind} field through the same native boundary`, async () => {
       await page.goto('https://auth.example/login');
       await page.evaluate(
-        `(() => { const field = document.querySelector('input'); field.type = 'text'; field.name = ${JSON.stringify(kind)}; field.autocomplete = ${JSON.stringify(kind === 'otp' ? 'one-time-code' : 'username')}; })()`,
+        `(() => { const field = document.querySelector('input'); field.type = 'text'; field.name = ${JSON.stringify(kind)}; field.autocomplete = ${JSON.stringify(kind === 'code' ? 'one-time-code' : 'username')}; })()`,
       );
       const bound = await binding(page.mainFrame(), kind);
       expect(await fillBoundBrowserSecrets(context(), bound, async () => [secret])).toEqual({ status: 'submitted' });
@@ -660,7 +878,7 @@ describe.skipIf(!chromePath)('native host secret fill', { timeout: 30_000 }, () 
     });
   }
 
-  it('navigates a fresh assistant page to the reviewed Amazon sign-in endpoint and submits the origin-bound native form', async () => {
+  it('navigates a fresh assistant page to a sign-in page and submits its native form past a hostile value setter', async () => {
     expect(page.url()).toBe('about:blank');
     const result = await executeBrowserBatch(
       context(),
@@ -709,5 +927,128 @@ describe.skipIf(!chromePath)('native host secret fill', { timeout: 30_000 }, () 
     );
     await page.waitForTimeout(1_500);
     expect(parentDocuments).toEqual(['/help/speculate']);
+  });
+  describe("signing in with a code from the assistant's own mail", () => {
+    let delivered = 0;
+    beforeEach(async () => {
+      await runMigrations(await initTestDb());
+      await recordWebAlias(ALIAS);
+      await createAgentGroup({
+        id: 'external-email',
+        name: 'external-email',
+        folder: 'external-email',
+        agent_provider: null,
+        created_at: new Date().toISOString(),
+      });
+      await getDb().run(
+        'UPDATE gws_ea_profile SET external_email_agent_group_id = ?, assistant_workspace_email = ? WHERE singleton = 1',
+        'external-email',
+        'assistant@example.test',
+      );
+      setActiveInbox({
+        gmailAddress: async () => 'assistant@example.test',
+        knownGmailAddress: () => 'assistant@example.test',
+        wakeSignIn: () => undefined,
+      } as unknown as InboxRuntime);
+    });
+    afterEach(() => {
+      setActiveInbox(undefined);
+    });
+
+    /** The site's email reaches the assistant inbox, and the isolated interpreter answers its claim. */
+    async function deliver(value: string, receivedAt = new Date()): Promise<boolean> {
+      delivered++;
+      const mail = parseGmailMessage({
+        id: `sign-in-${delivered}`,
+        threadId: `sign-in-${delivered}`,
+        labelIds: ['INBOX'],
+        internalDate: String(receivedAt.getTime()),
+        payload: {
+          mimeType: 'text/plain',
+          headers: [
+            { name: 'Authentication-Results', value: 'mx.google.com; dkim=pass header.d=auth.example' },
+            { name: 'From', value: 'login@auth.example' },
+            { name: 'To', value: ALIAS },
+            { name: 'Subject', value: 'Your sign-in code' },
+          ],
+          body: { data: Buffer.from(`Your code is ${value}`).toString('base64url') },
+        },
+      });
+      if (!(await routeSignInMail(mail, new Date()))) return false;
+      const [interpreter] = await getSessionsByAgentGroup('external-email');
+      expect(await answerSignInReply({ kind: 'code', value }, interpreter)).toEqual({ status: 'accepted' });
+      return true;
+    }
+
+    it('fills the alias, lets the agent press Send code, then fills the emailed code and submits it', async () => {
+      await page.goto('https://auth.example/code-login');
+      expect(await executeSignInCode(context(), await refsFor({ email_field: 'Email' }))).toEqual({
+        status: 'filled',
+      });
+      const { send } = await refsFor({ send: 'Send code' });
+      expect(
+        await executeBrowserBatch(context(), { actions: [{ kind: 'click', ...send }] }, { record: false }),
+      ).toMatchObject({ status: 'stopped', reason: 'navigated' });
+      await expect.poll(() => page.locator('h1').textContent()).toBe('Check your email');
+      expect(await deliver('482913')).toBe(true);
+      const result = await executeSignInCode(context(), await refsFor({ code_field: 'Code', submit: 'Verify' }));
+      expect(result).toEqual({ status: 'code_filled' });
+      expect(posts.map((post) => Object.fromEntries(new URLSearchParams(post.body)))).toEqual([
+        { email: ALIAS },
+        { code: '482913' },
+      ]);
+      await expect.poll(() => page.locator('h1').textContent()).toBe('Signed in');
+      expect(JSON.stringify({ result, observation: await observePage(page) })).not.toContain('482913');
+    });
+
+    it('ignores mail that arrived before the code was requested', async () => {
+      const earlier = new Date(Date.now() - 60_000);
+      await page.goto('https://auth.example/code-login');
+      expect(await executeSignInCode(context(), await refsFor({ email_field: 'Email' }))).toEqual({
+        status: 'filled',
+      });
+      expect(await deliver('111111', earlier)).toBe(false);
+    });
+
+    it('keeps the code for the next step when the agent has not named its field yet', async () => {
+      await page.goto('https://auth.example/code-login');
+      await executeSignInCode(context(), await refsFor({ email_field: 'Email' }));
+      const { send } = await refsFor({ send: 'Send code' });
+      await executeBrowserBatch(context(), { actions: [{ kind: 'click', ...send }] }, { record: false });
+      await expect.poll(() => page.locator('h1').textContent()).toBe('Check your email');
+      await deliver('482913');
+      expect(await executeSignInCode(context(), {})).toEqual({ status: 'code_field_needed' });
+      expect(await executeSignInCode(context(), await refsFor({ code_field: 'Code', submit: 'Verify' }))).toEqual({
+        status: 'code_filled',
+      });
+    });
+
+    it('answers origin_mismatch for a code field on another site, keeping the code', async () => {
+      await page.goto('https://auth.example/code-login');
+      await executeSignInCode(context(), await refsFor({ email_field: 'Email' }));
+      await deliver('482913');
+      await executeBrowserBatch(
+        context(),
+        { actions: [{ kind: 'navigate', url: 'https://parent.example/elsewhere' }] },
+        { record: false },
+      );
+      await page.setContent(
+        '<form method="post" action="/verify"><label>Code<input name="code"></label><button type="submit">Verify</button></form>',
+      );
+      expect(await executeSignInCode(context(), await refsFor({ code_field: 'Code', submit: 'Verify' }))).toEqual({
+        status: 'origin_mismatch',
+      });
+      expect(posts).toEqual([]);
+    });
+
+    it('stops with alias_unavailable before anything is filled or watched', async () => {
+      await getDb().run('UPDATE gws_ea_profile SET assistant_alias = NULL WHERE singleton = 1');
+      await page.goto('https://auth.example/code-login');
+      expect(await executeSignInCode(context(), await refsFor({ email_field: 'Email' }))).toEqual({
+        status: 'alias_unavailable',
+      });
+      expect(await page.locator('input').inputValue()).toBe('');
+      expect(await getDb().all('SELECT id FROM gws_ea_browser_sign_in_claims')).toEqual([]);
+    });
   });
 });

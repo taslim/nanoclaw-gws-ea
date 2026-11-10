@@ -21,9 +21,10 @@ import type { ApprovalHandlerContext } from '../approvals/primitive.js';
 import { isVerifiedPrincipalUser, principalApproverUserId } from '../gws-ea-profile/db.js';
 import { errandSource, hasBrowserAccess, isMainAgentGroup } from './access.js';
 import {
+  ACCOUNT_INPUT_TYPES,
+  codeFieldFits,
   credentialFieldFits,
   httpsOrigin,
-  verificationCodeFits,
   type CredentialFormField,
   type CredentialKind,
 } from './authentication-signatures.js';
@@ -616,6 +617,15 @@ function destination(action: string, kind: CredentialKind, site: string): void {
   if (classification !== 'ordinary') throw stopFor(classification);
 }
 
+/** A field the site marks as an account's name: an email input, or one whose autocomplete names the account. */
+const accountField = (field: NativeFieldFacts): boolean =>
+  ACCOUNT_INPUT_TYPES.includes(field.type) &&
+  (field.type === 'email' ||
+    field.autocomplete
+      .toLowerCase()
+      .split(/\s+/u)
+      .some((token) => token === 'username' || token === 'email'));
+
 /** A field a fill or the browser could change; a read-only, disabled or hidden one only carries what the account is. */
 const editable = (field: NativeFieldFacts): boolean => field.type !== 'hidden' && !field.readonly && !field.disabled;
 
@@ -701,7 +711,6 @@ async function bindGroup(
     if (!binding) throw new StepStop('unsupported_form');
     fields.push({ ...field, binding });
   }
-  const currentBound = fields.some((field) => field.role === 'current_password');
   const form = fields[0].binding.formBackendNodeId;
   for (const { role, binding } of fields)
     if (
@@ -710,9 +719,7 @@ async function bindGroup(
       binding.facts.origin !== origin.origin ||
       binding.facts.tag !== 'INPUT' ||
       binding.formBackendNodeId !== form ||
-      !(role === 'code'
-        ? verificationCodeFits(binding.facts)
-        : credentialFieldFits(role, binding.facts, attempt.kind, currentBound))
+      !(role === 'code' ? codeFieldFits(binding.facts) : credentialFieldFits(role, binding.facts, attempt.kind))
     )
       throw new StepStop('unsupported_form');
   if (controlBinding.formBackendNodeId !== null && controlBinding.formBackendNodeId !== form)
@@ -730,8 +737,7 @@ async function bindGroup(
         )
       : undefined;
   if (scope.step === 'credentials') {
-    const namesAccount = (field: NativeFieldFacts): boolean =>
-      editable(field) && credentialFieldFits('username', { ...field, id: '' }, attempt.kind, currentBound);
+    const namesAccount = (field: NativeFieldFacts): boolean => editable(field) && accountField(field);
     // The Login is saved under the authority's username: a form that names the account must receive exactly that,
     if (!fields.some((field) => field.role === 'username') && fields[0].binding.facts.form?.fields.some(namesAccount))
       throw new StepStop('unsupported_form');
@@ -743,10 +749,6 @@ async function bindGroup(
     await readPageControlFacts(page, control.element),
     attempt.kind,
     attempt.site,
-    {
-      formControl: controlBinding.formBackendNodeId === form,
-      step: scope.step,
-    },
   );
   if (activation !== 'ordinary') throw stopFor(activation);
   return {
@@ -999,6 +1001,9 @@ async function activateWithin(
         carriesSecret(url, secrets)
           ? 'blocked_address'
           : classifyCredentialNavigation(url.href, group.kind, group.site),
+      // A filled password stays on its site: no non-GET document may carry the form elsewhere.
+      beforeNavigate: async (url, document) =>
+        document.method === 'GET' || registrableDomain(url.origin) === group.site ? 'ordinary' : 'blocked_address',
     },
     async () => {
       let activation: CredentialActivationResult = 'disabled';

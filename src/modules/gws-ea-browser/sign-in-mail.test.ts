@@ -20,10 +20,8 @@ vi.mock('../../config.js', async (original) => ({
 vi.mock('../../request-wake.js', () => ({ requestWake: vi.fn(async () => true) }));
 vi.mock('./fill.js', async (original) => ({
   ...(await original<typeof import('./fill.js')>()),
-  activateBoundBrowserSignIn: vi.fn(async () => undefined),
   bindBrowserSecretFields: vi.fn(),
   fillBoundBrowserSecrets: vi.fn(),
-  discoverAuthenticationCodeField: vi.fn(),
 }));
 import { closeDb, createAgentGroup, getDb, initTestDb, runMigrations } from '../../db/index.js';
 import { BrowserStore } from './db.js';
@@ -39,12 +37,7 @@ import {
   takeSignupVerification,
   validateSignInCode,
 } from './sign-in-mail.js';
-import {
-  bindBrowserSecretFields,
-  discoverAuthenticationCodeField,
-  fillBoundBrowserSecrets,
-  type BoundBrowserSecretFields,
-} from './fill.js';
+import { bindBrowserSecretFields, fillBoundBrowserSecrets, type BoundBrowserSecretFields } from './fill.js';
 import { observePage, type PinnedBrowserRef } from './observe.js';
 import { pageHasSecret } from './page-privacy.js';
 import type { BrowserExecutionContext } from './actions.js';
@@ -118,14 +111,22 @@ afterEach(async () => {
 });
 function receive(
   body: string,
-  options: { spam?: boolean; signer?: string; subject?: string; html?: string; to?: string; from?: string } = {},
+  options: {
+    spam?: boolean;
+    signer?: string;
+    subject?: string;
+    html?: string;
+    to?: string;
+    from?: string;
+    at?: number;
+  } = {},
 ): void {
   const domain = options.signer ?? 'shop.example';
   messages.push({
     id: String(messages.length + 1),
     threadId: 'mail',
     labelIds: [options.spam ? 'SPAM' : 'INBOX'],
-    internalDate: String(Date.now()),
+    internalDate: String(options.at ?? Date.now()),
     payload: {
       mimeType: options.html === undefined ? 'text/plain' : 'multipart/alternative',
       headers: [
@@ -165,25 +166,18 @@ async function interpret(reply: SignInReply = nextReply): Promise<void> {
   expect(JSON.parse(answer.content)).toMatchObject({ frame: { ok: true, data: { status: 'accepted' } } });
 }
 
-/** A sign-in page: its email field when `username`, holding `current`, else its code field. */
-function fixture(username = false, current = '') {
+/** A sign-in page whose email field holds `current`; the same field stands in for the code field once sent. */
+function fixture(current = '') {
   let url = 'https://www.shop.example/login';
   let loader = 'initial';
   const field = {
     ownerFrame: async () => frame,
     inputValue: async () => current,
     dispose: vi.fn(async () => undefined),
-    evaluate: async () => ({
-      tag: 'INPUT',
-      name: username ? 'email' : 'otp',
-      type: username ? 'email' : 'text',
-      autocomplete: username ? 'username' : 'one-time-code',
-    }),
   } as unknown as ElementHandle;
   const frame = { isDetached: () => false, url: () => url, evaluate: async () => [] } as unknown as Frame;
   const target: PinnedBrowserRef = { ref: 'e1', generation: 1, element: field, frame };
   const control = { ownerFrame: async () => frame, dispose: vi.fn(async () => undefined) } as unknown as ElementHandle;
-  const submit: PinnedBrowserRef = { ref: 'e2', generation: 1, element: control, frame };
   const listeners = new Map<string, Array<(...values: unknown[]) => void>>();
   const cdpEvents = new Map<string, (event: unknown) => void>();
   const gateEvents = new Map<string, (event: unknown) => void>();
@@ -260,30 +254,20 @@ function fixture(username = false, current = '') {
       await request('https://www.shop.example/image.png', 'Image');
     }),
   } as unknown as Page;
-  const binding = {
-    page,
-    fields: [{ field: username ? 'username' : 'otp', target }],
-    submit,
-    origin: 'https://www.shop.example',
-    native: {} as BoundBrowserSecretFields['native'],
-  } satisfies BoundBrowserSecretFields;
   const values: string[] = [];
-  vi.mocked(bindBrowserSecretFields).mockImplementation(async (_page, fields) => ({
-    ...binding,
+  vi.mocked(bindBrowserSecretFields).mockImplementation(async (_page, fields, submit, site) => ({
+    page,
+    frame,
     fields,
+    ...(submit ? { submit } : {}),
+    origin: new URL(url).origin,
+    site,
+    native: {} as BoundBrowserSecretFields['native'],
   }));
-  vi.mocked(fillBoundBrowserSecrets).mockImplementation(async (_context, _binding, resolve) => {
+  vi.mocked(fillBoundBrowserSecrets).mockImplementation(async (_context, binding, resolve) => {
     values.push(...(await resolve()));
-    if (username && values.length === 1) {
-      receive('Your code is 642981', {
-        spam: true,
-        html: '<a href="https://www.shop.example/access?token=temporary">Continue</a>',
-      });
-      await interpret();
-    }
-    return { status: 'submitted' };
+    return { status: binding.submit ? 'submitted' : 'filled' };
   });
-  vi.mocked(discoverAuthenticationCodeField).mockResolvedValue({ ...binding, fields: [{ field: 'otp', target }] });
   const context = {
     job: { id: 'job', thread_id: 'system:a2a:main:job' },
     request: { id: 'request' },
@@ -295,15 +279,15 @@ function fixture(username = false, current = '') {
     page: async () => page,
     assertActive: async () => undefined,
     wakeWaiters: async () => undefined,
-    remaining: () => 10_000,
+    remaining: () => 20_000,
   } as unknown as BrowserExecutionContext;
   return {
     page,
     frame,
+    target,
     context,
     values,
     cdp,
-    binding,
     network,
     redirects,
     setUrl: (next: string) => {
@@ -311,31 +295,55 @@ function fixture(username = false, current = '') {
     },
   };
 }
-const payload = { target: { ref: 'e1', generation: 1 }, send: { ref: 'e2', generation: 1 } };
-it("waits on the assistant's own mail and refuses raw codes, links, a mailbox choice and frame arguments", () => {
-  expect(validateSignInCode(payload)).toEqual(payload);
-  for (const extra of [
-    { code: '123456' },
-    { url: 'https://shop.example' },
-    { domain: 'shop.example' },
-    { from: 'principal' },
-    { from: 'assistant' },
+const start = { email_field: { ref: 'e1', generation: 1 } };
+const finish = { code_field: { ref: 'e1', generation: 1 }, submit: { ref: 'e2', generation: 1 } };
+/** The alias is filled and its claim open; the agent's own press of Send code follows. */
+async function started(f: ReturnType<typeof fixture>): Promise<void> {
+  await observePage(f.page);
+  expect(await executeSignInCode(f.context, start)).toEqual({ status: 'filled' });
+}
+
+it('starts with the email field and finishes with the code field, never taking a raw code, link or mailbox', () => {
+  expect(validateSignInCode(start)).toEqual(start);
+  expect(validateSignInCode(finish)).toEqual(finish);
+  expect(validateSignInCode({})).toEqual({});
+  for (const fields of [
+    { ...start, ...finish },
+    { code_field: finish.code_field },
+    { submit: finish.submit },
+    { code_field: finish.code_field, submit: finish.code_field },
+    { target: start.email_field, send: finish.submit },
+    { ...finish, code: '123456' },
+    { ...finish, url: 'https://shop.example' },
+    { ...start, domain: 'shop.example' },
+    { ...start, from: 'principal' },
   ])
-    expect(() => validateSignInCode({ ...payload, ...extra })).toThrow();
+    expect(() => validateSignInCode(fields)).toThrow();
   // A code the principal sends reaches the browser in main's message: no relay waits for it.
   expect(getDeliveryAction('relay_code')).toBeUndefined();
 });
-it('registers the wait before sending, routes raw HTML to external-email, and resumes only the browser', async () => {
-  const f = fixture(true);
+
+it('opens the wait before the alias reaches the page, presses nothing, and fills the emailed code in a later step', async () => {
+  const f = fixture();
   await observePage(f.page);
   const fill = vi.mocked(fillBoundBrowserSecrets).getMockImplementation()!;
   vi.mocked(fillBoundBrowserSecrets).mockImplementation(async (...args) => {
-    if (f.values.length === 0) expect(await getSignInClaim('signin-request')).toMatchObject({ gmail_message_id: null });
+    if (f.values.length === 0)
+      expect(await getSignInClaim('signin-request')).toMatchObject({ state: 'waiting', gmail_message_id: null });
     return fill(...args);
   });
-  const result = await executeSignInCode(f.context, payload);
+  expect(await executeSignInCode(f.context, start)).toEqual({ status: 'filled' });
+  expect(vi.mocked(bindBrowserSecretFields).mock.calls[0].slice(2)).toEqual([undefined, 'shop.example']);
+  receive('Your code is 642981', {
+    spam: true,
+    html: '<a href="https://www.shop.example/access?token=temporary">Continue</a>',
+    to: ALIAS,
+  });
+  await interpret();
+  const result = await executeSignInCode(f.context, finish);
   expect(result).toEqual({ status: 'code_filled' });
   expect(f.values).toEqual([ALIAS, '642981']);
+  expect(vi.mocked(bindBrowserSecretFields).mock.calls[1][1]).toEqual([{ field: 'code', target: f.target }]);
   expect(list).not.toHaveBeenCalled();
   expect(read).not.toHaveBeenCalled();
   const [session] = await getSessionsByAgentGroup('external-email');
@@ -345,16 +353,46 @@ it('registers the wait before sending, routes raw HTML to external-email, and re
   expect(rows).toEqual([expect.objectContaining({ channel_type: null, platform_id: null })]);
   expect(JSON.stringify(rows)).toContain('https://www.shop.example/access?token=temporary');
   expect(JSON.stringify(result)).not.toContain('642981');
+  // The code is spent once it may have reached the site.
   expect(await answerSignInReply({ kind: 'code', value: '111111' }, session)).toEqual({ status: 'no_wait' });
+  expect(await executeSignInCode(f.context, finish)).toEqual({ status: 'not_watched' });
+});
+
+it('takes only mail to the alias it filled', async () => {
+  const f = fixture();
+  await started(f);
+  receive('Code 642981', { to: 'assistant@example.com' });
+  expect(await routeSignInMail(parseGmailMessage(messages[0]), new Date())).toBe(false);
+  expect(await getSignInClaim('signin-request')).toMatchObject({ gmail_message_id: null });
+});
+
+it('ignores mail that arrived before the code was requested', async () => {
+  const f = fixture();
+  receive('Code 111111', { to: ALIAS, at: Date.now() - 60_000 });
+  await started(f);
+  expect(await routeSignInMail(parseGmailMessage(messages[0]), new Date())).toBe(false);
+  expect(await executeSignInCode({ ...f.context, remaining: () => 10_500 }, finish)).toEqual({
+    status: 'nothing_arrived',
+  });
 });
 
 it('returns ambiguity when the interpreter cannot identify one credential', async () => {
-  const f = fixture(true);
-  await observePage(f.page);
-  nextReply = { kind: 'unavailable' };
-  expect(await executeSignInCode(f.context, payload)).toEqual({ status: 'ambiguous' });
+  const f = fixture();
+  await started(f);
+  receive('Welcome aboard', { to: ALIAS });
+  await interpret({ kind: 'unavailable' });
+  expect(await executeSignInCode(f.context, finish)).toEqual({ status: 'ambiguous' });
   expect(f.values).toEqual([ALIAS]);
   expect(f.page.goto).not.toHaveBeenCalled();
+});
+
+it('keeps a code until a step names its field, then fills it', async () => {
+  const f = fixture();
+  await started(f);
+  receive('Code 642981', { to: ALIAS });
+  await interpret();
+  expect(await executeSignInCode(f.context, {})).toEqual({ status: 'code_field_needed' });
+  expect(await executeSignInCode(f.context, finish)).toEqual({ status: 'code_filled' });
 });
 
 describe("the assistant's email on a sign-in form", () => {
@@ -363,18 +401,18 @@ describe("the assistant's email on a sign-in form", () => {
     ['an address it converses from', 'Assistant@example.com', ALIAS],
     // The +tag spelling of the alias an account was registered with.
     ['a +tag of the alias', ' Tnatsissa+Shop@example.com ', 'tnatsissa+shop@example.com'],
-  ])('signs in with the alias when the field holds %s', async (_case, current, email) => {
-    const f = fixture(true, current);
-    await observePage(f.page);
-    expect(await executeSignInCode(f.context, payload)).toEqual({ status: 'code_filled' });
-    expect(f.values).toEqual([email, '642981']);
+  ])('fills the alias when the field holds %s', async (_case, current, email) => {
+    const f = fixture(current);
+    await started(f);
+    expect(f.values).toEqual([email]);
+    expect(JSON.parse((await getSignInClaim('signin-request'))!.binding_json)).toEqual({ username: email });
   });
 
-  it('stops with alias_unavailable while no alias is recorded, before any wait or send', async () => {
+  it('stops with alias_unavailable while no alias is recorded, before any fill or wait', async () => {
     await getDb().run('UPDATE gws_ea_profile SET assistant_alias = NULL WHERE singleton = 1');
-    const f = fixture(true, 'assistant@example.com');
+    const f = fixture('assistant@example.com');
     await observePage(f.page);
-    expect(await executeSignInCode(f.context, payload)).toEqual({ status: 'alias_unavailable' });
+    expect(await executeSignInCode(f.context, start)).toEqual({ status: 'alias_unavailable' });
     expect(f.values).toEqual([]);
     expect(await getSignInClaim('signin-request')).toBeUndefined();
   });
@@ -383,100 +421,91 @@ describe("the assistant's email on a sign-in form", () => {
 it.each(['session', 'job', 'expiry', 'cancellation', 'restart'] as const)(
   'refuses a mismatched or ended interpretation wait (%s)',
   async (mode) => {
-    const f = fixture(true);
-    await observePage(f.page);
-    vi.mocked(fillBoundBrowserSecrets).mockImplementationOnce(async (_context, _binding, resolve) => {
-      f.values.push(...(await resolve()));
-      receive('Code 642981');
-      await routeSignInMail(parseGmailMessage(messages[0]), new Date());
-      const [session] = await getSessionsByAgentGroup('external-email');
-      const caller =
-        mode === 'session'
-          ? (await resolveSystemSession('external-email', 'system:browser-sign-in:foreign')).session
-          : session;
-      if (mode === 'job') await getDb().run('UPDATE gws_ea_browser_sign_in_claims SET job_id = ?', 'another-job');
-      if (mode === 'expiry')
-        await getDb().run(
-          'UPDATE gws_ea_browser_sign_in_claims SET expires_at = ?',
-          new Date(Date.now() - 1).toISOString(),
-        );
-      if (mode === 'cancellation') await cleanupBrowserSignInMail('job');
-      if (mode === 'restart') await recoverBrowserSignInMail();
-      expect(await answerSignInReply({ kind: 'code', value: '642981' }, caller)).toEqual({ status: 'no_wait' });
-      await recoverBrowserSignInMail();
-      return { status: 'submitted' };
+    const f = fixture();
+    await started(f);
+    receive('Code 642981', { to: ALIAS });
+    await routeSignInMail(parseGmailMessage(messages[0]), new Date());
+    const [session] = await getSessionsByAgentGroup('external-email');
+    const caller =
+      mode === 'session'
+        ? (await resolveSystemSession('external-email', 'system:browser-sign-in:foreign')).session
+        : session;
+    if (mode === 'job') await getDb().run('UPDATE gws_ea_browser_sign_in_claims SET job_id = ?', 'another-job');
+    if (mode === 'expiry')
+      await getDb().run(
+        'UPDATE gws_ea_browser_sign_in_claims SET expires_at = ?',
+        new Date(Date.now() - 1).toISOString(),
+      );
+    if (mode === 'cancellation') await cleanupBrowserSignInMail('job');
+    if (mode === 'restart') await recoverBrowserSignInMail();
+    expect(await answerSignInReply({ kind: 'code', value: '642981' }, caller)).toEqual({ status: 'no_wait' });
+    expect(await executeSignInCode({ ...f.context, remaining: () => 10_500 }, finish)).toEqual({
+      status: mode === 'cancellation' || mode === 'restart' ? 'not_watched' : 'nothing_arrived',
     });
-    expect(await executeSignInCode(f.context, payload)).toEqual({ status: 'nothing_arrived' });
     expect(f.values).toEqual([ALIAS]);
   },
 );
 
 it('refuses a foreign group and invalid typed reply without echoing a credential', async () => {
-  const f = fixture(true);
-  await observePage(f.page);
-  vi.mocked(fillBoundBrowserSecrets).mockImplementationOnce(async () => {
-    receive('Code 642981');
-    await routeSignInMail(parseGmailMessage(messages[0]), new Date());
-    const [session] = await getSessionsByAgentGroup('external-email');
-    await expect(
-      answerSignInReply({ kind: 'code', value: '642981' }, { ...session, agent_group_id: 'foreign' }),
-    ).rejects.toMatchObject({ code: 'forbidden', message: 'Only the host sign-in interpreter may answer.' });
-    for (const fields of [
-      { kind: 'code', value: '642981', claim: 'other' },
-      { kind: 'unavailable', value: '642981' },
-    ]) {
-      await expect(answerSignInReply(fields, session)).rejects.toMatchObject({
-        code: 'invalid-args',
-        message: 'Return one sign-in code, one link, or unavailable.',
-      });
-    }
-    await recoverBrowserSignInMail();
-    return { status: 'submitted' };
-  });
-  expect(await executeSignInCode(f.context, payload)).toEqual({ status: 'nothing_arrived' });
+  const f = fixture();
+  await started(f);
+  receive('Code 642981', { to: ALIAS });
+  await routeSignInMail(parseGmailMessage(messages[0]), new Date());
+  const [session] = await getSessionsByAgentGroup('external-email');
+  await expect(
+    answerSignInReply({ kind: 'code', value: '642981' }, { ...session, agent_group_id: 'foreign' }),
+  ).rejects.toMatchObject({ code: 'forbidden', message: 'Only the host sign-in interpreter may answer.' });
+  for (const fields of [
+    { kind: 'code', value: '642981', claim: 'other' },
+    { kind: 'unavailable', value: '642981' },
+  ]) {
+    await expect(answerSignInReply(fields, session)).rejects.toMatchObject({
+      code: 'invalid-args',
+      message: 'Return one sign-in code, one link, or unavailable.',
+    });
+  }
 });
 
 it.each(['/security/lock', '/reset-password', '/auth/revoke', '/%73ecurity/lock'])(
   'refuses a typed account-security link before navigation (%s)',
   async (path) => {
-    const f = fixture(true);
-    await observePage(f.page);
-    nextReply = { kind: 'link', value: `https://www.shop.example${path}?token=security-response` };
-    await expect(executeSignInCode(f.context, payload)).rejects.toMatchObject({ code: 'forbidden' });
+    const f = fixture();
+    await started(f);
+    receive('Follow the link.', { to: ALIAS });
+    await interpret({ kind: 'link', value: `https://www.shop.example${path}?token=security-response` });
+    await expect(executeSignInCode(f.context, {})).rejects.toMatchObject({ code: 'forbidden' });
     expect(f.page.goto).not.toHaveBeenCalled();
   },
 );
 
-it.each(['https://www.shop.example:8443/login', 'http://www.shop.example/login', 'https://other.shop.example/login'])(
-  'refuses full-origin drift before releasing a mail code (%s)',
+it.each(['http://www.shop.example/verify', 'https://elsewhere.example/verify'])(
+  'answers origin_mismatch for a code field off the claimed site and keeps the code for its own site (%s)',
   async (next) => {
-    const f = fixture(true);
-    await observePage(f.page);
-    const fill = vi.mocked(fillBoundBrowserSecrets).getMockImplementation()!;
-    vi.mocked(fillBoundBrowserSecrets).mockImplementationOnce(async (...args) => {
-      const result = await fill(...args);
-      f.setUrl(next);
-      return result;
-    });
-    expect(await executeSignInCode(f.context, payload)).toEqual({ status: 'origin_mismatch' });
+    const f = fixture();
+    await started(f);
+    receive('Code 642981', { to: ALIAS });
+    await interpret();
+    f.setUrl(next);
+    expect(await executeSignInCode(f.context, finish)).toEqual({ status: 'origin_mismatch' });
     expect(f.values).toEqual([ALIAS]);
+    f.setUrl('https://login.shop.example/verify');
+    expect(await executeSignInCode(f.context, finish)).toEqual({ status: 'code_filled' });
+    expect(f.values).toEqual([ALIAS, '642981']);
   },
 );
+
 it('taints bearer documents before traffic and returns only after fresh sanitized navigation and history reset', async () => {
-  const f = fixture(true);
-  await observePage(f.page);
+  const f = fixture();
+  await started(f);
   const secret = 'magic-bearer-7622';
-  vi.mocked(fillBoundBrowserSecrets).mockImplementationOnce(async () => {
-    receive('Follow the sign-in button.');
-    await interpret({ kind: 'link', value: `https://www.shop.example/verify?token=${secret}` });
-    return { status: 'submitted' };
-  });
+  receive('Follow the sign-in button.', { to: ALIAS });
+  await interpret({ kind: 'link', value: `https://www.shop.example/verify?token=${secret}` });
   const original = vi.mocked(f.page.goto).getMockImplementation()!;
   vi.mocked(f.page.goto).mockImplementation(async (...args) => {
     expect(await pageHasSecret(f.page)).toBe(true);
     return original(...args);
   });
-  const result = await executeSignInCode(f.context, payload);
+  const result = await executeSignInCode(f.context, {});
   expect(result).toEqual({ status: 'link_opened' });
   expect(f.page.url()).toBe('https://www.shop.example/');
   expect(f.cdp.send).toHaveBeenCalledWith('Page.resetNavigationHistory');
@@ -487,22 +516,20 @@ it('taints bearer documents before traffic and returns only after fresh sanitize
     expect(
       (request.headers as Array<{ name: string; value: string }>).filter(({ name }) => /^referr?er$/iu.test(name)),
     ).toEqual([{ name: 'Referer', value: '' }]);
+  expect(await executeSignInCode(f.context, {})).toEqual({ status: 'not_watched' });
 });
 
 it.each(['http://www.shop.example/verify?token=magic-bearer', 'https://elsewhere.example/verify?token=magic-bearer'])(
   'refuses an insecure or foreign redirect before following it and scrubs its failure (%s)',
   async (redirect) => {
-    const f = fixture(true);
-    await observePage(f.page);
+    const f = fixture();
+    await started(f);
     f.redirects.push(redirect);
-    vi.mocked(fillBoundBrowserSecrets).mockImplementationOnce(async () => {
-      receive('Follow the sign-in button.');
-      await interpret({ kind: 'link', value: 'https://www.shop.example/verify?token=magic-bearer' });
-      return { status: 'submitted' };
-    });
-    await expect(executeSignInCode(f.context, payload)).rejects.toMatchObject({
+    receive('Follow the sign-in button.', { to: ALIAS });
+    await interpret({ kind: 'link', value: 'https://www.shop.example/verify?token=magic-bearer' });
+    await expect(executeSignInCode(f.context, {})).rejects.toMatchObject({
       code: 'forbidden',
-      message: 'The host could not safely consume this sign-in link.',
+      message: 'The host could not safely open this verification link.',
     });
     expect(f.network.find((request) => request.url === redirect)?.allowed).toBe(false);
     expect(f.context.runtime.closeJob).toHaveBeenCalledWith('job');
@@ -512,91 +539,63 @@ it.each(['http://www.shop.example/verify?token=magic-bearer', 'https://elsewhere
 );
 
 it.each(['http://www.shop.example/verify?token=magic-bearer', 'https://elsewhere.example/verify?token=magic-bearer'])(
-  'refuses an insecure or foreign original link without navigating (%s)',
+  'refuses an insecure or off-site magic link without navigating (%s)',
   async (link) => {
-    const f = fixture(true);
-    await observePage(f.page);
-    vi.mocked(fillBoundBrowserSecrets).mockImplementationOnce(async () => {
-      receive('Follow the sign-in button.');
-      await interpret({ kind: 'link', value: link });
-      return { status: 'submitted' };
+    const f = fixture();
+    await started(f);
+    receive('Follow the sign-in button.', { to: ALIAS });
+    await interpret({ kind: 'link', value: link });
+    await expect(executeSignInCode(f.context, {})).rejects.toMatchObject({
+      code: 'forbidden',
+      message: 'The host refused an insecure or off-site sign-in link.',
     });
-    await expect(executeSignInCode(f.context, payload)).rejects.toMatchObject({ code: 'forbidden' });
     expect(f.page.goto).not.toHaveBeenCalled();
   },
 );
 
-it('refuses an assistant code request immediately when its inbox is unavailable', async () => {
+it('refuses to start a sign-in while the assistant inbox is unavailable', async () => {
   const f = fixture();
   setActiveInbox(undefined);
-  await expect(executeSignInCode(f.context, payload)).rejects.toMatchObject({
+  await expect(executeSignInCode(f.context, start)).rejects.toMatchObject({
     code: 'forbidden',
     message: 'The assistant inbox is unavailable.',
   });
   expect(await getSignInClaim('signin-request')).toBeUndefined();
+  expect(f.values).toEqual([]);
 });
 
-it.each(['timer', 'abort', 'inactive'] as const)(
-  'ends a pending interpretation on %s and refuses late credentials',
-  async (mode) => {
-    vi.useFakeTimers();
-    const controller = new AbortController();
-    let active = true;
-    try {
-      const f = fixture(true);
-      await observePage(f.page);
-      let ready!: () => void;
-      const sent = new Promise<void>((resolve) => {
-        ready = resolve;
-      });
-      vi.mocked(fillBoundBrowserSecrets).mockImplementationOnce(async (_context, _binding, resolve) => {
-        f.values.push(...(await resolve()));
-        receive('Code 642981');
-        await routeSignInMail(parseGmailMessage(messages[0]), new Date());
-        ready();
-        return { status: 'submitted' };
-      });
-      const context = {
-        ...f.context,
-        signal: controller.signal,
-        remaining: () => 10_000,
-        assertActive: async () => {
-          if (!active || controller.signal.aborted) throw new Error('The request ended.');
-        },
-      };
-      const outcome = executeSignInCode(context, payload).then(
-        (value) => ({ value }),
-        (error: unknown) => ({ error }),
-      );
-      await sent;
-      await vi.advanceTimersByTimeAsync(0);
-      const [session] = await getSessionsByAgentGroup('external-email');
-      if (mode === 'timer') await vi.advanceTimersByTimeAsync(9_000);
-      else if (mode === 'abort') controller.abort();
-      else {
-        active = false;
-        expect(await answerSignInReply({ kind: 'code', value: '642981' }, session)).toEqual({ status: 'no_wait' });
-      }
-      const result = await outcome;
-      if (mode === 'timer') expect(result).toEqual({ value: { status: 'nothing_arrived' } });
-      else expect(result).toMatchObject({ error: { code: 'forbidden' } });
-      expect(await answerSignInReply({ kind: 'code', value: '642981' }, session)).toEqual({ status: 'no_wait' });
-      expect(f.values).toEqual([ALIAS]);
-      expect(f.page.goto).not.toHaveBeenCalled();
-    } finally {
-      controller.abort();
-      vi.useRealTimers();
-    }
-  },
-);
-
-it('returns nothing_arrived within the remaining request budget', async () => {
-  const f = fixture(true);
-  await observePage(f.page);
-  vi.mocked(fillBoundBrowserSecrets).mockImplementationOnce(async () => ({ status: 'submitted' }));
-  expect(await executeSignInCode({ ...f.context, remaining: () => 500 }, payload)).toEqual({
+it('holds an answer that arrives after a step stopped waiting, for the next step within the claim', async () => {
+  const f = fixture();
+  await started(f);
+  expect(await executeSignInCode({ ...f.context, remaining: () => 10_300 }, finish)).toEqual({
     status: 'nothing_arrived',
   });
+  receive('Code 642981', { to: ALIAS });
+  await interpret();
+  expect(await executeSignInCode(f.context, finish)).toEqual({ status: 'code_filled' });
+  expect(f.values).toEqual([ALIAS, '642981']);
+});
+
+it('ends its wait on abort and refuses an inactive step without filling', async () => {
+  const controller = new AbortController();
+  const f = fixture();
+  await started(f);
+  const waiting = executeSignInCode(
+    {
+      ...f.context,
+      signal: controller.signal,
+      assertActive: async () => {
+        if (controller.signal.aborted) throw new Error('The request ended.');
+      },
+    },
+    finish,
+  ).then(
+    (value) => ({ value }),
+    (error: unknown) => ({ error }),
+  );
+  controller.abort();
+  expect(await waiting).toMatchObject({ error: { code: 'forbidden' } });
+  expect(f.values).toEqual([ALIAS]);
 });
 
 describe('a signup waiting for its email verification', () => {

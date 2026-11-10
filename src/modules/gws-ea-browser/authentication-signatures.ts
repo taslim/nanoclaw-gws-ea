@@ -1,4 +1,5 @@
-export type BrowserSecretField = 'username' | 'password' | 'otp';
+/** What the host fills into a sign-in field: a saved login's username or password, or an emailed code. */
+export type BrowserSecretField = 'username' | 'password' | 'code';
 
 export function httpsOrigin(raw: string): URL | undefined {
   try {
@@ -21,32 +22,6 @@ export function browserDiagnosticsUnsafe(
     const prefix = pattern.slice(0, wildcard);
     return 'pw:'.startsWith(prefix) || prefix.startsWith('pw:');
   });
-}
-
-export interface AuthenticationFieldFacts {
-  name: string;
-  type: string;
-  autocomplete: string;
-}
-export function authenticationFieldKind(facts: AuthenticationFieldFacts): BrowserSecretField | undefined {
-  const autocomplete = facts.autocomplete.toLowerCase().split(/\s+/u);
-  const evidence = `${facts.name} ${facts.autocomplete}`;
-  if (/(?:cc-|credit.?card|card.?number|cvv|cvc|new-password)/iu.test(evidence)) return undefined;
-  if (autocomplete.includes('one-time-code') && ['text', 'tel', 'number', 'password', ''].includes(facts.type))
-    return 'otp';
-  if (
-    facts.type === 'password' &&
-    (autocomplete.includes('current-password') || /^(?:password|passwd|pass)$/iu.test(facts.name))
-  )
-    return 'password';
-  if (
-    ['email', 'text', 'tel', ''].includes(facts.type) &&
-    (autocomplete.includes('username') ||
-      facts.type === 'email' ||
-      /^(?:username|user|email|login|loginfmt)$/iu.test(facts.name))
-  )
-    return 'username';
-  return undefined;
 }
 
 /** Marks a field only the host fills: a site's own credential field, whatever its type shows now. */
@@ -78,68 +53,37 @@ export function entryRefusal(field: EntryFieldFacts, value?: string): 'card_fiel
 
 export type CredentialFormField = 'username' | 'current_password' | 'new_password' | 'confirmation';
 export type CredentialKind = 'signup' | 'rotation';
-export interface CredentialFieldFacts {
-  name: string;
-  id: string;
-  type: string;
-  autocomplete: string;
+/** An input's type and autocomplete tokens, as the host reads them at binding and again at each write. */
+export interface FieldTypeFacts {
+  readonly type: string;
+  readonly autocomplete: string;
 }
 
-const CURRENT_HINT = /(?:current|old|existing).?pass/iu;
-const NEW_HINT = /new.?pass|pass(?:word)?.?new/iu;
-const CONFIRM_HINT =
-  /(?:confirm|repeat|retype|re-?enter|verify|again).?pass|pass(?:word)?.?(?:confirm|repeat|again|verify|2)/iu;
-const NOT_CREDENTIAL = /(?:cc-|credit.?card|card.?number|cvc|cvv|security.?question|one-time-code)/iu;
-const USERNAME_HINT = /(?:^|[^a-z])(?:user.?name|user|e-?mail|login)(?:[^a-z]|$)/iu;
+const tokens = (facts: FieldTypeFacts): string[] => facts.autocomplete.toLowerCase().split(/\s+/u);
+const cardMarked = (facts: FieldTypeFacts): boolean => tokens(facts).some((token) => token.startsWith('cc-'));
+/** Text-entry inputs that can show an account name. */
+export const ACCOUNT_INPUT_TYPES: readonly string[] = ['email', 'text', 'tel'];
 
 /**
- * Whether a field's structure supports a credential role. The current and the
- * new password are never interchangeable: putting the old password into a new
- * field would leave the website and the vault disagreeing. A change form's
- * unmarked password field is new only beside a bound current-password field.
+ * Whether a field's type fits a role: an account name goes into an editable text, email or tel input, and every
+ * password only into a masked one, so a saved or generated password never shows as plain text. The current and the
+ * new password are never crossed where the site marks which is which: the old password in a new field would leave
+ * the website and the saved login disagreeing.
  */
-export function credentialFieldFits(
-  role: CredentialFormField,
-  facts: CredentialFieldFacts,
-  kind: CredentialKind,
-  currentBound: boolean,
-): boolean {
-  const autocomplete = facts.autocomplete.toLowerCase().split(/\s+/u);
-  const description = `${facts.name} ${facts.id}`;
-  if (NOT_CREDENTIAL.test(`${description} ${facts.autocomplete}`)) return false;
+export function credentialFieldFits(role: CredentialFormField, facts: FieldTypeFacts, kind: CredentialKind): boolean {
+  if (cardMarked(facts)) return false;
+  const marks = tokens(facts);
   if (role === 'username')
-    return (
-      ['email', 'text', ''].includes(facts.type) &&
-      (autocomplete.includes('username') ||
-        autocomplete.includes('email') ||
-        facts.type === 'email' ||
-        USERNAME_HINT.test(description))
-    );
-  const evidenced =
-    autocomplete.includes('new-password') ||
-    autocomplete.includes('current-password') ||
-    /pass(?:word|wd)|pwd/iu.test(description);
-  // A show-password toggle leaves a text field that still says what it holds.
-  if (facts.type !== 'password' && !(facts.type === 'text' && evidenced)) return false;
-  const current = autocomplete.includes('current-password') || CURRENT_HINT.test(description);
-  const fresh = autocomplete.includes('new-password') || NEW_HINT.test(description) || CONFIRM_HINT.test(description);
-  if (role === 'current_password') return kind === 'rotation' && current && !fresh;
-  return !current && (fresh || kind === 'signup' || currentBound);
+    return ACCOUNT_INPUT_TYPES.includes(facts.type) && !CREDENTIAL_AUTOCOMPLETE.test(facts.autocomplete);
+  if (facts.type !== 'password') return false;
+  if (role === 'current_password') return kind === 'rotation' && !marks.includes('new-password');
+  return !marks.includes('current-password');
 }
 
-const VERIFICATION_CODE =
-  /(?:^|[^a-z])(?:otp|one.?time|verif[a-z]*|confirm[a-z]*|activation|e-?mail.?code)(?:[^a-z]|$)|^(?:code|pin|token)$/iu;
-const NOT_VERIFICATION_CODE =
-  /(?:cc-|card|cvc|cvv|zip|postal|promo|coupon|discount|gift|referral|invite|voucher|security.?code|pass(?:word|wd))/iu;
+const NO_TEXT_ENTRY =
+  /^(?:hidden|submit|button|reset|image|checkbox|radio|file|range|color|date|datetime-local|month|week|time)$/u;
 
-/** A field for the code a new account's verification email carries. */
-export function verificationCodeFits(facts: CredentialFieldFacts): boolean {
-  const description = `${facts.name} ${facts.id}`;
-  return (
-    ['text', 'tel', 'number', ''].includes(facts.type) &&
-    !NOT_VERIFICATION_CODE.test(`${description} ${facts.autocomplete}`) &&
-    (facts.autocomplete.toLowerCase().split(/\s+/u).includes('one-time-code') ||
-      VERIFICATION_CODE.test(facts.name) ||
-      VERIFICATION_CODE.test(facts.id))
-  );
+/** A field the host may enter an emailed code into: any text field, a masked one included, but no card or credential field. */
+export function codeFieldFits(facts: FieldTypeFacts): boolean {
+  return !NO_TEXT_ENTRY.test(facts.type) && !cardMarked(facts) && !CREDENTIAL_AUTOCOMPLETE.test(facts.autocomplete);
 }

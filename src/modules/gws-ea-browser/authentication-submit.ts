@@ -64,6 +64,9 @@ export interface NativeCredentialFacts {
   autocomplete: string;
   /** `required` or `aria-required`. */
   required: boolean;
+  /** Whether a fill could change this node now; excluded from a binding's identity, like `required`. */
+  readonly: boolean;
+  disabled: boolean;
   override: { action: string; method: string; target: string } | null;
   form: { action: string; method: string; target: string; fields: NativeFieldFacts[] } | null;
 }
@@ -97,6 +100,7 @@ const readControlSource = `
       tag: node.tagName, id: node.id || '', name: typeof node.name === 'string' ? node.name : '',
       type: typeof node.type === 'string' ? node.type : '', autocomplete: node.getAttribute('autocomplete') || '',
       required: node.required === true || node.getAttribute('aria-required') === 'true',
+      readonly: node.readOnly === true, disabled: node.matches(':disabled'),
       override: overridden ? { action: node.formAction, method: node.formMethod, target: node.formTarget } : null,
       form: form ? {
         action: formProperty(form, 'action'), method: formProperty(form, 'method'), target: formProperty(form, 'target'),
@@ -169,11 +173,10 @@ export interface NativeCredentialGroup {
 /** Shared by the fill and the activation: the bound document, origin, nodes and facts, all unchanged. */
 const credentialGroupSource = `
   ${readControlSource}
-  // A show-password toggle turns a password field into text and back, and a controlled form enables its
-  // controls and marks them required as it fills: none of that changes what the group binds.
+  // A controlled form enables its controls and marks them required as it fills: that does not change what the
+  // group binds. A type does: a password field shown as text would put the value on screen.
   const shape = (facts) => JSON.stringify(facts, (key, value) =>
-    key === 'readonly' || key === 'disabled' || key === 'required' ? undefined
-      : key === 'type' && value === 'text' ? 'password' : value);
+    key === 'readonly' || key === 'disabled' || key === 'required' ? undefined : value);
   const same = (left, right) => shape(left) === shape(right);
   const valueOf = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value');
   const bound = (control, expectedControl, expectedFields, form, fields) =>

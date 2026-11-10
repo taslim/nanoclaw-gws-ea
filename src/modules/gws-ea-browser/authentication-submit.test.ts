@@ -171,6 +171,31 @@ describe.skipIf(!chromePath)('native authentication submission', { timeout: 30_0
     });
   }
 
+  // A show-password toggle leaves the saved password readable on screen, so it is a different field.
+  it('writes nothing into a password field that turned to text before the write', async () => {
+    await withFixture('top', async ({ page, frame, control, callbacks, posts }) => {
+      const signature = await group(frame, control);
+      if (!signature) throw new Error('The native authentication signature was refused.');
+      await page.evaluate("document.querySelector('#chosen input[name=password]').type = 'text'");
+      expect(await fillNativeCredentialGroup(frame, signature, values, async () => undefined)).toBe('not_inserted');
+      expect(await frame.locator('#chosen input[name=password]').inputValue()).toBe('');
+      expect(posts).toEqual([]);
+      expect(callbacks).toEqual([]);
+    });
+  });
+
+  it('never activates once a filled password field shows as text', async () => {
+    await withFixture('top', async ({ page, frame, control, callbacks, posts }) => {
+      const signature = await group(frame, control);
+      if (!signature) throw new Error('The native authentication signature was refused.');
+      expect(await fillNativeCredentialGroup(frame, signature, values, async () => undefined)).toBe('filled');
+      await page.evaluate("document.querySelector('#chosen input[name=password]').type = 'text'");
+      expect(await activateNativeCredentialControl(frame, signature, values, async () => undefined)).toBe('changed');
+      expect(posts).toEqual([]);
+      expect(callbacks).toEqual([]);
+    });
+  });
+
   it('refuses a document replaced during the last asynchronous liveness check', async () => {
     await withFixture('top', async ({ page, frame, control, callbacks, posts }) => {
       const signature = await group(frame, control);

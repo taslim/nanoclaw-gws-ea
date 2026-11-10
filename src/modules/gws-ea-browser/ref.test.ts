@@ -14,7 +14,7 @@ it('accepts document-prefixed native references on every host browser surface', 
   expect(validateFillSecret({ item_handle: 'vault_opaque', password: target, submit: target }).password).toEqual(
     target,
   );
-  expect(validateSignInCode({ target, send: target }).target).toEqual(target);
+  expect(validateSignInCode({ email_field: target })).toEqual({ email_field: target });
   for (const ref of ['fe17', 'f2e17extra', 'f2f3e4', 'e-1', 'f1e1foo']) {
     expect(() => validateBrowserBatch({ actions: [{ kind: 'click', ref, generation: 1 }] })).toThrow();
     expect(() =>
@@ -24,7 +24,7 @@ it('accepts document-prefixed native references on every host browser surface', 
         submit: target,
       }),
     ).toThrow();
-    expect(() => validateSignInCode({ target: { ref, generation: 1 }, send: target })).toThrow();
+    expect(() => validateSignInCode({ email_field: { ref, generation: 1 } })).toThrow();
   }
 });
 

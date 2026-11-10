@@ -63,7 +63,9 @@ const cases: ReadonlyArray<readonly [McpToolDefinition, Record<string, unknown>]
       submit: { ref: 'e3', generation: 1 },
     },
   ],
-  [signInCode, { target, send: { ref: 'e2', generation: 1 } }],
+  [fillSecret, { item_handle: 'login-1', username: target }],
+  [signInCode, { email_field: target }],
+  [signInCode, { code_field: target, submit: { ref: 'e2', generation: 1 } }],
   [
     credentialForm,
     {
@@ -344,26 +346,39 @@ describe('the browser tools', () => {
 
   it('offers saved username and password fills while email codes keep their own tool', () => {
     const validate = new Ajv().compile(fillSecret.tool.inputSchema);
-    const fields = { item_handle: 'login-1', submit: { ref: 'e3', generation: 1 } };
+    const handle = { item_handle: 'login-1' };
+    const submit = { submit: { ref: 'e3', generation: 1 } };
     for (const chosen of [
       { username: target },
-      { password: target },
-      { username: target, password: { ref: 'e2', generation: 1 } },
+      { username: target, ...submit },
+      { password: target, ...submit },
+      { username: target, password: { ref: 'e2', generation: 1 }, ...submit },
     ])
-      expect(validate({ ...fields, ...chosen })).toBe(true);
+      expect(validate({ ...handle, ...chosen })).toBe(true);
     for (const chosen of [
       {},
-      { password: 'raw-password' },
+      submit,
+      // The host submits a password in the same call it fills it.
+      { password: target },
+      { username: target, password: { ref: 'e2', generation: 1 } },
+      { password: 'raw-password', ...submit },
       { username: 'raw-username' },
-      { otp: target },
-      { field: 'password', target },
+      { otp: target, ...submit },
+      { field: 'password', target, ...submit },
     ])
-      expect(validate({ ...fields, ...chosen })).toBe(false);
+      expect(validate({ ...handle, ...chosen })).toBe(false);
     // A code the principal sends reaches the browser in main's message: sign_in_code serves the assistant's own mail.
     const signIn = new Ajv().compile(signInCode.tool.inputSchema);
-    const refs = { target, send: { ref: 'e2', generation: 1 } };
-    expect(signIn(refs)).toBe(true);
-    expect(signIn({ ...refs, from: 'principal' })).toBe(false);
+    const code = { code_field: target, submit: { ref: 'e2', generation: 1 } };
+    for (const fields of [{ email_field: target }, code, {}]) expect(signIn(fields)).toBe(true);
+    for (const fields of [
+      { email_field: target, ...code },
+      { code_field: target },
+      { submit: target },
+      { target, send: { ref: 'e2', generation: 1 } },
+      { email_field: target, from: 'principal' },
+    ])
+      expect(signIn(fields)).toBe(false);
     expect(signInCode.tool.description).not.toMatch(/principal|awaiting_code/u);
   });
 

@@ -381,7 +381,7 @@ describe('the credential activation scope', () => {
     expect(classifyControlFacts(control('Change password'))).toBe('account_security');
   });
 
-  it('refuses financial, unrelated security, speaking, ambiguous and off-site activation even when authorized', () => {
+  it('refuses financial, unrelated security, speaking, link and off-site activation even when authorized', () => {
     const refusals: Array<[ControlFacts, string]> = [
       [control('Start free trial'), 'purchase_control'],
       [control('Subscribe'), 'purchase_control'],
@@ -391,7 +391,6 @@ describe('the credential activation scope', () => {
       [control('Manage two-factor'), 'account_security'],
       [control('Delete account'), 'account_security'],
       [control('Post review'), 'speaks_as_principal'],
-      [control('Do it'), 'unsupported_control'],
       [control('Create account', { visibleLabel: 'Buy now' }), 'purchase_control'],
       [control('Create account', { formAction: 'https://collector.example/signup' }), 'unsupported_control'],
       [control('Create account', { formAction: 'http://accounts.shop.example/signup' }), 'blocked_address'],
@@ -404,58 +403,12 @@ describe('the credential activation scope', () => {
       ).toBe(reason);
   });
 
-  it('takes a signup form’s own agree-and-create control as its activation, and refuses those words in every other credential scope', () => {
-    const agreeing = [
-      'Agree and create account',
-      'Accept and sign up',
-      'Agree & continue',
-      'I agree and continue',
-      'Agree & Join',
-    ];
-    for (const name of agreeing) {
-      expect(classifyCredentialControlFacts(control(name), 'signup', 'shop.example', { formControl: true })).toBe(
-        'ordinary',
-      );
-      expect(classifyCredentialControlFacts(control(name), 'signup', 'shop.example')).toBe('unsupported_control');
-      expect(
-        classifyCredentialControlFacts(
-          control(name, { formAction: 'https://www.shop.example/account/change-password' }),
-          'rotation',
-          'shop.example',
-          { formControl: true },
-        ),
-      ).toBe('unsupported_control');
-      // Outside every credential scope the open rule decides: these words name no commit.
-      expect(classifyControlFacts(control(name))).toBe('ordinary');
-    }
-    const inForm = { formControl: true } as const;
-    expect(
-      classifyCredentialControlFacts(
-        control('Agree and create account', { moneyTerms: true }),
-        'signup',
-        'shop.example',
-        inForm,
-      ),
-    ).toBe('unsupported_control');
-    expect(classifyCredentialControlFacts(control('Agree and subscribe'), 'signup', 'shop.example', inForm)).toBe(
-      'purchase_control',
-    );
-    expect(
-      classifyCredentialControlFacts(control('Agree and start free trial'), 'signup', 'shop.example', inForm),
-    ).toBe('purchase_control');
-    expect(classifyCredentialControlFacts(control('Agree and pay'), 'signup', 'shop.example', inForm)).toBe(
-      'purchase_control',
-    );
-  });
-
-  it('activates a signup’s verification code only through a verification control', () => {
-    const verification = { step: 'verification' } as const;
-    for (const name of ['Verify', 'Verify email', 'Confirm', 'Submit code', 'Continue', 'Activate account'])
-      expect(classifyCredentialControlFacts(control(name), 'signup', 'shop.example', verification)).toBe('ordinary');
-    for (const name of ['Create account', 'Resend code', 'Change email', 'Subscribe'])
-      expect(classifyCredentialControlFacts(control(name), 'signup', 'shop.example', verification)).not.toBe(
-        'ordinary',
-      );
+  it('takes any control name a signup or its verification uses, refusing only commit and security wording', () => {
+    for (const name of ['Go', 'Agree and create account', 'Verify', 'Continue', 'Do it'])
+      expect(classifyCredentialControlFacts(control(name), 'signup', 'shop.example')).toBe('ordinary');
+    for (const name of ['Agree and subscribe', 'Agree and start free trial', 'Agree and pay'])
+      expect(classifyCredentialControlFacts(control(name), 'signup', 'shop.example')).toBe('purchase_control');
+    expect(classifyCredentialControlFacts(control('Change email'), 'signup', 'shop.example')).toBe('account_security');
   });
 
   it('lets a change navigate only to its own site’s password routes, never to other security or financial routes', () => {

@@ -10,7 +10,6 @@ import {
   readVaultSiteInfo,
   bindBrowserSecretFields,
   BrowserOriginMismatchError,
-  discoverAuthenticationCodeField,
   fillBoundBrowserSecrets,
   validateFillSecret,
 } from './fill.js';
@@ -178,6 +177,8 @@ function fixture(origin = 'https://www.shop.example') {
         type: node.type,
         autocomplete: node.getAttribute('autocomplete') ?? '',
         required: false,
+        readonly: false,
+        disabled: false,
         override: null,
         form: {
           ...form,
@@ -220,6 +221,7 @@ function fixture(origin = 'https://www.shop.example') {
     field,
     target,
     submit,
+    site: new URL(origin).hostname.split('.').slice(-2).join('.'),
     context,
     nodes,
     nativeSubmit,
@@ -236,7 +238,7 @@ function fixture(origin = 'https://www.shop.example') {
 
 it('blocks screenshots during target-bound insertion, clears same-page errors and redacts forever', async () => {
   const f = fixture();
-  const binding = await bindBrowserSecretFields(f.page, [{ field: 'password', target: f.target }], f.submit);
+  const binding = await bindBrowserSecretFields(f.page, [{ field: 'password', target: f.target }], f.submit, f.site);
   const original = f.nativeFill.getMockImplementation()!;
   f.nativeFill.mockImplementation(async (value) => {
     expect(await pageHasSecret(f.page)).toBe(true);
@@ -254,7 +256,7 @@ it('returns submitted after navigation and rechecks complete frame origin before
   f.nativeSubmit.mockImplementation(async () => {
     f.navigate();
   });
-  const binding = await bindBrowserSecretFields(f.page, [{ field: 'password', target: f.target }], f.submit);
+  const binding = await bindBrowserSecretFields(f.page, [{ field: 'password', target: f.target }], f.submit, f.site);
   expect(await fillBoundBrowserSecrets(f.context, binding, async () => [SECRET])).toEqual({ status: 'submitted' });
   const resolve = vi.fn(async () => [SECRET]);
   f.setUrl('https://www.shop.example:8443/login');
@@ -273,15 +275,20 @@ it('returns submitted after navigation and rechecks complete frame origin before
 it('judges iframe origins and refuses HTTP and card targets before any resolver runs', async () => {
   const insecure = fixture('http://shop.example');
   await expect(
-    bindBrowserSecretFields(insecure.page, [{ field: 'password', target: insecure.target }], insecure.submit),
+    bindBrowserSecretFields(
+      insecure.page,
+      [{ field: 'password', target: insecure.target }],
+      insecure.submit,
+      insecure.site,
+    ),
   ).rejects.toBeInstanceOf(BrowserOriginMismatchError);
   const f = fixture('https://identity.example');
   f.page.url = () => 'https://shop.example/login';
-  const binding = await bindBrowserSecretFields(f.page, [{ field: 'password', target: f.target }], f.submit);
+  const binding = await bindBrowserSecretFields(f.page, [{ field: 'password', target: f.target }], f.submit, f.site);
   expect(binding.origin).toBe('https://identity.example');
   f.field.getAttribute = (name) => (name === 'autocomplete' ? 'cc-number' : null);
   await expect(
-    bindBrowserSecretFields(f.page, [{ field: 'password', target: f.target }], f.submit),
+    bindBrowserSecretFields(f.page, [{ field: 'password', target: f.target }], f.submit, f.site),
   ).rejects.toMatchObject({
     code: 'forbidden',
   });
@@ -297,7 +304,7 @@ it('refuses a held iframe site before resolving any secret after its central lea
   await credentialAttempts.disclose(result.attempt.id, { jobId: 'another-job', origin: 'https://identity.example' });
   const f = fixture('https://identity.example');
   f.page.url = () => 'https://shop.example/login';
-  const binding = await bindBrowserSecretFields(f.page, [{ field: 'password', target: f.target }], f.submit);
+  const binding = await bindBrowserSecretFields(f.page, [{ field: 'password', target: f.target }], f.submit, f.site);
   const resolve = vi.fn(async () => [SECRET]);
   const reads = storeFixture.keyReads();
   expect(await fillBoundBrowserSecrets(f.context, binding, resolve)).toEqual({ status: 'site_busy' });
@@ -308,7 +315,7 @@ it('refuses a held iframe site before resolving any secret after its central lea
 
 it('detects a changed target value and clears every field holding the value, including copied values', async () => {
   const f = fixture();
-  const binding = await bindBrowserSecretFields(f.page, [{ field: 'password', target: f.target }], f.submit);
+  const binding = await bindBrowserSecretFields(f.page, [{ field: 'password', target: f.target }], f.submit, f.site);
   const other = { ...f.field, value: '' };
   f.nodes.push(other);
   f.nativeFill.mockImplementation(async (value) => {
@@ -323,7 +330,7 @@ it('detects a changed target value and clears every field holding the value, inc
 
 it('closes the job when a filled value cannot be cleared, and keeps refusing agent presses until it closes', async () => {
   const f = fixture();
-  const binding = await bindBrowserSecretFields(f.page, [{ field: 'password', target: f.target }], f.submit);
+  const binding = await bindBrowserSecretFields(f.page, [{ field: 'password', target: f.target }], f.submit, f.site);
   // A page copy of the value whose setter ignores clearing.
   let held = '';
   const stuck = {
@@ -349,7 +356,7 @@ it('closes the job when a filled value cannot be cleared, and keeps refusing age
 
 it('sanitizes browser and resolver failures and accepts no raw values or references', async () => {
   const f = fixture();
-  const binding = await bindBrowserSecretFields(f.page, [{ field: 'password', target: f.target }], f.submit);
+  const binding = await bindBrowserSecretFields(f.page, [{ field: 'password', target: f.target }], f.submit, f.site);
   const error = await fillBoundBrowserSecrets(f.context, binding, async () => {
     throw new Error(SECRET);
   }).catch((value: unknown) => value);
@@ -381,7 +388,7 @@ it('sanitizes browser and resolver failures and accepts no raw values or referen
 
 it('returns a vault refusal as its own bounded outcome before anything reaches the page', async () => {
   const f = fixture();
-  const binding = await bindBrowserSecretFields(f.page, [{ field: 'password', target: f.target }], f.submit);
+  const binding = await bindBrowserSecretFields(f.page, [{ field: 'password', target: f.target }], f.submit, f.site);
   for (const reason of ['vault_unavailable', 'no_item_for_site', 'origin_mismatch'] as const)
     expect(
       await fillBoundBrowserSecrets(f.context, binding, async () => {
@@ -392,43 +399,28 @@ it('returns a vault refusal as its own bounded outcome before anything reaches t
   expect(f.nativeSubmit).not.toHaveBeenCalled();
 });
 
-it('discovers a native OTP transition after old handles detach, while retaining the exact frame origin', async () => {
-  const previous = fixture();
-  const binding = await bindBrowserSecretFields(
-    previous.page,
-    [{ field: 'password', target: previous.target }],
-    previous.submit,
-  );
-  const next = fixture();
-  next.field.getAttribute = (name) =>
-    ({ autocomplete: 'one-time-code', type: 'text', name: 'code' })[name as 'autocomplete' | 'type' | 'name'] ?? null;
-  Object.assign(previous.target.element, { ownerFrame: async () => null });
-  Object.assign(next.target.element, {
-    ownerFrame: async () => previous.frame,
-    evaluateHandle: async () => ({ asElement: () => next.submit.element, dispose: async () => undefined }),
-  });
-  Object.assign(next.submit.element, { ownerFrame: async () => previous.frame });
-  Object.assign(previous.frame, {
-    locator: () => ({ count: async () => 1, elementHandle: async () => next.target.element }),
-  });
-  const discovered = await discoverAuthenticationCodeField(previous.page, binding);
-  expect(discovered?.fields[0].field).toBe('otp');
-  expect(discovered?.fields[0].target.element).toBe(next.target.element);
-  expect(discovered?.origin).toBe('https://www.shop.example');
-  previous.setUrl('https://www.shop.example:8443/verify');
-  expect(await discoverAuthenticationCodeField(previous.page, binding)).toBeUndefined();
-});
-
 it('refuses secret resolution while Playwright protocol debugging could disclose native keyboard values', async () => {
   const f = fixture();
-  const binding = await bindBrowserSecretFields(f.page, [{ field: 'password', target: f.target }], f.submit);
+  const binding = await bindBrowserSecretFields(f.page, [{ field: 'password', target: f.target }], f.submit, f.site);
   const resolve = vi.fn(async () => [SECRET]);
   vi.stubEnv('DEBUG', 'pw:protocol');
   await expect(fillBoundBrowserSecrets(f.context, binding, resolve)).rejects.toMatchObject({ code: 'forbidden' });
   expect(resolve).not.toHaveBeenCalled();
 });
 
-it('rejects stored OTP fill while preserving email-code field classification', () => {
+it('lets a username fill leave its submission to the agent, but never a password fill', () => {
+  const field = { ref: 'e1', generation: 1 };
+  expect(validateFillSecret({ item_handle: 'vault_opaque', username: field })).toEqual({
+    item_handle: 'vault_opaque',
+    username: field,
+  });
+  expect(() => validateFillSecret({ item_handle: 'vault_opaque', password: field })).toThrow(
+    'Choose the control that submits the password field.',
+  );
+  expect(() => validateFillSecret({ item_handle: 'vault_opaque', username: field, password: field })).toThrow();
+});
+
+it('rejects a stored code fill', () => {
   expect(() =>
     validateFillSecret({
       item_handle: 'vault_opaque',
@@ -517,7 +509,7 @@ it('leases the iframe login site before resolving its secret so another errand w
   try {
     const f = fixture('https://identity.example');
     f.page.url = () => 'https://shop.example/login';
-    const binding = await bindBrowserSecretFields(f.page, [{ field: 'password', target: f.target }], f.submit);
+    const binding = await bindBrowserSecretFields(f.page, [{ field: 'password', target: f.target }], f.submit, f.site);
     const prepared = await credentialAttempts.prepareSignup({
       jobId: 'another-job',
       origin: binding.origin,
