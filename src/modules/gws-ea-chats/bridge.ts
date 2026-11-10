@@ -283,6 +283,7 @@ export async function flushChatHandoffs(chatId: string, options: { readonly wake
     if (written && options.wake !== false) await requestWake(session, 'inbound-message');
   }
 }
+
 export async function bookableCalendar(value: unknown): Promise<string> {
   const requested = textOf(value, 'calendar', 254);
   const entry = await createMeetingsCalendarApi({

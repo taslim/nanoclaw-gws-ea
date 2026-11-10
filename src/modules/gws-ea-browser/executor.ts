@@ -235,7 +235,7 @@ async function fieldInput(
   });
 }
 
-/** The press as the answer carries it: its status is the batch's reason. */
+/** The batch's reason already says the press's status. */
 function pressFacts({ status: _status, ...facts }: FreePressAnswer): FreePressFacts {
   return facts;
 }

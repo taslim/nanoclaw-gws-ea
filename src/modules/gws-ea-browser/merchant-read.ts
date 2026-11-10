@@ -68,7 +68,7 @@ export interface FreeCheckout {
  * Whether a reviewed reservation is free by the test any site's booking takes: its reviewed facts state no money and
  * no terms, and nothing on the page offers or holds a way to pay. An unreadable page is not.
  */
-export async function freeReservation(page: Page, facts: PurchaseFacts, element: ElementHandle): Promise<boolean> {
+async function freeReservation(page: Page, facts: PurchaseFacts, element: ElementHandle): Promise<boolean> {
   if (!isFreeReservation(facts)) return false;
   try {
     return !offersPayment(await readCheckoutRegion(page, element));

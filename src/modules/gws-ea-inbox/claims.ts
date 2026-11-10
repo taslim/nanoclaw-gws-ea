@@ -51,8 +51,8 @@ export async function createSignInClaim(input: {
       await getDb().run('UPDATE gws_ea_browser_sign_in_claims SET state = ? WHERE id = ?', 'finished', claim.id);
     }
     await getDb().run(
-      `INSERT INTO gws_ea_browser_sign_in_claims(id,job_id,source,origin,domain,binding_json,since_at,expires_at,state)
-       VALUES(?,?,'assistant',?,?,?,?,?,?)`,
+      `INSERT INTO gws_ea_browser_sign_in_claims(id,job_id,origin,domain,binding_json,since_at,expires_at,state)
+       VALUES(?,?,?,?,?,?,?,?)`,
       input.id,
       input.jobId,
       origin.origin,

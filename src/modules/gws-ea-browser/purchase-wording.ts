@@ -143,8 +143,8 @@ export async function purchaseCommitNotice(
   return told(`${none} (${status}). Handle it as the purchase tool describes.`);
 }
 
-export function purchaseInvariantMessage(kind: 'checkout', unknown: never): string {
-  return `Unknown ${kind} read ${JSON.stringify(unknown)}`;
+export function purchaseInvariantMessage(unknown: never): string {
+  return `Unknown checkout read ${JSON.stringify(unknown)}`;
 }
 
 /** to: principal */

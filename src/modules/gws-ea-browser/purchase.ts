@@ -594,9 +594,23 @@ function unreadyCommit(read: Exclude<MerchantCheckoutRead, { status: 'ready' }>)
       return { status: read.status, repeat_safe: false };
     default: {
       const unknown: never = read;
-      throw new Error(purchaseInvariantMessage('checkout', unknown));
+      throw new Error(purchaseInvariantMessage(unknown));
     }
   }
+}
+
+/** One press of `target`, listening for the merchant's result from before it presses. */
+function pressListening(
+  context: BrowserExecutionContext,
+  page: Page,
+  signature: MerchantSignature,
+  target: ElementHandle,
+): () => Promise<void> {
+  return async () => {
+    const arrived = signature.waitForResult(page, Math.min(10_000, context.remaining())).catch(() => undefined);
+    await target.click({ timeout: Math.min(10_000, context.remaining()) });
+    await arrived;
+  };
 }
 
 /** The optional claim joins the same DB-only commit transaction. */
@@ -632,12 +646,7 @@ export async function executeAuthorizedPurchase(
       await activateControl(
         page,
         target,
-        async () => {
-          // Listening starts before the sole authorized press.
-          const arrived = signature.waitForResult(page, Math.min(10_000, context.remaining())).catch(() => undefined);
-          await target.click({ timeout: Math.min(10_000, context.remaining()) });
-          await arrived;
-        },
+        pressListening(context, page, signature, target),
         { commitStarted, ...(facts.generic ? { checkout: { origin: facts.origin } } : {}) },
         {
           kind: 'click',
@@ -792,24 +801,13 @@ async function pressFree(
   const before = await readConfirmations(page);
   let press: FreePressAnswer;
   try {
-    press = await pressFreeCheckout(
-      page,
-      element,
-      async () => {
-        // Listening starts before the press.
-        const arrived = signature.waitForResult(page, Math.min(10_000, context.remaining())).catch(() => undefined);
-        await element.click({ timeout: Math.min(10_000, context.remaining()) });
-        await arrived;
-      },
-      checkout,
-      {
-        kind: 'click',
-        scope: { jobId: context.job.id, db: context.store.db },
-        assertActive: context.assertActive,
-        remaining: context.remaining,
-        freePress: freePressScope(context),
-      },
-    );
+    press = await pressFreeCheckout(page, element, pressListening(context, page, signature, element), checkout, {
+      kind: 'click',
+      scope: { jobId: context.job.id, db: context.store.db },
+      assertActive: context.assertActive,
+      remaining: context.remaining,
+      freePress: freePressScope(context),
+    });
   } catch (error) {
     if (error instanceof BrowserConsentStop)
       return {
@@ -885,7 +883,7 @@ export async function executeBrowserPurchase(
             return { status: read.status, repeat_safe: true };
           default: {
             const unknown: never = read;
-            throw new Error(purchaseInvariantMessage('checkout', unknown));
+            throw new Error(purchaseInvariantMessage(unknown));
           }
         }
         // The merchant keeps its lease through a payment platform's own page.

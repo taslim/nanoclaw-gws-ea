@@ -1,5 +1,4 @@
 import type { ElementHandle, Frame, Page } from 'playwright-core';
-import { randomUUID } from 'node:crypto';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { ActionRefusal, forbidden, invalidArgs } from '../../cli/delivery-action.js';
 import {
@@ -9,7 +8,13 @@ import {
   httpsOrigin,
   type BrowserSecretField,
 } from './authentication-signatures.js';
-import { classifyActivation, ensureBrowserNavigationGuard, withBrowserJobNavigation } from './commit-classifier.js';
+import {
+  carriesSecret,
+  classifyActivation,
+  ensureBrowserNavigationGuard,
+  holdOnSite,
+  withBrowserJobNavigation,
+} from './commit-classifier.js';
 import { classifyNavigationUrl } from './control-policy.js';
 import { BrowserConsentStop, consentStopsForAgent, runConsentPass } from './consent.js';
 import {
@@ -90,7 +95,7 @@ const fits = (field: BrowserSecretField, facts: NativeCredentialFacts): boolean 
     : credentialFieldFits(field === 'username' ? 'username' : 'current_password', facts, 'rotation');
 
 /** Why a saved login stays off this page, in words the agent can pass on. */
-export function siteMismatchReason(loginSite: string, pageSite: string | undefined): string {
+function siteMismatchReason(loginSite: string, pageSite: string | undefined): string {
   return `This saved login is for ${loginSite}, but this sign-in page is on ${pageSite ?? 'no public HTTPS site'}. The host fills a login only on its own site.`;
 }
 
@@ -251,14 +256,6 @@ async function activateBoundBrowserSignIn(
   }
 }
 
-const carriesValue = (url: URL, values: readonly string[]): boolean =>
-  values.some(
-    (value) =>
-      url.href.includes(value) ||
-      url.href.includes(encodeURIComponent(value)) ||
-      [...url.searchParams.values()].some((part) => part.includes(value)),
-  );
-
 /**
  * Resolve only after the destination, current controls, consent and site lease are checked. A password or code
  * is filled, submitted and cleared in this one call; while it is on the page, no document request may carry it in
@@ -330,19 +327,13 @@ export async function fillBoundBrowserSecrets(
     }
     const secrets = values.filter((_value, index) => fields[index].field !== 'username');
     // From the first input callback until the values are cleared, page script cannot send them to another site.
-    const hold = `fill:${randomUUID()}`;
-    guard.holdSubmissions(hold, {
-      site: binding.site,
-      values: secrets,
-      departed: () => {
-        departed = true;
-      },
+    releaseHold = holdOnSite(guard, binding.site, secrets, () => {
+      departed = true;
     });
-    releaseHold = () => guard.allowSubmissions(hold);
     await guard.runWithPolicy(
       {
         classify(url) {
-          if (!httpsOrigin(url.href) || carriesValue(url, secrets)) {
+          if (!httpsOrigin(url.href) || carriesSecret(url, secrets)) {
             departed = true;
             return 'blocked_address';
           }

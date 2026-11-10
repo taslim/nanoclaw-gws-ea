@@ -33,7 +33,7 @@ import { readPageControlFacts } from './control-facts.js';
 import { bindBrowserSecretFields, executeFillSecret, fillBoundBrowserSecrets } from './fill.js';
 import './merchant-signatures.js';
 import { browserConsentMigration, browserSiteLeasesMigration } from './migration.js';
-import { browserSignInMigration } from './sign-in-migration.js';
+import { browserSignInAssistantOnlyMigration, browserSignInMigration } from './sign-in-migration.js';
 import { answerSignInReply, executeSignInCode, recoverBrowserSignInMail } from './sign-in-mail.js';
 import { createAgentGroup, initTestDb, runMigrations } from '../../db/index.js';
 import { registerMigration } from '../../db/migrations/index.js';
@@ -328,6 +328,7 @@ describe.skipIf(!chromePath)('native host secret fill', { timeout: 30_000 }, () 
     vi.stubEnv('GWS_EA_BROWSER_ROOT', join(root, 'browser'));
     await browserSiteLeasesMigration.up(await initSqliteTestDb());
     await browserSignInMigration.up(getDb());
+    await browserSignInAssistantOnlyMigration.up(getDb());
     await getDb().exec(
       "CREATE TABLE gws_ea_browser_jobs(id TEXT PRIMARY KEY); INSERT INTO gws_ea_browser_jobs VALUES('native-fill-job')",
     );

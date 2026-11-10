@@ -40,6 +40,7 @@ const input = {
 beforeEach(async () => {
   await runMigrations(await initTestDb());
   await browserSignInMigration.up(getDb());
+  await browserSignInAssistantOnlyMigration.up(getDb());
 });
 afterEach(async () => {
   await closeDb();
@@ -62,13 +63,20 @@ it('ignores mail before the claim and from foreign domains', async () => {
   expect(await claimSignInMail(mail('foreign', 1, 'evil.example'), at)).toBeUndefined();
 });
 it("keeps the assistant's claims and drops principal ones when principal relays retire", async () => {
-  await createSignInClaim(input);
-  await getDb().run(
-    `INSERT INTO gws_ea_browser_sign_in_claims(id,job_id,source,origin,domain,binding_json,since_at,expires_at,state)
-     VALUES('relay','job','principal','https://www.shop.example','shop.example','{}',?,?,'waiting')`,
-    at.toISOString(),
-    new Date(at.getTime() + 180_000).toISOString(),
-  );
+  await getDb().exec('DROP TABLE gws_ea_browser_sign_in_claims');
+  await browserSignInMigration.up(getDb());
+  for (const [id, source] of [
+    ['claim', 'assistant'],
+    ['relay', 'principal'],
+  ])
+    await getDb().run(
+      `INSERT INTO gws_ea_browser_sign_in_claims(id,job_id,source,origin,domain,binding_json,since_at,expires_at,state)
+       VALUES(?,'job',?,'https://www.shop.example','shop.example','{}',?,?,'waiting')`,
+      id,
+      source,
+      at.toISOString(),
+      new Date(at.getTime() + 180_000).toISOString(),
+    );
   await browserSignInAssistantOnlyMigration.up(getDb());
   expect(await getSignInClaim('claim')).toMatchObject({ state: 'waiting', domain: 'shop.example' });
   expect(await getSignInClaim('relay')).toBeUndefined();
@@ -79,7 +87,7 @@ it("keeps the assistant's claims and drops principal ones when principal relays 
       at.toISOString(),
       at.toISOString(),
     ),
-  ).rejects.toThrow(/CHECK/u);
+  ).rejects.toThrow(/source/u);
   await createSignInClaim({ ...input, id: 'after' });
   expect(await claimSignInMail(mail('after'), at)).toMatchObject({ id: 'after' });
 });

@@ -34,7 +34,7 @@ export interface BrowserSnapshotObservation extends BrowserObservationBase {
   delta?: never;
 }
 /** Lines added and removed since the agent's last whole-page snapshot; refs on unchanged lines stay current. */
-export interface BrowserDeltaObservation extends BrowserObservationBase {
+interface BrowserDeltaObservation extends BrowserObservationBase {
   delta: { removed: string[]; added: string[] };
   snapshot?: never;
 }
@@ -411,7 +411,7 @@ async function optionalSiteInfo(
 interface PageRead {
   readonly observation: BrowserObservationBase;
   readonly snapshot: string;
-  /** Against the agent's last whole-page snapshot of the same address. */
+  /** Against the agent's last whole-page snapshot of the same address, when the caller asked for changes. */
   readonly delta?: { removed: string[]; added: string[] };
 }
 
@@ -419,6 +419,7 @@ async function readPage(
   page: Page,
   assertActive: (() => Promise<void>) | undefined,
   options: ObservePageOptions,
+  changes: boolean,
 ): Promise<PageRead> {
   const state = stateFor(page);
   if (options.within && !(await refsCurrent(page, [options.within]))) throw new BrowserRefError('stale_ref');
@@ -434,7 +435,7 @@ async function readPage(
     snapshot = compactSnapshot([part], presentNodes([part]));
   } else {
     snapshot = compactSnapshot(roots, state.text);
-    if (state.url === url && state.presented) {
+    if (changes && state.url === url && state.presented) {
       const previous = new Set(state.presented.split('\n'));
       const current = new Set(snapshot.split('\n'));
       delta = {
@@ -507,7 +508,7 @@ export async function observePage(
   assertActive?: () => Promise<void>,
   options: ObservePageOptions = {},
 ): Promise<BrowserSnapshotObservation> {
-  const { observation, snapshot } = await readPage(page, assertActive, options);
+  const { observation, snapshot } = await readPage(page, assertActive, options, false);
   const { generation, url, ...rest } = observation;
   return { generation, url, snapshot, ...rest };
 }
@@ -518,7 +519,7 @@ export async function observePageChanges(
   assertActive?: () => Promise<void>,
   options: Omit<ObservePageOptions, 'within'> = {},
 ): Promise<BrowserObservation> {
-  const { observation, snapshot, delta } = await readPage(page, assertActive, options);
+  const { observation, snapshot, delta } = await readPage(page, assertActive, options, true);
   const { generation, url, ...rest } = observation;
   return delta && JSON.stringify(delta).length * 2 < snapshot.length
     ? { generation, url, delta, ...rest }

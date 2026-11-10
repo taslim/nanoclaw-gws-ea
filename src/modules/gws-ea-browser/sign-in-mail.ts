@@ -136,7 +136,7 @@ async function openMailWait(input: {
   mailWaits.set(claim.id, wait);
 }
 
-export type MailWaitReply =
+type MailWaitReply =
   | { readonly status: 'arrived'; readonly reply: SignInCredential; readonly claim: SignInClaim }
   | { readonly status: 'unavailable' }
   | { readonly status: 'nothing_arrived' }
@@ -208,8 +208,6 @@ export async function openSignupVerification(input: {
   return true;
 }
 
-export type SignupVerificationReply = MailWaitReply;
-
 /**
  * The verification email's answer for this job's signup, waiting at most `waitMs` and the claim's life for it.
  * `not_watched` also means the account's mail does not reach the assistant's inbox, so nothing can arrive.
@@ -218,7 +216,7 @@ export function takeSignupVerification(
   context: Pick<BrowserExecutionContext, 'job' | 'signal' | 'remaining'>,
   attemptId: string,
   waitMs = context.remaining(),
-): Promise<SignupVerificationReply> {
+): Promise<MailWaitReply> {
   return takeMailWait(context, attemptId, waitMs);
 }
 

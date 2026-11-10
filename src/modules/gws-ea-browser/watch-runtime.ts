@@ -17,6 +17,7 @@ import { credentialSiteHeldByOther, browserSite, SiteLeaseStore, type SiteLease 
 import { merchantSignatureFor } from './merchant-read.js';
 import type { ReservationAvailability, ReservationPolicy } from './merchant-contract.js';
 import { browserAvailability } from './availability.js';
+import { registrableDomain } from './login-store.js';
 
 import type { BrowserQueue } from './queue.js';
 import type {
@@ -159,11 +160,7 @@ function loadWatchAddress(
 /** The page's own address, query and fragment included, when it is on the watch's site and nothing in it is secret. */
 function watchAddress(page: Page, site: string): string | undefined {
   const address = browserPageReplayUrl(page);
-  try {
-    return address && new URL(address).protocol === 'https:' && browserSite(address) === site ? address : undefined;
-  } catch {
-    return undefined;
-  }
+  return address && registrableDomain(address) === site ? address : undefined;
 }
 
 /**
@@ -179,11 +176,7 @@ async function readAtAddress<T>(
 ): Promise<{ status: 'read'; value: T | undefined } | WatchAddressRefusal> {
   const siteAccess: BrowserSiteAccess = async (url) => {
     await context.assertActive();
-    try {
-      if (url.protocol !== 'https:' || browserSite(url.href) !== site) return 'blocked_address';
-    } catch {
-      return 'blocked_address';
-    }
+    if (registrableDomain(url.href) !== site) return 'blocked_address';
     if (await credentialSiteHeldByOther(context.job.id, site)) return 'site_busy';
     // The job takes the site as its own navigation would, and gives it up with its other sites.
     const lease = await new SiteLeaseStore(context.store.db).acquire(context.job.id, url.href);
@@ -234,31 +227,31 @@ export async function markWatchRegion(
     if (error instanceof BrowserRefError) return { status: 'refused', reason: 'stale_ref' };
     throw error;
   }
-  let region: StructuredBrowserLocator | undefined;
-  let seen: string | undefined;
+  let marked: { readonly region: StructuredBrowserLocator; readonly seen: string } | undefined;
   try {
     const target = pinned.get(ref.ref);
-    region = target ? await captureWatchRegion(page, target) : undefined;
-    seen = region ? await readWatchRegion(page, region) : undefined;
+    const region = target ? await captureWatchRegion(page, target) : undefined;
+    const seen = region ? await readWatchRegion(page, region) : undefined;
     await context.assertActive();
+    if (region && seen) marked = { region, seen };
   } finally {
     await disposeBrowserRefs(pinned);
   }
-  if (!region || !seen) return { status: 'refused', reason: 'region_unmarkable' };
+  if (!marked) return { status: 'refused', reason: 'region_unmarkable' };
+  const { region, seen } = marked;
   if (seen.length > WATCH_REGION_TEXT_LIMIT) return { status: 'refused', reason: 'region_too_large' };
   const address = watchAddress(page, site);
   if (!address) return { status: 'refused', reason: 'not_at_address' };
-  const marked = region;
   // A check finds the region on the page the address lands on, so that page, not the agent's, is where it is.
   const read = await readAtAddress(context, site, address, async (signedOut) => {
-    const text = await readWatchRegion(signedOut, marked, false);
+    const text = await readWatchRegion(signedOut, region, false);
     return text === undefined ? undefined : { text, landed: checkpointUrl(signedOut.url()) };
   });
   if (read.status === 'refused') return read;
   if (read.value?.text !== seen) return { status: 'refused', reason: 'not_at_address' };
   return {
     status: 'marked',
-    region: { ...marked, frameUrls: [read.value.landed, ...marked.frameUrls.slice(1)] },
+    region: { ...region, frameUrls: [read.value.landed, ...region.frameUrls.slice(1)] },
     text: read.value.text,
     address,
   };
@@ -408,11 +401,7 @@ export async function runBrowserWatchCheck(
       };
       const siteAccess = async (url: URL): Promise<'ordinary' | 'site_busy' | 'blocked_address'> => {
         await assertActive();
-        try {
-          if (url.protocol !== 'https:' || browserSite(url.href) !== input.site) return 'blocked_address';
-        } catch {
-          return 'blocked_address';
-        }
+        if (registrableDomain(url.href) !== input.site) return 'blocked_address';
         if (await credentialSiteHeldByOther(input.jobId, input.site)) return 'site_busy';
         const lease = await db.get<SiteLease>('SELECT * FROM gws_ea_browser_site_leases WHERE site = ?', input.site);
         if (lease) {

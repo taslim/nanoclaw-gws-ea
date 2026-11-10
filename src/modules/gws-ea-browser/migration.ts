@@ -490,9 +490,9 @@ export const browserConsentOutcomesMigration: PortableMigration & { name: Module
 };
 
 /**
- * Watches check by the page address they were armed on, so neither a watch nor its checks name a recipe. Earlier
- * watches are not carried: their checks replayed recipes this release no longer runs. A reader watch's booking recipe
- * stays, keyed by site, with the inputs it takes. Authorities that named an earlier watch keep their own record.
+ * Watches check by the address they were armed on, so no watch or check names a recipe; earlier watches are dropped.
+ * A reader watch's booking recipe stays, keyed by site, with the inputs it takes. Authorities that named an earlier
+ * watch keep their own record.
  */
 export const browserWatchAddressMigration: PortableMigration & { name: ModuleMigrationName } = {
   version: 1,

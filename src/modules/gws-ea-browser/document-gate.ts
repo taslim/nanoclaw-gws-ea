@@ -242,12 +242,19 @@ async function openDocumentGate(browser: Browser): Promise<DocumentGate> {
         if (serviceWorkerScript(event.request.headers)) return { allow: false };
         // Workers cannot own secret-bearing traffic, and a new frame or popup must not outrun a page-target
         // session. Decide HTTP requests here, on the browser session, using the hold captured at request time.
+        const holds = [...captured.values()].flatMap((policy) => (policy.hold ? [policy.hold] : []));
+        if (!holds.length) return { allow: true };
+        // Only a hold that reads a request to another site needs its body, so it is decoded once, on first read.
+        let body: { readonly value: string | undefined } | undefined;
         const request: HeldRequest = {
           method: event.request.method,
           url: event.request.url,
-          body: requestBody(event.request),
+          get body() {
+            body ??= { value: requestBody(event.request) };
+            return body.value;
+          },
         };
-        if (![...captured.values()].some((policy) => policy.hold?.refuses(request))) return { allow: true };
+        if (!holds.some((hold) => hold.refuses(request))) return { allow: true };
         const owner = await ownerOf(event.frameId);
         if (owner === 'unguarded') return { allow: true };
         if ('refuse' in owner) return { allow: false };

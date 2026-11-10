@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { captureBrowserDiagnosticRefusal } from './diagnostics.js';
 import type { CDPSession, ElementHandle, Frame, Page, Request } from 'playwright-core';
 import { getDomain } from 'tldts';
@@ -98,6 +99,16 @@ export interface ApprovedPress {
 }
 const approvedPresses = new WeakMap<Page, ApprovedPress>();
 
+/** The page's documents take `admission`'s reading only while `run` presses. */
+async function withApprovedPress<T>(page: Page, admission: ApprovedPress, run: () => Promise<T>): Promise<T> {
+  approvedPresses.set(page, admission);
+  try {
+    return await run();
+  } finally {
+    approvedPresses.delete(page);
+  }
+}
+
 export interface PurchaseAuthorityPress {
   /** Runs immediately before the press: the last re-read and the commit marker. */
   commitStarted(): Promise<void>;
@@ -163,6 +174,8 @@ export interface ActivationResult {
   /** The commit-class press was a free checkout's, or a repeat of the one this job already pressed. */
   readonly freePress?: FreePressAnswer;
 }
+
+const DEFAULT_ACTION_BUDGET_MS = 10_000;
 
 /** The job a free checkout's press belongs to, and what the press spends. */
 export interface FreePressScope {
@@ -280,14 +293,11 @@ export async function pressFreeCheckout(
   freePresses.set(scope.jobId, { site: checkout.site, facts, at, page: new WeakRef(page) });
   // An earlier dialog's admission never outlives a new press.
   freeDialogs.delete(page);
-  approvedPresses.set(page, admission);
-  try {
-    await guard.duringAction(intent.remaining?.() ?? DEFAULT_ACTION_BUDGET_MS, operation, {
+  await withApprovedPress(page, admission, () =>
+    guard.duringAction(intent.remaining?.() ?? DEFAULT_ACTION_BUDGET_MS, operation, {
       purchaseAdmission: admission,
-    });
-  } finally {
-    approvedPresses.delete(page);
-  }
+    }),
+  );
   // A press that loaded a new document opened no dialog over the checkout: later steps are ordinary.
   if (document && !page.isClosed() && (await mainDocumentLoader(page).catch(() => undefined)) === document)
     openFreeDialog(page, { admission, document, until: Date.now() + FREE_DIALOG_MS });
@@ -298,8 +308,6 @@ export async function pressFreeCheckout(
     ...(unresolved.length ? { unresolved_attempts: [...unresolved] } : {}),
   };
 }
-
-const DEFAULT_ACTION_BUDGET_MS = 10_000;
 
 /**
  * The one boundary every activation passes. A fresh classification decides it: an approved purchase's press
@@ -337,12 +345,7 @@ export async function activateControl(
     await authority.commitStarted();
     // A press after an approved one is ordinary: no free dialog's admission carries past it.
     freeDialogs.delete(page);
-    approvedPresses.set(page, approved);
-    try {
-      await operation();
-    } finally {
-      approvedPresses.delete(page);
-    }
+    await withApprovedPress(page, approved, operation);
     return { ordinaryPress: false };
   }
   const pressed = pressesControl(facts, intent.kind);
@@ -532,8 +535,9 @@ async function decideNavigation(
   return admitted;
 }
 
-function onHoldSite(hold: SubmissionSite, url: string): boolean {
-  return URL.canParse(url) && new URL(url).protocol === 'https:' && registrableSite(url) === hold.site;
+/** The site a held value may go to by this address: its registrable domain over HTTPS, else none. */
+function heldSiteOf(url: string): string | undefined {
+  return URL.canParse(url) && new URL(url).protocol === 'https:' ? registrableSite(url) : undefined;
 }
 
 function decoded(text: string): string {
@@ -546,35 +550,71 @@ function decoded(text: string): string {
 }
 
 /** The forms a page script commonly sends a value in: as typed, URL- or form-encoded, JSON-escaped, or base64. */
-function sentForms(value: string): string[] {
-  const base64 = Buffer.from(value, 'utf8').toString('base64');
-  return [
-    value,
-    encodeURIComponent(value),
-    new URLSearchParams({ v: value }).toString().slice(2),
-    JSON.stringify(value).slice(1, -1),
-    base64,
-    base64.replace(/=+$/u, ''),
-    Buffer.from(value, 'utf8').toString('base64url'),
-  ].map((form) => form.toLowerCase());
+function sentForms(values: readonly string[]): string[] {
+  return values.flatMap((value) => {
+    const base64 = Buffer.from(value, 'utf8').toString('base64');
+    return [
+      value,
+      encodeURIComponent(value),
+      new URLSearchParams({ v: value }).toString().slice(2),
+      JSON.stringify(value).slice(1, -1),
+      base64,
+      base64.replace(/=+$/u, ''),
+      Buffer.from(value, 'utf8').toString('base64url'),
+    ].map((form) => form.toLowerCase());
+  });
 }
 
 /** Case-insensitive, since a host name in an address is lowercased on the way out. */
-function carriesHeldValue(texts: readonly string[], values: readonly string[]): boolean {
-  const read = texts.flatMap((text) => [text.toLowerCase(), decoded(text).toLowerCase()]);
-  return values.some((value) => sentForms(value).some((form) => read.some((text) => text.includes(form))));
+function readTexts(texts: readonly string[]): string[] {
+  return texts.flatMap((text) => [text.toLowerCase(), decoded(text).toLowerCase()]);
+}
+
+function carriesForms(read: readonly string[], forms: readonly string[]): boolean {
+  return forms.some((form) => read.some((text) => text.includes(form)));
+}
+
+/** Whether an address carries any of `values`, in any form a page script commonly sends one. */
+export function carriesSecret(url: URL, values: readonly string[]): boolean {
+  return carriesForms(readTexts([url.href, ...url.searchParams.values(), url.hash]), sentForms(values));
+}
+
+/**
+ * Holds `guard`'s page to `site` from before `values` reach it until the returned release: no document but a GET
+ * leaves the site and no request carries a value to another site, whatever any other hold allows meanwhile.
+ */
+export function holdOnSite(
+  guard: BrowserNavigationGuard,
+  site: string,
+  values: readonly string[],
+  departed?: () => void,
+): () => void {
+  const authority = `on-site:${randomUUID()}`;
+  guard.holdSubmissions(authority, { site, values, ...(departed ? { departed } : {}) });
+  return () => guard.allowSubmissions(authority);
+}
+
+/** A sited hold with its values' sent forms read once, as it was placed. */
+interface PlacedHold {
+  readonly onSite: SubmissionSite;
+  readonly forms: readonly string[];
 }
 
 /** A document leaves by being sent anywhere but the site as anything but a GET. */
-function holdRefusesDocument(hold: SubmissionSite | undefined, document: HeldRequest): boolean {
-  return !hold || (document.method.toUpperCase() !== 'GET' && !onHoldSite(hold, document.url));
+function holdRefusesDocument(hold: PlacedHold | undefined, document: HeldRequest, site: string | undefined): boolean {
+  return !hold || (document.method.toUpperCase() !== 'GET' && site !== hold.onSite.site);
 }
 
 /** Any other request leaves only by carrying a filled value to another site, or a body the gate could not read. */
-function holdRefusesRequest(hold: SubmissionSite | undefined, request: HeldRequest): boolean {
+function holdRefusesRequest(
+  hold: PlacedHold | undefined,
+  request: HeldRequest,
+  site: string | undefined,
+  read: () => readonly string[],
+): boolean {
   if (!hold) return true;
-  if (onHoldSite(hold, request.url)) return false;
-  return request.body === undefined || carriesHeldValue([request.url, request.body], hold.values);
+  if (site === hold.onSite.site) return false;
+  return request.body === undefined || carriesForms(read(), hold.forms);
 }
 
 /** What page script sends, a beacon (`Ping`) included. */
@@ -639,7 +679,7 @@ function withoutReferrer(headers: Record<string, string>): Array<{ name: string;
 async function installNavigationGuard(page: Page): Promise<BrowserNavigationGuard> {
   let blocked: NavigationRefusal | undefined;
   const policies: BrowserNavigationPolicy[] = [];
-  const submissionHolds = new Map<string, SubmissionSite | undefined>();
+  const submissionHolds = new Map<string, PlacedHold | undefined>();
   // Each outermost operation, and each span between them, is its own generation. A decision is
   // reported only to the generation its request paused in; a late one is still enforced, not reported.
   let generation = 0;
@@ -680,14 +720,26 @@ async function installNavigationGuard(page: Page): Promise<BrowserNavigationGuar
       const record = (classification: NavigationRefusal): void => {
         if (pausedIn === generation) blocked = classification;
       };
-      // A hold without a site refuses everything quietly; one with a site records what tried to leave it.
-      const sitedRefusing = (refuses: (held: SubmissionSite) => boolean): SubmissionSite[] =>
-        holds.filter((held): held is SubmissionSite => held !== undefined && refuses(held));
+      // A hold without a site refuses everything quietly; one with a site records what tried to leave it. The gate
+      // asks about one request more than once, so each request's verdict is reached once.
+      const verdicts = new WeakMap<HeldRequest, { readonly refused: boolean; readonly sited: boolean }>();
+      const verdict = (request: HeldRequest): { readonly refused: boolean; readonly sited: boolean } => {
+        let known = verdicts.get(request);
+        if (!known) {
+          const site = heldSiteOf(request.url);
+          let read: readonly string[] | undefined;
+          const texts = (): readonly string[] => (read ??= readTexts([request.url, request.body ?? '']));
+          const refusing = holds.filter((held) => holdRefusesRequest(held, request, site, texts));
+          known = { refused: refusing.length > 0, sited: refusing.some((held) => held !== undefined) };
+          verdicts.set(request, known);
+        }
+        return known;
+      };
       const hold: CapturedHold | undefined = holds.length
         ? {
-            refuses: (request) => holds.some((held) => holdRefusesRequest(held, request)),
+            refuses: (request) => verdict(request).refused,
             refused(request, resource) {
-              if (!sitedRefusing((held) => holdRefusesRequest(held, request)).length) return;
+              if (!verdict(request).sited) return;
               recordRefusal('action', { url: request.url, method: request.method, resource }, 'origin_mismatch');
             },
           }
@@ -695,10 +747,12 @@ async function installNavigationGuard(page: Page): Promise<BrowserNavigationGuar
       return {
         ...(hold ? { hold } : {}),
         async decide(document) {
-          if (holds.some((held) => holdRefusesDocument(held, document))) {
-            const sited = sitedRefusing((held) => holdRefusesDocument(held, document));
+          const site = heldSiteOf(document.url);
+          const refusing = holds.filter((held) => holdRefusesDocument(held, document, site));
+          if (refusing.length) {
+            const sited = refusing.filter((held): held is PlacedHold => held !== undefined);
             if (sited.length) {
-              for (const held of sited) held.departed?.();
+              for (const held of sited) held.onSite.departed?.();
               record('blocked_address');
               recordRefusal(
                 'document',
@@ -796,7 +850,7 @@ async function installNavigationGuard(page: Page): Promise<BrowserNavigationGuar
       blocked = undefined;
     },
     holdSubmissions(authority, onSite) {
-      submissionHolds.set(authority, onSite);
+      submissionHolds.set(authority, onSite && { onSite, forms: sentForms(onSite.values) });
     },
     allowSubmissions(authority) {
       submissionHolds.delete(authority);

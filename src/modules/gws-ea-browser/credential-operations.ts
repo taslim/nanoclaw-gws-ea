@@ -5,7 +5,6 @@ import {
   type CredentialActivationClass,
 } from './control-policy.js';
 import { readPageControlFacts } from './control-facts.js';
-import { randomUUID } from 'node:crypto';
 import { setTimeout as sleep } from 'node:timers/promises';
 
 import type { ElementHandle, Frame, Page } from 'playwright-core';
@@ -47,7 +46,13 @@ import {
   finishRequestedCancellation,
   resolveBrowserJob,
 } from './cancel.js';
-import { BrowserSiteBusyError, ensureBrowserNavigationGuard, withBrowserJobNavigation } from './commit-classifier.js';
+import {
+  BrowserSiteBusyError,
+  carriesSecret,
+  ensureBrowserNavigationGuard,
+  holdOnSite,
+  withBrowserJobNavigation,
+} from './commit-classifier.js';
 import { consentStopsForAgent, runConsentPass } from './consent.js';
 import { BrowserStore, type BrowserRequest } from './db.js';
 import {
@@ -118,18 +123,6 @@ async function holdCredentialSubmissions(page: Page, authority: string): Promise
   page.once('close', () => {
     if (credentialHeldPages.get(authority) === page) credentialHeldPages.delete(authority);
   });
-}
-
-/**
- * From before a generated password or code reaches the page until it is cleared, no document but a GET leaves the
- * attempt's site and no request carries a value to another site, whatever the attempt's own hold allows meanwhile.
- * Returns the release.
- */
-async function holdOnSite(page: Page, site: string, values: readonly string[]): Promise<() => void> {
-  const guard = await ensureBrowserNavigationGuard(page);
-  const authority = `on-site:${randomUUID()}`;
-  guard.holdSubmissions(authority, { site, values });
-  return () => guard.allowSubmissions(authority);
 }
 
 /** A known outcome or informed release frees only that authority's hold, without opening a page. */
@@ -922,17 +915,6 @@ function verificationResult(before: SiteState, now: SiteState, sameDocument: boo
     : 'none';
 }
 
-/** A credential must never travel in an address: a GET submission or redirect carrying one is stopped in the browser. */
-function carriesSecret(url: URL, secrets: readonly string[]): boolean {
-  const values = [...url.searchParams.values(), url.hash];
-  return secrets.some(
-    (secret) =>
-      url.href.includes(secret) ||
-      url.href.includes(encodeURIComponent(secret)) ||
-      values.some((value) => value.includes(secret)),
-  );
-}
-
 // ---------------------------------------------------------------- one step
 
 /** Binding and lease refusals become the step's own outcome; other errors cross as constant host prose. */
@@ -1182,7 +1164,7 @@ async function disclosingStep(
   let releaseOnSite: (() => void) | undefined;
   page.on('framenavigated', navigation);
   try {
-    releaseOnSite = await holdOnSite(page, group.site, secrets);
+    releaseOnSite = holdOnSite(await ensureBrowserNavigationGuard(page), group.site, secrets);
     for (const secret of secrets) {
       registerPageSecret(page, secret);
       await bindPageSecretDocuments(page, secret);
@@ -1482,7 +1464,7 @@ async function enterCode(
   let inserted = false;
   let releaseOnSite: (() => void) | undefined;
   try {
-    releaseOnSite = await holdOnSite(page, group.site, [code]);
+    releaseOnSite = holdOnSite(await ensureBrowserNavigationGuard(page), group.site, [code]);
     await bindPageSecretDocuments(page, code);
     const filled = await fillNativeCredentialGroup(group.frame, group.native, [code], context.assertActive);
     // Nothing reached the page: the answer stays for the next verify.

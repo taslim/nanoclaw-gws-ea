@@ -24,7 +24,7 @@ export const browserSignInMigration: PortableMigration & { name: ModuleMigration
   },
 };
 
-/** Principal-relayed codes are gone: the agent types a code the principal sends, so every claim is the assistant's. */
+/** Sign-in claims are the assistant's alone: a code the principal sends reaches the agent, never a claim. */
 export const browserSignInAssistantOnlyMigration: PortableMigration & { name: ModuleMigrationName } = {
   version: 2,
   name: 'module:gws-ea-browser:sign-in-claims-assistant-only',
@@ -33,7 +33,6 @@ export const browserSignInAssistantOnlyMigration: PortableMigration & { name: Mo
       CREATE TABLE gws_ea_browser_sign_in_claims_assistant (
         id TEXT PRIMARY KEY,
         job_id TEXT NOT NULL,
-        source TEXT NOT NULL CHECK(source = 'assistant'),
         origin TEXT NOT NULL,
         domain TEXT NOT NULL,
         binding_json TEXT NOT NULL,
@@ -43,7 +42,9 @@ export const browserSignInAssistantOnlyMigration: PortableMigration & { name: Mo
         gmail_message_id TEXT UNIQUE
       );
       INSERT INTO gws_ea_browser_sign_in_claims_assistant
-        SELECT * FROM gws_ea_browser_sign_in_claims WHERE source = 'assistant';
+          (id,job_id,origin,domain,binding_json,since_at,expires_at,state,gmail_message_id)
+        SELECT id,job_id,origin,domain,binding_json,since_at,expires_at,state,gmail_message_id
+          FROM gws_ea_browser_sign_in_claims WHERE source = 'assistant';
       DROP TABLE gws_ea_browser_sign_in_claims;
       ALTER TABLE gws_ea_browser_sign_in_claims_assistant RENAME TO gws_ea_browser_sign_in_claims;
       CREATE INDEX gws_ea_browser_sign_in_claim_site ON gws_ea_browser_sign_in_claims(domain,expires_at);

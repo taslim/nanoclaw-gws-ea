@@ -30,7 +30,7 @@ export const CREDENTIAL_AUTOCOMPLETE = /(?:^|\s)(?:new|current)-password(?:\s|$)
 export const CODE_SHAPED = /^[a-z\d]{0,10}$/iu;
 
 /** What the host reads of a field before the agent enters anything into it. */
-export interface EntryFieldFacts {
+interface EntryFieldFacts {
   /** A field for payment details. */
   readonly card: boolean;
   /** Marked `new-password` or `current-password`. */
@@ -54,7 +54,7 @@ export function entryRefusal(field: EntryFieldFacts, value?: string): 'card_fiel
 export type CredentialFormField = 'username' | 'current_password' | 'new_password' | 'confirmation';
 export type CredentialKind = 'signup' | 'rotation';
 /** An input's type and autocomplete tokens, as the host reads them at binding and again at each write. */
-export interface FieldTypeFacts {
+interface FieldTypeFacts {
   readonly type: string;
   readonly autocomplete: string;
 }
@@ -80,10 +80,13 @@ export function credentialFieldFits(role: CredentialFormField, facts: FieldTypeF
   return !marks.includes('current-password');
 }
 
-const NO_TEXT_ENTRY =
+/** Input types no code can be typed into: those that take no text, and pickers whose text is a date or time. */
+const NON_CODE_INPUT_TYPES =
   /^(?:hidden|submit|button|reset|image|checkbox|radio|file|range|color|date|datetime-local|month|week|time)$/u;
 
 /** A field the host may enter an emailed code into: any text field, a masked one included, but no card or credential field. */
 export function codeFieldFits(facts: FieldTypeFacts): boolean {
-  return !NO_TEXT_ENTRY.test(facts.type) && !cardMarked(facts) && !CREDENTIAL_AUTOCOMPLETE.test(facts.autocomplete);
+  return (
+    !NON_CODE_INPUT_TYPES.test(facts.type) && !cardMarked(facts) && !CREDENTIAL_AUTOCOMPLETE.test(facts.autocomplete)
+  );
 }
