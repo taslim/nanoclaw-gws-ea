@@ -6,7 +6,14 @@ import { randomUUID } from 'node:crypto';
 import type { CDPSession, ElementHandle, Frame, Page } from 'playwright-core';
 import { getDomain } from 'tldts';
 
-import { CODE_SHAPED, CREDENTIAL_AUTOCOMPLETE } from './authentication-signatures.js';
+import {
+  CODE_MAX_LENGTH,
+  CODE_SHAPED,
+  CREDENTIAL_AUTOCOMPLETE,
+  DIGIT_CODE,
+  NUMERIC_INPUT_MODE,
+  ONE_TIME_CODE_AUTOCOMPLETE,
+} from './authentication-signatures.js';
 import { isolationSelector } from './authentication-submit.js';
 import {
   bounded,
@@ -62,6 +69,12 @@ export interface ControlFacts {
   credentialEntry?: boolean;
   /** The control is a masked input: `type=password` when read. */
   masked?: boolean;
+  /** The control is marked `one-time-code`. */
+  oneTimeCode?: boolean;
+  /** The control's `inputmode`, as the element reflects it. */
+  inputMode?: string;
+  /** The control's `maxlength`; negative where it sets none. */
+  maxLength?: number;
   role: string;
   tag: string;
   type: string;
@@ -130,9 +143,12 @@ const PAGE_VOCABULARY = {
   /** A gift card's or voucher's code, which a checkout applies like a coupon: no card details. */
   giftCard: /gift|voucher/iu,
   noTextEntry: NO_TEXT_ENTRY,
-  /** A credential field's marking and a code's shape (authentication-signatures owns these). */
+  /** A credential field's marking and a code's field and shape (authentication-signatures owns these). */
   credentialAutocomplete: CREDENTIAL_AUTOCOMPLETE,
   code: CODE_SHAPED,
+  digitCode: DIGIT_CODE,
+  oneTimeCode: ONE_TIME_CODE_AUTOCOMPLETE,
+  numericMode: NUMERIC_INPUT_MODE,
   /** An express-pay button. Pay Later messaging is text, never a button, so it is no payment method. */
   expressPay:
     /\b(?:apple|google|shop|amazon|samsung)\s?pay\b|\bg\s?pay\b|\bpaypal\b|\bvenmo\b|\bklarna\b|\bafterpay\b|\baffirm\b|\bpay\s+with\s+link\b/iu,
@@ -517,14 +533,20 @@ const librarySource = String.raw`(sources) => {
     return textEntry(element) && re.cardEntry.test(said) && !re.giftCard.test(said);
   };
   // The fields entryRefusal reads on the host: a credential field by its marking, which survives a show-password
-  // toggle, and a masked input by its type now.
+  // toggle, a masked input by its type now, and the marks of a code's field.
   const credentialField = (element) => element instanceof HTMLInputElement &&
     re.credentialAutocomplete.test(element.getAttribute('autocomplete') || '');
   const maskedField = (element) => element instanceof HTMLInputElement && element.type === 'password';
+  const oneTimeCodeField = (element) => re.oneTimeCode.test(element.getAttribute('autocomplete') || '');
+  // A masked value the agent may have typed, as entryRefusal decides it on the host: digits alone, or a letter
+  // code in a field that reads as a code's.
+  const maskedCode = (element) => re.digitCode.test(element.value) || (re.code.test(element.value) &&
+    (oneTimeCodeField(element) || re.numericMode.test(element.inputMode) ||
+      (element.maxLength > 0 && element.maxLength <= ${CODE_MAX_LENGTH})));
   // A value the agent could not have typed: payment details, a credential, or a masked value that is no code. A
   // code the agent typed is ordinary text.
   const secretValue = (element) => typeof element.value === 'string' && element.value !== '' &&
-    (cardEntryField(element) || credentialField(element) || (maskedField(element) && !re.code.test(element.value)));
+    (cardEntryField(element) || credentialField(element) || (maskedField(element) && !maskedCode(element)));
   const isDialog = (element) => element instanceof HTMLDialogElement || /^(?:alert)?dialog$/iu.test(element.getAttribute('role') || '');
   const openDialog = (element) => isDialog(element) && (!(element instanceof HTMLDialogElement) || element.open) && visible(element);
   const modal = (dialog) => (dialog instanceof HTMLDialogElement && dialog.matches(':modal')) || dialog.getAttribute('aria-modal') === 'true';
@@ -698,6 +720,9 @@ const librarySource = String.raw`(sources) => {
       formFieldNames: form ? fields.map((field) => field.getAttribute('name') || '').filter(Boolean) : [],
       credentialEntry: credentialField(node),
       masked: maskedField(node),
+      oneTimeCode: oneTimeCodeField(node),
+      inputMode: node instanceof HTMLInputElement ? node.inputMode : '',
+      maxLength: node instanceof HTMLInputElement ? node.maxLength : -1,
       formMethod: form ? (own('formmethod') ? node.formMethod : formProperty(form, 'method')) : undefined,
       formAction: form ? (own('formaction') ? node.formAction : formProperty(form, 'action')) : undefined,
       role: node.getAttribute('role') || '',
@@ -1087,6 +1112,9 @@ function parseControl(value: unknown): Omit<ControlFacts, 'transaction'> | undef
     formFieldNames: texts(facts.formFieldNames),
     credentialEntry: flag(facts.credentialEntry),
     masked: flag(facts.masked),
+    oneTimeCode: flag(facts.oneTimeCode),
+    inputMode: text(facts.inputMode) ?? '',
+    maxLength: typeof facts.maxLength === 'number' ? facts.maxLength : -1,
     name,
     visibleLabel: text(facts.visibleLabel) ?? '',
     ...(formMethod !== undefined ? { formMethod } : {}),

@@ -32,18 +32,31 @@ it('lets the agent type a code into any field, never card details, credentials o
     card: false,
     credential: false,
     masked: false,
+    oneTimeCode: false,
+    inputMode: '',
+    maxLength: -1,
     ...facts,
   });
-  for (const code of ['552913', '5', 'A7KX29', 'abcdefghij'])
-    for (const facts of [field({}), field({ masked: true })]) expect(entryRefusal(facts, code)).toBeUndefined();
+  for (const code of ['552913', '5', 'A7KX29', 'abcdefghij']) expect(entryRefusal(field({}), code)).toBeUndefined();
   expect(entryRefusal(field({}), 'Tr0ub4dor&3 is long')).toBeUndefined();
-  for (const value of ['Tr0ub4dor&3', 'abcdefghijk', '5529 13', 'pass-word'])
+  // An unmarked masked field takes digits alone: a letter code there could be a password the agent chose.
+  for (const code of ['5529', '552913', '5529130041'])
+    expect(entryRefusal(field({ masked: true }), code)).toBeUndefined();
+  for (const value of ['Summer2026', 'A7KX29', '552', 'Tr0ub4dor&3', '55291300417'])
     expect(entryRefusal(field({ masked: true }), value)).toBe('secret_field');
+  // A masked field that reads as a code's takes a letter code too, never a longer value or one with a space.
+  for (const marks of [{ oneTimeCode: true }, { inputMode: 'numeric' }, { maxLength: 6 }, { maxLength: 1 }]) {
+    const codeBox = field({ masked: true, ...marks });
+    expect(entryRefusal(codeBox, 'A7KX29')).toBeUndefined();
+    for (const value of ['abcdefghijk', '5529 13', 'pass-word'])
+      expect(entryRefusal(codeBox, value)).toBe('secret_field');
+  }
+  expect(entryRefusal(field({ masked: true, maxLength: 11 }), 'A7KX29')).toBe('secret_field');
   // A key types no text: Enter and Backspace act on a masked field, never on a credential or card field.
   expect(entryRefusal(field({ masked: true }))).toBeUndefined();
   expect(entryRefusal(field({ credential: true }))).toBe('secret_field');
-  expect(entryRefusal(field({ credential: true }), '552913')).toBe('secret_field');
-  expect(entryRefusal(field({ card: true, masked: true }), '4242')).toBe('card_field');
+  expect(entryRefusal(field({ credential: true, oneTimeCode: true }), '552913')).toBe('secret_field');
+  expect(entryRefusal(field({ card: true, masked: true, maxLength: 4 }), '4242')).toBe('card_field');
 });
 
 it('fits each credential role to its input type: passwords only to masked fields, never current and new crossed', () => {

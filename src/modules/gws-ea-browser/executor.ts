@@ -202,7 +202,7 @@ function givenText(action: BrowserAction): string[] {
   return action.kind === 'form_input' ? action.fields.map((field) => field.value) : [];
 }
 
-/** Payment details are never entered, and credentials only through the host's own fills; a code goes anywhere. */
+/** Payment details are never entered, and credentials only through the host's own fills; a code goes where a code fits. */
 async function refuseFieldEntry(
   page: Page,
   target: PinnedBrowserRef,
@@ -210,7 +210,14 @@ async function refuseFieldEntry(
 ): Promise<ControlFacts> {
   const facts = await readPageControlFacts(page, target.element);
   const refusal = entryRefusal(
-    { card: facts.cardEntry === true, credential: facts.credentialEntry === true, masked: facts.masked === true },
+    {
+      card: facts.cardEntry === true,
+      credential: facts.credentialEntry === true,
+      masked: facts.masked === true,
+      oneTimeCode: facts.oneTimeCode === true,
+      inputMode: facts.inputMode ?? '',
+      maxLength: facts.maxLength ?? -1,
+    },
     value,
   );
   if (refusal) throw new BrowserBatchStop(refusal);
