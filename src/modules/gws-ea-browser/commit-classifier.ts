@@ -1,12 +1,19 @@
-import { randomUUID } from 'node:crypto';
 import { captureBrowserDiagnosticRefusal } from './diagnostics.js';
-import { errors, type CDPSession, type ElementHandle, type Frame, type Page, type Request } from 'playwright-core';
+import type { CDPSession, ElementHandle, Frame, Page, Request } from 'playwright-core';
 import { getDomain } from 'tldts';
-import { genericCheckoutSignature } from './generic-signature.js';
 import { SiteLeaseStore } from './leases.js';
 import { documentGate, type CapturedHold, type HeldRequest, type PausedDocument } from './document-gate.js';
 import { coverPageTargets, ensurePageTargets, onUncoveredPageTarget, pageTargetsReady } from './page-targets.js';
 import { browserOperationId, type BrowserOperationContext } from './actions.js';
+import {
+  approvedPress,
+  approvedPressOn,
+  BrowserActivationError,
+  consentBeforeSubmission,
+  DEFAULT_ACTION_BUDGET_MS,
+  withApprovedPress,
+  type ApprovedPress,
+} from './activation.js';
 import { paymentProcessorHost, readPageControlFacts, type ControlFacts } from './control-facts.js';
 import {
   classifyControlFacts,
@@ -17,15 +24,25 @@ import {
   type ActivationKind,
   type ReviewedMerchantFlow,
 } from './control-policy.js';
-import { BrowserConsentStop, runConsentPass, type ConsentScope } from './consent.js';
-import { readFreeCheckout, type FreeCheckout } from './merchant-read.js';
-import { mainDocumentLoader, pageFieldHoldsHostSecret } from './page-privacy.js';
+import type { ConsentScope } from './consent.js';
+import {
+  closeFreeDialog,
+  currentFreeDialog,
+  pressFreeCheckout,
+  type FreePressAnswer,
+  type FreePressScope,
+} from './free-press.js';
+import { readFreeCheckout } from './merchant-read.js';
+import { pageFieldHoldsHostSecret } from './page-privacy.js';
+import {
+  holdRefusesDocument,
+  holdRefusesRequest,
+  readTexts,
+  sentForms,
+  type PlacedHold,
+  type SubmissionSite,
+} from './submission-hold.js';
 
-/**
- * `secret_field`: a press while a field holds a password or code the host filled, which only the host's own sign-in
- * and credential paths submit.
- */
-export type ActivationRefusal = Exclude<ActionClass, 'ordinary'> | 'secret_field';
 /** `site_busy`: another job holds the site; `read_only`: a read-only replay's non-GET document. */
 export type NavigationRefusal = Exclude<ActionClass, 'ordinary'> | 'site_busy' | 'read_only';
 /** The open rule for an action on this control, with any reviewed flow's exact reading of it. */
@@ -56,22 +73,6 @@ async function activationDispatch(
   return { classification: 'ordinary', facts };
 }
 
-export class BrowserActivationError extends Error {
-  constructor(readonly reason: ActivationRefusal) {
-    super(reason);
-  }
-}
-
-/**
- * The consent engine's one check before a submission outside a purchase: every choice in the control's form
- * made, or a stop. An extra the press would still buy makes it a purchase.
- */
-async function consentBeforeSubmission(page: Page, element: ElementHandle, intent: ActivationIntent): Promise<void> {
-  const consent = await runConsentPass(page, element, { scope: intent.scope, assertActive: intent.assertActive });
-  if (consent.status === 'consent_required') throw new BrowserConsentStop(consent.stops);
-  if (consent.status === 'add_on') throw new BrowserActivationError('purchase_control');
-}
-
 /** The guard refused to start an operation: a page-target setting cannot reach a live frame, so nothing ran. */
 export class BrowserFramesUnreadyError extends BrowserActivationError {
   constructor() {
@@ -86,29 +87,6 @@ export function framesUnreadyStop(error: unknown): import('./actions.js').Browse
     : undefined;
 }
 
-/**
- * An approved purchase's own press, or a free checkout's: the documents and script requests it may send while it
- * runs, beyond the open rule.
- */
-export interface ApprovedPress {
-  /** The origin of the document the approved control commits from. */
-  readonly origin: string;
-  matches(url: URL): boolean;
-  /** The flow's reading of its own route; undefined for a route it does not know, which stays refused. */
-  classify(url: URL): ActionClass | undefined;
-}
-const approvedPresses = new WeakMap<Page, ApprovedPress>();
-
-/** The page's documents take `admission`'s reading only while `run` presses. */
-async function withApprovedPress<T>(page: Page, admission: ApprovedPress, run: () => Promise<T>): Promise<T> {
-  approvedPresses.set(page, admission);
-  try {
-    return await run();
-  } finally {
-    approvedPresses.delete(page);
-  }
-}
-
 export interface PurchaseAuthorityPress {
   /** Runs immediately before the press: the last re-read and the commit marker. */
   commitStarted(): Promise<void>;
@@ -117,41 +95,6 @@ export interface PurchaseAuthorityPress {
    * origin, and the press loads its own routes there.
    */
   readonly checkout?: { readonly origin: string };
-}
-
-/**
- * The press an approval, or a free checkout, admits: a reviewed flow's exact control on its page, or a generic
- * checkout's control in its checkout origin. A reviewed flow's page never takes the generic verifier: that flow
- * fails closed.
- */
-async function approvedPress(
-  page: Page,
-  element: ElementHandle,
-  flow: ReviewedMerchantFlow | undefined,
-  checkout: { readonly origin: string } | undefined,
-): Promise<ApprovedPress | undefined> {
-  if (flow) {
-    if (!flow.verifyPurchaseControl || !(await flow.verifyPurchaseControl(page, element))) return undefined;
-    return {
-      origin: new URL(page.url()).origin,
-      matches: (url) => flow.matches(url),
-      classify: (url) => flow.classifyNavigation(url),
-    };
-  }
-  const frame = await element.ownerFrame();
-  if (
-    !checkout ||
-    !frame ||
-    !URL.canParse(frame.url()) ||
-    new URL(frame.url()).origin !== checkout.origin ||
-    !(await genericCheckoutSignature.verifyPurchaseControl?.(page, element))
-  )
-    return undefined;
-  return {
-    origin: checkout.origin,
-    matches: (url) => url.origin === checkout.origin,
-    classify: (url) => classifyNavigationUrl(url.href),
-  };
 }
 
 export interface ActivationIntent {
@@ -173,185 +116,6 @@ export interface ActivationResult {
   readonly ordinaryPress: boolean;
   /** The commit-class press was a free checkout's, or a repeat of the one this job already pressed. */
   readonly freePress?: FreePressAnswer;
-}
-
-const DEFAULT_ACTION_BUDGET_MS = 10_000;
-
-/** The job a free checkout's press belongs to, and what the press spends. */
-export interface FreePressScope {
-  readonly jobId: string;
-  /** Runs once every check has passed, immediately before the press: claims what a booking spends in the job. */
-  pressStarting(checkout: FreeCheckout, at: string): Promise<FreePressStart>;
-}
-
-/** A free press about to run, and how what it claimed settles. */
-export interface FreePressStart {
-  /** The merchant's paid attempts whose outcome nobody has recorded, which the press does not wait on. */
-  readonly unresolved: readonly string[];
-  /** When the press ran, as the agent reads it: on the principal's clock. */
-  readonly pressedAt: string;
-  /** The press may have reached the site: what it claimed is spent. */
-  reached(): Promise<void>;
-  /** The press proved it never reached the page: what it claimed goes back as it was. */
-  neverReached(): Promise<void>;
-}
-
-/** A free checkout's press: the merchant, when, and the merchant's paid attempts nobody has recorded an outcome for. */
-export interface FreePressFacts {
-  readonly site: string;
-  readonly pressed_at: string;
-  readonly unresolved_attempts?: readonly string[];
-}
-/** What a free checkout's press answers: pressed now, or the earlier press a repeat would have repeated. */
-export type FreePressAnswer = FreePressFacts & { readonly status: 'pressed' | 'already_pressed' };
-
-/** A job's last free press: a repeat with the same facts would book the same table twice. */
-interface FreePress {
-  readonly site: string;
-  readonly facts: string;
-  readonly at: string;
-  /** `at` as the agent reads it. */
-  readonly pressedAt: string;
-  readonly page: WeakRef<Page>;
-}
-const freePresses = new Map<string, FreePress>();
-
-/**
- * The dialog a free press opened over its own document: until that document changes, the agent's steps in it load
- * the checkout origin's own purchase routes, as the press did, so a verification step can book. A site's hold on a
- * table lasts minutes, and a code relayed through main may take several.
- */
-interface FreeDialog {
-  readonly admission: ApprovedPress;
-  readonly document: string;
-  readonly until: number;
-}
-const freeDialogs = new WeakMap<Page, FreeDialog>();
-const FREE_DIALOG_MS = 15 * 60_000;
-const watchedDocuments = new WeakSet<Page>();
-
-function currentFreeDialog(page: Page): FreeDialog | undefined {
-  const dialog = freeDialogs.get(page);
-  if (dialog && dialog.until <= Date.now()) freeDialogs.delete(page);
-  return freeDialogs.get(page);
-}
-
-function openFreeDialog(page: Page, dialog: FreeDialog): void {
-  freeDialogs.set(page, dialog);
-  if (watchedDocuments.has(page)) return;
-  watchedDocuments.add(page);
-  // A same-document navigation keeps the dialog; a new main document ends it.
-  page.on('framenavigated', (frame) => {
-    if (frame !== page.mainFrame() || !freeDialogs.has(page)) return;
-    void mainDocumentLoader(page)
-      .then((loader) => loader !== freeDialogs.get(page)?.document)
-      .catch(() => true)
-      .then((changed) => {
-        if (changed) freeDialogs.delete(page);
-      });
-  });
-}
-
-/** When job `jobId` last pressed a free checkout, which counts as a step toward a booking. */
-export function lastFreePress(jobId: string): { readonly site: string; readonly at: string } | undefined {
-  const press = freePresses.get(jobId);
-  return press && { site: press.site, at: press.at };
-}
-
-/** Whether job `jobId`'s page still shows the dialog its free press opened, where a texted code may still land. */
-export function freePressInProgress(jobId: string): boolean {
-  const page = freePresses.get(jobId)?.page.deref();
-  return Boolean(page && !page.isClosed() && currentFreeDialog(page));
-}
-
-/**
- * A free checkout's press, as the host presses an approved one: the consent pass, a fresh read immediately before
- * that finds it still free and unchanged, and the press under the checkout origin's admission. Its script requests
- * to payment processors stay refused. A repeat of the job's last free press with the same facts presses nothing.
- */
-export async function pressFreeCheckout(
-  page: Page,
-  element: ElementHandle,
-  operation: () => Promise<void>,
-  checkout: FreeCheckout,
-  intent: ActivationIntent & { readonly freePress: FreePressScope },
-): Promise<FreePressAnswer> {
-  const scope = intent.freePress;
-  const facts = JSON.stringify(checkout.facts);
-  // Only on the page it was pressed in: a page the job lost with its dialog leaves a checkout to rebuild and press.
-  const earlier = freePresses.get(scope.jobId);
-  if (earlier && earlier.page.deref() === page && earlier.site === checkout.site && earlier.facts === facts)
-    return { status: 'already_pressed', site: earlier.site, pressed_at: earlier.pressedAt };
-  const guard = await ensureBrowserNavigationGuard(page);
-  await guard.actionsSettled();
-  if (await pageFieldHoldsHostSecret(page)) throw new BrowserActivationError('secret_field');
-  await consentBeforeSubmission(page, element, intent);
-  const admission = await approvedPress(
-    page,
-    element,
-    reviewedMerchantFlow(new URL(page.url())),
-    checkout.facts.flowId === genericCheckoutSignature.id ? { origin: checkout.origin } : undefined,
-  );
-  if (!admission) throw new BrowserActivationError('purchase_control');
-  await intent.assertActive?.();
-  // The consent pass may have changed the form: the booking must still read as the same free one.
-  const latest = await readFreeCheckout(page, element);
-  if (!latest || latest.site !== checkout.site || JSON.stringify(latest.facts) !== facts)
-    throw new BrowserActivationError('purchase_control');
-  const document = await mainDocumentLoader(page).catch(() => undefined);
-  const at = new Date().toISOString();
-  const start = await scope.pressStarting(checkout, at);
-  freePresses.set(scope.jobId, { site: checkout.site, facts, at, pressedAt: start.pressedAt, page: new WeakRef(page) });
-  // Until the click runs, and again when it fails before dispatching, nothing reached the site.
-  let reached = false;
-  const press = async (): Promise<void> => {
-    reached = true;
-    try {
-      await operation();
-    } catch (error) {
-      if (neverDispatched(error)) reached = false;
-      throw error;
-    }
-  };
-  try {
-    await withApprovedPress(page, admission, () =>
-      guard.duringAction(intent.remaining?.() ?? DEFAULT_ACTION_BUDGET_MS, press, {
-        purchaseAdmission: admission,
-      }),
-    );
-  } finally {
-    // A press that may have landed is never repeated, and an earlier dialog's admission never outlives it; one that
-    // never ran leaves the job as it was.
-    if (reached) {
-      freeDialogs.delete(page);
-      await start.reached();
-    } else {
-      if (earlier) freePresses.set(scope.jobId, earlier);
-      else freePresses.delete(scope.jobId);
-      await start.neverReached();
-    }
-  }
-  // A press that loaded a new document opened no dialog over the checkout: later steps are ordinary.
-  if (document && !page.isClosed() && (await mainDocumentLoader(page).catch(() => undefined)) === document)
-    openFreeDialog(page, { admission, document, until: Date.now() + FREE_DIALOG_MS });
-  return {
-    status: 'pressed',
-    site: checkout.site,
-    pressed_at: start.pressedAt,
-    ...(start.unresolved.length ? { unresolved_attempts: [...start.unresolved] } : {}),
-  };
-}
-
-/**
- * Whether a press's own failure proves its click never reached the page. Playwright's click waits for nothing after
- * it dispatches, so its timeout means the actionability checks never passed: the control stayed covered, hidden or
- * disabled. The executor answers that timeout as `not_actionable`.
- */
-function neverDispatched(error: unknown): boolean {
-  return (
-    error instanceof errors.TimeoutError ||
-    (error instanceof Error && 'reason' in error && error.reason === 'not_actionable')
-  );
 }
 
 /**
@@ -389,7 +153,7 @@ export async function activateControl(
     if (!approved) throw new BrowserActivationError('purchase_control');
     await authority.commitStarted();
     // A press after an approved one is ordinary: no free dialog's admission carries past it.
-    freeDialogs.delete(page);
+    closeFreeDialog(page);
     await withApprovedPress(page, approved, operation);
     return { ordinaryPress: false };
   }
@@ -398,10 +162,17 @@ export async function activateControl(
   if (classification === 'purchase_control' && pressed && intent.freePress) {
     const checkout = await readFreeCheckout(page, element);
     if (checkout) {
-      const freePress = await pressFreeCheckout(page, element, operation, checkout, {
-        ...intent,
-        freePress: intent.freePress,
-      });
+      const freePress = await pressFreeCheckout(
+        page,
+        await ensureBrowserNavigationGuard(page),
+        element,
+        operation,
+        checkout,
+        {
+          ...intent,
+          freePress: intent.freePress,
+        },
+      );
       return { ordinaryPress: freePress.status === 'pressed', freePress };
     }
   }
@@ -440,18 +211,6 @@ export interface BrowserNavigationPolicy {
   leasedSite?: string;
   /** Runs for each document the rules call ordinary, the page's own top-level one or a frame's. */
   beforeNavigate?(url: URL, document: NavigationDocument): Promise<'ordinary' | 'site_busy' | 'blocked_address'>;
-}
-/** Where a credential hold lets host-filled values go. */
-export interface SubmissionSite {
-  /** The registrable domain the filled values stay on. */
-  readonly site: string;
-  /** The values the host filled: a request to another site that carries one is refused. */
-  readonly values: readonly string[];
-  /**
-   * Hears each document the hold refused for leaving the site. A refused script request only records a diagnostic:
-   * a sign-in page's own telemetry beacons do not make its sign-in fail.
-   */
-  readonly departed?: () => void;
 }
 export interface BrowserNavigationGuard {
   reason(): NavigationRefusal | undefined;
@@ -585,83 +344,6 @@ function heldSiteOf(url: string): string | undefined {
   return URL.canParse(url) && new URL(url).protocol === 'https:' ? registrableSite(url) : undefined;
 }
 
-function decoded(text: string): string {
-  try {
-    return decodeURIComponent(text.replace(/\+/gu, ' '));
-    // eslint-disable-next-line no-catch-all/no-catch-all -- text that is not percent-encoding is read as it is
-  } catch (_error) {
-    return text;
-  }
-}
-
-/** The forms a page script commonly sends a value in: as typed, URL- or form-encoded, JSON-escaped, or base64. */
-function sentForms(values: readonly string[]): string[] {
-  return values.flatMap((value) => {
-    const base64 = Buffer.from(value, 'utf8').toString('base64');
-    return [
-      value,
-      encodeURIComponent(value),
-      new URLSearchParams({ v: value }).toString().slice(2),
-      JSON.stringify(value).slice(1, -1),
-      base64,
-      base64.replace(/=+$/u, ''),
-      Buffer.from(value, 'utf8').toString('base64url'),
-    ].map((form) => form.toLowerCase());
-  });
-}
-
-/** Case-insensitive, since a host name in an address is lowercased on the way out. */
-function readTexts(texts: readonly string[]): string[] {
-  return texts.flatMap((text) => [text.toLowerCase(), decoded(text).toLowerCase()]);
-}
-
-function carriesForms(read: readonly string[], forms: readonly string[]): boolean {
-  return forms.some((form) => read.some((text) => text.includes(form)));
-}
-
-/** Whether an address carries any of `values`, in any form a page script commonly sends one. */
-export function carriesSecret(url: URL, values: readonly string[]): boolean {
-  return carriesForms(readTexts([url.href, ...url.searchParams.values(), url.hash]), sentForms(values));
-}
-
-/**
- * Holds `guard`'s page to `site` from before `values` reach it until the returned release: no document but a GET
- * leaves the site and no request carries a value to another site, whatever any other hold allows meanwhile.
- */
-export function holdOnSite(
-  guard: BrowserNavigationGuard,
-  site: string,
-  values: readonly string[],
-  departed?: () => void,
-): () => void {
-  const authority = `on-site:${randomUUID()}`;
-  guard.holdSubmissions(authority, { site, values, ...(departed ? { departed } : {}) });
-  return () => guard.allowSubmissions(authority);
-}
-
-/** A sited hold with its values' sent forms read once, as it was placed. */
-interface PlacedHold {
-  readonly onSite: SubmissionSite;
-  readonly forms: readonly string[];
-}
-
-/** A document leaves by being sent anywhere but the site as anything but a GET. */
-function holdRefusesDocument(hold: PlacedHold | undefined, document: HeldRequest, site: string | undefined): boolean {
-  return !hold || (document.method.toUpperCase() !== 'GET' && site !== hold.onSite.site);
-}
-
-/** Any other request leaves only by carrying a filled value to another site, or a body the gate could not read. */
-function holdRefusesRequest(
-  hold: PlacedHold | undefined,
-  request: HeldRequest,
-  site: string | undefined,
-  read: () => readonly string[],
-): boolean {
-  if (!hold) return true;
-  if (site === hold.onSite.site) return false;
-  return request.body === undefined || carriesForms(read(), hold.forms);
-}
-
 /** What page script sends, a beacon (`Ping`) included. */
 const SCRIPT_REQUEST_TYPES = ['XHR', 'Fetch', 'Ping'] as const;
 /** How long an action's window stays open after it: enough for a handler that awaits one round trip, then posts. */
@@ -757,7 +439,7 @@ async function installNavigationGuard(page: Page): Promise<BrowserNavigationGuar
       const scopes = [...policies];
       const holds = [...submissionHolds.values()];
       // Inside an operation, a free press's dialog admits its checkout origin's routes as the press did.
-      const approved = approvedPresses.get(page) ?? (scopes.length ? currentFreeDialog(page)?.admission : undefined);
+      const approved = approvedPressOn(page) ?? (scopes.length ? currentFreeDialog(page)?.admission : undefined);
       const pausedIn = generation;
       // A document between operations is judged by the page as it stood when the document paused.
       const pageUrl = page.url();

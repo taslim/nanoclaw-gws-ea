@@ -38,17 +38,16 @@ import {
   renderPurchaseCard,
   type PurchaseCard,
 } from './cards.js';
+import { BrowserActivationError } from './activation.js';
 import { cancelBrowserJobInTransaction, finishBrowserJobCancellation } from './cancel.js';
 import { checkoutPicture } from './checkout-picture.js';
 import {
   activateControl,
-  BrowserActivationError,
   BrowserSiteBusyError,
   classifyActivation,
+  ensureBrowserNavigationGuard,
   framesUnreadyStop,
-  pressFreeCheckout,
   withBrowserJobNavigation,
-  type FreePressAnswer,
 } from './commit-classifier.js';
 import { readConfirmations, readPageLines } from './confirmation.js';
 import {
@@ -62,6 +61,7 @@ import { SiteLeaseStore } from './leases.js';
 import { BrowserStore, type BrowserRequest } from './db.js';
 import { unapprovedCommit } from './executor.js';
 import { materialPurchaseChange, type PurchaseBounds, type PurchaseFacts } from './fingerprint.js';
+import { pressFreeCheckout, type FreePressAnswer } from './free-press.js';
 import { genericCheckoutSignature, pressRefusal } from './generic-signature.js';
 import { stopForUnapprovedCommit, type IncidentKind, type UnapprovedCommit } from './incidents.js';
 import { readIsoTime, zonedInstant } from './iso-time.js';
@@ -801,13 +801,20 @@ async function pressFree(
   const before = await readConfirmations(page);
   let press: FreePressAnswer;
   try {
-    press = await pressFreeCheckout(page, element, pressListening(context, page, signature, element), checkout, {
-      kind: 'click',
-      scope: { jobId: context.job.id, db: context.store.db },
-      assertActive: context.assertActive,
-      remaining: context.remaining,
-      freePress: freePressScope(context),
-    });
+    press = await pressFreeCheckout(
+      page,
+      await ensureBrowserNavigationGuard(page),
+      element,
+      pressListening(context, page, signature, element),
+      checkout,
+      {
+        kind: 'click',
+        scope: { jobId: context.job.id, db: context.store.db },
+        assertActive: context.assertActive,
+        remaining: context.remaining,
+        freePress: freePressScope(context),
+      },
+    );
   } catch (error) {
     if (error instanceof BrowserConsentStop)
       return {

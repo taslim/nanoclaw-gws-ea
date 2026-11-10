@@ -17,7 +17,8 @@ import { setTimeout as sleep } from 'node:timers/promises';
 import type { ElementHandle, Page } from 'playwright-core';
 
 import { isolationSelector } from './authentication-submit.js';
-import { activateControl, BrowserActivationError, type ActivationIntent } from './commit-classifier.js';
+import { BrowserActivationError } from './activation.js';
+import { activateControl, type ActivationIntent } from './commit-classifier.js';
 import { frameGone, record } from './control-facts.js';
 import {
   bounded,

@@ -8,7 +8,7 @@ import { writeBrowserNotice } from './notices.js';
 import type { PendingApproval } from '../../types.js';
 import { detachApproval, finishApprovalWithdrawal } from '../approvals/index.js';
 import { type SpendingAuthority } from './authority.js';
-import { lastFreePress } from './commit-classifier.js';
+import { lastFreePress } from './free-press.js';
 import {
   completePurchaseFacts,
   venueKey,

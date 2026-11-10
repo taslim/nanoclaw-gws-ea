@@ -6,10 +6,10 @@ import { errors, type Page } from 'playwright-core';
 import { invalidArgs } from '../../cli/delivery-action.js';
 import { sessionDir } from '../../session-manager.js';
 import { isRecord } from '../../gws-ea/validation.js';
+import { BrowserActivationError } from './activation.js';
 import { freePressScope } from './authority.js';
 import {
   activateControl,
-  BrowserActivationError,
   BrowserSiteBusyError,
   ensureBrowserNavigationGuard,
   framesUnreadyStop,
@@ -18,8 +18,6 @@ import {
   type ActivationIntent,
   type ActivationResult,
   type BrowserNavigationGuard,
-  type FreePressAnswer,
-  type FreePressFacts,
 } from './commit-classifier.js';
 import { readConfirmations, showsCharge, type ConfirmationEvidence } from './confirmation.js';
 import { BrowserConsentStop, consentStopsForAgent, type ConsentStopView } from './consent.js';
@@ -27,6 +25,7 @@ import { settleCookieBanners } from './cookie-banners.js';
 import { addressFields, personalDataStop } from './disclosures.js';
 import { captureBrowserDownload, stageBrowserUpload, retainBrowserUpload } from './files.js';
 import type { PurchaseFacts } from './fingerprint.js';
+import type { FreePressAnswer, FreePressFacts } from './free-press.js';
 import { stopForUnapprovedCommit, type UnapprovedCommit } from './incidents.js';
 import { SiteLeaseStore } from './leases.js';
 import {

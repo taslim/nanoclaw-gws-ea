@@ -22,7 +22,7 @@ import { resolveSystemSession } from '../../session-manager.js';
 import '../gws-ea-profile/index.js';
 import './index.js';
 import { BrowserStore } from './db.js';
-import * as commitClassifier from './commit-classifier.js';
+import * as freePress from './free-press.js';
 import { browserAvailability } from './availability.js';
 import { type BrowserQueue } from './queue.js';
 import { browserWatchesMigration } from './migration.js';
@@ -886,7 +886,7 @@ it('wakes the agent with each change and books nothing itself; a step toward a b
   text = '7:30 PM';
   await checkRegion(scheduler);
   const pressedAt = new Date(Date.now() + 1).toISOString();
-  vi.spyOn(commitClassifier, 'lastFreePress').mockImplementation((job) =>
+  vi.spyOn(freePress, 'lastFreePress').mockImplementation((job) =>
     job === jobId ? { site: 'larder.example', at: pressedAt } : undefined,
   );
   await checkRegion(scheduler);

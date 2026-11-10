@@ -31,7 +31,7 @@ import {
   browserSiteLeasesMigration,
 } from './migration.js';
 import { BrowserStore } from './db.js';
-import { freePressInProgress } from './commit-classifier.js';
+import { freePressInProgress } from './free-press.js';
 import { notifyPendingIncidents } from './incidents.js';
 import { BrowserQueue, registerBrowserActionDelivery } from './queue.js';
 import { browserAction } from './executor.js';

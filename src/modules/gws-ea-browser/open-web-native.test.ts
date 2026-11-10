@@ -50,10 +50,10 @@ import {
   activateControl,
   classifyActivation,
   ensureBrowserNavigationGuard,
-  freePressInProgress,
   withBrowserJobNavigation,
   type ActivationIntent,
 } from './commit-classifier.js';
+import { freePressInProgress } from './free-press.js';
 import { recordConsentGrant, runConsentPass, type ConsentPassResult } from './consent.js';
 import { BrowserStore } from './db.js';
 import { BrowserDiagnosticAttempt } from './diagnostics.js';

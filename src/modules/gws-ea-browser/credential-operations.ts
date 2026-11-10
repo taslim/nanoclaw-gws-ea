@@ -46,13 +46,7 @@ import {
   finishRequestedCancellation,
   resolveBrowserJob,
 } from './cancel.js';
-import {
-  BrowserSiteBusyError,
-  carriesSecret,
-  ensureBrowserNavigationGuard,
-  holdOnSite,
-  withBrowserJobNavigation,
-} from './commit-classifier.js';
+import { BrowserSiteBusyError, ensureBrowserNavigationGuard, withBrowserJobNavigation } from './commit-classifier.js';
 import { consentStopsForAgent, runConsentPass } from './consent.js';
 import { BrowserStore, type BrowserRequest } from './db.js';
 import {
@@ -82,6 +76,7 @@ import {
   type PinnedBrowserRef,
 } from './observe.js';
 import { bindPageSecretDocuments, registerPageSecret } from './page-privacy.js';
+import { carriesSecret, holdOnSite } from './submission-hold.js';
 import { registrableDomain } from './login-store.js';
 import { type BrowserQueue } from './queue.js';
 import type { BrowserExecutionContext, BrowserQueuedAction } from './actions.js';

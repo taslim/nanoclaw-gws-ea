@@ -8,13 +8,7 @@ import {
   httpsOrigin,
   type BrowserSecretField,
 } from './authentication-signatures.js';
-import {
-  carriesSecret,
-  classifyActivation,
-  ensureBrowserNavigationGuard,
-  holdOnSite,
-  withBrowserJobNavigation,
-} from './commit-classifier.js';
+import { classifyActivation, ensureBrowserNavigationGuard, withBrowserJobNavigation } from './commit-classifier.js';
 import { classifyNavigationUrl } from './control-policy.js';
 import { BrowserConsentStop, consentStopsForAgent, runConsentPass } from './consent.js';
 import {
@@ -41,6 +35,7 @@ import {
   registerPageSecret,
   releasePageSecret,
 } from './page-privacy.js';
+import { carriesSecret, holdOnSite } from './submission-hold.js';
 import { browserOperationId, type BrowserExecutionContext, type BrowserQueuedAction } from './actions.js';
 
 export interface BrowserSignInField {

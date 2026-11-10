@@ -158,7 +158,7 @@ export type BrowserBatchResult = (
   observation?: import('./observe.js').BrowserObservation;
   incident?: { readonly site: string; readonly reference: string; readonly charged?: string };
   /** A free booking's host press, or the earlier one a repeat would have repeated. */
-  press?: import('./commit-classifier.js').FreePressFacts;
+  press?: import('./free-press.js').FreePressFacts;
 };
 
 export function browserActionRefs(action: BrowserAction): BrowserRef[] {

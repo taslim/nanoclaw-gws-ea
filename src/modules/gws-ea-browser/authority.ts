@@ -31,7 +31,7 @@ import {
 import { browserAvailability } from './availability.js';
 
 import { browserOperationId, type BrowserExecutionContext, type BrowserOperationContext } from './actions.js';
-import type { FreePressScope } from './commit-classifier.js';
+import type { FreePressScope } from './free-press.js';
 import type { WatchBounds } from './watch-state.js';
 
 export interface SpendingAuthority {
