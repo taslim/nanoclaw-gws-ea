@@ -331,6 +331,17 @@ describe('the browser tools', () => {
     );
   });
 
+  it('reads one part of a cut page within its ref, and says how compact observations and deltas carry refs', () => {
+    const validate = new Ajv({ formats: { uri: true } }).compile(browser.tool.inputSchema);
+    expect(validate({ actions: [{ kind: 'observe', within: { ref: 'f2e40', generation: 3 } }] })).toBe(true);
+    expect(validate({ actions: [{ kind: 'observe' }] })).toBe(true);
+    for (const within of [{ ref: 'e40' }, { ref: 'main', generation: 3 }, 'e40'])
+      expect(validate({ actions: [{ kind: 'observe', within }] })).toBe(false);
+    const description = browser.tool.description;
+    for (const phrase of ['open dialog first', 'within', 'delta', 'new generation', 'their own frame navigates'])
+      expect(description).toContain(phrase);
+  });
+
   it('offers saved username and password fills while email codes keep their own tool', () => {
     const validate = new Ajv().compile(fillSecret.tool.inputSchema);
     const fields = { item_handle: 'login-1', submit: { ref: 'e3', generation: 1 } };

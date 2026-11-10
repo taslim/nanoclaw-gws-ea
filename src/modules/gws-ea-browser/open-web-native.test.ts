@@ -84,7 +84,7 @@ import {
 import * as loginStoreModule from './login-store.js';
 import { createLoginsPageHandler } from './logins-page.js';
 import { testLoginStore } from './testing/login-store.js';
-import { observePage, type BrowserObservation } from './observe.js';
+import { observePage, type BrowserSnapshotObservation } from './observe.js';
 import { registerBrowserPurchaseDelivery, resumeBrowserPurchaseCommits } from './purchase.js';
 import { recordPurchaseOutcome } from './purchase-outcome.js';
 import { type BrowserQueue } from './queue.js';
@@ -1041,6 +1041,60 @@ describe.skipIf(!chromePath)('ordinary actions in native Chrome', { timeout: 60_
     expect(await page.getByRole('textbox', { name: 'Search term' }).inputValue()).toBe('current');
   });
 
+  it('keeps refs through an ad frame’s navigation and a same-document route, and makes them stale when their own frame or the page’s document changes', async () => {
+    const url = 'https://news.example/frames';
+    const ad = 'https://ads.example/slot';
+    const login = 'https://accounts.example/embedded';
+    const page = htmlPage(
+      'Frames',
+      `<h1>Frames</h1><input aria-label="Search term"><iframe id="ad" title="Advertisement" src="${ad}"></iframe><iframe id="login" title="Sign in" src="${login}"></iframe>`,
+    );
+    fixture.serve(url, page);
+    fixture.serve(`${url}/results`, page);
+    fixture.serve(ad, htmlPage('Ad', '<button type="button">First offer</button>'));
+    fixture.serve(`${ad}-2`, htmlPage('Ad', '<button type="button">Second offer</button>'));
+    fixture.serve(login, htmlPage('Sign in', '<input aria-label="Account email">'));
+    fixture.serve(`${login}/next`, htmlPage('Sign in', '<input aria-label="Account email">'));
+    const tab = await open();
+    await go(tab, url);
+    const frame = tab.frameLocator('#login');
+    await frame.getByRole('textbox', { name: 'Account email' }).waitFor();
+    await tab.frameLocator('#ad').getByRole('button', { name: 'First offer' }).waitFor();
+    const search = tab.getByRole('textbox', { name: 'Search term' });
+
+    let observation = await observePage(tab);
+    await tab.evaluate(`document.getElementById('ad').src = '${ad}-2'`);
+    await tab.frameLocator('#ad').getByRole('button', { name: 'Second offer' }).waitFor();
+    expect(await batch(tab, [{ kind: 'type', ...refIn(observation, 'Search term'), text: 'tapas' }])).toMatchObject({
+      status: 'completed',
+    });
+    expect(await search.inputValue()).toBe('tapas');
+
+    observation = await observePage(tab);
+    await tab.evaluate(`history.pushState({}, '', '/frames/results')`);
+    expect(await batch(tab, [{ kind: 'type', ...refIn(observation, 'Search term'), text: 'mezze' }])).toMatchObject({
+      status: 'completed',
+    });
+    expect(await search.inputValue()).toBe('mezze');
+
+    observation = await observePage(tab);
+    const email = refIn(observation, 'Account email');
+    const frameOf = (ref: string): string => ref.replace(/e\d+$/u, '');
+    expect(frameOf(email.ref)).not.toBe(frameOf(refIn(observation, 'Search term').ref));
+    await tab.evaluate(`document.getElementById('login').src = '${login}/next'`);
+    await frame.getByRole('textbox', { name: 'Account email' }).waitFor();
+    await expect.poll(() => tab.frames().some((candidate) => candidate.url() === `${login}/next`)).toBe(true);
+    expect(await batch(tab, [{ kind: 'type', ...email, text: 'morgan' }])).toMatchObject({ reason: 'stale_ref' });
+    expect(await frame.getByRole('textbox', { name: 'Account email' }).inputValue()).toBe('');
+
+    observation = await observePage(tab);
+    const old = refIn(observation, 'Search term');
+    await tab.reload();
+    await search.waitFor();
+    expect(await batch(tab, [{ kind: 'type', ...old, text: 'stale' }])).toMatchObject({ reason: 'stale_ref' });
+    expect(await search.inputValue()).toBe('');
+  });
+
   it('does not turn an internal TypeError into an actionability refusal', async () => {
     const page = await open();
     await go(page, OPEN_WEB.faq);
@@ -1171,7 +1225,7 @@ describe.skipIf(!chromePath)('ordinary actions in native Chrome', { timeout: 60_
     await go(page, OPEN_WEB.typedPosts);
     const guard = await ensureBrowserNavigationGuard(page);
     /** Types as `actions` says, aimed from a fresh observation, once every earlier window has closed. */
-    const typed = async (actions: (observation: BrowserObservation) => BrowserAction[]): Promise<void> => {
+    const typed = async (actions: (observation: BrowserSnapshotObservation) => BrowserAction[]): Promise<void> => {
       await guard.actionsSettled();
       await page.evaluate(`document.getElementById('status').textContent = 'Ready'`);
       expect(await batch(page, actions(await observePage(page)))).toMatchObject({ status: 'completed' });
@@ -1415,7 +1469,7 @@ describe.skipIf(!chromePath)('ordinary presses that buy, in native Chrome', { ti
     const store = vi.spyOn(loginStoreModule, 'getLoginStore').mockResolvedValue(logins.store);
     try {
       const opened = await run('inventory-labels', [{ kind: 'navigate', url: OPEN_WEB.faq }]);
-      expect((opened.observation as BrowserObservation).site?.vault_items).toEqual([
+      expect((opened.observation as BrowserSnapshotObservation).site?.vault_items).toEqual([
         { item_handle: assistant.id, title: 'Assistant login', account: 'assistant' },
         { item_handle: principal.id, title: 'Principal login', account: 'principal' },
       ]);
@@ -1460,7 +1514,7 @@ describe.skipIf(!chromePath)('ordinary presses that buy, in native Chrome', { ti
           budget_ms: 3_000,
         });
         expect(result).toMatchObject({ reason: 'navigated', actions: [{ status: 'completed' }] });
-        expect((result.observation as BrowserObservation).site).toMatchObject(
+        expect((result.observation as BrowserSnapshotObservation).site).toMatchObject(
           source === 'catalog'
             ? { recipes_status: 'unavailable', vault_items: [{ item_handle: item.id }] }
             : { recipes: [], vault_status: 'vault_unavailable' },
@@ -1592,9 +1646,9 @@ describe.skipIf(!chromePath)('cookie banners in native Chrome', { timeout: 30_00
   /** One batch through the executor, which settles cookie banners before the observation it returns. */
   async function batch(
     ...actions: BrowserAction[]
-  ): Promise<{ result: Record<string, unknown>; seen: BrowserObservation }> {
+  ): Promise<{ result: Record<string, unknown>; seen: BrowserSnapshotObservation }> {
     const result = await executeBrowserBatch(jobContext(db, page, JOB), { actions }, { record: false });
-    return { result, seen: result.observation as BrowserObservation };
+    return { result, seen: result.observation as BrowserSnapshotObservation };
   }
   const observe = () => batch({ kind: 'observe' });
   /** What the page's banner received: its choice, whether a real click made it, and how many presses it took. */
@@ -1704,10 +1758,10 @@ describe.skipIf(!chromePath)('personal data in native Chrome', { timeout: 60_000
     errandRequest(host, id, action, content);
   const run = (id: string, actions: BrowserAction[]) => request(id, 'browser', { actions });
   /** Opens `url` and answers with the observation the navigation returned. */
-  async function open(url: string): Promise<BrowserObservation> {
+  async function open(url: string): Promise<BrowserSnapshotObservation> {
     const opened = await run(`open-${randomUUID()}`, [{ kind: 'navigate', url }]);
     expect(opened).toMatchObject({ status: 'stopped', reason: 'navigated' });
-    return opened.observation as BrowserObservation;
+    return opened.observation as BrowserSnapshotObservation;
   }
   /** Main's disclosure of the mobile number to `site` for this errand, sent as its tool sends it; the host's answer. */
   async function disclose(site: string): Promise<unknown> {

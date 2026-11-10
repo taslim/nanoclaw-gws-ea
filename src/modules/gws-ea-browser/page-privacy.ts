@@ -14,7 +14,10 @@ export interface BrowserDocumentIdentity {
 }
 const documents = new WeakMap<Page, BrowserDocumentIdentity>();
 
-/** Native navigation invalidates every document-bound fact, including a same-URL reload or a frame replacement. */
+/**
+ * Changes with any frame's navigation, same-document ones included: a page read across one may include a document the
+ * secret-field scan never read. Element refs follow narrower rules in observe.ts.
+ */
 export function browserDocumentIdentity(page: Page): BrowserDocumentIdentity {
   let identity = documents.get(page);
   if (!identity) {
@@ -63,11 +66,7 @@ interface DocumentTree {
   frame: { loaderId: string };
   childFrames?: DocumentTree[];
 }
-/**
- * The page target's tree omits out-of-process frames. Their documents need no entry: none outlives the main-frame
- * document it was created under, and that document is always in this tree.
- */
-async function documentLoaders(page: Page): Promise<Set<string>> {
+async function documentTree(page: Page): Promise<DocumentTree> {
   let attached = documentSessions.get(page);
   if (!attached) {
     attached = page.context().newCDPSession(page);
@@ -78,14 +77,26 @@ async function documentLoaders(page: Page): Promise<Set<string>> {
     });
   }
   const session = await attached;
-  const tree = await session.send('Page.getFrameTree');
+  return (await session.send('Page.getFrameTree')).frameTree;
+}
+
+/**
+ * The page target's tree omits out-of-process frames. Their documents need no entry: none outlives the main-frame
+ * document it was created under, and that document is always in this tree.
+ */
+async function documentLoaders(page: Page): Promise<Set<string>> {
   const loaders = new Set<string>();
   const visit = (node: DocumentTree): void => {
     if (node.frame.loaderId) loaders.add(node.frame.loaderId);
     node.childFrames?.forEach(visit);
   };
-  visit(tree.frameTree);
+  visit(await documentTree(page));
   return loaders;
+}
+
+/** The main frame's current document: a same-document navigation keeps it, and any other navigation replaces it. */
+export async function mainDocumentLoader(page: Page): Promise<string | undefined> {
+  return (await documentTree(page)).frame.loaderId || undefined;
 }
 
 /**

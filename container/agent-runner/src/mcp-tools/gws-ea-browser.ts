@@ -47,7 +47,9 @@ function action(kind: string, properties: Record<string, object> = {}, required:
 export const browser = requestTool({
   name: 'browser',
   description:
-    'Run an ordered batch in this errand’s host browser, on any public site. It stops at the first failure or navigation and returns the resulting page observation, with generation-stamped refs. Screenshots arrive as images, linked by each action’s image_index. JavaScript, field-value reads, clipboard access, cookies and storage export are unavailable. Ordinary text input refuses passwords, codes and payment fields; use fill_secret or sign_in_code for sign-in, and credential_form for an authorized signup or password change. ' +
+    'Run an ordered batch in this errand’s host browser, on any public site. It stops at the first failure or navigation and returns the resulting page observation, with generation-stamped refs. ' +
+    'An observation’s snapshot has a fixed size: an open dialog first, then the focused form, then the rest of the page in order. Parts that did not fit are listed by ref at its end; observe with within set to one to read that part. After an action other than observe, an observation may hold only delta, the lines added and removed since your last full snapshot; refs on unchanged lines stay usable with its new generation. Refs stay usable until the page loads a new document or their own frame navigates. ' +
+    'Screenshots arrive as images, linked by each action’s image_index. JavaScript, field-value reads, clipboard access, cookies and storage export are unavailable. Ordinary text input refuses passwords, codes and payment fields; use fill_secret or sign_in_code for sign-in, and credential_form for an authorized signup or password change. ' +
     'The host refuses only commit-class actions: a purchase, booking or order, which goes through purchase; an account-security change; and speaking as the principal. Before each observation it rejects a cookie banner that offers a reject option, and the observation’s cookie_banner says what it did. ' +
     'Outcomes: completed, or stopped with a reason. navigated: the action reached another document; inspect its observation before continuing. challenge and sign_in_wall describe the resulting document even after navigation. navigation_failed: transport failed, with no inferred HTTP status; report the limitation and request id to main. A handler-error is an unexpected host runtime failure; report it with its safe diagnostics and request id, without blindly retrying. stale_ref or not_actionable: observe again; not_actionable also means something covered the control. purchase_control: call purchase with that control. speaks_as_principal: reviews, comments, ratings, tips, contact forms, chats and messages to people stay refused; a note that belongs to a booking or order, such as an allergy, goes in that form’s own field and rides along with it. account_security: changes to an account’s email, phone, password, two-factor, payment methods or existence are refused; report the need to main. consent_control: the host makes every consent, marketing and agreement choice before a form is submitted, so leave those boxes to it. consent_required: the form needs wording only the principal can agree to; call request_consent with the stop_id it returned. secret_field: use fill_secret, sign_in_code or credential_form. card_field: card details are never entered; report to main that the checkout needs a card. personal_data: nothing ran; the batch would have given private details without main’s disclosure, or a principal email only the host may fill from a saved login. Report the site and detail to main; never retype it elsewhere. alias_unavailable: the assistant’s web address is not set up; tell main the operator must finish setup. unapproved_commit: an ordinary press landed on a confirmation showing a charge nobody approved; the host stopped this errand and told main, so report only what the page showed. site_busy: another errand is using this site; the host wakes you when it is free. sign_in_wall: sign in with fill_secret or sign_in_code. timeout, window_closed or interrupted: observe before acting again. challenge, blocked_address or browser_unavailable: report what you could not get past to main. ' +
     NO_REPEAT,
@@ -63,7 +65,13 @@ export const browser = requestTool({
             { url: { type: 'string', format: 'uri', description: 'The public HTTP or HTTPS URL to open.' } },
             ['url'],
           ),
-          action('observe'),
+          action('observe', {
+            within: {
+              ...REF,
+              description:
+                'A ref from the latest observation, often one listed as cut: show only that part of the page. Only as the last action.',
+            },
+          }),
           action('screenshot'),
           action('click', REF_FIELDS, ['ref', 'generation']),
           action(

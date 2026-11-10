@@ -93,6 +93,77 @@ it('returns screenshots in a top-level image envelope linked to their action, wh
   expect(screenshots).toBe(2);
 });
 
+/** A page larger than one snapshot, of sixty listings, whose last line says `ending`; and a context for batches on it. */
+function listingsPage(ending: string): { page: Page; context: BrowserExecutionContext } {
+  const sections = Array.from({ length: 60 }, (_value, index) => ({
+    role: 'region',
+    name: `Listing ${index + 1}`,
+    ref: `e${10 + index}`,
+    text: 'Garden flat near the river with morning light. '.repeat(8),
+  }));
+  const page = {
+    url: () => 'about:blank',
+    context: () => ({
+      newCDPSession: async () => ({ on() {}, send: async () => ({ targetInfo: { targetId: 'page' } }) }),
+      browser: () => ({ once() {}, newBrowserCDPSession: async () => ({ on() {}, send: async () => undefined }) }),
+    }),
+    on() {},
+    off() {},
+    once() {},
+    frames: () => [],
+    mainFrame: () => ({}),
+    isClosed: () => false,
+    locator: () => ({
+      ariaSnapshotJSON: async () => [...sections, { role: 'paragraph', ref: 'e99', text: ending }],
+    }),
+    screenshot: async () => Buffer.from('screenshot'),
+  } as unknown as Page;
+  const context = {
+    job: { id: 'job' },
+    page: async () => page,
+    assertActive: async () => undefined,
+    remaining: () => 90_000,
+    signal: new AbortController().signal,
+    store: { db: {} },
+  } as unknown as BrowserExecutionContext;
+  return { page, context };
+}
+
+it('reads a challenge from the whole page even where the agent’s snapshot is cut', async () => {
+  const { context } = listingsPage('Please verify you are human to continue browsing.');
+  const result = await executeBrowserBatch(context, { actions: [{ kind: 'observe' }] }, { record: false });
+  expect(result.observation?.snapshot).toBeDefined();
+  expect(result.observation?.snapshot).not.toContain('verify you are human');
+  expect(result).toMatchObject({ status: 'stopped', reason: 'challenge' });
+});
+
+it('shows the page after an observe action, and only what changed after another action', async () => {
+  const { context } = listingsPage('Contact the host');
+  const run = (kind: 'observe' | 'screenshot') =>
+    executeBrowserBatch(context, { actions: [{ kind }] }, { record: false });
+  expect((await run('observe')).observation).toHaveProperty('snapshot');
+  const after = (await run('screenshot')).observation;
+  expect(after).not.toHaveProperty('snapshot');
+  expect(after?.delta).toEqual({ removed: [], added: [] });
+  expect((await run('observe')).observation).toHaveProperty('snapshot');
+});
+
+it('accepts an observation within a ref only as the batch’s closing look', () => {
+  const within = { ref: 'f1e4', generation: 3 };
+  expect(validateBrowserBatch({ actions: [{ kind: 'observe', within }] })).toEqual({
+    actions: [{ kind: 'observe', within }],
+  });
+  expect(() =>
+    validateBrowserBatch({
+      actions: [
+        { kind: 'observe', within },
+        { kind: 'scroll', direction: 'down' },
+      ],
+    }),
+  ).toThrow();
+  expect(() => validateBrowserBatch({ actions: [{ kind: 'observe', within: { ref: 'e4' } }] })).toThrow();
+});
+
 describe("the assistant's own address in a site field", () => {
   const opened = new Error('The batch opened its page');
   const context = {

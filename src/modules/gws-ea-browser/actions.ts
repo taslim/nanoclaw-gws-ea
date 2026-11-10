@@ -104,7 +104,8 @@ export type BrowserStopReason =
   | 'interrupted';
 export type BrowserAction =
   | { kind: 'navigate'; url: string }
-  | { kind: 'observe' | 'screenshot' }
+  | { kind: 'observe'; within?: BrowserRef }
+  | { kind: 'screenshot' }
   | ({ kind: 'click' | 'download' } & BrowserRef)
   | ({ kind: 'type'; text: string } & BrowserRef)
   | ({ kind: 'select'; value: string } & BrowserRef)

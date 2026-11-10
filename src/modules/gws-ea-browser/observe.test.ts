@@ -1,7 +1,14 @@
 import { expect, it, vi } from 'vitest';
 import type { Page } from 'playwright-core';
 import { readPageSecretValues } from './control-facts.js';
-import { observePage, configureBrowserSiteInfo, snapshotBrowserStructure, pinBrowserRefs } from './observe.js';
+import {
+  BROWSER_SNAPSHOT_BUDGET,
+  configureBrowserSiteInfo,
+  observePage,
+  observePageChanges,
+  pinBrowserRefs,
+  snapshotBrowserStructure,
+} from './observe.js';
 import {
   registerPageSecret,
   releasePageSecret,
@@ -151,6 +158,138 @@ it('emits host site metadata for changed full origins and keeps titles untrusted
   url = 'https://bob.github.io/login';
   expect((await observePage(page)).site?.origin).toBe('https://bob.github.io');
   expect(JSON.stringify(first)).not.toContain('private-fixture-value');
+});
+
+/** A restaurant page far larger than one observation: navigation, many menu sections, a time dialog and a footer. */
+function largeRestaurantTree(dialog = true, section = 'Menu section'): unknown {
+  const sections = Array.from({ length: 30 }, (_value, index) => ({
+    role: 'region',
+    name: `${section} ${index + 1}`,
+    ref: `e${100 + index * 10}`,
+    children: [
+      { role: 'heading', name: `${section} ${index + 1}`, level: 2, ref: `e${101 + index * 10}` },
+      {
+        role: 'paragraph',
+        ref: `e${102 + index * 10}`,
+        text: `${section}: ${'seasonal plates from the old mill kitchen. '.repeat(10)}`,
+      },
+      { role: 'button', name: `Reserve from section ${index + 1}`, ref: `e${103 + index * 10}` },
+    ],
+  }));
+  return [
+    {
+      role: 'generic',
+      ref: 'e1',
+      children: [
+        {
+          role: 'navigation',
+          name: 'Primary',
+          ref: 'e2',
+          children: Array.from({ length: 20 }, (_value, index) => ({
+            role: 'link',
+            name: `Neighbourhood ${index + 1}`,
+            ref: `e${3 + index}`,
+            url: `/area/${index + 1}`,
+          })),
+        },
+        { role: 'main', ref: 'e50', children: sections },
+        ...(dialog
+          ? [
+              {
+                role: 'dialog',
+                name: 'Choose a time',
+                ref: 'e900',
+                children: [
+                  { role: 'button', name: '7:30 PM', ref: 'e901' },
+                  { role: 'button', name: '8:00 PM', ref: 'e902' },
+                ],
+              },
+            ]
+          : []),
+        { role: 'contentinfo', ref: 'e950', children: [{ role: 'link', name: 'Careers', ref: 'e951' }] },
+      ],
+    },
+  ];
+}
+
+function fakePage(tree: () => unknown, url = 'https://tables.example/bistro-juno'): Page {
+  return {
+    url: () => url,
+    on() {},
+    frames: () => [],
+    locator: () => ({ ariaSnapshotJSON: async () => tree() }),
+    getByRef: (ref: string) => ({
+      elementHandle: async () => ({ ownerFrame: async () => ({}), dispose: async () => undefined, ref }),
+    }),
+  } as unknown as Page;
+}
+
+it('bounds a large page, showing the open dialog first and listing each cut section by ref', async () => {
+  const page = fakePage(() => largeRestaurantTree());
+  const observation = await observePage(page);
+  const snapshot = observation.snapshot;
+  expect(snapshot.length).toBeLessThanOrEqual(BROWSER_SNAPSHOT_BUDGET);
+  expect(observation).not.toHaveProperty('delta');
+  expect(snapshot.split('\n').slice(0, 3)).toEqual([
+    '- dialog "Choose a time" [ref=e900]:',
+    '  - button "7:30 PM" [ref=e901]',
+    '  - button "8:00 PM" [ref=e902]',
+  ]);
+  // The dialog is not repeated where it sits in the page.
+  expect(snapshot.match(/\[ref=e901\]/gu)).toHaveLength(1);
+  expect(snapshot).toContain('link "Neighbourhood 20" [ref=e22]');
+  expect(snapshot).toContain('button "Reserve from section 1" [ref=e103]');
+  const cut = snapshot.slice(snapshot.indexOf('\n# '));
+  expect(cut).toMatch(/observe with within/u);
+  expect(cut).toContain('region "Menu section 30" [ref=e390]');
+  expect(cut).toContain('contentinfo [ref=e950]');
+  expect(cut).not.toContain('Reserve from section 30');
+  for (const line of cut.trim().split('\n')) expect(line).toMatch(/^# /u);
+});
+
+it('reads a cut section within its ref, under the same budget, with refs the next action can use', async () => {
+  const page = fakePage(() => largeRestaurantTree());
+  const first = await observePage(page);
+  expect(first.snapshot).not.toContain('Reserve from section 30');
+  const within = await observePage(page, undefined, { within: { ref: 'e390', generation: first.generation } });
+  expect(within.snapshot.split('\n')[0]).toBe('- region "Menu section 30" [ref=e390]:');
+  expect(within.snapshot).toContain('button "Reserve from section 30" [ref=e393]');
+  expect(within.snapshot).not.toContain('Neighbourhood');
+  const pinned = await pinBrowserRefs(page, [{ ref: 'e393', generation: within.generation }]);
+  expect(pinned.get('e393')).toBeDefined();
+  await expect(
+    observePage(page, undefined, { within: { ref: 'e390', generation: first.generation } }),
+  ).rejects.toMatchObject({ reason: 'stale_ref' });
+  await expect(
+    observePage(page, undefined, { within: { ref: 'e999', generation: within.generation } }),
+  ).rejects.toMatchObject({ reason: 'not_actionable' });
+});
+
+it('answers a later look with the changes alone when they are small, and with the snapshot otherwise', async () => {
+  let section = 'Menu section';
+  let filled = '';
+  const page = fakePage(() => {
+    const tree = largeRestaurantTree(true, section) as Array<{ children: unknown[] }>;
+    tree[0].children.unshift({ role: 'textbox', name: 'Party size', ref: 'e60', text: filled });
+    return tree;
+  });
+  const first = await observePageChanges(page);
+  expect(first.snapshot).toBeDefined();
+  expect(first).not.toHaveProperty('delta');
+  filled = '4';
+  const typed = await observePageChanges(page);
+  expect(typed).not.toHaveProperty('snapshot');
+  expect(typed.delta).toEqual({
+    removed: ['  - textbox "Party size" [ref=e60]: ""'],
+    added: ['  - textbox "Party size" [ref=e60]: "4"'],
+  });
+  // An explicit look always shows the page.
+  const looked = await observePage(page);
+  expect(looked.snapshot).toContain('textbox "Party size" [ref=e60]: "4"');
+  section = 'Wine list';
+  const replaced = await observePageChanges(page);
+  expect(replaced.snapshot).toContain('region "Wine list 1" [ref=e100]');
+  expect(replaced).not.toHaveProperty('delta');
 });
 
 // These fake pages have no native DOM; Chrome suites exercise collection. Keep actual taint and redaction.

@@ -30,6 +30,8 @@ import {
   browserStructureFacts,
   disposeBrowserRefs,
   observePage,
+  observePageChanges,
+  observedPageText,
   pinBrowserRefs,
   readBrowserRef,
   hasBrowserChallenge,
@@ -108,6 +110,10 @@ export function validateBrowserBatch(content: Record<string, unknown>): BrowserB
         keys(value, ['kind', 'url']);
         return { kind, url: text(value.url, 'url') };
       case 'observe':
+        keys(value, ['kind', 'within']);
+        return value.within === undefined
+          ? { kind }
+          : { kind, within: readBrowserRef(value.within, 'within needs a ref and its snapshot generation.') };
       case 'screenshot':
         keys(value, ['kind']);
         return { kind };
@@ -178,6 +184,8 @@ export function validateBrowserBatch(content: Record<string, unknown>): BrowserB
         throw invalidArgs('Unknown browser action kind. JavaScript and field reads are unavailable.');
     }
   });
+  if (actions.slice(0, -1).some((action) => action.kind === 'observe' && action.within))
+    throw invalidArgs('An observation within a ref must be the last action.');
   return { actions };
 }
 
@@ -755,11 +763,16 @@ async function executeBatch(
         assertActive: context.assertActive,
         remaining: context.remaining,
       });
-      observation = await observePage(page, context.assertActive, {
-        cookieBanner,
-        remaining: context.remaining,
-        signal: context.signal,
-      });
+      const look = { cookieBanner, remaining: context.remaining, signal: context.signal };
+      const closing = actions.at(-1);
+      // An observe action asks to see the page; after any other action, only what changed may be enough.
+      observation =
+        closing?.kind === 'observe'
+          ? await observePage(page, context.assertActive, {
+              ...look,
+              ...(closing.within && results.at(-1)?.status === 'completed' ? { within: closing.within } : {}),
+            })
+          : await observePageChanges(page, context.assertActive, look);
     } catch (error) {
       if (!unapproved) {
         const failure = batchErrorReason(error, guard.reason(), context, page);
@@ -770,12 +783,13 @@ async function executeBatch(
   // Playwright waits only for main-frame navigations, so a refusal inside a frame can land after its action.
   const blocked = guard.reason();
   if ((!reason || reason === 'navigated') && blocked) reason = blocked;
-  if (observation && (!reason || reason === 'navigated') && hasBrowserChallenge(observation.snapshot))
-    reason = 'challenge';
+  // The whole page, not the agent's cut of it, decides what the page shows.
+  const pageText = observation ? observedPageText(page) : '';
+  if (observation && (!reason || reason === 'navigated') && hasBrowserChallenge(pageText)) reason = 'challenge';
   if (
     observation &&
     (!reason || reason === 'navigated') &&
-    /(?:sign in to continue|log in to continue|please sign in)/iu.test(observation.snapshot)
+    /(?:sign in to continue|log in to continue|please sign in)/iu.test(pageText)
   )
     reason = 'sign_in_wall';
   let recording: { status: 'complete' | 'unavailable'; trace_indices: number[] } | undefined;
