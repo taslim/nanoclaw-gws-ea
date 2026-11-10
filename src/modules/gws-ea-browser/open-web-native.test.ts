@@ -2426,12 +2426,14 @@ document.getElementById('updated').addEventListener('click', () => location.assi
       delayMs: 12_000,
     }));
     await open(CONSENT.offers);
-    const pressedAt = Date.now();
+    const shownAgain = page.waitForEvent('framenavigated', {
+      predicate: (frame) => frame === page.mainFrame() && frame.url() === CONSENT.offers,
+      timeout: 30_000,
+    });
     const first = await purchase('Reserve now');
     expect(first).toMatchObject({ status: 'pressed', site: 'table.example', repeat_safe: false });
     // The repeat comes on the checkout the site's late answer showed again.
-    await new Promise((resolve) => setTimeout(resolve, Math.max(0, pressedAt + 13_000 - Date.now())));
-    expect(page.url()).toBe(CONSENT.offers);
+    await shownAgain;
     expect(await purchase('Reserve now')).toMatchObject({
       status: 'already_pressed',
       pressed_at: first.pressed_at,
