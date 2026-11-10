@@ -73,7 +73,6 @@ import {
   PROCESSOR,
   checkoutPage,
   feeTablePage,
-  genericCheckoutPages,
   guestBookingPage,
   htmlPage,
   openWebFixture,
@@ -89,7 +88,6 @@ import { testLoginStore } from './testing/login-store.js';
 import { observePage, type BrowserSnapshotObservation } from './observe.js';
 import { registerPageSecret, releasePageSecret } from './page-privacy.js';
 import { registerBrowserPurchaseDelivery, resumeBrowserPurchaseCommits } from './purchase.js';
-import { recordPurchaseOutcome } from './purchase-outcome.js';
 import { type BrowserQueue } from './queue.js';
 import type { BrowserExecutionContext, BrowserWatchExecutionContext } from './actions.js';
 import { executeRecipe, saveBrowserRecipe } from './recipes.js';

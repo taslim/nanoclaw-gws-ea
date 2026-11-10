@@ -627,7 +627,6 @@ describe.skipIf(!chromePath)('a reader watch beside region watches in native Chr
   let resy: Awaited<ReturnType<typeof resyFixture>>;
   let queue: BrowserQueue;
   let session: Session;
-  let jobId: string;
   const request = (action: string, content: Record<string, unknown>): Promise<Record<string, unknown>> =>
     requestOf(queue, session, action, content);
   beforeEach(async () => {
@@ -644,9 +643,7 @@ describe.skipIf(!chromePath)('a reader watch beside region watches in native Chr
     );
     session = (await resolveSystemSession('reader-browser', 'system:a2a:reader-main:counter')).session;
     const store = new BrowserStore();
-    const job = await store.jobForSession(session);
-    if (!job) throw new Error('No browser job');
-    jobId = job.id;
+    if (!(await store.jobForSession(session))) throw new Error('No browser job');
     resy = await resyFixture(chromePath, freeResyTable());
     await resyReservationSignature.preparePage?.(resy.page);
     // The model-free check reads Resy's API in a page of its own, as a signed-out check page would.

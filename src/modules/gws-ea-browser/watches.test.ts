@@ -562,7 +562,6 @@ describe('native watch bounds and one booking claim', () => {
     await queue.stop();
   });
   it('arms a financial watch only through its native principal card, with restart-safe replay and exact host policy', async () => {
-    const at = new Date().toISOString();
     const cards = await bindPrincipal();
     const { context } = await executionContext('setup');
     const terms = '$12.50 per guest for cancellation within 24 hours or no-show';
