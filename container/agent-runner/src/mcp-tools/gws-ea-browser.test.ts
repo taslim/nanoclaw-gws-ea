@@ -63,7 +63,7 @@ const cases: ReadonlyArray<readonly [McpToolDefinition, Record<string, unknown>]
       submit: { ref: 'e3', generation: 1 },
     },
   ],
-  [signInCode, { from: 'principal', target, send: { ref: 'e2', generation: 1 } }],
+  [signInCode, { target, send: { ref: 'e2', generation: 1 } }],
   [
     credentialForm,
     {
@@ -359,7 +359,12 @@ describe('the browser tools', () => {
       { field: 'password', target },
     ])
       expect(validate({ ...fields, ...chosen })).toBe(false);
-    expect(signInCode.tool.inputSchema.properties).toHaveProperty('from');
+    // A code the principal sends reaches the browser in main's message: sign_in_code serves the assistant's own mail.
+    const signIn = new Ajv().compile(signInCode.tool.inputSchema);
+    const refs = { target, send: { ref: 'e2', generation: 1 } };
+    expect(signIn(refs)).toBe(true);
+    expect(signIn({ ...refs, from: 'principal' })).toBe(false);
+    expect(signInCode.tool.description).not.toMatch(/principal|awaiting_code/u);
   });
 
   it('takes a watch’s maximum as its only financial bound, and names a fee above it', () => {

@@ -254,15 +254,9 @@ export const credentialForm = requestTool({
 export const signInCode = requestTool({
   name: 'sign_in_code',
   description:
-    'Register a site-bound sign-in wait before the host presses the send control. The target is the code field, or the starting email field of a passwordless flow; the host binds its new code field after the transition. For assistant mail, isolated external-email interprets one qualifying code or magic link; only the host inserts or opens it. from=principal records the wait for a code relayed through main; never supply a raw code here. Outcomes: code_filled, link_opened, nothing_arrived, ambiguous, origin_mismatch, awaiting_code or alias_unavailable (no web address is set up yet). Observe again after completion; tell main the recorded site when awaiting_code, and report ambiguity, origin mismatch or alias_unavailable. ' +
+    'Register a site-bound sign-in wait before the host presses the send control. The target is the code field, or the starting email field of a passwordless flow; the host binds its new code field after the transition. For assistant mail, isolated external-email interprets one qualifying code or magic link; only the host inserts or opens it. Outcomes: code_filled, link_opened, nothing_arrived, ambiguous, origin_mismatch or alias_unavailable (no web address is set up yet). Observe again after completion, and report ambiguity, origin mismatch or alias_unavailable. ' +
     NO_REPEAT,
   properties: {
-    from: {
-      type: 'string',
-      enum: ['assistant', 'principal'],
-      default: 'assistant',
-      description: 'Whose mailbox receives the sign-in message.',
-    },
     target: REF,
     send: REF,
     submit: REF,

@@ -19,20 +19,6 @@ export const cancelJob = requestTool({
   repeatable: true,
   timeoutMs: 120_000,
 });
-export const relayCode = requestTool({
-  name: 'relay_code',
-  description:
-    'Relay a principal-provided sign-in code directly to the host for this job. Name the recorded site when asking the principal; never send the code in a message to browser. The host fills only its recorded field and origin. Returns code_filled; origin_mismatch means the field or site changed; no_wait means no eligible wait exists, so do not send the code elsewhere. After a timeout, use request_status before anything else; do not repeat because the first call may still act.',
-  properties: {
-    thread: THREAD,
-    code: { type: 'string', description: 'The sign-in code the principal relayed for this recorded site.' },
-  },
-  required: ['thread', 'code'],
-  additionalProperties: false,
-  repeatable: false,
-  timeoutMs: 120_000,
-});
-
 export const reservationGuarantee = requestTool({
   name: 'reservation_guarantee',
   description:
@@ -216,7 +202,6 @@ export const recordPurchaseOutcome = requestTool({
 registerTools(
   [
     cancelJob,
-    relayCode,
     reservationGuarantee,
     reservationBounds,
     loginsPage,

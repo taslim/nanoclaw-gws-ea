@@ -38,7 +38,6 @@ const region = (changes: Partial<ControlRegion> = {}): ControlRegion => ({
   freeText: false,
   commits: false,
   accountFields: false,
-  secretFields: false,
   ...changes,
 });
 

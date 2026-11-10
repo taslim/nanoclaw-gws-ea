@@ -18,7 +18,7 @@ async function delegates(agentGroupId: string): Promise<boolean> {
  */
 export const BROWSER_DELEGATE_CAPABILITY = 'browser-delegate';
 registerCapability(BROWSER_DELEGATE_CAPABILITY, {
-  description: 'Delegate browser errands, cancel jobs and relay principal sign-in codes through the host',
+  description: 'Delegate browser errands and cancel jobs through the host',
   default: 'off',
   grantedTo: delegates,
 });

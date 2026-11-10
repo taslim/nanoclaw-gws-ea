@@ -23,8 +23,7 @@ import { bindBrowserSecretFields, executeFillSecret, fillBoundBrowserSecrets } f
 import './merchant-signatures.js';
 import { browserConsentMigration, browserSiteLeasesMigration } from './migration.js';
 import { browserSignInMigration } from './sign-in-migration.js';
-import { recoverBrowserSignInMail, executeSignInCode } from './sign-in-mail.js';
-import { getSignInClaim } from '../gws-ea-inbox/claims.js';
+import { recoverBrowserSignInMail } from './sign-in-mail.js';
 import type { BrowserSecretField } from './authentication-signatures.js';
 import { observePage, type BrowserRef, type PinnedBrowserRef } from './observe.js';
 import { browserPaths } from './paths.js';
@@ -587,34 +586,6 @@ describe.skipIf(!chromePath)('native host secret fill', { timeout: 30_000 }, () 
     });
   }
 
-  for (const path of ['/otp-send', '/otp-send-button']) {
-    it(`opens the principal code wait after its ${path} control runs on a real code form`, async () => {
-      await page.goto(`https://auth.example${path}`);
-      const observation = await observePage(page);
-      const ref = (label: string): BrowserRef => {
-        const line = observation.snapshot.split('\n').find((line) => line.includes(`"${label}"`));
-        const found = line?.match(/\[ref=([^\]]+)\]/u)?.[1];
-        if (!found) throw new Error(`Missing ${label} reference`);
-        return { ref: found, generation: observation.generation };
-      };
-      expect(
-        await executeSignInCode(context(), {
-          from: 'principal',
-          target: ref('Code'),
-          send: ref('Send code'),
-          submit: ref('Verify'),
-        }),
-      ).toEqual({ status: 'awaiting_code', site: 'auth.example', origin: 'https://auth.example' });
-      expect(posts).toHaveLength(1);
-      expect(Object.fromEntries(new URLSearchParams(posts[0].body))).toEqual(path === '/otp-send' ? { code: '' } : {});
-      expect(await getSignInClaim('signin-native-fill-request')).toMatchObject({
-        source: 'principal',
-        state: 'waiting',
-        origin: 'https://auth.example',
-      });
-      expect(await page.locator('input[name=code]').inputValue()).toBe('');
-    });
-  }
   async function binding(frame: Frame, kind: BrowserSecretField = 'password') {
     const target = await frame.locator('#chosen input').elementHandle();
     const submit = await frame.locator('#chosen button').elementHandle();

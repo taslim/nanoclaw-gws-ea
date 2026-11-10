@@ -73,7 +73,6 @@ export const OPERATIONAL_CODES: ReadonlySet<string> = new Set([
   'origin_mismatch',
   'no_item_for_site',
   'vault_unavailable',
-  'awaiting_code',
   'nothing_arrived',
   'ambiguous',
   'link_opened',

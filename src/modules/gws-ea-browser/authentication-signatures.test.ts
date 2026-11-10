@@ -5,7 +5,7 @@ import {
   browserDiagnosticsUnsafe,
   credentialFieldFits,
   httpsOrigin,
-  isSensitiveField,
+  entryRefusal,
 } from './authentication-signatures.js';
 
 it('recognizes credential fields without granting card, new-password or security fields authority', () => {
@@ -38,35 +38,23 @@ it('treats Playwright protocol logging as unsafe for sign-in', () => {
     expect(browserDiagnosticsUnsafe(environment)).toBe(true);
 });
 
-it('treats every password-bearing field as secret, including a show-password toggle that made it text', () => {
-  const field = (facts: Partial<Parameters<typeof isSensitiveField>[0]>) => ({
-    type: 'text',
-    autocomplete: '',
-    name: '',
+it('lets the agent type a code into any field, never card details, credentials or a password into a masked one', () => {
+  const field = (facts: Partial<Parameters<typeof entryRefusal>[0]>) => ({
+    card: false,
+    credential: false,
+    masked: false,
     ...facts,
   });
-  for (const facts of [
-    field({ type: 'password', name: 'pin' }),
-    field({ autocomplete: 'new-password' }),
-    field({ autocomplete: 'current-password' }),
-    field({ name: 'confirm_password' }),
-    field({ name: 'passwordConfirmation' }),
-    field({ id: 'new-pwd' }),
-    field({ id: 'currentPassword' }),
-    field({ label: 'Repeat password' }),
-    field({ label: 'Repeat passphrase' }),
-    field({ autocomplete: 'one-time-code' }),
-    field({ autocomplete: 'cc-number' }),
-    field({ name: 'cvv' }),
-  ])
-    expect(isSensitiveField(facts)).toBe(true);
-  for (const facts of [
-    field({ name: 'email', type: 'email', autocomplete: 'email' }),
-    field({ name: 'passenger_name' }),
-    field({ name: 'compass_heading' }),
-    field({ name: 'first_name', autocomplete: 'given-name' }),
-  ])
-    expect(isSensitiveField(facts)).toBe(false);
+  for (const code of ['552913', '5', 'A7KX29', 'abcdefghij'])
+    for (const facts of [field({}), field({ masked: true })]) expect(entryRefusal(facts, code)).toBeUndefined();
+  expect(entryRefusal(field({}), 'Tr0ub4dor&3 is long')).toBeUndefined();
+  for (const value of ['Tr0ub4dor&3', 'abcdefghijk', '5529 13', 'pass-word'])
+    expect(entryRefusal(field({ masked: true }), value)).toBe('secret_field');
+  // A key types no text: Enter and Backspace act on a masked field, never on a credential or card field.
+  expect(entryRefusal(field({ masked: true }))).toBeUndefined();
+  expect(entryRefusal(field({ credential: true }))).toBe('secret_field');
+  expect(entryRefusal(field({ credential: true }), '552913')).toBe('secret_field');
+  expect(entryRefusal(field({ card: true, masked: true }), '4242')).toBe('card_field');
 });
 
 it('fits credential roles only to fields whose structure supports them, never current and new interchangeably', () => {

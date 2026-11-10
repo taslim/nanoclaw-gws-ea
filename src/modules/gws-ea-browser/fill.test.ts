@@ -17,7 +17,7 @@ import {
 import type { BrowserExecutionContext } from './actions.js';
 import type { PinnedBrowserRef } from './observe.js';
 import { observePage, configureBrowserSiteInfo } from './observe.js';
-import { pageHasSecret } from './page-privacy.js';
+import { pageFieldHoldsHostSecret, pageHasSecret } from './page-privacy.js';
 import * as navigation from './commit-classifier.js';
 import * as nativeAuthentication from './authentication-submit.js';
 import * as isolatedFacts from './control-facts.js';
@@ -319,6 +319,32 @@ it('detects a changed target value and clears every field holding the value, inc
     code: 'forbidden',
   });
   expect(f.nodes.map((node) => node.value)).toEqual(['', '']);
+});
+
+it('closes the job when a filled value cannot be cleared, and keeps refusing agent presses until it closes', async () => {
+  const f = fixture();
+  const binding = await bindBrowserSecretFields(f.page, [{ field: 'password', target: f.target }], f.submit);
+  // A page copy of the value whose setter ignores clearing.
+  let held = '';
+  const stuck = {
+    get value(): string {
+      return held;
+    },
+    set value(value: string) {
+      if (value) held = value;
+    },
+  };
+  f.nodes.push(stuck);
+  f.nativeFill.mockImplementation(async (value) => {
+    f.field.value = value;
+    stuck.value = value;
+    return true;
+  });
+  expect(await fillBoundBrowserSecrets(f.context, binding, async () => [SECRET])).toEqual({
+    status: 'cleared_after_submit',
+  });
+  expect(f.context.runtime.closeJob).toHaveBeenCalledWith('job');
+  expect(await pageFieldHoldsHostSecret(f.page)).toBe(true);
 });
 
 it('sanitizes browser and resolver failures and accepts no raw values or references', async () => {

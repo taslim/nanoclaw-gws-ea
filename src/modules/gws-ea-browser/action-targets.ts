@@ -1,5 +1,5 @@
 import { classifyNavigationUrl, type ActionClass } from './control-policy.js';
-import { readPageControlFacts, type ControlFacts } from './control-facts.js';
+import { readPageControlFacts, withheldField, type ControlFacts } from './control-facts.js';
 import { browserActionRefs } from './actions.js';
 import { browserStructureFacts } from './observe.js';
 import { browserPageReplayUrl, redactPageData } from './page-privacy.js';
@@ -23,9 +23,8 @@ export function browserKeyboardSubmitTarget(element: ElementHandle): Promise<JSH
 async function readOnlyTarget(page: Page, target: PinnedBrowserRef, kind: ActivationIntent['kind']): Promise<boolean> {
   const facts = await readPageControlFacts(page, target.element);
   if (
-    facts.secretEntry ||
+    withheldField(facts) ||
     facts.transaction ||
-    facts.cardEntry ||
     (await classifyActivation(page, target.element, kind)) !== 'ordinary'
   )
     return false;
@@ -128,7 +127,7 @@ export function enrichBrowserActionFacts(
     for (let index = 0; index < inputCount; index++) {
       const facts = controls.get(targets[index].ref)?.facts;
       const frameUrl = step.targets[index]?.frameUrls.at(-1);
-      if (!facts || facts.secretEntry || !frameUrl) return undefined;
+      if (!facts || withheldField(facts) || !frameUrl) return undefined;
       step.inputs.push({ name: facts.inputName ?? '', origin: new URL(facts.formAction ?? frameUrl).origin });
     }
     const submits =
@@ -149,8 +148,7 @@ export function enrichBrowserActionFacts(
         if (!control) return false;
         const { facts, classification } = control;
         return (
-          !facts.secretEntry &&
-          !facts.cardEntry &&
+          !withheldField(facts) &&
           !facts.transaction &&
           classification === 'ordinary' &&
           (facts.formMethod === undefined || facts.formMethod.toLowerCase() === 'get')

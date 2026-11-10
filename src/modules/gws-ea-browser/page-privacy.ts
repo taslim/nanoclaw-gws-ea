@@ -1,4 +1,4 @@
-import type { CDPSession, Page } from 'playwright-core';
+import type { CDPSession, ElementHandle, Page } from 'playwright-core';
 import { ControlFactsUnavailableError, readPageSecretValues } from './control-facts.js';
 
 interface PagePrivacyState {
@@ -59,6 +59,28 @@ export function registerPageSecret(page: Page, value: string): void {
 }
 export function releasePageSecret(page: Page, value: string): void {
   stateFor(page).activeSecrets.delete(value);
+}
+
+/**
+ * Whether a field in any frame still holds a value the host filled and has not released: a fill whose clearing
+ * failed, until its job closes. A read that cannot complete counts as finding one.
+ */
+export async function pageFieldHoldsHostSecret(page: Page): Promise<boolean> {
+  const active = stateFor(page).activeSecrets;
+  if (!active.size) return false;
+  for (const frame of page.frames()) {
+    let elements: ElementHandle[] = [];
+    try {
+      elements = await frame.locator('input,textarea').elementHandles();
+      for (const element of elements) if (active.has(await element.inputValue())) return true;
+      // eslint-disable-next-line no-catch-all/no-catch-all -- an unreadable field may hold the value; fail closed
+    } catch {
+      return true;
+    } finally {
+      await Promise.all(elements.map((element) => element.dispose().catch(() => undefined)));
+    }
+  }
+  return false;
 }
 
 const documentSessions = new WeakMap<Page, Promise<CDPSession>>();

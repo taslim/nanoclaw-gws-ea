@@ -48,13 +48,12 @@ import {
   sweepBrowserJobSessions,
 } from './cancel.js';
 import { reconcileBrowserGroup } from './reconcile.js';
-import { browserSignInMigration } from './sign-in-migration.js';
+import { browserSignInAssistantOnlyMigration, browserSignInMigration } from './sign-in-migration.js';
 import {
   cleanupBrowserSignInMail,
   recoverBrowserSignInMail,
   registerSignInMailDelivery,
   signInCodeAction,
-  relaySignInAction,
 } from './sign-in-mail.js';
 import {
   registerBrowserPurchaseDelivery,
@@ -94,6 +93,7 @@ registerMigration(browserGenericCheckoutMigration);
 registerMigration(browserWatchRegionMigration);
 registerMigration(browserPurchaseOutcomesMigration);
 registerMigration(browserConsentOutcomesMigration);
+registerMigration(browserSignInAssistantOnlyMigration);
 
 const runtime = new BrowserRuntime(undefined, browserAdmissionReady, undefined, async (jobId) => {
   const store = new BrowserStore();
@@ -205,7 +205,6 @@ export const browserActions: BrowserActions = {
   fill_secret: fillSecretAction,
   credential_form: credentialFormAction,
   sign_in_code: signInCodeAction,
-  browser_relay_sign_in: relaySignInAction,
   save_recipe: saveRecipeAction,
   run_recipe: runRecipeAction,
   request_consent: requestConsentAction,
@@ -248,7 +247,7 @@ registerBrowserActionDelivery('request_consent', getBrowserQueue);
 for (const name of ['watch', 'list_watches', 'cancel_watch'] as const)
   registerBrowserActionDelivery(name, getBrowserQueue);
 registerBrowserCancellationDelivery(getBrowserQueue);
-registerSignInMailDelivery(getBrowserQueue);
+registerSignInMailDelivery();
 registerBrowserPurchaseDelivery(getBrowserQueue);
 registerPurchaseOutcomeDelivery(getBrowserQueue);
 registerReservationGuaranteeDelivery();

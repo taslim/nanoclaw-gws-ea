@@ -17,7 +17,7 @@ import type { Page } from 'playwright-core';
 import { invalidArgs } from '../../cli/delivery-action.js';
 import { isRecord } from '../../gws-ea/validation.js';
 import { classifyNavigationUrl } from './control-policy.js';
-import { readPageControlFacts } from './control-facts.js';
+import { readPageControlFacts, withheldField } from './control-facts.js';
 import { executeBrowserBatch } from './executor.js';
 import { browserSite } from './leases.js';
 import {
@@ -433,7 +433,7 @@ export async function executeRecipe(
         for (const locator of targets.slice(0, expectedInputs.length)) {
           const element = await resolveLocator(page, locator, false);
           try {
-            if ((await readPageControlFacts(page, element)).secretEntry)
+            if (withheldField(await readPageControlFacts(page, element)))
               throw new Error('The recorded input became a secret field');
             actual.push(await element.inputValue());
           } finally {

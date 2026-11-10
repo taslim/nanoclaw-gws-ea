@@ -386,9 +386,6 @@ async function linkState(link: MatterLink, sources: LiveSources, lens: Lens): Pr
         const view = await readBrowserJob(link.reference);
         if (!view) return { line: 'no such browser job' };
         const held = view.held_sites.length === 0 ? '' : `; sites: ${view.held_sites.join(', ')}`;
-        const signIn = view.waiting_sign_in
-          ? `; waiting for a principal sign-in code for ${view.waiting_sign_in.site} (${view.waiting_sign_in.origin})`
-          : '';
         const card = view.open_card
           ? `; card awaiting the principal: ${view.open_card.site}, ${view.open_card.total}, ${view.open_card.due_now} due now, until ${view.open_card.expires}`
           : '';
@@ -399,7 +396,7 @@ async function linkState(link: MatterLink, sources: LiveSources, lens: Lens): Pr
           )
           .join('');
         return {
-          line: `${view.state}${held}${signIn}${card}${unconfirmed}`,
+          line: `${view.state}${held}${card}${unconfirmed}`,
           ...(view.last_report
             ? {
                 framed: `  Last report ${formatLocalTime(view.last_report.at, lensZoneAt(lens, view.last_report.at))}:\n${untrusted(view.last_report.text, FRAME_LIMIT, 'browser')}`,

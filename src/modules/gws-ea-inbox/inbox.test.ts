@@ -870,7 +870,6 @@ it('hands matching sign-in mail and HTML only to one isolated system session, on
   await createSignInClaim({
     id: 'browser-claim',
     jobId: 'browser-job',
-    source: 'assistant',
     origin: 'https://shop.example',
     binding: { frame: 0, field: 'e1' },
     at: new Date(now()),
@@ -936,7 +935,6 @@ it('retries a reserved Spam message after transient dispatch failure without lea
   await createSignInClaim({
     id: 'spam-claim',
     jobId: 'job',
-    source: 'assistant',
     origin: 'https://shop.example',
     binding: {},
     at: new Date(now()),
@@ -967,7 +965,6 @@ it.each(['expiry', 'recovery'] as const)('keeps failed reserved credentials isol
   await createSignInClaim({
     id: 'ended-claim',
     jobId: 'job',
-    source: 'assistant',
     origin: 'https://shop.example',
     binding: {},
     at: new Date(now()),
@@ -994,7 +991,6 @@ it('exhausts sign-in dispatch retries quietly while ordinary principal mail prog
   await createSignInClaim({
     id: 'failed-claim',
     jobId: 'job',
-    source: 'assistant',
     origin: 'https://shop.example',
     binding: {},
     at: new Date(now()),
@@ -1032,7 +1028,6 @@ it('retries reserved dispatch within one second in the real loop without extra c
     await createSignInClaim({
       id: 'retry-claim',
       jobId: 'job',
-      source: 'assistant',
       origin: 'https://shop.example',
       binding: {},
       at: new Date(now()),
@@ -1057,7 +1052,6 @@ it('keeps a principal-only message private when its domain matches a sign-in cla
   await createSignInClaim({
     id: 'principal-domain',
     jobId: 'job',
-    source: 'assistant',
     origin: 'https://portal.principal.example',
     binding: {},
     at: new Date(now()),
@@ -1078,7 +1072,6 @@ it('preserves a complete HTML magic-link target after a large email template', a
   await createSignInClaim({
     id: 'template-claim',
     jobId: 'job',
-    source: 'assistant',
     origin: 'https://shop.example',
     binding: {},
     at: new Date(now()),
@@ -1114,7 +1107,6 @@ it('stops fetching full messages once every pending sign-in has matched', async 
   await createSignInClaim({
     id: 'bounded-claim',
     jobId: 'job',
-    source: 'assistant',
     origin: 'https://shop.example',
     binding: {},
     at: new Date(now()),
@@ -1144,7 +1136,6 @@ it('wakes one inbox loop promptly, polls pending mail quickly, and retains the c
     await createSignInClaim({
       id: 'fast-claim',
       jobId: 'job',
-      source: 'assistant',
       origin: 'https://shop.example',
       binding: {},
       at: new Date(now()),

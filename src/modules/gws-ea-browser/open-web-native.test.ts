@@ -85,6 +85,7 @@ import * as loginStoreModule from './login-store.js';
 import { createLoginsPageHandler } from './logins-page.js';
 import { testLoginStore } from './testing/login-store.js';
 import { observePage, type BrowserSnapshotObservation } from './observe.js';
+import { registerPageSecret, releasePageSecret } from './page-privacy.js';
 import { registerBrowserPurchaseDelivery, resumeBrowserPurchaseCommits } from './purchase.js';
 import { recordPurchaseOutcome } from './purchase-outcome.js';
 import { type BrowserQueue } from './queue.js';
@@ -1306,19 +1307,17 @@ describe.skipIf(!chromePath)('ordinary actions in native Chrome', { timeout: 60_
     expect(posts()).toEqual(['https://bistro.example/availability/hold']);
   });
 
-  it.each([
-    { source: 'autocomplete', label: 'Display value', attributes: 'autocomplete="new-password"' },
-    { source: 'label', label: 'Password', attributes: '' },
-  ])(
-    'refuses ordinary typing and editing of a secret field even when page script hides its attributes ($source)',
-    async ({ label, attributes }) => {
+  it.each(['new-password', 'current-password'])(
+    'refuses ordinary typing and editing of a field marked %s even when page script hides its attributes',
+    async (autocomplete) => {
       const page = await open();
-      const url = 'https://shop.example/secret-entry';
+      const url = `https://shop.example/secret-entry-${autocomplete}`;
+      const label = 'Display value';
       fixture.serve(
         url,
         htmlPage(
           'Profile',
-          `<form method="post" action="${url}/submitted"><label>${label} <input id="entry" name="value" type="text" ${attributes}></label><button>Continue</button></form>`,
+          `<form method="post" action="${url}/submitted"><label>${label} <input id="entry" name="value" type="text" autocomplete="${autocomplete}"></label><button>Continue</button></form>`,
           `
       const read = HTMLInputElement.prototype.getAttribute;
       HTMLInputElement.prototype.getAttribute = function(name) {
@@ -1327,7 +1326,6 @@ describe.skipIf(!chromePath)('ordinary actions in native Chrome', { timeout: 60_
     `,
         ),
       );
-      fixture.serve(`${url}/submitted`, htmlPage('Submitted', 'Done'));
       await page.goto(url);
       const secret = 'Synthetic-"credential\\U3-42';
       await page.locator('#entry').fill(secret);
@@ -1339,9 +1337,10 @@ describe.skipIf(!chromePath)('ordinary actions in native Chrome', { timeout: 60_
       await page.locator('#entry').fill('');
       for (const kind of ['type', 'key', 'form_input'] as const) {
         const field = refIn(await observePage(page), label);
+        // A code-shaped value too: only the host fills a credential field.
         const action: BrowserAction =
           kind === 'type'
-            ? { kind, ...field, text: 'ordinary-text' }
+            ? { kind, ...field, text: '552913' }
             : kind === 'key'
               ? { kind, ...field, key: 'Backspace' }
               : { kind, fields: [{ ...field, value: 'ordinary-text' }] };
@@ -1349,12 +1348,142 @@ describe.skipIf(!chromePath)('ordinary actions in native Chrome', { timeout: 60_
         expect(result).toMatchObject({ status: 'stopped', reason: 'secret_field' });
         expect(await page.locator('#entry').inputValue()).toBe('');
       }
-      await page.locator('#entry').fill(secret);
-      const submitted = await batch(page, [{ kind: 'click', ...refIn(await observePage(page), 'Continue') }]);
-      expect.soft(submitted).toMatchObject({ status: 'stopped', reason: 'secret_field' });
-      expect(fixture.requests.some((request) => request.url === `${url}/submitted`)).toBe(false);
     },
   );
+
+  describe('codes the agent types', () => {
+    const CODE = '552913';
+    const verify = (url: string, fields: string): string =>
+      htmlPage(
+        'Verify',
+        `<h1>Enter the code we sent</h1><form method="post" action="${url}/verified">${fields}<button type="submit">Verify</button></form>`,
+      );
+    const serve = (name: string, fields: string): string => {
+      const url = `https://shop.example/verify-${name}`;
+      fixture.serve(url, verify(url, fields));
+      fixture.serve(`${url}/verified`, htmlPage('Verified', '<h1>You are signed in</h1>'));
+      return url;
+    };
+
+    it('types a code into a one-time-code field, shows it as typed, and leaves screenshots available', async () => {
+      const page = await open();
+      await page.goto(
+        serve(
+          'otp',
+          '<label>Verification code <input name="code" autocomplete="one-time-code" inputmode="numeric"></label>',
+        ),
+      );
+      const typed = await batch(page, [
+        { kind: 'type', ...refIn(await observePage(page), 'Verification code'), text: CODE },
+      ]);
+      expect(typed).toMatchObject({ status: 'completed' });
+      expect(await page.locator('[name=code]').inputValue()).toBe(CODE);
+      expect((await observePage(page)).snapshot).toContain(CODE);
+      expect(await batch(page, [{ kind: 'screenshot' }])).toMatchObject({
+        status: 'completed',
+        images: [{ mime_type: 'image/png' }],
+      });
+    });
+
+    it('types one digit into each of six single-digit boxes', async () => {
+      const page = await open();
+      const boxes = Array.from(
+        { length: 6 },
+        (_value, index) =>
+          `<input aria-label="Digit ${index + 1}" name="d${index + 1}" maxlength="1" inputmode="numeric"${index === 0 ? ' autocomplete="one-time-code"' : ''}>`,
+      ).join('');
+      await page.goto(serve('boxes', boxes));
+      const observation = await observePage(page);
+      const typed = await batch(page, [
+        {
+          kind: 'form_input',
+          fields: [...CODE].map((digit, index) => ({ ...refIn(observation, `Digit ${index + 1}`), value: digit })),
+        },
+      ]);
+      expect(typed).toMatchObject({ status: 'completed' });
+      expect(await Promise.all((await page.locator('input').all()).map((input) => input.inputValue()))).toEqual([
+        ...CODE,
+      ]);
+    });
+
+    it('types a code into a masked PIN field, then presses Verify, with screenshots still available', async () => {
+      const page = await open();
+      const url = serve('pin', '<label>PIN <input name="pin" type="password" inputmode="numeric"></label>');
+      await page.goto(url);
+      const typed = await batch(page, [{ kind: 'type', ...refIn(await observePage(page), 'PIN'), text: CODE }]);
+      expect(typed).toMatchObject({ status: 'completed' });
+      expect(await batch(page, [{ kind: 'screenshot' }])).toMatchObject({ status: 'completed' });
+      expect(await click(page, 'Verify')).toMatchObject({ status: 'stopped', reason: 'navigated' });
+      expect(page.url()).toBe(`${url}/verified`);
+      expect(posts()).toContain(`${url}/verified`);
+    });
+
+    it('refuses a password-shaped value in a masked field, and a model-chosen signup password never submits', async () => {
+      const page = await open();
+      const url = serve(
+        'signup',
+        '<label>Username <input name="username"></label><label>Password <input name="password" type="password"></label>',
+      );
+      await page.goto(url);
+      for (const text of ['Tr0ub4dor&3', 'longerthanten1', '5529 13']) {
+        const typed = await batch(page, [{ kind: 'type', ...refIn(await observePage(page), 'Password'), text }]);
+        expect(typed).toMatchObject({ status: 'stopped', reason: 'secret_field' });
+      }
+      const observation = await observePage(page);
+      const signup = await batch(page, [
+        {
+          kind: 'form_input',
+          fields: [
+            { ...refIn(observation, 'Username'), value: 'fixture-member' },
+            { ...refIn(observation, 'Password'), value: 'Model-chosen-passphrase-9' },
+          ],
+          submit: refIn(observation, 'Verify'),
+        },
+      ]);
+      expect(signup).toMatchObject({ status: 'stopped', reason: 'secret_field' });
+      expect(await page.locator('[name=password]').inputValue()).toBe('');
+      expect(posts()).not.toContain(`${url}/verified`);
+    });
+
+    it.each(['form', 'formless'] as const)(
+      'refuses an agent press while a %s group holds a value the host filled',
+      async (shape) => {
+        const page = await open();
+        const url = `https://shop.example/host-held-${shape}`;
+        const fields =
+          '<label>Email <input name="email" type="email"></label><label>Password <input id="pw" name="password" type="password" autocomplete="current-password"></label>';
+        fixture.serve(
+          url,
+          htmlPage(
+            'Sign in',
+            shape === 'form'
+              ? `<form method="post" action="${url}/session">${fields}<button type="submit">Sign in</button></form>`
+              : `<div>${fields}<div role="button" tabindex="0" id="go">Sign in</div></div>`,
+            shape === 'form'
+              ? ''
+              : `document.getElementById('go').addEventListener('click', () => fetch('${url}/session', { method: 'POST', body: document.getElementById('pw').value }));`,
+          ),
+        );
+        fixture.serve(`${url}/session`, htmlPage('Signed in', '<h1>Signed in</h1>'));
+        await page.goto(url);
+        // A host fill whose clearing failed leaves its value in the field; only the host submits it.
+        const held = 'host-held-fixture-7731';
+        await page.locator('#pw').fill(held);
+        registerPageSecret(page, held);
+        try {
+          expect(await click(page, 'Sign in')).toMatchObject({ status: 'stopped', reason: 'secret_field' });
+          const email = refIn(await observePage(page), 'Email');
+          expect(await batch(page, [{ kind: 'key', ...email, key: 'Enter' }])).toMatchObject({
+            status: 'stopped',
+            reason: 'secret_field',
+          });
+          expect(posts()).not.toContain(`${url}/session`);
+        } finally {
+          releasePageSecret(page, held);
+        }
+      },
+    );
+  });
 
   it('stops a watch batch at a download without running later actions', async () => {
     const page = await open();
@@ -1403,8 +1532,8 @@ describe.skipIf(!chromePath)('ordinary actions in native Chrome', { timeout: 60_
     expect(await typed('Card number')).toMatchObject({ status: 'stopped', reason: 'card_field' });
     expect(await typed('Expiry')).toMatchObject({ status: 'stopped', reason: 'card_field' });
     expect(await page.locator('input[name="cardnumber"]').inputValue()).toBe('');
-    // A gift card's number is no card entry: the secret rule keeps it out of ordinary typing.
-    expect(await typed('Gift card number')).toMatchObject({ status: 'stopped', reason: 'secret_field' });
+    // A gift card's number is no card entry: it is ordinary text, like a coupon.
+    expect(await typed('Gift card number')).toMatchObject({ status: 'completed' });
     await go(page, OPEN_WEB.hostedCard);
     await page.frameLocator('#card-frame').locator('input[name="cardnumber"]').waitFor();
     for (const name of ['Card number', 'CVC']) expect(await typed(name)).toMatchObject({ reason: 'card_field' });
@@ -2209,7 +2338,8 @@ document.getElementById('updated').addEventListener('click', () => location.assi
     for (const [index, [mode, field, value, pictured]] of (
       [
         ['open', password, 'fixture-pass-7731', false],
-        ['closed', code, '552913', false],
+        // A code is ordinary text: it never withholds the picture.
+        ['closed', code, '552913', true],
         ['open', password, '', true],
       ] as const
     ).entries()) {

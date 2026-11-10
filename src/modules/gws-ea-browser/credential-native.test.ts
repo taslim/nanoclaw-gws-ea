@@ -157,7 +157,7 @@ const PAGES: Record<string, string> = {
     });
     document.getElementById('join').addEventListener('submit', (event) => { event.preventDefault(); send(); });`,
   )}`,
-  '/prefilled': `<h1>Join</h1><label>Confirm password <input type="text" name="confirm_password" value="page-chosen-secret-value"></label>`,
+  '/prefilled': `<h1>Join</h1><label>Confirm password <input type="text" name="confirm_password" autocomplete="new-password" value="page-chosen-secret-value"></label>`,
   '/change': `<h1>Security</h1><form method="post" action="/account/change-password">${field('Current password', 'current_password', 'password', 'current-password')}${field('New password', 'new_password', 'password', 'new-password')}${field('Confirm new password', 'confirm_password', 'password', 'new-password')}<button type="submit">Change password</button></form>`,
   '/change-shown-account': `<h1>Security</h1><form method="post" action="/account/change-password"><label>Account <input type="email" name="email" autocomplete="username" value="${USERNAME}" readonly></label>${field('Current password', 'current_password', 'password', 'current-password')}${field('New password', 'new_password', 'password', 'new-password')}${field('Confirm new password', 'confirm_password', 'password', 'new-password')}<button type="submit">Change password</button></form>`,
   '/change-with-email': `<h1>Security</h1><form method="post" action="/account/change-password">${field('Current password', 'current_password', 'password', 'current-password')}${field('New password', 'new_password', 'password', 'new-password')}${field('Recovery email', 'recovery_email', 'email', 'email')}<button type="submit">Change password</button></form>`,
@@ -954,14 +954,14 @@ describe.skipIf(!chromePath)('native authorized signup and password change', { t
       expect(JSON.stringify(shot)).not.toContain(password);
     }, 30_000);
 
-    it('treats a page-filled text-type confirmation field as secret', async () => {
+    it('treats a page-filled credential field as secret, whatever its type shows', async () => {
       await page.goto(`${SITE}/prefilled`);
       expect(JSON.stringify(await observePage(page))).not.toContain('page-chosen-secret-value');
       const shot = await executeBrowserBatch(context(), { actions: [{ kind: 'screenshot' }] }, { record: false });
       expect(shot).toMatchObject({ status: 'stopped', reason: 'secret_field' });
     }, 30_000);
 
-    it('keeps generic typing, keys and clicks out of the credential scope', async () => {
+    it('keeps generic typing and keys out of credential fields, a toggled one included', async () => {
       await page.goto(`${SITE}/masking`);
       await page.evaluate("document.querySelector('[name=password_confirmation]').type = 'text'");
       // Each action stops its batch and its observation renews the refs, so every step reads fresh ones.
@@ -987,9 +987,6 @@ describe.skipIf(!chromePath)('native authorized signup and password change', { t
       expect(await batch(({ password }) => ({ kind: 'key', ...password, key: 'Enter' }))).toEqual(
         stopped('secret_field'),
       );
-      // A form that holds password fields is submitted only by the credential operation itself.
-      expect(await batch(({ activate }) => ({ kind: 'click', ...activate }))).toEqual(stopped('secret_field'));
-      expect(await batch(({ email }) => ({ kind: 'key', ...email, key: 'Enter' }))).toEqual(stopped('secret_field'));
       expect(posts).toEqual([]);
     }, 30_000);
   });

@@ -542,7 +542,6 @@ describe('optional host browser lifecycle', () => {
       'fill_secret',
       'credential_form',
       'sign_in_code',
-      'browser_relay_sign_in',
       'save_recipe',
       'run_recipe',
       'request_consent',
@@ -554,7 +553,7 @@ describe('optional host browser lifecycle', () => {
       'browser_watch_book',
     ];
     expect(Object.keys(browserActions).sort()).toEqual([...names].sort());
-    const internal = new Set(['browser_relay_sign_in', 'browser_purchase_commit', 'browser_watch_book']);
+    const internal = new Set(['browser_purchase_commit', 'browser_watch_book']);
     for (const name of names)
       if (internal.has(name)) expect(delivery.getDeliveryAction(name)).toBeUndefined();
       else expect(delivery.getDeliveryAction(name)).toBeTypeOf('function');

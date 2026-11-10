@@ -8,7 +8,6 @@ import { registerDeliveryAction } from '../../delivery.js';
 import { ALLOW, DENY, defineGuardedAction } from '../../guard/index.js';
 import { withExistingMailboxSession } from '../../session-manager.js';
 import type { PendingApproval, Session } from '../../types.js';
-import { readPendingSignInSite } from '../gws-ea-inbox/claims.js';
 import { attemptSummary } from './notices.js';
 import { getBrowserAgentGroupId } from '../gws-ea-profile/db.js';
 import type { DbDriver } from '../../db/driver.js';
@@ -46,7 +45,6 @@ export interface BrowserJobView {
   readonly job: BrowserJob;
   readonly state: BrowserJobState;
   readonly held_sites: readonly string[];
-  readonly waiting_sign_in?: { readonly site: string; readonly origin: string; readonly expires_at: string };
   readonly open_card?: BrowserJobCard;
   readonly unconfirmed?: readonly BrowserJobUnconfirmed[];
   /** The delivered report's raw text; the rendering boundary frames it as untrusted. */
@@ -158,7 +156,6 @@ export async function readBrowserJob(thread: string, store = new BrowserStore())
         job.id,
       )
     : undefined;
-  const waitingSignIn = job.cancelled ? undefined : await readPendingSignInSite(job.id);
   const report = await withExistingMailboxSession(browser, job.browser_session_id, (mailbox) =>
     mailbox.getLatestDeliveredAgentReport(job.source_agent_group_id),
   );
@@ -186,7 +183,6 @@ export async function readBrowserJob(thread: string, store = new BrowserStore())
               ? 'working'
               : 'idle',
     held_sites: leases.map((lease) => lease.site),
-    ...(waitingSignIn ? { waiting_sign_in: waitingSignIn } : {}),
     ...(await purchaseState(store, job.id)),
     ...(text === undefined || !report ? {} : { last_report: { at: report.timestamp, text } }),
   };

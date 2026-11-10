@@ -49,30 +49,31 @@ export function authenticationFieldKind(facts: AuthenticationFieldFacts): Browse
   return undefined;
 }
 
-/**
- * What marks a field's value as a credential, code or payment secret. Both
- * survive a show-password toggle, which only turns a password field's type to
- * text. The page-side scan in control-facts.ts builds its filter from these.
- */
-export const SECRET_AUTOCOMPLETE = /(?:current-password|new-password|one-time-code|cc-)/iu;
-export const SECRET_DESCRIPTION =
-  /(?:pass(?:word|wd|phrase|code)|pwd|one-time-code|(?:^|\s)cc-|credit.?card|card.?number|cvc|cvv|otp|one.?time|verification.?code|security.?code)/iu;
+/** Marks a field only the host fills: a site's own credential field, whatever its type shows now. */
+export const CREDENTIAL_AUTOCOMPLETE = /(?:^|\s)(?:new|current)-password(?:\s|$)/iu;
+/** A one-time code: up to ten letters and digits, no spaces. A password a model chooses is longer or has symbols. */
+export const CODE_SHAPED = /^[a-z\d]{0,10}$/iu;
 
-export interface SensitiveFieldFacts {
-  type: string;
-  autocomplete: string;
-  name: string;
-  id?: string;
-  label?: string;
-  placeholder?: string;
+/** What the host reads of a field before the agent enters anything into it. */
+export interface EntryFieldFacts {
+  /** A field for payment details. */
+  readonly card: boolean;
+  /** Marked `new-password` or `current-password`. */
+  readonly credential: boolean;
+  /** A masked input: `type=password` when read. */
+  readonly masked: boolean;
 }
 
-/** Ordinary text input refuses these; only the host's bound fills may write them. */
-export function isSensitiveField(facts: SensitiveFieldFacts): boolean {
-  if (facts.type === 'password' || SECRET_AUTOCOMPLETE.test(facts.autocomplete)) return true;
-  return SECRET_DESCRIPTION.test(
-    [facts.autocomplete, facts.name, facts.id ?? '', facts.label ?? '', facts.placeholder ?? ''].join(' '),
-  );
+/**
+ * Whether the agent may enter `value` into a field; `undefined` for a key, which types no text. A code reaches any
+ * field, a masked PIN box included, while a password the agent chose never reaches a credential or masked field, so
+ * accounts are created only through the host's own credential fills.
+ */
+export function entryRefusal(field: EntryFieldFacts, value?: string): 'card_field' | 'secret_field' | undefined {
+  if (field.card) return 'card_field';
+  if (field.credential) return 'secret_field';
+  if (field.masked && value !== undefined && !CODE_SHAPED.test(value)) return 'secret_field';
+  return undefined;
 }
 
 export type CredentialFormField = 'username' | 'current_password' | 'new_password' | 'confirmation';

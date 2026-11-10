@@ -172,29 +172,6 @@ it('cancels jobs linked to closed matters during startup reconciliation', async 
   expect(await readBrowserJob(THREAD)).toMatchObject({ state: 'cancelled' });
 });
 
-it('names the host-recorded site when the principal needs to relay a sign-in code', async () => {
-  const matter = (
-    await openMatter({
-      title: 'Sign in',
-      openLoop: 'Waiting for the principal code.',
-      links: [{ kind: 'job', reference: THREAD }],
-    })
-  ).matter;
-  const at = new Date().toISOString();
-  await getDb().run(
-    `INSERT INTO gws_ea_browser_sign_in_claims
-     (id,job_id,source,origin,domain,binding_json,since_at,expires_at,state)
-     VALUES(?,?,'principal','https://login.merchant.example','merchant.example','{}',?,?,'waiting')`,
-    'principal-site',
-    THREAD,
-    at,
-    new Date(Date.now() + 60_000).toISOString(),
-  );
-  expect(await renderMatter(matter)).toContain(
-    'principal sign-in code for merchant.example (https://login.merchant.example)',
-  );
-});
-
 it("never links another agent's browser job into main's matters", async () => {
   await createAgentGroup({
     id: 'research',

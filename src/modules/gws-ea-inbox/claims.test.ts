@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, expect, it } from 'vitest';
 import { closeDb, initTestDb, runMigrations } from '../../db/index.js';
 import { getDb } from '../../db/connection.js';
-import { browserSignInMigration } from '../gws-ea-browser/sign-in-migration.js';
+import { browserSignInAssistantOnlyMigration, browserSignInMigration } from '../gws-ea-browser/sign-in-migration.js';
 import {
   claimSignInMail,
   createSignInClaim,
@@ -33,7 +33,6 @@ function mail(id: string, offset = 10, signer = 'shop.example', to?: string) {
 const input = {
   id: 'claim',
   jobId: 'job',
-  source: 'assistant' as const,
   origin: 'https://www.shop.example',
   binding: { frame: 0, field: 'e1', generation: 1 },
   at,
@@ -57,13 +56,32 @@ it('reserves one message atomically before a tool turn and retains only that mes
   expect(await claimSignInMail(mail('second'), at)).toBeUndefined();
   expect(await claimSignInMail(mail('first'), new Date(at.getTime() + 180_001))).toBeUndefined();
 });
-it('ignores mail before the claim, foreign domains and principal-mail claims', async () => {
+it('ignores mail before the claim and from foreign domains', async () => {
   await createSignInClaim(input);
   expect(await claimSignInMail(mail('old', -1), at)).toBeUndefined();
   expect(await claimSignInMail(mail('foreign', 1, 'evil.example'), at)).toBeUndefined();
-  await finishSignInClaim('claim');
-  await createSignInClaim({ ...input, id: 'principal', source: 'principal' });
-  expect(await claimSignInMail(mail('new'), at)).toBeUndefined();
+});
+it("keeps the assistant's claims and drops principal ones when principal relays retire", async () => {
+  await createSignInClaim(input);
+  await getDb().run(
+    `INSERT INTO gws_ea_browser_sign_in_claims(id,job_id,source,origin,domain,binding_json,since_at,expires_at,state)
+     VALUES('relay','job','principal','https://www.shop.example','shop.example','{}',?,?,'waiting')`,
+    at.toISOString(),
+    new Date(at.getTime() + 180_000).toISOString(),
+  );
+  await browserSignInAssistantOnlyMigration.up(getDb());
+  expect(await getSignInClaim('claim')).toMatchObject({ state: 'waiting', domain: 'shop.example' });
+  expect(await getSignInClaim('relay')).toBeUndefined();
+  await expect(
+    getDb().run(
+      `INSERT INTO gws_ea_browser_sign_in_claims(id,job_id,source,origin,domain,binding_json,since_at,expires_at,state)
+       VALUES('later','job','principal','https://www.shop.example','shop.example','{}',?,?,'waiting')`,
+      at.toISOString(),
+      at.toISOString(),
+    ),
+  ).rejects.toThrow(/CHECK/u);
+  await createSignInClaim({ ...input, id: 'after' });
+  expect(await claimSignInMail(mail('after'), at)).toMatchObject({ id: 'after' });
 });
 it('recovers without a live field binding while preserving a message already withheld from routing', async () => {
   await createSignInClaim(input);

@@ -1,7 +1,8 @@
 import { useAvailableBrowser } from './testing/browser-runtime.js';
 import * as loginStoreModule from './login-store.js';
 import { testLoginStore } from './testing/login-store.js';
-import { createBrowserQueue, recoverAndStartBrowserQueue } from './index.js';
+// Registers the browser module's migrations.
+import './index.js';
 import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import Database from 'better-sqlite3';
@@ -27,7 +28,6 @@ vi.mock('./fill.js', async (original) => ({
 import { closeDb, createAgentGroup, getDb, initTestDb, runMigrations } from '../../db/index.js';
 import { BrowserStore } from './db.js';
 import {
-  answerRelayCode,
   answerSignInReply,
   registerSignInMailDelivery,
   type SignInReply,
@@ -47,10 +47,8 @@ import {
 } from './fill.js';
 import { observePage, type PinnedBrowserRef } from './observe.js';
 import { pageHasSecret } from './page-privacy.js';
-import { BrowserQueue } from './queue.js';
 import type { BrowserExecutionContext } from './actions.js';
 import { getDeliveryAction } from '../../delivery.js';
-import { ANSWER_LATER } from '../../cli/delivery-action.js';
 import { getSessionsByAgentGroup } from '../../db/sessions.js';
 import { routeSignInMail } from '../gws-ea-inbox/route-mail.js';
 import { parseGmailMessage } from '../gws-ea-inbox/mime.js';
@@ -64,13 +62,9 @@ import { registerMigration } from '../../db/migrations/index.js';
 import '../gws-ea-profile/index.js';
 import { addPrincipalAddress } from '../gws-ea-profile/db.js';
 import { recordWebAlias } from '../gws-ea-profile/testing/web-alias.js';
-import { configureBrowserAccess } from './testing/browser-access.js';
-import { BrowserConsentStop } from './consent.js';
 
 registerMigration(gwsEaInboxMigration);
-registerSignInMailDelivery(() => {
-  throw new Error('Principal queue is provided by its own test.');
-});
+registerSignInMailDelivery();
 
 /** The assistant's web alias: its email on every site. */
 const ALIAS = 'tnatsissa@example.com';
@@ -318,15 +312,18 @@ function fixture(username = false, current = '') {
   };
 }
 const payload = { target: { ref: 'e1', generation: 1 }, send: { ref: 'e2', generation: 1 } };
-it('defaults to the assistant and refuses raw codes, links and arbitrary frame arguments', () => {
-  expect(validateSignInCode(payload)).toMatchObject({ from: 'assistant' });
+it("waits on the assistant's own mail and refuses raw codes, links, a mailbox choice and frame arguments", () => {
+  expect(validateSignInCode(payload)).toEqual(payload);
   for (const extra of [
     { code: '123456' },
     { url: 'https://shop.example' },
     { domain: 'shop.example' },
-    { from: 'watch' },
+    { from: 'principal' },
+    { from: 'assistant' },
   ])
     expect(() => validateSignInCode({ ...payload, ...extra })).toThrow();
+  // A code the principal sends reaches the browser in main's message: no relay waits for it.
+  expect(getDeliveryAction('relay_code')).toBeUndefined();
 });
 it('registers the wait before sending, routes raw HTML to external-email, and resumes only the browser', async () => {
   const f = fixture(true);
@@ -600,145 +597,6 @@ it('returns nothing_arrived within the remaining request budget', async () => {
   expect(await executeSignInCode({ ...f.context, remaining: () => 500 }, payload)).toEqual({
     status: 'nothing_arrived',
   });
-});
-
-it.each(['fill', 'restart', 'consent'] as const)(
-  'defers a principal relay immediately and retains only host references (%s)',
-  async (mode) => {
-    const f = fixture();
-    await observePage(f.page);
-    for (const id of ['main', 'browser', 'research'])
-      await createAgentGroup({ id, name: id, folder: id, agent_provider: null, created_at: new Date().toISOString() });
-    await getDb().run(
-      `UPDATE gws_ea_profile SET assistant_first_name=COALESCE(assistant_first_name,'Juno'),principal_first_name=COALESCE(principal_first_name,'Morgan'),main_agent_group_id = ?, browser_agent_group_id = ? WHERE singleton = 1`,
-      'main',
-      'browser',
-    );
-    // The setting lists a second group: it may use the browser, but its relays reach only its own errands.
-    await configureBrowserAccess(`${root}/browser`, ['main', 'research']);
-    const source = (await resolveSystemSession('main', 'system:principal')).session;
-    const research = (await resolveSystemSession('research', 'system:principal')).session;
-    const browser = (await resolveSystemSession('browser', 'system:a2a:main:job')).session;
-    const job = (await f.context.store.jobForSession(browser))!;
-    const context = { ...f.context, job, session: browser };
-    const waiting = await executeSignInCode(context, { ...payload, from: 'principal' });
-    expect(waiting).toEqual({ status: 'awaiting_code', site: 'shop.example', origin: 'https://www.shop.example' });
-    const code = '817264';
-    const request = { action: 'relay_code', requestId: 'main-relay', thread: job.id, code };
-    const foreign = { action: 'relay_code', requestId: 'research-relay', thread: job.id, code: '552918' };
-    for (const [from, sent] of [
-      [source, request],
-      [research, foreign],
-    ] as const) {
-      const outbound = new Database(outboundDbPath(from.agent_group_id, from.id));
-      outbound
-        .prepare('INSERT INTO messages_out(id,kind,timestamp,content) VALUES(?,?,?,?)')
-        .run(sent.requestId, 'system', new Date().toISOString(), JSON.stringify(sent));
-      outbound.close();
-    }
-    const queue = createBrowserQueue(context.store, {
-      pageForJob: async () => f.page,
-      connection: async () => {
-        throw new Error('No Chrome in this fixture');
-      },
-      closeJob: async () => undefined,
-      withActivity: <T>(operation: () => Promise<T>): Promise<T> => operation(),
-      onDisconnected: () => () => undefined,
-    });
-    if (mode !== 'restart') await recoverAndStartBrowserQueue(queue);
-    if (mode === 'consent')
-      vi.mocked(fillBoundBrowserSecrets).mockRejectedValueOnce(
-        new BrowserConsentStop([
-          { stop_id: 'consent-stop', site: 'shop.example', wording: 'I agree to binding arbitration' },
-        ]),
-      );
-    let unlock!: () => void;
-    const blocked = new Promise<void>((resolve) => {
-      unlock = resolve;
-    });
-    const lock = queue.withJobLock(job.id, () => blocked);
-    await expect(answerRelayCode(request, browser, 'main-relay', queue)).rejects.toThrow(
-      'Only an agent with browser access',
-    );
-    expect(await answerRelayCode(foreign, research, 'research-relay', queue)).toEqual({ status: 'no_wait' });
-    expect(await context.store.pending(job.id)).toEqual([]);
-    expect(await answerRelayCode(request, source, 'main-relay', queue)).toBe(ANSWER_LATER);
-    const pending = await context.store.pending(job.id);
-    expect(pending).toHaveLength(1);
-    expect(JSON.parse(pending[0].payload_json)).toEqual({
-      source_session_id: source.id,
-      source_request_id: 'main-relay',
-      claim_id: 'signin-request',
-    });
-    expect(JSON.stringify(pending)).not.toContain(code);
-    expect(f.values).toEqual([]);
-    if (mode === 'restart') {
-      await recoverBrowserSignInMail();
-      await recoverAndStartBrowserQueue(queue);
-    }
-    unlock();
-    await lock;
-    await queue.idle();
-    await queue.stop();
-    expect(f.values).toEqual(mode === 'fill' ? [code] : []);
-    for (const session of [source, browser]) {
-      const mailbox = new Database(inboundDbPath(session.agent_group_id, session.id), { readonly: true });
-      const contents = mailbox.prepare('SELECT content FROM messages_in').all();
-      mailbox.close();
-      expect(JSON.stringify(contents)).toContain(
-        mode === 'fill'
-          ? 'code_filled'
-          : mode === 'consent'
-            ? 'consent_required'
-            : session === source
-              ? 'origin_mismatch'
-              : 'interrupted',
-      );
-      if (mode === 'consent') {
-        if (session === browser) expect(JSON.stringify(contents)).toContain('consent-stop');
-        expect(JSON.stringify(contents)).not.toContain('handler-error');
-      }
-      expect(JSON.stringify(contents)).not.toContain(code);
-    }
-    expect(await getSignInClaim('signin-request')).toMatchObject({ state: 'finished' });
-  },
-);
-
-it("refuses a principal relay aimed at the email field, sending the browser to the code field the host's send fills", async () => {
-  const f = fixture(true);
-  await observePage(f.page);
-  await expect(executeSignInCode(f.context, { ...payload, from: 'principal' })).rejects.toThrow(
-    "For a code the principal relays, target the site's one-time-code field: the host presses send itself once the wait is recorded.",
-  );
-  expect(f.values).toEqual([]);
-  expect(await getSignInClaim('signin-request')).toBeUndefined();
-});
-
-it('refuses a relay after cancellation cleanup instead of reusing its pinned field', async () => {
-  const f = fixture();
-  await observePage(f.page);
-  await createAgentGroup({
-    id: 'main',
-    name: 'main',
-    folder: 'main',
-    agent_provider: null,
-    created_at: new Date().toISOString(),
-  });
-  await getDb().run(
-    `UPDATE gws_ea_profile SET assistant_first_name=COALESCE(assistant_first_name,'Juno'),principal_first_name=COALESCE(principal_first_name,'Morgan'),main_agent_group_id = ? WHERE singleton = 1`,
-    'main',
-  );
-  await executeSignInCode(f.context, { ...payload, from: 'principal' });
-  await cleanupBrowserSignInMail('job');
-  expect(
-    await answerRelayCode(
-      { thread: 'job', code: '817264' },
-      { agent_group_id: 'main' } as never,
-      'relay',
-      {} as BrowserQueue,
-    ),
-  ).toEqual({ status: 'no_wait' });
-  expect(f.values).toEqual([]);
 });
 
 describe('a signup waiting for its email verification', () => {

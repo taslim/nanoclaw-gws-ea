@@ -10,7 +10,6 @@ import {
   credentialAuthority,
   recordDisclosure,
   recordPurchaseOutcome,
-  relayCode,
   reservationGuarantee,
   reservationBounds,
   loginsPage,
@@ -23,7 +22,6 @@ afterEach(closeSessionDb);
 
 const DELEGATE_TOOLS = [
   cancelJob,
-  relayCode,
   reservationGuarantee,
   reservationBounds,
   loginsPage,
@@ -62,14 +60,6 @@ it('passes an exact thread to host cancellation and never models cancellation as
   );
   expect(kind).toBe('system');
   expect(request).toEqual({ action: 'cancel_job', requestId: id, thread: 'system:a2a:main:1' });
-});
-
-it('keeps relay_code in its host request and requires both thread and code before sending', async () => {
-  expect((await relayCode.handler({ code: '123456' })).isError).toBe(true);
-  expect(getUndeliveredMessages()).toHaveLength(0);
-  // The answer is the host's alone: the code never comes back to the agent.
-  const { request, id } = await call(relayCode, { thread: 'system:a2a:main:1', code: '123456' }, { status: 'no_wait' });
-  expect(request).toEqual({ action: 'relay_code', requestId: id, thread: 'system:a2a:main:1', code: '123456' });
 });
 
 it('keeps reservation guarantees main-only at the host and exposes a closed explicit-amount schema', () => {

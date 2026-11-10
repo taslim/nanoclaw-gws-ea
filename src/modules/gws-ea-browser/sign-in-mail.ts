@@ -1,23 +1,12 @@
 import { classifyNavigationUrl } from './control-policy.js';
 import { BrowserConsentStop, consentStopsForAgent } from './consent.js';
-import { createHash } from 'node:crypto';
 import type { Frame, Page } from 'playwright-core';
 import { getDomain } from 'tldts';
-import {
-  ANSWER_LATER,
-  ActionRefusal,
-  answeredGuard,
-  answeringAction,
-  forbidden,
-  invalidArgs,
-  writeActionResponse,
-} from '../../cli/delivery-action.js';
+import { ActionRefusal, answeredGuard, answeringAction, forbidden, invalidArgs } from '../../cli/delivery-action.js';
 import { getDb } from '../../db/connection.js';
-import { hasControlCharacters, isRecord } from '../../gws-ea/validation.js';
-import type { ResponseFrame } from '../../cli/frame.js';
+import { hasControlCharacters } from '../../gws-ea/validation.js';
 import { getSession } from '../../db/sessions.js';
 import { registerDeliveryAction } from '../../delivery.js';
-import { clearOutbox, withExistingMailboxSession } from '../../session-manager.js';
 import type { Session } from '../../types.js';
 import { ALLOW, DENY, defineGuardedAction } from '../../guard/index.js';
 import { getExternalEmailAgentGroupId } from '../gws-ea-external-email/index.js';
@@ -27,14 +16,10 @@ import {
   finishSignInClaim,
   getSignInClaim,
   recoverSignInClaims,
-  waitingSignInClaim,
   type SignInClaim,
 } from '../gws-ea-inbox/claims.js';
 import { activeInbox, assistantAddresses } from '../gws-ea-inbox/runtime.js';
-import { errandSource, hasBrowserAccess } from './access.js';
 import { authenticationFieldKind } from './authentication-signatures.js';
-import { browserDelegateGuard } from './cancel.js';
-import type { BrowserJob, BrowserRequest } from './db.js';
 import { ensureBrowserNavigationGuard, framesUnreadyStop, withBrowserJobNavigation } from './commit-classifier.js';
 import {
   assertBrowserSecretDiagnosticsSafe,
@@ -54,12 +39,10 @@ import {
   type PinnedBrowserRef,
 } from './observe.js';
 import { bindPageSecretDocuments, registerPageSecret, releasePageSecret } from './page-privacy.js';
-import { type BrowserQueue } from './queue.js';
 import type { BrowserExecutionContext, BrowserQueuedAction } from './actions.js';
 import { signInAddress } from './web-address.js';
 
 interface SignInPayload extends Record<string, unknown> {
-  from: 'assistant' | 'principal';
   target: BrowserRef;
   send: BrowserRef;
   submit?: BrowserRef;
@@ -69,33 +52,18 @@ function browserRef(raw: unknown): BrowserRef {
 }
 export function validateSignInCode(content: Record<string, unknown>): SignInPayload {
   if (
-    Object.keys(content).some(
-      (key) => !['action', 'requestId', 'budget_ms', 'from', 'target', 'send', 'submit'].includes(key),
-    ) ||
-    (content.from !== undefined && content.from !== 'assistant' && content.from !== 'principal')
+    Object.keys(content).some((key) => !['action', 'requestId', 'budget_ms', 'target', 'send', 'submit'].includes(key))
   )
-    throw invalidArgs('Choose assistant or principal sign-in and current field/control references.');
+    throw invalidArgs('Choose current field and control references.');
   return {
-    from: content.from === 'principal' ? 'principal' : 'assistant',
     target: browserRef(content.target),
     send: browserRef(content.send),
     ...(content.submit === undefined ? {} : { submit: browserRef(content.submit) }),
   };
 }
 
-interface LiveClaim {
-  readonly binding: BoundBrowserSecretFields;
-  readonly refs: Map<string, PinnedBrowserRef>;
-}
-const bindings = new Map<string, LiveClaim>();
-
 function sameOrigin(binding: BoundBrowserSecretFields): boolean {
   return httpsOrigin(binding.fields[0].target.frame.url())?.origin === binding.origin;
-}
-async function releaseBinding(id: string): Promise<void> {
-  const live = bindings.get(id);
-  bindings.delete(id);
-  if (live) await disposeBrowserRefs(live.refs);
 }
 async function codeBinding(
   page: Page,
@@ -197,7 +165,6 @@ export async function openSignupVerification(input: {
   const claim = await createSignInClaim({
     id: input.claimId,
     jobId: input.jobId,
-    source: 'assistant',
     origin: input.origin,
     binding: { attempt: input.attemptId, username: input.username },
   });
@@ -306,7 +273,6 @@ export async function answerSignInReply(
   if (
     !claim ||
     jobId === undefined ||
-    claim.source !== 'assistant' ||
     claim.state !== 'waiting' ||
     claim.gmail_message_id === null ||
     claim.job_id !== jobId ||
@@ -503,14 +469,13 @@ export async function executeSignInCode(
   content: Record<string, unknown>,
 ): Promise<Record<string, unknown>> {
   const payload = validateSignInCode(content);
-  if (payload.from === 'assistant' && !activeInbox()) throw forbidden('The assistant inbox is unavailable.');
+  if (!activeInbox()) throw forbidden('The assistant inbox is unavailable.');
   assertBrowserSecretDiagnosticsSafe();
   const page = await context.page();
   return withBrowserJobNavigation(context, page, async () => {
     let refs = new Map<string, PinnedBrowserRef>();
     let discovered: BoundBrowserSecretFields | undefined;
     let claim: SignInClaim | undefined;
-    let retained = false;
     let assistantWait: ReturnType<typeof awaitAssistantReply> | undefined;
     try {
       await context.assertActive();
@@ -529,10 +494,6 @@ export async function executeSignInCode(
       const kind = field.tag === 'INPUT' ? authenticationFieldKind(field) : undefined;
       if (kind !== 'username' && kind !== 'otp')
         throw invalidArgs('Choose the email or one-time-code field in a supported sign-in form.');
-      if (payload.from === 'principal' && kind !== 'otp')
-        throw invalidArgs(
-          "For a code the principal relays, target the site's one-time-code field: the host presses send itself once the wait is recorded.",
-        );
       // The assistant signs in with its web address, never one it converses from.
       const email = kind === 'username' ? await signInAddress(await target.element.inputValue()) : undefined;
       if (kind === 'username' && email === undefined) return { status: 'alias_unavailable' };
@@ -550,7 +511,6 @@ export async function executeSignInCode(
       claim = await createSignInClaim({
         id: `signin-${context.request.id}`,
         jobId: context.job.id,
-        source: payload.from,
         origin: binding.origin,
         binding: {
           frame: page.frames().indexOf(target.frame),
@@ -559,7 +519,7 @@ export async function executeSignInCode(
           submit: payload.submit ?? payload.send,
         },
       });
-      if (payload.from === 'assistant') assistantWait = awaitAssistantReply(context, claim);
+      assistantWait = awaitAssistantReply(context, claim);
       await context.assertActive();
       if (kind === 'username' && email !== undefined) {
         if (!activeInbox()) throw forbidden('The assistant inbox is unavailable.');
@@ -574,12 +534,7 @@ export async function executeSignInCode(
       }
       await context.assertActive();
       if (!sameOrigin(binding)) return { status: 'origin_mismatch' };
-      if (payload.from === 'principal') {
-        bindings.set(claim.id, { binding, refs });
-        retained = true;
-        return { status: 'awaiting_code', site: claim.domain, origin: claim.origin };
-      }
-      const secret = await assistantWait!.answer;
+      const secret = await assistantWait.answer;
       await context.assertActive();
       if (!secret) return { status: 'nothing_arrived' };
       if (secret.kind === 'unavailable') return { status: 'ambiguous' };
@@ -609,8 +564,8 @@ export async function executeSignInCode(
       throw forbidden('The host could not safely complete this sign-in. Take a fresh observation.');
     } finally {
       assistantWait?.dispose();
-      if (claim && !retained) await finishSignInClaim(claim.id);
-      if (!retained) await disposeBrowserRefs(refs);
+      if (claim) await finishSignInClaim(claim.id);
+      await disposeBrowserRefs(refs);
       if (discovered && ![...refs.values()].some((ref) => ref.element === discovered!.fields[0].target.element)) {
         await disposeBrowserRefs(
           new Map([
@@ -627,173 +582,17 @@ export async function executeSignInCode(
   });
 }
 
-interface RelayPayload extends Record<string, unknown> {
-  source_session_id: string;
-  source_request_id: string;
-  claim_id: string;
-}
-function validateRelayPayload(content: Record<string, unknown>): RelayPayload {
-  if (
-    Object.keys(content).some((key) => !['source_session_id', 'source_request_id', 'claim_id'].includes(key)) ||
-    typeof content.source_session_id !== 'string' ||
-    typeof content.source_request_id !== 'string' ||
-    typeof content.claim_id !== 'string'
-  )
-    throw invalidArgs('The principal relay reference is invalid.');
-  return {
-    source_session_id: content.source_session_id,
-    source_request_id: content.source_request_id,
-    claim_id: content.claim_id,
-  };
-}
-function relayCode(content: Record<string, unknown>): { thread: string; code: string } {
-  if (
-    Object.keys(content).some((key) => !['action', 'requestId', 'thread', 'code'].includes(key)) ||
-    typeof content.thread !== 'string' ||
-    !content.thread ||
-    typeof content.code !== 'string' ||
-    !/^[A-Za-z\d][A-Za-z\d -]{2,63}$/u.test(content.code)
-  )
-    throw invalidArgs('Choose the waiting browser thread and the principal’s code.');
-  return { thread: content.thread, code: content.code };
-}
-
-export async function answerRelayCode(
-  content: Record<string, unknown>,
-  session: Session,
-  requestId: string,
-  queue: BrowserQueue,
-): Promise<Record<string, unknown> | typeof ANSWER_LATER> {
-  if (!(await hasBrowserAccess(session.agent_group_id)))
-    throw forbidden('Only an agent with browser access may relay the principal’s code.');
-  const payload = relayCode(content);
-  // A code goes only to an errand this agent opened.
-  if (errandSource(payload.thread) !== session.agent_group_id) return { status: 'no_wait' };
-  const claim = await waitingSignInClaim(payload.thread, 'principal');
-  if (!claim || !bindings.has(claim.id)) return { status: 'no_wait' };
-  const id = createHash('sha256').update(`${session.id}\0${requestId}`).digest('hex');
-  await queue.enqueueInternal(
-    claim.job_id,
-    'browser_relay_sign_in',
-    { source_session_id: session.id, source_request_id: requestId, claim_id: claim.id },
-    `relay-${id}`,
-  );
-  return ANSWER_LATER;
-}
-async function executeRelayCode(
-  context: BrowserExecutionContext,
-  content: Record<string, unknown>,
-): Promise<Record<string, unknown>> {
-  const payload = validateRelayPayload(content);
-  let result: Record<string, unknown> = { status: 'no_wait' };
-  const source = await getSession(payload.source_session_id);
-  if (
-    !source ||
-    source.agent_group_id !== context.job.source_agent_group_id ||
-    !(await hasBrowserAccess(source.agent_group_id))
-  )
-    return result;
-  const claim = await getSignInClaim(payload.claim_id);
-  const live = bindings.get(payload.claim_id);
-  try {
-    await context.assertActive();
-    if (
-      !claim ||
-      claim.source !== 'principal' ||
-      claim.state !== 'waiting' ||
-      claim.job_id !== context.job.id ||
-      Date.parse(claim.expires_at) <= Date.now() ||
-      !live
-    )
-      return result;
-    result = { status: 'origin_mismatch' };
-    if (!sameOrigin(live.binding)) return result;
-    const message = await withExistingMailboxSession(source.agent_group_id, source.id, (mailbox) =>
-      mailbox.getOutboundMessage(payload.source_request_id),
-    );
-    let original: unknown;
-    try {
-      original = message?.kind === 'system' ? (JSON.parse(message.content) as unknown) : undefined;
-    } catch (error) {
-      if (!(error instanceof SyntaxError)) throw error;
-      original = undefined;
-    }
-    if (!isRecord(original)) return result;
-    const request = original;
-    const relayed = relayCode(request);
-    if (
-      request.action !== 'relay_code' ||
-      request.requestId !== payload.source_request_id ||
-      relayed.thread !== claim.job_id
-    )
-      return result;
-    result = await withBrowserJobNavigation(context, live.binding.page, async () => {
-      const filled = await fillBoundBrowserSecrets(context, live.binding, async () => [relayed.code]);
-      return {
-        status:
-          filled.status === 'submitted' || filled.status === 'cleared_after_submit' ? 'code_filled' : filled.status,
-      };
-    });
-    return result;
-    // eslint-disable-next-line no-catch-all/no-catch-all -- the relayed code and any native exception stay host-only; the fixed result is answered to both callers
-  } catch (error) {
-    if (error instanceof BrowserConsentStop)
-      return { status: 'stopped', reason: error.reason, consent: consentStopsForAgent(error.stops) };
-    return result;
-  } finally {
-    await finishSignInClaim(payload.claim_id);
-    await releaseBinding(payload.claim_id);
-  }
-}
-
-/** A relayed code is queued as durable references only; the queue reads the code from the relaying agent's outbox. */
-export function registerSignInMailDelivery(queue: () => BrowserQueue): void {
+export function registerSignInMailDelivery(): void {
   registerDeliveryAction(
     'sign_in_reply',
     answeringAction('sign_in_reply', answerSignInReply),
     answeredGuard(signInReplyGuard),
   );
-  registerDeliveryAction(
-    'relay_code',
-    answeringAction('relay_code', (content, session, requestId) =>
-      answerRelayCode(content, session, requestId, queue()),
-    ),
-    answeredGuard(browserDelegateGuard),
-  );
 }
 
-/** Native queue delivery owns this side answer for success, pre-start expiry, interruption and restart alike. */
-async function deliverRelayAnswer(request: BrowserRequest, frame: ResponseFrame): Promise<void> {
-  const payload = validateRelayPayload(JSON.parse(request.payload_json) as Record<string, unknown>);
-  const source = await getSession(payload.source_session_id);
-  const job = await getDb().get<BrowserJob>('SELECT * FROM gws_ea_browser_jobs WHERE id = ?', request.job_id);
-  if (
-    !source ||
-    !job ||
-    source.agent_group_id !== job.source_agent_group_id ||
-    job.browser_session_id !== request.session_id
-  )
-    throw forbidden('The principal relay is no longer attached to the job its agent delegated.');
-  const claim = await getSignInClaim(payload.claim_id);
-  if (claim && claim.job_id !== job.id) throw forbidden('The principal relay belongs to another browser job.');
-  const data = frame.ok && isRecord(frame.data) ? frame.data : undefined;
-  const status =
-    data && (data.status === 'code_filled' || data.status === 'no_wait')
-      ? data.status
-      : data?.status === 'stopped' && data.reason === 'consent_required'
-        ? 'consent_required'
-        : 'origin_mismatch';
-  await writeActionResponse(source, payload.source_request_id, {
-    id: payload.source_request_id,
-    ok: true,
-    data: { status },
-  });
-  clearOutbox(source.agent_group_id, source.id, payload.source_request_id);
-}
 export async function recoverBrowserSignInMail(): Promise<void> {
   for (const wait of assistantWaits.values()) wait.complete();
   for (const verification of [...signupVerifications.values()]) dropSignupVerification(verification);
-  for (const id of bindings.keys()) await releaseBinding(id);
   await recoverSignInClaims();
 }
 export async function cleanupBrowserSignInMail(jobId?: string): Promise<void> {
@@ -810,28 +609,7 @@ export async function cleanupBrowserSignInMail(jobId?: string): Promise<void> {
     if (!claim || claim.state !== 'waiting' || verification.expiresAt <= Date.now() || verification.jobId === jobId)
       dropSignupVerification(verification);
   }
-  for (const [id] of bindings) {
-    const claim = await getSignInClaim(id);
-    const job = claim
-      ? await getDb().get<{ cancelled: number }>('SELECT cancelled FROM gws_ea_browser_jobs WHERE id = ?', claim.job_id)
-      : undefined;
-    if (
-      !claim ||
-      claim.state !== 'waiting' ||
-      Date.parse(claim.expires_at) <= Date.now() ||
-      job?.cancelled ||
-      claim.job_id === jobId
-    ) {
-      await releaseBinding(id);
-      if (claim) await finishSignInClaim(id);
-    }
-  }
   await cleanupSignInClaims();
 }
 
 export const signInCodeAction: BrowserQueuedAction = { validate: validateSignInCode, execute: executeSignInCode };
-export const relaySignInAction: BrowserQueuedAction = {
-  validate: validateRelayPayload,
-  execute: executeRelayCode,
-  deliverAnswer: deliverRelayAnswer,
-};

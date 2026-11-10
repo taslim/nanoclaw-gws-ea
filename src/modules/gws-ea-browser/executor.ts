@@ -67,6 +67,7 @@ import {
   type BrowserBatch,
 } from './actions.js';
 import { ControlFactsUnavailableError, readPageControlFacts, type ControlFacts } from './control-facts.js';
+import { entryRefusal } from './authentication-signatures.js';
 import { givenAddressStop } from './web-address.js';
 import { BrowserLocatorError, resolveLocator } from './locators.js';
 
@@ -197,11 +198,18 @@ function givenText(action: BrowserAction): string[] {
   return action.kind === 'form_input' ? action.fields.map((field) => field.value) : [];
 }
 
-/** Payment details are never entered; passwords and codes only through the host's own fills. */
-async function refuseFieldEntry(page: Page, target: PinnedBrowserRef): Promise<ControlFacts> {
+/** Payment details are never entered, and credentials only through the host's own fills; a code goes anywhere. */
+async function refuseFieldEntry(
+  page: Page,
+  target: PinnedBrowserRef,
+  value: string | undefined,
+): Promise<ControlFacts> {
   const facts = await readPageControlFacts(page, target.element);
-  if (facts.cardEntry === true) throw new BrowserBatchStop('card_field');
-  if (facts.secretEntry) throw new BrowserBatchStop('secret_field');
+  const refusal = entryRefusal(
+    { card: facts.cardEntry === true, credential: facts.credentialEntry === true, masked: facts.masked === true },
+    value,
+  );
+  if (refusal) throw new BrowserBatchStop(refusal);
   return facts;
 }
 
@@ -559,13 +567,13 @@ async function executeBatch(
             break;
           case 'type':
             if (target) {
-              recordField(target, await refuseFieldEntry(page, target));
+              recordField(target, await refuseFieldEntry(page, target, action.text));
               await fieldInput(context, guard, [{ target, value: action.text }]);
             }
             break;
           case 'select':
             if (target) {
-              recordField(target, await refuseFieldEntry(page, target));
+              recordField(target, await refuseFieldEntry(page, target, action.value));
               await activateControl(
                 page,
                 target.element,
@@ -580,8 +588,8 @@ async function executeBatch(
             break;
           case 'key':
             if (target) {
-              const facts = await readPageControlFacts(page, target.element);
-              if (facts.secretEntry) throw new BrowserBatchStop('secret_field');
+              // Space types a space; every other allowed key types no text.
+              const facts = await refuseFieldEntry(page, target, SPACE_KEY.test(action.key) ? ' ' : undefined);
               recordField(target, facts, ENTER_KEY.test(action.key) ? 'submit' : 'click');
               const press = (): Promise<void> =>
                 nativeAction(context, (options) => target.element.press(action.key, options));
@@ -631,7 +639,7 @@ async function executeBatch(
             for (const field of action.fields) {
               const pinned = refs.get(field.ref);
               if (!pinned) throw new BrowserBatchStop('stale_ref');
-              recordField(pinned, await refuseFieldEntry(page, pinned));
+              recordField(pinned, await refuseFieldEntry(page, pinned, field.value));
             }
             await fieldInput(
               context,

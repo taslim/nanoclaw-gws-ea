@@ -55,7 +55,6 @@ export const BROWSER_ACTION_NAMES = [
   'fill_secret',
   'credential_form',
   'sign_in_code',
-  'browser_relay_sign_in',
   'save_recipe',
   'run_recipe',
   'request_consent',

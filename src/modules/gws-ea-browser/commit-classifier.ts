@@ -17,10 +17,11 @@ import {
   type ReviewedMerchantFlow,
 } from './control-policy.js';
 import { BrowserConsentStop, runConsentPass, type ConsentScope } from './consent.js';
+import { pageFieldHoldsHostSecret } from './page-privacy.js';
 
 /**
- * `secret_field`: a submission of a form holding a password, code or payment field, which only the host's own
- * sign-in and credential paths make.
+ * `secret_field`: a press while a field holds a password or code the host filled, which only the host's own sign-in
+ * and credential paths submit.
  */
 export type ActivationRefusal = Exclude<ActionClass, 'ordinary'> | 'secret_field';
 /** `site_busy`: another job holds the site; `read_only`: a read-only replay's non-GET document. */
@@ -157,15 +158,6 @@ export interface ActivationResult {
 
 const DEFAULT_ACTION_BUDGET_MS = 10_000;
 
-function submitsForm(facts: ControlFacts, kind: ActivationIntent['kind']): boolean {
-  if (facts.formAction === undefined) return false;
-  if (kind === 'submit') return true;
-  return (
-    (facts.tag === 'button' && facts.type === 'submit') ||
-    (facts.tag === 'input' && ['submit', 'image'].includes(facts.type))
-  );
-}
-
 /**
  * The one boundary every activation passes. A fresh classification decides it: an approved purchase's press
  * runs only on a control its approval covers, anything commit-class is refused, and anything ordinary runs as
@@ -212,11 +204,12 @@ export async function activateControl(
     throw new BrowserActivationError(classification);
   }
   const pressed = pressesControl(facts, intent.kind);
-  if (submitsForm(facts, intent.kind) && facts.region?.secretFields === true)
-    throw new BrowserActivationError('secret_field');
   // Anything that can submit a form: a press, or a choice inside one, which page script may submit on change.
-  if (pressed || (facts.formAction !== undefined && (intent.kind === 'select' || facts.toggles !== undefined)))
+  if (pressed || (facts.formAction !== undefined && (intent.kind === 'select' || facts.toggles !== undefined))) {
+    // A script-driven group submits without a form, so a held value refuses every press, not only its own form's.
+    if (await pageFieldHoldsHostSecret(page)) throw new BrowserActivationError('secret_field');
     await consentBeforeSubmission(page, element, intent);
+  }
   const guard = await ensureBrowserNavigationGuard(page);
   await guard.duringAction(intent.remaining?.() ?? DEFAULT_ACTION_BUDGET_MS, operation);
   return { ordinaryPress: pressed };
