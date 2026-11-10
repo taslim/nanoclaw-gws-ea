@@ -41,7 +41,7 @@ export interface FreePressFacts {
 /** What a free checkout's press answers: pressed now, or the earlier press a repeat would have repeated. */
 export type FreePressAnswer = FreePressFacts & { readonly status: 'pressed' | 'already_pressed' };
 
-/** A job's last free press: a repeat with the same facts would book the same table twice. */
+/** A job's free press: a repeat with the same facts would book the same table twice. */
 interface FreePress {
   readonly site: string;
   readonly facts: string;
@@ -50,7 +50,9 @@ interface FreePress {
   readonly pressedAt: string;
   readonly page: WeakRef<Page>;
 }
-const freePresses = new Map<string, FreePress>();
+/** Each job's presses that may have landed, latest last. */
+const freePresses = new Map<string, readonly FreePress[]>();
+const latestFreePress = (jobId: string): FreePress | undefined => freePresses.get(jobId)?.at(-1);
 
 /**
  * The dialog a free press opened over its own document: until that document changes, the agent's steps in it load
@@ -94,20 +96,20 @@ function openFreeDialog(page: Page, dialog: FreeDialog): void {
 
 /** When job `jobId` last pressed a free checkout, which counts as a step toward a booking. */
 export function lastFreePress(jobId: string): { readonly site: string; readonly at: string } | undefined {
-  const press = freePresses.get(jobId);
+  const press = latestFreePress(jobId);
   return press && { site: press.site, at: press.at };
 }
 
 /** Whether job `jobId`'s page still shows the dialog its free press opened, where a texted code may still land. */
 export function freePressInProgress(jobId: string): boolean {
-  const page = freePresses.get(jobId)?.page.deref();
+  const page = latestFreePress(jobId)?.page.deref();
   return Boolean(page && !page.isClosed() && currentFreeDialog(page));
 }
 
 /**
  * A free checkout's press, as the host presses an approved one: the consent pass, a fresh read immediately before
  * that finds it still free and unchanged, and the press under the checkout origin's admission. Its script requests
- * to payment processors stay refused. A repeat of the job's last free press with the same facts presses nothing.
+ * to payment processors stay refused. A repeat of any of the job's free presses with the same facts presses nothing.
  */
 export async function pressFreeCheckout(
   page: Page,
@@ -120,9 +122,11 @@ export async function pressFreeCheckout(
   const scope = intent.freePress;
   const facts = JSON.stringify(checkout.facts);
   // Only on the page it was pressed in: a page the job lost with its dialog leaves a checkout to rebuild and press.
-  const earlier = freePresses.get(scope.jobId);
-  if (earlier && earlier.page.deref() === page && earlier.site === checkout.site && earlier.facts === facts)
-    return { status: 'already_pressed', site: earlier.site, pressed_at: earlier.pressedAt };
+  const earlier = freePresses.get(scope.jobId) ?? [];
+  const repeated = earlier.find(
+    (press) => press.page.deref() === page && press.site === checkout.site && press.facts === facts,
+  );
+  if (repeated) return { status: 'already_pressed', site: repeated.site, pressed_at: repeated.pressedAt };
   await guard.actionsSettled();
   if (await pageFieldHoldsHostSecret(page)) throw new BrowserActivationError('secret_field');
   await consentBeforeSubmission(page, element, intent);
@@ -141,7 +145,10 @@ export async function pressFreeCheckout(
   const document = await mainDocumentLoader(page).catch(() => undefined);
   const at = new Date().toISOString();
   const start = await scope.pressStarting(checkout, at);
-  freePresses.set(scope.jobId, { site: checkout.site, facts, at, pressedAt: start.pressedAt, page: new WeakRef(page) });
+  freePresses.set(scope.jobId, [
+    ...earlier,
+    { site: checkout.site, facts, at, pressedAt: start.pressedAt, page: new WeakRef(page) },
+  ]);
   // Until the click runs, and again when it fails before dispatching, nothing reached the site.
   let reached = false;
   const press = async (): Promise<void> => {
@@ -166,7 +173,7 @@ export async function pressFreeCheckout(
       freeDialogs.delete(page);
       await start.reached();
     } else {
-      if (earlier) freePresses.set(scope.jobId, earlier);
+      if (earlier.length) freePresses.set(scope.jobId, earlier);
       else freePresses.delete(scope.jobId);
       await start.neverReached();
     }

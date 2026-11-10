@@ -269,6 +269,7 @@ it('answers a later look with the changes alone when they are small, and with th
   let section = 'Menu section';
   let filled = '';
   let times = ['Sold out', 'Sold out'];
+  let notes = ['Sold out', 'Sold out'];
   const page = fakePage(() => {
     const tree = largeRestaurantTree(true, section) as Array<{ children: unknown[] }>;
     tree[0].children.unshift(
@@ -279,6 +280,7 @@ it('answers a later look with the changes alone when they are small, and with th
         ref: `e7${index}`,
         children: [{ role: 'text', text: time }],
       })),
+      { role: 'listitem', name: '9:00 PM', ref: 'e80', children: notes.map((text) => ({ role: 'text', text })) },
     );
     return tree;
   });
@@ -300,6 +302,11 @@ it('answers a later look with the changes alone when they are small, and with th
   const slot = await observePageChanges(page);
   expect(slot).not.toHaveProperty('delta');
   expect(slot.snapshot).toContain('listitem "6:30 PM" [ref=e70]:\n    - text: "Available"');
+  // One of two identical unreferenced lines under one slot disappears: a change all the same.
+  notes = ['Sold out'];
+  const fewer = await observePageChanges(page);
+  expect(fewer).not.toHaveProperty('delta');
+  expect(fewer.snapshot).toContain('listitem "9:00 PM" [ref=e80]:\n    - text: "Sold out"\n');
   section = 'Wine list';
   const replaced = await observePageChanges(page);
   expect(replaced.snapshot).toContain('region "Wine list 1" [ref=e100]');

@@ -2442,6 +2442,29 @@ document.getElementById('updated').addEventListener('click', () => location.assi
     expect(posts()).toEqual(['https://table.example/book/r-7/confirm']);
   }, 60_000);
 
+  it('answers already_pressed for a repeat of an earlier free booking after the errand pressed another', async () => {
+    fixture.serve('https://table.example/book/r-7/confirm', () => ({
+      status: 303,
+      headers: { location: CONSENT.offers },
+    }));
+    const party = async (size: string): Promise<void> => {
+      await open(CONSENT.offers);
+      expect(
+        await run(`party-${randomUUID()}`, [
+          { kind: 'select', ...refIn(await observePage(page), 'Party size'), value: size },
+        ]),
+      ).toMatchObject({ status: 'completed' });
+    };
+    await party('2');
+    const forTwo = await purchase('Reserve now');
+    expect(forTwo).toMatchObject({ status: 'pressed' });
+    await party('4');
+    expect(await purchase('Reserve now')).toMatchObject({ status: 'pressed' });
+    await party('2');
+    expect(await purchase('Reserve now')).toMatchObject({ status: 'already_pressed', pressed_at: forTwo.pressed_at });
+    expect(posts()).toHaveLength(2);
+  }, 60_000);
+
   it.each(['purchase', 'click'] as const)(
     'stops the job with an incident when a free booking’s confirmation shows a charge, pressed by %s',
     async (pressedBy) => {

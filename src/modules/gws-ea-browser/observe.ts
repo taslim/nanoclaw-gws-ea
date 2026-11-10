@@ -437,12 +437,15 @@ async function readPage(
   } else {
     snapshot = compactSnapshot(roots, state.text);
     if (changes && state.url === url && state.presented) {
-      const previous = new Set(state.presented.split('\n'));
-      const current = new Set(snapshot.split('\n'));
-      const removed = [...previous].filter((line) => !current.has(line));
-      const added = [...current].filter((line) => !previous.has(line));
+      // Counted, not deduplicated: one of two identical lines going away is a change too.
+      const counts = new Map<string, number>();
+      for (const line of state.presented.split('\n')) counts.set(line, (counts.get(line) ?? 0) - 1);
+      for (const line of snapshot.split('\n')) counts.set(line, (counts.get(line) ?? 0) + 1);
+      const changed = [...counts].filter(([, count]) => count !== 0);
+      const removed = changed.filter(([, count]) => count < 0).map(([line]) => line);
+      const added = changed.filter(([, count]) => count > 0).map(([line]) => line);
       // A changed line without its own ref cannot be placed, as text repeats across a page: show the snapshot.
-      if ([...removed, ...added].every((line) => OWN_REF.test(line))) delta = { removed, added };
+      if (changed.every(([line]) => OWN_REF.test(line))) delta = { removed, added };
     }
     state.url = url;
     state.presented = snapshot;
