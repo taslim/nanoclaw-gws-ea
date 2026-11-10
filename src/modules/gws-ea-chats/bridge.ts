@@ -283,6 +283,15 @@ export async function flushChatHandoffs(chatId: string, options: { readonly wake
     if (written && options.wake !== false) await requestWake(session, 'inbound-message');
   }
 }
+export async function bookableCalendar(value: unknown): Promise<string> {
+  const requested = textOf(value, 'calendar', 254);
+  const entry = await createMeetingsCalendarApi({
+    token: () => hostGoogleAccessToken('calendar-host'),
+  }).getCalendar(requested);
+  if (!entry || !isBookableCalendar(entry, await loadPrincipalRecognizer()))
+    throw invalidArgs('calendar must be one of the principal’s calendars the assistant can write to.');
+  return entry.id;
+}
 const handoff: ActionAnswer = async (content, session, requestId) => {
   assertFields(content, ['chat', 'message', 'matter', 'files', 'calendar', 'people', 'principal_message', 'job']);
   const chatId = targetId(content);
@@ -323,16 +332,7 @@ const handoff: ActionAnswer = async (content, session, requestId) => {
     }
     if (!check.allowed && principalMessage === undefined) throw forbidden(`Nothing was handed over: ${check.reason}`);
     await checkHandoffLinks(texts, members, people);
-    let calendar: string | undefined;
-    if (content.calendar !== undefined) {
-      const requested = textOf(content.calendar, 'calendar', 254);
-      const entry = await createMeetingsCalendarApi({
-        token: () => hostGoogleAccessToken('calendar-host'),
-      }).getCalendar(requested);
-      if (!entry || !isBookableCalendar(entry, await loadPrincipalRecognizer()))
-        throw invalidArgs('calendar must be one of the principal’s calendars the assistant can write to.');
-      calendar = entry.id;
-    }
+    const calendar = content.calendar === undefined ? undefined : await bookableCalendar(content.calendar);
     const move =
       content.job === true && chat.state !== 'moving' && chat.state !== 'job' ? await prepareChatMove(chat) : undefined;
     await getDb().transaction(async () => {

@@ -65,9 +65,9 @@ const BUDGETS: Readonly<Record<Agent, { readonly tokens: number; readonly reason
       '4,013 tokens: the character, chat role and privacy, chat scheduling with the resident calendar craft and meeting shaping, and WhatsApp formatting; rounded up.',
   },
   job: {
-    tokens: 4_600,
+    tokens: 4_650,
     reason:
-      "4,593 tokens: external-chat's scheduling with the resident calendar craft and its formatting, plus job memory, documents and authority; rounded up.",
+      "4,626 tokens: external-chat's scheduling with the resident calendar craft and its formatting, plus job memory, documents and authority, and the rule that members hear only settled plans, one question at a time and no corrections; rounded up.",
   },
   browser: {
     tokens: 4_800,

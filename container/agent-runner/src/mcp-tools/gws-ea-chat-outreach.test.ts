@@ -17,6 +17,8 @@ it('requires people, words and the principal citation in a closed outreach schem
   };
   expect(valid(args)).toBe(true);
   expect(valid({ ...args, group: 'Coffee' })).toBe(true);
+  expect(valid({ ...args, calendar: 'juno@example.com' })).toBe(true);
+  expect(valid({ ...args, calendar: 7 })).toBe(false);
   expect(valid({ ...args, principal_message: undefined })).toBe(false);
   expect(valid({ ...args, chat: 'forged-target' })).toBe(false);
 });
