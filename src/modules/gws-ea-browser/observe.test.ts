@@ -268,9 +268,18 @@ it('reads a cut section within its ref, under the same budget, with refs the nex
 it('answers a later look with the changes alone when they are small, and with the snapshot otherwise', async () => {
   let section = 'Menu section';
   let filled = '';
+  let times = ['Sold out', 'Sold out'];
   const page = fakePage(() => {
     const tree = largeRestaurantTree(true, section) as Array<{ children: unknown[] }>;
-    tree[0].children.unshift({ role: 'textbox', name: 'Party size', ref: 'e60', text: filled });
+    tree[0].children.unshift(
+      { role: 'textbox', name: 'Party size', ref: 'e60', text: filled },
+      ...times.map((time, index) => ({
+        role: 'listitem',
+        name: `${6 + index}:30 PM`,
+        ref: `e7${index}`,
+        children: [{ role: 'text', text: time }],
+      })),
+    );
     return tree;
   });
   const first = await observePageChanges(page);
@@ -286,6 +295,11 @@ it('answers a later look with the changes alone when they are small, and with th
   // An explicit look always shows the page.
   const looked = await observePage(page);
   expect(looked.snapshot).toContain('textbox "Party size" [ref=e60]: "4"');
+  // One of two identical lines without a ref changes: a delta could not say which slot, so the page is shown.
+  times = ['Available', 'Sold out'];
+  const slot = await observePageChanges(page);
+  expect(slot).not.toHaveProperty('delta');
+  expect(slot.snapshot).toContain('listitem "6:30 PM" [ref=e70]:\n    - text: "Available"');
   section = 'Wine list';
   const replaced = await observePageChanges(page);
   expect(replaced.snapshot).toContain('region "Wine list 1" [ref=e100]');

@@ -94,6 +94,7 @@ const CUT_LIST_ROOM = 2_000;
 const CUT_NAME_LENGTH = 60;
 const DIALOG_ROLES = new Set(['dialog', 'alertdialog']);
 const NO_NODES: ReadonlySet<AriaNode> = new Set();
+const OWN_REF = /\[ref=(?:f\d+)?e\d+\]/u;
 
 type AriaNode = Record<string, unknown> & { role: string };
 function isAriaNode(value: unknown): value is AriaNode {
@@ -438,10 +439,10 @@ async function readPage(
     if (changes && state.url === url && state.presented) {
       const previous = new Set(state.presented.split('\n'));
       const current = new Set(snapshot.split('\n'));
-      delta = {
-        removed: [...previous].filter((line) => !current.has(line)),
-        added: [...current].filter((line) => !previous.has(line)),
-      };
+      const removed = [...previous].filter((line) => !current.has(line));
+      const added = [...current].filter((line) => !previous.has(line));
+      // A changed line without its own ref cannot be placed, as text repeats across a page: show the snapshot.
+      if ([...removed, ...added].every((line) => OWN_REF.test(line))) delta = { removed, added };
     }
     state.url = url;
     state.presented = snapshot;

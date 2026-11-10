@@ -36,6 +36,7 @@ export function reviewedMerchantFlow(url: URL): ReviewedMerchantFlow | undefined
 const purchase =
   /\b(?:buy(?:\s+now)?|pay(?:\s+now)?|place\s+(?:your\s+)?order|order\s+now|purchase(?!\s+(?:history|details|summary|records?|protection|options?))|confirm\s+(?:purchase|order|reservation|booking)|complete\s+(?:purchase|order|booking|reservation)|reserve\s+now|book\s+now|subscribe|start\s+(?:free\s+)?trial|donate|accept\s+(?:fee|charge)|upgrade|renew|place\s+(?:a\s+|your\s+)?bid|bid\s+now)\b/iu;
 const registration = /\bregister\b/iu;
+const agreeing = /\b(?:agree|accept|register)\b/iu;
 const cancellation =
   /\b(?:cancel|change|modify|reschedule|amend)\s+(?:(?:my|this|your|the)\s+)?(?:reservation|booking|order|appointment|table|stay|trip|tickets?|subscription|membership|plan|visit|class)s?\b|^yes,?\s+cancel\b/iu;
 const bareCancel = /^cancel$/iu;
@@ -209,8 +210,8 @@ export function classifyCredentialNavigation(raw: string, kind: CredentialKind, 
 
 /**
  * Whether an authorized signup or password change may activate this control: its name is never matched to a
- * vocabulary of its own, only refused for a transaction on the page, purchase or subscription wording, unrelated
- * security, speaking or a link. The form's destination must stay on the site.
+ * vocabulary of its own, only refused for a transaction on the page, purchase or subscription wording, agreeing to
+ * a price the page names, unrelated security, speaking or a link. The form's destination must stay on the site.
  */
 export function classifyCredentialControlFacts(
   facts: ControlFacts,
@@ -220,7 +221,8 @@ export function classifyCredentialControlFacts(
   const evidence = `${facts.name} ${facts.visibleLabel ?? ''}`;
   const refused = credentialSecurityClass(evidence, kind);
   if (refused) return refused;
-  if (purchase.test(evidence)) return 'purchase_control';
+  // Agreeing to join where the page names a price or recurring charge may accept that fee.
+  if (purchase.test(evidence) || (facts.moneyTerms === true && agreeing.test(evidence))) return 'purchase_control';
   if (facts.transaction || facts.tag === 'a' || facts.href) return 'unsupported_control';
   if (facts.formAction) {
     const destination = classifyCredentialNavigation(facts.formAction, kind, site);

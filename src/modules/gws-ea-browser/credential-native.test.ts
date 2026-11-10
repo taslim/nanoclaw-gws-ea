@@ -217,6 +217,7 @@ const PAGES: Record<string, string> = {
   // After the fill the page adds a paid extra it keeps.
   '/donation-on-fill': `${nativeForm('/signup')}${onFill(`const gift = box('donation', 'Add a $1 donation to the Food Bank'); gift.required = true; gift.checked = true;`)}`,
   '/agree-money': `${nativeForm('/signup', 'Agree and create account')}<p>Premium is $9.99 per month after you join.</p>`,
+  '/price-only': `${nativeForm('/signup')}<p>Premium is $9.99 per month after you join.</p>`,
   '/agree-outside': `<h1>Join</h1><form method="post" action="/signup">${signupFields}</form><div role="button" tabindex="0" id="go">Agree and create account</div><script>
     document.getElementById('go').addEventListener('click', () => document.querySelector('form').requestSubmit());
   </script>`,
@@ -843,13 +844,19 @@ describe.skipIf(!chromePath)('native authorized signup and password change', { t
       ['/http-action', 'blocked_address'],
       ['/checkout-action', 'purchase_control'],
       ['/trial', 'purchase_control'],
+      ['/agree-money', 'purchase_control'],
       ['/order-total', 'unsupported_control'],
       ['/unmasked-confirmation', 'unsupported_form'],
     ] as const)
       it(`refuses ${path} as ${reason}`, async () => {
         await page.goto(`${SITE}${path}`);
         const authority = await signupAuthority();
-        const activate = path === '/trial' ? 'Start free trial' : 'Create account';
+        const activate =
+          path === '/trial'
+            ? 'Start free trial'
+            : path === '/agree-money'
+              ? 'Agree and create account'
+              : 'Create account';
         expect(await fill(authority, await refs({ ...SIGNUP, activate }))).toEqual({ status: 'refused', reason });
         await unexposed(authority);
       }, 30_000);
@@ -1118,10 +1125,11 @@ describe.skipIf(!chromePath)('native authorized signup and password change', { t
     }, 30_000);
 
     // The control's name is the site's own: it is refused only for what it commits to, never for its wording, and
-    // agreeing words on the control itself ask no consent of the principal.
+    // agreeing words on the control itself ask no consent of the principal. A price elsewhere on the page commits
+    // nothing unless the control agrees to it.
     for (const [path, activate] of [
       ['/ambiguous', 'Go'],
-      ['/agree-money', 'Agree and create account'],
+      ['/price-only', 'Create account'],
       ['/agree-outside', 'Agree and create account'],
     ] as const)
       it(`takes ${path}'s own "${activate}" control as the signup's activation`, async () => {
