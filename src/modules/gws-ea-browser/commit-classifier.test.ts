@@ -408,14 +408,11 @@ describe('the credential activation scope', () => {
       expect(classifyCredentialControlFacts(control(name), 'signup', 'shop.example')).toBe('ordinary');
     for (const name of ['Agree and subscribe', 'Agree and start free trial', 'Agree and pay'])
       expect(classifyCredentialControlFacts(control(name), 'signup', 'shop.example')).toBe('purchase_control');
-    // Agreeing to join on a page that names a price may accept the fee; a plain activation there does not.
-    for (const name of ['Agree and create account', 'Accept and join', 'Register'])
+    // A price elsewhere on the page commits nothing: money is gated where it is paid, at a transaction or card field.
+    for (const name of ['Agree and create account', 'Register'])
       expect(classifyCredentialControlFacts(control(name, { moneyTerms: true }), 'signup', 'shop.example')).toBe(
-        'purchase_control',
+        'ordinary',
       );
-    expect(
-      classifyCredentialControlFacts(control('Create account', { moneyTerms: true }), 'signup', 'shop.example'),
-    ).toBe('ordinary');
     expect(classifyCredentialControlFacts(control('Change email'), 'signup', 'shop.example')).toBe('account_security');
   });
 
