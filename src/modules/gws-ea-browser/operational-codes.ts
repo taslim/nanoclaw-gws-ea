@@ -32,6 +32,8 @@ export const OPERATIONAL_CODES: ReadonlySet<string> = new Set([
   'alias_unavailable',
   'personal_data',
   'interrupted',
+  'pressed',
+  'already_pressed',
   // Consent requests.
   'unknown_stop',
   'stop_used',
@@ -68,6 +70,7 @@ export const OPERATIONAL_CODES: ReadonlySet<string> = new Set([
   'placed',
   'booked',
   // Sign-in.
+  'filled',
   'submitted',
   'cleared_after_submit',
   'origin_mismatch',

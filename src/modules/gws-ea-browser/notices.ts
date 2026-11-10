@@ -1,5 +1,5 @@
 import { formatLocalTimeWithZone } from '../../timezone.js';
-import { formatMoney, freeCommitBooks, type FreeCommitFacts, type PurchaseFacts } from './fingerprint.js';
+import { formatMoney, type PurchaseFacts } from './fingerprint.js';
 import { principalClock } from './watch-policy.js';
 import type { PurchaseAttemptRow } from './authority.js';
 import type { DbDriver } from '../../db/driver.js';
@@ -120,15 +120,11 @@ export async function tellOfPurchaseOnce(
   );
 }
 
-export function attemptSummary(attempt: Pick<PurchaseAttemptRow, 'kind' | 'facts_json' | 'site'>): {
+export function attemptSummary(attempt: Pick<PurchaseAttemptRow, 'facts_json' | 'site'>): {
   booking: boolean;
   what: string;
-  total?: string;
+  total: string;
 } {
-  if (attempt.kind === 'free') {
-    const booking = freeCommitBooks(JSON.parse(attempt.facts_json) as FreeCommitFacts);
-    return { booking, what: `free ${booking ? 'booking' : 'order'} on ${attempt.site}` };
-  }
   const facts = JSON.parse(attempt.facts_json) as PurchaseFacts;
   const booking = Boolean(facts.reservation || facts.generic?.booking);
   return {
@@ -142,7 +138,7 @@ export function attemptSummary(attempt: Pick<PurchaseAttemptRow, 'kind' | 'facts
 async function unconfirmedText(job: BrowserJob, attempt: PurchaseAttemptRow): Promise<string> {
   const { what, total } = attemptSummary(attempt);
   return (
-    `Browser job ${job.thread_id}: the ${what}${total ? ` for ${total}` : ''}, pressed ` +
+    `Browser job ${job.thread_id}: the ${what} for ${total}, pressed ` +
     `${formatLocalTimeWithZone(attempt.attempted_at, await principalClock())}, has no page proving whether it went through, so it is ` +
     `unconfirmed (attempt ${attempt.id}). When the merchant's order email reaches you, or once you have asked the ` +
     `principal whether it went through, record it with record_purchase_outcome. Until then another purchase on ` +
@@ -154,7 +150,7 @@ async function unconfirmedText(job: BrowserJob, attempt: PurchaseAttemptRow): Pr
 export async function notifyUnconfirmedPurchase(attempt: PurchaseAttemptRow, db: DbDriver): Promise<void> {
   if (attempt.resolution || !attempt.unconfirmed_at || attempt.notified_at) return;
   await tellOfPurchaseOnce(db, attempt, {
-    table: attempt.kind === 'paid' ? 'gws_ea_browser_purchase_attempts' : 'gws_ea_browser_free_attempts',
+    table: 'gws_ea_browser_purchase_attempts',
     noteId: `browser-unconfirmed-${attempt.id}`,
     text: (job) => unconfirmedText(job, attempt),
     unsent: { message: 'Nobody to tell of an unconfirmed purchase yet', kind: 'attempt' },

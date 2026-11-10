@@ -16,6 +16,7 @@ import {
   browserConsentOutcomesMigration,
   browserRetiredCredentialsMigration,
   browserDisclosuresMigration,
+  browserFreeAttemptsRetiredMigration,
   browserGenericCheckoutMigration,
   browserIncidentsMigration,
   browserPurchaseMigration,
@@ -29,6 +30,7 @@ import {
   browserSiteLeasesMigration,
 } from './migration.js';
 import { BrowserStore } from './db.js';
+import { freePressInProgress } from './commit-classifier.js';
 import { notifyPendingIncidents } from './incidents.js';
 import { BrowserQueue, registerBrowserActionDelivery } from './queue.js';
 import { browserAction } from './executor.js';
@@ -94,6 +96,7 @@ registerMigration(browserWatchRegionMigration);
 registerMigration(browserPurchaseOutcomesMigration);
 registerMigration(browserConsentOutcomesMigration);
 registerMigration(browserSignInAssistantOnlyMigration);
+registerMigration(browserFreeAttemptsRetiredMigration);
 
 const runtime = new BrowserRuntime(undefined, browserAdmissionReady, undefined, async (jobId) => {
   const store = new BrowserStore();
@@ -102,7 +105,9 @@ const runtime = new BrowserRuntime(undefined, browserAdmissionReady, undefined, 
   return (
     isContainerRunning(job.browser_session_id) ||
     (await store.hasPending(jobId)) ||
-    (await store.hasCheckoutPageHold(jobId))
+    (await store.hasCheckoutPageHold(jobId)) ||
+    // A free booking's verification dialog waits on a code the site texted, within the site's hold on the table.
+    freePressInProgress(jobId)
   );
 });
 export function getBrowserRuntime(): BrowserRuntime {

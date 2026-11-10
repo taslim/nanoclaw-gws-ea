@@ -1,7 +1,6 @@
 import * as loginStores from './login-store.js';
 import { testLoginStore } from './testing/login-store.js';
 import { useAvailableBrowser } from './testing/browser-runtime.js';
-import { claimRegionWatchCommit } from './watch-state.js';
 import { createBrowserQueue } from './index.js';
 import { holdBrowserRequest, stopHeldBrowserRequests } from './testing/held-request.js';
 /**
@@ -43,7 +42,9 @@ import { resolveSession, writeSessionMessage } from '../../session-manager.js';
 import type { Session } from '../../types.js';
 import '../gws-ea-profile/index.js';
 import './index.js';
-import { PurchaseAuthorityError, PurchaseAuthorityStore } from './authority.js';
+import { freePressScope, PurchaseAuthorityError, PurchaseAuthorityStore } from './authority.js';
+import type { BrowserExecutionContext } from './actions.js';
+import type { FreeCheckout } from './merchant-read.js';
 import { finishRequestedCancellation, readBrowserJob } from './cancel.js';
 import { BrowserStore, type BrowserJob } from './db.js';
 import { GENERIC_FLOW_ID, type PurchaseFacts } from './fingerprint.js';
@@ -605,7 +606,7 @@ describe('main recording an unconfirmed purchase', () => {
 });
 
 describe('page evidence', () => {
-  it('never resolves a second attempt, paid or free, from an order number already used under the same contact email', async () => {
+  it('never resolves a second attempt from an order number already used under the same contact email', async () => {
     const { job } = await errand('main-p', 'mugs');
     const store = new PurchaseAuthorityStore();
     const page = (id: string, account: string | null) => ({
@@ -619,16 +620,6 @@ describe('page evidence', () => {
     expect(await store.resolve(first, page('HP-1042', ALIAS))).toMatchObject({ status: 'resolved' });
     expect(await store.resolve(second, page('HP-1042', ALIAS))).toMatchObject({ status: 'record_used' });
     expect(await attempt(second)).toEqual({ resolution: null, resolution_source: null, merchant_record_id: null });
-    // A free booking keyed by the same contact email is held to the same order numbers.
-    await getDb().run(
-      `INSERT INTO gws_ea_browser_free_attempts(id,job_id,request_id,site,account_key,facts_json,attempted_at)
-       VALUES('free-attempt-table',?,'free-request',?,?,'{}',?)`,
-      job.id,
-      SITE,
-      ALIAS,
-      new Date().toISOString(),
-    );
-    expect(await store.resolve('free-attempt-table', page('HP-1042', ALIAS))).toMatchObject({ status: 'record_used' });
     // Under another contact email the same number is another order.
     expect(await store.resolve(second, page('HP-1042', 'morgan.ellery@example.test'))).toMatchObject({
       status: 'resolved',
@@ -751,17 +742,6 @@ describe('a region watch', () => {
     );
     await getDb().run("INSERT INTO gws_ea_browser_watch_job_claims(job_id,state) VALUES(?,'available')", job.id);
   }
-  /** The claim a commit on the watched site takes, in its own transaction, as the press's does. */
-  const claim = (job: BrowserJob, site: string, attemptId: string) =>
-    getDb().transaction(() =>
-      claimRegionWatchCommit(getDb(), {
-        jobId: job.id,
-        site,
-        attemptId,
-        requestId: 'request',
-        at: new Date().toISOString(),
-      }),
-    );
   const watchState = (job: BrowserJob, watch: string) =>
     Promise.all([
       getDb().get('SELECT status FROM gws_ea_browser_watches WHERE id = ?', watch),
@@ -771,34 +751,29 @@ describe('a region watch', () => {
       ),
     ]);
 
-  it('ends the watch a free table claimed once its outcome is unconfirmed, then once main records it, and never again', async () => {
+  it('ends the watch a free press claimed at once, leaving no attempt for main to record or wait on', async () => {
     const { job } = await errand('main-p', 'larder');
     await regionWatch(job, 'larder', 'larder.example');
-    await getDb().run(
-      `INSERT INTO gws_ea_browser_free_attempts(id,job_id,request_id,site,account_key,facts_json,attempted_at)
-       VALUES('free-attempt-larder',?,'free-request','larder.example',?,?,?)`,
-      job.id,
-      ALIAS,
-      JSON.stringify({ site: 'larder.example', control: { label: 'Reserve' }, booking: { partySize: 2 } }),
-      new Date().toISOString(),
-    );
-    await claim(job, 'larder.example', 'free-attempt-larder');
-    expect((await watchState(job, 'larder'))[0]).toEqual({ status: 'booking' });
-    await new PurchaseAuthorityStore().unconfirm('free-attempt-larder');
+    const context = {
+      kind: 'request',
+      request: { id: 'press-request' },
+      job,
+      store: new BrowserStore(),
+    } as unknown as BrowserExecutionContext;
+    const checkout: FreeCheckout = {
+      site: 'larder.example',
+      origin: 'https://larder.example',
+      facts: { site: 'larder.example', control: { label: 'Reserve' } } as unknown as FreeCheckout['facts'],
+      books: true,
+    };
+    expect(await freePressScope(context).pressStarting(checkout, new Date().toISOString())).toEqual([]);
     expect(await watchState(job, 'larder')).toEqual([
       { status: 'outcome_unknown' },
       { state: 'unknown', finished_at: expect.any(String) },
     ]);
-    expect(await record(job.thread_id, 'free-attempt-larder', 'placed', 'principal')).toMatchObject({
-      status: 'recorded',
-    });
-    const [watch, finished] = await watchState(job, 'larder');
-    expect(watch).toEqual({ status: 'booked' });
-    expect(finished).toMatchObject({ state: 'booked' });
-    expect(await record(job.thread_id, 'free-attempt-larder', 'placed', 'email')).toMatchObject({
-      status: 'already_recorded',
-    });
-    expect(await watchState(job, 'larder')).toEqual([{ status: 'booked' }, finished]);
+    expect(await new PurchaseAuthorityStore().unconfirmedOf(job.id)).toEqual([]);
+    expect(await getDb().all('SELECT site FROM gws_ea_browser_purchase_blocks')).toEqual([]);
+    expect(await getDb().hasTable('gws_ea_browser_free_attempts')).toBe(false);
   });
 });
 

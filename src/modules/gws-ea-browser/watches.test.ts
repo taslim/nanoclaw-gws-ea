@@ -1165,7 +1165,7 @@ describe('watches on sites with no reader', () => {
       expect(compareWatchBounds(regionBounds, facts, at)).toEqual({ status: 'outside_bounds', reason });
   });
 
-  it('lets a free commit or a card on the watched site spend the job’s one booking, and its outcome end the watch', async () => {
+  it('lets a free press or a card on the watched site spend the job’s one booking, and its outcome end the watch', async () => {
     await seedWatch('larder', regionBounds);
     await seedWatch('elsewhere', { ...regionBounds, site: 'tables.example' });
     const at = new Date().toISOString();

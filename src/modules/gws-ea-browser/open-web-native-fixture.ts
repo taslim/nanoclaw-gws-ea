@@ -1229,6 +1229,98 @@ export function genericCheckoutPages(): Record<string, OpenWebRoute> {
   };
 }
 
+/**
+ * A booking platform's guest checkout: Complete reservation states no money, then verifies the guest's phone in a
+ * dialog over the same document (Send code, then the code and Verify) before the site books through its own
+ * purchase route and loads its confirmation.
+ */
+export const GUEST_BOOKING = {
+  details: 'https://tablehop.example/booking/details',
+  sendCode: 'https://tablehop.example/api/verify/send',
+  verify: 'https://tablehop.example/api/verify/check',
+  /** The site's booking POST, on a route the open rule calls a purchase. */
+  book: 'https://tablehop.example/api/confirmbooking',
+  confirmed: 'https://tablehop.example/booking/confirmed',
+  /** The code the site texts the guest. */
+  code: '482913',
+} as const;
+
+export interface GuestBookingOptions {
+  /** HTML inside the checkout's form, beside its booking facts: an agreement box, a fee line. */
+  readonly inForm?: string;
+  /**
+   * What Complete reservation opens: the phone verification, or a dialog that saves a card for a no-show fee and
+   * sends it to the payment processor when its Confirm reservation is pressed.
+   */
+  readonly dialog?: 'verify' | 'card';
+  /** A further address Send code posts to, as page script beside the site's own request. */
+  readonly sendAlsoPosts?: string;
+}
+
+/** The guest checkout's page; it counts each press of Complete reservation in `body[data-presses]`. */
+export function guestBookingPage(options: GuestBookingOptions = {}): string {
+  const dialog =
+    options.dialog === 'card'
+      ? `<div role="dialog" aria-label="Hold your table"><h2>A card is required to hold this table</h2>
+<p>No-show fee: $25 per person, charged if you miss your reservation.</p>
+<label>Card number <input name="cardnumber" autocomplete="cc-number" inputmode="numeric"></label>
+<label>Expiry <input name="exp-date" autocomplete="cc-exp"></label>
+<button type="button" id="hold">Confirm reservation</button></div>`
+      : `<div role="dialog" aria-label="Verify your phone"><h2>Verify your phone number</h2>
+<p>We'll text you a code to confirm this reservation.</p>
+<label>Phone number <input type="tel" id="phone" name="phone" autocomplete="tel"></label>
+<button type="button" id="send">Send code</button>
+<label>Verification code <input id="code" name="code" inputmode="numeric" autocomplete="one-time-code"></label>
+<button type="button" id="check">Verify</button><p id="status"></p></div>`;
+  return htmlPage(
+    'Complete your reservation',
+    `<header><a href="/">TableHop</a></header><h1>Complete your reservation</h1>
+<form id="details" onsubmit="return false"><p>Bistro Hale</p>
+<p>Table for 2, <time datetime="2026-11-09T18:30:00-08:00">today at 6:30 PM</time></p>
+<p>We're holding this table for you for 3 minutes.</p>
+<label>First name <input name="first" value="Morgan"></label>${options.inForm ?? ''}
+<button type="button" id="complete">Complete reservation</button></form><div id="dialog"></div>`,
+    `const presses = () => Number(document.body.dataset.presses ?? '0');
+document.body.dataset.presses = '0';
+document.getElementById('complete').addEventListener('click', () => {
+  document.body.dataset.presses = String(presses() + 1);
+  document.getElementById('dialog').innerHTML = ${JSON.stringify(dialog)};
+  const hold = document.getElementById('hold');
+  if (hold) hold.addEventListener('click', () => fetch(${JSON.stringify(PROCESSOR.methods)}, { method: 'POST', mode: 'no-cors', body: 'card' }).catch(() => undefined));
+  const send = document.getElementById('send');
+  if (send) send.addEventListener('click', () => {
+    fetch('/api/verify/send', { method: 'POST', body: document.getElementById('phone').value });
+    ${options.sendAlsoPosts ? `fetch(${JSON.stringify(options.sendAlsoPosts)}, { method: 'POST', mode: 'no-cors', body: 'hold' }).catch(() => undefined);` : ''}
+  });
+  const check = document.getElementById('check');
+  if (check) check.addEventListener('click', async () => {
+    const answer = await fetch('/api/verify/check', { method: 'POST', body: document.getElementById('code').value }).then((response) => response.json());
+    if (!answer.verified) { document.getElementById('status').textContent = 'That code did not match.'; return; }
+    const booked = await fetch('/api/confirmbooking', { method: 'POST', body: 'party=2' }).then((response) => response.ok, () => false);
+    if (booked) location.assign('/booking/confirmed');
+    else document.getElementById('status').textContent = 'We could not book this table.';
+  });
+});`,
+  );
+}
+
+function guestBookingPages(): Record<string, OpenWebRoute> {
+  const json = (body: unknown): OpenWebResponse => ({
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  return {
+    [GUEST_BOOKING.details]: guestBookingPage(),
+    [GUEST_BOOKING.sendCode]: () => json({ sent: true }),
+    [GUEST_BOOKING.verify]: ({ body }) => json({ verified: body === GUEST_BOOKING.code }),
+    [GUEST_BOOKING.book]: () => json({ confirmation: 'TH-5512' }),
+    [GUEST_BOOKING.confirmed]: htmlPage(
+      'Reservation confirmed',
+      "<h1>You're all set</h1><p>Bistro Hale, table for 2, today at 6:30 PM.</p><p>Confirmation #TH-5512</p>",
+    ),
+  };
+}
+
 function openWebPages(): Record<string, OpenWebRoute> {
   return {
     [OPEN_WEB.article]: articlePage(),
@@ -1291,6 +1383,7 @@ function openWebPages(): Record<string, OpenWebRoute> {
     ...cookieBannerPages(),
     ...personalDataPages(),
     ...genericCheckoutPages(),
+    ...guestBookingPages(),
   };
 }
 

@@ -337,20 +337,21 @@ describe.skipIf(!chromePath)('wake-on-change watches in native Chrome', { timeou
     expect(watchWakes()).toBe(1);
     expect((await watch()).region_baseline).toBe(region.after);
 
-    // The agent observes, opens the slot, and books: a free table the host presses itself, with no card.
+    // The agent observes, opens the slot, and books: a free table the host presses itself, with no card. The press
+    // spends the watch's one booking at once; the agent reads the outcome from the page.
     await run([{ kind: 'navigate', url: WATCHED.tables }]);
     await run([{ kind: 'click', ...refIn(await observePage(page), '7:30 PM') }]);
-    expect(await purchase('Reserve now')).toMatchObject({ status: 'booked', order_number: 'LR-1930' });
+    expect(await purchase('Reserve now')).toMatchObject({ status: 'pressed', site: 'larder.example' });
     expect(await approvals()).toEqual([]);
     expect(sent).toEqual([]);
-    expect(await watch()).toMatchObject({ status: 'booked' });
-    expect(await getDb().get('SELECT state FROM gws_ea_browser_watch_job_claims')).toEqual({ state: 'booked' });
+    expect(await watch()).toMatchObject({ status: 'outcome_unknown' });
+    expect(await getDb().get('SELECT state FROM gws_ea_browser_watch_job_claims')).toEqual({ state: 'unknown' });
   });
 
   it('books a free table outside the watch’s window without spending the watch', async () => {
     await setWatch();
     await run([{ kind: 'navigate', url: `${WATCHED.book}?slot=2215` }]);
-    expect(await purchase('Reserve now')).toMatchObject({ status: 'booked', order_number: 'LR-2215' });
+    expect(await purchase('Reserve now')).toMatchObject({ status: 'pressed' });
     expect(await watch()).toMatchObject({ status: 'armed' });
     expect(await getDb().get('SELECT state FROM gws_ea_browser_watch_job_claims')).toEqual({ state: 'available' });
   });

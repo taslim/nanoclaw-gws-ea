@@ -6,6 +6,7 @@ import { errors, type Page } from 'playwright-core';
 import { invalidArgs } from '../../cli/delivery-action.js';
 import { sessionDir } from '../../session-manager.js';
 import { isRecord } from '../../gws-ea/validation.js';
+import { freePressScope } from './authority.js';
 import {
   activateControl,
   BrowserActivationError,
@@ -15,7 +16,10 @@ import {
   registrableSite,
   withBrowserJobNavigation,
   type ActivationIntent,
+  type ActivationResult,
   type BrowserNavigationGuard,
+  type FreePressAnswer,
+  type FreePressFacts,
 } from './commit-classifier.js';
 import { readConfirmations, showsCharge, type ConfirmationEvidence } from './confirmation.js';
 import { BrowserConsentStop, consentStopsForAgent, type ConsentStopView } from './consent.js';
@@ -231,6 +235,11 @@ async function fieldInput(
   });
 }
 
+/** The press as the answer carries it: its status is the batch's reason. */
+function pressFacts({ status: _status, ...facts }: FreePressAnswer): FreePressFacts {
+  return facts;
+}
+
 class BrowserBatchStop extends Error {
   constructor(readonly reason: BrowserStopReason) {
     super(reason);
@@ -293,8 +302,8 @@ function sameConfirmation(left: ConfirmationEvidence, right: ConfirmationEvidenc
 
 /**
  * Whether `evidence` is the merchant's record of a purchase this job placed under an approval, confirmed for no more
- * than the approved total: the same order number for more is something added to that order. A free commit was approved
- * for nothing, so a charge on its record is never its own.
+ * than the approved total: the same order number for more is something added to that order. A free press was approved
+ * for nothing, so a charge it shows is never its own.
  */
 async function placedByJob(context: BrowserOperationContext, evidence: ConfirmationEvidence): Promise<boolean> {
   const { charged } = evidence;
@@ -318,7 +327,7 @@ async function placedByJob(context: BrowserOperationContext, evidence: Confirmat
  * (`before`) bought nothing, wherever the press shows it again: a press on a thank-you page, or its receipt or
  * tracking. Nor did the order this job's own approved purchase placed, for up to its approved total.
  */
-async function unapprovedCommit(
+export async function unapprovedCommit(
   context: BrowserOperationContext,
   page: Page,
   site: string | undefined,
@@ -413,6 +422,8 @@ async function executeBatch(
   /** The wordings a consent stop names, with the stop ids the job asks the principal with. */
   let consent: readonly ConsentStopView[] | undefined;
   let unapproved: UnapprovedCommit | undefined;
+  /** A free checkout's press, or the earlier one a repeat would have repeated: either ends the batch. */
+  let press: FreePressAnswer | undefined;
   let repeatSafe = true;
   let refs = new Map<string, PinnedBrowserRef>();
   const recordings: Array<{
@@ -433,13 +444,23 @@ async function executeBatch(
   ): void => {
     controls.set(target.ref, { facts, classification: classifyControlFacts(facts, kind) });
   };
+  // A host replay stops at a commit point for the agent's purchase, and a watch's check never commits: neither
+  // presses a free checkout itself.
+  const freePress =
+    options.readOnly || options.targets || context.kind === 'watch_check' ? undefined : freePressScope(context);
   const intent = (kind: ActivationIntent['kind'], target?: PinnedBrowserRef): ActivationIntent => ({
     ...(target ? { onFacts: (facts, classification) => controls.set(target.ref, { facts, classification }) } : {}),
     kind,
     scope: { jobId: context.job.id, db: context.store.db },
     assertActive: context.assertActive,
     remaining: context.remaining,
+    ...(freePress && (kind === 'click' || kind === 'submit') ? { freePress } : {}),
   });
+  /** Whether a press ran, keeping a free checkout's press for the answer. */
+  const pressedBy = (result: ActivationResult): boolean => {
+    press = result.freePress;
+    return result.ordinaryPress;
+  };
   page.on('framenavigated', navigated);
   try {
     beginBrowserDiagnosticAction(page, 0);
@@ -557,13 +578,15 @@ async function executeBatch(
           }
           case 'click':
             if (target)
-              ({ ordinaryPress: pressed } = await activateControl(
-                page,
-                target.element,
-                () => nativeAction(context, (options) => target.element.click(options)),
-                undefined,
-                intent('click', target),
-              ));
+              pressed = pressedBy(
+                await activateControl(
+                  page,
+                  target.element,
+                  () => nativeAction(context, (options) => target.element.click(options)),
+                  undefined,
+                  intent('click', target),
+                ),
+              );
             break;
           case 'type':
             if (target) {
@@ -591,33 +614,31 @@ async function executeBatch(
               // Space types a space; every other allowed key types no text.
               const facts = await refuseFieldEntry(page, target, SPACE_KEY.test(action.key) ? ' ' : undefined);
               recordField(target, facts, ENTER_KEY.test(action.key) ? 'submit' : 'click');
-              const press = (): Promise<void> =>
+              const keyPress = (): Promise<void> =>
                 nativeAction(context, (options) => target.element.press(action.key, options));
               if (ENTER_KEY.test(action.key)) {
                 const formSubmit = await browserKeyboardSubmitTarget(target.element);
                 try {
                   // A field's Enter submits its form through the form's own submit control; a formless field's
                   // Enter is the field's own press.
-                  ({ ordinaryPress: pressed } = await activateControl(
-                    page,
-                    formSubmit.asElement() ?? target.element,
-                    press,
-                    undefined,
-                    intent('submit', target),
-                  ));
+                  pressed = pressedBy(
+                    await activateControl(
+                      page,
+                      formSubmit.asElement() ?? target.element,
+                      keyPress,
+                      undefined,
+                      intent('submit', target),
+                    ),
+                  );
                 } finally {
                   await formSubmit.dispose();
                 }
               } else if (SPACE_KEY.test(action.key))
-                ({ ordinaryPress: pressed } = await activateControl(
-                  page,
-                  target.element,
-                  press,
-                  undefined,
-                  intent('click', target),
-                ));
+                pressed = pressedBy(
+                  await activateControl(page, target.element, keyPress, undefined, intent('click', target)),
+                );
               // Any other key edits or moves within the field: typing, inside the same window as a fill.
-              else await guard.duringAction(context.remaining(), press);
+              else await guard.duringAction(context.remaining(), keyPress);
             }
             break;
           case 'scroll': {
@@ -648,13 +669,15 @@ async function executeBatch(
             );
             if (action.submit) {
               const submit = refs.get(action.submit.ref)!;
-              ({ ordinaryPress: pressed } = await activateControl(
-                page,
-                submit.element,
-                () => nativeAction(context, (options) => submit.element.click(options)),
-                undefined,
-                intent('submit', submit),
-              ));
+              pressed = pressedBy(
+                await activateControl(
+                  page,
+                  submit.element,
+                  () => nativeAction(context, (options) => submit.element.click(options)),
+                  undefined,
+                  intent('submit', submit),
+                ),
+              );
             }
             break;
           }
@@ -727,6 +750,11 @@ async function executeBatch(
           if (commit) throw new UnapprovedCommitStop(commit);
         }
         results[index] = { index, status: 'completed', ...data, ...(trace ? { trace_index: trace.index } : {}) };
+        // Later actions were aimed at the checkout as it stood before the press; the agent reads what it opened.
+        if (press) {
+          reason = press.status;
+          break;
+        }
         if (navigation !== before) {
           reason = 'navigated';
           break;
@@ -773,12 +801,15 @@ async function executeBatch(
       });
       const look = { cookieBanner, remaining: context.remaining, signal: context.signal };
       const closing = actions.at(-1);
-      // An observe action asks to see the page; after any other action, only what changed may be enough.
+      // An observe action asks to see the page, as a free press's answer does; after any other action, only what
+      // changed may be enough.
       observation =
-        closing?.kind === 'observe'
+        closing?.kind === 'observe' || press
           ? await observePage(page, context.assertActive, {
               ...look,
-              ...(closing.within && results.at(-1)?.status === 'completed' ? { within: closing.within } : {}),
+              ...(closing?.kind === 'observe' && closing.within && results.at(-1)?.status === 'completed'
+                ? { within: closing.within }
+                : {}),
             })
           : await observePageChanges(page, context.assertActive, look);
     } catch (error) {
@@ -824,6 +855,7 @@ async function executeBatch(
     answer: {
       ...(reason ? { status: 'stopped' as const, reason } : { status: 'completed' as const }),
       ...(consent ? { consent } : {}),
+      ...(press ? { press: pressFacts(press) } : {}),
       actions: results,
       ...(recording ? { recording } : {}),
       ...(images.length ? { images } : {}),

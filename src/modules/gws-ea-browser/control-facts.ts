@@ -645,9 +645,13 @@ const librarySource = String.raw`(sources) => {
     re.search.test(describe(element));
   const editableRoot = (element) => element instanceof HTMLElement && element.isContentEditable &&
     !(parentOf(element) instanceof HTMLElement && parentOf(element).isContentEditable);
+  // A verification code the site sent is no message: a field marked for one, or a numeric field holding digits.
+  const codeField = (element) => element.autocomplete === 'one-time-code' ||
+    (element.inputMode === 'numeric' && /^\d{1,10}$/u.test(element.value.trim()));
   // Free text: a textarea, a contenteditable element, or a formless non-search text input.
   const freeTextField = (element) => element instanceof HTMLTextAreaElement || editableRoot(element) ||
-    (element instanceof HTMLInputElement && element.type === 'text' && !formOf(element) && !searchLike(element));
+    (element instanceof HTMLInputElement && element.type === 'text' && !formOf(element) && !searchLike(element) &&
+      !codeField(element));
   const holdsText = (element) => visible(element) && !element.disabled && !element.readOnly &&
     squash(element instanceof HTMLElement && element.isContentEditable ? element.innerText : element.value) !== '';
   const accountField = (element) => element instanceof HTMLInputElement &&

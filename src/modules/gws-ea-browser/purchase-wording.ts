@@ -19,7 +19,6 @@ const purchaseMessages = {
   notHeld: 'Purchase confirmation was not held for the principal.',
   cancelled: 'The browser job was cancelled.',
   unreadable: 'The checkout is no longer readable.',
-  bookingChanged: 'The booking changed before the host pressed it.',
   authority: 'authority_id required',
   consentFacts: 'A purchase consent pass answers only with its facts',
 } as const;
@@ -144,10 +143,8 @@ export async function purchaseCommitNotice(
   return told(`${none} (${status}). Handle it as the purchase tool describes.`);
 }
 
-export function purchaseInvariantMessage(kind: 'checkout' | 'free', unknown: never): string {
-  return kind === 'checkout'
-    ? `Unknown checkout read ${JSON.stringify(unknown)}`
-    : `Unknown free commit ${JSON.stringify(unknown)}`;
+export function purchaseInvariantMessage(kind: 'checkout', unknown: never): string {
+  return `Unknown ${kind} read ${JSON.stringify(unknown)}`;
 }
 
 /** to: principal */
@@ -161,8 +158,4 @@ export function purchaseCardWithdrawal(): string {
 /** to: principal */
 export function purchaseApprovalExpired(): string {
   return 'The previous approval expired.';
-}
-/** to: browser */
-export function purchaseAddOnMissing(addOn: string): string {
-  return `the charge for ${addOn}`;
 }

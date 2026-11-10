@@ -45,7 +45,7 @@ import { upsertUser } from '../permissions/db/users.js';
 import { upsertUserDm } from '../permissions/db/user-dms.js';
 import '../gws-ea-profile/index.js';
 import './index.js';
-import { configureBrowserCancellation } from './cancel.js';
+import { configureBrowserCancellation, readBrowserJob } from './cancel.js';
 import {
   activateControl,
   classifyActivation,
@@ -67,12 +67,14 @@ import {
   CONSENT,
   COOKIE_BANNERS,
   GENERIC,
+  GUEST_BOOKING,
   OPEN_WEB,
   PERSONAL_DATA,
   PROCESSOR,
   checkoutPage,
   feeTablePage,
   genericCheckoutPages,
+  guestBookingPage,
   htmlPage,
   openWebFixture,
   orderConfirmationPage,
@@ -2371,22 +2373,25 @@ document.getElementById('updated').addEventListener('click', () => location.assi
     expect(await approvals()).toHaveLength(1);
   });
 
-  it('presses a free table itself with no card, unticking the offers box, and records a money-less attempt', async () => {
+  it('presses a free table itself with no card, unticking the offers box, and records nothing for main to settle', async () => {
     fixture.serve('https://table.example/book/r-7/confirm', placedPage('T-7731', '$0.00'));
     await open(CONSENT.offers);
-    expect(await purchase('Reserve now')).toMatchObject({ status: 'booked', order_number: 'T-7731' });
+    expect(await purchase('Reserve now')).toMatchObject({
+      status: 'pressed',
+      site: 'table.example',
+      pressed_at: expect.any(String),
+      repeat_safe: false,
+    });
     expect(await approvals()).toEqual([]);
     expect(sent).toEqual([]);
     const booking = fixture.requests.find((request) => request.method === 'POST');
     expect(new URLSearchParams(booking?.body)).toEqual(new URLSearchParams({ party: '2' }));
-    expect(await getDb().all('SELECT site,resolution,merchant_record_id FROM gws_ea_browser_free_attempts')).toEqual([
-      { site: 'table.example', resolution: 'committed', merchant_record_id: 'T-7731' },
-    ]);
     expect(await attempts()).toEqual([]);
-    expect(await getDb().all('SELECT * FROM gws_ea_browser_purchase_blocks')).toEqual([]);
+    expect(await blocks()).toEqual([]);
+    expect(await getDb().hasTable('gws_ea_browser_free_attempts')).toBe(false);
   });
 
-  it('stops the job with an incident when a free booking’s confirmation shows a charge', async () => {
+  it('stops the job with an incident when a free booking’s confirmation shows a charge, pressed by purchase or by a click', async () => {
     fixture.serve(GENERIC.booked, placedPage('T-2210', '$25.00'));
     await open(GENERIC.freeTable);
     expect(await purchase('Reserve now')).toMatchObject({
@@ -2398,6 +2403,17 @@ document.getElementById('updated').addEventListener('click', () => location.assi
     expect(await getDb().all('SELECT kind,site,job_id FROM gws_ea_browser_incidents')).toEqual([
       { kind: 'unapproved_commit', site: 'table.example', job_id: session.thread_id },
     ]);
+  });
+
+  it('reports unapproved_commit when an agent’s free press lands on a confirmation showing a charge', async () => {
+    fixture.serve(GENERIC.booked, placedPage('T-2210', '$25.00'));
+    await open(GENERIC.freeTable);
+    expect(await run('reserve', [{ kind: 'click', ...refIn(await observePage(page), 'Reserve now') }])).toMatchObject({
+      status: 'stopped',
+      reason: 'unapproved_commit',
+      incident: { site: 'table.example', reference: 'T-2210', charged: '$25.00' },
+    });
+    expect(posts()).toEqual([GENERIC.booked]);
   });
 
   it('keeps a booking free past "No credit card required" and a Gift cards link outside its form, but not beside Google Pay or a saved card', async () => {
@@ -2635,37 +2651,6 @@ document.getElementById('updated').addEventListener('click', () => location.assi
     expect(await unconfirmedNotes()).toEqual([]);
   });
 
-  it('leaves a free booking with no confirmation unconfirmed, and makes the next booking there wait until main records it', async () => {
-    fixture.serve(GENERIC.booked, '<!doctype html><title>Processing</title><p>Processing your request</p>');
-    await open(GENERIC.freeTable);
-    const pressed = await purchase('Reserve now');
-    expect(pressed).toMatchObject({ status: 'unconfirmed', attempt_id: expect.stringMatching(/^free-attempt-/u) });
-    const attemptId = String(pressed.attempt_id);
-    expect(await getDb().all('SELECT resolution FROM gws_ea_browser_free_attempts')).toEqual([{ resolution: null }]);
-    expect(await blocks()).toEqual([{ site: 'table.example' }]);
-    const told = await unconfirmedNotes();
-    expect(told).toHaveLength(1);
-    expect(told[0]).toContain(`free booking on table.example`);
-    expect(told[0]).toContain(attemptId);
-    // Browsing the site goes on; another booking there waits.
-    await open(GENERIC.freeTable);
-    expect(await purchase('Reserve now')).toMatchObject({ status: 'waiting_on_earlier', site: 'table.example' });
-    expect(posts()).toEqual([GENERIC.booked]);
-    fixture.serve(GENERIC.booked, genericCheckoutPages()[GENERIC.booked]);
-    expect(
-      await recordPurchaseOutcome(
-        { thread: session.thread_id!, attempt_id: attemptId, outcome: 'not_placed', source: 'principal' },
-        main,
-        () => queue,
-      ),
-    ).toMatchObject({ status: 'recorded', outcome: 'not_placed', source: 'principal' });
-    expect(await blocks()).toEqual([]);
-    expect((await texts(session)).filter((text) => text.includes('"site":"table.example"'))).toHaveLength(1);
-    await open(GENERIC.freeTable);
-    expect(await purchase('Reserve now')).toMatchObject({ status: 'booked', order_number: 'T-2210' });
-    expect(posts()).toEqual([GENERIC.booked, GENERIC.booked]);
-  });
-
   it('keeps the merchant’s lease and block through a payment platform’s own page, binding the platform origin', async () => {
     await open(GENERIC.toPlatform);
     expect(page.url()).toBe(GENERIC.platform);
@@ -2732,5 +2717,169 @@ document.getElementById('updated').addEventListener('click', () => location.assi
     expect(await attempts()).toMatchObject([
       { site: 'osteria.example', platform: 'tables.example', resolution: 'committed', merchant_record_id: 'OJ-818' },
     ]);
+  });
+
+  describe('a guest booking that verifies the guest after Complete reservation', () => {
+    const MOBILE = '+1 415 555 0134';
+    const presses = async (): Promise<string | null> => page.locator('body').getAttribute('data-presses');
+    const processorRequests = (): string[] =>
+      fixture.requests.filter((request) => new URL(request.url).hostname === 'api.stripe.com').map(({ url }) => url);
+    /** Main's disclosure of the principal's mobile number to the booking site, for this errand. */
+    async function discloseMobile(): Promise<void> {
+      const value = (await addPrivateValue({ label: 'Mobile', kind: 'phone', value: MOBILE })).id;
+      const frame = await deliverAction(main, 'record_disclosure', {
+        thread: session.thread_id,
+        site: 'tablehop.example',
+        value_id: value,
+      });
+      if (!frame.ok) throw new Error(frame.error.message);
+    }
+    /** The agent's click on the control named `name`, aimed from a fresh observation. */
+    const click = async (name: string, id = `click-${randomUUID()}`): Promise<Record<string, unknown>> =>
+      run(id, [{ kind: 'click', ...refIn(await observePage(page), name) }]);
+
+    it('presses Complete reservation as an ordinary press, verifies the texted code and books, leaving main nothing to record', async () => {
+      await discloseMobile();
+      await open(GUEST_BOOKING.details);
+      const pressed = await click('Complete reservation');
+      expect(pressed).toMatchObject({
+        status: 'stopped',
+        reason: 'pressed',
+        press: { site: 'tablehop.example', pressed_at: expect.any(String) },
+        observation: { snapshot: expect.stringContaining('Verify your phone number') },
+        repeat_safe: false,
+      });
+      expect(await presses()).toBe('1');
+      const dialog = pressed.observation as BrowserSnapshotObservation;
+      expect(
+        await run('send-code', [
+          { kind: 'type', ...refIn(dialog, 'Phone number'), text: '(415) 555-0134' },
+          { kind: 'click', ...refIn(dialog, 'Send code') },
+        ]),
+      ).toMatchObject({ status: 'completed' });
+      const sentCode = await observePage(page);
+      expect(
+        await run('verify', [
+          { kind: 'type', ...refIn(sentCode, 'Verification code'), text: GUEST_BOOKING.code },
+          { kind: 'click', ...refIn(sentCode, 'Verify') },
+        ]),
+      ).toMatchObject({ status: 'stopped', reason: 'navigated' });
+      expect(page.url()).toBe(GUEST_BOOKING.confirmed);
+      // The site's own booking POST, on a purchase route, went through from inside the dialog the free press opened.
+      expect(posts()).toEqual([GUEST_BOOKING.sendCode, GUEST_BOOKING.verify, GUEST_BOOKING.book]);
+      expect(fixture.requests.find((request) => request.url === GUEST_BOOKING.sendCode)?.body).toBe('(415) 555-0134');
+      expect(await approvals()).toEqual([]);
+      expect(await attempts()).toEqual([]);
+      expect(await blocks()).toEqual([]);
+      expect(await unconfirmedNotes()).toEqual([]);
+      expect((await readBrowserJob(session.thread_id!))?.unconfirmed).toBeUndefined();
+    });
+
+    it('answers already_pressed for a repeat press of the same booking in the errand, without pressing it again', async () => {
+      await open(GUEST_BOOKING.details);
+      const first = await click('Complete reservation');
+      expect(first).toMatchObject({ status: 'stopped', reason: 'pressed' });
+      const { pressed_at } = first.press as { pressed_at: string };
+      expect(await click('Complete reservation')).toMatchObject({
+        status: 'stopped',
+        reason: 'already_pressed',
+        press: { site: 'tablehop.example', pressed_at },
+      });
+      expect(await presses()).toBe('1');
+    });
+
+    it('refuses a payment processor request from a press inside the dialog, while the site’s own requests go', async () => {
+      fixture.serve(GUEST_BOOKING.details, guestBookingPage({ sendAlsoPosts: PROCESSOR.confirm }));
+      await open(GUEST_BOOKING.details);
+      expect(await click('Complete reservation')).toMatchObject({ reason: 'pressed' });
+      expect(await click('Send code')).toMatchObject({ status: 'completed' });
+      expect(posts()).toEqual([GUEST_BOOKING.sendCode]);
+      expect(processorRequests()).toEqual([]);
+    });
+
+    it('stops with purchase_control at a dialog that saves a card for a no-show fee, sending nothing to the processor', async () => {
+      fixture.serve(GUEST_BOOKING.details, guestBookingPage({ dialog: 'card' }));
+      await open(GUEST_BOOKING.details);
+      expect(await click('Complete reservation')).toMatchObject({ reason: 'pressed' });
+      expect(await click('Confirm reservation')).toMatchObject({ status: 'stopped', reason: 'purchase_control' });
+      expect(processorRequests()).toEqual([]);
+      expect(posts()).toEqual([]);
+    });
+
+    it('stops a free booking at an agreement only the principal can grant, pressing nothing', async () => {
+      fixture.serve(
+        GUEST_BOOKING.details,
+        guestBookingPage({
+          inForm: '<label><input type="checkbox" name="marketing" required> I agree to receive marketing</label>',
+        }),
+      );
+      await open(GUEST_BOOKING.details);
+      expect(await click('Complete reservation')).toMatchObject({ status: 'stopped', reason: 'consent_required' });
+      expect(await presses()).toBe('0');
+    });
+
+    it('presses a free booking while an earlier paid attempt on the merchant is unresolved, and names that attempt', async () => {
+      await open(GUEST_BOOKING.details);
+      const at = new Date().toISOString();
+      const facts = JSON.stringify({ site: 'tablehop.example', totalMinor: 2000, dueNowMinor: 2000, currency: 'USD' });
+      await getDb().run(
+        `INSERT INTO gws_ea_browser_authorities (id,job_id,kind,state,facts_json,bounds_json,exception_ids_json,attempt_id,expires_at,created_at)
+         VALUES('authority-deposit',?,'checkout','unknown',?,'{}','[]','attempt-deposit',?,?)`,
+        session.thread_id,
+        facts,
+        at,
+        at,
+      );
+      await getDb().run(
+        `INSERT INTO gws_ea_browser_purchase_attempts(id,authority_id,job_id,site,facts_json,attempted_at,unconfirmed_at)
+         VALUES('attempt-deposit','authority-deposit',?,'tablehop.example',?,?,?)`,
+        session.thread_id,
+        facts,
+        at,
+        at,
+      );
+      await getDb().run(
+        'INSERT INTO gws_ea_browser_purchase_blocks(site,created_at) VALUES(?,?)',
+        'tablehop.example',
+        at,
+      );
+      expect(await click('Complete reservation')).toMatchObject({
+        status: 'stopped',
+        reason: 'pressed',
+        press: { site: 'tablehop.example', unresolved_attempts: ['attempt-deposit'] },
+      });
+      expect(await presses()).toBe('1');
+    });
+
+    it('still answers purchase_control for a commit on a checkout with a total and a saved payment method', async () => {
+      await open(GENERIC.review);
+      expect(await click('Place order')).toMatchObject({ status: 'stopped', reason: 'purchase_control' });
+      expect(posts()).toEqual([]);
+    });
+
+    it('runs a press after an approved paid press as an ordinary action, refusing the checkout’s purchase route', async () => {
+      const deposit = 'https://tablehop.example/booking/deposit';
+      fixture.serve(
+        deposit,
+        checkoutPage({
+          action: '/booking/deposit/paid',
+          commit: 'Pay deposit',
+          items: ['Gift card × 1'],
+          total: '$20.00',
+          payment: 'Visa ending in 4242',
+          email: ALIAS,
+          outside: `<div id="after" hidden><button type="button" id="hold-table">Hold my table</button></div><script>
+document.getElementById('checkout').addEventListener('submit', (event) => { event.preventDefault(); document.getElementById('after').hidden = false; });
+document.getElementById('hold-table').addEventListener('click', () => fetch('/api/confirmbooking', { method: 'POST', body: 'party=2' }).catch(() => undefined));
+</script>`,
+        }),
+      );
+      await open(deposit);
+      expect(await purchase('Pay deposit')).toMatchObject({ status: 'awaiting_principal' });
+      await approve((await approvals())[0]);
+      expect(page.url()).toBe(deposit);
+      expect(await click('Hold my table')).toMatchObject({ status: 'completed' });
+      expect(posts()).toEqual([]);
+    });
   });
 });

@@ -71,7 +71,8 @@ describe.skipIf(!chromePath)('native reservation through the common purchase exe
     vi.spyOn(loginStoreModule, 'getLoginStore').mockResolvedValue(testLoginStore(`${root}/browser`).store);
     useAvailableBrowser();
     if (!chromePath) throw new Error('Chrome required');
-    vi.useFakeTimers({ toFake: ['Date'] });
+    // The clock starts at a fixed instant and runs on: a press's script-request window waits on it.
+    vi.useFakeTimers({ toFake: ['Date'], shouldAdvanceTime: true });
     vi.setSystemTime(new Date('2026-10-15T12:00:00.000Z'));
     calendar.mockReset();
     calendar.mockResolvedValue({ conflicts: [], conflicts_not_listed: 0 });
@@ -275,33 +276,24 @@ describe.skipIf(!chromePath)('native reservation through the common purchase exe
         },
       });
     });
-    it('books a free reservation with no card on file itself, with no card, as a money-less attempt', async () => {
+    it('presses a free reservation with no card on file itself, with no card, and records nothing for main to settle', async () => {
       fixtureState.selectedPayment = null;
       fixtureState.details.user = { id: 72, payment_methods: [] };
       // The booking sends this box's state, and Resy's reviewed record proves only a booking with it unticked.
       fixtureState.extraTerms =
         '<label><input type="checkbox" name="venue_marketing_opt_in" checked> Send me news and offers from L&#39;Artusi</label>';
       await load();
-      expect(await purchase('free')).toMatchObject({ status: 'booked', order_number: '90123', repeat_safe: false });
+      expect(await purchase('free')).toMatchObject({
+        status: 'pressed',
+        site: 'resy.com',
+        pressed_at: expect.any(String),
+        repeat_safe: false,
+      });
       expect(fixture.submitted()).toBe(1);
       expect(cards).toEqual([]);
       expect(await getDb().get('SELECT COUNT(*) AS count FROM pending_approvals')).toEqual({ count: 0 });
-      expect(
-        await getDb().all(
-          'SELECT site,platform,account_key,resolution,resolution_source,merchant_record_id FROM gws_ea_browser_free_attempts',
-        ),
-      ).toEqual([
-        {
-          site: 'resy.com',
-          platform: null,
-          // The reviewed merchant's account keys its reservation numbers, as a paid attempt's does.
-          account_key: 'resy:72',
-          resolution: 'committed',
-          resolution_source: 'page',
-          merchant_record_id: '90123',
-        },
-      ]);
       expect(await getDb().get('SELECT COUNT(*) AS count FROM gws_ea_browser_purchase_attempts')).toEqual({ count: 0 });
+      expect(await getDb().get('SELECT COUNT(*) AS count FROM gws_ea_browser_purchase_blocks')).toEqual({ count: 0 });
       expect(await getDb().get('SELECT COUNT(*) AS count FROM gws_ea_browser_authorities')).toEqual({ count: 0 });
     });
     it('sends a card and presses nothing for a reservation with a card on file, or with a fee', async () => {
@@ -317,7 +309,6 @@ describe.skipIf(!chromePath)('native reservation through the common purchase exe
       await load();
       expect(await purchase('fee')).toMatchObject({ status: 'awaiting_principal' });
       expect(fixture.submitted()).toBe(0);
-      expect(await getDb().get('SELECT COUNT(*) AS count FROM gws_ea_browser_free_attempts')).toEqual({ count: 0 });
       // Resy's checkout document holds a booking bearer the host tracks as a secret, so its reader places no
       // picture: each card names one with none beside it, which the card says is unavailable.
       expect(await pageMayShowSecret(fixture.page)).toBe(true);

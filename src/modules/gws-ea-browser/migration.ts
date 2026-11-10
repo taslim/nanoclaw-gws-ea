@@ -462,6 +462,15 @@ export const browserPurchaseOutcomesMigration: PortableMigration & { name: Modul
   },
 };
 
+/** Free checkouts are ordinary presses: nothing records them, and their old attempts settle nothing. */
+export const browserFreeAttemptsRetiredMigration: PortableMigration & { name: ModuleMigrationName } = {
+  version: 1,
+  name: 'module:gws-ea-browser:retired-free-attempts',
+  async up(db) {
+    await db.exec('DROP TABLE IF EXISTS gws_ea_browser_free_attempts');
+  },
+};
+
 export const browserConsentOutcomesMigration: PortableMigration & { name: ModuleMigrationName } = {
   version: 1,
   name: 'module:gws-ea-browser:consent-outcomes',

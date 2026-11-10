@@ -8,6 +8,7 @@ import { writeBrowserNotice } from './notices.js';
 import type { PendingApproval } from '../../types.js';
 import { detachApproval, finishApprovalWithdrawal } from '../approvals/index.js';
 import { type SpendingAuthority } from './authority.js';
+import { lastFreePress } from './commit-classifier.js';
 import {
   completePurchaseFacts,
   venueKey,
@@ -408,20 +409,23 @@ export async function regionWakesThisHour(db: DbDriver, watchId: string, now: nu
   );
   return notices.filter((notice) => REGION_WAKE.test(notice.event_key)).map((notice) => Date.parse(notice.created_at));
 }
+/**
+ * When the job last stepped toward a booking: a purchase card, an authority, or a free checkout's press. A free press
+ * leaves no row, so the job's in-memory press record stands for it; after a host restart a wake it followed may slow
+ * the check until the next step, which only paces checks and decides nothing.
+ */
 async function latestBookingStep(db: DbDriver, jobId: string): Promise<number> {
   const step = await db.get<{ at: string | null }>(
     `SELECT MAX(at) AS at FROM (
-      SELECT MAX(attempted_at) AS at FROM gws_ea_browser_free_attempts WHERE job_id = ?
-      UNION ALL SELECT MAX(created_at) AS at FROM gws_ea_browser_purchase_cards WHERE job_id = ?
+      SELECT MAX(created_at) AS at FROM gws_ea_browser_purchase_cards WHERE job_id = ?
       UNION ALL SELECT MAX(created_at) AS at FROM gws_ea_browser_authorities WHERE job_id = ?)`,
     jobId,
     jobId,
-    jobId,
   );
-  return Date.parse(step?.at ?? '') || 0;
+  return Math.max(Date.parse(step?.at ?? '') || 0, Date.parse(lastFreePress(jobId)?.at ?? '') || 0);
 }
 /**
- * How much slower a region check runs. A wake that no step toward a booking followed (a free commit, a purchase card
+ * How much slower a region check runs. A wake that no step toward a booking followed (a free press, a purchase card
  * or an authority) matched nothing, and each such wake this hour doubles the interval; a booking step resets it. A
  * shared check keeps its least-slowed member's pace, and one that serves a reader watch never slows.
  */
@@ -548,7 +552,8 @@ export async function claimRegionWatchCommit(
 }
 /**
  * Ends the watch whose claim a commit took, whatever took it, once the commit's attempt is unconfirmed (`placed`
- * undefined) or resolved by any source. Joins the authority store's transaction; a claim already final is left.
+ * undefined) or resolved by any source, or at once for a free press, which leaves no attempt. Joins the caller's
+ * transaction; a claim already final is left.
  */
 export async function finishWatchCommit(
   db: DbDriver,

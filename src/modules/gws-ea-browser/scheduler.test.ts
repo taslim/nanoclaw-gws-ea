@@ -22,6 +22,7 @@ import { resolveSystemSession } from '../../session-manager.js';
 import '../gws-ea-profile/index.js';
 import './index.js';
 import { BrowserStore } from './db.js';
+import * as commitClassifier from './commit-classifier.js';
 import { browserAvailability } from './availability.js';
 import { type BrowserQueue } from './queue.js';
 import { browserWatchesMigration } from './migration.js';
@@ -886,13 +887,12 @@ it('wakes the agent with each change and books nothing itself; a step toward a b
   // The host never books a region watch's change: no booking was queued, and the job's one claim is untouched.
   expect(await getDb().all("SELECT id FROM gws_ea_browser_requests WHERE action = 'browser_watch_book'")).toEqual([]);
   expect(await getDb().get('SELECT state FROM gws_ea_browser_watch_job_claims')).toEqual({ state: 'available' });
-  // The agent pursued the next change: a free commit's attempt is its match, and the cadence is back to four minutes.
+  // The agent pursued the next change: its free press of a table is its match, and the cadence is back to four minutes.
   text = '7:30 PM';
   await checkRegion(scheduler);
-  await getDb().run(
-    "INSERT INTO gws_ea_browser_free_attempts(id,job_id,request_id,site,facts_json,attempted_at) VALUES('free',?,'free-request','larder.example','{}',?)",
-    jobId,
-    new Date(Date.now() + 1).toISOString(),
+  const pressedAt = new Date(Date.now() + 1).toISOString();
+  vi.spyOn(commitClassifier, 'lastFreePress').mockImplementation((job) =>
+    job === jobId ? { site: 'larder.example', at: pressedAt } : undefined,
   );
   await checkRegion(scheduler);
   expect(regionWakes()).toBe(3);

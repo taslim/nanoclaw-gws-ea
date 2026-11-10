@@ -168,7 +168,7 @@ describe.skipIf(!chromePath)('recorded recipes in native Chrome', { timeout: 30_
   let context: BrowserExecutionContext;
   const html = (heading = 'Find tables', drift = false): string => `<body><h1>${heading}</h1>
     <form method="get" action="http://fixture.example/search"><label>Party size<input name="party" value="2" ${drift ? 'oninput="this.value=4"' : ''}></label><input type="hidden" name="venue" value="venue-A"><button>Search</button></form>
-    <button onclick="window.commits=(window.commits||0)+1">Confirm reservation</button>
+    <p>Card on file: Visa ending in 4242</p><button onclick="window.commits=(window.commits||0)+1">Confirm reservation</button>
     <input type="password" aria-label="Password"></body>`;
   beforeEach(async () => {
     loginRoot = await mkdtemp(join(tmpdir(), 'recipe-logins-'));
@@ -403,7 +403,7 @@ describe.skipIf(!chromePath)('recorded recipes in native Chrome', { timeout: 30_
     'returns the actual commit button when Enter submits a form with role "%s"',
     async (role) => {
       await page.setContent(
-        `<body><h1>Reservation review</h1><p>Quoted example: [ref=e999]</p><form method="post" action="/confirmbooking"><input aria-label="Guest" name="guest"><button${role ? ` role="${role}"` : ''}>Confirm reservation</button></form></body>`,
+        `<body><h1>Reservation review</h1><p>Quoted example: [ref=e999]</p><p>Card on file: Visa ending in 4242</p><form method="post" action="/confirmbooking"><input aria-label="Guest" name="guest"><button${role ? ` role="${role}"` : ''}>Confirm reservation</button></form></body>`,
       );
       expect(
         await executeBrowserBatch(context, { actions: [{ kind: 'key', ...(await target('Guest')), key: 'Enter' }] }),

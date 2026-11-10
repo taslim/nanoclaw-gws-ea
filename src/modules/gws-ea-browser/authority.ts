@@ -22,7 +22,8 @@ import {
 } from './fingerprint.js';
 import { browserAvailability } from './availability.js';
 
-import type { BrowserExecutionContext } from './actions.js';
+import { browserOperationId, type BrowserExecutionContext, type BrowserOperationContext } from './actions.js';
+import type { FreePressScope } from './commit-classifier.js';
 import type { WatchBounds } from './watch-state.js';
 
 export interface SpendingAuthority {
@@ -63,12 +64,10 @@ export type NewSpendingAuthority = NewSpendingAuthorityFacts &
 /** Where an attempt's outcome came from: its page, a later checkout step, the merchant's email or the principal. */
 export type ResolutionSource = 'page' | 'email' | 'principal' | 'step';
 
-/** A purchase attempt, paid under an authority or free, as the resolve function reads either. */
+/** A paid purchase attempt under its authority, as the resolve function reads it. */
 export interface PurchaseAttemptRow {
   readonly id: string;
-  readonly kind: 'paid' | 'free';
-  /** The paid attempt's authority; a free attempt has none. */
-  readonly authority_id: string | null;
+  readonly authority_id: string;
   readonly job_id: string;
   /** The merchant. */
   readonly site: string;
@@ -86,14 +85,8 @@ export interface PurchaseAttemptRow {
   /** The card that showed the principal the recorded "not placed" answer for it. */
   readonly answer_card_id: string | null;
 }
-const ATTEMPT_COLUMNS =
-  'site,account_key,facts_json,attempted_at,resolution,resolution_source,evidence_json,unconfirmed_at,notified_at,answer_card_id';
-const ATTEMPTS = `SELECT id,'paid' AS kind,authority_id,job_id,${ATTEMPT_COLUMNS} FROM gws_ea_browser_purchase_attempts
-  UNION ALL SELECT id,'free' AS kind,NULL AS authority_id,job_id,${ATTEMPT_COLUMNS} FROM gws_ea_browser_free_attempts`;
-const ATTEMPT_TABLES = {
-  paid: 'gws_ea_browser_purchase_attempts',
-  free: 'gws_ea_browser_free_attempts',
-} as const satisfies Record<PurchaseAttemptRow['kind'], string>;
+const ATTEMPTS = `SELECT id,authority_id,job_id,site,account_key,facts_json,attempted_at,resolution,resolution_source,
+  evidence_json,unconfirmed_at,notified_at,answer_card_id FROM gws_ea_browser_purchase_attempts`;
 
 export interface AttemptResolution {
   readonly placed: boolean;
@@ -156,9 +149,7 @@ export class PurchaseAuthorityStore {
   async unresolved(site: string): Promise<string[]> {
     return (
       await this.db.all<{ id: string }>(
-        `SELECT id FROM gws_ea_browser_purchase_attempts WHERE site = ? AND resolution IS NULL
-         UNION ALL SELECT id FROM gws_ea_browser_free_attempts WHERE site = ? AND resolution IS NULL ORDER BY id`,
-        site,
+        'SELECT id FROM gws_ea_browser_purchase_attempts WHERE site = ? AND resolution IS NULL ORDER BY id',
         site,
       )
     ).map((row) => row.id);
@@ -192,15 +183,12 @@ export class PurchaseAuthorityStore {
   }
   /** Marks the recorded answers as shown on `cardId`, so the next card on the site does not repeat them. */
   async markRecordedShown(recorded: ReadonlyArray<{ readonly id: string }>, cardId: string): Promise<void> {
-    for (const { id } of recorded) {
-      const attempt = await this.attempt(id);
-      if (attempt)
-        await this.db.run(
-          `UPDATE ${ATTEMPT_TABLES[attempt.kind]} SET answer_card_id = ? WHERE id = ? AND answer_card_id IS NULL`,
-          cardId,
-          id,
-        );
-    }
+    for (const { id } of recorded)
+      await this.db.run(
+        'UPDATE gws_ea_browser_purchase_attempts SET answer_card_id = ? WHERE id = ? AND answer_card_id IS NULL',
+        cardId,
+        id,
+      );
   }
   /**
    * Whether a purchase on `site` waits on an earlier one: an attempt there with no recorded outcome that
@@ -491,7 +479,7 @@ export class PurchaseAuthorityStore {
     });
   }
   /**
-   * The one resolve function: a compare-and-set on an unresolved attempt, paid or free, that records its
+   * The one resolve function: a compare-and-set on an unresolved attempt that records its
    * outcome and its source. In the same transaction it settles the attempt's authority, its watch's claim and
    * status, the site's block and the jobs waiting on the site; a resolved attempt's pending unconfirmed notice
    * is never sent. After commit, the attempt's job hears what its page or its step showed (a recorded answer
@@ -509,31 +497,19 @@ export class PurchaseAuthorityStore {
         return { status: 'record_used', attempt };
       const outcome = resolution.placed ? 'committed' : 'not_committed';
       const record = resolution.record?.id ?? null;
-      const changed =
-        attempt.kind === 'paid'
-          ? await this.db.run(
-              `UPDATE gws_ea_browser_purchase_attempts SET resolution = ?,resolution_source = ?,evidence_json = ?,reconciled_at = ?,
-               merchant_record_id = ?,merchant_account = ? WHERE id = ? AND resolution IS NULL`,
-              outcome,
-              resolution.source,
-              JSON.stringify(resolution.evidence),
-              at,
-              record,
-              resolution.record?.account ?? null,
-              attempt.id,
-            )
-          : await this.db.run(
-              `UPDATE gws_ea_browser_free_attempts SET resolution = ?,resolution_source = ?,evidence_json = ?,reconciled_at = ?,
-               merchant_record_id = ? WHERE id = ? AND resolution IS NULL`,
-              outcome,
-              resolution.source,
-              JSON.stringify(resolution.evidence),
-              at,
-              record,
-              attempt.id,
-            );
+      const changed = await this.db.run(
+        `UPDATE gws_ea_browser_purchase_attempts SET resolution = ?,resolution_source = ?,evidence_json = ?,reconciled_at = ?,
+         merchant_record_id = ?,merchant_account = ? WHERE id = ? AND resolution IS NULL`,
+        outcome,
+        resolution.source,
+        JSON.stringify(resolution.evidence),
+        at,
+        record,
+        resolution.record?.account ?? null,
+        attempt.id,
+      );
       if (!changed.changes) return { status: 'already_resolved', attempt: (await this.attempt(attempt.id)) ?? attempt };
-      const authority = attempt.authority_id ? await this.get(attempt.authority_id) : undefined;
+      const authority = await this.get(attempt.authority_id);
       if (authority) {
         await this.db.run(
           "UPDATE gws_ea_browser_authorities SET state = ?,outcome_json = ?,notified_at = ? WHERE id = ? AND state IN ('committing','unknown')",
@@ -552,8 +528,8 @@ export class PurchaseAuthorityStore {
         await this.db.run('DELETE FROM gws_ea_browser_pending_commits WHERE authority_id = ?', authority.id);
         await this.settleRequestedCancellation(authority.job_id, at);
       }
-      // The watch whose one booking this attempt claimed, by a watch's own authority, a card or guarantee booking
-      // on a region watch's site, or a free table there, ends with it.
+      // The watch whose one booking this attempt claimed, by a watch's own authority or a card or guarantee booking
+      // on a region watch's site, ends with it.
       await finishWatchCommit(this.db, attempt.job_id, attempt.id, resolution.placed);
       if (!(await this.unresolved(attempt.site)).length) {
         await this.db.run('DELETE FROM gws_ea_browser_purchase_blocks WHERE site = ?', attempt.site);
@@ -572,15 +548,14 @@ export class PurchaseAuthorityStore {
           await promoteCommittedWatchRecipe(this.db, result.attempt.job_id, result.attempt.id);
         });
       const authorityId = result.attempt.authority_id;
-      if (authorityId && !mainsAnswer)
-        await afterCommit('A purchase outcome', () => notifyPurchaseOutcome(authorityId, this));
+      if (!mainsAnswer) await afterCommit('A purchase outcome', () => notifyPurchaseOutcome(authorityId, this));
       await afterCommit('A purchase wait', () => notifyPurchaseWaiters(this.db));
     }
     return result;
   }
   /**
-   * A merchant record already proving another attempt on the site under the same account key: the contact email
-   * a generic checkout keys its order numbers by, or a reviewed merchant's account.
+   * A merchant record already proving another attempt on the site under the same account: the contact email a
+   * generic checkout keys its order numbers by, or a reviewed merchant's account.
    */
   private async recordUsed(
     attempt: PurchaseAttemptRow,
@@ -589,12 +564,7 @@ export class PurchaseAuthorityStore {
     const account = record.account ?? '';
     return (
       (await this.db.get(
-        `SELECT 1 FROM gws_ea_browser_purchase_attempts WHERE site = ? AND COALESCE(merchant_account,'') = ? AND merchant_record_id = ? AND id <> ?
-         UNION ALL SELECT 1 FROM gws_ea_browser_free_attempts WHERE site = ? AND COALESCE(account_key,'') = ? AND merchant_record_id = ? AND id <> ?`,
-        attempt.site,
-        account,
-        record.id,
-        attempt.id,
+        `SELECT 1 FROM gws_ea_browser_purchase_attempts WHERE site = ? AND COALESCE(merchant_account,'') = ? AND merchant_record_id = ? AND id <> ?`,
         attempt.site,
         account,
         record.id,
@@ -605,8 +575,8 @@ export class PurchaseAuthorityStore {
   /**
    * An attempt that ended with no page proof either way: unconfirmed, until its page, the merchant's
    * email or the principal settles it. Its site's next purchase waits on it, and its delegating group hears of
-   * it once, after commit. A paid attempt's authority is spent, and its job hears `unconfirmed`. Returns what
-   * the attempt's job answers.
+   * it once, after commit. Its authority is spent, and its job hears `unconfirmed`. Returns what the attempt's job
+   * answers.
    */
   async unconfirm(attemptId: string): Promise<Record<string, unknown>> {
     const outcome = unconfirmedOutcome(attemptId);
@@ -615,7 +585,7 @@ export class PurchaseAuthorityStore {
       if (!attempt || attempt.resolution || attempt.unconfirmed_at) return false;
       const at = new Date().toISOString();
       await this.db.run(
-        `UPDATE ${ATTEMPT_TABLES[attempt.kind]} SET unconfirmed_at = ? WHERE id = ? AND resolution IS NULL AND unconfirmed_at IS NULL`,
+        'UPDATE gws_ea_browser_purchase_attempts SET unconfirmed_at = ? WHERE id = ? AND resolution IS NULL AND unconfirmed_at IS NULL',
         at,
         attempt.id,
       );
@@ -624,7 +594,7 @@ export class PurchaseAuthorityStore {
         attempt.site,
         at,
       );
-      const authority = attempt.authority_id ? await this.get(attempt.authority_id) : undefined;
+      const authority = await this.get(attempt.authority_id);
       if (authority) {
         await this.db.run(
           "UPDATE gws_ea_browser_authorities SET state = 'unknown',outcome_json = ?,notified_at = NULL WHERE id = ? AND state = 'committing'",
@@ -666,6 +636,35 @@ export class PurchaseAuthorityStore {
       jobId,
     );
   }
+}
+
+/**
+ * What a free checkout's press spends in `context`'s job: a booking on a region watch's site spends that watch's one
+ * booking, as a paid one does, and ends the watch at once, since no attempt follows whose outcome would. Its answer
+ * names the merchant's unresolved paid attempts, which a free press does not wait on.
+ */
+export function freePressScope(context: BrowserOperationContext): FreePressScope {
+  const db = context.store.db;
+  return {
+    jobId: context.job.id,
+    async pressStarting(checkout, at) {
+      const press = `free-press-${browserOperationId(context)}`;
+      if (checkout.books)
+        await db.transaction(async () => {
+          await claimRegionWatchCommit(db, {
+            jobId: context.job.id,
+            site: checkout.site,
+            attemptId: press,
+            requestId: browserOperationId(context),
+            at,
+            ...(checkout.booking ? { booking: checkout.booking } : {}),
+          });
+          await finishWatchCommit(db, context.job.id, press, undefined);
+        });
+      if (!(await db.hasTable('gws_ea_browser_purchase_attempts'))) return [];
+      return new PurchaseAuthorityStore(db).unresolved(checkout.site);
+    },
+  };
 }
 
 /** Deterministic mailbox ids make a crash between insertion and notified_at harmless. */
