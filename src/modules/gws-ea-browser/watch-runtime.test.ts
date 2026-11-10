@@ -1,26 +1,40 @@
 import type { Page } from 'playwright-core';
-import { afterEach, expect, it, vi } from 'vitest';
-import * as observe from './observe.js';
+import { expect, it } from 'vitest';
+import { observePage } from './observe.js';
 import { normalizeWatchRegion, watchCheckFailure } from './watch-runtime.js';
 
-const page = {} as Page;
-afterEach(() => {
-  vi.restoreAllMocks();
-});
+/** A page the host observed: sixty listings, more than one snapshot holds, then `ending` as its last line. */
+async function observedListings(ending: string): Promise<{ page: Page; snapshot: string }> {
+  const tree = [
+    ...Array.from({ length: 60 }, (_value, index) => ({
+      role: 'region',
+      name: `Listing ${index + 1}`,
+      ref: `e${10 + index}`,
+      text: 'Garden flat near the river with morning light. '.repeat(8),
+    })),
+    { role: 'paragraph', ref: 'e99', text: ending },
+  ];
+  const page = {
+    url: () => 'https://larder.example/tables',
+    on() {},
+    frames: () => [],
+    locator: () => ({ ariaSnapshotJSON: async () => tree }),
+  } as unknown as Page;
+  return { page, snapshot: (await observePage(page)).snapshot };
+}
 
-it('carries a check’s stop reasons into site backoff instead of treating challenges as ordinary drift', () => {
-  vi.spyOn(observe, 'observedPageText').mockReturnValue('- heading "The Larder"');
+it('carries a check’s stop reasons into site backoff instead of treating challenges as ordinary drift', async () => {
+  const { page } = await observedListings('Book a table');
   expect(watchCheckFailure({ reason: 'challenge' }, page)).toEqual({ status: 'blocked' });
   expect(watchCheckFailure({ reason: 'sign_in_wall' }, page)).toEqual({ status: 'blocked' });
   expect(watchCheckFailure({ reason: 'site_busy' }, page)).toEqual({ status: 'site_busy' });
   expect(watchCheckFailure({ reason: 'navigation_failed' }, page)).toEqual({ status: 'failed' });
 });
 
-it('finds a challenge in the whole page read when the agent’s cut of it leaves the challenge out', () => {
-  // The page read past the snapshot budget: the cut the agent sees ends before the challenge.
-  const read = vi.spyOn(observe, 'observedPageText').mockReturnValue('- paragraph: Verify you are human');
+it('finds a challenge in the whole page read when the agent’s cut of it leaves the challenge out', async () => {
+  const { page, snapshot } = await observedListings('Please verify you are human to continue browsing.');
+  expect(snapshot).not.toContain('verify you are human');
   expect(watchCheckFailure({ reason: 'timeout' }, page)).toEqual({ status: 'blocked' });
-  expect(read).toHaveBeenCalledWith(page);
 });
 
 it('compares a region without its countdowns, viewers, clocks, relative times, tallies and link addresses', () => {

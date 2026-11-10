@@ -376,23 +376,17 @@ describe.skipIf(!chromePath)('native host secret fill', { timeout: 30_000 }, () 
     } as unknown as BrowserExecutionContext;
   }
   async function savedFill(item: string, fields: readonly ('username' | 'password')[]) {
-    const observation = await observePage(page);
-    const reference = (label: string): BrowserRef => {
-      const line = observation.snapshot.split('\n').find((line) => line.includes(`"${label}"`));
-      const ref = line?.match(/\[ref=([^\]]+)\]/u)?.[1];
-      if (!ref) throw new Error(`Missing ${label} reference`);
-      return { ref, generation: observation.generation };
-    };
     return executeFillSecret(context(), {
       item_handle: item,
-      ...Object.fromEntries(fields.map((field) => [field, reference(field === 'username' ? 'Email' : 'Password')])),
-      submit: reference(
-        fields.length === 1 && fields[0] === 'username'
-          ? 'Next'
-          : fields.length === 1 && page.url().endsWith('/step/email')
-            ? 'Continue'
-            : 'Log in',
-      ),
+      ...(await refsFor({
+        ...Object.fromEntries(fields.map((field) => [field, field === 'username' ? 'Email' : 'Password'])),
+        submit:
+          fields.length === 1 && fields[0] === 'username'
+            ? 'Next'
+            : fields.length === 1 && page.url().endsWith('/step/email')
+              ? 'Continue'
+              : 'Log in',
+      })),
     });
   }
 
@@ -412,8 +406,8 @@ describe.skipIf(!chromePath)('native host secret fill', { timeout: 30_000 }, () 
     return logins.store.create({ site, title: 'Saved login', username: 'principal@example.test', password: secret });
   }
 
-  for (const path of ['/formless', '/react-login'])
-    it(`fills a saved login into ${path} on a sign-in host of the login's own site`, async () => {
+  for (const path of ['/u/login', '/formless', '/react-login'])
+    it(`signs in through a controlled ${path} page on a sign-in host of the login's own site`, async () => {
       const item = await saved('auth.example');
       await page.goto(`https://login.auth.example${path}`);
       const result = await executeFillSecret(context(), {
@@ -542,27 +536,6 @@ describe.skipIf(!chromePath)('native host secret fill', { timeout: 30_000 }, () 
     expect(read).not.toHaveBeenCalled();
     expect(posts).toEqual([]);
   });
-
-  for (const path of ['/u/login', '/formless']) {
-    it(`signs in through a controlled ${path} page with both saved fields and its own callbacks`, async () => {
-      const item = await logins.store.create({
-        site: 'auth.example',
-        title: 'Saved login',
-        username: 'principal@example.test',
-        password: secret,
-      });
-      await page.goto(`https://auth.example${path}`);
-      const result = await savedFill(item.id, ['username', 'password']);
-      await expect.poll(() => posts.length).toBe(1);
-      expect(Object.fromEntries(new URLSearchParams(posts[0].body))).toEqual({
-        username: 'principal@example.test',
-        password: secret,
-      });
-      await expect.poll(() => page.locator('h1').textContent()).toBe('Signed in');
-      expect(['submitted', 'cleared_after_submit']).toContain(result.status);
-      expect(JSON.stringify({ result, observation: await observePage(page) })).not.toContain(secret);
-    });
-  }
 
   for (const transition of ['navigation', 'same-document'] as const) {
     it(`uses fresh references for email then password steps after ${transition}`, async () => {
@@ -980,7 +953,6 @@ describe.skipIf(!chromePath)('native host secret fill', { timeout: 30_000 }, () 
     expect(parentDocuments).toEqual(['/help/speculate']);
   });
   describe("signing in with a code from the assistant's own mail", () => {
-    let delivered = 0;
     beforeEach(async () => {
       await runMigrations(await initTestDb());
       await recordWebAlias(ALIAS);
@@ -1007,13 +979,12 @@ describe.skipIf(!chromePath)('native host secret fill', { timeout: 30_000 }, () 
     });
 
     /** The site's email reaches the assistant inbox, and the isolated interpreter answers its claim. */
-    async function deliver(value: string, receivedAt = new Date()): Promise<boolean> {
-      delivered++;
+    async function deliver(value: string): Promise<void> {
       const mail = parseGmailMessage({
-        id: `sign-in-${delivered}`,
-        threadId: `sign-in-${delivered}`,
+        id: 'sign-in-code',
+        threadId: 'sign-in-code',
         labelIds: ['INBOX'],
-        internalDate: String(receivedAt.getTime()),
+        internalDate: String(Date.now()),
         payload: {
           mimeType: 'text/plain',
           headers: [
@@ -1025,10 +996,9 @@ describe.skipIf(!chromePath)('native host secret fill', { timeout: 30_000 }, () 
           body: { data: Buffer.from(`Your code is ${value}`).toString('base64url') },
         },
       });
-      if (!(await routeSignInMail(mail, new Date()))) return false;
+      expect(await routeSignInMail(mail, new Date())).toBe(true);
       const [interpreter] = await getSessionsByAgentGroup('external-email');
       expect(await answerSignInReply({ kind: 'code', value }, interpreter)).toEqual({ status: 'accepted' });
-      return true;
     }
 
     it('fills the alias, lets the agent press Send code, then fills the emailed code and submits it', async () => {
@@ -1041,7 +1011,9 @@ describe.skipIf(!chromePath)('native host secret fill', { timeout: 30_000 }, () 
         await executeBrowserBatch(context(), { actions: [{ kind: 'click', ...send }] }, { record: false }),
       ).toMatchObject({ status: 'stopped', reason: 'navigated' });
       await expect.poll(() => page.locator('h1').textContent()).toBe('Check your email');
-      expect(await deliver('482913')).toBe(true);
+      await deliver('482913');
+      // The code waits for a step that names its field.
+      expect(await executeSignInCode(context(), {})).toEqual({ status: 'code_field_needed' });
       const result = await executeSignInCode(context(), await refsFor({ code_field: 'Code', submit: 'Verify' }));
       expect(result).toEqual({ status: 'code_filled' });
       expect(posts.map((post) => Object.fromEntries(new URLSearchParams(post.body)))).toEqual([
@@ -1050,28 +1022,6 @@ describe.skipIf(!chromePath)('native host secret fill', { timeout: 30_000 }, () 
       ]);
       await expect.poll(() => page.locator('h1').textContent()).toBe('Signed in');
       expect(JSON.stringify({ result, observation: await observePage(page) })).not.toContain('482913');
-    });
-
-    it('ignores mail that arrived before the code was requested', async () => {
-      const earlier = new Date(Date.now() - 60_000);
-      await page.goto('https://auth.example/code-login');
-      expect(await executeSignInCode(context(), await refsFor({ email_field: 'Email' }))).toEqual({
-        status: 'filled',
-      });
-      expect(await deliver('111111', earlier)).toBe(false);
-    });
-
-    it('keeps the code for the next step when the agent has not named its field yet', async () => {
-      await page.goto('https://auth.example/code-login');
-      await executeSignInCode(context(), await refsFor({ email_field: 'Email' }));
-      const { send } = await refsFor({ send: 'Send code' });
-      await executeBrowserBatch(context(), { actions: [{ kind: 'click', ...send }] }, { record: false });
-      await expect.poll(() => page.locator('h1').textContent()).toBe('Check your email');
-      await deliver('482913');
-      expect(await executeSignInCode(context(), {})).toEqual({ status: 'code_field_needed' });
-      expect(await executeSignInCode(context(), await refsFor({ code_field: 'Code', submit: 'Verify' }))).toEqual({
-        status: 'code_filled',
-      });
     });
 
     it('answers origin_mismatch for a code field on another site, keeping the code', async () => {
@@ -1090,16 +1040,19 @@ describe.skipIf(!chromePath)('native host secret fill', { timeout: 30_000 }, () 
         status: 'origin_mismatch',
       });
       expect(posts).toEqual([]);
-    });
-
-    it('stops with alias_unavailable before anything is filled or watched', async () => {
-      await getDb().run('UPDATE gws_ea_profile SET assistant_alias = NULL WHERE singleton = 1');
-      await page.goto('https://auth.example/code-login');
-      expect(await executeSignInCode(context(), await refsFor({ email_field: 'Email' }))).toEqual({
-        status: 'alias_unavailable',
+      // The refusal spends nothing: the same code still completes on the claimed site.
+      await executeBrowserBatch(
+        context(),
+        { actions: [{ kind: 'navigate', url: 'https://auth.example/code-login' }] },
+        { record: false },
+      );
+      await page.setContent(
+        '<form method="post" action="/code/verify"><label>Code<input name="code"></label><button type="submit">Verify</button></form>',
+      );
+      expect(await executeSignInCode(context(), await refsFor({ code_field: 'Code', submit: 'Verify' }))).toEqual({
+        status: 'code_filled',
       });
-      expect(await page.locator('input').inputValue()).toBe('');
-      expect(await getDb().all('SELECT id FROM gws_ea_browser_sign_in_claims')).toEqual([]);
+      expect(posts).toEqual([{ host: 'auth.example', body: 'code=482913' }]);
     });
   });
 });

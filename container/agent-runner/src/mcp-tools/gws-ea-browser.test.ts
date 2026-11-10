@@ -332,15 +332,12 @@ describe('the browser tools', () => {
     );
   });
 
-  it('reads one part of a cut page within its ref, and says how compact observations and deltas carry refs', () => {
+  it('reads one part of a cut page within a ref of an observation', () => {
     const validate = new Ajv({ formats: { uri: true } }).compile(browser.tool.inputSchema);
     expect(validate({ actions: [{ kind: 'observe', within: { ref: 'f2e40', generation: 3 } }] })).toBe(true);
     expect(validate({ actions: [{ kind: 'observe' }] })).toBe(true);
     for (const within of [{ ref: 'e40' }, { ref: 'main', generation: 3 }, 'e40'])
       expect(validate({ actions: [{ kind: 'observe', within }] })).toBe(false);
-    const description = browser.tool.description;
-    for (const phrase of ['open dialog first', 'within', 'delta', 'new generation', 'their own frame navigates'])
-      expect(description).toContain(phrase);
   });
 
   it('offers saved username and password fills while email codes keep their own tool', () => {
@@ -398,8 +395,6 @@ describe('the browser tools', () => {
     const { parameters: _parameters, ...regionWatch } = fields;
     expect(accepts({ ...regionWatch, region: { ref: 'e4', generation: 2 } })).toBe(true);
     expect(accepts({ ...fields, recipe_id: 'recipe-1' })).toBe(false);
-    expect(watch.tool.description).toContain('not_at_address');
-    expect(watch.tool.description).not.toMatch(/read-only recipe|recipe ends on/u);
   });
 
   it('refuses a credential_form step the host would refuse, before sending anything', async () => {

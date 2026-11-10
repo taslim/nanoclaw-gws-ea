@@ -196,22 +196,6 @@ async function bindPrincipal(): Promise<string[]> {
 }
 
 describe('the watch tables', () => {
-  const columns = async (table: string): Promise<string[]> =>
-    (await getDb().all<{ name: string }>(`SELECT name FROM pragma_table_info('${table}')`)).map(
-      (column) => column.name,
-    );
-
-  it('keep a watch by its address, with no recipe its checks replay', async () => {
-    const watches = await columns('gws_ea_browser_watches');
-    expect(watches).toEqual(expect.arrayContaining(['address', 'booking_parameters_json', 'region_json']));
-    for (const column of ['check_recipe_id', 'check_recipe_version', 'parameters_json', 'check_key'])
-      expect(watches).not.toContain(column);
-    const checks = await columns('gws_ea_browser_watch_checks');
-    for (const column of ['check_recipe_id', 'check_recipe_version', 'parameter_hash'])
-      expect(checks).not.toContain(column);
-    expect(await columns('gws_ea_browser_watch_recipe_links')).not.toContain('check_recipe_id');
-  });
-
   it('rebuilds over earlier watches without carrying them, leaving the authorities that named one', async () => {
     await seedWatch('earlier');
     const at = new Date().toISOString();

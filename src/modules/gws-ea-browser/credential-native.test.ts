@@ -205,7 +205,6 @@ const PAGES: Record<string, string> = {
         .then((response) => response.text()).then((html) => { document.getElementById('result').innerHTML = html; });
     });
   </script>`,
-  '/agree-signup': nativeForm('/signup', 'Agree and create account'),
   // Each fill resets a box only the principal can agree to: the form shows it, unticked, once a password is typed.
   '/waiver-on-fill': `${nativeForm('/signup')}${onFill(`box('waiver', '${WAIVER}');`)}`,
   // The fill also moves the page to a new address, as a single-page app's router does.
@@ -855,13 +854,6 @@ describe.skipIf(!chromePath)('native authorized signup and password change', { t
         await unexposed(authority);
       }, 30_000);
 
-    // The control's name is the site's own: it is refused only for what it commits to, never for its wording.
-    it('activates a signup control whatever the site calls it', async () => {
-      const { result } = await signUp('/ambiguous', { ...SIGNUP, activate: 'Go' });
-      expect(result).toEqual({ status: 'account_created' });
-      expect(posts.map((post) => post.path)).toEqual(['/signup']);
-    }, 30_000);
-
     it('refuses a signup whose account field is left unbound, since the Login would name another account', async () => {
       await page.goto(`${SITE}/native-signup`);
       const authority = await signupAuthority();
@@ -1125,9 +1117,15 @@ describe.skipIf(!chromePath)('native authorized signup and password change', { t
       expect(await anyChecked()).toBe(false);
     }, 30_000);
 
-    for (const path of ['/agree-signup', '/agree-money', '/agree-outside'] as const)
-      it(`takes an agree-and-create control on ${path} as the signup's activation`, async () => {
-        const { result } = await signUp(path, { ...SIGNUP, activate: 'Agree and create account' });
+    // The control's name is the site's own: it is refused only for what it commits to, never for its wording, and
+    // agreeing words on the control itself ask no consent of the principal.
+    for (const [path, activate] of [
+      ['/ambiguous', 'Go'],
+      ['/agree-money', 'Agree and create account'],
+      ['/agree-outside', 'Agree and create account'],
+    ] as const)
+      it(`takes ${path}'s own "${activate}" control as the signup's activation`, async () => {
+        const { result } = await signUp(path, { ...SIGNUP, activate });
         expect(result).toEqual({ status: 'account_created' });
         expect(posts.map((post) => post.path)).toEqual(['/signup']);
       }, 30_000);

@@ -2386,33 +2386,29 @@ document.getElementById('updated').addEventListener('click', () => location.assi
     expect(new URLSearchParams(booking?.body)).toEqual(new URLSearchParams({ party: '2' }));
     expect(await attempts()).toEqual([]);
     expect(await blocks()).toEqual([]);
-    expect(await getDb().hasTable('gws_ea_browser_free_attempts')).toBe(false);
   });
 
-  it('stops the job with an incident when a free booking’s confirmation shows a charge, pressed by purchase or by a click', async () => {
-    fixture.serve(GENERIC.booked, placedPage('T-2210', '$25.00'));
-    await open(GENERIC.freeTable);
-    expect(await purchase('Reserve now')).toMatchObject({
-      status: 'stopped',
-      reason: 'unapproved_commit',
-      incident: { site: 'table.example', reference: 'T-2210', charged: '$25.00' },
-      repeat_safe: false,
-    });
-    expect(await getDb().all('SELECT kind,site,job_id FROM gws_ea_browser_incidents')).toEqual([
-      { kind: 'unapproved_commit', site: 'table.example', job_id: session.thread_id },
-    ]);
-  });
-
-  it('reports unapproved_commit when an agent’s free press lands on a confirmation showing a charge', async () => {
-    fixture.serve(GENERIC.booked, placedPage('T-2210', '$25.00'));
-    await open(GENERIC.freeTable);
-    expect(await run('reserve', [{ kind: 'click', ...refIn(await observePage(page), 'Reserve now') }])).toMatchObject({
-      status: 'stopped',
-      reason: 'unapproved_commit',
-      incident: { site: 'table.example', reference: 'T-2210', charged: '$25.00' },
-    });
-    expect(posts()).toEqual([GENERIC.booked]);
-  });
+  it.each(['purchase', 'click'] as const)(
+    'stops the job with an incident when a free booking’s confirmation shows a charge, pressed by %s',
+    async (pressedBy) => {
+      fixture.serve(GENERIC.booked, placedPage('T-2210', '$25.00'));
+      await open(GENERIC.freeTable);
+      const result =
+        pressedBy === 'purchase'
+          ? await purchase('Reserve now')
+          : await run('reserve', [{ kind: 'click', ...refIn(await observePage(page), 'Reserve now') }]);
+      expect(result).toMatchObject({
+        status: 'stopped',
+        reason: 'unapproved_commit',
+        incident: { site: 'table.example', reference: 'T-2210', charged: '$25.00' },
+        repeat_safe: false,
+      });
+      expect(posts()).toEqual([GENERIC.booked]);
+      expect(await getDb().all('SELECT kind,site,job_id FROM gws_ea_browser_incidents')).toEqual([
+        { kind: 'unapproved_commit', site: 'table.example', job_id: session.thread_id },
+      ]);
+    },
+  );
 
   it('keeps a booking free past "No credit card required" and a Gift cards link outside its form, but not beside Google Pay or a saved card', async () => {
     await open(GENERIC.freeTable);

@@ -561,6 +561,9 @@ describe.skipIf(!chromePath)('wake-on-change watches in native Chrome', { timeou
     await checkNow();
     expect(await outcomes()).toEqual(['blocked']);
     expect(await notices()).toEqual([]);
+    // The check went past what the agent would be shown of this page.
+    await page.goto(WATCHED.tables);
+    expect((await observePage(page)).snapshot).not.toContain('Verify you are human');
   });
 
   it('books a paid table a change found under the watch’s approval when the host-read total is within it', async () => {
