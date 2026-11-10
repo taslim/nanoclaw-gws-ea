@@ -5,7 +5,7 @@
  */
 import { execFileSync } from 'node:child_process';
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
-import { createServer as httpServer } from 'node:http';
+import { createServer as httpServer, type ServerResponse } from 'node:http';
 import { createServer as httpsServer } from 'node:https';
 import { connect, type Socket } from 'node:net';
 import { tmpdir } from 'node:os';
@@ -31,6 +31,8 @@ export interface OpenWebResponse {
   readonly status?: number;
   readonly headers?: Readonly<Record<string, string>>;
   readonly body?: string;
+  /** Answered only after this long, as a site slow to answer a request it took; a reset or close drops it. */
+  readonly delayMs?: number;
 }
 /** A page's HTML, or a handler for every request to its address. */
 export type OpenWebRoute = string | ((request: OpenWebRequest) => OpenWebResponse);
@@ -1401,7 +1403,16 @@ export async function openWebFixture(chromePath: string): Promise<OpenWebFixture
   const serve = (url: string, route: OpenWebRoute): void => {
     routes.set(key(url), route);
   };
+  const delayed = new Map<ServerResponse, ReturnType<typeof setTimeout>>();
+  const release = (): void => {
+    for (const [response, timer] of delayed) {
+      clearTimeout(timer);
+      response.destroy();
+    }
+    delayed.clear();
+  };
   const reset = (): void => {
+    release();
     routes.clear();
     for (const [url, route] of Object.entries(openWebPages())) serve(url, route);
     requests.length = 0;
@@ -1445,8 +1456,13 @@ export async function openWebFixture(chromePath: string): Promise<OpenWebFixture
             : typeof route === 'string'
               ? { body: route }
               : route(request);
-        response.writeHead(answer.status ?? 200, { 'content-type': 'text/html; charset=utf-8', ...answer.headers });
-        response.end(answer.body ?? '');
+        const send = (): void => {
+          delayed.delete(response);
+          response.writeHead(answer.status ?? 200, { 'content-type': 'text/html; charset=utf-8', ...answer.headers });
+          response.end(answer.body ?? '');
+        };
+        if (answer.delayMs) delayed.set(response, setTimeout(send, answer.delayMs));
+        else send();
       });
     },
   );
@@ -1502,6 +1518,7 @@ export async function openWebFixture(chromePath: string): Promise<OpenWebFixture
       return page;
     },
     async close() {
+      release();
       await browser.close();
       for (const socket of sockets) socket.destroy();
       sites.closeAllConnections();

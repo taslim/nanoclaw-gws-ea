@@ -2418,6 +2418,28 @@ document.getElementById('updated').addEventListener('click', () => location.assi
     expect(await blocks()).toEqual([]);
   });
 
+  it('keeps a free press the site answers only after the click’s wait, so a repeat on the same checkout presses nothing', async () => {
+    // Answered after the press's 10-second click window by showing the checkout again.
+    fixture.serve('https://table.example/book/r-7/confirm', () => ({
+      status: 303,
+      headers: { location: CONSENT.offers },
+      delayMs: 12_000,
+    }));
+    await open(CONSENT.offers);
+    const pressedAt = Date.now();
+    const first = await purchase('Reserve now');
+    expect(first).toMatchObject({ status: 'pressed', site: 'table.example', repeat_safe: false });
+    // The repeat comes on the checkout the site's late answer showed again.
+    await new Promise((resolve) => setTimeout(resolve, Math.max(0, pressedAt + 13_000 - Date.now())));
+    expect(page.url()).toBe(CONSENT.offers);
+    expect(await purchase('Reserve now')).toMatchObject({
+      status: 'already_pressed',
+      pressed_at: first.pressed_at,
+      repeat_safe: true,
+    });
+    expect(posts()).toEqual(['https://table.example/book/r-7/confirm']);
+  }, 60_000);
+
   it.each(['purchase', 'click'] as const)(
     'stops the job with an incident when a free booking’s confirmation shows a charge, pressed by %s',
     async (pressedBy) => {

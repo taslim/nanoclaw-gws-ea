@@ -608,7 +608,8 @@ function pressListening(
 ): () => Promise<void> {
   return async () => {
     const arrived = signature.waitForResult(page, Math.min(10_000, context.remaining())).catch(() => undefined);
-    await target.click({ timeout: Math.min(10_000, context.remaining()) });
+    // No wait after the click: its timeout then proves the click never ran, so a press that may have landed is kept.
+    await target.click({ timeout: Math.min(10_000, context.remaining()), noWaitAfter: true });
     await arrived;
   };
 }

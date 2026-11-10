@@ -16,12 +16,10 @@ export interface SubmissionSite {
 }
 
 function decoded(text: string): string {
-  try {
-    return decodeURIComponent(text.replace(/\+/gu, ' '));
-    // eslint-disable-next-line no-catch-all/no-catch-all -- text that is not percent-encoding is read as it is
-  } catch (_error) {
-    return text;
-  }
+  // Each run of escapes decodes on its own, invalid bytes as replacement characters, so one bad escape hides nothing.
+  return text
+    .replace(/\+/gu, ' ')
+    .replace(/(?:%[0-9a-f]{2})+/giu, (run) => Buffer.from(run.replace(/%/gu, ''), 'hex').toString('utf8'));
 }
 
 /** The forms a page script commonly sends a value in: as typed, URL- or form-encoded, JSON-escaped, or base64. */
