@@ -70,6 +70,8 @@ export interface Matter {
   readonly needs_minutes: number | null;
   readonly place: string | null;
   readonly deferrals: number;
+  /** When `open_loop` last changed, or the matter opened; null only for a row written outside this file. */
+  readonly open_loop_changed_at: string | null;
   readonly links: readonly MatterLink[];
   /** A project's strands, open and closed, oldest first. */
   readonly strands: readonly StrandSummary[];
@@ -302,13 +304,14 @@ interface MatterRow {
   readonly needs_minutes: number | null;
   readonly place: string | null;
   readonly deferrals: number;
+  readonly open_loop_changed_at: string | null;
   readonly created_at: string;
   readonly updated_at: string;
   readonly closed_at: string | null;
 }
 
 const MATTER_COLUMNS =
-  'id, title, open_loop, parent_id, outcome, look_task_id, due_at, needs_minutes, place, deferrals, created_at, updated_at, closed_at';
+  'id, title, open_loop, parent_id, outcome, look_task_id, due_at, needs_minutes, place, deferrals, open_loop_changed_at, created_at, updated_at, closed_at';
 
 async function matterRow(id: string): Promise<MatterRow | undefined> {
   return getDb().get<MatterRow>(`SELECT ${MATTER_COLUMNS} FROM gws_ea_matters WHERE id = ?`, id);
@@ -355,6 +358,7 @@ export async function getMatter(id: string): Promise<Matter | undefined> {
     needs_minutes: row.needs_minutes,
     place: row.place,
     deferrals: row.deferrals,
+    open_loop_changed_at: row.open_loop_changed_at,
     // By kind, and within a kind in the order they were placed.
     links: [...links].sort(byKind),
     strands: strands.map((strand) => ({ id: strand.id, title: strand.title, open: strand.closed_at === null })),
@@ -622,12 +626,13 @@ export async function openMatter(input: OpenMatterInput): Promise<Placed> {
   const moved = await db.transaction(async () => {
     if (parentId !== undefined) await assertProject(parentId, id);
     await db.run(
-      `INSERT INTO gws_ea_matters (id, title, open_loop, parent_id, created_at, updated_at, due_at, needs_minutes, place)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO gws_ea_matters (id, title, open_loop, parent_id, created_at, updated_at, open_loop_changed_at, due_at, needs_minutes, place)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       id,
       title,
       openLoop,
       parentId ?? null,
+      now,
       now,
       now,
       dueAt,
@@ -762,7 +767,7 @@ export async function updateMatter(input: UpdateMatterInput): Promise<Matter> {
       for (const threadKey of await threadsOf(id)) await placeThread(threadKey, 'matter');
     }
     if (openLoop !== undefined && openLoop !== row.open_loop) {
-      await db.run('UPDATE gws_ea_matters SET deferrals = 0 WHERE id = ?', id);
+      await db.run('UPDATE gws_ea_matters SET deferrals = 0, open_loop_changed_at = ? WHERE id = ?', now, id);
     }
     for (const [column, value] of [
       ['title', title],

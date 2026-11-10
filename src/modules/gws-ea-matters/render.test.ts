@@ -43,7 +43,10 @@ import {
   getMatter,
   listOpenMatters,
   openMatter,
+  placeInMatter,
   recordLookTask,
+  recordMatterDeferral,
+  updateMatter,
   type LinkRef,
   type Matter,
 } from './db.js';
@@ -619,6 +622,97 @@ describe('a matter as main reads it', () => {
     vi.setSystemTime(new Date('2026-10-14T13:05:00.000Z'));
     expect(await view(acme, sources)).toContain('Next look: none pending.');
     expect(await view(office, sources)).toContain('Next look: Oct 19, 2026, 9:00 AM, repeating on "0 9 * * 1".');
+  });
+});
+
+describe('the deadline facts of a due matter', () => {
+  // Nov 9, 2026 in New York is EST: 4:22 PM is 21:22Z, 4:45 PM is 21:45Z, 6:30 PM is 23:30Z.
+  const OPENED = '2026-11-09T21:22:00.000Z';
+  const LOOKED = '2026-11-09T21:45:00.000Z';
+  const DUE = '2026-11-09T18:30:00-05:00';
+
+  async function dueMatter(dueAt: string | null): Promise<Matter> {
+    vi.setSystemTime(new Date(OPENED));
+    return (
+      await openMatter({
+        title: 'Dinner for eight',
+        openLoop: 'Book a table for tonight.',
+        links: [],
+        ...(dueAt === null ? {} : { dueAt }),
+      })
+    ).matter;
+  }
+
+  it('states the time left until a fixed due moment and how long since the open loop changed, each with its clock time', async () => {
+    const { sources } = world();
+    const dinner = await dueMatter(DUE);
+    vi.setSystemTime(new Date(LOOKED));
+
+    const rendered = await view(dinner, sources);
+    expect(rendered).toContain(
+      [
+        'Due: Nov 9, 2026, 6:30 PM (fixed moment).',
+        'Due in 1 hour 45 minutes, at Nov 9, 2026, 6:30 PM.',
+        'Open loop last changed 23 minutes ago, at Nov 9, 2026, 4:22 PM.',
+        'Next look: none pending.',
+      ].join('\n'),
+    );
+  });
+
+  it('counts a date-only due to the end of that local day', async () => {
+    const { sources } = world();
+    const dinner = await dueMatter('2026-11-09');
+    vi.setSystemTime(new Date(LOOKED));
+
+    expect(await view(dinner, sources)).toContain('Due in 7 hours 15 minutes, by the end of 2026-11-09.');
+  });
+
+  it('states how long a past due is overdue, and counts days once a day has passed', async () => {
+    const { sources } = world();
+    const dinner = await dueMatter(DUE);
+    vi.setSystemTime(new Date('2026-11-10T01:35:00.000Z'));
+    expect(await view(dinner, sources)).toContain('Overdue by 2 hours 5 minutes, since Nov 9, 2026, 6:30 PM.');
+
+    vi.setSystemTime(new Date('2026-11-11T02:30:00.000Z'));
+    const later = await view(dinner, sources);
+    expect(later).toContain('Overdue by 1 day 3 hours, since Nov 9, 2026, 6:30 PM.');
+    expect(later).toContain('Open loop last changed 1 day 5 hours ago, at Nov 9, 2026, 4:22 PM.');
+  });
+
+  it('resets time since change on an open-loop rewrite, and on nothing else', async () => {
+    const { sources } = world();
+    const dinner = await dueMatter(DUE);
+    vi.setSystemTime(new Date('2026-11-09T21:30:00.000Z'));
+    await recordMatterDeferral(dinner.id);
+    await placeInMatter(dinner.id, [{ kind: 'thread', reference: THREAD_JUNO }]);
+    await updateMatter({
+      id: dinner.id,
+      title: 'Dinner for ten',
+      dueAt: '2026-11-09T19:00:00-05:00',
+      place: 'Downtown',
+    });
+    await updateMatter({ id: dinner.id, unlink: [{ kind: 'thread', reference: THREAD_JUNO }] });
+    await updateMatter({ id: dinner.id, openLoop: 'Book a table for tonight.' });
+    expect((await fresh(dinner)).open_loop_changed_at).toBe(OPENED);
+
+    vi.setSystemTime(new Date('2026-11-09T21:40:00.000Z'));
+    await updateMatter({ id: dinner.id, openLoop: 'Held a table at 7; waiting on the venue to confirm.' });
+    expect((await fresh(dinner)).open_loop_changed_at).toBe('2026-11-09T21:40:00.000Z');
+    vi.setSystemTime(new Date(LOOKED));
+    expect(await view(dinner, sources)).toContain('Open loop last changed 5 minutes ago, at Nov 9, 2026, 4:40 PM.');
+  });
+
+  it('shows neither line for a closed matter or an open one with no due time', async () => {
+    const { sources } = world();
+    const closed = await dueMatter(DUE);
+    await closeMatter({ id: closed.id, outcome: 'Booked for 7.' });
+    const undated = await dueMatter(null);
+    vi.setSystemTime(new Date(LOOKED));
+
+    for (const matter of [closed, undated]) {
+      const rendered = await view(matter, sources);
+      expect(rendered).not.toMatch(/Due in|Overdue by|Open loop last changed/u);
+    }
   });
 });
 

@@ -58,3 +58,52 @@ export function matterPlanningLines(
     );
   return lines;
 }
+
+function count(value: number, unit: string): string {
+  return `${value} ${unit}${value === 1 ? '' : 's'}`;
+}
+
+/** Whole minutes under an hour, hours and minutes under a day, then days and hours. */
+function span(milliseconds: number): string {
+  const minutes = Math.floor(Math.max(0, milliseconds) / 60_000);
+  if (minutes === 0) return 'less than a minute';
+  if (minutes < 60) return count(minutes, 'minute');
+  const [larger, smaller, smallerUnit]: readonly [string, number, string] =
+    minutes < 1440
+      ? [count(Math.floor(minutes / 60), 'hour'), minutes % 60, 'minute']
+      : [count(Math.floor(minutes / 1440), 'day'), Math.floor((minutes % 1440) / 60), 'hour'];
+  return smaller === 0 ? larger : `${larger} ${count(smaller, smallerUnit)}`;
+}
+
+/**
+ * Time left on an open matter's due time and how long its open loop has stood
+ * still, measured at `now`. Each relative span carries its absolute time, so a
+ * note that holds these lines stays true whenever it is read.
+ */
+export function matterDeadlineLines(
+  matter: Pick<Matter, 'open' | 'due_at' | 'open_loop_changed_at'>,
+  timeline: Timeline,
+  homeZone: string,
+  now: number,
+): string[] {
+  if (!matter.open || matter.due_at === null) return [];
+  const lines: string[] = [];
+  const due = resolveMatterDueAt(matter.due_at, timeline);
+  if (due !== null) {
+    const at = due.dateOnly
+      ? `the end of ${matter.due_at}`
+      : formatLocalTime(new Date(due.instant).toISOString(), due.zone ?? homeZone);
+    lines.push(
+      due.instant > now
+        ? `Due in ${span(due.instant - now)}, ${due.dateOnly ? 'by' : 'at'} ${at}.`
+        : `Overdue by ${span(now - due.instant)}, since ${at}.`,
+    );
+  }
+  if (matter.open_loop_changed_at !== null) {
+    const changed = Date.parse(matter.open_loop_changed_at);
+    lines.push(
+      `Open loop last changed ${span(now - changed)} ago, at ${formatLocalTime(matter.open_loop_changed_at, zoneAt(timeline, changed) ?? homeZone)}.`,
+    );
+  }
+  return lines;
+}

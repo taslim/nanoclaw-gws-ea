@@ -15,7 +15,7 @@ import { formatLocalTime } from '../../timezone.js';
 import { getMainAgentGroupId } from '../gws-ea-profile/db.js';
 import { loadTimeline, zoneAt, type Timeline } from '../gws-ea-whereabouts/timeline.js';
 import { afterRun, getTimeAnchor, retimeAnchor } from './anchors.js';
-import { matterPlanningLines } from './planning.js';
+import { matterDeadlineLines, matterPlanningLines } from './planning.js';
 import { getMatter, type Matter, type OpenMatterSummary } from './db.js';
 import { hostSources, loadLens, readLinks, type Lens, type LiveSources } from './live.js';
 
@@ -92,7 +92,10 @@ export async function renderMatter(
     matter.open && matter.look_task_id !== null ? readNextLook(matter.look_task_id, lens.timeline) : undefined,
     matter.parent_id === null ? undefined : getMatter(matter.parent_id),
   ]);
-  const planning = matterPlanningLines(matter, lens.timeline, timezone);
+  const planning = [
+    ...matterPlanningLines(matter, lens.timeline, timezone),
+    ...matterDeadlineLines(matter, lens.timeline, timezone, Date.parse(readAt)),
+  ];
   const state = matter.open
     ? 'open'
     : `closed ${formatLocalTime(matter.closed_at ?? matter.updated_at, zoneAt(lens.timeline, Date.parse(matter.closed_at ?? matter.updated_at)) ?? timezone)}`;

@@ -163,3 +163,19 @@ export const gwsEaCloseClockMigration: ModuleMigration = {
     `);
   },
 };
+
+/**
+ * When the open loop last changed, so a due matter can say how long it has
+ * stood still. `updated_at` cannot: a deferral or a link move touches it. A
+ * matter from before dates its open loop from its last update.
+ */
+export const gwsEaMatterOpenLoopChangedMigration: ModuleMigration = {
+  version: 1,
+  name: 'module:gws-ea-matters:open-loop-changed',
+  async up(db) {
+    await db.exec(`
+      ALTER TABLE gws_ea_matters ADD COLUMN open_loop_changed_at TEXT;
+      UPDATE gws_ea_matters SET open_loop_changed_at = updated_at;
+    `);
+  },
+};

@@ -517,9 +517,13 @@ describe('matter planning facts', () => {
     expect(read).toContain('15 minutes');
     expect(read).toContain('Berkeley office');
     expect(read).toContain('2026-12-31');
+    expect(read).toMatch(/^Due in \d+ days \d+ hours, by the end of 2026-12-31\.$/mu);
+    expect(read).toMatch(/^Open loop last changed less than a minute ago, at .+\.$/mu);
     const today = await data<{ data: string[] }>(run('matters-today', {}));
     expect(today.data.join('\n')).toContain('15 minutes');
     expect(today.data.join('\n')).toContain('Berkeley office');
+    // The daily rundown keeps its planning facts only: no time left or time since change.
+    expect(today.data.join('\n')).not.toMatch(/Due in|Overdue by|Open loop last changed/u);
     const changed = await data<Matter>(
       run('matters-update', { id: opened.matter.id, due: '', place: '', 'needs-minutes': 0 }),
     );
