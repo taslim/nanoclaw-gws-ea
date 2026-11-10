@@ -39,7 +39,7 @@ import { BrowserQueue, browserRequestGuard } from './queue.js';
 import { setBrowserAdmissionReady } from './group.js';
 import { recoverCredentialRequest } from './credential-operations.js';
 import * as signedOut from './signed-out.js';
-import * as recipes from './recipes.js';
+import * as executor from './executor.js';
 import { runBrowserWatchCheck } from './watch-runtime.js';
 import type { ChromeConnection } from './connection.js';
 
@@ -910,8 +910,8 @@ it('bounds a real watch check with its own provenance and keeps late work quaran
   if (!job) throw new Error('Expected native job');
   const at = new Date().toISOString();
   await store.db.run(
-    `INSERT INTO gws_ea_browser_watch_checks(id,site,check_recipe_id,check_recipe_version,parameter_hash,trigger,scheduled_at,started_at)
-     VALUES('native-check','resy.com','recipe',1,'parameters','timer',?,?)`,
+    `INSERT INTO gws_ea_browser_watch_checks(id,site,trigger,scheduled_at,started_at)
+     VALUES('native-check','resy.com','timer',?,?)`,
     at,
     at,
   );
@@ -929,7 +929,7 @@ it('bounds a real watch check with its own provenance and keeps late work quaran
     .spyOn(signedOut, 'withSignedOutBrowserPage')
     .mockImplementation(async (_connection, run) => run(page));
   let lateRefused = false;
-  const replay = vi.spyOn(recipes, 'executeRecipe').mockImplementation(async (context) => {
+  const replay = vi.spyOn(executor, 'executeBrowserBatch').mockImplementation(async (context) => {
     expect(context).toMatchObject({ kind: 'watch_check', check: { id: 'native-check' } });
     expect(context).not.toHaveProperty('request');
     entered();
@@ -939,7 +939,7 @@ it('bounds a real watch check with its own provenance and keeps late work quaran
     } catch {
       lateRefused = true;
     }
-    return { status: 'checkpoint_failed' };
+    return { status: 'stopped', reason: 'timeout', repeat_safe: true };
   });
   vi.useFakeTimers();
   const running = runBrowserWatchCheck(
@@ -948,8 +948,7 @@ it('bounds a real watch check with its own provenance and keeps late work quaran
       id: 'native-check',
       jobId: job.id,
       site: 'resy.com',
-      recipeId: 'recipe',
-      parameters: {},
+      address: 'https://resy.com/venue?seats=2',
       venueId: 'venue',
       partySize: 2,
     },
@@ -1152,8 +1151,7 @@ it('refuses ordinary site contention before creating a signed-out Chrome context
         id: 'check',
         jobId: job.id,
         site: 'resy.com',
-        recipeId: 'recipe',
-        parameters: {},
+        address: 'https://resy.com/venue?seats=2',
         venueId: 'venue',
         partySize: 2,
       },
@@ -1190,8 +1188,7 @@ it.each(['missing', 'conflicting'] as const)(
           id: 'check',
           jobId: job.id,
           site: 'resy.com',
-          recipeId: 'recipe',
-          parameters: {},
+          address: 'https://resy.com/venue?seats=2',
           venueId: 'venue',
           partySize: 2,
         },
@@ -1237,8 +1234,7 @@ it('keeps a pending checkout exclusive while its owning job is executing', async
           id: 'check',
           jobId: job.id,
           site: 'resy.com',
-          recipeId: 'recipe',
-          parameters: {},
+          address: 'https://resy.com/venue?seats=2',
           venueId: 'venue',
           partySize: 2,
         },

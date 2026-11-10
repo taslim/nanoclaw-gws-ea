@@ -1,19 +1,26 @@
-import { expect, it } from 'vitest';
+import type { Page } from 'playwright-core';
+import { afterEach, expect, it, vi } from 'vitest';
+import * as observe from './observe.js';
 import { normalizeWatchRegion, watchCheckFailure } from './watch-runtime.js';
 
-it('carries recipe stop reasons into site backoff instead of treating challenges as ordinary drift', () => {
-  expect(watchCheckFailure({ status: 'checkpoint_failed', found: { reason: 'challenge' } })).toEqual({
-    status: 'blocked',
-  });
-  expect(watchCheckFailure({ status: 'checkpoint_failed', found: { reason: 'site_busy' } })).toEqual({
-    status: 'site_busy',
-  });
-  expect(watchCheckFailure({ status: 'checkpoint_failed', observation: { snapshot: 'Verify you are human' } })).toEqual(
-    { status: 'blocked' },
-  );
-  expect(watchCheckFailure({ status: 'checkpoint_failed', found: { heading: 'A changed restaurant title' } })).toEqual({
-    status: 'failed',
-  });
+const page = {} as Page;
+afterEach(() => {
+  vi.restoreAllMocks();
+});
+
+it('carries a check’s stop reasons into site backoff instead of treating challenges as ordinary drift', () => {
+  vi.spyOn(observe, 'observedPageText').mockReturnValue('- heading "The Larder"');
+  expect(watchCheckFailure({ reason: 'challenge' }, page)).toEqual({ status: 'blocked' });
+  expect(watchCheckFailure({ reason: 'sign_in_wall' }, page)).toEqual({ status: 'blocked' });
+  expect(watchCheckFailure({ reason: 'site_busy' }, page)).toEqual({ status: 'site_busy' });
+  expect(watchCheckFailure({ reason: 'navigation_failed' }, page)).toEqual({ status: 'failed' });
+});
+
+it('finds a challenge in the whole page read when the agent’s cut of it leaves the challenge out', () => {
+  // The page read past the snapshot budget: the cut the agent sees ends before the challenge.
+  const read = vi.spyOn(observe, 'observedPageText').mockReturnValue('- paragraph: Verify you are human');
+  expect(watchCheckFailure({ reason: 'timeout' }, page)).toEqual({ status: 'blocked' });
+  expect(read).toHaveBeenCalledWith(page);
 });
 
 it('compares a region without its countdowns, viewers, clocks, relative times, tallies and link addresses', () => {

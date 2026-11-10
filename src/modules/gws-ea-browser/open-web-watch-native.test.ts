@@ -6,7 +6,7 @@ import { locateStructured } from './locators.js';
 import { createBrowserQueue, recoverAndStartBrowserQueue } from './index.js';
 /**
  * Wake-on-change watches against native Chrome: an unreviewed booking site whose slot list changes, checked
- * by the real scheduler and replay without the model. The signed-out context is the fixture's own page, since the
+ * by the real scheduler at the watch's address without the model. The signed-out context is the fixture's own page, since the
  * fixture's Chrome carries no host policy; the calendar and container wake are the other fixture boundaries.
  */
 import { randomUUID } from 'node:crypto';
@@ -71,6 +71,7 @@ import { setBrowserAdmissionReady } from './group.js';
 import { prepareMerchantPage } from './merchant-read.js';
 import {
   WATCHED,
+  htmlPage,
   openWebFixture,
   refIn,
   watchedBookingSite,
@@ -85,7 +86,7 @@ import { registerBrowserPurchaseDelivery, resumeBrowserPurchaseCommits } from '.
 import { type BrowserQueue } from './queue.js';
 import { createBrowserWatchScheduler, type BrowserWatchScheduler } from './scheduler.js';
 import { watchSitePolicy } from './watch-policy.js';
-import type { WatchBounds, WatchRow } from './watch-state.js';
+import type { WatchRow } from './watch-state.js';
 import { readWatchRegion } from './watch-runtime.js';
 import type { StructuredBrowserLocator } from './locators.js';
 import * as nativeControlFacts from './control-facts.js';
@@ -140,7 +141,6 @@ describe.skipIf(!chromePath)('wake-on-change watches in native Chrome', { timeou
   const PRINCIPAL = 'gchat:users/principal';
   const BOUNDS = {
     site: WATCHED.tables,
-    parameters: {},
     venue: { id: 'the-larder', name: 'The Larder' },
     party_size: 2,
     windows: [{ start: '2026-10-24T19:00:00-07:00', end: '2026-10-24T21:00:00-07:00' }],
@@ -274,20 +274,13 @@ describe.skipIf(!chromePath)('wake-on-change watches in native Chrome', { timeou
     });
     await queue.idle();
   }
-  /** The agent records the route to the slot list, then sets the watch with the list marked. */
+  /** The agent opens the slot list for the evening and party, then sets the watch there with the list marked. */
   async function setWatch(financial: Record<string, string> = FREE): Promise<Record<string, unknown>> {
     await run([{ kind: 'navigate', url: WATCHED.tables }]);
-    const recipe = await request('save_recipe', { name: 'Tables', first_action: 0, last_action: 0, parameters: [] });
-    expect(recipe).toMatchObject({ status: 'saved', read_only: true });
-    return request('watch', {
-      ...BOUNDS,
-      recipe_id: recipe.recipe_id,
-      financial,
-      region: refIn(await observePage(page), 'Available tables'),
-    });
+    return request('watch', { ...BOUNDS, financial, region: refIn(await observePage(page), 'Available tables') });
   }
   const watch = async (): Promise<WatchRow> => (await getDb().get<WatchRow>('SELECT * FROM gws_ea_browser_watches'))!;
-  /** One scheduled check, due now: the scheduler replays the recipe in a signed-out page and reads the region. */
+  /** One scheduled check, due now: the scheduler loads the watch's address in a signed-out page and reads it. */
   async function checkNow(): Promise<void> {
     const now = new Date().toISOString();
     await getDb().run("UPDATE gws_ea_browser_watches SET next_check_at = ? WHERE status = 'armed'", now);
@@ -315,9 +308,12 @@ describe.skipIf(!chromePath)('wake-on-change watches in native Chrome', { timeou
       free_only: true,
       region: { untrusted: true, text: expect.stringContaining('No tables') as unknown },
     });
+    // Arming read the address once signed out, as each check does, and kept the page's own address.
+    expect(site.served).toBe(2);
+    expect((await watch()).address).toBe(WATCHED.tables);
     // Each view moves its countdown, viewer count, clock and tally: the region still reads the same.
     for (let check = 0; check < 3; check++) await checkNow();
-    expect(site.served).toBe(4);
+    expect(site.served).toBe(5);
     expect(await outcomes()).toEqual(['region_read', 'region_read', 'region_read']);
     expect(await notices()).toEqual([]);
     expect(watchWakes()).toBe(0);
@@ -375,7 +371,6 @@ describe.skipIf(!chromePath)('wake-on-change watches in native Chrome', { timeou
     const fresh = await observePage(page);
     const result = await request('watch', {
       ...BOUNDS,
-      recipe_id: (await watch()).check_recipe_id,
       financial: FREE,
       watch_id: marked.watch_id,
       region: refIn(fresh, 'Available tables'),
@@ -442,13 +437,11 @@ describe.skipIf(!chromePath)('wake-on-change watches in native Chrome', { timeou
       }),
     ]);
 
-    // The agent marks the redesigned list on the view its recipe reaches; bounds and recipe are unchanged.
+    // The agent marks the redesigned list on the same page; the bounds are unchanged.
     await run([{ kind: 'navigate', url: WATCHED.tables }]);
-    const recipe = (await watch()).check_recipe_id;
     expect(
       await request('watch', {
         ...BOUNDS,
-        recipe_id: recipe,
         financial: FREE,
         watch_id: created.watch_id,
         region: refIn(await observePage(page), 'Times'),
@@ -458,7 +451,6 @@ describe.skipIf(!chromePath)('wake-on-change watches in native Chrome', { timeou
       await request('watch', {
         ...BOUNDS,
         party_size: 4,
-        recipe_id: recipe,
         financial: FREE,
         watch_id: created.watch_id,
         region: refIn(await observePage(page), 'Times'),
@@ -473,56 +465,102 @@ describe.skipIf(!chromePath)('wake-on-change watches in native Chrome', { timeou
     expect((change.region as { after: string }).after).toContain('8:00 PM');
   });
 
-  it('refuses a region off the recipe’s view, one with nothing to compare or one too large, set or marked again', async () => {
-    await run([{ kind: 'navigate', url: WATCHED.tables }]);
-    const recipe = await request('save_recipe', { name: 'Tables', first_action: 0, last_action: 0, parameters: [] });
-    /** The agent marks, on `url`, the first element whose observed line shows `text`. */
-    async function mark(url: string, text: string, watchId?: string): Promise<Record<string, unknown>> {
-      await run([{ kind: 'navigate', url }]);
+  it('refuses a region its address does not show signed out, one with nothing to compare or one too large', async () => {
+    /** The agent marks, on the page it is on, the first element whose observed line shows `text`. */
+    async function mark(text: string, watchId?: string): Promise<Record<string, unknown>> {
       const observation = await observePage(page);
       const line = observation.snapshot.split('\n').find((candidate) => candidate.includes(text));
       const ref = line && /\[ref=((?:f\d+)?e\d+)\]/u.exec(line)?.[1];
       if (!ref) throw new Error(`Missing ${text} in ${observation.snapshot}`);
       return request('watch', {
         ...BOUNDS,
-        recipe_id: recipe.recipe_id,
         financial: FREE,
         region: { ref, generation: observation.generation },
         ...(watchId ? { watch_id: watchId } : {}),
       });
     }
-    // The booking page is not the view the recipe reaches.
-    const offRoute = `${WATCHED.book}?slot=1930`;
-    expect(await mark(offRoute, '"Reserve now"')).toMatchObject({ status: 'refused', reason: 'region_off_route' });
+    // Members see their tables only once signed in: a signed-out check would never see them.
+    const MEMBERS = 'https://larder.example/members?date=2026-10-24&party=2';
+    fixture.serve(
+      MEMBERS,
+      htmlPage(
+        'Member tables',
+        '<h1>Members</h1><section aria-label="Member tables" hidden><p>Saturday, October 24</p><ul><li>7:30 PM</li></ul></section><p>Sign up for member tables</p>',
+        `if (document.cookie.includes('member=yes')) document.querySelector('section').hidden = false;`,
+      ),
+    );
+    await page.context().addCookies([{ name: 'member', value: 'yes', url: 'https://larder.example/' }]);
+    await run([{ kind: 'navigate', url: MEMBERS }]);
+    expect(await mark('"Member tables"')).toMatchObject({ status: 'refused', reason: 'not_at_address' });
+    // A later sitting the agent opened with a click shows at the same address only after that click.
+    const LATER = 'https://larder.example/later?date=2026-10-24&party=2';
+    fixture.serve(
+      LATER,
+      htmlPage(
+        'Later tables',
+        '<h1>Later tables</h1><button type="button">Show later sitting</button><section aria-label="Sitting"><p>Early sitting</p><p>No tables</p></section>',
+        `document.querySelector('button').addEventListener('click', () => { document.querySelector('section').innerHTML = '<p>Late sitting</p><ul><li>9:45 PM</li></ul>'; });`,
+      ),
+    );
+    await run([{ kind: 'navigate', url: LATER }]);
+    await run([{ kind: 'click', ...refIn(await observePage(page), 'Show later sitting') }]);
+    expect(await mark('"Sitting"')).toMatchObject({ status: 'refused', reason: 'not_at_address' });
     // The day's booking tally changes on every view: once stripped, nothing is left to compare.
-    expect(await mark(WATCHED.tables, 'times today')).toMatchObject({ status: 'refused', reason: 'region_unmarkable' });
+    await run([{ kind: 'navigate', url: WATCHED.tables }]);
+    expect(await mark('times today')).toMatchObject({ status: 'refused', reason: 'region_unmarkable' });
     // More slots than the host keeps of a region's text.
     site.slots = Array.from(
       { length: 168 },
       (_, index) => `${10 + Math.floor(index / 12)}${String((index % 12) * 5).padStart(2, '0')}`,
     );
-    expect(await mark(WATCHED.tables, '"Available tables"')).toMatchObject({
-      status: 'refused',
-      reason: 'region_too_large',
-    });
+    await run([{ kind: 'navigate', url: WATCHED.tables }]);
+    expect(await mark('"Available tables"')).toMatchObject({ status: 'refused', reason: 'region_too_large' });
     site.slots = [];
     expect(await getDb().all('SELECT id FROM gws_ea_browser_watches')).toEqual([]);
 
     // Marking a watch's region again goes through the same mark: its refusal leaves the marked region as it was.
-    const created = await mark(WATCHED.tables, '"Available tables"');
+    await run([{ kind: 'navigate', url: WATCHED.tables }]);
+    const created = await mark('"Available tables"');
     expect(created).toMatchObject({ status: 'armed' });
     const marked = await watch();
-    expect(await mark(offRoute, '"Reserve now"', String(created.watch_id))).toMatchObject({
+    await run([{ kind: 'navigate', url: MEMBERS }]);
+    expect(await mark('"Member tables"', String(created.watch_id))).toMatchObject({
       status: 'refused',
-      reason: 'region_off_route',
+      reason: 'not_at_address',
       watch_id: created.watch_id,
     });
     expect(await watch()).toMatchObject({
       status: 'armed',
+      address: WATCHED.tables,
       region_json: marked.region_json,
       region_baseline: marked.region_baseline,
       region_marked_at: marked.region_marked_at,
     });
+  });
+
+  it('reports the region missing once its address redirects elsewhere', async () => {
+    const created = await setWatch();
+    const closed = 'https://larder.example/closed';
+    fixture.serve(closed, htmlPage('Closed', '<h1>The Larder is closed for a private event</h1>'));
+    fixture.serve(WATCHED.tables, () => ({ status: 302, headers: { location: closed } }));
+    await checkNow();
+    await checkNow();
+    expect(await outcomes()).toEqual(['region_missing', 'region_missing']);
+    expect(await notices()).toEqual([
+      expect.objectContaining({ status: 'region_missing', reason: 'route_changed', watch_id: created.watch_id }),
+    ]);
+  });
+
+  it('blocks a check on a challenge page even where the agent’s cut of the page leaves the challenge out', async () => {
+    await setWatch();
+    const filler = Array.from({ length: 600 }, (_, index) => `<li>Private dining room option ${index}</li>`).join('');
+    fixture.serve(
+      WATCHED.tables,
+      htmlPage('One moment', `<h1>One moment</h1><ul>${filler}</ul><p>Verify you are human to continue</p>`),
+    );
+    await checkNow();
+    expect(await outcomes()).toEqual(['blocked']);
+    expect(await notices()).toEqual([]);
   });
 
   it('books a paid table a change found under the watch’s approval when the host-read total is within it', async () => {
@@ -635,7 +673,7 @@ describe.skipIf(!chromePath)('a reader watch beside region watches in native Chr
   });
 
   it('books a Resy table through its reader without waking the agent', async () => {
-    // The agent recorded the route to the reservation and its booking path: a click that reached the commit.
+    // The agent opened the reservation and recorded its booking path: a click that reached the commit.
     expect(
       await request('browser', { actions: [{ kind: 'navigate', url: 'https://resy.com/reservation-details' }] }),
     ).toMatchObject({ reason: 'navigated', actions: [{ status: 'completed' }] });
@@ -644,26 +682,21 @@ describe.skipIf(!chromePath)('a reader watch beside region watches in native Chr
     expect(
       await request('browser', { actions: [{ kind: 'click', ...refIn(observation, 'Reserve Now') }] }),
     ).toMatchObject({ status: 'stopped', reason: 'purchase_control' });
-    const check = await request('save_recipe', { name: 'Table', first_action: 0, last_action: 0, parameters: [] });
-    const bounds: WatchBounds = {
-      site: 'resy.com',
-      venue: { id: '25973', name: "L'Artusi" },
-      partySize: 2,
-      windows: [{ start: '2026-10-17T15:00:00.000Z', end: '2026-10-17T16:00:00.000Z' }],
-      financial: { freeOnly: true, currency: 'USD', maxTotalMinor: 0, maxDueNowMinor: 0 },
-      until: '2026-10-17T14:00:00.000Z',
-    };
-    const at = new Date().toISOString();
-    await getDb().run(
-      `INSERT INTO gws_ea_browser_watches(id,job_id,site,check_recipe_id,check_recipe_version,parameters_json,check_key,bounds_json,status,created_at,updated_at,next_check_at) VALUES('reader',?,'resy.com',?,1,'{}','reader',?,'armed',?,?,?)`,
-      jobId,
-      check.recipe_id,
-      JSON.stringify(bounds),
-      at,
-      at,
-      at,
-    );
-    await getDb().run("INSERT INTO gws_ea_browser_watch_job_claims(job_id,state) VALUES(?,'available')", jobId);
+    // The agent watches the venue from the reservation's own page: the host reads it there, signed out, at arming.
+    expect(
+      await request('watch', {
+        site: 'https://resy.com/reservation-details',
+        venue: { id: '25973', name: "L'Artusi" },
+        party_size: 2,
+        windows: [{ start: '2026-10-17T15:00:00.000Z', end: '2026-10-17T16:00:00.000Z' }],
+        financial: { currency: 'USD', max_total: '0' },
+        until: '2026-10-17T14:00:00.000Z',
+      }),
+    ).toMatchObject({ status: 'armed', free_only: true });
+    expect(await getDb().get('SELECT address,region_json FROM gws_ea_browser_watches')).toEqual({
+      address: 'https://resy.com/reservation-details',
+      region_json: null,
+    });
     await request('save_recipe', { name: 'Book', first_action: 0, last_action: 1, parameters: [] });
     expect(await getDb().get('SELECT booking_recipe_id IS NOT NULL AS linked FROM gws_ea_browser_watches')).toEqual({
       linked: 1,

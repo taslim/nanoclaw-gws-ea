@@ -62,10 +62,8 @@ export interface WatchRow {
   id: string;
   job_id: string;
   site: string;
-  check_recipe_id: string;
-  check_recipe_version: number;
-  parameters_json: string;
-  check_key: string;
+  /** The page address the watch was armed on: each check loads it signed out, read-only, and reads it there. */
+  address: string;
   bounds_json: string;
   approval_id: string | null;
   approval_json: string | null;
@@ -75,6 +73,8 @@ export interface WatchRow {
   pending_request_id: string | null;
   booking_recipe_id: string | null;
   booking_recipe_version: number | null;
+  /** A reader watch's inputs to its booking recipe; empty on a region watch, which never books by itself. */
+  booking_parameters_json: string;
   /** The venue's release schedule, written once at creation; null when the venue states none. */
   release_json: string | null;
   /** The structured locator of the region the agent marked; null on a reader watch. */

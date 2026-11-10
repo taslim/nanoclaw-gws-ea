@@ -19,7 +19,7 @@ import { configureBrowserSiteInfo, observePage, type BrowserRef } from './observ
 import { registerPageSecret } from './page-privacy.js';
 import type { BrowserExecutionContext } from './actions.js';
 import { executeRecipe, saveBrowserRecipe, validateRunRecipe, validateSaveRecipe } from './recipes.js';
-import { loadRecipe, recipeCheckKey } from './recipe-store.js';
+import { loadRecipe } from './recipe-store.js';
 
 it('accepts closed recipe inputs and refuses ambiguous or executable bindings', () => {
   expect(
@@ -107,16 +107,6 @@ it('pins immutable recipe versions and keys checks by every named value', async 
       { recipe_id: second.recipe_id, name: 'Find tables', version: 2, parameters: ['party'], read_only: true },
     ]);
     expect((await observePage(page)).site).toBeUndefined();
-    expect(recipeCheckKey(old!, { party: '2', date: '2026-10-15' })).toBe(
-      recipeCheckKey(old!, { date: '2026-10-15', party: '2' }),
-    );
-    expect(recipeCheckKey(old!, { party: '3', date: '2026-10-15' })).not.toBe(
-      recipeCheckKey(old!, { party: '2', date: '2026-10-15' }),
-    );
-    expect(recipeCheckKey(old!, { party: '2', date: '2026-10-16' })).not.toBe(
-      recipeCheckKey(old!, { party: '2', date: '2026-10-15' }),
-    );
-    expect(recipeCheckKey({ ...old!, version: 2 }, { party: '2' })).not.toBe(recipeCheckKey(old!, { party: '2' }));
     await expect(saveBrowserRecipe(context, { ...input, last_action: 1 })).rejects.toThrow();
     const navigation = {
       action: { kind: 'navigate', url: 'https://fixture.example/search' },

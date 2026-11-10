@@ -25,6 +25,7 @@ import {
   browserQueueMigration,
   browserRecipesMigration,
   browserWatchesMigration,
+  browserWatchAddressMigration,
   browserWatchRegionMigration,
   browserWatchReleaseMigration,
   browserSiteLeasesMigration,
@@ -97,6 +98,7 @@ registerMigration(browserPurchaseOutcomesMigration);
 registerMigration(browserConsentOutcomesMigration);
 registerMigration(browserSignInAssistantOnlyMigration);
 registerMigration(browserFreeAttemptsRetiredMigration);
+registerMigration(browserWatchAddressMigration);
 
 const runtime = new BrowserRuntime(undefined, browserAdmissionReady, undefined, async (jobId) => {
   const store = new BrowserStore();

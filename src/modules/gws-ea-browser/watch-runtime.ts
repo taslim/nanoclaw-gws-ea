@@ -1,27 +1,41 @@
 import type { Page } from 'playwright-core';
 import { getSession } from '../../db/sessions.js';
-import { isRecord } from '../../gws-ea/validation.js';
 import { settleCookieBanners } from './cookie-banners.js';
 import {
   BrowserRefError,
   invalidateBrowserRefs,
   disposeBrowserRefs,
   hasBrowserChallenge,
+  observedPageText,
   pinBrowserRefs,
+  snapshotBrowserStructure,
   type BrowserRef,
+  type PinnedBrowserRef,
 } from './observe.js';
-import { collectSecretFields, redactPageText } from './page-privacy.js';
-import { credentialSiteHeldByOther, browserSite, type SiteLease } from './leases.js';
+import { browserPageReplayUrl, collectSecretFields, redactPageText } from './page-privacy.js';
+import { credentialSiteHeldByOther, browserSite, SiteLeaseStore, type SiteLease } from './leases.js';
 import { merchantSignatureFor } from './merchant-read.js';
 import type { ReservationAvailability, ReservationPolicy } from './merchant-contract.js';
 import { browserAvailability } from './availability.js';
 
 import type { BrowserQueue } from './queue.js';
-import type { BrowserExecutionContext, BrowserWatchExecutionContext } from './actions.js';
+import type {
+  BrowserBatchResult,
+  BrowserExecutionContext,
+  BrowserOperationContext,
+  BrowserWatchExecutionContext,
+} from './actions.js';
+import type { BrowserSiteAccess } from './commit-classifier.js';
+import { executeBrowserBatch } from './executor.js';
 import { BrowserOperation } from './operation.js';
-import { captureRecipeRegion, executeRecipe } from './recipes.js';
-import { type BrowserRecipe } from './recipe-store.js';
-import { locateStructured, type StructuredBrowserLocator } from './locators.js';
+import {
+  ariaNodes,
+  captureLocator,
+  checkpointUrl,
+  flatten,
+  locateStructured,
+  type StructuredBrowserLocator,
+} from './locators.js';
 import type { BrowserWatchCheckInput, BrowserWatchCheckResult } from './scheduler.js';
 import { withSignedOutBrowserPage } from './signed-out.js';
 import { WATCH_REGION_TEXT_LIMIT } from './watch-policy.js';
@@ -114,18 +128,102 @@ export async function readWatchRegion(
   }
 }
 
+/** Why arming refused an address: it does not show signed out what the agent saw, or the site is busy or refusing. */
+export type WatchAddressRefusal = { status: 'refused'; reason: 'not_at_address' | 'site_busy' | 'challenge' };
+
 export type WatchRegionMark =
-  | { status: 'marked'; region: StructuredBrowserLocator; text: string }
-  | { status: 'refused'; reason: 'stale_ref' | 'region_off_route' | 'region_unmarkable' | 'region_too_large' };
+  | { status: 'marked'; region: StructuredBrowserLocator; text: string; address: string }
+  | { status: 'refused'; reason: 'stale_ref' | 'region_unmarkable' | 'region_too_large' }
+  | WatchAddressRefusal;
+
+/** Whether a watch's one batch reached its address: a check or an arming reads the page only then. */
+const loaded = (result: BrowserBatchResult): boolean => result.status === 'completed' || result.reason === 'navigated';
 
 /**
- * The region the agent marked from an observation ref, on the page `recipe` reaches: its structured locator and its
- * normalized text, which becomes the watch's baseline. Nothing on the page is pressed.
+ * Loads a watch's address read-only in a signed-out page and reads it whole: the one batch arming and every check run,
+ * with no recorded step and no click. Its observation ends the batch, so the page's full text is current.
+ */
+function loadWatchAddress(
+  context: BrowserOperationContext,
+  page: Page,
+  address: string,
+  siteAccess: BrowserSiteAccess,
+): Promise<BrowserBatchResult> {
+  return executeBrowserBatch(
+    context,
+    { actions: [{ kind: 'navigate', url: address }, { kind: 'observe' }] },
+    { page, readOnly: true, record: false, siteAccess },
+  );
+}
+
+/** The page's own address, query and fragment included, when it is on the watch's site and nothing in it is secret. */
+function watchAddress(page: Page, site: string): string | undefined {
+  const address = browserPageReplayUrl(page);
+  try {
+    return address && new URL(address).protocol === 'https:' && browserSite(address) === site ? address : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Reads `address` as a check will, signed out and read-only, with the site held for the agent's job: arming refuses an
+ * address that does not reach the state the agent saw. A page the site serves only after sign-in or a click reads
+ * as `not_at_address`.
+ */
+async function readAtAddress<T>(
+  context: BrowserExecutionContext,
+  site: string,
+  address: string,
+  read: (page: Page) => Promise<T | undefined>,
+): Promise<{ status: 'read'; value: T | undefined } | WatchAddressRefusal> {
+  const siteAccess: BrowserSiteAccess = async (url) => {
+    await context.assertActive();
+    try {
+      if (url.protocol !== 'https:' || browserSite(url.href) !== site) return 'blocked_address';
+    } catch {
+      return 'blocked_address';
+    }
+    if (await credentialSiteHeldByOther(context.job.id, site)) return 'site_busy';
+    // The job takes the site as its own navigation would, and gives it up with its other sites.
+    const lease = await new SiteLeaseStore(context.store.db).acquire(context.job.id, url.href);
+    await context.wakeWaiters(lease.waitingJobs, `${context.request.id}:watch-address`);
+    return lease.acquired ? 'ordinary' : 'site_busy';
+  };
+  return withSignedOutBrowserPage(await context.runtime.connection(), async (signedOut) => {
+    await context.assertActive();
+    const result = await loadWatchAddress(context, signedOut, address, siteAccess);
+    if (!loaded(result))
+      return {
+        status: 'refused' as const,
+        reason: result.reason === 'site_busy' || result.reason === 'challenge' ? result.reason : 'not_at_address',
+      };
+    const value = await read(signedOut);
+    await context.assertActive();
+    return { status: 'read' as const, value };
+  });
+}
+
+/** The marked element's structured locator, found again by its accessible role and name; undefined when none does. */
+async function captureWatchRegion(page: Page, target: PinnedBrowserRef): Promise<StructuredBrowserLocator | undefined> {
+  const snapshot = await snapshotBrowserStructure(page);
+  try {
+    return await captureLocator(target, flatten(ariaNodes(snapshot.tree)));
+  } catch (error) {
+    if (error instanceof Error) return undefined;
+    throw error;
+  }
+}
+
+/**
+ * The region the agent marked from an observation ref, with the page's address: its structured locator, and its
+ * normalized text as the address shows it signed out, which becomes the watch's baseline. The address must show the
+ * region as the agent sees it; nothing on either page is pressed.
  */
 export async function markWatchRegion(
   context: BrowserExecutionContext,
   ref: BrowserRef,
-  recipe: BrowserRecipe,
+  site: string,
 ): Promise<WatchRegionMark> {
   await context.assertActive();
   const page = await context.page();
@@ -136,18 +234,42 @@ export async function markWatchRegion(
     if (error instanceof BrowserRefError) return { status: 'refused', reason: 'stale_ref' };
     throw error;
   }
+  let region: StructuredBrowserLocator | undefined;
+  let seen: string | undefined;
   try {
     const target = pinned.get(ref.ref);
-    const region = target ? await captureRecipeRegion(page, target, recipe) : undefined;
-    if (region === 'off_route') return { status: 'refused', reason: 'region_off_route' };
-    const text = region ? await readWatchRegion(page, region) : undefined;
+    region = target ? await captureWatchRegion(page, target) : undefined;
+    seen = region ? await readWatchRegion(page, region) : undefined;
     await context.assertActive();
-    if (!region || !text) return { status: 'refused', reason: 'region_unmarkable' };
-    if (text.length > WATCH_REGION_TEXT_LIMIT) return { status: 'refused', reason: 'region_too_large' };
-    return { status: 'marked', region, text };
   } finally {
     await disposeBrowserRefs(pinned);
   }
+  if (!region || !seen) return { status: 'refused', reason: 'region_unmarkable' };
+  if (seen.length > WATCH_REGION_TEXT_LIMIT) return { status: 'refused', reason: 'region_too_large' };
+  const address = watchAddress(page, site);
+  if (!address) return { status: 'refused', reason: 'not_at_address' };
+  const marked = region;
+  // A check finds the region on the page the address lands on, so that page, not the agent's, is where it is.
+  const read = await readAtAddress(context, site, address, async (signedOut) => {
+    const text = await readWatchRegion(signedOut, marked, false);
+    return text === undefined ? undefined : { text, landed: checkpointUrl(signedOut.url()) };
+  });
+  if (read.status === 'refused') return read;
+  if (read.value?.text !== seen) return { status: 'refused', reason: 'not_at_address' };
+  return {
+    status: 'marked',
+    region: { ...marked, frameUrls: [read.value.landed, ...marked.frameUrls.slice(1)] },
+    text: read.value.text,
+    address,
+  };
+}
+
+/** A reader watch's venue as the host reads it on the agent's page, and the address that shows it signed out. */
+export interface BrowserWatchSetup {
+  status: 'ready';
+  availability: Extract<ReservationAvailability, { status: 'ready' }>;
+  policy?: ReservationPolicy;
+  address: string;
 }
 
 export async function readBrowserWatchSetup(
@@ -157,9 +279,7 @@ export async function readBrowserWatchSetup(
     venue: { id: string; name: string };
     partySize: number;
   },
-): Promise<
-  { availability: Extract<ReservationAvailability, { status: 'ready' }>; policy?: ReservationPolicy } | undefined
-> {
+): Promise<BrowserWatchSetup | WatchAddressRefusal | undefined> {
   await context.assertActive();
   const page = await context.page();
   if (browserSite(page.url()) !== expected.site) return undefined;
@@ -170,7 +290,19 @@ export async function readBrowserWatchSetup(
   });
   const policy = await signature?.readReservationPolicy?.(page, expected.venue.id);
   await context.assertActive();
-  return availability?.status === 'ready' ? { availability, ...(policy ? { policy } : {}) } : undefined;
+  if (availability?.status !== 'ready') return undefined;
+  const address = watchAddress(page, expected.site);
+  if (!address) return { status: 'refused', reason: 'not_at_address' };
+  const read = await readAtAddress(context, expected.site, address, async (signedOut) =>
+    merchantSignatureFor(signedOut)?.readAvailability?.(signedOut, {
+      venueId: expected.venue.id,
+      partySize: expected.partySize,
+    }),
+  );
+  if (read.status === 'refused') return read;
+  if (read.value?.status !== 'ready' || read.value.venue.id !== availability.venue.id)
+    return { status: 'refused', reason: 'not_at_address' };
+  return { status: 'ready', availability, ...(policy ? { policy } : {}), address };
 }
 
 /** Only a real pending checkout permits a second, signed-out read on this exact site. */
@@ -187,58 +319,52 @@ async function pendingCheckout(queue: BrowserQueue, lease: SiteLease): Promise<b
   });
 }
 
+const BLOCKING_STOPS: ReadonlySet<string> = new Set(['challenge', 'blocked_address', 'sign_in_wall']);
+/**
+ * A check that did not read its page: the site busy, refusing it, or otherwise failed. The whole page read decides
+ * whether the site showed a challenge; the agent's cut of it may leave one out.
+ */
 export function watchCheckFailure(
-  result: Record<string, unknown>,
+  result: { readonly reason?: string },
+  page: Page,
 ): Exclude<BrowserWatchCheckResult, { status: 'ready' }> {
-  const reason = result.reason ?? (isRecord(result.found) ? result.found.reason : undefined);
-  if (reason === 'site_busy') return { status: 'site_busy' };
-  const snapshot = isRecord(result.observation) ? result.observation.snapshot : undefined;
+  if (result.reason === 'site_busy') return { status: 'site_busy' };
   return {
     status:
-      reason === 'challenge' ||
-      reason === 'blocked_address' ||
-      reason === 'sign_in_wall' ||
-      (typeof snapshot === 'string' && hasBrowserChallenge(snapshot))
+      (result.reason !== undefined && BLOCKING_STOPS.has(result.reason)) || hasBrowserChallenge(observedPageText(page))
         ? 'blocked'
         : 'failed',
   };
 }
 
-/** Whether a replay failed on the page's own structure (its heading, address or elements), not on a stop. */
-function structuralFailure(result: Record<string, unknown>): boolean {
-  return result.status === 'checkpoint_failed' && isRecord(result.found) && result.found.reason === undefined;
-}
-
 /**
- * A region check after its replay: the region's normalized text, or that the route to it or the region itself is gone.
- * A cookie banner left on the page, a challenge or an operational stop fails or blocks the check instead, so nothing
- * the site shows over the page asks the agent to mark it again.
+ * A region check after its address loaded: the region's normalized text, or that the page or the region is gone. A
+ * cookie banner left on the page, a challenge or an operational stop fails or blocks the check instead, so nothing the
+ * site shows over the page asks the agent to mark it again.
  */
 async function readRegionCheck(
   context: BrowserWatchExecutionContext,
   page: Page,
   region: StructuredBrowserLocator,
-  result: Record<string, unknown>,
+  result: BrowserBatchResult,
 ): Promise<BrowserWatchCheckResult> {
+  if (!loaded(result)) return watchCheckFailure(result, page);
+  if (hasBrowserChallenge(observedPageText(page))) return { status: 'blocked' };
   const banner = await settleCookieBanners(page, {
     scope: { jobId: context.job.id, db: context.store.db },
     assertActive: context.assertActive,
     remaining: context.remaining,
   });
   const covered = banner !== undefined && banner.status !== 'rejected';
-  if (result.status !== 'completed') {
-    const failure = watchCheckFailure(result);
-    return failure.status === 'failed' && !covered && structuralFailure(result)
-      ? { status: 'region_missing', reason: 'route_changed' }
-      : failure;
-  }
-  const snapshot = isRecord(result.observation) ? result.observation.snapshot : undefined;
-  if (typeof snapshot === 'string' && hasBrowserChallenge(snapshot)) return { status: 'blocked' };
-  // The replay checked the route; the region's own frames are checked as it is found.
-  const text = await readWatchRegion(page, region, false);
+  const text = await readWatchRegion(page, region);
   await context.assertActive();
   if (text !== undefined) return { status: 'region_read', text };
-  return covered ? { status: 'failed' } : { status: 'region_missing', reason: 'region_not_found' };
+  if (covered) return { status: 'failed' };
+  // The address now lands elsewhere, such as a redirect, or the page it lands on no longer shows the region.
+  return {
+    status: 'region_missing',
+    reason: checkpointUrl(page.url()) === region.frameUrls[0] ? 'region_not_found' : 'route_changed',
+  };
 }
 
 /** Model-free: the check runs under its watch-check id and inserts no tool request of its own. */
@@ -320,13 +446,9 @@ export async function runBrowserWatchCheck(
               remaining: operation.remaining,
               wakeWaiters: (ids, eventId) => queue.wakeWaiters(ids, eventId),
             };
-            const result = await executeRecipe(
-              context,
-              { recipe_id: input.recipeId, parameters: input.parameters },
-              { page: signedOut, record: false, readOnly: true, siteAccess },
-            );
+            const result = await loadWatchAddress(context, signedOut, input.address, siteAccess);
             if (input.region) return readRegionCheck(context, signedOut, input.region, result);
-            if (result.status !== 'completed') return watchCheckFailure(result);
+            if (!loaded(result)) return watchCheckFailure(result, signedOut);
             const availability = await merchantSignatureFor(signedOut)?.readAvailability?.(signedOut, {
               venueId: input.venueId,
               partySize: input.partySize,

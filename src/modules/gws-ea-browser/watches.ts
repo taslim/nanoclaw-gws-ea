@@ -20,7 +20,6 @@ import {
 } from './watch-state.js';
 import { invalidArgs } from '../../cli/delivery-action.js';
 import { getDb } from '../../db/connection.js';
-import type { DbDriver } from '../../db/driver.js';
 import { getPendingApproval } from '../../db/sessions.js';
 import { DENY, HOLD, defineGuardedAction, guard } from '../../guard/index.js';
 import { log } from '../../log.js';
@@ -38,7 +37,7 @@ import { readBrowserRef, type BrowserRef } from './observe.js';
 import { browserAvailability } from './availability.js';
 import { browserDelegators } from './access.js';
 import { executeRecipe } from './recipes.js';
-import { loadRecipe, recipeCheckKey, type BrowserRecipe } from './recipe-store.js';
+import { loadRecipe } from './recipe-store.js';
 import { type StructuredBrowserLocator } from './locators.js';
 import type { BrowserExecutionContext, BrowserQueuedAction } from './actions.js';
 import { loadPrincipalClock, watchSitePolicy, watchStartAt, type WatchReleaseRule } from './watch-policy.js';
@@ -60,7 +59,7 @@ interface WatchReleaseInput {
 }
 interface WatchInput extends Record<string, unknown> {
   site: string;
-  recipe_id: string;
+  /** A reader watch's inputs to the booking recipe it books through, by name. */
   parameters: Record<string, string>;
   venue: { id: string; name: string };
   party_size: number;
@@ -119,7 +118,6 @@ export function validateWatchRequest(raw: Record<string, unknown>): WatchInput {
           'action',
           'requestId',
           'site',
-          'recipe_id',
           'parameters',
           'venue',
           'party_size',
@@ -136,10 +134,6 @@ export function validateWatchRequest(raw: Record<string, unknown>): WatchInput {
     throw invalidArgs(watchMessage('unknownField'));
   if (
     typeof raw.site !== 'string' ||
-    typeof raw.recipe_id !== 'string' ||
-    !raw.recipe_id ||
-    !isRecord(raw.parameters) ||
-    Object.values(raw.parameters).some((value) => typeof value !== 'string') ||
     !isRecord(raw.venue) ||
     typeof raw.venue.id !== 'string' ||
     !raw.venue.id ||
@@ -173,6 +167,13 @@ export function validateWatchRequest(raw: Record<string, unknown>): WatchInput {
     if (start > end) throw invalidArgs(watchMessage('windowOrder'));
     return { start, end };
   });
+  const parameters = raw.parameters ?? {};
+  if (
+    !isRecord(parameters) ||
+    Object.values(parameters).some((value) => typeof value !== 'string') ||
+    (raw.region !== undefined && Object.keys(parameters).length)
+  )
+    throw invalidArgs(watchMessage('parameters'));
   const until = offsetInstant(raw.until);
   if (until <= new Date().toISOString()) throw invalidArgs(watchMessage('deadline'));
   const release = raw.release === undefined ? undefined : validateRelease(raw.release);
@@ -181,8 +182,7 @@ export function validateWatchRequest(raw: Record<string, unknown>): WatchInput {
     throw invalidArgs(watchMessage('mark'));
   return {
     site: raw.site,
-    recipe_id: raw.recipe_id,
-    parameters: raw.parameters as Record<string, string>,
+    parameters: parameters as Record<string, string>,
     venue: { id: raw.venue.id, name: raw.venue.name },
     party_size: Number(raw.party_size),
     windows,
@@ -266,6 +266,8 @@ type PreparedWatch =
       release: WatchReleaseRule | undefined;
       /** The venue's clock for the card's arrival windows, when the host or the release rule names it. */
       venueTimeZone: string | undefined;
+      /** The page address each check loads signed out. */
+      address: string;
       region?: { locator: StructuredBrowserLocator; text: string };
     }
   | { status: 'refused'; reason: string; exposure?: string; max_total?: string; message?: string };
@@ -277,6 +279,7 @@ async function prepareReaderWatch(
 ): Promise<PreparedWatch> {
   if (input.region) return { status: 'refused', reason: 'site_has_reader' };
   const setup = await readBrowserWatchSetup(context, { site, venue: input.venue, partySize: input.party_size });
+  if (setup?.status === 'refused') return setup;
   if (
     !setup ||
     setup.availability.site !== site ||
@@ -332,39 +335,32 @@ async function prepareReaderWatch(
     },
     release,
     venueTimeZone: setup.availability.timeZone,
+    address: setup.address,
   };
 }
 /**
- * A region watch on a site with no reader: the recipe to the availability view, the region the agent marked on it,
- * and that region's normalized text as the baseline. Its release rule reads on the zone the agent gives.
+ * A region watch on a site with no reader: the address of the agent's page, the region the agent marked on it, and
+ * that region's normalized text as the address shows it signed out, which is the baseline. Its release rule reads on
+ * the zone the agent gives.
  */
 async function prepareRegionWatch(
   context: BrowserExecutionContext,
   input: WatchInput,
   site: string,
-  recipe: BrowserRecipe,
 ): Promise<PreparedWatch> {
   if (!input.region) return { status: 'refused', reason: 'region_required' };
   const release = input.release && watchReleaseRule(input.release, undefined);
   if (input.release && !release) return { status: 'refused', reason: 'release_zone_unknown' };
-  const mark = await markWatchRegion(context, input.region, recipe);
+  const mark = await markWatchRegion(context, input.region, site);
   if (mark.status === 'refused') return mark;
   return {
     status: 'ready',
     bounds: regionWatchBounds(input, site),
     release,
     venueTimeZone: release?.timeZone,
+    address: mark.address,
     region: { locator: mark.region, text: mark.text },
   };
-}
-async function watchRecipe(input: WatchInput, site: string, db: DbDriver): Promise<BrowserRecipe | undefined> {
-  const recipe = await loadRecipe(input.recipe_id, db);
-  return recipe?.readOnly &&
-    recipe.site === site &&
-    JSON.stringify(recipe.parameters.map((entry) => entry.name).sort()) ===
-      JSON.stringify(Object.keys(input.parameters).sort())
-    ? recipe
-    : undefined;
 }
 export async function createBrowserWatch(
   context: BrowserExecutionContext,
@@ -381,13 +377,11 @@ export async function createBrowserWatch(
       watch_id: existing.id,
     };
   const site = browserSite(input.site);
-  const recipe = await watchRecipe(input, site, db);
-  if (!recipe) return { status: 'refused', reason: 'read_only_recipe_required' };
   const prepared = hasWatchReader(input.site, site)
     ? await prepareReaderWatch(context, input, site)
-    : await prepareRegionWatch(context, input, site, recipe);
+    : await prepareRegionWatch(context, input, site);
   if (prepared.status === 'refused') return prepared;
-  const { bounds, release, region } = prepared;
+  const { bounds, release, region, address } = prepared;
   const freeOnly = bounds.financial.freeOnly;
   const at = new Date().toISOString();
   await db.transaction(async () => {
@@ -402,14 +396,12 @@ export async function createBrowserWatch(
       context.job.id,
     );
     await db.run(
-      `INSERT INTO gws_ea_browser_watches(id,job_id,site,check_recipe_id,check_recipe_version,parameters_json,check_key,bounds_json,release_json,region_json,region_baseline,region_marked_at,status,created_at,updated_at,next_check_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      `INSERT INTO gws_ea_browser_watches(id,job_id,site,address,booking_parameters_json,bounds_json,release_json,region_json,region_baseline,region_marked_at,status,created_at,updated_at,next_check_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
       id,
       context.job.id,
       site,
-      recipe.id,
-      recipe.version,
+      address,
       JSON.stringify(input.parameters),
-      recipeCheckKey(recipe, input.parameters),
       JSON.stringify(bounds),
       release ? JSON.stringify(release) : null,
       region ? JSON.stringify(region.locator) : null,
@@ -421,10 +413,10 @@ export async function createBrowserWatch(
       at,
     );
     if (region) return;
+    // A booking recipe a watch on this site proved takes the same inputs here.
     const links = await db.all<{ booking_recipe_id: string; booking_recipe_version: number }>(
-      'SELECT * FROM gws_ea_browser_watch_recipe_links WHERE check_recipe_id = ? AND check_recipe_version = ? ORDER BY verified_at DESC',
-      recipe.id,
-      recipe.version,
+      'SELECT * FROM gws_ea_browser_watch_recipe_links WHERE site = ? ORDER BY verified_at DESC',
+      site,
     );
     for (const link of links) {
       const booking = await loadRecipe(link.booking_recipe_id, db);
@@ -489,9 +481,9 @@ export async function createBrowserWatch(
   return { status: approvalId ? 'awaiting_principal' : 'refused', watch_id: id, ...(approvalId ? marked : {}) };
 }
 /**
- * Marks a region watch's region again after the host could not find it, from a fresh observation of the view its
- * recipe reaches, with a new recipe when the route changed. Its bounds, approval and release stay; the new text is its
- * baseline, and it is checked again at once.
+ * Marks a region watch's region again after the host could not find it, from a fresh observation, at the address of
+ * the agent's page now. Its bounds, approval and release stay; the new address and text are its own, and it is
+ * checked again at once.
  */
 async function markBrowserWatchAgain(
   context: BrowserExecutionContext,
@@ -506,17 +498,12 @@ async function markBrowserWatchAgain(
   const site = browserSite(input.site);
   if (JSON.stringify(regionWatchBounds(input, site)) !== watch.bounds_json)
     return { status: 'refused', reason: 'bounds_changed', watch_id: watch.id };
-  const recipe = await watchRecipe(input, site, db);
-  if (!recipe) return { status: 'refused', reason: 'read_only_recipe_required', watch_id: watch.id };
-  const mark = await markWatchRegion(context, input.region!, recipe);
+  const mark = await markWatchRegion(context, input.region!, site);
   if (mark.status === 'refused') return { ...mark, watch_id: watch.id };
   const at = new Date().toISOString();
   const marked = await db.run(
-    `UPDATE gws_ea_browser_watches SET check_recipe_id = ?,check_recipe_version = ?,parameters_json = ?,check_key = ?,region_json = ?,region_baseline = ?,region_marked_at = ?,region_missing_since = NULL,next_check_at = ?,updated_at = ? WHERE id = ? AND status IN (${markable.map(() => '?').join(',')})`,
-    recipe.id,
-    recipe.version,
-    JSON.stringify(input.parameters),
-    recipeCheckKey(recipe, input.parameters),
+    `UPDATE gws_ea_browser_watches SET address = ?,region_json = ?,region_baseline = ?,region_marked_at = ?,region_missing_since = NULL,next_check_at = ?,updated_at = ? WHERE id = ? AND status IN (${markable.map(() => '?').join(',')})`,
+    mark.address,
     JSON.stringify(mark.region),
     mark.text,
     at,
@@ -729,7 +716,7 @@ export const watchBookAction: BrowserQueuedAction = {
     try {
       const result = await executeRecipe(context, {
         recipe_id: watch.booking_recipe_id,
-        parameters: JSON.parse(watch.parameters_json) as Record<string, string>,
+        parameters: JSON.parse(watch.booking_parameters_json) as Record<string, string>,
       });
       if (result.status !== 'reached_commit_point') {
         await context.store.db.run(

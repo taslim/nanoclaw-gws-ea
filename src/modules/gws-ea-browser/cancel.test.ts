@@ -162,7 +162,7 @@ it('derives awaiting and watching state and cancels watches before a later tick 
   const job = (await readBrowserJob(session.thread_id!))!.job;
   const at = new Date().toISOString();
   await getDb().run(
-    `INSERT INTO gws_ea_browser_watches(id,job_id,site,check_recipe_id,check_recipe_version,parameters_json,check_key,bounds_json,status,created_at,updated_at,next_check_at) VALUES('watch',?,'resy.com','recipe',1,'{}','key','{}','awaiting_principal',?,?,?)`,
+    `INSERT INTO gws_ea_browser_watches(id,job_id,site,address,bounds_json,status,created_at,updated_at,next_check_at) VALUES('watch',?,'resy.com','https://resy.com/venue','{}','awaiting_principal',?,?,?)`,
     job.id,
     at,
     at,
@@ -330,7 +330,7 @@ describe('an explicitly granted second agent group', () => {
     await readBrowserJob(mainThread);
     const at = new Date().toISOString();
     await getDb().run(
-      `INSERT INTO gws_ea_browser_watches(id,job_id,site,check_recipe_id,check_recipe_version,parameters_json,check_key,bounds_json,status,created_at,updated_at,next_check_at) VALUES('offline-watch',?,'resy.com','recipe',1,'{}','key','{}','awaiting_principal',?,?,?)`,
+      `INSERT INTO gws_ea_browser_watches(id,job_id,site,address,bounds_json,status,created_at,updated_at,next_check_at) VALUES('offline-watch',?,'resy.com','https://resy.com/venue','{}','awaiting_principal',?,?,?)`,
       job.id,
       at,
       at,

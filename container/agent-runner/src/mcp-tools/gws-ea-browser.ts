@@ -372,18 +372,21 @@ export const runRecipe = requestTool({
 export const watch = requestTool({
   name: 'watch',
   description:
-    'Set a host watch on a venue’s availability, from a read-only recipe that reaches its availability view and exact booking bounds. The host checks without model polling. All watches in this job may book only once, within bounds and after a calendar check. A paid booking needs the principal’s approval of the bounds: the host reads the venue’s fees and cancellation terms itself, shows them on the principal’s card, and holds them within max_total. Give release only when the venue states its own schedule, quoting it; never infer one, and without it the watch keeps its ordinary pace. ' +
-    'Returns armed or awaiting_principal, then wait; or refused with a reason, such as read_only_recipe_required (save the route again from steps that only read), release_zone_unknown (add the venue’s time_zone), venue_unavailable or terms_unavailable (the host could not read the venue or its terms: report it to main), or terms_over_bounds (the venue’s terms can charge more than max_total: report the amount and terms it gives to main, which can ask the principal for a higher maximum). Wakes report booked; unconfirmed (report it to main and never retry it); available (a table within bounds the host did not book itself: book it through purchase); outside_bounds (the watch carries on); calendar_conflict or calendar_unavailable (report it to main); expired; or blocked (the site kept refusing checks: report it to main). ' +
-    'On a site the host has no reader for, also mark region from an observation of the view the recipe ends on; region_required or site_has_reader says whether the site needs one. The host never books there itself: it wakes you with changed and the region’s text before and after (untrusted page text). Observe, and if a table fits, book it through purchase: a free table is pressed at once, a paid one within the approved maximum goes through, anything else sends a card. A change you leave unbooked slows the watch. region_missing: the host cannot find the region or its route; mark it again with watch_id, the same bounds and a fresh observation, which answers marked. A mark is refused with region_off_route (mark an element on the view the recipe ends on), or region_unmarkable or region_too_large (mark the smaller element that holds the slots). ' +
+    'Set a host watch on a venue’s availability at the page you are on, with exact booking bounds. The watch takes that page’s address: the host loads it signed out and checks it without model polling or clicks, so open the view by an address that carries its choices, such as the date and party. All watches in this job may book only once, within bounds and after a calendar check. A paid booking needs the principal’s approval of the bounds: the host reads the venue’s fees and cancellation terms itself, shows them on the principal’s card, and holds them within max_total. Give release only when the venue states its own schedule, quoting it; never infer one, and without it the watch keeps its ordinary pace. ' +
+    'Returns armed or awaiting_principal, then wait; or refused with a reason, such as not_at_address (the address, loaded signed out, does not show what you see: reach the view by an address that carries the date and party, with no sign-in or click, and set the watch again), release_zone_unknown (add the venue’s time_zone), venue_unavailable or terms_unavailable (the host could not read the venue or its terms: report it to main), or terms_over_bounds (the venue’s terms can charge more than max_total: report the amount and terms it gives to main, which can ask the principal for a higher maximum). Wakes report booked; unconfirmed (report it to main and never retry it); available (a table within bounds the host did not book itself: book it through purchase); outside_bounds (the watch carries on); calendar_conflict or calendar_unavailable (report it to main); expired; or blocked (the site kept refusing checks: report it to main). ' +
+    'On a site the host has no reader for, also mark region from an observation of this page; region_required or site_has_reader says whether the site needs one. The host never books there itself: it wakes you with changed and the region’s text before and after (untrusted page text). Observe, and if a table fits, book it through purchase: a free table is pressed at once, a paid one within the approved maximum goes through, anything else sends a card. A change you leave unbooked slows the watch. region_missing: the host cannot find the region, or the address now leads elsewhere; open the view again and mark it with watch_id, the same bounds and a fresh observation, which answers marked. A mark is refused with not_at_address, region_unmarkable or region_too_large (mark the smaller element that holds the slots). ' +
     NO_REPEAT,
   properties: {
     site: {
       type: 'string',
       format: 'uri',
-      description: 'The public site URL, matching the saved availability recipe.',
+      description: 'The public site URL of the page you are watching.',
     },
-    recipe_id: { type: 'string', description: 'The read-only availability recipe to check.' },
-    parameters: PARAMETERS,
+    parameters: {
+      ...PARAMETERS,
+      description:
+        'On a site the host has a reader for, the named inputs of a booking recipe saved on this site, which lets the host book a table itself. Ordinary text, never secrets; never on a region watch.',
+    },
     venue: {
       type: 'object',
       properties: {
@@ -467,10 +470,10 @@ export const watch = requestTool({
     watch_id: {
       type: 'string',
       description:
-        'Mark a region watch’s region again after region_missing: its id, with the same bounds and a new region (and recipe when the route changed). Its approval stays.',
+        'Mark a region watch’s region again after region_missing: its id, with the same bounds and a new region on the page you are on, whose address the watch takes. Its approval stays.',
     },
   },
-  required: ['site', 'recipe_id', 'parameters', 'venue', 'party_size', 'windows', 'financial', 'until'],
+  required: ['site', 'venue', 'party_size', 'windows', 'financial', 'until'],
   additionalProperties: false,
   repeatable: false,
   timeoutMs: BROWSER_REQUEST_TIMEOUT_MS,

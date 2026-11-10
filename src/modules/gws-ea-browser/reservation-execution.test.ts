@@ -118,7 +118,7 @@ describe.skipIf(!chromePath)('native reservation through the common purchase exe
       until: '2026-10-17T14:00:00.000Z',
     };
     await getDb().run(
-      `INSERT INTO gws_ea_browser_watches(id,job_id,site,check_recipe_id,check_recipe_version,parameters_json,check_key,bounds_json,status,created_at,updated_at,next_check_at) VALUES('watch',?,'resy.com','check',1,'{}','check',?,'armed',?,?,?)`,
+      `INSERT INTO gws_ea_browser_watches(id,job_id,site,address,bounds_json,status,created_at,updated_at,next_check_at) VALUES('watch',?,'resy.com','https://resy.com/venue',?,'armed',?,?,?)`,
       jobId,
       JSON.stringify(bounds),
       new Date().toISOString(),

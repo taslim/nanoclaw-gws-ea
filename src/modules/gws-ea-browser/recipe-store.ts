@@ -1,6 +1,5 @@
 import { browserSite } from './leases.js';
 import { type BrowserRecipeStep } from './recording.js';
-import { createHash } from 'node:crypto';
 import { getDb } from '../../db/connection.js';
 import type { DbDriver } from '../../db/driver.js';
 
@@ -52,23 +51,6 @@ export async function loadRecipe(id: string, db: DbDriver = getDb()): Promise<Br
     readOnly: row.read_only === 1,
   };
 }
-export function recipeCheckKey(
-  recipe: Pick<BrowserRecipe, 'id' | 'version'>,
-  parameters: Record<string, string>,
-): string {
-  return createHash('sha256')
-    .update(
-      JSON.stringify([
-        recipe.id,
-        recipe.version,
-        Object.keys(parameters)
-          .sort()
-          .map((name) => [name, parameters[name]]),
-      ]),
-    )
-    .digest('hex');
-}
-
 export async function readRecipeSiteInfo(origin: string): Promise<Record<string, unknown>> {
   const rows = await getDb().all<RecipeRow>(
     `SELECT r.* FROM gws_ea_browser_recipes r WHERE r.site = ? AND r.version = (SELECT MAX(latest.version) FROM gws_ea_browser_recipes latest WHERE latest.site = r.site AND latest.name = r.name) ORDER BY r.name`,

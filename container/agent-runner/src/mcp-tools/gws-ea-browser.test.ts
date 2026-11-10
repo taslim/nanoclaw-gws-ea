@@ -98,7 +98,6 @@ const cases: ReadonlyArray<readonly [McpToolDefinition, Record<string, unknown>]
     watch,
     {
       site: 'https://restaurant.example/',
-      recipe_id: 'recipe-1',
       parameters: { party: '4' },
       venue: { id: 'bistro-123', name: 'Bistro' },
       party_size: 4,
@@ -391,6 +390,16 @@ describe('the browser tools', () => {
       false,
     );
     expect(watch.tool.description).toContain('terms_over_bounds');
+  });
+
+  it('sets a watch at the page the agent is on, never from a recipe its checks replay', () => {
+    const accepts = new Ajv({ formats: { uri: true, 'date-time': true } }).compile(watch.tool.inputSchema);
+    const [, fields] = cases.find(([tool]) => tool === watch)!;
+    const { parameters: _parameters, ...regionWatch } = fields;
+    expect(accepts({ ...regionWatch, region: { ref: 'e4', generation: 2 } })).toBe(true);
+    expect(accepts({ ...fields, recipe_id: 'recipe-1' })).toBe(false);
+    expect(watch.tool.description).toContain('not_at_address');
+    expect(watch.tool.description).not.toMatch(/read-only recipe|recipe ends on/u);
   });
 
   it('refuses a credential_form step the host would refuse, before sending anything', async () => {

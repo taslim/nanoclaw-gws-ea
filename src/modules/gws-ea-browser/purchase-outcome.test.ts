@@ -678,12 +678,12 @@ describe('a watch booking', () => {
     const at = new Date().toISOString();
     await getDb().run(
       `INSERT INTO gws_ea_browser_watches
-       (id,job_id,site,check_recipe_id,check_recipe_version,parameters_json,check_key,bounds_json,status,created_at,updated_at,next_check_at)
-       VALUES(?,?,?,'recipe',1,'{}',?,'{}','booking',?,?,?)`,
+       (id,job_id,site,address,bounds_json,status,created_at,updated_at,next_check_at)
+       VALUES(?,?,?,?,'{}','booking',?,?,?)`,
       id,
       job.id,
       SITE,
-      id,
+      `https://${SITE}/${id}`,
       at,
       at,
       at,
@@ -729,12 +729,12 @@ describe('a region watch', () => {
   async function regionWatch(job: BrowserJob, id: string, site: string): Promise<void> {
     const at = new Date().toISOString();
     await getDb().run(
-      `INSERT INTO gws_ea_browser_watches(id,job_id,site,check_recipe_id,check_recipe_version,parameters_json,check_key,bounds_json,region_json,region_baseline,region_marked_at,status,created_at,updated_at,next_check_at)
-       VALUES(?,?,?,'recipe',1,'{}',?,'{}','{}','No tables',?,'armed',?,?,?)`,
+      `INSERT INTO gws_ea_browser_watches(id,job_id,site,address,bounds_json,region_json,region_baseline,region_marked_at,status,created_at,updated_at,next_check_at)
+       VALUES(?,?,?,?,'{}','{}','No tables',?,'armed',?,?,?)`,
       id,
       job.id,
       site,
-      id,
+      `https://${site}/${id}`,
       at,
       at,
       at,

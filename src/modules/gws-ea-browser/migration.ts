@@ -488,3 +488,53 @@ export const browserConsentOutcomesMigration: PortableMigration & { name: Module
     );
   },
 };
+
+/**
+ * Watches check by the page address they were armed on, so neither a watch nor its checks name a recipe. Earlier
+ * watches are not carried: their checks replayed recipes this release no longer runs. A reader watch's booking recipe
+ * stays, keyed by site, with the inputs it takes. Authorities that named an earlier watch keep their own record.
+ */
+export const browserWatchAddressMigration: PortableMigration & { name: ModuleMigrationName } = {
+  version: 1,
+  name: 'module:gws-ea-browser:watch-address',
+  async up(db) {
+    await db.exec(`
+      UPDATE gws_ea_browser_authorities SET watch_id = NULL WHERE watch_id IS NOT NULL;
+      DELETE FROM gws_ea_browser_watch_notices;
+      DELETE FROM gws_ea_browser_watch_slot_claims;
+      DROP TABLE gws_ea_browser_watch_check_members;
+      DROP TABLE gws_ea_browser_watch_checks;
+      DROP TABLE gws_ea_browser_watch_recipe_links;
+      DROP TABLE gws_ea_browser_watches;
+      CREATE TABLE gws_ea_browser_watches (
+        id TEXT PRIMARY KEY, job_id TEXT NOT NULL REFERENCES gws_ea_browser_jobs(id), site TEXT NOT NULL,
+        address TEXT NOT NULL, bounds_json TEXT NOT NULL,
+        approval_id TEXT UNIQUE, approval_json TEXT, approval_finished_at TEXT, authority_id TEXT,
+        status TEXT NOT NULL CHECK(status IN ('awaiting_principal','armed','checking','preparing','booking','booked','expired','cancelled','blocked','outcome_unknown')),
+        pending_request_id TEXT, booking_recipe_id TEXT, booking_recipe_version INTEGER,
+        booking_parameters_json TEXT NOT NULL DEFAULT '{}',
+        release_json TEXT, region_json TEXT, region_baseline TEXT, region_marked_at TEXT, region_missing_since TEXT,
+        created_at TEXT NOT NULL, updated_at TEXT NOT NULL, next_check_at TEXT NOT NULL
+      );
+      CREATE INDEX gws_ea_browser_watch_due ON gws_ea_browser_watches(status,next_check_at);
+      CREATE INDEX gws_ea_browser_watch_job ON gws_ea_browser_watches(job_id,status);
+      CREATE TABLE gws_ea_browser_watch_checks (
+        id TEXT PRIMARY KEY, site TEXT NOT NULL,
+        trigger TEXT NOT NULL CHECK(trigger IN ('timer','notify')),
+        scheduled_at TEXT NOT NULL, started_at TEXT NOT NULL, finished_at TEXT,
+        outcome TEXT, next_check_at TEXT, backoff_until TEXT
+      );
+      CREATE INDEX gws_ea_browser_watch_check_budget ON gws_ea_browser_watch_checks(site,started_at);
+      CREATE TABLE gws_ea_browser_watch_check_members (
+        check_id TEXT NOT NULL REFERENCES gws_ea_browser_watch_checks(id),
+        watch_id TEXT NOT NULL REFERENCES gws_ea_browser_watches(id),
+        PRIMARY KEY(check_id,watch_id)
+      );
+      CREATE TABLE gws_ea_browser_watch_recipe_links (
+        site TEXT NOT NULL, booking_recipe_id TEXT NOT NULL, booking_recipe_version INTEGER NOT NULL,
+        source_watch_id TEXT NOT NULL, source_attempt_id TEXT NOT NULL, verified_at TEXT NOT NULL,
+        PRIMARY KEY(site,booking_recipe_id,booking_recipe_version)
+      );
+    `);
+  },
+};

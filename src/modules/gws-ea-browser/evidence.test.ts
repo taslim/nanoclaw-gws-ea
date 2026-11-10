@@ -321,7 +321,7 @@ it('attributes shared watch checks only to persisted consumer watches for this j
     ['foreign-watch', foreignJob.id],
   ] as const) {
     await getDb().run(
-      "INSERT INTO gws_ea_browser_watches(id,job_id,site,check_recipe_id,check_recipe_version,parameters_json,check_key,bounds_json,status,created_at,updated_at,next_check_at) VALUES(?,?,'resy.com','recipe',1,'{}','same','{}','armed',?,?,?)",
+      "INSERT INTO gws_ea_browser_watches(id,job_id,site,address,bounds_json,status,created_at,updated_at,next_check_at) VALUES(?,?,'resy.com','https://resy.com/venue','{}','armed',?,?,?)",
       watch,
       job,
       at(1),
@@ -334,7 +334,7 @@ it('attributes shared watch checks only to persisted consumer watches for this j
     ['foreign-only', ['foreign-watch']],
   ] as const) {
     await getDb().run(
-      "INSERT INTO gws_ea_browser_watch_checks(id,site,check_recipe_id,check_recipe_version,parameter_hash,trigger,scheduled_at,started_at,finished_at,outcome,next_check_at) VALUES(?,'resy.com','recipe',1,'same','timer',?,?,?,'ready',?)",
+      "INSERT INTO gws_ea_browser_watch_checks(id,site,trigger,scheduled_at,started_at,finished_at,outcome,next_check_at) VALUES(?,'resy.com','timer',?,?,?,'ready',?)",
       id,
       at(1),
       at(2),
