@@ -4,7 +4,8 @@
  * principal approves or rejects it on a card showing the site and the exact wording. An approval stands for that
  * wording on that site and frame origin until the wording changes, which stops again, or the principal withdraws
  * it through an agent with browser access. A rejection leaves the box unticked, and the job is told; a credential
- * form held for that stop is left unknown, never filled again.
+ * form held for that stop is left unknown, never filled again. Asking again for a stop already asked answers with
+ * the card it waits on or the decline it got, never a second card.
  */
 import { noVerifiedPrincipalMessage } from '../gws-ea-profile/approval-wording.js';
 import { getDomain } from 'tldts';
@@ -107,9 +108,22 @@ export function validateConsentRequest(content: Record<string, unknown>): Record
   return { stop_id: content.stop_id };
 }
 
+/** A stop asked before: still on the principal's card, declined, or settled some other way and done. */
+function askedAgain(stop: ConsentStop): Record<string, unknown> {
+  switch (stop.status) {
+    case 'requested':
+      return { status: 'awaiting_principal', stop_id: stop.id };
+    case 'rejected':
+      return { status: 'rejected', stop_id: stop.id };
+    default:
+      return { status: 'refused', reason: 'stop_used' };
+  }
+}
+
 /**
- * Posts the principal's card for one stop of this job. An unknown stop, another job's or one already used is
- * refused; a wording the principal already agreed to on the site is approved without a card.
+ * Posts the principal's card for one stop of this job. An unknown stop or another job's is refused; a stop already
+ * asked answers with its card or the principal's decline; a wording the principal already agreed to on the site is
+ * approved without a card.
  */
 export async function executeConsentRequest(
   context: BrowserExecutionContext,
@@ -118,7 +132,7 @@ export async function executeConsentRequest(
   const { db } = context.store;
   const stop = typeof payload.stop_id === 'string' ? await getConsentStop(db, payload.stop_id) : undefined;
   if (!stop || stop.job_id !== context.job.id) return { status: 'refused', reason: 'unknown_stop' };
-  if (stop.status !== 'open') return { status: 'refused', reason: 'stop_used' };
+  if (stop.status !== 'open') return askedAgain(stop);
   if ((await liveConsentGrants(db, stop.site, stop.origin)).has(stop.wording)) {
     await db.run(
       "UPDATE gws_ea_browser_consent_stops SET status = 'approved',decided_at = ?,outcome_notified_at = ? WHERE id = ? AND status = 'open'",
@@ -134,7 +148,8 @@ export async function executeConsentRequest(
     payload: approval,
   });
   if (decision.effect !== 'hold') throw forbidden(decision.reason);
-  if (creatingConsentCards.has(stop.id)) return { status: 'refused', reason: 'stop_used' };
+  // The card another request is posting for this stop answers this one too: its note reaches the job either way.
+  if (creatingConsentCards.has(stop.id)) return { status: 'awaiting_principal', stop_id: stop.id };
   creatingConsentCards.add(stop.id);
   try {
     const claimed = await db.run(
@@ -142,7 +157,10 @@ export async function executeConsentRequest(
       new Date().toISOString(),
       stop.id,
     );
-    if (!claimed.changes) return { status: 'refused', reason: 'stop_used' };
+    if (!claimed.changes) {
+      const current = await getConsentStop(db, stop.id);
+      return current ? askedAgain(current) : { status: 'refused', reason: 'unknown_stop' };
+    }
     const approvalId = await requestApproval({
       session: context.session,
       agentName: 'browser',

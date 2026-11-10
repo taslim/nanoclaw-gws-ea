@@ -38,7 +38,7 @@ import { upsertUser } from '../permissions/db/users.js';
 import { upsertUserDm } from '../permissions/db/user-dms.js';
 import '../gws-ea-profile/index.js';
 import './index.js';
-import { recordConsentStops, runConsentPass } from './consent.js';
+import { liveConsentGrants, recordConsentStops, runConsentPass } from './consent.js';
 import { BrowserStore, browserRequestId, type BrowserJob } from './db.js';
 import { setBrowserAdmissionReady } from './group.js';
 import { CONSENT, openWebFixture, type OpenWebFixture } from './open-web-native-fixture.js';
@@ -144,13 +144,14 @@ async function stop(
   jobId = job.id,
   site = 'join.example',
   origin = 'https://join.example',
+  fingerprint = 'join-form',
 ): Promise<string> {
   const [view] = await recordConsentStops(
     { jobId, db: getDb() },
     {
       site,
       origin,
-      fingerprint: 'join-form',
+      fingerprint,
       items: [{ id: 0, wording, kind: 'marketing' }],
     },
   );
@@ -487,7 +488,7 @@ describe('asking the principal for consent', () => {
     expect(await stopStatus(id)).toBe('requested');
   });
 
-  it('refuses an unknown stop, another job’s stop and a stop already used, with no card', async () => {
+  it('refuses an unknown stop, another job’s stop and a lapsed stop, with no card', async () => {
     const id = await stop();
     expect(await ask('0b5c3a52-8f4e-4c1d-9a7b-2e6f1d3c4b5a', 'unknown')).toEqual(
       expect.objectContaining({ status: 'refused', reason: 'unknown_stop' }),
@@ -499,9 +500,61 @@ describe('asking the principal for consent', () => {
       expect.objectContaining({ status: 'refused', reason: 'unknown_stop' }),
     );
     expect(await ask(id, 'first')).toMatchObject({ status: 'awaiting_principal' });
+    expect(await approvals()).toHaveLength(1);
+    await getDb().run("UPDATE pending_approvals SET expires_at = '2026-01-01T00:00:00.000Z'");
+    await sweepExpiredApprovals();
     expect(await ask(id, 'again')).toEqual(expect.objectContaining({ status: 'refused', reason: 'stop_used' }));
+    expect(await approvals()).toEqual([]);
+  });
+
+  it('answers a retried pass over wording already on the principal’s card with that card, never a second', async () => {
+    const first = await stop();
+    expect(await ask(first, 'consent-1')).toMatchObject({ status: 'awaiting_principal', stop_id: first });
+    // The retry may read the form with a field more or less; the wording, site and frame origin are the same.
+    for (const [requestId, fingerprint] of [
+      ['consent-2', 'join-form'],
+      ['consent-3', 'join-form-with-promo'],
+    ]) {
+      const retried = await stop(WORDING, job.id, 'join.example', 'https://join.example', fingerprint);
+      expect(retried).toBe(first);
+      expect(await ask(retried, requestId)).toMatchObject({ status: 'awaiting_principal', stop_id: first });
+    }
     expect(await approvals()).toHaveLength(1);
     expect(sent).toHaveLength(1);
+    // Other wording on the same form is its own decision.
+    const offers = await stop('Share my details with travel partners');
+    expect(offers).not.toBe(first);
+    expect(await ask(offers, 'consent-4')).toMatchObject({ status: 'awaiting_principal', stop_id: offers });
+    expect(await approvals()).toHaveLength(2);
+    expect(sent).toHaveLength(2);
+    // One approval covers every pass that named the card, and the job hears it once.
+    const card = (await approvals()).find(
+      (approval) => (JSON.parse(approval.payload) as { stopId?: unknown }).stopId === first,
+    );
+    if (!card) throw new Error('Card missing');
+    await click(card);
+    expect(await stopStatus(first)).toBe('approved');
+    expect(await liveConsentGrants(getDb(), 'join.example', 'https://join.example')).toEqual(new Set([WORDING]));
+    expect(await notices()).toEqual([expect.objectContaining({ stop_id: first, status: 'approved' })]);
+  });
+
+  it('answers a retry after the principal declined with that decline, not a second card', async () => {
+    const first = await stop();
+    await ask(first, 'consent-1');
+    await click((await approvals())[0], 'reject');
+    const delivered = sent.length;
+    const retried = await stop(WORDING, job.id, 'join.example', 'https://join.example', 'join-form-with-promo');
+    expect(retried).toBe(first);
+    expect(await ask(retried, 'consent-2')).toMatchObject({ status: 'rejected', stop_id: first });
+    expect(await stopStatus(first)).toBe('rejected');
+    expect(await approvals()).toEqual([]);
+    expect(sent).toHaveLength(delivered);
+    expect(await notices()).toEqual([expect.objectContaining({ stop_id: first, status: 'rejected' })]);
+    // A later errand is a fresh question.
+    const other = (await resolveSystemSession('browser-p', 'system:a2a:main-p:later')).session;
+    const laterJob = await new BrowserStore().jobForSession(other);
+    if (!laterJob) throw new Error('Later job missing');
+    expect(await stop(WORDING, laterJob.id)).not.toBe(first);
   });
 
   it('approves a wording the principal already agreed to on that site and frame origin without a card, and asks again anywhere else', async () => {
