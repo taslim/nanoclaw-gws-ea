@@ -50,9 +50,9 @@ type Agent = 'main' | 'external-email' | 'external-chat' | 'job' | 'browser';
 /** A raise needs its reason here; each reason records the size its budget was set from. */
 const BUDGETS: Readonly<Record<Agent, { readonly tokens: number; readonly reason: string }>> = {
   main: {
-    tokens: 9_850,
+    tokens: 10_050,
     reason:
-      "9,837 tokens (39,345 characters): main's whole document with the original browser guidance, saved-login account intent and page access, and the distinction between host refusals and site-rejected credentials; rounded up. The front page is rendered for an empty install and grows only within its own budget.",
+      "10,032 tokens (40,127 characters): main's whole document with the original browser guidance, saved-login account intent and page access, the distinction between host refusals and site-rejected credentials, and follow-through on deadlines (promised work starts in the turn, unsent words are unsaid, due times, near-deadline pace) with settled-only outside updates and booking calendars for meeting chats; rounded up. The front page is rendered for an empty install and grows only within its own budget.",
   },
   'external-email': {
     tokens: 4_300,
