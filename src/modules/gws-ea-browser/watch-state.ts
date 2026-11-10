@@ -513,7 +513,7 @@ export async function recordRegionCheck(
  * `booking`, as its page states it, spends only a watch it does not fall outside: a table for another venue, party or
  * time books and leaves every watch going, while one whose page leaves a fact unstated may be the watched table and
  * spends it. Joins the commit's transaction and waits on nothing outside the database. A job with no such live region
- * watch on the site, or whose claim is already spent, is left as it is.
+ * watch on the site, or whose claim is already spent, is left as it is. Answers the watch it claimed, as it was.
  */
 export async function claimRegionWatchCommit(
   db: DbDriver,
@@ -525,8 +525,8 @@ export async function claimRegionWatchCommit(
     at: string;
     booking?: GenericBookingFacts;
   },
-): Promise<void> {
-  if (!(await db.hasTable('gws_ea_browser_watches'))) return;
+): Promise<RegionWatchClaim | undefined> {
+  if (!(await db.hasTable('gws_ea_browser_watches'))) return undefined;
   const live = await db.all<WatchRow>(
     "SELECT * FROM gws_ea_browser_watches WHERE job_id = ? AND site = ? AND region_json IS NOT NULL AND status IN ('armed','checking','preparing') ORDER BY created_at,id",
     input.jobId,
@@ -534,7 +534,7 @@ export async function claimRegionWatchCommit(
   );
   const { booking } = input;
   const watch = booking ? live.find((candidate) => !regionBookingOutside(boundsOf(candidate), booking)) : live[0];
-  if (!watch) return;
+  if (!watch) return undefined;
   const claimed = await db.run(
     "UPDATE gws_ea_browser_watch_job_claims SET state = 'committing',watch_id = ?,attempt_id = ?,request_id = ?,commit_started_at = ? WHERE job_id = ? AND state = 'available'",
     watch.id,
@@ -543,11 +543,39 @@ export async function claimRegionWatchCommit(
     input.at,
     input.jobId,
   );
-  if (claimed.changes)
+  if (!claimed.changes) return undefined;
+  await db.run(
+    "UPDATE gws_ea_browser_watches SET status = 'booking',pending_request_id = NULL,updated_at = ? WHERE id = ?",
+    input.at,
+    watch.id,
+  );
+  return {
+    attemptId: input.attemptId,
+    watch: { id: watch.id, status: watch.status, pending_request_id: watch.pending_request_id },
+  };
+}
+/** A commit's claim of a region watch, with the watch as it was before. */
+export interface RegionWatchClaim {
+  readonly attemptId: string;
+  readonly watch: Pick<WatchRow, 'id' | 'status' | 'pending_request_id'>;
+}
+/**
+ * Gives back a claim whose commit proved it never reached the site: the job's one booking is available again and the
+ * watch goes on as it was. Joins the caller's transaction; a claim no longer committing is left.
+ */
+export async function releaseRegionWatchCommit(db: DbDriver, jobId: string, claim: RegionWatchClaim): Promise<void> {
+  const released = await db.run(
+    "UPDATE gws_ea_browser_watch_job_claims SET state = 'available',watch_id = NULL,attempt_id = NULL,request_id = NULL,commit_started_at = NULL WHERE job_id = ? AND attempt_id = ? AND state = 'committing'",
+    jobId,
+    claim.attemptId,
+  );
+  if (released.changes)
     await db.run(
-      "UPDATE gws_ea_browser_watches SET status = 'booking',pending_request_id = NULL,updated_at = ? WHERE id = ?",
-      input.at,
-      watch.id,
+      "UPDATE gws_ea_browser_watches SET status = ?,pending_request_id = ?,updated_at = ? WHERE id = ? AND status = 'booking'",
+      claim.watch.status,
+      claim.watch.pending_request_id,
+      new Date().toISOString(),
+      claim.watch.id,
     );
 }
 /**

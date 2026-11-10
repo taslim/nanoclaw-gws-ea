@@ -751,12 +751,11 @@ describe('a region watch', () => {
       ),
     ]);
 
-  it('ends the watch a free press claimed at once, leaving no attempt for main to record or wait on', async () => {
-    const { job } = await errand('main-p', 'larder');
-    await regionWatch(job, 'larder', 'larder.example');
+  /** A free press of a table at The Larder, from errand `job`'s request `request`. */
+  function larderPress(job: BrowserJob, request: string) {
     const context = {
       kind: 'request',
-      request: { id: 'press-request' },
+      request: { id: request },
       job,
       store: new BrowserStore(),
     } as unknown as BrowserExecutionContext;
@@ -766,7 +765,20 @@ describe('a region watch', () => {
       facts: { site: 'larder.example', control: { label: 'Reserve' } } as unknown as FreeCheckout['facts'],
       books: true,
     };
-    expect(await freePressScope(context).pressStarting(checkout, new Date().toISOString())).toEqual([]);
+    return freePressScope(context).pressStarting(checkout, '2026-11-10T03:05:00.000Z');
+  }
+
+  it('ends the watch a free press claimed once it may have reached the site, leaving no attempt for main to record or wait on', async () => {
+    const { job } = await errand('main-p', 'larder');
+    await regionWatch(job, 'larder', 'larder.example');
+    const start = await larderPress(job, 'press-request');
+    // The press time reads on the principal's clock, never as a stored timestamp.
+    expect(start).toMatchObject({ unresolved: [], pressedAt: 'Nov 9, 2026, 7:05 PM Los Angeles time' });
+    expect(await watchState(job, 'larder')).toEqual([
+      { status: 'booking' },
+      { state: 'committing', finished_at: null },
+    ]);
+    await start.reached();
     expect(await watchState(job, 'larder')).toEqual([
       { status: 'outcome_unknown' },
       { state: 'unknown', finished_at: expect.any(String) },
@@ -774,6 +786,24 @@ describe('a region watch', () => {
     expect(await new PurchaseAuthorityStore().unconfirmedOf(job.id)).toEqual([]);
     expect(await getDb().all('SELECT site FROM gws_ea_browser_purchase_blocks')).toEqual([]);
     expect(await getDb().hasTable('gws_ea_browser_free_attempts')).toBe(false);
+  });
+
+  it('gives the watch its booking back when the press never reached the page, so a later press can still spend it', async () => {
+    const { job } = await errand('main-p', 'larder');
+    await regionWatch(job, 'larder', 'larder.example');
+    await (await larderPress(job, 'covered-press')).neverReached();
+    expect(await watchState(job, 'larder')).toEqual([{ status: 'armed' }, { state: 'available', finished_at: null }]);
+    expect(
+      await getDb().get(
+        'SELECT watch_id,attempt_id,request_id,commit_started_at FROM gws_ea_browser_watch_job_claims WHERE job_id = ?',
+        job.id,
+      ),
+    ).toEqual({ watch_id: null, attempt_id: null, request_id: null, commit_started_at: null });
+    await (await larderPress(job, 'clear-press')).reached();
+    expect(await watchState(job, 'larder')).toEqual([
+      { status: 'outcome_unknown' },
+      { state: 'unknown', finished_at: expect.any(String) },
+    ]);
   });
 });
 

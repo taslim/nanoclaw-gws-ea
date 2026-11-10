@@ -50,6 +50,7 @@ import {
   activateControl,
   classifyActivation,
   ensureBrowserNavigationGuard,
+  freePressInProgress,
   withBrowserJobNavigation,
   type ActivationIntent,
 } from './commit-classifier.js';
@@ -1418,6 +1419,35 @@ describe.skipIf(!chromePath)('ordinary actions in native Chrome', { timeout: 60_
       expect(posts()).toContain(`${url}/verified`);
     });
 
+    it('keeps a code-shaped password out of an unmarked password field, while a masked code box takes a letter code', async () => {
+      const page = await open();
+      const signup = serve(
+        'unmarked-signup',
+        '<label>Email <input name="email" type="email"></label><label>Password <input name="password" type="password"></label>',
+      );
+      await page.goto(signup);
+      const typed: BrowserAction = { kind: 'type', ...refIn(await observePage(page), 'Password'), text: 'Summer2026' };
+      expect(await batch(page, [typed])).toMatchObject({ status: 'stopped', reason: 'secret_field' });
+      const observation = await observePage(page);
+      const filled = await batch(page, [
+        {
+          kind: 'form_input',
+          fields: [{ ...refIn(observation, 'Password'), value: 'Summer2026' }],
+          submit: refIn(observation, 'Verify'),
+        },
+      ]);
+      expect(filled).toMatchObject({ status: 'stopped', reason: 'secret_field' });
+      expect(await page.locator('[name=password]').inputValue()).toBe('');
+      expect(posts()).not.toContain(`${signup}/verified`);
+
+      const box = serve('masked-letters', '<label>Code <input name="code" type="password" maxlength="6"></label>');
+      await page.goto(box);
+      const code = await batch(page, [{ kind: 'type', ...refIn(await observePage(page), 'Code'), text: 'A7KX29' }]);
+      expect(code).toMatchObject({ status: 'completed' });
+      expect(await click(page, 'Verify')).toMatchObject({ status: 'stopped', reason: 'navigated' });
+      expect(posts()).toContain(`${box}/verified`);
+    });
+
     it('refuses a password-shaped value in a masked field, and a model-chosen signup password never submits', async () => {
       const page = await open();
       const url = serve(
@@ -2377,7 +2407,7 @@ document.getElementById('updated').addEventListener('click', () => location.assi
     expect(await purchase('Reserve now')).toMatchObject({
       status: 'pressed',
       site: 'table.example',
-      pressed_at: expect.any(String),
+      pressed_at: expect.stringMatching(/ Los Angeles time$/u),
       repeat_safe: false,
     });
     expect(await approvals()).toEqual([]);
@@ -2739,7 +2769,7 @@ document.getElementById('updated').addEventListener('click', () => location.assi
       expect(pressed).toMatchObject({
         status: 'stopped',
         reason: 'pressed',
-        press: { site: 'tablehop.example', pressed_at: expect.any(String) },
+        press: { site: 'tablehop.example', pressed_at: expect.stringMatching(/ Los Angeles time$/u) },
         observation: { snapshot: expect.stringContaining('Verify your phone number') },
         repeat_safe: false,
       });
@@ -2780,6 +2810,112 @@ document.getElementById('updated').addEventListener('click', () => location.assi
         press: { site: 'tablehop.example', pressed_at },
       });
       expect(await presses()).toBe('1');
+    });
+
+    it('records no press and leaves a region watch unspent when a cover kept the free press from reaching the page', async () => {
+      await open(GUEST_BOOKING.details);
+      const at = new Date().toISOString();
+      // A watch for the very table the page offers, its venue as the generic reader takes it from the heading.
+      const bounds = {
+        kind: 'region',
+        site: 'tablehop.example',
+        venue: { id: 'tablehop', name: 'Complete your reservation' },
+        partySize: 2,
+        windows: [{ start: '2026-11-10T02:00:00.000Z', end: '2026-11-10T04:00:00.000Z' }],
+        financial: { freeOnly: true, currency: 'USD', maxTotalMinor: 0, maxDueNowMinor: 0 },
+        until: '2099-01-01T00:00:00.000Z',
+      };
+      await getDb().run(
+        `INSERT INTO gws_ea_browser_watches(id,job_id,site,address,bounds_json,region_json,region_baseline,region_marked_at,status,created_at,updated_at,next_check_at)
+         VALUES('hale-tables',?,'tablehop.example',?,?,'{}','No tables',?,'armed',?,?,?)`,
+        session.thread_id,
+        GUEST_BOOKING.details,
+        JSON.stringify(bounds),
+        at,
+        at,
+        at,
+        at,
+      );
+      await getDb().run(
+        "INSERT INTO gws_ea_browser_watch_job_claims(job_id,state) VALUES(?,'available')",
+        session.thread_id,
+      );
+      const watch = () =>
+        Promise.all([
+          getDb().get('SELECT status FROM gws_ea_browser_watches WHERE id = ?', 'hale-tables'),
+          getDb().get('SELECT state FROM gws_ea_browser_watch_job_claims WHERE job_id = ?', session.thread_id),
+        ]);
+      await page.evaluate(
+        `document.body.insertAdjacentHTML('beforeend', '<div id="cookie-cover" style="position:fixed;inset:0;z-index:9999;background:rgba(0,0,0,0.4)"></div>')`,
+      );
+      expect(await click('Complete reservation')).toMatchObject({ status: 'stopped', reason: 'not_actionable' });
+      expect(await presses()).toBe('0');
+      expect(await watch()).toEqual([{ status: 'armed' }, { state: 'available' }]);
+      await page.evaluate(`document.getElementById('cookie-cover').remove()`);
+      expect(await click('Complete reservation')).toMatchObject({ status: 'stopped', reason: 'pressed' });
+      expect(await presses()).toBe('1');
+      // The press that reached the page spends the job's one booking and ends the watch.
+      expect(await watch()).toEqual([{ status: 'outcome_unknown' }, { state: 'unknown' }]);
+    });
+
+    describe('the dialog a free press opened', () => {
+      /** The agent's verification inside the dialog: its code, then Verify, whose success books the table. */
+      async function verify(): Promise<Record<string, unknown>> {
+        const dialog = await observePage(page);
+        return run('verify', [
+          { kind: 'type', ...refIn(dialog, 'Verification code'), text: GUEST_BOOKING.code },
+          { kind: 'click', ...refIn(dialog, 'Verify') },
+        ]);
+      }
+      const inProgress = () => freePressInProgress(session.thread_id!);
+      /** The free press of Complete reservation, once its own window, which admits its routes, has closed. */
+      async function pressComplete(): Promise<void> {
+        await open(GUEST_BOOKING.details);
+        expect(await click('Complete reservation')).toMatchObject({ reason: 'pressed' });
+        await (await ensureBrowserNavigationGuard(page)).actionsSettled();
+      }
+
+      it('keeps admitting the checkout’s booking route across a same-document route change', async () => {
+        await pressComplete();
+        expect(inProgress()).toBe(true);
+        await page.evaluate(`history.pushState({}, '', '/booking/details/verify')`);
+        await verify();
+        expect(posts()).toEqual([GUEST_BOOKING.verify, GUEST_BOOKING.book]);
+        // The booking's confirmation is a new document, which ends the dialog.
+        await expect.poll(inProgress).toBe(false);
+      });
+
+      it('ends at a new main document, refusing the checkout’s booking route from there', async () => {
+        const hold = 'https://tablehop.example/booking/hold';
+        fixture.serve(
+          hold,
+          htmlPage(
+            'Hold your table',
+            '<button type="button" id="hold">Hold my table</button>',
+            `document.getElementById('hold').addEventListener('click', () =>
+  fetch('/api/confirmbooking', { method: 'POST', body: 'party=2' }).catch(() => undefined));`,
+          ),
+        );
+        await pressComplete();
+        await open(hold);
+        await expect.poll(inProgress).toBe(false);
+        expect(await click('Hold my table')).toMatchObject({ status: 'completed' });
+        expect(posts()).toEqual([]);
+      });
+
+      it('ends once its time has passed, refusing the booking route a verification inside it sends', async () => {
+        await pressComplete();
+        // Past the dialog's fifteen minutes, with the host's clock running on from there.
+        vi.useFakeTimers({ toFake: ['Date'], shouldAdvanceTime: true });
+        try {
+          vi.setSystemTime(Date.now() + 16 * 60_000);
+          expect(inProgress()).toBe(false);
+          expect(await verify()).toMatchObject({ status: 'completed' });
+        } finally {
+          vi.useRealTimers();
+        }
+        expect(posts()).toEqual([GUEST_BOOKING.verify]);
+      });
     });
 
     it('refuses a payment processor request from a press inside the dialog, while the site’s own requests go', async () => {

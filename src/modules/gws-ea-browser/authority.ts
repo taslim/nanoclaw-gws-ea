@@ -1,4 +1,12 @@
-import { getBrowserWatch, compareWatchBounds, claimRegionWatchCommit, finishWatchCommit } from './watch-state.js';
+import {
+  getBrowserWatch,
+  compareWatchBounds,
+  claimRegionWatchCommit,
+  finishWatchCommit,
+  releaseRegionWatchCommit,
+} from './watch-state.js';
+import { formatLocalTimeWithZone } from '../../timezone.js';
+import { principalClock } from './watch-policy.js';
 import { getDb } from '../../db/connection.js';
 import type { DbDriver } from '../../db/driver.js';
 import { isUniqueViolation } from '../../db/errors.js';
@@ -639,30 +647,42 @@ export class PurchaseAuthorityStore {
 }
 
 /**
- * What a free checkout's press spends in `context`'s job: a booking on a region watch's site spends that watch's one
- * booking, as a paid one does, and ends the watch at once, since no attempt follows whose outcome would. Its answer
- * names the merchant's unresolved paid attempts, which a free press does not wait on.
+ * What a free checkout's press spends in `context`'s job: a booking on a region watch's site claims that watch's one
+ * booking before the press, as a paid one does, and once the press may have reached the site ends the watch at once,
+ * since no attempt follows whose outcome would. Its answer names the merchant's unresolved paid attempts, which a
+ * free press does not wait on, and its time on the principal's clock.
  */
 export function freePressScope(context: BrowserOperationContext): FreePressScope {
   const db = context.store.db;
+  const jobId = context.job.id;
   return {
-    jobId: context.job.id,
+    jobId,
     async pressStarting(checkout, at) {
+      const pressedAt = formatLocalTimeWithZone(at, await principalClock(Date.parse(at)));
+      const unresolved = (await db.hasTable('gws_ea_browser_purchase_attempts'))
+        ? await new PurchaseAuthorityStore(db).unresolved(checkout.site)
+        : [];
       const press = `free-press-${browserOperationId(context)}`;
-      if (checkout.books)
-        await db.transaction(async () => {
-          await claimRegionWatchCommit(db, {
-            jobId: context.job.id,
-            site: checkout.site,
-            attemptId: press,
-            requestId: browserOperationId(context),
-            at,
-            ...(checkout.booking ? { booking: checkout.booking } : {}),
-          });
-          await finishWatchCommit(db, context.job.id, press, undefined);
-        });
-      if (!(await db.hasTable('gws_ea_browser_purchase_attempts'))) return [];
-      return new PurchaseAuthorityStore(db).unresolved(checkout.site);
+      const claim = checkout.books
+        ? await db.transaction(() =>
+            claimRegionWatchCommit(db, {
+              jobId,
+              site: checkout.site,
+              attemptId: press,
+              requestId: browserOperationId(context),
+              at,
+              ...(checkout.booking ? { booking: checkout.booking } : {}),
+            }),
+          )
+        : undefined;
+      return {
+        unresolved,
+        pressedAt,
+        reached: () => db.transaction(() => finishWatchCommit(db, jobId, press, undefined)),
+        neverReached: async () => {
+          if (claim) await db.transaction(() => releaseRegionWatchCommit(db, jobId, claim));
+        },
+      };
     },
   };
 }

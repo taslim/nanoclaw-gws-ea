@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { captureBrowserDiagnosticRefusal } from './diagnostics.js';
-import type { CDPSession, ElementHandle, Frame, Page, Request } from 'playwright-core';
+import { errors, type CDPSession, type ElementHandle, type Frame, type Page, type Request } from 'playwright-core';
 import { getDomain } from 'tldts';
 import { genericCheckoutSignature } from './generic-signature.js';
 import { SiteLeaseStore } from './leases.js';
@@ -180,11 +180,20 @@ const DEFAULT_ACTION_BUDGET_MS = 10_000;
 /** The job a free checkout's press belongs to, and what the press spends. */
 export interface FreePressScope {
   readonly jobId: string;
-  /**
-   * Runs once every check has passed, immediately before the press: spends what a booking spends in the job, and
-   * answers the merchant's paid attempts whose outcome nobody has recorded, which the press does not wait on.
-   */
-  pressStarting(checkout: FreeCheckout, at: string): Promise<readonly string[]>;
+  /** Runs once every check has passed, immediately before the press: claims what a booking spends in the job. */
+  pressStarting(checkout: FreeCheckout, at: string): Promise<FreePressStart>;
+}
+
+/** A free press about to run, and how what it claimed settles. */
+export interface FreePressStart {
+  /** The merchant's paid attempts whose outcome nobody has recorded, which the press does not wait on. */
+  readonly unresolved: readonly string[];
+  /** When the press ran, as the agent reads it: on the principal's clock. */
+  readonly pressedAt: string;
+  /** The press may have reached the site: what it claimed is spent. */
+  reached(): Promise<void>;
+  /** The press proved it never reached the page: what it claimed goes back as it was. */
+  neverReached(): Promise<void>;
 }
 
 /** A free checkout's press: the merchant, when, and the merchant's paid attempts nobody has recorded an outcome for. */
@@ -201,6 +210,8 @@ interface FreePress {
   readonly site: string;
   readonly facts: string;
   readonly at: string;
+  /** `at` as the agent reads it. */
+  readonly pressedAt: string;
   readonly page: WeakRef<Page>;
 }
 const freePresses = new Map<string, FreePress>();
@@ -270,7 +281,7 @@ export async function pressFreeCheckout(
   // Only on the page it was pressed in: a page the job lost with its dialog leaves a checkout to rebuild and press.
   const earlier = freePresses.get(scope.jobId);
   if (earlier && earlier.page.deref() === page && earlier.site === checkout.site && earlier.facts === facts)
-    return { status: 'already_pressed', site: earlier.site, pressed_at: earlier.at };
+    return { status: 'already_pressed', site: earlier.site, pressed_at: earlier.pressedAt };
   const guard = await ensureBrowserNavigationGuard(page);
   await guard.actionsSettled();
   if (await pageFieldHoldsHostSecret(page)) throw new BrowserActivationError('secret_field');
@@ -289,24 +300,58 @@ export async function pressFreeCheckout(
     throw new BrowserActivationError('purchase_control');
   const document = await mainDocumentLoader(page).catch(() => undefined);
   const at = new Date().toISOString();
-  const unresolved = await scope.pressStarting(checkout, at);
-  freePresses.set(scope.jobId, { site: checkout.site, facts, at, page: new WeakRef(page) });
-  // An earlier dialog's admission never outlives a new press.
-  freeDialogs.delete(page);
-  await withApprovedPress(page, admission, () =>
-    guard.duringAction(intent.remaining?.() ?? DEFAULT_ACTION_BUDGET_MS, operation, {
-      purchaseAdmission: admission,
-    }),
-  );
+  const start = await scope.pressStarting(checkout, at);
+  freePresses.set(scope.jobId, { site: checkout.site, facts, at, pressedAt: start.pressedAt, page: new WeakRef(page) });
+  // Until the click runs, and again when it fails before dispatching, nothing reached the site.
+  let reached = false;
+  const press = async (): Promise<void> => {
+    reached = true;
+    try {
+      await operation();
+    } catch (error) {
+      if (neverDispatched(error)) reached = false;
+      throw error;
+    }
+  };
+  try {
+    await withApprovedPress(page, admission, () =>
+      guard.duringAction(intent.remaining?.() ?? DEFAULT_ACTION_BUDGET_MS, press, {
+        purchaseAdmission: admission,
+      }),
+    );
+  } finally {
+    // A press that may have landed is never repeated, and an earlier dialog's admission never outlives it; one that
+    // never ran leaves the job as it was.
+    if (reached) {
+      freeDialogs.delete(page);
+      await start.reached();
+    } else {
+      if (earlier) freePresses.set(scope.jobId, earlier);
+      else freePresses.delete(scope.jobId);
+      await start.neverReached();
+    }
+  }
   // A press that loaded a new document opened no dialog over the checkout: later steps are ordinary.
   if (document && !page.isClosed() && (await mainDocumentLoader(page).catch(() => undefined)) === document)
     openFreeDialog(page, { admission, document, until: Date.now() + FREE_DIALOG_MS });
   return {
     status: 'pressed',
     site: checkout.site,
-    pressed_at: at,
-    ...(unresolved.length ? { unresolved_attempts: [...unresolved] } : {}),
+    pressed_at: start.pressedAt,
+    ...(start.unresolved.length ? { unresolved_attempts: [...start.unresolved] } : {}),
   };
+}
+
+/**
+ * Whether a press's own failure proves its click never reached the page. Playwright's click waits for nothing after
+ * it dispatches, so its timeout means the actionability checks never passed: the control stayed covered, hidden or
+ * disabled. The executor answers that timeout as `not_actionable`.
+ */
+function neverDispatched(error: unknown): boolean {
+  return (
+    error instanceof errors.TimeoutError ||
+    (error instanceof Error && 'reason' in error && error.reason === 'not_actionable')
+  );
 }
 
 /**
