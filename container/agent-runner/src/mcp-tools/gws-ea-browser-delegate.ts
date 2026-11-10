@@ -1,5 +1,5 @@
 /**
- * A delegating group's host requests about its browser errands; no code enters the browser job's conversation.
+ * A delegating group's host requests about its browser errands.
  * src/modules/gws-ea-browser/guidance.ts decides which groups hold them.
  */
 import { requestTool } from '../action-request.js';
