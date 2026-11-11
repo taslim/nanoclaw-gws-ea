@@ -18,7 +18,6 @@
  * This test asserts the SECURE behaviour (nothing written outside). It FAILS
  * against the current code, demonstrating the gap.
  */
-import { createHash } from 'crypto';
 import fs from 'fs';
 import path from 'path';
 
@@ -30,6 +29,7 @@ vi.mock('./config.js', async () => {
   return { ...actual, DATA_DIR: '/tmp/nanoclaw-test-saveatt-gap' };
 });
 
+import { inboxFolderName } from './attachment-safety.js';
 import { initTestDb, closeDb, runMigrations, createAgentGroup } from './db/index.js';
 import { createSession } from './db/sessions.js';
 import { inboundDbPath } from './mailbox/sqlite/paths.js';
@@ -183,6 +183,7 @@ describe('extractAttachmentFiles — inbox-root symlink containment (#2828 sibli
 
 describe('extractAttachmentFiles — a platform message ID that is not a file name', () => {
   const GCHAT_ID = 'spaces/AAAA/messages/BBBB.BBBB';
+  const GCHAT_FOLDER = inboxFolderName(GCHAT_ID);
 
   function storedContent(id: string): Record<string, unknown> {
     const inbound = new Database(inboundDbPath(AG, SESS), { readonly: true });
@@ -191,7 +192,7 @@ describe('extractAttachmentFiles — a platform message ID that is not a file na
     return JSON.parse(row.content) as Record<string, unknown>;
   }
 
-  it('saves the attachment in a folder named for a hash of the ID, and points the message at it', async () => {
+  it('saves the attachment in the folder named for the ID, and points the message at it', async () => {
     const content = JSON.stringify({
       text: 'the agenda',
       attachments: [{ name: 'agenda.txt', data: Buffer.from('agenda bytes').toString('base64') }],
@@ -207,7 +208,7 @@ describe('extractAttachmentFiles — a platform message ID that is not a file na
       content,
     });
 
-    const folder = `msg-${createHash('sha256').update(GCHAT_ID).digest('hex').slice(0, 32)}`;
+    const folder = GCHAT_FOLDER!;
     const stored = storedContent(GCHAT_ID);
     expect(stored.attachments).toEqual([{ name: 'agenda.txt', localPath: `inbox/${folder}/agenda.txt` }]);
     expect(fs.readFileSync(path.join(sessionDir(AG, SESS), 'inbox', folder, 'agenda.txt'), 'utf8')).toBe(
@@ -234,7 +235,7 @@ describe('extractAttachmentFiles — a platform message ID that is not a file na
   });
 
   it('reuses only the same owned regular audio file when a delivery is retried', async () => {
-    const folder = `msg-${createHash('sha256').update(GCHAT_ID).digest('hex').slice(0, 32)}`;
+    const folder = GCHAT_FOLDER!;
     const inbox = path.join(sessionDir(AG, SESS), 'inbox', folder);
     fs.mkdirSync(inbox, { recursive: true });
     fs.writeFileSync(path.join(inbox, 'note.ogg'), 'original audio');
@@ -254,7 +255,7 @@ describe('extractAttachmentFiles — a platform message ID that is not a file na
   });
 
   it.each(['different bytes', 'symlink'] as const)('refuses to reuse an existing attachment with %s', async (kind) => {
-    const folder = `msg-${createHash('sha256').update(GCHAT_ID).digest('hex').slice(0, 32)}`;
+    const folder = GCHAT_FOLDER!;
     const inbox = path.join(sessionDir(AG, SESS), 'inbox', folder);
     fs.mkdirSync(inbox, { recursive: true });
     const target = path.join(inbox, 'note.ogg');

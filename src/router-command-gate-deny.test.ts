@@ -19,10 +19,13 @@ import {
   createAgentGroup,
   createMessagingGroup,
   createMessagingGroupAgent,
+  getDb,
 } from './db/index.js';
 import { initChannelAdapters, registerChannelAdapter, teardownChannelAdapters } from './channels/channel-registry.js';
 import { setDeliveryAdapter, type ChannelDeliveryAdapter } from './delivery.js';
 import { routeInbound } from './router.js';
+import { findSessionForAgent } from './db/sessions.js';
+import { sessionDir } from './session-manager.js';
 import type { ChannelAdapter, ChannelDefaults } from './channels/adapter.js';
 
 vi.mock('./container-runner.js', () => ({
@@ -31,6 +34,26 @@ vi.mock('./container-runner.js', () => ({
   getActiveContainerCount: vi.fn().mockReturnValue(0),
   killContainer: vi.fn(),
 }));
+
+// Lets a test hold the command gate (e.g. a slow admin lookup) and pick its answer.
+const gateHold = vi.hoisted(() => ({
+  until: null as Promise<void> | null,
+  pass: false,
+  reached: vi.fn(),
+}));
+vi.mock('./command-gate.js', async () => {
+  const actual = await vi.importActual<typeof import('./command-gate.js')>('./command-gate.js');
+  return {
+    ...actual,
+    gateCommand: async (...args: Parameters<typeof actual.gateCommand>) => {
+      if (gateHold.until) {
+        gateHold.reached();
+        await gateHold.until;
+      }
+      return gateHold.pass ? { action: 'pass' as const } : actual.gateCommand(...args);
+    },
+  };
+});
 
 vi.mock('./config.js', async () => {
   const actual = await vi.importActual('./config.js');
@@ -106,7 +129,7 @@ async function seed(): Promise<void> {
   });
 }
 
-function sendClear(): Promise<void> {
+function sendClear(isGroup = false): Promise<void> {
   return routeInbound({
     channelType: 'testchat',
     platformId: 'testchat:C1',
@@ -117,7 +140,7 @@ function sendClear(): Promise<void> {
       content: JSON.stringify({ sender: 'Alex', senderId: 'U1', text: '/clear' }),
       timestamp: new Date().toISOString(),
       isMention: true,
-      isGroup: false,
+      isGroup,
     },
   });
 }
@@ -171,9 +194,72 @@ describe('command-gate denial', () => {
         undefined,
       ],
     ]);
-    const counts = outboundRowCounts();
-    expect(counts.length).toBeGreaterThan(0);
-    expect(counts.every((count) => count === 0)).toBe(true);
+    // A denied command creates no session, so no outbound.db exists at all.
+    expect(outboundRowCounts()).toEqual([]);
+    const { wakeContainer } = await import('./container-runner.js');
+    expect(vi.mocked(wakeContainer)).not.toHaveBeenCalled();
+  });
+
+  it('a mentioned denied command does not make a mention-sticky thread active', async () => {
+    await seed();
+    await getDb().run("UPDATE messaging_groups SET is_group = 1 WHERE id = 'mg-1'");
+    await getDb().run("UPDATE messaging_group_agents SET engage_mode = 'mention-sticky' WHERE id = 'mga-1'");
+    let release: () => void = () => {};
+    const replyHeld = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const calls = recordingAdapter(async () => {
+      await replyHeld;
+      return 'platform-msg-1';
+    });
+
+    const clear = sendClear(true);
+    await vi.waitFor(() => expect(calls).toHaveLength(1));
+    // An unmentioned follow-up while the denial reply is still being sent.
+    // GWS-EA routes a conversation's events in order, so it is judged after.
+    const followup = routeInbound({
+      channelType: 'testchat',
+      platformId: 'testchat:C1',
+      threadId: null,
+      message: {
+        id: 'm2',
+        kind: 'chat-sdk',
+        content: JSON.stringify({ sender: 'Alex', senderId: 'U1', text: 'so what now' }),
+        timestamp: new Date().toISOString(),
+        isGroup: true,
+      },
+    });
+    release();
+    await Promise.all([clear, followup]);
+
+    const { wakeContainer } = await import('./container-runner.js');
+    expect(vi.mocked(wakeContainer)).not.toHaveBeenCalled();
+  });
+
+  it('a denied command not addressed to the agent gets no reply and creates no session', async () => {
+    await seed();
+    const calls = recordingAdapter(async () => 'platform-msg-1');
+    await getDb().run("UPDATE messaging_groups SET is_group = 1 WHERE id = 'mg-1'");
+    await getDb().run(
+      "UPDATE messaging_group_agents SET engage_mode = 'mention', ignored_message_policy = 'accumulate' WHERE id = 'mga-1'",
+    );
+
+    await routeInbound({
+      channelType: 'testchat',
+      platformId: 'testchat:C1',
+      threadId: null,
+      message: {
+        id: 'm1',
+        kind: 'chat-sdk',
+        content: JSON.stringify({ sender: 'Alex', senderId: 'U1', text: '/clear' }),
+        timestamp: new Date().toISOString(),
+        isMention: false,
+        isGroup: true,
+      },
+    });
+
+    expect(calls).toEqual([]);
+    expect(outboundRowCounts()).toEqual([]);
     const { wakeContainer } = await import('./container-runner.js');
     expect(vi.mocked(wakeContainer)).not.toHaveBeenCalled();
   });
@@ -186,5 +272,311 @@ describe('command-gate denial', () => {
 
     await expect(sendClear()).resolves.toBeUndefined();
     expect(calls).toHaveLength(1);
+  });
+
+  for (const allowed of [true, false]) {
+    it(`a follow-up routed while a first mentioned command is gated waits for the verdict (${allowed ? 'allowed' : 'denied'})`, async () => {
+      await seed();
+      recordingAdapter(async () => 'platform-msg-1');
+      await getDb().run("UPDATE messaging_groups SET is_group = 1 WHERE id = 'mg-1'");
+      await getDb().run(
+        "UPDATE messaging_group_agents SET engage_mode = 'mention-sticky', ignored_message_policy = 'drop' WHERE id = 'mga-1'",
+      );
+      const { wakeContainer } = await import('./container-runner.js');
+      vi.mocked(wakeContainer).mockClear();
+      let release: () => void = () => {};
+      gateHold.reached.mockClear();
+      gateHold.pass = allowed;
+      gateHold.until = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      try {
+        const clear = sendClear(true);
+        await vi.waitFor(() => expect(gateHold.reached).toHaveBeenCalledTimes(1));
+        gateHold.until = null;
+
+        const followup = routeInbound({
+          channelType: 'testchat',
+          platformId: 'testchat:C1',
+          threadId: null,
+          message: {
+            id: 'm2',
+            kind: 'chat-sdk',
+            content: JSON.stringify({ sender: 'Alex', senderId: 'U1', text: 'and keep the notes' }),
+            timestamp: new Date().toISOString(),
+            isGroup: true,
+          },
+        });
+        // Let the follow-up reach the sticky check while the gate is held.
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        expect(vi.mocked(wakeContainer)).not.toHaveBeenCalled();
+        release();
+        await Promise.all([clear, followup]);
+        // Allowed: the command and the follow-up wake. Denied (no admin): neither does.
+        expect(vi.mocked(wakeContainer)).toHaveBeenCalledTimes(allowed ? 2 : 0);
+      } finally {
+        gateHold.until = null;
+        gateHold.pass = false;
+        release();
+      }
+    });
+  }
+
+  it('a follow-up wakes once one gated command passes, without waiting for the others', async () => {
+    await seed();
+    recordingAdapter(async () => 'platform-msg-1');
+    await getDb().run("UPDATE messaging_groups SET is_group = 1 WHERE id = 'mg-1'");
+    await getDb().run(
+      "UPDATE messaging_group_agents SET engage_mode = 'mention-sticky', ignored_message_policy = 'drop' WHERE id = 'mga-1'",
+    );
+    const message = (id: string, text: string, isMention: boolean) =>
+      routeInbound({
+        channelType: 'testchat',
+        platformId: 'testchat:C1',
+        threadId: null,
+        message: {
+          id,
+          kind: 'chat-sdk',
+          content: JSON.stringify({ sender: 'Alex', senderId: 'U1', text }),
+          timestamp: new Date().toISOString(),
+          isMention,
+          isGroup: true,
+        },
+      });
+    const { wakeContainer } = await import('./container-runner.js');
+    vi.mocked(wakeContainer).mockClear();
+    const releases: (() => void)[] = [];
+    const hold = () => new Promise<void>((resolve) => releases.push(resolve));
+    gateHold.reached.mockClear();
+    gateHold.pass = true;
+    try {
+      // GWS-EA routes a conversation's events in order: the second command
+      // reaches its gate once the first is routed, and the follow-up after both.
+      gateHold.until = hold();
+      const first = message('m1', '/clear', true);
+      await vi.waitFor(() => expect(gateHold.reached).toHaveBeenCalledTimes(1));
+      gateHold.until = hold();
+      const second = message('m3', '/clear', true);
+      const followup = message('m2', 'and keep the notes', false);
+      releases[0]();
+      await first;
+      await vi.waitFor(() => expect(gateHold.reached).toHaveBeenCalledTimes(2));
+      gateHold.until = null;
+      // The second command is still gated, and the follow-up waits behind it.
+      await Promise.race([followup, new Promise((resolve) => setTimeout(resolve, 200))]);
+      expect(vi.mocked(wakeContainer)).toHaveBeenCalledTimes(1);
+      releases[1]();
+      await Promise.all([second, followup]);
+      expect(vi.mocked(wakeContainer)).toHaveBeenCalledTimes(3);
+    } finally {
+      gateHold.until = null;
+      gateHold.pass = false;
+      releases.forEach((release) => release());
+    }
+  });
+
+  it('a follow-up waiting on a gated command wakes when a later mention passes first', async () => {
+    await seed();
+    recordingAdapter(async () => 'platform-msg-1');
+    await getDb().run("UPDATE messaging_groups SET is_group = 1 WHERE id = 'mg-1'");
+    await getDb().run(
+      "UPDATE messaging_group_agents SET engage_mode = 'mention-sticky', ignored_message_policy = 'drop' WHERE id = 'mga-1'",
+    );
+    const message = (id: string, text: string, isMention: boolean) =>
+      routeInbound({
+        channelType: 'testchat',
+        platformId: 'testchat:C1',
+        threadId: null,
+        message: {
+          id,
+          kind: 'chat-sdk',
+          content: JSON.stringify({ sender: 'Alex', senderId: 'U1', text }),
+          timestamp: new Date().toISOString(),
+          isMention,
+          isGroup: true,
+        },
+      });
+    const { wakeContainer } = await import('./container-runner.js');
+    vi.mocked(wakeContainer).mockClear();
+    let release: () => void = () => {};
+    gateHold.reached.mockClear();
+    gateHold.until = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    try {
+      const clear = sendClear(true);
+      await vi.waitFor(() => expect(gateHold.reached).toHaveBeenCalledTimes(1));
+      gateHold.until = null;
+
+      // GWS-EA routes a conversation's events in order: a plain mention, then
+      // the follow-up, are judged after the gated command.
+      const mention = message('m3', 'hello', true);
+      const followup = message('m2', 'and keep the notes', false);
+      await Promise.race([followup, new Promise((resolve) => setTimeout(resolve, 200))]);
+      expect(vi.mocked(wakeContainer)).not.toHaveBeenCalled();
+      release();
+      await Promise.all([clear, mention, followup]);
+      // The held /clear is denied (no admin), so it adds no wake.
+      expect(vi.mocked(wakeContainer)).toHaveBeenCalledTimes(2);
+    } finally {
+      gateHold.until = null;
+      release();
+    }
+  });
+
+  it('a follow-up keeps waiting for a command gated after it began to wait', async () => {
+    await seed();
+    recordingAdapter(async () => 'platform-msg-1');
+    await getDb().run("UPDATE messaging_groups SET is_group = 1 WHERE id = 'mg-1'");
+    await getDb().run(
+      "UPDATE messaging_group_agents SET engage_mode = 'mention-sticky', ignored_message_policy = 'drop' WHERE id = 'mga-1'",
+    );
+    const message = (id: string, text: string, isMention: boolean) =>
+      routeInbound({
+        channelType: 'testchat',
+        platformId: 'testchat:C1',
+        threadId: null,
+        message: {
+          id,
+          kind: 'chat-sdk',
+          content: JSON.stringify({ sender: 'Alex', senderId: 'U1', text }),
+          timestamp: new Date().toISOString(),
+          isMention,
+          isGroup: true,
+        },
+      });
+    const { wakeContainer } = await import('./container-runner.js');
+    vi.mocked(wakeContainer).mockClear();
+    const releases: (() => void)[] = [];
+    const hold = () => new Promise<void>((resolve) => releases.push(resolve));
+    gateHold.reached.mockClear();
+    try {
+      // GWS-EA routes a conversation's events in order: a follow-up routed
+      // behind two gated commands waits for both verdicts.
+      gateHold.until = hold();
+      const denied = message('m1', '/clear', true);
+      await vi.waitFor(() => expect(gateHold.reached).toHaveBeenCalledTimes(1));
+      gateHold.until = hold();
+      const allowed = message('m3', '/clear', true);
+      const followup = message('m2', 'and keep the notes', false);
+      releases[0]();
+      await denied;
+      await vi.waitFor(() => expect(gateHold.reached).toHaveBeenCalledTimes(2));
+      gateHold.until = null;
+      await Promise.race([followup, new Promise((resolve) => setTimeout(resolve, 100))]);
+      expect(vi.mocked(wakeContainer)).not.toHaveBeenCalled();
+
+      gateHold.pass = true;
+      releases[1]();
+      await Promise.all([allowed, followup]);
+      expect(vi.mocked(wakeContainer)).toHaveBeenCalledTimes(2);
+    } finally {
+      gateHold.until = null;
+      gateHold.pass = false;
+      releases.forEach((release) => release());
+    }
+  });
+
+  it('a follow-up in an already active thread does not wait for a pending command verdict', async () => {
+    await seed();
+    recordingAdapter(async () => 'platform-msg-1');
+    await getDb().run("UPDATE messaging_groups SET is_group = 1 WHERE id = 'mg-1'");
+    await getDb().run(
+      "UPDATE messaging_group_agents SET engage_mode = 'mention-sticky', ignored_message_policy = 'drop' WHERE id = 'mga-1'",
+    );
+    const message = (id: string, text: string, isMention: boolean) =>
+      routeInbound({
+        channelType: 'testchat',
+        platformId: 'testchat:C1',
+        threadId: null,
+        message: {
+          id,
+          kind: 'chat-sdk',
+          content: JSON.stringify({ sender: 'Alex', senderId: 'U1', text }),
+          timestamp: new Date().toISOString(),
+          isMention,
+          isGroup: true,
+        },
+      });
+    const { wakeContainer } = await import('./container-runner.js');
+    vi.mocked(wakeContainer).mockClear();
+    await message('m0', 'hello', true);
+    expect(vi.mocked(wakeContainer)).toHaveBeenCalledTimes(1);
+
+    let release: () => void = () => {};
+    gateHold.reached.mockClear();
+    gateHold.until = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    try {
+      const clear = sendClear(true);
+      await vi.waitFor(() => expect(gateHold.reached).toHaveBeenCalledTimes(1));
+      gateHold.until = null;
+
+      // The thread is already active, so the follow-up wakes whatever the
+      // command's verdict. GWS-EA routes a conversation's events in order, so
+      // it is judged once the gated command is routed.
+      const followup = message('m2', 'and keep the notes', false);
+      await Promise.race([followup, new Promise((resolve) => setTimeout(resolve, 200))]);
+      expect(vi.mocked(wakeContainer)).toHaveBeenCalledTimes(1);
+      release();
+      await Promise.all([clear, followup]);
+      expect(vi.mocked(wakeContainer)).toHaveBeenCalledTimes(2);
+    } finally {
+      gateHold.until = null;
+      release();
+    }
+  });
+  it('a follow-up in a thread whose inbox was reset does not wait for a pending command verdict', async () => {
+    await seed();
+    recordingAdapter(async () => 'platform-msg-1');
+    await getDb().run("UPDATE messaging_groups SET is_group = 1 WHERE id = 'mg-1'");
+    await getDb().run(
+      "UPDATE messaging_group_agents SET engage_mode = 'mention-sticky', ignored_message_policy = 'drop' WHERE id = 'mga-1'",
+    );
+    const message = (id: string, text: string, isMention: boolean) =>
+      routeInbound({
+        channelType: 'testchat',
+        platformId: 'testchat:C1',
+        threadId: null,
+        message: {
+          id,
+          kind: 'chat-sdk',
+          content: JSON.stringify({ sender: 'Alex', senderId: 'U1', text }),
+          timestamp: new Date().toISOString(),
+          isMention,
+          isGroup: true,
+        },
+      });
+    const { wakeContainer } = await import('./container-runner.js');
+    vi.mocked(wakeContainer).mockClear();
+    await message('m0', 'hello', true);
+    expect(vi.mocked(wakeContainer)).toHaveBeenCalledTimes(1);
+    const session = await findSessionForAgent('ag-1', 'mg-1', null);
+    fs.rmSync(sessionDir('ag-1', session!.id), { recursive: true, force: true });
+
+    let release: () => void = () => {};
+    gateHold.reached.mockClear();
+    gateHold.until = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    try {
+      const clear = sendClear(true);
+      await vi.waitFor(() => expect(gateHold.reached).toHaveBeenCalledTimes(1));
+      gateHold.until = null;
+
+      // An inbox with no evidence keeps the thread active, so the follow-up wakes whatever the
+      // command's verdict. GWS-EA routes a conversation's events in order, so
+      // it is judged once the gated command is routed.
+      const followup = message('m2', 'and keep the notes', false);
+      await Promise.race([followup, new Promise((resolve) => setTimeout(resolve, 200))]);
+      expect(vi.mocked(wakeContainer)).toHaveBeenCalledTimes(1);
+      release();
+      await Promise.all([clear, followup]);
+      expect(vi.mocked(wakeContainer)).toHaveBeenCalledTimes(2);
+    } finally {
+      gateHold.until = null;
+      release();
+    }
   });
 });

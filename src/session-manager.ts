@@ -14,12 +14,14 @@ import { DATA_DIR } from './config.js';
 import { getMessagingGroup } from './db/messaging-groups.js';
 import { isUniqueViolation } from './db/errors.js';
 import {
+  bindUnboundSession,
   createSession,
   findSystemSession,
   findSessionByAgentGroup,
   findSessionForAgent,
   getSession,
   taskThreadId,
+  unbindSession,
   updateSession,
 } from './db/sessions.js';
 import { log } from './log.js';
@@ -142,6 +144,20 @@ export async function resolveSession(
   return withSessionCreationLock(key, async () => {
     const existing = await findSession(agentGroupId, messagingGroupId, threadId, sessionMode);
     if (existing) {
+      // A session kept without a chat (its chat was deleted) takes the chat that
+      // resumes it; cards and questions route only to the bound chat.
+      if (sessionMode === 'agent-shared' && messagingGroupId && !existing.messaging_group_id) {
+        if (await bindUnboundSession(existing.id, messagingGroupId)) {
+          try {
+            await writeSessionRouting(agentGroupId, existing.id);
+          } catch (err) {
+            // Unbound again, so the next message that resumes it retries the routing.
+            await unbindSession(existing.id, messagingGroupId);
+            throw err;
+          }
+          existing.messaging_group_id = messagingGroupId;
+        }
+      }
       return { session: existing, created: false };
     }
 
@@ -393,8 +409,8 @@ function holdsStagedOriginal(dir: AnchoredDir, name: string, bytes: Buffer): boo
  * `inbox/<msgId>` names and can turn either into a symlink at any time.
  *
  * Defenses:
- *   1. basename check on `filename`; a `messageId` that is not a safe file
- *      name (every Google Chat ID holds `/`) names its folder by a hash.
+ *   1. `messageId` maps to one safe folder name (`inboxFolderName`), and
+ *      `filename` passes the basename check.
  *   2. `inbox/<folder>` is opened as an AnchoredDir, refusing symlinks, and
  *      every attachment is written through that descriptor, so a later swap
  *      of either name cannot redirect a write.
@@ -417,7 +433,12 @@ function extractAttachmentFiles(
   const attachments = parsed.attachments as Array<Record<string, unknown>> | undefined;
   if (!Array.isArray(attachments)) return contentStr;
 
-  const inboxFolder = inboxFolderName(messageId);
+  const folder = inboxFolderName(messageId);
+  if (folder === null) {
+    log.warn('Rejecting unsafe inbound message id', { messageId });
+    return contentStr;
+  }
+
   // Opened lazily on the first attachment that actually carries bytes, so a
   // message whose attachments have no inline `data` never creates an inbox dir.
   let inbox: AnchoredDir | null | undefined;
@@ -439,7 +460,7 @@ function extractAttachmentFiles(
 
       if (inbox === undefined) {
         try {
-          inbox = AnchoredDir.open(sessionDir(agentGroupId, sessionId), ['inbox', inboxFolder], true);
+          inbox = AnchoredDir.open(sessionDir(agentGroupId, sessionId), ['inbox', folder], true);
         } catch (err) {
           log.warn('Rejecting unsafe inbox directory', { messageId, err });
           inbox = null;
@@ -465,7 +486,7 @@ function extractAttachmentFiles(
       }
 
       att.name = filename;
-      att.localPath = `inbox/${inboxFolder}/${filename}`;
+      att.localPath = `inbox/${folder}/${filename}`;
       delete att.data;
       changed = true;
       log.debug('Saved attachment to inbox', { messageId, filename, size: att.size });

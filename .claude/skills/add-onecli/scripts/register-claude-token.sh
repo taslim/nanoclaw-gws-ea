@@ -1,46 +1,24 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Register a Claude subscription OAuth token with OneCLI — the *only* auth
-# path that needs a TTY break in the flow. Paste-based paths (existing
-# OAuth token / API key) are handled in-process by setup/auto.ts using
-# clack prompts, then onecli secrets create is invoked directly from TS.
+# Capture a Claude subscription OAuth token for OneCLI — the *only* auth
+# path that needs a TTY break in the flow. auth.ts saves every token
+# (pasted or captured here) in-process, so a failed save is redacted.
+#
+# Usage: register-claude-token.sh <output-file>
 #
 # Flow:
 #   1. Run `claude setup-token` under a PTY (via script(1)) so the browser
 #      OAuth dance works and its token is captured into a tempfile.
 #   2. Parse the sk-ant-oat…AA token out of the capture via the shared
 #      PTY-capture parser (setup/lib/captured-token.ts).
-#   3. Register it with OneCLI, or, with --output-file, write it to a new
-#      owner-only file for a caller that stores the token itself.
-#
-# Env overrides:
-#   SECRET_NAME   OneCLI secret name   (default: Anthropic)
-#   HOST_PATTERN  OneCLI host pattern  (default: api.anthropic.com)
+#   3. Write it to <output-file>, mode 0600, for auth.ts to save.
 
 # Prefer bash 4+ (for `read -e -i` readline preload). macOS ships 3.2 in
 # /bin/bash, but Homebrew users usually have 5.x first on PATH. The
 # readline preload is optional — on 3.x we fall back to a plain prompt.
 
-SECRET_NAME="${SECRET_NAME:-Anthropic}"
-HOST_PATTERN="${HOST_PATTERN:-api.anthropic.com}"
-
-output_file=""
-if [ "${1:-}" = "--output-file" ]; then
-  output_file="${2:-}"
-  if [ -z "$output_file" ] || [ "${output_file#/}" = "$output_file" ] || [ "$#" -ne 2 ]; then
-    echo "Usage: $0 [--output-file /absolute/owner-only/path]" >&2
-    exit 2
-  fi
-elif [ "$#" -ne 0 ]; then
-  echo "Usage: $0 [--output-file /absolute/owner-only/path]" >&2
-  exit 2
-fi
-
-if [ -z "$output_file" ]; then
-  command -v onecli >/dev/null \
-    || { echo "onecli not found. Install it first (see /setup §4)." >&2; exit 1; }
-fi
+output=${1:?output path required}
 
 if ! command -v claude >/dev/null 2>&1; then
   echo "Claude Code CLI not found — installing it now (needed for subscription sign-in)…"
@@ -81,7 +59,7 @@ fi
 if [ "$is_headless" = "1" ]; then
   cat <<'EOF'
 A sign-in link will appear for you to sign in with your Claude account.
-When you finish, we'll save the token to your OneCLI vault automatically.
+When you finish, setup saves the token to your OneCLI vault.
 
 Press Enter to continue, or edit the command first.
 
@@ -89,7 +67,7 @@ EOF
 else
   cat <<'EOF'
 A browser window will open for you to sign in with your Claude account.
-When you finish, we'll save the token to your OneCLI vault automatically.
+When you finish, setup saves the token to your OneCLI vault.
 
 Press Enter to continue, or edit the command first.
 
@@ -129,25 +107,7 @@ if [ -z "$token" ]; then
   exit 1
 fi
 
-if [ -n "$output_file" ]; then
-  umask 077
-  if [ -e "$output_file" ] || [ -L "$output_file" ]; then
-    echo "Credential output path already exists; refusing to overwrite it." >&2
-    exit 1
-  fi
-  printf '%s' "$token" > "$output_file"
-  echo
-  echo "Claude sign-in complete."
-  exit 0
-fi
-
 echo
 echo "Got token: ${token:0:16}…${token: -4}"
-echo "Saving it to your OneCLI vault as '${SECRET_NAME}' (host: ${HOST_PATTERN})…"
-onecli secrets create \
-  --name "$SECRET_NAME" \
-  --type anthropic \
-  --value "$token" \
-  --host-pattern "$HOST_PATTERN"
-
-echo "Done."
+umask 077
+printf '%s' "$token" > "$output"

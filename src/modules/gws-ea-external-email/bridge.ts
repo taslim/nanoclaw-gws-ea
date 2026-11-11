@@ -409,7 +409,9 @@ async function writeHandoff(
         }),
   });
   // Recorded at the path core stages each file to, before main's words arrive, so the words never come without them.
-  const inbox = path.join(sessionDir(thread.agent_group_id, thread.id), 'inbox', inboxFolderName(id));
+  const folder = inboxFolderName(id);
+  if (folder === null) throw new Error(`Handoff ${id} has no inbox folder core would stage its files to`);
+  const inbox = path.join(sessionDir(thread.agent_group_id, thread.id), 'inbox', folder);
   for (const file of files) {
     await recordThreadFile(
       threadKey,

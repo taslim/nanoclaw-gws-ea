@@ -46,8 +46,16 @@ describe('wrapper gateway image identity', () => {
   });
 });
 
+/**
+ * The add-onecli pin GWS-EA reviewed on 2026-11-10 and stays behind: NanoClaw
+ * moved to 1.45.0 for agent grants, not for a fix GWS-EA's gateway needs (see
+ * onecli-gateway-image/README.md). Any later NanoClaw move fails the guard
+ * below until GWS-EA follows it or reviews it again.
+ */
+const REVIEWED_ADD_ONECLI_GATEWAY = '1.45.0';
+
 describe("GWS-EA's gateway pin", () => {
-  it("is never older than the add-onecli skill's, which NanoClaw moves for security fixes", () => {
+  it("is never older than the add-onecli skill's, unless GWS-EA reviewed that pin and stays behind it", () => {
     const skill = JSON.parse(
       readFileSync(path.join(import.meta.dirname, '../../.claude/skills/add-onecli/versions.json'), 'utf8'),
     ) as Record<string, unknown>;
@@ -60,9 +68,10 @@ describe("GWS-EA's gateway pin", () => {
     const order = ours.map((part, index) => part - nanoclaw[index]!).find((difference) => difference !== 0) ?? 0;
 
     expect(nanoclaw.every(Number.isSafeInteger), 'add-onecli no longer pins onecli-gateway to one version').toBe(true);
+    if (skill['onecli-gateway'] === REVIEWED_ADD_ONECLI_GATEWAY) return;
     expect(
       order,
-      `OneCLI ${ONECLI_GATEWAY_VERSION} is older than add-onecli's ${String(skill['onecli-gateway'])}`,
+      `OneCLI ${ONECLI_GATEWAY_VERSION} is older than add-onecli's ${String(skill['onecli-gateway'])}: follow it, or review it and record it as REVIEWED_ADD_ONECLI_GATEWAY with the reason in onecli-gateway-image/README.md`,
     ).toBeGreaterThanOrEqual(0);
   });
 });

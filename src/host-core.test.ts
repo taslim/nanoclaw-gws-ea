@@ -38,6 +38,72 @@ vi.mock('./container-runner.js', () => ({
   killContainer: vi.fn(),
 }));
 
+// Lets a test hold a delivery inside backfill, before its inbox row lands.
+const backfillHold = vi.hoisted(() => ({ until: null as Promise<void> | null, reached: vi.fn() }));
+vi.mock('./modules/cross-session-context/index.js', async () => {
+  const actual = await vi.importActual<typeof import('./modules/cross-session-context/index.js')>(
+    './modules/cross-session-context/index.js',
+  );
+  return {
+    ...actual,
+    backfillSession: async (...args: Parameters<typeof actual.backfillSession>) => {
+      if (backfillHold.until) {
+        backfillHold.reached();
+        await backfillHold.until;
+      }
+      return actual.backfillSession(...args);
+    },
+  };
+});
+
+// Lets a test hold the next session lookup, to order it against a mention.
+const lookupHold = vi.hoisted(() => ({ until: null as Promise<void> | null, reached: vi.fn() }));
+vi.mock('./db/sessions.js', async () => {
+  const actual = await vi.importActual<typeof import('./db/sessions.js')>('./db/sessions.js');
+  return {
+    ...actual,
+    findSessionForAgent: async (...args: Parameters<typeof actual.findSessionForAgent>) => {
+      const hold = lookupHold.until;
+      if (hold) {
+        lookupHold.until = null;
+        lookupHold.reached();
+        await hold;
+      }
+      return actual.findSessionForAgent(...args);
+    },
+  };
+});
+
+// Lets a test hold the next inbox write from the router, after its session
+// exists, or the next inbox read after it has run.
+const writeHold = vi.hoisted(() => ({ until: null as Promise<void> | null, reached: vi.fn() }));
+const readHold = vi.hoisted(() => ({ until: null as Promise<void> | null, reached: vi.fn() }));
+vi.mock('./session-manager.js', async () => {
+  const actual = await vi.importActual<typeof import('./session-manager.js')>('./session-manager.js');
+  return {
+    ...actual,
+    writeSessionMessage: async (...args: Parameters<typeof actual.writeSessionMessage>) => {
+      const hold = writeHold.until;
+      if (hold) {
+        writeHold.until = null;
+        writeHold.reached();
+        await hold;
+      }
+      return actual.writeSessionMessage(...args);
+    },
+    withExistingMailboxSession: async (...args: Parameters<typeof actual.withExistingMailboxSession>) => {
+      const result = await actual.withExistingMailboxSession(...args);
+      const hold = readHold.until;
+      if (hold) {
+        readHold.until = null;
+        readHold.reached();
+        await hold;
+      }
+      return result;
+    },
+  };
+});
+
 // Override DATA_DIR for tests
 vi.mock('./config.js', async () => {
   const actual = await vi.importActual('./config.js');
@@ -213,7 +279,7 @@ describe('session manager', () => {
     expect(fs.readFileSync(outside, 'utf-8')).toBe('ORIGINAL');
   });
 
-  it('keeps inbound attachments inside the inbox when messageId is unsafe', async () => {
+  it('should reject inbound attachments when messageId is unsafe', async () => {
     initSessionFolder('ag-1', 'sess-test');
     const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
 
@@ -228,10 +294,62 @@ describe('session manager', () => {
     });
 
     const inboxRoot = path.join(sessionDir('ag-1', session.id), 'inbox');
+    if (fs.existsSync(inboxRoot)) {
+      expect(fs.readdirSync(inboxRoot)).toEqual([]);
+    }
+  });
+
+  it('should reject inbound attachments when messageId is an absolute path', async () => {
+    initSessionFolder('ag-1', 'sess-test');
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
+    const outside = path.join(TEST_DIR, 'outside-abs');
+
+    await writeSessionMessage('ag-1', session.id, {
+      id: outside,
+      kind: 'chat',
+      timestamp: now(),
+      content: JSON.stringify({
+        text: 'abs',
+        attachments: [{ name: 'photo.png', data: Buffer.from('PNGBYTES').toString('base64'), size: 8 }],
+      }),
+    });
+
+    expect(fs.existsSync(outside)).toBe(false);
+    const inboxRoot = path.join(sessionDir('ag-1', session.id), 'inbox');
+    if (fs.existsSync(inboxRoot)) {
+      expect(fs.readdirSync(inboxRoot)).toEqual([]);
+    }
+  });
+
+  it('should stage inbound attachments when messageId contains a path separator', async () => {
+    initSessionFolder('ag-1', 'sess-test');
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
+    const messageId = 'spaces/AAA/messages/BBB.BBB:ag-1';
+
+    await writeSessionMessage('ag-1', session.id, {
+      id: messageId,
+      kind: 'chat',
+      timestamp: now(),
+      content: JSON.stringify({
+        text: 'photo',
+        attachments: [{ name: 'photo.png', data: Buffer.from('PNGBYTES').toString('base64'), size: 8 }],
+      }),
+    });
+
+    const inboxRoot = path.join(sessionDir('ag-1', session.id), 'inbox');
     const folders = fs.readdirSync(inboxRoot);
-    expect(folders).toEqual([expect.stringMatching(/^msg-[0-9a-f]{32}$/)]);
-    expect(fs.readFileSync(path.join(inboxRoot, folders[0]!, 'photo.png'), 'utf-8')).toBe('PNGBYTES');
-    expect(fs.existsSync(path.join(inboxRoot, '..', '..', 'escape'))).toBe(false);
+    expect(folders).toHaveLength(1);
+    const folder = folders[0];
+    expect(folder).toMatch(/^~spaces-AAA-messages-BBB\.BBB-ag-1-[0-9a-f]{16}$/);
+    expect(fs.readFileSync(path.join(inboxRoot, folder, 'photo.png'), 'utf-8')).toBe('PNGBYTES');
+
+    const db = new Database(inboundDbPath('ag-1', session.id));
+    const row = db.prepare('SELECT id, content FROM messages_in').get() as { id: string; content: string };
+    db.close();
+    expect(row.id).toBe(messageId);
+    const [att] = JSON.parse(row.content).attachments;
+    expect(att.localPath).toBe(`inbox/${folder}/photo.png`);
+    expect(att.data).toBeUndefined();
   });
 
   it('should still save inbound attachments with safe basenames', async () => {
@@ -967,6 +1085,414 @@ describe('router — per-wiring thread policy', () => {
       // event-derived address is policy-stripped.
       expect(row.channel_type).toBe('cli');
       expect(row.thread_id).toBe('term-1');
+    });
+  });
+
+  it('mention-sticky wakes on a mention and its follow-ups, not on accumulated chatter', async () => {
+    await getDb().run(
+      "UPDATE messaging_group_agents SET engage_mode = 'mention-sticky', ignored_message_policy = 'accumulate' WHERE id = 'mga-tp'",
+    );
+
+    await withThreadedAdapter(async () => {
+      const { routeInbound } = await import('./router.js');
+      const { wakeContainer } = await import('./container-runner.js');
+      const wake = wakeContainer as unknown as ReturnType<typeof vi.fn>;
+      wake.mockClear();
+
+      await routeInbound(threadedEvent('msg-ambient-1'));
+      await routeInbound(threadedEvent('msg-ambient-2'));
+
+      expect(wake).not.toHaveBeenCalled();
+      const session = await findSession('mg-tp', 'thread-42');
+      expect(session).toBeDefined();
+      const db = new Database(inboundDbPath('ag-tp', session!.id));
+      expect(db.prepare('SELECT trigger FROM messages_in ORDER BY seq').all()).toEqual([
+        { trigger: 0 },
+        { trigger: 0 },
+      ]);
+      db.close();
+
+      const mention = threadedEvent('msg-mention');
+      await routeInbound({ ...mention, message: { ...mention.message, isMention: true } });
+      await routeInbound(threadedEvent('msg-followup'));
+
+      expect(wake).toHaveBeenCalledTimes(2);
+      const after = new Database(inboundDbPath('ag-tp', session!.id));
+      expect(after.prepare('SELECT trigger FROM messages_in ORDER BY seq').all()).toEqual([
+        { trigger: 0 },
+        { trigger: 0 },
+        { trigger: 1 },
+        { trigger: 1 },
+      ]);
+      after.close();
+    });
+  });
+
+  it('mention-sticky engages a follow-up sent while the first wake is still starting', async () => {
+    await getDb().run("UPDATE messaging_group_agents SET engage_mode = 'mention-sticky' WHERE id = 'mga-tp'");
+
+    await withThreadedAdapter(async () => {
+      const { routeInbound } = await import('./router.js');
+      const { wakeContainer } = await import('./container-runner.js');
+      const wake = wakeContainer as unknown as ReturnType<typeof vi.fn>;
+      wake.mockClear();
+      let release: (value: boolean) => void = () => {};
+      const slowWake = new Promise<boolean>((resolve) => {
+        release = resolve;
+      });
+      wake.mockReturnValueOnce(slowWake);
+
+      const mention = threadedEvent('msg-slow-mention');
+      const mentionDone = routeInbound({ ...mention, message: { ...mention.message, isMention: true } });
+      await vi.waitFor(() => expect(wake).toHaveBeenCalledTimes(1));
+
+      // GWS-EA routes a conversation's events in order, so the follow-up is routed after the mention's routing ends.
+      const followupDone = routeInbound(threadedEvent('msg-quick-followup'));
+      release(true);
+      await Promise.all([mentionDone, followupDone]);
+      expect(wake).toHaveBeenCalledTimes(2);
+    });
+  });
+
+  it('mention-sticky engages a follow-up routed before the mention reaches the inbox', async () => {
+    await getDb().run("UPDATE messaging_group_agents SET engage_mode = 'mention-sticky' WHERE id = 'mga-tp'");
+
+    await withThreadedAdapter(async () => {
+      const { routeInbound } = await import('./router.js');
+      const { wakeContainer } = await import('./container-runner.js');
+      const wake = wakeContainer as unknown as ReturnType<typeof vi.fn>;
+      wake.mockClear();
+      let release: () => void = () => {};
+      backfillHold.until = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      backfillHold.reached.mockClear();
+
+      try {
+        const mention = threadedEvent('msg-held-mention');
+        const mentionDone = routeInbound({ ...mention, message: { ...mention.message, isMention: true } });
+        await vi.waitFor(() => expect(backfillHold.reached).toHaveBeenCalledTimes(1));
+        backfillHold.until = null;
+
+        // GWS-EA routes a conversation's events in order, so the follow-up is routed after the mention's routing ends.
+        const followupDone = routeInbound(threadedEvent('msg-early-followup'));
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        expect(wake).not.toHaveBeenCalled();
+
+        release();
+        await Promise.all([mentionDone, followupDone]);
+        expect(wake).toHaveBeenCalledTimes(2);
+      } finally {
+        backfillHold.until = null;
+        release();
+      }
+    });
+  });
+
+  it('mention-sticky keeps a thread active after its session folder is reset', async () => {
+    await getDb().run("UPDATE messaging_group_agents SET engage_mode = 'mention-sticky' WHERE id = 'mga-tp'");
+
+    await withThreadedAdapter(async () => {
+      const { routeInbound } = await import('./router.js');
+      const { wakeContainer } = await import('./container-runner.js');
+      const wake = wakeContainer as unknown as ReturnType<typeof vi.fn>;
+      wake.mockClear();
+
+      const mention = threadedEvent('msg-before-reset');
+      await routeInbound({ ...mention, message: { ...mention.message, isMention: true } });
+      const session = await findSession('mg-tp', 'thread-42');
+      fs.rmSync(sessionDir('ag-tp', session!.id), { recursive: true, force: true });
+
+      await routeInbound(threadedEvent('msg-after-reset'));
+      expect(wake).toHaveBeenCalledTimes(2);
+    });
+  });
+
+  it('mention-sticky stays active when a card answer is the first row after a folder reset', async () => {
+    await getDb().run("UPDATE messaging_group_agents SET engage_mode = 'mention-sticky' WHERE id = 'mga-tp'");
+
+    await withThreadedAdapter(async () => {
+      const { routeInbound } = await import('./router.js');
+      const { wakeContainer } = await import('./container-runner.js');
+      const wake = wakeContainer as unknown as ReturnType<typeof vi.fn>;
+      wake.mockClear();
+
+      const mention = threadedEvent('msg-before-reset-answer');
+      await routeInbound({ ...mention, message: { ...mention.message, isMention: true } });
+      const session = await findSession('mg-tp', 'thread-42');
+      fs.rmSync(sessionDir('ag-tp', session!.id), { recursive: true, force: true });
+      await writeSessionMessage('ag-tp', session!.id, {
+        id: 'answer-after-reset',
+        kind: 'system',
+        timestamp: now(),
+        content: JSON.stringify({ type: 'question_response', answer: 'yes' }),
+      });
+
+      await routeInbound(threadedEvent('msg-after-answer'));
+      expect(wake).toHaveBeenCalledTimes(2);
+    });
+  });
+
+  it('mention-sticky engages a follow-up whose session lookup overlaps the mention', async () => {
+    await getDb().run(
+      "UPDATE messaging_group_agents SET engage_mode = 'mention-sticky', ignored_message_policy = 'accumulate' WHERE id = 'mga-tp'",
+    );
+
+    await withThreadedAdapter(async () => {
+      const { routeInbound } = await import('./router.js');
+      const { wakeContainer } = await import('./container-runner.js');
+      const wake = wakeContainer as unknown as ReturnType<typeof vi.fn>;
+      await routeInbound(threadedEvent('msg-chatter-first'));
+      wake.mockClear();
+
+      let releaseLookup: () => void = () => {};
+      let releaseBackfill: () => void = () => {};
+      lookupHold.reached.mockClear();
+      backfillHold.reached.mockClear();
+      try {
+        // GWS-EA routes a conversation's events in order: a slow mention is
+        // routed in full before the follow-up behind it looks up its session.
+        backfillHold.until = new Promise<void>((resolve) => {
+          releaseBackfill = resolve;
+        });
+        const mention = threadedEvent('msg-overlapping-mention');
+        const mentionDone = routeInbound({ ...mention, message: { ...mention.message, isMention: true } });
+        await vi.waitFor(() => expect(backfillHold.reached).toHaveBeenCalledTimes(1));
+        backfillHold.until = null;
+
+        lookupHold.until = new Promise<void>((resolve) => {
+          releaseLookup = resolve;
+        });
+        const followupDone = routeInbound(threadedEvent('msg-overlapping-followup'));
+        releaseBackfill();
+        await vi.waitFor(() => expect(lookupHold.reached).toHaveBeenCalledTimes(1));
+        releaseLookup();
+        await Promise.all([mentionDone, followupDone]);
+        expect(wake).toHaveBeenCalledTimes(2);
+      } finally {
+        lookupHold.until = null;
+        backfillHold.until = null;
+        releaseLookup();
+        releaseBackfill();
+      }
+    });
+  });
+
+  it('mention-sticky stays active when routing data or a silent reply recreates a reset inbox', async () => {
+    await getDb().run("UPDATE messaging_group_agents SET engage_mode = 'mention-sticky' WHERE id = 'mga-tp'");
+
+    await withThreadedAdapter(async () => {
+      const { routeInbound } = await import('./router.js');
+      const { wakeContainer } = await import('./container-runner.js');
+      const wake = wakeContainer as unknown as ReturnType<typeof vi.fn>;
+      wake.mockClear();
+
+      const mention = threadedEvent('msg-before-routing-reset');
+      await routeInbound({ ...mention, message: { ...mention.message, isMention: true } });
+      const session = await findSession('mg-tp', 'thread-42');
+      fs.rmSync(sessionDir('ag-tp', session!.id), { recursive: true, force: true });
+      await writeSessionRouting('ag-tp', session!.id);
+      await writeSessionMessage('ag-tp', session!.id, {
+        id: 'late-cli-reply',
+        kind: 'system',
+        timestamp: now(),
+        content: JSON.stringify({ text: 'cli done' }),
+        trigger: false,
+      });
+
+      await routeInbound(threadedEvent('msg-after-routing-reset'));
+      expect(wake).toHaveBeenCalledTimes(2);
+    });
+  });
+
+  it('mention-sticky is not activated by chatter that overlaps the first silent write', async () => {
+    await getDb().run(
+      "UPDATE messaging_group_agents SET engage_mode = 'mention-sticky', ignored_message_policy = 'accumulate' WHERE id = 'mga-tp'",
+    );
+
+    await withThreadedAdapter(async () => {
+      const { routeInbound } = await import('./router.js');
+      const { wakeContainer } = await import('./container-runner.js');
+      const wake = wakeContainer as unknown as ReturnType<typeof vi.fn>;
+      wake.mockClear();
+
+      let release: () => void = () => {};
+      writeHold.reached.mockClear();
+      writeHold.until = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      try {
+        const firstDone = routeInbound(threadedEvent('msg-first-chatter'));
+        await vi.waitFor(() => expect(writeHold.reached).toHaveBeenCalledTimes(1));
+
+        // The session exists but its inbox is still empty. GWS-EA routes a
+        // conversation's events in order, so this chatter is judged after the
+        // first write lands.
+        const secondDone = routeInbound(threadedEvent('msg-overlapping-chatter'));
+        release();
+        await Promise.all([firstDone, secondDone]);
+
+        expect(wake).not.toHaveBeenCalled();
+        const session = await findSession('mg-tp', 'thread-42');
+        const db = new Database(inboundDbPath('ag-tp', session!.id));
+        expect(db.prepare('SELECT trigger FROM messages_in ORDER BY seq').all()).toEqual([
+          { trigger: 0 },
+          { trigger: 0 },
+        ]);
+        db.close();
+      } finally {
+        writeHold.until = null;
+        release();
+      }
+    });
+  });
+
+  it('mention-sticky is not activated by a first silent write that starts and ends during a lookup', async () => {
+    await getDb().run(
+      "UPDATE messaging_group_agents SET engage_mode = 'mention-sticky', ignored_message_policy = 'accumulate' WHERE id = 'mga-tp'",
+    );
+
+    await withThreadedAdapter(async () => {
+      const { routeInbound } = await import('./router.js');
+      const { wakeContainer } = await import('./container-runner.js');
+      const wake = wakeContainer as unknown as ReturnType<typeof vi.fn>;
+      wake.mockClear();
+
+      const releases: (() => void)[] = [];
+      const hold = () => new Promise<void>((resolve) => releases.push(resolve));
+      lookupHold.reached.mockClear();
+      writeHold.reached.mockClear();
+      try {
+        // GWS-EA routes a conversation's events in order: the second chatter,
+        // routed while the first one's lookup and write are held, is judged
+        // only after the first write lands.
+        lookupHold.until = hold();
+        const firstDone = routeInbound(threadedEvent('msg-first-silent'));
+        await vi.waitFor(() => expect(lookupHold.reached).toHaveBeenCalledTimes(1));
+        writeHold.until = hold();
+        const secondDone = routeInbound(threadedEvent('msg-lookup-chatter'));
+        releases[0]();
+        await vi.waitFor(() => expect(writeHold.reached).toHaveBeenCalledTimes(1));
+        releases[1]();
+        await Promise.all([firstDone, secondDone]);
+
+        expect(wake).not.toHaveBeenCalled();
+      } finally {
+        lookupHold.until = null;
+        writeHold.until = null;
+        releases.forEach((release) => release());
+      }
+    });
+  });
+
+  it('mention-sticky engages a follow-up whose inbox read overlaps a whole mention', async () => {
+    await getDb().run(
+      "UPDATE messaging_group_agents SET engage_mode = 'mention-sticky', ignored_message_policy = 'accumulate' WHERE id = 'mga-tp'",
+    );
+
+    await withThreadedAdapter(async () => {
+      const { routeInbound } = await import('./router.js');
+      const { wakeContainer } = await import('./container-runner.js');
+      const wake = wakeContainer as unknown as ReturnType<typeof vi.fn>;
+      await routeInbound(threadedEvent('msg-chatter-before-read'));
+      wake.mockClear();
+
+      let releaseRead: () => void = () => {};
+      let releaseBackfill: () => void = () => {};
+      readHold.reached.mockClear();
+      backfillHold.reached.mockClear();
+      try {
+        // GWS-EA routes a conversation's events in order: a held mention is
+        // routed in full before the follow-up behind it reads the inbox.
+        backfillHold.until = new Promise<void>((resolve) => {
+          releaseBackfill = resolve;
+        });
+        const mention = threadedEvent('msg-read-overlap-mention');
+        const mentionDone = routeInbound({ ...mention, message: { ...mention.message, isMention: true } });
+        await vi.waitFor(() => expect(backfillHold.reached).toHaveBeenCalledTimes(1));
+        backfillHold.until = null;
+
+        const followupDone = routeInbound(threadedEvent('msg-read-overlap-followup'));
+        readHold.until = new Promise<void>((resolve) => {
+          releaseRead = resolve;
+        });
+        releaseBackfill();
+        await vi.waitFor(() => expect(readHold.reached).toHaveBeenCalledTimes(1));
+        releaseRead();
+        await Promise.all([mentionDone, followupDone]);
+        expect(wake).toHaveBeenCalledTimes(2);
+      } finally {
+        readHold.until = null;
+        backfillHold.until = null;
+        releaseRead();
+        releaseBackfill();
+      }
+    });
+  });
+
+  it('mention-sticky is not activated by a filtered command posted without a mention', async () => {
+    await getDb().run(
+      "UPDATE messaging_group_agents SET engage_mode = 'mention-sticky', ignored_message_policy = 'accumulate' WHERE id = 'mga-tp'",
+    );
+
+    await withThreadedAdapter(async () => {
+      const { routeInbound } = await import('./router.js');
+      const { wakeContainer } = await import('./container-runner.js');
+      const wake = wakeContainer as unknown as ReturnType<typeof vi.fn>;
+      wake.mockClear();
+
+      const command = threadedEvent('msg-filtered-command');
+      await routeInbound({
+        ...command,
+        message: { ...command.message, content: JSON.stringify({ sender: 'U', text: '/remote-control' }) },
+      });
+      await routeInbound(threadedEvent('msg-after-command'));
+      expect(wake).not.toHaveBeenCalled();
+    });
+  });
+
+  it('mention-sticky does not wake an agent that was never mentioned in the thread', async () => {
+    await getDb().run("UPDATE messaging_group_agents SET engage_mode = 'mention-sticky' WHERE id = 'mga-tp'");
+
+    await withThreadedAdapter(async () => {
+      const { routeInbound } = await import('./router.js');
+      const { getSessionsByAgentGroup } = await import('./db/sessions.js');
+      const { wakeContainer } = await import('./container-runner.js');
+      const wake = wakeContainer as unknown as ReturnType<typeof vi.fn>;
+      wake.mockClear();
+
+      const mention = threadedEvent('msg-first-agent-mention');
+      await routeInbound({ ...mention, message: { ...mention.message, isMention: true } });
+      expect(wake).toHaveBeenCalledTimes(1);
+
+      // A second sticky agent is wired after the thread was activated. It
+      // stores chatter, so it gets a session of its own without a mention.
+      await createAgentGroup({
+        id: 'ag-tp2',
+        name: 'Late Agent',
+        folder: 'late-agent',
+        agent_provider: null,
+        created_at: now(),
+      });
+      await createMessagingGroupAgent({
+        id: 'mga-tp2',
+        messaging_group_id: 'mg-tp',
+        agent_group_id: 'ag-tp2',
+        engage_mode: 'mention-sticky',
+        engage_pattern: null,
+        sender_scope: 'all',
+        ignored_message_policy: 'accumulate',
+        session_mode: 'shared',
+        priority: 1,
+        created_at: now(),
+      });
+
+      await routeInbound(threadedEvent('msg-followup-1'));
+      await routeInbound(threadedEvent('msg-followup-2'));
+      expect(wake).toHaveBeenCalledTimes(3);
+      const woken = wake.mock.calls.map((call) => (call[0] as { agent_group_id: string }).agent_group_id);
+      expect(woken).toEqual(['ag-tp', 'ag-tp', 'ag-tp']);
+      expect(await getSessionsByAgentGroup('ag-tp2')).toHaveLength(1);
     });
   });
 

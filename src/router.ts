@@ -50,6 +50,7 @@ import {
 import { requestWake } from './request-wake.js';
 import { getSession } from './db/sessions.js';
 import type { AgentGroup, MessagingGroup, MessagingGroupAgent, Session } from './types.js';
+import type { WakeEvidence } from './mailbox/types.js';
 import type { InboundEvent } from './channels/adapter.js';
 
 function generateId(): string {
@@ -690,11 +691,10 @@ async function mayReachQuietly(
  *                      user wants to disambiguate between multiple agents
  *                      wired to one chat, use engage_mode='pattern' with
  *                      the disambiguator as the regex.
- *   'mention-sticky' — platform mention OR an active per-thread session
- *                      already exists for this (agent, mg, thread). The
- *                      session existence IS our subscription state; once
- *                      a thread has engaged us once, follow-ups arrive
- *                      with no mention and should still fire.
+ *   'mention-sticky' — platform mention OR this agent was already woken
+ *                      in an active per-thread session for (agent, mg,
+ *                      thread). A session that holds only accumulated
+ *                      chatter does not count.
  *   'module'         — undefined: the channel's `registerEngagementDecider`
  *                      decides.
  */
@@ -722,11 +722,25 @@ async function evaluateEngage(
       return isMention;
     case 'mention-sticky': {
       if (isMention) return true;
-      // Sticky follow-up: session already exists for this (agent, mg, thread)
-      // — the thread was activated before, keep firing.
       if (mg.is_group === 0) return false; // DMs never use mention-sticky sensibly
-      const existing = await findSessionForAgent(agent.agent_group_id, mg.id, threadId);
-      return existing !== undefined;
+      const [thread, release] = holdThread(threadKey(agent.agent_group_id, mg.id, threadId));
+      try {
+        if (thread.wake > 0) return true;
+        const wakesBefore = thread.wakeStarted;
+        const silentBefore = thread.silent > 0;
+        const silentsBefore = thread.silentStarted;
+        const existing = await findSessionForAgent(agent.agent_group_id, mg.id, threadId);
+        const evidence = existing ? await inboxWakeEvidence(agent.agent_group_id, existing.id) : 'chatter';
+        // A wake that began while we looked counts.
+        if (thread.wakeStarted !== wakesBefore || evidence === 'woken') return true;
+        // An inbox with no evidence (e.g. after a folder reset) keeps the thread
+        // active, unless a silent first row was being written meanwhile.
+        if (evidence === 'none' && !silentBefore && thread.silentStarted === silentsBefore) return true;
+        // Only a thread not yet active waits for a first mention still in the command gate.
+        return (await gateVerdicts(thread)) || thread.wakeStarted !== wakesBefore;
+      } finally {
+        release();
+      }
     }
     default:
       // Unrecognized engage_mode (e.g. stale data from a past CLI version,
@@ -748,6 +762,100 @@ async function evaluateEngage(
  */
 type Delivery = 'wake' | 'accumulate' | 'quiet' | 'module';
 
+/**
+ * Routing in flight per (agent, mg, thread) that a sticky follow-up must see:
+ * command-gate verdicts pending for a wake, inbox writes not yet landed, and
+ * counts of writes ever started. The entry lives while anyone holds it, so a
+ * reader can tell that a write started and finished during its own lookup.
+ */
+interface ThreadInFlight {
+  holders: number;
+  gates: Set<Promise<boolean>>;
+  /** Called when a wake starts, so a follow-up waiting on gates stops at once. */
+  onWake: Set<() => void>;
+  wake: number;
+  silent: number;
+  wakeStarted: number;
+  silentStarted: number;
+}
+const threadsInFlight = new Map<string, ThreadInFlight>();
+
+function threadKey(agentGroupId: string, messagingGroupId: string, threadId: string | null): string {
+  return JSON.stringify([agentGroupId, messagingGroupId, threadId]);
+}
+
+function holdThread(key: string): [ThreadInFlight, () => void] {
+  const thread = threadsInFlight.get(key) ?? {
+    holders: 0,
+    gates: new Set(),
+    onWake: new Set(),
+    wake: 0,
+    silent: 0,
+    wakeStarted: 0,
+    silentStarted: 0,
+  };
+  threadsInFlight.set(key, thread);
+  thread.holders++;
+  let released = false;
+  return [
+    thread,
+    () => {
+      if (released) return;
+      released = true;
+      if (--thread.holders === 0 && threadsInFlight.get(key) === thread) threadsInFlight.delete(key);
+    },
+  ];
+}
+
+/**
+ * True once any wake starts on the thread (a passing gate starts one), false
+ * once no gate is pending, including gates opened while we wait.
+ */
+async function gateVerdicts(thread: ThreadInFlight): Promise<boolean> {
+  if (thread.gates.size === 0) return false;
+  let woke = (): void => {};
+  try {
+    return await new Promise<boolean>((resolve) => {
+      woke = () => resolve(true);
+      thread.onWake.add(woke);
+      // A settled gate leaves the set (see openGate).
+      void (async () => {
+        while (thread.gates.size > 0) await Promise.all(thread.gates);
+        resolve(false);
+      })();
+    });
+  } finally {
+    thread.onWake.delete(woke);
+  }
+}
+
+/** Registers a pending gate verdict; settling it again is a no-op. */
+function openGate(thread: ThreadInFlight): (pass: boolean) => void {
+  let settle: (pass: boolean) => void = () => {};
+  const verdict = new Promise<boolean>((resolve) => {
+    settle = resolve;
+  });
+  thread.gates.add(verdict);
+  return (pass) => {
+    if (thread.gates.delete(verdict)) settle(pass);
+  };
+}
+
+/**
+ * What a session's inbox shows: 'woken' once anything woke the agent there,
+ * 'chatter' when it holds only silent context (ignored_message_policy=
+ * 'accumulate'), 'none' when missing, empty or unreadable.
+ */
+async function inboxWakeEvidence(agentGroupId: string, sessionId: string): Promise<WakeEvidence> {
+  try {
+    return (await withExistingMailboxSession(agentGroupId, sessionId, (mailbox) => mailbox.wakeEvidence())) ?? 'none';
+    // eslint-disable-next-line no-catch-all/no-catch-all -- an unreadable inbox must not drop the message
+  } catch (err) {
+    log.warn('mention-sticky: could not read session inbox, treating thread as active', { sessionId, err });
+    return 'none';
+  }
+}
+
 async function deliverToAgent(
   agent: MessagingGroupAgent,
   agentGroup: AgentGroup,
@@ -764,19 +872,6 @@ async function deliverToAgent(
   // session_mode.
   const sessionMode = effectiveSessionMode(agent, mg, threadsEnabled);
 
-  let session: Session;
-  let created = false;
-  if (delivery === 'quiet') {
-    const existing = await findSession(agent.agent_group_id, mg.id, effectiveThreadId, sessionMode);
-    if (!existing) {
-      log.debug('Quiet event dropped — the conversation has no session', { agentGroupId: agent.agent_group_id });
-      return;
-    }
-    session = existing;
-  } else {
-    ({ session, created } = await resolveSession(agent.agent_group_id, mg.id, effectiveThreadId, sessionMode));
-  }
-
   // The inbound row's (channel_type, platform_id, thread_id) is the address
   // the agent's reply will be delivered to. Normally it mirrors the source
   // (stamped from the event, with the wiring's thread policy applied). When
@@ -788,92 +883,134 @@ async function deliverToAgent(
     platformId: event.platformId,
     threadId: effectiveThreadId,
   };
+  const replyInstance = event.replyTo ? undefined : mg.instance;
 
-  let deniedCommand: string | undefined;
-  if (event.message.kind === 'chat' || event.message.kind === 'chat-sdk') {
-    const gate = await gateCommand(event.message.content, userId, agent.agent_group_id);
-    if (gate.action === 'filter') {
-      log.debug('Filtered command dropped by gate', { agentGroupId: agent.agent_group_id });
-      return;
-    }
-    if (gate.action === 'deny') deniedCommand = gate.command;
-  }
-
-  // Admission and typed command classification used the original event.
-  // Preparation replaces only content and is reused across admitted targets.
-  if (prepare && (deniedCommand === undefined || delivery === 'module')) event = await prepare(session);
-
-  if (delivery === 'module') {
-    if (
-      event.message.deduplicate &&
-      event.message.id &&
-      (await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) =>
-        mailbox.hasMessage(messageIdForAgent(event.message.id, agent.agent_group_id)),
-      ))
-    )
-      return;
-    const decide = engagementDeciders.get(event.channelType);
-    delivery = decide && (await decide({ event, session, messagingGroup: mg, wiring: agent })) ? 'wake' : 'accumulate';
-  }
-  const wake = delivery === 'wake';
-  const delay = await inboundDelay(event, session);
-  const held = delay === HOLD_UNTIL_RELEASED;
-  if (deniedCommand !== undefined) {
-    if (!wake || held) return;
-    log.info('Admin command denied by gate', { command: deniedCommand, userId, agentGroupId: agent.agent_group_id });
-    const adapter = getDeliveryAdapter();
-    if (!adapter) {
-      log.warn('Permission-denied reply not sent: no delivery adapter', { command: deniedCommand });
-      return;
-    }
-    try {
-      await adapter.deliver(
-        deliveryAddr.channelType,
-        deliveryAddr.platformId,
-        deliveryAddr.threadId,
-        'chat',
-        JSON.stringify({ text: `Permission denied: ${deniedCommand} requires admin access.` }),
-        undefined,
-        event.replyTo ? undefined : mg.instance,
-      );
-      // eslint-disable-next-line no-catch-all/no-catch-all -- a failed reply must not fail inbound routing
-    } catch (err) {
-      log.error('Failed to deliver permission-denied reply', { command: deniedCommand, err });
-    }
-    return;
-  }
-
-  if (wake) {
-    // Cross-session context backfill: a just-born or long-idle session is
-    // seeded with its conversation's recent top-level timeline from the
-    // conversation's hot set BEFORE the triggering message is written, so
-    // replying to something said in another thread lands with that context
-    // in view. Bounded (K sources, read concurrently); a hot session is a
-    // one-query no-op. Never throws.
-    await backfillSession(agentGroup, session, mg, { created });
-  }
-
+  // A wake's gate verdict is pending from here: a follow-up routed meanwhile
+  // waits for it. A filtered command, and a denied one that no module decided
+  // to hear, creates no session, which mention-sticky would read as an active
+  // thread.
+  const [thread, release] = holdThread(threadKey(agent.agent_group_id, mg.id, effectiveThreadId));
+  const settleGate = delivery === 'wake' || delivery === 'module' ? openGate(thread) : undefined;
   const messageId = messageIdForAgent(event.message.id, agent.agent_group_id);
-  const processAfter = held ? null : delay;
+  let writing = false;
+  let wake = false;
+  let session: Session;
+  let created = false;
+  let delay: InboundDelay;
+  let held: boolean;
+  let processAfter: string | null;
   try {
-    await writeSessionMessage(session.agent_group_id, session.id, {
-      id: messageId,
-      kind: event.message.kind,
-      timestamp: event.message.timestamp,
-      platformId: deliveryAddr.platformId,
-      channelType: deliveryAddr.channelType,
-      threadId: deliveryAddr.threadId,
-      content: event.message.content,
-      processAfter,
-      trigger: wake,
-      status: held ? 'held' : 'pending',
-    });
-  } catch (error) {
-    if (!event.message.deduplicate || !isDuplicateInboundMessageIdViolation(error)) throw error;
-    // The first copy already set off everything below: typing, the wake (or
-    // the sweep's, when that wake failed), and the fan-out to sibling sessions.
-    log.info('Duplicate retry-safe inbound message already queued', { messageId, sessionId: session.id });
-    return;
+    // Command gate: classify slash commands before they reach the container.
+    // Filtered commands are dropped silently. A denied admin command gets a
+    // permission-denied reply sent straight to the chat (outbound.db belongs
+    // to the container, and a host write there can collide with its writes),
+    // but only when it was addressed to the agent: never as accumulated or
+    // quiet context, and in a module wiring only when the module wakes the
+    // agent for it and nothing holds it.
+    let deniedCommand: string | undefined;
+    if (event.message.kind === 'chat' || event.message.kind === 'chat-sdk') {
+      const gate = await gateCommand(event.message.content, userId, agent.agent_group_id);
+      if (gate.action === 'filter') {
+        log.debug('Filtered command dropped by gate', { agentGroupId: agent.agent_group_id });
+        return;
+      }
+      if (gate.action === 'deny') deniedCommand = gate.command;
+    }
+    if (deniedCommand !== undefined && delivery !== 'module') {
+      settleGate?.(false);
+      if (delivery === 'wake')
+        await replyPermissionDenied(deniedCommand, deliveryAddr, replyInstance, userId, agent.agent_group_id);
+      return;
+    }
+
+    if (delivery === 'quiet') {
+      const existing = await findSession(agent.agent_group_id, mg.id, effectiveThreadId, sessionMode);
+      if (!existing) {
+        log.debug('Quiet event dropped — the conversation has no session', { agentGroupId: agent.agent_group_id });
+        return;
+      }
+      session = existing;
+    } else {
+      ({ session, created } = await resolveSession(agent.agent_group_id, mg.id, effectiveThreadId, sessionMode));
+    }
+
+    // Admission and typed command classification used the original event.
+    // Preparation replaces only content and is reused across admitted targets.
+    if (prepare) event = await prepare(session);
+
+    if (delivery === 'module') {
+      if (
+        event.message.deduplicate &&
+        event.message.id &&
+        (await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) =>
+          mailbox.hasMessage(messageId),
+        ))
+      )
+        return;
+      const decide = engagementDeciders.get(event.channelType);
+      delivery =
+        decide && (await decide({ event, session, messagingGroup: mg, wiring: agent })) ? 'wake' : 'accumulate';
+    }
+    wake = delivery === 'wake';
+    delay = await inboundDelay(event, session);
+    held = delay === HOLD_UNTIL_RELEASED;
+    if (deniedCommand !== undefined) {
+      settleGate?.(false);
+      if (wake && !held)
+        await replyPermissionDenied(deniedCommand, deliveryAddr, replyInstance, userId, agent.agent_group_id);
+      return;
+    }
+
+    // Mark the write before releasing waiters, so none sees a gap.
+    writing = true;
+    if (wake) {
+      thread.wake++;
+      thread.wakeStarted++;
+      thread.onWake.forEach((woke) => woke());
+    } else {
+      thread.silent++;
+      thread.silentStarted++;
+    }
+    settleGate?.(wake);
+
+    if (wake) {
+      // Cross-session context backfill: a just-born or long-idle session is
+      // seeded with its conversation's recent top-level timeline from the
+      // conversation's hot set BEFORE the triggering message is written, so
+      // replying to something said in another thread lands with that context
+      // in view. Bounded (K sources, read concurrently); a hot session is a
+      // one-query no-op. Never throws.
+      await backfillSession(agentGroup, session, mg, { created });
+    }
+
+    processAfter = delay === HOLD_UNTIL_RELEASED ? null : delay;
+    try {
+      await writeSessionMessage(session.agent_group_id, session.id, {
+        id: messageId,
+        kind: event.message.kind,
+        timestamp: event.message.timestamp,
+        platformId: deliveryAddr.platformId,
+        channelType: deliveryAddr.channelType,
+        threadId: deliveryAddr.threadId,
+        content: event.message.content,
+        processAfter,
+        trigger: wake,
+        status: held ? 'held' : 'pending',
+      });
+    } catch (error) {
+      if (!event.message.deduplicate || !isDuplicateInboundMessageIdViolation(error)) throw error;
+      // The first copy already set off everything below: typing, the wake (or
+      // the sweep's, when that wake failed), and the fan-out to sibling sessions.
+      log.info('Duplicate retry-safe inbound message already queued', { messageId, sessionId: session.id });
+      return;
+    }
+  } finally {
+    settleGate?.(false);
+    if (writing) {
+      if (wake) thread.wake--;
+      else thread.silent--;
+    }
+    release();
   }
 
   if (wake && created) {
@@ -955,6 +1092,35 @@ async function deliverToAgent(
     });
   }
   return wake;
+}
+
+async function replyPermissionDenied(
+  command: string,
+  address: { channelType: string; platformId: string; threadId: string | null },
+  instance: string | undefined,
+  userId: string | null,
+  agentGroupId: string,
+): Promise<void> {
+  log.info('Admin command denied by gate', { command, userId, agentGroupId });
+  const adapter = getDeliveryAdapter();
+  if (!adapter) {
+    log.warn('Permission-denied reply not sent: no delivery adapter', { command });
+    return;
+  }
+  try {
+    await adapter.deliver(
+      address.channelType,
+      address.platformId,
+      address.threadId,
+      'chat',
+      JSON.stringify({ text: `Permission denied: ${command} requires admin access.` }),
+      undefined,
+      instance,
+    );
+    // eslint-disable-next-line no-catch-all/no-catch-all -- a failed reply must not fail inbound routing
+  } catch (err) {
+    log.error('Failed to deliver permission-denied reply', { command, err });
+  }
 }
 
 function isDuplicateInboundMessageIdViolation(error: unknown): boolean {

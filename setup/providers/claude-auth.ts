@@ -62,7 +62,7 @@ async function collectSubscriptionToken(output?: NodeJS.WriteStream): Promise<st
   try {
     const exitCode = await runInheritScript(
       '/bin/bash',
-      ['.claude/skills/add-onecli/scripts/register-claude-token.sh', '--output-file', outputFile],
+      ['.claude/skills/add-onecli/scripts/register-claude-token.sh', outputFile],
       { env: buildInteractiveEnvironment(), ...(output ? { output } : {}) },
     );
     if (exitCode !== 0) throw new Error("Couldn't complete the Claude sign-in");

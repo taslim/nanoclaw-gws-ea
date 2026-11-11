@@ -2048,10 +2048,9 @@ describe('recorded divergence: upstream sync 2026-10-19 re-applied these on upst
     );
   });
 
-  it('keeps a Chat attachment folder named by hash, reusing only the identical file a retry staged', async () => {
+  it('reuses only the identical file a retry staged in an attachment folder', async () => {
     const sessions = await read('src/session-manager.ts');
 
-    expect(sessions).toContain("AnchoredDir.open(sessionDir(agentGroupId, sessionId), ['inbox', inboxFolder], true)");
     expect(sessions).toContain('if (!holdsStagedOriginal(inbox, filename, bytes)) {');
   });
 

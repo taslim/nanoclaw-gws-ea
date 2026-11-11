@@ -11,6 +11,7 @@ import { findQuestionResponse, markCompleted } from '../db/messages-in.js';
 import { getDeliveryStatus, writeMessageOut } from '../db/messages-out.js';
 import { getSessionRouting, resolveDestinationThread } from '../db/session-routing.js';
 import { getCurrentReplyRoute } from '../db/session-state.js';
+import { cardProblems } from './card-parts.js';
 import { registerTools } from './server.js';
 import type { McpToolDefinition } from './types.js';
 
@@ -313,6 +314,8 @@ export const sendCard: McpToolDefinition = {
     const id = generateId();
     const r = routing();
     const { card: renderable, dropped } = partitionActions(card);
+    const problems = cardProblems(renderable);
+    if (problems.length > 0) return err(`Not sent. Fix these and send it again: ${problems.join('; ')}`);
 
     await writeMessageOut({
       id,

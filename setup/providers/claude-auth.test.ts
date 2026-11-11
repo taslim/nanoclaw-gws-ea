@@ -100,7 +100,7 @@ describe('shared Claude credential flow', () => {
     fixture.select.mockResolvedValue('subscription');
     const token = `sk-ant-oat${'a'.repeat(80)}AA`;
     fixture.runInheritScript.mockImplementation(async (_command, args: string[]) => {
-      await writeFile(args[2]!, token, { mode: 0o600 });
+      await writeFile(args[1]!, token, { mode: 0o600 });
       return 0;
     });
 
@@ -117,7 +117,7 @@ describe('shared Claude credential flow', () => {
     });
     expect(fixture.runInheritScript).toHaveBeenCalledWith(
       '/bin/bash',
-      ['.claude/skills/add-onecli/scripts/register-claude-token.sh', '--output-file', expect.any(String)],
+      ['.claude/skills/add-onecli/scripts/register-claude-token.sh', expect.any(String)],
       { env: { NANOCLAW_SETUP_WIZARD: '1', HOME: '/Users/operator' }, output: process.stderr },
     );
   });

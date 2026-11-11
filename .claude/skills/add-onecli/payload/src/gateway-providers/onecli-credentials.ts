@@ -243,10 +243,13 @@ export function createOneCliCredentialConnection(
  * The caller-described connection over one OneCLI secret. The seam hands
  * over a destination, a header scheme, and parsed values; a target's
  * placeholder is never matched, because OneCLI injects by host pattern.
+ * `stored` hears the id of each entry it saves or keeps, for a caller that
+ * records them.
  */
 export function createProviderCredentialConnection(
   target: GatewayCredentialTarget,
   management: OneCliManagement,
+  stored?: (id: string) => Promise<void>,
 ): GatewayRuntimeCredentialConnection {
   if (target.kind === 'oauth' && target.oauth.profile !== 'chatgpt') {
     throw new Error(
@@ -257,8 +260,8 @@ export function createProviderCredentialConnection(
     {
       name: target.name,
       // OneCLI's `openai` type is its native ChatGPT-subscription record: it
-      // injects the account header itself (the pinned OneCLI cannot refresh it;
-      // see encodeOneCliValue).
+      // injects the account header itself (unattended refresh through the
+      // pinned OneCLI is not yet verified; see encodeOneCliValue).
       type: target.kind === 'oauth' ? 'openai' : 'generic',
       hostPattern: target.host,
       ...(target.path ? { pathPattern: target.path } : {}),
@@ -283,10 +286,12 @@ export function createProviderCredentialConnection(
       const id = require();
       if (id === null) throw new Error(`No stored ${target.name} credential to keep; enter a value.`);
       await vault.keep(id);
+      await stored?.(id);
     },
     async save(value) {
       const id = require();
       observed = await vault.save(encodeOneCliValue(target, value), id);
+      await stored?.(observed);
     },
     async remove() {
       const id = require();
@@ -306,7 +311,7 @@ export function encodeOneCliValue(target: GatewayCredentialTarget, value: string
   if (typeof value === 'string' || value.profile !== target.oauth.profile) {
     throw new Error(`This connection stores the ${target.oauth.profile} OAuth profile.`);
   }
-  // NanoClaw's pinned OneCLI cannot refresh this record on its own; see
+  // Unattended refresh through the pinned OneCLI is not yet verified; see
   // .claude/skills/add-onecli/references/chatgpt-oauth-refresh.md for the manual procedure.
   return JSON.stringify({
     tokens: {

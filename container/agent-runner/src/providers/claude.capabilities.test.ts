@@ -293,10 +293,20 @@ describe('the pinned SDK offers only granted built-in tools', () => {
       await optionsFor(['files-read', 'time', 'request-status', 'gws-ea-email-external']),
     );
 
+    // DeferredToolPlaceholder is Claude Code's inert stand-in that keeps ToolSearch's deferred loading on.
     expect(offered.filter((tool) => !tool.startsWith('mcp__'))).toEqual(
-      ['Glob', 'Grep', 'Read', 'Skill', 'TaskCreate', 'TaskGet', 'TaskList', 'TaskUpdate', 'ToolSearch'].filter(
-        (tool) => offered.includes(tool),
-      ),
+      [
+        'DeferredToolPlaceholder',
+        'Glob',
+        'Grep',
+        'Read',
+        'Skill',
+        'TaskCreate',
+        'TaskGet',
+        'TaskList',
+        'TaskUpdate',
+        'ToolSearch',
+      ].filter((tool) => offered.includes(tool)),
     );
     for (const tool of ['Write', 'Edit', 'NotebookEdit', 'Bash', 'WebFetch', 'WebSearch', 'Agent', 'Task']) {
       expect(offered).not.toContain(tool);

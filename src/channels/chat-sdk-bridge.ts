@@ -13,7 +13,12 @@ import {
   CardText,
   Actions,
   Button,
+  Chart,
+  Divider,
+  Field,
+  Fields,
   LinkButton,
+  Table,
   type CardChild,
   type Adapter,
   type AdapterPostableMessage,
@@ -29,6 +34,7 @@ import {
 import { log } from '../log.js';
 import { SqliteStateAdapter } from '../state-sqlite.js';
 import { registerWebhookAdapter } from '../webhook-server.js';
+import { cardProblems, isCardPart, isRecord, type CardPart } from './card-parts.js';
 import {
   approveRejectRequest,
   CardTooLongError,
@@ -640,8 +646,8 @@ function textOutcome({ title, question, resolution }: TerminalApprovalCard): str
 /** A send_card payload, as both of its renderings read it. */
 interface DisplayCard {
   readonly title: string;
-  /** Its description, then each text child. */
-  readonly texts: readonly string[];
+  /** Its description, then each child in order: text, or a part cardProblems has checked. */
+  readonly children: ReadonlyArray<string | CardPart>;
   readonly links: ReadonlyArray<{ label: string; url: string; style?: 'primary' | 'danger' | 'default' }>;
 }
 
@@ -652,14 +658,16 @@ interface DisplayCard {
  * stand because any producer can write this payload.
  */
 function readDisplayCard(spec: Record<string, unknown>): DisplayCard {
-  const texts: string[] = [];
-  if (typeof spec.description === 'string' && spec.description) texts.push(spec.description);
+  const children: Array<string | CardPart> = [];
+  if (typeof spec.description === 'string' && spec.description) children.push(spec.description);
   if (Array.isArray(spec.children)) {
     for (const child of spec.children) {
-      if (typeof child === 'string' && child) {
-        texts.push(child);
+      if (isCardPart(child)) {
+        children.push(child);
+      } else if (typeof child === 'string' && child) {
+        children.push(child);
       } else if (child && typeof child === 'object' && typeof (child as Record<string, unknown>).text === 'string') {
-        texts.push((child as Record<string, string>).text);
+        children.push((child as Record<string, string>).text);
       }
     }
   }
@@ -681,10 +689,12 @@ function readDisplayCard(spec: Record<string, unknown>): DisplayCard {
           return { label: a.label as string, url: a.url as string, style: safeStyle };
         })
     : [];
-  return { title: (spec.title as string) || '', texts, links };
+  return { title: (spec.title as string) || '', children, links };
 }
 
-function textDisplayCard({ title, texts, links }: DisplayCard): string {
+/** Text children only: send_card offers no parts to the agents of a text-only channel (interactive.ts). */
+function textDisplayCard({ title, children, links }: DisplayCard): string {
+  const texts = children.filter((child): child is string => typeof child === 'string');
   const linkLines = links.map((link) => `[${link.label}](${link.url})`).join('\n');
   return [title ? `**${title}**` : '', ...texts, linkLines].filter(Boolean).join('\n\n');
 }
@@ -848,6 +858,54 @@ export function appendRawText(
   if (!extra) return;
   const text = typeof serialized.text === 'string' ? serialized.text : '';
   serialized.text = text ? `${text}\n\n${extra}` : extra;
+}
+
+/** A checked part as its Chat SDK element, rebuilt from the fields it may have and nothing else. */
+function buildCardPart(part: CardPart): CardChild {
+  const props = (isRecord(part.props) ? part.props : {}) as Record<string, any>; // eslint-disable-line @typescript-eslint/no-explicit-any
+  switch (part.type) {
+    case 'Text':
+      return props.style ? CardText(props.content, { style: props.style }) : CardText(props.content);
+    case 'Fields':
+      return Fields(
+        (part.children as Array<{ props: { label: string; value: string | number } }>).map((field) =>
+          Field({ label: field.props.label, value: String(field.props.value) }),
+        ),
+      );
+    case 'Table':
+      return Table({
+        headers: props.headers,
+        rows: (props.rows as Array<Array<string | number>>).map((row) => row.map(String)),
+        ...(props.align ? { align: props.align } : {}),
+        ...(props.caption ? { caption: props.caption } : {}),
+      });
+    case 'Chart': {
+      const chart = props.chart;
+      if (chart.type === 'pie') {
+        const segments = (chart.segments as Array<{ label: string; value: number }>).map(({ label, value }) => ({
+          label,
+          value,
+        }));
+        return Chart({ title: props.title, chart: { type: 'pie', segments } });
+      }
+      const categories = chart.categories as string[];
+      return Chart({
+        title: props.title,
+        chart: {
+          type: chart.type,
+          categories,
+          ...(chart.xLabel ? { xLabel: chart.xLabel } : {}),
+          ...(chart.yLabel ? { yLabel: chart.yLabel } : {}),
+          series: (chart.series as Array<{ name: string; values: number[] }>).map((series) => ({
+            name: series.name,
+            data: series.values.map((value, i) => ({ label: categories[i], value })),
+          })),
+        },
+      });
+    }
+    default:
+      return Divider();
+  }
 }
 
 export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter {
@@ -1528,8 +1586,12 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
       // URL actions render as link buttons, or as links when requests are text.
       if (content.type === 'card' && content.card && typeof content.card === 'object') {
         const cardSpec = content.card as Record<string, unknown>;
+        // Checked again here: anything in the container can write this row, not only send_card.
+        const problems = cardProblems(cardSpec);
+        if (problems.length > 0) throw new Error(`send_card card refused: ${problems.join('; ')}`);
+
         const display = readDisplayCard(cardSpec);
-        if (display.texts.length === 0 && display.links.length === 0 && !display.title) {
+        if (display.children.length === 0 && display.links.length === 0 && !display.title) {
           log.warn('send_card payload empty, skipping delivery');
           return;
         }
@@ -1540,7 +1602,9 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
 
         const fallbackText =
           (content.fallbackText as string) || (cardSpec.description as string) || display.title || '';
-        const cardChildren: CardChild[] = display.texts.map((child) => CardText(child));
+        const cardChildren: CardChild[] = display.children.map((child) =>
+          typeof child === 'string' ? CardText(child) : buildCardPart(child),
+        );
         if (display.links.length > 0) cardChildren.push(Actions(display.links.map((link) => LinkButton(link))));
         const card = Card({ title: display.title, children: cardChildren });
         const result = await adapter.postMessage(tid, { card, fallbackText });
@@ -1734,7 +1798,8 @@ async function handleForwardedEvent(
         const colonIdx = customId.indexOf(':', 4); // after "ncq:"
         if (colonIdx !== -1) {
           questionId = customId.slice(4, colonIdx);
-          tail = customId.slice(colonIdx + 1);
+          // @chat-adapter/discord encodes custom_id as '<actionId>\n<value>'; keep only the index.
+          tail = customId.slice(colonIdx + 1).split('\n')[0];
         }
       }
 

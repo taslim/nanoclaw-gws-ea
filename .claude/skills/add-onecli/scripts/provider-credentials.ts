@@ -2,9 +2,13 @@
  * Setup's side of OneCLI's credential connection. The implementation is the
  * skill's payload (`payload/src/gateway-providers/onecli-credentials.ts`),
  * imported in place so setup needs no install, and installed unchanged for
- * the host. This file only reads this installation's management settings.
+ * the host. This file reads this installation's management settings and
+ * records the provider credentials setup saves.
  */
+import path from 'node:path';
+
 import { readEnvFile } from '../../../../src/env.js';
+import { recordProviderCredentials } from '../payload/src/gateway-providers/onecli-provider-credentials.js';
 import type {
   GatewayCredentialConnection,
   GatewayCredentialTarget,
@@ -54,5 +58,8 @@ export function createProviderCredentialConnection(
   target: GatewayCredentialTarget,
   root = process.cwd(),
 ): GatewayCredentialConnection {
-  return connectTarget(target, management(root));
+  // Groups running this provider are granted the recorded ids; keeping records too, so a retried login repairs it.
+  return connectTarget(target, management(root), async (id) => {
+    if (target.provider) await recordProviderCredentials(path.join(root, 'data'), target.provider, [id]);
+  });
 }
