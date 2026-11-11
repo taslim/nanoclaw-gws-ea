@@ -50,6 +50,22 @@ describe('shared Claude credential flow', () => {
     );
   });
 
+  it('takes every Anthropic API key type the Console issues, and refuses what cannot call Claude', async () => {
+    fixture.select.mockResolvedValue('api');
+    fixture.password.mockResolvedValue('sk-ant-svc-test-value');
+    await collectClaudeCredential({ allowSkip: false });
+    const { validate } = fixture.password.mock.calls[0]![0] as { validate: (value: string) => string | undefined };
+
+    expect(['sk-ant-api03-x', 'sk-ant-usr01-x', 'sk-ant-svc01-x'].map(validate)).toEqual([
+      undefined,
+      undefined,
+      undefined,
+    ]);
+    expect(validate('sk-ant-admin01-x')).toMatch(/Admin API keys cannot call Claude/);
+    expect(validate('sk-ant-ort01-x')).toMatch(/refresh tokens cannot call Claude/);
+    expect(validate('sk-ant-oat01-short')).toMatch(/truncated/);
+  });
+
   it('routes managed credential prompts beside stdout results while retaining setup defaults', async () => {
     fixture.select.mockResolvedValue('api');
     fixture.password.mockResolvedValue('sk-ant-api-explicit');

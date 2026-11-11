@@ -4,6 +4,12 @@ import path from 'node:path';
 
 import * as p from '@clack/prompts';
 
+import {
+  anthropicCredentialError,
+  anthropicCredentialPrompt,
+  isAnthropicOAuthToken,
+  pastedCredential,
+} from '../lib/anthropic-credential.js';
 import { buildInteractiveEnvironment, runInheritScript } from '../lib/inherit-script.js';
 import { brightSelect } from '../lib/bright-select.js';
 import type {
@@ -85,17 +91,15 @@ async function collectSubscriptionToken(output?: NodeJS.WriteStream): Promise<st
 }
 
 async function collectPastedToken(method: 'oauth' | 'api', output?: NodeJS.WriteStream): Promise<string> {
-  const label = method === 'oauth' ? 'OAuth token' : 'API key';
-  const prefix = method === 'oauth' ? 'sk-ant-oat' : 'sk-ant-api';
   const answer = await p.password({
-    message: `Paste your ${label}`,
+    message: anthropicCredentialPrompt(method),
     clearOnError: true,
     output,
     validate: (value) => {
-      const cleaned = (value ?? '').replace(/\s+/gu, '');
-      if (!cleaned) return 'Required';
-      if (!cleaned.startsWith(prefix)) return `Should start with ${prefix}…`;
-      if (method === 'oauth' && !/^sk-ant-oat[A-Za-z0-9_-]{80,500}AA$/u.test(cleaned)) {
+      const error = anthropicCredentialError(method, value);
+      if (error) return error;
+      const cleaned = pastedCredential(value);
+      if (isAnthropicOAuthToken(cleaned) && !/^sk-ant-oat[A-Za-z0-9_-]{80,500}AA$/u.test(cleaned)) {
         return cleaned.length < 90
           ? 'Token looks truncated — widen your terminal so it fits on one line, then paste again.'
           : "Token shape doesn't look right (expected sk-ant-oat…AA).";
@@ -104,7 +108,7 @@ async function collectPastedToken(method: 'oauth' | 'api', output?: NodeJS.Write
     },
   });
   if (p.isCancel(answer) || typeof answer !== 'string') return cancelled(answer);
-  return answer.replace(/\s+/gu, '');
+  return pastedCredential(answer);
 }
 
 export async function collectClaudeCredential(options: {
