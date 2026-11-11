@@ -2451,4 +2451,23 @@ describe('recorded divergence: upstream sync 2026-11-10 re-applied these on upst
       'if (wake && !held)\n        await replyPermissionDenied(deniedCommand, deliveryAddr, replyInstance, userId, agent.agent_group_id);',
     );
   });
+
+  it("installs the host's packages before the container tests, whose browser tool checks load them", async () => {
+    type RunDefaults = { defaults?: { run?: { 'working-directory'?: string } } };
+    const { parse } = await import('yaml');
+    const workflow = parse(await read('.github/workflows/ci.yml')) as RunDefaults & {
+      jobs: Record<string, RunDefaults & { steps: Array<{ run?: string; 'working-directory'?: string }> }>;
+    };
+    const job = workflow.jobs['container-test'];
+    const install = job.steps.findIndex((step) => step.run === 'pnpm install --frozen-lockfile');
+
+    expect(install).toBeGreaterThan(-1);
+    expect(install).toBeLessThan(job.steps.findIndex((step) => step.run === 'bun run test'));
+    // Job or workflow defaults that a sync merges in cleanly would move the install off the root lockfile.
+    expect(
+      job.steps[install]['working-directory'] ??
+        job.defaults?.run?.['working-directory'] ??
+        workflow.defaults?.run?.['working-directory'],
+    ).toBeUndefined();
+  });
 });
