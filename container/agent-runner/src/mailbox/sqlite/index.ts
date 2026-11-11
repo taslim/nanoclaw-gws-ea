@@ -93,7 +93,6 @@ function parseInboundMessage(row: MessageInRow): InboundMessage | undefined {
 
 export class SqliteAgentMailbox implements AgentMailbox {
   readonly operations: MailboxOperations = this;
-  private agentGroupId: string | null = null;
 
   shouldRestartAfter(error: unknown): boolean {
     const message = error instanceof Error ? error.message : String(error);
@@ -104,16 +103,13 @@ export class SqliteAgentMailbox implements AgentMailbox {
     );
   }
 
-  async start(key: MailboxSessionKey | null): Promise<void> {
-    this.agentGroupId = key?.agentGroupId ?? null;
-  }
+  async start(_key: MailboxSessionKey | null): Promise<void> {}
 
   async run<T>(action: () => T | Promise<T>): Promise<T> {
     return action();
   }
 
   async stop(): Promise<void> {
-    this.agentGroupId = null;
     closeSessionDb();
   }
 
@@ -155,7 +151,7 @@ export class SqliteAgentMailbox implements AgentMailbox {
   }
 
   getMessageIdBySeq(sequence: number): string | null {
-    return sqliteGetMessageIdBySeq(sequence, this.agentGroupId);
+    return sqliteGetMessageIdBySeq(sequence);
   }
 
   getRoutingBySeq(sequence: number) {
