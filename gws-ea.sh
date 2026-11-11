@@ -48,7 +48,9 @@ if NANOCLAW_BOOTSTRAP_LOG="$LOG" NANOCLAW_NO_DIAGNOSTICS=1 bash setup.sh >>"$LOG
   printf '%s\n' 'done'
 else
   printf '%s\n' 'failed'
-  printf '%s\n' "$(grep -m 1 '^STATUS:' "$LOG" || printf 'STATUS: unknown')" "See $LOG" >&2
+  # setup.sh's own BOOTSTRAP block: install-node.sh, when it ran, wrote its STATUS lines into the same log first.
+  STATUS="$(awk '/^=== NANOCLAW SETUP: BOOTSTRAP ===/{b=1} b && /^STATUS:/ {print; exit}' "$LOG")"
+  printf '%s\n' "${STATUS:-STATUS: unknown}" "See $LOG" >&2
   exit 1
 fi
 

@@ -88,7 +88,12 @@ describe('GWS-EA machine setup', () => {
       path.join(directory, 'setup.sh'),
       [
         'printf "diagnostics=%s" "$NANOCLAW_NO_DIAGNOSTICS" > "$HOME/bootstrap-ran"',
-        'if [ -n "${BOOTSTRAP_FAILS:-}" ]; then echo "STATUS: deps_failed"; exit 1; fi',
+        // As NanoClaw's: install-node.sh's own STATUS line, then setup.sh's block.
+        'if [ -n "${BOOTSTRAP_FAILS:-}" ]; then',
+        '  echo "STATUS: success"',
+        '  printf "=== NANOCLAW SETUP: BOOTSTRAP ===\\nSTATUS: deps_failed\\n=== END ===\\n"',
+        '  exit 1',
+        'fi',
         'echo "STATUS: success"',
       ].join('\n'),
     );
@@ -138,10 +143,9 @@ describe('GWS-EA machine setup', () => {
     const directory = await checkout(root, 'checkout');
     const link = path.join(home, '.local', 'bin', 'gws-ea');
 
-    await expect(setUp(directory, home, { BOOTSTRAP_FAILS: '1' })).rejects.toMatchObject({
-      code: 1,
-      stderr: expect.stringContaining('STATUS: deps_failed'),
-    });
+    const failed = setUp(directory, home, { BOOTSTRAP_FAILS: '1' });
+    await expect(failed).rejects.toMatchObject({ code: 1, stderr: expect.stringContaining('STATUS: deps_failed') });
+    await expect(failed).rejects.toMatchObject({ stderr: expect.not.stringContaining('STATUS: success') });
     await expect(readlink(link)).rejects.toMatchObject({ code: 'ENOENT' });
 
     await mkdir(path.dirname(link), { recursive: true });
