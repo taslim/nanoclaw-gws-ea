@@ -2399,3 +2399,46 @@ describe('recorded divergence: the PreCompact hook composes the mailbox it reads
     expect(compaction).toContain('await mailbox.stop();');
   });
 });
+
+describe('recorded divergence: upstream sync 2026-11-10 re-applied these on upstream code', () => {
+  const read = (file: string) => readFile(path.join(originalCwd, file), 'utf8');
+
+  it('keeps the language rule out of the runtime contract every agent receives', async () => {
+    expect(await read('container/CLAUDE.md')).not.toMatch(/reply in the language/iu);
+  });
+
+  it('frames each re-routed A2A copy, and completes the source only after a route lands', async () => {
+    const route = await read('src/modules/agent-to-agent/agent-route.ts');
+    const loop = route.indexOf('for (let attempt = 1; attempt <= 2; attempt++) {');
+
+    expect(loop).toBeGreaterThan(-1);
+    expect(route.indexOf('inboundFraming(forwardedContent,', loop)).toBeGreaterThan(loop);
+    expect(route.indexOf('inboundFraming(forwardedContent,', loop)).toBeLessThan(
+      route.indexOf('await writeSessionMessage(targetAgentGroupId, targetSession.id, {', loop),
+    );
+    expect(route.indexOf('mailbox.markDelivered(msg.id, a2aMsgId)')).toBeGreaterThan(
+      route.indexOf("await requestWake(fresh, 'inbound-message');"),
+    );
+  });
+
+  it("clears a deleted chat's dropped-message rows on its own adapter instance only", async () => {
+    expect(await read('src/cli/resources/messaging-groups.ts')).toContain(
+      'OR (channel_type = ? AND platform_id = ? AND instance = ?',
+    );
+  });
+
+  it('gates a command before any session exists, and answers a denial only when it was addressed to the agent', async () => {
+    const router = await read('src/router.ts');
+
+    expect(router.indexOf('const gate = await gateCommand(')).toBeGreaterThan(-1);
+    expect(router.indexOf('const gate = await gateCommand(')).toBeLessThan(
+      router.indexOf('({ session, created } = await resolveSession('),
+    );
+    expect(router).toContain(
+      "if (delivery === 'wake')\n        await replyPermissionDenied(deniedCommand, deliveryAddr, replyInstance, userId, agent.agent_group_id);",
+    );
+    expect(router).toContain(
+      'if (wake && !held)\n        await replyPermissionDenied(deniedCommand, deliveryAddr, replyInstance, userId, agent.agent_group_id);',
+    );
+  });
+});
