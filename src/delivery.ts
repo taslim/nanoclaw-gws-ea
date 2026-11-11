@@ -68,6 +68,8 @@ const TICK_DRAIN_WAIT_MS = 5_000;
  * retry and timeout bounds channel SDKs already have; any send still pending then is given up on.
  */
 const OVERDUE_GIVE_UP_MS = 60 * 60_000;
+/** How soon a given-up row whose failure could not be recorded tries the record again; it stays parked meanwhile. */
+const GIVEN_UP_RECORD_RETRY_MS = 60_000;
 /**
  * Parked sends one session may have at once; past it the session sends nothing new. A given-up send frees its
  * slot while it may still be out, so this bounds new sends per give-up window, not sends outstanding.
@@ -717,17 +719,17 @@ async function settleFailedSend(
 }
 
 /**
- * Tell the delivery-failed hooks, then record the rows failed. The report
- * comes before the record: a stop between them leaves the rows pending with
- * their attempts spent, and the next pass reports them again instead of
- * losing the report. Never throws.
+ * Tell the delivery-failed hooks, then record the rows failed; returns the
+ * ids recorded. The report comes before the record: a stop between them
+ * leaves the rows pending with their attempts spent, and the next pass
+ * reports them again instead of losing the report. Never throws.
  */
 async function reportGivenUp(
   rows: readonly OutboundMessage[],
   session: Session,
   agentGroup: AgentGroup,
-): Promise<void> {
-  if (rows.length === 0) return;
+): Promise<Set<string>> {
+  if (rows.length === 0) return new Set();
   for (const hook of deliveryFailedHooks) {
     /* eslint-disable no-catch-all/no-catch-all -- a failing hook must never affect the recorded failure or other hooks */
     try {
@@ -737,10 +739,21 @@ async function reportGivenUp(
     }
     /* eslint-enable no-catch-all/no-catch-all */
   }
+  return recordGivenUp(rows, session, agentGroup);
+}
+
+/** Record given-up rows failed; returns the ids recorded. Never throws. */
+async function recordGivenUp(
+  rows: readonly OutboundMessage[],
+  session: Session,
+  agentGroup: AgentGroup,
+): Promise<Set<string>> {
+  const recorded = new Set<string>();
   for (const msg of rows) {
     try {
       await withExistingMailboxSession(agentGroup.id, session.id, (mailbox) => mailbox.markDeliveryFailed(msg.id));
       await clearAttemptRow(msg.id);
+      recorded.add(msg.id);
     } catch (markErr) {
       log.error('Failed to record permanent delivery failure', {
         messageId: msg.id,
@@ -749,6 +762,23 @@ async function reportGivenUp(
       });
     }
   }
+  return recorded;
+}
+
+/**
+ * Release a parked row given up on once its failure is recorded. Until then it
+ * stays parked with its claim, because no attempt marks it spent: unparked, the
+ * next drain would send it again while its first send may still land.
+ */
+function releaseGivenUp(msg: OutboundMessage, session: Session, agentGroup: AgentGroup, recorded: Set<string>): void {
+  if (recorded.has(msg.id)) {
+    finishChannelDelivery(session.id, msg.id);
+    unparkDelivery(session.id, msg.id);
+    return;
+  }
+  setTimeout(() => {
+    void recordGivenUp([msg], session, agentGroup).then((again) => releaseGivenUp(msg, session, agentGroup, again));
+  }, GIVEN_UP_RECORD_RETRY_MS).unref();
 }
 
 /**
@@ -822,8 +852,8 @@ function parkOverdueDelivery(
   else log.warn('Message delivery passed its deadline, parked until the send settles', context);
 
   // The give-up is reported as a row whose attempts are spent, so whoever was
-  // waiting for the message hears it did not go out. Its channel claim goes
-  // too, so a conversation cleanup waiting on it resumes.
+  // waiting for the message hears it did not go out. Once it is recorded its
+  // channel claim goes too, so a conversation cleanup waiting on it resumes.
   let gaveUp = false;
   const giveUp = setTimeout(() => {
     gaveUp = true;
@@ -832,14 +862,13 @@ function parkOverdueDelivery(
       sessionId: session.id,
       giveUpMs: OVERDUE_GIVE_UP_MS,
     });
-    void reportGivenUp([msg], session, agentGroup).finally(() => {
-      finishChannelDelivery(session.id, msg.id);
-      unparkDelivery(session.id, msg.id);
-    });
+    void reportGivenUp([msg], session, agentGroup).then((recorded) =>
+      releaseGivenUp(msg, session, agentGroup, recorded),
+    );
   }, OVERDUE_GIVE_UP_MS);
   giveUp.unref();
 
-  // After the give-up the row is recorded and unparked there, so a settle changes nothing.
+  // After the give-up the row is recorded and released there, so a settle changes nothing.
   void send
     .finally(() => clearTimeout(giveUp))
     .then(async (platformMsgId) => {

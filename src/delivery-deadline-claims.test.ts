@@ -25,9 +25,27 @@ vi.mock('./config.js', async () => {
   };
 });
 
+/** How many coming failure records fail, as a session DB that cannot be written does. */
+const failingRecords = vi.hoisted(() => ({ remaining: 0 }));
+
+vi.mock('./mailbox/sqlite/session-db.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./mailbox/sqlite/session-db.js')>();
+  return {
+    ...actual,
+    markDeliveryFailed: (...args: Parameters<typeof actual.markDeliveryFailed>) => {
+      if (failingRecords.remaining > 0) {
+        failingRecords.remaining -= 1;
+        throw new Error('disk I/O error');
+      }
+      return actual.markDeliveryFailed(...args);
+    },
+  };
+});
+
 const TEST_DIR = '/tmp/nanoclaw-test-delivery-deadline-claims';
 const DEADLINE_MS = 60_000; // DELIVERY_DEADLINE_MS in delivery.ts
 const GIVE_UP_MS = 60 * 60_000; // OVERDUE_GIVE_UP_MS in delivery.ts
+const RECORD_RETRY_MS = 60_000; // GIVEN_UP_RECORD_RETRY_MS in delivery.ts
 const STOP_WAIT_MS = 10_000; // STOP_WAIT_MS in delivery.ts
 
 import { closeDb, createAgentGroup, createMessagingGroup, initTestDb, runMigrations } from './db/index.js';
@@ -138,6 +156,7 @@ beforeEach(async () => {
   });
   ({ session } = await resolveSession('ag-1', 'mg-1', null, 'shared'));
   reports = [];
+  failingRecords.remaining = 0;
   vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
   vi.spyOn(log, 'warn').mockImplementation(() => {});
   vi.spyOn(log, 'error').mockImplementation(() => {});
@@ -184,6 +203,28 @@ describe('parked sends and conversation cleanup', () => {
     await vi.waitFor(() => expect(deliveredStatus(session, 'out-wedged')).toBe('failed'));
     expect(reports).toEqual([{ id: 'out-wedged', recordedAtReport: undefined }]);
     expect(await cleanupWait(session)).toBe('settled');
+  });
+
+  it('a given-up row whose failure cannot be recorded stays parked, never sent again, until the record holds', async () => {
+    insertOutbound(session, 'out-stuck');
+    const calls = recordingAdapter((text) => (text === 'out-stuck' ? new Promise<string>(() => {}) : undefined));
+
+    await parkNextSend(session);
+    failingRecords.remaining = 1;
+    await vi.advanceTimersByTimeAsync(GIVE_UP_MS);
+    await vi.waitFor(() => expect(reports).toEqual([{ id: 'out-stuck', recordedAtReport: undefined }]));
+    expect(deliveredStatus(session, 'out-stuck')).toBeUndefined();
+
+    await deliverSessionMessages(session);
+    expect(calls).toEqual(['out-stuck']);
+    expect(await cleanupWait(session)).toBe('pending');
+
+    await vi.advanceTimersByTimeAsync(RECORD_RETRY_MS);
+    await vi.waitFor(() => expect(deliveredStatus(session, 'out-stuck')).toBe('failed'));
+    expect(reports).toHaveLength(1);
+    expect(await cleanupWait(session)).toBe('settled');
+    await deliverSessionMessages(session);
+    expect(calls).toEqual(['out-stuck']);
   });
 
   it('a parked send that fails its last attempt late is reported, then recorded failed', async () => {

@@ -2421,6 +2421,16 @@ describe('recorded divergence: upstream sync 2026-11-10 re-applied these on upst
     );
   });
 
+  it("strips the router's agent-group suffix from an edit target on the host, as the container no longer does", async () => {
+    const { withPlatformMessageId } = await import('../delivery.js');
+    const edit = { operation: 'edit', messageId: 'spaces/AAAA/messages/BBBB.BBBB:ag-main', text: 'Moved to 3pm.' };
+
+    expect(JSON.parse(withPlatformMessageId(edit, JSON.stringify(edit), 'ag-main'))).toEqual({
+      ...edit,
+      messageId: 'spaces/AAAA/messages/BBBB.BBBB',
+    });
+  });
+
   it("clears a deleted chat's dropped-message rows on its own adapter instance only", async () => {
     expect(await read('src/cli/resources/messaging-groups.ts')).toContain(
       'OR (channel_type = ? AND platform_id = ? AND instance = ?',
