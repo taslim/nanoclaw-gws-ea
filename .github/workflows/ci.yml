@@ -94,9 +94,16 @@ jobs:
     runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          cache: pnpm
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
           bun-version: 1.4.4
+      # GWS-EA's browser tool tests check their guidance with the host's runner-tools helper, which loads root packages.
+      - run: pnpm install --frozen-lockfile
       - name: Install agent-runner deps (Bun)
         working-directory: container/agent-runner
         run: bun install --frozen-lockfile

@@ -2451,4 +2451,15 @@ describe('recorded divergence: upstream sync 2026-11-10 re-applied these on upst
       'if (wake && !held)\n        await replyPermissionDenied(deniedCommand, deliveryAddr, replyInstance, userId, agent.agent_group_id);',
     );
   });
+
+  it("installs the host's packages before the container tests, whose browser tool checks load them", async () => {
+    const { parse } = await import('yaml');
+    const workflow = parse(await read('.github/workflows/ci.yml')) as {
+      jobs: Record<string, { steps: Array<{ run?: string }> }>;
+    };
+    const runs = workflow.jobs['container-test'].steps.map((step) => step.run);
+
+    expect(runs.indexOf('pnpm install --frozen-lockfile')).toBeGreaterThan(-1);
+    expect(runs.indexOf('pnpm install --frozen-lockfile')).toBeLessThan(runs.indexOf('bun run test'));
+  });
 });
