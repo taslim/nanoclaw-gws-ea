@@ -1,0 +1,808 @@
+import { randomUUID } from 'node:crypto';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { createServer, request as httpRequest, type IncomingHttpHeaders, type Server } from 'node:http';
+import os from 'node:os';
+import path from 'node:path';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+
+import { closeDb, createAgentGroup, getDb, initTestDb, runMigrations } from '../../db/index.js';
+import { ensureContainerConfig, getContainerConfig, updateContainerConfigJson } from '../../db/container-configs.js';
+import type { GatewayCredentialTarget } from '../../gateway-providers/credential-connection.js';
+import { log } from '../../log.js';
+import '../gws-ea-profile/index.js';
+import type { AdmissionDependencies } from './admit.js';
+import { applyMainServers, mainOperatorServers } from './apply.js';
+import { connectionsLinkFacts, connectionsStatus } from './connections-mount.js';
+import { AppCredentialsUnavailableError, type AppConnection } from './credentials.js';
+import { ConnectionOperations, type ConnectionsListing } from './operations.js';
+import { createConnectionsPageHandler } from './page.js';
+import type { ConnectionApp, ConnectionsStore } from './store.js';
+import { FakeMcpApp, startFakeEndpoints, type FakeEndpoints, type FakeHandler } from './testing/oauth-server.js';
+import { testConnectionsStore, type TestKeychain } from './testing/store.js';
+
+const HOST = 'juno.example.test';
+const PRINCIPAL = 'morgan@example.test';
+const READER = 'remy@example.test';
+const MAIN = 'ag-main';
+const HOMEBOARD = 'https://homeboard.nownow.ai/mcp';
+const HOMEBOARD_REDIRECT = `https://${HOST}/connections/callback/homeboard.nownow.ai`;
+const LEDGER = 'https://mcp.ledger.example.test/mcp';
+const NOTES = 'https://notes.example.test/mcp';
+const RECIPES = 'https://recipes.example.test/mcp';
+const CLIENT_ID = 'juno-homeboard-client';
+const SENTINEL_SECRET = 'sentinel-client-secret-V7k2';
+const SENTINEL_TOKEN = 'sentinel-pasted-token-R4m9';
+const SENTINEL_QUERY = 'sentinel-url-key-T3c8';
+const postHeaders = { 'sec-fetch-site': 'same-origin', 'content-type': 'application/json' };
+
+interface Reply {
+  readonly status: number;
+  readonly headers: IncomingHttpHeaders;
+  readonly body: string;
+}
+
+interface HeldCredential {
+  readonly id: string;
+  readonly host: string;
+  readonly path: string | undefined;
+  readonly value: string;
+}
+
+/** The gateway seam as the host sees it: credentials by name, listed by exact host. */
+class FakeGateway {
+  readonly held = new Map<string, HeldCredential>();
+  readonly events: string[] = [];
+  failRemoval = false;
+  readonly connection: AppConnection = (target: GatewayCredentialTarget) => {
+    let observed: HeldCredential | undefined;
+    return {
+      find: async () => {
+        observed = this.held.get(target.name);
+        return observed ? { reusable: true } : null;
+      },
+      save: async (value) => {
+        if (typeof value !== 'string') throw new Error('App credentials are plain tokens');
+        this.held.set(target.name, { id: observed?.id ?? randomUUID(), host: target.host, path: target.path, value });
+        this.events.push(`publish:${target.name}`);
+      },
+      keep: async () => undefined,
+      remove: async () => {
+        if (this.failRemoval) throw new Error('gateway unreachable');
+        if (observed) this.held.delete(target.name);
+        this.events.push(`remove:${target.name}`);
+      },
+    };
+  };
+  async listForHost(host: string): Promise<{ id: string; name: string }[]> {
+    return [...this.held].filter(([, held]) => held.host === host).map(([name, held]) => ({ id: held.id, name }));
+  }
+}
+
+let endpoints: FakeEndpoints;
+let directory: string;
+let store: ConnectionsStore;
+let keychain: TestKeychain;
+let raw: ReturnType<typeof testConnectionsStore>['raw'];
+let gateway: FakeGateway;
+let gatewaySeam: boolean;
+let server: Server;
+let port: number;
+let replies: Reply[];
+let logged: string[];
+
+beforeAll(async () => {
+  endpoints = await startFakeEndpoints([
+    'homeboard.nownow.ai',
+    'mcp.ledger.example.test',
+    'auth.example.test',
+    'notes.example.test',
+    'recipes.example.test',
+    'down.example.test',
+  ]);
+});
+afterAll(async () => {
+  await endpoints.close();
+});
+
+function operations(): ConnectionOperations {
+  const admission: AdmissionDependencies = {
+    appByHost: (host) => store.byHost(host),
+    operatorServers: mainOperatorServers,
+    gatewayCredentials: (host) => gateway.listForHost(host),
+    protectedHosts: async () => new Set([HOST, 'api.anthropic.com']),
+  };
+  return new ConnectionOperations({
+    store,
+    webHostname: HOST,
+    fetches: endpoints.fetches,
+    admission,
+    connection: () => {
+      if (!gatewaySeam) throw new AppCredentialsUnavailableError();
+      return gateway.connection;
+    },
+    applyMain: async (applied) => {
+      const changed = await applyMainServers(applied);
+      gateway.events.push('apply');
+      return changed;
+    },
+  });
+}
+
+beforeEach(async () => {
+  endpoints.reset();
+  directory = await mkdtemp(path.join(os.tmpdir(), 'connections-page-'));
+  ({ store, keychain, raw } = testConnectionsStore(path.join(directory, 'connections')));
+  gateway = new FakeGateway();
+  gatewaySeam = true;
+  replies = [];
+  logged = [];
+  for (const level of ['debug', 'info', 'warn', 'error'] as const)
+    vi.spyOn(log, level).mockImplementation((...args: unknown[]) => {
+      logged.push(JSON.stringify(args));
+    });
+  await runMigrations(await initTestDb());
+  await createAgentGroup({
+    id: MAIN,
+    name: 'Main',
+    folder: 'main',
+    agent_provider: null,
+    created_at: '2026-11-14T00:00:00.000Z',
+  });
+  await ensureContainerConfig(MAIN);
+  await getDb().run(
+    "UPDATE gws_ea_profile SET assistant_first_name = 'Juno', principal_first_name = 'Morgan', main_agent_group_id = ? WHERE singleton = 1",
+    MAIN,
+  );
+  await getDb().run(
+    'INSERT INTO gws_ea_principal_addresses(email, added_at) VALUES (?, ?)',
+    PRINCIPAL,
+    new Date().toISOString(),
+  );
+  const handler = createConnectionsPageHandler({
+    hostname: HOST,
+    identity: async (incoming) => {
+      const identity = incoming.headers['cf-access-jwt-assertion'];
+      return typeof identity === 'string' && identity ? identity : undefined;
+    },
+    operations: async () => operations(),
+  });
+  server = createServer(handler);
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address();
+  if (!address || typeof address === 'string') throw new Error('No test server port');
+  port = address.port;
+});
+afterEach(async () => {
+  server.closeAllConnections();
+  await new Promise<void>((resolve) => server.close(() => resolve()));
+  await closeDb();
+  await rm(directory, { recursive: true, force: true });
+  vi.restoreAllMocks();
+});
+
+function request(
+  route: string,
+  method = 'GET',
+  headers: Readonly<Record<string, string>> = {},
+  body?: string,
+): Promise<Reply> {
+  return new Promise((resolve, reject) => {
+    const outgoing = httpRequest(
+      {
+        hostname: '127.0.0.1',
+        port,
+        method,
+        path: route,
+        headers: { host: HOST, 'cf-access-jwt-assertion': PRINCIPAL, ...headers },
+      },
+      (incoming) => {
+        let text = '';
+        incoming.on('data', (chunk: Buffer) => {
+          text += chunk.toString();
+        });
+        incoming.on('end', () => {
+          const reply = { status: incoming.statusCode ?? 0, headers: incoming.headers, body: text };
+          replies.push(reply);
+          resolve(reply);
+        });
+      },
+    );
+    outgoing.on('error', reject);
+    outgoing.end(body);
+  });
+}
+
+const post = (route: string, data: unknown, headers: Readonly<Record<string, string>> = {}): Promise<Reply> =>
+  request(route, 'POST', { ...postHeaders, ...headers }, JSON.stringify(data));
+
+function serve(...handlers: FakeHandler[]): void {
+  for (const handler of handlers) endpoints.use(handler);
+}
+
+function homeBoard(): FakeMcpApp {
+  return new FakeMcpApp({
+    appUrl: HOMEBOARD,
+    issuer: 'https://homeboard.nownow.ai',
+    client: { id: CLIENT_ID, secret: SENTINEL_SECRET, redirectUri: HOMEBOARD_REDIRECT },
+  });
+}
+
+/** Takes a pasted token and nothing else, publishing no sign-in metadata. */
+const notesServer: FakeHandler = (incoming) => {
+  if (incoming.host !== 'notes.example.test' || incoming.method !== 'POST') return undefined;
+  if (incoming.headers.authorization !== `Bearer ${SENTINEL_TOKEN}`)
+    return { status: 401, body: { error: 'unauthorized' } };
+  return { status: 200, body: { jsonrpc: '2.0', id: 1, result: { serverInfo: { name: 'Notes', version: '1' } } } };
+};
+
+/** Answers without sign-in and advertises its name. */
+const recipesServer: FakeHandler = (incoming) =>
+  incoming.host === 'recipes.example.test' && incoming.method === 'POST'
+    ? { status: 200, body: { jsonrpc: '2.0', id: 1, result: { serverInfo: { name: 'Recipes', version: '1' } } } }
+    : undefined;
+
+async function mainServers(): Promise<Record<string, unknown>> {
+  const row = await getContainerConfig(MAIN);
+  if (!row) throw new Error('Main has no container config');
+  return JSON.parse(row.mcp_servers) as Record<string, unknown>;
+}
+
+async function onlyApp(): Promise<ConnectionApp> {
+  const apps = await store.apps();
+  expect(apps).toHaveLength(1);
+  return apps[0];
+}
+
+function signInRow(appId: string): { claimed_at: string | null } | undefined {
+  return raw(
+    (db) =>
+      db.prepare('SELECT claimed_at FROM sign_ins WHERE app_id = ?').get(appId) as
+        | { claimed_at: string | null }
+        | undefined,
+  );
+}
+
+async function startSignIn(app: ConnectionApp, client?: Record<string, string>): Promise<string> {
+  const reply = await post('/connections/sign-in', { id: app.id, version: String(app.version), ...client });
+  expect(reply.status).toBe(200);
+  const { authorizationUrl } = JSON.parse(reply.body) as { authorizationUrl: string };
+  return authorizationUrl;
+}
+
+function callback(host: string, query: URLSearchParams, identity = PRINCIPAL): Promise<Reply> {
+  return request(`/connections/callback/${host}?${query.toString()}`, 'GET', { 'cf-access-jwt-assertion': identity });
+}
+
+/** HomeBoard added from the page and signed in, as F1 runs it. */
+async function connectedHomeBoard(app = homeBoard()): Promise<ConnectionApp> {
+  serve(app.handle);
+  expect((await post('/connections/add', { url: HOMEBOARD, name: '' })).status).toBe(200);
+  const url = await startSignIn(await onlyApp(), { clientId: CLIENT_ID, clientSecret: SENTINEL_SECRET });
+  const reply = await callback('homeboard.nownow.ai', app.approve(url).query);
+  expect(reply.headers.location).toBe('/connections?outcome=connected');
+  return onlyApp();
+}
+
+function assertNoSentinels(): void {
+  for (const sentinel of [SENTINEL_SECRET, SENTINEL_TOKEN, SENTINEL_QUERY]) {
+    for (const reply of replies) {
+      expect(reply.body).not.toContain(sentinel);
+      expect(JSON.stringify(reply.headers)).not.toContain(sentinel);
+    }
+    for (const line of logged) expect(line).not.toContain(sentinel);
+  }
+}
+
+describe('adding and connecting an OAuth app that needs a client', () => {
+  it('runs F1 end to end: client fields, sign-in, Connected, credential published before main’s entry', async () => {
+    const app = homeBoard();
+    serve(app.handle);
+
+    const added = await post('/connections/add', { url: HOMEBOARD, name: '' });
+    expect(added.status).toBe(200);
+    expect(added.headers['x-page-saved']).toBe('true');
+    const stored = await onlyApp();
+    expect(stored).toMatchObject({ status: 'not_connected', auth: 'oauth', hasClient: false });
+    expect(added.headers['x-page-location']).toBe(`/connections/app/${stored.id}/connect`);
+    for (const body of [added.body, (await request(`/connections/app/${stored.id}/connect`)).body]) {
+      expect(body).toContain(HOMEBOARD_REDIRECT);
+      expect(body).toContain('name="clientId"');
+      expect(body).toContain('name="clientSecret"');
+      expect(body).toContain('Your operator hasn’t reviewed homeboard.nownow.ai');
+      expect(body).toContain('data-copy-from="redirect-uri"');
+    }
+
+    const authorizationUrl = new URL(await startSignIn(stored, { clientId: CLIENT_ID, clientSecret: SENTINEL_SECRET }));
+    expect(authorizationUrl.searchParams.get('code_challenge_method')).toBe('S256');
+    expect(authorizationUrl.searchParams.get('resource')).toBe(HOMEBOARD);
+    expect(authorizationUrl.searchParams.get('redirect_uri')).toBe(HOMEBOARD_REDIRECT);
+    expect(authorizationUrl.searchParams.get('state')?.length).toBeGreaterThanOrEqual(22);
+
+    const returned = await callback('homeboard.nownow.ai', app.approve(authorizationUrl.href).query);
+    expect(returned.status).toBe(302);
+    expect(returned.headers.location).toBe('/connections?outcome=connected');
+
+    const connected = await onlyApp();
+    expect(connected.status).toBe('connected');
+    const credential = gateway.held.get(`gws-ea-app-${connected.id}`);
+    expect(credential).toMatchObject({ host: 'homeboard.nownow.ai', path: '/mcp' });
+    expect(app.accessTokens.has(credential?.value ?? '')).toBe(true);
+    expect(gateway.events).toEqual([`publish:gws-ea-app-${connected.id}`, 'apply']);
+    expect(await mainServers()).toEqual({ [connected.serverKey]: { type: 'http', url: HOMEBOARD } });
+    expect(await store.pendingRestart()).toBeDefined();
+    expect(signInRow(connected.id)).toBeUndefined();
+
+    const list = await request('/connections?outcome=connected');
+    expect(list.body).toContain('App connected. Your assistant can use it from your next message.');
+    expect(list.body).toContain('Connected');
+    assertNoSentinels();
+  });
+
+  it('connects a chat-added app, Not connected, through the same sign-in route with client details', async () => {
+    const app = homeBoard();
+    serve(app.handle);
+    const added = await operations().add({ url: HOMEBOARD, name: 'HomeBoard' });
+    if (added.status !== 'added') throw new Error(added.reason);
+    expect(added.app.status).toBe('not_connected');
+
+    const url = await startSignIn(added.app, { clientId: CLIENT_ID, clientSecret: SENTINEL_SECRET });
+    expect((await callback('homeboard.nownow.ai', app.approve(url).query)).headers.location).toBe(
+      '/connections?outcome=connected',
+    );
+    expect((await onlyApp()).status).toBe('connected');
+    assertNoSentinels();
+  });
+
+  it('goes straight to sign-in for a server that registers clients itself, with no client fields', async () => {
+    const ledger = new FakeMcpApp({ appUrl: LEDGER, issuer: 'https://auth.example.test', registration: true });
+    serve(ledger.handle);
+    const added = await post('/connections/add', { url: LEDGER, name: 'Ledger' });
+    expect(added.status).toBe(200);
+    expect(added.body).not.toContain('name="clientId"');
+    expect(added.body).toContain('You’ll sign in on auth.example.test.');
+    expect(ledger.registrations).toHaveLength(1);
+    expect(ledger.registrations[0]).toMatchObject({
+      redirect_uris: [`https://${HOST}/connections/callback/mcp.ledger.example.test`],
+    });
+
+    const url = await startSignIn(await onlyApp());
+    expect((await callback('mcp.ledger.example.test', ledger.approve(url).query)).headers.location).toBe(
+      '/connections?outcome=connected',
+    );
+    expect((await onlyApp()).status).toBe('connected');
+    expect(ledger.registrations).toHaveLength(1);
+  });
+});
+
+describe('pasted tokens and servers without sign-in', () => {
+  it('connects a token app, disconnects it, and connects it again through the token field', async () => {
+    serve(notesServer);
+    const added = await post('/connections/add', { url: NOTES, name: '' });
+    expect(added.body).toContain('name="token"');
+    let app = await onlyApp();
+    expect(app).toMatchObject({ auth: 'token', name: 'notes.example.test' });
+
+    const wrong = await post('/connections/connect', { id: app.id, version: String(app.version), token: 'not-it' });
+    expect(wrong.status).toBe(400);
+    expect(wrong.body).toContain('The app didn’t accept that token.');
+    expect((await onlyApp()).status).toBe('not_connected');
+    expect(gateway.held.size).toBe(0);
+
+    const connected = await post('/connections/connect', {
+      id: app.id,
+      version: String(app.version),
+      token: ` ${SENTINEL_TOKEN} `,
+    });
+    expect(connected.status).toBe(200);
+    app = await onlyApp();
+    expect(app.status).toBe('connected');
+    expect(gateway.held.get(`gws-ea-app-${app.id}`)?.value).toBe(SENTINEL_TOKEN);
+
+    expect((await post('/connections/disconnect', { id: app.id, version: String(app.version) })).status).toBe(200);
+    app = await onlyApp();
+    expect(app.status).toBe('not_connected');
+    expect(gateway.held.size).toBe(0);
+    expect((await request(`/connections/app/${app.id}/connect`)).body).toContain('name="token"');
+
+    await post('/connections/connect', { id: app.id, version: String(app.version), token: SENTINEL_TOKEN });
+    expect((await onlyApp()).status).toBe('connected');
+    assertNoSentinels();
+  });
+
+  it('connects a server without sign-in on confirm, with no OAuth step', async () => {
+    serve(recipesServer);
+    const added = await post('/connections/add', { url: RECIPES, name: '' });
+    expect(added.body).toContain('recipes.example.test doesn’t ask you to sign in.');
+    let app = await onlyApp();
+    expect(app).toMatchObject({ name: 'Recipes', auth: 'none' });
+
+    expect((await post('/connections/connect', { id: app.id, version: String(app.version) })).status).toBe(200);
+    app = await onlyApp();
+    expect(app.status).toBe('connected');
+    expect(gateway.held.size).toBe(0);
+    expect(await mainServers()).toEqual({ [app.serverKey]: { type: 'http', url: RECIPES } });
+    expect(endpoints.requests.every((incoming) => !incoming.path.includes('oauth'))).toBe(true);
+  });
+});
+
+describe('sign-in returns', () => {
+  it('renders each outcome’s constant message once, and the script strips it from the address', async () => {
+    const messages = {
+      connected: 'App connected.',
+      cancelled: 'Sign-in was cancelled.',
+      expired: 'That sign-in expired or was already used.',
+      failed: 'Sign-in didn’t finish.',
+    };
+    for (const [code, message] of Object.entries(messages)) {
+      const reply = await request(`/connections?outcome=${code}`);
+      expect(reply.status).toBe(200);
+      expect(reply.body.split(message)).toHaveLength(2);
+      expect(reply.body).toContain("history.replaceState(null, '', location.pathname)");
+    }
+    const plain = await request('/connections');
+    for (const message of Object.values(messages)) expect(plain.body).not.toContain(message);
+    expect((await request('/connections?outcome=other')).status).toBe(404);
+  });
+
+  it('refuses an invited reader’s return with not-found and leaves the pending sign-in untouched', async () => {
+    const app = homeBoard();
+    serve(app.handle);
+    await post('/connections/add', { url: HOMEBOARD, name: '' });
+    const stored = await onlyApp();
+    const url = await startSignIn(stored, { clientId: CLIENT_ID, clientSecret: SENTINEL_SECRET });
+
+    const reply = await callback('homeboard.nownow.ai', app.approve(url).query, READER);
+    expect(reply.status).toBe(404);
+    expect(reply.body).toBe('');
+    expect(signInRow(stored.id)).toEqual({ claimed_at: null });
+    expect((await request('/connections', 'GET', { 'cf-access-jwt-assertion': READER })).status).toBe(404);
+  });
+
+  it('answers a return on another app’s path, and unknown, consumed or replaced states, with the same expired outcome', async () => {
+    const app = homeBoard();
+    serve(app.handle, recipesServer);
+    await post('/connections/add', { url: RECIPES, name: '' });
+    await post('/connections/add', { url: HOMEBOARD, name: '' });
+    const stored = (await store.apps()).find((entry) => entry.host === 'homeboard.nownow.ai');
+    if (!stored) throw new Error('HomeBoard was not added');
+
+    const first = await startSignIn(stored, { clientId: CLIENT_ID, clientSecret: SENTINEL_SECRET });
+    const firstQuery = app.approve(first).query;
+    const elsewhere = await callback('recipes.example.test', firstQuery);
+    expect(elsewhere.headers.location).toBe('/connections?outcome=expired');
+    expect(signInRow(stored.id)).toEqual({ claimed_at: null });
+
+    // A second start in another tab replaces the first, so the first tab's return reads as expired.
+    const second = await startSignIn(await store.get(stored.id));
+    expect((await callback('homeboard.nownow.ai', firstQuery)).headers.location).toBe('/connections?outcome=expired');
+    const unknown = new URLSearchParams({ code: 'whatever', state: 'never-issued' });
+    expect((await callback('homeboard.nownow.ai', unknown)).headers.location).toBe('/connections?outcome=expired');
+
+    const secondQuery = app.approve(second).query;
+    expect((await callback('homeboard.nownow.ai', secondQuery)).headers.location).toBe(
+      '/connections?outcome=connected',
+    );
+    expect((await callback('homeboard.nownow.ai', secondQuery)).headers.location).toBe('/connections?outcome=expired');
+  });
+
+  it('leaves the app as it was after a failed exchange, with the claimed sign-in unusable', async () => {
+    const app = homeBoard();
+    serve(app.handle);
+    await post('/connections/add', { url: HOMEBOARD, name: '' });
+    const stored = await onlyApp();
+    const url = await startSignIn(stored, { clientId: CLIENT_ID, clientSecret: SENTINEL_SECRET });
+    const query = app.approve(url).query;
+    query.set('code', 'tampered-code');
+
+    expect((await callback('homeboard.nownow.ai', query)).headers.location).toBe('/connections?outcome=failed');
+    expect(await onlyApp()).toMatchObject({ status: 'not_connected' });
+    expect(signInRow(stored.id)).toBeUndefined();
+    expect((await callback('homeboard.nownow.ai', query)).headers.location).toBe('/connections?outcome=expired');
+    expect(gateway.held.size).toBe(0);
+    assertNoSentinels();
+  });
+
+  it('clears the sign-in and leaves the app as it was when the principal cancels at the server', async () => {
+    const app = homeBoard();
+    serve(app.handle);
+    await post('/connections/add', { url: HOMEBOARD, name: '' });
+    const stored = await onlyApp();
+    const url = new URL(await startSignIn(stored, { clientId: CLIENT_ID, clientSecret: SENTINEL_SECRET }));
+    const query = new URLSearchParams({
+      error: 'access_denied',
+      error_description: 'Morgan declined',
+      state: url.searchParams.get('state') ?? '',
+    });
+
+    expect((await callback('homeboard.nownow.ai', query)).headers.location).toBe('/connections?outcome=cancelled');
+    expect(await onlyApp()).toMatchObject({ status: 'not_connected' });
+    expect(signInRow(stored.id)).toBeUndefined();
+    expect(logged.join('\n')).not.toContain('Morgan declined');
+  });
+
+  it('refuses a cross-site sign-in start and leaves the pending sign-in as it was', async () => {
+    const app = homeBoard();
+    serve(app.handle);
+    await post('/connections/add', { url: HOMEBOARD, name: '' });
+    const stored = await onlyApp();
+    await startSignIn(stored, { clientId: CLIENT_ID, clientSecret: SENTINEL_SECRET });
+    const before = raw((db) => db.prepare('SELECT state_hash FROM sign_ins').all());
+
+    const current = await store.get(stored.id);
+    const reply = await post(
+      '/connections/sign-in',
+      { id: current.id, version: String(current.version) },
+      { 'sec-fetch-site': 'cross-site' },
+    );
+    expect(reply.status).toBe(404);
+    expect(raw((db) => db.prepare('SELECT state_hash FROM sign_ins').all())).toEqual(before);
+  });
+});
+
+describe('managing apps', () => {
+  it('disconnects at once: grant ended, credential gone, pending sign-in cleared, restart requested', async () => {
+    const connected = await connectedHomeBoard();
+    await store.startSignIn(connected.id, connected.version, {
+      principalId: PRINCIPAL,
+      verifier: 'pending-verifier-abcdefghijklmnopqrstuvwxyz0123456789',
+      issuer: 'https://homeboard.nownow.ai/',
+      redirectUri: HOMEBOARD_REDIRECT,
+      resource: HOMEBOARD,
+    });
+    const app = await onlyApp();
+    await store.clearRestart((await store.pendingRestart()) ?? '');
+
+    const reply = await post('/connections/disconnect', { id: app.id, version: String(app.version) });
+    expect(reply.status).toBe(200);
+    expect(reply.body).toContain('App disconnected.');
+    expect(await onlyApp()).toMatchObject({ status: 'not_connected' });
+    expect(gateway.held.size).toBe(0);
+    expect(signInRow(app.id)).toBeUndefined();
+    expect(await mainServers()).toEqual({});
+    expect(await store.pendingRestart()).toBeDefined();
+    expect(gateway.events.indexOf(`remove:gws-ea-app-${app.id}`)).toBeLessThan(gateway.events.lastIndexOf('apply'));
+  });
+
+  it('deletes a connected app even when the server refuses revocation', async () => {
+    const homeboard = homeBoard();
+    serve((incoming) => (incoming.path === '/oauth/revoke' ? { status: 503 } : undefined));
+    const app = await connectedHomeBoard(homeboard);
+
+    const reply = await post('/connections/delete', { id: app.id, version: String(app.version) });
+    expect(reply.status).toBe(200);
+    expect(reply.body).toContain('App deleted.');
+    expect(await store.apps()).toEqual([]);
+    expect(gateway.held.size).toBe(0);
+    expect(await mainServers()).toEqual({});
+  });
+
+  it('deletes an app that needs reconnecting', async () => {
+    const app = await connectedHomeBoard();
+    const grant = (await store.liveGrants())[0];
+    await store.markRefused(app.id, grant.generation);
+    const refused = await onlyApp();
+    expect(refused.status).toBe('needs_reconnecting');
+    expect((await request('/connections')).body).toContain('Needs reconnecting');
+
+    expect((await post('/connections/delete', { id: refused.id, version: String(refused.version) })).status).toBe(200);
+    expect(await store.apps()).toEqual([]);
+  });
+
+  it('keeps an app listed, Not connected, when its credential cannot be removed, so Delete can run again', async () => {
+    serve(notesServer);
+    await post('/connections/add', { url: NOTES, name: '' });
+    let app = await onlyApp();
+    await post('/connections/connect', { id: app.id, version: String(app.version), token: SENTINEL_TOKEN });
+    app = await onlyApp();
+    gateway.failRemoval = true;
+
+    const reply = await post('/connections/delete', { id: app.id, version: String(app.version) });
+    expect(reply.status).toBe(200);
+    expect(reply.body).toContain('Try deleting it again.');
+    app = await onlyApp();
+    expect(app.status).toBe('not_connected');
+    expect(gateway.held.has(`gws-ea-app-${app.id}`)).toBe(true);
+    expect(await mainServers()).toEqual({});
+
+    gateway.failRemoval = false;
+    expect((await post('/connections/delete', { id: app.id, version: String(app.version) })).body).toContain(
+      'App deleted.',
+    );
+    expect(await store.apps()).toEqual([]);
+    expect(gateway.held.size).toBe(0);
+    assertNoSentinels();
+  });
+
+  it('renames the label only: the server key and main’s entry stay', async () => {
+    serve(recipesServer);
+    await post('/connections/add', { url: RECIPES, name: '' });
+    let app = await onlyApp();
+    await post('/connections/connect', { id: app.id, version: String(app.version) });
+    app = await onlyApp();
+    const before = await mainServers();
+
+    const reply = await post('/connections/rename', { id: app.id, version: String(app.version), name: 'Family meals' });
+    expect(reply.status).toBe(200);
+    const renamed = await onlyApp();
+    expect(renamed).toMatchObject({ name: 'Family meals', serverKey: app.serverKey, status: 'connected' });
+    expect(await mainServers()).toEqual(before);
+  });
+
+  it('refuses every action carrying an old version and changes nothing', async () => {
+    serve(recipesServer);
+    await post('/connections/add', { url: RECIPES, name: '' });
+    const stale = await onlyApp();
+    await store.rename(stale.id, stale.version, 'Meals');
+    const reference = { id: stale.id, version: String(stale.version) };
+
+    for (const [route, data] of [
+      ['/connections/connect', reference],
+      ['/connections/disconnect', reference],
+      ['/connections/delete', reference],
+      ['/connections/rename', { ...reference, name: 'Dinners' }],
+    ] as const) {
+      const reply = await post(route, data);
+      expect(reply.status).toBe(409);
+      expect(reply.body).toContain('This app changed since you opened the page.');
+    }
+    const signIn = await post('/connections/sign-in', reference);
+    expect(signIn.status).toBe(409);
+    expect(await onlyApp()).toMatchObject({ name: 'Meals', status: 'not_connected' });
+  });
+});
+
+describe('the add dialog', () => {
+  it.each([
+    [
+      'credentials in the URL',
+      `https://notes.example.test/mcp?api_key=${SENTINEL_QUERY}`,
+      'Remove the sign-in details',
+    ],
+    ['not https', 'http://notes.example.test/mcp', 'The address must start with https://.'],
+    ['an unparseable address', 'notes', 'Enter the app’s full address'],
+    ['one of the assistant’s own services', 'https://api.anthropic.com/mcp', 'one of your assistant’s own services'],
+    ['an operator server’s host', 'https://tasks.example.test/other', 'already uses this address'],
+    ['a server that does not answer', 'https://down.example.test/mcp', 'The app’s server didn’t answer.'],
+    ['a server whose sign-in is unusable', 'https://recipes.example.test/mcp', 'signs in in a way'],
+  ])('refuses %s with a constant message and stores nothing', async (_case, url, message) => {
+    await updateContainerConfigJson(MAIN, 'mcp_servers', {
+      tasks: { type: 'http', url: `https://tasks.example.test/mcp?key=${SENTINEL_QUERY}` },
+    });
+    serve(
+      (incoming) => (incoming.host === 'down.example.test' ? { status: 503 } : undefined),
+      (incoming) => (incoming.host === 'recipes.example.test' ? { status: 200, body: 'not json-rpc' } : undefined),
+    );
+    const reply = await post('/connections/add', { url, name: 'Notes' });
+    expect(reply.status).toBe(400);
+    expect(reply.body).toContain(message);
+    expect(reply.body).toContain('value="Notes"');
+    expect(await store.apps()).toEqual([]);
+    assertNoSentinels();
+  });
+
+  it('refuses a host another app already uses', async () => {
+    serve(recipesServer);
+    await post('/connections/add', { url: RECIPES, name: '' });
+    const reply = await post('/connections/add', { url: 'https://recipes.example.test/other', name: '' });
+    expect(reply.status).toBe(400);
+    expect(reply.body).toContain('already uses this address');
+    expect(await store.apps()).toHaveLength(1);
+  });
+
+  it('refuses a name another app has, ignoring case', async () => {
+    serve(recipesServer, notesServer);
+    await post('/connections/add', { url: RECIPES, name: 'Kitchen' });
+    const reply = await post('/connections/add', { url: NOTES, name: 'kitchen' });
+    expect(reply.status).toBe(400);
+    expect(reply.body).toContain('Another app already has that name.');
+    expect(await store.apps()).toHaveLength(1);
+  });
+});
+
+describe('page states', () => {
+  it('shows a short explanation and Add when there are no apps', async () => {
+    const reply = await request('/connections');
+    expect(reply.status).toBe(200);
+    expect(reply.body).toContain('No apps yet.');
+    expect(reply.body).toContain('href="/connections/new"');
+    expect(reply.body).not.toContain('Added by you');
+  });
+
+  it('lists operator servers by host only, without an Added by you section or any action', async () => {
+    await updateContainerConfigJson(MAIN, 'mcp_servers', {
+      homeboard: { type: 'http', url: `https://homeboard.nownow.ai/mcp?key=${SENTINEL_QUERY}` },
+      calendar: { command: 'calendar-mcp' },
+    });
+    const reply = await request('/connections');
+    expect(reply.body).toContain('From your operator');
+    expect(reply.body).toContain('homeboard.nownow.ai');
+    expect(reply.body).not.toContain('Added by you');
+    expect(reply.body).not.toContain('calendar');
+    expect(reply.body).not.toContain('aria-haspopup="menu"');
+    assertNoSentinels();
+  });
+
+  it.each([
+    ['an unreadable Keychain', () => (keychain.unavailable = true)],
+    ['a gateway without a credential store', () => (gatewaySeam = false)],
+  ])('lists existing apps but hides Add and Connect with %s', async (_case, breakIt) => {
+    serve(recipesServer);
+    await post('/connections/add', { url: RECIPES, name: '' });
+    const app = await onlyApp();
+    breakIt();
+    const list = await request('/connections');
+    expect(list.body).toContain('Recipes');
+    expect(list.body).toContain('Apps can’t be added or connected right now. Ask your operator.');
+    expect(list.body).not.toContain('href="/connections/new"');
+    expect(list.body).not.toContain('/connect"');
+    expect(list.body).toContain('Delete');
+    expect((await request(`/connections/app/${app.id}/connect`)).body).not.toContain('action="/connections/connect"');
+    expect((await request('/connections/new')).body).not.toContain('action="/connections/add"');
+  });
+
+  it('refuses unknown routes, other methods and non-principal identities with an empty not-found', async () => {
+    for (const [route, method, headers] of [
+      ['/connections/unknown', 'GET', {}],
+      ['/connections/new?x=1', 'GET', {}],
+      ['/connections/add', 'GET', {}],
+      ['/connections/callback/homeboard.nownow.ai', 'HEAD', {}],
+      ['/connections', 'GET', { 'cf-access-jwt-assertion': '' }],
+      ['/connections', 'GET', { host: `${HOST}:443` }],
+    ] as const) {
+      const reply = await request(route, method, headers);
+      expect(reply.status).toBe(404);
+      expect(reply.body).toBe('');
+    }
+    expect((await post('/connections/add', { url: RECIPES, extra: 'x' })).status).toBe(404);
+  });
+});
+
+describe('home status and link facts', () => {
+  const listing = (overrides: Partial<ConnectionsListing>): (() => Promise<ConnectionsListing>) => {
+    return async () => ({ listed: true, canChange: true, apps: [], operators: [], ...overrides });
+  };
+  const app = (status: ConnectionApp['status'], name: string): ConnectionApp => ({
+    id: randomUUID(),
+    serverKey: `app_${name.toLowerCase()}`,
+    name,
+    url: `https://${name.toLowerCase()}.example.test/mcp`,
+    host: `${name.toLowerCase()}.example.test`,
+    auth: 'token',
+    issuer: null,
+    hasClient: false,
+    status,
+    version: 1,
+    createdAt: '2026-11-14T00:00:00.000Z',
+    updatedAt: '2026-11-14T00:00:00.000Z',
+  });
+
+  it('summarizes unavailable, then apps needing reconnecting, then connected apps, then none yet', async () => {
+    const operator = { key: 'homeboard', url: 'https://homeboard.nownow.ai/mcp' };
+    expect(await connectionsStatus(listing({ canChange: false, apps: [app('needs_reconnecting', 'Notes')] }))).toBe(
+      'Unavailable',
+    );
+    expect(
+      await connectionsStatus(listing({ apps: [app('needs_reconnecting', 'Notes'), app('connected', 'Recipes')] })),
+    ).toBe('1 app needs reconnecting');
+    expect(await connectionsStatus(listing({ apps: [app('connected', 'Recipes')], operators: [operator] }))).toBe(
+      '2 apps connected',
+    );
+    expect(await connectionsStatus(listing({ apps: [app('not_connected', 'Notes')] }))).toBe('None yet');
+  });
+
+  it('gives main each app’s name, key, host, origin and status, never an address', async () => {
+    const facts = await connectionsLinkFacts(
+      listing({
+        apps: [app('connected', 'Recipes')],
+        operators: [{ key: 'homeboard', url: `https://homeboard.nownow.ai/mcp?key=${SENTINEL_QUERY}` }],
+      }),
+    );
+    expect(facts).toEqual({
+      apps: [
+        { name: 'Recipes', key: 'app_recipes', host: 'recipes.example.test', origin: 'principal', status: 'connected' },
+        { name: 'homeboard', key: 'homeboard', host: 'homeboard.nownow.ai', origin: 'operator', status: 'connected' },
+      ],
+    });
+    expect(JSON.stringify(facts)).not.toContain('https://');
+  });
+});

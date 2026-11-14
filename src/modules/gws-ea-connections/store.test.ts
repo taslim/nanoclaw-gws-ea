@@ -243,6 +243,18 @@ describe('grants', () => {
     expect(keychain.calls).toEqual([]);
   });
 
+  it("reads an unconnected app's client for sign-in, version-checked when a version is given", async () => {
+    const added = await store.create(LEDGER);
+    expect(await store.readClient(added.id, added.version)).toEqual({ issuer: ISSUER, client: undefined });
+    expect(keychain.calls).toEqual([]);
+    const client = { clientId: 'ledger-client', clientSecret: SENTINELS.clientSecret };
+    const withClient = await store.setClient(added.id, added.version, { issuer: ISSUER, client });
+    expect(await store.readClient(withClient.id, withClient.version)).toEqual({ issuer: ISSUER, client });
+    expect(await store.readClient(withClient.id)).toEqual({ issuer: ISSUER, client });
+    await expect(store.readClient(withClient.id, added.version)).rejects.toMatchObject({ reason: 'app_changed' });
+    await expect(store.readClient('no-such-app')).rejects.toMatchObject({ reason: 'app_not_found' });
+  });
+
   it('forgets the app, its client, grant and sign-in on delete', async () => {
     const { app } = await connectedOauth();
     await store.startSignIn(app.id, app.version, signIn(app));

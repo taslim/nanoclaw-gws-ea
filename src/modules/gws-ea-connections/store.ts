@@ -492,6 +492,28 @@ export class ConnectionsStore {
     });
   }
 
+  /**
+   * The app's client whatever its grant, for a sign-in to start or finish. A sign-in's return carries no version, so
+   * the version is checked only when given.
+   */
+  async readClient(
+    id: string,
+    version?: number,
+  ): Promise<{ readonly issuer: string | null; readonly client: ClientRegistration | undefined }> {
+    if (version !== undefined) versionValid(version);
+    return this.use(async (db) => {
+      const read = (key: Buffer | undefined) => {
+        const app = version === undefined ? this.app(db, id) : this.appAt(db, id, version);
+        const sealed = db.prepare<[string], { client: Buffer | null }>('SELECT client FROM apps WHERE id = ?').get(id);
+        if (!sealed?.client) return { issuer: app.issuer, client: undefined };
+        if (!key) throw new ConnectionsStoreError('store_unavailable');
+        return { issuer: app.issuer, client: parseClient(this.unsealText(sealed.client, key)) };
+      };
+      const app = version === undefined ? this.app(db, id) : this.appAt(db, id, version);
+      return app.hasClient ? this.withKey(db, read) : read(undefined);
+    });
+  }
+
   async clearClient(id: string, version: number): Promise<ConnectionApp> {
     versionValid(version);
     return this.use((db) =>
