@@ -81,7 +81,9 @@ For ad-hoc central queries from skills or scripts, use the in-tree wrapper rathe
 | `src/modules/gws-ea-matters/{sync,morning,loop,ledger}.ts` | Principal-local evening close, captured day-ledger coverage, durable completion/reporting, held morning gate and timed looks |
 | `container/agent-runner/src/planning-agents.ts` + `week-view/` | Native planning-worker attribution and permissions; main-only week/Manual context hooks and moment-local clock reads |
 | `src/modules/gws-ea-browser/` | Built-in host Playwright runtime, owned loopback Chrome CDP connection, public-only proxy, job queue, sign-in, the open-rule classifier, consent engine, reviewed and generic purchase readers, purchase authority, recipes and wake-on-change watches |
-| `src/modules/gws-ea-browser/{login-key,login-store,credential-*,logins-*}.ts` | Built-in encrypted saved logins and per-assistant macOS Keychain keys; durable signup and password-change attempts; the principal-only saved-logins page and its host link tool |
+| `src/modules/gws-ea-browser/{login-key,login-store,credential-*,logins-*}.ts` | Built-in encrypted saved logins and per-assistant macOS Keychain keys; durable signup and password-change attempts; the principal-only saved-logins page |
+| `src/modules/gws-ea-web/{home,mounts,page-link,kit/}` | Principal home at `/`, the principal-page mount registry, the `principal_page` link tool and the shared page kit |
+| `src/modules/gws-ea-connections/` | The principal's custom remote MCP apps for main: encrypted app store, OAuth/token connect, gateway-held credentials the host renews, the Connections page and main's approval-gated add/delete |
 | `src/command-gate.ts` | Router-side admin command gate — queries `user_roles` directly (no env var, no container-side check) |
 | `src/modules/permissions/user-dm.ts` | Cold-DM resolution + `user_dms` cache |
 | `src/group-init.ts` | Per-agent-group filesystem scaffold (CLAUDE.md, skills) — agent-runner source is a shared read-only mount, not copied per group |
@@ -232,8 +234,10 @@ release, and rollback never provisions.
 
 The `web` connector owns one claimed `<first-name>.<zone apex>` hostname and
 loopback port per assistant, stable across renames. It serves artifacts at
-`/artifacts` and the principal-only saved-logins page at `/logins`, with no home page. Web owns policy, listener and identity; artifacts
-owns object and sharing authority, and browser owns saved-login authority.
+`/artifacts`, and the principal-only home at `/` with the saved-logins page at
+`/logins` and the Connections page at `/connections`. Web owns policy, listener,
+identity and the shared page kit; artifacts owns object and sharing authority,
+browser owns saved-login authority, and connections owns app authority.
 Transient serving failures retain author tools. Removing
 an assistant settles only its DNS, route and Access app; shared resources remain
 until connector uninstall, which closes all policies before remote cleanup.
@@ -271,7 +275,7 @@ filesystem remnants in freed blocks. Releasing an unsettled attempt discards
 its generated password and preserves the previous login; if the site took it,
 the assistant can reset it through its own email.
 
-Main obtains the host's `/logins` link through `logins_page` when a missing login
+Main obtains the host's `/logins` link through `principal_page` when a missing login
 is needed or the principal asks. Only the principal's currently confirmed
 addresses can open it. They can add or remove logins and edit the label, website,
 username or saved password, whichever account owner it has. On a login’s details
