@@ -141,6 +141,41 @@ describe('disconnectOperatorServer', () => {
     assertNoSentinels();
   });
 
+  it('keeps the host’s credentials while another operator server in main still uses that host', async () => {
+    const boards = { type: 'http', url: `https://${HOMEBOARD_HOST}/boards/mcp` };
+    await updateContainerConfigJson(MAIN, 'mcp_servers', { homeboard: HOMEBOARD, boards });
+    credentials.hold('secret-bearer', 'homeboard', HOMEBOARD_HOST);
+
+    expect(await disconnectOperatorServer(store, { key: 'homeboard', host: HOMEBOARD_HOST }, dependencies())).toBe(
+      'disconnected',
+    );
+    expect(await mainServers()).toEqual({ boards });
+    expect([...credentials.held.keys()]).toEqual(['secret-bearer']);
+    expect(await store.pendingRestart()).toBeDefined();
+
+    // The last server on the host takes the host's credentials with it.
+    expect(await disconnectOperatorServer(store, { key: 'boards', host: HOMEBOARD_HOST }, dependencies())).toBe(
+      'disconnected',
+    );
+    expect(await mainServers()).toEqual({});
+    expect(credentials.held.size).toBe(0);
+  });
+
+  it('removes the host’s credentials once when two servers on it are disconnected together', async () => {
+    const boards = { type: 'http', url: `https://${HOMEBOARD_HOST}/boards/mcp` };
+    await updateContainerConfigJson(MAIN, 'mcp_servers', { homeboard: HOMEBOARD, boards });
+    credentials.hold('secret-bearer', 'homeboard', HOMEBOARD_HOST);
+
+    expect(
+      await Promise.all([
+        disconnectOperatorServer(store, { key: 'homeboard', host: HOMEBOARD_HOST }, dependencies()),
+        disconnectOperatorServer(store, { key: 'boards', host: HOMEBOARD_HOST }, dependencies()),
+      ]),
+    ).toEqual(['disconnected', 'disconnected']);
+    expect(await mainServers()).toEqual({});
+    expect(credentials.held.size).toBe(0);
+  });
+
   it('keeps the server when a credential stays, and the next try removes the rest and the server', async () => {
     await updateContainerConfigJson(MAIN, 'mcp_servers', { homeboard: HOMEBOARD });
     credentials.hold('secret-bearer', SENTINEL_NAME, HOMEBOARD_HOST);

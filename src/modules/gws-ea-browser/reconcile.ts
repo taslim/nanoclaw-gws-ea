@@ -18,9 +18,30 @@ import { browserConfigured } from './availability.js';
 
 import './destination-policy.js';
 
+/**
+ * The startup and sweep pass: routes first, then browser's gateway identity. The gateway goes last so an outage
+ * never keeps a revoked group's route to browser.
+ */
 export async function reconcileBrowserGroup(root?: string): Promise<void> {
+  await closingAdmissionOnFailure(async () => {
+    const browser = await reconcileDestinations(root);
+    if (browser !== null) await reconcileSealedGateway(browser, BROWSER_NAME);
+  });
+}
+
+/**
+ * The pass before each browser request: routes only, so a slow or unreachable gateway admin never delays or refuses
+ * a running errand. Admission still reads the identity's drift before every browser session starts.
+ */
+export async function reconcileBrowserRoutes(): Promise<void> {
+  await closingAdmissionOnFailure(async () => {
+    await reconcileDestinations();
+  });
+}
+
+async function closingAdmissionOnFailure(work: () => Promise<void>): Promise<void> {
   try {
-    await reconcileDestinations(root);
+    await work();
   } catch (error) {
     // On-use reconciliation shares the same admission boundary as startup and
     // sweeps. A partially projected map cannot keep a previous ready state.
@@ -90,8 +111,9 @@ function sameEdge(row: AgentDestination | undefined, wanted: AgentDestination): 
   );
 }
 
-async function reconcileDestinations(root?: string): Promise<void> {
-  if (!(await getDb().hasTable('gws_ea_profile'))) return;
+/** Returns browser's group while any group may delegate to it, else null. */
+async function reconcileDestinations(root?: string): Promise<string | null> {
+  if (!(await getDb().hasTable('gws_ea_profile'))) return null;
   const granted = await browserDelegators();
   const delegators = browserConfigured(root) ? granted : [];
   const existing = await getBrowserAgentGroupId();
@@ -100,7 +122,7 @@ async function reconcileDestinations(root?: string): Promise<void> {
       ? new Set<string>()
       : await cancelErrandsOutside(existing, new Set(delegators.map((delegator) => delegator.agentGroupId)));
   if (delegators.length === 0) {
-    if (existing === null) return;
+    if (existing === null) return null;
     const rows = await getDb().all<{ agent_group_id: string; local_name: string }>(
       "SELECT agent_group_id, local_name FROM agent_destinations WHERE agent_group_id = ? OR (target_type = 'agent' AND target_id = ?)",
       existing,
@@ -116,11 +138,9 @@ async function reconcileDestinations(root?: string): Promise<void> {
     ]);
     for (const row of rows) await deleteDestination(row.agent_group_id, row.local_name);
     for (const owner of owners) await project(owner);
-    return;
+    return null;
   }
   const browser = existing ?? (await ensureBrowserGroup());
-  // Every pass, not only creation: admission refuses an identity holding more than the model credential.
-  await reconcileSealedGateway(browser, BROWSER_NAME);
   const wanted = delegators.map((delegator) => edges(browser, delegator));
   const held = await getDestinations(browser);
   if (
@@ -164,6 +184,7 @@ async function reconcileDestinations(root?: string): Promise<void> {
   // A correct central row is not evidence that its last mailbox projection
   // succeeded. Re-project every direction, including already-active delegators.
   for (const owner of owners) await project(owner);
+  return browser;
 }
 
 async function project(agentGroupId: string): Promise<void> {

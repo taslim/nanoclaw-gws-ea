@@ -1,6 +1,7 @@
 /**
  * Disconnecting a server the operator added to main. Removing only the entry would leave the operator's gateway
- * credential on the server's host, still attached to main's own requests there, so the host's credentials go too.
+ * credential on the server's host, still attached to main's own requests there, so the host's credentials go too,
+ * unless another of the operator's servers in main still reaches that host and needs them.
  *
  * The credentials go first and the entry last: while any credential remains, the entry keeps the server listed, so
  * the principal can try again and the next attempt finds whatever is left. The host is always read from main's
@@ -114,14 +115,18 @@ export async function disconnectOperatorServer(
 ): Promise<OperatorDisconnectOutcome> {
   const { credentials, protectedHosts } = dependencies;
   if (!credentials) return 'unavailable';
-  // App ids are UUIDs, so an operator key can never share an app's lock.
-  return withAppLock(`operator:${request.key}`, async () => {
+  // One host at a time: two of its servers going together would each see the other and leave the host's credentials
+  // behind. The prefix keeps this lock apart from every app's, whose keys are bare UUIDs.
+  return withAppLock(`operator:${request.host}`, async () => {
     try {
-      const server = (await mainOperatorServers()).find((candidate) => candidate.key === request.key);
+      const servers = await mainOperatorServers();
+      const server = servers.find((candidate) => candidate.key === request.key);
       if (!server) return 'not_found';
       const host = operatorServerHost(server);
       if ((host ?? '') !== request.host) return 'changed';
-      if (host && !(await removeHostCredentials(host, credentials, protectedHosts))) return 'credentials_kept';
+      const shared = servers.some((other) => other.key !== request.key && operatorServerHost(other) === host);
+      if (host && !shared && !(await removeHostCredentials(host, credentials, protectedHosts)))
+        return 'credentials_kept';
       const removal = await removeOperatorServer(store, request.key);
       if (removal === 'not_operator') return 'not_found';
       log.info('Operator server disconnected', { key: request.key });

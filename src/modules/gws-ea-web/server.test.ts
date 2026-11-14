@@ -71,9 +71,12 @@ function mount(overrides: Partial<WebMount> & Pick<WebMount, 'name' | 'audience'
       };
 }
 
-async function fixture(artifact: RequestListener = (_request, response) => response.end('artifact')) {
+async function fixture(
+  artifact: RequestListener = (_request, response) => response.end('artifact'),
+  principalPage: RequestListener = (_request, response) => response.end('logins'),
+) {
   const artifacts = vi.fn<RequestListener>(artifact);
-  const logins = vi.fn<RequestListener>((_request, response) => response.end('logins'));
+  const logins = vi.fn<RequestListener>(principalPage);
   const home = vi.fn<RequestListener>((_request, response) => response.end('home'));
   const routes: WebRoute[] = [
     { mount: mount({ name: 'artifacts', audience: 'artifact-readers', path: '/artifacts' }), listener: artifacts },
@@ -83,6 +86,7 @@ async function fixture(artifact: RequestListener = (_request, response) => respo
   const policy = JSON.parse(fs.readFileSync(path.join(root, 'policy.json'), 'utf8')) as WebPolicyFile;
   const identity = createWebIdentity(policy, async (token) => {
     if (token) verified.push(token);
+    if (token === 'broken') throw new Error('Access keys unreachable');
     return token === 'principal' ? 'morgan@example.com' : token === 'reader' ? 'juno@example.com' : undefined;
   });
   server = createServer(createWebHandler(HOST, routes, principalGate(identity)));
@@ -108,6 +112,9 @@ async function fixture(artifact: RequestListener = (_request, response) => respo
             body += chunk.toString();
           });
           res.on('end', () => resolve({ status: res.statusCode ?? 0, headers: res.headers, body }));
+          res.on('error', (error: NodeJS.ErrnoException) =>
+            error.code === 'ECONNRESET' ? resolve({ reset: true }) : reject(error),
+          );
         },
       );
       req.on('error', (error: NodeJS.ErrnoException) =>
@@ -135,6 +142,41 @@ it('admits only the verified principal to a principal mount; an invited reader g
   expect(await request('/logins/add', { method: 'POST', as: 'principal' })).toMatchObject({ body: 'logins' });
   expect(await request('/', { as: 'principal' })).toMatchObject({ status: 200, body: 'home' });
   expect(logins).toHaveBeenCalledTimes(2);
+});
+
+it('answers not-found without reaching the page when the identity check itself fails', async () => {
+  const { logins, home, status } = await fixture();
+  expect(await status('/logins', { as: 'broken' })).toBe(404);
+  expect(await status('/', { as: 'broken' })).toBe(404);
+  expect(verified).toEqual(['broken', 'broken']);
+  expect(logins).not.toHaveBeenCalled();
+  expect(home).not.toHaveBeenCalled();
+});
+
+it('ends the request when a verified principal page throws, resetting it once headers went out', async () => {
+  const cases: readonly [RequestListener, number | 'reset'][] = [
+    [
+      () => {
+        throw new Error('page failed before answering');
+      },
+      404,
+    ],
+    [
+      (_request, response) => {
+        response.writeHead(200, { 'content-type': 'text/plain' });
+        response.write('partial');
+        throw new Error('page failed mid-answer');
+      },
+      'reset',
+    ],
+  ];
+  for (const [page, expected] of cases) {
+    const { logins, status } = await fixture(undefined, page);
+    expect(await status('/logins', { as: 'principal' }), page.toString()).toBe(expected);
+    expect(logins).toHaveBeenCalledTimes(1);
+    await new Promise<void>((resolve) => server!.close(() => resolve()));
+    server = undefined;
+  }
 });
 
 it('refuses encoded slashes and dot segments before any handler or identity check', async () => {

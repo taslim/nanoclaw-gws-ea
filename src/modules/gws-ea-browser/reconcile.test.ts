@@ -39,10 +39,21 @@ import { getRequiredProjectDocSections } from '../../project-doc-sections.js';
 import { getDestinations } from '../agent-to-agent/db/agent-destinations.js';
 import type { AgentGroup, Session } from '../../types.js';
 import { configureBrowserAccess } from './testing/browser-access.js';
-import { useFakeGateway } from '../gws-ea-sealed-gateway/testing/fake-gateway.js';
+import {
+  APP_SECRET,
+  GATEWAY_URL,
+  MODEL_SECRET,
+  useFakeGateway,
+  type FakeGateway,
+} from '../gws-ea-sealed-gateway/testing/fake-gateway.js';
+import { getDeliveryAction } from '../../delivery.js';
+import { assertSessionAdmitted } from '../../container-runner.js';
+import { getBrowserQueue } from './index.js';
+
+let gateway: FakeGateway;
 
 beforeEach(async () => {
-  useFakeGateway();
+  gateway = useFakeGateway();
   vi.spyOn(loginStores, 'getLoginStore').mockResolvedValue(testLoginStore(`${ROOT}/browser`).store);
   useAvailableBrowser();
   vi.stubEnv('GWS_EA_BROWSER_ROOT', `${ROOT}/browser`);
@@ -297,4 +308,78 @@ it('retains destinations and errands when Chrome disappears, and refuses the nex
       source,
     ),
   ).rejects.toMatchObject({ reason: expect.stringMatching(/Chrome.*ask your operator/u) });
+});
+
+describe('the gateway identity and the per-request pass', () => {
+  /** How many requests reached the gateway's admin API so far. */
+  const gatewayCalls = (): number =>
+    vi
+      .mocked(globalThis.fetch)
+      .mock.calls.filter(
+        ([input]) => new URL(input instanceof Request ? input.url : String(input)).origin === GATEWAY_URL,
+      ).length;
+  /** A route to browser from a group that holds no grant, as a revoked grant leaves behind. */
+  async function staleRoute(browser: string): Promise<void> {
+    await createAgentGroup({
+      id: 'research',
+      name: 'research',
+      folder: 'research',
+      agent_provider: null,
+      created_at: new Date().toISOString(),
+    });
+    // Written past the destination policy, which refuses such a route on any new write.
+    await getDb().run(
+      `INSERT INTO agent_destinations (agent_group_id, local_name, target_type, target_id, session_mode, inbound_untrusted, created_at)
+       VALUES ('research', 'browser', 'agent', ?, 'per-thread', 1, ?)`,
+      browser,
+      new Date().toISOString(),
+    );
+  }
+
+  it('leaves a browser request off the gateway admin, so only admission refuses a drifted identity and the sweep repairs it', async () => {
+    await reconcileBrowserGroup();
+    const browser = (await getBrowserAgentGroupId())!;
+    const errand = (await resolveSystemSession(browser, 'system:a2a:main:errand')).session;
+    const admit = () =>
+      assertSessionAdmitted({
+        disposition: 'create',
+        key: { installSlug: 'test', agentGroupId: browser, sessionId: errand.id },
+      });
+    await expect(admit()).resolves.toBeUndefined();
+    await staleRoute(browser);
+    gateway.agents.get(browser)!.secrets.push(APP_SECRET.id);
+    const accept = vi.spyOn(getBrowserQueue(), 'accept').mockResolvedValue();
+    const before = gatewayCalls();
+
+    await getDeliveryAction('browser')!({ action: 'browser', requestId: 'request-1', actions: [] }, errand);
+
+    expect(accept).toHaveBeenCalledOnce();
+    expect(gatewayCalls()).toBe(before);
+    expect(browserAdmissionReady()).toBe(true);
+    expect(await getDestinationByName('research', 'browser')).toBeUndefined();
+    expect(gateway.agents.get(browser)!.secrets).toEqual([MODEL_SECRET.id, APP_SECRET.id]);
+    await expect(admit()).rejects.toThrow('browser may not start: its gateway secret assignments are not model-only');
+
+    await reconcileBrowserGroup();
+    expect(gateway.agents.get(browser)).toMatchObject({ secretMode: 'selective', secrets: [MODEL_SECRET.id] });
+    await expect(admit()).resolves.toBeUndefined();
+  });
+
+  it('takes back a revoked route before the sweep reaches an unreachable gateway', async () => {
+    await reconcileBrowserGroup();
+    const browser = (await getBrowserAgentGroupId())!;
+    await staleRoute(browser);
+    const fakeGateway = vi.mocked(globalThis.fetch).getMockImplementation()!;
+    vi.mocked(globalThis.fetch).mockImplementation(async (input, init) => {
+      if (new URL(input instanceof Request ? input.url : String(input)).origin === GATEWAY_URL)
+        throw new TypeError('fetch failed');
+      return fakeGateway(input, init);
+    });
+
+    await expect(reconcileBrowserGroup()).rejects.toThrow();
+
+    expect(await getDestinationByName('research', 'browser')).toBeUndefined();
+    expect(await getDestinationByName('main', 'browser')).toMatchObject({ target_id: browser });
+    expect(browserAdmissionReady()).toBe(false);
+  });
 });
