@@ -7,7 +7,10 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } 
 
 import { closeDb, createAgentGroup, getDb, initTestDb, runMigrations } from '../../db/index.js';
 import { ensureContainerConfig, getContainerConfig, updateContainerConfigJson } from '../../db/container-configs.js';
-import type { GatewayCredentialTarget } from '../../gateway-providers/credential-connection.js';
+import type {
+  GatewayCredentialRemoval,
+  GatewayCredentialTarget,
+} from '../../gateway-providers/credential-connection.js';
 import { log } from '../../log.js';
 import '../gws-ea-profile/index.js';
 import type { AdmissionDependencies } from './admit.js';
@@ -15,6 +18,7 @@ import { applyMainServers, mainOperatorServers } from './apply.js';
 import { connectionsLinkFacts, connectionsStatus } from './connections-mount.js';
 import { AppCredentialsUnavailableError, type AppConnection } from './credentials.js';
 import { ConnectionOperations, type ConnectionsListing } from './operations.js';
+import type { OperatorCredentials } from './operator.js';
 import { createConnectionsPageHandler } from './page.js';
 import type { ConnectionApp, ConnectionsStore } from './store.js';
 import { FakeMcpApp, startFakeEndpoints, type FakeEndpoints, type FakeHandler } from './testing/oauth-server.js';
@@ -48,11 +52,18 @@ interface HeldCredential {
   readonly value: string;
 }
 
-/** The gateway seam as the host sees it: credentials by name, listed by exact host. */
-class FakeGateway {
+/** The gateway seam as the host sees it: credentials by name, listed and removed by exact host. */
+class FakeGateway implements OperatorCredentials {
   readonly held = new Map<string, HeldCredential>();
   readonly events: string[] = [];
+  readonly failingIds = new Set<string>();
   failRemoval = false;
+  /** A credential written into the gateway directly, as an operator does. */
+  hold(name: string, host: string): string {
+    const id = randomUUID();
+    this.held.set(name, { id, host, path: undefined, value: 'operator-written-token' });
+    return id;
+  }
   readonly connection: AppConnection = (target: GatewayCredentialTarget) => {
     let observed: HeldCredential | undefined;
     return {
@@ -76,6 +87,15 @@ class FakeGateway {
   async listForHost(host: string): Promise<{ id: string; name: string }[]> {
     return [...this.held].filter(([, held]) => held.host === host).map(([name, held]) => ({ id: held.id, name }));
   }
+  async removeById(ids: readonly string[]): Promise<GatewayCredentialRemoval[]> {
+    return ids.map((id) => {
+      const name = [...this.held].find(([, held]) => held.id === id)?.[0];
+      if (name === undefined) return { id, outcome: 'gone' };
+      if (this.failingIds.has(id)) return { id, outcome: 'failed' };
+      this.held.delete(name);
+      return { id, outcome: 'removed' };
+    });
+  }
 }
 
 let endpoints: FakeEndpoints;
@@ -85,6 +105,8 @@ let keychain: TestKeychain;
 let raw: ReturnType<typeof testConnectionsStore>['raw'];
 let gateway: FakeGateway;
 let gatewaySeam: boolean;
+/** Whether the gateway can also list and remove credentials by host. */
+let hostSeam: boolean;
 let server: Server;
 let port: number;
 let replies: Reply[];
@@ -134,6 +156,7 @@ beforeEach(async () => {
   ({ store, keychain, raw } = testConnectionsStore(path.join(directory, 'connections')));
   gateway = new FakeGateway();
   gatewaySeam = true;
+  hostSeam = true;
   replies = [];
   logged = [];
   for (const level of ['debug', 'info', 'warn', 'error'] as const)
@@ -165,6 +188,10 @@ beforeEach(async () => {
       return typeof identity === 'string' && identity ? identity : undefined;
     },
     operations: async () => operations(),
+    operatorDependencies: () => ({
+      credentials: gatewaySeam && hostSeam ? gateway : undefined,
+      protectedHosts: async () => new Set([HOST, 'api.anthropic.com']),
+    }),
   });
   server = createServer(handler);
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
@@ -708,7 +735,7 @@ describe('page states', () => {
     expect(reply.body).not.toContain('Added by you');
   });
 
-  it('lists operator servers by host only, without an Added by you section or any action', async () => {
+  it('lists operator servers by host only, without an Added by you section, offering only Disconnect', async () => {
     await updateContainerConfigJson(MAIN, 'mcp_servers', {
       homeboard: { type: 'http', url: `https://homeboard.nownow.ai/mcp?key=${SENTINEL_QUERY}` },
       calendar: { command: 'calendar-mcp' },
@@ -718,7 +745,10 @@ describe('page states', () => {
     expect(reply.body).toContain('homeboard.nownow.ai');
     expect(reply.body).not.toContain('Added by you');
     expect(reply.body).not.toContain('calendar');
-    expect(reply.body).not.toContain('aria-haspopup="menu"');
+    expect(reply.body.match(/<(?:a|button)[^>]*role="menuitem"[^>]*>([^<]*)</gu)).toEqual([
+      '<button type="submit" role="menuitem" tabindex="-1" data-pending-label="Disconnecting…" data-danger>Disconnect<',
+    ]);
+    expect(reply.body).toContain('action="/connections/disconnect-operator"');
     assertNoSentinels();
   });
 
@@ -754,6 +784,94 @@ describe('page states', () => {
       expect(reply.body).toBe('');
     }
     expect((await post('/connections/add', { url: RECIPES, extra: 'x' })).status).toBe(404);
+  });
+});
+
+describe('operator servers', () => {
+  const homeBoardEntry = { type: 'http', url: HOMEBOARD };
+  const confirmation =
+    'data-confirm-title="Disconnect homeboard?" data-confirm-action="Disconnect" data-confirm-message="This removes it from your assistant and deletes its saved access to homeboard.nownow.ai. Your operator can add it back."';
+  const disconnectHomeBoard = () =>
+    post('/connections/disconnect-operator', { key: 'homeboard', host: 'homeboard.nownow.ai' });
+
+  it('disconnects a hand-wired server after a confirmation naming it and its host: entry and credential gone', async () => {
+    await updateContainerConfigJson(MAIN, 'mcp_servers', { homeboard: homeBoardEntry });
+    gateway.hold('homeboard-bearer', 'homeboard.nownow.ai');
+    gateway.hold('ledger-bearer', 'mcp.ledger.example.test');
+
+    const page = await request('/connections');
+    expect(page.body).toContain(confirmation);
+    expect(page.body).not.toContain('homeboard-bearer');
+
+    const reply = await disconnectHomeBoard();
+    expect(reply.status).toBe(200);
+    expect(reply.body).toContain('Server disconnected.');
+    expect(reply.body).not.toContain('From your operator');
+    expect(await mainServers()).toEqual({});
+    expect([...gateway.held.keys()]).toEqual(['ledger-bearer']);
+    expect(await store.pendingRestart()).toBeDefined();
+    expect((await request('/connections')).body).not.toContain('homeboard.nownow.ai');
+    assertNoSentinels();
+  });
+
+  it('keeps the server listed with Retry when a credential stays, and Retry completes the disconnect', async () => {
+    await updateContainerConfigJson(MAIN, 'mcp_servers', { homeboard: homeBoardEntry });
+    gateway.hold('homeboard-bearer', 'homeboard.nownow.ai');
+    gateway.failingIds.add(gateway.hold('homeboard-workspace', 'homeboard.nownow.ai'));
+
+    const failed = await disconnectHomeBoard();
+    expect(failed.status).toBe(200);
+    expect(failed.body).toContain('data-error="true"');
+    expect(failed.body).toContain('so it’s still connected. Try again.');
+    expect(failed.body).toContain('From your operator');
+    expect(failed.body).toMatch(/action="\/connections\/disconnect-operator" data-send>.*>Retry<\/button>/u);
+    expect(failed.body).not.toContain('homeboard-workspace');
+    expect(await mainServers()).toEqual({ homeboard: homeBoardEntry });
+    expect([...gateway.held.keys()]).toEqual(['homeboard-workspace']);
+
+    gateway.failingIds.clear();
+    const retried = await disconnectHomeBoard();
+    expect(retried.body).toContain('Server disconnected.');
+    expect(await mainServers()).toEqual({});
+    expect(gateway.held.size).toBe(0);
+  });
+
+  it('shows Disconnect unavailable on a gateway that cannot list and remove credentials by host', async () => {
+    await updateContainerConfigJson(MAIN, 'mcp_servers', { homeboard: homeBoardEntry });
+    gateway.hold('homeboard-bearer', 'homeboard.nownow.ai');
+    hostSeam = false;
+
+    const page = await request('/connections');
+    expect(page.body).toContain('Disconnect unavailable');
+    expect(page.body).not.toContain('action="/connections/disconnect-operator"');
+    expect((await disconnectHomeBoard()).status).toBe(503);
+    expect(await mainServers()).toEqual({ homeboard: homeBoardEntry });
+    expect(gateway.held.size).toBe(1);
+  });
+
+  it('refuses a key that is not an operator http entry, or a host the entry no longer has, changing nothing', async () => {
+    const connected = await connectedHomeBoard();
+    serve(recipesServer);
+    const servers = { ...(await mainServers()), calendar: { command: 'calendar-mcp' } };
+    await updateContainerConfigJson(MAIN, 'mcp_servers', {
+      ...servers,
+      recipes: { type: 'http', url: RECIPES },
+    });
+    gateway.hold('recipes-bearer', 'recipes.example.test');
+    const held = [...gateway.held.keys()];
+
+    for (const submission of [
+      { key: connected.serverKey, host: 'homeboard.nownow.ai' },
+      { key: 'calendar', host: '' },
+      { key: 'recipes', host: 'homeboard.nownow.ai' },
+    ]) {
+      const reply = await post('/connections/disconnect-operator', submission);
+      expect(reply.status).toBe(409);
+      expect(reply.body).toContain('This server changed since you opened the page.');
+    }
+    expect(await mainServers()).toEqual({ ...servers, recipes: { type: 'http', url: RECIPES } });
+    expect([...gateway.held.keys()]).toEqual(held);
+    expect((await post('/connections/disconnect-operator', { key: 'recipes' })).status).toBe(404);
   });
 });
 

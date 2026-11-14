@@ -21,6 +21,12 @@ import {
   type SignInReturn,
 } from './operations.js';
 import { appRedirectUri } from './oauth.js';
+import {
+  disconnectOperatorServer,
+  gatewayOperatorDependencies,
+  type OperatorDisconnectDependencies,
+  type OperatorDisconnectOutcome,
+} from './operator.js';
 import { renderConnectionsPage, type ConnectionsView } from './page-view.js';
 import { ConnectionsStoreError, getConnectionsStore } from './store.js';
 
@@ -31,15 +37,25 @@ interface ConnectionsPageOptions {
   readonly hostname: string;
   readonly identity: WebIdentity;
   readonly operations?: ConnectionsOperationsFactory;
+  /** Read afresh on each request, so the page offers an operator disconnect only while the gateway can do it. */
+  readonly operatorDependencies?: () => OperatorDisconnectDependencies;
 }
 
-type WriteAction = 'add' | 'connect' | 'sign-in' | 'disconnect' | 'delete' | 'rename';
+type WriteAction = 'add' | 'connect' | 'sign-in' | 'disconnect' | 'delete' | 'rename' | 'disconnect-operator';
 type Route =
   | { readonly kind: 'view'; readonly view: ConnectionsView; readonly outcome?: SignInReturn }
   | { readonly kind: 'callback'; readonly host: string; readonly query: URLSearchParams }
   | { readonly kind: 'write'; readonly action: WriteAction };
 
-const WRITES: readonly WriteAction[] = ['add', 'connect', 'sign-in', 'disconnect', 'delete', 'rename'];
+const WRITES: readonly WriteAction[] = [
+  'add',
+  'connect',
+  'sign-in',
+  'disconnect',
+  'delete',
+  'rename',
+  'disconnect-operator',
+];
 const RETURNS: readonly SignInReturn[] = ['connected', 'cancelled', 'expired', 'failed'];
 const APP_ID = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}';
 const APP_VIEW = new RegExp(`^/connections/app/(${APP_ID})/(connect|rename)$`, 'u');
@@ -60,6 +76,24 @@ const UNSUPPORTED = 'This app signs in in a way your assistant doesn’t support
 const HOST_IN_USE =
   'Another app or one of your operator’s servers already uses this address. Remove it first to add this one.';
 const OPERATOR_NEEDED = 'Apps can’t be added or connected right now. Ask your operator.';
+
+function operatorMessage(outcome: Exclude<OperatorDisconnectOutcome, 'disconnected'>): {
+  readonly status: number;
+  readonly message: string;
+} {
+  switch (outcome) {
+    case 'credentials_kept':
+      return {
+        status: 200,
+        message: 'Some of this server’s saved access couldn’t be removed, so it’s still connected. Try again.',
+      };
+    case 'changed':
+    case 'not_found':
+      return { status: 409, message: 'This server changed since you opened the page. Reload the page and try again.' };
+    case 'unavailable':
+      return { status: 503, message: 'Servers can’t be disconnected right now. Ask your operator.' };
+  }
+}
 
 function addMessage(reason: AddRefusal): string {
   switch (reason) {
@@ -224,12 +258,14 @@ interface WriteResult {
   /** A saved change that did not finish, shown as an error. */
   readonly failed?: boolean;
   readonly addName?: string;
+  readonly retryServer?: string;
 }
 
 async function write(
   action: Exclude<WriteAction, 'sign-in'>,
   data: Record<string, unknown>,
   operations: ConnectionOperations,
+  operatorDependencies: OperatorDisconnectDependencies,
 ): Promise<WriteResult> {
   const done = (view: ConnectionsView, outcome: string): WriteResult => ({ view, outcome, status: 200, saved: true });
   const refused = (view: ConnectionsView, outcome: string, status = 400): WriteResult => ({
@@ -283,6 +319,21 @@ async function write(
       await operations.rename(id, version, text(data, 'name'));
       return done({ kind: 'list' }, 'App renamed.');
     }
+    case 'disconnect-operator': {
+      only(data, ['key', 'host']);
+      const key = text(data, 'key');
+      if (!key) throw new InvalidSubmission();
+      const outcome = await disconnectOperatorServer(
+        operations.store,
+        { key, host: text(data, 'host') },
+        operatorDependencies,
+      );
+      if (outcome === 'disconnected')
+        return done({ kind: 'list' }, 'Server disconnected. Your assistant no longer has its tools.');
+      const { status, message } = operatorMessage(outcome);
+      if (outcome !== 'credentials_kept') return refused({ kind: 'list' }, message, status);
+      return { ...done({ kind: 'list' }, message), failed: true, retryServer: key };
+    }
   }
 }
 
@@ -321,6 +372,7 @@ async function startSignIn(
  */
 export function createConnectionsPageHandler(options: ConnectionsPageOptions): RequestListener {
   const factory = options.operations ?? defaultOperations;
+  const readOperatorDependencies = options.operatorDependencies ?? gatewayOperatorDependencies;
   return (request, response) => {
     const serve = async (): Promise<void> => {
       const route = readRoute(request.method, request.url);
@@ -338,6 +390,7 @@ export function createConnectionsPageHandler(options: ConnectionsPageOptions): R
         return startSignIn(response, data ?? {}, principal, operations);
       // Before any write, so a page that cannot be drawn changes nothing.
       const shell = await readShell();
+      const operatorDependencies = readOperatorDependencies();
       let result: WriteResult = {
         view: route.kind === 'view' ? route.view : { kind: 'list' },
         outcome: route.kind === 'view' && route.outcome ? RETURN_MESSAGES[route.outcome] : '',
@@ -348,7 +401,7 @@ export function createConnectionsPageHandler(options: ConnectionsPageOptions): R
         if (!operations) result = { ...result, outcome: STORE_UNAVAILABLE, status: 503 };
         else {
           try {
-            result = await write(route.action, data, operations);
+            result = await write(route.action, data, operations, operatorDependencies);
           } catch (error) {
             if (!(error instanceof ConnectionsStoreError)) throw error;
             const failure = storeFailure(error);
@@ -386,6 +439,9 @@ export function createConnectionsPageHandler(options: ConnectionsPageOptions): R
                   error: result.failed === true || (!result.saved && (status >= 400 || !listing.listed)),
                   ...(result.addName === undefined ? {} : { addName: result.addName }),
                   redirectUri: (app) => appRedirectUri(options.hostname, app.host),
+                  // Main's restart after an operator disconnect is requested through the store.
+                  operatorDisconnect: operations !== undefined && operatorDependencies.credentials !== undefined,
+                  ...(result.retryServer === undefined ? {} : { retryServer: result.retryServer }),
                 },
                 shell,
                 nonce,

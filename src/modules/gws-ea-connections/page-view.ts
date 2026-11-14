@@ -8,6 +8,7 @@ import {
 } from '../gws-ea-web/kit/index.js';
 import type { OperatorServer } from './apply.js';
 import type { ConnectionsListing } from './operations.js';
+import { operatorServerHost } from './operator.js';
 import { CONNECTIONS_PAGE_SCRIPT } from './page-client.js';
 import type { AppStatus, ConnectionApp } from './store.js';
 
@@ -24,6 +25,10 @@ export interface ConnectionsPageState {
   /** The name a refused add is redisplayed with; the address never is, since it may carry a credential. */
   readonly addName?: string;
   readonly redirectUri: (app: ConnectionApp) => string;
+  /** The gateway can find and remove an operator server's credentials, so Disconnect is offered. */
+  readonly operatorDisconnect: boolean;
+  /** The operator server whose disconnect just stopped part way, offered again as Retry. */
+  readonly retryServer?: string;
 }
 
 const STATUS_LABELS = {
@@ -84,18 +89,40 @@ function appRow(app: ConnectionApp, index: number, canChange: boolean): string {
   return `<li class="app-row"><span class="app-identity"><span class="app-name">${escapeHtml(app.name)}</span><span class="app-host">${escapeHtml(app.host)}</span></span>${statusBadge(app.status)}${appMenu(app, index, canChange)}</li>`;
 }
 
+/** The page names the host it showed, and the host disconnects only if main's entry still points there. */
+function hiddenServer(server: OperatorServer): string {
+  return `<input type="hidden" name="key" value="${escapeHtml(server.key)}"><input type="hidden" name="host" value="${escapeHtml(operatorServerHost(server) ?? '')}">`;
+}
+
+/** Names the server and its host only; which gateway credentials go is never shown. */
+function operatorConfirmation(server: OperatorServer): string {
+  const host = operatorServerHost(server);
+  const access = host ? ` and deletes its saved access to ${host}` : '';
+  return `data-confirm-title="${escapeHtml(`Disconnect ${server.key}?`)}" data-confirm-action="Disconnect" data-confirm-message="${escapeHtml(`This removes it from your assistant${access}. Your operator can add it back.`)}"`;
+}
+
+function operatorAction(server: OperatorServer, index: number, state: ConnectionsPageState): string {
+  if (!state.operatorDisconnect) return '<span class="row-note">Disconnect unavailable</span>';
+  // The principal already confirmed this disconnect, so trying again does not ask a second time.
+  if (state.retryServer === server.key)
+    return `<form class="row-action" method="post" action="/connections/disconnect-operator" data-send>${hiddenServer(server)}<button class="button button-secondary" type="submit" data-pending-label="Disconnecting…">Retry</button></form>`;
+  return renderMenu(`operator-menu-${index}`, `Actions for ${server.key}`, [
+    `<form method="post" action="/connections/disconnect-operator" data-send ${operatorConfirmation(server)}>${hiddenServer(server)}<button type="submit" role="menuitem" tabindex="-1" data-pending-label="Disconnecting…" data-danger>Disconnect</button></form>`,
+  ]);
+}
+
 /** Only the host is shown: an operator's address can carry a credential in its query. */
-function operatorRow(server: OperatorServer): string {
-  const host = hostOf(server.url);
-  return `<li class="app-row"><span class="app-identity"><span class="app-name">${escapeHtml(server.key)}</span>${host ? `<span class="app-host">${escapeHtml(host)}</span>` : ''}</span>${statusBadge('connected')}</li>`;
+function operatorRow(server: OperatorServer, index: number, state: ConnectionsPageState): string {
+  const host = operatorServerHost(server);
+  return `<li class="app-row"><span class="app-identity"><span class="app-name">${escapeHtml(server.key)}</span>${host ? `<span class="app-host">${escapeHtml(host)}</span>` : ''}</span>${statusBadge('connected')}${operatorAction(server, index, state)}</li>`;
 }
 
 function section(id: string, title: string, rows: readonly string[]): string {
   return `<section class="app-section" aria-labelledby="${id}"><h2 id="${id}">${title}</h2><ul class="app-list">${rows.join('')}</ul></section>`;
 }
 
-function appList(listing: ConnectionsListing): string {
-  const { apps, operators, canChange } = listing;
+function appList(state: ConnectionsPageState): string {
+  const { apps, operators, canChange } = state.listing;
   const notice = canChange ? '' : `<p class="notice">${UNAVAILABLE}</p>`;
   if (apps.length === 0 && operators.length === 0)
     return `${pageHeading('Connections')}${notice}<section class="empty-state"><span class="empty-icon">${icon('plus')}</span><h2>No apps yet.</h2><p class="empty-copy">Connect the apps you use so your assistant can work with them. Add an app by its address.</p>${canChange ? addLink() : ''}</section>`;
@@ -107,7 +134,15 @@ function appList(listing: ConnectionsListing): string {
           apps.map((app, index) => appRow(app, index, canChange)),
         )
       : ''
-  }${operators.length ? section('operator-heading', 'From your operator', operators.map(operatorRow)) : ''}`;
+  }${
+    operators.length
+      ? section(
+          'operator-heading',
+          'From your operator',
+          operators.map((server, index) => operatorRow(server, index, state)),
+        )
+      : ''
+  }`;
 }
 
 function addForm(state: ConnectionsPageState): string {
@@ -155,7 +190,7 @@ function pageContent(state: ConnectionsPageState): string {
   const { view } = state;
   switch (view.kind) {
     case 'list':
-      return appList(state.listing);
+      return appList(state);
     case 'add':
       return addForm(state);
     case 'connect':
@@ -183,6 +218,7 @@ const STYLE = `
 .status-connected::before { background: var(--success); }
 .status-needs-reconnecting { color: var(--danger); }
 .status-needs-reconnecting::before { background: var(--danger); }
+.row-note { color: var(--muted); font-size: 12px; white-space: nowrap; }
 .empty-copy { max-width: 400px; color: var(--muted); font-size: 13px; }
 .connect-body { padding: 28px 28px 0; }
 .connect-body form { padding: 0 0 28px; }
@@ -195,7 +231,7 @@ const STYLE = `
   .app-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px 12px; padding: 14px 12px 14px 16px; }
   .app-identity { grid-column: 1; grid-row: 1; }
   .app-row > .status { grid-column: 1; grid-row: 2; }
-  .app-row > .menu { grid-column: 2; grid-row: 1 / span 2; }
+  .app-row > .menu, .app-row > .row-action, .app-row > .row-note { grid-column: 2; grid-row: 1 / span 2; }
   .connect-body { padding: 24px 20px 0; }
   .connect-body form { padding-bottom: 24px; }
   .redirect { flex-direction: column; align-items: stretch; }
