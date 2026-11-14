@@ -22,9 +22,17 @@ function imports(barrel: string, moduleName: string): boolean {
 
 describe('release composition', () => {
   it('composes every GWS-EA host module into the module barrel', async () => {
-    const modules = (await readdir(path.join(CONTROL_PLANE_ROOT, 'src/modules'), { withFileTypes: true }))
-      .filter((entry) => entry.isDirectory() && entry.name.startsWith('gws-ea-'))
-      .map((entry) => entry.name);
+    const root = path.join(CONTROL_PLANE_ROOT, 'src/modules');
+    // A module registers through its index; a directory without one is a shared library its users import.
+    const modules = (
+      await Promise.all(
+        (await readdir(root, { withFileTypes: true }))
+          .filter((entry) => entry.isDirectory() && entry.name.startsWith('gws-ea-'))
+          .map(async (entry) =>
+            (await readdir(path.join(root, entry.name))).includes('index.ts') ? entry.name : undefined,
+          ),
+      )
+    ).filter((name): name is string => name !== undefined);
     expect(modules.length).toBeGreaterThan(0);
     const barrel = await read('src/modules/index.ts');
     expect(modules.filter((name) => !imports(barrel, `${name}/index`))).toEqual([]);
