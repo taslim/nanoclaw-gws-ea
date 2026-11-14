@@ -65,6 +65,7 @@ import { secureJobPage } from './connection.js';
 import { prepareAuthenticationIsolation } from './authentication-submit.js';
 import { coverPageTargets } from './page-targets.js';
 import { setBrowserAdmissionReady } from './group.js';
+import { useFakeGateway } from '../gws-ea-sealed-gateway/testing/fake-gateway.js';
 
 const PRINCIPAL = 'gchat:users/principal';
 const OPERATOR = 'gchat:users/operator';
@@ -455,6 +456,8 @@ describe.skipIf(!chromePath)('reviewed merchant purchases through native host de
     if (certificateRoot) fs.rmSync(certificateRoot, { recursive: true, force: true });
   });
   beforeEach(async () => {
+    // Each job's queue reconciles the browser group's gateway identity.
+    useFakeGateway();
     vi.spyOn(loginStoreModule, 'getLoginStore').mockResolvedValue(testLoginStore(`${root}/browser`).store);
     useAvailableBrowser();
     fs.rmSync(root, { recursive: true, force: true });
@@ -545,6 +548,8 @@ describe.skipIf(!chromePath)('reviewed merchant purchases through native host de
     await queue?.stop();
     await page?.context().close();
     delete process.env.GWS_EA_BROWSER_ROOT;
+    vi.unstubAllEnvs();
+    vi.unstubAllGlobals();
     await closeDb();
     fs.rmSync(root, { recursive: true, force: true });
   });

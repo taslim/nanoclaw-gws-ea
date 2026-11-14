@@ -90,6 +90,7 @@ import type { WatchRow } from './watch-state.js';
 import { readWatchRegion } from './watch-runtime.js';
 import type { StructuredBrowserLocator } from './locators.js';
 import * as nativeControlFacts from './control-facts.js';
+import { useFakeGateway } from '../gws-ea-sealed-gateway/testing/fake-gateway.js';
 
 const chromePath = process.env.GWS_EA_BROWSER_TEST_CHROME;
 let restoreLoginStore: (() => void) | undefined;
@@ -165,6 +166,8 @@ describe.skipIf(!chromePath)('wake-on-change watches in native Chrome', { timeou
     await fixture?.close();
   });
   beforeEach(async () => {
+    // Each job's queue reconciles the browser group's gateway identity.
+    useFakeGateway();
     useAvailableBrowser();
     // Date moves on in real time from the errand's afternoon, a week before the dinner; a test may jump it.
     vi.useFakeTimers({ toFake: ['Date'], shouldAdvanceTime: true });
@@ -247,6 +250,8 @@ describe.skipIf(!chromePath)('wake-on-change watches in native Chrome', { timeou
     await queue?.stop();
     await page?.context().close();
     await clearBrowserState();
+    vi.unstubAllEnvs();
+    vi.unstubAllGlobals();
   });
 
   const request = (action: string, content: Record<string, unknown>): Promise<Record<string, unknown>> =>
