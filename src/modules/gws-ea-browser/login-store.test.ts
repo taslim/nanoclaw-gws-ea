@@ -11,6 +11,7 @@ import {
   symlink,
   writeFile,
 } from 'node:fs/promises';
+import { createCipheriv, randomBytes } from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
@@ -348,6 +349,42 @@ it.each(['fill', 'reveal'] as const)(
     for (const log of logs) expect(log).not.toHaveBeenCalled();
   },
 );
+
+it('opens a store written in the established on-disk format and keeps using its key', async () => {
+  // Built with raw crypto so the format is pinned independently of the sealing code under test.
+  key = 'a7'.repeat(32);
+  const sealed = (value: string): Buffer => {
+    const iv = randomBytes(12);
+    const cipher = createCipheriv('aes-256-gcm', Buffer.from(key ?? '', 'hex'), iv, { authTagLength: 16 });
+    cipher.setAAD(Buffer.from(`gws-ea-logins:v1|${INSTANCE}`, 'utf8'));
+    const ciphertext = Buffer.concat([cipher.update(value, 'utf8'), cipher.final()]);
+    return Buffer.concat([iv, cipher.getAuthTag(), ciphertext]);
+  };
+  expect(await store.all()).toEqual([]);
+  raw((db) => {
+    db.prepare('INSERT INTO meta (id, key_check) VALUES (1, ?)').run(sealed('gws-ea-logins-key-check:v1'));
+    db.prepare(
+      'INSERT INTO logins (id, hostname, domain, username, title, password, version, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+    ).run(
+      'vault_established',
+      'accounts.cedar.example',
+      'cedar.example',
+      'alden',
+      'Cedar',
+      sealed(PASSWORD),
+      1,
+      '2026-11-01T09:00:00.000Z',
+      '2026-11-01T09:00:00.000Z',
+    );
+  });
+  expect(await loginStoreAvailability(store)).toEqual({ available: true });
+  expect(await store.secret('vault_established', 'password', 'https://cedar.example')).toBe(PASSWORD);
+  expect(await store.revealPassword('vault_established', 1)).toBe(PASSWORD);
+  const added = await store.create({ ...DETAILS, username: 'briar' });
+  expect(await store.secret(added.id, 'password', 'https://cedar.example')).toBe(PASSWORD);
+  expect(calls.filter((call) => call.args[0] === '-i')).toHaveLength(0);
+  expect(calls.every((call) => call.args.includes('gws-ea.saved-logins') || call.args[0] === '-i')).toBe(true);
+});
 
 it('binds ciphertext to the assistant even if the same key is supplied', async () => {
   const login = await store.create(DETAILS);

@@ -1,7 +1,7 @@
-import { createDecipheriv } from 'node:crypto';
 import path from 'node:path';
 import Database from 'better-sqlite3';
 import type { SanitizedCommandOutcomeRunner } from '../../../gws-ea/process.js';
+import { unseal } from '../../gws-ea-vault/seal.js';
 import { LoginStore } from '../login-store.js';
 
 export const TEST_INSTANCE_ID = 'b910edf1-4a37-47db-b3ec-415e79e792dc';
@@ -44,11 +44,11 @@ export function testLoginStore(browserRoot: string): {
           .prepare<[string], { password: Buffer | null }>('SELECT password FROM attempts WHERE id = ?')
           .get(id);
         if (!row?.password) throw new Error('Fixture has no pending password');
-        const blob = row.password;
-        const decipher = createDecipheriv('aes-256-gcm', Buffer.from('3d'.repeat(32), 'hex'), blob.subarray(0, 12));
-        decipher.setAAD(Buffer.from(`gws-ea-logins:v1|${TEST_INSTANCE_ID}`));
-        decipher.setAuthTag(blob.subarray(12, 28));
-        return Buffer.concat([decipher.update(blob.subarray(28)), decipher.final()]).toString();
+        return unseal(
+          row.password,
+          Buffer.from('3d'.repeat(32), 'hex'),
+          `gws-ea-logins:v1|${TEST_INSTANCE_ID}`,
+        ).toString('utf8');
       }),
     store: new LoginStore({ browserRoot, instanceId: TEST_INSTANCE_ID, runCommand }),
     setUnavailable: (value) => {
