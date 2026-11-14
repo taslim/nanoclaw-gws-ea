@@ -32,6 +32,10 @@ function parseRoute(url: string): ArtifactViewRoute | undefined {
     ...(match[4] ? { expectedSourceHash: match[4] } : {}),
   };
 }
+/** The hash-pinned child document renders the author's HTML; the viewer around it is host-authored. */
+export function isArtifactDocumentPath(pathname: string): boolean {
+  return parseRoute(pathname)?.expectedSourceHash !== undefined;
+}
 /** View-only origin. The caller owns listening and supplies real current authorization; there is no permissive default. */
 export function createArtifactViewHandler(
   options: ArtifactViewServerOptions,

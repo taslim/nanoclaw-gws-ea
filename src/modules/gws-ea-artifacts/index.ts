@@ -10,8 +10,11 @@ import { ArtifactsRuntime } from './runtime.js';
 import { getAllAgentGroups } from '../../db/agent-groups.js';
 import { hasArtifactsAccess } from './policy.js';
 import { webReadiness } from '../gws-ea-web/index.js';
+import { registerWebMount } from '../gws-ea-web/mounts.js';
+import { artifactsWebMount } from './web-mount.js';
 
 registerMigration(artifactsMigration);
+registerWebMount(artifactsWebMount);
 registerOutboundGuard('gws-ea-artifacts:link-access', judgeArtifactSend);
 for (const [action, handler, guard] of ARTIFACT_ACTIONS) registerDeliveryAction(action, handler, guard);
 

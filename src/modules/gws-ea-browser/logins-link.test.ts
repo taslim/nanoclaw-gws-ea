@@ -24,6 +24,7 @@ import type { WebPolicyFile } from '../gws-ea-web/policy.js';
 import { WebRuntime } from '../gws-ea-web/runtime.js';
 import './index.js';
 import { registerLoginsPageDelivery } from './logins-link.js';
+import { loginsWebMount } from './logins-mount.js';
 import { writePrivateFile } from './paths.js';
 import { configureBrowserAccess } from './testing/browser-access.js';
 import { deliverAction } from './testing/delivery-answer.js';
@@ -91,11 +92,9 @@ beforeEach(async () => {
   });
   await writePrivateFile(path.join(ROOT, 'web-policy.json'), JSON.stringify(config));
   vi.stubEnv('GWS_EA_WEB_POLICY_FILE', path.join(ROOT, 'web-policy.json'));
-  runtime = new WebRuntime(
-    { artifacts: () => (_request, response) => response.end(), logins: () => (_request, response) => response.end() },
-    async () => ['morgan@example.com'],
-    { reconcileAccess: async () => ({ verified: true, emails: ['morgan@example.com'], changed: false }) },
-  );
+  runtime = new WebRuntime(() => [loginsWebMount], {
+    reconcileAccess: async () => ({ verified: true, emails: ['morgan@example.com'], changed: false }),
+  });
   registerLoginsPageDelivery({ publicationReady: (policy) => runtime.publicationReady(policy) });
   main = (await resolveSystemSession('main', 'system:logins-link')).session;
 });

@@ -1,11 +1,26 @@
-import type { RequestListener, ServerResponse } from 'node:http';
+import type {
+  IncomingMessage,
+  OutgoingHttpHeader,
+  OutgoingHttpHeaders,
+  RequestListener,
+  ServerResponse,
+} from 'node:http';
+import { log } from '../../log.js';
+import { isPrincipalWebIdentity, type WebIdentity } from './access.js';
+import { mountCovers, normalizeWebPathname, type ArtifactReadersMount, type WebMount } from './mounts.js';
 
-export interface WebFeatures<T = RequestListener> {
-  readonly artifacts: T;
-  readonly logins: T;
+export interface WebRoute {
+  readonly mount: WebMount;
+  readonly listener: RequestListener;
+}
+export type PrincipalGate = (request: IncomingMessage) => Promise<boolean>;
+
+export function principalGate(identity: WebIdentity): PrincipalGate {
+  return async (request) => isPrincipalWebIdentity(await identity(request));
 }
 
 function finish(response: ServerResponse, status: number): void {
+  response.shouldKeepAlive = false;
   response.writeHead(status, {
     'cache-control': 'no-store',
     'content-type': 'text/plain; charset=utf-8',
@@ -19,16 +34,87 @@ export const unavailableWebHandler: RequestListener = (_request, response) => {
   finish(response, 404);
 };
 
-/** The whole hostname serves exactly these two feature mounts. */
-export function createWebHandler(hostname: string, features: WebFeatures): RequestListener {
+function headerValues(value: OutgoingHttpHeader | undefined): string[] {
+  if (value === undefined) return [];
+  return Array.isArray(value) ? value.map(String) : [String(value)];
+}
+
+function policies(
+  response: ServerResponse,
+  written: string | OutgoingHttpHeaders | OutgoingHttpHeader[] | undefined,
+): string[] {
+  const values = headerValues(response.getHeader('content-security-policy'));
+  if (Array.isArray(written)) {
+    for (let index = 0; index + 1 < written.length; index += 2)
+      if (String(written[index]).toLowerCase() === 'content-security-policy')
+        values.push(...headerValues(written[index + 1]));
+  } else if (written && typeof written === 'object') {
+    for (const [name, value] of Object.entries(written))
+      if (name.toLowerCase() === 'content-security-policy') values.push(...headerValues(value));
+  }
+  return values;
+}
+
+/** The artifacts' same-origin JSON check relies on authored content never sharing the host's origin. */
+function sandboxedOpaque(csp: readonly string[]): boolean {
+  const sandboxes = csp
+    .flatMap((policy) => policy.split(','))
+    .flatMap((policy) => policy.split(';'))
+    .map((directive) => directive.trim().toLowerCase().split(/\s+/u))
+    .filter(([name]) => name === 'sandbox');
+  return sandboxes.length > 0 && sandboxes.every((tokens) => !tokens.includes('allow-same-origin'));
+}
+
+/** A successful authored-content response without an opaque-origin sandbox is dropped before any byte is sent. */
+function requireSandbox(response: ServerResponse, mount: ArtifactReadersMount): void {
+  const writeHead = response.writeHead.bind(response);
+  response.writeHead = ((
+    statusCode: number,
+    reason?: string | OutgoingHttpHeaders | OutgoingHttpHeader[],
+    headers?: OutgoingHttpHeaders | OutgoingHttpHeader[],
+  ) => {
+    if (response.destroyed) return response;
+    const written = typeof reason === 'string' ? headers : reason;
+    if (statusCode >= 200 && statusCode < 300 && !sandboxedOpaque(policies(response, written))) {
+      log.error('Web mount sent authored content without an opaque-origin sandbox', { mount: mount.name });
+      response.destroy();
+      return response;
+    }
+    return typeof reason === 'string' ? writeHead(statusCode, reason, headers) : writeHead(statusCode, reason);
+  }) as ServerResponse['writeHead'];
+}
+
+/**
+ * The hostname serves only registered mounts. A principal mount is reached only after the principal is
+ * verified for this request, so its handler never sees anyone else.
+ */
+export function createWebHandler(
+  hostname: string,
+  routes: readonly WebRoute[],
+  principal: PrincipalGate,
+): RequestListener {
   return (request, response) => {
-    if (request.headers.host !== hostname || !request.url) return finish(response, 404);
-    const pathname = request.url.split('?', 1)[0];
-    const logins = pathname === '/logins' || pathname?.startsWith('/logins/') === true;
-    const artifacts = pathname?.startsWith('/artifacts/') === true;
-    if (!logins && !artifacts) return finish(response, 404);
-    if (request.method !== 'GET' && request.method !== 'HEAD' && !(logins && request.method === 'POST'))
-      return finish(response, 405);
-    (logins ? features.logins : features.artifacts)(request, response);
+    if (request.headers.host !== hostname) return finish(response, 404);
+    const pathname = normalizeWebPathname(request.url);
+    const route = pathname === undefined ? undefined : routes.find(({ mount }) => mountCovers(mount.path, pathname));
+    if (!pathname || !route) return finish(response, 404);
+    const { mount, listener } = route;
+    const allowed = mount.methods.some((method) => method === request.method);
+    if (mount.audience === 'artifact-readers') {
+      if (!allowed) return finish(response, 405);
+      if (mount.authoredContent(pathname)) requireSandbox(response, mount);
+      return listener(request, response);
+    }
+    void principal(request)
+      .catch((_error: unknown) => false)
+      .then((verified) => {
+        if (!verified) finish(response, 404);
+        else if (!allowed) finish(response, 405);
+        else listener(request, response);
+      })
+      .catch((_error: unknown) => {
+        if (response.headersSent) response.destroy();
+        else finish(response, 404);
+      });
   };
 }
