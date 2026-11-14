@@ -172,6 +172,28 @@ export function allowsMcpTool(policy: ClaudeCapabilityPolicy, toolName: string):
   return policy.externalMcpServers || toolName.startsWith(`mcp__${NANOCLAW_MCP_SERVER}__`);
 }
 
+/**
+ * Servers under this key prefix are the host's: it holds their credentials and the gateway supplies them, so
+ * nothing inside the container may sign in to one.
+ */
+export const HOST_MANAGED_MCP_PREFIX = 'app_';
+
+export function isHostManagedMcpServer(serverName: string): boolean {
+  return serverName.startsWith(HOST_MANAGED_MCP_PREFIX);
+}
+
+/**
+ * The tools Claude Code offers in place of a server's own when the server answers 401: one starts its own OAuth
+ * sign-in and hands the model an authorization URL, the other completes it.
+ */
+const MCP_SIGN_IN_TOOLS = ['authenticate', 'complete_authentication'] as const;
+
+export function hostManagedMcpSignInTools(serverNames: Iterable<string>): string[] {
+  return [...serverNames]
+    .filter(isHostManagedMcpServer)
+    .flatMap((name) => MCP_SIGN_IN_TOOLS.map((tool) => `${mcpToolPrefix(name)}${tool}`));
+}
+
 export interface ClaudeToolOptions {
   tools?: string[];
   allowedTools: string[];
@@ -202,7 +224,11 @@ export function resolveClaudeToolOptions(
   return {
     ...(policy.tools ? { tools: [...policy.tools] } : {}),
     allowedTools,
-    disallowedTools: [...disallowedTools, ...policy.withheldTools],
+    disallowedTools: [
+      ...disallowedTools,
+      ...policy.withheldTools,
+      ...hostManagedMcpSignInTools(Object.keys(mcpServers)),
+    ],
     mcpServers,
     ...(policy.externalMcpServers ? {} : { strictMcpConfig: true as const }),
     // The pinned CLI reads this switch beside its disableClaudeAiConnectors setting.
@@ -213,8 +239,12 @@ export function resolveClaudeToolOptions(
 // MCP server names are sanitized by the SDK when forming tool prefixes:
 // any character outside [A-Za-z0-9_-] becomes '_'. Mirror that here so our
 // allowlist patterns match what the SDK actually exposes.
+function mcpToolPrefix(serverName: string): string {
+  return `mcp__${serverName.replace(/[^a-zA-Z0-9_-]/g, '_')}__`;
+}
+
 export function mcpAllowPattern(serverName: string): string {
-  return `mcp__${serverName.replace(/[^a-zA-Z0-9_-]/g, '_')}__*`;
+  return `${mcpToolPrefix(serverName)}*`;
 }
 
 /** Claude Code's built-in plugin for authoring mods to its own interface, which a headless agent has no use for. */

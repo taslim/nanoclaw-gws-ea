@@ -132,6 +132,12 @@ interface ActiveSessionRuntime {
   startedAtMs: number;
   /** True when this runtime was adopted at startup rather than spawned here. */
   adopted: boolean;
+  /**
+   * When this host began materializing the runtime's container.json, before
+   * reading the configuration it carries. Unset for an adopted runtime: a
+   * previous host read its configuration, at a time this host cannot know.
+   */
+  configReadAtMs?: number;
   exitCallbacks: Array<() => void>;
   finished: boolean;
   finishedPromise: Promise<void>;
@@ -231,6 +237,11 @@ export function isContainerRunning(sessionId: string): boolean {
 
 export function getContainerStartedAtMs(sessionId: string): number | undefined {
   return activeContainers.get(sessionId)?.startedAtMs;
+}
+
+/** Undefined when no runtime is registered or this host did not spawn it. */
+export function getContainerConfigReadAtMs(sessionId: string): number | undefined {
+  return activeContainers.get(sessionId)?.configReadAtMs;
 }
 
 /** Stop host-local observation without revoking resources that may survive restart. */
@@ -465,6 +476,7 @@ async function spawnContainer(session: Session): Promise<void> {
   // Materialize container.json from DB — writes fresh file and returns
   // the config object, threaded through provider resolution, buildMounts,
   // and buildContainerArgs so we don't re-read.
+  const configReadAtMs = Date.now();
   const containerConfig = await materializeContainerJson(agentGroup.id);
 
   const providerName = resolveProviderName(session.agent_provider, containerConfig.provider);
@@ -552,6 +564,7 @@ async function spawnContainer(session: Session): Promise<void> {
   }
   const runtime = registerRuntime(session.id, handle, gatewaySession, containerName, false);
   runtime.claimIncarnation = claimIncarnation;
+  runtime.configReadAtMs = configReadAtMs;
 
   await armSessionLifecycle({
     handle,
