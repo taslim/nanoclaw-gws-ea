@@ -1,6 +1,8 @@
 import { ALLOW, DENY, defineGuardedAction } from '../../guard/index.js';
 import { getMainAgentGroupId } from '../gws-ea-profile/db.js';
 import type { PrincipalPageMount } from '../gws-ea-web/mounts.js';
+import { hostOf } from './admit.js';
+import type { OperatorServer } from './apply.js';
 import { readListing, type ConnectionsListing } from './operations.js';
 import { createConnectionsPageHandler } from './page.js';
 import { ConnectionsStoreError, getConnectionsStore, type AppStatus } from './store.js';
@@ -45,6 +47,13 @@ export interface ConnectionLinkFact {
   readonly status: AppStatus;
 }
 
+/** The host knows nothing of an operator server beyond its entry, so a present entry is connected. */
+export function operatorAsApp(server: OperatorServer): ConnectionLinkFact | undefined {
+  const host = hostOf(server.url);
+  // An entry without a host reaches no server, so there is nothing of it to show.
+  return host ? { name: server.key, key: server.key, host, origin: 'operator', status: 'connected' } : undefined;
+}
+
 /** Main learns which apps exist and how they stand, never an address that could carry a credential. */
 export async function connectionsLinkFacts(
   read: () => Promise<ConnectionsListing> = currentListing,
@@ -61,10 +70,7 @@ export async function connectionsLinkFacts(
           status,
         }),
       ),
-      ...operators.flatMap(({ key, url }): ConnectionLinkFact[] => {
-        const host = URL.parse(url)?.hostname;
-        return host ? [{ name: key, key, host, origin: 'operator', status: 'connected' }] : [];
-      }),
+      ...operators.flatMap((server) => operatorAsApp(server) ?? []),
     ],
   };
 }

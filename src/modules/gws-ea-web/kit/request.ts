@@ -1,11 +1,23 @@
-import type { IncomingMessage } from 'node:http';
+import type { IncomingMessage, ServerResponse } from 'node:http';
 import { isRecord } from '../../../gws-ea/validation.js';
 import { isPrincipalWebIdentity, type WebIdentity } from '../access.js';
+import { refuse, sendUnavailable } from './headers.js';
 
 export const MAX_SUBMISSION_BYTES = 16 * 1024;
 
 /** Refused with the same empty not-found as any other refusal. */
 export class InvalidSubmission extends Error {}
+
+/** The principal's verified address, for a page that records who acted; undefined for anyone else. */
+export async function principalEmail(
+  request: IncomingMessage,
+  hostname: string,
+  identity: WebIdentity,
+): Promise<string | undefined> {
+  if (request.headers.host !== hostname) return undefined;
+  const email = await identity(request);
+  return (await isPrincipalWebIdentity(email)) ? email : undefined;
+}
 
 /** Checked afresh by each page, in addition to the web module's own gate, before anything is read. */
 export async function isPrincipalRequest(
@@ -13,7 +25,19 @@ export async function isPrincipalRequest(
   hostname: string,
   identity: WebIdentity,
 ): Promise<boolean> {
-  return request.headers.host === hostname && (await isPrincipalWebIdentity(await identity(request)));
+  return (await principalEmail(request, hostname, identity)) !== undefined;
+}
+
+/**
+ * Serves one request; a failure after the response began cuts the connection, a malformed submission gets the
+ * ordinary refusal, and anything else answers unavailable.
+ */
+export function handle(response: ServerResponse, serve: () => Promise<void>): void {
+  void serve().catch((error: unknown) => {
+    if (response.headersSent) response.destroy();
+    else if (error instanceof InvalidSubmission) refuse(response);
+    else sendUnavailable(response);
+  });
 }
 
 /**

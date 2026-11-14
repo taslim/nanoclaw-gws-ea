@@ -7,12 +7,12 @@
  * grant that breaks again after a reconnect is a new one.
  */
 import { getContainerConfigReadAtMs, isContainerRunning } from '../../container-runner.js';
-import { getDb } from '../../db/connection.js';
 import { getContainerConfig } from '../../db/container-configs.js';
 import { getSessionsByAgentGroup } from '../../db/sessions.js';
 import { log } from '../../log.js';
-import { getMainAgentGroupId } from '../gws-ea-profile/db.js';
+import { readMainAgentGroupId } from '../gws-ea-profile/db.js';
 import { writeNoteForMain, type NoteForMain, type NoteForMainResult } from '../gws-ea-profile/main-note.js';
+import { createPendingPoller } from './poller.js';
 import type { RefusedApp } from './refresher.js';
 import { ConnectionsStoreError, type ConnectionApp, type ConnectionsStore } from './store.js';
 
@@ -37,10 +37,6 @@ export interface ReconnectNotes {
   owe(app: RefusedApp): void;
   /** Writes every owed note nothing holds back; returns whether any is still owed. */
   deliver(): Promise<boolean>;
-}
-
-async function mainAgentGroupId(): Promise<string | null> {
-  return (await getDb().hasTable('gws_ea_profile')) ? getMainAgentGroupId() : null;
 }
 
 async function mainServerKeys(agentGroupId: string): Promise<ReadonlySet<string>> {
@@ -88,7 +84,7 @@ export function createReconnectNotes(
     }
     // Reconnected, disconnected or deleted since: nothing is broken to report.
     if (app.status !== 'needs_reconnecting') return undefined;
-    const mainId = await mainAgentGroupId();
+    const mainId = await readMainAgentGroupId();
     if (mainId !== null) {
       if ((await mainServerKeys(mainId)).has(app.serverKey))
         return { appId: entry.appId, generation: entry.generation };
@@ -130,45 +126,11 @@ export function createReconnectNotes(
   };
 }
 
-let armed: { readonly notes: ReconnectNotes; readonly signal: AbortSignal } | undefined;
-let timer: NodeJS.Timeout | undefined;
-let inFlight: Promise<void> | undefined;
-let recheck = false;
-
-function stopTimer(): void {
-  if (timer) clearInterval(timer);
-  timer = undefined;
-}
-
-function tick(): void {
-  if (!armed || armed.signal.aborted) return;
-  if (inFlight) {
-    recheck = true;
-    return;
-  }
-  const { notes } = armed;
-  inFlight = notes
-    .deliver()
-    .catch((err: unknown) => {
-      log.error('Reconnect notes check failed', { err });
-      return true;
-    })
-    .then((pending) => {
-      inFlight = undefined;
-      if (recheck) {
-        recheck = false;
-        tick();
-      } else if (!pending) stopTimer();
-    });
-}
-
-function checkWhileOwed(): void {
-  if (!timer) {
-    timer = setInterval(tick, NOTE_CHECK_INTERVAL_MS);
-    timer.unref();
-  }
-  tick();
-}
+const delivery = createPendingPoller<ReconnectNotes>({
+  intervalMs: NOTE_CHECK_INTERVAL_MS,
+  run: (notes) => notes.deliver(),
+  onError: (err) => log.error('Reconnect notes check failed', { err }),
+});
 
 /**
  * Arms delivery for this host and owes again every grant the store still holds refused, so a note a previous host
@@ -181,8 +143,7 @@ export async function startReconnectNotes(
 ): Promise<void> {
   if (signal.aborted) return;
   const notes = createReconnectNotes(store, dependencies);
-  armed = { notes, signal };
-  signal.addEventListener('abort', stopTimer, { once: true });
+  delivery.arm(notes, signal);
   let refused: readonly RefusedApp[];
   try {
     refused = await store.refusedGrants();
@@ -191,22 +152,20 @@ export async function startReconnectNotes(
     log.warn('Reconnect notes not owed again: the connections store is unavailable', { code: error.reason });
     return;
   }
-  if (armed?.notes !== notes || signal.aborted || refused.length === 0) return;
+  if (delivery.current() !== notes || signal.aborted || refused.length === 0) return;
   for (const app of refused) notes.owe(app);
-  checkWhileOwed();
+  delivery.soon();
 }
 
 /** The refresher's `onRefused`: records the note and checks now, then every few seconds while one is owed. */
 export function oweReconnectNote(app: RefusedApp): void {
-  if (!armed || armed.signal.aborted) return;
-  armed.notes.owe(app);
-  checkWhileOwed();
+  const notes = delivery.current();
+  if (!notes) return;
+  notes.owe(app);
+  delivery.soon();
 }
 
 /** Stops new checks and waits for one in flight. */
-export async function stopReconnectNotes(): Promise<void> {
-  armed = undefined;
-  recheck = false;
-  stopTimer();
-  await inFlight;
+export function stopReconnectNotes(): Promise<void> {
+  return delivery.stop();
 }

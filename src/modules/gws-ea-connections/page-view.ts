@@ -6,11 +6,12 @@ import {
   renderPrincipalPage,
   type Shell,
 } from '../gws-ea-web/kit/index.js';
+import { hostOf } from './admit.js';
 import type { OperatorServer } from './apply.js';
 import type { ConnectionsListing } from './operations.js';
 import { operatorServerHost } from './operator.js';
 import { CONNECTIONS_PAGE_SCRIPT } from './page-client.js';
-import type { AppStatus, ConnectionApp } from './store.js';
+import { NAME_MAX, type AppStatus, type ConnectionApp } from './store.js';
 
 export type ConnectionsView =
   | { readonly kind: 'list' }
@@ -41,10 +42,6 @@ const UNAVAILABLE = 'Apps can’t be added or connected right now. Ask your oper
 
 function appUrl(app: Pick<ConnectionApp, 'id'>, action: 'connect' | 'rename'): string {
   return `/connections/app/${encodeURIComponent(app.id)}/${action}`;
-}
-
-function hostOf(url: string | null): string | undefined {
-  return url === null ? undefined : (URL.parse(url)?.hostname ?? undefined);
 }
 
 function pageHeading(title: string, metadata = '', action = ''): string {
@@ -148,7 +145,7 @@ function appList(state: ConnectionsPageState): string {
 function addForm(state: ConnectionsPageState): string {
   const heading = `${backLink()}${pageHeading('Add app')}`;
   if (!state.listing.canChange) return `${heading}<p class="notice">${UNAVAILABLE}</p>`;
-  return `${heading}<section class="panel form-panel"><form method="post" action="/connections/add" data-send><div class="field"><label for="url">Address</label><input id="url" name="url" type="url" inputmode="url" autocomplete="off" autocapitalize="none" spellcheck="false" placeholder="https://example.com/mcp" required aria-describedby="url-hint"><p class="field-hint" id="url-hint">The app’s MCP server address. Leave out any token or key; you can enter one when you connect.</p></div><div class="field"><label for="name">Name <span class="optional" aria-hidden="true">Optional</span></label><input id="name" name="name" type="text" maxlength="100" autocomplete="off" value="${escapeHtml(state.addName ?? '')}" aria-describedby="name-hint"><p class="field-hint" id="name-hint">Leave blank to use the name the app gives itself.</p></div><div class="form-actions"><button class="button button-primary" type="submit" data-pending-label="Checking…">Add app</button><a class="button button-secondary" href="/connections" data-navigation>Cancel</a></div></form></section>`;
+  return `${heading}<section class="panel form-panel"><form method="post" action="/connections/add" data-send><div class="field"><label for="url">Address</label><input id="url" name="url" type="url" inputmode="url" autocomplete="off" autocapitalize="none" spellcheck="false" placeholder="https://example.com/mcp" required aria-describedby="url-hint"><p class="field-hint" id="url-hint">The app’s MCP server address. Leave out any token or key; you can enter one when you connect.</p></div><div class="field"><label for="name">Name <span class="optional" aria-hidden="true">Optional</span></label><input id="name" name="name" type="text" maxlength="${NAME_MAX}" autocomplete="off" value="${escapeHtml(state.addName ?? '')}" aria-describedby="name-hint"><p class="field-hint" id="name-hint">Leave blank to use the name the app gives itself.</p></div><div class="form-actions"><button class="button button-primary" type="submit" data-pending-label="Checking…">Add app</button><a class="button button-secondary" href="/connections" data-navigation>Cancel</a></div></form></section>`;
 }
 
 function trustNotice(app: ConnectionApp): string {
@@ -156,7 +153,7 @@ function trustNotice(app: ConnectionApp): string {
 }
 
 function connectForm(app: ConnectionApp, state: ConnectionsPageState): string {
-  const signInHost = hostOf(app.issuer) ?? app.host;
+  const signInHost = (app.issuer === null ? undefined : hostOf(app.issuer)) ?? app.host;
   const submit = (label: string, pending: string) =>
     `<div class="form-actions"><button class="button button-primary" type="submit" data-pending-label="${pending}">${label}</button><a class="button button-secondary" href="/connections" data-navigation>Cancel</a></div>`;
   switch (app.auth) {
@@ -183,7 +180,7 @@ function connectView(app: ConnectionApp, state: ConnectionsPageState): string {
 }
 
 function renameView(app: ConnectionApp): string {
-  return `${backLink()}${pageHeading('Rename app', escapeHtml(app.host))}<section class="panel form-panel"><form method="post" action="/connections/rename" data-send data-track-changes>${hiddenApp(app)}<div class="field"><label for="name">Name</label><input id="name" name="name" type="text" maxlength="100" autocomplete="off" required value="${escapeHtml(app.name)}" aria-describedby="rename-hint"><p class="field-hint" id="rename-hint">Only the name changes; your assistant keeps the app’s tools.</p></div><div class="form-actions"><button class="button button-primary" type="submit">Save name</button><a class="button button-secondary" href="/connections" data-navigation>Cancel</a></div></form></section>`;
+  return `${backLink()}${pageHeading('Rename app', escapeHtml(app.host))}<section class="panel form-panel"><form method="post" action="/connections/rename" data-send data-track-changes>${hiddenApp(app)}<div class="field"><label for="name">Name</label><input id="name" name="name" type="text" maxlength="${NAME_MAX}" autocomplete="off" required value="${escapeHtml(app.name)}" aria-describedby="rename-hint"><p class="field-hint" id="rename-hint">Only the name changes; your assistant keeps the app’s tools.</p></div><div class="form-actions"><button class="button button-primary" type="submit">Save name</button><a class="button button-secondary" href="/connections" data-navigation>Cancel</a></div></form></section>`;
 }
 
 function pageContent(state: ConnectionsPageState): string {

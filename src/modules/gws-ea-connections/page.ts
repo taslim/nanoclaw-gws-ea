@@ -1,16 +1,17 @@
-import type { IncomingMessage, RequestListener, ServerResponse } from 'node:http';
-import { isPrincipalWebIdentity, type WebIdentity } from '../gws-ea-web/access.js';
+import type { RequestListener, ServerResponse } from 'node:http';
+import type { WebIdentity } from '../gws-ea-web/access.js';
 import {
+  handle,
   InvalidSubmission,
   pageHeaders,
   pageNonce,
+  principalEmail,
   readShell,
   readSubmission,
   refuse,
   sameOriginJson,
   sendJson,
   sendPage,
-  sendUnavailable,
 } from '../gws-ea-web/kit/index.js';
 import {
   ConnectionOperations,
@@ -28,7 +29,7 @@ import {
   type OperatorDisconnectOutcome,
 } from './operator.js';
 import { renderConnectionsPage, type ConnectionsView } from './page-view.js';
-import { ConnectionsStoreError, getConnectionsStore } from './store.js';
+import { ConnectionsStoreError, getConnectionsStore, NAME_MAX } from './store.js';
 
 /** Builds the operations for one request; a store that cannot be opened leaves the page listing what it can. */
 export type ConnectionsOperationsFactory = (webHostname: string) => Promise<ConnectionOperations>;
@@ -41,23 +42,15 @@ interface ConnectionsPageOptions {
   readonly operatorDependencies?: () => OperatorDisconnectDependencies;
 }
 
-type WriteAction = 'add' | 'connect' | 'sign-in' | 'disconnect' | 'delete' | 'rename' | 'disconnect-operator';
+const WRITES = ['add', 'connect', 'sign-in', 'disconnect', 'delete', 'rename', 'disconnect-operator'] as const;
+type WriteAction = (typeof WRITES)[number];
 type Route =
   | { readonly kind: 'view'; readonly view: ConnectionsView; readonly outcome?: SignInReturn }
   | { readonly kind: 'callback'; readonly host: string; readonly query: URLSearchParams }
   | { readonly kind: 'write'; readonly action: WriteAction };
 
-const WRITES: readonly WriteAction[] = [
-  'add',
-  'connect',
-  'sign-in',
-  'disconnect',
-  'delete',
-  'rename',
-  'disconnect-operator',
-];
-const RETURNS: readonly SignInReturn[] = ['connected', 'cancelled', 'expired', 'failed', 'client_refused'];
 const APP_ID = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}';
+const EXACT_APP_ID = new RegExp(`^${APP_ID}$`, 'u');
 const APP_VIEW = new RegExp(`^/connections/app/(${APP_ID})/(connect|rename)$`, 'u');
 const CALLBACK = /^\/connections\/callback\/([a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?)$/u;
 
@@ -69,6 +62,10 @@ const RETURN_MESSAGES = {
   failed: 'Sign-in didn’t finish. The app wasn’t changed. Try connecting again.',
   client_refused: 'The app’s sign-in service refused the client details, so they were removed. Connect the app again.',
 } satisfies Record<SignInReturn, string>;
+
+function isSignInReturn(code: string | null): code is SignInReturn {
+  return code !== null && Object.hasOwn(RETURN_MESSAGES, code);
+}
 
 const CHANGED = 'This app changed since you opened the page. Reload the page and try again.';
 const STORE_UNAVAILABLE = 'Your apps can’t be read right now. Ask your operator.';
@@ -96,6 +93,11 @@ function operatorMessage(outcome: Exclude<OperatorDisconnectOutcome, 'disconnect
   }
 }
 
+/** A refusal that a reload settles is a conflict; any other is the request's own fault. */
+function connectRefusalStatus(reason: ConnectRefusal): number {
+  return reason === 'wrong_method' || reason === 'already_connected' ? 409 : 400;
+}
+
 function addMessage(reason: AddRefusal): string {
   switch (reason) {
     case 'invalid_url':
@@ -117,7 +119,7 @@ function addMessage(reason: AddRefusal): string {
     case 'duplicate_name':
       return 'Another app already has that name. Choose a different name.';
     case 'invalid_name':
-      return 'Enter a name of at most 100 characters, without control characters.';
+      return `Enter a name of at most ${NAME_MAX} characters, without control characters.`;
   }
 }
 
@@ -180,7 +182,8 @@ function readRoute(method: string | undefined, url: string | undefined): Route |
   if (pathname === '/connections') {
     if (search === undefined) return { kind: 'view', view: { kind: 'list' } };
     const query = new URLSearchParams(search);
-    const outcome = RETURNS.find((code) => code === query.get('outcome'));
+    const code = query.get('outcome');
+    const outcome = isSignInReturn(code) ? code : undefined;
     return outcome && [...query.keys()].length === 1 ? { kind: 'view', view: { kind: 'list' }, outcome } : undefined;
   }
   if (search !== undefined) return undefined;
@@ -218,16 +221,9 @@ function appReference(data: Record<string, unknown>): { readonly id: string; rea
   const id = text(data, 'id');
   const raw = text(data, 'version');
   const version = Number(raw);
-  if (!new RegExp(`^${APP_ID}$`, 'u').test(id) || !/^[1-9]\d*$/u.test(raw) || !Number.isSafeInteger(version))
+  if (!EXACT_APP_ID.test(id) || !/^[1-9]\d*$/u.test(raw) || !Number.isSafeInteger(version))
     throw new InvalidSubmission();
   return { id, version };
-}
-
-/** The Access-verified principal, checked afresh on this request; their address names a sign-in's owner. */
-async function principalOf(request: IncomingMessage, options: ConnectionsPageOptions): Promise<string | undefined> {
-  if (request.headers.host !== options.hostname) return undefined;
-  const email = await options.identity(request);
-  return (await isPrincipalWebIdentity(email)) ? email : undefined;
 }
 
 async function defaultOperations(webHostname: string): Promise<ConnectionOperations> {
@@ -281,7 +277,7 @@ async function write(
       const addName = text(data, 'name');
       const added = await operations.add({ url: text(data, 'url'), name: addName });
       if (added.status === 'refused')
-        return { ...refused({ kind: 'add' }, addMessage(added.reason)), addName: addName.slice(0, 100) };
+        return { ...refused({ kind: 'add' }, addMessage(added.reason)), addName: addName.slice(0, NAME_MAX) };
       return done({ kind: 'connect', id: added.app.id }, 'App added. Connect it to give your assistant its tools.');
     }
     case 'connect': {
@@ -292,7 +288,7 @@ async function write(
         return refused(
           { kind: 'connect', id },
           connectMessage(connected.reason),
-          connected.reason === 'wrong_method' || connected.reason === 'already_connected' ? 409 : 400,
+          connectRefusalStatus(connected.reason),
         );
       return done({ kind: 'list' }, RETURN_MESSAGES.connected);
     }
@@ -358,8 +354,7 @@ async function startSignIn(
       clientId || clientSecret ? { clientId, clientSecret } : undefined,
     );
     if (started.status === 'started') return sendJson(response, 200, { authorizationUrl: started.authorizationUrl });
-    const conflict = started.reason === 'wrong_method' || started.reason === 'already_connected';
-    sendJson(response, conflict ? 409 : 400, { error: connectMessage(started.reason) });
+    sendJson(response, connectRefusalStatus(started.reason), { error: connectMessage(started.reason) });
   } catch (error) {
     if (!(error instanceof ConnectionsStoreError)) throw error;
     const failure = storeFailure(error);
@@ -378,7 +373,8 @@ export function createConnectionsPageHandler(options: ConnectionsPageOptions): R
     const serve = async (): Promise<void> => {
       const route = readRoute(request.method, request.url);
       if (!route) return refuse(response);
-      const principal = await principalOf(request, options);
+      // Their address names a sign-in's owner.
+      const principal = await principalEmail(request, options.hostname, options.identity);
       if (!principal) return refuse(response);
       if (route.kind === 'write' && !sameOriginJson(request, options.hostname)) return refuse(response);
       const data = route.kind === 'write' ? await readSubmission(request) : undefined;
@@ -449,10 +445,6 @@ export function createConnectionsPageHandler(options: ConnectionsPageOptions): R
               ),
       });
     };
-    void serve().catch((error: unknown) => {
-      if (response.headersSent) response.destroy();
-      else if (error instanceof InvalidSubmission) refuse(response);
-      else sendUnavailable(response);
-    });
+    handle(response, serve);
   };
 }

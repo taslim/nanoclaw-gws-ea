@@ -1,6 +1,7 @@
 import type { RequestListener } from 'node:http';
 import type { WebIdentity } from '../gws-ea-web/access.js';
 import {
+  handle,
   InvalidSubmission,
   isPrincipalRequest,
   pageNonce,
@@ -10,7 +11,6 @@ import {
   sameOriginJson,
   sendJson,
   sendPage,
-  sendUnavailable,
 } from '../gws-ea-web/kit/index.js';
 import { credentialAttempts, type CredentialAttempts } from './credential-attempts.js';
 import {
@@ -230,10 +230,6 @@ export function createLoginsPageHandler(options: LoginsPageOptions): RequestList
             : renderLoginsPage({ rows, view, outcome, available, error: status >= 400 && !saved }, shell, nonce),
       });
     };
-    void serve().catch((error: unknown) => {
-      if (response.headersSent) response.destroy();
-      else if (error instanceof InvalidSubmission) refuse(response);
-      else sendUnavailable(response);
-    });
+    handle(response, serve);
   };
 }

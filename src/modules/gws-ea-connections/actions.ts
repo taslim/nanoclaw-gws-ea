@@ -20,15 +20,21 @@ import { clearOutbox, withExistingMailboxSession } from '../../session-manager.j
 import type { PendingApproval, Session } from '../../types.js';
 import { registerApprovalHandler, requestApproval } from '../approvals/index.js';
 import { quoted } from '../approvals/request-text.js';
-import { getMainAgentGroupId, principalApproverUserId } from '../gws-ea-profile/db.js';
+import { principalApproverUserId, readMainAgentGroupId } from '../gws-ea-profile/db.js';
 import { writeNoteForMain, type NoteForMain, type NoteForMainResult } from '../gws-ea-profile/main-note.js';
 import { readWebPolicy } from '../gws-ea-web/policy.js';
-import { admissionDependencies, admitAppUrl, type AdmissionDependencies } from './admit.js';
+import { admissionDependencies, admitAppUrl, hostOf, type AdmissionDependencies } from './admit.js';
 import { APP_SERVER_PREFIX } from './apply.js';
-import type { ConnectionOAuthOptions } from './oauth.js';
+import type { ConnectionOAuthOptions, SignInServer } from './oauth.js';
 import { ConnectionOperations, type AddRefusal, type ConnectRefusal } from './operations.js';
 import { probeApp, type SignInMethod } from './probe.js';
-import { ConnectionsStoreError, getConnectionsStore, type ConnectionApp, type ConnectionsStore } from './store.js';
+import {
+  ConnectionsStoreError,
+  getConnectionsStore,
+  NAME_MAX,
+  type ConnectionApp,
+  type ConnectionsStore,
+} from './store.js';
 
 export const ADD_APP_ACTION = 'add_app';
 export const DELETE_APP_ACTION = 'delete_app';
@@ -49,13 +55,15 @@ export interface AppActionDependencies {
   readonly writeNote?: (note: NoteForMain) => Promise<NoteForMainResult>;
 }
 
-const NAME_MAX = 100;
 const ADD_FIELDS: ReadonlySet<string> = new Set(['action', 'requestId', 'url', 'name']);
 /** The approved request also carries the app's id, so it deletes exactly the app the principal saw. */
 const DELETE_FIELDS: ReadonlySet<string> = new Set(['action', 'requestId', 'app', 'id']);
 
 type AddAnswer = AddRefusal | AppsUnavailable;
 type DeleteAnswer = AppsUnavailable | 'operator_server' | 'not_found';
+
+const OPERATOR_NEEDED =
+  'Web is not set up, so the principal has no Connections page. Tell them to ask their operator to finish setup.';
 
 const ADD_REFUSED: Readonly<Record<AddAnswer, string>> = {
   invalid_url: 'That is not an address the host can use: it needs a plain https host name, with no port or fragment.',
@@ -69,9 +77,8 @@ const ADD_REFUSED: Readonly<Record<AddAnswer, string>> = {
   unreachable: 'The server did not answer. Try again later.',
   unsupported: "The server's sign-in cannot be used, so it cannot be added.",
   duplicate_name: 'Another app already has this name. Choose another.',
-  invalid_name: 'The name must be 1 to 100 characters, with no control characters.',
-  operator_needed:
-    'Web is not set up, so the principal has no Connections page. Tell them to ask their operator to finish setup.',
+  invalid_name: `The name must be 1 to ${NAME_MAX} characters, with no control characters.`,
+  operator_needed: OPERATOR_NEEDED,
 };
 
 const DELETE_REFUSED: Readonly<Record<DeleteAnswer, string>> = {
@@ -79,8 +86,7 @@ const DELETE_REFUSED: Readonly<Record<DeleteAnswer, string>> = {
     "That server is the operator's. The principal can disconnect it on their Connections page; it cannot be deleted from chat.",
   not_found: 'No app the principal added has this key. Check the app keys principal_page connections lists.',
   unavailable: 'Apps cannot be changed right now. Try again later.',
-  operator_needed:
-    'Web is not set up, so the principal has no Connections page. Tell them to ask their operator to finish setup.',
+  operator_needed: OPERATOR_NEEDED,
 };
 
 const CONNECT_REFUSED: Readonly<Record<ConnectRefusal, string>> = {
@@ -98,12 +104,9 @@ const CONNECT_REFUSED: Readonly<Record<ConnectRefusal, string>> = {
   publish_failed: 'its credential could not be stored',
 };
 
-async function canonicalMain(): Promise<string | null> {
-  return (await getDb().hasTable('gws_ea_profile')) ? getMainAgentGroupId() : null;
-}
-
 async function principalHold({ actor, grant }: GuardInput, what: string): Promise<GuardDecision> {
-  if (actor.kind !== 'agent' || actor.agentGroupId !== (await canonicalMain())) return DENY(`Only main may ${what}.`);
+  if (actor.kind !== 'agent' || actor.agentGroupId !== (await readMainAgentGroupId()))
+    return DENY(`Only main may ${what}.`);
   const principal = await principalApproverUserId();
   if (!principal) return DENY(`No verified principal can approve this, so main cannot ${what} now.`);
   // An approval from whoever was principal before stays theirs.
@@ -131,7 +134,7 @@ export const deleteAppGuard = defineGuardedAction({
 registerMcpServerPolicy('gws-ea-connections:main-apps', async ({ agentGroupId, serverName }) => {
   if (serverName?.startsWith(APP_SERVER_PREFIX))
     return `server names starting with ${APP_SERVER_PREFIX} belong to the principal's connected apps`;
-  if (agentGroupId === (await canonicalMain()))
+  if (agentGroupId === (await readMainAgentGroupId()))
     return "main's MCP servers are the principal's apps: use add_app or delete_app, and the principal connects apps on their Connections page";
   return undefined;
 });
@@ -207,6 +210,10 @@ async function heldAlready(session: Session, action: string, payload: Record<str
   );
 }
 
+function authorizationHost(signIn: SignInServer): string {
+  return new URL(signIn.server.authorizationEndpoint).hostname;
+}
+
 function signInLine(method: SignInMethod): string {
   switch (method.kind) {
     case 'none':
@@ -214,7 +221,7 @@ function signInLine(method: SignInMethod): string {
     case 'token':
       return 'It signs in with a token you would enter on your Connections page.';
     case 'oauth':
-      return `You would sign in at ${new URL(method.signIn.server.authorizationEndpoint).hostname}.`;
+      return `You would sign in at ${authorizationHost(method.signIn)}.`;
   }
 }
 
@@ -225,7 +232,7 @@ function signInHost(method: SignInMethod): string {
     case 'token':
       return 'token';
     case 'oauth':
-      return new URL(method.signIn.server.authorizationEndpoint).hostname;
+      return authorizationHost(method.signIn);
   }
 }
 
@@ -234,8 +241,8 @@ function payloadOf(approval: PendingApproval): Record<string, unknown> {
   return isRecord(parsed) ? parsed : {};
 }
 
-function hostOf(url: unknown): string {
-  return (typeof url === 'string' && URL.parse(url)?.hostname) || 'an unreadable address';
+function hostText(url: unknown): string {
+  return (typeof url === 'string' ? hostOf(url) : undefined) ?? 'an unreadable address';
 }
 
 function reasonSuffix(reason: string | undefined): string {
@@ -245,7 +252,7 @@ function reasonSuffix(reason: string | undefined): string {
 registerApprovalHandler(ADD_APP_ACTION, reenterGuardedDeliveryAction(ADD_APP_ACTION), {
   restartSafe: true,
   rejectionNote: (approval, reason) =>
-    `The principal declined adding the app at ${hostOf(payloadOf(approval).url)}${reasonSuffix(reason)}. Nothing was added.`,
+    `The principal declined adding the app at ${hostText(payloadOf(approval).url)}${reasonSuffix(reason)}. Nothing was added.`,
 });
 registerApprovalHandler(DELETE_APP_ACTION, reenterGuardedDeliveryAction(DELETE_APP_ACTION), {
   restartSafe: true,
@@ -351,6 +358,33 @@ export function createAppActions(dependencies: AppActionDependencies) {
     });
   }
 
+  /** Main reads how an approved request ended; a store that fails part way leaves it to check before asking again. */
+  async function noteSettled(
+    session: Session,
+    requestId: string,
+    note: {
+      readonly kind: 'add' | 'delete';
+      readonly settle: () => Promise<string>;
+      readonly unfinished: string;
+      readonly wake: boolean;
+    },
+  ): Promise<void> {
+    let text: string;
+    try {
+      text = await note.settle();
+    } catch (error) {
+      if (!(error instanceof ConnectionsStoreError)) throw error;
+      log.warn(`Approved app ${note.kind} did not finish`, { code: error.reason });
+      text = note.unfinished;
+    }
+    await writeNote({
+      id: `connection-${note.kind}:${session.id}:${requestId}`,
+      timestamp: new Date().toISOString(),
+      text,
+      wake: note.wake,
+    });
+  }
+
   async function requestAddHold(content: Record<string, unknown>, session: Session): Promise<void> {
     const request = addRequest(content, requestIdOf(content) ?? '');
     if (await alreadyAnswered(session, request.requestId)) return;
@@ -379,7 +413,7 @@ export function createAppActions(dependencies: AppActionDependencies) {
 
   /** What main reads once an approved add has run: the app as it now stands, or why it was not added. */
   async function settleAdd(request: AddRequest): Promise<string> {
-    const host = hostOf(request.url);
+    const host = hostText(request.url);
     const approved = `The principal approved adding ${JSON.stringify(request.name)} at ${host}`;
     const context = await dependencies.context();
     if (typeof context === 'string') return `${approved}, but it could not be added: ${ADD_REFUSED[context]}`;
@@ -402,18 +436,10 @@ export function createAppActions(dependencies: AppActionDependencies) {
 
   const applyAdd: GuardedDeliveryHandler = async (content, session) => {
     const request = addRequest(content, requestIdOf(content) ?? '');
-    let text: string;
-    try {
-      text = await settleAdd(request);
-    } catch (error) {
-      if (!(error instanceof ConnectionsStoreError)) throw error;
-      log.warn('Approved app add did not finish', { code: error.reason });
-      text = `The principal approved adding ${JSON.stringify(request.name)} at ${hostOf(request.url)}, but it could not be finished right now. Check principal_page connections before asking again.`;
-    }
-    await writeNote({
-      id: `connection-add:${session.id}:${request.requestId}`,
-      timestamp: new Date().toISOString(),
-      text,
+    await noteSettled(session, request.requestId, {
+      kind: 'add',
+      settle: () => settleAdd(request),
+      unfinished: `The principal approved adding ${JSON.stringify(request.name)} at ${hostText(request.url)}, but it could not be finished right now. Check principal_page connections before asking again.`,
       wake: true,
     });
   };
@@ -457,18 +483,10 @@ export function createAppActions(dependencies: AppActionDependencies) {
 
   const applyDelete: GuardedDeliveryHandler = async (content, session) => {
     const request = deleteRequest(content, requestIdOf(content) ?? '');
-    let text: string;
-    try {
-      text = await settleDelete(request);
-    } catch (error) {
-      if (!(error instanceof ConnectionsStoreError)) throw error;
-      log.warn('Approved app delete did not finish', { code: error.reason });
-      text = `The principal approved deleting the app ${request.app}, but it could not be finished right now. Check principal_page connections before asking again.`;
-    }
-    await writeNote({
-      id: `connection-delete:${session.id}:${request.requestId}`,
-      timestamp: new Date().toISOString(),
-      text,
+    await noteSettled(session, request.requestId, {
+      kind: 'delete',
+      settle: () => settleDelete(request),
+      unfinished: `The principal approved deleting the app ${request.app}, but it could not be finished right now. Check principal_page connections before asking again.`,
       wake: false,
     });
   };

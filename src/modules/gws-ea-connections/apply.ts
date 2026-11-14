@@ -7,8 +7,9 @@ import { isDeepStrictEqual } from 'node:util';
 import { mcpServerPluginOwner } from '../../container-config.js';
 import { getDb } from '../../db/connection.js';
 import { getContainerConfig, updateContainerConfigJson } from '../../db/container-configs.js';
-import { getMainAgentGroupId } from '../gws-ea-profile/db.js';
+import { readMainAgentGroupId } from '../gws-ea-profile/db.js';
 import { checkRestartSoon } from './idle-restart.js';
+import { withAppLock } from './locks.js';
 import type { ConnectionApp, ConnectionsStore } from './store.js';
 
 /** The key prefix the store gives every app; main's entries under it belong to the store alone. */
@@ -34,17 +35,8 @@ interface AppEntry {
   readonly url: string;
 }
 
-let queue: Promise<unknown> = Promise.resolve();
 /** Applies and removals read, change and write one stored column, so one runs at a time. */
-function serialized<T>(operation: () => Promise<T>): Promise<T> {
-  const run = queue.then(operation, operation);
-  queue = run.catch(() => undefined);
-  return run;
-}
-
-async function mainAgentGroupId(): Promise<string | null> {
-  return (await getDb().hasTable('gws_ea_profile')) ? getMainAgentGroupId() : null;
-}
+const MAIN_SERVERS_LOCK = 'main-servers';
 
 async function readServers(agentGroupId: string): Promise<StoredServers | undefined> {
   const row = await getContainerConfig(agentGroupId);
@@ -98,9 +90,9 @@ async function writeAndRequestRestart<T>(store: ConnectionsStore, write: () => P
  * configuration exists, there is nothing to reconcile.
  */
 export function applyMainServers(store: ConnectionsStore): Promise<boolean> {
-  return serialized(async () => {
+  return withAppLock(MAIN_SERVERS_LOCK, async () => {
     const desired = desiredAppEntries(await store.apps());
-    const agentGroupId = await mainAgentGroupId();
+    const agentGroupId = await readMainAgentGroupId();
     if (!agentGroupId) return false;
     const before = await readServers(agentGroupId);
     if (!before || appEntriesMatch(before, desired)) return false;
@@ -124,7 +116,7 @@ function operatorServer(key: string, entry: unknown): OperatorServer | undefined
 
 /** Main's `http` servers the operator added; stdio and plugin servers are theirs to manage elsewhere. */
 export async function mainOperatorServers(): Promise<readonly OperatorServer[]> {
-  const agentGroupId = await mainAgentGroupId();
+  const agentGroupId = await readMainAgentGroupId();
   const servers = agentGroupId ? await readServers(agentGroupId) : undefined;
   if (!servers) return [];
   return Object.entries(servers).flatMap(([key, entry]) => operatorServer(key, entry) ?? []);
@@ -132,8 +124,8 @@ export async function mainOperatorServers(): Promise<readonly OperatorServer[]> 
 
 /** Takes one operator server away from main; an app's entry or a plugin's is never removed this way. */
 export function removeOperatorServer(store: ConnectionsStore, key: string): Promise<OperatorRemoval> {
-  return serialized(async () => {
-    const agentGroupId = await mainAgentGroupId();
+  return withAppLock(MAIN_SERVERS_LOCK, async () => {
+    const agentGroupId = await readMainAgentGroupId();
     const before = agentGroupId ? await readServers(agentGroupId) : undefined;
     if (!agentGroupId || !before || !Object.hasOwn(before, key)) return 'absent';
     if (!operatorServer(key, before[key])) return 'not_operator';

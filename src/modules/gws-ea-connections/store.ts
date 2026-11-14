@@ -8,7 +8,13 @@ import { instanceLayout } from '../../gws-ea/release-layout.js';
 import { GwsEaError } from '../../gws-ea/types.js';
 import { hasControlCharacters } from '../../gws-ea/validation.js';
 import { openPrivateDatabase } from '../gws-ea-vault/file.js';
-import { SealUnavailableError, StoreSeal, type SealAvailability, type SealedFile } from '../gws-ea-vault/seal.js';
+import {
+  SEALED_MIN_BYTES,
+  SealUnavailableError,
+  StoreSeal,
+  type SealAvailability,
+  type SealedFile,
+} from '../gws-ea-vault/seal.js';
 import { connectionsRoot } from './config.js';
 import { ConnectionsKey } from './key.js';
 
@@ -137,8 +143,7 @@ export interface ConnectionsStoreOptions {
 }
 
 export const SIGN_IN_TTL_MS = 10 * 60_000;
-const SEALED_MIN = 28;
-const NAME_MAX = 100;
+export const NAME_MAX = 100;
 const SECRET_MAX = 64 * 1024;
 const STATE_MAX = 512;
 
@@ -148,7 +153,7 @@ CREATE TABLE IF NOT EXISTS apps (
   id TEXT PRIMARY KEY, server_key TEXT NOT NULL UNIQUE CHECK(server_key GLOB 'app_[0-9a-f]*'),
   name TEXT NOT NULL, name_key TEXT NOT NULL UNIQUE, url TEXT NOT NULL, host TEXT NOT NULL UNIQUE,
   auth TEXT NOT NULL CHECK(auth IN ('none','oauth','token')), issuer TEXT,
-  client BLOB CHECK(client IS NULL OR length(client) >= ${SEALED_MIN}),
+  client BLOB CHECK(client IS NULL OR length(client) >= ${SEALED_MIN_BYTES}),
   version INTEGER NOT NULL CHECK(version > 0), created_at TEXT NOT NULL, updated_at TEXT NOT NULL
 ) STRICT;
 CREATE TABLE IF NOT EXISTS grants (
@@ -156,7 +161,7 @@ CREATE TABLE IF NOT EXISTS grants (
   generation INTEGER NOT NULL CHECK(generation > 0),
   kind TEXT NOT NULL CHECK(kind IN ('none','oauth','token')),
   state TEXT NOT NULL CHECK(state IN ('live','disconnected','refused')),
-  secret BLOB CHECK(secret IS NULL OR length(secret) >= ${SEALED_MIN}),
+  secret BLOB CHECK(secret IS NULL OR length(secret) >= ${SEALED_MIN_BYTES}),
   access_issued_at TEXT, access_expires_at TEXT, updated_at TEXT NOT NULL,
   CHECK(state = 'live' OR secret IS NULL),
   CHECK(kind <> 'none' OR secret IS NULL),
@@ -167,7 +172,7 @@ CREATE TABLE IF NOT EXISTS grants (
 CREATE TABLE IF NOT EXISTS sign_ins (
   app_id TEXT PRIMARY KEY REFERENCES apps(id) ON DELETE CASCADE,
   state_hash TEXT NOT NULL UNIQUE CHECK(length(state_hash) = 64),
-  principal_id TEXT NOT NULL, verifier BLOB NOT NULL CHECK(length(verifier) >= ${SEALED_MIN}),
+  principal_id TEXT NOT NULL, verifier BLOB NOT NULL CHECK(length(verifier) >= ${SEALED_MIN_BYTES}),
   issuer TEXT NOT NULL, redirect_uri TEXT NOT NULL, resource TEXT NOT NULL,
   expires_at TEXT NOT NULL, claimed_at TEXT
 ) STRICT;

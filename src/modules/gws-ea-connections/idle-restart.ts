@@ -5,13 +5,13 @@
  */
 import { getContainerConfigReadAtMs, isContainerRunning, killContainer } from '../../container-runner.js';
 import { setStopIntent, shadowWrite } from '../../db/coordination.js';
-import { getDb } from '../../db/connection.js';
 import { getSession, getSessionsByAgentGroup } from '../../db/sessions.js';
 import { log } from '../../log.js';
 import { requestWake } from '../../request-wake.js';
 import { withExistingMailboxSession } from '../../session-manager.js';
 import type { Session } from '../../types.js';
-import { getMainAgentGroupId } from '../gws-ea-profile/db.js';
+import { readMainAgentGroupId } from '../gws-ea-profile/db.js';
+import { createPendingPoller } from './poller.js';
 import { ConnectionsStoreError, type ConnectionsStore } from './store.js';
 
 export const RESTART_CHECK_INTERVAL_MS = 5_000;
@@ -79,7 +79,7 @@ export async function servePendingRestart(store: ConnectionsStore): Promise<bool
   const appliedAt = await store.pendingRestart();
   if (appliedAt === undefined) return false;
   const appliedAtMs = Date.parse(appliedAt);
-  const mainAgentGroupId = (await getDb().hasTable('gws_ea_profile')) ? await getMainAgentGroupId() : null;
+  const mainAgentGroupId = await readMainAgentGroupId();
   const behind = mainAgentGroupId
     ? (await getSessionsByAgentGroup(mainAgentGroupId)).filter(
         (session) => isContainerRunning(session.id) && readBefore(session.id, appliedAtMs),
@@ -104,17 +104,6 @@ export async function servePendingRestart(store: ConnectionsStore): Promise<bool
   return true;
 }
 
-let armed: { readonly store: ConnectionsStore; readonly signal: AbortSignal } | undefined;
-let timer: NodeJS.Timeout | undefined;
-let inFlight: Promise<void> | undefined;
-/** A request recorded while a check ran, which that check may have read before it existed. */
-let recheck = false;
-
-function stopTimer(): void {
-  if (timer) clearInterval(timer);
-  timer = undefined;
-}
-
 /** Whether to keep checking: an unreadable store or a failed check leaves the request for the next one. */
 async function check(store: ConnectionsStore): Promise<boolean> {
   try {
@@ -126,48 +115,24 @@ async function check(store: ConnectionsStore): Promise<boolean> {
   }
 }
 
-function tick(): void {
-  if (!armed || armed.signal.aborted) return;
-  if (inFlight) {
-    recheck = true;
-    return;
-  }
-  inFlight = check(armed.store)
-    .catch((err: unknown) => {
-      log.error('Connections restart check failed', { err });
-      return true;
-    })
-    .then((pending) => {
-      inFlight = undefined;
-      if (recheck) {
-        recheck = false;
-        checkRestartSoon();
-      } else if (!pending) stopTimer();
-    });
-}
+const checks = createPendingPoller<ConnectionsStore>({
+  intervalMs: RESTART_CHECK_INTERVAL_MS,
+  run: check,
+  onError: (err) => log.error('Connections restart check failed', { err }),
+});
 
 /** Checks now and every few seconds while a request is pending; does nothing until the host has armed the checks. */
 export function checkRestartSoon(): void {
-  if (!armed || armed.signal.aborted) return;
-  if (!timer) {
-    timer = setInterval(tick, RESTART_CHECK_INTERVAL_MS);
-    timer.unref();
-  }
-  tick();
+  checks.soon();
 }
 
 /** Arms the checks for this host; a request a previous host left pending is served from now on. */
 export function startRestartChecks(store: ConnectionsStore, signal: AbortSignal): void {
-  if (signal.aborted) return;
-  armed = { store, signal };
-  signal.addEventListener('abort', stopTimer, { once: true });
-  checkRestartSoon();
+  checks.arm(store, signal);
+  checks.soon();
 }
 
 /** Stops new checks and waits for one in flight, so a stop the check began is not left half done. */
-export async function stopRestartChecks(): Promise<void> {
-  armed = undefined;
-  recheck = false;
-  stopTimer();
-  await inFlight;
+export function stopRestartChecks(): Promise<void> {
+  return checks.stop();
 }

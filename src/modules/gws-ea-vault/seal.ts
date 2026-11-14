@@ -3,7 +3,8 @@ import type { KeychainKey } from './key.js';
 
 const IV_BYTES = 12;
 const TAG_BYTES = 16;
-const SEALED_MIN_BYTES = IV_BYTES + TAG_BYTES;
+/** The iv and tag alone: no sealed value is shorter. */
+export const SEALED_MIN_BYTES = IV_BYTES + TAG_BYTES;
 
 /** AES-256-GCM as iv | tag | ciphertext. The label binds a value to one store of one assistant. */
 export function seal(value: Buffer, key: Buffer, label: string): Buffer {

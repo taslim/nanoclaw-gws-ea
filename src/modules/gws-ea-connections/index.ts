@@ -8,7 +8,7 @@ import { registerWebMount } from '../gws-ea-web/mounts.js';
 import { registerAppActions } from './actions.js';
 import { applyMainServers, MainServersUnreadableError, mainOperatorServers } from './apply.js';
 import { connectionsRoot } from './config.js';
-import { connectionsWebMount } from './connections-mount.js';
+import { connectionsWebMount, operatorAsApp } from './connections-mount.js';
 import { startRestartChecks, stopRestartChecks } from './idle-restart.js';
 import { oweReconnectNote, startReconnectNotes, stopReconnectNotes } from './note.js';
 import { startConnectionsRefresher, stopConnectionsRefresher } from './refresher.js';
@@ -54,11 +54,9 @@ export async function connectionsHealth(
     if (!(error instanceof ConnectionsStoreError)) throw error;
     store = { available: false, reason: 'keychain_unavailable' };
   }
-  const operatorApps = (await mainOperatorServers()).flatMap(({ key, url }): AppHealth[] => {
-    // An entry without a host reaches no server, so there is nothing of it to show.
-    const host = URL.parse(url)?.hostname;
-    return host ? [{ name: key, host, origin: 'operator', status: 'connected' }] : [];
-  });
+  const operatorApps = (await mainOperatorServers())
+    .flatMap((server) => operatorAsApp(server) ?? [])
+    .map(({ key: _key, ...app }): AppHealth => app);
   return {
     schemaVersion: 1,
     store,

@@ -15,6 +15,7 @@ import {
   type ConnectionOAuthOptions,
   type SignInServer,
 } from './oauth.js';
+import { NAME_MAX } from './store.js';
 
 export type SignInMethod =
   | { readonly kind: 'none' }
@@ -42,7 +43,6 @@ export type ProbeOutcome =
 
 export type TokenCheck = 'valid' | 'refused' | 'unreachable' | 'unsupported';
 
-const NAME_MAX = 100;
 const ACCESS_TOKEN = /^[\x21-\x7e]+$/u;
 const INITIALIZE_ID = 1;
 

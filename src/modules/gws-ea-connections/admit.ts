@@ -74,8 +74,9 @@ function parsed(input: string): URL | AdmissionRefusal {
   return url;
 }
 
-function hostOf(url: string): string | undefined {
-  return URL.canParse(url) ? new URL(url).hostname : undefined;
+/** Undefined for a URL that cannot be read or names no host. */
+export function hostOf(url: string): string | undefined {
+  return URL.parse(url)?.hostname || undefined;
 }
 
 /** Refusals are decided from the URL first, so a malformed address never reaches the gateway or the store. */
@@ -104,13 +105,18 @@ function oneCliHost(): string | undefined {
   return url ? hostOf(url) : undefined;
 }
 
+/** The assistant's web address whenever web is configured, enabled or not. */
+export async function webHostname(): Promise<string | undefined> {
+  const policy = await readWebPolicy();
+  return 'config' in policy ? policy.config?.hostname : undefined;
+}
+
 /** The hosts whose gateway credentials or traffic belong to the assistant itself. */
 export async function assistantProtectedHosts(): Promise<ReadonlySet<string>> {
   const modelHosts = listProviderHostContracts().flatMap((contract) =>
     Object.values(contract.modelEndpoints ?? {}).flatMap((endpoint) => hostOf(endpoint) ?? []),
   );
-  const policy = await readWebPolicy();
-  const webHost = 'config' in policy ? policy.config?.hostname : undefined;
+  const webHost = await webHostname();
   return new Set(
     [...modelHosts, CHATGPT_HOST, ...AGENT_GOOGLE_HOSTS, webHost, oneCliHost()].filter(
       (host): host is string => host !== undefined,

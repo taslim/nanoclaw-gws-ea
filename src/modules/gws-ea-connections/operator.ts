@@ -11,7 +11,7 @@ import type { GatewayCredentialRemoval, GatewayHostCredential } from '../../gate
 import { getGatewayProvider } from '../../gateway-providers/index.js';
 import { log } from '../../log.js';
 import { AGENT_GOOGLE_CREDENTIALS } from '../gws-ea-google/grant.js';
-import { APP_CREDENTIAL_PREFIX, assistantProtectedHosts } from './admit.js';
+import { APP_CREDENTIAL_PREFIX, assistantProtectedHosts, hostOf } from './admit.js';
 import { MainServersUnreadableError, mainOperatorServers, removeOperatorServer, type OperatorServer } from './apply.js';
 import { withAppLock } from './locks.js';
 import type { ConnectionsStore } from './store.js';
@@ -55,7 +55,7 @@ function assistantCredential(credential: GatewayHostCredential): boolean {
 
 /** The host the gateway matches the entry's requests by; an entry that names none reaches no server. */
 export function operatorServerHost(server: OperatorServer): string | undefined {
-  return URL.parse(server.url)?.hostname || undefined;
+  return hostOf(server.url);
 }
 
 export function gatewayOperatorDependencies(): OperatorDisconnectDependencies {

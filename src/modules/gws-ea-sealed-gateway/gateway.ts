@@ -53,6 +53,7 @@ async function modelSecret(client: OnecliAdmin, group: string, label: string): P
  * this creates it, repairs it, and reads back both restrictions. Only this group's identity is written.
  */
 export async function reconcileSealedGateway(group: string, label: string): Promise<void> {
+  if ((await sealedGatewayDrift(group, label)).length === 0) return;
   const client = sealedGatewayAdmin(label);
   const secret = await modelSecret(client, group, label);
   let current = await sealedGatewayIdentity(client, group, label);
@@ -73,12 +74,12 @@ export async function reconcileSealedGateway(group: string, label: string): Prom
 /** Admission reads the gateway; a cached successful reconcile is not authority to start. */
 export async function sealedGatewayDrift(group: string, label: string): Promise<string[]> {
   const client = sealedGatewayAdmin(label);
+  const model = modelSecret(client, group, label);
+  // The identity's own drift returns before the model credential is awaited; its failure must not go unhandled.
+  void model.catch(() => undefined);
   const current = await sealedGatewayIdentity(client, group, label);
   if (!current) return ['its gateway identity is missing'];
   if (current.secretMode !== 'selective') return ['its gateway secret mode is not selective'];
-  const [secret, assigned] = await Promise.all([
-    modelSecret(client, group, label),
-    client.listAgentSecretIds(current.id),
-  ]);
+  const [secret, assigned] = await Promise.all([model, client.listAgentSecretIds(current.id)]);
   return assigned.length === 1 && assigned[0] === secret ? [] : ['its gateway secret assignments are not model-only'];
 }

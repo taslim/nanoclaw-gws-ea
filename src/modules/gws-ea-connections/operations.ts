@@ -29,6 +29,8 @@ import {
   type ConnectionFetches,
   type ConnectionOAuthOptions,
   type IssuedTokens,
+  type PreparedAuthorization,
+  type SignInServer,
 } from './oauth.js';
 import { checkPastedToken, probeApp } from './probe.js';
 import {
@@ -247,12 +249,7 @@ export class ConnectionOperations {
     let client: ClientRegistration | undefined;
     if (method.kind === 'oauth' && method.dynamicRegistration) {
       try {
-        ({ client } = await clientForSignIn(
-          method.signIn,
-          { issuer: null, client: undefined },
-          { host: admission.host, redirectUri: this.redirectUri(admission) },
-          this.oauth,
-        ));
+        client = await this.registerClient(method.signIn, admission);
       } catch (error) {
         if (!(error instanceof ConnectionOAuthError)) throw error;
         if (error.code === 'unreachable') return { status: 'refused', reason: 'unreachable' };
@@ -338,8 +335,9 @@ export class ConnectionOperations {
       if (probe.method.kind !== 'oauth') return refusedConnect('method_changed');
       const { signIn } = probe.method;
       const redirectUri = this.redirectUri(app);
-      let client: ClientRegistration;
+      let prepared: PreparedAuthorization;
       try {
+        let client: ClientRegistration;
         if (own) {
           client = own;
           app = await this.store.setClient(app.id, app.version, { issuer: signIn.server.issuer, client });
@@ -354,12 +352,6 @@ export class ConnectionOperations {
           if (settled.registered)
             app = await this.store.setClient(app.id, app.version, { issuer: signIn.server.issuer, client });
         }
-      } catch (error) {
-        if (!(error instanceof ConnectionOAuthError)) throw error;
-        return this.refusedSignIn(app, error.code);
-      }
-      let prepared;
-      try {
         prepared = await prepareAuthorization(signIn, client, redirectUri);
       } catch (error) {
         if (!(error instanceof ConnectionOAuthError)) throw error;
@@ -492,12 +484,7 @@ export class ConnectionOperations {
       if (probe.status !== 'ok' || probe.method.kind !== 'oauth' || !probe.method.dynamicRegistration)
         return 'client_refused';
       const { signIn } = probe.method;
-      const { client } = await clientForSignIn(
-        signIn,
-        { issuer: null, client: undefined },
-        { host: app.host, redirectUri: this.redirectUri(app) },
-        this.oauth,
-      );
+      const client = await this.registerClient(signIn, app);
       await this.store.setClient(app.id, app.version, { issuer: signIn.server.issuer, client });
     } catch (error) {
       if (error instanceof ConnectionOAuthError)
@@ -507,6 +494,17 @@ export class ConnectionOperations {
       else throw error;
     }
     return 'client_refused';
+  }
+
+  /** A new registration for this app alone, whatever client it held before. */
+  private async registerClient(signIn: SignInServer, app: Pick<ConnectionApp, 'host'>): Promise<ClientRegistration> {
+    const { client } = await clientForSignIn(
+      signIn,
+      { issuer: null, client: undefined },
+      { host: app.host, redirectUri: this.redirectUri(app) },
+      this.oauth,
+    );
+    return client;
   }
 
   private async current(id: string, version: number): Promise<ConnectionApp> {

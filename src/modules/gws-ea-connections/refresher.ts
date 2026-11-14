@@ -16,8 +16,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import type { GatewayCredentialRemoval, GatewayHostCredential } from '../../gateway-providers/credential-connection.js';
 import { getGatewayProvider } from '../../gateway-providers/index.js';
 import { log as hostLog } from '../../log.js';
-import { readWebPolicy } from '../gws-ea-web/policy.js';
-import { APP_CREDENTIAL_PREFIX, appCredentialName } from './admit.js';
+import { APP_CREDENTIAL_PREFIX, appCredentialName, webHostname } from './admit.js';
 import { applyMainServers, MainServersUnreadableError } from './apply.js';
 import { publishAppCredential, removeAppCredential, type AppConnection } from './credentials.js';
 import { withAppLock } from './locks.js';
@@ -115,11 +114,6 @@ function failureCode(error: unknown, fallback: string): string {
   if (error instanceof ConnectionsStoreError) return error.reason;
   if (error instanceof MainServersUnreadableError) return 'main_servers_unreadable';
   return fallback;
-}
-
-async function webHostname(): Promise<string | undefined> {
-  const policy = await readWebPolicy();
-  return 'config' in policy ? policy.config?.hostname : undefined;
 }
 
 export function createConnectionsRefresher(dependencies: ConnectionsRefresherDependencies): ConnectionsRefresher {

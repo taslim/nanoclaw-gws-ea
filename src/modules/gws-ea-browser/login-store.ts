@@ -11,7 +11,7 @@ import type { SanitizedCommandOutcomeRunner } from '../../gws-ea/process.js';
 import { hasControlCharacters } from '../../gws-ea/validation.js';
 import { httpsOrigin } from './authentication-signatures.js';
 import { openPrivateDatabase } from '../gws-ea-vault/file.js';
-import { StoreSeal, type SealAvailability, type SealedFile } from '../gws-ea-vault/seal.js';
+import { SEALED_MIN_BYTES, StoreSeal, type SealAvailability, type SealedFile } from '../gws-ea-vault/seal.js';
 import { LoginKey } from './login-key.js';
 import { browserPaths } from './paths.js';
 import {
@@ -67,7 +67,7 @@ const ATTEMPT_COLUMNS =
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS logins (
   id TEXT PRIMARY KEY, hostname TEXT NOT NULL, domain TEXT NOT NULL, username TEXT NOT NULL,
-  title TEXT NOT NULL, password BLOB NOT NULL CHECK(length(password) >= 28), version INTEGER NOT NULL CHECK(version > 0),
+  title TEXT NOT NULL, password BLOB NOT NULL CHECK(length(password) >= ${SEALED_MIN_BYTES}), version INTEGER NOT NULL CHECK(version > 0),
   created_at TEXT NOT NULL, updated_at TEXT NOT NULL, UNIQUE(domain, username)
 ) STRICT;
 CREATE TABLE IF NOT EXISTS attempts (
@@ -81,7 +81,7 @@ CREATE TABLE IF NOT EXISTS attempts (
   CHECK((source_login_id IS NULL) = (source_version IS NULL)),
   CHECK(owned_login_id IS NULL OR phase = 'finalized'),
   CHECK(CASE WHEN phase IN ('rejected','finalized') THEN password IS NULL
-    ELSE password IS NOT NULL AND length(password) >= 28 END)
+    ELSE password IS NOT NULL AND length(password) >= ${SEALED_MIN_BYTES} END)
 ) STRICT;
 CREATE UNIQUE INDEX IF NOT EXISTS open_rotation ON attempts(source_login_id)
   WHERE source_login_id IS NOT NULL AND phase NOT IN ('rejected','finalized');
