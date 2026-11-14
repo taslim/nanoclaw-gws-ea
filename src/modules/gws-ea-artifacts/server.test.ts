@@ -87,6 +87,9 @@ describe('view-only artifact origin', () => {
       expect(child.headers.get('content-security-policy')).toContain("script-src 'none'");
       expect(child.headers.get('content-security-policy')).not.toContain('allow-same-origin');
       expect(child.headers.get('connection-allowlist')).toBeNull();
+      // The web module drops an unsandboxed authored-content response only on the paths the mount marks.
+      expect(artifactsWebMount.authoredContent(`${route}/frame/${sourceHash}`)).toBe(true);
+      expect(artifactsWebMount.authoredContent(route)).toBe(false);
       const head = await request(route, 'HEAD');
       expect(head.status).toBe(200);
       expect(await head.text()).toBe('');

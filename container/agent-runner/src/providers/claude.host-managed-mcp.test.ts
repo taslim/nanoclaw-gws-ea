@@ -229,8 +229,11 @@ describe('host-managed MCP servers', () => {
     expect(appRequests.filter((pathname) => ['/register', '/token', '/authorize'].includes(pathname))).toEqual([]);
     expect(fs.existsSync(path.join(configDirectory, '.credentials.json'))).toBe(false);
 
+    // The pinned Claude Code remembers the refusal, as it does for any server; the next query starts without it.
+    const remembered = () =>
+      Object.keys(JSON.parse(fs.readFileSync(path.join(configDirectory, MCP_NEEDS_AUTH_CACHE), 'utf8')) as object);
+    expect(remembered()).toContain(APP);
     await providerQuery(configDirectory, { [APP]: SERVERS[APP] });
-    const cache = path.join(configDirectory, MCP_NEEDS_AUTH_CACHE);
-    if (fs.existsSync(cache)) expect(Object.keys(JSON.parse(fs.readFileSync(cache, 'utf8')))).not.toContain(APP);
+    expect(remembered()).not.toContain(APP);
   }, 60_000);
 });

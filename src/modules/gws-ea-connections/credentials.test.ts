@@ -41,6 +41,8 @@ describe('app credentials', () => {
     await publishAppCredential(app, 'access-token-1', fake.connection);
     expect(fake.entry.find).toHaveBeenCalledOnce();
     expect(fake.entry.save).toHaveBeenCalledWith('access-token-1');
+    // A gateway saves into the entry find() observed, so the order is the contract.
+    expect(fake.entry.find.mock.invocationCallOrder[0]).toBeLessThan(fake.entry.save.mock.invocationCallOrder[0]);
   });
 
   it('removes only what the gateway holds', async () => {

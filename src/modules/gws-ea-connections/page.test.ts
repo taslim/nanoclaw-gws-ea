@@ -37,6 +37,8 @@ const CLIENT_ID = 'juno-homeboard-client';
 const SENTINEL_SECRET = 'sentinel-client-secret-V7k2';
 const SENTINEL_TOKEN = 'sentinel-pasted-token-R4m9';
 const SENTINEL_QUERY = 'sentinel-url-key-T3c8';
+/** A token or client secret the principal enters that is refused. */
+const SENTINEL_REFUSED = 'sentinel-refused-value-N2d6';
 const postHeaders = { 'sec-fetch-site': 'same-origin', 'content-type': 'application/json' };
 
 interface Reply {
@@ -311,7 +313,7 @@ async function connectedHomeBoard(app = homeBoard()): Promise<ConnectionApp> {
 }
 
 function assertNoSentinels(): void {
-  for (const sentinel of [SENTINEL_SECRET, SENTINEL_TOKEN, SENTINEL_QUERY]) {
+  for (const sentinel of [SENTINEL_SECRET, SENTINEL_TOKEN, SENTINEL_QUERY, SENTINEL_REFUSED]) {
     for (const reply of replies) {
       expect(reply.body).not.toContain(sentinel);
       expect(JSON.stringify(reply.headers)).not.toContain(sentinel);
@@ -406,7 +408,17 @@ describe('client details the server refuses', () => {
     const app = homeBoard();
     serve(app.handle);
     await post('/connections/add', { url: HOMEBOARD, name: '' });
-    const url = await startSignIn(await onlyApp(), { clientId: CLIENT_ID, clientSecret: 'mistyped-secret' });
+    const added = await onlyApp();
+    const unusable = await post('/connections/sign-in', {
+      id: added.id,
+      version: String(added.version),
+      clientId: CLIENT_ID,
+      clientSecret: `${SENTINEL_REFUSED} pasted twice`,
+    });
+    expect(unusable.status).toBe(400);
+    expect(unusable.body).toContain('Enter the client ID and secret exactly');
+    expect(await onlyApp()).toMatchObject({ hasClient: false });
+    const url = await startSignIn(await onlyApp(), { clientId: CLIENT_ID, clientSecret: SENTINEL_REFUSED });
 
     expect((await callback('homeboard.nownow.ai', app.approve(url).query)).headers.location).toBe(
       '/connections?outcome=client_refused',
@@ -481,7 +493,11 @@ describe('pasted tokens and servers without sign-in', () => {
     let app = await onlyApp();
     expect(app).toMatchObject({ auth: 'token', name: 'notes.example.test' });
 
-    const wrong = await post('/connections/connect', { id: app.id, version: String(app.version), token: 'not-it' });
+    const wrong = await post('/connections/connect', {
+      id: app.id,
+      version: String(app.version),
+      token: SENTINEL_REFUSED,
+    });
     expect(wrong.status).toBe(400);
     expect(wrong.body).toContain('The app didn’t accept that token.');
     expect((await onlyApp()).status).toBe('not_connected');
@@ -640,8 +656,11 @@ describe('sign-in returns', () => {
 });
 
 describe('managing apps', () => {
-  it('disconnects at once: grant ended, credential gone, pending sign-in cleared, restart requested', async () => {
-    const connected = await connectedHomeBoard();
+  it('disconnects at once: grant ended, credential gone, access revoked, pending sign-in cleared, restart requested', async () => {
+    const homeboard = homeBoard();
+    const connected = await connectedHomeBoard(homeboard);
+    const grant = await store.readGrant(connected.id, 1);
+    if (grant?.kind !== 'oauth' || !grant.refreshToken) throw new Error('HomeBoard issues refresh tokens');
     await store.startSignIn(connected.id, connected.version, {
       principalId: PRINCIPAL,
       verifier: 'pending-verifier-abcdefghijklmnopqrstuvwxyz0123456789',
@@ -658,6 +677,7 @@ describe('managing apps', () => {
     expect(await onlyApp()).toMatchObject({ status: 'not_connected' });
     expect(gateway.held.size).toBe(0);
     expect(signInRow(app.id)).toBeUndefined();
+    expect(homeboard.revoked).toEqual([grant.refreshToken]);
     expect(await mainServers()).toEqual({});
     expect(await store.pendingRestart()).toBeDefined();
     expect(gateway.events.indexOf(`remove:gws-ea-app-${app.id}`)).toBeLessThan(gateway.events.lastIndexOf('apply'));
@@ -671,6 +691,9 @@ describe('managing apps', () => {
     const reply = await post('/connections/delete', { id: app.id, version: String(app.version) });
     expect(reply.status).toBe(200);
     expect(reply.body).toContain('App deleted.');
+    // Revocation was asked for and refused, and the delete went ahead.
+    expect(endpoints.requests.filter((incoming) => incoming.path === '/oauth/revoke')).toHaveLength(1);
+    expect(homeboard.revoked).toEqual([]);
     expect(await store.apps()).toEqual([]);
     expect(gateway.held.size).toBe(0);
     expect(await mainServers()).toEqual({});

@@ -271,13 +271,15 @@ describe('add_app', () => {
     });
   });
 
-  it('refuses a credential in the address or a host an operator server uses before any card exists', async () => {
+  it('refuses a credential in the address or beside it, or a host an operator server uses, before any card exists', async () => {
     await updateContainerConfigJson(MAIN, 'mcp_servers', { homeboard: { type: 'http', url: HOMEBOARD } });
 
     const inUrl = await send(ADD_APP_ACTION, { url: `${RECIPES}?api_key=sentinel-url-key-Z1`, name: 'Recipes' });
+    const beside = await send(ADD_APP_ACTION, { url: RECIPES, name: 'Recipes', clientSecret: SENTINEL_SECRET });
     const operatorHost = await send(ADD_APP_ACTION, { url: HOMEBOARD, name: 'HomeBoard' });
 
     expect(inUrl.answer).toMatchObject({ ok: false, error: { message: expect.stringContaining('query') } });
+    expect(beside.answer).toMatchObject({ ok: false, error: { code: 'invalid-args' } });
     expect(operatorHost.answer).toMatchObject({
       ok: false,
       error: { message: expect.stringContaining("one of the operator's servers") },
@@ -286,6 +288,7 @@ describe('add_app', () => {
     expect(cards).toEqual([]);
     expect(endpoints.requests).toEqual([]);
     expect(await store.apps()).toEqual([]);
+    expect(everything()).not.toContain(SENTINEL_SECRET);
   });
 
   it('creates nothing when the principal declines, and tells main so', async () => {

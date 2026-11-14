@@ -187,6 +187,8 @@ describe('NanoClaw tool server capabilities', () => {
     ],
     ['browser-purchase-outcome', ['browser-purchase-outcome'], ['record_purchase_outcome']],
     ['gws-ea-principal-pages', ['gws-ea-principal-pages'], ['principal_page']],
+    // main's app tools: the host grants this key to canonical main alone.
+    ['gws-ea-connections', ['gws-ea-connections'], ['add_app', 'delete_app']],
     // main works in Drive, Docs, Sheets, Slides and Forms with gog alone.
     ['google-workspace', ['google-workspace'], []],
     ["external-email's keys", EXTERNAL_EMAIL, [...EXTERNAL_EMAIL_TOOLS, 'request_status', ...TIME_TOOLS].sort()],

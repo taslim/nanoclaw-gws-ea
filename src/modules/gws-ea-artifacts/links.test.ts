@@ -144,9 +144,10 @@ it('allows each registered principal page at its exact address toward the princi
   ])
     for (const recipients of [['principal@example.com'], ['juno@example.com']])
       expect((await check(url, recipients)).allowed, url).toBe(false);
+  // Refused as below a principal page, naming the page's own address, not as an unknown artifact path.
   expect(await check('https://aya.example.com/connections/callback/homeboard.example.test')).toEqual({
     allowed: false,
-    reason: expect.stringContaining('https://aya.example.com/connections'),
+    reason: expect.stringContaining('Connections page address, https://aya.example.com/connections,'),
   });
 });
 it('denies stale hash, pending/revoked state, expiry, disable and deleted content even for the principal', async () => {

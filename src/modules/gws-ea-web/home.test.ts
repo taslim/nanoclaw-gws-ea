@@ -1,5 +1,5 @@
 import { createServer, request as httpRequest, type IncomingHttpHeaders, type Server } from 'node:http';
-import { afterEach, beforeEach, expect, it } from 'vitest';
+import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { closeDb, getDb, initTestDb, runMigrations } from '../../db/index.js';
 import { DENY, defineGuardedAction, type GuardActor } from '../../guard/index.js';
 import '../gws-ea-profile/index.js';
@@ -102,6 +102,27 @@ it('lists every other principal page with its summary, and a failing summary lea
   expect(response.body).toContain('<p class="shell-name">Juno Hale</p>');
   expect(response.body).toContain('<a href="/" data-navigation aria-current="page">Home</a>');
   expect(response.body).toContain('<a href="/apps" data-navigation>Apps &lt;beta&gt;</a>');
+});
+
+it('does not let a page whose summary never settles hold the home page back', async () => {
+  let asked = false;
+  pages[1] = page('logins', '/logins', 'Logins', () => {
+    asked = true;
+    return new Promise<string>(() => undefined);
+  });
+  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+  try {
+    const pending = request(PRINCIPAL);
+    await vi.waitFor(() => expect(asked).toBe(true));
+    await vi.advanceTimersByTimeAsync(3000);
+    const response = await pending;
+    expect(response.status).toBe(200);
+    expect(response.body).toContain(
+      '<a class="page-row" href="/logins" data-navigation><span class="page-identity"><span class="page-title">Logins</span></span>',
+    );
+  } finally {
+    vi.useRealTimers();
+  }
 });
 
 it('says so when there are no other pages', async () => {

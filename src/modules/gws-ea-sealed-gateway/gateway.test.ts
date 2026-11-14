@@ -44,3 +44,16 @@ it('writes only its own identity, and reports one the gateway created with all s
   expect(other).toMatchObject({ secretMode: 'all', secrets: [] });
   expect(await sealedGatewayDrift('ag-sealed', 'browser')).toEqual([]);
 });
+
+it('replaces a single assignment that is not the model credential', async () => {
+  const gateway = useFakeGateway([MODEL_SECRET, APP_SECRET]);
+  Object.assign(gateway.createDefault('ag-sealed', 'sealed'), { secretMode: 'selective', secrets: [APP_SECRET.id] });
+
+  expect(await sealedGatewayDrift('ag-sealed', 'browser')).toEqual([
+    'its gateway secret assignments are not model-only',
+  ]);
+  await reconcileSealedGateway('ag-sealed', 'browser');
+
+  expect(gateway.agents.get('ag-sealed')).toMatchObject({ secretMode: 'selective', secrets: [MODEL_SECRET.id] });
+  expect(gateway.injected('ag-sealed', APP_SECRET.hostPattern)).toEqual([]);
+});

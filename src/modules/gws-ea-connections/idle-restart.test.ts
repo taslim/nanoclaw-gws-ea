@@ -210,7 +210,16 @@ describe('servePendingRestart', () => {
   it('keeps a request recorded during the check that served the previous one', async () => {
     const first = await requestAt(0);
     runtime.running.clear();
-    await store.requestRestart(new Date(Date.parse(first) + 1).toISOString());
+    const later = new Date(Date.parse(first) + 1).toISOString();
+    const clear = store.clearRestart.bind(store);
+    // An apply lands after the check read the request and before it clears it.
+    vi.spyOn(store, 'clearRestart').mockImplementationOnce(async (appliedAt) => {
+      await store.requestRestart(later);
+      return clear(appliedAt);
+    });
+
+    expect(await idle.servePendingRestart(store)).toBe(true);
+    expect(await store.pendingRestart()).toBe(later);
 
     expect(await idle.servePendingRestart(store)).toBe(false);
     expect(await store.pendingRestart()).toBeUndefined();
@@ -254,10 +263,22 @@ describe('restart checks', () => {
     expect(killed()).toEqual([dm.id]);
   });
 
-  it('do nothing before the host arms them', async () => {
+  it('do nothing once the host has stopped, whatever asks for a check', async () => {
+    const reads = vi.spyOn(store, 'pendingRestart');
+    const host = new AbortController();
+    idle.startRestartChecks(store, host.signal);
+    // The first check finds nothing pending and settles.
+    await vi.waitFor(() => expect(reads).toHaveBeenCalled());
+    await reads.mock.results[0]?.value;
+    await new Promise((resolve) => setImmediate(resolve));
+
+    host.abort();
     await requestAt(0);
     idle.checkRestartSoon();
-    await new Promise((resolve) => setImmediate(resolve));
+    // Waits for any check that began, so a stop it made would show.
+    await idle.stopRestartChecks();
+
     expect(killed()).toEqual([]);
+    expect(await store.pendingRestart()).toBeDefined();
   });
 });

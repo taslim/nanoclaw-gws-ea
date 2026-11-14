@@ -127,7 +127,8 @@ it('keeps the web module free of feature-module imports', () => {
       if (!specifier.startsWith('.')) continue;
       const target = path.resolve(path.dirname(file), specifier).replace(/\.js$/u, '.ts');
       imported.push(path.relative(modules, target));
-      if (path.dirname(target) === directory) pending.push(target);
+      // Follow every file inside the web module, the kit included, but not other modules.
+      if (target.startsWith(`${directory}${path.sep}`)) pending.push(target);
     }
   }
   expect(seen.size).toBeGreaterThan(3);

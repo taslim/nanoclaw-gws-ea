@@ -7,7 +7,6 @@ import type { McpToolDefinition } from './types.js';
 // The barrel loads every tool module under its key, as the container does.
 import './index.js';
 import { addApp, deleteApp } from './gws-ea-connections.js';
-import { registeredToolCapabilities } from './server.js';
 
 beforeEach(initTestSessionDb);
 afterEach(closeSessionDb);
@@ -82,8 +81,4 @@ it('teaches what a failing app tool means and when the link is sent', () => {
   ])
     expect(instructions).toContain(rule);
   expect(instructions).not.toMatch(/authenticate/iu);
-});
-
-it('registers both tools under the main-only capability', () => {
-  expect(registeredToolCapabilities()).toContain('gws-ea-connections');
 });

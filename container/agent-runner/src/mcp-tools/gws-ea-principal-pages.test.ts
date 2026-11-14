@@ -7,7 +7,6 @@ import { closeSessionDb, getInboundDb, initTestSessionDb } from '../mailbox/sqli
 // The barrel loads every tool module under its key, as the container does.
 import './index.js';
 import { principalPage } from './gws-ea-principal-pages.js';
-import { registeredToolCapabilities } from './server.js';
 
 beforeEach(initTestSessionDb);
 afterEach(closeSessionDb);
@@ -58,7 +57,6 @@ it("says what each of the host's answers means and that the link goes only to th
 });
 
 it('replaces the logins-only link tool in every tool module', () => {
-  expect(registeredToolCapabilities()).toContain('gws-ea-principal-pages');
   const modules = fileURLToPath(new URL('.', import.meta.url));
   for (const file of fs.readdirSync(modules).filter((name) => /\.(?:ts|md)$/u.test(name) && !name.endsWith('.test.ts')))
     expect(fs.readFileSync(`${modules}/${file}`, 'utf8'), file).not.toContain('logins_page');

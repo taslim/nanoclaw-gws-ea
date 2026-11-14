@@ -197,7 +197,8 @@ describe('the caller-described connection', () => {
 
 describe("OneCLI's credentials on one host", () => {
   const HOMEBOARD: OneCliCredential = { ...CALENDAR, name: 'HomeBoard', hostPattern: 'homeboard.nownow.ai' };
-  const app = (id: string) => row(id, { ...HOMEBOARD, name: `gws-ea-app-${id}` });
+  // An app's entry is limited to its server's path; it is still on that host.
+  const app = (id: string) => ({ ...row(id, { ...HOMEBOARD, name: `gws-ea-app-${id}` }), pathPattern: '/mcp' });
 
   it('lists only the entries on exactly that host, and removing them by id leaves the rest', async () => {
     const rows = [

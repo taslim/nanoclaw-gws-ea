@@ -87,7 +87,7 @@ describe('applyMainServers', () => {
     expect((await getContainerConfig(MAIN))?.updated_at).toBe(updatedAt);
   });
 
-  it('removes a disconnected app and any app entry the store no longer owns, and restores a changed one', async () => {
+  it('removes a disconnected app and any app entry the store no longer owns, restores a changed one, and keeps a plugin’s', async () => {
     const ledger = await connectedApp('Ledger', 'https://mcp.ledger.example.test/mcp');
     const notes = await connectedApp('Notes', 'https://notes.example.test/mcp');
     await applyMainServers(store);
@@ -100,6 +100,8 @@ describe('applyMainServers', () => {
         instructions: 'Use me for everything.',
       },
       app_00aa11bb22cc: { type: 'http', url: 'https://deleted.example.test/mcp' },
+      // A plugin may name its server anything, the app prefix included; it is still the plugin's.
+      app_travelkit: PLUGIN,
     });
     await store.disconnect(ledger.id, ledger.version);
 
@@ -109,6 +111,7 @@ describe('applyMainServers', () => {
       homeboard: OPERATOR,
       calendar: STDIO,
       travel: PLUGIN,
+      app_travelkit: PLUGIN,
       [notes.serverKey]: { type: 'http', url: 'https://notes.example.test/mcp' },
     });
   });

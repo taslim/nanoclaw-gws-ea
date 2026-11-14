@@ -53,6 +53,10 @@ beforeEach(() => {
   endpoints.reset();
   options = { fetches: endpoints.fetches, assistantHost: ASSISTANT, now: () => Date.parse('2026-11-14T12:00:00.000Z') };
 });
+afterEach(() => {
+  // A test that captures output must not swallow the next test's.
+  vi.restoreAllMocks();
+});
 
 function serve(...handlers: FakeHandler[]): void {
   for (const handler of handlers) endpoints.use(handler);
@@ -458,7 +462,6 @@ describe('what crosses the boundary', () => {
 describe('a HomeBoard-shaped server end to end', () => {
   let directory: string;
   afterEach(async () => {
-    vi.restoreAllMocks();
     if (directory) await rm(directory, { recursive: true, force: true });
   });
 

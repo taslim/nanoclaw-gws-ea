@@ -2458,12 +2458,17 @@ describe('connected apps', () => {
     ).toHaveLength(1);
   });
 
+  const LEDGER = { name: 'Ledger', host: 'mcp.ledger.example.test', origin: 'principal', status: 'connected' };
+  // Each report differs from a valid one in one field, so each check is proved on its own.
   it.each([
-    ['a stopped assistant', { stopped: true }],
-    ['a malformed host report', { stopped: false }],
-  ] as const)('reports not checked for %s', async (_case, options) => {
+    ['a stopped assistant', { stopped: true }, LEDGER],
+    ['an app with no host', { stopped: false }, { ...LEDGER, host: '' }],
+    ['an app name carrying a terminal control sequence', { stopped: false }, { ...LEDGER, name: 'Ledger\u001b[2J' }],
+    ['an app of unknown origin', { stopped: false }, { ...LEDGER, origin: 'gateway' }],
+    ['an app with an unknown status', { stopped: false }, { ...LEDGER, status: 'expired' }],
+  ] as const)('reports not checked for %s', async (_case, options, app) => {
     const { result, text, healthCalls } = await detailedStatus(
-      { schemaVersion: 1, store: { available: true }, apps: [{ name: 'Ledger', host: '', origin: 'principal' }] },
+      { schemaVersion: 1, store: { available: true }, apps: [app] },
       options,
     );
 

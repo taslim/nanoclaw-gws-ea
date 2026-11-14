@@ -25,7 +25,7 @@ import { WEB_POLICY_FILE_ENV, type WebPolicyFile } from '../gws-ea-web/policy.js
 import '../gws-ea-artifacts/capability.js';
 import '../gws-ea-profile/index.js';
 import '../gws-ea-manual/index.js';
-import { GUIDANCE_PATH, MAIN_SHARED_SKILLS } from './index.js';
+import { GUIDANCE_PATH, MAIN_APPS_CAPABILITY, MAIN_SHARED_SKILLS } from './index.js';
 import '../gws-ea-browser/guidance.js';
 // It registers the email channel's keys, whose instructions main is taught.
 import '../gws-ea-external-email/index.js';
@@ -41,18 +41,22 @@ import { useFakeGateway } from '../gws-ea-sealed-gateway/testing/fake-gateway.js
 
 const TEST_ROOT = `/tmp/nanoclaw-gws-ea-main-test-${process.pid}`;
 
-it('grants live main context only to canonical main, even when another group stores all or the key explicitly', async () => {
-  const main = group('context-main');
-  const outward = group('context-outward', 'external-email');
-  await createGroup(main);
-  await createGroup(outward);
-  await publishMain(main);
-  await updateContainerConfigJson(outward.id, 'capabilities', ['gws-ea-main-context']);
-  expect(await getGroupCapabilities(main.id)).toContain('gws-ea-main-context');
-  expect(await getGroupCapabilities(outward.id)).not.toContain('gws-ea-main-context');
-  await updateContainerConfigJson(outward.id, 'capabilities', 'all');
-  expect(await getGroupCapabilities(outward.id)).not.toContain('gws-ea-main-context');
-});
+// Live context, and the app tools: custom apps are main's alone.
+it.each(['gws-ea-main-context', MAIN_APPS_CAPABILITY])(
+  'grants %s only to canonical main, even when another group stores all or the key explicitly',
+  async (key) => {
+    const main = group('context-main');
+    const outward = group('context-outward', 'external-email');
+    await createGroup(main);
+    await createGroup(outward);
+    await publishMain(main);
+    await updateContainerConfigJson(outward.id, 'capabilities', [key]);
+    expect(await getGroupCapabilities(main.id)).toContain(key);
+    expect(await getGroupCapabilities(outward.id)).not.toContain(key);
+    await updateContainerConfigJson(outward.id, 'capabilities', 'all');
+    expect(await getGroupCapabilities(outward.id)).not.toContain(key);
+  },
+);
 const GUIDANCE = fs.readFileSync(path.resolve(GUIDANCE_PATH), 'utf8').trim();
 const WELCOME = fs.readFileSync(path.resolve('templates', 'gws-ea', 'main', 'skills', 'welcome', 'SKILL.md'), 'utf8');
 

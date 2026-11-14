@@ -1797,8 +1797,10 @@ describe('recorded divergence: a module can refuse changes to MCP servers it own
     expect(
       await guard(commandGuard('groups-config-add-mcp-server'), { actor: { kind: 'host' }, payload }),
     ).toMatchObject({ effect: 'allow' });
-    const decided = await guard(commandGuard('groups-config-add-mcp-server'), { actor: actor('g'), payload });
-    expect(decided.reason).toContain('its servers are the module’s');
+    expect(await guard(commandGuard('groups-config-add-mcp-server'), { actor: actor('g'), payload })).toMatchObject({
+      effect: 'deny',
+      reason: expect.stringContaining('its servers are the module’s'),
+    });
   });
 });
 
