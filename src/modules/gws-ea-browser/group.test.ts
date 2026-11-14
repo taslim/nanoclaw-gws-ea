@@ -189,8 +189,10 @@ it('hands the delegate tools to main to main by default and to explicitly grante
   expect((await getGroupCapabilities('research')).has('browser-delegate')).toBe(false);
   // A stored explicit key grants delegation to an ordinary group.
   await updateContainerConfigJson('research', 'capabilities', ['reply', 'browser-delegate']);
+  // Browser access also gives the logins page's link.
   expect((await materializeContainerJson('research')).capabilities).toEqual([
     'reply',
+    'gws-ea-principal-pages',
     'browser-delegate',
     'browser-purchase-outcome',
   ]);

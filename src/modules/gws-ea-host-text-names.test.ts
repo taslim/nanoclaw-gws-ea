@@ -53,6 +53,7 @@ import { OPERATIONAL_CODES } from './gws-ea-browser/operational-codes.js';
 import { EXTERNAL_EMAIL_CAPABILITIES } from './gws-ea-external-email/group.js';
 import { CHAT_SHARED_SKILLS, EXTERNAL_CHAT_CAPABILITIES, JOB_CHAT_CAPABILITIES } from './gws-ea-chat-agents/shape.js';
 import { GOG_COMMANDS } from './gws-ea-google/index.js';
+import { PRINCIPAL_PAGES_CAPABILITY } from './gws-ea-web/page-link.js';
 // They register the `ncl` commands host texts name.
 import '../cli/resources/index.js';
 import './gws-ea-profile/index.js';
@@ -80,7 +81,8 @@ interface Holdings {
   readonly ncl: 'global' | 'group' | 'none';
 }
 
-const DELEGATE_KEYS = [BROWSER_DELEGATE_CAPABILITY, PURCHASE_OUTCOME_CAPABILITY];
+// Browser access also gives the logins page's link, so every delegator holds the page-link tool.
+const DELEGATE_KEYS = [BROWSER_DELEGATE_CAPABILITY, PURCHASE_OUTCOME_CAPABILITY, PRINCIPAL_PAGES_CAPABILITY];
 
 const HOLDINGS: Readonly<Record<Reader, Holdings>> = {
   // Create/update reconciliation stores main's current release defaults; browser access grants both delegate keys:
@@ -131,6 +133,11 @@ const POLICY: Policy = {
     },
     'gws-ea-chats/handoffs.ts': {
       delivered_session_id: 'a column in the optional SQL delivery filter, read only by the host',
+    },
+    'gws-ea-connections/store.ts': {
+      needs_reconnecting: 'an app status value in the host-only SQL column list',
+      not_connected: 'an app status value in the host-only SQL column list',
+      name_key: 'a column in the host-only SQL uniqueness check and assignment',
     },
     'gws-ea-workspace/docs-api.ts': {
       nc_job_doc: 'the Drive app-property key used to find a document after an uncertain create',
@@ -475,6 +482,7 @@ const GUIDANCE_READERS: Readonly<Record<string, readonly Reader[]>> = {
   'container/agent-runner/src/mcp-tools/gws-ea-email-external.instructions.md': ['external-email'],
   // Default-on: a group that stores `all` holds it too.
   'container/agent-runner/src/mcp-tools/gws-ea-email.instructions.md': ['main', 'delegator'],
+  'container/agent-runner/src/mcp-tools/gws-ea-principal-pages.instructions.md': ['main', 'delegator'],
   // Google skill instructions are generic: a non-main recipient may have group-scoped or disabled CLI.
   'container/skills/gcalendar/instructions.md': ['main', 'delegator', 'job'],
   'container/skills/gmail/instructions.md': ['main', 'delegator', 'job'],

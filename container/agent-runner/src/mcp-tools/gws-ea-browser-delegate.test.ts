@@ -12,7 +12,6 @@ import {
   recordPurchaseOutcome,
   reservationGuarantee,
   reservationBounds,
-  loginsPage,
 } from './gws-ea-browser-delegate.js';
 import * as browserTools from './gws-ea-browser.js';
 import type { McpToolDefinition } from './types.js';
@@ -24,7 +23,6 @@ const DELEGATE_TOOLS = [
   cancelJob,
   reservationGuarantee,
   reservationBounds,
-  loginsPage,
   credentialAuthority,
   consentGrants,
   recordDisclosure,
@@ -112,27 +110,6 @@ it('sends only the explicit guarantee proposal fields through the native request
     currency: 'USD',
     max_total: '100.00',
   });
-});
-
-it('gets the host logins page with no arguments or credential-bearing fields', async () => {
-  const validate = new Ajv().compile(loginsPage.tool.inputSchema);
-  expect(validate({})).toBe(true);
-  for (const fields of [{ operation: 'share' }, { url: 'https://foreign.example/logins' }, { password: 'secret' }])
-    expect(validate(fields)).toBe(false);
-  const { request, id } = await call(
-    loginsPage,
-    { url: 'https://foreign.example/logins', password: 'secret' },
-    { status: 'available', url: 'https://juno.example.com/logins' },
-  );
-  expect(request).toEqual({ action: 'logins_page', requestId: id });
-  for (const meaning of [
-    'operator_needed',
-    'ask their operator',
-    'unavailable',
-    'try again later',
-    'reveal saved passwords there',
-  ])
-    expect(loginsPage.tool.description).toContain(meaning);
 });
 
 it('records signup or password-change authority through the native host request, never another security change or a value', async () => {
@@ -287,7 +264,6 @@ it('carries at each tool the rules a delegating agent meets there', () => {
   expect(reservationGuarantee.tool.description).toContain(
     'A booking made under it carries the fee and cancellation-deadline terms the host accepted: follow them through its matter and the calendar',
   );
-  expect(loginsPage.tool.description).toContain('send that exact link to the principal');
   expect(credentialAuthority.tool.description).toContain(
     'no password passes through you, so never put one in a message or file',
   );
@@ -362,8 +338,6 @@ it('keeps shared browser judgment brief and moves outcome meanings to the tools 
     "Use the principal's account when the errand concerns something there",
     'whichever exposes less of the principal',
     'do only the errand and report only what it needs',
-    'operator_needed means ask their operator',
-    'unavailable means try again later',
   ])
     expect(guidance).toContain(judgment);
   expect(recordDisclosure.tool.description).toContain('embedded');

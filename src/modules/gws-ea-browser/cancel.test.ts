@@ -34,7 +34,7 @@ import { getSession, updateSession } from '../../db/sessions.js';
 import { guard } from '../../guard/index.js';
 import { browserWatchesMigration } from './migration.js';
 import { deliverAction as send, refusal } from './testing/delivery-answer.js';
-import { loginsPageGuard } from './logins-link.js';
+import { loginsPageGuard } from './logins-mount.js';
 import { credentialAttempts } from './credential-attempts.js';
 import { browserAvailability } from './availability.js';
 

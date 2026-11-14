@@ -14,6 +14,7 @@ import { browserRetiredCredentialsMigration } from './migration.js';
 import { testLoginStore, TEST_INSTANCE_ID } from './testing/login-store.js';
 import * as loginStoreModule from './login-store.js';
 import { createLoginsPageHandler } from './logins-page.js';
+import { homeWebMount } from '../gws-ea-web/home.js';
 import { registerWebMount } from '../gws-ea-web/mounts.js';
 import { loginsWebMount } from './logins-mount.js';
 
@@ -23,6 +24,7 @@ const ALIAS = 'mira.web@example.com';
 const SECRET = 'page-only-secret-7!';
 const SITE = 'https://stream.example';
 const postHeaders = { 'sec-fetch-site': 'same-origin', 'content-type': 'application/json' };
+registerWebMount(homeWebMount);
 registerWebMount(loginsWebMount);
 let directory: string;
 let server: Server;

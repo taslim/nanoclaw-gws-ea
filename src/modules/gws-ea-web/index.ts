@@ -2,6 +2,7 @@ import { register } from '../../cli/registry.js';
 import { onHostStart, onHostShutdown } from '../../host-lifecycle.js';
 import { homeWebMount } from './home.js';
 import { registerWebMount, webAdmissionEmails, webMounts } from './mounts.js';
+import { registerPrincipalPageDelivery } from './page-link.js';
 import { WebRuntime, type WebReadiness } from './runtime.js';
 
 registerWebMount(homeWebMount);
@@ -10,6 +11,7 @@ export const webReadiness: WebReadiness = {
   verifyAdmission: (config) => runtime.verifyAdmission(config),
   publicationReady: (config) => runtime.publicationReady(config),
 };
+registerPrincipalPageDelivery(webReadiness);
 onHostStart(({ signal }) => runtime.start(signal));
 onHostShutdown(() => runtime.stop());
 for (const name of ['gws-ea-web-health', 'gws-ea-web-admission-emails'] as const) {

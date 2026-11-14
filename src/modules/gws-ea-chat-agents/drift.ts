@@ -10,6 +10,7 @@ import { resolveProviderName } from '../../providers/provider-name.js';
 import { groupSkillsOverlayDir } from '../../templates/create-agent.js';
 import { hasBrowserAccess } from '../gws-ea-browser/access.js';
 import { sealedGatewayDrift } from '../gws-ea-sealed-gateway/gateway.js';
+import { mayObtainPrincipalPage, PRINCIPAL_PAGES_CAPABILITY } from '../gws-ea-web/page-link.js';
 import { CHAT_AGENT } from './gateway.js';
 import {
   CHAT_SHARED_SKILLS,
@@ -64,6 +65,7 @@ export async function chatAgentDrift(
   const expected = [
     ...baseline,
     ...(kind === 'job' && (await hasBrowserAccess(groupId)) ? ['browser-delegate', 'browser-purchase-outcome'] : []),
+    ...(kind === 'job' && (await mayObtainPrincipalPage(groupId)) ? [PRINCIPAL_PAGES_CAPABILITY] : []),
   ];
   if (!sameKeys([...(await getGroupCapabilities(groupId))], expected))
     problems.push('its effective capabilities differ from its authorized grants');

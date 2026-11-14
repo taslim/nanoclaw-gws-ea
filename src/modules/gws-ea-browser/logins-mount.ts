@@ -1,7 +1,17 @@
+import { ALLOW, DENY, defineGuardedAction } from '../../guard/index.js';
 import type { PrincipalPageMount } from '../gws-ea-web/mounts.js';
+import { hasBrowserAccess } from './access.js';
 import { getLoginStore, LoginStoreError } from './login-store.js';
-import { loginsPageGuard } from './logins-link.js';
 import { createLoginsPageHandler } from './logins-page.js';
+
+export const loginsPageGuard = defineGuardedAction({
+  action: 'gws_ea_browser.logins_page',
+  async decide({ actor }) {
+    return actor.kind === 'agent' && (await hasBrowserAccess(actor.agentGroupId))
+      ? ALLOW("An agent with browser access asks for the principal's logins page.")
+      : DENY("Only an agent with browser access may obtain the principal's logins page.");
+  },
+});
 
 async function loginsStatus(): Promise<string> {
   try {
