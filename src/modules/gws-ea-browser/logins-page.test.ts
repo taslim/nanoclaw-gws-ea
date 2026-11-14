@@ -14,6 +14,8 @@ import { browserRetiredCredentialsMigration } from './migration.js';
 import { testLoginStore, TEST_INSTANCE_ID } from './testing/login-store.js';
 import * as loginStoreModule from './login-store.js';
 import { createLoginsPageHandler } from './logins-page.js';
+import { registerWebMount } from '../gws-ea-web/mounts.js';
+import { loginsWebMount } from './logins-mount.js';
 
 const HOST = 'mira.example.com';
 const PRINCIPAL = 'rowan@example.com';
@@ -21,6 +23,7 @@ const ALIAS = 'mira.web@example.com';
 const SECRET = 'page-only-secret-7!';
 const SITE = 'https://stream.example';
 const postHeaders = { 'sec-fetch-site': 'same-origin', 'content-type': 'application/json' };
+registerWebMount(loginsWebMount);
 let directory: string;
 let server: Server;
 let port: number;
@@ -162,6 +165,21 @@ it('closes wrong hosts and missing or non-principal identities before any store 
   expect(fixture.keyReads()).toBe(0);
 });
 
+it('draws the shared navigation for the principal and summarizes saved logins for home', async () => {
+  const page = await request();
+  expect(page.body).toContain('<a href="/" data-navigation>Home</a>');
+  expect(page.body).toContain('<a href="/logins" data-navigation aria-current="page">Logins</a>');
+  const reader = await request('/logins', 'GET', { 'cf-access-jwt-assertion': 'reader@example.com' });
+  expect(reader).toMatchObject({ status: 404, body: '' });
+  expect(await loginsWebMount.status()).toBe('No saved logins');
+  await login();
+  expect(await loginsWebMount.status()).toBe('1 saved login');
+  await login(ALIAS);
+  expect(await loginsWebMount.status()).toBe('2 saved logins');
+  fixture.setUnavailable(true);
+  expect(await loginsWebMount.status()).toBe('Unavailable');
+});
+
 it('refuses cross-site, non-JSON and oversized submissions before reading their bodies', async () => {
   const refused: Readonly<Record<string, string>>[] = [
     { ...postHeaders, 'sec-fetch-site': 'cross-site', origin: `https://${HOST}` },
@@ -272,7 +290,7 @@ it('keeps separate list, add, detail and edit views, and a blank replacement pre
   });
   expect(response.status).toBe(200);
   expect(response.body).toContain('Login updated.');
-  expect(response.headers['x-logins-location']).toBe(detail);
+  expect(response.headers['x-page-location']).toBe(detail);
   expect(await fixture.store.get(saved.id)).toMatchObject({
     title: 'Business account',
     hostname: 'accounts.example.com',
@@ -500,8 +518,8 @@ it('keeps the successful save outcome if reading the displayed list fails', asyn
   vi.spyOn(fixture.store, 'all').mockRejectedValueOnce(new Error(SECRET));
   const response = await post('/logins/add', { site: SITE, title: 'Personal', username: PRINCIPAL, password: SECRET });
   expect(response.status).toBe(503);
-  expect(response.headers['x-logins-saved']).toBe('true');
-  expect(response.headers['x-logins-location']).toBe('/logins');
+  expect(response.headers['x-page-saved']).toBe('true');
+  expect(response.headers['x-page-location']).toBe('/logins');
   expect(response.body).toContain('Login added. Saved passwords can&#39;t be read right now. Ask your operator.');
   expect(response.body).not.toContain(SECRET);
   expect(await fixture.store.all()).toHaveLength(1);

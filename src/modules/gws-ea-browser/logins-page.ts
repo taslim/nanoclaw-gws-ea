@@ -1,7 +1,17 @@
-import { randomBytes } from 'node:crypto';
-import type { IncomingMessage, RequestListener, ServerResponse } from 'node:http';
-import { isRecord } from '../../gws-ea/validation.js';
-import { isPrincipalWebIdentity, type WebIdentity } from '../gws-ea-web/access.js';
+import type { RequestListener } from 'node:http';
+import type { WebIdentity } from '../gws-ea-web/access.js';
+import {
+  InvalidSubmission,
+  isPrincipalRequest,
+  pageNonce,
+  readShell,
+  readSubmission,
+  refuse,
+  sameOriginJson,
+  sendJson,
+  sendPage,
+  sendUnavailable,
+} from '../gws-ea-web/kit/index.js';
 import { credentialAttempts, type CredentialAttempts } from './credential-attempts.js';
 import {
   getLoginStore,
@@ -18,54 +28,6 @@ interface LoginsPageOptions {
   readonly identity: WebIdentity;
   readonly store?: LoginStore;
   readonly credentials?: CredentialAttempts;
-}
-const MAX_BODY_BYTES = 16 * 1024;
-class InvalidSubmission extends Error {}
-function headers(nonce?: string): Readonly<Record<string, string>> {
-  return {
-    'cache-control': 'no-store',
-    'content-type': nonce ? 'text/html; charset=utf-8' : 'text/plain; charset=utf-8',
-    'content-security-policy': `default-src 'none'; script-src ${nonce ? `'nonce-${nonce}'` : "'none'"}; style-src ${nonce ? `'nonce-${nonce}'` : "'none'"}; font-src data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'; object-src 'none'`,
-    'referrer-policy': 'no-referrer',
-    'x-content-type-options': 'nosniff',
-    'x-dns-prefetch-control': 'off',
-    'permissions-policy': 'camera=(), microphone=(), geolocation=(), payment=()',
-  };
-}
-function refuse(response: ServerResponse): void {
-  response.shouldKeepAlive = false;
-  response.writeHead(404, headers());
-  response.end();
-}
-function sameOriginJson(request: IncomingMessage, hostname: string): boolean {
-  const site = request.headers['sec-fetch-site'];
-  const length = request.headers['content-length'];
-  return (
-    (site === undefined ? request.headers.origin === `https://${hostname}` : site === 'same-origin') &&
-    typeof request.headers['content-type'] === 'string' &&
-    /^application\/json(?:\s*;\s*charset=utf-8)?$/iu.test(request.headers['content-type']) &&
-    (length === undefined || (/^\d+$/u.test(length) && Number(length) <= MAX_BODY_BYTES))
-  );
-}
-async function submission(request: IncomingMessage): Promise<Record<string, unknown>> {
-  const chunks: Buffer[] = [];
-  let size = 0;
-  // Stop at the byte cap without destroying the socket before its closed response is sent.
-  for await (const chunk of request.iterator({ destroyOnReturn: false })) {
-    const value: unknown = chunk;
-    if (!(value instanceof Uint8Array)) throw new InvalidSubmission();
-    size += value.byteLength;
-    if (size > MAX_BODY_BYTES) throw new InvalidSubmission();
-    chunks.push(Buffer.from(value));
-  }
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(Buffer.concat(chunks, size)));
-  } catch (_error) {
-    throw new InvalidSubmission();
-  }
-  if (!isRecord(parsed)) throw new InvalidSubmission();
-  return parsed;
 }
 function stringField(data: Record<string, unknown>, name: string): string {
   const value = data[name];
@@ -137,11 +99,6 @@ function failureStatus(error: unknown): number {
     return error.reason === 'login_changed' || error.reason === 'login_busy' ? 409 : 400;
   return 503;
 }
-function json(response: ServerResponse, status: number, data: Readonly<Record<string, string>>): void {
-  response.writeHead(status, { ...headers(), 'content-type': 'application/json; charset=utf-8' });
-  response.end(JSON.stringify(data));
-}
-
 /** The Access-verified principal is checked afresh before every read or write. */
 export function createLoginsPageHandler(options: LoginsPageOptions): RequestListener {
   const credentials = options.credentials ?? credentialAttempts;
@@ -153,31 +110,34 @@ export function createLoginsPageHandler(options: LoginsPageOptions): RequestList
         request.method === 'POST' &&
         ['/logins/add', '/logins/update', '/logins/remove', '/logins/reveal'].includes(route ?? '');
       let view: LoginsView = (reading ? readView(route) : undefined) ?? { kind: 'list' };
-      if (request.headers.host !== options.hostname || (reading ? !readView(route) : !writing)) return refuse(response);
-      if (!(await isPrincipalWebIdentity(await options.identity(request)))) return refuse(response);
+      if (reading ? !readView(route) : !writing) return refuse(response);
+      if (!(await isPrincipalRequest(request, options.hostname, options.identity))) return refuse(response);
       if (writing && !sameOriginJson(request, options.hostname)) return refuse(response);
       const store = options.store ?? (await getLoginStore());
+      const data = writing ? await readSubmission(request) : undefined;
+      if (data && route === '/logins/reveal') {
+        const keys = Object.keys(data).sort().join(',');
+        if (keys !== 'handle,version') throw new InvalidSubmission();
+        const handle = stringField(data, 'handle');
+        const version = versionField(data);
+        /* eslint-disable no-catch-all/no-catch-all -- The reveal response reports only constant failures and never credential-bearing errors. */
+        try {
+          const password = await store.revealPassword(handle, version);
+          if (!(await isPrincipalRequest(request, options.hostname, options.identity))) return refuse(response);
+          sendJson(response, 200, { password });
+        } catch (error) {
+          sendJson(response, failureStatus(error), { error: failureMessage(error) });
+        }
+        /* eslint-enable no-catch-all/no-catch-all */
+        return;
+      }
+      // Before any write, so a page that cannot be drawn changes nothing.
+      const shell = await readShell();
       let outcome = '';
       let status = 200;
       let saved = false;
-      if (writing) {
-        const data = await submission(request);
+      if (data) {
         const keys = Object.keys(data).sort().join(',');
-        if (route === '/logins/reveal') {
-          if (keys !== 'handle,version') throw new InvalidSubmission();
-          const handle = stringField(data, 'handle');
-          const version = versionField(data);
-          /* eslint-disable no-catch-all/no-catch-all -- The reveal response reports only constant failures and never credential-bearing errors. */
-          try {
-            const password = await store.revealPassword(handle, version);
-            if (!(await isPrincipalWebIdentity(await options.identity(request)))) return refuse(response);
-            json(response, 200, { password });
-          } catch (error) {
-            json(response, failureStatus(error), { error: failureMessage(error) });
-          }
-          /* eslint-enable no-catch-all/no-catch-all */
-          return;
-        }
         try {
           if (route === '/logins/add') {
             view = { kind: 'add' };
@@ -258,25 +218,22 @@ export function createLoginsPageHandler(options: LoginsPageOptions): RequestList
         !rows.some((row) => row.handle === view.handle)
       )
         status = 404;
-      const nonce = randomBytes(24).toString('base64url');
-      response.writeHead(status, {
-        ...headers(nonce),
-        'x-logins-location': viewLocation(view),
-        ...(saved ? { 'x-logins-saved': 'true' } : {}),
+      const nonce = pageNonce();
+      sendPage(response, {
+        status,
+        nonce,
+        location: viewLocation(view),
+        saved,
+        body:
+          request.method === 'HEAD'
+            ? undefined
+            : renderLoginsPage({ rows, view, outcome, available, error: status >= 400 && !saved }, shell, nonce),
       });
-      response.end(
-        request.method === 'HEAD'
-          ? undefined
-          : renderLoginsPage({ rows, view, outcome, available, error: status >= 400 && !saved }, nonce),
-      );
     };
     void serve().catch((error: unknown) => {
       if (response.headersSent) response.destroy();
       else if (error instanceof InvalidSubmission) refuse(response);
-      else {
-        response.writeHead(503, headers());
-        response.end();
-      }
+      else sendUnavailable(response);
     });
   };
 }

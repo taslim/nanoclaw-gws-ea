@@ -1,8 +1,10 @@
 import { register } from '../../cli/registry.js';
 import { onHostStart, onHostShutdown } from '../../host-lifecycle.js';
-import { webAdmissionEmails, webMounts } from './mounts.js';
+import { homeWebMount } from './home.js';
+import { registerWebMount, webAdmissionEmails, webMounts } from './mounts.js';
 import { WebRuntime, type WebReadiness } from './runtime.js';
 
+registerWebMount(homeWebMount);
 const runtime = new WebRuntime(webMounts);
 export const webReadiness: WebReadiness = {
   verifyAdmission: (config) => runtime.verifyAdmission(config),
