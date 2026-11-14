@@ -92,7 +92,7 @@ onHostStart(async ({ signal }) => {
     await store.sweepExpiredSignIns();
     // Armed first, so a restart a previous host left pending and one this apply records are both served.
     startRestartChecks(store, signal);
-    startReconnectNotes(store, signal);
+    await startReconnectNotes(store, signal);
     startConnectionsRefresher(store, signal, { onRefused: oweReconnectNote });
     await applyMainServers(store);
   } catch (error) {

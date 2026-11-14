@@ -648,6 +648,18 @@ export class ConnectionsStore {
     );
   }
 
+  /** Each app whose server refused renewal and that nobody has reconnected, disconnected or deleted since. */
+  async refusedGrants(): Promise<readonly { readonly appId: string; readonly generation: number }[]> {
+    return this.use((db) =>
+      db
+        .prepare<
+          [],
+          { appId: string; generation: number }
+        >("SELECT app_id AS appId, generation FROM grants WHERE state = 'refused' ORDER BY app_id")
+        .all(),
+    );
+  }
+
   /** Undefined unless the grant is still live at exactly this generation. */
   async readGrant(appId: string, generation: number): Promise<GrantCredentials | undefined> {
     const read = (row: GrantRow | undefined, key: Buffer | undefined): GrantCredentials | undefined => {

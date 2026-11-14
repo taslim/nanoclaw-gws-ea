@@ -29,7 +29,7 @@ import { inboundDbPath } from '../../mailbox/sqlite/paths.js';
 import type { Session } from '../../types.js';
 import { MAIN, mainSession, seedMain } from '../gws-ea-matters/testing/main-conversation.js';
 import '../gws-ea-profile/index.js';
-import { createReconnectNotes, type ReconnectNotes } from './note.js';
+import { createReconnectNotes, startReconnectNotes, stopReconnectNotes, type ReconnectNotes } from './note.js';
 import type { RefusedApp } from './refresher.js';
 import type { ConnectionApp, ConnectionsStore } from './store.js';
 import { testConnectionsStore } from './testing/store.js';
@@ -183,5 +183,21 @@ describe('the reconnect note', () => {
 
     expect(await notes.deliver()).toBe(false);
     expect(written()).toEqual([]);
+  });
+});
+
+describe('after a host restart', () => {
+  it('owes each refused grant again from the store, and a note already written stays the only one', async () => {
+    const { refused } = await refusedApp('Notes', 'https://notes.example.test/mcp');
+    const healthy = await store.create({ name: 'Recipes', url: 'https://recipes.example.test/mcp', auth: 'token' });
+    await store.connect(healthy.id, healthy.version, { kind: 'token', token: SENTINEL_TOKEN });
+
+    await startReconnectNotes(store, new AbortController().signal, { now: () => clock });
+    await stopReconnectNotes();
+    expect(written().map(({ id }) => id)).toEqual([`connection-reconnect:${refused.appId}:${refused.generation}`]);
+
+    await startReconnectNotes(store, new AbortController().signal, { now: () => clock });
+    await stopReconnectNotes();
+    expect(written()).toHaveLength(1);
   });
 });

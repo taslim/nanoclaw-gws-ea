@@ -401,6 +401,78 @@ describe('adding and connecting an OAuth app that needs a client', () => {
   });
 });
 
+describe('client details the server refuses', () => {
+  it('forgets entered details the server refused at the exchange, so Connect asks for them again', async () => {
+    const app = homeBoard();
+    serve(app.handle);
+    await post('/connections/add', { url: HOMEBOARD, name: '' });
+    const url = await startSignIn(await onlyApp(), { clientId: CLIENT_ID, clientSecret: 'mistyped-secret' });
+
+    expect((await callback('homeboard.nownow.ai', app.approve(url).query)).headers.location).toBe(
+      '/connections?outcome=client_refused',
+    );
+    const cleared = await onlyApp();
+    expect(cleared).toMatchObject({ status: 'not_connected', hasClient: false });
+    expect((await request(`/connections/app/${cleared.id}/connect`)).body).toContain('name="clientId"');
+    expect(gateway.held.size).toBe(0);
+
+    const retry = await startSignIn(cleared, { clientId: CLIENT_ID, clientSecret: SENTINEL_SECRET });
+    expect((await callback('homeboard.nownow.ai', app.approve(retry).query)).headers.location).toBe(
+      '/connections?outcome=connected',
+    );
+    assertNoSentinels();
+  });
+
+  it('registers a new client when the server refuses the one it registered, so Connect signs in again', async () => {
+    const ledger = new FakeMcpApp({ appUrl: LEDGER, issuer: 'https://auth.example.test', registration: true });
+    serve(ledger.handle);
+    await post('/connections/add', { url: LEDGER, name: 'Ledger' });
+    const [[clientId, registered]] = [...ledger.clients];
+    // The server expired the registration's secret.
+    ledger.clients.set(clientId, { ...registered, secret: 'expired-secret' });
+    const url = await startSignIn(await onlyApp());
+
+    expect((await callback('mcp.ledger.example.test', ledger.approve(url).query)).headers.location).toBe(
+      '/connections?outcome=client_refused',
+    );
+    expect(ledger.registrations).toHaveLength(2);
+    const replaced = await onlyApp();
+    expect(replaced).toMatchObject({ status: 'not_connected', hasClient: true });
+    expect((await request(`/connections/app/${replaced.id}/connect`)).body).not.toContain('name="clientId"');
+
+    const again = await startSignIn(replaced);
+    expect((await callback('mcp.ledger.example.test', ledger.approve(again).query)).headers.location).toBe(
+      '/connections?outcome=connected',
+    );
+  });
+
+  it('forgets a client stored for an authorization server the app no longer names when the new one refuses registration', async () => {
+    const ledger = new FakeMcpApp({ appUrl: LEDGER, issuer: 'https://auth.example.test', registration: true });
+    serve(ledger.handle);
+    await post('/connections/add', { url: LEDGER, name: 'Ledger' });
+    expect(await onlyApp()).toMatchObject({ hasClient: true });
+
+    // The app now names another authorization server, which refuses automatic registration.
+    const moved = new FakeMcpApp({ appUrl: LEDGER, issuer: 'https://homeboard.nownow.ai', registration: true });
+    endpoints.reset();
+    serve(
+      (incoming) =>
+        incoming.host === 'homeboard.nownow.ai' && incoming.path === '/oauth/register'
+          ? { status: 400, body: { error: 'invalid_client_metadata' } }
+          : undefined,
+      moved.handle,
+    );
+    const stored = await onlyApp();
+    const reply = await post('/connections/sign-in', { id: stored.id, version: String(stored.version) });
+
+    expect(reply.status).toBe(400);
+    expect(reply.body).toContain('refused the client details');
+    const cleared = await onlyApp();
+    expect(cleared).toMatchObject({ status: 'not_connected', hasClient: false });
+    expect((await request(`/connections/app/${cleared.id}/connect`)).body).toContain('name="clientId"');
+  });
+});
+
 describe('pasted tokens and servers without sign-in', () => {
   it('connects a token app, disconnects it, and connects it again through the token field', async () => {
     serve(notesServer);
@@ -459,6 +531,7 @@ describe('sign-in returns', () => {
       cancelled: 'Sign-in was cancelled.',
       expired: 'That sign-in expired or was already used.',
       failed: 'Sign-in didn’t finish.',
+      client_refused: 'The app’s sign-in service refused the client details',
     };
     for (const [code, message] of Object.entries(messages)) {
       const reply = await request(`/connections?outcome=${code}`);

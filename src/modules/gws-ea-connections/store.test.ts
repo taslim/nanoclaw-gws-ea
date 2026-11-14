@@ -189,6 +189,27 @@ describe('grants', () => {
     ]);
   });
 
+  it('lists only refused grants, at their generation, without Keychain', async () => {
+    const refused = await store.create(HOMEBOARD);
+    const live = await store.create({ ...HOMEBOARD, name: 'Notes', url: 'https://notes.example/mcp' });
+    const ended = await store.create({ ...HOMEBOARD, name: 'Recipes', url: 'https://recipes.example/mcp' });
+    await store.create({ ...HOMEBOARD, name: 'Unconnected', url: 'https://unconnected.example/mcp' });
+    for (const app of [refused, live, ended])
+      await store.connect(app.id, app.version, { kind: 'token', token: SENTINELS.token });
+    // A reconnected grant that broke again is owed at its new generation.
+    await store.markRefused(refused.id, 1);
+    const again = await store.connect(refused.id, (await store.get(refused.id)).version, {
+      kind: 'token',
+      token: SENTINELS.token,
+    });
+    await store.markRefused(refused.id, again.generation);
+    await store.markRefused(ended.id, 1);
+    await store.disconnect(ended.id, (await store.get(ended.id)).version);
+
+    keychain.unavailable = true;
+    expect(await store.refusedGrants()).toEqual([{ appId: refused.id, generation: 2 }]);
+  });
+
   it('hands back the grant a reconnect replaced, for revocation once the new one is in place', async () => {
     const { app } = await connectedOauth();
     const { state } = await store.startSignIn(app.id, app.version, signIn(app));

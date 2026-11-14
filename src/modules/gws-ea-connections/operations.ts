@@ -79,8 +79,11 @@ export type SignInStartOutcome =
   | { readonly status: 'started'; readonly authorizationUrl: string; readonly app: ConnectionApp }
   | { readonly status: 'refused'; readonly reason: ConnectRefusal; readonly app?: ConnectionApp };
 
-/** The only facts a sign-in's return reports; anything more could tell a forged return apart from a real one. */
-export type SignInReturn = 'connected' | 'cancelled' | 'expired' | 'failed';
+/**
+ * The only facts a sign-in's return reports; anything more could tell a forged return apart from a real one. A
+ * refused client is reported only after a sign-in this host started was claimed, so a forged return never reaches it.
+ */
+export type SignInReturn = 'connected' | 'cancelled' | 'expired' | 'failed' | 'client_refused';
 
 /** `credential_kept`: the grant is ended but the gateway still holds its credential, so the app stays listed. */
 export type RemoveOutcome = 'deleted' | 'credential_kept';
@@ -353,17 +356,14 @@ export class ConnectionOperations {
         }
       } catch (error) {
         if (!(error instanceof ConnectionOAuthError)) throw error;
-        // A client stored for an authorization server the app no longer names cannot sign in; the principal
-        // enters details for the new one.
-        if (error.code === 'needs_client' && app.hasClient) app = await this.store.clearClient(app.id, app.version);
-        return { status: 'refused', reason: oauthRefusal(error.code), app };
+        return this.refusedSignIn(app, error.code);
       }
       let prepared;
       try {
         prepared = await prepareAuthorization(signIn, client, redirectUri);
       } catch (error) {
         if (!(error instanceof ConnectionOAuthError)) throw error;
-        return { status: 'refused', reason: oauthRefusal(error.code), app };
+        return this.refusedSignIn(app, error.code);
       }
       const { state } = await this.store.startSignIn(app.id, app.version, {
         principalId,
@@ -399,6 +399,7 @@ export class ConnectionOperations {
         await this.store.discardSignIn(claim);
         if (error instanceof ConnectionOAuthError) {
           log.info('App sign-in did not complete', { appId: claim.appId, code: error.code });
+          if (error.code === 'client_refused' && client) return this.replaceRefusedClient(claim.appId);
           return error.code === 'cancelled' ? 'cancelled' : 'failed';
         }
         if (error instanceof AppCredentialsUnavailableError) return 'failed';
@@ -465,6 +466,47 @@ export class ConnectionOperations {
   /** A label only: the app's server key, and so main's tools, stay as they are. */
   rename(id: string, version: number, name: string): Promise<ConnectionApp> {
     return withAppLock(id, () => this.store.rename(id, version, name));
+  }
+
+  /**
+   * A client the server refused, or one stored for an authorization server the app no longer names, cannot sign in,
+   * so it is forgotten and the next Connect asks for client details again.
+   */
+  private async refusedSignIn(app: ConnectionApp, code: ConnectionOAuthError['code']): Promise<SignInStartOutcome> {
+    const forget = (code === 'needs_client' || code === 'client_refused') && app.hasClient;
+    const settled = forget ? await this.store.clearClient(app.id, app.version) : app;
+    return { status: 'refused', reason: oauthRefusal(code), app: settled };
+  }
+
+  /**
+   * The server refused the app's client at the code exchange, so it is forgotten. A server that registers clients
+   * itself is given a new registration now, as when the app was added, so the next Connect signs in again; otherwise
+   * the next Connect asks the principal for client details.
+   */
+  private async replaceRefusedClient(appId: string): Promise<SignInReturn> {
+    try {
+      const refused = await this.store.get(appId);
+      if (!refused.hasClient) return 'client_refused';
+      const app = await this.store.clearClient(refused.id, refused.version);
+      const probe = await probeApp(app.url, this.oauth);
+      if (probe.status !== 'ok' || probe.method.kind !== 'oauth' || !probe.method.dynamicRegistration)
+        return 'client_refused';
+      const { signIn } = probe.method;
+      const { client } = await clientForSignIn(
+        signIn,
+        { issuer: null, client: undefined },
+        { host: app.host, redirectUri: this.redirectUri(app) },
+        this.oauth,
+      );
+      await this.store.setClient(app.id, app.version, { issuer: signIn.server.issuer, client });
+    } catch (error) {
+      if (error instanceof ConnectionOAuthError)
+        log.info('App registration refused; client details needed', { appId, code: error.code });
+      else if (error instanceof ConnectionsStoreError)
+        log.warn('Refused app client not replaced', { appId, code: error.reason });
+      else throw error;
+    }
+    return 'client_refused';
   }
 
   private async current(id: string, version: number): Promise<ConnectionApp> {

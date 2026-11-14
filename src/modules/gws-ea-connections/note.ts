@@ -162,26 +162,45 @@ function tick(): void {
     });
 }
 
-/** Arms delivery for this host; owed notes live in its memory, so one owed when it stops is not written. */
-export function startReconnectNotes(
+function checkWhileOwed(): void {
+  if (!timer) {
+    timer = setInterval(tick, NOTE_CHECK_INTERVAL_MS);
+    timer.unref();
+  }
+  tick();
+}
+
+/**
+ * Arms delivery for this host and owes again every grant the store still holds refused, so a note a previous host
+ * owed but never wrote is not lost; one it did write keeps its id and is not written twice.
+ */
+export async function startReconnectNotes(
   store: ConnectionsStore,
   signal: AbortSignal,
   dependencies: ReconnectNotesDependencies = {},
-): void {
+): Promise<void> {
   if (signal.aborted) return;
-  armed = { notes: createReconnectNotes(store, dependencies), signal };
+  const notes = createReconnectNotes(store, dependencies);
+  armed = { notes, signal };
   signal.addEventListener('abort', stopTimer, { once: true });
+  let refused: readonly RefusedApp[];
+  try {
+    refused = await store.refusedGrants();
+  } catch (error) {
+    if (!(error instanceof ConnectionsStoreError)) throw error;
+    log.warn('Reconnect notes not owed again: the connections store is unavailable', { code: error.reason });
+    return;
+  }
+  if (armed?.notes !== notes || signal.aborted || refused.length === 0) return;
+  for (const app of refused) notes.owe(app);
+  checkWhileOwed();
 }
 
 /** The refresher's `onRefused`: records the note and checks now, then every few seconds while one is owed. */
 export function oweReconnectNote(app: RefusedApp): void {
   if (!armed || armed.signal.aborted) return;
   armed.notes.owe(app);
-  if (!timer) {
-    timer = setInterval(tick, NOTE_CHECK_INTERVAL_MS);
-    timer.unref();
-  }
-  tick();
+  checkWhileOwed();
 }
 
 /** Stops new checks and waits for one in flight. */

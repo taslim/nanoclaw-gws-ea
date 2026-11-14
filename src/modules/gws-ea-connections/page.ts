@@ -56,17 +56,18 @@ const WRITES: readonly WriteAction[] = [
   'rename',
   'disconnect-operator',
 ];
-const RETURNS: readonly SignInReturn[] = ['connected', 'cancelled', 'expired', 'failed'];
+const RETURNS: readonly SignInReturn[] = ['connected', 'cancelled', 'expired', 'failed', 'client_refused'];
 const APP_ID = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}';
 const APP_VIEW = new RegExp(`^/connections/app/(${APP_ID})/(connect|rename)$`, 'u');
 const CALLBACK = /^\/connections\/callback\/([a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?)$/u;
 
-/** Each code's one message: the outcome of a sign-in says nothing about why it ended. */
+/** Each code's one message. Only a refused client says why a sign-in ended: the principal can correct it. */
 const RETURN_MESSAGES = {
   connected: 'App connected. Your assistant can use it from your next message.',
   cancelled: 'Sign-in was cancelled. The app wasn’t changed.',
   expired: 'That sign-in expired or was already used. Connect the app again to start a new one.',
   failed: 'Sign-in didn’t finish. The app wasn’t changed. Try connecting again.',
+  client_refused: 'The app’s sign-in service refused the client details, so they were removed. Connect the app again.',
 } satisfies Record<SignInReturn, string>;
 
 const CHANGED = 'This app changed since you opened the page. Reload the page and try again.';
@@ -137,7 +138,7 @@ function connectMessage(reason: ConnectRefusal): string {
     case 'needs_client':
       return 'Enter the client details this app’s sign-in service gave you. Reload the page to see the fields.';
     case 'client_refused':
-      return 'The app’s sign-in service refused the client details. Check them, or delete the app and add it again.';
+      return 'The app’s sign-in service refused the client details. Reload the page to enter them again.';
     case 'unreachable':
       return UNREACHABLE;
     case 'unsupported':
