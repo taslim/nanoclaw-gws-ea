@@ -458,30 +458,97 @@ describe('client details the server refuses', () => {
     );
   });
 
-  it('forgets a client stored for an authorization server the app no longer names when the new one refuses registration', async () => {
-    const ledger = new FakeMcpApp({ appUrl: LEDGER, issuer: 'https://auth.example.test', registration: true });
-    serve(ledger.handle);
-    await post('/connections/add', { url: LEDGER, name: 'Ledger' });
-    expect(await onlyApp()).toMatchObject({ hasClient: true });
+  it('sends no client details to an authorization server other than the one Connect named', async () => {
+    const app = homeBoard();
+    serve(app.handle);
+    await post('/connections/add', { url: HOMEBOARD, name: '' });
+    const added = await onlyApp();
+    expect((await request(`/connections/app/${added.id}/connect`)).body).toContain('sign in on homeboard.nownow.ai');
 
-    // The app now names another authorization server, which refuses automatic registration.
-    const moved = new FakeMcpApp({ appUrl: LEDGER, issuer: 'https://homeboard.nownow.ai', registration: true });
+    // Between the view and the submit, the app starts naming another authorization server.
+    const moved = new FakeMcpApp({ appUrl: HOMEBOARD, issuer: 'https://auth.example.test', registration: true });
     endpoints.reset();
-    serve(
-      (incoming) =>
-        incoming.host === 'homeboard.nownow.ai' && incoming.path === '/oauth/register'
-          ? { status: 400, body: { error: 'invalid_client_metadata' } }
-          : undefined,
-      moved.handle,
-    );
-    const stored = await onlyApp();
-    const reply = await post('/connections/sign-in', { id: stored.id, version: String(stored.version) });
+    serve(moved.handle);
+    const reply = await post('/connections/sign-in', {
+      id: added.id,
+      version: String(added.version),
+      clientId: CLIENT_ID,
+      clientSecret: SENTINEL_SECRET,
+    });
 
     expect(reply.status).toBe(400);
-    expect(reply.body).toContain('refused the client details');
+    expect(JSON.parse(reply.body)).toEqual({ error: 'This app now signs in differently. Delete it and add it again.' });
+    expect(await onlyApp()).toEqual(added);
+    expect(signInRow(added.id)).toBeUndefined();
+    expect(moved.registrations).toEqual([]);
+    expect(
+      endpoints.requests.some((incoming) => incoming.host === 'auth.example.test' && incoming.method === 'POST'),
+    ).toBe(false);
+    assertNoSentinels();
+  });
+
+  it('runs the refused-client recovery when the server answers the sign-in with unauthorized_client', async () => {
+    const app = homeBoard();
+    serve(app.handle);
+    await post('/connections/add', { url: HOMEBOARD, name: '' });
+    const url = await startSignIn(await onlyApp(), { clientId: CLIENT_ID, clientSecret: SENTINEL_SECRET });
+    const state = new URL(url).searchParams.get('state') ?? '';
+
+    const returned = await callback(
+      'homeboard.nownow.ai',
+      new URLSearchParams({ error: 'unauthorized_client', state }),
+    );
+
+    expect(returned.headers.location).toBe('/connections?outcome=client_refused');
     const cleared = await onlyApp();
     expect(cleared).toMatchObject({ status: 'not_connected', hasClient: false });
     expect((await request(`/connections/app/${cleared.id}/connect`)).body).toContain('name="clientId"');
+  });
+
+  it('lets the principal change client details the server rejected on its own page', async () => {
+    const app = homeBoard();
+    serve(app.handle);
+    await post('/connections/add', { url: HOMEBOARD, name: '' });
+    // The server rejects this client on its sign-in page, so no return ever reaches the host.
+    await startSignIn(await onlyApp(), { clientId: 'mistyped-client', clientSecret: SENTINEL_REFUSED });
+    const stored = await onlyApp();
+    expect(stored).toMatchObject({ hasClient: true, clientEntered: true });
+    const view = (await request(`/connections/app/${stored.id}/connect`)).body;
+    expect(view).toContain('action="/connections/change-client"');
+    expect(view).not.toContain('name="clientId"');
+
+    const stale = await post('/connections/change-client', { id: stored.id, version: String(stored.version - 1) });
+    expect(stale.status).toBe(409);
+    expect(await onlyApp()).toEqual(stored);
+
+    const changed = await post('/connections/change-client', { id: stored.id, version: String(stored.version) });
+    expect(changed.status).toBe(200);
+    expect(changed.headers['x-page-location']).toBe(`/connections/app/${stored.id}/connect`);
+    expect(changed.body).toContain('Client details removed. Enter the new ones to sign in.');
+    expect(changed.body).toContain('name="clientId"');
+    expect(await onlyApp()).toMatchObject({ hasClient: false, clientEntered: false });
+    expect(signInRow(stored.id)).toBeUndefined();
+
+    const retry = await startSignIn(await onlyApp(), { clientId: CLIENT_ID, clientSecret: SENTINEL_SECRET });
+    expect((await callback('homeboard.nownow.ai', app.approve(retry).query)).headers.location).toBe(
+      '/connections?outcome=connected',
+    );
+    assertNoSentinels();
+  });
+
+  it('offers no client change for a client registered for the app, and refuses one', async () => {
+    const ledger = new FakeMcpApp({ appUrl: LEDGER, issuer: 'https://auth.example.test', registration: true });
+    serve(ledger.handle);
+    await post('/connections/add', { url: LEDGER, name: 'Ledger' });
+    const stored = await onlyApp();
+    expect(stored).toMatchObject({ hasClient: true, clientEntered: false });
+    expect((await request(`/connections/app/${stored.id}/connect`)).body).not.toContain(
+      'action="/connections/change-client"',
+    );
+
+    const reply = await post('/connections/change-client', { id: stored.id, version: String(stored.version) });
+    expect(reply.status).toBe(409);
+    expect(await onlyApp()).toEqual(stored);
   });
 });
 
@@ -701,8 +768,8 @@ describe('managing apps', () => {
 
   it('deletes an app that needs reconnecting', async () => {
     const app = await connectedHomeBoard();
-    const grant = (await store.liveGrants())[0];
-    await store.markRefused(app.id, grant.generation);
+    const grant = await store.currentGrant(app.id);
+    await store.markRefused(app.id, grant?.generation ?? 0);
     const refused = await onlyApp();
     expect(refused.status).toBe('needs_reconnecting');
     expect((await request('/connections')).body).toContain('Needs reconnecting');
@@ -984,6 +1051,7 @@ describe('home status and link facts', () => {
     auth: 'token',
     issuer: null,
     hasClient: false,
+    clientEntered: false,
     status,
     version: 1,
     createdAt: '2026-11-14T00:00:00.000Z',

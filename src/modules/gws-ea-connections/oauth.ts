@@ -460,7 +460,10 @@ export async function completeAuthorization(
   options: ConnectionOAuthOptions = {},
 ): Promise<IssuedTokens> {
   const error = single(returned, 'error');
-  if (error !== undefined) return fail(error === 'access_denied' ? 'cancelled' : 'failed');
+  if (error !== undefined) {
+    if (error === 'access_denied') return fail('cancelled');
+    return fail(error === 'unauthorized_client' ? 'client_refused' : 'failed');
+  }
   const code = single(returned, 'code');
   if (!code) return fail('failed');
   const iss = single(returned, 'iss');
@@ -485,12 +488,13 @@ export async function completeAuthorization(
 
 /**
  * Renews an access token. The app must still describe the same resource and authorization server; a server that
- * publishes no resource metadata is renewed with the issuer it signed in with.
+ * publishes no resource metadata is renewed with the issuer it signed in with. Once `signal` is aborted no token
+ * request starts; one already sent is left to finish, since the server may have rotated the refresh token.
  */
 export async function refreshAccess(
   app: { readonly url: string; readonly issuer: string },
   grant: { readonly refreshToken: string; readonly client: ClientRegistration | undefined },
-  options: ConnectionOAuthOptions = {},
+  options: ConnectionOAuthOptions & { readonly signal?: AbortSignal } = {},
 ): Promise<IssuedTokens> {
   if (!grant.client) return fail('client_refused');
   const resource = await readProtectedResource(app.url, options);
@@ -498,6 +502,7 @@ export async function refreshAccess(
   const server = await discoverAuthorizationServer(app.issuer, options);
   const information = sdkClient(grant.client);
   const watch = watched((options.fetches ?? connectionFetches()).token);
+  options.signal?.throwIfAborted();
   const tokens = await guarded('failed', watch, () =>
     refreshAuthorization(server.issuer, {
       metadata: sdkMetadata(server),

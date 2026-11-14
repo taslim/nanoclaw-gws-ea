@@ -42,7 +42,16 @@ interface ConnectionsPageOptions {
   readonly operatorDependencies?: () => OperatorDisconnectDependencies;
 }
 
-const WRITES = ['add', 'connect', 'sign-in', 'disconnect', 'delete', 'rename', 'disconnect-operator'] as const;
+const WRITES = [
+  'add',
+  'connect',
+  'sign-in',
+  'change-client',
+  'disconnect',
+  'delete',
+  'rename',
+  'disconnect-operator',
+] as const;
 type WriteAction = (typeof WRITES)[number];
 type Route =
   | { readonly kind: 'view'; readonly view: ConnectionsView; readonly outcome?: SignInReturn }
@@ -291,6 +300,14 @@ async function write(
           connectRefusalStatus(connected.reason),
         );
       return done({ kind: 'list' }, RETURN_MESSAGES.connected);
+    }
+    case 'change-client': {
+      only(data, ['id', 'version']);
+      const { id, version } = appReference(data);
+      const changed = await operations.changeClient(id, version);
+      if (changed.status === 'refused')
+        return refused({ kind: 'connect', id }, connectMessage(changed.reason), connectRefusalStatus(changed.reason));
+      return done({ kind: 'connect', id }, 'Client details removed. Enter the new ones to sign in.');
     }
     case 'disconnect': {
       only(data, ['id', 'version']);

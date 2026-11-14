@@ -41,3 +41,34 @@ export async function openPrivateDatabase(file: string, schema: string): Promise
     throw error;
   }
 }
+
+const operationGates = new Map<string, Promise<void>>();
+
+/**
+ * Runs one operation on a private store with the file to itself: operations on the same file run one at a time, in
+ * the order they were asked, each on its own connection that is closed afterwards.
+ */
+export async function withPrivateDatabase<T>(
+  file: string,
+  schema: string,
+  operation: (db: Database.Database) => T | Promise<T>,
+): Promise<T> {
+  const previous = operationGates.get(file);
+  let release = (): void => undefined;
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  operationGates.set(file, gate);
+  await previous;
+  try {
+    const db = await openPrivateDatabase(file, schema);
+    try {
+      return await operation(db);
+    } finally {
+      db.close();
+    }
+  } finally {
+    release();
+    if (operationGates.get(file) === gate) operationGates.delete(file);
+  }
+}

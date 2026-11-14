@@ -274,6 +274,8 @@ describe('authorization', () => {
       resource: HOMEBOARD,
     };
     expect(await codeOf(completeAuthorization(query, pending, HOMEBOARD_CLIENT, options))).toBe('cancelled');
+    query.set('error', 'unauthorized_client');
+    expect(await codeOf(completeAuthorization(query, pending, HOMEBOARD_CLIENT, options))).toBe('client_refused');
     query.set('error', 'server_error');
     expect(await codeOf(completeAuthorization(query, pending, HOMEBOARD_CLIENT, options))).toBe('failed');
     expect(endpoints.requests).toEqual([]);
@@ -332,6 +334,15 @@ describe('refresh', () => {
   ] as const)('answers %j as %s', async (reply, code) => {
     serve((request) => (request.path === '/oauth/token' ? reply : undefined), homeBoard().handle);
     expect(await codeOf(refreshAccess(homeBoardApp, grant('refresh-old'), options))).toBe(code);
+  });
+
+  it('starts no token request once its signal is aborted', async () => {
+    serve(homeBoard().handle);
+    const stopped = AbortSignal.abort();
+    await expect(refreshAccess(homeBoardApp, grant('refresh-old'), { ...options, signal: stopped })).rejects.toBe(
+      stopped.reason,
+    );
+    expect(tokenRequests()).toBe(0);
   });
 
   it('refuses renewal once the resource names another authorization server', async () => {
@@ -491,6 +502,7 @@ describe('a HomeBoard-shaped server end to end', () => {
     const app = await store.setClient(created.id, created.version, {
       issuer: probe.method.issuer,
       client: HOMEBOARD_CLIENT,
+      entered: true,
     });
 
     const again = await probeApp(app.url, options);

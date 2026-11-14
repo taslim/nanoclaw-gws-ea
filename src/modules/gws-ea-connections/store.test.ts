@@ -52,6 +52,7 @@ async function connectedOauth(): Promise<{ app: ConnectionApp; state: string }> 
   const withClient = await store.setClient(added.id, added.version, {
     issuer: ISSUER,
     client: { clientId: 'ledger-client', clientSecret: SENTINELS.clientSecret },
+    entered: true,
   });
   const { state } = await store.startSignIn(withClient.id, withClient.version, signIn(withClient));
   const claim = await store.claimSignIn(state, { host: withClient.host, principalId: PRINCIPAL });
@@ -113,7 +114,7 @@ describe('apps', () => {
     const stale = app.version;
     const mutations = [
       () => store.rename(app.id, stale, 'Ledger two'),
-      () => store.setClient(app.id, stale, { issuer: ISSUER, client: { clientId: 'x' } }),
+      () => store.setClient(app.id, stale, { issuer: ISSUER, client: { clientId: 'x' }, entered: true }),
       () => store.clearClient(app.id, stale),
       () => store.connect(app.id, stale, { kind: 'token', token: SENTINELS.token }),
       () => store.startSignIn(app.id, stale, signIn(app)),
@@ -157,22 +158,20 @@ describe('grants', () => {
     const app = await store.create(HOMEBOARD);
     const first = await store.connect(app.id, app.version, { kind: 'token', token: SENTINELS.token });
     expect(first).toMatchObject({ generation: 1, replaced: undefined, app: { status: 'connected', version: 2 } });
-    expect(await store.liveGrants()).toEqual([
-      {
-        appId: app.id,
-        serverKey: app.serverKey,
-        host: app.host,
-        url: app.url,
-        generation: 1,
-        kind: 'token',
-      },
-    ]);
+    expect(await store.currentGrant(app.id)).toEqual({
+      appId: app.id,
+      serverKey: app.serverKey,
+      host: app.host,
+      url: app.url,
+      generation: 1,
+      kind: 'token',
+    });
 
     expect(await store.markRefused(app.id, 1)).toBe(true);
     expect(await store.markRefused(app.id, 1)).toBe(false);
     const refused = await store.get(app.id);
     expect(refused).toMatchObject({ status: 'needs_reconnecting', version: 3 });
-    expect(await store.liveGrants()).toEqual([]);
+    expect(await store.currentGrant(app.id)).toBeUndefined();
     expect(await store.readGrant(app.id, 1)).toBeUndefined();
 
     const second = await store.connect(app.id, refused.version, { kind: 'token', token: 'second-token' });
@@ -238,20 +237,63 @@ describe('grants', () => {
     };
     expect(await store.rotateGrant(app.id, 1, rotation)).toBe(true);
     expect(await store.readGrant(app.id, 1)).toMatchObject({ refreshToken: SENTINELS.rotated });
-    expect(await store.liveGrants()).toEqual([
-      expect.objectContaining({
-        kind: 'oauth',
-        renewable: true,
-        accessIssuedAt: rotation.accessIssuedAt,
-        accessExpiresAt: rotation.accessExpiresAt,
-      }),
-    ]);
+    expect(await store.currentGrant(app.id)).toMatchObject({
+      kind: 'oauth',
+      renewable: true,
+      accessIssuedAt: rotation.accessIssuedAt,
+      accessExpiresAt: rotation.accessExpiresAt,
+    });
     const kept = { accessIssuedAt: '2026-11-14T12:00:00.000Z', accessExpiresAt: '2026-11-14T13:00:00.000Z' };
     expect(await store.rotateGrant(app.id, 1, kept)).toBe(true);
     expect(await store.readGrant(app.id, 1)).toMatchObject({ refreshToken: SENTINELS.rotated });
     expect(await store.rotateGrant(app.id, 2, kept)).toBe(false);
     await store.disconnect(app.id, (await store.get(app.id)).version);
     expect(await store.rotateGrant(app.id, 1, kept)).toBe(false);
+  });
+
+  it('records a publish only for the access token it names, until a renewal or reconnect replaces it', async () => {
+    const { app } = await connectedOauth();
+    const issued = oauthGrant().accessExpiresAt;
+    const published = async () => {
+      const grant = await store.currentGrant(app.id);
+      return grant?.kind === 'oauth' ? grant.published : undefined;
+    };
+    expect(await published()).toBe(false);
+    expect(await store.markPublished(app.id, 1, '2026-11-14T12:00:00.000Z')).toBe(false);
+    expect(await store.markPublished(app.id, 2, issued)).toBe(false);
+    expect(await store.markPublished(app.id, 1, issued)).toBe(true);
+    expect(await published()).toBe(true);
+    expect(await store.currentGrant(app.id)).toMatchObject({ generation: 1, published: true });
+
+    const rotation = { accessIssuedAt: '2026-11-14T11:00:00.000Z', accessExpiresAt: '2026-11-14T12:00:00.000Z' };
+    expect(await store.rotateGrant(app.id, 1, rotation)).toBe(true);
+    expect(await published()).toBe(false);
+    expect(await store.markPublished(app.id, 1, rotation.accessExpiresAt)).toBe(true);
+
+    const current = await store.get(app.id);
+    const { state } = await store.startSignIn(app.id, current.version, signIn(current));
+    const claim = await store.claimSignIn(state, { host: app.host, principalId: PRINCIPAL });
+    if (!claim) throw new Error('Expected a claim');
+    await store.completeSignIn(claim, oauthGrant('next-refresh'));
+    expect(await published()).toBe(false);
+
+    await store.disconnect(app.id, (await store.get(app.id)).version);
+    expect(await store.markPublished(app.id, 2, issued)).toBe(false);
+    expect(await store.currentGrant(app.id)).toBeUndefined();
+  });
+
+  it('remembers whether the principal entered the client, and forgets it with the client and any pending sign-in', async () => {
+    const added = await store.create(LEDGER);
+    const client = { clientId: 'ledger-client', clientSecret: SENTINELS.clientSecret };
+    const registered = await store.setClient(added.id, added.version, { issuer: ISSUER, client, entered: false });
+    expect(registered).toMatchObject({ hasClient: true, clientEntered: false });
+    const entered = await store.setClient(registered.id, registered.version, { issuer: ISSUER, client, entered: true });
+    expect(entered).toMatchObject({ hasClient: true, clientEntered: true });
+    const { state } = await store.startSignIn(entered.id, entered.version, signIn(entered));
+
+    const cleared = await store.clearClient(entered.id, entered.version);
+    expect(cleared).toMatchObject({ hasClient: false, clientEntered: false });
+    expect(await store.claimSignIn(state, { host: entered.host, principalId: PRINCIPAL })).toBeUndefined();
   });
 
   it('connects a server without sign-in with no Keychain key', async () => {
@@ -269,7 +311,7 @@ describe('grants', () => {
     expect(await store.readClient(added.id, added.version)).toEqual({ issuer: ISSUER, client: undefined });
     expect(keychain.calls).toEqual([]);
     const client = { clientId: 'ledger-client', clientSecret: SENTINELS.clientSecret };
-    const withClient = await store.setClient(added.id, added.version, { issuer: ISSUER, client });
+    const withClient = await store.setClient(added.id, added.version, { issuer: ISSUER, client, entered: true });
     expect(await store.readClient(withClient.id, withClient.version)).toEqual({ issuer: ISSUER, client });
     expect(await store.readClient(withClient.id)).toEqual({ issuer: ISSUER, client });
     await expect(store.readClient(withClient.id, added.version)).rejects.toMatchObject({ reason: 'app_changed' });
@@ -381,7 +423,7 @@ describe('sign-ins', () => {
       generation: 1,
       app: { status: 'connected', auth: 'oauth', issuer: ISSUER },
     });
-    expect(await store.liveGrants()).toEqual([expect.objectContaining({ kind: 'oauth', renewable: false })]);
+    expect(await store.currentGrant(app.id)).toMatchObject({ kind: 'oauth', renewable: false });
     expect(raw((db) => db.prepare('SELECT COUNT(*) AS n FROM sign_ins').get())).toEqual({ n: 0 });
   });
 
@@ -420,7 +462,11 @@ describe('availability', () => {
     await expect(store.readGrant(app.id, 1)).rejects.toMatchObject({ reason: 'store_unavailable' });
     const other = await store.create(LEDGER);
     await expect(
-      store.setClient(other.id, other.version, { issuer: ISSUER, client: { clientId: 'ledger-client' } }),
+      store.setClient(other.id, other.version, {
+        issuer: ISSUER,
+        client: { clientId: 'ledger-client' },
+        entered: true,
+      }),
     ).rejects.toMatchObject({ reason: 'store_unavailable' });
     expect(keychain.calls.some((call) => call.args[0] === '-i')).toBe(false);
     expect(keychain.key).toBeUndefined();

@@ -2,7 +2,8 @@ import { chmod, link, mkdir, mkdtemp, realpath, rm, stat, symlink, writeFile } f
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, beforeEach, expect, it } from 'vitest';
-import { openPrivateDatabase } from './file.js';
+import type Database from 'better-sqlite3';
+import { openPrivateDatabase, withPrivateDatabase } from './file.js';
 
 const SCHEMA = 'CREATE TABLE IF NOT EXISTS entries (id TEXT PRIMARY KEY) STRICT;';
 let directory: string;
@@ -61,4 +62,37 @@ it('never leaves a group- or world-readable store readable', async () => {
 it('refuses a path that is not normalized and absolute', async () => {
   await expect(openPrivateDatabase('connections/apps.db', SCHEMA)).rejects.toThrow();
   await expect(openPrivateDatabase(`${storeRoot}/../connections/apps.db`, SCHEMA)).rejects.toThrow();
+});
+
+it('runs operations on one file one at a time, in order, each on a connection closed afterwards', async () => {
+  const order: string[] = [];
+  let release = (): void => undefined;
+  const held = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  let first: Database.Database | undefined;
+  const slow = withPrivateDatabase(file, SCHEMA, async (db) => {
+    first = db;
+    order.push('first started');
+    await held;
+    db.prepare('INSERT INTO entries (id) VALUES (?)').run('first');
+    order.push('first finished');
+  });
+  const failing = withPrivateDatabase(file, SCHEMA, () => {
+    order.push('second started');
+    throw new Error('second failed');
+  });
+  const reading = withPrivateDatabase(file, SCHEMA, (db) => {
+    order.push('third started');
+    return db.prepare('SELECT id FROM entries').pluck().all();
+  });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  expect(order).toEqual(['first started']);
+  release();
+
+  await slow;
+  await expect(failing).rejects.toThrow('second failed');
+  expect(await reading).toEqual(['first']);
+  expect(order).toEqual(['first started', 'first finished', 'second started', 'third started']);
+  expect(first?.open).toBe(false);
 });

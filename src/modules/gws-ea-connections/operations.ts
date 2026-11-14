@@ -77,6 +77,10 @@ export type ConnectOutcome =
   | { readonly status: 'connected'; readonly app: ConnectionApp }
   | { readonly status: 'refused'; readonly reason: ConnectRefusal };
 
+export type ClientChangeOutcome =
+  | { readonly status: 'cleared'; readonly app: ConnectionApp }
+  | { readonly status: 'refused'; readonly reason: 'already_connected' | 'wrong_method' };
+
 export type SignInStartOutcome =
   | { readonly status: 'started'; readonly authorizationUrl: string; readonly app: ConnectionApp }
   | { readonly status: 'refused'; readonly reason: ConnectRefusal; readonly app?: ConnectionApp };
@@ -277,7 +281,7 @@ export class ConnectionOperations {
     }
     if (!app) return { status: 'refused', reason: 'duplicate_name' };
     if (client && method.kind === 'oauth')
-      app = await this.store.setClient(app.id, app.version, { issuer: method.issuer, client });
+      app = await this.store.setClient(app.id, app.version, { issuer: method.issuer, client, entered: false });
     return { status: 'added', app };
   }
 
@@ -315,7 +319,9 @@ export class ConnectionOperations {
 
   /**
    * Re-reads how the app signs in, settles its client, and returns the server's sign-in page for this attempt. The
-   * pending sign-in replaces any earlier one, so an older tab's return reads as expired.
+   * pending sign-in replaces any earlier one, so an older tab's return reads as expired. Client details go only to
+   * the authorization server the Connect view named: one the app names now instead is refused before anything is
+   * stored.
    */
   async startSignIn(
     id: string,
@@ -332,7 +338,7 @@ export class ConnectionOperations {
       if (!this.gatewayAvailable()) return refusedConnect('credentials_unavailable');
       const probe = await probeApp(app.url, this.oauth);
       if (probe.status !== 'ok') return refusedConnect(probe.status);
-      if (probe.method.kind !== 'oauth') return refusedConnect('method_changed');
+      if (probe.method.kind !== 'oauth' || probe.method.issuer !== app.issuer) return refusedConnect('method_changed');
       const { signIn } = probe.method;
       const redirectUri = this.redirectUri(app);
       let prepared: PreparedAuthorization;
@@ -340,7 +346,11 @@ export class ConnectionOperations {
         let client: ClientRegistration;
         if (own) {
           client = own;
-          app = await this.store.setClient(app.id, app.version, { issuer: signIn.server.issuer, client });
+          app = await this.store.setClient(app.id, app.version, {
+            issuer: signIn.server.issuer,
+            client,
+            entered: true,
+          });
         } else {
           const settled = await clientForSignIn(
             signIn,
@@ -350,7 +360,11 @@ export class ConnectionOperations {
           );
           client = settled.client;
           if (settled.registered)
-            app = await this.store.setClient(app.id, app.version, { issuer: signIn.server.issuer, client });
+            app = await this.store.setClient(app.id, app.version, {
+              issuer: signIn.server.issuer,
+              client,
+              entered: false,
+            });
         }
         prepared = await prepareAuthorization(signIn, client, redirectUri);
       } catch (error) {
@@ -419,6 +433,7 @@ export class ConnectionOperations {
         await revokeGrant(claim.issuer, issued(tokens.refreshToken), this.oauth);
         return 'failed';
       }
+      await this.recordPublished(completion.app, completion.generation, tokens.accessExpiresAt);
       await revokeGrant(previousIssuer, completion.replaced, this.oauth);
       await this.apply();
       return 'connected';
@@ -455,17 +470,27 @@ export class ConnectionOperations {
     });
   }
 
+  /**
+   * Forgets client details the principal entered, so Connect asks for them again: a server that rejects a client on
+   * its own sign-in page never returns to say so. A registration made for the app is not the principal's to change.
+   */
+  async changeClient(id: string, version: number): Promise<ClientChangeOutcome> {
+    return withAppLock(id, async () => {
+      const app = await this.current(id, version);
+      if (app.status === 'connected') return { status: 'refused', reason: 'already_connected' };
+      if (app.auth !== 'oauth' || !app.clientEntered) return { status: 'refused', reason: 'wrong_method' };
+      return { status: 'cleared', app: await this.store.clearClient(id, version) };
+    });
+  }
+
   /** A label only: the app's server key, and so main's tools, stay as they are. */
   rename(id: string, version: number, name: string): Promise<ConnectionApp> {
     return withAppLock(id, () => this.store.rename(id, version, name));
   }
 
-  /**
-   * A client the server refused, or one stored for an authorization server the app no longer names, cannot sign in,
-   * so it is forgotten and the next Connect asks for client details again.
-   */
+  /** A client the server refused cannot sign in, so it is forgotten and the next Connect asks for client details. */
   private async refusedSignIn(app: ConnectionApp, code: ConnectionOAuthError['code']): Promise<SignInStartOutcome> {
-    const forget = (code === 'needs_client' || code === 'client_refused') && app.hasClient;
+    const forget = code === 'client_refused' && app.hasClient;
     const settled = forget ? await this.store.clearClient(app.id, app.version) : app;
     return { status: 'refused', reason: oauthRefusal(code), app: settled };
   }
@@ -485,7 +510,7 @@ export class ConnectionOperations {
         return 'client_refused';
       const { signIn } = probe.method;
       const client = await this.registerClient(signIn, app);
-      await this.store.setClient(app.id, app.version, { issuer: signIn.server.issuer, client });
+      await this.store.setClient(app.id, app.version, { issuer: signIn.server.issuer, client, entered: false });
     } catch (error) {
       if (error instanceof ConnectionOAuthError)
         log.info('App registration refused; client details needed', { appId, code: error.code });
@@ -528,6 +553,19 @@ export class ConnectionOperations {
       await this.store.disconnect(app.id, app.version);
       await this.removeCredential(app);
       return false;
+    }
+  }
+
+  /**
+   * Without the record the refresher cannot tell this token from an older one under the same name, so it renews the
+   * grant, or ends one it cannot renew; the sign-in itself still connected.
+   */
+  private async recordPublished(app: ConnectionApp, generation: number, accessExpiresAt: string): Promise<void> {
+    try {
+      await this.store.markPublished(app.id, generation, accessExpiresAt);
+    } catch (error) {
+      if (!(error instanceof ConnectionsStoreError)) throw error;
+      log.warn('App credential publish not recorded', { appId: app.id, code: error.reason });
     }
   }
 

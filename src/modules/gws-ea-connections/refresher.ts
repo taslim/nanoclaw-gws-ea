@@ -4,10 +4,11 @@
  * removes app credentials no live grant owns, and reconciles main's servers to the store, so a crash, a failed
  * removal or a rollback heals itself within a tick.
  *
- * Every step for one app runs under that app's lock, which connect, disconnect and delete also take. A renewal's new
- * refresh token is stored before its access token is published, and only while the grant is still live at the
- * generation it was renewed for. A refusal the server will repeat ends the grant durably first; the credential and
- * main's entry follow.
+ * Every step for one app runs under that app's lock, which connect, disconnect and delete also take, and reads the
+ * app and its grant afresh under it. A renewal's new refresh token is stored before its access token is published,
+ * and only while the grant is still live at the generation it was renewed for; the grant records the publish once
+ * the gateway has the token, so a token lost unpublished in a restart is renewed again. A refusal the server will
+ * repeat ends the grant durably first; the credential and main's entry follow.
  *
  * Log lines name the app by ID and the outcome by code, nothing more: a server's words and every token stay out.
  */
@@ -26,8 +27,11 @@ import { ConnectionsStoreError, type ConnectionApp, type ConnectionsStore, type 
 export const REFRESH_TICK_MS = 60_000;
 /** Renewal starts when less than this, or half the token's issued lifetime if shorter, remains. */
 export const RENEW_WITHIN_MS = 15 * 60_000;
-/** How long host shutdown waits for a tick in flight, so a renewal's new refresh token is stored. */
-export const SHUTDOWN_WAIT_MS = 10_000;
+/**
+ * How long host shutdown waits for a tick in flight, so a renewal's new refresh token is stored: longer than the
+ * egress's 10-second cap on the token exchange, plus the store write after it.
+ */
+export const SHUTDOWN_WAIT_MS = 15_000;
 
 /** The gateway's view of app credentials: one connection per app, plus listing and removal by exact host. */
 export interface AppGateway {
@@ -58,7 +62,7 @@ export interface ConnectionsRefresherDependencies {
   readonly assistantHost?: () => Promise<string | undefined>;
   readonly fetches?: ConnectionFetches;
   readonly now?: () => number;
-  /** Once aborted, a tick finishes the app it is on and starts no other. */
+  /** Once aborted, a tick finishes the app it is on, starts no other, and asks for no new token. */
   readonly signal?: AbortSignal;
   readonly log?: RefresherLog;
 }
@@ -69,8 +73,11 @@ export interface ConnectionsRefresher {
 
 type OAuthGrant = Extract<LiveGrant, { kind: 'oauth' }>;
 
-/** A server's refusal it will repeat on every attempt, or a token that lapsed with nothing to renew it. */
-type TerminalCode = ConnectionOAuthCode | 'access_expired';
+/**
+ * A server's refusal it will repeat on every attempt, or a token with nothing to renew it that lapsed or never
+ * reached the gateway.
+ */
+type TerminalCode = ConnectionOAuthCode | 'access_expired' | 'access_unpublished';
 
 /** An access token stored as renewed but not yet in the gateway: published on the next tick without renewing again. */
 interface Unpublished {
@@ -167,6 +174,8 @@ export function createConnectionsRefresher(dependencies: ConnectionsRefresherDep
   async function publish(app: ConnectionApp, token: Unpublished): Promise<void> {
     unpublished.set(app.id, token);
     await publishAppCredential(app, token.accessToken, gateway.connection);
+    // Until the publish is recorded the token stays held, so a failed write is published and recorded again.
+    await store.markPublished(app.id, token.generation, token.accessExpiresAt);
     unpublished.delete(app.id);
   }
 
@@ -182,6 +191,7 @@ export function createConnectionsRefresher(dependencies: ConnectionsRefresherDep
         {
           ...(dependencies.fetches ? { fetches: dependencies.fetches } : {}),
           ...(host === undefined ? {} : { assistantHost: host }),
+          ...(dependencies.signal ? { signal: dependencies.signal } : {}),
           now,
         },
       );
@@ -206,7 +216,10 @@ export function createConnectionsRefresher(dependencies: ConnectionsRefresherDep
     log.info('Renewed app access', { appId: app.id });
   }
 
-  /** The gateway's own credential is present unless the listing says otherwise. */
+  /**
+   * The gateway's own credential is present unless the listing says otherwise. Presence is by name only, so a token
+   * the grant does not record as published may be an older one under the same name.
+   */
   async function keepOAuth(
     app: ConnectionApp,
     grant: OAuthGrant,
@@ -224,13 +237,15 @@ export function createConnectionsRefresher(dependencies: ConnectionsRefresherDep
     if (!pending) unpublished.delete(app.id);
     if (!grant.renewable) {
       if (Date.parse(grant.accessExpiresAt) <= at) return endRefused(app, grant.generation, 'access_expired');
-      if (pending) await publish(app, pending);
+      if (pending) return publish(app, pending);
+      // Its only access token was lost before the gateway had it, and nothing can issue another.
+      if (!grant.published) return endRefused(app, grant.generation, 'access_unpublished');
       return;
     }
     if (renewalDue(grant, at)) return renew(app, grant, host);
     if (pending) return publish(app, pending);
-    // Without the token in memory, a credential the gateway lost comes back only through a renewal.
-    if (!present) return renew(app, grant, host);
+    // Without the token in memory, a credential lost or never published comes back only through a renewal.
+    if (!present || !grant.published) return renew(app, grant, host);
   }
 
   async function republishToken(app: ConnectionApp, generation: number): Promise<void> {
@@ -253,18 +268,18 @@ export function createConnectionsRefresher(dependencies: ConnectionsRefresherDep
     else log.info('Removed app credentials without a live grant', { appId: app.id });
   }
 
-  async function reconcileApp(appId: string, grant: LiveGrant | undefined, host: string | undefined): Promise<void> {
+  async function reconcileApp(appId: string, host: string | undefined): Promise<void> {
     await withAppLock(appId, async () => {
-      // Read again under the lock: a connect or disconnect may have finished since the tick began.
+      // Read under the lock: a connect, sign-in or disconnect may have finished since the tick began.
       let app: ConnectionApp;
+      let grant: LiveGrant | undefined;
       try {
-        app = await store.get(appId);
+        [app, grant] = await Promise.all([store.get(appId), store.currentGrant(appId)]);
       } catch (error) {
         if (!(error instanceof ConnectionsStoreError)) throw error;
         if (error.reason !== 'app_not_found') log.warn('Connections store unavailable', { appId, code: error.reason });
         return;
       }
-      // The current state decides what the gateway keeps; the tick's earlier read of the grant only drives renewal.
       const own = app.status === 'connected' && app.auth !== 'none' ? appCredentialName(app.id) : undefined;
       const live = app.status === 'connected' ? grant : undefined;
       let held: readonly GatewayHostCredential[] | undefined;
@@ -300,9 +315,8 @@ export function createConnectionsRefresher(dependencies: ConnectionsRefresherDep
   return {
     async tick() {
       let apps: readonly ConnectionApp[];
-      let grants: readonly LiveGrant[];
       try {
-        [apps, grants] = await Promise.all([store.apps(), store.liveGrants()]);
+        apps = await store.apps();
       } catch (error) {
         if (!(error instanceof ConnectionsStoreError)) throw error;
         log.warn('Connections store unavailable', { code: error.reason });
@@ -318,11 +332,7 @@ export function createConnectionsRefresher(dependencies: ConnectionsRefresherDep
       }
       for (const app of apps) {
         if (dependencies.signal?.aborted) return;
-        await reconcileApp(
-          app.id,
-          grants.find(({ appId }) => appId === app.id),
-          host,
-        );
+        await reconcileApp(app.id, host);
       }
       if (!dependencies.signal?.aborted) await applyStore();
     },

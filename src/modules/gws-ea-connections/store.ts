@@ -7,7 +7,7 @@ import { readInstanceMarkerFile } from '../../gws-ea/registry.js';
 import { instanceLayout } from '../../gws-ea/release-layout.js';
 import { GwsEaError } from '../../gws-ea/types.js';
 import { hasControlCharacters } from '../../gws-ea/validation.js';
-import { openPrivateDatabase } from '../gws-ea-vault/file.js';
+import { withPrivateDatabase } from '../gws-ea-vault/file.js';
 import {
   SEALED_MIN_BYTES,
   SealUnavailableError,
@@ -52,6 +52,8 @@ export interface ConnectionApp {
   readonly auth: AppAuth;
   readonly issuer: string | null;
   readonly hasClient: boolean;
+  /** The principal entered the client's details, so they may change them; a registration made for the app is not theirs. */
+  readonly clientEntered: boolean;
   readonly status: AppStatus;
   readonly version: number;
   readonly createdAt: string;
@@ -77,6 +79,11 @@ export type LiveGrant = GrantFacts &
         readonly renewable: boolean;
         readonly accessIssuedAt: string;
         readonly accessExpiresAt: string;
+        /**
+         * The current access token reached the gateway. Only the refresher holds a renewed token until it is
+         * published, so after a restart an unpublished one is renewed or, with nothing to renew it, ended.
+         */
+        readonly published: boolean;
       }
     | { readonly kind: 'token' | 'none' }
   );
@@ -154,7 +161,9 @@ CREATE TABLE IF NOT EXISTS apps (
   name TEXT NOT NULL, name_key TEXT NOT NULL UNIQUE, url TEXT NOT NULL, host TEXT NOT NULL UNIQUE,
   auth TEXT NOT NULL CHECK(auth IN ('none','oauth','token')), issuer TEXT,
   client BLOB CHECK(client IS NULL OR length(client) >= ${SEALED_MIN_BYTES}),
-  version INTEGER NOT NULL CHECK(version > 0), created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+  client_entered INTEGER NOT NULL DEFAULT 0 CHECK(client_entered IN (0,1)),
+  version INTEGER NOT NULL CHECK(version > 0), created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+  CHECK(client IS NOT NULL OR client_entered = 0)
 ) STRICT;
 CREATE TABLE IF NOT EXISTS grants (
   app_id TEXT PRIMARY KEY REFERENCES apps(id) ON DELETE CASCADE,
@@ -162,8 +171,10 @@ CREATE TABLE IF NOT EXISTS grants (
   kind TEXT NOT NULL CHECK(kind IN ('none','oauth','token')),
   state TEXT NOT NULL CHECK(state IN ('live','disconnected','refused')),
   secret BLOB CHECK(secret IS NULL OR length(secret) >= ${SEALED_MIN_BYTES}),
-  access_issued_at TEXT, access_expires_at TEXT, updated_at TEXT NOT NULL,
+  access_issued_at TEXT, access_expires_at TEXT,
+  access_published INTEGER NOT NULL DEFAULT 0 CHECK(access_published IN (0,1)), updated_at TEXT NOT NULL,
   CHECK(state = 'live' OR secret IS NULL),
+  CHECK(access_published = 0 OR (kind = 'oauth' AND state = 'live')),
   CHECK(kind <> 'none' OR secret IS NULL),
   CHECK(kind <> 'token' OR state <> 'live' OR secret IS NOT NULL),
   CHECK((kind = 'oauth' AND state = 'live') = (access_expires_at IS NOT NULL)),
@@ -184,13 +195,14 @@ CREATE TABLE IF NOT EXISTS meta (
 ) STRICT;`;
 
 const APP_COLUMNS = `a.id, a.server_key AS serverKey, a.name, a.url, a.host, a.auth, a.issuer,
-  a.client IS NOT NULL AS hasClient,
+  a.client IS NOT NULL AS hasClient, a.client_entered AS clientEntered,
   CASE g.state WHEN 'live' THEN 'connected' WHEN 'refused' THEN 'needs_reconnecting' ELSE 'not_connected' END AS status,
   a.version, a.created_at AS createdAt, a.updated_at AS updatedAt`;
 const APP_FROM = 'apps a LEFT JOIN grants g ON g.app_id = a.id';
 
-interface AppRow extends Omit<ConnectionApp, 'hasClient'> {
+interface AppRow extends Omit<ConnectionApp, 'hasClient' | 'clientEntered'> {
   readonly hasClient: number;
+  readonly clientEntered: number;
 }
 interface GrantRow {
   readonly app_id: string;
@@ -203,6 +215,7 @@ interface GrantRow {
   readonly secret: Buffer | null;
   readonly access_issued_at: string | null;
   readonly access_expires_at: string | null;
+  readonly access_published: number;
   readonly client: Buffer | null;
 }
 interface SignInRow {
@@ -218,10 +231,8 @@ interface SignInRow {
   readonly host: string;
 }
 
-const fileOperationGates = new Map<string, Promise<void>>();
-
 function toApp(row: AppRow): ConnectionApp {
-  return { ...row, hasClient: row.hasClient === 1 };
+  return { ...row, hasClient: row.hasClient === 1, clientEntered: row.clientEntered === 1 };
 }
 function invalid(): never {
   throw new ConnectionsStoreError('invalid_details');
@@ -305,26 +316,11 @@ export class ConnectionsStore {
   }
 
   private async use<T>(operation: (db: Database.Database) => T | Promise<T>): Promise<T> {
-    const previous = fileOperationGates.get(this.file);
-    let release = (): void => undefined;
-    const gate = new Promise<void>((resolve) => {
-      release = resolve;
-    });
-    fileOperationGates.set(this.file, gate);
-    await previous;
     try {
-      const db = await openPrivateDatabase(this.file, SCHEMA);
-      try {
-        return await operation(db);
-      } finally {
-        db.close();
-      }
+      return await withPrivateDatabase(this.file, SCHEMA, operation);
     } catch (error) {
       if (error instanceof ConnectionsStoreError) throw error;
       throw new ConnectionsStoreError('store_unavailable');
-    } finally {
-      release();
-      if (fileOperationGates.get(this.file) === gate) fileOperationGates.delete(this.file);
     }
   }
 
@@ -478,7 +474,7 @@ export class ConnectionsStore {
   async setClient(
     id: string,
     version: number,
-    registration: { readonly issuer: string; readonly client: ClientRegistration },
+    registration: { readonly issuer: string; readonly client: ClientRegistration; readonly entered: boolean },
   ): Promise<ConnectionApp> {
     versionValid(version);
     const issuer = httpsUrl(registration.issuer).href;
@@ -489,7 +485,15 @@ export class ConnectionsStore {
         const sealed = this.sealText(JSON.stringify(registration.client), key);
         return db
           .transaction(() => {
-            this.touch(db, id, version, 'issuer = ?, client = ?', issuer, sealed);
+            this.touch(
+              db,
+              id,
+              version,
+              'issuer = ?, client = ?, client_entered = ?',
+              issuer,
+              sealed,
+              registration.entered ? 1 : 0,
+            );
             return this.app(db, id);
           })
           .immediate();
@@ -519,13 +523,15 @@ export class ConnectionsStore {
     });
   }
 
+  /** A sign-in still pending with the forgotten client reads as expired. */
   async clearClient(id: string, version: number): Promise<ConnectionApp> {
     versionValid(version);
     return this.use((db) =>
       db
         .transaction(() => {
           this.appAt(db, id, version);
-          this.touch(db, id, version, 'client = NULL');
+          db.prepare('DELETE FROM sign_ins WHERE app_id = ?').run(id);
+          this.touch(db, id, version, 'client = NULL, client_entered = 0');
           return this.app(db, id);
         })
         .immediate(),
@@ -556,7 +562,7 @@ export class ConnectionsStore {
     return db
       .prepare<[string], GrantRow>(
         `SELECT g.app_id, a.server_key, a.host, a.url, g.generation, g.kind, g.state, g.secret,
-          g.access_issued_at, g.access_expires_at, a.client
+          g.access_issued_at, g.access_expires_at, g.access_published, a.client
           FROM grants g JOIN apps a ON a.id = g.app_id WHERE g.app_id = ?`,
       )
       .get(appId);
@@ -578,6 +584,7 @@ export class ConnectionsStore {
       renewable: row.secret !== null,
       accessIssuedAt: row.access_issued_at,
       accessExpiresAt: row.access_expires_at,
+      published: row.access_published === 1,
     };
   }
 
@@ -599,11 +606,12 @@ export class ConnectionsStore {
     }
     const at = new Date().toISOString();
     db.prepare(
-      `INSERT INTO grants (app_id, generation, kind, state, secret, access_issued_at, access_expires_at, updated_at)
-        VALUES (?, ?, ?, 'live', ?, ?, ?, ?)
+      `INSERT INTO grants (app_id, generation, kind, state, secret, access_issued_at, access_expires_at,
+          access_published, updated_at)
+        VALUES (?, ?, ?, 'live', ?, ?, ?, 0, ?)
         ON CONFLICT(app_id) DO UPDATE SET generation = excluded.generation, kind = excluded.kind, state = 'live',
           secret = excluded.secret, access_issued_at = excluded.access_issued_at,
-          access_expires_at = excluded.access_expires_at, updated_at = excluded.updated_at`,
+          access_expires_at = excluded.access_expires_at, access_published = 0, updated_at = excluded.updated_at`,
     ).run(
       app.id,
       generation,
@@ -640,17 +648,12 @@ export class ConnectionsStore {
     });
   }
 
-  async liveGrants(): Promise<readonly LiveGrant[]> {
-    return this.use((db) =>
-      db
-        .prepare<[], GrantRow>(
-          `SELECT g.app_id, a.server_key, a.host, a.url, g.generation, g.kind, g.state, g.secret,
-            g.access_issued_at, g.access_expires_at, a.client
-            FROM grants g JOIN apps a ON a.id = g.app_id WHERE g.state = 'live' ORDER BY a.name_key, a.id`,
-        )
-        .all()
-        .map((row) => this.liveGrant(row)),
-    );
+  /** The app's grant as it is now, undefined unless live. */
+  async currentGrant(appId: string): Promise<LiveGrant | undefined> {
+    return this.use((db) => {
+      const row = this.grantRow(db, appId);
+      return row?.state === 'live' ? this.liveGrant(row) : undefined;
+    });
   }
 
   /** Each app whose server refused renewal and that nobody has reconnected, disconnected or deleted since. */
@@ -695,7 +698,7 @@ export class ConnectionsStore {
     });
   }
 
-  /** Persists a renewal before its access token is published; false when the grant moved on meanwhile. */
+  /** Persists a renewal, unpublished, before its access token is published; false when the grant moved on meanwhile. */
   async rotateGrant(appId: string, generation: number, rotation: GrantRotation): Promise<boolean> {
     if (rotation.refreshToken !== undefined) secretValid(rotation.refreshToken);
     isoValid(rotation.accessIssuedAt);
@@ -706,7 +709,8 @@ export class ConnectionsStore {
       const update = (secret: Buffer | undefined): boolean =>
         db
           .prepare(
-            `UPDATE grants SET secret = COALESCE(?, secret), access_issued_at = ?, access_expires_at = ?, updated_at = ?
+            `UPDATE grants SET secret = COALESCE(?, secret), access_issued_at = ?, access_expires_at = ?,
+                access_published = 0, updated_at = ?
               WHERE app_id = ? AND generation = ? AND state = 'live' AND kind = 'oauth'`,
           )
           .run(
@@ -721,6 +725,22 @@ export class ConnectionsStore {
       if (refreshToken === undefined) return update(undefined);
       return this.withKey(db, (key) => update(this.sealText(refreshToken, key)));
     });
+  }
+
+  /**
+   * Records that the OAuth access token expiring at `accessExpiresAt` reached the gateway; false when the grant was
+   * ended, replaced or renewed meanwhile.
+   */
+  async markPublished(appId: string, generation: number, accessExpiresAt: string): Promise<boolean> {
+    return this.use(
+      (db) =>
+        db
+          .prepare(
+            `UPDATE grants SET access_published = 1, updated_at = ?
+              WHERE app_id = ? AND generation = ? AND state = 'live' AND kind = 'oauth' AND access_expires_at = ?`,
+          )
+          .run(new Date().toISOString(), appId, generation, accessExpiresAt).changes === 1,
+    );
   }
 
   /** The server refused renewal: Needs reconnecting. True only for the call that ended this generation. */
@@ -741,7 +761,8 @@ export class ConnectionsStore {
 
   private endGrant(db: Database.Database, appId: string, state: 'disconnected' | 'refused'): void {
     db.prepare(
-      `UPDATE grants SET state = ?, secret = NULL, access_issued_at = NULL, access_expires_at = NULL, updated_at = ?
+      `UPDATE grants SET state = ?, secret = NULL, access_issued_at = NULL, access_expires_at = NULL,
+          access_published = 0, updated_at = ?
         WHERE app_id = ?`,
     ).run(state, new Date().toISOString(), appId);
   }

@@ -152,6 +152,11 @@ function trustNotice(app: ConnectionApp): string {
   return `<p class="trust-notice">Your operator hasn’t reviewed ${escapeHtml(app.host)}. Once it’s connected, your assistant will send it information to use its tools. Connect only apps you trust.</p>`;
 }
 
+/** A server can reject a client on its own page without ever returning, so the entered details stay changeable. */
+function changeClientForm(app: ConnectionApp, signInHost: string): string {
+  return `<form class="change-client" method="post" action="/connections/change-client" data-send>${hiddenApp(app)}<p class="field-hint">If ${escapeHtml(signInHost)} doesn’t accept the client details you entered, enter them again.</p><button class="button button-secondary" type="submit" data-pending-label="Removing…">Change client details</button></form>`;
+}
+
 function connectForm(app: ConnectionApp, state: ConnectionsPageState): string {
   const signInHost = (app.issuer === null ? undefined : hostOf(app.issuer)) ?? app.host;
   const submit = (label: string, pending: string) =>
@@ -163,7 +168,7 @@ function connectForm(app: ConnectionApp, state: ConnectionsPageState): string {
       return `<form method="post" action="/connections/connect" data-send>${hiddenApp(app)}<div class="field"><label for="token">Access token</label><input id="token" name="token" type="password" autocomplete="off" autocapitalize="none" spellcheck="false" required aria-describedby="token-hint"><p class="field-hint" id="token-hint">A token ${escapeHtml(app.host)} issued for your account. Your assistant checks it once and never shows it again.</p></div>${submit('Connect', 'Checking…')}</form>`;
     case 'oauth':
       if (app.hasClient)
-        return `<p class="sign-in">You’ll sign in on ${escapeHtml(signInHost)}.</p><form method="post" action="/connections/sign-in" data-sign-in>${hiddenApp(app)}${submit('Continue to sign in', 'Opening sign-in…')}</form>`;
+        return `<p class="sign-in">You’ll sign in on ${escapeHtml(signInHost)}.</p>${app.clientEntered ? changeClientForm(app, signInHost) : ''}<form method="post" action="/connections/sign-in" data-sign-in>${hiddenApp(app)}${submit('Continue to sign in', 'Opening sign-in…')}</form>`;
       return `<p class="sign-in">${escapeHtml(signInHost)} needs a client registered for your assistant. Register this redirect URI with it, then enter the client details it gives you. You’ll sign in on ${escapeHtml(signInHost)}.</p><div class="redirect"><code id="redirect-uri">${escapeHtml(state.redirectUri(app))}</code>${renderCopyButton('redirect-uri', 'Copy redirect URI')}</div><form method="post" action="/connections/sign-in" data-sign-in>${hiddenApp(app)}<div class="field"><label for="client-id">Client ID</label><input id="client-id" name="clientId" type="text" autocomplete="off" autocapitalize="none" spellcheck="false" required></div><div class="field"><label for="client-secret">Client secret <span class="optional" aria-hidden="true">Optional</span></label><input id="client-secret" name="clientSecret" type="password" autocomplete="off" autocapitalize="none" spellcheck="false" aria-describedby="client-secret-hint"><p class="field-hint" id="client-secret-hint">Leave blank if ${escapeHtml(signInHost)} gave you no secret.</p></div>${submit('Continue to sign in', 'Opening sign-in…')}</form>`;
   }
 }
@@ -224,6 +229,8 @@ const STYLE = `
 .redirect { display: flex; align-items: center; gap: 12px; margin-bottom: 24px; padding: 10px 10px 10px 14px; border: 1px solid var(--line); border-radius: 9px; }
 .redirect code { flex: 1; min-width: 0; font: 13px/1.5 ui-monospace, monospace; }
 .connect-body .field:first-of-type { margin-top: 0; }
+.connect-body .change-client { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; padding: 0; margin-bottom: 4px; }
+.change-client .field-hint { flex: 1; min-width: 200px; margin: 0; }
 @media (max-width: 600px) {
   .app-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px 12px; padding: 14px 12px 14px 16px; }
   .app-identity { grid-column: 1; grid-row: 1; }

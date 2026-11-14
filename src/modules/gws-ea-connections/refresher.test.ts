@@ -243,6 +243,7 @@ async function oauthApp(name: string, appUrl: string, grant: OAuthGrantSpec): Pr
   const withClient = await store.setClient(created.id, created.version, {
     issuer,
     client: { clientId: `${host}-client`, clientSecret: CLIENT_SECRET },
+    entered: true,
   });
   const { state } = await store.startSignIn(withClient.id, withClient.version, {
     principalId: PRINCIPAL,
@@ -263,10 +264,11 @@ async function oauthApp(name: string, appUrl: string, grant: OAuthGrantSpec): Pr
   return done.app;
 }
 
-/** As a connect leaves it: the grant stored and its credential published. */
+/** As a connect leaves it: the grant stored, its credential published and the publish recorded. */
 async function publishedOAuthApp(name: string, appUrl: string, grant: OAuthGrantSpec): Promise<ConnectionApp> {
   const app = await oauthApp(name, appUrl, grant);
   gateway.put(appCredentialName(app.id), app.host, 'sentinel-access-at-sign-in');
+  expect(await store.markPublished(app.id, 1, new Date(grant.expiresAt).toISOString())).toBe(true);
   return app;
 }
 
@@ -278,7 +280,7 @@ async function tokenApp(name: string, appUrl: string): Promise<ConnectionApp> {
 }
 
 async function grantOf(app: Pick<ConnectionApp, 'id'>): Promise<LiveGrant | undefined> {
-  return (await store.liveGrants()).find(({ appId }) => appId === app.id);
+  return store.currentGrant(app.id);
 }
 
 async function mainServers(): Promise<Record<string, unknown>> {
@@ -440,6 +442,47 @@ describe('durable rotation', () => {
 
     expect(tokens.presented).toEqual(['sentinel-refresh-home']);
     expect(gateway.valueFor(app)).toBe('sentinel-access-1');
+  });
+
+  it('renews and publishes after a host restart a renewal whose publish failed, though the gateway lists the old credential', async () => {
+    const tokens = serveApp(HOMEBOARD);
+    const app = await publishedOAuthApp('HomeBoard', HOMEBOARD, {
+      refreshToken: 'sentinel-refresh-home',
+      issuedAt: START - 55 * MINUTE,
+      expiresAt: START + 5 * MINUTE,
+    });
+    gateway.failSaves = true;
+    await createConnectionsRefresher(dependencies()).tick();
+    expect(await grantOf(app)).toMatchObject({ published: false });
+    expect(gateway.valueFor(app)).toBe('sentinel-access-at-sign-in');
+
+    // The host restarts: the renewed access token held in memory is gone.
+    gateway.failSaves = false;
+    clock = START + MINUTE;
+    const restarted = createConnectionsRefresher(dependencies());
+    await restarted.tick();
+
+    expect(tokens.presented).toEqual(['sentinel-refresh-home', 'sentinel-refresh-1']);
+    expect(gateway.valueFor(app)).toBe('sentinel-access-2');
+    expect(await grantOf(app)).toMatchObject({ published: true });
+
+    clock = START + 2 * MINUTE;
+    await restarted.tick();
+    expect(tokens.presented).toHaveLength(2);
+  });
+
+  it('ends a grant without a refresh token whose credential a crash left unpublished', async () => {
+    serveApp(HOMEBOARD);
+    // A crash between the stored sign-in and its publish leaves an earlier grant's credential in the gateway.
+    const app = await oauthApp('HomeBoard', HOMEBOARD, { issuedAt: START, expiresAt: START + 60 * MINUTE });
+    gateway.put(appCredentialName(app.id), app.host, 'sentinel-access-before-reconnect');
+
+    await createConnectionsRefresher(dependencies()).tick();
+
+    expect((await store.get(app.id)).status).toBe('needs_reconnecting');
+    expect(gateway.valueFor(app)).toBeUndefined();
+    expect(refused).toEqual([{ appId: app.id, generation: 1 }]);
+    expect(endpoints.requests.filter(({ path: route }) => route === '/oauth/token')).toEqual([]);
   });
 
   it('renews a grant whose credential the gateway lost', async () => {
@@ -627,6 +670,57 @@ describe('locks and drift', () => {
     expect(gateway.valueFor(created)).toBe(PASTED_TOKEN);
   });
 
+  it('keeps a grant without a refresh token whose sign-in published after the tick began', async () => {
+    serveApp(HOMEBOARD);
+    const host = new URL(HOMEBOARD).hostname;
+    const issuer = `https://${host}/`;
+    const created = await store.create({ name: 'HomeBoard', url: HOMEBOARD, auth: 'oauth', issuer });
+    const withClient = await store.setClient(created.id, created.version, {
+      issuer,
+      client: { clientId: `${host}-client`, clientSecret: CLIENT_SECRET },
+      entered: true,
+    });
+    const { state } = await store.startSignIn(withClient.id, withClient.version, {
+      principalId: PRINCIPAL,
+      verifier: 'verifier-'.padEnd(48, 'x'),
+      issuer,
+      redirectUri: appRedirectUri(ASSISTANT, host),
+      resource: HOMEBOARD,
+    });
+    const claim = await store.claimSignIn(state, { host, principalId: PRINCIPAL });
+    if (!claim) throw new Error('The sign-in was not claimed');
+    const expiresAt = new Date(START + 60 * MINUTE).toISOString();
+    let release = (): void => undefined;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let stored = (): void => undefined;
+    const signedIn = new Promise<void>((resolve) => {
+      stored = resolve;
+    });
+    // As a sign-in's return runs: the grant is stored, then published and recorded, all under the app's lock.
+    const finishing = withAppLock(created.id, async () => {
+      await store.completeSignIn(claim, {
+        kind: 'oauth',
+        accessIssuedAt: new Date(START).toISOString(),
+        accessExpiresAt: expiresAt,
+      });
+      stored();
+      await gate;
+      gateway.put(appCredentialName(created.id), host, 'sentinel-access-at-sign-in');
+      await store.markPublished(created.id, 1, expiresAt);
+    });
+    await signedIn;
+    const ticking = createConnectionsRefresher(dependencies()).tick();
+    await sleep(50);
+    release();
+    await Promise.all([finishing, ticking]);
+
+    expect((await store.get(created.id)).status).toBe('connected');
+    expect(gateway.valueFor(created)).toBe('sentinel-access-at-sign-in');
+    expect(refused).toEqual([]);
+  });
+
   it('retries a credential removal that failed during a disconnect and succeeds on the next tick', async () => {
     const app = await tokenApp('Notes', NOTES);
     await store.disconnect(app.id, app.version);
@@ -724,6 +818,46 @@ describe('shutdown', () => {
     const grant = await store.readGrant(app.id, 1);
     expect(grant?.kind === 'oauth' ? grant.refreshToken : undefined).toBe('sentinel-refresh-1');
     expect(gateway.valueFor(app)).toBe('sentinel-access-1');
+  });
+
+  it('starts no token request once shutdown begins', async () => {
+    const tokens = serveApp(HOMEBOARD);
+    const app = await publishedOAuthApp('HomeBoard', HOMEBOARD, {
+      refreshToken: 'sentinel-refresh-home',
+      issuedAt: START - 55 * MINUTE,
+      expiresAt: START + 5 * MINUTE,
+    });
+    let release = (): void => undefined;
+    let enter = (): void => undefined;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const entered = new Promise<void>((resolve) => {
+      enter = resolve;
+    });
+    const fetches: ConnectionFetches = {
+      ...endpoints.fetches,
+      metadata: async (input, init) => {
+        enter();
+        await gate;
+        return endpoints.fetches.metadata(input, init);
+      },
+    };
+    const controller = new AbortController();
+    startConnectionsRefresher(store, controller.signal, dependencies({ fetches }));
+    await entered;
+
+    const stopping = stopConnectionsRefresher();
+    release();
+    await stopping;
+
+    expect(tokens.presented).toEqual([]);
+    expect(await grantOf(app)).toMatchObject({
+      generation: 1,
+      accessExpiresAt: new Date(START + 5 * MINUTE).toISOString(),
+    });
+    expect(gateway.valueFor(app)).toBe('sentinel-access-at-sign-in');
+    controller.abort();
   });
 
   it('stops waiting at its bound', async () => {

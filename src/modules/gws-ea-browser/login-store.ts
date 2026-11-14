@@ -10,7 +10,7 @@ import { browserRoot } from './availability.js';
 import type { SanitizedCommandOutcomeRunner } from '../../gws-ea/process.js';
 import { hasControlCharacters } from '../../gws-ea/validation.js';
 import { httpsOrigin } from './authentication-signatures.js';
-import { openPrivateDatabase } from '../gws-ea-vault/file.js';
+import { withPrivateDatabase } from '../gws-ea-vault/file.js';
 import { SEALED_MIN_BYTES, StoreSeal, type SealAvailability, type SealedFile } from '../gws-ea-vault/seal.js';
 import { LoginKey } from './login-key.js';
 import { browserPaths } from './paths.js';
@@ -90,7 +90,6 @@ CREATE INDEX IF NOT EXISTS signup_ownership ON attempts(site,username)
 CREATE TABLE IF NOT EXISTS meta (
   id INTEGER PRIMARY KEY CHECK(id = 1), key_check BLOB NOT NULL
 ) STRICT;`;
-const fileOperationGates = new Map<string, Promise<void>>();
 
 export function registrableDomain(origin: string): string | undefined {
   const url = httpsOrigin(origin);
@@ -129,20 +128,8 @@ export class LoginStore {
   }
 
   private async use<T>(operation: (db: Database.Database) => T | Promise<T>): Promise<T> {
-    const previous = fileOperationGates.get(this.file);
-    let release = (): void => undefined;
-    const gate = new Promise<void>((resolve) => {
-      release = resolve;
-    });
-    fileOperationGates.set(this.file, gate);
-    await previous;
     try {
-      const db = await openPrivateDatabase(this.file, SCHEMA);
-      try {
-        return await operation(db);
-      } finally {
-        db.close();
-      }
+      return await withPrivateDatabase(this.file, SCHEMA, operation);
     } catch (error) {
       if (
         error instanceof LoginStoreError ||
@@ -151,9 +138,6 @@ export class LoginStore {
       )
         throw error;
       throw new LoginStoreError('vault_unavailable');
-    } finally {
-      release();
-      if (fileOperationGates.get(this.file) === gate) fileOperationGates.delete(this.file);
     }
   }
 
