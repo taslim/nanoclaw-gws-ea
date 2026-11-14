@@ -29,12 +29,14 @@ import { reconcileBrowserGroup } from '../gws-ea-browser/reconcile.js';
 import { BrowserStore } from '../gws-ea-browser/db.js';
 import { useAvailableBrowser } from '../gws-ea-browser/testing/browser-runtime.js';
 import { configureBrowserAccess } from '../gws-ea-browser/testing/browser-access.js';
+import { useFakeGateway } from '../gws-ea-sealed-gateway/testing/fake-gateway.js';
 import { createDestination } from '../agent-to-agent/db/agent-destinations.js';
 import type { Session } from '../../types.js';
 
 let source: Session;
 let other: Session;
 beforeEach(async () => {
+  useFakeGateway();
   vi.spyOn(loginStores, 'getLoginStore').mockResolvedValue(testLoginStore(`${ROOT}/browser`).store);
   useAvailableBrowser();
   fs.rmSync(ROOT, { recursive: true, force: true });
@@ -71,6 +73,7 @@ beforeEach(async () => {
 afterEach(async () => {
   await closeDb();
   vi.unstubAllEnvs();
+  vi.unstubAllGlobals();
   fs.rmSync(ROOT, { recursive: true, force: true });
 });
 const send = (id: string, target: string, thread_id?: string) => ({

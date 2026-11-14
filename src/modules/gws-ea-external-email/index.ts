@@ -6,7 +6,8 @@
  * is any self-modification request from it. Before any session of it starts
  * or is adopted, a session admission policy refuses one whose capabilities,
  * configuration, stamped plugins, or provider differ from what the host
- * stamped. It works with main only through the host (`./bridge.ts`).
+ * stamped, or whose gateway identity holds more than the model credential.
+ * It works with main only through the host (`./bridge.ts`).
  */
 import path from 'node:path';
 
@@ -28,9 +29,10 @@ import { resolveTimezone } from '../../timezone.js';
 import { getGwsEaProfile, getExternalEmailAgentGroupId as readExternalEmailPointer } from '../gws-ea-profile/db.js';
 import { registerGuidance } from '../gws-ea-profile/guidance.js';
 import { escapeMarkdownInline } from '../gws-ea-profile/markdown.js';
+import { reconcileSealedGateway } from '../gws-ea-sealed-gateway/gateway.js';
 import { BRIDGE_ACTIONS } from './bridge.js';
 import { destinationViolations } from './destination-policy.js';
-import { ensureExternalEmailGroup, externalEmailDrift } from './group.js';
+import { EXTERNAL_EMAIL_NAME, ensureExternalEmailGroup, externalEmailDrift } from './group.js';
 
 export {
   EXTERNAL_EMAIL_CAPABILITIES,
@@ -48,7 +50,7 @@ export async function getExternalEmailAgentGroupId(): Promise<string | null> {
 // wiring to it: start callbacks run in module import order.
 onHostStart(async () => {
   if (!(await getDb().hasTable('gws_ea_profile'))) return;
-  await ensureExternalEmailGroup();
+  await reconcileSealedGateway(await ensureExternalEmailGroup(), EXTERNAL_EMAIL_NAME);
 });
 
 for (const [action, handler, guard] of BRIDGE_ACTIONS) registerDeliveryAction(action, handler, guard);

@@ -9,6 +9,8 @@
 import fs from 'node:fs';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+import { useFakeGateway } from '../gws-ea-sealed-gateway/testing/fake-gateway.js';
+
 const TEST_ROOT = '/tmp/nanoclaw-gws-ea-external-email-destinations-test';
 
 vi.mock('../../config.js', async (importOriginal) => ({
@@ -115,6 +117,7 @@ async function sessionOf(agentGroupId: string): Promise<Session> {
 }
 
 beforeEach(async () => {
+  useFakeGateway();
   fs.rmSync(TEST_ROOT, { recursive: true, force: true });
   fs.mkdirSync(TEST_ROOT, { recursive: true });
   await runMigrations(await initTestDb());
@@ -156,6 +159,8 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
+  vi.unstubAllEnvs();
+  vi.unstubAllGlobals();
   await closeDb();
   fs.rmSync(TEST_ROOT, { recursive: true, force: true });
 });

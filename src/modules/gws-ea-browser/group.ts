@@ -26,6 +26,7 @@ import { resolveProviderName } from '../../providers/provider-name.js';
 import { createAgentFromTemplate, groupSkillsOverlayDir } from '../../templates/create-agent.js';
 import type { ContainerConfigRow } from '../../types.js';
 import { getBrowserAgentGroupId, nameAssistantAgent, setBrowserAgentGroupId } from '../gws-ea-profile/db.js';
+import { sealedGatewayDrift } from '../gws-ea-sealed-gateway/gateway.js';
 
 /** The release template the host stamps the group from, and the plugin that stamp leaves in its folder. */
 export const BROWSER_TEMPLATE = 'gws-ea/browser';
@@ -94,6 +95,7 @@ export async function browserGroupDrift(agentGroupId: string, context: DriftCont
   ) {
     problems.push(`its provider ${provider} does not give each session its own state`);
   }
+  problems.push(...(await sealedGatewayDrift(agentGroupId, BROWSER_NAME)));
   return problems;
 }
 

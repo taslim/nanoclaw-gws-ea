@@ -37,6 +37,7 @@ import '../gws-ea-whereabouts/index.js';
 import '../gws-ea-matters/index.js';
 import '../gws-ea-lessons/index.js';
 import '../gws-ea-chats/directory.js';
+import { useFakeGateway } from '../gws-ea-sealed-gateway/testing/fake-gateway.js';
 
 const TEST_ROOT = `/tmp/nanoclaw-gws-ea-main-test-${process.pid}`;
 
@@ -109,6 +110,8 @@ async function startHost(): Promise<void> {
 }
 
 beforeEach(async () => {
+  // Starting the host reconciles external-email's gateway identity.
+  useFakeGateway();
   fs.rmSync(TEST_ROOT, { recursive: true, force: true });
   fs.mkdirSync(TEST_ROOT, { recursive: true });
   vi.stubEnv('GWS_EA_BROWSER_ROOT', path.join(TEST_ROOT, 'browser'));
@@ -117,6 +120,7 @@ beforeEach(async () => {
 
 afterEach(async () => {
   vi.unstubAllEnvs();
+  vi.unstubAllGlobals();
   hostStopped.abort();
   hostStopped = new AbortController();
   await closeDb();

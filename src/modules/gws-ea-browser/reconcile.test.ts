@@ -39,8 +39,10 @@ import { getRequiredProjectDocSections } from '../../project-doc-sections.js';
 import { getDestinations } from '../agent-to-agent/db/agent-destinations.js';
 import type { AgentGroup, Session } from '../../types.js';
 import { configureBrowserAccess } from './testing/browser-access.js';
+import { useFakeGateway } from '../gws-ea-sealed-gateway/testing/fake-gateway.js';
 
 beforeEach(async () => {
+  useFakeGateway();
   vi.spyOn(loginStores, 'getLoginStore').mockResolvedValue(testLoginStore(`${ROOT}/browser`).store);
   useAvailableBrowser();
   vi.stubEnv('GWS_EA_BROWSER_ROOT', `${ROOT}/browser`);
@@ -62,6 +64,8 @@ beforeEach(async () => {
 afterEach(async () => {
   setBrowserAdmissionReady(false);
   delete process.env.GWS_EA_BROWSER_ROOT;
+  vi.unstubAllEnvs();
+  vi.unstubAllGlobals();
   vi.restoreAllMocks();
   await closeDb();
   fs.rmSync(ROOT, { recursive: true, force: true });

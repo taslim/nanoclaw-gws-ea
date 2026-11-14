@@ -152,8 +152,9 @@ beforeEach(async () => {
           { id: 'google', hostPattern: 'www.googleapis.com' },
         ]);
       if (url.pathname === '/v1/agents' && init?.method === 'POST') {
-        if (gatewayFails) throw new Error('Gateway unavailable');
         const agent = body as { name: string; identifier: string };
+        // Only the new job agent's creation fails; browser's own identity is reconciled on the same path.
+        if (gatewayFails && (await host.jobs.getJobAgent(agent.identifier))) throw new Error('Gateway unavailable');
         agents.set(agent.identifier, { ...agent, id: `oc-${agents.size + 1}`, secretMode: 'all', secrets: [] });
         return Response.json({}, { status: 201 });
       }

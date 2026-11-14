@@ -19,7 +19,8 @@ import { registerGuidance } from '../gws-ea-profile/guidance.js';
 import { escapeMarkdownInline } from '../gws-ea-profile/markdown.js';
 import { chatAgentDrift } from './drift.js';
 import { ensureExternalChatGroup, reconcileChatShape } from './external-chat.js';
-import { reconcileChatGateway, retiredChatGatewayDrift } from './gateway.js';
+import { reconcileSealedGateway } from '../gws-ea-sealed-gateway/gateway.js';
+import { CHAT_AGENT, retiredChatGatewayDrift } from './gateway.js';
 import { safeErrorMessage } from '../../gws-ea/redact.js';
 import { getJobAgent, listJobAgents } from './jobs.js';
 import { chatAgentsMigration } from './migration.js';
@@ -62,7 +63,7 @@ export async function reconcileChatAgents(): Promise<void> {
     if (job.state === 'retired' || job.state === 'retiring') continue;
     await reconcileChatShape(job.agent_group_id, 'job');
     if (job.state === 'creating' && (await getChat(job.messaging_group_id))?.state === 'moving') continue;
-    await reconcileChatGateway(job.agent_group_id);
+    await reconcileSealedGateway(job.agent_group_id, CHAT_AGENT);
   }
 }
 

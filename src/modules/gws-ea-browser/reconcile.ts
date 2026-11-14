@@ -9,9 +9,10 @@ import {
   getDestinations,
 } from '../agent-to-agent/db/agent-destinations.js';
 import { getBrowserAgentGroupId } from '../gws-ea-profile/db.js';
+import { reconcileSealedGateway } from '../gws-ea-sealed-gateway/gateway.js';
 import { browserDelegators, errandSource, type BrowserDelegator } from './access.js';
 import { cancelBrowserJob } from './cancel.js';
-import { ensureBrowserGroup, setBrowserAdmissionReady } from './group.js';
+import { BROWSER_NAME, ensureBrowserGroup, setBrowserAdmissionReady } from './group.js';
 
 import { browserConfigured } from './availability.js';
 
@@ -118,6 +119,8 @@ async function reconcileDestinations(root?: string): Promise<void> {
     return;
   }
   const browser = existing ?? (await ensureBrowserGroup());
+  // Every pass, not only creation: admission refuses an identity holding more than the model credential.
+  await reconcileSealedGateway(browser, BROWSER_NAME);
   const wanted = delegators.map((delegator) => edges(browser, delegator));
   const held = await getDestinations(browser);
   if (

@@ -2,7 +2,8 @@ import { getDb } from '../../db/connection.js';
 import { getMessagingGroup } from '../../db/messaging-groups.js';
 import { createAgentFromTemplate } from '../../templates/create-agent.js';
 import { reconcileChatShape } from './external-chat.js';
-import { reconcileChatGateway } from './gateway.js';
+import { reconcileSealedGateway } from '../gws-ea-sealed-gateway/gateway.js';
+import { CHAT_AGENT } from './gateway.js';
 import { JOB_CHAT_TEMPLATE } from './shape.js';
 
 export type JobAgentState = 'creating' | 'active' | 'retiring' | 'retired';
@@ -58,7 +59,7 @@ export async function createJobAgent(chat: string): Promise<JobAgent> {
     );
     return row;
   });
-  await reconcileChatGateway(result.agent_group_id);
+  await reconcileSealedGateway(result.agent_group_id, CHAT_AGENT);
   return result;
 }
 

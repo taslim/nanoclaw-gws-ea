@@ -9,7 +9,8 @@ import { getProviderHostContract } from '../../provider-contracts/index.js';
 import { resolveProviderName } from '../../providers/provider-name.js';
 import { groupSkillsOverlayDir } from '../../templates/create-agent.js';
 import { hasBrowserAccess } from '../gws-ea-browser/access.js';
-import { chatGatewayDrift } from './gateway.js';
+import { sealedGatewayDrift } from '../gws-ea-sealed-gateway/gateway.js';
+import { CHAT_AGENT } from './gateway.js';
 import {
   CHAT_SHARED_SKILLS,
   EXTERNAL_CHAT_CAPABILITIES,
@@ -86,6 +87,6 @@ export async function chatAgentDrift(
     )
       problems.push(`its provider ${provider} does not isolate session state`);
   }
-  problems.push(...(await chatGatewayDrift(groupId)));
+  problems.push(...(await sealedGatewayDrift(groupId, CHAT_AGENT)));
   return problems;
 }

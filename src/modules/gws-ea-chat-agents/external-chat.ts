@@ -8,7 +8,8 @@ import {
   nameAssistantAgent,
   recordExternalChatAgentGroupId,
 } from '../gws-ea-profile/db.js';
-import { reconcileChatGateway } from './gateway.js';
+import { reconcileSealedGateway } from '../gws-ea-sealed-gateway/gateway.js';
+import { CHAT_AGENT } from './gateway.js';
 import {
   CHAT_SHARED_SKILLS,
   EXTERNAL_CHAT_CAPABILITIES,
@@ -38,6 +39,6 @@ export async function ensureExternalChatGroup(): Promise<string> {
     await recordExternalChatAgentGroupId(created.group.id);
     return created.group.id;
   });
-  await reconcileChatGateway(group);
+  await reconcileSealedGateway(group, CHAT_AGENT);
   return group;
 }
