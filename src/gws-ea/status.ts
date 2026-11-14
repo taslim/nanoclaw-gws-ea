@@ -30,6 +30,7 @@ import {
 import { CONNECTOR_ACTIONS, CONNECTOR_NAMES, connectorDefinition } from './connectors.js';
 import { inspectConnector, type ConnectorObservation, type ConnectorInspection } from './connector-inspection.js';
 import type { ChatSubscriptionState } from '../modules/gws-ea-chat/health.js';
+import type { AppStatus } from '../modules/gws-ea-connections/store.js';
 import { formatLocalTime } from '../timezone.js';
 import { taggedImageId } from './agent-image.js';
 import { releaseImageTag } from './agent-image-release.js';
@@ -80,7 +81,7 @@ import {
   type NanoclawServiceHelpers,
 } from './service-control.js';
 import { GwsEaError, shortCommit, type InstanceReservation, type ReleaseCoordinates } from './types.js';
-import { isRecord, optionalString, unwrapData } from './validation.js';
+import { hasControlCharacters, isRecord, optionalString, unwrapData } from './validation.js';
 import {
   readLatestDelivery,
   readLatestProviderTurn,
@@ -216,33 +217,98 @@ export interface WebAliasFacts {
   readonly address: string | null;
 }
 
-export interface LoginStoreStatus {
+type StoreReason = 'key_missing' | 'key_mismatch' | 'keychain_unavailable';
+/** A host store whose secrets are sealed with its own Keychain key, as the running host reports it. */
+export interface SealedStoreStatus {
   readonly status: 'available' | 'unavailable' | 'not_checked';
-  readonly reason: 'key_missing' | 'key_mismatch' | 'keychain_unavailable' | null;
+  readonly reason: StoreReason | null;
   readonly operator_action: string | null;
 }
-const LOGIN_STORE_NOT_CHECKED: LoginStoreStatus = { status: 'not_checked', reason: null, operator_action: null };
-function hostLoginStoreStatus(health: unknown): LoginStoreStatus {
-  if (!isRecord(health) || !isRecord(health.loginStore)) return LOGIN_STORE_NOT_CHECKED;
-  const store = health.loginStore;
-  if (store.available === true) return { status: 'available', reason: null, operator_action: null };
+const STORE_NOT_CHECKED: SealedStoreStatus = { status: 'not_checked', reason: null, operator_action: null };
+const UNLOCK_KEYCHAIN = 'Log in locally at the Mac and unlock the keychain';
+function sealedStoreStatus(availability: unknown, unreadableAction: string): SealedStoreStatus {
+  if (!isRecord(availability)) return STORE_NOT_CHECKED;
+  if (availability.available === true) return { status: 'available', reason: null, operator_action: null };
+  const reason = availability.reason;
   if (
-    store.available !== false ||
-    (store.reason !== 'key_missing' && store.reason !== 'key_mismatch' && store.reason !== 'keychain_unavailable')
+    availability.available !== false ||
+    (reason !== 'key_missing' && reason !== 'key_mismatch' && reason !== 'keychain_unavailable')
   )
-    return LOGIN_STORE_NOT_CHECKED;
-  const reason = store.reason;
+    return STORE_NOT_CHECKED;
   return {
     status: 'unavailable',
     reason,
     operator_action:
       reason === 'keychain_unavailable'
-        ? 'Log in locally at the Mac and unlock the keychain, then check this assistant again.'
-        : 'Log in locally at the Mac and unlock the keychain; if the key remains missing or different, remove the unreadable logins on the principal’s saved-logins page before the next add can create a key.',
+        ? `${UNLOCK_KEYCHAIN}, then check this assistant again.`
+        : `${UNLOCK_KEYCHAIN}; if the key remains missing or different, ${unreadableAction}`,
   };
 }
+function hostLoginStoreStatus(health: unknown): SealedStoreStatus {
+  return isRecord(health)
+    ? sealedStoreStatus(
+        health.loginStore,
+        'remove the unreadable logins on the principal’s saved-logins page before the next add can create a key.',
+      )
+    : STORE_NOT_CHECKED;
+}
+
+export interface ConnectedAppView {
+  readonly name: string;
+  readonly host: string;
+  readonly origin: 'principal' | 'operator';
+  readonly status: AppStatus;
+}
+/** The assistant's custom apps; `apps` is null when they were not checked. */
+export interface ConnectionsView {
+  readonly store: SealedStoreStatus;
+  readonly apps: readonly ConnectedAppView[] | null;
+}
+const CONNECTIONS_NOT_CHECKED: ConnectionsView = { store: STORE_NOT_CHECKED, apps: null };
+function isAppStatus(value: unknown): value is AppStatus {
+  return value === 'connected' || value === 'needs_reconnecting' || value === 'not_connected';
+}
+function shownText(value: unknown): value is string {
+  return typeof value === 'string' && value.length > 0 && !hasControlCharacters(value);
+}
+/** Only the four shown fields are kept, so a host that reports more never widens what status prints. */
+function connectedApp(value: unknown): ConnectedAppView | undefined {
+  if (!isRecord(value)) return undefined;
+  const { name, host, origin, status } = value;
+  if (!shownText(name) || !shownText(host) || (origin !== 'principal' && origin !== 'operator')) return undefined;
+  return isAppStatus(status) ? { name, host, origin, status } : undefined;
+}
+function hostConnections(health: unknown): ConnectionsView {
+  if (!isRecord(health) || !Array.isArray(health.apps)) return CONNECTIONS_NOT_CHECKED;
+  const store = sealedStoreStatus(
+    health.store,
+    'delete the unreadable apps on the principal’s Connections page before the next connection can create a key.',
+  );
+  if (store.status === 'not_checked') return CONNECTIONS_NOT_CHECKED;
+  const apps: ConnectedAppView[] = [];
+  for (const entry of health.apps as unknown[]) {
+    const app = connectedApp(entry);
+    if (!app) return CONNECTIONS_NOT_CHECKED;
+    apps.push(app);
+  }
+  return { store, apps };
+}
+
+/** Read only from a running host and only with details, like the saved-logins store. */
+async function observeConnections(subject: Subject, active: boolean): Promise<ConnectionsView> {
+  if (!active || !subject.context.details) return CONNECTIONS_NOT_CHECKED;
+  try {
+    return hostConnections(
+      unwrapData(await subject.observers.ncl(requireRuntime(subject.runtime), ['gws-ea-connections-health'])),
+    );
+    // eslint-disable-next-line no-catch-all/no-catch-all -- An unanswered host report leaves the apps unchecked; it never hides the other observations.
+  } catch {
+    return CONNECTIONS_NOT_CHECKED;
+  }
+}
+
 export interface BrowserStatus extends ProbeResult {
-  readonly login_store: LoginStoreStatus;
+  readonly login_store: SealedStoreStatus;
   readonly chrome: 'available' | 'missing' | 'unavailable' | 'not_checked';
   readonly isolation: BrowserIsolationObservation | null;
 }
@@ -398,6 +464,7 @@ export interface AssistantStatus {
   readonly rollback: RollbackView;
   readonly schema: SchemaView;
   readonly main_turn: MainTurnView;
+  readonly connections: ConnectionsView;
   readonly probes: AssistantProbes;
   readonly connectors: readonly ConnectorObservation[];
 }
@@ -1001,7 +1068,7 @@ async function browserProbe(subject: Subject, active: boolean): Promise<BrowserS
       healthFailure = error;
     }
   }
-  const login_store = active && subject.context.details ? hostLoginStoreStatus(health) : LOGIN_STORE_NOT_CHECKED;
+  const login_store = active && subject.context.details ? hostLoginStoreStatus(health) : STORE_NOT_CHECKED;
   const isolation =
     active && subject.context.details
       ? await inspectBrowserIsolation(subject.context.paths, subject.reservation.instance_id, {
@@ -1384,6 +1451,7 @@ export async function observeAssistantStatus(
     browser,
     voice,
     rollback,
+    connections,
   ] = await Promise.all([
     probe<CheckoutFacts>(() => checkoutProbe(subject), { commit: null }),
     probe<ImageFacts>(() => imageProbe(subject), { tag: null }),
@@ -1423,7 +1491,7 @@ export async function observeAssistantStatus(
     probe<Omit<BrowserStatus, 'status' | 'reason'>>(() => browserProbe(subject, active), {
       chrome: 'not_checked' as const,
       isolation: null,
-      login_store: LOGIN_STORE_NOT_CHECKED,
+      login_store: STORE_NOT_CHECKED,
     }),
     probe<Omit<VoiceObservation, 'status' | 'reason'>>(
       async () => {
@@ -1456,6 +1524,7 @@ export async function observeAssistantStatus(
       },
     ),
     observeRollback(subject, live),
+    observeConnections(subject, active),
   ]);
   return {
     ...record,
@@ -1463,6 +1532,7 @@ export async function observeAssistantStatus(
     rollback,
     schema: schemaView(live),
     main_turn: observeMainTurn(subject),
+    connections,
     probes: {
       checkout,
       image,
@@ -1764,6 +1834,25 @@ function mainTurnLine({ provider, last, reason }: MainTurnView, timezone: string
   return `  Last observed agent outcome (main): ${detail}`;
 }
 
+function storeLine({ status, reason, operator_action: action }: SealedStoreStatus): string {
+  return [status.replaceAll('_', ' '), ...(reason ? [reason] : []), ...(action ? [action] : [])].join('; ');
+}
+
+const ORIGIN_WORDS: Readonly<Record<ConnectedAppView['origin'], string>> = {
+  principal: 'added by the principal',
+  operator: 'from the operator',
+};
+
+function connectionsLines({ store, apps }: ConnectionsView): string[] {
+  return [
+    `  Connected apps: ${storeLine(store)}${apps?.length === 0 ? '; none' : ''}`,
+    ...(apps ?? []).map(
+      ({ name, host, origin, status }) =>
+        `    ${name} (${host}): ${ORIGIN_WORDS[origin]}; ${status.replaceAll('_', ' ')}`,
+    ),
+  ];
+}
+
 function webStatusDetail(observation: ConnectorObservation, instanceId: string): string {
   if (observation.name !== 'web' || 'name' in observation.details) return '';
   const address = observation.details.find((assistant) => assistant.instance_id === instanceId)?.hostname;
@@ -1791,6 +1880,7 @@ function renderStatusDetails(status: AssistantStatus, timezone: string): string[
     ...operation.slice(1).map((line) => `             ${line}`),
     `  Schema:    ${schemaLine}`,
     mainTurnLine(status.main_turn, timezone),
+    ...connectionsLines(status.connections),
     ...status.connectors.map(
       (entry) =>
         `  ${entry.name}: ${entry.setup.replaceAll('_', ' ')}; ${entry.readiness.status.replaceAll('_', ' ')}${entry.reasons.length ? `; ${entry.reasons.join(' ')}` : ''}${webStatusDetail(entry, status.instance_id)}`,
@@ -1807,10 +1897,7 @@ function renderStatusDetails(status: AssistantStatus, timezone: string): string[
         ? [probeDetail(name, status.probes, timezone), ...(result.reason ? [result.reason] : [])].join('; ')
         : (result.reason ?? probeDetail(name, status.probes, timezone));
     lines.push(probeLine(result.status, name, detail));
-    if (name === 'browser')
-      lines.push(
-        `    Saved logins: ${status.probes.browser.login_store.status.replaceAll('_', ' ')}${status.probes.browser.login_store.reason ? `; ${status.probes.browser.login_store.reason}` : ''}${status.probes.browser.login_store.operator_action ? `; ${status.probes.browser.login_store.operator_action}` : ''}`,
-      );
+    if (name === 'browser') lines.push(`    Saved logins: ${storeLine(status.probes.browser.login_store)}`);
     if (name === 'job_agents') lines.push(...(status.probes.job_agents.jobs ?? []).map(jobAgentLine));
     if (name === 'inbox') lines.push(...calendarAccessLines(status.probes.inbox.calendar_access, timezone));
   }
@@ -1907,8 +1994,12 @@ function statusActions(status: AssistantStatus): NextAction[] {
       (action) => entry.setup !== 'not_installed' || action.kind === 'external' || action.argv.includes('--abandon'),
     ),
   );
-  if (status.probes.browser.login_store.operator_action)
-    actions.push({ kind: 'external', instruction: status.probes.browser.login_store.operator_action });
+  // Both stores share one Keychain action when the Keychain itself is locked; the operator needs it once.
+  for (const store of [status.probes.browser.login_store, status.connections.store]) {
+    const instruction = store.operator_action;
+    if (instruction && !actions.some((action) => action.kind === 'external' && action.instruction === instruction))
+      actions.push({ kind: 'external', instruction });
+  }
   if (status.probes.service.state === 'not_installed') actions.push(command('resume'));
   if (status.probes.chat.sign_in_needed === true || status.probes.workspace.status === 'degraded')
     actions.push(command('connect-google'));
