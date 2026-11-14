@@ -1,14 +1,57 @@
 import { mkdtemp, rm } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+
+/** The host-start hook this module registers, and the order its starts ran in. */
+const host = vi.hoisted(() => ({
+  start: undefined as ((context: { readonly signal: AbortSignal }) => Promise<void>) | undefined,
+  started: [] as string[],
+}));
+vi.mock('../../host-lifecycle.js', async (original) => ({
+  ...(await original<typeof import('../../host-lifecycle.js')>()),
+  onHostStart: (callback: (context: { readonly signal: AbortSignal }) => Promise<void>) => {
+    host.start = callback;
+  },
+}));
+vi.mock('../../log.js', () => ({
+  log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn(), fatal: vi.fn() },
+}));
+vi.mock('./store.js', async (original) => ({
+  ...(await original<typeof import('./store.js')>()),
+  getConnectionsStore: vi.fn(),
+}));
+vi.mock('./idle-restart.js', async (original) => ({
+  ...(await original<typeof import('./idle-restart.js')>()),
+  startRestartChecks: vi.fn(() => host.started.push('restart checks')),
+}));
+vi.mock('./note.js', async (original) => ({
+  ...(await original<typeof import('./note.js')>()),
+  startReconnectNotes: vi.fn(async () => {
+    host.started.push('reconnect notes');
+  }),
+}));
+vi.mock('./refresher.js', async (original) => ({
+  ...(await original<typeof import('./refresher.js')>()),
+  startConnectionsRefresher: vi.fn(() => host.started.push('refresher')),
+}));
+vi.mock('./apply.js', async (original) => ({
+  ...(await original<typeof import('./apply.js')>()),
+  applyMainServers: vi.fn(async () => {
+    host.started.push('apply');
+    return true;
+  }),
+}));
 
 import { lookup } from '../../cli/registry.js';
 import { closeDb, createAgentGroup, getDb, initTestDb, runMigrations } from '../../db/index.js';
 import { ensureContainerConfig, updateContainerConfigJson } from '../../db/container-configs.js';
+import { log } from '../../log.js';
 import '../gws-ea-profile/index.js';
+import { applyMainServers, MainServersUnreadableError } from './apply.js';
+import { CONNECTIONS_ROOT_ENV } from './config.js';
 import { connectionsHealth } from './index.js';
-import { ConnectionsStoreError, type ConnectionsStore } from './store.js';
+import { ConnectionsStoreError, getConnectionsStore, type ConnectionsStore } from './store.js';
 import { testConnectionsStore, type TestKeychain } from './testing/store.js';
 
 const MAIN = 'ag-main';
@@ -119,5 +162,60 @@ describe('gws-ea-connections-health', () => {
     expect(command).toMatchObject({ access: 'hidden', hostOnly: true });
     expect(command?.parseArgs({})).toBeUndefined();
     expect(() => command?.parseArgs({ id: 'app_1' })).toThrow('takes no arguments');
+  });
+});
+
+describe('the host-start hook', () => {
+  const start = async (): Promise<void> => {
+    if (!host.start) throw new Error('the connections module registered no host-start hook');
+    await host.start({ signal: new AbortController().signal });
+  };
+
+  beforeEach(() => {
+    process.env[CONNECTIONS_ROOT_ENV] = path.join(directory, 'connections');
+    host.started.length = 0;
+    vi.mocked(getConnectionsStore).mockResolvedValue(store);
+    vi.mocked(log.warn).mockClear();
+    vi.mocked(log.error).mockClear();
+  });
+  afterEach(() => {
+    delete process.env[CONNECTIONS_ROOT_ENV];
+  });
+
+  it('sweeps expired sign-ins, then arms restart checks before the first apply', async () => {
+    const sweep = vi.spyOn(store, 'sweepExpiredSignIns').mockImplementation(async () => {
+      host.started.push('sweep');
+      return 0;
+    });
+
+    await start();
+
+    expect(sweep).toHaveBeenCalledOnce();
+    expect(host.started).toEqual(['sweep', 'restart checks', 'reconnect notes', 'refresher', 'apply']);
+  });
+
+  it('still arms everything and applies when the sign-in sweep finds the store unavailable', async () => {
+    vi.spyOn(store, 'sweepExpiredSignIns').mockRejectedValue(new ConnectionsStoreError('store_unavailable'));
+
+    await start();
+
+    expect(host.started).toEqual(['restart checks', 'reconnect notes', 'refresher', 'apply']);
+    expect(log.warn).toHaveBeenCalledWith(expect.any(String), { reason: 'store_unavailable' });
+  });
+
+  it('logs an unavailable store or unreadable main servers from the apply, and rethrows anything else', async () => {
+    vi.mocked(applyMainServers).mockRejectedValueOnce(new ConnectionsStoreError('store_unavailable'));
+    await expect(start()).resolves.toBeUndefined();
+    expect(log.warn).toHaveBeenCalledWith('Connections store unavailable', { reason: 'store_unavailable' });
+
+    vi.mocked(applyMainServers).mockRejectedValueOnce(new MainServersUnreadableError());
+    await expect(start()).resolves.toBeUndefined();
+    expect(log.error).toHaveBeenCalledWith('Main apps not applied', {
+      reason: new MainServersUnreadableError().message,
+    });
+
+    const defect = new TypeError('a programming error');
+    vi.mocked(applyMainServers).mockRejectedValueOnce(defect);
+    await expect(start()).rejects.toBe(defect);
   });
 });

@@ -1523,20 +1523,33 @@ describe('recorded divergence: a module can refuse a session before it starts', 
 });
 
 describe('recorded divergence: a spawned container records when it read its configuration', () => {
-  it('stamps the read before container.json is materialized and reports none for an unknown session', async () => {
+  it('stamps the read before container.json is materialized, while starting and once registered', async () => {
     await freshInstall();
     const runner = await import('../container-runner.js');
     const source = await readFile(path.join(originalCwd, 'src/container-runner.ts'), 'utf8');
 
     // Main's apps restart only containers that read their configuration before a change; one stamped after the
-    // read would keep the old apps and never be restarted.
+    // read, or invisible while it starts, would keep the old apps and never be restarted.
     expect(runner.getContainerConfigReadAtMs('no-such-session')).toBeUndefined();
+    expect(runner.getSpawningConfigReadAtMs('no-such-session')).toBeUndefined();
     const spawn = source.slice(source.indexOf('async function spawnContainer('));
-    const stamp = spawn.indexOf('const configReadAtMs = Date.now();');
+    const stamp = spawn.indexOf(
+      'const configReadAtMs = Date.now();\n  spawningConfigReads.set(session.id, configReadAtMs);',
+    );
     expect(stamp).toBeGreaterThan(-1);
     expect(stamp).toBeLessThan(spawn.indexOf('await materializeContainerJson('));
+    // Registration hands the stamp from the starting map to the runtime in one synchronous step.
     expect(spawn.slice(spawn.indexOf('const runtime = registerRuntime('))).toMatch(
-      /^const runtime = registerRuntime\([^;]*\);\s*runtime\.claimIncarnation = claimIncarnation;\s*runtime\.configReadAtMs = configReadAtMs;/u,
+      /^const runtime = registerRuntime\([^;]*\);\s*runtime\.claimIncarnation = claimIncarnation;\s*runtime\.configReadAtMs = configReadAtMs;\s*spawningConfigReads\.delete\(session\.id\);/u,
+    );
+    // Every spawn ends through wakeContainer's finally, so a failed or abandoned one never stays starting.
+    expect(source.match(/spawnContainer\(/gu)).toHaveLength(2);
+    const wake = source.slice(
+      source.indexOf('export function wakeContainer('),
+      source.indexOf('async function spawnContainer('),
+    );
+    expect(wake).toMatch(
+      /const promise = spawnContainer\(session\)[\s\S]*\.finally\(\(\) => \{\s*spawningConfigReads\.delete\(session\.id\);/u,
     );
   });
 });

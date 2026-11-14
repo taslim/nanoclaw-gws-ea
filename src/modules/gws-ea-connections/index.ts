@@ -87,7 +87,13 @@ onHostStart(async ({ signal }) => {
   if (!connectionsRoot()) return;
   try {
     const store = await getConnectionsStore();
-    await store.sweepExpiredSignIns();
+    try {
+      await store.sweepExpiredSignIns();
+    } catch (error) {
+      // Expired sign-ins are refused when read; a failed sweep must not leave the apps unserved for this host.
+      if (!(error instanceof ConnectionsStoreError)) throw error;
+      log.warn('Expired connection sign-ins not swept', { reason: error.reason });
+    }
     // Armed first, so a restart a previous host left pending and one this apply records are both served.
     startRestartChecks(store, signal);
     await startReconnectNotes(store, signal);

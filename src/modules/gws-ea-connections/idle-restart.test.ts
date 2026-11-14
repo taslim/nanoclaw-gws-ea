@@ -14,9 +14,13 @@ vi.mock('../../log.js', () => ({
 }));
 vi.mock('../../request-wake.js', () => ({ requestWake: vi.fn(async () => true) }));
 
-/** Each running container's config read time; undefined for one this host adopted. */
+/**
+ * Each running container's config read time (undefined for one this host adopted), and each container still
+ * starting with the time it read its configuration, not yet registered as running.
+ */
 const runtime = vi.hoisted(() => ({
   running: new Map<string, number | undefined>(),
+  spawning: new Map<string, number>(),
   exits: new Map<string, Array<() => void>>(),
   kill: vi.fn((sessionId: string, _reason: string, onExit?: () => void) => {
     const callbacks = runtime.exits.get(sessionId) ?? [];
@@ -28,6 +32,7 @@ vi.mock('../../container-runner.js', async (original) => ({
   ...(await original<typeof import('../../container-runner.js')>()),
   isContainerRunning: (sessionId: string) => runtime.running.has(sessionId),
   getContainerConfigReadAtMs: (sessionId: string) => runtime.running.get(sessionId),
+  getSpawningConfigReadAtMs: (sessionId: string) => runtime.spawning.get(sessionId),
   killContainer: runtime.kill,
 }));
 
@@ -105,6 +110,7 @@ beforeEach(async () => {
   fs.mkdirSync(ROOT, { recursive: true });
   ({ store } = testConnectionsStore(path.join(ROOT, 'connections')));
   runtime.running.clear();
+  runtime.spawning.clear();
   runtime.exits.clear();
   runtime.kill.mockClear();
   vi.mocked(requestWake).mockClear();
@@ -223,6 +229,44 @@ describe('servePendingRestart', () => {
 
     expect(await idle.servePendingRestart(store)).toBe(false);
     expect(await store.pendingRestart()).toBeUndefined();
+  });
+});
+
+describe('a main session still starting', () => {
+  it('keeps the request while it starts on the configuration it read before the change, then restarts it', async () => {
+    runtime.running.clear();
+    const readAt = Date.now() - 1_000;
+    runtime.spawning.set(dm.id, readAt);
+    await requestAt(0);
+
+    expect(await idle.servePendingRestart(store)).toBe(true);
+    expect(await store.pendingRestart()).toBeDefined();
+    expect(killed()).toEqual([]);
+
+    // Registered with the configuration it read before the change, and idle.
+    runtime.spawning.delete(dm.id);
+    runtime.running.set(dm.id, readAt);
+    expect(await idle.servePendingRestart(store)).toBe(true);
+    expect(killed()).toEqual([dm.id]);
+
+    exit(dm);
+    expect(await idle.servePendingRestart(store)).toBe(false);
+    expect(await store.pendingRestart()).toBeUndefined();
+  });
+
+  it("does not hold the request when it read after the change, failed to start, or is not main's", async () => {
+    runtime.running.clear();
+    await requestAt(0);
+    runtime.spawning.set(dm.id, Date.now() + 1_000);
+    runtime.spawning.set(other.id, Date.now() - 1_000);
+
+    expect(await idle.servePendingRestart(store)).toBe(false);
+    expect(await store.pendingRestart()).toBeUndefined();
+
+    await requestAt(2_000);
+    runtime.spawning.delete(dm.id);
+    expect(await idle.servePendingRestart(store)).toBe(false);
+    expect(killed()).toEqual([]);
   });
 });
 

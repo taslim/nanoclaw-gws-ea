@@ -14,24 +14,39 @@ vi.mock('../../log.js', () => ({
 }));
 vi.mock('../../request-wake.js', () => ({ requestWake: vi.fn(async () => true) }));
 
-/** Each running container's config read time; undefined for one this host adopted. */
-const runtime = vi.hoisted(() => ({ running: new Map<string, number | undefined>() }));
+/**
+ * Each running container's config read time (undefined for one this host adopted), and each container still
+ * starting with the time it read its configuration, not yet registered as running.
+ */
+const runtime = vi.hoisted(() => ({
+  running: new Map<string, number | undefined>(),
+  spawning: new Map<string, number>(),
+}));
 vi.mock('../../container-runner.js', async (original) => ({
   ...(await original<typeof import('../../container-runner.js')>()),
   isContainerRunning: (sessionId: string) => runtime.running.has(sessionId),
   getContainerConfigReadAtMs: (sessionId: string) => runtime.running.get(sessionId),
+  getSpawningConfigReadAtMs: (sessionId: string) => runtime.spawning.get(sessionId),
 }));
 
-import { closeDb, initTestDb, runMigrations } from '../../db/index.js';
+import { closeDb, getDb, initTestDb, runMigrations } from '../../db/index.js';
 import { createSession } from '../../db/sessions.js';
 import { getContainerConfig, updateContainerConfigJson } from '../../db/container-configs.js';
+import { log } from '../../log.js';
 import { inboundDbPath } from '../../mailbox/sqlite/paths.js';
 import type { Session } from '../../types.js';
 import { MAIN, mainSession, seedMain } from '../gws-ea-matters/testing/main-conversation.js';
 import '../gws-ea-profile/index.js';
-import { createReconnectNotes, startReconnectNotes, stopReconnectNotes, type ReconnectNotes } from './note.js';
+import { writeNoteForMain } from '../gws-ea-profile/main-note.js';
+import {
+  createReconnectNotes,
+  reconnectNoteId,
+  startReconnectNotes,
+  stopReconnectNotes,
+  type ReconnectNotes,
+} from './note.js';
 import type { RefusedApp } from './refresher.js';
-import type { ConnectionApp, ConnectionsStore } from './store.js';
+import { ConnectionsStoreError, type ConnectionApp, type ConnectionsStore } from './store.js';
 import { testConnectionsStore } from './testing/store.js';
 
 const SENTINEL_TOKEN = 'sentinel-dead-grant-token-Q8x4';
@@ -81,6 +96,9 @@ beforeEach(async () => {
   await seedMain('UTC');
   session = await mainSession();
   runtime.running.clear();
+  runtime.spawning.clear();
+  vi.mocked(log.warn).mockClear();
+  vi.mocked(log.error).mockClear();
   clock = Date.parse('2026-11-14T12:00:00.000Z');
   notes = createReconnectNotes(store, { now: () => clock });
 });
@@ -147,6 +165,27 @@ describe('the reconnect note', () => {
     expect(written()).toHaveLength(1);
   });
 
+  it('waits while a main container still starting read its configuration before the app left it', async () => {
+    const { refused } = await refusedApp('Notes', 'https://notes.example.test/mcp');
+    await setMainServers({});
+    runtime.spawning.set(session.id, clock - 1_000);
+
+    notes.owe(refused);
+    expect(await notes.deliver()).toBe(true);
+
+    // Registered on that older configuration: it still holds the app.
+    runtime.spawning.delete(session.id);
+    runtime.running.set(session.id, clock - 1_000);
+    expect(await notes.deliver()).toBe(true);
+    expect(written()).toEqual([]);
+
+    // Restarted, and a container now starting read after the app left.
+    runtime.running.delete(session.id);
+    runtime.spawning.set(session.id, clock + 1_000);
+    expect(await notes.deliver()).toBe(false);
+    expect(written()).toHaveLength(1);
+  });
+
   it("waits while main's servers still list the app, counting containers from when it left them", async () => {
     const { app, refused } = await refusedApp('Notes', 'https://notes.example.test/mcp');
     await setMainServers({ [app.serverKey]: { type: 'http', url: app.url } });
@@ -183,6 +222,67 @@ describe('the reconnect note', () => {
 
     expect(await notes.deliver()).toBe(false);
     expect(written()).toEqual([]);
+  });
+});
+
+describe('a note that cannot be delivered', () => {
+  it('stays owed without holding back the others, and each distinct failure is logged once', async () => {
+    const stuck = await refusedApp('Notes', 'https://notes.example.test/mcp');
+    const fine = await refusedApp('Recipes', 'https://recipes.example.test/mcp');
+    let writerBroken = true;
+    const failing = createReconnectNotes(store, {
+      now: () => clock,
+      write: async (note) => {
+        if (writerBroken && note.id === reconnectNoteId(stuck.refused)) throw new TypeError('note writer broke');
+        return writeNoteForMain(note);
+      },
+    });
+
+    failing.owe(stuck.refused);
+    failing.owe(fine.refused);
+    expect(await failing.deliver()).toBe(true);
+    expect(await failing.deliver()).toBe(true);
+    expect(written().map(({ id }) => id)).toEqual([reconnectNoteId(fine.refused)]);
+    expect(log.error).toHaveBeenCalledOnce();
+    expect(log.error).toHaveBeenCalledWith(expect.any(String), {
+      appId: stuck.app.id,
+      name: 'TypeError',
+      code: undefined,
+    });
+
+    // A different failure is logged once more; once both clear, the note goes through.
+    const unavailable = vi.spyOn(store, 'get').mockRejectedValue(new ConnectionsStoreError('store_unavailable'));
+    expect(await failing.deliver()).toBe(true);
+    expect(await failing.deliver()).toBe(true);
+    expect(log.warn).toHaveBeenCalledOnce();
+    expect(log.warn).toHaveBeenCalledWith(expect.any(String), { appId: stuck.app.id, code: 'store_unavailable' });
+    unavailable.mockRestore();
+    writerBroken = false;
+    expect(await failing.deliver()).toBe(false);
+    expect(written().map(({ id }) => id)).toEqual([reconnectNoteId(fine.refused), reconnectNoteId(stuck.refused)]);
+  });
+
+  it('logs unreadable main servers by error name only, never their text', async () => {
+    const { refused } = await refusedApp('Notes', 'https://notes.example.test/mcp');
+    const operatorKey = 'sentinel-operator-key-R5k1';
+    await getDb().run(
+      'UPDATE container_configs SET mcp_servers = ? WHERE agent_group_id = ?',
+      `{"homeboard": {"url": "https://homeboard.example.test/mcp?key=${operatorKey}"`,
+      MAIN,
+    );
+
+    notes.owe(refused);
+    expect(await notes.deliver()).toBe(true);
+    expect(await notes.deliver()).toBe(true);
+
+    expect(written()).toEqual([]);
+    expect(log.error).toHaveBeenCalledOnce();
+    expect(log.error).toHaveBeenCalledWith(expect.any(String), {
+      appId: refused.appId,
+      name: 'SyntaxError',
+      code: undefined,
+    });
+    expect(JSON.stringify(vi.mocked(log.error).mock.calls)).not.toContain(operatorKey);
   });
 });
 

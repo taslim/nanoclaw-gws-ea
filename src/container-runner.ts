@@ -222,6 +222,13 @@ async function releaseClaimQuietly(sessionId: string, incarnation: number): Prom
 const wakePromises = new Map<string, Promise<boolean>>();
 
 /**
+ * Spawns in flight that have begun reading their configuration and are not
+ * registered yet, with when each began. Between the read and registration a
+ * session is not running, yet it will run on what it read.
+ */
+const spawningConfigReads = new Map<string, number>();
+
+/**
  * Sweep-run deferred-adoption retries in flight, keyed by session id (see
  * `retryPendingAdoptions`). Resolves false when the retry failed.
  */
@@ -242,6 +249,11 @@ export function getContainerStartedAtMs(sessionId: string): number | undefined {
 /** Undefined when no runtime is registered or this host did not spawn it. */
 export function getContainerConfigReadAtMs(sessionId: string): number | undefined {
   return activeContainers.get(sessionId)?.configReadAtMs;
+}
+
+/** Undefined unless the session's container is starting here and has not registered yet. */
+export function getSpawningConfigReadAtMs(sessionId: string): number | undefined {
+  return spawningConfigReads.get(sessionId);
 }
 
 /** Stop host-local observation without revoking resources that may survive restart. */
@@ -440,6 +452,7 @@ export function wakeContainer(session: Session): Promise<boolean> {
       return false;
     })
     .finally(() => {
+      spawningConfigReads.delete(session.id);
       wakePromises.delete(session.id);
     });
   wakePromises.set(session.id, promise);
@@ -477,6 +490,7 @@ async function spawnContainer(session: Session): Promise<void> {
   // the config object, threaded through provider resolution, buildMounts,
   // and buildContainerArgs so we don't re-read.
   const configReadAtMs = Date.now();
+  spawningConfigReads.set(session.id, configReadAtMs);
   const containerConfig = await materializeContainerJson(agentGroup.id);
 
   const providerName = resolveProviderName(session.agent_provider, containerConfig.provider);
@@ -565,6 +579,7 @@ async function spawnContainer(session: Session): Promise<void> {
   const runtime = registerRuntime(session.id, handle, gatewaySession, containerName, false);
   runtime.claimIncarnation = claimIncarnation;
   runtime.configReadAtMs = configReadAtMs;
+  spawningConfigReads.delete(session.id);
 
   await armSessionLifecycle({
     handle,

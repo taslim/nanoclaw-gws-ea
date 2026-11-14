@@ -3,7 +3,12 @@
  * turn: its container is stopped and comes back on the new configuration. A busy session never holds an idle one
  * on the old apps.
  */
-import { getContainerConfigReadAtMs, isContainerRunning, killContainer } from '../../container-runner.js';
+import {
+  getContainerConfigReadAtMs,
+  getSpawningConfigReadAtMs,
+  isContainerRunning,
+  killContainer,
+} from '../../container-runner.js';
 import { setStopIntent, shadowWrite } from '../../db/coordination.js';
 import { getSession, getSessionsByAgentGroup } from '../../db/sessions.js';
 import { log } from '../../log.js';
@@ -44,6 +49,12 @@ function readBefore(sessionId: string, appliedAtMs: number): boolean {
   return readAt === undefined || readAt <= appliedAtMs;
 }
 
+/** A container still starting on a configuration read before the change runs on it once registered. */
+function startingBefore(sessionId: string, appliedAtMs: number): boolean {
+  const readAt = getSpawningConfigReadAtMs(sessionId);
+  return readAt !== undefined && readAt <= appliedAtMs;
+}
+
 /** Core's restart path: due messages bring the new container straight back, otherwise the next message does. */
 async function restart(session: Session, due: boolean): Promise<boolean> {
   const intent = (value: 'respawn_after_stop' | null): Promise<void> =>
@@ -73,19 +84,20 @@ async function restart(session: Session, due: boolean): Promise<boolean> {
 
 /**
  * Serves the pending restart once: stops each of main's idle containers that read its configuration before the
- * latest apply, and clears the request once none is left. Returns whether a request is still pending.
+ * latest apply, and clears the request once none is left running or starting. Returns whether a request is still
+ * pending.
  */
 export async function servePendingRestart(store: ConnectionsStore): Promise<boolean> {
   const appliedAt = await store.pendingRestart();
   if (appliedAt === undefined) return false;
   const appliedAtMs = Date.parse(appliedAt);
   const mainAgentGroupId = await readMainAgentGroupId();
-  const behind = mainAgentGroupId
-    ? (await getSessionsByAgentGroup(mainAgentGroupId)).filter(
-        (session) => isContainerRunning(session.id) && readBefore(session.id, appliedAtMs),
-      )
-    : [];
-  if (behind.length === 0) return !(await store.clearRestart(appliedAt));
+  const sessions = mainAgentGroupId ? await getSessionsByAgentGroup(mainAgentGroupId) : [];
+  const behind = sessions.filter((session) => isContainerRunning(session.id) && readBefore(session.id, appliedAtMs));
+  if (behind.length === 0) {
+    if (sessions.some((session) => startingBefore(session.id, appliedAtMs))) return true;
+    return !(await store.clearRestart(appliedAt));
+  }
 
   const idle: Session[] = [];
   for (const session of behind) {

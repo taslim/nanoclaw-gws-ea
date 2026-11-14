@@ -6,7 +6,7 @@
  * deliver it. Its id names the app and the refused generation: repeated refusals of one grant are one note, and a
  * grant that breaks again after a reconnect is a new one.
  */
-import { getContainerConfigReadAtMs, isContainerRunning } from '../../container-runner.js';
+import { getContainerConfigReadAtMs, getSpawningConfigReadAtMs, isContainerRunning } from '../../container-runner.js';
 import { getContainerConfig } from '../../db/container-configs.js';
 import { getSessionsByAgentGroup } from '../../db/sessions.js';
 import { log } from '../../log.js';
@@ -25,6 +25,8 @@ export function reconnectNoteId(app: RefusedApp): string {
 interface Owed extends RefusedApp {
   /** When main's servers were first read without the app: a container that read its own later never held it. */
   readonly droppedAt?: number;
+  /** The failure last logged for this note: one that keeps failing the same way is logged once. */
+  readonly failure?: string;
 }
 
 export interface ReconnectNotesDependencies {
@@ -46,16 +48,24 @@ async function mainServerKeys(agentGroupId: string): Promise<ReadonlySet<string>
 }
 
 /**
- * A container that read its configuration before the app left it may still hold the app; one this host adopted
- * may hold anything a previous host gave it.
+ * A container that read its configuration before the app left it may still hold the app, whether it runs or is
+ * still starting; one this host adopted may hold anything a previous host gave it.
  */
 async function anyHolding(agentGroupId: string, droppedAt: number): Promise<boolean> {
   for (const session of await getSessionsByAgentGroup(agentGroupId)) {
+    const startingReadAt = getSpawningConfigReadAtMs(session.id);
+    if (startingReadAt !== undefined && startingReadAt <= droppedAt) return true;
     if (!isContainerRunning(session.id)) continue;
     const readAt = getContainerConfigReadAtMs(session.id);
     if (readAt === undefined || readAt <= droppedAt) return true;
   }
   return false;
+}
+
+function errorCode(error: unknown): string | undefined {
+  return typeof error === 'object' && error !== null && 'code' in error && typeof error.code === 'string'
+    ? error.code
+    : undefined;
 }
 
 function noteText(app: ConnectionApp): string {
@@ -89,7 +99,7 @@ export function createReconnectNotes(
       if ((await mainServerKeys(mainId)).has(app.serverKey))
         return { appId: entry.appId, generation: entry.generation };
       const droppedAt = entry.droppedAt ?? now();
-      if (await anyHolding(mainId, droppedAt)) return { ...entry, droppedAt };
+      if (await anyHolding(mainId, droppedAt)) return { appId: entry.appId, generation: entry.generation, droppedAt };
     }
     await write({
       id: reconnectNoteId(entry),
@@ -98,6 +108,22 @@ export function createReconnectNotes(
       wake: false,
     });
     return undefined;
+  }
+
+  /**
+   * Keeps a note that failed owed, so it neither blocks the others nor is lost. Only the error's name and code are
+   * logged: a parse error's message can quote main's stored servers, credentials included.
+   */
+  function failed(entry: Owed, error: unknown): Owed {
+    const name = error instanceof Error ? error.name : typeof error;
+    const code = error instanceof ConnectionsStoreError ? error.reason : errorCode(error);
+    const failure = `${name}:${code ?? ''}`;
+    if (entry.failure !== failure) {
+      if (error instanceof ConnectionsStoreError)
+        log.warn('Reconnect note waits on the connections store', { appId: entry.appId, code });
+      else log.error('Reconnect note not delivered; it stays owed', { appId: entry.appId, name, code });
+    }
+    return { ...entry, failure };
   }
 
   return {
@@ -111,10 +137,9 @@ export function createReconnectNotes(
         let next: Owed | undefined;
         try {
           next = await settle(entry);
+          // eslint-disable-next-line no-catch-all/no-catch-all -- one note's failure, logged by name, must not block the others
         } catch (error) {
-          if (!(error instanceof ConnectionsStoreError)) throw error;
-          log.warn('Reconnect note waits on the connections store', { appId: entry.appId, code: error.reason });
-          next = entry;
+          next = failed(entry, error);
         }
         // A newer refusal recorded meanwhile replaces this one.
         if (owed.get(entry.appId)?.generation !== entry.generation) continue;
