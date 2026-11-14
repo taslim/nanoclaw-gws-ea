@@ -4,7 +4,11 @@ import { OneCLI, type ContainerConfig, type ApprovalRequest } from '@onecli-sh/s
 import { DATA_DIR } from '../config.js';
 import { combinedCaBundle, stageOnecliFile } from './onecli-files.js';
 import { storedAccountId, stubNeedsAccountId, withAccountId } from './onecli-chatgpt-stub.js';
-import { createProviderCredentialConnection } from './onecli-credentials.js';
+import {
+  createProviderCredentialConnection,
+  listOneCliCredentialsForHost,
+  removeOneCliCredentialsById,
+} from './onecli-credentials.js';
 import {
   adoptSavedProviderCredentials,
   hasSavedProviderNames,
@@ -510,6 +514,8 @@ function buildQuestion(request: ApprovalRequest, agentName: string): string {
   return lines.join('\n').slice(0, 2_600);
 }
 
+const management = { url: onecliUrl, apiKey: onecliApiKey, projectId: onecliProjectId };
+
 registerGatewayProvider({
   kind: 'onecli',
   connections: {
@@ -531,8 +537,9 @@ registerGatewayProvider({
     },
   },
   credentials: {
-    connection: (target) =>
-      createProviderCredentialConnection(target, { url: onecliUrl, apiKey: onecliApiKey, projectId: onecliProjectId }),
+    connection: (target) => createProviderCredentialConnection(target, management),
+    listForHost: (host) => listOneCliCredentialsForHost(host, management),
+    removeById: (ids) => removeOneCliCredentialsById(ids, management),
   },
   agentSkills: ['onecli-gateway'],
   sessions: { ensure: ensureSession },

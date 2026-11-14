@@ -259,6 +259,43 @@ describe('recorded divergence: the installed OneCLI adapter', () => {
     }
   }
 
+  it("lists one host's credentials and removes them by id, through the registered provider", async () => {
+    const provider = await installedProvider();
+    const secret = (id: string, name: string, hostPattern: string) => ({ id, name, hostPattern, scope: 'project' });
+    const rows = [
+      secret('app', 'gws-ea-app-a1', 'homeboard.nownow.ai'),
+      secret('operator', 'HomeBoard', 'homeboard.nownow.ai'),
+      secret('other', 'Search', 'api.search.example.test'),
+    ];
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
+      const url = new URL(input instanceof Request ? input.url : String(input));
+      if (url.origin !== onecliUrl || !url.pathname.startsWith('/v1/secrets')) throw new Error(`Unexpected ${url}`);
+      if (init?.method === 'DELETE') {
+        rows.splice(
+          rows.findIndex((row) => row.id === decodeURIComponent(url.pathname.split('/')[3]!)),
+          1,
+        );
+        return new Response(null, { status: 204 });
+      }
+      return Response.json(rows);
+    });
+    const credentials = provider.credentials;
+    if (!credentials?.listForHost || !credentials.removeById) {
+      throw new Error('The installed OneCLI adapter cannot list or remove by host');
+    }
+
+    const listed = await credentials.listForHost('homeboard.nownow.ai');
+    expect(listed).toEqual([
+      { id: 'app', name: 'gws-ea-app-a1' },
+      { id: 'operator', name: 'HomeBoard' },
+    ]);
+    expect(await credentials.removeById(listed.map(({ id }) => id))).toEqual([
+      { id: 'app', outcome: 'removed' },
+      { id: 'operator', outcome: 'removed' },
+    ]);
+    expect(rows.map(({ id }) => id)).toEqual(['other']);
+  });
+
   it('leaves an approval pending when no decision is available, without asking again at once', async () => {
     const provider = await installedProvider();
     const servers = onecliServers([approval('undecided', 'owned-group')]);

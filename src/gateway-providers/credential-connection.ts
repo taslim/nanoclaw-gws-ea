@@ -77,3 +77,19 @@ export interface GatewayRuntimeCredentialConnection extends GatewayCredentialCon
   /** Delete the entry `find()` observed; nothing when it observed none. */
   remove(): Promise<void>;
 }
+
+/** A stored credential scoped to exactly one host, by the gateway's own id. */
+export interface GatewayHostCredential {
+  id: string;
+  name: string;
+}
+
+/**
+ * What became of one id in a removal. `gone` means it no longer existed when
+ * the gateway re-read its entries, so nothing was deleted and nothing needs
+ * retrying.
+ */
+export interface GatewayCredentialRemoval {
+  id: string;
+  outcome: 'removed' | 'gone' | 'failed';
+}

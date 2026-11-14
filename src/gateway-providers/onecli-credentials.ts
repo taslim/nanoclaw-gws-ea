@@ -11,7 +11,9 @@
  * runtime import and each caller supplies its own management settings.
  */
 import type {
+  GatewayCredentialRemoval,
   GatewayCredentialTarget,
+  GatewayHostCredential,
   GatewayOAuthCredential,
   GatewayRuntimeCredentialConnection,
 } from './credential-connection.js';
@@ -61,11 +63,15 @@ function sameInjection(value: unknown, expected: KeyInjection): boolean {
   );
 }
 
-function namedSecret(payload: unknown, name: string): Record<string, unknown> | undefined {
+function secretRows(payload: unknown): Record<string, unknown>[] {
   if (!Array.isArray(payload) || !payload.every(isRecord)) {
     throw new Error('OneCLI returned invalid secret metadata.');
   }
-  const matches = payload.filter((row) => row.name === name);
+  return payload;
+}
+
+function namedSecret(payload: unknown, name: string): Record<string, unknown> | undefined {
+  const matches = secretRows(payload).filter((row) => row.name === name);
   if (matches.length > 1) {
     throw new Error(`Multiple ${name} credentials exist. Resolve duplicates in OneCLI before continuing.`);
   }
@@ -115,19 +121,25 @@ export function findOneCliCredential(payload: unknown, descriptor: OneCliCredent
   return secret.id as string;
 }
 
-/** Use this installation's management connection, independently of the global OneCLI CLI configuration. */
-export function createOneCliCredentialConnection(
-  descriptor: OneCliCredential,
+type SecretsRequest = (suffix: string, method: string, body?: unknown) => Promise<unknown>;
+
+/**
+ * This installation's `/v1/secrets` API. `send` fails with no detail; `request`
+ * fails with one fixed message naming `subject`, so neither can echo what
+ * OneCLI answered.
+ */
+function oneCliSecrets(
   management: OneCliManagement,
-): OneCliCredentialConnection {
+  subject: string,
+): { send: SecretsRequest; request: SecretsRequest } {
   const { url, apiKey, projectId } = management;
   const fetchImpl = management.fetch ?? globalThis.fetch;
-  if (!url) throw new Error(`Configure ONECLI_URL before connecting the ${descriptor.name} credential.`);
+  if (!url) throw new Error(`Configure ONECLI_URL before managing ${subject}.`);
   const base = new URL(url);
   if (!['http:', 'https:'].includes(base.protocol) || base.username || base.password || base.search || base.hash) {
     throw new Error('ONECLI_URL must be an HTTP(S) gateway URL without embedded credentials, query, or fragment.');
   }
-  const send = async (suffix: string, method: string, body?: unknown): Promise<unknown> => {
+  const send: SecretsRequest = async (suffix, method, body) => {
     const response = await fetchImpl(`${base.href.replace(/\/+$/, '')}/v1/secrets${suffix}`, {
       method,
       headers: {
@@ -143,7 +155,7 @@ export function createOneCliCredentialConnection(
     // A deletion answers with no body to read.
     return method === 'DELETE' ? undefined : await response.json();
   };
-  const request = async (suffix: string, method: string, body?: unknown): Promise<unknown> => {
+  const request: SecretsRequest = async (suffix, method, body) => {
     // API responses can include previews of secrets, and a parse error quotes
     // them. Never echo a response or a transport error, including when a
     // successful write's response is lost: every failure is this one message.
@@ -153,11 +165,20 @@ export function createOneCliCredentialConnection(
     );
     if (!result) {
       throw new Error(
-        `Could not confirm the ${descriptor.name} credential in OneCLI. Check gateway connectivity and management permissions, then retry.`,
+        `Could not confirm ${subject} in OneCLI. Check gateway connectivity and management permissions, then retry.`,
       );
     }
     return result.value;
   };
+  return { send, request };
+}
+
+/** Use this installation's management connection, independently of the global OneCLI CLI configuration. */
+export function createOneCliCredentialConnection(
+  descriptor: OneCliCredential,
+  management: OneCliManagement,
+): OneCliCredentialConnection {
+  const { request } = oneCliSecrets(management, `the ${descriptor.name} credential`);
   const changed = () =>
     new Error(`The ${descriptor.name} vault entry changed since it was looked up. Check OneCLI and retry.`);
   // A host move is explicit and keeps the granted ID. Revalidate the old
@@ -237,6 +258,49 @@ export function createOneCliCredentialConnection(
       await request(`/${encodeURIComponent(existingId)}`, 'DELETE');
     },
   };
+}
+
+/**
+ * Every entry whose host pattern is exactly `host`, compared as DNS compares
+ * names. A wildcard pattern that would also cover `host` is not listed.
+ */
+export async function listOneCliCredentialsForHost(
+  host: string,
+  management: OneCliManagement,
+): Promise<GatewayHostCredential[]> {
+  if (!exactHost(host)) throw new Error('List credentials for one exact host name.');
+  const { request } = oneCliSecrets(management, `the credentials for ${host}`);
+  return secretRows(await request('', 'GET'))
+    .filter((row) => typeof row.hostPattern === 'string' && row.hostPattern.toLowerCase() === host)
+    .map((row) => {
+      if (typeof row.id !== 'string' || !row.id || typeof row.name !== 'string') {
+        throw new Error('OneCLI returned invalid secret metadata.');
+      }
+      return { id: row.id, name: row.name };
+    });
+}
+
+/**
+ * Re-read, then delete each id still present. One failed delete does not stop
+ * the rest, so a caller can retry exactly the ids reported as failed.
+ */
+export async function removeOneCliCredentialsById(
+  ids: readonly string[],
+  management: OneCliManagement,
+): Promise<GatewayCredentialRemoval[]> {
+  const { send, request } = oneCliSecrets(management, 'the credentials to remove');
+  const present = new Set(secretRows(await request('', 'GET')).map((row) => row.id));
+  const removals: GatewayCredentialRemoval[] = [];
+  for (const id of new Set(ids)) {
+    const outcome = !present.has(id)
+      ? ('gone' as const)
+      : await send(`/${encodeURIComponent(id)}`, 'DELETE').then(
+          () => 'removed' as const,
+          () => 'failed' as const,
+        );
+    removals.push({ id, outcome });
+  }
+  return removals;
 }
 
 /**

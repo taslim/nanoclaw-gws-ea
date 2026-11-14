@@ -23,6 +23,11 @@ import path from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 import {
+  createProviderCredentialConnection,
+  listOneCliCredentialsForHost,
+  removeOneCliCredentialsById,
+} from '../gateway-providers/onecli-credentials.js';
+import {
   findCredentialSecret,
   importProviderCredential,
   persistOnecliApiKeyFiles,
@@ -205,6 +210,60 @@ describe.runIf(CONTRACT)(`the OneCLI admin client against OneCLI ${ONECLI_GATEWA
       expect((await admin.listAgents()).find((listed) => listed.id === agent!.id)?.secretMode).toBe('selective');
       await admin.setSecretMode(agent!.id, 'all');
       expect((await admin.listAgents()).find((listed) => listed.id === agent!.id)?.secretMode).toBe('all');
+    },
+    CALL_TIMEOUT_MS,
+  );
+
+  it(
+    "limits a runtime credential to its path, lists one host's secrets exactly, and removes them by ID",
+    async () => {
+      const management = { url: layout!.appUrl, apiKey };
+      const host = 'mcp.contract.example.test';
+      const app = createProviderCredentialConnection(
+        {
+          kind: 'api-key',
+          name: 'gws-ea-app-contract',
+          host,
+          path: '/mcp',
+          proxyValue: 'gateway-managed',
+          injection: { headerName: 'Authorization', valueFormat: 'Bearer {value}' },
+        },
+        management,
+      );
+      expect(await app.find()).toBeNull();
+      await app.save('contract-app-token');
+      const operator = await admin.createSecret({
+        name: 'Contract operator',
+        type: 'generic',
+        value: 'contract-operator-value',
+        hostPattern: host,
+        headerName: 'x-api-key',
+      });
+      const elsewhere = await admin.createSecret({
+        name: 'Contract elsewhere',
+        type: 'generic',
+        value: 'contract-elsewhere-value',
+        hostPattern: `other.${host}`,
+        headerName: 'x-api-key',
+      });
+
+      const stored = (await admin.listSecrets()).find((secret) => secret.name === 'gws-ea-app-contract');
+      expect(stored).toMatchObject({ hostPattern: host, pathPattern: '/mcp' });
+      expect(await app.find()).toEqual({ reusable: true });
+      const listed = await listOneCliCredentialsForHost(host, management);
+      expect(listed).toHaveLength(2);
+      expect(listed).toEqual(
+        expect.arrayContaining([
+          { id: stored!.id, name: 'gws-ea-app-contract' },
+          { id: operator, name: 'Contract operator' },
+        ]),
+      );
+
+      expect(
+        await removeOneCliCredentialsById([...listed.map(({ id }) => id), 'contract-missing'], management),
+      ).toEqual([...listed.map(({ id }) => ({ id, outcome: 'removed' })), { id: 'contract-missing', outcome: 'gone' }]);
+      expect(await listOneCliCredentialsForHost(host, management)).toEqual([]);
+      expect((await admin.listSecrets()).some((secret) => secret.id === elsewhere)).toBe(true);
     },
     CALL_TIMEOUT_MS,
   );
