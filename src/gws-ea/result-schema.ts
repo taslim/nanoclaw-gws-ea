@@ -438,6 +438,7 @@ const removal = object(
         'web',
         'chat-subscription',
         'login-key',
+        'connections-key',
         'gcp-project',
         'onecli',
         'instance-files',
@@ -447,6 +448,7 @@ const removal = object(
     keyPolicyUnrestored: text,
     memberPolicyUnrestored: text,
     login_key: choices('removed', 'left_behind'),
+    connections_key: choices('removed', 'left_behind'),
   },
   ['removed', 'abandoned'],
 );

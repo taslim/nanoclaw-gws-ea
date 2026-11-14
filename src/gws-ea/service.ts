@@ -38,6 +38,7 @@ import { instanceLayout, readCurrent, releaseName } from './release-layout.js';
 import { GCHAT_PROJECT_ID_ENV, GCHAT_SUBSCRIBER_KEY_FILE_ENV } from '../modules/gws-ea-chat/config.js';
 import { GOOGLE_GRANT_FILE_ENV, GOOGLE_GRANT_FILE_NAME } from '../modules/gws-ea-google/grant.js';
 import { BROWSER_ROOT_ENV } from '../modules/gws-ea-browser/availability.js';
+import { CONNECTIONS_ROOT_ENV } from '../modules/gws-ea-connections/config.js';
 import { WEB_POLICY_FILE_ENV } from '../modules/gws-ea-web/policy.js';
 import { VOICE_POLICY_FILE_ENV } from '../modules/gws-ea-voice/config.js';
 import { GwsEaError, type AllocatedPorts, type InstanceReservation } from './types.js';
@@ -307,6 +308,7 @@ export const INSTANCE_HOST_ENV_KEYS = [
   'ONECLI_GATEWAY_CONTAINER',
   'ONECLI_URL',
   BROWSER_ROOT_ENV,
+  CONNECTIONS_ROOT_ENV,
   WEB_POLICY_FILE_ENV,
 ] as const;
 
@@ -322,6 +324,7 @@ export function instanceHostConfiguration(config: InstanceRuntimeConfig): Readon
     ONECLI_GATEWAY_CONTAINER: config.onecli_gateway_container,
     ONECLI_URL: config.onecli_app_url,
     [BROWSER_ROOT_ENV]: path.join(config.instance_root, 'browser'),
+    [CONNECTIONS_ROOT_ENV]: path.join(config.instance_root, 'connections'),
     [WEB_POLICY_FILE_ENV]: path.join(config.instance_root, 'web', 'policy.json'),
   };
 }

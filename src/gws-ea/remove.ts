@@ -12,8 +12,8 @@
  * helpers stop the host; removal then cleans up what they leave. The
  * assistant's Google Chat subscription goes after the host, which would only
  * create it again, and before the project, which takes its topic, its Pub/Sub
- * subscription, and its subscriber account with it. The login key and web
- * resources go after the host, once nothing can use them. Web cleanup IDs
+ * subscription, and its subscriber account with it. The login and connections
+ * keys and web resources go after the host, once nothing can use them. Web cleanup IDs
  * are copied into the receipt before anything changes; abandoned web keeps
  * that receipt after local removal.
  * An unfinished update or rollback never stops it: its releases, what is
@@ -24,6 +24,7 @@
  * from its physical state.
  */
 import { LoginKey } from '../modules/gws-ea-browser/login-key.js';
+import { ConnectionsKey } from '../modules/gws-ea-connections/key.js';
 import { access, rm } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -101,6 +102,7 @@ export const REMOVAL_RESOURCES = [
   'web',
   'chat-subscription',
   'login-key',
+  'connections-key',
   'gcp-project',
   'onecli',
   'instance-files',
@@ -134,6 +136,7 @@ const RESOURCE_STEPS: Readonly<Record<RemovalResource, StepIdentity>> = {
   web: { id: 'remove_web', label: 'Removing the assistant’s owned web access…' },
   'chat-subscription': { id: 'remove_chat_subscription', label: 'Deleting the Google Chat subscription…' },
   'login-key': { id: 'remove_login_key', label: 'Deleting the saved-login Keychain key…' },
+  'connections-key': { id: 'remove_connections_key', label: 'Deleting the connected-apps Keychain key…' },
   'gcp-project': { id: 'remove_gcp_project', label: 'Deleting the Google Cloud project…' },
   onecli: { id: 'remove_onecli', label: 'Removing OneCLI…' },
   'instance-files': { id: 'remove_instance_files', label: 'Removing local files…' },
@@ -157,6 +160,7 @@ interface RemovalReceipt {
   /** A member-domain policy `provision_gcp` relaxed that Google refused to restore. */
   readonly member_policy_unrestored?: Evidence;
   readonly login_key?: 'removed' | 'left_behind';
+  readonly connections_key?: 'removed' | 'left_behind';
   readonly web?: WebCleanup;
 }
 
@@ -207,6 +211,7 @@ export interface RemovalOutcome {
   /** Why a relaxed member-domain policy could not be restored. */
   readonly memberPolicyUnrestored?: string;
   readonly login_key?: 'removed' | 'left_behind';
+  readonly connections_key?: 'removed' | 'left_behind';
 }
 
 /**
@@ -273,6 +278,8 @@ async function readReceipt(paths: ControlPlanePaths, instanceId: string): Promis
     const memberPolicyUnrestored = evidenceOf(raw.member_policy_unrestored);
     if (raw.login_key !== undefined && raw.login_key !== 'removed' && raw.login_key !== 'left_behind')
       throw new GwsEaError(UNREADABLE_CLEANUP, 'The removal receipt has an invalid saved-login key outcome.');
+    if (raw.connections_key !== undefined && raw.connections_key !== 'removed' && raw.connections_key !== 'left_behind')
+      throw new GwsEaError(UNREADABLE_CLEANUP, 'The removal receipt has an invalid connected-apps key outcome.');
     const web = raw.web === undefined ? undefined : parseWebCleanup(raw.web);
     if (raw.web !== undefined && !web)
       throw new GwsEaError(
@@ -289,6 +296,9 @@ async function readReceipt(paths: ControlPlanePaths, instanceId: string): Promis
       ...(keyPolicyUnrestored ? { key_policy_unrestored: keyPolicyUnrestored } : {}),
       ...(memberPolicyUnrestored ? { member_policy_unrestored: memberPolicyUnrestored } : {}),
       ...(raw.login_key === 'removed' || raw.login_key === 'left_behind' ? { login_key: raw.login_key } : {}),
+      ...(raw.connections_key === 'removed' || raw.connections_key === 'left_behind'
+        ? { connections_key: raw.connections_key }
+        : {}),
       ...(web ? { web } : {}),
     };
   } catch (error) {
@@ -789,6 +799,7 @@ async function removeLocked(
     'chat-subscription': started('start_nanoclaw'),
     'gcp-project': started('provision_gcp'),
     'login-key': platform === 'macos',
+    'connections-key': platform === 'macos',
     onecli: started('start_onecli'),
     'instance-files': true,
   };
@@ -959,6 +970,14 @@ async function removeLocked(
       }));
       return undefined;
     },
+    'connections-key': async () => {
+      const result = await new ConnectionsKey({ instanceId, runCommand: dependencies.runCommand }).remove();
+      await record((current) => ({
+        ...current,
+        connections_key: result.status === 'removed' ? 'removed' : 'left_behind',
+      }));
+      return undefined;
+    },
     'gcp-project': async () => {
       const coordinates: GcpProjectCoordinates = {
         instanceId,
@@ -1006,7 +1025,7 @@ async function removeLocked(
       return undefined;
     },
     'instance-files': async () => {
-      // Includes browser/profile and host-only browser/staging. Teardown order puts this after the native NanoClaw
+      // Includes browser/profile, host-only browser/staging and the connections store. Teardown order puts this after the native NanoClaw
       // stop and drain whenever removal owns the host.
       await rm(paths.instanceRoot(instanceId), { recursive: true, force: true });
       return undefined;
@@ -1029,7 +1048,9 @@ async function removeLocked(
   return {
     removed: REMOVAL_RESOURCES.filter(
       (resource) =>
-        receipt.completed[resource] !== undefined && (resource !== 'login-key' || receipt.login_key === 'removed'),
+        receipt.completed[resource] !== undefined &&
+        (resource !== 'login-key' || receipt.login_key === 'removed') &&
+        (resource !== 'connections-key' || receipt.connections_key === 'removed'),
     ),
     abandoned: ABANDONABLE_RESOURCES.flatMap((resource) => {
       const entry = receipt.abandoned[resource];
@@ -1038,5 +1059,6 @@ async function removeLocked(
     ...(receipt.key_policy_unrestored ? { keyPolicyUnrestored: receipt.key_policy_unrestored.evidence } : {}),
     ...(receipt.member_policy_unrestored ? { memberPolicyUnrestored: receipt.member_policy_unrestored.evidence } : {}),
     ...(receipt.login_key ? { login_key: receipt.login_key } : {}),
+    ...(receipt.connections_key ? { connections_key: receipt.connections_key } : {}),
   };
 }
