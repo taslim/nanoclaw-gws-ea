@@ -7,6 +7,7 @@ vi.mock('./runtime.js', () => ({ startPortalRuntime: runtime.start }));
 vi.mock('../gws-ea-browser/index.js', () => ({}));
 vi.mock('../gws-ea-artifacts/index.js', () => ({}));
 vi.mock('../gws-ea-web/index.js', () => ({}));
+vi.mock('../gws-ea-connections/index.js', () => ({}));
 vi.mock('../../log.js', () => ({
   log: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn(), fatal: vi.fn() },
 }));

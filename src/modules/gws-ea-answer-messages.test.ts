@@ -50,6 +50,19 @@ const REVIEWED: Readonly<Record<string, Review>> = {
     reason: 'the source event id ties the gap to host evidence; message states the complete gap',
   },
 
+  'gws-ea-connections/actions.ts refusal: code': {
+    kind: 'host-only',
+    reason:
+      'the response frame keeps its transport error code; the error message tells main what was refused and what to do',
+  },
+  'gws-ea-connections/page.ts operatorMessage: status': {
+    kind: 'host-only',
+    reason: 'the HTTP status serves the page response; the principal reads only the constant message',
+  },
+  'gws-ea-connections/page.ts storeFailure: status': {
+    kind: 'host-only',
+    reason: 'the HTTP status serves the page response; the principal reads only the constant message',
+  },
   'gws-ea-meetings/booking.ts answerRequest: code': {
     kind: 'host-only',
     reason: 'the response frame keeps its transport error code; the rendered error message explains the refusal',

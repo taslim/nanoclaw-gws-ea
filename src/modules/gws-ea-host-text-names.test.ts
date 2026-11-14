@@ -148,6 +148,7 @@ const POLICY: Policy = {
       needs_reconnecting: 'an app status value in the host-only SQL column list',
       not_connected: 'an app status value in the host-only SQL column list',
       name_key: 'a column in the host-only SQL uniqueness check and assignment',
+      client_entered: 'a column in the host-only SQL client assignments',
     },
     'gws-ea-workspace/docs-api.ts': {
       nc_job_doc: 'the Drive app-property key used to find a document after an uncertain create',

@@ -25,6 +25,8 @@ const TOLD_BY_THEIR_MODULE = [
   'artifact_share_private_values',
 ];
 const WORDED = [
+  'add_app',
+  'delete_app',
   'browser_credential_release',
   'browser_reservation_guarantee',
   'principal_address_add',
