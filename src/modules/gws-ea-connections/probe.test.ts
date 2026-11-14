@@ -1,0 +1,162 @@
+import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
+
+import { checkPastedToken, probeApp } from './probe.js';
+import { FakeMcpApp, startFakeEndpoints, type FakeEndpoints, type FakeHandler } from './testing/oauth-server.js';
+
+const HOMEBOARD = 'https://homeboard.nownow.ai/mcp';
+const LEDGER = 'https://mcp.ledger.example.test/mcp';
+
+let endpoints: FakeEndpoints;
+
+beforeAll(async () => {
+  endpoints = await startFakeEndpoints(['homeboard.nownow.ai', 'mcp.ledger.example.test', 'auth.example.test']);
+});
+afterAll(async () => {
+  await endpoints.close();
+});
+beforeEach(() => {
+  endpoints.reset();
+});
+
+function serve(...handlers: FakeHandler[]): void {
+  for (const handler of handlers) endpoints.use(handler);
+}
+
+function homeBoard(): FakeMcpApp {
+  return new FakeMcpApp({
+    appUrl: HOMEBOARD,
+    issuer: 'https://homeboard.nownow.ai',
+    tokenAuthMethods: ['client_secret_basic'],
+    scopes: ['homeboard.read', 'homeboard.write'],
+  });
+}
+
+const initialized =
+  (name: string): FakeHandler =>
+  (request) =>
+    request.method === 'POST'
+      ? {
+          status: 200,
+          body: {
+            jsonrpc: '2.0',
+            id: 1,
+            result: { protocolVersion: '2025-11-25', serverInfo: { name, version: '2' } },
+          },
+        }
+      : undefined;
+
+describe('probeApp', () => {
+  it('classifies a server that answers without sign-in, keeping the name it advertises', async () => {
+    serve(initialized('Ledger'));
+    expect(await probeApp(LEDGER, { fetches: endpoints.fetches })).toEqual({
+      status: 'ok',
+      method: { kind: 'none' },
+      advertisedName: 'Ledger',
+    });
+    const [request] = endpoints.requests;
+    expect(request.headers.authorization).toBeUndefined();
+    expect(JSON.parse(request.body)).toMatchObject({ method: 'initialize' });
+  });
+
+  it('reads an event-stream answer and drops an advertised name unfit to show', async () => {
+    serve((request) =>
+      request.method === 'POST'
+        ? {
+            status: 200,
+            headers: { 'content-type': 'text/event-stream' },
+            body: `event: message\ndata: ${JSON.stringify({ jsonrpc: '2.0', id: 1, result: { serverInfo: { name: 'Led\u0007ger' } } })}\n\n`,
+          }
+        : undefined,
+    );
+    expect(await probeApp(LEDGER, { fetches: endpoints.fetches })).toEqual({
+      status: 'ok',
+      method: { kind: 'none' },
+      advertisedName: undefined,
+    });
+  });
+
+  it('classifies a 401 without protected-resource metadata as a pasted token', async () => {
+    serve((request) => (request.method === 'POST' ? { status: 401, body: { error: 'unauthorized' } } : undefined));
+    expect(await probeApp(LEDGER, { fetches: endpoints.fetches })).toEqual({
+      status: 'ok',
+      method: { kind: 'token' },
+      advertisedName: undefined,
+    });
+  });
+
+  it('classifies a HomeBoard-shaped server as OAuth that needs client details', async () => {
+    serve(homeBoard().handle);
+    const outcome = await probeApp(HOMEBOARD, { fetches: endpoints.fetches, assistantHost: 'juno.example.test' });
+    expect(outcome).toMatchObject({
+      status: 'ok',
+      method: {
+        kind: 'oauth',
+        issuer: 'https://homeboard.nownow.ai/',
+        dynamicRegistration: false,
+        clientAuthMethods: ['client_secret_basic'],
+        scope: 'homeboard.read homeboard.write',
+      },
+    });
+  });
+
+  it('classifies a server whose metadata offers registration as automatic registration, with the scope its 401 asks for', async () => {
+    const ledger = new FakeMcpApp({ appUrl: LEDGER, issuer: 'https://auth.example.test', registration: true });
+    serve((request) =>
+      request.method === 'POST' && request.host === 'mcp.ledger.example.test'
+        ? {
+            status: 401,
+            headers: {
+              'www-authenticate': `Bearer resource_metadata="${ledger.resourceMetadataUrl}", scope="ledger:read"`,
+            },
+          }
+        : undefined,
+    );
+    serve(ledger.handle);
+    expect(await probeApp(LEDGER, { fetches: endpoints.fetches })).toMatchObject({
+      status: 'ok',
+      method: { kind: 'oauth', issuer: 'https://auth.example.test/', dynamicRegistration: true, scope: 'ledger:read' },
+    });
+  });
+
+  it('refuses OAuth whose protected resource names another address', async () => {
+    const app = homeBoard();
+    app.resourceMetadata.resource = 'https://homeboard.nownow.ai/';
+    serve(app.handle);
+    expect(await probeApp(HOMEBOARD, { fetches: endpoints.fetches })).toEqual({ status: 'unsupported' });
+  });
+
+  it.each([
+    [403, 'unsupported'],
+    [404, 'unsupported'],
+    [429, 'unreachable'],
+    [503, 'unreachable'],
+  ] as const)('answers a %i as %s', async (status, outcome) => {
+    serve(() => ({ status, body: { error: 'nope' } }));
+    expect(await probeApp(LEDGER, { fetches: endpoints.fetches })).toEqual({ status: outcome });
+  });
+
+  it('answers a redirect, which the probe never follows, as unreachable', async () => {
+    serve(() => ({ status: 307, headers: { location: 'https://auth.example.test/mcp' } }));
+    expect(await probeApp(LEDGER, { fetches: endpoints.fetches })).toEqual({ status: 'unreachable' });
+    expect(endpoints.requests.map((request) => request.host)).toEqual(['mcp.ledger.example.test']);
+  });
+});
+
+describe('checkPastedToken', () => {
+  it('refuses a token the server answers with 401, and accepts one it serves', async () => {
+    const app = homeBoard();
+    app.accessTokens.add('pasted-token-good');
+    serve(app.handle);
+    expect(await checkPastedToken(HOMEBOARD, 'pasted-token-stale', { fetches: endpoints.fetches })).toBe('refused');
+    expect(await checkPastedToken(HOMEBOARD, 'pasted-token-good', { fetches: endpoints.fetches })).toBe('valid');
+    expect(endpoints.requests.map((request) => request.headers.authorization)).toEqual([
+      'Bearer pasted-token-stale',
+      'Bearer pasted-token-good',
+    ]);
+  });
+
+  it('refuses a token no header could carry without sending it', async () => {
+    expect(await checkPastedToken(HOMEBOARD, 'two words', { fetches: endpoints.fetches })).toBe('refused');
+    expect(endpoints.requests).toEqual([]);
+  });
+});
