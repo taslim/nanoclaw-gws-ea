@@ -11,9 +11,11 @@
  *   cli_scope 'disabled' → deny; 'group' → resource allowlist, cross-group
  *   arg denial, cli_scope-change denial;
  *   access 'approval' for agent callers → hold for the group's admin chain.
- * One registration seam on top: a protected agent group (registered by the
- * module that owns it) is the host's alone, so any agent caller's command
- * that names one is denied, whatever its CLI scope or an approval.
+ * Two registration seams on top, each denying whatever the CLI scope or an
+ * approval: a protected agent group (registered by the module that owns it)
+ * is the host's alone, so any agent caller's command that names one is
+ * denied; and a module that owns some MCP servers refuses an agent caller's
+ * command that would change them.
  *
  * Arg auto-fill, the sessions-get existence oracle, and post-handler row
  * filtering stay in dispatch.ts — mechanics, not policy.
@@ -55,6 +57,52 @@ export async function protectedGroupReason(agentGroupId: string): Promise<string
     if (reason !== undefined) return reason;
   }
   return undefined;
+}
+
+/** A change to one group's MCP servers, naming the server when the change names one. */
+export interface McpServerChange {
+  readonly agentGroupId: string;
+  readonly serverName?: string;
+}
+
+/**
+ * Says why no agent may make this change to a group's MCP servers, or undefined. A module registers one for the
+ * servers it owns: a group whose servers it reconciles, or server names it reserves.
+ */
+export type McpServerPolicy = (change: McpServerChange) => string | undefined | Promise<string | undefined>;
+
+const mcpServerPolicies = new Map<string, McpServerPolicy>();
+
+/**
+ * Every agent caller's `ncl` command that changes a group's MCP servers is checked against these, as is whatever
+ * else consults `mcpServerChangeReason`. The host caller is unaffected.
+ */
+export function registerMcpServerPolicy(id: string, policy: McpServerPolicy): void {
+  if (!PROTECTED_GROUP_POLICY_ID.test(id)) throw new Error(`Invalid MCP server policy ID: ${id}`);
+  if (mcpServerPolicies.has(id)) throw new Error(`MCP server policy already registered: ${id}`);
+  mcpServerPolicies.set(id, policy);
+}
+
+export async function mcpServerChangeReason(change: McpServerChange): Promise<string | undefined> {
+  for (const policy of mcpServerPolicies.values()) {
+    const reason = await policy(change);
+    if (reason !== undefined) return reason;
+  }
+  return undefined;
+}
+
+/** The server an `ncl` command changes on each group it names, or undefined when it changes no MCP server. */
+function mcpServerChangeOf(cmd: CommandDef, args: Record<string, unknown>): { serverName?: string } | undefined {
+  switch (cmd.name) {
+    case 'groups-config-add-mcp-server':
+    case 'groups-config-remove-mcp-server':
+      return typeof args.name === 'string' ? { serverName: args.name } : {};
+    case 'groups-create':
+      // Updating a stamped group from its template rewrites the plugin's servers on it.
+      return args.template !== undefined && args.new !== true ? {} : undefined;
+    default:
+      return undefined;
+  }
 }
 
 async function namedGroups(cmd: CommandDef, args: Record<string, unknown>): Promise<string[]> {
@@ -123,6 +171,14 @@ async function commandDecide(cmd: CommandDef, input: GuardInput) {
     for (const agentGroupId of await namedGroups(cmd, args)) {
       const reason = await protectedGroupReason(agentGroupId);
       if (reason !== undefined) return DENY(`"${cmd.name}" may not address agent group ${agentGroupId}: ${reason}`);
+    }
+  }
+  const serverChange = mcpServerPolicies.size > 0 ? mcpServerChangeOf(cmd, args) : undefined;
+  if (serverChange) {
+    for (const agentGroupId of await namedGroups(cmd, args)) {
+      const reason = await mcpServerChangeReason({ agentGroupId, ...serverChange });
+      if (reason !== undefined)
+        return DENY(`"${cmd.name}" may not change agent group ${agentGroupId}'s MCP servers: ${reason}`);
     }
   }
   const cliScope = (await getContainerConfig(actor.agentGroupId))?.cli_scope ?? 'group';

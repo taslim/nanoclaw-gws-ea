@@ -5,10 +5,12 @@ import { register } from '../../cli/registry.js';
 import { onHostShutdown, onHostStart } from '../../host-lifecycle.js';
 import { log } from '../../log.js';
 import { registerWebMount } from '../gws-ea-web/mounts.js';
+import { registerAppActions } from './actions.js';
 import { applyMainServers, MainServersUnreadableError, mainOperatorServers } from './apply.js';
 import { connectionsRoot } from './config.js';
 import { connectionsWebMount } from './connections-mount.js';
 import { startRestartChecks, stopRestartChecks } from './idle-restart.js';
+import { oweReconnectNote, startReconnectNotes, stopReconnectNotes } from './note.js';
 import { startConnectionsRefresher, stopConnectionsRefresher } from './refresher.js';
 import {
   ConnectionsStoreError,
@@ -80,6 +82,7 @@ register({
 });
 
 registerWebMount(connectionsWebMount);
+registerAppActions();
 
 onHostStart(async ({ signal }) => {
   // Only a gws-ea assistant has a store; a plain NanoClaw host has nothing to sweep.
@@ -89,7 +92,8 @@ onHostStart(async ({ signal }) => {
     await store.sweepExpiredSignIns();
     // Armed first, so a restart a previous host left pending and one this apply records are both served.
     startRestartChecks(store, signal);
-    startConnectionsRefresher(store, signal);
+    startReconnectNotes(store, signal);
+    startConnectionsRefresher(store, signal, { onRefused: oweReconnectNote });
     await applyMainServers(store);
   } catch (error) {
     if (error instanceof ConnectionsStoreError) log.warn('Connections store unavailable', { reason: error.reason });
@@ -99,4 +103,5 @@ onHostStart(async ({ signal }) => {
 });
 
 onHostShutdown(stopConnectionsRefresher);
+onHostShutdown(stopReconnectNotes);
 onHostShutdown(stopRestartChecks);

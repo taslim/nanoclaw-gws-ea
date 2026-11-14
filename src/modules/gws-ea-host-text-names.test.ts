@@ -42,7 +42,12 @@ import ts from 'typescript';
 import { describe, expect, it } from 'vitest';
 
 import { resolveCapabilities, SHELL_CAPABILITY } from '../capabilities.js';
-import { MAIN_CHAT_CAPABILITY, MAIN_SHARED_SKILLS, mainCapabilitySelection } from './gws-ea-main/index.js';
+import {
+  MAIN_APPS_CAPABILITY,
+  MAIN_CHAT_CAPABILITY,
+  MAIN_SHARED_SKILLS,
+  mainCapabilitySelection,
+} from './gws-ea-main/index.js';
 import { registeredGuidanceFiles } from './gws-ea-profile/guidance.js';
 import { noVerifiedPrincipalMessage } from './gws-ea-profile/approval-wording.js';
 import { GROUP_SCOPE_RESOURCES, listCommands, lookup } from '../cli/registry.js';
@@ -87,7 +92,10 @@ const DELEGATE_KEYS = [BROWSER_DELEGATE_CAPABILITY, PURCHASE_OUTCOME_CAPABILITY,
 const HOLDINGS: Readonly<Record<Reader, Holdings>> = {
   // Create/update reconciliation stores main's current release defaults; browser access grants both delegate keys:
   // policy version 1 lists main alone, and main records every unconfirmed purchase.
-  main: { keys: new Set([...mainCapabilitySelection(), MAIN_CHAT_CAPABILITY, ...DELEGATE_KEYS]), ncl: 'global' },
+  main: {
+    keys: new Set([...mainCapabilitySelection(), MAIN_CHAT_CAPABILITY, MAIN_APPS_CAPABILITY, ...DELEGATE_KEYS]),
+    ncl: 'global',
+  },
   'external-email': { keys: new Set(EXTERNAL_EMAIL_CAPABILITIES), ncl: 'none' },
   'external-chat': { keys: new Set(EXTERNAL_CHAT_CAPABILITIES), ncl: 'none' },
   job: { keys: new Set(JOB_CHAT_CAPABILITIES), ncl: 'none' },
@@ -119,6 +127,8 @@ const POLICY: Policy = {
     'gws-ea-meetings/principal-events.ts': 'main',
     'gws-ea-chats/context.ts': 'external-chat',
     'gws-ea-chat-agents/docs.ts': 'job',
+    // The answers and notes of main's app tools; their cards name no tool.
+    'gws-ea-connections/actions.ts': 'main',
     // `ncl people` and `ncl preferences` help, answers and guidance.
     'gws-ea-people/index.ts': 'main',
     'gws-ea-preferences/index.ts': 'main',
@@ -479,6 +489,7 @@ const GUIDANCE_READERS: Readonly<Record<string, readonly Reader[]>> = {
   'container/agent-runner/src/mcp-tools/gws-ea-chat-external.instructions.md': ['external-chat', 'job'],
   'container/agent-runner/src/mcp-tools/gws-ea-chat-outreach.instructions.md': ['main'],
   'container/agent-runner/src/mcp-tools/gws-ea-chat.instructions.md': ['main'],
+  'container/agent-runner/src/mcp-tools/gws-ea-connections.instructions.md': ['main'],
   'container/agent-runner/src/mcp-tools/gws-ea-email-external.instructions.md': ['external-email'],
   // Default-on: a group that stores `all` holds it too.
   'container/agent-runner/src/mcp-tools/gws-ea-email.instructions.md': ['main', 'delegator'],

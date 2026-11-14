@@ -1778,6 +1778,30 @@ describe("recorded divergence: a protected agent group is the host's alone", () 
   });
 });
 
+describe('recorded divergence: a module can refuse changes to MCP servers it owns', () => {
+  it('denies the add_mcp_server request and the raw config command a registered policy refuses', async () => {
+    await freshInstall();
+    const { guard } = await import('../guard/index.js');
+    const { registerMcpServerPolicy } = await import('../cli/guard.js');
+    const { commandGuard } = await import('../cli/registry.js');
+    await import('../cli/resources/index.js');
+    const { selfModAddMcpServer } = await import('../modules/self-mod/guard.js');
+    registerMcpServerPolicy('divergence:owned-servers', ({ agentGroupId }) =>
+      agentGroupId === 'g' ? 'its servers are the module’s' : undefined,
+    );
+    const actor = (agentGroupId: string) => ({ kind: 'agent', agentGroupId, sessionId: 'session-1' }) as const;
+    const payload = { id: 'g', name: 'tools', url: 'https://tools.example.test/mcp' };
+
+    expect(await guard(selfModAddMcpServer, { actor: actor('g'), payload })).toMatchObject({ effect: 'deny' });
+    expect(await guard(selfModAddMcpServer, { actor: actor('ag-other'), payload })).toMatchObject({ effect: 'hold' });
+    expect(
+      await guard(commandGuard('groups-config-add-mcp-server'), { actor: { kind: 'host' }, payload }),
+    ).toMatchObject({ effect: 'allow' });
+    const decided = await guard(commandGuard('groups-config-add-mcp-server'), { actor: actor('g'), payload });
+    expect(decided.reason).toContain('its servers are the module’s');
+  });
+});
+
 describe('recorded divergence: a module can refuse a role grant', () => {
   it('refuses a grant a registered policy refuses, on the module writer and the ncl roles grant path', async () => {
     const { db } = await migratedInstall();

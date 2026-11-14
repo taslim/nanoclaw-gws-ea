@@ -30,6 +30,7 @@ await import('./gws-ea-artifacts.js');
 await import('./gws-ea-browser.js');
 await import('./gws-ea-browser-delegate.js');
 await import('./gws-ea-principal-pages.js');
+await import('./gws-ea-connections.js');
 // Module barrel — loads registration modules, including the singular mailbox
 // slot. A module registering tools passes its own capability key.
 await import('../modules/index.js');

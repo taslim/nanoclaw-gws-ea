@@ -49,6 +49,14 @@ registerCapability(MAIN_CHAT_CAPABILITY, {
   // Canonical main's alone: a group that stores `all` must not learn main's chat commands.
   grantedTo: async (agentGroupId) => agentGroupId === (await mainAgentGroupId()),
 });
+export const MAIN_APPS_CAPABILITY = 'gws-ea-connections';
+registerCapability(MAIN_APPS_CAPABILITY, {
+  description: "add_app and delete_app: the principal's apps, each change approved by the principal",
+  default: 'off',
+  instructions: [MAIN_APPS_CAPABILITY],
+  // Custom apps are main's alone, so no other group learns to ask for them.
+  grantedTo: async (agentGroupId) => agentGroupId === (await mainAgentGroupId()),
+});
 
 /**
  * Main's capabilities bound the list: it receives each skill only while it
