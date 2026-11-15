@@ -172,7 +172,7 @@ h2 { font-size: 14px; font-weight: 600; line-height: 1.4; letter-spacing: -.005e
 /* Fields */
 .field + .field { margin-top: 20px; }
 .field label { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; margin-bottom: 6px; font-size: 13px; font-weight: 500; }
-.optional { color: var(--faint); font-size: 12px; font-weight: 400; }
+.optional { color: var(--muted); font-size: 12px; font-weight: 400; }
 .field-hint { display: block; margin-top: 6px; color: var(--muted); font-size: 13px; line-height: 1.5; overflow-wrap: anywhere; }
 input {
   width: 100%;
@@ -296,8 +296,8 @@ dialog p { margin-top: 8px; color: var(--muted); font-size: 14px; line-height: 1
     transition: box-shadow .2s;
   }
   .shell[data-condensed]::before { box-shadow: 0 1px 0 var(--line); }
-  .shell-name { height: 52px; font-size: 15px; }
-  body:has(main .back-link) .shell-name { display: none; }
+  /* The page's own title names it; the assistant's name belongs to the desktop header. */
+  .shell-name { display: none; }
   .appbar-title {
     display: block;
     position: absolute;
@@ -317,7 +317,6 @@ dialog p { margin-top: 8px; color: var(--muted); font-size: 14px; line-height: 1
     pointer-events: none;
   }
   .shell[data-condensed] .appbar-title { opacity: 1; transform: translate(-50%, 0); }
-  body:not(:has(main .back-link)) .shell[data-condensed] .shell-name { opacity: 0; transition: opacity .2s; }
 
   main .back-link {
     position: fixed;
@@ -372,7 +371,7 @@ dialog p { margin-top: 8px; color: var(--muted); font-size: 14px; line-height: 1
     width: 100%;
     min-height: 56px;
     padding: 4px 0;
-    color: var(--faint);
+    color: var(--muted);
     font-size: 11px;
     letter-spacing: .01em;
     -webkit-user-select: none;
@@ -386,8 +385,10 @@ dialog p { margin-top: 8px; color: var(--muted); font-size: 14px; line-height: 1
   main, main[data-width="narrow"] { width: calc(100% - 32px); padding-block: 4px 32px; }
   h1 { font-size: 30px; letter-spacing: -.03em; }
   .page-heading { margin-bottom: 20px; }
+  .page-heading + #outcome { margin-top: -4px; margin-bottom: 20px; }
   .page-metadata { margin-top: 6px; }
   .section-title { padding-inline: 16px; }
+  * + .section { margin-top: 28px; }
 
   .list { border-radius: 18px; }
   .row { min-height: 64px; padding: 12px 8px 12px 16px; }

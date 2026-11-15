@@ -46,10 +46,6 @@ function addLink(): string {
   return `<a class="button button-primary" href="/logins/new" data-navigation>${icon('plus')}<span class="button-label">Add login</span></a>`;
 }
 
-function count(total: number): string {
-  return `${total} ${total === 1 ? 'login' : 'logins'}`;
-}
-
 function loginRow(row: LoginRow): string {
   // The principal's own account is the usual case, so only the assistant's is marked in the list.
   const owner = row.account === 'assistant' ? renderBadge(ACCOUNT_LABELS.assistant, 'accent', false) : '';
@@ -66,7 +62,7 @@ function loginList(rows: readonly LoginRow[]): string {
   const sites = [...groups].sort(([left], [right]) => left.localeCompare(right));
   const heading = renderPageHeading('Logins', '', rows.length ? addLink() : '');
   if (rows.length === 0) return `${heading}${renderEmptyState('No saved logins yet', 'lock', addLink())}`;
-  return `${heading}<div class="list-tools"><div class="search-field">${icon('search')}<label class="sr-only" for="login-search">Search logins</label><input id="login-search" type="search" placeholder="Search" autocomplete="off" spellcheck="false"></div><p class="list-summary" id="search-count" role="status" aria-live="polite" data-total="${escapeHtml(count(rows.length))}">${count(rows.length)}</p></div>${sites
+  return `${heading}<div class="list-tools"><div class="search-field">${icon('search')}<label class="sr-only" for="login-search">Search logins</label><input id="login-search" type="search" placeholder="Search" autocomplete="off" spellcheck="false"></div><p class="list-summary" id="search-count" role="status" aria-live="polite"></p></div>${sites
     .map(
       ([site, group], index) =>
         `<section class="section site-group" data-site-group aria-labelledby="site-${index}"><h2 class="section-title site-heading" id="site-${index}"><span class="site-mark" aria-hidden="true">${escapeHtml((site[0] ?? '•').toLocaleUpperCase())}</span>${escapeHtml(site)}</h2><div class="list">${group
@@ -116,6 +112,7 @@ const STYLE = `
 .search-field { position: relative; flex: 1; max-width: 320px; }
 .search-field > .icon { position: absolute; left: 14px; top: 14px; width: 16px; height: 16px; color: var(--faint); pointer-events: none; }
 input[type="search"] { padding-left: 40px; }
+.list-summary:empty { display: none; }
 .list-summary { margin-left: auto; color: var(--muted); font-size: 13px; white-space: nowrap; font-variant-numeric: tabular-nums; }
 .site-heading { display: flex; align-items: center; gap: 8px; color: var(--text); }
 .site-mark { display: grid; place-items: center; width: 20px; height: 20px; border-radius: 6px; background: var(--fill-strong); color: var(--muted); font-size: 11px; font-weight: 600; }
@@ -132,6 +129,14 @@ dd { margin: 0; font-size: 14px; font-weight: 500; overflow-wrap: anywhere; }
 .remove { margin-top: 16px; }
 .remove .button { margin-left: -16px; }
 @media (max-width: 719px) {
+  /* The owner tag shares the title's line, so the username keeps its own. */
+  a.row[data-login-row] { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; grid-template-areas: "title owner chevron" "sub sub chevron"; gap: 2px 8px; align-items: center; }
+  a.row[data-login-row] > .row-main { display: contents; }
+  a.row[data-login-row] .row-title { grid-area: title; }
+  a.row[data-login-row] .row-sub { grid-area: sub; }
+  a.row[data-login-row] > .badge { grid-area: owner; height: 20px; padding: 0 8px; font-size: 11px; }
+  a.row[data-login-row] > .row-chevron { grid-area: chevron; }
+  .site-group + .site-group { margin-top: 24px; }
   .list-tools { margin-bottom: 4px; }
   .search-field { max-width: none; }
   input[type="search"] { min-height: 44px; border-radius: 12px; }

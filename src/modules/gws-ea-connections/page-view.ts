@@ -206,7 +206,9 @@ function appMissing(): string {
 }
 
 function connectView(app: ConnectionApp, state: ConnectionsPageState): string {
-  const heading = `${BACK}${renderPageHeading(`Connect ${app.name}`, `<span>${escapeHtml(app.host)}</span>${statusBadge(app.status)}`)}`;
+  // Connecting already says it is not connected; only a lapsed connection is news.
+  const status = app.status === 'needs_reconnecting' ? statusBadge(app.status) : '';
+  const heading = `${BACK}${renderPageHeading(`Connect ${app.name}`, `<span>${escapeHtml(app.host)}</span>${status}`)}`;
   if (app.status === 'connected') return `${heading}${notice('This app is connected.')}`;
   if (!state.listing.canChange) return `${heading}${notice(UNAVAILABLE)}`;
   return `${heading}${connectForm(app, state)}`;
@@ -245,12 +247,18 @@ const STYLE = `
 .change-client { margin-top: 12px; }
 .change-client .button { margin-left: -16px; }
 @media (max-width: 719px) {
-  .app-row { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; gap: 6px 4px; align-items: center; }
-  .app-row > .row-main { padding-right: 4px; }
-  .app-row > .row-main { grid-column: 1; grid-row: 1; }
-  .app-row > .badge { grid-column: 1; grid-row: 2; justify-self: start; }
-  .app-row > .row-button, .app-row > form { grid-column: 2; grid-row: 1 / span 2; }
-  .app-row > .menu, .app-row > .row-note { grid-column: 3; grid-row: 1 / span 2; }
+  /* Two lines on a phone: the name, then its status in words. The host is on the app's own pages. */
+  .app-row { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; grid-template-areas: "title action menu" "status action menu"; gap: 2px 4px; align-items: center; }
+  .app-row > .row-main { display: contents; }
+  .app-row .row-title { grid-area: title; }
+  .app-row .row-sub { display: none; }
+  .app-row > .badge { grid-area: status; justify-self: start; height: auto; padding: 0; background: none; font-size: 14px; font-weight: 400; }
+  .app-row > .badge::before { width: 7px; height: 7px; }
+  /* Only what needs attention keeps its colour in words; a settled status is a coloured dot. */
+  .app-row > .badge-success, .app-row > .badge:not([class*="badge-"]) { color: var(--muted); }
+  .app-row > .badge-success::before { background: var(--success); }
+  .app-row > .row-button, .app-row > form { grid-area: action; }
+  .app-row > .menu, .app-row > .row-note { grid-area: menu; }
   .steps h2 { font-size: 15px; }
   .change-client .button { margin: 0; width: 100%; }
   .redirect { flex-direction: column; align-items: stretch; padding: 4px; }

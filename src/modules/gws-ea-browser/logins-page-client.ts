@@ -86,8 +86,7 @@ export const LOGINS_PAGE_SCRIPT = String.raw`
       group.hidden = ![...group.querySelectorAll('[data-login-row]')].some(row => !row.hidden);
     });
     document.getElementById('search-empty').hidden = count !== 0;
-    const summary = document.getElementById('search-count');
-    summary.textContent = needle ? count + ' found' : summary.dataset.total;
+    document.getElementById('search-count').textContent = needle ? count + ' found' : '';
   });
   document.addEventListener('click', event => {
     if (!(event.target instanceof Element)) return;

@@ -73,9 +73,12 @@ export function renderBadge(label: string, tone: BadgeTone = 'neutral', status =
   return `<span class="${classes.join(' ')}">${escapeHtml(label)}</span>`;
 }
 
+/** Where the page's outcome message goes: under the title, so the title stays the first thing read. */
+const OUTCOME_SLOT = '<!--outcome-->';
+
 /** `metadata` and `action` are trusted markup. */
 export function renderPageHeading(title: string, metadata = '', action = ''): string {
-  return `<div class="page-heading"><div><h1>${escapeHtml(title)}</h1>${metadata ? `<div class="page-metadata">${metadata}</div>` : ''}</div>${action}</div>`;
+  return `<div class="page-heading"><div><h1>${escapeHtml(title)}</h1>${metadata ? `<div class="page-metadata">${metadata}</div>` : ''}</div>${action}</div>${OUTCOME_SLOT}`;
 }
 
 /** Named for where it goes, so it reads the same wherever it appears. */
@@ -104,5 +107,10 @@ export function renderPrincipalPage(spec: PrincipalPage, nonce: string): string 
     .map(escapeHtml)
     .join(' · ');
   const attribute = escapeHtml(nonce);
-  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><meta name="color-scheme" content="light dark"><meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)"><meta name="theme-color" content="#0b0b0c" media="(prefers-color-scheme: dark)"><title>${title}</title><style nonce="${attribute}">${KIT_STYLE}${spec.style ?? ''}</style></head><body><header class="shell"><p class="shell-name"><span class="shell-mark" aria-hidden="true">${escapeHtml(initial(shell.assistantName))}</span><span>${escapeHtml(shell.assistantName)}</span></p><p class="appbar-title" aria-hidden="true"></p>${navigation(shell, spec.page)}</header><main tabindex="-1" data-view="${escapeHtml(spec.view)}"${spec.narrow ? ' data-width="narrow"' : ''}><p id="outcome" role="${spec.error ? 'alert' : 'status'}" tabindex="-1" data-error="${spec.error}"${spec.outcome ? '' : ' hidden'}>${escapeHtml(spec.outcome)}</p>${spec.content}${spec.noscript ? `<noscript><p class="field-hint">${escapeHtml(spec.noscript)}</p></noscript>` : ''}</main><p id="announcer" class="sr-only" role="status" aria-live="polite"></p><dialog id="confirm-dialog" aria-labelledby="confirm-heading" aria-describedby="confirm-description"><div class="sheet-grab" data-sheet-grab aria-hidden="true"></div><h2 id="confirm-heading"></h2><p id="confirm-description"></p><div class="dialog-actions"><button class="button button-secondary" type="button" id="confirm-cancel" data-dialog-close>Cancel</button><button class="button button-danger" type="button" id="confirm-action"></button></div></dialog><script nonce="${attribute}">${pageScript(spec.script)}</script></body></html>`;
+  const outcome = `<p id="outcome" role="${spec.error ? 'alert' : 'status'}" tabindex="-1" data-error="${spec.error}"${spec.outcome ? '' : ' hidden'}>${escapeHtml(spec.outcome)}</p>`;
+  // Escaped text cannot spell the slot, so only a heading's own slot is ever filled.
+  const content = spec.content.includes(OUTCOME_SLOT)
+    ? spec.content.replace(OUTCOME_SLOT, outcome)
+    : `${outcome}${spec.content}`;
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><meta name="color-scheme" content="light dark"><meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)"><meta name="theme-color" content="#0b0b0c" media="(prefers-color-scheme: dark)"><title>${title}</title><style nonce="${attribute}">${KIT_STYLE}${spec.style ?? ''}</style></head><body><header class="shell"><p class="shell-name"><span class="shell-mark" aria-hidden="true">${escapeHtml(initial(shell.assistantName))}</span><span>${escapeHtml(shell.assistantName)}</span></p><p class="appbar-title" aria-hidden="true"></p>${navigation(shell, spec.page)}</header><main tabindex="-1" data-view="${escapeHtml(spec.view)}"${spec.narrow ? ' data-width="narrow"' : ''}>${content}${spec.noscript ? `<noscript><p class="field-hint">${escapeHtml(spec.noscript)}</p></noscript>` : ''}</main><p id="announcer" class="sr-only" role="status" aria-live="polite"></p><dialog id="confirm-dialog" aria-labelledby="confirm-heading" aria-describedby="confirm-description"><div class="sheet-grab" data-sheet-grab aria-hidden="true"></div><h2 id="confirm-heading"></h2><p id="confirm-description"></p><div class="dialog-actions"><button class="button button-secondary" type="button" id="confirm-cancel" data-dialog-close>Cancel</button><button class="button button-danger" type="button" id="confirm-action"></button></div></dialog><script nonce="${attribute}">${pageScript(spec.script)}</script></body></html>`;
 }

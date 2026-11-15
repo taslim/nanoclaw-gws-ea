@@ -25,6 +25,7 @@ import {
   refuse,
   renderCopyButton,
   renderMenu,
+  renderPageHeading,
   renderPrincipalPage,
   sameOriginJson,
   sendJson,
@@ -178,6 +179,23 @@ it('reads one JSON object of at most 16 KiB and refuses anything else', async ()
   expect(await read('{"handle":"x"}')).toEqual({ handle: 'x' });
   for (const body of ['{', '[]', 'null', '"text"', JSON.stringify({ padding: 'x'.repeat(16 * 1024) })])
     expect(await read(body)).toBeInstanceOf(InvalidSubmission);
+});
+
+it('puts the outcome under the page title, or first when the page has no title, and never inside escaped text', () => {
+  const page = (content: string) =>
+    renderPrincipalPage(
+      { shell, page: '/logins', title: 'T', view: 'v', outcome: 'Done.', error: false, content },
+      'n',
+    );
+  const titled = page(`${renderPageHeading('Logins')}<p>Body</p>`);
+  expect(titled.indexOf('<h1>Logins</h1>')).toBeLessThan(titled.indexOf('>Done.</p>'));
+  expect(titled.indexOf('>Done.</p>')).toBeLessThan(titled.indexOf('<p>Body</p>'));
+  expect(titled).not.toContain('<!--outcome-->');
+  const untitled = page('<p>Body</p>');
+  expect(untitled.indexOf('>Done.</p>')).toBeLessThan(untitled.indexOf('<p>Body</p>'));
+  const escaped = page(renderPageHeading(escapeHtml('<!--outcome-->')));
+  expect(escaped.match(/id="outcome"/gu)).toHaveLength(1);
+  expect(escaped).toContain('<h1>&amp;lt;!--outcome--&amp;gt;</h1>');
 });
 
 it('draws the shell with the escaped assistant name and the current page marked', () => {
