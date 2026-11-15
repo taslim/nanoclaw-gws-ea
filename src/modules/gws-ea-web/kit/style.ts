@@ -393,6 +393,7 @@ dialog p { margin-top: 8px; color: var(--muted); font-size: 14px; line-height: 1
     user-select: none;
   }
   .shell-nav a[aria-current="page"] { color: var(--accent-text); }
+  .shell-nav a[aria-current="page"] .tab-icon { stroke-width: 1.9; }
   .shell-nav a[aria-current="page"]::before { display: none; }
   .tab-icon { display: block; width: 26px; height: 26px; transition: transform .16s var(--ease-out); }
   .shell-nav a:active .tab-icon { transform: scale(.88); }
