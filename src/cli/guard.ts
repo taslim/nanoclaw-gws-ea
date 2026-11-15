@@ -239,14 +239,15 @@ async function commandDecide(cmd: CommandDef, input: GuardInput) {
  */
 async function serverChangeGroups(cmd: CommandDef, args: Record<string, unknown>): Promise<string[]> {
   const named = await namedGroups(cmd, args);
-  if (cmd.name !== 'groups-create' || named.length > 0 || typeof args.template !== 'string') return named;
+  // The handler targets --id alone; any other group flag leaves the carrier as its target.
+  if (cmd.name !== 'groups-create' || typeof args.id === 'string' || typeof args.template !== 'string') return named;
   // Loaded on use: the template layer reaches far into the host, which itself loads this guard.
   const { groupsCarryingPlugin } = await import('../templates/restamp.js');
   /* eslint-disable no-catch-all/no-catch-all -- any template read failure is the handler's to report */
   try {
-    return (await groupsCarryingPlugin(args.template)).map((group) => group.id);
+    return [...named, ...(await groupsCarryingPlugin(args.template)).map((group) => group.id)];
   } catch {
-    return [];
+    return named;
   }
   /* eslint-enable no-catch-all/no-catch-all */
 }

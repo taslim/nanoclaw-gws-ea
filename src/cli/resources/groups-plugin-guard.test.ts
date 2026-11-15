@@ -187,6 +187,9 @@ describe('a module’s MCP server policy on a template update', () => {
       effect: 'deny',
       reason: expect.stringContaining('its servers are the module’s'),
     });
+    expect(await guard(create, { actor, payload: { template: 'sdr', group: 'ag-owner', yes: true } })).toMatchObject({
+      effect: 'deny',
+    });
     expect(await guard(create, { actor, payload: { template: 'sdr', new: true } })).toMatchObject({ effect: 'hold' });
   });
 });

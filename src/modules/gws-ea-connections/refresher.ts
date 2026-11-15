@@ -179,6 +179,7 @@ export function createConnectionsRefresher(dependencies: ConnectionsRefresherDep
   /** Durably ended first, so nothing removed afterwards can come back if a later step fails or the host stops. */
   async function endRefused(app: ConnectionApp, generation: number, code: TerminalCode): Promise<void> {
     unpublished.delete(app.id);
+    unstored.delete(app.id);
     if (!(await store.markRefused(app.id, generation))) return;
     log.warn('App needs reconnecting', { appId: app.id, code });
     // A removal that fails here is retried by the sweep on the next tick.
@@ -313,6 +314,8 @@ export function createConnectionsRefresher(dependencies: ConnectionsRefresherDep
       }
       const own = app.status === 'connected' && app.auth !== 'none' ? appCredentialName(app.id) : undefined;
       const live = app.status === 'connected' ? grant : undefined;
+      // A held renewal belongs only to the live grant it was issued for.
+      if (live?.kind !== 'oauth' || live.generation !== unstored.get(app.id)?.generation) unstored.delete(app.id);
       let held: readonly GatewayHostCredential[] | undefined;
       await attempt(app.id, 'Could not list app credentials; retrying', 'gateway_failed', async () => {
         held = await gateway.listForHost(app.host);
@@ -353,7 +356,8 @@ export function createConnectionsRefresher(dependencies: ConnectionsRefresherDep
         log.warn('Connections store unavailable', { code: error.reason });
         return;
       }
-      for (const appId of unpublished.keys()) if (!apps.some(({ id }) => id === appId)) unpublished.delete(appId);
+      for (const held of [unpublished, unstored])
+        for (const appId of held.keys()) if (!apps.some(({ id }) => id === appId)) held.delete(appId);
       let host: string | undefined;
       try {
         host = await assistantHost();
