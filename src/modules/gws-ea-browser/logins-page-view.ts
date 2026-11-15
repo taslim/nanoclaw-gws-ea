@@ -75,8 +75,11 @@ function loginList(rows: readonly LoginRow[]): string {
 
 function loginDetail(row: LoginRow): string {
   const owner = renderBadge(ACCOUNT_LABELS[row.account], row.account === 'assistant' ? 'accent' : 'neutral', false);
-  const edit = `<a class="button button-secondary" href="${escapeHtml(itemUrl(row))}/edit" data-navigation>${icon('edit')}<span class="button-label">Edit</span></a>`;
-  return `${renderBackLink('/logins', 'Logins')}${renderPageHeading(row.title || row.site, owner, edit)}<dl class="list details"><div class="detail"><dt>Website</dt><dd>${escapeHtml(row.site)}</dd></div><div class="detail"><dt>Username</dt><dd>${escapeHtml(row.username || 'No username')}</dd></div><div class="detail detail-password"><dt>Password</dt><dd><span id="password-concealed" class="concealed"><span aria-hidden="true">••••••••••</span><span class="sr-only">Hidden</span></span><code id="password-value" hidden></code><button class="button button-secondary" id="show-password" type="button" data-handle="${escapeHtml(row.handle)}" data-version="${row.version}" aria-controls="password-value" aria-expanded="false">Show password</button><p class="field-hint" id="password-reveal-hint" hidden>Hides after 30 seconds.</p></dd></div></dl><form class="remove" method="post" action="/logins/remove" data-send data-confirm-title="Remove this login?" data-confirm-action="Remove login" data-confirm-message="${escapeHtml(`Your assistant will no longer sign in to ${row.site} as ${row.username || 'this account'}. Your account on the site stays as it is, and your assistant’s browser may stay signed in until you ask it to sign out.`)}">${hiddenItem(row)}<button class="button button-danger" type="submit" data-pending-label="Removing…">Remove login</button></form>`;
+  const editUrl = `${itemUrl(row)}/edit`;
+  const edit = `<a class="button button-secondary edit-top" href="${escapeHtml(editUrl)}" data-navigation>${icon('edit')}<span class="button-label">Edit</span></a>`;
+  // On a phone both actions sit together at the bottom, within reach, in place of the desktop's Edit by the title.
+  const editBottom = `<a class="button button-secondary edit-bottom" href="${escapeHtml(editUrl)}" data-navigation>Edit login</a>`;
+  return `${renderBackLink('/logins', 'Logins')}${renderPageHeading(row.title || row.site, owner, edit)}<dl class="list details"><div class="detail"><dt>Website</dt><dd>${escapeHtml(row.site)}</dd></div><div class="detail"><dt>Username</dt><dd>${escapeHtml(row.username || 'No username')}</dd></div><div class="detail detail-password"><dt>Password</dt><dd><span id="password-concealed" class="concealed"><span aria-hidden="true">••••••••••</span><span class="sr-only">Hidden</span></span><code id="password-value" hidden></code><button class="button button-secondary" id="show-password" type="button" data-handle="${escapeHtml(row.handle)}" data-version="${row.version}" aria-controls="password-value" aria-expanded="false">Show password</button><p class="field-hint" id="password-reveal-hint" hidden>Hides after 30 seconds.</p></dd></div></dl><div class="detail-actions">${editBottom}<form class="remove" method="post" action="/logins/remove" data-send data-confirm-title="Remove this login?" data-confirm-action="Remove login" data-confirm-message="${escapeHtml(`Your assistant will no longer sign in to ${row.site} as ${row.username || 'this account'}. Your account on the site stays as it is, and your assistant’s browser may stay signed in until you ask it to sign out.`)}">${hiddenItem(row)}<button class="button button-danger" type="submit" data-pending-label="Removing…">Remove login</button></form></div>`;
 }
 
 function loginForm(row?: LoginRow): string {
@@ -126,7 +129,8 @@ dd { margin: 0; font-size: 14px; font-weight: 500; overflow-wrap: anywhere; }
 .concealed { flex: 1; color: var(--muted); letter-spacing: .12em; }
 #password-value { flex: 1; min-width: 0; white-space: pre-wrap; overflow-wrap: anywhere; font: 500 14px/1.5 ui-monospace, "SF Mono", monospace; user-select: text; }
 #password-reveal-hint { flex-basis: 100%; margin: 0; font-weight: 400; }
-.remove { margin-top: 16px; }
+.detail-actions { margin-top: 16px; }
+.edit-bottom { display: none; }
 .remove .button { margin-left: -16px; }
 @media (max-width: 719px) {
   /* The owner tag shares the title's line, so the username keeps its own. */
@@ -144,8 +148,11 @@ dd { margin: 0; font-size: 14px; font-weight: 500; overflow-wrap: anywhere; }
   .details { padding: 2px 16px; border-radius: 18px; }
   .detail { grid-template-columns: 1fr; gap: 2px; min-height: 64px; }
   dd { font-size: 16px; }
-  .remove { margin-top: 24px; }
-  .remove .button { width: 100%; margin: 0; min-height: 52px; border-radius: 14px; background: var(--danger-soft); font-size: 16px; }
+  main .page-heading > .button.edit-top { display: none; }
+  .detail-actions { display: flex; flex-direction: column; gap: 10px; margin-top: 24px; }
+  .detail-actions .button { width: 100%; margin: 0; min-height: 52px; border-radius: 14px; font-size: 16px; }
+  .detail-actions .button.edit-bottom { display: flex; }
+  .remove .button { background: var(--danger-soft); }
 }
 `;
 

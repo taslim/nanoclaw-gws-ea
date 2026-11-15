@@ -698,7 +698,7 @@ it.skipIf(!chromePath).each([320, 390, 1200])(
       await page.getByRole('searchbox', { name: 'Search logins' }).fill('personal');
       expect(await page.locator('[data-login-row]:visible').count()).toBe(1);
       await page.locator('[data-login-row]').click();
-      await page.getByRole('link', { name: 'Edit', exact: true }).click();
+      await page.getByRole('link', { name: width < 720 ? 'Edit login' : 'Edit', exact: true }).click();
       await page.getByRole('textbox', { name: 'Label', exact: true }).fill('Unsaved change');
       page.once('dialog', async (confirmation) => {
         expect(confirmation.type()).toBe('beforeunload');
@@ -752,7 +752,8 @@ it.skipIf(!chromePath).each([320, 390, 1200])(
       await page.setViewportSize({ width: 320, height: 568 });
       await page.locator('[data-login-row]').filter({ hasText: longUsername }).click();
       await layout();
-      await page.getByRole('link', { name: 'Edit', exact: true }).click();
+      // A phone pairs Edit login with Remove login at the bottom instead of an Edit beside the title.
+      await page.getByRole('link', { name: 'Edit login', exact: true }).click();
       await layout();
       if (width === 320) {
         await fixture.store.update(long.id, 1, { title: 'Concurrent edit', password: '' });
