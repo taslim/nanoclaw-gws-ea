@@ -263,8 +263,8 @@ describe('recorded divergence: the installed OneCLI adapter', () => {
     const provider = await installedProvider();
     const secret = (id: string, name: string, hostPattern: string) => ({ id, name, hostPattern, scope: 'project' });
     const rows = [
-      secret('app', 'gws-ea-app-a1', 'homeboard.nownow.ai'),
-      secret('operator', 'HomeBoard', 'homeboard.nownow.ai'),
+      secret('app', 'gws-ea-app-a1', 'app.ledgerly.example.test'),
+      secret('operator', 'Ledgerly', 'app.ledgerly.example.test'),
       secret('other', 'Search', 'api.search.example.test'),
     ];
     vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
@@ -284,10 +284,10 @@ describe('recorded divergence: the installed OneCLI adapter', () => {
       throw new Error('The installed OneCLI adapter cannot list or remove by host');
     }
 
-    const listed = await credentials.listForHost('homeboard.nownow.ai');
+    const listed = await credentials.listForHost('app.ledgerly.example.test');
     expect(listed).toEqual([
       { id: 'app', name: 'gws-ea-app-a1' },
-      { id: 'operator', name: 'HomeBoard' },
+      { id: 'operator', name: 'Ledgerly' },
     ]);
     expect(await credentials.removeById(listed.map(({ id }) => id))).toEqual([
       { id: 'app', outcome: 'removed' },

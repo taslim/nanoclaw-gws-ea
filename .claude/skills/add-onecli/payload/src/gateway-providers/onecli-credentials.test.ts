@@ -146,7 +146,7 @@ describe('the caller-described connection', () => {
     const app: GatewayCredentialTarget = {
       ...target,
       name: 'gws-ea-app-a1',
-      host: 'homeboard.nownow.ai',
+      host: 'app.ledgerly.example.test',
       path: '/mcp',
     };
     const v = vault([]);
@@ -157,7 +157,7 @@ describe('the caller-described connection', () => {
 
     expect(v.writes[0]!.body).toMatchObject({
       name: 'gws-ea-app-a1',
-      hostPattern: 'homeboard.nownow.ai',
+      hostPattern: 'app.ledgerly.example.test',
       pathPattern: '/mcp',
     });
   });
@@ -166,10 +166,10 @@ describe('the caller-described connection', () => {
     const app: GatewayCredentialTarget = {
       ...target,
       name: 'gws-ea-app-a1',
-      host: 'homeboard.nownow.ai',
+      host: 'app.ledgerly.example.test',
       path: '/mcp',
     };
-    const spec: OneCliCredential = { ...CALENDAR, name: 'gws-ea-app-a1', hostPattern: 'homeboard.nownow.ai' };
+    const spec: OneCliCredential = { ...CALENDAR, name: 'gws-ea-app-a1', hostPattern: 'app.ledgerly.example.test' };
     const v = vault([row('whole-host', spec)]);
 
     await expect(createProviderCredentialConnection(app, management(v, 'oc_key')).find()).rejects.toThrow(
@@ -196,24 +196,24 @@ describe('the caller-described connection', () => {
 });
 
 describe("OneCLI's credentials on one host", () => {
-  const HOMEBOARD: OneCliCredential = { ...CALENDAR, name: 'HomeBoard', hostPattern: 'homeboard.nownow.ai' };
+  const LEDGERLY: OneCliCredential = { ...CALENDAR, name: 'Ledgerly', hostPattern: 'app.ledgerly.example.test' };
   // An app's entry is limited to its server's path; it is still on that host.
-  const app = (id: string) => ({ ...row(id, { ...HOMEBOARD, name: `gws-ea-app-${id}` }), pathPattern: '/mcp' });
+  const app = (id: string) => ({ ...row(id, { ...LEDGERLY, name: `gws-ea-app-${id}` }), pathPattern: '/mcp' });
 
   it('lists only the entries on exactly that host, and removing them by id leaves the rest', async () => {
     const rows = [
       app('a1'),
       row('calendar'),
-      row('operator', HOMEBOARD),
-      row('wildcard', { ...HOMEBOARD, name: 'Wildcard', hostPattern: '*.nownow.ai' }),
+      row('operator', LEDGERLY),
+      row('wildcard', { ...LEDGERLY, name: 'Wildcard', hostPattern: '*.ledgerly.example.test' }),
     ];
     const v = vault(rows);
     const settings = management(v, 'oc_key');
 
-    const listed = await listOneCliCredentialsForHost('homeboard.nownow.ai', settings);
+    const listed = await listOneCliCredentialsForHost('app.ledgerly.example.test', settings);
     expect(listed).toEqual([
       { id: 'a1', name: 'gws-ea-app-a1' },
-      { id: 'operator', name: 'HomeBoard' },
+      { id: 'operator', name: 'Ledgerly' },
     ]);
     expect(
       await removeOneCliCredentialsById(
@@ -232,22 +232,27 @@ describe("OneCLI's credentials on one host", () => {
   });
 
   it('matches a host whatever its letter case, as DNS does', async () => {
-    const v = vault([row('operator', { ...HOMEBOARD, hostPattern: 'HomeBoard.NowNow.ai' })]);
-    expect(await listOneCliCredentialsForHost('homeboard.nownow.ai', management(v, 'k'))).toEqual([
-      { id: 'operator', name: 'HomeBoard' },
+    const v = vault([row('operator', { ...LEDGERLY, hostPattern: 'App.Ledgerly.Example.Test' })]);
+    expect(await listOneCliCredentialsForHost('app.ledgerly.example.test', management(v, 'k'))).toEqual([
+      { id: 'operator', name: 'Ledgerly' },
     ]);
   });
 
   it('refuses a host that is not one exact DNS name', async () => {
-    const v = vault([row('operator', HOMEBOARD)]);
-    for (const host of ['*.nownow.ai', 'homeboard.nownow.ai/mcp', 'https://homeboard.nownow.ai', '']) {
+    const v = vault([row('operator', LEDGERLY)]);
+    for (const host of [
+      '*.ledgerly.example.test',
+      'app.ledgerly.example.test/mcp',
+      'https://app.ledgerly.example.test',
+      '',
+    ]) {
       await expect(listOneCliCredentialsForHost(host, management(v, 'k')), host).rejects.toThrow(/exact host/);
     }
     expect(v.calls).toEqual([]);
   });
 
   it('reports a delete that fails as failed, and still removes the others', async () => {
-    const rows = [app('a1'), row('operator', HOMEBOARD), app('a2')];
+    const rows = [app('a1'), row('operator', LEDGERLY), app('a2')];
     const v = vault(rows, (method, url) =>
       method === 'DELETE' && url.endsWith('/operator')
         ? new Response('{"valuePreview":"hb-leaked"}', { status: 500 })
@@ -263,10 +268,10 @@ describe("OneCLI's credentials on one host", () => {
   });
 
   it('reports an id that disappeared since it was listed as gone, deleting nothing for it', async () => {
-    const rows = [app('a1'), row('operator', HOMEBOARD)];
+    const rows = [app('a1'), row('operator', LEDGERLY)];
     const v = vault(rows);
     const settings = management(v, 'k');
-    const listed = await listOneCliCredentialsForHost('homeboard.nownow.ai', settings);
+    const listed = await listOneCliCredentialsForHost('app.ledgerly.example.test', settings);
     rows.splice(1, 1);
 
     expect(
@@ -294,7 +299,7 @@ describe("OneCLI's credentials on one host", () => {
       method === 'GET' ? new Response('hb-leaked-preview', { status: 500 }) : undefined,
     );
     for (const attempt of [
-      listOneCliCredentialsForHost('homeboard.nownow.ai', management(v, 'oc_key')),
+      listOneCliCredentialsForHost('app.ledgerly.example.test', management(v, 'oc_key')),
       removeOneCliCredentialsById(['a1'], management(v, 'oc_key')),
     ]) {
       const error = String(await attempt.catch((caught: unknown) => caught));

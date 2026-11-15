@@ -267,7 +267,7 @@ describe('a note that cannot be delivered', () => {
     const operatorKey = 'sentinel-operator-key-R5k1';
     await getDb().run(
       'UPDATE container_configs SET mcp_servers = ? WHERE agent_group_id = ?',
-      `{"homeboard": {"url": "https://homeboard.example.test/mcp?key=${operatorKey}"`,
+      `{"ledgerly": {"url": "https://app2.ledgerly.example.test/mcp?key=${operatorKey}"`,
       MAIN,
     );
 

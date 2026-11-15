@@ -40,7 +40,7 @@ import { testConnectionsStore } from './testing/store.js';
 
 const HOST = 'juno.example.test';
 const PRINCIPAL = 'gchat:users/morgan';
-const HOMEBOARD = 'https://homeboard.nownow.ai/mcp';
+const LEDGERLY = 'https://app.ledgerly.example.test/mcp';
 const RECIPES = 'https://recipes.example.test/mcp';
 const BOOKS = 'https://bücher.example.test/mcp';
 const BOOKS_HOST = 'xn--bcher-kva.example.test';
@@ -54,15 +54,15 @@ function openServer(host: string, name: string): FakeHandler {
       : undefined;
 }
 
-/** HomeBoard as it publishes itself: OAuth on its own authorization server, a client registered by hand. */
-function homeBoard(): FakeMcpApp {
+/** Ledgerly as it publishes itself: OAuth on its own authorization server, a client registered by hand. */
+function ledgerly(): FakeMcpApp {
   return new FakeMcpApp({
-    appUrl: HOMEBOARD,
+    appUrl: LEDGERLY,
     issuer: 'https://auth.example.test',
     client: {
-      id: 'juno-homeboard',
+      id: 'juno-ledgerly',
       secret: SENTINEL_SECRET,
-      redirectUri: `https://${HOST}/connections/callback/homeboard.nownow.ai`,
+      redirectUri: `https://${HOST}/connections/callback/app.ledgerly.example.test`,
     },
   });
 }
@@ -93,7 +93,7 @@ let cards: { title: string; question: string }[];
 
 beforeAll(async () => {
   endpoints = await startFakeEndpoints([
-    'homeboard.nownow.ai',
+    'app.ledgerly.example.test',
     'auth.example.test',
     'recipes.example.test',
     BOOKS_HOST,
@@ -130,7 +130,7 @@ afterAll(async () => {
 beforeEach(async () => {
   endpoints.reset();
   for (const handler of [
-    homeBoard().handle,
+    ledgerly().handle,
     openServer('recipes.example.test', 'Recipes'),
     openServer(BOOKS_HOST, 'Books'),
   ])
@@ -211,8 +211,8 @@ function everything(): string {
 }
 
 describe('add_app', () => {
-  it("holds HomeBoard for the principal's card, then lists it Not connected and asks main to send the link", async () => {
-    const { answer } = await send(ADD_APP_ACTION, { url: HOMEBOARD, name: 'HomeBoard' });
+  it("holds Ledgerly for the principal's card, then lists it Not connected and asks main to send the link", async () => {
+    const { answer } = await send(ADD_APP_ACTION, { url: LEDGERLY, name: 'Ledgerly' });
 
     expect(answer).toMatchObject({ ok: true, data: { status: 'awaiting_principal' } });
     expect(await store.apps()).toEqual([]);
@@ -221,9 +221,9 @@ describe('add_app', () => {
       {
         title: 'Add this app?',
         question: [
-          "I'd like to add an app at homeboard.nownow.ai.",
+          "I'd like to add an app at app.ledgerly.example.test.",
           'You would sign in at auth.example.test.',
-          'The name I gave it: "HomeBoard"',
+          'The name I gave it: "Ledgerly"',
           "Your operator hasn't reviewed this server, and I'll send it information when I use it.",
         ].join('\n'),
       },
@@ -234,8 +234,8 @@ describe('add_app', () => {
     const [app, ...others] = await store.apps();
     expect(others).toEqual([]);
     expect(app).toMatchObject({
-      name: 'HomeBoard',
-      host: 'homeboard.nownow.ai',
+      name: 'Ledgerly',
+      host: 'app.ledgerly.example.test',
       status: 'not_connected',
       auth: 'oauth',
     });
@@ -272,11 +272,11 @@ describe('add_app', () => {
   });
 
   it('refuses a credential in the address or beside it, or a host an operator server uses, before any card exists', async () => {
-    await updateContainerConfigJson(MAIN, 'mcp_servers', { homeboard: { type: 'http', url: HOMEBOARD } });
+    await updateContainerConfigJson(MAIN, 'mcp_servers', { ledgerly: { type: 'http', url: LEDGERLY } });
 
     const inUrl = await send(ADD_APP_ACTION, { url: `${RECIPES}?api_key=sentinel-url-key-Z1`, name: 'Recipes' });
     const beside = await send(ADD_APP_ACTION, { url: RECIPES, name: 'Recipes', clientSecret: SENTINEL_SECRET });
-    const operatorHost = await send(ADD_APP_ACTION, { url: HOMEBOARD, name: 'HomeBoard' });
+    const operatorHost = await send(ADD_APP_ACTION, { url: LEDGERLY, name: 'Ledgerly' });
 
     expect(inUrl.answer).toMatchObject({ ok: false, error: { message: expect.stringContaining('query') } });
     expect(beside.answer).toMatchObject({ ok: false, error: { code: 'invalid-args' } });
@@ -354,10 +354,10 @@ describe('add_app', () => {
 
 describe('delete_app', () => {
   it("refuses an operator's server before any card exists", async () => {
-    await updateContainerConfigJson(MAIN, 'mcp_servers', { homeboard: { type: 'http', url: HOMEBOARD } });
+    await updateContainerConfigJson(MAIN, 'mcp_servers', { ledgerly: { type: 'http', url: LEDGERLY } });
 
     const { answer } = await send(DELETE_APP_ACTION, { app: 'app_000000000000' });
-    const operator = await send(DELETE_APP_ACTION, { app: 'homeboard' });
+    const operator = await send(DELETE_APP_ACTION, { app: 'ledgerly' });
 
     expect(answer).toMatchObject({ ok: false, error: { message: expect.stringContaining('No app the principal') } });
     expect(operator.answer).toMatchObject({ ok: false, error: { message: expect.stringContaining("operator's") } });
@@ -394,7 +394,7 @@ describe("main's self-modification path", () => {
     const run = getDeliveryAction('add_mcp_server');
     if (!run) throw new Error('add_mcp_server is not registered');
 
-    await run({ action: 'add_mcp_server', name: 'homeboard', url: HOMEBOARD }, session);
+    await run({ action: 'add_mcp_server', name: 'ledgerly', url: LEDGERLY }, session);
 
     expect(await getPendingApprovalsByAction('add_mcp_server')).toEqual([]);
     expect(cards).toEqual([]);

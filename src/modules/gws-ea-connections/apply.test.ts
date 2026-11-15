@@ -35,7 +35,7 @@ beforeEach(async () => {
     "UPDATE gws_ea_profile SET assistant_first_name = 'Juno', principal_first_name = 'Morgan', main_agent_group_id = ? WHERE singleton = 1",
     MAIN,
   );
-  await storeServers({ homeboard: OPERATOR, calendar: STDIO, travel: PLUGIN });
+  await storeServers({ ledgerly: OPERATOR, calendar: STDIO, travel: PLUGIN });
 });
 afterEach(async () => {
   await closeDb();
@@ -64,7 +64,7 @@ describe('applyMainServers', () => {
     expect(await applyMainServers(store)).toBe(true);
 
     expect(await mainServers()).toEqual({
-      homeboard: OPERATOR,
+      ledgerly: OPERATOR,
       calendar: STDIO,
       travel: PLUGIN,
       [ledger.serverKey]: { type: 'http', url: 'https://mcp.ledger.example.test/mcp' },
@@ -108,7 +108,7 @@ describe('applyMainServers', () => {
     expect(await applyMainServers(store)).toBe(true);
 
     expect(await mainServers()).toEqual({
-      homeboard: OPERATOR,
+      ledgerly: OPERATOR,
       calendar: STDIO,
       travel: PLUGIN,
       app_travelkit: PLUGIN,
@@ -130,7 +130,7 @@ describe('applyMainServers', () => {
     await getDb().run('UPDATE gws_ea_profile SET main_agent_group_id = NULL WHERE singleton = 1');
 
     expect(await applyMainServers(store)).toBe(false);
-    expect(await mainServers()).toEqual({ homeboard: OPERATOR, calendar: STDIO, travel: PLUGIN });
+    expect(await mainServers()).toEqual({ ledgerly: OPERATOR, calendar: STDIO, travel: PLUGIN });
   });
 });
 
@@ -139,7 +139,7 @@ describe('operator servers', () => {
     await connectedApp('Ledger', 'https://mcp.ledger.example.test/mcp');
     await applyMainServers(store);
 
-    expect(await mainOperatorServers()).toEqual([{ key: 'homeboard', url: 'https://tasks.example.test/mcp' }]);
+    expect(await mainOperatorServers()).toEqual([{ key: 'ledgerly', url: 'https://tasks.example.test/mcp' }]);
   });
 
   it('removes one operator server, keeps the rest and requests a restart', async () => {
@@ -148,7 +148,7 @@ describe('operator servers', () => {
     const requested = await store.pendingRestart();
     if (requested) await store.clearRestart(requested);
 
-    expect(await removeOperatorServer(store, 'homeboard')).toBe('removed');
+    expect(await removeOperatorServer(store, 'ledgerly')).toBe('removed');
 
     expect(await mainServers()).toEqual({
       calendar: STDIO,
@@ -156,7 +156,7 @@ describe('operator servers', () => {
       [ledger.serverKey]: { type: 'http', url: 'https://mcp.ledger.example.test/mcp' },
     });
     expect(await store.pendingRestart()).toBeDefined();
-    expect(await removeOperatorServer(store, 'homeboard')).toBe('absent');
+    expect(await removeOperatorServer(store, 'ledgerly')).toBe('absent');
   });
 
   it('refuses an app’s, a plugin’s or a stdio entry', async () => {

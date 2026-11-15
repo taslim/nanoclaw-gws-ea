@@ -101,9 +101,9 @@ describe('admitAppUrl', () => {
   });
 
   it('refuses the host of an operator http entry', async () => {
-    operators = [{ key: 'homeboard', url: 'https://homeboard.nownow.ai/mcp' }];
-    expect(await refusal('https://homeboard.nownow.ai/mcp')).toBe('host_in_use');
-    expect(await refusal('https://homeboard.nownow.ai/other')).toBe('host_in_use');
+    operators = [{ key: 'ledgerly', url: 'https://app.ledgerly.example.test/mcp' }];
+    expect(await refusal('https://app.ledgerly.example.test/mcp')).toBe('host_in_use');
+    expect(await refusal('https://app.ledgerly.example.test/other')).toBe('host_in_use');
   });
 
   it('refuses a host another app holds but lets that app check its own', async () => {

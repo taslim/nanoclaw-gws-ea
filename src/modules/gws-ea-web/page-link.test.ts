@@ -32,7 +32,7 @@ import { PRINCIPAL_PAGE_ACTION, PRINCIPAL_PAGES_CAPABILITY, registerPrincipalPag
 import type { WebPolicyFile } from './policy.js';
 import { WebRuntime } from './runtime.js';
 
-const FACTS = { apps: [{ name: 'HomeBoard', key: 'homeboard', status: 'needs_reconnecting' }] };
+const FACTS = { apps: [{ name: 'Ledgerly', key: 'ledgerly', status: 'needs_reconnecting' }] };
 // A main-only page with link facts, as the connections page registers itself.
 registerWebMount({
   name: 'connections',
@@ -188,7 +188,7 @@ it('answers a page that is not registered, or any other field, as invalid argume
   for (const fields of [
     {},
     { page: 'settings' },
-    { page: 'connections/callback/homeboard.example.test' },
+    { page: 'connections/callback/app2.ledgerly.example.test' },
     { page: 7 },
     { page: 'logins', url: 'https://foreign.example/logins' },
   ])

@@ -47,7 +47,7 @@ const { MEMORY_SESSION_HOOK } = await import('../memory/session-hook.js');
 const { MCP_NEEDS_AUTH_CACHE } = await import('./claude-mcp-auth.js');
 
 const APP = 'app_0a1b2c3d4e5f';
-const OPERATOR = 'homeboard';
+const OPERATOR = 'ledgerly';
 
 /** A host-managed server whose credential is gone: every MCP request is refused, sign-in is advertised. */
 const appRequests: string[] = [];

@@ -79,7 +79,7 @@ beforeEach(async () => {
     MAIN,
   );
   await updateContainerConfigJson(MAIN, 'mcp_servers', {
-    homeboard: { type: 'http', url: `https://homeboard.nownow.ai/mcp?key=${OPERATOR_KEY}` },
+    ledgerly: { type: 'http', url: `https://app.ledgerly.example.test/mcp?key=${OPERATOR_KEY}` },
     calendar: { command: 'calendar-mcp', args: ['--readonly'] },
     travel: { type: 'http', url: 'https://plugin.example.test/mcp', plugin: 'travel-kit' },
     broken: { type: 'http', url: 'not a url' },
@@ -112,7 +112,7 @@ describe('connectionsHealth', () => {
         { name: 'Ledger', host: 'mcp.ledger.example.test', origin: 'principal', status: 'connected' },
         { name: 'Notes', host: 'notes.example.test', origin: 'principal', status: 'needs_reconnecting' },
         { name: 'Recipes', host: 'recipes.example.test', origin: 'principal', status: 'not_connected' },
-        { name: 'homeboard', host: 'homeboard.nownow.ai', origin: 'operator', status: 'connected' },
+        { name: 'ledgerly', host: 'app.ledgerly.example.test', origin: 'operator', status: 'connected' },
       ],
     });
     const text = JSON.stringify(health);
@@ -138,7 +138,7 @@ describe('connectionsHealth', () => {
     expect(health.store).toEqual({ available: false, reason });
     expect(health.apps.map(({ name, status }) => [name, status])).toEqual([
       ['Ledger', 'connected'],
-      ['homeboard', 'connected'],
+      ['ledgerly', 'connected'],
     ]);
   });
 
@@ -150,7 +150,7 @@ describe('connectionsHealth', () => {
     expect(health).toEqual({
       schemaVersion: 1,
       store: { available: false, reason: 'keychain_unavailable' },
-      apps: [{ name: 'homeboard', host: 'homeboard.nownow.ai', origin: 'operator', status: 'connected' }],
+      apps: [{ name: 'ledgerly', host: 'app.ledgerly.example.test', origin: 'operator', status: 'connected' }],
     });
   });
 });

@@ -33,7 +33,7 @@ it('asks the host for one named page and sends no other field', async () => {
   for (const fields of [
     {},
     { page: 'settings' },
-    { page: 'connections/callback/homeboard.example.test' },
+    { page: 'connections/callback/app2.ledgerly.example.test' },
     { page: 'logins', url: 'https://foreign.example/logins' },
     { page: 'connections', token: 'secret' },
   ])

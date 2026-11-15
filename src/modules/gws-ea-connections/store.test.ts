@@ -6,7 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ConnectionsStoreError, SIGN_IN_TTL_MS, type ConnectionApp, type ConnectionsStore } from './store.js';
 import { testConnectionsStore, type TestKeychain } from './testing/store.js';
 
-const HOMEBOARD = { name: 'HomeBoard', url: 'https://homeboard.nownow.ai/mcp', auth: 'token' } as const;
+const LEDGERLY = { name: 'Ledgerly', url: 'https://app.ledgerly.example.test/mcp', auth: 'token' } as const;
 const ISSUER = 'https://auth.ledger.example/';
 const LEDGER = { name: 'Ledger', url: 'https://mcp.ledger.example/mcp', auth: 'oauth', issuer: ISSUER } as const;
 const PRINCIPAL = 'gchat:users/morgan-ellery';
@@ -64,11 +64,11 @@ async function connectedOauth(): Promise<{ app: ConnectionApp; state: string }> 
 
 describe('apps', () => {
   it('adds an app Not connected with a fixed server key that a rename keeps', async () => {
-    const app = await store.create(HOMEBOARD);
+    const app = await store.create(LEDGERLY);
     expect(app).toMatchObject({
-      name: 'HomeBoard',
-      url: 'https://homeboard.nownow.ai/mcp',
-      host: 'homeboard.nownow.ai',
+      name: 'Ledgerly',
+      url: 'https://app.ledgerly.example.test/mcp',
+      host: 'app.ledgerly.example.test',
       auth: 'token',
       issuer: null,
       hasClient: false,
@@ -82,28 +82,28 @@ describe('apps', () => {
   });
 
   it('refuses a name that differs only by case, and a host another app uses', async () => {
-    const existing = await store.create({ ...HOMEBOARD, name: 'homeboard' });
-    await expect(store.create({ ...HOMEBOARD, url: 'https://boards.example.test/mcp' })).rejects.toMatchObject({
+    const existing = await store.create({ ...LEDGERLY, name: 'ledgerly' });
+    await expect(store.create({ ...LEDGERLY, url: 'https://boards.example.test/mcp' })).rejects.toMatchObject({
       reason: 'duplicate_name',
     });
     await expect(
-      store.create({ ...HOMEBOARD, name: 'Boards', url: 'https://HomeBoard.NowNow.ai/other' }),
+      store.create({ ...LEDGERLY, name: 'Boards', url: 'https://App.Ledgerly.Example.Test/other' }),
     ).rejects.toMatchObject({ reason: 'duplicate_host' });
     const other = await store.create(LEDGER);
-    await expect(store.rename(other.id, other.version, 'HOMEBOARD')).rejects.toMatchObject({
+    await expect(store.rename(other.id, other.version, 'LEDGERLY')).rejects.toMatchObject({
       reason: 'duplicate_name',
     });
-    expect(await store.rename(existing.id, existing.version, 'HomeBoard')).toMatchObject({ name: 'HomeBoard' });
-    expect((await store.apps()).map(({ name }) => name)).toEqual(['HomeBoard', 'Ledger']);
+    expect(await store.rename(existing.id, existing.version, 'Ledgerly')).toMatchObject({ name: 'Ledgerly' });
+    expect((await store.apps()).map(({ name }) => name)).toEqual(['Ledger', 'Ledgerly']);
   });
 
   it.each([
-    'http://homeboard.nownow.ai/mcp',
-    'https://juno:pass@homeboard.nownow.ai/mcp',
-    'https://juno@homeboard.nownow.ai/mcp',
+    'http://app.ledgerly.example.test/mcp',
+    'https://juno:pass@app.ledgerly.example.test/mcp',
+    'https://juno@app.ledgerly.example.test/mcp',
     'not a url',
   ])('refuses %s and stores nothing', async (url) => {
-    await expect(store.create({ ...HOMEBOARD, url })).rejects.toMatchObject({ reason: 'invalid_details' });
+    await expect(store.create({ ...LEDGERLY, url })).rejects.toMatchObject({ reason: 'invalid_details' });
     expect(await store.apps()).toEqual([]);
   });
 
@@ -135,7 +135,7 @@ describe('apps', () => {
   });
 
   it('keeps the file owner-only and serves the same apps, grants and restart request after a host restart', async () => {
-    const app = await store.create(HOMEBOARD);
+    const app = await store.create(LEDGERLY);
     const connected = await store.connect(app.id, app.version, { kind: 'token', token: SENTINELS.token });
     await store.requestRestart('2026-11-14T10:00:00.000Z');
     expect((await stat(path.join(root, 'apps.db'))).mode & 0o777).toBe(0o600);
@@ -155,7 +155,7 @@ describe('apps', () => {
 
 describe('grants', () => {
   it('moves through Connected, Needs reconnecting and Not connected with increasing generations', async () => {
-    const app = await store.create(HOMEBOARD);
+    const app = await store.create(LEDGERLY);
     const first = await store.connect(app.id, app.version, { kind: 'token', token: SENTINELS.token });
     expect(first).toMatchObject({ generation: 1, replaced: undefined, app: { status: 'connected', version: 2 } });
     expect(await store.currentGrant(app.id)).toEqual({
@@ -189,10 +189,10 @@ describe('grants', () => {
   });
 
   it('lists only refused grants, at their generation, without Keychain', async () => {
-    const refused = await store.create(HOMEBOARD);
-    const live = await store.create({ ...HOMEBOARD, name: 'Notes', url: 'https://notes.example/mcp' });
-    const ended = await store.create({ ...HOMEBOARD, name: 'Recipes', url: 'https://recipes.example/mcp' });
-    await store.create({ ...HOMEBOARD, name: 'Unconnected', url: 'https://unconnected.example/mcp' });
+    const refused = await store.create(LEDGERLY);
+    const live = await store.create({ ...LEDGERLY, name: 'Notes', url: 'https://notes.example/mcp' });
+    const ended = await store.create({ ...LEDGERLY, name: 'Recipes', url: 'https://recipes.example/mcp' });
+    await store.create({ ...LEDGERLY, name: 'Unconnected', url: 'https://unconnected.example/mcp' });
     for (const app of [refused, live, ended])
       await store.connect(app.id, app.version, { kind: 'token', token: SENTINELS.token });
     // A reconnected grant that broke again is owed at its new generation.
@@ -297,7 +297,7 @@ describe('grants', () => {
   });
 
   it('connects a server without sign-in with no Keychain key', async () => {
-    const app = await store.create({ ...HOMEBOARD, auth: 'none' });
+    const app = await store.create({ ...LEDGERLY, auth: 'none' });
     expect(await store.connect(app.id, app.version, { kind: 'none' })).toMatchObject({
       generation: 1,
       app: { status: 'connected' },
@@ -335,7 +335,7 @@ describe('grants', () => {
   it('keeps client secrets, tokens and verifiers unreadable in the raw file', async () => {
     const { app } = await connectedOauth();
     await store.startSignIn(app.id, app.version, signIn(app));
-    const token = await store.create(HOMEBOARD);
+    const token = await store.create(LEDGERLY);
     await store.connect(token.id, token.version, { kind: 'token', token: SENTINELS.token });
     const file = await readFile(path.join(root, 'apps.db'));
     for (const sentinel of [
@@ -371,10 +371,12 @@ describe('sign-ins', () => {
 
   it("answers another principal's or another app's claim with nothing and leaves the row usable", async () => {
     const app = await store.create(LEDGER);
-    await store.create(HOMEBOARD);
+    await store.create(LEDGERLY);
     const { state } = await store.startSignIn(app.id, app.version, signIn(app));
     expect(await store.claimSignIn(state, { host: app.host, principalId: 'gchat:users/juno-hale' })).toBeUndefined();
-    expect(await store.claimSignIn(state, { host: 'homeboard.nownow.ai', principalId: PRINCIPAL })).toBeUndefined();
+    expect(
+      await store.claimSignIn(state, { host: 'app.ledgerly.example.test', principalId: PRINCIPAL }),
+    ).toBeUndefined();
     expect(await store.claimSignIn('unknown-state', { host: app.host, principalId: PRINCIPAL })).toBeUndefined();
     expect(await store.claimSignIn(state, { host: app.host, principalId: PRINCIPAL })).toMatchObject({ appId: app.id });
   });
@@ -392,7 +394,7 @@ describe('sign-ins', () => {
     vi.useFakeTimers({ toFake: ['Date'] });
     vi.setSystemTime(new Date('2026-11-14T10:00:00.000Z'));
     const ledger = await store.create(LEDGER);
-    const home = await store.create({ ...HOMEBOARD, auth: 'oauth', issuer: ISSUER });
+    const home = await store.create({ ...LEDGERLY, auth: 'oauth', issuer: ISSUER });
     const old = await store.startSignIn(ledger.id, ledger.version, signIn(ledger));
     vi.setSystemTime(new Date('2026-11-14T10:05:00.000Z'));
     const recent = await store.startSignIn(home.id, home.version, signIn(home));
@@ -454,7 +456,7 @@ describe('restart request', () => {
 
 describe('availability', () => {
   it('reports a missing key while secrets exist, and never creates a replacement', async () => {
-    const app = await store.create(HOMEBOARD);
+    const app = await store.create(LEDGERLY);
     await store.connect(app.id, app.version, { kind: 'token', token: SENTINELS.token });
     keychain.key = undefined;
     keychain.calls.length = 0;
@@ -481,7 +483,7 @@ describe('availability', () => {
   });
 
   it('reports a different key as a mismatch and an unreachable Keychain as unavailable', async () => {
-    const app = await store.create(HOMEBOARD);
+    const app = await store.create(LEDGERLY);
     await store.connect(app.id, app.version, { kind: 'token', token: SENTINELS.token });
     keychain.key = 'ab'.repeat(32);
     expect(await store.availability()).toEqual({ available: false, reason: 'key_mismatch' });
@@ -491,7 +493,7 @@ describe('availability', () => {
   });
 
   it('uses the connections Keychain service under this assistant', async () => {
-    const app = await store.create(HOMEBOARD);
+    const app = await store.create(LEDGERLY);
     await store.connect(app.id, app.version, { kind: 'token', token: SENTINELS.token });
     expect(keychain.calls[0]?.args.slice(0, 5)).toEqual([
       'find-generic-password',

@@ -39,7 +39,7 @@ import { testConnectionsStore } from './testing/store.js';
 const MAIN = 'ag-main';
 const ASSISTANT = 'juno.example.test';
 const PRINCIPAL = 'gchat:users/morgan-ellery';
-const HOMEBOARD = 'https://homeboard.nownow.ai/mcp';
+const LEDGERLY = 'https://app.ledgerly.example.test/mcp';
 const LEDGER = 'https://mcp.ledger.example.test/mcp';
 const NOTES = 'https://notes.example.test/mcp';
 const CLIENT_SECRET = 'sentinel-client-secret-7Hk2';
@@ -180,7 +180,7 @@ function dependencies(overrides: Partial<ConnectionsRefresherDependencies> = {})
 }
 
 beforeAll(async () => {
-  endpoints = await startFakeEndpoints(['homeboard.nownow.ai', 'mcp.ledger.example.test', 'notes.example.test']);
+  endpoints = await startFakeEndpoints(['app.ledgerly.example.test', 'mcp.ledger.example.test', 'notes.example.test']);
 });
 afterAll(async () => {
   await endpoints.close();
@@ -291,9 +291,9 @@ async function mainServers(): Promise<Record<string, unknown>> {
 
 describe('renewal timing', () => {
   it('renews and publishes a token ten minutes from expiry and skips one forty minutes away', async () => {
-    const homeTokens = serveApp(HOMEBOARD);
+    const homeTokens = serveApp(LEDGERLY);
     const ledgerTokens = serveApp(LEDGER);
-    const home = await publishedOAuthApp('HomeBoard', HOMEBOARD, {
+    const home = await publishedOAuthApp('Ledgerly', LEDGERLY, {
       refreshToken: 'sentinel-refresh-home',
       issuedAt: START - 50 * MINUTE,
       expiresAt: START + 10 * MINUTE,
@@ -317,9 +317,9 @@ describe('renewal timing', () => {
   });
 
   it('renews a five-minute token at about half its lifetime, not on every tick', async () => {
-    const tokens = serveApp(HOMEBOARD);
+    const tokens = serveApp(LEDGERLY);
     tokens.expiresIn = 300;
-    const app = await publishedOAuthApp('HomeBoard', HOMEBOARD, {
+    const app = await publishedOAuthApp('Ledgerly', LEDGERLY, {
       refreshToken: 'sentinel-refresh-home',
       issuedAt: START,
       expiresAt: START + 5 * MINUTE,
@@ -340,9 +340,9 @@ describe('renewal timing', () => {
   });
 
   it('renews a token issued without expires_in after about 45 minutes', async () => {
-    const tokens = serveApp(HOMEBOARD);
+    const tokens = serveApp(LEDGERLY);
     tokens.expiresIn = undefined;
-    const app = await publishedOAuthApp('HomeBoard', HOMEBOARD, {
+    const app = await publishedOAuthApp('Ledgerly', LEDGERLY, {
       refreshToken: 'sentinel-refresh-home',
       issuedAt: START - 59 * MINUTE,
       expiresAt: START + MINUTE,
@@ -364,9 +364,9 @@ describe('renewal timing', () => {
   });
 
   it('keeps a short-lived grant working across several expiries', async () => {
-    const tokens = serveApp(HOMEBOARD);
+    const tokens = serveApp(LEDGERLY);
     tokens.expiresIn = 120;
-    const app = await publishedOAuthApp('HomeBoard', HOMEBOARD, {
+    const app = await publishedOAuthApp('Ledgerly', LEDGERLY, {
       refreshToken: 'sentinel-refresh-home',
       issuedAt: START,
       expiresAt: START + 2 * MINUTE,
@@ -386,8 +386,8 @@ describe('renewal timing', () => {
 
 describe('durable rotation', () => {
   it('stores the rotated refresh token before the access token is published', async () => {
-    serveApp(HOMEBOARD);
-    const app = await publishedOAuthApp('HomeBoard', HOMEBOARD, {
+    serveApp(LEDGERLY);
+    const app = await publishedOAuthApp('Ledgerly', LEDGERLY, {
       refreshToken: 'sentinel-refresh-home',
       issuedAt: START - 55 * MINUTE,
       expiresAt: START + 5 * MINUTE,
@@ -405,8 +405,8 @@ describe('durable rotation', () => {
   });
 
   it('publishes nothing when the rotation cannot be stored', async () => {
-    serveApp(HOMEBOARD);
-    const app = await publishedOAuthApp('HomeBoard', HOMEBOARD, {
+    serveApp(LEDGERLY);
+    const app = await publishedOAuthApp('Ledgerly', LEDGERLY, {
       refreshToken: 'sentinel-refresh-home',
       issuedAt: START - 55 * MINUTE,
       expiresAt: START + 5 * MINUTE,
@@ -425,8 +425,8 @@ describe('durable rotation', () => {
   });
 
   it('publishes a stored renewal the gateway missed on the next tick without renewing again', async () => {
-    const tokens = serveApp(HOMEBOARD);
-    const app = await publishedOAuthApp('HomeBoard', HOMEBOARD, {
+    const tokens = serveApp(LEDGERLY);
+    const app = await publishedOAuthApp('Ledgerly', LEDGERLY, {
       refreshToken: 'sentinel-refresh-home',
       issuedAt: START - 55 * MINUTE,
       expiresAt: START + 5 * MINUTE,
@@ -445,8 +445,8 @@ describe('durable rotation', () => {
   });
 
   it('renews and publishes after a host restart a renewal whose publish failed, though the gateway lists the old credential', async () => {
-    const tokens = serveApp(HOMEBOARD);
-    const app = await publishedOAuthApp('HomeBoard', HOMEBOARD, {
+    const tokens = serveApp(LEDGERLY);
+    const app = await publishedOAuthApp('Ledgerly', LEDGERLY, {
       refreshToken: 'sentinel-refresh-home',
       issuedAt: START - 55 * MINUTE,
       expiresAt: START + 5 * MINUTE,
@@ -472,9 +472,9 @@ describe('durable rotation', () => {
   });
 
   it('ends a grant without a refresh token whose credential a crash left unpublished', async () => {
-    serveApp(HOMEBOARD);
+    serveApp(LEDGERLY);
     // A crash between the stored sign-in and its publish leaves an earlier grant's credential in the gateway.
-    const app = await oauthApp('HomeBoard', HOMEBOARD, { issuedAt: START, expiresAt: START + 60 * MINUTE });
+    const app = await oauthApp('Ledgerly', LEDGERLY, { issuedAt: START, expiresAt: START + 60 * MINUTE });
     gateway.put(appCredentialName(app.id), app.host, 'sentinel-access-before-reconnect');
 
     await createConnectionsRefresher(dependencies()).tick();
@@ -486,8 +486,8 @@ describe('durable rotation', () => {
   });
 
   it('renews a grant whose credential the gateway lost', async () => {
-    const tokens = serveApp(HOMEBOARD);
-    const app = await oauthApp('HomeBoard', HOMEBOARD, {
+    const tokens = serveApp(LEDGERLY);
+    const app = await oauthApp('Ledgerly', LEDGERLY, {
       refreshToken: 'sentinel-refresh-home',
       issuedAt: START,
       expiresAt: START + 60 * MINUTE,
@@ -537,8 +537,8 @@ describe('pasted tokens', () => {
 
 describe('refusals', () => {
   it('ends a grant the server keeps refusing once, and drops it from main once', async () => {
-    const tokens = serveApp(HOMEBOARD);
-    const app = await publishedOAuthApp('HomeBoard', HOMEBOARD, {
+    const tokens = serveApp(LEDGERLY);
+    const app = await publishedOAuthApp('Ledgerly', LEDGERLY, {
       refreshToken: 'sentinel-refresh-home',
       issuedAt: START - 55 * MINUTE,
       expiresAt: START + 5 * MINUTE,
@@ -566,8 +566,8 @@ describe('refusals', () => {
   });
 
   it('ends a grant whose client the server refuses', async () => {
-    const tokens = serveApp(HOMEBOARD);
-    const app = await publishedOAuthApp('HomeBoard', HOMEBOARD, {
+    const tokens = serveApp(LEDGERLY);
+    const app = await publishedOAuthApp('Ledgerly', LEDGERLY, {
       refreshToken: 'sentinel-refresh-home',
       issuedAt: START - 55 * MINUTE,
       expiresAt: START + 5 * MINUTE,
@@ -581,8 +581,8 @@ describe('refusals', () => {
   });
 
   it('keeps the grant live and Connected through a 503', async () => {
-    const tokens = serveApp(HOMEBOARD);
-    const app = await publishedOAuthApp('HomeBoard', HOMEBOARD, {
+    const tokens = serveApp(LEDGERLY);
+    const app = await publishedOAuthApp('Ledgerly', LEDGERLY, {
       refreshToken: 'sentinel-refresh-home',
       issuedAt: START - 55 * MINUTE,
       expiresAt: START + 5 * MINUTE,
@@ -603,8 +603,8 @@ describe('refusals', () => {
   });
 
   it('marks a grant without a refresh token Needs reconnecting once its access lapses', async () => {
-    serveApp(HOMEBOARD);
-    const app = await publishedOAuthApp('HomeBoard', HOMEBOARD, {
+    serveApp(LEDGERLY);
+    const app = await publishedOAuthApp('Ledgerly', LEDGERLY, {
       issuedAt: START - 50 * MINUTE,
       expiresAt: START + 10 * MINUTE,
     });
@@ -625,8 +625,8 @@ describe('refusals', () => {
 
 describe('locks and drift', () => {
   it('discards a renewal that waited behind a disconnect and publishes nothing', async () => {
-    const tokens = serveApp(HOMEBOARD);
-    const app = await publishedOAuthApp('HomeBoard', HOMEBOARD, {
+    const tokens = serveApp(LEDGERLY);
+    const app = await publishedOAuthApp('Ledgerly', LEDGERLY, {
       refreshToken: 'sentinel-refresh-home',
       issuedAt: START - 55 * MINUTE,
       expiresAt: START + 5 * MINUTE,
@@ -671,10 +671,10 @@ describe('locks and drift', () => {
   });
 
   it('keeps a grant without a refresh token whose sign-in published after the tick began', async () => {
-    serveApp(HOMEBOARD);
-    const host = new URL(HOMEBOARD).hostname;
+    serveApp(LEDGERLY);
+    const host = new URL(LEDGERLY).hostname;
     const issuer = `https://${host}/`;
-    const created = await store.create({ name: 'HomeBoard', url: HOMEBOARD, auth: 'oauth', issuer });
+    const created = await store.create({ name: 'Ledgerly', url: LEDGERLY, auth: 'oauth', issuer });
     const withClient = await store.setClient(created.id, created.version, {
       issuer,
       client: { clientId: `${host}-client`, clientSecret: CLIENT_SECRET },
@@ -685,7 +685,7 @@ describe('locks and drift', () => {
       verifier: 'verifier-'.padEnd(48, 'x'),
       issuer,
       redirectUri: appRedirectUri(ASSISTANT, host),
-      resource: HOMEBOARD,
+      resource: LEDGERLY,
     });
     const claim = await store.claimSignIn(state, { host, principalId: PRINCIPAL });
     if (!claim) throw new Error('The sign-in was not claimed');
@@ -794,8 +794,8 @@ describe('shutdown', () => {
   }
 
   it('waits for a renewal in flight to store its rotation and publish', async () => {
-    serveApp(HOMEBOARD);
-    const app = await publishedOAuthApp('HomeBoard', HOMEBOARD, {
+    serveApp(LEDGERLY);
+    const app = await publishedOAuthApp('Ledgerly', LEDGERLY, {
       refreshToken: 'sentinel-refresh-home',
       issuedAt: START - 55 * MINUTE,
       expiresAt: START + 5 * MINUTE,
@@ -821,8 +821,8 @@ describe('shutdown', () => {
   });
 
   it('starts no token request once shutdown begins', async () => {
-    const tokens = serveApp(HOMEBOARD);
-    const app = await publishedOAuthApp('HomeBoard', HOMEBOARD, {
+    const tokens = serveApp(LEDGERLY);
+    const app = await publishedOAuthApp('Ledgerly', LEDGERLY, {
       refreshToken: 'sentinel-refresh-home',
       issuedAt: START - 55 * MINUTE,
       expiresAt: START + 5 * MINUTE,
@@ -861,8 +861,8 @@ describe('shutdown', () => {
   });
 
   it('stops waiting at its bound', async () => {
-    serveApp(HOMEBOARD);
-    await publishedOAuthApp('HomeBoard', HOMEBOARD, {
+    serveApp(LEDGERLY);
+    await publishedOAuthApp('Ledgerly', LEDGERLY, {
       refreshToken: 'sentinel-refresh-home',
       issuedAt: START - 55 * MINUTE,
       expiresAt: START + 5 * MINUTE,

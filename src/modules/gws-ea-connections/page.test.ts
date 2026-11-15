@@ -28,12 +28,12 @@ const HOST = 'juno.example.test';
 const PRINCIPAL = 'morgan@example.test';
 const READER = 'remy@example.test';
 const MAIN = 'ag-main';
-const HOMEBOARD = 'https://homeboard.nownow.ai/mcp';
-const HOMEBOARD_REDIRECT = `https://${HOST}/connections/callback/homeboard.nownow.ai`;
+const LEDGERLY = 'https://app.ledgerly.example.test/mcp';
+const LEDGERLY_REDIRECT = `https://${HOST}/connections/callback/app.ledgerly.example.test`;
 const LEDGER = 'https://mcp.ledger.example.test/mcp';
 const NOTES = 'https://notes.example.test/mcp';
 const RECIPES = 'https://recipes.example.test/mcp';
-const CLIENT_ID = 'juno-homeboard-client';
+const CLIENT_ID = 'juno-ledgerly-client';
 const SENTINEL_SECRET = 'sentinel-client-secret-V7k2';
 const SENTINEL_TOKEN = 'sentinel-pasted-token-R4m9';
 const SENTINEL_QUERY = 'sentinel-url-key-T3c8';
@@ -116,7 +116,7 @@ let logged: string[];
 
 beforeAll(async () => {
   endpoints = await startFakeEndpoints([
-    'homeboard.nownow.ai',
+    'app.ledgerly.example.test',
     'mcp.ledger.example.test',
     'auth.example.test',
     'notes.example.test',
@@ -248,11 +248,11 @@ function serve(...handlers: FakeHandler[]): void {
   for (const handler of handlers) endpoints.use(handler);
 }
 
-function homeBoard(): FakeMcpApp {
+function fakeLedgerly(): FakeMcpApp {
   return new FakeMcpApp({
-    appUrl: HOMEBOARD,
-    issuer: 'https://homeboard.nownow.ai',
-    client: { id: CLIENT_ID, secret: SENTINEL_SECRET, redirectUri: HOMEBOARD_REDIRECT },
+    appUrl: LEDGERLY,
+    issuer: 'https://app.ledgerly.example.test',
+    client: { id: CLIENT_ID, secret: SENTINEL_SECRET, redirectUri: LEDGERLY_REDIRECT },
   });
 }
 
@@ -302,12 +302,12 @@ function callback(host: string, query: URLSearchParams, identity = PRINCIPAL): P
   return request(`/connections/callback/${host}?${query.toString()}`, 'GET', { 'cf-access-jwt-assertion': identity });
 }
 
-/** HomeBoard added from the page and signed in, as F1 runs it. */
-async function connectedHomeBoard(app = homeBoard()): Promise<ConnectionApp> {
+/** Ledgerly added from the page and signed in, as F1 runs it. */
+async function connectedLedgerly(app = fakeLedgerly()): Promise<ConnectionApp> {
   serve(app.handle);
-  expect((await post('/connections/add', { url: HOMEBOARD, name: '' })).status).toBe(200);
+  expect((await post('/connections/add', { url: LEDGERLY, name: '' })).status).toBe(200);
   const url = await startSignIn(await onlyApp(), { clientId: CLIENT_ID, clientSecret: SENTINEL_SECRET });
-  const reply = await callback('homeboard.nownow.ai', app.approve(url).query);
+  const reply = await callback('app.ledgerly.example.test', app.approve(url).query);
   expect(reply.headers.location).toBe('/connections?outcome=connected');
   return onlyApp();
 }
@@ -324,40 +324,40 @@ function assertNoSentinels(): void {
 
 describe('adding and connecting an OAuth app that needs a client', () => {
   it('runs F1 end to end: client fields, sign-in, Connected, credential published before main’s entry', async () => {
-    const app = homeBoard();
+    const app = fakeLedgerly();
     serve(app.handle);
 
-    const added = await post('/connections/add', { url: HOMEBOARD, name: '' });
+    const added = await post('/connections/add', { url: LEDGERLY, name: '' });
     expect(added.status).toBe(200);
     expect(added.headers['x-page-saved']).toBe('true');
     const stored = await onlyApp();
     expect(stored).toMatchObject({ status: 'not_connected', auth: 'oauth', hasClient: false });
     expect(added.headers['x-page-location']).toBe(`/connections/app/${stored.id}/connect`);
     for (const body of [added.body, (await request(`/connections/app/${stored.id}/connect`)).body]) {
-      expect(body).toContain(HOMEBOARD_REDIRECT);
+      expect(body).toContain(LEDGERLY_REDIRECT);
       expect(body).toContain('name="clientId"');
       expect(body).toContain('name="clientSecret"');
-      expect(body).toContain('Your operator hasn’t reviewed homeboard.nownow.ai');
+      expect(body).toContain('Your operator hasn’t reviewed app.ledgerly.example.test');
       expect(body).toContain('data-copy-from="redirect-uri"');
     }
 
     const authorizationUrl = new URL(await startSignIn(stored, { clientId: CLIENT_ID, clientSecret: SENTINEL_SECRET }));
     expect(authorizationUrl.searchParams.get('code_challenge_method')).toBe('S256');
-    expect(authorizationUrl.searchParams.get('resource')).toBe(HOMEBOARD);
-    expect(authorizationUrl.searchParams.get('redirect_uri')).toBe(HOMEBOARD_REDIRECT);
+    expect(authorizationUrl.searchParams.get('resource')).toBe(LEDGERLY);
+    expect(authorizationUrl.searchParams.get('redirect_uri')).toBe(LEDGERLY_REDIRECT);
     expect(authorizationUrl.searchParams.get('state')?.length).toBeGreaterThanOrEqual(22);
 
-    const returned = await callback('homeboard.nownow.ai', app.approve(authorizationUrl.href).query);
+    const returned = await callback('app.ledgerly.example.test', app.approve(authorizationUrl.href).query);
     expect(returned.status).toBe(302);
     expect(returned.headers.location).toBe('/connections?outcome=connected');
 
     const connected = await onlyApp();
     expect(connected.status).toBe('connected');
     const credential = gateway.held.get(`gws-ea-app-${connected.id}`);
-    expect(credential).toMatchObject({ host: 'homeboard.nownow.ai', path: '/mcp' });
+    expect(credential).toMatchObject({ host: 'app.ledgerly.example.test', path: '/mcp' });
     expect(app.accessTokens.has(credential?.value ?? '')).toBe(true);
     expect(gateway.events).toEqual([`publish:gws-ea-app-${connected.id}`, 'apply']);
-    expect(await mainServers()).toEqual({ [connected.serverKey]: { type: 'http', url: HOMEBOARD } });
+    expect(await mainServers()).toEqual({ [connected.serverKey]: { type: 'http', url: LEDGERLY } });
     expect(await store.pendingRestart()).toBeDefined();
     expect(signInRow(connected.id)).toBeUndefined();
 
@@ -368,14 +368,14 @@ describe('adding and connecting an OAuth app that needs a client', () => {
   });
 
   it('connects a chat-added app, Not connected, through the same sign-in route with client details', async () => {
-    const app = homeBoard();
+    const app = fakeLedgerly();
     serve(app.handle);
-    const added = await operations().add({ url: HOMEBOARD, name: 'HomeBoard' });
+    const added = await operations().add({ url: LEDGERLY, name: 'Ledgerly' });
     if (added.status !== 'added') throw new Error(added.reason);
     expect(added.app.status).toBe('not_connected');
 
     const url = await startSignIn(added.app, { clientId: CLIENT_ID, clientSecret: SENTINEL_SECRET });
-    expect((await callback('homeboard.nownow.ai', app.approve(url).query)).headers.location).toBe(
+    expect((await callback('app.ledgerly.example.test', app.approve(url).query)).headers.location).toBe(
       '/connections?outcome=connected',
     );
     expect((await onlyApp()).status).toBe('connected');
@@ -405,9 +405,9 @@ describe('adding and connecting an OAuth app that needs a client', () => {
 
 describe('client details the server refuses', () => {
   it('forgets entered details the server refused at the exchange, so Connect asks for them again', async () => {
-    const app = homeBoard();
+    const app = fakeLedgerly();
     serve(app.handle);
-    await post('/connections/add', { url: HOMEBOARD, name: '' });
+    await post('/connections/add', { url: LEDGERLY, name: '' });
     const added = await onlyApp();
     const unusable = await post('/connections/sign-in', {
       id: added.id,
@@ -420,7 +420,7 @@ describe('client details the server refuses', () => {
     expect(await onlyApp()).toMatchObject({ hasClient: false });
     const url = await startSignIn(await onlyApp(), { clientId: CLIENT_ID, clientSecret: SENTINEL_REFUSED });
 
-    expect((await callback('homeboard.nownow.ai', app.approve(url).query)).headers.location).toBe(
+    expect((await callback('app.ledgerly.example.test', app.approve(url).query)).headers.location).toBe(
       '/connections?outcome=client_refused',
     );
     const cleared = await onlyApp();
@@ -429,7 +429,7 @@ describe('client details the server refuses', () => {
     expect(gateway.held.size).toBe(0);
 
     const retry = await startSignIn(cleared, { clientId: CLIENT_ID, clientSecret: SENTINEL_SECRET });
-    expect((await callback('homeboard.nownow.ai', app.approve(retry).query)).headers.location).toBe(
+    expect((await callback('app.ledgerly.example.test', app.approve(retry).query)).headers.location).toBe(
       '/connections?outcome=connected',
     );
     assertNoSentinels();
@@ -459,14 +459,16 @@ describe('client details the server refuses', () => {
   });
 
   it('sends no client details to an authorization server other than the one Connect named', async () => {
-    const app = homeBoard();
+    const app = fakeLedgerly();
     serve(app.handle);
-    await post('/connections/add', { url: HOMEBOARD, name: '' });
+    await post('/connections/add', { url: LEDGERLY, name: '' });
     const added = await onlyApp();
-    expect((await request(`/connections/app/${added.id}/connect`)).body).toContain('sign in on homeboard.nownow.ai');
+    expect((await request(`/connections/app/${added.id}/connect`)).body).toContain(
+      'sign in on app.ledgerly.example.test',
+    );
 
     // Between the view and the submit, the app starts naming another authorization server.
-    const moved = new FakeMcpApp({ appUrl: HOMEBOARD, issuer: 'https://auth.example.test', registration: true });
+    const moved = new FakeMcpApp({ appUrl: LEDGERLY, issuer: 'https://auth.example.test', registration: true });
     endpoints.reset();
     serve(moved.handle);
     const reply = await post('/connections/sign-in', {
@@ -488,14 +490,14 @@ describe('client details the server refuses', () => {
   });
 
   it('runs the refused-client recovery when the server answers the sign-in with unauthorized_client', async () => {
-    const app = homeBoard();
+    const app = fakeLedgerly();
     serve(app.handle);
-    await post('/connections/add', { url: HOMEBOARD, name: '' });
+    await post('/connections/add', { url: LEDGERLY, name: '' });
     const url = await startSignIn(await onlyApp(), { clientId: CLIENT_ID, clientSecret: SENTINEL_SECRET });
     const state = new URL(url).searchParams.get('state') ?? '';
 
     const returned = await callback(
-      'homeboard.nownow.ai',
+      'app.ledgerly.example.test',
       new URLSearchParams({ error: 'unauthorized_client', state }),
     );
 
@@ -506,9 +508,9 @@ describe('client details the server refuses', () => {
   });
 
   it('lets the principal change client details the server rejected on its own page', async () => {
-    const app = homeBoard();
+    const app = fakeLedgerly();
     serve(app.handle);
-    await post('/connections/add', { url: HOMEBOARD, name: '' });
+    await post('/connections/add', { url: LEDGERLY, name: '' });
     // The server rejects this client on its sign-in page, so no return ever reaches the host.
     await startSignIn(await onlyApp(), { clientId: 'mistyped-client', clientSecret: SENTINEL_REFUSED });
     const stored = await onlyApp();
@@ -530,7 +532,7 @@ describe('client details the server refuses', () => {
     expect(signInRow(stored.id)).toBeUndefined();
 
     const retry = await startSignIn(await onlyApp(), { clientId: CLIENT_ID, clientSecret: SENTINEL_SECRET });
-    expect((await callback('homeboard.nownow.ai', app.approve(retry).query)).headers.location).toBe(
+    expect((await callback('app.ledgerly.example.test', app.approve(retry).query)).headers.location).toBe(
       '/connections?outcome=connected',
     );
     assertNoSentinels();
@@ -628,13 +630,13 @@ describe('sign-in returns', () => {
   });
 
   it('refuses an invited reader’s return with not-found and leaves the pending sign-in untouched', async () => {
-    const app = homeBoard();
+    const app = fakeLedgerly();
     serve(app.handle);
-    await post('/connections/add', { url: HOMEBOARD, name: '' });
+    await post('/connections/add', { url: LEDGERLY, name: '' });
     const stored = await onlyApp();
     const url = await startSignIn(stored, { clientId: CLIENT_ID, clientSecret: SENTINEL_SECRET });
 
-    const reply = await callback('homeboard.nownow.ai', app.approve(url).query, READER);
+    const reply = await callback('app.ledgerly.example.test', app.approve(url).query, READER);
     expect(reply.status).toBe(404);
     expect(reply.body).toBe('');
     expect(signInRow(stored.id)).toEqual({ claimed_at: null });
@@ -642,12 +644,12 @@ describe('sign-in returns', () => {
   });
 
   it('answers a return on another app’s path, and unknown, consumed or replaced states, with the same expired outcome', async () => {
-    const app = homeBoard();
+    const app = fakeLedgerly();
     serve(app.handle, recipesServer);
     await post('/connections/add', { url: RECIPES, name: '' });
-    await post('/connections/add', { url: HOMEBOARD, name: '' });
-    const stored = (await store.apps()).find((entry) => entry.host === 'homeboard.nownow.ai');
-    if (!stored) throw new Error('HomeBoard was not added');
+    await post('/connections/add', { url: LEDGERLY, name: '' });
+    const stored = (await store.apps()).find((entry) => entry.host === 'app.ledgerly.example.test');
+    if (!stored) throw new Error('Ledgerly was not added');
 
     const first = await startSignIn(stored, { clientId: CLIENT_ID, clientSecret: SENTINEL_SECRET });
     const firstQuery = app.approve(first).query;
@@ -657,38 +659,44 @@ describe('sign-in returns', () => {
 
     // A second start in another tab replaces the first, so the first tab's return reads as expired.
     const second = await startSignIn(await store.get(stored.id));
-    expect((await callback('homeboard.nownow.ai', firstQuery)).headers.location).toBe('/connections?outcome=expired');
+    expect((await callback('app.ledgerly.example.test', firstQuery)).headers.location).toBe(
+      '/connections?outcome=expired',
+    );
     const unknown = new URLSearchParams({ code: 'whatever', state: 'never-issued' });
-    expect((await callback('homeboard.nownow.ai', unknown)).headers.location).toBe('/connections?outcome=expired');
+    expect((await callback('app.ledgerly.example.test', unknown)).headers.location).toBe(
+      '/connections?outcome=expired',
+    );
 
     const secondQuery = app.approve(second).query;
-    expect((await callback('homeboard.nownow.ai', secondQuery)).headers.location).toBe(
+    expect((await callback('app.ledgerly.example.test', secondQuery)).headers.location).toBe(
       '/connections?outcome=connected',
     );
-    expect((await callback('homeboard.nownow.ai', secondQuery)).headers.location).toBe('/connections?outcome=expired');
+    expect((await callback('app.ledgerly.example.test', secondQuery)).headers.location).toBe(
+      '/connections?outcome=expired',
+    );
   });
 
   it('leaves the app as it was after a failed exchange, with the claimed sign-in unusable', async () => {
-    const app = homeBoard();
+    const app = fakeLedgerly();
     serve(app.handle);
-    await post('/connections/add', { url: HOMEBOARD, name: '' });
+    await post('/connections/add', { url: LEDGERLY, name: '' });
     const stored = await onlyApp();
     const url = await startSignIn(stored, { clientId: CLIENT_ID, clientSecret: SENTINEL_SECRET });
     const query = app.approve(url).query;
     query.set('code', 'tampered-code');
 
-    expect((await callback('homeboard.nownow.ai', query)).headers.location).toBe('/connections?outcome=failed');
+    expect((await callback('app.ledgerly.example.test', query)).headers.location).toBe('/connections?outcome=failed');
     expect(await onlyApp()).toMatchObject({ status: 'not_connected' });
     expect(signInRow(stored.id)).toBeUndefined();
-    expect((await callback('homeboard.nownow.ai', query)).headers.location).toBe('/connections?outcome=expired');
+    expect((await callback('app.ledgerly.example.test', query)).headers.location).toBe('/connections?outcome=expired');
     expect(gateway.held.size).toBe(0);
     assertNoSentinels();
   });
 
   it('clears the sign-in and leaves the app as it was when the principal cancels at the server', async () => {
-    const app = homeBoard();
+    const app = fakeLedgerly();
     serve(app.handle);
-    await post('/connections/add', { url: HOMEBOARD, name: '' });
+    await post('/connections/add', { url: LEDGERLY, name: '' });
     const stored = await onlyApp();
     const url = new URL(await startSignIn(stored, { clientId: CLIENT_ID, clientSecret: SENTINEL_SECRET }));
     const query = new URLSearchParams({
@@ -697,16 +705,18 @@ describe('sign-in returns', () => {
       state: url.searchParams.get('state') ?? '',
     });
 
-    expect((await callback('homeboard.nownow.ai', query)).headers.location).toBe('/connections?outcome=cancelled');
+    expect((await callback('app.ledgerly.example.test', query)).headers.location).toBe(
+      '/connections?outcome=cancelled',
+    );
     expect(await onlyApp()).toMatchObject({ status: 'not_connected' });
     expect(signInRow(stored.id)).toBeUndefined();
     expect(logged.join('\n')).not.toContain('Morgan declined');
   });
 
   it('refuses a cross-site sign-in start and leaves the pending sign-in as it was', async () => {
-    const app = homeBoard();
+    const app = fakeLedgerly();
     serve(app.handle);
-    await post('/connections/add', { url: HOMEBOARD, name: '' });
+    await post('/connections/add', { url: LEDGERLY, name: '' });
     const stored = await onlyApp();
     await startSignIn(stored, { clientId: CLIENT_ID, clientSecret: SENTINEL_SECRET });
     const before = raw((db) => db.prepare('SELECT state_hash FROM sign_ins').all());
@@ -724,16 +734,16 @@ describe('sign-in returns', () => {
 
 describe('managing apps', () => {
   it('disconnects at once: grant ended, credential gone, access revoked, pending sign-in cleared, restart requested', async () => {
-    const homeboard = homeBoard();
-    const connected = await connectedHomeBoard(homeboard);
+    const ledgerly = fakeLedgerly();
+    const connected = await connectedLedgerly(ledgerly);
     const grant = await store.readGrant(connected.id, 1);
-    if (grant?.kind !== 'oauth' || !grant.refreshToken) throw new Error('HomeBoard issues refresh tokens');
+    if (grant?.kind !== 'oauth' || !grant.refreshToken) throw new Error('Ledgerly issues refresh tokens');
     await store.startSignIn(connected.id, connected.version, {
       principalId: PRINCIPAL,
       verifier: 'pending-verifier-abcdefghijklmnopqrstuvwxyz0123456789',
-      issuer: 'https://homeboard.nownow.ai/',
-      redirectUri: HOMEBOARD_REDIRECT,
-      resource: HOMEBOARD,
+      issuer: 'https://app.ledgerly.example.test/',
+      redirectUri: LEDGERLY_REDIRECT,
+      resource: LEDGERLY,
     });
     const app = await onlyApp();
     await store.clearRestart((await store.pendingRestart()) ?? '');
@@ -744,30 +754,30 @@ describe('managing apps', () => {
     expect(await onlyApp()).toMatchObject({ status: 'not_connected' });
     expect(gateway.held.size).toBe(0);
     expect(signInRow(app.id)).toBeUndefined();
-    expect(homeboard.revoked).toEqual([grant.refreshToken]);
+    expect(ledgerly.revoked).toEqual([grant.refreshToken]);
     expect(await mainServers()).toEqual({});
     expect(await store.pendingRestart()).toBeDefined();
     expect(gateway.events.indexOf(`remove:gws-ea-app-${app.id}`)).toBeLessThan(gateway.events.lastIndexOf('apply'));
   });
 
   it('deletes a connected app even when the server refuses revocation', async () => {
-    const homeboard = homeBoard();
+    const ledgerly = fakeLedgerly();
     serve((incoming) => (incoming.path === '/oauth/revoke' ? { status: 503 } : undefined));
-    const app = await connectedHomeBoard(homeboard);
+    const app = await connectedLedgerly(ledgerly);
 
     const reply = await post('/connections/delete', { id: app.id, version: String(app.version) });
     expect(reply.status).toBe(200);
     expect(reply.body).toContain('App deleted.');
     // Revocation was asked for and refused, and the delete went ahead.
     expect(endpoints.requests.filter((incoming) => incoming.path === '/oauth/revoke')).toHaveLength(1);
-    expect(homeboard.revoked).toEqual([]);
+    expect(ledgerly.revoked).toEqual([]);
     expect(await store.apps()).toEqual([]);
     expect(gateway.held.size).toBe(0);
     expect(await mainServers()).toEqual({});
   });
 
   it('deletes an app that needs reconnecting', async () => {
-    const app = await connectedHomeBoard();
+    const app = await connectedLedgerly();
     const grant = await store.currentGrant(app.id);
     await store.markRefused(app.id, grant?.generation ?? 0);
     const refused = await onlyApp();
@@ -900,12 +910,12 @@ describe('page states', () => {
 
   it('lists operator servers by host only, without an Added by you section, offering only Disconnect', async () => {
     await updateContainerConfigJson(MAIN, 'mcp_servers', {
-      homeboard: { type: 'http', url: `https://homeboard.nownow.ai/mcp?key=${SENTINEL_QUERY}` },
+      ledgerly: { type: 'http', url: `https://app.ledgerly.example.test/mcp?key=${SENTINEL_QUERY}` },
       calendar: { command: 'calendar-mcp' },
     });
     const reply = await request('/connections');
     expect(reply.body).toContain('From your operator');
-    expect(reply.body).toContain('homeboard.nownow.ai');
+    expect(reply.body).toContain('app.ledgerly.example.test');
     expect(reply.body).not.toContain('Added by you');
     expect(reply.body).not.toContain('calendar');
     expect(reply.body.match(/<(?:a|button)[^>]*role="menuitem"[^>]*>([^<]*)</gu)).toEqual([
@@ -938,7 +948,7 @@ describe('page states', () => {
       ['/connections/unknown', 'GET', {}],
       ['/connections/new?x=1', 'GET', {}],
       ['/connections/add', 'GET', {}],
-      ['/connections/callback/homeboard.nownow.ai', 'HEAD', {}],
+      ['/connections/callback/app.ledgerly.example.test', 'HEAD', {}],
       ['/connections', 'GET', { 'cf-access-jwt-assertion': '' }],
       ['/connections', 'GET', { host: `${HOST}:443` }],
     ] as const) {
@@ -951,69 +961,69 @@ describe('page states', () => {
 });
 
 describe('operator servers', () => {
-  const homeBoardEntry = { type: 'http', url: HOMEBOARD };
+  const ledgerlyEntry = { type: 'http', url: LEDGERLY };
   const confirmation =
-    'data-confirm-title="Disconnect homeboard?" data-confirm-action="Disconnect" data-confirm-message="This removes it from your assistant and deletes its saved access to homeboard.nownow.ai. Your operator can add it back."';
-  const disconnectHomeBoard = () =>
-    post('/connections/disconnect-operator', { key: 'homeboard', host: 'homeboard.nownow.ai' });
+    'data-confirm-title="Disconnect ledgerly?" data-confirm-action="Disconnect" data-confirm-message="This removes it from your assistant and deletes its saved access to app.ledgerly.example.test. Your operator can add it back."';
+  const disconnectLedgerly = () =>
+    post('/connections/disconnect-operator', { key: 'ledgerly', host: 'app.ledgerly.example.test' });
 
   it('disconnects a hand-wired server after a confirmation naming it and its host: entry and credential gone', async () => {
-    await updateContainerConfigJson(MAIN, 'mcp_servers', { homeboard: homeBoardEntry });
-    gateway.hold('homeboard-bearer', 'homeboard.nownow.ai');
+    await updateContainerConfigJson(MAIN, 'mcp_servers', { ledgerly: ledgerlyEntry });
+    gateway.hold('ledgerly-bearer', 'app.ledgerly.example.test');
     gateway.hold('ledger-bearer', 'mcp.ledger.example.test');
 
     const page = await request('/connections');
     expect(page.body).toContain(confirmation);
-    expect(page.body).not.toContain('homeboard-bearer');
+    expect(page.body).not.toContain('ledgerly-bearer');
 
-    const reply = await disconnectHomeBoard();
+    const reply = await disconnectLedgerly();
     expect(reply.status).toBe(200);
     expect(reply.body).toContain('Server disconnected.');
     expect(reply.body).not.toContain('From your operator');
     expect(await mainServers()).toEqual({});
     expect([...gateway.held.keys()]).toEqual(['ledger-bearer']);
     expect(await store.pendingRestart()).toBeDefined();
-    expect((await request('/connections')).body).not.toContain('homeboard.nownow.ai');
+    expect((await request('/connections')).body).not.toContain('app.ledgerly.example.test');
     assertNoSentinels();
   });
 
   it('keeps the server listed with Retry when a credential stays, and Retry completes the disconnect', async () => {
-    await updateContainerConfigJson(MAIN, 'mcp_servers', { homeboard: homeBoardEntry });
-    gateway.hold('homeboard-bearer', 'homeboard.nownow.ai');
-    gateway.failingIds.add(gateway.hold('homeboard-workspace', 'homeboard.nownow.ai'));
+    await updateContainerConfigJson(MAIN, 'mcp_servers', { ledgerly: ledgerlyEntry });
+    gateway.hold('ledgerly-bearer', 'app.ledgerly.example.test');
+    gateway.failingIds.add(gateway.hold('ledgerly-workspace', 'app.ledgerly.example.test'));
 
-    const failed = await disconnectHomeBoard();
+    const failed = await disconnectLedgerly();
     expect(failed.status).toBe(200);
     expect(failed.body).toContain('data-error="true"');
     expect(failed.body).toContain('so it’s still connected. Try again.');
     expect(failed.body).toContain('From your operator');
     expect(failed.body).toMatch(/action="\/connections\/disconnect-operator" data-send>.*>Retry<\/button>/u);
-    expect(failed.body).not.toContain('homeboard-workspace');
-    expect(await mainServers()).toEqual({ homeboard: homeBoardEntry });
-    expect([...gateway.held.keys()]).toEqual(['homeboard-workspace']);
+    expect(failed.body).not.toContain('ledgerly-workspace');
+    expect(await mainServers()).toEqual({ ledgerly: ledgerlyEntry });
+    expect([...gateway.held.keys()]).toEqual(['ledgerly-workspace']);
 
     gateway.failingIds.clear();
-    const retried = await disconnectHomeBoard();
+    const retried = await disconnectLedgerly();
     expect(retried.body).toContain('Server disconnected.');
     expect(await mainServers()).toEqual({});
     expect(gateway.held.size).toBe(0);
   });
 
   it('shows Disconnect unavailable on a gateway that cannot list and remove credentials by host', async () => {
-    await updateContainerConfigJson(MAIN, 'mcp_servers', { homeboard: homeBoardEntry });
-    gateway.hold('homeboard-bearer', 'homeboard.nownow.ai');
+    await updateContainerConfigJson(MAIN, 'mcp_servers', { ledgerly: ledgerlyEntry });
+    gateway.hold('ledgerly-bearer', 'app.ledgerly.example.test');
     hostSeam = false;
 
     const page = await request('/connections');
     expect(page.body).toContain('Disconnect unavailable');
     expect(page.body).not.toContain('action="/connections/disconnect-operator"');
-    expect((await disconnectHomeBoard()).status).toBe(503);
-    expect(await mainServers()).toEqual({ homeboard: homeBoardEntry });
+    expect((await disconnectLedgerly()).status).toBe(503);
+    expect(await mainServers()).toEqual({ ledgerly: ledgerlyEntry });
     expect(gateway.held.size).toBe(1);
   });
 
   it('refuses a key that is not an operator http entry, or a host the entry no longer has, changing nothing', async () => {
-    const connected = await connectedHomeBoard();
+    const connected = await connectedLedgerly();
     serve(recipesServer);
     const servers = { ...(await mainServers()), calendar: { command: 'calendar-mcp' } };
     await updateContainerConfigJson(MAIN, 'mcp_servers', {
@@ -1024,9 +1034,9 @@ describe('operator servers', () => {
     const held = [...gateway.held.keys()];
 
     for (const submission of [
-      { key: connected.serverKey, host: 'homeboard.nownow.ai' },
+      { key: connected.serverKey, host: 'app.ledgerly.example.test' },
       { key: 'calendar', host: '' },
-      { key: 'recipes', host: 'homeboard.nownow.ai' },
+      { key: 'recipes', host: 'app.ledgerly.example.test' },
     ]) {
       const reply = await post('/connections/disconnect-operator', submission);
       expect(reply.status).toBe(409);
@@ -1059,7 +1069,7 @@ describe('home status and link facts', () => {
   });
 
   it('summarizes unavailable, then apps needing reconnecting, then connected apps, then none yet', async () => {
-    const operator = { key: 'homeboard', url: 'https://homeboard.nownow.ai/mcp' };
+    const operator = { key: 'ledgerly', url: 'https://app.ledgerly.example.test/mcp' };
     expect(await connectionsStatus(listing({ canChange: false, apps: [app('needs_reconnecting', 'Notes')] }))).toBe(
       'Unavailable',
     );
@@ -1076,13 +1086,19 @@ describe('home status and link facts', () => {
     const facts = await connectionsLinkFacts(
       listing({
         apps: [app('connected', 'Recipes')],
-        operators: [{ key: 'homeboard', url: `https://homeboard.nownow.ai/mcp?key=${SENTINEL_QUERY}` }],
+        operators: [{ key: 'ledgerly', url: `https://app.ledgerly.example.test/mcp?key=${SENTINEL_QUERY}` }],
       }),
     );
     expect(facts).toEqual({
       apps: [
         { name: 'Recipes', key: 'app_recipes', host: 'recipes.example.test', origin: 'principal', status: 'connected' },
-        { name: 'homeboard', key: 'homeboard', host: 'homeboard.nownow.ai', origin: 'operator', status: 'connected' },
+        {
+          name: 'ledgerly',
+          key: 'ledgerly',
+          host: 'app.ledgerly.example.test',
+          origin: 'operator',
+          status: 'connected',
+        },
       ],
     });
     expect(JSON.stringify(facts)).not.toContain('https://');

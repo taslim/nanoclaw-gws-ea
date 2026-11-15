@@ -124,8 +124,8 @@ describe("main's MCP servers change only through its app tools", () => {
 
   it("refuses main's raw config commands with the app-tool pointer, while the operator's host calls go through", async () => {
     const commands: [string, Record<string, unknown>][] = [
-      ['groups-config-add-mcp-server', { id: MAIN, name: 'homeboard', url: 'https://homeboard.nownow.ai/mcp' }],
-      ['groups-config-remove-mcp-server', { id: MAIN, name: 'homeboard' }],
+      ['groups-config-add-mcp-server', { id: MAIN, name: 'ledgerly', url: 'https://app.ledgerly.example.test/mcp' }],
+      ['groups-config-remove-mcp-server', { id: MAIN, name: 'ledgerly' }],
       ['groups-create', { id: MAIN, template: 'gws-ea/main', yes: true }],
     ];
     for (const [command, payload] of commands) {
@@ -144,11 +144,11 @@ describe("main's MCP servers change only through its app tools", () => {
   it('refuses the add_mcp_server delivery action for main, and an app_ server name for any group', async () => {
     const other: GuardActor = { kind: 'agent', agentGroupId: OTHER, sessionId: 'sess-other' };
 
-    expect(await guard(selfModAddMcpServer, { actor: main, payload: { name: 'homeboard' } })).toMatchObject({
+    expect(await guard(selfModAddMcpServer, { actor: main, payload: { name: 'ledgerly' } })).toMatchObject({
       effect: 'deny',
       reason: expect.stringContaining('use add_app or delete_app'),
     });
-    expect(await guard(selfModAddMcpServer, { actor: other, payload: { name: 'homeboard' } })).toMatchObject({
+    expect(await guard(selfModAddMcpServer, { actor: other, payload: { name: 'ledgerly' } })).toMatchObject({
       effect: 'hold',
     });
     expect(await guard(selfModAddMcpServer, { actor: other, payload: { name: 'app_0a1b2c3d4e5f' } })).toMatchObject({

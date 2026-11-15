@@ -2369,7 +2369,7 @@ describe('connected apps', () => {
           url: `https://mcp.ledger.example.test/mcp?token=${SENTINEL}`,
           clientId: `client-${SENTINEL}`,
         },
-        { name: 'homeboard', host: 'homeboard.nownow.ai', origin: 'operator', status: 'connected' },
+        { name: 'ledgerly', host: 'app.ledgerly.example.test', origin: 'operator', status: 'connected' },
       ],
     });
 
@@ -2377,12 +2377,12 @@ describe('connected apps', () => {
       store: { status: 'available', reason: null, operator_action: null },
       apps: [
         { name: 'Ledger', host: 'mcp.ledger.example.test', origin: 'principal', status: 'needs_reconnecting' },
-        { name: 'homeboard', host: 'homeboard.nownow.ai', origin: 'operator', status: 'connected' },
+        { name: 'ledgerly', host: 'app.ledgerly.example.test', origin: 'operator', status: 'connected' },
       ],
     });
     expect(text).toContain('  Connected apps: available\n');
     expect(text).toContain('    Ledger (mcp.ledger.example.test): added by the principal; needs reconnecting');
-    expect(text).toContain('    homeboard (homeboard.nownow.ai): from the operator; connected');
+    expect(text).toContain('    ledgerly (app.ledgerly.example.test): from the operator; connected');
     for (const output of [text, json]) {
       expect(output).not.toContain(SENTINEL);
       expect(output).not.toContain('token=');

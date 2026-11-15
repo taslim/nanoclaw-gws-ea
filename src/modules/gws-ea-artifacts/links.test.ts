@@ -137,15 +137,15 @@ it('allows each registered principal page at its exact address toward the princi
     expect((await check(url, ['principal@example.com', 'juno@example.com'])).allowed, url).toBe(false);
   }
   for (const url of [
-    'https://aya.example.com/connections/callback/homeboard.example.test',
-    'https://aya.example.com/connections/callback/homeboard.example.test?code=sentinel&state=sentinel',
+    'https://aya.example.com/connections/callback/app2.ledgerly.example.test',
+    'https://aya.example.com/connections/callback/app2.ledgerly.example.test?code=sentinel&state=sentinel',
     'https://aya.example.com/connections/',
     'https://aya.example.com/logins/edit',
   ])
     for (const recipients of [['principal@example.com'], ['juno@example.com']])
       expect((await check(url, recipients)).allowed, url).toBe(false);
   // Refused as below a principal page, naming the page's own address, not as an unknown artifact path.
-  expect(await check('https://aya.example.com/connections/callback/homeboard.example.test')).toEqual({
+  expect(await check('https://aya.example.com/connections/callback/app2.ledgerly.example.test')).toEqual({
     allowed: false,
     reason: expect.stringContaining('Connections page address, https://aya.example.com/connections,'),
   });

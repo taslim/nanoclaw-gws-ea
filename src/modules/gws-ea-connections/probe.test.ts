@@ -3,13 +3,13 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { checkPastedToken, probeApp } from './probe.js';
 import { FakeMcpApp, startFakeEndpoints, type FakeEndpoints, type FakeHandler } from './testing/oauth-server.js';
 
-const HOMEBOARD = 'https://homeboard.nownow.ai/mcp';
+const LEDGERLY = 'https://app.ledgerly.example.test/mcp';
 const LEDGER = 'https://mcp.ledger.example.test/mcp';
 
 let endpoints: FakeEndpoints;
 
 beforeAll(async () => {
-  endpoints = await startFakeEndpoints(['homeboard.nownow.ai', 'mcp.ledger.example.test', 'auth.example.test']);
+  endpoints = await startFakeEndpoints(['app.ledgerly.example.test', 'mcp.ledger.example.test', 'auth.example.test']);
 });
 afterAll(async () => {
   await endpoints.close();
@@ -22,12 +22,12 @@ function serve(...handlers: FakeHandler[]): void {
   for (const handler of handlers) endpoints.use(handler);
 }
 
-function homeBoard(): FakeMcpApp {
+function ledgerly(): FakeMcpApp {
   return new FakeMcpApp({
-    appUrl: HOMEBOARD,
-    issuer: 'https://homeboard.nownow.ai',
+    appUrl: LEDGERLY,
+    issuer: 'https://app.ledgerly.example.test',
     tokenAuthMethods: ['client_secret_basic'],
-    scopes: ['homeboard.read', 'homeboard.write'],
+    scopes: ['ledgerly.read', 'ledgerly.write'],
   });
 }
 
@@ -84,17 +84,17 @@ describe('probeApp', () => {
     });
   });
 
-  it('classifies a HomeBoard-shaped server as OAuth that needs client details', async () => {
-    serve(homeBoard().handle);
-    const outcome = await probeApp(HOMEBOARD, { fetches: endpoints.fetches, assistantHost: 'juno.example.test' });
+  it('classifies a Ledgerly-shaped server as OAuth that needs client details', async () => {
+    serve(ledgerly().handle);
+    const outcome = await probeApp(LEDGERLY, { fetches: endpoints.fetches, assistantHost: 'juno.example.test' });
     expect(outcome).toMatchObject({
       status: 'ok',
       method: {
         kind: 'oauth',
-        issuer: 'https://homeboard.nownow.ai/',
+        issuer: 'https://app.ledgerly.example.test/',
         dynamicRegistration: false,
         clientAuthMethods: ['client_secret_basic'],
-        scope: 'homeboard.read homeboard.write',
+        scope: 'ledgerly.read ledgerly.write',
       },
     });
   });
@@ -119,10 +119,10 @@ describe('probeApp', () => {
   });
 
   it('refuses OAuth whose protected resource names another address', async () => {
-    const app = homeBoard();
-    app.resourceMetadata.resource = 'https://homeboard.nownow.ai/';
+    const app = ledgerly();
+    app.resourceMetadata.resource = 'https://app.ledgerly.example.test/';
     serve(app.handle);
-    expect(await probeApp(HOMEBOARD, { fetches: endpoints.fetches })).toEqual({ status: 'unsupported' });
+    expect(await probeApp(LEDGERLY, { fetches: endpoints.fetches })).toEqual({ status: 'unsupported' });
   });
 
   it.each([
@@ -144,11 +144,11 @@ describe('probeApp', () => {
 
 describe('checkPastedToken', () => {
   it('refuses a token the server answers with 401, and accepts one it serves', async () => {
-    const app = homeBoard();
+    const app = ledgerly();
     app.accessTokens.add('pasted-token-good');
     serve(app.handle);
-    expect(await checkPastedToken(HOMEBOARD, 'pasted-token-stale', { fetches: endpoints.fetches })).toBe('refused');
-    expect(await checkPastedToken(HOMEBOARD, 'pasted-token-good', { fetches: endpoints.fetches })).toBe('valid');
+    expect(await checkPastedToken(LEDGERLY, 'pasted-token-stale', { fetches: endpoints.fetches })).toBe('refused');
+    expect(await checkPastedToken(LEDGERLY, 'pasted-token-good', { fetches: endpoints.fetches })).toBe('valid');
     expect(endpoints.requests.map((request) => request.headers.authorization)).toEqual([
       'Bearer pasted-token-stale',
       'Bearer pasted-token-good',
@@ -156,7 +156,7 @@ describe('checkPastedToken', () => {
   });
 
   it('refuses a token no header could carry without sending it', async () => {
-    expect(await checkPastedToken(HOMEBOARD, 'two words', { fetches: endpoints.fetches })).toBe('refused');
+    expect(await checkPastedToken(LEDGERLY, 'two words', { fetches: endpoints.fetches })).toBe('refused');
     expect(endpoints.requests).toEqual([]);
   });
 });

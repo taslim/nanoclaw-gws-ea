@@ -29,25 +29,25 @@ async function call(tool: McpToolDefinition, args: Record<string, unknown>, data
 
 it('asks the host to add one app by address and name, and sends no other field', async () => {
   const validate = new Ajv().compile(addApp.tool.inputSchema);
-  expect(validate({ url: 'https://homeboard.nownow.ai/mcp', name: 'HomeBoard' })).toBe(true);
+  expect(validate({ url: 'https://app.ledgerly.example.test/mcp', name: 'Ledgerly' })).toBe(true);
   for (const fields of [
     {},
-    { url: 'https://homeboard.nownow.ai/mcp' },
-    { name: 'HomeBoard' },
-    { url: 'https://homeboard.nownow.ai/mcp', name: 'HomeBoard', token: 'secret' },
-    { url: 'https://homeboard.nownow.ai/mcp', name: 'HomeBoard', client_secret: 'secret' },
+    { url: 'https://app.ledgerly.example.test/mcp' },
+    { name: 'Ledgerly' },
+    { url: 'https://app.ledgerly.example.test/mcp', name: 'Ledgerly', token: 'secret' },
+    { url: 'https://app.ledgerly.example.test/mcp', name: 'Ledgerly', client_secret: 'secret' },
   ])
     expect(validate(fields)).toBe(false);
   const { request, id } = await call(
     addApp,
-    { url: 'https://homeboard.nownow.ai/mcp', name: 'HomeBoard', token: 'secret' },
+    { url: 'https://app.ledgerly.example.test/mcp', name: 'Ledgerly', token: 'secret' },
     { status: 'awaiting_principal' },
   );
   expect(request).toEqual({
     action: 'add_app',
     requestId: id,
-    url: 'https://homeboard.nownow.ai/mcp',
-    name: 'HomeBoard',
+    url: 'https://app.ledgerly.example.test/mcp',
+    name: 'Ledgerly',
   });
 });
 

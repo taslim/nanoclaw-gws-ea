@@ -7,7 +7,7 @@ import type {
 import { appCredentialTarget, publishAppCredential, removeAppCredential } from './credentials.js';
 import { withAppLock } from './locks.js';
 
-const app = { id: 'a1b2c3', url: 'https://homeboard.nownow.ai/mcp' };
+const app = { id: 'a1b2c3', url: 'https://app.ledgerly.example.test/mcp' };
 
 function fakeConnection(stored: boolean) {
   const entry = {
@@ -29,7 +29,7 @@ describe('app credentials', () => {
     expect(appCredentialTarget(app)).toEqual({
       kind: 'api-key',
       name: 'gws-ea-app-a1b2c3',
-      host: 'homeboard.nownow.ai',
+      host: 'app.ledgerly.example.test',
       path: '/mcp',
       proxyValue: 'gateway-managed',
       injection: { headerName: 'Authorization', valueFormat: 'Bearer {value}' },

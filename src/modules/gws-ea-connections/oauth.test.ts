@@ -25,13 +25,13 @@ import { FakeMcpApp, startFakeEndpoints, type FakeEndpoints, type FakeHandler } 
 import { testConnectionsStore } from './testing/store.js';
 
 const ASSISTANT = 'juno.example.test';
-const HOMEBOARD = 'https://homeboard.nownow.ai/mcp';
-const HOMEBOARD_ISSUER = 'https://homeboard.nownow.ai/';
+const LEDGERLY = 'https://app.ledgerly.example.test/mcp';
+const LEDGERLY_ISSUER = 'https://app.ledgerly.example.test/';
 const LEDGER = 'https://mcp.ledger.example.test/mcp';
 const NOTES = 'https://notes.example.test/mcp';
 const SHARED_ISSUER = 'https://auth.example.test/';
-const HOMEBOARD_REDIRECT = appRedirectUri(ASSISTANT, 'homeboard.nownow.ai');
-const HOMEBOARD_CLIENT: ClientRegistration = { clientId: 'remy-homeboard-client', clientSecret: 'remy-client-secret' };
+const LEDGERLY_REDIRECT = appRedirectUri(ASSISTANT, 'app.ledgerly.example.test');
+const LEDGERLY_CLIENT: ClientRegistration = { clientId: 'remy-ledgerly-client', clientSecret: 'remy-client-secret' };
 const SENTINEL = 'sentinel-token-9Zq4';
 
 let endpoints: FakeEndpoints;
@@ -39,7 +39,7 @@ let options: ConnectionOAuthOptions;
 
 beforeAll(async () => {
   endpoints = await startFakeEndpoints([
-    'homeboard.nownow.ai',
+    'app.ledgerly.example.test',
     'mcp.ledger.example.test',
     'notes.example.test',
     'auth.example.test',
@@ -62,15 +62,15 @@ function serve(...handlers: FakeHandler[]): void {
   for (const handler of handlers) endpoints.use(handler);
 }
 
-function homeBoard(overrides: { issParameter?: boolean } = {}): FakeMcpApp {
+function ledgerly(overrides: { issParameter?: boolean } = {}): FakeMcpApp {
   return new FakeMcpApp({
-    appUrl: HOMEBOARD,
-    issuer: 'https://homeboard.nownow.ai',
+    appUrl: LEDGERLY,
+    issuer: 'https://app.ledgerly.example.test',
     tokenAuthMethods: ['client_secret_basic', 'client_secret_post'],
     client: {
-      id: HOMEBOARD_CLIENT.clientId,
-      secret: HOMEBOARD_CLIENT.clientSecret ?? '',
-      redirectUri: HOMEBOARD_REDIRECT,
+      id: LEDGERLY_CLIENT.clientId,
+      secret: LEDGERLY_CLIENT.clientSecret ?? '',
+      redirectUri: LEDGERLY_REDIRECT,
     },
     ...overrides,
   });
@@ -85,23 +85,23 @@ async function codeOf(work: Promise<unknown>): Promise<ConnectionOAuthCode> {
   return error.code;
 }
 
-async function homeBoardSignIn(): Promise<SignInServer> {
-  const resource = await readProtectedResource(HOMEBOARD, options);
-  if (!resource) throw new Error('HomeBoard publishes resource metadata');
+async function ledgerlySignIn(): Promise<SignInServer> {
+  const resource = await readProtectedResource(LEDGERLY, options);
+  if (!resource) throw new Error('Ledgerly publishes resource metadata');
   return signInServer(resource, undefined, options);
 }
 
 /** Starts a sign-in and approves it at the fake server, returning what the redirect URI receives. */
-async function approvedReturn(app: FakeMcpApp, client = HOMEBOARD_CLIENT) {
-  const prepared = await prepareAuthorization(await homeBoardSignIn(), client, HOMEBOARD_REDIRECT);
+async function approvedReturn(app: FakeMcpApp, client = LEDGERLY_CLIENT) {
+  const prepared = await prepareAuthorization(await ledgerlySignIn(), client, LEDGERLY_REDIRECT);
   const { query } = app.approve(prepared.authorizationUrl('state-for-test'));
   return {
     query,
     pending: {
-      issuer: HOMEBOARD_ISSUER,
+      issuer: LEDGERLY_ISSUER,
       verifier: prepared.verifier,
-      redirectUri: HOMEBOARD_REDIRECT,
-      resource: HOMEBOARD,
+      redirectUri: LEDGERLY_REDIRECT,
+      resource: LEDGERLY,
     },
   };
 }
@@ -118,7 +118,7 @@ describe('discovery checks', () => {
     ],
     [
       'an http token endpoint',
-      (app: FakeMcpApp) => (app.serverMetadata.token_endpoint = 'http://homeboard.nownow.ai/oauth/token'),
+      (app: FakeMcpApp) => (app.serverMetadata.token_endpoint = 'http://app.ledgerly.example.test/oauth/token'),
     ],
     [
       "an authorization endpoint on the assistant's hostname",
@@ -130,24 +130,24 @@ describe('discovery checks', () => {
       (app: FakeMcpApp) => delete app.serverMetadata.code_challenge_methods_supported,
     ],
   ])('refuses %s', async (_case, change) => {
-    const app = homeBoard();
+    const app = ledgerly();
     change(app);
     serve(app.handle);
-    const resource = await readProtectedResource(HOMEBOARD, options);
-    if (!resource) throw new Error('HomeBoard publishes resource metadata');
+    const resource = await readProtectedResource(LEDGERLY, options);
+    if (!resource) throw new Error('Ledgerly publishes resource metadata');
     expect(await codeOf(signInServer(resource, undefined, options))).toBe('unsupported');
   });
 
   it('refuses a protected resource that names another address than the app', async () => {
-    const app = homeBoard();
-    app.resourceMetadata.resource = 'https://homeboard.nownow.ai/other';
+    const app = ledgerly();
+    app.resourceMetadata.resource = 'https://app.ledgerly.example.test/other';
     serve(app.handle);
-    expect(await codeOf(readProtectedResource(HOMEBOARD, options))).toBe('resource_mismatch');
+    expect(await codeOf(readProtectedResource(LEDGERLY, options))).toBe('resource_mismatch');
   });
 
   it('answers a discovery 503 as unreachable', async () => {
     serve(() => ({ status: 503, body: 'down' }));
-    expect(await codeOf(readProtectedResource(HOMEBOARD, options))).toBe('unreachable');
+    expect(await codeOf(readProtectedResource(LEDGERLY, options))).toBe('unreachable');
   });
 });
 
@@ -209,75 +209,73 @@ describe('clients', () => {
   });
 
   it('asks for client details when the server cannot register one, and drops a client bound to another issuer', async () => {
-    serve(homeBoard().handle);
-    const signIn = await homeBoardSignIn();
-    const app = { host: 'homeboard.nownow.ai', redirectUri: HOMEBOARD_REDIRECT };
+    serve(ledgerly().handle);
+    const signIn = await ledgerlySignIn();
+    const app = { host: 'app.ledgerly.example.test', redirectUri: LEDGERLY_REDIRECT };
     expect(await codeOf(clientForSignIn(signIn, { issuer: null, client: undefined }, app, options))).toBe(
       'needs_client',
     );
     expect(
-      await codeOf(clientForSignIn(signIn, { issuer: SHARED_ISSUER, client: HOMEBOARD_CLIENT }, app, options)),
+      await codeOf(clientForSignIn(signIn, { issuer: SHARED_ISSUER, client: LEDGERLY_CLIENT }, app, options)),
     ).toBe('needs_client');
-    expect(await clientForSignIn(signIn, { issuer: HOMEBOARD_ISSUER, client: HOMEBOARD_CLIENT }, app, options)).toEqual(
-      {
-        client: HOMEBOARD_CLIENT,
-        registered: false,
-      },
-    );
+    expect(await clientForSignIn(signIn, { issuer: LEDGERLY_ISSUER, client: LEDGERLY_CLIENT }, app, options)).toEqual({
+      client: LEDGERLY_CLIENT,
+      registered: false,
+    });
   });
 });
 
 describe('authorization', () => {
   it('builds the sign-in URL with S256, state, resource, scope and this app’s redirect URI', async () => {
-    const app = homeBoard();
-    app.resourceMetadata.scopes_supported = ['homeboard.read'];
+    const app = ledgerly();
+    app.resourceMetadata.scopes_supported = ['ledgerly.read'];
     serve(app.handle);
-    const prepared = await prepareAuthorization(await homeBoardSignIn(), HOMEBOARD_CLIENT, HOMEBOARD_REDIRECT);
+    const prepared = await prepareAuthorization(await ledgerlySignIn(), LEDGERLY_CLIENT, LEDGERLY_REDIRECT);
     const url = new URL(prepared.authorizationUrl('state-1'));
-    expect(url.origin + url.pathname).toBe('https://homeboard.nownow.ai/oauth/authorize');
+    expect(url.origin + url.pathname).toBe('https://app.ledgerly.example.test/oauth/authorize');
     expect(Object.fromEntries(url.searchParams)).toMatchObject({
       response_type: 'code',
-      client_id: HOMEBOARD_CLIENT.clientId,
+      client_id: LEDGERLY_CLIENT.clientId,
       code_challenge_method: 'S256',
-      redirect_uri: HOMEBOARD_REDIRECT,
-      resource: HOMEBOARD,
-      scope: 'homeboard.read',
+      redirect_uri: LEDGERLY_REDIRECT,
+      resource: LEDGERLY,
+      scope: 'ledgerly.read',
       state: 'state-1',
     });
     expect(prepared.verifier.length).toBeGreaterThanOrEqual(43);
   });
 
   it('refuses a return whose iss differs from the recorded issuer before any token request', async () => {
-    const app = homeBoard({ issParameter: true });
+    const app = ledgerly({ issParameter: true });
     serve(app.handle);
     const { query, pending } = await approvedReturn(app);
     query.set('iss', SHARED_ISSUER);
-    expect(await codeOf(completeAuthorization(query, pending, HOMEBOARD_CLIENT, options))).toBe('issuer_mismatch');
+    expect(await codeOf(completeAuthorization(query, pending, LEDGERLY_CLIENT, options))).toBe('issuer_mismatch');
     expect(tokenRequests()).toBe(0);
   });
 
   it('refuses a return without iss from a server that promised it', async () => {
-    const app = homeBoard({ issParameter: true });
+    const app = ledgerly({ issParameter: true });
     serve(app.handle);
     const { query, pending } = await approvedReturn(app);
     query.delete('iss');
-    expect(await codeOf(completeAuthorization(query, pending, HOMEBOARD_CLIENT, options))).toBe('issuer_mismatch');
+    expect(await codeOf(completeAuthorization(query, pending, LEDGERLY_CLIENT, options))).toBe('issuer_mismatch');
     expect(tokenRequests()).toBe(0);
   });
 
   it('reads a declined sign-in from its error code alone, without any request', async () => {
     const query = new URLSearchParams({ error: 'access_denied', error_description: SENTINEL, state: 'state-1' });
     const pending = {
-      issuer: HOMEBOARD_ISSUER,
+      issuer: LEDGERLY_ISSUER,
       verifier: 'v'.repeat(43),
-      redirectUri: HOMEBOARD_REDIRECT,
-      resource: HOMEBOARD,
+      redirectUri: LEDGERLY_REDIRECT,
+      resource: LEDGERLY,
     };
-    expect(await codeOf(completeAuthorization(query, pending, HOMEBOARD_CLIENT, options))).toBe('cancelled');
+    expect(await codeOf(completeAuthorization(query, pending, LEDGERLY_CLIENT, options))).toBe('cancelled');
     query.set('error', 'unauthorized_client');
-    expect(await codeOf(completeAuthorization(query, pending, HOMEBOARD_CLIENT, options))).toBe('client_refused');
+    expect(await codeOf(completeAuthorization(query, pending, LEDGERLY_CLIENT, options))).toBe('client_refused');
     query.set('error', 'server_error');
-    expect(await codeOf(completeAuthorization(query, pending, HOMEBOARD_CLIENT, options))).toBe('failed');
+    expect(await codeOf(completeAuthorization(query, pending, LEDGERLY_CLIENT, options))).toBe('failed');
     expect(endpoints.requests).toEqual([]);
   });
 });
@@ -285,18 +283,18 @@ describe('authorization', () => {
 describe('refresh', () => {
   async function connected(app: FakeMcpApp): Promise<string> {
     const { query, pending } = await approvedReturn(app);
-    const tokens = await completeAuthorization(query, pending, HOMEBOARD_CLIENT, options);
-    if (!tokens.refreshToken) throw new Error('HomeBoard issues refresh tokens');
+    const tokens = await completeAuthorization(query, pending, LEDGERLY_CLIENT, options);
+    if (!tokens.refreshToken) throw new Error('Ledgerly issues refresh tokens');
     return tokens.refreshToken;
   }
-  const grant = (refreshToken: string) => ({ refreshToken, client: HOMEBOARD_CLIENT });
-  const homeBoardApp = { url: HOMEBOARD, issuer: HOMEBOARD_ISSUER };
+  const grant = (refreshToken: string) => ({ refreshToken, client: LEDGERLY_CLIENT });
+  const ledgerlyApp = { url: LEDGERLY, issuer: LEDGERLY_ISSUER };
 
   it('returns the new access token and the rotated refresh token, sending resource', async () => {
-    const app = homeBoard();
+    const app = ledgerly();
     serve(app.handle);
     const first = await connected(app);
-    const renewed = await refreshAccess(homeBoardApp, grant(first), options);
+    const renewed = await refreshAccess(ledgerlyApp, grant(first), options);
     expect(renewed.refreshToken).toMatch(/^refresh-/u);
     expect(renewed.refreshToken).not.toBe(first);
     expect(app.accessTokens.has(renewed.accessToken)).toBe(true);
@@ -307,7 +305,7 @@ describe('refresh', () => {
     const sent = new URLSearchParams(
       endpoints.requests.filter((request) => request.path === '/oauth/token').at(-1)?.body,
     );
-    expect(sent.get('resource')).toBe(HOMEBOARD);
+    expect(sent.get('resource')).toBe(LEDGERLY);
   });
 
   it('omits a refresh token the server kept, and assumes an hour when expires_in is absent', async () => {
@@ -316,9 +314,9 @@ describe('refresh', () => {
         request.path === '/oauth/token'
           ? { status: 200, body: { access_token: 'access-kept', token_type: 'bearer' } }
           : undefined,
-      homeBoard().handle,
+      ledgerly().handle,
     );
-    const renewed = await refreshAccess(homeBoardApp, grant('refresh-kept'), options);
+    const renewed = await refreshAccess(ledgerlyApp, grant('refresh-kept'), options);
     expect(renewed).toEqual({
       accessToken: 'access-kept',
       accessIssuedAt: '2026-11-14T12:00:00.000Z',
@@ -332,43 +330,43 @@ describe('refresh', () => {
     [{ status: 429, body: { error: 'slow_down' } }, 'unreachable'],
     [{ status: 401, body: { error: 'invalid_client' } }, 'client_refused'],
   ] as const)('answers %j as %s', async (reply, code) => {
-    serve((request) => (request.path === '/oauth/token' ? reply : undefined), homeBoard().handle);
-    expect(await codeOf(refreshAccess(homeBoardApp, grant('refresh-old'), options))).toBe(code);
+    serve((request) => (request.path === '/oauth/token' ? reply : undefined), ledgerly().handle);
+    expect(await codeOf(refreshAccess(ledgerlyApp, grant('refresh-old'), options))).toBe(code);
   });
 
   it('starts no token request once its signal is aborted', async () => {
-    serve(homeBoard().handle);
+    serve(ledgerly().handle);
     const stopped = AbortSignal.abort();
-    await expect(refreshAccess(homeBoardApp, grant('refresh-old'), { ...options, signal: stopped })).rejects.toBe(
+    await expect(refreshAccess(ledgerlyApp, grant('refresh-old'), { ...options, signal: stopped })).rejects.toBe(
       stopped.reason,
     );
     expect(tokenRequests()).toBe(0);
   });
 
   it('refuses renewal once the resource names another authorization server', async () => {
-    const app = homeBoard();
+    const app = ledgerly();
     app.resourceMetadata.authorization_servers = ['https://auth.example.test'];
     serve(app.handle);
-    expect(await codeOf(refreshAccess(homeBoardApp, grant('refresh-old'), options))).toBe('issuer_changed');
+    expect(await codeOf(refreshAccess(ledgerlyApp, grant('refresh-old'), options))).toBe('issuer_changed');
     expect(tokenRequests()).toBe(0);
   });
 });
 
 describe('revocation', () => {
-  const released = { kind: 'oauth', generation: 1, refreshToken: 'refresh-ended', client: HOMEBOARD_CLIENT } as const;
+  const released = { kind: 'oauth', generation: 1, refreshToken: 'refresh-ended', client: LEDGERLY_CLIENT } as const;
 
   it('does not fail the caller when the endpoint answers 500', async () => {
     serve(
       (request) => (request.path === '/oauth/revoke' ? { status: 500, body: 'boom' } : undefined),
-      homeBoard().handle,
+      ledgerly().handle,
     );
-    expect(await revokeGrant(HOMEBOARD_ISSUER, released, options)).toBe('failed');
+    expect(await revokeGrant(LEDGERLY_ISSUER, released, options)).toBe('failed');
   });
 
   it('answers unreachable discovery and grants with nothing to revoke without throwing', async () => {
     serve(() => ({ status: 503 }));
-    expect(await revokeGrant(HOMEBOARD_ISSUER, released, options)).toBe('failed');
-    expect(await revokeGrant(HOMEBOARD_ISSUER, { kind: 'token', generation: 1, token: SENTINEL }, options)).toBe(
+    expect(await revokeGrant(LEDGERLY_ISSUER, released, options)).toBe('failed');
+    expect(await revokeGrant(LEDGERLY_ISSUER, { kind: 'token', generation: 1, token: SENTINEL }, options)).toBe(
       'nothing',
     );
     expect(await revokeGrant(null, released, options)).toBe('nothing');
@@ -402,7 +400,7 @@ describe('what crosses the boundary', () => {
         request.path === '/oauth/revoke'
           ? { status: 400, body: { error: 'x', error_description: SENTINEL } }
           : undefined,
-      homeBoard().handle,
+      ledgerly().handle,
       ledger.handle,
     );
 
@@ -415,21 +413,21 @@ describe('what crosses the boundary', () => {
         ),
       );
     };
-    const homeBoardApp = { url: HOMEBOARD, issuer: HOMEBOARD_ISSUER };
-    await settle(refreshAccess(homeBoardApp, { refreshToken: 'refresh-json', client: HOMEBOARD_CLIENT }, options));
-    await settle(refreshAccess(homeBoardApp, { refreshToken: 'refresh-html', client: HOMEBOARD_CLIENT }, options));
+    const ledgerlyApp = { url: LEDGERLY, issuer: LEDGERLY_ISSUER };
+    await settle(refreshAccess(ledgerlyApp, { refreshToken: 'refresh-json', client: LEDGERLY_CLIENT }, options));
+    await settle(refreshAccess(ledgerlyApp, { refreshToken: 'refresh-html', client: LEDGERLY_CLIENT }, options));
     const pending = {
-      issuer: HOMEBOARD_ISSUER,
+      issuer: LEDGERLY_ISSUER,
       verifier: 'v'.repeat(43),
-      redirectUri: HOMEBOARD_REDIRECT,
-      resource: HOMEBOARD,
+      redirectUri: LEDGERLY_REDIRECT,
+      resource: LEDGERLY,
     };
-    await settle(completeAuthorization(new URLSearchParams({ code: 'code-1' }), pending, HOMEBOARD_CLIENT, options));
+    await settle(completeAuthorization(new URLSearchParams({ code: 'code-1' }), pending, LEDGERLY_CLIENT, options));
     await settle(
       completeAuthorization(
         new URLSearchParams({ error: 'invalid_scope', error_description: SENTINEL }),
         pending,
-        HOMEBOARD_CLIENT,
+        LEDGERLY_CLIENT,
         options,
       ),
     );
@@ -445,8 +443,8 @@ describe('what crosses the boundary', () => {
     );
     await settle(
       revokeGrant(
-        HOMEBOARD_ISSUER,
-        { kind: 'oauth', generation: 1, refreshToken: 'refresh-x', client: HOMEBOARD_CLIENT },
+        LEDGERLY_ISSUER,
+        { kind: 'oauth', generation: 1, refreshToken: 'refresh-x', client: LEDGERLY_CLIENT },
         options,
       ),
     );
@@ -470,7 +468,7 @@ describe('what crosses the boundary', () => {
   });
 });
 
-describe('a HomeBoard-shaped server end to end', () => {
+describe('a Ledgerly-shaped server end to end', () => {
   let directory: string;
   afterEach(async () => {
     if (directory) await rm(directory, { recursive: true, force: true });
@@ -479,7 +477,7 @@ describe('a HomeBoard-shaped server end to end', () => {
   it('admits, probes, takes client details, signs in, exchanges, refreshes and revokes', async () => {
     directory = await mkdtemp(path.join(os.tmpdir(), 'connections-oauth-'));
     const { store } = testConnectionsStore(path.join(directory, 'connections'));
-    const fake = homeBoard({ issParameter: true });
+    const fake = ledgerly({ issParameter: true });
     serve(fake.handle);
     const admission: AdmissionDependencies = {
       appByHost: (host) => store.byHost(host),
@@ -488,20 +486,20 @@ describe('a HomeBoard-shaped server end to end', () => {
       protectedHosts: async () => new Set([ASSISTANT]),
     };
 
-    const admitted = await admitAppUrl(HOMEBOARD, admission);
-    if (!admitted.admitted) throw new Error('HomeBoard is admitted');
+    const admitted = await admitAppUrl(LEDGERLY, admission);
+    if (!admitted.admitted) throw new Error('Ledgerly is admitted');
     const probe = await probeApp(admitted.url, options);
-    if (probe.status !== 'ok' || probe.method.kind !== 'oauth') throw new Error('HomeBoard signs in with OAuth');
+    if (probe.status !== 'ok' || probe.method.kind !== 'oauth') throw new Error('Ledgerly signs in with OAuth');
     expect(probe.method.dynamicRegistration).toBe(false);
     const created = await store.create({
-      name: 'HomeBoard',
+      name: 'Ledgerly',
       url: admitted.url,
       auth: 'oauth',
       issuer: probe.method.issuer,
     });
     const app = await store.setClient(created.id, created.version, {
       issuer: probe.method.issuer,
-      client: HOMEBOARD_CLIENT,
+      client: LEDGERLY_CLIENT,
       entered: true,
     });
 
@@ -510,20 +508,20 @@ describe('a HomeBoard-shaped server end to end', () => {
     const signIn = again.method.signIn;
     const { client } = await clientForSignIn(
       signIn,
-      { issuer: app.issuer, client: HOMEBOARD_CLIENT },
-      { host: app.host, redirectUri: HOMEBOARD_REDIRECT },
+      { issuer: app.issuer, client: LEDGERLY_CLIENT },
+      { host: app.host, redirectUri: LEDGERLY_REDIRECT },
       options,
     );
-    const prepared = await prepareAuthorization(signIn, client, HOMEBOARD_REDIRECT);
+    const prepared = await prepareAuthorization(signIn, client, LEDGERLY_REDIRECT);
     const { state } = await store.startSignIn(app.id, app.version, {
       principalId: 'gchat:morgan',
       verifier: prepared.verifier,
       issuer: signIn.server.issuer,
-      redirectUri: HOMEBOARD_REDIRECT,
+      redirectUri: LEDGERLY_REDIRECT,
       resource: signIn.resource,
     });
     const { redirectUri, query } = fake.approve(prepared.authorizationUrl(state));
-    expect(redirectUri).toBe(HOMEBOARD_REDIRECT);
+    expect(redirectUri).toBe(LEDGERLY_REDIRECT);
 
     const claim = await store.claimSignIn(query.get('state') ?? '', { host: app.host, principalId: 'gchat:morgan' });
     if (!claim) throw new Error('The return claims its sign-in');

@@ -163,7 +163,7 @@ interface PendingCode {
 }
 
 /**
- * An MCP server with OAuth in the shape HomeBoard publishes by default: protected-resource and authorization-server
+ * An MCP server with OAuth in the shape Ledgerly publishes by default: protected-resource and authorization-server
  * metadata, PKCE S256, refresh tokens with rotation, revocation, `client_secret_basic` or `client_secret_post`, and
  * no registration endpoint unless asked for.
  */
@@ -185,7 +185,7 @@ export class FakeMcpApp {
     this.app = new URL(options.appUrl);
     this.issuer = new URL(options.issuer);
     this.issParameter = options.issParameter ?? false;
-    this.serverName = options.serverName ?? 'HomeBoard';
+    this.serverName = options.serverName ?? 'Ledgerly';
     const at = (route: string): string => new URL(route, this.issuer).href;
     this.resourceMetadata = {
       resource: this.app.href,

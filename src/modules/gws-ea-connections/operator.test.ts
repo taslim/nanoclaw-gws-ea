@@ -14,8 +14,8 @@ import type { ConnectionsStore } from './store.js';
 import { testConnectionsStore } from './testing/store.js';
 
 const MAIN = 'ag-main';
-const HOMEBOARD_HOST = 'homeboard.nownow.ai';
-const HOMEBOARD = { type: 'http', url: `https://${HOMEBOARD_HOST}/mcp` };
+const LEDGERLY_HOST = 'app.ledgerly.example.test';
+const LEDGERLY = { type: 'http', url: `https://${LEDGERLY_HOST}/mcp` };
 const MODEL_HOST = 'api.anthropic.com';
 const SENTINEL_NAME = 'sentinel-credential-name-H6p1';
 const SENTINEL_FAILURE = 'sentinel-gateway-failure-Z9w3';
@@ -105,11 +105,11 @@ function assertNoSentinels(): void {
 
 describe('disconnectOperatorServer', () => {
   it('removes a hand-wired server and its Bearer credential, leaving other hosts’ credentials, and restarts main', async () => {
-    await updateContainerConfigJson(MAIN, 'mcp_servers', { homeboard: HOMEBOARD, calendar: { command: 'cal-mcp' } });
-    credentials.hold('secret-homeboard', 'homeboard', HOMEBOARD_HOST);
+    await updateContainerConfigJson(MAIN, 'mcp_servers', { ledgerly: LEDGERLY, calendar: { command: 'cal-mcp' } });
+    credentials.hold('secret-ledgerly', 'ledgerly', LEDGERLY_HOST);
     credentials.hold('secret-ledger', 'ledger', 'mcp.ledger.example.test');
 
-    expect(await disconnectOperatorServer(store, { key: 'homeboard', host: HOMEBOARD_HOST }, dependencies())).toBe(
+    expect(await disconnectOperatorServer(store, { key: 'ledgerly', host: LEDGERLY_HOST }, dependencies())).toBe(
       'disconnected',
     );
 
@@ -120,15 +120,15 @@ describe('disconnectOperatorServer', () => {
 
   it('never removes the assistant’s own credentials on the host: app, Google or model', async () => {
     await updateContainerConfigJson(MAIN, 'mcp_servers', {
-      homeboard: HOMEBOARD,
+      ledgerly: LEDGERLY,
       models: { type: 'http', url: `https://${MODEL_HOST}/mcp` },
     });
-    credentials.hold('secret-homeboard', SENTINEL_NAME, HOMEBOARD_HOST);
-    credentials.hold('secret-app', appCredentialName('5b0d7f3e-2c4a-4e8b-9f61-7a3c2e1d0b9f'), HOMEBOARD_HOST);
-    credentials.hold('secret-google', 'google-calendar', HOMEBOARD_HOST);
+    credentials.hold('secret-ledgerly', SENTINEL_NAME, LEDGERLY_HOST);
+    credentials.hold('secret-app', appCredentialName('5b0d7f3e-2c4a-4e8b-9f61-7a3c2e1d0b9f'), LEDGERLY_HOST);
+    credentials.hold('secret-google', 'google-calendar', LEDGERLY_HOST);
     credentials.hold('secret-model', 'Anthropic', MODEL_HOST);
 
-    expect(await disconnectOperatorServer(store, { key: 'homeboard', host: HOMEBOARD_HOST }, dependencies())).toBe(
+    expect(await disconnectOperatorServer(store, { key: 'ledgerly', host: LEDGERLY_HOST }, dependencies())).toBe(
       'disconnected',
     );
     expect(await disconnectOperatorServer(store, { key: 'models', host: MODEL_HOST }, dependencies())).toBe(
@@ -137,16 +137,16 @@ describe('disconnectOperatorServer', () => {
 
     expect(await mainServers()).toEqual({});
     expect([...credentials.held.keys()].sort()).toEqual(['secret-app', 'secret-google', 'secret-model']);
-    expect(credentials.listed).toEqual([HOMEBOARD_HOST]);
+    expect(credentials.listed).toEqual([LEDGERLY_HOST]);
     assertNoSentinels();
   });
 
   it('keeps the host’s credentials while another operator server in main still uses that host', async () => {
-    const boards = { type: 'http', url: `https://${HOMEBOARD_HOST}/boards/mcp` };
-    await updateContainerConfigJson(MAIN, 'mcp_servers', { homeboard: HOMEBOARD, boards });
-    credentials.hold('secret-bearer', 'homeboard', HOMEBOARD_HOST);
+    const boards = { type: 'http', url: `https://${LEDGERLY_HOST}/boards/mcp` };
+    await updateContainerConfigJson(MAIN, 'mcp_servers', { ledgerly: LEDGERLY, boards });
+    credentials.hold('secret-bearer', 'ledgerly', LEDGERLY_HOST);
 
-    expect(await disconnectOperatorServer(store, { key: 'homeboard', host: HOMEBOARD_HOST }, dependencies())).toBe(
+    expect(await disconnectOperatorServer(store, { key: 'ledgerly', host: LEDGERLY_HOST }, dependencies())).toBe(
       'disconnected',
     );
     expect(await mainServers()).toEqual({ boards });
@@ -154,7 +154,7 @@ describe('disconnectOperatorServer', () => {
     expect(await store.pendingRestart()).toBeDefined();
 
     // The last server on the host takes the host's credentials with it.
-    expect(await disconnectOperatorServer(store, { key: 'boards', host: HOMEBOARD_HOST }, dependencies())).toBe(
+    expect(await disconnectOperatorServer(store, { key: 'boards', host: LEDGERLY_HOST }, dependencies())).toBe(
       'disconnected',
     );
     expect(await mainServers()).toEqual({});
@@ -162,14 +162,14 @@ describe('disconnectOperatorServer', () => {
   });
 
   it('removes the host’s credentials once when two servers on it are disconnected together', async () => {
-    const boards = { type: 'http', url: `https://${HOMEBOARD_HOST}/boards/mcp` };
-    await updateContainerConfigJson(MAIN, 'mcp_servers', { homeboard: HOMEBOARD, boards });
-    credentials.hold('secret-bearer', 'homeboard', HOMEBOARD_HOST);
+    const boards = { type: 'http', url: `https://${LEDGERLY_HOST}/boards/mcp` };
+    await updateContainerConfigJson(MAIN, 'mcp_servers', { ledgerly: LEDGERLY, boards });
+    credentials.hold('secret-bearer', 'ledgerly', LEDGERLY_HOST);
 
     expect(
       await Promise.all([
-        disconnectOperatorServer(store, { key: 'homeboard', host: HOMEBOARD_HOST }, dependencies()),
-        disconnectOperatorServer(store, { key: 'boards', host: HOMEBOARD_HOST }, dependencies()),
+        disconnectOperatorServer(store, { key: 'ledgerly', host: LEDGERLY_HOST }, dependencies()),
+        disconnectOperatorServer(store, { key: 'boards', host: LEDGERLY_HOST }, dependencies()),
       ]),
     ).toEqual(['disconnected', 'disconnected']);
     expect(await mainServers()).toEqual({});
@@ -177,14 +177,14 @@ describe('disconnectOperatorServer', () => {
   });
 
   it('keeps the server when a credential stays, and the next try removes the rest and the server', async () => {
-    await updateContainerConfigJson(MAIN, 'mcp_servers', { homeboard: HOMEBOARD });
-    credentials.hold('secret-bearer', SENTINEL_NAME, HOMEBOARD_HOST);
-    credentials.hold('secret-workspace', 'homeboard-workspace', HOMEBOARD_HOST);
+    await updateContainerConfigJson(MAIN, 'mcp_servers', { ledgerly: LEDGERLY });
+    credentials.hold('secret-bearer', SENTINEL_NAME, LEDGERLY_HOST);
+    credentials.hold('secret-workspace', 'ledgerly-workspace', LEDGERLY_HOST);
     credentials.failing.add('secret-workspace');
-    const request = { key: 'homeboard', host: HOMEBOARD_HOST };
+    const request = { key: 'ledgerly', host: LEDGERLY_HOST };
 
     expect(await disconnectOperatorServer(store, request, dependencies())).toBe('credentials_kept');
-    expect(await mainServers()).toEqual({ homeboard: HOMEBOARD });
+    expect(await mainServers()).toEqual({ ledgerly: LEDGERLY });
     expect([...credentials.held.keys()]).toEqual(['secret-workspace']);
     expect(await store.pendingRestart()).toBeUndefined();
 
@@ -196,14 +196,14 @@ describe('disconnectOperatorServer', () => {
   });
 
   it('keeps the server when the gateway cannot list the host’s credentials', async () => {
-    await updateContainerConfigJson(MAIN, 'mcp_servers', { homeboard: HOMEBOARD });
-    credentials.hold('secret-bearer', 'homeboard', HOMEBOARD_HOST);
+    await updateContainerConfigJson(MAIN, 'mcp_servers', { ledgerly: LEDGERLY });
+    credentials.hold('secret-bearer', 'ledgerly', LEDGERLY_HOST);
     credentials.listFails = true;
 
-    expect(await disconnectOperatorServer(store, { key: 'homeboard', host: HOMEBOARD_HOST }, dependencies())).toBe(
+    expect(await disconnectOperatorServer(store, { key: 'ledgerly', host: LEDGERLY_HOST }, dependencies())).toBe(
       'credentials_kept',
     );
-    expect(await mainServers()).toEqual({ homeboard: HOMEBOARD });
+    expect(await mainServers()).toEqual({ ledgerly: LEDGERLY });
     expect(credentials.held.size).toBe(1);
     assertNoSentinels();
   });
@@ -222,7 +222,7 @@ describe('disconnectOperatorServer', () => {
       ['app_5b0d7f3e', 'notes.example.test'],
       ['calendar', ''],
       ['travel', 'travel.example.test'],
-      ['homeboard', HOMEBOARD_HOST],
+      ['ledgerly', LEDGERLY_HOST],
     ] as const)
       expect(await disconnectOperatorServer(store, { key, host }, dependencies())).toBe('not_found');
 
@@ -233,27 +233,27 @@ describe('disconnectOperatorServer', () => {
 
   it('refuses when the entry now points at another host than the one confirmed', async () => {
     await updateContainerConfigJson(MAIN, 'mcp_servers', {
-      homeboard: { type: 'http', url: 'https://boards.example.test/mcp' },
+      ledgerly: { type: 'http', url: 'https://boards.example.test/mcp' },
     });
     credentials.hold('secret-boards', 'boards', 'boards.example.test');
 
-    expect(await disconnectOperatorServer(store, { key: 'homeboard', host: HOMEBOARD_HOST }, dependencies())).toBe(
+    expect(await disconnectOperatorServer(store, { key: 'ledgerly', host: LEDGERLY_HOST }, dependencies())).toBe(
       'changed',
     );
-    expect(Object.keys(await mainServers())).toEqual(['homeboard']);
+    expect(Object.keys(await mainServers())).toEqual(['ledgerly']);
     expect(credentials.held.size).toBe(1);
   });
 
   it('is unavailable on a gateway that cannot list and remove credentials by host', async () => {
-    await updateContainerConfigJson(MAIN, 'mcp_servers', { homeboard: HOMEBOARD });
+    await updateContainerConfigJson(MAIN, 'mcp_servers', { ledgerly: LEDGERLY });
 
     expect(
       await disconnectOperatorServer(
         store,
-        { key: 'homeboard', host: HOMEBOARD_HOST },
+        { key: 'ledgerly', host: LEDGERLY_HOST },
         dependencies({ credentials: undefined }),
       ),
     ).toBe('unavailable');
-    expect(await mainServers()).toEqual({ homeboard: HOMEBOARD });
+    expect(await mainServers()).toEqual({ ledgerly: LEDGERLY });
   });
 });

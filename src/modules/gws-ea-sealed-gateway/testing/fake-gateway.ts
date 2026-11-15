@@ -29,7 +29,7 @@ export interface FakeGateway {
 
 export const GATEWAY_URL = 'http://onecli.example.test';
 export const MODEL_SECRET: FakeGatewaySecret = { id: 'model', hostPattern: 'api.anthropic.com' };
-export const APP_SECRET: FakeGatewaySecret = { id: 'homeboard', hostPattern: 'homeboard.nownow.ai' };
+export const APP_SECRET: FakeGatewaySecret = { id: 'ledgerly', hostPattern: 'app.ledgerly.example.test' };
 
 export function useFakeGateway(secrets: readonly FakeGatewaySecret[] = [MODEL_SECRET, APP_SECRET]): FakeGateway {
   const agents = new Map<string, FakeGatewayAgent>();
