@@ -19,6 +19,7 @@ import { withAppLock } from './locks.js';
 import { appRedirectUri, type ConnectionFetches } from './oauth.js';
 import {
   createConnectionsRefresher,
+  REFRESH_TICK_MS,
   startConnectionsRefresher,
   stopConnectionsRefresher,
   type AppGateway,
@@ -333,10 +334,10 @@ describe('renewal timing', () => {
       if (tokens.presented.length > before) renewedAt.push(minute);
     }
 
-    // Each token is renewed once less than 2.5 of its 5 minutes remain: at minutes 3, 6 and 9.
-    expect(renewedAt).toEqual([3, 6, 9]);
-    expect(gateway.valueFor(app)).toBe('sentinel-access-3');
-    expect(await grantOf(app)).toMatchObject({ accessExpiresAt: new Date(START + 14 * MINUTE).toISOString() });
+    // Each token is renewed once less than 2.5 of its 5 minutes would remain at the next tick: every other minute.
+    expect(renewedAt).toEqual([2, 4, 6, 8]);
+    expect(gateway.valueFor(app)).toBe('sentinel-access-4');
+    expect(await grantOf(app)).toMatchObject({ accessExpiresAt: new Date(START + 13 * MINUTE).toISOString() });
   });
 
   it('renews a token issued without expires_in after about 45 minutes', async () => {
@@ -363,23 +364,24 @@ describe('renewal timing', () => {
     expect(gateway.valueFor(app)).toBe('sentinel-access-2');
   });
 
-  it('keeps a short-lived grant working across several expiries', async () => {
+  it('keeps a short-lived grant working until the next tick, signed in between ticks and with ticks running late', async () => {
     const tokens = serveApp(LEDGERLY);
     tokens.expiresIn = 120;
+    // Signed in 58 seconds before the first tick, so its renewal point falls between that tick and the next.
     const app = await publishedOAuthApp('Ledgerly', LEDGERLY, {
       refreshToken: 'sentinel-refresh-home',
-      issuedAt: START,
-      expiresAt: START + 2 * MINUTE,
+      issuedAt: START - 58_000,
+      expiresAt: START + 62_000,
     });
     const refresher = createConnectionsRefresher(dependencies());
-    for (let minute = 1; minute <= 12; minute += 1) {
-      clock = START + minute * MINUTE;
+    const period = REFRESH_TICK_MS + 5_000;
+    for (let tick = 0; tick <= 10; tick += 1) {
+      clock = START + tick * period;
       await refresher.tick();
       const grant = await grantOf(app);
       if (grant?.kind !== 'oauth') throw new Error('The grant ended');
-      expect(Date.parse(grant.accessExpiresAt)).toBeGreaterThan(clock);
+      expect(Date.parse(grant.accessExpiresAt)).toBeGreaterThan(clock + period);
     }
-    expect(tokens.issued).toBeGreaterThanOrEqual(6);
     expect(gateway.valueFor(app)).toBe(`sentinel-access-${tokens.issued}`);
   });
 });
@@ -404,16 +406,17 @@ describe('durable rotation', () => {
     expect(gateway.valueFor(app)).toBe('sentinel-access-1');
   });
 
-  it('publishes nothing when the rotation cannot be stored', async () => {
-    serveApp(LEDGERLY);
+  it('publishes nothing when the rotation cannot be stored, and stores that rotation next instead of renewing again', async () => {
+    const tokens = serveApp(LEDGERLY);
     const app = await publishedOAuthApp('Ledgerly', LEDGERLY, {
       refreshToken: 'sentinel-refresh-home',
       issuedAt: START - 55 * MINUTE,
       expiresAt: START + 5 * MINUTE,
     });
     vi.spyOn(store, 'rotateGrant').mockRejectedValueOnce(new ConnectionsStoreError('store_unavailable'));
+    const refresher = createConnectionsRefresher(dependencies());
 
-    await createConnectionsRefresher(dependencies()).tick();
+    await refresher.tick();
 
     expect(gateway.saves).toBe(0);
     expect(gateway.valueFor(app)).toBe('sentinel-access-at-sign-in');
@@ -422,6 +425,18 @@ describe('durable rotation', () => {
       message: 'Could not renew app access; retrying',
       fields: { appId: app.id, code: 'store_unavailable' },
     });
+
+    // The server rotated the refresh token, so it now refuses the one it replaced.
+    tokens.queued.push({ status: 400, body: { error: 'invalid_grant' } });
+    clock = START + MINUTE;
+    await refresher.tick();
+
+    expect(tokens.presented).toEqual(['sentinel-refresh-home']);
+    expect(await store.readGrant(app.id, (await grantOf(app))?.generation ?? -1)).toMatchObject({
+      refreshToken: 'sentinel-refresh-1',
+    });
+    expect(gateway.valueFor(app)).toBe('sentinel-access-1');
+    expect((await store.apps())[0]).toMatchObject({ status: 'connected' });
   });
 
   it('publishes a stored renewal the gateway missed on the next tick without renewing again', async () => {

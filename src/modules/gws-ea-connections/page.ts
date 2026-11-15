@@ -28,7 +28,7 @@ import {
   type OperatorDisconnectDependencies,
   type OperatorDisconnectOutcome,
 } from './operator.js';
-import { renderConnectionsPage, type ConnectionsView } from './page-view.js';
+import { renderConnectionsPage, type ConnectionsPageState, type ConnectionsView } from './page-view.js';
 import { ConnectionsStoreError, getConnectionsStore, NAME_MAX } from './store.js';
 
 /** Builds the operations for one request; a store that cannot be opened leaves the page listing what it can. */
@@ -264,7 +264,7 @@ interface WriteResult {
   /** A saved change that did not finish, shown as an error. */
   readonly failed?: boolean;
   readonly addName?: string;
-  readonly retryServer?: string;
+  readonly retryServer?: ConnectionsPageState['retryServer'];
 }
 
 async function write(
@@ -337,16 +337,13 @@ async function write(
       only(data, ['key', 'host']);
       const key = text(data, 'key');
       if (!key) throw new InvalidSubmission();
-      const outcome = await disconnectOperatorServer(
-        operations.store,
-        { key, host: text(data, 'host') },
-        operatorDependencies,
-      );
+      const host = text(data, 'host');
+      const outcome = await disconnectOperatorServer(operations.store, { key, host }, operatorDependencies);
       if (outcome === 'disconnected')
         return done({ kind: 'list' }, 'Server disconnected. Your assistant no longer has its tools.');
       const { status, message } = operatorMessage(outcome);
       if (outcome !== 'credentials_kept') return refused({ kind: 'list' }, message, status);
-      return { ...done({ kind: 'list' }, message), failed: true, retryServer: key };
+      return { ...done({ kind: 'list' }, message), failed: true, retryServer: { key, host } };
     }
   }
 }

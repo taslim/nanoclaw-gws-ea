@@ -48,7 +48,8 @@ export function createArtifactViewHandler(
         'cache-control': 'no-store',
         'content-type': 'text/plain; charset=utf-8',
         'x-content-type-options': 'nosniff',
-        'content-security-policy': "default-src 'none'; frame-ancestors 'none'",
+        // Sandboxed too: the web server drops any response on a document path without an opaque-origin sandbox.
+        'content-security-policy': "default-src 'none'; frame-ancestors 'none'; sandbox",
       });
       response.end(request.method === 'HEAD' ? undefined : body);
     };

@@ -30,8 +30,10 @@ export async function reconcileBrowserGroup(root?: string): Promise<void> {
 }
 
 /**
- * The pass before each browser request: routes only, so a slow or unreachable gateway admin never delays or refuses
- * a running errand. Admission still reads the identity's drift before every browser session starts.
+ * The pass before each browser request: routes only, so no request waits on the gateway admin. A sweep that cannot
+ * confirm browser's gateway identity closes admission until one does, running errands included: an identity that
+ * may have drifted to all secrets must not keep serving untrusted pages. Admission also reads the identity's drift
+ * before every browser session starts.
  */
 export async function reconcileBrowserRoutes(): Promise<void> {
   await closingAdmissionOnFailure(async () => {

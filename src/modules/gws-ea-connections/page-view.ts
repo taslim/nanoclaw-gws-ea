@@ -28,8 +28,8 @@ export interface ConnectionsPageState {
   readonly redirectUri: (app: ConnectionApp) => string;
   /** The gateway can find and remove an operator server's credentials, so Disconnect is offered. */
   readonly operatorDisconnect: boolean;
-  /** The operator server whose disconnect just stopped part way, offered again as Retry. */
-  readonly retryServer?: string;
+  /** The operator server whose disconnect just stopped part way, and the host the principal confirmed for it. */
+  readonly retryServer?: { readonly key: string; readonly host: string };
 }
 
 const STATUS_LABELS = {
@@ -105,8 +105,9 @@ function operatorConfirmation(server: OperatorServer): string {
 
 function operatorAction(server: OperatorServer, index: number, state: ConnectionsPageState): string {
   if (!state.operatorDisconnect) return '<span class="row-note">Disconnect unavailable</span>';
-  // The principal already confirmed this disconnect, so trying again does not ask a second time.
-  if (state.retryServer === server.key)
+  // The principal already confirmed this disconnect, so trying again does not ask a second time, unless the entry
+  // now points at a host other than the one they confirmed.
+  if (state.retryServer?.key === server.key && state.retryServer.host === (operatorServerHost(server) ?? ''))
     return `<form class="row-action" method="post" action="/connections/disconnect-operator" data-send>${hiddenServer(server)}<button class="button button-secondary" type="submit" data-pending-label="Disconnecting…">Retry</button></form>`;
   return renderMenu(`operator-menu-${index}`, `Actions for ${server.key}`, [
     `<form method="post" action="/connections/disconnect-operator" data-send ${operatorConfirmation(server)}>${hiddenServer(server)}<button type="submit" role="menuitem" tabindex="-1" data-pending-label="Disconnecting…" data-danger>Disconnect</button></form>`,

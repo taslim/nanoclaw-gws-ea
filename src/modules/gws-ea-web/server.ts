@@ -55,17 +55,33 @@ function policies(
   return values;
 }
 
-/** The artifacts' same-origin JSON check relies on authored content never sharing the host's origin. */
+/** CSP splits on ASCII whitespace only, so a directive joined by any other space is not the directive it looks like. */
+const CSP_WHITESPACE = /[\t\n\f\r ]+/u;
+
+/**
+ * The host's same-origin JSON checks rely on authored content never sharing the host's origin. Every policy must
+ * carry the sandbox: a writeHead header replaces one set earlier, so only a sandbox in each one survives whichever
+ * Node sends.
+ */
 function sandboxedOpaque(csp: readonly string[]): boolean {
-  const sandboxes = csp
-    .flatMap((policy) => policy.split(','))
-    .flatMap((policy) => policy.split(';'))
-    .map((directive) => directive.trim().toLowerCase().split(/\s+/u))
-    .filter(([name]) => name === 'sandbox');
-  return sandboxes.length > 0 && sandboxes.every((tokens) => !tokens.includes('allow-same-origin'));
+  const policies = csp.flatMap((value) => value.split(','));
+  return (
+    policies.length > 0 &&
+    policies.every((policy) => {
+      // A repeated directive is ignored, so the first sandbox is the one the browser applies.
+      const sandbox = policy
+        .split(';')
+        .map((directive) => directive.toLowerCase().split(CSP_WHITESPACE).filter(Boolean))
+        .find(([name]) => name === 'sandbox');
+      return sandbox !== undefined && !sandbox.includes('allow-same-origin');
+    })
+  );
 }
 
-/** A successful authored-content response without an opaque-origin sandbox is dropped before any byte is sent. */
+/**
+ * An authored-content response without an opaque-origin sandbox is dropped before any byte is sent, whatever its
+ * status: a browser runs an error document's scripts too.
+ */
 function requireSandbox(response: ServerResponse, mount: ArtifactReadersMount): void {
   const writeHead = response.writeHead.bind(response);
   response.writeHead = ((
@@ -75,7 +91,7 @@ function requireSandbox(response: ServerResponse, mount: ArtifactReadersMount): 
   ) => {
     if (response.destroyed) return response;
     const written = typeof reason === 'string' ? headers : reason;
-    if (statusCode >= 200 && statusCode < 300 && !sandboxedOpaque(policies(response, written))) {
+    if (!sandboxedOpaque(policies(response, written))) {
       log.error('Web mount sent authored content without an opaque-origin sandbox', { mount: mount.name });
       response.destroy();
       return response;

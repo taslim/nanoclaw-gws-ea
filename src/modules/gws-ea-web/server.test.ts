@@ -242,7 +242,7 @@ it('refuses a wrong Host header before any mount or identity check runs', async 
   expect(verified).toEqual([]);
 });
 
-it('drops a successful authored-content response that lacks an opaque-origin sandbox', async () => {
+it('drops an authored-content response of any status unless every policy it sends has an opaque-origin sandbox', async () => {
   const cases: readonly [string, RequestListener, number | 'reset'][] = [
     [
       '/artifacts/id/frame',
@@ -272,8 +272,48 @@ it('drops a successful authored-content response that lacks an opaque-origin san
       },
       200,
     ],
-    ['/artifacts/id/frame', (_request, response) => response.writeHead(404, 'Not Found', {}).end(), 404],
-    ['/artifacts/id/frame', (_request, response) => response.writeHead(503).end(), 503],
+    [
+      '/artifacts/id/frame',
+      (_request, response) => {
+        response.setHeader('content-security-policy', SANDBOX);
+        response.writeHead(200, { 'content-security-policy': "default-src 'self' 'unsafe-inline'" }).end('x');
+      },
+      'reset',
+    ],
+    [
+      '/artifacts/id/frame',
+      (_request, response) =>
+        response
+          .writeHead(200, { 'content-security-policy': "default-src 'none'; sandbox\u00a0allow-scripts" })
+          .end('x'),
+      'reset',
+    ],
+    [
+      '/artifacts/id/frame',
+      (_request, response) =>
+        response.writeHead(200, { 'content-security-policy': `default-src *, ${SANDBOX}` }).end('x'),
+      'reset',
+    ],
+    [
+      '/artifacts/id/frame',
+      (_request, response) =>
+        response
+          .writeHead(200, { 'content-security-policy': `sandbox allow-same-origin allow-scripts; ${SANDBOX}` })
+          .end('x'),
+      'reset',
+    ],
+    [
+      '/artifacts/id/frame',
+      (_request, response) => response.writeHead(404, 'Not Found', { 'content-security-policy': SANDBOX }).end(),
+      404,
+    ],
+    [
+      '/artifacts/id/frame',
+      (_request, response) =>
+        response.writeHead(404, { 'content-type': 'text/html' }).end('<script>parent.postMessage(1, "*")</script>'),
+      'reset',
+    ],
+    ['/artifacts/id/frame', (_request, response) => response.writeHead(503).end(), 'reset'],
     [
       '/artifacts/id',
       (_request, response) => response.writeHead(200, { 'content-security-policy': "default-src 'none'" }).end('shell'),

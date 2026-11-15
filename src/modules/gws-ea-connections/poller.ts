@@ -71,8 +71,10 @@ export function createPendingPoller<T>(options: PendingPollerOptions<T>): Pendin
   return {
     arm(context, signal) {
       if (signal.aborted) return;
-      armed = { context, signal };
-      signal.addEventListener('abort', stopTimer, { once: true });
+      const arming = { context, signal };
+      armed = arming;
+      // An earlier arming's signal no longer governs the timer once it is replaced.
+      signal.addEventListener('abort', () => armed === arming && stopTimer(), { once: true });
     },
     current: () => live()?.context,
     soon,

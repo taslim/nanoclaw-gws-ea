@@ -22,10 +22,19 @@ import { applyMainServers, MainServersUnreadableError } from './apply.js';
 import { publishAppCredential, removeAppCredential, type AppConnection } from './credentials.js';
 import { withAppLock } from './locks.js';
 import { ConnectionOAuthError, refreshAccess, type ConnectionFetches, type ConnectionOAuthCode } from './oauth.js';
-import { ConnectionsStoreError, type ConnectionApp, type ConnectionsStore, type LiveGrant } from './store.js';
+import {
+  ConnectionsStoreError,
+  type ConnectionApp,
+  type ConnectionsStore,
+  type GrantRotation,
+  type LiveGrant,
+} from './store.js';
 
 export const REFRESH_TICK_MS = 60_000;
-/** Renewal starts when less than this, or half the token's issued lifetime if shorter, remains. */
+/**
+ * Renewal starts once less than this, or half the token's issued lifetime if shorter, would remain at the next tick:
+ * a renewal point that falls between two ticks is met at the earlier one.
+ */
 export const RENEW_WITHIN_MS = 15 * 60_000;
 /**
  * How long host shutdown waits for a tick in flight, so a renewal's new refresh token is stored: longer than the
@@ -87,6 +96,16 @@ interface Unpublished {
 }
 
 /**
+ * A renewal the server issued that could not be stored. The server may already refuse the refresh token it replaced,
+ * so the next tick stores this one before asking for anything new.
+ */
+interface Unstored {
+  readonly generation: number;
+  readonly rotation: GrantRotation;
+  readonly accessToken: string;
+}
+
+/**
  * A refused client stays refused until the principal reconnects with a new registration, so it ends the grant like a
  * refused refresh token. A missing or malformed sign-in description, or any other unexpected answer, may be a server
  * mid-deploy: the grant is kept and asked again, and the app stays Connected.
@@ -112,7 +131,7 @@ function refusedForGood(code: ConnectionOAuthCode): boolean {
 export function renewalDue(grant: Pick<OAuthGrant, 'accessIssuedAt' | 'accessExpiresAt'>, now: number): boolean {
   const issued = Date.parse(grant.accessIssuedAt);
   const expires = Date.parse(grant.accessExpiresAt);
-  return expires - now < Math.min(RENEW_WITHIN_MS, (expires - issued) / 2);
+  return expires - (now + REFRESH_TICK_MS) < Math.min(RENEW_WITHIN_MS, (expires - issued) / 2);
 }
 
 /** Only a code crosses into a log line: an error's message may quote a server or name a URL. */
@@ -131,6 +150,7 @@ export function createConnectionsRefresher(dependencies: ConnectionsRefresherDep
   const now = dependencies.now ?? Date.now;
   const log = dependencies.log ?? hostLog;
   const unpublished = new Map<string, Unpublished>();
+  const unstored = new Map<string, Unstored>();
   let applyFailing = false;
 
   /**
@@ -180,6 +200,9 @@ export function createConnectionsRefresher(dependencies: ConnectionsRefresherDep
   }
 
   async function renew(app: ConnectionApp, grant: OAuthGrant, host: string | undefined): Promise<void> {
+    const held = unstored.get(app.id);
+    if (held?.generation === grant.generation) return storeRenewal(app, held);
+    unstored.delete(app.id);
     const credentials = await store.readGrant(app.id, grant.generation);
     if (credentials?.kind !== 'oauth' || credentials.refreshToken === undefined) return;
     if (app.issuer === null) throw new ConnectionsStoreError('store_unavailable');
@@ -205,14 +228,22 @@ export function createConnectionsRefresher(dependencies: ConnectionsRefresherDep
       accessIssuedAt: issued.accessIssuedAt,
       accessExpiresAt: issued.accessExpiresAt,
     };
+    return storeRenewal(app, { generation: grant.generation, rotation, accessToken: issued.accessToken });
+  }
+
+  async function storeRenewal(app: ConnectionApp, renewal: Unstored): Promise<void> {
+    unstored.set(app.id, renewal);
+    const stored = await store.rotateGrant(app.id, renewal.generation, renewal.rotation);
+    unstored.delete(app.id);
     // A grant ended or replaced meanwhile keeps its own credential; this token is discarded unpublished.
-    if (!(await store.rotateGrant(app.id, grant.generation, rotation))) return;
-    const token = {
-      generation: grant.generation,
-      accessExpiresAt: issued.accessExpiresAt,
-      accessToken: issued.accessToken,
-    };
-    await publish(app, token);
+    if (!stored) return;
+    // An access token that lapsed while its rotation waited is replaced by the next tick's renewal.
+    if (Date.parse(renewal.rotation.accessExpiresAt) <= now()) return;
+    await publish(app, {
+      generation: renewal.generation,
+      accessExpiresAt: renewal.rotation.accessExpiresAt,
+      accessToken: renewal.accessToken,
+    });
     log.info('Renewed app access', { appId: app.id });
   }
 

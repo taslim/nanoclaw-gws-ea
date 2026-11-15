@@ -175,7 +175,7 @@ async function commandDecide(cmd: CommandDef, input: GuardInput) {
   }
   const serverChange = mcpServerPolicies.size > 0 ? mcpServerChangeOf(cmd, args) : undefined;
   if (serverChange) {
-    for (const agentGroupId of await namedGroups(cmd, args)) {
+    for (const agentGroupId of await serverChangeGroups(cmd, args)) {
       const reason = await mcpServerChangeReason({ agentGroupId, ...serverChange });
       if (reason !== undefined)
         return DENY(`"${cmd.name}" may not change agent group ${agentGroupId}'s MCP servers: ${reason}`);
@@ -230,4 +230,23 @@ async function commandDecide(cmd: CommandDef, input: GuardInput) {
   }
 
   return ALLOW('open command');
+}
+
+/**
+ * The groups whose MCP servers a command changes. A template update that names no group restamps the sole group
+ * already carrying the plugin, so that group counts as named. A template that cannot be read changes nothing: the
+ * handler fails on the same read before it stamps anything.
+ */
+async function serverChangeGroups(cmd: CommandDef, args: Record<string, unknown>): Promise<string[]> {
+  const named = await namedGroups(cmd, args);
+  if (cmd.name !== 'groups-create' || named.length > 0 || typeof args.template !== 'string') return named;
+  // Loaded on use: the template layer reaches far into the host, which itself loads this guard.
+  const { groupsCarryingPlugin } = await import('../templates/restamp.js');
+  /* eslint-disable no-catch-all/no-catch-all -- any template read failure is the handler's to report */
+  try {
+    return (await groupsCarryingPlugin(args.template)).map((group) => group.id);
+  } catch {
+    return [];
+  }
+  /* eslint-enable no-catch-all/no-catch-all */
 }

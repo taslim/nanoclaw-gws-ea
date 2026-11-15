@@ -3,6 +3,7 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { createServer, request as httpRequest, type IncomingHttpHeaders, type Server } from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
+import { chromium } from 'playwright-core';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { closeDb, createAgentGroup, getDb, initTestDb, runMigrations } from '../../db/index.js';
@@ -401,6 +402,70 @@ describe('adding and connecting an OAuth app that needs a client', () => {
     expect((await onlyApp()).status).toBe('connected');
     expect(ledger.registrations).toHaveLength(1);
   });
+});
+
+const chromePath = process.env.GWS_EA_BROWSER_TEST_CHROME;
+/** Hop-by-hop and length headers the test server sent for its own connection, not for the page. */
+const CONNECTION_HEADERS = new Set(['connection', 'content-length', 'keep-alive', 'transfer-encoding']);
+
+describe('sign-in in Chrome', () => {
+  it.skipIf(!chromePath)(
+    'sends the app and the client details entered with it, then opens the server’s sign-in',
+    async () => {
+      const app = fakeLedgerly();
+      serve(app.handle);
+      expect((await post('/connections/add', { url: LEDGERLY, name: '' })).status).toBe(200);
+      const added = await onlyApp();
+      const browser = await chromium.launch({ executablePath: chromePath, headless: true });
+      try {
+        const context = await browser.newContext();
+        const started: unknown[] = [];
+        await context.route(`https://${HOST}/**`, async (route) => {
+          const sent = route.request();
+          const url = new URL(sent.url());
+          const body = sent.postData() ?? undefined;
+          if (url.pathname === '/connections/sign-in') started.push(JSON.parse(body ?? 'null'));
+          const headers = await sent.allHeaders();
+          const forwarded = Object.fromEntries(
+            ['content-type', 'origin', 'sec-fetch-site'].flatMap((name) =>
+              headers[name] ? [[name, headers[name]]] : [],
+            ),
+          );
+          const reply = await request(`${url.pathname}${url.search}`, sent.method(), forwarded, body);
+          await route.fulfill({
+            status: reply.status,
+            headers: Object.fromEntries(
+              Object.entries(reply.headers).flatMap(([name, value]) =>
+                CONNECTION_HEADERS.has(name) || value === undefined
+                  ? []
+                  : [[name, Array.isArray(value) ? value.join(', ') : value]],
+              ),
+            ),
+            body: reply.body,
+          });
+        });
+        await context.route('https://app.ledgerly.example.test/**', (route) =>
+          route.fulfill({ status: 200, contentType: 'text/html', body: '<title>Sign in</title>' }),
+        );
+        const page = await context.newPage();
+        page.setDefaultTimeout(5000);
+        await page.goto(`https://${HOST}/connections/app/${added.id}/connect`);
+        await page.getByLabel('Client ID').fill(CLIENT_ID);
+        await page.getByLabel(/Client secret/u).fill(SENTINEL_SECRET);
+        await page.getByRole('button', { name: 'Continue to sign in' }).click();
+        await page.waitForURL('https://app.ledgerly.example.test/**');
+
+        expect(started).toEqual([
+          { id: added.id, version: String(added.version), clientId: CLIENT_ID, clientSecret: SENTINEL_SECRET },
+        ]);
+        expect(signInRow(added.id)).toEqual({ claimed_at: null });
+        await context.close();
+      } finally {
+        await browser.close();
+      }
+    },
+    30_000,
+  );
 });
 
 describe('client details the server refuses', () => {
@@ -1017,6 +1082,21 @@ describe('operator servers', () => {
     expect(retried.body).toContain('Server disconnected.');
     expect(await mainServers()).toEqual({});
     expect(gateway.held.size).toBe(0);
+  });
+
+  it('asks again instead of offering Retry when the entry moved to another host while the disconnect stopped', async () => {
+    await updateContainerConfigJson(MAIN, 'mcp_servers', { ledgerly: ledgerlyEntry });
+    gateway.failingIds.add(gateway.hold('ledgerly-workspace', 'app.ledgerly.example.test'));
+    const removeById = gateway.removeById.bind(gateway);
+    vi.spyOn(gateway, 'removeById').mockImplementation(async (ids) => {
+      await updateContainerConfigJson(MAIN, 'mcp_servers', { ledgerly: { type: 'http', url: LEDGER } });
+      return removeById(ids);
+    });
+
+    const failed = await disconnectLedgerly();
+    expect(failed.body).toContain('so it’s still connected. Try again.');
+    expect(failed.body).not.toContain('>Retry</button>');
+    expect(failed.body).toContain('deletes its saved access to mcp.ledger.example.test.');
   });
 
   it('shows Disconnect unavailable on a gateway that cannot list and remove credentials by host', async () => {

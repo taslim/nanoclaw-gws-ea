@@ -13,6 +13,8 @@ export const CONNECTIONS_PAGE_SCRIPT = String.raw`
     const submit = form.querySelector('button[type="submit"]');
     const label = submit.textContent;
     submit.textContent = submit.dataset.pendingLabel || 'Opening sign-in…';
+    // Read before disabling: a disabled control is left out of the form's data.
+    const body = JSON.stringify(Object.fromEntries(new FormData(form)));
     const controls = [...document.querySelectorAll('button, input')].filter(control => !control.disabled);
     controls.forEach(control => { control.disabled = true; });
     document.querySelector('main').setAttribute('aria-busy', 'true');
@@ -20,7 +22,7 @@ export const CONNECTIONS_PAGE_SCRIPT = String.raw`
     try {
       const response = await fetch(form.action, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(Object.fromEntries(new FormData(form))),
+        body,
         credentials: 'same-origin', cache: 'no-store',
       });
       if (response.status === 404) {
