@@ -81,6 +81,7 @@ export const connectionsWebMount: PrincipalPageMount = {
   path: '/connections',
   methods: ['GET', 'HEAD', 'POST'],
   title: 'Connections',
+  icon: 'plug',
   status: () => connectionsStatus(),
   linkGuard: connectionsPageGuard,
   linkFacts: () => connectionsLinkFacts(),

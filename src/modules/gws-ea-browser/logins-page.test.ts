@@ -169,8 +169,12 @@ it('closes wrong hosts and missing or non-principal identities before any store 
 
 it('draws the shared navigation for the principal and summarizes saved logins for home', async () => {
   const page = await request();
-  expect(page.body).toContain('<a href="/" data-navigation>Home</a>');
-  expect(page.body).toContain('<a href="/logins" data-navigation aria-current="page">Logins</a>');
+  expect(page.body).toMatch(
+    /<a href="\/" data-navigation><svg class="icon tab-icon"[^]*?<\/svg><span>Home<\/span><\/a>/u,
+  );
+  expect(page.body).toMatch(
+    /<a href="\/logins" data-navigation aria-current="page"><svg class="icon tab-icon"[^]*?<\/svg><span>Logins<\/span><\/a>/u,
+  );
   const reader = await request('/logins', 'GET', { 'cf-access-jwt-assertion': 'reader@example.com' });
   expect(reader).toMatchObject({ status: 404, body: '' });
   expect(await loginsWebMount.status()).toBe('No saved logins');

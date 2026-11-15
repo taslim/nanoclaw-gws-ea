@@ -35,6 +35,7 @@ ${GEIST_FONT_FACE}
   --danger-hover: #991b1b;
   --shadow-pop: 0 0 0 1px rgb(0 0 0 / .06), 0 4px 16px rgb(0 0 0 / .08), 0 12px 32px rgb(0 0 0 / .06);
   --ease-out: cubic-bezier(.23, 1, .32, 1);
+  --ease-drawer: cubic-bezier(.32, .72, 0, 1);
 }
 @media (prefers-color-scheme: dark) {
   :root {
@@ -84,6 +85,7 @@ button:disabled, a[aria-disabled="true"] { opacity: .55; cursor: wait; }
 h1, h2, h3, p, ol { margin: 0; }
 code { overflow-wrap: anywhere; }
 .icon { width: 18px; height: 18px; flex-shrink: 0; vertical-align: middle; }
+.tab-icon, .appbar-title, .sheet-grab, .menu [role="menuitem"].sheet-cancel { display: none; }
 .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
 
 /* Shell */
@@ -262,26 +264,227 @@ dialog p { margin-top: 8px; color: var(--muted); font-size: 14px; line-height: 1
   input:hover:not(:focus) { border-color: var(--line-strong); }
 }
 
-@media (max-width: 600px) {
-  .shell, main, main[data-width="narrow"] { width: calc(100% - 32px); }
-  .shell { padding-block: 10px 0; }
-  .shell-nav { width: 100%; }
-  .shell-nav ul { margin-left: -12px; }
+/*
+ * The phone is its own layout, not a narrow desktop: a translucent app bar with the back control on the left and
+ * the page's action on the right, a large title that hands over to the bar as it scrolls away, a bottom tab bar,
+ * full-screen forms with their actions pinned to the bottom, and menus and confirmations as bottom sheets.
+ */
+@media (max-width: 719px) {
+  body { padding-bottom: calc(68px + env(safe-area-inset-bottom)); }
+  body:has(main .form-actions) { padding-bottom: 0; }
+
+  .shell {
+    position: sticky;
+    top: 0;
+    z-index: 15;
+    width: 100%;
+    height: calc(52px + env(safe-area-inset-top));
+    margin: 0;
+    padding: env(safe-area-inset-top) 16px 0;
+    display: block;
+  }
+  /* The blur sits behind the bar, not on it: a filter on the bar would trap the fixed tab bar inside it. */
+  .shell::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    z-index: -1;
+    background: color-mix(in srgb, var(--page) 84%, transparent);
+    -webkit-backdrop-filter: saturate(1.8) blur(18px);
+    backdrop-filter: saturate(1.8) blur(18px);
+    box-shadow: 0 1px 0 transparent;
+    transition: box-shadow .2s;
+  }
+  .shell[data-condensed]::before { box-shadow: 0 1px 0 var(--line); }
+  .shell-name { height: 52px; font-size: 15px; }
+  body:has(main .back-link) .shell-name { display: none; }
+  .appbar-title {
+    display: block;
+    position: absolute;
+    left: 50%;
+    bottom: 0;
+    max-width: calc(100% - 200px);
+    line-height: 52px;
+    font-size: 16px;
+    font-weight: 600;
+    letter-spacing: -.01em;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    opacity: 0;
+    transform: translate(-50%, 4px);
+    transition: opacity .2s var(--ease-out), transform .2s var(--ease-out);
+    pointer-events: none;
+  }
+  .shell[data-condensed] .appbar-title { opacity: 1; transform: translate(-50%, 0); }
+  body:not(:has(main .back-link)) .shell[data-condensed] .shell-name { opacity: 0; transition: opacity .2s; }
+
+  main .back-link {
+    position: fixed;
+    z-index: 16;
+    top: env(safe-area-inset-top);
+    left: 4px;
+    height: 52px;
+    max-width: 38vw;
+    margin: 0;
+    padding: 0 8px 0 4px;
+    gap: 2px;
+    color: var(--accent-text);
+    font-size: 16px;
+    font-weight: 500;
+  }
+  main .back-link .icon { width: 24px; height: 24px; }
+  main .page-heading > .button {
+    position: fixed;
+    z-index: 16;
+    top: calc(env(safe-area-inset-top) + 4px);
+    right: 6px;
+    min-width: 44px;
+    padding: 0 10px;
+    background: transparent;
+    color: var(--accent-text);
+    font-size: 16px;
+  }
+  main .page-heading > .button-primary .button-label { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; }
+  main .page-heading > .button-primary .icon { width: 24px; height: 24px; margin: 0; }
+  main .page-heading > .button-secondary .icon { display: none; }
+
+  .shell-nav {
+    position: fixed;
+    z-index: 15;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    padding: 4px 8px env(safe-area-inset-bottom);
+    background: color-mix(in srgb, var(--page) 84%, transparent);
+    -webkit-backdrop-filter: saturate(1.8) blur(18px);
+    backdrop-filter: saturate(1.8) blur(18px);
+    box-shadow: 0 -1px 0 var(--line);
+  }
+  body:has(main .form-actions) .shell-nav { display: none; }
+  .shell-nav ul { gap: 0; }
+  .shell-nav li { flex: 1; }
   .shell-nav li:last-child a { margin-right: 0; }
-  main { padding-block: 24px 48px; }
-  h1 { font-size: 24px; }
-  .page-heading { margin-bottom: 24px; }
-  .form-actions .button { flex: 1; white-space: normal; text-align: center; }
-  .empty-state { padding: 48px 20px; }
-  dialog { padding: 20px; }
-  .dialog-actions .button { flex: 1; }
+  .shell-nav a {
+    flex-direction: column;
+    justify-content: center;
+    gap: 2px;
+    width: 100%;
+    min-height: 56px;
+    padding: 4px 0;
+    color: var(--faint);
+    font-size: 11px;
+    letter-spacing: .01em;
+    -webkit-user-select: none;
+    user-select: none;
+  }
+  .shell-nav a[aria-current="page"] { color: var(--accent-text); }
+  .shell-nav a[aria-current="page"]::before { display: none; }
+  .tab-icon { display: block; width: 26px; height: 26px; transition: transform .16s var(--ease-out); }
+  .shell-nav a:active .tab-icon { transform: scale(.88); }
+
+  main, main[data-width="narrow"] { width: calc(100% - 32px); padding-block: 4px 32px; }
+  h1 { font-size: 30px; letter-spacing: -.03em; }
+  .page-heading { margin-bottom: 20px; }
+  .page-metadata { margin-top: 6px; }
+  .section-title { padding-inline: 16px; }
+
+  .list { border-radius: 18px; }
+  .row { min-height: 64px; padding: 12px 8px 12px 16px; }
+  a.row { padding-right: 14px; }
+  .row-title { font-size: 16px; }
+  .row-sub { font-size: 14px; }
+  .row + .row::before { left: 16px; right: 0; }
+  a.row:active { background: var(--fill); transition: none; }
+
+  .field + .field { margin-top: 18px; }
+  .field label { font-size: 14px; }
+  input { min-height: 50px; border-radius: 14px; }
+  main:has(.form-actions) { display: flex; flex-direction: column; min-height: calc(100svh - 52px - env(safe-area-inset-top)); padding-bottom: 0; }
+  main:has(.form-actions) > form:has(.form-actions) { flex: 1; display: flex; flex-direction: column; }
+  .form-actions {
+    position: sticky;
+    bottom: 0;
+    z-index: 5;
+    margin: auto -16px 0;
+    padding: 24px 16px calc(12px + env(safe-area-inset-bottom));
+    background: linear-gradient(to bottom, transparent, var(--page) 20px);
+  }
+  .form-actions .button { flex: 1; min-height: 52px; border-radius: 14px; font-size: 16px; white-space: normal; text-align: center; }
+  .empty-state { padding: 48px 20px; border-radius: 18px; }
+
+  body[data-sheet] { overflow: hidden; }
+  body[data-sheet]::before { content: ""; position: fixed; inset: 0; z-index: 25; background: rgb(0 0 0 / .4); transition: opacity .3s var(--ease-out); }
+  body[data-sheet="closing"]::before { opacity: 0; }
+  .menu [role="menu"] {
+    position: fixed;
+    z-index: 30;
+    left: 0;
+    right: 0;
+    top: auto;
+    bottom: 0;
+    min-width: 0;
+    max-height: 85svh;
+    overflow: auto;
+    padding: 0 10px calc(10px + env(safe-area-inset-bottom));
+    border-radius: 24px 24px 0 0;
+    box-shadow: 0 -10px 40px rgb(0 0 0 / .16);
+    transition: transform .5s var(--ease-drawer);
+  }
+  .menu [role="menuitem"] { min-height: 54px; padding: 0 16px; border-radius: 14px; font-size: 17px; }
+  .menu [role="menuitem"]:active { background: var(--fill); }
+  .menu form + form:has([data-danger]), .menu a + form:has([data-danger]) { margin-top: 0; padding-top: 0; border-top: 0; }
+  .sheet-grab { display: block; padding: 8px 0 2px; touch-action: none; cursor: grab; }
+  .sheet-grab::before { content: ""; display: block; width: 36px; height: 5px; margin: 0 auto; border-radius: 3px; background: var(--line-strong); }
+  .sheet-title { margin: 12px 16px 8px; color: var(--muted); font-size: 13px; font-weight: 500; text-align: center; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .menu [role="menuitem"].sheet-cancel { display: flex; justify-content: center; margin-top: 8px; background: var(--fill); font-weight: 600; }
+
+  dialog {
+    width: 100%;
+    max-width: none;
+    max-height: 85svh;
+    margin: auto 0 0;
+    padding: 0 20px calc(16px + env(safe-area-inset-bottom));
+    border-radius: 24px 24px 0 0;
+    transition: transform .5s var(--ease-drawer);
+  }
+  dialog .sheet-grab { margin-inline: -20px; }
+  dialog h2 { margin-top: 14px; font-size: 19px; }
+  dialog p { font-size: 15px; }
+  dialog[data-closing]::backdrop { opacity: 0; }
+  .dialog-actions { flex-direction: column-reverse; margin-top: 24px; }
+  .dialog-actions .button { width: 100%; min-height: 52px; border-radius: 14px; font-size: 16px; }
+
+  @starting-style {
+    .menu [role="menu"]:not([hidden]) { opacity: 1; transform: translateY(100%); }
+    body[data-sheet]::before { opacity: 0; }
+    dialog[open] { opacity: 1; transform: translateY(100%); }
+  }
 }
+@media (max-width: 719px) and (prefers-reduced-transparency: reduce) {
+  .shell::before, .shell-nav { background: var(--page); -webkit-backdrop-filter: none; backdrop-filter: none; }
+}
+
+/* Moving between pages fades the content while the header and tab bar stay put. */
+@media (prefers-reduced-motion: no-preference) {
+  @view-transition { navigation: auto; }
+  .shell { view-transition-name: shell; }
+  .shell-nav { view-transition-name: tabs; }
+  ::view-transition-old(root) { animation: .12s var(--ease-out) both page-out; }
+  ::view-transition-new(root) { animation: .24s var(--ease-out) both page-in; }
+}
+@media (prefers-reduced-motion: no-preference) {
+  #outcome:not(:empty) { animation: .24s var(--ease-out) both outcome-in; }
+}
+@keyframes outcome-in { from { opacity: 0; transform: translateY(-4px); } }
+@keyframes page-out { to { opacity: 0; } }
+@keyframes page-in { from { opacity: 0; transform: translateY(6px); } }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { transition-property: opacity, color, background-color, border-color, box-shadow !important; scroll-behavior: auto !important; }
   .button:active:not(:disabled) { transform: none; }
   @starting-style {
-    .menu [role="menu"]:not([hidden]) { transform: none; }
-    dialog[open] { transform: none; }
+    .menu [role="menu"]:not([hidden]) { opacity: 0; transform: none; }
+    dialog[open] { opacity: 0; transform: none; }
   }
 }
 @media (prefers-contrast: more) {

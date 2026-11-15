@@ -7,6 +7,7 @@ import { KIT_STYLE } from './style.js';
 export interface ShellPage {
   readonly title: string;
   readonly path: WebMountPath;
+  readonly icon?: IconName;
 }
 export interface Shell {
   readonly assistantName: string;
@@ -21,13 +22,13 @@ export async function readShell(pages: readonly PrincipalPageMount[] = principal
     assistantName: profile.assistant_display_name ?? 'Your assistant',
     pages: [...pages]
       .sort((left, right) => Number(right.path === '/') - Number(left.path === '/'))
-      .map(({ title, path }) => ({ title, path })),
+      .map(({ title, path, icon: pageIcon }) => ({ title, path, ...(pageIcon ? { icon: pageIcon } : {}) })),
   };
 }
 
 export interface PrincipalPage {
   readonly shell: Shell;
-  /** The registered page this document belongs to, marked as current in the navigation. */
+  /** The registered page this document belongs to, marked as current in the navigation and the phone's tab bar. */
   readonly page: WebMountPath;
   /** This view's title; the document title adds the page's. */
   readonly title: string;
@@ -46,18 +47,22 @@ export interface PrincipalPage {
 function navigation(shell: Shell, current: WebMountPath): string {
   return `<nav class="shell-nav" aria-label="Pages"><ul>${shell.pages
     .map(
-      ({ title, path }) =>
-        `<li><a href="${escapeHtml(path)}" data-navigation${path === current ? ' aria-current="page"' : ''}>${escapeHtml(title)}</a></li>`,
+      ({ title, path, icon: pageIcon }) =>
+        `<li><a href="${escapeHtml(path)}" data-navigation${path === current ? ' aria-current="page"' : ''}>${icon(pageIcon ?? 'apps', 'tab-icon')}<span>${escapeHtml(title)}</span></a></li>`,
     )
     .join('')}</ul></nav>`;
 }
 
 /**
  * A menu button and the menu it opens. Items are `role="menuitem"` controls with `tabindex="-1"`, which the
- * kit's script moves focus between.
+ * kit's script moves focus between. On a phone the menu is a sheet: it names what it acts on and ends with
+ * Cancel, both of which a desktop dropdown leaves out.
  */
-export function renderMenu(id: string, label: string, items: readonly string[]): string {
-  return `<div class="menu"><button class="button icon-button" type="button" data-menu-button aria-haspopup="menu" aria-expanded="false" aria-controls="${escapeHtml(id)}" aria-label="${escapeHtml(label)}">${icon('more')}</button><div role="menu" id="${escapeHtml(id)}" aria-label="${escapeHtml(label)}" hidden>${items.join('')}</div></div>`;
+export function renderMenu(id: string, label: string, items: readonly string[], subject = ''): string {
+  const sheetTop = `<div class="sheet-grab" data-sheet-grab aria-hidden="true">${subject ? `<p class="sheet-title">${escapeHtml(subject)}</p>` : ''}</div>`;
+  const cancel =
+    '<button class="sheet-cancel" type="button" role="menuitem" tabindex="-1" data-menu-close>Cancel</button>';
+  return `<div class="menu"><button class="button icon-button" type="button" data-menu-button aria-haspopup="menu" aria-expanded="false" aria-controls="${escapeHtml(id)}" aria-label="${escapeHtml(label)}">${icon('more')}</button><div role="menu" id="${escapeHtml(id)}" aria-label="${escapeHtml(label)}" hidden>${sheetTop}${items.join('')}${cancel}</div></div>`;
 }
 
 export type BadgeTone = 'neutral' | 'success' | 'warning' | 'accent';
@@ -75,7 +80,7 @@ export function renderPageHeading(title: string, metadata = '', action = ''): st
 
 /** Named for where it goes, so it reads the same wherever it appears. */
 export function renderBackLink(href: string, label: string): string {
-  return `<a class="back-link" href="${escapeHtml(href)}" data-navigation>${icon('back')}<span>${escapeHtml(label)}</span></a>`;
+  return `<a class="back-link" href="${escapeHtml(href)}" data-navigation>${icon('chevron-back')}<span>${escapeHtml(label)}</span></a>`;
 }
 
 /** `action` is trusted markup. */
@@ -99,5 +104,5 @@ export function renderPrincipalPage(spec: PrincipalPage, nonce: string): string 
     .map(escapeHtml)
     .join(' · ');
   const attribute = escapeHtml(nonce);
-  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="color-scheme" content="light dark"><title>${title}</title><style nonce="${attribute}">${KIT_STYLE}${spec.style ?? ''}</style></head><body><header class="shell"><p class="shell-name"><span class="shell-mark" aria-hidden="true">${escapeHtml(initial(shell.assistantName))}</span><span>${escapeHtml(shell.assistantName)}</span></p>${navigation(shell, spec.page)}</header><main tabindex="-1" data-view="${escapeHtml(spec.view)}"${spec.narrow ? ' data-width="narrow"' : ''}><p id="outcome" role="${spec.error ? 'alert' : 'status'}" tabindex="-1" data-error="${spec.error}"${spec.outcome ? '' : ' hidden'}>${escapeHtml(spec.outcome)}</p>${spec.content}${spec.noscript ? `<noscript><p class="field-hint">${escapeHtml(spec.noscript)}</p></noscript>` : ''}</main><p id="announcer" class="sr-only" role="status" aria-live="polite"></p><dialog id="confirm-dialog" aria-labelledby="confirm-heading" aria-describedby="confirm-description"><h2 id="confirm-heading"></h2><p id="confirm-description"></p><div class="dialog-actions"><button class="button button-secondary" type="button" id="confirm-cancel" data-dialog-close>Cancel</button><button class="button button-danger" type="button" id="confirm-action"></button></div></dialog><script nonce="${attribute}">${pageScript(spec.script)}</script></body></html>`;
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><meta name="color-scheme" content="light dark"><meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)"><meta name="theme-color" content="#0b0b0c" media="(prefers-color-scheme: dark)"><title>${title}</title><style nonce="${attribute}">${KIT_STYLE}${spec.style ?? ''}</style></head><body><header class="shell"><p class="shell-name"><span class="shell-mark" aria-hidden="true">${escapeHtml(initial(shell.assistantName))}</span><span>${escapeHtml(shell.assistantName)}</span></p><p class="appbar-title" aria-hidden="true"></p>${navigation(shell, spec.page)}</header><main tabindex="-1" data-view="${escapeHtml(spec.view)}"${spec.narrow ? ' data-width="narrow"' : ''}><p id="outcome" role="${spec.error ? 'alert' : 'status'}" tabindex="-1" data-error="${spec.error}"${spec.outcome ? '' : ' hidden'}>${escapeHtml(spec.outcome)}</p>${spec.content}${spec.noscript ? `<noscript><p class="field-hint">${escapeHtml(spec.noscript)}</p></noscript>` : ''}</main><p id="announcer" class="sr-only" role="status" aria-live="polite"></p><dialog id="confirm-dialog" aria-labelledby="confirm-heading" aria-describedby="confirm-description"><div class="sheet-grab" data-sheet-grab aria-hidden="true"></div><h2 id="confirm-heading"></h2><p id="confirm-description"></p><div class="dialog-actions"><button class="button button-secondary" type="button" id="confirm-cancel" data-dialog-close>Cancel</button><button class="button button-danger" type="button" id="confirm-action"></button></div></dialog><script nonce="${attribute}">${pageScript(spec.script)}</script></body></html>`;
 }

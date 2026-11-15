@@ -2,6 +2,7 @@ import type { RequestListener } from 'node:http';
 import type { GuardedAction } from '../../guard/index.js';
 import { listPrincipalAddresses } from '../gws-ea-profile/db.js';
 import type { WebIdentity } from './access.js';
+import type { IconName } from './kit/html.js';
 import type { WebPolicyFile } from './policy.js';
 
 export type WebMethod = 'GET' | 'HEAD' | 'POST';
@@ -20,6 +21,8 @@ interface WebMountBase {
 export interface PrincipalPageMount extends WebMountBase {
   readonly audience: 'principal';
   readonly title: string;
+  /** Marks the page in the phone's tab bar. */
+  readonly icon?: IconName;
   /** A rejection leaves the page listed without a summary. */
   readonly status: () => Promise<string>;
   /** Decides which agents may obtain this page's link. */

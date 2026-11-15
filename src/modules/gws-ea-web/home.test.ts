@@ -102,8 +102,12 @@ it('lists every other principal page with its summary, and a failing summary lea
   expect(response.body).toContain(
     '<p class="shell-name"><span class="shell-mark" aria-hidden="true">J</span><span>Juno Hale</span></p>',
   );
-  expect(response.body).toContain('<a href="/" data-navigation aria-current="page">Home</a>');
-  expect(response.body).toContain('<a href="/apps" data-navigation>Apps &lt;beta&gt;</a>');
+  expect(response.body).toMatch(
+    /<a href="\/" data-navigation aria-current="page"><svg class="icon tab-icon"[^]*?<\/svg><span>Home<\/span><\/a>/u,
+  );
+  expect(response.body).toMatch(
+    /<a href="\/apps" data-navigation><svg class="icon tab-icon"[^]*?<\/svg><span>Apps &lt;beta&gt;<\/span><\/a>/u,
+  );
 });
 
 it('does not let a page whose summary never settles hold the home page back', async () => {

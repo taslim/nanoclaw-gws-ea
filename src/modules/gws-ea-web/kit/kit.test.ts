@@ -185,8 +185,10 @@ it('draws the shell with the escaped assistant name and the current page marked'
   expect(html).toContain(
     '<p class="shell-name"><span class="shell-mark" aria-hidden="true">J</span><span>Juno &lt;Hale&gt;</span></p>',
   );
-  expect(html).toContain('<a href="/" data-navigation>Home</a>');
-  expect(html).toContain('<a href="/logins" data-navigation aria-current="page">Logins</a>');
+  expect(html).toMatch(/<a href="\/" data-navigation><svg class="icon tab-icon"[^]*?<\/svg><span>Home<\/span><\/a>/u);
+  expect(html).toMatch(
+    /<a href="\/logins" data-navigation aria-current="page"><svg class="icon tab-icon"[^]*?<\/svg><span>Logins<\/span><\/a>/u,
+  );
   expect(html).toContain('<title>Saved logins · Logins · Juno &lt;Hale&gt;</title>');
   expect(html).toContain('>Saved &lt;now&gt;.</p>');
   expect(html).toContain('<p id="announcer" class="sr-only" role="status" aria-live="polite"></p>');
@@ -268,6 +270,9 @@ it.skipIf(!chromePath).each([320, 1200])(
       expect(await focused()).toBe('remove');
       expect(sent).toEqual([]);
 
+      // On a phone the menu is a sheet that ends with its own Cancel, which a desktop dropdown leaves out.
+      const sheet = width < 720;
+      const lastItem = sheet ? 'Cancel' : 'Delete';
       const menuButton = page.getByRole('button', { name: 'Actions' });
       await menuButton.focus();
       await page.keyboard.press('ArrowDown');
@@ -276,19 +281,22 @@ it.skipIf(!chromePath).each([320, 1200])(
       await page.keyboard.press('ArrowDown');
       expect(await focused()).toBe('Delete');
       await page.keyboard.press('ArrowDown');
-      expect(await focused()).toBe('Rename');
+      expect(await focused()).toBe(sheet ? 'Cancel' : 'Rename');
       await page.keyboard.press('End');
-      expect(await focused()).toBe('Delete');
+      expect(await focused()).toBe(lastItem);
       await page.keyboard.press('Escape');
       expect(await page.getByRole('menu').isHidden()).toBe(true);
       expect(await focused()).toBe('Actions');
       await page.keyboard.press('ArrowUp');
+      expect(await focused()).toBe(lastItem);
+      if (sheet) await page.keyboard.press('ArrowUp');
       expect(await focused()).toBe('Delete');
       await page.keyboard.press('Enter');
       await page.getByRole('dialog', { name: 'Delete?' }).waitFor();
       expect(await page.getByRole('menu').isHidden()).toBe(true);
+      // A tapped Cancel slides a phone sheet away first, so focus returns when it has gone.
       await page.getByRole('dialog').getByRole('button', { name: 'Cancel' }).click();
-      expect(await focused()).toBe('Actions');
+      await expect.poll(focused).toBe('Actions');
       expect(sent).toEqual([]);
 
       await page.getByRole('button', { name: 'Copy redirect URI' }).click();

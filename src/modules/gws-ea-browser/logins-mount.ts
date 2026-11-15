@@ -31,6 +31,7 @@ export const loginsWebMount: PrincipalPageMount = {
   path: '/logins',
   methods: ['GET', 'HEAD', 'POST'],
   title: 'Logins',
+  icon: 'key',
   status: loginsStatus,
   linkGuard: loginsPageGuard,
   handler: (config, identity) => createLoginsPageHandler({ hostname: config.hostname, identity }),

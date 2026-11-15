@@ -43,7 +43,7 @@ function hiddenItem(row: LoginRow): string {
 }
 
 function addLink(): string {
-  return `<a class="button button-primary" href="/logins/new" data-navigation>${icon('plus')}Add login</a>`;
+  return `<a class="button button-primary" href="/logins/new" data-navigation>${icon('plus')}<span class="button-label">Add login</span></a>`;
 }
 
 function count(total: number): string {
@@ -79,7 +79,7 @@ function loginList(rows: readonly LoginRow[]): string {
 
 function loginDetail(row: LoginRow): string {
   const owner = renderBadge(ACCOUNT_LABELS[row.account], row.account === 'assistant' ? 'accent' : 'neutral', false);
-  const edit = `<a class="button button-secondary" href="${escapeHtml(itemUrl(row))}/edit" data-navigation>${icon('edit')}Edit</a>`;
+  const edit = `<a class="button button-secondary" href="${escapeHtml(itemUrl(row))}/edit" data-navigation>${icon('edit')}<span class="button-label">Edit</span></a>`;
   return `${renderBackLink('/logins', 'Logins')}${renderPageHeading(row.title || row.site, owner, edit)}<dl class="list details"><div class="detail"><dt>Website</dt><dd>${escapeHtml(row.site)}</dd></div><div class="detail"><dt>Username</dt><dd>${escapeHtml(row.username || 'No username')}</dd></div><div class="detail detail-password"><dt>Password</dt><dd><span id="password-concealed" class="concealed"><span aria-hidden="true">••••••••••</span><span class="sr-only">Hidden</span></span><code id="password-value" hidden></code><button class="button button-secondary" id="show-password" type="button" data-handle="${escapeHtml(row.handle)}" data-version="${row.version}" aria-controls="password-value" aria-expanded="false">Show password</button><p class="field-hint" id="password-reveal-hint" hidden>Hides after 30 seconds.</p></dd></div></dl><form class="remove" method="post" action="/logins/remove" data-send data-confirm-title="Remove this login?" data-confirm-action="Remove login" data-confirm-message="${escapeHtml(`Your assistant will no longer sign in to ${row.site} as ${row.username || 'this account'}. Your account on the site stays as it is, and your assistant’s browser may stay signed in until you ask it to sign out.`)}">${hiddenItem(row)}<button class="button button-danger" type="submit" data-pending-label="Removing…">Remove login</button></form>`;
 }
 
@@ -131,9 +131,16 @@ dd { margin: 0; font-size: 14px; font-weight: 500; overflow-wrap: anywhere; }
 #password-reveal-hint { flex-basis: 100%; margin: 0; font-weight: 400; }
 .remove { margin-top: 16px; }
 .remove .button { margin-left: -16px; }
-@media (max-width: 600px) {
-  .detail { grid-template-columns: 1fr; gap: 2px; }
+@media (max-width: 719px) {
+  .list-tools { margin-bottom: 4px; }
   .search-field { max-width: none; }
+  input[type="search"] { min-height: 44px; border-radius: 12px; }
+  .site-heading { padding-inline: 16px; }
+  .details { padding: 2px 16px; border-radius: 18px; }
+  .detail { grid-template-columns: 1fr; gap: 2px; min-height: 64px; }
+  dd { font-size: 16px; }
+  .remove { margin-top: 24px; }
+  .remove .button { width: 100%; margin: 0; min-height: 52px; border-radius: 14px; background: var(--danger-soft); font-size: 16px; }
 }
 `;
 

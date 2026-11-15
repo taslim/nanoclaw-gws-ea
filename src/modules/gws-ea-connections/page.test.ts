@@ -1004,6 +1004,8 @@ describe('page states', () => {
     expect(reply.body).not.toContain('calendar');
     expect(reply.body.match(/<(?:a|button)[^>]*role="menuitem"[^>]*>([^<]*)</gu)).toEqual([
       '<button type="submit" role="menuitem" tabindex="-1" data-pending-label="Disconnecting…" data-danger>Disconnect<',
+      // The phone sheet's own Cancel, which a desktop dropdown does not show.
+      '<button class="sheet-cancel" type="button" role="menuitem" tabindex="-1" data-menu-close>Cancel<',
     ]);
     expect(reply.body).toContain('action="/connections/disconnect-operator"');
     assertNoSentinels();

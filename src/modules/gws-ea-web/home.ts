@@ -115,6 +115,7 @@ export const homeWebMount: PrincipalPageMount = {
   path: '/',
   methods: ['GET', 'HEAD'],
   title: 'Home',
+  icon: 'home',
   // Home lists the other pages and is never listed itself.
   status: async () => '',
   linkGuard: homePageGuard,

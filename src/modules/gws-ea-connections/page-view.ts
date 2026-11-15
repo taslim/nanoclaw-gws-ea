@@ -58,7 +58,7 @@ function appUrl(app: Pick<ConnectionApp, 'id'>, action: 'connect' | 'rename'): s
 const BACK = renderBackLink('/connections', 'Connections');
 
 function addLink(): string {
-  return `<a class="button button-primary" href="/connections/new" data-navigation>${icon('plus')}Add app</a>`;
+  return `<a class="button button-primary" href="/connections/new" data-navigation>${icon('plus')}<span class="button-label">Add app</span></a>`;
 }
 
 function hiddenApp(app: ConnectionApp): string {
@@ -90,7 +90,7 @@ function appMenu(app: ConnectionApp, index: number): string {
       : [menuForm('/connections/disconnect', app, 'Disconnect', 'Disconnecting…')]),
     menuForm('/connections/delete', app, 'Delete', 'Deleting…', deleteConfirmation(app)),
   ];
-  return renderMenu(`app-menu-${index}`, `More for ${app.name}`, items);
+  return renderMenu(`app-menu-${index}`, `More for ${app.name}`, items, app.name);
 }
 
 function appRow(app: ConnectionApp, index: number, canChange: boolean): string {
@@ -119,9 +119,14 @@ function operatorAction(server: OperatorServer, index: number, state: Connection
   // now points at a host other than the one they confirmed.
   if (state.retryServer?.key === server.key && state.retryServer.host === (operatorServerHost(server) ?? ''))
     return `<form method="post" action="/connections/disconnect-operator" data-send>${hiddenServer(server)}<button class="button button-secondary row-button" type="submit" data-pending-label="Disconnecting…">Try again</button></form>`;
-  return renderMenu(`operator-menu-${index}`, `More for ${server.key}`, [
-    `<form method="post" action="/connections/disconnect-operator" data-send ${operatorConfirmation(server)}>${hiddenServer(server)}<button type="submit" role="menuitem" tabindex="-1" data-pending-label="Disconnecting…" data-danger>Disconnect</button></form>`,
-  ]);
+  return renderMenu(
+    `operator-menu-${index}`,
+    `More for ${server.key}`,
+    [
+      `<form method="post" action="/connections/disconnect-operator" data-send ${operatorConfirmation(server)}>${hiddenServer(server)}<button type="submit" role="menuitem" tabindex="-1" data-pending-label="Disconnecting…" data-danger>Disconnect</button></form>`,
+    ],
+    server.key,
+  );
 }
 
 /** Only the host is shown: an operator's address can carry a credential in its query. */
@@ -239,13 +244,15 @@ const STYLE = `
 .redirect .button { background: var(--surface); box-shadow: 0 0 0 1px var(--line); }
 .change-client { margin-top: 12px; }
 .change-client .button { margin-left: -16px; }
-@media (max-width: 600px) {
-  .app-row { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; gap: 6px 8px; align-items: center; }
+@media (max-width: 719px) {
+  .app-row { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; gap: 6px 4px; align-items: center; }
+  .app-row > .row-main { padding-right: 4px; }
   .app-row > .row-main { grid-column: 1; grid-row: 1; }
   .app-row > .badge { grid-column: 1; grid-row: 2; justify-self: start; }
   .app-row > .row-button, .app-row > form { grid-column: 2; grid-row: 1 / span 2; }
   .app-row > .menu, .app-row > .row-note { grid-column: 3; grid-row: 1 / span 2; }
-  .steps > li { padding-left: 0; padding-top: 34px; }
+  .steps h2 { font-size: 15px; }
+  .change-client .button { margin: 0; width: 100%; }
   .redirect { flex-direction: column; align-items: stretch; padding: 4px; }
   .redirect code { padding-inline: 10px; }
 }

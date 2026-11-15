@@ -10,6 +10,10 @@ import { PAGE_LOCATION_HEADER, PAGE_SAVED_HEADER } from './headers.js';
  * Dialogs keep focus inside while open and return it to the control that opened them. A `data-menu-button`
  * opens the `role="menu"` it controls, operated by arrow keys, Home, End and Escape. A `data-copy-from`
  * control copies the named element's text and reports the result in the shell's live region.
+ *
+ * On a phone, menus and the confirmation dialog are bottom sheets: a tap outside, Cancel or a downward drag on
+ * the sheet's grab area slides one away, while a key or a chosen item closes it at once. The page's heading
+ * moves into the app bar once it scrolls under it.
  */
 const KIT_SCRIPT = String.raw`
   let busy = false;
@@ -18,6 +22,10 @@ const KIT_SCRIPT = String.raw`
   const confirmDialog = document.getElementById('confirm-dialog');
   const announcer = document.getElementById('announcer');
   const FOCUSABLE = 'a[href], button, input, select, textarea, [tabindex]:not([tabindex="-1"])';
+  const phone = matchMedia('(max-width: 719px)');
+  const calm = matchMedia('(prefers-reduced-motion: reduce)');
+  const appbar = document.querySelector('.shell');
+  const appbarTitle = document.querySelector('.appbar-title');
   function focusables(root) {
     return [...root.querySelectorAll(FOCUSABLE)].filter(element => !element.disabled && element.getClientRects().length > 0);
   }
@@ -46,13 +54,42 @@ const KIT_SCRIPT = String.raw`
   function menuOf(button) {
     return document.getElementById(button.getAttribute('aria-controls'));
   }
+  // A sheet's own Cancel exists only on a phone, so a hidden item is never a stop.
   function menuItems(menu) {
-    return [...menu.querySelectorAll('[role="menuitem"]')].filter(item => !item.disabled);
+    return [...menu.querySelectorAll('[role="menuitem"]')].filter(item => !item.disabled && item.getClientRects().length > 0);
   }
-  function closeMenus(restore) {
+  // Slides a sheet down from wherever a drag left it; anywhere a sheet is not shown, or motion is unwanted, it just closes.
+  function slideAway(sheet, done) {
+    if (!phone.matches || calm.matches) { done(); return; }
+    sheet.dataset.closing = '';
+    sheet.style.transform = 'translateY(100%)';
+    let finished = false;
+    const finish = () => {
+      if (finished) return;
+      finished = true;
+      sheet.removeEventListener('transitionend', ended);
+      delete sheet.dataset.closing;
+      sheet.style.transform = '';
+      done();
+    };
+    const ended = event => { if (event.target === sheet && event.propertyName === 'transform') finish(); };
+    sheet.addEventListener('transitionend', ended);
+    setTimeout(finish, 400);
+  }
+  function closeMenus(restore, slide = false) {
     document.querySelectorAll('[data-menu-button][aria-expanded="true"]').forEach(button => {
       button.setAttribute('aria-expanded', 'false');
-      menuOf(button).hidden = true;
+      const menu = menuOf(button);
+      const hide = () => {
+        // Opened again while it slid away: it stays.
+        if (button.getAttribute('aria-expanded') === 'true') return;
+        menu.hidden = true;
+        if (!document.querySelector('[data-menu-button][aria-expanded="true"]')) delete document.body.dataset.sheet;
+      };
+      if (slide && phone.matches && !calm.matches) {
+        document.body.dataset.sheet = 'closing';
+        slideAway(menu, hide);
+      } else hide();
       if (restore) button.focus();
     });
   }
@@ -61,6 +98,7 @@ const KIT_SCRIPT = String.raw`
     button.setAttribute('aria-expanded', 'true');
     const menu = menuOf(button);
     menu.hidden = false;
+    document.body.dataset.sheet = 'open';
     const items = menuItems(menu);
     (last ? items[items.length - 1] : items[0])?.focus();
   }
@@ -76,8 +114,9 @@ const KIT_SCRIPT = String.raw`
     (initial ?? focusables(dialog)[0])?.focus();
   }
   // The browser returns focus where it can; the opener takes it only if it was left nowhere.
-  function closeDialog(dialog) {
-    if (!dialog.open) return;
+  function closeDialog(dialog, slide = false) {
+    if (!dialog.open || dialog.dataset.closing !== undefined) return;
+    if (slide) { slideAway(dialog, () => closeDialog(dialog)); return; }
     dialog.close();
     if (dialog === confirmDialog) pendingForm = undefined;
     const opener = openers.get(dialog);
@@ -85,6 +124,21 @@ const KIT_SCRIPT = String.raw`
     const active = document.activeElement;
     if (opener?.isConnected && (!active || active === document.body || dialog.contains(active))) opener.focus();
   }
+  // The heading's text follows it into the app bar, which shows it only once the heading has scrolled beneath.
+  let titleWatch;
+  function watchTitle() {
+    titleWatch?.disconnect();
+    delete appbar.dataset.condensed;
+    const heading = document.querySelector('main h1');
+    appbarTitle.textContent = heading?.textContent ?? '';
+    if (!heading || !('IntersectionObserver' in window)) return;
+    titleWatch = new IntersectionObserver(([entry]) => {
+      if (entry.isIntersecting) delete appbar.dataset.condensed;
+      else appbar.dataset.condensed = '';
+    }, { rootMargin: '-60px 0px 0px 0px' });
+    titleWatch.observe(heading);
+  }
+  watchTitle();
   async function send(form) {
     if (busy) return;
     busy = true;
@@ -120,9 +174,14 @@ const KIT_SCRIPT = String.raw`
           'That change couldn’t be confirmed. Reload the page to check it before trying again.', uncertain || response.status === 409);
         return;
       }
-      document.querySelector('main').replaceWith(next);
-      document.title = page.title;
-      history.replaceState(null, '', response.headers.get('${PAGE_LOCATION_HEADER}'));
+      const swap = () => {
+        document.querySelector('main').replaceWith(next);
+        document.title = page.title;
+        history.replaceState(null, '', response.headers.get('${PAGE_LOCATION_HEADER}'));
+        watchTitle();
+      };
+      if (document.startViewTransition && !calm.matches) await document.startViewTransition(swap).updateCallbackDone;
+      else swap();
       const outcome = document.getElementById('outcome');
       (outcome.textContent ? outcome : next).focus();
       window.scrollTo({ top: 0, behavior: 'instant' });
@@ -178,14 +237,24 @@ const KIT_SCRIPT = String.raw`
   document.addEventListener('click', event => {
     if (!(event.target instanceof Element)) return;
     const closing = event.target.closest('[data-dialog-close]')?.closest('dialog');
-    if (closing) { closeDialog(closing); return; }
+    if (closing) { closeDialog(closing, true); return; }
+    // A tap on a dialog's backdrop lands on the dialog itself, outside its box.
+    if (event.target instanceof HTMLDialogElement && event.target.open) {
+      const box = event.target.getBoundingClientRect();
+      if (event.clientY < box.top || event.clientY > box.bottom || event.clientX < box.left || event.clientX > box.right) {
+        closeDialog(event.target, true);
+        return;
+      }
+    }
+    if (event.target.closest('[data-menu-close]')) { closeMenus(true, true); return; }
     const menuButton = event.target.closest('[data-menu-button]');
     if (menuButton) {
       if (menuButton.getAttribute('aria-expanded') === 'true') closeMenus(false);
       else openMenu(menuButton);
       return;
     }
-    if (!event.target.closest('[role="menu"]') || event.target.closest('[role="menuitem"]')) closeMenus(false);
+    if (event.target.closest('[role="menuitem"]')) closeMenus(false);
+    else if (!event.target.closest('[role="menu"]')) closeMenus(false, true);
     const copier = event.target.closest('[data-copy-from]');
     if (copier) { copier.dataset.copyIdle ??= (copier.querySelector('[data-copy-label]') ?? copier).textContent; void copy(copier); return; }
     if (busy && event.target.closest('a[data-navigation]')) event.preventDefault();
@@ -222,6 +291,37 @@ const KIT_SCRIPT = String.raw`
       closeMenus(true);
     } else if (event.key === 'Tab') closeMenus(true);
   });
+  // Dragging a sheet's grab area down follows the finger; a long or quick enough drag dismisses it.
+  let drag;
+  document.addEventListener('pointerdown', event => {
+    if (!phone.matches || !(event.target instanceof Element)) return;
+    const grab = event.target.closest('[data-sheet-grab]');
+    const sheet = grab?.closest('[role="menu"], dialog');
+    if (!sheet) return;
+    drag = { sheet, id: event.pointerId, start: event.clientY, last: event.clientY, time: event.timeStamp, speed: 0 };
+    sheet.style.transition = 'none';
+    grab.setPointerCapture(event.pointerId);
+  });
+  document.addEventListener('pointermove', event => {
+    if (!drag || event.pointerId !== drag.id) return;
+    drag.speed = (event.clientY - drag.last) / Math.max(1, event.timeStamp - drag.time);
+    drag.last = event.clientY;
+    drag.time = event.timeStamp;
+    drag.sheet.style.transform = 'translateY(' + Math.max(0, event.clientY - drag.start) + 'px)';
+  });
+  const endDrag = event => {
+    if (!drag || event.pointerId !== drag.id) return;
+    const { sheet, start, speed } = drag;
+    drag = undefined;
+    sheet.style.transition = '';
+    const offset = Math.max(0, event.clientY - start);
+    if (event.type === 'pointerup' && (offset > sheet.offsetHeight * 0.3 || speed > 0.5)) {
+      if (sheet instanceof HTMLDialogElement) closeDialog(sheet, true);
+      else closeMenus(false, true);
+    } else sheet.style.transform = '';
+  };
+  document.addEventListener('pointerup', endDrag);
+  document.addEventListener('pointercancel', endDrag);
   window.addEventListener('beforeunload', event => {
     if (!busy && !changed()) return;
     event.preventDefault();
