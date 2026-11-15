@@ -1,6 +1,4 @@
-import { createCipheriv, createDecipheriv, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
-import { constants } from 'node:fs';
-import { open } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
 import path from 'node:path';
 import Database from 'better-sqlite3';
 import { getDomain } from 'tldts';
@@ -12,8 +10,10 @@ import { browserRoot } from './availability.js';
 import type { SanitizedCommandOutcomeRunner } from '../../gws-ea/process.js';
 import { hasControlCharacters } from '../../gws-ea/validation.js';
 import { httpsOrigin } from './authentication-signatures.js';
+import { withPrivateDatabase } from '../gws-ea-vault/file.js';
+import { SEALED_MIN_BYTES, StoreSeal, type SealAvailability, type SealedFile } from '../gws-ea-vault/seal.js';
 import { LoginKey } from './login-key.js';
-import { browserPaths, ensurePrivateDirectory } from './paths.js';
+import { browserPaths } from './paths.js';
 import {
   CredentialAttemptError,
   RELEASABLE_PHASES,
@@ -54,23 +54,20 @@ export interface LoginDetails {
   readonly password: string;
 }
 export type LoginChanges = Partial<Omit<LoginDetails, 'password'>> & Pick<LoginDetails, 'password'>;
-export type LoginStoreAvailability =
-  | { readonly available: true }
-  | { readonly available: false; readonly reason: 'key_missing' | 'key_mismatch' | 'keychain_unavailable' };
+export type LoginStoreAvailability = SealAvailability;
 export interface LoginStoreOptions {
   readonly browserRoot: string;
   readonly instanceId: string;
   readonly runCommand?: SanitizedCommandOutcomeRunner;
 }
 
-const CHECK = Buffer.from('gws-ea-logins-key-check:v1', 'utf8');
 const COLUMNS = 'id, hostname, domain, username, title, version, created_at AS createdAt, updated_at AS updatedAt';
 const ATTEMPT_COLUMNS =
   'id, kind, job_id, origin, site, username, source_login_id, source_version, phase, evidence_json, owned_login_id, created_at, updated_at, exposed_at, finalized_at';
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS logins (
   id TEXT PRIMARY KEY, hostname TEXT NOT NULL, domain TEXT NOT NULL, username TEXT NOT NULL,
-  title TEXT NOT NULL, password BLOB NOT NULL CHECK(length(password) >= 28), version INTEGER NOT NULL CHECK(version > 0),
+  title TEXT NOT NULL, password BLOB NOT NULL CHECK(length(password) >= ${SEALED_MIN_BYTES}), version INTEGER NOT NULL CHECK(version > 0),
   created_at TEXT NOT NULL, updated_at TEXT NOT NULL, UNIQUE(domain, username)
 ) STRICT;
 CREATE TABLE IF NOT EXISTS attempts (
@@ -84,7 +81,7 @@ CREATE TABLE IF NOT EXISTS attempts (
   CHECK((source_login_id IS NULL) = (source_version IS NULL)),
   CHECK(owned_login_id IS NULL OR phase = 'finalized'),
   CHECK(CASE WHEN phase IN ('rejected','finalized') THEN password IS NULL
-    ELSE password IS NOT NULL AND length(password) >= 28 END)
+    ELSE password IS NOT NULL AND length(password) >= ${SEALED_MIN_BYTES} END)
 ) STRICT;
 CREATE UNIQUE INDEX IF NOT EXISTS open_rotation ON attempts(source_login_id)
   WHERE source_login_id IS NOT NULL AND phase NOT IN ('rejected','finalized');
@@ -93,7 +90,6 @@ CREATE INDEX IF NOT EXISTS signup_ownership ON attempts(site,username)
 CREATE TABLE IF NOT EXISTS meta (
   id INTEGER PRIMARY KEY CHECK(id = 1), key_check BLOB NOT NULL
 ) STRICT;`;
-const fileOperationGates = new Map<string, Promise<void>>();
 
 export function registrableDomain(origin: string): string | undefined {
   const url = httpsOrigin(origin);
@@ -120,53 +116,20 @@ function versionValid(version: number): void {
 /** A direct, host-only file: only passwords are encrypted; every metadata read is independent of Keychain. */
 export class LoginStore {
   private readonly file: string;
-  private readonly key: LoginKey;
-  private readonly aad: Buffer;
-  constructor(private readonly options: LoginStoreOptions) {
+  private readonly sealing: StoreSeal;
+  constructor(options: LoginStoreOptions) {
     this.file = path.join(browserPaths(options.browserRoot).root, 'logins.db');
-    this.key = new LoginKey(options);
-    this.aad = Buffer.from(`gws-ea-logins:v1|${options.instanceId}`, 'utf8');
-  }
-
-  private async database(): Promise<Database.Database> {
-    await ensurePrivateDirectory(this.options.browserRoot);
-    const handle = await open(this.file, constants.O_RDWR | constants.O_CREAT | constants.O_NOFOLLOW, 0o600);
-    try {
-      const stat = await handle.stat();
-      if (!stat.isFile() || stat.nlink !== 1 || (process.getuid !== undefined && stat.uid !== process.getuid()))
-        throw new LoginStoreError('vault_unavailable');
-      if ((stat.mode & 0o7777) !== 0o600) await handle.chmod(0o600);
-    } finally {
-      await handle.close();
-    }
-    const db = new Database(this.file);
-    try {
-      db.pragma('journal_mode = DELETE');
-      db.pragma('secure_delete = ON');
-      db.pragma('synchronous = FULL');
-      db.exec(SCHEMA);
-      return db;
-    } catch (error) {
-      db.close();
-      throw error;
-    }
+    // Existing stores were sealed under exactly these label and check values.
+    this.sealing = new StoreSeal({
+      key: new LoginKey(options),
+      label: `gws-ea-logins:v1|${options.instanceId}`,
+      check: 'gws-ea-logins-key-check:v1',
+    });
   }
 
   private async use<T>(operation: (db: Database.Database) => T | Promise<T>): Promise<T> {
-    const previous = fileOperationGates.get(this.file);
-    let release = (): void => undefined;
-    const gate = new Promise<void>((resolve) => {
-      release = resolve;
-    });
-    fileOperationGates.set(this.file, gate);
-    await previous;
     try {
-      const db = await this.database();
-      try {
-        return await operation(db);
-      } finally {
-        db.close();
-      }
+      return await withPrivateDatabase(this.file, SCHEMA, operation);
     } catch (error) {
       if (
         error instanceof LoginStoreError ||
@@ -175,91 +138,34 @@ export class LoginStore {
       )
         throw error;
       throw new LoginStoreError('vault_unavailable');
-    } finally {
-      release();
-      if (fileOperationGates.get(this.file) === gate) fileOperationGates.delete(this.file);
     }
   }
 
-  private hasSecrets(db: Database.Database): boolean {
-    return (
-      db
-        .prepare<
-          [],
-          { present: number }
-        >('SELECT EXISTS(SELECT 1 FROM logins UNION ALL SELECT 1 FROM attempts WHERE password IS NOT NULL) AS present')
-        .get()?.present === 1
-    );
-  }
-  private seal(value: Buffer, key: Buffer): Buffer {
-    const iv = randomBytes(12);
-    const cipher = createCipheriv('aes-256-gcm', key, iv, { authTagLength: 16 });
-    cipher.setAAD(this.aad);
-    const ciphertext = Buffer.concat([cipher.update(value), cipher.final()]);
-    return Buffer.concat([iv, cipher.getAuthTag(), ciphertext]);
-  }
-  private unseal(blob: Buffer, key: Buffer): Buffer {
-    if (!Buffer.isBuffer(blob) || blob.length < 28) throw new LoginStoreError('vault_unavailable');
-    const decipher = createDecipheriv('aes-256-gcm', key, blob.subarray(0, 12), { authTagLength: 16 });
-    decipher.setAAD(this.aad);
-    decipher.setAuthTag(blob.subarray(12, 28));
-    // Keep unauthenticated bytes out of returned values even when final() rejects.
-    const decoded = decipher.update(blob.subarray(28));
-    try {
-      return Buffer.concat([decoded, decipher.final()]);
-    } finally {
-      decoded.fill(0);
-    }
-  }
-  private matchesKey(db: Database.Database, key: Buffer): boolean {
-    const check = db.prepare<[], { key_check: Buffer }>('SELECT key_check FROM meta WHERE id = 1').get();
-    if (!check) return false;
-    let value: Buffer | undefined;
-    try {
-      value = this.unseal(check.key_check, key);
-      return value.length === CHECK.length && timingSafeEqual(value, CHECK);
-      // eslint-disable-next-line no-catch-all/no-catch-all -- Authentication failure is the constant key_mismatch state.
-    } catch {
-      return false;
-    } finally {
-      value?.fill(0);
-    }
-  }
-  private async withKey<T>(db: Database.Database, operation: (key: Buffer) => T): Promise<T> {
-    const populated = this.hasSecrets(db);
-    let read = await this.key.read();
-    if (read.status === 'missing' && !populated) read = await this.key.create();
-    if (read.status !== 'ready') throw new LoginStoreError('vault_unavailable');
-    try {
-      if (populated) {
-        if (!this.matchesKey(db, read.key)) throw new LoginStoreError('vault_unavailable');
-      } else {
+  private sealedFile(db: Database.Database): SealedFile {
+    return {
+      hasSecrets: () =>
+        db
+          .prepare<
+            [],
+            { present: number }
+          >('SELECT EXISTS(SELECT 1 FROM logins UNION ALL SELECT 1 FROM attempts WHERE password IS NOT NULL) AS present')
+          .get()?.present === 1,
+      readCheck: () =>
+        db.prepare<[], { key_check: Buffer }>('SELECT key_check FROM meta WHERE id = 1').get()?.key_check,
+      writeCheck: (sealed) => {
         db.prepare(
           'INSERT INTO meta (id, key_check) VALUES (1, ?) ON CONFLICT(id) DO UPDATE SET key_check = excluded.key_check',
-        ).run(this.seal(CHECK, read.key));
-      }
-      return operation(read.key);
-    } finally {
-      read.key.fill(0);
-    }
+        ).run(sealed);
+      },
+    };
+  }
+  private async withKey<T>(db: Database.Database, operation: (key: Buffer) => T): Promise<T> {
+    return this.sealing.withKey(this.sealedFile(db), operation);
   }
 
   async availability(): Promise<LoginStoreAvailability> {
     try {
-      return await this.use(async (db) => {
-        const populated = this.hasSecrets(db);
-        const read = await this.key.read();
-        if (read.status === 'unavailable') return { available: false, reason: 'keychain_unavailable' };
-        if (read.status === 'missing')
-          return populated ? { available: false, reason: 'key_missing' } : { available: true };
-        try {
-          return !populated || this.matchesKey(db, read.key)
-            ? { available: true }
-            : { available: false, reason: 'key_mismatch' };
-        } finally {
-          read.key.fill(0);
-        }
-      });
+      return await this.use((db) => this.sealing.availability(this.sealedFile(db)));
     } catch (error) {
       if (error instanceof LoginStoreError) return { available: false, reason: 'keychain_unavailable' };
       throw error;
@@ -302,7 +208,7 @@ export class LoginStore {
             if (!current) throw new LoginStoreError('no_item_for_site');
             if (current.version !== version) throw new LoginDetailsError('login_changed');
             this.editableAttempts(db, id, current);
-            const plaintext = this.unseal(current.password, key);
+            const plaintext = this.sealing.unseal(current.password, key);
             try {
               return plaintext.toString('utf8');
             } finally {
@@ -321,7 +227,7 @@ export class LoginStore {
         if (field === 'username') return login.username;
         const row = db.prepare<[string], { password: Buffer }>('SELECT password FROM logins WHERE id = ?').get(id);
         if (!row) throw new LoginStoreError('no_item_for_site');
-        const plaintext = this.unseal(row.password, key);
+        const plaintext = this.sealing.unseal(row.password, key);
         try {
           return plaintext.toString('utf8');
         } finally {
@@ -362,7 +268,7 @@ export class LoginStore {
       return this.withKey(db, (key) => {
         const plaintext = Buffer.from(spec.password, 'utf8');
         try {
-          const sealed = this.seal(plaintext, key);
+          const sealed = this.sealing.seal(plaintext, key);
           return db
             .transaction(() => {
               this.giveWay(db, null, metadata);
@@ -391,7 +297,7 @@ export class LoginStore {
         let plaintext: Buffer | undefined;
         try {
           plaintext = changes.password ? Buffer.from(changes.password, 'utf8') : undefined;
-          const sealed = plaintext ? this.seal(plaintext, key) : undefined;
+          const sealed = plaintext ? this.sealing.seal(plaintext, key) : undefined;
           return db
             .transaction(() => {
               this.assertDistinct(db, metadata.domain, metadata.username, id);
@@ -510,7 +416,7 @@ export class LoginStore {
       this.withKey(db, (key) => {
         const plaintext = Buffer.from(password, 'utf8');
         try {
-          const sealed = this.seal(plaintext, key);
+          const sealed = this.sealing.seal(plaintext, key);
           return db
             .transaction(() => {
               if (attempt.kind === 'rotation') {
@@ -583,7 +489,7 @@ export class LoginStore {
             .prepare<[string], { password: Buffer }>(`SELECT password FROM ${table} WHERE id = ?`)
             .get(rowId);
           if (!row) throw new CredentialAttemptError('not_found');
-          const plaintext = this.unseal(row.password, key);
+          const plaintext = this.sealing.unseal(row.password, key);
           try {
             return plaintext.toString('utf8');
           } finally {

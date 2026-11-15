@@ -54,10 +54,17 @@ import { getHostStartCallbacks } from '../../host-lifecycle.js';
 import type { AgentGroup } from '../../types.js';
 import { EXTERNAL_EMAIL_CAPABILITIES, externalEmailHealth, getExternalEmailAgentGroupId } from './index.js';
 import '../gws-ea-profile/index.js';
+import {
+  APP_SECRET,
+  MODEL_SECRET,
+  useFakeGateway,
+  type FakeGateway,
+} from '../gws-ea-sealed-gateway/testing/fake-gateway.js';
 
 const GROUPS_DIR = path.join(TEST_ROOT, 'groups');
 const DATA_DIR = path.join(TEST_ROOT, 'data');
 const SESSION = 'sess-ee';
+let gateway: FakeGateway;
 
 const ensure = vi.fn(async () => ({
   contribution: { networkAccess: { endpoint: 'localhost', target: { kind: 'host' as const } } },
@@ -164,6 +171,20 @@ const DRIFTS: ReadonlyArray<readonly [string, (group: AgentGroup) => Promise<voi
     /plugins/,
   ],
   [
+    'a gateway identity in all-secrets mode',
+    async (g) => {
+      gateway.createDefault(g.id, g.name).secretMode = 'all';
+    },
+    /gateway secret mode is not selective/,
+  ],
+  [
+    'an app credential assigned beside the model credential',
+    async (g) => {
+      gateway.createDefault(g.id, g.name).secrets.push(APP_SECRET.id);
+    },
+    /gateway secret assignments are not model-only/,
+  ],
+  [
     'a template skill',
     async (g) => {
       fs.mkdirSync(path.join(DATA_DIR, 'v2-sessions', g.id, '.claude-shared', 'skills', 'widget'), { recursive: true });
@@ -173,6 +194,7 @@ const DRIFTS: ReadonlyArray<readonly [string, (group: AgentGroup) => Promise<voi
 ];
 
 beforeEach(async () => {
+  gateway = useFakeGateway();
   fs.rmSync(TEST_ROOT, { recursive: true, force: true });
   fs.mkdirSync(TEST_ROOT, { recursive: true });
   snapshots.length = 0;
@@ -193,6 +215,8 @@ afterEach(async () => {
     killContainer(SESSION, 'test-teardown');
     await vi.waitFor(() => expect(isContainerRunning(SESSION)).toBe(false));
   }
+  vi.unstubAllEnvs();
+  vi.unstubAllGlobals();
   await closeDb();
   fs.rmSync(TEST_ROOT, { recursive: true, force: true });
 });
@@ -201,6 +225,25 @@ describe('the session admission external-email registers', () => {
   it('admits external-email as the host stamped it', async () => {
     await expect(admit((await externalEmail()).id)).resolves.toBeUndefined();
     expect((await externalEmailHealth()).problems).toEqual([]);
+  });
+
+  it('gives it a gateway identity holding only the model credential at each start, and leaves main all', async () => {
+    const ee = await externalEmail();
+    expect(gateway.agents.get(ee.id)).toMatchObject({ secretMode: 'selective', secrets: [MODEL_SECRET.id] });
+    expect(gateway.injected(ee.id, APP_SECRET.hostPattern)).toEqual([]);
+    expect(gateway.injected(ee.id, MODEL_SECRET.hostPattern)).toEqual([MODEL_SECRET.id]);
+
+    const main = gateway.createDefault('ag-main', 'main');
+    Object.assign(gateway.agents.get(ee.id)!, { secretMode: 'all', secrets: [MODEL_SECRET.id, APP_SECRET.id] });
+    await expect(admit(ee.id)).rejects.toThrow(
+      'external-email may not start: its gateway secret mode is not selective',
+    );
+    await startHost();
+
+    expect(gateway.agents.get(ee.id)).toMatchObject({ secretMode: 'selective', secrets: [MODEL_SECRET.id] });
+    await expect(admit(ee.id)).resolves.toBeUndefined();
+    expect(main).toMatchObject({ secretMode: 'all', secrets: [] });
+    expect(gateway.injected('ag-main', APP_SECRET.hostPattern)).toEqual([APP_SECRET.id]);
   });
 
   it.each(DRIFTS)('refuses it with %s, and status names why', async (_label, drift, reason) => {

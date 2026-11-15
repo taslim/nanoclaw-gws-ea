@@ -124,6 +124,7 @@ const STATUS_FIELDS = [
   'rollback',
   'schema',
   'main_turn',
+  'connections',
   'probes',
 ] as const;
 
@@ -449,6 +450,8 @@ function ncl(state: World): StatusObservers['ncl'] {
         return { alias: 'web@example.test', candidate: null };
       case 'gws-ea-browser-health':
         return { schemaVersion: 1, available: true, proxy: { state: 'stopped' }, chrome: { state: 'stopped' } };
+      case 'gws-ea-connections-health':
+        return { schemaVersion: 1, store: { available: true }, apps: [] };
       case 'gws-ea-profile get':
         return { main_agent_group_id: MAIN, assistant_display_name: 'Aya' };
       case 'gws-ea-external-email health':
@@ -2320,6 +2323,178 @@ it.each(['key_missing', 'key_mismatch', 'keychain_unavailable'] as const)(
     expect(keyRead).not.toHaveBeenCalled();
   },
 );
+
+describe('connected apps', () => {
+  const SENTINEL = 'sentinel-app-token-R2k6';
+
+  async function detailedStatus(connectionsHealth: unknown, options: { readonly stopped?: boolean } = {}) {
+    const host = await machine();
+    const reservation = await assistant(host, { label: 'alpha', port: 36001 });
+    const state = world(reservation);
+    if (options.stopped) {
+      state.active.clear();
+      state.serving.clear();
+    }
+    const healthy = healthyObservers(state);
+    const ncl = vi.fn<StatusObservers['ncl']>(async (runtime, args) =>
+      args.join(' ') === 'gws-ea-connections-health' ? connectionsHealth : healthy.ncl(runtime, args),
+    );
+    const json = command(host, state, { ...healthy, ncl });
+    expect(
+      await runStatusCommand(json.runtime, { instanceId: reservation.instance_id, json: true, details: true }),
+    ).toBe(0);
+    const result = JSON.parse(json.output.stdout.join('\n')) as {
+      data: StatusShape & { connections: unknown };
+      next_actions: readonly NextAction[];
+    };
+    expectResultContract('status', result);
+    const human = command(host, state, { ...healthy, ncl });
+    expect(
+      await runStatusCommand(human.runtime, { instanceId: reservation.instance_id, json: false, details: true }),
+    ).toBe(0);
+    const healthCalls = ncl.mock.calls.filter(([, args]) => args.join(' ') === 'gws-ea-connections-health').length;
+    return { result, text: human.output.stdout.join('\n'), json: json.output.stdout.join('\n'), healthCalls };
+  }
+
+  it('lists each app with its origin and status, and nothing else the host reports', async () => {
+    const { result, text, json } = await detailedStatus({
+      schemaVersion: 1,
+      store: { available: true },
+      apps: [
+        {
+          name: 'Ledger',
+          host: 'mcp.ledger.example.test',
+          origin: 'principal',
+          status: 'needs_reconnecting',
+          url: `https://mcp.ledger.example.test/mcp?token=${SENTINEL}`,
+          clientId: `client-${SENTINEL}`,
+        },
+        { name: 'ledgerly', host: 'app.ledgerly.example.test', origin: 'operator', status: 'connected' },
+      ],
+    });
+
+    expect(result.data.connections).toEqual({
+      store: { status: 'available', reason: null, operator_action: null },
+      apps: [
+        { name: 'Ledger', host: 'mcp.ledger.example.test', origin: 'principal', status: 'needs_reconnecting' },
+        { name: 'ledgerly', host: 'app.ledgerly.example.test', origin: 'operator', status: 'connected' },
+      ],
+    });
+    expect(text).toContain('  Connected apps: available\n');
+    expect(text).toContain('    Ledger (mcp.ledger.example.test): added by the principal; needs reconnecting');
+    expect(text).toContain('    ledgerly (app.ledgerly.example.test): from the operator; connected');
+    for (const output of [text, json]) {
+      expect(output).not.toContain(SENTINEL);
+      expect(output).not.toContain('token=');
+      expect(output).not.toContain('client');
+    }
+  });
+
+  it('shows an assistant with no apps as checked and empty', async () => {
+    const { result, text } = await detailedStatus({ schemaVersion: 1, store: { available: true }, apps: [] });
+
+    expect(result.data.connections).toEqual({
+      store: { status: 'available', reason: null, operator_action: null },
+      apps: [],
+    });
+    expect(text).toContain('  Connected apps: available; none');
+  });
+
+  it.each(['key_missing', 'key_mismatch', 'keychain_unavailable'] as const)(
+    'shows an unreadable store (%s) with its operator action, beside the apps it can still list',
+    async (reason) => {
+      const { result, text } = await detailedStatus({
+        schemaVersion: 1,
+        store: { available: false, reason },
+        apps: [{ name: 'Ledger', host: 'mcp.ledger.example.test', origin: 'principal', status: 'connected' }],
+      });
+
+      const action =
+        reason === 'keychain_unavailable' ? 'unlock the keychain, then check' : 'delete the unreadable apps';
+      expect(result.data.connections).toEqual({
+        store: { status: 'unavailable', reason, operator_action: expect.stringContaining(action) },
+        apps: [{ name: 'Ledger', host: 'mcp.ledger.example.test', origin: 'principal', status: 'connected' }],
+      });
+      expect(result.next_actions).toContainEqual({ kind: 'external', instruction: expect.stringContaining(action) });
+      expect(text).toContain(`  Connected apps: unavailable; ${reason}; `);
+      expect(text).toContain(action);
+    },
+  );
+
+  it('asks once to unlock the keychain when both stores report it locked', async () => {
+    const host = await machine();
+    const reservation = await assistant(host, { label: 'alpha', port: 36001 });
+    const state = world(reservation);
+    const healthy = healthyObservers(state);
+    const locked = { available: false, reason: 'keychain_unavailable' };
+    const invocation = command(host, state, {
+      ...healthy,
+      ncl: async (runtime, args) => {
+        switch (args.join(' ')) {
+          case 'gws-ea-connections-health':
+            return { schemaVersion: 1, store: locked, apps: [] };
+          case 'gws-ea-browser-health':
+            return {
+              schemaVersion: 1,
+              available: true,
+              loginStore: locked,
+              proxy: { state: 'stopped' },
+              chrome: { state: 'stopped' },
+            };
+          default:
+            return healthy.ncl(runtime, args);
+        }
+      },
+    });
+    expect(
+      await runStatusCommand(invocation.runtime, { instanceId: reservation.instance_id, json: true, details: true }),
+    ).toBe(0);
+    const result = JSON.parse(invocation.output.stdout.join('\n')) as { next_actions: readonly NextAction[] };
+
+    expect(
+      result.next_actions.filter(
+        (action) => action.kind === 'external' && action.instruction.includes('unlock the keychain'),
+      ),
+    ).toHaveLength(1);
+  });
+
+  const LEDGER = { name: 'Ledger', host: 'mcp.ledger.example.test', origin: 'principal', status: 'connected' };
+  // Each report differs from a valid one in one field, so each check is proved on its own.
+  it.each([
+    ['a stopped assistant', { stopped: true }, LEDGER],
+    ['an app with no host', { stopped: false }, { ...LEDGER, host: '' }],
+    ['an app name carrying a terminal control sequence', { stopped: false }, { ...LEDGER, name: 'Ledger\u001b[2J' }],
+    ['an app of unknown origin', { stopped: false }, { ...LEDGER, origin: 'gateway' }],
+    ['an app with an unknown status', { stopped: false }, { ...LEDGER, status: 'expired' }],
+  ] as const)('reports not checked for %s', async (_case, options, app) => {
+    const { result, text, healthCalls } = await detailedStatus(
+      { schemaVersion: 1, store: { available: true }, apps: [app] },
+      options,
+    );
+
+    expect(result.data.connections).toEqual({
+      store: { status: 'not_checked', reason: null, operator_action: null },
+      apps: null,
+    });
+    expect(text).toContain('  Connected apps: not checked\n');
+    expect(healthCalls).toBe(options.stopped ? 0 : 2);
+  });
+
+  it('does not ask the host without details', async () => {
+    const host = await machine();
+    const reservation = await assistant(host, { label: 'alpha', port: 36001 });
+    const state = world(reservation);
+    const healthy = healthyObservers(state);
+    const ncl = vi.fn(healthy.ncl);
+    const { status } = await statusJson(host, state, reservation.instance_id, { ...healthy, ncl });
+
+    expect((status as unknown as { connections: unknown }).connections).toEqual({
+      store: { status: 'not_checked', reason: null, operator_action: null },
+      apps: null,
+    });
+    expect(ncl.mock.calls.some(([, args]) => args.join(' ') === 'gws-ea-connections-health')).toBe(false);
+  });
+});
 
 it('keeps locally missing Chrome visible when the running host cannot report browser health', async () => {
   const host = await machine();

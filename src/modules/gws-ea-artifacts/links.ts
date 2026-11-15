@@ -6,6 +6,8 @@ import { EMAIL_CHANNEL_TYPE, INBOX_PLATFORM_ID } from '../gws-ea-inbox/runtime.j
 import { resolveAudience } from '../gws-ea-privacy/audience.js';
 import { linkTargets, messageStrings } from '../gws-ea-privacy/outbound.js';
 import { listPrincipalAddresses } from '../gws-ea-profile/db.js';
+import { mountCovers, principalPages } from '../gws-ea-web/mounts.js';
+import { principalPageUrl } from '../gws-ea-web/page-link.js';
 import { readWebPolicy, type WebPolicyFile } from '../gws-ea-web/policy.js';
 
 interface ArtifactLinkCheckRequest {
@@ -88,11 +90,14 @@ export async function checkArtifactLinksOpenable(request: ArtifactLinkCheckReque
     if (policy.status !== 'enabled') return refuse(written);
     if (url.origin !== `https://${config.hostname}` || url.username || url.password || url.search || url.hash)
       return refuse(written);
-    if (url.pathname === '/logins') {
-      if (!principalOnly || written !== `https://${config.hostname}/logins`)
+    const page = principalPages().find(({ path }) => mountCovers(path, url.pathname));
+    if (page) {
+      // Only a page's own address leaves the host: anything below it, such as a sign-in return, never does.
+      const exact = principalPageUrl(config.hostname, page);
+      if (!principalOnly || written !== exact)
         return {
           allowed: false,
-          reason: `The logins page ${written} can be sent only to the principal. Send it directly to the principal or send without it.`,
+          reason: `Only the principal's own ${page.title} page address, ${exact}, can be sent, and only to the principal. Send it directly to the principal or send without it.`,
         };
       continue;
     }

@@ -68,6 +68,11 @@ const operation = {
     object({ state: { const: 'committed' }, ...operationFacts, follow_ups: array(followUp) }),
   ],
 };
+const sealedStore = object({
+  status: choices('available', 'unavailable', 'not_checked'),
+  reason: nullable(choices('key_missing', 'key_mismatch', 'keychain_unavailable')),
+  operator_action: nullable(text),
+});
 const probe = (facts: Readonly<Record<string, ResultSchema>> = {}): ResultSchema =>
   object({ status: choices('ok', 'degraded', 'unknown'), reason: nullable(text), ...facts });
 const probes = object({
@@ -128,11 +133,7 @@ const probes = object({
     address: nullable(text),
   }),
   browser: probe({
-    login_store: object({
-      status: choices('available', 'unavailable', 'not_checked'),
-      reason: nullable(choices('key_missing', 'key_mismatch', 'keychain_unavailable')),
-      operator_action: nullable(text),
-    }),
+    login_store: sealedStore,
     chrome: choices('available', 'missing', 'unavailable', 'not_checked'),
     isolation: nullable(
       object({
@@ -384,6 +385,19 @@ export const STATUS_DATA_SCHEMA = object({
     ),
     reason: nullable(text),
   }),
+  connections: object({
+    store: sealedStore,
+    apps: nullable(
+      array(
+        object({
+          name: text,
+          host: text,
+          origin: choices('principal', 'operator'),
+          status: choices('connected', 'needs_reconnecting', 'not_connected'),
+        }),
+      ),
+    ),
+  }),
   probes,
   connectors: array(CONNECTOR_OBSERVATION_SCHEMA),
 });
@@ -438,6 +452,7 @@ const removal = object(
         'web',
         'chat-subscription',
         'login-key',
+        'connections-key',
         'gcp-project',
         'onecli',
         'instance-files',
@@ -447,6 +462,7 @@ const removal = object(
     keyPolicyUnrestored: text,
     memberPolicyUnrestored: text,
     login_key: choices('removed', 'left_behind'),
+    connections_key: choices('removed', 'left_behind'),
   },
   ['removed', 'abandoned'],
 );

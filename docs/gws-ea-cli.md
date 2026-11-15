@@ -54,8 +54,9 @@ is optional assistant identity.
 ## Assistant web
 
 The `web` connector gives each assistant a stable address such as
-`aya.example.com`. HTML artifacts live at `/artifacts` and the principal’s saved
-logins page at `/logins`; there is no home page. There is one connector install
+`aya.example.com`. HTML artifacts live at `/artifacts`. The principal’s home at
+`/` links their own pages: saved logins at `/logins` and connected apps at
+`/connections`. Main sends their links with `principal_page`. There is one connector install
 and no separate feature switch. Cloudflare Access covers the whole hostname;
 public artifacts retain their explicit public route.
 
@@ -133,6 +134,45 @@ file. Inspect an exact unproven creation and remove any resource it created befo
 acknowledging it with `--discard-unproven <attempt>`.
 
 See the [artifact guide](gws-ea-artifacts.md) for retention, sharing and native tools.
+
+### Connected apps
+
+On the Connections page at `/connections`, the principal adds the remote MCP
+servers they use, by HTTPS address, as apps for main. They connect each one by
+signing in at the app's service, pasting an access token, or confirming a server
+that needs no sign-in. A service that registers clients itself gets a client for
+this app alone; otherwise the page shows the redirect URI to register and asks
+for the client details. The operator does not review these apps: once one is
+connected, main sends it information to use its tools. Main can add or delete an
+app only after the principal approves; connecting happens only on the page.
+
+Credentials never reach an agent. The host keeps refresh tokens, pasted tokens
+and client details in `connections/apps.db` under the instance root, encrypted
+under a per-assistant macOS Keychain key, and it renews access tokens before they
+expire. The gateway holds each app's current access token and injects it on that
+app's host and path. Connected apps need a gateway that can hold, list and
+remove credentials by host; with any other gateway the page lists apps but
+nothing can be added or connected. When a service refuses renewal, the app reads
+Needs reconnecting: main loses its tools and gets a note saying so.
+
+The page also lists the MCP servers the operator added to main, by host. The
+principal can disconnect one: its entry in main's configuration and the
+operator's gateway credentials on its host are removed. The assistant's own model
+and Google credentials stay. Add the server again to restore it.
+
+`gws-ea status --details` shows a Connected apps line from the running host:
+the store's state, then each app's name, host, origin and status. When the key
+is missing, different or unavailable it reports `key_missing`, `key_mismatch` or
+`keychain_unavailable` with an operator action: log in at the Mac and unlock its
+keychain, or have the principal delete the unreadable apps on the Connections
+page before the next connection can create a key. Removing an assistant deletes
+the store and its Keychain key after stopping the host, without revoking access
+at the apps; an unreachable key is reported as left behind (`connections_key`)
+without failing removal.
+
+Updates and rollbacks preserve the store. Releases that predate it cannot read
+it, so connected apps' access tokens lapse while rolled back; updating again
+resumes renewal.
 
 ## Find and inspect an assistant
 

@@ -259,6 +259,43 @@ describe('recorded divergence: the installed OneCLI adapter', () => {
     }
   }
 
+  it("lists one host's credentials and removes them by id, through the registered provider", async () => {
+    const provider = await installedProvider();
+    const secret = (id: string, name: string, hostPattern: string) => ({ id, name, hostPattern, scope: 'project' });
+    const rows = [
+      secret('app', 'gws-ea-app-a1', 'app.ledgerly.example.test'),
+      secret('operator', 'Ledgerly', 'app.ledgerly.example.test'),
+      secret('other', 'Search', 'api.search.example.test'),
+    ];
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
+      const url = new URL(input instanceof Request ? input.url : String(input));
+      if (url.origin !== onecliUrl || !url.pathname.startsWith('/v1/secrets')) throw new Error(`Unexpected ${url}`);
+      if (init?.method === 'DELETE') {
+        rows.splice(
+          rows.findIndex((row) => row.id === decodeURIComponent(url.pathname.split('/')[3]!)),
+          1,
+        );
+        return new Response(null, { status: 204 });
+      }
+      return Response.json(rows);
+    });
+    const credentials = provider.credentials;
+    if (!credentials?.listForHost || !credentials.removeById) {
+      throw new Error('The installed OneCLI adapter cannot list or remove by host');
+    }
+
+    const listed = await credentials.listForHost('app.ledgerly.example.test');
+    expect(listed).toEqual([
+      { id: 'app', name: 'gws-ea-app-a1' },
+      { id: 'operator', name: 'Ledgerly' },
+    ]);
+    expect(await credentials.removeById(listed.map(({ id }) => id))).toEqual([
+      { id: 'app', outcome: 'removed' },
+      { id: 'operator', outcome: 'removed' },
+    ]);
+    expect(rows.map(({ id }) => id)).toEqual(['other']);
+  });
+
   it('leaves an approval pending when no decision is available, without asking again at once', async () => {
     const provider = await installedProvider();
     const servers = onecliServers([approval('undecided', 'owned-group')]);
@@ -1485,6 +1522,38 @@ describe('recorded divergence: a module can refuse a session before it starts', 
   });
 });
 
+describe('recorded divergence: a spawned container records when it read its configuration', () => {
+  it('stamps the read before container.json is materialized, while starting and once registered', async () => {
+    await freshInstall();
+    const runner = await import('../container-runner.js');
+    const source = await readFile(path.join(originalCwd, 'src/container-runner.ts'), 'utf8');
+
+    // Main's apps restart only containers that read their configuration before a change; one stamped after the
+    // read, or invisible while it starts, would keep the old apps and never be restarted.
+    expect(runner.getContainerConfigReadAtMs('no-such-session')).toBeUndefined();
+    expect(runner.getSpawningConfigReadAtMs('no-such-session')).toBeUndefined();
+    const spawn = source.slice(source.indexOf('async function spawnContainer('));
+    const stamp = spawn.indexOf(
+      'const configReadAtMs = Date.now();\n  spawningConfigReads.set(session.id, configReadAtMs);',
+    );
+    expect(stamp).toBeGreaterThan(-1);
+    expect(stamp).toBeLessThan(spawn.indexOf('await materializeContainerJson('));
+    // Registration hands the stamp from the starting map to the runtime in one synchronous step.
+    expect(spawn.slice(spawn.indexOf('const runtime = registerRuntime('))).toMatch(
+      /^const runtime = registerRuntime\([^;]*\);\s*runtime\.claimIncarnation = claimIncarnation;\s*runtime\.configReadAtMs = configReadAtMs;\s*spawningConfigReads\.delete\(session\.id\);/u,
+    );
+    // Every spawn ends through wakeContainer's finally, so a failed or abandoned one never stays starting.
+    expect(source.match(/spawnContainer\(/gu)).toHaveLength(2);
+    const wake = source.slice(
+      source.indexOf('export function wakeContainer('),
+      source.indexOf('async function spawnContainer('),
+    );
+    expect(wake).toMatch(
+      /const promise = spawnContainer\(session\)[\s\S]*\.finally\(\(\) => \{\s*spawningConfigReads\.delete\(session\.id\);/u,
+    );
+  });
+});
+
 describe('recorded divergence: a group without conversation-context keeps its sessions sealed', () => {
   it("declares Claude's home as conversation state, which a sealed session holds on its own", async () => {
     await freshInstall();
@@ -1719,6 +1788,32 @@ describe("recorded divergence: a protected agent group is the host's alone", () 
         effect: 'hold',
       });
     }
+  });
+});
+
+describe('recorded divergence: a module can refuse changes to MCP servers it owns', () => {
+  it('denies the add_mcp_server request and the raw config command a registered policy refuses', async () => {
+    await freshInstall();
+    const { guard } = await import('../guard/index.js');
+    const { registerMcpServerPolicy } = await import('../cli/guard.js');
+    const { commandGuard } = await import('../cli/registry.js');
+    await import('../cli/resources/index.js');
+    const { selfModAddMcpServer } = await import('../modules/self-mod/guard.js');
+    registerMcpServerPolicy('divergence:owned-servers', ({ agentGroupId }) =>
+      agentGroupId === 'g' ? 'its servers are the module’s' : undefined,
+    );
+    const actor = (agentGroupId: string) => ({ kind: 'agent', agentGroupId, sessionId: 'session-1' }) as const;
+    const payload = { id: 'g', name: 'tools', url: 'https://tools.example.test/mcp' };
+
+    expect(await guard(selfModAddMcpServer, { actor: actor('g'), payload })).toMatchObject({ effect: 'deny' });
+    expect(await guard(selfModAddMcpServer, { actor: actor('ag-other'), payload })).toMatchObject({ effect: 'hold' });
+    expect(
+      await guard(commandGuard('groups-config-add-mcp-server'), { actor: { kind: 'host' }, payload }),
+    ).toMatchObject({ effect: 'allow' });
+    expect(await guard(commandGuard('groups-config-add-mcp-server'), { actor: actor('g'), payload })).toMatchObject({
+      effect: 'deny',
+      reason: expect.stringContaining('its servers are the module’s'),
+    });
   });
 });
 

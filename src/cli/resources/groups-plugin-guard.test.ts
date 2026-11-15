@@ -30,12 +30,15 @@ vi.mock('../../log.js', () => ({
   log: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn(), fatal: vi.fn() },
 }));
 
-import { closeDb, initTestDb, runMigrations } from '../../db/index.js';
-import { getContainerConfig } from '../../db/container-configs.js';
+import { closeDb, createAgentGroup, initTestDb, runMigrations } from '../../db/index.js';
+import { ensureContainerConfig, getContainerConfig, updateContainerConfigScalars } from '../../db/container-configs.js';
+import { guard } from '../../guard/index.js';
 import { NANOCLAW_EXTENSION_NS } from '../../templates/extension.js';
 import { MCP_SCHEMA_URL, PLUGIN_SCHEMA_URL } from '../../templates/manifest.js';
 import { createAgentFromTemplate } from '../../templates/create-agent.js';
 import { dispatch } from '../dispatch.js';
+import { registerMcpServerPolicy } from '../guard.js';
+import { commandGuard } from '../registry.js';
 // Side-effect import: registers the `groups-*` commands.
 import './groups.js';
 
@@ -156,5 +159,37 @@ describe('ncl groups create --template on an already-stamped plugin', () => {
     const targeted = await run('groups-create', { template: 'sdr', id: secondId });
     expect(targeted.ok).toBe(true);
     if (targeted.ok) expect(targeted.data).toMatchObject({ applied: false, group: { id: secondId } });
+  });
+});
+
+describe('a module’s MCP server policy on a template update', () => {
+  it('covers the stamped group an agent’s --template update would restamp without naming it', async () => {
+    const refused = new Set<string>();
+    registerMcpServerPolicy('test:stamped-servers', ({ agentGroupId }) =>
+      refused.has(agentGroupId) ? 'its servers are the module’s' : undefined,
+    );
+    await createAgentGroup({
+      id: 'ag-owner',
+      name: 'Owner',
+      folder: 'owner',
+      agent_provider: null,
+      created_at: new Date().toISOString(),
+    });
+    await ensureContainerConfig('ag-owner');
+    // A global-scope caller has no --id filled in, so the handler picks the sole carrier itself.
+    await updateContainerConfigScalars('ag-owner', { cli_scope: 'global' });
+    const actor = { kind: 'agent', agentGroupId: 'ag-owner', sessionId: 'session-1' } as const;
+    const create = commandGuard('groups-create');
+
+    expect(await guard(create, { actor, payload: { template: 'sdr', yes: true } })).toMatchObject({ effect: 'hold' });
+    refused.add(groupId);
+    expect(await guard(create, { actor, payload: { template: 'sdr', yes: true } })).toMatchObject({
+      effect: 'deny',
+      reason: expect.stringContaining('its servers are the module’s'),
+    });
+    expect(await guard(create, { actor, payload: { template: 'sdr', group: 'ag-owner', yes: true } })).toMatchObject({
+      effect: 'deny',
+    });
+    expect(await guard(create, { actor, payload: { template: 'sdr', new: true } })).toMatchObject({ effect: 'hold' });
   });
 });

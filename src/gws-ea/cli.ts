@@ -1000,15 +1000,13 @@ class Cli {
       status: 'ready',
       message: `Assistant ${instanceId} was removed.`,
       details: removalSummary(preview, removed),
-      actions:
-        removed?.login_key === 'left_behind'
-          ? [
-              {
-                kind: 'external',
-                instruction: `Log in locally and unlock the keychain, then delete the gws-ea.saved-logins key for assistant ${instanceId} in Keychain Access.`,
-              },
-            ]
-          : [],
+      actions: [
+        ...(removed?.login_key === 'left_behind' ? ['gws-ea.saved-logins'] : []),
+        ...(removed?.connections_key === 'left_behind' ? ['gws-ea.connections'] : []),
+      ].map((service) => ({
+        kind: 'external' as const,
+        instruction: `Log in locally and unlock the keychain, then delete the ${service} key for assistant ${instanceId} in Keychain Access.`,
+      })),
     };
   }
 
@@ -2128,6 +2126,7 @@ function removalPreviewLines(preview: RemovalPreview): string[] {
     `OneCLI: ${preview.onecliProject}`,
     `Google Cloud project: ${preview.gcpProject} (${preview.gcpAccount})`,
     'Saved logins: removes the local store and deletes its Keychain key after the host stops; an unreachable key is listed as left behind.',
+    'Connected apps: removes the local store and deletes its Keychain key after the host stops, without revoking access at the apps; an unreachable key is listed as left behind.',
     'Permanently tears down this assistant’s recorded local resources and requests project deletion; its subscription and credentials are removed within their existing ownership rules.',
   ];
 }
@@ -2152,6 +2151,13 @@ function removalSummary(preview: RemovalPreview, outcome: RemovalOutcome | undef
           outcome.login_key === 'removed'
             ? 'Saved-login Keychain key: deleted or already absent.'
             : `Left behind: the saved-login Keychain key for assistant ${preview.instanceId}; log in locally and unlock the keychain, then delete it in Keychain Access.`,
+        ]
+      : []),
+    ...(outcome?.connections_key
+      ? [
+          outcome.connections_key === 'removed'
+            ? 'Connected-apps Keychain key: deleted or already absent.'
+            : `Left behind: the connected-apps Keychain key for assistant ${preview.instanceId}; log in locally and unlock the keychain, then delete it in Keychain Access.`,
         ]
       : []),
     ...(outcome?.abandoned.flatMap(({ resource, evidence }) =>

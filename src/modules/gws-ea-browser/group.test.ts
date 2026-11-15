@@ -21,15 +21,26 @@ import { ensureContainerConfig, getContainerConfig, updateContainerConfigJson } 
 import { closeDb, createAgentGroup, initTestDb, runMigrations } from '../../db/index.js';
 import { getRequiredProjectDocSections } from '../../project-doc-sections.js';
 import { getBrowserAgentGroupId } from '../gws-ea-profile/db.js';
+import { reconcileSealedGateway } from '../gws-ea-sealed-gateway/gateway.js';
+import {
+  APP_SECRET,
+  MODEL_SECRET,
+  useFakeGateway,
+  type FakeGateway,
+} from '../gws-ea-sealed-gateway/testing/fake-gateway.js';
 import { getDb } from '../../db/connection.js';
 import { resolveSystemSession } from '../../session-manager.js';
 import '../gws-ea-profile/index.js';
 import './index.js';
 import './guidance.js';
-import { browserGroupDrift, ensureBrowserGroup, setBrowserAdmissionReady } from './group.js';
+import { BROWSER_NAME, browserGroupDrift, ensureBrowserGroup, setBrowserAdmissionReady } from './group.js';
+import { reconcileBrowserGroup } from './reconcile.js';
 import { configureBrowserAccess } from './testing/browser-access.js';
 
+let gateway: FakeGateway;
+
 beforeEach(async () => {
+  gateway = useFakeGateway();
   useAvailableBrowser();
   setBrowserAdmissionReady(true);
   fs.rmSync(ROOT, { recursive: true, force: true });
@@ -38,6 +49,8 @@ beforeEach(async () => {
 afterEach(async () => {
   setBrowserAdmissionReady(false);
   delete process.env.GWS_EA_BROWSER_ROOT;
+  vi.unstubAllEnvs();
+  vi.unstubAllGlobals();
   await closeDb();
   fs.rmSync(ROOT, { recursive: true, force: true });
 });
@@ -56,6 +69,8 @@ it('stamps the exact sealed composition once and refuses capability drift at adm
     skills: '[]',
     capabilities: JSON.stringify(['browser', 'reply', 'files-send', 'files-read', 'time', 'request-status']),
   });
+  expect(await browserGroupDrift(id)).toEqual(['its gateway identity is missing']);
+  await reconcileSealedGateway(id, BROWSER_NAME);
   expect(await browserGroupDrift(id)).toEqual([]);
   await updateContainerConfigJson(id, 'capabilities', [
     'browser',
@@ -135,7 +150,8 @@ it('admits only canonical main errand sessions to the sealed browser group', asy
   const policy = `${ROOT}/browser`;
 
   process.env.GWS_EA_BROWSER_ROOT = policy;
-  const id = await ensureBrowserGroup();
+  await reconcileBrowserGroup();
+  const id = (await getBrowserAgentGroupId())!;
   const own = (await resolveSystemSession(id, 'system:a2a:main:errand')).session;
   await expect(
     assertSessionAdmitted({ disposition: 'create', key: { installSlug: 'test', agentGroupId: id, sessionId: own.id } }),
@@ -173,8 +189,10 @@ it('hands the delegate tools to main to main by default and to explicitly grante
   expect((await getGroupCapabilities('research')).has('browser-delegate')).toBe(false);
   // A stored explicit key grants delegation to an ordinary group.
   await updateContainerConfigJson('research', 'capabilities', ['reply', 'browser-delegate']);
+  // Browser access also gives the logins page's link.
   expect((await materializeContainerJson('research')).capabilities).toEqual([
     'reply',
+    'gws-ea-principal-pages',
     'browser-delegate',
     'browser-purchase-outcome',
   ]);
@@ -210,7 +228,8 @@ it('admits the errands of every explicitly granted group and always main', async
     'main',
   );
   await configureBrowserAccess(`${ROOT}/browser`, ['research']);
-  const id = await ensureBrowserGroup();
+  await reconcileBrowserGroup();
+  const id = (await getBrowserAgentGroupId())!;
   const admit = async (thread: string) =>
     assertSessionAdmitted({
       disposition: 'create',
@@ -218,4 +237,45 @@ it('admits the errands of every explicitly granted group and always main', async
     });
   await expect(admit('system:a2a:research:errand')).resolves.toBeUndefined();
   await expect(admit('system:a2a:main:errand')).resolves.toBeUndefined();
+});
+
+it('gives browser a gateway identity holding only the model credential, refusing any other until repaired, and leaves main all', async () => {
+  await createAgentGroup({
+    id: 'main',
+    name: 'main',
+    folder: 'main',
+    agent_provider: null,
+    created_at: new Date().toISOString(),
+  });
+  await getDb().run(
+    `UPDATE gws_ea_profile SET assistant_first_name=COALESCE(assistant_first_name,'Juno'),principal_first_name=COALESCE(principal_first_name,'Morgan'),main_agent_group_id = ? WHERE singleton = 1`,
+    'main',
+  );
+  await configureBrowserAccess(`${ROOT}/browser`);
+  gateway.createDefault('main', 'main');
+
+  await reconcileBrowserGroup();
+  const id = (await getBrowserAgentGroupId())!;
+  expect(gateway.agents.get(id)).toMatchObject({ secretMode: 'selective', secrets: [MODEL_SECRET.id] });
+  expect(gateway.injected(id, APP_SECRET.hostPattern)).toEqual([]);
+  expect(gateway.injected(id, MODEL_SECRET.hostPattern)).toEqual([MODEL_SECRET.id]);
+  const errand = (await resolveSystemSession(id, 'system:a2a:main:errand')).session;
+  const admit = () =>
+    assertSessionAdmitted({
+      disposition: 'create',
+      key: { installSlug: 'test', agentGroupId: id, sessionId: errand.id },
+    });
+  await expect(admit()).resolves.toBeUndefined();
+
+  gateway.agents.get(id)!.secrets.push(APP_SECRET.id);
+  expect(await browserGroupDrift(id)).toEqual(['its gateway secret assignments are not model-only']);
+  await expect(admit()).rejects.toThrow('browser may not start: its gateway secret assignments are not model-only');
+  gateway.agents.get(id)!.secretMode = 'all';
+  await expect(admit()).rejects.toThrow('its gateway secret mode is not selective');
+
+  await reconcileBrowserGroup();
+  expect(gateway.agents.get(id)).toMatchObject({ secretMode: 'selective', secrets: [MODEL_SECRET.id] });
+  await expect(admit()).resolves.toBeUndefined();
+  expect(gateway.agents.get('main')).toMatchObject({ secretMode: 'all', secrets: [] });
+  expect(gateway.injected('main', APP_SECRET.hostPattern)).toEqual([APP_SECRET.id]);
 });

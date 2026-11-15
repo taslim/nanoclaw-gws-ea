@@ -96,6 +96,7 @@ import { executeRecipe, saveBrowserRecipe } from './recipes.js';
 import { registerReservationGuaranteeDelivery } from './reservation-guarantee.js';
 import { deliverAction } from './testing/delivery-answer.js';
 import { siteWordingPattern } from './testing/site-wording.js';
+import { useFakeGateway } from '../gws-ea-sealed-gateway/testing/fake-gateway.js';
 
 const chromePath = process.env.GWS_EA_BROWSER_TEST_CHROME;
 
@@ -109,13 +110,19 @@ afterAll(async () => {
   await fixture?.close();
 });
 beforeEach(() => {
+  // Each job's queue reconciles the browser group's gateway identity.
+  useFakeGateway();
   useAvailableBrowser();
   fixture?.reset();
   fs.rmSync(`${root}/browser`, { recursive: true, force: true });
   defaultLogins = testLoginStore(`${root}/browser`);
   vi.spyOn(loginStoreModule, 'getLoginStore').mockResolvedValue(defaultLogins.store);
 });
-afterEach(() => vi.restoreAllMocks());
+afterEach(() => {
+  vi.unstubAllEnvs();
+  vi.unstubAllGlobals();
+  vi.restoreAllMocks();
+});
 
 /** A PNG's width and height, as its header states them. */
 function pngSize(data: Buffer): { width: number; height: number } {

@@ -28,6 +28,7 @@ import {
   nameAssistantAgent,
   recordExternalEmailAgentGroupId,
 } from '../gws-ea-profile/db.js';
+import { sealedGatewayDrift } from '../gws-ea-sealed-gateway/gateway.js';
 
 /**
  * The email channel's tool keys, one for each part, registered together so
@@ -119,6 +120,7 @@ export async function externalEmailDrift(agentGroupId: string, context: DriftCon
   ) {
     problems.push(`its provider ${provider} does not give each session its own state`);
   }
+  problems.push(...(await sealedGatewayDrift(agentGroupId, EXTERNAL_EMAIL_NAME)));
   return problems;
 }
 

@@ -18,6 +18,20 @@ import { createSession } from '../../db/sessions.js';
 import { saveArtifact, prepareArtifactSource } from './db.js';
 import { checkArtifactLinksOpenable } from './links.js';
 import { checkLinksOpenable } from '../gws-ea-workspace/link-access.js';
+import { DENY, defineGuardedAction } from '../../guard/index.js';
+import { principalPages, registerWebMount } from '../gws-ea-web/mounts.js';
+// The check reads principal pages from the registry; this one stands in when no module serves connections.
+if (!principalPages().some(({ name }) => name === 'connections'))
+  registerWebMount({
+    name: 'connections',
+    audience: 'principal',
+    path: '/connections',
+    methods: ['GET', 'POST'],
+    title: 'Connections',
+    status: async () => '',
+    linkGuard: defineGuardedAction({ action: 'test.artifact-links-connections', decide: () => DENY('test') }),
+    handler: () => (_request, response) => response.end(),
+  });
 let artifactId: string;
 let sourceHash: string;
 const shareId = '11111111-1111-4111-8111-111111111111';
@@ -115,6 +129,26 @@ it('allows the exact logins link only toward the principal while web policy is e
     expect((await check(`${url}${suffix}`, ['principal@example.com'])).allowed).toBe(false);
   policy(false);
   expect((await check(url, ['principal@example.com'])).allowed).toBe(false);
+});
+it('allows each registered principal page at its exact address toward the principal alone, and nothing below it', async () => {
+  for (const url of ['https://aya.example.com/', 'https://aya.example.com/connections']) {
+    expect((await check(url, ['principal@example.com'])).allowed, url).toBe(true);
+    expect((await check(url)).allowed, url).toBe(false);
+    expect((await check(url, ['principal@example.com', 'juno@example.com'])).allowed, url).toBe(false);
+  }
+  for (const url of [
+    'https://aya.example.com/connections/callback/app2.ledgerly.example.test',
+    'https://aya.example.com/connections/callback/app2.ledgerly.example.test?code=sentinel&state=sentinel',
+    'https://aya.example.com/connections/',
+    'https://aya.example.com/logins/edit',
+  ])
+    for (const recipients of [['principal@example.com'], ['juno@example.com']])
+      expect((await check(url, recipients)).allowed, url).toBe(false);
+  // Refused as below a principal page, naming the page's own address, not as an unknown artifact path.
+  expect(await check('https://aya.example.com/connections/callback/app2.ledgerly.example.test')).toEqual({
+    allowed: false,
+    reason: expect.stringContaining('Connections page address, https://aya.example.com/connections,'),
+  });
 });
 it('denies stale hash, pending/revoked state, expiry, disable and deleted content even for the principal', async () => {
   const url = `${base}/share/${shareId}`;

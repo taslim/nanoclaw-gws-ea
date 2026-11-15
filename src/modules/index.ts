@@ -50,3 +50,4 @@ import './community-portal/index.js';
 import './gws-ea-browser/index.js';
 import './gws-ea-web/index.js';
 import './gws-ea-artifacts/index.js';
+import './gws-ea-connections/index.js';

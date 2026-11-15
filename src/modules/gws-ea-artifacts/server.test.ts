@@ -1,8 +1,9 @@
 import { createHash } from 'node:crypto';
 import { createServer, request as httpRequest, type Server } from 'node:http';
 import { afterEach, describe, expect, it } from 'vitest';
-import { createWebHandler, unavailableWebHandler } from '../gws-ea-web/server.js';
+import { createWebHandler } from '../gws-ea-web/server.js';
 import { createArtifactViewHandler, type ArtifactViewRoute } from './server.js';
+import { artifactsWebMount } from './web-mount.js';
 
 const id = '12345678-1234-4321-8321-123456789abc';
 const html = '<!doctype html><h1>Selected revision</h1>';
@@ -18,16 +19,22 @@ async function fixture(selectedHash = sourceHash) {
   let authorized = true;
   const routes: ArtifactViewRoute[] = [];
   server = createServer(
-    createWebHandler('artifact.test', {
-      artifacts: createArtifactViewHandler({
-        hostname: 'artifact.test',
-        resolve: async (_request, route) => {
-          routes.push(route);
-          return authorized ? { title: 'Revision title', html, sourceHash: selectedHash } : undefined;
+    createWebHandler(
+      'artifact.test',
+      [
+        {
+          mount: artifactsWebMount,
+          listener: createArtifactViewHandler({
+            hostname: 'artifact.test',
+            resolve: async (_request, route) => {
+              routes.push(route);
+              return authorized ? { title: 'Revision title', html, sourceHash: selectedHash } : undefined;
+            },
+          }),
         },
-      }),
-      logins: unavailableWebHandler,
-    }),
+      ],
+      async () => false,
+    ),
   );
   await new Promise<void>((resolve) => server!.listen(0, '127.0.0.1', resolve));
   const address = server.address();
@@ -80,6 +87,9 @@ describe('view-only artifact origin', () => {
       expect(child.headers.get('content-security-policy')).toContain("script-src 'none'");
       expect(child.headers.get('content-security-policy')).not.toContain('allow-same-origin');
       expect(child.headers.get('connection-allowlist')).toBeNull();
+      // The web module drops an unsandboxed authored-content response only on the paths the mount marks.
+      expect(artifactsWebMount.authoredContent(`${route}/frame/${sourceHash}`)).toBe(true);
+      expect(artifactsWebMount.authoredContent(route)).toBe(false);
       const head = await request(route, 'HEAD');
       expect(head.status).toBe(200);
       expect(await head.text()).toBe('');

@@ -1,9 +1,10 @@
-import { createServer, type Server, type RequestListener } from 'node:http';
+import { createServer, type Server } from 'node:http';
 import { readWebOperatorConfig, reconcileWebAccessEmails } from '../../gws-ea/web-cloudflare.js';
 import { log } from '../../log.js';
-import { createWebIdentity, type WebIdentity } from './access.js';
+import { createWebIdentity } from './access.js';
+import { webAdmissionEmails, type WebMount } from './mounts.js';
 import { WEB_POLICY_VERSIONS, readWebPolicy, webPolicyDigest, type WebPolicyFile } from './policy.js';
-import { createWebHandler, unavailableWebHandler, type WebFeatures } from './server.js';
+import { createWebHandler, principalGate, unavailableWebHandler } from './server.js';
 
 export interface WebHealth {
   readonly policyVersions: readonly number[];
@@ -19,7 +20,6 @@ export interface WebReadiness {
   readonly verifyAdmission: (config: WebPolicyFile) => Promise<void>;
   readonly publicationReady: (config: WebPolicyFile) => Promise<boolean>;
 }
-type WebFeatureFactory = (config: WebPolicyFile, identity: WebIdentity) => RequestListener;
 /** One optional origin and one non-overlapping admission reconciliation tick per host. */
 export class WebRuntime {
   private server: Server | undefined;
@@ -33,9 +33,10 @@ export class WebRuntime {
   private stopped = false;
   private tick: Promise<void> | undefined;
   private timer: NodeJS.Timeout | undefined;
+  private readonly admissionEmails = (): Promise<readonly string[]> => webAdmissionEmails(this.mounts());
+  /** Read when the listener opens, so every module has registered its mounts by then. */
   constructor(
-    private readonly features: WebFeatures<WebFeatureFactory>,
-    private readonly admissionEmails: () => Promise<readonly string[]>,
+    private readonly mounts: () => readonly WebMount[],
     private readonly dependencies: WebRuntimeDependencies = {},
   ) {}
   async publicationReady(config: WebPolicyFile): Promise<boolean> {
@@ -182,10 +183,12 @@ export class WebRuntime {
       }
       if (!this.server) {
         const identity = createWebIdentity(fresh.config);
-        const handler = createWebHandler(fresh.config.hostname, {
-          artifacts: this.features.artifacts(fresh.config, identity),
-          logins: this.features.logins(fresh.config, identity),
-        });
+        const config = fresh.config;
+        const handler = createWebHandler(
+          config.hostname,
+          this.mounts().map((mount) => ({ mount, listener: mount.handler(config, identity) })),
+          principalGate(identity),
+        );
         const server = createServer((request, response) => {
           if (this.ready) handler(request, response);
           else unavailableWebHandler(request, response);

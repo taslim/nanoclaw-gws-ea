@@ -383,7 +383,7 @@ export const COMMAND_DEFINITIONS: readonly CommandDefinition[] = [
     ],
     effects: [
       'Removes only recorded owned resources; external resource abandonment must be explicit.',
-      'Deletes the saved-login Keychain key after the host stops; an unreachable key is reported as left behind without failing removal.',
+      'Deletes the saved-login and connected-apps Keychain keys after the host stops; an unreachable key is reported as left behind without failing removal.',
     ],
     prerequisites: [...assistantPrerequisites],
     recovery: ['Rerun removal to continue its retained journal after fixing the stated blocker.'],

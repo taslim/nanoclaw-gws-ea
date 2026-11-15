@@ -18,19 +18,28 @@
  * imageBuild. add_mcp_server needs no rebuild and carries no gate.
  *
  * A protected agent group (src/cli/guard.ts) is the host's alone, so a
- * self-modification request from one is DENIED, never carded.
+ * self-modification request from one is DENIED, never carded, as is an
+ * add_mcp_server request a registered MCP server policy refuses.
  */
-import { protectedGroupReason } from '../../cli/guard.js';
+import { mcpServerChangeReason, protectedGroupReason } from '../../cli/guard.js';
 import { getSessionDriver } from '../../drivers/index.js';
 import { DENY, HOLD, defineGuardedAction, type GuardInput } from '../../guard/index.js';
 
-function selfModDecide(label: string) {
+function selfModDecide(label: string, changesMcpServer = false) {
   return async (input: GuardInput) => {
     if (input.actor.kind !== 'agent') {
       return DENY(`${label} is a container-originated action.`);
     }
     const protectedReason = await protectedGroupReason(input.actor.agentGroupId);
     if (protectedReason !== undefined) return DENY(`${label} is not allowed: ${protectedReason}`);
+    if (changesMcpServer) {
+      const { name } = input.payload;
+      const reason = await mcpServerChangeReason({
+        agentGroupId: input.actor.agentGroupId,
+        ...(typeof name === 'string' ? { serverName: name } : {}),
+      });
+      if (reason !== undefined) return DENY(`${label} is not allowed: ${reason}`);
+    }
     return HOLD(`${label} always requires admin approval from the container path`);
   };
 }
@@ -57,5 +66,5 @@ export const selfModInstallPackages = defineGuardedAction({
 export const selfModAddMcpServer = defineGuardedAction({
   action: 'self_mod.add_mcp_server',
   grantActionName: 'add_mcp_server',
-  decide: selfModDecide('add_mcp_server'),
+  decide: selfModDecide('add_mcp_server', true),
 });

@@ -1797,6 +1797,7 @@ describe('removal command', () => {
       `OneCLI: ${input.exclusive_resource_claims.onecli_project}`,
       `Google Cloud project: ${input.exclusive_resource_claims.gcp_project_id} (${ACCOUNT})`,
       'Saved logins: removes the local store and deletes its Keychain key after the host stops; an unreachable key is listed as left behind.',
+      'Connected apps: removes the local store and deletes its Keychain key after the host stops, without revoking access at the apps; an unreachable key is listed as left behind.',
       'Permanently tears down this assistant’s recorded local resources and requests project deletion; its subscription and credentials are removed within their existing ownership rules.',
       'Removal cancelled. Nothing was changed.',
       `Assistant: ${input.instance_id}`,
@@ -2088,7 +2089,9 @@ describe('WhatsApp removal', () => {
   });
 });
 
-describe('saved-login key removal', () => {
+describe('Keychain key removal', () => {
+  const SERVICES = ['gws-ea.saved-logins', 'gws-ea.connections'];
+
   it('skips Keychain cleanup on Linux without reporting a key left behind', async () => {
     const paths = await testPaths();
     const input = await reserve(paths, reservationInput());
@@ -2106,14 +2109,13 @@ describe('saved-login key removal', () => {
     await expectGone(paths, input);
   });
 
-  it.each([0, 44])('deletes the key after the host stops, treating exit %s as gone', async (exitCode) => {
+  it.each([0, 44])('deletes each store key after the host stops, treating exit %s as gone', async (exitCode) => {
     const paths = await testPaths();
     const input = await reserve(paths, reservationInput(), { started: ['start_nanoclaw'] });
     const scene = world(input);
     const runCommand = vi.fn(async (request: SanitizedCommand): Promise<SanitizedCommandOutcome> => {
       expect(scene.order).toContain('nanoclaw');
       expect(request.command).toBe('/usr/bin/security');
-      expect(request.args).toEqual(['delete-generic-password', '-s', 'gws-ea.saved-logins', '-a', input.instance_id]);
       return { exitCode, stdout: '', stderr: '' };
     });
     const outcome = await removeAssistant(paths, input.instance_id, {
@@ -2121,26 +2123,33 @@ describe('saved-login key removal', () => {
       platform: 'macos',
       runCommand,
     });
-    expect(runCommand).toHaveBeenCalledOnce();
-    expect(outcome.removed).toContain('login-key');
-    expect(outcome).toMatchObject({ login_key: 'removed' });
+    expect(runCommand.mock.calls.map(([request]) => request.args)).toEqual(
+      SERVICES.map((service) => ['delete-generic-password', '-s', service, '-a', input.instance_id]),
+    );
+    expect(outcome.removed).toEqual(expect.arrayContaining(['login-key', 'connections-key']));
+    expect(outcome).toMatchObject({ login_key: 'removed', connections_key: 'removed' });
     await expectGone(paths, input);
   });
+
   it('finishes local removal while naming an unreachable key as left behind', async () => {
     const paths = await testPaths();
     const input = await reserve(paths, reservationInput());
     const scene = world(input);
     const runCommand = vi.fn(
-      async (): Promise<SanitizedCommandOutcome> => ({ exitCode: 36, stdout: '', stderr: 'locked' }),
+      async (request: SanitizedCommand): Promise<SanitizedCommandOutcome> =>
+        request.args.includes('gws-ea.connections')
+          ? { exitCode: 36, stdout: '', stderr: 'locked' }
+          : { exitCode: 0, stdout: '', stderr: '' },
     );
     const outcome = await removeAssistant(paths, input.instance_id, {
       ...scene.dependencies,
       platform: 'macos',
       runCommand,
     });
-    expect(runCommand).toHaveBeenCalledOnce();
-    expect(outcome.removed).not.toContain('login-key');
-    expect(outcome).toMatchObject({ login_key: 'left_behind' });
+    expect(runCommand).toHaveBeenCalledTimes(2);
+    expect(outcome.removed).toContain('login-key');
+    expect(outcome.removed).not.toContain('connections-key');
+    expect(outcome).toMatchObject({ login_key: 'removed', connections_key: 'left_behind' });
     await expectGone(paths, input);
     expect(await exists(paths.removalFile(input.instance_id))).toBe(false);
   });
@@ -2154,33 +2163,39 @@ it('preserves a key left behind when a later removal step must resume', async ()
   const removeOnecli = vi.fn(async () => undefined).mockRejectedValueOnce(new Error('Teardown interrupted'));
   const dependencies = { ...scene.dependencies, platform: 'macos' as const, runCommand, removeOnecli };
   await expect(removeAssistant(paths, input.instance_id, dependencies)).rejects.toThrow('Teardown interrupted');
-  expect(await removeAssistant(paths, input.instance_id, dependencies)).toMatchObject({ login_key: 'left_behind' });
-  expect(runCommand).toHaveBeenCalledOnce();
+  expect(await removeAssistant(paths, input.instance_id, dependencies)).toMatchObject({
+    login_key: 'left_behind',
+    connections_key: 'left_behind',
+  });
+  expect(runCommand).toHaveBeenCalledTimes(2);
   await expectGone(paths, input);
 });
 
-it('keeps an invalid key outcome in a removal receipt explicit before further teardown', async () => {
-  const paths = await testPaths();
-  const input = await reserve(paths, reservationInput(), { started: ['start_onecli'] });
-  const scene = world(input);
-  await expect(
-    removeAssistant(paths, input.instance_id, {
-      ...scene.dependencies,
-      platform: 'macos',
-      removeOnecli: async () => {
-        throw new Error('Teardown interrupted');
-      },
-    }),
-  ).rejects.toThrow('Teardown interrupted');
-  const receipt = JSON.parse(await readFile(paths.removalFile(input.instance_id), 'utf8'));
-  await writePrivate(paths.removalFile(input.instance_id), { ...receipt, login_key: 'invalid' });
-  await expect(
-    removeAssistant(paths, input.instance_id, { ...scene.dependencies, platform: 'macos' }),
-  ).rejects.toMatchObject({
-    code: 'removal_receipt_unreadable',
-  });
-  expect(scene.dependencies.removeOnecli).not.toHaveBeenCalled();
-});
+it.each(['login_key', 'connections_key'])(
+  'keeps an invalid %s outcome in a removal receipt explicit before further teardown',
+  async (field) => {
+    const paths = await testPaths();
+    const input = await reserve(paths, reservationInput(), { started: ['start_onecli'] });
+    const scene = world(input);
+    await expect(
+      removeAssistant(paths, input.instance_id, {
+        ...scene.dependencies,
+        platform: 'macos',
+        removeOnecli: async () => {
+          throw new Error('Teardown interrupted');
+        },
+      }),
+    ).rejects.toThrow('Teardown interrupted');
+    const receipt = JSON.parse(await readFile(paths.removalFile(input.instance_id), 'utf8'));
+    await writePrivate(paths.removalFile(input.instance_id), { ...receipt, [field]: 'invalid' });
+    await expect(
+      removeAssistant(paths, input.instance_id, { ...scene.dependencies, platform: 'macos' }),
+    ).rejects.toMatchObject({
+      code: 'removal_receipt_unreadable',
+    });
+    expect(scene.dependencies.removeOnecli).not.toHaveBeenCalled();
+  },
+);
 
 it.each([false, true])('names an unreachable key after successful removal in text and JSON, json=%s', async (json) => {
   const paths = await testPaths();
@@ -2206,9 +2221,22 @@ it.each([false, true])('names an unreachable key after successful removal in tex
     expectResultContract('remove', result);
     expect(result).toMatchObject({
       outcome: 'succeeded',
-      data: { removal: { login_key: 'left_behind' } },
-      next_actions: [{ kind: 'external', instruction: expect.stringContaining(input.instance_id) }],
+      data: { removal: { login_key: 'left_behind', connections_key: 'left_behind' } },
+      next_actions: [
+        {
+          kind: 'external',
+          instruction: expect.stringContaining(`gws-ea.saved-logins key for assistant ${input.instance_id}`),
+        },
+        {
+          kind: 'external',
+          instruction: expect.stringContaining(`gws-ea.connections key for assistant ${input.instance_id}`),
+        },
+      ],
     });
-  } else
+  } else {
     expect(output.join('\n')).toContain(`Left behind: the saved-login Keychain key for assistant ${input.instance_id}`);
+    expect(output.join('\n')).toContain(
+      `Left behind: the connected-apps Keychain key for assistant ${input.instance_id}`,
+    );
+  }
 });

@@ -70,7 +70,8 @@ import { registerPurchaseOutcomeDelivery } from './purchase-outcome.js';
 import { registerReservationGuaranteeDelivery } from './reservation-guarantee.js';
 import { recoverConsentOutcomes, registerConsentGrantsDelivery, requestConsentAction } from './consent-approval.js';
 import { registerDisclosureDelivery } from './disclosures.js';
-import { registerLoginsPageDelivery } from './logins-link.js';
+import { loginsWebMount } from './logins-mount.js';
+import { registerWebMount } from '../gws-ea-web/mounts.js';
 import { watchAction, listWatchesAction, cancelWatchAction, watchBookAction } from './watches.js';
 
 import type { BrowserActions, BrowserExecutionContext } from './actions.js';
@@ -260,7 +261,7 @@ registerPurchaseOutcomeDelivery(getBrowserQueue);
 registerReservationGuaranteeDelivery();
 registerConsentGrantsDelivery();
 registerDisclosureDelivery();
-registerLoginsPageDelivery();
+registerWebMount(loginsWebMount);
 registerCredentialAuthorityDelivery(getBrowserQueue);
 
 export {

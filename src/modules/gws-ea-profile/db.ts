@@ -217,7 +217,8 @@ export function knownMainAgentGroupId(): string | null {
   return knownMainAgentGroup ?? null;
 }
 
-async function readMainAgentGroupId(): Promise<string | null> {
+/** Null before the profile table exists, as on a host that is not a gws-ea assistant. */
+export async function readMainAgentGroupId(): Promise<string | null> {
   return (await getDb().hasTable('gws_ea_profile')) ? getMainAgentGroupId() : null;
 }
 

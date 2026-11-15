@@ -27,7 +27,7 @@ import { BrowserStore, markBrowserRequestCommitStarted, type BrowserRequest } fr
 import { SiteLeaseStore } from './leases.js';
 import { browserAvailability } from './availability.js';
 
-import { reconcileBrowserGroup } from './reconcile.js';
+import { reconcileBrowserRoutes } from './reconcile.js';
 import { writeBrowserNotice } from './notices.js';
 import { browserAdmissionReady } from './group.js';
 import { BrowserDiagnosticAttempt } from './diagnostics.js';
@@ -59,7 +59,7 @@ export function registerBrowserActionDelivery(name: BrowserActionName, queue: ()
   registerDeliveryAction(
     name,
     answeringAction(name, async (content, session, requestId) => {
-      await reconcileBrowserGroup();
+      await reconcileBrowserRoutes();
       await queue().accept(name, content, session, requestId);
       return ANSWER_LATER;
     }),

@@ -77,6 +77,8 @@ interface GatewayProviderDefinition {
   kind: string;
   credentials?: {
     connection(target: GatewayCredentialTarget): GatewayRuntimeCredentialConnection;
+    listForHost?(host: string): Promise<GatewayHostCredential[]>;
+    removeById?(ids: readonly string[]): Promise<GatewayCredentialRemoval[]>;
   };
   agentSkills: readonly string[];
   sessions: {
@@ -371,6 +373,15 @@ like the writes, re-reads native metadata and refuses an entry that changed
 since. A host module that writes a credential (a token it refreshes, for
 example) uses only this connection, never the gateway's native API, and is
 that credential's only writer.
+
+Two optional methods let the host find and clear credentials by host, whoever
+wrote them. `listForHost(host)` returns every stored credential whose host is
+exactly `host`, as the gateway's own id and the credential's name.
+`removeById(ids)` re-reads the gateway's entries, deletes each id and reports
+every id's outcome instead of stopping at the first failure: `removed`, `gone`
+when it no longer existed, or `failed`. Both report facts only. The gateway
+applies no policy to them; the caller decides what a match means and which ids
+to remove. A gateway that cannot list by exact host omits both.
 
 OneCLI implements the connection once, in its payload's
 `src/gateway-providers/onecli-credentials.ts`. The installed copy serves its

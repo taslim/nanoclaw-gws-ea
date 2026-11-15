@@ -4,16 +4,44 @@ import { tmpdir } from 'node:os';
 import { createServer, request as httpRequest, type Server } from 'node:http';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { writeWebOperatorConfig } from '../../gws-ea/web-cloudflare.js';
+import { defineGuardedAction, DENY } from '../../guard/index.js';
+import type { WebMount } from './mounts.js';
 import { WebRuntime } from './runtime.js';
 import type { WebPolicyFile } from './policy.js';
 vi.mock('../../log.js', () => ({ log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() } }));
+vi.mock('../gws-ea-profile/db.js', () => ({
+  listPrincipalAddresses: async () => [{ email: 'principal@example.com', added_at: '2026-11-01T00:00:00.000Z' }],
+}));
+
+const mounts: readonly WebMount[] = [
+  {
+    name: 'artifacts',
+    audience: 'artifact-readers',
+    path: '/artifacts',
+    methods: ['GET', 'HEAD'],
+    handler: () => (_request, response) => response.end('artifact'),
+    admissionEmails: async () => ['juno@example.com'],
+    authoredContent: () => false,
+  },
+  {
+    name: 'logins',
+    audience: 'principal',
+    path: '/logins',
+    methods: ['GET', 'HEAD', 'POST'],
+    title: 'Logins',
+    status: async () => 'No saved logins',
+    linkGuard: defineGuardedAction({ action: 'test.web-runtime-logins-link', decide: () => DENY('test') }),
+    handler: () => (_request, response) => response.end('logins'),
+  },
+];
 
 let root: string;
 let config: WebPolicyFile;
 let runtime: WebRuntime;
 let blocker: Server | undefined;
 let unavailable: boolean;
-const emails = ['principal@example.com'];
+let admitted: readonly string[] = [];
+const emails = ['juno@example.com', 'principal@example.com'];
 beforeEach(async () => {
   root = fs.mkdtempSync(path.join(fs.realpathSync(tmpdir()), 'web-runtime-'));
   const port = createServer();
@@ -60,21 +88,16 @@ beforeEach(async () => {
   fs.writeFileSync(path.join(root, 'policy.json'), JSON.stringify(config), { mode: 0o600 });
   vi.stubEnv('GWS_EA_WEB_POLICY_FILE', path.join(root, 'policy.json'));
   unavailable = false;
-  runtime = new WebRuntime(
-    {
-      artifacts: () => (_request, response) => response.end('artifact'),
-      logins: () => (_request, response) => response.end('logins'),
+  admitted = [];
+  runtime = new WebRuntime(() => mounts, {
+    reconcileAccess: async (options) => {
+      if (unavailable) throw new Error('Admission unavailable');
+      admitted = typeof options.emails === 'function' ? await options.emails() : options.emails;
+      return { verified: true, emails, changed: false };
     },
-    async () => emails,
-    {
-      reconcileAccess: async () => {
-        if (unavailable) throw new Error('Admission unavailable');
-        return { verified: true, emails, changed: false };
-      },
-    },
-  );
+  });
 });
-it('serves both fixed features through the same ready origin and closes publication readiness on stop', async () => {
+it('serves registered mounts through the same ready origin and closes publication readiness on stop', async () => {
   expect(await runtime.publicationReady(config)).toBe(false);
   await runtime.reconcile();
   expect(await runtime.publicationReady(config)).toBe(true);
@@ -96,7 +119,9 @@ it('serves both fixed features through the same ready origin and closes publicat
   }
   expect(await request('/artifacts/id')).toEqual({ status: 200, body: 'artifact' });
   expect(await request('/artifacts/id', 'POST')).toEqual({ status: 405, body: '' });
-  expect(await request('/logins', 'POST')).toEqual({ status: 200, body: 'logins' });
+  // Without a verified principal assertion the principal gate answers before the page handler.
+  expect(await request('/logins', 'POST')).toEqual({ status: 404, body: '' });
+  expect(admitted).toEqual(emails);
   await runtime.stop();
   expect(await runtime.publicationReady(config)).toBe(false);
 });

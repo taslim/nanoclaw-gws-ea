@@ -12,7 +12,12 @@ import type {
   NetworkAccessIntent,
   SessionKey,
 } from '../drivers/types.js';
-import type { GatewayCredentialTarget, GatewayRuntimeCredentialConnection } from './credential-connection.js';
+import type {
+  GatewayCredentialRemoval,
+  GatewayCredentialTarget,
+  GatewayHostCredential,
+  GatewayRuntimeCredentialConnection,
+} from './credential-connection.js';
 
 /** Typed spec content contributed to one session. Raw runtime flags never cross this seam. */
 export interface GatewayContribution {
@@ -136,11 +141,21 @@ export interface GatewayProviderDefinition {
   };
   /**
    * Caller-described credentials the host stores at runtime: setup's
-   * connection contract, plus removal. Absent when the gateway takes
-   * credentials only at setup.
+   * connection contract, plus removal, and optionally listing and removal by
+   * host. Absent when the gateway takes credentials only at setup.
    */
   credentials?: {
     connection(target: GatewayCredentialTarget): GatewayRuntimeCredentialConnection;
+    /**
+     * Every stored credential whose host is exactly `host`, whoever wrote it.
+     * Facts only: the caller decides what a match means.
+     */
+    listForHost?(host: string): Promise<GatewayHostCredential[]>;
+    /**
+     * Delete each id after re-reading the gateway's entries, reporting every
+     * id's outcome instead of stopping at the first failure.
+     */
+    removeById?(ids: readonly string[]): Promise<GatewayCredentialRemoval[]>;
   };
   /** Only the selected gateway's skills and instructions reach an agent. */
   agentSkills: readonly string[];

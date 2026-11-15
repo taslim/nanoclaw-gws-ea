@@ -27,6 +27,7 @@ import {
 // Transcript archiving and rotation are this provider's own concern: both
 // read the SDK's on-disk .jsonl, which no other provider has.
 import { archiveClaudeTranscript, rotateClaudeContinuation } from './claude-history.js';
+import { forgetHostManagedMcpAuth } from './claude-mcp-auth.js';
 import { registerProvider } from './provider-registry.js';
 import type {
   AgentProvider,
@@ -365,6 +366,7 @@ export class ClaudeProvider implements AgentProvider {
     const instructions = input.systemContext?.instructions;
     const toolOptions = resolveClaudeToolOptions(this.capabilities, this.mcp, this.executionPolicy.disallowedTools);
     const planning = planningAgentsEnabled(runnerCapabilities()) ? createPlanningRuntime(input.cwd) : undefined;
+    forgetHostManagedMcpAuth();
 
     const sdkResult = sdkQuery({
       prompt: stream,
