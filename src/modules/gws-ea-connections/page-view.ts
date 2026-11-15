@@ -64,8 +64,13 @@ function statusBadge(status: AppStatus): string {
   return `<span class="status status-${status.replace('_', '-')}">${STATUS_LABELS[status]}</span>`;
 }
 
-function menuForm(action: string, app: ConnectionApp, label: string, pending: string, danger = false): string {
-  return `<form method="post" action="${action}" data-send>${hiddenApp(app)}<button type="submit" role="menuitem" tabindex="-1" data-pending-label="${pending}"${danger ? ' data-danger' : ''}>${label}</button></form>`;
+function menuForm(action: string, app: ConnectionApp, label: string, pending: string, confirm?: string): string {
+  return `<form method="post" action="${action}" data-send${confirm ? ` ${confirm}` : ''}>${hiddenApp(app)}<button type="submit" role="menuitem" tabindex="-1" data-pending-label="${pending}"${confirm ? ' data-danger' : ''}>${label}</button></form>`;
+}
+
+/** Delete also forgets client details the principal may have registered elsewhere, so it asks; Disconnect is undone by Connect. */
+function deleteConfirmation(app: ConnectionApp): string {
+  return `data-confirm-title="${escapeHtml(`Delete ${app.name}?`)}" data-confirm-action="Delete" data-confirm-message="This removes it from your assistant and forgets its sign-in and any client details you entered. You can add it again later."`;
 }
 
 function appMenu(app: ConnectionApp, index: number, canChange: boolean): string {
@@ -77,7 +82,7 @@ function appMenu(app: ConnectionApp, index: number, canChange: boolean): string 
     ...(app.status === 'not_connected'
       ? []
       : [menuForm('/connections/disconnect', app, 'Disconnect', 'Disconnecting…')]),
-    menuForm('/connections/delete', app, 'Delete', 'Deleting…', true),
+    menuForm('/connections/delete', app, 'Delete', 'Deleting…', deleteConfirmation(app)),
   ];
   return renderMenu(`app-menu-${index}`, `Actions for ${app.name}`, items);
 }

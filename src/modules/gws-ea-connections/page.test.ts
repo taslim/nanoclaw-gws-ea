@@ -813,6 +813,16 @@ describe('managing apps', () => {
     assertNoSentinels();
   });
 
+  it('asks before Delete, which also forgets entered client details, and not before Disconnect', async () => {
+    serve(recipesServer);
+    await post('/connections/add', { url: RECIPES, name: '' });
+    const list = (await request('/connections')).body;
+    expect(list).toContain(
+      'action="/connections/delete" data-send data-confirm-title="Delete Recipes?" data-confirm-action="Delete" data-confirm-message="This removes it from your assistant and forgets its sign-in and any client details you entered. You can add it again later."',
+    );
+    expect(list).not.toMatch(/action="\/connections\/disconnect" data-send data-confirm/u);
+  });
+
   it('renames the label only: the server key and main’s entry stay', async () => {
     serve(recipesServer);
     await post('/connections/add', { url: RECIPES, name: '' });
