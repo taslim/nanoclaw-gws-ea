@@ -36,7 +36,7 @@ export async function connectionsStatus(read: () => Promise<ConnectionsListing> 
   const reconnect = listing.apps.filter((app) => app.status === 'needs_reconnecting').length;
   if (reconnect) return count(reconnect, 'app needs reconnecting', 'apps need reconnecting');
   const connected = listing.apps.filter((app) => app.status === 'connected').length + listing.operators.length;
-  return connected ? count(connected, 'app connected', 'apps connected') : 'None yet';
+  return connected ? count(connected, 'app connected', 'apps connected') : 'No apps yet';
 }
 
 export interface ConnectionLinkFact {

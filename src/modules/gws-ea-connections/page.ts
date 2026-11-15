@@ -66,22 +66,22 @@ const CALLBACK = /^\/connections\/callback\/([a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9
 /** Each code's one message. Only a refused client says why a sign-in ended: the principal can correct it. */
 const RETURN_MESSAGES = {
   connected: 'App connected. Your assistant can use it from your next message.',
-  cancelled: 'Sign-in was cancelled. The app wasn’t changed.',
-  expired: 'That sign-in expired or was already used. Connect the app again to start a new one.',
-  failed: 'Sign-in didn’t finish. The app wasn’t changed. Try connecting again.',
-  client_refused: 'The app’s sign-in service refused the client details, so they were removed. Connect the app again.',
+  cancelled: 'Sign-in was cancelled, so nothing changed.',
+  expired: 'That sign-in expired or was already used. Connect again to start over.',
+  failed: 'Sign-in didn’t finish, so nothing changed. Try connecting again.',
+  client_refused:
+    'The sign-in service didn’t accept the client details, so they were removed. Connect again to enter new ones.',
 } satisfies Record<SignInReturn, string>;
 
 function isSignInReturn(code: string | null): code is SignInReturn {
   return code !== null && Object.hasOwn(RETURN_MESSAGES, code);
 }
 
-const CHANGED = 'This app changed since you opened the page. Reload the page and try again.';
-const STORE_UNAVAILABLE = 'Your apps can’t be read right now. Ask your operator.';
-const UNREACHABLE = 'The app’s server didn’t answer. Check the address and try again.';
-const UNSUPPORTED = 'This app signs in in a way your assistant doesn’t support.';
-const HOST_IN_USE =
-  'Another app or one of your operator’s servers already uses this address. Remove it first to add this one.';
+const CHANGED = 'This app changed after you opened the page. Reload and try again.';
+const STORE_UNAVAILABLE = 'Your apps can’t be loaded right now. Ask your operator.';
+const UNREACHABLE = 'The app didn’t respond. Check the address and try again.';
+const UNSUPPORTED = 'This app uses a kind of sign-in your assistant doesn’t support.';
+const HOST_IN_USE = 'Another app already uses this address. Remove it first, then add this one.';
 const OPERATOR_NEEDED = 'Apps can’t be added or connected right now. Ask your operator.';
 
 function operatorMessage(outcome: Exclude<OperatorDisconnectOutcome, 'disconnected'>): {
@@ -92,13 +92,13 @@ function operatorMessage(outcome: Exclude<OperatorDisconnectOutcome, 'disconnect
     case 'credentials_kept':
       return {
         status: 200,
-        message: 'Some of this server’s saved access couldn’t be removed, so it’s still connected. Try again.',
+        message: 'Not all of its saved access could be removed, so it’s still connected. Try again.',
       };
     case 'changed':
     case 'not_found':
-      return { status: 409, message: 'This server changed since you opened the page. Reload the page and try again.' };
+      return { status: 409, message: CHANGED };
     case 'unavailable':
-      return { status: 503, message: 'Servers can’t be disconnected right now. Ask your operator.' };
+      return { status: 503, message: 'Apps can’t be disconnected right now. Ask your operator.' };
   }
 }
 
@@ -110,15 +110,15 @@ function connectRefusalStatus(reason: ConnectRefusal): number {
 function addMessage(reason: AddRefusal): string {
   switch (reason) {
     case 'invalid_url':
-      return 'Enter the app’s full address, such as https://example.com/mcp.';
+      return 'Enter the app’s full server address, like https://example.com/mcp.';
     case 'not_https':
-      return 'The address must start with https://.';
+      return 'The address needs to start with https://.';
     case 'credentials_in_url':
-      return 'Remove the sign-in details or query from the address. You can enter a token when you connect.';
+      return 'Leave sign-in details and query text out of the address. You can enter a token when you connect.';
     case 'host_in_use':
       return HOST_IN_USE;
     case 'own_service':
-      return 'This address belongs to one of your assistant’s own services, so it can’t be added as an app.';
+      return 'That address belongs to your assistant, so it can’t be added as an app.';
     case 'unavailable':
       return OPERATOR_NEEDED;
     case 'unreachable':
@@ -126,9 +126,9 @@ function addMessage(reason: AddRefusal): string {
     case 'unsupported':
       return UNSUPPORTED;
     case 'duplicate_name':
-      return 'Another app already has that name. Choose a different name.';
+      return 'Another app already has that name. Try a different one.';
     case 'invalid_name':
-      return `Enter a name of at most ${NAME_MAX} characters, without control characters.`;
+      return `Use a name of up to ${NAME_MAX} characters.`;
   }
 }
 
@@ -139,17 +139,17 @@ function connectMessage(reason: ConnectRefusal): string {
     case 'wrong_method':
       return CHANGED;
     case 'method_changed':
-      return 'This app now signs in differently. Delete it and add it again.';
+      return 'This app now signs in differently. Delete it, then add it again.';
     case 'token_missing':
       return 'Enter an access token.';
     case 'token_refused':
       return 'The app didn’t accept that token. Check it and try again.';
     case 'invalid_client':
-      return 'Enter the client ID and secret exactly as the app’s sign-in service gave them.';
+      return 'Enter the client ID and secret exactly as the sign-in service gave them.';
     case 'needs_client':
-      return 'Enter the client details this app’s sign-in service gave you. Reload the page to see the fields.';
+      return 'This app now needs client details. Reload the page to enter them.';
     case 'client_refused':
-      return 'The app’s sign-in service refused the client details. Reload the page to enter them again.';
+      return 'The sign-in service didn’t accept the client details. Reload the page to enter them again.';
     case 'unreachable':
       return UNREACHABLE;
     case 'unsupported':
@@ -287,7 +287,7 @@ async function write(
       const added = await operations.add({ url: text(data, 'url'), name: addName });
       if (added.status === 'refused')
         return { ...refused({ kind: 'add' }, addMessage(added.reason)), addName: addName.slice(0, NAME_MAX) };
-      return done({ kind: 'connect', id: added.app.id }, 'App added. Connect it to give your assistant its tools.');
+      return done({ kind: 'connect', id: added.app.id }, 'App added. Connect it so your assistant can use it.');
     }
     case 'connect': {
       only(data, ['id', 'version'], ['token']);
@@ -307,13 +307,13 @@ async function write(
       const changed = await operations.changeClient(id, version);
       if (changed.status === 'refused')
         return refused({ kind: 'connect', id }, connectMessage(changed.reason), connectRefusalStatus(changed.reason));
-      return done({ kind: 'connect', id }, 'Client details removed. Enter the new ones to sign in.');
+      return done({ kind: 'connect', id }, 'Client details removed. Enter new ones to sign in.');
     }
     case 'disconnect': {
       only(data, ['id', 'version']);
       const { id, version } = appReference(data);
       await operations.disconnect(id, version);
-      return done({ kind: 'list' }, 'App disconnected. Your assistant no longer has its tools.');
+      return done({ kind: 'list' }, 'App disconnected. Your assistant can’t use it until you connect it again.');
     }
     case 'delete': {
       only(data, ['id', 'version']);
@@ -322,7 +322,7 @@ async function write(
       return {
         ...done(
           { kind: 'list' },
-          'The app is disconnected, but its access couldn’t be removed yet, so it’s still listed. Try deleting it again.',
+          'The app is disconnected, but not all of its saved access could be removed, so it’s still listed. Try deleting it again.',
         ),
         failed: true,
       };
@@ -340,7 +340,7 @@ async function write(
       const host = text(data, 'host');
       const outcome = await disconnectOperatorServer(operations.store, { key, host }, operatorDependencies);
       if (outcome === 'disconnected')
-        return done({ kind: 'list' }, 'Server disconnected. Your assistant no longer has its tools.');
+        return done({ kind: 'list' }, 'App disconnected. Your assistant can’t use it anymore.');
       const { status, message } = operatorMessage(outcome);
       if (outcome !== 'credentials_kept') return refused({ kind: 'list' }, message, status);
       return { ...done({ kind: 'list' }, message), failed: true, retryServer: { key, host } };

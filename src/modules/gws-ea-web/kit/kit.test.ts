@@ -182,7 +182,9 @@ it('reads one JSON object of at most 16 KiB and refuses anything else', async ()
 
 it('draws the shell with the escaped assistant name and the current page marked', () => {
   const html = sample('nonce-value');
-  expect(html).toContain('<p class="shell-name">Juno &lt;Hale&gt;</p>');
+  expect(html).toContain(
+    '<p class="shell-name"><span class="shell-mark" aria-hidden="true">J</span><span>Juno &lt;Hale&gt;</span></p>',
+  );
   expect(html).toContain('<a href="/" data-navigation>Home</a>');
   expect(html).toContain('<a href="/logins" data-navigation aria-current="page">Logins</a>');
   expect(html).toContain('<title>Saved logins · Logins · Juno &lt;Hale&gt;</title>');
@@ -238,12 +240,14 @@ it.skipIf(!chromePath).each([320, 1200])(
       page.setDefaultTimeout(5000);
       await page.goto(`https://${HOST}/logins`);
       const focused = (): Promise<string> =>
-        page.evaluate<string>('document.activeElement.id || document.activeElement.textContent');
+        page.evaluate<string>(
+          "document.activeElement.id || document.activeElement.getAttribute('aria-label') || document.activeElement.textContent",
+        );
 
       expect(await page.evaluate<boolean>('document.documentElement.scrollWidth <= innerWidth')).toBe(true);
       expect(
         await page.evaluate<string[]>(
-          `[...document.querySelectorAll('.shell-nav a, button')].filter(element => { const r = element.getBoundingClientRect(); return r.width > 0 && (r.width < 44 || r.height < 44); }).map(element => element.textContent)`,
+          `[...document.querySelectorAll('.shell-nav a, button')].filter(element => { const r = element.getBoundingClientRect(); return r.width > 0 && (r.width < 44 || r.height < 44); }).map(element => element.getAttribute('aria-label') || element.textContent)`,
         ),
       ).toEqual([]);
 

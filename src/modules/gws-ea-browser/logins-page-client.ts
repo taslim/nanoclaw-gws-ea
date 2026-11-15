@@ -15,7 +15,7 @@ export const LOGINS_PAGE_SCRIPT = String.raw`
     const value = document.getElementById('password-value');
     if (value) { value.textContent = ''; value.hidden = true; }
     const concealed = document.getElementById('password-concealed');
-    if (concealed) { concealed.hidden = false; concealed.lastChild.textContent = 'Not shown'; }
+    if (concealed) { concealed.hidden = false; concealed.lastChild.textContent = 'Hidden'; }
     const button = document.getElementById('show-password');
     if (button) {
       button.textContent = 'Show password';
@@ -44,14 +44,14 @@ export const LOGINS_PAGE_SCRIPT = String.raw`
       if (generation !== revealGeneration) return;
       if (response.status === 404) {
         hidePassword();
-        kit.message('This request could not be accepted. Reload the page and try again.', true);
+        kit.message('That didn’t go through. Reload the page and try again.', true);
         return;
       }
       const data = await response.json();
       if (generation !== revealGeneration || document.visibilityState !== 'visible') return;
       if (!response.ok || typeof data.password !== 'string') {
         hidePassword();
-        kit.message(typeof data.error === 'string' ? data.error : 'The password could not be shown. Try again.', response.status === 409);
+        kit.message(typeof data.error === 'string' ? data.error : 'Couldn’t show the password. Try again.', response.status === 409);
         return;
       }
       value.textContent = data.password;
@@ -64,7 +64,7 @@ export const LOGINS_PAGE_SCRIPT = String.raw`
     } catch {
       if (generation !== revealGeneration) return;
       hidePassword();
-      kit.message('The password could not be shown. Reload the page and try again.', true);
+      kit.message('Couldn’t show the password. Reload the page and try again.', true);
     } finally {
       if (generation === revealGeneration) {
         revealRequest = undefined;
@@ -86,7 +86,8 @@ export const LOGINS_PAGE_SCRIPT = String.raw`
       group.hidden = ![...group.querySelectorAll('[data-login-row]')].some(row => !row.hidden);
     });
     document.getElementById('search-empty').hidden = count !== 0;
-    document.getElementById('search-count').textContent = needle ? count + (count === 1 ? ' login found' : ' logins found') : '';
+    const summary = document.getElementById('search-count');
+    summary.textContent = needle ? count + ' found' : summary.dataset.total;
   });
   document.addEventListener('click', event => {
     if (!(event.target instanceof Element)) return;

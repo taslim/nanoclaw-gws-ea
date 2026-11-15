@@ -9,6 +9,8 @@ import {
   pageNonce,
   readShell,
   refuse,
+  renderEmptyState,
+  renderPageHeading,
   renderPrincipalPage,
   sendPage,
   sendUnavailable,
@@ -45,22 +47,6 @@ async function summary(page: PrincipalPageMount): Promise<string | undefined> {
   /* eslint-enable no-catch-all/no-catch-all */
 }
 
-const STYLE = `
-.page-list { overflow: hidden; background: var(--panel); border: 1px solid var(--line); border-radius: 12px; }
-.page-row { display: flex; align-items: center; gap: 20px; padding: 17px 20px; min-height: 76px; transition: background-color .15s; }
-.page-row + .page-row { border-top: 1px solid var(--line); }
-.page-row:hover { background: var(--hover); }
-.page-row:focus-visible { outline-offset: -3px; }
-.page-identity { min-width: 0; flex: 1; display: flex; flex-direction: column; gap: 3px; }
-.page-title { font-size: 15px; font-weight: 500; line-height: 1.4; letter-spacing: -.015em; overflow-wrap: anywhere; }
-.page-status { font-size: 12px; color: var(--muted); overflow-wrap: anywhere; }
-.row-arrow { width: 15px; height: 15px; color: var(--muted); }
-@media (max-width: 600px) {
-  .page-row { gap: 16px; padding: 16px; }
-  .page-title { font-size: 14px; }
-}
-`;
-
 interface HomeRow {
   readonly title: string;
   readonly path: string;
@@ -68,14 +54,14 @@ interface HomeRow {
 }
 
 function homeContent(rows: readonly HomeRow[]): string {
-  const heading = '<div class="page-heading"><div><h1>Home</h1></div></div>';
-  if (rows.length === 0) return `${heading}<section class="empty-state"><h2>No pages yet.</h2></section>`;
-  return `${heading}<section class="page-list" aria-label="Your pages">${rows
+  const heading = renderPageHeading('Home');
+  if (rows.length === 0) return `${heading}${renderEmptyState('Nothing here yet', 'apps')}`;
+  return `${heading}<nav class="list" aria-label="Your pages">${rows
     .map(
       (row) =>
-        `<a class="page-row" href="${escapeHtml(row.path)}" data-navigation><span class="page-identity"><span class="page-title">${escapeHtml(row.title)}</span>${row.status ? `<span class="page-status">${escapeHtml(row.status)}</span>` : ''}</span>${icon('arrow', 'row-arrow')}</a>`,
+        `<a class="row" href="${escapeHtml(row.path)}" data-navigation><span class="row-main"><span class="row-title">${escapeHtml(row.title)}</span>${row.status ? `<span class="row-sub">${escapeHtml(row.status)}</span>` : ''}</span>${icon('arrow', 'row-chevron')}</a>`,
     )
-    .join('')}</section>`;
+    .join('')}</nav>`;
 }
 
 interface HomePageOptions {
@@ -111,7 +97,6 @@ export function createHomePageHandler(options: HomePageOptions): RequestListener
                   content: homeContent(
                     listed.map(({ title, path }, index) => ({ title, path, status: statuses[index] })),
                   ),
-                  style: STYLE,
                 },
                 nonce,
               ),

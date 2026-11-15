@@ -26,7 +26,7 @@ export const CONNECTIONS_PAGE_SCRIPT = String.raw`
         credentials: 'same-origin', cache: 'no-store',
       });
       if (response.status === 404) {
-        kit.message('This request could not be accepted. Reload the page and try again.', true);
+        kit.message('That didn’t go through. Reload the page and try again.', true);
         return;
       }
       const data = await response.json();
@@ -35,9 +35,9 @@ export const CONNECTIONS_PAGE_SCRIPT = String.raw`
         location.assign(data.authorizationUrl);
         return;
       }
-      kit.message(typeof data.error === 'string' ? data.error : 'Sign-in could not start. Try again.', response.status === 409);
+      kit.message(typeof data.error === 'string' ? data.error : 'Couldn’t open the sign-in. Try again.', response.status === 409);
     } catch {
-      kit.message('Sign-in could not start. Reload the page and try again.', true);
+      kit.message('Couldn’t open the sign-in. Reload the page and try again.', true);
     } finally {
       signingIn = false;
       document.querySelector('main').removeAttribute('aria-busy');

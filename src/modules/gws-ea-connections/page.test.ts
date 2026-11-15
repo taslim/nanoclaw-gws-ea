@@ -389,7 +389,7 @@ describe('adding and connecting an OAuth app that needs a client', () => {
     const added = await post('/connections/add', { url: LEDGER, name: 'Ledger' });
     expect(added.status).toBe(200);
     expect(added.body).not.toContain('name="clientId"');
-    expect(added.body).toContain('You’ll sign in on auth.example.test.');
+    expect(added.body).toContain('>Continue to auth.example.test</button>');
     expect(ledger.registrations).toHaveLength(1);
     expect(ledger.registrations[0]).toMatchObject({
       redirect_uris: [`https://${HOST}/connections/callback/mcp.ledger.example.test`],
@@ -452,7 +452,7 @@ describe('sign-in in Chrome', () => {
         await page.goto(`https://${HOST}/connections/app/${added.id}/connect`);
         await page.getByLabel('Client ID').fill(CLIENT_ID);
         await page.getByLabel(/Client secret/u).fill(SENTINEL_SECRET);
-        await page.getByRole('button', { name: 'Continue to sign in' }).click();
+        await page.getByRole('button', { name: 'Continue to app.ledgerly.example.test' }).click();
         await page.waitForURL('https://app.ledgerly.example.test/**');
 
         expect(started).toEqual([
@@ -529,7 +529,7 @@ describe('client details the server refuses', () => {
     await post('/connections/add', { url: LEDGERLY, name: '' });
     const added = await onlyApp();
     expect((await request(`/connections/app/${added.id}/connect`)).body).toContain(
-      'sign in on app.ledgerly.example.test',
+      '>Continue to app.ledgerly.example.test</button>',
     );
 
     // Between the view and the submit, the app starts naming another authorization server.
@@ -544,7 +544,9 @@ describe('client details the server refuses', () => {
     });
 
     expect(reply.status).toBe(400);
-    expect(JSON.parse(reply.body)).toEqual({ error: 'This app now signs in differently. Delete it and add it again.' });
+    expect(JSON.parse(reply.body)).toEqual({
+      error: 'This app now signs in differently. Delete it, then add it again.',
+    });
     expect(await onlyApp()).toEqual(added);
     expect(signInRow(added.id)).toBeUndefined();
     expect(moved.registrations).toEqual([]);
@@ -591,7 +593,7 @@ describe('client details the server refuses', () => {
     const changed = await post('/connections/change-client', { id: stored.id, version: String(stored.version) });
     expect(changed.status).toBe(200);
     expect(changed.headers['x-page-location']).toBe(`/connections/app/${stored.id}/connect`);
-    expect(changed.body).toContain('Client details removed. Enter the new ones to sign in.');
+    expect(changed.body).toContain('Client details removed. Enter new ones to sign in.');
     expect(changed.body).toContain('name="clientId"');
     expect(await onlyApp()).toMatchObject({ hasClient: false, clientEntered: false });
     expect(signInRow(stored.id)).toBeUndefined();
@@ -661,7 +663,10 @@ describe('pasted tokens and servers without sign-in', () => {
   it('connects a server without sign-in on confirm, with no OAuth step', async () => {
     serve(recipesServer);
     const added = await post('/connections/add', { url: RECIPES, name: '' });
-    expect(added.body).toContain('recipes.example.test doesn’t ask you to sign in.');
+    // Connect asks for nothing: no token field and no sign-in.
+    expect(added.body).toContain('action="/connections/connect"');
+    expect(added.body).not.toContain('name="token"');
+    expect(added.body).not.toContain('action="/connections/sign-in"');
     let app = await onlyApp();
     expect(app).toMatchObject({ name: 'Recipes', auth: 'none' });
 
@@ -678,10 +683,10 @@ describe('sign-in returns', () => {
   it('renders each outcome’s constant message once, and the script strips it from the address', async () => {
     const messages = {
       connected: 'App connected.',
-      cancelled: 'Sign-in was cancelled.',
+      cancelled: 'Sign-in was cancelled, so nothing changed.',
       expired: 'That sign-in expired or was already used.',
-      failed: 'Sign-in didn’t finish.',
-      client_refused: 'The app’s sign-in service refused the client details',
+      failed: 'Sign-in didn’t finish, so nothing changed.',
+      client_refused: 'The sign-in service didn’t accept the client details, so they were removed.',
     };
     for (const [code, message] of Object.entries(messages)) {
       const reply = await request(`/connections?outcome=${code}`);
@@ -883,7 +888,7 @@ describe('managing apps', () => {
     await post('/connections/add', { url: RECIPES, name: '' });
     const list = (await request('/connections')).body;
     expect(list).toContain(
-      'action="/connections/delete" data-send data-confirm-title="Delete Recipes?" data-confirm-action="Delete" data-confirm-message="This removes it from your assistant and forgets its sign-in and any client details you entered. You can add it again later."',
+      'action="/connections/delete" data-send data-confirm-title="Delete Recipes?" data-confirm-action="Delete app" data-confirm-message="Your assistant will stop using it, and its sign-in and any client details you entered will be forgotten. You can add it again later."',
     );
     expect(list).not.toMatch(/action="\/connections\/disconnect" data-send data-confirm/u);
   });
@@ -918,7 +923,7 @@ describe('managing apps', () => {
     ] as const) {
       const reply = await post(route, data);
       expect(reply.status).toBe(409);
-      expect(reply.body).toContain('This app changed since you opened the page.');
+      expect(reply.body).toContain('This app changed after you opened the page.');
     }
     const signIn = await post('/connections/sign-in', reference);
     expect(signIn.status).toBe(409);
@@ -931,14 +936,18 @@ describe('the add dialog', () => {
     [
       'credentials in the URL',
       `https://notes.example.test/mcp?api_key=${SENTINEL_QUERY}`,
-      'Remove the sign-in details',
+      'Leave sign-in details and query text out of the address.',
     ],
-    ['not https', 'http://notes.example.test/mcp', 'The address must start with https://.'],
-    ['an unparseable address', 'notes', 'Enter the app’s full address'],
-    ['one of the assistant’s own services', 'https://api.anthropic.com/mcp', 'one of your assistant’s own services'],
+    ['not https', 'http://notes.example.test/mcp', 'The address needs to start with https://.'],
+    ['an unparseable address', 'notes', 'Enter the app’s full server address'],
+    ['one of the assistant’s own services', 'https://api.anthropic.com/mcp', 'That address belongs to your assistant'],
     ['an operator server’s host', 'https://tasks.example.test/other', 'already uses this address'],
-    ['a server that does not answer', 'https://down.example.test/mcp', 'The app’s server didn’t answer.'],
-    ['a server whose sign-in is unusable', 'https://recipes.example.test/mcp', 'signs in in a way'],
+    ['a server that does not answer', 'https://down.example.test/mcp', 'The app didn’t respond.'],
+    [
+      'a server whose sign-in is unusable',
+      'https://recipes.example.test/mcp',
+      'a kind of sign-in your assistant doesn’t support',
+    ],
   ])('refuses %s with a constant message and stores nothing', async (_case, url, message) => {
     await updateContainerConfigJson(MAIN, 'mcp_servers', {
       tasks: { type: 'http', url: `https://tasks.example.test/mcp?key=${SENTINEL_QUERY}` },
@@ -975,23 +984,23 @@ describe('the add dialog', () => {
 });
 
 describe('page states', () => {
-  it('shows a short explanation and Add when there are no apps', async () => {
+  it('shows an empty state and Add when there are no apps', async () => {
     const reply = await request('/connections');
     expect(reply.status).toBe(200);
-    expect(reply.body).toContain('No apps yet.');
+    expect(reply.body).toContain('<h2>No apps yet</h2>');
     expect(reply.body).toContain('href="/connections/new"');
-    expect(reply.body).not.toContain('Added by you');
+    expect(reply.body).not.toContain('Your apps');
   });
 
-  it('lists operator servers by host only, without an Added by you section, offering only Disconnect', async () => {
+  it('lists operator servers by host only, without a Your apps section, offering only Disconnect', async () => {
     await updateContainerConfigJson(MAIN, 'mcp_servers', {
       ledgerly: { type: 'http', url: `https://app.ledgerly.example.test/mcp?key=${SENTINEL_QUERY}` },
       calendar: { command: 'calendar-mcp' },
     });
     const reply = await request('/connections');
-    expect(reply.body).toContain('From your operator');
+    expect(reply.body).toContain('Added by your operator');
     expect(reply.body).toContain('app.ledgerly.example.test');
-    expect(reply.body).not.toContain('Added by you');
+    expect(reply.body).not.toContain('Your apps');
     expect(reply.body).not.toContain('calendar');
     expect(reply.body.match(/<(?:a|button)[^>]*role="menuitem"[^>]*>([^<]*)</gu)).toEqual([
       '<button type="submit" role="menuitem" tabindex="-1" data-pending-label="Disconnecting…" data-danger>Disconnect<',
@@ -1038,7 +1047,7 @@ describe('page states', () => {
 describe('operator servers', () => {
   const ledgerlyEntry = { type: 'http', url: LEDGERLY };
   const confirmation =
-    'data-confirm-title="Disconnect ledgerly?" data-confirm-action="Disconnect" data-confirm-message="This removes it from your assistant and deletes its saved access to app.ledgerly.example.test. Your operator can add it back."';
+    'data-confirm-title="Disconnect ledgerly?" data-confirm-action="Disconnect" data-confirm-message="Your assistant will stop using it, and its saved access to app.ledgerly.example.test will be deleted. Your operator can add it back."';
   const disconnectLedgerly = () =>
     post('/connections/disconnect-operator', { key: 'ledgerly', host: 'app.ledgerly.example.test' });
 
@@ -1053,8 +1062,8 @@ describe('operator servers', () => {
 
     const reply = await disconnectLedgerly();
     expect(reply.status).toBe(200);
-    expect(reply.body).toContain('Server disconnected.');
-    expect(reply.body).not.toContain('From your operator');
+    expect(reply.body).toContain('App disconnected. Your assistant can’t use it anymore.');
+    expect(reply.body).not.toContain('Added by your operator');
     expect(await mainServers()).toEqual({});
     expect([...gateway.held.keys()]).toEqual(['ledger-bearer']);
     expect(await store.pendingRestart()).toBeDefined();
@@ -1062,7 +1071,7 @@ describe('operator servers', () => {
     assertNoSentinels();
   });
 
-  it('keeps the server listed with Retry when a credential stays, and Retry completes the disconnect', async () => {
+  it('keeps the server listed with Try again when a credential stays, and Try again completes the disconnect', async () => {
     await updateContainerConfigJson(MAIN, 'mcp_servers', { ledgerly: ledgerlyEntry });
     gateway.hold('ledgerly-bearer', 'app.ledgerly.example.test');
     gateway.failingIds.add(gateway.hold('ledgerly-workspace', 'app.ledgerly.example.test'));
@@ -1071,20 +1080,20 @@ describe('operator servers', () => {
     expect(failed.status).toBe(200);
     expect(failed.body).toContain('data-error="true"');
     expect(failed.body).toContain('so it’s still connected. Try again.');
-    expect(failed.body).toContain('From your operator');
-    expect(failed.body).toMatch(/action="\/connections\/disconnect-operator" data-send>.*>Retry<\/button>/u);
+    expect(failed.body).toContain('Added by your operator');
+    expect(failed.body).toMatch(/action="\/connections\/disconnect-operator" data-send>.*>Try again<\/button>/u);
     expect(failed.body).not.toContain('ledgerly-workspace');
     expect(await mainServers()).toEqual({ ledgerly: ledgerlyEntry });
     expect([...gateway.held.keys()]).toEqual(['ledgerly-workspace']);
 
     gateway.failingIds.clear();
     const retried = await disconnectLedgerly();
-    expect(retried.body).toContain('Server disconnected.');
+    expect(retried.body).toContain('App disconnected. Your assistant can’t use it anymore.');
     expect(await mainServers()).toEqual({});
     expect(gateway.held.size).toBe(0);
   });
 
-  it('asks again instead of offering Retry when the entry moved to another host while the disconnect stopped', async () => {
+  it('asks again instead of offering Try again when the entry moved to another host while the disconnect stopped', async () => {
     await updateContainerConfigJson(MAIN, 'mcp_servers', { ledgerly: ledgerlyEntry });
     gateway.failingIds.add(gateway.hold('ledgerly-workspace', 'app.ledgerly.example.test'));
     const removeById = gateway.removeById.bind(gateway);
@@ -1095,17 +1104,17 @@ describe('operator servers', () => {
 
     const failed = await disconnectLedgerly();
     expect(failed.body).toContain('so it’s still connected. Try again.');
-    expect(failed.body).not.toContain('>Retry</button>');
-    expect(failed.body).toContain('deletes its saved access to mcp.ledger.example.test.');
+    expect(failed.body).not.toContain('>Try again</button>');
+    expect(failed.body).toContain('its saved access to mcp.ledger.example.test will be deleted.');
   });
 
-  it('shows Disconnect unavailable on a gateway that cannot list and remove credentials by host', async () => {
+  it('shows Can’t disconnect on a gateway that cannot list and remove credentials by host', async () => {
     await updateContainerConfigJson(MAIN, 'mcp_servers', { ledgerly: ledgerlyEntry });
     gateway.hold('ledgerly-bearer', 'app.ledgerly.example.test');
     hostSeam = false;
 
     const page = await request('/connections');
-    expect(page.body).toContain('Disconnect unavailable');
+    expect(page.body).toContain('Can’t disconnect');
     expect(page.body).not.toContain('action="/connections/disconnect-operator"');
     expect((await disconnectLedgerly()).status).toBe(503);
     expect(await mainServers()).toEqual({ ledgerly: ledgerlyEntry });
@@ -1130,7 +1139,7 @@ describe('operator servers', () => {
     ]) {
       const reply = await post('/connections/disconnect-operator', submission);
       expect(reply.status).toBe(409);
-      expect(reply.body).toContain('This server changed since you opened the page.');
+      expect(reply.body).toContain('This app changed after you opened the page.');
     }
     expect(await mainServers()).toEqual({ ...servers, recipes: { type: 'http', url: RECIPES } });
     expect([...gateway.held.keys()]).toEqual(held);
@@ -1169,7 +1178,7 @@ describe('home status and link facts', () => {
     expect(await connectionsStatus(listing({ apps: [app('connected', 'Recipes')], operators: [operator] }))).toBe(
       '2 apps connected',
     );
-    expect(await connectionsStatus(listing({ apps: [app('not_connected', 'Notes')] }))).toBe('None yet');
+    expect(await connectionsStatus(listing({ apps: [app('not_connected', 'Notes')] }))).toBe('No apps yet');
   });
 
   it('gives main each app’s name, key, host, origin and status, never an address', async () => {

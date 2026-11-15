@@ -214,8 +214,12 @@ it('lists metadata and account owners without the key, escaping text and keeping
   const response = await request();
   expect(response.status).toBe(200);
   expect(response.body).toContain('stream.example');
-  expect(response.body).toContain('Assistant’s account');
-  expect(response.body).toContain('Your account');
+  // Only the assistant's own account is marked in the list; the principal's is the unmarked default.
+  expect(response.body).toContain(
+    `<span class="row-sub">${ALIAS}</span></span><span class="badge badge-accent badge-plain">Assistant’s account</span>`,
+  );
+  expect(response.body.match(/Assistant’s account/gu)).toHaveLength(1);
+  expect(response.body).not.toContain('Your account');
   expect(response.body).toContain('unproven_user');
   expect(response.body).toContain('&lt;script&gt;alert(1)&lt;/script&gt;');
   expect(response.body).toContain('&lt;img src=x onerror=alert(2)&gt;');
@@ -280,7 +284,7 @@ it('keeps separate list, add, detail and edit views, and a blank replacement pre
   expect((await request('/logins/new')).body).toContain('name="title"');
   expect((await request(detail)).body).toContain(`${detail}/edit`);
   const edit = await request(`${detail}/edit`);
-  expect(edit.body).toContain('Leave blank to keep the saved password.');
+  expect(edit.body).toContain('placeholder="Unchanged"');
   expect(edit.body).not.toContain(SECRET);
   const response = await post('/logins/update', {
     handle: saved.id,
@@ -291,7 +295,7 @@ it('keeps separate list, add, detail and edit views, and a blank replacement pre
     password: '',
   });
   expect(response.status).toBe(200);
-  expect(response.body).toContain('Login updated.');
+  expect(response.body).toContain('Changes saved.');
   expect(response.headers['x-page-location']).toBe(detail);
   expect(await fixture.store.get(saved.id)).toMatchObject({
     title: 'Business account',
@@ -354,7 +358,7 @@ it('refuses duplicate site and username edits without changing the existing logi
     password: 'replacement',
   });
   expect(response.status).toBe(400);
-  expect(response.body).toContain('That site and username already have a login.');
+  expect(response.body).toContain('There’s already a login for this site and username.');
   expect(await fixture.store.get(other.id)).toMatchObject({ username: 'business@example.com', version: 1 });
 });
 
@@ -369,7 +373,7 @@ it.each(['exposed', 'awaiting_verification', 'unknown'] as const)(
         ...(action === 'update' ? { password: 'replacement' } : {}),
       });
       expect(response.status).toBe(409);
-      expect(response.body).toContain('The assistant is changing this password. Try again after the change finishes.');
+      expect(response.body).toContain('Your assistant is changing this password. Try again once it’s done.');
     }
     expect((await fixture.store.get(loginId)).version).toBe(1);
     expect((await attempts.get(attempt.id))?.phase).toBe(phase);
@@ -411,7 +415,7 @@ it.each(['add', 'update'] as const)('refuses a page %s that would collide with a
     password: 'page-replacement',
   });
   expect(response.status).toBe(409);
-  expect(response.body).toContain('The assistant is changing this password.');
+  expect(response.body).toContain('Your assistant is changing this password.');
   expect(await fixture.store.forOrigin(SITE)).toEqual([]);
   if (existing) expect(await fixture.store.get(existing.id)).toEqual(existing);
   expect(await attempts.get(prepared.attempt.id)).toMatchObject({ phase: 'exposed' });
@@ -467,7 +471,7 @@ it('writes nothing when giving way loses the compare-and-set to disclosure', asy
   });
   const response = await post('/logins/update', { handle: loginId, version: '1', password: 'replacement' });
   expect(response.status).toBe(409);
-  expect(response.body).toContain('The assistant is changing this password.');
+  expect(response.body).toContain('Your assistant is changing this password.');
   expect(await fixture.store.secret(loginId, 'password', SITE)).toBe(SECRET);
   expect(fixture.hasPending(attempt.id)).toBe(true);
 });
@@ -493,12 +497,14 @@ it('lists and removes with a missing key while saving shows one operator message
         : { handle: saved.id, version: '1', password: 'replacement' },
     );
     expect(response.status).toBe(503);
-    expect(response.body.match(/Saved passwords can&#39;t be read right now\. Ask your operator\./gu)).toHaveLength(1);
+    expect(response.body.match(/Saved logins can’t be opened right now\. Ask your operator\./gu)).toHaveLength(1);
     expect(response.body).not.toMatch(/page-only-secret|replacement/u);
   }
   const removed = await post('/logins/remove', { handle: saved.id, version: '1' });
   expect(removed.status).toBe(200);
-  expect(removed.body).toContain('Saved login removed. The browser may still be signed in.');
+  expect(removed.body).toContain(
+    'Login removed. If your assistant’s browser is still signed in, ask your assistant to sign out.',
+  );
   expect(await fixture.store.all()).toEqual([]);
 });
 
@@ -522,7 +528,7 @@ it('keeps the successful save outcome if reading the displayed list fails', asyn
   expect(response.status).toBe(503);
   expect(response.headers['x-page-saved']).toBe('true');
   expect(response.headers['x-page-location']).toBe('/logins');
-  expect(response.body).toContain('Login added. Saved passwords can&#39;t be read right now. Ask your operator.');
+  expect(response.body).toContain('Login added. Saved logins can’t be opened right now. Ask your operator.');
   expect(response.body).not.toContain(SECRET);
   expect(await fixture.store.all()).toHaveLength(1);
 });
@@ -594,16 +600,16 @@ it('returns constant reveal errors for changed, busy, missing and unavailable lo
   expect(JSON.parse(stale.body)).toEqual({ error: expect.stringContaining('This login changed') });
   const missing = await post('/logins/reveal', { handle: 'vault_00000000-0000-0000-0000-000000000000', version: '1' });
   expect(missing.status).toBe(409);
-  expect(JSON.parse(missing.body)).toEqual({ error: expect.stringContaining('no longer available') });
+  expect(JSON.parse(missing.body)).toEqual({ error: expect.stringContaining('no longer saved') });
   const { loginId } = await changing('exposed');
   const held = await post('/logins/reveal', { handle: loginId, version: '1' });
   expect(held.status).toBe(409);
-  expect(JSON.parse(held.body)).toEqual({ error: expect.stringContaining('The assistant is changing this password') });
+  expect(JSON.parse(held.body)).toEqual({ error: expect.stringContaining('Your assistant is changing this password') });
   fixture.setUnavailable(true);
   const unavailable = await post('/logins/reveal', { handle: saved.id, version: '2' });
   expect(unavailable.status).toBe(503);
   expect(JSON.parse(unavailable.body)).toEqual({
-    error: "Saved passwords can't be read right now. Ask your operator.",
+    error: 'Saved logins can’t be opened right now. Ask your operator.',
   });
   for (const response of [stale, missing, held, unavailable]) expect(response.body).not.toContain(SECRET);
 });
@@ -650,6 +656,10 @@ it.skipIf(!chromePath).each([320, 390, 1200])(
       const page = await context.newPage();
       page.setDefaultTimeout(7000);
       const layout = async (): Promise<void> => {
+        // Measure the settled layout, not a frame of an entrance transition (the dialog scales in).
+        await page.evaluate(
+          'Promise.all(document.getAnimations().map(animation => animation.finished.catch(() => undefined)))',
+        );
         expect(await page.evaluate<boolean>('document.documentElement.scrollWidth <= innerWidth')).toBe(true);
         expect(
           await page.evaluate<string[]>(
@@ -665,10 +675,10 @@ it.skipIf(!chromePath).each([320, 390, 1200])(
         ),
       ).toBe(true);
       await page.getByRole('link', { name: 'Add login', exact: true }).click();
-      await page.getByRole('textbox', { name: 'Account label', exact: true }).fill('Personal');
       await page.getByLabel('Website', { exact: true }).fill('stream.example');
       await page.getByLabel('Username', { exact: true }).fill(PRINCIPAL);
       await page.getByLabel('Password', { exact: true }).fill(SECRET);
+      await page.getByRole('textbox', { name: 'Label', exact: true }).fill('Personal');
       await layout();
       expect(await page.evaluate<boolean>('document.activeElement.getBoundingClientRect().bottom <= innerHeight')).toBe(
         true,
@@ -684,20 +694,18 @@ it.skipIf(!chromePath).each([320, 390, 1200])(
       await page.getByRole('searchbox', { name: 'Search logins' }).fill('personal');
       expect(await page.locator('[data-login-row]:visible').count()).toBe(1);
       await page.locator('[data-login-row]').click();
-      await page.getByRole('link', { name: 'Edit details', exact: true }).click();
-      await page.getByRole('textbox', { name: 'Account label', exact: true }).fill('Unsaved change');
+      await page.getByRole('link', { name: 'Edit', exact: true }).click();
+      await page.getByRole('textbox', { name: 'Label', exact: true }).fill('Unsaved change');
       page.once('dialog', async (confirmation) => {
         expect(confirmation.type()).toBe('beforeunload');
         await confirmation.dismiss();
       });
       await page.getByRole('link', { name: 'Cancel', exact: true }).click();
-      expect(await page.getByRole('textbox', { name: 'Account label', exact: true }).inputValue()).toBe(
-        'Unsaved change',
-      );
-      await page.getByRole('textbox', { name: 'Account label', exact: true }).fill('Personal');
+      expect(await page.getByRole('textbox', { name: 'Label', exact: true }).inputValue()).toBe('Unsaved change');
+      await page.getByRole('textbox', { name: 'Label', exact: true }).fill('Personal');
       await page.emulateMedia({ colorScheme: 'dark' });
       await layout();
-      await page.getByLabel('New saved password', { exact: true }).fill('browser-replacement-password');
+      await page.getByLabel('New password', { exact: true }).fill('browser-replacement-password');
       holdSave = true;
       await page.getByRole('button', { name: 'Save changes', exact: true }).click();
       await started;
@@ -705,20 +713,21 @@ it.skipIf(!chromePath).each([320, 390, 1200])(
       await page.getByRole('link', { name: 'Cancel', exact: true }).click({ force: true });
       expect(new URL(page.url()).pathname).toBe(savingPath);
       releaseSave();
-      await page.getByText('Login updated.', { exact: true }).waitFor();
+      await page.getByText('Changes saved.', { exact: true }).waitFor();
       expect(actions[1]).toEqual({ path: '/logins/update', contentType: 'application/json' });
       expect(await fixture.store.secret(saved.id, 'password', SITE)).toBe('browser-replacement-password');
       await page.getByRole('button', { name: 'Remove login', exact: true }).first().click();
       const dialog = page.getByRole('dialog');
-      expect(await dialog.textContent()).toContain(`stream.example (${PRINCIPAL})`);
-      expect(await dialog.textContent()).toContain('The browser may still be signed in');
+      expect(await dialog.textContent()).toContain('Remove this login?');
+      expect(await dialog.textContent()).toContain(`sign in to stream.example as ${PRINCIPAL}`);
+      expect(await dialog.textContent()).toContain('your assistant’s browser may stay signed in');
       await layout();
       expect(actions).toHaveLength(2);
       await dialog.getByRole('button', { name: 'Cancel', exact: true }).click();
       expect(await fixture.store.all()).toHaveLength(1);
       await page.getByRole('button', { name: 'Remove login', exact: true }).first().click();
       await dialog.getByRole('button', { name: 'Remove login', exact: true }).click();
-      await page.getByText('No saved logins yet.', { exact: true }).waitFor();
+      await page.getByText('No saved logins yet', { exact: true }).waitFor();
       expect(actions[2]).toEqual({ path: '/logins/remove', contentType: 'application/json' });
       expect(await fixture.store.all()).toEqual([]);
       expect(await page.content()).not.toMatch(/page-only-secret|browser-replacement-password/u);
@@ -739,13 +748,13 @@ it.skipIf(!chromePath).each([320, 390, 1200])(
       await page.setViewportSize({ width: 320, height: 568 });
       await page.locator('[data-login-row]').filter({ hasText: longUsername }).click();
       await layout();
-      await page.getByRole('link', { name: 'Edit details', exact: true }).click();
+      await page.getByRole('link', { name: 'Edit', exact: true }).click();
       await layout();
       if (width === 320) {
         await fixture.store.update(long.id, 1, { title: 'Concurrent edit', password: '' });
-        await page.getByLabel('New saved password', { exact: true }).fill('stale-replacement');
+        await page.getByLabel('New password', { exact: true }).fill('stale-replacement');
         await page.getByRole('button', { name: 'Save changes', exact: true }).click();
-        await page.getByText(/This login changed since you opened it/u).waitFor();
+        await page.getByText(/This login changed after you opened it/u).waitFor();
         expect(await page.getByRole('button', { name: 'Save changes', exact: true }).isEnabled()).toBe(true);
         await page.reload();
         const update = fixture.store.update.bind(fixture.store);
@@ -753,7 +762,7 @@ it.skipIf(!chromePath).each([320, 390, 1200])(
           await update(...parameters);
           throw new Error('Synthetic response loss');
         });
-        await page.getByLabel('New saved password', { exact: true }).fill('saved-with-lost-response');
+        await page.getByLabel('New password', { exact: true }).fill('saved-with-lost-response');
         await page.getByRole('button', { name: 'Save changes', exact: true }).click();
         await page.getByRole('link', { name: 'Reload page', exact: true }).waitFor();
         expect(await page.getByRole('button', { name: 'Save changes', exact: true }).isDisabled()).toBe(true);
@@ -767,10 +776,10 @@ it.skipIf(!chromePath).each([320, 390, 1200])(
           vi.spyOn(fixture.store, 'get').mockRejectedValueOnce(new Error('Synthetic display failure'));
           return result;
         });
-        await page.getByLabel('New saved password', { exact: true }).fill('saved-before-display-failed');
+        await page.getByLabel('New password', { exact: true }).fill('saved-before-display-failed');
         await page.getByRole('button', { name: 'Save changes', exact: true }).click();
-        await page.getByRole('heading', { name: 'Logins unavailable', exact: true }).waitFor();
-        expect(await page.locator('#outcome').textContent()).toContain('Login updated.');
+        await page.getByRole('heading', { name: 'Saved logins can’t be opened right now', exact: true }).waitFor();
+        expect(await page.locator('#outcome').textContent()).toContain('Changes saved.');
         expect(await page.getByRole('button', { name: 'Save changes', exact: true }).count()).toBe(0);
         expect(await fixture.store.secret(long.id, 'password', 'https://accounts.long-subdomain.example.com')).toBe(
           'saved-before-display-failed',

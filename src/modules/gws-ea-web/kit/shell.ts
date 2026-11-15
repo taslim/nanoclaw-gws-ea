@@ -1,7 +1,7 @@
 import { getGwsEaProfile } from '../../gws-ea-profile/db.js';
 import { principalPages, type PrincipalPageMount, type WebMountPath } from '../mounts.js';
 import { pageScript } from './client.js';
-import { escapeHtml } from './html.js';
+import { escapeHtml, icon, type IconName } from './html.js';
 import { KIT_STYLE } from './style.js';
 
 export interface ShellPage {
@@ -57,12 +57,39 @@ function navigation(shell: Shell, current: WebMountPath): string {
  * kit's script moves focus between.
  */
 export function renderMenu(id: string, label: string, items: readonly string[]): string {
-  return `<div class="menu"><button class="button button-secondary" type="button" data-menu-button aria-haspopup="menu" aria-expanded="false" aria-controls="${escapeHtml(id)}">${escapeHtml(label)}</button><div role="menu" id="${escapeHtml(id)}" aria-label="${escapeHtml(label)}" hidden>${items.join('')}</div></div>`;
+  return `<div class="menu"><button class="button icon-button" type="button" data-menu-button aria-haspopup="menu" aria-expanded="false" aria-controls="${escapeHtml(id)}" aria-label="${escapeHtml(label)}">${icon('more')}</button><div role="menu" id="${escapeHtml(id)}" aria-label="${escapeHtml(label)}" hidden>${items.join('')}</div></div>`;
+}
+
+export type BadgeTone = 'neutral' | 'success' | 'warning' | 'accent';
+
+/** A pill that names a status in words; the tone only repeats it. A label that is not a status has no dot. */
+export function renderBadge(label: string, tone: BadgeTone = 'neutral', status = true): string {
+  const classes = ['badge', ...(tone === 'neutral' ? [] : [`badge-${tone}`]), ...(status ? [] : ['badge-plain'])];
+  return `<span class="${classes.join(' ')}">${escapeHtml(label)}</span>`;
+}
+
+/** `metadata` and `action` are trusted markup. */
+export function renderPageHeading(title: string, metadata = '', action = ''): string {
+  return `<div class="page-heading"><div><h1>${escapeHtml(title)}</h1>${metadata ? `<div class="page-metadata">${metadata}</div>` : ''}</div>${action}</div>`;
+}
+
+/** Named for where it goes, so it reads the same wherever it appears. */
+export function renderBackLink(href: string, label: string): string {
+  return `<a class="back-link" href="${escapeHtml(href)}" data-navigation>${icon('back')}<span>${escapeHtml(label)}</span></a>`;
+}
+
+/** `action` is trusted markup. */
+export function renderEmptyState(title: string, iconName: IconName, action = '', extraClass = '', id = ''): string {
+  return `<section class="empty-state${extraClass ? ` ${extraClass}` : ''}"${id ? ` id="${escapeHtml(id)}" hidden` : ''}><span class="empty-icon">${icon(iconName)}</span><h2>${escapeHtml(title)}</h2>${action}</section>`;
 }
 
 /** Copies the text of the element with `sourceId`; the result is announced as well as shown. */
 export function renderCopyButton(sourceId: string, label: string): string {
   return `<button class="button button-secondary" type="button" data-copy-from="${escapeHtml(sourceId)}" aria-label="${escapeHtml(label)}"><span data-copy-label>Copy</span></button>`;
+}
+
+function initial(name: string): string {
+  return ([...name.trim()][0] ?? '•').toLocaleUpperCase();
 }
 
 export function renderPrincipalPage(spec: PrincipalPage, nonce: string): string {
@@ -72,5 +99,5 @@ export function renderPrincipalPage(spec: PrincipalPage, nonce: string): string 
     .map(escapeHtml)
     .join(' · ');
   const attribute = escapeHtml(nonce);
-  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="color-scheme" content="light dark"><title>${title}</title><style nonce="${attribute}">${KIT_STYLE}${spec.style ?? ''}</style></head><body><header class="shell"><p class="shell-name">${escapeHtml(shell.assistantName)}</p>${navigation(shell, spec.page)}</header><main tabindex="-1" data-view="${escapeHtml(spec.view)}"${spec.narrow ? ' data-width="narrow"' : ''}><p id="outcome" role="${spec.error ? 'alert' : 'status'}" tabindex="-1" data-error="${spec.error}"${spec.outcome ? '' : ' hidden'}>${escapeHtml(spec.outcome)}</p>${spec.content}${spec.noscript ? `<noscript><p class="field-hint">${escapeHtml(spec.noscript)}</p></noscript>` : ''}</main><p id="announcer" class="sr-only" role="status" aria-live="polite"></p><dialog id="confirm-dialog" aria-labelledby="confirm-heading" aria-describedby="confirm-description"><h2 id="confirm-heading"></h2><p id="confirm-description"></p><div class="dialog-actions"><button class="button button-secondary" type="button" id="confirm-cancel" data-dialog-close>Cancel</button><button class="button button-danger" type="button" id="confirm-action"></button></div></dialog><script nonce="${attribute}">${pageScript(spec.script)}</script></body></html>`;
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="color-scheme" content="light dark"><title>${title}</title><style nonce="${attribute}">${KIT_STYLE}${spec.style ?? ''}</style></head><body><header class="shell"><p class="shell-name"><span class="shell-mark" aria-hidden="true">${escapeHtml(initial(shell.assistantName))}</span><span>${escapeHtml(shell.assistantName)}</span></p>${navigation(shell, spec.page)}</header><main tabindex="-1" data-view="${escapeHtml(spec.view)}"${spec.narrow ? ' data-width="narrow"' : ''}><p id="outcome" role="${spec.error ? 'alert' : 'status'}" tabindex="-1" data-error="${spec.error}"${spec.outcome ? '' : ' hidden'}>${escapeHtml(spec.outcome)}</p>${spec.content}${spec.noscript ? `<noscript><p class="field-hint">${escapeHtml(spec.noscript)}</p></noscript>` : ''}</main><p id="announcer" class="sr-only" role="status" aria-live="polite"></p><dialog id="confirm-dialog" aria-labelledby="confirm-heading" aria-describedby="confirm-description"><h2 id="confirm-heading"></h2><p id="confirm-description"></p><div class="dialog-actions"><button class="button button-secondary" type="button" id="confirm-cancel" data-dialog-close>Cancel</button><button class="button button-danger" type="button" id="confirm-action"></button></div></dialog><script nonce="${attribute}">${pageScript(spec.script)}</script></body></html>`;
 }

@@ -92,14 +92,16 @@ it('lists every other principal page with its summary, and a failing summary lea
   expect(response.headers['cache-control']).toBe('no-store');
   expect(response.headers['content-security-policy']).toMatch(/script-src 'nonce-[\w-]+'.*frame-ancestors 'none'/u);
   expect(response.body).toContain(
-    '<a class="page-row" href="/logins" data-navigation><span class="page-identity"><span class="page-title">Logins</span><span class="page-status">2 saved logins</span></span>',
+    '<a class="row" href="/logins" data-navigation><span class="row-main"><span class="row-title">Logins</span><span class="row-sub">2 saved logins</span></span>',
   );
   expect(response.body).toContain(
-    '<a class="page-row" href="/apps" data-navigation><span class="page-identity"><span class="page-title">Apps &lt;beta&gt;</span></span>',
+    '<a class="row" href="/apps" data-navigation><span class="row-main"><span class="row-title">Apps &lt;beta&gt;</span></span>',
   );
   expect(response.body).not.toContain('store unreadable');
-  expect(response.body).not.toContain('class="page-row" href="/"');
-  expect(response.body).toContain('<p class="shell-name">Juno Hale</p>');
+  expect(response.body).not.toContain('class="row" href="/"');
+  expect(response.body).toContain(
+    '<p class="shell-name"><span class="shell-mark" aria-hidden="true">J</span><span>Juno Hale</span></p>',
+  );
   expect(response.body).toContain('<a href="/" data-navigation aria-current="page">Home</a>');
   expect(response.body).toContain('<a href="/apps" data-navigation>Apps &lt;beta&gt;</a>');
 });
@@ -118,7 +120,7 @@ it('does not let a page whose summary never settles hold the home page back', as
     const response = await pending;
     expect(response.status).toBe(200);
     expect(response.body).toContain(
-      '<a class="page-row" href="/logins" data-navigation><span class="page-identity"><span class="page-title">Logins</span></span>',
+      '<a class="row" href="/logins" data-navigation><span class="row-main"><span class="row-title">Logins</span></span>',
     );
   } finally {
     vi.useRealTimers();
@@ -127,7 +129,7 @@ it('does not let a page whose summary never settles hold the home page back', as
 
 it('says so when there are no other pages', async () => {
   pages = [pages[0]];
-  expect((await request(PRINCIPAL)).body).toContain('No pages yet.');
+  expect((await request(PRINCIPAL)).body).toContain('<h2>Nothing here yet</h2>');
 });
 
 it('shows navigation only to the principal', async () => {

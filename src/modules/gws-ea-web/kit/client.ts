@@ -108,7 +108,7 @@ const KIT_SCRIPT = String.raw`
       });
       if (response.status === 404) {
         uncertain = true;
-        message('This request could not be accepted. Reload the page and try again.', true);
+        message('That didn’t go through. Reload the page and try again.', true);
         return;
       }
       const page = new DOMParser().parseFromString(await response.text(), 'text/html');
@@ -117,7 +117,7 @@ const KIT_SCRIPT = String.raw`
       if (!next || (!response.ok && !saved)) {
         uncertain = response.status >= 500 || !next;
         message(page.getElementById('outcome')?.textContent ||
-          'The request could not be confirmed. Reload the page before trying again.', uncertain || response.status === 409);
+          'That change couldn’t be confirmed. Reload the page to check it before trying again.', uncertain || response.status === 409);
         return;
       }
       document.querySelector('main').replaceWith(next);
@@ -128,7 +128,7 @@ const KIT_SCRIPT = String.raw`
       window.scrollTo({ top: 0, behavior: 'instant' });
     } catch {
       uncertain = true;
-      message('The request could not be confirmed. Reload the page before trying again.', true);
+      message('That change couldn’t be confirmed. Reload the page to check it before trying again.', true);
     } finally {
       busy = false;
       submit.textContent = label;
@@ -145,7 +145,7 @@ const KIT_SCRIPT = String.raw`
       label.textContent = 'Copied';
       announce('Copied.');
     } catch {
-      label.textContent = 'Copy failed';
+      label.textContent = 'Couldn’t copy';
       announce('Couldn’t copy. Select the text and copy it instead.');
     }
     setTimeout(() => { label.textContent = button.dataset.copyIdle; }, 2000);

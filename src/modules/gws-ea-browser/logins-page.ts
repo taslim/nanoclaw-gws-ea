@@ -77,20 +77,20 @@ function failureMessage(error: unknown): string {
   if (error instanceof LoginDetailsError) {
     switch (error.reason) {
       case 'login_busy':
-        return 'The assistant is changing this password. Try again after the change finishes.';
+        return 'Your assistant is changing this password. Try again once it’s done.';
       case 'duplicate_login':
-        return 'That site and username already have a login. Open that login to update it.';
+        return 'There’s already a login for this site and username. Open it to make changes.';
       case 'invalid_site':
-        return 'Enter a website such as netflix.com or an HTTPS URL without a username or password in the address.';
+        return 'Enter a website like example.com, without a username or password in it.';
       case 'invalid_details':
-        return 'Enter a username and an account label of at most 200 characters, without control characters.';
+        return 'Enter a username and password, and keep the label to 200 characters.';
       case 'login_changed':
-        return 'This login changed since you opened it. Reload the page to see the latest details before saving again.';
+        return 'This login changed after you opened it. Reload to see the latest details, then save again.';
     }
   }
   if (error instanceof LoginStoreError && error.reason === 'no_item_for_site')
-    return 'That login is no longer available. Return to saved logins and try again.';
-  return "Saved passwords can't be read right now. Ask your operator.";
+    return 'This login is no longer saved. Go back to your logins and try again.';
+  return 'Saved logins can’t be opened right now. Ask your operator.';
 }
 
 function failureStatus(error: unknown): number {
@@ -159,15 +159,14 @@ export function createLoginsPageHandler(options: LoginsPageOptions): RequestList
             const changes = changedDetails(data);
             await store.update(handle, version, changes);
             view = { kind: 'detail', handle };
-            outcome = 'Login updated.';
+            outcome = 'Changes saved.';
           } else {
             if (keys !== 'handle,version') throw new InvalidSubmission();
             view = { kind: 'detail', handle: stringField(data, 'handle') };
             const version = versionField(data);
             await store.remove(view.handle, version);
             view = { kind: 'list' };
-            outcome =
-              'Saved login removed. The browser may still be signed in. You can ask your assistant to sign out.';
+            outcome = 'Login removed. If your assistant’s browser is still signed in, ask your assistant to sign out.';
           }
           saved = true;
         } catch (error) {
