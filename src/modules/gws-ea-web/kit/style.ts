@@ -344,8 +344,23 @@ dialog p { margin-top: 8px; color: var(--muted); font-size: 14px; line-height: 1
     color: var(--accent-text);
     font-size: 16px;
   }
+  /* Adding is the main thing a list is for, so it floats where a thumb rests, above the tab bar. */
+  main .page-heading > .button-primary {
+    top: auto;
+    right: 16px;
+    bottom: calc(68px + env(safe-area-inset-bottom) + 16px);
+    width: 56px;
+    height: 56px;
+    padding: 0;
+    border-radius: 18px;
+    background: var(--ink);
+    color: var(--ink-text);
+    box-shadow: 0 8px 24px rgb(0 0 0 / .18), 0 2px 6px rgb(0 0 0 / .12);
+  }
+  main .page-heading > .button-primary:active:not(:disabled) { transform: scale(.94); }
   main .page-heading > .button-primary .button-label { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; }
-  main .page-heading > .button-primary .icon { width: 24px; height: 24px; margin: 0; }
+  main .page-heading > .button-primary .icon { width: 26px; height: 26px; margin: 0; }
+  main:has(.page-heading > .button-primary) { padding-bottom: 96px; }
   main .page-heading > .button-secondary .icon { display: none; }
 
   .shell-nav {
