@@ -193,6 +193,20 @@ it('puts the outcome under the page title, or first when the page has no title, 
   expect(titled).not.toContain('<!--outcome-->');
   const untitled = page('<p>Body</p>');
   expect(untitled.indexOf('>Done.</p>')).toBeLessThan(untitled.indexOf('<p>Body</p>'));
+  // A replacement string would read these as substitution patterns.
+  const dollars = renderPrincipalPage(
+    {
+      shell,
+      page: '/logins',
+      title: 'T',
+      view: 'v',
+      outcome: 'Paid $$ and $` too.',
+      error: false,
+      content: renderPageHeading('Logins'),
+    },
+    'n',
+  );
+  expect(dollars).toContain('>Paid $$ and $` too.</p>');
   const escaped = page(renderPageHeading(escapeHtml('<!--outcome-->')));
   expect(escaped.match(/id="outcome"/gu)).toHaveLength(1);
   expect(escaped).toContain('<h1>&amp;lt;!--outcome--&amp;gt;</h1>');
