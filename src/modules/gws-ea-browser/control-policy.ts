@@ -150,9 +150,10 @@ function navigationEvidence(url: URL): string | undefined {
   }
 }
 
-function pathnameWords(url: URL): string | undefined {
+const terminalBookingVerb = /\b(?:book|reserve|schedule)\b/iu;
+
+function decodedPathSegments(url: URL): string[] | undefined {
   try {
-    decodeURIComponent(url.search);
     return url.pathname
       .split('/')
       .map((segment) =>
@@ -160,12 +161,25 @@ function pathnameWords(url: URL): string | undefined {
           .replace(/[_/-]+/gu, ' ')
           .trim(),
       )
-      .filter((piece) => piece && piece.split(/\s+/u).length < PROSE_WORDS)
-      .join(' ');
+      .filter(Boolean);
   } catch (error) {
     if (!(error instanceof URIError)) throw error;
     return undefined;
   }
+}
+
+function queryDecodes(url: URL): boolean {
+  try {
+    decodeURIComponent(url.search);
+    return true;
+  } catch (error) {
+    if (!(error instanceof URIError)) throw error;
+    return false;
+  }
+}
+
+function pathnameWords(segments: readonly string[]): string {
+  return segments.filter((piece) => piece.split(/\s+/u).length < PROSE_WORDS).join(' ');
 }
 
 function routeWords(url: URL, pathOnly: string): string {
@@ -183,12 +197,16 @@ function actionParameterWords(url: URL): string {
     .join(' ');
 }
 
-function submissionCommits(words: string, pathOnly: string): boolean {
+function terminalSegmentIsLookup(lastSegment: string | undefined): boolean {
+  return Boolean(lastSegment && submissionLookup.test(lastSegment) && !terminalBookingVerb.test(lastSegment));
+}
+
+function submissionCommits(words: string, pathOnly: string, lastSegment: string | undefined): boolean {
   return (
     commitPurchase.test(words) ||
     purchaseRoute.test(words) ||
     purchase.test(words) ||
-    (submissionBooking.test(pathOnly) && !submissionLookup.test(pathOnly))
+    (submissionBooking.test(pathOnly) && !terminalSegmentIsLookup(lastSegment))
   );
 }
 
@@ -204,15 +222,16 @@ export function isPurchaseSubmissionUrl(raw: string): boolean {
     return true;
   }
   if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password) return true;
-  const pathOnly = pathnameWords(url);
-  if (pathOnly === undefined) return true;
+  const segments = decodedPathSegments(url);
+  if (!segments) return true;
+  const pathOnly = pathnameWords(segments);
   const words = routeWords(url, pathOnly);
   const actions = actionParameterWords(url);
   const reviewed = reviewedMerchantFlow(url)?.classifyNavigation(url);
   if (reviewed === 'ordinary' && !actions) return false;
   if (reviewed === 'purchase_control') return true;
   return (
-    submissionCommits(words, pathOnly) ||
+    submissionCommits(words, pathOnly, segments.at(-1)) ||
     Boolean(actions && (purchase.test(actions) || purchaseRoute.test(actions) || submissionBooking.test(actions)))
   );
 }
@@ -231,8 +250,9 @@ export function classifyNavigationUrl(raw: string, purpose: NavigationUrlPurpose
     return 'blocked_address';
   }
   if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password) return 'blocked_address';
-  const pathOnly = pathnameWords(url);
-  if (pathOnly === undefined) return 'blocked_address';
+  const segments = decodedPathSegments(url);
+  if (!segments || !queryDecodes(url)) return 'blocked_address';
+  const pathOnly = pathnameWords(segments);
   const words = routeWords(url, pathOnly);
   const actions = actionParameterWords(url);
   if (security.test(words) || securityRoute.test(words)) return 'account_security';

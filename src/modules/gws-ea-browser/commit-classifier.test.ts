@@ -827,7 +827,12 @@ it('refuses only script requests that are no GET, to a payment processor or a pu
     ['POST', 'https://bistro.example/api/reservations'],
     ['POST', 'https://salon.example/api/bookings?time=19%3A00'],
     ['POST', 'https://salon.example/api/appointments'],
+    ['POST', 'https://salon.example/api/slots/42/book'],
+    ['POST', 'https://bistro.example/api/availability/reserve'],
+    ['POST', 'https://salon.example/api/book-slot'],
+    ['POST', 'https://shop.example/api/%E0%A4%A'],
     ['POST', 'https://shop.example/api/charge?action=please-change-password-now'],
+    ['POST', 'https://shop.example/api/items?action=buy&q=50%'],
   ])
     expect(refusedScriptRequest({ method, url })).toBe(true);
   for (const [method, url] of [
@@ -835,6 +840,7 @@ it('refuses only script requests that are no GET, to a payment processor or a pu
     ['POST', 'https://shop.example/api/cart/add'],
     ['POST', 'https://bistro.example/api/reservations/availability'],
     ['POST', 'https://salon.example/api/bookings/search'],
+    ['POST', 'https://shop.example/api/search?q=50%'],
     ['POST', 'https://notstripe.com/collect'],
     ['POST', 'https://www.google.com/recaptcha/api2/reload'],
   ])
