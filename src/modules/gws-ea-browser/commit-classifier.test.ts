@@ -830,6 +830,7 @@ it('refuses only script requests that are no GET, to a payment processor or a pu
     ['POST', 'https://salon.example/api/slots/42/book'],
     ['POST', 'https://bistro.example/api/availability/reserve'],
     ['POST', 'https://salon.example/api/book-slot'],
+    ['POST', 'https://shop.example/api%2Fv1%2Fcheckout%2Fsubmit'],
     ['POST', 'https://shop.example/api/%E0%A4%A'],
     ['POST', 'https://shop.example/api/charge?action=please-change-password-now'],
     ['POST', 'https://shop.example/api/items?action=buy&q=50%'],

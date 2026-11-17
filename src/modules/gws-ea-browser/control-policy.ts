@@ -154,13 +154,9 @@ const terminalBookingVerb = /\b(?:book|reserve|schedule)\b/iu;
 
 function decodedPathSegments(url: URL): string[] | undefined {
   try {
-    return url.pathname
+    return decodeURIComponent(url.pathname)
       .split('/')
-      .map((segment) =>
-        decodeURIComponent(segment)
-          .replace(/[_/-]+/gu, ' ')
-          .trim(),
-      )
+      .map((segment) => segment.replace(/[_/-]+/gu, ' ').trim())
       .filter(Boolean);
   } catch (error) {
     if (!(error instanceof URIError)) throw error;
